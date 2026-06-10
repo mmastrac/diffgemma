@@ -137,7 +137,7 @@ cargo run -- layer0    # validate all 22 layer-0 tensors vs config shapes
 
 ---
 
-## Phase 3 — Single decoder layer (CPU)
+## Phase 3 — Single decoder layer (CPU) ✅
 
 **Deliverable:** one forward pass of `model.decoder.layers.0` on random data.
 
@@ -159,6 +159,8 @@ cargo run -- layer0    # validate all 22 layer-0 tensors vs config shapes
 **Files:** `src/model/attention.rs`, `src/model/moe.rs`, `src/model/decoder_layer.rs`
 
 **Exit criteria:** `cargo run -- layer0` completes without panic; output shape `[seq, 2816]`.
+
+**Run:** `cargo run --release -- layer0` (default seq=16).
 
 ---
 
@@ -418,7 +420,7 @@ diffgemma-mps/
 | 0 | Weight summary binary | — ✅ |
 | 1 | Config + tensor views | — ✅ |
 | 2 | CPU kernels tested | generic/blas ✅ |
-| 3 | Decoder layer 0 | generic/blas |
+| 3 | Decoder layer 0 | generic/blas ✅ |
 | 4 | Full decoder forward | blas |
 | 5 | Encoder + KV cache | blas |
 | 6 | Entropy sampler + blocks | blas |

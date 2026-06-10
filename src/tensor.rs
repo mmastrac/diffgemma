@@ -110,4 +110,24 @@ impl<'a> Bf16Slice<'a> {
             .collect::<Vec<_>>()
             .join(", ")
     }
+
+    pub fn to_f32_vec(&self) -> Vec<f32> {
+        (0..self.len())
+            .map(|i| f32::from_bits((self.get(i) as u32) << 16))
+            .collect()
+    }
+}
+
+impl<'a> TensorView<'a> {
+    pub fn bf16_f32(&self) -> Result<Vec<f32>, Error> {
+        Ok(self.bf16()?.to_f32_vec())
+    }
+
+    pub fn bf16_scalar(&self) -> Result<f32, Error> {
+        let slice = self.bf16()?;
+        if slice.len() != 1 {
+            return Err(Error::Format("expected scalar bf16 tensor"));
+        }
+        Ok(f32::from_bits((slice.get(0) as u32) << 16))
+    }
 }

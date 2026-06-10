@@ -1,4 +1,7 @@
+pub mod attention;
+pub mod decoder_layer;
 pub mod layer_weights;
+pub mod moe;
 
 use crate::config::ModelConfig;
 use crate::safetensors::Error;

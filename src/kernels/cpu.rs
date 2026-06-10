@@ -4,6 +4,20 @@ use crate::tensor::Bf16Slice;
 
 const GELU_TANH_COEF: f32 = 0.797_884_560_802_865_4; // sqrt(2/pi)
 
+/// RMSNorm without learnable scale (`router` gate input, `v_norm`).
+pub fn rms_norm_no_scale(out: &mut [f32], x: &[f32], eps: f32) {
+    assert_eq!(out.len(), x.len());
+    let hidden = x.len();
+    let mut sum_sq = 0.0f32;
+    for &v in x {
+        sum_sq += v * v;
+    }
+    let rms_inv = 1.0 / (sum_sq / hidden as f32 + eps).sqrt();
+    for i in 0..hidden {
+        out[i] = x[i] * rms_inv;
+    }
+}
+
 /// Gemma RMSNorm: `out = x / rms(x) * weight`, `rms = sqrt(mean(x^2) + eps)`.
 pub fn rms_norm(out: &mut [f32], x: &[f32], weight: &[f32], eps: f32) {
     assert_eq!(out.len(), x.len());
@@ -81,6 +95,32 @@ pub fn linear_bf16(
         w_f32[i] = bf16_to_f32(w.get(i));
     }
     linear(y, x, &w_f32, b, seq_len, in_dim, out_dim);
+}
+
+/// `y = x @ W[out, in]^T` reading bf16 weights starting at `w_elem_offset`.
+pub fn linear_bf16_slice(
+    y: &mut [f32],
+    x: &[f32],
+    w: Bf16Slice<'_>,
+    w_elem_offset: usize,
+    seq_len: usize,
+    in_dim: usize,
+    out_dim: usize,
+) {
+    assert_eq!(x.len(), seq_len * in_dim);
+    assert_eq!(y.len(), seq_len * out_dim);
+    for s in 0..seq_len {
+        let x_row = &x[s * in_dim..(s + 1) * in_dim];
+        let y_row = &mut y[s * out_dim..(s + 1) * out_dim];
+        for o in 0..out_dim {
+            let mut sum = 0.0f32;
+            let row_off = w_elem_offset + o * in_dim;
+            for i in 0..in_dim {
+                sum += x_row[i] * bf16_to_f32(w.get(row_off + i));
+            }
+            y_row[o] = sum;
+        }
+    }
 }
 
 pub fn silu(x: &mut [f32]) {

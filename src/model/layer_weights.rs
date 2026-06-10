@@ -222,6 +222,7 @@ impl<'a> DecoderLayerWeights<'a> {
         })
     }
 
+    #[allow(dead_code)]
     pub fn print_summary(&self) {
         println!("decoder layer {} weights (validated)", self.keys.layer);
         self.q_proj.print_info();

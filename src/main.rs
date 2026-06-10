@@ -57,23 +57,7 @@ fn run_command(m: &model::Model, command: Command) -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Command::Layer0 => {
-            match model::layer_weights::DecoderLayerWeights::load(
-                &m.weights,
-                0,
-                &m.config.text_config,
-            ) {
-                Ok(layer) => {
-                    layer.print_summary();
-                    println!("\n  all 22 layer-0 tensors present with expected shapes");
-                    ExitCode::SUCCESS
-                }
-                Err(err) => {
-                    eprintln!("error: {err}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
+        Command::Layer0 => run_layer0_forward(m),
     }
 }
 
@@ -177,4 +161,68 @@ fn print_summary(store: &weights::WeightStore) {
 
 fn gib(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+}
+
+fn run_layer0_forward(m: &model::Model) -> ExitCode {
+    const SEQ_LEN: usize = 16;
+    let hidden = m.config.text_config.hidden_size;
+
+    let layer = match model::layer_weights::DecoderLayerWeights::load(
+        &m.weights,
+        0,
+        &m.config.text_config,
+    ) {
+        Ok(layer) => layer,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut scratch = match model::decoder_layer::DecoderLayerScratch::new(
+        SEQ_LEN,
+        &m.config.text_config,
+        0,
+    ) {
+        Ok(scratch) => scratch,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut input = vec![0.0f32; SEQ_LEN * hidden];
+    let mut output = vec![0.0f32; SEQ_LEN * hidden];
+    for (i, v) in input.iter_mut().enumerate() {
+        *v = ((i % hidden) as f32) * 0.01 - 0.5;
+    }
+    let positions: Vec<i64> = (0..SEQ_LEN as i64).collect();
+
+    eprintln!("running decoder layer 0 forward (seq={SEQ_LEN}, hidden={hidden})...");
+    let started = std::time::Instant::now();
+    match model::decoder_layer::forward(
+        &mut output,
+        &input,
+        &layer,
+        &m.config.text_config,
+        0,
+        SEQ_LEN,
+        &positions,
+        &mut scratch,
+    ) {
+        Ok(()) => {
+            println!("decoder layer 0 forward ok");
+            println!("  output shape: [{SEQ_LEN}, {hidden}]");
+            println!("  elapsed: {:.2?}", started.elapsed());
+            println!(
+                "  output[0..4]: [{:.6}, {:.6}, {:.6}, {:.6}]",
+                output[0], output[1], output[2], output[3]
+            );
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
 }
