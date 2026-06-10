@@ -1,4 +1,6 @@
 mod config;
+#[allow(dead_code)]
+mod kernels;
 mod model;
 mod safetensors;
 mod tensor;

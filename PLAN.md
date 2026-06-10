@@ -116,7 +116,7 @@ cargo run -- layer0    # validate all 22 layer-0 tensors vs config shapes
 
 ---
 
-## Phase 2 — CPU kernels (reference math)
+## Phase 2 — CPU kernels (reference math) ✅
 
 **Deliverable:** unit-tested primitives used by every layer.
 
@@ -129,7 +129,9 @@ cargo run -- layer0    # validate all 22 layer-0 tensors vs config shapes
 | `rope` | sliding + full attention variants, proportional rope for full layers |
 | `matmul` | naive loop + `blas` feature via Accelerate |
 
-**Files:** `src/kernels/cpu.rs`, `src/kernels/mod.rs`
+**Files:** `src/kernels/cpu.rs`, `src/kernels/matmul.rs`, `src/kernels/mod.rs`, `build.rs`
+
+**Build:** `cargo test` (default `blas` → Accelerate on macOS); `cargo test --no-default-features` for generic matmul.
 
 **Exit criteria:** `cargo test` — RMSNorm and RoPE vs small golden vectors (hand-computed or Python reference in `/tmp`).
 
@@ -415,7 +417,7 @@ diffgemma-mps/
 |---|-----------|---------|
 | 0 | Weight summary binary | — ✅ |
 | 1 | Config + tensor views | — ✅ |
-| 2 | CPU kernels tested | generic |
+| 2 | CPU kernels tested | generic/blas ✅ |
 | 3 | Decoder layer 0 | generic/blas |
 | 4 | Full decoder forward | blas |
 | 5 | Encoder + KV cache | blas |

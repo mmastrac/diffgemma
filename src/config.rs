@@ -103,6 +103,40 @@ impl ModelConfig {
     }
 }
 
+impl TextConfig {
+    /// Rotary dimension for a layer (full `head_dim` sliding, partial on `global_head_dim`).
+    pub fn rotary_dim_for_layer(&self, layer: usize) -> Option<usize> {
+        let kind = self.layer_types.get(layer)?;
+        Some(match kind {
+            LayerType::SlidingAttention => self.head_dim,
+            LayerType::FullAttention => {
+                let factor = self
+                    .rope_parameters
+                    .full_attention
+                    .partial_rotary_factor
+                    .unwrap_or(0.25);
+                ((self.global_head_dim as f64) * factor).round() as usize
+            }
+        })
+    }
+
+    pub fn full_head_dim_for_layer(&self, layer: usize) -> Option<usize> {
+        let kind = self.layer_types.get(layer)?;
+        Some(match kind {
+            LayerType::SlidingAttention => self.head_dim,
+            LayerType::FullAttention => self.global_head_dim,
+        })
+    }
+
+    pub fn rope_theta_for_layer(&self, layer: usize) -> Option<f32> {
+        let kind = self.layer_types.get(layer)?;
+        Some(match kind {
+            LayerType::SlidingAttention => self.rope_parameters.sliding_attention.rope_theta as f32,
+            LayerType::FullAttention => self.rope_parameters.full_attention.rope_theta as f32,
+        })
+    }
+}
+
 impl ModelConfig {
     pub fn print_summary(&self) {
         let t = &self.text_config;
