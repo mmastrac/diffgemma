@@ -1,4 +1,5 @@
 use crate::safetensors::{Error, SafetensorsFile, TensorInfo};
+use crate::tensor::TensorView;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -57,6 +58,15 @@ impl WeightStore {
         let &(shard_idx, tensor_idx) = self.index.get(name)?;
         let shard = &self.shards[shard_idx];
         Some((shard, &shard.tensors[tensor_idx]))
+    }
+
+    /// Zero-copy mmap view of a named weight tensor.
+    pub fn tensor(&self, name: &str) -> Result<TensorView<'_>, Error> {
+        let (shard, info) = self
+            .get(name)
+            .ok_or_else(|| Error::NotFound(name.to_string()))?;
+        let data = shard.data(info);
+        Ok(TensorView::from_info(&info.name, info, data))
     }
 }
 

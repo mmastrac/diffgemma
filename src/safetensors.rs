@@ -75,6 +75,17 @@ pub enum Error {
     Io(std::io::Error),
     Json(serde_json::Error),
     Format(&'static str),
+    NotFound(String),
+    DType {
+        name: String,
+        expected: DType,
+        got: DType,
+    },
+    ShapeMismatch {
+        name: String,
+        expected: Vec<i64>,
+        got: Vec<i64>,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -83,6 +94,13 @@ impl std::fmt::Display for Error {
             Self::Io(e) => write!(f, "io error: {e}"),
             Self::Json(e) => write!(f, "json error: {e}"),
             Self::Format(msg) => write!(f, "format error: {msg}"),
+            Self::NotFound(name) => write!(f, "tensor not found: {name}"),
+            Self::DType { name, expected, got } => {
+                write!(f, "dtype mismatch for {name}: expected {}, got {}", expected.as_str(), got.as_str())
+            }
+            Self::ShapeMismatch { name, expected, got } => {
+                write!(f, "shape mismatch for {name}: expected {expected:?}, got {got:?}")
+            }
         }
     }
 }

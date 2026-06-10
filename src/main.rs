@@ -1,19 +1,33 @@
+mod config;
+mod model;
 mod safetensors;
+mod tensor;
 mod weights;
 
 use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-fn main() -> ExitCode {
-    let model_dir = parse_model_dir();
-    eprintln!("loading weights from {}", model_dir.display());
+#[derive(Debug)]
+struct Cli {
+    model_dir: PathBuf,
+    command: Command,
+}
 
-    match weights::WeightStore::open(&model_dir) {
-        Ok(store) => {
-            print_summary(&store);
-            ExitCode::SUCCESS
-        }
+#[derive(Debug)]
+enum Command {
+    Summary,
+    Config,
+    Weights(String),
+    Layer0,
+}
+
+fn main() -> ExitCode {
+    let cli = parse_cli();
+    eprintln!("loading from {}", cli.model_dir.display());
+
+    match model::Model::open(&cli.model_dir) {
+        Ok(m) => run_command(&m, cli.command),
         Err(err) => {
             eprintln!("error: {err}");
             ExitCode::FAILURE
@@ -21,13 +35,81 @@ fn main() -> ExitCode {
     }
 }
 
-fn parse_model_dir() -> PathBuf {
-    let mut args = env::args().skip(1);
-    match (args.next(), args.next()) {
-        (Some(flag), Some(path)) if flag == "-m" || flag == "--model" => PathBuf::from(path),
-        (Some(path), _) => PathBuf::from(path),
-        _ => PathBuf::from("model/transformer"),
+fn run_command(m: &model::Model, command: Command) -> ExitCode {
+    match command {
+        Command::Summary => {
+            print_summary(&m.weights);
+            ExitCode::SUCCESS
+        }
+        Command::Config => {
+            m.config.print_summary();
+            ExitCode::SUCCESS
+        }
+        Command::Weights(name) => match m.weights.tensor(&name) {
+            Ok(t) => {
+                t.print_info();
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("error: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Layer0 => {
+            match model::layer_weights::DecoderLayerWeights::load(
+                &m.weights,
+                0,
+                &m.config.text_config,
+            ) {
+                Ok(layer) => {
+                    layer.print_summary();
+                    println!("\n  all 22 layer-0 tensors present with expected shapes");
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
     }
+}
+
+fn parse_cli() -> Cli {
+    let mut args = env::args().skip(1);
+    let mut model_dir = PathBuf::from("model/transformer");
+    let mut positional = Vec::new();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-m" | "--model" => {
+                if let Some(path) = args.next() {
+                    model_dir = PathBuf::from(path);
+                }
+            }
+            _ => positional.push(arg),
+        }
+    }
+
+    let command = match positional.first().map(String::as_str) {
+        None | Some("summary") => Command::Summary,
+        Some("config") => Command::Config,
+        Some("weights") => {
+            let name = positional.get(1).cloned().unwrap_or_else(|| {
+                eprintln!("usage: diffgemma-mps weights <tensor_name>");
+                std::process::exit(2);
+            });
+            Command::Weights(name)
+        }
+        Some("layer0") => Command::Layer0,
+        Some(cmd) => {
+            eprintln!("unknown command: {cmd}");
+            eprintln!("usage: diffgemma-mps [summary|config|weights <name>|layer0]");
+            std::process::exit(2);
+        }
+    };
+
+    Cli { model_dir, command }
 }
 
 fn print_summary(store: &weights::WeightStore) {
@@ -77,16 +159,17 @@ fn print_summary(store: &weights::WeightStore) {
         println!("      shape={shape}  numel={numel}");
     }
 
-    if let Some((shard, tensor)) = store.get("model.decoder.embed_tokens.weight") {
-        let data = shard.data(tensor);
+    if let Ok(t) = store.tensor("model.decoder.embed_tokens.weight") {
         println!("\n  spot-check: model.decoder.embed_tokens.weight");
         println!(
             "    dtype={} shape={:?} bytes={}",
-            tensor.dtype.as_str(),
-            tensor.shape,
-            data.len()
+            t.dtype.as_str(),
+            t.shape,
+            t.byte_len()
         );
-        println!("    first bytes: {:02x?}", &data[..8.min(data.len())]);
+        if let Ok(bf16) = t.bf16() {
+            println!("    bf16[0..4]: [{}]", bf16.preview_hex(4));
+        }
     }
 }
 
