@@ -307,6 +307,22 @@ cargo run --release --features metal -- gemm --size 512
 
 **Exit criteria:** Layer 0 attention output matches CPU forward on same inputs.
 
+**Status:** Done.
+
+| Added | Notes |
+|-------|-------|
+| `shaders/attention.metal` | `apply_rope_heads` + `gqa_attention` (causal/sliding, encoder extend, decoder bitmap) |
+| `src/metal/attention.rs` | `GpuAttention`: RoPE, GQA softmax, `rope_and_gqa` |
+| `src/model/attention.rs` | `GqaMask`, `gqa_attention`, `prepare_qkv_pre_rope`, `forward_to_attn_out` |
+| CLI `attention` | Layer 0 RoPE+GQA parity vs CPU at seq=16 |
+
+```bash
+cargo test --features metal
+cargo run --release --features metal -- attention
+```
+
+Verified: layer 0, seq=16, `max_abs_diff: 0.000001`.
+
 ---
 
 ## Phase 10 — Metal MoE + full decoder

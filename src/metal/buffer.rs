@@ -48,4 +48,18 @@ impl BufferPool {
             std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), out.len());
         }
     }
+
+    pub fn write_bytes(buffer: &ProtocolObject<dyn MTLBuffer>, data: &[u8]) {
+        let ptr = buffer.contents().as_ptr() as *mut u8;
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+        }
+    }
+
+    pub fn write_i64(buffer: &ProtocolObject<dyn MTLBuffer>, data: &[i64]) {
+        let ptr = buffer.contents().as_ptr() as *mut i64;
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+        }
+    }
 }

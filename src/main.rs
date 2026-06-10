@@ -37,6 +37,7 @@ enum Command {
     },
     Tokenize(String),
     Gemm { size: usize },
+    Attention,
 }
 
 fn main() -> ExitCode {
@@ -78,6 +79,7 @@ fn run_command(m: &model::Model, command: Command) -> ExitCode {
             }
         },
         Command::Layer0 => run_layer0_forward(m),
+        Command::Attention => run_attention_parity(m),
         Command::Decoder => run_decoder_forward(m),
         Command::Prefill => run_prefill(m),
         Command::Generate {
@@ -179,13 +181,15 @@ fn parse_cli() -> Cli {
             Command::Tokenize(text)
         }
         Some("gemm") => Command::Gemm { size: gemm_size },
+        Some("attention") => Command::Attention,
         Some(cmd) => {
             eprintln!("unknown command: {cmd}");
             eprintln!(
-                "usage: diffgemma-mps [summary|config|weights <name>|layer0|decoder|prefill|generate|tokenize <text>|gemm]"
+                "usage: diffgemma-mps [summary|config|weights <name>|layer0|decoder|prefill|generate|tokenize <text>|gemm|attention]"
             );
             eprintln!("  generate options: --seed N --steps N --prompt-len N --max-new-tokens N");
             eprintln!("  gemm options: --size N (default 512, requires --features metal)");
+            eprintln!("  attention: layer 0 GQA parity (requires --features metal)");
             std::process::exit(2);
         }
     };
@@ -513,6 +517,148 @@ fn run_generate(
             eprintln!("error: {err}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn run_attention_parity(m: &model::Model) -> ExitCode {
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    {
+        use metal::GpuAttention;
+        use model::attention::{forward_to_attn_out, prepare_qkv_pre_rope, AttentionParams};
+
+        const SEQ_LEN: usize = 16;
+        let hidden = m.config.text_config.hidden_size;
+
+        let layer = match model::layer_weights::DecoderLayerWeights::load(
+            &m.weights,
+            0,
+            &m.config.text_config,
+        ) {
+            Ok(layer) => layer,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        let params = match AttentionParams::for_layer(&m.config.text_config, 0) {
+            Ok(p) => p,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        let mut scratch = model::attention::AttentionScratch::new(SEQ_LEN, hidden, &params);
+
+        let mut input = vec![0.0f32; SEQ_LEN * hidden];
+        for (i, v) in input.iter_mut().enumerate() {
+            *v = ((i % hidden) as f32) * 0.01 - 0.5;
+        }
+        let positions: Vec<i64> = (0..SEQ_LEN as i64).collect();
+
+        if let Err(err) = prepare_qkv_pre_rope(
+            &input,
+            &layer,
+            &m.config.text_config,
+            0,
+            SEQ_LEN,
+            &positions,
+            &mut scratch,
+        ) {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+
+        let pre_q = scratch.q.clone();
+        let pre_k = scratch.k.clone();
+        let pre_v = scratch.v.clone();
+        let freqs = scratch.rope_freqs.clone();
+
+        let q_dim = SEQ_LEN * params.n_heads * params.head_dim;
+        let mut cpu_out = vec![0.0f32; q_dim];
+        if let Err(err) = forward_to_attn_out(
+            &mut cpu_out,
+            &input,
+            &layer,
+            &m.config.text_config,
+            0,
+            SEQ_LEN,
+            &positions,
+            &mut scratch,
+        ) {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+
+        let mut gpu_q = pre_q;
+        let mut gpu_k = pre_k;
+        let mut gpu_out = vec![0.0f32; q_dim];
+        let mut gpu = match GpuAttention::new() {
+            Ok(g) => g,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        eprintln!(
+            "running layer 0 GPU attention (seq={SEQ_LEN}, heads={}, kv_heads={}, head_dim={})...",
+            params.n_heads, params.n_kv_heads, params.head_dim
+        );
+        let started = std::time::Instant::now();
+        if let Err(err) = gpu.rope_and_gqa(
+            &mut gpu_out,
+            &mut gpu_q,
+            &mut gpu_k,
+            &pre_v,
+            &freqs,
+            SEQ_LEN,
+            SEQ_LEN,
+            &params,
+            model::attention::GqaMask::CausalSliding,
+        ) {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+        let gpu_elapsed = started.elapsed();
+
+        let mut max_abs = 0.0f32;
+        let mut max_idx = 0usize;
+        for (i, (&c, &g)) in cpu_out.iter().zip(gpu_out.iter()).enumerate() {
+            let d = (c - g).abs();
+            if d > max_abs {
+                max_abs = d;
+                max_idx = i;
+            }
+        }
+
+        println!("layer 0 attention parity ok");
+        println!("  shape: [{SEQ_LEN}, {}, {}]", params.n_heads, params.head_dim);
+        println!("  gpu elapsed: {gpu_elapsed:.2?}");
+        println!("  max_abs_diff: {max_abs:.6} at index {max_idx}");
+        println!(
+            "  cpu[0..4]: [{:.6}, {:.6}, {:.6}, {:.6}]",
+            cpu_out[0], cpu_out[1], cpu_out[2], cpu_out[3]
+        );
+        println!(
+            "  gpu[0..4]: [{:.6}, {:.6}, {:.6}, {:.6}]",
+            gpu_out[0], gpu_out[1], gpu_out[2], gpu_out[3]
+        );
+
+        const TOL: f32 = 1e-3;
+        if max_abs <= TOL {
+            ExitCode::SUCCESS
+        } else {
+            eprintln!("error: max_abs_diff {max_abs} exceeds tolerance {TOL}");
+            ExitCode::FAILURE
+        }
+    }
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    {
+        let _ = m;
+        eprintln!("error: attention requires --features metal on macOS");
+        ExitCode::FAILURE
     }
 }
 

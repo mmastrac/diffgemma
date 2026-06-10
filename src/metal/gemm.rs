@@ -1,6 +1,6 @@
 use crate::kernels::cpu::bf16_to_f32;
 use crate::metal::buffer::BufferPool;
-use crate::metal::device::{Bf16GemmPipeline, MetalContext};
+use crate::metal::device::{ComputePipeline, MetalContext};
 use crate::safetensors::Error;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
@@ -14,7 +14,7 @@ const THREADGROUP: usize = 16;
 
 pub struct Bf16Gemm {
     ctx: MetalContext,
-    pipeline: Bf16GemmPipeline,
+    pipeline: ComputePipeline,
     pool: BufferPool,
 }
 

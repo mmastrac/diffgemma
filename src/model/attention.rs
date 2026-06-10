@@ -8,7 +8,21 @@ use crate::model::layer_weights::DecoderLayerWeights;
 use crate::model::mask::DecoderAttnMask;
 use crate::safetensors::Error;
 
-const MASK_NEG: f32 = -1e9;
+pub const MASK_NEG: f32 = -1e9;
+
+/// Mask mode for shared CPU/GPU GQA attention (`gqa_attention`).
+pub enum GqaMask<'a> {
+    CausalSliding,
+    EncoderExtend {
+        kv_cache_len: usize,
+        positions: &'a [i64],
+    },
+    DecoderBitmap(&'a DecoderAttnMask),
+}
+
+pub fn pack_decoder_mask(mask: &DecoderAttnMask) -> Vec<u8> {
+    mask.attend.iter().map(|&b| u8::from(b)).collect()
+}
 
 pub struct AttentionParams {
     pub n_heads: usize,
@@ -123,13 +137,55 @@ pub fn forward(
     scratch: &mut AttentionScratch,
 ) -> Result<(), Error> {
     let hidden_size = cfg.hidden_size;
+    let params = AttentionParams::for_layer(cfg, layer)?;
+    let q_dim = params.n_heads * params.head_dim;
+
+    assert_eq!(hidden.len(), seq_len * hidden_size);
+    assert_eq!(out.len(), seq_len * hidden_size);
+
+    prepare_qkv_pre_rope(hidden, weights, cfg, layer, seq_len, positions, scratch)?;
+    apply_rope_to_scratch_qkv(cfg, layer, seq_len, positions, scratch)?;
+    gqa_attention(
+        &mut scratch.attn_out,
+        &mut scratch.scores,
+        &scratch.q,
+        &scratch.k,
+        &scratch.v,
+        seq_len,
+        seq_len,
+        &params,
+        GqaMask::CausalSliding,
+    );
+
+    linear(
+        out,
+        &scratch.attn_out,
+        &scratch.o_w,
+        None,
+        seq_len,
+        q_dim,
+        hidden_size,
+    );
+    Ok(())
+}
+
+/// Q/K/V projections and per-head norm; RoPE freqs computed but not applied.
+pub fn prepare_qkv_pre_rope(
+    hidden: &[f32],
+    weights: &DecoderLayerWeights<'_>,
+    cfg: &TextConfig,
+    layer: usize,
+    seq_len: usize,
+    positions: &[i64],
+    scratch: &mut AttentionScratch,
+) -> Result<(), Error> {
+    let hidden_size = cfg.hidden_size;
     let eps = cfg.rms_norm_eps as f32;
     let params = AttentionParams::for_layer(cfg, layer)?;
     let q_dim = params.n_heads * params.head_dim;
     let kv_dim = params.n_kv_heads * params.head_dim;
 
     assert_eq!(hidden.len(), seq_len * hidden_size);
-    assert_eq!(out.len(), seq_len * hidden_size);
     assert_eq!(positions.len(), seq_len);
 
     scratch.load_weights(weights)?;
@@ -194,6 +250,17 @@ pub fn forward(
 
     let rope_kind = rope_kind_for_layer(cfg, layer).ok_or(Error::Format("rope kind"))?;
     compute_rope_freqs(&mut scratch.rope_freqs, positions, rope_kind);
+    Ok(())
+}
+
+fn apply_rope_to_scratch_qkv(
+    cfg: &TextConfig,
+    layer: usize,
+    seq_len: usize,
+    _positions: &[i64],
+    scratch: &mut AttentionScratch,
+) -> Result<(), Error> {
+    let params = AttentionParams::for_layer(cfg, layer)?;
     apply_rope_tensor(
         &mut scratch.q,
         seq_len,
@@ -210,35 +277,81 @@ pub fn forward(
         &scratch.rope_freqs,
         params.rotary_dim,
     );
+    Ok(())
+}
 
-    attention_scores_gqa(
+/// Attention through RoPE and GQA softmax; stops before `o_proj`.
+pub fn forward_to_attn_out(
+    attn_out: &mut [f32],
+    hidden: &[f32],
+    weights: &DecoderLayerWeights<'_>,
+    cfg: &TextConfig,
+    layer: usize,
+    seq_len: usize,
+    positions: &[i64],
+    scratch: &mut AttentionScratch,
+) -> Result<(), Error> {
+    let params = AttentionParams::for_layer(cfg, layer)?;
+    let q_dim = params.n_heads * params.head_dim;
+    assert_eq!(attn_out.len(), seq_len * q_dim);
+
+    prepare_qkv_pre_rope(hidden, weights, cfg, layer, seq_len, positions, scratch)?;
+    apply_rope_to_scratch_qkv(cfg, layer, seq_len, positions, scratch)?;
+    gqa_attention(
+        attn_out,
         &mut scratch.scores,
         &scratch.q,
         &scratch.k,
-        seq_len,
-        &params,
-    );
-    apply_attention_mask(&mut scratch.scores, seq_len, &params);
-    softmax_rows(&mut scratch.scores, seq_len * params.n_heads, seq_len);
-
-    attention_output_gqa(
-        &mut scratch.attn_out,
-        &scratch.scores,
         &scratch.v,
         seq_len,
-        &params,
-    );
-
-    linear(
-        out,
-        &scratch.attn_out,
-        &scratch.o_w,
-        None,
         seq_len,
-        q_dim,
-        hidden_size,
+        &params,
+        GqaMask::CausalSliding,
     );
     Ok(())
+}
+
+/// GQA attention from post-RoPE Q/K/V (CPU reference for Metal parity).
+pub fn gqa_attention(
+    attn_out: &mut [f32],
+    scores: &mut [f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    total_kv: usize,
+    params: &AttentionParams,
+    mask: GqaMask<'_>,
+) {
+    assert_eq!(q.len(), seq_len * params.n_heads * params.head_dim);
+    assert_eq!(scores.len(), seq_len * params.n_heads * total_kv);
+    assert_eq!(attn_out.len(), seq_len * params.n_heads * params.head_dim);
+
+    if total_kv == seq_len && matches!(mask, GqaMask::CausalSliding) {
+        attention_scores_gqa(scores, q, k, seq_len, params);
+        apply_attention_mask(scores, seq_len, params);
+    } else {
+        attention_scores_gqa_ext(scores, q, k, seq_len, total_kv, params);
+        match mask {
+            GqaMask::CausalSliding => apply_attention_mask(scores, seq_len, params),
+            GqaMask::EncoderExtend {
+                kv_cache_len,
+                positions,
+            } => apply_encoder_extend_mask(
+                scores,
+                seq_len,
+                total_kv,
+                kv_cache_len,
+                positions,
+                params,
+            ),
+            GqaMask::DecoderBitmap(decoder_mask) => {
+                apply_decoder_mask(scores, seq_len, total_kv, params, decoder_mask)
+            }
+        }
+    }
+    softmax_rows(scores, seq_len * params.n_heads, total_kv);
+    attention_output_gqa_ext(attn_out, scores, v, seq_len, total_kv, params);
 }
 
 /// Incremental encoder prefill: causal attention over cached KV + new tokens; appends K/V.
