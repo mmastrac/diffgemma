@@ -282,6 +282,13 @@ shaders/gemm.metal
 
 **Exit criteria:** `cargo run --features metal -- gemm` — bf16 matmul matches CPU within tolerance on 512×512.
 
+**Status:** ✅ Done — `src/metal/*`, `shaders/gemm.metal`, `gemm` CLI.
+
+**Run:**
+```bash
+cargo run --release --features metal -- gemm --size 512
+```
+
 ---
 
 ## Phase 9 — Metal attention

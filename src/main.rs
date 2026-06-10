@@ -2,6 +2,8 @@ mod config;
 mod generate;
 #[allow(dead_code)]
 mod kernels;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+mod metal;
 mod model;
 mod sample;
 mod safetensors;
@@ -34,12 +36,14 @@ enum Command {
         max_new_tokens: usize,
     },
     Tokenize(String),
+    Gemm { size: usize },
 }
 
 fn main() -> ExitCode {
     let cli = parse_cli();
     match cli.command {
         Command::Tokenize(text) => run_tokenize(&cli.model_dir, &text),
+        Command::Gemm { size } => run_gemm(size),
         command => {
             eprintln!("loading from {}", cli.model_dir.display());
             match model::Model::open(&cli.model_dir) {
@@ -83,6 +87,7 @@ fn run_command(m: &model::Model, command: Command) -> ExitCode {
             max_new_tokens,
         } => run_generate(m, seed, steps, prompt_len, max_new_tokens),
         Command::Tokenize(_) => ExitCode::FAILURE,
+        Command::Gemm { .. } => ExitCode::FAILURE,
     }
 }
 
@@ -94,6 +99,7 @@ fn parse_cli() -> Cli {
     let mut steps = 2usize;
     let mut prompt_len = 8usize;
     let mut max_new_tokens = 256usize;
+    let mut gemm_size = 512usize;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -134,6 +140,14 @@ fn parse_cli() -> Cli {
                     });
                 }
             }
+            "--size" => {
+                if let Some(v) = args.next() {
+                    gemm_size = v.parse().unwrap_or_else(|_| {
+                        eprintln!("invalid --size");
+                        std::process::exit(2);
+                    });
+                }
+            }
             _ => positional.push(arg),
         }
     }
@@ -164,12 +178,14 @@ fn parse_cli() -> Cli {
             });
             Command::Tokenize(text)
         }
+        Some("gemm") => Command::Gemm { size: gemm_size },
         Some(cmd) => {
             eprintln!("unknown command: {cmd}");
             eprintln!(
-                "usage: diffgemma-mps [summary|config|weights <name>|layer0|decoder|prefill|generate|tokenize <text>]"
+                "usage: diffgemma-mps [summary|config|weights <name>|layer0|decoder|prefill|generate|tokenize <text>|gemm]"
             );
             eprintln!("  generate options: --seed N --steps N --prompt-len N --max-new-tokens N");
+            eprintln!("  gemm options: --size N (default 512, requires --features metal)");
             std::process::exit(2);
         }
     };
@@ -340,6 +356,77 @@ fn run_decoder_forward(m: &model::Model) -> ExitCode {
             eprintln!("error: {err}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn run_gemm(size: usize) -> ExitCode {
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    {
+        use metal::{bf16_matmul_cpu, f32_to_bf16, Bf16Gemm};
+
+        let n = size.max(1);
+        let m = n;
+        let k = n;
+        eprintln!("running bf16 gemm on Metal ({m}x{k} @ {k}x{n})...");
+
+        let mut a = vec![0u16; m * k];
+        let mut b = vec![0u16; k * n];
+        let mut cpu = vec![0.0f32; m * n];
+        let mut gpu = vec![0.0f32; m * n];
+
+        let mut state = 0xC0FFEE_u64;
+        for slot in a.iter_mut().chain(b.iter_mut()) {
+            state = state.wrapping_mul(6_966_169_279).wrapping_add(1);
+            let v = ((state >> 32) as f32) / 65536.0 - 0.5;
+            *slot = f32_to_bf16(v);
+        }
+
+        let started = std::time::Instant::now();
+        bf16_matmul_cpu(&mut cpu, &a, &b, m, k, n);
+        let cpu_elapsed = started.elapsed();
+
+        let mut gemm = match Bf16Gemm::new() {
+            Ok(g) => g,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let started = std::time::Instant::now();
+        if let Err(err) = gemm.matmul(&a, &b, &mut gpu, m, k, n) {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+        let gpu_elapsed = started.elapsed();
+
+        let mut max_abs = 0.0f32;
+        let mut max_idx = 0usize;
+        for (i, (&c, &g)) in cpu.iter().zip(gpu.iter()).enumerate() {
+            let d = (c - g).abs();
+            if d > max_abs {
+                max_abs = d;
+                max_idx = i;
+            }
+        }
+
+        println!("bf16 gemm ok");
+        println!("  shape: {m}x{k} @ {k}x{n}");
+        println!("  cpu elapsed: {cpu_elapsed:.2?}");
+        println!("  gpu elapsed: {gpu_elapsed:.2?}");
+        println!("  max_abs_diff: {max_abs:.6} at index {max_idx}");
+        const TOL: f32 = 1e-3;
+        if max_abs <= TOL {
+            ExitCode::SUCCESS
+        } else {
+            eprintln!("error: max_abs_diff {max_abs} exceeds tolerance {TOL}");
+            ExitCode::FAILURE
+        }
+    }
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    {
+        let _ = size;
+        eprintln!("error: gemm requires --features metal on macOS");
+        ExitCode::FAILURE
     }
 }
 
