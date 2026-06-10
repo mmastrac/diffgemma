@@ -3,7 +3,7 @@ use crate::kernels::cpu::{
     apply_rope_tensor, compute_rope_freqs, linear, rms_norm, rms_norm_no_scale, rms_norm_rows,
     rope_kind_for_layer, softmax_rows,
 };
-use crate::model::kv_cache::LayerKvView;
+use crate::model::kv_cache::{LayerKv, LayerKvView};
 use crate::model::layer_weights::DecoderLayerWeights;
 use crate::model::mask::DecoderAttnMask;
 use crate::safetensors::Error;
@@ -238,6 +238,35 @@ pub fn forward(
         q_dim,
         hidden_size,
     );
+    Ok(())
+}
+
+/// Causal encoder attention; writes post-RoPE K/V into `kv_out` for decoder cross-attn.
+pub fn forward_encoder(
+    out: &mut [f32],
+    hidden: &[f32],
+    weights: &DecoderLayerWeights<'_>,
+    cfg: &TextConfig,
+    layer: usize,
+    seq_len: usize,
+    positions: &[i64],
+    kv_out: &mut LayerKv,
+    scratch: &mut AttentionScratch,
+) -> Result<(), Error> {
+    forward(
+        out,
+        hidden,
+        weights,
+        cfg,
+        layer,
+        seq_len,
+        positions,
+        scratch,
+    )?;
+    let params = AttentionParams::for_layer(cfg, layer)?;
+    kv_out.n_kv_heads = params.n_kv_heads;
+    kv_out.head_dim = params.head_dim;
+    kv_out.set_kv(&scratch.k, &scratch.v, seq_len)?;
     Ok(())
 }
 

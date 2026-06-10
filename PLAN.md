@@ -184,7 +184,7 @@ cargo run -- layer0    # validate all 22 layer-0 tensors vs config shapes
 
 ---
 
-## Phase 5 — Causal encoder + KV cache (CPU)
+## Phase 5 — Causal encoder + KV cache (CPU) ✅
 
 **Deliverable:** prefill path that fills KV cache for prompt tokens.
 
@@ -196,6 +196,12 @@ cargo run -- layer0    # validate all 22 layer-0 tensors vs config shapes
 | Cache position offsets | RoPE with absolute positions |
 
 **Exit criteria:** Prefill 128 prompt tokens → KV cache size matches expected `(layers, seq, kv_heads, head_dim)`.
+
+**Files:** `src/model/encoder.rs`, `src/model/kv_cache.rs` (extend), encoder path in `attention.rs` / `decoder_layer.rs`
+
+**Note:** Encoder layers use tied `model.decoder.layers.*` weights; only `model.encoder.language_model.layers.*.layer_scalar` buffers are separate in the checkpoint.
+
+**Run:** `cargo run --release -- prefill`
 
 ---
 
@@ -426,7 +432,7 @@ diffgemma-mps/
 | 2 | CPU kernels tested | generic/blas ✅ |
 | 3 | Decoder layer 0 | generic/blas ✅ |
 | 4 | Full decoder forward | blas ✅ |
-| 5 | Encoder + KV cache | blas |
+| 5 | Encoder + KV cache | blas ✅ |
 | 6 | Entropy sampler + blocks | blas |
 | 7 | Tokenizer | blas |
 | 8 | Metal GEMM + buffers | metal |

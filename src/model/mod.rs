@@ -2,6 +2,7 @@ pub mod attention;
 pub mod decoder;
 pub mod decoder_layer;
 pub mod embed;
+pub mod encoder;
 pub mod kv_cache;
 pub mod layer_weights;
 pub mod mask;

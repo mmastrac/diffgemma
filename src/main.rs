@@ -23,6 +23,7 @@ enum Command {
     Weights(String),
     Layer0,
     Decoder,
+    Prefill,
 }
 
 fn main() -> ExitCode {
@@ -60,6 +61,7 @@ fn run_command(m: &model::Model, command: Command) -> ExitCode {
         },
         Command::Layer0 => run_layer0_forward(m),
         Command::Decoder => run_decoder_forward(m),
+        Command::Prefill => run_prefill(m),
     }
 }
 
@@ -91,9 +93,10 @@ fn parse_cli() -> Cli {
         }
         Some("layer0") => Command::Layer0,
         Some("decoder") => Command::Decoder,
+        Some("prefill") => Command::Prefill,
         Some(cmd) => {
             eprintln!("unknown command: {cmd}");
-            eprintln!("usage: diffgemma-mps [summary|config|weights <name>|layer0|decoder]");
+            eprintln!("usage: diffgemma-mps [summary|config|weights <name>|layer0|decoder|prefill]");
             std::process::exit(2);
         }
     };
@@ -164,6 +167,48 @@ fn print_summary(store: &weights::WeightStore) {
 
 fn gib(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+}
+
+fn run_prefill(m: &model::Model) -> ExitCode {
+    const PROMPT_LEN: usize = 128;
+    let vocab = m.config.text_config.vocab_size;
+
+    let mut token_ids = vec![0u32; PROMPT_LEN];
+    for (i, id) in token_ids.iter_mut().enumerate() {
+        *id = ((i * 131 + 7) % vocab.max(1)) as u32;
+    }
+
+    let mut scratch = model::encoder::EncoderScratch::new(PROMPT_LEN, &m.config);
+    let input = model::encoder::EncoderPrefillInput {
+        token_ids: &token_ids,
+        position_offset: 0,
+    };
+
+    eprintln!("running encoder prefill (prompt_len={PROMPT_LEN}, layers={})...", m.config.text_config.num_hidden_layers);
+    let started = std::time::Instant::now();
+    match model::encoder::prefill(&m.weights, &m.config, &input, &mut scratch) {
+        Ok(out) => {
+            println!("encoder prefill ok");
+            println!("  kv_len: {}", out.kv_cache.kv_len);
+            println!("  hidden shape: [{PROMPT_LEN}, {}]", m.config.text_config.hidden_size);
+            println!("  elapsed: {:.2?}", started.elapsed());
+            println!("  {}", out.kv_cache.describe_layer(0));
+            println!("  {}", out.kv_cache.describe_layer(5));
+            println!("  {}", out.kv_cache.describe_layer(29));
+            println!(
+                "  hidden[0..4]: [{:.6}, {:.6}, {:.6}, {:.6}]",
+                out.hidden_states[0],
+                out.hidden_states[1],
+                out.hidden_states[2],
+                out.hidden_states[3]
+            );
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn run_decoder_forward(m: &model::Model) -> ExitCode {
