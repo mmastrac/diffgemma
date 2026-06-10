@@ -22,6 +22,7 @@ enum Command {
     Config,
     Weights(String),
     Layer0,
+    Decoder,
 }
 
 fn main() -> ExitCode {
@@ -58,6 +59,7 @@ fn run_command(m: &model::Model, command: Command) -> ExitCode {
             }
         },
         Command::Layer0 => run_layer0_forward(m),
+        Command::Decoder => run_decoder_forward(m),
     }
 }
 
@@ -88,9 +90,10 @@ fn parse_cli() -> Cli {
             Command::Weights(name)
         }
         Some("layer0") => Command::Layer0,
+        Some("decoder") => Command::Decoder,
         Some(cmd) => {
             eprintln!("unknown command: {cmd}");
-            eprintln!("usage: diffgemma-mps [summary|config|weights <name>|layer0]");
+            eprintln!("usage: diffgemma-mps [summary|config|weights <name>|layer0|decoder]");
             std::process::exit(2);
         }
     };
@@ -161,6 +164,65 @@ fn print_summary(store: &weights::WeightStore) {
 
 fn gib(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+}
+
+fn run_decoder_forward(m: &model::Model) -> ExitCode {
+    const CANVAS_LEN: usize = 256;
+    const KV_LEN: usize = 128;
+    let hidden = m.config.text_config.hidden_size;
+    let vocab = m.config.text_config.vocab_size;
+
+    let kv_cache = match model::kv_cache::KvCache::dummy(&m.config.text_config, KV_LEN, 42) {
+        Ok(cache) => cache,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut token_ids = vec![0u32; CANVAS_LEN];
+    for (i, id) in token_ids.iter_mut().enumerate() {
+        *id = ((i * 997 + 13) % vocab.max(1)) as u32;
+    }
+
+    let mut scratch = model::decoder::DecoderScratch::new(CANVAS_LEN, &m.config);
+    let mask = model::mask::DecoderAttnMask::all_valid(CANVAS_LEN, KV_LEN);
+    let input = model::decoder::DecoderForwardInput {
+        token_ids: &token_ids,
+        kv_cache: &kv_cache,
+        self_conditioning_logits: None,
+        mask: Some(mask),
+    };
+
+    eprintln!(
+        "running full decoder forward (canvas={CANVAS_LEN}, kv={KV_LEN}, layers={})...",
+        m.config.text_config.num_hidden_layers
+    );
+    let started = std::time::Instant::now();
+    match model::decoder::forward(&m.weights, &m.config, &input, &mut scratch) {
+        Ok(out) => {
+            println!("decoder forward ok");
+            println!("  hidden shape: [{CANVAS_LEN}, {hidden}]");
+            println!("  logits shape: [{CANVAS_LEN}, {vocab}]");
+            println!("  elapsed: {:.2?}", started.elapsed());
+            println!(
+                "  hidden[0..4]: [{:.6}, {:.6}, {:.6}, {:.6}]",
+                out.hidden_states[0],
+                out.hidden_states[1],
+                out.hidden_states[2],
+                out.hidden_states[3]
+            );
+            println!(
+                "  logits[0,0..4]: [{:.6}, {:.6}, {:.6}, {:.6}]",
+                out.logits[0], out.logits[1], out.logits[2], out.logits[3]
+            );
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn run_layer0_forward(m: &model::Model) -> ExitCode {

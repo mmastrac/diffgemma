@@ -1,4 +1,4 @@
-use crate::config::TextConfig;
+use crate::config::{LayerType, TextConfig};
 use crate::safetensors::Error;
 use crate::tensor::TensorView;
 use crate::weights::WeightStore;
@@ -67,8 +67,9 @@ impl DecoderLayerKeys {
 pub struct DecoderLayerShapes {
     pub q_proj: [i64; 2],
     pub k_proj: [i64; 2],
-    pub v_proj: [i64; 2],
+    pub v_proj: Option<[i64; 2]>,
     pub o_proj: [i64; 2],
+    pub head_norm: [i64; 1],
     pub norm_1d: [i64; 1],
     pub mlp_gate_up: [i64; 2],
     pub mlp_down: [i64; 2],
@@ -78,26 +79,37 @@ pub struct DecoderLayerShapes {
 }
 
 impl DecoderLayerShapes {
-    pub fn from_config(cfg: &TextConfig) -> Self {
+    pub fn for_layer(cfg: &TextConfig, layer: usize) -> Result<Self, Error> {
+        let layer_type = cfg
+            .layer_types
+            .get(layer)
+            .ok_or(Error::Format("invalid layer index"))?;
         let h = cfg.hidden_size as i64;
-        let q = (cfg.num_attention_heads * cfg.head_dim) as i64;
-        let kv = (cfg.num_key_value_heads * cfg.head_dim) as i64;
+        let (head_dim, n_kv) = match layer_type {
+            LayerType::SlidingAttention => (cfg.head_dim, cfg.num_key_value_heads),
+            LayerType::FullAttention => (cfg.global_head_dim, cfg.num_global_key_value_heads),
+        };
+        let q = (cfg.num_attention_heads * head_dim) as i64;
+        let kv = (n_kv * head_dim) as i64;
         let moe = cfg.moe_intermediate_size as i64;
         let shared = cfg.intermediate_size as i64;
         let experts = cfg.num_experts as i64;
-
-        Self {
+        Ok(Self {
             q_proj: [q, h],
             k_proj: [kv, h],
-            v_proj: [kv, h],
+            v_proj: match layer_type {
+                LayerType::SlidingAttention => Some([kv, h]),
+                LayerType::FullAttention => None,
+            },
             o_proj: [h, q],
+            head_norm: [head_dim as i64],
             norm_1d: [h],
             mlp_gate_up: [shared, h],
             mlp_down: [h, shared],
             router_proj: [experts, h],
             experts_gate_up: [experts, moe * 2, h],
             experts_down: [experts, h, moe],
-        }
+        })
     }
 }
 
@@ -109,7 +121,7 @@ pub struct DecoderLayerWeights<'a> {
     pub k_norm: TensorView<'a>,
     pub q_proj: TensorView<'a>,
     pub k_proj: TensorView<'a>,
-    pub v_proj: TensorView<'a>,
+    pub v_proj: Option<TensorView<'a>>,
     pub o_proj: TensorView<'a>,
     pub post_attention_layernorm: TensorView<'a>,
     pub pre_feedforward_layernorm: TensorView<'a>,
@@ -131,16 +143,16 @@ pub struct DecoderLayerWeights<'a> {
 impl<'a> DecoderLayerWeights<'a> {
     pub fn load(store: &'a WeightStore, layer: usize, cfg: &TextConfig) -> Result<Self, Error> {
         let keys = DecoderLayerKeys::new(layer);
-        let shapes = DecoderLayerShapes::from_config(cfg);
+        let shapes = DecoderLayerShapes::for_layer(cfg, layer)?;
 
         let input_layernorm = store.tensor(&keys.input_layernorm)?;
         input_layernorm.expect_shape(&shapes.norm_1d)?;
 
         let q_norm = store.tensor(&keys.q_norm)?;
-        q_norm.expect_shape(&[cfg.head_dim as i64])?;
+        q_norm.expect_shape(&shapes.head_norm)?;
 
         let k_norm = store.tensor(&keys.k_norm)?;
-        k_norm.expect_shape(&[cfg.head_dim as i64])?;
+        k_norm.expect_shape(&shapes.head_norm)?;
 
         let q_proj = store.tensor(&keys.q_proj)?;
         q_proj.expect_shape(&shapes.q_proj)?;
@@ -148,8 +160,14 @@ impl<'a> DecoderLayerWeights<'a> {
         let k_proj = store.tensor(&keys.k_proj)?;
         k_proj.expect_shape(&shapes.k_proj)?;
 
-        let v_proj = store.tensor(&keys.v_proj)?;
-        v_proj.expect_shape(&shapes.v_proj)?;
+        let v_proj = match shapes.v_proj {
+            Some(shape) => {
+                let v = store.tensor(&keys.v_proj)?;
+                v.expect_shape(&shape)?;
+                Some(v)
+            }
+            None => None,
+        };
 
         let o_proj = store.tensor(&keys.o_proj)?;
         o_proj.expect_shape(&shapes.o_proj)?;

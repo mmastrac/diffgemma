@@ -1,7 +1,12 @@
 pub mod attention;
+pub mod decoder;
 pub mod decoder_layer;
+pub mod embed;
+pub mod kv_cache;
 pub mod layer_weights;
+pub mod mask;
 pub mod moe;
+pub mod self_conditioning;
 
 use crate::config::ModelConfig;
 use crate::safetensors::Error;

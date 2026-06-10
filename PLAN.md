@@ -164,7 +164,7 @@ cargo run -- layer0    # validate all 22 layer-0 tensors vs config shapes
 
 ---
 
-## Phase 4 — Full decoder stack (CPU)
+## Phase 4 — Full decoder stack (CPU) ✅
 
 **Deliverable:** 30-layer decoder forward, bidirectional mask over canvas region.
 
@@ -177,6 +177,10 @@ cargo run -- layer0    # validate all 22 layer-0 tensors vs config shapes
 | Self-conditioning | `model.decoder.self_conditioning.*` wired per paper/model |
 
 **Exit criteria:** Forward on `seq=256` random token ids + dummy KV cache; logits shape correct.
+
+**Files:** `src/model/decoder.rs`, `src/model/mask.rs`, `src/model/kv_cache.rs`, `src/model/embed.rs`, `src/model/self_conditioning.rs`
+
+**Run:** `cargo run --release -- decoder` (canvas=256, dummy kv=128, ~7 min on Apple Silicon).
 
 ---
 
@@ -421,7 +425,7 @@ diffgemma-mps/
 | 1 | Config + tensor views | — ✅ |
 | 2 | CPU kernels tested | generic/blas ✅ |
 | 3 | Decoder layer 0 | generic/blas ✅ |
-| 4 | Full decoder forward | blas |
+| 4 | Full decoder forward | blas ✅ |
 | 5 | Encoder + KV cache | blas |
 | 6 | Entropy sampler + blocks | blas |
 | 7 | Tokenizer | blas |
