@@ -6,6 +6,7 @@ mod model;
 mod sample;
 mod safetensors;
 mod tensor;
+mod tokenizer;
 mod weights;
 
 use std::env;
@@ -32,17 +33,22 @@ enum Command {
         prompt_len: usize,
         max_new_tokens: usize,
     },
+    Tokenize(String),
 }
 
 fn main() -> ExitCode {
     let cli = parse_cli();
-    eprintln!("loading from {}", cli.model_dir.display());
-
-    match model::Model::open(&cli.model_dir) {
-        Ok(m) => run_command(&m, cli.command),
-        Err(err) => {
-            eprintln!("error: {err}");
-            ExitCode::FAILURE
+    match cli.command {
+        Command::Tokenize(text) => run_tokenize(&cli.model_dir, &text),
+        command => {
+            eprintln!("loading from {}", cli.model_dir.display());
+            match model::Model::open(&cli.model_dir) {
+                Ok(m) => run_command(&m, command),
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    ExitCode::FAILURE
+                }
+            }
         }
     }
 }
@@ -76,6 +82,7 @@ fn run_command(m: &model::Model, command: Command) -> ExitCode {
             prompt_len,
             max_new_tokens,
         } => run_generate(m, seed, steps, prompt_len, max_new_tokens),
+        Command::Tokenize(_) => ExitCode::FAILURE,
     }
 }
 
@@ -150,10 +157,17 @@ fn parse_cli() -> Cli {
             prompt_len,
             max_new_tokens,
         },
+        Some("tokenize") => {
+            let text = positional.get(1).cloned().unwrap_or_else(|| {
+                eprintln!("usage: diffgemma-mps tokenize <text>");
+                std::process::exit(2);
+            });
+            Command::Tokenize(text)
+        }
         Some(cmd) => {
             eprintln!("unknown command: {cmd}");
             eprintln!(
-                "usage: diffgemma-mps [summary|config|weights <name>|layer0|decoder|prefill|generate]"
+                "usage: diffgemma-mps [summary|config|weights <name>|layer0|decoder|prefill|generate|tokenize <text>]"
             );
             eprintln!("  generate options: --seed N --steps N --prompt-len N --max-new-tokens N");
             std::process::exit(2);
@@ -320,6 +334,25 @@ fn run_decoder_forward(m: &model::Model) -> ExitCode {
                 "  logits[0,0..4]: [{:.6}, {:.6}, {:.6}, {:.6}]",
                 out.logits[0], out.logits[1], out.logits[2], out.logits[3]
             );
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_tokenize(model_dir: &PathBuf, text: &str) -> ExitCode {
+    let path = model_dir.join("tokenizer.json");
+    match tokenizer::Tokenizer::load(&path) {
+        Ok(tok) => {
+            let ids = tok.encode(text, false);
+            let payload = serde_json::json!({
+                "text": text,
+                "ids": ids,
+            });
+            println!("{}", serde_json::to_string(&payload).unwrap_or_default());
             ExitCode::SUCCESS
         }
         Err(err) => {

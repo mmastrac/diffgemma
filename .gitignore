@@ -1,2 +1,5 @@
 /target
 /model
+/python/.venv/
+__pycache__/
+*.pyc

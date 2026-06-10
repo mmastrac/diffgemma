@@ -247,6 +247,14 @@ cargo run --release -- generate --seed 42 --steps 2 --prompt-len 8 --max-new-tok
 
 **Exit criteria:** Encode `"Hello"` matches Python `AutoTokenizer` ids.
 
+**Status:** ✅ Done — `src/tokenizer.rs`, `tokenize` CLI, `python/` uv parity tests.
+
+**Run:**
+```bash
+cargo run --release -- tokenize "Hello"
+cd python && uv sync && uv run pytest -q
+```
+
 ---
 
 ## Phase 8 — Metal bootstrap
@@ -368,7 +376,7 @@ diffgemma-mps --benchmark --features metal
 | Generation tests | 2-step denoise, fixed seed, compare token ids |
 | Metal regression | CPU vs GPU max abs diff per tensor type |
 
-**Reference workflow:** Python venv with `transformers` + `diffusion_gemma` in `./venv/` (gitignored). One-off scripts in `debug/`, not runtime deps.
+**Reference workflow:** Locked Python env in `python/` via `uv` (`uv.lock` committed). Parity tests in `python/tests/`; one-off scripts in `debug/` if needed.
 
 **Do not commit:** `model/`, `venv/`, downloaded weights.
 

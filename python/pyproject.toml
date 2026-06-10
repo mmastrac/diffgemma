@@ -1,0 +1,11 @@
+[project]
+name = "diffgemma-parity"
+version = "0.1.0"
+description = "Reproducible HuggingFace parity tests for diffgemma-mps"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pytest>=9.0.3",
+    "tokenizers>=0.22.2",
+    "transformers>=5.11.0",
+]
