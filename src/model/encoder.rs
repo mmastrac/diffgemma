@@ -1,6 +1,10 @@
 use crate::config::ModelConfig;
 use crate::kernels::cpu::rms_norm_rows;
-use crate::model::decoder_layer::{forward_encoder as layer_forward_encoder, DecoderLayerScratch};
+use crate::model::decoder_layer::{
+    forward_encoder as layer_forward_encoder, forward_encoder_extend as layer_forward_encoder_extend,
+    DecoderLayerScratch,
+};
+use crate::model::kv_cache::LayerKvView;
 use crate::model::embed::embed_tokens;
 use crate::model::kv_cache::KvCache;
 use crate::model::layer_weights::DecoderLayerWeights;
@@ -52,7 +56,7 @@ pub fn prefill(
     let embed = store.tensor("model.decoder.embed_tokens.weight")?;
     embed.expect_shape(&[text.vocab_size as i64, hidden as i64])?;
     embed_tokens(
-        &mut scratch.embed_buf,
+        &mut scratch.embed_buf[..seq_len * hidden],
         input.token_ids,
         embed.bf16()?,
         hidden,
@@ -64,48 +68,153 @@ pub fn prefill(
         .map(|i| input.position_offset + i)
         .collect();
 
-    let mut in_buf = &mut scratch.hidden_a;
-    let mut out_buf = &mut scratch.hidden_b;
-    in_buf.copy_from_slice(&scratch.embed_buf);
+    scratch.hidden_a[..seq_len * hidden]
+        .copy_from_slice(&scratch.embed_buf[..seq_len * hidden]);
 
+    let mut use_a_input = true;
     for layer in 0..text.num_hidden_layers {
         let weights = DecoderLayerWeights::load(store, layer, text)?;
         let mut layer_scratch = DecoderLayerScratch::new(seq_len, text, layer)?;
         let kv_layer = kv_cache
             .layer_mut(layer)
             .ok_or(Error::Format("missing kv layer"))?;
-        layer_forward_encoder(
-            out_buf,
-            in_buf,
-            &weights,
-            text,
-            layer,
-            seq_len,
-            &positions,
-            kv_layer,
-            &mut layer_scratch,
-        )?;
-        std::mem::swap(&mut in_buf, &mut out_buf);
+        if use_a_input {
+            layer_forward_encoder(
+                &mut scratch.hidden_b[..seq_len * hidden],
+                &scratch.hidden_a[..seq_len * hidden],
+                &weights,
+                text,
+                layer,
+                seq_len,
+                &positions,
+                kv_layer,
+                &mut layer_scratch,
+            )?;
+        } else {
+            layer_forward_encoder(
+                &mut scratch.hidden_a[..seq_len * hidden],
+                &scratch.hidden_b[..seq_len * hidden],
+                &weights,
+                text,
+                layer,
+                seq_len,
+                &positions,
+                kv_layer,
+                &mut layer_scratch,
+            )?;
+        }
+        use_a_input = !use_a_input;
     }
 
     kv_cache.kv_len = seq_len;
     kv_cache.validate_dims(text)?;
 
+    let layer_out = if use_a_input {
+        &scratch.hidden_b[..seq_len * hidden]
+    } else {
+        &scratch.hidden_a[..seq_len * hidden]
+    };
+
     scratch.norm_w = store.tensor("model.decoder.norm.weight")?.bf16()?.to_f32_vec();
+    let mut hidden_out = vec![0.0f32; seq_len * hidden];
     rms_norm_rows(
-        out_buf,
-        in_buf,
+        &mut hidden_out,
+        layer_out,
         &scratch.norm_w,
         seq_len,
         hidden,
         text.rms_norm_eps as f32,
     );
 
-    let mut hidden_out = vec![0.0f32; seq_len * hidden];
-    hidden_out.copy_from_slice(out_buf);
-
     Ok(EncoderPrefillOutput {
         kv_cache,
         hidden_states: hidden_out,
     })
+}
+
+/// Extend encoder KV cache with new prompt/canvas tokens (incremental prefill).
+pub fn extend_prefill(
+    store: &WeightStore,
+    cfg: &ModelConfig,
+    kv_cache: &mut KvCache,
+    token_ids: &[u32],
+    scratch: &mut EncoderScratch,
+) -> Result<(), Error> {
+    let text = &cfg.text_config;
+    let seq_len = token_ids.len();
+    if seq_len == 0 {
+        return Ok(());
+    }
+    let hidden = text.hidden_size;
+    let embed_scale = (hidden as f32).sqrt();
+    let position_offset = kv_cache.kv_len as i64;
+
+    let embed = store.tensor("model.decoder.embed_tokens.weight")?;
+    embed.expect_shape(&[text.vocab_size as i64, hidden as i64])?;
+    embed_tokens(
+        &mut scratch.embed_buf[..seq_len * hidden],
+        token_ids,
+        embed.bf16()?,
+        hidden,
+        embed_scale,
+    )?;
+
+    let positions: Vec<i64> = (0..seq_len as i64)
+        .map(|i| position_offset + i)
+        .collect();
+
+    scratch.hidden_a[..seq_len * hidden]
+        .copy_from_slice(&scratch.embed_buf[..seq_len * hidden]);
+
+    let kv_len_before = kv_cache.kv_len;
+    let mut use_a_input = true;
+    for layer in 0..text.num_hidden_layers {
+        let weights = DecoderLayerWeights::load(store, layer, text)?;
+        let mut layer_scratch =
+            DecoderLayerScratch::with_kv_len(seq_len, text, layer, kv_len_before)?;
+        let kv_view = {
+            let kv_layer = kv_cache
+                .layer(layer)
+                .ok_or(Error::Format("missing kv layer"))?;
+            LayerKvView::from_layer(kv_layer, kv_len_before)
+        };
+        if use_a_input {
+            layer_forward_encoder_extend(
+                &mut scratch.hidden_b[..seq_len * hidden],
+                &scratch.hidden_a[..seq_len * hidden],
+                &weights,
+                text,
+                layer,
+                seq_len,
+                &positions,
+                kv_view,
+                &mut layer_scratch,
+            )?;
+        } else {
+            layer_forward_encoder_extend(
+                &mut scratch.hidden_a[..seq_len * hidden],
+                &scratch.hidden_b[..seq_len * hidden],
+                &weights,
+                text,
+                layer,
+                seq_len,
+                &positions,
+                kv_view,
+                &mut layer_scratch,
+            )?;
+        }
+        let kv_out = kv_cache
+            .layer_mut(layer)
+            .ok_or(Error::Format("missing kv layer"))?;
+        kv_out.append_kv(
+            &layer_scratch.attn.k,
+            &layer_scratch.attn.v,
+            seq_len,
+        )?;
+        use_a_input = !use_a_input;
+    }
+
+    kv_cache.kv_len += seq_len;
+    kv_cache.validate_dims(text)?;
+    Ok(())
 }

@@ -2,7 +2,8 @@ use crate::config::TextConfig;
 use crate::kernels::cpu::{gelu_pytorch_tanh, linear, rms_norm_rows};
 use crate::model::attention::{
     forward as attention_forward, forward_decoder as attention_forward_decoder,
-    forward_encoder as attention_forward_encoder, AttentionScratch,
+    forward_encoder as attention_forward_encoder,
+    forward_encoder_extend as attention_forward_encoder_extend, AttentionScratch,
 };
 use crate::model::kv_cache::{LayerKv, LayerKvView};
 use crate::model::mask::DecoderAttnMask;
@@ -260,6 +261,152 @@ pub fn forward_encoder(
         seq_len,
         positions,
         kv_out,
+        &mut scratch.attn,
+    )?;
+    rms_norm_rows(
+        &mut scratch.normed,
+        &scratch.attn_out,
+        &scratch.post_attn_norm_w,
+        seq_len,
+        hidden,
+        eps,
+    );
+    for i in 0..scratch.normed.len() {
+        scratch.normed[i] += scratch.residual[i];
+    }
+
+    scratch.residual.copy_from_slice(&scratch.normed);
+    rms_norm_rows(
+        &mut scratch.normed,
+        &scratch.residual,
+        &scratch.pre_ff_norm_w,
+        seq_len,
+        hidden,
+        eps,
+    );
+    linear(
+        &mut scratch.gate,
+        &scratch.normed,
+        &scratch.mlp_gate_w,
+        None,
+        seq_len,
+        hidden,
+        inter,
+    );
+    linear(
+        &mut scratch.mlp_hidden,
+        &scratch.normed,
+        &scratch.mlp_up_w,
+        None,
+        seq_len,
+        hidden,
+        inter,
+    );
+    gelu_pytorch_tanh(&mut scratch.gate);
+    for i in 0..scratch.mlp_hidden.len() {
+        scratch.mlp_hidden[i] *= scratch.gate[i];
+    }
+    linear(
+        &mut scratch.dense_out,
+        &scratch.mlp_hidden,
+        &scratch.mlp_down_w,
+        None,
+        seq_len,
+        inter,
+        hidden,
+    );
+
+    rms_norm_rows(
+        &mut scratch.normed,
+        &scratch.dense_out,
+        &scratch.post_ff_norm_1_w,
+        seq_len,
+        hidden,
+        eps,
+    );
+
+    let routes = route(&scratch.residual, weights, cfg, seq_len, &mut scratch.moe)?;
+    prepare_expert_input(
+        &mut scratch.moe_input,
+        &scratch.residual,
+        &scratch.pre_ff_norm_2_w,
+        seq_len,
+        hidden,
+        eps,
+    );
+    experts_forward(
+        &mut scratch.moe_branch,
+        &scratch.moe_input,
+        weights,
+        cfg,
+        seq_len,
+        &routes,
+        &mut scratch.moe,
+    )?;
+    scratch.dense_out.copy_from_slice(&scratch.moe_branch);
+    rms_norm_rows(
+        &mut scratch.moe_branch,
+        &scratch.dense_out,
+        &scratch.post_ff_norm_2_w,
+        seq_len,
+        hidden,
+        eps,
+    );
+
+    for i in 0..scratch.normed.len() {
+        scratch.normed[i] += scratch.moe_branch[i];
+    }
+
+    rms_norm_rows(
+        out,
+        &scratch.normed,
+        &scratch.post_ff_norm_w,
+        seq_len,
+        hidden,
+        eps,
+    );
+    for i in 0..out.len() {
+        out[i] += scratch.residual[i];
+    }
+
+    let layer_scalar = weights.layer_scalar.bf16_scalar()?;
+    for v in out.iter_mut() {
+        *v *= layer_scalar;
+    }
+    Ok(())
+}
+
+pub fn forward_encoder_extend(
+    out: &mut [f32],
+    hidden_states: &[f32],
+    weights: &DecoderLayerWeights<'_>,
+    cfg: &TextConfig,
+    layer: usize,
+    seq_len: usize,
+    positions: &[i64],
+    kv: LayerKvView<'_>,
+    scratch: &mut DecoderLayerScratch,
+) -> Result<(), Error> {
+    let hidden = cfg.hidden_size;
+    let inter = cfg.intermediate_size;
+    let eps = cfg.rms_norm_eps as f32;
+
+    assert_eq!(hidden_states.len(), seq_len * hidden);
+    assert_eq!(out.len(), seq_len * hidden);
+    assert_eq!(positions.len(), seq_len);
+
+    scratch.load_norm_and_mlp(weights)?;
+
+    scratch.residual.copy_from_slice(hidden_states);
+    attention_forward_encoder_extend(
+        &mut scratch.attn_out,
+        hidden_states,
+        weights,
+        cfg,
+        layer,
+        seq_len,
+        positions,
+        kv,
         &mut scratch.attn,
     )?;
     rms_norm_rows(

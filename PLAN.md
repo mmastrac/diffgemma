@@ -225,6 +225,13 @@ cargo run -- layer0    # validate all 22 layer-0 tensors vs config shapes
 
 **Exit criteria:** Greedy-ish run on tiny prompt produces deterministic output (fixed seed); compare token ids to Python reference on 1–2 steps.
 
+**Status:** ✅ Done — `src/sample.rs`, `src/generate.rs`, `encoder::extend_prefill`, `generate` CLI.
+
+**Run:**
+```bash
+cargo run --release -- generate --seed 42 --steps 2 --prompt-len 8 --max-new-tokens 256
+```
+
 ---
 
 ## Phase 7 — Tokenizer

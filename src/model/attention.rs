@@ -241,6 +241,158 @@ pub fn forward(
     Ok(())
 }
 
+/// Incremental encoder prefill: causal attention over cached KV + new tokens; appends K/V.
+pub fn forward_encoder_extend(
+    out: &mut [f32],
+    hidden: &[f32],
+    weights: &DecoderLayerWeights<'_>,
+    cfg: &TextConfig,
+    layer: usize,
+    seq_len: usize,
+    positions: &[i64],
+    kv: LayerKvView<'_>,
+    scratch: &mut AttentionScratch,
+) -> Result<(), Error> {
+    let hidden_size = cfg.hidden_size;
+    let eps = cfg.rms_norm_eps as f32;
+    let params = AttentionParams::for_layer(cfg, layer)?;
+    let q_dim = params.n_heads * params.head_dim;
+    let kv_dim = params.n_kv_heads * params.head_dim;
+    let total_kv = scratch.total_kv_len;
+    let kv_cache_len = kv.kv_len;
+
+    assert_eq!(hidden.len(), seq_len * hidden_size);
+    assert_eq!(out.len(), seq_len * hidden_size);
+    assert_eq!(positions.len(), seq_len);
+    assert_eq!(kv_cache_len + seq_len, total_kv);
+
+    scratch.load_weights(weights)?;
+
+    let input_norm_w = weights.input_layernorm.bf16()?.to_f32_vec();
+    rms_norm_rows(
+        &mut scratch.normed,
+        hidden,
+        &input_norm_w,
+        seq_len,
+        hidden_size,
+        eps,
+    );
+
+    linear(
+        &mut scratch.q,
+        &scratch.normed,
+        &scratch.q_w,
+        None,
+        seq_len,
+        hidden_size,
+        q_dim,
+    );
+    linear(
+        &mut scratch.k,
+        &scratch.normed,
+        &scratch.k_w,
+        None,
+        seq_len,
+        hidden_size,
+        kv_dim,
+    );
+    if let Some(v_w) = &scratch.v_w {
+        linear(
+            &mut scratch.v,
+            &scratch.normed,
+            v_w,
+            None,
+            seq_len,
+            hidden_size,
+            kv_dim,
+        );
+    } else {
+        scratch.v.copy_from_slice(&scratch.k);
+    }
+
+    {
+        let q_norm_w = scratch.q_norm_w.clone();
+        let k_norm_w = scratch.k_norm_w.clone();
+        normalize_qkv_heads(
+            &mut scratch.q,
+            &mut scratch.k,
+            &mut scratch.v,
+            seq_len,
+            &params,
+            eps,
+            &mut scratch.head_buf,
+            &q_norm_w,
+            &k_norm_w,
+        );
+    }
+
+    let rope_kind = rope_kind_for_layer(cfg, layer).ok_or(Error::Format("rope kind"))?;
+    compute_rope_freqs(&mut scratch.rope_freqs, positions, rope_kind);
+    apply_rope_tensor(
+        &mut scratch.q,
+        seq_len,
+        params.n_heads,
+        params.head_dim,
+        &scratch.rope_freqs,
+        params.rotary_dim,
+    );
+    apply_rope_tensor(
+        &mut scratch.k,
+        seq_len,
+        params.n_kv_heads,
+        params.head_dim,
+        &scratch.rope_freqs,
+        params.rotary_dim,
+    );
+
+    concat_kv_cache(
+        &mut scratch.k_full,
+        &mut scratch.v_full,
+        kv,
+        &scratch.k,
+        &scratch.v,
+        &params,
+    );
+
+    attention_scores_gqa_ext(
+        &mut scratch.scores,
+        &scratch.q,
+        &scratch.k_full,
+        seq_len,
+        total_kv,
+        &params,
+    );
+    apply_encoder_extend_mask(
+        &mut scratch.scores,
+        seq_len,
+        total_kv,
+        kv_cache_len,
+        positions,
+        &params,
+    );
+    softmax_rows(&mut scratch.scores, seq_len * params.n_heads, total_kv);
+
+    attention_output_gqa_ext(
+        &mut scratch.attn_out,
+        &scratch.scores,
+        &scratch.v_full,
+        seq_len,
+        total_kv,
+        &params,
+    );
+
+    linear(
+        out,
+        &scratch.attn_out,
+        &scratch.o_w,
+        None,
+        seq_len,
+        q_dim,
+        hidden_size,
+    );
+    Ok(())
+}
+
 /// Causal encoder attention; writes post-RoPE K/V into `kv_out` for decoder cross-attn.
 pub fn forward_encoder(
     out: &mut [f32],
@@ -494,6 +646,38 @@ fn attention_scores_gqa(
                     dot += q[q_off + d] * k[k_off + d];
                 }
                 row[ki] = dot;
+            }
+        }
+    }
+}
+
+fn apply_encoder_extend_mask(
+    scores: &mut [f32],
+    seq_len: usize,
+    total_kv: usize,
+    kv_cache_len: usize,
+    positions: &[i64],
+    params: &AttentionParams,
+) {
+    for qi in 0..seq_len {
+        let pos_q = positions[qi];
+        for h in 0..params.n_heads {
+            let row = &mut scores[(qi * params.n_heads + h) * total_kv..(qi * params.n_heads + h + 1) * total_kv];
+            for ki in 0..total_kv {
+                let pos_k = if ki < kv_cache_len {
+                    ki as i64
+                } else {
+                    positions[ki - kv_cache_len]
+                };
+                let mut masked = pos_k > pos_q;
+                if let Some(window) = params.sliding_window {
+                    if pos_k + window as i64 <= pos_q {
+                        masked = true;
+                    }
+                }
+                if masked {
+                    row[ki] = MASK_NEG;
+                }
             }
         }
     }

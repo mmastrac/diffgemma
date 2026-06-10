@@ -1,7 +1,9 @@
 mod config;
+mod generate;
 #[allow(dead_code)]
 mod kernels;
 mod model;
+mod sample;
 mod safetensors;
 mod tensor;
 mod weights;
@@ -24,6 +26,12 @@ enum Command {
     Layer0,
     Decoder,
     Prefill,
+    Generate {
+        seed: u64,
+        steps: usize,
+        prompt_len: usize,
+        max_new_tokens: usize,
+    },
 }
 
 fn main() -> ExitCode {
@@ -62,6 +70,12 @@ fn run_command(m: &model::Model, command: Command) -> ExitCode {
         Command::Layer0 => run_layer0_forward(m),
         Command::Decoder => run_decoder_forward(m),
         Command::Prefill => run_prefill(m),
+        Command::Generate {
+            seed,
+            steps,
+            prompt_len,
+            max_new_tokens,
+        } => run_generate(m, seed, steps, prompt_len, max_new_tokens),
     }
 }
 
@@ -69,12 +83,48 @@ fn parse_cli() -> Cli {
     let mut args = env::args().skip(1);
     let mut model_dir = PathBuf::from("model/transformer");
     let mut positional = Vec::new();
+    let mut seed = 42u64;
+    let mut steps = 2usize;
+    let mut prompt_len = 8usize;
+    let mut max_new_tokens = 256usize;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-m" | "--model" => {
                 if let Some(path) = args.next() {
                     model_dir = PathBuf::from(path);
+                }
+            }
+            "--seed" => {
+                if let Some(v) = args.next() {
+                    seed = v.parse().unwrap_or_else(|_| {
+                        eprintln!("invalid --seed");
+                        std::process::exit(2);
+                    });
+                }
+            }
+            "--steps" => {
+                if let Some(v) = args.next() {
+                    steps = v.parse().unwrap_or_else(|_| {
+                        eprintln!("invalid --steps");
+                        std::process::exit(2);
+                    });
+                }
+            }
+            "--prompt-len" => {
+                if let Some(v) = args.next() {
+                    prompt_len = v.parse().unwrap_or_else(|_| {
+                        eprintln!("invalid --prompt-len");
+                        std::process::exit(2);
+                    });
+                }
+            }
+            "--max-new-tokens" => {
+                if let Some(v) = args.next() {
+                    max_new_tokens = v.parse().unwrap_or_else(|_| {
+                        eprintln!("invalid --max-new-tokens");
+                        std::process::exit(2);
+                    });
                 }
             }
             _ => positional.push(arg),
@@ -94,9 +144,18 @@ fn parse_cli() -> Cli {
         Some("layer0") => Command::Layer0,
         Some("decoder") => Command::Decoder,
         Some("prefill") => Command::Prefill,
+        Some("generate") => Command::Generate {
+            seed,
+            steps,
+            prompt_len,
+            max_new_tokens,
+        },
         Some(cmd) => {
             eprintln!("unknown command: {cmd}");
-            eprintln!("usage: diffgemma-mps [summary|config|weights <name>|layer0|decoder|prefill]");
+            eprintln!(
+                "usage: diffgemma-mps [summary|config|weights <name>|layer0|decoder|prefill|generate]"
+            );
+            eprintln!("  generate options: --seed N --steps N --prompt-len N --max-new-tokens N");
             std::process::exit(2);
         }
     };
@@ -261,6 +320,73 @@ fn run_decoder_forward(m: &model::Model) -> ExitCode {
                 "  logits[0,0..4]: [{:.6}, {:.6}, {:.6}, {:.6}]",
                 out.logits[0], out.logits[1], out.logits[2], out.logits[3]
             );
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_generate(
+    m: &model::Model,
+    seed: u64,
+    steps: usize,
+    prompt_len: usize,
+    max_new_tokens: usize,
+) -> ExitCode {
+    let vocab = m.config.text_config.vocab_size;
+    let canvas = m.config.canvas_length;
+
+    let mut prompt = vec![0u32; prompt_len];
+    for (i, id) in prompt.iter_mut().enumerate() {
+        *id = ((i * 131 + 7) % vocab.max(1)) as u32;
+    }
+
+    let enc_seq = prompt_len.max(canvas);
+    let mut enc_scratch = model::encoder::EncoderScratch::new(enc_seq, &m.config);
+    let mut dec_scratch = model::decoder::DecoderScratch::new(canvas, &m.config);
+
+    let gen_cfg = generate::GenerateConfig {
+        sampler: sample::SamplerConfig {
+            max_denoising_steps: steps.max(1),
+            ..sample::SamplerConfig::default()
+        },
+        max_new_tokens,
+        seed,
+    };
+
+    eprintln!(
+        "running generate (prompt_len={prompt_len}, canvas={canvas}, steps={steps}, max_new_tokens={max_new_tokens}, seed={seed})..."
+    );
+    let started = std::time::Instant::now();
+    match generate::generate(&m.weights, &m.config, &prompt, &gen_cfg, &mut enc_scratch, &mut dec_scratch)
+    {
+        Ok(out) => {
+            let new_tokens = out.token_ids.len().saturating_sub(prompt_len);
+            println!("generate ok");
+            println!("  total tokens: {}", out.token_ids.len());
+            println!("  new tokens:   {new_tokens}");
+            println!("  denoise steps run: {}", out.denoise_steps_run);
+            println!("  blocks committed:  {}", out.blocks_committed);
+            println!("  kv after last block: {}", out.token_ids.len());
+            println!("  elapsed: {:.2?}", started.elapsed());
+            let preview: Vec<String> = out
+                .token_ids
+                .iter()
+                .take(16)
+                .map(|t| t.to_string())
+                .collect();
+            println!("  token_ids[0..16]: [{}]", preview.join(", "));
+            if out.token_ids.len() > 16 {
+                let tail_start = out.token_ids.len().saturating_sub(8);
+                let tail: Vec<String> = out.token_ids[tail_start..]
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect();
+                println!("  token_ids[last 8]: [{}]", tail.join(", "));
+            }
             ExitCode::SUCCESS
         }
         Err(err) => {
