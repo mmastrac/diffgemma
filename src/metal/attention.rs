@@ -31,6 +31,7 @@ struct GqaParams {
     mask_neg: f32,
     rotary_dim: u32,
     num_heads_rope: u32,
+    elem_offset: u32,
 }
 
 pub struct GpuAttentionKernels {
@@ -111,6 +112,7 @@ impl GpuAttention {
             mask_neg: MASK_NEG,
             rotary_dim: rotary_dim as u32,
             num_heads_rope: num_heads as u32,
+            elem_offset: 0,
         };
 
         run_kernel(
@@ -184,6 +186,7 @@ impl GpuAttention {
             mask_neg: MASK_NEG,
             rotary_dim: rotary_dim as u32,
             num_heads_rope: n_heads as u32,
+            elem_offset: 0,
         };
         let rope_k = GqaParams {
             num_heads_rope: n_kv_heads as u32,
@@ -308,6 +311,7 @@ impl GpuAttention {
             mask_neg: MASK_NEG,
             rotary_dim: params.rotary_dim as u32,
             num_heads_rope: 0,
+            elem_offset: 0,
         };
 
         run_kernel(

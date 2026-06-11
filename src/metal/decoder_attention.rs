@@ -1,6 +1,6 @@
 use crate::config::TextConfig;
 use crate::kernels::cpu::{compute_rope_freqs, rope_kind_for_layer};
-use crate::metal::attention_batch::{gqa_batched, gqa_batched_gpu_kv, rope_qk_batched};
+use crate::metal::attention_batch::{decoder_gqa_gpu_kv_batched, gqa_batched, rope_qk_batched};
 use crate::metal::batched_kernels::{self as bk};
 use crate::metal::batch::GpuBatch;
 use crate::metal::engine::GpuDecoderEngine;
@@ -122,28 +122,28 @@ pub fn forward_decoder_attention(
     let rope_kind = rope_kind_for_layer(cfg, layer).ok_or(Error::Format("rope kind"))?;
     compute_rope_freqs(&mut scratch.rope_freqs, positions, rope_kind);
 
-    {
-        let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
-        rope_qk_batched(
-            &mut batch,
-            &engine.attention,
-            &mut scratch.q,
-            &mut scratch.k,
-            &scratch.rope_freqs,
-            seq_len,
-            params.n_heads,
-            params.n_kv_heads,
-            params.head_dim,
-            params.rotary_dim,
-        )?;
-        batch.end()?;
-    }
-
     let use_gpu_kv = gpu_kv
         .map(|g| g.kv_len == kv.kv_len)
         .unwrap_or(false);
 
     if !use_gpu_kv {
+        {
+            let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
+            rope_qk_batched(
+                &mut batch,
+                &engine.attention,
+                &mut scratch.q,
+                &mut scratch.k,
+                &scratch.rope_freqs,
+                seq_len,
+                params.n_heads,
+                params.n_kv_heads,
+                params.head_dim,
+                params.rotary_dim,
+            )?;
+            batch.end()?;
+        }
+
         concat_kv_for_decoder(
             &mut scratch.k_full,
             &mut scratch.v_full,
@@ -165,16 +165,19 @@ pub fn forward_decoder_attention(
 
     if use_gpu_kv {
         let gpu_kv = gpu_kv.expect("gpu kv");
-        gpu_kv.write_canvas_kv(layer, seq_len, &scratch.k, &scratch.v)?;
+        gpu_kv.write_canvas_kv_pre_rope(layer, seq_len, &scratch.k, &scratch.v)?;
+        let k_canvas_off = gpu_kv.canvas_k_elem_offset(layer)?;
         let (k_buf, v_buf) = gpu_kv.layer_buffers(layer)?;
         let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
-        gqa_batched_gpu_kv(
+        decoder_gqa_gpu_kv_batched(
             &mut batch,
             &engine.attention,
             &mut scratch.attn_out,
             &scratch.q,
             k_buf,
             v_buf,
+            k_canvas_off,
+            &scratch.rope_freqs,
             seq_len,
             total_kv,
             &params,

@@ -74,7 +74,16 @@ impl GpuKvCache {
         Ok(())
     }
 
-    pub fn write_canvas_kv(
+    pub fn canvas_k_elem_offset(&self, layer: usize) -> Result<usize, Error> {
+        let gpu = self
+            .layers
+            .get(layer)
+            .ok_or(Error::Format("missing gpu kv layer"))?;
+        Ok(self.kv_len * gpu.kv_dim)
+    }
+
+    /// Upload pre-RoPE canvas K and raw V into the suffix of the GPU KV buffers.
+    pub fn write_canvas_kv_pre_rope(
         &self,
         layer: usize,
         canvas_len: usize,

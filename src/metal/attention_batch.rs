@@ -28,6 +28,7 @@ struct GqaParams {
     mask_neg: f32,
     rotary_dim: u32,
     num_heads_rope: u32,
+    elem_offset: u32,
 }
 
 pub fn rope_qk_batched(
@@ -66,6 +67,7 @@ pub fn rope_qk_batched(
         mask_neg: MASK_NEG,
         rotary_dim: rotary_dim as u32,
         num_heads_rope: n_heads as u32,
+        elem_offset: 0,
     };
     let rope_k = GqaParams {
         num_heads_rope: n_kv_heads as u32,
@@ -78,6 +80,86 @@ pub fn rope_qk_batched(
     batch.register_read(buf_q, q);
     batch.register_read(buf_k, k);
     Ok(())
+}
+
+/// RoPE canvas K in-place at `k_canvas_elem_offset` within `k_buf`, RoPE Q in pool buffer, then GQA.
+/// `k_buf`/`v_buf` must already hold encoder prefix; canvas V written at the same suffix offset.
+pub fn decoder_gqa_gpu_kv_batched(
+    batch: &mut GpuBatch<'_>,
+    kernels: &GpuAttentionKernels,
+    attn_out: &mut [f32],
+    q_pre_rope: &[f32],
+    k_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    v_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    k_canvas_elem_offset: usize,
+    freqs: &[f32],
+    seq_len: usize,
+    total_kv: usize,
+    params: &AttentionParams,
+    mask: GqaMask<'_>,
+) -> Result<(), Error> {
+    let q_dim = seq_len * params.n_heads * params.head_dim;
+    let out_dim = seq_len * params.n_heads * params.head_dim;
+    if q_pre_rope.len() != q_dim || attn_out.len() != out_dim {
+        return Err(Error::Format("decoder gpu kv gqa shape mismatch"));
+    }
+
+    let buf_q = batch.alloc_f32(q_pre_rope)?;
+    let buf_f = batch.alloc_f32(freqs)?;
+
+    let rope_base = GqaParams {
+        seq_len: seq_len as u32,
+        total_kv: 0,
+        n_heads: 0,
+        n_kv_heads: 0,
+        head_dim: params.head_dim as u32,
+        n_groups: 0,
+        mask_kind: 0,
+        sliding_window: 0,
+        kv_cache_len: 0,
+        mask_neg: MASK_NEG,
+        rotary_dim: params.rotary_dim as u32,
+        num_heads_rope: params.n_heads as u32,
+        elem_offset: 0,
+    };
+    let rope_k = GqaParams {
+        num_heads_rope: params.n_kv_heads as u32,
+        elem_offset: k_canvas_elem_offset as u32,
+        ..rope_base
+    };
+
+    encode_rope(
+        batch,
+        &kernels.rope_pipeline.pipeline,
+        &buf_q,
+        &buf_f,
+        &rope_base,
+        params.n_heads,
+        seq_len,
+    );
+    encode_rope(
+        batch,
+        &kernels.rope_pipeline.pipeline,
+        &k_buf,
+        &buf_f,
+        &rope_k,
+        params.n_kv_heads,
+        seq_len,
+    );
+
+    gqa_batched_inner(
+        batch,
+        kernels,
+        attn_out,
+        q_pre_rope,
+        None,
+        Some((k_buf, v_buf)),
+        seq_len,
+        total_kv,
+        params,
+        mask,
+        Some(buf_q),
+    )
 }
 
 pub fn gqa_batched(
@@ -103,6 +185,7 @@ pub fn gqa_batched(
         total_kv,
         params,
         mask,
+        None,
     )
 }
 
@@ -130,6 +213,7 @@ pub fn gqa_batched_gpu_kv(
         total_kv,
         params,
         mask,
+        None,
     )
 }
 
@@ -144,6 +228,7 @@ fn gqa_batched_inner(
     total_kv: usize,
     params: &AttentionParams,
     mask: GqaMask<'_>,
+    q_gpu: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
 ) -> Result<(), Error> {
     let q_dim = seq_len * params.n_heads * params.head_dim;
     let kv_dim_elems = total_kv * params.n_kv_heads * params.head_dim;
@@ -169,7 +254,11 @@ fn gqa_batched_inner(
         GqaMask::DecoderBitmap(m) => (MASK_DECODER_BITMAP, m.kv_cache_len, None, Some(m)),
     };
 
-    let buf_q = batch.alloc_f32(q)?;
+    let buf_q = if let Some(buf) = q_gpu {
+        buf
+    } else {
+        batch.alloc_f32(q)?
+    };
     let (buf_k, buf_v) = match kv_cpu {
         Some((k, v)) => (batch.alloc_f32(k)?, batch.alloc_f32(v)?),
         None => kv_gpu.expect("gpu kv"),
@@ -201,6 +290,7 @@ fn gqa_batched_inner(
         mask_neg: MASK_NEG,
         rotary_dim: params.rotary_dim as u32,
         num_heads_rope: 0,
+        elem_offset: 0,
     };
 
     encode_gqa(

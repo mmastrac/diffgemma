@@ -14,6 +14,7 @@ struct GqaParams {
     float mask_neg;
     uint rotary_dim;
     uint num_heads_rope;
+    uint elem_offset;
 };
 
 constant uint MASK_CAUSAL_SLIDING = 0;
@@ -32,7 +33,7 @@ kernel void apply_rope_heads(
         return;
     }
 
-    uint off = (s * p.num_heads_rope + h) * p.head_dim;
+    uint off = p.elem_offset + (s * p.num_heads_rope + h) * p.head_dim;
     uint foff = s * p.rotary_dim;
     uint rot_half = p.rotary_dim / 2;
 
