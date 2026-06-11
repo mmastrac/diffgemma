@@ -971,6 +971,25 @@ fn build_prompt_tokens(
     }
 }
 
+fn print_generate_elapsed(label: &str, elapsed: std::time::Duration) {
+    let secs = elapsed.as_secs_f64();
+    println!("  {label} elapsed: {secs:.2}s ({elapsed:.2?})");
+}
+
+fn print_generate_timing_compare(
+    cpu_elapsed: std::time::Duration,
+    gpu_elapsed: std::time::Duration,
+) {
+    let cpu_s = cpu_elapsed.as_secs_f64();
+    let gpu_s = gpu_elapsed.as_secs_f64();
+    println!("timing:");
+    print_generate_elapsed("cpu (generate)", cpu_elapsed);
+    print_generate_elapsed("gpu (generate-gpu)", gpu_elapsed);
+    if gpu_s > 0.0 {
+        println!("  gpu speedup: {:.2}x", cpu_s / gpu_s);
+    }
+}
+
 fn print_generate_output(
     label: &str,
     out: &generate::GenerateOutput,
@@ -984,7 +1003,7 @@ fn print_generate_output(
     println!("  new tokens:   {new_tokens}");
     println!("  denoise steps run: {}", out.denoise_steps_run);
     println!("  blocks committed:  {}", out.blocks_committed);
-    println!("  elapsed: {elapsed:.2?}");
+    print_generate_elapsed(label, elapsed);
 
     if let Ok(tokenizer) = tokenizer::Tokenizer::load(model_dir.join("tokenizer.json")) {
         let text = tokenizer.decode(&out.token_ids);
@@ -1198,6 +1217,7 @@ fn run_generate_parity(
             }
         };
         let cpu_elapsed = cpu_started.elapsed();
+        eprintln!("CPU generate finished in {:.2}s ({cpu_elapsed:.2?})", cpu_elapsed.as_secs_f64());
 
         eprintln!("running GPU generate...");
         let gpu_started = std::time::Instant::now();
@@ -1218,6 +1238,7 @@ fn run_generate_parity(
             }
         };
         let gpu_elapsed = gpu_started.elapsed();
+        eprintln!("GPU generate finished in {:.2}s ({gpu_elapsed:.2?})", gpu_elapsed.as_secs_f64());
 
         if cpu_out.token_ids != gpu_out.token_ids {
             let first_diff = cpu_out
@@ -1242,8 +1263,7 @@ fn run_generate_parity(
         println!("  tokens: {}", cpu_out.token_ids.len());
         println!("  denoise steps: {}", cpu_out.denoise_steps_run);
         println!("  blocks: {}", cpu_out.blocks_committed);
-        println!("  cpu elapsed: {cpu_elapsed:.2?}");
-        println!("  gpu elapsed: {gpu_elapsed:.2?}");
+        print_generate_timing_compare(cpu_elapsed, gpu_elapsed);
         if let Ok(tokenizer) = tokenizer::Tokenizer::load(model_dir.join("tokenizer.json")) {
             let text = tokenizer.decode(&cpu_out.token_ids);
             if !text.is_empty() {
