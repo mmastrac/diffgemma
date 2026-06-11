@@ -61,6 +61,29 @@ impl GpuDecoderLayerScratch {
     }
 }
 
+fn rms_norm_batch(
+    engine: &mut GpuDecoderEngine,
+    out: &mut [f32],
+    x: &[f32],
+    weight: &[f32],
+    seq_len: usize,
+    hidden: usize,
+    eps: f32,
+) -> Result<(), Error> {
+    let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
+    bk::rms_norm_rows(
+        &mut batch,
+        &engine.kernels,
+        out,
+        x,
+        weight,
+        seq_len,
+        hidden,
+        eps,
+    )?;
+    batch.end()
+}
+
 pub fn forward_decoder(
     out: &mut [f32],
     hidden_states: &[f32],
@@ -76,7 +99,6 @@ pub fn forward_decoder(
     engine: &mut GpuDecoderEngine,
 ) -> Result<(), Error> {
     let hidden = cfg.hidden_size;
-    let inter = cfg.intermediate_size;
     let eps = cfg.rms_norm_eps as f32;
 
     attention_forward_decoder(
@@ -94,31 +116,32 @@ pub fn forward_decoder(
 
     scratch.residual.copy_from_slice(hidden_states);
 
-    // Batch 1: post-attn norm → dense gate/up linears
+    rms_norm_batch(
+        engine,
+        &mut scratch.normed,
+        &scratch.attn_out,
+        &cached.post_attn_norm,
+        seq_len,
+        hidden,
+        eps,
+    )?;
+    for i in 0..scratch.normed.len() {
+        scratch.normed[i] += scratch.residual[i];
+    }
+    scratch.residual.copy_from_slice(&scratch.normed);
+
+    rms_norm_batch(
+        engine,
+        &mut scratch.normed,
+        &scratch.residual,
+        &cached.pre_ff_norm,
+        seq_len,
+        hidden,
+        eps,
+    )?;
+
     {
         let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
-        bk::rms_norm_rows(
-            &mut batch,
-            &engine.kernels,
-            &mut scratch.normed,
-            &scratch.attn_out,
-            &cached.post_attn_norm,
-            seq_len,
-            hidden,
-            eps,
-        )?;
-        bk::vec_add_inplace(&mut batch, &engine.kernels, &mut scratch.normed, &scratch.residual)?;
-        scratch.residual.copy_from_slice(&scratch.normed);
-        bk::rms_norm_rows(
-            &mut batch,
-            &engine.kernels,
-            &mut scratch.normed,
-            &scratch.residual,
-            &cached.pre_ff_norm,
-            seq_len,
-            hidden,
-            eps,
-        )?;
         linear_cached_batched(
             &mut batch,
             &engine.f32_bf16_gemm_pipeline,
@@ -143,7 +166,6 @@ pub fn forward_decoder(
         scratch.mlp_hidden[i] *= scratch.gate[i];
     }
 
-    // Batch 2: down linear → post_ff_1 norm
     {
         let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
         linear_cached_batched(
@@ -154,42 +176,38 @@ pub fn forward_decoder(
             &cached.mlp_down,
             seq_len,
         )?;
-        bk::rms_norm_rows(
-            &mut batch,
-            &engine.kernels,
-            &mut scratch.normed,
-            &scratch.dense_out,
-            &cached.post_ff_norm_1,
-            seq_len,
-            hidden,
-            eps,
-        )?;
         batch.end()?;
     }
 
-    let routes = crate::model::moe::route(
+    rms_norm_batch(
+        engine,
+        &mut scratch.normed,
+        &scratch.dense_out,
+        &cached.post_ff_norm_1,
+        seq_len,
+        hidden,
+        eps,
+    )?;
+
+    let routes = crate::model::moe::route_with_cached_weights(
         &scratch.residual,
-        weights,
+        &cached.router_proj,
+        &cached.router_scale,
+        &cached.per_expert_scale,
         cfg,
         seq_len,
         &mut scratch.cpu.moe,
     )?;
 
-    // Batch 3: MoE input norm → expert GEMMs → final norms/add/scale
-    {
-        let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
-        bk::rms_norm_rows(
-            &mut batch,
-            &engine.kernels,
-            &mut scratch.moe_input,
-            &scratch.residual,
-            &cached.pre_ff_norm_2,
-            seq_len,
-            hidden,
-            eps,
-        )?;
-        batch.end()?;
-    }
+    rms_norm_batch(
+        engine,
+        &mut scratch.moe_input,
+        &scratch.residual,
+        &cached.pre_ff_norm_2,
+        seq_len,
+        hidden,
+        eps,
+    )?;
 
     experts_forward_gpu_batched(
         &mut scratch.moe_branch,
@@ -208,38 +226,35 @@ pub fn forward_decoder(
         &engine.f32_bf16_gemm_pipeline,
     )?;
 
-    {
-        let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
-        scratch.dense_out.copy_from_slice(&scratch.moe_branch);
-        bk::rms_norm_rows(
-            &mut batch,
-            &engine.kernels,
-            &mut scratch.moe_branch,
-            &scratch.dense_out,
-            &cached.post_ff_norm_2,
-            seq_len,
-            hidden,
-            eps,
-        )?;
-        bk::vec_add_inplace(
-            &mut batch,
-            &engine.kernels,
-            &mut scratch.normed,
-            &scratch.moe_branch,
-        )?;
-        bk::rms_norm_rows(
-            &mut batch,
-            &engine.kernels,
-            out,
-            &scratch.normed,
-            &cached.post_ff_norm,
-            seq_len,
-            hidden,
-            eps,
-        )?;
-        bk::vec_add_inplace(&mut batch, &engine.kernels, out, &scratch.residual)?;
-        bk::vec_scale_inplace(&mut batch, &engine.kernels, out, cached.layer_scalar)?;
-        batch.end()?;
+    scratch.dense_out.copy_from_slice(&scratch.moe_branch);
+    rms_norm_batch(
+        engine,
+        &mut scratch.moe_branch,
+        &scratch.dense_out,
+        &cached.post_ff_norm_2,
+        seq_len,
+        hidden,
+        eps,
+    )?;
+
+    for i in 0..scratch.normed.len() {
+        scratch.normed[i] += scratch.moe_branch[i];
+    }
+
+    rms_norm_batch(
+        engine,
+        out,
+        &scratch.normed,
+        &cached.post_ff_norm,
+        seq_len,
+        hidden,
+        eps,
+    )?;
+    for i in 0..out.len() {
+        out[i] += scratch.residual[i];
+    }
+    for v in out.iter_mut() {
+        *v *= cached.layer_scalar;
     }
 
     Ok(())

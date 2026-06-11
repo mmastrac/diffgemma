@@ -53,7 +53,11 @@ enum Command {
     Tokenize(String),
     Gemm { size: usize },
     Attention,
-    DecoderGpu,
+    DecoderGpu {
+        seq_len: usize,
+        kv_len: usize,
+        layers: usize,
+    },
     BenchDecoder {
         seq_len: usize,
         kv_len: usize,
@@ -103,7 +107,11 @@ fn run_command(m: &model::Model, model_dir: &std::path::Path, command: Command) 
         Command::Layer0 => run_layer0_forward(m),
         Command::Attention => run_attention_parity(m),
         Command::Decoder => run_decoder_forward(m),
-        Command::DecoderGpu => run_decoder_gpu_parity(m),
+        Command::DecoderGpu {
+            seq_len,
+            kv_len,
+            layers,
+        } => run_decoder_gpu_parity(m, seq_len, kv_len, layers),
         Command::BenchDecoder {
             seq_len,
             kv_len,
@@ -151,6 +159,9 @@ fn parse_cli() -> Cli {
     let mut bench_kv = 8usize;
     let mut bench_layers = 1usize;
     let mut bench_iters = 3usize;
+    let mut parity_seq: Option<usize> = None;
+    let mut parity_kv: Option<usize> = None;
+    let mut parity_layers: Option<usize> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -206,26 +217,32 @@ fn parse_cli() -> Cli {
             }
             "--seq" => {
                 if let Some(v) = args.next() {
-                    bench_seq = v.parse().unwrap_or_else(|_| {
+                    let n = v.parse().unwrap_or_else(|_| {
                         eprintln!("invalid --seq");
                         std::process::exit(2);
                     });
+                    bench_seq = n;
+                    parity_seq = Some(n);
                 }
             }
             "--kv" => {
                 if let Some(v) = args.next() {
-                    bench_kv = v.parse().unwrap_or_else(|_| {
+                    let n = v.parse().unwrap_or_else(|_| {
                         eprintln!("invalid --kv");
                         std::process::exit(2);
                     });
+                    bench_kv = n;
+                    parity_kv = Some(n);
                 }
             }
             "--layers" => {
                 if let Some(v) = args.next() {
-                    bench_layers = v.parse().unwrap_or_else(|_| {
+                    let n = v.parse().unwrap_or_else(|_| {
                         eprintln!("invalid --layers");
                         std::process::exit(2);
                     });
+                    bench_layers = n;
+                    parity_layers = Some(n);
                 }
             }
             "--iters" => {
@@ -284,7 +301,11 @@ fn parse_cli() -> Cli {
         }
         Some("gemm") => Command::Gemm { size: gemm_size },
         Some("attention") => Command::Attention,
-        Some("decoder-gpu") => Command::DecoderGpu,
+        Some("decoder-gpu") => Command::DecoderGpu {
+            seq_len: parity_seq.unwrap_or(256),
+            kv_len: parity_kv.unwrap_or(128),
+            layers: parity_layers.unwrap_or(0),
+        },
         Some("bench-decoder") => Command::BenchDecoder {
             seq_len: bench_seq,
             kv_len: bench_kv,
@@ -449,19 +470,24 @@ fn run_prefill(m: &model::Model) -> ExitCode {
     }
 }
 
-fn run_decoder_gpu_parity(m: &model::Model) -> ExitCode {
+fn run_decoder_gpu_parity(m: &model::Model, seq_len: usize, kv_len: usize, layers: usize) -> ExitCode {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     {
         use metal::{
-            decoder_forward as gpu_forward, load_weight_cache, GpuDecoderEngine, GpuDecoderScratch,
+            bench_forward, load_weight_cache, BenchConfig, GpuDecoderEngine, GpuDecoderScratch,
         };
         use model::decoder::{forward as cpu_forward, DecoderForwardInput, DecoderScratch};
 
-        const CANVAS_LEN: usize = 256;
-        const KV_LEN: usize = 128;
+        let canvas_len = seq_len;
+        let kv_len = kv_len;
+        let max_layers = if layers == 0 {
+            m.config.text_config.num_hidden_layers
+        } else {
+            layers.min(m.config.text_config.num_hidden_layers)
+        };
         let hidden = m.config.text_config.hidden_size;
 
-        let kv_cache = match model::kv_cache::KvCache::dummy(&m.config.text_config, KV_LEN, 42) {
+        let kv_cache = match model::kv_cache::KvCache::dummy(&m.config.text_config, kv_len, 42) {
             Ok(cache) => cache,
             Err(err) => {
                 eprintln!("error: {err}");
@@ -469,13 +495,13 @@ fn run_decoder_gpu_parity(m: &model::Model) -> ExitCode {
             }
         };
 
-        let mut token_ids = vec![0u32; CANVAS_LEN];
+        let mut token_ids = vec![0u32; canvas_len];
         let vocab = m.config.text_config.vocab_size;
         for (i, id) in token_ids.iter_mut().enumerate() {
             *id = ((i * 997 + 13) % vocab.max(1)) as u32;
         }
 
-        let mask = model::mask::DecoderAttnMask::all_valid(CANVAS_LEN, KV_LEN);
+        let mask = model::mask::DecoderAttnMask::all_valid(canvas_len, kv_len);
         let input = DecoderForwardInput {
             token_ids: &token_ids,
             kv_cache: &kv_cache,
@@ -483,8 +509,8 @@ fn run_decoder_gpu_parity(m: &model::Model) -> ExitCode {
             mask: Some(mask),
         };
 
-        let mut cpu_scratch = DecoderScratch::new(CANVAS_LEN, &m.config);
-        let mut gpu_scratch = GpuDecoderScratch::new(CANVAS_LEN, &m.config);
+        let mut cpu_scratch = DecoderScratch::new(canvas_len, &m.config);
+        let mut gpu_scratch = GpuDecoderScratch::new(canvas_len, &m.config);
         let gpu_weights = match load_weight_cache(&m.weights, &m.config.text_config) {
             Ok(w) => w,
             Err(err) => {
@@ -501,11 +527,16 @@ fn run_decoder_gpu_parity(m: &model::Model) -> ExitCode {
         };
 
         eprintln!(
-            "running CPU decoder forward (canvas={CANVAS_LEN}, kv={KV_LEN}, layers={})...",
-            m.config.text_config.num_hidden_layers
+            "running CPU decoder forward (canvas={canvas_len}, kv={kv_len}, layers={max_layers})..."
         );
         let cpu_started = std::time::Instant::now();
-        let cpu_out = match cpu_forward(&m.weights, &m.config, &input, &mut cpu_scratch) {
+        let cpu_out = match cpu_forward(
+            &m.weights,
+            &m.config,
+            &input,
+            &mut cpu_scratch,
+            Some(max_layers),
+        ) {
             Ok(out) => out,
             Err(err) => {
                 eprintln!("error: {err}");
@@ -516,13 +547,15 @@ fn run_decoder_gpu_parity(m: &model::Model) -> ExitCode {
 
         eprintln!("running GPU decoder forward...");
         let gpu_started = std::time::Instant::now();
-        let gpu_out = match gpu_forward(
+        let bench_cfg = BenchConfig { max_layers };
+        let gpu_out = match bench_forward(
             &m.weights,
             &m.config,
             &input,
             &mut gpu_scratch,
             &gpu_weights,
             &mut engine,
+            &bench_cfg,
         )
         {
             Ok(out) => out,
@@ -568,7 +601,8 @@ fn run_decoder_gpu_parity(m: &model::Model) -> ExitCode {
         }
 
         println!("decoder GPU parity ok");
-        println!("  hidden shape: [{CANVAS_LEN}, {hidden}]");
+        println!("  hidden shape: [{canvas_len}, {hidden}]");
+        println!("  layers: {max_layers}");
         println!("  cpu elapsed: {cpu_elapsed:.2?}");
         println!("  gpu elapsed: {gpu_elapsed:.2?}");
         println!("  max_abs_diff: {max_abs:.6} at index {max_idx}");
@@ -747,7 +781,7 @@ fn run_decoder_forward(m: &model::Model) -> ExitCode {
         m.config.text_config.num_hidden_layers
     );
     let started = std::time::Instant::now();
-    match model::decoder::forward(&m.weights, &m.config, &input, &mut scratch) {
+    match model::decoder::forward(&m.weights, &m.config, &input, &mut scratch, None) {
         Ok(out) => {
             println!("decoder forward ok");
             println!("  hidden shape: [{CANVAS_LEN}, {hidden}]");

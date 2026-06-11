@@ -95,6 +95,55 @@ pub fn route(
     Ok(routes)
 }
 
+/// Router using pre-cached f32 weights (no per-forward dequant).
+pub fn route_with_cached_weights(
+    residual: &[f32],
+    router_proj: &[f32],
+    router_scale: &[f32],
+    per_expert_scale: &[f32],
+    cfg: &TextConfig,
+    seq_len: usize,
+    scratch: &mut MoeScratch,
+) -> Result<Vec<RouteResult>, Error> {
+    let hidden = cfg.hidden_size;
+    let experts = cfg.num_experts;
+    let top_k = cfg.top_k_experts;
+    let eps = cfg.rms_norm_eps as f32;
+    let root = (hidden as f32).powf(-0.5);
+
+    assert_eq!(residual.len(), seq_len * hidden);
+
+    for s in 0..seq_len {
+        let off = s * hidden;
+        rms_norm_no_scale(
+            &mut scratch.router_input[off..off + hidden],
+            &residual[off..off + hidden],
+            eps,
+        );
+        for i in 0..hidden {
+            scratch.router_input[off + i] *= router_scale[i] * root;
+        }
+    }
+
+    crate::kernels::cpu::linear(
+        &mut scratch.router_logits,
+        &scratch.router_input,
+        router_proj,
+        None,
+        seq_len,
+        hidden,
+        experts,
+    );
+    softmax_rows(&mut scratch.router_logits, seq_len, experts);
+
+    let mut routes = Vec::with_capacity(seq_len);
+    for s in 0..seq_len {
+        let row = &scratch.router_logits[s * experts..(s + 1) * experts];
+        routes.push(top_k_route(row, top_k, per_expert_scale));
+    }
+    Ok(routes)
+}
+
 pub fn top_k_route(probs: &[f32], k: usize, per_expert_scale: &[f32]) -> RouteResult {
     let mut ranked: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));

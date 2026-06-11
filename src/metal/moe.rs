@@ -8,6 +8,14 @@ use crate::model::layer_weights::DecoderLayerWeights;
 use crate::model::moe::RouteResult;
 use crate::safetensors::Error;
 
+struct ExpertJob {
+    expert: usize,
+    tokens: Vec<(usize, f32)>,
+    gate_up_off: usize,
+    gate_act_off: usize,
+    out_off: usize,
+}
+
 pub fn experts_forward_gpu_batched(
     out: &mut [f32],
     expert_input: &[f32],
@@ -17,9 +25,9 @@ pub fn experts_forward_gpu_batched(
     _seq_len: usize,
     routes: &[RouteResult],
     batch_input: &mut Vec<f32>,
-    batch_gate_up: &mut Vec<f32>,
-    batch_gate_act: &mut Vec<f32>,
-    batch_out: &mut Vec<f32>,
+    gate_up_arena: &mut Vec<f32>,
+    gate_act_arena: &mut Vec<f32>,
+    out_arena: &mut Vec<f32>,
     ctx: &MetalContext,
     pool: &mut crate::metal::buffer::BufferPool,
     gemm_pipeline: &crate::metal::device::ComputePipeline,
@@ -39,32 +47,55 @@ pub fn experts_forward_gpu_batched(
         }
     }
 
-    let pipeline = &gemm_pipeline.pipeline;
-
+    let mut jobs: Vec<ExpertJob> = Vec::new();
+    let mut gate_up_len = 0usize;
+    let mut gate_act_len = 0usize;
+    let mut out_len = 0usize;
     for expert in 0..experts {
         let tokens = &buckets[expert];
         if tokens.is_empty() {
             continue;
         }
         let batch_size = tokens.len();
-        batch_input.resize(batch_size * hidden, 0.0);
-        batch_gate_up.resize(batch_size * moe_inter * 2, 0.0);
-        batch_gate_act.resize(batch_size * moe_inter, 0.0);
-        batch_out.resize(batch_size * hidden, 0.0);
+        jobs.push(ExpertJob {
+            expert,
+            tokens: tokens.clone(),
+            gate_up_off: gate_up_len,
+            gate_act_off: gate_act_len,
+            out_off: out_len,
+        });
+        gate_up_len += batch_size * moe_inter * 2;
+        gate_act_len += batch_size * moe_inter;
+        out_len += batch_size * hidden;
+    }
 
-        for (bi, &(tok, _)) in tokens.iter().enumerate() {
-            let src = tok * hidden;
-            let dst = bi * hidden;
-            batch_input[dst..dst + hidden].copy_from_slice(&expert_input[src..src + hidden]);
-        }
+    if jobs.is_empty() {
+        return Ok(());
+    }
 
-        {
-            let mut batch = GpuBatch::begin(&ctx.queue, pool, &ctx.device)?;
-            cached.with_expert_gate_up_t(gate_up, expert, |w_t| {
+    gate_up_arena.resize(gate_up_len, 0.0);
+    gate_act_arena.resize(gate_act_len, 0.0);
+    out_arena.resize(out_len, 0.0);
+
+    let pipeline = &gemm_pipeline.pipeline;
+
+    // Phase 1: all expert gate_up GEMMs in one GPU batch (one sync).
+    {
+        let mut batch = GpuBatch::begin(&ctx.queue, pool, &ctx.device)?;
+        for job in &jobs {
+            let batch_size = job.tokens.len();
+            batch_input.resize(batch_size * hidden, 0.0);
+            for (bi, &(tok, _)) in job.tokens.iter().enumerate() {
+                let src = tok * hidden;
+                let dst = bi * hidden;
+                batch_input[dst..dst + hidden].copy_from_slice(&expert_input[src..src + hidden]);
+            }
+            let gate_slice = &mut gate_up_arena[job.gate_up_off..job.gate_up_off + batch_size * moe_inter * 2];
+            cached.with_expert_gate_up_t(gate_up, job.expert, |w_t| {
                 f32_bf16_gemm(
                     &mut batch,
                     pipeline,
-                    batch_gate_up,
+                    gate_slice,
                     batch_input,
                     w_t,
                     batch_size,
@@ -72,41 +103,52 @@ pub fn experts_forward_gpu_batched(
                     moe_inter * 2,
                 )
             })?;
-            batch.end()?;
         }
+        batch.end()?;
+    }
 
+    for job in &jobs {
+        let batch_size = job.tokens.len();
         for row in 0..batch_size {
-            let off = row * moe_inter * 2;
-            let (gate, up) = batch_gate_up[off..off + moe_inter * 2].split_at_mut(moe_inter);
+            let gu_off = job.gate_up_off + row * moe_inter * 2;
+            let (gate, up) = gate_up_arena[gu_off..gu_off + moe_inter * 2].split_at_mut(moe_inter);
             gelu_pytorch_tanh(gate);
-            let act_off = row * moe_inter;
+            let act_off = job.gate_act_off + row * moe_inter;
             for i in 0..moe_inter {
-                batch_gate_act[act_off + i] = gate[i] * up[i];
+                gate_act_arena[act_off + i] = gate[i] * up[i];
             }
         }
+    }
 
-        {
-            let mut batch = GpuBatch::begin(&ctx.queue, pool, &ctx.device)?;
-            cached.with_expert_down_t(down, expert, |w_t| {
+    // Phase 2: all expert down GEMMs in one GPU batch (one sync).
+    {
+        let mut batch = GpuBatch::begin(&ctx.queue, pool, &ctx.device)?;
+        for job in &jobs {
+            let batch_size = job.tokens.len();
+            let act_slice = &gate_act_arena[job.gate_act_off..job.gate_act_off + batch_size * moe_inter];
+            let out_slice = &mut out_arena[job.out_off..job.out_off + batch_size * hidden];
+            cached.with_expert_down_t(down, job.expert, |w_t| {
                 f32_bf16_gemm(
                     &mut batch,
                     pipeline,
-                    batch_out,
-                    batch_gate_act,
+                    out_slice,
+                    act_slice,
                     w_t,
                     batch_size,
                     moe_inter,
                     hidden,
                 )
             })?;
-            batch.end()?;
         }
+        batch.end()?;
+    }
 
-        for (bi, &(_, weight)) in tokens.iter().enumerate() {
-            let src = bi * hidden;
-            let dst = tokens[bi].0 * hidden;
+    for job in &jobs {
+        for (bi, &(_, weight)) in job.tokens.iter().enumerate() {
+            let src = job.out_off + bi * hidden;
+            let dst = job.tokens[bi].0 * hidden;
             for i in 0..hidden {
-                out[dst + i] += weight * batch_out[src + i];
+                out[dst + i] += weight * out_arena[src + i];
             }
         }
     }

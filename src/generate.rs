@@ -57,7 +57,7 @@ fn decoder_forward(
 ) -> Result<DecoderForwardOutput, Error> {
     match backend {
         DecoderBackend::Cpu { store, cfg, scratch } => {
-            crate::model::decoder::forward(store, cfg, input, scratch)
+            crate::model::decoder::forward(store, cfg, input, scratch, None)
         }
         #[cfg(all(feature = "metal", target_os = "macos"))]
         DecoderBackend::Gpu {

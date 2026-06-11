@@ -49,6 +49,7 @@ pub fn forward(
     cfg: &ModelConfig,
     input: &DecoderForwardInput<'_>,
     scratch: &mut DecoderScratch,
+    max_layers: Option<usize>,
 ) -> Result<DecoderForwardOutput, Error> {
     let text = &cfg.text_config;
     let seq_len = input.token_ids.len();
@@ -99,7 +100,10 @@ pub fn forward(
     let mut in_buf = &mut scratch.hidden_a;
     let mut out_buf = &mut scratch.hidden_b;
 
-    for layer in 0..text.num_hidden_layers {
+    let n_layers = max_layers
+        .unwrap_or(text.num_hidden_layers)
+        .min(text.num_hidden_layers);
+    for layer in 0..n_layers {
         let weights = DecoderLayerWeights::load(store, layer, text)?;
         let mut layer_scratch =
             DecoderLayerScratch::with_kv_len(seq_len, text, layer, input.kv_cache.kv_len)?;
