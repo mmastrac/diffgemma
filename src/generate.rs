@@ -83,18 +83,68 @@ fn decoder_forward(
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
-fn sync_gpu_kv_cache(
+fn run_encoder_prefill(
+    store: &WeightStore,
+    cfg: &ModelConfig,
+    prompt_token_ids: &[u32],
+    enc_scratch: &mut EncoderScratch,
     decoder: &mut DecoderBackend<'_>,
-    kv_cache: &KvCache,
+    gen_cfg: &GenerateConfig,
     canvas_len: usize,
-    max_encoder_kv: usize,
-) -> Result<(), Error> {
-    if let DecoderBackend::Gpu { scratch, engine, cfg, .. } = decoder {
-        let text = &cfg.text_config;
-        scratch.ensure_gpu_kv(&engine.ctx.device, text, max_encoder_kv, canvas_len)?;
-        scratch.sync_gpu_kv_from_cpu(kv_cache, canvas_len)?;
-    }
-    Ok(())
+) -> Result<(KvCache, std::time::Duration), Error> {
+    let max_encoder_kv = prompt_token_ids.len() + gen_cfg.max_new_tokens;
+    let input = EncoderPrefillInput {
+        token_ids: prompt_token_ids,
+        position_offset: 0,
+    };
+    let started = std::time::Instant::now();
+    let kv_cache = match decoder {
+        DecoderBackend::Gpu {
+            scratch,
+            weights,
+            engine,
+            ..
+        } => crate::metal::prefill_gpu(
+            store,
+            cfg,
+            &input,
+            enc_scratch,
+            scratch,
+            weights,
+            engine,
+            max_encoder_kv,
+            canvas_len,
+            gen_cfg.max_layers,
+        )?,
+        DecoderBackend::Cpu { .. } => {
+            let out = prefill(store, cfg, &input, enc_scratch)?;
+            out.kv_cache
+        }
+    };
+    Ok((kv_cache, started.elapsed()))
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn run_encoder_prefill(
+    store: &WeightStore,
+    cfg: &ModelConfig,
+    prompt_token_ids: &[u32],
+    enc_scratch: &mut EncoderScratch,
+    _decoder: &mut DecoderBackend<'_>,
+    _gen_cfg: &GenerateConfig,
+    _canvas_len: usize,
+) -> Result<(KvCache, std::time::Duration), Error> {
+    let started = std::time::Instant::now();
+    let out = prefill(
+        store,
+        cfg,
+        &EncoderPrefillInput {
+            token_ids: prompt_token_ids,
+            position_offset: 0,
+        },
+        enc_scratch,
+    )?;
+    Ok((out.kv_cache, started.elapsed()))
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -157,23 +207,11 @@ fn generate_inner(
     let vocab = text.vocab_size;
     let max_blocks = gen_cfg.max_new_tokens.div_ceil(canvas_len).max(1);
 
-    let prefill_started = std::time::Instant::now();
-    let prefill_out = prefill(
-        store,
-        cfg,
-        &EncoderPrefillInput {
-            token_ids: prompt_token_ids,
-            position_offset: 0,
-        },
-        enc_scratch,
-    )?;
-    let prefill_elapsed = prefill_started.elapsed();
+    let (kv_cache, prefill_elapsed) =
+        run_encoder_prefill(store, cfg, prompt_token_ids, enc_scratch, decoder, gen_cfg, canvas_len)?;
 
     let mut sequences = prompt_token_ids.to_vec();
-    let mut kv_cache = prefill_out.kv_cache;
-    let max_encoder_kv = prompt_token_ids.len() + gen_cfg.max_new_tokens;
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    sync_gpu_kv_cache(decoder, &kv_cache, canvas_len, max_encoder_kv)?;
+    let mut kv_cache = kv_cache;
     let mut rng = Rng::new(gen_cfg.seed);
     let mut denoise_steps_run = 0usize;
     let mut blocks_committed = 0usize;

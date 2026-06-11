@@ -7,7 +7,7 @@ use crate::metal::linear::linear_cached_batched;
 use crate::metal::moe::experts_forward_gpu_batched;
 use crate::metal::weights::GpuLayerWeightCache;
 use crate::metal::decoder_attention::{
-    forward_decoder_attention, forward_encoder_extend_attention,
+    forward_decoder_attention, forward_encoder_extend_attention, forward_encoder_prefill_attention,
 };
 use crate::metal::kv_cache::GpuKvCache;
 use crate::model::attention::{AttentionParams, AttentionScratch};
@@ -287,6 +287,44 @@ fn forward_layer_ff(
     }
 
     Ok(())
+}
+
+pub fn forward_encoder_prefill(
+    out: &mut [f32],
+    hidden_states: &[f32],
+    weights: &DecoderLayerWeights<'_>,
+    cached: &GpuLayerWeightCache,
+    cfg: &TextConfig,
+    layer: usize,
+    seq_len: usize,
+    positions: &[i64],
+    scratch: &mut GpuDecoderLayerScratch,
+    engine: &mut GpuDecoderEngine,
+    gpu_kv: &GpuKvCache,
+) -> Result<(), Error> {
+    forward_encoder_prefill_attention(
+        &mut scratch.attn_out,
+        hidden_states,
+        cached,
+        cfg,
+        layer,
+        seq_len,
+        positions,
+        &mut scratch.attn,
+        engine,
+        gpu_kv,
+    )?;
+
+    forward_layer_ff(
+        out,
+        hidden_states,
+        weights,
+        cached,
+        cfg,
+        seq_len,
+        scratch,
+        engine,
+    )
 }
 
 pub fn forward_encoder_extend(

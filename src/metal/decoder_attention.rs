@@ -218,8 +218,8 @@ pub fn forward_decoder_attention(
     Ok(())
 }
 
-/// Encoder extend attention: causal GQA over GPU prefix + new tokens; suffix K/V stay on GPU.
-pub fn forward_encoder_extend_attention(
+/// Shared encoder attention on GPU: writes RoPE K + V for new tokens into `gpu_kv` at current suffix.
+fn forward_encoder_kv_attention_gpu(
     out: &mut [f32],
     hidden: &[f32],
     cached: &GpuLayerWeightCache,
@@ -227,10 +227,10 @@ pub fn forward_encoder_extend_attention(
     layer: usize,
     seq_len: usize,
     positions: &[i64],
-    kv_cache_len: usize,
     scratch: &mut AttentionScratch,
     engine: &mut GpuDecoderEngine,
     gpu_kv: &GpuKvCache,
+    gqa_mask: GqaMask<'_>,
 ) -> Result<(), Error> {
     let hidden_size = cfg.hidden_size;
     let eps = cfg.rms_norm_eps as f32;
@@ -240,8 +240,6 @@ pub fn forward_encoder_extend_attention(
     assert_eq!(hidden.len(), seq_len * hidden_size);
     assert_eq!(out.len(), seq_len * hidden_size);
     assert_eq!(positions.len(), seq_len);
-    assert_eq!(kv_cache_len + seq_len, total_kv);
-    assert_eq!(gpu_kv.kv_len, kv_cache_len);
 
     rms_norm_batch(
         engine,
@@ -306,10 +304,6 @@ pub fn forward_encoder_extend_attention(
     gpu_kv.write_canvas_kv_pre_rope(layer, seq_len, &scratch.k, &scratch.v)?;
     let k_suffix_off = gpu_kv.canvas_k_elem_offset(layer)?;
     let (k_buf, v_buf) = gpu_kv.layer_buffers(layer)?;
-    let gqa_mask = GqaMask::EncoderExtend {
-        kv_cache_len,
-        positions,
-    };
 
     {
         let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
@@ -344,4 +338,68 @@ pub fn forward_encoder_extend_attention(
     }
 
     Ok(())
+}
+
+/// Causal encoder prefill: writes post-RoPE K/V into `gpu_kv` at offset 0.
+pub fn forward_encoder_prefill_attention(
+    out: &mut [f32],
+    hidden: &[f32],
+    cached: &GpuLayerWeightCache,
+    cfg: &TextConfig,
+    layer: usize,
+    seq_len: usize,
+    positions: &[i64],
+    scratch: &mut AttentionScratch,
+    engine: &mut GpuDecoderEngine,
+    gpu_kv: &GpuKvCache,
+) -> Result<(), Error> {
+    assert_eq!(gpu_kv.kv_len, 0);
+    assert_eq!(scratch.total_kv_len, seq_len);
+    forward_encoder_kv_attention_gpu(
+        out,
+        hidden,
+        cached,
+        cfg,
+        layer,
+        seq_len,
+        positions,
+        scratch,
+        engine,
+        gpu_kv,
+        GqaMask::CausalSliding,
+    )
+}
+
+/// Encoder extend attention: causal GQA over GPU prefix + new tokens; suffix K/V stay on GPU.
+pub fn forward_encoder_extend_attention(
+    out: &mut [f32],
+    hidden: &[f32],
+    cached: &GpuLayerWeightCache,
+    cfg: &TextConfig,
+    layer: usize,
+    seq_len: usize,
+    positions: &[i64],
+    kv_cache_len: usize,
+    scratch: &mut AttentionScratch,
+    engine: &mut GpuDecoderEngine,
+    gpu_kv: &GpuKvCache,
+) -> Result<(), Error> {
+    assert_eq!(kv_cache_len + seq_len, scratch.total_kv_len);
+    assert_eq!(gpu_kv.kv_len, kv_cache_len);
+    forward_encoder_kv_attention_gpu(
+        out,
+        hidden,
+        cached,
+        cfg,
+        layer,
+        seq_len,
+        positions,
+        scratch,
+        engine,
+        gpu_kv,
+        GqaMask::EncoderExtend {
+            kv_cache_len,
+            positions,
+        },
+    )
 }

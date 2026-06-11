@@ -108,6 +108,10 @@ impl GpuKvCache {
         Ok(())
     }
 
+    pub fn reset_len(&mut self) {
+        self.kv_len = 0;
+    }
+
     pub fn advance_kv_len(&mut self, append_len: usize) -> Result<(), Error> {
         let cap = self
             .layers

@@ -25,7 +25,7 @@ pub use attention::{GpuAttention, GpuAttentionKernels};
 pub use decoder::{
     bench_forward, forward as decoder_forward, load_weight_cache, BenchConfig, GpuDecoderScratch,
 };
-pub use encoder_extend::extend_prefill_gpu;
+pub use encoder_extend::{extend_prefill_gpu, prefill_gpu};
 pub use weights::GpuDecoderWeightCache;
 pub use kv_cache::GpuKvCache;
 pub use engine::GpuDecoderEngine;

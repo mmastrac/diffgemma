@@ -360,7 +360,7 @@ cargo run --release --features metal -- bench-decoder --seq 16 --kv 8 --layers 3
 | GPU decoder attention | ✅ | GPU Q/K/V/o_proj + batched RoPE/GQA via shared engine pool |
 | `--layers` on generate commands | ✅ | smoke-test subset of decoder stack |
 | KV cache on GPU | ✅ | prefix on GPU; canvas K RoPE+GQA; GPU encoder extend |
-| CPU↔GPU only at boundaries | ✅ | GPU norms/GEMM/MoE/attention/KV; CPU embed prefill, head norms, router, sampler |
+| CPU↔GPU only at boundaries | ✅ | GPU encoder prefill/extend + norms/GEMM/MoE/attention/KV; CPU embed gather, head norms, router, sampler |
 | Entropy + sampling on CPU | ✅ | same as Phase 6 |
 | Block loop on GPU | ✅ | `generate-parity` golden match (full 30 layers, steps 1–2) |
 | Generate golden fixtures | ✅ | 4 fixtures; GPU-only parity default; `--compare-cpu` optional |
@@ -370,7 +370,7 @@ cargo run --release --features metal -- bench-decoder --seq 16 --kv 8 --layers 3
 **Verified (2026-06):**
 ```bash
 cargo run --release --features metal -- generate-gpu -p "Hello" --seed 42 --steps 1
-# prefill ~3.7s, denoise ~125s → ~2.05 tok/s (30 layers, canvas=256)
+# prefill ~19s (GPU), denoise ~115s → ~2.22 tok/s (30 layers, canvas=256)
 cargo run --release --features metal -- generate-parity -p "Hello" --seed 42 --steps 1
 # golden ok (hello_steps1_full), ~134s
 cargo run --release --features metal -- generate-parity -p "Hello" --seed 42 --steps 2
@@ -398,8 +398,9 @@ cargo run --release --features metal -- generate-parity -p "Hello" --seed 42 --s
 | Skip logits clone in generate loop | ✅ | reuse `sample_logits` / `sc_logits` buffers |
 | Zero-copy logits in generate forward | ✅ | `logits_out` + reusable `logits_buf`; skip lm_head in bench |
 | Generate golden fixtures | ✅ | `fixtures/generate/*.json`; GPU-only `generate-parity` |
-| GPU KV without CPU mirrors | partial ✅ | prefix on GPU; canvas K RoPE + GQA fused; GPU encoder extend appends suffix |
+| GPU KV without CPU mirrors | ✅ | GPU encoder prefill + extend; prefix never synced from CPU on generate path |
 | Slim GPU attention scratch | ✅ | skip `k_full`/`v_full`/`scores` when KV on GPU; lazy alloc for CPU fallback |
+| GPU encoder prefill | ✅ | `prefill_gpu`: causal GQA → `GpuKvCache` at offset 0; `run_encoder_prefill` in generate |
 
 **OOM note:** full `decoder-gpu` (30 layers, seq=256) needs ~2.3 GiB single-path (estimate). Prior OOM was caused by 30 persistent attention scratches + unbounded expert transpose cache + CPU∥GPU peak.
 
@@ -586,7 +587,7 @@ diffgemma-mps/
 
 ## Immediate next step
 
-**Phase 12 (ongoing):** perf, memory, FastSlice — GPU prefill, drop CPU `k_full` scratch, fuse attention submits.
+**Phase 12 (ongoing):** perf, memory, FastSlice — fuse attention submits, GPU head norms, trim prefill paging cost.
 
 ```bash
 cargo run --release --features metal -- bench-decoder --seq 16 --kv 8 --layers 3 --iters 3
