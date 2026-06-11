@@ -1,38 +1,30 @@
+use crate::buffer::Buffer;
+use crate::fast_slice::{transpose_bf16_weight_into, FastBf16Slice, FastSlice};
 use crate::metal::batch::GpuBatch;
 use crate::metal::device::ComputePipeline;
 use crate::safetensors::Error;
 use crate::tensor::Bf16Slice;
 
-/// Pack PyTorch linear weights `[out, in]` into `[in, out]` for `bf16_gemm`.
-pub fn transpose_weight_bf16(w: &[u16], out_dim: usize, in_dim: usize) -> Vec<u16> {
-    let mut t = vec![0u16; in_dim * out_dim];
-    for o in 0..out_dim {
-        for i in 0..in_dim {
-            t[i * out_dim + o] = w[o * in_dim + i];
-        }
-    }
-    t
-}
-
-pub fn bf16_slice_to_vec(slice: Bf16Slice<'_>) -> Vec<u16> {
-    (0..slice.len()).map(|i| slice.get(i)).collect()
-}
-
-#[derive(Clone)]
 pub struct CachedLinear {
-    pub w_t: Vec<u16>,
+    pub w_t: Buffer<u16>,
     pub in_dim: usize,
     pub out_dim: usize,
 }
 
 impl CachedLinear {
     pub fn from_bf16(w: Bf16Slice<'_>, out_dim: usize, in_dim: usize) -> Self {
-        let w_raw = bf16_slice_to_vec(w);
+        let mut w_t = Buffer::new(in_dim * out_dim);
+        let src = FastBf16Slice::from_bf16(w);
+        transpose_bf16_weight_into(src, w_t.as_fast_slice_mut(), out_dim, in_dim);
         Self {
-            w_t: transpose_weight_bf16(&w_raw, out_dim, in_dim),
+            w_t,
             in_dim,
             out_dim,
         }
+    }
+
+    pub fn w_t_fast(&self) -> FastSlice<'_, u16> {
+        self.w_t.as_fast_slice()
     }
 }
 
@@ -49,7 +41,8 @@ pub fn linear_cached_batched(
         return Err(Error::Format("linear_cached_batched shape mismatch"));
     }
     let buf_a = batch.alloc_f32(x)?;
-    let buf_b = batch.alloc_bf16(&w.w_t)?;
+    let w_fast = w.w_t_fast();
+    let buf_b = batch.alloc_bf16_fast(w_fast)?;
     let buf_c = batch.alloc_f32_out(y.len())?;
     batch.dispatch_gemm(
         &pipeline.pipeline,

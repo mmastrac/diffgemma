@@ -87,6 +87,11 @@ pub struct Bf16Slice<'a> {
 }
 
 impl<'a> Bf16Slice<'a> {
+    #[cfg(test)]
+    pub(crate) fn from_bytes(data: &'a [u8]) -> Self {
+        Self { data }
+    }
+
     pub fn len(&self) -> usize {
         self.data.len() / 2
     }

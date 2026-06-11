@@ -405,9 +405,10 @@ Today `Bf16Slice::get()` bounds-checks every element; `to_f32_vec()` and MoE tra
 
 | Task | Files | Notes |
 |------|-------|-------|
-| `FastSlice<'a, T>` | `src/tensor.rs` | `from_raw_parts(ptr, len)` after `TensorView` shape check |
-| `FastBf16Slice<'a>` | `src/tensor.rs` | `get_unchecked(i) -> u16`; `as_u16_slice()` when 2-byte aligned |
-| `FastSliceMut<'a, T>` | `src/tensor.rs` | for activation buffers with proven exclusive access |
+| `FastSlice<'a, T>` | `src/fast_slice.rs` | raw `ptr + len` (not `&[T]`); construct after `TensorView` shape check |
+| `FastBf16Slice<'a>` | `src/fast_slice.rs` | `get_u16_unchecked` / `to_f32_unchecked` over mmap bytes |
+| `FastSliceMut<'a, T>` | `src/fast_slice.rs` | mutable ptr+len for transpose/dequant writes |
+| `Buffer<T>` | `src/buffer.rs` | owned allocation; hot loops use `as_fast_slice()` only |
 | Safety contract | docs + `debug_assert!` | only construct from validated `TensorView`, `Vec`, or pool buffer |
 | Migrate matmul/GEMM inputs | `kernels/cpu.rs`, `metal/linear.rs` | inner dimension loops |
 | Migrate MoE transpose | `metal/weights.rs`, `model/moe.rs` | expert weight gather |
@@ -486,6 +487,8 @@ diffgemma-mps/
     main.rs
     config.rs
     tensor.rs
+    fast_slice.rs
+    buffer.rs
     safetensors.rs
     weights.rs
     tokenizer.rs

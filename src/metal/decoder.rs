@@ -223,7 +223,7 @@ fn forward_inner(
             &engine.kernels,
             out_buf,
             in_buf,
-            &weights.final_norm,
+            weights.final_norm.as_slice(),
             seq_len,
             hidden,
             text.rms_norm_eps as f32,

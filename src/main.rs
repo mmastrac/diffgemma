@@ -1,4 +1,6 @@
+mod buffer;
 mod config;
+mod fast_slice;
 mod generate;
 #[allow(dead_code)]
 mod kernels;

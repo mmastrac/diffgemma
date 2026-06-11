@@ -1,5 +1,7 @@
 use super::matmul;
 use crate::config::{LayerType, TextConfig};
+use crate::buffer::Buffer;
+use crate::fast_slice::{bf16_to_f32_into, FastBf16Slice};
 use crate::tensor::Bf16Slice;
 
 const GELU_TANH_COEF: f32 = 0.797_884_560_802_865_4; // sqrt(2/pi)
@@ -88,13 +90,15 @@ pub fn linear_bf16(
     seq_len: usize,
     in_dim: usize,
     out_dim: usize,
+    w_scratch: &mut Buffer<f32>,
 ) {
     assert_eq!(w.len(), out_dim * in_dim);
-    let mut w_f32 = vec![0.0f32; out_dim * in_dim];
-    for i in 0..w.len() {
-        w_f32[i] = bf16_to_f32(w.get(i));
-    }
-    linear(y, x, &w_f32, b, seq_len, in_dim, out_dim);
+    w_scratch.ensure_len(out_dim * in_dim);
+    bf16_to_f32_into(
+        FastBf16Slice::from_bf16(w),
+        w_scratch.as_fast_slice_mut(),
+    );
+    linear(y, x, w_scratch.as_slice(), b, seq_len, in_dim, out_dim);
 }
 
 /// `y = x @ W[out, in]^T` reading bf16 weights starting at `w_elem_offset`.
@@ -109,6 +113,7 @@ pub fn linear_bf16_slice(
 ) {
     assert_eq!(x.len(), seq_len * in_dim);
     assert_eq!(y.len(), seq_len * out_dim);
+    let wfast = FastBf16Slice::from_bf16(w);
     for s in 0..seq_len {
         let x_row = &x[s * in_dim..(s + 1) * in_dim];
         let y_row = &mut y[s * out_dim..(s + 1) * out_dim];
@@ -116,7 +121,7 @@ pub fn linear_bf16_slice(
             let mut sum = 0.0f32;
             let row_off = w_elem_offset + o * in_dim;
             for i in 0..in_dim {
-                sum += x_row[i] * bf16_to_f32(w.get(row_off + i));
+                sum += x_row[i] * unsafe { wfast.to_f32_unchecked(row_off + i) };
             }
             y_row[o] = sum;
         }

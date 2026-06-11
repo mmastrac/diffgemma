@@ -48,9 +48,17 @@ impl BufferPool {
     }
 
     pub fn write_bf16(buffer: &ProtocolObject<dyn MTLBuffer>, data: &[u16]) {
+        Self::write_bf16_ptr(buffer, data.as_ptr(), data.len());
+    }
+
+    pub fn write_bf16_ptr(
+        buffer: &ProtocolObject<dyn MTLBuffer>,
+        src: *const u16,
+        len: usize,
+    ) {
         let ptr = buffer.contents().as_ptr() as *mut u16;
         unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+            std::ptr::copy_nonoverlapping(src, ptr, len);
         }
     }
 

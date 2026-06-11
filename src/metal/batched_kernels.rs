@@ -1,5 +1,6 @@
 //! Elementwise kernels encoded into a shared `GpuBatch`.
 
+use crate::fast_slice::FastSlice;
 use crate::metal::batch::{set_bytes, GpuBatch};
 use crate::metal::kernels::GpuKernels;
 use crate::safetensors::Error;
@@ -83,7 +84,7 @@ pub fn f32_bf16_gemm(
     pipeline: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
     c: &mut [f32],
     a: &[f32],
-    b: &[u16],
+    b: FastSlice<'_, u16>,
     m: usize,
     k: usize,
     n: usize,
@@ -92,7 +93,7 @@ pub fn f32_bf16_gemm(
         return Err(Error::Format("f32_bf16 gemm shape mismatch"));
     }
     let buf_a = batch.alloc_f32(a)?;
-    let buf_b = batch.alloc_bf16(b)?;
+    let buf_b = batch.alloc_bf16_fast(b)?;
     let buf_c = batch.alloc_f32_out(c.len())?;
     batch.dispatch_gemm(pipeline, &buf_a, &buf_b, &buf_c, m, n, k);
     batch.register_read(buf_c, c);

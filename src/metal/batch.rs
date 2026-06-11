@@ -1,5 +1,6 @@
 //! Batched Metal dispatches: many kernels, one `commit` + `waitUntilCompleted`.
 
+use crate::fast_slice::FastSlice;
 use crate::metal::buffer::BufferPool;
 use crate::safetensors::Error;
 use objc2::rc::Retained;
@@ -86,12 +87,19 @@ impl<'a> GpuBatch<'a> {
         &mut self,
         data: &[u16],
     ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
+        unsafe { self.alloc_bf16_fast(FastSlice::from_ptr(data.as_ptr(), data.len())) }
+    }
+
+    pub fn alloc_bf16_fast(
+        &mut self,
+        data: FastSlice<'_, u16>,
+    ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
         let bytes = data.len() * 2;
         let buf = self
             .pool
             .allocate(self.device, bytes)
             .ok_or(Error::Format("Metal buffer alloc failed"))?;
-        BufferPool::write_bf16(&buf, data);
+        BufferPool::write_bf16_ptr(&buf, data.ptr, data.len());
         self.track_release(bytes, buf.clone());
         Ok(buf)
     }
