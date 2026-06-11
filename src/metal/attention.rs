@@ -115,6 +115,91 @@ impl GpuAttention {
         Ok(())
     }
 
+    /// RoPE on Q and K canvas tensors in a single GPU submit.
+    pub fn apply_rope_qk(
+        &mut self,
+        q: &mut [f32],
+        k: &mut [f32],
+        freqs: &[f32],
+        seq_len: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+    ) -> Result<(), Error> {
+        let q_bytes = q.len() * 4;
+        let k_bytes = k.len() * 4;
+        let f_bytes = freqs.len() * 4;
+        if q.len() != seq_len * n_heads * head_dim
+            || k.len() != seq_len * n_kv_heads * head_dim
+            || freqs.len() != seq_len * rotary_dim
+        {
+            return Err(Error::Format("rope qk shape mismatch"));
+        }
+
+        let buf_q = self
+            .pool
+            .allocate(&self.ctx.device, q_bytes)
+            .ok_or(Error::Format("Metal buffer alloc failed"))?;
+        let buf_k = self
+            .pool
+            .allocate(&self.ctx.device, k_bytes)
+            .ok_or(Error::Format("Metal buffer alloc failed"))?;
+        let buf_f = self
+            .pool
+            .allocate(&self.ctx.device, f_bytes)
+            .ok_or(Error::Format("Metal buffer alloc failed"))?;
+
+        BufferPool::write_f32(&buf_q, q);
+        BufferPool::write_f32(&buf_k, k);
+        BufferPool::write_f32(&buf_f, freqs);
+
+        let rope_q = GqaParams {
+            seq_len: seq_len as u32,
+            total_kv: 0,
+            n_heads: 0,
+            n_kv_heads: 0,
+            head_dim: head_dim as u32,
+            n_groups: 0,
+            mask_kind: 0,
+            sliding_window: 0,
+            kv_cache_len: 0,
+            mask_neg: MASK_NEG,
+            rotary_dim: rotary_dim as u32,
+            num_heads_rope: n_heads as u32,
+        };
+        let rope_k = GqaParams {
+            num_heads_rope: n_kv_heads as u32,
+            ..rope_q
+        };
+
+        run_kernel(
+            &self.ctx.queue,
+            &self.rope_pipeline.pipeline,
+            |encoder| {
+                unsafe {
+                    encoder.setBuffer_offset_atIndex(Some(&buf_q), 0, 0);
+                    encoder.setBuffer_offset_atIndex(Some(&buf_f), 0, 1);
+                }
+                set_params(encoder, &rope_q, 2);
+                dispatch_2d(encoder, n_heads, seq_len);
+
+                unsafe {
+                    encoder.setBuffer_offset_atIndex(Some(&buf_k), 0, 0);
+                }
+                set_params(encoder, &rope_k, 2);
+                dispatch_2d(encoder, n_kv_heads, seq_len);
+            },
+        )?;
+
+        BufferPool::read_f32(&buf_q, q);
+        BufferPool::read_f32(&buf_k, k);
+        self.pool.release(q_bytes, buf_q);
+        self.pool.release(k_bytes, buf_k);
+        self.pool.release(f_bytes, buf_f);
+        Ok(())
+    }
+
     pub fn gqa_attention(
         &mut self,
         attn_out: &mut [f32],

@@ -5,6 +5,7 @@ mod batch;
 mod batched_kernels;
 mod buffer;
 mod decoder;
+mod decoder_attention;
 mod decoder_layer;
 mod device;
 mod engine;

@@ -6,9 +6,8 @@ use crate::metal::engine::GpuDecoderEngine;
 use crate::metal::linear::linear_cached_batched;
 use crate::metal::moe::experts_forward_gpu_batched;
 use crate::metal::weights::GpuLayerWeightCache;
-use crate::model::attention::{
-    forward_decoder as attention_forward_decoder, AttentionParams, AttentionScratch,
-};
+use crate::metal::decoder_attention::forward_decoder_attention;
+use crate::model::attention::{AttentionParams, AttentionScratch};
 use crate::model::decoder_layer::{forward_decoder as cpu_forward_decoder, DecoderLayerScratch};
 use crate::model::kv_cache::LayerKvView;
 use crate::model::layer_weights::DecoderLayerWeights;
@@ -101,7 +100,7 @@ pub fn forward_decoder(
     let hidden = cfg.hidden_size;
     let eps = cfg.rms_norm_eps as f32;
 
-    attention_forward_decoder(
+    forward_decoder_attention(
         &mut scratch.attn_out,
         hidden_states,
         weights,
@@ -112,6 +111,7 @@ pub fn forward_decoder(
         kv,
         mask,
         &mut scratch.attn,
+        engine,
     )?;
 
     scratch.residual.copy_from_slice(hidden_states);
