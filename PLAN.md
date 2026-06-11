@@ -566,10 +566,10 @@ diffgemma-mps/
 
 **Phase 12:** finish memory paging, then introduce `FastSlice` and migrate the hottest bf16 access loops.
 
-1. **Per-layer weight cache paging** — load/drop `GpuLayerWeightCache` one layer at a time in `decoder.rs` forward (biggest remaining RAM win).
-2. **Wire `GpuAttention`** into `decoder_layer.rs` once parity holds at `--layers 3`.
-3. **Migrate remaining hot paths** — `model/moe.rs` CPU experts, attention weight dequant.
-4. **Skip logits alloc in parity mode** — save 256 MiB on comparison runs.
+1. **Wire `GpuAttention`** into `decoder_layer.rs` (biggest remaining CPU bottleneck).
+2. **Migrate remaining hot paths** — `model/moe.rs` CPU experts, attention weight dequant.
+3. **Skip logits alloc in parity mode** — save 256 MiB on comparison runs.
+4. **Optional: layer weight sticky cache** — retain N recently used layers if paging cost dominates.
 
 Always record before/after numbers:
 ```bash
