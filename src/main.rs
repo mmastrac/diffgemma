@@ -30,6 +30,21 @@ enum Command {
     Decoder,
     Prefill,
     Generate {
+        prompt: Option<String>,
+        seed: u64,
+        steps: usize,
+        prompt_len: usize,
+        max_new_tokens: usize,
+    },
+    GenerateGpu {
+        prompt: Option<String>,
+        seed: u64,
+        steps: usize,
+        prompt_len: usize,
+        max_new_tokens: usize,
+    },
+    GenerateParity {
+        prompt: Option<String>,
         seed: u64,
         steps: usize,
         prompt_len: usize,
@@ -39,6 +54,12 @@ enum Command {
     Gemm { size: usize },
     Attention,
     DecoderGpu,
+    BenchDecoder {
+        seq_len: usize,
+        kv_len: usize,
+        layers: usize,
+        iters: usize,
+    },
 }
 
 fn main() -> ExitCode {
@@ -49,7 +70,7 @@ fn main() -> ExitCode {
         command => {
             eprintln!("loading from {}", cli.model_dir.display());
             match model::Model::open(&cli.model_dir) {
-                Ok(m) => run_command(&m, command),
+                Ok(m) => run_command(&m, &cli.model_dir, command),
                 Err(err) => {
                     eprintln!("error: {err}");
                     ExitCode::FAILURE
@@ -59,7 +80,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_command(m: &model::Model, command: Command) -> ExitCode {
+fn run_command(m: &model::Model, model_dir: &std::path::Path, command: Command) -> ExitCode {
     match command {
         Command::Summary => {
             print_summary(&m.weights);
@@ -83,13 +104,34 @@ fn run_command(m: &model::Model, command: Command) -> ExitCode {
         Command::Attention => run_attention_parity(m),
         Command::Decoder => run_decoder_forward(m),
         Command::DecoderGpu => run_decoder_gpu_parity(m),
+        Command::BenchDecoder {
+            seq_len,
+            kv_len,
+            layers,
+            iters,
+        } => run_bench_decoder(m, seq_len, kv_len, layers, iters),
         Command::Prefill => run_prefill(m),
         Command::Generate {
+            prompt,
             seed,
             steps,
             prompt_len,
             max_new_tokens,
-        } => run_generate(m, seed, steps, prompt_len, max_new_tokens),
+        } => run_generate(m, model_dir, prompt, seed, steps, prompt_len, max_new_tokens, false),
+        Command::GenerateGpu {
+            prompt,
+            seed,
+            steps,
+            prompt_len,
+            max_new_tokens,
+        } => run_generate(m, model_dir, prompt, seed, steps, prompt_len, max_new_tokens, true),
+        Command::GenerateParity {
+            prompt,
+            seed,
+            steps,
+            prompt_len,
+            max_new_tokens,
+        } => run_generate_parity(m, model_dir, prompt, seed, steps, prompt_len, max_new_tokens),
         Command::Tokenize(_) => ExitCode::FAILURE,
         Command::Gemm { .. } => ExitCode::FAILURE,
     }
@@ -104,9 +146,19 @@ fn parse_cli() -> Cli {
     let mut prompt_len = 8usize;
     let mut max_new_tokens = 256usize;
     let mut gemm_size = 512usize;
+    let mut prompt: Option<String> = None;
+    let mut bench_seq = 16usize;
+    let mut bench_kv = 8usize;
+    let mut bench_layers = 1usize;
+    let mut bench_iters = 3usize;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "-p" | "--prompt" => {
+                if let Some(text) = args.next() {
+                    prompt = Some(text);
+                }
+            }
             "-m" | "--model" => {
                 if let Some(path) = args.next() {
                     model_dir = PathBuf::from(path);
@@ -152,12 +204,45 @@ fn parse_cli() -> Cli {
                     });
                 }
             }
+            "--seq" => {
+                if let Some(v) = args.next() {
+                    bench_seq = v.parse().unwrap_or_else(|_| {
+                        eprintln!("invalid --seq");
+                        std::process::exit(2);
+                    });
+                }
+            }
+            "--kv" => {
+                if let Some(v) = args.next() {
+                    bench_kv = v.parse().unwrap_or_else(|_| {
+                        eprintln!("invalid --kv");
+                        std::process::exit(2);
+                    });
+                }
+            }
+            "--layers" => {
+                if let Some(v) = args.next() {
+                    bench_layers = v.parse().unwrap_or_else(|_| {
+                        eprintln!("invalid --layers");
+                        std::process::exit(2);
+                    });
+                }
+            }
+            "--iters" => {
+                if let Some(v) = args.next() {
+                    bench_iters = v.parse().unwrap_or_else(|_| {
+                        eprintln!("invalid --iters");
+                        std::process::exit(2);
+                    });
+                }
+            }
             _ => positional.push(arg),
         }
     }
 
     let command = match positional.first().map(String::as_str) {
-        None | Some("summary") => Command::Summary,
+        None => default_generate_command(prompt, seed, steps, prompt_len, max_new_tokens),
+        Some("summary") => Command::Summary,
         Some("config") => Command::Config,
         Some("weights") => {
             let name = positional.get(1).cloned().unwrap_or_else(|| {
@@ -170,6 +255,21 @@ fn parse_cli() -> Cli {
         Some("decoder") => Command::Decoder,
         Some("prefill") => Command::Prefill,
         Some("generate") => Command::Generate {
+            prompt: prompt.clone(),
+            seed,
+            steps,
+            prompt_len,
+            max_new_tokens,
+        },
+        Some("generate-gpu") => Command::GenerateGpu {
+            prompt: prompt.clone(),
+            seed,
+            steps,
+            prompt_len,
+            max_new_tokens,
+        },
+        Some("generate-parity") => Command::GenerateParity {
+            prompt: prompt.clone(),
             seed,
             steps,
             prompt_len,
@@ -185,12 +285,19 @@ fn parse_cli() -> Cli {
         Some("gemm") => Command::Gemm { size: gemm_size },
         Some("attention") => Command::Attention,
         Some("decoder-gpu") => Command::DecoderGpu,
+        Some("bench-decoder") => Command::BenchDecoder {
+            seq_len: bench_seq,
+            kv_len: bench_kv,
+            layers: bench_layers,
+            iters: bench_iters,
+        },
         Some(cmd) => {
             eprintln!("unknown command: {cmd}");
             eprintln!(
-                "usage: diffgemma-mps [summary|config|weights <name>|layer0|decoder|decoder-gpu|prefill|generate|tokenize <text>|gemm|attention]"
+                "usage: diffgemma-mps [-p PROMPT] [summary|config|weights <name>|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-parity|tokenize <text>|gemm|attention]"
             );
-            eprintln!("  generate options: --seed N --steps N --prompt-len N --max-new-tokens N");
+            eprintln!("  default (no command): generate-gpu with --features metal");
+            eprintln!("  options: -p/--prompt TEXT --seed N --steps N --prompt-len N --max-new-tokens N");
             eprintln!("  gemm options: --size N (default 512, requires --features metal)");
             eprintln!("  attention: layer 0 GQA parity (requires --features metal)");
             eprintln!("  decoder-gpu: full decoder CPU vs GPU parity at seq=256 (requires --features metal)");
@@ -199,6 +306,40 @@ fn parse_cli() -> Cli {
     };
 
     Cli { model_dir, command }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn default_generate_command(
+    prompt: Option<String>,
+    seed: u64,
+    steps: usize,
+    prompt_len: usize,
+    max_new_tokens: usize,
+) -> Command {
+    Command::GenerateGpu {
+        prompt,
+        seed,
+        steps,
+        prompt_len,
+        max_new_tokens,
+    }
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn default_generate_command(
+    prompt: Option<String>,
+    seed: u64,
+    steps: usize,
+    prompt_len: usize,
+    max_new_tokens: usize,
+) -> Command {
+    Command::Generate {
+        prompt,
+        seed,
+        steps,
+        prompt_len,
+        max_new_tokens,
+    }
 }
 
 fn print_summary(store: &weights::WeightStore) {
@@ -311,7 +452,9 @@ fn run_prefill(m: &model::Model) -> ExitCode {
 fn run_decoder_gpu_parity(m: &model::Model) -> ExitCode {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     {
-        use metal::{decoder_forward as gpu_forward, GpuDecoderEngine, GpuDecoderScratch};
+        use metal::{
+            decoder_forward as gpu_forward, load_weight_cache, GpuDecoderEngine, GpuDecoderScratch,
+        };
         use model::decoder::{forward as cpu_forward, DecoderForwardInput, DecoderScratch};
 
         const CANVAS_LEN: usize = 256;
@@ -342,6 +485,13 @@ fn run_decoder_gpu_parity(m: &model::Model) -> ExitCode {
 
         let mut cpu_scratch = DecoderScratch::new(CANVAS_LEN, &m.config);
         let mut gpu_scratch = GpuDecoderScratch::new(CANVAS_LEN, &m.config);
+        let gpu_weights = match load_weight_cache(&m.weights, &m.config.text_config) {
+            Ok(w) => w,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
         let mut engine = match GpuDecoderEngine::new() {
             Ok(e) => e,
             Err(err) => {
@@ -366,7 +516,14 @@ fn run_decoder_gpu_parity(m: &model::Model) -> ExitCode {
 
         eprintln!("running GPU decoder forward...");
         let gpu_started = std::time::Instant::now();
-        let gpu_out = match gpu_forward(&m.weights, &m.config, &input, &mut gpu_scratch, &mut engine)
+        let gpu_out = match gpu_forward(
+            &m.weights,
+            &m.config,
+            &input,
+            &mut gpu_scratch,
+            &gpu_weights,
+            &mut engine,
+        )
         {
             Ok(out) => out,
             Err(err) => {
@@ -443,6 +600,116 @@ fn run_decoder_gpu_parity(m: &model::Model) -> ExitCode {
     {
         let _ = m;
         eprintln!("error: decoder-gpu requires --features metal on macOS");
+        ExitCode::FAILURE
+    }
+}
+
+fn run_bench_decoder(
+    m: &model::Model,
+    seq_len: usize,
+    kv_len: usize,
+    layers: usize,
+    iters: usize,
+) -> ExitCode {
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    {
+        use metal::{
+            bench_forward, load_weight_cache, BenchConfig, GpuDecoderEngine, GpuDecoderScratch,
+        };
+        use model::decoder::DecoderForwardInput;
+
+        let seq_len = seq_len.max(1);
+        let kv_len = kv_len.max(1);
+        let layers = layers.max(1).min(m.config.text_config.num_hidden_layers);
+        let iters = iters.max(1);
+        let vocab = m.config.text_config.vocab_size;
+
+        let kv_cache = match model::kv_cache::KvCache::dummy(&m.config.text_config, kv_len, 42) {
+            Ok(cache) => cache,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        let mut token_ids = vec![0u32; seq_len];
+        for (i, id) in token_ids.iter_mut().enumerate() {
+            *id = ((i * 997 + 13) % vocab.max(1)) as u32;
+        }
+
+        let mask = model::mask::DecoderAttnMask::all_valid(seq_len, kv_len);
+        let input = DecoderForwardInput {
+            token_ids: &token_ids,
+            kv_cache: &kv_cache,
+            self_conditioning_logits: None,
+            mask: Some(mask),
+        };
+
+        let mut scratch = GpuDecoderScratch::new(seq_len, &m.config);
+        let gpu_weights = match load_weight_cache(&m.weights, &m.config.text_config) {
+            Ok(w) => w,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let mut engine = match GpuDecoderEngine::new() {
+            Ok(e) => e,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        let bench = BenchConfig { max_layers: layers };
+        eprintln!(
+            "bench-decoder warmup (seq={seq_len}, kv={kv_len}, layers={layers})..."
+        );
+        if let Err(err) = bench_forward(
+            &m.weights,
+            &m.config,
+            &input,
+            &mut scratch,
+            &gpu_weights,
+            &mut engine,
+            &bench,
+        ) {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+
+        eprintln!("bench-decoder running {iters} iterations...");
+        let started = std::time::Instant::now();
+        for _ in 0..iters {
+            if let Err(err) = bench_forward(
+                &m.weights,
+                &m.config,
+                &input,
+                &mut scratch,
+                &gpu_weights,
+                &mut engine,
+                &bench,
+            ) {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+        let elapsed = started.elapsed();
+        let per_fwd = elapsed / iters as u32;
+
+        println!("bench-decoder ok");
+        println!("  seq_len: {seq_len}");
+        println!("  kv_len:  {kv_len}");
+        println!("  layers:  {layers}");
+        println!("  iters:   {iters}");
+        println!("  total:   {elapsed:.2?}");
+        println!("  per_fwd: {per_fwd:.2?}");
+        ExitCode::SUCCESS
+    }
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    {
+        let _ = (m, seq_len, kv_len, layers, iters);
+        eprintln!("error: bench-decoder requires --features metal on macOS");
         ExitCode::FAILURE
     }
 }
@@ -596,24 +863,86 @@ fn run_tokenize(model_dir: &PathBuf, text: &str) -> ExitCode {
     }
 }
 
+fn build_prompt_tokens(
+    model_dir: &std::path::Path,
+    prompt_text: Option<&str>,
+    prompt_len: usize,
+    vocab: usize,
+) -> Result<Vec<u32>, safetensors::Error> {
+    if let Some(text) = prompt_text {
+        let tok_path = model_dir.join("tokenizer.json");
+        let tokenizer = tokenizer::Tokenizer::load(&tok_path)?;
+        Ok(tokenizer.encode(text, false))
+    } else {
+        let mut prompt = vec![0u32; prompt_len];
+        for (i, id) in prompt.iter_mut().enumerate() {
+            *id = ((i * 131 + 7) % vocab.max(1)) as u32;
+        }
+        Ok(prompt)
+    }
+}
+
+fn print_generate_output(
+    label: &str,
+    out: &generate::GenerateOutput,
+    prompt_len: usize,
+    elapsed: std::time::Duration,
+    model_dir: &std::path::Path,
+) {
+    let new_tokens = out.token_ids.len().saturating_sub(prompt_len);
+    println!("{label} ok");
+    println!("  total tokens: {}", out.token_ids.len());
+    println!("  new tokens:   {new_tokens}");
+    println!("  denoise steps run: {}", out.denoise_steps_run);
+    println!("  blocks committed:  {}", out.blocks_committed);
+    println!("  elapsed: {elapsed:.2?}");
+
+    if let Ok(tokenizer) = tokenizer::Tokenizer::load(model_dir.join("tokenizer.json")) {
+        let text = tokenizer.decode(&out.token_ids);
+        if !text.is_empty() {
+            let preview: String = text.chars().take(200).collect();
+            println!("  text: {preview}");
+        }
+    }
+
+    let preview: Vec<String> = out
+        .token_ids
+        .iter()
+        .take(16)
+        .map(|t| t.to_string())
+        .collect();
+    println!("  token_ids[0..16]: [{}]", preview.join(", "));
+}
+
 fn run_generate(
     m: &model::Model,
+    model_dir: &std::path::Path,
+    prompt_text: Option<String>,
     seed: u64,
     steps: usize,
     prompt_len: usize,
     max_new_tokens: usize,
+    use_gpu: bool,
 ) -> ExitCode {
     let vocab = m.config.text_config.vocab_size;
     let canvas = m.config.canvas_length;
 
-    let mut prompt = vec![0u32; prompt_len];
-    for (i, id) in prompt.iter_mut().enumerate() {
-        *id = ((i * 131 + 7) % vocab.max(1)) as u32;
-    }
+    let prompt = match build_prompt_tokens(
+        model_dir,
+        prompt_text.as_deref(),
+        prompt_len,
+        vocab,
+    ) {
+        Ok(ids) => ids,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let prompt_len = prompt.len();
 
     let enc_seq = prompt_len.max(canvas);
     let mut enc_scratch = model::encoder::EncoderScratch::new(enc_seq, &m.config);
-    let mut dec_scratch = model::decoder::DecoderScratch::new(canvas, &m.config);
 
     let gen_cfg = generate::GenerateConfig {
         sampler: sample::SamplerConfig {
@@ -624,42 +953,211 @@ fn run_generate(
         seed,
     };
 
+    let backend = if use_gpu { "generate-gpu" } else { "generate" };
     eprintln!(
-        "running generate (prompt_len={prompt_len}, canvas={canvas}, steps={steps}, max_new_tokens={max_new_tokens}, seed={seed})..."
+        "running {backend} (prompt_len={prompt_len}, canvas={canvas}, steps={steps}, max_new_tokens={max_new_tokens}, seed={seed})..."
     );
     let started = std::time::Instant::now();
-    match generate::generate(&m.weights, &m.config, &prompt, &gen_cfg, &mut enc_scratch, &mut dec_scratch)
-    {
-        Ok(out) => {
-            let new_tokens = out.token_ids.len().saturating_sub(prompt_len);
-            println!("generate ok");
-            println!("  total tokens: {}", out.token_ids.len());
-            println!("  new tokens:   {new_tokens}");
-            println!("  denoise steps run: {}", out.denoise_steps_run);
-            println!("  blocks committed:  {}", out.blocks_committed);
-            println!("  kv after last block: {}", out.token_ids.len());
-            println!("  elapsed: {:.2?}", started.elapsed());
-            let preview: Vec<String> = out
-                .token_ids
-                .iter()
-                .take(16)
-                .map(|t| t.to_string())
-                .collect();
-            println!("  token_ids[0..16]: [{}]", preview.join(", "));
-            if out.token_ids.len() > 16 {
-                let tail_start = out.token_ids.len().saturating_sub(8);
-                let tail: Vec<String> = out.token_ids[tail_start..]
-                    .iter()
-                    .map(|t| t.to_string())
-                    .collect();
-                println!("  token_ids[last 8]: [{}]", tail.join(", "));
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    if use_gpu {
+        use metal::{load_weight_cache, GpuDecoderEngine, GpuDecoderScratch};
+        let mut dec_scratch = GpuDecoderScratch::new(canvas, &m.config);
+        let gpu_weights = match load_weight_cache(&m.weights, &m.config.text_config) {
+            Ok(w) => w,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
             }
+        };
+        let mut engine = match GpuDecoderEngine::new() {
+            Ok(e) => e,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        return match generate::generate_gpu(
+            &m.weights,
+            &m.config,
+            &prompt,
+            &gen_cfg,
+            &mut enc_scratch,
+            &mut dec_scratch,
+            &gpu_weights,
+            &mut engine,
+        ) {
+            Ok(out) => {
+                print_generate_output(backend, &out, prompt_len, started.elapsed(), model_dir);
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("error: {err}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    if use_gpu {
+        eprintln!("error: generate-gpu requires --features metal on macOS");
+        return ExitCode::FAILURE;
+    }
+
+    let mut dec_scratch = model::decoder::DecoderScratch::new(canvas, &m.config);
+    match generate::generate(
+        &m.weights,
+        &m.config,
+        &prompt,
+        &gen_cfg,
+        &mut enc_scratch,
+        &mut dec_scratch,
+    ) {
+        Ok(out) => {
+            print_generate_output(backend, &out, prompt_len, started.elapsed(), model_dir);
             ExitCode::SUCCESS
         }
         Err(err) => {
             eprintln!("error: {err}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn run_generate_parity(
+    m: &model::Model,
+    model_dir: &std::path::Path,
+    prompt_text: Option<String>,
+    seed: u64,
+    steps: usize,
+    prompt_len: usize,
+    max_new_tokens: usize,
+) -> ExitCode {
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    {
+        use metal::{load_weight_cache, GpuDecoderEngine, GpuDecoderScratch};
+
+        let vocab = m.config.text_config.vocab_size;
+        let canvas = m.config.canvas_length;
+        let prompt = match build_prompt_tokens(
+            model_dir,
+            prompt_text.as_deref(),
+            prompt_len,
+            vocab,
+        ) {
+            Ok(ids) => ids,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        let gen_cfg = generate::GenerateConfig {
+            sampler: sample::SamplerConfig {
+                max_denoising_steps: steps.max(1),
+                ..sample::SamplerConfig::default()
+            },
+            max_new_tokens,
+            seed,
+        };
+
+        let enc_seq = prompt.len().max(canvas);
+        let mut enc_cpu = model::encoder::EncoderScratch::new(enc_seq, &m.config);
+        let mut dec_cpu = model::decoder::DecoderScratch::new(canvas, &m.config);
+        let mut enc_gpu = model::encoder::EncoderScratch::new(enc_seq, &m.config);
+        let mut dec_gpu = GpuDecoderScratch::new(canvas, &m.config);
+        let gpu_weights = match load_weight_cache(&m.weights, &m.config.text_config) {
+            Ok(w) => w,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let mut engine = match GpuDecoderEngine::new() {
+            Ok(e) => e,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        eprintln!("running CPU generate...");
+        let cpu_started = std::time::Instant::now();
+        let cpu_out = match generate::generate(
+            &m.weights,
+            &m.config,
+            &prompt,
+            &gen_cfg,
+            &mut enc_cpu,
+            &mut dec_cpu,
+        ) {
+            Ok(out) => out,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let cpu_elapsed = cpu_started.elapsed();
+
+        eprintln!("running GPU generate...");
+        let gpu_started = std::time::Instant::now();
+        let gpu_out = match generate::generate_gpu(
+            &m.weights,
+            &m.config,
+            &prompt,
+            &gen_cfg,
+            &mut enc_gpu,
+            &mut dec_gpu,
+            &gpu_weights,
+            &mut engine,
+        ) {
+            Ok(out) => out,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let gpu_elapsed = gpu_started.elapsed();
+
+        if cpu_out.token_ids != gpu_out.token_ids {
+            let first_diff = cpu_out
+                .token_ids
+                .iter()
+                .zip(gpu_out.token_ids.iter())
+                .position(|(a, b)| a != b);
+            eprintln!(
+                "error: token mismatch at index {:?} (cpu len={}, gpu len={})",
+                first_diff,
+                cpu_out.token_ids.len(),
+                gpu_out.token_ids.len()
+            );
+            if let Some(i) = first_diff {
+                eprintln!("  cpu[{}]={}", i, cpu_out.token_ids[i]);
+                eprintln!("  gpu[{}]={}", i, gpu_out.token_ids[i]);
+            }
+            return ExitCode::FAILURE;
+        }
+
+        println!("generate parity ok");
+        println!("  tokens: {}", cpu_out.token_ids.len());
+        println!("  denoise steps: {}", cpu_out.denoise_steps_run);
+        println!("  blocks: {}", cpu_out.blocks_committed);
+        println!("  cpu elapsed: {cpu_elapsed:.2?}");
+        println!("  gpu elapsed: {gpu_elapsed:.2?}");
+        if let Ok(tokenizer) = tokenizer::Tokenizer::load(model_dir.join("tokenizer.json")) {
+            let text = tokenizer.decode(&cpu_out.token_ids);
+            if !text.is_empty() {
+                let preview: String = text.chars().take(200).collect();
+                println!("  text: {preview}");
+            }
+        }
+        ExitCode::SUCCESS
+    }
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    {
+        let _ = (m, model_dir, prompt_text, seed, steps, prompt_len, max_new_tokens);
+        eprintln!("error: generate-parity requires --features metal on macOS");
+        ExitCode::FAILURE
     }
 }
 

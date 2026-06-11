@@ -313,6 +313,25 @@ impl Tokenizer {
         }
         ids
     }
+
+    /// Decode token ids to text (Gemma SentencePiece: ▁ marks word starts).
+    pub fn decode(&self, ids: &[u32]) -> String {
+        let mut out = String::new();
+        for &id in ids {
+            let Some(piece) = self.id_to_token(id) else {
+                continue;
+            };
+            if piece.starts_with(SPACE_REPLACEMENT) {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(piece.trim_start_matches(SPACE_REPLACEMENT));
+            } else {
+                out.push_str(piece);
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]

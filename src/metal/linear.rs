@@ -1,4 +1,5 @@
-use crate::metal::gemm::{f32_to_bf16, Bf16Gemm};
+use crate::metal::batch::GpuBatch;
+use crate::metal::device::ComputePipeline;
 use crate::safetensors::Error;
 use crate::tensor::Bf16Slice;
 
@@ -17,24 +18,48 @@ pub fn bf16_slice_to_vec(slice: Bf16Slice<'_>) -> Vec<u16> {
     (0..slice.len()).map(|i| slice.get(i)).collect()
 }
 
-pub fn pack_input_bf16(x: &[f32]) -> Vec<u16> {
-    x.iter().map(|&v| f32_to_bf16(v)).collect()
+#[derive(Clone)]
+pub struct CachedLinear {
+    pub w_t: Vec<u16>,
+    pub in_dim: usize,
+    pub out_dim: usize,
 }
 
-/// `y[seq, out] = x[seq, in] @ W[out, in]^T` using bf16 GEMM.
-pub fn linear_bf16(
-    gemm: &mut Bf16Gemm,
+impl CachedLinear {
+    pub fn from_bf16(w: Bf16Slice<'_>, out_dim: usize, in_dim: usize) -> Self {
+        let w_raw = bf16_slice_to_vec(w);
+        Self {
+            w_t: transpose_weight_bf16(&w_raw, out_dim, in_dim),
+            in_dim,
+            out_dim,
+        }
+    }
+}
+
+/// Batched `y = x @ W^T` with pre-transposed weights; readback on `batch.end()`.
+pub fn linear_cached_batched(
+    batch: &mut GpuBatch<'_>,
+    pipeline: &ComputePipeline,
     y: &mut [f32],
     x: &[f32],
-    w: Bf16Slice<'_>,
+    w: &CachedLinear,
     seq_len: usize,
-    in_dim: usize,
-    out_dim: usize,
 ) -> Result<(), Error> {
-    if x.len() != seq_len * in_dim || y.len() != seq_len * out_dim || w.len() != out_dim * in_dim {
-        return Err(Error::Format("linear_bf16 shape mismatch"));
+    if x.len() != seq_len * w.in_dim || y.len() != seq_len * w.out_dim {
+        return Err(Error::Format("linear_cached_batched shape mismatch"));
     }
-    let w_raw = bf16_slice_to_vec(w);
-    let w_t = transpose_weight_bf16(&w_raw, out_dim, in_dim);
-    gemm.matmul_f32_bf16(x, &w_t, y, seq_len, in_dim, out_dim)
+    let buf_a = batch.alloc_f32(x)?;
+    let buf_b = batch.alloc_bf16(&w.w_t)?;
+    let buf_c = batch.alloc_f32_out(y.len())?;
+    batch.dispatch_gemm(
+        &pipeline.pipeline,
+        &buf_a,
+        &buf_b,
+        &buf_c,
+        seq_len,
+        w.out_dim,
+        w.in_dim,
+    );
+    batch.register_read(buf_c, y);
+    Ok(())
 }

@@ -1,9 +1,9 @@
-//! End-to-end block diffusion generation on CPU.
+//! End-to-end block diffusion generation (CPU decoder; optional Metal GPU decoder).
 
 use crate::config::ModelConfig;
-use crate::model::decoder::{DecoderForwardInput, DecoderScratch};
-use crate::model::encoder::{prefill, EncoderPrefillInput, EncoderScratch};
+use crate::model::decoder::{DecoderForwardInput, DecoderForwardOutput, DecoderScratch};
 use crate::model::encoder::extend_prefill;
+use crate::model::encoder::{prefill, EncoderPrefillInput, EncoderScratch};
 use crate::model::mask::DecoderAttnMask;
 use crate::sample::{
     accept_canvas, apply_temperature, argmax_canvas, initialize_canvas, renoise_canvas,
@@ -35,13 +35,48 @@ pub struct GenerateOutput {
     pub blocks_committed: usize,
 }
 
-pub fn generate(
+enum DecoderBackend<'a> {
+    Cpu {
+        store: &'a WeightStore,
+        cfg: &'a ModelConfig,
+        scratch: &'a mut DecoderScratch,
+    },
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    Gpu {
+        store: &'a WeightStore,
+        cfg: &'a ModelConfig,
+        scratch: &'a mut crate::metal::GpuDecoderScratch,
+        weights: &'a crate::metal::GpuDecoderWeightCache,
+        engine: &'a mut crate::metal::GpuDecoderEngine,
+    },
+}
+
+fn decoder_forward(
+    backend: &mut DecoderBackend<'_>,
+    input: &DecoderForwardInput<'_>,
+) -> Result<DecoderForwardOutput, Error> {
+    match backend {
+        DecoderBackend::Cpu { store, cfg, scratch } => {
+            crate::model::decoder::forward(store, cfg, input, scratch)
+        }
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        DecoderBackend::Gpu {
+            store,
+            cfg,
+            scratch,
+            weights,
+            engine,
+        } => crate::metal::decoder_forward(store, cfg, input, scratch, weights, engine),
+    }
+}
+
+fn generate_inner(
     store: &WeightStore,
     cfg: &ModelConfig,
     prompt_token_ids: &[u32],
     gen_cfg: &GenerateConfig,
     enc_scratch: &mut EncoderScratch,
-    dec_scratch: &mut DecoderScratch,
+    decoder: &mut DecoderBackend<'_>,
 ) -> Result<GenerateOutput, Error> {
     let text = &cfg.text_config;
     let canvas_len = cfg.canvas_length;
@@ -94,7 +129,7 @@ pub fn generate(
                 self_conditioning_logits: self_conditioning_logits.as_deref(),
                 mask: Some(mask.clone()),
             };
-            let decoder_out = crate::model::decoder::forward(store, cfg, &decoder_input, dec_scratch)?;
+            let decoder_out = decoder_forward(decoder, &decoder_input)?;
 
             processed_logits.copy_from_slice(&decoder_out.logits);
             apply_temperature(&mut processed_logits, cur_step, &gen_cfg.sampler);
@@ -135,6 +170,43 @@ pub fn generate(
         denoise_steps_run,
         blocks_committed,
     })
+}
+
+pub fn generate(
+    store: &WeightStore,
+    cfg: &ModelConfig,
+    prompt_token_ids: &[u32],
+    gen_cfg: &GenerateConfig,
+    enc_scratch: &mut EncoderScratch,
+    dec_scratch: &mut DecoderScratch,
+) -> Result<GenerateOutput, Error> {
+    let mut decoder = DecoderBackend::Cpu {
+        store,
+        cfg,
+        scratch: dec_scratch,
+    };
+    generate_inner(store, cfg, prompt_token_ids, gen_cfg, enc_scratch, &mut decoder)
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn generate_gpu(
+    store: &WeightStore,
+    cfg: &ModelConfig,
+    prompt_token_ids: &[u32],
+    gen_cfg: &GenerateConfig,
+    enc_scratch: &mut EncoderScratch,
+    dec_scratch: &mut crate::metal::GpuDecoderScratch,
+    weights: &crate::metal::GpuDecoderWeightCache,
+    engine: &mut crate::metal::GpuDecoderEngine,
+) -> Result<GenerateOutput, Error> {
+    let mut decoder = DecoderBackend::Gpu {
+        store,
+        cfg,
+        scratch: dec_scratch,
+        weights,
+        engine,
+    };
+    generate_inner(store, cfg, prompt_token_ids, gen_cfg, enc_scratch, &mut decoder)
 }
 
 #[cfg(test)]

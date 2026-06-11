@@ -7,18 +7,84 @@ use crate::model::kv_cache::LayerKvView;
 use crate::model::layer_weights::DecoderLayerWeights;
 use crate::model::self_conditioning::{apply as apply_self_conditioning, SelfConditioningWeights};
 use crate::safetensors::Error;
+use crate::metal::weights::GpuDecoderWeightCache;
 use crate::weights::WeightStore;
+
+pub fn load_weight_cache(
+    store: &WeightStore,
+    text: &crate::config::TextConfig,
+) -> Result<GpuDecoderWeightCache, Error> {
+    eprintln!(
+        "warming GPU weight cache ({} layers)...",
+        text.num_hidden_layers
+    );
+    let warm = std::time::Instant::now();
+    let cache = GpuDecoderWeightCache::load(store, text)?;
+    eprintln!("  weight cache ready in {:.2?}", warm.elapsed());
+    Ok(cache)
+}
 
 pub struct GpuDecoderScratch {
     pub cpu: DecoderScratch,
+    layer_kv_len: usize,
+    layers: Vec<GpuDecoderLayerScratch>,
 }
 
 impl GpuDecoderScratch {
     pub fn new(seq_len: usize, cfg: &ModelConfig) -> Self {
         Self {
             cpu: DecoderScratch::new(seq_len, cfg),
+            layer_kv_len: usize::MAX,
+            layers: Vec::new(),
         }
     }
+
+    fn ensure_layers(
+        &mut self,
+        cfg: &ModelConfig,
+        seq_len: usize,
+        kv_len: usize,
+    ) -> Result<(), Error> {
+        let n_layers = cfg.text_config.num_hidden_layers;
+        if self.layer_kv_len == kv_len && self.layers.len() == n_layers {
+            return Ok(());
+        }
+        self.layers.clear();
+        for layer in 0..n_layers {
+            self.layers.push(GpuDecoderLayerScratch::with_kv_len(
+                seq_len,
+                &cfg.text_config,
+                layer,
+                kv_len,
+            )?);
+        }
+        self.layer_kv_len = kv_len;
+        Ok(())
+    }
+}
+
+pub struct BenchConfig {
+    pub max_layers: usize,
+}
+
+pub fn bench_forward(
+    store: &WeightStore,
+    cfg: &ModelConfig,
+    input: &DecoderForwardInput<'_>,
+    scratch: &mut GpuDecoderScratch,
+    weights: &GpuDecoderWeightCache,
+    engine: &mut GpuDecoderEngine,
+    bench: &BenchConfig,
+) -> Result<DecoderForwardOutput, Error> {
+    forward_inner(
+        store,
+        cfg,
+        input,
+        scratch,
+        weights,
+        engine,
+        bench.max_layers,
+    )
 }
 
 pub fn forward(
@@ -26,7 +92,21 @@ pub fn forward(
     cfg: &ModelConfig,
     input: &DecoderForwardInput<'_>,
     scratch: &mut GpuDecoderScratch,
+    weights: &GpuDecoderWeightCache,
     engine: &mut GpuDecoderEngine,
+) -> Result<DecoderForwardOutput, Error> {
+    let n = cfg.text_config.num_hidden_layers;
+    forward_inner(store, cfg, input, scratch, weights, engine, n)
+}
+
+fn forward_inner(
+    store: &WeightStore,
+    cfg: &ModelConfig,
+    input: &DecoderForwardInput<'_>,
+    scratch: &mut GpuDecoderScratch,
+    weights: &GpuDecoderWeightCache,
+    engine: &mut GpuDecoderEngine,
+    max_layers: usize,
 ) -> Result<DecoderForwardOutput, Error> {
     let text = &cfg.text_config;
     let seq_len = input.token_ids.len();
@@ -75,17 +155,19 @@ pub fn forward(
     let positions: Vec<i64> =
         (input.kv_cache.kv_len as i64..input.kv_cache.kv_len as i64 + seq_len as i64).collect();
 
+    scratch.ensure_layers(cfg, seq_len, input.kv_cache.kv_len)?;
+
     let mut in_buf = &mut scratch.cpu.hidden_a;
     let mut out_buf = &mut scratch.cpu.hidden_b;
 
-    for layer in 0..text.num_hidden_layers {
-        let weights = DecoderLayerWeights::load(store, layer, text)?;
-        let mut layer_scratch =
-            GpuDecoderLayerScratch::with_kv_len(seq_len, text, layer, input.kv_cache.kv_len)?;
+    let n_layers = max_layers.min(text.num_hidden_layers);
+    for layer in 0..n_layers {
+        let layer_weights = DecoderLayerWeights::load(store, layer, text)?;
         layer_forward(
             out_buf,
             in_buf,
-            &weights,
+            &layer_weights,
+            &weights.layers[layer],
             text,
             layer,
             seq_len,
@@ -98,24 +180,28 @@ pub fn forward(
                 input.kv_cache.kv_len,
             ),
             mask,
-            &mut layer_scratch,
+            &mut scratch.layers[layer],
             engine,
         )?;
         std::mem::swap(&mut in_buf, &mut out_buf);
     }
 
-    scratch.cpu.norm_w = store.tensor("model.decoder.norm.weight")?.bf16()?.to_f32_vec();
-    engine.kernels.rms_norm_rows(
-        &engine.ctx.queue,
-        &mut engine.pool,
-        &engine.ctx.device,
-        out_buf,
-        in_buf,
-        &scratch.cpu.norm_w,
-        seq_len,
-        hidden,
-        text.rms_norm_eps as f32,
-    )?;
+    {
+        use crate::metal::batched_kernels as bk;
+        use crate::metal::batch::GpuBatch;
+        let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
+        bk::rms_norm_rows(
+            &mut batch,
+            &engine.kernels,
+            out_buf,
+            in_buf,
+            &weights.final_norm,
+            seq_len,
+            hidden,
+            text.rms_norm_eps as f32,
+        )?;
+        batch.end()?;
+    }
 
     let mut logits = vec![0.0f32; seq_len * vocab];
     lm_head_tied_bf16(&mut logits, out_buf, embed, seq_len, hidden, vocab)?;

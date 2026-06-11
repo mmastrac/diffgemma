@@ -1,8 +1,11 @@
 use crate::config::TextConfig;
 use crate::kernels::cpu::gelu_pytorch_tanh;
+use crate::metal::batched_kernels::{self as bk};
+use crate::metal::batch::GpuBatch;
 use crate::metal::engine::GpuDecoderEngine;
-use crate::metal::linear::linear_bf16;
-use crate::metal::moe::{experts_forward_gpu, GpuMoeScratch};
+use crate::metal::linear::linear_cached_batched;
+use crate::metal::moe::experts_forward_gpu_batched;
+use crate::metal::weights::GpuLayerWeightCache;
 use crate::model::attention::{
     forward_decoder as attention_forward_decoder, AttentionParams, AttentionScratch,
 };
@@ -15,7 +18,6 @@ use crate::safetensors::Error;
 pub struct GpuDecoderLayerScratch {
     pub cpu: DecoderLayerScratch,
     pub attn: AttentionScratch,
-    pub moe: GpuMoeScratch,
     pub attn_out: Vec<f32>,
     pub residual: Vec<f32>,
     pub normed: Vec<f32>,
@@ -24,6 +26,10 @@ pub struct GpuDecoderLayerScratch {
     pub dense_out: Vec<f32>,
     pub moe_branch: Vec<f32>,
     pub moe_input: Vec<f32>,
+    pub moe_batch_input: Vec<f32>,
+    pub moe_batch_gate_up: Vec<f32>,
+    pub moe_batch_gate_act: Vec<f32>,
+    pub moe_batch_out: Vec<f32>,
 }
 
 impl GpuDecoderLayerScratch {
@@ -39,7 +45,6 @@ impl GpuDecoderLayerScratch {
         Ok(Self {
             cpu: DecoderLayerScratch::with_kv_len(seq_len, cfg, layer, kv_cache_len)?,
             attn: AttentionScratch::with_kv_len(seq_len, hidden, &attn_params, kv_cache_len),
-            moe: GpuMoeScratch::new(seq_len, cfg),
             attn_out: vec![0.0; seq_len * hidden],
             residual: vec![0.0; seq_len * hidden],
             normed: vec![0.0; seq_len * hidden],
@@ -48,6 +53,10 @@ impl GpuDecoderLayerScratch {
             dense_out: vec![0.0; seq_len * hidden],
             moe_branch: vec![0.0; seq_len * hidden],
             moe_input: vec![0.0; seq_len * hidden],
+            moe_batch_input: Vec::new(),
+            moe_batch_gate_up: Vec::new(),
+            moe_batch_gate_act: Vec::new(),
+            moe_batch_out: Vec::new(),
         })
     }
 }
@@ -56,6 +65,7 @@ pub fn forward_decoder(
     out: &mut [f32],
     hidden_states: &[f32],
     weights: &DecoderLayerWeights<'_>,
+    cached: &GpuLayerWeightCache,
     cfg: &TextConfig,
     layer: usize,
     seq_len: usize,
@@ -82,87 +92,81 @@ pub fn forward_decoder(
         &mut scratch.attn,
     )?;
 
-    let post_attn_w = weights.post_attention_layernorm.bf16()?.to_f32_vec();
     scratch.residual.copy_from_slice(hidden_states);
-    engine.kernels.rms_norm_rows(
-        &engine.ctx.queue,
-        &mut engine.pool,
-        &engine.ctx.device,
-        &mut scratch.normed,
-        &scratch.attn_out,
-        &post_attn_w,
-        seq_len,
-        hidden,
-        eps,
-    )?;
-    engine.kernels.vec_add_inplace(
-        &engine.ctx.queue,
-        &mut engine.pool,
-        &engine.ctx.device,
-        &mut scratch.normed,
-        &scratch.residual,
-    )?;
 
-    scratch.residual.copy_from_slice(&scratch.normed);
-    let pre_ff_w = weights.pre_feedforward_layernorm.bf16()?.to_f32_vec();
-    engine.kernels.rms_norm_rows(
-        &engine.ctx.queue,
-        &mut engine.pool,
-        &engine.ctx.device,
-        &mut scratch.normed,
-        &scratch.residual,
-        &pre_ff_w,
-        seq_len,
-        hidden,
-        eps,
-    )?;
+    // Batch 1: post-attn norm → dense gate/up linears
+    {
+        let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
+        bk::rms_norm_rows(
+            &mut batch,
+            &engine.kernels,
+            &mut scratch.normed,
+            &scratch.attn_out,
+            &cached.post_attn_norm,
+            seq_len,
+            hidden,
+            eps,
+        )?;
+        bk::vec_add_inplace(&mut batch, &engine.kernels, &mut scratch.normed, &scratch.residual)?;
+        scratch.residual.copy_from_slice(&scratch.normed);
+        bk::rms_norm_rows(
+            &mut batch,
+            &engine.kernels,
+            &mut scratch.normed,
+            &scratch.residual,
+            &cached.pre_ff_norm,
+            seq_len,
+            hidden,
+            eps,
+        )?;
+        linear_cached_batched(
+            &mut batch,
+            &engine.f32_bf16_gemm_pipeline,
+            &mut scratch.gate,
+            &scratch.normed,
+            &cached.mlp_gate,
+            seq_len,
+        )?;
+        linear_cached_batched(
+            &mut batch,
+            &engine.f32_bf16_gemm_pipeline,
+            &mut scratch.mlp_hidden,
+            &scratch.normed,
+            &cached.mlp_up,
+            seq_len,
+        )?;
+        batch.end()?;
+    }
 
-    linear_bf16(
-        &mut engine.gemm,
-        &mut scratch.gate,
-        &scratch.normed,
-        weights.mlp_gate.bf16()?,
-        seq_len,
-        hidden,
-        inter,
-    )?;
-    linear_bf16(
-        &mut engine.gemm,
-        &mut scratch.mlp_hidden,
-        &scratch.normed,
-        weights.mlp_up.bf16()?,
-        seq_len,
-        hidden,
-        inter,
-    )?;
     gelu_pytorch_tanh(&mut scratch.gate);
     for i in 0..scratch.mlp_hidden.len() {
         scratch.mlp_hidden[i] *= scratch.gate[i];
     }
-    linear_bf16(
-        &mut engine.gemm,
-        &mut scratch.dense_out,
-        &scratch.mlp_hidden,
-        weights.mlp_down.bf16()?,
-        seq_len,
-        inter,
-        hidden,
-    )?;
 
-    let post_ff_1_w = weights.post_feedforward_layernorm_1.bf16()?.to_f32_vec();
-    engine.kernels.rms_norm_rows(
-        &engine.ctx.queue,
-        &mut engine.pool,
-        &engine.ctx.device,
-        &mut scratch.normed,
-        &scratch.dense_out,
-        &post_ff_1_w,
-        seq_len,
-        hidden,
-        eps,
-    )?;
+    // Batch 2: down linear → post_ff_1 norm
+    {
+        let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
+        linear_cached_batched(
+            &mut batch,
+            &engine.f32_bf16_gemm_pipeline,
+            &mut scratch.dense_out,
+            &scratch.mlp_hidden,
+            &cached.mlp_down,
+            seq_len,
+        )?;
+        bk::rms_norm_rows(
+            &mut batch,
+            &engine.kernels,
+            &mut scratch.normed,
+            &scratch.dense_out,
+            &cached.post_ff_norm_1,
+            seq_len,
+            hidden,
+            eps,
+        )?;
+        batch.end()?;
+    }
 
-    // CPU router for now: GPU router logits differ enough to change top-k vs CPU.
     let routes = crate::model::moe::route(
         &scratch.residual,
         weights,
@@ -171,81 +175,73 @@ pub fn forward_decoder(
         &mut scratch.cpu.moe,
     )?;
 
-    let pre_ff_2_w = weights.pre_feedforward_layernorm_2.bf16()?.to_f32_vec();
-    engine.kernels.rms_norm_rows(
-        &engine.ctx.queue,
-        &mut engine.pool,
-        &engine.ctx.device,
-        &mut scratch.moe_input,
-        &scratch.residual,
-        &pre_ff_2_w,
-        seq_len,
-        hidden,
-        eps,
-    )?;
-    experts_forward_gpu(
+    // Batch 3: MoE input norm → expert GEMMs → final norms/add/scale
+    {
+        let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
+        bk::rms_norm_rows(
+            &mut batch,
+            &engine.kernels,
+            &mut scratch.moe_input,
+            &scratch.residual,
+            &cached.pre_ff_norm_2,
+            seq_len,
+            hidden,
+            eps,
+        )?;
+        batch.end()?;
+    }
+
+    experts_forward_gpu_batched(
         &mut scratch.moe_branch,
         &scratch.moe_input,
         weights,
+        cached,
         cfg,
         seq_len,
         &routes,
-        &mut scratch.moe,
+        &mut scratch.moe_batch_input,
+        &mut scratch.moe_batch_gate_up,
+        &mut scratch.moe_batch_gate_act,
+        &mut scratch.moe_batch_out,
         &engine.ctx,
         &mut engine.pool,
-        &engine.kernels,
         &engine.f32_bf16_gemm_pipeline,
     )?;
 
-    scratch.dense_out.copy_from_slice(&scratch.moe_branch);
-    let post_ff_2_w = weights.post_feedforward_layernorm_2.bf16()?.to_f32_vec();
-    engine.kernels.rms_norm_rows(
-        &engine.ctx.queue,
-        &mut engine.pool,
-        &engine.ctx.device,
-        &mut scratch.moe_branch,
-        &scratch.dense_out,
-        &post_ff_2_w,
-        seq_len,
-        hidden,
-        eps,
-    )?;
-    engine.kernels.vec_add_inplace(
-        &engine.ctx.queue,
-        &mut engine.pool,
-        &engine.ctx.device,
-        &mut scratch.normed,
-        &scratch.moe_branch,
-    )?;
+    {
+        let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
+        scratch.dense_out.copy_from_slice(&scratch.moe_branch);
+        bk::rms_norm_rows(
+            &mut batch,
+            &engine.kernels,
+            &mut scratch.moe_branch,
+            &scratch.dense_out,
+            &cached.post_ff_norm_2,
+            seq_len,
+            hidden,
+            eps,
+        )?;
+        bk::vec_add_inplace(
+            &mut batch,
+            &engine.kernels,
+            &mut scratch.normed,
+            &scratch.moe_branch,
+        )?;
+        bk::rms_norm_rows(
+            &mut batch,
+            &engine.kernels,
+            out,
+            &scratch.normed,
+            &cached.post_ff_norm,
+            seq_len,
+            hidden,
+            eps,
+        )?;
+        bk::vec_add_inplace(&mut batch, &engine.kernels, out, &scratch.residual)?;
+        bk::vec_scale_inplace(&mut batch, &engine.kernels, out, cached.layer_scalar)?;
+        batch.end()?;
+    }
 
-    let post_ff_w = weights.post_feedforward_layernorm.bf16()?.to_f32_vec();
-    engine.kernels.rms_norm_rows(
-        &engine.ctx.queue,
-        &mut engine.pool,
-        &engine.ctx.device,
-        out,
-        &scratch.normed,
-        &post_ff_w,
-        seq_len,
-        hidden,
-        eps,
-    )?;
-    engine.kernels.vec_add_inplace(
-        &engine.ctx.queue,
-        &mut engine.pool,
-        &engine.ctx.device,
-        out,
-        &scratch.residual,
-    )?;
-
-    let layer_scalar = weights.layer_scalar.bf16_scalar()?;
-    engine.kernels.vec_scale_inplace(
-        &engine.ctx.queue,
-        &mut engine.pool,
-        &engine.ctx.device,
-        out,
-        layer_scalar,
-    )?;
     Ok(())
 }
 

@@ -10,14 +10,14 @@ use objc2_metal::{
 const DECODER_SHADER: &str = include_str!("../../shaders/decoder.metal");
 
 pub struct GpuKernels {
-    rms_norm: ComputePipeline,
-    rms_norm_no_scale: ComputePipeline,
-    vec_add: ComputePipeline,
-    vec_mul: ComputePipeline,
-    vec_scale: ComputePipeline,
-    router_scale: ComputePipeline,
-    gelu: ComputePipeline,
-    swiglu_mul: ComputePipeline,
+    pub(crate) rms_norm: ComputePipeline,
+    pub(crate) rms_norm_no_scale: ComputePipeline,
+    pub(crate) vec_add: ComputePipeline,
+    pub(crate) vec_mul: ComputePipeline,
+    pub(crate) vec_scale: ComputePipeline,
+    pub(crate) router_scale: ComputePipeline,
+    pub(crate) gelu: ComputePipeline,
+    pub(crate) swiglu_mul: ComputePipeline,
 }
 
 impl GpuKernels {
