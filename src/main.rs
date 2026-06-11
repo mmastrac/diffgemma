@@ -37,6 +37,7 @@ enum Command {
         steps: usize,
         prompt_len: usize,
         max_new_tokens: usize,
+        max_layers: Option<usize>,
     },
     GenerateGpu {
         prompt: Option<String>,
@@ -44,6 +45,7 @@ enum Command {
         steps: usize,
         prompt_len: usize,
         max_new_tokens: usize,
+        max_layers: Option<usize>,
     },
     GenerateParity {
         prompt: Option<String>,
@@ -51,6 +53,7 @@ enum Command {
         steps: usize,
         prompt_len: usize,
         max_new_tokens: usize,
+        max_layers: Option<usize>,
     },
     Tokenize(String),
     Gemm { size: usize },
@@ -127,21 +130,53 @@ fn run_command(m: &model::Model, model_dir: &std::path::Path, command: Command) 
             steps,
             prompt_len,
             max_new_tokens,
-        } => run_generate(m, model_dir, prompt, seed, steps, prompt_len, max_new_tokens, false),
+            max_layers,
+        } => run_generate(
+            m,
+            model_dir,
+            prompt,
+            seed,
+            steps,
+            prompt_len,
+            max_new_tokens,
+            max_layers,
+            false,
+        ),
         Command::GenerateGpu {
             prompt,
             seed,
             steps,
             prompt_len,
             max_new_tokens,
-        } => run_generate(m, model_dir, prompt, seed, steps, prompt_len, max_new_tokens, true),
+            max_layers,
+        } => run_generate(
+            m,
+            model_dir,
+            prompt,
+            seed,
+            steps,
+            prompt_len,
+            max_new_tokens,
+            max_layers,
+            true,
+        ),
         Command::GenerateParity {
             prompt,
             seed,
             steps,
             prompt_len,
             max_new_tokens,
-        } => run_generate_parity(m, model_dir, prompt, seed, steps, prompt_len, max_new_tokens),
+            max_layers,
+        } => run_generate_parity(
+            m,
+            model_dir,
+            prompt,
+            seed,
+            steps,
+            prompt_len,
+            max_new_tokens,
+            max_layers,
+        ),
         Command::Tokenize(_) => ExitCode::FAILURE,
         Command::Gemm { .. } => ExitCode::FAILURE,
     }
@@ -260,7 +295,7 @@ fn parse_cli() -> Cli {
     }
 
     let command = match positional.first().map(String::as_str) {
-        None => default_generate_command(prompt, seed, steps, prompt_len, max_new_tokens),
+        None => default_generate_command(prompt, seed, steps, prompt_len, max_new_tokens, parity_layers),
         Some("summary") => Command::Summary,
         Some("config") => Command::Config,
         Some("weights") => {
@@ -279,6 +314,7 @@ fn parse_cli() -> Cli {
             steps,
             prompt_len,
             max_new_tokens,
+            max_layers: parity_layers,
         },
         Some("generate-gpu") => Command::GenerateGpu {
             prompt: prompt.clone(),
@@ -286,6 +322,7 @@ fn parse_cli() -> Cli {
             steps,
             prompt_len,
             max_new_tokens,
+            max_layers: parity_layers,
         },
         Some("generate-parity") => Command::GenerateParity {
             prompt: prompt.clone(),
@@ -293,6 +330,7 @@ fn parse_cli() -> Cli {
             steps,
             prompt_len,
             max_new_tokens,
+            max_layers: parity_layers,
         },
         Some("tokenize") => {
             let text = positional.get(1).cloned().unwrap_or_else(|| {
@@ -320,7 +358,7 @@ fn parse_cli() -> Cli {
                 "usage: diffgemma-mps [-p PROMPT] [summary|config|weights <name>|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-parity|tokenize <text>|gemm|attention]"
             );
             eprintln!("  default (no command): generate-gpu with --features metal");
-            eprintln!("  options: -p/--prompt TEXT --seed N --steps N --prompt-len N --max-new-tokens N");
+            eprintln!("  options: -p/--prompt TEXT --seed N --steps N --prompt-len N --max-new-tokens N --layers N");
             eprintln!("  gemm options: --size N (default 512, requires --features metal)");
             eprintln!("  attention: layer 0 GQA parity (requires --features metal)");
             eprintln!("  decoder-gpu: full decoder CPU vs GPU parity at seq=256 (requires --features metal)");
@@ -338,6 +376,7 @@ fn default_generate_command(
     steps: usize,
     prompt_len: usize,
     max_new_tokens: usize,
+    max_layers: Option<usize>,
 ) -> Command {
     Command::GenerateGpu {
         prompt,
@@ -345,6 +384,7 @@ fn default_generate_command(
         steps,
         prompt_len,
         max_new_tokens,
+        max_layers,
     }
 }
 
@@ -355,6 +395,7 @@ fn default_generate_command(
     steps: usize,
     prompt_len: usize,
     max_new_tokens: usize,
+    max_layers: Option<usize>,
 ) -> Command {
     Command::Generate {
         prompt,
@@ -362,6 +403,7 @@ fn default_generate_command(
         steps,
         prompt_len,
         max_new_tokens,
+        max_layers,
     }
 }
 
@@ -969,6 +1011,7 @@ fn run_generate(
     steps: usize,
     prompt_len: usize,
     max_new_tokens: usize,
+    max_layers: Option<usize>,
     use_gpu: bool,
 ) -> ExitCode {
     let vocab = m.config.text_config.vocab_size;
@@ -998,11 +1041,15 @@ fn run_generate(
         },
         max_new_tokens,
         seed,
+        max_layers,
     };
 
     let backend = if use_gpu { "generate-gpu" } else { "generate" };
+    let layers_note = max_layers
+        .map(|n| format!(", layers={n}"))
+        .unwrap_or_default();
     eprintln!(
-        "running {backend} (prompt_len={prompt_len}, canvas={canvas}, steps={steps}, max_new_tokens={max_new_tokens}, seed={seed})..."
+        "running {backend} (prompt_len={prompt_len}, canvas={canvas}, steps={steps}, max_new_tokens={max_new_tokens}, seed={seed}{layers_note})..."
     );
     let started = std::time::Instant::now();
 
@@ -1079,6 +1126,7 @@ fn run_generate_parity(
     steps: usize,
     prompt_len: usize,
     max_new_tokens: usize,
+    max_layers: Option<usize>,
 ) -> ExitCode {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     {
@@ -1106,7 +1154,12 @@ fn run_generate_parity(
             },
             max_new_tokens,
             seed,
+            max_layers,
         };
+
+        if let Some(n) = max_layers {
+            eprintln!("generate-parity: decoder layers limited to {n}");
+        }
 
         let enc_seq = prompt.len().max(canvas);
         let mut enc_cpu = model::encoder::EncoderScratch::new(enc_seq, &m.config);
@@ -1202,7 +1255,7 @@ fn run_generate_parity(
     }
     #[cfg(not(all(feature = "metal", target_os = "macos")))]
     {
-        let _ = (m, model_dir, prompt_text, seed, steps, prompt_len, max_new_tokens);
+        let _ = (m, model_dir, prompt_text, seed, steps, prompt_len, max_new_tokens, max_layers);
         eprintln!("error: generate-parity requires --features metal on macOS");
         ExitCode::FAILURE
     }

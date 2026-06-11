@@ -17,6 +17,8 @@ pub struct GenerateConfig {
     pub sampler: SamplerConfig,
     pub max_new_tokens: usize,
     pub seed: u64,
+    /// Limit decoder layers (None = full stack). For smoke tests only.
+    pub max_layers: Option<usize>,
 }
 
 impl Default for GenerateConfig {
@@ -25,6 +27,7 @@ impl Default for GenerateConfig {
             sampler: SamplerConfig::default(),
             max_new_tokens: 256,
             seed: 42,
+            max_layers: None,
         }
     }
 }
@@ -54,10 +57,11 @@ enum DecoderBackend<'a> {
 fn decoder_forward(
     backend: &mut DecoderBackend<'_>,
     input: &DecoderForwardInput<'_>,
+    max_layers: Option<usize>,
 ) -> Result<DecoderForwardOutput, Error> {
     match backend {
         DecoderBackend::Cpu { store, cfg, scratch } => {
-            crate::model::decoder::forward(store, cfg, input, scratch, None)
+            crate::model::decoder::forward(store, cfg, input, scratch, max_layers)
         }
         #[cfg(all(feature = "metal", target_os = "macos"))]
         DecoderBackend::Gpu {
@@ -66,7 +70,7 @@ fn decoder_forward(
             scratch,
             weights,
             engine,
-        } => crate::metal::decoder_forward(store, cfg, input, scratch, weights, engine),
+        } => crate::metal::decoder_forward(store, cfg, input, scratch, weights, engine, max_layers),
     }
 }
 
@@ -129,7 +133,7 @@ fn generate_inner(
                 self_conditioning_logits: self_conditioning_logits.as_deref(),
                 mask: Some(mask.clone()),
             };
-            let decoder_out = decoder_forward(decoder, &decoder_input)?;
+            let decoder_out = decoder_forward(decoder, &decoder_input, gen_cfg.max_layers)?;
 
             processed_logits.copy_from_slice(&decoder_out.logits);
             apply_temperature(&mut processed_logits, cur_step, &gen_cfg.sampler);

@@ -119,8 +119,11 @@ pub fn forward(
     scratch: &mut GpuDecoderScratch,
     weights: &mut GpuDecoderWeightCache,
     engine: &mut GpuDecoderEngine,
+    max_layers: Option<usize>,
 ) -> Result<DecoderForwardOutput, Error> {
-    let n = cfg.text_config.num_hidden_layers;
+    let n = max_layers
+        .unwrap_or(cfg.text_config.num_hidden_layers)
+        .min(cfg.text_config.num_hidden_layers);
     forward_inner(store, cfg, input, scratch, weights, engine, n)
 }
 

@@ -357,12 +357,22 @@ cargo run --release --features metal -- bench-decoder --seq 16 --kv 8 --layers 3
 | `generate-gpu` / `generate-parity` CLI | ✅ | Shared loop via `DecoderBackend`; `-p` prompt |
 | `bench-decoder` | ✅ | `--seq`, `--kv`, `--layers`, `--iters` |
 | `decoder-gpu` scalable parity | ✅ | `--seq`, `--kv`, `--layers`; memory estimate printed |
+| GPU decoder attention | ✅ | `decoder_attention.rs`: RoPE + GQA on GPU |
+| `--layers` on generate commands | ✅ | smoke-test subset of decoder stack |
 | KV cache on GPU | — | persist across prefill + denoise |
-| CPU↔GPU only at boundaries | partial | GPU decoder forward; CPU attention + router still |
+| CPU↔GPU only at boundaries | partial | GPU norms/GEMM/MoE/attention; CPU QKV prep, router, sampler |
 | Entropy + sampling on CPU | ✅ | same as Phase 6 |
-| Block loop on GPU | partial | `generate-gpu` wired; end-to-end token parity TBD |
+| Block loop on GPU | ✅ | `generate-parity` token match (full 30 layers, steps=1) |
 
 **Exit criteria:** `cargo run --features metal -- generate-gpu -p "Hello" --seed 42` prints coherent text; matches CPU path tokens for same seed.
+
+**Verified (2025-06):**
+```bash
+cargo run --release --features metal -- generate-parity -p "Hello" --seed 42 --steps 1
+# generate parity ok — cpu ~682s, gpu ~452s (30 layers, canvas=256)
+cargo run --release --features metal -- generate-parity -p "Hello" --seed 42 --steps 1 --layers 3
+# fast smoke test (~minutes)
+```
 
 ---
 
@@ -389,7 +399,7 @@ cargo run --release --features metal -- bench-decoder --seq 16 --kv 8 --layers 3
 
 | Idea | Impact | Notes |
 |------|--------|-------|
-| Wire `GpuAttention` into decoder layer | high | removes largest CPU bottleneck per layer |
+| Wire `GpuAttention` into decoder layer | high | ✅ RoPE + GQA on GPU |
 | Per-layer weight paging | high RAM / medium speed | transpose once per layer per session |
 | Keep MoE arena batching | medium | already 2 syncs/layer; don't re-sync per expert |
 | Fuse independent GPU norms/GEMMs | medium | only when buffer dependencies allow readback |
@@ -564,17 +574,17 @@ diffgemma-mps/
 
 ## Immediate next step
 
-**Phase 12:** finish memory paging, then introduce `FastSlice` and migrate the hottest bf16 access loops.
+**Phase 11:** finish GPU generation path — KV on GPU, optional `--steps 2+` parity gate.
 
-1. **Wire `GpuAttention`** into `decoder_layer.rs` (biggest remaining CPU bottleneck).
-2. **Migrate remaining hot paths** — `model/moe.rs` CPU experts, attention weight dequant.
-3. **Skip logits alloc in parity mode** — save 256 MiB on comparison runs.
-4. **Optional: layer weight sticky cache** — retain N recently used layers if paging cost dominates.
+1. **GPU KV cache** — avoid CPU mirrors across denoise steps (largest remaining Phase 11 item).
+2. **GPU QKV + o_proj** — move attention bookends off CPU; share Metal context/pool with decoder engine.
+3. **Fuse attention submits** — RoPE + GQA in one command buffer per layer.
 
-Always record before/after numbers:
+**Phase 12 (ongoing):**
 ```bash
 cargo run --release --features metal -- bench-decoder --seq 16 --kv 8 --layers 3 --iters 3
 cargo run --release --features metal -- decoder-gpu --seq 16 --kv 8 --layers 3
+cargo run --release --features metal -- generate-parity -p "Hello" --seed 42 --steps 1 --layers 3
 ```
 
-**Phase 11 (parallel):** `generate-gpu -p "Hello" --seed 42 --steps 1` token parity vs CPU.
+**Phase 11 smoke test (full stack):** `generate-parity -p "Hello" --seed 42 --steps 1` (30 layers, ~10–15 min).
