@@ -1,9 +1,10 @@
 use crate::config::TextConfig;
 use crate::kernels::cpu::{compute_rope_freqs, rope_kind_for_layer};
-use crate::metal::attention_batch::{gqa_batched, rope_qk_batched};
+use crate::metal::attention_batch::{gqa_batched, gqa_batched_gpu_kv, rope_qk_batched};
 use crate::metal::batched_kernels::{self as bk};
 use crate::metal::batch::GpuBatch;
 use crate::metal::engine::GpuDecoderEngine;
+use crate::metal::kv_cache::GpuKvCache;
 use crate::metal::linear::linear_cached_batched;
 use crate::metal::weights::GpuLayerWeightCache;
 use crate::model::attention::{
@@ -49,6 +50,7 @@ pub fn forward_decoder_attention(
     mask: Option<&DecoderAttnMask>,
     scratch: &mut AttentionScratch,
     engine: &mut GpuDecoderEngine,
+    gpu_kv: Option<&GpuKvCache>,
 ) -> Result<(), Error> {
     let hidden_size = cfg.hidden_size;
     let eps = cfg.rms_norm_eps as f32;
@@ -137,14 +139,20 @@ pub fn forward_decoder_attention(
         batch.end()?;
     }
 
-    concat_kv_for_decoder(
-        &mut scratch.k_full,
-        &mut scratch.v_full,
-        &kv,
-        &scratch.k,
-        &scratch.v,
-        &params,
-    );
+    let use_gpu_kv = gpu_kv
+        .map(|g| g.kv_len == kv.kv_len)
+        .unwrap_or(false);
+
+    if !use_gpu_kv {
+        concat_kv_for_decoder(
+            &mut scratch.k_full,
+            &mut scratch.v_full,
+            &kv,
+            &scratch.k,
+            &scratch.v,
+            &params,
+        );
+    }
 
     let default_mask;
     let gqa_mask = match mask {
@@ -155,7 +163,25 @@ pub fn forward_decoder_attention(
         }
     };
 
-    {
+    if use_gpu_kv {
+        let gpu_kv = gpu_kv.expect("gpu kv");
+        gpu_kv.write_canvas_kv(layer, seq_len, &scratch.k, &scratch.v)?;
+        let (k_buf, v_buf) = gpu_kv.layer_buffers(layer)?;
+        let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
+        gqa_batched_gpu_kv(
+            &mut batch,
+            &engine.attention,
+            &mut scratch.attn_out,
+            &scratch.q,
+            k_buf,
+            v_buf,
+            seq_len,
+            total_kv,
+            &params,
+            gqa_mask,
+        )?;
+        batch.end()?;
+    } else {
         let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
         gqa_batched(
             &mut batch,

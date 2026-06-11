@@ -8,6 +8,7 @@ use crate::model::layer_weights::DecoderLayerWeights;
 use crate::model::self_conditioning::{apply as apply_self_conditioning, SelfConditioningWeights};
 use crate::safetensors::Error;
 use crate::metal::weights::GpuDecoderWeightCache;
+use crate::metal::kv_cache::GpuKvCache;
 use crate::weights::WeightStore;
 
 pub fn load_weight_cache(
@@ -71,6 +72,7 @@ impl LayerScratchReuse {
 
 pub struct GpuDecoderScratch {
     pub cpu: DecoderScratch,
+    pub gpu_kv: Option<GpuKvCache>,
     layer: LayerScratchReuse,
 }
 
@@ -78,6 +80,7 @@ impl GpuDecoderScratch {
     pub fn new(seq_len: usize, cfg: &ModelConfig) -> Self {
         Self {
             cpu: DecoderScratch::new(seq_len, cfg),
+            gpu_kv: None,
             layer: LayerScratchReuse {
                 seq_len: 0,
                 kv_len: 0,
@@ -85,6 +88,30 @@ impl GpuDecoderScratch {
                 full: None,
             },
         }
+    }
+
+    pub fn ensure_gpu_kv(
+        &mut self,
+        device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
+        cfg: &TextConfig,
+        max_encoder_kv: usize,
+        max_canvas: usize,
+    ) -> Result<(), Error> {
+        if self.gpu_kv.is_none() {
+            self.gpu_kv = Some(GpuKvCache::new(device, cfg, max_encoder_kv, max_canvas)?);
+        }
+        Ok(())
+    }
+
+    pub fn sync_gpu_kv_from_cpu(
+        &mut self,
+        cpu: &crate::model::kv_cache::KvCache,
+        canvas_len: usize,
+    ) -> Result<(), Error> {
+        if let Some(gpu_kv) = self.gpu_kv.as_mut() {
+            gpu_kv.sync_all_from_cpu(cpu, canvas_len)?;
+        }
+        Ok(())
     }
 }
 
@@ -188,6 +215,7 @@ fn forward_inner(
     let mut out_buf = &mut scratch.cpu.hidden_b;
 
     let n_layers = max_layers.min(text.num_hidden_layers);
+    let gpu_kv_ref = scratch.gpu_kv.as_ref();
     for layer in 0..n_layers {
         let layer_scratch = scratch.layer.ensure(cfg, seq_len, input.kv_cache.kv_len, layer)?;
         let layer_weights = DecoderLayerWeights::load(store, layer, text)?;
@@ -211,6 +239,7 @@ fn forward_inner(
             mask,
             layer_scratch,
             engine,
+            gpu_kv_ref,
         )?;
         weights.release_layer();
         std::mem::swap(&mut in_buf, &mut out_buf);

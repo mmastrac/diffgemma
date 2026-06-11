@@ -4,6 +4,7 @@ use crate::config::ModelConfig;
 use crate::model::decoder::{DecoderForwardInput, DecoderScratch};
 use crate::model::encoder::extend_prefill;
 use crate::model::encoder::{prefill, EncoderPrefillInput, EncoderScratch};
+use crate::model::kv_cache::KvCache;
 use crate::model::mask::DecoderAttnMask;
 use crate::sample::{
     accept_canvas, apply_temperature, argmax_canvas, initialize_canvas, renoise_canvas,
@@ -81,6 +82,21 @@ fn decoder_forward(
     }
 }
 
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn sync_gpu_kv_cache(
+    decoder: &mut DecoderBackend<'_>,
+    kv_cache: &KvCache,
+    canvas_len: usize,
+    max_encoder_kv: usize,
+) -> Result<(), Error> {
+    if let DecoderBackend::Gpu { scratch, engine, cfg, .. } = decoder {
+        let text = &cfg.text_config;
+        scratch.ensure_gpu_kv(&engine.ctx.device, text, max_encoder_kv, canvas_len)?;
+        scratch.sync_gpu_kv_from_cpu(kv_cache, canvas_len)?;
+    }
+    Ok(())
+}
+
 fn generate_inner(
     store: &WeightStore,
     cfg: &ModelConfig,
@@ -108,6 +124,9 @@ fn generate_inner(
 
     let mut sequences = prompt_token_ids.to_vec();
     let mut kv_cache = prefill_out.kv_cache;
+    let max_encoder_kv = prompt_token_ids.len() + gen_cfg.max_new_tokens;
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    sync_gpu_kv_cache(decoder, &kv_cache, canvas_len, max_encoder_kv)?;
     let mut rng = Rng::new(gen_cfg.seed);
     let mut denoise_steps_run = 0usize;
     let mut blocks_committed = 0usize;
@@ -193,6 +212,8 @@ fn generate_inner(
         if !is_last_block {
             let extend_started = std::time::Instant::now();
             extend_prefill(store, cfg, &mut kv_cache, &argmax_canvas_tokens, enc_scratch)?;
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            sync_gpu_kv_cache(decoder, &kv_cache, canvas_len, max_encoder_kv)?;
             extend_elapsed += extend_started.elapsed();
         }
         blocks_committed += 1;

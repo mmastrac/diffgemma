@@ -47,6 +47,17 @@ impl BufferPool {
         }
     }
 
+    pub fn write_f32_at_offset(
+        buffer: &ProtocolObject<dyn MTLBuffer>,
+        byte_offset: usize,
+        data: &[f32],
+    ) {
+        let ptr = buffer.contents().as_ptr() as *mut f32;
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(byte_offset / 4), data.len());
+        }
+    }
+
     pub fn write_bf16(buffer: &ProtocolObject<dyn MTLBuffer>, data: &[u16]) {
         Self::write_bf16_ptr(buffer, data.as_ptr(), data.len());
     }

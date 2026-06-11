@@ -13,6 +13,7 @@ mod engine;
 mod gemm;
 mod kernels;
 mod linear;
+mod kv_cache;
 mod memory;
 mod moe;
 mod weights;
@@ -24,5 +25,6 @@ pub use decoder::{
     bench_forward, forward as decoder_forward, load_weight_cache, BenchConfig, GpuDecoderScratch,
 };
 pub use weights::GpuDecoderWeightCache;
+pub use kv_cache::GpuKvCache;
 pub use engine::GpuDecoderEngine;
 pub use gemm::{bf16_matmul_cpu, f32_to_bf16, Bf16Gemm};

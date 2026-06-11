@@ -393,7 +393,7 @@ cargo run --release --features metal -- generate-parity -p "Hello" --seed 42 --s
 | Skip logits clone in generate loop | ✅ | reuse `sample_logits` / `sc_logits` buffers |
 | Zero-copy logits in generate forward | ✅ | `logits_out` + reusable `logits_buf`; skip lm_head in bench |
 | Generate golden fixtures | ✅ | `fixtures/generate/*.json`; GPU-only `generate-parity` |
-| GPU KV without CPU mirrors | — | for generation loop |
+| GPU KV without CPU mirrors | partial ✅ | persistent prefix buffers; canvas suffix patched per forward |
 
 **OOM note:** full `decoder-gpu` (30 layers, seq=256) needs ~2.3 GiB single-path (estimate). Prior OOM was caused by 30 persistent attention scratches + unbounded expert transpose cache + CPU∥GPU peak.
 

@@ -613,6 +613,19 @@ fn run_decoder_gpu_parity(m: &model::Model, seq_len: usize, kv_len: usize, layer
                 return ExitCode::FAILURE;
             }
         };
+        if let Err(err) = gpu_scratch.ensure_gpu_kv(
+            &engine.ctx.device,
+            &m.config.text_config,
+            kv_len,
+            canvas_len,
+        ) {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+        if let Err(err) = gpu_scratch.sync_gpu_kv_from_cpu(&kv_cache, canvas_len) {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
 
         eprintln!(
             "running GPU decoder forward (canvas={canvas_len}, kv={kv_len}, layers={max_layers})..."
@@ -785,6 +798,19 @@ fn run_bench_decoder(
                 return ExitCode::FAILURE;
             }
         };
+        if let Err(err) = scratch.ensure_gpu_kv(
+            &engine.ctx.device,
+            &m.config.text_config,
+            kv_len,
+            seq_len,
+        ) {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+        if let Err(err) = scratch.sync_gpu_kv_from_cpu(&kv_cache, seq_len) {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
 
         let bench = BenchConfig { max_layers: layers };
         eprintln!(
