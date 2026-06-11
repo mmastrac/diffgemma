@@ -70,7 +70,7 @@ impl DecoderLayerScratch {
         })
     }
 
-    fn load_norm_and_mlp(&mut self, weights: &DecoderLayerWeights<'_>) -> Result<(), Error> {
+    pub fn load_norm_and_mlp(&mut self, weights: &DecoderLayerWeights<'_>) -> Result<(), Error> {
         self.post_attn_norm_w = weights.post_attention_layernorm.bf16()?.to_f32_vec();
         self.pre_ff_norm_w = weights.pre_feedforward_layernorm.bf16()?.to_f32_vec();
         self.post_ff_norm_w = weights.post_feedforward_layernorm.bf16()?.to_f32_vec();

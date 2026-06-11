@@ -675,7 +675,7 @@ pub fn forward_decoder(
     Ok(())
 }
 
-fn normalize_qkv_heads(
+pub fn normalize_qkv_heads(
     q: &mut [f32],
     k: &mut [f32],
     v: &mut [f32],
@@ -714,6 +714,17 @@ fn normalize_qkv_heads(
             );
         }
     }
+}
+
+pub fn concat_kv_for_decoder(
+    k_full: &mut [f32],
+    v_full: &mut [f32],
+    kv: &LayerKvView<'_>,
+    k_canvas: &[f32],
+    v_canvas: &[f32],
+    params: &AttentionParams,
+) {
+    concat_kv_cache(k_full, v_full, *kv, k_canvas, v_canvas, params);
 }
 
 fn concat_kv_cache(

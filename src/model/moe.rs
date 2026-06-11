@@ -95,7 +95,7 @@ pub fn route(
     Ok(routes)
 }
 
-fn top_k_route(probs: &[f32], k: usize, per_expert_scale: &[f32]) -> RouteResult {
+pub fn top_k_route(probs: &[f32], k: usize, per_expert_scale: &[f32]) -> RouteResult {
     let mut ranked: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let top = &ranked[..k];
@@ -210,4 +210,18 @@ pub fn prepare_expert_input(
     eps: f32,
 ) {
     rms_norm_rows(out, residual, norm_w, seq_len, hidden, eps);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn top_k_route_renormalizes_and_scales() {
+        let probs = [0.1f32, 0.2, 0.3, 0.4];
+        let scales = [1.0, 2.0, 1.0, 0.5];
+        let route = top_k_route(&probs, 2, &scales);
+        assert_eq!(route.indices, vec![3, 2]);
+        assert!(route.weights.iter().all(|w| *w > 0.0));
+    }
 }

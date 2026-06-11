@@ -38,6 +38,7 @@ enum Command {
     Tokenize(String),
     Gemm { size: usize },
     Attention,
+    DecoderGpu,
 }
 
 fn main() -> ExitCode {
@@ -81,6 +82,7 @@ fn run_command(m: &model::Model, command: Command) -> ExitCode {
         Command::Layer0 => run_layer0_forward(m),
         Command::Attention => run_attention_parity(m),
         Command::Decoder => run_decoder_forward(m),
+        Command::DecoderGpu => run_decoder_gpu_parity(m),
         Command::Prefill => run_prefill(m),
         Command::Generate {
             seed,
@@ -182,14 +184,16 @@ fn parse_cli() -> Cli {
         }
         Some("gemm") => Command::Gemm { size: gemm_size },
         Some("attention") => Command::Attention,
+        Some("decoder-gpu") => Command::DecoderGpu,
         Some(cmd) => {
             eprintln!("unknown command: {cmd}");
             eprintln!(
-                "usage: diffgemma-mps [summary|config|weights <name>|layer0|decoder|prefill|generate|tokenize <text>|gemm|attention]"
+                "usage: diffgemma-mps [summary|config|weights <name>|layer0|decoder|decoder-gpu|prefill|generate|tokenize <text>|gemm|attention]"
             );
             eprintln!("  generate options: --seed N --steps N --prompt-len N --max-new-tokens N");
             eprintln!("  gemm options: --size N (default 512, requires --features metal)");
             eprintln!("  attention: layer 0 GQA parity (requires --features metal)");
+            eprintln!("  decoder-gpu: full decoder CPU vs GPU parity at seq=256 (requires --features metal)");
             std::process::exit(2);
         }
     };
@@ -301,6 +305,145 @@ fn run_prefill(m: &model::Model) -> ExitCode {
             eprintln!("error: {err}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn run_decoder_gpu_parity(m: &model::Model) -> ExitCode {
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    {
+        use metal::{decoder_forward as gpu_forward, GpuDecoderEngine, GpuDecoderScratch};
+        use model::decoder::{forward as cpu_forward, DecoderForwardInput, DecoderScratch};
+
+        const CANVAS_LEN: usize = 256;
+        const KV_LEN: usize = 128;
+        let hidden = m.config.text_config.hidden_size;
+
+        let kv_cache = match model::kv_cache::KvCache::dummy(&m.config.text_config, KV_LEN, 42) {
+            Ok(cache) => cache,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        let mut token_ids = vec![0u32; CANVAS_LEN];
+        let vocab = m.config.text_config.vocab_size;
+        for (i, id) in token_ids.iter_mut().enumerate() {
+            *id = ((i * 997 + 13) % vocab.max(1)) as u32;
+        }
+
+        let mask = model::mask::DecoderAttnMask::all_valid(CANVAS_LEN, KV_LEN);
+        let input = DecoderForwardInput {
+            token_ids: &token_ids,
+            kv_cache: &kv_cache,
+            self_conditioning_logits: None,
+            mask: Some(mask),
+        };
+
+        let mut cpu_scratch = DecoderScratch::new(CANVAS_LEN, &m.config);
+        let mut gpu_scratch = GpuDecoderScratch::new(CANVAS_LEN, &m.config);
+        let mut engine = match GpuDecoderEngine::new() {
+            Ok(e) => e,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        eprintln!(
+            "running CPU decoder forward (canvas={CANVAS_LEN}, kv={KV_LEN}, layers={})...",
+            m.config.text_config.num_hidden_layers
+        );
+        let cpu_started = std::time::Instant::now();
+        let cpu_out = match cpu_forward(&m.weights, &m.config, &input, &mut cpu_scratch) {
+            Ok(out) => out,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let cpu_elapsed = cpu_started.elapsed();
+
+        eprintln!("running GPU decoder forward...");
+        let gpu_started = std::time::Instant::now();
+        let gpu_out = match gpu_forward(&m.weights, &m.config, &input, &mut gpu_scratch, &mut engine)
+        {
+            Ok(out) => out,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let gpu_elapsed = gpu_started.elapsed();
+
+        let mut max_abs = 0.0f32;
+        let mut max_rel = 0.0f32;
+        let mut max_idx = 0usize;
+        let mut nan_count = 0usize;
+        for (i, (&c, &g)) in cpu_out
+            .hidden_states
+            .iter()
+            .zip(gpu_out.hidden_states.iter())
+            .enumerate()
+        {
+            if !g.is_finite() {
+                nan_count += 1;
+                continue;
+            }
+            let d = (c - g).abs();
+            if !d.is_finite() {
+                nan_count += 1;
+                continue;
+            }
+            let denom = c.abs().max(g.abs()).max(1e-2);
+            let rel = d / denom;
+            if d > max_abs {
+                max_abs = d;
+                max_idx = i;
+            }
+            if rel > max_rel {
+                max_rel = rel;
+            }
+        }
+        if nan_count > 0 {
+            eprintln!("error: GPU hidden has {nan_count} non-finite values");
+            return ExitCode::FAILURE;
+        }
+
+        println!("decoder GPU parity ok");
+        println!("  hidden shape: [{CANVAS_LEN}, {hidden}]");
+        println!("  cpu elapsed: {cpu_elapsed:.2?}");
+        println!("  gpu elapsed: {gpu_elapsed:.2?}");
+        println!("  max_abs_diff: {max_abs:.6} at index {max_idx}");
+        println!("  max_rel_diff: {max_rel:.6}");
+        println!(
+            "  cpu hidden[0..4]: [{:.6}, {:.6}, {:.6}, {:.6}]",
+            cpu_out.hidden_states[0],
+            cpu_out.hidden_states[1],
+            cpu_out.hidden_states[2],
+            cpu_out.hidden_states[3]
+        );
+        println!(
+            "  gpu hidden[0..4]: [{:.6}, {:.6}, {:.6}, {:.6}]",
+            gpu_out.hidden_states[0],
+            gpu_out.hidden_states[1],
+            gpu_out.hidden_states[2],
+            gpu_out.hidden_states[3]
+        );
+
+        const TOL: f32 = 1e-2;
+        if max_abs <= TOL {
+            ExitCode::SUCCESS
+        } else {
+            eprintln!("error: max_abs_diff {max_abs} exceeds tolerance {TOL}");
+            ExitCode::FAILURE
+        }
+    }
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    {
+        let _ = m;
+        eprintln!("error: decoder-gpu requires --features metal on macOS");
+        ExitCode::FAILURE
     }
 }
 

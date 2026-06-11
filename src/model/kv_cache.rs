@@ -136,6 +136,7 @@ impl KvCache {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct LayerKvView<'a> {
     pub keys: &'a [f32],
     pub values: &'a [f32],

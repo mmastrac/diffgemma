@@ -325,18 +325,20 @@ Verified: layer 0, seq=16, `max_abs_diff: 0.000001`.
 
 ---
 
-## Phase 10 — Metal MoE + full decoder
+## Phase 10 — Metal MoE + full decoder ✅
 
 **Deliverable:** 30-layer decoder on GPU.
 
 | Task | Notes |
 |------|-------|
-| Router top-k (8 of 128) | softmax + gather |
-| Expert GEMM batching | group tokens by expert to avoid 128 sequential launches |
-| Shared MLP path | non-MoE fallback per layer |
-| Layer norm + activations on GPU | fuse where ROI is clear |
+| Router top-k (8 of 128) | CPU router for top-k parity; GPU router path in `route_gpu` (needs top-k tie-break parity) |
+| Expert GEMM batching | `experts_forward_gpu` groups tokens by expert; f32 activations × bf16 weights |
+| Shared MLP path | GPU RMSNorm + `f32_bf16_gemm` dense MLP; CPU GELU/SwiGLU |
+| Layer norm + activations on GPU | `shaders/decoder.metal` elementwise kernels; 256-wide threadgroups (Metal 65535 TG limit) |
 
-**Exit criteria:** Full decoder forward matches CPU on `seq=256` (bf16 tolerance ~1e-2 relative).
+**Exit criteria:** Full decoder forward matches CPU on `seq=256` (bf16 tolerance ~1e-2). `decoder-gpu` passes with `max_abs_diff ≤ 1e-2` (~0.008); ~2× faster than CPU path on M-series.
+
+**Run:** `cargo run --release --features metal -- decoder-gpu`
 
 ---
 
