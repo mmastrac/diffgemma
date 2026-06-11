@@ -15,7 +15,7 @@ mod memory;
 mod moe;
 mod weights;
 
-pub use memory::{estimate_decoder_forward, estimate_weight_cache, MemoryEstimate};
+pub use memory::{estimate_decoder_forward, estimate_paged_layer_bytes, estimate_weight_cache, MemoryEstimate};
 
 pub use attention::GpuAttention;
 pub use decoder::{

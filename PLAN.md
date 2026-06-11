@@ -379,7 +379,7 @@ cargo run --release --features metal -- bench-decoder --seq 16 --kv 8 --layers 3
 | GPU-first parity + drop GPU state | ✅ | avoids CPU+GPU peak in `decoder-gpu` |
 | Buffer pool trim | ✅ | `BufferPool::trim()` at forward end |
 | Memory estimates | ✅ | `src/metal/memory.rs`; printed by `decoder-gpu` |
-| Per-layer weight cache paging | — | load `GpuLayerWeightCache` for layer L only (~35 MiB vs ~1 GiB) |
+| Per-layer weight cache paging | ✅ | one `GpuLayerWeightCache` resident; load/release per layer |
 | Skip logits in parity mode | — | save 256 MiB on comparison runs |
 | GPU KV without CPU mirrors | — | for generation loop |
 
@@ -426,6 +426,7 @@ Today `Bf16Slice::get()` bounds-checks every element; `to_f32_vec()` and MoE tra
 |-----------|---------|
 | Post FastSlice commit | ~2.26s |
 | Post embed migration | ~2.13s |
+| Post weight paging (layers=3) | ~2.16s (RAM ~1 GiB → ~35 MiB weights) |
 
 ---
 

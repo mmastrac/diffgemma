@@ -14,13 +14,10 @@ pub fn load_weight_cache(
     store: &WeightStore,
     text: &crate::config::TextConfig,
 ) -> Result<GpuDecoderWeightCache, Error> {
-    eprintln!(
-        "warming GPU weight cache ({} layers)...",
-        text.num_hidden_layers
-    );
+    eprintln!("initializing GPU weight cache (paged layers, final norm only)...");
     let warm = std::time::Instant::now();
     let cache = GpuDecoderWeightCache::load(store, text)?;
-    eprintln!("  weight cache ready in {:.2?}", warm.elapsed());
+    eprintln!("  cache ready in {:.2?}", warm.elapsed());
     Ok(cache)
 }
 
@@ -100,7 +97,7 @@ pub fn bench_forward(
     cfg: &ModelConfig,
     input: &DecoderForwardInput<'_>,
     scratch: &mut GpuDecoderScratch,
-    weights: &GpuDecoderWeightCache,
+    weights: &mut GpuDecoderWeightCache,
     engine: &mut GpuDecoderEngine,
     bench: &BenchConfig,
 ) -> Result<DecoderForwardOutput, Error> {
@@ -120,7 +117,7 @@ pub fn forward(
     cfg: &ModelConfig,
     input: &DecoderForwardInput<'_>,
     scratch: &mut GpuDecoderScratch,
-    weights: &GpuDecoderWeightCache,
+    weights: &mut GpuDecoderWeightCache,
     engine: &mut GpuDecoderEngine,
 ) -> Result<DecoderForwardOutput, Error> {
     let n = cfg.text_config.num_hidden_layers;
@@ -132,7 +129,7 @@ fn forward_inner(
     cfg: &ModelConfig,
     input: &DecoderForwardInput<'_>,
     scratch: &mut GpuDecoderScratch,
-    weights: &GpuDecoderWeightCache,
+    weights: &mut GpuDecoderWeightCache,
     engine: &mut GpuDecoderEngine,
     max_layers: usize,
 ) -> Result<DecoderForwardOutput, Error> {
@@ -191,11 +188,12 @@ fn forward_inner(
     for layer in 0..n_layers {
         let layer_scratch = scratch.layer.ensure(cfg, seq_len, input.kv_cache.kv_len, layer)?;
         let layer_weights = DecoderLayerWeights::load(store, layer, text)?;
+        let layer_cache = weights.ensure_layer(store, text, layer)?;
         layer_forward(
             out_buf,
             in_buf,
             &layer_weights,
-            &weights.layers[layer],
+            layer_cache,
             text,
             layer,
             seq_len,
@@ -211,7 +209,7 @@ fn forward_inner(
             layer_scratch,
             engine,
         )?;
-        weights.layers[layer].clear_expert_cache();
+        weights.release_layer();
         std::mem::swap(&mut in_buf, &mut out_buf);
     }
 

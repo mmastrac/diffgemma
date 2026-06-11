@@ -10,6 +10,8 @@ use crate::tensor::Bf16Slice;
 use crate::weights::WeightStore;
 use std::cell::RefCell;
 
+const NO_LAYER: usize = usize::MAX;
+
 fn bf16_tensor_to_f32_buffer(slice: Bf16Slice<'_>) -> Buffer<f32> {
     let mut out = Buffer::new(slice.len());
     bf16_to_f32_into(FastBf16Slice::from_bf16(slice), out.as_fast_slice_mut());
@@ -114,13 +116,6 @@ impl GpuLayerWeightCache {
         f(cache[expert].as_ref().expect("expert down").as_fast_slice())
     }
 
-    /// Drop lazily transposed expert weights (call after each layer forward).
-    pub fn clear_expert_cache(&self) {
-        let n = self.expert_gate_up.borrow().len();
-        *self.expert_gate_up.borrow_mut() = (0..n).map(|_| None).collect();
-        *self.expert_down.borrow_mut() = (0..n).map(|_| None).collect();
-    }
-
     pub fn resident_bytes(&self) -> u64 {
         let mut bytes = (self.post_attn_norm.len()
             + self.pre_ff_norm.len()
@@ -142,20 +137,49 @@ impl GpuLayerWeightCache {
     }
 }
 
+/// Final norm plus at most one layer of transposed GPU weights resident at a time.
 pub struct GpuDecoderWeightCache {
-    pub layers: Vec<GpuLayerWeightCache>,
     pub final_norm: Buffer<f32>,
+    layer: Option<GpuLayerWeightCache>,
+    loaded_layer: usize,
 }
 
 impl GpuDecoderWeightCache {
-    pub fn load(store: &WeightStore, text: &TextConfig) -> Result<Self, Error> {
-        let mut layers = Vec::with_capacity(text.num_hidden_layers);
-        for layer in 0..text.num_hidden_layers {
-            let weights = DecoderLayerWeights::load(store, layer, text)?;
-            layers.push(GpuLayerWeightCache::load(&weights, text)?);
-        }
+    pub fn load(store: &WeightStore, _text: &TextConfig) -> Result<Self, Error> {
         let final_norm =
             bf16_tensor_to_f32_buffer(store.tensor("model.decoder.norm.weight")?.bf16()?);
-        Ok(Self { layers, final_norm })
+        Ok(Self {
+            final_norm,
+            layer: None,
+            loaded_layer: NO_LAYER,
+        })
+    }
+
+    pub fn ensure_layer(
+        &mut self,
+        store: &WeightStore,
+        text: &TextConfig,
+        layer: usize,
+    ) -> Result<&GpuLayerWeightCache, Error> {
+        if self.loaded_layer != layer || self.layer.is_none() {
+            let weights = DecoderLayerWeights::load(store, layer, text)?;
+            self.layer = Some(GpuLayerWeightCache::load(&weights, text)?);
+            self.loaded_layer = layer;
+        }
+        Ok(self.layer.as_ref().expect("layer cache"))
+    }
+
+    pub fn release_layer(&mut self) {
+        self.layer = None;
+        self.loaded_layer = NO_LAYER;
+    }
+
+    pub fn resident_bytes(&self) -> u64 {
+        self.final_norm.len() as u64 * 4
+            + self
+                .layer
+                .as_ref()
+                .map(GpuLayerWeightCache::resident_bytes)
+                .unwrap_or(0)
     }
 }

@@ -46,7 +46,7 @@ enum DecoderBackend<'a> {
         store: &'a WeightStore,
         cfg: &'a ModelConfig,
         scratch: &'a mut crate::metal::GpuDecoderScratch,
-        weights: &'a crate::metal::GpuDecoderWeightCache,
+        weights: &'a mut crate::metal::GpuDecoderWeightCache,
         engine: &'a mut crate::metal::GpuDecoderEngine,
     },
 }
@@ -196,7 +196,7 @@ pub fn generate_gpu(
     gen_cfg: &GenerateConfig,
     enc_scratch: &mut EncoderScratch,
     dec_scratch: &mut crate::metal::GpuDecoderScratch,
-    weights: &crate::metal::GpuDecoderWeightCache,
+    weights: &mut crate::metal::GpuDecoderWeightCache,
     engine: &mut crate::metal::GpuDecoderEngine,
 ) -> Result<GenerateOutput, Error> {
     let mut decoder = DecoderBackend::Gpu {

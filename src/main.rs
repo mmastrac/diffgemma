@@ -476,8 +476,9 @@ fn run_decoder_gpu_parity(m: &model::Model, seq_len: usize, kv_len: usize, layer
     #[cfg(all(feature = "metal", target_os = "macos"))]
     {
         use metal::{
-            bench_forward, estimate_decoder_forward, estimate_weight_cache, load_weight_cache,
-            BenchConfig, GpuDecoderEngine, GpuDecoderScratch,
+            bench_forward, estimate_decoder_forward, estimate_paged_layer_bytes,
+            estimate_weight_cache, load_weight_cache, BenchConfig, GpuDecoderEngine,
+            GpuDecoderScratch,
         };
         use model::decoder::{forward as cpu_forward, DecoderForwardInput, DecoderScratch};
 
@@ -516,7 +517,7 @@ fn run_decoder_gpu_parity(m: &model::Model, seq_len: usize, kv_len: usize, layer
         est.print_summary("decoder-gpu (single-path)");
 
         let mut gpu_scratch = GpuDecoderScratch::new(canvas_len, &m.config);
-        let gpu_weights = match load_weight_cache(&m.weights, &m.config.text_config) {
+        let mut gpu_weights = match load_weight_cache(&m.weights, &m.config.text_config) {
             Ok(w) => w,
             Err(err) => {
                 eprintln!("error: {err}");
@@ -524,8 +525,9 @@ fn run_decoder_gpu_parity(m: &model::Model, seq_len: usize, kv_len: usize, layer
             }
         };
         eprintln!(
-            "  weight cache actual: {:.1} MiB",
-            estimate_weight_cache(&gpu_weights) as f64 / (1024.0 * 1024.0)
+            "  weight cache: {:.1} KiB final norm; ~{:.1} MiB peak per layer (paged)",
+            estimate_weight_cache(&gpu_weights) as f64 / 1024.0,
+            estimate_paged_layer_bytes(&m.config.text_config) as f64 / (1024.0 * 1024.0)
         );
         let mut engine = match GpuDecoderEngine::new() {
             Ok(e) => e,
@@ -545,7 +547,7 @@ fn run_decoder_gpu_parity(m: &model::Model, seq_len: usize, kv_len: usize, layer
             &m.config,
             &input,
             &mut gpu_scratch,
-            &gpu_weights,
+            &mut gpu_weights,
             &mut engine,
             &bench_cfg,
         ) {
@@ -691,7 +693,7 @@ fn run_bench_decoder(
         };
 
         let mut scratch = GpuDecoderScratch::new(seq_len, &m.config);
-        let gpu_weights = match load_weight_cache(&m.weights, &m.config.text_config) {
+        let mut gpu_weights = match load_weight_cache(&m.weights, &m.config.text_config) {
             Ok(w) => w,
             Err(err) => {
                 eprintln!("error: {err}");
@@ -715,7 +717,7 @@ fn run_bench_decoder(
             &m.config,
             &input,
             &mut scratch,
-            &gpu_weights,
+            &mut gpu_weights,
             &mut engine,
             &bench,
         ) {
@@ -731,7 +733,7 @@ fn run_bench_decoder(
                 &m.config,
                 &input,
                 &mut scratch,
-                &gpu_weights,
+                &mut gpu_weights,
                 &mut engine,
                 &bench,
             ) {
@@ -1008,7 +1010,7 @@ fn run_generate(
     if use_gpu {
         use metal::{load_weight_cache, GpuDecoderEngine, GpuDecoderScratch};
         let mut dec_scratch = GpuDecoderScratch::new(canvas, &m.config);
-        let gpu_weights = match load_weight_cache(&m.weights, &m.config.text_config) {
+        let mut gpu_weights = match load_weight_cache(&m.weights, &m.config.text_config) {
             Ok(w) => w,
             Err(err) => {
                 eprintln!("error: {err}");
@@ -1029,7 +1031,7 @@ fn run_generate(
             &gen_cfg,
             &mut enc_scratch,
             &mut dec_scratch,
-            &gpu_weights,
+            &mut gpu_weights,
             &mut engine,
         ) {
             Ok(out) => {
@@ -1111,7 +1113,7 @@ fn run_generate_parity(
         let mut dec_cpu = model::decoder::DecoderScratch::new(canvas, &m.config);
         let mut enc_gpu = model::encoder::EncoderScratch::new(enc_seq, &m.config);
         let mut dec_gpu = GpuDecoderScratch::new(canvas, &m.config);
-        let gpu_weights = match load_weight_cache(&m.weights, &m.config.text_config) {
+        let mut gpu_weights = match load_weight_cache(&m.weights, &m.config.text_config) {
             Ok(w) => w,
             Err(err) => {
                 eprintln!("error: {err}");
@@ -1153,7 +1155,7 @@ fn run_generate_parity(
             &gen_cfg,
             &mut enc_gpu,
             &mut dec_gpu,
-            &gpu_weights,
+            &mut gpu_weights,
             &mut engine,
         ) {
             Ok(out) => out,

@@ -41,14 +41,10 @@ pub fn estimate_decoder_forward(text: &TextConfig, seq_len: usize, kv_len: usize
     let vocab = text.vocab_size as u64;
     let seq = seq_len as u64;
     let kv = kv_len as u64;
-
-    // Dense transposed bf16 + f32 norms/router per layer (expert transposes are on-demand).
-    let per_layer_dense = 2 * (inter * hidden + hidden * inter) + inter * hidden;
-    let per_layer_f32 = hidden * 6 + experts * hidden + hidden + experts;
-    let weight_cache_bytes = layers * (per_layer_dense * 2 + per_layer_f32 * 4) + hidden * 4;
-
-    // Two reusable layer scratches (sliding + full attention shapes).
     let total_kv = kv + seq;
+
+    let weight_cache_bytes = estimate_paged_layer_bytes(text) + hidden * 4;
+
     let layer_scratch_bytes = layer_attn_scratch_bytes(
         text, seq, total_kv, hidden, inter, moe_inter, experts,
     ) * 2;
@@ -97,9 +93,16 @@ fn layer_attn_scratch_bytes(
 }
 
 pub fn estimate_weight_cache(cache: &GpuDecoderWeightCache) -> u64 {
-    let mut bytes = cache.final_norm.len() as u64 * 4;
-    for layer in &cache.layers {
-        bytes += layer.resident_bytes();
-    }
-    bytes
+    cache.resident_bytes()
+}
+
+pub fn estimate_paged_layer_bytes(text: &TextConfig) -> u64 {
+    let hidden = text.hidden_size as u64;
+    let inter = text.intermediate_size as u64;
+    let per_layer_dense = 2 * (inter * hidden + hidden * inter) + inter * hidden;
+    let per_layer_f32 = hidden * 6
+        + text.num_experts as u64 * hidden
+        + hidden
+        + text.num_experts as u64;
+    per_layer_dense * 2 + per_layer_f32 * 4
 }
