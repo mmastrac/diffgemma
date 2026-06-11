@@ -6,7 +6,9 @@ use crate::metal::engine::GpuDecoderEngine;
 use crate::metal::linear::linear_cached_batched;
 use crate::metal::moe::experts_forward_gpu_batched;
 use crate::metal::weights::GpuLayerWeightCache;
-use crate::metal::decoder_attention::forward_decoder_attention;
+use crate::metal::decoder_attention::{
+    forward_decoder_attention, forward_encoder_extend_attention,
+};
 use crate::metal::kv_cache::GpuKvCache;
 use crate::model::attention::{AttentionParams, AttentionScratch};
 use crate::model::decoder_layer::{forward_decoder as cpu_forward_decoder, DecoderLayerScratch};
@@ -99,8 +101,7 @@ pub fn forward_decoder(
     engine: &mut GpuDecoderEngine,
     gpu_kv: Option<&GpuKvCache>,
 ) -> Result<(), Error> {
-    let hidden = cfg.hidden_size;
-    let eps = cfg.rms_norm_eps as f32;
+    let _hidden = cfg.hidden_size;
 
     forward_decoder_attention(
         &mut scratch.attn_out,
@@ -116,6 +117,31 @@ pub fn forward_decoder(
         engine,
         gpu_kv,
     )?;
+
+    forward_layer_ff(
+        out,
+        hidden_states,
+        weights,
+        cached,
+        cfg,
+        seq_len,
+        scratch,
+        engine,
+    )
+}
+
+fn forward_layer_ff(
+    out: &mut [f32],
+    hidden_states: &[f32],
+    weights: &DecoderLayerWeights<'_>,
+    cached: &GpuLayerWeightCache,
+    cfg: &TextConfig,
+    seq_len: usize,
+    scratch: &mut GpuDecoderLayerScratch,
+    engine: &mut GpuDecoderEngine,
+) -> Result<(), Error> {
+    let hidden = cfg.hidden_size;
+    let eps = cfg.rms_norm_eps as f32;
 
     scratch.residual.copy_from_slice(hidden_states);
 
@@ -261,6 +287,49 @@ pub fn forward_decoder(
     }
 
     Ok(())
+}
+
+pub fn forward_encoder_extend(
+    out: &mut [f32],
+    hidden_states: &[f32],
+    weights: &DecoderLayerWeights<'_>,
+    cached: &GpuLayerWeightCache,
+    cfg: &TextConfig,
+    layer: usize,
+    seq_len: usize,
+    positions: &[i64],
+    kv_cache_len: usize,
+    scratch: &mut GpuDecoderLayerScratch,
+    engine: &mut GpuDecoderEngine,
+    gpu_kv: &GpuKvCache,
+) -> Result<(), Error> {
+    let hidden = cfg.hidden_size;
+    let eps = cfg.rms_norm_eps as f32;
+
+    forward_encoder_extend_attention(
+        &mut scratch.attn_out,
+        hidden_states,
+        cached,
+        cfg,
+        layer,
+        seq_len,
+        positions,
+        kv_cache_len,
+        &mut scratch.attn,
+        engine,
+        gpu_kv,
+    )?;
+
+    forward_layer_ff(
+        out,
+        hidden_states,
+        weights,
+        cached,
+        cfg,
+        seq_len,
+        scratch,
+        engine,
+    )
 }
 
 #[allow(dead_code)]

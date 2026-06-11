@@ -120,6 +120,11 @@ impl KvCache {
         Ok(())
     }
 
+    /// Bump logical length when per-layer tensors are not updated (GPU encoder extend).
+    pub fn advance_kv_len(&mut self, append_len: usize) {
+        self.kv_len += append_len;
+    }
+
     pub fn describe_layer(&self, layer: usize) -> String {
         if let Some(kv) = self.layer(layer) {
             format!(

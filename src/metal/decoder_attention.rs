@@ -216,3 +216,131 @@ pub fn forward_decoder_attention(
 
     Ok(())
 }
+
+/// Encoder extend attention: causal GQA over GPU prefix + new tokens; suffix K/V stay on GPU.
+pub fn forward_encoder_extend_attention(
+    out: &mut [f32],
+    hidden: &[f32],
+    cached: &GpuLayerWeightCache,
+    cfg: &TextConfig,
+    layer: usize,
+    seq_len: usize,
+    positions: &[i64],
+    kv_cache_len: usize,
+    scratch: &mut AttentionScratch,
+    engine: &mut GpuDecoderEngine,
+    gpu_kv: &GpuKvCache,
+) -> Result<(), Error> {
+    let hidden_size = cfg.hidden_size;
+    let eps = cfg.rms_norm_eps as f32;
+    let params = AttentionParams::for_layer(cfg, layer)?;
+    let total_kv = scratch.total_kv_len;
+
+    assert_eq!(hidden.len(), seq_len * hidden_size);
+    assert_eq!(out.len(), seq_len * hidden_size);
+    assert_eq!(positions.len(), seq_len);
+    assert_eq!(kv_cache_len + seq_len, total_kv);
+    assert_eq!(gpu_kv.kv_len, kv_cache_len);
+
+    rms_norm_batch(
+        engine,
+        &mut scratch.normed,
+        hidden,
+        cached.input_layernorm.as_slice(),
+        seq_len,
+        hidden_size,
+        eps,
+    )?;
+
+    {
+        let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
+        linear_cached_batched(
+            &mut batch,
+            &engine.f32_bf16_gemm_pipeline,
+            &mut scratch.q,
+            &scratch.normed,
+            &cached.q_proj,
+            seq_len,
+        )?;
+        linear_cached_batched(
+            &mut batch,
+            &engine.f32_bf16_gemm_pipeline,
+            &mut scratch.k,
+            &scratch.normed,
+            &cached.k_proj,
+            seq_len,
+        )?;
+        if let Some(v_proj) = &cached.v_proj {
+            linear_cached_batched(
+                &mut batch,
+                &engine.f32_bf16_gemm_pipeline,
+                &mut scratch.v,
+                &scratch.normed,
+                v_proj,
+                seq_len,
+            )?;
+        }
+        batch.end()?;
+    }
+
+    if cached.v_proj.is_none() {
+        scratch.v.copy_from_slice(&scratch.k);
+    }
+
+    normalize_qkv_heads(
+        &mut scratch.q,
+        &mut scratch.k,
+        &mut scratch.v,
+        seq_len,
+        &params,
+        eps,
+        &mut scratch.head_buf,
+        cached.q_norm.as_slice(),
+        cached.k_norm.as_slice(),
+    );
+
+    let rope_kind = rope_kind_for_layer(cfg, layer).ok_or(Error::Format("rope kind"))?;
+    compute_rope_freqs(&mut scratch.rope_freqs, positions, rope_kind);
+
+    gpu_kv.write_canvas_kv_pre_rope(layer, seq_len, &scratch.k, &scratch.v)?;
+    let k_suffix_off = gpu_kv.canvas_k_elem_offset(layer)?;
+    let (k_buf, v_buf) = gpu_kv.layer_buffers(layer)?;
+    let gqa_mask = GqaMask::EncoderExtend {
+        kv_cache_len,
+        positions,
+    };
+
+    {
+        let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
+        decoder_gqa_gpu_kv_batched(
+            &mut batch,
+            &engine.attention,
+            &mut scratch.attn_out,
+            &scratch.q,
+            k_buf,
+            v_buf,
+            k_suffix_off,
+            &scratch.rope_freqs,
+            seq_len,
+            total_kv,
+            &params,
+            gqa_mask,
+        )?;
+        batch.end()?;
+    }
+
+    {
+        let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
+        linear_cached_batched(
+            &mut batch,
+            &engine.f32_bf16_gemm_pipeline,
+            out,
+            &scratch.attn_out,
+            &cached.o_proj,
+            seq_len,
+        )?;
+        batch.end()?;
+    }
+
+    Ok(())
+}

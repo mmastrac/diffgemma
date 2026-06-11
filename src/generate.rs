@@ -97,6 +97,53 @@ fn sync_gpu_kv_cache(
     Ok(())
 }
 
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn extend_encoder_kv(
+    backend: &mut DecoderBackend<'_>,
+    store: &WeightStore,
+    cfg: &ModelConfig,
+    kv_cache: &mut KvCache,
+    token_ids: &[u32],
+    enc_scratch: &mut EncoderScratch,
+    max_layers: Option<usize>,
+) -> Result<(), Error> {
+    match backend {
+        DecoderBackend::Gpu {
+            scratch,
+            weights,
+            engine,
+            ..
+        } => crate::metal::extend_prefill_gpu(
+            store,
+            cfg,
+            kv_cache,
+            token_ids,
+            enc_scratch,
+            scratch,
+            weights,
+            engine,
+            max_layers,
+        ),
+        DecoderBackend::Cpu { store, cfg, .. } => {
+            extend_prefill(store, cfg, kv_cache, token_ids, enc_scratch)
+        }
+    }
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn extend_encoder_kv(
+    backend: &mut DecoderBackend<'_>,
+    store: &WeightStore,
+    cfg: &ModelConfig,
+    kv_cache: &mut KvCache,
+    token_ids: &[u32],
+    enc_scratch: &mut EncoderScratch,
+    _max_layers: Option<usize>,
+) -> Result<(), Error> {
+    let _ = backend;
+    extend_prefill(store, cfg, kv_cache, token_ids, enc_scratch)
+}
+
 fn generate_inner(
     store: &WeightStore,
     cfg: &ModelConfig,
@@ -211,9 +258,15 @@ fn generate_inner(
         sequences.extend_from_slice(&argmax_canvas_tokens);
         if !is_last_block {
             let extend_started = std::time::Instant::now();
-            extend_prefill(store, cfg, &mut kv_cache, &argmax_canvas_tokens, enc_scratch)?;
-            #[cfg(all(feature = "metal", target_os = "macos"))]
-            sync_gpu_kv_cache(decoder, &kv_cache, canvas_len, max_encoder_kv)?;
+            extend_encoder_kv(
+                decoder,
+                store,
+                cfg,
+                &mut kv_cache,
+                &argmax_canvas_tokens,
+                enc_scratch,
+                gen_cfg.max_layers,
+            )?;
             extend_elapsed += extend_started.elapsed();
         }
         blocks_committed += 1;

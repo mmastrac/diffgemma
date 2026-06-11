@@ -108,6 +108,19 @@ impl GpuKvCache {
         Ok(())
     }
 
+    pub fn advance_kv_len(&mut self, append_len: usize) -> Result<(), Error> {
+        let cap = self
+            .layers
+            .first()
+            .map(|l| l.capacity_tokens)
+            .unwrap_or(0);
+        if self.kv_len + append_len > cap {
+            return Err(Error::Format("GPU kv cache capacity exceeded"));
+        }
+        self.kv_len += append_len;
+        Ok(())
+    }
+
     pub fn layer_buffers(
         &self,
         layer: usize,

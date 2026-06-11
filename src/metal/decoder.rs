@@ -113,6 +113,16 @@ impl GpuDecoderScratch {
         }
         Ok(())
     }
+
+    pub fn ensure_layer_scratch(
+        &mut self,
+        cfg: &ModelConfig,
+        seq_len: usize,
+        kv_len: usize,
+        layer: usize,
+    ) -> Result<&mut GpuDecoderLayerScratch, Error> {
+        self.layer.ensure(cfg, seq_len, kv_len, layer)
+    }
 }
 
 pub struct BenchConfig {
