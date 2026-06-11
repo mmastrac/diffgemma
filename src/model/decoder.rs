@@ -15,6 +15,26 @@ pub struct DecoderForwardInput<'a> {
     pub kv_cache: &'a KvCache,
     pub self_conditioning_logits: Option<&'a [f32]>,
     pub mask: Option<&'a DecoderAttnMask>,
+    /// When set, lm_head writes here (must be `seq_len * vocab`). Avoids a per-forward logits alloc.
+    pub logits_out: Option<&'a mut [f32]>,
+    /// When false, skip lm_head (e.g. `bench-decoder`).
+    pub compute_logits: bool,
+    /// When false, omit hidden copy in output (generate only needs logits).
+    pub return_hidden: bool,
+}
+
+impl<'a> DecoderForwardInput<'a> {
+    pub fn new(token_ids: &'a [u32], kv_cache: &'a KvCache) -> Self {
+        Self {
+            token_ids,
+            kv_cache,
+            self_conditioning_logits: None,
+            mask: None,
+            logits_out: None,
+            compute_logits: true,
+            return_hidden: true,
+        }
+    }
 }
 
 pub struct DecoderForwardOutput {
@@ -30,6 +50,7 @@ pub struct DecoderScratch {
     pub norm_w: Vec<f32>,
     pub lm_head_chunk: Buffer<f32>,
     pub sc_probs: Buffer<f32>,
+    pub logits_buf: Buffer<f32>,
     pub self_cond: SelfConditioningScratch,
 }
 
@@ -45,6 +66,7 @@ impl DecoderScratch {
             norm_w: Vec::new(),
             lm_head_chunk: Buffer::with_capacity(crate::model::embed::LM_HEAD_CHUNK * hidden),
             sc_probs: Buffer::with_capacity(vocab),
+            logits_buf: Buffer::with_capacity(seq_len * vocab),
             self_cond: SelfConditioningScratch::new(seq_len, &cfg.text_config),
         }
     }
@@ -53,7 +75,7 @@ impl DecoderScratch {
 pub fn forward(
     store: &WeightStore,
     cfg: &ModelConfig,
-    input: &DecoderForwardInput<'_>,
+    input: &mut DecoderForwardInput<'_>,
     scratch: &mut DecoderScratch,
     max_layers: Option<usize>,
 ) -> Result<DecoderForwardOutput, Error> {
@@ -144,23 +166,53 @@ pub fn forward(
         text.rms_norm_eps as f32,
     );
 
-    let mut logits = vec![0.0f32; seq_len * vocab];
-    lm_head_tied_bf16(
-        &mut logits,
-        out_buf,
-        embed,
-        seq_len,
-        hidden,
-        vocab,
-        &mut scratch.lm_head_chunk,
-    )?;
-    logit_softcapping(&mut logits, text.final_logit_softcapping as f32);
+    if input.compute_logits {
+        if let Some(out) = input.logits_out.as_mut() {
+            let need = seq_len * vocab;
+            if out.len() != need {
+                return Err(Error::Format("logits_out length mismatch"));
+            }
+            lm_head_tied_bf16(
+                out,
+                out_buf,
+                embed,
+                seq_len,
+                hidden,
+                vocab,
+                &mut scratch.lm_head_chunk,
+            )?;
+            logit_softcapping(out, text.final_logit_softcapping as f32);
+        } else {
+            scratch.logits_buf.ensure_len(seq_len * vocab);
+            lm_head_tied_bf16(
+                scratch.logits_buf.as_slice_mut(),
+                out_buf,
+                embed,
+                seq_len,
+                hidden,
+                vocab,
+                &mut scratch.lm_head_chunk,
+            )?;
+            logit_softcapping(scratch.logits_buf.as_slice_mut(), text.final_logit_softcapping as f32);
+        }
+    }
 
-    let mut hidden_out = vec![0.0f32; seq_len * hidden];
-    hidden_out.copy_from_slice(out_buf);
+    let hidden_states = if input.return_hidden {
+        let mut hidden_out = vec![0.0f32; seq_len * hidden];
+        hidden_out.copy_from_slice(out_buf);
+        hidden_out
+    } else {
+        Vec::new()
+    };
+
+    let logits = if input.compute_logits && input.logits_out.is_none() {
+        scratch.logits_buf.as_slice().to_vec()
+    } else {
+        Vec::new()
+    };
 
     Ok(DecoderForwardOutput {
-        hidden_states: hidden_out,
+        hidden_states,
         logits,
     })
 }

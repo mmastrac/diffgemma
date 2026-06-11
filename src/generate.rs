@@ -1,7 +1,7 @@
 //! End-to-end block diffusion generation (CPU decoder; optional Metal GPU decoder).
 
 use crate::config::ModelConfig;
-use crate::model::decoder::{DecoderForwardInput, DecoderForwardOutput, DecoderScratch};
+use crate::model::decoder::{DecoderForwardInput, DecoderScratch};
 use crate::model::encoder::extend_prefill;
 use crate::model::encoder::{prefill, EncoderPrefillInput, EncoderScratch};
 use crate::model::mask::DecoderAttnMask;
@@ -59,12 +59,13 @@ enum DecoderBackend<'a> {
 
 fn decoder_forward(
     backend: &mut DecoderBackend<'_>,
-    input: &DecoderForwardInput<'_>,
+    input: &mut DecoderForwardInput<'_>,
     max_layers: Option<usize>,
-) -> Result<DecoderForwardOutput, Error> {
+) -> Result<(), Error> {
     match backend {
         DecoderBackend::Cpu { store, cfg, scratch } => {
-            crate::model::decoder::forward(store, cfg, input, scratch, max_layers)
+            crate::model::decoder::forward(store, cfg, input, scratch, max_layers)?;
+            Ok(())
         }
         #[cfg(all(feature = "metal", target_os = "macos"))]
         DecoderBackend::Gpu {
@@ -73,7 +74,10 @@ fn decoder_forward(
             scratch,
             weights,
             engine,
-        } => crate::metal::decoder_forward(store, cfg, input, scratch, weights, engine, max_layers),
+        } => {
+            crate::metal::decoder_forward(store, cfg, input, scratch, weights, engine, max_layers)?;
+            Ok(())
+        }
     }
 }
 
@@ -140,7 +144,7 @@ fn generate_inner(
                 break;
             }
 
-            let decoder_input = DecoderForwardInput {
+            let mut decoder_input = DecoderForwardInput {
                 token_ids: &current_canvas,
                 kv_cache: &kv_cache,
                 self_conditioning_logits: if have_sc_logits {
@@ -149,10 +153,12 @@ fn generate_inner(
                     None
                 },
                 mask: Some(&mask),
+                logits_out: Some(&mut processed_logits),
+                compute_logits: true,
+                return_hidden: false,
             };
-            let decoder_out = decoder_forward(decoder, &decoder_input, gen_cfg.max_layers)?;
+            decoder_forward(decoder, &mut decoder_input, gen_cfg.max_layers)?;
 
-            processed_logits.copy_from_slice(&decoder_out.logits);
             apply_temperature(&mut processed_logits, cur_step, &gen_cfg.sampler);
 
             sample_logits.copy_from_slice(&processed_logits);

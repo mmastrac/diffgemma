@@ -95,7 +95,7 @@ pub struct BenchConfig {
 pub fn bench_forward(
     store: &WeightStore,
     cfg: &ModelConfig,
-    input: &DecoderForwardInput<'_>,
+    input: &mut DecoderForwardInput<'_>,
     scratch: &mut GpuDecoderScratch,
     weights: &mut GpuDecoderWeightCache,
     engine: &mut GpuDecoderEngine,
@@ -115,7 +115,7 @@ pub fn bench_forward(
 pub fn forward(
     store: &WeightStore,
     cfg: &ModelConfig,
-    input: &DecoderForwardInput<'_>,
+    input: &mut DecoderForwardInput<'_>,
     scratch: &mut GpuDecoderScratch,
     weights: &mut GpuDecoderWeightCache,
     engine: &mut GpuDecoderEngine,
@@ -130,7 +130,7 @@ pub fn forward(
 fn forward_inner(
     store: &WeightStore,
     cfg: &ModelConfig,
-    input: &DecoderForwardInput<'_>,
+    input: &mut DecoderForwardInput<'_>,
     scratch: &mut GpuDecoderScratch,
     weights: &mut GpuDecoderWeightCache,
     engine: &mut GpuDecoderEngine,
@@ -234,23 +234,56 @@ fn forward_inner(
     }
     engine.pool.trim(4);
 
-    let mut logits = vec![0.0f32; seq_len * vocab];
-    lm_head_tied_bf16(
-        &mut logits,
-        out_buf,
-        embed,
-        seq_len,
-        hidden,
-        vocab,
-        &mut scratch.cpu.lm_head_chunk,
-    )?;
-    logit_softcapping(&mut logits, text.final_logit_softcapping as f32);
+    if input.compute_logits {
+        if let Some(out) = input.logits_out.as_mut() {
+            let need = seq_len * vocab;
+            if out.len() != need {
+                return Err(Error::Format("logits_out length mismatch"));
+            }
+            lm_head_tied_bf16(
+                out,
+                out_buf,
+                embed,
+                seq_len,
+                hidden,
+                vocab,
+                &mut scratch.cpu.lm_head_chunk,
+            )?;
+            logit_softcapping(out, text.final_logit_softcapping as f32);
+        } else {
+            scratch.cpu.logits_buf.ensure_len(seq_len * vocab);
+            lm_head_tied_bf16(
+                scratch.cpu.logits_buf.as_slice_mut(),
+                out_buf,
+                embed,
+                seq_len,
+                hidden,
+                vocab,
+                &mut scratch.cpu.lm_head_chunk,
+            )?;
+            logit_softcapping(
+                scratch.cpu.logits_buf.as_slice_mut(),
+                text.final_logit_softcapping as f32,
+            );
+        }
+    }
 
-    let mut hidden_out = vec![0.0f32; seq_len * hidden];
-    hidden_out.copy_from_slice(out_buf);
+    let hidden_states = if input.return_hidden {
+        let mut hidden_out = vec![0.0f32; seq_len * hidden];
+        hidden_out.copy_from_slice(out_buf);
+        hidden_out
+    } else {
+        Vec::new()
+    };
+
+    let logits = if input.compute_logits && input.logits_out.is_none() {
+        scratch.cpu.logits_buf.as_slice().to_vec()
+    } else {
+        Vec::new()
+    };
 
     Ok(DecoderForwardOutput {
-        hidden_states: hidden_out,
+        hidden_states,
         logits,
     })
 }

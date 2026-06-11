@@ -582,11 +582,12 @@ fn run_decoder_gpu_parity(m: &model::Model, seq_len: usize, kv_len: usize, layer
         }
 
         let mask = model::mask::DecoderAttnMask::all_valid(canvas_len, kv_len);
-        let input = DecoderForwardInput {
-            token_ids: &token_ids,
-            kv_cache: &kv_cache,
-            self_conditioning_logits: None,
+        let input = DecoderForwardInput::new(&token_ids, &kv_cache);
+        let mut input = DecoderForwardInput {
             mask: Some(&mask),
+            compute_logits: false,
+            return_hidden: true,
+            ..input
         };
 
         let est = estimate_decoder_forward(&m.config.text_config, canvas_len, kv_len);
@@ -621,7 +622,7 @@ fn run_decoder_gpu_parity(m: &model::Model, seq_len: usize, kv_len: usize, layer
         let gpu_out = match bench_forward(
             &m.weights,
             &m.config,
-            &input,
+            &mut input,
             &mut gpu_scratch,
             &mut gpu_weights,
             &mut engine,
@@ -646,7 +647,7 @@ fn run_decoder_gpu_parity(m: &model::Model, seq_len: usize, kv_len: usize, layer
         let cpu_out = match cpu_forward(
             &m.weights,
             &m.config,
-            &input,
+            &mut input,
             &mut cpu_scratch,
             Some(max_layers),
         ) {
@@ -761,11 +762,12 @@ fn run_bench_decoder(
         }
 
         let mask = model::mask::DecoderAttnMask::all_valid(seq_len, kv_len);
-        let input = DecoderForwardInput {
-            token_ids: &token_ids,
-            kv_cache: &kv_cache,
-            self_conditioning_logits: None,
+        let input = DecoderForwardInput::new(&token_ids, &kv_cache);
+        let mut input = DecoderForwardInput {
             mask: Some(&mask),
+            compute_logits: false,
+            return_hidden: false,
+            ..input
         };
 
         let mut scratch = GpuDecoderScratch::new(seq_len, &m.config);
@@ -791,7 +793,7 @@ fn run_bench_decoder(
         if let Err(err) = bench_forward(
             &m.weights,
             &m.config,
-            &input,
+            &mut input,
             &mut scratch,
             &mut gpu_weights,
             &mut engine,
@@ -807,7 +809,7 @@ fn run_bench_decoder(
             if let Err(err) = bench_forward(
                 &m.weights,
                 &m.config,
-                &input,
+                &mut input,
                 &mut scratch,
                 &mut gpu_weights,
                 &mut engine,
@@ -858,11 +860,10 @@ fn run_decoder_forward(m: &model::Model) -> ExitCode {
 
     let mut scratch = model::decoder::DecoderScratch::new(CANVAS_LEN, &m.config);
     let mask = model::mask::DecoderAttnMask::all_valid(CANVAS_LEN, KV_LEN);
-    let input = model::decoder::DecoderForwardInput {
-        token_ids: &token_ids,
-        kv_cache: &kv_cache,
-        self_conditioning_logits: None,
+    let input = model::decoder::DecoderForwardInput::new(&token_ids, &kv_cache);
+    let mut input = model::decoder::DecoderForwardInput {
         mask: Some(&mask),
+        ..input
     };
 
     eprintln!(
@@ -870,7 +871,7 @@ fn run_decoder_forward(m: &model::Model) -> ExitCode {
         m.config.text_config.num_hidden_layers
     );
     let started = std::time::Instant::now();
-    match model::decoder::forward(&m.weights, &m.config, &input, &mut scratch, None) {
+    match model::decoder::forward(&m.weights, &m.config, &mut input, &mut scratch, None) {
         Ok(out) => {
             println!("decoder forward ok");
             println!("  hidden shape: [{CANVAS_LEN}, {hidden}]");

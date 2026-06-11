@@ -94,6 +94,10 @@ impl<T> Buffer<T> {
     pub fn as_slice(&self) -> &[T] {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
+
+    pub fn as_slice_mut(&mut self) -> &mut [T] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
 }
 
 impl<T: Copy> Buffer<T> {

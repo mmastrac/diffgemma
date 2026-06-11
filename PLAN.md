@@ -391,6 +391,7 @@ cargo run --release --features metal -- generate-parity -p "Hello" --seed 42 --s
 | Memory estimates | ✅ | `src/metal/memory.rs`; printed by `decoder-gpu` |
 | Per-layer weight cache paging | ✅ | one `GpuLayerWeightCache` resident; load/release per layer |
 | Skip logits clone in generate loop | ✅ | reuse `sample_logits` / `sc_logits` buffers |
+| Zero-copy logits in generate forward | ✅ | `logits_out` + reusable `logits_buf`; skip lm_head in bench |
 | Generate golden fixtures | ✅ | `fixtures/generate/*.json`; GPU-only `generate-parity` |
 | GPU KV without CPU mirrors | — | for generation loop |
 
@@ -440,6 +441,7 @@ Today `Bf16Slice::get()` bounds-checks every element; `to_f32_vec()` and MoE tra
 | Post FastSlice commit | ~2.26s |
 | Post embed migration | ~2.13s |
 | Post weight paging (layers=3) | ~2.16s (RAM ~1 GiB → ~35 MiB weights) |
+| Post logits reuse + skip lm_head in bench | ~1.89s |
 
 ---
 
