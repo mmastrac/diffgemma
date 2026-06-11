@@ -399,6 +399,7 @@ cargo run --release --features metal -- generate-parity -p "Hello" --seed 42 --s
 | Zero-copy logits in generate forward | ✅ | `logits_out` + reusable `logits_buf`; skip lm_head in bench |
 | Generate golden fixtures | ✅ | `fixtures/generate/*.json`; GPU-only `generate-parity` |
 | GPU KV without CPU mirrors | partial ✅ | prefix on GPU; canvas K RoPE + GQA fused; GPU encoder extend appends suffix |
+| Slim GPU attention scratch | ✅ | skip `k_full`/`v_full`/`scores` when KV on GPU; lazy alloc for CPU fallback |
 
 **OOM note:** full `decoder-gpu` (30 layers, seq=256) needs ~2.3 GiB single-path (estimate). Prior OOM was caused by 30 persistent attention scratches + unbounded expert transpose cache + CPU∥GPU peak.
 
@@ -447,6 +448,7 @@ Today `Bf16Slice::get()` bounds-checks every element; `to_f32_vec()` and MoE tra
 | Post embed migration | ~2.13s |
 | Post weight paging (layers=3) | ~2.16s (RAM ~1 GiB → ~35 MiB weights) |
 | Post logits reuse + skip lm_head in bench | ~1.89s |
+| Post slim GPU attention scratch | ~1.68s |
 
 ---
 

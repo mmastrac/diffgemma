@@ -46,7 +46,7 @@ impl GpuDecoderLayerScratch {
         let attn_params = AttentionParams::for_layer(cfg, layer)?;
         Ok(Self {
             cpu: DecoderLayerScratch::with_kv_len(seq_len, cfg, layer, kv_cache_len)?,
-            attn: AttentionScratch::with_kv_len(seq_len, hidden, &attn_params, kv_cache_len),
+            attn: AttentionScratch::with_kv_len_gpu(seq_len, hidden, &attn_params, kv_cache_len),
             attn_out: vec![0.0; seq_len * hidden],
             residual: vec![0.0; seq_len * hidden],
             normed: vec![0.0; seq_len * hidden],

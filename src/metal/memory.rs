@@ -45,7 +45,7 @@ pub fn estimate_decoder_forward(text: &TextConfig, seq_len: usize, kv_len: usize
 
     let weight_cache_bytes = estimate_paged_layer_bytes(text) + hidden * 4;
 
-    let layer_scratch_bytes = layer_attn_scratch_bytes(
+    let layer_scratch_bytes = layer_attn_scratch_bytes_gpu(
         text, seq, total_kv, hidden, inter, moe_inter, experts,
     ) * 2;
 
@@ -67,7 +67,32 @@ pub fn estimate_decoder_forward(text: &TextConfig, seq_len: usize, kv_len: usize
     }
 }
 
-fn layer_attn_scratch_bytes(
+fn layer_attn_scratch_bytes_gpu(
+    text: &TextConfig,
+    seq: u64,
+    total_kv: u64,
+    hidden: u64,
+    inter: u64,
+    moe_inter: u64,
+    experts: u64,
+) -> u64 {
+    let sliding_q = text.num_attention_heads as u64 * text.head_dim as u64;
+    let full_q = text.num_attention_heads as u64 * text.global_head_dim as u64;
+    let sliding_kv = text.num_key_value_heads as u64 * text.head_dim as u64;
+    let full_kv = text.num_global_key_value_heads as u64 * text.global_head_dim as u64;
+    let q_dim = sliding_q.max(full_q);
+    let kv_dim = sliding_kv.max(full_kv);
+    // GPU path: no k_full/v_full/scores (KV on Metal buffers).
+    let attn_bufs = (seq * hidden * 2 + seq * q_dim * 2 + seq * kv_dim * 4
+        + seq * text.global_head_dim.max(text.head_dim) as u64 * 4)
+        * 4;
+    let ff_bufs = seq * (hidden * 5 + inter * 2 + moe_inter * 3) * 4;
+    let moe_router = seq * (hidden + experts) * 4;
+    attn_bufs + ff_bufs + moe_router
+}
+
+#[allow(dead_code)]
+fn layer_attn_scratch_bytes_cpu(
     text: &TextConfig,
     seq: u64,
     total_kv: u64,

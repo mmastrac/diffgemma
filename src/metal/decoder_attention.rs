@@ -127,6 +127,7 @@ pub fn forward_decoder_attention(
         .unwrap_or(false);
 
     if !use_gpu_kv {
+        scratch.ensure_cpu_kv_buffers(&params);
         {
             let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
             rope_qk_batched(

@@ -88,18 +88,47 @@ impl AttentionScratch {
         params: &AttentionParams,
         kv_cache_len: usize,
     ) -> Self {
+        Self::with_kv_len_inner(seq_len, hidden, params, kv_cache_len, true)
+    }
+
+    /// GPU decoder/encoder extend: skip `k_full`/`v_full`/`scores` (KV concat on GPU).
+    pub fn with_kv_len_gpu(
+        seq_len: usize,
+        hidden: usize,
+        params: &AttentionParams,
+        kv_cache_len: usize,
+    ) -> Self {
+        Self::with_kv_len_inner(seq_len, hidden, params, kv_cache_len, false)
+    }
+
+    fn with_kv_len_inner(
+        seq_len: usize,
+        hidden: usize,
+        params: &AttentionParams,
+        kv_cache_len: usize,
+        cpu_kv_buffers: bool,
+    ) -> Self {
         let q_dim = params.n_heads * params.head_dim;
         let kv_dim = params.n_kv_heads * params.head_dim;
         let total_kv_len = kv_cache_len + seq_len;
+        let (k_full, v_full, scores) = if cpu_kv_buffers {
+            (
+                vec![0.0; total_kv_len * kv_dim],
+                vec![0.0; total_kv_len * kv_dim],
+                vec![0.0; seq_len * params.n_heads * total_kv_len],
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
         Self {
             normed: vec![0.0; seq_len * hidden],
             q: vec![0.0; seq_len * q_dim],
             k: vec![0.0; seq_len * kv_dim],
             v: vec![0.0; seq_len * kv_dim],
-            k_full: vec![0.0; total_kv_len * kv_dim],
-            v_full: vec![0.0; total_kv_len * kv_dim],
+            k_full,
+            v_full,
             rope_freqs: vec![0.0; seq_len * params.rotary_dim],
-            scores: vec![0.0; seq_len * params.n_heads * total_kv_len],
+            scores,
             attn_out: vec![0.0; seq_len * q_dim],
             head_buf: vec![0.0; params.head_dim],
             q_w: Vec::new(),
@@ -110,6 +139,19 @@ impl AttentionScratch {
             k_norm_w: Vec::new(),
             total_kv_len,
         }
+    }
+
+    /// Lazily allocate CPU concat/scores buffers (GPU KV fallback in `decoder_attention`).
+    pub fn ensure_cpu_kv_buffers(&mut self, params: &AttentionParams) {
+        if !self.k_full.is_empty() {
+            return;
+        }
+        let kv_dim = params.n_kv_heads * params.head_dim;
+        let total_kv = self.total_kv_len;
+        let seq_len = self.q.len() / (params.n_heads * params.head_dim);
+        self.k_full.resize(total_kv * kv_dim, 0.0);
+        self.v_full.resize(total_kv * kv_dim, 0.0);
+        self.scores.resize(seq_len * params.n_heads * total_kv, 0.0);
     }
 
     fn load_weights(&mut self, weights: &DecoderLayerWeights<'_>) -> Result<(), Error> {
