@@ -103,6 +103,33 @@ impl GpuLayerWeightCache {
         let cache = self.expert_down.borrow();
         f(cache[expert].as_ref().unwrap())
     }
+
+    /// Drop lazily transposed expert weights (call after each layer forward).
+    pub fn clear_expert_cache(&self) {
+        let n = self.expert_gate_up.borrow().len();
+        *self.expert_gate_up.borrow_mut() = vec![None; n];
+        *self.expert_down.borrow_mut() = vec![None; n];
+    }
+
+    pub fn resident_bytes(&self) -> u64 {
+        let mut bytes = (self.post_attn_norm.len()
+            + self.pre_ff_norm.len()
+            + self.post_ff_norm.len()
+            + self.post_ff_norm_1.len()
+            + self.pre_ff_norm_2.len()
+            + self.post_ff_norm_2.len()
+            + self.router_proj.len()
+            + self.router_scale.len()
+            + self.per_expert_scale.len()) as u64
+            * 4;
+        bytes += (self.mlp_gate.w_t.len() + self.mlp_up.w_t.len() + self.mlp_down.w_t.len()) as u64 * 2;
+        for slot in self.expert_gate_up.borrow().iter().chain(self.expert_down.borrow().iter()) {
+            if let Some(w) = slot {
+                bytes += w.len() as u64 * 2;
+            }
+        }
+        bytes
+    }
 }
 
 pub struct GpuDecoderWeightCache {

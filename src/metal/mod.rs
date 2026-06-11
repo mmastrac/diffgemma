@@ -11,8 +11,11 @@ mod engine;
 mod gemm;
 mod kernels;
 mod linear;
+mod memory;
 mod moe;
 mod weights;
+
+pub use memory::{estimate_decoder_forward, estimate_weight_cache, MemoryEstimate};
 
 pub use attention::GpuAttention;
 pub use decoder::{

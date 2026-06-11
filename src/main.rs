@@ -474,7 +474,8 @@ fn run_decoder_gpu_parity(m: &model::Model, seq_len: usize, kv_len: usize, layer
     #[cfg(all(feature = "metal", target_os = "macos"))]
     {
         use metal::{
-            bench_forward, load_weight_cache, BenchConfig, GpuDecoderEngine, GpuDecoderScratch,
+            bench_forward, estimate_decoder_forward, estimate_weight_cache, load_weight_cache,
+            BenchConfig, GpuDecoderEngine, GpuDecoderScratch,
         };
         use model::decoder::{forward as cpu_forward, DecoderForwardInput, DecoderScratch};
 
@@ -509,7 +510,9 @@ fn run_decoder_gpu_parity(m: &model::Model, seq_len: usize, kv_len: usize, layer
             mask: Some(mask),
         };
 
-        let mut cpu_scratch = DecoderScratch::new(canvas_len, &m.config);
+        let est = estimate_decoder_forward(&m.config.text_config, canvas_len, kv_len);
+        est.print_summary("decoder-gpu (single-path)");
+
         let mut gpu_scratch = GpuDecoderScratch::new(canvas_len, &m.config);
         let gpu_weights = match load_weight_cache(&m.weights, &m.config.text_config) {
             Ok(w) => w,
@@ -518,6 +521,10 @@ fn run_decoder_gpu_parity(m: &model::Model, seq_len: usize, kv_len: usize, layer
                 return ExitCode::FAILURE;
             }
         };
+        eprintln!(
+            "  weight cache actual: {:.1} MiB",
+            estimate_weight_cache(&gpu_weights) as f64 / (1024.0 * 1024.0)
+        );
         let mut engine = match GpuDecoderEngine::new() {
             Ok(e) => e,
             Err(err) => {
@@ -527,8 +534,34 @@ fn run_decoder_gpu_parity(m: &model::Model, seq_len: usize, kv_len: usize, layer
         };
 
         eprintln!(
-            "running CPU decoder forward (canvas={canvas_len}, kv={kv_len}, layers={max_layers})..."
+            "running GPU decoder forward (canvas={canvas_len}, kv={kv_len}, layers={max_layers})..."
         );
+        let gpu_started = std::time::Instant::now();
+        let bench_cfg = BenchConfig { max_layers };
+        let gpu_out = match bench_forward(
+            &m.weights,
+            &m.config,
+            &input,
+            &mut gpu_scratch,
+            &gpu_weights,
+            &mut engine,
+            &bench_cfg,
+        ) {
+            Ok(out) => out,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let gpu_elapsed = gpu_started.elapsed();
+        let gpu_hidden = gpu_out.hidden_states;
+        drop(gpu_out.logits);
+        drop(gpu_scratch);
+        drop(gpu_weights);
+        drop(engine);
+
+        let mut cpu_scratch = DecoderScratch::new(canvas_len, &m.config);
+        eprintln!("running CPU decoder forward...");
         let cpu_started = std::time::Instant::now();
         let cpu_out = match cpu_forward(
             &m.weights,
@@ -545,27 +578,6 @@ fn run_decoder_gpu_parity(m: &model::Model, seq_len: usize, kv_len: usize, layer
         };
         let cpu_elapsed = cpu_started.elapsed();
 
-        eprintln!("running GPU decoder forward...");
-        let gpu_started = std::time::Instant::now();
-        let bench_cfg = BenchConfig { max_layers };
-        let gpu_out = match bench_forward(
-            &m.weights,
-            &m.config,
-            &input,
-            &mut gpu_scratch,
-            &gpu_weights,
-            &mut engine,
-            &bench_cfg,
-        )
-        {
-            Ok(out) => out,
-            Err(err) => {
-                eprintln!("error: {err}");
-                return ExitCode::FAILURE;
-            }
-        };
-        let gpu_elapsed = gpu_started.elapsed();
-
         let mut max_abs = 0.0f32;
         let mut max_rel = 0.0f32;
         let mut max_idx = 0usize;
@@ -573,7 +585,7 @@ fn run_decoder_gpu_parity(m: &model::Model, seq_len: usize, kv_len: usize, layer
         for (i, (&c, &g)) in cpu_out
             .hidden_states
             .iter()
-            .zip(gpu_out.hidden_states.iter())
+            .zip(gpu_hidden.iter())
             .enumerate()
         {
             if !g.is_finite() {
@@ -616,10 +628,7 @@ fn run_decoder_gpu_parity(m: &model::Model, seq_len: usize, kv_len: usize, layer
         );
         println!(
             "  gpu hidden[0..4]: [{:.6}, {:.6}, {:.6}, {:.6}]",
-            gpu_out.hidden_states[0],
-            gpu_out.hidden_states[1],
-            gpu_out.hidden_states[2],
-            gpu_out.hidden_states[3]
+            gpu_hidden[0], gpu_hidden[1], gpu_hidden[2], gpu_hidden[3]
         );
 
         const TOL: f32 = 1e-2;

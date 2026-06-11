@@ -28,6 +28,18 @@ impl BufferPool {
         self.free.push((capacity, buffer));
     }
 
+    /// Drop pooled buffers so unified memory can be reclaimed (buffers are not returned to the OS
+    /// until the `Retained` handles are released).
+    pub fn trim(&mut self, max_buffers: usize) {
+        if self.free.len() > max_buffers {
+            self.free.truncate(max_buffers);
+        }
+    }
+
+    pub fn retained_bytes(&self) -> usize {
+        self.free.iter().map(|(cap, _)| *cap).sum()
+    }
+
     pub fn write_f32(buffer: &ProtocolObject<dyn MTLBuffer>, data: &[f32]) {
         let ptr = buffer.contents().as_ptr() as *mut f32;
         unsafe {

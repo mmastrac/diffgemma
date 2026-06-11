@@ -1,4 +1,4 @@
-use crate::config::ModelConfig;
+use crate::config::{LayerType, ModelConfig, TextConfig};
 use crate::metal::decoder_layer::{forward_decoder as layer_forward, GpuDecoderLayerScratch};
 use crate::metal::engine::GpuDecoderEngine;
 use crate::model::decoder::{DecoderForwardInput, DecoderForwardOutput, DecoderScratch};
@@ -24,42 +24,70 @@ pub fn load_weight_cache(
     Ok(cache)
 }
 
+fn example_layer(text: &TextConfig, kind: LayerType) -> usize {
+    text.layer_types
+        .iter()
+        .position(|t| *t == kind)
+        .unwrap_or(0)
+}
+
+/// Two layer scratches (sliding vs full attention shapes) reused across the stack.
+struct LayerScratchReuse {
+    seq_len: usize,
+    kv_len: usize,
+    sliding: Option<GpuDecoderLayerScratch>,
+    full: Option<GpuDecoderLayerScratch>,
+}
+
+impl LayerScratchReuse {
+    fn ensure(
+        &mut self,
+        cfg: &ModelConfig,
+        seq_len: usize,
+        kv_len: usize,
+        layer: usize,
+    ) -> Result<&mut GpuDecoderLayerScratch, Error> {
+        if self.seq_len != seq_len || self.kv_len != kv_len {
+            self.sliding = None;
+            self.full = None;
+            self.seq_len = seq_len;
+            self.kv_len = kv_len;
+        }
+        let text = &cfg.text_config;
+        let kind = text
+            .layer_types
+            .get(layer)
+            .ok_or(Error::Format("invalid layer"))?;
+        let slot = match kind {
+            LayerType::SlidingAttention => &mut self.sliding,
+            LayerType::FullAttention => &mut self.full,
+        };
+        if slot.is_none() {
+            let example = example_layer(text, *kind);
+            *slot = Some(GpuDecoderLayerScratch::with_kv_len(
+                seq_len, text, example, kv_len,
+            )?);
+        }
+        Ok(slot.as_mut().expect("layer scratch"))
+    }
+}
+
 pub struct GpuDecoderScratch {
     pub cpu: DecoderScratch,
-    layer_kv_len: usize,
-    layers: Vec<GpuDecoderLayerScratch>,
+    layer: LayerScratchReuse,
 }
 
 impl GpuDecoderScratch {
     pub fn new(seq_len: usize, cfg: &ModelConfig) -> Self {
         Self {
             cpu: DecoderScratch::new(seq_len, cfg),
-            layer_kv_len: usize::MAX,
-            layers: Vec::new(),
+            layer: LayerScratchReuse {
+                seq_len: 0,
+                kv_len: 0,
+                sliding: None,
+                full: None,
+            },
         }
-    }
-
-    fn ensure_layers(
-        &mut self,
-        cfg: &ModelConfig,
-        seq_len: usize,
-        kv_len: usize,
-    ) -> Result<(), Error> {
-        let n_layers = cfg.text_config.num_hidden_layers;
-        if self.layer_kv_len == kv_len && self.layers.len() == n_layers {
-            return Ok(());
-        }
-        self.layers.clear();
-        for layer in 0..n_layers {
-            self.layers.push(GpuDecoderLayerScratch::with_kv_len(
-                seq_len,
-                &cfg.text_config,
-                layer,
-                kv_len,
-            )?);
-        }
-        self.layer_kv_len = kv_len;
-        Ok(())
     }
 }
 
@@ -155,13 +183,12 @@ fn forward_inner(
     let positions: Vec<i64> =
         (input.kv_cache.kv_len as i64..input.kv_cache.kv_len as i64 + seq_len as i64).collect();
 
-    scratch.ensure_layers(cfg, seq_len, input.kv_cache.kv_len)?;
-
     let mut in_buf = &mut scratch.cpu.hidden_a;
     let mut out_buf = &mut scratch.cpu.hidden_b;
 
     let n_layers = max_layers.min(text.num_hidden_layers);
     for layer in 0..n_layers {
+        let layer_scratch = scratch.layer.ensure(cfg, seq_len, input.kv_cache.kv_len, layer)?;
         let layer_weights = DecoderLayerWeights::load(store, layer, text)?;
         layer_forward(
             out_buf,
@@ -180,9 +207,10 @@ fn forward_inner(
                 input.kv_cache.kv_len,
             ),
             mask,
-            &mut scratch.layers[layer],
+            layer_scratch,
             engine,
         )?;
+        weights.layers[layer].clear_expert_cache();
         std::mem::swap(&mut in_buf, &mut out_buf);
     }
 
@@ -202,6 +230,7 @@ fn forward_inner(
         )?;
         batch.end()?;
     }
+    engine.pool.trim(4);
 
     let mut logits = vec![0.0f32; seq_len * vocab];
     lm_head_tied_bf16(&mut logits, out_buf, embed, seq_len, hidden, vocab)?;
