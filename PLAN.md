@@ -332,32 +332,96 @@ Verified: layer 0, seq=16, `max_abs_diff: 0.000001`.
 | Task | Notes |
 |------|-------|
 | Router top-k (8 of 128) | CPU router for top-k parity; GPU router path in `route_gpu` (needs top-k tie-break parity) |
-| Expert GEMM batching | `experts_forward_gpu` groups tokens by expert; f32 activations × bf16 weights |
+| Expert GEMM batching | MoE arena: all active experts in 2 GPU syncs/layer (`gate_up` batch + `down` batch) |
 | Shared MLP path | GPU RMSNorm + `f32_bf16_gemm` dense MLP; CPU GELU/SwiGLU |
 | Layer norm + activations on GPU | `shaders/decoder.metal` elementwise kernels; 256-wide threadgroups (Metal 65535 TG limit) |
+| Batched dispatches | `GpuBatch`: one `commit`+`wait` per independent section; **no chained readback on same buffer** |
+| Weight cache | `GpuDecoderWeightCache`: pre-transposed dense bf16, cached router f32, lazy expert transpose |
 
-**Exit criteria:** Full decoder forward matches CPU on `seq=256` (bf16 tolerance ~1e-2). `decoder-gpu` passes with `max_abs_diff ≤ 1e-2` (~0.008); ~2× faster than CPU path on M-series.
+**Exit criteria:** Full decoder forward matches CPU on `seq=256` (bf16 tolerance ~1e-2). `decoder-gpu --seq 16 --kv 8 --layers 3` passes with `max_abs_diff ≤ 1e-2`; ~2× faster than CPU at small scale.
 
-**Run:** `cargo run --release --features metal -- decoder-gpu`
+**Run:**
+```bash
+cargo run --release --features metal -- decoder-gpu --seq 16 --kv 8 --layers 3
+cargo run --release --features metal -- bench-decoder --seq 16 --kv 8 --layers 3
+```
 
 ---
 
-## Phase 11 — Metal encoder + sampler integration
+## Phase 11 — Metal encoder + sampler integration (in progress)
 
 **Deliverable:** full accelerated generation.
 
-| Task | Notes |
-|------|-------|
-| KV cache on GPU | persist across prefill + denoise |
-| CPU↔GPU only at boundaries | tokenizer in, detokenizer out; keep canvas on GPU |
-| Entropy + sampling on CPU or GPU | entropy reduction is cheap; can stay CPU initially |
-| Block loop | same logic as Phase 6, GPU forward |
+| Task | Status | Notes |
+|------|--------|-------|
+| `generate-gpu` / `generate-parity` CLI | ✅ | Shared loop via `DecoderBackend`; `-p` prompt |
+| `bench-decoder` | ✅ | `--seq`, `--kv`, `--layers`, `--iters` |
+| `decoder-gpu` scalable parity | ✅ | `--seq`, `--kv`, `--layers`; memory estimate printed |
+| KV cache on GPU | — | persist across prefill + denoise |
+| CPU↔GPU only at boundaries | partial | GPU decoder forward; CPU attention + router still |
+| Entropy + sampling on CPU | ✅ | same as Phase 6 |
+| Block loop on GPU | partial | `generate-gpu` wired; end-to-end token parity TBD |
 
-**Exit criteria:** `cargo run --features metal -- -p "Hello" --seed 42` prints coherent text; matches CPU path tokens for same seed.
+**Exit criteria:** `cargo run --features metal -- generate-gpu -p "Hello" --seed 42` prints coherent text; matches CPU path tokens for same seed.
 
 ---
 
-## Phase 12 — CLI + ergonomics
+## Phase 12 — Performance, memory & FastSlice
+
+**Deliverable:** lower peak RAM, faster hot paths, foundation for unchecked inner loops.
+
+### Memory (partial ✅)
+
+| Task | Status | Notes |
+|------|--------|-------|
+| Two reusable layer scratches | ✅ | sliding + full attention shapes (~400 MiB vs 30×) |
+| Per-layer MoE expert cache eviction | ✅ | `clear_expert_cache()` after each layer |
+| GPU-first parity + drop GPU state | ✅ | avoids CPU+GPU peak in `decoder-gpu` |
+| Buffer pool trim | ✅ | `BufferPool::trim()` at forward end |
+| Memory estimates | ✅ | `src/metal/memory.rs`; printed by `decoder-gpu` |
+| Per-layer weight cache paging | — | load `GpuLayerWeightCache` for layer L only (~35 MiB vs ~1 GiB) |
+| Skip logits in parity mode | — | save 256 MiB on comparison runs |
+| GPU KV without CPU mirrors | — | for generation loop |
+
+**OOM note:** full `decoder-gpu` (30 layers, seq=256) needs ~2.3 GiB single-path (estimate). Prior OOM was caused by 30 persistent attention scratches + unbounded expert transpose cache + CPU∥GPU peak.
+
+### Performance ideas
+
+| Idea | Impact | Notes |
+|------|--------|-------|
+| Wire `GpuAttention` into decoder layer | high | removes largest CPU bottleneck per layer |
+| Per-layer weight paging | high RAM / medium speed | transpose once per layer per session |
+| Keep MoE arena batching | medium | already 2 syncs/layer; don't re-sync per expert |
+| Fuse independent GPU norms/GEMMs | medium | only when buffer dependencies allow readback |
+| Avoid per-layer `pool.trim` | medium | caused 3× slowdown; trim at section boundaries only |
+| `bench-decoder` regression table | process | always record before/after per change |
+| Optional expert transpose disk cache | low | only if re-transpose dominates after eviction |
+
+### FastSlice — remove bounds checks in hot loops
+
+Today `Bf16Slice::get()` bounds-checks every element; `to_f32_vec()` and MoE transpose loops call it millions of times per forward.
+
+**Goal:** introduce `FastSlice` / `FastBf16Slice` in `src/tensor.rs` — pointer+length views with unchecked access behind a validated construction boundary.
+
+| Task | Files | Notes |
+|------|-------|-------|
+| `FastSlice<'a, T>` | `src/tensor.rs` | `from_raw_parts(ptr, len)` after `TensorView` shape check |
+| `FastBf16Slice<'a>` | `src/tensor.rs` | `get_unchecked(i) -> u16`; `as_u16_slice()` when 2-byte aligned |
+| `FastSliceMut<'a, T>` | `src/tensor.rs` | for activation buffers with proven exclusive access |
+| Safety contract | docs + `debug_assert!` | only construct from validated `TensorView`, `Vec`, or pool buffer |
+| Migrate matmul/GEMM inputs | `kernels/cpu.rs`, `metal/linear.rs` | inner dimension loops |
+| Migrate MoE transpose | `metal/weights.rs`, `model/moe.rs` | expert weight gather |
+| Migrate embed gather | `model/embed.rs` | token lookup |
+| Benchmark gate | `bench-decoder` | document ns/op or ms/fwd before and after each migration |
+
+**Exit criteria:**
+- `decoder-gpu --seq 16 --kv 8 --layers 3` still within 1e-2 tolerance after each migration step.
+- Measurable `bench-decoder` improvement on at least one config (record numbers in commit).
+- Full `decoder-gpu` completes without OOM on 16 GiB unified memory.
+
+---
+
+## Phase 13 — CLI + ergonomics
 
 **Deliverable:** usable local tool.
 
@@ -376,7 +440,7 @@ diffgemma-mps --benchmark --features metal
 
 ---
 
-## Phase 13 — Vision / multimodal (deferred)
+## Phase 14 — Vision / multimodal (deferred)
 
 355 vision tensors; image → soft tokens → encoder.
 
@@ -441,6 +505,7 @@ diffgemma-mps/
       mod.rs
       device.rs
       buffer.rs
+      memory.rs
       gemm.rs
       attention.rs
       decoder.rs
@@ -456,7 +521,8 @@ diffgemma-mps/
 | MoE expert layout mismatch | Inspect shapes early (Phase 1); unit test router on layer 0 |
 | Sliding vs full RoPE differs | Separate code paths per `layer_types[i]`; test layers 0 and 5 |
 | Bidirectional mask bugs | Small 16-token hand-crafted mask test |
-| 48 GiB mmap + GPU residency | Unified memory: shared buffers; don’t duplicate weights |
+| 48 GiB mmap + GPU residency | Unified memory: shared buffers; don’t duplicate weights; page layer caches |
+| Hot-loop bounds checks | `FastSlice` with validated construction; migrate incrementally |
 | Metal graph compile latency | Cache MPSGraph executables per shape (Iris lesson) |
 | Tokenizer complexity | Defer to Phase 7; use fixed token ids until then |
 | Apple Silicon bandwidth ceiling | Set expectations; profile before over-optimizing |
@@ -477,18 +543,27 @@ diffgemma-mps/
 | 7 | Tokenizer | blas |
 | 8 | Metal GEMM + buffers | metal |
 | 9 | Metal attention | metal |
-| 10 | Metal full decoder | metal |
-| 11 | End-to-end generation | metal |
-| 12 | CLI | metal |
-| 13 | Vision (optional) | metal |
+| 10 | Metal full decoder | metal ✅ |
+| 11 | End-to-end generation | metal (partial) |
+| 12 | Performance + FastSlice | metal (in progress) |
+| 13 | CLI | metal |
+| 14 | Vision (optional) | metal |
 
 ---
 
 ## Immediate next step
 
-**Phase 1:** add `src/config.rs` and `src/tensor.rs`, extend the binary with a `config` subcommand, and map `model.decoder.layers.0.*` weight names to a struct with expected shapes from config.
+**Phase 12:** finish memory paging, then introduce `FastSlice` and migrate the hottest bf16 access loops.
 
+1. **Per-layer weight cache paging** — load/drop `GpuLayerWeightCache` one layer at a time in `decoder.rs` forward (biggest remaining RAM win).
+2. **`FastBf16Slice` in `src/tensor.rs`** — validated wrapper over mmap bytes; `get_unchecked` for inner loops.
+3. **First migration: `metal/weights.rs` expert transpose** — replace `(0..n).map(|i| gate_up.get(w_off + i))` with unchecked stride reads; benchmark with `bench-decoder`.
+4. **Wire `GpuAttention`** into `decoder_layer.rs` once parity holds at `--layers 3`.
+
+Always record before/after numbers:
 ```bash
-cargo run -- config
-cargo run -- weights model.decoder.layers.0.self_attn.q_proj.weight
+cargo run --release --features metal -- bench-decoder --seq 16 --kv 8 --layers 3 --iters 3
+cargo run --release --features metal -- decoder-gpu --seq 16 --kv 8 --layers 3
 ```
+
+**Phase 11 (parallel):** `generate-gpu -p "Hello" --seed 42 --steps 1` token parity vs CPU.
