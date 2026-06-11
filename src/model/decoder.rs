@@ -1,3 +1,4 @@
+use crate::buffer::Buffer;
 use crate::config::ModelConfig;
 use crate::kernels::cpu::rms_norm_rows;
 use crate::model::decoder_layer::{forward_decoder as layer_forward, DecoderLayerScratch};
@@ -27,18 +28,23 @@ pub struct DecoderScratch {
     pub embed_buf: Vec<f32>,
     pub sc_signal: Vec<f32>,
     pub norm_w: Vec<f32>,
+    pub lm_head_chunk: Buffer<f32>,
+    pub sc_probs: Buffer<f32>,
     pub self_cond: SelfConditioningScratch,
 }
 
 impl DecoderScratch {
     pub fn new(seq_len: usize, cfg: &ModelConfig) -> Self {
         let hidden = cfg.text_config.hidden_size;
+        let vocab = cfg.text_config.vocab_size;
         Self {
             hidden_a: vec![0.0; seq_len * hidden],
             hidden_b: vec![0.0; seq_len * hidden],
             embed_buf: vec![0.0; seq_len * hidden],
             sc_signal: vec![0.0; seq_len * hidden],
             norm_w: Vec::new(),
+            lm_head_chunk: Buffer::with_capacity(crate::model::embed::LM_HEAD_CHUNK * hidden),
+            sc_probs: Buffer::with_capacity(vocab),
             self_cond: SelfConditioningScratch::new(seq_len, &cfg.text_config),
         }
     }
@@ -80,6 +86,7 @@ pub fn forward(
                 vocab,
                 hidden,
                 embed_scale,
+                &mut scratch.sc_probs,
             );
         }
         None => scratch.sc_signal.fill(0.0),
@@ -138,7 +145,15 @@ pub fn forward(
     );
 
     let mut logits = vec![0.0f32; seq_len * vocab];
-    lm_head_tied_bf16(&mut logits, out_buf, embed, seq_len, hidden, vocab)?;
+    lm_head_tied_bf16(
+        &mut logits,
+        out_buf,
+        embed,
+        seq_len,
+        hidden,
+        vocab,
+        &mut scratch.lm_head_chunk,
+    )?;
     logit_softcapping(&mut logits, text.final_logit_softcapping as f32);
 
     let mut hidden_out = vec![0.0f32; seq_len * hidden];

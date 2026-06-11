@@ -165,6 +165,7 @@ fn forward_inner(
                 vocab,
                 hidden,
                 embed_scale,
+                &mut scratch.cpu.sc_probs,
             );
         }
         None => scratch.cpu.sc_signal.fill(0.0),
@@ -233,7 +234,15 @@ fn forward_inner(
     engine.pool.trim(4);
 
     let mut logits = vec![0.0f32; seq_len * vocab];
-    lm_head_tied_bf16(&mut logits, out_buf, embed, seq_len, hidden, vocab)?;
+    lm_head_tied_bf16(
+        &mut logits,
+        out_buf,
+        embed,
+        seq_len,
+        hidden,
+        vocab,
+        &mut scratch.cpu.lm_head_chunk,
+    )?;
     logit_softcapping(&mut logits, text.final_logit_softcapping as f32);
 
     let mut hidden_out = vec![0.0f32; seq_len * hidden];

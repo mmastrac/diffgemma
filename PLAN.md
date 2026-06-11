@@ -410,15 +410,22 @@ Today `Bf16Slice::get()` bounds-checks every element; `to_f32_vec()` and MoE tra
 | `FastSliceMut<'a, T>` | `src/fast_slice.rs` | mutable ptr+len for transpose/dequant writes |
 | `Buffer<T>` | `src/buffer.rs` | owned allocation; hot loops use `as_fast_slice()` only |
 | Safety contract | docs + `debug_assert!` | only construct from validated `TensorView`, `Vec`, or pool buffer |
-| Migrate matmul/GEMM inputs | `kernels/cpu.rs`, `metal/linear.rs` | inner dimension loops |
-| Migrate MoE transpose | `metal/weights.rs`, `model/moe.rs` | expert weight gather |
-| Migrate embed gather | `model/embed.rs` | token lookup |
+| Migrate matmul/GEMM inputs | `kernels/cpu.rs`, `metal/linear.rs` | ✅ inner loops |
+| Migrate MoE transpose | `metal/weights.rs` | ✅ expert weight gather |
+| Migrate embed gather | `model/embed.rs` | ✅ `embed_tokens`, `lm_head_tied_bf16`; `sc_probs` buffer |
+| Migrate embed gather | `model/moe.rs` | CPU `linear_bf16_slice` via FastBf16Slice (partial) |
 | Benchmark gate | `bench-decoder` | document ns/op or ms/fwd before and after each migration |
 
 **Exit criteria:**
-- `decoder-gpu --seq 16 --kv 8 --layers 3` still within 1e-2 tolerance after each migration step.
+- `decoder-gpu --seq 16 --kv 8 --layers 3` still within 1e-2 tolerance after each migration step. ✅
 - Measurable `bench-decoder` improvement on at least one config (record numbers in commit).
-- Full `decoder-gpu` completes without OOM on 16 GiB unified memory.
+- Full `decoder-gpu` (30 layers) completes without OOM on 16 GiB unified memory. ✅ (`max_abs_diff ≈ 0.008`, GPU ~169s)
+
+**Bench reference (seq=16, kv=8, layers=3, iters=3):**
+| Milestone | per_fwd |
+|-----------|---------|
+| Post FastSlice commit | ~2.26s |
+| Post embed migration | ~2.13s |
 
 ---
 
@@ -559,9 +566,9 @@ diffgemma-mps/
 **Phase 12:** finish memory paging, then introduce `FastSlice` and migrate the hottest bf16 access loops.
 
 1. **Per-layer weight cache paging** — load/drop `GpuLayerWeightCache` one layer at a time in `decoder.rs` forward (biggest remaining RAM win).
-2. **`FastBf16Slice` in `src/tensor.rs`** — validated wrapper over mmap bytes; `get_unchecked` for inner loops.
-3. **First migration: `metal/weights.rs` expert transpose** — replace `(0..n).map(|i| gate_up.get(w_off + i))` with unchecked stride reads; benchmark with `bench-decoder`.
-4. **Wire `GpuAttention`** into `decoder_layer.rs` once parity holds at `--layers 3`.
+2. **Wire `GpuAttention`** into `decoder_layer.rs` once parity holds at `--layers 3`.
+3. **Migrate remaining hot paths** — `model/moe.rs` CPU experts, attention weight dequant.
+4. **Skip logits alloc in parity mode** — save 256 MiB on comparison runs.
 
 Always record before/after numbers:
 ```bash
