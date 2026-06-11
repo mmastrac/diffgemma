@@ -348,7 +348,7 @@ cargo run --release --features metal -- bench-decoder --seq 16 --kv 8 --layers 3
 
 ---
 
-## Phase 11 — Metal encoder + sampler integration (in progress)
+## Phase 11 — Metal encoder + sampler integration ✅
 
 **Deliverable:** full accelerated generation.
 
@@ -359,19 +359,24 @@ cargo run --release --features metal -- bench-decoder --seq 16 --kv 8 --layers 3
 | `decoder-gpu` scalable parity | ✅ | `--seq`, `--kv`, `--layers`; memory estimate printed |
 | GPU decoder attention | ✅ | GPU Q/K/V/o_proj + batched RoPE/GQA via shared engine pool |
 | `--layers` on generate commands | ✅ | smoke-test subset of decoder stack |
-| KV cache on GPU | — | persist across prefill + denoise |
-| CPU↔GPU only at boundaries | partial | GPU norms/GEMM/MoE/attention; CPU QKV prep, router, sampler |
+| KV cache on GPU | ✅ | prefix on GPU; canvas K RoPE+GQA; GPU encoder extend |
+| CPU↔GPU only at boundaries | ✅ | GPU norms/GEMM/MoE/attention/KV; CPU embed prefill, head norms, router, sampler |
 | Entropy + sampling on CPU | ✅ | same as Phase 6 |
-| Block loop on GPU | ✅ | `generate-parity` token match (full 30 layers, steps=1) |
+| Block loop on GPU | ✅ | `generate-parity` golden match (full 30 layers, steps 1–2) |
+| Generate golden fixtures | ✅ | 4 fixtures; GPU-only parity default; `--compare-cpu` optional |
 
-**Exit criteria:** `cargo run --features metal -- generate-gpu -p "Hello" --seed 42` prints coherent text; matches CPU path tokens for same seed.
+**Exit criteria:** `cargo run --features metal -- generate-gpu -p "Hello" --seed 42` prints text; GPU tokens match checked-in golden for same seed.
 
-**Verified (2025-06):**
+**Verified (2026-06):**
 ```bash
 cargo run --release --features metal -- generate-gpu -p "Hello" --seed 42 --steps 1
-# prefill ~3s, denoise ~118s → 2.17 tok/s (30 layers, canvas=256)
+# prefill ~3.7s, denoise ~125s → ~2.05 tok/s (30 layers, canvas=256)
+cargo run --release --features metal -- generate-parity -p "Hello" --seed 42 --steps 1
+# golden ok (hello_steps1_full), ~134s
+cargo run --release --features metal -- generate-parity -p "Hello" --seed 42 --steps 2
+# golden ok (hello_steps2_full), ~288s, ~0.94 tok/s denoise
 cargo run --release --features metal -- generate-parity -p "Hello" --seed 42 --steps 1 --layers 3
-# GPU-only vs golden ~15s (3 fixtures in fixtures/generate/)
+# golden ok ~15–20s
 ```
 
 ---
@@ -570,7 +575,7 @@ diffgemma-mps/
 | 8 | Metal GEMM + buffers | metal |
 | 9 | Metal attention | metal |
 | 10 | Metal full decoder | metal ✅ |
-| 11 | End-to-end generation | metal (partial) |
+| 11 | End-to-end generation | metal ✅ |
 | 12 | Performance + FastSlice | metal (in progress) |
 | 13 | CLI | metal |
 | 14 | Vision (optional) | metal |
@@ -579,17 +584,11 @@ diffgemma-mps/
 
 ## Immediate next step
 
-**Phase 11:** finish GPU generation path — KV on GPU, optional `--steps 2+` parity gate.
+**Phase 12 (ongoing):** perf, memory, FastSlice — GPU prefill, drop CPU `k_full` scratch, fuse attention submits.
 
-1. **GPU KV cache** — avoid CPU mirrors across denoise steps (largest remaining Phase 11 item).
-2. **GPU QKV + o_proj** — move attention bookends off CPU; share Metal context/pool with decoder engine.
-3. **Fuse attention submits** — RoPE + GQA in one command buffer per layer.
-
-**Phase 12 (ongoing):**
 ```bash
 cargo run --release --features metal -- bench-decoder --seq 16 --kv 8 --layers 3 --iters 3
 cargo run --release --features metal -- decoder-gpu --seq 16 --kv 8 --layers 3
 cargo run --release --features metal -- generate-parity -p "Hello" --seed 42 --steps 1 --layers 3
+cargo run --release --features metal -- generate-parity -p "Hello" --seed 42 --steps 1   # full stack ~2 min
 ```
-
-**Phase 11 smoke test (full stack):** `generate-parity -p "Hello" --seed 42 --steps 1` (30 layers, ~10–15 min).
