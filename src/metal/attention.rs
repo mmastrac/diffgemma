@@ -33,25 +33,42 @@ struct GqaParams {
     num_heads_rope: u32,
 }
 
+pub struct GpuAttentionKernels {
+    pub rope_pipeline: ComputePipeline,
+    pub attn_pipeline: ComputePipeline,
+}
+
+impl GpuAttentionKernels {
+    pub fn new(ctx: &MetalContext) -> Result<Self, Error> {
+        let mut pipelines = ctx.compile_kernels(ATTENTION_SHADER, &[ROPE_ENTRY, GQA_ENTRY])?;
+        let attn_pipeline = pipelines.pop().ok_or(Error::Format("Metal pipeline missing"))?;
+        let rope_pipeline = pipelines.pop().ok_or(Error::Format("Metal pipeline missing"))?;
+        Ok(Self {
+            rope_pipeline,
+            attn_pipeline,
+        })
+    }
+}
+
 pub struct GpuAttention {
     ctx: MetalContext,
-    rope_pipeline: ComputePipeline,
-    attn_pipeline: ComputePipeline,
+    kernels: GpuAttentionKernels,
     pool: BufferPool,
 }
 
 impl GpuAttention {
     pub fn new() -> Result<Self, Error> {
         let ctx = MetalContext::new()?;
-        let mut pipelines = ctx.compile_kernels(ATTENTION_SHADER, &[ROPE_ENTRY, GQA_ENTRY])?;
-        let attn_pipeline = pipelines.pop().ok_or(Error::Format("Metal pipeline missing"))?;
-        let rope_pipeline = pipelines.pop().ok_or(Error::Format("Metal pipeline missing"))?;
+        let kernels = GpuAttentionKernels::new(&ctx)?;
         Ok(Self {
             ctx,
-            rope_pipeline,
-            attn_pipeline,
+            kernels,
             pool: BufferPool::new(),
         })
+    }
+
+    pub fn kernels(&self) -> &GpuAttentionKernels {
+        &self.kernels
     }
 
     pub fn apply_rope(
@@ -98,7 +115,7 @@ impl GpuAttention {
 
         run_kernel(
             &self.ctx.queue,
-            &self.rope_pipeline.pipeline,
+            &self.kernels.rope_pipeline.pipeline,
             |encoder| {
                 unsafe {
                     encoder.setBuffer_offset_atIndex(Some(&buf_x), 0, 0);
@@ -175,7 +192,7 @@ impl GpuAttention {
 
         run_kernel(
             &self.ctx.queue,
-            &self.rope_pipeline.pipeline,
+            &self.kernels.rope_pipeline.pipeline,
             |encoder| {
                 unsafe {
                     encoder.setBuffer_offset_atIndex(Some(&buf_q), 0, 0);
@@ -295,7 +312,7 @@ impl GpuAttention {
 
         run_kernel(
             &self.ctx.queue,
-            &self.attn_pipeline.pipeline,
+            &self.kernels.attn_pipeline.pipeline,
             |encoder| {
                 unsafe {
                     encoder.setBuffer_offset_atIndex(Some(&buf_q), 0, 0);

@@ -357,7 +357,7 @@ cargo run --release --features metal -- bench-decoder --seq 16 --kv 8 --layers 3
 | `generate-gpu` / `generate-parity` CLI | ✅ | Shared loop via `DecoderBackend`; `-p` prompt |
 | `bench-decoder` | ✅ | `--seq`, `--kv`, `--layers`, `--iters` |
 | `decoder-gpu` scalable parity | ✅ | `--seq`, `--kv`, `--layers`; memory estimate printed |
-| GPU decoder attention | ✅ | `decoder_attention.rs`: RoPE + GQA on GPU |
+| GPU decoder attention | ✅ | GPU Q/K/V/o_proj + batched RoPE/GQA via shared engine pool |
 | `--layers` on generate commands | ✅ | smoke-test subset of decoder stack |
 | KV cache on GPU | — | persist across prefill + denoise |
 | CPU↔GPU only at boundaries | partial | GPU norms/GEMM/MoE/attention; CPU QKV prep, router, sampler |
@@ -368,10 +368,10 @@ cargo run --release --features metal -- bench-decoder --seq 16 --kv 8 --layers 3
 
 **Verified (2025-06):**
 ```bash
-cargo run --release --features metal -- generate-parity -p "Hello" --seed 42 --steps 1
-# generate parity ok — cpu ~682s, gpu ~452s (30 layers, canvas=256)
+cargo run --release --features metal -- generate-gpu -p "Hello" --seed 42 --steps 1
+# prefill ~3s, denoise ~118s → 2.17 tok/s (30 layers, canvas=256)
 cargo run --release --features metal -- generate-parity -p "Hello" --seed 42 --steps 1 --layers 3
-# fast smoke test (~minutes)
+# token parity ok, gpu ~15s → ~17 tok/s (3-layer smoke)
 ```
 
 ---
@@ -399,7 +399,9 @@ cargo run --release --features metal -- generate-parity -p "Hello" --seed 42 --s
 
 | Idea | Impact | Notes |
 |------|--------|-------|
-| Wire `GpuAttention` into decoder layer | high | ✅ RoPE + GQA on GPU |
+| Wire `GpuAttention` into decoder layer | high | ✅ GPU Q/K/V/o_proj + batched RoPE/GQA |
+| Share Metal pool for attention | medium | ✅ `attention_batch.rs`; no second `MetalContext` |
+| Generate tok/s reporting | process | ✅ denoise throughput in `generate-gpu` output |
 | Per-layer weight paging | high RAM / medium speed | transpose once per layer per session |
 | Keep MoE arena batching | medium | already 2 syncs/layer; don't re-sync per expert |
 | Fuse independent GPU norms/GEMMs | medium | only when buffer dependencies allow readback |

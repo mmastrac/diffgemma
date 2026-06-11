@@ -1,4 +1,4 @@
-use crate::metal::attention::GpuAttention;
+use crate::metal::attention::GpuAttentionKernels;
 use crate::metal::buffer::BufferPool;
 use crate::metal::device::{ComputePipeline, MetalContext};
 use crate::metal::kernels::GpuKernels;
@@ -14,7 +14,7 @@ pub struct GpuDecoderEngine {
     pub gemm_pipeline: ComputePipeline,
     pub f32_bf16_gemm_pipeline: ComputePipeline,
     pub kernels: GpuKernels,
-    pub attention: GpuAttention,
+    pub attention: GpuAttentionKernels,
 }
 
 impl GpuDecoderEngine {
@@ -24,7 +24,7 @@ impl GpuDecoderEngine {
         let gemm_pipeline = ctx.compile_kernel(GEMM_SHADER, GEMM_ENTRY)?;
         let f32_bf16_gemm_pipeline = ctx.compile_kernel(GEMM_SHADER, F32_BF16_GEMM_ENTRY)?;
         let kernels = GpuKernels::new(&ctx)?;
-        let attention = GpuAttention::new()?;
+        let attention = GpuAttentionKernels::new(&ctx)?;
         Ok(Self {
             ctx,
             pool,

@@ -32,10 +32,13 @@ impl Default for GenerateConfig {
     }
 }
 
-pub struct GenerateOutput {
+    pub struct GenerateOutput {
     pub token_ids: Vec<u32>,
     pub denoise_steps_run: usize,
     pub blocks_committed: usize,
+    pub prefill_elapsed: std::time::Duration,
+    pub denoise_elapsed: std::time::Duration,
+    pub extend_elapsed: std::time::Duration,
 }
 
 enum DecoderBackend<'a> {
@@ -87,6 +90,7 @@ fn generate_inner(
     let vocab = text.vocab_size;
     let max_blocks = gen_cfg.max_new_tokens.div_ceil(canvas_len).max(1);
 
+    let prefill_started = std::time::Instant::now();
     let prefill_out = prefill(
         store,
         cfg,
@@ -96,17 +100,23 @@ fn generate_inner(
         },
         enc_scratch,
     )?;
+    let prefill_elapsed = prefill_started.elapsed();
 
     let mut sequences = prompt_token_ids.to_vec();
     let mut kv_cache = prefill_out.kv_cache;
     let mut rng = Rng::new(gen_cfg.seed);
     let mut denoise_steps_run = 0usize;
     let mut blocks_committed = 0usize;
+    let mut denoise_elapsed = std::time::Duration::ZERO;
+    let mut extend_elapsed = std::time::Duration::ZERO;
 
     for _block in 0..max_blocks {
         if sequences.len() >= prompt_token_ids.len() + gen_cfg.max_new_tokens {
             break;
         }
+
+        let remaining = prompt_token_ids.len() + gen_cfg.max_new_tokens - sequences.len();
+        let is_last_block = remaining <= canvas_len;
 
         let mut current_canvas = initialize_canvas(canvas_len, vocab, &mut rng);
         let mut argmax_canvas_tokens = current_canvas.clone();
@@ -122,6 +132,7 @@ fn generate_inner(
         let mask = DecoderAttnMask::all_valid(canvas_len, kv_cache.kv_len);
         let mut processed_logits = vec![0.0f32; canvas_len * vocab];
 
+        let denoise_started = std::time::Instant::now();
         for cur_step in (1..=gen_cfg.sampler.max_denoising_steps).rev() {
             if finished {
                 break;
@@ -131,7 +142,7 @@ fn generate_inner(
                 token_ids: &current_canvas,
                 kv_cache: &kv_cache,
                 self_conditioning_logits: self_conditioning_logits.as_deref(),
-                mask: Some(mask.clone()),
+                mask: Some(&mask),
             };
             let decoder_out = decoder_forward(decoder, &decoder_input, gen_cfg.max_layers)?;
 
@@ -163,9 +174,14 @@ fn generate_inner(
             self_conditioning_logits = Some(processed_logits.clone());
             denoise_steps_run += 1;
         }
+        denoise_elapsed += denoise_started.elapsed();
 
         sequences.extend_from_slice(&argmax_canvas_tokens);
-        extend_prefill(store, cfg, &mut kv_cache, &argmax_canvas_tokens, enc_scratch)?;
+        if !is_last_block {
+            let extend_started = std::time::Instant::now();
+            extend_prefill(store, cfg, &mut kv_cache, &argmax_canvas_tokens, enc_scratch)?;
+            extend_elapsed += extend_started.elapsed();
+        }
         blocks_committed += 1;
     }
 
@@ -173,6 +189,9 @@ fn generate_inner(
         token_ids: sequences,
         denoise_steps_run,
         blocks_committed,
+        prefill_elapsed,
+        denoise_elapsed,
+        extend_elapsed,
     })
 }
 

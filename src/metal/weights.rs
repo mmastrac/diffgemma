@@ -19,6 +19,13 @@ fn bf16_tensor_to_f32_buffer(slice: Bf16Slice<'_>) -> Buffer<f32> {
 }
 
 pub struct GpuLayerWeightCache {
+    pub input_layernorm: Buffer<f32>,
+    pub q_norm: Buffer<f32>,
+    pub k_norm: Buffer<f32>,
+    pub q_proj: CachedLinear,
+    pub k_proj: CachedLinear,
+    pub v_proj: Option<CachedLinear>,
+    pub o_proj: CachedLinear,
     pub post_attn_norm: Buffer<f32>,
     pub pre_ff_norm: Buffer<f32>,
     pub post_ff_norm: Buffer<f32>,
@@ -46,7 +53,20 @@ impl GpuLayerWeightCache {
         let inter = cfg.intermediate_size;
         let moe_inter = cfg.moe_intermediate_size;
         let experts = cfg.num_experts;
+        let shapes = crate::model::layer_weights::DecoderLayerShapes::for_layer(cfg, weights.keys.layer)?;
+        let q_out = shapes.q_proj[0] as usize;
+        let kv_out = shapes.k_proj[0] as usize;
         Ok(Self {
+            input_layernorm: bf16_tensor_to_f32_buffer(weights.input_layernorm.bf16()?),
+            q_norm: bf16_tensor_to_f32_buffer(weights.q_norm.bf16()?),
+            k_norm: bf16_tensor_to_f32_buffer(weights.k_norm.bf16()?),
+            q_proj: CachedLinear::from_bf16(weights.q_proj.bf16()?, q_out, hidden),
+            k_proj: CachedLinear::from_bf16(weights.k_proj.bf16()?, kv_out, hidden),
+            v_proj: match &weights.v_proj {
+                Some(v) => Some(CachedLinear::from_bf16(v.bf16()?, kv_out, hidden)),
+                None => None,
+            },
+            o_proj: CachedLinear::from_bf16(weights.o_proj.bf16()?, hidden, q_out),
             post_attn_norm: bf16_tensor_to_f32_buffer(weights.post_attention_layernorm.bf16()?),
             pre_ff_norm: bf16_tensor_to_f32_buffer(weights.pre_feedforward_layernorm.bf16()?),
             post_ff_norm: bf16_tensor_to_f32_buffer(weights.post_feedforward_layernorm.bf16()?),
@@ -117,7 +137,10 @@ impl GpuLayerWeightCache {
     }
 
     pub fn resident_bytes(&self) -> u64 {
-        let mut bytes = (self.post_attn_norm.len()
+        let mut bytes = (self.input_layernorm.len()
+            + self.q_norm.len()
+            + self.k_norm.len()
+            + self.post_attn_norm.len()
             + self.pre_ff_norm.len()
             + self.post_ff_norm.len()
             + self.post_ff_norm_1.len()
@@ -127,7 +150,16 @@ impl GpuLayerWeightCache {
             + self.router_scale.len()
             + self.per_expert_scale.len()) as u64
             * 4;
-        bytes += (self.mlp_gate.w_t.len() + self.mlp_up.w_t.len() + self.mlp_down.w_t.len()) as u64 * 2;
+        bytes += (self.q_proj.w_t.len()
+            + self.k_proj.w_t.len()
+            + self.o_proj.w_t.len()
+            + self.mlp_gate.w_t.len()
+            + self.mlp_up.w_t.len()
+            + self.mlp_down.w_t.len()) as u64
+            * 2;
+        if let Some(v) = &self.v_proj {
+            bytes += v.w_t.len() as u64 * 2;
+        }
         for slot in self.expert_gate_up.borrow().iter().chain(self.expert_down.borrow().iter()) {
             if let Some(w) = slot {
                 bytes += w.len() as u64 * 2;

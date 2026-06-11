@@ -103,7 +103,7 @@ pub fn forward_decoder(
     forward_decoder_attention(
         &mut scratch.attn_out,
         hidden_states,
-        weights,
+        cached,
         cfg,
         layer,
         seq_len,

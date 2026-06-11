@@ -180,7 +180,7 @@ fn forward_inner(
         &mut scratch.cpu.self_cond,
     )?;
 
-    let mask = input.mask.as_ref();
+    let mask = input.mask;
     let positions: Vec<i64> =
         (input.kv_cache.kv_len as i64..input.kv_cache.kv_len as i64 + seq_len as i64).collect();
 

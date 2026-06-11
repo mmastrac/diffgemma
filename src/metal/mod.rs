@@ -1,6 +1,7 @@
 //! Metal GPU runtime (macOS only, `metal` feature).
 
 mod attention;
+mod attention_batch;
 mod batch;
 mod batched_kernels;
 mod buffer;
@@ -18,7 +19,7 @@ mod weights;
 
 pub use memory::{estimate_decoder_forward, estimate_paged_layer_bytes, estimate_weight_cache, MemoryEstimate};
 
-pub use attention::GpuAttention;
+pub use attention::{GpuAttention, GpuAttentionKernels};
 pub use decoder::{
     bench_forward, forward as decoder_forward, load_weight_cache, BenchConfig, GpuDecoderScratch,
 };

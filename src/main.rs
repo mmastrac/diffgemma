@@ -552,7 +552,7 @@ fn run_decoder_gpu_parity(m: &model::Model, seq_len: usize, kv_len: usize, layer
             token_ids: &token_ids,
             kv_cache: &kv_cache,
             self_conditioning_logits: None,
-            mask: Some(mask),
+            mask: Some(&mask),
         };
 
         let est = estimate_decoder_forward(&m.config.text_config, canvas_len, kv_len);
@@ -731,7 +731,7 @@ fn run_bench_decoder(
             token_ids: &token_ids,
             kv_cache: &kv_cache,
             self_conditioning_logits: None,
-            mask: Some(mask),
+            mask: Some(&mask),
         };
 
         let mut scratch = GpuDecoderScratch::new(seq_len, &m.config);
@@ -828,7 +828,7 @@ fn run_decoder_forward(m: &model::Model) -> ExitCode {
         token_ids: &token_ids,
         kv_cache: &kv_cache,
         self_conditioning_logits: None,
-        mask: Some(mask),
+        mask: Some(&mask),
     };
 
     eprintln!(
@@ -1004,6 +1004,15 @@ fn print_generate_output(
     println!("  denoise steps run: {}", out.denoise_steps_run);
     println!("  blocks committed:  {}", out.blocks_committed);
     print_generate_elapsed(label, elapsed);
+    println!("  prefill:  {:.2}s ({:.2?})", out.prefill_elapsed.as_secs_f64(), out.prefill_elapsed);
+    println!("  denoise:  {:.2}s ({:.2?})", out.denoise_elapsed.as_secs_f64(), out.denoise_elapsed);
+    if out.extend_elapsed.as_secs_f64() > 0.0 {
+        println!("  extend:   {:.2}s ({:.2?})", out.extend_elapsed.as_secs_f64(), out.extend_elapsed);
+    }
+    if out.denoise_elapsed.as_secs_f64() > 0.0 && new_tokens > 0 {
+        let tok_s = new_tokens as f64 / out.denoise_elapsed.as_secs_f64();
+        println!("  throughput: {tok_s:.2} tok/s (denoise only, excludes prefill/extend)");
+    }
 
     if let Ok(tokenizer) = tokenizer::Tokenizer::load(model_dir.join("tokenizer.json")) {
         let text = tokenizer.decode(&out.token_ids);
@@ -1264,6 +1273,13 @@ fn run_generate_parity(
         println!("  denoise steps: {}", cpu_out.denoise_steps_run);
         println!("  blocks: {}", cpu_out.blocks_committed);
         print_generate_timing_compare(cpu_elapsed, gpu_elapsed);
+        let new_tokens = cpu_out.token_ids.len().saturating_sub(prompt.len());
+        if cpu_out.denoise_elapsed.as_secs_f64() > 0.0 && new_tokens > 0 {
+            let cpu_tps = new_tokens as f64 / cpu_out.denoise_elapsed.as_secs_f64();
+            let gpu_tps = new_tokens as f64 / gpu_out.denoise_elapsed.as_secs_f64();
+            println!("  cpu throughput: {cpu_tps:.2} tok/s (denoise only)");
+            println!("  gpu throughput: {gpu_tps:.2} tok/s (denoise only)");
+        }
         if let Ok(tokenizer) = tokenizer::Tokenizer::load(model_dir.join("tokenizer.json")) {
             let text = tokenizer.decode(&cpu_out.token_ids);
             if !text.is_empty() {

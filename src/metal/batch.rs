@@ -114,6 +114,34 @@ impl<'a> GpuBatch<'a> {
         Ok(buf)
     }
 
+    pub fn alloc_bytes(
+        &mut self,
+        data: &[u8],
+    ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
+        let bytes = data.len();
+        let buf = self
+            .pool
+            .allocate(self.device, bytes)
+            .ok_or(Error::Format("Metal buffer alloc failed"))?;
+        BufferPool::write_bytes(&buf, data);
+        self.track_release(bytes, buf.clone());
+        Ok(buf)
+    }
+
+    pub fn alloc_i64(
+        &mut self,
+        data: &[i64],
+    ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
+        let bytes = data.len() * 8;
+        let buf = self
+            .pool
+            .allocate(self.device, bytes)
+            .ok_or(Error::Format("Metal buffer alloc failed"))?;
+        BufferPool::write_i64(&buf, data);
+        self.track_release(bytes, buf.clone());
+        Ok(buf)
+    }
+
     pub fn dispatch_1d(
         &self,
         pipeline: &ProtocolObject<dyn MTLComputePipelineState>,

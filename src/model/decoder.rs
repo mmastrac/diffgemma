@@ -14,7 +14,7 @@ pub struct DecoderForwardInput<'a> {
     pub token_ids: &'a [u32],
     pub kv_cache: &'a KvCache,
     pub self_conditioning_logits: Option<&'a [f32]>,
-    pub mask: Option<DecoderAttnMask>,
+    pub mask: Option<&'a DecoderAttnMask>,
 }
 
 pub struct DecoderForwardOutput {
@@ -101,7 +101,7 @@ pub fn forward(
         &mut scratch.self_cond,
     )?;
 
-    let mask = input.mask.as_ref();
+    let mask = input.mask;
     let positions: Vec<i64> = (input.kv_cache.kv_len as i64..input.kv_cache.kv_len as i64 + seq_len as i64).collect();
 
     let mut in_buf = &mut scratch.hidden_a;
