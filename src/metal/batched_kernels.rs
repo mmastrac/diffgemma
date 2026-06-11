@@ -4,7 +4,9 @@ use crate::fast_slice::FastSlice;
 use crate::metal::batch::{set_bytes, GpuBatch};
 use crate::metal::kernels::GpuKernels;
 use crate::safetensors::Error;
-use objc2_metal::MTLComputeCommandEncoder;
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder};
 
 pub fn rms_norm_rows(
     batch: &mut GpuBatch<'_>,
@@ -35,6 +37,88 @@ pub fn rms_norm_rows(
     });
     batch.register_read(buf_o, out);
     Ok(())
+}
+
+/// RMSNorm rows; output stays on GPU until the batch ends.
+pub fn rms_norm_rows_gpu(
+    batch: &mut GpuBatch<'_>,
+    kernels: &GpuKernels,
+    x: &[f32],
+    weight: &[f32],
+    seq_len: usize,
+    hidden: usize,
+    eps: f32,
+) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
+    let len = seq_len * hidden;
+    if x.len() != len || weight.len() != hidden {
+        return Err(Error::Format("rms_norm_rows shape mismatch"));
+    }
+    let buf_x = batch.alloc_f32(x)?;
+    let buf_w = batch.alloc_f32(weight)?;
+    let buf_o = batch.alloc_f32_out(len)?;
+    let dims = [seq_len as u32, hidden as u32];
+    batch.dispatch_1d(&kernels.rms_norm.pipeline, seq_len, |enc| {
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&buf_x), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(&buf_w), 0, 1);
+            enc.setBuffer_offset_atIndex(Some(&buf_o), 0, 2);
+        }
+        set_bytes(enc, &dims, 3);
+        set_bytes(enc, &eps, 4);
+    });
+    Ok(buf_o)
+}
+
+/// RMSNorm rows from a GPU buffer input.
+pub fn rms_norm_rows_gpu_buf(
+    batch: &mut GpuBatch<'_>,
+    kernels: &GpuKernels,
+    x_buf: &ProtocolObject<dyn MTLBuffer>,
+    weight: &[f32],
+    seq_len: usize,
+    hidden: usize,
+    eps: f32,
+) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
+    if weight.len() != hidden {
+        return Err(Error::Format("rms_norm_rows shape mismatch"));
+    }
+    let len = seq_len * hidden;
+    let buf_w = batch.alloc_f32(weight)?;
+    let buf_o = batch.alloc_f32_out(len)?;
+    let dims = [seq_len as u32, hidden as u32];
+    batch.dispatch_1d(&kernels.rms_norm.pipeline, seq_len, |enc| {
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(x_buf), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(&buf_w), 0, 1);
+            enc.setBuffer_offset_atIndex(Some(&buf_o), 0, 2);
+        }
+        set_bytes(enc, &dims, 3);
+        set_bytes(enc, &eps, 4);
+    });
+    Ok(buf_o)
+}
+
+/// RMSNorm without affine weight; output stays on GPU until the batch ends.
+pub fn rms_norm_rows_no_scale_gpu_buf(
+    batch: &mut GpuBatch<'_>,
+    kernels: &GpuKernels,
+    x_buf: &ProtocolObject<dyn MTLBuffer>,
+    seq_len: usize,
+    hidden: usize,
+    eps: f32,
+) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
+    let len = seq_len * hidden;
+    let buf_o = batch.alloc_f32_out(len)?;
+    let dims = [seq_len as u32, hidden as u32];
+    batch.dispatch_1d(&kernels.rms_norm_no_scale.pipeline, seq_len, |enc| {
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(x_buf), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(&buf_o), 0, 1);
+        }
+        set_bytes(enc, &dims, 2);
+        set_bytes(enc, &eps, 3);
+    });
+    Ok(buf_o)
 }
 
 pub fn vec_add_inplace(

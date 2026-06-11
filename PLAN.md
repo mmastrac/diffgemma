@@ -413,7 +413,7 @@ cargo run --release --features metal -- generate-parity -p "Hello" --seed 42 --s
 | Generate tok/s reporting | process | ✅ denoise throughput in `generate-gpu` output |
 | Per-layer weight paging | high RAM / medium speed | transpose once per layer per session |
 | Keep MoE arena batching | medium | already 2 syncs/layer; don't re-sync per expert |
-| Fuse independent GPU norms/GEMMs | medium | only when buffer dependencies allow readback |
+| Fuse independent GPU norms/GEMMs | medium | ✅ fused norm+QKV+head-norms, GQA+o_proj, pre_ff+gate/up, down+post_ff_1 |
 | Avoid per-layer `pool.trim` | medium | caused 3× slowdown; trim at section boundaries only |
 | `bench-decoder` regression table | process | always record before/after per change |
 | Optional expert transpose disk cache | low | only if re-transpose dominates after eviction |
@@ -450,6 +450,7 @@ Today `Bf16Slice::get()` bounds-checks every element; `to_f32_vec()` and MoE tra
 | Post weight paging (layers=3) | ~2.16s (RAM ~1 GiB → ~35 MiB weights) |
 | Post logits reuse + skip lm_head in bench | ~1.89s |
 | Post slim GPU attention scratch | ~1.68s |
+| Post fused attention/FF submits | ~1.63s |
 
 ---
 
@@ -587,7 +588,7 @@ diffgemma-mps/
 
 ## Immediate next step
 
-**Phase 12 (ongoing):** perf, memory, FastSlice — fuse attention submits, GPU head norms, trim prefill paging cost.
+**Phase 12 (ongoing):** perf, memory, FastSlice — trim prefill paging cost, GPU gelu/swiglu, MoE submit fusion.
 
 ```bash
 cargo run --release --features metal -- bench-decoder --seq 16 --kv 8 --layers 3 --iters 3

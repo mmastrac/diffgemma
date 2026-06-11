@@ -3,7 +3,7 @@ use crate::kernels::cpu::gelu_pytorch_tanh;
 use crate::metal::batched_kernels::{self as bk};
 use crate::metal::batch::GpuBatch;
 use crate::metal::engine::GpuDecoderEngine;
-use crate::metal::linear::linear_cached_batched;
+use crate::metal::linear::{linear_cached_batched_in_buf, linear_cached_batched_in_cpu_out};
 use crate::metal::moe::experts_forward_gpu_batched;
 use crate::metal::weights::GpuLayerWeightCache;
 use crate::metal::decoder_attention::{
@@ -159,31 +159,30 @@ fn forward_layer_ff(
     }
     scratch.residual.copy_from_slice(&scratch.normed);
 
-    rms_norm_batch(
-        engine,
-        &mut scratch.normed,
-        &scratch.residual,
-        cached.pre_ff_norm.as_slice(),
-        seq_len,
-        hidden,
-        eps,
-    )?;
-
     {
         let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
-        linear_cached_batched(
+        let buf_normed = bk::rms_norm_rows_gpu(
+            &mut batch,
+            &engine.kernels,
+            &scratch.residual,
+            cached.pre_ff_norm.as_slice(),
+            seq_len,
+            hidden,
+            eps,
+        )?;
+        linear_cached_batched_in_cpu_out(
             &mut batch,
             &engine.f32_bf16_gemm_pipeline,
             &mut scratch.gate,
-            &scratch.normed,
+            &buf_normed,
             &cached.mlp_gate,
             seq_len,
         )?;
-        linear_cached_batched(
+        linear_cached_batched_in_cpu_out(
             &mut batch,
             &engine.f32_bf16_gemm_pipeline,
             &mut scratch.mlp_hidden,
-            &scratch.normed,
+            &buf_normed,
             &cached.mlp_up,
             seq_len,
         )?;
@@ -197,26 +196,26 @@ fn forward_layer_ff(
 
     {
         let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
-        linear_cached_batched(
+        let buf_mlp = batch.alloc_f32(&scratch.mlp_hidden)?;
+        let buf_down = linear_cached_batched_in_buf(
             &mut batch,
             &engine.f32_bf16_gemm_pipeline,
-            &mut scratch.dense_out,
-            &scratch.mlp_hidden,
+            &buf_mlp,
             &cached.mlp_down,
             seq_len,
         )?;
+        let buf_normed = bk::rms_norm_rows_gpu_buf(
+            &mut batch,
+            &engine.kernels,
+            &buf_down,
+            cached.post_ff_norm_1.as_slice(),
+            seq_len,
+            hidden,
+            eps,
+        )?;
+        batch.register_read(buf_normed, &mut scratch.normed);
         batch.end()?;
     }
-
-    rms_norm_batch(
-        engine,
-        &mut scratch.normed,
-        &scratch.dense_out,
-        cached.post_ff_norm_1.as_slice(),
-        seq_len,
-        hidden,
-        eps,
-    )?;
 
     let routes = crate::model::moe::route_with_cached_weights(
         &scratch.residual,

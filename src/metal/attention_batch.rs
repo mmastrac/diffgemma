@@ -87,7 +87,7 @@ pub fn rope_qk_batched(
 pub fn decoder_gqa_gpu_kv_batched(
     batch: &mut GpuBatch<'_>,
     kernels: &GpuAttentionKernels,
-    attn_out: &mut [f32],
+    attn_out: Option<&mut [f32]>,
     q_pre_rope: &[f32],
     k_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     v_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -97,11 +97,16 @@ pub fn decoder_gqa_gpu_kv_batched(
     total_kv: usize,
     params: &AttentionParams,
     mask: GqaMask<'_>,
-) -> Result<(), Error> {
+) -> Result<Option<Retained<ProtocolObject<dyn MTLBuffer>>>, Error> {
     let q_dim = seq_len * params.n_heads * params.head_dim;
     let out_dim = seq_len * params.n_heads * params.head_dim;
-    if q_pre_rope.len() != q_dim || attn_out.len() != out_dim {
+    if q_pre_rope.len() != q_dim {
         return Err(Error::Format("decoder gpu kv gqa shape mismatch"));
+    }
+    if let Some(out) = &attn_out {
+        if out.len() != out_dim {
+            return Err(Error::Format("decoder gpu kv gqa shape mismatch"));
+        }
     }
 
     let buf_q = batch.alloc_f32(q_pre_rope)?;
@@ -162,6 +167,37 @@ pub fn decoder_gqa_gpu_kv_batched(
     )
 }
 
+/// RoPE + GQA over GPU KV; returns attention output buffer when `attn_out` is `None`.
+pub fn decoder_gqa_gpu_kv_batched_chained(
+    batch: &mut GpuBatch<'_>,
+    kernels: &GpuAttentionKernels,
+    q_pre_rope: &[f32],
+    k_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    v_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    k_canvas_elem_offset: usize,
+    freqs: &[f32],
+    seq_len: usize,
+    total_kv: usize,
+    params: &AttentionParams,
+    mask: GqaMask<'_>,
+) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
+    decoder_gqa_gpu_kv_batched(
+        batch,
+        kernels,
+        None,
+        q_pre_rope,
+        k_buf,
+        v_buf,
+        k_canvas_elem_offset,
+        freqs,
+        seq_len,
+        total_kv,
+        params,
+        mask,
+    )?
+    .ok_or(Error::Format("gqa gpu kv missing output buffer"))
+}
+
 pub fn gqa_batched(
     batch: &mut GpuBatch<'_>,
     kernels: &GpuAttentionKernels,
@@ -177,7 +213,7 @@ pub fn gqa_batched(
     gqa_batched_inner(
         batch,
         kernels,
-        attn_out,
+        Some(attn_out),
         q,
         Some((k, v)),
         None,
@@ -186,7 +222,35 @@ pub fn gqa_batched(
         params,
         mask,
         None,
-    )
+    )?;
+    Ok(())
+}
+
+pub fn gqa_batched_chained(
+    batch: &mut GpuBatch<'_>,
+    kernels: &GpuAttentionKernels,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    total_kv: usize,
+    params: &AttentionParams,
+    mask: GqaMask<'_>,
+) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
+    gqa_batched_inner(
+        batch,
+        kernels,
+        None,
+        q,
+        Some((k, v)),
+        None,
+        seq_len,
+        total_kv,
+        params,
+        mask,
+        None,
+    )?
+    .ok_or(Error::Format("gqa missing output buffer"))
 }
 
 /// GQA with K/V already resident in GPU buffers (`k_buf`/`v_buf` hold prefix+canvas).
@@ -205,7 +269,7 @@ pub fn gqa_batched_gpu_kv(
     gqa_batched_inner(
         batch,
         kernels,
-        attn_out,
+        Some(attn_out),
         q,
         None,
         Some((k_buf, v_buf)),
@@ -214,13 +278,14 @@ pub fn gqa_batched_gpu_kv(
         params,
         mask,
         None,
-    )
+    )?;
+    Ok(())
 }
 
 fn gqa_batched_inner(
     batch: &mut GpuBatch<'_>,
     kernels: &GpuAttentionKernels,
-    attn_out: &mut [f32],
+    attn_out: Option<&mut [f32]>,
     q: &[f32],
     kv_cpu: Option<(&[f32], &[f32])>,
     kv_gpu: Option<(Retained<ProtocolObject<dyn MTLBuffer>>, Retained<ProtocolObject<dyn MTLBuffer>>)>,
@@ -229,13 +294,18 @@ fn gqa_batched_inner(
     params: &AttentionParams,
     mask: GqaMask<'_>,
     q_gpu: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
-) -> Result<(), Error> {
+) -> Result<Option<Retained<ProtocolObject<dyn MTLBuffer>>>, Error> {
     let q_dim = seq_len * params.n_heads * params.head_dim;
     let kv_dim_elems = total_kv * params.n_kv_heads * params.head_dim;
     let out_dim = seq_len * params.n_heads * params.head_dim;
 
-    if q.len() != q_dim || attn_out.len() != out_dim {
+    if q.len() != q_dim {
         return Err(Error::Format("gqa attention shape mismatch"));
+    }
+    if let Some(out) = &attn_out {
+        if out.len() != out_dim {
+            return Err(Error::Format("gqa attention shape mismatch"));
+        }
     }
     if let Some((k, v)) = kv_cpu {
         if k.len() != kv_dim_elems || v.len() != kv_dim_elems {
@@ -263,7 +333,7 @@ fn gqa_batched_inner(
         Some((k, v)) => (batch.alloc_f32(k)?, batch.alloc_f32(v)?),
         None => kv_gpu.expect("gpu kv"),
     };
-    let buf_o = batch.alloc_f32_out(attn_out.len())?;
+    let buf_o = batch.alloc_f32_out(out_dim)?;
 
     let mut mask_buf = None;
     let mut pos_buf = None;
@@ -307,8 +377,12 @@ fn gqa_batched_inner(
         seq_len,
     );
 
-    batch.register_read(buf_o, attn_out);
-    Ok(())
+    if let Some(out) = attn_out {
+        batch.register_read(buf_o, out);
+        Ok(None)
+    } else {
+        Ok(Some(buf_o))
+    }
 }
 
 fn encode_rope(
