@@ -2,6 +2,7 @@ mod buffer;
 mod config;
 mod fast_slice;
 mod generate;
+mod generate_golden;
 #[allow(dead_code)]
 mod kernels;
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -46,6 +47,7 @@ enum Command {
         prompt_len: usize,
         max_new_tokens: usize,
         max_layers: Option<usize>,
+        write_golden: Option<String>,
     },
     GenerateParity {
         prompt: Option<String>,
@@ -54,6 +56,9 @@ enum Command {
         prompt_len: usize,
         max_new_tokens: usize,
         max_layers: Option<usize>,
+        golden: Option<String>,
+        compare_cpu: bool,
+        write_golden: Option<String>,
     },
     Tokenize(String),
     Gemm { size: usize },
@@ -141,6 +146,7 @@ fn run_command(m: &model::Model, model_dir: &std::path::Path, command: Command) 
             max_new_tokens,
             max_layers,
             false,
+            None,
         ),
         Command::GenerateGpu {
             prompt,
@@ -149,6 +155,7 @@ fn run_command(m: &model::Model, model_dir: &std::path::Path, command: Command) 
             prompt_len,
             max_new_tokens,
             max_layers,
+            write_golden,
         } => run_generate(
             m,
             model_dir,
@@ -159,6 +166,7 @@ fn run_command(m: &model::Model, model_dir: &std::path::Path, command: Command) 
             max_new_tokens,
             max_layers,
             true,
+            write_golden,
         ),
         Command::GenerateParity {
             prompt,
@@ -167,6 +175,9 @@ fn run_command(m: &model::Model, model_dir: &std::path::Path, command: Command) 
             prompt_len,
             max_new_tokens,
             max_layers,
+            golden,
+            compare_cpu,
+            write_golden,
         } => run_generate_parity(
             m,
             model_dir,
@@ -176,6 +187,9 @@ fn run_command(m: &model::Model, model_dir: &std::path::Path, command: Command) 
             prompt_len,
             max_new_tokens,
             max_layers,
+            golden,
+            compare_cpu,
+            write_golden,
         ),
         Command::Tokenize(_) => ExitCode::FAILURE,
         Command::Gemm { .. } => ExitCode::FAILURE,
@@ -199,6 +213,9 @@ fn parse_cli() -> Cli {
     let mut parity_seq: Option<usize> = None;
     let mut parity_kv: Option<usize> = None;
     let mut parity_layers: Option<usize> = None;
+    let mut golden_name: Option<String> = None;
+    let mut compare_cpu = false;
+    let mut write_golden: Option<String> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -242,6 +259,17 @@ fn parse_cli() -> Cli {
                         eprintln!("invalid --max-new-tokens");
                         std::process::exit(2);
                     });
+                }
+            }
+            "--compare-cpu" => compare_cpu = true,
+            "--write-golden" => {
+                if let Some(v) = args.next() {
+                    write_golden = Some(v);
+                }
+            }
+            "--golden" => {
+                if let Some(v) = args.next() {
+                    golden_name = Some(v);
                 }
             }
             "--size" => {
@@ -323,6 +351,7 @@ fn parse_cli() -> Cli {
             prompt_len,
             max_new_tokens,
             max_layers: parity_layers,
+            write_golden,
         },
         Some("generate-parity") => Command::GenerateParity {
             prompt: prompt.clone(),
@@ -331,6 +360,9 @@ fn parse_cli() -> Cli {
             prompt_len,
             max_new_tokens,
             max_layers: parity_layers,
+            golden: golden_name,
+            compare_cpu,
+            write_golden,
         },
         Some("tokenize") => {
             let text = positional.get(1).cloned().unwrap_or_else(|| {
@@ -358,7 +390,8 @@ fn parse_cli() -> Cli {
                 "usage: diffgemma-mps [-p PROMPT] [summary|config|weights <name>|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-parity|tokenize <text>|gemm|attention]"
             );
             eprintln!("  default (no command): generate-gpu with --features metal");
-            eprintln!("  options: -p/--prompt TEXT --seed N --steps N --prompt-len N --max-new-tokens N --layers N");
+            eprintln!("  generate-parity: GPU vs checked-in golden (use --compare-cpu for slow CPU path)");
+            eprintln!("  options: ... --golden NAME --write-golden NAME --compare-cpu");
             eprintln!("  gemm options: --size N (default 512, requires --features metal)");
             eprintln!("  attention: layer 0 GQA parity (requires --features metal)");
             eprintln!("  decoder-gpu: full decoder CPU vs GPU parity at seq=256 (requires --features metal)");
@@ -385,6 +418,7 @@ fn default_generate_command(
         prompt_len,
         max_new_tokens,
         max_layers,
+        write_golden: None,
     }
 }
 
@@ -1031,6 +1065,19 @@ fn print_generate_output(
     println!("  token_ids[0..16]: [{}]", preview.join(", "));
 }
 
+fn infer_golden_name(prompt_text: Option<&str>, steps: usize, max_layers: Option<usize>) -> Option<String> {
+    if prompt_text != Some("Hello") {
+        return None;
+    }
+    match (steps, max_layers) {
+        (1, None) => Some("hello_steps1_full".into()),
+        (1, Some(3)) => Some("hello_steps1_layers3".into()),
+        (2, Some(3)) => Some("hello_steps2_layers3".into()),
+        (2, None) => Some("hello_steps2_full".into()),
+        _ => None,
+    }
+}
+
 fn run_generate(
     m: &model::Model,
     model_dir: &std::path::Path,
@@ -1041,6 +1088,7 @@ fn run_generate(
     max_new_tokens: usize,
     max_layers: Option<usize>,
     use_gpu: bool,
+    write_golden: Option<String>,
 ) -> ExitCode {
     let vocab = m.config.text_config.vocab_size;
     let canvas = m.config.canvas_length;
@@ -1110,6 +1158,20 @@ fn run_generate(
             &mut engine,
         ) {
             Ok(out) => {
+                if let Some(ref name) = write_golden {
+                    let golden_name = name.clone();
+                    let prompt_str = prompt_text.clone().unwrap_or_default();
+                    if let Err(err) = write_generate_golden(
+                        &golden_name,
+                        &prompt_str,
+                        &gen_cfg,
+                        steps,
+                        &out,
+                    ) {
+                        eprintln!("error: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                }
                 print_generate_output(backend, &out, prompt_len, started.elapsed(), model_dir);
                 ExitCode::SUCCESS
             }
@@ -1146,6 +1208,20 @@ fn run_generate(
     }
 }
 
+fn write_generate_golden(
+    name: &str,
+    prompt: &str,
+    gen_cfg: &generate::GenerateConfig,
+    steps: usize,
+    out: &generate::GenerateOutput,
+) -> Result<(), safetensors::Error> {
+    let golden = generate_golden::GenerateGolden::from_run(name, prompt, gen_cfg, steps, out);
+    let path = generate_golden::resolve_fixture(name);
+    golden.write(&path)?;
+    eprintln!("wrote golden {} ({} tokens)", path.display(), out.token_ids.len());
+    Ok(())
+}
+
 fn run_generate_parity(
     m: &model::Model,
     model_dir: &std::path::Path,
@@ -1155,9 +1231,13 @@ fn run_generate_parity(
     prompt_len: usize,
     max_new_tokens: usize,
     max_layers: Option<usize>,
+    golden_name: Option<String>,
+    compare_cpu: bool,
+    write_golden: Option<String>,
 ) -> ExitCode {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     {
+        use generate_golden::GenerateGolden;
         use metal::{load_weight_cache, GpuDecoderEngine, GpuDecoderScratch};
 
         let vocab = m.config.text_config.vocab_size;
@@ -1185,13 +1265,13 @@ fn run_generate_parity(
             max_layers,
         };
 
+        let prompt_label = prompt_text.clone().unwrap_or_else(|| format!("prompt_len={prompt_len}"));
+
         if let Some(n) = max_layers {
             eprintln!("generate-parity: decoder layers limited to {n}");
         }
 
         let enc_seq = prompt.len().max(canvas);
-        let mut enc_cpu = model::encoder::EncoderScratch::new(enc_seq, &m.config);
-        let mut dec_cpu = model::decoder::DecoderScratch::new(canvas, &m.config);
         let mut enc_gpu = model::encoder::EncoderScratch::new(enc_seq, &m.config);
         let mut dec_gpu = GpuDecoderScratch::new(canvas, &m.config);
         let mut gpu_weights = match load_weight_cache(&m.weights, &m.config.text_config) {
@@ -1208,25 +1288,6 @@ fn run_generate_parity(
                 return ExitCode::FAILURE;
             }
         };
-
-        eprintln!("running CPU generate...");
-        let cpu_started = std::time::Instant::now();
-        let cpu_out = match generate::generate(
-            &m.weights,
-            &m.config,
-            &prompt,
-            &gen_cfg,
-            &mut enc_cpu,
-            &mut dec_cpu,
-        ) {
-            Ok(out) => out,
-            Err(err) => {
-                eprintln!("error: {err}");
-                return ExitCode::FAILURE;
-            }
-        };
-        let cpu_elapsed = cpu_started.elapsed();
-        eprintln!("CPU generate finished in {:.2}s ({cpu_elapsed:.2?})", cpu_elapsed.as_secs_f64());
 
         eprintln!("running GPU generate...");
         let gpu_started = std::time::Instant::now();
@@ -1249,39 +1310,87 @@ fn run_generate_parity(
         let gpu_elapsed = gpu_started.elapsed();
         eprintln!("GPU generate finished in {:.2}s ({gpu_elapsed:.2?})", gpu_elapsed.as_secs_f64());
 
-        if cpu_out.token_ids != gpu_out.token_ids {
-            let first_diff = cpu_out
-                .token_ids
-                .iter()
-                .zip(gpu_out.token_ids.iter())
-                .position(|(a, b)| a != b);
-            eprintln!(
-                "error: token mismatch at index {:?} (cpu len={}, gpu len={})",
-                first_diff,
-                cpu_out.token_ids.len(),
-                gpu_out.token_ids.len()
-            );
-            if let Some(i) = first_diff {
-                eprintln!("  cpu[{}]={}", i, cpu_out.token_ids[i]);
-                eprintln!("  gpu[{}]={}", i, gpu_out.token_ids[i]);
+        if let Some(ref name) = write_golden {
+            if let Err(err) = write_generate_golden(name, &prompt_label, &gen_cfg, steps, &gpu_out) {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
             }
-            return ExitCode::FAILURE;
         }
 
-        println!("generate parity ok");
-        println!("  tokens: {}", cpu_out.token_ids.len());
-        println!("  denoise steps: {}", cpu_out.denoise_steps_run);
-        println!("  blocks: {}", cpu_out.blocks_committed);
-        print_generate_timing_compare(cpu_elapsed, gpu_elapsed);
-        let new_tokens = cpu_out.token_ids.len().saturating_sub(prompt.len());
-        if cpu_out.denoise_elapsed.as_secs_f64() > 0.0 && new_tokens > 0 {
-            let cpu_tps = new_tokens as f64 / cpu_out.denoise_elapsed.as_secs_f64();
+        if compare_cpu {
+            let mut enc_cpu = model::encoder::EncoderScratch::new(enc_seq, &m.config);
+            let mut dec_cpu = model::decoder::DecoderScratch::new(canvas, &m.config);
+            eprintln!("running CPU generate...");
+            let cpu_started = std::time::Instant::now();
+            let cpu_out = match generate::generate(
+                &m.weights,
+                &m.config,
+                &prompt,
+                &gen_cfg,
+                &mut enc_cpu,
+                &mut dec_cpu,
+            ) {
+                Ok(out) => out,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let cpu_elapsed = cpu_started.elapsed();
+            eprintln!("CPU generate finished in {:.2}s ({cpu_elapsed:.2?})", cpu_elapsed.as_secs_f64());
+            if cpu_out.token_ids != gpu_out.token_ids {
+                let first_diff = cpu_out
+                    .token_ids
+                    .iter()
+                    .zip(gpu_out.token_ids.iter())
+                    .position(|(a, b)| a != b);
+                eprintln!(
+                    "error: CPU/GPU token mismatch at index {:?}",
+                    first_diff
+                );
+                return ExitCode::FAILURE;
+            }
+            print_generate_timing_compare(cpu_elapsed, gpu_elapsed);
+        } else {
+            let fixture = match golden_name
+                .or_else(|| infer_golden_name(prompt_text.as_deref(), steps, max_layers))
+            {
+                Some(name) => name,
+                None => {
+                    eprintln!("error: no --golden fixture; use --write-golden NAME or --compare-cpu");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let path = generate_golden::resolve_fixture(&fixture);
+            eprintln!("checking golden {}...", path.display());
+            let golden = match GenerateGolden::load(&path) {
+                Ok(g) => g,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if !golden.matches_config(&prompt_label, &gen_cfg, steps) {
+                eprintln!("error: golden config mismatch for {}", golden.name);
+                return ExitCode::FAILURE;
+            }
+            if let Err(err) = golden.compare(&gpu_out) {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+            println!("generate golden ok ({})", golden.name);
+        }
+
+        let new_tokens = gpu_out.token_ids.len().saturating_sub(prompt.len());
+        println!("  tokens: {}", gpu_out.token_ids.len());
+        println!("  denoise steps: {}", gpu_out.denoise_steps_run);
+        println!("  blocks: {}", gpu_out.blocks_committed);
+        if gpu_out.denoise_elapsed.as_secs_f64() > 0.0 && new_tokens > 0 {
             let gpu_tps = new_tokens as f64 / gpu_out.denoise_elapsed.as_secs_f64();
-            println!("  cpu throughput: {cpu_tps:.2} tok/s (denoise only)");
             println!("  gpu throughput: {gpu_tps:.2} tok/s (denoise only)");
         }
         if let Ok(tokenizer) = tokenizer::Tokenizer::load(model_dir.join("tokenizer.json")) {
-            let text = tokenizer.decode(&cpu_out.token_ids);
+            let text = tokenizer.decode(&gpu_out.token_ids);
             if !text.is_empty() {
                 let preview: String = text.chars().take(200).collect();
                 println!("  text: {preview}");
@@ -1291,7 +1400,19 @@ fn run_generate_parity(
     }
     #[cfg(not(all(feature = "metal", target_os = "macos")))]
     {
-        let _ = (m, model_dir, prompt_text, seed, steps, prompt_len, max_new_tokens, max_layers);
+        let _ = (
+            m,
+            model_dir,
+            prompt_text,
+            seed,
+            steps,
+            prompt_len,
+            max_new_tokens,
+            max_layers,
+            golden_name,
+            compare_cpu,
+            write_golden,
+        );
         eprintln!("error: generate-parity requires --features metal on macOS");
         ExitCode::FAILURE
     }

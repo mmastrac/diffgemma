@@ -32,7 +32,7 @@ impl Default for GenerateConfig {
     }
 }
 
-    pub struct GenerateOutput {
+pub struct GenerateOutput {
     pub token_ids: Vec<u32>,
     pub denoise_steps_run: usize,
     pub blocks_committed: usize,
@@ -120,8 +120,8 @@ fn generate_inner(
 
         let mut current_canvas = initialize_canvas(canvas_len, vocab, &mut rng);
         let mut argmax_canvas_tokens = current_canvas.clone();
-        let mut self_conditioning_logits: Option<Vec<f32>> = None;
         let mut finished = false;
+        let mut have_sc_logits = false;
 
         let mut stopper = StableConfidentStopper::new(
             gen_cfg.sampler.stability_threshold,
@@ -131,6 +131,8 @@ fn generate_inner(
 
         let mask = DecoderAttnMask::all_valid(canvas_len, kv_cache.kv_len);
         let mut processed_logits = vec![0.0f32; canvas_len * vocab];
+        let mut sample_logits = vec![0.0f32; canvas_len * vocab];
+        let mut sc_logits = vec![0.0f32; canvas_len * vocab];
 
         let denoise_started = std::time::Instant::now();
         for cur_step in (1..=gen_cfg.sampler.max_denoising_steps).rev() {
@@ -141,7 +143,11 @@ fn generate_inner(
             let decoder_input = DecoderForwardInput {
                 token_ids: &current_canvas,
                 kv_cache: &kv_cache,
-                self_conditioning_logits: self_conditioning_logits.as_deref(),
+                self_conditioning_logits: if have_sc_logits {
+                    Some(sc_logits.as_slice())
+                } else {
+                    None
+                },
                 mask: Some(&mask),
             };
             let decoder_out = decoder_forward(decoder, &decoder_input, gen_cfg.max_layers)?;
@@ -149,7 +155,7 @@ fn generate_inner(
             processed_logits.copy_from_slice(&decoder_out.logits);
             apply_temperature(&mut processed_logits, cur_step, &gen_cfg.sampler);
 
-            let mut sample_logits = processed_logits.clone();
+            sample_logits.copy_from_slice(&processed_logits);
             let denoiser_canvas =
                 sample_canvas(&mut sample_logits, canvas_len, vocab, &mut rng);
             let new_argmax = argmax_canvas(&processed_logits, canvas_len, vocab);
@@ -171,7 +177,8 @@ fn generate_inner(
                 canvas_len,
                 vocab,
             );
-            self_conditioning_logits = Some(processed_logits.clone());
+            sc_logits.copy_from_slice(&processed_logits);
+            have_sc_logits = true;
             denoise_steps_run += 1;
         }
         denoise_elapsed += denoise_started.elapsed();

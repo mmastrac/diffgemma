@@ -371,7 +371,7 @@ cargo run --release --features metal -- bench-decoder --seq 16 --kv 8 --layers 3
 cargo run --release --features metal -- generate-gpu -p "Hello" --seed 42 --steps 1
 # prefill ~3s, denoise ~118s → 2.17 tok/s (30 layers, canvas=256)
 cargo run --release --features metal -- generate-parity -p "Hello" --seed 42 --steps 1 --layers 3
-# token parity ok, gpu ~15s → ~17 tok/s (3-layer smoke)
+# GPU-only vs golden ~15s (3 fixtures in fixtures/generate/)
 ```
 
 ---
@@ -390,7 +390,8 @@ cargo run --release --features metal -- generate-parity -p "Hello" --seed 42 --s
 | Buffer pool trim | ✅ | `BufferPool::trim()` at forward end |
 | Memory estimates | ✅ | `src/metal/memory.rs`; printed by `decoder-gpu` |
 | Per-layer weight cache paging | ✅ | one `GpuLayerWeightCache` resident; load/release per layer |
-| Skip logits in parity mode | — | save 256 MiB on comparison runs |
+| Skip logits clone in generate loop | ✅ | reuse `sample_logits` / `sc_logits` buffers |
+| Generate golden fixtures | ✅ | `fixtures/generate/*.json`; GPU-only `generate-parity` |
 | GPU KV without CPU mirrors | — | for generation loop |
 
 **OOM note:** full `decoder-gpu` (30 layers, seq=256) needs ~2.3 GiB single-path (estimate). Prior OOM was caused by 30 persistent attention scratches + unbounded expert transpose cache + CPU∥GPU peak.
