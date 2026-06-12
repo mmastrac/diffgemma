@@ -26,6 +26,9 @@ pub struct ExpertCacheStats {
     pub used_bytes: u64,
     pub entries: usize,
     pub evictions: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub upload_bytes: u64,
 }
 
 /// Bytes for one expert's gate_up + down (bf16, PyTorch layout).
@@ -46,6 +49,9 @@ struct ExpertLruCache {
     budget_bytes: u64,
     used_bytes: u64,
     evictions: u64,
+    hits: u64,
+    misses: u64,
+    upload_bytes: u64,
     touch_order: VecDeque<(usize, usize)>,
     layers: Vec<LayerExpertWeightCache>,
     entry_bytes: u64,
@@ -64,6 +70,9 @@ impl ExpertLruCache {
             budget_bytes,
             used_bytes: 0,
             evictions: 0,
+            hits: 0,
+            misses: 0,
+            upload_bytes: 0,
             touch_order: VecDeque::new(),
             layers: (0..text.num_hidden_layers)
                 .map(|_| LayerExpertWeightCache {
@@ -91,6 +100,9 @@ impl ExpertLruCache {
             used_bytes: self.used_bytes,
             entries,
             evictions: self.evictions,
+            hits: self.hits,
+            misses: self.misses,
+            upload_bytes: self.upload_bytes,
         }
     }
 
@@ -155,9 +167,11 @@ impl ExpertLruCache {
     ) {
         if self.layers[layer].gate_up[expert].is_some() {
             self.touch(layer, expert);
+            self.hits += 1;
             return;
         }
 
+        self.misses += 1;
         self.make_room(self.entry_bytes);
 
         let gate_elems = self.moe_inter * 2 * self.hidden;
@@ -168,7 +182,9 @@ impl ExpertLruCache {
         let gate_buf = Self::upload_expert_bf16(device, pool, gate_up, gate_off, gate_elems);
         let down_buf = Self::upload_expert_bf16(device, pool, down, down_off, down_elems);
 
-        self.used_bytes += gate_buf.length() as u64 + down_buf.length() as u64;
+        let uploaded = gate_buf.length() as u64 + down_buf.length() as u64;
+        self.used_bytes += uploaded;
+        self.upload_bytes += uploaded;
         let slot = &mut self.layers[layer];
         slot.gate_up[expert] = Some(gate_buf);
         slot.down[expert] = Some(down_buf);

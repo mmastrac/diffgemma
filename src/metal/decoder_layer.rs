@@ -1,6 +1,6 @@
 use crate::config::TextConfig;
 use crate::metal::batched_kernels::{self as bk};
-use crate::metal::batch::GpuBatch;
+use crate::metal::batch::begin_engine_batch;
 use crate::metal::engine::GpuDecoderEngine;
 use crate::metal::linear::linear_cached_batched_in_buf;
 use crate::metal::moe::experts_forward_gpu_batched;
@@ -123,7 +123,13 @@ fn forward_layer_ff(
     scratch.residual.copy_from_slice(hidden_states);
 
     {
-        let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
+        let telemetry = engine.batch_telemetry();
+        let mut batch = begin_engine_batch(
+            &engine.ctx.queue,
+            &mut engine.pool,
+            &engine.ctx.device,
+            telemetry,
+        )?;
         let len = seq_len * hidden;
         let buf_res = batch.alloc_f32(&scratch.residual)?;
         let buf_attn = batch.alloc_f32(&scratch.attn_out)?;
@@ -194,6 +200,7 @@ fn forward_layer_ff(
         &mut scratch.cpu.moe,
     )?;
 
+    let telemetry = engine.batch_telemetry();
     experts_forward_gpu_batched(
         &mut scratch.moe_branch,
         &scratch.residual,
@@ -211,10 +218,17 @@ fn forward_layer_ff(
         &mut engine.pool,
         &engine.kernels,
         &engine.f32_bf16_linear_pipeline,
+        telemetry,
     )?;
 
     {
-        let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
+        let telemetry = engine.batch_telemetry();
+        let mut batch = begin_engine_batch(
+            &engine.ctx.queue,
+            &mut engine.pool,
+            &engine.ctx.device,
+            telemetry,
+        )?;
         let len = seq_len * hidden;
         let buf_moe = batch.alloc_f32(&scratch.moe_branch)?;
         let buf_moe_n = bk::rms_norm_rows_gpu_buf(

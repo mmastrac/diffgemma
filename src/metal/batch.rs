@@ -2,7 +2,10 @@
 
 use crate::fast_slice::FastSlice;
 use crate::metal::buffer::BufferPool;
+use crate::metal::telemetry::ForwardTelemetry;
 use crate::safetensors::Error;
+use std::cell::RefCell;
+use std::rc::Rc;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
@@ -24,6 +27,7 @@ pub struct GpuBatch<'a> {
     enc: Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>,
     reads: Vec<PendingRead>,
     releases: Vec<(usize, Retained<ProtocolObject<dyn MTLBuffer>>)>,
+    telemetry: Option<Rc<RefCell<ForwardTelemetry>>>,
 }
 
 impl<'a> GpuBatch<'a> {
@@ -31,7 +35,16 @@ impl<'a> GpuBatch<'a> {
         queue: &'a ProtocolObject<dyn MTLCommandQueue>,
         pool: &'a mut BufferPool,
         device: &'a ProtocolObject<dyn MTLDevice>,
-    ) -> Result<Self, Error> {
+    ) -> Result<GpuBatch<'a>, Error> {
+        Self::begin_with_telemetry(queue, pool, device, None)
+    }
+
+    pub fn begin_with_telemetry(
+        queue: &'a ProtocolObject<dyn MTLCommandQueue>,
+        pool: &'a mut BufferPool,
+        device: &'a ProtocolObject<dyn MTLDevice>,
+        telemetry: Option<Rc<RefCell<ForwardTelemetry>>>,
+    ) -> Result<GpuBatch<'a>, Error> {
         let cmd = queue
             .commandBuffer()
             .ok_or(Error::Format("Metal command buffer alloc failed"))?;
@@ -46,6 +59,7 @@ impl<'a> GpuBatch<'a> {
             enc: Some(enc),
             reads: Vec::new(),
             releases: Vec::new(),
+            telemetry,
         })
     }
 
@@ -240,12 +254,25 @@ impl<'a> GpuBatch<'a> {
         self.track_read(buf, out);
     }
 
+    pub(crate) fn record_dense_upload(&mut self, bytes: u64) {
+        if let Some(cell) = self.telemetry.as_ref() {
+            cell.borrow_mut().dense_gpu_upload_bytes += bytes;
+        }
+    }
+
     pub fn end(mut self) -> Result<(), Error> {
+        let readback_bytes: u64 = self.reads.iter().map(|r| r.len as u64 * 4).sum();
         let enc = self.enc.take().expect("batch encoder missing");
         enc.endEncoding();
         let cmd = self.cmd.take().expect("batch command buffer missing");
         cmd.commit();
         cmd.waitUntilCompleted();
+
+        if let Some(cell) = self.telemetry.as_ref() {
+            let mut tel = cell.borrow_mut();
+            tel.gpu_syncs += 1;
+            tel.gpu_readback_bytes += readback_bytes;
+        }
 
         for read in self.reads {
             let slice = unsafe { std::slice::from_raw_parts_mut(read.dst, read.len) };
@@ -260,6 +287,16 @@ impl<'a> GpuBatch<'a> {
 
 fn div_up(value: usize, group: usize) -> usize {
     (value + group - 1) / group
+}
+
+/// Start a batch with optional step telemetry (only `pool` is mutably borrowed).
+pub fn begin_engine_batch<'a>(
+    queue: &'a ProtocolObject<dyn MTLCommandQueue>,
+    pool: &'a mut BufferPool,
+    device: &'a ProtocolObject<dyn MTLDevice>,
+    telemetry: Option<Rc<RefCell<ForwardTelemetry>>>,
+) -> Result<GpuBatch<'a>, Error> {
+    GpuBatch::begin_with_telemetry(queue, pool, device, telemetry)
 }
 
 pub fn set_bytes<T>(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, value: &T, index: usize) {

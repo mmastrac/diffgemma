@@ -43,6 +43,8 @@ pub struct GenerateOutput {
     pub prefill_elapsed: std::time::Duration,
     pub denoise_elapsed: std::time::Duration,
     pub extend_elapsed: std::time::Duration,
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    pub session_telemetry: crate::metal::SessionTelemetry,
 }
 
 enum DecoderBackend<'a> {
@@ -220,6 +222,8 @@ fn generate_inner(
     let mut blocks_committed = 0usize;
     let mut denoise_elapsed = std::time::Duration::ZERO;
     let mut extend_elapsed = std::time::Duration::ZERO;
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    let mut session_telemetry = crate::metal::SessionTelemetry::default();
 
     for _block in 0..max_blocks {
         if sequences.len() >= prompt_token_ids.len() + gen_cfg.max_new_tokens {
@@ -264,8 +268,20 @@ fn generate_inner(
                 compute_logits: true,
                 return_hidden: false,
             };
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            if let DecoderBackend::Gpu { engine, .. } = decoder {
+                engine.reset_forward_telemetry();
+            }
+            let decoder_started = std::time::Instant::now();
             decoder_forward(decoder, &mut decoder_input, gen_cfg.max_layers)?;
+            let decoder_ms = decoder_started.elapsed().as_secs_f64() * 1000.0;
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            let forward_telemetry = match decoder {
+                DecoderBackend::Gpu { engine, .. } => engine.take_forward_telemetry(),
+                _ => crate::metal::ForwardTelemetry::default(),
+            };
 
+            let sampler_started = std::time::Instant::now();
             apply_temperature(&mut processed_logits, cur_step, &gen_cfg.sampler);
 
             sample_logits.copy_from_slice(&processed_logits);
@@ -290,6 +306,15 @@ fn generate_inner(
                 canvas_len,
                 vocab,
             );
+            let sampler_ms = sampler_started.elapsed().as_secs_f64() * 1000.0;
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            if matches!(decoder, DecoderBackend::Gpu { .. }) {
+                session_telemetry.steps.push(crate::metal::StepPhaseTelemetry {
+                    decoder_ms,
+                    sampler_ms,
+                    forward: forward_telemetry,
+                });
+            }
             sc_logits.copy_from_slice(&processed_logits);
             have_sc_logits = true;
             denoise_steps_run += 1;
@@ -320,6 +345,8 @@ fn generate_inner(
         prefill_elapsed,
         denoise_elapsed,
         extend_elapsed,
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        session_telemetry,
     })
 }
 

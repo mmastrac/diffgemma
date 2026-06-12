@@ -3,7 +3,10 @@ use crate::metal::batched_kernels::{self as bk};
 use crate::metal::kernels::GpuKernels;
 use crate::metal::batch::GpuBatch;
 use crate::metal::device::MetalContext;
+use crate::metal::telemetry::ForwardTelemetry;
 use crate::metal::weights::GpuDecoderWeightCache;
+use std::cell::RefCell;
+use std::rc::Rc;
 use crate::model::layer_weights::DecoderLayerWeights;
 use crate::model::moe::RouteResult;
 use crate::safetensors::Error;
@@ -33,6 +36,7 @@ pub fn experts_forward_gpu_batched(
     pool: &mut crate::metal::buffer::BufferPool,
     kernels: &GpuKernels,
     gemm_pipeline: &crate::metal::device::ComputePipeline,
+    telemetry: Option<Rc<RefCell<ForwardTelemetry>>>,
 ) -> Result<(), Error> {
     let hidden = cfg.hidden_size;
     let moe_inter = cfg.moe_intermediate_size;
@@ -75,6 +79,11 @@ pub fn experts_forward_gpu_batched(
         return Ok(());
     }
 
+    if let Some(cell) = &telemetry {
+        cell.borrow_mut()
+            .record_expert_layer(layer, jobs.len(), cfg);
+    }
+
     let _ = (gate_up_len, gate_act_len);
     out_arena.resize(out_len, 0.0);
 
@@ -93,7 +102,12 @@ pub fn experts_forward_gpu_batched(
 
     // One sync: pre_ff norm → gather → gate_up GEMM → gelu/swiglu → down GEMM per expert job.
     {
-        let mut batch = GpuBatch::begin(&ctx.queue, pool, &ctx.device)?;
+        let mut batch = GpuBatch::begin_with_telemetry(
+            &ctx.queue,
+            pool,
+            &ctx.device,
+            telemetry.clone(),
+        )?;
         let buf_res = batch.alloc_f32(residual)?;
         let buf_moe_in = bk::rms_norm_rows_gpu_buf(
             &mut batch,

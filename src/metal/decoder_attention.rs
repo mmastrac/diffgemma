@@ -4,7 +4,7 @@ use crate::metal::attention_batch::{
     decoder_gqa_gpu_kv_batched_chained, gqa_batched_chained, rope_qk_batched,
 };
 use crate::metal::batched_kernels::{self as bk};
-use crate::metal::batch::GpuBatch;
+use crate::metal::batch::begin_engine_batch;
 use crate::metal::engine::GpuDecoderEngine;
 use crate::metal::kv_cache::GpuKvCache;
 use crate::metal::linear::{linear_cached_batched_in_buf, linear_cached_batched_in_cpu_out};
@@ -28,7 +28,13 @@ fn fused_input_qkv_heads(
     k: &mut [f32],
     v: &mut [f32],
 ) -> Result<(), Error> {
-    let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
+    let telemetry = engine.batch_telemetry();
+    let mut batch = begin_engine_batch(
+        &engine.ctx.queue,
+        &mut engine.pool,
+        &engine.ctx.device,
+        telemetry,
+    )?;
     let buf_normed = bk::rms_norm_rows_gpu(
         &mut batch,
         &engine.kernels,
@@ -112,7 +118,13 @@ fn fused_gqa_o_proj_gpu_kv(
     mask: GqaMask<'_>,
     o_proj: &crate::metal::linear::CachedLinear,
 ) -> Result<(), Error> {
-    let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
+    let telemetry = engine.batch_telemetry();
+    let mut batch = begin_engine_batch(
+        &engine.ctx.queue,
+        &mut engine.pool,
+        &engine.ctx.device,
+        telemetry,
+    )?;
     let buf_attn = decoder_gqa_gpu_kv_batched_chained(
         &mut batch,
         &engine.attention,
@@ -185,7 +197,13 @@ pub fn forward_decoder_attention(
     if !use_gpu_kv {
         scratch.ensure_cpu_kv_buffers(&params);
         {
-            let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
+            let telemetry = engine.batch_telemetry();
+    let mut batch = begin_engine_batch(
+        &engine.ctx.queue,
+        &mut engine.pool,
+        &engine.ctx.device,
+        telemetry,
+    )?;
             rope_qk_batched(
                 &mut batch,
                 &engine.attention,
@@ -240,7 +258,13 @@ pub fn forward_decoder_attention(
             &cached.o_proj,
         )?;
     } else {
-        let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
+        let telemetry = engine.batch_telemetry();
+    let mut batch = begin_engine_batch(
+        &engine.ctx.queue,
+        &mut engine.pool,
+        &engine.ctx.device,
+        telemetry,
+    )?;
         let buf_attn = gqa_batched_chained(
             &mut batch,
             &engine.attention,

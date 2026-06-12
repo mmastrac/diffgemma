@@ -18,6 +18,8 @@ mod linear;
 mod kv_cache;
 mod memory;
 mod moe;
+mod probe;
+mod telemetry;
 mod weights;
 
 pub use memory::{
@@ -34,3 +36,5 @@ pub use weights::GpuDecoderWeightCache;
 pub use kv_cache::GpuKvCache;
 pub use engine::GpuDecoderEngine;
 pub use gemm::{bf16_matmul_cpu, f32_to_bf16, Bf16Gemm};
+pub use probe::{print_probe_result, probe_device, DeviceProbeResult};
+pub use telemetry::{ForwardTelemetry, SessionTelemetry, StepPhaseTelemetry};

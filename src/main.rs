@@ -78,6 +78,14 @@ enum Command {
         layers: usize,
         iters: usize,
     },
+    BenchStep {
+        canvas: usize,
+        layers: usize,
+        iters: usize,
+        prompt: Option<String>,
+        seed: u64,
+    },
+    ProbeDevice,
     ConvertModel {
         output_dir: PathBuf,
     },
@@ -89,6 +97,7 @@ fn main() -> ExitCode {
         Command::ConvertModel { output_dir } => run_convert_model(&cli.model_dir, &output_dir),
         Command::Tokenize(text) => run_tokenize(&cli.model_dir, &text),
         Command::Gemm { size } => run_gemm(size),
+        Command::ProbeDevice => run_probe_device(),
         command => {
             eprintln!("loading from {}", cli.model_dir.display());
             match model::Model::open(&cli.model_dir) {
@@ -136,6 +145,13 @@ fn run_command(m: &model::Model, model_dir: &std::path::Path, command: Command) 
             layers,
             iters,
         } => run_bench_decoder(m, seq_len, kv_len, layers, iters),
+        Command::BenchStep {
+            canvas,
+            layers,
+            iters,
+            prompt,
+            seed,
+        } => run_bench_step(m, model_dir, canvas, layers, iters, prompt, seed),
         Command::Prefill => run_prefill(m),
         Command::Generate {
             prompt,
@@ -207,8 +223,30 @@ fn run_command(m: &model::Model, model_dir: &std::path::Path, command: Command) 
         ),
         Command::Tokenize(_) => ExitCode::FAILURE,
         Command::Gemm { .. } => ExitCode::FAILURE,
+        Command::ProbeDevice { .. } => ExitCode::FAILURE,
         Command::ConvertModel { .. } => ExitCode::FAILURE,
     }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn run_probe_device() -> ExitCode {
+    use metal::{print_probe_result, probe_device};
+    match probe_device() {
+        Ok(r) => {
+            print_probe_result(&r);
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn run_probe_device() -> ExitCode {
+    eprintln!("error: probe-device requires --features metal on macOS");
+    ExitCode::FAILURE
 }
 
 fn run_convert_model(source_dir: &std::path::Path, output_dir: &std::path::Path) -> ExitCode {
@@ -253,6 +291,7 @@ fn parse_cli() -> Cli {
     let mut bench_kv = 8usize;
     let mut bench_layers = 1usize;
     let mut bench_iters = 3usize;
+    let mut bench_canvas = 256usize;
     let mut parity_seq: Option<usize> = None;
     let mut parity_kv: Option<usize> = None;
     let mut parity_layers: Option<usize> = None;
@@ -369,6 +408,14 @@ fn parse_cli() -> Cli {
                     });
                 }
             }
+            "--canvas" => {
+                if let Some(v) = args.next() {
+                    bench_canvas = v.parse().unwrap_or_else(|_| {
+                        eprintln!("invalid --canvas");
+                        std::process::exit(2);
+                    });
+                }
+            }
             _ => positional.push(arg),
         }
     }
@@ -446,6 +493,14 @@ fn parse_cli() -> Cli {
             layers: bench_layers,
             iters: bench_iters,
         },
+        Some("bench-step") => Command::BenchStep {
+            canvas: bench_canvas,
+            layers: bench_layers.max(1),
+            iters: bench_iters,
+            prompt: prompt.clone(),
+            seed,
+        },
+        Some("probe-device") => Command::ProbeDevice,
         Some("convert-model") => {
             let out = output_dir.unwrap_or_else(|| {
                 eprintln!("usage: diffgemma-mps convert-model -o OUTPUT_DIR [-m SOURCE_MODEL]");
@@ -456,7 +511,7 @@ fn parse_cli() -> Cli {
         Some(cmd) => {
             eprintln!("unknown command: {cmd}");
             eprintln!(
-                "usage: diffgemma-mps [-p PROMPT] [summary|config|weights <name>|convert-model|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-parity|tokenize <text>|gemm|attention]"
+                "usage: diffgemma-mps [-p PROMPT] [summary|config|weights <name>|convert-model|bench-step|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-parity|tokenize <text>|gemm|attention]"
             );
             eprintln!("  default (no command): generate-gpu with --features metal");
             eprintln!("  generate-parity: GPU vs checked-in golden (use --compare-cpu for slow CPU path)");
@@ -952,6 +1007,211 @@ fn run_bench_decoder(
     }
 }
 
+fn run_bench_step(
+    m: &model::Model,
+    model_dir: &std::path::Path,
+    canvas: usize,
+    layers: usize,
+    iters: usize,
+    prompt_text: Option<String>,
+    seed: u64,
+) -> ExitCode {
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    {
+        use metal::{
+            decoder_forward, load_weight_cache, GpuDecoderEngine, GpuDecoderScratch,
+        };
+        use model::decoder::DecoderForwardInput;
+        use model::encoder::{prefill, EncoderPrefillInput, EncoderScratch};
+        use sample::{initialize_canvas, Rng};
+
+        let canvas = canvas.max(1);
+        let layers = layers.max(1).min(m.config.text_config.num_hidden_layers);
+        let iters = iters.max(1);
+        let vocab = m.config.text_config.vocab_size;
+
+        let prompt = match build_prompt_tokens(model_dir, prompt_text.as_deref(), 0, vocab) {
+            Ok(ids) => ids,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let kv_len = prompt.len();
+
+        let mut enc_scratch = EncoderScratch::new(kv_len.max(canvas), &m.config);
+        eprintln!(
+            "bench-step setup (canvas={canvas}, kv={kv_len}, layers={layers}, seed={seed})..."
+        );
+        let prefill_out = match prefill(
+            &m.weights,
+            &m.config,
+            &EncoderPrefillInput {
+                token_ids: &prompt,
+                position_offset: 0,
+            },
+            &mut enc_scratch,
+        ) {
+            Ok(out) => out,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let kv_cache = prefill_out.kv_cache;
+
+        let mut rng = Rng::new(seed);
+        let mut token_ids = initialize_canvas(canvas, vocab, &mut rng);
+        let mask = model::mask::DecoderAttnMask::all_valid(canvas, kv_cache.kv_len);
+        let mut logits = vec![0.0f32; canvas * vocab];
+
+        let mut scratch = GpuDecoderScratch::new(canvas, &m.config);
+        let mut gpu_weights = match load_weight_cache(
+            &m.weights,
+            &m.config.text_config,
+            canvas,
+            kv_len,
+        ) {
+            Ok(w) => w,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let mut engine = match GpuDecoderEngine::new() {
+            Ok(e) => e,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Err(err) = scratch.ensure_gpu_kv(
+            &engine.ctx.device,
+            &m.config.text_config,
+            kv_len,
+            canvas,
+        ) {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+        if let Err(err) = scratch.sync_gpu_kv_from_cpu(&kv_cache, canvas) {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+
+        eprintln!("bench-step warmup...");
+        {
+            let mut input = DecoderForwardInput {
+                token_ids: &token_ids,
+                kv_cache: &kv_cache,
+                self_conditioning_logits: None,
+                mask: Some(&mask),
+                logits_out: Some(&mut logits),
+                compute_logits: true,
+                return_hidden: false,
+            };
+            engine.reset_forward_telemetry();
+            if let Err(err) = decoder_forward(
+                &m.weights,
+                &m.config,
+                &mut input,
+                &mut scratch,
+                &mut gpu_weights,
+                &mut engine,
+                Some(layers),
+            ) {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+            let _ = engine.take_forward_telemetry();
+        }
+
+        eprintln!("bench-step running {iters} iterations...");
+        let mut telem_sum = metal::ForwardTelemetry::default();
+        let started = std::time::Instant::now();
+        for i in 0..iters {
+            token_ids = initialize_canvas(canvas, vocab, &mut Rng::new(seed + i as u64 + 1));
+            let mut input = DecoderForwardInput {
+                token_ids: &token_ids,
+                kv_cache: &kv_cache,
+                self_conditioning_logits: None,
+                mask: Some(&mask),
+                logits_out: Some(&mut logits),
+                compute_logits: true,
+                return_hidden: false,
+            };
+            engine.reset_forward_telemetry();
+            if let Err(err) = decoder_forward(
+                &m.weights,
+                &m.config,
+                &mut input,
+                &mut scratch,
+                &mut gpu_weights,
+                &mut engine,
+                Some(layers),
+            ) {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+            let t = engine.take_forward_telemetry();
+            telem_sum.gpu_syncs += t.gpu_syncs;
+            telem_sum.gpu_readback_bytes += t.gpu_readback_bytes;
+            telem_sum.expert_weight_bytes_touched += t.expert_weight_bytes_touched;
+            telem_sum.expert_hits += t.expert_hits;
+            telem_sum.expert_misses += t.expert_misses;
+            telem_sum.expert_upload_bytes += t.expert_upload_bytes;
+            telem_sum.dense_gpu_upload_bytes += t.dense_gpu_upload_bytes;
+            telem_sum.lm_head_logits_bytes += t.lm_head_logits_bytes;
+            let n = t.expert_unique_per_layer.len();
+            if telem_sum.expert_unique_per_layer.len() < n {
+                telem_sum
+                    .expert_unique_per_layer
+                    .resize(n, 0);
+            }
+            for (li, &u) in t.expert_unique_per_layer.iter().enumerate() {
+                telem_sum.expert_unique_per_layer[li] += u;
+            }
+        }
+        let elapsed = started.elapsed();
+        let per_step = elapsed / iters as u32;
+        let n = iters as f64;
+        for u in &mut telem_sum.expert_unique_per_layer {
+            *u = ((*u as f64) / n).round() as u32;
+        }
+        telem_sum.gpu_syncs /= iters as u64;
+        telem_sum.gpu_readback_bytes /= iters as u64;
+        telem_sum.expert_weight_bytes_touched /= iters as u64;
+        telem_sum.expert_hits /= iters as u64;
+        telem_sum.expert_misses /= iters as u64;
+        telem_sum.expert_upload_bytes /= iters as u64;
+        telem_sum.dense_gpu_upload_bytes /= iters as u64;
+        telem_sum.lm_head_logits_bytes /= iters as u64;
+
+        let expert_stats = gpu_weights.expert_cache_stats();
+        println!("bench-step ok");
+        println!("  canvas:   {canvas}");
+        println!("  kv_len:   {kv_len}");
+        println!("  layers:   {layers}");
+        println!("  iters:    {iters}");
+        println!("  per_step: {per_step:.2?}");
+        telem_sum.print_summary("  telemetry (per step, mean):");
+        println!(
+            "  expert LRU end: {:.1}/{:.1} MiB, {} entries, {} evictions",
+            expert_stats.used_bytes as f64 / (1024.0 * 1024.0),
+            expert_stats.budget_bytes as f64 / (1024.0 * 1024.0),
+            expert_stats.entries,
+            expert_stats.evictions,
+        );
+        ExitCode::SUCCESS
+    }
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    {
+        let _ = (m, model_dir, canvas, layers, iters, prompt_text, seed);
+        eprintln!("error: bench-step requires --features metal on macOS");
+        ExitCode::FAILURE
+    }
+}
+
 fn run_decoder_forward(m: &model::Model) -> ExitCode {
     const CANVAS_LEN: usize = 256;
     const KV_LEN: usize = 128;
@@ -1160,6 +1420,22 @@ fn print_generate_output(
     if out.denoise_elapsed.as_secs_f64() > 0.0 && new_tokens > 0 {
         let tok_s = new_tokens as f64 / out.denoise_elapsed.as_secs_f64();
         println!("  throughput: {tok_s:.2} tok/s (denoise only, excludes prefill/extend)");
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    if !out.session_telemetry.steps.is_empty() {
+        out.session_telemetry.print_summary("  session telemetry:");
+        if out.denoise_steps_run > 0 {
+            let agg = out.session_telemetry.aggregate_forward();
+            let step_ms = out.denoise_elapsed.as_secs_f64() * 1000.0
+                / out.denoise_steps_run as f64;
+            println!("  mean step wall:       {step_ms:.1} ms");
+            println!(
+                "  weight bytes/step:    {:.2} GiB expert + {:.2} MiB logits",
+                agg.expert_weight_bytes_touched as f64 / (1024.0_f64.powi(3)),
+                agg.lm_head_logits_bytes as f64 / (1024.0 * 1024.0)
+            );
+        }
     }
 
     if let Ok(tokenizer) = tokenizer::Tokenizer::load(model_dir.join("tokenizer.json")) {

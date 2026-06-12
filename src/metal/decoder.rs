@@ -233,6 +233,11 @@ fn forward_inner(
     let mut out_buf = &mut scratch.cpu.hidden_b;
 
     let n_layers = max_layers.min(text.num_hidden_layers);
+    let expert_before = if engine.telemetry_enabled() {
+        Some(weights.expert_cache_stats())
+    } else {
+        None
+    };
     let gpu_kv_ref = scratch.gpu_kv.as_ref();
     for layer in 0..n_layers {
         let layer_scratch = scratch.layer.ensure(cfg, seq_len, input.kv_cache.kv_len, layer)?;
@@ -268,8 +273,14 @@ fn forward_inner(
 
     {
         use crate::metal::batched_kernels as bk;
-        use crate::metal::batch::GpuBatch;
-        let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
+        use crate::metal::batch::begin_engine_batch;
+        let telemetry = engine.batch_telemetry();
+        let mut batch = begin_engine_batch(
+            &engine.ctx.queue,
+            &mut engine.pool,
+            &engine.ctx.device,
+            telemetry,
+        )?;
         bk::rms_norm_rows(
             &mut batch,
             &engine.kernels,
@@ -283,6 +294,21 @@ fn forward_inner(
         batch.end()?;
     }
     engine.pool.trim(4);
+
+    if let Some(before) = expert_before {
+        let after = weights.expert_cache_stats();
+        let handle = engine.telemetry_handle();
+        let mut tel = handle.borrow_mut();
+        tel.expert_hits += after.hits.saturating_sub(before.hits);
+        tel.expert_misses += after.misses.saturating_sub(before.misses);
+        tel.expert_upload_bytes += after.upload_bytes.saturating_sub(before.upload_bytes);
+    }
+    if engine.telemetry_enabled() && input.compute_logits {
+        engine
+            .telemetry_handle()
+            .borrow_mut()
+            .lm_head_logits_bytes = (seq_len * vocab * 4) as u64;
+    }
 
     if input.compute_logits {
         if let Some(out) = input.logits_out.as_mut() {

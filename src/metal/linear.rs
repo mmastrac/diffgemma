@@ -43,6 +43,15 @@ impl CachedLinear {
         device: &ProtocolObject<dyn MTLDevice>,
         pool: &mut BufferPool,
     ) -> Retained<ProtocolObject<dyn MTLBuffer>> {
+        self.gpu_weight_tracked(device, pool, None)
+    }
+
+    pub fn gpu_weight_tracked(
+        &self,
+        device: &ProtocolObject<dyn MTLDevice>,
+        pool: &mut BufferPool,
+        upload_bytes: Option<&mut u64>,
+    ) -> Retained<ProtocolObject<dyn MTLBuffer>> {
         let mut slot = self.gpu_w.borrow_mut();
         if let Some(buf) = slot.as_ref() {
             return buf.clone();
@@ -53,6 +62,9 @@ impl CachedLinear {
             .expect("Metal weight buffer alloc failed");
         BufferPool::write_bf16_ptr(&buf, self.w.as_slice().as_ptr(), self.w.len());
         *slot = Some(buf.clone());
+        if let Some(acc) = upload_bytes {
+            *acc += bytes as u64;
+        }
         buf
     }
 
@@ -74,7 +86,9 @@ pub fn linear_cached_batched(
         return Err(Error::Format("linear_cached_batched shape mismatch"));
     }
     let buf_a = batch.alloc_f32(x)?;
-    let buf_w = w.gpu_weight(batch.device, batch.pool);
+    let mut upload = 0u64;
+    let buf_w = w.gpu_weight_tracked(batch.device, batch.pool, Some(&mut upload));
+    batch.record_dense_upload(upload);
     let buf_c = batch.alloc_f32_out(y.len())?;
     batch.dispatch_linear(
         &pipeline.pipeline,
@@ -98,7 +112,9 @@ pub fn linear_cached_batched_in_buf(
     seq_len: usize,
 ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
     let out_len = seq_len * w.out_dim;
-    let buf_w = w.gpu_weight(batch.device, batch.pool);
+    let mut upload = 0u64;
+    let buf_w = w.gpu_weight_tracked(batch.device, batch.pool, Some(&mut upload));
+    batch.record_dense_upload(upload);
     let buf_c = batch.alloc_f32_out(out_len)?;
     batch.dispatch_linear(
         &pipeline.pipeline,
