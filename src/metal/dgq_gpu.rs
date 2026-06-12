@@ -1,6 +1,6 @@
 //! Zero-copy `.dgq` blob → `MTLBuffer` and per-tensor GPU views.
 
-use crate::dgq::layout::{q4_matrix_bytes, QuantKind, DGQ_VERSION, MANIFEST_FILE};
+use crate::dgq::layout::{q4_matrix_bytes, q8_row_bytes, QuantKind, DGQ_VERSION, MANIFEST_FILE};
 use crate::dgq::DgqStore;
 use crate::safetensors::Error;
 use memmap2::Mmap;
@@ -125,6 +125,48 @@ impl Q4ExpertStackGpu {
     }
 }
 
+/// Q8 row-major matrix view into the shared blob (embed / lm_head).
+#[derive(Clone)]
+pub struct Q8LinearGpu {
+    pub blob: Arc<DgqGpuBlob>,
+    pub byte_offset: u64,
+    pub row_offset: usize,
+    pub out_dim: usize,
+    pub in_dim: usize,
+}
+
+impl Q8LinearGpu {
+    pub fn from_entry(blob: Arc<DgqGpuBlob>, offset: u64, out_dim: usize, in_dim: usize) -> Self {
+        Self {
+            blob,
+            byte_offset: offset,
+            row_offset: 0,
+            out_dim,
+            in_dim,
+        }
+    }
+
+    pub fn row_slice(&self, row_offset: usize, out_dim: usize) -> Self {
+        assert!(row_offset + out_dim <= self.out_dim);
+        Self {
+            blob: Arc::clone(&self.blob),
+            byte_offset: self.byte_offset,
+            row_offset: self.row_offset + row_offset,
+            out_dim,
+            in_dim: self.in_dim,
+        }
+    }
+
+    pub fn row_stride(&self) -> usize {
+        q8_row_bytes(self.in_dim)
+    }
+
+    pub fn weight_buffer(&self) -> (&ProtocolObject<dyn MTLBuffer>, u64) {
+        let off = self.byte_offset + self.row_offset as u64 * self.row_stride() as u64;
+        (&self.blob.buffer, off)
+    }
+}
+
 pub fn parse_kind(s: &str) -> Result<QuantKind, Error> {
     match s {
         "q4_block" => Ok(QuantKind::Q4Block),
@@ -132,6 +174,21 @@ pub fn parse_kind(s: &str) -> Result<QuantKind, Error> {
         "raw" => Ok(QuantKind::Raw),
         _ => Err(Error::Format("unknown dgq tensor kind")),
     }
+}
+
+pub fn load_q8_linear(store: &DgqStore, blob: Arc<DgqGpuBlob>, name: &str) -> Result<Q8LinearGpu, Error> {
+    let entry = store
+        .get_entry(name)
+        .ok_or_else(|| Error::NotFound(name.to_string()))?;
+    if parse_kind(&entry.meta.kind)? != QuantKind::Q8Row {
+        return Err(Error::Format("expected q8_row linear"));
+    }
+    if entry.meta.shape.len() != 2 {
+        return Err(Error::Format("q8 linear expects rank 2"));
+    }
+    let out = entry.meta.shape[0] as usize;
+    let inp = entry.meta.shape[1] as usize;
+    Ok(Q8LinearGpu::from_entry(blob, entry.meta.offset, out, inp))
 }
 
 pub fn load_q4_linear(store: &DgqStore, blob: Arc<DgqGpuBlob>, name: &str) -> Result<Q4LinearGpu, Error> {
@@ -248,6 +305,65 @@ mod q4_gpu_tests {
             max_err = max_err.max((a - b).abs());
         }
         eprintln!("q4 gpu vs cpu dequant max_err={max_err:.6}");
+        assert!(max_err < 0.05, "max_err={max_err}");
+    }
+
+    #[test]
+    fn q8_gpu_linear_matches_cpu_dequant() {
+        let dgq_dir = std::path::Path::new("/tmp/quantized-weights");
+        if !dgq_dir.join("model.dgq.json").exists() {
+            eprintln!("skip: /tmp/quantized-weights missing");
+            return;
+        }
+        let store = DgqStore::open(dgq_dir).expect("open dgq");
+        let ctx = MetalContext::new().expect("metal");
+        let blob = DgqGpuBlob::from_store(&store, &ctx.device).expect("blob");
+        let q8 = load_q8_linear(
+            &store,
+            Arc::clone(&blob),
+            "model.decoder.embed_tokens.weight",
+        )
+        .expect("q8 embed");
+        let q8 = q8.row_slice(100, 8);
+
+        let m = 4usize;
+        let k = q8.in_dim;
+        let n = q8.out_dim;
+        let a: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.001 - 0.5).sin() * 0.01).collect();
+
+        let f32_w = store
+            .tensor_f32("model.decoder.embed_tokens.weight")
+            .expect("dequant");
+        let row_off = 100usize;
+        let mut cpu_out = vec![0.0f32; m * n];
+        for row in 0..m {
+            for col in 0..n {
+                let mut sum = 0.0f32;
+                for p in 0..k {
+                    sum += a[row * k + p] * f32_w[(row_off + col) * k + p];
+                }
+                cpu_out[row * n + col] = sum;
+            }
+        }
+
+        let mut pool = BufferPool::new();
+        let pipeline = ctx
+            .compile_kernel(include_str!("../../shaders/qgemm.metal"), "f32_q8_linear")
+            .expect("pipeline");
+        let mut batch = GpuBatch::begin(&ctx.queue, &mut pool, &ctx.device).expect("batch");
+        let buf_a = batch.alloc_f32(&a).expect("a");
+        let buf_c =
+            crate::metal::linear::f32_q8_linear_gpu_bufs(&mut batch, &pipeline, &buf_a, &q8, m, k, n)
+                .expect("gemm");
+        let mut gpu_out = vec![0.0f32; m * n];
+        batch.register_read(buf_c, &mut gpu_out);
+        batch.end().expect("end");
+
+        let mut max_err = 0.0f32;
+        for (a, b) in cpu_out.iter().zip(gpu_out.iter()) {
+            max_err = max_err.max((a - b).abs());
+        }
+        eprintln!("q8 gpu vs cpu dequant max_err={max_err:.6}");
         assert!(max_err < 0.05, "max_err={max_err}");
     }
 }

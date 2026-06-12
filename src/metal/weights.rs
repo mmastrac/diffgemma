@@ -5,7 +5,8 @@ use crate::config::TextConfig;
 use crate::dgq::DgqStore;
 use crate::fast_slice::{bf16_to_f32_into, FastBf16Slice};
 use crate::metal::dgq_gpu::{
-    load_q4_expert_stack, load_q4_linear, load_raw_view, DgqGpuBlob, Q4ExpertStackGpu,
+    load_q4_expert_stack, load_q4_linear, load_q8_linear, load_raw_view, DgqGpuBlob,
+    Q4ExpertStackGpu, Q8LinearGpu,
 };
 use crate::metal::expert_cache::{ExpertCacheStats, ExpertWeightCache};
 use crate::metal::linear::GpuLinearWeight;
@@ -308,6 +309,7 @@ struct Bf16Paged {
 struct DgqResident {
     blob: Arc<DgqGpuBlob>,
     final_norm: Buffer<f32>,
+    embed_q8: Option<Q8LinearGpu>,
     layers: Vec<GpuLayerWeightCache>,
 }
 
@@ -342,9 +344,16 @@ impl GpuDecoderWeightCache {
                         text,
                     )?);
                 }
+                let embed_q8 = load_q8_linear(
+                    dgq,
+                    Arc::clone(&blob),
+                    "model.decoder.embed_tokens.weight",
+                )
+                .ok();
                 Ok(Self::Dgq(DgqResident {
                     blob,
                     final_norm,
+                    embed_q8,
                     layers,
                 }))
             }
@@ -365,6 +374,13 @@ impl GpuDecoderWeightCache {
 
     pub fn is_dgq(&self) -> bool {
         matches!(self, Self::Dgq(_))
+    }
+
+    pub fn embed_q8(&self) -> Option<&Q8LinearGpu> {
+        match self {
+            Self::Dgq(d) => d.embed_q8.as_ref(),
+            Self::Bf16(_) => None,
+        }
     }
 
     pub fn expert_cache_stats(&self) -> ExpertCacheStats {

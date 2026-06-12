@@ -51,3 +51,44 @@ kernel void f32_q4_linear(
     }
     c[row * n + col] = sum;
 }
+
+/// Q8 row layout per output row: fp16 scale + int8 weights along K.
+inline float q8_weight_at(
+    device const uchar *base,
+    uint row,
+    uint col,
+    uint in_dim,
+    uint row_stride
+) {
+    device const uchar *r = base + row * row_stride;
+    float scale = bf16_bits_to_f32(uint(r[0]) | (uint(r[1]) << 8));
+    int q = int(*((device const char *)(r + 2 + col)));
+    return float(q) * scale;
+}
+
+/// C[M,N] = A[M,K] @ W[N,K]^T with Q8 row-major W as in `.dgq`.
+kernel void f32_q8_linear(
+    device const float *a [[buffer(0)]],
+    device const uchar *w [[buffer(1)]],
+    device float *c [[buffer(2)]],
+    constant uint3 &dims [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint m = dims.x;
+    uint n = dims.y;
+    uint k_dim = dims.z;
+    uint row_stride = 2u + k_dim;
+    uint row = gid.y;
+    uint col = gid.x;
+    if (row >= m || col >= n) {
+        return;
+    }
+
+    float sum = 0.0f;
+    for (uint p = 0; p < k_dim; p++) {
+        float av = a[row * k_dim + p];
+        float wv = q8_weight_at(w, col, p, k_dim, row_stride);
+        sum += av * wv;
+    }
+    c[row * n + col] = sum;
+}

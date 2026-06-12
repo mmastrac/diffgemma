@@ -347,27 +347,73 @@ fn forward_inner(
             if out.len() != need {
                 return Err(Error::Format("logits_out length mismatch"));
             }
-            lm_head_tied_from_store(
-                store,
-                out,
-                out_buf,
-                seq_len,
-                hidden,
-                vocab,
-                &mut scratch.cpu.lm_head_chunk,
-            )?;
+            if let Some(embed_q8) = weights.embed_q8() {
+                use crate::metal::batch::begin_engine_batch;
+                use crate::metal::lm_head::lm_head_tied_q8_gpu;
+                let telemetry = engine.batch_telemetry();
+                let mut batch = begin_engine_batch(
+                    &engine.ctx.queue,
+                    &mut engine.pool,
+                    &engine.ctx.device,
+                    telemetry,
+                )?;
+                lm_head_tied_q8_gpu(
+                    &mut batch,
+                    &engine.f32_q8_linear_pipeline,
+                    out_buf,
+                    embed_q8,
+                    seq_len,
+                    hidden,
+                    vocab,
+                    out,
+                )?;
+                batch.end()?;
+            } else {
+                lm_head_tied_from_store(
+                    store,
+                    out,
+                    out_buf,
+                    seq_len,
+                    hidden,
+                    vocab,
+                    &mut scratch.cpu.lm_head_chunk,
+                )?;
+            }
             logit_softcapping(out, text.final_logit_softcapping as f32);
         } else {
             scratch.cpu.logits_buf.ensure_len(seq_len * vocab);
-            lm_head_tied_from_store(
-                store,
-                scratch.cpu.logits_buf.as_slice_mut(),
-                out_buf,
-                seq_len,
-                hidden,
-                vocab,
-                &mut scratch.cpu.lm_head_chunk,
-            )?;
+            if let Some(embed_q8) = weights.embed_q8() {
+                use crate::metal::batch::begin_engine_batch;
+                use crate::metal::lm_head::lm_head_tied_q8_gpu;
+                let telemetry = engine.batch_telemetry();
+                let mut batch = begin_engine_batch(
+                    &engine.ctx.queue,
+                    &mut engine.pool,
+                    &engine.ctx.device,
+                    telemetry,
+                )?;
+                lm_head_tied_q8_gpu(
+                    &mut batch,
+                    &engine.f32_q8_linear_pipeline,
+                    out_buf,
+                    embed_q8,
+                    seq_len,
+                    hidden,
+                    vocab,
+                    scratch.cpu.logits_buf.as_slice_mut(),
+                )?;
+                batch.end()?;
+            } else {
+                lm_head_tied_from_store(
+                    store,
+                    scratch.cpu.logits_buf.as_slice_mut(),
+                    out_buf,
+                    seq_len,
+                    hidden,
+                    vocab,
+                    &mut scratch.cpu.lm_head_chunk,
+                )?;
+            }
             logit_softcapping(
                 scratch.cpu.logits_buf.as_slice_mut(),
                 text.final_logit_softcapping as f32,

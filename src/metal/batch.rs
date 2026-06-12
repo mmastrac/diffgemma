@@ -17,6 +17,7 @@ struct PendingRead {
     buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     dst: *mut f32,
     len: usize,
+    src_byte_offset: usize,
 }
 
 pub struct GpuBatch<'a> {
@@ -80,6 +81,21 @@ impl<'a> GpuBatch<'a> {
             buf,
             dst: out.as_mut_ptr(),
             len: out.len(),
+            src_byte_offset: 0,
+        });
+    }
+
+    pub fn register_read_offset(
+        &mut self,
+        buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+        src_offset_elems: usize,
+        out: &mut [f32],
+    ) {
+        self.reads.push(PendingRead {
+            buf,
+            dst: out.as_mut_ptr(),
+            len: out.len(),
+            src_byte_offset: src_offset_elems * 4,
         });
     }
 
@@ -244,6 +260,41 @@ impl<'a> GpuBatch<'a> {
         encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
     }
 
+    /// `C[M,N] = A[M,K] @ W[N,K]^T` with Q8 row weights at `buf_w` + byte offset.
+    pub fn dispatch_q8_linear(
+        &self,
+        pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+        buf_a: &ProtocolObject<dyn MTLBuffer>,
+        buf_w: &ProtocolObject<dyn MTLBuffer>,
+        w_byte_offset: u64,
+        buf_c: &ProtocolObject<dyn MTLBuffer>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        const THREADGROUP: usize = 16;
+        let encoder = self.encoder();
+        encoder.setComputePipelineState(pipeline);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(buf_a), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(buf_w), w_byte_offset as usize, 1);
+            encoder.setBuffer_offset_atIndex(Some(buf_c), 0, 2);
+        }
+        let dims = [m as u32, n as u32, k as u32];
+        crate::metal::batch::set_bytes(encoder, &dims, 3);
+        let tg = MTLSize {
+            width: THREADGROUP,
+            height: THREADGROUP,
+            depth: 1,
+        };
+        let grid = MTLSize {
+            width: div_up(n, THREADGROUP),
+            height: div_up(m, THREADGROUP),
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    }
+
     fn dispatch_matmul(
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
@@ -312,7 +363,11 @@ impl<'a> GpuBatch<'a> {
 
         for read in self.reads {
             let slice = unsafe { std::slice::from_raw_parts_mut(read.dst, read.len) };
-            BufferPool::read_f32(&read.buf, slice);
+            if read.src_byte_offset == 0 {
+                BufferPool::read_f32(&read.buf, slice);
+            } else {
+                BufferPool::read_f32_at_offset(&read.buf, read.src_byte_offset, slice);
+            }
         }
         for (bytes, buf) in self.releases {
             self.pool.release(bytes, buf);

@@ -2,7 +2,7 @@ use crate::buffer::Buffer;
 use crate::metal::batch::GpuBatch;
 use crate::metal::buffer::BufferPool;
 use crate::metal::device::ComputePipeline;
-use crate::metal::dgq_gpu::Q4LinearGpu;
+use crate::metal::dgq_gpu::{Q4LinearGpu, Q8LinearGpu};
 use crate::safetensors::Error;
 use crate::tensor::Bf16Slice;
 use objc2::rc::Retained;
@@ -239,6 +239,30 @@ pub fn f32_q4_linear_gpu_bufs(
         n,
         k,
         w.groups_per_row(),
+    );
+    Ok(buf_c)
+}
+
+pub fn f32_q8_linear_gpu_bufs(
+    batch: &mut GpuBatch<'_>,
+    q8_pipeline: &ComputePipeline,
+    x_buf: &ProtocolObject<dyn MTLBuffer>,
+    w: &Q8LinearGpu,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
+    let buf_c = batch.alloc_f32_out(m * n)?;
+    let (buf_w, off) = w.weight_buffer();
+    batch.dispatch_q8_linear(
+        &q8_pipeline.pipeline,
+        x_buf,
+        buf_w,
+        off,
+        &buf_c,
+        m,
+        n,
+        k,
     );
     Ok(buf_c)
 }

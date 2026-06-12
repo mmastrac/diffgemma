@@ -81,17 +81,16 @@ Keep: golden-parity discipline, `bench-decoder` regression tables, CPU/BLAS orac
 
 ---
 
-## Phase Q1 — Offline quantizer + `.dgq` format (the long pole)
+## Phase Q1 — Offline quantizer + `.dgq` format ✅
 
-**Status: ~done (2026-06).** Measured: 15.35 GiB blob, 1047 tensors (454 q4 = decoder matrices ✓, 4 q8 = SC only, 589 raw), 214.5 s streaming convert, mmap load OK.
+**Status: done (2026-06).** Measured: 15.35 GiB blob, 1047 tensors (454 q4 = decoder matrices ✓, embed q8 ✓, 4 q8 = SC, 589 raw), 214.5 s streaming convert, mmap load OK (~40 ms GPU cache init).
 
-**Two residency follow-ups before closing:**
+**Remaining follow-up (optional, not blocking Q2):**
 | Fix | Why | Saves |
 |---|---|---|
-| embed_tokens → q8 (missed profile; only 4 q8 = SC) | tied lm_head — GEMM-read every step, not just CPU gather; q8 kernel exists for SC anyway | 0.74 GiB |
 | `--skip-vision` flag (355 raw tensors ≈ 1.1 GiB) | text-first; avoids wiring vision pages via the blob's MTLBuffer | 1.1 GiB |
 
-→ ~13.5 GiB, back on budget. Matters at the 24 GiB floor: 15.35 + scratch + KV ≈ 17.5 vs ~18 GiB working-set cap = razor thin; 13.5 is comfortable. (The 1.3 GiB overage was vision + raw embed — router/norms/scales total only ~30–50 MB.)
+→ ~13.5 GiB with skip-vision, back on budget for 24 GiB floor.
 
 **Checkpoint shape note:** expert `gate_up` trailing dim **1408 = fused gate‖up (704 each)**; true inter = 704. Reconciles 11.3 MiB/expert LRU log (2816×1408 + 704×2816 = 5.95M params ✓) and total param count (3840 × 5.95M ≈ 22.8B experts ✓; inter=1408-per-branch would imply 45.7B — impossible). Kernels must split 1408 → 704‖704 for swiglu; FLOPs model uses 5.95M/expert.
 
@@ -116,21 +115,26 @@ Keep: golden-parity discipline, `bench-decoder` regression tables, CPU/BLAS orac
 
 ## Phase Q2 — Dequant-in-kernel GEMMs (residency goes live)
 
+**Status: in progress (2026-06).** `.dgq` path is resident on GPU; bf16 LRU/paging bypassed when quantized.
+
 **Deliverable:** all weight-consuming GPU paths read quantized blocks directly; **never** materialize bf16/f32 weight buffers (that recreates the bandwidth problem).
 
-| Task | Notes |
-|---|---|
-| Quantized matvec/GEMM kernels | consume `[out, in]` row-major quantized blocks **as stored** (no runtime relayout); load nibbles + scales, dequant in registers/threadgroup; fp16 math, f32 accumulate. Prior art: llama.cpp / MLX Metal kernels (reference, not deps) |
-| MoE grouped GEMM | sort/bucket tokens by expert (GPU, Q3 finishes this; CPU-sorted interim ok), one batched dispatch over present experts; reuse existing arena 2-sync structure |
-| Dense layers + lm_head on quantized weights | embed gather stays CPU (tiny); lm_head must be GPU (q8 GEMM, 378 GFLOP/step) |
-| **Delete** | expert LRU, transpose cache, `GpuLayerWeightCache` paging, resident-cap/eviction logic, bf16 GPU weight upload path |
-| Regenerate goldens | quantized goldens (CPU-dequant oracle on same `.dgq`); keep bf16 CPU fixtures separately for quality eval |
+| Task | Notes | Status |
+|---|---|---|
+| Q4 matvec/GEMM kernels | `f32_q4_linear` — attn/MLP/MoE per-expert from blob | ✅ |
+| Zero-copy blob + resident layer cache | `DgqGpuBlob`, all 30 layers loaded, 0 expert LRU on `.dgq` | ✅ |
+| q8 embed gather (CPU) | `embed_tokens_from_store` for prefill/decoder embed | ✅ |
+| GPU lm_head (q8) | `f32_q8_linear` + chunked tied head from blob; replaces CPU row dequant | ✅ |
+| MoE grouped GEMM | sort/bucket tokens by expert, one batched dispatch; still per-expert today | ⏳ |
+| **Delete** bf16 paths on `.dgq` | expert LRU, transpose cache, layer paging, bf16 upload — inactive on `.dgq`; code retained for safetensors | ✅ (dgq) / ⏳ (delete dead code) |
+| Regenerate goldens | quantized goldens (CPU-dequant oracle on same `.dgq`); bf16 fixtures separate | ⏳ |
+| `bench-step` on `.dgq` | M3 Pro, canvas=256, kv=64, 30L | **18.8 s** (was 107 s bf16, 24.6 s pre-lm_head-gpu) |
 
 **Exit / gates (M3 Pro):**
-- `bench-step` ≤ **12 s** (compute-bound at current kernel rate; the sub-second-class gate moves to Q2.5).
-- Zero evictions, zero transposes (counters must read 0); LRU/paging code deleted.
-- Prefill (1 tok) ≤ 0.5 s (vs 18.7 s).
-- `generate-parity` passes on quantized goldens; bf16-vs-q4 divergence documented on fixtures.
+- `bench-step` ≤ **12 s** — **not met** (18.8 s; MoE per-expert kernel MFU is wall #2).
+- Zero evictions, zero transposes — **met** (0 LRU hits/misses/evictions on `.dgq`).
+- Prefill (1 tok) ≤ 0.5 s — **not measured** (GPU `prefill_gpu` wired for bench-step).
+- `generate-parity` on quantized goldens — **not done**.
 
 ---
 
@@ -238,8 +242,8 @@ Profile-driven leftovers after Q2.5 gates are met.
 | # | Milestone | Gate (M3 Pro, 36 GiB) |
 |---|---|---|
 | Q0 | Instrumentation + device probes | ✅ measured: 112 GiB/s, 184 GFLOP/s, 62 experts/layer, 151 syncs |
-| Q1 | `.dgq` quantizer + zero-copy load | ≤2 s load, ≤ budget resident, CPU dequant parity |
-| Q2 | Quantized kernels, residency, deletions | step ≤ 12 s; 0 evictions; prefill ≤ 0.5 s |
+| Q1 | `.dgq` quantizer + zero-copy load | ✅ ≤2 s load, mmap OK, embed q8 + q4 dense |
+| Q2 | Quantized kernels, residency, deletions | ⏳ step 18.8 s (target ≤12 s); 0 evictions ✅; parity ⏳ |
 | Q2.5 | GEMM MFU (dense→MPS, grouped MoE kernel) | grouped MoE ≥ 0.8 TF/s; step ≤ 1.6 s; ≥ 7 tok/s |
 | Q3 | GPU router/sampler/early-stop | ≤3 syncs, ≤1 MB readback/step; ≥ 7 tok/s |
 | Q4 | Uncommitted-only lm_head, step telemetry | +15% tok/s → **8–12 tok/s target zone** |
@@ -250,9 +254,11 @@ Profile-driven leftovers after Q2.5 gates are met.
 
 ## Immediate next step
 
-**Q1** (quantizer, long pole) in parallel with the **Q2.5 MPS oracle bench** — the oracle takes an afternoon and determines whether dense paths use MPS or custom tiles, which shapes the Q2 kernel work before it's written.
+**Q2.5** — grouped MoE kernel + dense→MPS (oracle already measured: MPS 3.35 / 0.52 TFLOP/s vs custom 0.19 / 0.14). This is the path from 18.8 s/step → ≤12 s (Q2 gate) → ≤1.6 s (Q2.5 gate).
+
+Remaining **Q2** before closing the phase: MoE grouped dispatch, quantized golden regen + `generate-parity`, prefill gate measurement.
 
 ```bash
+cargo run --release --features metal -- -m /tmp/quantized-weights bench-step --canvas 256 --layers 30 --iters 1
 cargo run --release --features metal -- bench-gemm --oracle mps --shapes 256x2816x2816,33x2816x1408
-cargo run --release -- quantize model/transformer -o model.dgq --profile q4   # Q1
 ```
