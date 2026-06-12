@@ -23,7 +23,9 @@ impl Model {
     pub fn open(model_dir: impl AsRef<Path>) -> Result<Self, Error> {
         let model_dir = model_dir.as_ref();
         let weights = WeightStore::open(model_dir)?;
-        if weights.is_packed() {
+        if weights.is_quantized() {
+            eprintln!("loaded .dgq quantized weights from {}", model_dir.display());
+        } else if weights.is_packed() {
             eprintln!("loaded iris.pack weights from {}", model_dir.display());
         }
         Ok(Self {

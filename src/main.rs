@@ -9,6 +9,7 @@ mod kernels;
 mod metal;
 mod model;
 mod pack;
+mod dgq;
 mod sample;
 mod safetensors;
 mod tensor;
@@ -86,6 +87,10 @@ enum Command {
         seed: u64,
     },
     ProbeDevice,
+    Quantize {
+        output: PathBuf,
+        profile: String,
+    },
     ConvertModel {
         output_dir: PathBuf,
     },
@@ -95,6 +100,7 @@ fn main() -> ExitCode {
     let cli = parse_cli();
     match cli.command {
         Command::ConvertModel { output_dir } => run_convert_model(&cli.model_dir, &output_dir),
+        Command::Quantize { output, profile } => run_quantize(&cli.model_dir, &output, &profile),
         Command::Tokenize(text) => run_tokenize(&cli.model_dir, &text),
         Command::Gemm { size } => run_gemm(size),
         Command::ProbeDevice => run_probe_device(),
@@ -225,6 +231,58 @@ fn run_command(m: &model::Model, model_dir: &std::path::Path, command: Command) 
         Command::Gemm { .. } => ExitCode::FAILURE,
         Command::ProbeDevice { .. } => ExitCode::FAILURE,
         Command::ConvertModel { .. } => ExitCode::FAILURE,
+        Command::Quantize { .. } => ExitCode::FAILURE,
+    }
+}
+
+fn run_quantize(source_dir: &std::path::Path, output: &std::path::Path, profile: &str) -> ExitCode {
+    use dgq::{quantize_model, QuantizeOptions};
+    use dgq::layout::QuantProfile;
+
+    let profile_name = profile;
+    let profile = match profile {
+        "q4" => QuantProfile::Q4,
+        "q5" => QuantProfile::Q5,
+        other => {
+            eprintln!("error: unknown profile {other} (use q4 or q5)");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let out_dir = if output.extension().is_some_and(|e| e == "dgq") {
+        output.with_extension("")
+    } else {
+        output.to_path_buf()
+    };
+
+    eprintln!(
+        "quantize: {} -> {} (profile={profile_name})",
+        source_dir.display(),
+        out_dir.display(),
+    );
+    let started = std::time::Instant::now();
+    match quantize_model(QuantizeOptions {
+        source_dir: source_dir.to_path_buf(),
+        output_prefix: out_dir.clone(),
+        profile,
+    }) {
+        Ok(summary) => {
+            let gib = summary.blob_bytes as f64 / (1024.0_f64.powi(3));
+            println!("quantize ok");
+            println!("  output dir:    {}", out_dir.display());
+            println!("  tensors:       {}", summary.tensor_count);
+            println!("  blob size:     {gib:.2} GiB");
+            println!("  q4 tensors:    {}", summary.q4_tensors);
+            println!("  q8 tensors:    {}", summary.q8_tensors);
+            println!("  raw tensors:   {}", summary.raw_tensors);
+            println!("  elapsed:       {:.2?}", started.elapsed());
+            println!("  manifest:      {}/{}", out_dir.display(), dgq::layout::MANIFEST_FILE);
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -300,6 +358,7 @@ fn parse_cli() -> Cli {
     let mut write_golden: Option<String> = None;
     let mut no_early_stop = false;
     let mut output_dir: Option<PathBuf> = None;
+    let mut quant_profile = String::from("q4");
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -416,6 +475,11 @@ fn parse_cli() -> Cli {
                     });
                 }
             }
+            "--profile" => {
+                if let Some(v) = args.next() {
+                    quant_profile = v;
+                }
+            }
             _ => positional.push(arg),
         }
     }
@@ -501,6 +565,16 @@ fn parse_cli() -> Cli {
             seed,
         },
         Some("probe-device") => Command::ProbeDevice,
+        Some("quantize") => {
+            let out = output_dir.unwrap_or_else(|| {
+                eprintln!("usage: diffgemma-mps quantize -o OUTPUT_DIR [-m SOURCE] [--profile q4|q5]");
+                std::process::exit(2);
+            });
+            Command::Quantize {
+                output: out,
+                profile: quant_profile,
+            }
+        }
         Some("convert-model") => {
             let out = output_dir.unwrap_or_else(|| {
                 eprintln!("usage: diffgemma-mps convert-model -o OUTPUT_DIR [-m SOURCE_MODEL]");
@@ -511,7 +585,7 @@ fn parse_cli() -> Cli {
         Some(cmd) => {
             eprintln!("unknown command: {cmd}");
             eprintln!(
-                "usage: diffgemma-mps [-p PROMPT] [summary|config|weights <name>|convert-model|bench-step|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-parity|tokenize <text>|gemm|attention]"
+                "usage: diffgemma-mps [-p PROMPT] [summary|config|weights <name>|quantize|convert-model|bench-step|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-parity|tokenize <text>|gemm|attention]"
             );
             eprintln!("  default (no command): generate-gpu with --features metal");
             eprintln!("  generate-parity: GPU vs checked-in golden (use --compare-cpu for slow CPU path)");
@@ -574,7 +648,9 @@ fn print_summary(store: &weights::WeightStore) {
 
     println!("DiffusionGemma weight summary");
     println!("  model dir:          {}", store.model_dir().display());
-    if store.is_packed() {
+    if store.is_quantized() {
+        println!("  format:             .dgq (quantized, mmap)");
+    } else if store.is_packed() {
         println!("  format:             iris.pack (pre-transposed)");
     }
     println!("  shards:             {}", s.shard_count);
@@ -619,6 +695,9 @@ fn print_summary(store: &weights::WeightStore) {
         }
         weights::WeightStore::Packed(_) => {
             println!("    iris.pack.bin  (single mmap blob)");
+        }
+        weights::WeightStore::Dgq(_) => {
+            println!("    model.dgq.bin  (quantized mmap blob)");
         }
     }
 
