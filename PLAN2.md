@@ -125,14 +125,14 @@ Keep: golden-parity discipline, `bench-decoder` regression tables, CPU/BLAS orac
 | Zero-copy blob + resident layer cache | `DgqGpuBlob`, all 30 layers loaded, 0 expert LRU on `.dgq` | ✅ |
 | q8 embed gather (CPU) | `embed_tokens_from_store` for prefill/decoder embed | ✅ |
 | GPU lm_head (q8) | `f32_q8_linear` + chunked tied head from blob; replaces CPU row dequant | ✅ |
-| MoE grouped GEMM | sort/bucket tokens by expert, one batched dispatch; still per-expert today | ⏳ |
+| MoE grouped GEMM | sort/bucket tokens by expert, one batched dispatch; simd K-reduction q4 kernel | ✅ |
 | Dense → MPS (Q2.5 interim) | q4 dequant scratch + `MPSMatrixMultiplication` for attn/MLP linears on `.dgq` | ✅ |
 | **Delete** bf16 paths on `.dgq` | expert LRU, transpose cache, layer paging, bf16 upload — inactive on `.dgq`; code retained for safetensors | ✅ (dgq) / ⏳ (delete dead code) |
 | Regenerate goldens | quantized goldens (CPU-dequant oracle on same `.dgq`); bf16 fixtures separate | ⏳ |
-| `bench-step` on `.dgq` | M3 Pro, canvas=256, kv=64, 30L | **11.9 s** (was 107 s bf16, 24.6 s pre-lm_head, 18.8 s pre-MPS) |
+| `bench-step` on `.dgq` | M3 Pro, canvas=256, kv=64, 30L | **~6.0 s** (was 107 s bf16, 24.6 s pre-lm_head, 18.8 s pre-MPS, 11.9 s pre-grouped-MoE) |
 
 **Exit / gates (M3 Pro):**
-- `bench-step` ≤ **12 s** — **met** (11.9 s with MPS dense; MoE per-expert kernel still wall #2).
+- `bench-step` ≤ **12 s** — **met** (~6.0 s with MPS dense + grouped MoE q4).
 - Zero evictions, zero transposes — **met** (0 LRU hits/misses/evictions on `.dgq`).
 - Prefill (1 tok) ≤ 0.5 s — **not measured** (GPU `prefill_gpu` wired for bench-step).
 - `generate-parity` on quantized goldens — **not done**.
@@ -147,7 +147,7 @@ Keep: golden-parity discipline, `bench-decoder` regression tables, CPU/BLAS orac
 
 | Task | Notes |
 |---|---|
-| **Grouped MoE kernel (critical path)** | all ~62 active experts, one dispatch (per-expert MPS = ~3,720 encodes/step — ruled out; fp16-resident experts = 12+ GiB — ruled out). simdgroup_matrix tiles, q4 dequant in-register (compute-bound at AI ≈ 120 FLOP/byte). MPS's 0.52 @ M=33 is an occupancy artifact of a lone small GEMM; grouping ×62 threadgroups should clear it. Target 0.8–1.5 TF/s. Reference: MLX `qmm` |
+| **Grouped MoE kernel (critical path)** | all ~62 active experts, one dispatch (per-expert MPS = ~3,720 encodes/step — ruled out; fp16-resident experts = 12+ GiB — ruled out). simdgroup K-reduction over Q4 groups, flattened gather + 2 dispatches/layer (gate_up + down). Target 0.8–1.5 TF/s. Reference: MLX `qmm` | ✅ **~6.0 s/step** (was 11.9 s) |
 | Dense → MPS | interim: **per-layer dequant-to-scratch → MPS**, same command buffer (~200–300 MB reusable fp16 scratch; +50–100 ms/step dequant traffic @ 112 GiB/s). Full fp16-resident dense = +3.4 GiB → 36 GiB dev shortcut only, **kills 24 GiB floor**. End state: custom simdgroup q4 tiles modeled on MPS tiling | ✅ **11.9 s/step** (was 18.8 s) |
 | Re-bench grouped shapes | M=33 × 62 experts grouped, not lone-GEMM probes |
 

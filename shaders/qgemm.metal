@@ -1,4 +1,5 @@
 #include <metal_stdlib>
+#include <metal_simdgroup>
 using namespace metal;
 
 inline float bf16_bits_to_f32(uint bits) {
@@ -22,6 +23,80 @@ inline float q4_weight_at(
     uchar byte = blk[4u + j / 2u];
     float q = (j & 1u) ? float(byte >> 4) : float(byte & 0x0fu);
     return delta * q + mn;
+}
+
+/// Dot one Q4 group (32 K elements) against activations.
+inline float dot_q4_group(
+    device const float *a_row,
+    device const uchar *blk,
+    uint base_k
+) {
+    float delta = bf16_bits_to_f32(uint(blk[0]) | (uint(blk[1]) << 8));
+    float mn = bf16_bits_to_f32(uint(blk[2]) | (uint(blk[3]) << 8));
+    float sum = 0.0f;
+    for (uint j = 0; j < 16u; j++) {
+        uchar byte = blk[4u + j];
+        float q0 = float(byte & 0x0fu);
+        float q1 = float(byte >> 4);
+        sum = fma(a_row[base_k + j * 2u], delta * q0 + mn, sum);
+        sum = fma(a_row[base_k + j * 2u + 1u], delta * q1 + mn, sum);
+    }
+    return sum;
+}
+
+struct Q4GroupedJob {
+    uint w_byte_off;
+    uint groups_per_row;
+};
+
+/// Grouped MoE Q4 GEMM: flattened `[total_m,K] @ expert weights^T` in one dispatch.
+kernel void f32_q4_linear_grouped(
+    device const float *a [[buffer(0)]],
+    device const uchar *w_blob [[buffer(1)]],
+    device float *c [[buffer(2)]],
+    device const Q4GroupedJob *jobs [[buffer(3)]],
+    device const uint *row_starts [[buffer(4)]],
+    constant uint3 &dims [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]]
+) {
+    uint k = dims.x;
+    uint n = dims.y;
+    uint num_jobs = dims.z;
+    uint global_row = gid.y;
+    uint col = gid.x;
+    if (col >= n) {
+        return;
+    }
+
+    uint lo = 0u;
+    uint hi = num_jobs;
+    while (lo + 1u < hi) {
+        uint mid = (lo + hi) >> 1;
+        if (row_starts[mid] <= global_row) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    uint job_id = lo;
+    if (global_row >= row_starts[job_id + 1u]) {
+        return;
+    }
+
+    Q4GroupedJob job = jobs[job_id];
+    device const uchar *w = w_blob + job.w_byte_off;
+    uint row_stride = job.groups_per_row * 20u;
+
+    float sum = 0.0f;
+    for (uint g = simd_lane; g < job.groups_per_row; g += 32u) {
+        device const uchar *blk = w + col * row_stride + g * 20u;
+        sum += dot_q4_group(a + global_row * k, blk, g * 32u);
+    }
+    sum = simd_sum(sum);
+    if (simd_lane == 0u) {
+        c[global_row * n + col] = sum;
+    }
 }
 
 /// C[M,N] = A[M,K] @ W[N,K]^T with Q4 PyTorch row-major W stored as in `.dgq`.

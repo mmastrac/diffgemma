@@ -260,6 +260,45 @@ impl<'a> GpuBatch<'a> {
         encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
     }
 
+    /// Grouped MoE Q4 GEMM: `total_m` flattened rows, one weight row per job via metadata.
+    pub fn dispatch_q4_linear_grouped(
+        &self,
+        pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+        buf_a: &ProtocolObject<dyn MTLBuffer>,
+        buf_w_blob: &ProtocolObject<dyn MTLBuffer>,
+        buf_c: &ProtocolObject<dyn MTLBuffer>,
+        buf_jobs: &ProtocolObject<dyn MTLBuffer>,
+        buf_row_starts: &ProtocolObject<dyn MTLBuffer>,
+        total_m: usize,
+        k: usize,
+        n: usize,
+        num_jobs: usize,
+    ) {
+        const SIMD_WIDTH: usize = 32;
+        let encoder = self.encoder();
+        encoder.setComputePipelineState(pipeline);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(buf_a), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(buf_w_blob), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(buf_c), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(buf_jobs), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(buf_row_starts), 0, 4);
+        }
+        let dims = [k as u32, n as u32, num_jobs as u32];
+        crate::metal::batch::set_bytes(encoder, &dims, 5);
+        let tg = MTLSize {
+            width: SIMD_WIDTH,
+            height: 1,
+            depth: 1,
+        };
+        let grid = MTLSize {
+            width: n,
+            height: total_m,
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    }
+
     /// `C[M,N] = A[M,K] @ W[N,K]^T` with Q8 row weights at `buf_w` + byte offset.
     pub fn dispatch_q8_linear(
         &self,

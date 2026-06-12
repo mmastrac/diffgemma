@@ -15,6 +15,7 @@ const GEMM_ENTRY: &str = "bf16_gemm";
 const F32_BF16_GEMM_ENTRY: &str = "f32_bf16_gemm";
 const F32_BF16_LINEAR_ENTRY: &str = "f32_bf16_linear";
 const F32_Q4_LINEAR_ENTRY: &str = "f32_q4_linear";
+const F32_Q4_LINEAR_GROUPED_ENTRY: &str = "f32_q4_linear_grouped";
 const F32_Q8_LINEAR_ENTRY: &str = "f32_q8_linear";
 const DEQUANT_Q4_MATRIX_ENTRY: &str = "dequant_q4_matrix";
 
@@ -25,6 +26,7 @@ pub struct GpuDecoderEngine {
     /// PyTorch `[out,in]` weights: `y = x @ W^T` without offline transpose.
     pub f32_bf16_linear_pipeline: ComputePipeline,
     pub f32_q4_linear_pipeline: ComputePipeline,
+    pub f32_q4_linear_grouped_pipeline: ComputePipeline,
     pub f32_q8_linear_pipeline: ComputePipeline,
     pub dequant_q4_matrix_pipeline: ComputePipeline,
     pub mps_matmul: MpsMatmulCache,
@@ -41,6 +43,8 @@ impl GpuDecoderEngine {
         let gemm_pipeline = ctx.compile_kernel(GEMM_SHADER, GEMM_ENTRY)?;
         let f32_bf16_linear_pipeline = ctx.compile_kernel(GEMM_SHADER, F32_BF16_LINEAR_ENTRY)?;
         let f32_q4_linear_pipeline = ctx.compile_kernel(QGEMM_SHADER, F32_Q4_LINEAR_ENTRY)?;
+        let f32_q4_linear_grouped_pipeline =
+            ctx.compile_kernel(QGEMM_SHADER, F32_Q4_LINEAR_GROUPED_ENTRY)?;
         let f32_q8_linear_pipeline = ctx.compile_kernel(QGEMM_SHADER, F32_Q8_LINEAR_ENTRY)?;
         let dequant_q4_matrix_pipeline =
             ctx.compile_kernel(QGEMM_SHADER, DEQUANT_Q4_MATRIX_ENTRY)?;
@@ -53,6 +57,7 @@ impl GpuDecoderEngine {
             gemm_pipeline,
             f32_bf16_linear_pipeline,
             f32_q4_linear_pipeline,
+            f32_q4_linear_grouped_pipeline,
             f32_q8_linear_pipeline,
             dequant_q4_matrix_pipeline,
             mps_matmul,

@@ -239,6 +239,7 @@ fn forward_layer_ff(
         &engine.kernels,
         &engine.f32_bf16_linear_pipeline,
         &engine.f32_q4_linear_pipeline,
+        &engine.f32_q4_linear_grouped_pipeline,
         telemetry,
     )?;
 

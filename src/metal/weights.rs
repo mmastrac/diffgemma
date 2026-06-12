@@ -376,6 +376,13 @@ impl GpuDecoderWeightCache {
         matches!(self, Self::Dgq(_))
     }
 
+    pub fn dgq_blob(&self) -> Option<&ProtocolObject<dyn MTLBuffer>> {
+        match self {
+            Self::Dgq(d) => Some(&d.blob.buffer),
+            Self::Bf16(_) => None,
+        }
+    }
+
     pub fn embed_q8(&self) -> Option<&Q8LinearGpu> {
         match self {
             Self::Dgq(d) => d.embed_q8.as_ref(),
