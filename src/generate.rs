@@ -619,7 +619,6 @@ mod gpu_determinism {
 
     /// Same KV + canvas: two decoder forwards back-to-back must match bit-for-bit.
     #[test]
-    #[ignore = "repeat forward on shared dec/gpu_kv still drifts; single-pass surveys pass"]
     fn dgq_forward_logits_same_inputs_twice() {
         let Some(dgq_dir) = dgq_fixture_dir() else {
             eprintln!("skip: /tmp/quantized-weights missing");
@@ -669,7 +668,6 @@ mod gpu_determinism {
 
     /// Isolate engine pool: second forward uses a fresh engine (same dec/kv/canvas).
     #[test]
-    #[ignore = "see dgq_forward_logits_same_inputs_twice"]
     fn dgq_forward_logits_fresh_engine_second_pass() {
         let Some(dgq_dir) = dgq_fixture_dir() else {
             eprintln!("skip: /tmp/quantized-weights missing");
@@ -729,7 +727,6 @@ mod gpu_determinism {
 
     /// Second pass repeats prefill (fresh gpu_kv) — if this passes, gpu_kv canvas corruption is the bug.
     #[test]
-    #[ignore = "see dgq_forward_logits_same_inputs_twice"]
     fn dgq_forward_logits_fresh_prefill_second_pass() {
         let Some(dgq_dir) = dgq_fixture_dir() else {
             eprintln!("skip: /tmp/quantized-weights missing");
@@ -786,7 +783,6 @@ mod gpu_determinism {
 
     /// Fully isolated second chain (fresh weights + engine + scratch).
     #[test]
-    #[ignore = "3-layer forward drift; regen goldens after fix"]
     fn dgq_forward_logits_fully_isolated_chains() {
         let Some(dgq_dir) = dgq_fixture_dir() else {
             eprintln!("skip: /tmp/quantized-weights missing");
@@ -894,7 +890,6 @@ mod gpu_determinism {
     }
 
     #[test]
-    #[ignore = "bisect helper; layer 1 decoder still drifts"]
     fn dgq_drift_prefill_vs_decoder_layers() {
         if dgq_fixture_dir().is_none() {
             eprintln!("skip: /tmp/quantized-weights missing");
@@ -951,15 +946,32 @@ mod gpu_determinism {
         let mut a = std::collections::HashSet::new();
         let mut b = std::collections::HashSet::new();
         let mut c = std::collections::HashSet::new();
+        let mut d = std::collections::HashSet::new();
+        let mut e = std::collections::HashSet::new();
+        let mut f = std::collections::HashSet::new();
         for _ in 0..8 {
             a.insert(run(1, 1));
             b.insert(run(2, 1));
             c.insert(run(2, 2));
+            d.insert(run(3, 1));
+            e.insert(run(3, 2));
+            f.insert(run(3, 3));
         }
-        eprintln!("prefill1/dec1 unique={} prefill2/dec1 unique={} prefill2/dec2 unique={}", a.len(), b.len(), c.len());
+        eprintln!(
+            "prefill1/dec1={} prefill2/dec1={} prefill2/dec2={} prefill3/dec1={} prefill3/dec2={} prefill3/dec3={}",
+            a.len(),
+            b.len(),
+            c.len(),
+            d.len(),
+            e.len(),
+            f.len()
+        );
         assert_eq!(a.len(), 1, "1/1 drift");
-        assert_eq!(b.len(), 1, "2/1 drift (prefill layer1 poisons kv?)");
+        assert_eq!(b.len(), 1, "2/1 drift");
         assert_eq!(c.len(), 1, "2/2 drift");
+        assert_eq!(d.len(), 1, "3/1 drift");
+        assert_eq!(e.len(), 1, "3/2 drift");
+        assert_eq!(f.len(), 1, "3/3 drift");
     }
 
     #[test]
@@ -1057,7 +1069,6 @@ mod gpu_determinism {
 
     /// Full prefill + forward repeated in-process (reused engine pool).
     #[test]
-    #[ignore = "3-layer forward drift; regen goldens after fix"]
     fn dgq_forward_logits_repeatable_with_reused_engine() {
         let Some(dgq_dir) = dgq_fixture_dir() else {
             eprintln!("skip: /tmp/quantized-weights missing");
@@ -1127,9 +1138,8 @@ mod gpu_determinism {
         }
     }
 
-    /// Native Q4 + CPU sampler should be repeatable; tracked in Q3 (currently flaky on some runs).
+    /// Native Q4 + CPU sampler should be repeatable.
     #[test]
-    #[ignore = "native Q4 forward still shows occasional run-to-run token drift; see PLAN2 Q3"]
     fn dgq_generate_stable_deterministic_mode() {
         let Some(dgq_dir) = dgq_fixture_dir() else {
             eprintln!("skip: /tmp/quantized-weights missing");

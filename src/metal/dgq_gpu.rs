@@ -92,6 +92,20 @@ impl Q4LinearGpu {
     pub fn weight_buffer(&self) -> (&ProtocolObject<dyn MTLBuffer>, u64) {
         (&self.blob.buffer, self.byte_offset)
     }
+
+    /// CPU-readable view of Q4 bytes (shared mmap; matches GPU blob layout).
+    pub fn src_slice(&self) -> &[u8] {
+        let len = self.q4_byte_len();
+        unsafe {
+            let ptr = self
+                .blob
+                .buffer
+                .contents()
+                .as_ptr()
+                .add(self.byte_offset as usize) as *const u8;
+            std::slice::from_raw_parts(ptr, len)
+        }
+    }
 }
 
 /// Raw bf16/f32 payload in the blob (norms, router).

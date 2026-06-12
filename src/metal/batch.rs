@@ -15,9 +15,10 @@ use objc2_metal::{
 
 struct PendingRead {
     buf: Retained<ProtocolObject<dyn MTLBuffer>>,
-    dst: *mut f32,
-    len: usize,
+    dst: *mut u8,
+    len_bytes: usize,
     src_byte_offset: usize,
+    read_u32: bool,
 }
 
 pub struct GpuBatch<'a> {
@@ -79,9 +80,32 @@ impl<'a> GpuBatch<'a> {
     ) {
         self.reads.push(PendingRead {
             buf,
-            dst: out.as_mut_ptr(),
-            len: out.len(),
+            dst: out.as_mut_ptr() as *mut u8,
+            len_bytes: out.len() * 4,
             src_byte_offset: 0,
+            read_u32: false,
+        });
+    }
+
+    pub fn register_read(
+        &mut self,
+        buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+        out: &mut [f32],
+    ) {
+        self.track_read(buf, out);
+    }
+
+    pub fn register_read_u32(
+        &mut self,
+        buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+        out: &mut [u32],
+    ) {
+        self.reads.push(PendingRead {
+            buf,
+            dst: out.as_mut_ptr() as *mut u8,
+            len_bytes: out.len() * 4,
+            src_byte_offset: 0,
+            read_u32: true,
         });
     }
 
@@ -93,10 +117,33 @@ impl<'a> GpuBatch<'a> {
     ) {
         self.reads.push(PendingRead {
             buf,
-            dst: out.as_mut_ptr(),
-            len: out.len(),
+            dst: out.as_mut_ptr() as *mut u8,
+            len_bytes: out.len() * 4,
             src_byte_offset: src_offset_elems * 4,
+            read_u32: false,
         });
+    }
+
+    fn run_pending_read(read: PendingRead) {
+        if read.read_u32 {
+            let out = unsafe {
+                std::slice::from_raw_parts_mut(read.dst as *mut u32, read.len_bytes / 4)
+            };
+            if read.src_byte_offset == 0 {
+                BufferPool::read_u32(&read.buf, out);
+            } else {
+                BufferPool::read_u32_at_offset(&read.buf, read.src_byte_offset, out);
+            }
+        } else {
+            let out = unsafe {
+                std::slice::from_raw_parts_mut(read.dst as *mut f32, read.len_bytes / 4)
+            };
+            if read.src_byte_offset == 0 {
+                BufferPool::read_f32(&read.buf, out);
+            } else {
+                BufferPool::read_f32_at_offset(&read.buf, read.src_byte_offset, out);
+            }
+        }
     }
 
     pub fn alloc_f32(
@@ -427,27 +474,6 @@ impl<'a> GpuBatch<'a> {
         encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
     }
 
-    pub fn register_read(
-        &mut self,
-        buf: Retained<ProtocolObject<dyn MTLBuffer>>,
-        out: &mut [f32],
-    ) {
-        self.track_read(buf, out);
-    }
-
-    pub fn register_read_u32(
-        &mut self,
-        buf: Retained<ProtocolObject<dyn MTLBuffer>>,
-        out: &mut [u32],
-    ) {
-        self.reads.push(PendingRead {
-            buf,
-            dst: out.as_mut_ptr() as *mut f32,
-            len: out.len(),
-            src_byte_offset: 0,
-        });
-    }
-
     pub(crate) fn record_dense_upload(&mut self, bytes: u64) {
         if let Some(cell) = self.telemetry.as_ref() {
             cell.borrow_mut().dense_gpu_upload_bytes += bytes;
@@ -473,7 +499,7 @@ impl<'a> GpuBatch<'a> {
 
     /// Commit, wait, and run pending readbacks without releasing GPU buffers.
     pub fn flush_reads(&mut self) -> Result<(), Error> {
-        let readback_bytes: u64 = self.reads.iter().map(|r| r.len as u64 * 4).sum();
+        let readback_bytes: u64 = self.reads.iter().map(|r| r.len_bytes as u64).sum();
         if let Some(enc) = self.enc.take() {
             enc.endEncoding();
         }
@@ -488,12 +514,7 @@ impl<'a> GpuBatch<'a> {
         }
 
         for read in self.reads.drain(..) {
-            let slice = unsafe { std::slice::from_raw_parts_mut(read.dst, read.len) };
-            if read.src_byte_offset == 0 {
-                BufferPool::read_f32(&read.buf, slice);
-            } else {
-                BufferPool::read_f32_at_offset(&read.buf, read.src_byte_offset, slice);
-            }
+            Self::run_pending_read(read);
         }
 
         self.cmd = Some(
@@ -510,7 +531,7 @@ impl<'a> GpuBatch<'a> {
     }
 
     pub fn end(mut self) -> Result<(), Error> {
-        let readback_bytes: u64 = self.reads.iter().map(|r| r.len as u64 * 4).sum();
+        let readback_bytes: u64 = self.reads.iter().map(|r| r.len_bytes as u64).sum();
         let enc = self.enc.take().expect("batch encoder missing");
         enc.endEncoding();
         let cmd = self.cmd.take().expect("batch command buffer missing");
@@ -524,12 +545,7 @@ impl<'a> GpuBatch<'a> {
         }
 
         for read in self.reads {
-            let slice = unsafe { std::slice::from_raw_parts_mut(read.dst, read.len) };
-            if read.src_byte_offset == 0 {
-                BufferPool::read_f32(&read.buf, slice);
-            } else {
-                BufferPool::read_f32_at_offset(&read.buf, read.src_byte_offset, slice);
-            }
+            Self::run_pending_read(read);
         }
         for (bytes, buf) in self.releases {
             self.pool.release(bytes, buf);

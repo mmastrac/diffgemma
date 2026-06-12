@@ -1,4 +1,6 @@
 use crate::config::TextConfig;
+use crate::dgq::block::q4_gemm_cpu;
+use crate::kernels::cpu::gelu_pytorch_tanh;
 use crate::metal::batched_kernels::{self as bk};
 use crate::metal::batch::GpuBatch;
 use crate::metal::device::ComputePipeline;
@@ -9,7 +11,7 @@ use crate::metal::weights::GpuDecoderWeightCache;
 use std::cell::RefCell;
 use std::rc::Rc;
 use crate::model::layer_weights::DecoderLayerWeights;
-use crate::model::moe::RouteResult;
+use crate::model::moe::{MoeScratch, RouteResult};
 use crate::safetensors::Error;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLBuffer;
@@ -354,6 +356,60 @@ pub fn experts_forward_gpu_grouped_in_batch(
         num_jobs,
     );
     batch.register_read(buf_out, out_arena);
+    Ok(())
+}
+
+/// Deterministic CPU expert forward for `.dgq` (native Q4 GEMM matches Metal kernel).
+pub fn experts_forward_dgq_cpu(
+    out: &mut [f32],
+    expert_input: &[f32],
+    expert_cache: &GpuDecoderWeightCache,
+    layer: usize,
+    cfg: &TextConfig,
+    seq_len: usize,
+    routes: &[RouteResult],
+    scratch: &mut MoeScratch,
+) -> Result<(), Error> {
+    let hidden = cfg.hidden_size;
+    let moe_inter = cfg.moe_intermediate_size;
+    assert_eq!(expert_input.len(), seq_len * hidden);
+    assert_eq!(out.len(), seq_len * hidden);
+    assert_eq!(routes.len(), seq_len);
+
+    out.fill(0.0);
+    for s in 0..seq_len {
+        let x = &expert_input[s * hidden..(s + 1) * hidden];
+        let route = &routes[s];
+        let o = &mut out[s * hidden..(s + 1) * hidden];
+        for (&expert, &weight) in route.indices.iter().zip(route.weights.iter()) {
+            let gate_up = expert_cache.expert_gate_up_q4(layer, expert);
+            let down = expert_cache.expert_down_q4(layer, expert);
+            q4_gemm_cpu(
+                x,
+                1,
+                hidden,
+                gate_up.src_slice(),
+                moe_inter * 2,
+                &mut scratch.gate_up,
+            );
+            let (gate, up) = scratch.gate_up.split_at_mut(moe_inter);
+            gelu_pytorch_tanh(gate);
+            for i in 0..moe_inter {
+                scratch.gate_act[i] = gate[i] * up[i];
+            }
+            q4_gemm_cpu(
+                &scratch.gate_act,
+                1,
+                moe_inter,
+                down.src_slice(),
+                hidden,
+                &mut scratch.expert_out,
+            );
+            for i in 0..hidden {
+                o[i] += weight * scratch.expert_out[i];
+            }
+        }
+    }
     Ok(())
 }
 

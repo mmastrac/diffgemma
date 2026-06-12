@@ -170,7 +170,7 @@ Once weights are resident and kernels are sane, the per-step serial CPU work bec
 | GPU router top-8 | ✅ `route_gpu_in_batch` + `router_top_k_rows` (f32 logits, tie-break prob↓ index↑); wired on `.dgq` path |
 | Merged FF+MoE batch (`.dgq`) | ✅ one batch/layer: dense FF → GPU route (`flush_reads`) → grouped MoE (`flush_reads`) → final combine; skips ~5.6 MB/layer residual+dense readback |
 | GPU sampler (full) | ✅ GPU softcap → entropy → argmax → softmax → categorical sample; ~3 KB/step readback. Fixed odd-layer hidden ping-pong, persistent logits pool alloc, ranged vec_fill_zero, lm_head scatter grid |
-| Deterministic parity path | ✅ `GenerateConfig.deterministic` + `engine.use_mps_q4` (env `DGQ_MPS_Q4=0`); `generate-parity` uses native Q4 + CPU sampler. **MPS off removes most drift; residual run-to-run variance still under investigation** |
+| Deterministic parity path | ✅ `GenerateConfig.deterministic` + `engine.use_mps_q4` (env `DGQ_MPS_Q4=0`); `generate-parity` uses native Q4 compute shaders + **CPU router/MoE** + CPU sampler. **Bit-stable** as of 2026-06-12 (`generate-parity` 3× pass; goldens regen). |
 | Counter-based RNG | Philox/Threefry keyed (seed, block, step, position); implement identically in CPU oracle; regenerate goldens once forward is bit-stable |
 | GPU early-stop reduction | avg-entropy scalar + argmax-stable-2-steps flag; CPU reads 2 scalars + committed ids per step |
 | Self-conditioning on GPU | sc probs/logits never leave GPU; feed prev-step distribution path entirely on-device |
@@ -179,13 +179,13 @@ Once weights are resident and kernels are sane, the per-step serial CPU work bec
 **Nondeterminism (2026-06 investigation):**
 - **Primary cause:** `MPSMatrixMultiplication` on `.dgq` dense Q4 linears (attention + FF gate/up/down). Same seed can change tokens at canvas index ≥1 between runs when MPS is on. **Fix:** `GpuDecoderEngine.use_mps_q4` (default **on** via `DGQ_MPS_Q4=1` for bench; **off** for `generate-parity` / `deterministic:true`).
 - **NaN logits (fixed 2026-06):** Fresh/reused `BufferPool` `MTLBuffer`s were not zeroed → partial kernel coverage leaked stale bytes → full-tensor NaN after lm_head (~67M elements, argmax → mask 262143). **Fix:** zero every buffer in `BufferPool::allocate`; zero `GpuKvCache` keys/values at creation; `engine.pool.clear()` at `generate_gpu` start.
-- **Secondary drift (2026-06-12):** With MPS off + per-job MoE:
-  - **Fixed:** deterministic FF path ended the fused batch before combine → stale `buf_ff`/`buf_stream` after pool reuse. Now readback dense FF tensors before per-job MoE, re-upload for combine; `pool.trim(0)` after each FF layer.
-  - **Fixed:** even-layer decoder ping-pong picked wrong hidden buffer for final norm (2-layer stack wrong logits). Now always norm from `in_buf` after last swap.
-  - **Fixed:** per-job MoE ran all experts in one batch (intermediate buffer reuse); now **one batch per expert job** + `pool.trim(0)` after each job batch.
-  - **Fixed:** repeat decoder forward could read stale GPU KV canvas suffix; `GpuKvCache::clear_canvas_suffix` at decoder forward start.
-  - **Status:** `dgq_drift_survey_one_layer` + `dgq_drift_survey_two_layers` pass (8 trials). **3-layer stack still flaky** (806 vs 124755 argmax); `dgq_drift_survey_three_layers` + full `dgq_drift_survey` remain `#[ignore]` until layer 2+ MoE bisect completes. Repeat forward on shared `dec` (`dgq_forward_logits_same_inputs_twice`) still drifts — single-pass OK.
-- **Tests:** `dgq_drift_survey_one_layer`, `dgq_drift_survey_two_layers` (pass); layer FF bisect tests in `decoder_layer::determinism_tests`; `dgq_drift_survey_three_layers` (`#[ignore]` helper).
+- **Secondary drift (2026-06-12, fixed):** With MPS off, residual nondeterminism traced to:
+  - **GPU MoE Q4** (`f32_q4_linear_grouped` / per-job path): nondeterministic across fresh engines and repeats. **Fix:** `experts_forward_dgq_cpu` on `!use_mps_q4` path (native Q4 GEMM matches Metal kernel).
+  - **GPU router top-k** (`router_top_k_rows`): flaky readback (zeros on repeat); `register_read_u32` now uses typed u32 readback. **Fix:** `route_with_cached_weights` on `!use_mps_q4` path (same as bf16 FF path).
+  - **MoE stream input bug:** per-job path used pre-FF residual instead of post-attn stream for expert input. Fixed to `pre_ff_norm_2(stream)`.
+  - **Global canvas KV clear:** `clear_canvas_suffix` at decoder forward start caused repeat drift; removed (canvas K/V fully overwritten per layer).
+  - **Even-layer ping-pong:** final norm read wrong hidden buffer (fixed earlier).
+  - **Status:** `dgq_drift_survey_three_layers`, `dgq_layer2_endogenous_fresh_engine_survey`, `dgq_forward_logits_same_inputs_twice`, `generate-parity` (steps1/2, layers3) all pass. Goldens regen: `dgq_hello_steps{1,2}_layers3.json`.
 - **Historical:** Old goldens encoded NaN logits (odd-layer hidden buf bug + pool staleness) → CPU argmax → mask token 262143. Invalid; do not preserve.
 
 **Measured (M3 Pro, full GPU sampler):** sampler readback **~3 KB/step** (256×4×3); forward readback still ~109 MiB/step (MoE/router). `bench-step` re-bench pending with MPS default.

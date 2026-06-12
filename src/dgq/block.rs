@@ -114,6 +114,40 @@ pub fn dequant_matrix_q4(src: &[u8], out_dim: usize, in_dim: usize, dst: &mut [f
     }
 }
 
+#[inline]
+fn q4_weight_at(src: &[u8], row: usize, col: usize, in_dim: usize) -> f32 {
+    let row_bytes = q4_row_bytes(in_dim);
+    let row_off = row * row_bytes;
+    let g = col / GROUP_SIZE;
+    let j = col % GROUP_SIZE;
+    let si = row_off + g * (4 + GROUP_SIZE / 2);
+    let delta = bf16_to_f32(u16::from_le_bytes([src[si], src[si + 1]]));
+    let min = bf16_to_f32(u16::from_le_bytes([src[si + 2], src[si + 3]]));
+    let byte = src[si + 4 + j / 2];
+    let q = if j % 2 == 0 {
+        (byte & 0x0f) as f32
+    } else {
+        (byte >> 4) as f32
+    };
+    delta * q + min
+}
+
+/// CPU Q4 GEMM matching `f32_q4_linear.metal` (deterministic parity path).
+pub fn q4_gemm_cpu(a: &[f32], m: usize, k: usize, w_q4: &[u8], n: usize, out: &mut [f32]) {
+    assert_eq!(a.len(), m * k);
+    assert_eq!(out.len(), m * n);
+    assert_eq!(w_q4.len(), q4_matrix_bytes(n, k));
+    for row in 0..m {
+        for col in 0..n {
+            let mut sum = 0.0f32;
+            for p in 0..k {
+                sum += a[row * k + p] * q4_weight_at(w_q4, col, p, k);
+            }
+            out[row * n + col] = sum;
+        }
+    }
+}
+
 /// Quantize `[out, in]` bf16 to per-row int8 + fp16 scale.
 pub fn quantize_bf16_matrix_q8(src: &[u8], out_dim: usize, in_dim: usize, dst: &mut [u8]) {
     let need = q8_matrix_bytes(out_dim, in_dim);

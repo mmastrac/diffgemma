@@ -304,15 +304,17 @@ fn forward_inner(
     let mut out_buf = &mut scratch.cpu.hidden_b;
 
     let n_layers = max_layers.min(text.num_hidden_layers);
+    if !engine.use_mps_q4() {
+        engine.pool.clear();
+    }
     let expert_before = if engine.telemetry_enabled() {
         Some(weights.expert_cache_stats())
     } else {
         None
     };
     let gpu_kv_ref = scratch.gpu_kv.as_ref();
-    if let Some(gpu_kv) = scratch.gpu_kv.as_ref() {
-        gpu_kv.clear_canvas_suffix(seq_len)?;
-    }
+    // Canvas K/V are fully overwritten per layer in write_canvas_kv_pre_rope; do not
+    // zero the suffix here — clearing all layers before each forward caused repeat drift.
     let mut bf16_layer_weights = None;
     for layer in 0..n_layers {
         let layer_scratch = scratch.layer.ensure(cfg, seq_len, input.kv_cache.kv_len, layer)?;

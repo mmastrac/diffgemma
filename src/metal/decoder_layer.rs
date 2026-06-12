@@ -4,9 +4,11 @@ use crate::metal::batch::begin_engine_batch;
 use crate::metal::engine::GpuDecoderEngine;
 use crate::metal::linear::linear_cached_batched_in_buf;
 use crate::metal::moe::{
-    build_expert_jobs, experts_forward_gpu_batched, experts_forward_gpu_grouped_in_batch,
-    experts_forward_gpu_per_job, scatter_weighted_expert_outputs,
+    build_expert_jobs, experts_forward_dgq_cpu, experts_forward_gpu_batched,
+    experts_forward_gpu_grouped_in_batch, experts_forward_gpu_per_job,
+    scatter_weighted_expert_outputs,
 };
+use crate::model::moe::{prepare_expert_input, route_with_cached_weights};
 use crate::metal::router::{pack_routes, route_gpu_in_batch, GpuRouteScratch};
 use crate::metal::weights::{GpuDecoderWeightCache, GpuLayerWeightCache};
 use crate::metal::decoder_attention::{
@@ -267,30 +269,48 @@ fn forward_layer_ff_dgq_gpu(
         eps,
     )?;
 
-    let mut route_scratch = GpuRouteScratch {
-        indices: std::mem::take(&mut scratch.route_indices),
-        weights: std::mem::take(&mut scratch.route_weights),
+    let (routes, mut batch) = if use_mps_q4 {
+        let mut route_scratch = GpuRouteScratch {
+            indices: std::mem::take(&mut scratch.route_indices),
+            weights: std::mem::take(&mut scratch.route_weights),
+        };
+        route_gpu_in_batch(
+            &mut batch,
+            &engine.kernels,
+            &engine.f32_f32_linear_pipeline.pipeline,
+            &buf_stream,
+            cached,
+            cfg,
+            seq_len,
+            &mut route_scratch,
+        )?;
+        batch.flush_reads()?;
+        scratch.route_indices = route_scratch.indices;
+        scratch.route_weights = route_scratch.weights;
+        let routes = pack_routes(
+            &scratch.route_indices,
+            &scratch.route_weights,
+            seq_len,
+            top_k,
+        );
+        (routes, Some(batch))
+    } else {
+        scratch.dense_out.resize(len, 0.0);
+        scratch.moe_input.resize(len, 0.0);
+        batch.register_read(buf_ff.clone(), &mut scratch.dense_out);
+        batch.register_read(buf_stream.clone(), &mut scratch.moe_input);
+        batch.end()?;
+        let routes = route_with_cached_weights(
+            &scratch.moe_input,
+            cached.router_proj.as_slice(),
+            cached.router_scale.as_slice(),
+            cached.per_expert_scale.as_slice(),
+            cfg,
+            seq_len,
+            &mut scratch.cpu.moe,
+        )?;
+        (routes, None)
     };
-    route_gpu_in_batch(
-        &mut batch,
-        &engine.kernels,
-        &engine.f32_f32_linear_pipeline.pipeline,
-        &buf_stream,
-        cached,
-        cfg,
-        seq_len,
-        &mut route_scratch,
-    )?;
-    batch.flush_reads()?;
-
-    let routes = pack_routes(
-        &route_scratch.indices,
-        &route_scratch.weights,
-        seq_len,
-        top_k,
-    );
-    scratch.route_indices = route_scratch.indices;
-    scratch.route_weights = route_scratch.weights;
 
     let jobs = build_expert_jobs(&routes, experts);
     if let Some(cell) = &telemetry {
@@ -315,7 +335,7 @@ fn forward_layer_ff_dgq_gpu(
     if !jobs.is_empty() {
         if use_mps_q4 {
             experts_forward_gpu_grouped_in_batch(
-                &mut batch,
+                batch.as_mut().expect("mps batch"),
                 &mut scratch.moe_batch_out,
                 &buf_stream,
                 cached.pre_ff_norm_2.as_slice(),
@@ -329,49 +349,61 @@ fn forward_layer_ff_dgq_gpu(
                 &engine.kernels,
                 &engine.f32_q4_linear_grouped_pipeline,
             )?;
-            batch.flush_reads()?;
+            batch.as_mut().expect("mps batch").flush_reads()?;
+            scatter_weighted_expert_outputs(
+                &mut scratch.moe_branch,
+                &scratch.moe_batch_out,
+                &jobs,
+                hidden,
+            );
         } else {
-            scratch.dense_out.resize(len, 0.0);
-            scratch.moe_input.resize(len, 0.0);
-            batch.register_read(buf_ff.clone(), &mut scratch.dense_out);
-            batch.register_read(buf_stream.clone(), &mut scratch.moe_input);
-            batch.end()?;
-            experts_forward_gpu_per_job(
-                &mut scratch.moe_batch_out,
-                &scratch.residual,
+            prepare_expert_input(
+                &mut scratch.normed,
+                &scratch.moe_input,
                 cached.pre_ff_norm_2.as_slice(),
+                seq_len,
+                hidden,
                 eps,
+            );
+            scratch.moe_branch.resize(len, 0.0);
+            scratch.moe_branch.fill(0.0);
+            experts_forward_dgq_cpu(
+                &mut scratch.moe_branch,
+                &scratch.normed,
                 expert_cache,
                 layer,
-                hidden,
-                cfg.moe_intermediate_size,
+                cfg,
                 seq_len,
-                &jobs,
-                &mut scratch.moe_token_indices,
-                &engine.ctx,
-                &mut engine.pool,
-                &engine.kernels,
-                &engine.f32_bf16_linear_pipeline,
-                &engine.f32_q4_linear_pipeline,
-                telemetry.clone(),
+                &routes,
+                &mut scratch.cpu.moe,
             )?;
-            batch = begin_engine_batch(
+            batch = Some(begin_engine_batch(
                 &engine.ctx.queue,
                 &mut engine.pool,
                 &engine.ctx.device,
                 telemetry.clone(),
-            )?;
-            buf_ff = batch.alloc_f32(&scratch.dense_out)?;
-            buf_stream = batch.alloc_f32(&scratch.moe_input)?;
+            )?);
+            buf_ff = batch.as_mut().expect("combine batch").alloc_f32(&scratch.dense_out)?;
+            buf_stream = batch
+                .as_mut()
+                .expect("combine batch")
+                .alloc_f32(&scratch.moe_input)?;
         }
+    } else if !use_mps_q4 {
+        batch = Some(begin_engine_batch(
+            &engine.ctx.queue,
+            &mut engine.pool,
+            &engine.ctx.device,
+            telemetry.clone(),
+        )?);
+        buf_ff = batch.as_mut().expect("combine batch").alloc_f32(&scratch.dense_out)?;
+        buf_stream = batch
+            .as_mut()
+            .expect("combine batch")
+            .alloc_f32(&scratch.moe_input)?;
     }
 
-    scatter_weighted_expert_outputs(
-        &mut scratch.moe_branch,
-        &scratch.moe_batch_out,
-        &jobs,
-        hidden,
-    );
+    let mut batch = batch.expect("ff combine batch");
 
     let buf_moe = batch.alloc_f32(&scratch.moe_branch)?;
     let buf_moe_n = bk::rms_norm_rows_gpu_buf(
@@ -1317,9 +1349,13 @@ mod determinism_tests {
             .expect("attn");
         }
         scratch1.residual.copy_from_slice(&h0);
+        let attn_out_fixed = scratch1.attn_out.clone();
+        let residual_fixed = scratch1.residual.clone();
         ctx.weights.release_layer();
         ctx.engine.pool.clear();
         assert_f32_repeatable("layer 1 FF drift", || {
+            scratch1.attn_out.copy_from_slice(&attn_out_fixed);
+            scratch1.residual.copy_from_slice(&residual_fixed);
             ctx.weights
                 .ensure_layer(
                     &ctx.store,
@@ -1528,6 +1564,302 @@ mod determinism_tests {
     }
 
     #[test]
+    fn dgq_layer0_ff_shared_engine_survey() {
+        if dgq_dir().is_none() {
+            eprintln!("skip: /tmp/quantized-weights missing");
+            return;
+        }
+        let mut setup = LayerTestCtx::new(3);
+        let canvas_len = setup.cfg.canvas_length;
+        let hidden_dim = setup.cfg.text_config.hidden_size;
+        let eps = setup.cfg.text_config.rms_norm_eps as f32;
+        let mut scratch0 = GpuDecoderLayerScratch::with_kv_len(
+            canvas_len,
+            &setup.cfg.text_config,
+            0,
+            setup.kv.kv_len,
+        )
+        .expect("scratch");
+        let hidden_in = setup.hidden_in.clone();
+        let _ = stream_residual_for_ff(&mut setup, &mut scratch0, &hidden_in, 0).expect("stream");
+        let attn_fixed = scratch0.attn_out.clone();
+        let res_fixed = scratch0.residual.clone();
+
+        let mut unique = std::collections::HashSet::new();
+        for trial in 0..8 {
+            setup.engine.pool.clear();
+            let mut scratch = GpuDecoderLayerScratch::with_kv_len(
+                canvas_len,
+                &setup.cfg.text_config,
+                0,
+                setup.kv.kv_len,
+            )
+            .expect("scratch");
+            scratch.attn_out.copy_from_slice(&attn_fixed);
+            scratch.residual.copy_from_slice(&res_fixed);
+            setup.weights
+                .ensure_layer(
+                    &setup.store,
+                    &setup.cfg.text_config,
+                    0,
+                    &setup.engine.ctx.device,
+                    &mut setup.engine.pool,
+                )
+                .expect("layer0");
+            let cached = setup.weights.layer_ref(0);
+            let mut out = vec![0.0f32; canvas_len * hidden_dim];
+            forward_layer_ff_dgq_gpu(
+                &mut out,
+                &cached,
+                &setup.weights,
+                &setup.cfg.text_config,
+                0,
+                canvas_len,
+                hidden_dim,
+                eps,
+                &mut scratch,
+                &mut setup.engine,
+            )
+            .expect("ff");
+            setup.weights.release_layer();
+            let tag = out.iter().take(4).map(|v| v.to_bits()).collect::<Vec<_>>();
+            eprintln!("shared-engine ff trial {trial}: {tag:?}");
+            unique.insert(tag);
+        }
+        assert_eq!(unique.len(), 1, "shared-engine ff drift: {unique:?}");
+    }
+
+    #[test]
+    fn dgq_layer0_ff_fresh_engine_survey() {
+        if dgq_dir().is_none() {
+            eprintln!("skip: /tmp/quantized-weights missing");
+            return;
+        }
+        let mut setup = LayerTestCtx::new(3);
+        let canvas_len = setup.cfg.canvas_length;
+        let hidden_dim = setup.cfg.text_config.hidden_size;
+        let eps = setup.cfg.text_config.rms_norm_eps as f32;
+        let mut scratch = GpuDecoderLayerScratch::with_kv_len(
+            canvas_len,
+            &setup.cfg.text_config,
+            0,
+            setup.kv.kv_len,
+        )
+        .expect("scratch");
+        let hidden_in = setup.hidden_in.clone();
+        let stream = stream_residual_for_ff(&mut setup, &mut scratch, &hidden_in, 0).expect("stream");
+        let attn_fixed = scratch.attn_out.clone();
+        let res_fixed = scratch.residual.clone();
+
+        let mut unique = std::collections::HashSet::new();
+        for trial in 0..8 {
+            let mut ctx = LayerTestCtx::new(3);
+            let mut scratch = GpuDecoderLayerScratch::with_kv_len(
+                canvas_len,
+                &ctx.cfg.text_config,
+                0,
+                ctx.kv.kv_len,
+            )
+            .expect("scratch");
+            scratch.attn_out.copy_from_slice(&attn_fixed);
+            scratch.residual.copy_from_slice(&res_fixed);
+            ctx.weights
+                .ensure_layer(&ctx.store, &ctx.cfg.text_config, 0, &ctx.engine.ctx.device, &mut ctx.engine.pool)
+                .expect("layer0");
+            let cached = ctx.weights.layer_ref(0);
+            let mut out = vec![0.0f32; canvas_len * hidden_dim];
+            forward_layer_ff_dgq_gpu(
+                &mut out,
+                &cached,
+                &ctx.weights,
+                &ctx.cfg.text_config,
+                0,
+                canvas_len,
+                hidden_dim,
+                eps,
+                &mut scratch,
+                &mut ctx.engine,
+            )
+            .expect("ff");
+            ctx.weights.release_layer();
+            let tag = out.iter().take(4).map(|v| v.to_bits()).collect::<Vec<_>>();
+            eprintln!("layer0 ff fresh trial {trial}: {tag:?}");
+            unique.insert(tag);
+        }
+        assert_eq!(unique.len(), 1, "layer0 ff fresh-engine drift: {unique:?}");
+    }
+
+    #[test]
+    fn dgq_layer0_route_fresh_engine_survey() {
+        if dgq_dir().is_none() {
+            eprintln!("skip: /tmp/quantized-weights missing");
+            return;
+        }
+        let mut setup = LayerTestCtx::new(3);
+        let canvas_len = setup.cfg.canvas_length;
+        let top_k = setup.cfg.text_config.top_k_experts;
+        let mut scratch = GpuDecoderLayerScratch::with_kv_len(
+            canvas_len,
+            &setup.cfg.text_config,
+            0,
+            setup.kv.kv_len,
+        )
+        .expect("scratch");
+        let hidden_in = setup.hidden_in.clone();
+        let stream = stream_residual_for_ff(&mut setup, &mut scratch, &hidden_in, 0).expect("stream");
+
+        let mut unique = std::collections::HashSet::new();
+        for trial in 0..8 {
+            let mut ctx = LayerTestCtx::new(3);
+            ctx.weights
+                .ensure_layer(&ctx.store, &ctx.cfg.text_config, 0, &ctx.engine.ctx.device, &mut ctx.engine.pool)
+                .expect("layer0");
+            let cached = ctx.weights.layer_ref(0);
+            let telemetry = ctx.engine.batch_telemetry();
+            let mut batch = begin_engine_batch(
+                &ctx.engine.ctx.queue,
+                &mut ctx.engine.pool,
+                &ctx.engine.ctx.device,
+                telemetry,
+            )
+            .expect("batch");
+            let buf_stream = batch.alloc_f32(&stream).expect("buf");
+            let mut route_scratch = GpuRouteScratch::new(canvas_len, top_k);
+            route_gpu_in_batch(
+                &mut batch,
+                &ctx.engine.kernels,
+                &ctx.engine.f32_f32_linear_pipeline.pipeline,
+                &buf_stream,
+                &cached,
+                &ctx.cfg.text_config,
+                canvas_len,
+                &mut route_scratch,
+            )
+            .expect("route");
+            batch.end().expect("end");
+            let routes = pack_routes(&route_scratch.indices, &route_scratch.weights, canvas_len, top_k);
+            let tag = routes[1].indices.clone();
+            eprintln!("layer0 route fresh trial {trial}: experts={tag:?}");
+            unique.insert(tag);
+            ctx.weights.release_layer();
+        }
+        assert_eq!(unique.len(), 1, "layer0 route fresh-engine drift: {unique:?}");
+    }
+
+    #[test]
+    fn dgq_layer0_attn_fresh_engine_survey() {
+        if dgq_dir().is_none() {
+            eprintln!("skip: /tmp/quantized-weights missing");
+            return;
+        }
+        let mut unique = std::collections::HashSet::new();
+        for trial in 0..8 {
+            let mut ctx = LayerTestCtx::new(3);
+            let canvas_len = ctx.cfg.canvas_length;
+            let hidden_dim = ctx.cfg.text_config.hidden_size;
+            let mut scratch = GpuDecoderLayerScratch::with_kv_len(
+                canvas_len,
+                &ctx.cfg.text_config,
+                0,
+                ctx.kv.kv_len,
+            )
+            .expect("scratch");
+            ctx.weights
+                .ensure_layer(&ctx.store, &ctx.cfg.text_config, 0, &ctx.engine.ctx.device, &mut ctx.engine.pool)
+                .expect("layer0");
+            let cached = ctx.weights.layer_ref(0);
+            let kv_view = LayerKvView::from_layer(ctx.kv.layer(0).expect("kv"), ctx.kv.kv_len);
+            ctx.engine.set_use_mps_q4(false);
+            let mut out = vec![0.0f32; canvas_len * hidden_dim];
+            forward_decoder_attention(
+                &mut out,
+                &ctx.hidden_in,
+                &cached,
+                &ctx.cfg.text_config,
+                0,
+                canvas_len,
+                &ctx.positions,
+                kv_view,
+                Some(&ctx.mask),
+                &mut scratch.attn,
+                &mut ctx.engine,
+                ctx.dec.gpu_kv.as_ref(),
+                false,
+            )
+            .expect("attn");
+            ctx.weights.release_layer();
+            let tag = out.iter().take(4).map(|v| v.to_bits()).collect::<Vec<_>>();
+            eprintln!("layer0 attn fresh trial {trial}: {tag:?}");
+            unique.insert(tag);
+        }
+        assert_eq!(unique.len(), 1, "layer0 attn fresh-engine drift: {unique:?}");
+    }
+
+    #[test]
+    fn dgq_layer0_fresh_engine_survey() {
+        if dgq_dir().is_none() {
+            eprintln!("skip: /tmp/quantized-weights missing");
+            return;
+        }
+        let mut unique = std::collections::HashSet::new();
+        for trial in 0..8 {
+            let mut ctx = LayerTestCtx::new(3);
+            let canvas_len = ctx.cfg.canvas_length;
+            let mut scratch = GpuDecoderLayerScratch::with_kv_len(
+                canvas_len,
+                &ctx.cfg.text_config,
+                0,
+                ctx.kv.kv_len,
+            )
+            .expect("scratch");
+            let out = ctx.run_layer(0, &ctx.hidden_in.clone(), &mut scratch);
+            let tag = out.iter().take(4).map(|v| v.to_bits()).collect::<Vec<_>>();
+            eprintln!("layer0 fresh trial {trial}: {tag:?}");
+            unique.insert(tag);
+        }
+        assert_eq!(unique.len(), 1, "layer0 fresh-engine drift: {unique:?}");
+    }
+
+    #[test]
+    fn dgq_layer0_repeat_with_clear_only() {
+        if dgq_dir().is_none() {
+            eprintln!("skip: /tmp/quantized-weights missing");
+            return;
+        }
+        let mut ctx = LayerTestCtx::new(2);
+        let canvas_len = ctx.cfg.canvas_length;
+        let hidden_in = ctx.hidden_in.clone();
+        let mut scratch_a = GpuDecoderLayerScratch::with_kv_len(
+            canvas_len,
+            &ctx.cfg.text_config,
+            0,
+            ctx.kv.kv_len,
+        )
+        .expect("scratch_a");
+        let mut scratch_b = GpuDecoderLayerScratch::with_kv_len(
+            canvas_len,
+            &ctx.cfg.text_config,
+            0,
+            ctx.kv.kv_len,
+        )
+        .expect("scratch_b");
+        if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {
+            gpu_kv.clear_canvas_suffix(canvas_len).expect("clear");
+        }
+        let a = ctx.run_layer(0, &hidden_in, &mut scratch_a);
+        if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {
+            gpu_kv.clear_canvas_suffix(canvas_len).expect("clear");
+        }
+        let b = ctx.run_layer(0, &hidden_in, &mut scratch_b);
+        if a != b {
+            let detail = first_f32_diff(&a, &b)
+                .map(|(i, x, y)| format!("idx {i}: {x} vs {y}"))
+                .unwrap_or_default();
+            panic!("layer 0 clear-only repeat drift: {detail}");
+        }
+    }
+
+    #[test]
     fn dgq_layer0_repeatable() {
         if dgq_dir().is_none() {
             eprintln!("skip: /tmp/quantized-weights missing");
@@ -1536,7 +1868,7 @@ mod determinism_tests {
         let mut ctx = LayerTestCtx::new(2);
         let canvas_len = ctx.cfg.canvas_length;
         let hidden_in = ctx.hidden_in.clone();
-        let run_once = |ctx: &mut LayerTestCtx| {
+        let run_once = |ctx: &mut LayerTestCtx, clear_kv: bool| {
             let mut scratch = GpuDecoderLayerScratch::with_kv_len(
                 canvas_len,
                 &ctx.cfg.text_config,
@@ -1544,20 +1876,354 @@ mod determinism_tests {
                 ctx.kv.kv_len,
             )
             .expect("scratch");
-            if let Some(gpu_kv) = ctx.dec.gpu_kv.as_mut() {
-                gpu_kv
-                    .sync_all_from_cpu(&ctx.kv, canvas_len)
-                    .expect("reset gpu kv from prefill");
+            if clear_kv {
+                if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {
+                    gpu_kv
+                        .clear_canvas_suffix(canvas_len)
+                        .expect("clear canvas kv");
+                }
             }
             ctx.run_layer(0, &hidden_in, &mut scratch)
         };
-        let a = run_once(&mut ctx);
-        let b = run_once(&mut ctx);
+        let a = run_once(&mut ctx, false);
+        let b = run_once(&mut ctx, false);
         if a != b {
             let detail = first_f32_diff(&a, &b)
                 .map(|(i, x, y)| format!("idx {i}: {x} vs {y}"))
                 .unwrap_or_default();
-            panic!("layer 0 drift: {detail}");
+            panic!("layer 0 repeat (no clear) drift: {detail}");
+        }
+        let c = run_once(&mut ctx, true);
+        let d = run_once(&mut ctx, true);
+        if c != d {
+            let detail = first_f32_diff(&c, &d)
+                .map(|(i, x, y)| format!("idx {i}: {x} vs {y}"))
+                .unwrap_or_default();
+            panic!("layer 0 repeat (with clear) drift: {detail}");
+        }
+    }
+
+    #[test]
+    fn dgq_layer2_after_full_stack_once() {
+        if dgq_dir().is_none() {
+            eprintln!("skip: /tmp/quantized-weights missing");
+            return;
+        }
+        let mut ctx = LayerTestCtx::new(3);
+        let canvas_len = ctx.cfg.canvas_length;
+        let kv_len = ctx.kv.kv_len;
+        let hidden_in = ctx.hidden_in.clone();
+        let mut s0 = GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 0, kv_len).expect("s0");
+        let mut s1 = GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 1, kv_len).expect("s1");
+        let mut s2 = GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 2, kv_len).expect("s2");
+        let h0 = ctx.run_layer(0, &hidden_in, &mut s0);
+        let h1 = ctx.run_layer(1, &h0, &mut s1);
+        let _ = ctx.run_layer(2, &h1, &mut s2);
+
+        let mut s2a = GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 2, kv_len).expect("s2a");
+        let mut s2b = GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 2, kv_len).expect("s2b");
+        if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {
+            gpu_kv.clear_canvas_suffix(canvas_len).expect("clear kv");
+        }
+        let a = ctx.run_layer(2, &h1, &mut s2a);
+        if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {
+            gpu_kv.clear_canvas_suffix(canvas_len).expect("clear kv");
+        }
+        let b = ctx.run_layer(2, &h1, &mut s2b);
+        if a != b {
+            let detail = first_f32_diff(&a, &b)
+                .map(|(i, x, y)| format!("idx {i}: {x} vs {y}"))
+                .unwrap_or_default();
+            panic!("layer2 after full stack drift: {detail}");
+        }
+    }
+
+    #[test]
+    fn dgq_three_layer_same_engine_twice() {
+        if dgq_dir().is_none() {
+            eprintln!("skip: /tmp/quantized-weights missing");
+            return;
+        }
+        let mut ctx = LayerTestCtx::new(3);
+        let canvas_len = ctx.cfg.canvas_length;
+        let kv_len = ctx.kv.kv_len;
+        let hidden_in = ctx.hidden_in.clone();
+
+        let mut s0a = GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 0, kv_len).expect("s0a");
+        let mut s1a = GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 1, kv_len).expect("s1a");
+        let mut s2a = GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 2, kv_len).expect("s2a");
+        if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {
+            gpu_kv.clear_canvas_suffix(canvas_len).expect("clear kv");
+        }
+        let h0a = ctx.run_layer(0, &hidden_in, &mut s0a);
+        let h1a = ctx.run_layer(1, &h0a, &mut s1a);
+        let a = ctx.run_layer(2, &h1a, &mut s2a);
+
+        let mut s0b = GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 0, kv_len).expect("s0b");
+        let mut s1b = GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 1, kv_len).expect("s1b");
+        let mut s2b = GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 2, kv_len).expect("s2b");
+        if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {
+            gpu_kv.clear_canvas_suffix(canvas_len).expect("clear kv");
+        }
+        let h0b = ctx.run_layer(0, &hidden_in, &mut s0b);
+        let h1b = ctx.run_layer(1, &h0b, &mut s1b);
+        let b = ctx.run_layer(2, &h1b, &mut s2b);
+
+        if a != b {
+            let detail = first_f32_diff(&a, &b)
+                .map(|(i, x, y)| format!("idx {i}: {x} vs {y}"))
+                .unwrap_or_default();
+            panic!("3-layer same-engine repeat drift: {detail}");
+        }
+    }
+
+    #[test]
+    fn dgq_layer2_endogenous_fresh_engine_survey() {
+        if dgq_dir().is_none() {
+            eprintln!("skip: /tmp/quantized-weights missing");
+            return;
+        }
+        let mut unique = std::collections::HashSet::new();
+        for trial in 0..8 {
+            let mut ctx = LayerTestCtx::new(3);
+            let canvas_len = ctx.cfg.canvas_length;
+            let kv_len = ctx.kv.kv_len;
+            let mut scratch0 = GpuDecoderLayerScratch::with_kv_len(
+                canvas_len,
+                &ctx.cfg.text_config,
+                0,
+                kv_len,
+            )
+            .expect("scratch0");
+            let mut scratch1 = GpuDecoderLayerScratch::with_kv_len(
+                canvas_len,
+                &ctx.cfg.text_config,
+                1,
+                kv_len,
+            )
+            .expect("scratch1");
+            let mut scratch2 = GpuDecoderLayerScratch::with_kv_len(
+                canvas_len,
+                &ctx.cfg.text_config,
+                2,
+                kv_len,
+            )
+            .expect("scratch2");
+            let hidden_in = ctx.hidden_in.clone();
+            let h0 = ctx.run_layer(0, &hidden_in, &mut scratch0);
+            let h1 = ctx.run_layer(1, &h0, &mut scratch1);
+            let h2 = ctx.run_layer(2, &h1, &mut scratch2);
+            let nan_n = h2.iter().filter(|v| v.is_nan()).count();
+            let tag = h2.iter().take(4).map(|v| v.to_bits()).collect::<Vec<_>>();
+            eprintln!("endogenous trial {trial}: nan={nan_n} head={tag:?}");
+            unique.insert(tag);
+        }
+        assert_eq!(
+            unique.len(),
+            1,
+            "layer2 endogenous fresh-engine drift: {unique:?}"
+        );
+    }
+
+    #[test]
+    fn dgq_layer2_fresh_engine_survey() {
+        if dgq_dir().is_none() {
+            eprintln!("skip: /tmp/quantized-weights missing");
+            return;
+        }
+        let mut setup = LayerTestCtx::new(3);
+        let canvas_len = setup.cfg.canvas_length;
+        let kv_len = setup.kv.kv_len;
+        let mut scratch0 = GpuDecoderLayerScratch::with_kv_len(
+            canvas_len,
+            &setup.cfg.text_config,
+            0,
+            kv_len,
+        )
+        .expect("scratch0");
+        let mut scratch1 = GpuDecoderLayerScratch::with_kv_len(
+            canvas_len,
+            &setup.cfg.text_config,
+            1,
+            kv_len,
+        )
+        .expect("scratch1");
+        let hidden_in = setup.hidden_in.clone();
+        let h0 = setup.run_layer(0, &hidden_in, &mut scratch0);
+        let h1 = setup.run_layer(1, &h0, &mut scratch1);
+        let h1_fixed = h1.clone();
+        drop(setup);
+
+        let mut unique_hashes = std::collections::HashSet::new();
+        for trial in 0..8 {
+            let mut ctx = LayerTestCtx::new(3);
+            let mut scratch2 = GpuDecoderLayerScratch::with_kv_len(
+                canvas_len,
+                &ctx.cfg.text_config,
+                2,
+                kv_len,
+            )
+            .expect("scratch2");
+            let out = ctx.run_layer(2, &h1_fixed, &mut scratch2);
+            let nan_n = out.iter().filter(|v| v.is_nan()).count();
+            let hash = out.iter().take(16).map(|v| v.to_bits()).collect::<Vec<_>>();
+            eprintln!("layer2 fresh-engine trial {trial}: nan={nan_n} head_bits={hash:?}");
+            unique_hashes.insert(hash);
+        }
+        assert_eq!(
+            unique_hashes.len(),
+            1,
+            "layer 2 drift across fresh engines: {} unique",
+            unique_hashes.len()
+        );
+    }
+
+    #[test]
+    fn dgq_layer2_repeatable_with_fixed_input() {
+        if dgq_dir().is_none() {
+            eprintln!("skip: /tmp/quantized-weights missing");
+            return;
+        }
+        let mut ctx = LayerTestCtx::new(3);
+        let canvas_len = ctx.cfg.canvas_length;
+        let kv_len = ctx.kv.kv_len;
+        let mut scratch0 = GpuDecoderLayerScratch::with_kv_len(
+            canvas_len,
+            &ctx.cfg.text_config,
+            0,
+            kv_len,
+        )
+        .expect("scratch0");
+        let mut scratch1 = GpuDecoderLayerScratch::with_kv_len(
+            canvas_len,
+            &ctx.cfg.text_config,
+            1,
+            kv_len,
+        )
+        .expect("scratch1");
+        let hidden_in = ctx.hidden_in.clone();
+        let h0 = ctx.run_layer(0, &hidden_in, &mut scratch0);
+        let h1 = ctx.run_layer(1, &h0, &mut scratch1);
+        let h1_fixed = h1.clone();
+
+        let mut scratch2a = GpuDecoderLayerScratch::with_kv_len(
+            canvas_len,
+            &ctx.cfg.text_config,
+            2,
+            kv_len,
+        )
+        .expect("scratch2a");
+        let mut scratch2b = GpuDecoderLayerScratch::with_kv_len(
+            canvas_len,
+            &ctx.cfg.text_config,
+            2,
+            kv_len,
+        )
+        .expect("scratch2b");
+        let a = ctx.run_layer(2, &h1_fixed, &mut scratch2a);
+        let b = ctx.run_layer(2, &h1_fixed, &mut scratch2b);
+        if a != b {
+            let detail = first_f32_diff(&a, &b)
+                .map(|(i, x, y)| format!("idx {i}: {x} vs {y}"))
+                .unwrap_or_default();
+            panic!("layer 2 drift with fixed h1: {detail}");
+        }
+    }
+
+    #[test]
+    fn dgq_layer2_attention_repeatable() {
+        if dgq_dir().is_none() {
+            eprintln!("skip: /tmp/quantized-weights missing");
+            return;
+        }
+        let mut ctx = LayerTestCtx::new(3);
+        let canvas_len = ctx.cfg.canvas_length;
+        let kv_len = ctx.kv.kv_len;
+        let hidden_dim = ctx.cfg.text_config.hidden_size;
+        let mut scratch0 = GpuDecoderLayerScratch::with_kv_len(
+            canvas_len,
+            &ctx.cfg.text_config,
+            0,
+            kv_len,
+        )
+        .expect("scratch0");
+        let mut scratch1 = GpuDecoderLayerScratch::with_kv_len(
+            canvas_len,
+            &ctx.cfg.text_config,
+            1,
+            kv_len,
+        )
+        .expect("scratch1");
+        let hidden_in = ctx.hidden_in.clone();
+        let h0 = ctx.run_layer(0, &hidden_in, &mut scratch0);
+        let h1 = ctx.run_layer(1, &h0, &mut scratch1);
+        let h1_fixed = h1.clone();
+        let mut scratch = GpuDecoderLayerScratch::with_kv_len(
+            canvas_len,
+            &ctx.cfg.text_config,
+            2,
+            kv_len,
+        )
+        .expect("scratch");
+        ctx.weights
+            .ensure_layer(&ctx.store, &ctx.cfg.text_config, 2, &ctx.engine.ctx.device, &mut ctx.engine.pool)
+            .expect("layer2");
+        let cached = ctx.weights.layer_ref(2);
+        let kv_view = LayerKvView::from_layer(ctx.kv.layer(2).expect("kv"), kv_len);
+        ctx.engine.set_use_mps_q4(false);
+        if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {
+            gpu_kv.clear_canvas_suffix(canvas_len).expect("clear canvas kv");
+        }
+        let mut a = vec![0.0f32; canvas_len * hidden_dim];
+        let mut b = vec![0.0f32; canvas_len * hidden_dim];
+        forward_decoder_attention(
+            &mut a,
+            &h1_fixed,
+            &cached,
+            &ctx.cfg.text_config,
+            2,
+            canvas_len,
+            &ctx.positions,
+            kv_view,
+            Some(&ctx.mask),
+            &mut scratch.attn,
+            &mut ctx.engine,
+            ctx.dec.gpu_kv.as_ref(),
+            false,
+        )
+        .expect("attn a");
+        let mut scratch_b = GpuDecoderLayerScratch::with_kv_len(
+            canvas_len,
+            &ctx.cfg.text_config,
+            2,
+            kv_len,
+        )
+        .expect("scratch_b");
+        if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {
+            gpu_kv.clear_canvas_suffix(canvas_len).expect("clear canvas kv");
+        }
+        forward_decoder_attention(
+            &mut b,
+            &h1_fixed,
+            &cached,
+            &ctx.cfg.text_config,
+            2,
+            canvas_len,
+            &ctx.positions,
+            kv_view,
+            Some(&ctx.mask),
+            &mut scratch_b.attn,
+            &mut ctx.engine,
+            ctx.dec.gpu_kv.as_ref(),
+            false,
+        )
+        .expect("attn b");
+        ctx.weights.release_layer();
+        if a != b {
+            let detail = first_f32_diff(&a, &b)
+                .map(|(i, x, y)| format!("idx {i}: {x} vs {y}"))
+                .unwrap_or_default();
+            panic!("layer 2 attention drift: {detail}");
         }
     }
 
