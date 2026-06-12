@@ -493,6 +493,7 @@ pub fn generate_gpu(
     {
         engine.set_use_mps_q4(false);
     }
+    engine.pool.clear();
     let mut decoder = DecoderBackend::Gpu {
         store,
         cfg,
@@ -506,35 +507,634 @@ pub fn generate_gpu(
 #[cfg(all(test, feature = "metal", target_os = "macos"))]
 mod gpu_determinism {
     use super::*;
-    use crate::metal::{load_weight_cache, GpuDecoderEngine, GpuDecoderScratch};
+    use crate::metal::{
+        decoder_forward, load_weight_cache, prefill_gpu, GpuDecoderEngine, GpuDecoderScratch,
+    };
+    use crate::model::decoder::DecoderForwardInput;
+    use crate::model::encoder::{EncoderPrefillInput, EncoderScratch};
+    use crate::model::mask::DecoderAttnMask;
+    use crate::sample::{argmax_canvas, initialize_canvas, Rng};
     use crate::weights::WeightStore;
+
+    const DGQ_HELLO_PROMPT: [u32; 1] = [9259];
+    const DGQ_MAX_LAYERS: usize = 3;
+
+    fn dgq_fixture_dir() -> Option<std::path::PathBuf> {
+        let dir = std::path::Path::new("/tmp/quantized-weights");
+        if dir.join("model.dgq.json").exists() {
+            Some(dir.to_path_buf())
+        } else {
+            None
+        }
+    }
+
+    fn hello_gen_cfg() -> GenerateConfig {
+        GenerateConfig {
+            sampler: crate::sample::sampler_for_steps(1, false),
+            max_new_tokens: 256,
+            seed: 42,
+            max_layers: Some(DGQ_MAX_LAYERS),
+            no_early_stop: false,
+            deterministic: true,
+        }
+    }
+
+    fn forward_logits_once(
+        store: &WeightStore,
+        cfg: &ModelConfig,
+        weights: &crate::metal::GpuDecoderWeightCache,
+        engine: &mut GpuDecoderEngine,
+        dec: &mut GpuDecoderScratch,
+        canvas_tokens: &[u32],
+        kv_cache: &KvCache,
+        max_layers: usize,
+    ) -> Result<Vec<f32>, Error> {
+        engine.set_use_mps_q4(false);
+        dec.use_gpu_sampler = false;
+        let canvas = cfg.canvas_length;
+        let vocab = cfg.text_config.vocab_size;
+        let mut logits = vec![0.0f32; canvas * vocab];
+        let mask = DecoderAttnMask::all_valid(canvas, kv_cache.kv_len);
+        let mut input = DecoderForwardInput {
+            token_ids: canvas_tokens,
+            kv_cache,
+            self_conditioning_logits: None,
+            mask: Some(&mask),
+            logits_out: Some(&mut logits),
+            compute_logits: true,
+            return_hidden: false,
+        };
+        decoder_forward(
+            store,
+            cfg,
+            &mut input,
+            dec,
+            weights,
+            engine,
+            Some(max_layers),
+        )?;
+        Ok(logits)
+    }
+
+    fn prefill_and_canvas(
+        store: &WeightStore,
+        cfg: &ModelConfig,
+        weights: &mut crate::metal::GpuDecoderWeightCache,
+        engine: &mut GpuDecoderEngine,
+        enc: &mut EncoderScratch,
+        dec: &mut GpuDecoderScratch,
+        max_kv: usize,
+    ) -> Result<(KvCache, Vec<u32>), Error> {
+        let canvas = cfg.canvas_length;
+        let vocab = cfg.text_config.vocab_size;
+        let input = EncoderPrefillInput {
+            token_ids: &DGQ_HELLO_PROMPT,
+            position_offset: 0,
+        };
+        engine.set_use_mps_q4(false);
+        dec.use_gpu_sampler = false;
+        let kv = prefill_gpu(
+            store,
+            cfg,
+            &input,
+            enc,
+            dec,
+            weights,
+            engine,
+            max_kv,
+            canvas,
+            Some(DGQ_MAX_LAYERS),
+        )?;
+        let mut rng = Rng::new(42);
+        let canvas_tokens = initialize_canvas(canvas, vocab, &mut rng);
+        Ok((kv, canvas_tokens))
+    }
+
+    fn first_logit_diff(a: &[f32], b: &[f32]) -> Option<(usize, f32, f32)> {
+        a.iter()
+            .zip(b.iter())
+            .enumerate()
+            .find_map(|(i, (&x, &y))| if x.to_bits() != y.to_bits() { Some((i, x, y)) } else { None })
+    }
+
+    /// Same KV + canvas: two decoder forwards back-to-back must match bit-for-bit.
+    #[test]
+    #[ignore = "second decoder forward on same gpu_kv still drifts until layer 1 fixed"]
+    fn dgq_forward_logits_same_inputs_twice() {
+        let Some(dgq_dir) = dgq_fixture_dir() else {
+            eprintln!("skip: /tmp/quantized-weights missing");
+            return;
+        };
+        let store = WeightStore::open(&dgq_dir).expect("open");
+        let cfg = crate::config::ModelConfig::load(&dgq_dir).expect("cfg");
+        let canvas = cfg.canvas_length;
+        let max_kv = DGQ_HELLO_PROMPT.len() + 256;
+
+        let mut weights = load_weight_cache(&store, &cfg.text_config, canvas, max_kv).expect("cache");
+        let mut engine = GpuDecoderEngine::new().expect("engine");
+        let mut enc = EncoderScratch::new(canvas.max(1), &cfg);
+        let mut dec = GpuDecoderScratch::new(canvas, &cfg);
+        let (kv, canvas_tokens) =
+            prefill_and_canvas(&store, &cfg, &mut weights, &mut engine, &mut enc, &mut dec, max_kv)
+                .expect("prefill");
+
+        let a = forward_logits_once(
+            &store,
+            &cfg,
+            &weights,
+            &mut engine,
+            &mut dec,
+            &canvas_tokens,
+            &kv,
+            DGQ_MAX_LAYERS,
+        )
+        .expect("forward a");
+        let b = forward_logits_once(
+            &store,
+            &cfg,
+            &weights,
+            &mut engine,
+            &mut dec,
+            &canvas_tokens,
+            &kv,
+            DGQ_MAX_LAYERS,
+        )
+        .expect("forward b");
+        if a != b {
+            if let Some((idx, x, y)) = first_logit_diff(&a, &b) {
+                panic!("forward drift on repeat: flat idx {idx}: {x} vs {y}");
+            }
+        }
+    }
+
+    /// Isolate engine pool: second forward uses a fresh engine (same dec/kv/canvas).
+    #[test]
+    #[ignore = "see dgq_forward_logits_same_inputs_twice"]
+    fn dgq_forward_logits_fresh_engine_second_pass() {
+        let Some(dgq_dir) = dgq_fixture_dir() else {
+            eprintln!("skip: /tmp/quantized-weights missing");
+            return;
+        };
+        let store = WeightStore::open(&dgq_dir).expect("open");
+        let cfg = crate::config::ModelConfig::load(&dgq_dir).expect("cfg");
+        let canvas = cfg.canvas_length;
+        let max_kv = DGQ_HELLO_PROMPT.len() + 256;
+
+        let mut weights = load_weight_cache(&store, &cfg.text_config, canvas, max_kv).expect("cache");
+        let mut engine_a = GpuDecoderEngine::new().expect("engine a");
+        let mut enc = EncoderScratch::new(canvas.max(1), &cfg);
+        let mut dec = GpuDecoderScratch::new(canvas, &cfg);
+        let (kv, canvas_tokens) = prefill_and_canvas(
+            &store,
+            &cfg,
+            &mut weights,
+            &mut engine_a,
+            &mut enc,
+            &mut dec,
+            max_kv,
+        )
+        .expect("prefill");
+
+        let a = forward_logits_once(
+            &store,
+            &cfg,
+            &weights,
+            &mut engine_a,
+            &mut dec,
+            &canvas_tokens,
+            &kv,
+            DGQ_MAX_LAYERS,
+        )
+        .expect("forward a");
+
+        let mut engine_b = GpuDecoderEngine::new().expect("engine b");
+        let b = forward_logits_once(
+            &store,
+            &cfg,
+            &weights,
+            &mut engine_b,
+            &mut dec,
+            &canvas_tokens,
+            &kv,
+            DGQ_MAX_LAYERS,
+        )
+        .expect("forward b");
+
+        if a != b {
+            if let Some((idx, x, y)) = first_logit_diff(&a, &b) {
+                panic!("forward drift with fresh engine: flat idx {idx}: {x} vs {y}");
+            }
+        }
+    }
+
+    /// Second pass repeats prefill (fresh gpu_kv) — if this passes, gpu_kv canvas corruption is the bug.
+    #[test]
+    #[ignore = "see dgq_forward_logits_same_inputs_twice"]
+    fn dgq_forward_logits_fresh_prefill_second_pass() {
+        let Some(dgq_dir) = dgq_fixture_dir() else {
+            eprintln!("skip: /tmp/quantized-weights missing");
+            return;
+        };
+        let store = WeightStore::open(&dgq_dir).expect("open");
+        let cfg = crate::config::ModelConfig::load(&dgq_dir).expect("cfg");
+        let canvas = cfg.canvas_length;
+        let max_kv = DGQ_HELLO_PROMPT.len() + 256;
+
+        let mut weights = load_weight_cache(&store, &cfg.text_config, canvas, max_kv).expect("cache");
+
+        let mut engine = GpuDecoderEngine::new().expect("engine");
+        let mut enc = EncoderScratch::new(canvas.max(1), &cfg);
+        let mut dec = GpuDecoderScratch::new(canvas, &cfg);
+        let (kv, canvas_tokens) =
+            prefill_and_canvas(&store, &cfg, &mut weights, &mut engine, &mut enc, &mut dec, max_kv)
+                .expect("prefill a");
+        let a = forward_logits_once(
+            &store,
+            &cfg,
+            &weights,
+            &mut engine,
+            &mut dec,
+            &canvas_tokens,
+            &kv,
+            DGQ_MAX_LAYERS,
+        )
+        .expect("forward a");
+
+        let mut enc = EncoderScratch::new(canvas.max(1), &cfg);
+        let mut dec = GpuDecoderScratch::new(canvas, &cfg);
+        let (kv, canvas_tokens) =
+            prefill_and_canvas(&store, &cfg, &mut weights, &mut engine, &mut enc, &mut dec, max_kv)
+                .expect("prefill b");
+        let b = forward_logits_once(
+            &store,
+            &cfg,
+            &weights,
+            &mut engine,
+            &mut dec,
+            &canvas_tokens,
+            &kv,
+            DGQ_MAX_LAYERS,
+        )
+        .expect("forward b");
+
+        if a != b {
+            if let Some((idx, x, y)) = first_logit_diff(&a, &b) {
+                panic!("forward drift with fresh prefill: flat idx {idx}: {x} vs {y}");
+            }
+        }
+    }
+
+    /// Fully isolated second chain (fresh weights + engine + scratch).
+    #[test]
+    #[ignore = "3-layer forward drift; regen goldens after fix"]
+    fn dgq_forward_logits_fully_isolated_chains() {
+        let Some(dgq_dir) = dgq_fixture_dir() else {
+            eprintln!("skip: /tmp/quantized-weights missing");
+            return;
+        };
+        let store = WeightStore::open(&dgq_dir).expect("open");
+        let cfg = crate::config::ModelConfig::load(&dgq_dir).expect("cfg");
+        let canvas = cfg.canvas_length;
+        let max_kv = DGQ_HELLO_PROMPT.len() + 256;
+
+        let run_chain = || -> Vec<f32> {
+            let mut weights =
+                load_weight_cache(&store, &cfg.text_config, canvas, max_kv).expect("cache");
+            let mut engine = GpuDecoderEngine::new().expect("engine");
+            let mut enc = EncoderScratch::new(canvas.max(1), &cfg);
+            let mut dec = GpuDecoderScratch::new(canvas, &cfg);
+            let (kv, canvas_tokens) = prefill_and_canvas(
+                &store,
+                &cfg,
+                &mut weights,
+                &mut engine,
+                &mut enc,
+                &mut dec,
+                max_kv,
+            )
+            .expect("prefill");
+            forward_logits_once(
+                &store,
+                &cfg,
+                &weights,
+                &mut engine,
+                &mut dec,
+                &canvas_tokens,
+                &kv,
+                DGQ_MAX_LAYERS,
+            )
+            .expect("forward")
+        };
+
+        let a = run_chain();
+        let b = run_chain();
+        if a != b {
+            if let Some((idx, x, y)) = first_logit_diff(&a, &b) {
+                panic!("forward drift isolated chains: flat idx {idx}: {x} vs {y}");
+            }
+        }
+    }
+
+    fn drift_survey_layers(layers: usize, trials: usize) -> std::collections::HashSet<u32> {
+        let dgq_dir = dgq_fixture_dir().expect("dgq dir");
+        let store = WeightStore::open(&dgq_dir).expect("open");
+        let cfg = crate::config::ModelConfig::load(&dgq_dir).expect("cfg");
+        let canvas = cfg.canvas_length;
+        let vocab = cfg.text_config.vocab_size;
+        let max_kv = DGQ_HELLO_PROMPT.len() + 256;
+        let mut argmax_samples = std::collections::HashSet::new();
+        for trial in 0..trials {
+            let mut weights =
+                load_weight_cache(&store, &cfg.text_config, canvas, max_kv).expect("cache");
+            let mut engine = GpuDecoderEngine::new().expect("engine");
+            let mut enc = EncoderScratch::new(canvas.max(1), &cfg);
+            let mut dec = GpuDecoderScratch::new(canvas, &cfg);
+            engine.set_use_mps_q4(false);
+            dec.use_gpu_sampler = false;
+            let input = EncoderPrefillInput {
+                token_ids: &DGQ_HELLO_PROMPT,
+                position_offset: 0,
+            };
+            let kv = prefill_gpu(
+                &store,
+                &cfg,
+                &input,
+                &mut enc,
+                &mut dec,
+                &mut weights,
+                &mut engine,
+                max_kv,
+                canvas,
+                Some(layers),
+            )
+            .expect("prefill");
+            let mut rng = Rng::new(42);
+            let canvas_tokens = initialize_canvas(canvas, vocab, &mut rng);
+            let logits = forward_logits_once(
+                &store,
+                &cfg,
+                &weights,
+                &mut engine,
+                &mut dec,
+                &canvas_tokens,
+                &kv,
+                layers,
+            )
+            .expect("forward");
+            let nan_n = logits.iter().filter(|v| v.is_nan()).count();
+            let argmax = argmax_canvas(&logits, canvas, vocab);
+            eprintln!(
+                "{layers}-layer trial {trial}: nan={nan_n} pos1_argmax={} logit0={}",
+                argmax[1],
+                logits[0]
+            );
+            argmax_samples.insert(argmax[1]);
+        }
+        argmax_samples
+    }
+
+    #[test]
+    #[ignore = "bisect helper; layer 1 decoder still drifts"]
+    fn dgq_drift_prefill_vs_decoder_layers() {
+        if dgq_fixture_dir().is_none() {
+            eprintln!("skip: /tmp/quantized-weights missing");
+            return;
+        }
+        let dgq_dir = dgq_fixture_dir().unwrap();
+        let store = WeightStore::open(&dgq_dir).expect("open");
+        let cfg = crate::config::ModelConfig::load(&dgq_dir).expect("cfg");
+        let canvas = cfg.canvas_length;
+        let vocab = cfg.text_config.vocab_size;
+        let max_kv = DGQ_HELLO_PROMPT.len() + 256;
+
+        let run = |prefill_layers: usize, decoder_layers: usize| -> u32 {
+            let mut weights =
+                load_weight_cache(&store, &cfg.text_config, canvas, max_kv).expect("cache");
+            let mut engine = GpuDecoderEngine::new().expect("engine");
+            let mut enc = EncoderScratch::new(canvas.max(1), &cfg);
+            let mut dec = GpuDecoderScratch::new(canvas, &cfg);
+            engine.set_use_mps_q4(false);
+            dec.use_gpu_sampler = false;
+            let input = EncoderPrefillInput {
+                token_ids: &DGQ_HELLO_PROMPT,
+                position_offset: 0,
+            };
+            let kv = prefill_gpu(
+                &store,
+                &cfg,
+                &input,
+                &mut enc,
+                &mut dec,
+                &mut weights,
+                &mut engine,
+                max_kv,
+                canvas,
+                Some(prefill_layers),
+            )
+            .expect("prefill");
+            let mut rng = Rng::new(42);
+            let canvas_tokens = initialize_canvas(canvas, vocab, &mut rng);
+            let logits = forward_logits_once(
+                &store,
+                &cfg,
+                &weights,
+                &mut engine,
+                &mut dec,
+                &canvas_tokens,
+                &kv,
+                decoder_layers,
+            )
+            .expect("forward");
+            argmax_canvas(&logits, canvas, vocab)[1]
+        };
+
+        let mut a = std::collections::HashSet::new();
+        let mut b = std::collections::HashSet::new();
+        let mut c = std::collections::HashSet::new();
+        for _ in 0..8 {
+            a.insert(run(1, 1));
+            b.insert(run(2, 1));
+            c.insert(run(2, 2));
+        }
+        eprintln!("prefill1/dec1 unique={} prefill2/dec1 unique={} prefill2/dec2 unique={}", a.len(), b.len(), c.len());
+        assert_eq!(a.len(), 1, "1/1 drift");
+        assert_eq!(b.len(), 1, "2/1 drift (prefill layer1 poisons kv?)");
+        assert_eq!(c.len(), 1, "2/2 drift");
+    }
+
+    #[test]
+    #[ignore = "layer 2 stack still drifts; see PLAN2 Q3"]
+    fn dgq_drift_survey_two_layers() {
+        if dgq_fixture_dir().is_none() {
+            eprintln!("skip: /tmp/quantized-weights missing");
+            return;
+        }
+        let unique = drift_survey_layers(2, 8);
+        eprintln!("2-layer unique pos1 argmax: {}", unique.len());
+        assert_eq!(unique.len(), 1, "2-layer drift: {unique:?}");
+    }
+
+    #[test]
+    fn dgq_drift_survey_one_layer() {
+        if dgq_fixture_dir().is_none() {
+            eprintln!("skip: /tmp/quantized-weights missing");
+            return;
+        }
+        let unique = drift_survey_layers(1, 8);
+        eprintln!("1-layer unique pos1 argmax: {}", unique.len());
+        assert_eq!(unique.len(), 1, "1-layer drift: {unique:?}");
+    }
+
+    #[test]
+    #[ignore = "3-layer stack drift survey; see PLAN2 Q3"]
+    fn dgq_drift_survey() {
+        let Some(dgq_dir) = dgq_fixture_dir() else {
+            eprintln!("skip: /tmp/quantized-weights missing");
+            return;
+        };
+        let store = WeightStore::open(&dgq_dir).expect("open");
+        let cfg = crate::config::ModelConfig::load(&dgq_dir).expect("cfg");
+        let canvas = cfg.canvas_length;
+        let vocab = cfg.text_config.vocab_size;
+        let max_kv = DGQ_HELLO_PROMPT.len() + 256;
+
+        let mut argmax_samples = Vec::new();
+        for trial in 0..8 {
+            let mut weights =
+                load_weight_cache(&store, &cfg.text_config, canvas, max_kv).expect("cache");
+            let mut engine = GpuDecoderEngine::new().expect("engine");
+            let mut enc = EncoderScratch::new(canvas.max(1), &cfg);
+            let mut dec = GpuDecoderScratch::new(canvas, &cfg);
+            let (kv, canvas_tokens) = prefill_and_canvas(
+                &store,
+                &cfg,
+                &mut weights,
+                &mut engine,
+                &mut enc,
+                &mut dec,
+                max_kv,
+            )
+            .expect("prefill");
+            let logits = forward_logits_once(
+                &store,
+                &cfg,
+                &weights,
+                &mut engine,
+                &mut dec,
+                &canvas_tokens,
+                &kv,
+                DGQ_MAX_LAYERS,
+            )
+            .expect("forward");
+            let nan_n = logits.iter().filter(|v| v.is_nan()).count();
+            let argmax = argmax_canvas(&logits, canvas, vocab);
+            eprintln!(
+                "trial {trial}: nan={nan_n} canvas[0..3]={:?} pos1_argmax={} logit0={}",
+                &canvas_tokens[0..3],
+                argmax[1],
+                logits[0]
+            );
+            argmax_samples.push(argmax[1]);
+        }
+        let unique: std::collections::HashSet<_> = argmax_samples.iter().copied().collect();
+        eprintln!("unique pos1 argmax values in 8 trials: {}", unique.len());
+        assert_eq!(
+            unique.len(),
+            1,
+            "expected deterministic pos1 argmax, got {unique:?}"
+        );
+    }
+
+    /// Full prefill + forward repeated in-process (reused engine pool).
+    #[test]
+    #[ignore = "3-layer forward drift; regen goldens after fix"]
+    fn dgq_forward_logits_repeatable_with_reused_engine() {
+        let Some(dgq_dir) = dgq_fixture_dir() else {
+            eprintln!("skip: /tmp/quantized-weights missing");
+            return;
+        };
+        let store = WeightStore::open(&dgq_dir).expect("open");
+        let cfg = crate::config::ModelConfig::load(&dgq_dir).expect("cfg");
+        let canvas = cfg.canvas_length;
+        let vocab = cfg.text_config.vocab_size;
+        let max_kv = DGQ_HELLO_PROMPT.len() + 256;
+
+        let mut weights = load_weight_cache(&store, &cfg.text_config, canvas, max_kv).expect("cache");
+        let mut engine = GpuDecoderEngine::new().expect("engine");
+
+        let mut enc = EncoderScratch::new(canvas.max(1), &cfg);
+        let mut dec = GpuDecoderScratch::new(canvas, &cfg);
+        let (kv, canvas_tokens) =
+            prefill_and_canvas(&store, &cfg, &mut weights, &mut engine, &mut enc, &mut dec, max_kv)
+                .expect("prefill baseline");
+        let baseline = forward_logits_once(
+            &store,
+            &cfg,
+            &weights,
+            &mut engine,
+            &mut dec,
+            &canvas_tokens,
+            &kv,
+            DGQ_MAX_LAYERS,
+        )
+        .expect("baseline forward");
+        let argmax1 = argmax_canvas(&baseline, canvas, vocab)[1];
+
+        for trial in 1..=20 {
+            let mut enc = EncoderScratch::new(canvas.max(1), &cfg);
+            let mut dec = GpuDecoderScratch::new(canvas, &cfg);
+            let (kv_t, canvas_t) = prefill_and_canvas(
+                &store,
+                &cfg,
+                &mut weights,
+                &mut engine,
+                &mut enc,
+                &mut dec,
+                max_kv,
+            )
+            .expect("prefill");
+            assert_eq!(canvas_t, canvas_tokens, "canvas init drift at trial {trial}");
+            let logits = forward_logits_once(
+                &store,
+                &cfg,
+                &weights,
+                &mut engine,
+                &mut dec,
+                &canvas_t,
+                &kv_t,
+                DGQ_MAX_LAYERS,
+            )
+            .expect("forward");
+            if logits != baseline {
+                let argmax_t = argmax_canvas(&logits, canvas, vocab)[1];
+                let detail = first_logit_diff(&baseline, &logits)
+                    .map(|(i, x, y)| format!("flat idx {i}: {x} vs {y}"))
+                    .unwrap_or_default();
+                panic!(
+                    "forward drift trial {trial}: pos1 argmax {argmax1} vs {argmax_t}; {detail}"
+                );
+            }
+        }
+    }
 
     /// Native Q4 + CPU sampler should be repeatable; tracked in Q3 (currently flaky on some runs).
     #[test]
     #[ignore = "native Q4 forward still shows occasional run-to-run token drift; see PLAN2 Q3"]
     fn dgq_generate_stable_deterministic_mode() {
-        let dgq_dir = std::path::Path::new("/tmp/quantized-weights");
-        if !dgq_dir.join("model.dgq.json").exists() {
+        let Some(dgq_dir) = dgq_fixture_dir() else {
             eprintln!("skip: /tmp/quantized-weights missing");
             return;
-        }
-        let store = WeightStore::open(dgq_dir).expect("open");
-        let cfg = crate::config::ModelConfig::load(dgq_dir).expect("cfg");
-        let prompt = vec![9259u32];
-        let gen_cfg = GenerateConfig {
-            sampler: crate::sample::sampler_for_steps(1, false),
-            max_new_tokens: 256,
-            seed: 42,
-            max_layers: Some(3),
-            no_early_stop: false,
-            deterministic: true,
         };
+        let store = WeightStore::open(&dgq_dir).expect("open");
+        let cfg = crate::config::ModelConfig::load(&dgq_dir).expect("cfg");
+        let prompt = DGQ_HELLO_PROMPT.to_vec();
+        let gen_cfg = hello_gen_cfg();
         let canvas = cfg.canvas_length;
         let max_kv = prompt.len() + gen_cfg.max_new_tokens;
 
         let mut weights = load_weight_cache(&store, &cfg.text_config, canvas, max_kv).expect("cache");
         let mut engine = GpuDecoderEngine::new().expect("engine");
-        let mut enc = crate::model::encoder::EncoderScratch::new(prompt.len().max(canvas), &cfg);
+        let mut enc = EncoderScratch::new(prompt.len().max(canvas), &cfg);
         let mut dec = GpuDecoderScratch::new(canvas, &cfg);
         let out_a = generate_gpu(
             &store,
@@ -547,7 +1147,7 @@ mod gpu_determinism {
             &mut engine,
         )
         .expect("generate a");
-        let mut enc = crate::model::encoder::EncoderScratch::new(prompt.len().max(canvas), &cfg);
+        let mut enc = EncoderScratch::new(prompt.len().max(canvas), &cfg);
         let mut dec = GpuDecoderScratch::new(canvas, &cfg);
         let mut engine = GpuDecoderEngine::new().expect("engine");
         let out_b = generate_gpu(
@@ -561,7 +1161,18 @@ mod gpu_determinism {
             &mut engine,
         )
         .expect("generate b");
-        assert_eq!(out_a.token_ids, out_b.token_ids);
+        if out_a.token_ids != out_b.token_ids {
+            let idx = out_a
+                .token_ids
+                .iter()
+                .zip(out_b.token_ids.iter())
+                .position(|(a, b)| a != b);
+            panic!(
+                "token drift at index {idx:?}: a={:?} b={:?}",
+                out_a.token_ids.get(1),
+                out_b.token_ids.get(1)
+            );
+        }
     }
 }
 

@@ -47,12 +47,11 @@ fn example_layer(text: &TextConfig, kind: LayerType) -> usize {
         .unwrap_or(0)
 }
 
-/// Two layer scratches (sliding vs full attention shapes) reused across the stack.
+/// Per-layer decoder scratch (do not share MoE/route arenas across layers).
 struct LayerScratchReuse {
     seq_len: usize,
     kv_len: usize,
-    sliding: Option<GpuDecoderLayerScratch>,
-    full: Option<GpuDecoderLayerScratch>,
+    layers: Vec<Option<GpuDecoderLayerScratch>>,
 }
 
 impl LayerScratchReuse {
@@ -64,27 +63,25 @@ impl LayerScratchReuse {
         layer: usize,
     ) -> Result<&mut GpuDecoderLayerScratch, Error> {
         if self.seq_len != seq_len || self.kv_len != kv_len {
-            self.sliding = None;
-            self.full = None;
+            self.layers.clear();
             self.seq_len = seq_len;
             self.kv_len = kv_len;
         }
-        let text = &cfg.text_config;
-        let kind = text
-            .layer_types
-            .get(layer)
-            .ok_or(Error::Format("invalid layer"))?;
-        let slot = match kind {
-            LayerType::SlidingAttention => &mut self.sliding,
-            LayerType::FullAttention => &mut self.full,
-        };
-        if slot.is_none() {
+        if self.layers.len() <= layer {
+            self.layers.resize_with(layer + 1, || None);
+        }
+        if self.layers[layer].is_none() {
+            let text = &cfg.text_config;
+            let kind = text
+                .layer_types
+                .get(layer)
+                .ok_or(Error::Format("invalid layer"))?;
             let example = example_layer(text, *kind);
-            *slot = Some(GpuDecoderLayerScratch::with_kv_len(
+            self.layers[layer] = Some(GpuDecoderLayerScratch::with_kv_len(
                 seq_len, text, example, kv_len,
             )?);
         }
-        Ok(slot.as_mut().expect("layer scratch"))
+        Ok(self.layers[layer].as_mut().expect("layer scratch"))
     }
 }
 
@@ -112,8 +109,7 @@ impl GpuDecoderScratch {
             layer: LayerScratchReuse {
                 seq_len: 0,
                 kv_len: 0,
-                sliding: None,
-                full: None,
+                layers: Vec::new(),
             },
         }
     }

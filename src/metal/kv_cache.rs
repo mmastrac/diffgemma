@@ -41,6 +41,8 @@ impl GpuKvCache {
             let values = device
                 .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
                 .ok_or(Error::Format("GPU kv values alloc failed"))?;
+            zero_buffer(&keys);
+            zero_buffer(&values);
             layers.push(GpuKvLayer {
                 keys,
                 values,
@@ -140,6 +142,13 @@ impl GpuKvCache {
             .get(layer)
             .ok_or(Error::Format("missing gpu kv layer"))?;
         Ok((gpu.keys.clone(), gpu.values.clone()))
+    }
+}
+
+fn zero_buffer(buf: &ProtocolObject<dyn MTLBuffer>) {
+    let len = buf.length();
+    unsafe {
+        std::ptr::write_bytes(buf.contents().as_ptr() as *mut u8, 0, len);
     }
 }
 

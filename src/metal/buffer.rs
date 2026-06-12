@@ -17,11 +17,23 @@ impl BufferPool {
         device: &ProtocolObject<dyn MTLDevice>,
         size: usize,
     ) -> Option<Retained<ProtocolObject<dyn MTLBuffer>>> {
-        if let Some(idx) = self.free.iter().position(|(cap, _)| *cap >= size) {
+        let buf = if let Some(idx) = self.free.iter().position(|(cap, _)| *cap >= size) {
             let (_, buf) = self.free.swap_remove(idx);
-            return Some(buf);
+            buf
+        } else {
+            device.newBufferWithLength_options(size, MTLResourceOptions::StorageModeShared)?
+        };
+        // Fresh and pooled buffers may hold stale bytes; zero so partial writes cannot leak.
+        let len = buf.length();
+        unsafe {
+            std::ptr::write_bytes(buf.contents().as_ptr() as *mut u8, 0, len);
         }
-        device.newBufferWithLength_options(size, MTLResourceOptions::StorageModeShared)
+        Some(buf)
+    }
+
+    /// Drop all pooled buffers (e.g. at generate start for deterministic reuse).
+    pub fn clear(&mut self) {
+        self.free.clear();
     }
 
     pub fn release(&mut self, capacity: usize, buffer: Retained<ProtocolObject<dyn MTLBuffer>>) {

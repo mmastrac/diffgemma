@@ -178,8 +178,10 @@ Once weights are resident and kernels are sane, the per-step serial CPU work bec
 
 **Nondeterminism (2026-06 investigation):**
 - **Primary cause:** `MPSMatrixMultiplication` on `.dgq` dense Q4 linears (attention + FF gate/up/down). Same seed can change tokens at canvas index ≥1 between runs when MPS is on. **Fix:** `GpuDecoderEngine.use_mps_q4` (default **on** via `DGQ_MPS_Q4=1` for bench; **off** for `generate-parity` / `deterministic:true`).
-- **Secondary:** With MPS off + CPU sampler, occasional run-to-run token drift remains (~20% of back-to-back `cargo run` parity checks on M3 Pro). Suspects: pooled output buffers (now zeroed in `alloc_f32_out`), GPU MoE grouped `simd_sum`, or fp32 threshold effects in categorical sample. Tracked; golden regen deferred until stable.
-- **Historical:** Old goldens encoded NaN logits (odd-layer hidden buf bug) → CPU argmax → mask token 262143. Invalid; do not preserve.
+- **NaN logits (fixed 2026-06):** Fresh/reused `BufferPool` `MTLBuffer`s were not zeroed → partial kernel coverage leaked stale bytes → full-tensor NaN after lm_head (~67M elements, argmax → mask 262143). **Fix:** zero every buffer in `BufferPool::allocate`; zero `GpuKvCache` keys/values at creation; `engine.pool.clear()` at `generate_gpu` start.
+- **Secondary drift (open):** With MPS off + native Q4, bisect shows **decoder layer index 1+** is flaky (1-layer prefill+forward bit-stable; 2-layer stack drifts / occasional NaN). Layer 0 decoder OK; not prefill-KV poisoning. Suspects: grouped MoE Q4 (`f32_q4_linear_grouped`), mid-batch route readback, or layer-1 attention+sliding GQA. Per-layer GPU scratch (no longer sharing sliding slot across layers) landed but did not fully gate. Golden regen still deferred.
+- **Tests:** `dgq_drift_survey_one_layer` (passes); `dgq_generate_stable_deterministic_mode` + multi-layer forward surveys (`#[ignore]` until stable).
+- **Historical:** Old goldens encoded NaN logits (odd-layer hidden buf bug + pool staleness) → CPU argmax → mask token 262143. Invalid; do not preserve.
 
 **Measured (M3 Pro, full GPU sampler):** sampler readback **~3 KB/step** (256×4×3); forward readback still ~109 MiB/step (MoE/router). `bench-step` re-bench pending with MPS default.
 
