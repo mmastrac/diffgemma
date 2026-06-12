@@ -19,6 +19,7 @@ mod kv_cache;
 mod memory;
 mod moe;
 mod probe;
+mod bench_gemm;
 mod telemetry;
 mod weights;
 
@@ -37,4 +38,5 @@ pub use kv_cache::GpuKvCache;
 pub use engine::GpuDecoderEngine;
 pub use gemm::{bf16_matmul_cpu, f32_to_bf16, Bf16Gemm};
 pub use probe::{print_probe_result, probe_device, DeviceProbeResult};
+pub use bench_gemm::{bench_custom_kernel, bench_mps_oracle, parse_shapes, print_bench_rows};
 pub use telemetry::{ForwardTelemetry, SessionTelemetry, StepPhaseTelemetry};

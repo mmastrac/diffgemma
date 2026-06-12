@@ -178,6 +178,81 @@ impl Bf16Gemm {
         Ok(())
     }
 
+    /// Dispatch only — buffers must already hold A/W/C on device (no upload/readback/sync wrapper).
+    pub fn dispatch_f32_bf16_linear(
+        &self,
+        buf_a: &ProtocolObject<dyn MTLBuffer>,
+        buf_w: &ProtocolObject<dyn MTLBuffer>,
+        buf_c: &ProtocolObject<dyn MTLBuffer>,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<(), Error> {
+        let cmd_buf = self
+            .ctx
+            .queue
+            .commandBuffer()
+            .ok_or(Error::Format("Metal command buffer alloc failed"))?;
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .ok_or(Error::Format("Metal compute encoder alloc failed"))?;
+        encode_gemm(
+            &encoder,
+            &self.f32_bf16_linear_pipeline.pipeline,
+            buf_a,
+            buf_w,
+            buf_c,
+            m,
+            n,
+            k,
+        );
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+        Ok(())
+    }
+
+    /// Multiple dispatches in one command buffer, single sync (closer to fused decoder step).
+    pub fn dispatch_f32_bf16_linear_batched(
+        &self,
+        buf_a: &ProtocolObject<dyn MTLBuffer>,
+        buf_w: &ProtocolObject<dyn MTLBuffer>,
+        buf_c: &ProtocolObject<dyn MTLBuffer>,
+        m: usize,
+        k: usize,
+        n: usize,
+        count: usize,
+    ) -> Result<(), Error> {
+        let cmd_buf = self
+            .ctx
+            .queue
+            .commandBuffer()
+            .ok_or(Error::Format("Metal command buffer alloc failed"))?;
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .ok_or(Error::Format("Metal compute encoder alloc failed"))?;
+        for _ in 0..count {
+            encode_gemm(
+                &encoder,
+                &self.f32_bf16_linear_pipeline.pipeline,
+                buf_a,
+                buf_w,
+                buf_c,
+                m,
+                n,
+                k,
+            );
+        }
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+        Ok(())
+    }
+
+    pub fn f32_bf16_linear_pipeline(&self) -> &ComputePipeline {
+        &self.f32_bf16_linear_pipeline
+    }
+
     pub fn matmul_f32_bf16(
         &mut self,
         a: &[f32],

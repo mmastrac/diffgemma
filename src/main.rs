@@ -87,6 +87,11 @@ enum Command {
         seed: u64,
     },
     ProbeDevice,
+    BenchGemm {
+        shapes: String,
+        oracle: Option<String>,
+        iters: usize,
+    },
     Quantize {
         output: PathBuf,
         profile: String,
@@ -104,6 +109,7 @@ fn main() -> ExitCode {
         Command::Tokenize(text) => run_tokenize(&cli.model_dir, &text),
         Command::Gemm { size } => run_gemm(size),
         Command::ProbeDevice => run_probe_device(),
+        Command::BenchGemm { shapes, oracle, iters } => run_bench_gemm(&shapes, oracle.as_deref(), iters),
         command => {
             eprintln!("loading from {}", cli.model_dir.display());
             match model::Model::open(&cli.model_dir) {
@@ -232,6 +238,7 @@ fn run_command(m: &model::Model, model_dir: &std::path::Path, command: Command) 
         Command::ProbeDevice { .. } => ExitCode::FAILURE,
         Command::ConvertModel { .. } => ExitCode::FAILURE,
         Command::Quantize { .. } => ExitCode::FAILURE,
+        Command::BenchGemm { .. } => ExitCode::FAILURE,
     }
 }
 
@@ -307,6 +314,41 @@ fn run_probe_device() -> ExitCode {
     ExitCode::FAILURE
 }
 
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn run_bench_gemm(shapes: &str, oracle: Option<&str>, iters: usize) -> ExitCode {
+    use metal::{bench_custom_kernel, bench_mps_oracle, parse_shapes, print_bench_rows};
+    let parsed = match parse_shapes(shapes) {
+        Ok(s) => s,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut rows = match bench_custom_kernel(&parsed, iters) {
+        Ok(r) => r,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if oracle == Some("mps") {
+        match bench_mps_oracle(&parsed, iters) {
+            Ok(mut mps) => rows.append(&mut mps),
+            Err(err) => {
+                eprintln!("warning: {err}");
+            }
+        }
+    }
+    print_bench_rows(&rows);
+    ExitCode::SUCCESS
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn run_bench_gemm(_shapes: &str, _oracle: Option<&str>, _iters: usize) -> ExitCode {
+    eprintln!("error: bench-gemm requires --features metal on macOS");
+    ExitCode::FAILURE
+}
+
 fn run_convert_model(source_dir: &std::path::Path, output_dir: &std::path::Path) -> ExitCode {
     use pack::{convert_model, ConvertOptions};
     eprintln!(
@@ -359,6 +401,8 @@ fn parse_cli() -> Cli {
     let mut no_early_stop = false;
     let mut output_dir: Option<PathBuf> = None;
     let mut quant_profile = String::from("q4");
+    let mut bench_gemm_shapes = String::from("256x2816x2816,33x2816x1408");
+    let mut bench_gemm_oracle: Option<String> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -480,6 +524,16 @@ fn parse_cli() -> Cli {
                     quant_profile = v;
                 }
             }
+            "--shapes" => {
+                if let Some(v) = args.next() {
+                    bench_gemm_shapes = v;
+                }
+            }
+            "--oracle" => {
+                if let Some(v) = args.next() {
+                    bench_gemm_oracle = Some(v);
+                }
+            }
             _ => positional.push(arg),
         }
     }
@@ -565,6 +619,11 @@ fn parse_cli() -> Cli {
             seed,
         },
         Some("probe-device") => Command::ProbeDevice,
+        Some("bench-gemm") => Command::BenchGemm {
+            shapes: bench_gemm_shapes,
+            oracle: bench_gemm_oracle,
+            iters: bench_iters.max(1),
+        },
         Some("quantize") => {
             let out = output_dir.unwrap_or_else(|| {
                 eprintln!("usage: diffgemma-mps quantize -o OUTPUT_DIR [-m SOURCE] [--profile q4|q5]");

@@ -39,7 +39,6 @@ Estimated landing zones (assumptions: 0.3–0.5 MFU, q4.5, steps_eff=20 — **ve
 
 | Device class | BW (GB/s) | est. step | est. tok/s |
 |---|---|---|---|
-| **M3 Pro (measured BW=112 GiB/s, compute ~0.18 TFLOP/s @ dense shape)** | **112** | **~11 s compute floor; ~108 s w/ LRU today** | **~0.03 today → ~8+ post-quant** |
 | M4 Max / M3 Max (36 GiB+) | 400–546 | 150–300 ms | 30–80 |
 | M1/M2 Max | ~400 | 250–450 ms | 25–50 |
 | M*-Pro (24–36 GiB) | 150–273 | 300–700 ms | 15–40 |
@@ -47,7 +46,7 @@ Estimated landing zones (assumptions: 0.3–0.5 MFU, q4.5, steps_eff=20 — **ve
 
 Honest caveat (was in v1, still true): canvas=256 makes each step dense-cost, so Apple Silicon won't see the H100 multiples from the model card. Reading-speed-plus is the realistic win.
 
-**M3-class is compute-bound, not bandwidth-bound.** At canvas=256: ~1.95 TFLOP/step vs M3 Pro ~5–7 TFLOPS (no fp16 rate-doubling on Apple GPUs) → ~0.8–1.2 s/step compute vs ~55–90 ms q4 weight read @ 150 GB/s. M3 Max: ~400 ms compute vs ~30–45 ms bandwidth. Consequences: (a) q4 vs q5 is a **residency/quality** choice on M3, not speed — q5 is ~free in wall-clock on 36 GiB; (b) Q5 (MoE MFU) outranks bandwidth tricks; (c) get activation precision right early — fp16 math, f32 accumulate.
+**M3-class is compute-bound, not bandwidth-bound — now oracle-calibrated.** q4 weight read ≈ 70 ms @ 112 GiB/s vs compute: dense 1.22 TFLOP @ MPS 3.35 TF/s ≈ 0.36 s + MoE 731 GFLOP @ grouped-kernel target 0.8–1.5 TF/s ≈ 0.5–0.9 s → step ≈ 0.9–1.3 s. **M3 Pro forecast: Q2 ≈ 1 tok/s → Q2.5 ≈ 7–9 → Q3+Q4 ≈ 9–13 tok/s.** MoE grouped kernel = critical path (~75% of step at MPS rates). Consequences: (a) q4 vs q5 is a **residency/quality** choice on M3, not speed; (b) kernel MFU (Q2.5) outranks bandwidth tricks; (c) fp16 math, f32 accumulate from the start.
 
 ---
 
@@ -65,39 +64,36 @@ Keep: golden-parity discipline, `bench-decoder` regression tables, CPU/BLAS orac
 
 ---
 
-## Phase Q0 — Instrument the model ✅-gate for everything else
+## Phase Q0 — Instrument the model ✅ (measured 2026-06, M3 Pro 36 GiB)
 
-**Deliverable:** numbers that replace the estimates above.
-
-| Task | Notes |
+| Metric | Measured |
 |---|---|
-| Per-step phase timers in `generate-gpu` | weights-bytes touched, unique experts/layer (histogram), sync count, sampler ms, logits-readback bytes |
-| `bench-step` CLI | full 30L, canvas=256, real routing (prompt-seeded), reports ms/step + bytes/step |
-| Device probe | BW estimate (memcpy kernel), fp16/fp32 GEMM TFLOPS probe at sizes (256×2816×2816, 16×2816×~1400) |
-| Record table in PLAN | this machine (36 GiB, working_set 27 GiB) first |
+| Memcpy BW | 112 GiB/s |
+| Dense GEMM 256×2816×2816 | 184 GFLOP/s (**~3% of hardware**) |
+| MoE GEMM 16×2816×1408 | 110 GFLOP/s |
+| bench-step (30L, canvas=256) | 107.5 s/step |
+| Syncs/step | 151 |
+| Experts unique/layer | mean 62 (33–96) → tokens/active-expert ≈ 33 |
+| Expert bytes touched | 20.6 GiB/step bf16 (≈ 6 GiB @ q4) |
+| LRU misses | 1858/step (~21 GiB re-upload) |
 
-**Exit:** measured BW, MFU at MoE-relevant GEMM shapes, expert-uniqueness distribution. Update the landing-zone table.
-
-### Measured on dev box (Apple M3 Pro, 27 GiB working set, 2026-06-03)
-
-| Metric | Value |
-|---|---|
-| `probe-device` memcpy BW | **112 GiB/s** |
-| GEMM dense 256×2816×2816 | **184 GFLOP/s** (~10.6 s for 1.95 TFLOP/step, kernel-only) |
-| GEMM MoE 16×2816×1408 | **110 GFLOP/s** |
-| `bench-step` wall (30L, canvas=256, 1 iter) | **107.5 s/step** |
-| GPU syncs/step | **151** |
-| GPU readback/step | **1.24 GiB** (residual/norm/MoE scatter; logits separate) |
-| lm_head CPU logits/step | **256 MiB** |
-| Expert unique/layer (mean/min/max) | **62 / 33 / 96** |
-| Expert bf16 touched/step | **20.6 GiB** |
-| Expert LRU misses/step (cold-ish) | **1858** (~21 GiB uploaded) |
-
-**Takeaways:** M3 Pro is **compute-bound** at canvas=256 for the dense GEMM probe (~0.18 TFLOP/s vs ~1.95 TFLOP/step → ~11 s compute floor), but the **dominant wall today is expert LRU thrashing** (20+ GiB/step touched, 6.6 GiB budget). Quantized full residency (Q1/Q2) is mandatory; instrumentation confirms PLAN v2 estimates.
+**Reading:** thrash = the 107.5 s ✓ (walls #1). But **wall #2**: GEMMs run ~30× below the M3 Pro's ~5–6 TFLOPS class. Residency alone → step ≈ 1.95 TFLOP ÷ 184 GFLOP/s ≈ 11 s ≈ 1 tok/s. **Kernel MFU is co-P0 with quantization** → Q2.5. Upside: uniqueness 62 < est. 74 → q4 traffic ~7–8 GiB/step ≈ 70 ms @ 112 GiB/s — bandwidth definitively non-binding on M3 Pro.
 
 ---
 
 ## Phase Q1 — Offline quantizer + `.dgq` format (the long pole)
+
+**Status: ~done (2026-06).** Measured: 15.35 GiB blob, 1047 tensors (454 q4 = decoder matrices ✓, 4 q8 = SC only, 589 raw), 214.5 s streaming convert, mmap load OK.
+
+**Two residency follow-ups before closing:**
+| Fix | Why | Saves |
+|---|---|---|
+| embed_tokens → q8 (missed profile; only 4 q8 = SC) | tied lm_head — GEMM-read every step, not just CPU gather; q8 kernel exists for SC anyway | 0.74 GiB |
+| `--skip-vision` flag (355 raw tensors ≈ 1.1 GiB) | text-first; avoids wiring vision pages via the blob's MTLBuffer | 1.1 GiB |
+
+→ ~13.5 GiB, back on budget. Matters at the 24 GiB floor: 15.35 + scratch + KV ≈ 17.5 vs ~18 GiB working-set cap = razor thin; 13.5 is comfortable. (The 1.3 GiB overage was vision + raw embed — router/norms/scales total only ~30–50 MB.)
+
+**Checkpoint shape note:** expert `gate_up` trailing dim **1408 = fused gate‖up (704 each)**; true inter = 704. Reconciles 11.3 MiB/expert LRU log (2816×1408 + 704×2816 = 5.95M params ✓) and total param count (3840 × 5.95M ≈ 22.8B experts ✓; inter=1408-per-branch would imply 45.7B — impossible). Kernels must split 1408 → 704‖704 for swiglu; FLOPs model uses 5.95M/expert.
 
 **Deliverable:** `diffgemma-mps quantize model/transformer -o model.dgq --profile q4` produces a single resident-friendly file.
 
@@ -130,17 +126,33 @@ Keep: golden-parity discipline, `bench-decoder` regression tables, CPU/BLAS orac
 | **Delete** | expert LRU, transpose cache, `GpuLayerWeightCache` paging, resident-cap/eviction logic, bf16 GPU weight upload path |
 | Regenerate goldens | quantized goldens (CPU-dequant oracle on same `.dgq`); keep bf16 CPU fixtures separately for quality eval |
 
-**Exit / gates (dev box):**
-- `bench-step` full 30L canvas=256 ≤ **500 ms** (vs ~175 s today implied).
-- Zero evictions, zero transposes (counters must read 0).
+**Exit / gates (M3 Pro):**
+- `bench-step` ≤ **12 s** (compute-bound at current kernel rate; the sub-second-class gate moves to Q2.5).
+- Zero evictions, zero transposes (counters must read 0); LRU/paging code deleted.
 - Prefill (1 tok) ≤ 0.5 s (vs 18.7 s).
 - `generate-parity` passes on quantized goldens; bf16-vs-q4 divergence documented on fixtures.
 
 ---
 
+## Phase Q2.5 — GEMM MFU (promoted from Q5 by Q0 data)
+
+**Oracle measured (2026-06):** custom `f32_bf16_linear` 0.19 / 0.14 TFLOP/s (dense / MoE M=33) vs **MPS 3.35 / 0.52 TFLOP/s**. Upload/readback ≈ 5% — the naive 1-thread/output kernel is the gap, not hardware, not measurement.
+
+**Step decomposition at oracle rates** (canvas=256, 5.95M/expert): experts 731 GFLOP ÷ 0.52 ≈ **1.4 s**; dense-shaped M=256 (attn proj 532 + shared MLP 307 + lm_head 378 GFLOP) ÷ 3.35 ≈ **0.36 s**. → **MoE grouped kernel is ~75% of the step and the critical path.** Dense via MPS is the easy 18×; it buys the small slice.
+
+| Task | Notes |
+|---|---|
+| **Grouped MoE kernel (critical path)** | all ~62 active experts, one dispatch (per-expert MPS = ~3,720 encodes/step — ruled out; fp16-resident experts = 12+ GiB — ruled out). simdgroup_matrix tiles, q4 dequant in-register (compute-bound at AI ≈ 120 FLOP/byte). MPS's 0.52 @ M=33 is an occupancy artifact of a lone small GEMM; grouping ×62 threadgroups should clear it. Target 0.8–1.5 TF/s. Reference: MLX `qmm` |
+| Dense → MPS | interim: **per-layer dequant-to-scratch → MPS**, same command buffer (~200–300 MB reusable fp16 scratch; +50–100 ms/step dequant traffic @ 112 GiB/s). Full fp16-resident dense = +3.4 GiB → 36 GiB dev shortcut only, **kills 24 GiB floor**. End state: custom simdgroup q4 tiles modeled on MPS tiling |
+| Re-bench grouped shapes | M=33 × 62 experts grouped, not lone-GEMM probes |
+
+**Exit / gates (M3 Pro):** grouped MoE ≥ **0.8 TFLOP/s**; dense path ≥ 3 TFLOP/s effective (incl. dequant scratch cost); `bench-step` ≤ **1.6 s** → ≥ 7 tok/s e2e (pre-Q3).
+
+---
+
 ## Phase Q3 — Kill the CPU round-trips
 
-Once weights are resident, the per-step serial CPU work becomes the wall: logits readback [256 × 262,144] ≈ 134–268 MB/step + CPU softmax/entropy over 67M values; CPU router = 30 sync round-trips/step.
+Once weights are resident and kernels are sane, the per-step serial CPU work becomes the wall: logits readback [256 × 262,144] ≈ 134–268 MB/step + CPU softmax/entropy over 67M values; CPU router = measured **151 syncs/step**.
 
 | Task | Notes |
 |---|---|
@@ -151,10 +163,10 @@ Once weights are resident, the per-step serial CPU work becomes the wall: logits
 | Self-conditioning on GPU | sc probs/logits never leave GPU; feed prev-step distribution path entirely on-device |
 | Command-buffer structure | encode whole step into 1–3 command buffers; no mid-step `waitUntilCompleted`; sampler dependency stays on-GPU |
 
-**Exit / gates:**
+**Exit / gates (M3 Pro):**
 - Readback/step ≤ 1 MB (ids + scalars), down from ~134–268 MB.
-- Syncs/step ≤ 3 (was ≥ 30 router + sampler).
-- `bench-step` ≤ **350 ms**; `generate-gpu` end-to-end ≥ 10 tok/s on dev box.
+- Syncs/step ≤ 3 (measured 151).
+- `bench-step` ≤ **1.8 s**; `generate-gpu` end-to-end ≥ 7 tok/s.
 
 ---
 
@@ -171,18 +183,18 @@ Once weights are resident, the per-step serial CPU work becomes the wall: logits
 
 ---
 
-## Phase Q5 — MoE kernel MFU
+## Phase Q5 — Residual MoE/attention tuning (was: MoE MFU — core promoted to Q2.5)
 
-The per-expert GEMM is M≈16 rows (2048 draws / ~128 experts) — occupancy-hostile. This phase is profile-driven; only after Q2/Q3 numbers exist.
+Profile-driven leftovers after Q2.5 gates are met.
 
 | Task | Notes |
 |---|---|
 | GPU token sort/scatter | bucket by expert on GPU, fuse weighted scatter-add tail (open item from v1) |
-| Tile/threadgroup tuning at M=8..32 | simdgroup_matrix ops; benchmark per shape, table in repo. If load-bound here → row-interleaved format bump in converter (see Q1), never runtime relayout |
+| Per-shape tile retuning | table in repo; if load-bound → row-interleaved format bump in converter (see Q1), never runtime relayout |
 | Fuse activation into gate_up→down | gelu/swiglu in-kernel (Metal `tanh` clamp lesson stands) |
 | Attention sync merges | carry-over from v1 ideas list |
 
-**Exit:** MoE MFU ≥ 2× Q2 measurement or documented why not; `bench-step` ≤ **250 ms** on dev box (stretch).
+**Exit:** `bench-step` ≤ **1.4 s** on M3 Pro (stretch); document final MFU table.
 
 ---
 
@@ -217,30 +229,30 @@ The per-expert GEMM is M≈16 rows (2048 draws / ~128 experts) — occupancy-hos
 | 24 GiB working-set cap (~18 GiB) too tight | q4 profile + scratch diet; document `iogpu.wired_limit_mb`; measure real peak in Q0 counters |
 | GPU top-k / RNG parity drift | bit-exact tie-break spec + counter-based RNG mirrored in oracle; goldens regenerated deliberately |
 | M=16 expert GEMMs stuck at low MFU | Q5 tuning; worst case still bandwidth-floored ≈ fine for ≥8 tok/s target |
-| Estimates wrong | Q0 exists so every later gate uses measured constants |
+| Estimates wrong | Q0 done — gates use measured constants. Watch: M3 Pro lands at the 8 tok/s floor with thin margin; if Q2.5 MoE rate stalls < 0.6 TFLOP/s, recover via Q4 (lm_head ≈ 19% FLOPs) + steps_eff tuning before reaching for Q6 approximations |
 
 ---
 
 ## Milestones (v2)
 
-| # | Milestone | Gate (dev box, 36 GiB) |
+| # | Milestone | Gate (M3 Pro, 36 GiB) |
 |---|---|---|
-| Q0 | Instrumentation + device probes | measured BW/MFU/expert-uniqueness table |
+| Q0 | Instrumentation + device probes | ✅ measured: 112 GiB/s, 184 GFLOP/s, 62 experts/layer, 151 syncs |
 | Q1 | `.dgq` quantizer + zero-copy load | ≤2 s load, ≤ budget resident, CPU dequant parity |
-| Q2 | Quantized kernels, residency, deletions | step ≤ 500 ms; 0 evictions; prefill ≤ 0.5 s |
-| Q3 | GPU router/sampler/early-stop | ≤3 syncs, ≤1 MB readback/step; ≥10 tok/s e2e |
-| Q4 | Uncommitted-only lm_head, step telemetry | +15% tok/s |
-| Q5 | MoE MFU | step ≤ 250 ms (stretch) |
+| Q2 | Quantized kernels, residency, deletions | step ≤ 12 s; 0 evictions; prefill ≤ 0.5 s |
+| Q2.5 | GEMM MFU (dense→MPS, grouped MoE kernel) | grouped MoE ≥ 0.8 TF/s; step ≤ 1.6 s; ≥ 7 tok/s |
+| Q3 | GPU router/sampler/early-stop | ≤3 syncs, ≤1 MB readback/step; ≥ 7 tok/s |
+| Q4 | Uncommitted-only lm_head, step telemetry | +15% tok/s → **8–12 tok/s target zone** |
+| Q5 | Residual MoE/attention tuning | step ≤ 1.4 s (stretch) |
 | Q6 | Approximations | default-off, quality-gated |
 
 ---
 
 ## Immediate next step
 
-**Q0**: add bytes/uniqueness/sync counters + `bench-step`, run device probes, replace the estimate table with measurements. Then start the Q1 quantizer (long pole — begin file format + CPU dequant while Q0 numbers come in).
+**Q1** (quantizer, long pole) in parallel with the **Q2.5 MPS oracle bench** — the oracle takes an afternoon and determines whether dense paths use MPS or custom tiles, which shapes the Q2 kernel work before it's written.
 
 ```bash
-cargo run --release --features metal -- bench-step --canvas 256 --layers 30 --iters 3
-cargo run --release --features metal -- probe-device
+cargo run --release --features metal -- bench-gemm --oracle mps --shapes 256x2816x2816,33x2816x1408
 cargo run --release -- quantize model/transformer -o model.dgq --profile q4   # Q1
 ```
