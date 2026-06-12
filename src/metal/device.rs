@@ -3,7 +3,8 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSError, NSString};
 use objc2_metal::{
-    MTLCommandQueue, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary,
+    MTLCommandQueue, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDataType,
+    MTLDevice, MTLFunctionConstantValues, MTLLibrary,
 };
 
 pub struct MetalContext {
@@ -20,23 +21,67 @@ impl MetalContext {
         Ok(Self { device, queue })
     }
 
-    pub fn compile_kernel(&self, source: &str, entry: &str) -> Result<ComputePipeline, Error> {
+    pub fn compile_library(&self, source: &str) -> Result<Retained<ProtocolObject<dyn MTLLibrary>>, Error> {
         let ns_source = NSString::from_str(source);
-        let library = self
-            .device
+        self.device
             .newLibraryWithSource_options_error(&ns_source, None)
-            .map_err(|e| shader_compile_error(e))?;
+            .map_err(|e| shader_compile_error(e))
+    }
 
+    pub fn compile_kernel(&self, source: &str, entry: &str) -> Result<ComputePipeline, Error> {
+        let library = self.compile_library(source)?;
+        Self::compile_kernel_from_library(&self.device, &library, entry)
+    }
+
+    pub fn compile_kernel_from_library(
+        device: &ProtocolObject<dyn MTLDevice>,
+        library: &ProtocolObject<dyn MTLLibrary>,
+        entry: &str,
+    ) -> Result<ComputePipeline, Error> {
         let name = NSString::from_str(entry);
         let function = library
             .newFunctionWithName(&name)
             .ok_or(Error::Format("Metal kernel not found"))?;
-
-        let pipeline = self
-            .device
+        let pipeline = device
             .newComputePipelineStateWithFunction_error(&function)
             .map_err(|_| Error::Format("Metal pipeline compile failed"))?;
+        Ok(ComputePipeline { pipeline })
+    }
 
+    /// Specialize `k_gemm_q4` / `k_gemm_q8` (function constants 1–3).
+    pub fn compile_gemm_kernel(
+        device: &ProtocolObject<dyn MTLDevice>,
+        library: &ProtocolObject<dyn MTLLibrary>,
+        entry: &str,
+        gemm_n: u32,
+        gemm_k: u32,
+    ) -> Result<ComputePipeline, Error> {
+        let fc = MTLFunctionConstantValues::new();
+        let is_full = false;
+        unsafe {
+            fc.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from_ref(&is_full).cast(),
+                MTLDataType::Bool,
+                1,
+            );
+            fc.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from_ref(&gemm_n).cast(),
+                MTLDataType::UInt,
+                2,
+            );
+            fc.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from_ref(&gemm_k).cast(),
+                MTLDataType::UInt,
+                3,
+            );
+        }
+        let name = NSString::from_str(entry);
+        let function = library
+            .newFunctionWithName_constantValues_error(&name, &fc)
+            .map_err(|e| shader_compile_error(e))?;
+        let pipeline = device
+            .newComputePipelineStateWithFunction_error(&function)
+            .map_err(|_| Error::Format("Metal pipeline compile failed"))?;
         Ok(ComputePipeline { pipeline })
     }
 
@@ -45,23 +90,14 @@ impl MetalContext {
         source: &str,
         entries: &[&str],
     ) -> Result<Vec<ComputePipeline>, Error> {
-        let ns_source = NSString::from_str(source);
-        let library = self
-            .device
-            .newLibraryWithSource_options_error(&ns_source, None)
-            .map_err(|e| shader_compile_error(e))?;
-
+        let library = self.compile_library(source)?;
         let mut pipelines = Vec::with_capacity(entries.len());
         for entry in entries {
-            let name = NSString::from_str(entry);
-            let function = library
-                .newFunctionWithName(&name)
-                .ok_or(Error::Format("Metal kernel not found"))?;
-            let pipeline = self
-                .device
-                .newComputePipelineStateWithFunction_error(&function)
-                .map_err(|_| Error::Format("Metal pipeline compile failed"))?;
-            pipelines.push(ComputePipeline { pipeline });
+            pipelines.push(Self::compile_kernel_from_library(
+                &self.device,
+                &library,
+                entry,
+            )?);
         }
         Ok(pipelines)
     }

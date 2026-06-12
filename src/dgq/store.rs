@@ -52,6 +52,10 @@ impl DgqStore {
         self.manifest.tensors.len()
     }
 
+    pub fn tensor_entries(&self) -> &[crate::dgq::layout::DgqTensorEntry] {
+        &self.manifest.tensors
+    }
+
     pub fn get_entry(&self, name: &str) -> Option<&crate::dgq::layout::DgqTensorEntry> {
         let &idx = self.index.get(name)?;
         Some(&self.manifest.tensors[idx])

@@ -31,6 +31,8 @@ objc2-metal = { version = "0.3", optional = true, default-features = false, feat
     "MTLBuffer",
     "MTLResource",
     "MTLTypes",
+    "MTLFunctionConstantValues",
+    "MTLDataType",
     "block2",
 ] }
 objc2-foundation = { version = "0.3", optional = true, default-features = false, features = [

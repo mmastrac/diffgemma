@@ -105,12 +105,26 @@ enum Command {
     ConvertModel {
         output_dir: PathBuf,
     },
+    StepSmoke {
+        layers: usize,
+        steps: usize,
+        kv_len: u32,
+        seed: u64,
+        max_seq: usize,
+    },
 }
 
 fn main() -> ExitCode {
     let cli = parse_cli();
     match cli.command {
         Command::ConvertModel { output_dir } => run_convert_model(&cli.model_dir, &output_dir),
+        Command::StepSmoke {
+            layers,
+            steps,
+            kv_len,
+            seed,
+            max_seq,
+        } => run_step_smoke_cmd(&cli.model_dir, layers, steps, kv_len, seed, max_seq),
         Command::Quantize { output, profile } => run_quantize(&cli.model_dir, &output, &profile),
         Command::Tokenize(text) => run_tokenize(&cli.model_dir, &text),
         Command::Gemm { size } => run_gemm(size),
@@ -251,7 +265,81 @@ fn run_command(m: &model::Model, model_dir: &std::path::Path, command: Command) 
         Command::ConvertModel { .. } => ExitCode::FAILURE,
         Command::Quantize { .. } => ExitCode::FAILURE,
         Command::BenchGemm { .. } => ExitCode::FAILURE,
+        Command::StepSmoke { .. } => ExitCode::FAILURE,
     }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn run_step_smoke_cmd(
+    model_dir: &std::path::Path,
+    layers: usize,
+    steps: usize,
+    kv_len: u32,
+    seed: u64,
+    max_seq: usize,
+) -> ExitCode {
+    use metal::{run_step_smoke, StepSmokeConfig};
+
+    if !dgq::store::looks_like_dgq_dir(model_dir) {
+        eprintln!("error: step-smoke requires a .dgq directory (-m /path/to/quantized-weights)");
+        return ExitCode::FAILURE;
+    }
+
+    let cfg = StepSmokeConfig {
+        layers,
+        steps,
+        kv_len,
+        seed,
+        max_seq,
+    };
+    eprintln!(
+        "step-smoke: model={} layers={layers} steps={steps} kv_len={kv_len} seed={seed} max_seq={max_seq}",
+        model_dir.display()
+    );
+    match run_step_smoke(model_dir, cfg) {
+        Ok(r) => {
+            println!("step-smoke ok");
+            println!("  step:          {}", r.step);
+            println!("  stop_flag:     {}", r.stop_flag);
+            println!("  mean_entropy:  {:.4}", r.mean_entropy);
+            println!("  logits_finite: {}", r.logits_finite);
+            println!("  max_abs_logit: {:.4}", r.max_abs_logit);
+            println!("  elapsed:       {:.2?}", r.elapsed);
+            println!(
+                "  ids[0..8]:     {:?}",
+                &r.ids[..8.min(r.ids.len())]
+            );
+            if r.step >= 1 {
+                if !r.logits_finite {
+                    eprintln!(
+                        "warning: logits contain non-finite values (max_abs={:.4}); parity tuning still needed",
+                        r.max_abs_logit
+                    );
+                }
+                ExitCode::SUCCESS
+            } else {
+                eprintln!("error: smoke criteria not met (step={})", r.step);
+                ExitCode::FAILURE
+            }
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn run_step_smoke_cmd(
+    _model_dir: &std::path::Path,
+    _layers: usize,
+    _steps: usize,
+    _kv_len: u32,
+    _seed: u64,
+    _max_seq: usize,
+) -> ExitCode {
+    eprintln!("error: step-smoke requires --features metal on macOS");
+    ExitCode::FAILURE
 }
 
 fn run_quantize(source_dir: &std::path::Path, output: &std::path::Path, profile: &str) -> ExitCode {
@@ -416,6 +504,8 @@ fn parse_cli() -> Cli {
     let mut bench_gemm_shapes = String::from("256x2816x2816,33x2816x1408");
     let mut bench_gemm_oracle: Option<String> = None;
     let mut bench_prefill_len = 1usize;
+    let mut step_kv_len = 0u32;
+    let mut step_max_seq = 512usize;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -555,6 +645,22 @@ fn parse_cli() -> Cli {
                     bench_gemm_oracle = Some(v);
                 }
             }
+            "--max-seq" => {
+                if let Some(v) = args.next() {
+                    step_max_seq = v.parse().unwrap_or_else(|_| {
+                        eprintln!("invalid --max-seq");
+                        std::process::exit(2);
+                    });
+                }
+            }
+            "--kv-len" => {
+                if let Some(v) = args.next() {
+                    step_kv_len = v.parse().unwrap_or_else(|_| {
+                        eprintln!("invalid --kv-len");
+                        std::process::exit(2);
+                    });
+                }
+            }
             _ => positional.push(arg),
         }
     }
@@ -668,10 +774,17 @@ fn parse_cli() -> Cli {
             });
             Command::ConvertModel { output_dir: out }
         }
+        Some("step-smoke") => Command::StepSmoke {
+            layers: bench_layers.max(1).min(30),
+            steps: steps.max(1),
+            kv_len: step_kv_len,
+            seed,
+            max_seq: step_max_seq.max(64),
+        },
         Some(cmd) => {
             eprintln!("unknown command: {cmd}");
             eprintln!(
-                "usage: diffgemma-mps [-p PROMPT] [summary|config|weights <name>|quantize|convert-model|bench-step|bench-prefill|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-parity|tokenize <text>|gemm|attention]"
+                "usage: diffgemma-mps [-p PROMPT] [summary|config|weights <name>|quantize|convert-model|step-smoke|bench-step|bench-prefill|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-parity|tokenize <text>|gemm|attention]"
             );
             eprintln!("  default (no command): generate-gpu with --features metal");
             eprintln!("  generate-parity: GPU vs checked-in golden (use --compare-cpu for slow CPU path)");

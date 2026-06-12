@@ -38,6 +38,10 @@ impl Rng {
             self.next_u32() % high
         }
     }
+
+    pub fn state(&self) -> u64 {
+        self.state
+    }
 }
 
 #[derive(Debug, Clone)]
