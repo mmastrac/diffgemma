@@ -6,7 +6,7 @@ use crate::metal::kernels::GpuKernels;
 use crate::safetensors::Error;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder};
+use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder, MTLComputePipelineState};
 
 pub fn rms_norm_rows(
     batch: &mut GpuBatch<'_>,
@@ -121,6 +121,97 @@ pub fn rms_norm_rows_no_scale_gpu_buf(
     Ok(buf_o)
 }
 
+pub fn gelu_pytorch_tanh_gpu_buf(
+    batch: &mut GpuBatch<'_>,
+    kernels: &GpuKernels,
+    buf: &ProtocolObject<dyn MTLBuffer>,
+    len: usize,
+) -> Result<(), Error> {
+    let len_u = len as u32;
+    batch.dispatch_1d(&kernels.gelu.pipeline, len, |enc| {
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(buf), 0, 0);
+        }
+        set_bytes(enc, &len_u, 1);
+    });
+    Ok(())
+}
+
+pub fn swiglu_mul_gpu_bufs(
+    batch: &mut GpuBatch<'_>,
+    kernels: &GpuKernels,
+    gate_buf: &ProtocolObject<dyn MTLBuffer>,
+    up_buf: &ProtocolObject<dyn MTLBuffer>,
+    len: usize,
+) -> Result<(), Error> {
+    let len_u = len as u32;
+    batch.dispatch_1d(&kernels.swiglu_mul.pipeline, len, |enc| {
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(gate_buf), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(up_buf), 0, 1);
+        }
+        set_bytes(enc, &len_u, 2);
+    });
+    Ok(())
+}
+
+pub fn gelu_swiglu_gate_up_gpu(
+    batch: &mut GpuBatch<'_>,
+    kernels: &GpuKernels,
+    gate_up_buf: &ProtocolObject<dyn MTLBuffer>,
+    out_len: usize,
+    batch_size: usize,
+    moe_inter: usize,
+) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
+    if out_len != batch_size * moe_inter {
+        return Err(Error::Format("gelu_swiglu_gate_up shape mismatch"));
+    }
+    let buf_o = batch.alloc_f32_out(out_len)?;
+    let dims = [batch_size as u32, moe_inter as u32];
+    batch.dispatch_1d(&kernels.gelu_swiglu_gate_up.pipeline, out_len, |enc| {
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(gate_up_buf), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(&buf_o), 0, 1);
+        }
+        set_bytes(enc, &dims, 2);
+    });
+    Ok(buf_o)
+}
+
+pub fn f32_bf16_gemm_gpu_out(
+    batch: &mut GpuBatch<'_>,
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    a: &[f32],
+    b: FastSlice<'_, u16>,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
+    if a.len() != m * k || b.len() != k * n {
+        return Err(Error::Format("f32_bf16 gemm shape mismatch"));
+    }
+    let buf_a = batch.alloc_f32(a)?;
+    f32_bf16_gemm_gpu_in_out(batch, pipeline, &buf_a, b, m, k, n)
+}
+
+pub fn f32_bf16_gemm_gpu_in_out(
+    batch: &mut GpuBatch<'_>,
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    a_buf: &ProtocolObject<dyn MTLBuffer>,
+    b: FastSlice<'_, u16>,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
+    if b.len() != k * n {
+        return Err(Error::Format("f32_bf16 gemm shape mismatch"));
+    }
+    let buf_b = batch.alloc_bf16_fast(b)?;
+    let buf_c = batch.alloc_f32_out(m * n)?;
+    batch.dispatch_gemm(pipeline, a_buf, &buf_b, &buf_c, m, n, k);
+    Ok(buf_c)
+}
+
 pub fn vec_add_inplace(
     batch: &mut GpuBatch<'_>,
     kernels: &GpuKernels,
@@ -161,6 +252,76 @@ pub fn vec_scale_inplace(
     });
     batch.register_read(buf, x);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernels::cpu::gelu_pytorch_tanh;
+    use crate::metal::batch::GpuBatch;
+    use crate::metal::device::MetalContext;
+    use crate::metal::kernels::GpuKernels;
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn gpu_gelu_large_input() {
+        let mut cpu = vec![10.229641f32];
+        let mut gpu = cpu.clone();
+        gelu_pytorch_tanh(&mut cpu);
+        let ctx = MetalContext::new().expect("metal");
+        let kernels = GpuKernels::new(&ctx).expect("kernels");
+        kernels
+            .gelu_pytorch_tanh(&ctx.queue, &mut crate::metal::buffer::BufferPool::new(), &ctx.device, &mut gpu)
+            .expect("gelu");
+        assert!(gpu[0].is_finite(), "gpu={}", gpu[0]);
+        assert!((cpu[0] - gpu[0]).abs() < 1e-4);
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn gpu_gelu_matches_cpu() {
+        let mut cpu = vec![-2.0f32, -1.0, 0.0, 0.5, 1.5, 3.0];
+        let mut gpu = cpu.clone();
+        gelu_pytorch_tanh(&mut cpu);
+
+        let ctx = MetalContext::new().expect("metal");
+        let kernels = GpuKernels::new(&ctx).expect("kernels");
+        let mut pool = crate::metal::buffer::BufferPool::new();
+        let mut batch = GpuBatch::begin(&ctx.queue, &mut pool, &ctx.device).expect("batch");
+        let buf = batch.alloc_f32(&gpu).expect("buf");
+        gelu_pytorch_tanh_gpu_buf(&mut batch, &kernels, &buf, gpu.len()).expect("gelu");
+        batch.register_read(buf, &mut gpu);
+        batch.end().expect("end");
+
+        for (a, b) in cpu.iter().zip(gpu.iter()) {
+            assert!((a - b).abs() < 1e-5, "cpu={a} gpu={b}");
+        }
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn gpu_gelu_matches_cpu_mlp_shape() {
+        let len = 16 * 2112;
+        let data: Vec<f32> = (0..len).map(|i| ((i as f32) * 0.001).sin()).collect();
+        let mut cpu = data.clone();
+        let mut gpu = data;
+        gelu_pytorch_tanh(&mut cpu);
+
+        let ctx = MetalContext::new().expect("metal");
+        let kernels = GpuKernels::new(&ctx).expect("kernels");
+        kernels
+            .gelu_pytorch_tanh(&ctx.queue, &mut crate::metal::buffer::BufferPool::new(), &ctx.device, &mut gpu)
+            .expect("gelu");
+
+        let nan = gpu.iter().filter(|v| !v.is_finite()).count();
+        assert_eq!(nan, 0, "gpu gelu produced {nan} non-finite values");
+        let max_diff = cpu
+            .iter()
+            .zip(gpu.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_diff < 1e-4, "max_diff={max_diff}");
+    }
 }
 
 pub fn f32_bf16_gemm(

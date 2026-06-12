@@ -18,6 +18,7 @@ pub struct GpuKernels {
     pub(crate) router_scale: ComputePipeline,
     pub(crate) gelu: ComputePipeline,
     pub(crate) swiglu_mul: ComputePipeline,
+    pub(crate) gelu_swiglu_gate_up: ComputePipeline,
 }
 
 impl GpuKernels {
@@ -35,6 +36,7 @@ impl GpuKernels {
         let pipelines = ctx.compile_kernels(DECODER_SHADER, &names)?;
         let mut it = pipelines.into_iter().rev();
         Ok(Self {
+            gelu_swiglu_gate_up: ctx.compile_kernel(DECODER_SHADER, "gelu_swiglu_gate_up")?,
             swiglu_mul: it.next().ok_or(Error::Format("pipeline missing"))?,
             gelu: it.next().ok_or(Error::Format("pipeline missing"))?,
             router_scale: it.next().ok_or(Error::Format("pipeline missing"))?,

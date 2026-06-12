@@ -1,6 +1,6 @@
 use crate::config::TextConfig;
-use crate::kernels::cpu::gelu_pytorch_tanh;
-use crate::metal::batched_kernels::f32_bf16_gemm;
+use crate::metal::batched_kernels::{self as bk, f32_bf16_gemm};
+use crate::metal::kernels::GpuKernels;
 use crate::metal::batch::GpuBatch;
 use crate::metal::device::MetalContext;
 use crate::metal::weights::GpuLayerWeightCache;
@@ -30,6 +30,7 @@ pub fn experts_forward_gpu_batched(
     out_arena: &mut Vec<f32>,
     ctx: &MetalContext,
     pool: &mut crate::metal::buffer::BufferPool,
+    kernels: &GpuKernels,
     gemm_pipeline: &crate::metal::device::ComputePipeline,
 ) -> Result<(), Error> {
     let hidden = cfg.hidden_size;
@@ -107,17 +108,26 @@ pub fn experts_forward_gpu_batched(
         batch.end()?;
     }
 
-    for job in &jobs {
-        let batch_size = job.tokens.len();
-        for row in 0..batch_size {
-            let gu_off = job.gate_up_off + row * moe_inter * 2;
-            let (gate, up) = gate_up_arena[gu_off..gu_off + moe_inter * 2].split_at_mut(moe_inter);
-            gelu_pytorch_tanh(gate);
-            let act_off = job.gate_act_off + row * moe_inter;
-            for i in 0..moe_inter {
-                gate_act_arena[act_off + i] = gate[i] * up[i];
-            }
+    {
+        let mut batch = GpuBatch::begin(&ctx.queue, pool, &ctx.device)?;
+        for job in &jobs {
+            let batch_size = job.tokens.len();
+            let gu_len = batch_size * moe_inter * 2;
+            let gu_slice = &gate_up_arena[job.gate_up_off..job.gate_up_off + gu_len];
+            let buf_gu = batch.alloc_f32(gu_slice)?;
+            let act_len = batch_size * moe_inter;
+            let buf_act = bk::gelu_swiglu_gate_up_gpu(
+                &mut batch,
+                kernels,
+                &buf_gu,
+                act_len,
+                batch_size,
+                moe_inter,
+            )?;
+            let act_slice = &mut gate_act_arena[job.gate_act_off..job.gate_act_off + act_len];
+            batch.register_read(buf_act, act_slice);
         }
+        batch.end()?;
     }
 
     // Phase 2: all expert down GEMMs in one GPU batch (one sync).

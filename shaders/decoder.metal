@@ -113,7 +113,10 @@ kernel void router_scale_rows(
 
 inline float gelu_tanh(float x) {
     float x3 = x * x * x;
-    return 0.5f * x * (1.0f + tanh(GELU_TANH_COEF * (x + 0.044715f * x3)));
+    float u = GELU_TANH_COEF * (x + 0.044715f * x3);
+    // Metal fast-math tanh can return NaN for large |u|; GELU only needs ±1 limits.
+    float t = (u > 8.0f) ? 1.0f : (u < -8.0f) ? -1.0f : tanh(u);
+    return 0.5f * x * (1.0f + t);
 }
 
 kernel void gelu_pytorch_tanh(
@@ -137,4 +140,24 @@ kernel void swiglu_mul(
         return;
     }
     gate[gid] = gate[gid] * up[gid];
+}
+
+/// MoE gate_up layout `[batch, 2 * moe_inter]` -> activated `[batch, moe_inter]`.
+kernel void gelu_swiglu_gate_up(
+    device const float *gate_up [[buffer(0)]],
+    device float *out [[buffer(1)]],
+    constant uint2 &dims [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint batch_size = dims.x;
+    uint moe_inter = dims.y;
+    uint row = gid / moe_inter;
+    uint col = gid % moe_inter;
+    if (row >= batch_size) {
+        return;
+    }
+    uint off = row * (2u * moe_inter) + col;
+    float g = gelu_tanh(gate_up[off]);
+    float u = gate_up[off + moe_inter];
+    out[gid] = g * u;
 }

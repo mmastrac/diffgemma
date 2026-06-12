@@ -1,5 +1,4 @@
 use crate::config::TextConfig;
-use crate::kernels::cpu::gelu_pytorch_tanh;
 use crate::metal::batched_kernels::{self as bk};
 use crate::metal::batch::GpuBatch;
 use crate::metal::engine::GpuDecoderEngine;
@@ -170,41 +169,31 @@ fn forward_layer_ff(
             hidden,
             eps,
         )?;
-        linear_cached_batched_in_cpu_out(
+        let buf_gate = linear_cached_batched_in_buf(
             &mut batch,
             &engine.f32_bf16_gemm_pipeline,
-            &mut scratch.gate,
             &buf_normed,
             &cached.mlp_gate,
             seq_len,
         )?;
-        linear_cached_batched_in_cpu_out(
+        let buf_up = linear_cached_batched_in_buf(
             &mut batch,
             &engine.f32_bf16_gemm_pipeline,
-            &mut scratch.mlp_hidden,
             &buf_normed,
             &cached.mlp_up,
             seq_len,
         )?;
-        batch.end()?;
-    }
-
-    gelu_pytorch_tanh(&mut scratch.gate);
-    for i in 0..scratch.mlp_hidden.len() {
-        scratch.mlp_hidden[i] *= scratch.gate[i];
-    }
-
-    {
-        let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
-        let buf_mlp = batch.alloc_f32(&scratch.mlp_hidden)?;
+        let act_len = seq_len * cached.mlp_gate.out_dim;
+        bk::gelu_pytorch_tanh_gpu_buf(&mut batch, &engine.kernels, &buf_gate, act_len)?;
+        bk::swiglu_mul_gpu_bufs(&mut batch, &engine.kernels, &buf_gate, &buf_up, act_len)?;
         let buf_down = linear_cached_batched_in_buf(
             &mut batch,
             &engine.f32_bf16_gemm_pipeline,
-            &buf_mlp,
+            &buf_gate,
             &cached.mlp_down,
             seq_len,
         )?;
-        let buf_normed = bk::rms_norm_rows_gpu_buf(
+        let buf_ff = bk::rms_norm_rows_gpu_buf(
             &mut batch,
             &engine.kernels,
             &buf_down,
@@ -213,7 +202,7 @@ fn forward_layer_ff(
             hidden,
             eps,
         )?;
-        batch.register_read(buf_normed, &mut scratch.normed);
+        batch.register_read(buf_ff, &mut scratch.normed);
         batch.end()?;
     }
 
@@ -251,6 +240,7 @@ fn forward_layer_ff(
         &mut scratch.moe_batch_out,
         &engine.ctx,
         &mut engine.pool,
+        &engine.kernels,
         &engine.f32_bf16_gemm_pipeline,
     )?;
 
