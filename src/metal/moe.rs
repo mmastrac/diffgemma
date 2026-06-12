@@ -357,7 +357,8 @@ pub fn experts_forward_gpu_grouped_in_batch(
     Ok(())
 }
 
-fn experts_forward_gpu_per_job(
+/// Per-expert Q4/BF16 MoE in one batch (deterministic; avoids grouped `simd_sum` kernel).
+pub fn experts_forward_gpu_per_job(
     out_arena: &mut [f32],
     residual: &[f32],
     pre_ff_norm_2: &[f32],
