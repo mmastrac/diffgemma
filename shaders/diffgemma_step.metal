@@ -644,6 +644,26 @@ kernel void k_softcap(device half* logits [[buffer(0)]],
     logits[i] = half(tanh(x) * SOFTCAP);
 }
 
+kernel void k_half_to_f32(device const half* x [[buffer(0)]],
+                          device float* y [[buffer(1)]],
+                          constant uint& base [[buffer(2)]],
+                          constant uint& len [[buffer(3)]],
+                          uint gid [[thread_position_in_grid]]) {
+    if (gid >= len) return;
+    uint i = base + gid;
+    y[i] = float(x[i]);
+}
+
+kernel void k_f32_to_half(device const float* x [[buffer(0)]],
+                          device half* y [[buffer(1)]],
+                          constant uint& base [[buffer(2)]],
+                          constant uint& len [[buffer(3)]],
+                          uint gid [[thread_position_in_grid]]) {
+    if (gid >= len) return;
+    uint i = base + gid;
+    y[i] = half(x[i]);
+}
+
 // ======================= sampler =======================
 // pass 1: tempered row stats -> A_RS_SAMP; entropy (nats); argmax + changed flag.
 kernel void k_sample_rowstats(device const half* logits [[buffer(0)]],

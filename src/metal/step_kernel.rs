@@ -4,7 +4,8 @@
 use crate::dgq::DgqStore;
 use crate::metal::batch::set_bytes;
 use crate::metal::device::{ComputePipeline, MetalContext};
-use crate::metal::dgq_gpu::DgqGpuBlob;
+use crate::metal::dgq_gpu::{DgqGpuBlob, Q4LinearGpu};
+use crate::metal::mps_gemm::{dispatch_dequant_q4_matrix, MpsMatmulCache};
 use crate::sample::{initialize_canvas, Rng, SamplerConfig};
 use crate::safetensors::Error;
 use objc2::rc::Retained;
@@ -19,6 +20,7 @@ use std::path::Path;
 use std::time::Instant;
 
 const STEP_SHADER: &str = include_str!("../../shaders/diffgemma_step.metal");
+const QGEMM_SHADER: &str = include_str!("../../shaders/qgemm.metal");
 
 pub const HID: usize = 2816;
 pub const VOCAB: usize = 262144;
@@ -81,6 +83,7 @@ pub struct LayerOffsets {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct ModelLayout {
     pub embed: u64,
     pub sc_pre_norm: u64,
@@ -273,10 +276,47 @@ fn div_up(v: usize, g: usize) -> usize {
     (v + g - 1) / g
 }
 
+/// Scratch byte sizes for the MPS Q4 path (max over all step-kernel GEMM shapes).
+fn mps_scratch_bytes() -> (usize, usize, usize) {
+    let shapes = [
+        (CANVAS, 4096u32, HID as u32),
+        (CANVAS, 2048, HID as u32),
+        (CANVAS, 2816, 4096),
+        (CANVAS, 8192, HID as u32),
+        (CANVAS, 1024, HID as u32),
+        (CANVAS, 2816, 8192),
+        (CANVAS, DENSE_FF, HID as u32),
+        (CANVAS, 2816, DENSE_FF),
+    ];
+    let mut max_mk = 0usize;
+    let mut max_nk = 0usize;
+    let mut max_mn = 0usize;
+    for (m, n, k) in shapes {
+        max_mk = max_mk.max(m * k as usize);
+        max_nk = max_nk.max(n as usize * k as usize);
+        max_mn = max_mn.max(m * n as usize);
+    }
+    (
+        max_mk * std::mem::size_of::<f32>(),
+        max_nk * std::mem::size_of::<f32>(),
+        max_mn * std::mem::size_of::<f32>(),
+    )
+}
+
+fn step_use_mps_q4_from_env() -> bool {
+    match std::env::var("DGQ_MPS_Q4") {
+        Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
+        Err(_) => true,
+    }
+}
+
 struct StepPipelines {
     memzero: ComputePipeline,
     rmsnorm: ComputePipeline,
     rmsnorm_f32: ComputePipeline,
+    dequant_q4: ComputePipeline,
+    half_to_f32: ComputePipeline,
+    f32_to_half: ComputePipeline,
     gemm_q4: HashMap<(u32, u32), ComputePipeline>,
     gemm_q8: HashMap<(u32, u32), ComputePipeline>,
     qk_rope_kv: ComputePipeline,
@@ -333,6 +373,9 @@ impl StepPipelines {
             memzero: simple("k_memzero")?,
             rmsnorm: simple("k_rmsnorm")?,
             rmsnorm_f32: simple("k_rmsnorm_f32")?,
+            dequant_q4: ctx.compile_kernel(QGEMM_SHADER, "dequant_q4_matrix")?,
+            half_to_f32: simple("k_half_to_f32")?,
+            f32_to_half: simple("k_f32_to_half")?,
             gemm_q4,
             gemm_q8,
             qk_rope_kv: simple("k_qk_rope_kv")?,
@@ -377,12 +420,19 @@ struct StepBuffers {
     state: Retained<ProtocolObject<dyn MTLBuffer>>,
     logits: Retained<ProtocolObject<dyn MTLBuffer>>,
     route: Retained<ProtocolObject<dyn MTLBuffer>>,
+    mps_x: Retained<ProtocolObject<dyn MTLBuffer>>,
+    mps_w: Retained<ProtocolObject<dyn MTLBuffer>>,
+    mps_c: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
 
 struct StepEnc<'a> {
     enc: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
+    cmd: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     ps: &'a StepPipelines,
     bufs: &'a StepBuffers,
+    gpu_blob: &'a std::sync::Arc<DgqGpuBlob>,
+    mps: &'a mut MpsMatmulCache,
+    use_mps_q4: bool,
 }
 
 impl StepEnc<'_> {
@@ -503,6 +553,128 @@ impl StepEnc<'_> {
         });
     }
 
+    fn pause_for_mps(&mut self) {
+        self.enc.endEncoding();
+    }
+
+    fn resume_compute_after_mps(&mut self) {
+        self.enc = self
+            .cmd
+            .computeCommandEncoder()
+            .expect("compute encoder alloc failed");
+    }
+
+    fn dispatch_convert_1d(
+        &self,
+        ps: &ComputePipeline,
+        src: &ProtocolObject<dyn MTLBuffer>,
+        src_off: usize,
+        dst: &ProtocolObject<dyn MTLBuffer>,
+        dst_off: usize,
+        len: usize,
+    ) {
+        self.dispatch_1d_ranged(ps, len, 256, |enc, base, chunk| {
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(src), src_off, 0);
+                enc.setBuffer_offset_atIndex(Some(dst), dst_off, 1);
+            }
+            set_bytes(enc, &base, 2);
+            set_bytes(enc, &chunk, 3);
+        });
+    }
+
+    fn half_to_f32_buf(&self, arena_off: u64, len: usize) {
+        self.dispatch_convert_1d(
+            &self.ps.half_to_f32,
+            &self.bufs.arena,
+            arena_off as usize,
+            &self.bufs.mps_x,
+            0,
+            len,
+        );
+    }
+
+    fn f32_to_half_arena(&self, arena_off: u64, len: usize) {
+        self.dispatch_convert_1d(
+            &self.ps.f32_to_half,
+            &self.bufs.mps_c,
+            0,
+            &self.bufs.arena,
+            arena_off as usize,
+            len,
+        );
+    }
+
+    fn gemm_q4_fused(
+        &self,
+        x_off: u64,
+        y_off: u64,
+        w_off: u64,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) -> Result<(), Error> {
+        let ps = self.ps.q4(n, k)?;
+        self.enc.setComputePipelineState(&ps.pipeline);
+        unsafe {
+            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), x_off as usize, 0);
+            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), y_off as usize, 1);
+            self.bind_blob(2);
+            set_bytes(&self.enc, &w_off, 3);
+            set_bytes(&self.enc, &m, 4);
+        }
+        let grid = MTLSize {
+            width: div_up(n as usize, 32),
+            height: div_up(m as usize, 32),
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 32,
+            height: 32,
+            depth: 1,
+        };
+        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        Ok(())
+    }
+
+    fn gemm_q4(
+        &mut self,
+        x_off: u64,
+        y_off: u64,
+        w_off: u64,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) -> Result<(), Error> {
+        if !self.use_mps_q4 {
+            return self.gemm_q4_fused(x_off, y_off, w_off, m, n, k);
+        }
+        let m_us = m as usize;
+        let n_us = n as usize;
+        let k_us = k as usize;
+        let q4 = Q4LinearGpu::from_entry(
+            std::sync::Arc::clone(self.gpu_blob),
+            w_off,
+            n_us,
+            k_us,
+        );
+        self.half_to_f32_buf(x_off, m_us * k_us);
+        dispatch_dequant_q4_matrix(&self.enc, &self.ps.dequant_q4, &q4, &self.bufs.mps_w);
+        self.pause_for_mps();
+        self.mps.encode_f32_linear(
+            &self.cmd,
+            &self.bufs.mps_x,
+            &self.bufs.mps_w,
+            &self.bufs.mps_c,
+            m_us,
+            k_us,
+            n_us,
+        );
+        self.resume_compute_after_mps();
+        self.f32_to_half_arena(y_off, m_us * n_us);
+        Ok(())
+    }
+
     fn dispatch_2d(&self, ps: &ComputePipeline, gx: usize, gy: usize, tpg_x: usize, tpg_y: usize) {
         self.enc.setComputePipelineState(&ps.pipeline);
         let grid = MTLSize {
@@ -587,38 +759,6 @@ impl StepEnc<'_> {
             depth: 1,
         };
         self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
-    }
-
-    fn gemm_q4(
-        &self,
-        x_off: u64,
-        y_off: u64,
-        w_off: u64,
-        m: u32,
-        n: u32,
-        k: u32,
-    ) -> Result<(), Error> {
-        let ps = self.ps.q4(n, k)?;
-        self.enc.setComputePipelineState(&ps.pipeline);
-        unsafe {
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), x_off as usize, 0);
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), y_off as usize, 1);
-            self.bind_blob(2);
-            set_bytes(&self.enc, &w_off, 3);
-            set_bytes(&self.enc, &m, 4);
-        }
-        let grid = MTLSize {
-            width: div_up(n as usize, 32),
-            height: div_up(m as usize, 32),
-            depth: 1,
-        };
-        let tg = MTLSize {
-            width: 32,
-            height: 32,
-            depth: 1,
-        };
-        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
-        Ok(())
     }
 
     fn gemm_q8(
@@ -706,7 +846,7 @@ impl StepEnc<'_> {
         self.dispatch_1d(&self.ps.glu, elems, 256);
     }
 
-    fn encode_layer(&self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
+    fn encode_layer(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
         let l = &layout.layers[layer];
         let q_n = if l.is_full != 0 { 8192 } else { 4096 };
         let k_n = if l.is_full != 0 { 1024 } else { 2048 };
@@ -851,7 +991,7 @@ impl StepEnc<'_> {
         Ok(())
     }
 
-    fn encode_step_preamble(&self, layout: &ModelLayout, first_step: u32) -> Result<(), Error> {
+    fn encode_step_preamble(&mut self, layout: &ModelLayout, first_step: u32) -> Result<(), Error> {
         if first_step == 0 {
             self.enc.setComputePipelineState(&self.ps.logit_rowstats.pipeline);
             self.bind_logits(0);
@@ -943,7 +1083,7 @@ impl StepEnc<'_> {
     }
 
     fn encode_step_finish(
-        &self,
+        &mut self,
         layout: &ModelLayout,
         mode: StepFinishMode,
     ) -> Result<(), Error> {
@@ -1180,44 +1320,52 @@ struct StepRuntime {
     ctx: MetalContext,
     pipelines: StepPipelines,
     bufs: StepBuffers,
+    gpu_blob: std::sync::Arc<DgqGpuBlob>,
+    mps_matmul: MpsMatmulCache,
+    use_mps_q4: bool,
     layout: ModelLayout,
     layers: usize,
 }
 
 impl StepRuntime {
-    fn dispatch_and_wait<F>(&self, f: F) -> Result<(), Error>
+    fn dispatch_and_wait<F>(&mut self, f: F) -> Result<(), Error>
     where
-        F: FnOnce(&StepEnc<'_>) -> Result<(), Error>,
+        F: FnOnce(&mut StepEnc<'_>) -> Result<(), Error>,
     {
         let cmd = self
             .ctx
             .queue
             .commandBuffer()
             .ok_or(Error::Format("command buffer alloc failed"))?;
-        let enc = cmd
-            .computeCommandEncoder()
-            .ok_or(Error::Format("compute encoder alloc failed"))?;
-        let enc = StepEnc {
-            enc,
+        let mut enc = StepEnc {
+            enc: cmd
+                .computeCommandEncoder()
+                .ok_or(Error::Format("compute encoder alloc failed"))?,
+            cmd: cmd.clone(),
             ps: &self.pipelines,
             bufs: &self.bufs,
+            gpu_blob: &self.gpu_blob,
+            mps: &mut self.mps_matmul,
+            use_mps_q4: self.use_mps_q4,
         };
-        f(&enc)?;
+        f(&mut enc)?;
         enc.enc.endEncoding();
         cmd.commit();
         cmd.waitUntilCompleted();
         Ok(())
     }
 
-    fn run_forward_once(&self, finish: StepFinishMode) -> Result<(), Error> {
+    fn run_forward_once(&mut self, finish: StepFinishMode) -> Result<(), Error> {
+        let layout = self.layout;
+        let layers = self.layers;
         self.dispatch_and_wait(|enc| {
             let st: CanvasState = read_struct(&enc.bufs.state);
             let first_step = if st.step == 0 { 1u32 } else { 0u32 };
-            enc.encode_step_preamble(&self.layout, first_step)?;
-            for layer in 0..self.layers {
-                enc.encode_layer(layer, &self.layout)?;
+            enc.encode_step_preamble(&layout, first_step)?;
+            for layer in 0..layers {
+                enc.encode_layer(layer, &layout)?;
             }
-            enc.encode_step_finish(&self.layout, finish)?;
+            enc.encode_step_finish(&layout, finish)?;
             Ok(())
         })
     }
@@ -1251,6 +1399,7 @@ fn build_step_runtime(model_dir: &Path, cfg: &StepSmokeConfig) -> Result<(StepRu
         _pad: 0,
     };
     let state = init_canvas_state(cfg.seed, VOCAB);
+    let (mps_x_bytes, mps_w_bytes, mps_c_bytes) = mps_scratch_bytes();
 
     let bufs = StepBuffers {
         blob: gpu_blob.buffer.clone(),
@@ -1277,17 +1426,24 @@ fn build_step_runtime(model_dir: &Path, cfg: &StepSmokeConfig) -> Result<(StepRu
             zero_buffer(&b);
             b
         },
+        mps_x: alloc_buffer(&ctx.device, mps_x_bytes)?,
+        mps_w: alloc_buffer(&ctx.device, mps_w_bytes)?,
+        mps_c: alloc_buffer(&ctx.device, mps_c_bytes)?,
     };
     zero_buffer(&bufs.arena);
     zero_buffer(&bufs.kvcache);
     zero_buffer(&bufs.logits);
 
     let compile = compile_started.elapsed();
+    let mps_matmul = MpsMatmulCache::new(ctx.device.clone());
     Ok((
         StepRuntime {
             ctx,
             pipelines,
             bufs,
+            gpu_blob,
+            mps_matmul,
+            use_mps_q4: step_use_mps_q4_from_env(),
             layout,
             layers,
         },
@@ -1297,7 +1453,9 @@ fn build_step_runtime(model_dir: &Path, cfg: &StepSmokeConfig) -> Result<(StepRu
 
 pub fn run_step_probe(model_dir: &Path, cfg: StepSmokeConfig) -> Result<StepProbeResult, Error> {
     let started = Instant::now();
-    let (rt, _) = build_step_runtime(model_dir, &cfg)?;
+    let (mut rt, _) = build_step_runtime(model_dir, &cfg)?;
+    let layout = rt.layout;
+    let layers = rt.layers;
     let mut checkpoints = Vec::new();
 
     let mut push = |label: &str, finite: bool, max_abs: f32, non_finite: usize| {
@@ -1311,15 +1469,15 @@ pub fn run_step_probe(model_dir: &Path, cfg: StepSmokeConfig) -> Result<StepProb
 
     rt.dispatch_and_wait(|enc| {
         let first_step = 1u32;
-        enc.encode_step_preamble(&rt.layout, first_step)?;
+        enc.encode_step_preamble(&layout, first_step)?;
         Ok(())
     })?;
     let (f, m, n) = arena_hidden_stats(&rt.bufs.arena);
     push("after_preamble", f, m, n);
 
-    for layer in 0..rt.layers {
+    for layer in 0..layers {
         rt.dispatch_and_wait(|enc| {
-            enc.encode_layer(layer, &rt.layout)?;
+            enc.encode_layer(layer, &layout)?;
             Ok(())
         })?;
         let (f, m, n) = arena_hidden_stats(&rt.bufs.arena);
@@ -1327,10 +1485,10 @@ pub fn run_step_probe(model_dir: &Path, cfg: StepSmokeConfig) -> Result<StepProb
     }
 
     rt.dispatch_and_wait(|enc| {
-        enc.rmsnorm(A_HIDDEN, A_TMP, rt.layout.final_norm, HID as u32, CANVAS);
+        enc.rmsnorm(A_HIDDEN, A_TMP, layout.final_norm, HID as u32, CANVAS);
         enc.gemm_q8_logits(
             A_TMP,
-            rt.layout.embed,
+            layout.embed,
             CANVAS as u32,
             VOCAB as u32,
             HID as u32,
@@ -1353,7 +1511,7 @@ pub fn bench_step_kernel(
     iters: usize,
 ) -> Result<StepBenchResult, Error> {
     let iters = iters.max(1);
-    let (rt, compile) = build_step_runtime(model_dir, &cfg)?;
+    let (mut rt, compile) = build_step_runtime(model_dir, &cfg)?;
     let finish = cfg.finish;
 
     let warmup_started = Instant::now();
@@ -1379,17 +1537,19 @@ pub fn bench_step_kernel(
 pub fn run_step_smoke(model_dir: &Path, cfg: StepSmokeConfig) -> Result<StepSmokeResult, Error> {
     let finish = cfg.finish;
     let steps = cfg.steps;
-    let (rt, _) = build_step_runtime(model_dir, &cfg)?;
+    let (mut rt, _) = build_step_runtime(model_dir, &cfg)?;
+    let layout = rt.layout;
+    let layers = rt.layers;
     let started = Instant::now();
     for step_i in 0..steps {
         rt.dispatch_and_wait(|enc| {
             let cur_state: CanvasState = read_struct(&enc.bufs.state);
             let first_step = if cur_state.step == 0 { 1u32 } else { 0u32 };
-            enc.encode_step_preamble(&rt.layout, first_step)?;
-            for layer in 0..rt.layers {
-                enc.encode_layer(layer, &rt.layout)?;
+            enc.encode_step_preamble(&layout, first_step)?;
+            for layer in 0..layers {
+                enc.encode_layer(layer, &layout)?;
             }
-            enc.encode_step_finish(&rt.layout, finish)?;
+            enc.encode_step_finish(&layout, finish)?;
             Ok(())
         })?;
         eprintln!("step-smoke: completed denoise step {}/{}", step_i + 1, steps);
