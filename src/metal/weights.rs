@@ -1,8 +1,8 @@
-//! Pre-transposed bf16 weights and f32 norm vectors (load once, reuse every forward).
+//! GPU decoder weights: PyTorch-layout bf16 linears + f32 norms (upload once per layer).
 
 use crate::buffer::Buffer;
 use crate::config::TextConfig;
-use crate::fast_slice::{bf16_to_f32_into, FastBf16Slice, FastSlice};
+use crate::fast_slice::{bf16_to_f32_into, FastBf16Slice};
 use crate::metal::expert_cache::{ExpertCacheStats, ExpertWeightCache};
 use crate::metal::linear::CachedLinear;
 use crate::model::layer_weights::DecoderLayerWeights;
@@ -18,6 +18,7 @@ fn bf16_tensor_to_f32_buffer(slice: Bf16Slice<'_>) -> Buffer<f32> {
     bf16_to_f32_into(FastBf16Slice::from_bf16(slice), out.as_fast_slice_mut());
     out
 }
+
 
 struct LayerSlot {
     loaded_layer: usize,
@@ -95,22 +96,22 @@ impl GpuLayerWeightCache {
             + self.router_scale.len()
             + self.per_expert_scale.len()) as u64
             * 4;
-        bytes += (self.q_proj.w_t.len()
-            + self.k_proj.w_t.len()
-            + self.o_proj.w_t.len()
-            + self.mlp_gate.w_t.len()
-            + self.mlp_up.w_t.len()
-            + self.mlp_down.w_t.len()) as u64
+        bytes += (self.q_proj.w.len()
+            + self.k_proj.w.len()
+            + self.o_proj.w.len()
+            + self.mlp_gate.w.len()
+            + self.mlp_up.w.len()
+            + self.mlp_down.w.len()) as u64
             * 2;
         if let Some(v) = &self.v_proj {
-            bytes += v.w_t.len() as u64 * 2;
+            bytes += v.w.len() as u64 * 2;
         }
         bytes
     }
 }
 
-/// Final norm plus at most one layer of transposed GPU weights resident at a time.
-/// MoE expert transposes use an LRU cache bounded by GPU memory budget.
+/// Final norm plus at most one layer of GPU weights resident at a time.
+/// MoE experts use an LRU of GPU buffers (mmap → GPU upload, no transpose).
 pub struct GpuDecoderWeightCache {
     pub final_norm: Buffer<f32>,
     layer: RefCell<LayerSlot>,
@@ -139,30 +140,64 @@ impl GpuDecoderWeightCache {
         self.expert_cache.borrow().stats()
     }
 
-    pub fn with_expert_gate_up_t<R>(
+    pub fn prefetch_expert(
         &self,
         layer: usize,
         gate_up: Bf16Slice<'_>,
         down: Bf16Slice<'_>,
         expert: usize,
-        f: impl FnOnce(FastSlice<'_, u16>) -> R,
-    ) -> R {
-        self.expert_cache
-            .borrow_mut()
-            .with_expert_gate_up_t(layer, gate_up, down, expert, f)
+        device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
+        pool: &mut crate::metal::buffer::BufferPool,
+    ) {
+        self.expert_cache.borrow_mut().prefetch_expert(
+            layer, gate_up, down, expert, device, pool,
+        );
     }
 
-    pub fn with_expert_down_t<R>(
+    pub fn expert_gate_up_buf(
+        &self,
+        layer: usize,
+        expert: usize,
+    ) -> objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>> {
+        self.expert_cache.borrow().expert_gate_up_buf(layer, expert)
+    }
+
+    pub fn expert_down_buf(
+        &self,
+        layer: usize,
+        expert: usize,
+    ) -> objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>> {
+        self.expert_cache.borrow().expert_down_buf(layer, expert)
+    }
+
+    pub fn with_expert_gate_up_buf<R>(
         &self,
         layer: usize,
         gate_up: Bf16Slice<'_>,
         down: Bf16Slice<'_>,
         expert: usize,
-        f: impl FnOnce(FastSlice<'_, u16>) -> R,
+        device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
+        pool: &mut crate::metal::buffer::BufferPool,
+        f: impl FnOnce(&objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>) -> R,
     ) -> R {
-        self.expert_cache
-            .borrow_mut()
-            .with_expert_down_t(layer, gate_up, down, expert, f)
+        self.expert_cache.borrow_mut().with_expert_gate_up_buf(
+            layer, gate_up, down, expert, device, pool, f,
+        )
+    }
+
+    pub fn with_expert_down_buf<R>(
+        &self,
+        layer: usize,
+        gate_up: Bf16Slice<'_>,
+        down: Bf16Slice<'_>,
+        expert: usize,
+        device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
+        pool: &mut crate::metal::buffer::BufferPool,
+        f: impl FnOnce(&objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>) -> R,
+    ) -> R {
+        self.expert_cache.borrow_mut().with_expert_down_buf(
+            layer, gate_up, down, expert, device, pool, f,
+        )
     }
 
     pub fn ensure_layer(
@@ -170,14 +205,41 @@ impl GpuDecoderWeightCache {
         store: &WeightStore,
         text: &TextConfig,
         layer: usize,
+        device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
+        pool: &mut crate::metal::buffer::BufferPool,
     ) -> Result<(), Error> {
         let mut slot = self.layer.borrow_mut();
         if slot.loaded_layer != layer || slot.cache.is_none() {
             let weights = DecoderLayerWeights::load(store, layer, text)?;
-            slot.cache = Some(GpuLayerWeightCache::load(&weights, text)?);
+            let cache = GpuLayerWeightCache::load(&weights, text)?;
+            slot.cache = Some(cache);
             slot.loaded_layer = layer;
+            drop(slot);
+            self.warm_layer_gpu(layer, device, pool);
         }
         Ok(())
+    }
+
+    fn warm_layer_gpu(
+        &self,
+        layer: usize,
+        device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
+        pool: &mut crate::metal::buffer::BufferPool,
+    ) {
+        let slot = self.layer.borrow();
+        let cache = slot.cache.as_ref().expect("layer cache");
+        if slot.loaded_layer != layer {
+            return;
+        }
+        let _ = cache.q_proj.gpu_weight(device, pool);
+        let _ = cache.k_proj.gpu_weight(device, pool);
+        if let Some(v) = &cache.v_proj {
+            let _ = v.gpu_weight(device, pool);
+        }
+        let _ = cache.o_proj.gpu_weight(device, pool);
+        let _ = cache.mlp_gate.gpu_weight(device, pool);
+        let _ = cache.mlp_up.gpu_weight(device, pool);
+        let _ = cache.mlp_down.gpu_weight(device, pool);
     }
 
     pub fn layer(&self) -> std::cell::Ref<'_, GpuLayerWeightCache> {
@@ -190,6 +252,17 @@ impl GpuDecoderWeightCache {
 
     pub fn release_layer(&self) {
         let mut slot = self.layer.borrow_mut();
+        if let Some(cache) = slot.cache.as_ref() {
+            cache.q_proj.clear_gpu();
+            cache.k_proj.clear_gpu();
+            if let Some(v) = &cache.v_proj {
+                v.clear_gpu();
+            }
+            cache.o_proj.clear_gpu();
+            cache.mlp_gate.clear_gpu();
+            cache.mlp_up.clear_gpu();
+            cache.mlp_down.clear_gpu();
+        }
         slot.cache = None;
         slot.loaded_layer = NO_LAYER;
     }

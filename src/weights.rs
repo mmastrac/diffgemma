@@ -1,3 +1,4 @@
+use crate::pack::{PackedStore, TensorLayout};
 use crate::safetensors::{Error, SafetensorsFile, TensorInfo};
 use crate::tensor::TensorView;
 use serde::Deserialize;
@@ -11,7 +12,8 @@ struct IndexFile {
     weight_map: BTreeMap<String, String>,
 }
 
-pub struct WeightStore {
+/// Original HuggingFace sharded safetensors layout.
+pub struct SafetensorStore {
     pub model_dir: PathBuf,
     pub metadata: BTreeMap<String, serde_json::Value>,
     pub shards: Vec<SafetensorsFile>,
@@ -19,7 +21,7 @@ pub struct WeightStore {
     index: HashMap<String, (usize, usize)>,
 }
 
-impl WeightStore {
+impl SafetensorStore {
     pub fn open(model_dir: impl AsRef<Path>) -> Result<Self, Error> {
         let model_dir = model_dir.as_ref().to_path_buf();
         let index_path = model_dir.join("model.safetensors.index.json");
@@ -60,7 +62,6 @@ impl WeightStore {
         Some((shard, &shard.tensors[tensor_idx]))
     }
 
-    /// Zero-copy mmap view of a named weight tensor.
     pub fn tensor(&self, name: &str) -> Result<TensorView<'_>, Error> {
         let (shard, info) = self
             .get(name)
@@ -68,21 +69,15 @@ impl WeightStore {
         let data = shard.data(info);
         Ok(TensorView::from_info(&info.name, info, data))
     }
-}
 
-pub struct Summary {
-    pub shard_count: usize,
-    pub tensor_count_index: usize,
-    pub tensor_count_headers: usize,
-    pub total_file_bytes: u64,
-    pub total_data_bytes: u64,
-    pub total_elements: i64,
-    pub dtypes: BTreeMap<String, usize>,
-    pub top_prefixes: Vec<(String, usize)>,
-    pub largest: Vec<(String, i64, String)>,
-}
+    pub fn tensor_layout(&self, _name: &str) -> TensorLayout {
+        TensorLayout::Raw
+    }
 
-impl WeightStore {
+    pub fn is_packed(&self) -> bool {
+        false
+    }
+
     pub fn summarize(&self) -> Summary {
         let mut dtypes = BTreeMap::new();
         let mut prefix_counts: BTreeMap<String, usize> = BTreeMap::new();
@@ -119,12 +114,88 @@ impl WeightStore {
     }
 }
 
-fn top_prefix(name: &str) -> String {
+/// Inference weights: safetensors (default) or pre-packed `iris.pack`.
+pub enum WeightStore {
+    Safetensors(SafetensorStore),
+    Packed(PackedStore),
+}
+
+impl WeightStore {
+    pub fn open(model_dir: impl AsRef<Path>) -> Result<Self, Error> {
+        let model_dir = model_dir.as_ref();
+        if model_dir.join(crate::pack::layout::MANIFEST_FILE).exists() {
+            Ok(Self::Packed(PackedStore::open(model_dir)?))
+        } else {
+            Ok(Self::Safetensors(SafetensorStore::open(model_dir)?))
+        }
+    }
+
+    pub fn model_dir(&self) -> &Path {
+        match self {
+            Self::Safetensors(s) => &s.model_dir,
+            Self::Packed(s) => &s.model_dir,
+        }
+    }
+
+    pub fn is_packed(&self) -> bool {
+        match self {
+            Self::Safetensors(s) => s.is_packed(),
+            Self::Packed(s) => s.is_packed(),
+        }
+    }
+
+    pub fn tensor_layout(&self, name: &str) -> TensorLayout {
+        match self {
+            Self::Safetensors(s) => s.tensor_layout(name),
+            Self::Packed(s) => s.tensor_layout(name),
+        }
+    }
+
+    pub fn experts_pretransposed(&self) -> bool {
+        self.tensor_layout("model.decoder.layers.0.experts.gate_up_proj")
+            == TensorLayout::ExpertGateUpT
+    }
+
+    pub fn tensor(&self, name: &str) -> Result<TensorView<'_>, Error> {
+        match self {
+            Self::Safetensors(s) => s.tensor(name),
+            Self::Packed(s) => s.tensor(name),
+        }
+    }
+
+    pub fn summarize(&self) -> Summary {
+        match self {
+            Self::Safetensors(s) => s.summarize(),
+            Self::Packed(s) => s.summarize(),
+        }
+    }
+
+    pub fn safetensor_metadata(&self) -> Option<&BTreeMap<String, serde_json::Value>> {
+        match self {
+            Self::Safetensors(s) => Some(&s.metadata),
+            Self::Packed(_) => None,
+        }
+    }
+}
+
+pub struct Summary {
+    pub shard_count: usize,
+    pub tensor_count_index: usize,
+    pub tensor_count_headers: usize,
+    pub total_file_bytes: u64,
+    pub total_data_bytes: u64,
+    pub total_elements: i64,
+    pub dtypes: BTreeMap<String, usize>,
+    pub top_prefixes: Vec<(String, usize)>,
+    pub largest: Vec<(String, i64, String)>,
+}
+
+pub(crate) fn top_prefix(name: &str) -> String {
     let parts: Vec<&str> = name.split('.').collect();
     parts[..parts.len().min(3)].join(".")
 }
 
-fn format_shape(shape: &[i64]) -> String {
+pub(crate) fn format_shape(shape: &[i64]) -> String {
     if shape.is_empty() {
         "[]".into()
     } else {

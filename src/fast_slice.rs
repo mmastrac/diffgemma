@@ -49,6 +49,10 @@ impl<'a, T> FastSlice<'a, T> {
 }
 
 impl<'a, T> FastSliceMut<'a, T> {
+    pub fn from_slice_mut(slice: &'a mut [T]) -> Self {
+        unsafe { Self::from_ptr(slice.as_mut_ptr(), slice.len()) }
+    }
+
     /// # Safety
     /// `ptr` must be valid for `len` writes for `'a`.
     pub unsafe fn from_ptr(ptr: *mut T, len: usize) -> Self {

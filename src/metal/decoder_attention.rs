@@ -40,14 +40,14 @@ fn fused_input_qkv_heads(
     )?;
     let buf_q = linear_cached_batched_in_buf(
         &mut batch,
-        &engine.f32_bf16_gemm_pipeline,
+        &engine.f32_bf16_linear_pipeline,
         &buf_normed,
         &cached.q_proj,
         seq_len,
     )?;
     let buf_k = linear_cached_batched_in_buf(
         &mut batch,
-        &engine.f32_bf16_gemm_pipeline,
+        &engine.f32_bf16_linear_pipeline,
         &buf_normed,
         &cached.k_proj,
         seq_len,
@@ -55,7 +55,7 @@ fn fused_input_qkv_heads(
     let buf_v = if let Some(v_proj) = &cached.v_proj {
         linear_cached_batched_in_buf(
             &mut batch,
-            &engine.f32_bf16_gemm_pipeline,
+            &engine.f32_bf16_linear_pipeline,
             &buf_normed,
             v_proj,
             seq_len,
@@ -128,7 +128,7 @@ fn fused_gqa_o_proj_gpu_kv(
     )?;
     linear_cached_batched_in_cpu_out(
         &mut batch,
-        &engine.f32_bf16_gemm_pipeline,
+        &engine.f32_bf16_linear_pipeline,
         out,
         &buf_attn,
         o_proj,
@@ -254,7 +254,7 @@ pub fn forward_decoder_attention(
         )?;
         linear_cached_batched_in_cpu_out(
             &mut batch,
-            &engine.f32_bf16_gemm_pipeline,
+            &engine.f32_bf16_linear_pipeline,
             out,
             &buf_attn,
             &cached.o_proj,

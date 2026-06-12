@@ -8,6 +8,7 @@ mod kernels;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod metal;
 mod model;
+mod pack;
 mod sample;
 mod safetensors;
 mod tensor;
@@ -77,11 +78,15 @@ enum Command {
         layers: usize,
         iters: usize,
     },
+    ConvertModel {
+        output_dir: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
     let cli = parse_cli();
     match cli.command {
+        Command::ConvertModel { output_dir } => run_convert_model(&cli.model_dir, &output_dir),
         Command::Tokenize(text) => run_tokenize(&cli.model_dir, &text),
         Command::Gemm { size } => run_gemm(size),
         command => {
@@ -202,6 +207,35 @@ fn run_command(m: &model::Model, model_dir: &std::path::Path, command: Command) 
         ),
         Command::Tokenize(_) => ExitCode::FAILURE,
         Command::Gemm { .. } => ExitCode::FAILURE,
+        Command::ConvertModel { .. } => ExitCode::FAILURE,
+    }
+}
+
+fn run_convert_model(source_dir: &std::path::Path, output_dir: &std::path::Path) -> ExitCode {
+    use pack::{convert_model, ConvertOptions};
+    eprintln!(
+        "convert-model: {} -> {}",
+        source_dir.display(),
+        output_dir.display()
+    );
+    match convert_model(ConvertOptions {
+        source_dir: source_dir.to_path_buf(),
+        output_dir: output_dir.to_path_buf(),
+    }) {
+        Ok(summary) => {
+            println!("convert-model ok");
+            println!("  tensors:           {}", summary.tensor_count);
+            println!("  blob size:         {:.2} GiB", summary.blob_bytes as f64 / (1024.0_f64.powi(3)));
+            println!("  gemm transposed:   {}", summary.transposed_gemm);
+            println!("  expert transposed: {}", summary.transposed_experts);
+            println!("  raw copied:        {}", summary.raw_copied);
+            println!("  manifest:          {}/{}", output_dir.display(), pack::layout::MANIFEST_FILE);
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -226,6 +260,7 @@ fn parse_cli() -> Cli {
     let mut compare_cpu = false;
     let mut write_golden: Option<String> = None;
     let mut no_early_stop = false;
+    let mut output_dir: Option<PathBuf> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -237,6 +272,11 @@ fn parse_cli() -> Cli {
             "-m" | "--model" => {
                 if let Some(path) = args.next() {
                     model_dir = PathBuf::from(path);
+                }
+            }
+            "-o" | "--output" => {
+                if let Some(path) = args.next() {
+                    output_dir = Some(PathBuf::from(path));
                 }
             }
             "--seed" => {
@@ -406,10 +446,17 @@ fn parse_cli() -> Cli {
             layers: bench_layers,
             iters: bench_iters,
         },
+        Some("convert-model") => {
+            let out = output_dir.unwrap_or_else(|| {
+                eprintln!("usage: diffgemma-mps convert-model -o OUTPUT_DIR [-m SOURCE_MODEL]");
+                std::process::exit(2);
+            });
+            Command::ConvertModel { output_dir: out }
+        }
         Some(cmd) => {
             eprintln!("unknown command: {cmd}");
             eprintln!(
-                "usage: diffgemma-mps [-p PROMPT] [summary|config|weights <name>|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-parity|tokenize <text>|gemm|attention]"
+                "usage: diffgemma-mps [-p PROMPT] [summary|config|weights <name>|convert-model|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-parity|tokenize <text>|gemm|attention]"
             );
             eprintln!("  default (no command): generate-gpu with --features metal");
             eprintln!("  generate-parity: GPU vs checked-in golden (use --compare-cpu for slow CPU path)");
@@ -471,7 +518,10 @@ fn print_summary(store: &weights::WeightStore) {
     let s = store.summarize();
 
     println!("DiffusionGemma weight summary");
-    println!("  model dir:          {}", store.model_dir.display());
+    println!("  model dir:          {}", store.model_dir().display());
+    if store.is_packed() {
+        println!("  format:             iris.pack (pre-transposed)");
+    }
     println!("  shards:             {}", s.shard_count);
     println!("  tensors (index):    {}", s.tensor_count_index);
     println!("  tensors (headers):  {}", s.tensor_count_headers);
@@ -479,11 +529,13 @@ fn print_summary(store: &weights::WeightStore) {
     println!("  tensor payload:     {:.2} GiB", gib(s.total_data_bytes));
     println!("  total elements:     {}", s.total_elements);
 
-    if let Some(params) = store.metadata.get("total_parameters") {
-        println!("  index metadata total_parameters: {params}");
-    }
-    if let Some(size) = store.metadata.get("total_size") {
-        println!("  index metadata total_size:       {size}");
+    if let Some(meta) = store.safetensor_metadata() {
+        if let Some(params) = meta.get("total_parameters") {
+            println!("  index metadata total_parameters: {params}");
+        }
+        if let Some(size) = meta.get("total_size") {
+            println!("  index metadata total_size:       {size}");
+        }
     }
 
     println!("\n  dtypes:");
@@ -497,15 +549,22 @@ fn print_summary(store: &weights::WeightStore) {
     }
 
     println!("\n  per-shard:");
-    for shard in &store.shards {
-        let payload: u64 = shard.tensors.iter().map(|t| t.data_size as u64).sum();
-        println!(
-            "    {}  {:>4} tensors  {:.2} GiB payload  {:.2} GiB file",
-            shard.path.file_name().unwrap().to_string_lossy(),
-            shard.tensors.len(),
-            gib(payload),
-            gib(shard.file_size() as u64),
-        );
+    match store {
+        weights::WeightStore::Safetensors(s) => {
+            for shard in &s.shards {
+                let payload: u64 = shard.tensors.iter().map(|t| t.data_size as u64).sum();
+                println!(
+                    "    {}  {:>4} tensors  {:.2} GiB payload  {:.2} GiB file",
+                    shard.path.file_name().unwrap().to_string_lossy(),
+                    shard.tensors.len(),
+                    gib(payload),
+                    gib(shard.file_size() as u64),
+                );
+            }
+        }
+        weights::WeightStore::Packed(_) => {
+            println!("    iris.pack.bin  (single mmap blob)");
+        }
     }
 
     println!("\n  largest tensors (by numel):");

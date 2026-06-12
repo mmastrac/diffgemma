@@ -18,8 +18,8 @@ struct PendingRead {
 
 pub struct GpuBatch<'a> {
     queue: &'a ProtocolObject<dyn MTLCommandQueue>,
-    pool: &'a mut BufferPool,
-    device: &'a ProtocolObject<dyn MTLDevice>,
+    pub(crate) pool: &'a mut BufferPool,
+    pub(crate) device: &'a ProtocolObject<dyn MTLDevice>,
     cmd: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     enc: Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>,
     reads: Vec<PendingRead>,
@@ -177,16 +177,43 @@ impl<'a> GpuBatch<'a> {
         n: usize,
         k: usize,
     ) {
+        Self::dispatch_matmul(self.encoder(), pipeline, buf_a, buf_b, buf_c, m, n, k);
+    }
+
+    /// `C[M,N] = A[M,K] @ W[N,K]^T` with PyTorch row-major `W`.
+    pub fn dispatch_linear(
+        &self,
+        pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+        buf_a: &ProtocolObject<dyn MTLBuffer>,
+        buf_w: &ProtocolObject<dyn MTLBuffer>,
+        buf_c: &ProtocolObject<dyn MTLBuffer>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        Self::dispatch_matmul(self.encoder(), pipeline, buf_a, buf_w, buf_c, m, n, k);
+    }
+
+    fn dispatch_matmul(
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+        buf_a: &ProtocolObject<dyn MTLBuffer>,
+        buf_b: &ProtocolObject<dyn MTLBuffer>,
+        buf_c: &ProtocolObject<dyn MTLBuffer>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
         const THREADGROUP: usize = 16;
-        self.encoder().setComputePipelineState(pipeline);
+        encoder.setComputePipelineState(pipeline);
         unsafe {
-            self.encoder().setBuffer_offset_atIndex(Some(buf_a), 0, 0);
-            self.encoder().setBuffer_offset_atIndex(Some(buf_b), 0, 1);
-            self.encoder().setBuffer_offset_atIndex(Some(buf_c), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(buf_a), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(buf_b), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(buf_c), 0, 2);
         }
         let dims = [m as u32, n as u32, k as u32];
         unsafe {
-            self.encoder().setBytes_length_atIndex(
+            encoder.setBytes_length_atIndex(
                 std::ptr::NonNull::from_ref(&dims).cast(),
                 std::mem::size_of_val(&dims),
                 3,
@@ -202,8 +229,7 @@ impl<'a> GpuBatch<'a> {
             height: div_up(m, THREADGROUP),
             depth: 1,
         };
-        self.encoder()
-            .dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
     }
 
     pub fn register_read(

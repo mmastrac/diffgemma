@@ -11,12 +11,14 @@ use objc2_metal::{
 const GEMM_SHADER: &str = include_str!("../../shaders/gemm.metal");
 const GEMM_ENTRY: &str = "bf16_gemm";
 const F32_BF16_GEMM_ENTRY: &str = "f32_bf16_gemm";
+const F32_BF16_LINEAR_ENTRY: &str = "f32_bf16_linear";
 const THREADGROUP: usize = 16;
 
 pub struct Bf16Gemm {
     ctx: MetalContext,
     pipeline: ComputePipeline,
     f32_bf16_pipeline: ComputePipeline,
+    f32_bf16_linear_pipeline: ComputePipeline,
     pool: BufferPool,
 }
 
@@ -25,10 +27,12 @@ impl Bf16Gemm {
         let ctx = MetalContext::new()?;
         let pipeline = ctx.compile_kernel(GEMM_SHADER, GEMM_ENTRY)?;
         let f32_bf16_pipeline = ctx.compile_kernel(GEMM_SHADER, F32_BF16_GEMM_ENTRY)?;
+        let f32_bf16_linear_pipeline = ctx.compile_kernel(GEMM_SHADER, F32_BF16_LINEAR_ENTRY)?;
         Ok(Self {
             ctx,
             pipeline,
             f32_bf16_pipeline,
+            f32_bf16_linear_pipeline,
             pool: BufferPool::new(),
         })
     }
@@ -108,6 +112,72 @@ impl Bf16Gemm {
     }
 
     /// Row-major GEMM with f32 activations and bf16 weights: C[M,N] = A[M,K] @ B[K,N].
+    /// `C = A @ W^T` with PyTorch `W[n,k]`.
+    pub fn matmul_f32_bf16_linear(
+        &mut self,
+        a: &[f32],
+        w: &[u16],
+        c: &mut [f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<(), Error> {
+        if a.len() != m * k || w.len() != n * k || c.len() != m * n {
+            return Err(Error::Format("f32_bf16 linear shape mismatch"));
+        }
+
+        let a_bytes = a.len() * 4;
+        let w_bytes = w.len() * 2;
+        let c_bytes = c.len() * 4;
+
+        let buf_a = self
+            .pool
+            .allocate(&self.ctx.device, a_bytes)
+            .ok_or(Error::Format("Metal buffer alloc failed"))?;
+        let buf_w = self
+            .pool
+            .allocate(&self.ctx.device, w_bytes)
+            .ok_or(Error::Format("Metal buffer alloc failed"))?;
+        let buf_c = self
+            .pool
+            .allocate(&self.ctx.device, c_bytes)
+            .ok_or(Error::Format("Metal buffer alloc failed"))?;
+
+        BufferPool::write_f32(&buf_a, a);
+        BufferPool::write_bf16(&buf_w, w);
+        BufferPool::write_f32(&buf_c, c);
+
+        let cmd_buf = self
+            .ctx
+            .queue
+            .commandBuffer()
+            .ok_or(Error::Format("Metal command buffer alloc failed"))?;
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .ok_or(Error::Format("Metal compute encoder alloc failed"))?;
+
+        encode_gemm(
+            &encoder,
+            &self.f32_bf16_linear_pipeline.pipeline,
+            &buf_a,
+            &buf_w,
+            &buf_c,
+            m,
+            n,
+            k,
+        );
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+
+        BufferPool::read_f32(&buf_c, c);
+
+        self.pool.release(a_bytes, buf_a);
+        self.pool.release(w_bytes, buf_w);
+        self.pool.release(c_bytes, buf_c);
+        Ok(())
+    }
+
     pub fn matmul_f32_bf16(
         &mut self,
         a: &[f32],
@@ -339,6 +409,20 @@ fn div_up(value: usize, group: usize) -> usize {
     (value + group - 1) / group
 }
 
+pub fn f32_bf16_linear_cpu(c: &mut [f32], a: &[f32], w: &[u16], m: usize, k: usize, n: usize) {
+    for row in 0..m {
+        for col in 0..n {
+            let mut sum = 0.0f32;
+            for p in 0..k {
+                let av = a[row * k + p];
+                let wv = bf16_to_f32(w[col * k + p]);
+                sum += av * wv;
+            }
+            c[row * n + col] = sum;
+        }
+    }
+}
+
 pub fn f32_bf16_matmul_cpu(c: &mut [f32], a: &[f32], b: &[u16], m: usize, k: usize, n: usize) {
     for row in 0..m {
         for col in 0..n {
@@ -382,21 +466,21 @@ mod tests {
 
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
-    fn gpu_f32_bf16_gemm_matches_cpu_decoder_mlp_shape() {
+    fn gpu_f32_bf16_linear_matches_cpu_decoder_mlp_shape() {
         let m = 256usize;
         let k = 2816usize;
         let n = 2112usize;
         let a: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.001).sin()).collect();
-        let b: Vec<u16> = (0..k * n)
+        let w: Vec<u16> = (0..n * k)
             .map(|i| f32_to_bf16(((i as f32) * 0.0007).cos() * 0.01))
             .collect();
         let mut cpu = vec![0.0f32; m * n];
-        f32_bf16_matmul_cpu(&mut cpu, &a, &b, m, k, n);
+        f32_bf16_linear_cpu(&mut cpu, &a, &w, m, k, n);
 
         let mut gpu = vec![0.0f32; m * n];
         let mut gemm = Bf16Gemm::new().expect("gemm");
-        gemm.matmul_f32_bf16(&a, &b, &mut gpu, m, k, n)
-            .expect("gpu gemm");
+        gemm.matmul_f32_bf16_linear(&a, &w, &mut gpu, m, k, n)
+            .expect("gpu linear");
 
         let max_diff = cpu
             .iter()

@@ -62,7 +62,7 @@ pub fn prefill_gpu(
     let mut use_a_input = true;
     for layer in 0..n_layers {
         let layer_weights = DecoderLayerWeights::load(store, layer, text)?;
-        weights.ensure_layer(store, text, layer)?;
+        weights.ensure_layer(store, text, layer, &engine.ctx.device, &mut engine.pool)?;
         let layer_cache = weights.layer();
         let layer_scratch = dec_scratch.ensure_layer_scratch(cfg, seq_len, 0, layer)?;
         if use_a_input {
@@ -159,7 +159,7 @@ pub fn extend_prefill_gpu(
     let mut use_a_input = true;
     for layer in 0..n_layers {
         let layer_weights = DecoderLayerWeights::load(store, layer, text)?;
-        weights.ensure_layer(store, text, layer)?;
+        weights.ensure_layer(store, text, layer, &engine.ctx.device, &mut engine.pool)?;
         let layer_cache = weights.layer();
         let layer_scratch =
             dec_scratch.ensure_layer_scratch(cfg, seq_len, kv_len_before, layer)?;

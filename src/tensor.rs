@@ -21,6 +21,15 @@ impl<'a> TensorView<'a> {
         }
     }
 
+    pub fn from_parts(name: &'a str, dtype: DType, shape: &'a [i64], data: &'a [u8]) -> Self {
+        Self {
+            name,
+            dtype,
+            shape,
+            data,
+        }
+    }
+
     pub fn numel(&self) -> i64 {
         self.shape.iter().product()
     }
@@ -87,8 +96,7 @@ pub struct Bf16Slice<'a> {
 }
 
 impl<'a> Bf16Slice<'a> {
-    #[cfg(test)]
-    pub(crate) fn from_bytes(data: &'a [u8]) -> Self {
+    pub fn from_bytes(data: &'a [u8]) -> Self {
         Self { data }
     }
 

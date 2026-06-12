@@ -237,7 +237,7 @@ fn forward_inner(
     for layer in 0..n_layers {
         let layer_scratch = scratch.layer.ensure(cfg, seq_len, input.kv_cache.kv_len, layer)?;
         let layer_weights = DecoderLayerWeights::load(store, layer, text)?;
-        weights.ensure_layer(store, text, layer)?;
+        weights.ensure_layer(store, text, layer, &engine.ctx.device, &mut engine.pool)?;
         let layer_cache = weights.layer();
         layer_forward(
             out_buf,

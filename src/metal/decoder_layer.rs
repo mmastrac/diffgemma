@@ -148,14 +148,14 @@ fn forward_layer_ff(
         )?;
         let buf_gate = linear_cached_batched_in_buf(
             &mut batch,
-            &engine.f32_bf16_gemm_pipeline,
+            &engine.f32_bf16_linear_pipeline,
             &buf_normed,
             &cached.mlp_gate,
             seq_len,
         )?;
         let buf_up = linear_cached_batched_in_buf(
             &mut batch,
-            &engine.f32_bf16_gemm_pipeline,
+            &engine.f32_bf16_linear_pipeline,
             &buf_normed,
             &cached.mlp_up,
             seq_len,
@@ -165,7 +165,7 @@ fn forward_layer_ff(
         bk::swiglu_mul_gpu_bufs(&mut batch, &engine.kernels, &buf_gate, &buf_up, act_len)?;
         let buf_down = linear_cached_batched_in_buf(
             &mut batch,
-            &engine.f32_bf16_gemm_pipeline,
+            &engine.f32_bf16_linear_pipeline,
             &buf_gate,
             &cached.mlp_down,
             seq_len,
@@ -210,7 +210,7 @@ fn forward_layer_ff(
         &engine.ctx,
         &mut engine.pool,
         &engine.kernels,
-        &engine.f32_bf16_gemm_pipeline,
+        &engine.f32_bf16_linear_pipeline,
     )?;
 
     {

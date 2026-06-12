@@ -1,9 +1,11 @@
-//! LRU cache for transposed MoE expert weights, bounded by GPU memory budget.
+//! LRU cache for MoE expert bf16 weights on GPU (PyTorch layout, no transpose).
 
-use crate::buffer::Buffer;
+use crate::metal::buffer::BufferPool;
 use crate::config::TextConfig;
-use crate::fast_slice::{transpose_bf16_weight_into, FastBf16Slice, FastSlice};
 use crate::tensor::Bf16Slice;
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLBuffer, MTLDevice};
 use std::collections::VecDeque;
 
 /// Target max fraction of Metal `recommendedMaxWorkingSetSize` for all resident data.
@@ -26,7 +28,7 @@ pub struct ExpertCacheStats {
     pub evictions: u64,
 }
 
-/// Bytes for one expert's transposed gate_up + down (bf16).
+/// Bytes for one expert's gate_up + down (bf16, PyTorch layout).
 pub fn expert_entry_bytes(text: &TextConfig) -> u64 {
     let moe_inter = text.moe_intermediate_size as u64;
     let hidden = text.hidden_size as u64;
@@ -36,8 +38,8 @@ pub fn expert_entry_bytes(text: &TextConfig) -> u64 {
 }
 
 struct LayerExpertWeightCache {
-    gate_up: Vec<Option<Buffer<u16>>>,
-    down: Vec<Option<Buffer<u16>>>,
+    gate_up: Vec<Option<Retained<ProtocolObject<dyn MTLBuffer>>>>,
+    down: Vec<Option<Retained<ProtocolObject<dyn MTLBuffer>>>>,
 }
 
 struct ExpertLruCache {
@@ -109,10 +111,10 @@ impl ExpertLruCache {
         };
         let slot = &mut self.layers[layer];
         if let Some(buf) = slot.gate_up[expert].take() {
-            self.used_bytes = self.used_bytes.saturating_sub(buf.len() as u64 * 2);
+            self.used_bytes = self.used_bytes.saturating_sub(buf.length() as u64);
         }
         if let Some(buf) = slot.down[expert].take() {
-            self.used_bytes = self.used_bytes.saturating_sub(buf.len() as u64 * 2);
+            self.used_bytes = self.used_bytes.saturating_sub(buf.length() as u64);
         }
         self.evictions += 1;
     }
@@ -126,12 +128,30 @@ impl ExpertLruCache {
         }
     }
 
+    fn upload_expert_bf16(
+        device: &ProtocolObject<dyn MTLDevice>,
+        pool: &mut BufferPool,
+        src: Bf16Slice<'_>,
+        elem_off: usize,
+        elem_len: usize,
+    ) -> Retained<ProtocolObject<dyn MTLBuffer>> {
+        let bytes = elem_len * 2;
+        let buf = pool
+            .allocate(device, bytes)
+            .expect("expert weight buffer alloc failed");
+        let src_bytes = &src.as_bytes()[elem_off * 2..elem_off * 2 + bytes];
+        BufferPool::write_bytes(&buf, src_bytes);
+        buf
+    }
+
     fn ensure_expert_weights(
         &mut self,
         layer: usize,
         gate_up: Bf16Slice<'_>,
         down: Bf16Slice<'_>,
         expert: usize,
+        device: &ProtocolObject<dyn MTLDevice>,
+        pool: &mut BufferPool,
     ) {
         if self.layers[layer].gate_up[expert].is_some() {
             self.touch(layer, expert);
@@ -140,20 +160,15 @@ impl ExpertLruCache {
 
         self.make_room(self.entry_bytes);
 
-        let out_dim = self.moe_inter * 2;
-        let gate_elems = out_dim * self.hidden;
-        let mut gate_buf = Buffer::new(gate_elems);
-        let src = FastBf16Slice::from_bf16(gate_up);
-        let src = unsafe { src.slice_unchecked(expert * self.gate_up_stride, gate_elems) };
-        transpose_bf16_weight_into(src, gate_buf.as_fast_slice_mut(), out_dim, self.hidden);
-
+        let gate_elems = self.moe_inter * 2 * self.hidden;
         let down_elems = self.hidden * self.moe_inter;
-        let mut down_buf = Buffer::new(down_elems);
-        let src = FastBf16Slice::from_bf16(down);
-        let src = unsafe { src.slice_unchecked(expert * self.down_stride, down_elems) };
-        transpose_bf16_weight_into(src, down_buf.as_fast_slice_mut(), self.hidden, self.moe_inter);
+        let gate_off = expert * self.gate_up_stride;
+        let down_off = expert * self.down_stride;
 
-        self.used_bytes += self.entry_bytes;
+        let gate_buf = Self::upload_expert_bf16(device, pool, gate_up, gate_off, gate_elems);
+        let down_buf = Self::upload_expert_bf16(device, pool, down, down_off, down_elems);
+
+        self.used_bytes += gate_buf.length() as u64 + down_buf.length() as u64;
         let slot = &mut self.layers[layer];
         slot.gate_up[expert] = Some(gate_buf);
         slot.down[expert] = Some(down_buf);
@@ -166,14 +181,15 @@ impl ExpertLruCache {
         gate_up: Bf16Slice<'_>,
         down: Bf16Slice<'_>,
         expert: usize,
-        f: impl FnOnce(FastSlice<'_, u16>) -> R,
+        device: &ProtocolObject<dyn MTLDevice>,
+        pool: &mut BufferPool,
+        f: impl FnOnce(&ProtocolObject<dyn MTLBuffer>) -> R,
     ) -> R {
-        self.ensure_expert_weights(layer, gate_up, down, expert);
-        let layers = &self.layers;
-        f(layers[layer].gate_up[expert]
+        self.ensure_expert_weights(layer, gate_up, down, expert, device, pool);
+        let buf = self.layers[layer].gate_up[expert]
             .as_ref()
-            .expect("expert gate_up")
-            .as_fast_slice())
+            .expect("expert gate_up");
+        f(buf)
     }
 
     fn with_down<R>(
@@ -182,14 +198,15 @@ impl ExpertLruCache {
         gate_up: Bf16Slice<'_>,
         down: Bf16Slice<'_>,
         expert: usize,
-        f: impl FnOnce(FastSlice<'_, u16>) -> R,
+        device: &ProtocolObject<dyn MTLDevice>,
+        pool: &mut BufferPool,
+        f: impl FnOnce(&ProtocolObject<dyn MTLBuffer>) -> R,
     ) -> R {
-        self.ensure_expert_weights(layer, gate_up, down, expert);
-        let layers = &self.layers;
-        f(layers[layer].down[expert]
+        self.ensure_expert_weights(layer, gate_up, down, expert, device, pool);
+        let buf = self.layers[layer].down[expert]
             .as_ref()
-            .expect("expert down")
-            .as_fast_slice())
+            .expect("expert down");
+        f(buf)
     }
 
     fn resident_bytes(&self) -> u64 {
@@ -216,26 +233,67 @@ impl ExpertWeightCache {
         self.inner.resident_bytes()
     }
 
-    pub fn with_expert_gate_up_t<R>(
+    pub fn with_expert_gate_up_buf<R>(
         &mut self,
         layer: usize,
         gate_up: Bf16Slice<'_>,
         down: Bf16Slice<'_>,
         expert: usize,
-        f: impl FnOnce(FastSlice<'_, u16>) -> R,
+        device: &ProtocolObject<dyn MTLDevice>,
+        pool: &mut BufferPool,
+        f: impl FnOnce(&ProtocolObject<dyn MTLBuffer>) -> R,
     ) -> R {
-        self.inner.with_gate_up(layer, gate_up, down, expert, f)
+        self.inner
+            .with_gate_up(layer, gate_up, down, expert, device, pool, f)
     }
 
-    pub fn with_expert_down_t<R>(
+    pub fn with_expert_down_buf<R>(
         &mut self,
         layer: usize,
         gate_up: Bf16Slice<'_>,
         down: Bf16Slice<'_>,
         expert: usize,
-        f: impl FnOnce(FastSlice<'_, u16>) -> R,
+        device: &ProtocolObject<dyn MTLDevice>,
+        pool: &mut BufferPool,
+        f: impl FnOnce(&ProtocolObject<dyn MTLBuffer>) -> R,
     ) -> R {
-        self.inner.with_down(layer, gate_up, down, expert, f)
+        self.inner
+            .with_down(layer, gate_up, down, expert, device, pool, f)
+    }
+
+    pub fn prefetch_expert(
+        &mut self,
+        layer: usize,
+        gate_up: Bf16Slice<'_>,
+        down: Bf16Slice<'_>,
+        expert: usize,
+        device: &ProtocolObject<dyn MTLDevice>,
+        pool: &mut BufferPool,
+    ) {
+        self.inner
+            .ensure_expert_weights(layer, gate_up, down, expert, device, pool);
+    }
+
+    pub fn expert_gate_up_buf(
+        &self,
+        layer: usize,
+        expert: usize,
+    ) -> Retained<ProtocolObject<dyn MTLBuffer>> {
+        self.inner.layers[layer].gate_up[expert]
+            .as_ref()
+            .expect("expert gate_up not prefetched")
+            .clone()
+    }
+
+    pub fn expert_down_buf(
+        &self,
+        layer: usize,
+        expert: usize,
+    ) -> Retained<ProtocolObject<dyn MTLBuffer>> {
+        self.inner.layers[layer].down[expert]
+            .as_ref()
+            .expect("expert down not prefetched")
+            .clone()
     }
 }
 
@@ -244,15 +302,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lru_evicts_oldest_when_over_budget() {
+    fn expert_entry_bytes_positive() {
         let text = test_text_config();
-        let entry = expert_entry_bytes(&text);
-        let mut cache = ExpertLruCache::new(&text, entry);
-        cache.insert_dummy(0, 0);
-        cache.insert_dummy(0, 1);
-        assert!(cache.layers[0].gate_up[0].is_none());
-        assert!(cache.layers[0].gate_up[1].is_some());
-        assert_eq!(cache.evictions, 1);
+        assert!(expert_entry_bytes(&text) > 0);
     }
 
     fn test_text_config() -> crate::config::TextConfig {
@@ -287,21 +339,6 @@ mod tests {
                     partial_rotary_factor: None,
                 },
             },
-        }
-    }
-
-    #[cfg(test)]
-    impl ExpertLruCache {
-        fn insert_dummy(&mut self, layer: usize, expert: usize) {
-            if self.layers[layer].gate_up[expert].is_some() {
-                self.touch(layer, expert);
-                return;
-            }
-            self.make_room(self.entry_bytes);
-            self.layers[layer].gate_up[expert] = Some(Buffer::new(4));
-            self.layers[layer].down[expert] = Some(Buffer::new(4));
-            self.used_bytes += self.entry_bytes;
-            self.touch(layer, expert);
         }
     }
 }

@@ -80,6 +80,17 @@ pub fn experts_forward_gpu_batched(
 
     let pipeline = &gemm_pipeline.pipeline;
 
+    for job in &jobs {
+        expert_cache.prefetch_expert(
+            layer,
+            gate_up,
+            down,
+            job.expert,
+            &ctx.device,
+            pool,
+        );
+    }
+
     // One sync: pre_ff norm → gather → gate_up GEMM → gelu/swiglu → down GEMM per expert job.
     {
         let mut batch = GpuBatch::begin(&ctx.queue, pool, &ctx.device)?;
@@ -105,37 +116,35 @@ pub fn experts_forward_gpu_batched(
                 hidden,
             )?;
             let act_len = batch_size * moe_inter;
-            let buf_act = expert_cache.with_expert_gate_up_t(layer, gate_up, down, job.expert, |w_t| {
-                let buf_gu = bk::f32_bf16_gemm_gpu_in_out(
-                    &mut batch,
-                    pipeline,
-                    &buf_a,
-                    w_t,
-                    batch_size,
-                    hidden,
-                    moe_inter * 2,
-                )?;
-                bk::gelu_swiglu_gate_up_gpu(
-                    &mut batch,
-                    kernels,
-                    &buf_gu,
-                    act_len,
-                    batch_size,
-                    moe_inter,
-                )
-            })?;
+            let w_gate = expert_cache.expert_gate_up_buf(layer, job.expert);
+            let buf_gu = bk::f32_bf16_linear_gpu_bufs(
+                &mut batch,
+                pipeline,
+                &buf_a,
+                &w_gate,
+                batch_size,
+                hidden,
+                moe_inter * 2,
+            )?;
+            let buf_act = bk::gelu_swiglu_gate_up_gpu(
+                &mut batch,
+                kernels,
+                &buf_gu,
+                act_len,
+                batch_size,
+                moe_inter,
+            )?;
+            let w_down = expert_cache.expert_down_buf(layer, job.expert);
             let out_slice = &mut out_arena[job.out_off..job.out_off + batch_size * hidden];
-            let buf_out = expert_cache.with_expert_down_t(layer, gate_up, down, job.expert, |w_t| {
-                bk::f32_bf16_gemm_gpu_in_out(
-                    &mut batch,
-                    pipeline,
-                    &buf_act,
-                    w_t,
-                    batch_size,
-                    moe_inter,
-                    hidden,
-                )
-            })?;
+            let buf_out = bk::f32_bf16_linear_gpu_bufs(
+                &mut batch,
+                pipeline,
+                &buf_act,
+                &w_down,
+                batch_size,
+                moe_inter,
+                hidden,
+            )?;
             batch.register_read(buf_out, out_slice);
         }
         batch.end()?;

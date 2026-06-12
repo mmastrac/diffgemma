@@ -212,6 +212,21 @@ pub fn f32_bf16_gemm_gpu_in_out(
     Ok(buf_c)
 }
 
+/// `C = A @ W^T` with PyTorch `W[out,in]` already on GPU.
+pub fn f32_bf16_linear_gpu_bufs(
+    batch: &mut GpuBatch<'_>,
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    a_buf: &ProtocolObject<dyn MTLBuffer>,
+    w_buf: &ProtocolObject<dyn MTLBuffer>,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
+    let buf_c = batch.alloc_f32_out(m * n)?;
+    batch.dispatch_linear(pipeline, a_buf, w_buf, &buf_c, m, n, k);
+    Ok(buf_c)
+}
+
 /// Copy `indices[b]` rows from `src` into contiguous `dst` rows on GPU.
 pub fn gather_rows_gpu(
     batch: &mut GpuBatch<'_>,
