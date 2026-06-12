@@ -18,16 +18,16 @@ struct ExpertJob {
 
 pub fn experts_forward_gpu_batched(
     out: &mut [f32],
-    expert_input: &[f32],
+    residual: &[f32],
+    pre_ff_norm_2: &[f32],
+    eps: f32,
     weights: &DecoderLayerWeights<'_>,
     expert_cache: &GpuDecoderWeightCache,
     layer: usize,
     cfg: &TextConfig,
-    _seq_len: usize,
+    seq_len: usize,
     routes: &[RouteResult],
-    batch_input: &mut Vec<f32>,
-    gate_up_arena: &mut Vec<f32>,
-    gate_act_arena: &mut Vec<f32>,
+    token_indices: &mut Vec<u32>,
     out_arena: &mut Vec<f32>,
     ctx: &MetalContext,
     pool: &mut crate::metal::buffer::BufferPool,
@@ -80,18 +80,30 @@ pub fn experts_forward_gpu_batched(
 
     let pipeline = &gemm_pipeline.pipeline;
 
-    // One sync: gate_up GEMM → gelu/swiglu → down GEMM per expert job.
+    // One sync: pre_ff norm → gather → gate_up GEMM → gelu/swiglu → down GEMM per expert job.
     {
         let mut batch = GpuBatch::begin(&ctx.queue, pool, &ctx.device)?;
+        let buf_res = batch.alloc_f32(residual)?;
+        let buf_moe_in = bk::rms_norm_rows_gpu_buf(
+            &mut batch,
+            kernels,
+            &buf_res,
+            pre_ff_norm_2,
+            seq_len,
+            hidden,
+            eps,
+        )?;
         for job in &jobs {
             let batch_size = job.tokens.len();
-            batch_input.resize(batch_size * hidden, 0.0);
-            for (bi, &(tok, _)) in job.tokens.iter().enumerate() {
-                let src = tok * hidden;
-                let dst = bi * hidden;
-                batch_input[dst..dst + hidden].copy_from_slice(&expert_input[src..src + hidden]);
-            }
-            let buf_a = batch.alloc_f32(&batch_input)?;
+            token_indices.clear();
+            token_indices.extend(job.tokens.iter().map(|&(tok, _)| tok as u32));
+            let buf_a = bk::gather_rows_gpu(
+                &mut batch,
+                kernels,
+                &buf_moe_in,
+                token_indices,
+                hidden,
+            )?;
             let act_len = batch_size * moe_inter;
             let buf_act = expert_cache.with_expert_gate_up_t(layer, gate_up, down, job.expert, |w_t| {
                 let buf_gu = bk::f32_bf16_gemm_gpu_in_out(

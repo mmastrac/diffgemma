@@ -27,9 +27,7 @@ pub struct GpuDecoderLayerScratch {
     pub dense_out: Vec<f32>,
     pub moe_branch: Vec<f32>,
     pub moe_input: Vec<f32>,
-    pub moe_batch_input: Vec<f32>,
-    pub moe_batch_gate_up: Vec<f32>,
-    pub moe_batch_gate_act: Vec<f32>,
+    pub moe_token_indices: Vec<u32>,
     pub moe_batch_out: Vec<f32>,
 }
 
@@ -54,35 +52,10 @@ impl GpuDecoderLayerScratch {
             dense_out: vec![0.0; seq_len * hidden],
             moe_branch: vec![0.0; seq_len * hidden],
             moe_input: vec![0.0; seq_len * hidden],
-            moe_batch_input: Vec::new(),
-            moe_batch_gate_up: Vec::new(),
-            moe_batch_gate_act: Vec::new(),
+            moe_token_indices: Vec::new(),
             moe_batch_out: Vec::new(),
         })
     }
-}
-
-fn rms_norm_batch(
-    engine: &mut GpuDecoderEngine,
-    out: &mut [f32],
-    x: &[f32],
-    weight: &[f32],
-    seq_len: usize,
-    hidden: usize,
-    eps: f32,
-) -> Result<(), Error> {
-    let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
-    bk::rms_norm_rows(
-        &mut batch,
-        &engine.kernels,
-        out,
-        x,
-        weight,
-        seq_len,
-        hidden,
-        eps,
-    )?;
-    batch.end()
 }
 
 pub fn forward_decoder(
@@ -221,28 +194,18 @@ fn forward_layer_ff(
         &mut scratch.cpu.moe,
     )?;
 
-    rms_norm_batch(
-        engine,
-        &mut scratch.moe_input,
-        &scratch.residual,
-        cached.pre_ff_norm_2.as_slice(),
-        seq_len,
-        hidden,
-        eps,
-    )?;
-
     experts_forward_gpu_batched(
         &mut scratch.moe_branch,
-        &scratch.moe_input,
+        &scratch.residual,
+        cached.pre_ff_norm_2.as_slice(),
+        eps,
         weights,
         expert_cache,
         layer,
         cfg,
         seq_len,
         &routes,
-        &mut scratch.moe_batch_input,
-        &mut scratch.moe_batch_gate_up,
-        &mut scratch.moe_batch_gate_act,
+        &mut scratch.moe_token_indices,
         &mut scratch.moe_batch_out,
         &engine.ctx,
         &mut engine.pool,

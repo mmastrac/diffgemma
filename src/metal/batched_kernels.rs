@@ -212,6 +212,38 @@ pub fn f32_bf16_gemm_gpu_in_out(
     Ok(buf_c)
 }
 
+/// Copy `indices[b]` rows from `src` into contiguous `dst` rows on GPU.
+pub fn gather_rows_gpu(
+    batch: &mut GpuBatch<'_>,
+    kernels: &GpuKernels,
+    src: &ProtocolObject<dyn MTLBuffer>,
+    indices: &[u32],
+    hidden: usize,
+) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
+    let batch_size = indices.len();
+    if batch_size == 0 {
+        return Err(Error::Format("gather_rows empty batch"));
+    }
+    let idx_bytes = unsafe {
+        std::slice::from_raw_parts(indices.as_ptr().cast::<u8>(), batch_size * 4)
+    };
+    let buf_idx = batch.alloc_bytes(idx_bytes)?;
+    let buf_dst = batch.alloc_f32_out(batch_size * hidden)?;
+    let dims = [0u32, hidden as u32];
+    let batch_u = batch_size as u32;
+    let grid = batch_size * hidden;
+    batch.dispatch_1d(&kernels.gather_rows.pipeline, grid, |enc| {
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(src), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(&buf_idx), 0, 1);
+            enc.setBuffer_offset_atIndex(Some(&buf_dst), 0, 2);
+        }
+        set_bytes(enc, &dims, 3);
+        set_bytes(enc, &batch_u, 4);
+    });
+    Ok(buf_dst)
+}
+
 /// `out_buf += addend_buf` on GPU (in-place on `out_buf`).
 pub fn vec_add_gpu_bufs(
     batch: &mut GpuBatch<'_>,

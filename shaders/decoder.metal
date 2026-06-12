@@ -68,6 +68,24 @@ kernel void vec_add_inplace(
     out[gid] += addend[gid];
 }
 
+kernel void gather_rows(
+    device const float *src [[buffer(0)]],
+    device const uint *indices [[buffer(1)]],
+    device float *dst [[buffer(2)]],
+    constant uint2 &dims [[buffer(3)]],
+    constant uint &batch_size [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint hidden = dims.y;
+    uint bi = gid / hidden;
+    uint h = gid % hidden;
+    if (bi >= batch_size) {
+        return;
+    }
+    uint tok = indices[bi];
+    dst[bi * hidden + h] = src[tok * hidden + h];
+}
+
 kernel void vec_mul_inplace(
     device float *a [[buffer(0)]],
     device const float *b [[buffer(1)]],
