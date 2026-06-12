@@ -207,16 +207,29 @@ fn forward_inner(
 
     let eps = text.rms_norm_eps as f32;
     if let Some(logits) = input.self_conditioning_logits {
-        crate::model::embed::soft_embeddings_from_logits_store(
-            store,
-            &mut scratch.cpu.sc_signal,
-            logits,
-            seq_len,
-            vocab,
-            hidden,
-            embed_scale,
-            &mut scratch.cpu.sc_probs,
-        )?;
+        if let Some(embed_q8) = weights.embed_q8() {
+            crate::metal::embed::soft_embeddings_q8_gpu(
+                engine,
+                logits,
+                embed_q8,
+                seq_len,
+                vocab,
+                hidden,
+                embed_scale,
+                &mut scratch.cpu.sc_signal,
+            )?;
+        } else {
+            crate::model::embed::soft_embeddings_from_logits_store(
+                store,
+                &mut scratch.cpu.sc_signal,
+                logits,
+                seq_len,
+                vocab,
+                hidden,
+                embed_scale,
+                &mut scratch.cpu.sc_probs,
+            )?;
+        }
         if let Some(sc) = weights.self_conditioning() {
             crate::metal::self_conditioning::apply_gpu(
                 engine,

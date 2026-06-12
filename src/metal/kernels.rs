@@ -20,6 +20,9 @@ pub struct GpuKernels {
     pub(crate) gelu: ComputePipeline,
     pub(crate) swiglu_mul: ComputePipeline,
     pub(crate) gelu_swiglu_gate_up: ComputePipeline,
+    pub(crate) softmax_rows: ComputePipeline,
+    pub(crate) gather_prob_cols: ComputePipeline,
+    pub(crate) vec_fill_zero: ComputePipeline,
 }
 
 impl GpuKernels {
@@ -38,6 +41,9 @@ impl GpuKernels {
         let pipelines = ctx.compile_kernels(DECODER_SHADER, &names)?;
         let mut it = pipelines.into_iter().rev();
         Ok(Self {
+            vec_fill_zero: ctx.compile_kernel(DECODER_SHADER, "vec_fill_zero")?,
+            gather_prob_cols: ctx.compile_kernel(DECODER_SHADER, "gather_prob_cols")?,
+            softmax_rows: ctx.compile_kernel(DECODER_SHADER, "softmax_rows")?,
             gelu_swiglu_gate_up: ctx.compile_kernel(DECODER_SHADER, "gelu_swiglu_gate_up")?,
             swiglu_mul: it.next().ok_or(Error::Format("pipeline missing"))?,
             gelu: it.next().ok_or(Error::Format("pipeline missing"))?,

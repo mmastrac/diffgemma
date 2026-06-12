@@ -197,6 +197,19 @@ impl<'a> GpuBatch<'a> {
             .dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
     }
 
+    pub fn dispatch_with_grid(
+        &self,
+        pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+        grid: MTLSize,
+        tg: MTLSize,
+        encode: impl FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>),
+    ) {
+        self.encoder().setComputePipelineState(pipeline);
+        encode(self.encoder());
+        self.encoder()
+            .dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    }
+
     pub fn dispatch_gemm(
         &self,
         pipeline: &ProtocolObject<dyn MTLComputePipelineState>,

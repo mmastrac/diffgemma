@@ -179,3 +179,86 @@ kernel void gelu_swiglu_gate_up(
     float u = gate_up[off + moe_inter];
     out[gid] = g * u;
 }
+
+/// Stable row softmax in-place over row-major `[rows, cols]`.
+kernel void softmax_rows(
+    device float *x [[buffer(0)]],
+    constant uint2 &dims [[buffer(1)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]]
+) {
+    const uint TG = 256u;
+    uint rows = dims.x;
+    uint cols = dims.y;
+    if (row >= rows) {
+        return;
+    }
+
+    device float *r = x + row * cols;
+    threadgroup float scratch[256];
+
+    float local_max = -1e30f;
+    for (uint c = lid; c < cols; c += TG) {
+        local_max = max(local_max, r[c]);
+    }
+    scratch[lid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = TG / 2u; s > 0u; s >>= 1u) {
+        if (lid < s) {
+            scratch[lid] = max(scratch[lid], scratch[lid + s]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float row_max = scratch[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local_sum = 0.0f;
+    for (uint c = lid; c < cols; c += TG) {
+        float e = exp(r[c] - row_max);
+        r[c] = e;
+        local_sum += e;
+    }
+    scratch[lid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = TG / 2u; s > 0u; s >>= 1u) {
+        if (lid < s) {
+            scratch[lid] += scratch[lid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = 1.0f / scratch[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint c = lid; c < cols; c += TG) {
+        r[c] *= inv;
+    }
+}
+
+/// Copy `[rows, chunk]` columns starting at `v0` from row-major `[rows, vocab]` probs.
+kernel void gather_prob_cols(
+    device const float *probs [[buffer(0)]],
+    device float *out [[buffer(1)]],
+    constant uint4 &params [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint rows = params.x;
+    uint vocab = params.y;
+    uint v0 = params.z;
+    uint chunk = params.w;
+    uint col = gid.x;
+    uint row = gid.y;
+    if (row >= rows || col >= chunk) {
+        return;
+    }
+    out[row * chunk + col] = probs[row * vocab + v0 + col];
+}
+
+kernel void vec_fill_zero(
+    device float *x [[buffer(0)]],
+    constant uint &len [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len) {
+        return;
+    }
+    x[gid] = 0.0f;
+}

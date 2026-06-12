@@ -15,6 +15,7 @@ mod engine;
 mod gemm;
 mod kernels;
 mod linear;
+mod embed;
 mod lm_head;
 mod kv_cache;
 mod memory;
