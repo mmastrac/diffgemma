@@ -82,3 +82,29 @@ kernel void f32_bf16_gemm(
     }
     c[row * n + col] = sum;
 }
+
+/// C[M,N] = A[M,K] @ W[N,K]^T with f32 weights W stored row-major [N,K] (router proj).
+kernel void f32_f32_linear(
+    device const float *a [[buffer(0)]],
+    device const float *w [[buffer(1)]],
+    device float *c [[buffer(2)]],
+    constant uint3 &dims [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint m = dims.x;
+    uint n = dims.y;
+    uint k_dim = dims.z;
+    uint row = gid.y;
+    uint col = gid.x;
+    if (row >= m || col >= n) {
+        return;
+    }
+
+    float sum = 0.0f;
+    for (uint p = 0; p < k_dim; p++) {
+        float av = a[row * k_dim + p];
+        float wv = w[col * k_dim + p];
+        sum += av * wv;
+    }
+    c[row * n + col] = sum;
+}

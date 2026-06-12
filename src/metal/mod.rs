@@ -24,6 +24,7 @@ mod mps_gemm;
 mod probe;
 mod dgq_gpu;
 mod bench_gemm;
+mod router;
 mod self_conditioning;
 mod telemetry;
 mod weights;

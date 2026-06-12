@@ -146,7 +146,11 @@ pub fn route_with_cached_weights(
 
 pub fn top_k_route(probs: &[f32], k: usize, per_expert_scale: &[f32]) -> RouteResult {
     let mut ranked: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
-    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.sort_by(|(ia, pa), (ib, pb)| {
+        pb.partial_cmp(pa)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(ia.cmp(ib))
+    });
     let top = &ranked[..k];
     let mut weights: Vec<f32> = top.iter().map(|(_, p)| *p).collect();
     let sum: f32 = weights.iter().sum();

@@ -144,6 +144,10 @@ impl<'a> GpuBatch<'a> {
         Ok(buf)
     }
 
+    pub fn alloc_u32_out(&mut self, len: usize) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
+        self.alloc_f32_out(len)
+    }
+
     pub fn alloc_bytes(
         &mut self,
         data: &[u8],
@@ -393,6 +397,19 @@ impl<'a> GpuBatch<'a> {
         self.track_read(buf, out);
     }
 
+    pub fn register_read_u32(
+        &mut self,
+        buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+        out: &mut [u32],
+    ) {
+        self.reads.push(PendingRead {
+            buf,
+            dst: out.as_mut_ptr() as *mut f32,
+            len: out.len(),
+            src_byte_offset: 0,
+        });
+    }
+
     pub(crate) fn record_dense_upload(&mut self, bytes: u64) {
         if let Some(cell) = self.telemetry.as_ref() {
             cell.borrow_mut().dense_gpu_upload_bytes += bytes;
@@ -414,6 +431,44 @@ impl<'a> GpuBatch<'a> {
             let cmd = self.cmd.as_ref().expect("cmd");
             self.enc = cmd.computeCommandEncoder();
         }
+    }
+
+    /// Commit, wait, and run pending readbacks without releasing GPU buffers.
+    pub fn flush_reads(&mut self) -> Result<(), Error> {
+        let readback_bytes: u64 = self.reads.iter().map(|r| r.len as u64 * 4).sum();
+        if let Some(enc) = self.enc.take() {
+            enc.endEncoding();
+        }
+        let cmd = self.cmd.as_ref().expect("batch command buffer missing");
+        cmd.commit();
+        cmd.waitUntilCompleted();
+
+        if let Some(cell) = self.telemetry.as_ref() {
+            let mut tel = cell.borrow_mut();
+            tel.gpu_syncs += 1;
+            tel.gpu_readback_bytes += readback_bytes;
+        }
+
+        for read in self.reads.drain(..) {
+            let slice = unsafe { std::slice::from_raw_parts_mut(read.dst, read.len) };
+            if read.src_byte_offset == 0 {
+                BufferPool::read_f32(&read.buf, slice);
+            } else {
+                BufferPool::read_f32_at_offset(&read.buf, read.src_byte_offset, slice);
+            }
+        }
+
+        self.cmd = Some(
+            self.queue
+                .commandBuffer()
+                .ok_or(Error::Format("Metal command buffer alloc failed"))?,
+        );
+        self.enc = self
+            .cmd
+            .as_ref()
+            .expect("cmd")
+            .computeCommandEncoder();
+        Ok(())
     }
 
     pub fn end(mut self) -> Result<(), Error> {

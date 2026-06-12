@@ -161,16 +161,22 @@ Keep: golden-parity discipline, `bench-decoder` regression tables, CPU/BLAS orac
 
 ## Phase Q3 — Kill the CPU round-trips
 
+**Status: in progress (2026-06).** GPU router + merged `.dgq` FF/MoE batch landed; sampler/early-stop still CPU.
+
 Once weights are resident and kernels are sane, the per-step serial CPU work becomes the wall: logits readback [256 × 262,144] ≈ 134–268 MB/step + CPU softmax/entropy over 67M values; CPU router = measured **151 syncs/step**.
 
 | Task | Notes |
 |---|---|
-| GPU router top-8 | finish `route_gpu`; **f32 logits into top-k** (f16 ≈ 3 sig. digits → adjacent experts within epsilon → CPU/GPU ordering flakiness); tie-break key = (logit, expert index), bit-exact vs CPU |
+| GPU router top-8 | ✅ `route_gpu_in_batch` + `router_top_k_rows` (f32 logits, tie-break prob↓ index↑); wired on `.dgq` path; indices match CPU unit test; dgq `generate-parity` layers3 ✅ |
+| Merged FF+MoE batch (`.dgq`) | ✅ one batch/layer: dense FF → GPU route (`flush_reads`) → grouped MoE (`flush_reads`) → final combine; skips ~5.6 MB/layer residual+dense readback |
+| GPU token scatter | MoE expert outputs still CPU weighted scatter + re-upload (~200 KB/layer); open |
 | GPU sampler | softmax → per-position entropy → commit mask (entropy_bound) → categorical sample for re-noised positions → write canvas in place |
 | Counter-based RNG | Philox/Threefry keyed (seed, block, step, position); implement identically in CPU oracle; regenerate goldens once |
 | GPU early-stop reduction | avg-entropy scalar + argmax-stable-2-steps flag; CPU reads 2 scalars + committed ids per step |
 | Self-conditioning on GPU | sc probs/logits never leave GPU; feed prev-step distribution path entirely on-device |
 | Command-buffer structure | encode whole step into 1–3 command buffers; no mid-step `waitUntilCompleted`; sampler dependency stays on-GPU |
+
+**Measured (M3 Pro, re-bench after GPU router):** `bench-step` **5.00 s/step** (was 5.29 s); readback **1334 MiB/step** (was ~1534 MiB); syncs still **152** (`flush_reads` counts as sync). Next wins: GPU scatter (drop MoE readback), GPU sampler (drop 256 MiB logits/step), merge attention batches.
 
 **Exit / gates (M3 Pro):**
 - Readback/step ≤ 1 MB (ids + scalars), down from ~134–268 MB.
@@ -250,7 +256,7 @@ Profile-driven leftovers after Q2.5 gates are met.
 | Q1 | `.dgq` quantizer + zero-copy load | ✅ ≤2 s load, mmap OK, embed q8 + q4 dense |
 | Q2 | Quantized kernels, residency, deletions | ✅ step 5.29 s (gate ≤12 s); 0 evictions; dgq parity ✅ |
 | Q2.5 | GEMM MFU (dense→MPS, grouped MoE kernel) | ✅ kernels shipped; step 5.29 s (1.6 s gate → Q3) |
-| Q3 | GPU router/sampler/early-stop | ≤3 syncs, ≤1 MB readback/step; ≥ 7 tok/s |
+| Q3 | GPU router/sampler/early-stop | 🔄 router ✅ 5.00 s/step; sampler/RNG next |
 | Q4 | Uncommitted-only lm_head, step telemetry | +15% tok/s → **8–12 tok/s target zone** |
 | Q5 | Residual MoE/attention tuning | step ≤ 1.4 s (stretch) |
 | Q6 | Approximations | default-off, quality-gated |
@@ -259,11 +265,11 @@ Profile-driven leftovers after Q2.5 gates are met.
 
 ## Immediate next step
 
-**Q3** — kill CPU round-trips: GPU router top-8, GPU sampler/entropy-bound, counter-based RNG, early-stop reduction, ≤3 syncs/step, ≤1 MB readback/step. Target: `bench-step` ≤ **1.8 s** from current **5.29 s**.
+**Q3 (continued)** — GPU sampler + early-stop reduction (kill 256 MiB logits readback/step); then GPU MoE scatter. Target: `bench-step` ≤ **1.8 s** from current **5.00 s**.
 
 ```bash
 cargo run --release --features metal -- -m /tmp/quantized-weights bench-step --canvas 256 --layers 30 --iters 3
-cargo run --release --features metal -- -m /tmp/quantized-weights bench-prefill --prefill-len 1 --layers 30 --iters 3
 cargo run --release --features metal -- -m /tmp/quantized-weights generate-parity -p "Hello" --seed 42 --steps 1 --layers 3
+cargo run --release --features metal -- -m /tmp/quantized-weights generate-parity -p "Hello" --seed 42 --steps 2 --layers 3
 cargo run --release --features metal -- bench-gemm --oracle mps --shapes 256x2816x2816,33x2816x1408
 ```

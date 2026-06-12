@@ -11,13 +11,40 @@ use std::rc::Rc;
 use crate::model::layer_weights::DecoderLayerWeights;
 use crate::model::moe::RouteResult;
 use crate::safetensors::Error;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLBuffer;
 
-struct ExpertJob {
-    expert: usize,
-    tokens: Vec<(usize, f32)>,
-    gate_up_off: usize,
-    gate_act_off: usize,
-    out_off: usize,
+pub(crate) struct ExpertJob {
+    pub(crate) expert: usize,
+    pub(crate) tokens: Vec<(usize, f32)>,
+    pub(crate) gate_up_off: usize,
+    pub(crate) gate_act_off: usize,
+    pub(crate) out_off: usize,
+}
+
+pub fn build_expert_jobs(routes: &[RouteResult], experts: usize) -> Vec<ExpertJob> {
+    let mut buckets: Vec<Vec<(usize, f32)>> = vec![Vec::new(); experts];
+    for (s, route) in routes.iter().enumerate() {
+        for (&expert, &weight) in route.indices.iter().zip(route.weights.iter()) {
+            buckets[expert].push((s, weight));
+        }
+    }
+
+    let mut jobs = Vec::new();
+    for expert in 0..experts {
+        let tokens = &buckets[expert];
+        if tokens.is_empty() {
+            continue;
+        }
+        jobs.push(ExpertJob {
+            expert,
+            tokens: tokens.clone(),
+            gate_up_off: 0,
+            gate_act_off: 0,
+            out_off: 0,
+        });
+    }
+    jobs
 }
 
 #[repr(C)]
@@ -55,30 +82,16 @@ pub fn experts_forward_gpu_batched(
 
     out.fill(0.0);
 
-    let mut buckets: Vec<Vec<(usize, f32)>> = vec![Vec::new(); experts];
-    for (s, route) in routes.iter().enumerate() {
-        for (&expert, &weight) in route.indices.iter().zip(route.weights.iter()) {
-            buckets[expert].push((s, weight));
-        }
-    }
+    let mut jobs = build_expert_jobs(routes, experts);
 
-    let mut jobs: Vec<ExpertJob> = Vec::new();
     let mut gate_up_len = 0usize;
     let mut gate_act_len = 0usize;
     let mut out_len = 0usize;
-    for expert in 0..experts {
-        let tokens = &buckets[expert];
-        if tokens.is_empty() {
-            continue;
-        }
-        let batch_size = tokens.len();
-        jobs.push(ExpertJob {
-            expert,
-            tokens: tokens.clone(),
-            gate_up_off: gate_up_len,
-            gate_act_off: gate_act_len,
-            out_off: out_len,
-        });
+    for job in &mut jobs {
+        let batch_size = job.tokens.len();
+        job.gate_up_off = gate_up_len;
+        job.gate_act_off = gate_act_len;
+        job.out_off = out_len;
         gate_up_len += batch_size * moe_inter * 2;
         gate_act_len += batch_size * moe_inter;
         out_len += batch_size * hidden;
@@ -152,7 +165,18 @@ pub fn experts_forward_gpu_batched(
         )?;
     }
 
-    for job in &jobs {
+    scatter_weighted_expert_outputs(out, out_arena, &jobs, hidden);
+    Ok(())
+}
+
+pub fn scatter_weighted_expert_outputs(
+    out: &mut [f32],
+    out_arena: &[f32],
+    jobs: &[ExpertJob],
+    hidden: usize,
+) {
+    out.fill(0.0);
+    for job in jobs {
         for (bi, &(_, weight)) in job.tokens.iter().enumerate() {
             let src = job.out_off + bi * hidden;
             let dst = job.tokens[bi].0 * hidden;
@@ -161,7 +185,6 @@ pub fn experts_forward_gpu_batched(
             }
         }
     }
-    Ok(())
 }
 
 fn experts_forward_gpu_grouped_dgq(
@@ -180,6 +203,47 @@ fn experts_forward_gpu_grouped_dgq(
     kernels: &GpuKernels,
     q4_grouped_pipeline: &ComputePipeline,
     telemetry: Option<Rc<RefCell<ForwardTelemetry>>>,
+) -> Result<(), Error> {
+    let mut batch = GpuBatch::begin_with_telemetry(
+        &ctx.queue,
+        pool,
+        &ctx.device,
+        telemetry.clone(),
+    )?;
+    let buf_res = batch.alloc_f32(residual)?;
+    experts_forward_gpu_grouped_in_batch(
+        &mut batch,
+        out_arena,
+        &buf_res,
+        pre_ff_norm_2,
+        eps,
+        expert_cache,
+        layer,
+        cfg,
+        seq_len,
+        jobs,
+        token_indices,
+        kernels,
+        q4_grouped_pipeline,
+    )?;
+    batch.end()?;
+    Ok(())
+}
+
+pub fn experts_forward_gpu_grouped_in_batch(
+    batch: &mut GpuBatch<'_>,
+    out_arena: &mut [f32],
+    residual_buf: &ProtocolObject<dyn MTLBuffer>,
+    pre_ff_norm_2: &[f32],
+    eps: f32,
+    expert_cache: &GpuDecoderWeightCache,
+    layer: usize,
+    cfg: &TextConfig,
+    seq_len: usize,
+    jobs: &[ExpertJob],
+    token_indices: &mut Vec<u32>,
+    kernels: &GpuKernels,
+    q4_grouped_pipeline: &ComputePipeline,
 ) -> Result<(), Error> {
     let hidden = cfg.hidden_size;
     let moe_inter = cfg.moe_intermediate_size;
@@ -231,75 +295,65 @@ fn experts_forward_gpu_grouped_dgq(
         )
     };
 
-    {
-        let mut batch = GpuBatch::begin_with_telemetry(
-            &ctx.queue,
-            pool,
-            &ctx.device,
-            telemetry.clone(),
-        )?;
-        let buf_res = batch.alloc_f32(residual)?;
-        let buf_moe_in = bk::rms_norm_rows_gpu_buf(
-            &mut batch,
-            kernels,
-            &buf_res,
-            pre_ff_norm_2,
-            seq_len,
-            hidden,
-            eps,
-        )?;
-        let buf_a = bk::gather_rows_gpu(
-            &mut batch,
-            kernels,
-            &buf_moe_in,
-            token_indices,
-            hidden,
-        )?;
-        let buf_gate_jobs = batch.alloc_bytes(gate_jobs_bytes)?;
-        let buf_down_jobs = batch.alloc_bytes(down_jobs_bytes)?;
-        let buf_row_starts = batch.alloc_bytes(row_starts_bytes)?;
+    let buf_moe_in = bk::rms_norm_rows_gpu_buf(
+        batch,
+        kernels,
+        residual_buf,
+        pre_ff_norm_2,
+        seq_len,
+        cfg.hidden_size,
+        eps,
+    )?;
+    let buf_a = bk::gather_rows_gpu(
+        batch,
+        kernels,
+        &buf_moe_in,
+        token_indices,
+        cfg.hidden_size,
+    )?;
+    let buf_gate_jobs = batch.alloc_bytes(gate_jobs_bytes)?;
+    let buf_down_jobs = batch.alloc_bytes(down_jobs_bytes)?;
+    let buf_row_starts = batch.alloc_bytes(row_starts_bytes)?;
 
-        let gate_n = moe_inter * 2;
-        let buf_gu = batch.alloc_f32_out(total_m * gate_n)?;
-        batch.dispatch_q4_linear_grouped(
-            &q4_grouped_pipeline.pipeline,
-            &buf_a,
-            w_blob,
-            &buf_gu,
-            &buf_gate_jobs,
-            &buf_row_starts,
-            total_m,
-            hidden,
-            gate_n,
-            num_jobs,
-        );
+    let gate_n = moe_inter * 2;
+    let buf_gu = batch.alloc_f32_out(total_m * gate_n)?;
+    batch.dispatch_q4_linear_grouped(
+        &q4_grouped_pipeline.pipeline,
+        &buf_a,
+        w_blob,
+        &buf_gu,
+        &buf_gate_jobs,
+        &buf_row_starts,
+        total_m,
+        cfg.hidden_size,
+        gate_n,
+        num_jobs,
+    );
 
-        let act_len = total_m * moe_inter;
-        let buf_act = bk::gelu_swiglu_gate_up_gpu(
-            &mut batch,
-            kernels,
-            &buf_gu,
-            act_len,
-            total_m,
-            moe_inter,
-        )?;
+    let act_len = total_m * moe_inter;
+    let buf_act = bk::gelu_swiglu_gate_up_gpu(
+        batch,
+        kernels,
+        &buf_gu,
+        act_len,
+        total_m,
+        moe_inter,
+    )?;
 
-        let buf_out = batch.alloc_f32_out(total_m * hidden)?;
-        batch.dispatch_q4_linear_grouped(
-            &q4_grouped_pipeline.pipeline,
-            &buf_act,
-            w_blob,
-            &buf_out,
-            &buf_down_jobs,
-            &buf_row_starts,
-            total_m,
-            moe_inter,
-            hidden,
-            num_jobs,
-        );
-        batch.register_read(buf_out, out_arena);
-        batch.end()?;
-    }
+    let buf_out = batch.alloc_f32_out(total_m * cfg.hidden_size)?;
+    batch.dispatch_q4_linear_grouped(
+        &q4_grouped_pipeline.pipeline,
+        &buf_act,
+        w_blob,
+        &buf_out,
+        &buf_down_jobs,
+        &buf_row_starts,
+        total_m,
+        moe_inter,
+        cfg.hidden_size,
+        num_jobs,
+    );
+    batch.register_read(buf_out, out_arena);
     Ok(())
 }
 

@@ -212,6 +212,46 @@ pub fn f32_bf16_gemm_gpu_in_out(
     Ok(buf_c)
 }
 
+/// `C = A @ W^T` with f32 weights already on GPU (router proj).
+pub fn f32_f32_linear_gpu_bufs(
+    batch: &mut GpuBatch<'_>,
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    a_buf: &ProtocolObject<dyn MTLBuffer>,
+    w_buf: &ProtocolObject<dyn MTLBuffer>,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
+    let buf_c = batch.alloc_f32_out(m * n)?;
+    batch.dispatch_linear(pipeline, a_buf, w_buf, &buf_c, m, n, k);
+    Ok(buf_c)
+}
+
+pub fn router_scale_rows_gpu_buf(
+    batch: &mut GpuBatch<'_>,
+    kernels: &GpuKernels,
+    buf: &ProtocolObject<dyn MTLBuffer>,
+    scale: &[f32],
+    seq_len: usize,
+    hidden: usize,
+    root: f32,
+) -> Result<(), Error> {
+    if scale.len() != hidden {
+        return Err(Error::Format("router_scale shape mismatch"));
+    }
+    let buf_scale = batch.alloc_f32(scale)?;
+    let dims = [seq_len as u32, hidden as u32];
+    batch.dispatch_1d(&kernels.router_scale.pipeline, seq_len, |enc| {
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(buf), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(&buf_scale), 0, 1);
+        }
+        set_bytes(enc, &dims, 2);
+        set_bytes(enc, &root, 3);
+    });
+    Ok(())
+}
+
 /// `C = A @ W^T` with PyTorch `W[out,in]` already on GPU.
 pub fn f32_bf16_linear_gpu_bufs(
     batch: &mut GpuBatch<'_>,
