@@ -276,6 +276,7 @@ fn div_up(v: usize, g: usize) -> usize {
 struct StepPipelines {
     memzero: ComputePipeline,
     rmsnorm: ComputePipeline,
+    rmsnorm_f32: ComputePipeline,
     gemm_q4: HashMap<(u32, u32), ComputePipeline>,
     gemm_q8: HashMap<(u32, u32), ComputePipeline>,
     qk_rope_kv: ComputePipeline,
@@ -287,7 +288,6 @@ struct StepPipelines {
     bucket_count: ComputePipeline,
     bucket_fill: ComputePipeline,
     moe_grouped: ComputePipeline,
-    moe_to_half: ComputePipeline,
     embed_gather: ComputePipeline,
     logit_rowstats: ComputePipeline,
     sc_softembed: ComputePipeline,
@@ -332,6 +332,7 @@ impl StepPipelines {
         Ok(Self {
             memzero: simple("k_memzero")?,
             rmsnorm: simple("k_rmsnorm")?,
+            rmsnorm_f32: simple("k_rmsnorm_f32")?,
             gemm_q4,
             gemm_q8,
             qk_rope_kv: simple("k_qk_rope_kv")?,
@@ -343,7 +344,6 @@ impl StepPipelines {
             bucket_count: simple("k_bucket_count")?,
             bucket_fill: simple("k_bucket_fill")?,
             moe_grouped: simple("k_moe_grouped")?,
-            moe_to_half: simple("k_moe_to_half")?,
             embed_gather: simple("k_embed_gather")?,
             logit_rowstats: simple("k_logit_rowstats")?,
             sc_softembed: simple("k_sc_softembed")?,
@@ -540,6 +540,35 @@ impl StepEnc<'_> {
         rows: usize,
     ) {
         self.enc.setComputePipelineState(&self.ps.rmsnorm.pipeline);
+        unsafe {
+            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), x_off as usize, 0);
+            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), y_off as usize, 1);
+            self.bind_blob(2);
+            set_bytes(&self.enc, &w_off, 3);
+            set_bytes(&self.enc, &dim, 4);
+        }
+        let grid = MTLSize {
+            width: rows,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    }
+
+    fn rmsnorm_f32(
+        &self,
+        x_off: u64,
+        y_off: u64,
+        w_off: u64,
+        dim: u32,
+        rows: usize,
+    ) {
+        self.enc.setComputePipelineState(&self.ps.rmsnorm_f32.pipeline);
         unsafe {
             self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), x_off as usize, 0);
             self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), y_off as usize, 1);
@@ -815,14 +844,7 @@ impl StepEnc<'_> {
         };
         self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
 
-        self.enc.setComputePipelineState(&self.ps.moe_to_half.pipeline);
-        unsafe {
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), A_MOEOUT as usize, 0);
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), A_TMP as usize, 1);
-        }
-        self.dispatch_1d(&self.ps.moe_to_half, CANVAS * HID, 256);
-
-        self.rmsnorm(A_TMP, A_MOEIN, l.post_ff_ln_2, HID as u32, CANVAS);
+        self.rmsnorm_f32(A_MOEOUT, A_MOEIN, l.post_ff_ln_2, HID as u32, CANVAS);
         self.residual(A_DENSE, A_MOEIN, A_TMP, 0, CANVAS * HID);
         self.rmsnorm(A_TMP, A_TMP, l.post_ff_ln, HID as u32, CANVAS);
         self.residual(A_STREAM, A_TMP, A_HIDDEN, l.layer_scalar, CANVAS * HID);

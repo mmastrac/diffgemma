@@ -174,6 +174,37 @@ kernel void k_rmsnorm(device const half* x [[buffer(0)]],
     }
 }
 
+// RMSNorm reading f32 activations (MoE scatter output) and writing half.
+kernel void k_rmsnorm_f32(device const float* x [[buffer(0)]],
+                          device half* y [[buffer(1)]],
+                          device const uchar* blob [[buffer(2)]],
+                          constant ulong& w_off [[buffer(3)]],
+                          constant uint& dim [[buffer(4)]],
+                          uint row [[threadgroup_position_in_grid]],
+                          uint lid [[thread_position_in_threadgroup]],
+                          uint tpg [[threads_per_threadgroup]]) {
+    threadgroup float red[8];
+    device const float* xr = x + (ulong)row * dim;
+    float acc = 0.f;
+    for (uint i = lid; i < dim; i += tpg) { float v = xr[i]; acc += v*v; }
+    acc = simd_sum(acc);
+    uint sg = lid / 32, nsg = (tpg + 31) / 32;
+    if ((lid & 31) == 0) red[sg] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0) {
+        float t = 0.f;
+        for (uint i = 0; i < nsg; ++i) t += red[i];
+        red[0] = rsqrt(t / float(dim) + RMS_EPS);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv = red[0];
+    for (uint i = lid; i < dim; i += tpg) {
+        float v = xr[i] * inv;
+        if (w_off != 0) v *= bf16_bytes(blob + w_off + 2ul*i);
+        y[(ulong)row * dim + i] = half(v);
+    }
+}
+
 // ===================== k_gemm_q4: y[M,N] = x[M,K] @ Wq4[N,K]^T =====================
 kernel void k_gemm_q4(device const half* x [[buffer(0)]],
                       device half* y [[buffer(1)]],
@@ -784,8 +815,7 @@ kernel void k_sample_write(device CanvasState* S [[buffer(0)]],
 //      k_bucket_count(128) ; k_bucket_fill phase0(2048) ; phase1(1) ; phase2(2048)
 //   9. k_rmsnorm(A_STREAM, pre_ff_2) -> A_MOEIN ; k_memzero(A_MOEOUT)
 //      k_moe_grouped (grid = maxM x 128, tpg 128)
-//      [A_MOEOUT f32] -> k_residual_f32b? no: k_rmsnorm needs half: convert via
-//      k_rmsnorm reads half — use k_moe_to_half (below) then k_rmsnorm(post_ff_2) -> A_MOEIN
+//      [A_MOEOUT f32] -> k_rmsnorm_f32(post_ff_2) -> A_MOEIN
 //  10. k_residual(A_DENSE, A_MOEIN, 0) -> A_TMP ; k_rmsnorm(A_TMP, post_ff) -> A_TMP
 //      k_residual(A_STREAM, A_TMP, layer_scalar) -> A_HIDDEN
 // finish:
@@ -794,9 +824,3 @@ kernel void k_sample_write(device CanvasState* S [[buffer(0)]],
 //  12. k_sample_rowstats(tpg 256) ; k_sample_commit(tpg 256) ;
 //      k_sample_apply(grid 256, tpg 256) ; k_sample_write(1)
 // CPU: poll S->stop_flag every step (or every N); on stop read S->ids -> incremental prefill.
-
-kernel void k_moe_to_half(device const float* x [[buffer(0)]],
-                          device half* y [[buffer(1)]],
-                          uint i [[thread_position_in_grid]]) {
-    y[i] = half(x[i]);
-}
