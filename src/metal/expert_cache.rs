@@ -9,8 +9,14 @@ use std::collections::VecDeque;
 /// Target max fraction of Metal `recommendedMaxWorkingSetSize` for all resident data.
 pub const GPU_RESIDENT_FRACTION: f64 = 0.80;
 
-/// Conservative allowance for transient `BufferPool` allocations not in forward estimates.
+/// Expert LRU may use at most this fraction of the overall resident cap (not the remainder).
+pub const EXPERT_MAX_FRACTION_OF_RESIDENT_CAP: f64 = 0.30;
+
+/// Conservative allowance for transient `BufferPool` allocations (small-seq runs).
 pub const BUFFER_POOL_FUDGE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Buffer pool peak allowance for full-canvas denoise (seq=256).
+pub const BUFFER_POOL_LARGE_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ExpertCacheStats {

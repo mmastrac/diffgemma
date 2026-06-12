@@ -1,7 +1,10 @@
 //! Rough resident-memory estimates for planning GPU decoder runs.
 
 use crate::config::TextConfig;
-use crate::metal::expert_cache::{expert_entry_bytes, ExpertCacheStats, GPU_RESIDENT_FRACTION};
+use crate::metal::expert_cache::{
+    expert_entry_bytes, ExpertCacheStats, BUFFER_POOL_FUDGE_BYTES, BUFFER_POOL_LARGE_BYTES,
+    EXPERT_MAX_FRACTION_OF_RESIDENT_CAP, GPU_RESIDENT_FRACTION,
+};
 use crate::metal::weights::GpuDecoderWeightCache;
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -55,9 +58,9 @@ pub fn estimate_decoder_forward(text: &TextConfig, seq_len: usize, kv_len: usize
         text, seq, total_kv, hidden, inter, moe_inter, experts,
     ) * 2;
 
-    // Per-layer KV tensors in the dummy cache (sliding layers dominate size).
-    let kv_dim = text.num_key_value_heads as u64 * text.head_dim as u64;
-    let kv_cache_bytes = layers * kv * kv_dim * 2 * 4;
+    // GPU KV is sized for encoder prefix capacity + canvas (see `GpuKvCache::new`).
+    let kv_dim = max_kv_dim(text);
+    let kv_cache_bytes = layers * (kv + seq) * kv_dim * 2 * 4;
 
     // Embed + hidden ping-pong in GpuDecoderScratch.cpu.
     let activations_bytes = seq * hidden * 4 * 4;
@@ -127,6 +130,43 @@ pub fn estimate_weight_cache(cache: &GpuDecoderWeightCache) -> u64 {
     cache.resident_bytes()
 }
 
+fn max_kv_dim(text: &TextConfig) -> u64 {
+    let sliding = text.num_key_value_heads as u64 * text.head_dim as u64;
+    let full = text.num_global_key_value_heads as u64 * text.global_head_dim as u64;
+    sliding.max(full)
+}
+
+/// Resident bytes for a generate/bench session (decoder forward + denoise side buffers).
+pub fn estimate_session_resident_bytes(
+    text: &TextConfig,
+    canvas_len: usize,
+    max_encoder_kv: usize,
+) -> u64 {
+    let est = estimate_decoder_forward(text, canvas_len, max_encoder_kv);
+    let mut bytes = est.total_bytes();
+
+    // Denoise keeps processed + sample + self-conditioning logit tensors.
+    bytes += est.logits_bytes * 2;
+
+    // Self-conditioning embed signal + probability scratch.
+    let hidden = text.hidden_size as u64;
+    let canvas = canvas_len as u64;
+    bytes += canvas * hidden * 4 * 2;
+
+    // Encoder prefill/extend scratch (embed + hidden ping-pong).
+    let enc_seq = max_encoder_kv.max(canvas_len) as u64;
+    bytes += enc_seq * hidden * 4 * 3;
+
+    // Transient Metal buffer pool peaks with canvas width.
+    bytes += if canvas_len >= 256 {
+        BUFFER_POOL_LARGE_BYTES
+    } else {
+        BUFFER_POOL_FUDGE_BYTES
+    };
+
+    bytes
+}
+
 /// Metal-reported working set limit (unified memory on Apple Silicon).
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub fn gpu_working_set_cap_bytes(device: &ProtocolObject<dyn MTLDevice>) -> u64 {
@@ -151,11 +191,13 @@ pub fn expert_cache_budget_bytes(
     seq_len: usize,
     kv_len: usize,
 ) -> u64 {
-    use crate::metal::expert_cache::BUFFER_POOL_FUDGE_BYTES;
     let cap = (gpu_working_set_cap_bytes(device) as f64 * GPU_RESIDENT_FRACTION) as u64;
-    let forward = estimate_decoder_forward(text, seq_len, kv_len).total_bytes() + BUFFER_POOL_FUDGE_BYTES;
+    let forward = estimate_session_resident_bytes(text, seq_len, kv_len);
     let entry = expert_entry_bytes(text);
-    cap.saturating_sub(forward).max(entry)
+    let expert_cap = (cap as f64 * EXPERT_MAX_FRACTION_OF_RESIDENT_CAP) as u64;
+    cap.saturating_sub(forward)
+        .min(expert_cap)
+        .max(entry)
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -168,7 +210,8 @@ pub fn log_gpu_memory_plan(
 ) {
     let working_set = gpu_working_set_cap_bytes(device);
     let cap = (working_set as f64 * GPU_RESIDENT_FRACTION) as u64;
-    let forward = estimate_decoder_forward(text, seq_len, kv_len).total_bytes();
+    let forward = estimate_session_resident_bytes(text, seq_len, kv_len);
+    let expert_cap = (cap as f64 * EXPERT_MAX_FRACTION_OF_RESIDENT_CAP) as u64;
     let entry = expert_entry_bytes(text);
     let max_experts = expert_budget / entry.max(1);
     let unified = if device.hasUnifiedMemory() { "yes" } else { "no" };
@@ -179,13 +222,15 @@ pub fn log_gpu_memory_plan(
         cap as f64 / (1024.0 * 1024.0 * 1024.0),
     );
     eprintln!(
-        "  forward reserve (seq={seq_len}, kv={kv_len}): {:.1} MiB",
+        "  session reserve (canvas={seq_len}, encoder_kv={kv_len}): {:.1} MiB",
         forward as f64 / (1024.0 * 1024.0),
     );
     eprintln!(
-        "  expert LRU budget: {:.1} MiB (~{max_experts} experts @ {:.1} MiB each)",
+        "  expert LRU budget: {:.1} MiB (~{max_experts} experts @ {:.1} MiB each, max {:.1} MiB = {:.0}% of resident)",
         expert_budget as f64 / (1024.0 * 1024.0),
         entry as f64 / (1024.0 * 1024.0),
+        expert_cap as f64 / (1024.0 * 1024.0),
+        EXPERT_MAX_FRACTION_OF_RESIDENT_CAP * 100.0,
     );
 }
 
