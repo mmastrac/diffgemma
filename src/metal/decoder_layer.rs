@@ -2,9 +2,9 @@ use crate::config::TextConfig;
 use crate::metal::batched_kernels::{self as bk};
 use crate::metal::batch::GpuBatch;
 use crate::metal::engine::GpuDecoderEngine;
-use crate::metal::linear::{linear_cached_batched_in_buf, linear_cached_batched_in_cpu_out};
+use crate::metal::linear::linear_cached_batched_in_buf;
 use crate::metal::moe::experts_forward_gpu_batched;
-use crate::metal::weights::GpuLayerWeightCache;
+use crate::metal::weights::{GpuDecoderWeightCache, GpuLayerWeightCache};
 use crate::metal::decoder_attention::{
     forward_decoder_attention, forward_encoder_extend_attention, forward_encoder_prefill_attention,
 };
@@ -90,6 +90,7 @@ pub fn forward_decoder(
     hidden_states: &[f32],
     weights: &DecoderLayerWeights<'_>,
     cached: &GpuLayerWeightCache,
+    expert_cache: &GpuDecoderWeightCache,
     cfg: &TextConfig,
     layer: usize,
     seq_len: usize,
@@ -122,7 +123,9 @@ pub fn forward_decoder(
         hidden_states,
         weights,
         cached,
+        expert_cache,
         cfg,
+        layer,
         seq_len,
         scratch,
         engine,
@@ -134,7 +137,9 @@ fn forward_layer_ff(
     hidden_states: &[f32],
     weights: &DecoderLayerWeights<'_>,
     cached: &GpuLayerWeightCache,
+    expert_cache: &GpuDecoderWeightCache,
     cfg: &TextConfig,
+    layer: usize,
     seq_len: usize,
     scratch: &mut GpuDecoderLayerScratch,
     engine: &mut GpuDecoderEngine,
@@ -230,7 +235,8 @@ fn forward_layer_ff(
         &mut scratch.moe_branch,
         &scratch.moe_input,
         weights,
-        cached,
+        expert_cache,
+        layer,
         cfg,
         seq_len,
         &routes,
@@ -283,6 +289,7 @@ pub fn forward_encoder_prefill(
     hidden_states: &[f32],
     weights: &DecoderLayerWeights<'_>,
     cached: &GpuLayerWeightCache,
+    expert_cache: &GpuDecoderWeightCache,
     cfg: &TextConfig,
     layer: usize,
     seq_len: usize,
@@ -309,7 +316,9 @@ pub fn forward_encoder_prefill(
         hidden_states,
         weights,
         cached,
+        expert_cache,
         cfg,
+        layer,
         seq_len,
         scratch,
         engine,
@@ -321,6 +330,7 @@ pub fn forward_encoder_extend(
     hidden_states: &[f32],
     weights: &DecoderLayerWeights<'_>,
     cached: &GpuLayerWeightCache,
+    expert_cache: &GpuDecoderWeightCache,
     cfg: &TextConfig,
     layer: usize,
     seq_len: usize,
@@ -352,7 +362,9 @@ pub fn forward_encoder_extend(
         hidden_states,
         weights,
         cached,
+        expert_cache,
         cfg,
+        layer,
         seq_len,
         scratch,
         engine,

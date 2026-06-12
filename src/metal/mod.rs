@@ -9,6 +9,7 @@ mod decoder;
 mod decoder_attention;
 mod decoder_layer;
 mod device;
+mod expert_cache;
 mod encoder_extend;
 mod engine;
 mod gemm;
@@ -19,7 +20,10 @@ mod memory;
 mod moe;
 mod weights;
 
-pub use memory::{estimate_decoder_forward, estimate_paged_layer_bytes, estimate_weight_cache, MemoryEstimate};
+pub use memory::{
+    estimate_decoder_forward, estimate_paged_layer_bytes, estimate_weight_cache,
+    log_expert_cache_stats, MemoryEstimate,
+};
 
 pub use attention::{GpuAttention, GpuAttentionKernels};
 pub use decoder::{

@@ -1,9 +1,9 @@
 use crate::config::TextConfig;
-use crate::metal::batched_kernels::{self as bk, f32_bf16_gemm};
+use crate::metal::batched_kernels::{self as bk};
 use crate::metal::kernels::GpuKernels;
 use crate::metal::batch::GpuBatch;
 use crate::metal::device::MetalContext;
-use crate::metal::weights::GpuLayerWeightCache;
+use crate::metal::weights::GpuDecoderWeightCache;
 use crate::model::layer_weights::DecoderLayerWeights;
 use crate::model::moe::RouteResult;
 use crate::safetensors::Error;
@@ -20,7 +20,8 @@ pub fn experts_forward_gpu_batched(
     out: &mut [f32],
     expert_input: &[f32],
     weights: &DecoderLayerWeights<'_>,
-    cached: &GpuLayerWeightCache,
+    expert_cache: &GpuDecoderWeightCache,
+    layer: usize,
     cfg: &TextConfig,
     _seq_len: usize,
     routes: &[RouteResult],
@@ -74,13 +75,12 @@ pub fn experts_forward_gpu_batched(
         return Ok(());
     }
 
-    gate_up_arena.resize(gate_up_len, 0.0);
-    gate_act_arena.resize(gate_act_len, 0.0);
+    let _ = (gate_up_len, gate_act_len);
     out_arena.resize(out_len, 0.0);
 
     let pipeline = &gemm_pipeline.pipeline;
 
-    // Phase 1: all expert gate_up GEMMs in one GPU batch (one sync).
+    // One sync: gate_up GEMM → gelu/swiglu → down GEMM per expert job.
     {
         let mut batch = GpuBatch::begin(&ctx.queue, pool, &ctx.device)?;
         for job in &jobs {
@@ -91,64 +91,40 @@ pub fn experts_forward_gpu_batched(
                 let dst = bi * hidden;
                 batch_input[dst..dst + hidden].copy_from_slice(&expert_input[src..src + hidden]);
             }
-            let gate_slice = &mut gate_up_arena[job.gate_up_off..job.gate_up_off + batch_size * moe_inter * 2];
-            cached.with_expert_gate_up_t(gate_up, job.expert, |w_t| {
-                f32_bf16_gemm(
+            let buf_a = batch.alloc_f32(&batch_input)?;
+            let act_len = batch_size * moe_inter;
+            let buf_act = expert_cache.with_expert_gate_up_t(layer, gate_up, down, job.expert, |w_t| {
+                let buf_gu = bk::f32_bf16_gemm_gpu_in_out(
                     &mut batch,
                     pipeline,
-                    gate_slice,
-                    batch_input,
+                    &buf_a,
                     w_t,
                     batch_size,
                     hidden,
                     moe_inter * 2,
+                )?;
+                bk::gelu_swiglu_gate_up_gpu(
+                    &mut batch,
+                    kernels,
+                    &buf_gu,
+                    act_len,
+                    batch_size,
+                    moe_inter,
                 )
             })?;
-        }
-        batch.end()?;
-    }
-
-    {
-        let mut batch = GpuBatch::begin(&ctx.queue, pool, &ctx.device)?;
-        for job in &jobs {
-            let batch_size = job.tokens.len();
-            let gu_len = batch_size * moe_inter * 2;
-            let gu_slice = &gate_up_arena[job.gate_up_off..job.gate_up_off + gu_len];
-            let buf_gu = batch.alloc_f32(gu_slice)?;
-            let act_len = batch_size * moe_inter;
-            let buf_act = bk::gelu_swiglu_gate_up_gpu(
-                &mut batch,
-                kernels,
-                &buf_gu,
-                act_len,
-                batch_size,
-                moe_inter,
-            )?;
-            let act_slice = &mut gate_act_arena[job.gate_act_off..job.gate_act_off + act_len];
-            batch.register_read(buf_act, act_slice);
-        }
-        batch.end()?;
-    }
-
-    // Phase 2: all expert down GEMMs in one GPU batch (one sync).
-    {
-        let mut batch = GpuBatch::begin(&ctx.queue, pool, &ctx.device)?;
-        for job in &jobs {
-            let batch_size = job.tokens.len();
-            let act_slice = &gate_act_arena[job.gate_act_off..job.gate_act_off + batch_size * moe_inter];
             let out_slice = &mut out_arena[job.out_off..job.out_off + batch_size * hidden];
-            cached.with_expert_down_t(down, job.expert, |w_t| {
-                f32_bf16_gemm(
+            let buf_out = expert_cache.with_expert_down_t(layer, gate_up, down, job.expert, |w_t| {
+                bk::f32_bf16_gemm_gpu_in_out(
                     &mut batch,
                     pipeline,
-                    out_slice,
-                    act_slice,
+                    &buf_act,
                     w_t,
                     batch_size,
                     moe_inter,
                     hidden,
                 )
             })?;
+            batch.register_read(buf_out, out_slice);
         }
         batch.end()?;
     }

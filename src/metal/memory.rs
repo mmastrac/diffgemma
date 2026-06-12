@@ -1,7 +1,13 @@
 //! Rough resident-memory estimates for planning GPU decoder runs.
 
 use crate::config::TextConfig;
+use crate::metal::expert_cache::{expert_entry_bytes, ExpertCacheStats, GPU_RESIDENT_FRACTION};
 use crate::metal::weights::GpuDecoderWeightCache;
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+use objc2::runtime::ProtocolObject;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+use objc2_metal::MTLDevice;
 
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryEstimate {
@@ -119,6 +125,80 @@ fn layer_attn_scratch_bytes_cpu(
 
 pub fn estimate_weight_cache(cache: &GpuDecoderWeightCache) -> u64 {
     cache.resident_bytes()
+}
+
+/// Metal-reported working set limit (unified memory on Apple Silicon).
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn gpu_working_set_cap_bytes(device: &ProtocolObject<dyn MTLDevice>) -> u64 {
+    let recommended = device.recommendedMaxWorkingSetSize();
+    if recommended > 0 {
+        return recommended;
+    }
+    // Fallback if the driver does not report a limit.
+    16_u64 * 1024 * 1024 * 1024
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+pub fn gpu_working_set_cap_bytes() -> u64 {
+    16_u64 * 1024 * 1024 * 1024
+}
+
+/// LRU budget for transposed MoE experts: 80% of working set minus estimated forward resident.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn expert_cache_budget_bytes(
+    device: &ProtocolObject<dyn MTLDevice>,
+    text: &TextConfig,
+    seq_len: usize,
+    kv_len: usize,
+) -> u64 {
+    use crate::metal::expert_cache::BUFFER_POOL_FUDGE_BYTES;
+    let cap = (gpu_working_set_cap_bytes(device) as f64 * GPU_RESIDENT_FRACTION) as u64;
+    let forward = estimate_decoder_forward(text, seq_len, kv_len).total_bytes() + BUFFER_POOL_FUDGE_BYTES;
+    let entry = expert_entry_bytes(text);
+    cap.saturating_sub(forward).max(entry)
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn log_gpu_memory_plan(
+    device: &ProtocolObject<dyn MTLDevice>,
+    text: &TextConfig,
+    seq_len: usize,
+    kv_len: usize,
+    expert_budget: u64,
+) {
+    let working_set = gpu_working_set_cap_bytes(device);
+    let cap = (working_set as f64 * GPU_RESIDENT_FRACTION) as u64;
+    let forward = estimate_decoder_forward(text, seq_len, kv_len).total_bytes();
+    let entry = expert_entry_bytes(text);
+    let max_experts = expert_budget / entry.max(1);
+    let unified = if device.hasUnifiedMemory() { "yes" } else { "no" };
+    eprintln!(
+        "  GPU memory: working_set={:.1} GiB, unified={unified}, resident cap={:.0}% ({:.1} GiB)",
+        working_set as f64 / (1024.0 * 1024.0 * 1024.0),
+        GPU_RESIDENT_FRACTION * 100.0,
+        cap as f64 / (1024.0 * 1024.0 * 1024.0),
+    );
+    eprintln!(
+        "  forward reserve (seq={seq_len}, kv={kv_len}): {:.1} MiB",
+        forward as f64 / (1024.0 * 1024.0),
+    );
+    eprintln!(
+        "  expert LRU budget: {:.1} MiB (~{max_experts} experts @ {:.1} MiB each)",
+        expert_budget as f64 / (1024.0 * 1024.0),
+        entry as f64 / (1024.0 * 1024.0),
+    );
+}
+
+pub fn log_expert_cache_stats(stats: ExpertCacheStats) {
+    if stats.evictions > 0 {
+        eprintln!(
+            "  expert LRU: {:.1}/{:.1} MiB, {} entries, {} evictions",
+            stats.used_bytes as f64 / (1024.0 * 1024.0),
+            stats.budget_bytes as f64 / (1024.0 * 1024.0),
+            stats.entries,
+            stats.evictions,
+        );
+    }
 }
 
 pub fn estimate_paged_layer_bytes(text: &TextConfig) -> u64 {

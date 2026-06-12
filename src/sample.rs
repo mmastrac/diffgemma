@@ -63,6 +63,17 @@ impl Default for SamplerConfig {
     }
 }
 
+/// Build sampler config for a run; `no_early_stop` forces all `steps` denoise iterations.
+pub fn sampler_for_steps(steps: usize, no_early_stop: bool) -> SamplerConfig {
+    let mut cfg = SamplerConfig::default();
+    cfg.max_denoising_steps = steps.max(1);
+    if no_early_stop {
+        cfg.confidence_threshold = f32::MAX;
+        cfg.stability_threshold = usize::MAX;
+    }
+    cfg
+}
+
 impl SamplerConfig {
     /// Temperature at denoising step `cur_step` (counts down from `max_denoising_steps` to 1).
     pub fn temperature_at_step(&self, cur_step: usize) -> f32 {

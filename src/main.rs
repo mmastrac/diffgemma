@@ -39,6 +39,7 @@ enum Command {
         prompt_len: usize,
         max_new_tokens: usize,
         max_layers: Option<usize>,
+        no_early_stop: bool,
     },
     GenerateGpu {
         prompt: Option<String>,
@@ -47,6 +48,7 @@ enum Command {
         prompt_len: usize,
         max_new_tokens: usize,
         max_layers: Option<usize>,
+        no_early_stop: bool,
         write_golden: Option<String>,
     },
     GenerateParity {
@@ -56,6 +58,7 @@ enum Command {
         prompt_len: usize,
         max_new_tokens: usize,
         max_layers: Option<usize>,
+        no_early_stop: bool,
         golden: Option<String>,
         compare_cpu: bool,
         write_golden: Option<String>,
@@ -136,6 +139,7 @@ fn run_command(m: &model::Model, model_dir: &std::path::Path, command: Command) 
             prompt_len,
             max_new_tokens,
             max_layers,
+            no_early_stop,
         } => run_generate(
             m,
             model_dir,
@@ -145,6 +149,7 @@ fn run_command(m: &model::Model, model_dir: &std::path::Path, command: Command) 
             prompt_len,
             max_new_tokens,
             max_layers,
+            no_early_stop,
             false,
             None,
         ),
@@ -155,6 +160,7 @@ fn run_command(m: &model::Model, model_dir: &std::path::Path, command: Command) 
             prompt_len,
             max_new_tokens,
             max_layers,
+            no_early_stop,
             write_golden,
         } => run_generate(
             m,
@@ -165,6 +171,7 @@ fn run_command(m: &model::Model, model_dir: &std::path::Path, command: Command) 
             prompt_len,
             max_new_tokens,
             max_layers,
+            no_early_stop,
             true,
             write_golden,
         ),
@@ -175,6 +182,7 @@ fn run_command(m: &model::Model, model_dir: &std::path::Path, command: Command) 
             prompt_len,
             max_new_tokens,
             max_layers,
+            no_early_stop,
             golden,
             compare_cpu,
             write_golden,
@@ -187,6 +195,7 @@ fn run_command(m: &model::Model, model_dir: &std::path::Path, command: Command) 
             prompt_len,
             max_new_tokens,
             max_layers,
+            no_early_stop,
             golden,
             compare_cpu,
             write_golden,
@@ -216,6 +225,7 @@ fn parse_cli() -> Cli {
     let mut golden_name: Option<String> = None;
     let mut compare_cpu = false;
     let mut write_golden: Option<String> = None;
+    let mut no_early_stop = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -262,6 +272,7 @@ fn parse_cli() -> Cli {
                 }
             }
             "--compare-cpu" => compare_cpu = true,
+            "--no-early-stop" => no_early_stop = true,
             "--write-golden" => {
                 if let Some(v) = args.next() {
                     write_golden = Some(v);
@@ -323,7 +334,15 @@ fn parse_cli() -> Cli {
     }
 
     let command = match positional.first().map(String::as_str) {
-        None => default_generate_command(prompt, seed, steps, prompt_len, max_new_tokens, parity_layers),
+        None => default_generate_command(
+            prompt,
+            seed,
+            steps,
+            prompt_len,
+            max_new_tokens,
+            parity_layers,
+            no_early_stop,
+        ),
         Some("summary") => Command::Summary,
         Some("config") => Command::Config,
         Some("weights") => {
@@ -343,6 +362,7 @@ fn parse_cli() -> Cli {
             prompt_len,
             max_new_tokens,
             max_layers: parity_layers,
+            no_early_stop,
         },
         Some("generate-gpu") => Command::GenerateGpu {
             prompt: prompt.clone(),
@@ -351,6 +371,7 @@ fn parse_cli() -> Cli {
             prompt_len,
             max_new_tokens,
             max_layers: parity_layers,
+            no_early_stop,
             write_golden,
         },
         Some("generate-parity") => Command::GenerateParity {
@@ -360,6 +381,7 @@ fn parse_cli() -> Cli {
             prompt_len,
             max_new_tokens,
             max_layers: parity_layers,
+            no_early_stop,
             golden: golden_name,
             compare_cpu,
             write_golden,
@@ -391,7 +413,7 @@ fn parse_cli() -> Cli {
             );
             eprintln!("  default (no command): generate-gpu with --features metal");
             eprintln!("  generate-parity: GPU vs checked-in golden (use --compare-cpu for slow CPU path)");
-            eprintln!("  options: ... --golden NAME --write-golden NAME --compare-cpu");
+            eprintln!("  options: ... --golden NAME --write-golden NAME --compare-cpu --no-early-stop");
             eprintln!("  gemm options: --size N (default 512, requires --features metal)");
             eprintln!("  attention: layer 0 GQA parity (requires --features metal)");
             eprintln!("  decoder-gpu: full decoder CPU vs GPU parity at seq=256 (requires --features metal)");
@@ -410,6 +432,7 @@ fn default_generate_command(
     prompt_len: usize,
     max_new_tokens: usize,
     max_layers: Option<usize>,
+    no_early_stop: bool,
 ) -> Command {
     Command::GenerateGpu {
         prompt,
@@ -418,6 +441,7 @@ fn default_generate_command(
         prompt_len,
         max_new_tokens,
         max_layers,
+        no_early_stop,
         write_golden: None,
     }
 }
@@ -430,6 +454,7 @@ fn default_generate_command(
     prompt_len: usize,
     max_new_tokens: usize,
     max_layers: Option<usize>,
+    no_early_stop: bool,
 ) -> Command {
     Command::Generate {
         prompt,
@@ -438,6 +463,7 @@ fn default_generate_command(
         prompt_len,
         max_new_tokens,
         max_layers,
+        no_early_stop,
     }
 }
 
@@ -594,7 +620,8 @@ fn run_decoder_gpu_parity(m: &model::Model, seq_len: usize, kv_len: usize, layer
         est.print_summary("decoder-gpu (single-path)");
 
         let mut gpu_scratch = GpuDecoderScratch::new(canvas_len, &m.config);
-        let mut gpu_weights = match load_weight_cache(&m.weights, &m.config.text_config) {
+        let mut gpu_weights =
+            match load_weight_cache(&m.weights, &m.config.text_config, canvas_len, kv_len) {
             Ok(w) => w,
             Err(err) => {
                 eprintln!("error: {err}");
@@ -784,7 +811,8 @@ fn run_bench_decoder(
         };
 
         let mut scratch = GpuDecoderScratch::new(seq_len, &m.config);
-        let mut gpu_weights = match load_weight_cache(&m.weights, &m.config.text_config) {
+        let mut gpu_weights =
+            match load_weight_cache(&m.weights, &m.config.text_config, seq_len, kv_len) {
             Ok(w) => w,
             Err(err) => {
                 eprintln!("error: {err}");
@@ -1114,6 +1142,7 @@ fn run_generate(
     prompt_len: usize,
     max_new_tokens: usize,
     max_layers: Option<usize>,
+    no_early_stop: bool,
     use_gpu: bool,
     write_golden: Option<String>,
 ) -> ExitCode {
@@ -1138,29 +1167,32 @@ fn run_generate(
     let mut enc_scratch = model::encoder::EncoderScratch::new(enc_seq, &m.config);
 
     let gen_cfg = generate::GenerateConfig {
-        sampler: sample::SamplerConfig {
-            max_denoising_steps: steps.max(1),
-            ..sample::SamplerConfig::default()
-        },
+        sampler: sample::sampler_for_steps(steps, no_early_stop),
         max_new_tokens,
         seed,
         max_layers,
+        no_early_stop,
     };
 
     let backend = if use_gpu { "generate-gpu" } else { "generate" };
     let layers_note = max_layers
         .map(|n| format!(", layers={n}"))
         .unwrap_or_default();
+    let stop_note = if no_early_stop { ", no_early_stop" } else { "" };
     eprintln!(
-        "running {backend} (prompt_len={prompt_len}, canvas={canvas}, steps={steps}, max_new_tokens={max_new_tokens}, seed={seed}{layers_note})..."
+        "running {backend} (prompt_len={prompt_len}, canvas={canvas}, steps={steps}, max_new_tokens={max_new_tokens}, seed={seed}{layers_note}{stop_note})..."
     );
     let started = std::time::Instant::now();
 
     #[cfg(all(feature = "metal", target_os = "macos"))]
     if use_gpu {
-        use metal::{load_weight_cache, GpuDecoderEngine, GpuDecoderScratch};
+        use metal::{
+            load_weight_cache, log_expert_cache_stats, GpuDecoderEngine, GpuDecoderScratch,
+        };
         let mut dec_scratch = GpuDecoderScratch::new(canvas, &m.config);
-        let mut gpu_weights = match load_weight_cache(&m.weights, &m.config.text_config) {
+        let max_kv = prompt_len + max_new_tokens;
+        let mut gpu_weights =
+            match load_weight_cache(&m.weights, &m.config.text_config, canvas, max_kv) {
             Ok(w) => w,
             Err(err) => {
                 eprintln!("error: {err}");
@@ -1199,6 +1231,7 @@ fn run_generate(
                         return ExitCode::FAILURE;
                     }
                 }
+                log_expert_cache_stats(gpu_weights.expert_cache_stats());
                 print_generate_output(backend, &out, prompt_len, started.elapsed(), model_dir);
                 ExitCode::SUCCESS
             }
@@ -1258,6 +1291,7 @@ fn run_generate_parity(
     prompt_len: usize,
     max_new_tokens: usize,
     max_layers: Option<usize>,
+    no_early_stop: bool,
     golden_name: Option<String>,
     compare_cpu: bool,
     write_golden: Option<String>,
@@ -1283,13 +1317,11 @@ fn run_generate_parity(
         };
 
         let gen_cfg = generate::GenerateConfig {
-            sampler: sample::SamplerConfig {
-                max_denoising_steps: steps.max(1),
-                ..sample::SamplerConfig::default()
-            },
+            sampler: sample::sampler_for_steps(steps, no_early_stop),
             max_new_tokens,
             seed,
             max_layers,
+            no_early_stop,
         };
 
         let prompt_label = prompt_text.clone().unwrap_or_else(|| format!("prompt_len={prompt_len}"));
@@ -1301,7 +1333,9 @@ fn run_generate_parity(
         let enc_seq = prompt.len().max(canvas);
         let mut enc_gpu = model::encoder::EncoderScratch::new(enc_seq, &m.config);
         let mut dec_gpu = GpuDecoderScratch::new(canvas, &m.config);
-        let mut gpu_weights = match load_weight_cache(&m.weights, &m.config.text_config) {
+        let max_kv = prompt.len() + max_new_tokens;
+        let mut gpu_weights =
+            match load_weight_cache(&m.weights, &m.config.text_config, canvas, max_kv) {
             Ok(w) => w,
             Err(err) => {
                 eprintln!("error: {err}");

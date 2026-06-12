@@ -14,10 +14,18 @@ use crate::weights::WeightStore;
 pub fn load_weight_cache(
     store: &WeightStore,
     text: &crate::config::TextConfig,
+    seq_len: usize,
+    kv_len: usize,
 ) -> Result<GpuDecoderWeightCache, Error> {
-    eprintln!("initializing GPU weight cache (paged layers, final norm only)...");
+    use crate::metal::device::MetalContext;
+    use crate::metal::memory::{expert_cache_budget_bytes, log_gpu_memory_plan};
+
+    eprintln!("initializing GPU weight cache (paged layers, expert LRU)...");
     let warm = std::time::Instant::now();
-    let cache = GpuDecoderWeightCache::load(store, text)?;
+    let ctx = MetalContext::new()?;
+    let expert_budget = expert_cache_budget_bytes(&ctx.device, text, seq_len, kv_len);
+    log_gpu_memory_plan(&ctx.device, text, seq_len, kv_len, expert_budget);
+    let cache = GpuDecoderWeightCache::load(store, text, expert_budget)?;
     eprintln!("  cache ready in {:.2?}", warm.elapsed());
     Ok(cache)
 }
@@ -134,7 +142,7 @@ pub fn bench_forward(
     cfg: &ModelConfig,
     input: &mut DecoderForwardInput<'_>,
     scratch: &mut GpuDecoderScratch,
-    weights: &mut GpuDecoderWeightCache,
+    weights: &GpuDecoderWeightCache,
     engine: &mut GpuDecoderEngine,
     bench: &BenchConfig,
 ) -> Result<DecoderForwardOutput, Error> {
@@ -154,7 +162,7 @@ pub fn forward(
     cfg: &ModelConfig,
     input: &mut DecoderForwardInput<'_>,
     scratch: &mut GpuDecoderScratch,
-    weights: &mut GpuDecoderWeightCache,
+    weights: &GpuDecoderWeightCache,
     engine: &mut GpuDecoderEngine,
     max_layers: Option<usize>,
 ) -> Result<DecoderForwardOutput, Error> {
@@ -169,7 +177,7 @@ fn forward_inner(
     cfg: &ModelConfig,
     input: &mut DecoderForwardInput<'_>,
     scratch: &mut GpuDecoderScratch,
-    weights: &mut GpuDecoderWeightCache,
+    weights: &GpuDecoderWeightCache,
     engine: &mut GpuDecoderEngine,
     max_layers: usize,
 ) -> Result<DecoderForwardOutput, Error> {
@@ -229,12 +237,14 @@ fn forward_inner(
     for layer in 0..n_layers {
         let layer_scratch = scratch.layer.ensure(cfg, seq_len, input.kv_cache.kv_len, layer)?;
         let layer_weights = DecoderLayerWeights::load(store, layer, text)?;
-        let layer_cache = weights.ensure_layer(store, text, layer)?;
+        weights.ensure_layer(store, text, layer)?;
+        let layer_cache = weights.layer();
         layer_forward(
             out_buf,
             in_buf,
             &layer_weights,
-            layer_cache,
+            &layer_cache,
+            weights,
             text,
             layer,
             seq_len,
@@ -251,6 +261,7 @@ fn forward_inner(
             engine,
             gpu_kv_ref,
         )?;
+        drop(layer_cache);
         weights.release_layer();
         std::mem::swap(&mut in_buf, &mut out_buf);
     }

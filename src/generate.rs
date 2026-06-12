@@ -20,6 +20,8 @@ pub struct GenerateConfig {
     pub seed: u64,
     /// Limit decoder layers (None = full stack). For smoke tests only.
     pub max_layers: Option<usize>,
+    /// When true, run every denoise step (disable stable/confident early stop).
+    pub no_early_stop: bool,
 }
 
 impl Default for GenerateConfig {
@@ -29,6 +31,7 @@ impl Default for GenerateConfig {
             max_new_tokens: 256,
             seed: 42,
             max_layers: None,
+            no_early_stop: false,
         }
     }
 }

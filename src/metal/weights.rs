@@ -2,7 +2,8 @@
 
 use crate::buffer::Buffer;
 use crate::config::TextConfig;
-use crate::fast_slice::{bf16_to_f32_into, transpose_bf16_weight_into, FastBf16Slice, FastSlice};
+use crate::fast_slice::{bf16_to_f32_into, FastBf16Slice, FastSlice};
+use crate::metal::expert_cache::{ExpertCacheStats, ExpertWeightCache};
 use crate::metal::linear::CachedLinear;
 use crate::model::layer_weights::DecoderLayerWeights;
 use crate::safetensors::Error;
@@ -16,6 +17,11 @@ fn bf16_tensor_to_f32_buffer(slice: Bf16Slice<'_>) -> Buffer<f32> {
     let mut out = Buffer::new(slice.len());
     bf16_to_f32_into(FastBf16Slice::from_bf16(slice), out.as_fast_slice_mut());
     out
+}
+
+struct LayerSlot {
+    loaded_layer: usize,
+    cache: Option<GpuLayerWeightCache>,
 }
 
 pub struct GpuLayerWeightCache {
@@ -39,20 +45,12 @@ pub struct GpuLayerWeightCache {
     pub router_scale: Buffer<f32>,
     pub per_expert_scale: Buffer<f32>,
     pub layer_scalar: f32,
-    expert_gate_up: RefCell<Vec<Option<Buffer<u16>>>>,
-    expert_down: RefCell<Vec<Option<Buffer<u16>>>>,
-    gate_up_stride: usize,
-    down_stride: usize,
-    moe_inter: usize,
-    hidden: usize,
 }
 
 impl GpuLayerWeightCache {
     pub fn load(weights: &DecoderLayerWeights<'_>, cfg: &TextConfig) -> Result<Self, Error> {
         let hidden = cfg.hidden_size;
         let inter = cfg.intermediate_size;
-        let moe_inter = cfg.moe_intermediate_size;
-        let experts = cfg.num_experts;
         let shapes = crate::model::layer_weights::DecoderLayerShapes::for_layer(cfg, weights.keys.layer)?;
         let q_out = shapes.q_proj[0] as usize;
         let kv_out = shapes.k_proj[0] as usize;
@@ -80,60 +78,7 @@ impl GpuLayerWeightCache {
             router_scale: bf16_tensor_to_f32_buffer(weights.router_scale.bf16()?),
             per_expert_scale: bf16_tensor_to_f32_buffer(weights.router_per_expert_scale.bf16()?),
             layer_scalar: weights.layer_scalar.bf16_scalar()?,
-            expert_gate_up: RefCell::new((0..experts).map(|_| None).collect()),
-            expert_down: RefCell::new((0..experts).map(|_| None).collect()),
-            gate_up_stride: moe_inter * 2 * hidden,
-            down_stride: hidden * moe_inter,
-            moe_inter,
-            hidden,
         })
-    }
-
-    fn ensure_expert_gate_up(&self, gate_up: Bf16Slice<'_>, expert: usize) {
-        let mut cache = self.expert_gate_up.borrow_mut();
-        if cache[expert].is_none() {
-            let out_dim = self.moe_inter * 2;
-            let elem_count = out_dim * self.hidden;
-            let mut buf = Buffer::new(elem_count);
-            let src = FastBf16Slice::from_bf16(gate_up);
-            let src = unsafe { src.slice_unchecked(expert * self.gate_up_stride, elem_count) };
-            transpose_bf16_weight_into(src, buf.as_fast_slice_mut(), out_dim, self.hidden);
-            cache[expert] = Some(buf);
-        }
-    }
-
-    fn ensure_expert_down(&self, down: Bf16Slice<'_>, expert: usize) {
-        let mut cache = self.expert_down.borrow_mut();
-        if cache[expert].is_none() {
-            let elem_count = self.hidden * self.moe_inter;
-            let mut buf = Buffer::new(elem_count);
-            let src = FastBf16Slice::from_bf16(down);
-            let src = unsafe { src.slice_unchecked(expert * self.down_stride, elem_count) };
-            transpose_bf16_weight_into(src, buf.as_fast_slice_mut(), self.hidden, self.moe_inter);
-            cache[expert] = Some(buf);
-        }
-    }
-
-    pub fn with_expert_gate_up_t<R>(
-        &self,
-        gate_up: Bf16Slice<'_>,
-        expert: usize,
-        f: impl FnOnce(FastSlice<'_, u16>) -> R,
-    ) -> R {
-        self.ensure_expert_gate_up(gate_up, expert);
-        let cache = self.expert_gate_up.borrow();
-        f(cache[expert].as_ref().expect("expert gate_up").as_fast_slice())
-    }
-
-    pub fn with_expert_down_t<R>(
-        &self,
-        down: Bf16Slice<'_>,
-        expert: usize,
-        f: impl FnOnce(FastSlice<'_, u16>) -> R,
-    ) -> R {
-        self.ensure_expert_down(down, expert);
-        let cache = self.expert_down.borrow();
-        f(cache[expert].as_ref().expect("expert down").as_fast_slice())
     }
 
     pub fn resident_bytes(&self) -> u64 {
@@ -160,58 +105,104 @@ impl GpuLayerWeightCache {
         if let Some(v) = &self.v_proj {
             bytes += v.w_t.len() as u64 * 2;
         }
-        for slot in self.expert_gate_up.borrow().iter().chain(self.expert_down.borrow().iter()) {
-            if let Some(w) = slot {
-                bytes += w.len() as u64 * 2;
-            }
-        }
         bytes
     }
 }
 
 /// Final norm plus at most one layer of transposed GPU weights resident at a time.
+/// MoE expert transposes use an LRU cache bounded by GPU memory budget.
 pub struct GpuDecoderWeightCache {
     pub final_norm: Buffer<f32>,
-    layer: Option<GpuLayerWeightCache>,
-    loaded_layer: usize,
+    layer: RefCell<LayerSlot>,
+    expert_cache: RefCell<ExpertWeightCache>,
 }
 
 impl GpuDecoderWeightCache {
-    pub fn load(store: &WeightStore, _text: &TextConfig) -> Result<Self, Error> {
+    pub fn load(
+        store: &WeightStore,
+        text: &TextConfig,
+        expert_budget_bytes: u64,
+    ) -> Result<Self, Error> {
         let final_norm =
             bf16_tensor_to_f32_buffer(store.tensor("model.decoder.norm.weight")?.bf16()?);
         Ok(Self {
             final_norm,
-            layer: None,
-            loaded_layer: NO_LAYER,
+            layer: RefCell::new(LayerSlot {
+                loaded_layer: NO_LAYER,
+                cache: None,
+            }),
+            expert_cache: RefCell::new(ExpertWeightCache::new(text, expert_budget_bytes)),
         })
     }
 
+    pub fn expert_cache_stats(&self) -> ExpertCacheStats {
+        self.expert_cache.borrow().stats()
+    }
+
+    pub fn with_expert_gate_up_t<R>(
+        &self,
+        layer: usize,
+        gate_up: Bf16Slice<'_>,
+        down: Bf16Slice<'_>,
+        expert: usize,
+        f: impl FnOnce(FastSlice<'_, u16>) -> R,
+    ) -> R {
+        self.expert_cache
+            .borrow_mut()
+            .with_expert_gate_up_t(layer, gate_up, down, expert, f)
+    }
+
+    pub fn with_expert_down_t<R>(
+        &self,
+        layer: usize,
+        gate_up: Bf16Slice<'_>,
+        down: Bf16Slice<'_>,
+        expert: usize,
+        f: impl FnOnce(FastSlice<'_, u16>) -> R,
+    ) -> R {
+        self.expert_cache
+            .borrow_mut()
+            .with_expert_down_t(layer, gate_up, down, expert, f)
+    }
+
     pub fn ensure_layer(
-        &mut self,
+        &self,
         store: &WeightStore,
         text: &TextConfig,
         layer: usize,
-    ) -> Result<&GpuLayerWeightCache, Error> {
-        if self.loaded_layer != layer || self.layer.is_none() {
+    ) -> Result<(), Error> {
+        let mut slot = self.layer.borrow_mut();
+        if slot.loaded_layer != layer || slot.cache.is_none() {
             let weights = DecoderLayerWeights::load(store, layer, text)?;
-            self.layer = Some(GpuLayerWeightCache::load(&weights, text)?);
-            self.loaded_layer = layer;
+            slot.cache = Some(GpuLayerWeightCache::load(&weights, text)?);
+            slot.loaded_layer = layer;
         }
-        Ok(self.layer.as_ref().expect("layer cache"))
+        Ok(())
     }
 
-    pub fn release_layer(&mut self) {
-        self.layer = None;
-        self.loaded_layer = NO_LAYER;
+    pub fn layer(&self) -> std::cell::Ref<'_, GpuLayerWeightCache> {
+        std::cell::Ref::map(self.layer.borrow(), |s| {
+            s.cache
+                .as_ref()
+                .expect("layer cache not loaded; call ensure_layer first")
+        })
+    }
+
+    pub fn release_layer(&self) {
+        let mut slot = self.layer.borrow_mut();
+        slot.cache = None;
+        slot.loaded_layer = NO_LAYER;
     }
 
     pub fn resident_bytes(&self) -> u64 {
         self.final_norm.len() as u64 * 4
             + self
                 .layer
+                .borrow()
+                .cache
                 .as_ref()
                 .map(GpuLayerWeightCache::resident_bytes)
                 .unwrap_or(0)
+            + self.expert_cache.borrow().resident_bytes()
     }
 }

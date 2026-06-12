@@ -62,14 +62,16 @@ pub fn prefill_gpu(
     let mut use_a_input = true;
     for layer in 0..n_layers {
         let layer_weights = DecoderLayerWeights::load(store, layer, text)?;
-        let layer_cache = weights.ensure_layer(store, text, layer)?;
+        weights.ensure_layer(store, text, layer)?;
+        let layer_cache = weights.layer();
         let layer_scratch = dec_scratch.ensure_layer_scratch(cfg, seq_len, 0, layer)?;
         if use_a_input {
             forward_encoder_prefill(
                 &mut enc_scratch.hidden_b[..seq_len * hidden],
                 &enc_scratch.hidden_a[..seq_len * hidden],
                 &layer_weights,
-                layer_cache,
+                &layer_cache,
+                weights,
                 text,
                 layer,
                 seq_len,
@@ -83,7 +85,8 @@ pub fn prefill_gpu(
                 &mut enc_scratch.hidden_a[..seq_len * hidden],
                 &enc_scratch.hidden_b[..seq_len * hidden],
                 &layer_weights,
-                layer_cache,
+                &layer_cache,
+                weights,
                 text,
                 layer,
                 seq_len,
@@ -93,6 +96,7 @@ pub fn prefill_gpu(
                 &gpu_kv,
             )?;
         }
+        drop(layer_cache);
         weights.release_layer();
         use_a_input = !use_a_input;
     }
@@ -155,7 +159,8 @@ pub fn extend_prefill_gpu(
     let mut use_a_input = true;
     for layer in 0..n_layers {
         let layer_weights = DecoderLayerWeights::load(store, layer, text)?;
-        let layer_cache = weights.ensure_layer(store, text, layer)?;
+        weights.ensure_layer(store, text, layer)?;
+        let layer_cache = weights.layer();
         let layer_scratch =
             dec_scratch.ensure_layer_scratch(cfg, seq_len, kv_len_before, layer)?;
         if use_a_input {
@@ -163,7 +168,8 @@ pub fn extend_prefill_gpu(
                 &mut enc_scratch.hidden_b[..seq_len * hidden],
                 &enc_scratch.hidden_a[..seq_len * hidden],
                 &layer_weights,
-                layer_cache,
+                &layer_cache,
+                weights,
                 text,
                 layer,
                 seq_len,
@@ -178,7 +184,8 @@ pub fn extend_prefill_gpu(
                 &mut enc_scratch.hidden_a[..seq_len * hidden],
                 &enc_scratch.hidden_b[..seq_len * hidden],
                 &layer_weights,
-                layer_cache,
+                &layer_cache,
+                weights,
                 text,
                 layer,
                 seq_len,
@@ -189,6 +196,7 @@ pub fn extend_prefill_gpu(
                 &gpu_kv,
             )?;
         }
+        drop(layer_cache);
         weights.release_layer();
         use_a_input = !use_a_input;
     }
