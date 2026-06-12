@@ -161,22 +161,27 @@ Keep: golden-parity discipline, `bench-decoder` regression tables, CPU/BLAS orac
 
 ## Phase Q3 — Kill the CPU round-trips
 
-**Status: in progress (2026-06).** GPU router + merged `.dgq` FF/MoE batch landed; sampler/early-stop still CPU.
+**Status: in progress (2026-06).** Full GPU sampler landed (~3 KB/step readback); parity goldens blocked on determinism work below.
 
 Once weights are resident and kernels are sane, the per-step serial CPU work becomes the wall: logits readback [256 × 262,144] ≈ 134–268 MB/step + CPU softmax/entropy over 67M values; CPU router = measured **151 syncs/step**.
 
 | Task | Notes |
 |---|---|
-| GPU router top-8 | ✅ `route_gpu_in_batch` + `router_top_k_rows` (f32 logits, tie-break prob↓ index↑); wired on `.dgq` path; dgq `generate-parity` layers3 ✅ |
+| GPU router top-8 | ✅ `route_gpu_in_batch` + `router_top_k_rows` (f32 logits, tie-break prob↓ index↑); wired on `.dgq` path |
 | Merged FF+MoE batch (`.dgq`) | ✅ one batch/layer: dense FF → GPU route (`flush_reads`) → grouped MoE (`flush_reads`) → final combine; skips ~5.6 MB/layer residual+dense readback |
-| GPU sampler (partial) | ✅ lm_head → GPU logits buf (scatter); GPU softcap + temperature; CPU sample/accept/stop |
-| GPU sampler (full) | ✅ GPU entropy + argmax + categorical sample; ~3 KB/step readback (256×4×3). Fixed odd-layer hidden buf + persistent logits pool alloc. Forward nondeterminism blocks stable goldens |
-| Counter-based RNG | Philox/Threefry keyed (seed, block, step, position); implement identically in CPU oracle; regenerate goldens once |
+| GPU sampler (full) | ✅ GPU softcap → entropy → argmax → softmax → categorical sample; ~3 KB/step readback. Fixed odd-layer hidden ping-pong, persistent logits pool alloc, ranged vec_fill_zero, lm_head scatter grid |
+| Deterministic parity path | ✅ `GenerateConfig.deterministic` + `engine.use_mps_q4` (env `DGQ_MPS_Q4=0`); `generate-parity` uses native Q4 + CPU sampler. **MPS off removes most drift; residual run-to-run variance still under investigation** |
+| Counter-based RNG | Philox/Threefry keyed (seed, block, step, position); implement identically in CPU oracle; regenerate goldens once forward is bit-stable |
 | GPU early-stop reduction | avg-entropy scalar + argmax-stable-2-steps flag; CPU reads 2 scalars + committed ids per step |
 | Self-conditioning on GPU | sc probs/logits never leave GPU; feed prev-step distribution path entirely on-device |
 | Command-buffer structure | encode whole step into 1–3 command buffers; no mid-step `waitUntilCompleted`; sampler dependency stays on-GPU |
 
-**Measured (M3 Pro, re-bench after GPU router + partial GPU sampler):** `bench-step` **4.93 s/step** (was 5.29 s); readback **1334 MiB/step**; syncs **152**. lm_head uses GPU scatter (no per-chunk readback); sampler still readbacks once/step for CPU categorical sample (256 MiB). Next: full GPU sample + MoE scatter.
+**Nondeterminism (2026-06 investigation):**
+- **Primary cause:** `MPSMatrixMultiplication` on `.dgq` dense Q4 linears (attention + FF gate/up/down). Same seed can change tokens at canvas index ≥1 between runs when MPS is on. **Fix:** `GpuDecoderEngine.use_mps_q4` (default **on** via `DGQ_MPS_Q4=1` for bench; **off** for `generate-parity` / `deterministic:true`).
+- **Secondary:** With MPS off + CPU sampler, occasional run-to-run token drift remains (~20% of back-to-back `cargo run` parity checks on M3 Pro). Suspects: pooled output buffers (now zeroed in `alloc_f32_out`), GPU MoE grouped `simd_sum`, or fp32 threshold effects in categorical sample. Tracked; golden regen deferred until stable.
+- **Historical:** Old goldens encoded NaN logits (odd-layer hidden buf bug) → CPU argmax → mask token 262143. Invalid; do not preserve.
+
+**Measured (M3 Pro, full GPU sampler):** sampler readback **~3 KB/step** (256×4×3); forward readback still ~109 MiB/step (MoE/router). `bench-step` re-bench pending with MPS default.
 
 **Exit / gates (M3 Pro):**
 - Readback/step ≤ 1 MB (ids + scalars), down from ~134–268 MB.

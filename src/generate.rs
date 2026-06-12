@@ -22,6 +22,8 @@ pub struct GenerateConfig {
     pub max_layers: Option<usize>,
     /// When true, run every denoise step (disable stable/confident early stop).
     pub no_early_stop: bool,
+    /// Parity / golden tests: native Q4 kernels + CPU sampler (deterministic, slower).
+    pub deterministic: bool,
 }
 
 impl Default for GenerateConfig {
@@ -32,6 +34,7 @@ impl Default for GenerateConfig {
             seed: 42,
             max_layers: None,
             no_early_stop: false,
+            deterministic: false,
         }
     }
 }
@@ -483,7 +486,13 @@ pub fn generate_gpu(
     weights: &mut crate::metal::GpuDecoderWeightCache,
     engine: &mut crate::metal::GpuDecoderEngine,
 ) -> Result<GenerateOutput, Error> {
-    dec_scratch.use_gpu_sampler = weights.is_dgq();
+    dec_scratch.use_gpu_sampler = weights.is_dgq() && !gen_cfg.deterministic;
+    if gen_cfg.deterministic || std::env::var("DGQ_DETERMINISTIC")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false)
+    {
+        engine.set_use_mps_q4(false);
+    }
     let mut decoder = DecoderBackend::Gpu {
         store,
         cfg,
@@ -492,6 +501,68 @@ pub fn generate_gpu(
         engine,
     };
     generate_inner(store, cfg, prompt_token_ids, gen_cfg, enc_scratch, &mut decoder)
+}
+
+#[cfg(all(test, feature = "metal", target_os = "macos"))]
+mod gpu_determinism {
+    use super::*;
+    use crate::metal::{load_weight_cache, GpuDecoderEngine, GpuDecoderScratch};
+    use crate::weights::WeightStore;
+
+    /// Native Q4 + CPU sampler should be repeatable; tracked in Q3 (currently flaky on some runs).
+    #[test]
+    #[ignore = "native Q4 forward still shows occasional run-to-run token drift; see PLAN2 Q3"]
+    fn dgq_generate_stable_deterministic_mode() {
+        let dgq_dir = std::path::Path::new("/tmp/quantized-weights");
+        if !dgq_dir.join("model.dgq.json").exists() {
+            eprintln!("skip: /tmp/quantized-weights missing");
+            return;
+        }
+        let store = WeightStore::open(dgq_dir).expect("open");
+        let cfg = crate::config::ModelConfig::load(dgq_dir).expect("cfg");
+        let prompt = vec![9259u32];
+        let gen_cfg = GenerateConfig {
+            sampler: crate::sample::sampler_for_steps(1, false),
+            max_new_tokens: 256,
+            seed: 42,
+            max_layers: Some(3),
+            no_early_stop: false,
+            deterministic: true,
+        };
+        let canvas = cfg.canvas_length;
+        let max_kv = prompt.len() + gen_cfg.max_new_tokens;
+
+        let mut weights = load_weight_cache(&store, &cfg.text_config, canvas, max_kv).expect("cache");
+        let mut engine = GpuDecoderEngine::new().expect("engine");
+        let mut enc = crate::model::encoder::EncoderScratch::new(prompt.len().max(canvas), &cfg);
+        let mut dec = GpuDecoderScratch::new(canvas, &cfg);
+        let out_a = generate_gpu(
+            &store,
+            &cfg,
+            &prompt,
+            &gen_cfg,
+            &mut enc,
+            &mut dec,
+            &mut weights,
+            &mut engine,
+        )
+        .expect("generate a");
+        let mut enc = crate::model::encoder::EncoderScratch::new(prompt.len().max(canvas), &cfg);
+        let mut dec = GpuDecoderScratch::new(canvas, &cfg);
+        let mut engine = GpuDecoderEngine::new().expect("engine");
+        let out_b = generate_gpu(
+            &store,
+            &cfg,
+            &prompt,
+            &gen_cfg,
+            &mut enc,
+            &mut dec,
+            &mut weights,
+            &mut engine,
+        )
+        .expect("generate b");
+        assert_eq!(out_a.token_ids, out_b.token_ids);
+    }
 }
 
 #[cfg(test)]

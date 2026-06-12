@@ -33,6 +33,8 @@ pub struct GpuDecoderEngine {
     pub f32_q8_linear_pipeline: ComputePipeline,
     pub dequant_q4_matrix_pipeline: ComputePipeline,
     pub mps_matmul: MpsMatmulCache,
+    /// When false, `.dgq` q4 linears use the native Metal kernel instead of MPS (deterministic).
+    use_mps_q4: Cell<bool>,
     pub kernels: GpuKernels,
     pub attention: GpuAttentionKernels,
     pub sampler_kernels: GpuSamplerKernels,
@@ -54,6 +56,7 @@ impl GpuDecoderEngine {
         let dequant_q4_matrix_pipeline =
             ctx.compile_kernel(QGEMM_SHADER, DEQUANT_Q4_MATRIX_ENTRY)?;
         let mps_matmul = MpsMatmulCache::new(ctx.device.clone());
+        let use_mps_q4 = Cell::new(mps_q4_default_from_env());
         let kernels = GpuKernels::new(&ctx)?;
         let attention = GpuAttentionKernels::new(&ctx)?;
         let sampler_kernels = GpuSamplerKernels::new(&ctx)?;
@@ -68,6 +71,7 @@ impl GpuDecoderEngine {
             f32_q8_linear_pipeline,
             dequant_q4_matrix_pipeline,
             mps_matmul,
+            use_mps_q4,
             kernels,
             attention,
             sampler_kernels,
@@ -109,5 +113,20 @@ impl GpuDecoderEngine {
         } else {
             None
         }
+    }
+
+    pub fn use_mps_q4(&self) -> bool {
+        self.use_mps_q4.get()
+    }
+
+    pub fn set_use_mps_q4(&self, enabled: bool) {
+        self.use_mps_q4.set(enabled);
+    }
+}
+
+fn mps_q4_default_from_env() -> bool {
+    match std::env::var("DGQ_MPS_Q4") {
+        Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
+        Err(_) => true,
     }
 }

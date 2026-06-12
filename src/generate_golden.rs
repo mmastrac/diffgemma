@@ -204,6 +204,7 @@ mod tests {
             seed: 42,
             max_layers: Some(3),
             no_early_stop: false,
+            deterministic: false,
         };
         assert!(g.matches_config("Hello", &cfg, 1, "dgq_q4"));
         assert!(!g.matches_config("Hello", &cfg, 1, "safetensors"));

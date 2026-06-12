@@ -140,6 +140,11 @@ impl<'a> GpuBatch<'a> {
             .pool
             .allocate(self.device, bytes)
             .ok_or(Error::Format("Metal buffer alloc failed"))?;
+        // Pooled buffers may hold stale bytes; zero so partial kernel coverage cannot leak.
+        unsafe {
+            let ptr = buf.contents().as_ptr() as *mut u8;
+            std::ptr::write_bytes(ptr, 0, bytes);
+        }
         self.track_release(bytes, buf.clone());
         Ok(buf)
     }

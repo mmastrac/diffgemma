@@ -97,7 +97,7 @@ pub fn forward_decoder(
         &mut scratch.attn,
         engine,
         gpu_kv,
-        expert_cache.is_dgq(),
+        engine.use_mps_q4(),
     )?;
 
     forward_layer_ff(
@@ -184,6 +184,7 @@ fn forward_layer_ff_dgq_gpu(
     let len = seq_len * hidden;
     let experts = cfg.num_experts;
     let top_k = cfg.top_k_experts;
+    let use_mps_q4 = engine.use_mps_q4();
 
     let telemetry = engine.batch_telemetry();
     let mut batch = begin_engine_batch(
@@ -218,7 +219,11 @@ fn forward_layer_ff_dgq_gpu(
         &mut batch,
         &engine.f32_bf16_linear_pipeline,
         &engine.f32_q4_linear_pipeline,
-        Some((&mut engine.mps_matmul, &engine.dequant_q4_matrix_pipeline)),
+        if use_mps_q4 {
+            Some((&mut engine.mps_matmul, &engine.dequant_q4_matrix_pipeline))
+        } else {
+            None
+        },
         &buf_normed,
         &cached.mlp_gate,
         seq_len,
@@ -227,7 +232,11 @@ fn forward_layer_ff_dgq_gpu(
         &mut batch,
         &engine.f32_bf16_linear_pipeline,
         &engine.f32_q4_linear_pipeline,
-        Some((&mut engine.mps_matmul, &engine.dequant_q4_matrix_pipeline)),
+        if use_mps_q4 {
+            Some((&mut engine.mps_matmul, &engine.dequant_q4_matrix_pipeline))
+        } else {
+            None
+        },
         &buf_normed,
         &cached.mlp_up,
         seq_len,
@@ -239,7 +248,11 @@ fn forward_layer_ff_dgq_gpu(
         &mut batch,
         &engine.f32_bf16_linear_pipeline,
         &engine.f32_q4_linear_pipeline,
-        Some((&mut engine.mps_matmul, &engine.dequant_q4_matrix_pipeline)),
+        if use_mps_q4 {
+            Some((&mut engine.mps_matmul, &engine.dequant_q4_matrix_pipeline))
+        } else {
+            None
+        },
         &buf_gate,
         &cached.mlp_down,
         seq_len,
@@ -532,7 +545,7 @@ pub fn forward_encoder_prefill(
         &mut scratch.attn,
         engine,
         gpu_kv,
-        expert_cache.is_dgq(),
+        engine.use_mps_q4(),
     )?;
 
     forward_layer_ff(
@@ -579,7 +592,7 @@ pub fn forward_encoder_extend(
         &mut scratch.attn,
         engine,
         gpu_kv,
-        expert_cache.is_dgq(),
+        engine.use_mps_q4(),
     )?;
 
     forward_layer_ff(

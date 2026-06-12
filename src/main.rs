@@ -1817,6 +1817,7 @@ fn run_generate(
         seed,
         max_layers,
         no_early_stop,
+        deterministic: false,
     };
 
     let backend = if use_gpu { "generate-gpu" } else { "generate" };
@@ -1982,6 +1983,7 @@ fn run_generate_parity(
             seed,
             max_layers,
             no_early_stop,
+            deterministic: true,
         };
 
         let prompt_label = prompt_text.clone().unwrap_or_else(|| format!("prompt_len={prompt_len}"));
