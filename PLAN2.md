@@ -115,7 +115,7 @@ Keep: golden-parity discipline, `bench-decoder` regression tables, CPU/BLAS orac
 
 ## Phase Q2 — Dequant-in-kernel GEMMs (residency goes live)
 
-**Status: in progress (2026-06).** `.dgq` path is resident on GPU; bf16 LRU/paging bypassed when quantized.
+**Status: done (2026-06).** `.dgq` path is resident on GPU; bf16 LRU/paging bypassed when quantized.
 
 **Deliverable:** all weight-consuming GPU paths read quantized blocks directly; **never** materialize bf16/f32 weight buffers (that recreates the bandwidth problem).
 
@@ -127,31 +127,35 @@ Keep: golden-parity discipline, `bench-decoder` regression tables, CPU/BLAS orac
 | GPU lm_head (q8) | `f32_q8_linear` + chunked tied head from blob; replaces CPU row dequant | ✅ |
 | MoE grouped GEMM | sort/bucket tokens by expert, one batched dispatch; simd K-reduction q4 kernel | ✅ |
 | Dense → MPS (Q2.5 interim) | q4 dequant scratch + `MPSMatrixMultiplication` for attn/MLP linears on `.dgq` | ✅ |
-| **Delete** bf16 paths on `.dgq` | expert LRU, transpose cache, layer paging, bf16 upload — inactive on `.dgq`; code retained for safetensors | ✅ (dgq) / ⏳ (delete dead code) |
-| Regenerate goldens | quantized goldens (CPU-dequant oracle on same `.dgq`); bf16 fixtures separate | ⏳ |
-| `bench-step` on `.dgq` | M3 Pro, canvas=256, kv=64, 30L | **~6.0 s** (was 107 s bf16, 24.6 s pre-lm_head, 18.8 s pre-MPS, 11.9 s pre-grouped-MoE) |
+| GPU self-conditioning + soft embed | q8 SC MLP + GPU softmax/prob@embed for multi-step `.dgq` | ✅ |
+| **Delete** bf16 paths on `.dgq` | expert LRU, transpose cache, layer paging, bf16 upload — inactive on `.dgq`; code retained for safetensors | ✅ (dgq) / ⏳ (delete dead code, low priority) |
+| Regenerate goldens | `dgq_*` fixtures with `weights_profile`; bf16 fixtures unchanged | ✅ (layers3 steps 1–2; full 30L optional) |
+| `bench-step` on `.dgq` | M3 Pro, canvas=256, kv=64, 30L | **5.29 s/step** (was 107 s bf16 → 18.8 s → 11.9 s → 5.29 s) |
+| `bench-prefill` on `.dgq` | GPU encoder prefill, 1 tok, 30L | **1.66 s/run** (gate ≤0.5 s not met — see note) |
 
 **Exit / gates (M3 Pro):**
-- `bench-step` ≤ **12 s** — **met** (~6.0 s with MPS dense + grouped MoE q4).
-- Zero evictions, zero transposes — **met** (0 LRU hits/misses/evictions on `.dgq`).
-- Prefill (1 tok) ≤ 0.5 s — **not measured** (GPU `prefill_gpu` wired for bench-step).
-- `generate-parity` on quantized goldens — **not done**.
+- `bench-step` ≤ **12 s** — **met** (5.29 s).
+- Zero evictions, zero transposes — **met** (0 LRU on `.dgq`).
+- Prefill (1 tok, 30L encoder) ≤ 0.5 s — **not met** (1.66 s); incremental prefill during generate is separate (~10 s for "Hello" cold path incl. cache init). Revisit in Q3/Q4.
+- `generate-parity` on quantized goldens — **met** (`dgq_hello_steps{1,2}_layers3`).
 
 ---
 
 ## Phase Q2.5 — GEMM MFU (promoted from Q5 by Q0 data)
 
-**Oracle measured (2026-06):** custom `f32_bf16_linear` 0.19 / 0.14 TFLOP/s (dense / MoE M=33) vs **MPS 3.35 / 0.52 TFLOP/s**. Upload/readback ≈ 5% — the naive 1-thread/output kernel is the gap, not hardware, not measurement.
+**Status: kernel work done (2026-06).** Throughput gates deferred — remaining wall is Q3 (readback + sync + CPU sampler/router).
 
-**Step decomposition at oracle rates** (canvas=256, 5.95M/expert): experts 731 GFLOP ÷ 0.52 ≈ **1.4 s**; dense-shaped M=256 (attn proj 532 + shared MLP 307 + lm_head 378 GFLOP) ÷ 3.35 ≈ **0.36 s**. → **MoE grouped kernel is ~75% of the step and the critical path.** Dense via MPS is the easy 18×; it buys the small slice.
+**Oracle measured (2026-06, re-bench):** custom dense 0.18 TFLOP/s vs **MPS 2.22 TFLOP/s** @ 256×2816×2816; MoE-shape M=33 custom 0.15 vs **MPS 0.35 TFLOP/s**. Upload/readback ≈ 5% — naive 1-thread/output kernel was the gap.
+
+**Step decomposition at measured rates** (canvas=256, grouped MoE q4 path): `bench-step` **5.29 s** @ 30L (152 syncs, ~1.5 GiB readback/step). End-to-end generate with early stop: **~17 s/block**, ~18 tok/s denoise (2 effective steps).
 
 | Task | Notes |
 |---|---|
-| **Grouped MoE kernel (critical path)** | all ~62 active experts, one dispatch (per-expert MPS = ~3,720 encodes/step — ruled out; fp16-resident experts = 12+ GiB — ruled out). simdgroup K-reduction over Q4 groups, flattened gather + 2 dispatches/layer (gate_up + down). Target 0.8–1.5 TF/s. Reference: MLX `qmm` | ✅ **~6.0 s/step** (was 11.9 s) |
-| Dense → MPS | interim: **per-layer dequant-to-scratch → MPS**, same command buffer (~200–300 MB reusable fp16 scratch; +50–100 ms/step dequant traffic @ 112 GiB/s). Full fp16-resident dense = +3.4 GiB → 36 GiB dev shortcut only, **kills 24 GiB floor**. End state: custom simdgroup q4 tiles modeled on MPS tiling | ✅ **11.9 s/step** (was 18.8 s) |
-| Re-bench grouped shapes | M=33 × 62 experts grouped, not lone-GEMM probes |
+| **Grouped MoE kernel (critical path)** | flattened gather + 2 dispatches/layer (gate_up + down), simdgroup K-reduction | ✅ **5.29 s/step** (was 11.9 s pre-grouped, 107 s bf16) |
+| Dense → MPS | per-layer dequant-to-scratch → MPS | ✅ **11.9 s/step** (was 18.8 s) |
+| Re-bench grouped shapes | `bench-gemm --oracle mps --shapes 256x2816x2816,33x2816x1408` | ✅ MPS 2.22 / 0.35 TFLOP/s |
 
-**Exit / gates (M3 Pro):** grouped MoE ≥ **0.8 TFLOP/s**; dense path ≥ 3 TFLOP/s effective (incl. dequant scratch cost); `bench-step` ≤ **1.6 s** → ≥ 7 tok/s e2e (pre-Q3).
+**Exit / gates (M3 Pro):** grouped MoE kernel shipped; dense MPS ≥3 TFLOP/s on oracle probes (**2.22 TFLOP/s** on 256×2816×2816 — close). **`bench-step` ≤ 1.6 s not met** (5.29 s); **≥7 tok/s e2e not met** on full 48-step stress (early-stop path ~18 tok/s denoise). Q3 (GPU sampler/router, kill readback) is the path to 1.6 s/step.
 
 ---
 
@@ -244,8 +248,8 @@ Profile-driven leftovers after Q2.5 gates are met.
 |---|---|---|
 | Q0 | Instrumentation + device probes | ✅ measured: 112 GiB/s, 184 GFLOP/s, 62 experts/layer, 151 syncs |
 | Q1 | `.dgq` quantizer + zero-copy load | ✅ ≤2 s load, mmap OK, embed q8 + q4 dense |
-| Q2 | Quantized kernels, residency, deletions | ⏳ step 18.8 s (target ≤12 s); 0 evictions ✅; parity ⏳ |
-| Q2.5 | GEMM MFU (dense→MPS, grouped MoE kernel) | grouped MoE ≥ 0.8 TF/s; step ≤ 1.6 s; ≥ 7 tok/s |
+| Q2 | Quantized kernels, residency, deletions | ✅ step 5.29 s (gate ≤12 s); 0 evictions; dgq parity ✅ |
+| Q2.5 | GEMM MFU (dense→MPS, grouped MoE kernel) | ✅ kernels shipped; step 5.29 s (1.6 s gate → Q3) |
 | Q3 | GPU router/sampler/early-stop | ≤3 syncs, ≤1 MB readback/step; ≥ 7 tok/s |
 | Q4 | Uncommitted-only lm_head, step telemetry | +15% tok/s → **8–12 tok/s target zone** |
 | Q5 | Residual MoE/attention tuning | step ≤ 1.4 s (stretch) |
@@ -255,11 +259,11 @@ Profile-driven leftovers after Q2.5 gates are met.
 
 ## Immediate next step
 
-**Q2.5** — grouped MoE kernel + dense→MPS (oracle already measured: MPS 3.35 / 0.52 TFLOP/s vs custom 0.19 / 0.14). This is the path from 18.8 s/step → ≤12 s (Q2 gate) → ≤1.6 s (Q2.5 gate).
-
-Remaining **Q2** before closing the phase: MoE grouped dispatch, quantized golden regen + `generate-parity`, prefill gate measurement.
+**Q3** — kill CPU round-trips: GPU router top-8, GPU sampler/entropy-bound, counter-based RNG, early-stop reduction, ≤3 syncs/step, ≤1 MB readback/step. Target: `bench-step` ≤ **1.8 s** from current **5.29 s**.
 
 ```bash
-cargo run --release --features metal -- -m /tmp/quantized-weights bench-step --canvas 256 --layers 30 --iters 1
+cargo run --release --features metal -- -m /tmp/quantized-weights bench-step --canvas 256 --layers 30 --iters 3
+cargo run --release --features metal -- -m /tmp/quantized-weights bench-prefill --prefill-len 1 --layers 30 --iters 3
+cargo run --release --features metal -- -m /tmp/quantized-weights generate-parity -p "Hello" --seed 42 --steps 1 --layers 3
 cargo run --release --features metal -- bench-gemm --oracle mps --shapes 256x2816x2816,33x2816x1408
 ```

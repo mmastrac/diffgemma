@@ -86,6 +86,12 @@ enum Command {
         prompt: Option<String>,
         seed: u64,
     },
+    BenchPrefill {
+        prompt_len: usize,
+        layers: usize,
+        iters: usize,
+        seed: u64,
+    },
     ProbeDevice,
     BenchGemm {
         shapes: String,
@@ -164,6 +170,12 @@ fn run_command(m: &model::Model, model_dir: &std::path::Path, command: Command) 
             prompt,
             seed,
         } => run_bench_step(m, model_dir, canvas, layers, iters, prompt, seed),
+        Command::BenchPrefill {
+            prompt_len,
+            layers,
+            iters,
+            seed,
+        } => run_bench_prefill(m, prompt_len, layers, iters, seed),
         Command::Prefill => run_prefill(m),
         Command::Generate {
             prompt,
@@ -403,6 +415,7 @@ fn parse_cli() -> Cli {
     let mut quant_profile = String::from("q4");
     let mut bench_gemm_shapes = String::from("256x2816x2816,33x2816x1408");
     let mut bench_gemm_oracle: Option<String> = None;
+    let mut bench_prefill_len = 1usize;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -441,6 +454,14 @@ fn parse_cli() -> Cli {
                 if let Some(v) = args.next() {
                     prompt_len = v.parse().unwrap_or_else(|_| {
                         eprintln!("invalid --prompt-len");
+                        std::process::exit(2);
+                    });
+                }
+            }
+            "--prefill-len" => {
+                if let Some(v) = args.next() {
+                    bench_prefill_len = v.parse().unwrap_or_else(|_| {
+                        eprintln!("invalid --prefill-len");
                         std::process::exit(2);
                     });
                 }
@@ -618,6 +639,12 @@ fn parse_cli() -> Cli {
             prompt: prompt.clone(),
             seed,
         },
+        Some("bench-prefill") => Command::BenchPrefill {
+            prompt_len: bench_prefill_len.max(1),
+            layers: bench_layers.max(1),
+            iters: bench_iters.max(1),
+            seed,
+        },
         Some("probe-device") => Command::ProbeDevice,
         Some("bench-gemm") => Command::BenchGemm {
             shapes: bench_gemm_shapes,
@@ -644,7 +671,7 @@ fn parse_cli() -> Cli {
         Some(cmd) => {
             eprintln!("unknown command: {cmd}");
             eprintln!(
-                "usage: diffgemma-mps [-p PROMPT] [summary|config|weights <name>|quantize|convert-model|bench-step|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-parity|tokenize <text>|gemm|attention]"
+                "usage: diffgemma-mps [-p PROMPT] [summary|config|weights <name>|quantize|convert-model|bench-step|bench-prefill|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-parity|tokenize <text>|gemm|attention]"
             );
             eprintln!("  default (no command): generate-gpu with --features metal");
             eprintln!("  generate-parity: GPU vs checked-in golden (use --compare-cpu for slow CPU path)");
@@ -1375,6 +1402,130 @@ fn run_bench_step(
     }
 }
 
+fn run_bench_prefill(
+    m: &model::Model,
+    prompt_len: usize,
+    layers: usize,
+    iters: usize,
+    seed: u64,
+) -> ExitCode {
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    {
+        use metal::{load_weight_cache, GpuDecoderEngine, GpuDecoderScratch};
+        use model::encoder::{prefill, EncoderPrefillInput, EncoderScratch};
+
+        let prompt_len = prompt_len.max(1);
+        let layers = layers.max(1).min(m.config.text_config.num_hidden_layers);
+        let iters = iters.max(1);
+        let canvas = m.config.canvas_length;
+        let vocab = m.config.text_config.vocab_size;
+
+        let mut token_ids = vec![0u32; prompt_len];
+        for (i, id) in token_ids.iter_mut().enumerate() {
+            *id = ((i as u64 * 131 + seed + 7) % vocab.max(1) as u64) as u32;
+        }
+
+        let mut enc_scratch = EncoderScratch::new(prompt_len.max(canvas), &m.config);
+        let mut dec_scratch = GpuDecoderScratch::new(canvas, &m.config);
+        let mut gpu_weights = match load_weight_cache(
+            &m.weights,
+            &m.config.text_config,
+            canvas,
+            prompt_len,
+        ) {
+            Ok(w) => w,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let mut engine = match GpuDecoderEngine::new() {
+            Ok(e) => e,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        let input = EncoderPrefillInput {
+            token_ids: &token_ids,
+            position_offset: 0,
+        };
+
+        eprintln!(
+            "bench-prefill setup (prompt_len={prompt_len}, layers={layers}, quantized={})...",
+            m.weights.is_quantized()
+        );
+
+        // Warmup
+        if m.weights.is_quantized() {
+            if let Err(err) = metal::prefill_gpu(
+                &m.weights,
+                &m.config,
+                &input,
+                &mut enc_scratch,
+                &mut dec_scratch,
+                &mut gpu_weights,
+                &mut engine,
+                prompt_len,
+                canvas,
+                Some(layers),
+            ) {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        } else {
+            if let Err(err) = prefill(&m.weights, &m.config, &input, &mut enc_scratch) {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+
+        eprintln!("bench-prefill running {iters} iterations...");
+        let started = std::time::Instant::now();
+        for _ in 0..iters {
+            if m.weights.is_quantized() {
+                if let Err(err) = metal::prefill_gpu(
+                    &m.weights,
+                    &m.config,
+                    &input,
+                    &mut enc_scratch,
+                    &mut dec_scratch,
+                    &mut gpu_weights,
+                    &mut engine,
+                    prompt_len,
+                    canvas,
+                    Some(layers),
+                ) {
+                    eprintln!("error: {err}");
+                    return ExitCode::FAILURE;
+                }
+            } else {
+                if let Err(err) = prefill(&m.weights, &m.config, &input, &mut enc_scratch) {
+                    eprintln!("error: {err}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        let elapsed = started.elapsed();
+        let per_run = elapsed / iters as u32;
+
+        println!("bench-prefill ok");
+        println!("  prompt_len: {prompt_len}");
+        println!("  layers:     {layers}");
+        println!("  iters:      {iters}");
+        println!("  per_run:    {per_run:.2?}");
+        println!("  gate (≤0.5s @ 1 tok): {}", if per_run.as_secs_f64() <= 0.5 { "pass" } else { "fail" });
+        ExitCode::SUCCESS
+    }
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    {
+        let _ = (m, prompt_len, layers, iters, seed);
+        eprintln!("error: bench-prefill requires --features metal on macOS");
+        ExitCode::FAILURE
+    }
+}
+
 fn run_decoder_forward(m: &model::Model) -> ExitCode {
     const CANVAS_LEN: usize = 256;
     const KV_LEN: usize = 128;
@@ -1618,17 +1769,13 @@ fn print_generate_output(
     println!("  token_ids[0..16]: [{}]", preview.join(", "));
 }
 
-fn infer_golden_name(prompt_text: Option<&str>, steps: usize, max_layers: Option<usize>) -> Option<String> {
-    if prompt_text != Some("Hello") {
-        return None;
-    }
-    match (steps, max_layers) {
-        (1, None) => Some("hello_steps1_full".into()),
-        (1, Some(3)) => Some("hello_steps1_layers3".into()),
-        (2, Some(3)) => Some("hello_steps2_layers3".into()),
-        (2, None) => Some("hello_steps2_full".into()),
-        _ => None,
-    }
+fn infer_golden_name(
+    prompt_text: Option<&str>,
+    steps: usize,
+    max_layers: Option<usize>,
+    quantized: bool,
+) -> Option<String> {
+    generate_golden::infer_fixture_name(prompt_text, steps, max_layers, quantized)
 }
 
 fn run_generate(
@@ -1718,11 +1865,14 @@ fn run_generate(
                 if let Some(ref name) = write_golden {
                     let golden_name = name.clone();
                     let prompt_str = prompt_text.clone().unwrap_or_default();
+                    let profile =
+                        generate_golden::weights_profile_name(m.weights.is_quantized());
                     if let Err(err) = write_generate_golden(
                         &golden_name,
                         &prompt_str,
                         &gen_cfg,
                         steps,
+                        profile,
                         &out,
                     ) {
                         eprintln!("error: {err}");
@@ -1771,12 +1921,24 @@ fn write_generate_golden(
     prompt: &str,
     gen_cfg: &generate::GenerateConfig,
     steps: usize,
+    weights_profile: &str,
     out: &generate::GenerateOutput,
 ) -> Result<(), safetensors::Error> {
-    let golden = generate_golden::GenerateGolden::from_run(name, prompt, gen_cfg, steps, out);
+    let golden = generate_golden::GenerateGolden::from_run(
+        name,
+        prompt,
+        gen_cfg,
+        steps,
+        weights_profile,
+        out,
+    );
     let path = generate_golden::resolve_fixture(name);
     golden.write(&path)?;
-    eprintln!("wrote golden {} ({} tokens)", path.display(), out.token_ids.len());
+    eprintln!(
+        "wrote golden {} (profile={weights_profile}, {} tokens)",
+        path.display(),
+        out.token_ids.len()
+    );
     Ok(())
 }
 
@@ -1869,8 +2031,17 @@ fn run_generate_parity(
         let gpu_elapsed = gpu_started.elapsed();
         eprintln!("GPU generate finished in {:.2}s ({gpu_elapsed:.2?})", gpu_elapsed.as_secs_f64());
 
+        let weights_profile = generate_golden::weights_profile_name(m.weights.is_quantized());
+
         if let Some(ref name) = write_golden {
-            if let Err(err) = write_generate_golden(name, &prompt_label, &gen_cfg, steps, &gpu_out) {
+            if let Err(err) = write_generate_golden(
+                name,
+                &prompt_label,
+                &gen_cfg,
+                steps,
+                weights_profile,
+                &gpu_out,
+            ) {
                 eprintln!("error: {err}");
                 return ExitCode::FAILURE;
             }
@@ -1911,9 +2082,14 @@ fn run_generate_parity(
             }
             print_generate_timing_compare(cpu_elapsed, gpu_elapsed);
         } else {
-            let fixture = match golden_name
-                .or_else(|| infer_golden_name(prompt_text.as_deref(), steps, max_layers))
-            {
+            let fixture = match golden_name.or_else(|| {
+                infer_golden_name(
+                    prompt_text.as_deref(),
+                    steps,
+                    max_layers,
+                    m.weights.is_quantized(),
+                )
+            }) {
                 Some(name) => name,
                 None => {
                     eprintln!("error: no --golden fixture; use --write-golden NAME or --compare-cpu");
@@ -1921,7 +2097,7 @@ fn run_generate_parity(
                 }
             };
             let path = generate_golden::resolve_fixture(&fixture);
-            eprintln!("checking golden {}...", path.display());
+            eprintln!("checking golden {} (profile={weights_profile})...", path.display());
             let golden = match GenerateGolden::load(&path) {
                 Ok(g) => g,
                 Err(err) => {
@@ -1929,8 +2105,12 @@ fn run_generate_parity(
                     return ExitCode::FAILURE;
                 }
             };
-            if !golden.matches_config(&prompt_label, &gen_cfg, steps) {
-                eprintln!("error: golden config mismatch for {}", golden.name);
+            if !golden.matches_config(&prompt_label, &gen_cfg, steps, weights_profile) {
+                eprintln!(
+                    "error: golden config mismatch for {} (expected profile={})",
+                    golden.name,
+                    golden.expected_weights_profile()
+                );
                 return ExitCode::FAILURE;
             }
             if let Err(err) = golden.compare(&gpu_out) {

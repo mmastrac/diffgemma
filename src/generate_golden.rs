@@ -5,6 +5,15 @@ use crate::safetensors::Error;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Weight format tag for fixture selection (`safetensors` vs `dgq_q4`).
+pub fn weights_profile_name(quantized: bool) -> &'static str {
+    if quantized {
+        "dgq_q4"
+    } else {
+        "safetensors"
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenerateGolden {
     pub name: String,
@@ -14,6 +23,9 @@ pub struct GenerateGolden {
     pub max_new_tokens: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_layers: Option<usize>,
+    /// `safetensors` (bf16) or `dgq_q4`; omitted in legacy bf16 fixtures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weights_profile: Option<String>,
     pub denoise_steps_run: usize,
     pub blocks_committed: usize,
     pub token_ids: Vec<u32>,
@@ -25,6 +37,7 @@ impl GenerateGolden {
         prompt: impl Into<String>,
         gen_cfg: &GenerateConfig,
         steps: usize,
+        weights_profile: &str,
         out: &GenerateOutput,
     ) -> Self {
         Self {
@@ -34,6 +47,7 @@ impl GenerateGolden {
             steps,
             max_new_tokens: gen_cfg.max_new_tokens,
             max_layers: gen_cfg.max_layers,
+            weights_profile: Some(weights_profile.to_string()),
             denoise_steps_run: out.denoise_steps_run,
             blocks_committed: out.blocks_committed,
             token_ids: out.token_ids.clone(),
@@ -53,12 +67,26 @@ impl GenerateGolden {
         std::fs::write(path, text).map_err(Error::Io)
     }
 
-    pub fn matches_config(&self, prompt: &str, gen_cfg: &GenerateConfig, steps: usize) -> bool {
+    pub fn matches_config(
+        &self,
+        prompt: &str,
+        gen_cfg: &GenerateConfig,
+        steps: usize,
+        weights_profile: &str,
+    ) -> bool {
         self.prompt == prompt
             && self.seed == gen_cfg.seed
             && self.steps == steps
             && self.max_new_tokens == gen_cfg.max_new_tokens
             && self.max_layers == gen_cfg.max_layers
+            && self.expected_weights_profile() == weights_profile
+    }
+
+    /// Legacy bf16 fixtures omit `weights_profile`; treat as safetensors.
+    pub fn expected_weights_profile(&self) -> &str {
+        self.weights_profile
+            .as_deref()
+            .unwrap_or(weights_profile_name(false))
     }
 
     pub fn compare(&self, out: &GenerateOutput) -> Result<(), String> {
@@ -100,5 +128,84 @@ pub fn resolve_fixture(name: &str) -> std::path::PathBuf {
         path.to_path_buf()
     } else {
         default_fixture_dir().join(format!("{name}.json"))
+    }
+}
+
+pub fn infer_fixture_name(
+    prompt_text: Option<&str>,
+    steps: usize,
+    max_layers: Option<usize>,
+    quantized: bool,
+) -> Option<String> {
+    if prompt_text != Some("Hello") {
+        return None;
+    }
+    let prefix = if quantized { "dgq_" } else { "" };
+    Some(match (steps, max_layers) {
+        (1, None) => format!("{prefix}hello_steps1_full"),
+        (1, Some(3)) => format!("{prefix}hello_steps1_layers3"),
+        (2, Some(3)) => format!("{prefix}hello_steps2_layers3"),
+        (2, None) => format!("{prefix}hello_steps2_full"),
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sample::SamplerConfig;
+
+    #[test]
+    fn legacy_golden_defaults_to_safetensors_profile() {
+        let g = GenerateGolden {
+            name: "x".into(),
+            prompt: "Hello".into(),
+            seed: 42,
+            steps: 1,
+            max_new_tokens: 256,
+            max_layers: None,
+            weights_profile: None,
+            denoise_steps_run: 1,
+            blocks_committed: 1,
+            token_ids: vec![1],
+        };
+        assert_eq!(g.expected_weights_profile(), "safetensors");
+    }
+
+    #[test]
+    fn infer_fixture_name_dgq_prefix() {
+        assert_eq!(
+            infer_fixture_name(Some("Hello"), 1, Some(3), true).as_deref(),
+            Some("dgq_hello_steps1_layers3")
+        );
+        assert_eq!(
+            infer_fixture_name(Some("Hello"), 1, None, false).as_deref(),
+            Some("hello_steps1_full")
+        );
+    }
+
+    #[test]
+    fn matches_config_checks_weights_profile() {
+        let g = GenerateGolden {
+            name: "x".into(),
+            prompt: "Hello".into(),
+            seed: 42,
+            steps: 1,
+            max_new_tokens: 256,
+            max_layers: Some(3),
+            weights_profile: Some("dgq_q4".into()),
+            denoise_steps_run: 1,
+            blocks_committed: 1,
+            token_ids: vec![1],
+        };
+        let cfg = GenerateConfig {
+            sampler: SamplerConfig::default(),
+            max_new_tokens: 256,
+            seed: 42,
+            max_layers: Some(3),
+            no_early_stop: false,
+        };
+        assert!(g.matches_config("Hello", &cfg, 1, "dgq_q4"));
+        assert!(!g.matches_config("Hello", &cfg, 1, "safetensors"));
     }
 }
