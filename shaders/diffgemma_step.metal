@@ -603,9 +603,14 @@ kernel void k_sc_softembed(device const half* logits [[buffer(0)]],
 
 kernel void k_softcap(device half* logits [[buffer(0)]],
                       constant uint& base [[buffer(1)]],
-                      uint i [[thread_position_in_grid]]) {
-    uint idx = base + i;
-    logits[idx] = half(tanh(float(logits[idx]) * (1.0f/SOFTCAP)) * SOFTCAP);
+                      constant uint& len [[buffer(2)]],
+                      uint gid [[thread_position_in_grid]]) {
+    if (gid >= len) return;
+    uint i = base + gid;
+    float v = float(logits[i]);
+    // Metal fast-math tanh overflows for large |x|; clamp preserves softcap saturation.
+    float x = clamp(v / SOFTCAP, -20.0f, 20.0f);
+    logits[i] = half(tanh(x) * SOFTCAP);
 }
 
 // ======================= sampler =======================

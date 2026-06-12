@@ -466,18 +466,18 @@ impl StepEnc<'_> {
         ps: &ComputePipeline,
         count: usize,
         tpg: usize,
-        set_base: impl Fn(&ProtocolObject<dyn MTLComputeCommandEncoder>, u32),
+        mut encode: impl FnMut(&ProtocolObject<dyn MTLComputeCommandEncoder>, u32, u32),
     ) {
         const MAX_GROUPS: usize = 65535;
-        let chunk = MAX_GROUPS * tpg;
+        let chunk_max = MAX_GROUPS * tpg;
         let mut base = 0usize;
         while base < count {
-            let n = (count - base).min(chunk);
+            let chunk = (count - base).min(chunk_max);
             self.enc.setComputePipelineState(&ps.pipeline);
-            set_base(&self.enc, base as u32);
-            let tg_w = tpg.min(n.max(1));
+            encode(&self.enc, base as u32, chunk as u32);
+            let tg_w = tpg.min(chunk.max(1));
             let grid = MTLSize {
-                width: div_up(n, tg_w),
+                width: div_up(chunk, tg_w),
                 height: 1,
                 depth: 1,
             };
@@ -487,8 +487,20 @@ impl StepEnc<'_> {
                 depth: 1,
             };
             self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
-            base += n;
+            base += chunk;
         }
+    }
+
+    /// Softcap logits (matches sampler.metal ranged dispatch pattern).
+    fn dispatch_softcap(&self) {
+        let len = CANVAS * VOCAB;
+        self.dispatch_1d_ranged(&self.ps.softcap, len, 256, |enc, base, chunk| {
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(&self.bufs.logits), 0, 0);
+            }
+            set_bytes(enc, &base, 1);
+            set_bytes(enc, &chunk, 2);
+        });
     }
 
     fn dispatch_2d(&self, ps: &ComputePipeline, gx: usize, gy: usize, tpg_x: usize, tpg_y: usize) {
@@ -818,10 +830,8 @@ impl StepEnc<'_> {
     }
 
     fn encode_step_preamble(&self, layout: &ModelLayout, first_step: u32) -> Result<(), Error> {
-        self.enc.setComputePipelineState(&self.ps.logit_rowstats.pipeline);
         if first_step == 0 {
-            // skip when step==0
-        } else {
+            self.enc.setComputePipelineState(&self.ps.logit_rowstats.pipeline);
             self.bind_logits(0);
             unsafe {
                 self.enc.setBuffer_offset_atIndex(
@@ -841,49 +851,50 @@ impl StepEnc<'_> {
                 depth: 1,
             };
             self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
-        }
 
-        self.enc.setComputePipelineState(&self.ps.sc_softembed.pipeline);
-        unsafe {
-            self.bind_logits(0);
-            self.enc.setBuffer_offset_atIndex(
-                Some(&self.bufs.arena),
-                A_RS_SC as usize,
-                1,
-            );
-            self.bind_blob(2);
-            self.bind_layout(3);
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), A_SOFT as usize, 4);
-            set_bytes(&self.enc, &first_step, 5);
-        }
-        self.dispatch_2d(&self.ps.sc_softembed, HID / 64, CANVAS, 64, 1);
+            self.enc.setComputePipelineState(&self.ps.sc_softembed.pipeline);
+            unsafe {
+                self.bind_logits(0);
+                self.enc.setBuffer_offset_atIndex(
+                    Some(&self.bufs.arena),
+                    A_RS_SC as usize,
+                    1,
+                );
+                self.bind_blob(2);
+                self.bind_layout(3);
+                self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), A_SOFT as usize, 4);
+                set_bytes(&self.enc, &first_step, 5);
+            }
+            self.dispatch_2d(&self.ps.sc_softembed, HID / 64, CANVAS, 64, 1);
 
-        self.rmsnorm(A_SOFT, A_TMP, layout.sc_pre_norm, HID as u32, CANVAS);
-        self.gemm_q8(
-            A_TMP,
-            A_FFG,
-            layout.sc_gate,
-            CANVAS as u32,
-            DENSE_FF,
-            HID as u32,
-        )?;
-        self.gemm_q8(
-            A_TMP,
-            A_FFU,
-            layout.sc_up,
-            CANVAS as u32,
-            DENSE_FF,
-            HID as u32,
-        )?;
-        self.glu(A_FFG, A_FFU, A_FFG, CANVAS * DENSE_FF as usize);
-        self.gemm_q8(
-            A_FFG,
-            A_DENSE,
-            layout.sc_down,
-            CANVAS as u32,
-            HID as u32,
-            DENSE_FF,
-        )?;
+            self.rmsnorm(A_SOFT, A_TMP, layout.sc_pre_norm, HID as u32, CANVAS);
+            self.gemm_q8(
+                A_TMP,
+                A_FFG,
+                layout.sc_gate,
+                CANVAS as u32,
+                DENSE_FF,
+                HID as u32,
+            )?;
+            self.gemm_q8(
+                A_TMP,
+                A_FFU,
+                layout.sc_up,
+                CANVAS as u32,
+                DENSE_FF,
+                HID as u32,
+            )?;
+            self.glu(A_FFG, A_FFU, A_FFG, CANVAS * DENSE_FF as usize);
+            self.gemm_q8(
+                A_FFG,
+                A_DENSE,
+                layout.sc_down,
+                CANVAS as u32,
+                HID as u32,
+                DENSE_FF,
+            )?;
+        }
+        // first_step: A_DENSE stays zero; skip SC MLP + O(vocab) softembed.
 
         self.enc.setComputePipelineState(&self.ps.embed_gather.pipeline);
         unsafe {
@@ -922,7 +933,7 @@ impl StepEnc<'_> {
             VOCAB as u32,
             HID as u32,
         )?;
-        // Caller must commit + wait, then softcap_logits_cpu(), before sampler.
+        self.dispatch_softcap();
         if mode == StepFinishMode::ForwardOnly {
             return Ok(());
         }
@@ -1102,18 +1113,6 @@ fn f32_to_f16(v: f32) -> u16 {
     (sign << 15) | ((exp as u16) << 10) | (mant as u16)
 }
 
-fn softcap_logits_cpu(logits: &ProtocolObject<dyn MTLBuffer>) {
-    const SOFTCAP: f32 = 30.0;
-    let ptr = logits.contents().as_ptr() as *mut u16;
-    let elems = CANVAS * VOCAB;
-    for i in 0..elems {
-        unsafe {
-            let v = f16_bits_to_f32(*ptr.add(i));
-            let out = (v / SOFTCAP).tanh() * SOFTCAP;
-            *ptr.add(i) = f32_to_f16(out);
-        }
-    }
-}
 
 fn count_non_finite_half(buf: &ProtocolObject<dyn MTLBuffer>, elems: usize) -> (usize, f32) {
     let ptr = buf.contents().as_ptr() as *const u16;
@@ -1216,22 +1215,9 @@ impl StepRuntime {
             for layer in 0..self.layers {
                 enc.encode_layer(layer, &self.layout)?;
             }
-            enc.rmsnorm(A_HIDDEN, A_TMP, self.layout.final_norm, HID as u32, CANVAS);
-            enc.gemm_q8_logits(
-                A_TMP,
-                self.layout.embed,
-                CANVAS as u32,
-                VOCAB as u32,
-                HID as u32,
-            )?;
+            enc.encode_step_finish(&self.layout, finish)?;
             Ok(())
-        })?;
-        softcap_logits_cpu(&self.bufs.logits);
-        if finish == StepFinishMode::ForwardOnly {
-            return Ok(());
-        }
-        self.dispatch_and_wait(|enc| enc.encode_step_sampler(&self.layout))?;
-        Ok(())
+        })
     }
 }
 
@@ -1346,25 +1332,12 @@ pub fn run_step_probe(model_dir: &Path, cfg: StepSmokeConfig) -> Result<StepProb
             CANVAS as u32,
             VOCAB as u32,
             HID as u32,
-        )
-    })?;
-    let (bad, m) = count_non_finite_half(&rt.bufs.logits, CANVAS * VOCAB);
-    push("after_lm_head", bad == 0, m, bad);
-
-    rt.dispatch_and_wait(|enc| {
-        enc.enc.setComputePipelineState(&enc.ps.softcap.pipeline);
-        enc.bind_logits(0);
-        enc.dispatch_1d_ranged(&enc.ps.softcap, CANVAS * VOCAB, 256, |e, base| {
-            set_bytes(e, &base, 1);
-        });
+        )?;
+        enc.dispatch_softcap();
         Ok(())
     })?;
     let (bad, m) = count_non_finite_half(&rt.bufs.logits, CANVAS * VOCAB);
-    push("after_softcap_gpu", bad == 0, m, bad);
-
-    softcap_logits_cpu(&rt.bufs.logits);
-    let (bad, m) = count_non_finite_half(&rt.bufs.logits, CANVAS * VOCAB);
-    push("after_softcap_cpu", bad == 0, m, bad);
+    push("after_lm_head_softcap", bad == 0, m, bad);
 
     Ok(StepProbeResult {
         checkpoints,
@@ -1414,13 +1387,9 @@ pub fn run_step_smoke(model_dir: &Path, cfg: StepSmokeConfig) -> Result<StepSmok
             for layer in 0..rt.layers {
                 enc.encode_layer(layer, &rt.layout)?;
             }
-            enc.encode_step_finish(&rt.layout, StepFinishMode::ForwardOnly)?;
+            enc.encode_step_finish(&rt.layout, finish)?;
             Ok(())
         })?;
-        softcap_logits_cpu(&rt.bufs.logits);
-        if finish == StepFinishMode::Full {
-            rt.dispatch_and_wait(|enc| enc.encode_step_sampler(&rt.layout))?;
-        }
         eprintln!("step-smoke: completed denoise step {}/{}", step_i + 1, steps);
         if finish == StepFinishMode::Full {
             let st: CanvasState = read_struct(&rt.bufs.state);
