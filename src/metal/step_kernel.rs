@@ -1115,26 +1115,6 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
     val
 }
 
-fn f32_to_f16(v: f32) -> u16 {
-    if v.is_nan() {
-        return 0x7e00;
-    }
-    if v.is_infinite() {
-        return if v.is_sign_negative() { 0xfc00 } else { 0x7c00 };
-    }
-    let x = v.to_bits();
-    let sign = ((x >> 31) & 1) as u16;
-    let mut exp = ((x >> 23) & 0xff) as i32 - 127 + 15;
-    let mant = (x >> 13) & 0x3ff;
-    if exp <= 0 {
-        return sign << 15;
-    }
-    if exp >= 0x1f {
-        return (sign << 15) | 0x7c00;
-    }
-    (sign << 15) | ((exp as u16) << 10) | (mant as u16)
-}
-
 
 fn count_non_finite_half(buf: &ProtocolObject<dyn MTLBuffer>, elems: usize) -> (usize, f32) {
     let ptr = buf.contents().as_ptr() as *const u16;
