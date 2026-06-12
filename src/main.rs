@@ -111,6 +111,21 @@ enum Command {
         kv_len: u32,
         seed: u64,
         max_seq: usize,
+        forward_only: bool,
+    },
+    StepProbe {
+        layers: usize,
+        kv_len: u32,
+        seed: u64,
+        max_seq: usize,
+    },
+    BenchStepKernel {
+        layers: usize,
+        kv_len: u32,
+        seed: u64,
+        max_seq: usize,
+        iters: usize,
+        forward_only: bool,
     },
 }
 
@@ -124,7 +139,38 @@ fn main() -> ExitCode {
             kv_len,
             seed,
             max_seq,
-        } => run_step_smoke_cmd(&cli.model_dir, layers, steps, kv_len, seed, max_seq),
+            forward_only,
+        } => run_step_smoke_cmd(
+            &cli.model_dir,
+            layers,
+            steps,
+            kv_len,
+            seed,
+            max_seq,
+            forward_only,
+        ),
+        Command::StepProbe {
+            layers,
+            kv_len,
+            seed,
+            max_seq,
+        } => run_step_probe_cmd(&cli.model_dir, layers, kv_len, seed, max_seq),
+        Command::BenchStepKernel {
+            layers,
+            kv_len,
+            seed,
+            max_seq,
+            iters,
+            forward_only,
+        } => run_bench_step_kernel_cmd(
+            &cli.model_dir,
+            layers,
+            kv_len,
+            seed,
+            max_seq,
+            iters,
+            forward_only,
+        ),
         Command::Quantize { output, profile } => run_quantize(&cli.model_dir, &output, &profile),
         Command::Tokenize(text) => run_tokenize(&cli.model_dir, &text),
         Command::Gemm { size } => run_gemm(size),
@@ -266,7 +312,133 @@ fn run_command(m: &model::Model, model_dir: &std::path::Path, command: Command) 
         Command::Quantize { .. } => ExitCode::FAILURE,
         Command::BenchGemm { .. } => ExitCode::FAILURE,
         Command::StepSmoke { .. } => ExitCode::FAILURE,
+        Command::StepProbe { .. } => ExitCode::FAILURE,
+        Command::BenchStepKernel { .. } => ExitCode::FAILURE,
     }
+}
+
+fn step_kernel_config(
+    layers: usize,
+    kv_len: u32,
+    seed: u64,
+    max_seq: usize,
+    forward_only: bool,
+) -> metal::StepSmokeConfig {
+    metal::StepSmokeConfig {
+        layers,
+        steps: 1,
+        kv_len,
+        seed,
+        max_seq,
+        finish: if forward_only {
+            metal::StepFinishMode::ForwardOnly
+        } else {
+            metal::StepFinishMode::Full
+        },
+    }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn run_step_probe_cmd(
+    model_dir: &std::path::Path,
+    layers: usize,
+    kv_len: u32,
+    seed: u64,
+    max_seq: usize,
+) -> ExitCode {
+    use metal::{run_step_probe, StepFinishMode, StepSmokeConfig};
+
+    if !dgq::store::looks_like_dgq_dir(model_dir) {
+        eprintln!("error: step-probe requires a .dgq directory");
+        return ExitCode::FAILURE;
+    }
+    let cfg = StepSmokeConfig {
+        layers,
+        steps: 1,
+        kv_len,
+        seed,
+        max_seq,
+        finish: StepFinishMode::ForwardOnly,
+    };
+    match run_step_probe(model_dir, cfg) {
+        Ok(r) => {
+            println!("step-probe ok ({:.2?})", r.elapsed);
+            for cp in &r.checkpoints {
+                println!(
+                    "  {:>16}: finite={} max_abs={:.4}",
+                    cp.label, cp.finite, cp.max_abs
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn run_step_probe_cmd(
+    _model_dir: &std::path::Path,
+    _layers: usize,
+    _kv_len: u32,
+    _seed: u64,
+    _max_seq: usize,
+) -> ExitCode {
+    eprintln!("error: step-probe requires --features metal on macOS");
+    ExitCode::FAILURE
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn run_bench_step_kernel_cmd(
+    model_dir: &std::path::Path,
+    layers: usize,
+    kv_len: u32,
+    seed: u64,
+    max_seq: usize,
+    iters: usize,
+    forward_only: bool,
+) -> ExitCode {
+    use metal::bench_step_kernel;
+
+    if !dgq::store::looks_like_dgq_dir(model_dir) {
+        eprintln!("error: bench-step-kernel requires a .dgq directory");
+        return ExitCode::FAILURE;
+    }
+    let cfg = step_kernel_config(layers, kv_len, seed, max_seq, forward_only);
+    eprintln!(
+        "bench-step-kernel: layers={layers} kv_len={kv_len} iters={iters} forward_only={forward_only}"
+    );
+    match bench_step_kernel(model_dir, cfg, iters) {
+        Ok(r) => {
+            println!("bench-step-kernel ok");
+            println!("  compile:  {:.2?}", r.compile);
+            println!("  warmup:   {:.2?}", r.warmup);
+            println!("  per_step: {:.2?}", r.per_step);
+            println!("  iters:    {}", r.iters);
+            println!("  mode:     {:?}", r.finish);
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn run_bench_step_kernel_cmd(
+    _model_dir: &std::path::Path,
+    _layers: usize,
+    _kv_len: u32,
+    _seed: u64,
+    _max_seq: usize,
+    _iters: usize,
+    _forward_only: bool,
+) -> ExitCode {
+    eprintln!("error: bench-step-kernel requires --features metal on macOS");
+    ExitCode::FAILURE
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -277,6 +449,7 @@ fn run_step_smoke_cmd(
     kv_len: u32,
     seed: u64,
     max_seq: usize,
+    forward_only: bool,
 ) -> ExitCode {
     use metal::{run_step_smoke, StepSmokeConfig};
 
@@ -285,13 +458,8 @@ fn run_step_smoke_cmd(
         return ExitCode::FAILURE;
     }
 
-    let cfg = StepSmokeConfig {
-        layers,
-        steps,
-        kv_len,
-        seed,
-        max_seq,
-    };
+    let mut cfg = step_kernel_config(layers, kv_len, seed, max_seq, forward_only);
+    cfg.steps = steps.max(1);
     eprintln!(
         "step-smoke: model={} layers={layers} steps={steps} kv_len={kv_len} seed={seed} max_seq={max_seq}",
         model_dir.display()
@@ -337,6 +505,7 @@ fn run_step_smoke_cmd(
     _kv_len: u32,
     _seed: u64,
     _max_seq: usize,
+    _forward_only: bool,
 ) -> ExitCode {
     eprintln!("error: step-smoke requires --features metal on macOS");
     ExitCode::FAILURE
@@ -506,6 +675,7 @@ fn parse_cli() -> Cli {
     let mut bench_prefill_len = 1usize;
     let mut step_kv_len = 0u32;
     let mut step_max_seq = 512usize;
+    let mut step_forward_only = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -645,6 +815,7 @@ fn parse_cli() -> Cli {
                     bench_gemm_oracle = Some(v);
                 }
             }
+            "--forward-only" => step_forward_only = true,
             "--max-seq" => {
                 if let Some(v) = args.next() {
                     step_max_seq = v.parse().unwrap_or_else(|_| {
@@ -780,11 +951,26 @@ fn parse_cli() -> Cli {
             kv_len: step_kv_len,
             seed,
             max_seq: step_max_seq.max(64),
+            forward_only: step_forward_only,
+        },
+        Some("step-probe") => Command::StepProbe {
+            layers: bench_layers.max(1).min(30),
+            kv_len: step_kv_len,
+            seed,
+            max_seq: step_max_seq.max(64),
+        },
+        Some("bench-step-kernel") => Command::BenchStepKernel {
+            layers: bench_layers.max(1).min(30),
+            kv_len: step_kv_len,
+            seed,
+            max_seq: step_max_seq.max(64),
+            iters: bench_iters.max(1),
+            forward_only: step_forward_only,
         },
         Some(cmd) => {
             eprintln!("unknown command: {cmd}");
             eprintln!(
-                "usage: diffgemma-mps [-p PROMPT] [summary|config|weights <name>|quantize|convert-model|step-smoke|bench-step|bench-prefill|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-parity|tokenize <text>|gemm|attention]"
+                "usage: diffgemma-mps [-p PROMPT] [summary|config|weights <name>|quantize|convert-model|step-smoke|step-probe|bench-step-kernel|bench-step|bench-prefill|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-parity|tokenize <text>|gemm|attention]"
             );
             eprintln!("  default (no command): generate-gpu with --features metal");
             eprintln!("  generate-parity: GPU vs checked-in golden (use --compare-cpu for slow CPU path)");

@@ -602,8 +602,10 @@ kernel void k_sc_softembed(device const half* logits [[buffer(0)]],
 }
 
 kernel void k_softcap(device half* logits [[buffer(0)]],
+                      constant uint& base [[buffer(1)]],
                       uint i [[thread_position_in_grid]]) {
-    logits[i] = half(tanh(float(logits[i]) * (1.0f/SOFTCAP)) * SOFTCAP);
+    uint idx = base + i;
+    logits[idx] = half(tanh(float(logits[idx]) * (1.0f/SOFTCAP)) * SOFTCAP);
 }
 
 // ======================= sampler =======================

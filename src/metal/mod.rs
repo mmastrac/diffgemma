@@ -49,5 +49,8 @@ pub use gemm::{bf16_matmul_cpu, f32_to_bf16, Bf16Gemm};
 pub use probe::{print_probe_result, probe_device, DeviceProbeResult};
 pub use bench_gemm::{bench_custom_kernel, bench_mps_oracle, parse_shapes, print_bench_rows};
 pub use sampler::{sampler_step_gpu, upload_logits_gpu};
-pub use step_kernel::{run_step_smoke, StepSmokeConfig, StepSmokeResult};
+pub use step_kernel::{
+    bench_step_kernel, run_step_probe, run_step_smoke, StepBenchResult, StepFinishMode,
+    StepProbeResult, StepSmokeConfig, StepSmokeResult,
+};
 pub use telemetry::{ForwardTelemetry, SessionTelemetry, StepPhaseTelemetry};

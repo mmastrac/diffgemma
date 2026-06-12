@@ -132,6 +132,14 @@ pub struct RouteScratch {
     pub slot_list: [u32; CANVAS * TOP_K],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepFinishMode {
+    /// lm_head + softcap + GPU sampler
+    Full,
+    /// lm_head + softcap only (no sampler)
+    ForwardOnly,
+}
+
 #[derive(Debug, Clone)]
 pub struct StepSmokeConfig {
     pub layers: usize,
@@ -139,6 +147,7 @@ pub struct StepSmokeConfig {
     pub kv_len: u32,
     pub seed: u64,
     pub max_seq: usize,
+    pub finish: StepFinishMode,
 }
 
 impl Default for StepSmokeConfig {
@@ -149,6 +158,7 @@ impl Default for StepSmokeConfig {
             kv_len: 0,
             seed: 42,
             max_seq: 512,
+            finish: StepFinishMode::Full,
         }
     }
 }
@@ -162,6 +172,29 @@ pub struct StepSmokeResult {
     pub logits_finite: bool,
     pub max_abs_logit: f32,
     pub elapsed: std::time::Duration,
+}
+
+#[derive(Debug, Clone)]
+pub struct StepProbeCheckpoint {
+    pub label: String,
+    pub finite: bool,
+    pub max_abs: f32,
+    pub non_finite: usize,
+}
+
+#[derive(Debug)]
+pub struct StepProbeResult {
+    pub checkpoints: Vec<StepProbeCheckpoint>,
+    pub elapsed: std::time::Duration,
+}
+
+#[derive(Debug)]
+pub struct StepBenchResult {
+    pub compile: std::time::Duration,
+    pub warmup: std::time::Duration,
+    pub per_step: std::time::Duration,
+    pub iters: usize,
+    pub finish: StepFinishMode,
 }
 
 pub fn build_offsets_from_store(store: &DgqStore) -> HashMap<String, u64> {
@@ -425,6 +458,37 @@ impl StepEnc<'_> {
             depth: 1,
         };
         self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    }
+
+    /// Split 1D dispatches that would exceed Metal's 65535 threadgroup grid width.
+    fn dispatch_1d_ranged(
+        &self,
+        ps: &ComputePipeline,
+        count: usize,
+        tpg: usize,
+        set_base: impl Fn(&ProtocolObject<dyn MTLComputeCommandEncoder>, u32),
+    ) {
+        const MAX_GROUPS: usize = 65535;
+        let chunk = MAX_GROUPS * tpg;
+        let mut base = 0usize;
+        while base < count {
+            let n = (count - base).min(chunk);
+            self.enc.setComputePipelineState(&ps.pipeline);
+            set_base(&self.enc, base as u32);
+            let tg_w = tpg.min(n.max(1));
+            let grid = MTLSize {
+                width: div_up(n, tg_w),
+                height: 1,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: tg_w,
+                height: 1,
+                depth: 1,
+            };
+            self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+            base += n;
+        }
     }
 
     fn dispatch_2d(&self, ps: &ComputePipeline, gx: usize, gy: usize, tpg_x: usize, tpg_y: usize) {
@@ -845,7 +909,11 @@ impl StepEnc<'_> {
         Ok(())
     }
 
-    fn encode_step_finish(&self, layout: &ModelLayout) -> Result<(), Error> {
+    fn encode_step_finish(
+        &self,
+        layout: &ModelLayout,
+        mode: StepFinishMode,
+    ) -> Result<(), Error> {
         self.rmsnorm(A_HIDDEN, A_TMP, layout.final_norm, HID as u32, CANVAS);
         self.gemm_q8_logits(
             A_TMP,
@@ -854,11 +922,14 @@ impl StepEnc<'_> {
             VOCAB as u32,
             HID as u32,
         )?;
-        self.enc.setComputePipelineState(&self.ps.softcap.pipeline);
-        self.bind_logits(0);
-        let logits_elems = CANVAS * VOCAB;
-        self.dispatch_1d(&self.ps.softcap, logits_elems, 256);
+        // Caller must commit + wait, then softcap_logits_cpu(), before sampler.
+        if mode == StepFinishMode::ForwardOnly {
+            return Ok(());
+        }
+        self.encode_step_sampler(layout)
+    }
 
+    fn encode_step_sampler(&self, _layout: &ModelLayout) -> Result<(), Error> {
         self.enc.setComputePipelineState(&self.ps.sample_rowstats.pipeline);
         unsafe {
             self.bind_logits(0);
@@ -1011,24 +1082,161 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
     val
 }
 
-fn check_logits_finite(logits: &ProtocolObject<dyn MTLBuffer>) -> (bool, f32) {
-    let ptr = logits.contents().as_ptr() as *const u16;
+fn f32_to_f16(v: f32) -> u16 {
+    if v.is_nan() {
+        return 0x7e00;
+    }
+    if v.is_infinite() {
+        return if v.is_sign_negative() { 0xfc00 } else { 0x7c00 };
+    }
+    let x = v.to_bits();
+    let sign = ((x >> 31) & 1) as u16;
+    let mut exp = ((x >> 23) & 0xff) as i32 - 127 + 15;
+    let mant = (x >> 13) & 0x3ff;
+    if exp <= 0 {
+        return sign << 15;
+    }
+    if exp >= 0x1f {
+        return (sign << 15) | 0x7c00;
+    }
+    (sign << 15) | ((exp as u16) << 10) | (mant as u16)
+}
+
+fn softcap_logits_cpu(logits: &ProtocolObject<dyn MTLBuffer>) {
+    const SOFTCAP: f32 = 30.0;
+    let ptr = logits.contents().as_ptr() as *mut u16;
+    let elems = CANVAS * VOCAB;
+    for i in 0..elems {
+        unsafe {
+            let v = f16_bits_to_f32(*ptr.add(i));
+            let out = (v / SOFTCAP).tanh() * SOFTCAP;
+            *ptr.add(i) = f32_to_f16(out);
+        }
+    }
+}
+
+fn count_non_finite_half(buf: &ProtocolObject<dyn MTLBuffer>, elems: usize) -> (usize, f32) {
+    let ptr = buf.contents().as_ptr() as *const u16;
+    let mut bad = 0usize;
     let mut max_abs = 0.0f32;
-    let mut finite = true;
-    let sample = 4096.min(CANVAS * VOCAB);
-    unsafe {
-        for i in 0..sample {
+    for i in 0..elems {
+        unsafe {
             let v = f16_bits_to_f32(*ptr.add(i));
             if !v.is_finite() {
-                finite = false;
+                bad += 1;
             }
             max_abs = max_abs.max(v.abs());
         }
     }
+    (bad, max_abs)
+}
+
+fn check_logits_finite(logits: &ProtocolObject<dyn MTLBuffer>) -> (bool, f32) {
+    half_buffer_stats(logits, 0, CANVAS * VOCAB, CANVAS * VOCAB)
+}
+
+fn half_buffer_stats(
+    buf: &ProtocolObject<dyn MTLBuffer>,
+    byte_off: usize,
+    elems: usize,
+    sample: usize,
+) -> (bool, f32) {
+    let ptr = unsafe { buf.contents().as_ptr().add(byte_off) as *const u16 };
+    let mut max_abs = 0.0f32;
+    let mut finite = true;
+    let mut non_finite = 0usize;
+    let n = sample.min(elems);
+    let stride = (elems / n.max(1)).max(1);
+    unsafe {
+        let mut i = 0usize;
+        while i < elems {
+            let v = f16_bits_to_f32(*ptr.add(i));
+            if !v.is_finite() {
+                finite = false;
+                non_finite += 1;
+            }
+            max_abs = max_abs.max(v.abs());
+            i += stride;
+            if i / stride >= n {
+                break;
+            }
+        }
+    }
+    if non_finite > 0 {
+        finite = false;
+    }
     (finite, max_abs)
 }
 
-pub fn run_step_smoke(model_dir: &Path, cfg: StepSmokeConfig) -> Result<StepSmokeResult, Error> {
+fn arena_hidden_stats(arena: &ProtocolObject<dyn MTLBuffer>) -> (bool, f32, usize) {
+    let (finite, max_abs) =
+        half_buffer_stats(arena, A_HIDDEN as usize, CANVAS * HID, CANVAS * HID);
+    let non_finite = if finite { 0 } else { 1 };
+    (finite, max_abs, non_finite)
+}
+
+struct StepRuntime {
+    ctx: MetalContext,
+    pipelines: StepPipelines,
+    bufs: StepBuffers,
+    layout: ModelLayout,
+    layers: usize,
+}
+
+impl StepRuntime {
+    fn dispatch_and_wait<F>(&self, f: F) -> Result<(), Error>
+    where
+        F: FnOnce(&StepEnc<'_>) -> Result<(), Error>,
+    {
+        let cmd = self
+            .ctx
+            .queue
+            .commandBuffer()
+            .ok_or(Error::Format("command buffer alloc failed"))?;
+        let enc = cmd
+            .computeCommandEncoder()
+            .ok_or(Error::Format("compute encoder alloc failed"))?;
+        let enc = StepEnc {
+            enc,
+            ps: &self.pipelines,
+            bufs: &self.bufs,
+        };
+        f(&enc)?;
+        enc.enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+        Ok(())
+    }
+
+    fn run_forward_once(&self, finish: StepFinishMode) -> Result<(), Error> {
+        self.dispatch_and_wait(|enc| {
+            let st: CanvasState = read_struct(&enc.bufs.state);
+            let first_step = if st.step == 0 { 1u32 } else { 0u32 };
+            enc.encode_step_preamble(&self.layout, first_step)?;
+            for layer in 0..self.layers {
+                enc.encode_layer(layer, &self.layout)?;
+            }
+            enc.rmsnorm(A_HIDDEN, A_TMP, self.layout.final_norm, HID as u32, CANVAS);
+            enc.gemm_q8_logits(
+                A_TMP,
+                self.layout.embed,
+                CANVAS as u32,
+                VOCAB as u32,
+                HID as u32,
+            )?;
+            Ok(())
+        })?;
+        softcap_logits_cpu(&self.bufs.logits);
+        if finish == StepFinishMode::ForwardOnly {
+            return Ok(());
+        }
+        self.dispatch_and_wait(|enc| enc.encode_step_sampler(&self.layout))?;
+        Ok(())
+    }
+}
+
+fn build_step_runtime(model_dir: &Path, cfg: &StepSmokeConfig) -> Result<(StepRuntime, std::time::Duration), Error> {
+    let compile_started = Instant::now();
     let store = DgqStore::open(model_dir)?;
     let offsets = build_offsets_from_store(&store);
     let layout = build_layout(&offsets, cfg.max_seq);
@@ -1036,9 +1244,7 @@ pub fn run_step_smoke(model_dir: &Path, cfg: StepSmokeConfig) -> Result<StepSmok
 
     let ctx = MetalContext::new()?;
     let library = ctx.compile_library(STEP_SHADER)?;
-    eprintln!("step-smoke: compiled diffgemma_step.metal");
     let pipelines = StepPipelines::new(&ctx, &library)?;
-    eprintln!("step-smoke: built {} q4 + {} q8 gemm pipelines", pipelines.gemm_q4.len(), pipelines.gemm_q8.len());
 
     let gpu_blob = DgqGpuBlob::from_store(&store, &ctx.device)?;
     let gpu_blob = std::sync::Arc::clone(&gpu_blob);
@@ -1056,8 +1262,7 @@ pub fn run_step_smoke(model_dir: &Path, cfg: StepSmokeConfig) -> Result<StepSmok
         stability_threshold: sampler.stability_threshold as u32,
         _pad: 0,
     };
-    let vocab = VOCAB;
-    let state = init_canvas_state(cfg.seed, vocab);
+    let state = init_canvas_state(cfg.seed, VOCAB);
 
     let bufs = StepBuffers {
         blob: gpu_blob.buffer.clone(),
@@ -1089,41 +1294,146 @@ pub fn run_step_smoke(model_dir: &Path, cfg: StepSmokeConfig) -> Result<StepSmok
     zero_buffer(&bufs.kvcache);
     zero_buffer(&bufs.logits);
 
+    let compile = compile_started.elapsed();
+    Ok((
+        StepRuntime {
+            ctx,
+            pipelines,
+            bufs,
+            layout,
+            layers,
+        },
+        compile,
+    ))
+}
+
+pub fn run_step_probe(model_dir: &Path, cfg: StepSmokeConfig) -> Result<StepProbeResult, Error> {
     let started = Instant::now();
-    for step_i in 0..cfg.steps {
-        let cmd = ctx
-            .queue
-            .commandBuffer()
-            .ok_or(Error::Format("command buffer alloc failed"))?;
-        let enc = cmd
-            .computeCommandEncoder()
-            .ok_or(Error::Format("compute encoder alloc failed"))?;
-        let cur_state: CanvasState = read_struct(&bufs.state);
-        let first_step = if cur_state.step == 0 { 1u32 } else { 0u32 };
-        let enc = StepEnc {
-            enc,
-            ps: &pipelines,
-            bufs: &bufs,
-        };
-        enc.encode_step_preamble(&layout, first_step)?;
-        for layer in 0..layers {
-            enc.encode_layer(layer, &layout)?;
+    let (rt, _) = build_step_runtime(model_dir, &cfg)?;
+    let mut checkpoints = Vec::new();
+
+    let mut push = |label: &str, finite: bool, max_abs: f32, non_finite: usize| {
+        checkpoints.push(StepProbeCheckpoint {
+            label: label.to_string(),
+            finite,
+            max_abs,
+            non_finite,
+        });
+    };
+
+    rt.dispatch_and_wait(|enc| {
+        let first_step = 1u32;
+        enc.encode_step_preamble(&rt.layout, first_step)?;
+        Ok(())
+    })?;
+    let (f, m, n) = arena_hidden_stats(&rt.bufs.arena);
+    push("after_preamble", f, m, n);
+
+    for layer in 0..rt.layers {
+        rt.dispatch_and_wait(|enc| {
+            enc.encode_layer(layer, &rt.layout)?;
+            Ok(())
+        })?;
+        let (f, m, n) = arena_hidden_stats(&rt.bufs.arena);
+        push(&format!("after_layer_{layer}"), f, m, n);
+    }
+
+    rt.dispatch_and_wait(|enc| {
+        enc.rmsnorm(A_HIDDEN, A_TMP, rt.layout.final_norm, HID as u32, CANVAS);
+        enc.gemm_q8_logits(
+            A_TMP,
+            rt.layout.embed,
+            CANVAS as u32,
+            VOCAB as u32,
+            HID as u32,
+        )
+    })?;
+    let (bad, m) = count_non_finite_half(&rt.bufs.logits, CANVAS * VOCAB);
+    push("after_lm_head", bad == 0, m, bad);
+
+    rt.dispatch_and_wait(|enc| {
+        enc.enc.setComputePipelineState(&enc.ps.softcap.pipeline);
+        enc.bind_logits(0);
+        enc.dispatch_1d_ranged(&enc.ps.softcap, CANVAS * VOCAB, 256, |e, base| {
+            set_bytes(e, &base, 1);
+        });
+        Ok(())
+    })?;
+    let (bad, m) = count_non_finite_half(&rt.bufs.logits, CANVAS * VOCAB);
+    push("after_softcap_gpu", bad == 0, m, bad);
+
+    softcap_logits_cpu(&rt.bufs.logits);
+    let (bad, m) = count_non_finite_half(&rt.bufs.logits, CANVAS * VOCAB);
+    push("after_softcap_cpu", bad == 0, m, bad);
+
+    Ok(StepProbeResult {
+        checkpoints,
+        elapsed: started.elapsed(),
+    })
+}
+
+pub fn bench_step_kernel(
+    model_dir: &Path,
+    cfg: StepSmokeConfig,
+    iters: usize,
+) -> Result<StepBenchResult, Error> {
+    let iters = iters.max(1);
+    let (rt, compile) = build_step_runtime(model_dir, &cfg)?;
+    let finish = cfg.finish;
+
+    let warmup_started = Instant::now();
+    rt.run_forward_once(finish)?;
+    let warmup = warmup_started.elapsed();
+
+    let started = Instant::now();
+    for _ in 0..iters {
+        rt.run_forward_once(finish)?;
+    }
+    let elapsed = started.elapsed();
+    let per_step = elapsed / iters as u32;
+
+    Ok(StepBenchResult {
+        compile,
+        warmup,
+        per_step,
+        iters,
+        finish,
+    })
+}
+
+pub fn run_step_smoke(model_dir: &Path, cfg: StepSmokeConfig) -> Result<StepSmokeResult, Error> {
+    let finish = cfg.finish;
+    let steps = cfg.steps;
+    let (rt, _) = build_step_runtime(model_dir, &cfg)?;
+    let started = Instant::now();
+    for step_i in 0..steps {
+        rt.dispatch_and_wait(|enc| {
+            let cur_state: CanvasState = read_struct(&enc.bufs.state);
+            let first_step = if cur_state.step == 0 { 1u32 } else { 0u32 };
+            enc.encode_step_preamble(&rt.layout, first_step)?;
+            for layer in 0..rt.layers {
+                enc.encode_layer(layer, &rt.layout)?;
+            }
+            enc.encode_step_finish(&rt.layout, StepFinishMode::ForwardOnly)?;
+            Ok(())
+        })?;
+        softcap_logits_cpu(&rt.bufs.logits);
+        if finish == StepFinishMode::Full {
+            rt.dispatch_and_wait(|enc| enc.encode_step_sampler(&rt.layout))?;
         }
-        enc.encode_step_finish(&layout)?;
-        enc.enc.endEncoding();
-        cmd.commit();
-        cmd.waitUntilCompleted();
-        eprintln!("step-smoke: completed denoise step {}/{}", step_i + 1, cfg.steps);
-        let st: CanvasState = read_struct(&bufs.state);
-        if st.stop_flag != 0 {
-            eprintln!("step-smoke: early stop at step {}", st.step);
-            break;
+        eprintln!("step-smoke: completed denoise step {}/{}", step_i + 1, steps);
+        if finish == StepFinishMode::Full {
+            let st: CanvasState = read_struct(&rt.bufs.state);
+            if st.stop_flag != 0 {
+                eprintln!("step-smoke: early stop at step {}", st.step);
+                break;
+            }
         }
     }
     let elapsed = started.elapsed();
 
-    let final_state: CanvasState = read_struct(&bufs.state);
-    let (logits_finite, max_abs_logit) = check_logits_finite(&bufs.logits);
+    let final_state: CanvasState = read_struct(&rt.bufs.state);
+    let (logits_finite, max_abs_logit) = check_logits_finite(&rt.bufs.logits);
 
     Ok(StepSmokeResult {
         step: final_state.step,
