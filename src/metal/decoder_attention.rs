@@ -47,6 +47,7 @@ fn fused_input_qkv_heads(
     let buf_q = linear_cached_batched_in_buf(
         &mut batch,
         &engine.f32_bf16_linear_pipeline,
+        &engine.f32_q4_linear_pipeline,
         &buf_normed,
         &cached.q_proj,
         seq_len,
@@ -54,6 +55,7 @@ fn fused_input_qkv_heads(
     let buf_k = linear_cached_batched_in_buf(
         &mut batch,
         &engine.f32_bf16_linear_pipeline,
+        &engine.f32_q4_linear_pipeline,
         &buf_normed,
         &cached.k_proj,
         seq_len,
@@ -62,6 +64,7 @@ fn fused_input_qkv_heads(
         linear_cached_batched_in_buf(
             &mut batch,
             &engine.f32_bf16_linear_pipeline,
+            &engine.f32_q4_linear_pipeline,
             &buf_normed,
             v_proj,
             seq_len,
@@ -116,7 +119,7 @@ fn fused_gqa_o_proj_gpu_kv(
     total_kv: usize,
     params: &AttentionParams,
     mask: GqaMask<'_>,
-    o_proj: &crate::metal::linear::CachedLinear,
+    o_proj: &crate::metal::linear::GpuLinearWeight,
 ) -> Result<(), Error> {
     let telemetry = engine.batch_telemetry();
     let mut batch = begin_engine_batch(
@@ -141,6 +144,7 @@ fn fused_gqa_o_proj_gpu_kv(
     linear_cached_batched_in_cpu_out(
         &mut batch,
         &engine.f32_bf16_linear_pipeline,
+        &engine.f32_q4_linear_pipeline,
         out,
         &buf_attn,
         o_proj,
@@ -279,6 +283,7 @@ pub fn forward_decoder_attention(
         linear_cached_batched_in_cpu_out(
             &mut batch,
             &engine.f32_bf16_linear_pipeline,
+            &engine.f32_q4_linear_pipeline,
             out,
             &buf_attn,
             &cached.o_proj,

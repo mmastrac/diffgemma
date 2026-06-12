@@ -1,8 +1,9 @@
 use crate::config::TextConfig;
 use crate::metal::batched_kernels::{self as bk};
-use crate::metal::kernels::GpuKernels;
 use crate::metal::batch::GpuBatch;
-use crate::metal::device::MetalContext;
+use crate::metal::device::ComputePipeline;
+use crate::metal::kernels::GpuKernels;
+use crate::metal::linear::f32_q4_linear_gpu_bufs;
 use crate::metal::telemetry::ForwardTelemetry;
 use crate::metal::weights::GpuDecoderWeightCache;
 use std::cell::RefCell;
@@ -24,7 +25,7 @@ pub fn experts_forward_gpu_batched(
     residual: &[f32],
     pre_ff_norm_2: &[f32],
     eps: f32,
-    weights: &DecoderLayerWeights<'_>,
+    _weights: Option<&DecoderLayerWeights<'_>>,
     expert_cache: &GpuDecoderWeightCache,
     layer: usize,
     cfg: &TextConfig,
@@ -32,17 +33,17 @@ pub fn experts_forward_gpu_batched(
     routes: &[RouteResult],
     token_indices: &mut Vec<u32>,
     out_arena: &mut Vec<f32>,
-    ctx: &MetalContext,
+    ctx: &crate::metal::device::MetalContext,
     pool: &mut crate::metal::buffer::BufferPool,
     kernels: &GpuKernels,
-    gemm_pipeline: &crate::metal::device::ComputePipeline,
+    bf16_pipeline: &ComputePipeline,
+    q4_pipeline: &ComputePipeline,
     telemetry: Option<Rc<RefCell<ForwardTelemetry>>>,
 ) -> Result<(), Error> {
     let hidden = cfg.hidden_size;
     let moe_inter = cfg.moe_intermediate_size;
     let experts = cfg.num_experts;
-    let gate_up = weights.experts_gate_up.bf16()?;
-    let down = weights.experts_down.bf16()?;
+    let dgq = expert_cache.is_dgq();
 
     out.fill(0.0);
 
@@ -87,20 +88,24 @@ pub fn experts_forward_gpu_batched(
     let _ = (gate_up_len, gate_act_len);
     out_arena.resize(out_len, 0.0);
 
-    let pipeline = &gemm_pipeline.pipeline;
+    let pipeline = &bf16_pipeline.pipeline;
 
-    for job in &jobs {
-        expert_cache.prefetch_expert(
-            layer,
-            gate_up,
-            down,
-            job.expert,
-            &ctx.device,
-            pool,
-        );
+    if !dgq {
+        let weights = _weights.ok_or(Error::Format("bf16 moe needs layer weights"))?;
+        let gate_up = weights.experts_gate_up.bf16()?;
+        let down = weights.experts_down.bf16()?;
+        for job in &jobs {
+            expert_cache.prefetch_expert(
+                layer,
+                gate_up,
+                down,
+                job.expert,
+                &ctx.device,
+                pool,
+            );
+        }
     }
 
-    // One sync: pre_ff norm → gather → gate_up GEMM → gelu/swiglu → down GEMM per expert job.
     {
         let mut batch = GpuBatch::begin_with_telemetry(
             &ctx.queue,
@@ -130,16 +135,29 @@ pub fn experts_forward_gpu_batched(
                 hidden,
             )?;
             let act_len = batch_size * moe_inter;
-            let w_gate = expert_cache.expert_gate_up_buf(layer, job.expert);
-            let buf_gu = bk::f32_bf16_linear_gpu_bufs(
-                &mut batch,
-                pipeline,
-                &buf_a,
-                &w_gate,
-                batch_size,
-                hidden,
-                moe_inter * 2,
-            )?;
+            let buf_gu = if dgq {
+                let w = expert_cache.expert_gate_up_q4(layer, job.expert);
+                f32_q4_linear_gpu_bufs(
+                    &mut batch,
+                    q4_pipeline,
+                    &buf_a,
+                    &w,
+                    batch_size,
+                    hidden,
+                    moe_inter * 2,
+                )?
+            } else {
+                let w_gate = expert_cache.expert_gate_up_buf(layer, job.expert);
+                bk::f32_bf16_linear_gpu_bufs(
+                    &mut batch,
+                    pipeline,
+                    &buf_a,
+                    &w_gate,
+                    batch_size,
+                    hidden,
+                    moe_inter * 2,
+                )?
+            };
             let buf_act = bk::gelu_swiglu_gate_up_gpu(
                 &mut batch,
                 kernels,
@@ -148,17 +166,30 @@ pub fn experts_forward_gpu_batched(
                 batch_size,
                 moe_inter,
             )?;
-            let w_down = expert_cache.expert_down_buf(layer, job.expert);
             let out_slice = &mut out_arena[job.out_off..job.out_off + batch_size * hidden];
-            let buf_out = bk::f32_bf16_linear_gpu_bufs(
-                &mut batch,
-                pipeline,
-                &buf_act,
-                &w_down,
-                batch_size,
-                moe_inter,
-                hidden,
-            )?;
+            let buf_out = if dgq {
+                let w = expert_cache.expert_down_q4(layer, job.expert);
+                f32_q4_linear_gpu_bufs(
+                    &mut batch,
+                    q4_pipeline,
+                    &buf_act,
+                    &w,
+                    batch_size,
+                    moe_inter,
+                    hidden,
+                )?
+            } else {
+                let w_down = expert_cache.expert_down_buf(layer, job.expert);
+                bk::f32_bf16_linear_gpu_bufs(
+                    &mut batch,
+                    pipeline,
+                    &buf_act,
+                    &w_down,
+                    batch_size,
+                    moe_inter,
+                    hidden,
+                )?
+            };
             batch.register_read(buf_out, out_slice);
         }
         batch.end()?;

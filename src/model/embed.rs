@@ -1,10 +1,55 @@
 use crate::buffer::Buffer;
+use crate::dgq::block::dequant_row_q8;
+use crate::dgq::layout::q8_row_bytes;
 use crate::fast_slice::FastBf16Slice;
 use crate::kernels::matmul;
 use crate::safetensors::Error;
 use crate::tensor::{Bf16Slice, TensorView};
+use crate::weights::WeightStore;
 
 pub const LM_HEAD_CHUNK: usize = 4096;
+
+const EMBED_KEY: &str = "model.decoder.embed_tokens.weight";
+
+/// Token gather from bf16 or `.dgq` q8 embedding table.
+pub fn embed_tokens_from_store(
+    store: &WeightStore,
+    out: &mut [f32],
+    token_ids: &[u32],
+    hidden: usize,
+    scale: f32,
+) -> Result<(), Error> {
+    match store {
+        WeightStore::Dgq(dgq) => {
+            let entry = dgq
+                .get_entry(EMBED_KEY)
+                .ok_or_else(|| Error::NotFound(EMBED_KEY.to_string()))?;
+            entry
+                .meta
+                .shape
+                .get(1)
+                .filter(|&&d| d as usize == hidden)
+                .ok_or(Error::Format("embed hidden mismatch"))?;
+            let src = dgq.tensor_bytes(EMBED_KEY)?;
+            let row_bytes = q8_row_bytes(hidden);
+            assert_eq!(out.len(), token_ids.len() * hidden);
+            for (t, &id) in token_ids.iter().enumerate() {
+                let row = id as usize;
+                let row_src = &src[row * row_bytes..(row + 1) * row_bytes];
+                let out_row = &mut out[t * hidden..(t + 1) * hidden];
+                dequant_row_q8(row_src, hidden, out_row);
+                for v in out_row.iter_mut() {
+                    *v *= scale;
+                }
+            }
+            Ok(())
+        }
+        _ => {
+            let embed = store.tensor(EMBED_KEY)?;
+            embed_tokens(out, token_ids, embed.bf16()?, hidden, scale)
+        }
+    }
+}
 
 pub fn embed_tokens(
     out: &mut [f32],
@@ -76,6 +121,62 @@ pub fn soft_embeddings_from_logits(
                     out_row[h] += prob * table.to_f32_unchecked(row_off + h) * scale;
                 }
             }
+        }
+    }
+}
+
+/// Tied LM head: `logits = hidden @ embed^T`, chunked over bf16 or `.dgq` q8 weights.
+pub fn lm_head_tied_from_store(
+    store: &WeightStore,
+    logits: &mut [f32],
+    hidden: &[f32],
+    seq_len: usize,
+    hidden_dim: usize,
+    vocab_size: usize,
+    w_chunk: &mut Buffer<f32>,
+) -> Result<(), Error> {
+    match store {
+        WeightStore::Dgq(dgq) => {
+            assert_eq!(hidden.len(), seq_len * hidden_dim);
+            assert_eq!(logits.len(), seq_len * vocab_size);
+            let src = dgq.tensor_bytes(EMBED_KEY)?;
+            let row_bytes = q8_row_bytes(hidden_dim);
+            logits.fill(0.0);
+            let mut row_buf = vec![0.0f32; hidden_dim];
+            for v0 in (0..vocab_size).step_by(LM_HEAD_CHUNK) {
+                let v1 = (v0 + LM_HEAD_CHUNK).min(vocab_size);
+                let chunk = v1 - v0;
+                w_chunk.ensure_len(chunk * hidden_dim);
+                {
+                    let w = w_chunk.as_slice_mut();
+                    for (vi, v) in (v0..v1).enumerate() {
+                        dequant_row_q8(
+                            &src[v * row_bytes..(v + 1) * row_bytes],
+                            hidden_dim,
+                            &mut row_buf,
+                        );
+                        w[vi * hidden_dim..(vi + 1) * hidden_dim].copy_from_slice(&row_buf);
+                    }
+                }
+                let w_slice = w_chunk.as_slice();
+                for s in 0..seq_len {
+                    matmul::matmul_b_transpose(
+                        &mut logits[s * vocab_size + v0..s * vocab_size + v1],
+                        &hidden[s * hidden_dim..(s + 1) * hidden_dim],
+                        w_slice,
+                        1,
+                        hidden_dim,
+                        chunk,
+                        1.0,
+                        1.0,
+                    );
+                }
+            }
+            Ok(())
+        }
+        _ => {
+            let embed = store.tensor(EMBED_KEY)?;
+            lm_head_tied_bf16(logits, hidden, embed, seq_len, hidden_dim, vocab_size, w_chunk)
         }
     }
 }

@@ -19,6 +19,7 @@ mod kv_cache;
 mod memory;
 mod moe;
 mod probe;
+mod dgq_gpu;
 mod bench_gemm;
 mod telemetry;
 mod weights;

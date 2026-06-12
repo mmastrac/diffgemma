@@ -1168,7 +1168,7 @@ fn run_bench_step(
         let iters = iters.max(1);
         let vocab = m.config.text_config.vocab_size;
 
-        let prompt = match build_prompt_tokens(model_dir, prompt_text.as_deref(), 0, vocab) {
+        let prompt = match build_prompt_tokens(model_dir, prompt_text.as_deref(), 64, vocab) {
             Ok(ids) => ids,
             Err(err) => {
                 eprintln!("error: {err}");
@@ -1181,27 +1181,6 @@ fn run_bench_step(
         eprintln!(
             "bench-step setup (canvas={canvas}, kv={kv_len}, layers={layers}, seed={seed})..."
         );
-        let prefill_out = match prefill(
-            &m.weights,
-            &m.config,
-            &EncoderPrefillInput {
-                token_ids: &prompt,
-                position_offset: 0,
-            },
-            &mut enc_scratch,
-        ) {
-            Ok(out) => out,
-            Err(err) => {
-                eprintln!("error: {err}");
-                return ExitCode::FAILURE;
-            }
-        };
-        let kv_cache = prefill_out.kv_cache;
-
-        let mut rng = Rng::new(seed);
-        let mut token_ids = initialize_canvas(canvas, vocab, &mut rng);
-        let mask = model::mask::DecoderAttnMask::all_valid(canvas, kv_cache.kv_len);
-        let mut logits = vec![0.0f32; canvas * vocab];
 
         let mut scratch = GpuDecoderScratch::new(canvas, &m.config);
         let mut gpu_weights = match load_weight_cache(
@@ -1232,10 +1211,56 @@ fn run_bench_step(
             eprintln!("error: {err}");
             return ExitCode::FAILURE;
         }
-        if let Err(err) = scratch.sync_gpu_kv_from_cpu(&kv_cache, canvas) {
-            eprintln!("error: {err}");
-            return ExitCode::FAILURE;
-        }
+
+        let kv_cache = if m.weights.is_quantized() {
+            match metal::prefill_gpu(
+                &m.weights,
+                &m.config,
+                &EncoderPrefillInput {
+                    token_ids: &prompt,
+                    position_offset: 0,
+                },
+                &mut enc_scratch,
+                &mut scratch,
+                &mut gpu_weights,
+                &mut engine,
+                kv_len,
+                canvas,
+                Some(layers),
+            ) {
+                Ok(kv) => kv,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        } else {
+            let prefill_out = match prefill(
+                &m.weights,
+                &m.config,
+                &EncoderPrefillInput {
+                    token_ids: &prompt,
+                    position_offset: 0,
+                },
+                &mut enc_scratch,
+            ) {
+                Ok(out) => out,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if let Err(err) = scratch.sync_gpu_kv_from_cpu(&prefill_out.kv_cache, canvas) {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+            prefill_out.kv_cache
+        };
+
+        let mut rng = Rng::new(seed);
+        let mut token_ids = initialize_canvas(canvas, vocab, &mut rng);
+        let mask = model::mask::DecoderAttnMask::all_valid(canvas, kv_cache.kv_len);
+        let mut logits = vec![0.0f32; canvas * vocab];
 
         eprintln!("bench-step warmup...");
         {

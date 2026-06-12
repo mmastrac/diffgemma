@@ -61,7 +61,7 @@ impl GpuDecoderLayerScratch {
 pub fn forward_decoder(
     out: &mut [f32],
     hidden_states: &[f32],
-    weights: &DecoderLayerWeights<'_>,
+    weights: Option<&DecoderLayerWeights<'_>>,
     cached: &GpuLayerWeightCache,
     expert_cache: &GpuDecoderWeightCache,
     cfg: &TextConfig,
@@ -108,7 +108,7 @@ pub fn forward_decoder(
 fn forward_layer_ff(
     out: &mut [f32],
     hidden_states: &[f32],
-    weights: &DecoderLayerWeights<'_>,
+    weights: Option<&DecoderLayerWeights<'_>>,
     cached: &GpuLayerWeightCache,
     expert_cache: &GpuDecoderWeightCache,
     cfg: &TextConfig,
@@ -155,6 +155,7 @@ fn forward_layer_ff(
         let buf_gate = linear_cached_batched_in_buf(
             &mut batch,
             &engine.f32_bf16_linear_pipeline,
+            &engine.f32_q4_linear_pipeline,
             &buf_normed,
             &cached.mlp_gate,
             seq_len,
@@ -162,16 +163,18 @@ fn forward_layer_ff(
         let buf_up = linear_cached_batched_in_buf(
             &mut batch,
             &engine.f32_bf16_linear_pipeline,
+            &engine.f32_q4_linear_pipeline,
             &buf_normed,
             &cached.mlp_up,
             seq_len,
         )?;
-        let act_len = seq_len * cached.mlp_gate.out_dim;
+        let act_len = seq_len * cached.mlp_gate.out_dim();
         bk::gelu_pytorch_tanh_gpu_buf(&mut batch, &engine.kernels, &buf_gate, act_len)?;
         bk::swiglu_mul_gpu_bufs(&mut batch, &engine.kernels, &buf_gate, &buf_up, act_len)?;
         let buf_down = linear_cached_batched_in_buf(
             &mut batch,
             &engine.f32_bf16_linear_pipeline,
+            &engine.f32_q4_linear_pipeline,
             &buf_gate,
             &cached.mlp_down,
             seq_len,
@@ -218,6 +221,7 @@ fn forward_layer_ff(
         &mut engine.pool,
         &engine.kernels,
         &engine.f32_bf16_linear_pipeline,
+        &engine.f32_q4_linear_pipeline,
         telemetry,
     )?;
 
@@ -266,7 +270,7 @@ fn forward_layer_ff(
 pub fn forward_encoder_prefill(
     out: &mut [f32],
     hidden_states: &[f32],
-    weights: &DecoderLayerWeights<'_>,
+    weights: Option<&DecoderLayerWeights<'_>>,
     cached: &GpuLayerWeightCache,
     expert_cache: &GpuDecoderWeightCache,
     cfg: &TextConfig,
@@ -307,7 +311,7 @@ pub fn forward_encoder_prefill(
 pub fn forward_encoder_extend(
     out: &mut [f32],
     hidden_states: &[f32],
-    weights: &DecoderLayerWeights<'_>,
+    weights: Option<&DecoderLayerWeights<'_>>,
     cached: &GpuLayerWeightCache,
     expert_cache: &GpuDecoderWeightCache,
     cfg: &TextConfig,

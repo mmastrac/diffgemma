@@ -20,7 +20,7 @@ pub const BUFFER_POOL_FUDGE_BYTES: u64 = 64 * 1024 * 1024;
 /// Buffer pool peak allowance for full-canvas denoise (seq=256).
 pub const BUFFER_POOL_LARGE_BYTES: u64 = 512 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct ExpertCacheStats {
     pub budget_bytes: u64,
     pub used_bytes: u64,

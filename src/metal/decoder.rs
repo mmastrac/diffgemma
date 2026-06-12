@@ -2,14 +2,14 @@ use crate::config::{LayerType, ModelConfig, TextConfig};
 use crate::metal::decoder_layer::{forward_decoder as layer_forward, GpuDecoderLayerScratch};
 use crate::metal::engine::GpuDecoderEngine;
 use crate::model::decoder::{DecoderForwardInput, DecoderForwardOutput, DecoderScratch};
-use crate::model::embed::{embed_tokens, lm_head_tied_bf16, logit_softcapping};
+use crate::model::embed::{embed_tokens_from_store, lm_head_tied_from_store, logit_softcapping};
 use crate::model::kv_cache::LayerKvView;
-use crate::model::layer_weights::DecoderLayerWeights;
 use crate::model::self_conditioning::{apply as apply_self_conditioning, SelfConditioningWeights};
 use crate::safetensors::Error;
 use crate::metal::weights::GpuDecoderWeightCache;
 use crate::metal::kv_cache::GpuKvCache;
 use crate::weights::WeightStore;
+use crate::kernels::cpu::rms_norm_no_scale;
 
 pub fn load_weight_cache(
     store: &WeightStore,
@@ -20,12 +20,22 @@ pub fn load_weight_cache(
     use crate::metal::device::MetalContext;
     use crate::metal::memory::{expert_cache_budget_bytes, log_gpu_memory_plan};
 
-    eprintln!("initializing GPU weight cache (paged layers, expert LRU)...");
+    eprintln!("initializing GPU weight cache...");
     let warm = std::time::Instant::now();
     let ctx = MetalContext::new()?;
-    let expert_budget = expert_cache_budget_bytes(&ctx.device, text, seq_len, kv_len);
-    log_gpu_memory_plan(&ctx.device, text, seq_len, kv_len, expert_budget);
-    let cache = GpuDecoderWeightCache::load(store, text, expert_budget)?;
+    let expert_budget = if store.is_quantized() {
+        0
+    } else {
+        let budget = expert_cache_budget_bytes(&ctx.device, text, seq_len, kv_len);
+        log_gpu_memory_plan(&ctx.device, text, seq_len, kv_len, budget);
+        budget
+    };
+    if store.is_quantized() {
+        eprintln!("  mode: .dgq resident (zero-copy blob, no expert LRU)");
+    } else {
+        eprintln!("  mode: bf16 paged layers + expert LRU");
+    }
+    let cache = GpuDecoderWeightCache::load(store, text, expert_budget, &ctx.device)?;
     eprintln!("  cache ready in {:.2?}", warm.elapsed());
     Ok(cache)
 }
@@ -187,43 +197,55 @@ fn forward_inner(
     let vocab = text.vocab_size;
     let embed_scale = (hidden as f32).sqrt();
 
-    let embed = store.tensor("model.decoder.embed_tokens.weight")?;
-    embed.expect_shape(&[vocab as i64, hidden as i64])?;
-    let embed_bf16 = embed.bf16()?;
-
-    embed_tokens(
+    embed_tokens_from_store(
+        store,
         &mut scratch.cpu.embed_buf,
         input.token_ids,
-        embed_bf16,
         hidden,
         embed_scale,
     )?;
 
-    let sc_weights = SelfConditioningWeights::load(store, text)?;
-    match input.self_conditioning_logits {
-        Some(logits) => {
-            crate::model::embed::soft_embeddings_from_logits(
-                &mut scratch.cpu.sc_signal,
-                logits,
-                embed_bf16,
-                seq_len,
-                vocab,
-                hidden,
-                embed_scale,
-                &mut scratch.cpu.sc_probs,
+    let eps = text.rms_norm_eps as f32;
+    if let Some(logits) = input.self_conditioning_logits {
+        let sc_weights = SelfConditioningWeights::load(store, text)?;
+        let embed = store.tensor("model.decoder.embed_tokens.weight")?;
+        crate::model::embed::soft_embeddings_from_logits(
+            &mut scratch.cpu.sc_signal,
+            logits,
+            embed.bf16()?,
+            seq_len,
+            vocab,
+            hidden,
+            embed_scale,
+            &mut scratch.cpu.sc_probs,
+        );
+        apply_self_conditioning(
+            &mut scratch.cpu.hidden_a,
+            &scratch.cpu.embed_buf,
+            &scratch.cpu.sc_signal,
+            &sc_weights,
+            text,
+            seq_len,
+            &mut scratch.cpu.self_cond,
+        )?;
+    } else {
+        scratch.cpu.hidden_a.copy_from_slice(&scratch.cpu.embed_buf);
+        scratch
+            .cpu
+            .self_cond
+            .normed
+            .resize(seq_len * hidden, 0.0);
+        for s in 0..seq_len {
+            let off = s * hidden;
+            scratch.cpu.self_cond.normed[off..off + hidden]
+                .copy_from_slice(&scratch.cpu.hidden_a[off..off + hidden]);
+            rms_norm_no_scale(
+                &mut scratch.cpu.hidden_a[off..off + hidden],
+                &scratch.cpu.self_cond.normed[off..off + hidden],
+                eps,
             );
         }
-        None => scratch.cpu.sc_signal.fill(0.0),
     }
-    apply_self_conditioning(
-        &mut scratch.cpu.hidden_a,
-        &scratch.cpu.embed_buf,
-        &scratch.cpu.sc_signal,
-        &sc_weights,
-        text,
-        seq_len,
-        &mut scratch.cpu.self_cond,
-    )?;
 
     let mask = input.mask;
     let positions: Vec<i64> =
@@ -239,15 +261,23 @@ fn forward_inner(
         None
     };
     let gpu_kv_ref = scratch.gpu_kv.as_ref();
+    let mut bf16_layer_weights = None;
     for layer in 0..n_layers {
         let layer_scratch = scratch.layer.ensure(cfg, seq_len, input.kv_cache.kv_len, layer)?;
-        let layer_weights = DecoderLayerWeights::load(store, layer, text)?;
+        let lw = if weights.is_dgq() {
+            None
+        } else {
+            bf16_layer_weights = Some(crate::model::layer_weights::DecoderLayerWeights::load(
+                store, layer, text,
+            )?);
+            bf16_layer_weights.as_ref()
+        };
         weights.ensure_layer(store, text, layer, &engine.ctx.device, &mut engine.pool)?;
-        let layer_cache = weights.layer();
+        let layer_cache = weights.layer_ref(layer);
         layer_forward(
             out_buf,
             in_buf,
-            &layer_weights,
+            lw,
             &layer_cache,
             weights,
             text,
@@ -266,8 +296,9 @@ fn forward_inner(
             engine,
             gpu_kv_ref,
         )?;
-        drop(layer_cache);
-        weights.release_layer();
+        if !weights.is_dgq() {
+            weights.release_layer();
+        }
         std::mem::swap(&mut in_buf, &mut out_buf);
     }
 
@@ -286,7 +317,7 @@ fn forward_inner(
             &engine.kernels,
             out_buf,
             in_buf,
-            weights.final_norm.as_slice(),
+            weights.final_norm(),
             seq_len,
             hidden,
             text.rms_norm_eps as f32,
@@ -316,10 +347,10 @@ fn forward_inner(
             if out.len() != need {
                 return Err(Error::Format("logits_out length mismatch"));
             }
-            lm_head_tied_bf16(
+            lm_head_tied_from_store(
+                store,
                 out,
                 out_buf,
-                embed,
                 seq_len,
                 hidden,
                 vocab,
@@ -328,10 +359,10 @@ fn forward_inner(
             logit_softcapping(out, text.final_logit_softcapping as f32);
         } else {
             scratch.cpu.logits_buf.ensure_len(seq_len * vocab);
-            lm_head_tied_bf16(
+            lm_head_tied_from_store(
+                store,
                 scratch.cpu.logits_buf.as_slice_mut(),
                 out_buf,
-                embed,
                 seq_len,
                 hidden,
                 vocab,

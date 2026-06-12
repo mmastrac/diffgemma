@@ -5,7 +5,7 @@ use crate::metal::decoder_layer::{forward_encoder_extend, forward_encoder_prefil
 use crate::model::encoder::EncoderPrefillInput;
 use crate::metal::engine::GpuDecoderEngine;
 use crate::metal::weights::GpuDecoderWeightCache;
-use crate::model::embed::embed_tokens;
+use crate::model::embed::embed_tokens_from_store;
 use crate::model::encoder::EncoderScratch;
 use crate::model::kv_cache::KvCache;
 use crate::model::layer_weights::DecoderLayerWeights;
@@ -39,12 +39,10 @@ pub fn prefill_gpu(
         .ok_or(Error::Format("gpu kv cache missing"))?;
     gpu_kv.reset_len();
 
-    let embed = store.tensor("model.decoder.embed_tokens.weight")?;
-    embed.expect_shape(&[text.vocab_size as i64, hidden as i64])?;
-    embed_tokens(
+    embed_tokens_from_store(
+        store,
         &mut enc_scratch.embed_buf[..seq_len * hidden],
         input.token_ids,
-        embed.bf16()?,
         hidden,
         embed_scale,
     )?;
@@ -60,16 +58,22 @@ pub fn prefill_gpu(
         .unwrap_or(text.num_hidden_layers)
         .min(text.num_hidden_layers);
     let mut use_a_input = true;
+    let mut bf16_layer_weights = None;
     for layer in 0..n_layers {
-        let layer_weights = DecoderLayerWeights::load(store, layer, text)?;
+        let lw = if weights.is_dgq() {
+            None
+        } else {
+            bf16_layer_weights = Some(DecoderLayerWeights::load(store, layer, text)?);
+            bf16_layer_weights.as_ref()
+        };
         weights.ensure_layer(store, text, layer, &engine.ctx.device, &mut engine.pool)?;
-        let layer_cache = weights.layer();
+        let layer_cache = weights.layer_ref(layer);
         let layer_scratch = dec_scratch.ensure_layer_scratch(cfg, seq_len, 0, layer)?;
         if use_a_input {
             forward_encoder_prefill(
                 &mut enc_scratch.hidden_b[..seq_len * hidden],
                 &enc_scratch.hidden_a[..seq_len * hidden],
-                &layer_weights,
+                lw,
                 &layer_cache,
                 weights,
                 text,
@@ -84,7 +88,7 @@ pub fn prefill_gpu(
             forward_encoder_prefill(
                 &mut enc_scratch.hidden_a[..seq_len * hidden],
                 &enc_scratch.hidden_b[..seq_len * hidden],
-                &layer_weights,
+                lw,
                 &layer_cache,
                 weights,
                 text,
@@ -96,8 +100,9 @@ pub fn prefill_gpu(
                 &gpu_kv,
             )?;
         }
-        drop(layer_cache);
-        weights.release_layer();
+        if !weights.is_dgq() {
+            weights.release_layer();
+        }
         use_a_input = !use_a_input;
     }
 
@@ -136,12 +141,10 @@ pub fn extend_prefill_gpu(
         return Err(Error::Format("gpu/cpu kv_len mismatch"));
     }
 
-    let embed = store.tensor("model.decoder.embed_tokens.weight")?;
-    embed.expect_shape(&[text.vocab_size as i64, hidden as i64])?;
-    embed_tokens(
+    embed_tokens_from_store(
+        store,
         &mut enc_scratch.embed_buf[..seq_len * hidden],
         token_ids,
-        embed.bf16()?,
         hidden,
         embed_scale,
     )?;
@@ -157,17 +160,23 @@ pub fn extend_prefill_gpu(
         .unwrap_or(text.num_hidden_layers)
         .min(text.num_hidden_layers);
     let mut use_a_input = true;
+    let mut bf16_layer_weights = None;
     for layer in 0..n_layers {
-        let layer_weights = DecoderLayerWeights::load(store, layer, text)?;
+        let lw = if weights.is_dgq() {
+            None
+        } else {
+            bf16_layer_weights = Some(DecoderLayerWeights::load(store, layer, text)?);
+            bf16_layer_weights.as_ref()
+        };
         weights.ensure_layer(store, text, layer, &engine.ctx.device, &mut engine.pool)?;
-        let layer_cache = weights.layer();
+        let layer_cache = weights.layer_ref(layer);
         let layer_scratch =
             dec_scratch.ensure_layer_scratch(cfg, seq_len, kv_len_before, layer)?;
         if use_a_input {
             forward_encoder_extend(
                 &mut enc_scratch.hidden_b[..seq_len * hidden],
                 &enc_scratch.hidden_a[..seq_len * hidden],
-                &layer_weights,
+                lw,
                 &layer_cache,
                 weights,
                 text,
@@ -183,7 +192,7 @@ pub fn extend_prefill_gpu(
             forward_encoder_extend(
                 &mut enc_scratch.hidden_a[..seq_len * hidden],
                 &enc_scratch.hidden_b[..seq_len * hidden],
-                &layer_weights,
+                lw,
                 &layer_cache,
                 weights,
                 text,
@@ -196,8 +205,9 @@ pub fn extend_prefill_gpu(
                 &gpu_kv,
             )?;
         }
-        drop(layer_cache);
-        weights.release_layer();
+        if !weights.is_dgq() {
+            weights.release_layer();
+        }
         use_a_input = !use_a_input;
     }
 
