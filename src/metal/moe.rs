@@ -379,12 +379,16 @@ pub fn experts_forward_gpu_per_job(
 ) -> Result<(), Error> {
     let dgq = expert_cache.is_dgq();
     let bf16_ps = &bf16_pipeline.pipeline;
-    {
+    for job in jobs {
+        let batch_size = job.tokens.len();
+        token_indices.clear();
+        token_indices.extend(job.tokens.iter().map(|&(tok, _)| tok as u32));
+        let out_slice = &mut out_arena[job.out_off..job.out_off + batch_size * hidden];
         let mut batch = GpuBatch::begin_with_telemetry(
             &ctx.queue,
             pool,
             &ctx.device,
-            telemetry,
+            telemetry.clone(),
         )?;
         let buf_res = batch.alloc_f32(residual)?;
         let buf_moe_in = bk::rms_norm_rows_gpu_buf(
@@ -396,76 +400,71 @@ pub fn experts_forward_gpu_per_job(
             hidden,
             eps,
         )?;
-        for job in jobs {
-            let batch_size = job.tokens.len();
-            token_indices.clear();
-            token_indices.extend(job.tokens.iter().map(|&(tok, _)| tok as u32));
-            let buf_a = bk::gather_rows_gpu(
+        let buf_a = bk::gather_rows_gpu(
+            &mut batch,
+            kernels,
+            &buf_moe_in,
+            token_indices,
+            hidden,
+        )?;
+        let act_len = batch_size * moe_inter;
+        let buf_gu = if dgq {
+            let w = expert_cache.expert_gate_up_q4(layer, job.expert);
+            f32_q4_linear_gpu_bufs(
                 &mut batch,
-                kernels,
-                &buf_moe_in,
-                token_indices,
+                q4_pipeline,
+                &buf_a,
+                &w,
+                batch_size,
                 hidden,
-            )?;
-            let act_len = batch_size * moe_inter;
-            let buf_gu = if dgq {
-                let w = expert_cache.expert_gate_up_q4(layer, job.expert);
-                f32_q4_linear_gpu_bufs(
-                    &mut batch,
-                    q4_pipeline,
-                    &buf_a,
-                    &w,
-                    batch_size,
-                    hidden,
-                    moe_inter * 2,
-                )?
-            } else {
-                let w_gate = expert_cache.expert_gate_up_buf(layer, job.expert);
-                bk::f32_bf16_linear_gpu_bufs(
-                    &mut batch,
-                    bf16_ps,
-                    &buf_a,
-                    &w_gate,
-                    batch_size,
-                    hidden,
-                    moe_inter * 2,
-                )?
-            };
-            let buf_act = bk::gelu_swiglu_gate_up_gpu(
+                moe_inter * 2,
+            )?
+        } else {
+            let w_gate = expert_cache.expert_gate_up_buf(layer, job.expert);
+            bk::f32_bf16_linear_gpu_bufs(
                 &mut batch,
-                kernels,
-                &buf_gu,
-                act_len,
+                bf16_ps,
+                &buf_a,
+                &w_gate,
+                batch_size,
+                hidden,
+                moe_inter * 2,
+            )?
+        };
+        let buf_act = bk::gelu_swiglu_gate_up_gpu(
+            &mut batch,
+            kernels,
+            &buf_gu,
+            act_len,
+            batch_size,
+            moe_inter,
+        )?;
+        let buf_out = if dgq {
+            let w = expert_cache.expert_down_q4(layer, job.expert);
+            f32_q4_linear_gpu_bufs(
+                &mut batch,
+                q4_pipeline,
+                &buf_act,
+                &w,
                 batch_size,
                 moe_inter,
-            )?;
-            let out_slice = &mut out_arena[job.out_off..job.out_off + batch_size * hidden];
-            let buf_out = if dgq {
-                let w = expert_cache.expert_down_q4(layer, job.expert);
-                f32_q4_linear_gpu_bufs(
-                    &mut batch,
-                    q4_pipeline,
-                    &buf_act,
-                    &w,
-                    batch_size,
-                    moe_inter,
-                    hidden,
-                )?
-            } else {
-                let w_down = expert_cache.expert_down_buf(layer, job.expert);
-                bk::f32_bf16_linear_gpu_bufs(
-                    &mut batch,
-                    bf16_ps,
-                    &buf_act,
-                    &w_down,
-                    batch_size,
-                    moe_inter,
-                    hidden,
-                )?
-            };
-            batch.register_read(buf_out, out_slice);
-        }
+                hidden,
+            )?
+        } else {
+            let w_down = expert_cache.expert_down_buf(layer, job.expert);
+            bk::f32_bf16_linear_gpu_bufs(
+                &mut batch,
+                bf16_ps,
+                &buf_act,
+                &w_down,
+                batch_size,
+                moe_inter,
+                hidden,
+            )?
+        };
+        batch.register_read(buf_out, out_slice);
         batch.end()?;
+        pool.trim(0);
     }
     Ok(())
 }

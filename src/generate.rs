@@ -619,7 +619,7 @@ mod gpu_determinism {
 
     /// Same KV + canvas: two decoder forwards back-to-back must match bit-for-bit.
     #[test]
-    #[ignore = "second decoder forward on same gpu_kv still drifts until layer 1 fixed"]
+    #[ignore = "repeat forward on shared dec/gpu_kv still drifts; single-pass surveys pass"]
     fn dgq_forward_logits_same_inputs_twice() {
         let Some(dgq_dir) = dgq_fixture_dir() else {
             eprintln!("skip: /tmp/quantized-weights missing");
@@ -963,7 +963,6 @@ mod gpu_determinism {
     }
 
     #[test]
-    #[ignore = "layer 2 stack still drifts; see PLAN2 Q3"]
     fn dgq_drift_survey_two_layers() {
         if dgq_fixture_dir().is_none() {
             eprintln!("skip: /tmp/quantized-weights missing");
@@ -986,7 +985,18 @@ mod gpu_determinism {
     }
 
     #[test]
-    #[ignore = "3-layer stack drift survey; see PLAN2 Q3"]
+    fn dgq_drift_survey_three_layers() {
+        if dgq_fixture_dir().is_none() {
+            eprintln!("skip: /tmp/quantized-weights missing");
+            return;
+        }
+        let unique = drift_survey_layers(3, 8);
+        eprintln!("3-layer unique pos1 argmax: {}", unique.len());
+        assert_eq!(unique.len(), 1, "3-layer drift: {unique:?}");
+    }
+
+    #[test]
+    #[ignore = "3-layer stack drift survey; use dgq_drift_survey_three_layers"]
     fn dgq_drift_survey() {
         let Some(dgq_dir) = dgq_fixture_dir() else {
             eprintln!("skip: /tmp/quantized-weights missing");

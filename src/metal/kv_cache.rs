@@ -127,6 +127,25 @@ impl GpuKvCache {
         Ok(())
     }
 
+    /// Zero decoder canvas slots so a repeat forward cannot read stale K/V suffix bytes.
+    pub fn clear_canvas_suffix(&self, canvas_len: usize) -> Result<(), Error> {
+        for layer in &self.layers {
+            let kv_dim = layer.kv_dim;
+            let byte_off = self.kv_len * kv_dim * 4;
+            let bytes = canvas_len * kv_dim * 4;
+            if byte_off + bytes > layer.keys.length() {
+                return Err(Error::Format("GPU kv canvas suffix out of range"));
+            }
+            unsafe {
+                let k = layer.keys.contents().as_ptr() as *mut u8;
+                let v = layer.values.contents().as_ptr() as *mut u8;
+                std::ptr::write_bytes(k.add(byte_off), 0, bytes);
+                std::ptr::write_bytes(v.add(byte_off), 0, bytes);
+            }
+        }
+        Ok(())
+    }
+
     pub fn layer_buffers(
         &self,
         layer: usize,

@@ -310,6 +310,9 @@ fn forward_inner(
         None
     };
     let gpu_kv_ref = scratch.gpu_kv.as_ref();
+    if let Some(gpu_kv) = scratch.gpu_kv.as_ref() {
+        gpu_kv.clear_canvas_suffix(seq_len)?;
+    }
     let mut bf16_layer_weights = None;
     for layer in 0..n_layers {
         let layer_scratch = scratch.layer.ensure(cfg, seq_len, input.kv_cache.kv_len, layer)?;
@@ -351,12 +354,8 @@ fn forward_inner(
         std::mem::swap(&mut in_buf, &mut out_buf);
     }
 
-    // After `n_layers` ping-pong swaps, the last layer output is in `in_buf` when odd.
-    let (norm_in, norm_out) = if n_layers % 2 == 0 {
-        (out_buf, in_buf)
-    } else {
-        (in_buf, out_buf)
-    };
+    // Each layer writes to `out_buf`, then swap moves it to `in_buf`.
+    let (norm_in, norm_out) = (in_buf, out_buf);
 
     {
         use crate::metal::batched_kernels as bk;
