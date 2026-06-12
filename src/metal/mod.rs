@@ -19,6 +19,7 @@ mod lm_head;
 mod kv_cache;
 mod memory;
 mod moe;
+mod mps_gemm;
 mod probe;
 mod dgq_gpu;
 mod bench_gemm;

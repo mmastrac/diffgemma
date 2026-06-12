@@ -2,6 +2,7 @@ use crate::metal::attention::GpuAttentionKernels;
 use crate::metal::buffer::BufferPool;
 use crate::metal::device::{ComputePipeline, MetalContext};
 use crate::metal::kernels::GpuKernels;
+use crate::metal::mps_gemm::MpsMatmulCache;
 use crate::metal::telemetry::ForwardTelemetry;
 use crate::safetensors::Error;
 use std::cell::Cell;
@@ -15,6 +16,7 @@ const F32_BF16_GEMM_ENTRY: &str = "f32_bf16_gemm";
 const F32_BF16_LINEAR_ENTRY: &str = "f32_bf16_linear";
 const F32_Q4_LINEAR_ENTRY: &str = "f32_q4_linear";
 const F32_Q8_LINEAR_ENTRY: &str = "f32_q8_linear";
+const DEQUANT_Q4_MATRIX_ENTRY: &str = "dequant_q4_matrix";
 
 pub struct GpuDecoderEngine {
     pub ctx: MetalContext,
@@ -24,6 +26,8 @@ pub struct GpuDecoderEngine {
     pub f32_bf16_linear_pipeline: ComputePipeline,
     pub f32_q4_linear_pipeline: ComputePipeline,
     pub f32_q8_linear_pipeline: ComputePipeline,
+    pub dequant_q4_matrix_pipeline: ComputePipeline,
+    pub mps_matmul: MpsMatmulCache,
     pub kernels: GpuKernels,
     pub attention: GpuAttentionKernels,
     telemetry: Rc<RefCell<ForwardTelemetry>>,
@@ -38,6 +42,9 @@ impl GpuDecoderEngine {
         let f32_bf16_linear_pipeline = ctx.compile_kernel(GEMM_SHADER, F32_BF16_LINEAR_ENTRY)?;
         let f32_q4_linear_pipeline = ctx.compile_kernel(QGEMM_SHADER, F32_Q4_LINEAR_ENTRY)?;
         let f32_q8_linear_pipeline = ctx.compile_kernel(QGEMM_SHADER, F32_Q8_LINEAR_ENTRY)?;
+        let dequant_q4_matrix_pipeline =
+            ctx.compile_kernel(QGEMM_SHADER, DEQUANT_Q4_MATRIX_ENTRY)?;
+        let mps_matmul = MpsMatmulCache::new(ctx.device.clone());
         let kernels = GpuKernels::new(&ctx)?;
         let attention = GpuAttentionKernels::new(&ctx)?;
         Ok(Self {
@@ -47,6 +54,8 @@ impl GpuDecoderEngine {
             f32_bf16_linear_pipeline,
             f32_q4_linear_pipeline,
             f32_q8_linear_pipeline,
+            dequant_q4_matrix_pipeline,
+            mps_matmul,
             kernels,
             attention,
             telemetry: Rc::new(RefCell::new(ForwardTelemetry::default())),
@@ -75,5 +84,17 @@ impl GpuDecoderEngine {
     pub fn batch_telemetry(&self) -> Option<Rc<RefCell<ForwardTelemetry>>> {
         self.telemetry_enabled()
             .then(|| self.telemetry_handle())
+    }
+
+    /// MPS dense path for `.dgq` q4 linears (dequant scratch + MPSMatrixMultiplication).
+    pub fn q4_mps_pair(
+        &mut self,
+        enabled: bool,
+    ) -> Option<(&mut MpsMatmulCache, &ComputePipeline)> {
+        if enabled {
+            Some((&mut self.mps_matmul, &self.dequant_q4_matrix_pipeline))
+        } else {
+            None
+        }
     }
 }

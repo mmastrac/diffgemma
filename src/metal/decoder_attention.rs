@@ -27,6 +27,7 @@ fn fused_input_qkv_heads(
     q: &mut [f32],
     k: &mut [f32],
     v: &mut [f32],
+    use_q4_mps: bool,
 ) -> Result<(), Error> {
     let telemetry = engine.batch_telemetry();
     let mut batch = begin_engine_batch(
@@ -48,6 +49,11 @@ fn fused_input_qkv_heads(
         &mut batch,
         &engine.f32_bf16_linear_pipeline,
         &engine.f32_q4_linear_pipeline,
+        if use_q4_mps {
+            Some((&mut engine.mps_matmul, &engine.dequant_q4_matrix_pipeline))
+        } else {
+            None
+        },
         &buf_normed,
         &cached.q_proj,
         seq_len,
@@ -56,6 +62,11 @@ fn fused_input_qkv_heads(
         &mut batch,
         &engine.f32_bf16_linear_pipeline,
         &engine.f32_q4_linear_pipeline,
+        if use_q4_mps {
+            Some((&mut engine.mps_matmul, &engine.dequant_q4_matrix_pipeline))
+        } else {
+            None
+        },
         &buf_normed,
         &cached.k_proj,
         seq_len,
@@ -65,6 +76,11 @@ fn fused_input_qkv_heads(
             &mut batch,
             &engine.f32_bf16_linear_pipeline,
             &engine.f32_q4_linear_pipeline,
+            if use_q4_mps {
+                Some((&mut engine.mps_matmul, &engine.dequant_q4_matrix_pipeline))
+            } else {
+                None
+            },
             &buf_normed,
             v_proj,
             seq_len,
@@ -120,6 +136,7 @@ fn fused_gqa_o_proj_gpu_kv(
     params: &AttentionParams,
     mask: GqaMask<'_>,
     o_proj: &crate::metal::linear::GpuLinearWeight,
+    use_q4_mps: bool,
 ) -> Result<(), Error> {
     let telemetry = engine.batch_telemetry();
     let mut batch = begin_engine_batch(
@@ -128,6 +145,11 @@ fn fused_gqa_o_proj_gpu_kv(
         &engine.ctx.device,
         telemetry,
     )?;
+    let q4_mps = if use_q4_mps {
+        Some((&mut engine.mps_matmul, &engine.dequant_q4_matrix_pipeline))
+    } else {
+        None
+    };
     let buf_attn = decoder_gqa_gpu_kv_batched_chained(
         &mut batch,
         &engine.attention,
@@ -145,6 +167,7 @@ fn fused_gqa_o_proj_gpu_kv(
         &mut batch,
         &engine.f32_bf16_linear_pipeline,
         &engine.f32_q4_linear_pipeline,
+        q4_mps,
         out,
         &buf_attn,
         o_proj,
@@ -167,6 +190,7 @@ pub fn forward_decoder_attention(
     scratch: &mut AttentionScratch,
     engine: &mut GpuDecoderEngine,
     gpu_kv: Option<&GpuKvCache>,
+    use_q4_mps: bool,
 ) -> Result<(), Error> {
     let hidden_size = cfg.hidden_size;
     let eps = cfg.rms_norm_eps as f32;
@@ -189,6 +213,7 @@ pub fn forward_decoder_attention(
         &mut scratch.q,
         &mut scratch.k,
         &mut scratch.v,
+        use_q4_mps,
     )?;
 
     let rope_kind = rope_kind_for_layer(cfg, layer).ok_or(Error::Format("rope kind"))?;
@@ -260,6 +285,7 @@ pub fn forward_decoder_attention(
             &params,
             gqa_mask,
             &cached.o_proj,
+            use_q4_mps,
         )?;
     } else {
         let telemetry = engine.batch_telemetry();
@@ -269,6 +295,11 @@ pub fn forward_decoder_attention(
         &engine.ctx.device,
         telemetry,
     )?;
+        let q4_mps = if use_q4_mps {
+            Some((&mut engine.mps_matmul, &engine.dequant_q4_matrix_pipeline))
+        } else {
+            None
+        };
         let buf_attn = gqa_batched_chained(
             &mut batch,
             &engine.attention,
@@ -284,6 +315,7 @@ pub fn forward_decoder_attention(
             &mut batch,
             &engine.f32_bf16_linear_pipeline,
             &engine.f32_q4_linear_pipeline,
+            q4_mps,
             out,
             &buf_attn,
             &cached.o_proj,
@@ -308,6 +340,7 @@ fn forward_encoder_kv_attention_gpu(
     engine: &mut GpuDecoderEngine,
     gpu_kv: &GpuKvCache,
     gqa_mask: GqaMask<'_>,
+    use_q4_mps: bool,
 ) -> Result<(), Error> {
     let hidden_size = cfg.hidden_size;
     let eps = cfg.rms_norm_eps as f32;
@@ -329,6 +362,7 @@ fn forward_encoder_kv_attention_gpu(
         &mut scratch.q,
         &mut scratch.k,
         &mut scratch.v,
+        use_q4_mps,
     )?;
 
     let rope_kind = rope_kind_for_layer(cfg, layer).ok_or(Error::Format("rope kind"))?;
@@ -351,6 +385,7 @@ fn forward_encoder_kv_attention_gpu(
         &params,
         gqa_mask,
         &cached.o_proj,
+        use_q4_mps,
     )
 }
 
@@ -366,6 +401,7 @@ pub fn forward_encoder_prefill_attention(
     scratch: &mut AttentionScratch,
     engine: &mut GpuDecoderEngine,
     gpu_kv: &GpuKvCache,
+    use_q4_mps: bool,
 ) -> Result<(), Error> {
     assert_eq!(gpu_kv.kv_len, 0);
     assert_eq!(scratch.total_kv_len, seq_len);
@@ -381,6 +417,7 @@ pub fn forward_encoder_prefill_attention(
         engine,
         gpu_kv,
         GqaMask::CausalSliding,
+        use_q4_mps,
     )
 }
 
@@ -397,6 +434,7 @@ pub fn forward_encoder_extend_attention(
     scratch: &mut AttentionScratch,
     engine: &mut GpuDecoderEngine,
     gpu_kv: &GpuKvCache,
+    use_q4_mps: bool,
 ) -> Result<(), Error> {
     assert_eq!(kv_cache_len + seq_len, scratch.total_kv_len);
     assert_eq!(gpu_kv.kv_len, kv_cache_len);
@@ -415,5 +453,6 @@ pub fn forward_encoder_extend_attention(
             kv_cache_len,
             positions,
         },
+        use_q4_mps,
     )
 }

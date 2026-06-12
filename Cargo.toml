@@ -10,7 +10,7 @@ path = "src/main.rs"
 [features]
 default = ["blas"]
 blas = []
-metal = ["dep:objc2", "dep:objc2-metal", "dep:objc2-foundation", "dep:block2"]
+metal = ["dep:objc2", "dep:objc2-metal", "dep:objc2-foundation", "dep:objc2-metal-performance-shaders", "dep:block2"]
 
 [dependencies]
 memmap2 = "0.9"
@@ -36,4 +36,11 @@ objc2-metal = { version = "0.3", optional = true, default-features = false, feat
 objc2-foundation = { version = "0.3", optional = true, default-features = false, features = [
     "NSString",
     "NSError",
+] }
+objc2-metal-performance-shaders = { version = "0.3", optional = true, default-features = false, features = [
+    "MPSCore",
+    "MPSCoreTypes",
+    "MPSKernel",
+    "MPSMatrix",
+    "MPSMatrixMultiplication",
 ] }

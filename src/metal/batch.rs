@@ -347,6 +347,23 @@ impl<'a> GpuBatch<'a> {
         }
     }
 
+    /// End the compute encoder, run MPS on the command buffer, reopen compute encoding.
+    pub fn pause_compute_for_mps(
+        &mut self,
+        encode: impl FnOnce(&ProtocolObject<dyn MTLCommandBuffer>),
+    ) {
+        if let Some(enc) = self.enc.take() {
+            enc.endEncoding();
+        }
+        if let Some(cmd) = self.cmd.as_ref() {
+            encode(cmd);
+        }
+        if self.cmd.is_some() {
+            let cmd = self.cmd.as_ref().expect("cmd");
+            self.enc = cmd.computeCommandEncoder();
+        }
+    }
+
     pub fn end(mut self) -> Result<(), Error> {
         let readback_bytes: u64 = self.reads.iter().map(|r| r.len as u64 * 4).sum();
         let enc = self.enc.take().expect("batch encoder missing");
