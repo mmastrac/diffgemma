@@ -201,6 +201,39 @@ impl<'a> GpuBatch<'a> {
             .dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
     }
 
+    /// Like [`dispatch_1d`] but splits work when `count` exceeds Metal's 65535 threadgroup grid limit.
+    pub fn dispatch_1d_ranged(
+        &self,
+        pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+        count: usize,
+        mut encode: impl FnMut(&ProtocolObject<dyn MTLComputeCommandEncoder>, u32, u32),
+    ) {
+        const THREADS_PER_TG: usize = 256;
+        const MAX_GROUPS: usize = 65535;
+        const CHUNK: usize = MAX_GROUPS * THREADS_PER_TG;
+        let mut base = 0usize;
+        while base < count {
+            let chunk = (count - base).min(CHUNK);
+            self.encoder().setComputePipelineState(pipeline);
+            encode(self.encoder(), base as u32, chunk as u32);
+            let tg_width = THREADS_PER_TG.min(chunk);
+            let grid_width = div_up(chunk, tg_width);
+            let grid = MTLSize {
+                width: grid_width,
+                height: 1,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: tg_width,
+                height: 1,
+                depth: 1,
+            };
+            self.encoder()
+                .dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+            base += chunk;
+        }
+    }
+
     pub fn dispatch_with_grid(
         &self,
         pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
@@ -500,7 +533,7 @@ impl<'a> GpuBatch<'a> {
     }
 }
 
-fn div_up(value: usize, group: usize) -> usize {
+pub(crate) fn div_up(value: usize, group: usize) -> usize {
     (value + group - 1) / group
 }
 

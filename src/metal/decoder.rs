@@ -355,6 +355,13 @@ fn forward_inner(
         std::mem::swap(&mut in_buf, &mut out_buf);
     }
 
+    // After `n_layers` ping-pong swaps, the last layer output is in `in_buf` when odd.
+    let (norm_in, norm_out) = if n_layers % 2 == 0 {
+        (out_buf, in_buf)
+    } else {
+        (in_buf, out_buf)
+    };
+
     {
         use crate::metal::batched_kernels as bk;
         use crate::metal::batch::begin_engine_batch;
@@ -368,8 +375,8 @@ fn forward_inner(
         bk::rms_norm_rows(
             &mut batch,
             &engine.kernels,
-            out_buf,
-            in_buf,
+            norm_in,
+            norm_out,
             weights.final_norm(),
             seq_len,
             hidden,
@@ -401,6 +408,11 @@ fn forward_inner(
             if let Some(embed_q8) = weights.embed_q8() {
                 use crate::metal::batch::begin_engine_batch;
                 use crate::metal::lm_head::lm_head_tied_q8_gpu_buf;
+                let total = seq_len * vocab;
+                scratch
+                    .sampler
+                    .logits
+                    .ensure(&engine.ctx.device, &mut engine.pool, total)?;
                 let telemetry = engine.batch_telemetry();
                 let mut batch = begin_engine_batch(
                     &engine.ctx.queue,
@@ -413,7 +425,7 @@ fn forward_inner(
                     &engine.f32_q8_linear_pipeline,
                     &engine.sampler_kernels,
                     &engine.kernels,
-                    out_buf,
+                    norm_out,
                     embed_q8,
                     &mut scratch.sampler.logits,
                     seq_len,
@@ -442,7 +454,7 @@ fn forward_inner(
                 lm_head_tied_q8_gpu(
                     &mut batch,
                     &engine.f32_q8_linear_pipeline,
-                    out_buf,
+                    norm_out,
                     embed_q8,
                     seq_len,
                     hidden,
@@ -454,7 +466,7 @@ fn forward_inner(
                 lm_head_tied_from_store(
                     store,
                     out,
-                    out_buf,
+                    norm_out,
                     seq_len,
                     hidden,
                     vocab,
@@ -477,7 +489,7 @@ fn forward_inner(
                 lm_head_tied_q8_gpu(
                     &mut batch,
                     &engine.f32_q8_linear_pipeline,
-                    out_buf,
+                    norm_out,
                     embed_q8,
                     seq_len,
                     hidden,
@@ -489,7 +501,7 @@ fn forward_inner(
                 lm_head_tied_from_store(
                     store,
                     scratch.cpu.logits_buf.as_slice_mut(),
-                    out_buf,
+                    norm_out,
                     seq_len,
                     hidden,
                     vocab,
@@ -505,7 +517,7 @@ fn forward_inner(
 
     let hidden_states = if input.return_hidden {
         let mut hidden_out = vec![0.0f32; seq_len * hidden];
-        hidden_out.copy_from_slice(out_buf);
+        hidden_out.copy_from_slice(norm_out);
         hidden_out
     } else {
         Vec::new()

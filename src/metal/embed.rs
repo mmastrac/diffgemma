@@ -80,12 +80,12 @@ pub fn vec_fill_zero_gpu_buf(
     buf: &ProtocolObject<dyn MTLBuffer>,
     len: usize,
 ) {
-    let len_u = len as u32;
-    batch.dispatch_1d(&kernels.vec_fill_zero.pipeline, len, |enc| {
+    batch.dispatch_1d_ranged(&kernels.vec_fill_zero.pipeline, len, |enc, base, chunk| {
+        let range = [base, chunk];
         unsafe {
             enc.setBuffer_offset_atIndex(Some(buf), 0, 0);
         }
-        crate::metal::batch::set_bytes(enc, &len_u, 1);
+        crate::metal::batch::set_bytes(enc, &range, 1);
     });
 }
 

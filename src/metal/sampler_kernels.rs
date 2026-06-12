@@ -12,6 +12,7 @@ pub struct GpuSamplerKernels {
     pub scatter_vocab_chunk: ComputePipeline,
     pub argmax_rows: ComputePipeline,
     pub row_entropy: ComputePipeline,
+    pub softmax_rows: ComputePipeline,
     pub sample_from_probs_rows: ComputePipeline,
 }
 
@@ -24,6 +25,7 @@ impl GpuSamplerKernels {
             scatter_vocab_chunk: ctx.compile_kernel(SAMPLER_SHADER, "scatter_vocab_chunk")?,
             argmax_rows: ctx.compile_kernel(SAMPLER_SHADER, "argmax_rows")?,
             row_entropy: ctx.compile_kernel(SAMPLER_SHADER, "row_entropy")?,
+            softmax_rows: ctx.compile_kernel(SAMPLER_SHADER, "softmax_rows")?,
             sample_from_probs_rows: ctx.compile_kernel(SAMPLER_SHADER, "sample_from_probs_rows")?,
         })
     }

@@ -1,46 +1,55 @@
 #include <metal_stdlib>
 using namespace metal;
 
-/// Copy `len` f32 elements device-to-device.
+/// Copy `len` f32 elements device-to-device starting at `base`.
 kernel void copy_f32(
     device const float *src [[buffer(0)]],
     device float *dst [[buffer(1)]],
-    constant uint &len [[buffer(2)]],
+    constant uint2 &range [[buffer(2)]],
     uint gid [[thread_position_in_grid]]
 ) {
+    uint base = range.x;
+    uint len = range.y;
+    uint i = base + gid;
     if (gid >= len) {
         return;
     }
-    dst[gid] = src[gid];
+    dst[i] = src[i];
 }
 
 kernel void logit_softcapping(
     device float *x [[buffer(0)]],
     constant float &cap [[buffer(1)]],
-    constant uint &len [[buffer(2)]],
+    constant uint2 &range [[buffer(2)]],
     uint gid [[thread_position_in_grid]]
 ) {
+    uint base = range.x;
+    uint len = range.y;
+    uint i = base + gid;
     if (gid >= len) {
         return;
     }
     if (cap <= 0.0f) {
         return;
     }
-    float v = x[gid];
-    x[gid] = tanh(v / cap) * cap;
+    float v = x[i];
+    x[i] = tanh(v / cap) * cap;
 }
 
 /// Divide every element by scalar temperature.
 kernel void scale_logits(
     device float *x [[buffer(0)]],
     constant float &inv_t [[buffer(1)]],
-    constant uint &len [[buffer(2)]],
+    constant uint2 &range [[buffer(2)]],
     uint gid [[thread_position_in_grid]]
 ) {
+    uint base = range.x;
+    uint len = range.y;
+    uint i = base + gid;
     if (gid >= len) {
         return;
     }
-    x[gid] *= inv_t;
+    x[i] *= inv_t;
 }
 
 /// Scatter `[seq, chunk]` GEMM output into `[seq, vocab]` logits at column offset `v0`.
@@ -67,10 +76,11 @@ kernel void argmax_rows(
     device const float *logits [[buffer(0)]],
     device uint *out [[buffer(1)]],
     constant uint2 &dims [[buffer(2)]],
-    uint row [[threadgroup_position_in_grid]],
+    uint3 tgp [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]]
 ) {
     const uint TG = 256u;
+    uint row = tgp.y;
     uint rows = dims.x;
     uint cols = dims.y;
     if (row >= rows) {
@@ -116,10 +126,11 @@ kernel void row_entropy(
     device const float *logits [[buffer(0)]],
     device float *entropies [[buffer(1)]],
     constant uint2 &dims [[buffer(2)]],
-    uint row [[threadgroup_position_in_grid]],
+    uint3 tgp [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]]
 ) {
     const uint TG = 256u;
+    uint row = tgp.y;
     uint rows = dims.x;
     uint cols = dims.y;
     if (row >= rows) {
@@ -179,17 +190,73 @@ kernel void row_entropy(
     }
 }
 
-/// Categorical sample per row from row-major probabilities `[rows, cols]`.
+/// Stable row softmax in-place (256-wide TG per row; uses `tgp.y` for row index).
+kernel void softmax_rows(
+    device float *x [[buffer(0)]],
+    constant uint2 &dims [[buffer(1)]],
+    uint3 tgp [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]]
+) {
+    const uint TG = 256u;
+    uint row = tgp.y;
+    uint rows = dims.x;
+    uint cols = dims.y;
+    if (row >= rows) {
+        return;
+    }
+
+    device float *r = x + row * cols;
+    threadgroup float scratch[256];
+
+    float local_max = -1e30f;
+    for (uint c = lid; c < cols; c += TG) {
+        local_max = max(local_max, r[c]);
+    }
+    scratch[lid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = TG / 2u; s > 0u; s >>= 1u) {
+        if (lid < s) {
+            scratch[lid] = max(scratch[lid], scratch[lid + s]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float row_max = scratch[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local_sum = 0.0f;
+    for (uint c = lid; c < cols; c += TG) {
+        float e = exp(r[c] - row_max);
+        r[c] = e;
+        local_sum += e;
+    }
+    scratch[lid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = TG / 2u; s > 0u; s >>= 1u) {
+        if (lid < s) {
+            scratch[lid] += scratch[lid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = 1.0f / scratch[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint c = lid; c < cols; c += TG) {
+        r[c] *= inv;
+    }
+}
+
+/// Categorical sample per row (one TG per row; lane 0 inverse-CDF scan).
 kernel void sample_from_probs_rows(
     device const float *probs [[buffer(0)]],
     device const float *rand [[buffer(1)]],
     device uint *out [[buffer(2)]],
     constant uint2 &dims [[buffer(3)]],
-    uint row [[thread_position_in_grid]]
+    uint3 tgp [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]]
 ) {
+    uint row = tgp.y;
     uint rows = dims.x;
     uint cols = dims.y;
-    if (row >= rows) {
+    if (row >= rows || lid != 0u) {
         return;
     }
 

@@ -159,6 +159,45 @@ pub fn accept_canvas(
     (accepted, accepted_mask)
 }
 
+/// Accept lowest-entropy positions using precomputed per-position entropies.
+pub fn accept_canvas_from_entropies(
+    current: &[u32],
+    denoiser: &[u32],
+    entropies: &[f32],
+    canvas_len: usize,
+    entropy_bound: f32,
+) -> (Vec<u32>, Vec<bool>) {
+    assert_eq!(current.len(), canvas_len);
+    assert_eq!(denoiser.len(), canvas_len);
+    assert_eq!(entropies.len(), canvas_len);
+
+    let mut order: Vec<usize> = (0..canvas_len).collect();
+    order.sort_by(|&a, &b| {
+        entropies[a]
+            .partial_cmp(&entropies[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut accepted_mask = vec![false; canvas_len];
+    let mut prefix_sum = 0.0f32;
+    for &idx in &order {
+        if prefix_sum <= entropy_bound {
+            accepted_mask[idx] = true;
+            prefix_sum += entropies[idx];
+        } else {
+            break;
+        }
+    }
+
+    let mut accepted = current.to_vec();
+    for i in 0..canvas_len {
+        if accepted_mask[i] {
+            accepted[i] = denoiser[i];
+        }
+    }
+    (accepted, accepted_mask)
+}
+
 pub fn renoise_canvas(
     accepted: &[u32],
     accepted_mask: &[bool],

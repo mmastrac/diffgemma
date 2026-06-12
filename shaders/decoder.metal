@@ -254,13 +254,16 @@ kernel void gather_prob_cols(
 
 kernel void vec_fill_zero(
     device float *x [[buffer(0)]],
-    constant uint &len [[buffer(1)]],
+    constant uint2 &range [[buffer(1)]],
     uint gid [[thread_position_in_grid]]
 ) {
+    uint base = range.x;
+    uint len = range.y;
+    uint i = base + gid;
     if (gid >= len) {
         return;
     }
-    x[gid] = 0.0f;
+    x[i] = 0.0f;
 }
 
 /// Top-k expert routing per row from softmax probs `[rows, experts]`.

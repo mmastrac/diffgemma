@@ -169,8 +169,8 @@ Once weights are resident and kernels are sane, the per-step serial CPU work bec
 |---|---|
 | GPU router top-8 | ✅ `route_gpu_in_batch` + `router_top_k_rows` (f32 logits, tie-break prob↓ index↑); wired on `.dgq` path; dgq `generate-parity` layers3 ✅ |
 | Merged FF+MoE batch (`.dgq`) | ✅ one batch/layer: dense FF → GPU route (`flush_reads`) → grouped MoE (`flush_reads`) → final combine; skips ~5.6 MB/layer residual+dense readback |
-| GPU sampler (partial) | ✅ lm_head → GPU logits buf (scatter, no per-chunk readback); GPU softcap + temperature; CPU sample/accept/stop for parity; GPU SC from logits buf |
-| GPU sampler (full) | GPU entropy + argmax + categorical sample on device; drop 256 MiB/step logits readback — kernels landed, numerics need parity work |
+| GPU sampler (partial) | ✅ lm_head → GPU logits buf (scatter); GPU softcap + temperature; CPU sample/accept/stop |
+| GPU sampler (full) | ✅ GPU entropy + argmax + categorical sample; ~3 KB/step readback (256×4×3). Fixed odd-layer hidden buf + persistent logits pool alloc. Forward nondeterminism blocks stable goldens |
 | Counter-based RNG | Philox/Threefry keyed (seed, block, step, position); implement identically in CPU oracle; regenerate goldens once |
 | GPU early-stop reduction | avg-entropy scalar + argmax-stable-2-steps flag; CPU reads 2 scalars + committed ids per step |
 | Self-conditioning on GPU | sc probs/logits never leave GPU; feed prev-step distribution path entirely on-device |
