@@ -89,37 +89,114 @@ pub fn soft_embeddings_from_logits(
     for s in 0..seq_len {
         let logit_row = &logits[s * vocab..(s + 1) * vocab];
         let out_row = &mut out[s * hidden..(s + 1) * hidden];
-        out_row.fill(0.0);
-        let max_logit = logit_row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let mut sum = 0.0f32;
-        {
-            let mut probs = prob_scratch.as_fast_slice_mut();
-            for i in 0..vocab {
-                let p = (logit_row[i] - max_logit).exp();
-                unsafe {
-                    probs.write_unchecked(i, p);
+        soft_embed_row_from_table(out_row, logit_row, &table, vocab, hidden, scale, prob_scratch);
+    }
+}
+
+/// Softmax-weighted embedding mix from bf16 or `.dgq` q8 table.
+pub fn soft_embeddings_from_logits_store(
+    store: &WeightStore,
+    out: &mut [f32],
+    logits: &[f32],
+    seq_len: usize,
+    vocab: usize,
+    hidden: usize,
+    scale: f32,
+    prob_scratch: &mut Buffer<f32>,
+) -> Result<(), Error> {
+    assert_eq!(logits.len(), seq_len * vocab);
+    assert_eq!(out.len(), seq_len * hidden);
+    match store {
+        WeightStore::Dgq(dgq) => {
+            let src = dgq.tensor_bytes(EMBED_KEY)?;
+            let row_bytes = q8_row_bytes(hidden);
+            prob_scratch.ensure_len(vocab);
+            let mut row_buf = vec![0.0f32; hidden];
+            for s in 0..seq_len {
+                let logit_row = &logits[s * vocab..(s + 1) * vocab];
+                let out_row = &mut out[s * hidden..(s + 1) * hidden];
+                out_row.fill(0.0);
+                softmax_row_into(logit_row, prob_scratch);
+                let probs = prob_scratch.as_slice();
+                for token in 0..vocab {
+                    let prob = probs[token];
+                    if prob == 0.0 {
+                        continue;
+                    }
+                    dequant_row_q8(
+                        &src[token * row_bytes..(token + 1) * row_bytes],
+                        hidden,
+                        &mut row_buf,
+                    );
+                    for h in 0..hidden {
+                        out_row[h] += prob * row_buf[h] * scale;
+                    }
                 }
-                sum += p;
             }
-            let inv = 1.0 / sum;
-            for i in 0..vocab {
-                unsafe {
-                    let p = probs.read_unchecked(i) * inv;
-                    probs.write_unchecked(i, p);
-                }
+            Ok(())
+        }
+        _ => {
+            let embed = store.tensor(EMBED_KEY)?;
+            soft_embeddings_from_logits(
+                out,
+                logits,
+                embed.bf16()?,
+                seq_len,
+                vocab,
+                hidden,
+                scale,
+                prob_scratch,
+            );
+            Ok(())
+        }
+    }
+}
+
+fn softmax_row_into(logit_row: &[f32], prob_scratch: &mut Buffer<f32>) {
+    let vocab = logit_row.len();
+    prob_scratch.ensure_len(vocab);
+    let max_logit = logit_row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    {
+        let mut probs = prob_scratch.as_fast_slice_mut();
+        for i in 0..vocab {
+            let p = (logit_row[i] - max_logit).exp();
+            unsafe {
+                probs.write_unchecked(i, p);
+            }
+            sum += p;
+        }
+        let inv = 1.0 / sum;
+        for i in 0..vocab {
+            unsafe {
+                let p = probs.read_unchecked(i) * inv;
+                probs.write_unchecked(i, p);
             }
         }
-        let probs = prob_scratch.as_fast_slice();
-        for token in 0..vocab {
-            let prob = unsafe { probs.read_unchecked(token) };
-            if prob == 0.0 {
-                continue;
-            }
-            let row_off = token * hidden;
-            for h in 0..hidden {
-                unsafe {
-                    out_row[h] += prob * table.to_f32_unchecked(row_off + h) * scale;
-                }
+    }
+}
+
+fn soft_embed_row_from_table(
+    out_row: &mut [f32],
+    logit_row: &[f32],
+    table: &FastBf16Slice<'_>,
+    vocab: usize,
+    hidden: usize,
+    scale: f32,
+    prob_scratch: &mut Buffer<f32>,
+) {
+    out_row.fill(0.0);
+    softmax_row_into(logit_row, prob_scratch);
+    let probs = prob_scratch.as_fast_slice();
+    for token in 0..vocab {
+        let prob = unsafe { probs.read_unchecked(token) };
+        if prob == 0.0 {
+            continue;
+        }
+        let row_off = token * hidden;
+        for h in 0..hidden {
+            unsafe {
+                out_row[h] += prob * table.to_f32_unchecked(row_off + h) * scale;
             }
         }
     }

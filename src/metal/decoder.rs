@@ -4,7 +4,7 @@ use crate::metal::engine::GpuDecoderEngine;
 use crate::model::decoder::{DecoderForwardInput, DecoderForwardOutput, DecoderScratch};
 use crate::model::embed::{embed_tokens_from_store, lm_head_tied_from_store, logit_softcapping};
 use crate::model::kv_cache::LayerKvView;
-use crate::model::self_conditioning::{apply as apply_self_conditioning, SelfConditioningWeights};
+use crate::model::self_conditioning::apply_from_store;
 use crate::safetensors::Error;
 use crate::metal::weights::GpuDecoderWeightCache;
 use crate::metal::kv_cache::GpuKvCache;
@@ -207,27 +207,39 @@ fn forward_inner(
 
     let eps = text.rms_norm_eps as f32;
     if let Some(logits) = input.self_conditioning_logits {
-        let sc_weights = SelfConditioningWeights::load(store, text)?;
-        let embed = store.tensor("model.decoder.embed_tokens.weight")?;
-        crate::model::embed::soft_embeddings_from_logits(
+        crate::model::embed::soft_embeddings_from_logits_store(
+            store,
             &mut scratch.cpu.sc_signal,
             logits,
-            embed.bf16()?,
             seq_len,
             vocab,
             hidden,
             embed_scale,
             &mut scratch.cpu.sc_probs,
-        );
-        apply_self_conditioning(
-            &mut scratch.cpu.hidden_a,
-            &scratch.cpu.embed_buf,
-            &scratch.cpu.sc_signal,
-            &sc_weights,
-            text,
-            seq_len,
-            &mut scratch.cpu.self_cond,
         )?;
+        if let Some(sc) = weights.self_conditioning() {
+            crate::metal::self_conditioning::apply_gpu(
+                engine,
+                sc,
+                &mut scratch.cpu.hidden_a,
+                &scratch.cpu.embed_buf,
+                &scratch.cpu.sc_signal,
+                seq_len,
+                hidden,
+                text.intermediate_size,
+                eps,
+            )?;
+        } else {
+            apply_from_store(
+                &mut scratch.cpu.hidden_a,
+                &scratch.cpu.embed_buf,
+                &scratch.cpu.sc_signal,
+                store,
+                text,
+                seq_len,
+                &mut scratch.cpu.self_cond,
+            )?;
+        }
     } else {
         scratch.cpu.hidden_a.copy_from_slice(&scratch.cpu.embed_buf);
         scratch

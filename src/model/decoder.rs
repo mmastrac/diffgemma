@@ -2,11 +2,11 @@ use crate::buffer::Buffer;
 use crate::config::ModelConfig;
 use crate::kernels::cpu::rms_norm_rows;
 use crate::model::decoder_layer::{forward_decoder as layer_forward, DecoderLayerScratch};
-use crate::model::embed::{embed_tokens, lm_head_tied_bf16, logit_softcapping};
+use crate::model::embed::{embed_tokens_from_store, lm_head_tied_from_store, logit_softcapping};
 use crate::model::kv_cache::{KvCache, LayerKvView};
 use crate::model::layer_weights::DecoderLayerWeights;
 use crate::model::mask::DecoderAttnMask;
-use crate::model::self_conditioning::{apply as apply_self_conditioning, SelfConditioningScratch, SelfConditioningWeights};
+use crate::model::self_conditioning::{apply_from_store, SelfConditioningScratch};
 use crate::safetensors::Error;
 use crate::weights::WeightStore;
 
@@ -85,39 +85,34 @@ pub fn forward(
     let vocab = text.vocab_size;
     let embed_scale = (hidden as f32).sqrt();
 
-    let embed = store.tensor("model.decoder.embed_tokens.weight")?;
-    embed.expect_shape(&[vocab as i64, hidden as i64])?;
-    let embed_bf16 = embed.bf16()?;
-
-    embed_tokens(
+    embed_tokens_from_store(
+        store,
         &mut scratch.embed_buf,
         input.token_ids,
-        embed_bf16,
         hidden,
         embed_scale,
     )?;
 
-    let sc_weights = SelfConditioningWeights::load(store, text)?;
     match input.self_conditioning_logits {
         Some(logits) => {
-            crate::model::embed::soft_embeddings_from_logits(
+            crate::model::embed::soft_embeddings_from_logits_store(
+                store,
                 &mut scratch.sc_signal,
                 logits,
-                embed_bf16,
                 seq_len,
                 vocab,
                 hidden,
                 embed_scale,
                 &mut scratch.sc_probs,
-            );
+            )?;
         }
         None => scratch.sc_signal.fill(0.0),
     }
-    apply_self_conditioning(
+    apply_from_store(
         &mut scratch.hidden_a,
         &scratch.embed_buf,
         &scratch.sc_signal,
-        &sc_weights,
+        store,
         text,
         seq_len,
         &mut scratch.self_cond,
@@ -172,10 +167,10 @@ pub fn forward(
             if out.len() != need {
                 return Err(Error::Format("logits_out length mismatch"));
             }
-            lm_head_tied_bf16(
+            lm_head_tied_from_store(
+                store,
                 out,
                 out_buf,
-                embed,
                 seq_len,
                 hidden,
                 vocab,
@@ -184,10 +179,10 @@ pub fn forward(
             logit_softcapping(out, text.final_logit_softcapping as f32);
         } else {
             scratch.logits_buf.ensure_len(seq_len * vocab);
-            lm_head_tied_bf16(
+            lm_head_tied_from_store(
+                store,
                 scratch.logits_buf.as_slice_mut(),
                 out_buf,
-                embed,
                 seq_len,
                 hidden,
                 vocab,

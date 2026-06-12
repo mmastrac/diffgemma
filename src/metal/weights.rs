@@ -8,6 +8,7 @@ use crate::metal::dgq_gpu::{
     load_q4_expert_stack, load_q4_linear, load_q8_linear, load_raw_view, DgqGpuBlob,
     Q4ExpertStackGpu, Q8LinearGpu,
 };
+use crate::metal::self_conditioning::GpuSelfConditioningWeights;
 use crate::metal::expert_cache::{ExpertCacheStats, ExpertWeightCache};
 use crate::metal::linear::GpuLinearWeight;
 use crate::model::layer_weights::DecoderLayerWeights;
@@ -20,6 +21,27 @@ use std::cell::RefCell;
 use std::sync::Arc;
 
 const NO_LAYER: usize = usize::MAX;
+
+const SC_PRE_NORM: &str = "model.decoder.self_conditioning.pre_norm.weight";
+const SC_GATE: &str = "model.decoder.self_conditioning.gate_proj.weight";
+const SC_UP: &str = "model.decoder.self_conditioning.up_proj.weight";
+const SC_DOWN: &str = "model.decoder.self_conditioning.down_proj.weight";
+
+fn load_self_conditioning_dgq(
+    dgq: &DgqStore,
+    blob: Arc<DgqGpuBlob>,
+) -> Result<GpuSelfConditioningWeights, Error> {
+    Ok(GpuSelfConditioningWeights {
+        pre_norm: raw_blob_bf16_to_f32(&load_raw_view(
+            dgq,
+            Arc::clone(&blob),
+            SC_PRE_NORM,
+        )?)?,
+        gate_proj: load_q8_linear(dgq, Arc::clone(&blob), SC_GATE)?,
+        up_proj: load_q8_linear(dgq, Arc::clone(&blob), SC_UP)?,
+        down_proj: load_q8_linear(dgq, blob, SC_DOWN)?,
+    })
+}
 
 fn bf16_tensor_to_f32_buffer(slice: Bf16Slice<'_>) -> Buffer<f32> {
     let mut out = Buffer::new(slice.len());
@@ -310,6 +332,7 @@ struct DgqResident {
     blob: Arc<DgqGpuBlob>,
     final_norm: Buffer<f32>,
     embed_q8: Option<Q8LinearGpu>,
+    self_conditioning: GpuSelfConditioningWeights,
     layers: Vec<GpuLayerWeightCache>,
 }
 
@@ -350,10 +373,12 @@ impl GpuDecoderWeightCache {
                     "model.decoder.embed_tokens.weight",
                 )
                 .ok();
+                let self_conditioning = load_self_conditioning_dgq(dgq, Arc::clone(&blob))?;
                 Ok(Self::Dgq(DgqResident {
                     blob,
                     final_norm,
                     embed_q8,
+                    self_conditioning,
                     layers,
                 }))
             }
@@ -386,6 +411,13 @@ impl GpuDecoderWeightCache {
     pub fn embed_q8(&self) -> Option<&Q8LinearGpu> {
         match self {
             Self::Dgq(d) => d.embed_q8.as_ref(),
+            Self::Bf16(_) => None,
+        }
+    }
+
+    pub fn self_conditioning(&self) -> Option<&GpuSelfConditioningWeights> {
+        match self {
+            Self::Dgq(d) => Some(&d.self_conditioning),
             Self::Bf16(_) => None,
         }
     }

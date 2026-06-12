@@ -4,6 +4,11 @@ use crate::safetensors::Error;
 use crate::tensor::TensorView;
 use crate::weights::WeightStore;
 
+const SC_PRE_NORM: &str = "model.decoder.self_conditioning.pre_norm.weight";
+const SC_GATE: &str = "model.decoder.self_conditioning.gate_proj.weight";
+const SC_UP: &str = "model.decoder.self_conditioning.up_proj.weight";
+const SC_DOWN: &str = "model.decoder.self_conditioning.down_proj.weight";
+
 pub struct SelfConditioningWeights<'a> {
     pub pre_norm: TensorView<'a>,
     pub gate_proj: TensorView<'a>,
@@ -15,13 +20,13 @@ impl<'a> SelfConditioningWeights<'a> {
     pub fn load(store: &'a WeightStore, cfg: &TextConfig) -> Result<Self, Error> {
         let hidden = cfg.hidden_size as i64;
         let inter = cfg.intermediate_size as i64;
-        let pre_norm = store.tensor("model.decoder.self_conditioning.pre_norm.weight")?;
+        let pre_norm = store.tensor(SC_PRE_NORM)?;
         pre_norm.expect_shape(&[hidden])?;
-        let gate_proj = store.tensor("model.decoder.self_conditioning.gate_proj.weight")?;
+        let gate_proj = store.tensor(SC_GATE)?;
         gate_proj.expect_shape(&[inter, hidden])?;
-        let up_proj = store.tensor("model.decoder.self_conditioning.up_proj.weight")?;
+        let up_proj = store.tensor(SC_UP)?;
         up_proj.expect_shape(&[inter, hidden])?;
-        let down_proj = store.tensor("model.decoder.self_conditioning.down_proj.weight")?;
+        let down_proj = store.tensor(SC_DOWN)?;
         down_proj.expect_shape(&[hidden, inter])?;
         Ok(Self {
             pre_norm,
@@ -66,6 +71,29 @@ impl SelfConditioningScratch {
         self.down_w = weights.down_proj.bf16()?.to_f32_vec();
         Ok(())
     }
+
+    fn ensure_loaded_from_store(
+        &mut self,
+        store: &WeightStore,
+        cfg: &TextConfig,
+    ) -> Result<(), Error> {
+        if !self.gate_w.is_empty() {
+            return Ok(());
+        }
+        match store {
+            WeightStore::Dgq(dgq) => {
+                self.pre_norm_w = dgq.tensor_f32(SC_PRE_NORM)?;
+                self.gate_w = dgq.tensor_f32(SC_GATE)?;
+                self.up_w = dgq.tensor_f32(SC_UP)?;
+                self.down_w = dgq.tensor_f32(SC_DOWN)?;
+            }
+            _ => {
+                let weights = SelfConditioningWeights::load(store, cfg)?;
+                self.load_weights(&weights)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// `inputs_embeds += MLP(pre_norm(soft_signal))`, then RMSNorm without scale on the sum.
@@ -78,6 +106,32 @@ pub fn apply(
     seq_len: usize,
     scratch: &mut SelfConditioningScratch,
 ) -> Result<(), Error> {
+    scratch.load_weights(weights)?;
+    apply_loaded(out, inputs_embeds, soft_signal, cfg, seq_len, scratch)
+}
+
+/// Same as `apply`, but loads bf16 or `.dgq` weights into `scratch` once.
+pub fn apply_from_store(
+    out: &mut [f32],
+    inputs_embeds: &[f32],
+    soft_signal: &[f32],
+    store: &WeightStore,
+    cfg: &TextConfig,
+    seq_len: usize,
+    scratch: &mut SelfConditioningScratch,
+) -> Result<(), Error> {
+    scratch.ensure_loaded_from_store(store, cfg)?;
+    apply_loaded(out, inputs_embeds, soft_signal, cfg, seq_len, scratch)
+}
+
+fn apply_loaded(
+    out: &mut [f32],
+    inputs_embeds: &[f32],
+    soft_signal: &[f32],
+    cfg: &TextConfig,
+    seq_len: usize,
+    scratch: &mut SelfConditioningScratch,
+) -> Result<(), Error> {
     let hidden = cfg.hidden_size;
     let inter = cfg.intermediate_size;
     let eps = cfg.rms_norm_eps as f32;
@@ -86,7 +140,6 @@ pub fn apply(
     assert_eq!(soft_signal.len(), seq_len * hidden);
     assert_eq!(out.len(), seq_len * hidden);
 
-    scratch.load_weights(weights)?;
     rms_norm_rows(
         &mut scratch.normed,
         soft_signal,
