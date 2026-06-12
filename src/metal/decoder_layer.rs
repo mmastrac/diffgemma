@@ -149,26 +149,25 @@ fn forward_layer_ff(
 
     scratch.residual.copy_from_slice(hidden_states);
 
-    rms_norm_batch(
-        engine,
-        &mut scratch.normed,
-        &scratch.attn_out,
-        cached.post_attn_norm.as_slice(),
-        seq_len,
-        hidden,
-        eps,
-    )?;
-    for i in 0..scratch.normed.len() {
-        scratch.normed[i] += scratch.residual[i];
-    }
-    scratch.residual.copy_from_slice(&scratch.normed);
-
     {
         let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
-        let buf_normed = bk::rms_norm_rows_gpu(
+        let len = seq_len * hidden;
+        let buf_res = batch.alloc_f32(&scratch.residual)?;
+        let buf_attn = batch.alloc_f32(&scratch.attn_out)?;
+        let buf_stream = bk::rms_norm_rows_gpu_buf(
             &mut batch,
             &engine.kernels,
-            &scratch.residual,
+            &buf_attn,
+            cached.post_attn_norm.as_slice(),
+            seq_len,
+            hidden,
+            eps,
+        )?;
+        bk::vec_add_gpu_bufs(&mut batch, &engine.kernels, &buf_stream, &buf_res, len)?;
+        let buf_normed = bk::rms_norm_rows_gpu_buf(
+            &mut batch,
+            &engine.kernels,
+            &buf_stream,
             cached.pre_ff_norm.as_slice(),
             seq_len,
             hidden,
@@ -207,6 +206,7 @@ fn forward_layer_ff(
             hidden,
             eps,
         )?;
+        batch.register_read(buf_stream, &mut scratch.residual);
         batch.register_read(buf_ff, &mut scratch.normed);
         batch.end()?;
     }
@@ -250,32 +250,34 @@ fn forward_layer_ff(
         &engine.f32_bf16_gemm_pipeline,
     )?;
 
-    scratch.dense_out.copy_from_slice(&scratch.moe_branch);
-    rms_norm_batch(
-        engine,
-        &mut scratch.moe_branch,
-        &scratch.dense_out,
-        cached.post_ff_norm_2.as_slice(),
-        seq_len,
-        hidden,
-        eps,
-    )?;
-
-    for i in 0..scratch.normed.len() {
-        scratch.normed[i] += scratch.moe_branch[i];
-    }
-
-    rms_norm_batch(
-        engine,
-        out,
-        &scratch.normed,
-        cached.post_ff_norm.as_slice(),
-        seq_len,
-        hidden,
-        eps,
-    )?;
-    for i in 0..out.len() {
-        out[i] += scratch.residual[i];
+    {
+        let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut engine.pool, &engine.ctx.device)?;
+        let len = seq_len * hidden;
+        let buf_moe = batch.alloc_f32(&scratch.moe_branch)?;
+        let buf_moe_n = bk::rms_norm_rows_gpu_buf(
+            &mut batch,
+            &engine.kernels,
+            &buf_moe,
+            cached.post_ff_norm_2.as_slice(),
+            seq_len,
+            hidden,
+            eps,
+        )?;
+        let buf_sum = batch.alloc_f32(&scratch.normed)?;
+        bk::vec_add_gpu_bufs(&mut batch, &engine.kernels, &buf_sum, &buf_moe_n, len)?;
+        let buf_out = bk::rms_norm_rows_gpu_buf(
+            &mut batch,
+            &engine.kernels,
+            &buf_sum,
+            cached.post_ff_norm.as_slice(),
+            seq_len,
+            hidden,
+            eps,
+        )?;
+        let buf_res = batch.alloc_f32(&scratch.residual)?;
+        bk::vec_add_gpu_bufs(&mut batch, &engine.kernels, &buf_out, &buf_res, len)?;
+        batch.register_read(buf_out, out);
+        batch.end()?;
     }
     for v in out.iter_mut() {
         *v *= cached.layer_scalar;

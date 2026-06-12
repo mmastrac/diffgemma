@@ -212,6 +212,25 @@ pub fn f32_bf16_gemm_gpu_in_out(
     Ok(buf_c)
 }
 
+/// `out_buf += addend_buf` on GPU (in-place on `out_buf`).
+pub fn vec_add_gpu_bufs(
+    batch: &mut GpuBatch<'_>,
+    kernels: &GpuKernels,
+    out_buf: &ProtocolObject<dyn MTLBuffer>,
+    addend_buf: &ProtocolObject<dyn MTLBuffer>,
+    len: usize,
+) -> Result<(), Error> {
+    let len_u = len as u32;
+    batch.dispatch_1d(&kernels.vec_add.pipeline, len, |enc| {
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(out_buf), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(addend_buf), 0, 1);
+        }
+        set_bytes(enc, &len_u, 2);
+    });
+    Ok(())
+}
+
 pub fn vec_add_inplace(
     batch: &mut GpuBatch<'_>,
     kernels: &GpuKernels,
