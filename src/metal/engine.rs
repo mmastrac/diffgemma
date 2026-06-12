@@ -3,6 +3,7 @@ use crate::metal::buffer::BufferPool;
 use crate::metal::device::{ComputePipeline, MetalContext};
 use crate::metal::kernels::GpuKernels;
 use crate::metal::mps_gemm::MpsMatmulCache;
+use crate::metal::sampler_kernels::GpuSamplerKernels;
 use crate::metal::telemetry::ForwardTelemetry;
 use crate::safetensors::Error;
 use std::cell::Cell;
@@ -34,6 +35,7 @@ pub struct GpuDecoderEngine {
     pub mps_matmul: MpsMatmulCache,
     pub kernels: GpuKernels,
     pub attention: GpuAttentionKernels,
+    pub sampler_kernels: GpuSamplerKernels,
     telemetry: Rc<RefCell<ForwardTelemetry>>,
     telemetry_enabled: Cell<bool>,
 }
@@ -54,6 +56,7 @@ impl GpuDecoderEngine {
         let mps_matmul = MpsMatmulCache::new(ctx.device.clone());
         let kernels = GpuKernels::new(&ctx)?;
         let attention = GpuAttentionKernels::new(&ctx)?;
+        let sampler_kernels = GpuSamplerKernels::new(&ctx)?;
         Ok(Self {
             ctx,
             pool,
@@ -67,6 +70,7 @@ impl GpuDecoderEngine {
             mps_matmul,
             kernels,
             attention,
+            sampler_kernels,
             telemetry: Rc::new(RefCell::new(ForwardTelemetry::default())),
             telemetry_enabled: Cell::new(false),
         })

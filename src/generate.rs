@@ -250,63 +250,171 @@ fn generate_inner(
         let mut sc_logits = vec![0.0f32; canvas_len * vocab];
 
         let denoise_started = std::time::Instant::now();
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if let DecoderBackend::Gpu { scratch, .. } = decoder {
+            scratch.have_gpu_sc_logits = false;
+        }
         for cur_step in (1..=gen_cfg.sampler.max_denoising_steps).rev() {
             if finished {
                 break;
             }
 
-            let mut decoder_input = DecoderForwardInput {
-                token_ids: &current_canvas,
-                kv_cache: &kv_cache,
-                self_conditioning_logits: if have_sc_logits {
-                    Some(sc_logits.as_slice())
-                } else {
-                    None
-                },
-                mask: Some(&mask),
-                logits_out: Some(&mut processed_logits),
-                compute_logits: true,
-                return_hidden: false,
-            };
             #[cfg(all(feature = "metal", target_os = "macos"))]
-            if let DecoderBackend::Gpu { engine, .. } = decoder {
-                engine.reset_forward_telemetry();
-            }
+            let gpu_sampler = matches!(
+                decoder,
+                DecoderBackend::Gpu { scratch, .. } if scratch.use_gpu_sampler
+            );
+
+            #[cfg(not(all(feature = "metal", target_os = "macos")))]
+            let gpu_sampler = false;
+
             let decoder_started = std::time::Instant::now();
-            decoder_forward(decoder, &mut decoder_input, gen_cfg.max_layers)?;
-            let decoder_ms = decoder_started.elapsed().as_secs_f64() * 1000.0;
             #[cfg(all(feature = "metal", target_os = "macos"))]
-            let forward_telemetry = match decoder {
-                DecoderBackend::Gpu { engine, .. } => engine.take_forward_telemetry(),
-                _ => crate::metal::ForwardTelemetry::default(),
+            let (step_finished, step_argmax, forward_telemetry, sampler_ms) = if gpu_sampler {
+                let mut decoder_input = DecoderForwardInput {
+                    token_ids: &current_canvas,
+                    kv_cache: &kv_cache,
+                    self_conditioning_logits: None,
+                    mask: Some(&mask),
+                    logits_out: None,
+                    compute_logits: true,
+                    return_hidden: false,
+                };
+                if let DecoderBackend::Gpu { engine, .. } = decoder {
+                    engine.reset_forward_telemetry();
+                }
+                decoder_forward(decoder, &mut decoder_input, gen_cfg.max_layers)?;
+                let forward_telemetry = if let DecoderBackend::Gpu { engine, .. } = decoder {
+                    engine.take_forward_telemetry()
+                } else {
+                    crate::metal::ForwardTelemetry::default()
+                };
+                let sampler_started = std::time::Instant::now();
+                let step = if let DecoderBackend::Gpu { scratch, engine, .. } = decoder {
+                    crate::metal::sampler_step_gpu(
+                        engine,
+                        &mut scratch.sampler,
+                        &mut current_canvas,
+                        cur_step,
+                        canvas_len,
+                        vocab,
+                        text.final_logit_softcapping as f32,
+                        &gen_cfg.sampler,
+                        &mut stopper,
+                        &mut rng,
+                    )?
+                } else {
+                    return Err(Error::Format("gpu sampler backend mismatch"));
+                };
+                if let DecoderBackend::Gpu { scratch, engine, .. } = decoder {
+                    if engine.telemetry_enabled() {
+                        engine
+                            .telemetry_handle()
+                            .borrow_mut()
+                            .lm_head_logits_bytes += step.readback_bytes;
+                    }
+                    scratch.have_gpu_sc_logits = true;
+                }
+                let sampler_ms = sampler_started.elapsed().as_secs_f64() * 1000.0;
+                (step.finished, step.argmax, forward_telemetry, sampler_ms)
+            } else {
+                let mut decoder_input = DecoderForwardInput {
+                    token_ids: &current_canvas,
+                    kv_cache: &kv_cache,
+                    self_conditioning_logits: if have_sc_logits {
+                        Some(sc_logits.as_slice())
+                    } else {
+                        None
+                    },
+                    mask: Some(&mask),
+                    logits_out: Some(&mut processed_logits),
+                    compute_logits: true,
+                    return_hidden: false,
+                };
+                if let DecoderBackend::Gpu { engine, .. } = decoder {
+                    engine.reset_forward_telemetry();
+                }
+                decoder_forward(decoder, &mut decoder_input, gen_cfg.max_layers)?;
+                let forward_telemetry = match decoder {
+                    DecoderBackend::Gpu { engine, .. } => engine.take_forward_telemetry(),
+                    _ => crate::metal::ForwardTelemetry::default(),
+                };
+                let sampler_started = std::time::Instant::now();
+                apply_temperature(&mut processed_logits, cur_step, &gen_cfg.sampler);
+                sample_logits.copy_from_slice(&processed_logits);
+                let denoiser_canvas =
+                    sample_canvas(&mut sample_logits, canvas_len, vocab, &mut rng);
+                let new_argmax = argmax_canvas(&processed_logits, canvas_len, vocab);
+                let (accepted, accepted_mask) = accept_canvas(
+                    &current_canvas,
+                    &denoiser_canvas,
+                    &processed_logits,
+                    canvas_len,
+                    vocab,
+                    gen_cfg.sampler.entropy_bound,
+                );
+                current_canvas = renoise_canvas(&accepted, &accepted_mask, vocab, &mut rng);
+                let step_finished = stopper.should_stop(
+                    &new_argmax,
+                    &processed_logits,
+                    canvas_len,
+                    vocab,
+                );
+                sc_logits.copy_from_slice(&processed_logits);
+                have_sc_logits = true;
+                let sampler_ms = sampler_started.elapsed().as_secs_f64() * 1000.0;
+                (step_finished, new_argmax, forward_telemetry, sampler_ms)
             };
 
-            let sampler_started = std::time::Instant::now();
-            apply_temperature(&mut processed_logits, cur_step, &gen_cfg.sampler);
+            #[cfg(not(all(feature = "metal", target_os = "macos")))]
+            let (step_finished, step_argmax, forward_telemetry, sampler_ms) = {
+                let mut decoder_input = DecoderForwardInput {
+                    token_ids: &current_canvas,
+                    kv_cache: &kv_cache,
+                    self_conditioning_logits: if have_sc_logits {
+                        Some(sc_logits.as_slice())
+                    } else {
+                        None
+                    },
+                    mask: Some(&mask),
+                    logits_out: Some(&mut processed_logits),
+                    compute_logits: true,
+                    return_hidden: false,
+                };
+                let decoder_started = std::time::Instant::now();
+                decoder_forward(decoder, &mut decoder_input, gen_cfg.max_layers)?;
+                let _decoder_ms = decoder_started.elapsed().as_secs_f64() * 1000.0;
+                let forward_telemetry = crate::metal::ForwardTelemetry::default();
+                let sampler_started = std::time::Instant::now();
+                apply_temperature(&mut processed_logits, cur_step, &gen_cfg.sampler);
+                sample_logits.copy_from_slice(&processed_logits);
+                let denoiser_canvas =
+                    sample_canvas(&mut sample_logits, canvas_len, vocab, &mut rng);
+                let new_argmax = argmax_canvas(&processed_logits, canvas_len, vocab);
+                let (accepted, accepted_mask) = accept_canvas(
+                    &current_canvas,
+                    &denoiser_canvas,
+                    &processed_logits,
+                    canvas_len,
+                    vocab,
+                    gen_cfg.sampler.entropy_bound,
+                );
+                current_canvas = renoise_canvas(&accepted, &accepted_mask, vocab, &mut rng);
+                let step_finished = stopper.should_stop(
+                    &new_argmax,
+                    &processed_logits,
+                    canvas_len,
+                    vocab,
+                );
+                sc_logits.copy_from_slice(&processed_logits);
+                have_sc_logits = true;
+                let sampler_ms = sampler_started.elapsed().as_secs_f64() * 1000.0;
+                (step_finished, new_argmax, forward_telemetry, sampler_ms)
+            };
 
-            sample_logits.copy_from_slice(&processed_logits);
-            let denoiser_canvas =
-                sample_canvas(&mut sample_logits, canvas_len, vocab, &mut rng);
-            let new_argmax = argmax_canvas(&processed_logits, canvas_len, vocab);
-
-            let (accepted, accepted_mask) = accept_canvas(
-                &current_canvas,
-                &denoiser_canvas,
-                &processed_logits,
-                canvas_len,
-                vocab,
-                gen_cfg.sampler.entropy_bound,
-            );
-            current_canvas = renoise_canvas(&accepted, &accepted_mask, vocab, &mut rng);
-            argmax_canvas_tokens = new_argmax;
-
-            finished = stopper.should_stop(
-                &argmax_canvas_tokens,
-                &processed_logits,
-                canvas_len,
-                vocab,
-            );
-            let sampler_ms = sampler_started.elapsed().as_secs_f64() * 1000.0;
+            finished = step_finished;
+            argmax_canvas_tokens = step_argmax;
+            let decoder_ms = decoder_started.elapsed().as_secs_f64() * 1000.0;
             #[cfg(all(feature = "metal", target_os = "macos"))]
             if matches!(decoder, DecoderBackend::Gpu { .. }) {
                 session_telemetry.steps.push(crate::metal::StepPhaseTelemetry {
@@ -315,8 +423,6 @@ fn generate_inner(
                     forward: forward_telemetry,
                 });
             }
-            sc_logits.copy_from_slice(&processed_logits);
-            have_sc_logits = true;
             denoise_steps_run += 1;
         }
         denoise_elapsed += denoise_started.elapsed();
@@ -377,6 +483,7 @@ pub fn generate_gpu(
     weights: &mut crate::metal::GpuDecoderWeightCache,
     engine: &mut crate::metal::GpuDecoderEngine,
 ) -> Result<GenerateOutput, Error> {
+    dec_scratch.use_gpu_sampler = weights.is_dgq();
     let mut decoder = DecoderBackend::Gpu {
         store,
         cfg,

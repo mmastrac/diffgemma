@@ -167,3 +167,63 @@ pub fn soft_embeddings_q8_gpu(
     batch.register_read(buf_out, out);
     batch.end()
 }
+
+/// Soft embeddings from logits already on GPU (temperature-scaled path for self-conditioning).
+pub fn soft_embeddings_q8_gpu_from_buf(
+    engine: &mut GpuDecoderEngine,
+    logits_buf: &ProtocolObject<dyn MTLBuffer>,
+    embed: &Q8LinearGpu,
+    seq_len: usize,
+    vocab: usize,
+    hidden: usize,
+    scale: f32,
+    out: &mut [f32],
+) -> Result<(), Error> {
+    assert_eq!(out.len(), seq_len * hidden);
+    assert_eq!(embed.in_dim, hidden);
+    assert_eq!(embed.out_dim, vocab);
+
+    let out_len = seq_len * hidden;
+    let telemetry = engine.batch_telemetry();
+    let mut batch = begin_engine_batch(
+        &engine.ctx.queue,
+        &mut engine.pool,
+        &engine.ctx.device,
+        telemetry,
+    )?;
+    softmax_rows_gpu_buf(&mut batch, &engine.kernels, logits_buf, seq_len, vocab);
+
+    let buf_out = batch.alloc_f32_out(out_len)?;
+    vec_fill_zero_gpu_buf(&mut batch, &engine.kernels, &buf_out, out_len);
+
+    for v0 in (0..vocab).step_by(LM_HEAD_CHUNK) {
+        let v1 = (v0 + LM_HEAD_CHUNK).min(vocab);
+        let chunk = v1 - v0;
+        let buf_probs = gather_prob_cols_gpu_buf(
+            &mut batch,
+            &engine.kernels,
+            logits_buf,
+            seq_len,
+            vocab,
+            v0,
+            chunk,
+        )?;
+        let w_chunk = embed.row_slice(v0, chunk);
+        let buf_partial = f32_q8_linear_gpu_bufs(
+            &mut batch,
+            &engine.f32_q8_linear_pipeline,
+            &buf_probs,
+            &w_chunk,
+            seq_len,
+            chunk,
+            hidden,
+        )?;
+        bk::vec_add_gpu_bufs(&mut batch, &engine.kernels, &buf_out, &buf_partial, out_len)?;
+    }
+
+    if scale != 1.0 {
+        vec_scale_gpu_buf(&mut batch, &engine.kernels, &buf_out, out_len, scale);
+    }
+    batch.register_read(buf_out, out);
+    batch.end()
+}

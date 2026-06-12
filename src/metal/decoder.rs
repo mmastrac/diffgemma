@@ -91,6 +91,10 @@ impl LayerScratchReuse {
 pub struct GpuDecoderScratch {
     pub cpu: DecoderScratch,
     pub gpu_kv: Option<GpuKvCache>,
+    pub sampler: crate::metal::sampler::GpuSamplerScratch,
+    /// When true, lm_head + denoise sampler keep logits on GPU (`.dgq` path).
+    pub use_gpu_sampler: bool,
+    pub have_gpu_sc_logits: bool,
     layer: LayerScratchReuse,
 }
 
@@ -99,6 +103,12 @@ impl GpuDecoderScratch {
         Self {
             cpu: DecoderScratch::new(seq_len, cfg),
             gpu_kv: None,
+            sampler: crate::metal::sampler::GpuSamplerScratch::new(
+                cfg.canvas_length,
+                cfg.text_config.vocab_size,
+            ),
+            use_gpu_sampler: false,
+            have_gpu_sc_logits: false,
             layer: LayerScratchReuse {
                 seq_len: 0,
                 kv_len: 0,
@@ -206,7 +216,25 @@ fn forward_inner(
     )?;
 
     let eps = text.rms_norm_eps as f32;
-    if let Some(logits) = input.self_conditioning_logits {
+    if scratch.have_gpu_sc_logits {
+        if let (Some(embed_q8), Some(logits_buf)) = (
+            weights.embed_q8(),
+            scratch.sampler.logits.as_buf(),
+        ) {
+            crate::metal::embed::soft_embeddings_q8_gpu_from_buf(
+                engine,
+                logits_buf,
+                embed_q8,
+                seq_len,
+                vocab,
+                hidden,
+                embed_scale,
+                &mut scratch.cpu.sc_signal,
+            )?;
+        } else {
+            return Err(Error::Format("gpu sc logits missing"));
+        }
+    } else if let Some(logits) = input.self_conditioning_logits {
         if let Some(embed_q8) = weights.embed_q8() {
             crate::metal::embed::soft_embeddings_q8_gpu(
                 engine,
@@ -360,14 +388,43 @@ fn forward_inner(
         tel.expert_upload_bytes += after.upload_bytes.saturating_sub(before.upload_bytes);
     }
     if engine.telemetry_enabled() && input.compute_logits {
-        engine
-            .telemetry_handle()
-            .borrow_mut()
-            .lm_head_logits_bytes = (seq_len * vocab * 4) as u64;
+        if !scratch.use_gpu_sampler {
+            engine
+                .telemetry_handle()
+                .borrow_mut()
+                .lm_head_logits_bytes = (seq_len * vocab * 4) as u64;
+        }
     }
 
     if input.compute_logits {
-        if let Some(out) = input.logits_out.as_mut() {
+        if scratch.use_gpu_sampler {
+            if let Some(embed_q8) = weights.embed_q8() {
+                use crate::metal::batch::begin_engine_batch;
+                use crate::metal::lm_head::lm_head_tied_q8_gpu_buf;
+                let telemetry = engine.batch_telemetry();
+                let mut batch = begin_engine_batch(
+                    &engine.ctx.queue,
+                    &mut engine.pool,
+                    &engine.ctx.device,
+                    telemetry,
+                )?;
+                lm_head_tied_q8_gpu_buf(
+                    &mut batch,
+                    &engine.f32_q8_linear_pipeline,
+                    &engine.sampler_kernels,
+                    &engine.kernels,
+                    out_buf,
+                    embed_q8,
+                    &mut scratch.sampler.logits,
+                    seq_len,
+                    hidden,
+                    vocab,
+                )?;
+                batch.end()?;
+            } else {
+                return Err(Error::Format("gpu sampler requires .dgq embed"));
+            }
+        } else if let Some(out) = input.logits_out.as_mut() {
             let need = seq_len * vocab;
             if out.len() != need {
                 return Err(Error::Format("logits_out length mismatch"));

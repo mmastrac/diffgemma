@@ -236,7 +236,12 @@ impl StableConfidentStopper {
 
     pub fn should_stop(&mut self, argmax: &[u32], processed_logits: &[f32], canvas_len: usize, vocab_size: usize) -> bool {
         let ent = token_entropy(processed_logits, canvas_len, vocab_size);
-        let confident = mean_entropy(&ent) < self.confidence_threshold;
+        self.should_stop_with_entropies(argmax, &ent)
+    }
+
+    /// Early stop using precomputed per-position entropies (GPU path).
+    pub fn should_stop_with_entropies(&mut self, argmax: &[u32], entropies: &[f32]) -> bool {
+        let confident = mean_entropy(entropies) < self.confidence_threshold;
 
         let stable = if self.stability_threshold == 0 {
             true
