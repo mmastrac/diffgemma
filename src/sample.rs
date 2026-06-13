@@ -4,6 +4,48 @@
 
 use crate::kernels::cpu::softmax_rows;
 
+/// `<pad>` token id (Gemma tokenizer).
+pub const PAD_TOKEN_ID: u32 = 0;
+/// Sentinel id used when logits are invalid (vocab - 1).
+pub const FILLER_TOKEN_ID: u32 = 262_143;
+
+/// Minimum denoise steps before pad-aware early stop may fire.
+pub const MIN_EARLY_STOP_STEPS: u32 = 12;
+/// Minimum non-degenerate argmax positions required (unless `steps` exceeds min steps).
+pub const MIN_REAL_ARGMAX_POSITIONS: u32 = 8;
+
+/// True when every canvas position argmax is pad or filler.
+pub fn argmax_is_degenerate(argmax: &[u32]) -> bool {
+    !argmax.is_empty()
+        && argmax
+            .iter()
+            .all(|&t| t == PAD_TOKEN_ID || t == FILLER_TOKEN_ID)
+}
+
+pub fn count_real_argmax_positions(argmax: &[u32]) -> usize {
+    argmax
+        .iter()
+        .filter(|&&t| t != PAD_TOKEN_ID && t != FILLER_TOKEN_ID)
+        .count()
+}
+
+/// Pad-aware gate for early stop (shared by CPU, engine GPU, monolithic GPU).
+pub fn early_stop_allowed(steps_done: u32, argmax: &[u32]) -> bool {
+    if argmax_is_degenerate(argmax) {
+        return false;
+    }
+    let real = count_real_argmax_positions(argmax);
+    steps_done >= MIN_EARLY_STOP_STEPS || real >= MIN_REAL_ARGMAX_POSITIONS as usize
+}
+
+/// Strip pad/filler ids for display-only decode (KV commit still uses full argmax).
+pub fn strip_degenerate_token_ids(ids: &[u32]) -> Vec<u32> {
+    ids.iter()
+        .copied()
+        .filter(|&id| id != PAD_TOKEN_ID && id != FILLER_TOKEN_ID)
+        .collect()
+}
+
 /// Simple deterministic PRNG (LCG); same family as `KvCache::dummy`.
 #[derive(Debug, Clone)]
 pub struct Rng {
@@ -70,6 +112,11 @@ impl Default for SamplerConfig {
             confidence_threshold: 0.005,
         }
     }
+}
+
+/// Denoise steps completed when the loop variable counts down `max..=1`.
+pub fn denoise_steps_completed(max_steps: usize, cur_step: usize) -> u32 {
+    (max_steps.saturating_sub(cur_step) + 1) as u32
 }
 
 /// Build sampler config for a run; `no_early_stop` forces all `steps` denoise iterations.
@@ -282,13 +329,25 @@ impl StableConfidentStopper {
         self.argmax_history.clear();
     }
 
-    pub fn should_stop(&mut self, argmax: &[u32], processed_logits: &[f32], canvas_len: usize, vocab_size: usize) -> bool {
+    pub fn should_stop(
+        &mut self,
+        argmax: &[u32],
+        processed_logits: &[f32],
+        canvas_len: usize,
+        vocab_size: usize,
+        steps_done: u32,
+    ) -> bool {
         let ent = token_entropy(processed_logits, canvas_len, vocab_size);
-        self.should_stop_with_entropies(argmax, &ent)
+        self.should_stop_with_entropies(argmax, &ent, steps_done)
     }
 
     /// Early stop using precomputed per-position entropies (GPU path).
-    pub fn should_stop_with_entropies(&mut self, argmax: &[u32], entropies: &[f32]) -> bool {
+    pub fn should_stop_with_entropies(
+        &mut self,
+        argmax: &[u32],
+        entropies: &[f32],
+        steps_done: u32,
+    ) -> bool {
         let confident = mean_entropy(entropies) < self.confidence_threshold;
 
         let stable = if self.stability_threshold == 0 {
@@ -303,7 +362,7 @@ impl StableConfidentStopper {
             all_match
         };
 
-        stable && confident
+        stable && confident && early_stop_allowed(steps_done, argmax)
     }
 }
 
@@ -383,7 +442,37 @@ mod tests {
         apply_temperature(&mut processed, 48, &SamplerConfig::default());
         let argmax = argmax_canvas(&processed, canvas_len, vocab);
 
-        assert!(!stopper.should_stop(&argmax, &processed, canvas_len, vocab));
-        assert!(stopper.should_stop(&argmax, &processed, canvas_len, vocab));
+        assert!(!stopper.should_stop(&argmax, &processed, canvas_len, vocab, 1));
+        assert!(stopper.should_stop(&argmax, &processed, canvas_len, vocab, MIN_EARLY_STOP_STEPS));
+    }
+
+    #[test]
+    fn stopper_blocks_degenerate_all_pad_argmax() {
+        let canvas_len = 4;
+        let mut stopper = StableConfidentStopper::new(0, f32::MAX);
+        let argmax = vec![PAD_TOKEN_ID; canvas_len];
+        let entropies = vec![0.0f32; canvas_len];
+        assert!(!stopper.should_stop_with_entropies(
+            &argmax,
+            &entropies,
+            MIN_EARLY_STOP_STEPS
+        ));
+    }
+
+    #[test]
+    fn early_stop_allowed_requires_steps_or_real_tokens() {
+        let degenerate = vec![PAD_TOKEN_ID; 256];
+        assert!(!early_stop_allowed(2, &degenerate));
+
+        let mut sparse = vec![PAD_TOKEN_ID; 256];
+        for i in 0..4 {
+            sparse[i] = 42;
+        }
+        assert!(!early_stop_allowed(2, &sparse));
+        assert!(early_stop_allowed(MIN_EARLY_STOP_STEPS, &sparse));
+        assert!(early_stop_allowed(
+            2,
+            &vec![42u32; MIN_REAL_ARGMAX_POSITIONS as usize]
+        ));
     }
 }

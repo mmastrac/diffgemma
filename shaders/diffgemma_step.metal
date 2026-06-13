@@ -86,8 +86,8 @@ struct ModelLayout {
 struct StepParams {
     uint kv_len; uint max_steps;
     float entropy_bound; float t_min; float t_max; float conf_threshold;
-    uint stability_threshold;      // CPU SamplerConfig (default 1)
-    uint _pad;
+    uint stability_threshold;
+    uint min_early_stop_steps;
 };
 struct CanvasState {
     uint ids[256]; uint prev_argmax[256]; uint new_sample[256];
@@ -349,7 +349,7 @@ kernel void k_gemm_q8_rowk(device const half* x [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     threadgroup float ty[32][32];
-    simdgroup_store(acc0,&ty[8*sgid][0],32); simdgroup_store(acc1,&ty[8*sgid][8],32);
+    simdgroup_store(acc0,&ty[8*sgid][   0],32); simdgroup_store(acc1,&ty[8*sgid][8],32);
     simdgroup_store(acc2,&ty[8*sgid][16],32); simdgroup_store(acc3,&ty[8*sgid][24],32);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint i = ltid; i < 32*32; i += 128) {
@@ -827,7 +827,17 @@ kernel void k_sample_commit(device CanvasState* S [[buffer(0)]],
         S->argmax_stable = changed ? 0u : (S->argmax_stable + 1u);
         atomic_store_explicit((device atomic_uint*)&S->argmax_changed, 0u, memory_order_relaxed);
         S->step += 1;
-        if (S->mean_entropy < P.conf_threshold && S->argmax_stable >= P.stability_threshold)
+        bool degenerate = true;
+        uint real_count = 0u;
+        for (uint i = 0; i < CANVAS; ++i) {
+            uint t = S->prev_argmax[i];
+            if (t != 0u && t != 262143u) { degenerate = false; real_count++; }
+        }
+        bool confident_stable = S->mean_entropy < P.conf_threshold
+            && S->argmax_stable >= P.stability_threshold;
+        bool allowed = !degenerate
+            && (S->step >= P.min_early_stop_steps || real_count >= 8u);
+        if (confident_stable && allowed)
             S->stop_flag = 1;
         if (S->step >= P.max_steps) S->stop_flag = 1;
     }

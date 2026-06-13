@@ -7,8 +7,8 @@ use crate::model::encoder::{prefill, EncoderPrefillInput, EncoderScratch};
 use crate::model::kv_cache::KvCache;
 use crate::model::mask::DecoderAttnMask;
 use crate::sample::{
-    accept_canvas, apply_temperature, argmax_canvas, initialize_canvas, renoise_canvas,
-    sample_canvas, Rng, SamplerConfig, StableConfidentStopper,
+    accept_canvas, apply_temperature, argmax_canvas, denoise_steps_completed, initialize_canvas,
+    renoise_canvas, sample_canvas, Rng, SamplerConfig, StableConfidentStopper,
 };
 use crate::safetensors::Error;
 use crate::weights::WeightStore;
@@ -43,6 +43,10 @@ pub struct GenerateOutput {
     pub token_ids: Vec<u32>,
     pub denoise_steps_run: usize,
     pub blocks_committed: usize,
+    /// Effective denoise steps per committed block (monolithic path).
+    pub block_steps_eff: Vec<u32>,
+    /// Accepted positions per step in the last committed block.
+    pub last_block_accept_hist: Vec<u32>,
     pub prefill_elapsed: std::time::Duration,
     pub denoise_elapsed: std::time::Duration,
     pub extend_elapsed: std::time::Duration,
@@ -357,11 +361,14 @@ fn generate_inner(
                     gen_cfg.sampler.entropy_bound,
                 );
                 current_canvas = renoise_canvas(&accepted, &accepted_mask, vocab, &mut rng);
+                let steps_done =
+                    denoise_steps_completed(gen_cfg.sampler.max_denoising_steps, cur_step);
                 let step_finished = stopper.should_stop(
                     &new_argmax,
                     &processed_logits,
                     canvas_len,
                     vocab,
+                    steps_done,
                 );
                 sc_logits.copy_from_slice(&processed_logits);
                 have_sc_logits = true;
@@ -403,11 +410,14 @@ fn generate_inner(
                     gen_cfg.sampler.entropy_bound,
                 );
                 current_canvas = renoise_canvas(&accepted, &accepted_mask, vocab, &mut rng);
+                let steps_done =
+                    denoise_steps_completed(gen_cfg.sampler.max_denoising_steps, cur_step);
                 let step_finished = stopper.should_stop(
                     &new_argmax,
                     &processed_logits,
                     canvas_len,
                     vocab,
+                    steps_done,
                 );
                 sc_logits.copy_from_slice(&processed_logits);
                 have_sc_logits = true;
@@ -451,6 +461,8 @@ fn generate_inner(
         token_ids: sequences,
         denoise_steps_run,
         blocks_committed,
+        block_steps_eff: Vec::new(),
+        last_block_accept_hist: Vec::new(),
         prefill_elapsed,
         denoise_elapsed,
         extend_elapsed,

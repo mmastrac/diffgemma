@@ -104,7 +104,7 @@ pub struct StepParams {
     pub t_max: f32,
     pub conf_threshold: f32,
     pub stability_threshold: u32,
-    pub _pad: u32,
+    pub min_early_stop_steps: u32,
 }
 
 #[repr(C)]
@@ -1342,7 +1342,7 @@ pub fn step_params_from_sampler(
         t_max: sampler.t_max,
         conf_threshold,
         stability_threshold: sampler.stability_threshold as u32,
-        _pad: 0,
+        min_early_stop_steps: crate::sample::MIN_EARLY_STOP_STEPS,
     }
 }
 
@@ -1666,7 +1666,7 @@ pub fn build_step_runtime(model_dir: &Path, cfg: &StepSmokeConfig) -> Result<(St
         t_max: sampler.t_max,
         conf_threshold: sampler.confidence_threshold,
         stability_threshold: sampler.stability_threshold as u32,
-        _pad: 0,
+        min_early_stop_steps: crate::sample::MIN_EARLY_STOP_STEPS,
     };
     let state = init_canvas_state(cfg.seed, VOCAB);
     let (mps_x_bytes, mps_w_bytes, mps_c_bytes) = mps_scratch_bytes();

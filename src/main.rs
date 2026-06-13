@@ -1068,12 +1068,17 @@ fn run_convert_model(source_dir: &std::path::Path, output_dir: &std::path::Path)
     }
 }
 
+/// Production generate/chat default is 48 (model card); parity/bench default is 2.
+fn resolve_steps(override_steps: Option<usize>, parity_default: bool) -> usize {
+    override_steps.unwrap_or(if parity_default { 2 } else { 48 })
+}
+
 fn parse_cli() -> Cli {
     let mut args = env::args().skip(1);
     let mut model_dir = PathBuf::from("model/transformer");
     let mut positional = Vec::new();
     let mut seed = 42u64;
-    let mut steps = 2usize;
+    let mut steps_override: Option<usize> = None;
     let mut prompt_len = 8usize;
     let mut max_new_tokens = 256usize;
     let mut gemm_size = 512usize;
@@ -1128,10 +1133,10 @@ fn parse_cli() -> Cli {
             }
             "--steps" => {
                 if let Some(v) = args.next() {
-                    steps = v.parse().unwrap_or_else(|_| {
+                    steps_override = Some(v.parse().unwrap_or_else(|_| {
                         eprintln!("invalid --steps");
                         std::process::exit(2);
-                    });
+                    }));
                 }
             }
             "--prompt-len" => {
@@ -1263,13 +1268,15 @@ fn parse_cli() -> Cli {
     }
 
     let use_monolithic = use_monolithic || monolithic_from_env();
+    let steps_production = resolve_steps(steps_override, false);
+    let steps_parity = resolve_steps(steps_override, true);
 
     let command = match positional.first().map(String::as_str) {
         None => default_generate_command(
             &model_dir,
             prompt,
             seed,
-            steps,
+            steps_production,
             prompt_len,
             max_new_tokens,
             parity_layers,
@@ -1291,7 +1298,7 @@ fn parse_cli() -> Cli {
         Some("generate") if use_monolithic => Command::GenerateMonolithic {
             prompt: prompt.clone(),
             seed,
-            steps,
+            steps: steps_production,
             prompt_len,
             max_new_tokens,
             max_layers: parity_layers,
@@ -1302,7 +1309,7 @@ fn parse_cli() -> Cli {
         Some("generate") => Command::Generate {
             prompt: prompt.clone(),
             seed,
-            steps,
+            steps: steps_production,
             prompt_len,
             max_new_tokens,
             max_layers: parity_layers,
@@ -1311,7 +1318,7 @@ fn parse_cli() -> Cli {
         Some("generate-gpu") if use_monolithic => Command::GenerateMonolithic {
             prompt: prompt.clone(),
             seed,
-            steps,
+            steps: steps_production,
             prompt_len,
             max_new_tokens,
             max_layers: parity_layers,
@@ -1322,7 +1329,7 @@ fn parse_cli() -> Cli {
         Some("generate-gpu") => Command::GenerateGpu {
             prompt: prompt.clone(),
             seed,
-            steps,
+            steps: steps_production,
             prompt_len,
             max_new_tokens,
             max_layers: parity_layers,
@@ -1332,7 +1339,7 @@ fn parse_cli() -> Cli {
         Some("generate-monolithic") => Command::GenerateMonolithic {
             prompt: prompt.clone(),
             seed,
-            steps,
+            steps: steps_production,
             prompt_len,
             max_new_tokens,
             max_layers: parity_layers,
@@ -1343,7 +1350,7 @@ fn parse_cli() -> Cli {
         Some("generate-monolithic-parity") => Command::GenerateMonolithicParity {
             prompt: prompt.clone(),
             seed,
-            steps,
+            steps: steps_parity,
             prompt_len,
             max_new_tokens,
             max_layers: parity_layers,
@@ -1353,7 +1360,7 @@ fn parse_cli() -> Cli {
         },
         Some("chat") => Command::Chat {
             seed,
-            steps,
+            steps: steps_production,
             max_new_tokens,
             max_layers: parity_layers,
             no_early_stop,
@@ -1362,7 +1369,7 @@ fn parse_cli() -> Cli {
         Some("generate-parity") => Command::GenerateParity {
             prompt: prompt.clone(),
             seed,
-            steps,
+            steps: steps_parity,
             prompt_len,
             max_new_tokens,
             max_layers: parity_layers,
@@ -1429,7 +1436,7 @@ fn parse_cli() -> Cli {
         }
         Some("step-smoke") => Command::StepSmoke {
             layers: bench_layers.max(1).min(30),
-            steps: steps.max(1),
+            steps: steps_parity.max(1),
             kv_len: step_kv_len,
             seed,
             max_seq: step_max_seq.max(64),
@@ -2667,14 +2674,9 @@ fn run_chat_cmd(
         let out = generate_with_session(&mut session, &prompt, &step_cfg)?;
         let elapsed = started.elapsed();
 
-        let new_ids: Vec<u32> = out
-            .token_ids
-            .get(prompt_len..)
-            .unwrap_or(&[])
-            .iter()
-            .copied()
-            .filter(|&id| id != 0)
-            .collect();
+        let new_ids = sample::strip_degenerate_token_ids(
+            out.token_ids.get(prompt_len..).unwrap_or(&[]),
+        );
         let reply = chat_template::sanitize_model_reply(&tokenizer.decode(&new_ids));
         if reply.is_empty() {
             println!("model> (empty response)");
@@ -2780,6 +2782,12 @@ fn print_generate_output(
     println!("  new tokens:   {new_tokens}");
     println!("  denoise steps run: {}", out.denoise_steps_run);
     println!("  blocks committed:  {}", out.blocks_committed);
+    if !out.block_steps_eff.is_empty() {
+        println!("  block steps_eff:   {:?}", out.block_steps_eff);
+    }
+    if !out.last_block_accept_hist.is_empty() {
+        println!("  last accept/step:  {:?}", out.last_block_accept_hist);
+    }
     print_generate_elapsed(label, elapsed);
     println!("  prefill:  {:.2}s ({:.2?})", out.prefill_elapsed.as_secs_f64(), out.prefill_elapsed);
     println!("  denoise:  {:.2}s ({:.2?})", out.denoise_elapsed.as_secs_f64(), out.denoise_elapsed);
@@ -2808,10 +2816,15 @@ fn print_generate_output(
     }
 
     if let Ok(tokenizer) = tokenizer::Tokenizer::load(model_dir.join("tokenizer.json")) {
-        let text = tokenizer.decode(&out.token_ids);
-        if !text.is_empty() {
-            let preview: String = text.chars().take(200).collect();
-            println!("  text: {preview}");
+        let display_ids = sample::strip_degenerate_token_ids(
+            &out.token_ids.get(prompt_len..).unwrap_or(&[]),
+        );
+        if !display_ids.is_empty() {
+            let text = tokenizer.decode(&display_ids);
+            if !text.is_empty() {
+                let preview: String = text.chars().take(200).collect();
+                println!("  text: {preview}");
+            }
         }
     }
 

@@ -129,6 +129,8 @@ pub fn generate_with_session(
     let mut rng = Rng::new(cfg.seed);
     let mut denoise_steps_run = 0usize;
     let mut blocks_committed = 0usize;
+    let mut block_steps_eff = Vec::new();
+    let mut last_block_accept_hist = Vec::new();
     let mut denoise_elapsed = Duration::ZERO;
     let mut extend_elapsed = Duration::ZERO;
     let mut session_telemetry = SessionTelemetry::default();
@@ -149,6 +151,8 @@ pub fn generate_with_session(
         rt.reset_block(VOCAB, &mut rng, params);
 
         let block_started = Instant::now();
+        let mut block_step_count = 0u32;
+        let mut accept_hist = Vec::new();
         loop {
             let step_started = Instant::now();
             rt.run_denoise_step()?;
@@ -160,7 +164,10 @@ pub fn generate_with_session(
                 forward: ForwardTelemetry::monolithic_gpu_step(),
             });
             denoise_steps_run += 1;
+            block_step_count += 1;
             let st = rt.read_canvas_state();
+            let accepted = st.accept.iter().filter(|&&a| a != 0).count() as u32;
+            accept_hist.push(accepted);
             if st.stop_flag != 0 {
                 break;
             }
@@ -169,6 +176,12 @@ pub fn generate_with_session(
             }
         }
         denoise_elapsed += block_started.elapsed();
+        block_steps_eff.push(block_step_count);
+        last_block_accept_hist = accept_hist.clone();
+        eprintln!(
+            "step-generate: block {} steps_eff={block_step_count} accept/step={accept_hist:?}",
+            blocks_committed + 1
+        );
 
         let st = rt.read_canvas_state();
         let argmax_tokens: Vec<u32> = st.prev_argmax.to_vec();
@@ -200,6 +213,8 @@ pub fn generate_with_session(
         token_ids: sequences,
         denoise_steps_run,
         blocks_committed,
+        block_steps_eff,
+        last_block_accept_hist,
         prefill_elapsed,
         denoise_elapsed,
         extend_elapsed,

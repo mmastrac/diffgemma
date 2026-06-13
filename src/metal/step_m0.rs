@@ -207,7 +207,7 @@ fn verify_temperature_schedule() -> M0Check {
         t_max: cfg.t_max,
         conf_threshold: cfg.confidence_threshold,
         stability_threshold: cfg.stability_threshold as u32,
-        _pad: 0,
+        min_early_stop_steps: crate::sample::MIN_EARLY_STOP_STEPS,
     };
     let mut max_err = 0.0f32;
     let n = cfg.max_denoising_steps.max(1);

@@ -5,7 +5,8 @@ use crate::metal::buffer::BufferPool;
 use crate::metal::engine::GpuDecoderEngine;
 use crate::metal::sampler_kernels::GpuSamplerKernels;
 use crate::sample::{
-    accept_canvas_from_entropies, renoise_canvas, Rng, SamplerConfig, StableConfidentStopper,
+    accept_canvas_from_entropies, denoise_steps_completed, renoise_canvas, Rng, SamplerConfig,
+    StableConfidentStopper,
 };
 use crate::safetensors::Error;
 use objc2::rc::Retained;
@@ -347,7 +348,9 @@ pub fn sampler_step_gpu(
     let renoised = renoise_canvas(&accepted, &accepted_mask, vocab, rng);
     current_canvas.copy_from_slice(&renoised);
 
-    let finished = stopper.should_stop_with_entropies(&scratch.argmax, &scratch.entropies);
+    let steps_done = denoise_steps_completed(sampler.max_denoising_steps, cur_step);
+    let finished =
+        stopper.should_stop_with_entropies(&scratch.argmax, &scratch.entropies, steps_done);
 
     Ok(GpuSamplerStepOut {
         argmax: scratch.argmax.clone(),
