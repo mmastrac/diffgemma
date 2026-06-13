@@ -38,7 +38,7 @@ Interpretation:
 
 **Next P1.6 experiments:** `--steps 96`; q5 profile; f32 rowstats; HF/Python accept count on same logits; engine vs monolithic @ 30L text compare.
 
-**P1.6 trace tooling (2026-06):** Per-step denoise JSON (`--write-trace`) from `generate-monolithic`; HuggingFace reference via `python/scripts/dump_denoise_trace.py`; compare with `python/scripts/compare_denoise_trace.py`. Traces are ~few KB/step (entropy + accept + argmax prefix), not full logits/hidden states.
+**P1.6 trace tooling (2026-06):** Per-step denoise JSON (`--write-trace`) from `generate-monolithic`; HuggingFace reference via `python/scripts/dump_denoise_trace.py`; MLX via `python/scripts/dump_mlx_denoise_trace.py`; compare with `python/scripts/compare_denoise_trace.py`. Fast iteration: `--steps 2` + `DGQ_LOG_DENOISE=1` + `DGQ_TRACE_ENTROPY=1`. **Canvas RNG:** monolithic uses Rust LCG (`sample::Rng`); MLX default uses `mx.random` — use `dump_mlx_denoise_trace.py --canvas-rng rust` for matched-canvas compares. Step-1 parity gap (2026-06): same canvas+prefill, MLX mxfp4 entropies ~0.04–1.5 nats vs `.dgq` ~0.5–3.1 nats → MLX accepts ~236 positions, mono ~1; argmax matches pos 0–1 then diverges (quant/forward, not accept rule).
 
 ### Target
 

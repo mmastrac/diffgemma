@@ -58,6 +58,7 @@ pub use step_kernel::{
     bench_step_kernel, build_step_runtime, hello_chat_prefill_token_ids, logits_finite_check_enabled,
     run_denoise_steps, run_single_denoise_step, run_step_forward,
     run_step_probe, run_step_smoke, run_step_q4_mps_parity, step_use_mps_q4_default, DenoiseStepStats,
+    trace_entropy_enabled,
     StepBenchResult, StepFinishMode,
     StepForwardOutput, StepProbeResult, StepQ4MpsParityResult, StepSmokeConfig, StepSmokeResult,
     CANVAS,

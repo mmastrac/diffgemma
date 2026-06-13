@@ -31,6 +31,13 @@ def compare_traces(
         if left.get(key) != right.get(key):
             errors.append(f"config {key}: {left.get(key)!r} vs {right.get(key)!r}")
 
+    left_canvas = left.get("initial_canvas_ids")
+    right_canvas = right.get("initial_canvas_ids")
+    if left_canvas is not None and right_canvas is not None and left_canvas != right_canvas:
+        errors.append(
+            f"initial_canvas_ids differ (first 8: {left_canvas[:8]!r} vs {right_canvas[:8]!r})"
+        )
+
     left_steps = left.get("step_traces") or []
     right_steps = right.get("step_traces") or []
     if len(left_steps) != len(right_steps):
@@ -74,6 +81,18 @@ def compare_traces(
                 f"{label}: argmax_prefix diverged "
                 f"{ls.get('argmax_prefix')!r} vs {rs.get('argmax_prefix')!r}"
             )
+
+        le = ls.get("entropy_prefix")
+        re = rs.get("entropy_prefix")
+        if le is not None and re is not None:
+            n = min(len(le), len(re), 16)
+            for pos in range(n):
+                if abs(float(le[pos]) - float(re[pos])) > entropy_tol:
+                    errors.append(
+                        f"{label}: entropy_prefix[{pos}] {float(le[pos]):.6f} vs "
+                        f"{float(re[pos]):.6f} (tol={entropy_tol})"
+                    )
+                    break
 
         if ls.get("early_stop") != rs.get("early_stop"):
             errors.append(

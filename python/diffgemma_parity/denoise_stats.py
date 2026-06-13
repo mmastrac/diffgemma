@@ -46,8 +46,9 @@ def trace_step_record(
     stats: StepStats,
     argmax_prefix: list[int],
     early_stop: bool,
+    entropy_prefix: list[float] | None = None,
 ) -> dict[str, Any]:
-    return {
+    row = {
         "block": block,
         "step_index": step_index,
         "cur_step": cur_step_from_index(step_index, max_denoise_steps),
@@ -59,6 +60,9 @@ def trace_step_record(
         "argmax_prefix": argmax_prefix[:16],
         "early_stop": early_stop,
     }
+    if entropy_prefix is not None:
+        row["entropy_prefix"] = entropy_prefix[:16]
+    return row
 
 
 def stats_dict(stats: StepStats) -> dict[str, Any]:

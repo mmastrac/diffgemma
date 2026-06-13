@@ -453,7 +453,7 @@ fn generate_inner(
                 use crate::denoise_trace::step_trace_from_stats;
                 use crate::sample::{accept_mask_from_entropies, step_entropy_stats, token_entropy};
                 block_step_count += 1;
-                let (stats, argmax_for_trace) = if gpu_sampler {
+                let (stats, argmax_for_trace, entropy_for_trace) = if gpu_sampler {
                     let DecoderBackend::Gpu { scratch, .. } = decoder else {
                         return Err(Error::Format("gpu sampler backend mismatch"));
                     };
@@ -465,6 +465,11 @@ fn generate_inner(
                     (
                         step_entropy_stats(&scratch.sampler.entropies, &accept_u32),
                         scratch.sampler.argmax.clone(),
+                        if crate::metal::trace_entropy_enabled() {
+                            Some(scratch.sampler.entropies.clone())
+                        } else {
+                            None
+                        },
                     )
                 } else {
                     let ent = token_entropy(&processed_logits, canvas_len, vocab);
@@ -474,6 +479,11 @@ fn generate_inner(
                     (
                         step_entropy_stats(&ent, &accept_u32),
                         argmax_canvas(&processed_logits, canvas_len, vocab),
+                        if crate::metal::trace_entropy_enabled() {
+                            Some(ent)
+                        } else {
+                            None
+                        },
                     )
                 };
                 step_traces.push(step_trace_from_stats(
@@ -482,6 +492,7 @@ fn generate_inner(
                     max_denoise_steps,
                     &stats,
                     &argmax_for_trace,
+                    entropy_for_trace.as_deref(),
                     step_finished,
                 ));
             }
@@ -547,6 +558,8 @@ fn generate_inner(
             denoise_steps_run,
             blocks_committed,
             output_token_ids: sequences.clone(),
+            initial_canvas_ids: None,
+            canvas_rng: Some("rust-lcg".into()),
         };
         (
             block_steps_eff,

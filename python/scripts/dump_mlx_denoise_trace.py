@@ -23,6 +23,7 @@ import mlx.core as mx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from diffgemma_parity.canvas_rng import initialize_canvas
 from diffgemma_parity.denoise_stats import (  # noqa: E402
     ENTROPY_BOUND,
     step_stats_from_entropies,
@@ -155,9 +156,20 @@ def run_trace(args: argparse.Namespace) -> dict[str, Any]:
     mx.eval([c.state for c in kv_cache])
 
     canvas_length = min(max_canvas_length, max(max_new_tokens, min_canvas_length))
-    current_canvas = _diffusion_initialize_canvas(
-        batch_size, canvas_length, vocab_size, input_ids.dtype
-    )
+    if args.canvas_ids is not None:
+        canvas_list = json.loads(args.canvas_ids.read_text())
+        if len(canvas_list) != canvas_length:
+            raise SystemExit(
+                f"error: canvas_ids length {len(canvas_list)} != canvas_length {canvas_length}"
+            )
+        canvas_rng_label = "file"
+    else:
+        canvas_list = initialize_canvas(
+            args.seed, canvas_length, vocab_size, rng=args.canvas_rng
+        )
+        canvas_rng_label = f"{args.canvas_rng}-default"
+    initial_canvas_ids = list(canvas_list)
+    current_canvas = mx.array([canvas_list], dtype=input_ids.dtype)
     accepted_canvas = current_canvas
     argmax_canvas = current_canvas
     self_conditioning_embeddings = None
@@ -230,6 +242,7 @@ def run_trace(args: argparse.Namespace) -> dict[str, Any]:
                 stats=stats,
                 argmax_prefix=[int(t) for t in argmax_canvas[0].tolist()],
                 early_stop=False,
+                entropy_prefix=[float(x) for x in ent_list[:16]],
             )
         )
 
@@ -267,6 +280,8 @@ def run_trace(args: argparse.Namespace) -> dict[str, Any]:
         "denoise_steps_run": steps_run,
         "blocks_committed": 1,
         "output_token_ids": output_ids,
+        "initial_canvas_ids": initial_canvas_ids,
+        "canvas_rng": canvas_rng_label,
     }
 
 
@@ -281,6 +296,18 @@ def main() -> int:
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--min-canvas-length", type=int, default=None)
     parser.add_argument("--no-early-stop", action="store_true")
+    parser.add_argument(
+        "--canvas-rng",
+        choices=("mlx", "rust"),
+        default="mlx",
+        help="canvas RNG (use rust to match monolithic seed=42 LCG)",
+    )
+    parser.add_argument(
+        "--canvas-ids",
+        type=Path,
+        default=None,
+        help="JSON array of canvas token ids (overrides --canvas-rng)",
+    )
     parser.add_argument("-o", "--output", type=Path, required=True)
     args = parser.parse_args()
     args.model = args.model or default_model_path()

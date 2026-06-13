@@ -813,12 +813,15 @@ kernel void k_sample_commit(device CanvasState* S [[buffer(0)]],
             while (j >= 0 && ent[S->sorted_idx[j]] > e) { S->sorted_idx[j+1] = S->sorted_idx[j]; --j; }
             S->sorted_idx[j+1] = id;
         }
-        // HF: accept sorted i when sum(ent[0..i-1]) <= bound (mutual-information bound)
+        // HF/MLX: on the final denoise step (cur_step==1) record stats but do not accept.
+        bool final_step = (S->step + 1 >= P.max_steps);
         float prefix = 0.f;
-        for (uint i = 0; i < CANVAS; ++i) {
-            uint id = S->sorted_idx[i];
-            if (prefix <= P.entropy_bound) { S->accept[id] = 1; prefix += ent[id]; }
-            else break;
+        if (!final_step) {
+            for (uint i = 0; i < CANVAS; ++i) {
+                uint id = S->sorted_idx[i];
+                if (prefix <= P.entropy_bound) { S->accept[id] = 1; prefix += ent[id]; }
+                else break;
+            }
         }
         float mean = 0.f;
         for (uint i = 0; i < CANVAS; ++i) mean += ent[i];

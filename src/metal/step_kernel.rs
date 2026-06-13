@@ -1447,6 +1447,72 @@ pub fn f16_bits_to_f32(bits: u16) -> f32 {
     val
 }
 
+pub fn trace_entropy_enabled() -> bool {
+    match std::env::var("DGQ_TRACE_ENTROPY") {
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        Err(_) => false,
+    }
+}
+
+pub fn denoise_parity_log_enabled() -> bool {
+    match std::env::var("DGQ_LOG_DENOISE") {
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        Err(_) => false,
+    }
+}
+
+fn denoise_parity_log_positions() -> usize {
+    match std::env::var("DGQ_LOG_DENOISE_POS") {
+        Ok(v) => v.parse().unwrap_or(8),
+        Err(_) => 8,
+    }
+}
+
+/// HF linear schedule: temperature at start of denoise step `steps_done` (0 = first step).
+pub fn scheduled_temperature(steps_done: u32, params: &StepParams) -> f32 {
+    let max = params.max_steps.max(1) as f32;
+    let cur = params.max_steps.saturating_sub(steps_done) as f32;
+    params.t_min + (params.t_max - params.t_min) * (cur / max)
+}
+
+fn read_logit_f32(logits: &ProtocolObject<dyn MTLBuffer>, row: usize, col: u32) -> f32 {
+    let byte_off = (row * VOCAB + col as usize) * 2;
+    let ptr = unsafe { logits.contents().as_ptr().add(byte_off) as *const u16 };
+    f16_bits_to_f32(unsafe { *ptr })
+}
+
+/// Log GPU vs CPU accept masks and per-position entropy/argmax (for MLX/HF parity iteration).
+pub fn log_denoise_parity_step(
+    label: &str,
+    state: &CanvasState,
+    params: &StepParams,
+    logits: &ProtocolObject<dyn MTLBuffer>,
+) {
+    use crate::sample::accept_mask_from_entropies;
+    let cpu_mask = accept_mask_from_entropies(&state.entropy, params.entropy_bound);
+    let cpu_accept = cpu_mask.iter().filter(|&&m| m).count() as u32;
+    let gpu_accept = state.accept.iter().filter(|&&a| a != 0).count();
+    let temp = scheduled_temperature(state.step.saturating_sub(1), params);
+    eprintln!(
+        "denoise-parity {label}: st.step={} T={temp:.4} gpu_accept={gpu_accept} cpu_accept={cpu_accept} mean_H={:.4} low_H={}",
+        state.step,
+        state.mean_entropy,
+        crate::sample::count_low_entropy_positions(&state.entropy, params.entropy_bound),
+    );
+    let n = denoise_parity_log_positions().min(CANVAS);
+    for pos in 0..n {
+        let argmax = state.prev_argmax[pos];
+        let logit = read_logit_f32(logits, pos, argmax);
+        eprintln!(
+            "  pos {pos:2}: H={:.4} accept={}/{} argmax={argmax} canvas={} logit={logit:.4}",
+            state.entropy[pos],
+            state.accept[pos],
+            u32::from(cpu_mask[pos]),
+            state.ids[pos],
+        );
+    }
+}
+
 
 fn count_non_finite_half(buf: &ProtocolObject<dyn MTLBuffer>, elems: usize) -> (usize, f32) {
     let ptr = buf.contents().as_ptr() as *const u16;
@@ -1533,6 +1599,10 @@ impl StepRuntime {
         &self.bufs.kvcache
     }
 
+    pub fn logits(&self) -> &ProtocolObject<dyn MTLBuffer> {
+        &self.bufs.logits
+    }
+
     pub fn shared_dgq_blob(&self) -> std::sync::Arc<DgqGpuBlob> {
         std::sync::Arc::clone(&self.gpu_blob)
     }
@@ -1553,6 +1623,18 @@ impl StepRuntime {
 
     pub fn read_canvas_state(&self) -> CanvasState {
         read_struct(&self.bufs.state)
+    }
+
+    pub fn set_canvas_ids(&mut self, ids: &[u32]) -> Result<(), Error> {
+        if ids.len() != CANVAS {
+            return Err(Error::Format("canvas ids length must match CANVAS"));
+        }
+        let mut state = self.read_canvas_state();
+        for (i, &id) in ids.iter().enumerate() {
+            state.ids[i] = id;
+        }
+        self.write_canvas_state(&state);
+        Ok(())
     }
 
     pub fn write_canvas_state(&mut self, state: &CanvasState) {

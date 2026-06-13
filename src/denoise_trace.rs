@@ -20,6 +20,9 @@ pub struct DenoiseStepTrace {
     pub max_entropy: f32,
     /// First 16 argmax token ids after this step.
     pub argmax_prefix: Vec<u32>,
+    /// First 16 per-position entropies (nats) when `DGQ_TRACE_ENTROPY=1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entropy_prefix: Option<Vec<f32>>,
     pub early_stop: bool,
 }
 
@@ -40,6 +43,11 @@ pub struct DenoiseTrace {
     pub denoise_steps_run: usize,
     pub blocks_committed: usize,
     pub output_token_ids: Vec<u32>,
+    /// Canvas token ids at block start (before first denoise step).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_canvas_ids: Option<Vec<u32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canvas_rng: Option<String>,
 }
 
 impl DenoiseTrace {
@@ -63,9 +71,11 @@ pub fn step_trace_from_stats(
     max_denoise_steps: usize,
     stats: &StepEntropyStats,
     argmax: &[u32],
+    entropies: Option<&[f32]>,
     early_stop: bool,
 ) -> DenoiseStepTrace {
     let prefix_len = argmax.len().min(16);
+    let entropy_prefix = entropies.map(|e| e[..e.len().min(16)].to_vec());
     DenoiseStepTrace {
         block,
         step_index,
@@ -78,6 +88,7 @@ pub fn step_trace_from_stats(
         mean_entropy: stats.mean_entropy,
         max_entropy: stats.max_entropy,
         argmax_prefix: argmax[..prefix_len].to_vec(),
+        entropy_prefix,
         early_stop,
     }
 }
@@ -92,9 +103,9 @@ mod tests {
         let ent = vec![0.05f32; 256];
         let accept = vec![1u32; 256];
         let stats = step_entropy_stats(&ent, &accept);
-        let row = step_trace_from_stats(1, 48, 48, &stats, &[1, 2, 3], false);
+        let row = step_trace_from_stats(1, 48, 48, &stats, &[1, 2, 3], None, false);
         assert_eq!(row.cur_step, 1);
-        let row = step_trace_from_stats(1, 1, 48, &stats, &[1, 2, 3], false);
+        let row = step_trace_from_stats(1, 1, 48, &stats, &[1, 2, 3], None, false);
         assert_eq!(row.cur_step, 48);
     }
 }

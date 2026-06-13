@@ -3,8 +3,9 @@
 use crate::denoise_trace::{step_trace_from_stats, DenoiseTrace, SCHEMA_VERSION};
 use crate::generate::GenerateOutput;
 use crate::metal::step_kernel::{
-    build_step_runtime, init_canvas_state_from_rng, step_params_from_sampler, StepFinishMode,
-    StepRuntime, StepSmokeConfig, CANVAS, N_LAYERS, VOCAB,
+    build_step_runtime, denoise_parity_log_enabled, init_canvas_state_from_rng, log_denoise_parity_step,
+    step_params_from_sampler, trace_entropy_enabled, StepFinishMode, StepRuntime, StepSmokeConfig,
+    CANVAS, N_LAYERS, VOCAB,
 };
 use crate::metal::step_kv::{
     extend_monolithic_kv_with_cache, prefill_monolithic_kv_with_cache, MonolithicEncoderCache,
@@ -27,6 +28,8 @@ pub struct StepGenerateConfig {
     pub step_use_mps_q4: Option<bool>,
     /// Encoder prefill/extend (`DGQ_MPS_Q4` when `None`).
     pub encoder_use_mps_q4: Option<bool>,
+    /// Override random canvas (256 ids) for parity with MLX/HF traces.
+    pub initial_canvas_ids: Option<Vec<u32>>,
 }
 
 impl StepGenerateConfig {
@@ -47,6 +50,7 @@ impl StepGenerateConfig {
             no_early_stop,
             step_use_mps_q4: None,
             encoder_use_mps_q4: None,
+            initial_canvas_ids: None,
         }
     }
 }
@@ -213,6 +217,7 @@ pub fn generate_with_session(
     let mut session_telemetry = SessionTelemetry::default();
     let mut step_traces = Vec::new();
     let max_steps = cfg.sampler.max_denoising_steps.max(1);
+    let mut initial_canvas_ids: Option<Vec<u32>> = None;
 
     for _block in 0..max_blocks {
         if sequences.len() >= prompt_token_ids.len() + cfg.max_new_tokens {
@@ -229,6 +234,19 @@ pub fn generate_with_session(
             cfg.no_early_stop,
         );
         rt.reset_block(VOCAB, &mut rng, params);
+        if let Some(ref ids) = cfg.initial_canvas_ids {
+            rt.set_canvas_ids(ids)?;
+        }
+        if initial_canvas_ids.is_none() {
+            initial_canvas_ids = Some(rt.read_canvas_state().ids.to_vec());
+            if denoise_parity_log_enabled() {
+                let c = initial_canvas_ids.as_ref().expect("initial canvas");
+                eprintln!(
+                    "denoise-parity: initial_canvas[:8]={:?}",
+                    &c[..8.min(c.len())]
+                );
+            }
+        }
 
         if progress_enabled() {
             eprintln!(
@@ -260,6 +278,14 @@ pub fn generate_with_session(
             block_step_count += 1;
             let st = rt.read_canvas_state();
             last_st = Some(st);
+            if denoise_parity_log_enabled() {
+                log_denoise_parity_step(
+                    &format!("block={block_idx} step_index={block_step_count}"),
+                    &st,
+                    &rt.read_params(),
+                    rt.logits(),
+                );
+            }
             if std::env::var("DGQ_LOG_SC").ok().as_deref() == Some("1") {
                 eprintln!(
                     "monolithic denoise: step_index={block_step_count} st.step={} sc_active_next={}",
@@ -278,6 +304,11 @@ pub fn generate_with_session(
                 max_steps,
                 &stats,
                 &st.prev_argmax,
+                if trace_entropy_enabled() {
+                    Some(&st.entropy)
+                } else {
+                    None
+                },
                 early_stop,
             ));
             log_denoise_step_progress(
@@ -393,6 +424,8 @@ pub fn generate_with_session(
             denoise_steps_run,
             blocks_committed,
             output_token_ids: sequences.clone(),
+            initial_canvas_ids,
+            canvas_rng: Some("rust-lcg".into()),
         }),
     })
 }
