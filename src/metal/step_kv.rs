@@ -28,7 +28,12 @@ use crate::config::ModelConfig;
 use crate::metal::decoder::load_weight_cache_opt;
 use crate::metal::engine::GpuDecoderEngine;
 use crate::metal::encoder_extend::{extend_prefill_gpu, prefill_gpu};
-use crate::metal::step_kernel::{f16_bits_to_f32, ModelLayout, N_LAYERS, CANVAS, StepSmokeConfig, StepFinishMode, run_step_forward, build_layout, build_offsets_from_store};
+use crate::metal::step_kernel::{
+    build_layout, build_offsets_from_store, build_step_runtime, f16_bits_to_f32,
+    step_params_from_sampler, ModelLayout, CANVAS, N_LAYERS, StepFinishMode, StepSmokeConfig,
+    VOCAB, run_step_forward,
+};
+use crate::sample::{step_entropy_stats, Rng, SamplerConfig};
 use crate::metal::device::MetalContext;
 use crate::dgq::DgqStore;
 use crate::metal::GpuDecoderScratch;
@@ -38,6 +43,7 @@ use crate::model::encoder::{EncoderPrefillInput, EncoderScratch};
 use crate::model::kv_cache::KvCache;
 use crate::safetensors::Error;
 use crate::weights::WeightStore;
+use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 use std::path::Path;
@@ -730,6 +736,182 @@ pub fn run_step_kv_audit(
         logits_max_abs_vs_zero: logits_diff,
         extend_kv_len,
         extend_hidden_diff,
+        pass,
+    })
+}
+
+fn copy_metal_buffer(
+    dst: &ProtocolObject<dyn MTLBuffer>,
+    src: &ProtocolObject<dyn MTLBuffer>,
+    len: usize,
+) {
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            src.contents().as_ptr() as *const u8,
+            dst.contents().as_ptr() as *mut u8,
+            len,
+        );
+    }
+}
+
+/// Max abs f32 diff between two monolithic b4 prefixes `[0, kv_len)` over `layers`.
+pub fn monolithic_kv_prefix_max_diff(
+    a: &ProtocolObject<dyn MTLBuffer>,
+    b: &ProtocolObject<dyn MTLBuffer>,
+    layout: &ModelLayout,
+    kv_len: usize,
+    layers: usize,
+) -> (f32, usize, usize) {
+    let mut max_diff = 0.0f32;
+    let mut max_layer = 0usize;
+    let mut max_pos = 0usize;
+    for layer in 0..layers.min(N_LAYERS) {
+        let l = &layout.layers[layer];
+        let nkv = l.n_kv_heads as usize;
+        let hd = l.head_dim as usize;
+        let token_stride_half = nkv * hd * 2;
+        let half_base = l.kv_region as usize / 2;
+        for pos in 0..kv_len {
+            for hidx in 0..token_stride_half {
+                let byte = (half_base + pos * token_stride_half + hidx) * 2;
+                let va = f16_bits_to_f32(read_half_at(a, byte));
+                let vb = f16_bits_to_f32(read_half_at(b, byte));
+                let d = (va - vb).abs();
+                if d > max_diff {
+                    max_diff = d;
+                    max_layer = layer;
+                    max_pos = pos;
+                }
+            }
+        }
+    }
+    (max_diff, max_layer, max_pos)
+}
+
+/// One denoise step with an external b4 KV prefix; returns min position entropy (nats).
+pub fn step_min_entropy_with_kv(
+    model_dir: &Path,
+    kv_src: &ProtocolObject<dyn MTLBuffer>,
+    kv_len: usize,
+    layers: usize,
+    max_seq: usize,
+    seed: u64,
+) -> Result<f32, Error> {
+    let cfg = StepSmokeConfig {
+        layers,
+        steps: 1,
+        kv_len: kv_len as u32,
+        seed,
+        max_seq,
+        finish: StepFinishMode::Full,
+        use_mps_q4: Some(false),
+        prefill_token_ids: None,
+    };
+    let (mut rt, _) = build_step_runtime(model_dir, &cfg)?;
+    let kv_bytes = kv_cache_total_bytes(rt.layout(), max_seq) as usize;
+    copy_metal_buffer(rt.kvcache(), kv_src, kv_bytes);
+    rt.set_kv_len(kv_len as u32);
+    let params = step_params_from_sampler(&SamplerConfig::default(), kv_len as u32, false);
+    let mut rng = Rng::new(seed);
+    rt.reset_block(VOCAB, &mut rng, params);
+    rt.run_denoise_step()?;
+    let st = rt.read_canvas_state();
+    Ok(step_entropy_stats(&st.entropy, &st.accept).min_entropy)
+}
+
+#[derive(Debug)]
+pub struct StepKvMpsParityResult {
+    pub kv_len: usize,
+    pub layers: usize,
+    pub native_prefix_max_l0: f32,
+    pub mps_prefix_max_l0: f32,
+    pub max_kv_diff: f32,
+    pub max_kv_diff_layer: usize,
+    pub max_kv_diff_pos: usize,
+    pub native_min_ent: f32,
+    pub mps_min_ent: f32,
+    pub ln_vocab: f32,
+    pub pass: bool,
+}
+
+/// P1.9: compare monolithic b4 KV from native vs MPS encoder prefill, then one denoise step.
+pub fn run_step_kv_mps_parity(
+    model_dir: &Path,
+    token_ids: &[u32],
+    layers: usize,
+    max_seq: usize,
+    seed: u64,
+) -> Result<StepKvMpsParityResult, Error> {
+    if token_ids.is_empty() {
+        return Err(Error::Format("step-kv-parity requires at least one token"));
+    }
+    if token_ids.len() > max_seq {
+        return Err(Error::Format("token_ids exceed max_seq"));
+    }
+    let layers = layers.max(1).min(N_LAYERS);
+    let store = DgqStore::open(model_dir)?;
+    let layout = build_layout(&build_offsets_from_store(&store), max_seq);
+    let ctx = MetalContext::new()?;
+    let kv_bytes = kv_cache_total_bytes(&layout, max_seq) as usize;
+
+    let alloc_kv = || -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
+        ctx.device
+            .newBufferWithLength_options(kv_bytes, MTLResourceOptions::StorageModeShared)
+            .ok_or(Error::Format("kv parity buffer alloc failed"))
+    };
+
+    let mut native_cache =
+        MonolithicEncoderCache::open_opt(model_dir, CANVAS, max_seq, None, Some(false))?;
+    let mut mps_cache =
+        MonolithicEncoderCache::open_opt(model_dir, CANVAS, max_seq, None, Some(true))?;
+
+    let native_buf = alloc_kv()?;
+    let mps_buf = alloc_kv()?;
+
+    let (kv_len, _) = prefill_monolithic_kv_with_cache(
+        &mut native_cache,
+        token_ids,
+        &native_buf,
+        &layout,
+        max_seq,
+        layers,
+    )?;
+    let (mps_kv_len, _) = prefill_monolithic_kv_with_cache(
+        &mut mps_cache,
+        token_ids,
+        &mps_buf,
+        &layout,
+        max_seq,
+        layers,
+    )?;
+    if mps_kv_len != kv_len {
+        return Err(Error::Format("mps/native prefill kv_len mismatch"));
+    }
+
+    let native_prefix_max_l0 = kvcache_prefix_max_abs(&native_buf, &layout, 0, kv_len);
+    let mps_prefix_max_l0 = kvcache_prefix_max_abs(&mps_buf, &layout, 0, kv_len);
+    let (max_kv_diff, max_kv_diff_layer, max_kv_diff_pos) =
+        monolithic_kv_prefix_max_diff(&native_buf, &mps_buf, &layout, kv_len, layers);
+
+    let native_min_ent = step_min_entropy_with_kv(model_dir, &native_buf, kv_len, layers, max_seq, seed)?;
+    let mps_min_ent = step_min_entropy_with_kv(model_dir, &mps_buf, kv_len, layers, max_seq, seed)?;
+
+    let ln_vocab = (VOCAB as f32).ln();
+    let kv_ok = max_kv_diff < 0.5 && mps_prefix_max_l0 > 1e-4;
+    let ent_ok = (mps_min_ent - native_min_ent).abs() < 1.0;
+    let pass = kv_ok && ent_ok;
+
+    Ok(StepKvMpsParityResult {
+        kv_len,
+        layers,
+        native_prefix_max_l0,
+        mps_prefix_max_l0,
+        max_kv_diff,
+        max_kv_diff_layer,
+        max_kv_diff_pos,
+        native_min_ent,
+        mps_min_ent,
+        ln_vocab,
         pass,
     })
 }

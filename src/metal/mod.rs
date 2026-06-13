@@ -63,7 +63,8 @@ pub use step_m0::{run_step_parity, run_step_verify, M0VerifyResult, StepParityCo
 pub use step_config::{log_validated_step_model, validate_step_model, ValidatedStepModel};
 pub use step_generate::{generate_monolithic, generate_with_session, StepGenerateConfig, StepGenerateSession};
 pub use step_kv::{
-    extend_monolithic_kv, prefill_monolithic_kv_with_cache, run_step_kv_audit,
-    MonolithicEncoderCache, StepKvAuditResult,
+    extend_monolithic_kv, monolithic_kv_prefix_max_diff, prefill_monolithic_kv_with_cache,
+    run_step_kv_audit, run_step_kv_mps_parity, MonolithicEncoderCache, StepKvAuditResult,
+    StepKvMpsParityResult,
 };
 pub use telemetry::{ForwardTelemetry, SessionTelemetry, StepPhaseTelemetry};

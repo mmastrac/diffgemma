@@ -153,6 +153,14 @@ enum Command {
         seed: u64,
         max_seq: usize,
     },
+    StepKvParity {
+        prompt: Option<String>,
+        prompt_len: usize,
+        layers: usize,
+        seed: u64,
+        max_seq: usize,
+        raw_prompt: bool,
+    },
     StepVerify {
         layers: usize,
     },
@@ -227,6 +235,22 @@ fn main() -> ExitCode {
             seed,
             max_seq,
         } => run_step_kv_check_cmd(&cli.model_dir, kv_len, layers, seed, max_seq),
+        Command::StepKvParity {
+            prompt,
+            prompt_len,
+            layers,
+            seed,
+            max_seq,
+            raw_prompt,
+        } => run_step_kv_parity_cmd(
+            &cli.model_dir,
+            prompt,
+            prompt_len,
+            layers,
+            seed,
+            max_seq,
+            raw_prompt,
+        ),
         Command::StepVerify { layers } => run_step_verify_cmd(&cli.model_dir, layers),
         Command::StepCi { layers } => run_step_ci_cmd(&cli.model_dir, layers),
         Command::StepParity {
@@ -467,6 +491,7 @@ fn run_command(
         Command::StepSmoke { .. } => ExitCode::FAILURE,
         Command::StepProbe { .. } => ExitCode::FAILURE,
         Command::StepKvCheck { .. } => ExitCode::FAILURE,
+        Command::StepKvParity { .. } => ExitCode::FAILURE,
         Command::StepVerify { .. } => ExitCode::FAILURE,
         Command::StepCi { .. } => ExitCode::FAILURE,
         Command::StepParity { .. } => ExitCode::FAILURE,
@@ -626,6 +651,96 @@ fn run_step_kv_check_cmd(
             ExitCode::FAILURE
         }
     }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn run_step_kv_parity_cmd(
+    model_dir: &std::path::Path,
+    prompt: Option<String>,
+    prompt_len: usize,
+    layers: usize,
+    seed: u64,
+    max_seq: usize,
+    raw_prompt: bool,
+) -> ExitCode {
+    use metal::run_step_kv_mps_parity;
+
+    if !dgq::store::looks_like_dgq_dir(model_dir) {
+        eprintln!("error: step-kv-parity requires a .dgq directory");
+        return ExitCode::FAILURE;
+    }
+    let vocab = match crate::config::ModelConfig::load(model_dir) {
+        Ok(c) => c.text_config.vocab_size,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let token_ids = match build_prompt_tokens(
+        model_dir,
+        prompt.as_deref(),
+        prompt_len,
+        vocab,
+        raw_prompt,
+        &[],
+    ) {
+        Ok(ids) => ids,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!(
+        "step-kv-parity: {} prompt tokens, layers={}",
+        token_ids.len(),
+        layers.max(1).min(30)
+    );
+    match run_step_kv_mps_parity(
+        model_dir,
+        &token_ids,
+        layers,
+        max_seq.max(64),
+        seed,
+    ) {
+        Ok(r) => {
+            println!("step-kv-parity:");
+            println!("  kv_len:              {}", r.kv_len);
+            println!("  layers:              {}", r.layers);
+            println!("  native_prefix_l0:    {:.6}", r.native_prefix_max_l0);
+            println!("  mps_prefix_l0:       {:.6}", r.mps_prefix_max_l0);
+            println!(
+                "  max_kv_diff:         {:.6} (layer {} pos {})",
+                r.max_kv_diff, r.max_kv_diff_layer, r.max_kv_diff_pos
+            );
+            println!("  native_min_ent:      {:.4}", r.native_min_ent);
+            println!("  mps_min_ent:         {:.4}", r.mps_min_ent);
+            println!("  ln_vocab:            {:.4}", r.ln_vocab);
+            println!("  pass:                {}", r.pass);
+            if r.pass {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn run_step_kv_parity_cmd(
+    _model_dir: &std::path::Path,
+    _prompt: Option<String>,
+    _prompt_len: usize,
+    _layers: usize,
+    _seed: u64,
+    _max_seq: usize,
+    _raw_prompt: bool,
+) -> ExitCode {
+    eprintln!("error: step-kv-parity requires --features metal on macOS");
+    ExitCode::FAILURE
 }
 
 #[cfg(not(all(feature = "metal", target_os = "macos")))]
@@ -1550,6 +1665,14 @@ fn parse_cli() -> Cli {
             seed,
             max_seq: step_max_seq.max(64),
         },
+        Some("step-kv-parity") => Command::StepKvParity {
+            prompt: prompt.clone(),
+            prompt_len,
+            layers: bench_layers.max(1).min(30),
+            seed,
+            max_seq: step_max_seq.max(64),
+            raw_prompt,
+        },
         Some("step-verify") => Command::StepVerify {
             layers: bench_layers.max(1).min(30),
         },
@@ -1573,7 +1696,7 @@ fn parse_cli() -> Cli {
         Some(cmd) => {
             eprintln!("unknown command: {cmd}");
             eprintln!(
-                "usage: diffgemma-mps [-p PROMPT] [--raw] [summary|config|weights <name>|quantize|convert-model|step-smoke|step-probe|step-kv-check|step-verify|step-ci|step-parity|bench-step-kernel|bench-step|bench-prefill|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-monolithic|generate-monolithic-parity|generate-parity|chat|tokenize <text>|gemm|attention]"
+                "usage: diffgemma-mps [-p PROMPT] [--raw] [summary|config|weights <name>|quantize|convert-model|step-smoke|step-probe|step-kv-check|step-kv-parity|step-verify|step-ci|step-parity|bench-step-kernel|bench-step|bench-prefill|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-monolithic|generate-monolithic-parity|generate-parity|chat|tokenize <text>|gemm|attention]"
             );
             eprintln!("  default (no command): generate-gpu with --features metal (or generate-monolithic with DGQ_MONOLITHIC=1 / --monolithic on .dgq)");
             eprintln!("  prompts: chat template applied by default; use --raw for bare BPE (-p \"Hello\" -> [9259])");
