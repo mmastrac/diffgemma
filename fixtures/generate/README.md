@@ -22,7 +22,22 @@ Fixtures are tagged by `weights_profile` in the JSON (`safetensors` for bf16, `d
 | `dgq_hello_steps2_full.json` | `--steps 2` full | ~40s |
 | `dgq_hello_steps2_layers3.json` | `--steps 2 --layers 3` | ~5s |
 
-Refresh after intentional sampler/decoder changes:
+## Monolithic step kernel (`profile: monolithic`)
+
+Forward-only regression limits vs engine (`step-parity`). Use `DGQ_MPS_Q4=0` for deterministic Q4.
+
+| File | Config |
+|------|--------|
+| `monolithic_parity_layers3_seed42.json` | `step-parity --layers 3 --seed 42` |
+| `monolithic_parity_layers30_seed42.json` | `step-parity --layers 30 --seed 42` |
+| `monolithic_sampler_layers3.json` | `step-verify` sampler goldens (3 seeds × 4 steps) |
+
+Refresh after intentional monolithic/kernel changes:
+
+```bash
+DGQ_MPS_Q4=0 cargo run --release --features metal -- -m /tmp/quantized-weights step-parity --layers 3 --seed 42
+```
+
 
 ```bash
 # bf16

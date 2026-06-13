@@ -27,6 +27,7 @@ mod bench_gemm;
 mod router;
 mod sampler;
 mod sampler_kernels;
+mod step_m0;
 mod step_kernel;
 mod self_conditioning;
 mod telemetry;
@@ -50,7 +51,8 @@ pub use probe::{print_probe_result, probe_device, DeviceProbeResult};
 pub use bench_gemm::{bench_custom_kernel, bench_mps_oracle, parse_shapes, print_bench_rows};
 pub use sampler::{sampler_step_gpu, upload_logits_gpu};
 pub use step_kernel::{
-    bench_step_kernel, run_step_probe, run_step_smoke, StepBenchResult, StepFinishMode,
-    StepProbeResult, StepSmokeConfig, StepSmokeResult,
+    bench_step_kernel, run_step_forward, run_step_probe, run_step_smoke, StepBenchResult,
+    StepFinishMode, StepForwardOutput, StepProbeResult, StepSmokeConfig, StepSmokeResult,
 };
+pub use step_m0::{run_step_parity, run_step_verify, M0VerifyResult, StepParityConfig, StepParityResult};
 pub use telemetry::{ForwardTelemetry, SessionTelemetry, StepPhaseTelemetry};

@@ -119,6 +119,15 @@ enum Command {
         seed: u64,
         max_seq: usize,
     },
+    StepVerify {
+        layers: usize,
+    },
+    StepParity {
+        layers: usize,
+        kv_len: u32,
+        seed: u64,
+        max_seq: usize,
+    },
     BenchStepKernel {
         layers: usize,
         kv_len: u32,
@@ -155,6 +164,13 @@ fn main() -> ExitCode {
             seed,
             max_seq,
         } => run_step_probe_cmd(&cli.model_dir, layers, kv_len, seed, max_seq),
+        Command::StepVerify { layers } => run_step_verify_cmd(&cli.model_dir, layers),
+        Command::StepParity {
+            layers,
+            kv_len,
+            seed,
+            max_seq,
+        } => run_step_parity_cmd(&cli.model_dir, layers, kv_len, seed, max_seq),
         Command::BenchStepKernel {
             layers,
             kv_len,
@@ -313,6 +329,8 @@ fn run_command(m: &model::Model, model_dir: &std::path::Path, command: Command) 
         Command::BenchGemm { .. } => ExitCode::FAILURE,
         Command::StepSmoke { .. } => ExitCode::FAILURE,
         Command::StepProbe { .. } => ExitCode::FAILURE,
+        Command::StepVerify { .. } => ExitCode::FAILURE,
+        Command::StepParity { .. } => ExitCode::FAILURE,
         Command::BenchStepKernel { .. } => ExitCode::FAILURE,
     }
 }
@@ -335,6 +353,7 @@ fn step_kernel_config(
         } else {
             metal::StepFinishMode::Full
         },
+        use_mps_q4: None,
     }
 }
 
@@ -359,6 +378,7 @@ fn run_step_probe_cmd(
         seed,
         max_seq,
         finish: StepFinishMode::ForwardOnly,
+        use_mps_q4: None,
     };
     match run_step_probe(model_dir, cfg) {
         Ok(r) => {
@@ -387,6 +407,113 @@ fn run_step_probe_cmd(
     _max_seq: usize,
 ) -> ExitCode {
     eprintln!("error: step-probe requires --features metal on macOS");
+    ExitCode::FAILURE
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn run_step_verify_cmd(model_dir: &std::path::Path, layers: usize) -> ExitCode {
+    use metal::run_step_verify;
+
+    if !dgq::store::looks_like_dgq_dir(model_dir) {
+        eprintln!("error: step-verify requires a .dgq directory");
+        return ExitCode::FAILURE;
+    }
+    let probe_layers = layers.max(1).min(30);
+    match run_step_verify(Some(model_dir), probe_layers) {
+        Ok(r) => {
+            let ok = r.all_pass();
+            for c in &r.checks {
+                let mark = if c.pass { "ok" } else { "FAIL" };
+                println!("  [{mark}] {}: {}", c.id, c.detail);
+            }
+            if ok {
+                println!("step-verify ok ({probe_layers}L integration)");
+                ExitCode::SUCCESS
+            } else {
+                eprintln!("step-verify failed");
+                ExitCode::FAILURE
+            }
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn run_step_verify_cmd(_model_dir: &std::path::Path, _layers: usize) -> ExitCode {
+    eprintln!("error: step-verify requires --features metal on macOS");
+    ExitCode::FAILURE
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn run_step_parity_cmd(
+    model_dir: &std::path::Path,
+    layers: usize,
+    kv_len: u32,
+    seed: u64,
+    max_seq: usize,
+) -> ExitCode {
+    use metal::{run_step_parity, StepParityConfig};
+
+    if !dgq::store::looks_like_dgq_dir(model_dir) {
+        eprintln!("error: step-parity requires a .dgq directory");
+        return ExitCode::FAILURE;
+    }
+    let cfg = StepParityConfig {
+        layers: layers.max(1).min(30),
+        kv_len,
+        seed,
+        max_seq: max_seq.max(64),
+        ..StepParityConfig::default()
+    };
+    match run_step_parity(model_dir, &cfg) {
+        Ok(r) => {
+            if r.skipped {
+                println!(
+                    "step-parity skipped (kv_len={}): {}",
+                    r.kv_len,
+                    r.skip_reason.as_deref().unwrap_or("?")
+                );
+                return ExitCode::SUCCESS;
+            }
+            println!(
+                "step-parity: layers={} kv_len={} seed={}",
+                r.layers, r.kv_len, r.seed
+            );
+            println!(
+                "  hidden max_abs={:.4} (tol {:.1})",
+                r.hidden_max_abs, r.hidden_tol
+            );
+            println!(
+                "  logits max_abs={:.4} (tol {:.1})",
+                r.logits_max_abs, r.logits_tol
+            );
+            if r.pass {
+                println!("step-parity ok");
+                ExitCode::SUCCESS
+            } else {
+                eprintln!("step-parity failed");
+                ExitCode::FAILURE
+            }
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn run_step_parity_cmd(
+    _model_dir: &std::path::Path,
+    _layers: usize,
+    _kv_len: u32,
+    _seed: u64,
+    _max_seq: usize,
+) -> ExitCode {
+    eprintln!("error: step-parity requires --features metal on macOS");
     ExitCode::FAILURE
 }
 
@@ -959,6 +1086,15 @@ fn parse_cli() -> Cli {
             seed,
             max_seq: step_max_seq.max(64),
         },
+        Some("step-verify") => Command::StepVerify {
+            layers: bench_layers.max(1).min(30),
+        },
+        Some("step-parity") => Command::StepParity {
+            layers: bench_layers.max(1).min(30),
+            kv_len: step_kv_len,
+            seed,
+            max_seq: step_max_seq.max(64),
+        },
         Some("bench-step-kernel") => Command::BenchStepKernel {
             layers: bench_layers.max(1).min(30),
             kv_len: step_kv_len,
@@ -970,7 +1106,7 @@ fn parse_cli() -> Cli {
         Some(cmd) => {
             eprintln!("unknown command: {cmd}");
             eprintln!(
-                "usage: diffgemma-mps [-p PROMPT] [summary|config|weights <name>|quantize|convert-model|step-smoke|step-probe|bench-step-kernel|bench-step|bench-prefill|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-parity|tokenize <text>|gemm|attention]"
+                "usage: diffgemma-mps [-p PROMPT] [summary|config|weights <name>|quantize|convert-model|step-smoke|step-probe|step-verify|step-parity|bench-step-kernel|bench-step|bench-prefill|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-parity|tokenize <text>|gemm|attention]"
             );
             eprintln!("  default (no command): generate-gpu with --features metal");
             eprintln!("  generate-parity: GPU vs checked-in golden (use --compare-cpu for slow CPU path)");

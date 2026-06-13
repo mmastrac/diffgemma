@@ -151,6 +151,8 @@ pub struct StepSmokeConfig {
     pub seed: u64,
     pub max_seq: usize,
     pub finish: StepFinishMode,
+    /// When set, overrides `DGQ_MPS_Q4` for this run (deterministic goldens use `false`).
+    pub use_mps_q4: Option<bool>,
 }
 
 impl Default for StepSmokeConfig {
@@ -162,6 +164,7 @@ impl Default for StepSmokeConfig {
             seed: 42,
             max_seq: 512,
             finish: StepFinishMode::Full,
+            use_mps_q4: None,
         }
     }
 }
@@ -1181,7 +1184,7 @@ impl StepEnc<'_> {
     }
 }
 
-fn init_canvas_state(seed: u64, vocab: usize) -> CanvasState {
+pub fn init_canvas_state(seed: u64, vocab: usize) -> CanvasState {
     let mut rng = Rng::new(seed);
     let ids_vec = initialize_canvas(CANVAS, vocab, &mut rng);
     let mut ids = [0u32; CANVAS];
@@ -1233,7 +1236,7 @@ fn read_struct<T: Copy>(buf: &ProtocolObject<dyn MTLBuffer>) -> T {
     unsafe { *(buf.contents().as_ptr() as *const T) }
 }
 
-fn f16_bits_to_f32(bits: u16) -> f32 {
+pub fn f16_bits_to_f32(bits: u16) -> f32 {
     let sign = ((bits >> 15) & 1) as u32;
     let exp = ((bits >> 10) & 0x1f) as u32;
     let mant = (bits & 0x3ff) as u32;
@@ -1443,7 +1446,7 @@ fn build_step_runtime(model_dir: &Path, cfg: &StepSmokeConfig) -> Result<(StepRu
             bufs,
             gpu_blob,
             mps_matmul,
-            use_mps_q4: step_use_mps_q4_from_env(),
+            use_mps_q4: cfg.use_mps_q4.unwrap_or_else(step_use_mps_q4_from_env),
             layout,
             layers,
         },
@@ -1531,6 +1534,37 @@ pub fn bench_step_kernel(
         per_step,
         iters,
         finish,
+    })
+}
+
+/// Read `elems` half values from a shared Metal buffer as f32.
+pub fn read_half_buffer_f32(
+    buf: &ProtocolObject<dyn MTLBuffer>,
+    byte_off: usize,
+    elems: usize,
+) -> Vec<f32> {
+    let ptr = unsafe { buf.contents().as_ptr().add(byte_off) as *const u16 };
+    (0..elems)
+        .map(|i| unsafe { f16_bits_to_f32(*ptr.add(i)) })
+        .collect()
+}
+
+#[derive(Debug)]
+pub struct StepForwardOutput {
+    pub norm_hidden: Vec<f32>,
+    pub logits: Vec<f32>,
+    pub token_ids: Vec<u32>,
+}
+
+/// Forward-only monolithic pass: final norm hidden + softcapped logits.
+pub fn run_step_forward(model_dir: &Path, cfg: &StepSmokeConfig) -> Result<StepForwardOutput, Error> {
+    let (mut rt, _) = build_step_runtime(model_dir, cfg)?;
+    rt.run_forward_once(StepFinishMode::ForwardOnly)?;
+    let state: CanvasState = read_struct(&rt.bufs.state);
+    Ok(StepForwardOutput {
+        norm_hidden: read_half_buffer_f32(&rt.bufs.arena, A_TMP as usize, CANVAS * HID),
+        logits: read_half_buffer_f32(&rt.bufs.logits, 0, CANVAS * VOCAB),
+        token_ids: state.ids.to_vec(),
     })
 }
 

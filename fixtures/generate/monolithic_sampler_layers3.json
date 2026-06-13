@@ -1,0 +1,29 @@
+{
+  "name": "monolithic_sampler_layers3",
+  "profile": "monolithic",
+  "layers": 3,
+  "steps": 4,
+  "kv_len": 0,
+  "weights_profile": "dgq_q4",
+  "cases": [
+    {
+      "seed": 42,
+      "ids_head": [100691, 146483, 261606, 21027, 27498, 186817, 242016, 50996],
+      "step": 4,
+      "stop_flag": 1
+    },
+    {
+      "seed": 43,
+      "ids_head": [22431, 59629, 27721, 31328, 26087, 205511, 190278, 83847],
+      "step": 4,
+      "stop_flag": 1
+    },
+    {
+      "seed": 44,
+      "ids_head": [206314, 234920, 55981, 41628, 24676, 224205, 138541, 116698],
+      "step": 4,
+      "stop_flag": 1
+    }
+  ],
+  "note": "DGQ_MPS_Q4=0; MoE atomic f32 scatter may drift between back-to-back in-process runs — compare fresh-process goldens only."
+}

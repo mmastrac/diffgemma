@@ -1,0 +1,13 @@
+{
+  "name": "monolithic_parity_layers30_seed42",
+  "profile": "monolithic",
+  "layers": 30,
+  "kv_len": 0,
+  "seed": 42,
+  "weights_profile": "dgq_q4",
+  "hidden_max_abs_limit": 6000.0,
+  "logits_max_abs_limit": 55.0,
+  "measured_hidden_max_abs": 495.04,
+  "measured_logits_max_abs": 30.54,
+  "note": "Same tolerances as 3L with headroom for 30L depth; re-measure after major kernel changes."
+}

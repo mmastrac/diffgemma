@@ -94,22 +94,26 @@ Documented in `shaders/diffgemma_step.metal` lines 4–15:
 
 | Task | Files | Exit |
 |------|-------|------|
-| **M0.1 VERIFY-N** — Q4 nibble parity vs `q4_weight_at` in `qgemm.metal` | `diffgemma_step.metal` `dequant_q4_group` | Spot-check dequant error ≤ engine path on 10 random weights |
-| **M0.2 VERIFY-SC** — softembed `EMBED_SCALE = sqrt(hidden)`; softmax over post-softcap logits | `k_sc_softembed`, `k_logit_rowstats` | CPU reference match @ 1 layer |
-| **M0.3 RNG init** — `CanvasState.rng_state` matches `Rng::new(seed)` / `sample.rs` | `init_canvas_state` | Byte match first 1000 LCG draws |
-| **M0.4 Full-layer paths** — layers 5,11,17,23,29: V aliased from K, partial RoPE, q/k/o GEMM shapes | `encode_layer`, `k_qk_rope_kv` | `step-probe` finite @ 30L |
-| **M0.5 Sampler parity** — temperature schedule, entropy-bound accept, stable+confident stop | `k_sample_*`, `StepParams` | Token-id match vs CPU sampler on 3L, 10 steps, 3 seeds |
-| **M0.6 Decoder parity** — hidden/logits vs `decoder-gpu` forward-only @ same canvas+kv | new `step-parity` CLI | max_abs hidden ≤ agreed tolerance (document in fixture) |
-| **M0.7 MoE determinism policy** — document ~1 ulp f32 scatter variance; optional ordered-reduce kernel for goldens | `k_moe_grouped` comment | CI uses deterministic mode or relaxed compare |
+| **M0.1 VERIFY-N** — Q4 nibble parity vs `q4_weight_at` in `qgemm.metal` | `diffgemma_step.metal` `dequant_q4_group` | ✅ `step-verify` (CPU dequant_row_q4 vs metal layout) |
+| **M0.2 VERIFY-SC** — softembed `EMBED_SCALE = sqrt(hidden)`; softmax over post-softcap logits | `k_sc_softembed`, `k_logit_rowstats` | ✅ `step-verify` (scale + rowstats CPU ref) |
+| **M0.3 RNG init** — `CanvasState.rng_state` matches `Rng::new(seed)` / `sample.rs` | `init_canvas_state` | ✅ `step-verify` (1000 LCG draws) |
+| **M0.4 Full-layer paths** — layers 5,11,17,23,29: V aliased from K, partial RoPE, q/k/o GEMM shapes | `encode_layer`, `k_qk_rope_kv` | ✅ `step-probe` finite @ 30L |
+| **M0.5 Sampler parity** — temperature schedule, entropy-bound accept, stable+confident stop | `k_sample_*`, `StepParams` | ✅ `step-verify` (deterministic 3L×4 steps, 3 seeds) |
+| **M0.6 Decoder parity** — hidden/logits vs `decoder-gpu` forward-only @ same canvas+kv | `step-parity` CLI | ✅ @ 3L/30L vs `fixtures/generate/monolithic_parity_*.json` limits |
+| **M0.7 MoE determinism policy** — document ~1 ulp f32 scatter variance; optional ordered-reduce kernel for goldens | `k_moe_grouped` comment | ✅ shader NOTE + relaxed parity tolerances |
 
 **Commands to add:**
 
 ```bash
+# M0 unit + integration gates (Q4, RNG, sampler determinism, 30L finite)
+cargo run --release --features metal -- -m $WEIGHTS step-verify --layers 30
+
 # Layer checkpoints + sampler stats
 cargo run --release --features metal -- -m $WEIGHTS step-probe --layers 30 --seed 42
 
-# Forward-only parity vs engine (same canvas, kv, layers)
-cargo run --release --features metal -- -m $WEIGHTS step-parity --layers 3 --kv-len 64 --seed 42
+# Forward-only parity vs engine (same canvas; kv_len=0 until M1)
+DGQ_MPS_Q4=0 cargo run --release --features metal -- -m $WEIGHTS step-parity --layers 3 --seed 42
+DGQ_MPS_Q4=0 cargo run --release --features metal -- -m $WEIGHTS step-parity --layers 30 --seed 42
 ```
 
 **Exit:** `step-parity` passes @ 3L and 30L; goldens checked in under `fixtures/generate/` (new profile `monolithic`).

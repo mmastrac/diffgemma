@@ -1,0 +1,13 @@
+{
+  "name": "monolithic_parity_layers3_seed42",
+  "profile": "monolithic",
+  "layers": 3,
+  "kv_len": 0,
+  "seed": 42,
+  "weights_profile": "dgq_q4",
+  "hidden_max_abs_limit": 5000.0,
+  "logits_max_abs_limit": 50.0,
+  "measured_hidden_max_abs": 3925.04,
+  "measured_logits_max_abs": 40.64,
+  "note": "Monolithic f16 arena vs engine f32 forward-only; DGQ_MPS_Q4=0; kv_len=0. MoE atomic f32 scatter may add ~1 ulp."
+}

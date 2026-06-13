@@ -17,6 +17,11 @@ impl Rng {
         }
     }
 
+    /// Resume LCG from a stored state (matches `CanvasState.rng_state` after canvas init).
+    pub fn from_state(state: u64) -> Self {
+        Self { state }
+    }
+
     pub fn next_u32(&mut self) -> u32 {
         self.state = self
             .state
