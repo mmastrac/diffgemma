@@ -1640,7 +1640,17 @@ pub fn log_step_memory_budget(blob_bytes: u64, max_seq: usize, layout: &ModelLay
     );
 }
 
-pub fn build_step_runtime(model_dir: &Path, cfg: &StepSmokeConfig) -> Result<(StepRuntime, std::time::Duration), Error> {
+#[derive(Debug, Clone, Copy)]
+pub struct StepRuntimeBuildTiming {
+    pub compile: std::time::Duration,
+    pub total: std::time::Duration,
+}
+
+pub fn build_step_runtime(
+    model_dir: &Path,
+    cfg: &StepSmokeConfig,
+) -> Result<(StepRuntime, StepRuntimeBuildTiming), Error> {
+    let build_started = Instant::now();
     let validated = super::step_config::validate_step_model(model_dir)?;
     super::step_config::log_validated_step_model(&validated);
 
@@ -1732,6 +1742,14 @@ pub fn build_step_runtime(model_dir: &Path, cfg: &StepSmokeConfig) -> Result<(St
     }
 
     let mps_matmul = MpsMatmulCache::new(ctx.device.clone());
+    let build = StepRuntimeBuildTiming {
+        compile,
+        total: build_started.elapsed(),
+    };
+    eprintln!(
+        "step-kernel: runtime built (total={:.2?}, compile={:.2?})",
+        build.total, build.compile
+    );
     Ok((
         StepRuntime {
             ctx,
@@ -1744,7 +1762,7 @@ pub fn build_step_runtime(model_dir: &Path, cfg: &StepSmokeConfig) -> Result<(St
             layout,
             layers,
         },
-        compile,
+        build,
     ))
 }
 
@@ -1808,7 +1826,7 @@ pub fn bench_step_kernel(
     iters: usize,
 ) -> Result<StepBenchResult, Error> {
     let iters = iters.max(1);
-    let (mut rt, compile) = build_step_runtime(model_dir, &cfg)?;
+    let (mut rt, build) = build_step_runtime(model_dir, &cfg)?;
     let finish = cfg.finish;
 
     let warmup_started = Instant::now();
@@ -1823,7 +1841,7 @@ pub fn bench_step_kernel(
     let per_step = elapsed / iters as u32;
 
     Ok(StepBenchResult {
-        compile,
+        compile: build.compile,
         warmup,
         per_step,
         iters,

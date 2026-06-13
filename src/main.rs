@@ -116,6 +116,7 @@ enum Command {
         layers: usize,
         iters: usize,
         seed: u64,
+        repeat_prefill: bool,
     },
     ProbeDevice,
     BenchGemm {
@@ -382,7 +383,8 @@ fn run_command(
             layers,
             iters,
             seed,
-        } => run_bench_prefill(m, prompt_len, layers, iters, seed),
+            repeat_prefill,
+        } => run_bench_prefill(m, model_dir, prompt_len, layers, iters, seed, repeat_prefill),
         Command::Prefill => run_prefill(m),
         Command::Generate {
             prompt,
@@ -1179,6 +1181,7 @@ fn parse_cli() -> Cli {
     let mut bench_gemm_shapes = String::from("256x2816x2816,33x2816x1408");
     let mut bench_gemm_oracle: Option<String> = None;
     let mut bench_prefill_len = 1usize;
+    let mut bench_repeat_prefill = false;
     let mut step_kv_len = 0u32;
     let mut step_max_seq = 512usize;
     let mut step_forward_only = false;
@@ -1243,6 +1246,7 @@ fn parse_cli() -> Cli {
                 }
             }
             "--compare-cpu" => compare_cpu = true,
+            "--repeat-prefill" => bench_repeat_prefill = true,
             "--no-early-stop" => no_early_stop = true,
             "--write-golden" => {
                 if let Some(v) = args.next() {
@@ -1489,6 +1493,7 @@ fn parse_cli() -> Cli {
             layers: bench_layers.max(1),
             iters: bench_iters.max(1),
             seed,
+            repeat_prefill: bench_repeat_prefill,
         },
         Some("probe-device") => Command::ProbeDevice,
         Some("bench-gemm") => Command::BenchGemm {
@@ -2335,10 +2340,12 @@ fn run_bench_step(
 
 fn run_bench_prefill(
     m: &model::Model,
+    model_dir: &std::path::Path,
     prompt_len: usize,
     layers: usize,
     iters: usize,
     seed: u64,
+    repeat_prefill: bool,
 ) -> ExitCode {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     {
@@ -2350,12 +2357,14 @@ fn run_bench_prefill(
         let iters = iters.max(1);
         let canvas = m.config.canvas_length;
         let vocab = m.config.text_config.vocab_size;
+        let max_seq = prompt_len.max(512);
 
         let mut token_ids = vec![0u32; prompt_len];
         for (i, id) in token_ids.iter_mut().enumerate() {
             *id = ((i as u64 * 131 + seed + 7) % vocab.max(1) as u64) as u32;
         }
 
+        let setup_started = std::time::Instant::now();
         let mut enc_scratch = EncoderScratch::new(prompt_len.max(canvas), &m.config);
         let mut dec_scratch = GpuDecoderScratch::new(canvas, &m.config);
         let mut gpu_weights = match load_weight_cache(
@@ -2384,11 +2393,13 @@ fn run_bench_prefill(
         };
 
         eprintln!(
-            "bench-prefill setup (prompt_len={prompt_len}, layers={layers}, quantized={})...",
-            m.weights.is_quantized()
+            "bench-prefill setup (prompt_len={prompt_len}, layers={layers}, quantized={}, repeat_prefill={repeat_prefill}) ({:.2?})",
+            m.weights.is_quantized(),
+            setup_started.elapsed()
         );
 
         // Warmup
+        let warmup_started = std::time::Instant::now();
         if m.weights.is_quantized() {
             if let Err(err) = metal::prefill_gpu(
                 &m.weights,
@@ -2411,8 +2422,9 @@ fn run_bench_prefill(
                 return ExitCode::FAILURE;
             }
         }
+        eprintln!("bench-prefill warmup ({:.2?})", warmup_started.elapsed());
 
-        eprintln!("bench-prefill running {iters} iterations...");
+        eprintln!("bench-prefill running {iters} isolated iterations...");
         let started = std::time::Instant::now();
         for _ in 0..iters {
             if m.weights.is_quantized() {
@@ -2445,13 +2457,104 @@ fn run_bench_prefill(
         println!("  prompt_len: {prompt_len}");
         println!("  layers:     {layers}");
         println!("  iters:      {iters}");
-        println!("  per_run:    {per_run:.2?}");
-        println!("  gate (≤0.5s @ 1 tok): {}", if per_run.as_secs_f64() <= 0.5 { "pass" } else { "fail" });
+        println!("  isolated per_run: {per_run:.2?}");
+        println!(
+            "  gate (≤0.5s @ 1 tok): {}",
+            if per_run.as_secs_f64() <= 0.5 {
+                "pass"
+            } else {
+                "fail"
+            }
+        );
+
+        if repeat_prefill {
+            use metal::{
+                build_step_runtime, prefill_monolithic_kv_with_cache, MonolithicEncoderCache,
+                StepFinishMode, StepSmokeConfig, CANVAS,
+            };
+
+            eprintln!("bench-prefill: repeat-prefill path (step runtime resident)...");
+            let path_started = std::time::Instant::now();
+            let smoke_cfg = StepSmokeConfig {
+                layers,
+                steps: 1,
+                kv_len: 0,
+                seed,
+                max_seq,
+                finish: StepFinishMode::Full,
+                use_mps_q4: None,
+                prefill_token_ids: None,
+            };
+            let (mut rt, build) = match build_step_runtime(model_dir, &smoke_cfg) {
+                Ok(v) => v,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            eprintln!(
+                "bench-prefill: step runtime ready (total={:.2?}, compile={:.2?}) ({:.2?})",
+                build.total,
+                build.compile,
+                path_started.elapsed()
+            );
+
+            let encoder_started = std::time::Instant::now();
+            let shared_blob = rt.shared_dgq_blob();
+            let mut encoder = match MonolithicEncoderCache::open_opt(
+                model_dir,
+                CANVAS,
+                max_seq,
+                Some(shared_blob),
+                None,
+            ) {
+                Ok(c) => c,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            eprintln!(
+                "bench-prefill: encoder open ({:.2?})",
+                encoder_started.elapsed()
+            );
+
+            for turn in 1..=2 {
+                let turn_started = std::time::Instant::now();
+                match prefill_monolithic_kv_with_cache(
+                    &mut encoder,
+                    &token_ids,
+                    rt.kvcache(),
+                    rt.layout(),
+                    max_seq,
+                    layers,
+                ) {
+                    Ok((kv_len, timing)) => {
+                        eprintln!(
+                            "bench-prefill: monolithic prefill turn {turn} kv_len={kv_len} ({:.2?}, gpu_forward={:.1}ms kv_pack={:.1}ms total={:.1}ms)",
+                            turn_started.elapsed(),
+                            timing.gpu_forward_ms,
+                            timing.kv_pack_ms,
+                            timing.total_ms
+                        );
+                    }
+                    Err(err) => {
+                        eprintln!("error: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            eprintln!(
+                "bench-prefill: repeat-prefill path done ({:.2?})",
+                path_started.elapsed()
+            );
+        }
+
         ExitCode::SUCCESS
     }
     #[cfg(not(all(feature = "metal", target_os = "macos")))]
     {
-        let _ = (m, prompt_len, layers, iters, seed);
+        let _ = (m, model_dir, prompt_len, layers, iters, seed, repeat_prefill);
         eprintln!("error: bench-prefill requires --features metal on macOS");
         ExitCode::FAILURE
     }

@@ -97,6 +97,7 @@ impl PipelineArchiveCache {
     }
 
     fn open(device: &ProtocolObject<dyn MTLDevice>) -> Result<Self, Error> {
+        let open_started = std::time::Instant::now();
         if !cache_enabled() {
             return Self::open_ephemeral(device);
         }
@@ -128,9 +129,10 @@ impl PipelineArchiveCache {
             })?;
 
         eprintln!(
-            "metal pipeline cache: {} ({})",
+            "metal pipeline cache: {} ({}, {:.2?})",
             cache_file.display(),
-            if existed { "loaded" } else { "new" }
+            if existed { "loaded" } else { "new" },
+            open_started.elapsed()
         );
 
         Ok(Self {
@@ -193,10 +195,12 @@ impl PipelineArchiveCache {
         let Some(url) = NSURL::from_file_path(&self.cache_file) else {
             return;
         };
+        let save_started = std::time::Instant::now();
         match self.archive.serializeToURL_error(&url) {
             Ok(()) => eprintln!(
-                "metal pipeline cache: saved {}",
-                self.cache_file.display()
+                "metal pipeline cache: saved {} ({:.2?})",
+                self.cache_file.display(),
+                save_started.elapsed()
             ),
             Err(e) => eprintln!(
                 "warning: metal pipeline cache serialize failed: {}",

@@ -55,11 +55,15 @@ pub use probe::{print_probe_result, probe_device, DeviceProbeResult};
 pub use bench_gemm::{bench_custom_kernel, bench_mps_oracle, parse_shapes, print_bench_rows};
 pub use sampler::{sampler_step_gpu, upload_logits_gpu};
 pub use step_kernel::{
-    bench_step_kernel, run_step_forward, run_step_probe, run_step_smoke, StepBenchResult,
-    StepFinishMode, StepForwardOutput, StepProbeResult, StepSmokeConfig, StepSmokeResult,
+    bench_step_kernel, build_step_runtime, run_step_forward, run_step_probe, run_step_smoke,
+    StepBenchResult, StepFinishMode, StepForwardOutput, StepProbeResult, StepSmokeConfig,
+    StepSmokeResult, CANVAS,
 };
 pub use step_m0::{run_step_parity, run_step_verify, M0VerifyResult, StepParityConfig, StepParityResult};
 pub use step_config::{log_validated_step_model, validate_step_model, ValidatedStepModel};
 pub use step_generate::{generate_monolithic, generate_with_session, StepGenerateConfig, StepGenerateSession};
-pub use step_kv::{extend_monolithic_kv, run_step_kv_audit, StepKvAuditResult};
+pub use step_kv::{
+    extend_monolithic_kv, prefill_monolithic_kv_with_cache, run_step_kv_audit,
+    MonolithicEncoderCache, StepKvAuditResult,
+};
 pub use telemetry::{ForwardTelemetry, SessionTelemetry, StepPhaseTelemetry};

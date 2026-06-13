@@ -70,8 +70,11 @@ pub struct StepGenerateSession {
 impl StepGenerateSession {
     pub fn open(model_dir: &Path, cfg: &StepGenerateConfig) -> Result<(Self, Duration), Error> {
         let layers = cfg.layers.min(N_LAYERS).max(1);
-        let (rt, compile) = build_step_runtime(model_dir, &smoke_config(cfg))?;
-        eprintln!("step-generate: runtime ready ({compile:.2?})");
+        let (rt, build) = build_step_runtime(model_dir, &smoke_config(cfg))?;
+        eprintln!(
+            "step-generate: runtime ready (total={:.2?}, compile={:.2?})",
+            build.total, build.compile
+        );
         Ok((
             Self {
                 rt,
@@ -79,7 +82,7 @@ impl StepGenerateSession {
                 layers,
                 encoder: None,
             },
-            compile,
+            build.compile,
         ))
     }
 
@@ -116,6 +119,7 @@ pub fn generate_with_session(
     let model_dir = session.model_dir.as_path();
     let shared_blob = session.rt.shared_dgq_blob();
     if session.encoder.is_none() {
+        let encoder_started = Instant::now();
         session.encoder = Some(MonolithicEncoderCache::open_opt(
             model_dir,
             canvas_len,
@@ -123,23 +127,30 @@ pub fn generate_with_session(
             Some(shared_blob),
             cfg.use_mps_q4,
         )?);
+        eprintln!(
+            "step-generate: encoder cache ready ({:.2?})",
+            encoder_started.elapsed()
+        );
     }
     let encoder = session.encoder.as_mut().expect("encoder cache");
     let rt = &mut session.rt;
 
     let prefill_started = Instant::now();
-    let kv_len = prefill_monolithic_kv_with_cache(
+    let (kv_len, prefill_timing) = prefill_monolithic_kv_with_cache(
         encoder,
         prompt_token_ids,
         rt.kvcache(),
         rt.layout(),
         cfg.max_seq,
         layers,
-    )?
-    .0;
+    )?;
     rt.set_kv_len(kv_len as u32);
     let prefill_elapsed = prefill_started.elapsed();
-    eprintln!("step-generate: prefilled kv_len={kv_len}");
+    eprintln!(
+        "step-generate: prefilled kv_len={kv_len} ({prefill_elapsed:.2?}, gpu_forward={:.1}ms kv_pack={:.1}ms)",
+        prefill_timing.gpu_forward_ms,
+        prefill_timing.kv_pack_ms
+    );
 
     let mut sequences = prompt_token_ids.to_vec();
     let mut rng = Rng::new(cfg.seed);
@@ -196,7 +207,8 @@ pub fn generate_with_session(
                 break;
             }
         }
-        denoise_elapsed += block_started.elapsed();
+        let block_elapsed = block_started.elapsed();
+        denoise_elapsed += block_elapsed;
         block_steps_eff.push(block_step_count);
         last_block_accept_hist = accept_hist.clone();
         last_block_min_entropy_hist = min_entropy_hist.clone();
@@ -211,7 +223,7 @@ pub fn generate_with_session(
             .and_then(|s| s.iter().copied().reduce(u32::max))
             .unwrap_or(0);
         eprintln!(
-            "step-generate: block {} steps_eff={block_step_count} accept/step={accept_hist:?}",
+            "step-generate: block {} denoise={block_elapsed:.2?} steps_eff={block_step_count} accept/step={accept_hist:?}",
             blocks_committed + 1
         );
         eprintln!(
@@ -245,9 +257,10 @@ pub fn generate_with_session(
                 layers,
             )?;
             rt.set_kv_len(new_kv_len as u32);
-            extend_elapsed += extend_started.elapsed();
+            let block_extend = extend_started.elapsed();
+            extend_elapsed += block_extend;
             eprintln!(
-                "step-generate: extended kv {kv_before} -> {new_kv_len} (+{} tokens)",
+                "step-generate: extended kv {kv_before} -> {new_kv_len} (+{} tokens) ({block_extend:.2?})",
                 argmax_tokens.len()
             );
         }
