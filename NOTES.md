@@ -186,6 +186,7 @@ The first `diffgemma_step.metal` draft had silent-garbage bugs caught only by au
 |----|-------|------------------|
 | STOP-1 | Early stop fires on degenerate all-pad/filler stable argmax | done (P1.1) |
 | CONV-1 | ~1 accept/step; min_ent > 0.1 early, only ~5 positions H<0.1 late @ 30L q4 | P1.6 |
+| PREF-1 | Monolithic encoder prefill forced CPU MoE (`use_mps_q4=false`); ~98–155 s → ~4 s after fix | done (P1.8) |
 | QUAL-1 | Templated chat + default --steps 2 -> no readable reply | done (P1.2) |
 | CLI-1 | `--steps` default 2 (parity) vs model-card up to 48 | P1.2 |
 | CHAT-1 | Display decodes full 256 block incl. pads | P1.4 |

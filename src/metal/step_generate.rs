@@ -121,6 +121,7 @@ pub fn generate_with_session(
             canvas_len,
             cfg.max_seq,
             Some(shared_blob),
+            cfg.use_mps_q4,
         )?);
     }
     let encoder = session.encoder.as_mut().expect("encoder cache");

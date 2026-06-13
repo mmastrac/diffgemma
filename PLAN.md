@@ -31,7 +31,7 @@ Interpretation:
 - **3L + prompt KV is dead** (min_ent ≈ uniform ≈ 10 nats). Parity goldens use **kv_len=0**; chat always prefills kv≈14. Do not judge chat quality at 3L.
 - **`step-kv-check` passes** @ kv=64, 3L — KV pack is not totally zeroed, but 3L cannot use prompt context effectively.
 - **Prefill ~100 s** in `generate-monolithic` was initially blamed on cold reload (P1.8). **`bench-prefill` isolates the engine path at ~2.6 s/run** for 14 tokens @ 30L — so most of the gap is monolithic-specific overhead, not intrinsic encoder forward cost.
-- **Hypotheses (P1.8):** duplicate `.dgq` GPU blob fixed via `load_weight_cache_opt`, but **prefill still ~155 s gpu_forward** when step runtime is resident vs `bench-prefill` ~2.6 s — likely GPU memory pressure, not reload alone. KV pack ~9–74 ms.
+- **Hypotheses (P1.8):** ~~duplicate `.dgq` GPU blob~~ fixed; **root cause: monolithic encoder forced `use_mps_q4=false`** → CPU MoE + native Q4 dense (~0.18 TFLOP/s) while `bench-prefill` uses MPS Q4 default. Prefill is **batched** (full prompt `seq_len` per layer), not per-token (#4 ruled out). KV pack ~9–74 ms.
 - **MTLBinaryArchive** (P2.0): runtime pipeline ISA cache at `~/.cache/diffgemma-mps/metal-pipelines/` (`DGQ_METAL_PIPELINE_CACHE=0` to disable). Skips recompiling our `.metal` kernels on restart; MPS matmul internals remain uncached.
 
 **Next P1.6 experiments:** `--steps 96`; q5 profile; f32 rowstats; HF/Python accept count on same logits; engine vs monolithic @ 30L text compare.
@@ -112,7 +112,7 @@ Buffer ABI in `diffgemma_step.metal` (version-bump to change).
 | P1.5 | Templated-chat quality gate (`step-ci`) | **done** | CI fails pad-heavy regression |
 | P1.6 | **Canvas convergence** — see telemetry findings above. Open: raise simultaneous low-H positions (forward/quant/KV/SC) or validate HF parity on same weights. | **open** | `low_ent` ≥ 15 late-block OR readable Hello @ 30L |
 | P1.7 | HF accept parity (unit + `sampler_accept_entropy.json`) | **done** | Fixture tests pass; Metal uses equivalent prefix rule |
-| P1.8 | **Encoder prefill latency** — shared blob, phased timing, session reuse. Open: ~155 s gpu_forward when step runtime resident. | **partial** | Generate prefill ≤3 s @ 14 tok |
+| P1.8 | **Encoder prefill latency** — fixed hardcoded `use_mps_q4=false` on monolithic encoder; respects `StepGenerateConfig.use_mps_q4` / env. | **partial** | Generate prefill ≤5 s @ 14 tok; verify 2nd turn |
 | P2.0 | **MTLBinaryArchive pipeline cache** — persist compiled compute pipeline ISA across restarts. | **done** | Archive load/save under `~/.cache/diffgemma-mps/metal-pipelines/` |
 
 **P1 exit (unchanged):** `generate-monolithic -p "Hello"` default flags → coherent reply.

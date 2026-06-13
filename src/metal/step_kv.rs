@@ -202,7 +202,7 @@ pub struct MonolithicPrefillTiming {
 
 impl MonolithicEncoderCache {
     pub fn open(model_dir: &Path, canvas: usize, max_seq_hint: usize) -> Result<Self, Error> {
-        Self::open_opt(model_dir, canvas, max_seq_hint, None)
+        Self::open_opt(model_dir, canvas, max_seq_hint, None, None)
     }
 
     pub fn open_opt(
@@ -210,6 +210,7 @@ impl MonolithicEncoderCache {
         canvas: usize,
         max_seq_hint: usize,
         shared_dgq_blob: Option<std::sync::Arc<crate::metal::dgq_gpu::DgqGpuBlob>>,
+        use_mps_q4: Option<bool>,
     ) -> Result<Self, Error> {
         let open_started = std::time::Instant::now();
         let model = Model::open(model_dir)?;
@@ -222,11 +223,14 @@ impl MonolithicEncoderCache {
             shared_dgq_blob,
         )?;
         let mut engine = GpuDecoderEngine::new()?;
-        engine.set_use_mps_q4(false);
+        if let Some(v) = use_mps_q4 {
+            engine.set_use_mps_q4(v);
+        }
         let dec_scratch = GpuDecoderScratch::new(canvas, &model.config);
         eprintln!(
-            "monolithic-encoder: cache open {:.2?} (model + engine weights)",
-            open_started.elapsed()
+            "monolithic-encoder: cache open {:.2?} (model + engine weights, use_mps_q4={})",
+            open_started.elapsed(),
+            engine.use_mps_q4(),
         );
         Ok(Self {
             model,
@@ -332,7 +336,8 @@ pub fn prefill_monolithic_kv_with_cache_timed(
         total_ms: total_started.elapsed().as_secs_f64() * 1000.0,
     };
     eprintln!(
-        "monolithic-prefill: kv_len={kv_len} gpu_forward={gpu_forward_ms:.1}ms kv_pack={kv_pack_ms:.1}ms total={:.1}ms",
+        "monolithic-prefill: kv_len={kv_len} use_mps_q4={} gpu_forward={gpu_forward_ms:.1}ms kv_pack={kv_pack_ms:.1}ms total={:.1}ms",
+        cache.engine.use_mps_q4(),
         timing.total_ms
     );
     Ok((kv_len, timing))

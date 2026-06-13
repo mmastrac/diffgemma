@@ -131,3 +131,8 @@ fn mps_q4_default_from_env() -> bool {
         Err(_) => true,
     }
 }
+
+/// Default MPS Q4 dense path for production (`true` unless `DGQ_MPS_Q4=0`).
+pub fn default_use_mps_q4() -> bool {
+    mps_q4_default_from_env()
+}
