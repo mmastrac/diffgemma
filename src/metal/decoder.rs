@@ -364,29 +364,31 @@ fn forward_inner(
             bf16_layer_weights.as_ref()
         };
         weights.ensure_layer(store, text, layer, &engine.ctx.device, &mut engine.pool)?;
-        let layer_cache = weights.layer_ref(layer);
-        layer_forward(
-            out_buf,
-            in_buf,
-            lw,
-            &layer_cache,
-            weights,
-            text,
-            layer,
-            seq_len,
-            &positions,
-            LayerKvView::from_layer(
-                input
-                    .kv_cache
-                    .layer(layer)
-                    .ok_or(Error::Format("missing kv layer"))?,
-                input.kv_cache.kv_len,
-            ),
-            mask,
-            layer_scratch,
-            engine,
-            gpu_kv_ref,
-        )?;
+        {
+            let layer_cache = weights.layer_ref(layer);
+            layer_forward(
+                out_buf,
+                in_buf,
+                lw,
+                &layer_cache,
+                weights,
+                text,
+                layer,
+                seq_len,
+                &positions,
+                LayerKvView::from_layer(
+                    input
+                        .kv_cache
+                        .layer(layer)
+                        .ok_or(Error::Format("missing kv layer"))?,
+                    input.kv_cache.kv_len,
+                ),
+                mask,
+                layer_scratch,
+                engine,
+                gpu_kv_ref,
+            )?;
+        }
         if !weights.is_dgq() {
             weights.release_layer();
         }

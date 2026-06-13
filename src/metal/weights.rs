@@ -599,6 +599,7 @@ impl GpuDecoderWeightCache {
         }
     }
 
+    /// Drop any `layer_ref` before calling (bf16 paged path reuses one RefCell slot).
     pub fn release_layer(&self) {
         if let Self::Bf16(b) = self {
             let mut slot = b.layer.borrow_mut();
