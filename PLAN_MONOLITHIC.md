@@ -130,16 +130,18 @@ The monolithic KV layout is **intentionally different** from `GpuKvCache` (half,
 |------|-------|
 | **M1.1 Layout spec** | ✅ `src/metal/step_kv.rs` module docs + `kv_cache_total_bytes()` |
 | **M1.2 Prefill writer** | ✅ GPU encoder prefill → readback → pack b4 (`prefill_monolithic_kv`); CPU path for bf16 |
-| **M1.3 Extend writer** | After block commit: append 256 committed tokens to b4; bump effective `StepParams.kv_len` |
-| **M1.4 Attention read path audit** | `k_attention` + `k_qk_rope_kv` read b4 with `P.kv_len + tok` positions; test kv_len = 64, 512, 4096 |
-| **M1.5 Mask semantics** | Canvas queries attend causally to KV prefix, bidirectionally within canvas — verify against `DecoderAttnMask` |
+| **M1.3 Extend writer** | ✅ `extend_monolithic_kv`: hydrate b4 prefix → GPU extend → pack suffix |
+| **M1.4 Attention read path audit** | ✅ `step-kv-check` verifies b4 prefix + forward/extend vs kv_len=0 |
+| **M1.5 Mask semantics** | ✅ Monolithic `k_attention` uses full `T=kv_len+CANVAS` (matches `DecoderAttnMask::all_valid`) |
 | **M1.6 CLI** | ✅ `step-smoke --kv-len 64` runs GPU prefill writer; `-p` for real prompt tokens |
 
 **Exit:** `step-smoke --kv-len 64 --layers 30` finite logits; attention output changes vs kv_len=0 (sanity: not identical).
 
 ```bash
+cargo run --release --features metal -- -m $WEIGHTS step-kv-check --kv-len 64 --layers 30 --seed 42
 cargo run --release --features metal -- -m $WEIGHTS step-smoke --kv-len 64 --layers 30 --seed 42
 cargo run --release --features metal -- -m $WEIGHTS -p "Hello" step-smoke --kv-len 64 --layers 3
+cargo run --release --features metal -- -m $WEIGHTS step-probe --kv-len 64 --layers 30 --seed 42
 ```
 
 ---

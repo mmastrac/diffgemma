@@ -119,6 +119,13 @@ enum Command {
         kv_len: u32,
         seed: u64,
         max_seq: usize,
+        prompt: Option<String>,
+    },
+    StepKvCheck {
+        kv_len: usize,
+        layers: usize,
+        seed: u64,
+        max_seq: usize,
     },
     StepVerify {
         layers: usize,
@@ -166,7 +173,21 @@ fn main() -> ExitCode {
             kv_len,
             seed,
             max_seq,
-        } => run_step_probe_cmd(&cli.model_dir, layers, kv_len, seed, max_seq),
+            prompt,
+        } => run_step_probe_cmd(
+            &cli.model_dir,
+            layers,
+            kv_len,
+            seed,
+            max_seq,
+            prompt.as_deref(),
+        ),
+        Command::StepKvCheck {
+            kv_len,
+            layers,
+            seed,
+            max_seq,
+        } => run_step_kv_check_cmd(&cli.model_dir, kv_len, layers, seed, max_seq),
         Command::StepVerify { layers } => run_step_verify_cmd(&cli.model_dir, layers),
         Command::StepParity {
             layers,
@@ -332,6 +353,7 @@ fn run_command(m: &model::Model, model_dir: &std::path::Path, command: Command) 
         Command::BenchGemm { .. } => ExitCode::FAILURE,
         Command::StepSmoke { .. } => ExitCode::FAILURE,
         Command::StepProbe { .. } => ExitCode::FAILURE,
+        Command::StepKvCheck { .. } => ExitCode::FAILURE,
         Command::StepVerify { .. } => ExitCode::FAILURE,
         Command::StepParity { .. } => ExitCode::FAILURE,
         Command::BenchStepKernel { .. } => ExitCode::FAILURE,
@@ -361,6 +383,27 @@ fn step_kernel_config(
     }
 }
 
+fn attach_step_prefill(
+    cfg: &mut metal::StepSmokeConfig,
+    model_dir: &std::path::Path,
+    kv_len: u32,
+    prompt: Option<&str>,
+) -> Result<(), safetensors::Error> {
+    if kv_len == 0 && prompt.is_none() {
+        return Ok(());
+    }
+    let vocab = crate::config::ModelConfig::load(model_dir)?.text_config.vocab_size;
+    let prompt_len = if kv_len > 0 {
+        kv_len as usize
+    } else {
+        64
+    };
+    let ids = build_prompt_tokens(model_dir, prompt, prompt_len, vocab)?;
+    eprintln!("step-kernel: prefill {} prompt tokens", ids.len());
+    cfg.prefill_token_ids = Some(ids);
+    Ok(())
+}
+
 #[cfg(all(feature = "metal", target_os = "macos"))]
 fn run_step_probe_cmd(
     model_dir: &std::path::Path,
@@ -368,6 +411,7 @@ fn run_step_probe_cmd(
     kv_len: u32,
     seed: u64,
     max_seq: usize,
+    prompt: Option<&str>,
 ) -> ExitCode {
     use metal::{run_step_probe, StepFinishMode, StepSmokeConfig};
 
@@ -375,7 +419,7 @@ fn run_step_probe_cmd(
         eprintln!("error: step-probe requires a .dgq directory");
         return ExitCode::FAILURE;
     }
-    let cfg = StepSmokeConfig {
+    let mut cfg = StepSmokeConfig {
         layers,
         steps: 1,
         kv_len,
@@ -385,6 +429,10 @@ fn run_step_probe_cmd(
         use_mps_q4: None,
         prefill_token_ids: None,
     };
+    if let Err(err) = attach_step_prefill(&mut cfg, model_dir, kv_len, prompt) {
+        eprintln!("error: {err}");
+        return ExitCode::FAILURE;
+    }
     match run_step_probe(model_dir, cfg) {
         Ok(r) => {
             println!("step-probe ok ({:.2?})", r.elapsed);
@@ -410,6 +458,77 @@ fn run_step_probe_cmd(
     _kv_len: u32,
     _seed: u64,
     _max_seq: usize,
+    _prompt: Option<&str>,
+) -> ExitCode {
+    eprintln!("error: step-probe requires --features metal on macOS");
+    ExitCode::FAILURE
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn run_step_kv_check_cmd(
+    model_dir: &std::path::Path,
+    kv_len: usize,
+    layers: usize,
+    seed: u64,
+    max_seq: usize,
+) -> ExitCode {
+    use metal::run_step_kv_audit;
+
+    if !dgq::store::looks_like_dgq_dir(model_dir) {
+        eprintln!("error: step-kv-check requires a .dgq directory");
+        return ExitCode::FAILURE;
+    }
+    if kv_len == 0 {
+        eprintln!("error: step-kv-check requires --kv-len > 0");
+        return ExitCode::FAILURE;
+    }
+    match run_step_kv_audit(model_dir, kv_len, layers, seed, max_seq) {
+        Ok(r) => {
+            println!("step-kv-check ok");
+            println!("  kv_len:              {}", r.kv_len);
+            println!("  prefix_max_abs_l0:   {:.6}", r.prefix_max_abs_l0);
+            println!("  hidden_diff_vs_kv0:  {:.6}", r.hidden_max_abs_vs_zero);
+            println!("  logits_diff_vs_kv0:  {:.6}", r.logits_max_abs_vs_zero);
+            if let Some(n) = r.extend_kv_len {
+                println!("  extend_kv_len:       {n}");
+            }
+            if let Some(d) = r.extend_hidden_diff {
+                println!("  extend_hidden_diff:  {d:.6}");
+            }
+            println!("  pass:                {}", r.pass);
+            if r.pass {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn run_step_kv_check_cmd(
+    _model_dir: &std::path::Path,
+    _kv_len: usize,
+    _layers: usize,
+    _seed: u64,
+    _max_seq: usize,
+) -> ExitCode {
+    eprintln!("error: step-kv-check requires --features metal on macOS");
+    ExitCode::FAILURE
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn run_step_probe_cmd(
+    _model_dir: &std::path::Path,
+    _layers: usize,
+    _kv_len: u32,
+    _seed: u64,
+    _max_seq: usize,
+    _prompt: Option<&str>,
 ) -> ExitCode {
     eprintln!("error: step-probe requires --features metal on macOS");
     ExitCode::FAILURE
@@ -593,29 +712,9 @@ fn run_step_smoke_cmd(
 
     let mut cfg = step_kernel_config(layers, kv_len, seed, max_seq, forward_only);
     cfg.steps = steps.max(1);
-    if kv_len > 0 || prompt.is_some() {
-        let vocab = match crate::config::ModelConfig::load(model_dir) {
-            Ok(c) => c.text_config.vocab_size,
-            Err(err) => {
-                eprintln!("error: {err}");
-                return ExitCode::FAILURE;
-            }
-        };
-        let prompt_len = if kv_len > 0 {
-            kv_len as usize
-        } else {
-            64
-        };
-        match build_prompt_tokens(model_dir, prompt, prompt_len, vocab) {
-            Ok(ids) => {
-                eprintln!("step-smoke: prefill {} prompt tokens", ids.len());
-                cfg.prefill_token_ids = Some(ids);
-            }
-            Err(err) => {
-                eprintln!("error: {err}");
-                return ExitCode::FAILURE;
-            }
-        }
+    if let Err(err) = attach_step_prefill(&mut cfg, model_dir, kv_len, prompt) {
+        eprintln!("error: {err}");
+        return ExitCode::FAILURE;
     }
     eprintln!(
         "step-smoke: model={} layers={layers} steps={steps} kv_len={kv_len} seed={seed} max_seq={max_seq}",
@@ -1117,6 +1216,13 @@ fn parse_cli() -> Cli {
             kv_len: step_kv_len,
             seed,
             max_seq: step_max_seq.max(64),
+            prompt: prompt.clone(),
+        },
+        Some("step-kv-check") => Command::StepKvCheck {
+            kv_len: step_kv_len.max(1) as usize,
+            layers: bench_layers.max(1).min(30),
+            seed,
+            max_seq: step_max_seq.max(64),
         },
         Some("step-verify") => Command::StepVerify {
             layers: bench_layers.max(1).min(30),
@@ -1138,7 +1244,7 @@ fn parse_cli() -> Cli {
         Some(cmd) => {
             eprintln!("unknown command: {cmd}");
             eprintln!(
-                "usage: diffgemma-mps [-p PROMPT] [summary|config|weights <name>|quantize|convert-model|step-smoke|step-probe|step-verify|step-parity|bench-step-kernel|bench-step|bench-prefill|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-parity|tokenize <text>|gemm|attention]"
+                "usage: diffgemma-mps [-p PROMPT] [summary|config|weights <name>|quantize|convert-model|step-smoke|step-probe|step-kv-check|step-verify|step-parity|bench-step-kernel|bench-step|bench-prefill|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-parity|tokenize <text>|gemm|attention]"
             );
             eprintln!("  default (no command): generate-gpu with --features metal");
             eprintln!("  generate-parity: GPU vs checked-in golden (use --compare-cpu for slow CPU path)");

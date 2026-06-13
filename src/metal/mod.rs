@@ -56,4 +56,5 @@ pub use step_kernel::{
     StepFinishMode, StepForwardOutput, StepProbeResult, StepSmokeConfig, StepSmokeResult,
 };
 pub use step_m0::{run_step_parity, run_step_verify, M0VerifyResult, StepParityConfig, StepParityResult};
+pub use step_kv::{extend_monolithic_kv, run_step_kv_audit, StepKvAuditResult};
 pub use telemetry::{ForwardTelemetry, SessionTelemetry, StepPhaseTelemetry};

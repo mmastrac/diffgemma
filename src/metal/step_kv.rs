@@ -27,15 +27,17 @@
 use crate::config::ModelConfig;
 use crate::metal::decoder::load_weight_cache;
 use crate::metal::engine::GpuDecoderEngine;
-use crate::metal::encoder_extend::prefill_gpu;
-use crate::metal::step_kernel::{ModelLayout, N_LAYERS};
+use crate::metal::encoder_extend::{extend_prefill_gpu, prefill_gpu};
+use crate::metal::step_kernel::{f16_bits_to_f32, ModelLayout, N_LAYERS, StepSmokeConfig, StepFinishMode, run_step_forward, build_layout, build_offsets_from_store};
+use crate::metal::device::MetalContext;
+use crate::dgq::DgqStore;
 use crate::metal::GpuDecoderScratch;
 use crate::model::encoder::{EncoderPrefillInput, EncoderScratch};
 use crate::model::kv_cache::KvCache;
 use crate::safetensors::Error;
 use crate::weights::WeightStore;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLBuffer;
+use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 use std::path::Path;
 
 pub fn kv_region_bytes(n_kv_heads: u32, head_dim: u32, max_seq: usize) -> u64 {
@@ -133,30 +135,34 @@ pub fn write_monolithic_kv_buffer(
     pack_kv_cache_to_monolithic(dst, layout, kv, max_seq)
 }
 
-/// Pack one layer prefix from f32 K/V (engine GPU layout) into monolithic b4.
+/// Pack one layer prefix from f32 K/V (engine GPU layout) into monolithic b4 at `dst_pos..`.
 fn pack_layer_f32_kv_to_monolithic(
     dst: &mut [u8],
     layout: &ModelLayout,
     layer: usize,
     keys: &[f32],
     values: &[f32],
-    kv_len: usize,
+    dst_pos: usize,
+    token_count: usize,
     max_seq: usize,
 ) -> Result<(), Error> {
     let l = &layout.layers[layer];
     let nkv = l.n_kv_heads as usize;
     let hd = l.head_dim as usize;
     let per_token = nkv * hd;
-    if keys.len() < kv_len * per_token || values.len() < kv_len * per_token {
+    if keys.len() < token_count * per_token || values.len() < token_count * per_token {
         return Err(Error::Format("gpu kv prefix too short"));
+    }
+    if dst_pos + token_count > max_seq {
+        return Err(Error::Format("monolithic kv extend exceeds max_seq"));
     }
     let token_stride_half = nkv * hd * 2;
     let byte_base = l.kv_region as usize;
     if byte_base + max_seq * token_stride_half * 2 > dst.len() {
         return Err(Error::Format("monolithic kv buffer too small"));
     }
-    for pos in 0..kv_len {
-        let half_base = byte_base / 2 + pos * token_stride_half;
+    for pos in 0..token_count {
+        let half_base = byte_base / 2 + (dst_pos + pos) * token_stride_half;
         for hh in 0..nkv {
             for d in 0..hd {
                 let src_i = pos * per_token + hh * hd + d;
@@ -246,9 +252,159 @@ pub fn prefill_monolithic_kv(
         let (k_buf, v_buf) = gpu_kv.layer_buffers(layer)?;
         let keys = read_f32_prefix(&k_buf, elems);
         let values = read_f32_prefix(&v_buf, elems);
-        pack_layer_f32_kv_to_monolithic(dst, layout, layer, &keys, &values, kv_len, max_seq)?;
+        pack_layer_f32_kv_to_monolithic(dst, layout, layer, &keys, &values, 0, kv_len, max_seq)?;
     }
     Ok(kv_len)
+}
+
+fn read_half_at(kv_buf: &ProtocolObject<dyn MTLBuffer>, byte_off: usize) -> u16 {
+    let ptr = unsafe { kv_buf.contents().as_ptr().add(byte_off) as *const u8 };
+    u16::from_le_bytes([unsafe { *ptr }, unsafe { *ptr.add(1) }])
+}
+
+/// Load monolithic b4 prefix `[0, kv_len)` into engine `GpuKvCache` (for extend after prefill).
+fn hydrate_gpu_kv_from_monolithic(
+    kv_buf: &ProtocolObject<dyn MTLBuffer>,
+    layout: &ModelLayout,
+    kv_len: usize,
+    gpu_kv: &mut crate::metal::GpuKvCache,
+    layers: usize,
+) -> Result<(), Error> {
+    if kv_len == 0 {
+        gpu_kv.reset_len();
+        return Ok(());
+    }
+    use crate::metal::buffer::BufferPool;
+    for layer in 0..layers {
+        let l = &layout.layers[layer];
+        let nkv = l.n_kv_heads as usize;
+        let hd = l.head_dim as usize;
+        let per_token = nkv * hd;
+        let token_stride_half = nkv * hd * 2;
+        let byte_base = l.kv_region as usize;
+        let mut keys = vec![0f32; kv_len * per_token];
+        let mut values = vec![0f32; kv_len * per_token];
+        for pos in 0..kv_len {
+            let half_base = byte_base / 2 + pos * token_stride_half;
+            for hh in 0..nkv {
+                for d in 0..hd {
+                    let dst_i = pos * per_token + hh * hd + d;
+                    let k_byte = (half_base + hh * hd + d) * 2;
+                    let v_byte = (half_base + nkv * hd + hh * hd + d) * 2;
+                    keys[dst_i] = f16_bits_to_f32(read_half_at(kv_buf, k_byte));
+                    values[dst_i] = f16_bits_to_f32(read_half_at(kv_buf, v_byte));
+                }
+            }
+        }
+        let (k_buf, v_buf) = gpu_kv.layer_buffers(layer)?;
+        BufferPool::write_f32(&k_buf, &keys);
+        BufferPool::write_f32(&v_buf, &values);
+    }
+    gpu_kv.kv_len = kv_len;
+    Ok(())
+}
+
+/// GPU encoder extend → read back new suffix K/V → append into monolithic b4 (M1.3).
+pub fn extend_monolithic_kv(
+    model_dir: &Path,
+    kv_buf: &ProtocolObject<dyn MTLBuffer>,
+    layout: &ModelLayout,
+    kv_len_before: usize,
+    new_token_ids: &[u32],
+    max_seq: usize,
+    max_layers: usize,
+) -> Result<usize, Error> {
+    if new_token_ids.is_empty() {
+        return Ok(kv_len_before);
+    }
+    if kv_len_before + new_token_ids.len() > max_seq {
+        return Err(Error::Format("monolithic kv extend exceeds max_seq"));
+    }
+    let model = crate::model::Model::open(model_dir)?;
+    let text = &model.config.text_config;
+    let canvas = crate::metal::step_kernel::CANVAS;
+    let layers = max_layers.min(text.num_hidden_layers);
+
+    let mut enc_scratch = EncoderScratch::new(new_token_ids.len(), &model.config);
+    let mut dec_scratch = GpuDecoderScratch::new(canvas, &model.config);
+    let mut weights = load_weight_cache(
+        &model.weights,
+        text,
+        canvas,
+        kv_len_before + new_token_ids.len(),
+    )?;
+    let mut engine = GpuDecoderEngine::new()?;
+    engine.set_use_mps_q4(false);
+
+    dec_scratch.ensure_gpu_kv(
+        &engine.ctx.device,
+        text,
+        max_seq,
+        canvas,
+    )?;
+    let mut gpu_kv = dec_scratch
+        .gpu_kv
+        .take()
+        .ok_or(Error::Format("gpu kv cache missing"))?;
+    hydrate_gpu_kv_from_monolithic(kv_buf, layout, kv_len_before, &mut gpu_kv, layers)?;
+    dec_scratch.gpu_kv = Some(gpu_kv);
+
+    let mut cpu_kv = KvCache::empty(text)?;
+    cpu_kv.kv_len = kv_len_before;
+
+    extend_prefill_gpu(
+        &model.weights,
+        &model.config,
+        &mut cpu_kv,
+        new_token_ids,
+        &mut enc_scratch,
+        &mut dec_scratch,
+        &mut weights,
+        &mut engine,
+        Some(layers),
+    )?;
+
+    let gpu_kv = dec_scratch
+        .gpu_kv
+        .as_ref()
+        .ok_or(Error::Format("gpu kv missing after extend"))?;
+    let new_kv_len = gpu_kv.kv_len;
+    let append_len = new_token_ids.len();
+    let need = kv_cache_total_bytes(layout, max_seq) as usize;
+    if kv_buf.length() < need {
+        return Err(Error::Format("monolithic kv buffer too small"));
+    }
+    let dst = unsafe {
+        std::slice::from_raw_parts_mut(kv_buf.contents().as_ptr() as *mut u8, need)
+    };
+
+    for layer in 0..layers {
+        let l = &layout.layers[layer];
+        let nkv = l.n_kv_heads as usize;
+        let hd = l.head_dim as usize;
+        let per_token = nkv * hd;
+        let elems = append_len * per_token;
+        let (k_buf, v_buf) = gpu_kv.layer_buffers(layer)?;
+        let byte_off = kv_len_before * per_token * 4;
+        let keys = read_f32_at(&k_buf, byte_off, elems);
+        let values = read_f32_at(&v_buf, byte_off, elems);
+        pack_layer_f32_kv_to_monolithic(
+            dst,
+            layout,
+            layer,
+            &keys,
+            &values,
+            kv_len_before,
+            append_len,
+            max_seq,
+        )?;
+    }
+    Ok(new_kv_len)
+}
+
+fn read_f32_at(buf: &ProtocolObject<dyn MTLBuffer>, byte_offset: usize, elems: usize) -> Vec<f32> {
+    let ptr = unsafe { buf.contents().as_ptr().add(byte_offset) as *const f32 };
+    (0..elems).map(|i| unsafe { *ptr.add(i) }).collect()
 }
 
 /// CPU encoder prefill (bf16 weights only).
@@ -283,4 +439,171 @@ pub fn prefill_monolithic_kv_cpu(
     )?;
     write_monolithic_kv_buffer(kv_buf, layout, &out.kv_cache, max_seq)?;
     Ok(out.kv_cache.kv_len)
+}
+
+/// Max abs half value in layer `L` prefix `[0, kv_len)`.
+pub fn kvcache_prefix_max_abs(
+    kv_buf: &ProtocolObject<dyn MTLBuffer>,
+    layout: &ModelLayout,
+    layer: usize,
+    kv_len: usize,
+) -> f32 {
+    if kv_len == 0 || layer >= N_LAYERS {
+        return 0.0;
+    }
+    let l = &layout.layers[layer];
+    let nkv = l.n_kv_heads as usize;
+    let hd = l.head_dim as usize;
+    let token_stride_half = nkv * hd * 2;
+    let byte_base = l.kv_region as usize;
+    let half_base = byte_base / 2;
+    let mut max_abs = 0.0f32;
+    for pos in 0..kv_len {
+        let start = (half_base + pos * token_stride_half) * 2;
+        let end = start + token_stride_half * 2;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(kv_buf.contents().as_ptr().add(start) as *const u8, end - start)
+        };
+        for chunk in bytes.chunks_exact(2) {
+            let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+            max_abs = max_abs.max(f16_bits_to_f32(bits).abs());
+        }
+    }
+    max_abs
+}
+
+#[derive(Debug)]
+pub struct StepKvAuditResult {
+    pub kv_len: usize,
+    pub prefix_max_abs_l0: f32,
+    pub hidden_max_abs_vs_zero: f32,
+    pub logits_max_abs_vs_zero: f32,
+    pub extend_kv_len: Option<usize>,
+    pub extend_hidden_diff: Option<f32>,
+    pub pass: bool,
+}
+
+/// M1.4: verify b4 prefix is populated and forward changes vs kv_len=0.
+pub fn run_step_kv_audit(
+    model_dir: &Path,
+    kv_len: usize,
+    layers: usize,
+    seed: u64,
+    max_seq: usize,
+) -> Result<StepKvAuditResult, Error> {
+    let vocab = crate::metal::step_kernel::VOCAB;
+    let mut prompt = vec![0u32; kv_len];
+    for (i, id) in prompt.iter_mut().enumerate() {
+        *id = ((i * 131 + 7) % vocab.max(1)) as u32;
+    }
+    let base_cfg = StepSmokeConfig {
+        layers,
+        steps: 1,
+        kv_len: 0,
+        seed,
+        max_seq,
+        finish: StepFinishMode::ForwardOnly,
+        use_mps_q4: Some(false),
+        prefill_token_ids: None,
+    };
+    let zero = run_step_forward(model_dir, &base_cfg)?;
+    let mut kv_cfg = base_cfg.clone();
+    kv_cfg.prefill_token_ids = Some(prompt.clone());
+    let with_kv = run_step_forward(model_dir, &kv_cfg)?;
+
+    let store = DgqStore::open(model_dir)?;
+    let layout = build_layout(&build_offsets_from_store(&store), max_seq);
+    let ctx = MetalContext::new()?;
+    let kv_bytes = kv_cache_total_bytes(&layout, max_seq) as usize;
+    let kv_buf = ctx
+        .device
+        .newBufferWithLength_options(
+            kv_bytes,
+            objc2_metal::MTLResourceOptions::StorageModeShared,
+        )
+        .ok_or(Error::Format("kv audit buffer alloc failed"))?;
+    let actual_kv = prefill_monolithic_kv(
+        model_dir,
+        &prompt,
+        &kv_buf,
+        &layout,
+        max_seq,
+        layers,
+    )?;
+    let prefix_max = kvcache_prefix_max_abs(&kv_buf, &layout, 0, actual_kv);
+
+    let hidden_diff = zero
+        .norm_hidden
+        .iter()
+        .zip(with_kv.norm_hidden.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let logits_diff = zero
+        .logits
+        .iter()
+        .zip(with_kv.logits.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+
+    let mut extend_kv_len = None;
+    let mut extend_hidden_diff = None;
+    let mut pass = prefix_max > 1e-4 && hidden_diff > 1e-3;
+
+    if pass && kv_len >= 32 {
+        let prefill_len = kv_len / 2;
+        let extend_tokens = prompt[prefill_len..].to_vec();
+        let prefill_only = &prompt[..prefill_len];
+        let mut extend_buf = ctx
+            .device
+            .newBufferWithLength_options(
+                kv_bytes,
+                objc2_metal::MTLResourceOptions::StorageModeShared,
+            )
+            .ok_or(Error::Format("kv extend audit buffer alloc failed"))?;
+        let prefill_actual = prefill_monolithic_kv(
+            model_dir,
+            prefill_only,
+            &extend_buf,
+            &layout,
+            max_seq,
+            layers,
+        )?;
+        let extended = extend_monolithic_kv(
+            model_dir,
+            &extend_buf,
+            &layout,
+            prefill_actual,
+            &extend_tokens,
+            max_seq,
+            layers,
+        )?;
+        extend_kv_len = Some(extended);
+        if extended != kv_len {
+            pass = false;
+        } else {
+            let mut prefill_cfg = base_cfg.clone();
+            prefill_cfg.prefill_token_ids = Some(prefill_only.to_vec());
+            let half_kv = run_step_forward(model_dir, &prefill_cfg)?;
+            let ext_diff = half_kv
+                .norm_hidden
+                .iter()
+                .zip(with_kv.norm_hidden.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            extend_hidden_diff = Some(ext_diff);
+            if ext_diff <= 1e-3 {
+                pass = false;
+            }
+        }
+    }
+
+    Ok(StepKvAuditResult {
+        kv_len,
+        prefix_max_abs_l0: prefix_max,
+        hidden_max_abs_vs_zero: hidden_diff,
+        logits_max_abs_vs_zero: logits_diff,
+        extend_kv_len,
+        extend_hidden_diff,
+        pass,
+    })
 }
