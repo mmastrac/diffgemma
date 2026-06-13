@@ -238,10 +238,10 @@ cargo run --release --features metal -- -m $WEIGHTS step-ci --layers 3
 
 | Gate | Requirement |
 |------|-------------|
-| **Golden parity** | `generate-monolithic-parity` vs `fixtures/generate/dgq_hello_*` (new or extended) |
-| **Regression** | `step-ci --layers 3` in CI (skip if no weights); `cargo test` green |
+| **Golden parity** | ✅ `generate-monolithic-parity` vs `fixtures/generate/monolithic_hello_steps4_layers3.json` (`DGQ_MPS_Q4=0`) |
+| **Regression** | ✅ `step-ci --layers 3` (config + verify + parity); GitHub Actions `ci.yml` |
 | **Memory** | Peak RSS ≤ 24 GiB budget on base M4 with q4 `.dgq` (document sysctl if needed) |
-| **Determinism** | Same seed → same tokens with `DGQ_MPS_Q4=0`; document MPS nondeterminism if any |
+| **Determinism** | ✅ Same seed → same tokens with `DGQ_MPS_Q4=0` @ `monolithic_hello_steps4_layers3` |
 | **License / weights** | Same as engine — no new deps |
 
 **Ship definition:** `generate-monolithic` replaces `generate-gpu` as default on macOS+metal when `DGQ_MONOLITHIC=1`, with engine fallback until M5 gates pass.

@@ -5,13 +5,17 @@ use crate::safetensors::Error;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// Weight format tag for fixture selection (`safetensors` vs `dgq_q4`).
+/// Weight format tag for fixture selection (`safetensors` vs `dgq_q4` vs `monolithic`).
 pub fn weights_profile_name(quantized: bool) -> &'static str {
     if quantized {
         "dgq_q4"
     } else {
         "safetensors"
     }
+}
+
+pub fn monolithic_weights_profile() -> &'static str {
+    "monolithic"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +135,20 @@ pub fn resolve_fixture(name: &str) -> std::path::PathBuf {
     }
 }
 
+pub fn infer_monolithic_fixture_name(
+    prompt_text: Option<&str>,
+    steps: usize,
+    max_layers: Option<usize>,
+) -> Option<String> {
+    if prompt_text != Some("hello") {
+        return None;
+    }
+    Some(match (steps, max_layers) {
+        (4, Some(3)) => "monolithic_hello_steps4_layers3".into(),
+        _ => return None,
+    })
+}
+
 pub fn infer_fixture_name(
     prompt_text: Option<&str>,
     steps: usize,
@@ -170,6 +188,14 @@ mod tests {
             token_ids: vec![1],
         };
         assert_eq!(g.expected_weights_profile(), "safetensors");
+    }
+
+    #[test]
+    fn infer_monolithic_fixture_name_hello() {
+        assert_eq!(
+            infer_monolithic_fixture_name(Some("hello"), 4, Some(3)).as_deref(),
+            Some("monolithic_hello_steps4_layers3")
+        );
     }
 
     #[test]

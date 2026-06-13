@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test
+
+  macos-metal:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --features metal
+      - name: step-ci (skips if no .dgq weights)
+        run: cargo run --release --features metal -- -m /tmp/quantized-weights step-ci --layers 3
+      - name: generate-monolithic-parity (requires local weights)
+        run: |
+          if [ -f /tmp/quantized-weights/model.dgq.json ]; then
+            DGQ_MPS_Q4=0 cargo run --release --features metal -- \
+              -m /tmp/quantized-weights generate-monolithic-parity \
+              -p hello --layers 3 --steps 4 --seed 42 --no-early-stop
+          else
+            echo "skip generate-monolithic-parity (no weights at /tmp/quantized-weights)"
+          fi
