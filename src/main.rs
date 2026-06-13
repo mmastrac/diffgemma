@@ -1154,6 +1154,16 @@ fn resolve_steps(override_steps: Option<usize>, parity_default: bool) -> usize {
     override_steps.unwrap_or(if parity_default { 2 } else { 48 })
 }
 
+/// Layer count for generate paths: `--layers` override, else full `num_hidden_layers` from config.
+fn resolve_model_layers(
+    model_dir: &std::path::Path,
+    override_layers: Option<usize>,
+) -> Result<usize, safetensors::Error> {
+    let cfg = crate::config::ModelConfig::load(model_dir)?;
+    let n = cfg.text_config.num_hidden_layers.max(1);
+    Ok(override_layers.unwrap_or(n).max(1).min(n))
+}
+
 fn parse_cli() -> Cli {
     let mut args = env::args().skip(1);
     let mut model_dir = PathBuf::from("model/transformer");
@@ -2799,15 +2809,12 @@ fn run_chat_cmd(
         return ExitCode::FAILURE;
     }
 
-    let layers = match max_layers {
-        Some(n) => n.max(1).min(30),
-        None => match crate::config::ModelConfig::load(model_dir) {
-            Ok(c) => c.text_config.num_hidden_layers.min(30).max(1),
-            Err(err) => {
-                eprintln!("error: {err}");
-                return ExitCode::FAILURE;
-            }
-        },
+    let layers = match resolve_model_layers(model_dir, max_layers) {
+        Ok(n) => n,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
     };
 
     let sampler = sample::sampler_for_steps(steps, no_early_stop);
@@ -3088,21 +3095,26 @@ fn run_generate_monolithic_cmd(
     let prompt_len = prompt.len();
     let max_seq = (prompt_len + max_new_tokens).max(512);
 
+    let layers = match resolve_model_layers(model_dir, max_layers) {
+        Ok(n) => n,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let gen_cfg = generate::GenerateConfig {
         sampler: sample::sampler_for_steps(steps, no_early_stop),
         max_new_tokens,
         seed,
-        max_layers,
+        max_layers: Some(layers),
         no_early_stop,
         deterministic: false,
     };
 
-    let layers_note = max_layers
-        .map(|n| format!(", layers={n}"))
-        .unwrap_or_default();
     let stop_note = if no_early_stop { ", no_early_stop" } else { "" };
     eprintln!(
-        "running generate-monolithic (prompt_len={prompt_len}, steps={steps}, max_new_tokens={max_new_tokens}, seed={seed}{layers_note}{stop_note})..."
+        "running generate-monolithic (prompt_len={prompt_len}, steps={steps}, layers={layers}, max_new_tokens={max_new_tokens}, seed={seed}{stop_note})..."
     );
     let started = std::time::Instant::now();
 
