@@ -213,6 +213,13 @@ fn extend_encoder_kv(
     extend_prefill(store, cfg, kv_cache, token_ids, enc_scratch)
 }
 
+fn generate_progress_enabled() -> bool {
+    match std::env::var("DGQ_QUIET") {
+        Ok(v) => v != "1" && !v.eq_ignore_ascii_case("true"),
+        Err(_) => true,
+    }
+}
+
 fn generate_inner(
     store: &WeightStore,
     cfg: &ModelConfig,
@@ -228,6 +235,13 @@ fn generate_inner(
 
     let (kv_cache, prefill_elapsed) =
         run_encoder_prefill(store, cfg, prompt_token_ids, enc_scratch, decoder, gen_cfg, canvas_len)?;
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    if generate_progress_enabled() {
+        eprintln!(
+            "generate-gpu: encoder prefill finished ({prefill_elapsed:.2?}, kv_len={})",
+            kv_cache.kv_len
+        );
+    }
 
     let mut sequences = prompt_token_ids.to_vec();
     let mut kv_cache = kv_cache;
@@ -505,6 +519,13 @@ fn generate_inner(
                 });
             }
             denoise_steps_run += 1;
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            if generate_progress_enabled() {
+                let step_idx = max_denoise_steps - cur_step + 1;
+                eprintln!(
+                    "generate-gpu: block {block_idx} step {step_idx}/{max_denoise_steps} cur_step={cur_step} forward={decoder_ms:.0}ms sampler={sampler_ms:.0}ms stop={finished}"
+                );
+            }
         }
         denoise_elapsed += denoise_started.elapsed();
 

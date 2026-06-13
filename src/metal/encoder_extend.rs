@@ -12,6 +12,13 @@ use crate::model::layer_weights::DecoderLayerWeights;
 use crate::safetensors::Error;
 use crate::weights::WeightStore;
 
+fn progress_enabled() -> bool {
+    match std::env::var("DGQ_QUIET") {
+        Ok(v) => v != "1" && !v.eq_ignore_ascii_case("true"),
+        Err(_) => true,
+    }
+}
+
 pub fn prefill_gpu(
     store: &WeightStore,
     cfg: &ModelConfig,
@@ -57,9 +64,16 @@ pub fn prefill_gpu(
     let n_layers = max_layers
         .unwrap_or(text.num_hidden_layers)
         .min(text.num_hidden_layers);
+    let prefill_started = std::time::Instant::now();
+    if progress_enabled() {
+        eprintln!(
+            "generate-gpu: encoder prefill starting ({n_layers} layers, {seq_len} tokens)..."
+        );
+    }
     let mut use_a_input = true;
     let mut bf16_layer_weights = None;
     for layer in 0..n_layers {
+        let layer_started = std::time::Instant::now();
         let lw = if weights.is_dgq() {
             None
         } else {
@@ -105,7 +119,25 @@ pub fn prefill_gpu(
         if !weights.is_dgq() {
             weights.release_layer();
         }
+        if progress_enabled()
+            && (layer == 0 || layer + 1 == n_layers || (layer + 1) % 5 == 0)
+        {
+            eprintln!(
+                "generate-gpu: prefill layer {}/{} ({layer_elapsed:.2?}, cumulative {cum:.2?})",
+                layer + 1,
+                n_layers,
+                layer_elapsed = layer_started.elapsed(),
+                cum = prefill_started.elapsed(),
+            );
+        }
         use_a_input = !use_a_input;
+    }
+
+    if progress_enabled() {
+        eprintln!(
+            "generate-gpu: encoder prefill done ({:.2?}, kv_len={seq_len})",
+            prefill_started.elapsed()
+        );
     }
 
     gpu_kv.advance_kv_len(seq_len)?;
