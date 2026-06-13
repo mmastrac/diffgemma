@@ -21,11 +21,11 @@ pub struct ForwardTelemetry {
 }
 
 impl ForwardTelemetry {
-    /// One monolithic denoise step: single GPU sync, zero CPU readback, zero-copy blob.
-    pub fn monolithic_gpu_step() -> Self {
+    /// One monolithic denoise step: single `waitUntilCompleted`, host readback tracked separately.
+    pub fn monolithic_gpu_step(host_readback_bytes: u64) -> Self {
         Self {
             gpu_syncs: 1,
-            gpu_readback_bytes: 0,
+            gpu_readback_bytes: host_readback_bytes,
             expert_weight_bytes_touched: 0,
             expert_hits: 0,
             expert_misses: 0,
@@ -34,6 +34,11 @@ impl ForwardTelemetry {
             lm_head_logits_bytes: 0,
             ..Self::default()
         }
+    }
+
+    /// Backward-compatible alias (assumes P2.1 hot-path readback budget).
+    pub fn monolithic_gpu_step_default() -> Self {
+        Self::monolithic_gpu_step(0)
     }
 
     pub fn record_expert_layer(

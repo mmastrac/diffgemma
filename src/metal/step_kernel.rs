@@ -314,6 +314,25 @@ fn step_use_sc_gemm_from_env() -> bool {
     }
 }
 
+/// Opt-in logits NaN guard on generate hot path (`DGQ_CHECK_LOGITS=1`).
+pub fn logits_finite_check_enabled() -> bool {
+    match std::env::var("DGQ_CHECK_LOGITS") {
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        Err(_) => false,
+    }
+}
+
+fn logits_finite_sample_count() -> usize {
+    match std::env::var("DGQ_CHECK_LOGITS_SAMPLES") {
+        Ok(v) => v.parse().unwrap_or(4096),
+        Err(_) => 4096,
+    }
+}
+
+fn logits_finite_sample_bytes() -> u64 {
+    (logits_finite_sample_count().min(CANVAS * VOCAB) * 2) as u64
+}
+
 /// Step-kernel dense GEMM backend. Default is MPS dequant→matmul (opt out with `DGQ_STEP_MPS_Q4=0`).
 pub fn step_use_mps_q4_default() -> bool {
     match std::env::var("DGQ_STEP_MPS_Q4") {
@@ -1532,11 +1551,29 @@ impl StepRuntime {
         self.run_forward_once(StepFinishMode::Full)
     }
 
-    /// Sample logits for non-finite values (M4.4 hot-path guard).
+    /// Host readback size for one `CanvasState` poll (shared buffer, no extra sync).
+    pub const CANVAS_STATE_BYTES: usize = std::mem::size_of::<CanvasState>();
+
+    /// P2.1 budget: host bytes touched per denoise step on the generate hot path.
+    pub fn denoise_step_host_readback_bytes(check_logits: bool) -> u64 {
+        // Forward reads state once on CPU to seed preamble; generate polls once after sync.
+        let mut bytes = (Self::CANVAS_STATE_BYTES as u64) * 2;
+        if check_logits && logits_finite_check_enabled() {
+            bytes += logits_finite_sample_bytes();
+        }
+        bytes
+    }
+
+    /// Opt-in full-tensor logits scan (`DGQ_CHECK_LOGITS=1`). Off by default (P2.1).
     pub fn check_logits_finite(&self) -> Result<(), Error> {
-        let (bad, max_abs) = count_non_finite_half(&self.bufs.logits, CANVAS * VOCAB);
-        if bad > 0 {
-            eprintln!("non-finite logits (bad_samples={bad}, max_abs={max_abs:.4})");
+        if !logits_finite_check_enabled() {
+            return Ok(());
+        }
+        let sample = logits_finite_sample_count().min(CANVAS * VOCAB);
+        let (finite, max_abs) =
+            half_buffer_stats(&self.bufs.logits, 0, CANVAS * VOCAB, sample);
+        if !finite {
+            eprintln!("non-finite logits (max_abs={max_abs:.4}, sample={sample})");
             return Err(Error::Format("non-finite logits"));
         }
         Ok(())

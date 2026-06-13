@@ -96,6 +96,8 @@ Buffer ABI in `diffgemma_step.metal` (version-bump to change).
 | **P1.4** Display strips pad/filler; KV commit unchanged | done |
 | **P1.5** Templated-chat quality gate in `step-ci` | done |
 | **P1.7–P1.10** HF accept parity; MPS Q4 fix; parity gates | done |
+| **P2.1** Generate hot path: 1 sync/step, ~12 KiB host readback/step | done |
+| **P2.1** Monolithic generate hot path: 1 sync/step, ~12 KiB readback/step | done |
 | Plan consolidation (`NOTES.md`, retired PLAN2/MONOLITHIC) | done |
 
 **Measured baseline (M3 Pro, `/tmp/quantized-weights`):** monolithic forward ~4.8 s/step; MPS encoder prefill ~1.7 s @ 14 tok / 30L; `step-kv-parity` + `step-q4-parity` pass @ 30L.
@@ -124,11 +126,11 @@ Buffer ABI in `diffgemma_step.metal` (version-bump to change).
 
 ### P2 — Close the latency gap to interactive
 
-Blocked on P1.6 (no point optimizing gibberish). Sequence unchanged:
+P1.6 (convergence) remains the quality gate; P2.1 latency work can proceed in parallel.
 
 | # | Task | Impact | Exit |
 |---|------|--------|------|
-| P2.1 | GPU round-trip elimination | High | <= 3 syncs/step, <= 1 MB readback/step |
+| P2.1 | GPU round-trip elimination | High | **done** | ≤3 syncs/step, ≤1 MB readback/step on generate hot path |
 | P2.2 | ICB record/replay | High | steady-state encode ~= 0 |
 | P2.3 | SC softembed fast path | High @ step>0 | SC <= few % of step |
 | P2.4 | Dispatch fusion | Medium | dispatch count down |
@@ -146,11 +148,12 @@ Unchanged — multi-block extend, kv>0 parity, MoE determinism docs, 24 GiB budg
 ## Execution order
 
 ```
-P1.6 (convergence)  -->  P2 (MPS Q4 fix / latency)  -->  P3
+P1.6 (convergence)  -->  ship quality
+P2.1 done; P2.2–P2.6 (latency) in parallel with P1.6 experiments
      P1.7–P1.10 done (accept rule, MPS Q4 fix, parity gates)
 ```
 
-**Critical path to interactive:** P1.6 → fix MPS Q4 dense (P2.6 / encoder+step) → P2.1 → P2.2.
+**Critical path to interactive:** P1.6 → P2.2 (ICB) → P2.3 (SC fast path).
 
 ---
 

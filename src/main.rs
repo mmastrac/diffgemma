@@ -3251,6 +3251,11 @@ fn print_generate_output(
                 / out.denoise_steps_run as f64;
             println!("  mean step wall:       {step_ms:.1} ms");
             println!(
+                "  gpu hot path:         {:.1} syncs/step, {:.1} KiB readback/step",
+                agg.gpu_syncs,
+                agg.gpu_readback_bytes as f64 / 1024.0
+            );
+            println!(
                 "  weight bytes/step:    {:.2} GiB expert + {:.2} MiB logits",
                 agg.expert_weight_bytes_touched as f64 / (1024.0_f64.powi(3)),
                 agg.lm_head_logits_bytes as f64 / (1024.0 * 1024.0)

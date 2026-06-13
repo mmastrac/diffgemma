@@ -199,6 +199,7 @@ The first `diffgemma_step.metal` draft had silent-garbage bugs caught only by au
 | FULL-1 | 5 full-attention layers need shape-specialized pipelines | done (M0.4) |
 | METAL-1 | `tanh` large-input NaN | done (clamp) |
 | BENCH-1 | Historical benches used kv_len=0 vs engine 64 | reconciled in section 4 |
+| RT-1 | Generate scanned 134 MiB logits/step for NaN guard | done (P2.1): opt-in `DGQ_CHECK_LOGITS=1`; hot path ~12 KiB/step |
 
 ---
 

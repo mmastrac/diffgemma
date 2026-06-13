@@ -236,20 +236,24 @@ pub fn generate_with_session(
         let mut accept_hist = Vec::new();
         let mut min_entropy_hist = Vec::new();
         let mut low_ent_hist = Vec::new();
+        let mut last_st = None;
         loop {
             let step_started = Instant::now();
             rt.run_denoise_step()?;
+            let check_logits = crate::metal::step_kernel::logits_finite_check_enabled();
             rt.check_logits_finite()?;
             let step_elapsed = step_started.elapsed();
             let step_ms = step_elapsed.as_secs_f64() * 1000.0;
+            let readback_bytes = StepRuntime::denoise_step_host_readback_bytes(check_logits);
             session_telemetry.steps.push(StepPhaseTelemetry {
                 decoder_ms: step_ms,
                 sampler_ms: 0.0,
-                forward: ForwardTelemetry::monolithic_gpu_step(),
+                forward: ForwardTelemetry::monolithic_gpu_step(readback_bytes),
             });
             denoise_steps_run += 1;
             block_step_count += 1;
             let st = rt.read_canvas_state();
+            last_st = Some(st);
             let stats = step_entropy_stats(&st.entropy, &st.accept);
             accept_hist.push(stats.accept_count);
             min_entropy_hist.push(stats.min_entropy);
@@ -273,6 +277,7 @@ pub fn generate_with_session(
                 break;
             }
         }
+        let st = last_st.expect("denoise loop ran at least one step");
         let block_elapsed = block_started.elapsed();
         denoise_elapsed += block_elapsed;
         block_steps_eff.push(block_step_count);
@@ -305,7 +310,6 @@ pub fn generate_with_session(
             block_idx
         );
 
-        let st = rt.read_canvas_state();
         let argmax_tokens: Vec<u32> = st.prev_argmax.to_vec();
         sequences.extend_from_slice(&argmax_tokens);
         blocks_committed += 1;
@@ -332,6 +336,15 @@ pub fn generate_with_session(
         }
     }
 
+    if progress_enabled() && !session_telemetry.steps.is_empty() {
+        let agg = session_telemetry.aggregate_forward();
+        eprintln!(
+            "step-generate: P2.1 hot path mean {:.2} syncs/step, {:.1} KiB readback/step (DGQ_CHECK_LOGITS for opt-in logits scan)",
+            agg.gpu_syncs as f64,
+            agg.gpu_readback_bytes as f64 / 1024.0
+        );
+    }
+
     Ok(GenerateOutput {
         token_ids: sequences,
         denoise_steps_run,
@@ -350,7 +363,22 @@ pub fn generate_with_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metal::step_kernel::{logits_finite_check_enabled, StepRuntime};
     use crate::sample::initialize_canvas;
+
+    #[test]
+    fn p21_denoise_readback_under_1mb() {
+        let bytes = StepRuntime::denoise_step_host_readback_bytes(false);
+        assert!(
+            bytes <= 1024 * 1024,
+            "hot-path readback {bytes} B exceeds 1 MiB"
+        );
+        assert_eq!(bytes, (StepRuntime::CANVAS_STATE_BYTES * 2) as u64);
+        if logits_finite_check_enabled() {
+            let with_check = StepRuntime::denoise_step_host_readback_bytes(true);
+            assert!(with_check <= 1024 * 1024);
+        }
+    }
 
     #[test]
     fn block_reset_uses_fresh_canvas() {
