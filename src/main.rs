@@ -53,6 +53,15 @@ enum Command {
         no_early_stop: bool,
         write_golden: Option<String>,
     },
+    GenerateMonolithic {
+        prompt: Option<String>,
+        seed: u64,
+        steps: usize,
+        prompt_len: usize,
+        max_new_tokens: usize,
+        max_layers: Option<usize>,
+        no_early_stop: bool,
+    },
     GenerateParity {
         prompt: Option<String>,
         seed: u64,
@@ -211,6 +220,24 @@ fn main() -> ExitCode {
             iters,
             forward_only,
         ),
+        Command::GenerateMonolithic {
+            prompt,
+            seed,
+            steps,
+            prompt_len,
+            max_new_tokens,
+            max_layers,
+            no_early_stop,
+        } => run_generate_monolithic_cmd(
+            &cli.model_dir,
+            prompt,
+            seed,
+            steps,
+            prompt_len,
+            max_new_tokens,
+            max_layers,
+            no_early_stop,
+        ),
         Command::Quantize { output, profile } => run_quantize(&cli.model_dir, &output, &profile),
         Command::Tokenize(text) => run_tokenize(&cli.model_dir, &text),
         Command::Gemm { size } => run_gemm(size),
@@ -357,6 +384,7 @@ fn run_command(m: &model::Model, model_dir: &std::path::Path, command: Command) 
         Command::StepVerify { .. } => ExitCode::FAILURE,
         Command::StepParity { .. } => ExitCode::FAILURE,
         Command::BenchStepKernel { .. } => ExitCode::FAILURE,
+        Command::GenerateMonolithic { .. } => ExitCode::FAILURE,
     }
 }
 
@@ -1134,6 +1162,15 @@ fn parse_cli() -> Cli {
             no_early_stop,
             write_golden,
         },
+        Some("generate-monolithic") => Command::GenerateMonolithic {
+            prompt: prompt.clone(),
+            seed,
+            steps,
+            prompt_len,
+            max_new_tokens,
+            max_layers: parity_layers,
+            no_early_stop,
+        },
         Some("generate-parity") => Command::GenerateParity {
             prompt: prompt.clone(),
             seed,
@@ -1244,7 +1281,7 @@ fn parse_cli() -> Cli {
         Some(cmd) => {
             eprintln!("unknown command: {cmd}");
             eprintln!(
-                "usage: diffgemma-mps [-p PROMPT] [summary|config|weights <name>|quantize|convert-model|step-smoke|step-probe|step-kv-check|step-verify|step-parity|bench-step-kernel|bench-step|bench-prefill|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-parity|tokenize <text>|gemm|attention]"
+                "usage: diffgemma-mps [-p PROMPT] [summary|config|weights <name>|quantize|convert-model|step-smoke|step-probe|step-kv-check|step-verify|step-parity|bench-step-kernel|bench-step|bench-prefill|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-monolithic|generate-parity|tokenize <text>|gemm|attention]"
             );
             eprintln!("  default (no command): generate-gpu with --features metal");
             eprintln!("  generate-parity: GPU vs checked-in golden (use --compare-cpu for slow CPU path)");
@@ -2349,6 +2386,90 @@ fn infer_golden_name(
     quantized: bool,
 ) -> Option<String> {
     generate_golden::infer_fixture_name(prompt_text, steps, max_layers, quantized)
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn run_generate_monolithic_cmd(
+    model_dir: &std::path::Path,
+    prompt_text: Option<String>,
+    seed: u64,
+    steps: usize,
+    prompt_len: usize,
+    max_new_tokens: usize,
+    max_layers: Option<usize>,
+    no_early_stop: bool,
+) -> ExitCode {
+    if !dgq::store::looks_like_dgq_dir(model_dir) {
+        eprintln!("error: generate-monolithic requires a .dgq directory (-m /path/to/quantized-weights)");
+        return ExitCode::FAILURE;
+    }
+
+    let vocab = match crate::config::ModelConfig::load(model_dir) {
+        Ok(c) => c.text_config.vocab_size,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let prompt = match build_prompt_tokens(model_dir, prompt_text.as_deref(), prompt_len, vocab) {
+        Ok(ids) => ids,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let prompt_len = prompt.len();
+    let max_seq = (prompt_len + max_new_tokens).max(512);
+
+    let gen_cfg = generate::GenerateConfig {
+        sampler: sample::sampler_for_steps(steps, no_early_stop),
+        max_new_tokens,
+        seed,
+        max_layers,
+        no_early_stop,
+        deterministic: false,
+    };
+
+    let layers_note = max_layers
+        .map(|n| format!(", layers={n}"))
+        .unwrap_or_default();
+    let stop_note = if no_early_stop { ", no_early_stop" } else { "" };
+    eprintln!(
+        "running generate-monolithic (prompt_len={prompt_len}, steps={steps}, max_new_tokens={max_new_tokens}, seed={seed}{layers_note}{stop_note})..."
+    );
+    let started = std::time::Instant::now();
+
+    match generate::generate_monolithic_gpu(model_dir, &prompt, &gen_cfg, max_seq) {
+        Ok(out) => {
+            print_generate_output(
+                "generate-monolithic",
+                &out,
+                prompt_len,
+                started.elapsed(),
+                model_dir,
+            );
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn run_generate_monolithic_cmd(
+    _model_dir: &std::path::Path,
+    _prompt_text: Option<String>,
+    _seed: u64,
+    _steps: usize,
+    _prompt_len: usize,
+    _max_new_tokens: usize,
+    _max_layers: Option<usize>,
+    _no_early_stop: bool,
+) -> ExitCode {
+    eprintln!("error: generate-monolithic requires --features metal on macOS");
+    ExitCode::FAILURE
 }
 
 fn run_generate(

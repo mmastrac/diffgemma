@@ -34,7 +34,7 @@ See `ARCHITECTURE.md` for DiffusionGemma semantics (block diffusion, entropy sam
 | GPU sampler (rowstats → commit → apply → write) | ✅ early stop, entropy |
 | First-step SC skip (no rowstats / softembed / SC MLP when `step==0`) | ✅ |
 | MoE grouped kernel + fused `k_rmsnorm_f32` tail | ✅ |
-| Tooling | ✅ `step-smoke`, `step-probe`, `bench-step-kernel` |
+| Tooling | ✅ `step-smoke`, `step-probe`, `step-kv-check`, `bench-step-kernel`, `generate-monolithic` |
 
 ### Measured vs engine
 
@@ -46,12 +46,10 @@ See `ARCHITECTURE.md` for DiffusionGemma semantics (block diffusion, entropy sam
 
 ### What does **not** work yet
 
-- **No prompt / no KV context** — `step-smoke` starts from a random 256-token canvas with `kv_len=0`.
-- **No encoder prefill or extend** — shader comment `NOTE-KV`: monolithic KV layout ≠ `GpuKvCache`.
-- **Not wired to `generate`** — no block loop, no token output decode, no multi-block chaining.
-- **Layer coverage** — smoke/probe default to 3 layers; full 30L + 5 full-attention layers unverified.
-- **Parity gaps** — open `VERIFY-*` items in shader header (nibble order, SC scale, rng init).
-- **Perf debt** — ~130 dispatches/step/layer; `k_sc_softembed` is O(vocab×hidden) per step>0; MPS scratch ~92 MiB for largest Q4 shapes.
+- **Multi-block extend** — single 256-token block verified; `max_new_tokens > 256` extend path implemented but not heavily tested.
+- **Parity vs engine @ kv>0** — `step-parity` still kv_len=0 only.
+- **Layer coverage** — full 30L generate verified @ hello prompt; 5 full-attention layers exercised in forward path.
+- **Perf debt** — ~130 dispatches/step/layer; recompiles runtime per generate invocation (no cross-prompt reuse yet).
 
 ---
 
@@ -152,15 +150,20 @@ cargo run --release --features metal -- -m $WEIGHTS step-probe --kv-len 64 --lay
 
 | Task | Notes |
 |------|-------|
-| **M2.1 `StepGenerateConfig`** | Mirror `GenerateConfig`: max_new_tokens, max_denoising_steps, entropy_bound, seed, layers |
-| **M2.2 Block outer loop** | Same as engine: prefill prompt → repeat { denoise until stop → commit argmax canvas → extend KV } |
-| **M2.3 Canvas lifecycle** | Init from `initialize_canvas`; after stop read `CanvasState.ids`; commit **argmax** (not raw ids — match engine `argmax_canvas_tokens`) |
-| **M2.4 Step loop** | `StepParams.kv_len` updated each block; `CanvasState.step` reset per block; SC logits from prior step via b6 |
-| **M2.5 Early stop** | Honor `stop_flag`; respect max steps (48 default); linear temperature via existing `temp_at()` |
-| **M2.6 Output** | `GenerateOutput`-compatible struct; decode via `tokenizer.json`; print like `print_generate_output` |
-| **M2.7 CLI** | `generate-monolithic` flags aligned with `generate-gpu` (`-p`, `--seed`, `--steps`, `--layers`) |
+| **M2.1 `StepGenerateConfig`** | ✅ `src/metal/step_generate.rs` mirrors `GenerateConfig` fields |
+| **M2.2 Block outer loop** | ✅ prefill → denoise until stop → commit argmax → extend KV |
+| **M2.3 Canvas lifecycle** | ✅ `reset_block` + read `CanvasState.prev_argmax` for commit |
+| **M2.4 Step loop** | ✅ `StepParams.kv_len` patched per block; SC via b6 logits on step>0 |
+| **M2.5 Early stop** | ✅ GPU `stop_flag` + `max_steps`; `--no-early-stop` sets `conf_threshold=MAX` |
+| **M2.6 Output** | ✅ returns `GenerateOutput`; decode/print via existing `print_generate_output` |
+| **M2.7 CLI** | ✅ `generate-monolithic` (`-p`, `--seed`, `--steps`, `--layers`) |
 
 **Exit:** `generate-monolithic -p "hello" --seed 42 --layers 30` produces readable text; token stream starts with prompt ids; blocks_committed ≥ 1.
+
+```bash
+cargo run --release --features metal -- -m $WEIGHTS generate-monolithic -p "hello" --seed 42 --layers 30
+cargo run --release --features metal -- -m $WEIGHTS generate-monolithic -p "hello" --layers 3 --steps 4 --seed 42
+```
 
 ---
 

@@ -95,6 +95,7 @@ pub struct ModelLayout {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct StepParams {
     pub kv_len: u32,
     pub max_steps: u32,
@@ -1184,7 +1185,11 @@ impl StepEnc<'_> {
 
 pub fn init_canvas_state(seed: u64, vocab: usize) -> CanvasState {
     let mut rng = Rng::new(seed);
-    let ids_vec = initialize_canvas(CANVAS, vocab, &mut rng);
+    init_canvas_state_from_rng(vocab, &mut rng)
+}
+
+pub fn init_canvas_state_from_rng(vocab: usize, rng: &mut Rng) -> CanvasState {
+    let ids_vec = initialize_canvas(CANVAS, vocab, rng);
     let mut ids = [0u32; CANVAS];
     ids.copy_from_slice(&ids_vec);
     CanvasState {
@@ -1202,6 +1207,28 @@ pub fn init_canvas_state(seed: u64, vocab: usize) -> CanvasState {
         argmax_changed: 0,
         mean_entropy: 0.0,
         _pad2: 0,
+    }
+}
+
+pub fn step_params_from_sampler(
+    sampler: &SamplerConfig,
+    kv_len: u32,
+    no_early_stop: bool,
+) -> StepParams {
+    let conf_threshold = if no_early_stop {
+        f32::MAX
+    } else {
+        sampler.confidence_threshold
+    };
+    StepParams {
+        kv_len,
+        max_steps: sampler.max_denoising_steps.max(1) as u32,
+        entropy_bound: sampler.entropy_bound,
+        t_min: sampler.t_min,
+        t_max: sampler.t_max,
+        conf_threshold,
+        stability_threshold: sampler.stability_threshold as u32,
+        _pad: 0,
     }
 }
 
@@ -1317,7 +1344,7 @@ fn arena_hidden_stats(arena: &ProtocolObject<dyn MTLBuffer>) -> (bool, f32, usiz
     (finite, max_abs, non_finite)
 }
 
-struct StepRuntime {
+pub struct StepRuntime {
     ctx: MetalContext,
     pipelines: StepPipelines,
     bufs: StepBuffers,
@@ -1325,10 +1352,56 @@ struct StepRuntime {
     mps_matmul: MpsMatmulCache,
     use_mps_q4: bool,
     layout: ModelLayout,
-    layers: usize,
+    pub layers: usize,
 }
 
 impl StepRuntime {
+    pub fn layout(&self) -> &ModelLayout {
+        &self.layout
+    }
+
+    pub fn kvcache(&self) -> &ProtocolObject<dyn MTLBuffer> {
+        &self.bufs.kvcache
+    }
+
+    pub fn read_params(&self) -> StepParams {
+        read_struct(&self.bufs.params)
+    }
+
+    pub fn write_params(&mut self, params: StepParams) {
+        write_struct(&self.bufs.params, &params);
+    }
+
+    pub fn set_kv_len(&mut self, kv_len: u32) {
+        let mut params = self.read_params();
+        params.kv_len = kv_len;
+        self.write_params(params);
+    }
+
+    pub fn read_canvas_state(&self) -> CanvasState {
+        read_struct(&self.bufs.state)
+    }
+
+    pub fn write_canvas_state(&mut self, state: &CanvasState) {
+        write_struct(&self.bufs.state, state);
+    }
+
+    /// New denoise block: fresh random canvas, reset step/stop, patch sampler params.
+    pub fn reset_block(&mut self, vocab: usize, rng: &mut Rng, params: StepParams) {
+        let mut state = init_canvas_state_from_rng(vocab, rng);
+        state.step = 0;
+        state.stop_flag = 0;
+        state.argmax_stable = 0;
+        state.argmax_changed = 0;
+        state.mean_entropy = 0.0;
+        self.write_canvas_state(&state);
+        self.write_params(params);
+    }
+
+    pub fn run_denoise_step(&mut self) -> Result<(), Error> {
+        self.run_forward_once(StepFinishMode::Full)
+    }
+
     fn dispatch_and_wait<F>(&mut self, f: F) -> Result<(), Error>
     where
         F: FnOnce(&mut StepEnc<'_>) -> Result<(), Error>,
@@ -1372,7 +1445,7 @@ impl StepRuntime {
     }
 }
 
-fn build_step_runtime(model_dir: &Path, cfg: &StepSmokeConfig) -> Result<(StepRuntime, std::time::Duration), Error> {
+pub fn build_step_runtime(model_dir: &Path, cfg: &StepSmokeConfig) -> Result<(StepRuntime, std::time::Duration), Error> {
     let compile_started = Instant::now();
     let store = DgqStore::open(model_dir)?;
     let offsets = build_offsets_from_store(&store);

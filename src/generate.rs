@@ -504,6 +504,33 @@ pub fn generate_gpu(
     generate_inner(store, cfg, prompt_token_ids, gen_cfg, enc_scratch, &mut decoder)
 }
 
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn generate_monolithic_gpu(
+    model_dir: &std::path::Path,
+    prompt_token_ids: &[u32],
+    gen_cfg: &GenerateConfig,
+    max_seq: usize,
+) -> Result<GenerateOutput, Error> {
+    use crate::metal::{generate_monolithic, StepGenerateConfig};
+    let layers = gen_cfg.max_layers.unwrap_or(30);
+    let mut cfg = StepGenerateConfig::from_generate(
+        gen_cfg.seed,
+        gen_cfg.max_new_tokens,
+        max_seq,
+        layers,
+        gen_cfg.sampler.clone(),
+        gen_cfg.no_early_stop,
+    );
+    if gen_cfg.deterministic
+        || std::env::var("DGQ_DETERMINISTIC")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false)
+    {
+        cfg.use_mps_q4 = Some(false);
+    }
+    generate_monolithic(model_dir, prompt_token_ids, &cfg)
+}
+
 #[cfg(all(test, feature = "metal", target_os = "macos"))]
 mod gpu_determinism {
     use super::*;
