@@ -153,6 +153,8 @@ pub struct StepSmokeConfig {
     pub finish: StepFinishMode,
     /// When set, overrides `DGQ_MPS_Q4` for this run (deterministic goldens use `false`).
     pub use_mps_q4: Option<bool>,
+    /// Prompt token ids for encoder prefill into b4 (M1). When set, `StepParams.kv_len` = len.
+    pub prefill_token_ids: Option<Vec<u32>>,
 }
 
 impl Default for StepSmokeConfig {
@@ -165,6 +167,7 @@ impl Default for StepSmokeConfig {
             max_seq: 512,
             finish: StepFinishMode::Full,
             use_mps_q4: None,
+            prefill_token_ids: None,
         }
     }
 }
@@ -263,12 +266,7 @@ pub fn build_layout(offsets: &HashMap<String, u64>, max_seq: usize) -> ModelLayo
 }
 
 fn kv_cache_bytes(layout: &ModelLayout, max_seq: usize) -> u64 {
-    let mut t = 0u64;
-    for i in 0..N_LAYERS {
-        let l = &layout.layers[i];
-        t += (max_seq as u64) * (l.n_kv_heads as u64) * (l.head_dim as u64) * 2 * 2;
-    }
-    t
+    crate::metal::step_kv::kv_cache_total_bytes(layout, max_seq)
 }
 
 fn layer_byte_offset(layer: usize) -> u64 {
@@ -1391,8 +1389,13 @@ fn build_step_runtime(model_dir: &Path, cfg: &StepSmokeConfig) -> Result<(StepRu
     let logits_bytes = CANVAS * VOCAB * 2;
 
     let sampler = SamplerConfig::default();
+    let prefill_len = cfg
+        .prefill_token_ids
+        .as_ref()
+        .map(|t| t.len() as u32)
+        .unwrap_or(cfg.kv_len);
     let params = StepParams {
-        kv_len: cfg.kv_len,
+        kv_len: prefill_len,
         max_steps: cfg.steps.max(1) as u32,
         entropy_bound: sampler.entropy_bound,
         t_min: sampler.t_min,
@@ -1436,6 +1439,21 @@ fn build_step_runtime(model_dir: &Path, cfg: &StepSmokeConfig) -> Result<(StepRu
     zero_buffer(&bufs.arena);
     zero_buffer(&bufs.kvcache);
     zero_buffer(&bufs.logits);
+
+    if let Some(ref token_ids) = cfg.prefill_token_ids {
+        let kv_len = crate::metal::step_kv::prefill_monolithic_kv(
+            model_dir,
+            token_ids,
+            &bufs.kvcache,
+            &layout,
+            cfg.max_seq,
+            layers,
+        )?;
+        if kv_len as u32 != prefill_len {
+            return Err(Error::Format("prefill kv_len mismatch"));
+        }
+        eprintln!("step-kernel: prefilled kv_len={kv_len} tokens");
+    }
 
     let compile = compile_started.elapsed();
     let mps_matmul = MpsMatmulCache::new(ctx.device.clone());

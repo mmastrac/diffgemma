@@ -27,6 +27,7 @@ mod bench_gemm;
 mod router;
 mod sampler;
 mod sampler_kernels;
+mod step_kv;
 mod step_m0;
 mod step_kernel;
 mod self_conditioning;

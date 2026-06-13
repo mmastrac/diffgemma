@@ -112,6 +112,7 @@ enum Command {
         seed: u64,
         max_seq: usize,
         forward_only: bool,
+        prompt: Option<String>,
     },
     StepProbe {
         layers: usize,
@@ -149,6 +150,7 @@ fn main() -> ExitCode {
             seed,
             max_seq,
             forward_only,
+            prompt,
         } => run_step_smoke_cmd(
             &cli.model_dir,
             layers,
@@ -157,6 +159,7 @@ fn main() -> ExitCode {
             seed,
             max_seq,
             forward_only,
+            prompt.as_deref(),
         ),
         Command::StepProbe {
             layers,
@@ -354,6 +357,7 @@ fn step_kernel_config(
             metal::StepFinishMode::Full
         },
         use_mps_q4: None,
+        prefill_token_ids: None,
     }
 }
 
@@ -379,6 +383,7 @@ fn run_step_probe_cmd(
         max_seq,
         finish: StepFinishMode::ForwardOnly,
         use_mps_q4: None,
+        prefill_token_ids: None,
     };
     match run_step_probe(model_dir, cfg) {
         Ok(r) => {
@@ -577,6 +582,7 @@ fn run_step_smoke_cmd(
     seed: u64,
     max_seq: usize,
     forward_only: bool,
+    prompt: Option<&str>,
 ) -> ExitCode {
     use metal::{run_step_smoke, StepSmokeConfig};
 
@@ -587,6 +593,30 @@ fn run_step_smoke_cmd(
 
     let mut cfg = step_kernel_config(layers, kv_len, seed, max_seq, forward_only);
     cfg.steps = steps.max(1);
+    if kv_len > 0 || prompt.is_some() {
+        let vocab = match crate::config::ModelConfig::load(model_dir) {
+            Ok(c) => c.text_config.vocab_size,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let prompt_len = if kv_len > 0 {
+            kv_len as usize
+        } else {
+            64
+        };
+        match build_prompt_tokens(model_dir, prompt, prompt_len, vocab) {
+            Ok(ids) => {
+                eprintln!("step-smoke: prefill {} prompt tokens", ids.len());
+                cfg.prefill_token_ids = Some(ids);
+            }
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     eprintln!(
         "step-smoke: model={} layers={layers} steps={steps} kv_len={kv_len} seed={seed} max_seq={max_seq}",
         model_dir.display()
@@ -633,6 +663,7 @@ fn run_step_smoke_cmd(
     _seed: u64,
     _max_seq: usize,
     _forward_only: bool,
+    _prompt: Option<&str>,
 ) -> ExitCode {
     eprintln!("error: step-smoke requires --features metal on macOS");
     ExitCode::FAILURE
@@ -1079,6 +1110,7 @@ fn parse_cli() -> Cli {
             seed,
             max_seq: step_max_seq.max(64),
             forward_only: step_forward_only,
+            prompt: prompt.clone(),
         },
         Some("step-probe") => Command::StepProbe {
             layers: bench_layers.max(1).min(30),
