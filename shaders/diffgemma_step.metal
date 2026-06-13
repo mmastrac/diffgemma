@@ -307,6 +307,57 @@ kernel void k_gemm_q8(device const half* x [[buffer(0)]],
     }
 }
 
+// k_gemm_q8_rowk: weight rows indexed by K (vocab); cols N (hidden). For SC softembed.
+kernel void k_gemm_q8_rowk(device const half* x [[buffer(0)]],
+                           device half* y [[buffer(1)]],
+                           device const uchar* blob [[buffer(2)]],
+                           constant ulong& w_off [[buffer(3)]],
+                           constant uint& M [[buffer(4)]],
+                           uint3 tgid [[threadgroup_position_in_grid]],
+                           uint3 lid [[thread_position_in_threadgroup]],
+                           uint sgid [[simdgroup_index_in_threadgroup]]) {
+    const uint N = GEMM_N, K = GEMM_K;
+    threadgroup half tx[32][32];
+    threadgroup half tw[32][32];
+    uint m0 = tgid.y * 32, n0 = tgid.x * 32;
+    uint ltid = lid.x;
+    simdgroup_float8x8 acc0(0.f), acc1(0.f), acc2(0.f), acc3(0.f);
+    const ulong rowB = q8_row_bytes(N);
+    for (uint k0 = 0; k0 < K; k0 += 32) {
+        for (uint i = ltid; i < 32*32; i += 128) {
+            uint mm = i/32, kk = i%32;
+            tx[mm][kk] = (m0+mm < M) ? x[(ulong)(m0+mm)*K + k0+kk] : half(0);
+        }
+        for (uint i = ltid; i < 32*32; i += 128) {
+            uint nn = i/32, kk = i%32;
+            device const uchar* rb = blob + w_off + (ulong)(k0+kk)*rowB;
+            tw[nn][kk] = half(q8_at(rb, n0+nn, bf16_bytes(rb)));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint kk = 0; kk < 32; kk += 8) {
+            simdgroup_half8x8 a, b0, b1, b2, b3;
+            simdgroup_load(a,  &tx[8*sgid][kk], 32);
+            simdgroup_load(b0, &tw[0][kk],  32, ulong2(0,0), true);
+            simdgroup_load(b1, &tw[8][kk],  32, ulong2(0,0), true);
+            simdgroup_load(b2, &tw[16][kk], 32, ulong2(0,0), true);
+            simdgroup_load(b3, &tw[24][kk], 32, ulong2(0,0), true);
+            simdgroup_multiply_accumulate(acc0, a, b0, acc0);
+            simdgroup_multiply_accumulate(acc1, a, b1, acc1);
+            simdgroup_multiply_accumulate(acc2, a, b2, acc2);
+            simdgroup_multiply_accumulate(acc3, a, b3, acc3);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    threadgroup float ty[32][32];
+    simdgroup_store(acc0,&ty[8*sgid][0],32); simdgroup_store(acc1,&ty[8*sgid][8],32);
+    simdgroup_store(acc2,&ty[8*sgid][16],32); simdgroup_store(acc3,&ty[8*sgid][24],32);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = ltid; i < 32*32; i += 128) {
+        uint mm = i/32, nn = i%32;
+        if (m0+mm < M && n0+nn < N) y[(ulong)(m0+mm)*N + n0+nn] = half(ty[mm][nn]);
+    }
+}
+
 // ============ k_qk_rope_kv: per-head QK-norm + split-half RoPE + KV write ============
 // GRID: x = CANVAS tokens, y = NQ_HEADS + 2*n_kv_heads head slots (32 sliding / 20 full).
 // On full layers (L->v_proj == 0) the V slot reads from the K GEMM output (V1, audit item 6) —
@@ -605,6 +656,28 @@ kernel void k_logit_rowstats(device const half* logits [[buffer(0)]],
         float s = 0.f; for (uint i=0;i<nsg;++i) s += r_sum[i];
         rowstat[row*2] = mx; rowstat[row*2+1] = s;
     }
+}
+
+// ============ k_sc_probs: materialize softmax rows for SC GEMM fast path (M3.2) ============
+kernel void k_sc_probs(device const half* logits [[buffer(0)]],
+                       device const float* rowstat [[buffer(1)]],
+                       device half* probs [[buffer(2)]],
+                       uint row [[threadgroup_position_in_grid]],
+                       uint lid [[thread_position_in_threadgroup]],
+                       uint tpg [[threads_per_threadgroup]]) {
+    float mx = rowstat[row*2], sum = rowstat[row*2+1];
+    device const half* lr = logits + (ulong)row * VOCAB;
+    for (uint v = lid; v < VOCAB; v += tpg) {
+        probs[(ulong)row * VOCAB + v] = half(exp(float(lr[v]) - mx) / sum);
+    }
+}
+
+kernel void k_half_scale(device half* y [[buffer(0)]],
+                         constant uint& n [[buffer(1)]],
+                         constant float& scale [[buffer(2)]],
+                         uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) return;
+    y[gid] = half(float(y[gid]) * scale);
 }
 
 // ============ k_sc_softembed: soft[m,d] = (softmax(prev logits) @ embed)[m,d] * sqrt(H) ============

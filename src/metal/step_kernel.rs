@@ -305,6 +305,13 @@ fn mps_scratch_bytes() -> (usize, usize, usize) {
     )
 }
 
+fn step_use_sc_gemm_from_env() -> bool {
+    match std::env::var("DGQ_SC_GEMM") {
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        Err(_) => false,
+    }
+}
+
 fn step_use_mps_q4_from_env() -> bool {
     match std::env::var("DGQ_MPS_Q4") {
         Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
@@ -321,6 +328,7 @@ struct StepPipelines {
     f32_to_half: ComputePipeline,
     gemm_q4: HashMap<(u32, u32), ComputePipeline>,
     gemm_q8: HashMap<(u32, u32), ComputePipeline>,
+    gemm_q8_rowk: HashMap<(u32, u32), ComputePipeline>,
     qk_rope_kv: ComputePipeline,
     attention: ComputePipeline,
     residual: ComputePipeline,
@@ -332,7 +340,9 @@ struct StepPipelines {
     moe_grouped: ComputePipeline,
     embed_gather: ComputePipeline,
     logit_rowstats: ComputePipeline,
+    sc_probs: ComputePipeline,
     sc_softembed: ComputePipeline,
+    half_scale: ComputePipeline,
     softcap: ComputePipeline,
     sample_rowstats: ComputePipeline,
     sample_commit: ComputePipeline,
@@ -345,6 +355,7 @@ impl StepPipelines {
         let simple = |e: &str| MetalContext::compile_kernel_from_library(&ctx.device, library, e);
         let mut gemm_q4 = HashMap::new();
         let mut gemm_q8 = HashMap::new();
+        let mut gemm_q8_rowk = HashMap::new();
         for &(n, k) in &[
             (4096u32, HID as u32),
             (2048, HID as u32),
@@ -371,6 +382,12 @@ impl StepPipelines {
                 MetalContext::compile_gemm_kernel(&ctx.device, library, "k_gemm_q8", n, k)?,
             );
         }
+        for &(n, k) in &[(HID as u32, VOCAB as u32)] {
+            gemm_q8_rowk.insert(
+                (n, k),
+                MetalContext::compile_gemm_kernel(&ctx.device, library, "k_gemm_q8_rowk", n, k)?,
+            );
+        }
         Ok(Self {
             memzero: simple("k_memzero")?,
             rmsnorm: simple("k_rmsnorm")?,
@@ -380,6 +397,7 @@ impl StepPipelines {
             f32_to_half: simple("k_f32_to_half")?,
             gemm_q4,
             gemm_q8,
+            gemm_q8_rowk,
             qk_rope_kv: simple("k_qk_rope_kv")?,
             attention: simple("k_attention")?,
             residual: simple("k_residual")?,
@@ -391,7 +409,9 @@ impl StepPipelines {
             moe_grouped: simple("k_moe_grouped")?,
             embed_gather: simple("k_embed_gather")?,
             logit_rowstats: simple("k_logit_rowstats")?,
+            sc_probs: simple("k_sc_probs")?,
             sc_softembed: simple("k_sc_softembed")?,
+            half_scale: simple("k_half_scale")?,
             softcap: simple("k_softcap")?,
             sample_rowstats: simple("k_sample_rowstats")?,
             sample_commit: simple("k_sample_commit")?,
@@ -411,6 +431,12 @@ impl StepPipelines {
             .get(&(n, k))
             .ok_or(Error::Format("missing q8 pipeline"))
     }
+
+    fn q8_rowk(&self, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
+        self.gemm_q8_rowk
+            .get(&(n, k))
+            .ok_or(Error::Format("missing q8 rowk pipeline"))
+    }
 }
 
 struct StepBuffers {
@@ -421,6 +447,7 @@ struct StepBuffers {
     kvcache: Retained<ProtocolObject<dyn MTLBuffer>>,
     state: Retained<ProtocolObject<dyn MTLBuffer>>,
     logits: Retained<ProtocolObject<dyn MTLBuffer>>,
+    sc_probs: Retained<ProtocolObject<dyn MTLBuffer>>,
     route: Retained<ProtocolObject<dyn MTLBuffer>>,
     mps_x: Retained<ProtocolObject<dyn MTLBuffer>>,
     mps_w: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -435,6 +462,7 @@ struct StepEnc<'a> {
     gpu_blob: &'a std::sync::Arc<DgqGpuBlob>,
     mps: &'a mut MpsMatmulCache,
     use_mps_q4: bool,
+    use_sc_gemm: bool,
 }
 
 impl StepEnc<'_> {
@@ -486,6 +514,13 @@ impl StepEnc<'_> {
         unsafe {
             self.enc
                 .setBuffer_offset_atIndex(Some(&self.bufs.logits), 0, idx);
+        }
+    }
+
+    fn bind_sc_probs(&self, idx: usize) {
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&self.bufs.sc_probs), 0, idx);
         }
     }
 
@@ -826,6 +861,98 @@ impl StepEnc<'_> {
         Ok(())
     }
 
+    /// probs [M,K] half buffer @ sc_probs → arena y_off [M,N] via q8 weights.
+    fn gemm_q8_probs(
+        &self,
+        y_off: u64,
+        w_off: u64,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) -> Result<(), Error> {
+        let ps = self.ps.q8_rowk(n, k)?;
+        self.enc.setComputePipelineState(&ps.pipeline);
+        unsafe {
+            self.bind_sc_probs(0);
+            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), y_off as usize, 1);
+            self.bind_blob(2);
+            set_bytes(&self.enc, &w_off, 3);
+            set_bytes(&self.enc, &m, 4);
+        }
+        let grid = MTLSize {
+            width: div_up(n as usize, 32),
+            height: div_up(m as usize, 32),
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 32,
+            height: 32,
+            depth: 1,
+        };
+        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        Ok(())
+    }
+
+    fn scale_half_arena(&self, y_off: u64, elems: usize, scale: f32) {
+        self.enc
+            .setComputePipelineState(&self.ps.half_scale.pipeline);
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&self.bufs.arena), y_off as usize, 0);
+            set_bytes(&self.enc, &(elems as u32), 1);
+            set_bytes(&self.enc, &scale, 2);
+        }
+        self.dispatch_1d(&self.ps.half_scale, elems, 256);
+    }
+
+    fn encode_sc_softembed(&mut self, layout: &ModelLayout) -> Result<(), Error> {
+        if self.use_sc_gemm {
+            self.enc
+                .setComputePipelineState(&self.ps.sc_probs.pipeline);
+            self.bind_logits(0);
+            unsafe {
+                self.enc.setBuffer_offset_atIndex(
+                    Some(&self.bufs.arena),
+                    A_RS_SC as usize,
+                    1,
+                );
+            }
+            self.bind_sc_probs(2);
+            let grid = MTLSize {
+                width: CANVAS,
+                height: 1,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            };
+            self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+
+            self.gemm_q8_probs(A_SOFT, layout.embed, CANVAS as u32, HID as u32, VOCAB as u32)?;
+            self.scale_half_arena(A_SOFT, CANVAS * HID as usize, (HID as f32).sqrt());
+        } else {
+            self.enc
+                .setComputePipelineState(&self.ps.sc_softembed.pipeline);
+            unsafe {
+                self.bind_logits(0);
+                self.enc.setBuffer_offset_atIndex(
+                    Some(&self.bufs.arena),
+                    A_RS_SC as usize,
+                    1,
+                );
+                self.bind_blob(2);
+                self.bind_layout(3);
+                self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), A_SOFT as usize, 4);
+                let zero: u32 = 0;
+                set_bytes(&self.enc, &zero, 5);
+            }
+            self.dispatch_2d(&self.ps.sc_softembed, HID / 64, CANVAS, 64, 1);
+        }
+        Ok(())
+    }
+
     fn residual(&self, a_off: u64, b_off: u64, y_off: u64, scal_off: u64, elems: usize) {
         self.enc.setComputePipelineState(&self.ps.residual.pipeline);
         unsafe {
@@ -1016,20 +1143,7 @@ impl StepEnc<'_> {
             };
             self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
 
-            self.enc.setComputePipelineState(&self.ps.sc_softembed.pipeline);
-            unsafe {
-                self.bind_logits(0);
-                self.enc.setBuffer_offset_atIndex(
-                    Some(&self.bufs.arena),
-                    A_RS_SC as usize,
-                    1,
-                );
-                self.bind_blob(2);
-                self.bind_layout(3);
-                self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), A_SOFT as usize, 4);
-                set_bytes(&self.enc, &first_step, 5);
-            }
-            self.dispatch_2d(&self.ps.sc_softembed, HID / 64, CANVAS, 64, 1);
+            self.encode_sc_softembed(layout)?;
 
             self.rmsnorm(A_SOFT, A_TMP, layout.sc_pre_norm, HID as u32, CANVAS);
             self.gemm_q8(
@@ -1346,11 +1460,12 @@ fn arena_hidden_stats(arena: &ProtocolObject<dyn MTLBuffer>) -> (bool, f32, usiz
 
 pub struct StepRuntime {
     ctx: MetalContext,
-    pipelines: StepPipelines,
+    pipelines: &'static StepPipelines,
     bufs: StepBuffers,
     gpu_blob: std::sync::Arc<DgqGpuBlob>,
     mps_matmul: MpsMatmulCache,
     use_mps_q4: bool,
+    use_sc_gemm: bool,
     layout: ModelLayout,
     pub layers: usize,
 }
@@ -1421,6 +1536,7 @@ impl StepRuntime {
             gpu_blob: &self.gpu_blob,
             mps: &mut self.mps_matmul,
             use_mps_q4: self.use_mps_q4,
+            use_sc_gemm: self.use_sc_gemm,
         };
         f(&mut enc)?;
         enc.enc.endEncoding();
@@ -1445,21 +1561,83 @@ impl StepRuntime {
     }
 }
 
+static STEP_PIPELINES: std::sync::OnceLock<Result<StepPipelines, String>> =
+    std::sync::OnceLock::new();
+
+fn shared_step_pipelines(ctx: &MetalContext) -> Result<&'static StepPipelines, Error> {
+    STEP_PIPELINES
+        .get_or_init(|| {
+            ctx.compile_library(STEP_SHADER)
+                .and_then(|library| StepPipelines::new(ctx, &library))
+                .map_err(|e| e.to_string())
+        })
+        .as_ref()
+        .map_err(|msg| Error::Format(msg.as_str()))
+}
+
+pub fn log_step_memory_budget(blob_bytes: u64, max_seq: usize, layout: &ModelLayout, use_sc_gemm: bool) {
+    let kv = kv_cache_bytes(layout, max_seq);
+    let logits = (CANVAS * VOCAB * 2) as u64;
+    let sc_probs = if use_sc_gemm { logits } else { 0 };
+    let arena = ARENA_BYTES;
+    let (mx, mw, mc) = mps_scratch_bytes();
+    let mps = (mx + mw + mc) as u64;
+    let gpu_static = kv + logits + sc_probs + arena + mps;
+    let total = blob_bytes + gpu_static;
+    eprintln!("step-kernel memory budget:");
+    eprintln!(
+        "  blob:       {:.2} GiB",
+        blob_bytes as f64 / (1024.0_f64.powi(3))
+    );
+    eprintln!(
+        "  arena:      {:.2} MiB",
+        arena as f64 / (1024.0 * 1024.0)
+    );
+    eprintln!(
+        "  kv cache:   {:.2} MiB (max_seq={max_seq})",
+        kv as f64 / (1024.0 * 1024.0)
+    );
+    eprintln!(
+        "  logits:     {:.2} MiB",
+        logits as f64 / (1024.0 * 1024.0)
+    );
+    eprintln!(
+        "  sc_probs:   {:.2} MiB",
+        sc_probs as f64 / (1024.0 * 1024.0)
+    );
+    eprintln!(
+        "  mps scratch:{:.2} MiB",
+        mps as f64 / (1024.0 * 1024.0)
+    );
+    eprintln!(
+        "  gpu static: {:.2} GiB (excl. blob)",
+        gpu_static as f64 / (1024.0_f64.powi(3))
+    );
+    eprintln!(
+        "  total est:  {:.2} GiB",
+        total as f64 / (1024.0_f64.powi(3))
+    );
+}
+
 pub fn build_step_runtime(model_dir: &Path, cfg: &StepSmokeConfig) -> Result<(StepRuntime, std::time::Duration), Error> {
-    let compile_started = Instant::now();
     let store = DgqStore::open(model_dir)?;
     let offsets = build_offsets_from_store(&store);
     let layout = build_layout(&offsets, cfg.max_seq);
     let layers = cfg.layers.min(N_LAYERS).max(1);
 
     let ctx = MetalContext::new()?;
-    let library = ctx.compile_library(STEP_SHADER)?;
-    let pipelines = StepPipelines::new(&ctx, &library)?;
+    let compile_started = Instant::now();
+    let pipelines = shared_step_pipelines(&ctx)?;
+    let compile = compile_started.elapsed();
 
     let gpu_blob = DgqGpuBlob::from_store(&store, &ctx.device)?;
     let gpu_blob = std::sync::Arc::clone(&gpu_blob);
     let kv_bytes = kv_cache_bytes(&layout, cfg.max_seq) as usize;
+    let use_sc_gemm = step_use_sc_gemm_from_env();
     let logits_bytes = CANVAS * VOCAB * 2;
+    let sc_probs_bytes = if use_sc_gemm { logits_bytes } else { 1 };
+
+    log_step_memory_budget(store.blob_bytes(), cfg.max_seq, &layout, use_sc_gemm);
 
     let sampler = SamplerConfig::default();
     let prefill_len = cfg
@@ -1500,6 +1678,7 @@ pub fn build_step_runtime(model_dir: &Path, cfg: &StepSmokeConfig) -> Result<(St
             b
         },
         logits: alloc_buffer(&ctx.device, logits_bytes)?,
+        sc_probs: alloc_buffer(&ctx.device, sc_probs_bytes)?,
         route: {
             let b = alloc_buffer(&ctx.device, std::mem::size_of::<RouteScratch>())?;
             zero_buffer(&b);
@@ -1528,7 +1707,6 @@ pub fn build_step_runtime(model_dir: &Path, cfg: &StepSmokeConfig) -> Result<(St
         eprintln!("step-kernel: prefilled kv_len={kv_len} tokens");
     }
 
-    let compile = compile_started.elapsed();
     let mps_matmul = MpsMatmulCache::new(ctx.device.clone());
     Ok((
         StepRuntime {
@@ -1538,6 +1716,7 @@ pub fn build_step_runtime(model_dir: &Path, cfg: &StepSmokeConfig) -> Result<(St
             gpu_blob,
             mps_matmul,
             use_mps_q4: cfg.use_mps_q4.unwrap_or_else(step_use_mps_q4_from_env),
+            use_sc_gemm: step_use_sc_gemm_from_env(),
             layout,
             layers,
         },

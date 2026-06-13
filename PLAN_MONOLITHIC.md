@@ -42,7 +42,8 @@ See `ARCHITECTURE.md` for DiffusionGemma semantics (block diffusion, entropy sam
 |-----------|------------|----------------------|--------|
 | Forward-only @ 3L | **2.33 s/step** | 2.44 s/step | step-kernel `kv_len=0`; engine prefill @ 64 |
 | Full smoke (1 step, sampler) | ~2.7 s | — | Random canvas, no prompt |
-| 30 layers | **not tested** | ~5.3 s/step (PLAN2) | IS_FULL pipelines exist but unverified |
+| 30 layers forward-only | **4.80 s/step** (kv=64) | **7.87 s/step** | step-kernel beats engine ~39% |
+| 30L generate end-to-end | **6.58 tok/s** (8 steps/block) | **3.89 tok/s** (~33 s/step) | monolithic ~69% faster denoise |
 
 ### What does **not** work yet
 
@@ -173,17 +174,27 @@ cargo run --release --features metal -- -m $WEIGHTS generate-monolithic -p "hell
 
 | Task | Impact | Notes |
 |------|--------|-------|
-| **M3.1 ICB record/replay** | High | Encode dispatch schedule once at load; replay per step with patched b2/b5/b4 offsets only |
-| **M3.2 SC softembed fast path** | High @ step>0 | Replace O(vocab×hidden) loop with prob materialization + `k_gemm_q8` (noted in shader) |
-| **M3.3 Drop dispatch overhead** | Medium | Fuse bucket_count+fill; batch pipeline binds; invariant b0/b1 bind once per step |
-| **M3.4 MPS Q8 for lm_head** | Medium | 256×262144×2816 — evaluate MPS vs fused `k_gemm_q8` |
-| **M3.5 MPS scratch pooling** | Medium | Reuse ~92 MiB weight scratch across GEMMs; avoid alloc pressure |
-| **M3.6 f16 vs f32 activations** | TBD | Engine uses f32; monolithic uses f16 arena — quantify quality/speed tradeoff |
-| **M3.7 MoE path** | Medium | Evaluate MPS grouped Q4 vs `k_moe_grouped` native; expert traffic ~4 GiB/step @ 30L |
-| **M3.8 Single sync per block** | High | One `waitUntilCompleted` per denoise step (already true); zero CPU readback in hot path |
-| **M3.9 Memory budget doc** | Required | Arena 25 MiB + KV + logits 134 MiB + MPS scratch ~108 MiB + blob 15 GiB — print at load |
+| **M3.1 ICB record/replay** | High | ✅ Partial: `OnceLock` pipeline compile cache (~65ms → ~4ms on repeat loads). Full ICB deferred. |
+| **M3.2 SC softembed fast path** | High @ step>0 | ⚠️ Experimental `DGQ_SC_GEMM=1` (probs + `k_gemm_q8_rowk`); **regresses** (~130s/step) — default **off**. Needs tiled vocab chunks or MPS matmul. |
+| **M3.3 Drop dispatch overhead** | Medium | Not started (fuse bucket_count+fill; hoist invariant binds) |
+| **M3.4 MPS Q8 for lm_head** | Medium | Not started |
+| **M3.5 MPS scratch pooling** | Medium | ✅ Scratch buffers allocated once per `StepRuntime` (reuse across steps) |
+| **M3.6 f16 vs f32 activations** | TBD | Not started |
+| **M3.7 MoE path** | Medium | Not started |
+| **M3.8 Single sync per block** | High | ✅ One `waitUntilCompleted` per denoise step; no hot-path CPU readback |
+| **M3.9 Memory budget doc** | Required | ✅ `log_step_memory_budget()` printed at `build_step_runtime` |
 
-**Benchmark discipline** (same as PLAN2):
+**Measured (M3 Pro class, `/tmp/quantized-weights`, `DGQ_MPS_Q4=1`):**
+
+| Benchmark | Monolithic | Engine | Notes |
+|-----------|------------|--------|-------|
+| `bench-step-kernel` 30L kv64 forward-only | **4.80 s/step** | — | 3 iters, warmup 5.07s |
+| `bench-step` 30L | — | **7.87 s/step** | 152 syncs, 1.3 GiB readback/step |
+| `generate-monolithic` 30L hello seed42 | **6.58 tok/s** (38.9s/8 steps) | — | 1 block, 256 new tokens |
+| `generate-gpu` 30L hello seed42 | — | **3.89 tok/s** (65.9s/2 steps) | early-stop @ step 2; ~33 s/step wall |
+| Pipeline compile (repeat load) | **~3 ms** | — | `OnceLock` cache (was ~65 ms) |
+
+**Exit (M3):** ✅ Met — see measured table. Remaining items (ICB replay, SC GEMM, dispatch fusion, MPS lm_head) are incremental; not blocking M4.
 
 ```bash
 # Apples-to-apples: both with kv prefill @ 64, 30 layers
@@ -193,9 +204,10 @@ cargo run --release --features metal -- -m $WEIGHTS bench-step --layers 30 --ite
 # End-to-end
 cargo run --release --features metal -- -m $WEIGHTS generate-monolithic -p "hello" --layers 30 --seed 42
 cargo run --release --features metal -- -m $WEIGHTS generate-gpu -p "hello" --layers 30 --seed 42
-```
 
-**Exit:** `bench-step-kernel` ≤ `bench-step` @ 30L, kv=64; `generate-monolithic` tok/s ≥ `generate-gpu` ±10%.
+# Experimental SC GEMM (not recommended — slow)
+DGQ_SC_GEMM=1 cargo run --release --features metal -- -m $WEIGHTS step-smoke --layers 30 --steps 4
+```
 
 ---
 
