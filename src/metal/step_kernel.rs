@@ -314,13 +314,11 @@ fn step_use_sc_gemm_from_env() -> bool {
     }
 }
 
-/// Step-kernel dense GEMM backend. Default is native `k_gemm_q4` (not MPS): the MPS
-/// dequant→matmul path in `StepEnc::gemm_q4` yields flat logits (~ln(vocab) entropy).
-/// Opt in with `DGQ_STEP_MPS_Q4=1`. Encoder prefill uses `DGQ_MPS_Q4` separately.
+/// Step-kernel dense GEMM backend. Default is MPS dequant→matmul (opt out with `DGQ_STEP_MPS_Q4=0`).
 pub fn step_use_mps_q4_default() -> bool {
     match std::env::var("DGQ_STEP_MPS_Q4") {
-        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
-        Err(_) => false,
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
     }
 }
 
@@ -1888,6 +1886,76 @@ pub fn run_step_forward(model_dir: &Path, cfg: &StepSmokeConfig) -> Result<StepF
         norm_hidden: read_half_buffer_f32(&rt.bufs.arena, A_TMP as usize, CANVAS * HID),
         logits: read_half_buffer_f32(&rt.bufs.logits, 0, CANVAS * VOCAB),
         token_ids: state.ids.to_vec(),
+    })
+}
+
+#[derive(Debug)]
+pub struct StepQ4MpsParityResult {
+    pub layers: usize,
+    pub kv_len: u32,
+    pub hidden_max_abs: f32,
+    pub logits_max_abs: f32,
+    pub native_min_ent: f32,
+    pub mps_min_ent: f32,
+    pub pass: bool,
+}
+
+/// P1.10: native `k_gemm_q4` vs MPS dequant→matmul forward pass (optional KV prefill).
+pub fn run_step_q4_mps_parity(
+    model_dir: &Path,
+    layers: usize,
+    kv_len: u32,
+    seed: u64,
+    max_seq: usize,
+    prefill_token_ids: Option<Vec<u32>>,
+) -> Result<StepQ4MpsParityResult, Error> {
+    let base = StepSmokeConfig {
+        layers,
+        steps: 1,
+        kv_len,
+        seed,
+        max_seq,
+        finish: StepFinishMode::ForwardOnly,
+        use_mps_q4: Some(false),
+        prefill_token_ids,
+    };
+    let mut mps_cfg = base.clone();
+    mps_cfg.use_mps_q4 = Some(true);
+
+    let native = run_step_forward(model_dir, &base)?;
+    let mps = run_step_forward(model_dir, &mps_cfg)?;
+
+    let hidden_max_abs = native
+        .norm_hidden
+        .iter()
+        .zip(mps.norm_hidden.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let logits_max_abs = native
+        .logits
+        .iter()
+        .zip(mps.logits.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+
+    let ln_vocab = (VOCAB as f32).ln();
+    let native_ent = crate::sample::token_entropy(&native.logits, CANVAS, VOCAB);
+    let mps_ent = crate::sample::token_entropy(&mps.logits, CANVAS, VOCAB);
+    let native_min_ent = native_ent.iter().cloned().fold(f32::INFINITY, f32::min);
+    let mps_min_ent = mps_ent.iter().cloned().fold(f32::INFINITY, f32::min);
+
+    let pass = native_min_ent < ln_vocab - 0.5
+        && mps_min_ent < ln_vocab - 0.5
+        && (native_min_ent - mps_min_ent).abs() < 3.0;
+
+    Ok(StepQ4MpsParityResult {
+        layers,
+        kv_len,
+        hidden_max_abs,
+        logits_max_abs,
+        native_min_ent,
+        mps_min_ent,
+        pass,
     })
 }
 

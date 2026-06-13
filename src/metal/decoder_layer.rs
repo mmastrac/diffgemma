@@ -269,48 +269,23 @@ fn forward_layer_ff_dgq_gpu(
         eps,
     )?;
 
-    let (routes, mut batch) = if use_mps_q4 {
-        let mut route_scratch = GpuRouteScratch {
-            indices: std::mem::take(&mut scratch.route_indices),
-            weights: std::mem::take(&mut scratch.route_weights),
-        };
-        route_gpu_in_batch(
-            &mut batch,
-            &engine.kernels,
-            &engine.f32_f32_linear_pipeline.pipeline,
-            &buf_stream,
-            cached,
-            cfg,
-            seq_len,
-            &mut route_scratch,
-        )?;
-        batch.flush_reads()?;
-        scratch.route_indices = route_scratch.indices;
-        scratch.route_weights = route_scratch.weights;
-        let routes = pack_routes(
-            &scratch.route_indices,
-            &scratch.route_weights,
-            seq_len,
-            top_k,
-        );
-        (routes, Some(batch))
-    } else {
-        scratch.dense_out.resize(len, 0.0);
-        scratch.moe_input.resize(len, 0.0);
-        batch.register_read(buf_ff.clone(), &mut scratch.dense_out);
-        batch.register_read(buf_stream.clone(), &mut scratch.moe_input);
-        batch.end()?;
-        let routes = route_with_cached_weights(
-            &scratch.moe_input,
-            cached.router_proj.as_slice(),
-            cached.router_scale.as_slice(),
-            cached.per_expert_scale.as_slice(),
-            cfg,
-            seq_len,
-            &mut scratch.cpu.moe,
-        )?;
-        (routes, None)
-    };
+    // Dense Q4 may use MPS matmul; router + MoE stay on the proven CPU path (GPU grouped
+    // MoE diverges from CPU MoE — breaks encoder KV parity when use_mps_q4=true).
+    scratch.dense_out.resize(len, 0.0);
+    scratch.moe_input.resize(len, 0.0);
+    batch.register_read(buf_ff.clone(), &mut scratch.dense_out);
+    batch.register_read(buf_stream.clone(), &mut scratch.moe_input);
+    batch.end()?;
+    let routes = route_with_cached_weights(
+        &scratch.moe_input,
+        cached.router_proj.as_slice(),
+        cached.router_scale.as_slice(),
+        cached.per_expert_scale.as_slice(),
+        cfg,
+        seq_len,
+        &mut scratch.cpu.moe,
+    )?;
+    let mut batch = None;
 
     let jobs = build_expert_jobs(&routes, experts);
     if let Some(cell) = &telemetry {
@@ -333,63 +308,38 @@ fn forward_layer_ff_dgq_gpu(
     }
 
     if !jobs.is_empty() {
-        if use_mps_q4 {
-            experts_forward_gpu_grouped_in_batch(
-                batch.as_mut().expect("mps batch"),
-                &mut scratch.moe_batch_out,
-                &buf_stream,
-                cached.pre_ff_norm_2.as_slice(),
-                eps,
-                expert_cache,
-                layer,
-                cfg,
-                seq_len,
-                &jobs,
-                &mut scratch.moe_token_indices,
-                &engine.kernels,
-                &engine.f32_q4_linear_grouped_pipeline,
-            )?;
-            batch.as_mut().expect("mps batch").flush_reads()?;
-            scatter_weighted_expert_outputs(
-                &mut scratch.moe_branch,
-                &scratch.moe_batch_out,
-                &jobs,
-                hidden,
-            );
-        } else {
-            prepare_expert_input(
-                &mut scratch.normed,
-                &scratch.moe_input,
-                cached.pre_ff_norm_2.as_slice(),
-                seq_len,
-                hidden,
-                eps,
-            );
-            scratch.moe_branch.resize(len, 0.0);
-            scratch.moe_branch.fill(0.0);
-            experts_forward_dgq_cpu(
-                &mut scratch.moe_branch,
-                &scratch.normed,
-                expert_cache,
-                layer,
-                cfg,
-                seq_len,
-                &routes,
-                &mut scratch.cpu.moe,
-            )?;
-            batch = Some(begin_engine_batch(
-                &engine.ctx.queue,
-                &mut engine.pool,
-                &engine.ctx.device,
-                telemetry.clone(),
-            )?);
-            buf_ff = batch.as_mut().expect("combine batch").alloc_f32(&scratch.dense_out)?;
-            buf_stream = batch
-                .as_mut()
-                .expect("combine batch")
-                .alloc_f32(&scratch.moe_input)?;
-        }
-    } else if !use_mps_q4 {
+        prepare_expert_input(
+            &mut scratch.normed,
+            &scratch.moe_input,
+            cached.pre_ff_norm_2.as_slice(),
+            seq_len,
+            hidden,
+            eps,
+        );
+        scratch.moe_branch.resize(len, 0.0);
+        scratch.moe_branch.fill(0.0);
+        experts_forward_dgq_cpu(
+            &mut scratch.moe_branch,
+            &scratch.normed,
+            expert_cache,
+            layer,
+            cfg,
+            seq_len,
+            &routes,
+            &mut scratch.cpu.moe,
+        )?;
+        batch = Some(begin_engine_batch(
+            &engine.ctx.queue,
+            &mut engine.pool,
+            &engine.ctx.device,
+            telemetry.clone(),
+        )?);
+        buf_ff = batch.as_mut().expect("combine batch").alloc_f32(&scratch.dense_out)?;
+        buf_stream = batch
+            .as_mut()
+            .expect("combine batch")
+            .alloc_f32(&scratch.moe_input)?;
+    } else {
         batch = Some(begin_engine_batch(
             &engine.ctx.queue,
             &mut engine.pool,
@@ -428,9 +378,7 @@ fn forward_layer_ff_dgq_gpu(
     bk::vec_add_gpu_bufs(&mut batch, &engine.kernels, &buf_out, &buf_stream, len)?;
     batch.register_read(buf_out, out);
     batch.end()?;
-    if !use_mps_q4 {
-        engine.pool.trim(0);
-    }
+    engine.pool.trim(0);
     Ok(())
 }
 

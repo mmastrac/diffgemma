@@ -32,7 +32,8 @@ Interpretation:
 - **`step-kv-check` passes** @ kv=64, 3L — KV pack is not totally zeroed, but 3L cannot use prompt context effectively.
 - **Prefill ~100 s** in `generate-monolithic` was initially blamed on cold reload (P1.8). **`bench-prefill` isolates the engine path at ~2.6 s/run** for 14 tokens @ 30L — so most of the gap is monolithic-specific overhead, not intrinsic encoder forward cost.
 - **Hypotheses (P1.8):** ~~duplicate `.dgq` GPU blob~~ fixed; monolithic encoder now respects `encoder_use_mps_q4` / env. **Fast MPS encoder prefill blocked on P1.9** (MPS Q4 encoder KV ≠ native → flat logits @ 30L). Native encoder prefill ~31 s @ 14 tok / 30L (CPU MoE + fused Q4); MPS path ~1.7 s but wrong KV.
-- **P1.9 findings (2026-06, templated `"Hello"`, kv=14):** `step-kv-parity` @ 30L: `max_kv_diff≈17.4`, `native_min_ent≈0.82`, `mps_min_ent≈12.48` (= ln vocab). Root cause: engine `MPSMatrixMultiplication` Q4 dense path (same class as step-kernel NOTES §5). Generate defaults to native encoder; opt into MPS with `DGQ_MPS_Q4=1` for perf experiments only.
+- **P1.9 findings (2026-06):** `step-kv-parity` @ 30L now **passes** (`max_kv_diff≈0.008`). Root cause was transposed `dequant_q4_matrix` grid + GPU grouped MoE diverging from CPU MoE; encoder uses MPS dense + CPU MoE.
+- **P1.10 (2026-06):** `dequant_q4_matrix` dispatch had `width`/`height` swapped vs shader `row=gid.y, col=gid.x` for `[N,K]` weights — transposed dequant broke all MPS Q4 dense paths. Fixed; `step-q4-parity` @ 30L passes. Step + encoder MPS Q4 re-enabled by default (`DGQ_*_Q4=0` to opt out).
 - **MTLBinaryArchive** (P2.0): runtime pipeline ISA cache at `~/.cache/diffgemma-mps/metal-pipelines/` (`DGQ_METAL_PIPELINE_CACHE=0` to disable). Skips recompiling our `.metal` kernels on restart; MPS matmul internals remain uncached.
 
 **Next P1.6 experiments:** `--steps 96`; q5 profile; f32 rowstats; HF/Python accept count on same logits; engine vs monolithic @ 30L text compare.
@@ -94,10 +95,10 @@ Buffer ABI in `diffgemma_step.metal` (version-bump to change).
 | **P1.3** `steps_eff` + accept/step telemetry | done |
 | **P1.4** Display strips pad/filler; KV commit unchanged | done |
 | **P1.5** Templated-chat quality gate in `step-ci` | done |
-| **P1.7–P1.9** HF accept parity; encoder Q4 defaults; `step-kv-parity` gate | done |
+| **P1.7–P1.10** HF accept parity; MPS Q4 fix; parity gates | done |
 | Plan consolidation (`NOTES.md`, retired PLAN2/MONOLITHIC) | done |
 
-**Measured baseline (M3 Pro, `/tmp/quantized-weights`):** monolithic forward ~4.8 s/step; generate with early stop ~6.58 tok/s (8 steps/block). Native encoder prefill ~31 s @ 14 tok / 30L; MPS encoder ~1.7 s but fails `step-kv-parity` (`max_kv_diff≈17`, `mps_min_ent=ln vocab` @ 30L).
+**Measured baseline (M3 Pro, `/tmp/quantized-weights`):** monolithic forward ~4.8 s/step; MPS encoder prefill ~1.7 s @ 14 tok / 30L; `step-kv-parity` + `step-q4-parity` pass @ 30L.
 
 ---
 
@@ -115,7 +116,8 @@ Buffer ABI in `diffgemma_step.metal` (version-bump to change).
 | P1.6 | **Canvas convergence** — see telemetry findings above. Open: raise simultaneous low-H positions (forward/quant/KV/SC) or validate HF parity on same weights. | **open** | `low_ent` ≥ 15 late-block OR readable Hello @ 30L |
 | P1.7 | HF accept parity (unit + `sampler_accept_entropy.json`) | **done** | Fixture tests pass; Metal uses equivalent prefix rule |
 | P1.8 | **Encoder prefill path** — respects `StepGenerateConfig.encoder_use_mps_q4`; generate defaults native Q4. | **done** | Correct KV + readable entropy @ 30L with defaults |
-| P1.9 | **MPS encoder KV parity** — `step-kv-parity` compares native vs MPS prefill → b4 KV + one denoise step. Generate gated; fix MPS Q4 encoder deferred to P2.6. | **done** | `max_kv_diff` < 0.5 and `|mps_min_ent − native|` < 1.0 @ 30L (currently fails: ~17 / ~12) |
+| P1.9 | **MPS encoder KV parity** — `step-kv-parity`; MPS dense + CPU MoE hybrid | **done** | `max_kv_diff` < 0.5 @ 30L |
+| P1.10 | **Step-kernel MPS Q4** — fix `dequant_q4_matrix` grid; `step-q4-parity` gate | **done** | MPS min_ent ≪ ln vocab; |Δmin_ent| < 3 vs native @ 30L |
 | P2.0 | **MTLBinaryArchive pipeline cache** — persist compiled compute pipeline ISA across restarts. | **done** | Archive load/save under `~/.cache/diffgemma-mps/metal-pipelines/` |
 
 **P1 exit (unchanged):** `generate-monolithic -p "Hello"` default flags → coherent reply.
@@ -145,7 +147,7 @@ Unchanged — multi-block extend, kv>0 parity, MoE determinism docs, 24 GiB budg
 
 ```
 P1.6 (convergence)  -->  P2 (MPS Q4 fix / latency)  -->  P3
-     P1.7–P1.9 done (accept rule, encoder defaults, KV parity gate)
+     P1.7–P1.10 done (accept rule, MPS Q4 fix, parity gates)
 ```
 
 **Critical path to interactive:** P1.6 → fix MPS Q4 dense (P2.6 / encoder+step) → P2.1 → P2.2.
@@ -159,9 +161,9 @@ P1.6 (convergence)  -->  P2 (MPS Q4 fix / latency)  -->  P3
 | Accept/entropy fix changes token goldens | Synthetic-entropy fixtures only; token goldens keep `--raw` + fixed `--steps` |
 | q4 quality insufficient for 30L chat | q5 on 36 GiB; ablate embed/lm_head; CPU MoE parity isolate forward |
 | Half logits rowstats numerically wrong @ 262K vocab | P1.6: f32 rowstats experiment behind flag |
-| Prefill dominates short prompts (~98 s vs ~2.6 s bench) | P1.8 native path works but slow (~31 s @ 14 tok / 30L); fast MPS blocked until P1.9 exit criteria pass |
-| MPS encoder KV wrong → flat logits (`min_ent=ln vocab`) | P1.9 `step-kv-parity`; generate defaults native encoder (`DGQ_MPS_Q4` unset) |
-| Prefill KV pack wrong → flat logits | `step-kv-check` + `step-kv-parity` before re-enabling MPS encoder |
+| Prefill dominates short prompts | MPS encoder ~1.7 s @ 14 tok / 30L (P1.9–P1.10 fixed); CPU MoE remains on encoder path |
+| MPS encoder KV wrong → flat logits | `step-kv-parity` gate (passes @ 30L) |
+| MPS step Q4 wrong → flat logits | `step-q4-parity` gate (passes @ 30L) |
 | 24 GiB cap tight | q4 + `--skip-vision`; document `iogpu.wired_limit_mb` |
 
 ---
@@ -186,6 +188,7 @@ DGQ_MPS_Q4=0 cargo run --release --features metal -- -m $WEIGHTS generate-monoli
 cargo run --release --features metal -- -m $WEIGHTS bench-prefill --prefill-len 14 --layers 30 --iters 3
 cargo run --release --features metal -- -m $WEIGHTS step-kv-check --kv-len 64 --layers 30 --seed 42
 cargo run --release --features metal -- -m $WEIGHTS step-kv-parity -p "Hello" --layers 30 --seed 42
+cargo run --release --features metal -- -m $WEIGHTS step-q4-parity --layers 30 --seed 42
 cargo run --release --features metal -- -m $WEIGHTS step-smoke --layers 3 --steps 4 --kv-len 64 --seed 42
 
 # Bench

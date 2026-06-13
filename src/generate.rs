@@ -540,10 +540,8 @@ pub fn generate_monolithic_gpu(
         gen_cfg.sampler.clone(),
         gen_cfg.no_early_stop,
     );
-    // Step kernel: native Q4 unless `DGQ_STEP_MPS_Q4=1` (MPS path corrupts logits today).
+    // Step + encoder dense Q4 default to MPS (opt out with DGQ_STEP_MPS_Q4=0 / DGQ_MPS_Q4=0).
     cfg.step_use_mps_q4 = Some(step_use_mps_q4_default());
-    // Encoder: native Q4 by default for generate (MPS prefill KV + step attention still
-    // yields flat logits). Opt into MPS encoder with `DGQ_MPS_Q4=1` for perf experiments.
     cfg.encoder_use_mps_q4 = Some(encoder_use_mps_q4_for_generate());
     if gen_cfg.deterministic
         || std::env::var("DGQ_DETERMINISTIC")
@@ -559,8 +557,8 @@ pub fn generate_monolithic_gpu(
 #[cfg(all(feature = "metal", target_os = "macos"))]
 fn encoder_use_mps_q4_for_generate() -> bool {
     match std::env::var("DGQ_MPS_Q4") {
-        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
-        Err(_) => false,
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
     }
 }
 
