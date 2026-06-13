@@ -511,8 +511,12 @@ pub fn generate_monolithic_gpu(
     gen_cfg: &GenerateConfig,
     max_seq: usize,
 ) -> Result<GenerateOutput, Error> {
-    use crate::metal::{generate_monolithic, StepGenerateConfig};
-    let layers = gen_cfg.max_layers.unwrap_or(30);
+    use crate::metal::{generate_monolithic, validate_step_model, StepGenerateConfig};
+    let validated = validate_step_model(model_dir)?;
+    let layers = gen_cfg
+        .max_layers
+        .unwrap_or(validated.num_layers)
+        .min(validated.num_layers);
     let mut cfg = StepGenerateConfig::from_generate(
         gen_cfg.seed,
         gen_cfg.max_new_tokens,

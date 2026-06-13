@@ -221,11 +221,16 @@ DGQ_SC_GEMM=1 cargo run --release --features metal -- -m $WEIGHTS step-smoke --l
 | **M4.2 Telemetry** | ✅ Per-step `SessionTelemetry` (1 sync, 0 readback); same summary format as `generate-gpu` |
 | **M4.3 Weight hot-reload** | ✅ `StepGenerateSession` holds runtime across `generate_with_session` calls |
 | **M4.4 Error surfaces** | ✅ `check_logits_finite()` after each denoise step |
-| **M4.5 Config from model** | Not started |
+| **M4.5 Config from model** | ✅ `validate_step_model()` at runtime; layers default from `config.json` |
 | **M4.6 `--forward-only` bench mode** | ✅ Already in `bench-step-kernel` |
-| **M4.7 Docs** | Not started |
+| **M4.7 Docs** | ✅ `step-ci` + `fixtures/generate/README.md` cross-link |
 
-**Exit:** one-command generate works on fresh `.dgq` download; CI job runs `step-smoke` + `generate-monolithic` parity fixture.
+**Exit:** one-command generate works on fresh `.dgq` download; CI job runs `step-ci` (verify + generate smoke).
+
+```bash
+# CI gate (skips gracefully if no .dgq weights)
+cargo run --release --features metal -- -m $WEIGHTS step-ci --layers 3
+```
 
 ---
 
@@ -234,7 +239,7 @@ DGQ_SC_GEMM=1 cargo run --release --features metal -- -m $WEIGHTS step-smoke --l
 | Gate | Requirement |
 |------|-------------|
 | **Golden parity** | `generate-monolithic-parity` vs `fixtures/generate/dgq_hello_*` (new or extended) |
-| **Regression** | `step-smoke --layers 30` in CI (skip if no weights); `make test` green |
+| **Regression** | `step-ci --layers 3` in CI (skip if no weights); `cargo test` green |
 | **Memory** | Peak RSS ≤ 24 GiB budget on base M4 with q4 `.dgq` (document sysctl if needed) |
 | **Determinism** | Same seed → same tokens with `DGQ_MPS_Q4=0`; document MPS nondeterminism if any |
 | **License / weights** | Same as engine — no new deps |

@@ -1630,10 +1630,13 @@ pub fn log_step_memory_budget(blob_bytes: u64, max_seq: usize, layout: &ModelLay
 }
 
 pub fn build_step_runtime(model_dir: &Path, cfg: &StepSmokeConfig) -> Result<(StepRuntime, std::time::Duration), Error> {
+    let validated = super::step_config::validate_step_model(model_dir)?;
+    super::step_config::log_validated_step_model(&validated);
+
     let store = DgqStore::open(model_dir)?;
     let offsets = build_offsets_from_store(&store);
     let layout = build_layout(&offsets, cfg.max_seq);
-    let layers = cfg.layers.min(N_LAYERS).max(1);
+    let layers = cfg.layers.min(validated.num_layers).max(1);
 
     let ctx = MetalContext::new()?;
     let compile_started = Instant::now();

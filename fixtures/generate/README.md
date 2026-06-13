@@ -36,6 +36,9 @@ Refresh after intentional monolithic/kernel changes:
 
 ```bash
 DGQ_MPS_Q4=0 cargo run --release --features metal -- -m /tmp/quantized-weights step-parity --layers 3 --seed 42
+
+# CI regression (config validate + step-verify + generate-monolithic smoke)
+cargo run --release --features metal -- -m /tmp/quantized-weights step-ci --layers 3
 ```
 
 

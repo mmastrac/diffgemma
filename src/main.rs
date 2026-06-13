@@ -140,6 +140,9 @@ enum Command {
     StepVerify {
         layers: usize,
     },
+    StepCi {
+        layers: usize,
+    },
     StepParity {
         layers: usize,
         kv_len: u32,
@@ -199,6 +202,7 @@ fn main() -> ExitCode {
             max_seq,
         } => run_step_kv_check_cmd(&cli.model_dir, kv_len, layers, seed, max_seq),
         Command::StepVerify { layers } => run_step_verify_cmd(&cli.model_dir, layers),
+        Command::StepCi { layers } => run_step_ci_cmd(&cli.model_dir, layers),
         Command::StepParity {
             layers,
             kv_len,
@@ -385,6 +389,7 @@ fn run_command(m: &model::Model, model_dir: &std::path::Path, command: Command) 
         Command::StepProbe { .. } => ExitCode::FAILURE,
         Command::StepKvCheck { .. } => ExitCode::FAILURE,
         Command::StepVerify { .. } => ExitCode::FAILURE,
+        Command::StepCi { .. } => ExitCode::FAILURE,
         Command::StepParity { .. } => ExitCode::FAILURE,
         Command::BenchStepKernel { .. } => ExitCode::FAILURE,
         Command::GenerateMonolithic { .. } => ExitCode::FAILURE,
@@ -599,6 +604,98 @@ fn run_step_verify_cmd(model_dir: &std::path::Path, layers: usize) -> ExitCode {
 #[cfg(not(all(feature = "metal", target_os = "macos")))]
 fn run_step_verify_cmd(_model_dir: &std::path::Path, _layers: usize) -> ExitCode {
     eprintln!("error: step-verify requires --features metal on macOS");
+    ExitCode::FAILURE
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn run_step_ci_cmd(model_dir: &std::path::Path, layers: usize) -> ExitCode {
+    use metal::validate_step_model;
+
+    if !dgq::store::looks_like_dgq_dir(model_dir) {
+        println!(
+            "step-ci skipped (no .dgq weights at {})",
+            model_dir.display()
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    let probe_layers = layers.max(1).min(30);
+    eprintln!("step-ci: layers={probe_layers}");
+
+    match validate_step_model(model_dir) {
+        Ok(v) => metal::log_validated_step_model(&v),
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    if run_step_verify_cmd(model_dir, probe_layers) != ExitCode::SUCCESS {
+        eprintln!("step-ci failed at step-verify");
+        return ExitCode::FAILURE;
+    }
+
+    let vocab = match crate::config::ModelConfig::load(model_dir) {
+        Ok(c) => c.text_config.vocab_size,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let prompt = match build_prompt_tokens(model_dir, Some("hello"), 1, vocab) {
+        Ok(ids) => ids,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let max_seq = (prompt.len() + 256).max(512);
+    let gen_cfg = generate::GenerateConfig {
+        sampler: sample::sampler_for_steps(4, true),
+        max_new_tokens: 256,
+        seed: 42,
+        max_layers: Some(probe_layers),
+        no_early_stop: true,
+        deterministic: false,
+    };
+
+    eprintln!("step-ci: generate-monolithic smoke (hello, seed=42, steps=4)...");
+    match generate::generate_monolithic_gpu(model_dir, &prompt, &gen_cfg, max_seq) {
+        Ok(out) => {
+            if out.token_ids.len() < prompt.len() {
+                eprintln!("error: generate output shorter than prompt");
+                return ExitCode::FAILURE;
+            }
+            if out.token_ids[..prompt.len()] != prompt[..] {
+                eprintln!("error: generate output does not preserve prompt prefix");
+                return ExitCode::FAILURE;
+            }
+            if out.blocks_committed < 1 {
+                eprintln!("error: no blocks committed");
+                return ExitCode::FAILURE;
+            }
+            if out.denoise_steps_run < 1 {
+                eprintln!("error: no denoise steps run");
+                return ExitCode::FAILURE;
+            }
+            println!(
+                "step-ci ok (verify + generate: {} steps, {} blocks, {} tokens)",
+                out.denoise_steps_run,
+                out.blocks_committed,
+                out.token_ids.len()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: generate-monolithic smoke failed: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn run_step_ci_cmd(_model_dir: &std::path::Path, _layers: usize) -> ExitCode {
+    eprintln!("error: step-ci requires --features metal on macOS");
     ExitCode::FAILURE
 }
 
@@ -1294,6 +1391,9 @@ fn parse_cli() -> Cli {
         Some("step-verify") => Command::StepVerify {
             layers: bench_layers.max(1).min(30),
         },
+        Some("step-ci") => Command::StepCi {
+            layers: bench_layers.max(1).min(30),
+        },
         Some("step-parity") => Command::StepParity {
             layers: bench_layers.max(1).min(30),
             kv_len: step_kv_len,
@@ -1311,7 +1411,7 @@ fn parse_cli() -> Cli {
         Some(cmd) => {
             eprintln!("unknown command: {cmd}");
             eprintln!(
-                "usage: diffgemma-mps [-p PROMPT] [summary|config|weights <name>|quantize|convert-model|step-smoke|step-probe|step-kv-check|step-verify|step-parity|bench-step-kernel|bench-step|bench-prefill|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-monolithic|generate-parity|tokenize <text>|gemm|attention]"
+                "usage: diffgemma-mps [-p PROMPT] [summary|config|weights <name>|quantize|convert-model|step-smoke|step-probe|step-kv-check|step-verify|step-ci|step-parity|bench-step-kernel|bench-step|bench-prefill|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-monolithic|generate-parity|tokenize <text>|gemm|attention]"
             );
             eprintln!("  default (no command): generate-gpu with --features metal (or generate-monolithic with DGQ_MONOLITHIC=1 / --monolithic on .dgq)");
             eprintln!("  generate-parity: GPU vs checked-in golden (use --compare-cpu for slow CPU path)");
