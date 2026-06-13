@@ -724,7 +724,84 @@ fn run_step_ci_cmd(model_dir: &std::path::Path, layers: usize) -> ExitCode {
         }
     }
 
-    println!("step-ci ok (config + step-verify + generate-monolithic-parity)");
+    if run_chat_quality_gate(model_dir, probe_layers) != ExitCode::SUCCESS {
+        eprintln!("step-ci failed at chat-quality gate");
+        return ExitCode::FAILURE;
+    }
+
+    println!("step-ci ok (config + step-verify + generate-monolithic-parity + chat-quality)");
+    ExitCode::SUCCESS
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn run_chat_quality_gate(model_dir: &std::path::Path, layers: usize) -> ExitCode {
+    use generate_golden::{check_chat_quality, ChatQualityFixture};
+
+    let path = generate_golden::resolve_fixture("chat_quality_hello_layers3");
+    let gate = match ChatQualityFixture::load(&path) {
+        Ok(g) => g,
+        Err(err) => {
+            eprintln!("error: load chat quality fixture {}: {err}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let history: Vec<chat_template::ChatTurn> =
+        vec![chat_template::ChatTurn::user(&gate.prompt)];
+    let prompt = match build_chat_prompt_tokens(model_dir, &history, false) {
+        Ok(ids) => ids,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let prompt_len = prompt.len();
+    let max_seq = (prompt_len + 256).max(512);
+    let max_layers = gate.max_layers.unwrap_or(layers).min(layers);
+
+    let gen_cfg = generate::GenerateConfig {
+        sampler: sample::sampler_for_steps(gate.steps, false),
+        max_new_tokens: 256,
+        seed: gate.seed,
+        max_layers: Some(max_layers),
+        no_early_stop: false,
+        deterministic: true,
+    };
+
+    eprintln!(
+        "step-ci: chat-quality (templated {:?}, seed={}, steps={}, layers={max_layers})...",
+        gate.prompt, gate.seed, gate.steps
+    );
+
+    let out = match generate::generate_monolithic_gpu(model_dir, &prompt, &gen_cfg, max_seq) {
+        Ok(out) => out,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match check_chat_quality(&out, prompt_len, &gate) {
+        Ok(()) => {
+            let (total, real) = generate_golden::count_new_tokens(&out, prompt_len);
+            println!(
+                "chat-quality ok ({}: {}/{} real new tokens, block_steps_eff={:?})",
+                gate.name,
+                real,
+                total,
+                out.block_steps_eff
+            );
+            ExitCode::SUCCESS
+        }
+        Err(msg) => {
+            eprintln!("chat-quality failed: {msg}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn run_chat_quality_gate(_model_dir: &std::path::Path, _layers: usize) -> ExitCode {
     ExitCode::SUCCESS
 }
 

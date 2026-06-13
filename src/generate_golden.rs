@@ -168,6 +168,84 @@ pub fn infer_fixture_name(
     })
 }
 
+/// Thresholds for templated-chat quality (P1.5); not a token-id golden.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatQualityFixture {
+    pub name: String,
+    pub prompt: String,
+    pub seed: u64,
+    pub steps: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_layers: Option<usize>,
+    pub min_real_new_tokens: usize,
+    pub max_degenerate_ratio: f32,
+    /// Fail if the first block stops before this many steps with a pad-heavy canvas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_block_steps_eff: Option<u32>,
+}
+
+impl ChatQualityFixture {
+    pub fn load(path: &Path) -> Result<Self, Error> {
+        let text = std::fs::read_to_string(path).map_err(Error::Io)?;
+        serde_json::from_str(&text).map_err(Error::Json)
+    }
+}
+
+pub fn default_chat_quality_fixture() -> ChatQualityFixture {
+    ChatQualityFixture {
+        name: "chat_quality_hello_layers3".into(),
+        prompt: "Hello".into(),
+        seed: 42,
+        steps: 48,
+        max_layers: Some(3),
+        min_real_new_tokens: 8,
+        max_degenerate_ratio: 0.9,
+        min_block_steps_eff: Some(crate::sample::MIN_EARLY_STOP_STEPS),
+    }
+}
+
+/// Assess new tokens after prompt; returns (total_new, real_non_degenerate).
+pub fn count_new_tokens(out: &GenerateOutput, prompt_len: usize) -> (usize, usize) {
+    let new = out.token_ids.get(prompt_len..).unwrap_or(&[]);
+    let real = crate::sample::strip_degenerate_token_ids(new).len();
+    (new.len(), real)
+}
+
+pub fn check_chat_quality(
+    out: &GenerateOutput,
+    prompt_len: usize,
+    gate: &ChatQualityFixture,
+) -> Result<(), String> {
+    let (total_new, real_new) = count_new_tokens(out, prompt_len);
+    if total_new == 0 {
+        return Err("no new tokens emitted".into());
+    }
+    if real_new < gate.min_real_new_tokens {
+        return Err(format!(
+            "only {real_new} real new tokens (need >= {})",
+            gate.min_real_new_tokens
+        ));
+    }
+    let degenerate = total_new - real_new;
+    let ratio = degenerate as f32 / total_new as f32;
+    if ratio > gate.max_degenerate_ratio {
+        return Err(format!(
+            "degenerate ratio {ratio:.2} exceeds max {:.2} ({degenerate}/{total_new} pad/filler)",
+            gate.max_degenerate_ratio
+        ));
+    }
+    if let Some(min_steps) = gate.min_block_steps_eff {
+        if let Some(&steps_eff) = out.block_steps_eff.first() {
+            if steps_eff < min_steps && ratio > 0.5 {
+                return Err(format!(
+                    "block committed after {steps_eff} steps with {ratio:.0}% degenerate tokens (pad-aware stop regression)"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,5 +312,37 @@ mod tests {
         };
         assert!(g.matches_config("Hello", &cfg, 1, "dgq_q4"));
         assert!(!g.matches_config("Hello", &cfg, 1, "safetensors"));
+    }
+
+    #[test]
+    fn chat_quality_rejects_pad_heavy_block() {
+        use crate::sample::{FILLER_TOKEN_ID, PAD_TOKEN_ID};
+
+        fn fixture_out(token_ids: Vec<u32>, block_steps: Vec<u32>) -> GenerateOutput {
+            GenerateOutput {
+                token_ids,
+                denoise_steps_run: 2,
+                blocks_committed: 1,
+                block_steps_eff: block_steps,
+                last_block_accept_hist: vec![16, 16],
+                prefill_elapsed: std::time::Duration::ZERO,
+                denoise_elapsed: std::time::Duration::ZERO,
+                extend_elapsed: std::time::Duration::ZERO,
+                #[cfg(all(feature = "metal", target_os = "macos"))]
+                session_telemetry: crate::metal::SessionTelemetry::default(),
+            }
+        }
+
+        let gate = default_chat_quality_fixture();
+        let prompt_len = 10;
+        let mut token_ids = vec![1u32; prompt_len];
+        token_ids.extend(std::iter::repeat(PAD_TOKEN_ID).take(256));
+        let out = fixture_out(token_ids, vec![2]);
+        assert!(check_chat_quality(&out, prompt_len, &gate).is_err());
+
+        let mut good_ids = vec![1u32; prompt_len];
+        good_ids.extend((0..32).map(|i| 100 + i));
+        good_ids.extend(std::iter::repeat(FILLER_TOKEN_ID).take(224));
+        assert!(check_chat_quality(&fixture_out(good_ids, vec![20]), prompt_len, &gate).is_ok());
     }
 }

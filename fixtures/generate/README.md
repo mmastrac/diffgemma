@@ -32,6 +32,7 @@ Forward-only regression limits vs engine (`step-parity`). Use `DGQ_MPS_Q4=0` for
 | `monolithic_parity_layers30_seed42.json` | `step-parity --layers 30 --seed 42` |
 | `monolithic_sampler_layers3.json` | `step-verify` sampler goldens (3 seeds × 4 steps) |
 | `monolithic_hello_steps4_layers3.json` | `generate-monolithic-parity -p hello --raw --layers 3 --steps 4 --seed 42 --no-early-stop` (`DGQ_MPS_Q4=0`) |
+| `chat_quality_hello_layers3.json` | Templated `-p Hello`, 48 steps, early stop — quality gate (min real tokens, max pad ratio); run via `step-ci` |
 
 **Prompts:** `-p` uses the Gemma 4 chat template by default (`<bos><|turn>user\n…<turn|>\n<|turn>model\n<|channel>thought\n<channel|>`). Legacy goldens use bare BPE text — pass **`--raw`** for parity/regression commands that match `Hello` / `hello` fixtures.
 
