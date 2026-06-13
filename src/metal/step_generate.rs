@@ -59,6 +59,36 @@ fn smoke_config(cfg: &StepGenerateConfig) -> StepSmokeConfig {
     }
 }
 
+fn progress_enabled() -> bool {
+    match std::env::var("DGQ_QUIET") {
+        Ok(v) => v != "1" && !v.eq_ignore_ascii_case("true"),
+        Err(_) => true,
+    }
+}
+
+fn log_denoise_step_progress(
+    block_idx: usize,
+    max_blocks: usize,
+    step_idx: u32,
+    max_steps: usize,
+    stats: &crate::sample::StepEntropyStats,
+    step_elapsed: Duration,
+    block_elapsed: Duration,
+    denoise_elapsed: Duration,
+    early_stop: bool,
+) {
+    if !progress_enabled() {
+        return;
+    }
+    let stop_note = if early_stop { " early_stop" } else { "" };
+    eprintln!(
+        "step-generate: block {block_idx}/{max_blocks} step {step_idx}/{max_steps} accept={} low_ent={} min_ent={:.4} step={step_elapsed:.2?} block={block_elapsed:.2?} denoise={denoise_elapsed:.2?}{stop_note}",
+        stats.accept_count,
+        stats.low_entropy_positions,
+        stats.min_entropy,
+    );
+}
+
 /// Reusable monolithic runtime across prompts (M4.3).
 pub struct StepGenerateSession {
     rt: StepRuntime,
@@ -162,6 +192,7 @@ pub fn generate_with_session(
     let mut denoise_elapsed = Duration::ZERO;
     let mut extend_elapsed = Duration::ZERO;
     let mut session_telemetry = SessionTelemetry::default();
+    let max_steps = cfg.sampler.max_denoising_steps.max(1);
 
     for _block in 0..max_blocks {
         if sequences.len() >= prompt_token_ids.len() + cfg.max_new_tokens {
@@ -170,6 +201,7 @@ pub fn generate_with_session(
 
         let remaining = prompt_token_ids.len() + cfg.max_new_tokens - sequences.len();
         let is_last_block = remaining <= canvas_len;
+        let block_idx = blocks_committed + 1;
 
         let params = step_params_from_sampler(
             &cfg.sampler,
@@ -177,6 +209,13 @@ pub fn generate_with_session(
             cfg.no_early_stop,
         );
         rt.reset_block(VOCAB, &mut rng, params);
+
+        if progress_enabled() {
+            eprintln!(
+                "step-generate: block {block_idx}/{max_blocks} starting denoise (kv_len={}, max_steps={max_steps}, new_tokens_remaining={remaining})",
+                rt.read_params().kv_len
+            );
+        }
 
         let block_started = Instant::now();
         let mut block_step_count = 0u32;
@@ -187,7 +226,8 @@ pub fn generate_with_session(
             let step_started = Instant::now();
             rt.run_denoise_step()?;
             rt.check_logits_finite()?;
-            let step_ms = step_started.elapsed().as_secs_f64() * 1000.0;
+            let step_elapsed = step_started.elapsed();
+            let step_ms = step_elapsed.as_secs_f64() * 1000.0;
             session_telemetry.steps.push(StepPhaseTelemetry {
                 decoder_ms: step_ms,
                 sampler_ms: 0.0,
@@ -200,10 +240,22 @@ pub fn generate_with_session(
             accept_hist.push(stats.accept_count);
             min_entropy_hist.push(stats.min_entropy);
             low_ent_hist.push(stats.low_entropy_positions);
-            if st.stop_flag != 0 {
+            let early_stop = st.stop_flag != 0;
+            log_denoise_step_progress(
+                block_idx,
+                max_blocks,
+                block_step_count,
+                max_steps,
+                &stats,
+                step_elapsed,
+                block_started.elapsed(),
+                denoise_elapsed + block_started.elapsed(),
+                early_stop,
+            );
+            if early_stop {
                 break;
             }
-            if st.step >= cfg.sampler.max_denoising_steps as u32 {
+            if st.step >= max_steps as u32 {
                 break;
             }
         }
@@ -224,19 +276,19 @@ pub fn generate_with_session(
             .unwrap_or(0);
         eprintln!(
             "step-generate: block {} denoise={block_elapsed:.2?} steps_eff={block_step_count} accept/step={accept_hist:?}",
-            blocks_committed + 1
+            block_idx
         );
         eprintln!(
             "step-generate: block {} min_ent/step={min_entropy_hist:?}",
-            blocks_committed + 1
+            block_idx
         );
         eprintln!(
             "step-generate: block {} low_ent(<0.1)/step={low_ent_hist:?}",
-            blocks_committed + 1
+            block_idx
         );
         eprintln!(
             "step-generate: block {} late-window (last 8 steps): accept_sum={late_accept} min_ent={late_min_ent:.4} max_low_ent={late_low_ent} (need low_ent~15-20 for accept~15-20)",
-            blocks_committed + 1
+            block_idx
         );
 
         let st = rt.read_canvas_state();
