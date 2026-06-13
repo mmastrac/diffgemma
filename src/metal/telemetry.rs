@@ -21,6 +21,21 @@ pub struct ForwardTelemetry {
 }
 
 impl ForwardTelemetry {
+    /// One monolithic denoise step: single GPU sync, zero CPU readback, zero-copy blob.
+    pub fn monolithic_gpu_step() -> Self {
+        Self {
+            gpu_syncs: 1,
+            gpu_readback_bytes: 0,
+            expert_weight_bytes_touched: 0,
+            expert_hits: 0,
+            expert_misses: 0,
+            expert_upload_bytes: 0,
+            dense_gpu_upload_bytes: 0,
+            lm_head_logits_bytes: 0,
+            ..Self::default()
+        }
+    }
+
     pub fn record_expert_layer(
         &mut self,
         layer: usize,

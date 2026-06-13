@@ -61,6 +61,7 @@ enum Command {
         max_new_tokens: usize,
         max_layers: Option<usize>,
         no_early_stop: bool,
+        engine_fallback: bool,
     },
     GenerateParity {
         prompt: Option<String>,
@@ -228,6 +229,7 @@ fn main() -> ExitCode {
             max_new_tokens,
             max_layers,
             no_early_stop,
+            engine_fallback,
         } => run_generate_monolithic_cmd(
             &cli.model_dir,
             prompt,
@@ -237,6 +239,7 @@ fn main() -> ExitCode {
             max_new_tokens,
             max_layers,
             no_early_stop,
+            engine_fallback,
         ),
         Command::Quantize { output, profile } => run_quantize(&cli.model_dir, &output, &profile),
         Command::Tokenize(text) => run_tokenize(&cli.model_dir, &text),
@@ -961,6 +964,7 @@ fn parse_cli() -> Cli {
     let mut step_kv_len = 0u32;
     let mut step_max_seq = 512usize;
     let mut step_forward_only = false;
+    let mut use_monolithic = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -1101,6 +1105,7 @@ fn parse_cli() -> Cli {
                 }
             }
             "--forward-only" => step_forward_only = true,
+            "--monolithic" => use_monolithic = true,
             "--max-seq" => {
                 if let Some(v) = args.next() {
                     step_max_seq = v.parse().unwrap_or_else(|_| {
@@ -1121,8 +1126,11 @@ fn parse_cli() -> Cli {
         }
     }
 
+    let use_monolithic = use_monolithic || monolithic_from_env();
+
     let command = match positional.first().map(String::as_str) {
         None => default_generate_command(
+            &model_dir,
             prompt,
             seed,
             steps,
@@ -1130,6 +1138,7 @@ fn parse_cli() -> Cli {
             max_new_tokens,
             parity_layers,
             no_early_stop,
+            use_monolithic,
         ),
         Some("summary") => Command::Summary,
         Some("config") => Command::Config,
@@ -1143,6 +1152,16 @@ fn parse_cli() -> Cli {
         Some("layer0") => Command::Layer0,
         Some("decoder") => Command::Decoder,
         Some("prefill") => Command::Prefill,
+        Some("generate") if use_monolithic => Command::GenerateMonolithic {
+            prompt: prompt.clone(),
+            seed,
+            steps,
+            prompt_len,
+            max_new_tokens,
+            max_layers: parity_layers,
+            no_early_stop,
+            engine_fallback: true,
+        },
         Some("generate") => Command::Generate {
             prompt: prompt.clone(),
             seed,
@@ -1151,6 +1170,16 @@ fn parse_cli() -> Cli {
             max_new_tokens,
             max_layers: parity_layers,
             no_early_stop,
+        },
+        Some("generate-gpu") if use_monolithic => Command::GenerateMonolithic {
+            prompt: prompt.clone(),
+            seed,
+            steps,
+            prompt_len,
+            max_new_tokens,
+            max_layers: parity_layers,
+            no_early_stop,
+            engine_fallback: true,
         },
         Some("generate-gpu") => Command::GenerateGpu {
             prompt: prompt.clone(),
@@ -1170,6 +1199,7 @@ fn parse_cli() -> Cli {
             max_new_tokens,
             max_layers: parity_layers,
             no_early_stop,
+            engine_fallback: false,
         },
         Some("generate-parity") => Command::GenerateParity {
             prompt: prompt.clone(),
@@ -1283,7 +1313,7 @@ fn parse_cli() -> Cli {
             eprintln!(
                 "usage: diffgemma-mps [-p PROMPT] [summary|config|weights <name>|quantize|convert-model|step-smoke|step-probe|step-kv-check|step-verify|step-parity|bench-step-kernel|bench-step|bench-prefill|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-monolithic|generate-parity|tokenize <text>|gemm|attention]"
             );
-            eprintln!("  default (no command): generate-gpu with --features metal");
+            eprintln!("  default (no command): generate-gpu with --features metal (or generate-monolithic with DGQ_MONOLITHIC=1 / --monolithic on .dgq)");
             eprintln!("  generate-parity: GPU vs checked-in golden (use --compare-cpu for slow CPU path)");
             eprintln!("  options: ... --golden NAME --write-golden NAME --compare-cpu --no-early-stop");
             eprintln!("  gemm options: --size N (default 512, requires --features metal)");
@@ -1297,7 +1327,21 @@ fn parse_cli() -> Cli {
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
+fn monolithic_from_env() -> bool {
+    match std::env::var("DGQ_MONOLITHIC") {
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn monolithic_from_env() -> bool {
+    false
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
 fn default_generate_command(
+    model_dir: &std::path::Path,
     prompt: Option<String>,
     seed: u64,
     steps: usize,
@@ -1305,7 +1349,20 @@ fn default_generate_command(
     max_new_tokens: usize,
     max_layers: Option<usize>,
     no_early_stop: bool,
+    use_monolithic: bool,
 ) -> Command {
+    if use_monolithic && dgq::store::looks_like_dgq_dir(model_dir) {
+        return Command::GenerateMonolithic {
+            prompt,
+            seed,
+            steps,
+            prompt_len,
+            max_new_tokens,
+            max_layers,
+            no_early_stop,
+            engine_fallback: true,
+        };
+    }
     Command::GenerateGpu {
         prompt,
         seed,
@@ -1320,6 +1377,7 @@ fn default_generate_command(
 
 #[cfg(not(all(feature = "metal", target_os = "macos")))]
 fn default_generate_command(
+    _model_dir: &std::path::Path,
     prompt: Option<String>,
     seed: u64,
     steps: usize,
@@ -1327,6 +1385,7 @@ fn default_generate_command(
     max_new_tokens: usize,
     max_layers: Option<usize>,
     no_early_stop: bool,
+    _use_monolithic: bool,
 ) -> Command {
     Command::Generate {
         prompt,
@@ -2398,9 +2457,23 @@ fn run_generate_monolithic_cmd(
     max_new_tokens: usize,
     max_layers: Option<usize>,
     no_early_stop: bool,
+    engine_fallback: bool,
 ) -> ExitCode {
     if !dgq::store::looks_like_dgq_dir(model_dir) {
         eprintln!("error: generate-monolithic requires a .dgq directory (-m /path/to/quantized-weights)");
+        if engine_fallback {
+            eprintln!("note: falling back to generate-gpu (not a .dgq path)");
+            return run_generate_engine_fallback(
+                model_dir,
+                prompt_text,
+                seed,
+                steps,
+                prompt_len,
+                max_new_tokens,
+                max_layers,
+                no_early_stop,
+            );
+        }
         return ExitCode::FAILURE;
     }
 
@@ -2452,6 +2525,51 @@ fn run_generate_monolithic_cmd(
         }
         Err(err) => {
             eprintln!("error: {err}");
+            if engine_fallback {
+                eprintln!("note: monolithic failed; falling back to generate-gpu");
+                return run_generate_engine_fallback(
+                    model_dir,
+                    prompt_text,
+                    seed,
+                    steps,
+                    prompt_len,
+                    max_new_tokens,
+                    max_layers,
+                    no_early_stop,
+                );
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn run_generate_engine_fallback(
+    model_dir: &std::path::Path,
+    prompt_text: Option<String>,
+    seed: u64,
+    steps: usize,
+    prompt_len: usize,
+    max_new_tokens: usize,
+    max_layers: Option<usize>,
+    no_early_stop: bool,
+) -> ExitCode {
+    match model::Model::open(model_dir) {
+        Ok(m) => run_generate(
+            &m,
+            model_dir,
+            prompt_text,
+            seed,
+            steps,
+            prompt_len,
+            max_new_tokens,
+            max_layers,
+            no_early_stop,
+            true,
+            None,
+        ),
+        Err(err) => {
+            eprintln!("error: engine fallback failed: {err}");
             ExitCode::FAILURE
         }
     }
@@ -2467,6 +2585,7 @@ fn run_generate_monolithic_cmd(
     _max_new_tokens: usize,
     _max_layers: Option<usize>,
     _no_early_stop: bool,
+    _engine_fallback: bool,
 ) -> ExitCode {
     eprintln!("error: generate-monolithic requires --features metal on macOS");
     ExitCode::FAILURE

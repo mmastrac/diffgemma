@@ -1517,6 +1517,16 @@ impl StepRuntime {
         self.run_forward_once(StepFinishMode::Full)
     }
 
+    /// Sample logits for non-finite values (M4.4 hot-path guard).
+    pub fn check_logits_finite(&self) -> Result<(), Error> {
+        let (bad, max_abs) = count_non_finite_half(&self.bufs.logits, CANVAS * VOCAB);
+        if bad > 0 {
+            eprintln!("non-finite logits (bad_samples={bad}, max_abs={max_abs:.4})");
+            return Err(Error::Format("non-finite logits"));
+        }
+        Ok(())
+    }
+
     fn dispatch_and_wait<F>(&mut self, f: F) -> Result<(), Error>
     where
         F: FnOnce(&mut StepEnc<'_>) -> Result<(), Error>,

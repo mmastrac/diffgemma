@@ -217,13 +217,13 @@ DGQ_SC_GEMM=1 cargo run --release --features metal -- -m $WEIGHTS step-smoke --l
 
 | Task | Notes |
 |------|-------|
-| **M4.1 Feature flag** | `DGQ_MONOLITHIC=1` or `--monolithic` on default generate; fallback to engine on error |
-| **M4.2 Telemetry** | Port `ForwardTelemetry` / `SessionTelemetry` hooks; print same summary as `generate-gpu` |
-| **M4.3 Weight hot-reload** | Keep transformer loaded across prompts (match PLAN2 interactive lesson) |
-| **M4.4 Error surfaces** | Non-finite logits → abort with checkpoint dump; Metal API validation clean |
-| **M4.5 Config from model** | Read canvas_length, vocab, layer types, rms_eps from `config.json` — no hardcoded 2816/30 |
-| **M4.6 `--forward-only` bench mode** | Keep for perf isolation (no sampler) |
-| **M4.7 Docs** | Update README usage section; cross-link this plan |
+| **M4.1 Feature flag** | ✅ `DGQ_MONOLITHIC=1` or `--monolithic` routes default `generate` / `generate-gpu` to monolithic on `.dgq`; engine fallback on error |
+| **M4.2 Telemetry** | ✅ Per-step `SessionTelemetry` (1 sync, 0 readback); same summary format as `generate-gpu` |
+| **M4.3 Weight hot-reload** | ✅ `StepGenerateSession` holds runtime across `generate_with_session` calls |
+| **M4.4 Error surfaces** | ✅ `check_logits_finite()` after each denoise step |
+| **M4.5 Config from model** | Not started |
+| **M4.6 `--forward-only` bench mode** | ✅ Already in `bench-step-kernel` |
+| **M4.7 Docs** | Not started |
 
 **Exit:** one-command generate works on fresh `.dgq` download; CI job runs `step-smoke` + `generate-monolithic` parity fixture.
 

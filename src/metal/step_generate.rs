@@ -1,4 +1,4 @@
-//! M2: end-to-end monolithic generate loop (prefill → denoise blocks → KV extend).
+//! M2/M4: end-to-end monolithic generate loop (prefill → denoise blocks → KV extend).
 
 use crate::generate::GenerateOutput;
 use crate::metal::step_kernel::{
@@ -6,9 +6,10 @@ use crate::metal::step_kernel::{
     StepRuntime, StepSmokeConfig, CANVAS, N_LAYERS, VOCAB,
 };
 use crate::metal::step_kv::{extend_monolithic_kv, prefill_monolithic_kv};
+use crate::metal::{ForwardTelemetry, SessionTelemetry, StepPhaseTelemetry};
 use crate::sample::{initialize_canvas, Rng, SamplerConfig};
 use crate::safetensors::Error;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
@@ -43,8 +44,8 @@ impl StepGenerateConfig {
     }
 }
 
-fn open_runtime(model_dir: &Path, cfg: &StepGenerateConfig) -> Result<StepRuntime, Error> {
-    let smoke = StepSmokeConfig {
+fn smoke_config(cfg: &StepGenerateConfig) -> StepSmokeConfig {
+    StepSmokeConfig {
         layers: cfg.layers.min(N_LAYERS).max(1),
         steps: cfg.sampler.max_denoising_steps.max(1),
         kv_len: 0,
@@ -53,10 +54,38 @@ fn open_runtime(model_dir: &Path, cfg: &StepGenerateConfig) -> Result<StepRuntim
         finish: StepFinishMode::Full,
         use_mps_q4: cfg.use_mps_q4,
         prefill_token_ids: None,
-    };
-    let (rt, compile) = build_step_runtime(model_dir, &smoke)?;
-    eprintln!("step-generate: runtime ready ({compile:.2?})");
-    Ok(rt)
+    }
+}
+
+/// Reusable monolithic runtime across prompts (M4.3).
+pub struct StepGenerateSession {
+    rt: StepRuntime,
+    model_dir: PathBuf,
+    layers: usize,
+}
+
+impl StepGenerateSession {
+    pub fn open(model_dir: &Path, cfg: &StepGenerateConfig) -> Result<(Self, Duration), Error> {
+        let layers = cfg.layers.min(N_LAYERS).max(1);
+        let (rt, compile) = build_step_runtime(model_dir, &smoke_config(cfg))?;
+        eprintln!("step-generate: runtime ready ({compile:.2?})");
+        Ok((
+            Self {
+                rt,
+                model_dir: model_dir.to_path_buf(),
+                layers,
+            },
+            compile,
+        ))
+    }
+
+    pub fn runtime(&self) -> &StepRuntime {
+        &self.rt
+    }
+
+    pub fn runtime_mut(&mut self) -> &mut StepRuntime {
+        &mut self.rt
+    }
 }
 
 /// Monolithic generate: prefill prompt → denoise blocks → extend KV (matches `generate_inner` structure).
@@ -65,14 +94,23 @@ pub fn generate_monolithic(
     prompt_token_ids: &[u32],
     cfg: &StepGenerateConfig,
 ) -> Result<GenerateOutput, Error> {
+    let (mut session, _) = StepGenerateSession::open(model_dir, cfg)?;
+    generate_with_session(&mut session, prompt_token_ids, cfg)
+}
+
+pub fn generate_with_session(
+    session: &mut StepGenerateSession,
+    prompt_token_ids: &[u32],
+    cfg: &StepGenerateConfig,
+) -> Result<GenerateOutput, Error> {
     if prompt_token_ids.is_empty() {
         return Err(Error::Format("generate requires a non-empty prompt"));
     }
     let canvas_len = CANVAS;
-    let layers = cfg.layers.min(N_LAYERS).max(1);
+    let layers = session.layers;
     let max_blocks = cfg.max_new_tokens.div_ceil(canvas_len).max(1);
-
-    let mut rt = open_runtime(model_dir, cfg)?;
+    let model_dir = session.model_dir.as_path();
+    let rt = &mut session.rt;
 
     let prefill_started = Instant::now();
     let kv_len = prefill_monolithic_kv(
@@ -93,6 +131,7 @@ pub fn generate_monolithic(
     let mut blocks_committed = 0usize;
     let mut denoise_elapsed = Duration::ZERO;
     let mut extend_elapsed = Duration::ZERO;
+    let mut session_telemetry = SessionTelemetry::default();
 
     for _block in 0..max_blocks {
         if sequences.len() >= prompt_token_ids.len() + cfg.max_new_tokens {
@@ -111,7 +150,15 @@ pub fn generate_monolithic(
 
         let block_started = Instant::now();
         loop {
+            let step_started = Instant::now();
             rt.run_denoise_step()?;
+            rt.check_logits_finite()?;
+            let step_ms = step_started.elapsed().as_secs_f64() * 1000.0;
+            session_telemetry.steps.push(StepPhaseTelemetry {
+                decoder_ms: step_ms,
+                sampler_ms: 0.0,
+                forward: ForwardTelemetry::monolithic_gpu_step(),
+            });
             denoise_steps_run += 1;
             let st = rt.read_canvas_state();
             if st.stop_flag != 0 {
@@ -157,7 +204,7 @@ pub fn generate_monolithic(
         denoise_elapsed,
         extend_elapsed,
         #[cfg(all(feature = "metal", target_os = "macos"))]
-        session_telemetry: crate::metal::SessionTelemetry::default(),
+        session_telemetry,
     })
 }
 
