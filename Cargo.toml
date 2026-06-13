@@ -27,6 +27,8 @@ objc2-metal = { version = "0.3", optional = true, default-features = false, feat
     "MTLCommandEncoder",
     "MTLComputeCommandEncoder",
     "MTLComputePipeline",
+    "MTLBinaryArchive",
+    "MTLAllocation",
     "MTLLibrary",
     "MTLBuffer",
     "MTLResource",
@@ -36,8 +38,11 @@ objc2-metal = { version = "0.3", optional = true, default-features = false, feat
     "block2",
 ] }
 objc2-foundation = { version = "0.3", optional = true, default-features = false, features = [
+    "std",
     "NSString",
     "NSError",
+    "NSURL",
+    "NSArray",
 ] }
 objc2-metal-performance-shaders = { version = "0.3", optional = true, default-features = false, features = [
     "MPSCore",

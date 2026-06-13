@@ -30,9 +30,11 @@ Interpretation:
 - **30L eventually sharpens** (min_ent < 0.1 after ~step 28), but even then only **~5 positions** have H < 0.1 simultaneously — far below the ~15–20 needed for fast canvas fill. Late-window accept_sum=26 over 8 steps.
 - **3L + prompt KV is dead** (min_ent ≈ uniform ≈ 10 nats). Parity goldens use **kv_len=0**; chat always prefills kv≈14. Do not judge chat quality at 3L.
 - **`step-kv-check` passes** @ kv=64, 3L — KV pack is not totally zeroed, but 3L cannot use prompt context effectively.
-- **Prefill ~100 s** is cold reload per call (P1.8), not intrinsic 14-token cost.
+- **Prefill ~100 s** in `generate-monolithic` was initially blamed on cold reload (P1.8). **`bench-prefill` isolates the engine path at ~2.6 s/run** for 14 tokens @ 30L — so most of the gap is monolithic-specific overhead, not intrinsic encoder forward cost.
+- **Hypotheses (P1.8):** duplicate `.dgq` GPU blob fixed via `load_weight_cache_opt`, but **prefill still ~155 s gpu_forward** when step runtime is resident vs `bench-prefill` ~2.6 s — likely GPU memory pressure, not reload alone. KV pack ~9–74 ms.
+- **MTLBinaryArchive** (P2.0): runtime pipeline ISA cache at `~/.cache/diffgemma-mps/metal-pipelines/` (`DGQ_METAL_PIPELINE_CACHE=0` to disable). Skips recompiling our `.metal` kernels on restart; MPS matmul internals remain uncached.
 
-**Next P1.6 experiments:** `low_ent(<0.1)/step` histogram (landed); `--steps 96`; q5 profile; f32 rowstats; HF/Python accept count on same logits; engine vs monolithic @ 30L text compare.
+**Next P1.6 experiments:** `--steps 96`; q5 profile; f32 rowstats; HF/Python accept count on same logits; engine vs monolithic @ 30L text compare.
 
 ### Target
 
@@ -93,7 +95,7 @@ Buffer ABI in `diffgemma_step.metal` (version-bump to change).
 | **P1.5** Templated-chat quality gate in `step-ci` | done |
 | Plan consolidation (`NOTES.md`, retired PLAN2/MONOLITHIC) | done |
 
-**Measured baseline (M3 Pro, `/tmp/quantized-weights`):** monolithic forward ~4.8 s/step; generate with early stop ~6.58 tok/s (8 steps/block). User run @ 30L, 48 steps, no early stop: ~4.7 s/step, ~1.14 tok/s, prefill ~100 s (cold reload — see P1.8).
+**Measured baseline (M3 Pro, `/tmp/quantized-weights`):** monolithic forward ~4.8 s/step; generate with early stop ~6.58 tok/s (8 steps/block). User run @ 30L, 48 steps: ~4.7 s/step denoise, **prefill ~98 s wall** (see P1.8). `bench-prefill --prefill-len 14 --layers 30`: **~2.6 s/run** engine-only.
 
 ---
 
@@ -110,7 +112,8 @@ Buffer ABI in `diffgemma_step.metal` (version-bump to change).
 | P1.5 | Templated-chat quality gate (`step-ci`) | **done** | CI fails pad-heavy regression |
 | P1.6 | **Canvas convergence** — see telemetry findings above. Open: raise simultaneous low-H positions (forward/quant/KV/SC) or validate HF parity on same weights. | **open** | `low_ent` ≥ 15 late-block OR readable Hello @ 30L |
 | P1.7 | HF accept parity (unit + `sampler_accept_entropy.json`) | **done** | Fixture tests pass; Metal uses equivalent prefix rule |
-| P1.8 | **Prefill session reuse** — `prefill_monolithic_kv` reloads model+engine each call (~100 s for 14 tokens). Reuse `StepGenerateSession` weights/engine for prefill/extend. | **open** | Prefill << denoise for short prompts |
+| P1.8 | **Encoder prefill latency** — shared blob, phased timing, session reuse. Open: ~155 s gpu_forward when step runtime resident. | **partial** | Generate prefill ≤3 s @ 14 tok |
+| P2.0 | **MTLBinaryArchive pipeline cache** — persist compiled compute pipeline ISA across restarts. | **done** | Archive load/save under `~/.cache/diffgemma-mps/metal-pipelines/` |
 
 **P1 exit (unchanged):** `generate-monolithic -p "Hello"` default flags → coherent reply.
 
@@ -153,6 +156,7 @@ P1.6 (convergence)  -->  P1.8 (prefill)  -->  P2  -->  P3
 | Accept/entropy fix changes token goldens | Synthetic-entropy fixtures only; token goldens keep `--raw` + fixed `--steps` |
 | q4 quality insufficient for 30L chat | q5 on 36 GiB; ablate embed/lm_head; CPU MoE parity isolate forward |
 | Half logits rowstats numerically wrong @ 262K vocab | P1.6: f32 rowstats experiment behind flag |
+| Prefill dominates short prompts (~98 s vs ~2.6 s bench) | P1.8: phased timing, share dgq blob, avoid duplicate GPU weight resident |
 | Prefill KV pack wrong → flat logits | `step-kv-check` + prefix max_abs audit before sampler work |
 | 24 GiB cap tight | q4 + `--skip-vision`; document `iogpu.wired_limit_mb` |
 
@@ -174,7 +178,8 @@ cargo run --release --features metal -- -m $WEIGHTS step-ci --layers 3
 DGQ_MPS_Q4=0 cargo run --release --features metal -- -m $WEIGHTS generate-monolithic-parity \
   -p hello --raw --layers 3 --steps 4 --seed 42 --no-early-stop
 
-# KV + sampler diagnostics
+# KV + sampler + prefill diagnostics
+cargo run --release --features metal -- -m $WEIGHTS bench-prefill --prefill-len 14 --layers 30 --iters 3
 cargo run --release --features metal -- -m $WEIGHTS step-kv-check --kv-len 64 --layers 30 --seed 42
 cargo run --release --features metal -- -m $WEIGHTS step-smoke --layers 3 --steps 4 --kv-len 64 --seed 42
 

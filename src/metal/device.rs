@@ -1,3 +1,4 @@
+use crate::metal::pipeline_cache::PipelineArchiveCache;
 use crate::safetensors::Error;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -30,10 +31,18 @@ impl MetalContext {
 
     pub fn compile_kernel(&self, source: &str, entry: &str) -> Result<ComputePipeline, Error> {
         let library = self.compile_library(source)?;
-        Self::compile_kernel_from_library(&self.device, &library, entry)
+        self.compile_kernel_from_library(&library, entry)
     }
 
     pub fn compile_kernel_from_library(
+        &self,
+        library: &ProtocolObject<dyn MTLLibrary>,
+        entry: &str,
+    ) -> Result<ComputePipeline, Error> {
+        Self::compile_kernel_from_library_on_device(&self.device, library, entry)
+    }
+
+    pub fn compile_kernel_from_library_on_device(
         device: &ProtocolObject<dyn MTLDevice>,
         library: &ProtocolObject<dyn MTLLibrary>,
         entry: &str,
@@ -42,14 +51,23 @@ impl MetalContext {
         let function = library
             .newFunctionWithName(&name)
             .ok_or(Error::Format("Metal kernel not found"))?;
-        let pipeline = device
-            .newComputePipelineStateWithFunction_error(&function)
-            .map_err(|_| Error::Format("Metal pipeline compile failed"))?;
+        let cache = PipelineArchiveCache::shared(device)?;
+        let pipeline = cache.compile_compute(device, &function, entry)?;
         Ok(ComputePipeline { pipeline })
     }
 
     /// Specialize `k_gemm_q4` / `k_gemm_q8` (function constants 1–3).
     pub fn compile_gemm_kernel(
+        &self,
+        library: &ProtocolObject<dyn MTLLibrary>,
+        entry: &str,
+        gemm_n: u32,
+        gemm_k: u32,
+    ) -> Result<ComputePipeline, Error> {
+        Self::compile_gemm_kernel_on_device(&self.device, library, entry, gemm_n, gemm_k)
+    }
+
+    pub fn compile_gemm_kernel_on_device(
         device: &ProtocolObject<dyn MTLDevice>,
         library: &ProtocolObject<dyn MTLLibrary>,
         entry: &str,
@@ -79,9 +97,9 @@ impl MetalContext {
         let function = library
             .newFunctionWithName_constantValues_error(&name, &fc)
             .map_err(|e| shader_compile_error(e))?;
-        let pipeline = device
-            .newComputePipelineStateWithFunction_error(&function)
-            .map_err(|_| Error::Format("Metal pipeline compile failed"))?;
+        let label = format!("{entry}_n{gemm_n}_k{gemm_k}");
+        let cache = PipelineArchiveCache::shared(device)?;
+        let pipeline = cache.compile_compute(device, &function, &label)?;
         Ok(ComputePipeline { pipeline })
     }
 
@@ -93,11 +111,7 @@ impl MetalContext {
         let library = self.compile_library(source)?;
         let mut pipelines = Vec::with_capacity(entries.len());
         for entry in entries {
-            pipelines.push(Self::compile_kernel_from_library(
-                &self.device,
-                &library,
-                entry,
-            )?);
+            pipelines.push(self.compile_kernel_from_library(&library, entry)?);
         }
         Ok(pipelines)
     }

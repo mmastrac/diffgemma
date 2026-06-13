@@ -17,6 +17,16 @@ pub fn load_weight_cache(
     seq_len: usize,
     kv_len: usize,
 ) -> Result<GpuDecoderWeightCache, Error> {
+    load_weight_cache_opt(store, text, seq_len, kv_len, None)
+}
+
+pub fn load_weight_cache_opt(
+    store: &WeightStore,
+    text: &crate::config::TextConfig,
+    seq_len: usize,
+    kv_len: usize,
+    shared_dgq_blob: Option<std::sync::Arc<crate::metal::dgq_gpu::DgqGpuBlob>>,
+) -> Result<GpuDecoderWeightCache, Error> {
     use crate::metal::device::MetalContext;
     use crate::metal::memory::{expert_cache_budget_bytes, log_gpu_memory_plan};
 
@@ -31,11 +41,19 @@ pub fn load_weight_cache(
         budget
     };
     if store.is_quantized() {
-        eprintln!("  mode: .dgq resident (zero-copy blob, no expert LRU)");
+        if shared_dgq_blob.is_some() {
+            eprintln!("  mode: .dgq resident (shared step-kernel blob, zero-copy)");
+        } else {
+            eprintln!("  mode: .dgq resident (zero-copy blob, no expert LRU)");
+        }
     } else {
         eprintln!("  mode: bf16 paged layers + expert LRU");
     }
-    let cache = GpuDecoderWeightCache::load(store, text, expert_budget, &ctx.device)?;
+    let cache = if let (WeightStore::Dgq(_), Some(blob)) = (store, shared_dgq_blob) {
+        GpuDecoderWeightCache::load_with_dgq_blob(store, text, &ctx.device, blob)?
+    } else {
+        GpuDecoderWeightCache::load(store, text, expert_budget, &ctx.device)?
+    };
     eprintln!("  cache ready in {:.2?}", warm.elapsed());
     Ok(cache)
 }

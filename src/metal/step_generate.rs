@@ -5,7 +5,9 @@ use crate::metal::step_kernel::{
     build_step_runtime, init_canvas_state_from_rng, step_params_from_sampler, StepFinishMode,
     StepRuntime, StepSmokeConfig, CANVAS, N_LAYERS, VOCAB,
 };
-use crate::metal::step_kv::{extend_monolithic_kv, prefill_monolithic_kv};
+use crate::metal::step_kv::{
+    extend_monolithic_kv_with_cache, prefill_monolithic_kv_with_cache, MonolithicEncoderCache,
+};
 use crate::metal::{ForwardTelemetry, SessionTelemetry, StepPhaseTelemetry};
 use crate::sample::{initialize_canvas, Rng, SamplerConfig, step_entropy_stats};
 use crate::safetensors::Error;
@@ -62,6 +64,7 @@ pub struct StepGenerateSession {
     rt: StepRuntime,
     model_dir: PathBuf,
     layers: usize,
+    encoder: Option<MonolithicEncoderCache>,
 }
 
 impl StepGenerateSession {
@@ -74,6 +77,7 @@ impl StepGenerateSession {
                 rt,
                 model_dir: model_dir.to_path_buf(),
                 layers,
+                encoder: None,
             },
             compile,
         ))
@@ -110,17 +114,28 @@ pub fn generate_with_session(
     let layers = session.layers;
     let max_blocks = cfg.max_new_tokens.div_ceil(canvas_len).max(1);
     let model_dir = session.model_dir.as_path();
+    let shared_blob = session.rt.shared_dgq_blob();
+    if session.encoder.is_none() {
+        session.encoder = Some(MonolithicEncoderCache::open_opt(
+            model_dir,
+            canvas_len,
+            cfg.max_seq,
+            Some(shared_blob),
+        )?);
+    }
+    let encoder = session.encoder.as_mut().expect("encoder cache");
     let rt = &mut session.rt;
 
     let prefill_started = Instant::now();
-    let kv_len = prefill_monolithic_kv(
-        model_dir,
+    let kv_len = prefill_monolithic_kv_with_cache(
+        encoder,
         prompt_token_ids,
         rt.kvcache(),
         rt.layout(),
         cfg.max_seq,
         layers,
-    )?;
+    )?
+    .0;
     rt.set_kv_len(kv_len as u32);
     let prefill_elapsed = prefill_started.elapsed();
     eprintln!("step-generate: prefilled kv_len={kv_len}");
@@ -219,8 +234,8 @@ pub fn generate_with_session(
         if !is_last_block {
             let extend_started = Instant::now();
             let kv_before = rt.read_params().kv_len as usize;
-            let new_kv_len = extend_monolithic_kv(
-                model_dir,
+            let new_kv_len = extend_monolithic_kv_with_cache(
+                encoder,
                 rt.kvcache(),
                 rt.layout(),
                 kv_before,

@@ -967,6 +967,8 @@ fn run_step_smoke_cmd(
             println!("  step:          {}", r.step);
             println!("  stop_flag:     {}", r.stop_flag);
             println!("  mean_entropy:  {:.4}", r.mean_entropy);
+            println!("  min_entropy:   {:.4}", r.min_entropy);
+            println!("  low_ent(<0.1): {}", r.low_entropy_positions);
             println!("  logits_finite: {}", r.logits_finite);
             println!("  max_abs_logit: {:.4}", r.max_abs_logit);
             println!("  elapsed:       {:.2?}", r.elapsed);

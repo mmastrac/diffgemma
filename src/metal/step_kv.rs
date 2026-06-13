@@ -25,13 +25,15 @@
 //! cache stores **post-RoPE K** and **V** in the layout above. M1.2 packs CPU encoder prefill output.
 
 use crate::config::ModelConfig;
-use crate::metal::decoder::load_weight_cache;
+use crate::metal::decoder::load_weight_cache_opt;
 use crate::metal::engine::GpuDecoderEngine;
 use crate::metal::encoder_extend::{extend_prefill_gpu, prefill_gpu};
-use crate::metal::step_kernel::{f16_bits_to_f32, ModelLayout, N_LAYERS, StepSmokeConfig, StepFinishMode, run_step_forward, build_layout, build_offsets_from_store};
+use crate::metal::step_kernel::{f16_bits_to_f32, ModelLayout, N_LAYERS, CANVAS, StepSmokeConfig, StepFinishMode, run_step_forward, build_layout, build_offsets_from_store};
 use crate::metal::device::MetalContext;
 use crate::dgq::DgqStore;
 use crate::metal::GpuDecoderScratch;
+use crate::metal::weights::GpuDecoderWeightCache;
+use crate::model::Model;
 use crate::model::encoder::{EncoderPrefillInput, EncoderScratch};
 use crate::model::kv_cache::KvCache;
 use crate::safetensors::Error;
@@ -183,54 +185,122 @@ fn read_f32_prefix(buf: &ProtocolObject<dyn MTLBuffer>, elems: usize) -> Vec<f32
     (0..elems).map(|i| unsafe { *ptr.add(i) }).collect()
 }
 
-/// GPU encoder prefill → read back post-RoPE K/V → monolithic b4 (M1.2, `.dgq` path).
-pub fn prefill_monolithic_kv(
-    model_dir: &Path,
+/// Reusable GPU encoder stack for monolithic KV prefill/extend (P1.8).
+pub struct MonolithicEncoderCache {
+    model: Model,
+    weights: GpuDecoderWeightCache,
+    engine: GpuDecoderEngine,
+    dec_scratch: GpuDecoderScratch,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MonolithicPrefillTiming {
+    pub gpu_forward_ms: f64,
+    pub kv_pack_ms: f64,
+    pub total_ms: f64,
+}
+
+impl MonolithicEncoderCache {
+    pub fn open(model_dir: &Path, canvas: usize, max_seq_hint: usize) -> Result<Self, Error> {
+        Self::open_opt(model_dir, canvas, max_seq_hint, None)
+    }
+
+    pub fn open_opt(
+        model_dir: &Path,
+        canvas: usize,
+        max_seq_hint: usize,
+        shared_dgq_blob: Option<std::sync::Arc<crate::metal::dgq_gpu::DgqGpuBlob>>,
+    ) -> Result<Self, Error> {
+        let open_started = std::time::Instant::now();
+        let model = Model::open(model_dir)?;
+        let text = &model.config.text_config;
+        let weights = load_weight_cache_opt(
+            &model.weights,
+            text,
+            canvas,
+            max_seq_hint,
+            shared_dgq_blob,
+        )?;
+        let mut engine = GpuDecoderEngine::new()?;
+        engine.set_use_mps_q4(false);
+        let dec_scratch = GpuDecoderScratch::new(canvas, &model.config);
+        eprintln!(
+            "monolithic-encoder: cache open {:.2?} (model + engine weights)",
+            open_started.elapsed()
+        );
+        Ok(Self {
+            model,
+            weights,
+            engine,
+            dec_scratch,
+        })
+    }
+}
+
+/// GPU encoder prefill → read back post-RoPE K/V → monolithic b4 (reuses `cache`).
+pub fn prefill_monolithic_kv_with_cache(
+    cache: &mut MonolithicEncoderCache,
     token_ids: &[u32],
     kv_buf: &ProtocolObject<dyn MTLBuffer>,
     layout: &ModelLayout,
     max_seq: usize,
     max_layers: usize,
-) -> Result<usize, Error> {
+) -> Result<(usize, MonolithicPrefillTiming), Error> {
+    prefill_monolithic_kv_with_cache_timed(
+        cache,
+        token_ids,
+        kv_buf,
+        layout,
+        max_seq,
+        max_layers,
+    )
+}
+
+pub fn prefill_monolithic_kv_with_cache_timed(
+    cache: &mut MonolithicEncoderCache,
+    token_ids: &[u32],
+    kv_buf: &ProtocolObject<dyn MTLBuffer>,
+    layout: &ModelLayout,
+    max_seq: usize,
+    max_layers: usize,
+) -> Result<(usize, MonolithicPrefillTiming), Error> {
+    let total_started = std::time::Instant::now();
     if token_ids.is_empty() {
         return Err(Error::Format("prefill requires at least one token"));
     }
     if token_ids.len() > max_seq {
         return Err(Error::Format("prefill exceeds max_seq"));
     }
-    let model = crate::model::Model::open(model_dir)?;
-    let text = &model.config.text_config;
-    let canvas = crate::metal::step_kernel::CANVAS;
+    let text = &cache.model.config.text_config;
+    let canvas = CANVAS;
     let layers = max_layers.min(text.num_hidden_layers);
+    let encoder_kv_cap = token_ids.len().max(1);
 
-    let mut enc_scratch = EncoderScratch::new(token_ids.len(), &model.config);
-    let mut dec_scratch = GpuDecoderScratch::new(canvas, &model.config);
-    let mut weights = load_weight_cache(
-        &model.weights,
-        text,
-        canvas,
-        token_ids.len(),
-    )?;
-    let mut engine = GpuDecoderEngine::new()?;
-    engine.set_use_mps_q4(false);
+    let mut enc_scratch = EncoderScratch::new(token_ids.len(), &cache.model.config);
+    if let Some(gpu_kv) = cache.dec_scratch.gpu_kv.as_mut() {
+        gpu_kv.reset_len();
+    }
 
+    let gpu_started = std::time::Instant::now();
     let _cpu_kv = prefill_gpu(
-        &model.weights,
-        &model.config,
+        &cache.model.weights,
+        &cache.model.config,
         &EncoderPrefillInput {
             token_ids,
             position_offset: 0,
         },
         &mut enc_scratch,
-        &mut dec_scratch,
-        &mut weights,
-        &mut engine,
-        max_seq,
+        &mut cache.dec_scratch,
+        &mut cache.weights,
+        &mut cache.engine,
+        encoder_kv_cap,
         canvas,
         Some(layers),
     )?;
+    let gpu_forward_ms = gpu_started.elapsed().as_secs_f64() * 1000.0;
 
-    let gpu_kv = dec_scratch
+    let gpu_kv = cache
+        .dec_scratch
         .gpu_kv
         .as_ref()
         .ok_or(Error::Format("gpu kv missing after prefill"))?;
@@ -244,6 +314,7 @@ pub fn prefill_monolithic_kv(
     };
     dst.fill(0);
 
+    let pack_started = std::time::Instant::now();
     for layer in 0..layers {
         let l = &layout.layers[layer];
         let nkv = l.n_kv_heads as usize;
@@ -254,7 +325,38 @@ pub fn prefill_monolithic_kv(
         let values = read_f32_prefix(&v_buf, elems);
         pack_layer_f32_kv_to_monolithic(dst, layout, layer, &keys, &values, 0, kv_len, max_seq)?;
     }
-    Ok(kv_len)
+    let kv_pack_ms = pack_started.elapsed().as_secs_f64() * 1000.0;
+    let timing = MonolithicPrefillTiming {
+        gpu_forward_ms,
+        kv_pack_ms,
+        total_ms: total_started.elapsed().as_secs_f64() * 1000.0,
+    };
+    eprintln!(
+        "monolithic-prefill: kv_len={kv_len} gpu_forward={gpu_forward_ms:.1}ms kv_pack={kv_pack_ms:.1}ms total={:.1}ms",
+        timing.total_ms
+    );
+    Ok((kv_len, timing))
+}
+
+/// GPU encoder prefill → read back post-RoPE K/V → monolithic b4 (M1.2, `.dgq` path).
+pub fn prefill_monolithic_kv(
+    model_dir: &Path,
+    token_ids: &[u32],
+    kv_buf: &ProtocolObject<dyn MTLBuffer>,
+    layout: &ModelLayout,
+    max_seq: usize,
+    max_layers: usize,
+) -> Result<usize, Error> {
+    let mut cache = MonolithicEncoderCache::open(model_dir, CANVAS, max_seq)?;
+    Ok(prefill_monolithic_kv_with_cache(
+        &mut cache,
+        token_ids,
+        kv_buf,
+        layout,
+        max_seq,
+        max_layers,
+    )?
+    .0)
 }
 
 fn read_half_at(kv_buf: &ProtocolObject<dyn MTLBuffer>, byte_off: usize) -> u16 {
@@ -304,9 +406,9 @@ fn hydrate_gpu_kv_from_monolithic(
     Ok(())
 }
 
-/// GPU encoder extend → read back new suffix K/V → append into monolithic b4 (M1.3).
-pub fn extend_monolithic_kv(
-    model_dir: &Path,
+/// GPU encoder extend → read back new suffix K/V → append into monolithic b4 (reuses `cache`).
+pub fn extend_monolithic_kv_with_cache(
+    cache: &mut MonolithicEncoderCache,
     kv_buf: &ProtocolObject<dyn MTLBuffer>,
     layout: &ModelLayout,
     kv_len_before: usize,
@@ -320,51 +422,44 @@ pub fn extend_monolithic_kv(
     if kv_len_before + new_token_ids.len() > max_seq {
         return Err(Error::Format("monolithic kv extend exceeds max_seq"));
     }
-    let model = crate::model::Model::open(model_dir)?;
-    let text = &model.config.text_config;
-    let canvas = crate::metal::step_kernel::CANVAS;
+    let text = &cache.model.config.text_config;
+    let canvas = CANVAS;
     let layers = max_layers.min(text.num_hidden_layers);
 
-    let mut enc_scratch = EncoderScratch::new(new_token_ids.len(), &model.config);
-    let mut dec_scratch = GpuDecoderScratch::new(canvas, &model.config);
-    let mut weights = load_weight_cache(
-        &model.weights,
-        text,
-        canvas,
-        kv_len_before + new_token_ids.len(),
-    )?;
-    let mut engine = GpuDecoderEngine::new()?;
-    engine.set_use_mps_q4(false);
+    let mut enc_scratch = EncoderScratch::new(new_token_ids.len(), &cache.model.config);
+    let encoder_kv_cap = (kv_len_before + new_token_ids.len()).min(max_seq);
 
-    dec_scratch.ensure_gpu_kv(
-        &engine.ctx.device,
+    cache.dec_scratch.ensure_gpu_kv(
+        &cache.engine.ctx.device,
         text,
-        max_seq,
+        encoder_kv_cap,
         canvas,
     )?;
-    let mut gpu_kv = dec_scratch
+    let mut gpu_kv = cache
+        .dec_scratch
         .gpu_kv
         .take()
         .ok_or(Error::Format("gpu kv cache missing"))?;
     hydrate_gpu_kv_from_monolithic(kv_buf, layout, kv_len_before, &mut gpu_kv, layers)?;
-    dec_scratch.gpu_kv = Some(gpu_kv);
+    cache.dec_scratch.gpu_kv = Some(gpu_kv);
 
     let mut cpu_kv = KvCache::empty(text)?;
     cpu_kv.kv_len = kv_len_before;
 
     extend_prefill_gpu(
-        &model.weights,
-        &model.config,
+        &cache.model.weights,
+        &cache.model.config,
         &mut cpu_kv,
         new_token_ids,
         &mut enc_scratch,
-        &mut dec_scratch,
-        &mut weights,
-        &mut engine,
+        &mut cache.dec_scratch,
+        &mut cache.weights,
+        &mut cache.engine,
         Some(layers),
     )?;
 
-    let gpu_kv = dec_scratch
+    let gpu_kv = cache
+        .dec_scratch
         .gpu_kv
         .as_ref()
         .ok_or(Error::Format("gpu kv missing after extend"))?;
@@ -400,6 +495,28 @@ pub fn extend_monolithic_kv(
         )?;
     }
     Ok(new_kv_len)
+}
+
+/// GPU encoder extend → read back new suffix K/V → append into monolithic b4 (M1.3).
+pub fn extend_monolithic_kv(
+    model_dir: &Path,
+    kv_buf: &ProtocolObject<dyn MTLBuffer>,
+    layout: &ModelLayout,
+    kv_len_before: usize,
+    new_token_ids: &[u32],
+    max_seq: usize,
+    max_layers: usize,
+) -> Result<usize, Error> {
+    let mut cache = MonolithicEncoderCache::open(model_dir, CANVAS, max_seq)?;
+    extend_monolithic_kv_with_cache(
+        &mut cache,
+        kv_buf,
+        layout,
+        kv_len_before,
+        new_token_ids,
+        max_seq,
+        max_layers,
+    )
 }
 
 fn read_f32_at(buf: &ProtocolObject<dyn MTLBuffer>, byte_offset: usize, elems: usize) -> Vec<f32> {

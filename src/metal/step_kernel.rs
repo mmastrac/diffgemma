@@ -178,6 +178,8 @@ pub struct StepSmokeResult {
     pub step: u32,
     pub stop_flag: u32,
     pub mean_entropy: f32,
+    pub min_entropy: f32,
+    pub low_entropy_positions: u32,
     pub ids: [u32; CANVAS],
     pub logits_finite: bool,
     pub max_abs_logit: f32,
@@ -352,7 +354,7 @@ struct StepPipelines {
 
 impl StepPipelines {
     fn new(ctx: &MetalContext, library: &ProtocolObject<dyn MTLLibrary>) -> Result<Self, Error> {
-        let simple = |e: &str| MetalContext::compile_kernel_from_library(&ctx.device, library, e);
+        let simple = |e: &str| ctx.compile_kernel_from_library(library, e);
         let mut gemm_q4 = HashMap::new();
         let mut gemm_q8 = HashMap::new();
         let mut gemm_q8_rowk = HashMap::new();
@@ -369,7 +371,7 @@ impl StepPipelines {
         ] {
             gemm_q4.insert(
                 (n, k),
-                MetalContext::compile_gemm_kernel(&ctx.device, library, "k_gemm_q4", n, k)?,
+                ctx.compile_gemm_kernel(library, "k_gemm_q4", n, k)?,
             );
         }
         for &(n, k) in &[
@@ -379,13 +381,13 @@ impl StepPipelines {
         ] {
             gemm_q8.insert(
                 (n, k),
-                MetalContext::compile_gemm_kernel(&ctx.device, library, "k_gemm_q8", n, k)?,
+                ctx.compile_gemm_kernel(library, "k_gemm_q8", n, k)?,
             );
         }
         for &(n, k) in &[(HID as u32, VOCAB as u32)] {
             gemm_q8_rowk.insert(
                 (n, k),
-                MetalContext::compile_gemm_kernel(&ctx.device, library, "k_gemm_q8_rowk", n, k)?,
+                ctx.compile_gemm_kernel(library, "k_gemm_q8_rowk", n, k)?,
             );
         }
         Ok(Self {
@@ -1479,6 +1481,10 @@ impl StepRuntime {
         &self.bufs.kvcache
     }
 
+    pub fn shared_dgq_blob(&self) -> std::sync::Arc<DgqGpuBlob> {
+        std::sync::Arc::clone(&self.gpu_blob)
+    }
+
     pub fn read_params(&self) -> StepParams {
         read_struct(&self.bufs.params)
     }
@@ -1577,9 +1583,14 @@ static STEP_PIPELINES: std::sync::OnceLock<Result<StepPipelines, String>> =
 fn shared_step_pipelines(ctx: &MetalContext) -> Result<&'static StepPipelines, Error> {
     STEP_PIPELINES
         .get_or_init(|| {
-            ctx.compile_library(STEP_SHADER)
+            let result = ctx
+                .compile_library(STEP_SHADER)
                 .and_then(|library| StepPipelines::new(ctx, &library))
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string());
+            if result.is_ok() {
+                crate::metal::pipeline_cache::PipelineArchiveCache::flush_global();
+            }
+            result
         })
         .as_ref()
         .map_err(|msg| Error::Format(msg.as_str()))
@@ -1882,11 +1893,14 @@ pub fn run_step_smoke(model_dir: &Path, cfg: StepSmokeConfig) -> Result<StepSmok
 
     let final_state: CanvasState = read_struct(&rt.bufs.state);
     let (logits_finite, max_abs_logit) = check_logits_finite(&rt.bufs.logits);
+    let ent_stats = crate::sample::step_entropy_stats(&final_state.entropy, &final_state.accept);
 
     Ok(StepSmokeResult {
         step: final_state.step,
         stop_flag: final_state.stop_flag,
         mean_entropy: final_state.mean_entropy,
+        min_entropy: ent_stats.min_entropy,
+        low_entropy_positions: ent_stats.low_entropy_positions,
         ids: final_state.ids,
         logits_finite,
         max_abs_logit,

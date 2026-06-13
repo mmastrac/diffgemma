@@ -349,38 +349,33 @@ impl GpuDecoderWeightCache {
         expert_budget_bytes: u64,
         device: &ProtocolObject<dyn MTLDevice>,
     ) -> Result<Self, Error> {
+        Self::load_opt(store, text, expert_budget_bytes, device, None)
+    }
+
+    /// `.dgq` path with an existing GPU blob (avoids duplicate 15 GiB resident copy).
+    pub fn load_with_dgq_blob(
+        store: &WeightStore,
+        text: &TextConfig,
+        device: &ProtocolObject<dyn MTLDevice>,
+        blob: Arc<DgqGpuBlob>,
+    ) -> Result<Self, Error> {
+        Self::load_opt(store, text, 0, device, Some(blob))
+    }
+
+    fn load_opt(
+        store: &WeightStore,
+        text: &TextConfig,
+        expert_budget_bytes: u64,
+        device: &ProtocolObject<dyn MTLDevice>,
+        shared_dgq_blob: Option<Arc<DgqGpuBlob>>,
+    ) -> Result<Self, Error> {
         match store {
             WeightStore::Dgq(dgq) => {
-                let blob = DgqGpuBlob::from_store(dgq, device)?;
-                let final_norm = raw_blob_bf16_to_f32(&load_raw_view(
-                    dgq,
-                    Arc::clone(&blob),
-                    "model.decoder.norm.weight",
-                )?)?;
-                let mut layers = Vec::with_capacity(text.num_hidden_layers);
-                for layer in 0..text.num_hidden_layers {
-                    let keys = crate::model::layer_weights::DecoderLayerKeys::new(layer);
-                    layers.push(GpuLayerWeightCache::load_dgq(
-                        dgq,
-                        Arc::clone(&blob),
-                        &keys,
-                        text,
-                    )?);
-                }
-                let embed_q8 = load_q8_linear(
-                    dgq,
-                    Arc::clone(&blob),
-                    "model.decoder.embed_tokens.weight",
-                )
-                .ok();
-                let self_conditioning = load_self_conditioning_dgq(dgq, Arc::clone(&blob))?;
-                Ok(Self::Dgq(DgqResident {
-                    blob,
-                    final_norm,
-                    embed_q8,
-                    self_conditioning,
-                    layers,
-                }))
+                let blob = match shared_dgq_blob {
+                    Some(b) => b,
+                    None => DgqGpuBlob::from_store(dgq, device)?,
+                };
+                Self::load_dgq_layers(dgq, text, blob)
             }
             _ => {
                 let final_norm =
@@ -395,6 +390,42 @@ impl GpuDecoderWeightCache {
                 }))
             }
         }
+    }
+
+    fn load_dgq_layers(
+        dgq: &DgqStore,
+        text: &TextConfig,
+        blob: Arc<DgqGpuBlob>,
+    ) -> Result<Self, Error> {
+        let final_norm = raw_blob_bf16_to_f32(&load_raw_view(
+            dgq,
+            Arc::clone(&blob),
+            "model.decoder.norm.weight",
+        )?)?;
+        let mut layers = Vec::with_capacity(text.num_hidden_layers);
+        for layer in 0..text.num_hidden_layers {
+            let keys = crate::model::layer_weights::DecoderLayerKeys::new(layer);
+            layers.push(GpuLayerWeightCache::load_dgq(
+                dgq,
+                Arc::clone(&blob),
+                &keys,
+                text,
+            )?);
+        }
+        let embed_q8 = load_q8_linear(
+            dgq,
+            Arc::clone(&blob),
+            "model.decoder.embed_tokens.weight",
+        )
+        .ok();
+        let self_conditioning = load_self_conditioning_dgq(dgq, Arc::clone(&blob))?;
+        Ok(Self::Dgq(DgqResident {
+            blob,
+            final_norm,
+            embed_q8,
+            self_conditioning,
+            layers,
+        }))
     }
 
     pub fn is_dgq(&self) -> bool {
