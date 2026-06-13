@@ -51,6 +51,75 @@ See `ARCHITECTURE.md` for DiffusionGemma semantics (block diffusion, entropy sam
 - **Parity vs engine @ kv>0** — `step-parity` still kv_len=0 only.
 - **Layer coverage** — full 30L generate verified @ hello prompt; 5 full-attention layers exercised in forward path.
 - **Perf debt** — ~130 dispatches/step/layer; recompiles runtime per generate invocation (no cross-prompt reuse yet).
+- **Chat-quality generate** — chat template + default early-stop often commits all-pad blocks before canvas converges; see [Inference semantics](#inference-semantics-first-principles) below. Parity goldens use `--raw`; templated prompts are not yet a ship gate.
+
+---
+
+## Inference semantics (first principles)
+
+DiffusionGemma has **two different “commit” stages**. Conflating them explains empty/pad output and the “~16 tokens” question.
+
+### Per denoise step (~15–20 canvas positions)
+
+Each decoder forward still computes logits for all **256** canvas positions. The **entropy-bound sampler** (`entropy_bound = 0.1` in `src/sample.rs`) only **freezes** the lowest-entropy positions whose cumulative entropy stays ≤ 0.1; the rest are re-noised. In practice that is **~15–20 positions per step** — not a separate “emit 16 tokens to the user” mode.
+
+```
+denoise step:  forward(256) → accept ~15–20 low-entropy slots → renoise rest
+               (repeat until converged or step limit)
+```
+
+Both engine (`generate.rs` + GPU sampler) and monolithic (`k_sample_*` in `diffgemma_step.metal`) implement this intra-step accept/renoise loop.
+
+### Per block end (256 tokens to user / KV)
+
+When the block finishes (adaptive early stop or `max_denoising_steps`), official behavior (model card, vLLM) is:
+
+1. Take final **argmax** over all 256 canvas positions.
+2. **Emit all 256** to output.
+3. Run causal **encoder extend** on all 256 into KV (b4 monolithic / `GpuKvCache` engine).
+4. Start a fresh 256-token canvas for the next block (if `max_new_tokens > 256`).
+
+Our block drivers match this shape (`src/generate.rs`: `sequences.extend_from_slice(&argmax_canvas_tokens)` then `extend_encoder_kv` on the same 256 tokens).
+
+**Do not** “strip pads and continue” as the primary fix for bad output — that diverges from official KV semantics. Fix **premature block commit** (stop before the canvas has converged to real tokens).
+
+### Adaptive early stopping (why we stop at all)
+
+Early stop is an **optimization**, not the core algorithm. Model card / `ARCHITECTURE.md`:
+
+| Criterion | Value |
+|-----------|--------|
+| Max denoising steps | **48** (upper bound) |
+| Typical effective steps | **12–16** (task-dependent) |
+| Early stop | mean canvas entropy **< 0.005** AND argmax **stable** for 2 consecutive steps |
+| Entropy bound (per-step accept) | **0.1** |
+| Temperature | linear **0.8 → 0.4** |
+
+Implemented in `StableConfidentStopper` (`src/sample.rs`) and monolithic `StepParams.conf_threshold` / `stop_flag`.
+
+**CLI mismatch:** `main.rs` defaults `--steps` to **2** for fast parity/bench — not model-card production. With early stop **on** (default), runs often exit at step 2 when argmax stabilizes on **degenerate tokens** (`<pad>` id 0 or filler `262143`), which is confident but not meaningful text.
+
+**Recommended for chat / quality debugging:**
+
+```bash
+cargo run --release --features metal -- -m $WEIGHTS generate-monolithic \
+  -p "Hello" --layers 30 --steps 48 --no-early-stop --seed 42
+
+# Parity / legacy goldens (bare BPE, not chat template):
+... generate-monolithic-parity -p hello --raw --layers 3 --steps 4 --seed 42 --no-early-stop
+```
+
+### Chat templating (2026-06)
+
+| Item | Status |
+|------|--------|
+| `src/chat_template.rs` — HF-matched token assembly (`<bos>`, `<\|turn>`, `<turn\|>`, `<\|channel>`, `<channel\|>`) | ✅ |
+| Default `-p` wraps user text; `--raw` for bare BPE (parity goldens) | ✅ |
+| `chat` REPL on `StepGenerateSession` | ✅ |
+| `tokenize` shows `formatted` + ids; Python `test_chat_template.py` parity | ✅ |
+| Readable chat output @ default `--steps 2` + early stop | ❌ open (STOP-1 / QUAL-1) |
+
+Chat prompt ends at empty thought channel (`<|channel>thought\n<channel|>`); generation needs enough denoise steps for the canvas to converge past that structure.
 
 ---
 
@@ -155,11 +224,14 @@ cargo run --release --features metal -- -m $WEIGHTS step-probe --kv-len 64 --lay
 | **M2.2 Block outer loop** | ✅ prefill → denoise until stop → commit argmax → extend KV |
 | **M2.3 Canvas lifecycle** | ✅ `reset_block` + read `CanvasState.prev_argmax` for commit |
 | **M2.4 Step loop** | ✅ `StepParams.kv_len` patched per block; SC via b6 logits on step>0 |
-| **M2.5 Early stop** | ✅ GPU `stop_flag` + `max_steps`; `--no-early-stop` sets `conf_threshold=MAX` |
+| **M2.5 Early stop** | ✅ GPU `stop_flag` + `max_steps`; `--no-early-stop` sets `conf_threshold=MAX`. ⚠️ No guard against degenerate all-pad/stable argmax — see [Inference semantics](#inference-semantics-first-principles) |
 | **M2.6 Output** | ✅ returns `GenerateOutput`; decode/print via existing `print_generate_output` |
 | **M2.7 CLI** | ✅ `generate-monolithic` (`-p`, `--seed`, `--steps`, `--layers`) |
+| **M2.8 Chat template** | ✅ `chat_template.rs`, `--raw`, `chat` REPL; default `-p` uses Gemma 4 turn format |
 
 **Exit:** `generate-monolithic -p "hello" --seed 42 --layers 30` produces readable text; token stream starts with prompt ids; blocks_committed ≥ 1.
+
+**Note:** Exit was written for raw/`hello` smoke. Templated chat at `--steps 2` + early stop may still emit pad-heavy blocks — use `--steps 48 --no-early-stop` until STOP-1/QUAL-1 land.
 
 ```bash
 cargo run --release --features metal -- -m $WEIGHTS generate-monolithic -p "hello" --seed 42 --layers 30
@@ -238,7 +310,9 @@ cargo run --release --features metal -- -m $WEIGHTS step-ci --layers 3
 
 | Gate | Requirement |
 |------|-------------|
-| **Golden parity** | ✅ `generate-monolithic-parity` vs `fixtures/generate/monolithic_hello_steps4_layers3.json` (`DGQ_MPS_Q4=0`) |
+| **Golden parity** | ✅ `generate-monolithic-parity` vs `fixtures/generate/monolithic_hello_steps4_layers3.json` (`DGQ_MPS_Q4=0`, **`--raw`**) |
+| **Chat template parity** | ✅ Rust `format_chat_token_ids` vs HF `apply_chat_template` (`python/tests/test_chat_template.py`) |
+| **End-to-end chat text quality** | ❌ Not gated — engine/monolithic with templated `-p` + default early-stop often all-pad; distinct from token-id parity |
 | **Regression** | ✅ `step-ci --layers 3` (config + verify + parity); GitHub Actions `ci.yml` |
 | **Memory** | Peak RSS ≤ 24 GiB budget on base M4 with q4 `.dgq` (document sysctl if needed) |
 | **Determinism** | ✅ Same seed → same tokens with `DGQ_MPS_Q4=0` @ `monolithic_hello_steps4_layers3` |
@@ -261,6 +335,17 @@ cargo run --release --features metal -- -m $WEIGHTS step-ci --layers 3
 | BENCH-1 | Historical benches used kv_len=0 vs engine 64 | Misleading | M1 |
 | FULL-1 | 5 full-attention layers need shape-specialized pipelines | Correctness | M0 |
 | RNG-1 | `init_canvas_state` may not match `Rng::new(seed+1)` | Parity | M0 |
+| STOP-1 | Early stop fires on degenerate all-pad / filler argmax (confident but not text) | Quality | M5+ |
+| QUAL-1 | Templated chat + default `--steps 2` → no readable reply; need pad-aware stop + chat defaults | Quality | M5+ |
+| CLI-1 | `--steps` default is 2 (parity); model card recommends up to 48 | UX | M5+ |
+| CHAT-1 | Display decodes full 256 block incl. pads; strip pads in `print_generate_output` / `chat` only | UX | M5+ |
+
+### Planned fixes (STOP-1 / QUAL-1 / CLI-1)
+
+1. **Pad-aware early stop** — do not treat all-pad (or all-filler) stable argmax as convergence.
+2. **Chat-oriented CLI defaults** — e.g. `chat` / default generate: `--steps 48`, stricter or disabled early-stop until steps_eff ≥ ~12.
+3. **Decode hygiene** — show only non-pad new tokens in text preview; block commit still emits 256 argmax per official semantics.
+4. **Optional telemetry** — `steps_eff` per block + histogram of accepted positions/step (`PLAN2.md` Q4).
 
 ---
 
@@ -289,18 +374,23 @@ M0 (parity) ──► M1 (KV) ──► M2 (generate loop) ──► M3 (perf) �
 | `src/main.rs` | `step-smoke`, `step-probe`, `bench-step-kernel` |
 | `src/generate.rs` | Reference block loop to mirror |
 | `src/sample.rs` | Authoritative sampler semantics |
+| `src/chat_template.rs` | Gemma 4 turn formatting + HF-matched token ids |
+| `src/tokenizer.rs` | BPE + `added_tokens` for chat special tokens |
+| `fixtures/generate/README.md` | Golden commands (`--raw` for legacy prompts) |
 | `src/metal/kv_cache.rs` | **Legacy** — do not use for monolithic b4 |
 | `src/metal/encoder_extend.rs` | Reference for extend prefill behavior |
 
 ---
 
-## Open questions (resolve in M0/M1)
+## Open questions (resolve in M0/M1 / M5+)
 
 1. **Unify KV layouts?** Long-term, one layout for engine + monolithic reduces code — but migration cost is high; monolithic-first writer may be faster to ship.
 2. **Keep f16 arena?** Saves bandwidth; may complicate parity — decide before M5 golden lock.
 3. **ICB vs Metal 3 command replay?** Prototype both in M3.1; pick lower complexity.
 4. **When to delete engine path?** Only after M5 + 30L perf win sustained for 2 weeks of dogfooding.
+5. **Block commit shape?** Official emit is always 256 argmax; per-step accept is ~15–20 positions only inside the denoise loop — do not confuse the two when debugging output.
+6. **Chat ship gate?** Add templated-prompt golden or eval harness once STOP-1/QUAL-1 fixed; until then ship parity on `--raw` only.
 
 ---
 
-*Last updated: 2026-06 — reflects commits through `26c3a62` (MPS Q4, softcap, SC skip, MoE rmsnorm fuse).*
+*Last updated: 2026-06 — M0–M5 core gates, chat template (`chat_template.rs`, `--raw`, `chat`), inference-semantics notes (two-level commit, early-stop pitfalls).*

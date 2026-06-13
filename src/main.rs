@@ -1,4 +1,5 @@
 mod buffer;
+mod chat_template;
 mod config;
 mod fast_slice;
 mod generate;
@@ -24,6 +25,8 @@ use std::process::ExitCode;
 struct Cli {
     model_dir: PathBuf,
     command: Command,
+    /// When true, `-p` text is BPE-encoded as-is (no chat template).
+    raw_prompt: bool,
 }
 
 #[derive(Debug)]
@@ -169,6 +172,14 @@ enum Command {
         iters: usize,
         forward_only: bool,
     },
+    Chat {
+        seed: u64,
+        steps: usize,
+        max_new_tokens: usize,
+        max_layers: Option<usize>,
+        no_early_stop: bool,
+        initial_prompt: Option<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -192,6 +203,7 @@ fn main() -> ExitCode {
             max_seq,
             forward_only,
             prompt.as_deref(),
+            cli.raw_prompt,
         ),
         Command::StepProbe {
             layers,
@@ -206,6 +218,7 @@ fn main() -> ExitCode {
             seed,
             max_seq,
             prompt.as_deref(),
+            cli.raw_prompt,
         ),
         Command::StepKvCheck {
             kv_len,
@@ -258,6 +271,7 @@ fn main() -> ExitCode {
             no_early_stop,
             engine_fallback,
             write_golden,
+            cli.raw_prompt,
         ),
         Command::GenerateMonolithicParity {
             prompt,
@@ -280,16 +294,34 @@ fn main() -> ExitCode {
             no_early_stop,
             golden,
             write_golden,
+            cli.raw_prompt,
+        ),
+        Command::Chat {
+            seed,
+            steps,
+            max_new_tokens,
+            max_layers,
+            no_early_stop,
+            initial_prompt,
+        } => run_chat_cmd(
+            &cli.model_dir,
+            initial_prompt,
+            seed,
+            steps,
+            max_new_tokens,
+            max_layers,
+            no_early_stop,
+            cli.raw_prompt,
         ),
         Command::Quantize { output, profile } => run_quantize(&cli.model_dir, &output, &profile),
-        Command::Tokenize(text) => run_tokenize(&cli.model_dir, &text),
+        Command::Tokenize(text) => run_tokenize(&cli.model_dir, &text, cli.raw_prompt),
         Command::Gemm { size } => run_gemm(size),
         Command::ProbeDevice => run_probe_device(),
         Command::BenchGemm { shapes, oracle, iters } => run_bench_gemm(&shapes, oracle.as_deref(), iters),
         command => {
             eprintln!("loading from {}", cli.model_dir.display());
             match model::Model::open(&cli.model_dir) {
-                Ok(m) => run_command(&m, &cli.model_dir, command),
+                Ok(m) => run_command(&m, &cli.model_dir, command, cli.raw_prompt),
                 Err(err) => {
                     eprintln!("error: {err}");
                     ExitCode::FAILURE
@@ -299,7 +331,12 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_command(m: &model::Model, model_dir: &std::path::Path, command: Command) -> ExitCode {
+fn run_command(
+    m: &model::Model,
+    model_dir: &std::path::Path,
+    command: Command,
+    raw_prompt: bool,
+) -> ExitCode {
     match command {
         Command::Summary => {
             print_summary(&m.weights);
@@ -339,7 +376,7 @@ fn run_command(m: &model::Model, model_dir: &std::path::Path, command: Command) 
             iters,
             prompt,
             seed,
-        } => run_bench_step(m, model_dir, canvas, layers, iters, prompt, seed),
+        } => run_bench_step(m, model_dir, canvas, layers, iters, prompt, seed, raw_prompt),
         Command::BenchPrefill {
             prompt_len,
             layers,
@@ -367,6 +404,7 @@ fn run_command(m: &model::Model, model_dir: &std::path::Path, command: Command) 
             no_early_stop,
             false,
             None,
+            raw_prompt,
         ),
         Command::GenerateGpu {
             prompt,
@@ -389,6 +427,7 @@ fn run_command(m: &model::Model, model_dir: &std::path::Path, command: Command) 
             no_early_stop,
             true,
             write_golden,
+            raw_prompt,
         ),
         Command::GenerateParity {
             prompt,
@@ -414,7 +453,9 @@ fn run_command(m: &model::Model, model_dir: &std::path::Path, command: Command) 
             golden,
             compare_cpu,
             write_golden,
+            raw_prompt,
         ),
+        Command::Chat { .. } => ExitCode::FAILURE,
         Command::Tokenize(_) => ExitCode::FAILURE,
         Command::Gemm { .. } => ExitCode::FAILURE,
         Command::ProbeDevice { .. } => ExitCode::FAILURE,
@@ -461,6 +502,7 @@ fn attach_step_prefill(
     model_dir: &std::path::Path,
     kv_len: u32,
     prompt: Option<&str>,
+    raw_prompt: bool,
 ) -> Result<(), safetensors::Error> {
     if kv_len == 0 && prompt.is_none() {
         return Ok(());
@@ -471,7 +513,7 @@ fn attach_step_prefill(
     } else {
         64
     };
-    let ids = build_prompt_tokens(model_dir, prompt, prompt_len, vocab)?;
+    let ids = build_prompt_tokens(model_dir, prompt, prompt_len, vocab, raw_prompt, &[])?;
     eprintln!("step-kernel: prefill {} prompt tokens", ids.len());
     cfg.prefill_token_ids = Some(ids);
     Ok(())
@@ -485,6 +527,7 @@ fn run_step_probe_cmd(
     seed: u64,
     max_seq: usize,
     prompt: Option<&str>,
+    raw_prompt: bool,
 ) -> ExitCode {
     use metal::{run_step_probe, StepFinishMode, StepSmokeConfig};
 
@@ -502,7 +545,7 @@ fn run_step_probe_cmd(
         use_mps_q4: None,
         prefill_token_ids: None,
     };
-    if let Err(err) = attach_step_prefill(&mut cfg, model_dir, kv_len, prompt) {
+    if let Err(err) = attach_step_prefill(&mut cfg, model_dir, kv_len, prompt, raw_prompt) {
         eprintln!("error: {err}");
         return ExitCode::FAILURE;
     }
@@ -532,6 +575,7 @@ fn run_step_probe_cmd(
     _seed: u64,
     _max_seq: usize,
     _prompt: Option<&str>,
+    _raw_prompt: bool,
 ) -> ExitCode {
     eprintln!("error: step-probe requires --features metal on macOS");
     ExitCode::FAILURE
@@ -591,19 +635,6 @@ fn run_step_kv_check_cmd(
     _max_seq: usize,
 ) -> ExitCode {
     eprintln!("error: step-kv-check requires --features metal on macOS");
-    ExitCode::FAILURE
-}
-
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-fn run_step_probe_cmd(
-    _model_dir: &std::path::Path,
-    _layers: usize,
-    _kv_len: u32,
-    _seed: u64,
-    _max_seq: usize,
-    _prompt: Option<&str>,
-) -> ExitCode {
-    eprintln!("error: step-probe requires --features metal on macOS");
     ExitCode::FAILURE
 }
 
@@ -685,6 +716,7 @@ fn run_step_ci_cmd(model_dir: &std::path::Path, layers: usize) -> ExitCode {
             true,
             None,
             None,
+            true,
         );
         if parity != ExitCode::SUCCESS {
             eprintln!("step-ci failed at generate-monolithic-parity");
@@ -833,6 +865,7 @@ fn run_step_smoke_cmd(
     max_seq: usize,
     forward_only: bool,
     prompt: Option<&str>,
+    raw_prompt: bool,
 ) -> ExitCode {
     use metal::{run_step_smoke, StepSmokeConfig};
 
@@ -843,7 +876,7 @@ fn run_step_smoke_cmd(
 
     let mut cfg = step_kernel_config(layers, kv_len, seed, max_seq, forward_only);
     cfg.steps = steps.max(1);
-    if let Err(err) = attach_step_prefill(&mut cfg, model_dir, kv_len, prompt) {
+    if let Err(err) = attach_step_prefill(&mut cfg, model_dir, kv_len, prompt, raw_prompt) {
         eprintln!("error: {err}");
         return ExitCode::FAILURE;
     }
@@ -894,6 +927,7 @@ fn run_step_smoke_cmd(
     _max_seq: usize,
     _forward_only: bool,
     _prompt: Option<&str>,
+    _raw_prompt: bool,
 ) -> ExitCode {
     eprintln!("error: step-smoke requires --features metal on macOS");
     ExitCode::FAILURE
@@ -1065,6 +1099,7 @@ fn parse_cli() -> Cli {
     let mut step_max_seq = 512usize;
     let mut step_forward_only = false;
     let mut use_monolithic = false;
+    let mut raw_prompt = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -1206,6 +1241,7 @@ fn parse_cli() -> Cli {
             }
             "--forward-only" => step_forward_only = true,
             "--monolithic" => use_monolithic = true,
+            "--raw" => raw_prompt = true,
             "--max-seq" => {
                 if let Some(v) = args.next() {
                     step_max_seq = v.parse().unwrap_or_else(|_| {
@@ -1314,6 +1350,14 @@ fn parse_cli() -> Cli {
             no_early_stop,
             golden: golden_name,
             write_golden,
+        },
+        Some("chat") => Command::Chat {
+            seed,
+            steps,
+            max_new_tokens,
+            max_layers: parity_layers,
+            no_early_stop,
+            initial_prompt: prompt.clone(),
         },
         Some("generate-parity") => Command::GenerateParity {
             prompt: prompt.clone(),
@@ -1428,10 +1472,12 @@ fn parse_cli() -> Cli {
         Some(cmd) => {
             eprintln!("unknown command: {cmd}");
             eprintln!(
-                "usage: diffgemma-mps [-p PROMPT] [summary|config|weights <name>|quantize|convert-model|step-smoke|step-probe|step-kv-check|step-verify|step-ci|step-parity|bench-step-kernel|bench-step|bench-prefill|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-monolithic|generate-monolithic-parity|generate-parity|tokenize <text>|gemm|attention]"
+                "usage: diffgemma-mps [-p PROMPT] [--raw] [summary|config|weights <name>|quantize|convert-model|step-smoke|step-probe|step-kv-check|step-verify|step-ci|step-parity|bench-step-kernel|bench-step|bench-prefill|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-monolithic|generate-monolithic-parity|generate-parity|chat|tokenize <text>|gemm|attention]"
             );
             eprintln!("  default (no command): generate-gpu with --features metal (or generate-monolithic with DGQ_MONOLITHIC=1 / --monolithic on .dgq)");
-            eprintln!("  generate-parity: GPU vs checked-in golden (use --compare-cpu for slow CPU path)");
+            eprintln!("  prompts: chat template applied by default; use --raw for bare BPE (-p \"Hello\" -> [9259])");
+            eprintln!("  chat: interactive REPL (monolithic .dgq); optional -p for first user turn");
+            eprintln!("  generate-parity: GPU vs checked-in golden (use --compare-cpu for slow CPU path; use --raw for legacy goldens)");
             eprintln!("  options: ... --golden NAME --write-golden NAME --compare-cpu --no-early-stop");
             eprintln!("  gemm options: --size N (default 512, requires --features metal)");
             eprintln!("  attention: layer 0 GQA parity (requires --features metal)");
@@ -1440,7 +1486,11 @@ fn parse_cli() -> Cli {
         }
     };
 
-    Cli { model_dir, command }
+    Cli {
+        model_dir,
+        command,
+        raw_prompt,
+    }
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -1967,6 +2017,7 @@ fn run_bench_step(
     iters: usize,
     prompt_text: Option<String>,
     seed: u64,
+    raw_prompt: bool,
 ) -> ExitCode {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     {
@@ -1982,7 +2033,14 @@ fn run_bench_step(
         let iters = iters.max(1);
         let vocab = m.config.text_config.vocab_size;
 
-        let prompt = match build_prompt_tokens(model_dir, prompt_text.as_deref(), 64, vocab) {
+        let prompt = match build_prompt_tokens(
+            model_dir,
+            prompt_text.as_deref(),
+            64,
+            vocab,
+            raw_prompt,
+            &[],
+        ) {
             Ok(ids) => ids,
             Err(err) => {
                 eprintln!("error: {err}");
@@ -2442,13 +2500,32 @@ fn run_gemm(size: usize) -> ExitCode {
     }
 }
 
-fn run_tokenize(model_dir: &PathBuf, text: &str) -> ExitCode {
+fn run_tokenize(model_dir: &PathBuf, text: &str, raw_prompt: bool) -> ExitCode {
     let path = model_dir.join("tokenizer.json");
     match tokenizer::Tokenizer::load(&path) {
         Ok(tok) => {
-            let ids = tok.encode(text, false);
+            let (formatted, ids) = if raw_prompt {
+                (text.to_string(), tok.encode(text, false))
+            } else {
+                let turns = [chat_template::ChatTurn::user(text)];
+                let formatted = chat_template::format_user_prompt(text);
+                let ids = match chat_template::format_chat_token_ids(
+                    &tok,
+                    &turns,
+                    &chat_template::ChatFormatOptions::default(),
+                ) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        eprintln!("error: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                (formatted, ids)
+            };
             let payload = serde_json::json!({
                 "text": text,
+                "formatted": formatted,
+                "chat_template": !raw_prompt,
                 "ids": ids,
             });
             println!("{}", serde_json::to_string(&payload).unwrap_or_default());
@@ -2466,11 +2543,23 @@ fn build_prompt_tokens(
     prompt_text: Option<&str>,
     prompt_len: usize,
     vocab: usize,
+    raw_prompt: bool,
+    history: &[chat_template::ChatTurn],
 ) -> Result<Vec<u32>, safetensors::Error> {
     if let Some(text) = prompt_text {
         let tok_path = model_dir.join("tokenizer.json");
         let tokenizer = tokenizer::Tokenizer::load(&tok_path)?;
-        Ok(tokenizer.encode(text, false))
+        if raw_prompt {
+            Ok(tokenizer.encode(text, false))
+        } else {
+            let mut turns = history.to_vec();
+            turns.push(chat_template::ChatTurn::user(text));
+            chat_template::format_chat_token_ids(
+                &tokenizer,
+                &turns,
+                &chat_template::ChatFormatOptions::default(),
+            )
+        }
     } else {
         let mut prompt = vec![0u32; prompt_len];
         for (i, id) in prompt.iter_mut().enumerate() {
@@ -2478,6 +2567,185 @@ fn build_prompt_tokens(
         }
         Ok(prompt)
     }
+}
+
+fn build_chat_prompt_tokens(
+    model_dir: &std::path::Path,
+    history: &[chat_template::ChatTurn],
+    raw_prompt: bool,
+) -> Result<Vec<u32>, safetensors::Error> {
+    let tok_path = model_dir.join("tokenizer.json");
+    let tokenizer = tokenizer::Tokenizer::load(&tok_path)?;
+    if raw_prompt {
+        let text = history
+            .last()
+            .map(|t| t.content.as_str())
+            .unwrap_or("");
+        Ok(tokenizer.encode(text, false))
+    } else {
+        chat_template::format_chat_token_ids(
+            &tokenizer,
+            history,
+            &chat_template::ChatFormatOptions::default(),
+        )
+    }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn run_chat_cmd(
+    model_dir: &std::path::Path,
+    initial_prompt: Option<String>,
+    seed: u64,
+    steps: usize,
+    max_new_tokens: usize,
+    max_layers: Option<usize>,
+    no_early_stop: bool,
+    raw_prompt: bool,
+) -> ExitCode {
+    use metal::{generate_with_session, StepGenerateConfig, StepGenerateSession};
+    use std::io::{self, Write};
+
+    if !dgq::store::looks_like_dgq_dir(model_dir) {
+        eprintln!("error: chat requires a .dgq directory (-m /path/to/quantized-weights)");
+        return ExitCode::FAILURE;
+    }
+
+    let layers = match max_layers {
+        Some(n) => n.max(1).min(30),
+        None => match crate::config::ModelConfig::load(model_dir) {
+            Ok(c) => c.text_config.num_hidden_layers.min(30).max(1),
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+
+    let sampler = sample::sampler_for_steps(steps, no_early_stop);
+    let mut step_cfg = StepGenerateConfig::from_generate(
+        seed,
+        max_new_tokens,
+        512,
+        layers,
+        sampler,
+        no_early_stop,
+    );
+
+    let mut session = match StepGenerateSession::open(model_dir, &step_cfg) {
+        Ok((s, compile)) => {
+            eprintln!("chat: session ready ({compile:.2?}, layers={layers})");
+            s
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let tok_path = model_dir.join("tokenizer.json");
+    let tokenizer = match tokenizer::Tokenizer::load(&tok_path) {
+        Ok(t) => t,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut history: Vec<chat_template::ChatTurn> = Vec::new();
+    let mut turn_idx = 0u64;
+
+    let mut run_turn = |history: &mut Vec<chat_template::ChatTurn>,
+                        turn_idx: &mut u64|
+     -> Result<(), safetensors::Error> {
+        let prompt = build_chat_prompt_tokens(model_dir, history, raw_prompt)?;
+        let prompt_len = prompt.len();
+        step_cfg.max_seq = (prompt_len + max_new_tokens).max(512);
+        step_cfg.seed = seed.wrapping_add(*turn_idx);
+        *turn_idx = turn_idx.wrapping_add(1);
+
+        let started = std::time::Instant::now();
+        let out = generate_with_session(&mut session, &prompt, &step_cfg)?;
+        let elapsed = started.elapsed();
+
+        let new_ids: Vec<u32> = out
+            .token_ids
+            .get(prompt_len..)
+            .unwrap_or(&[])
+            .iter()
+            .copied()
+            .filter(|&id| id != 0)
+            .collect();
+        let reply = chat_template::sanitize_model_reply(&tokenizer.decode(&new_ids));
+        if reply.is_empty() {
+            println!("model> (empty response)");
+        } else {
+            println!("model> {reply}");
+        }
+        let new_tokens = out.token_ids.len().saturating_sub(prompt_len);
+        eprintln!(
+            "  turn: {new_tokens} new tokens, {} denoise steps, {:.2?}",
+            out.denoise_steps_run, elapsed
+        );
+        history.push(chat_template::ChatTurn::model(reply));
+        Ok(())
+    };
+
+    if let Some(first) = initial_prompt {
+        let first = first.trim();
+        if !first.is_empty() {
+            history.push(chat_template::ChatTurn::user(first));
+            if let Err(err) = run_turn(&mut history, &mut turn_idx) {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    eprintln!("chat ready (type 'exit' or 'quit' to end; Ctrl-D also exits)");
+    let stdin = io::stdin();
+    loop {
+        print!("you> ");
+        let _ = io::stdout().flush();
+        let mut line = String::new();
+        match stdin.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line == "exit" || line == "quit" {
+            break;
+        }
+
+        history.push(chat_template::ChatTurn::user(line));
+        if let Err(err) = run_turn(&mut history, &mut turn_idx) {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    ExitCode::SUCCESS
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn run_chat_cmd(
+    _model_dir: &std::path::Path,
+    _initial_prompt: Option<String>,
+    _seed: u64,
+    _steps: usize,
+    _max_new_tokens: usize,
+    _max_layers: Option<usize>,
+    _no_early_stop: bool,
+    _raw_prompt: bool,
+) -> ExitCode {
+    eprintln!("error: chat requires --features metal on macOS");
+    ExitCode::FAILURE
 }
 
 fn print_generate_elapsed(label: &str, elapsed: std::time::Duration) {
@@ -2577,6 +2845,7 @@ fn run_generate_monolithic_cmd(
     no_early_stop: bool,
     engine_fallback: bool,
     write_golden: Option<String>,
+    raw_prompt: bool,
 ) -> ExitCode {
     if !dgq::store::looks_like_dgq_dir(model_dir) {
         eprintln!("error: generate-monolithic requires a .dgq directory (-m /path/to/quantized-weights)");
@@ -2591,6 +2860,7 @@ fn run_generate_monolithic_cmd(
                 max_new_tokens,
                 max_layers,
                 no_early_stop,
+                raw_prompt,
             );
         }
         return ExitCode::FAILURE;
@@ -2603,7 +2873,14 @@ fn run_generate_monolithic_cmd(
             return ExitCode::FAILURE;
         }
     };
-    let prompt = match build_prompt_tokens(model_dir, prompt_text.as_deref(), prompt_len, vocab) {
+    let prompt = match build_prompt_tokens(
+        model_dir,
+        prompt_text.as_deref(),
+        prompt_len,
+        vocab,
+        raw_prompt,
+        &[],
+    ) {
         Ok(ids) => ids,
         Err(err) => {
             eprintln!("error: {err}");
@@ -2669,6 +2946,7 @@ fn run_generate_monolithic_cmd(
                     max_new_tokens,
                     max_layers,
                     no_early_stop,
+                    raw_prompt,
                 );
             }
             ExitCode::FAILURE
@@ -2688,6 +2966,7 @@ fn run_generate_monolithic_parity_cmd(
     no_early_stop: bool,
     golden_name: Option<String>,
     write_golden: Option<String>,
+    raw_prompt: bool,
 ) -> ExitCode {
     use generate_golden::GenerateGolden;
 
@@ -2703,7 +2982,14 @@ fn run_generate_monolithic_parity_cmd(
             return ExitCode::FAILURE;
         }
     };
-    let prompt = match build_prompt_tokens(model_dir, prompt_text.as_deref(), prompt_len, vocab) {
+    let prompt = match build_prompt_tokens(
+        model_dir,
+        prompt_text.as_deref(),
+        prompt_len,
+        vocab,
+        raw_prompt,
+        &[],
+    ) {
         Ok(ids) => ids,
         Err(err) => {
             eprintln!("error: {err}");
@@ -2808,6 +3094,7 @@ fn run_generate_monolithic_parity_cmd(
     _no_early_stop: bool,
     _golden_name: Option<String>,
     _write_golden: Option<String>,
+    _raw_prompt: bool,
 ) -> ExitCode {
     eprintln!("error: generate-monolithic-parity requires --features metal on macOS");
     ExitCode::FAILURE
@@ -2823,6 +3110,7 @@ fn run_generate_engine_fallback(
     max_new_tokens: usize,
     max_layers: Option<usize>,
     no_early_stop: bool,
+    raw_prompt: bool,
 ) -> ExitCode {
     match model::Model::open(model_dir) {
         Ok(m) => run_generate(
@@ -2837,6 +3125,7 @@ fn run_generate_engine_fallback(
             no_early_stop,
             true,
             None,
+            raw_prompt,
         ),
         Err(err) => {
             eprintln!("error: engine fallback failed: {err}");
@@ -2857,6 +3146,7 @@ fn run_generate_monolithic_cmd(
     _no_early_stop: bool,
     _engine_fallback: bool,
     _write_golden: Option<String>,
+    _raw_prompt: bool,
 ) -> ExitCode {
     eprintln!("error: generate-monolithic requires --features metal on macOS");
     ExitCode::FAILURE
@@ -2874,6 +3164,7 @@ fn run_generate(
     no_early_stop: bool,
     use_gpu: bool,
     write_golden: Option<String>,
+    raw_prompt: bool,
 ) -> ExitCode {
     let vocab = m.config.text_config.vocab_size;
     let canvas = m.config.canvas_length;
@@ -2883,6 +3174,8 @@ fn run_generate(
         prompt_text.as_deref(),
         prompt_len,
         vocab,
+        raw_prompt,
+        &[],
     ) {
         Ok(ids) => ids,
         Err(err) => {
@@ -3040,6 +3333,7 @@ fn run_generate_parity(
     golden_name: Option<String>,
     compare_cpu: bool,
     write_golden: Option<String>,
+    raw_prompt: bool,
 ) -> ExitCode {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     {
@@ -3053,6 +3347,8 @@ fn run_generate_parity(
             prompt_text.as_deref(),
             prompt_len,
             vocab,
+            raw_prompt,
+            &[],
         ) {
             Ok(ids) => ids,
             Err(err) => {

@@ -26,6 +26,11 @@ Tests use `transformers.AutoTokenizer` and `tokenizers.Tokenizer` against the lo
 After building the Rust CLI:
 
 ```bash
-cargo run --release -- tokenize "Hello"
-uv run pytest -q tests/test_rust_tokenizer.py
+# Raw BPE (legacy)
+cargo run --release -- tokenize "Hello" --raw
+
+# Chat template (default for generate/chat)
+cargo run --release -- tokenize "Why is the sky blue?"
+
+uv run pytest -q tests/test_rust_tokenizer.py tests/test_chat_template.py
 ```

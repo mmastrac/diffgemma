@@ -25,7 +25,7 @@ jobs:
           if [ -f /tmp/quantized-weights/model.dgq.json ]; then
             DGQ_MPS_Q4=0 cargo run --release --features metal -- \
               -m /tmp/quantized-weights generate-monolithic-parity \
-              -p hello --layers 3 --steps 4 --seed 42 --no-early-stop
+              -p hello --raw --layers 3 --steps 4 --seed 42 --no-early-stop
           else
             echo "skip generate-monolithic-parity (no weights at /tmp/quantized-weights)"
           fi

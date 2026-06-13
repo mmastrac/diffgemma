@@ -7,7 +7,15 @@ use std::path::Path;
 const SPACE_REPLACEMENT: char = '\u{2581}';
 
 #[derive(Debug, serde::Deserialize)]
+struct AddedTokenJson {
+    id: u32,
+    content: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct TokenizerJson {
+    #[serde(default)]
+    added_tokens: Vec<AddedTokenJson>,
     model: BpeModelJson,
 }
 
@@ -33,6 +41,7 @@ struct Symbol {
 #[allow(dead_code)]
 pub struct Tokenizer {
     vocab: HashMap<String, u32>,
+    special_tokens: HashMap<String, u32>,
     id_to_token: Vec<String>,
     merge_ranks: HashMap<(u32, u32), (u32, u32)>,
     byte_fallback: bool,
@@ -49,11 +58,22 @@ impl Tokenizer {
         }
 
         let vocab = parsed.model.vocab;
-        let max_id = vocab.values().copied().max().unwrap_or(0) as usize;
+        let mut special_tokens = HashMap::new();
+        let mut max_id = vocab.values().copied().max().unwrap_or(0);
+        for tok in &parsed.added_tokens {
+            special_tokens.insert(tok.content.clone(), tok.id);
+            max_id = max_id.max(tok.id);
+        }
+        let max_id = max_id as usize;
         let mut id_to_token = vec![String::new(); max_id + 1];
         for (token, &id) in &vocab {
             if id as usize <= max_id {
                 id_to_token[id as usize] = token.clone();
+            }
+        }
+        for tok in &parsed.added_tokens {
+            if tok.id as usize <= max_id {
+                id_to_token[tok.id as usize] = tok.content.clone();
             }
         }
 
@@ -77,6 +97,7 @@ impl Tokenizer {
 
         Ok(Self {
             vocab,
+            special_tokens,
             id_to_token,
             merge_ranks,
             byte_fallback: parsed.model.byte_fallback,
@@ -84,12 +105,28 @@ impl Tokenizer {
         })
     }
 
+    pub fn special_token_id(&self, token: &str) -> Option<u32> {
+        self.special_tokens.get(token).copied()
+    }
+
+    pub fn bos_token_id(&self) -> Option<u32> {
+        self.special_token_id("<bos>")
+    }
+
+    /// Append BPE-encoded text (no added-token splitting).
+    pub fn encode_append(&self, out: &mut Vec<u32>, text: &str) {
+        out.extend(self.encode(text, false));
+    }
+
     pub fn vocab_size(&self) -> usize {
         self.vocab.len()
     }
 
     pub fn token_to_id(&self, token: &str) -> Option<u32> {
-        self.vocab.get(token).copied()
+        self.special_tokens
+            .get(token)
+            .copied()
+            .or_else(|| self.vocab.get(token).copied())
     }
 
     pub fn id_to_token(&self, id: u32) -> Option<&str> {

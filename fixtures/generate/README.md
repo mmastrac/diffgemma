@@ -31,7 +31,9 @@ Forward-only regression limits vs engine (`step-parity`). Use `DGQ_MPS_Q4=0` for
 | `monolithic_parity_layers3_seed42.json` | `step-parity --layers 3 --seed 42` |
 | `monolithic_parity_layers30_seed42.json` | `step-parity --layers 30 --seed 42` |
 | `monolithic_sampler_layers3.json` | `step-verify` sampler goldens (3 seeds × 4 steps) |
-| `monolithic_hello_steps4_layers3.json` | `generate-monolithic-parity -p hello --layers 3 --steps 4 --seed 42 --no-early-stop` (`DGQ_MPS_Q4=0`) |
+| `monolithic_hello_steps4_layers3.json` | `generate-monolithic-parity -p hello --raw --layers 3 --steps 4 --seed 42 --no-early-stop` (`DGQ_MPS_Q4=0`) |
+
+**Prompts:** `-p` uses the Gemma 4 chat template by default (`<bos><|turn>user\n…<turn|>\n<|turn>model\n<|channel>thought\n<channel|>`). Legacy goldens use bare BPE text — pass **`--raw`** for parity/regression commands that match `Hello` / `hello` fixtures.
 
 Refresh after intentional monolithic/kernel changes:
 
@@ -42,7 +44,7 @@ DGQ_MPS_Q4=0 cargo run --release --features metal -- -m /tmp/quantized-weights s
 DGQ_MPS_Q4=0 cargo run --release --features metal -- -m /tmp/quantized-weights step-ci --layers 3
 
 # Golden parity only
-DGQ_MPS_Q4=0 cargo run --release --features metal -- -m /tmp/quantized-weights generate-monolithic-parity -p hello --layers 3 --steps 4 --seed 42 --no-early-stop
+DGQ_MPS_Q4=0 cargo run --release --features metal -- -m /tmp/quantized-weights generate-monolithic-parity -p hello --raw --layers 3 --steps 4 --seed 42 --no-early-stop
 ```
 
 
@@ -53,7 +55,7 @@ cargo run --release --features metal -- generate-gpu -p "Hello" --seed 42 --step
 # .dgq (quantize first if needed)
 cargo run --release --features metal -- quantize -o /tmp/quantized-weights
 cargo run --release --features metal -- -m /tmp/quantized-weights generate-gpu -p "Hello" --seed 42 --steps 1 --layers 3 --write-golden dgq_hello_steps1_layers3
-cargo run --release --features metal -- -m /tmp/quantized-weights generate-parity -p "Hello" --seed 42 --steps 1 --layers 3
+cargo run --release --features metal -- -m /tmp/quantized-weights generate-parity -p "Hello" --raw --seed 42 --steps 1 --layers 3
 ```
 
 Use `--compare-cpu` on `generate-parity` for full CPU vs GPU on the same weights (slow).
