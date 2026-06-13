@@ -20,7 +20,9 @@ const F32_Q4_LINEAR_ENTRY: &str = "f32_q4_linear";
 const F32_Q4_LINEAR_GROUPED_ENTRY: &str = "f32_q4_linear_grouped";
 const F32_Q8_LINEAR_ENTRY: &str = "f32_q8_linear";
 const F32_Q8_LINEAR_KXN_ENTRY: &str = "f32_q8_linear_kxn";
+const F32_NVFP4_LINEAR_ENTRY: &str = "f32_nvfp4_linear";
 const DEQUANT_Q4_MATRIX_ENTRY: &str = "dequant_q4_matrix";
+const DEQUANT_NVFP4_MATRIX_ENTRY: &str = "dequant_nvfp4_matrix";
 
 pub struct GpuDecoderEngine {
     pub ctx: MetalContext,
@@ -30,10 +32,12 @@ pub struct GpuDecoderEngine {
     pub f32_bf16_linear_pipeline: ComputePipeline,
     pub f32_f32_linear_pipeline: ComputePipeline,
     pub f32_q4_linear_pipeline: ComputePipeline,
+    pub f32_nvfp4_linear_pipeline: ComputePipeline,
     pub f32_q4_linear_grouped_pipeline: ComputePipeline,
     pub f32_q8_linear_pipeline: ComputePipeline,
     pub f32_q8_linear_kxn_pipeline: ComputePipeline,
     pub dequant_q4_matrix_pipeline: ComputePipeline,
+    pub dequant_nvfp4_matrix_pipeline: ComputePipeline,
     pub mps_matmul: MpsMatmulCache,
     /// When false, `.dgq` q4 linears use the native Metal kernel instead of MPS (deterministic).
     use_mps_q4: Cell<bool>,
@@ -52,6 +56,8 @@ impl GpuDecoderEngine {
         let f32_bf16_linear_pipeline = ctx.compile_kernel(GEMM_SHADER, F32_BF16_LINEAR_ENTRY)?;
         let f32_f32_linear_pipeline = ctx.compile_kernel(GEMM_SHADER, F32_F32_LINEAR_ENTRY)?;
         let f32_q4_linear_pipeline = ctx.compile_kernel(QGEMM_SHADER, F32_Q4_LINEAR_ENTRY)?;
+        let f32_nvfp4_linear_pipeline =
+            ctx.compile_kernel(QGEMM_SHADER, F32_NVFP4_LINEAR_ENTRY)?;
         let f32_q4_linear_grouped_pipeline =
             ctx.compile_kernel(QGEMM_SHADER, F32_Q4_LINEAR_GROUPED_ENTRY)?;
         let f32_q8_linear_pipeline = ctx.compile_kernel(QGEMM_SHADER, F32_Q8_LINEAR_ENTRY)?;
@@ -59,6 +65,8 @@ impl GpuDecoderEngine {
             ctx.compile_kernel(QGEMM_SHADER, F32_Q8_LINEAR_KXN_ENTRY)?;
         let dequant_q4_matrix_pipeline =
             ctx.compile_kernel(QGEMM_SHADER, DEQUANT_Q4_MATRIX_ENTRY)?;
+        let dequant_nvfp4_matrix_pipeline =
+            ctx.compile_kernel(QGEMM_SHADER, DEQUANT_NVFP4_MATRIX_ENTRY)?;
         let mps_matmul = MpsMatmulCache::new(ctx.device.clone());
         let use_mps_q4 = Cell::new(mps_q4_default_from_env());
         let kernels = GpuKernels::new(&ctx)?;
@@ -72,10 +80,12 @@ impl GpuDecoderEngine {
             f32_bf16_linear_pipeline,
             f32_f32_linear_pipeline,
             f32_q4_linear_pipeline,
+            f32_nvfp4_linear_pipeline,
             f32_q4_linear_grouped_pipeline,
             f32_q8_linear_pipeline,
             f32_q8_linear_kxn_pipeline,
             dequant_q4_matrix_pipeline,
+            dequant_nvfp4_matrix_pipeline,
             mps_matmul,
             use_mps_q4,
             kernels,
@@ -109,13 +119,21 @@ impl GpuDecoderEngine {
             .then(|| self.telemetry_handle())
     }
 
-    /// MPS dense path for `.dgq` q4 linears (dequant scratch + MPSMatrixMultiplication).
-    pub fn q4_mps_pair(
+    /// MPS dense path for `.dgq` block linears (dequant scratch + MPSMatrixMultiplication).
+    pub fn q4_mps_triple(
         &mut self,
         enabled: bool,
-    ) -> Option<(&mut MpsMatmulCache, &ComputePipeline)> {
+    ) -> Option<(
+        &mut MpsMatmulCache,
+        &ComputePipeline,
+        &ComputePipeline,
+    )> {
         if enabled {
-            Some((&mut self.mps_matmul, &self.dequant_q4_matrix_pipeline))
+            Some((
+                &mut self.mps_matmul,
+                &self.dequant_q4_matrix_pipeline,
+                &self.dequant_nvfp4_matrix_pipeline,
+            ))
         } else {
             None
         }

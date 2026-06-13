@@ -129,6 +129,34 @@ pub fn dispatch_dequant_q4_matrix(
     encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
 }
 
+pub fn dispatch_dequant_nvfp4_matrix(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    pipeline: &ComputePipeline,
+    block: &Q4LinearGpu,
+    buf_out: &ProtocolObject<dyn MTLBuffer>,
+) {
+    const THREADGROUP: usize = 16;
+    let (buf_w, off) = block.weight_buffer();
+    encoder.setComputePipelineState(&pipeline.pipeline);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(buf_w), off as usize, 0);
+        encoder.setBuffer_offset_atIndex(Some(buf_out), 0, 1);
+    }
+    let dims = [block.out_dim as u32, block.in_dim as u32];
+    crate::metal::batch::set_bytes(encoder, &dims, 2);
+    let tg = objc2_metal::MTLSize {
+        width: THREADGROUP,
+        height: THREADGROUP,
+        depth: 1,
+    };
+    let grid = objc2_metal::MTLSize {
+        width: (block.in_dim + THREADGROUP - 1) / THREADGROUP,
+        height: (block.out_dim + THREADGROUP - 1) / THREADGROUP,
+        depth: 1,
+    };
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+}
+
 /// Q4 weight dequant → f32 scratch → MPS linear. Requires compute encoder pause/resume on batch.
 pub fn q4_dequant_mps_linear(
     batch: &mut crate::metal::batch::GpuBatch<'_>,
@@ -146,7 +174,11 @@ pub fn q4_dequant_mps_linear(
     let buf_w = batch.alloc_f32_out(n * k)?;
     {
         let enc = batch.encoder();
-        dispatch_dequant_q4_matrix(enc, dequant_pipeline, q4, &buf_w);
+        if q4.is_nvfp4() {
+            dispatch_dequant_nvfp4_matrix(enc, dequant_pipeline, q4, &buf_w);
+        } else {
+            dispatch_dequant_q4_matrix(enc, dequant_pipeline, q4, &buf_w);
+        }
     }
     let buf_c = batch.alloc_f32_out(m * n)?;
     batch.pause_compute_for_mps(|cmd| {

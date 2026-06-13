@@ -49,8 +49,13 @@ fn fused_input_qkv_heads(
         &mut batch,
         &engine.f32_bf16_linear_pipeline,
         &engine.f32_q4_linear_pipeline,
+        &engine.f32_nvfp4_linear_pipeline,
         if use_q4_mps {
-            Some((&mut engine.mps_matmul, &engine.dequant_q4_matrix_pipeline))
+            Some((
+                &mut engine.mps_matmul,
+                &engine.dequant_q4_matrix_pipeline,
+                &engine.dequant_nvfp4_matrix_pipeline,
+            ))
         } else {
             None
         },
@@ -62,8 +67,13 @@ fn fused_input_qkv_heads(
         &mut batch,
         &engine.f32_bf16_linear_pipeline,
         &engine.f32_q4_linear_pipeline,
+        &engine.f32_nvfp4_linear_pipeline,
         if use_q4_mps {
-            Some((&mut engine.mps_matmul, &engine.dequant_q4_matrix_pipeline))
+            Some((
+                &mut engine.mps_matmul,
+                &engine.dequant_q4_matrix_pipeline,
+                &engine.dequant_nvfp4_matrix_pipeline,
+            ))
         } else {
             None
         },
@@ -76,8 +86,13 @@ fn fused_input_qkv_heads(
             &mut batch,
             &engine.f32_bf16_linear_pipeline,
             &engine.f32_q4_linear_pipeline,
+            &engine.f32_nvfp4_linear_pipeline,
             if use_q4_mps {
-                Some((&mut engine.mps_matmul, &engine.dequant_q4_matrix_pipeline))
+                Some((
+                    &mut engine.mps_matmul,
+                    &engine.dequant_q4_matrix_pipeline,
+                    &engine.dequant_nvfp4_matrix_pipeline,
+                ))
             } else {
                 None
             },
@@ -146,7 +161,11 @@ fn fused_gqa_o_proj_gpu_kv(
         telemetry,
     )?;
     let q4_mps = if use_q4_mps {
-        Some((&mut engine.mps_matmul, &engine.dequant_q4_matrix_pipeline))
+        Some((
+            &mut engine.mps_matmul,
+            &engine.dequant_q4_matrix_pipeline,
+            &engine.dequant_nvfp4_matrix_pipeline,
+        ))
     } else {
         None
     };
@@ -167,6 +186,7 @@ fn fused_gqa_o_proj_gpu_kv(
         &mut batch,
         &engine.f32_bf16_linear_pipeline,
         &engine.f32_q4_linear_pipeline,
+        &engine.f32_nvfp4_linear_pipeline,
         q4_mps,
         out,
         &buf_attn,
@@ -296,7 +316,11 @@ pub fn forward_decoder_attention(
         telemetry,
     )?;
         let q4_mps = if use_q4_mps {
-            Some((&mut engine.mps_matmul, &engine.dequant_q4_matrix_pipeline))
+            Some((
+                &mut engine.mps_matmul,
+                &engine.dequant_q4_matrix_pipeline,
+                &engine.dequant_nvfp4_matrix_pipeline,
+            ))
         } else {
             None
         };
@@ -315,6 +339,7 @@ pub fn forward_decoder_attention(
             &mut batch,
             &engine.f32_bf16_linear_pipeline,
             &engine.f32_q4_linear_pipeline,
+            &engine.f32_nvfp4_linear_pipeline,
             q4_mps,
             out,
             &buf_attn,

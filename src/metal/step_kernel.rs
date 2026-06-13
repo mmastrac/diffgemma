@@ -5,7 +5,7 @@ use crate::dgq::DgqStore;
 use crate::metal::batch::set_bytes;
 use crate::metal::device::{ComputePipeline, MetalContext};
 use crate::metal::dgq_gpu::{DgqGpuBlob, Q4LinearGpu};
-use crate::metal::mps_gemm::{dispatch_dequant_q4_matrix, MpsMatmulCache};
+use crate::metal::mps_gemm::{dispatch_dequant_nvfp4_matrix, dispatch_dequant_q4_matrix, MpsMatmulCache};
 use crate::sample::{initialize_canvas, Rng, SamplerConfig};
 use crate::safetensors::Error;
 use objc2::rc::Retained;
@@ -363,9 +363,11 @@ struct StepPipelines {
     rmsnorm: ComputePipeline,
     rmsnorm_f32: ComputePipeline,
     dequant_q4: ComputePipeline,
+    dequant_nvfp4: ComputePipeline,
     half_to_f32: ComputePipeline,
     f32_to_half: ComputePipeline,
     gemm_q4: HashMap<(u32, u32), ComputePipeline>,
+    gemm_nvfp4: HashMap<(u32, u32), ComputePipeline>,
     gemm_q8: HashMap<(u32, u32), ComputePipeline>,
     gemm_q8_rowk: HashMap<(u32, u32), ComputePipeline>,
     qk_rope_kv: ComputePipeline,
@@ -377,6 +379,7 @@ struct StepPipelines {
     bucket_count: ComputePipeline,
     bucket_fill: ComputePipeline,
     moe_grouped: ComputePipeline,
+    moe_grouped_nvfp4: ComputePipeline,
     embed_gather: ComputePipeline,
     logit_rowstats: ComputePipeline,
     sc_probs: ComputePipeline,
@@ -393,6 +396,7 @@ impl StepPipelines {
     fn new(ctx: &MetalContext, library: &ProtocolObject<dyn MTLLibrary>) -> Result<Self, Error> {
         let simple = |e: &str| ctx.compile_kernel_from_library(library, e);
         let mut gemm_q4 = HashMap::new();
+        let mut gemm_nvfp4 = HashMap::new();
         let mut gemm_q8 = HashMap::new();
         let mut gemm_q8_rowk = HashMap::new();
         for &(n, k) in &[
@@ -409,6 +413,10 @@ impl StepPipelines {
             gemm_q4.insert(
                 (n, k),
                 ctx.compile_gemm_kernel(library, "k_gemm_q4", n, k)?,
+            );
+            gemm_nvfp4.insert(
+                (n, k),
+                ctx.compile_gemm_kernel(library, "k_gemm_nvfp4", n, k)?,
             );
         }
         for &(n, k) in &[
@@ -432,9 +440,11 @@ impl StepPipelines {
             rmsnorm: simple("k_rmsnorm")?,
             rmsnorm_f32: simple("k_rmsnorm_f32")?,
             dequant_q4: ctx.compile_kernel(QGEMM_SHADER, "dequant_q4_matrix")?,
+            dequant_nvfp4: ctx.compile_kernel(QGEMM_SHADER, "dequant_nvfp4_matrix")?,
             half_to_f32: simple("k_half_to_f32")?,
             f32_to_half: simple("k_f32_to_half")?,
             gemm_q4,
+            gemm_nvfp4,
             gemm_q8,
             gemm_q8_rowk,
             qk_rope_kv: simple("k_qk_rope_kv")?,
@@ -446,6 +456,7 @@ impl StepPipelines {
             bucket_count: simple("k_bucket_count")?,
             bucket_fill: simple("k_bucket_fill")?,
             moe_grouped: simple("k_moe_grouped")?,
+            moe_grouped_nvfp4: simple("k_moe_grouped_nvfp4")?,
             embed_gather: simple("k_embed_gather")?,
             logit_rowstats: simple("k_logit_rowstats")?,
             sc_probs: simple("k_sc_probs")?,
@@ -463,6 +474,12 @@ impl StepPipelines {
         self.gemm_q4
             .get(&(n, k))
             .ok_or(Error::Format("missing q4 pipeline"))
+    }
+
+    fn nvfp4(&self, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
+        self.gemm_nvfp4
+            .get(&(n, k))
+            .ok_or(Error::Format("missing nvfp4 pipeline"))
     }
 
     fn q8(&self, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
@@ -501,6 +518,7 @@ struct StepEnc<'a> {
     gpu_blob: &'a std::sync::Arc<DgqGpuBlob>,
     mps: &'a mut MpsMatmulCache,
     use_mps_q4: bool,
+    use_nvfp4: bool,
     use_sc_gemm: bool,
 }
 
@@ -690,7 +708,11 @@ impl StepEnc<'_> {
         n: u32,
         k: u32,
     ) -> Result<(), Error> {
-        let ps = self.ps.q4(n, k)?;
+        let ps = if self.use_nvfp4 {
+            self.ps.nvfp4(n, k)?
+        } else {
+            self.ps.q4(n, k)?
+        };
         self.enc.setComputePipelineState(&ps.pipeline);
         unsafe {
             self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), x_off as usize, 0);
@@ -733,9 +755,18 @@ impl StepEnc<'_> {
             w_off,
             n_us,
             k_us,
+            if self.use_nvfp4 {
+                crate::dgq::layout::QuantKind::Nvfp4Block
+            } else {
+                crate::dgq::layout::QuantKind::Q4Block
+            },
         );
         self.half_to_f32_buf(x_off, m_us * k_us);
-        dispatch_dequant_q4_matrix(&self.enc, &self.ps.dequant_q4, &q4, &self.bufs.mps_w);
+        if self.use_nvfp4 {
+            dispatch_dequant_nvfp4_matrix(&self.enc, &self.ps.dequant_nvfp4, &q4, &self.bufs.mps_w);
+        } else {
+            dispatch_dequant_q4_matrix(&self.enc, &self.ps.dequant_q4, &q4, &self.bufs.mps_w);
+        }
         self.pause_for_mps();
         self.mps.encode_f32_linear(
             &self.cmd,
@@ -1139,7 +1170,13 @@ impl StepEnc<'_> {
         self.rmsnorm(A_STREAM, A_MOEIN, l.pre_ff_ln_2, HID as u32, CANVAS);
         self.memzero_bytes(A_MOEOUT, (CANVAS * HID * 4) as u64);
 
-        self.enc.setComputePipelineState(&self.ps.moe_grouped.pipeline);
+        self.enc.setComputePipelineState(
+            if self.use_nvfp4 {
+                &self.ps.moe_grouped_nvfp4.pipeline
+            } else {
+                &self.ps.moe_grouped.pipeline
+            },
+        );
         unsafe {
             self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), A_MOEIN as usize, 0);
             self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), A_MOEOUT as usize, 1);
@@ -1581,6 +1618,7 @@ pub struct StepRuntime {
     gpu_blob: std::sync::Arc<DgqGpuBlob>,
     mps_matmul: MpsMatmulCache,
     use_mps_q4: bool,
+    use_nvfp4: bool,
     use_sc_gemm: bool,
     layout: ModelLayout,
     pub layers: usize,
@@ -1704,6 +1742,7 @@ impl StepRuntime {
             gpu_blob: &self.gpu_blob,
             mps: &mut self.mps_matmul,
             use_mps_q4: self.use_mps_q4,
+            use_nvfp4: self.use_nvfp4,
             use_sc_gemm: self.use_sc_gemm,
         };
         f(&mut enc)?;
@@ -1820,6 +1859,11 @@ pub fn build_step_runtime(
     let layout = build_layout(&offsets, cfg.max_seq);
     let layers = cfg.layers.min(validated.num_layers).max(1);
 
+    let use_nvfp4 = store.profile() == crate::dgq::layout::QuantProfile::Nvfp4;
+    if use_nvfp4 {
+        eprintln!("step-kernel: nvfp4 block weights");
+    }
+
     let ctx = MetalContext::new()?;
     let compile_started = Instant::now();
     let pipelines = shared_step_pipelines(&ctx)?;
@@ -1917,6 +1961,7 @@ pub fn build_step_runtime(
             gpu_blob,
             mps_matmul,
             use_mps_q4: cfg.use_mps_q4.unwrap_or_else(step_use_mps_q4_from_env),
+            use_nvfp4,
             use_sc_gemm: step_use_sc_gemm_from_env(),
             layout,
             layers,

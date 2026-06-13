@@ -67,7 +67,7 @@ pub fn prefill_gpu(
     let prefill_started = std::time::Instant::now();
     if progress_enabled() {
         eprintln!(
-            "generate-gpu: encoder prefill starting ({n_layers} layers, {seq_len} tokens)..."
+            "encoder: prefill starting ({n_layers} layers, {seq_len} tokens)..."
         );
     }
     let mut use_a_input = true;
@@ -123,7 +123,7 @@ pub fn prefill_gpu(
             && (layer == 0 || layer + 1 == n_layers || (layer + 1) % 5 == 0)
         {
             eprintln!(
-                "generate-gpu: prefill layer {}/{} ({layer_elapsed:.2?}, cumulative {cum:.2?})",
+                "encoder: prefill layer {}/{} ({layer_elapsed:.2?}, cumulative {cum:.2?})",
                 layer + 1,
                 n_layers,
                 layer_elapsed = layer_started.elapsed(),
@@ -135,7 +135,7 @@ pub fn prefill_gpu(
 
     if progress_enabled() {
         eprintln!(
-            "generate-gpu: encoder prefill done ({:.2?}, kv_len={seq_len})",
+            "encoder: prefill done ({:.2?}, kv_len={seq_len})",
             prefill_started.elapsed()
         );
     }

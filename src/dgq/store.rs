@@ -1,7 +1,7 @@
 //! Mmap-backed `.dgq` weight store.
 
 use crate::dgq::dequant::dequant_to_f32;
-use crate::dgq::layout::{DgqManifest, QuantKind, BLOB_FILE, DGQ_VERSION, MANIFEST_FILE};
+use crate::dgq::layout::{dgq_version_supported, parse_quant_kind, DgqManifest, QuantKind, BLOB_FILE, MANIFEST_FILE};
 use crate::safetensors::{DType, Error};
 use crate::tensor::TensorView;
 use memmap2::Mmap;
@@ -22,7 +22,7 @@ impl DgqStore {
         let manifest_path = model_dir.join(MANIFEST_FILE);
         let manifest_json = std::fs::read_to_string(&manifest_path)?;
         let manifest: DgqManifest = serde_json::from_str(&manifest_json)?;
-        if manifest.version != DGQ_VERSION {
+        if !dgq_version_supported(manifest.version) {
             return Err(Error::Format("unsupported .dgq version"));
         }
         let blob_path = model_dir.join(&manifest.blob_file);
@@ -78,7 +78,7 @@ impl DgqStore {
         let entry = self
             .get_entry(name)
             .ok_or_else(|| Error::NotFound(name.to_string()))?;
-        let kind = parse_kind(&entry.meta.kind)?;
+        let kind = parse_quant_kind(&entry.meta.kind)?;
         let src = self.tensor_bytes(name)?;
         let numel: usize = entry.meta.shape.iter().product::<i64>() as usize;
         let mut out = vec![0.0f32; numel];
@@ -91,7 +91,7 @@ impl DgqStore {
         let entry = self
             .get_entry(name)
             .ok_or_else(|| Error::NotFound(name.to_string()))?;
-        let kind = parse_kind(&entry.meta.kind)?;
+        let kind = parse_quant_kind(&entry.meta.kind)?;
         if kind != QuantKind::Raw {
             return Err(Error::Format("dgq tensor is quantized; use tensor_f32"));
         }
@@ -144,16 +144,6 @@ impl DgqStore {
         }
     }
 }
-
-fn parse_kind(s: &str) -> Result<QuantKind, Error> {
-    match s {
-        "q4_block" => Ok(QuantKind::Q4Block),
-        "q8_row" => Ok(QuantKind::Q8Row),
-        "raw" => Ok(QuantKind::Raw),
-        _ => Err(Error::Format("unknown dgq tensor kind")),
-    }
-}
-
 pub fn looks_like_dgq_dir(path: &Path) -> bool {
     path.join(MANIFEST_FILE).is_file()
 }

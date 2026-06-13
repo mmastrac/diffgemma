@@ -1,17 +1,37 @@
 //! On-disk layout for `.dgq` quantized weights.
 
+use crate::safetensors::Error;
 use serde::{Deserialize, Serialize};
 
 pub const MANIFEST_FILE: &str = "model.dgq.json";
 pub const BLOB_FILE: &str = "model.dgq.bin";
-pub const DGQ_VERSION: u32 = 1;
+/// Version 1: affine Q4 (`q4_block`). Version 2: adds NVFP4 (`nvfp4_block`).
+pub const DGQ_VERSION_AFFINE: u32 = 1;
+pub const DGQ_VERSION_NVFP4: u32 = 2;
+
+pub fn dgq_version_for_profile(profile: QuantProfile) -> u32 {
+    match profile {
+        QuantProfile::Nvfp4 => DGQ_VERSION_NVFP4,
+        QuantProfile::Q4 | QuantProfile::Q5 => DGQ_VERSION_AFFINE,
+    }
+}
+
+pub fn dgq_version_supported(version: u32) -> bool {
+    version == DGQ_VERSION_AFFINE || version == DGQ_VERSION_NVFP4
+}
+/// Affine int4 group size (legacy `q4_block`).
 pub const GROUP_SIZE: usize = 32;
+/// NVFP4 micro-block size (MLX / NVIDIA nvfp4).
+pub const NVFP4_GROUP_SIZE: usize = 16;
+/// Per-tensor FP32 global scale prefix on `nvfp4_block` payloads (1.0 for 2-tier MLX quant).
+pub const NVFP4_HEADER_BYTES: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuantProfile {
     Q4,
     Q5,
+    Nvfp4,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +39,8 @@ pub enum QuantProfile {
 pub enum QuantKind {
     /// Affine int4 blocks along K (Q4_1-style: fp16 scale + fp16 min + nibbles).
     Q4Block,
+    /// NVFP4 blocks: E2M1 nibbles + FP8 E4M3 scale per 16 weights (MLX-compatible 2-tier).
+    Nvfp4Block,
     /// Per-row int8 + fp16 scale (embed / self-conditioning).
     Q8Row,
     /// Byte-identical bf16/f16/f32 payload.
@@ -29,9 +51,20 @@ impl QuantKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Q4Block => "q4_block",
+            Self::Nvfp4Block => "nvfp4_block",
             Self::Q8Row => "q8_row",
             Self::Raw => "raw",
         }
+    }
+}
+
+pub fn parse_quant_kind(s: &str) -> Result<QuantKind, Error> {
+    match s {
+        "q4_block" => Ok(QuantKind::Q4Block),
+        "nvfp4_block" => Ok(QuantKind::Nvfp4Block),
+        "q8_row" => Ok(QuantKind::Q8Row),
+        "raw" => Ok(QuantKind::Raw),
+        _ => Err(Error::Format("unknown dgq tensor kind")),
     }
 }
 
@@ -76,6 +109,24 @@ pub fn q4_matrix_bytes(out_dim: usize, in_dim: usize) -> usize {
     out_dim * q4_row_bytes(in_dim)
 }
 
+/// Packed E2M1 nibbles per row (2 codes per byte, low nibble first).
+pub fn nvfp4_data_row_bytes(in_dim: usize) -> usize {
+    in_dim.div_ceil(2)
+}
+
+/// FP8 E4M3 block scales per row (one byte per 16 weights along K).
+pub fn nvfp4_scales_row_bytes(in_dim: usize) -> usize {
+    in_dim.div_ceil(NVFP4_GROUP_SIZE)
+}
+
+pub fn nvfp4_row_bytes(in_dim: usize) -> usize {
+    nvfp4_data_row_bytes(in_dim) + nvfp4_scales_row_bytes(in_dim)
+}
+
+pub fn nvfp4_matrix_bytes(out_dim: usize, in_dim: usize) -> usize {
+    NVFP4_HEADER_BYTES + out_dim * nvfp4_row_bytes(in_dim)
+}
+
 pub fn q8_row_bytes(in_dim: usize) -> usize {
     2 + in_dim // fp16 scale + int8 weights
 }
@@ -95,12 +146,16 @@ pub fn classify_tensor(name: &str, shape: &[i64], profile: QuantProfile) -> Quan
     if name.contains("embed_tokens") || name.contains("self_conditioning") {
         return QuantKind::Q8Row;
     }
-    if name.contains(".experts.") && shape.len() == 3 {
-        return QuantKind::Q4Block;
-    }
     if shape.len() == 2 && is_gemm_linear(name) {
         return match profile {
             QuantProfile::Q4 | QuantProfile::Q5 => QuantKind::Q4Block,
+            QuantProfile::Nvfp4 => QuantKind::Nvfp4Block,
+        };
+    }
+    if name.contains(".experts.") && shape.len() == 3 {
+        return match profile {
+            QuantProfile::Q4 | QuantProfile::Q5 => QuantKind::Q4Block,
+            QuantProfile::Nvfp4 => QuantKind::Nvfp4Block,
         };
     }
     QuantKind::Raw
@@ -126,6 +181,14 @@ mod tests {
 
     #[test]
     fn classify_experts_and_router() {
+        assert_eq!(
+            classify_tensor(
+                "model.decoder.layers.0.experts.gate_up_proj",
+                &[128, 352, 2816],
+                QuantProfile::Nvfp4,
+            ),
+            QuantKind::Nvfp4Block,
+        );
         assert_eq!(
             classify_tensor(
                 "model.decoder.layers.0.experts.gate_up_proj",

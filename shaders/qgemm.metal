@@ -212,3 +212,107 @@ kernel void f32_q8_linear_kxn(
     }
     c[row * n + col] = sum;
 }
+
+inline float fp16_bits_to_f32(ushort bits) {
+    uint sign = (bits >> 15) & 1u;
+    uint exp = (bits >> 10) & 0x1fu;
+    uint mant = bits & 0x3ffu;
+    if (exp == 0u) {
+        if (mant == 0u) {
+            return sign ? -0.0f : 0.0f;
+        }
+        return (sign ? -1.0f : 1.0f) * float(mant) * exp2(-24.0f);
+    }
+    if (exp == 0x1fu) {
+        if (mant == 0u) {
+            return sign ? -INFINITY : INFINITY;
+        }
+        return NAN;
+    }
+    uint f32_bits = (sign << 31) | ((exp + 112u) << 23) | (mant << 13);
+    return as_type<float>(f32_bits);
+}
+
+inline float fp8_e4m3_to_f32(uchar b) {
+    ushort v = ushort(b & 127u) << 7;
+    float converted = fp16_bits_to_f32(v) * 256.0f;
+    return (b & 128u) ? -converted : converted;
+}
+
+inline float e2m1_to_f32(uint q) {
+    float mag = 0.0f;
+    switch (q & 7u) {
+        case 1: mag = 0.5f; break;
+        case 2: mag = 1.0f; break;
+        case 3: mag = 1.5f; break;
+        case 4: mag = 2.0f; break;
+        case 5: mag = 3.0f; break;
+        case 6: mag = 4.0f; break;
+        case 7: mag = 6.0f; break;
+        default: mag = 0.0f; break;
+    }
+    return (q & 8u) ? -mag : mag;
+}
+
+inline uint nvfp4_data_row_bytes(uint in_dim) { return (in_dim + 1u) / 2u; }
+inline uint nvfp4_scales_row_bytes(uint in_dim) { return (in_dim + 15u) / 16u; }
+inline uint nvfp4_row_bytes(uint in_dim) {
+    return nvfp4_data_row_bytes(in_dim) + nvfp4_scales_row_bytes(in_dim);
+}
+
+inline float nvfp4_weight_at(
+    device const uchar *base,
+    uint row,
+    uint col,
+    uint in_dim
+) {
+    float gscale = as_type<float>(*(device const uint *)(base));
+    uint data_len = nvfp4_data_row_bytes(in_dim);
+    uint row_stride = nvfp4_row_bytes(in_dim);
+    device const uchar *row_base = base + 4u + row * row_stride;
+    uint g = col / 16u;
+    float scale = fp8_e4m3_to_f32(row_base[data_len + g]) * gscale;
+    uchar byte = row_base[col / 2u];
+    uint q = (col & 1u) ? uint(byte >> 4) : uint(byte & 0x0fu);
+    return e2m1_to_f32(q) * scale;
+}
+
+kernel void f32_nvfp4_linear(
+    device const float *a [[buffer(0)]],
+    device const uchar *w [[buffer(1)]],
+    device float *c [[buffer(2)]],
+    constant uint3 &dims [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint m = dims.x;
+    uint n = dims.y;
+    uint k_dim = dims.z;
+    uint row = gid.y;
+    uint col = gid.x;
+    if (row >= m || col >= n) {
+        return;
+    }
+    float sum = 0.0f;
+    for (uint p = 0; p < k_dim; p++) {
+        float av = a[row * k_dim + p];
+        float wv = nvfp4_weight_at(w, col, p, k_dim);
+        sum += av * wv;
+    }
+    c[row * n + col] = sum;
+}
+
+kernel void dequant_nvfp4_matrix(
+    device const uchar *nvfp4 [[buffer(0)]],
+    device float *out [[buffer(1)]],
+    constant uint2 &dims [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint n = dims.x;
+    uint k_dim = dims.y;
+    uint row = gid.y;
+    uint col = gid.x;
+    if (row >= n || col >= k_dim) {
+        return;
+    }
+    out[row * k_dim + col] = nvfp4_weight_at(nvfp4, row, col, k_dim);
+}

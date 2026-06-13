@@ -362,6 +362,40 @@ impl<'a> GpuBatch<'a> {
         encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
     }
 
+    pub fn dispatch_nvfp4_linear(
+        &self,
+        pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+        buf_a: &ProtocolObject<dyn MTLBuffer>,
+        buf_w: &ProtocolObject<dyn MTLBuffer>,
+        w_byte_offset: u64,
+        buf_c: &ProtocolObject<dyn MTLBuffer>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        const THREADGROUP: usize = 16;
+        let encoder = self.encoder();
+        encoder.setComputePipelineState(pipeline);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(buf_a), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(buf_w), w_byte_offset as usize, 1);
+            encoder.setBuffer_offset_atIndex(Some(buf_c), 0, 2);
+        }
+        let dims = [m as u32, n as u32, k as u32];
+        crate::metal::batch::set_bytes(encoder, &dims, 3);
+        let tg = MTLSize {
+            width: THREADGROUP,
+            height: THREADGROUP,
+            depth: 1,
+        };
+        let grid = MTLSize {
+            width: div_up(n, THREADGROUP),
+            height: div_up(m, THREADGROUP),
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    }
+
     /// Grouped MoE Q4 GEMM: `total_m` flattened rows, one weight row per job via metadata.
     pub fn dispatch_q4_linear_grouped(
         &self,

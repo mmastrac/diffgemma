@@ -5,7 +5,8 @@ use crate::config::TextConfig;
 use crate::dgq::DgqStore;
 use crate::fast_slice::{bf16_to_f32_into, FastBf16Slice};
 use crate::metal::dgq_gpu::{
-    load_q4_expert_stack, load_q4_linear, load_q8_linear, load_raw_view, DgqGpuBlob,
+    load_block_expert_stack, load_block_linear, load_q4_expert_stack, load_q4_linear,
+    load_q8_linear, load_raw_view, DgqGpuBlob,
     Q4ExpertStackGpu, Q8LinearGpu,
 };
 use crate::metal::self_conditioning::GpuSelfConditioningWeights;
@@ -167,25 +168,25 @@ impl GpuLayerWeightCache {
                 Arc::clone(&blob),
                 &keys.k_norm,
             )?)?,
-            q_proj: GpuLinearWeight::q4(load_q4_linear(
+            q_proj: GpuLinearWeight::q4(load_block_linear(
                 store,
                 Arc::clone(&blob),
                 &keys.q_proj,
             )?),
-            k_proj: GpuLinearWeight::q4(load_q4_linear(
+            k_proj: GpuLinearWeight::q4(load_block_linear(
                 store,
                 Arc::clone(&blob),
                 &keys.k_proj,
             )?),
             v_proj: match &shapes.v_proj {
-                Some(_) => Some(GpuLinearWeight::q4(load_q4_linear(
+                Some(_) => Some(GpuLinearWeight::q4(load_block_linear(
                     store,
                     Arc::clone(&blob),
                     &keys.v_proj,
                 )?)),
                 None => None,
             },
-            o_proj: GpuLinearWeight::q4(load_q4_linear(
+            o_proj: GpuLinearWeight::q4(load_block_linear(
                 store,
                 Arc::clone(&blob),
                 &keys.o_proj,
@@ -220,17 +221,17 @@ impl GpuLayerWeightCache {
                 Arc::clone(&blob),
                 &keys.post_feedforward_layernorm_2,
             )?)?,
-            mlp_gate: GpuLinearWeight::q4(load_q4_linear(
+            mlp_gate: GpuLinearWeight::q4(load_block_linear(
                 store,
                 Arc::clone(&blob),
                 &keys.mlp_gate,
             )?),
-            mlp_up: GpuLinearWeight::q4(load_q4_linear(
+            mlp_up: GpuLinearWeight::q4(load_block_linear(
                 store,
                 Arc::clone(&blob),
                 &keys.mlp_up,
             )?),
-            mlp_down: GpuLinearWeight::q4(load_q4_linear(
+            mlp_down: GpuLinearWeight::q4(load_block_linear(
                 store,
                 Arc::clone(&blob),
                 &keys.mlp_down,
@@ -251,12 +252,12 @@ impl GpuLayerWeightCache {
                 &keys.router_per_expert_scale,
             )?)?,
             layer_scalar: layer_scalar_from_bytes(scalar_src)?,
-            experts_gate_up: Some(load_q4_expert_stack(
+            experts_gate_up: Some(load_block_expert_stack(
                 store,
                 Arc::clone(&blob),
                 &keys.experts_gate_up,
             )?),
-            experts_down: Some(load_q4_expert_stack(
+            experts_down: Some(load_block_expert_stack(
                 store,
                 blob,
                 &keys.experts_down,

@@ -1,15 +1,16 @@
-//! Safetensors → `.dgq` offline quantizer.
+//! Safetensors → `.dgq` offline quantizer (always from raw bf16 weights).
 
 use crate::dgq::block::{quantize_bf16_matrix_q4, quantize_bf16_matrix_q8, quantize_expert_stack_q4};
 use crate::dgq::layout::{
-    align_offset, classify_tensor, DgqManifest, DgqTensorEntry, DgqTensorMeta, QuantKind,
-    QuantProfile, BLOB_FILE, DGQ_VERSION, MANIFEST_FILE,
+    align_offset, classify_tensor, dgq_version_for_profile, DgqManifest, DgqTensorEntry,
+    DgqTensorMeta, QuantKind, QuantProfile, BLOB_FILE, MANIFEST_FILE,
 };
+use crate::dgq::nvfp4::{quantize_bf16_matrix_nvfp4, quantize_expert_stack_nvfp4};
 use crate::safetensors::Error;
 use crate::weights::SafetensorStore;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub struct QuantizeOptions {
     pub source_dir: PathBuf,
@@ -21,6 +22,7 @@ pub struct QuantizeSummary {
     pub tensor_count: usize,
     pub blob_bytes: u64,
     pub q4_tensors: usize,
+    pub nvfp4_tensors: usize,
     pub q8_tensors: usize,
     pub raw_tensors: usize,
 }
@@ -38,10 +40,12 @@ pub fn quantize_model(opts: QuantizeOptions) -> Result<QuantizeSummary, Error> {
     let mut bytes_written = 0u64;
     let mut entries = Vec::with_capacity(store.weight_map.len());
     let mut q4_tensors = 0usize;
+    let mut nvfp4_tensors = 0usize;
     let mut q8_tensors = 0usize;
     let mut raw_tensors = 0usize;
 
-    let names: Vec<String> = store.weight_map.keys().cloned().collect();
+    let mut names: Vec<String> = store.weight_map.keys().cloned().collect();
+    names.sort();
     for (i, name) in names.iter().enumerate() {
         let (shard, info) = store
             .get(name)
@@ -65,6 +69,10 @@ pub fn quantize_model(opts: QuantizeOptions) -> Result<QuantizeSummary, Error> {
             QuantKind::Q4Block => {
                 q4_tensors += 1;
                 write_q4_tensor(&mut blob, src, &info.shape)?
+            }
+            QuantKind::Nvfp4Block => {
+                nvfp4_tensors += 1;
+                write_nvfp4_tensor(&mut blob, src, &info.shape)?
             }
             QuantKind::Q8Row => {
                 q8_tensors += 1;
@@ -97,7 +105,7 @@ pub fn quantize_model(opts: QuantizeOptions) -> Result<QuantizeSummary, Error> {
     blob.flush()?;
 
     let manifest = DgqManifest {
-        version: DGQ_VERSION,
+        version: dgq_version_for_profile(opts.profile),
         profile: opts.profile,
         source_model: opts.source_dir.display().to_string(),
         blob_file: BLOB_FILE.to_string(),
@@ -110,6 +118,7 @@ pub fn quantize_model(opts: QuantizeOptions) -> Result<QuantizeSummary, Error> {
         tensor_count: names.len(),
         blob_bytes: offset,
         q4_tensors,
+        nvfp4_tensors,
         q8_tensors,
         raw_tensors,
     })
@@ -140,6 +149,31 @@ fn write_q4_tensor(out: &mut impl Write, src: &[u8], shape: &[i64]) -> Result<u6
     }
 }
 
+fn write_nvfp4_tensor(out: &mut impl Write, src: &[u8], shape: &[i64]) -> Result<u64, Error> {
+    match shape.len() {
+        2 => {
+            let out_dim = shape[0] as usize;
+            let in_dim = shape[1] as usize;
+            let need = crate::dgq::layout::nvfp4_matrix_bytes(out_dim, in_dim);
+            let mut buf = vec![0u8; need];
+            quantize_bf16_matrix_nvfp4(src, out_dim, in_dim, &mut buf);
+            out.write_all(&buf)?;
+            Ok(need as u64)
+        }
+        3 => {
+            let experts = shape[0] as usize;
+            let out_dim = shape[1] as usize;
+            let in_dim = shape[2] as usize;
+            let need = experts * crate::dgq::layout::nvfp4_matrix_bytes(out_dim, in_dim);
+            let mut buf = vec![0u8; need];
+            quantize_expert_stack_nvfp4(src, experts, out_dim, in_dim, &mut buf)?;
+            out.write_all(&buf)?;
+            Ok(need as u64)
+        }
+        _ => Err(Error::Format("nvfp4 unsupported rank")),
+    }
+}
+
 fn write_q8_tensor(out: &mut impl Write, src: &[u8], shape: &[i64]) -> Result<u64, Error> {
     if shape.len() != 2 {
         return Err(Error::Format("q8 expects rank 2"));
@@ -153,7 +187,7 @@ fn write_q8_tensor(out: &mut impl Write, src: &[u8], shape: &[i64]) -> Result<u6
     Ok(need as u64)
 }
 
-fn copy_sidecar_files(source: &std::path::Path, dest: &std::path::Path) -> Result<(), Error> {
+fn copy_sidecar_files(source: &Path, dest: &Path) -> Result<(), Error> {
     for name in ["config.json", "tokenizer.json", "tokenizer_config.json"] {
         let src = source.join(name);
         if src.is_file() {

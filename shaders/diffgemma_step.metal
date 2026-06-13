@@ -125,6 +125,67 @@ inline void dequant_q4_group(device const uchar* g, thread float* out32) {
     }
 }
 inline ulong q4_row_bytes(uint K) { return ulong(K/32) * 20ul; }
+// nvfp4_block: [f32 global_scale:4] + per row [data:ceil(K/2)][scales:ceil(K/16)]
+inline float fp16_bits_to_f32(ushort bits) {
+    uint sign = (bits >> 15) & 1u;
+    uint exp = (bits >> 10) & 0x1fu;
+    uint mant = bits & 0x3ffu;
+    if (exp == 0u) {
+        if (mant == 0u) {
+            return sign ? -0.0f : 0.0f;
+        }
+        return (sign ? -1.0f : 1.0f) * float(mant) * exp2(-24.0f);
+    }
+    if (exp == 0x1fu) {
+        if (mant == 0u) {
+            return sign ? -INFINITY : INFINITY;
+        }
+        return NAN;
+    }
+    uint f32_bits = (sign << 31) | ((exp + 112u) << 23) | (mant << 13);
+    return as_type<float>(f32_bits);
+}
+inline float fp8_e4m3_to_f32(uchar b) {
+    ushort v = ushort(b & 127u) << 7;
+    float converted = fp16_bits_to_f32(v) * 256.0f;
+    return (b & 128u) ? -converted : converted;
+}
+inline float e2m1_to_f32(uint q) {
+    float mag = 0.f;
+    switch (q & 7u) {
+        case 1: mag = 0.5f; break;
+        case 2: mag = 1.0f; break;
+        case 3: mag = 1.5f; break;
+        case 4: mag = 2.0f; break;
+        case 5: mag = 3.0f; break;
+        case 6: mag = 4.0f; break;
+        case 7: mag = 6.0f; break;
+        default: mag = 0.f; break;
+    }
+    return (q & 8u) ? -mag : mag;
+}
+inline ulong nvfp4_row_bytes(uint K) {
+    return ulong((K + 1u) / 2u + (K + 15u) / 16u);
+}
+inline ulong nvfp4_matrix_bytes(uint out_dim, uint K) {
+    return 4ul + ulong(out_dim) * nvfp4_row_bytes(K);
+}
+inline void dequant_nvfp4_group(device const uchar* row, uint K, uint g,
+                              thread float* out16, float gscale) {
+    uint data_len = (K + 1u) / 2u;
+    float scale = fp8_e4m3_to_f32(row[data_len + g]) * gscale;
+    device const uchar* packed = row + g * 8u;
+    for (uint i = 0; i < 16u; ++i) {
+        uchar byte = packed[i / 2u];
+        uint q = (i & 1u) ? uint(byte >> 4) : uint(byte & 0x0Fu);
+        out16[i] = e2m1_to_f32(q) * scale;
+    }
+}
+inline void dequant_nvfp4_tile(device const uchar* row, uint K, uint k0,
+                               thread float* out32, float gscale) {
+    dequant_nvfp4_group(row, K, k0 / 16u, out32, gscale);
+    dequant_nvfp4_group(row, K, k0 / 16u + 1u, out32 + 16, gscale);
+}
 // q8_row: [scale:2][i8:K]  (audit item 2)
 inline ulong q8_row_bytes(uint K) { return ulong(K) + 2ul; }
 inline float q8_at(device const uchar* row_base, uint col, float s) {
@@ -230,6 +291,60 @@ kernel void k_gemm_q4(device const half* x [[buffer(0)]],
         for (uint r = ltid; r < 32; r += 128) {
             float tmp[32];
             dequant_q4_group(blob + w_off + (ulong)(n0+r)*rowB + (ulong)(k0/32)*20ul, tmp);
+            for (uint kk = 0; kk < 32; ++kk) tw[r][kk] = half(tmp[kk]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint kk = 0; kk < 32; kk += 8) {
+            simdgroup_half8x8 a, b0, b1, b2, b3;
+            simdgroup_load(a,  &tx[8*sgid][kk], 32);
+            simdgroup_load(b0, &tw[0][kk],  32, ulong2(0,0), true);
+            simdgroup_load(b1, &tw[8][kk],  32, ulong2(0,0), true);
+            simdgroup_load(b2, &tw[16][kk], 32, ulong2(0,0), true);
+            simdgroup_load(b3, &tw[24][kk], 32, ulong2(0,0), true);
+            simdgroup_multiply_accumulate(acc0, a, b0, acc0);
+            simdgroup_multiply_accumulate(acc1, a, b1, acc1);
+            simdgroup_multiply_accumulate(acc2, a, b2, acc2);
+            simdgroup_multiply_accumulate(acc3, a, b3, acc3);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    threadgroup float ty[32][32];
+    simdgroup_store(acc0,&ty[8*sgid][0],32); simdgroup_store(acc1,&ty[8*sgid][8],32);
+    simdgroup_store(acc2,&ty[8*sgid][16],32); simdgroup_store(acc3,&ty[8*sgid][24],32);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = ltid; i < 32*32; i += 128) {
+        uint mm = i/32, nn = i%32;
+        if (m0+mm < M && n0+nn < N) y[(ulong)(m0+mm)*N + n0+nn] = half(ty[mm][nn]);
+    }
+}
+
+// ===================== k_gemm_nvfp4: y[M,N] = x[M,K] @ Wnvfp4[N,K]^T =====================
+kernel void k_gemm_nvfp4(device const half* x [[buffer(0)]],
+                         device half* y [[buffer(1)]],
+                         device const uchar* blob [[buffer(2)]],
+                         constant ulong& w_off [[buffer(3)]],
+                         constant uint& M [[buffer(4)]],
+                         uint3 tgid [[threadgroup_position_in_grid]],
+                         uint3 lid [[thread_position_in_threadgroup]],
+                         uint sgid [[simdgroup_index_in_threadgroup]]) {
+    const uint N = GEMM_N, K = GEMM_K;
+    threadgroup half tx[32][32];
+    threadgroup half tw[32][32];
+    uint m0 = tgid.y * 32, n0 = tgid.x * 32;
+    uint ltid = lid.x;
+    simdgroup_float8x8 acc0(0.f), acc1(0.f), acc2(0.f), acc3(0.f);
+    float gscale = as_type<float>(*(device const uint*)(blob + w_off));
+    const ulong body = w_off + 4ul;
+    const ulong rowB = nvfp4_row_bytes(K);
+    for (uint k0 = 0; k0 < K; k0 += 32) {
+        for (uint i = ltid; i < 32*32; i += 128) {
+            uint mm = i/32, kk = i%32;
+            tx[mm][kk] = (m0+mm < M) ? x[(ulong)(m0+mm)*K + k0+kk] : half(0);
+        }
+        for (uint r = ltid; r < 32; r += 128) {
+            float tmp[32];
+            device const uchar* row = blob + body + (ulong)(n0+r)*rowB;
+            dequant_nvfp4_tile(row, K, k0, tmp, gscale);
             for (uint kk = 0; kk < 32; ++kk) tw[r][kk] = half(tmp[kk]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -612,6 +727,61 @@ kernel void k_moe_grouped(device const half* moe_in [[buffer(0)]],
         for (uint k0 = 0; k0 < MOE_FF; k0 += 32) {
             float wd[32];
             dequant_q4_group(drow + (k0/32)*20ul, wd);
+            for (uint i = 0; i < 32; ++i) o += wd[i]*act[k0+i];
+        }
+        atomic_fetch_add_explicit((device atomic_float*)&moe_out[(ulong)tok*HID + d],
+                                  w*o, memory_order_relaxed);
+    }
+}
+
+kernel void k_moe_grouped_nvfp4(device const half* moe_in [[buffer(0)]],
+                                device float* moe_out [[buffer(1)]],
+                                device const uchar* blob [[buffer(2)]],
+                                device const LayerOffsets* L [[buffer(3)]],
+                                device const RouteScratch* R [[buffer(4)]],
+                                uint3 tgid [[threadgroup_position_in_grid]],
+                                uint3 lid [[thread_position_in_threadgroup]],
+                                uint3 tpg [[threads_per_threadgroup]]) {
+    const uint e = tgid.y;
+    const uint ltid = lid.x, tpg_w = tpg.x;
+    const uint end = (e+1 < N_EXPERTS) ? R->offset[e+1] : CANVAS*TOP_K;
+    const uint n_tok = end - R->offset[e];
+    if (tgid.x >= n_tok) return;
+    const uint slot = R->offset[e] + tgid.x;
+    const uint tok = R->token_list[slot];
+    const float w = float(R->weight[tok][R->slot_list[slot]]);
+    device const half* x = moe_in + (ulong)tok * HID;
+    const ulong gu = L->experts_gate_up + (ulong)e * nvfp4_matrix_bytes(1408u, HID);
+    const ulong dn = L->experts_down    + (ulong)e * nvfp4_matrix_bytes(HID, MOE_FF);
+    float gu_scale = as_type<float>(*(device const uint*)(blob + gu));
+    float dn_scale = as_type<float>(*(device const uint*)(blob + dn));
+    const ulong gu_body = gu + 4ul;
+    const ulong dn_body = dn + 4ul;
+    const ulong hid_row = nvfp4_row_bytes(HID);
+    const ulong ff_row = nvfp4_row_bytes(MOE_FF);
+    threadgroup float act[MOE_FF];
+    for (uint r = ltid; r < MOE_FF; r += tpg_w) {
+        float g = 0.f, u = 0.f;
+        device const uchar* grow = blob + gu_body + (ulong)r * hid_row;
+        device const uchar* urow = blob + gu_body + (ulong)(r + MOE_FF) * hid_row;
+        for (uint k0 = 0; k0 < HID; k0 += 32) {
+            float wg[32], wu[32];
+            dequant_nvfp4_tile(grow, HID, k0, wg, gu_scale);
+            dequant_nvfp4_tile(urow, HID, k0, wu, gu_scale);
+            for (uint i = 0; i < 32; ++i) {
+                float xv = float(x[k0+i]);
+                g += wg[i]*xv; u += wu[i]*xv;
+            }
+        }
+        act[r] = gelu_tanh(g) * u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint d = ltid; d < HID; d += tpg_w) {
+        float o = 0.f;
+        device const uchar* drow = blob + dn_body + (ulong)d * ff_row;
+        for (uint k0 = 0; k0 < MOE_FF; k0 += 32) {
+            float wd[32];
+            dequant_nvfp4_tile(drow, MOE_FF, k0, wd, dn_scale);
             for (uint i = 0; i < 32; ++i) o += wd[i]*act[k0+i];
         }
         atomic_fetch_add_explicit((device atomic_float*)&moe_out[(ulong)tok*HID + d],

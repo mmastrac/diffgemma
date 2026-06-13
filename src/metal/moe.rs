@@ -1,9 +1,12 @@
 use crate::config::TextConfig;
 use crate::dgq::block::q4_gemm_cpu;
+use crate::dgq::layout::NVFP4_HEADER_BYTES;
+use crate::dgq::nvfp4::nvfp4_gemm_cpu;
 use crate::kernels::cpu::gelu_pytorch_tanh;
 use crate::metal::batched_kernels::{self as bk};
 use crate::metal::batch::GpuBatch;
 use crate::metal::device::ComputePipeline;
+use crate::metal::dgq_gpu::Q4LinearGpu;
 use crate::metal::kernels::GpuKernels;
 use crate::metal::linear::f32_q4_linear_gpu_bufs;
 use crate::metal::telemetry::ForwardTelemetry;
@@ -56,6 +59,22 @@ struct Q4GroupedJob {
     groups_per_row: u32,
 }
 
+fn block_gemm_cpu(
+    a: &[f32],
+    m: usize,
+    k: usize,
+    w: &Q4LinearGpu,
+    n: usize,
+    out: &mut [f32],
+) {
+    if w.is_nvfp4() {
+        let body = &w.src_slice()[NVFP4_HEADER_BYTES..];
+        nvfp4_gemm_cpu(a, m, k, body, n, w.global_scale_f32(), out);
+    } else {
+        q4_gemm_cpu(a, m, k, w.src_slice(), n, out);
+    }
+}
+
 pub fn experts_forward_gpu_batched(
     out: &mut [f32],
     residual: &[f32],
@@ -74,6 +93,7 @@ pub fn experts_forward_gpu_batched(
     kernels: &GpuKernels,
     bf16_pipeline: &ComputePipeline,
     q4_pipeline: &ComputePipeline,
+    nvfp4_pipeline: &ComputePipeline,
     q4_grouped_pipeline: &ComputePipeline,
     telemetry: Option<Rc<RefCell<ForwardTelemetry>>>,
 ) -> Result<(), Error> {
@@ -163,6 +183,7 @@ pub fn experts_forward_gpu_batched(
             kernels,
             bf16_pipeline,
             q4_pipeline,
+            nvfp4_pipeline,
             telemetry,
         )?;
     }
@@ -384,11 +405,11 @@ pub fn experts_forward_dgq_cpu(
         for (&expert, &weight) in route.indices.iter().zip(route.weights.iter()) {
             let gate_up = expert_cache.expert_gate_up_q4(layer, expert);
             let down = expert_cache.expert_down_q4(layer, expert);
-            q4_gemm_cpu(
+            block_gemm_cpu(
                 x,
                 1,
                 hidden,
-                gate_up.src_slice(),
+                &gate_up,
                 moe_inter * 2,
                 &mut scratch.gate_up,
             );
@@ -397,11 +418,11 @@ pub fn experts_forward_dgq_cpu(
             for i in 0..moe_inter {
                 scratch.gate_act[i] = gate[i] * up[i];
             }
-            q4_gemm_cpu(
+            block_gemm_cpu(
                 &scratch.gate_act,
                 1,
                 moe_inter,
-                down.src_slice(),
+                &down,
                 hidden,
                 &mut scratch.expert_out,
             );
@@ -431,6 +452,7 @@ pub fn experts_forward_gpu_per_job(
     kernels: &GpuKernels,
     bf16_pipeline: &ComputePipeline,
     q4_pipeline: &ComputePipeline,
+    nvfp4_pipeline: &ComputePipeline,
     telemetry: Option<Rc<RefCell<ForwardTelemetry>>>,
 ) -> Result<(), Error> {
     let dgq = expert_cache.is_dgq();
@@ -469,6 +491,7 @@ pub fn experts_forward_gpu_per_job(
             f32_q4_linear_gpu_bufs(
                 &mut batch,
                 q4_pipeline,
+                nvfp4_pipeline,
                 &buf_a,
                 &w,
                 batch_size,
@@ -500,6 +523,7 @@ pub fn experts_forward_gpu_per_job(
             f32_q4_linear_gpu_bufs(
                 &mut batch,
                 q4_pipeline,
+                nvfp4_pipeline,
                 &buf_act,
                 &w,
                 batch_size,

@@ -687,7 +687,7 @@ pub fn generate_monolithic_gpu(
     max_seq: usize,
     prompt_label: &str,
 ) -> Result<GenerateOutput, Error> {
-    use crate::metal::{generate_monolithic, step_use_mps_q4_default, validate_step_model, StepGenerateConfig};
+    use crate::metal::{generate_monolithic, validate_step_model, StepGenerateConfig};
     let validated = validate_step_model(model_dir)?;
     let layers = gen_cfg
         .max_layers
@@ -701,9 +701,9 @@ pub fn generate_monolithic_gpu(
         gen_cfg.sampler.clone(),
         gen_cfg.no_early_stop,
     );
-    // Step + encoder dense Q4 default to MPS (opt out with DGQ_STEP_MPS_Q4=0 / DGQ_MPS_Q4=0).
-    cfg.step_use_mps_q4 = Some(step_use_mps_q4_default());
-    cfg.encoder_use_mps_q4 = Some(encoder_use_mps_q4_for_generate());
+    // MLX-parity path: native monolithic Q4 unless DGQ_STEP_MPS_Q4=1 / DGQ_MPS_Q4=1.
+    cfg.step_use_mps_q4 = Some(monolithic_step_use_mps_q4());
+    cfg.encoder_use_mps_q4 = Some(monolithic_encoder_use_mps_q4());
     if gen_cfg.deterministic
         || std::env::var("DGQ_DETERMINISTIC")
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
@@ -715,11 +715,21 @@ pub fn generate_monolithic_gpu(
     generate_monolithic(model_dir, prompt_token_ids, &cfg, prompt_label)
 }
 
+/// Native monolithic step GEMM by default; opt in with `DGQ_STEP_MPS_Q4=1`.
 #[cfg(all(feature = "metal", target_os = "macos"))]
-fn encoder_use_mps_q4_for_generate() -> bool {
+fn monolithic_step_use_mps_q4() -> bool {
+    match std::env::var("DGQ_STEP_MPS_Q4") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
+/// Native monolithic encoder prefill by default; opt in with `DGQ_MPS_Q4=1`.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn monolithic_encoder_use_mps_q4() -> bool {
     match std::env::var("DGQ_MPS_Q4") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
+        Err(_) => false,
     }
 }
 

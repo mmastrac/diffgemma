@@ -221,8 +221,13 @@ fn forward_layer_ff_dgq_gpu(
         &mut batch,
         &engine.f32_bf16_linear_pipeline,
         &engine.f32_q4_linear_pipeline,
+        &engine.f32_nvfp4_linear_pipeline,
         if use_mps_q4 {
-            Some((&mut engine.mps_matmul, &engine.dequant_q4_matrix_pipeline))
+            Some((
+                &mut engine.mps_matmul,
+                &engine.dequant_q4_matrix_pipeline,
+                &engine.dequant_nvfp4_matrix_pipeline,
+            ))
         } else {
             None
         },
@@ -234,8 +239,13 @@ fn forward_layer_ff_dgq_gpu(
         &mut batch,
         &engine.f32_bf16_linear_pipeline,
         &engine.f32_q4_linear_pipeline,
+        &engine.f32_nvfp4_linear_pipeline,
         if use_mps_q4 {
-            Some((&mut engine.mps_matmul, &engine.dequant_q4_matrix_pipeline))
+            Some((
+                &mut engine.mps_matmul,
+                &engine.dequant_q4_matrix_pipeline,
+                &engine.dequant_nvfp4_matrix_pipeline,
+            ))
         } else {
             None
         },
@@ -250,8 +260,13 @@ fn forward_layer_ff_dgq_gpu(
         &mut batch,
         &engine.f32_bf16_linear_pipeline,
         &engine.f32_q4_linear_pipeline,
+        &engine.f32_nvfp4_linear_pipeline,
         if use_mps_q4 {
-            Some((&mut engine.mps_matmul, &engine.dequant_q4_matrix_pipeline))
+            Some((
+                &mut engine.mps_matmul,
+                &engine.dequant_q4_matrix_pipeline,
+                &engine.dequant_nvfp4_matrix_pipeline,
+            ))
         } else {
             None
         },
@@ -430,6 +445,7 @@ fn forward_layer_ff_bf16(
             &mut batch,
             &engine.f32_bf16_linear_pipeline,
             &engine.f32_q4_linear_pipeline,
+            &engine.f32_nvfp4_linear_pipeline,
             None,
             &buf_normed,
             &cached.mlp_gate,
@@ -439,6 +455,7 @@ fn forward_layer_ff_bf16(
             &mut batch,
             &engine.f32_bf16_linear_pipeline,
             &engine.f32_q4_linear_pipeline,
+            &engine.f32_nvfp4_linear_pipeline,
             None,
             &buf_normed,
             &cached.mlp_up,
@@ -451,6 +468,7 @@ fn forward_layer_ff_bf16(
             &mut batch,
             &engine.f32_bf16_linear_pipeline,
             &engine.f32_q4_linear_pipeline,
+            &engine.f32_nvfp4_linear_pipeline,
             None,
             &buf_gate,
             &cached.mlp_down,
@@ -499,6 +517,7 @@ fn forward_layer_ff_bf16(
         &engine.kernels,
         &engine.f32_bf16_linear_pipeline,
         &engine.f32_q4_linear_pipeline,
+        &engine.f32_nvfp4_linear_pipeline,
         &engine.f32_q4_linear_grouped_pipeline,
         telemetry,
     )?;
@@ -873,6 +892,7 @@ mod determinism_tests {
             &mut batch,
             &ctx.engine.f32_bf16_linear_pipeline,
             &ctx.engine.f32_q4_linear_pipeline,
+            &ctx.engine.f32_nvfp4_linear_pipeline,
             None,
             &buf_normed,
             &cached.mlp_gate,
@@ -883,6 +903,7 @@ mod determinism_tests {
             &mut batch,
             &ctx.engine.f32_bf16_linear_pipeline,
             &ctx.engine.f32_q4_linear_pipeline,
+            &ctx.engine.f32_nvfp4_linear_pipeline,
             None,
             &buf_normed,
             &cached.mlp_up,
@@ -896,6 +917,7 @@ mod determinism_tests {
             &mut batch,
             &ctx.engine.f32_bf16_linear_pipeline,
             &ctx.engine.f32_q4_linear_pipeline,
+            &ctx.engine.f32_nvfp4_linear_pipeline,
             None,
             &buf_gate,
             &cached.mlp_down,

@@ -2,6 +2,7 @@
 
 use crate::dgq::block::{dequant_matrix_q4, dequant_matrix_q8};
 use crate::dgq::layout::{q4_matrix_bytes, q8_matrix_bytes, QuantKind};
+use crate::dgq::nvfp4::dequant_matrix_nvfp4_payload;
 use crate::kernels::cpu::bf16_to_f32;
 use crate::safetensors::Error;
 
@@ -14,6 +15,7 @@ pub fn dequant_to_f32(
 ) -> Result<(), Error> {
     match kind {
         QuantKind::Q4Block => dequant_q4_tensor(src, shape, dst),
+        QuantKind::Nvfp4Block => dequant_nvfp4_tensor(src, shape, dst),
         QuantKind::Q8Row => dequant_q8_tensor(src, shape, dst),
         QuantKind::Raw => dequant_raw_tensor(src, shape, dst),
     }
@@ -49,6 +51,36 @@ fn dequant_q4_tensor(src: &[u8], shape: &[i64], dst: &mut [f32]) -> Result<(), E
             Ok(())
         }
         _ => Err(Error::Format("q4 unsupported rank")),
+    }
+}
+
+fn dequant_nvfp4_tensor(src: &[u8], shape: &[i64], dst: &mut [f32]) -> Result<(), Error> {
+    match shape.len() {
+        2 => {
+            let out = shape[0] as usize;
+            let inp = shape[1] as usize;
+            dequant_matrix_nvfp4_payload(src, out, inp, dst)?;
+            Ok(())
+        }
+        3 => {
+            let experts = shape[0] as usize;
+            let out = shape[1] as usize;
+            let inp = shape[2] as usize;
+            let per = crate::dgq::layout::nvfp4_matrix_bytes(out, inp);
+            if src.len() != experts * per || dst.len() != experts * out * inp {
+                return Err(Error::Format("nvfp4 expert shape/size mismatch"));
+            }
+            for e in 0..experts {
+                dequant_matrix_nvfp4_payload(
+                    &src[e * per..(e + 1) * per],
+                    out,
+                    inp,
+                    &mut dst[e * out * inp..(e + 1) * out * inp],
+                )?;
+            }
+            Ok(())
+        }
+        _ => Err(Error::Format("nvfp4 unsupported rank")),
     }
 }
 

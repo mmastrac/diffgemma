@@ -29,6 +29,7 @@ pub fn spot_check(
             .ok_or_else(|| Error::NotFound(name.to_string()))?;
         let kind = match entry.meta.kind.as_str() {
             "q4_block" => QuantKind::Q4Block,
+            "nvfp4_block" => QuantKind::Nvfp4Block,
             "q8_row" => QuantKind::Q8Row,
             "raw" => QuantKind::Raw,
             _ => return Err(Error::Format("unknown kind")),
@@ -145,6 +146,7 @@ mod tests {
             );
             match r.kind {
                 QuantKind::Q4Block => assert!(r.max_abs_err < 0.2, "q4 {}", r.name),
+                QuantKind::Nvfp4Block => assert!(r.max_abs_err < 0.35, "nvfp4 {}", r.name),
                 QuantKind::Q8Row => assert!(r.max_abs_err < 0.05, "q8 {}", r.name),
                 QuantKind::Raw => assert!(r.max_abs_err < 1e-5, "raw {}", r.name),
             }
@@ -157,5 +159,32 @@ mod tests {
             embed.name, embed.kind, embed.max_abs_err, embed.mean_abs_err
         );
         assert!(embed.max_abs_err < 0.05);
+    }
+
+    #[test]
+    fn spot_check_nvfp4_weights() {
+        let src = std::path::Path::new("model/transformer");
+        let dgq = std::path::Path::new("/tmp/nvfp4-weights");
+        if !dgq.join("model.dgq.json").exists() || !src.exists() {
+            eprintln!("skip: model or /tmp/nvfp4-weights missing");
+            return;
+        }
+
+        let tensors = [
+            "model.decoder.layers.0.self_attn.q_proj.weight",
+            "model.decoder.layers.0.mlp.gate_proj.weight",
+            "model.decoder.layers.0.experts.gate_up_proj",
+        ];
+        let results = spot_check(src, dgq, &tensors).expect("spot-check");
+        for r in &results {
+            eprintln!(
+                "  {} {:?}: max={:.6} mean={:.6} (n={})",
+                r.name, r.kind, r.max_abs_err, r.mean_abs_err, r.samples
+            );
+            match r.kind {
+                QuantKind::Nvfp4Block => assert!(r.max_abs_err < 0.35, "nvfp4 {}", r.name),
+                _ => panic!("expected nvfp4"),
+            }
+        }
     }
 }
