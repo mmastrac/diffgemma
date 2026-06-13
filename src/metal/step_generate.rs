@@ -155,6 +155,7 @@ pub fn generate_with_session(
         let mut block_step_count = 0u32;
         let mut accept_hist = Vec::new();
         let mut min_entropy_hist = Vec::new();
+        let mut low_ent_hist = Vec::new();
         loop {
             let step_started = Instant::now();
             rt.run_denoise_step()?;
@@ -171,6 +172,7 @@ pub fn generate_with_session(
             let stats = step_entropy_stats(&st.entropy, &st.accept);
             accept_hist.push(stats.accept_count);
             min_entropy_hist.push(stats.min_entropy);
+            low_ent_hist.push(stats.low_entropy_positions);
             if st.stop_flag != 0 {
                 break;
             }
@@ -188,12 +190,24 @@ pub fn generate_with_session(
             .get(late..)
             .and_then(|s| s.iter().copied().reduce(f32::min))
             .unwrap_or(f32::NAN);
+        let late_low_ent = low_ent_hist
+            .get(late..)
+            .and_then(|s| s.iter().copied().reduce(u32::max))
+            .unwrap_or(0);
         eprintln!(
-            "step-generate: block {} steps_eff={block_step_count} accept/step={accept_hist:?} min_ent/step={min_entropy_hist:?}",
+            "step-generate: block {} steps_eff={block_step_count} accept/step={accept_hist:?}",
             blocks_committed + 1
         );
         eprintln!(
-            "step-generate: block {} late-window (last 8 steps): accept_sum={late_accept} min_ent={late_min_ent:.4} (expect accept/step~15-20 when min_ent << 0.1)",
+            "step-generate: block {} min_ent/step={min_entropy_hist:?}",
+            blocks_committed + 1
+        );
+        eprintln!(
+            "step-generate: block {} low_ent(<0.1)/step={low_ent_hist:?}",
+            blocks_committed + 1
+        );
+        eprintln!(
+            "step-generate: block {} late-window (last 8 steps): accept_sum={late_accept} min_ent={late_min_ent:.4} max_low_ent={late_low_ent} (need low_ent~15-20 for accept~15-20)",
             blocks_committed + 1
         );
 

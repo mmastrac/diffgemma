@@ -184,8 +184,9 @@ The first `diffgemma_step.metal` draft had silent-garbage bugs caught only by au
 
 | ID | Issue | Lives in PLAN as |
 |----|-------|------------------|
-| STOP-1 | Early stop fires on degenerate all-pad/filler stable argmax | P1.1 |
-| QUAL-1 | Templated chat + default --steps 2 -> no readable reply | P1.1/P1.2 |
+| STOP-1 | Early stop fires on degenerate all-pad/filler stable argmax | done (P1.1) |
+| CONV-1 | ~1 accept/step; min_ent > 0.1 early, only ~5 positions H<0.1 late @ 30L q4 | P1.6 |
+| QUAL-1 | Templated chat + default --steps 2 -> no readable reply | done (P1.2) |
 | CLI-1 | `--steps` default 2 (parity) vs model-card up to 48 | P1.2 |
 | CHAT-1 | Display decodes full 256 block incl. pads | P1.4 |
 | SC-1 | `k_sc_softembed` O(vocab x hidden)/step | P2.3 |

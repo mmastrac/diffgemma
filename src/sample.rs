@@ -183,9 +183,18 @@ pub fn mean_entropy(entropies: &[f32]) -> f32 {
 #[derive(Debug, Clone, Copy)]
 pub struct StepEntropyStats {
     pub accept_count: u32,
+    /// Positions with H < 0.1 nats (same scale as `entropy_bound`).
+    pub low_entropy_positions: u32,
     pub min_entropy: f32,
     pub mean_entropy: f32,
     pub max_entropy: f32,
+}
+
+pub fn count_low_entropy_positions(entropies: &[f32], threshold: f32) -> u32 {
+    entropies
+        .iter()
+        .filter(|&&e| e < threshold)
+        .count() as u32
 }
 
 pub fn step_entropy_stats(entropies: &[f32], accept: &[u32]) -> StepEntropyStats {
@@ -195,6 +204,7 @@ pub fn step_entropy_stats(entropies: &[f32], accept: &[u32]) -> StepEntropyStats
     });
     StepEntropyStats {
         accept_count,
+        low_entropy_positions: count_low_entropy_positions(entropies, 0.1),
         min_entropy: if entropies.is_empty() {
             0.0
         } else {

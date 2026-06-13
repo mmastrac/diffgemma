@@ -15,7 +15,24 @@ End-to-end generation works on GPU through **two** engines that share weights, t
 
 The monolithic path is the production target.
 
-**Honest status (post-P1.1–P1.5):** Infrastructure for readable chat is in place (defaults, stop logic, telemetry, CI quality gate), but **`generate-monolithic -p "Hello"` @ 30L q4 still emits gibberish.** Measured on hardware: ~1 accept/step (expect ~15–20), min position entropy ~0.1+ nats, 48 steps without early stop, ~4.7 s/step denoise. Root cause is **canvas convergence**, not early-stop misfire. Likely areas: KV prefill pack, half-precision sampler stats over 262K vocab, or q4 forward quality — see open P1.6+.
+**Honest status (post-P1.1–P1.5):** Infrastructure for readable chat is in place, but **`generate-monolithic -p "Hello"` @ 30L q4 still emits gibberish** after 48 steps (~320 s). Telemetry (seed 42) shows the accept rule is working as designed — the model rarely produces enough low-entropy positions per step.
+
+### P1.6 telemetry findings (2026-06, seed 42, templated "Hello")
+
+| Run | min_ent (early → late) | accept/step (late) | Output |
+|-----|------------------------|--------------------|--------|
+| **30L**, kv=14 | 0.87 → **0.008** by step 46 | 1–2 for steps 1–27; ramps to **5** at step 48 | Gibberish |
+| **3L**, kv=14 | **~9.6–10.0** entire run | **1** every step | Mask/filler tokens |
+
+Interpretation:
+
+- **`min_ent` is the bottleneck**, not the accept implementation. With `entropy_bound=0.1`, a second accept requires the lowest-entropy position to have H ≤ 0.1 nats. Early steps (high temperature + random canvas) correctly get ~1 accept.
+- **30L eventually sharpens** (min_ent < 0.1 after ~step 28), but even then only **~5 positions** have H < 0.1 simultaneously — far below the ~15–20 needed for fast canvas fill. Late-window accept_sum=26 over 8 steps.
+- **3L + prompt KV is dead** (min_ent ≈ uniform ≈ 10 nats). Parity goldens use **kv_len=0**; chat always prefills kv≈14. Do not judge chat quality at 3L.
+- **`step-kv-check` passes** @ kv=64, 3L — KV pack is not totally zeroed, but 3L cannot use prompt context effectively.
+- **Prefill ~100 s** is cold reload per call (P1.8), not intrinsic 14-token cost.
+
+**Next P1.6 experiments:** `low_ent(<0.1)/step` histogram (landed); `--steps 96`; q5 profile; f32 rowstats; HF/Python accept count on same logits; engine vs monolithic @ 30L text compare.
 
 ### Target
 
@@ -91,8 +108,8 @@ Buffer ABI in `diffgemma_step.metal` (version-bump to change).
 | P1.3 | `steps_eff` + accept/step telemetry | **done** | Visible in generate output |
 | P1.4 | Decode hygiene (display only) | **done** | Chat preview strips pad/filler |
 | P1.5 | Templated-chat quality gate (`step-ci`) | **done** | CI fails pad-heavy regression |
-| P1.6 | **Canvas convergence** — ~1 accept/step observed vs ~15–20 expected; gibberish templated output @ 30L q4. Diagnose: per-step min/mean entropy, KV prefill audit (`step-kv-check`), CPU-vs-GPU accept on same logits, half vs f32 rowstats. | **open** | accept/step median >= 8 late-block; readable Hello @ 30L |
-| P1.7 | **HF accept parity test** — unit + optional fixture lock accept counts on synthetic entropies; confirm Metal `k_sample_commit` matches `sample.rs`. | **open** | Golden accept counts on fixed entropy vectors |
+| P1.6 | **Canvas convergence** — see telemetry findings above. Open: raise simultaneous low-H positions (forward/quant/KV/SC) or validate HF parity on same weights. | **open** | `low_ent` ≥ 15 late-block OR readable Hello @ 30L |
+| P1.7 | HF accept parity (unit + `sampler_accept_entropy.json`) | **done** | Fixture tests pass; Metal uses equivalent prefix rule |
 | P1.8 | **Prefill session reuse** — `prefill_monolithic_kv` reloads model+engine each call (~100 s for 14 tokens). Reuse `StepGenerateSession` weights/engine for prefill/extend. | **open** | Prefill << denoise for short prompts |
 
 **P1 exit (unchanged):** `generate-monolithic -p "Hello"` default flags → coherent reply.
@@ -121,7 +138,8 @@ Unchanged — multi-block extend, kv>0 parity, MoE determinism docs, 24 GiB budg
 ## Execution order
 
 ```
-P1.6/P1.7 (convergence)  -->  P1.8 (prefill)  -->  P2  -->  P3
+P1.6 (convergence)  -->  P1.8 (prefill)  -->  P2  -->  P3
+     P1.7 done
 ```
 
 **Critical path to interactive:** P1.6 → P1.8 → P2.1 → P2.2.
