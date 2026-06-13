@@ -205,6 +205,10 @@ impl MonolithicEncoderCache {
         Self::open_opt(model_dir, canvas, max_seq_hint, None, None)
     }
 
+    pub fn use_mps_q4(&self) -> bool {
+        self.engine.use_mps_q4()
+    }
+
     pub fn open_opt(
         model_dir: &Path,
         canvas: usize,

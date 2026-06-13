@@ -526,7 +526,7 @@ pub fn generate_monolithic_gpu(
     gen_cfg: &GenerateConfig,
     max_seq: usize,
 ) -> Result<GenerateOutput, Error> {
-    use crate::metal::{generate_monolithic, validate_step_model, StepGenerateConfig};
+    use crate::metal::{generate_monolithic, step_use_mps_q4_default, validate_step_model, StepGenerateConfig};
     let validated = validate_step_model(model_dir)?;
     let layers = gen_cfg
         .max_layers
@@ -540,14 +540,28 @@ pub fn generate_monolithic_gpu(
         gen_cfg.sampler.clone(),
         gen_cfg.no_early_stop,
     );
+    // Step kernel: native Q4 unless `DGQ_STEP_MPS_Q4=1` (MPS path corrupts logits today).
+    cfg.step_use_mps_q4 = Some(step_use_mps_q4_default());
+    // Encoder: native Q4 by default for generate (MPS prefill KV + step attention still
+    // yields flat logits). Opt into MPS encoder with `DGQ_MPS_Q4=1` for perf experiments.
+    cfg.encoder_use_mps_q4 = Some(encoder_use_mps_q4_for_generate());
     if gen_cfg.deterministic
         || std::env::var("DGQ_DETERMINISTIC")
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
             .unwrap_or(false)
     {
-        cfg.use_mps_q4 = Some(false);
+        cfg.step_use_mps_q4 = Some(false);
+        cfg.encoder_use_mps_q4 = Some(false);
     }
     generate_monolithic(model_dir, prompt_token_ids, &cfg)
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn encoder_use_mps_q4_for_generate() -> bool {
+    match std::env::var("DGQ_MPS_Q4") {
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        Err(_) => false,
+    }
 }
 
 #[cfg(all(test, feature = "metal", target_os = "macos"))]

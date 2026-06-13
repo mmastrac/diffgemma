@@ -314,11 +314,18 @@ fn step_use_sc_gemm_from_env() -> bool {
     }
 }
 
-fn step_use_mps_q4_from_env() -> bool {
-    match std::env::var("DGQ_MPS_Q4") {
-        Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
-        Err(_) => true,
+/// Step-kernel dense GEMM backend. Default is native `k_gemm_q4` (not MPS): the MPS
+/// dequant→matmul path in `StepEnc::gemm_q4` yields flat logits (~ln(vocab) entropy).
+/// Opt in with `DGQ_STEP_MPS_Q4=1`. Encoder prefill uses `DGQ_MPS_Q4` separately.
+pub fn step_use_mps_q4_default() -> bool {
+    match std::env::var("DGQ_STEP_MPS_Q4") {
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        Err(_) => false,
     }
+}
+
+fn step_use_mps_q4_from_env() -> bool {
+    step_use_mps_q4_default()
 }
 
 struct StepPipelines {
@@ -1475,6 +1482,10 @@ pub struct StepRuntime {
 impl StepRuntime {
     pub fn layout(&self) -> &ModelLayout {
         &self.layout
+    }
+
+    pub fn use_mps_q4(&self) -> bool {
+        self.use_mps_q4
     }
 
     pub fn kvcache(&self) -> &ProtocolObject<dyn MTLBuffer> {
