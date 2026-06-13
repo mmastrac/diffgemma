@@ -1,5 +1,6 @@
 //! M2/M4: end-to-end monolithic generate loop (prefill → denoise blocks → KV extend).
 
+use crate::denoise_trace::{step_trace_from_stats, DenoiseTrace, SCHEMA_VERSION};
 use crate::generate::GenerateOutput;
 use crate::metal::step_kernel::{
     build_step_runtime, init_canvas_state_from_rng, step_params_from_sampler, StepFinishMode,
@@ -9,7 +10,7 @@ use crate::metal::step_kv::{
     extend_monolithic_kv_with_cache, prefill_monolithic_kv_with_cache, MonolithicEncoderCache,
 };
 use crate::metal::{ForwardTelemetry, SessionTelemetry, StepPhaseTelemetry};
-use crate::sample::{initialize_canvas, Rng, SamplerConfig, step_entropy_stats};
+use crate::sample::{Rng, SamplerConfig, step_entropy_stats};
 use crate::safetensors::Error;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -60,6 +61,8 @@ fn smoke_config(cfg: &StepGenerateConfig) -> StepSmokeConfig {
         finish: StepFinishMode::Full,
         use_mps_q4: cfg.step_use_mps_q4,
         prefill_token_ids: None,
+        no_early_stop: false,
+        encoder_use_mps_q4: cfg.encoder_use_mps_q4,
     }
 }
 
@@ -139,15 +142,17 @@ pub fn generate_monolithic(
     model_dir: &Path,
     prompt_token_ids: &[u32],
     cfg: &StepGenerateConfig,
+    prompt_label: &str,
 ) -> Result<GenerateOutput, Error> {
     let (mut session, _) = StepGenerateSession::open(model_dir, cfg)?;
-    generate_with_session(&mut session, prompt_token_ids, cfg)
+    generate_with_session(&mut session, prompt_token_ids, cfg, prompt_label)
 }
 
 pub fn generate_with_session(
     session: &mut StepGenerateSession,
     prompt_token_ids: &[u32],
     cfg: &StepGenerateConfig,
+    prompt_label: &str,
 ) -> Result<GenerateOutput, Error> {
     if prompt_token_ids.is_empty() {
         return Err(Error::Format("generate requires a non-empty prompt"));
@@ -206,6 +211,7 @@ pub fn generate_with_session(
     let mut denoise_elapsed = Duration::ZERO;
     let mut extend_elapsed = Duration::ZERO;
     let mut session_telemetry = SessionTelemetry::default();
+    let mut step_traces = Vec::new();
     let max_steps = cfg.sampler.max_denoising_steps.max(1);
 
     for _block in 0..max_blocks {
@@ -254,11 +260,26 @@ pub fn generate_with_session(
             block_step_count += 1;
             let st = rt.read_canvas_state();
             last_st = Some(st);
+            if std::env::var("DGQ_LOG_SC").ok().as_deref() == Some("1") {
+                eprintln!(
+                    "monolithic denoise: step_index={block_step_count} st.step={} sc_active_next={}",
+                    st.step,
+                    st.step >= 1
+                );
+            }
             let stats = step_entropy_stats(&st.entropy, &st.accept);
             accept_hist.push(stats.accept_count);
             min_entropy_hist.push(stats.min_entropy);
             low_ent_hist.push(stats.low_entropy_positions);
             let early_stop = st.stop_flag != 0;
+            step_traces.push(step_trace_from_stats(
+                block_idx as u32,
+                block_step_count,
+                max_steps,
+                &stats,
+                &st.prev_argmax,
+                early_stop,
+            ));
             log_denoise_step_progress(
                 block_idx,
                 max_blocks,
@@ -337,16 +358,17 @@ pub fn generate_with_session(
     }
 
     if progress_enabled() && !session_telemetry.steps.is_empty() {
+        let n = session_telemetry.steps.len().max(1) as f64;
         let agg = session_telemetry.aggregate_forward();
         eprintln!(
             "step-generate: P2.1 hot path mean {:.2} syncs/step, {:.1} KiB readback/step (DGQ_CHECK_LOGITS for opt-in logits scan)",
-            agg.gpu_syncs as f64,
-            agg.gpu_readback_bytes as f64 / 1024.0
+            agg.gpu_syncs as f64 / n,
+            agg.gpu_readback_bytes as f64 / 1024.0 / n
         );
     }
 
     Ok(GenerateOutput {
-        token_ids: sequences,
+        token_ids: sequences.clone(),
         denoise_steps_run,
         blocks_committed,
         block_steps_eff,
@@ -355,8 +377,23 @@ pub fn generate_with_session(
         prefill_elapsed,
         denoise_elapsed,
         extend_elapsed,
-        #[cfg(all(feature = "metal", target_os = "macos"))]
         session_telemetry,
+        denoise_trace: Some(DenoiseTrace {
+            schema_version: SCHEMA_VERSION,
+            source: "rust-monolithic".into(),
+            prompt: prompt_label.to_string(),
+            prompt_token_ids: prompt_token_ids.to_vec(),
+            seed: cfg.seed,
+            max_denoise_steps: max_steps,
+            layers,
+            max_new_tokens: cfg.max_new_tokens,
+            weights_profile: Some(crate::generate_golden::monolithic_weights_profile().into()),
+            entropy_bound: cfg.sampler.entropy_bound,
+            step_traces,
+            denoise_steps_run,
+            blocks_committed,
+            output_token_ids: sequences.clone(),
+        }),
     })
 }
 

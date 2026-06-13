@@ -60,3 +60,29 @@ cargo run --release --features metal -- -m /tmp/quantized-weights generate-parit
 ```
 
 Use `--compare-cpu` on `generate-parity` for full CPU vs GPU on the same weights (slow).
+
+## Denoise traces (P1.6 canvas convergence)
+
+Compact per-step telemetry for localizing sampler vs forward divergence. Schema: `src/denoise_trace.rs` (`schema_version: 1`).
+
+| File | Config |
+|------|--------|
+| `denoise_trace_hello_layers3_steps4_seed42.json` | Templated `-p Hello`, `--layers 3 --steps 4 --seed 42 --no-early-stop`, monolithic |
+
+**Rust dump:**
+
+```bash
+cargo run --release --features metal -- -m /tmp/quantized-weights generate-monolithic \
+  -p Hello --seed 42 --layers 3 --steps 4 --no-early-stop \
+  --write-trace fixtures/generate/denoise_trace_hello_layers3_steps4_seed42.json
+```
+
+**HuggingFace reference** (requires GPU + full weights; optional `uv sync --extra model`):
+
+```bash
+cd python && uv sync --extra model
+uv run python/scripts/dump_denoise_trace.py -p Hello --seed 42 --steps 4 -o /tmp/hf_trace.json
+uv run python/scripts/compare_denoise_trace.py /tmp/hf_trace.json /tmp/rust_trace.json
+```
+
+Traces store per-step `accept_count`, `min_entropy`, `low_entropy_positions`, and `argmax_prefix[0..16]` — not full 262K×256 logits (too large for git). For layer-level probes use `step-probe` on a single forward.

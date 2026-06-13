@@ -10,3 +10,18 @@ dependencies = [
     "tokenizers>=0.22.2",
     "transformers>=5.11.0",
 ]
+
+[project.optional-dependencies]
+model = [
+    "torch>=2.4",
+    "accelerate>=0.33",
+    "pillow>=10.0",
+    "torchvision>=0.20",
+]
+mlx = [
+    "mlx>=0.25",
+    "mlx-vlm>=0.6.3",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

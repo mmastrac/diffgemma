@@ -1,6 +1,7 @@
 mod buffer;
 mod chat_template;
 mod config;
+mod denoise_trace;
 mod fast_slice;
 mod generate;
 mod generate_golden;
@@ -55,6 +56,7 @@ enum Command {
         max_layers: Option<usize>,
         no_early_stop: bool,
         write_golden: Option<String>,
+        write_trace: Option<PathBuf>,
     },
     GenerateMonolithic {
         prompt: Option<String>,
@@ -66,6 +68,7 @@ enum Command {
         no_early_stop: bool,
         engine_fallback: bool,
         write_golden: Option<String>,
+        write_trace: Option<PathBuf>,
     },
     GenerateMonolithicParity {
         prompt: Option<String>,
@@ -157,6 +160,14 @@ enum Command {
         prompt: Option<String>,
         prompt_len: usize,
         layers: usize,
+        seed: u64,
+        max_seq: usize,
+        raw_prompt: bool,
+    },
+    StepAttnProbe {
+        prompt: Option<String>,
+        prompt_len: usize,
+        layer: usize,
         seed: u64,
         max_seq: usize,
         raw_prompt: bool,
@@ -260,6 +271,22 @@ fn main() -> ExitCode {
             max_seq,
             raw_prompt,
         ),
+        Command::StepAttnProbe {
+            prompt,
+            prompt_len,
+            layer,
+            seed,
+            max_seq,
+            raw_prompt,
+        } => run_step_attn_probe_cmd(
+            &cli.model_dir,
+            prompt,
+            prompt_len,
+            layer,
+            seed,
+            max_seq,
+            raw_prompt,
+        ),
         Command::StepQ4Parity {
             prompt,
             prompt_len,
@@ -312,6 +339,7 @@ fn main() -> ExitCode {
             no_early_stop,
             engine_fallback,
             write_golden,
+            write_trace,
         } => run_generate_monolithic_cmd(
             &cli.model_dir,
             prompt,
@@ -323,6 +351,7 @@ fn main() -> ExitCode {
             no_early_stop,
             engine_fallback,
             write_golden,
+            write_trace,
             cli.raw_prompt,
         ),
         Command::GenerateMonolithicParity {
@@ -457,6 +486,7 @@ fn run_command(
             no_early_stop,
             false,
             None,
+            None,
             raw_prompt,
         ),
         Command::GenerateGpu {
@@ -468,6 +498,7 @@ fn run_command(
             max_layers,
             no_early_stop,
             write_golden,
+            write_trace,
         } => run_generate(
             m,
             model_dir,
@@ -480,6 +511,7 @@ fn run_command(
             no_early_stop,
             true,
             write_golden,
+            write_trace,
             raw_prompt,
         ),
         Command::GenerateParity {
@@ -519,6 +551,7 @@ fn run_command(
         Command::StepProbe { .. } => ExitCode::FAILURE,
         Command::StepKvCheck { .. } => ExitCode::FAILURE,
         Command::StepKvParity { .. } => ExitCode::FAILURE,
+        Command::StepAttnProbe { .. } => ExitCode::FAILURE,
         Command::StepQ4Parity { .. } => ExitCode::FAILURE,
         Command::StepVerify { .. } => ExitCode::FAILURE,
         Command::StepCi { .. } => ExitCode::FAILURE,
@@ -549,6 +582,8 @@ fn step_kernel_config(
         },
         use_mps_q4: None,
         prefill_token_ids: None,
+        no_early_stop: false,
+        encoder_use_mps_q4: None,
     }
 }
 
@@ -599,6 +634,8 @@ fn run_step_probe_cmd(
         finish: StepFinishMode::ForwardOnly,
         use_mps_q4: None,
         prefill_token_ids: None,
+        no_early_stop: false,
+        encoder_use_mps_q4: None,
     };
     if let Err(err) = attach_step_prefill(&mut cfg, model_dir, kv_len, prompt, raw_prompt) {
         eprintln!("error: {err}");
@@ -749,6 +786,83 @@ fn run_step_kv_parity_cmd(
             } else {
                 ExitCode::FAILURE
             }
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn run_step_attn_probe_cmd(
+    model_dir: &std::path::Path,
+    prompt: Option<String>,
+    prompt_len: usize,
+    layer: usize,
+    seed: u64,
+    max_seq: usize,
+    raw_prompt: bool,
+) -> ExitCode {
+    use metal::run_step_attn_probe;
+
+    if !dgq::store::looks_like_dgq_dir(model_dir) {
+        eprintln!("error: step-attn-probe requires a .dgq directory");
+        return ExitCode::FAILURE;
+    }
+    let vocab = match crate::config::ModelConfig::load(model_dir) {
+        Ok(c) => c.text_config.vocab_size,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let token_ids = match build_prompt_tokens(
+        model_dir,
+        prompt.as_deref(),
+        prompt_len,
+        vocab,
+        raw_prompt,
+        &[],
+    ) {
+        Ok(ids) => ids,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!(
+        "step-attn-probe: {} prompt tokens, layer={layer}, seed={seed}",
+        token_ids.len()
+    );
+    match run_step_attn_probe(model_dir, &token_ids, layer, seed, max_seq.max(512)) {
+        Ok(r) => {
+            let ln_t = r.attn_keys_t as f32;
+            let ln_uniform = ln_t.ln();
+            println!("step-attn-probe:");
+            println!("  kv_len (prefix):        {}", r.kv_len);
+            println!("  canvas_len:             {}", r.canvas_len);
+            println!("  attn keys T:            {} (= kv_len + canvas_len)", r.attn_keys_t);
+            println!("  layer:                  {}", r.layer);
+            println!("  monolithic K max L0:    {:.4}", r.k_plane_max_l0);
+            println!("  monolithic V max L0:    {:.4}", r.v_plane_max_l0);
+            println!("  q_norm weight mean|w|: {:.4}  rms: {:.4}", r.q_norm_weight_mean_abs, r.q_norm_weight_rms);
+            println!("  k_norm weight mean|w|: {:.4}  rms: {:.4}", r.k_norm_weight_mean_abs, r.k_norm_weight_rms);
+            println!("  CPU Q·K raw max/min:    {:.2} / {:.2}", r.cpu_raw_dot_max, r.cpu_raw_dot_min);
+            println!(
+                "  CPU softmax row ent:    {:.4} nats (ln T = {:.4}, active keys/row = {})",
+                r.cpu_mean_softmax_entropy, ln_uniform, r.cpu_keys_per_row
+            );
+            println!("  CPU softmax max prob:   {:.4}", r.cpu_mean_max_prob);
+            println!("  CPU weight sum/row:     {:.6} (expect 1.0)", r.cpu_mean_weight_sum);
+            println!("  CPU Q/K head RMS:       {:.4} / {:.4}", r.cpu_q_head_rms, r.cpu_k_head_rms);
+            if r.cpu_mean_softmax_entropy > ln_uniform + 1e-3 {
+                eprintln!(
+                    "  WARNING: entropy {:.4} > ln(T) {:.4} — probe bug or invalid softmax",
+                    r.cpu_mean_softmax_entropy, ln_uniform
+                );
+            }
+            ExitCode::SUCCESS
         }
         Err(err) => {
             eprintln!("error: {err}");
@@ -1002,6 +1116,7 @@ fn run_chat_quality_gate(model_dir: &std::path::Path, layers: usize) -> ExitCode
         max_layers: Some(max_layers),
         no_early_stop: false,
         deterministic: true,
+        trace_prompt: None,
     };
 
     eprintln!(
@@ -1009,7 +1124,13 @@ fn run_chat_quality_gate(model_dir: &std::path::Path, layers: usize) -> ExitCode
         gate.prompt, gate.seed, gate.steps
     );
 
-    let out = match generate::generate_monolithic_gpu(model_dir, &prompt, &gen_cfg, max_seq) {
+    let out = match generate::generate_monolithic_gpu(
+        model_dir,
+        &prompt,
+        &gen_cfg,
+        max_seq,
+        &gate.prompt,
+    ) {
         Ok(out) => out,
         Err(err) => {
             eprintln!("error: {err}");
@@ -1419,6 +1540,7 @@ fn parse_cli() -> Cli {
     let mut golden_name: Option<String> = None;
     let mut compare_cpu = false;
     let mut write_golden: Option<String> = None;
+    let mut write_trace: Option<PathBuf> = None;
     let mut no_early_stop = false;
     let mut output_dir: Option<PathBuf> = None;
     let mut quant_profile = String::from("q4");
@@ -1495,6 +1617,11 @@ fn parse_cli() -> Cli {
             "--write-golden" => {
                 if let Some(v) = args.next() {
                     write_golden = Some(v);
+                }
+            }
+            "--write-trace" => {
+                if let Some(v) = args.next() {
+                    write_trace = Some(PathBuf::from(v));
                 }
             }
             "--golden" => {
@@ -1632,6 +1759,7 @@ fn parse_cli() -> Cli {
             no_early_stop,
             engine_fallback: true,
             write_golden: None,
+            write_trace: None,
         },
         Some("generate") => Command::Generate {
             prompt: prompt.clone(),
@@ -1652,6 +1780,7 @@ fn parse_cli() -> Cli {
             no_early_stop,
             engine_fallback: true,
             write_golden: None,
+            write_trace: None,
         },
         Some("generate-gpu") => Command::GenerateGpu {
             prompt: prompt.clone(),
@@ -1662,6 +1791,7 @@ fn parse_cli() -> Cli {
             max_layers: parity_layers,
             no_early_stop,
             write_golden,
+            write_trace,
         },
         Some("generate-monolithic") => Command::GenerateMonolithic {
             prompt: prompt.clone(),
@@ -1673,6 +1803,7 @@ fn parse_cli() -> Cli {
             no_early_stop,
             engine_fallback: false,
             write_golden,
+            write_trace,
         },
         Some("generate-monolithic-parity") => Command::GenerateMonolithicParity {
             prompt: prompt.clone(),
@@ -1792,6 +1923,14 @@ fn parse_cli() -> Cli {
             max_seq: step_max_seq.max(64),
             raw_prompt,
         },
+        Some("step-attn-probe") => Command::StepAttnProbe {
+            prompt: prompt.clone(),
+            prompt_len,
+            layer: bench_layers,
+            seed,
+            max_seq: step_max_seq.max(512),
+            raw_prompt,
+        },
         Some("step-q4-parity") => Command::StepQ4Parity {
             prompt: prompt.clone(),
             prompt_len,
@@ -1881,6 +2020,7 @@ fn default_generate_command(
             no_early_stop,
             engine_fallback: true,
             write_golden: None,
+            write_trace: None,
         };
     }
     Command::GenerateGpu {
@@ -1892,6 +2032,7 @@ fn default_generate_command(
         max_layers,
         no_early_stop,
         write_golden: None,
+        write_trace: None,
     }
 }
 
@@ -2745,6 +2886,8 @@ fn run_bench_prefill(
                 finish: StepFinishMode::Full,
                 use_mps_q4: None,
                 prefill_token_ids: None,
+                no_early_stop: false,
+                encoder_use_mps_q4: None,
             };
             let (mut rt, build) = match build_step_runtime(model_dir, &smoke_cfg) {
                 Ok(v) => v,
@@ -3111,7 +3254,7 @@ fn run_chat_cmd(
         *turn_idx = turn_idx.wrapping_add(1);
 
         let started = std::time::Instant::now();
-        let out = generate_with_session(&mut session, &prompt, &step_cfg)?;
+        let out = generate_with_session(&mut session, &prompt, &step_cfg, "chat")?;
         let elapsed = started.elapsed();
 
         let new_ids = sample::strip_degenerate_token_ids(
@@ -3247,18 +3390,18 @@ fn print_generate_output(
         out.session_telemetry.print_summary("  session telemetry:");
         if out.denoise_steps_run > 0 {
             let agg = out.session_telemetry.aggregate_forward();
-            let step_ms = out.denoise_elapsed.as_secs_f64() * 1000.0
-                / out.denoise_steps_run as f64;
+            let n = out.denoise_steps_run as f64;
+            let step_ms = out.denoise_elapsed.as_secs_f64() * 1000.0 / n;
             println!("  mean step wall:       {step_ms:.1} ms");
             println!(
                 "  gpu hot path:         {:.1} syncs/step, {:.1} KiB readback/step",
-                agg.gpu_syncs,
-                agg.gpu_readback_bytes as f64 / 1024.0
+                agg.gpu_syncs as f64 / n,
+                agg.gpu_readback_bytes as f64 / 1024.0 / n
             );
             println!(
                 "  weight bytes/step:    {:.2} GiB expert + {:.2} MiB logits",
-                agg.expert_weight_bytes_touched as f64 / (1024.0_f64.powi(3)),
-                agg.lm_head_logits_bytes as f64 / (1024.0 * 1024.0)
+                agg.expert_weight_bytes_touched as f64 / n / (1024.0_f64.powi(3)),
+                agg.lm_head_logits_bytes as f64 / n / (1024.0 * 1024.0)
             );
         }
     }
@@ -3306,6 +3449,7 @@ fn run_generate_monolithic_cmd(
     no_early_stop: bool,
     engine_fallback: bool,
     write_golden: Option<String>,
+    write_trace: Option<PathBuf>,
     raw_prompt: bool,
 ) -> ExitCode {
     if !dgq::store::looks_like_dgq_dir(model_dir) {
@@ -3366,6 +3510,7 @@ fn run_generate_monolithic_cmd(
         max_layers: Some(layers),
         no_early_stop,
         deterministic: false,
+        trace_prompt: None,
     };
 
     let stop_note = if no_early_stop { ", no_early_stop" } else { "" };
@@ -3374,7 +3519,14 @@ fn run_generate_monolithic_cmd(
     );
     let started = std::time::Instant::now();
 
-    match generate::generate_monolithic_gpu(model_dir, &prompt, &gen_cfg, max_seq) {
+    let prompt_label = prompt_text.clone().unwrap_or_default();
+    match generate::generate_monolithic_gpu(
+        model_dir,
+        &prompt,
+        &gen_cfg,
+        max_seq,
+        &prompt_label,
+    ) {
         Ok(out) => {
             if let Some(ref name) = write_golden {
                 let prompt_str = prompt_text.clone().unwrap_or_default();
@@ -3387,6 +3539,18 @@ fn run_generate_monolithic_cmd(
                     &out,
                 ) {
                     eprintln!("error: {err}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            if let Some(ref path) = write_trace {
+                if let Some(ref trace) = out.denoise_trace {
+                    if let Err(err) = trace.write(path) {
+                        eprintln!("error writing trace: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                    eprintln!("wrote denoise trace: {}", path.display());
+                } else {
+                    eprintln!("error: denoise trace unavailable on this build");
                     return ExitCode::FAILURE;
                 }
             }
@@ -3473,6 +3637,7 @@ fn run_generate_monolithic_parity_cmd(
         max_layers,
         no_early_stop,
         deterministic: true,
+        trace_prompt: None,
     };
 
     if let Some(n) = max_layers {
@@ -3482,7 +3647,13 @@ fn run_generate_monolithic_parity_cmd(
         "running generate-monolithic parity (DGQ_MPS_Q4=0 native Q4, prompt_len={prompt_len}, steps={steps}, seed={seed})..."
     );
 
-    let out = match generate::generate_monolithic_gpu(model_dir, &prompt, &gen_cfg, max_seq) {
+    let out = match generate::generate_monolithic_gpu(
+        model_dir,
+        &prompt,
+        &gen_cfg,
+        max_seq,
+        &prompt_label,
+    ) {
         Ok(out) => out,
         Err(err) => {
             eprintln!("error: {err}");
@@ -3591,6 +3762,7 @@ fn run_generate_engine_fallback(
             no_early_stop,
             true,
             None,
+            None,
             raw_prompt,
         ),
         Err(err) => {
@@ -3630,6 +3802,7 @@ fn run_generate(
     no_early_stop: bool,
     use_gpu: bool,
     write_golden: Option<String>,
+    write_trace: Option<PathBuf>,
     raw_prompt: bool,
 ) -> ExitCode {
     let vocab = m.config.text_config.vocab_size;
@@ -3661,6 +3834,7 @@ fn run_generate(
         max_layers,
         no_early_stop,
         deterministic: false,
+        trace_prompt: prompt_text.clone(),
     };
 
     let backend = if use_gpu { "generate-gpu" } else { "generate" };
@@ -3720,6 +3894,18 @@ fn run_generate(
                         &out,
                     ) {
                         eprintln!("error: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+                if let Some(ref path) = write_trace {
+                    if let Some(ref trace) = out.denoise_trace {
+                        if let Err(err) = trace.write(path) {
+                            eprintln!("error writing trace: {err}");
+                            return ExitCode::FAILURE;
+                        }
+                        eprintln!("wrote denoise trace: {}", path.display());
+                    } else {
+                        eprintln!("error: denoise trace unavailable on this build");
                         return ExitCode::FAILURE;
                     }
                 }
@@ -3830,6 +4016,7 @@ fn run_generate_parity(
             max_layers,
             no_early_stop,
             deterministic: true,
+            trace_prompt: None,
         };
 
         let prompt_label = prompt_text.clone().unwrap_or_else(|| format!("prompt_len={prompt_len}"));

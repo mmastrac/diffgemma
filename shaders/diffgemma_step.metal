@@ -205,6 +205,7 @@ kernel void k_rmsnorm_f32(device const float* x [[buffer(0)]],
     }
 }
 
+// Tile GEMM kernels below require threadgroup size (128, 1, 1): ltid = lid.x, loop stride 128.
 // ===================== k_gemm_q4: y[M,N] = x[M,K] @ Wq4[N,K]^T =====================
 kernel void k_gemm_q4(device const half* x [[buffer(0)]],
                       device half* y [[buffer(1)]],

@@ -304,6 +304,31 @@ pub fn f32_q8_linear_gpu_bufs(
     Ok(buf_c)
 }
 
+/// C[M,N] = A[M,K] @ W[K,N] for q8 row-major embed rows (soft-embed path).
+pub fn f32_q8_linear_kxn_gpu_bufs(
+    batch: &mut GpuBatch<'_>,
+    q8_pipeline: &ComputePipeline,
+    x_buf: &ProtocolObject<dyn MTLBuffer>,
+    w: &Q8LinearGpu,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
+    let buf_c = batch.alloc_f32_out(m * n)?;
+    let (buf_w, off) = w.weight_buffer();
+    batch.dispatch_q8_linear(
+        &q8_pipeline.pipeline,
+        x_buf,
+        buf_w,
+        off,
+        &buf_c,
+        m,
+        n,
+        k,
+    );
+    Ok(buf_c)
+}
+
 pub fn f32_linear_gpu_bufs(
     batch: &mut GpuBatch<'_>,
     bf16_pipeline: &ComputePipeline,

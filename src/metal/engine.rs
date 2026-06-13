@@ -19,6 +19,7 @@ const F32_F32_LINEAR_ENTRY: &str = "f32_f32_linear";
 const F32_Q4_LINEAR_ENTRY: &str = "f32_q4_linear";
 const F32_Q4_LINEAR_GROUPED_ENTRY: &str = "f32_q4_linear_grouped";
 const F32_Q8_LINEAR_ENTRY: &str = "f32_q8_linear";
+const F32_Q8_LINEAR_KXN_ENTRY: &str = "f32_q8_linear_kxn";
 const DEQUANT_Q4_MATRIX_ENTRY: &str = "dequant_q4_matrix";
 
 pub struct GpuDecoderEngine {
@@ -31,6 +32,7 @@ pub struct GpuDecoderEngine {
     pub f32_q4_linear_pipeline: ComputePipeline,
     pub f32_q4_linear_grouped_pipeline: ComputePipeline,
     pub f32_q8_linear_pipeline: ComputePipeline,
+    pub f32_q8_linear_kxn_pipeline: ComputePipeline,
     pub dequant_q4_matrix_pipeline: ComputePipeline,
     pub mps_matmul: MpsMatmulCache,
     /// When false, `.dgq` q4 linears use the native Metal kernel instead of MPS (deterministic).
@@ -53,6 +55,8 @@ impl GpuDecoderEngine {
         let f32_q4_linear_grouped_pipeline =
             ctx.compile_kernel(QGEMM_SHADER, F32_Q4_LINEAR_GROUPED_ENTRY)?;
         let f32_q8_linear_pipeline = ctx.compile_kernel(QGEMM_SHADER, F32_Q8_LINEAR_ENTRY)?;
+        let f32_q8_linear_kxn_pipeline =
+            ctx.compile_kernel(QGEMM_SHADER, F32_Q8_LINEAR_KXN_ENTRY)?;
         let dequant_q4_matrix_pipeline =
             ctx.compile_kernel(QGEMM_SHADER, DEQUANT_Q4_MATRIX_ENTRY)?;
         let mps_matmul = MpsMatmulCache::new(ctx.device.clone());
@@ -70,6 +74,7 @@ impl GpuDecoderEngine {
             f32_q4_linear_pipeline,
             f32_q4_linear_grouped_pipeline,
             f32_q8_linear_pipeline,
+            f32_q8_linear_kxn_pipeline,
             dequant_q4_matrix_pipeline,
             mps_matmul,
             use_mps_q4,

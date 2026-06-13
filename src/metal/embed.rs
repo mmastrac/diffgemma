@@ -5,12 +5,143 @@ use crate::metal::batch::{begin_engine_batch, GpuBatch};
 use crate::metal::dgq_gpu::Q8LinearGpu;
 use crate::metal::engine::GpuDecoderEngine;
 use crate::metal::kernels::GpuKernels;
-use crate::metal::linear::f32_q8_linear_gpu_bufs;
+use crate::metal::linear::{f32_q8_linear_gpu_bufs, f32_q8_linear_kxn_gpu_bufs};
 use crate::model::embed::LM_HEAD_CHUNK;
 use crate::safetensors::Error;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder, MTLSize};
+
+pub fn sc_log_enabled() -> bool {
+    std::env::var("DGQ_LOG_SC").ok().as_deref() == Some("1")
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct F32RowStats {
+    pub min: f32,
+    pub max: f32,
+    pub n_nan: u32,
+    pub n_inf: u32,
+    pub sum: f32,
+}
+
+/// Sample one row of a shared f32 buffer (e.g. logits row 0).
+pub fn f32_row_stats(buf: &ProtocolObject<dyn MTLBuffer>, row: usize, cols: usize) -> F32RowStats {
+    let byte_off = row * cols * 4;
+    let ptr = unsafe { buf.contents().as_ptr().add(byte_off) as *const f32 };
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    let mut n_nan = 0u32;
+    let mut n_inf = 0u32;
+    let mut sum = 0.0f32;
+    for c in 0..cols {
+        let v = unsafe { *ptr.add(c) };
+        if v.is_nan() {
+            n_nan += 1;
+        } else if !v.is_finite() {
+            n_inf += 1;
+        } else {
+            min = min.min(v);
+            max = max.max(v);
+            sum += v;
+        }
+    }
+    if !min.is_finite() {
+        min = 0.0;
+    }
+    if !max.is_finite() {
+        max = 0.0;
+    }
+    F32RowStats {
+        min,
+        max,
+        n_nan,
+        n_inf,
+        sum,
+    }
+}
+
+fn log_engine_sc_softembed(label: &str, pre: F32RowStats, post_z: f32, post_max: f32, out: &[f32]) {
+    let out_max = out.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    let out_finite = out.iter().filter(|v| v.is_finite()).count();
+    eprintln!(
+        "engine sc-softembed {label}: pre_exp min={:.4} max={:.4} nan={} inf={} | post_softmax Z={:.6} max_p={:.6} | out_max_abs={:.4} finite={}/{}",
+        pre.min,
+        pre.max,
+        pre.n_nan,
+        pre.n_inf,
+        post_z,
+        post_max,
+        out_max,
+        out_finite,
+        out.len()
+    );
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct F32BufStats {
+    pub finite: usize,
+    pub total: usize,
+    pub max_abs: f32,
+}
+
+pub fn f32_buf_stats(buf: &ProtocolObject<dyn MTLBuffer>, len: usize) -> F32BufStats {
+    let ptr = unsafe { buf.contents().as_ptr() as *const f32 };
+    let mut finite = 0usize;
+    let mut max_abs = 0.0f32;
+    for i in 0..len {
+        let v = unsafe { *ptr.add(i) };
+        if v.is_finite() {
+            finite += 1;
+            max_abs = max_abs.max(v.abs());
+        }
+    }
+    F32BufStats {
+        finite,
+        total: len,
+        max_abs,
+    }
+}
+
+fn f32_row_sum(buf: &ProtocolObject<dyn MTLBuffer>, row: usize, cols: usize) -> f32 {
+    let byte_off = row * cols * 4;
+    let ptr = unsafe { buf.contents().as_ptr().add(byte_off) as *const f32 };
+    let mut sum = 0.0f32;
+    for c in 0..cols {
+        let v = unsafe { *ptr.add(c) };
+        if v.is_finite() {
+            sum += v;
+        }
+    }
+    sum
+}
+
+fn log_chunk0_bisect(
+    chunk: usize,
+    buf_probs: &ProtocolObject<dyn MTLBuffer>,
+    buf_partial: &ProtocolObject<dyn MTLBuffer>,
+    buf_out: &ProtocolObject<dyn MTLBuffer>,
+    seq_len: usize,
+    hidden: usize,
+) {
+    let probs_len = seq_len * chunk;
+    let out_len = seq_len * hidden;
+    let probs_row0 = f32_row_sum(buf_probs, 0, chunk);
+    let p = f32_buf_stats(buf_probs, probs_len);
+    let partial = f32_buf_stats(buf_partial, out_len);
+    let out = f32_buf_stats(buf_out, out_len);
+    eprintln!(
+        "engine sc chunk-0 bisect: chunk={chunk} probs_row0_sum={probs_row0:.6} probs_finite={}/{} partial_finite={}/{} partial_max={:.4} out_finite={}/{} out_max={:.4}",
+        p.finite,
+        p.total,
+        partial.finite,
+        partial.total,
+        partial.max_abs,
+        out.finite,
+        out.total,
+        out.max_abs,
+    );
+}
 
 pub fn softmax_rows_gpu_buf(
     batch: &mut GpuBatch<'_>,
@@ -149,9 +280,9 @@ pub fn soft_embeddings_q8_gpu(
             chunk,
         )?;
         let w_chunk = embed.row_slice(v0, chunk);
-        let buf_partial = f32_q8_linear_gpu_bufs(
+        let buf_partial = f32_q8_linear_kxn_gpu_bufs(
             &mut batch,
-            &engine.f32_q8_linear_pipeline,
+            &engine.f32_q8_linear_kxn_pipeline,
             &buf_probs,
             &w_chunk,
             seq_len,
@@ -184,6 +315,11 @@ pub fn soft_embeddings_q8_gpu_from_buf(
     assert_eq!(embed.out_dim, vocab);
 
     let out_len = seq_len * hidden;
+    let pre_stats = if sc_log_enabled() {
+        Some(f32_row_stats(logits_buf, 0, vocab))
+    } else {
+        None
+    };
     let telemetry = engine.batch_telemetry();
     let mut batch = begin_engine_batch(
         &engine.ctx.queue,
@@ -193,10 +329,27 @@ pub fn soft_embeddings_q8_gpu_from_buf(
     )?;
     softmax_rows_gpu_buf(&mut batch, &engine.kernels, logits_buf, seq_len, vocab);
 
+    if sc_log_enabled() {
+        batch.end()?;
+        let row0_z = f32_row_stats(logits_buf, 0, vocab).sum;
+        eprintln!(
+            "engine sc post-softmax: row0_Z={row0_z:.6} (expect ~1.0; vocab={vocab} LM_HEAD_CHUNK={LM_HEAD_CHUNK} n_chunks={})",
+            vocab.div_ceil(LM_HEAD_CHUNK)
+        );
+        let telemetry = engine.batch_telemetry();
+        batch = begin_engine_batch(
+            &engine.ctx.queue,
+            &mut engine.pool,
+            &engine.ctx.device,
+            telemetry,
+        )?;
+    }
+
     let buf_out = batch.alloc_f32_out(out_len)?;
     vec_fill_zero_gpu_buf(&mut batch, &engine.kernels, &buf_out, out_len);
 
-    for v0 in (0..vocab).step_by(LM_HEAD_CHUNK) {
+    let mut v0 = 0usize;
+    while v0 < vocab {
         let v1 = (v0 + LM_HEAD_CHUNK).min(vocab);
         let chunk = v1 - v0;
         let buf_probs = gather_prob_cols_gpu_buf(
@@ -209,9 +362,12 @@ pub fn soft_embeddings_q8_gpu_from_buf(
             chunk,
         )?;
         let w_chunk = embed.row_slice(v0, chunk);
-        let buf_partial = f32_q8_linear_gpu_bufs(
+        if sc_log_enabled() && v0 == 0 {
+            crate::metal::dgq_gpu::log_q8_chunk_scale_histogram(&w_chunk, chunk, hidden);
+        }
+        let buf_partial = f32_q8_linear_kxn_gpu_bufs(
             &mut batch,
-            &engine.f32_q8_linear_pipeline,
+            &engine.f32_q8_linear_kxn_pipeline,
             &buf_probs,
             &w_chunk,
             seq_len,
@@ -219,11 +375,30 @@ pub fn soft_embeddings_q8_gpu_from_buf(
             hidden,
         )?;
         bk::vec_add_gpu_bufs(&mut batch, &engine.kernels, &buf_out, &buf_partial, out_len)?;
+
+        if sc_log_enabled() && v0 == 0 {
+            batch.end()?;
+            log_chunk0_bisect(chunk, &buf_probs, &buf_partial, &buf_out, seq_len, hidden);
+            let telemetry = engine.batch_telemetry();
+            batch = begin_engine_batch(
+                &engine.ctx.queue,
+                &mut engine.pool,
+                &engine.ctx.device,
+                telemetry,
+            )?;
+        }
+
+        v0 = v1;
     }
 
     if scale != 1.0 {
         vec_scale_gpu_buf(&mut batch, &engine.kernels, &buf_out, out_len, scale);
     }
     batch.register_read(buf_out, out);
-    batch.end()
+    batch.end()?;
+    if let Some(pre) = pre_stats {
+        let post = f32_row_stats(logits_buf, 0, vocab);
+        log_engine_sc_softembed("gpu_buf", pre, post.sum, post.max, out);
+    }
+    Ok(())
 }

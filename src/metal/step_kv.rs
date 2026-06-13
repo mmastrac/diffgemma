@@ -637,6 +637,8 @@ pub fn run_step_kv_audit(
         finish: StepFinishMode::ForwardOnly,
         use_mps_q4: Some(false),
         prefill_token_ids: None,
+        no_early_stop: false,
+        encoder_use_mps_q4: None,
     };
     let zero = run_step_forward(model_dir, &base_cfg)?;
     let mut kv_cfg = base_cfg.clone();
@@ -806,6 +808,8 @@ pub fn step_min_entropy_with_kv(
         finish: StepFinishMode::Full,
         use_mps_q4: Some(false),
         prefill_token_ids: None,
+        no_early_stop: false,
+        encoder_use_mps_q4: None,
     };
     let (mut rt, _) = build_step_runtime(model_dir, &cfg)?;
     let kv_bytes = kv_cache_total_bytes(rt.layout(), max_seq) as usize;
@@ -817,6 +821,199 @@ pub fn step_min_entropy_with_kv(
     rt.run_denoise_step()?;
     let st = rt.read_canvas_state();
     Ok(step_entropy_stats(&st.entropy, &st.accept).min_entropy)
+}
+
+/// Max abs half in K or V plane only for layer `L` prefix `[0, kv_len)`.
+pub fn kvcache_plane_max_abs(
+    kv_buf: &ProtocolObject<dyn MTLBuffer>,
+    layout: &ModelLayout,
+    layer: usize,
+    kv_len: usize,
+    plane: u8,
+) -> f32 {
+    if kv_len == 0 || layer >= N_LAYERS || plane > 1 {
+        return 0.0;
+    }
+    let l = &layout.layers[layer];
+    let nkv = l.n_kv_heads as usize;
+    let hd = l.head_dim as usize;
+    let plane_halfs = nkv * hd;
+    let token_stride_half = plane_halfs * 2;
+    let half_base = l.kv_region as usize / 2;
+    let plane_off = if plane == 0 { 0 } else { plane_halfs };
+    let mut max_abs = 0.0f32;
+    for pos in 0..kv_len {
+        let start = (half_base + pos * token_stride_half + plane_off) * 2;
+        let end = start + plane_halfs * 2;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(kv_buf.contents().as_ptr().add(start) as *const u8, end - start)
+        };
+        for chunk in bytes.chunks_exact(2) {
+            let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+            max_abs = max_abs.max(f16_bits_to_f32(bits).abs());
+        }
+    }
+    max_abs
+}
+
+#[derive(Debug)]
+pub struct StepAttnProbeResult {
+    pub kv_len: usize,
+    pub layer: usize,
+    pub k_plane_max_l0: f32,
+    pub v_plane_max_l0: f32,
+    pub q_norm_weight_mean_abs: f32,
+    pub q_norm_weight_rms: f32,
+    pub k_norm_weight_mean_abs: f32,
+    pub k_norm_weight_rms: f32,
+    pub cpu_raw_dot_max: f32,
+    pub cpu_raw_dot_min: f32,
+    pub cpu_mean_softmax_entropy: f32,
+    pub cpu_mean_max_prob: f32,
+    pub cpu_q_head_rms: f32,
+    pub cpu_k_head_rms: f32,
+    pub canvas_len: usize,
+    pub attn_keys_t: usize,
+    pub cpu_keys_per_row: usize,
+    pub cpu_mean_weight_sum: f32,
+}
+
+/// P1.0: attention magnitude + KV plane probe (monolithic b4 + CPU score model with real QK-norm weights).
+pub fn run_step_attn_probe(
+    model_dir: &Path,
+    token_ids: &[u32],
+    layer: usize,
+    seed: u64,
+    max_seq: usize,
+) -> Result<StepAttnProbeResult, Error> {
+    use crate::kernels::cpu::rms_norm;
+    use crate::model::attention::{attn_score_stats_decoder, qk_norm_weight_stats, AttentionParams};
+    use crate::model::mask::DecoderAttnMask;
+    use crate::sample::Rng;
+
+    if token_ids.is_empty() {
+        return Err(Error::Format("step-attn-probe requires prompt tokens"));
+    }
+    let layer = layer.min(N_LAYERS.saturating_sub(1));
+    let canvas_len = CANVAS;
+    let cfg = ModelConfig::load(model_dir)?;
+    let text = &cfg.text_config;
+    let dgq = DgqStore::open(model_dir)?;
+    let layout = build_layout(&build_offsets_from_store(&dgq), max_seq);
+    let params = AttentionParams::for_layer(text, layer)?;
+
+    let native_buf = MetalContext::new()?
+        .device
+        .newBufferWithLength_options(
+            kv_cache_total_bytes(&layout, max_seq) as usize,
+            MTLResourceOptions::StorageModeShared,
+        )
+        .ok_or(Error::Format("kv buffer alloc failed"))?;
+    let mut native_cache =
+        MonolithicEncoderCache::open_opt(model_dir, canvas_len, max_seq, None, Some(false))?;
+    let (kv_len, _) = prefill_monolithic_kv_with_cache(
+        &mut native_cache,
+        token_ids,
+        &native_buf,
+        &layout,
+        max_seq,
+        layer + 1,
+    )?;
+
+    let p = format!("model.decoder.layers.{layer}.self_attn");
+    let q_norm_w = dgq.tensor_f32(&format!("{p}.q_norm.weight"))?;
+    let k_norm_w = dgq.tensor_f32(&format!("{p}.k_norm.weight"))?;
+    let (q_na, q_nr) = qk_norm_weight_stats(&q_norm_w);
+    let (k_na, k_nr) = qk_norm_weight_stats(&k_norm_w);
+
+    // Build synthetic post-QK-norm Q/K from monolithic K-cache prefix + canvas-sized query grid.
+    let hd = params.head_dim;
+    let nkv = params.n_kv_heads;
+    let nheads = params.n_heads;
+    let total_kv = kv_len + canvas_len;
+    let kv_dim = nkv * hd;
+    let q_dim = nheads * hd;
+    let l = &layout.layers[layer];
+    let half_base = l.kv_region as usize / 2;
+    let token_stride_half = nkv * hd * 2;
+
+    let mut k_full = vec![0.0f32; total_kv * kv_dim];
+    let mut v_full = vec![0.0f32; total_kv * kv_dim];
+    for pos in 0..kv_len {
+        let k_off = pos * kv_dim;
+        let byte_k = (half_base + pos * token_stride_half) * 2;
+        let byte_v = byte_k + nkv * hd * 2;
+        for i in 0..nkv * hd {
+            k_full[k_off + i] = f16_bits_to_f32(read_half_at(&native_buf, byte_k + i * 2));
+            v_full[k_off + i] = f16_bits_to_f32(read_half_at(&native_buf, byte_v + i * 2));
+        }
+    }
+
+    let mut rng = Rng::new(seed);
+    let mut q = vec![0.0f32; canvas_len * q_dim];
+    let mut k_canvas = vec![0.0f32; canvas_len * kv_dim];
+    let eps = text.rms_norm_eps as f32;
+    let mut head = vec![0.0f32; hd];
+    for tok in 0..canvas_len {
+        for h in 0..nheads {
+            let off = (tok * nheads + h) * hd;
+            for d in 0..hd {
+                head[d] = (rng.next_f32() - 0.5) * 2.0;
+            }
+            rms_norm(&mut q[off..off + hd], &head, &q_norm_w, eps);
+        }
+        for h in 0..nkv {
+            let off = (tok * nkv + h) * hd;
+            for d in 0..hd {
+                head[d] = (rng.next_f32() - 0.5) * 2.0;
+            }
+            rms_norm(&mut k_canvas[off..off + hd], &head, &k_norm_w, eps);
+        }
+    }
+    k_full[kv_len * kv_dim..].copy_from_slice(&k_canvas);
+
+    let mask = DecoderAttnMask::all_valid(canvas_len, kv_len);
+    let stats = attn_score_stats_decoder(&q, &k_full, canvas_len, total_kv, &params, &mask);
+    let q_rms = head_rms_probe(&q, canvas_len, nheads, hd);
+    let k_rms = head_rms_probe(&k_full, total_kv, nkv, hd);
+
+    Ok(StepAttnProbeResult {
+        kv_len,
+        layer,
+        k_plane_max_l0: kvcache_plane_max_abs(&native_buf, &layout, 0, kv_len, 0),
+        v_plane_max_l0: kvcache_plane_max_abs(&native_buf, &layout, 0, kv_len, 1),
+        q_norm_weight_mean_abs: q_na,
+        q_norm_weight_rms: q_nr,
+        k_norm_weight_mean_abs: k_na,
+        k_norm_weight_rms: k_nr,
+        cpu_raw_dot_max: stats.raw_dot_max,
+        cpu_raw_dot_min: stats.raw_dot_min,
+        cpu_mean_softmax_entropy: stats.mean_row_softmax_entropy,
+        cpu_mean_max_prob: stats.mean_row_max_prob,
+        cpu_q_head_rms: q_rms,
+        cpu_k_head_rms: k_rms,
+        canvas_len,
+        attn_keys_t: total_kv,
+        cpu_keys_per_row: stats.keys_per_row,
+        cpu_mean_weight_sum: stats.mean_weight_sum,
+    })
+}
+
+fn head_rms_probe(buf: &[f32], seq_len: usize, n_heads: usize, head_dim: usize) -> f32 {
+    let mut sum = 0.0f32;
+    let n = (seq_len * n_heads).max(1) as f32;
+    for s in 0..seq_len {
+        for h in 0..n_heads {
+            let off = (s * n_heads + h) * head_dim;
+            let mut ss = 0.0f32;
+            for d in 0..head_dim {
+                let v = buf[off + d];
+                ss += v * v;
+            }
+            sum += (ss / head_dim as f32).sqrt();
+        }
+    }
+    sum / n
 }
 
 #[derive(Debug)]

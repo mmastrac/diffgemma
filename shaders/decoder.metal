@@ -184,10 +184,11 @@ kernel void gelu_swiglu_gate_up(
 kernel void softmax_rows(
     device float *x [[buffer(0)]],
     constant uint2 &dims [[buffer(1)]],
-    uint row [[threadgroup_position_in_grid]],
+    uint3 tgp [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]]
 ) {
     const uint TG = 256u;
+    uint row = tgp.y;
     uint rows = dims.x;
     uint cols = dims.y;
     if (row >= rows) {

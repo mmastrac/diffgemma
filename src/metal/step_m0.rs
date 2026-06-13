@@ -235,6 +235,8 @@ fn verify_full_layers(model_dir: &Path, layers: usize) -> Result<M0Check, Error>
         finish: StepFinishMode::ForwardOnly,
         use_mps_q4: None,
         prefill_token_ids: None,
+        no_early_stop: false,
+        encoder_use_mps_q4: None,
     };
     let probe = run_step_probe(model_dir, cfg)?;
     let bad: Vec<_> = probe
@@ -277,6 +279,8 @@ fn verify_sampler_golden(model_dir: &Path) -> Result<M0Check, Error> {
             finish: StepFinishMode::Full,
             use_mps_q4: Some(false),
             prefill_token_ids: None,
+            no_early_stop: false,
+            encoder_use_mps_q4: None,
         };
         let r = run_step_smoke(model_dir, cfg)?;
         if !r.logits_finite {
@@ -339,7 +343,7 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> (f32, usize) {
     (max_abs, max_idx)
 }
 
-fn engine_forward(
+pub(crate) fn engine_forward(
     model: &crate::model::Model,
     token_ids: &[u32],
     kv_len: usize,
@@ -436,6 +440,8 @@ pub fn run_step_parity(
         finish: StepFinishMode::ForwardOnly,
         use_mps_q4: Some(false),
         prefill_token_ids: None,
+        no_early_stop: false,
+        encoder_use_mps_q4: None,
     };
     let mono: StepForwardOutput = run_step_forward(model_dir, &step_cfg)?;
 
@@ -501,6 +507,8 @@ mod parity_debug {
             finish: StepFinishMode::ForwardOnly,
             use_mps_q4: Some(false),
             prefill_token_ids: None,
+            no_early_stop: false,
+            encoder_use_mps_q4: None,
         };
         let mono = run_step_forward(dir, &step_cfg).expect("mono");
         let (eng_h, eng_l) = engine_forward(&model, &token_ids, 0, 1).expect("eng");

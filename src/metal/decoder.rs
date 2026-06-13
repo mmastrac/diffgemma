@@ -314,6 +314,25 @@ fn forward_inner(
         }
     }
 
+    if std::env::var("DGQ_LOG_SC").ok().as_deref() == Some("1") {
+        let sc_used = scratch.have_gpu_sc_logits || input.self_conditioning_logits.is_some();
+        let sc_max = if sc_used {
+            scratch
+                .cpu
+                .sc_signal
+                .iter()
+                .map(|v| v.abs())
+                .fold(0.0f32, f32::max)
+        } else {
+            0.0
+        };
+        eprintln!(
+            "engine sc: gpu_sc={} input_sc={} sc_signal_max_abs={sc_max:.4}",
+            scratch.have_gpu_sc_logits,
+            input.self_conditioning_logits.is_some(),
+        );
+    }
+
     let mask = input.mask;
     let positions: Vec<i64> =
         (input.kv_cache.kv_len as i64..input.kv_cache.kv_len as i64 + seq_len as i64).collect();

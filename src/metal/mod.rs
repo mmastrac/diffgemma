@@ -55,8 +55,10 @@ pub use probe::{print_probe_result, probe_device, DeviceProbeResult};
 pub use bench_gemm::{bench_custom_kernel, bench_mps_oracle, parse_shapes, print_bench_rows};
 pub use sampler::{sampler_step_gpu, upload_logits_gpu};
 pub use step_kernel::{
-    bench_step_kernel, build_step_runtime, logits_finite_check_enabled, run_step_forward,
-    run_step_probe, run_step_smoke, run_step_q4_mps_parity, step_use_mps_q4_default, StepBenchResult, StepFinishMode,
+    bench_step_kernel, build_step_runtime, hello_chat_prefill_token_ids, logits_finite_check_enabled,
+    run_denoise_steps, run_single_denoise_step, run_step_forward,
+    run_step_probe, run_step_smoke, run_step_q4_mps_parity, step_use_mps_q4_default, DenoiseStepStats,
+    StepBenchResult, StepFinishMode,
     StepForwardOutput, StepProbeResult, StepQ4MpsParityResult, StepSmokeConfig, StepSmokeResult,
     CANVAS,
 };
@@ -65,7 +67,7 @@ pub use step_config::{log_validated_step_model, validate_step_model, ValidatedSt
 pub use step_generate::{generate_monolithic, generate_with_session, StepGenerateConfig, StepGenerateSession};
 pub use step_kv::{
     extend_monolithic_kv, monolithic_kv_prefix_max_diff, prefill_monolithic_kv_with_cache,
-    run_step_kv_audit, run_step_kv_mps_parity, MonolithicEncoderCache, StepKvAuditResult,
+    run_step_kv_audit, run_step_kv_mps_parity, run_step_attn_probe, MonolithicEncoderCache, StepKvAuditResult,
     StepKvMpsParityResult,
 };
 pub use telemetry::{ForwardTelemetry, SessionTelemetry, StepPhaseTelemetry};

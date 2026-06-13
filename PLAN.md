@@ -38,6 +38,8 @@ Interpretation:
 
 **Next P1.6 experiments:** `--steps 96`; q5 profile; f32 rowstats; HF/Python accept count on same logits; engine vs monolithic @ 30L text compare.
 
+**P1.6 trace tooling (2026-06):** Per-step denoise JSON (`--write-trace`) from `generate-monolithic`; HuggingFace reference via `python/scripts/dump_denoise_trace.py`; compare with `python/scripts/compare_denoise_trace.py`. Traces are ~few KB/step (entropy + accept + argmax prefix), not full logits/hidden states.
+
 ### Target
 
 Sustained **>= 8 tok/s end-to-end on 24 GiB base M-series; 25+ on Pro/Max 36 GiB**, with *readable* chat output. Per-step latency <= 1.8 s on M3 Pro near-term, <= 1.4 s stretch.

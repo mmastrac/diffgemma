@@ -50,6 +50,9 @@ pub const ARENA_BYTES: u64 = 25_628_672;
 
 pub const FULL_LAYERS: [usize; 5] = [5, 11, 17, 23, 29];
 
+/// k_gemm_q4/q8 tile kernels use ltid=lid.x and loop step 128 (4 simdgroups × 32 threads).
+const GEMM_THREADS_PER_TG: usize = 128;
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct LayerOffsets {
@@ -156,6 +159,10 @@ pub struct StepSmokeConfig {
     pub use_mps_q4: Option<bool>,
     /// Prompt token ids for encoder prefill into b4 (M1). When set, `StepParams.kv_len` = len.
     pub prefill_token_ids: Option<Vec<u32>>,
+    /// Match `generate-monolithic --no-early-stop` (disables confidence early stop).
+    pub no_early_stop: bool,
+    /// Encoder prefill/extend Q4 path (`DGQ_MPS_Q4` when `None`).
+    pub encoder_use_mps_q4: Option<bool>,
 }
 
 impl Default for StepSmokeConfig {
@@ -169,6 +176,8 @@ impl Default for StepSmokeConfig {
             finish: StepFinishMode::Full,
             use_mps_q4: None,
             prefill_token_ids: None,
+            no_early_stop: false,
+            encoder_use_mps_q4: None,
         }
     }
 }
@@ -180,6 +189,7 @@ pub struct StepSmokeResult {
     pub mean_entropy: f32,
     pub min_entropy: f32,
     pub low_entropy_positions: u32,
+    pub accept_count: u32,
     pub ids: [u32; CANVAS],
     pub logits_finite: bool,
     pub max_abs_logit: f32,
@@ -342,7 +352,10 @@ pub fn step_use_mps_q4_default() -> bool {
 }
 
 fn step_use_mps_q4_from_env() -> bool {
-    step_use_mps_q4_default()
+    match std::env::var("DGQ_STEP_MPS_Q4") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => crate::metal::engine::default_use_mps_q4(),
+    }
 }
 
 struct StepPipelines {
@@ -692,8 +705,8 @@ impl StepEnc<'_> {
             depth: 1,
         };
         let tg = MTLSize {
-            width: 32,
-            height: 32,
+            width: GEMM_THREADS_PER_TG,
+            height: 1,
             depth: 1,
         };
         self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
@@ -848,8 +861,8 @@ impl StepEnc<'_> {
             depth: 1,
         };
         let tg = MTLSize {
-            width: 32,
-            height: 32,
+            width: GEMM_THREADS_PER_TG,
+            height: 1,
             depth: 1,
         };
         self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
@@ -879,8 +892,8 @@ impl StepEnc<'_> {
             depth: 1,
         };
         let tg = MTLSize {
-            width: 32,
-            height: 32,
+            width: GEMM_THREADS_PER_TG,
+            height: 1,
             depth: 1,
         };
         self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
@@ -911,8 +924,8 @@ impl StepEnc<'_> {
             depth: 1,
         };
         let tg = MTLSize {
-            width: 32,
-            height: 32,
+            width: GEMM_THREADS_PER_TG,
+            height: 1,
             depth: 1,
         };
         self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
@@ -974,7 +987,18 @@ impl StepEnc<'_> {
                 let zero: u32 = 0;
                 set_bytes(&self.enc, &zero, 5);
             }
-            self.dispatch_2d(&self.ps.sc_softembed, HID / 64, CANVAS, 64, 1);
+            // One TG per (64-dim slice, canvas token): tgid.x = dim-block, tgid.y = tok.
+            let grid = MTLSize {
+                width: (HID as usize + 63) / 64,
+                height: CANVAS,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: 64,
+                height: 1,
+                depth: 1,
+            };
+            self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
         }
         Ok(())
     }
@@ -1610,9 +1634,18 @@ impl StepRuntime {
     fn run_forward_once(&mut self, finish: StepFinishMode) -> Result<(), Error> {
         let layout = self.layout;
         let layers = self.layers;
+        let st_before: CanvasState = read_struct(&self.bufs.state);
+        if crate::metal::embed::sc_log_enabled() && st_before.step >= 1 {
+            let elems = CANVAS * VOCAB;
+            let sample = elems.min(8192);
+            let (nf, mx) = half_buffer_stats(&self.bufs.logits, 0, elems, sample);
+            eprintln!(
+                "monolithic pre-sc: st.step={} logits_max_abs={:.4} non_finite_sample={}",
+                st_before.step, mx, nf
+            );
+        }
         self.dispatch_and_wait(|enc| {
-            let st: CanvasState = read_struct(&enc.bufs.state);
-            let first_step = if st.step == 0 { 1u32 } else { 0u32 };
+            let first_step = if st_before.step == 0 { 1u32 } else { 0u32 };
             enc.encode_step_preamble(&layout, first_step)?;
             for layer in 0..layers {
                 enc.encode_layer(layer, &layout)?;
@@ -1719,22 +1752,13 @@ pub fn build_step_runtime(
 
     log_step_memory_budget(store.blob_bytes(), cfg.max_seq, &layout, use_sc_gemm);
 
-    let sampler = SamplerConfig::default();
+    let sampler = crate::sample::sampler_for_steps(cfg.steps.max(1), cfg.no_early_stop);
     let prefill_len = cfg
         .prefill_token_ids
         .as_ref()
         .map(|t| t.len() as u32)
         .unwrap_or(cfg.kv_len);
-    let params = StepParams {
-        kv_len: prefill_len,
-        max_steps: cfg.steps.max(1) as u32,
-        entropy_bound: sampler.entropy_bound,
-        t_min: sampler.t_min,
-        t_max: sampler.t_max,
-        conf_threshold: sampler.confidence_threshold,
-        stability_threshold: sampler.stability_threshold as u32,
-        min_early_stop_steps: crate::sample::MIN_EARLY_STOP_STEPS,
-    };
+    let params = step_params_from_sampler(&sampler, prefill_len, cfg.no_early_stop);
     let state = init_canvas_state(cfg.seed, VOCAB);
     let (mps_x_bytes, mps_w_bytes, mps_c_bytes) = mps_scratch_bytes();
 
@@ -1773,8 +1797,15 @@ pub fn build_step_runtime(
     zero_buffer(&bufs.logits);
 
     if let Some(ref token_ids) = cfg.prefill_token_ids {
-        let kv_len = crate::metal::step_kv::prefill_monolithic_kv(
+        let mut encoder = crate::metal::step_kv::MonolithicEncoderCache::open_opt(
             model_dir,
+            CANVAS,
+            cfg.max_seq,
+            Some(std::sync::Arc::clone(&gpu_blob)),
+            cfg.encoder_use_mps_q4,
+        )?;
+        let (kv_len, _) = crate::metal::step_kv::prefill_monolithic_kv_with_cache(
+            &mut encoder,
             token_ids,
             &bufs.kvcache,
             &layout,
@@ -1955,6 +1986,8 @@ pub fn run_step_q4_mps_parity(
         finish: StepFinishMode::ForwardOnly,
         use_mps_q4: Some(false),
         prefill_token_ids,
+        no_early_stop: false,
+        encoder_use_mps_q4: None,
     };
     let mut mps_cfg = base.clone();
     mps_cfg.use_mps_q4 = Some(true);
@@ -1996,6 +2029,73 @@ pub fn run_step_q4_mps_parity(
     })
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct DenoiseStepStats {
+    pub accept_count: u32,
+    pub mean_entropy: f32,
+    pub min_entropy: f32,
+    pub low_entropy_positions: u32,
+}
+
+/// Chat-templated `-p Hello` prefill token ids (matches `generate-monolithic` default).
+pub fn hello_chat_prefill_token_ids(model_dir: &Path) -> Result<Vec<u32>, Error> {
+    use crate::chat_template::{format_chat_token_ids, ChatFormatOptions, ChatTurn};
+    use crate::tokenizer::Tokenizer;
+    let tok = Tokenizer::load(&model_dir.join("tokenizer.json"))?;
+    format_chat_token_ids(
+        &tok,
+        &[ChatTurn::user("Hello")],
+        &ChatFormatOptions::default(),
+    )
+}
+
+/// Run exactly one monolithic denoise step (forward + GPU sampler) and return its stats.
+pub fn run_single_denoise_step(
+    model_dir: &Path,
+    cfg: &StepSmokeConfig,
+) -> Result<DenoiseStepStats, Error> {
+    let mut one = cfg.clone();
+    one.steps = 1;
+    one.finish = StepFinishMode::Full;
+    let steps = run_denoise_steps(model_dir, &one)?;
+    steps
+        .into_iter()
+        .next()
+        .ok_or(Error::Format("denoise step produced no stats"))
+}
+
+/// Run `cfg.steps` monolithic denoise iterations; one stats record per iteration.
+pub fn run_denoise_steps(
+    model_dir: &Path,
+    cfg: &StepSmokeConfig,
+) -> Result<Vec<DenoiseStepStats>, Error> {
+    if cfg.finish != StepFinishMode::Full {
+        return Err(Error::Format("run_denoise_steps requires StepFinishMode::Full"));
+    }
+    let steps = cfg.steps.max(1);
+    let (mut rt, _) = build_step_runtime(model_dir, cfg)?;
+    let sampler = crate::sample::sampler_for_steps(steps, cfg.no_early_stop);
+    let params = step_params_from_sampler(&sampler, rt.read_params().kv_len, cfg.no_early_stop);
+    let mut rng = Rng::new(cfg.seed);
+    rt.reset_block(VOCAB, &mut rng, params);
+    let mut out = Vec::with_capacity(steps);
+    for _ in 0..steps {
+        rt.run_denoise_step()?;
+        let st = rt.read_canvas_state();
+        let ent = crate::sample::step_entropy_stats(&st.entropy, &st.accept);
+        out.push(DenoiseStepStats {
+            accept_count: ent.accept_count,
+            mean_entropy: st.mean_entropy,
+            min_entropy: ent.min_entropy,
+            low_entropy_positions: ent.low_entropy_positions,
+        });
+        if st.stop_flag != 0 && !cfg.no_early_stop {
+            break;
+        }
+    }
+    Ok(out)
+}
+
 pub fn run_step_smoke(model_dir: &Path, cfg: StepSmokeConfig) -> Result<StepSmokeResult, Error> {
     let finish = cfg.finish;
     let steps = cfg.steps;
@@ -2017,7 +2117,7 @@ pub fn run_step_smoke(model_dir: &Path, cfg: StepSmokeConfig) -> Result<StepSmok
         eprintln!("step-smoke: completed denoise step {}/{}", step_i + 1, steps);
         if finish == StepFinishMode::Full {
             let st: CanvasState = read_struct(&rt.bufs.state);
-            if st.stop_flag != 0 {
+            if st.stop_flag != 0 && !cfg.no_early_stop {
                 eprintln!("step-smoke: early stop at step {}", st.step);
                 break;
             }
@@ -2035,6 +2135,7 @@ pub fn run_step_smoke(model_dir: &Path, cfg: StepSmokeConfig) -> Result<StepSmok
         mean_entropy: final_state.mean_entropy,
         min_entropy: ent_stats.min_entropy,
         low_entropy_positions: ent_stats.low_entropy_positions,
+        accept_count: ent_stats.accept_count,
         ids: final_state.ids,
         logits_finite,
         max_abs_logit,
@@ -2046,6 +2147,78 @@ pub fn run_step_smoke(model_dir: &Path, cfg: StepSmokeConfig) -> Result<StepSmok
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn forward_row_entropy_probe() {
+        use crate::sample::token_entropy;
+        let dir = Path::new("/tmp/quantized-weights");
+        if !crate::dgq::store::looks_like_dgq_dir(dir) {
+            return;
+        }
+        let cfg = StepSmokeConfig {
+            layers: 3,
+            finish: StepFinishMode::ForwardOnly,
+            use_mps_q4: Some(false),
+            ..StepSmokeConfig::default()
+        };
+        let out = run_step_forward(dir, &cfg).expect("forward");
+        let ent = token_entropy(&out.logits, CANVAS, VOCAB);
+        for row in 0..CANVAS {
+            let base = row * VOCAB;
+            let row_logits = &out.logits[base..base + VOCAB];
+            let all_zero = row_logits.iter().all(|&v| v == 0.0);
+            assert!(!all_zero, "row {row} logits all zero (GEMM tg regression)");
+        }
+        let min_h = ent.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max_h = ent.iter().cloned().fold(0.0f32, f32::max);
+        eprintln!("forward 3L row entropy: min={min_h:.3} max={max_h:.3}");
+        assert!(max_h < 12.4, "uniform row entropy {max_h}");
+    }
+
+    #[test]
+    fn monolith_one_step_accept_regression() {
+        // MLX @ 30L/Hello/seed42 accepts ~196 positions on denoise step 1 alone.
+        // `.dgq` sharpens over the 8-step block; GEMM tg=(128,1,1) bug held ~1 accept/step
+        // (~8 total) with mean_entropy~10. Healthy cumulative accept >> 150.
+        const MIN_ACCEPT: u32 = 150;
+        let dir = Path::new("/tmp/quantized-weights");
+        if !crate::dgq::store::looks_like_dgq_dir(dir) {
+            eprintln!("skip monolith_one_step_accept_regression: no weights at /tmp/quantized-weights");
+            return;
+        }
+        let prefill = hello_chat_prefill_token_ids(dir).expect("hello prefill");
+        let cfg = StepSmokeConfig {
+            layers: 30,
+            steps: 8,
+            kv_len: 0,
+            seed: 42,
+            max_seq: 512,
+            finish: StepFinishMode::Full,
+            use_mps_q4: Some(false),
+            encoder_use_mps_q4: Some(false),
+            prefill_token_ids: Some(prefill),
+            no_early_stop: true,
+        };
+        let steps = run_denoise_steps(dir, &cfg).expect("monolith denoise block");
+        assert!(!steps.is_empty(), "denoise block produced no steps");
+        let accepts: Vec<u32> = steps.iter().map(|s| s.accept_count).collect();
+        let total_accept: u32 = accepts.iter().sum();
+        eprintln!(
+            "monolith 30L block: steps={} accept/step={accepts:?} total_accept={} step1(mean_H={:.3})",
+            steps.len(),
+            total_accept,
+            steps[0].mean_entropy,
+        );
+        assert!(
+            steps[0].mean_entropy < 6.0,
+            "step1 mean_entropy {:.3} (GEMM tg bug ~10)",
+            steps[0].mean_entropy
+        );
+        assert!(
+            total_accept > MIN_ACCEPT,
+            "total accept {total_accept} accept/step={accepts:?} (GEMM tg bug ~1/step, sum~8)",
+        );
+    }
 
     #[test]
     fn step_smoke_runs_if_weights_present() {

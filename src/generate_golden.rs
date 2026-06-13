@@ -309,6 +309,7 @@ mod tests {
             max_layers: Some(3),
             no_early_stop: false,
             deterministic: false,
+            trace_prompt: None,
         };
         assert!(g.matches_config("Hello", &cfg, 1, "dgq_q4"));
         assert!(!g.matches_config("Hello", &cfg, 1, "safetensors"));
@@ -350,6 +351,8 @@ mod tests {
                 extend_elapsed: std::time::Duration::ZERO,
                 #[cfg(all(feature = "metal", target_os = "macos"))]
                 session_telemetry: crate::metal::SessionTelemetry::default(),
+                #[cfg(all(feature = "metal", target_os = "macos"))]
+                denoise_trace: None,
             }
         }
 

@@ -179,6 +179,86 @@ impl Q8LinearGpu {
         let off = self.byte_offset + self.row_offset as u64 * self.row_stride() as u64;
         (&self.blob.buffer, off)
     }
+
+    /// Decode per-row bf16 scale at row `r` (CPU reference for q8 row layout).
+    pub fn row_scale_f32(&self, row: usize) -> f32 {
+        let stride = self.row_stride();
+        let (_, base) = self.weight_buffer();
+        let byte = base as usize + row * stride;
+        let ptr = unsafe {
+            self.blob.buffer.contents().as_ptr().add(byte) as *const u8
+        };
+        let bits = u16::from_le_bytes([unsafe { *ptr }, unsafe { *ptr.add(1) }]);
+        bf16_bits_to_f32(bits)
+    }
+}
+
+fn bf16_bits_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let mant = (bits & 0x3ff) as u32;
+    if exp == 0 {
+        if mant == 0 {
+            return if sign == 1 { -0.0 } else { 0.0 };
+        }
+        let val = (mant as f32) * 2f32.powi(-24);
+        return if sign == 1 { -val } else { val };
+    }
+    if exp == 0x1f {
+        return if mant == 0 {
+            if sign == 1 {
+                f32::NEG_INFINITY
+            } else {
+                f32::INFINITY
+            }
+        } else {
+            f32::NAN
+        };
+    }
+    f32::from_bits((sign << 31) | ((exp + 112) << 23) | (mant << 13))
+}
+
+/// Histogram q8 row scales for chunk; also show scales the old f32_q8_linear kernel would read.
+pub fn log_q8_chunk_scale_histogram(w: &Q8LinearGpu, k_dim: usize, hidden: usize) {
+    let rows = w.out_dim;
+    let mut ok = 0usize;
+    let mut huge = 0usize;
+    let mut max_scale = 0.0f32;
+    for r in 0..rows {
+        let s = w.row_scale_f32(r);
+        max_scale = max_scale.max(s.abs());
+        if s.is_finite() && s.abs() < 1e3 {
+            ok += 1;
+        } else {
+            huge += 1;
+        }
+    }
+    eprintln!(
+        "q8 chunk scales (correct row_stride={}): rows={rows} ok={ok} huge={huge} max_abs={max_scale:.6}",
+        w.row_stride()
+    );
+
+    // Old kernel: row index = hidden col, row_stride = 2 + k_dim (vocab chunk size).
+    let wrong_stride = 2 + k_dim;
+    let wrong_rows = hidden.min(rows);
+    let mut wrong_huge = 0usize;
+    let mut wrong_max = 0.0f32;
+    let (_, base) = w.weight_buffer();
+    for col in 0..wrong_rows {
+        let byte = base as usize + col * wrong_stride;
+        let ptr = unsafe {
+            w.blob.buffer.contents().as_ptr().add(byte) as *const u8
+        };
+        let bits = u16::from_le_bytes([unsafe { *ptr }, unsafe { *ptr.add(1) }]);
+        let s = bf16_bits_to_f32(bits);
+        wrong_max = wrong_max.max(s.abs());
+        if !s.is_finite() || s.abs() >= 1e3 {
+            wrong_huge += 1;
+        }
+    }
+    eprintln!(
+        "q8 chunk scales (old f32_q8_linear indexing, stride={wrong_stride}): sampled={wrong_rows} huge={wrong_huge} max_abs={wrong_max:.6e}"
+    );
 }
 
 pub fn parse_kind(s: &str) -> Result<QuantKind, Error> {

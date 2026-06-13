@@ -24,6 +24,8 @@ pub struct GenerateConfig {
     pub no_early_stop: bool,
     /// Parity / golden tests: native Q4 kernels + CPU sampler (deterministic, slower).
     pub deterministic: bool,
+    /// Optional label stored in denoise trace JSON.
+    pub trace_prompt: Option<String>,
 }
 
 impl Default for GenerateConfig {
@@ -35,6 +37,7 @@ impl Default for GenerateConfig {
             max_layers: None,
             no_early_stop: false,
             deterministic: false,
+            trace_prompt: None,
         }
     }
 }
@@ -54,6 +57,8 @@ pub struct GenerateOutput {
     pub extend_elapsed: std::time::Duration,
     #[cfg(all(feature = "metal", target_os = "macos"))]
     pub session_telemetry: crate::metal::SessionTelemetry,
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    pub denoise_trace: Option<crate::denoise_trace::DenoiseTrace>,
 }
 
 enum DecoderBackend<'a> {
@@ -233,6 +238,9 @@ fn generate_inner(
     let mut extend_elapsed = std::time::Duration::ZERO;
     #[cfg(all(feature = "metal", target_os = "macos"))]
     let mut session_telemetry = crate::metal::SessionTelemetry::default();
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    let mut step_traces = Vec::new();
+    let max_denoise_steps = gen_cfg.sampler.max_denoising_steps.max(1);
 
     for _block in 0..max_blocks {
         if sequences.len() >= prompt_token_ids.len() + gen_cfg.max_new_tokens {
@@ -260,6 +268,10 @@ fn generate_inner(
 
         let denoise_started = std::time::Instant::now();
         #[cfg(all(feature = "metal", target_os = "macos"))]
+        let block_idx = blocks_committed + 1;
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        let mut block_step_count = 0u32;
+        #[cfg(all(feature = "metal", target_os = "macos"))]
         if let DecoderBackend::Gpu { scratch, .. } = decoder {
             scratch.have_gpu_sc_logits = false;
         }
@@ -276,6 +288,12 @@ fn generate_inner(
 
             #[cfg(not(all(feature = "metal", target_os = "macos")))]
             let gpu_sampler = false;
+
+            if std::env::var("DGQ_LOG_SC").ok().as_deref() == Some("1") {
+                eprintln!(
+                    "engine denoise: cur_step={cur_step} have_sc_logits={have_sc_logits} gpu_sampler={gpu_sampler}"
+                );
+            }
 
             let decoder_started = std::time::Instant::now();
             #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -431,6 +449,43 @@ fn generate_inner(
             argmax_canvas_tokens = step_argmax;
             let decoder_ms = decoder_started.elapsed().as_secs_f64() * 1000.0;
             #[cfg(all(feature = "metal", target_os = "macos"))]
+            {
+                use crate::denoise_trace::step_trace_from_stats;
+                use crate::sample::{accept_mask_from_entropies, step_entropy_stats, token_entropy};
+                block_step_count += 1;
+                let (stats, argmax_for_trace) = if gpu_sampler {
+                    let DecoderBackend::Gpu { scratch, .. } = decoder else {
+                        return Err(Error::Format("gpu sampler backend mismatch"));
+                    };
+                    let mask = accept_mask_from_entropies(
+                        &scratch.sampler.entropies,
+                        gen_cfg.sampler.entropy_bound,
+                    );
+                    let accept_u32: Vec<u32> = mask.iter().map(|&b| u32::from(b)).collect();
+                    (
+                        step_entropy_stats(&scratch.sampler.entropies, &accept_u32),
+                        scratch.sampler.argmax.clone(),
+                    )
+                } else {
+                    let ent = token_entropy(&processed_logits, canvas_len, vocab);
+                    let mask =
+                        accept_mask_from_entropies(&ent, gen_cfg.sampler.entropy_bound);
+                    let accept_u32: Vec<u32> = mask.iter().map(|&b| u32::from(b)).collect();
+                    (
+                        step_entropy_stats(&ent, &accept_u32),
+                        argmax_canvas(&processed_logits, canvas_len, vocab),
+                    )
+                };
+                step_traces.push(step_trace_from_stats(
+                    block_idx as u32,
+                    block_step_count,
+                    max_denoise_steps,
+                    &stats,
+                    &argmax_for_trace,
+                    step_finished,
+                ));
+            }
+            #[cfg(all(feature = "metal", target_os = "macos"))]
             if matches!(decoder, DecoderBackend::Gpu { .. }) {
                 session_telemetry.steps.push(crate::metal::StepPhaseTelemetry {
                     decoder_ms,
@@ -459,18 +514,89 @@ fn generate_inner(
         blocks_committed += 1;
     }
 
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    let (block_steps_eff, last_block_accept_hist, last_block_min_entropy_hist, denoise_trace) = {
+        use crate::denoise_trace::{DenoiseTrace, SCHEMA_VERSION};
+        let last_block = blocks_committed.max(1) as u32;
+        let block_traces: Vec<_> = step_traces
+            .iter()
+            .filter(|s| s.block == last_block)
+            .collect();
+        let last_block_accept_hist = block_traces.iter().map(|s| s.accept_count).collect();
+        let last_block_min_entropy_hist = block_traces.iter().map(|s| s.min_entropy).collect();
+        let block_steps_eff = vec![block_traces.len() as u32];
+        let layers = gen_cfg
+            .max_layers
+            .unwrap_or(cfg.text_config.num_hidden_layers);
+        let trace = DenoiseTrace {
+            schema_version: SCHEMA_VERSION,
+            source: "rust-engine".into(),
+            prompt: gen_cfg.trace_prompt.clone().unwrap_or_default(),
+            prompt_token_ids: prompt_token_ids.to_vec(),
+            seed: gen_cfg.seed,
+            max_denoise_steps,
+            layers,
+            max_new_tokens: gen_cfg.max_new_tokens,
+            weights_profile: Some(if store.is_quantized() {
+                "dgq_q4".into()
+            } else {
+                "safetensors".into()
+            }),
+            entropy_bound: gen_cfg.sampler.entropy_bound,
+            step_traces: step_traces.clone(),
+            denoise_steps_run,
+            blocks_committed,
+            output_token_ids: sequences.clone(),
+        };
+        (
+            block_steps_eff,
+            last_block_accept_hist,
+            last_block_min_entropy_hist,
+            Some(trace),
+        )
+    };
+
     Ok(GenerateOutput {
         token_ids: sequences,
         denoise_steps_run,
         blocks_committed,
-        block_steps_eff: Vec::new(),
-        last_block_accept_hist: Vec::new(),
-        last_block_min_entropy_hist: Vec::new(),
+        block_steps_eff: {
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            {
+                block_steps_eff
+            }
+            #[cfg(not(all(feature = "metal", target_os = "macos")))]
+            {
+                Vec::new()
+            }
+        },
+        last_block_accept_hist: {
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            {
+                last_block_accept_hist
+            }
+            #[cfg(not(all(feature = "metal", target_os = "macos")))]
+            {
+                Vec::new()
+            }
+        },
+        last_block_min_entropy_hist: {
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            {
+                last_block_min_entropy_hist
+            }
+            #[cfg(not(all(feature = "metal", target_os = "macos")))]
+            {
+                Vec::new()
+            }
+        },
         prefill_elapsed,
         denoise_elapsed,
         extend_elapsed,
         #[cfg(all(feature = "metal", target_os = "macos"))]
         session_telemetry,
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        denoise_trace,
     })
 }
 
@@ -525,6 +651,7 @@ pub fn generate_monolithic_gpu(
     prompt_token_ids: &[u32],
     gen_cfg: &GenerateConfig,
     max_seq: usize,
+    prompt_label: &str,
 ) -> Result<GenerateOutput, Error> {
     use crate::metal::{generate_monolithic, step_use_mps_q4_default, validate_step_model, StepGenerateConfig};
     let validated = validate_step_model(model_dir)?;
@@ -551,7 +678,7 @@ pub fn generate_monolithic_gpu(
         cfg.step_use_mps_q4 = Some(false);
         cfg.encoder_use_mps_q4 = Some(false);
     }
-    generate_monolithic(model_dir, prompt_token_ids, &cfg)
+    generate_monolithic(model_dir, prompt_token_ids, &cfg, prompt_label)
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -594,6 +721,7 @@ mod gpu_determinism {
             max_layers: Some(DGQ_MAX_LAYERS),
             no_early_stop: false,
             deterministic: true,
+            trace_prompt: None,
         }
     }
 
