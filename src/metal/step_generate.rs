@@ -7,7 +7,7 @@ use crate::metal::step_kernel::{
 };
 use crate::metal::step_kv::{extend_monolithic_kv, prefill_monolithic_kv};
 use crate::metal::{ForwardTelemetry, SessionTelemetry, StepPhaseTelemetry};
-use crate::sample::{initialize_canvas, Rng, SamplerConfig};
+use crate::sample::{initialize_canvas, Rng, SamplerConfig, step_entropy_stats};
 use crate::safetensors::Error;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -131,6 +131,7 @@ pub fn generate_with_session(
     let mut blocks_committed = 0usize;
     let mut block_steps_eff = Vec::new();
     let mut last_block_accept_hist = Vec::new();
+    let mut last_block_min_entropy_hist = Vec::new();
     let mut denoise_elapsed = Duration::ZERO;
     let mut extend_elapsed = Duration::ZERO;
     let mut session_telemetry = SessionTelemetry::default();
@@ -153,6 +154,7 @@ pub fn generate_with_session(
         let block_started = Instant::now();
         let mut block_step_count = 0u32;
         let mut accept_hist = Vec::new();
+        let mut min_entropy_hist = Vec::new();
         loop {
             let step_started = Instant::now();
             rt.run_denoise_step()?;
@@ -166,8 +168,9 @@ pub fn generate_with_session(
             denoise_steps_run += 1;
             block_step_count += 1;
             let st = rt.read_canvas_state();
-            let accepted = st.accept.iter().filter(|&&a| a != 0).count() as u32;
-            accept_hist.push(accepted);
+            let stats = step_entropy_stats(&st.entropy, &st.accept);
+            accept_hist.push(stats.accept_count);
+            min_entropy_hist.push(stats.min_entropy);
             if st.stop_flag != 0 {
                 break;
             }
@@ -178,8 +181,19 @@ pub fn generate_with_session(
         denoise_elapsed += block_started.elapsed();
         block_steps_eff.push(block_step_count);
         last_block_accept_hist = accept_hist.clone();
+        last_block_min_entropy_hist = min_entropy_hist.clone();
+        let late = accept_hist.len().saturating_sub(8);
+        let late_accept: u32 = accept_hist.get(late..).unwrap_or(&[]).iter().sum();
+        let late_min_ent = min_entropy_hist
+            .get(late..)
+            .and_then(|s| s.iter().copied().reduce(f32::min))
+            .unwrap_or(f32::NAN);
         eprintln!(
-            "step-generate: block {} steps_eff={block_step_count} accept/step={accept_hist:?}",
+            "step-generate: block {} steps_eff={block_step_count} accept/step={accept_hist:?} min_ent/step={min_entropy_hist:?}",
+            blocks_committed + 1
+        );
+        eprintln!(
+            "step-generate: block {} late-window (last 8 steps): accept_sum={late_accept} min_ent={late_min_ent:.4} (expect accept/step~15-20 when min_ent << 0.1)",
             blocks_committed + 1
         );
 
@@ -215,6 +229,7 @@ pub fn generate_with_session(
         blocks_committed,
         block_steps_eff,
         last_block_accept_hist,
+        last_block_min_entropy_hist,
         prefill_elapsed,
         denoise_elapsed,
         extend_elapsed,

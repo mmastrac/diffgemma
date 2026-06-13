@@ -1,0 +1,11 @@
+{
+  "name": "sampler_accept_entropy",
+  "profile": "monolithic",
+  "note": "HF EntropyBoundSampler accept counts on synthetic per-position entropies (nats); bound=0.1",
+  "entropy_bound": 0.1,
+  "cases": [
+    { "entropies_uniform": 0.005, "canvas_len": 256, "expect_accept": 20 },
+    { "entropies_uniform": 0.15, "canvas_len": 256, "expect_accept": 1 },
+    { "entropies_uniform": 0.04, "canvas_len": 256, "expect_accept": 3 }
+  ]
+}

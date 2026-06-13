@@ -179,6 +179,63 @@ pub fn mean_entropy(entropies: &[f32]) -> f32 {
     }
 }
 
+/// Per-step sampler diagnostics (monolithic readback of `CanvasState.entropy`).
+#[derive(Debug, Clone, Copy)]
+pub struct StepEntropyStats {
+    pub accept_count: u32,
+    pub min_entropy: f32,
+    pub mean_entropy: f32,
+    pub max_entropy: f32,
+}
+
+pub fn step_entropy_stats(entropies: &[f32], accept: &[u32]) -> StepEntropyStats {
+    let accept_count = accept.iter().filter(|&&a| a != 0).count() as u32;
+    let (min_entropy, max_entropy) = entropies.iter().fold((f32::INFINITY, 0.0f32), |(mn, mx), &e| {
+        (mn.min(e), mx.max(e))
+    });
+    StepEntropyStats {
+        accept_count,
+        min_entropy: if entropies.is_empty() {
+            0.0
+        } else {
+            min_entropy
+        },
+        mean_entropy: mean_entropy(entropies),
+        max_entropy,
+    }
+}
+
+/// HuggingFace `EntropyBoundSampler.accept_canvas` selection mask:
+/// accept sorted position `i` when `sum(entropy[0..i-1]) <= bound`.
+pub fn accept_mask_from_entropies(entropies: &[f32], entropy_bound: f32) -> Vec<bool> {
+    let n = entropies.len();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        entropies[a]
+            .partial_cmp(&entropies[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut mask = vec![false; n];
+    let mut prefix = 0.0f32;
+    for &idx in &order {
+        if prefix <= entropy_bound {
+            mask[idx] = true;
+            prefix += entropies[idx];
+        } else {
+            break;
+        }
+    }
+    mask
+}
+
+pub fn accept_count_from_entropies(entropies: &[f32], entropy_bound: f32) -> usize {
+    accept_mask_from_entropies(entropies, entropy_bound)
+        .iter()
+        .filter(|&&m| m)
+        .count()
+}
+
 /// Accept lowest-entropy positions until the entropy-bound constraint is met.
 pub fn accept_canvas(
     current: &[u32],
@@ -192,19 +249,7 @@ pub fn accept_canvas(
     assert_eq!(denoiser.len(), canvas_len);
 
     let ent = token_entropy(processed_logits, canvas_len, vocab_size);
-    let mut order: Vec<usize> = (0..canvas_len).collect();
-    order.sort_by(|&a, &b| ent[a].partial_cmp(&ent[b]).unwrap_or(std::cmp::Ordering::Equal));
-
-    let mut accepted_mask = vec![false; canvas_len];
-    let mut prefix_sum = 0.0f32;
-    for &idx in &order {
-        if prefix_sum <= entropy_bound {
-            accepted_mask[idx] = true;
-            prefix_sum += ent[idx];
-        } else {
-            break;
-        }
-    }
+    let accepted_mask = accept_mask_from_entropies(&ent, entropy_bound);
 
     let mut accepted = current.to_vec();
     for i in 0..canvas_len {
@@ -227,23 +272,7 @@ pub fn accept_canvas_from_entropies(
     assert_eq!(denoiser.len(), canvas_len);
     assert_eq!(entropies.len(), canvas_len);
 
-    let mut order: Vec<usize> = (0..canvas_len).collect();
-    order.sort_by(|&a, &b| {
-        entropies[a]
-            .partial_cmp(&entropies[b])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let mut accepted_mask = vec![false; canvas_len];
-    let mut prefix_sum = 0.0f32;
-    for &idx in &order {
-        if prefix_sum <= entropy_bound {
-            accepted_mask[idx] = true;
-            prefix_sum += entropies[idx];
-        } else {
-            break;
-        }
-    }
+    let accepted_mask = accept_mask_from_entropies(entropies, entropy_bound);
 
     let mut accepted = current.to_vec();
     for i in 0..canvas_len {
@@ -384,6 +413,23 @@ mod tests {
         let cfg = SamplerConfig::default();
         assert!((cfg.temperature_at_step(48) - 0.8).abs() < 1e-5);
         assert!((cfg.temperature_at_step(1) - 0.4083333).abs() < 1e-4);
+    }
+
+    #[test]
+    fn accept_hf_bound_accepts_many_low_entropy_positions() {
+        let ent = vec![0.005f32; 256];
+        assert_eq!(accept_count_from_entropies(&ent, 0.1), 20);
+        let ent_high = vec![0.15f32; 256];
+        assert_eq!(accept_count_from_entropies(&ent_high, 0.1), 1);
+    }
+
+    #[test]
+    fn step_entropy_stats_counts_accept_mask() {
+        let ent = vec![0.05f32; 4];
+        let accept = vec![1u32, 0, 1, 0];
+        let s = step_entropy_stats(&ent, &accept);
+        assert_eq!(s.accept_count, 2);
+        assert!((s.min_entropy - 0.05).abs() < 1e-6);
     }
 
     #[test]

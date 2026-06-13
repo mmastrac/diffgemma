@@ -47,6 +47,8 @@ pub struct GenerateOutput {
     pub block_steps_eff: Vec<u32>,
     /// Accepted positions per step in the last committed block.
     pub last_block_accept_hist: Vec<u32>,
+    /// Min per-position entropy (nats) each denoise step in the last block.
+    pub last_block_min_entropy_hist: Vec<f32>,
     pub prefill_elapsed: std::time::Duration,
     pub denoise_elapsed: std::time::Duration,
     pub extend_elapsed: std::time::Duration,
@@ -463,6 +465,7 @@ fn generate_inner(
         blocks_committed,
         block_steps_eff: Vec::new(),
         last_block_accept_hist: Vec::new(),
+        last_block_min_entropy_hist: Vec::new(),
         prefill_elapsed,
         denoise_elapsed,
         extend_elapsed,

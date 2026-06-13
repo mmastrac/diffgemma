@@ -315,6 +315,25 @@ mod tests {
     }
 
     #[test]
+    fn sampler_accept_entropy_fixture() {
+        let path = resolve_fixture("sampler_accept_entropy");
+        let text = std::fs::read_to_string(&path).expect("fixture");
+        let v: serde_json::Value = serde_json::from_str(&text).expect("json");
+        let bound = v["entropy_bound"].as_f64().unwrap() as f32;
+        for case in v["cases"].as_array().unwrap() {
+            let e = case["entropies_uniform"].as_f64().unwrap() as f32;
+            let len = case["canvas_len"].as_u64().unwrap() as usize;
+            let expect = case["expect_accept"].as_u64().unwrap() as usize;
+            let ent = vec![e; len];
+            assert_eq!(
+                crate::sample::accept_count_from_entropies(&ent, bound),
+                expect,
+                "uniform e={e} len={len}"
+            );
+        }
+    }
+
+    #[test]
     fn chat_quality_rejects_pad_heavy_block() {
         use crate::sample::{FILLER_TOKEN_ID, PAD_TOKEN_ID};
 
@@ -325,6 +344,7 @@ mod tests {
                 blocks_committed: 1,
                 block_steps_eff: block_steps,
                 last_block_accept_hist: vec![16, 16],
+                last_block_min_entropy_hist: vec![0.05, 0.04],
                 prefill_elapsed: std::time::Duration::ZERO,
                 denoise_elapsed: std::time::Duration::ZERO,
                 extend_elapsed: std::time::Duration::ZERO,

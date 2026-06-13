@@ -2865,6 +2865,9 @@ fn print_generate_output(
     if !out.last_block_accept_hist.is_empty() {
         println!("  last accept/step:  {:?}", out.last_block_accept_hist);
     }
+    if !out.last_block_min_entropy_hist.is_empty() {
+        println!("  min_entropy/step:  {:?}", out.last_block_min_entropy_hist);
+    }
     print_generate_elapsed(label, elapsed);
     println!("  prefill:  {:.2}s ({:.2?})", out.prefill_elapsed.as_secs_f64(), out.prefill_elapsed);
     println!("  denoise:  {:.2}s ({:.2?})", out.denoise_elapsed.as_secs_f64(), out.denoise_elapsed);
