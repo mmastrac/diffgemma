@@ -128,6 +128,12 @@ pub static MANIFEST: Manifest = Manifest {
             variants: KernelVariants::Elementwise,
         },
         KernelSpec {
+            name: "sc_softembed",
+            entry: "sc_softembed",
+            quant_formats: &[QuantFormat::Q8],
+            variants: KernelVariants::Elementwise,
+        },
+        KernelSpec {
             name: "sc_probs",
             entry: "sc_probs",
             quant_formats: &[QuantFormat::Q4Affine],

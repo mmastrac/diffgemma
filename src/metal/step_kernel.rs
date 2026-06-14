@@ -505,7 +505,7 @@ impl StepPipelines {
             embed_gather: crate::kernels::sub::embed_gather::pipeline_for(ctx, prod)?,
             logit_rowstats: crate::kernels::sub::logit_rowstats::pipeline_for(ctx, prod)?,
             sc_probs: crate::kernels::sub::sc_probs::pipeline_for(ctx, prod)?,
-            sc_softembed: simple("k_sc_softembed")?,
+            sc_softembed: crate::kernels::sub::sc_softembed::pipeline_for(ctx, prod)?,
             half_scale: crate::kernels::sub::half_scale::pipeline_for(ctx, prod)?,
             softcap: crate::kernels::sub::softcap_half::pipeline_for(ctx, prod)?,
             sample_rowstats: simple("k_sample_rowstats")?,
@@ -1095,25 +1095,21 @@ impl StepEnc<'_> {
             self.gemm_q8_probs(A_SOFT, layout.embed, CANVAS as u32, HID as u32, VOCAB as u32)?;
             self.scale_half_arena(A_SOFT, CANVAS * HID as usize, (HID as f32).sqrt());
         } else {
+            use crate::dgq::embed_row::EMBED_SCALE;
+
             self.sink_set_pipeline(&self.ps.sc_softembed);
             self.bind_logits(0);
             self.sink_set_buffer(&self.bufs.arena, A_RS_SC as usize, 1);
             self.bind_blob(2);
-            self.bind_layout(3);
-            self.sink_set_buffer(&self.bufs.arena, A_SOFT as usize, 4);
-            let zero: u32 = 0;
-            self.sink_set_bytes(&zero, 5);
-            // One TG per (64-dim slice, canvas token): tgid.x = dim-block, tgid.y = tok.
-            let grid = MTLSize {
-                width: (HID as usize + 63) / 64,
-                height: CANVAS,
-                depth: 1,
-            };
-            let tg = MTLSize {
-                width: 64,
-                height: 1,
-                depth: 1,
-            };
+            self.sink_set_buffer(&self.bufs.arena, A_SOFT as usize, 3);
+            let first_step: u32 = 0;
+            self.sink_set_bytes(&layout.embed, 4);
+            self.sink_set_bytes(&first_step, 5);
+            let dims = [HID as u32, CANVAS as u32, VOCAB as u32];
+            self.sink_set_bytes(&dims, 6);
+            self.sink_set_bytes(&EMBED_SCALE, 7);
+            let (grid, tg) =
+                crate::kernels::sub::sc_softembed::dispatch_shape(HID, CANVAS);
             self.sink_dispatch(grid, tg);
         }
         Ok(())

@@ -43,6 +43,7 @@ fn shader_bundle_token() -> u64 {
         include_str!("../../shaders/kernels/half_to_f32.metal"),
         include_str!("../../shaders/kernels/logit_rowstats.metal"),
         include_str!("../../shaders/kernels/sc_probs.metal"),
+        include_str!("../../shaders/kernels/sc_softembed.metal"),
         include_str!("../../shaders/kernels/memzero_bytes.metal"),
         include_str!("../../shaders/kernels/residual_f32b.metal"),
         include_str!("../../shaders/kernels/residual_half.metal"),

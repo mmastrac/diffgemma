@@ -537,30 +537,7 @@ kernel void k_moe_grouped_nvfp4(device const half* moe_in [[buffer(0)]],
 // logit_rowstats -> shaders/kernels/logit_rowstats.metal
 // sc_probs -> shaders/kernels/sc_probs.metal
 
-// ============ k_sc_softembed: soft[m,d] = (softmax(prev logits) @ embed)[m,d] * sqrt(H) ============
-// Uses A_RS_SC (t=1 stats). first_step -> zeros (SC MLP still runs; VERIFY-SC).
-kernel void k_sc_softembed(device const half* logits [[buffer(0)]],
-                           device const float* rowstat [[buffer(1)]],
-                           device const uchar* blob [[buffer(2)]],
-                           device const ModelLayout* ML [[buffer(3)]],
-                           device half* soft [[buffer(4)]],
-                           constant uint& first_step [[buffer(5)]],
-                           uint3 tgid [[threadgroup_position_in_grid]],  // x: dim/64, y: token
-                           uint3 lid [[thread_position_in_threadgroup]]) { // 64
-    uint tok = tgid.y, d = tgid.x*64 + lid.x;
-    if (first_step) { soft[(ulong)tok*HID + d] = half(0); return; }
-    float mx = rowstat[tok*2], sum = rowstat[tok*2+1];
-    device const half* lr = logits + (ulong)tok * VOCAB;
-    float acc = 0.f;
-    for (uint v = 0; v < VOCAB; ++v) {
-        float p = exp(float(lr[v]) - mx) / sum;
-        device const uchar* row = blob + ML->embed + (ulong)v * q8_row_bytes(HID);
-        acc += p * q8_at(row, d, bf16_bytes(row));
-    }
-    soft[(ulong)tok*HID + d] = half(acc * EMBED_SCALE);
-    // PERF: O(vocab*hid) restream per step; replace with materialized-probs tiled q8 GEMM
-    // (reuse k_gemm_q8 with probs as x) once parity passes.
-}
+// sc_softembed -> shaders/kernels/sc_softembed.metal
 
 // ======================= sampler =======================
 // pass 1: tempered row stats -> A_RS_SAMP; entropy (nats); argmax + changed flag.
