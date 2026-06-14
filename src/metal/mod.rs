@@ -65,6 +65,7 @@ pub use step_kernel::{
     run_step_layer_hidden_probe, run_step_moe_layer_capture, run_step_moe_single_expert_capture,
     run_step_preamble_capture,
     run_step_probe, run_step_smoke, run_embed_row_gpu, run_step_q4_mps_parity, step_use_mps_q4_default,
+    step_use_sc_gemm_default,
     DenoiseStepStats, trace_entropy_enabled, LayerAttnCapture, LayerMoeCapture,
     PreambleCapture, SingleExpertMoeCapture,
     StepBenchResult, StepFinishMode, StepForwardOutput, StepProbeResult, StepQ4MpsParityResult,

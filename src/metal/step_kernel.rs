@@ -330,10 +330,15 @@ fn mps_scratch_bytes() -> (usize, usize, usize) {
     )
 }
 
+/// SC softembed backend: materialized probs + `k_gemm_q8_rowk` (default). Opt out with `DGQ_SC_GEMM=0`.
+pub fn step_use_sc_gemm_default() -> bool {
+    true
+}
+
 fn step_use_sc_gemm_from_env() -> bool {
     match std::env::var("DGQ_SC_GEMM") {
-        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
-        Err(_) => false,
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => step_use_sc_gemm_default(),
     }
 }
 
@@ -998,8 +1003,40 @@ impl StepEnc<'_> {
         self.dispatch_1d(&self.ps.half_scale, elems, 256);
     }
 
+    fn encode_sc_logit_rowstats(&mut self) {
+        self.enc
+            .setComputePipelineState(&self.ps.logit_rowstats.pipeline);
+        self.bind_logits(0);
+        unsafe {
+            self.enc.setBuffer_offset_atIndex(
+                Some(&self.bufs.arena),
+                A_RS_SC as usize,
+                1,
+            );
+        }
+        let grid = MTLSize {
+            width: CANVAS,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    }
+
     fn encode_sc_softembed(&mut self, layout: &ModelLayout) -> Result<(), Error> {
-        if self.use_sc_gemm {
+        self.encode_sc_softembed_path(layout, self.use_sc_gemm)
+    }
+
+    fn encode_sc_softembed_path(
+        &mut self,
+        layout: &ModelLayout,
+        use_gemm: bool,
+    ) -> Result<(), Error> {
+        if use_gemm {
             self.enc
                 .setComputePipelineState(&self.ps.sc_probs.pipeline);
             self.bind_logits(0);
@@ -2044,15 +2081,14 @@ impl StepRuntime {
                 st_before.step, mx, nf
             );
         }
+        let first_step = if st_before.step == 0 { 1u32 } else { 0u32 };
         self.dispatch_and_wait(|enc| {
-            let first_step = if st_before.step == 0 { 1u32 } else { 0u32 };
             enc.encode_step_preamble(&layout, first_step)?;
-            Ok(())
-        })?;
-        for layer in 0..layers {
-            self.encode_full_layer(layer)?;
-        }
-        self.dispatch_and_wait(|enc| {
+            for layer in 0..layers {
+                enc.encode_layer(layer, &layout)?;
+                enc.encode_layer_moe_grouped(layer, &layout)?;
+                enc.encode_layer_moe_post(layer, &layout)?;
+            }
             enc.encode_step_finish(&layout, finish)?;
             Ok(())
         })
@@ -3470,6 +3506,56 @@ mod tests {
                 "GPU decode mismatch k0={k0}"
             );
         }
+    }
+
+    #[test]
+    fn sc_gemm_softembed_matches_slow_kernel() {
+        let dir = Path::new("/tmp/quantized-weights");
+        if !crate::dgq::store::looks_like_dgq_dir(dir) {
+            eprintln!("skip sc_gemm_softembed_matches_slow_kernel");
+            return;
+        }
+        let cfg = StepSmokeConfig {
+            finish: StepFinishMode::Full,
+            steps: 1,
+            ..StepSmokeConfig::default()
+        };
+        let (mut rt, _) = build_step_runtime(dir, &cfg).expect("runtime");
+        let layout = rt.layout;
+        rt.run_forward_once(StepFinishMode::Full)
+            .expect("seed logits from step 1");
+
+        let soft_elems = CANVAS * HID;
+        rt.dispatch_and_wait(|enc| {
+            enc.encode_sc_logit_rowstats();
+            enc.encode_sc_softembed_path(&layout, false)?;
+            Ok(())
+        })
+        .expect("slow sc softembed");
+        let slow = read_half_buffer_f32(&rt.bufs.arena, A_SOFT as usize, soft_elems);
+
+        rt.dispatch_and_wait(|enc| {
+            enc.encode_sc_logit_rowstats();
+            enc.encode_sc_softembed_path(&layout, true)?;
+            Ok(())
+        })
+        .expect("fast sc gemm softembed");
+        let fast = read_half_buffer_f32(&rt.bufs.arena, A_SOFT as usize, soft_elems);
+
+        let mut dot = 0.0f64;
+        let mut na = 0.0f64;
+        let mut nb = 0.0f64;
+        let mut max_abs = 0.0f32;
+        for (a, b) in slow.iter().zip(fast.iter()) {
+            dot += *a as f64 * *b as f64;
+            na += *a as f64 * *a as f64;
+            nb += *b as f64 * *b as f64;
+            max_abs = max_abs.max((a - b).abs());
+        }
+        let cos = (dot / (na.sqrt() * nb.sqrt())) as f32;
+        eprintln!("sc softembed fast vs slow: cos={cos:.6} max_abs={max_abs:.6}");
+        assert!(cos > 0.999, "sc gemm cos={cos}");
+        assert!(max_abs < 0.05, "sc gemm max_abs={max_abs}");
     }
 
     #[test]
