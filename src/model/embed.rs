@@ -11,6 +11,8 @@ pub const LM_HEAD_CHUNK: usize = 4096;
 
 const EMBED_KEY: &str = "model.decoder.embed_tokens.weight";
 
+pub const EMBED_TENSOR: &str = EMBED_KEY;
+
 /// Token gather from bf16 or `.dgq` q8 embedding table.
 pub fn embed_tokens_from_store(
     store: &WeightStore,

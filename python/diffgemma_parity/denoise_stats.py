@@ -17,6 +17,20 @@ class StepStats:
     max_entropy: float
 
 
+def accept_count_from_entropies(entropies: list[float], entropy_bound: float = ENTROPY_BOUND) -> int:
+    """Match Rust `sample::accept_count_from_entropies`."""
+    order = sorted(range(len(entropies)), key=lambda i: entropies[i])
+    prefix = 0.0
+    count = 0
+    for idx in order:
+        if prefix <= entropy_bound:
+            count += 1
+            prefix += entropies[idx]
+        else:
+            break
+    return count
+
+
 def step_stats_from_entropies(
     entropies: list[float], accept_mask: list[bool], threshold: float = ENTROPY_BOUND
 ) -> StepStats:

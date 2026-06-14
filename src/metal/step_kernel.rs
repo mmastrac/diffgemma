@@ -6,7 +6,7 @@ use crate::metal::batch::set_bytes;
 use crate::metal::device::{ComputePipeline, MetalContext};
 use crate::metal::dgq_gpu::{DgqGpuBlob, Q4LinearGpu};
 use crate::metal::mps_gemm::{dispatch_dequant_nvfp4_matrix, dispatch_dequant_q4_matrix, MpsMatmulCache};
-use crate::sample::{initialize_canvas, Rng, SamplerConfig};
+use crate::sample::{initialize_canvas, Rng, SamplerConfig, StableConfidentStopper};
 use crate::safetensors::Error;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -1207,6 +1207,101 @@ impl StepEnc<'_> {
         Ok(())
     }
 
+    /// Run one decoder layer through QK-RoPE-KV + attention only (stops before o_proj).
+    fn encode_layer_through_attention(
+        &mut self,
+        layer: usize,
+        layout: &ModelLayout,
+    ) -> Result<(), Error> {
+        let l = &layout.layers[layer];
+        let q_n = if l.is_full != 0 { 8192 } else { 4096 };
+        let k_n = if l.is_full != 0 { 1024 } else { 2048 };
+        let qk_y = (16 + 2 * l.n_kv_heads) as usize;
+        let layer_off = layer_byte_offset(layer);
+
+        self.rmsnorm(A_HIDDEN, A_TMP, l.input_ln, HID as u32, CANVAS);
+        self.gemm_q4(A_TMP, A_ATTNQ, l.q_proj, CANVAS as u32, q_n, HID as u32)?;
+        self.gemm_q4(A_TMP, A_ATTNK, l.k_proj, CANVAS as u32, k_n, HID as u32)?;
+        if l.v_proj != 0 {
+            self.gemm_q4(A_TMP, A_ATTNV, l.v_proj, CANVAS as u32, k_n, HID as u32)?;
+        }
+
+        self.enc.setComputePipelineState(&self.ps.qk_rope_kv.pipeline);
+        unsafe {
+            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), A_ATTNQ as usize, 0);
+            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), A_ATTNK as usize, 1);
+            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), A_ATTNV as usize, 2);
+            self.bind_kvcache(3);
+            self.bind_blob(4);
+            self.enc.setBuffer_offset_atIndex(
+                Some(&self.bufs.layout),
+                layer_off as usize,
+                5,
+            );
+            self.bind_params(6);
+        }
+        let grid = MTLSize {
+            width: CANVAS,
+            height: qk_y,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+
+        self.enc.setComputePipelineState(&self.ps.attention.pipeline);
+        unsafe {
+            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), A_ATTNQ as usize, 0);
+            self.bind_kvcache(1);
+            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), A_ATTNO as usize, 2);
+            self.enc.setBuffer_offset_atIndex(
+                Some(&self.bufs.layout),
+                layer_off as usize,
+                3,
+            );
+            self.bind_params(4);
+        }
+        let grid = MTLSize {
+            width: CANVAS,
+            height: 16,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 64,
+            height: 1,
+            depth: 1,
+        };
+        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        Ok(())
+    }
+
+    /// Canvas token embed gather only (no SC residual, no no-scale RMSNorm).
+    fn encode_preamble_embed_only(&mut self, layout: &ModelLayout) -> Result<(), Error> {
+        let _ = layout;
+        self.enc.setComputePipelineState(&self.ps.embed_gather.pipeline);
+        unsafe {
+            self.bind_blob(0);
+            self.bind_layout(1);
+            self.bind_state(2);
+            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), A_HIDDEN as usize, 3);
+        }
+        let grid = MTLSize {
+            width: HID,
+            height: CANVAS,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        Ok(())
+    }
+
     fn encode_step_preamble(&mut self, layout: &ModelLayout, first_step: u32) -> Result<(), Error> {
         if first_step == 0 {
             self.enc.setComputePipelineState(&self.ps.logit_rowstats.pipeline);
@@ -1486,7 +1581,7 @@ pub fn f16_bits_to_f32(bits: u16) -> f32 {
 
 pub fn trace_entropy_enabled() -> bool {
     match std::env::var("DGQ_TRACE_ENTROPY") {
-        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("full"),
         Err(_) => false,
     }
 }
@@ -2024,6 +2119,351 @@ pub fn run_step_probe(model_dir: &Path, cfg: StepSmokeConfig) -> Result<StepProb
     })
 }
 
+#[derive(Debug, Clone)]
+pub struct LayerHiddenProbeCheckpoint {
+    pub label: String,
+    pub layer: Option<usize>,
+    pub hidden: Vec<f32>,
+    pub hidden_l2: f32,
+    pub hidden_max_abs: f32,
+}
+
+#[derive(Debug)]
+pub struct LayerHiddenProbeResult {
+    pub position: usize,
+    pub canvas_token: u32,
+    pub token_ids: Vec<u32>,
+    pub checkpoints: Vec<LayerHiddenProbeCheckpoint>,
+    pub elapsed: std::time::Duration,
+}
+
+fn read_arena_hidden_row(
+    arena: &ProtocolObject<dyn MTLBuffer>,
+    base: u64,
+    row: usize,
+) -> Vec<f32> {
+    read_arena_row(arena, base, row, HID)
+}
+
+fn read_arena_row(
+    arena: &ProtocolObject<dyn MTLBuffer>,
+    base: u64,
+    row: usize,
+    width: usize,
+) -> Vec<f32> {
+    let byte_off = base as usize + row * width * 2;
+    read_half_buffer_f32(arena, byte_off, width)
+}
+
+fn hidden_vec_stats(v: &[f32]) -> (f32, f32) {
+    let l2 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let max_abs = v.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+    (l2, max_abs)
+}
+
+/// Step-1 forward with per-layer hidden readback at one canvas row (for MLX parity).
+pub fn run_step_layer_hidden_probe(
+    model_dir: &Path,
+    cfg: &StepSmokeConfig,
+    position: usize,
+) -> Result<LayerHiddenProbeResult, Error> {
+    if position >= CANVAS {
+        return Err(Error::Format("layer probe position out of range"));
+    }
+    let started = Instant::now();
+    let (mut rt, _) = build_step_runtime(model_dir, cfg)?;
+    let layout = rt.layout;
+    let layers = rt.layers;
+    let mut checkpoints = Vec::new();
+
+    rt.dispatch_and_wait(|enc| {
+        enc.encode_step_preamble(&layout, 1)?;
+        Ok(())
+    })?;
+    {
+        let hidden = read_arena_hidden_row(&rt.bufs.arena, A_HIDDEN, position);
+        let (hidden_l2, hidden_max_abs) = hidden_vec_stats(&hidden);
+        checkpoints.push(LayerHiddenProbeCheckpoint {
+            label: "after_preamble".into(),
+            layer: None,
+            hidden,
+            hidden_l2,
+            hidden_max_abs,
+        });
+    }
+
+    for layer in 0..layers {
+        rt.dispatch_and_wait(|enc| {
+            enc.encode_layer(layer, &layout)?;
+            Ok(())
+        })?;
+        let hidden = read_arena_hidden_row(&rt.bufs.arena, A_HIDDEN, position);
+        let (hidden_l2, hidden_max_abs) = hidden_vec_stats(&hidden);
+        checkpoints.push(LayerHiddenProbeCheckpoint {
+            label: format!("after_layer_{layer}"),
+            layer: Some(layer),
+            hidden,
+            hidden_l2,
+            hidden_max_abs,
+        });
+    }
+
+    rt.dispatch_and_wait(|enc| {
+        enc.rmsnorm(A_HIDDEN, A_TMP, layout.final_norm, HID as u32, CANVAS);
+        Ok(())
+    })?;
+    {
+        let hidden = read_arena_hidden_row(&rt.bufs.arena, A_TMP, position);
+        let (hidden_l2, hidden_max_abs) = hidden_vec_stats(&hidden);
+        checkpoints.push(LayerHiddenProbeCheckpoint {
+            label: "after_final_norm".into(),
+            layer: Some(layers),
+            hidden,
+            hidden_l2,
+            hidden_max_abs,
+        });
+    }
+
+    let state: CanvasState = read_struct(&rt.bufs.state);
+    Ok(LayerHiddenProbeResult {
+        position,
+        canvas_token: state.ids[position],
+        token_ids: state.ids.to_vec(),
+        checkpoints,
+        elapsed: started.elapsed(),
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct PreambleCapture {
+    pub position: usize,
+    pub canvas_token: u32,
+    pub token_ids: Vec<u32>,
+    pub kv_len: u32,
+    pub embed_scaled: Vec<f32>,
+    pub after_preamble: Vec<f32>,
+}
+
+/// Step-1 preamble hidden at one canvas row (embed gather + no-scale RMSNorm).
+pub fn run_step_preamble_capture(
+    model_dir: &Path,
+    cfg: &StepSmokeConfig,
+    position: usize,
+) -> Result<PreambleCapture, Error> {
+    if position >= CANVAS {
+        return Err(Error::Format("preamble capture position out of range"));
+    }
+    let (mut rt, _) = build_step_runtime(model_dir, cfg)?;
+    let layout = rt.layout;
+
+    rt.dispatch_and_wait(|enc| enc.encode_preamble_embed_only(&layout))?;
+    let embed_scaled = read_arena_hidden_row(&rt.bufs.arena, A_HIDDEN, position);
+
+    rt.dispatch_and_wait(|enc| enc.encode_step_preamble(&layout, 1))?;
+    let after_preamble = read_arena_hidden_row(&rt.bufs.arena, A_HIDDEN, position);
+
+    let state = rt.read_canvas_state();
+    Ok(PreambleCapture {
+        position,
+        canvas_token: state.ids[position],
+        token_ids: state.ids.to_vec(),
+        kv_len: rt.read_params().kv_len,
+        embed_scaled,
+        after_preamble,
+    })
+}
+
+/// GPU `k_embed_gather` for a canvas filled uniformly with `token` (row 0 readback).
+pub fn run_embed_row_gpu(
+    model_dir: &Path,
+    cfg: &StepSmokeConfig,
+    token: u32,
+) -> Result<Vec<f32>, Error> {
+    let (mut rt, _) = build_step_runtime(model_dir, cfg)?;
+    let mut state = rt.read_canvas_state();
+    state.ids.fill(token);
+    rt.write_canvas_state(&state);
+    let layout = rt.layout;
+    rt.dispatch_and_wait(|enc| enc.encode_preamble_embed_only(&layout))?;
+    Ok(read_arena_hidden_row(&rt.bufs.arena, A_HIDDEN, 0))
+}
+
+/// Query heads in the monolithic step-kernel shader (`NQ_HEADS` in diffgemma_step.metal).
+pub const STEP_NQ_HEADS: usize = 16;
+
+#[derive(Debug, Clone)]
+pub struct LayerAttnCapture {
+    pub layer: usize,
+    pub position: usize,
+    pub canvas_token: u32,
+    pub token_ids: Vec<u32>,
+    pub kv_len: u32,
+    pub total_kv: usize,
+    pub head_dim: u32,
+    pub n_heads: usize,
+    pub n_kv_heads: u32,
+    pub is_full: bool,
+    pub hidden_in: Vec<f32>,
+    pub hidden_ln: Vec<f32>,
+    pub q_post_rope: Vec<f32>,
+    pub attn_out: Vec<f32>,
+    pub raw_scores: Vec<f32>,
+    pub attn_probs: Vec<f32>,
+    pub k_samples: Vec<(usize, Vec<f32>)>,
+}
+
+fn row_raw_scores(
+    q: &[f32],
+    k: &[f32],
+    qi: usize,
+    total_kv: usize,
+    n_heads: usize,
+    n_kv: usize,
+    hd: usize,
+) -> Vec<f32> {
+    let mut scores = vec![0.0f32; n_heads * total_kv];
+    let groups = n_heads / n_kv.max(1);
+    for h in 0..n_heads {
+        let kvh = h / groups.max(1);
+        let q_off = qi * n_heads * hd + h * hd;
+        for t in 0..total_kv {
+            let k_off = t * n_kv * hd + kvh * hd;
+            let mut dot = 0.0f32;
+            for d in 0..hd {
+                dot += q[q_off + d] * k[k_off + d];
+            }
+            scores[h * total_kv + t] = dot;
+        }
+    }
+    scores
+}
+
+fn softmax_attn_rows(scores: &[f32], n_heads: usize, total_kv: usize) -> Vec<f32> {
+    let mut probs = vec![0.0f32; scores.len()];
+    for h in 0..n_heads {
+        let base = h * total_kv;
+        let row = &scores[base..base + total_kv];
+        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut exps = row.iter().map(|&s| (s - max).exp()).collect::<Vec<_>>();
+        let sum: f32 = exps.iter().sum();
+        if sum > 0.0 {
+            for v in &mut exps {
+                *v /= sum;
+            }
+        }
+        probs[base..base + total_kv].copy_from_slice(&exps);
+    }
+    probs
+}
+
+fn top_key_positions(probs: &[f32], n_heads: usize, total_kv: usize, k: usize) -> Vec<usize> {
+    let mut mass = vec![0.0f32; total_kv];
+    for h in 0..n_heads {
+        let base = h * total_kv;
+        for t in 0..total_kv {
+            mass[t] += probs[base + t];
+        }
+    }
+    let mut order: Vec<usize> = (0..total_kv).collect();
+    order.sort_by(|&a, &b| {
+        mass[b]
+            .partial_cmp(&mass[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(&b))
+    });
+    order.into_iter().take(k).collect()
+}
+
+fn k_vec_at(k: &[f32], t: usize, n_kv: usize, hd: usize) -> Vec<f32> {
+    let off = t * n_kv * hd;
+    k[off..off + n_kv * hd].to_vec()
+}
+
+/// Step-1 forward through `layer` attention; read Q/K/scores/attn_out at one canvas row.
+pub fn run_step_attn_layer_capture(
+    model_dir: &Path,
+    cfg: &StepSmokeConfig,
+    layer: usize,
+    position: usize,
+) -> Result<LayerAttnCapture, Error> {
+    use crate::metal::step_kv::read_layer_k_cache_f32;
+
+    if position >= CANVAS {
+        return Err(Error::Format("attn capture position out of range"));
+    }
+    let layer = layer.min(cfg.layers.saturating_sub(1));
+    let (mut rt, _) = build_step_runtime(model_dir, cfg)?;
+    let layout = rt.layout;
+
+    rt.dispatch_and_wait(|enc| {
+        enc.encode_step_preamble(&layout, 1)?;
+        Ok(())
+    })?;
+    for l in 0..layer {
+        rt.dispatch_and_wait(|enc| {
+            enc.encode_layer(l, &layout)?;
+            Ok(())
+        })?;
+    }
+
+    let hidden_in = read_arena_hidden_row(&rt.bufs.arena, A_HIDDEN, position);
+
+    rt.dispatch_and_wait(|enc| {
+        enc.encode_layer_through_attention(layer, &layout)?;
+        Ok(())
+    })?;
+
+    let l = &layout.layers[layer];
+    let hd = l.head_dim as usize;
+    let nkv = l.n_kv_heads as usize;
+    let n_heads = STEP_NQ_HEADS;
+    let q_width = n_heads * hd;
+    let kv_len = rt.read_params().kv_len;
+    let total_kv = kv_len as usize + CANVAS;
+
+    let hidden_ln = read_arena_hidden_row(&rt.bufs.arena, A_TMP, position);
+    let q_all = read_half_buffer_f32(&rt.bufs.arena, A_ATTNQ as usize, CANVAS * q_width);
+    let q_post_rope = read_arena_row(&rt.bufs.arena, A_ATTNQ, position, q_width);
+    let attn_out = read_arena_row(&rt.bufs.arena, A_ATTNO, position, q_width);
+    let k_cache = read_layer_k_cache_f32(rt.kvcache(), &layout, layer, total_kv);
+
+    let raw_scores = row_raw_scores(&q_all, &k_cache, position, total_kv, n_heads, nkv, hd);
+    let attn_probs = softmax_attn_rows(&raw_scores, n_heads, total_kv);
+
+    let canvas_abs = kv_len as usize + position;
+    let mut sample_pos = vec![0usize, kv_len.saturating_sub(1) as usize, kv_len as usize, canvas_abs];
+    for t in top_key_positions(&attn_probs, n_heads, total_kv, 8) {
+        sample_pos.push(t);
+    }
+    sample_pos.sort_unstable();
+    sample_pos.dedup();
+    let k_samples = sample_pos
+        .into_iter()
+        .map(|t| (t, k_vec_at(&k_cache, t, nkv, hd)))
+        .collect();
+
+    let state = rt.read_canvas_state();
+    Ok(LayerAttnCapture {
+        layer,
+        position,
+        canvas_token: state.ids[position],
+        token_ids: state.ids.to_vec(),
+        kv_len,
+        total_kv,
+        head_dim: l.head_dim,
+        n_heads,
+        n_kv_heads: l.n_kv_heads,
+        is_full: l.is_full != 0,
+        hidden_in,
+        hidden_ln,
+        q_post_rope,
+        attn_out,
+        raw_scores,
+        attn_probs,
+        k_samples,
+    })
+}
+
 pub fn bench_step_kernel(
     model_dir: &Path,
     cfg: StepSmokeConfig,
@@ -2205,6 +2645,15 @@ pub fn run_denoise_steps(
     let params = step_params_from_sampler(&sampler, rt.read_params().kv_len, cfg.no_early_stop);
     let mut rng = Rng::new(cfg.seed);
     rt.reset_block(VOCAB, &mut rng, params);
+    let mut stopper = StableConfidentStopper::new(
+        sampler.stability_threshold,
+        if cfg.no_early_stop {
+            f32::MAX
+        } else {
+            sampler.confidence_threshold
+        },
+    );
+    stopper.reset();
     let mut out = Vec::with_capacity(steps);
     for _ in 0..steps {
         rt.run_denoise_step()?;
@@ -2216,7 +2665,10 @@ pub fn run_denoise_steps(
             min_entropy: ent.min_entropy,
             low_entropy_positions: ent.low_entropy_positions,
         });
-        if st.stop_flag != 0 && !cfg.no_early_stop {
+        let max_steps_reached = st.step >= params.max_steps;
+        let confident_stop = !cfg.no_early_stop
+            && stopper.should_stop_with_entropies(&st.prev_argmax, &st.entropy, st.step);
+        if confident_stop || max_steps_reached {
             break;
         }
     }

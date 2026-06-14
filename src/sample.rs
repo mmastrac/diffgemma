@@ -516,6 +516,25 @@ mod tests {
     }
 
     #[test]
+    fn stopper_matches_mlx_calgary_late_step() {
+        // MLX calgary/seed42 stops at step 29 when mean_H=0.0019 and argmax stable.
+        let mut stopper = StableConfidentStopper::new(1, 0.005);
+        let argmax = vec![42u32; 256];
+        // Rust nvfp4 late-window (~73/256 below 0.1): mean stays ~0.07, must not stop.
+        let ent: Vec<f32> = vec![0.05f32; 73]
+            .into_iter()
+            .chain(std::iter::repeat(0.12f32).take(256 - 73))
+            .collect();
+        assert!(!stopper.should_stop_with_entropies(&argmax, &ent, MIN_EARLY_STOP_STEPS));
+        assert!(!stopper.should_stop_with_entropies(&argmax, &ent, MIN_EARLY_STOP_STEPS + 1));
+
+        stopper.reset();
+        let ent = vec![0.001f32; 256];
+        assert!(!stopper.should_stop_with_entropies(&argmax, &ent, 12));
+        assert!(stopper.should_stop_with_entropies(&argmax, &ent, 13));
+    }
+
+    #[test]
     fn early_stop_allowed_requires_steps_or_real_tokens() {
         let degenerate = vec![PAD_TOKEN_ID; 256];
         assert!(!early_stop_allowed(2, &degenerate));

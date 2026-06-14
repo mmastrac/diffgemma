@@ -181,6 +181,55 @@ enum Command {
         max_seq: usize,
         raw_prompt: bool,
     },
+    StepLogitsDump {
+        prompt: Option<String>,
+        layers: usize,
+        steps: usize,
+        seed: u64,
+        max_seq: usize,
+        raw_prompt: bool,
+        output: PathBuf,
+        positions: String,
+        top_k: usize,
+    },
+    StepLayerProbe {
+        prompt: Option<String>,
+        layers: usize,
+        seed: u64,
+        max_seq: usize,
+        raw_prompt: bool,
+        output: PathBuf,
+        position: usize,
+    },
+    StepAttnDump {
+        prompt: Option<String>,
+        layers: usize,
+        seed: u64,
+        max_seq: usize,
+        raw_prompt: bool,
+        output: PathBuf,
+        layer: usize,
+        position: usize,
+    },
+    StepPreambleDump {
+        prompt: Option<String>,
+        layers: usize,
+        seed: u64,
+        max_seq: usize,
+        raw_prompt: bool,
+        output: PathBuf,
+        position: usize,
+    },
+    EmbedRowDump {
+        token: u32,
+        layers: usize,
+        max_seq: usize,
+        prompt: Option<String>,
+        raw_prompt: bool,
+        output: PathBuf,
+        bf16_ref_dir: Option<PathBuf>,
+        gpu: bool,
+    },
     StepVerify {
         layers: usize,
     },
@@ -304,6 +353,104 @@ fn main() -> ExitCode {
             seed,
             max_seq,
             raw_prompt,
+        ),
+        Command::StepLogitsDump {
+            prompt,
+            layers,
+            steps,
+            seed,
+            max_seq,
+            raw_prompt,
+            output,
+            positions,
+            top_k,
+        } => run_step_logits_dump_cmd(
+            &cli.model_dir,
+            prompt,
+            layers,
+            steps,
+            seed,
+            max_seq,
+            raw_prompt,
+            &output,
+            &positions,
+            top_k,
+        ),
+        Command::StepLayerProbe {
+            prompt,
+            layers,
+            seed,
+            max_seq,
+            raw_prompt,
+            output,
+            position,
+        } => run_step_layer_probe_cmd(
+            &cli.model_dir,
+            prompt,
+            layers,
+            seed,
+            max_seq,
+            raw_prompt,
+            &output,
+            position,
+        ),
+        Command::StepAttnDump {
+            prompt,
+            layers,
+            seed,
+            max_seq,
+            raw_prompt,
+            output,
+            layer,
+            position,
+        } => run_step_attn_dump_cmd(
+            &cli.model_dir,
+            prompt,
+            layers,
+            seed,
+            max_seq,
+            raw_prompt,
+            &output,
+            layer,
+            position,
+        ),
+        Command::StepPreambleDump {
+            prompt,
+            layers,
+            seed,
+            max_seq,
+            raw_prompt,
+            output,
+            position,
+        } => run_step_preamble_dump_cmd(
+            &cli.model_dir,
+            prompt,
+            layers,
+            seed,
+            max_seq,
+            raw_prompt,
+            &output,
+            position,
+        ),
+        Command::EmbedRowDump {
+            token,
+            layers,
+            max_seq,
+            prompt,
+            raw_prompt,
+            output,
+            bf16_ref_dir,
+            gpu,
+        } => run_embed_row_dump_cmd(
+            &cli.model_dir,
+            token,
+            layers,
+            max_seq,
+            prompt,
+            raw_prompt,
+            &output,
+            bf16_ref_dir.as_deref(),
+            gpu,
         ),
         Command::StepVerify { layers } => run_step_verify_cmd(&cli.model_dir, layers),
         Command::StepCi { layers } => run_step_ci_cmd(&cli.model_dir, layers),
@@ -553,6 +700,11 @@ fn run_command(
         Command::StepKvParity { .. } => ExitCode::FAILURE,
         Command::StepAttnProbe { .. } => ExitCode::FAILURE,
         Command::StepQ4Parity { .. } => ExitCode::FAILURE,
+        Command::StepLogitsDump { .. } => ExitCode::FAILURE,
+        Command::StepLayerProbe { .. } => ExitCode::FAILURE,
+        Command::StepAttnDump { .. } => ExitCode::FAILURE,
+        Command::StepPreambleDump { .. } => ExitCode::FAILURE,
+        Command::EmbedRowDump { .. } => ExitCode::FAILURE,
         Command::StepVerify { .. } => ExitCode::FAILURE,
         Command::StepCi { .. } => ExitCode::FAILURE,
         Command::StepParity { .. } => ExitCode::FAILURE,
@@ -670,6 +822,415 @@ fn run_step_probe_cmd(
     _raw_prompt: bool,
 ) -> ExitCode {
     eprintln!("error: step-probe requires --features metal on macOS");
+    ExitCode::FAILURE
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn run_step_logits_dump_cmd(
+    model_dir: &std::path::Path,
+    prompt: Option<String>,
+    layers: usize,
+    steps: usize,
+    seed: u64,
+    max_seq: usize,
+    raw_prompt: bool,
+    output: &std::path::Path,
+    positions: &str,
+    top_k: usize,
+) -> ExitCode {
+    use metal::{parse_positions, run_step_logits_dump, write_step_logits_dump, StepSmokeConfig};
+
+    if !dgq::store::looks_like_dgq_dir(model_dir) {
+        eprintln!("error: step-logits-dump requires a .dgq directory");
+        return ExitCode::FAILURE;
+    }
+    let mut cfg = StepSmokeConfig {
+        layers,
+        steps: steps.max(1),
+        kv_len: 0,
+        seed,
+        max_seq,
+        finish: metal::StepFinishMode::ForwardOnly,
+        use_mps_q4: None,
+        prefill_token_ids: None,
+        no_early_stop: false,
+        encoder_use_mps_q4: None,
+    };
+    if let Err(err) = attach_step_prefill(
+        &mut cfg,
+        model_dir,
+        0,
+        prompt.as_deref(),
+        raw_prompt,
+    ) {
+        eprintln!("error: {err}");
+        return ExitCode::FAILURE;
+    }
+    let pos = match parse_positions(positions) {
+        Ok(v) => v,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let label = prompt.unwrap_or_else(|| "Hello".to_string());
+    match run_step_logits_dump(model_dir, &cfg, &label, &pos, top_k.max(1)) {
+        Ok(dump) => {
+            if let Err(err) = write_step_logits_dump(output, &dump) {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+            println!(
+                "wrote {} (T={:.4}, {} rows)",
+                output.display(),
+                dump.temperature,
+                dump.rows.len()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn run_step_logits_dump_cmd(
+    _model_dir: &std::path::Path,
+    _prompt: Option<String>,
+    _layers: usize,
+    _steps: usize,
+    _seed: u64,
+    _max_seq: usize,
+    _raw_prompt: bool,
+    _output: &std::path::Path,
+    _positions: &str,
+    _top_k: usize,
+) -> ExitCode {
+    eprintln!("error: step-logits-dump requires --features metal on macOS");
+    ExitCode::FAILURE
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn run_step_layer_probe_cmd(
+    model_dir: &std::path::Path,
+    prompt: Option<String>,
+    layers: usize,
+    seed: u64,
+    max_seq: usize,
+    raw_prompt: bool,
+    output: &std::path::Path,
+    position: usize,
+) -> ExitCode {
+    use metal::{run_step_layer_hidden_dump, write_step_layer_hidden_dump, StepSmokeConfig};
+
+    if !dgq::store::looks_like_dgq_dir(model_dir) {
+        eprintln!("error: step-layer-probe requires a .dgq directory");
+        return ExitCode::FAILURE;
+    }
+    let mut cfg = StepSmokeConfig {
+        layers,
+        steps: 2,
+        kv_len: 0,
+        seed,
+        max_seq,
+        finish: metal::StepFinishMode::ForwardOnly,
+        use_mps_q4: None,
+        prefill_token_ids: None,
+        no_early_stop: false,
+        encoder_use_mps_q4: None,
+    };
+    if let Err(err) = attach_step_prefill(
+        &mut cfg,
+        model_dir,
+        0,
+        prompt.as_deref(),
+        raw_prompt,
+    ) {
+        eprintln!("error: {err}");
+        return ExitCode::FAILURE;
+    }
+    let label = prompt.unwrap_or_else(|| "Hello".to_string());
+    match run_step_layer_hidden_dump(model_dir, &cfg, &label, position) {
+        Ok(dump) => {
+            if let Err(err) = write_step_layer_hidden_dump(output, &dump) {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+            println!(
+                "wrote {} (pos={}, {} checkpoints)",
+                output.display(),
+                dump.position,
+                dump.checkpoints.len()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn run_step_layer_probe_cmd(
+    _model_dir: &std::path::Path,
+    _prompt: Option<String>,
+    _layers: usize,
+    _seed: u64,
+    _max_seq: usize,
+    _raw_prompt: bool,
+    _output: &std::path::Path,
+    _position: usize,
+) -> ExitCode {
+    eprintln!("error: step-layer-probe requires --features metal on macOS");
+    ExitCode::FAILURE
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn run_step_attn_dump_cmd(
+    model_dir: &std::path::Path,
+    prompt: Option<String>,
+    layers: usize,
+    seed: u64,
+    max_seq: usize,
+    raw_prompt: bool,
+    output: &std::path::Path,
+    layer: usize,
+    position: usize,
+) -> ExitCode {
+    use metal::{run_step_attn_layer_dump, write_step_attn_layer_dump, StepSmokeConfig};
+
+    if !dgq::store::looks_like_dgq_dir(model_dir) {
+        eprintln!("error: step-attn-dump requires a .dgq directory");
+        return ExitCode::FAILURE;
+    }
+    let mut cfg = StepSmokeConfig {
+        layers,
+        steps: 2,
+        kv_len: 0,
+        seed,
+        max_seq,
+        finish: metal::StepFinishMode::ForwardOnly,
+        use_mps_q4: None,
+        prefill_token_ids: None,
+        no_early_stop: false,
+        encoder_use_mps_q4: None,
+    };
+    if let Err(err) = attach_step_prefill(
+        &mut cfg,
+        model_dir,
+        0,
+        prompt.as_deref(),
+        raw_prompt,
+    ) {
+        eprintln!("error: {err}");
+        return ExitCode::FAILURE;
+    }
+    let label = prompt.unwrap_or_else(|| "Hello".to_string());
+    match run_step_attn_layer_dump(model_dir, &cfg, &label, layer, position) {
+        Ok(dump) => {
+            if let Err(err) = write_step_attn_layer_dump(output, &dump) {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+            println!(
+                "wrote {} (layer={}, pos={}, kv_len={})",
+                output.display(),
+                dump.layer,
+                dump.position,
+                dump.kv_len
+            );
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn run_step_preamble_dump_cmd(
+    model_dir: &std::path::Path,
+    prompt: Option<String>,
+    layers: usize,
+    seed: u64,
+    max_seq: usize,
+    raw_prompt: bool,
+    output: &std::path::Path,
+    position: usize,
+) -> ExitCode {
+    use metal::{run_step_preamble_dump, write_step_preamble_dump, StepSmokeConfig};
+
+    if !dgq::store::looks_like_dgq_dir(model_dir) {
+        eprintln!("error: step-preamble-dump requires a .dgq directory");
+        return ExitCode::FAILURE;
+    }
+    let mut cfg = StepSmokeConfig {
+        layers,
+        steps: 2,
+        kv_len: 0,
+        seed,
+        max_seq,
+        finish: metal::StepFinishMode::ForwardOnly,
+        use_mps_q4: None,
+        prefill_token_ids: None,
+        no_early_stop: false,
+        encoder_use_mps_q4: None,
+    };
+    if let Err(err) = attach_step_prefill(
+        &mut cfg,
+        model_dir,
+        0,
+        prompt.as_deref(),
+        raw_prompt,
+    ) {
+        eprintln!("error: {err}");
+        return ExitCode::FAILURE;
+    }
+    let label = prompt.unwrap_or_else(|| "Hello".to_string());
+    match run_step_preamble_dump(model_dir, &cfg, &label, position) {
+        Ok(dump) => {
+            if let Err(err) = write_step_preamble_dump(output, &dump) {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+            println!(
+                "wrote {} (pos={}, token={})",
+                output.display(),
+                dump.position,
+                dump.canvas_token
+            );
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_embed_row_dump_cmd(
+    model_dir: &std::path::Path,
+    token: u32,
+    layers: usize,
+    max_seq: usize,
+    prompt: Option<String>,
+    raw_prompt: bool,
+    output: &std::path::Path,
+    bf16_ref_dir: Option<&std::path::Path>,
+    gpu: bool,
+) -> ExitCode {
+    use dgq::{run_embed_row_dump, write_embed_row_dump};
+
+    if !dgq::store::looks_like_dgq_dir(model_dir) {
+        eprintln!("error: embed-row-dump requires a .dgq directory");
+        return ExitCode::FAILURE;
+    }
+    let hidden = match crate::config::ModelConfig::load(model_dir) {
+        Ok(c) => c.text_config.hidden_size,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    let gpu_scaled = if gpu {
+        use metal::{run_embed_row_gpu, StepFinishMode, StepSmokeConfig};
+        let mut cfg = StepSmokeConfig {
+            layers,
+            steps: 1,
+            kv_len: 0,
+            seed: 0,
+            max_seq,
+            finish: StepFinishMode::ForwardOnly,
+            use_mps_q4: None,
+            prefill_token_ids: None,
+            no_early_stop: false,
+            encoder_use_mps_q4: None,
+        };
+        if let Err(err) = attach_step_prefill(
+            &mut cfg,
+            model_dir,
+            0,
+            prompt.as_deref(),
+            raw_prompt,
+        ) {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+        match run_embed_row_gpu(model_dir, &cfg, token) {
+            Ok(v) => Some(v),
+            Err(err) => {
+                eprintln!("error: gpu embed row: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    let gpu_scaled: Option<Vec<f32>> = if gpu {
+        eprintln!("error: --embed-gpu requires --features metal on macOS");
+        return ExitCode::FAILURE;
+    } else {
+        None
+    };
+
+    match run_embed_row_dump(model_dir, token, hidden, bf16_ref_dir, gpu_scaled) {
+        Ok(dump) => {
+            if let Err(err) = write_embed_row_dump(output, &dump) {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+            println!(
+                "wrote {} (token={}, scale={:.6}, cpu_l2={:.2})",
+                output.display(),
+                dump.token,
+                dump.scale_f32,
+                dump.dequant_scaled_l2
+            );
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn run_step_preamble_dump_cmd(
+    _model_dir: &std::path::Path,
+    _prompt: Option<String>,
+    _layers: usize,
+    _seed: u64,
+    _max_seq: usize,
+    _raw_prompt: bool,
+    _output: &std::path::Path,
+    _position: usize,
+) -> ExitCode {
+    eprintln!("error: step-preamble-dump requires --features metal on macOS");
+    ExitCode::FAILURE
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn run_step_attn_dump_cmd(
+    _model_dir: &std::path::Path,
+    _prompt: Option<String>,
+    _layers: usize,
+    _seed: u64,
+    _max_seq: usize,
+    _raw_prompt: bool,
+    _output: &std::path::Path,
+    _layer: usize,
+    _position: usize,
+) -> ExitCode {
+    eprintln!("error: step-attn-dump requires --features metal on macOS");
     ExitCode::FAILURE
 }
 
@@ -1553,6 +2114,13 @@ fn parse_cli() -> Cli {
     let mut step_kv_len = 0u32;
     let mut step_max_seq = 512usize;
     let mut step_forward_only = false;
+    let mut step_logit_positions = String::new();
+    let mut step_logit_top_k = 10usize;
+    let mut step_layer_position = 129usize;
+    let mut step_attn_layer = 2usize;
+    let mut embed_row_token = 71153u32;
+    let mut embed_row_gpu = false;
+    let mut bf16_ref_dir: Option<PathBuf> = None;
     let mut use_monolithic = false;
     let mut raw_prompt = false;
 
@@ -1701,6 +2269,49 @@ fn parse_cli() -> Cli {
                 }
             }
             "--forward-only" => step_forward_only = true,
+            "--logit-positions" => {
+                if let Some(v) = args.next() {
+                    step_logit_positions = v;
+                }
+            }
+            "--logit-top-k" => {
+                if let Some(v) = args.next() {
+                    step_logit_top_k = v.parse().unwrap_or_else(|_| {
+                        eprintln!("invalid --logit-top-k");
+                        std::process::exit(2);
+                    });
+                }
+            }
+            "--layer-position" => {
+                if let Some(v) = args.next() {
+                    step_layer_position = v.parse().unwrap_or_else(|_| {
+                        eprintln!("invalid --layer-position");
+                        std::process::exit(2);
+                    });
+                }
+            }
+            "--attn-layer" => {
+                if let Some(v) = args.next() {
+                    step_attn_layer = v.parse().unwrap_or_else(|_| {
+                        eprintln!("invalid --attn-layer");
+                        std::process::exit(2);
+                    });
+                }
+            }
+            "--embed-token" => {
+                if let Some(v) = args.next() {
+                    embed_row_token = v.parse().unwrap_or_else(|_| {
+                        eprintln!("invalid --embed-token");
+                        std::process::exit(2);
+                    });
+                }
+            }
+            "--embed-gpu" => embed_row_gpu = true,
+            "--bf16-ref" => {
+                if let Some(v) = args.next() {
+                    bf16_ref_dir = Some(PathBuf::from(v));
+                }
+            }
             "--monolithic" => use_monolithic = true,
             "--raw" => raw_prompt = true,
             "--max-seq" => {
@@ -1942,6 +2553,104 @@ fn parse_cli() -> Cli {
             max_seq: step_max_seq.max(64),
             raw_prompt,
         },
+        Some("step-logits-dump") => {
+            let output = output_dir.unwrap_or_else(|| {
+                eprintln!(
+                    "usage: diffgemma-mps step-logits-dump -m MODEL -o OUT.json [-p Hello] [--layers 30] [--steps 2] [--seed 42] [--logit-positions 0,43,58] [--logit-top-k 10]"
+                );
+                std::process::exit(2);
+            });
+            Command::StepLogitsDump {
+                prompt: prompt.clone(),
+                layers: bench_layers.max(1).min(30),
+                steps: steps_parity.max(1),
+                seed,
+                max_seq: step_max_seq.max(64),
+                raw_prompt,
+                output,
+                positions: step_logit_positions,
+                top_k: step_logit_top_k,
+            }
+        }
+        Some("step-layer-probe") => {
+            let output = output_dir.unwrap_or_else(|| {
+                eprintln!(
+                    "usage: diffgemma-mps step-layer-probe -m MODEL -o OUT.json [-p Hello] [--layers 30] [--seed 42] [--layer-position 129]"
+                );
+                std::process::exit(2);
+            });
+            Command::StepLayerProbe {
+                prompt: prompt.clone(),
+                layers: bench_layers.max(1).min(30),
+                seed,
+                max_seq: step_max_seq.max(64),
+                raw_prompt,
+                output,
+                position: step_layer_position,
+            }
+        }
+        Some("step-attn-dump") => {
+            let output = output_dir.unwrap_or_else(|| {
+                eprintln!(
+                    "usage: diffgemma-mps step-attn-dump -m MODEL -o OUT.json [-p Hello] [--layers 30] [--seed 42] [--attn-layer 2] [--layer-position 129]"
+                );
+                std::process::exit(2);
+            });
+            Command::StepAttnDump {
+                prompt: prompt.clone(),
+                layers: bench_layers.max(1).min(30),
+                seed,
+                max_seq: step_max_seq.max(64),
+                raw_prompt,
+                output,
+                layer: step_attn_layer,
+                position: step_layer_position,
+            }
+        }
+        Some("step-preamble-dump") => {
+            let output = output_dir.unwrap_or_else(|| {
+                eprintln!(
+                    "usage: diffgemma-mps step-preamble-dump -m MODEL -o OUT.json [-p Hello] [--layers 30] [--seed 42] [--layer-position 129]"
+                );
+                std::process::exit(2);
+            });
+            Command::StepPreambleDump {
+                prompt: prompt.clone(),
+                layers: bench_layers.max(1).min(30),
+                seed,
+                max_seq: step_max_seq.max(64),
+                raw_prompt,
+                output,
+                position: step_layer_position,
+            }
+        }
+        Some("embed-row-dump") => {
+            let output = output_dir.unwrap_or_else(|| {
+                eprintln!(
+                    "usage: diffgemma-mps embed-row-dump -m MODEL -o OUT.json [--embed-token 71153] [--embed-gpu] [--bf16-ref DIR]"
+                );
+                std::process::exit(2);
+            });
+            let ref_dir = bf16_ref_dir.or_else(|| {
+                let p = model_dir.join("../model/transformer");
+                if p.is_dir() {
+                    Some(p)
+                } else {
+                    let p2 = PathBuf::from("model/transformer");
+                    p2.is_dir().then_some(p2)
+                }
+            });
+            Command::EmbedRowDump {
+                token: embed_row_token,
+                layers: bench_layers.max(1).min(30),
+                max_seq: step_max_seq.max(64),
+                prompt: prompt.clone(),
+                raw_prompt,
+                output,
+                bf16_ref_dir: ref_dir,
+                gpu: embed_row_gpu,
+            }
+        }
         Some("step-verify") => Command::StepVerify {
             layers: bench_layers.max(1).min(30),
         },

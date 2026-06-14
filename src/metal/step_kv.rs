@@ -379,6 +379,36 @@ fn read_half_at(kv_buf: &ProtocolObject<dyn MTLBuffer>, byte_off: usize) -> u16 
     u16::from_le_bytes([unsafe { *ptr }, unsafe { *ptr.add(1) }])
 }
 
+/// Read K plane for layer `L` for token positions `[0, total_kv)` from monolithic b4.
+pub fn read_layer_k_cache_f32(
+    kv_buf: &ProtocolObject<dyn MTLBuffer>,
+    layout: &ModelLayout,
+    layer: usize,
+    total_kv: usize,
+) -> Vec<f32> {
+    if layer >= N_LAYERS || total_kv == 0 {
+        return Vec::new();
+    }
+    let l = &layout.layers[layer];
+    let nkv = l.n_kv_heads as usize;
+    let hd = l.head_dim as usize;
+    let per_token = nkv * hd;
+    let token_stride_half = nkv * hd * 2;
+    let byte_base = l.kv_region as usize;
+    let mut keys = vec![0f32; total_kv * per_token];
+    for pos in 0..total_kv {
+        let half_base = byte_base / 2 + pos * token_stride_half;
+        for hh in 0..nkv {
+            for d in 0..hd {
+                let dst_i = pos * per_token + hh * hd + d;
+                let k_byte = (half_base + hh * hd + d) * 2;
+                keys[dst_i] = f16_bits_to_f32(read_half_at(kv_buf, k_byte));
+            }
+        }
+    }
+    keys
+}
+
 /// Load monolithic b4 prefix `[0, kv_len)` into engine `GpuKvCache` (for extend after prefill).
 fn hydrate_gpu_kv_from_monolithic(
     kv_buf: &ProtocolObject<dyn MTLBuffer>,

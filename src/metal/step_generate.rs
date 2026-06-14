@@ -11,7 +11,7 @@ use crate::metal::step_kv::{
     extend_monolithic_kv_with_cache, prefill_monolithic_kv_with_cache, MonolithicEncoderCache,
 };
 use crate::metal::{ForwardTelemetry, SessionTelemetry, StepPhaseTelemetry};
-use crate::sample::{Rng, SamplerConfig, step_entropy_stats};
+use crate::sample::{Rng, SamplerConfig, StableConfidentStopper, step_entropy_stats};
 use crate::safetensors::Error;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -77,23 +77,36 @@ fn progress_enabled() -> bool {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DenoiseStopReason {
+    None,
+    Confident,
+    MaxSteps,
+}
+
 fn log_denoise_step_progress(
     block_idx: usize,
     max_blocks: usize,
     step_idx: u32,
     max_steps: usize,
     stats: &crate::sample::StepEntropyStats,
+    mean_entropy_gpu: f32,
+    argmax_stable: u32,
     step_elapsed: Duration,
     block_elapsed: Duration,
     denoise_elapsed: Duration,
-    early_stop: bool,
+    stop: DenoiseStopReason,
 ) {
     if !progress_enabled() {
         return;
     }
-    let stop_note = if early_stop { " early_stop" } else { "" };
+    let stop_note = match stop {
+        DenoiseStopReason::None => "",
+        DenoiseStopReason::Confident => " confident_stop",
+        DenoiseStopReason::MaxSteps => " max_steps",
+    };
     eprintln!(
-        "step-generate: block {block_idx}/{max_blocks} step {step_idx}/{max_steps} accept={} low_ent={} min_ent={:.4} step={step_elapsed:.2?} block={block_elapsed:.2?} denoise={denoise_elapsed:.2?}{stop_note}",
+        "step-generate: block {block_idx}/{max_blocks} step {step_idx}/{max_steps} accept={} low_ent={} min_ent={:.4} mean_ent={mean_entropy_gpu:.4} stable={argmax_stable} step={step_elapsed:.2?} block={block_elapsed:.2?} denoise={denoise_elapsed:.2?}{stop_note}",
         stats.accept_count,
         stats.low_entropy_positions,
         stats.min_entropy,
@@ -259,8 +272,18 @@ pub fn generate_with_session(
         let mut block_step_count = 0u32;
         let mut accept_hist = Vec::new();
         let mut min_entropy_hist = Vec::new();
+        let mut mean_entropy_hist = Vec::new();
         let mut low_ent_hist = Vec::new();
         let mut last_st = None;
+        let mut stopper = StableConfidentStopper::new(
+            cfg.sampler.stability_threshold,
+            if cfg.no_early_stop {
+                f32::MAX
+            } else {
+                cfg.sampler.confidence_threshold
+            },
+        );
+        stopper.reset();
         loop {
             let step_started = Instant::now();
             rt.run_denoise_step()?;
@@ -296,8 +319,36 @@ pub fn generate_with_session(
             let stats = step_entropy_stats(&st.entropy, &st.accept);
             accept_hist.push(stats.accept_count);
             min_entropy_hist.push(stats.min_entropy);
+            mean_entropy_hist.push(st.mean_entropy);
             low_ent_hist.push(stats.low_entropy_positions);
-            let early_stop = st.stop_flag != 0;
+            let max_steps_reached = st.step >= max_steps as u32;
+            let confident_stop = !cfg.no_early_stop
+                && stopper.should_stop_with_entropies(
+                    &st.prev_argmax,
+                    &st.entropy,
+                    st.step,
+                );
+            let stop_reason = if confident_stop {
+                DenoiseStopReason::Confident
+            } else if max_steps_reached {
+                DenoiseStopReason::MaxSteps
+            } else {
+                DenoiseStopReason::None
+            };
+            if std::env::var("DGQ_LOG_EARLY_STOP")
+                .ok()
+                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                && (st.stop_flag != 0) != confident_stop
+            {
+                eprintln!(
+                    "step-generate: early-stop mismatch step={} gpu_flag={} cpu_confident={confident_stop} mean_ent={:.4} stable={} threshold={:.4}",
+                    st.step,
+                    st.stop_flag,
+                    st.mean_entropy,
+                    st.argmax_stable,
+                    cfg.sampler.confidence_threshold,
+                );
+            }
             step_traces.push(step_trace_from_stats(
                 block_idx as u32,
                 block_step_count,
@@ -309,7 +360,7 @@ pub fn generate_with_session(
                 } else {
                     None
                 },
-                early_stop,
+                stop_reason != DenoiseStopReason::None,
             ));
             log_denoise_step_progress(
                 block_idx,
@@ -317,15 +368,14 @@ pub fn generate_with_session(
                 block_step_count,
                 max_steps,
                 &stats,
+                st.mean_entropy,
+                st.argmax_stable,
                 step_elapsed,
                 block_started.elapsed(),
                 denoise_elapsed + block_started.elapsed(),
-                early_stop,
+                stop_reason,
             );
-            if early_stop {
-                break;
-            }
-            if st.step >= max_steps as u32 {
+            if stop_reason != DenoiseStopReason::None {
                 break;
             }
         }
@@ -354,12 +404,21 @@ pub fn generate_with_session(
             block_idx
         );
         eprintln!(
-            "step-generate: block {} low_ent(<0.1)/step={low_ent_hist:?}",
+            "step-generate: block {} mean_ent/step={mean_entropy_hist:?}",
             block_idx
         );
         eprintln!(
-            "step-generate: block {} late-window (last 8 steps): accept_sum={late_accept} min_ent={late_min_ent:.4} max_low_ent={late_low_ent} (need low_ent~15-20 for accept~15-20)",
+            "step-generate: block {} low_ent(<0.1)/step={low_ent_hist:?}",
             block_idx
+        );
+        let late_mean_ent = mean_entropy_hist
+            .get(late..)
+            .and_then(|s| s.iter().copied().reduce(f32::min))
+            .unwrap_or(f32::NAN);
+        eprintln!(
+            "step-generate: block {} late-window (last 8 steps): accept_sum={late_accept} min_ent={late_min_ent:.4} mean_ent={late_mean_ent:.4} max_low_ent={late_low_ent} (early stop needs mean_ent<{:.4} + stable argmax)",
+            block_idx,
+            cfg.sampler.confidence_threshold,
         );
 
         let argmax_tokens: Vec<u32> = st.prev_argmax.to_vec();

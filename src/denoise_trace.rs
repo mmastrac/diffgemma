@@ -74,8 +74,18 @@ pub fn step_trace_from_stats(
     entropies: Option<&[f32]>,
     early_stop: bool,
 ) -> DenoiseStepTrace {
-    let prefix_len = argmax.len().min(16);
-    let entropy_prefix = entropies.map(|e| e[..e.len().min(16)].to_vec());
+    let full_trace = std::env::var("DGQ_TRACE_ENTROPY")
+        .map(|v| v.eq_ignore_ascii_case("full"))
+        .unwrap_or(false);
+    let prefix_len = if full_trace {
+        argmax.len()
+    } else {
+        argmax.len().min(16)
+    };
+    let entropy_prefix = entropies.map(|e| {
+        let n = if full_trace { e.len() } else { e.len().min(16) };
+        e[..n].to_vec()
+    });
     DenoiseStepTrace {
         block,
         step_index,
