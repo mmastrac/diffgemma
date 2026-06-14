@@ -211,6 +211,16 @@ enum Command {
         layer: usize,
         position: usize,
     },
+    StepMoeDump {
+        prompt: Option<String>,
+        layers: usize,
+        seed: u64,
+        max_seq: usize,
+        raw_prompt: bool,
+        output: PathBuf,
+        layer: usize,
+        position: usize,
+    },
     StepPreambleDump {
         prompt: Option<String>,
         layers: usize,
@@ -404,6 +414,26 @@ fn main() -> ExitCode {
             layer,
             position,
         } => run_step_attn_dump_cmd(
+            &cli.model_dir,
+            prompt,
+            layers,
+            seed,
+            max_seq,
+            raw_prompt,
+            &output,
+            layer,
+            position,
+        ),
+        Command::StepMoeDump {
+            prompt,
+            layers,
+            seed,
+            max_seq,
+            raw_prompt,
+            output,
+            layer,
+            position,
+        } => run_step_moe_dump_cmd(
             &cli.model_dir,
             prompt,
             layers,
@@ -703,6 +733,7 @@ fn run_command(
         Command::StepLogitsDump { .. } => ExitCode::FAILURE,
         Command::StepLayerProbe { .. } => ExitCode::FAILURE,
         Command::StepAttnDump { .. } => ExitCode::FAILURE,
+        Command::StepMoeDump { .. } => ExitCode::FAILURE,
         Command::StepPreambleDump { .. } => ExitCode::FAILURE,
         Command::EmbedRowDump { .. } => ExitCode::FAILURE,
         Command::StepVerify { .. } => ExitCode::FAILURE,
@@ -1041,6 +1072,70 @@ fn run_step_attn_dump_cmd(
                 dump.layer,
                 dump.position,
                 dump.kv_len
+            );
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn run_step_moe_dump_cmd(
+    model_dir: &std::path::Path,
+    prompt: Option<String>,
+    layers: usize,
+    seed: u64,
+    max_seq: usize,
+    raw_prompt: bool,
+    output: &std::path::Path,
+    layer: usize,
+    position: usize,
+) -> ExitCode {
+    use metal::{run_step_moe_layer_dump, write_step_moe_layer_dump, StepSmokeConfig};
+
+    if !dgq::store::looks_like_dgq_dir(model_dir) {
+        eprintln!("error: step-moe-dump requires a .dgq directory");
+        return ExitCode::FAILURE;
+    }
+    let mut cfg = StepSmokeConfig {
+        layers,
+        steps: 2,
+        kv_len: 0,
+        seed,
+        max_seq,
+        finish: metal::StepFinishMode::ForwardOnly,
+        use_mps_q4: None,
+        prefill_token_ids: None,
+        no_early_stop: false,
+        encoder_use_mps_q4: None,
+    };
+    if let Err(err) = attach_step_prefill(
+        &mut cfg,
+        model_dir,
+        0,
+        prompt.as_deref(),
+        raw_prompt,
+    ) {
+        eprintln!("error: {err}");
+        return ExitCode::FAILURE;
+    }
+    let label = prompt.unwrap_or_else(|| "Hello".to_string());
+    match run_step_moe_layer_dump(model_dir, &cfg, &label, layer, position) {
+        Ok(dump) => {
+            if let Err(err) = write_step_moe_layer_dump(output, &dump) {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+            println!(
+                "wrote {} (layer={}, pos={}, kv_len={}, experts={:?})",
+                output.display(),
+                dump.layer,
+                dump.position,
+                dump.kv_len,
+                dump.experts,
             );
             ExitCode::SUCCESS
         }
@@ -2597,6 +2692,24 @@ fn parse_cli() -> Cli {
                 std::process::exit(2);
             });
             Command::StepAttnDump {
+                prompt: prompt.clone(),
+                layers: bench_layers.max(1).min(30),
+                seed,
+                max_seq: step_max_seq.max(64),
+                raw_prompt,
+                output,
+                layer: step_attn_layer,
+                position: step_layer_position,
+            }
+        }
+        Some("step-moe-dump") => {
+            let output = output_dir.unwrap_or_else(|| {
+                eprintln!(
+                    "usage: diffgemma-mps step-moe-dump -m MODEL -o OUT.json [-p Hello] [--layers 30] [--seed 42] [--attn-layer 2] [--layer-position 129]"
+                );
+                std::process::exit(2);
+            });
+            Command::StepMoeDump {
                 prompt: prompt.clone(),
                 layers: bench_layers.max(1).min(30),
                 seed,

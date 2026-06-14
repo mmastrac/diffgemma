@@ -1060,7 +1060,6 @@ impl StepEnc<'_> {
         let l = &layout.layers[layer];
         let q_n = if l.is_full != 0 { 8192 } else { 4096 };
         let k_n = if l.is_full != 0 { 1024 } else { 2048 };
-        let o_k = q_n;
         let qk_y = (16 + 2 * l.n_kv_heads) as usize;
         let layer_off = layer_byte_offset(layer);
 
@@ -1121,17 +1120,44 @@ impl StepEnc<'_> {
         };
         self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
 
+        self.encode_layer_o_proj_post_attn(layer, layout)?;
+        self.encode_layer_dense_ffn(layer, layout)?;
+        self.encode_layer_router_buckets(layer, layout)?;
+        self.encode_layer_moe_grouped(layer, layout)?;
+        self.encode_layer_moe_post(layer, layout)?;
+        Ok(())
+    }
+
+    fn encode_layer_o_proj_post_attn(
+        &mut self,
+        layer: usize,
+        layout: &ModelLayout,
+    ) -> Result<(), Error> {
+        let l = &layout.layers[layer];
+        let o_k = if l.is_full != 0 { 8192 } else { 4096 };
         self.gemm_q4(A_ATTNO, A_TMP, l.o_proj, CANVAS as u32, HID as u32, o_k)?;
         self.rmsnorm(A_TMP, A_TMP, l.post_attn_ln, HID as u32, CANVAS);
         self.residual(A_HIDDEN, A_TMP, A_STREAM, 0, CANVAS * HID);
+        Ok(())
+    }
 
+    fn encode_layer_dense_ffn(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
+        let l = &layout.layers[layer];
         self.rmsnorm(A_STREAM, A_TMP, l.pre_ff_ln, HID as u32, CANVAS);
         self.gemm_q4(A_TMP, A_FFG, l.mlp_gate, CANVAS as u32, DENSE_FF, HID as u32)?;
         self.gemm_q4(A_TMP, A_FFU, l.mlp_up, CANVAS as u32, DENSE_FF, HID as u32)?;
         self.glu(A_FFG, A_FFU, A_FFG, CANVAS * DENSE_FF as usize);
         self.gemm_q4(A_FFG, A_DENSE, l.mlp_down, CANVAS as u32, HID as u32, DENSE_FF)?;
         self.rmsnorm(A_DENSE, A_DENSE, l.post_ff_ln_1, HID as u32, CANVAS);
+        Ok(())
+    }
 
+    fn encode_layer_router_buckets(
+        &mut self,
+        layer: usize,
+        layout: &ModelLayout,
+    ) -> Result<(), Error> {
+        let layer_off = layer_byte_offset(layer);
         self.enc.setComputePipelineState(&self.ps.router.pipeline);
         unsafe {
             self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), A_STREAM as usize, 0);
@@ -1167,9 +1193,18 @@ impl StepEnc<'_> {
             self.dispatch_1d(&self.ps.bucket_fill, count, 256);
         }
 
+        let l = &layout.layers[layer];
         self.rmsnorm(A_STREAM, A_MOEIN, l.pre_ff_ln_2, HID as u32, CANVAS);
         self.memzero_bytes(A_MOEOUT, (CANVAS * HID * 4) as u64);
+        Ok(())
+    }
 
+    fn encode_layer_moe_grouped(
+        &mut self,
+        layer: usize,
+        layout: &ModelLayout,
+    ) -> Result<(), Error> {
+        let layer_off = layer_byte_offset(layer);
         self.enc.setComputePipelineState(
             if self.use_nvfp4 {
                 &self.ps.moe_grouped_nvfp4.pipeline
@@ -1199,7 +1234,11 @@ impl StepEnc<'_> {
             depth: 1,
         };
         self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        Ok(())
+    }
 
+    fn encode_layer_moe_post(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
+        let l = &layout.layers[layer];
         self.rmsnorm_f32(A_MOEOUT, A_MOEIN, l.post_ff_ln_2, HID as u32, CANVAS);
         self.residual(A_DENSE, A_MOEIN, A_TMP, 0, CANVAS * HID);
         self.rmsnorm(A_TMP, A_TMP, l.post_ff_ln, HID as u32, CANVAS);
@@ -2461,6 +2500,110 @@ pub fn run_step_attn_layer_capture(
         raw_scores,
         attn_probs,
         k_samples,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct LayerMoeCapture {
+    pub layer: usize,
+    pub position: usize,
+    pub canvas_token: u32,
+    pub token_ids: Vec<u32>,
+    pub kv_len: u32,
+    pub post_attn: Vec<f32>,
+    pub dense_out: Vec<f32>,
+    pub experts: Vec<u32>,
+    pub expert_weights: Vec<u16>,
+    pub moe_out: Vec<f32>,
+    pub layer_out: Vec<f32>,
+}
+
+fn read_f32_arena_row(
+    arena: &ProtocolObject<dyn MTLBuffer>,
+    base: u64,
+    row: usize,
+    width: usize,
+) -> Vec<f32> {
+    let byte_off = base as usize + row * width * 4;
+    let ptr = unsafe { arena.contents().as_ptr().add(byte_off) as *const f32 };
+    (0..width).map(|i| unsafe { *ptr.add(i) }).collect()
+}
+
+fn read_route_at_position(
+    route: &ProtocolObject<dyn MTLBuffer>,
+    position: usize,
+) -> (Vec<u32>, Vec<u16>) {
+    unsafe {
+        let ptr = route.contents().as_ptr();
+        let weight = ptr as *const u16;
+        let expert = ptr.add(CANVAS * TOP_K * 2) as *const u32;
+        let experts = (0..TOP_K)
+            .map(|k| *expert.add(position * TOP_K + k))
+            .collect();
+        let expert_weights = (0..TOP_K)
+            .map(|k| *weight.add(position * TOP_K + k))
+            .collect();
+        (experts, expert_weights)
+    }
+}
+
+/// Step-1 forward through `layer` FFN/MoE; read checkpoints at one canvas row.
+pub fn run_step_moe_layer_capture(
+    model_dir: &Path,
+    cfg: &StepSmokeConfig,
+    layer: usize,
+    position: usize,
+) -> Result<LayerMoeCapture, Error> {
+    if position >= CANVAS {
+        return Err(Error::Format("moe capture position out of range"));
+    }
+    let layer = layer.min(cfg.layers.saturating_sub(1));
+    let (mut rt, _) = build_step_runtime(model_dir, cfg)?;
+    let layout = rt.layout;
+
+    rt.dispatch_and_wait(|enc| {
+        enc.encode_step_preamble(&layout, 1)?;
+        Ok(())
+    })?;
+    for l in 0..layer {
+        rt.dispatch_and_wait(|enc| {
+            enc.encode_layer(l, &layout)?;
+            Ok(())
+        })?;
+    }
+
+    rt.dispatch_and_wait(|enc| {
+        enc.encode_layer_through_attention(layer, &layout)?;
+        enc.encode_layer_o_proj_post_attn(layer, &layout)?;
+        Ok(())
+    })?;
+    let post_attn = read_arena_hidden_row(&rt.bufs.arena, A_STREAM, position);
+
+    rt.dispatch_and_wait(|enc| enc.encode_layer_dense_ffn(layer, &layout))?;
+    let dense_out = read_arena_hidden_row(&rt.bufs.arena, A_DENSE, position);
+
+    rt.dispatch_and_wait(|enc| enc.encode_layer_router_buckets(layer, &layout))?;
+    let (experts, expert_weights) = read_route_at_position(&rt.bufs.route, position);
+
+    rt.dispatch_and_wait(|enc| enc.encode_layer_moe_grouped(layer, &layout))?;
+    let moe_out = read_f32_arena_row(&rt.bufs.arena, A_MOEOUT, position, HID);
+
+    rt.dispatch_and_wait(|enc| enc.encode_layer_moe_post(layer, &layout))?;
+    let layer_out = read_arena_hidden_row(&rt.bufs.arena, A_HIDDEN, position);
+
+    let state = rt.read_canvas_state();
+    Ok(LayerMoeCapture {
+        layer,
+        position,
+        canvas_token: state.ids[position],
+        token_ids: state.ids.to_vec(),
+        kv_len: rt.read_params().kv_len,
+        post_attn,
+        dense_out,
+        experts,
+        expert_weights,
+        moe_out,
+        layer_out,
     })
 }
 
