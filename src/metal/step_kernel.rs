@@ -1573,16 +1573,10 @@ impl StepEnc<'_> {
         self.sink_dispatch(grid, tg);
 
         self.sink_set_pipeline(&self.ps.sample_apply);
-        unsafe {
-            self.bind_logits(0);
-            self.enc.setBuffer_offset_atIndex(
-                Some(&self.bufs.arena),
-                A_RS_SAMP as usize,
-                1,
-            );
-            self.bind_state(2);
-            self.bind_params(3);
-        }
+        self.bind_logits(0);
+        self.sink_set_buffer(&self.bufs.arena, A_RS_SAMP as usize, 1);
+        self.bind_state(2);
+        self.bind_params(3);
         let grid = MTLSize {
             width: CANVAS,
             height: 1,
@@ -1715,6 +1709,31 @@ fn write_single_expert_route(
 
 fn read_struct<T: Copy>(buf: &ProtocolObject<dyn MTLBuffer>) -> T {
     unsafe { *(buf.contents().as_ptr() as *const T) }
+}
+
+struct GpuBufferSnapshot {
+    state: CanvasState,
+    arena: Vec<u8>,
+    logits: Vec<u8>,
+    sc_probs: Vec<u8>,
+    kvcache: Vec<u8>,
+    route: Vec<u8>,
+    mps_x: Vec<u8>,
+    mps_w: Vec<u8>,
+    mps_c: Vec<u8>,
+}
+
+fn copy_buffer_bytes(buf: &ProtocolObject<dyn MTLBuffer>, byte_off: usize, len: usize) -> Vec<u8> {
+    unsafe {
+        std::slice::from_raw_parts(buf.contents().as_ptr().add(byte_off) as *const u8, len).to_vec()
+    }
+}
+
+fn write_buffer_region(buf: &ProtocolObject<dyn MTLBuffer>, byte_off: usize, data: &[u8]) {
+    unsafe {
+        std::slice::from_raw_parts_mut(buf.contents().as_ptr().add(byte_off) as *mut u8, data.len())
+            .copy_from_slice(data);
+    }
 }
 
 pub fn f16_bits_to_f32(bits: u16) -> f32 {
@@ -2011,6 +2030,32 @@ impl StepRuntime {
         Ok(())
     }
 
+    fn snapshot_gpu_buffers(&self) -> GpuBufferSnapshot {
+        GpuBufferSnapshot {
+            state: self.read_canvas_state(),
+            arena: copy_buffer_bytes(&self.bufs.arena, 0, ARENA_BYTES as usize),
+            logits: copy_buffer_bytes(&self.bufs.logits, 0, CANVAS * VOCAB * 2),
+            sc_probs: copy_buffer_bytes(&self.bufs.sc_probs, 0, self.bufs.sc_probs.length()),
+            kvcache: copy_buffer_bytes(&self.bufs.kvcache, 0, self.bufs.kvcache.length()),
+            route: copy_buffer_bytes(&self.bufs.route, 0, self.bufs.route.length()),
+            mps_x: copy_buffer_bytes(&self.bufs.mps_x, 0, self.bufs.mps_x.length()),
+            mps_w: copy_buffer_bytes(&self.bufs.mps_w, 0, self.bufs.mps_w.length()),
+            mps_c: copy_buffer_bytes(&self.bufs.mps_c, 0, self.bufs.mps_c.length()),
+        }
+    }
+
+    fn restore_gpu_buffers(&mut self, snap: &GpuBufferSnapshot) {
+        self.write_canvas_state(&snap.state);
+        write_buffer_region(&self.bufs.arena, 0, &snap.arena);
+        write_buffer_region(&self.bufs.logits, 0, &snap.logits);
+        write_buffer_region(&self.bufs.sc_probs, 0, &snap.sc_probs);
+        write_buffer_region(&self.bufs.kvcache, 0, &snap.kvcache);
+        write_buffer_region(&self.bufs.route, 0, &snap.route);
+        write_buffer_region(&self.bufs.mps_x, 0, &snap.mps_x);
+        write_buffer_region(&self.bufs.mps_w, 0, &snap.mps_w);
+        write_buffer_region(&self.bufs.mps_c, 0, &snap.mps_c);
+    }
+
     fn dispatch_record<F>(&mut self, f: F, recorder: &mut crate::metal::step_icb::IcbRecorder) -> Result<(), Error>
     where
         F: FnOnce(&mut StepEnc<'_>) -> Result<(), Error>,
@@ -2064,12 +2109,55 @@ impl StepRuntime {
         recorder.finish()
     }
 
-    fn record_icb_pair(&mut self) -> Result<crate::metal::step_icb::StepIcbPair, Error> {
-        let saved = self.read_canvas_state();
+    fn ensure_no_sc_icb(&mut self) -> Result<(), Error> {
+        let kv_len = self.read_params().kv_len;
+        let started = Instant::now();
         let no_sc = self.record_icb_plan(false)?;
+        eprintln!(
+            "step-kernel: no_sc ICB ready (kv_len={kv_len}, {} cmds/{} ops) in {:.2?}",
+            no_sc.command_count,
+            no_sc.ops.len(),
+            started.elapsed()
+        );
+        let pair = self.icb.get_or_insert_with(|| crate::metal::step_icb::StepIcbPair {
+            no_sc: None,
+            with_sc: None,
+            no_sc_kv_len: u32::MAX,
+        });
+        pair.no_sc = Some(no_sc);
+        pair.no_sc_kv_len = kv_len;
+        pair.with_sc = None;
+        Ok(())
+    }
+
+    /// Record with_sc against the current GPU buffers (post step 1).
+    fn ensure_with_sc_icb(&mut self) -> Result<(), Error> {
+        if self
+            .icb
+            .as_ref()
+            .and_then(|p| p.with_sc.as_ref())
+            .is_some()
+        {
+            return Ok(());
+        }
+        let started = Instant::now();
         let with_sc = self.record_icb_plan(true)?;
-        self.write_canvas_state(&saved);
-        Ok(crate::metal::step_icb::StepIcbPair { no_sc, with_sc })
+        eprintln!(
+            "step-kernel: with_sc ICB ready ({} cmds/{} ops) in {:.2?}",
+            with_sc.command_count,
+            with_sc.ops.len(),
+            started.elapsed()
+        );
+        self.icb.as_mut().expect("icb").with_sc = Some(with_sc);
+        Ok(())
+    }
+
+    fn record_icb_pair(&mut self) -> Result<crate::metal::step_icb::StepIcbPair, Error> {
+        Ok(crate::metal::step_icb::StepIcbPair {
+            no_sc: None,
+            with_sc: None,
+            no_sc_kv_len: u32::MAX,
+        })
     }
 
     /// Attention + dense FFN + GPU router; MoE expert matmuls on CPU (matches `.dgq` Q4 oracle).
@@ -2115,9 +2203,20 @@ impl StepRuntime {
             );
         }
         let first_step = if st_before.step == 0 { 1u32 } else { 0u32 };
-        // ICB validated for step-0 (no SC) only; with_sc plan still drifts vs live encode.
-        if finish == StepFinishMode::Full && first_step == 1 {
+        // ICB parity validated at kv_len=0 (step-smoke). Prefilled KV paths still use live encode.
+        let icb_ok = self.read_params().kv_len == 0;
+        if finish == StepFinishMode::Full && icb_ok && self.icb.is_some() {
+            if first_step == 1 {
+                self.ensure_no_sc_icb()?;
+            } else {
+                self.ensure_with_sc_icb()?;
+            }
             if let Some(icb) = &self.icb {
+                let plan = if first_step == 1 {
+                    icb.no_sc.as_ref().ok_or(Error::Format("no_sc ICB missing"))?
+                } else {
+                    icb.with_sc.as_ref().ok_or(Error::Format("with_sc ICB missing"))?
+                };
                 let cmd = self
                     .ctx
                     .queue
@@ -2125,7 +2224,7 @@ impl StepRuntime {
                     .ok_or(Error::Format("command buffer alloc failed"))?;
                 let mut enc = crate::metal::step_icb::replay_step_icb(
                     &cmd,
-                    &icb.no_sc,
+                    plan,
                     &self.bufs,
                     &mut self.mps_matmul,
                 )?;
@@ -2348,18 +2447,8 @@ pub fn build_step_runtime(
         icb: None,
     };
     if crate::metal::step_icb::step_icb_enabled() && rt.use_mps_q4 {
-        let icb_started = Instant::now();
-        eprintln!("step-kernel: recording ICB replay plans...");
-        let pair = rt.record_icb_pair()?;
-        eprintln!(
-            "step-kernel: ICB ready (no_sc={} cmds/{} ops, with_sc={} cmds/{} ops) in {:.2?}",
-            pair.no_sc.command_count,
-            pair.no_sc.ops.len(),
-            pair.with_sc.command_count,
-            pair.with_sc.ops.len(),
-            icb_started.elapsed()
-        );
-        rt.icb = Some(pair);
+        eprintln!("step-kernel: ICB replay enabled (lazy record per kv_len/step)");
+        rt.icb = Some(rt.record_icb_pair()?);
     } else if crate::metal::step_icb::step_icb_enabled() {
         eprintln!("step-kernel: ICB skipped (fused Q4/nvfp4 path; set DGQ_STEP_MPS_Q4=1 to enable)");
     }
@@ -3635,22 +3724,40 @@ mod tests {
 
     struct StepGpuSnapshot {
         state: CanvasState,
+        arena: Vec<u8>,
         logits: Vec<u8>,
+        sc_probs: Vec<u8>,
         kvcache: Vec<u8>,
+        route: Vec<u8>,
+        mps_x: Vec<u8>,
+        mps_w: Vec<u8>,
+        mps_c: Vec<u8>,
     }
 
     fn snapshot_step_gpu(rt: &StepRuntime) -> StepGpuSnapshot {
         StepGpuSnapshot {
             state: rt.read_canvas_state(),
+            arena: read_buffer_bytes(&rt.bufs.arena, 0, ARENA_BYTES as usize),
             logits: read_buffer_bytes(&rt.bufs.logits, 0, CANVAS * VOCAB * 2),
+            sc_probs: read_buffer_bytes(&rt.bufs.sc_probs, 0, rt.bufs.sc_probs.length()),
             kvcache: read_buffer_bytes(&rt.bufs.kvcache, 0, rt.bufs.kvcache.length()),
+            route: read_buffer_bytes(&rt.bufs.route, 0, rt.bufs.route.length()),
+            mps_x: read_buffer_bytes(&rt.bufs.mps_x, 0, rt.bufs.mps_x.length()),
+            mps_w: read_buffer_bytes(&rt.bufs.mps_w, 0, rt.bufs.mps_w.length()),
+            mps_c: read_buffer_bytes(&rt.bufs.mps_c, 0, rt.bufs.mps_c.length()),
         }
     }
 
     fn restore_step_gpu(rt: &mut StepRuntime, snap: &StepGpuSnapshot) {
         rt.write_canvas_state(&snap.state);
+        write_buffer_bytes(&rt.bufs.arena, 0, &snap.arena);
         write_buffer_bytes(&rt.bufs.logits, 0, &snap.logits);
+        write_buffer_bytes(&rt.bufs.sc_probs, 0, &snap.sc_probs);
         write_buffer_bytes(&rt.bufs.kvcache, 0, &snap.kvcache);
+        write_buffer_bytes(&rt.bufs.route, 0, &snap.route);
+        write_buffer_bytes(&rt.bufs.mps_x, 0, &snap.mps_x);
+        write_buffer_bytes(&rt.bufs.mps_w, 0, &snap.mps_w);
+        write_buffer_bytes(&rt.bufs.mps_c, 0, &snap.mps_c);
     }
 
     fn icb_plan_parity(
@@ -3659,6 +3766,11 @@ mod tests {
         layers: usize,
         first_step: u32,
     ) -> f32 {
+        if first_step == 1 {
+            rt.ensure_no_sc_icb().expect("no_sc icb");
+        } else {
+            rt.ensure_with_sc_icb().expect("with_sc icb");
+        }
         let snap = snapshot_step_gpu(rt);
         rt.dispatch_and_wait(|enc| {
             enc.encode_step_preamble(layout, first_step)?;
@@ -3671,16 +3783,13 @@ mod tests {
         .expect("live");
         let live_logits = read_half_buffer_f32(&rt.bufs.logits, 0, CANVAS * VOCAB);
 
-        if first_step == 0 {
-            restore_step_gpu(rt, &snap);
-        } else {
-            rt.write_canvas_state(&snap.state);
-        }
+        // Sequential generate never rewinds arena/kv between live reference and ICB replay.
+        rt.write_canvas_state(&snap.state);
         let icb = rt.icb.as_ref().expect("icb plan");
         let plan = if first_step == 1 {
-            &icb.no_sc
+            icb.no_sc.as_ref().expect("no_sc plan")
         } else {
-            &icb.with_sc
+            icb.with_sc.as_ref().expect("with_sc plan")
         };
         let cmd = rt.ctx.queue.commandBuffer().expect("cmd");
         let mut enc =
@@ -3721,7 +3830,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "with_sc ICB replay drifts vs live encode; steps 2+ use live path"]
     fn icb_with_sc_matches_live_encode() {
         let dir = Path::new("/tmp/quantized-weights");
         if !crate::dgq::store::looks_like_dgq_dir(dir) {
@@ -3738,19 +3846,47 @@ mod tests {
         let (mut rt, _) = build_step_runtime(dir, &cfg).expect("build");
         let layout = rt.layout;
         let layers = rt.layers;
-        // Step 1 (no SC) establishes kv/logits like generate-monolithic.
-        rt.dispatch_and_wait(|enc| {
-            enc.encode_step_preamble(&layout, 1)?;
-            for layer in 0..layers {
-                enc.encode_full_layer(layer, &layout)?;
-            }
-            enc.encode_step_finish(&layout, StepFinishMode::Full)?;
-            Ok(())
-        })
-        .expect("step1 live");
+        // Step 1 via no_sc ICB (same path as generate-monolithic).
+        rt.run_forward_once(StepFinishMode::Full)
+            .expect("step1 icb");
         let max = icb_plan_parity(&mut rt, &layout, layers, 0);
         eprintln!("icb with_sc parity: logits_max_abs={max:.6}");
         assert!(max < 0.05, "with_sc logits drift max_abs={max}");
+    }
+
+    /// Production-shaped check: two fresh runtimes, step1 no_sc ICB then step2 with_sc.
+    #[test]
+    fn icb_sequential_with_sc_matches_live() {
+        let dir = Path::new("/tmp/quantized-weights");
+        if !crate::dgq::store::looks_like_dgq_dir(dir) {
+            eprintln!("skip icb_sequential_with_sc_matches_live");
+            return;
+        }
+        let cfg = StepSmokeConfig {
+            layers: 30,
+            steps: 1,
+            finish: StepFinishMode::Full,
+            no_early_stop: true,
+            seed: 42,
+            ..StepSmokeConfig::default()
+        };
+        let (mut live_rt, _) = build_step_runtime(dir, &cfg).expect("live rt");
+        live_rt.run_forward_once(StepFinishMode::Full).expect("step1");
+        live_rt.run_forward_once(StepFinishMode::Full).expect("step2 live");
+        let live_logits = read_half_buffer_f32(&live_rt.bufs.logits, 0, CANVAS * VOCAB);
+
+        let (mut icb_rt, _) = build_step_runtime(dir, &cfg).expect("icb rt");
+        icb_rt.run_forward_once(StepFinishMode::Full).expect("step1");
+        icb_rt.run_forward_once(StepFinishMode::Full).expect("step2 icb");
+        let icb_logits = read_half_buffer_f32(&icb_rt.bufs.logits, 0, CANVAS * VOCAB);
+
+        let max = live_logits
+            .iter()
+            .zip(icb_logits.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!("icb sequential with_sc: logits_max_abs={max:.6}");
+        assert!(max < 0.05, "sequential with_sc drift max_abs={max}");
     }
 
     #[test]

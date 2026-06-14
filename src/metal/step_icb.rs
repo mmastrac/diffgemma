@@ -42,8 +42,11 @@ pub struct StepIcbPlan {
 }
 
 pub struct StepIcbPair {
-    pub no_sc: StepIcbPlan,
-    pub with_sc: StepIcbPlan,
+    pub no_sc: Option<StepIcbPlan>,
+    /// Recorded lazily after step 1 (needs prefilled KV + step-1 canvas state).
+    pub with_sc: Option<StepIcbPlan>,
+    /// `StepParams.kv_len` used when `no_sc` was recorded (re-record on change).
+    pub no_sc_kv_len: u32,
 }
 
 pub struct IcbRecorder {
