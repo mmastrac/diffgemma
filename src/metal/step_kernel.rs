@@ -406,7 +406,8 @@ struct StepPipelines {
     gelu_swiglu_gate_up: ComputePipeline,
     moe_grouped: ComputePipeline,
     moe_grouped_nvfp4: ComputePipeline,
-    moe_grouped_act_probe: ComputePipeline,
+    /// Q4 grouped MoE with K_DUMP_STAGE=1 (debug capture only — never in forward/generate).
+    moe_grouped_dump: ComputePipeline,
     embed_gather: ComputePipeline,
     logit_rowstats: ComputePipeline,
     sc_probs: ComputePipeline,
@@ -463,6 +464,7 @@ impl StepPipelines {
             );
         }
         let prod = crate::kernels::sub::variant::KernelVariant::PRODUCTION;
+        let dump = crate::kernels::sub::variant::KernelVariant::TEST_DUMP;
         Ok(Self {
             memzero: crate::kernels::sub::memzero_bytes::pipeline_for(ctx, prod)?,
             rmsnorm: crate::kernels::sub::rms_norm_rows_tiled::pipeline_for(
@@ -504,7 +506,7 @@ impl StepPipelines {
                 ctx,
                 prod,
             )?,
-            moe_grouped_act_probe: simple("k_moe_grouped_act_probe")?,
+            moe_grouped_dump: crate::kernels::sub::moe_grouped::pipeline_for(ctx, dump)?,
             embed_gather: crate::kernels::sub::embed_gather::pipeline_for(ctx, prod)?,
             logit_rowstats: crate::kernels::sub::logit_rowstats::pipeline_for(ctx, prod)?,
             sc_probs: crate::kernels::sub::sc_probs::pipeline_for(ctx, prod)?,
@@ -553,6 +555,8 @@ pub(crate) struct StepBuffers {
     logits: Retained<ProtocolObject<dyn MTLBuffer>>,
     sc_probs: Retained<ProtocolObject<dyn MTLBuffer>>,
     route: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// Inert 4B buffer for optional dump slots (K_DUMP_STAGE=0 kernels).
+    dummy_dump: Retained<ProtocolObject<dyn MTLBuffer>>,
     pub(crate) mps_x: Retained<ProtocolObject<dyn MTLBuffer>>,
     pub(crate) mps_w: Retained<ProtocolObject<dyn MTLBuffer>>,
     pub(crate) mps_c: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -1317,6 +1321,9 @@ impl StepEnc<'_> {
             n_experts: N_EXPERTS as u32,
         };
         self.sink_set_bytes(&grouped_dims, 5);
+        if !self.use_nvfp4 {
+            self.sink_set_buffer(&self.bufs.dummy_dump, 0, 6);
+        }
         let grid = MTLSize {
             width: CANVAS,
             height: N_EXPERTS,
@@ -1362,7 +1369,7 @@ impl StepEnc<'_> {
         write_single_expert_route(&self.bufs.route, position, expert_id);
     }
 
-    /// Grouped MoE with two-point threadgroup act probe in A_SOFT.
+    /// Grouped MoE with K_DUMP_STAGE dump of threadgroup act (debug capture only).
     fn encode_layer_moe_grouped_act_probe(
         &mut self,
         layer: usize,
@@ -1370,7 +1377,7 @@ impl StepEnc<'_> {
     ) -> Result<(), Error> {
         if self.use_nvfp4 {
             return Err(Error::Format(
-                "k_moe_grouped_act_probe is q4-only (use q8 .dgq weights)",
+                "moe_grouped dump mode is q4-only (use q8 .dgq weights)",
             ));
         }
         let layer_off = layer_byte_offset(layer);
@@ -1379,19 +1386,22 @@ impl StepEnc<'_> {
             A_SOFT,
             (MOE_ACT_PROBE_FLOATS * std::mem::size_of::<f32>()) as u64,
         );
-        self.enc
-            .setComputePipelineState(&self.ps.moe_grouped_act_probe.pipeline);
+        self.sink_set_pipeline(&self.ps.moe_grouped_dump);
         unsafe {
-            self.enc
-                .setBuffer_offset_atIndex(Some(&self.bufs.arena), A_MOEIN as usize, 0);
-            self.enc
-                .setBuffer_offset_atIndex(Some(&self.bufs.arena), A_MOEOUT as usize, 1);
+            self.sink_set_buffer(&self.bufs.arena, A_MOEIN as usize, 0);
+            self.sink_set_buffer(&self.bufs.arena, A_MOEOUT as usize, 1);
             self.bind_blob(2);
             self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 3);
             self.bind_route(4);
-            self.enc
-                .setBuffer_offset_atIndex(Some(&self.bufs.arena), A_SOFT as usize, 5);
+            self.sink_set_buffer(&self.bufs.arena, A_SOFT as usize, 6);
         }
+        let grouped_dims = crate::kernels::sub::moe_grouped::GroupedDims {
+            canvas: CANVAS as u32,
+            hidden: HID as u32,
+            moe_ff: MOE_FF,
+            n_experts: N_EXPERTS as u32,
+        };
+        self.sink_set_bytes(&grouped_dims, 5);
         let grid = MTLSize {
             width: CANVAS,
             height: N_EXPERTS,
@@ -2426,6 +2436,7 @@ pub fn build_step_runtime(
             zero_buffer(&b);
             b
         },
+        dummy_dump: alloc_buffer(&ctx.device, 4)?,
         mps_x: alloc_buffer(&ctx.device, mps_x_bytes)?,
         mps_w: alloc_buffer(&ctx.device, mps_w_bytes)?,
         mps_c: alloc_buffer(&ctx.device, mps_c_bytes)?,
@@ -3569,6 +3580,8 @@ mod tests {
     fn q4_group_k_order_l2_e0_gate_probe() {
         use crate::config::ModelConfig;
         use crate::dgq::layout::q4_row_bytes;
+        use crate::kernels::sub::q4_group_k_order;
+        use crate::kernels::sub::variant::KernelVariant;
         use crate::metal::batch::{set_bytes, GpuBatch};
         use crate::metal::buffer::BufferPool;
         use crate::metal::device::MetalContext;
@@ -3576,13 +3589,6 @@ mod tests {
         use crate::weights::WeightStore;
         use objc2_metal::MTLSize;
         use std::path::Path;
-
-        const STEP_SHADER: &str = concat!(
-    include_str!("../../shaders/include/common.metal"),
-    include_str!("../../shaders/include/dequant.metal"),
-    include_str!("../../shaders/include/activations.metal"),
-    include_str!("../../shaders/monolithic/diffgemma_step.metal"),
-);
 
         let dir = Path::new("/tmp/quantized-weights");
         if !crate::dgq::store::looks_like_dgq_dir(dir) {
@@ -3601,9 +3607,8 @@ mod tests {
         let row_bytes = q4_row_bytes(hidden);
         assert!(row.len() >= row_bytes);
 
-        let pipeline = ctx
-            .compile_kernel(STEP_SHADER, "k_q4_group_k_order_probe")
-            .expect("pipeline");
+        let pipeline =
+            q4_group_k_order::pipeline_for(&ctx, KernelVariant::TEST_DUMP).expect("pipeline");
         let mut pool = BufferPool::new();
 
         for k0 in [0usize, 32, 64] {

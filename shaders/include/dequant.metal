@@ -20,6 +20,18 @@ inline void dequant_q4_group(device const uchar *g, thread float *out32) {
     }
 }
 
+/// Column-indexed Q4 decode (parity vs `dequant_q4_group` / CPU `q4_weight_at`).
+inline float q4_at_col(device const uchar *row_base, uint col, uint K) {
+    uint g = col / 32u;
+    uint j = col % 32u;
+    device const uchar *blk = row_base + ulong(g) * 20ul;
+    float delta = bf16_bytes(blk);
+    float mn = bf16_bytes(blk + 2);
+    uchar byte = blk[4u + j / 2u];
+    float q = (j & 1u) ? float(byte >> 4) : float(byte & 0x0fu);
+    return delta * q + mn;
+}
+
 inline ulong q4_row_bytes(uint K) {
     return ulong(K / 32) * 20ul;
 }

@@ -278,8 +278,8 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
 
     let ctx = MetalContext::new()?;
     let pipeline = pipeline_for(&ctx, variant)?;
-    let mut pool = BufferPool::new();
     let moe_in_f16 = f16::f32_slice_to_f16(&f.moe_in);
+    let mut pool = BufferPool::new();
     let buf_in = pool
         .allocate(&ctx.device, moe_in_f16.len() * 2)
         .ok_or(Error::Format("alloc"))?;
@@ -295,6 +295,14 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         .ok_or(Error::Format("alloc"))?;
     let buf_route = pool
         .allocate(&ctx.device, std::mem::size_of::<RouteScratch>())
+        .ok_or(Error::Format("alloc"))?;
+    let dump_bytes = if variant.dump_stage > 0 {
+        (f.moe_ff * 2 + 36) * 4
+    } else {
+        4
+    };
+    let buf_dump = pool
+        .allocate(&ctx.device, dump_bytes)
         .ok_or(Error::Format("alloc"))?;
 
     BufferPool::write_bf16(&buf_in, &moe_in_f16);
@@ -331,6 +339,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         enc.setBuffer_offset_atIndex(Some(&buf_blob), 0, 2);
         enc.setBuffer_offset_atIndex(Some(&buf_layer), 0, 3);
         enc.setBuffer_offset_atIndex(Some(&buf_route), 0, 4);
+        enc.setBuffer_offset_atIndex(Some(&buf_dump), 0, 6);
     }
     gpu_common::set_bytes(&enc, &dims, 5);
     enc.dispatchThreadgroups_threadsPerThreadgroup(
