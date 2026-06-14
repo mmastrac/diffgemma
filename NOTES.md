@@ -166,6 +166,7 @@ The first `diffgemma_step.metal` draft had silent-garbage bugs caught only by au
 - **OOM (bf16 era):** 30 persistent attention scratches + unbounded expert transpose cache + CPU||GPU peak. Fixed by two reusable layer scratches, per-layer eviction, GPU-first parity dropping CPU state.
 - **`pool.trim` per layer caused 3x slowdown** — trim at section boundaries only.
 - **Never chain readback on the same buffer within a batch** (Metal hazard).
+- **Grouped MoE GEMM column index (`gemm_linear_grouped`, 2026-06):** dispatch is `n` threadgroups in X × 32 threads (one output column per threadgroup; lanes split K-groups and `simd_sum` within the simdgroup). Bug used `col = thread_position_in_grid.x`, so lanes 0..31 in a simdgroup mapped to columns 0..31 and `simd_sum` mixed partial dot products across columns. Symptom: batched `moe_out` cos ≈ 0.02–0.24 vs scalar `moe_grouped` ~0.99; tier-1 `gemm_linear_grouped` GPU tests failed the same way. Fix: `col = threadgroup_position_in_grid.x`, `global_row = threadgroup_position_in_grid.y`. Not a Q4 dequant / K-order issue — see subkernel `shaders/kernels/gemm_linear_grouped.metal`.
 
 ---
 
@@ -208,7 +209,7 @@ The first `diffgemma_step.metal` draft had silent-garbage bugs caught only by au
 | Path | Role |
 |------|------|
 | `shaders/diffgemma_step.metal` | All monolithic step kernels + dispatch schedule comment |
-| `shaders/qgemm.metal` | **Authoritative** Q4/Q8 dequant reference |
+| `shaders/qgemm.metal` | Q4/Q8 dequant reference (scalar linears); grouped MoE GEMM → `shaders/kernels/gemm_linear_grouped.metal` |
 | `shaders/gemm.metal`, `attention.metal`, `decoder.metal`, `sampler.metal`, `probe.metal` | Engine-path kernels |
 | `src/metal/step_kernel.rs` | Monolithic ABI, layout builder, encode driver, CLI backends |
 | `src/metal/step_generate.rs` | Monolithic generate loop + session |
@@ -306,7 +307,7 @@ See **section 5** for full archaeology. Highest-frequency when MLX/HF match each
 | **Q4 layout** | Silent garbage matmuls | `[scale][min][nibbles]` at group **front**; not tail |
 | **Q8 scale** | Wrong embed / SC | `[scale:2][i8:K]` at row **front** |
 | **VERIFY-N** | Q4 nibble parity | Even col = low nibble |
-| **VERIFY-K** | MoE / grouped GEMM drift | K-order in `dequant_q4_group` vs `q4_weight_at`; grouped MoE fork drift (q4 vs nvfp4 files) |
+| **VERIFY-K** | MoE / grouped GEMM drift | Primary batched failure (2026-06): **`col = gid.x` with `simd_sum`** — must use `threadgroup_position_in_grid.x` (see section 5). Also watch K-order in `dequant_q4_group` vs `q4_weight_at` |
 | **RoPE** | Attention garbage | Split-half pairs; proportional-RoPE denominator = **full** head_dim (512) |
 | **Temperature** | Wrong accept timing | Count-**down** schedule (`cur = max_steps - steps_done`) |
 | **Accept rule** | Wrong frozen set | Test-before-add + break on prefix entropy (HF mutual-information bound) |

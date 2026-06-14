@@ -53,13 +53,7 @@ pub fn build_expert_jobs(routes: &[RouteResult], experts: usize) -> Vec<ExpertJo
     jobs
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Q4GroupedJob {
-    w_byte_off: u64,
-    groups_per_row: u32,
-    _pad: u32,
-}
+use crate::metal::BlockGroupedJob;
 
 fn block_gemm_cpu(
     a: &[f32],
@@ -421,13 +415,13 @@ pub fn experts_forward_gpu_grouped_in_batch(
     token_indices.clear();
     for job in jobs {
         let w_gu = expert_cache.expert_gate_up_q4(layer, job.expert);
-        gate_jobs.push(Q4GroupedJob {
+        gate_jobs.push(BlockGroupedJob {
             w_byte_off: w_gu.byte_offset,
             groups_per_row: w_gu.groups_per_row(),
             _pad: 0,
         });
         let w_dn = expert_cache.expert_down_q4(layer, job.expert);
-        down_jobs.push(Q4GroupedJob {
+        down_jobs.push(BlockGroupedJob {
             w_byte_off: w_dn.byte_offset,
             groups_per_row: w_dn.groups_per_row(),
             _pad: 0,
@@ -443,13 +437,13 @@ pub fn experts_forward_gpu_grouped_in_batch(
     let gate_jobs_bytes = unsafe {
         std::slice::from_raw_parts(
             gate_jobs.as_ptr().cast::<u8>(),
-            gate_jobs.len() * std::mem::size_of::<Q4GroupedJob>(),
+            gate_jobs.len() * std::mem::size_of::<BlockGroupedJob>(),
         )
     };
     let down_jobs_bytes = unsafe {
         std::slice::from_raw_parts(
             down_jobs.as_ptr().cast::<u8>(),
-            down_jobs.len() * std::mem::size_of::<Q4GroupedJob>(),
+            down_jobs.len() * std::mem::size_of::<BlockGroupedJob>(),
         )
     };
     let row_starts_bytes = unsafe {

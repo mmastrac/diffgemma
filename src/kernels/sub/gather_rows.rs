@@ -59,6 +59,27 @@ pub fn moe_fixture(_: ElemFormat) -> Fixture {
     }
 }
 
+/// 32-slot gather order mimicking batched MoE bucket fill (non-sequential token indices).
+pub fn moe_routing_fixture(_: ElemFormat) -> Fixture {
+    let hidden = 64;
+    let num_tokens = 256;
+    let src: Vec<f32> = (0..num_tokens * hidden)
+        .map(|i| ((i as f32) * 0.0023).sin() * 0.5 + 0.25)
+        .collect();
+    let indices: Vec<u32> = vec![
+        103, 87, 44, 12, 201, 155, 3, 98, //
+        17, 240, 66, 129, 8, 190, 51, 222, //
+        74, 11, 183, 145, 28, 99, 167, 4, //
+        131, 58, 210, 37, 172, 95, 21, 248,
+    ];
+    Fixture {
+        src,
+        indices,
+        hidden,
+        num_tokens,
+    }
+}
+
 pub fn cpu(f: &Fixture) -> Vec<f32> {
     let mut out = vec![0.0f32; f.out_len()];
     for (bi, &tok) in f.indices.iter().enumerate() {
@@ -174,6 +195,18 @@ mod tests {
         cpu_oracle = crate::kernels::sub::gather_rows::cpu_oracle,
         gpu = crate::kernels::sub::gather_rows::gpu,
         fixture = crate::kernels::sub::gather_rows::moe_fixture,
+        out_len = crate::kernels::sub::gather_rows::fixture_len,
+        formats: [F32],
+        max_tol = 1e-6,
+        min_cos = 0.9999,
+    }
+
+    kernel_oracle_matrix! {
+        mod moe_routing,
+        cpu = crate::kernels::sub::gather_rows::cpu,
+        cpu_oracle = crate::kernels::sub::gather_rows::cpu_oracle,
+        gpu = crate::kernels::sub::gather_rows::gpu,
+        fixture = crate::kernels::sub::gather_rows::moe_routing_fixture,
         out_len = crate::kernels::sub::gather_rows::fixture_len,
         formats: [F32],
         max_tol = 1e-6,

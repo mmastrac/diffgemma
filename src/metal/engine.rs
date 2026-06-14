@@ -17,7 +17,6 @@ const F32_BF16_GEMM_ENTRY: &str = "f32_bf16_gemm";
 const F32_BF16_LINEAR_ENTRY: &str = "f32_bf16_linear";
 const F32_F32_LINEAR_ENTRY: &str = "f32_f32_linear";
 const F32_Q4_LINEAR_ENTRY: &str = "f32_q4_linear";
-const F32_Q4_LINEAR_GROUPED_ENTRY: &str = "f32_q4_linear_grouped";
 const F32_Q8_LINEAR_ENTRY: &str = "f32_q8_linear";
 const F32_Q8_LINEAR_KXN_ENTRY: &str = "f32_q8_linear_kxn";
 const F32_NVFP4_LINEAR_ENTRY: &str = "f32_nvfp4_linear";
@@ -58,8 +57,11 @@ impl GpuDecoderEngine {
         let f32_q4_linear_pipeline = ctx.compile_kernel(QGEMM_SHADER, F32_Q4_LINEAR_ENTRY)?;
         let f32_nvfp4_linear_pipeline =
             ctx.compile_kernel(QGEMM_SHADER, F32_NVFP4_LINEAR_ENTRY)?;
-        let f32_q4_linear_grouped_pipeline =
-            ctx.compile_kernel(QGEMM_SHADER, F32_Q4_LINEAR_GROUPED_ENTRY)?;
+        let f32_q4_linear_grouped_pipeline = crate::kernels::sub::gemm_linear_grouped::pipeline_for(
+            &ctx,
+            crate::kernels::sub::QuantFormat::Q4Affine,
+            crate::kernels::sub::variant::KernelVariant::PRODUCTION,
+        )?;
         let f32_q8_linear_pipeline = ctx.compile_kernel(QGEMM_SHADER, F32_Q8_LINEAR_ENTRY)?;
         let f32_q8_linear_kxn_pipeline =
             ctx.compile_kernel(QGEMM_SHADER, F32_Q8_LINEAR_KXN_ENTRY)?;

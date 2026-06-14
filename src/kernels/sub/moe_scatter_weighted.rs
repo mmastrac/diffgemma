@@ -49,6 +49,39 @@ pub fn tiny_fixture(_: ElemFormat) -> Fixture {
     }
 }
 
+/// Overlapping token scatter: same canvas row from multiple expert slots/weights.
+pub fn moe_routing_fixture(_: ElemFormat) -> Fixture {
+    let hidden = 8usize;
+    let mut route = RouteScratch {
+        weight: [[0; crate::metal::TOP_K]; crate::metal::CANVAS],
+        expert: [[0; crate::metal::TOP_K]; crate::metal::CANVAS],
+        count: [0; crate::metal::N_EXPERTS],
+        row_start: [0; crate::metal::N_EXPERTS + 1],
+        num_slots: 8,
+        pad_route: 0,
+        token_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
+        slot_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
+    };
+    route.token_list[..8].copy_from_slice(&[5, 5, 17, 33, 17, 99, 12, 44]);
+    route.slot_list[..8].copy_from_slice(&[0, 1, 0, 0, 1, 0, 0, 0]);
+    route.weight[5][0] = f16::f32_to_f16_bits(0.6);
+    route.weight[5][1] = f16::f32_to_f16_bits(0.4);
+    route.weight[17][0] = f16::f32_to_f16_bits(0.75);
+    route.weight[17][1] = f16::f32_to_f16_bits(0.25);
+    route.weight[33][0] = f16::f32_to_f16_bits(1.0);
+    route.weight[99][0] = f16::f32_to_f16_bits(0.5);
+    route.weight[12][0] = f16::f32_to_f16_bits(0.8);
+    route.weight[44][0] = f16::f32_to_f16_bits(0.3);
+    let expert_out: Vec<f32> = (0..8 * hidden)
+        .map(|i| (i as f32 + 1.0) * 0.1)
+        .collect();
+    Fixture {
+        expert_out,
+        route,
+        hidden,
+    }
+}
+
 pub fn cpu(f: &Fixture) -> Vec<f32> {
     crate::kernels::cpu::moe_scatter_weighted::moe_scatter_weighted(
         &f.expert_out,
@@ -144,6 +177,18 @@ mod tests {
         cpu_oracle = crate::kernels::sub::moe_scatter_weighted::cpu_oracle,
         gpu = crate::kernels::sub::moe_scatter_weighted::gpu,
         fixture = crate::kernels::sub::moe_scatter_weighted::tiny_fixture,
+        out_len = |f: &crate::kernels::sub::moe_scatter_weighted::Fixture| f.out_len(),
+        formats: [F32],
+        max_tol = 1e-5,
+        min_cos = 0.9999,
+    }
+
+    kernel_oracle_matrix! {
+        mod moe_routing,
+        cpu = crate::kernels::sub::moe_scatter_weighted::cpu,
+        cpu_oracle = crate::kernels::sub::moe_scatter_weighted::cpu_oracle,
+        gpu = crate::kernels::sub::moe_scatter_weighted::gpu,
+        fixture = crate::kernels::sub::moe_scatter_weighted::moe_routing_fixture,
         out_len = |f: &crate::kernels::sub::moe_scatter_weighted::Fixture| f.out_len(),
         formats: [F32],
         max_tol = 1e-5,

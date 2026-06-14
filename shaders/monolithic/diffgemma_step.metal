@@ -1,6 +1,5 @@
-// diffgemma_step.metal — full DiffusionGemma denoise step as one encoder (~130 dispatches).
-// Device math primitives come from shaders/include/ via Rust concat in step_kernel.rs:
-//   common.metal, dequant.metal, activations.metal — no duplicate decode/activation bodies here.
+// diffgemma_step.metal — monolithic step ABI + dispatch schedule (~130 dispatches).
+// Shared device math comes from shaders/include/ via #include (Rust: include_metal! on this file).
 // rev2: fixed per audit against qgemm.metal / kernels/cpu.rs / sample.rs / generate.rs.
 //
 // ============================== BUFFER ABI =================================
@@ -36,6 +35,9 @@
 #include <metal_simdgroup>
 #include <metal_simdgroup_matrix>
 using namespace metal;
+
+#include "dequant.metal"
+#include "activations.metal"
 
 constant uint  HID = 2816;
 constant uint  VOCAB = 262144;

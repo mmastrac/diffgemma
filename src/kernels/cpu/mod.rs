@@ -7,6 +7,7 @@ use crate::tensor::Bf16Slice;
 pub mod activations;
 pub mod attention;
 pub mod dequant;
+pub mod gemm_linear_grouped;
 pub mod moe_grouped;
 pub mod moe_router;
 pub mod moe_scatter_weighted;

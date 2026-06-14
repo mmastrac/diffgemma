@@ -8,6 +8,7 @@ pub mod gather_prob_cols;
 pub mod gather_rows;
 pub mod gelu;
 pub mod gemm_common;
+pub mod gemm_linear_grouped;
 pub mod gemm_nvfp4;
 pub mod gemm_q4;
 pub mod gemm_q8;

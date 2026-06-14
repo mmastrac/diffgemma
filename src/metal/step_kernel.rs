@@ -21,19 +21,14 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLDevice, MTLResourceOptions, MTLSize, MTLLibrary,
+    MTLComputePipelineState, MTLDevice, MTLResourceOptions, MTLSize,
 };
 use std::collections::HashMap;
 use std::mem::offset_of;
 use std::path::Path;
 use std::time::Instant;
 
-const STEP_SHADER: &str = concat!(
-    include_str!("../../shaders/include/common.metal"),
-    include_str!("../../shaders/include/dequant.metal"),
-    include_str!("../../shaders/include/activations.metal"),
-    include_str!("../../shaders/monolithic/diffgemma_step.metal"),
-);
+const STEP_SHADER: &str = shader_include::include_metal!("monolithic/diffgemma_step.metal");
 const QGEMM_SHADER: &str = include_str!("../../shaders/qgemm.metal");
 
 pub const HID: usize = 2816;
@@ -448,8 +443,7 @@ struct StepPipelines {
 }
 
 impl StepPipelines {
-    fn new(ctx: &MetalContext, library: &ProtocolObject<dyn MTLLibrary>) -> Result<Self, Error> {
-        let simple = |e: &str| ctx.compile_kernel_from_library(library, e);
+    fn new(ctx: &MetalContext) -> Result<Self, Error> {
         let mut gemm_q4 = HashMap::new();
         let mut gemm_nvfp4 = HashMap::new();
         let mut gemm_q8 = HashMap::new();
@@ -525,8 +519,16 @@ impl StepPipelines {
             bucket_count: crate::kernels::sub::moe_bucket_count::pipeline_for(ctx, prod)?,
             bucket_fill: crate::kernels::sub::moe_bucket_fill::pipeline_for(ctx, prod)?,
             q4_linear: ctx.compile_kernel(QGEMM_SHADER, "f32_q4_linear")?,
-            q4_linear_grouped: ctx.compile_kernel(QGEMM_SHADER, "f32_q4_linear_grouped")?,
-            nvfp4_linear_grouped: ctx.compile_kernel(QGEMM_SHADER, "f32_nvfp4_linear_grouped")?,
+            q4_linear_grouped: crate::kernels::sub::gemm_linear_grouped::pipeline_for(
+                ctx,
+                crate::kernels::sub::QuantFormat::Q4Affine,
+                prod,
+            )?,
+            nvfp4_linear_grouped: crate::kernels::sub::gemm_linear_grouped::pipeline_for(
+                ctx,
+                crate::kernels::sub::QuantFormat::NvFp4,
+                prod,
+            )?,
             nvfp4_linear: ctx.compile_kernel(QGEMM_SHADER, "f32_nvfp4_linear")?,
             gather_rows: crate::kernels::sub::gather_rows::pipeline_for(ctx, prod)?,
             gelu_swiglu_gate_up: crate::kernels::sub::swiglu::pipeline_for_moe(ctx, prod)?,
@@ -2572,7 +2574,7 @@ fn shared_step_pipelines(ctx: &MetalContext) -> Result<&'static StepPipelines, E
         .get_or_init(|| {
             let result = ctx
                 .compile_library(STEP_SHADER)
-                .and_then(|library| StepPipelines::new(ctx, &library))
+                .and_then(|_| StepPipelines::new(ctx))
                 .map_err(|e| e.to_string());
             if result.is_ok() {
                 crate::metal::pipeline_cache::PipelineArchiveCache::flush_global();
