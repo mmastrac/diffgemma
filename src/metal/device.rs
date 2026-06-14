@@ -1,3 +1,4 @@
+use crate::kernels::sub::variant::KernelVariant;
 use crate::metal::pipeline_cache::PipelineArchiveCache;
 use crate::safetensors::Error;
 use objc2::rc::Retained;
@@ -114,6 +115,59 @@ impl MetalContext {
             pipelines.push(self.compile_kernel_from_library(&library, entry)?);
         }
         Ok(pipelines)
+    }
+
+    /// Specialize an isolated subkernel (function constants 1–3 per STRATEGY.md §4).
+    pub fn compile_subkernel(
+        &self,
+        source: &str,
+        entry: &str,
+        variant: KernelVariant,
+    ) -> Result<ComputePipeline, Error> {
+        Self::compile_subkernel_on_device(&self.device, source, entry, variant)
+    }
+
+    pub fn compile_subkernel_on_device(
+        device: &ProtocolObject<dyn MTLDevice>,
+        source: &str,
+        entry: &str,
+        variant: KernelVariant,
+    ) -> Result<ComputePipeline, Error> {
+        let library = {
+            let ns_source = NSString::from_str(source);
+            device
+                .newLibraryWithSource_options_error(&ns_source, None)
+                .map_err(|e| shader_compile_error(e))?
+        };
+        let fc = MTLFunctionConstantValues::new();
+        let shape_assert = variant.shape_assert;
+        let dump_stage = variant.dump_stage;
+        let use_fp4 = variant.use_fp4;
+        unsafe {
+            fc.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from_ref(&shape_assert).cast(),
+                MTLDataType::Bool,
+                1,
+            );
+            fc.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from_ref(&dump_stage).cast(),
+                MTLDataType::UInt,
+                2,
+            );
+            fc.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from_ref(&use_fp4).cast(),
+                MTLDataType::Bool,
+                3,
+            );
+        }
+        let name = NSString::from_str(entry);
+        let function = library
+            .newFunctionWithName_constantValues_error(&name, &fc)
+            .map_err(|e| shader_compile_error(e))?;
+        let label = variant.cache_label(entry);
+        let cache = PipelineArchiveCache::shared(device)?;
+        let pipeline = cache.compile_compute(device, &function, &label)?;
+        Ok(ComputePipeline { pipeline })
     }
 }
 

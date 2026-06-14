@@ -1,6 +1,7 @@
 use crate::metal::buffer::BufferPool;
 use crate::metal::device::{ComputePipeline, MetalContext};
 use crate::safetensors::Error;
+use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
@@ -8,6 +9,15 @@ use objc2_metal::{
 };
 
 const DECODER_SHADER: &str = include_str!("../../shaders/decoder.metal");
+
+/// One-byte scratch for optional dump buffer slot (compiled out when dump_stage=0).
+fn dummy_dump_buf(
+    pool: &mut BufferPool,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+) -> Result<Retained<ProtocolObject<dyn objc2_metal::MTLBuffer>>, Error> {
+    pool.allocate(device, 4)
+        .ok_or(Error::Format("Metal buffer alloc failed"))
+}
 
 pub struct GpuKernels {
     pub(crate) rms_norm: ComputePipeline,
@@ -29,7 +39,6 @@ pub struct GpuKernels {
 impl GpuKernels {
     pub fn new(ctx: &MetalContext) -> Result<Self, Error> {
         let names = [
-            "rms_norm_rows",
             "rms_norm_rows_no_scale",
             "vec_add_inplace",
             "gather_rows",
@@ -40,6 +49,10 @@ impl GpuKernels {
             "swiglu_mul",
         ];
         let pipelines = ctx.compile_kernels(DECODER_SHADER, &names)?;
+        let rms_norm = crate::kernels::sub::rms_norm_rows::pipeline_for(
+            ctx,
+            crate::kernels::sub::variant::KernelVariant::PRODUCTION,
+        )?;
         let mut it = pipelines.into_iter().rev();
         Ok(Self {
             vec_fill_zero: ctx.compile_kernel(DECODER_SHADER, "vec_fill_zero")?,
@@ -55,7 +68,7 @@ impl GpuKernels {
             gather_rows: it.next().ok_or(Error::Format("pipeline missing"))?,
             vec_add: it.next().ok_or(Error::Format("pipeline missing"))?,
             rms_norm_no_scale: it.next().ok_or(Error::Format("pipeline missing"))?,
-            rms_norm: it.next().ok_or(Error::Format("pipeline missing"))?,
+            rms_norm,
         })
     }
 
@@ -92,21 +105,19 @@ impl GpuKernels {
         BufferPool::write_f32(&buf_w, weight);
         BufferPool::write_f32(&buf_o, out);
 
+        let buf_dump = dummy_dump_buf(pool, device)?;
         let dims = [seq_len as u32, hidden as u32];
         run_1d(queue, &self.rms_norm.pipeline, seq_len, |enc| {
-            unsafe {
-                enc.setBuffer_offset_atIndex(Some(&buf_x), 0, 0);
-                enc.setBuffer_offset_atIndex(Some(&buf_w), 0, 1);
-                enc.setBuffer_offset_atIndex(Some(&buf_o), 0, 2);
-            }
-            set_bytes(enc, &dims, 3);
-            set_bytes(enc, &eps, 4);
+            crate::kernels::sub::rms_norm_rows::bind_gpu_buffers(
+                &enc, &buf_x, &buf_w, &buf_o, &buf_dump, &dims, eps,
+            );
         })?;
 
         BufferPool::read_f32(&buf_o, out);
         pool.release(x_bytes, buf_x);
         pool.release(w_bytes, buf_w);
         pool.release(o_bytes, buf_o);
+        pool.release(4, buf_dump);
         Ok(())
     }
 

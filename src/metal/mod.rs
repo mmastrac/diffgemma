@@ -4,11 +4,11 @@ mod attention;
 mod attention_batch;
 mod batch;
 mod batched_kernels;
-mod buffer;
+pub(crate) mod buffer;
 mod decoder;
 mod decoder_attention;
 mod decoder_layer;
-mod device;
+pub(crate) mod device;
 mod expert_cache;
 mod encoder_extend;
 mod engine;
@@ -42,6 +42,9 @@ mod step_icb;
 mod self_conditioning;
 mod telemetry;
 mod weights;
+
+pub(crate) use buffer::BufferPool;
+pub(crate) use device::{ComputePipeline, MetalContext};
 
 pub use memory::{
     estimate_decoder_forward, estimate_paged_layer_bytes, estimate_weight_cache,

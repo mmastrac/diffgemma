@@ -1,6 +1,7 @@
 //! Elementwise kernels encoded into a shared `GpuBatch`.
 
 use crate::fast_slice::FastSlice;
+use crate::kernels::sub::rms_norm_rows;
 use crate::metal::batch::{set_bytes, GpuBatch};
 use crate::metal::kernels::GpuKernels;
 use crate::safetensors::Error;
@@ -25,15 +26,10 @@ pub fn rms_norm_rows(
     let buf_x = batch.alloc_f32(x)?;
     let buf_w = batch.alloc_f32(weight)?;
     let buf_o = batch.alloc_f32_out(len)?;
+    let buf_dump = batch.alloc_f32_out(1)?;
     let dims = [seq_len as u32, hidden as u32];
     batch.dispatch_1d(&kernels.rms_norm.pipeline, seq_len, |enc| {
-        unsafe {
-            enc.setBuffer_offset_atIndex(Some(&buf_x), 0, 0);
-            enc.setBuffer_offset_atIndex(Some(&buf_w), 0, 1);
-            enc.setBuffer_offset_atIndex(Some(&buf_o), 0, 2);
-        }
-        set_bytes(enc, &dims, 3);
-        set_bytes(enc, &eps, 4);
+        rms_norm_rows::bind_gpu_buffers(&enc, &buf_x, &buf_w, &buf_o, &buf_dump, &dims, eps);
     });
     batch.register_read(buf_o, out);
     Ok(())
@@ -56,15 +52,10 @@ pub fn rms_norm_rows_gpu(
     let buf_x = batch.alloc_f32(x)?;
     let buf_w = batch.alloc_f32(weight)?;
     let buf_o = batch.alloc_f32_out(len)?;
+    let buf_dump = batch.alloc_f32_out(1)?;
     let dims = [seq_len as u32, hidden as u32];
     batch.dispatch_1d(&kernels.rms_norm.pipeline, seq_len, |enc| {
-        unsafe {
-            enc.setBuffer_offset_atIndex(Some(&buf_x), 0, 0);
-            enc.setBuffer_offset_atIndex(Some(&buf_w), 0, 1);
-            enc.setBuffer_offset_atIndex(Some(&buf_o), 0, 2);
-        }
-        set_bytes(enc, &dims, 3);
-        set_bytes(enc, &eps, 4);
+        rms_norm_rows::bind_gpu_buffers(&enc, &buf_x, &buf_w, &buf_o, &buf_dump, &dims, eps);
     });
     Ok(buf_o)
 }
@@ -85,15 +76,10 @@ pub fn rms_norm_rows_gpu_buf(
     let len = seq_len * hidden;
     let buf_w = batch.alloc_f32(weight)?;
     let buf_o = batch.alloc_f32_out(len)?;
+    let buf_dump = batch.alloc_f32_out(1)?;
     let dims = [seq_len as u32, hidden as u32];
     batch.dispatch_1d(&kernels.rms_norm.pipeline, seq_len, |enc| {
-        unsafe {
-            enc.setBuffer_offset_atIndex(Some(x_buf), 0, 0);
-            enc.setBuffer_offset_atIndex(Some(&buf_w), 0, 1);
-            enc.setBuffer_offset_atIndex(Some(&buf_o), 0, 2);
-        }
-        set_bytes(enc, &dims, 3);
-        set_bytes(enc, &eps, 4);
+        rms_norm_rows::bind_gpu_buffers(&enc, x_buf, &buf_w, &buf_o, &buf_dump, &dims, eps);
     });
     Ok(buf_o)
 }
