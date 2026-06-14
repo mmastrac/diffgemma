@@ -116,6 +116,12 @@ pub static MANIFEST: Manifest = Manifest {
             variants: KernelVariants::Gelu,
         },
         KernelSpec {
+            name: "embed_gather",
+            entry: "embed_gather",
+            quant_formats: &[QuantFormat::Q8],
+            variants: KernelVariants::Elementwise,
+        },
+        KernelSpec {
             name: "logit_rowstats",
             entry: "logit_rowstats",
             quant_formats: &[QuantFormat::Q4Affine],

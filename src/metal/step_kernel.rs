@@ -497,7 +497,7 @@ impl StepPipelines {
             moe_grouped: simple("k_moe_grouped")?,
             moe_grouped_nvfp4: simple("k_moe_grouped_nvfp4")?,
             moe_grouped_act_probe: simple("k_moe_grouped_act_probe")?,
-            embed_gather: simple("k_embed_gather")?,
+            embed_gather: crate::kernels::sub::embed_gather::pipeline_for(ctx, prod)?,
             logit_rowstats: crate::kernels::sub::logit_rowstats::pipeline_for(ctx, prod)?,
             sc_probs: crate::kernels::sub::sc_probs::pipeline_for(ctx, prod)?,
             sc_softembed: simple("k_sc_softembed")?,
@@ -1437,27 +1437,26 @@ impl StepEnc<'_> {
         Ok(())
     }
 
-    /// Canvas token embed gather only (no SC residual, no no-scale RMSNorm).
-    fn encode_preamble_embed_only(&mut self, layout: &ModelLayout) -> Result<(), Error> {
-        let _ = layout;
+    fn dispatch_embed_gather(&mut self, embed_off: u64) {
+        use crate::dgq::embed_row::EMBED_SCALE;
+
         self.sink_set_pipeline(&self.ps.embed_gather);
         unsafe {
             self.bind_blob(0);
-            self.bind_layout(1);
-            self.bind_state(2);
-            self.sink_set_buffer(&self.bufs.arena, A_HIDDEN as usize, 3);
+            self.bind_state(1);
+            self.sink_set_buffer(&self.bufs.arena, A_HIDDEN as usize, 2);
         }
-        let grid = MTLSize {
-            width: HID,
-            height: CANVAS,
-            depth: 1,
-        };
-        let tg = MTLSize {
-            width: 1,
-            height: 1,
-            depth: 1,
-        };
+        self.sink_set_bytes(&embed_off, 3);
+        let dims = [HID as u32, CANVAS as u32];
+        self.sink_set_bytes(&dims, 4);
+        self.sink_set_bytes(&EMBED_SCALE, 5);
+        let (grid, tg) = crate::kernels::sub::embed_gather::dispatch_shape(HID, CANVAS);
         self.sink_dispatch(grid, tg);
+    }
+
+    /// Canvas token embed gather only (no SC residual, no no-scale RMSNorm).
+    fn encode_preamble_embed_only(&mut self, layout: &ModelLayout) -> Result<(), Error> {
+        self.dispatch_embed_gather(layout.embed);
         Ok(())
     }
 
@@ -1495,26 +1494,7 @@ impl StepEnc<'_> {
         }
         // first_step: A_DENSE stays zero; skip SC MLP + O(vocab) softembed.
 
-        self.sink_set_pipeline(&self.ps.embed_gather);
-        unsafe {
-            self.bind_blob(0);
-            self.bind_layout(1);
-            self.bind_state(2);
-            self.sink_set_buffer(&self.bufs.arena, A_HIDDEN as usize, 3);
-        }
-        let grid = MTLSize {
-            width: HID,
-            height: CANVAS,
-            depth: 1,
-        };
-        let tg = MTLSize {
-            width: 1,
-            height: 1,
-            depth: 1,
-        };
-        self.sink_dispatch(grid, tg);
-
-        self.residual(A_HIDDEN, A_DENSE, A_HIDDEN, 0, CANVAS * HID);
+        self.dispatch_embed_gather(layout.embed);
         self.rmsnorm(A_HIDDEN, A_HIDDEN, 0, HID as u32, CANVAS);
         Ok(())
     }

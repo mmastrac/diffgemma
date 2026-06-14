@@ -615,16 +615,7 @@ kernel void k_moe_grouped_nvfp4(device const half* moe_in [[buffer(0)]],
     }
 }
 
-// ============ k_embed_gather (q8: [scale:2][i8:K], audit item 2) ============
-kernel void k_embed_gather(device const uchar* blob [[buffer(0)]],
-                           device const ModelLayout* ML [[buffer(1)]],
-                           device const CanvasState* S [[buffer(2)]],
-                           device half* out [[buffer(3)]],
-                           uint2 gid [[thread_position_in_grid]]) {  // x=dim, y=token
-    uint tok = gid.y, d = gid.x;
-    device const uchar* row = blob + ML->embed + (ulong)S->ids[tok] * q8_row_bytes(HID);
-    out[(ulong)tok*HID + d] = half(q8_at(row, d, bf16_bytes(row)) * EMBED_SCALE);
-}
+// embed_gather -> shaders/kernels/embed_gather.metal
 
 // logit_rowstats -> shaders/kernels/logit_rowstats.metal
 // sc_probs -> shaders/kernels/sc_probs.metal
