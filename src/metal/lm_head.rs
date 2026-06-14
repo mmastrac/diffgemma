@@ -161,9 +161,9 @@ mod tests {
             .collect();
 
         let mut pool = BufferPool::new();
-        let q8_pipeline = ctx
-            .compile_kernel(include_str!("../../shaders/qgemm.metal"), "f32_q8_linear")
-            .expect("q8");
+        let prod = crate::kernels::sub::variant::KernelVariant::PRODUCTION;
+        let q8_pipeline =
+            crate::kernels::sub::gemm_q8_linear_f32::pipeline_for(&ctx, prod).expect("q8");
         let sampler_kernels = GpuSamplerKernels::new(&ctx).expect("sampler kernels");
         let kernels = GpuKernels::new(&ctx).expect("kernels");
 

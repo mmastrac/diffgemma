@@ -1,6 +1,6 @@
 // diffgemma_step.metal — monolithic step ABI + dispatch schedule (~130 dispatches).
 // Shared device math comes from shaders/include/ via #include (Rust: include_metal! on this file).
-// rev2: fixed per audit against qgemm.metal / kernels/cpu.rs / sample.rs / generate.rs.
+// rev2: fixed per audit against kernels/cpu.rs / shaders/include/dequant.metal / sample.rs / generate.rs.
 //
 // ============================== BUFFER ABI =================================
 // b0  blob     device const uchar*        model.dgq.bin, mmap'd, bytesNoCopy
@@ -15,7 +15,7 @@
 //                                         buffer completion order across replays.
 // b7  route    device RouteScratch*
 //
-// FORMATS (authoritative: src/dgq/block.rs, shaders/qgemm.metal):
+// FORMATS (authoritative: src/dgq/block.rs, shaders/include/dequant.metal):
 //   q4_block group (20B): [scale bf16:2][min bf16:2][nibbles:16]; w = scale*q + min;
 //                         q for col j at byte 4+j/2; even j = low nibble.   (VERIFY-N: nibble parity)
 //   q8_row   row (K+2B):  [scale bf16:2][i8 weights:K]; w = scale*q.

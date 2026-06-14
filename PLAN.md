@@ -152,7 +152,7 @@ P1.6 (convergence) remains the quality gate; P2.1 latency work can proceed in pa
 | P3.5 | CI default monolithic | Medium | `step-ci` + templated gate on monolithic path |
 | P3.6 | **Declarative step dispatch schedule** | High (maintainability) | See [P3.6 detail](#p36-declarative-step-dispatch-schedule) |
 | P3.7 | **GPU debug status / invariant flag** | High (debuggability) | See [P3.7 detail](#p37-gpu-debug-status--invariant-flag) |
-| P3.8 | Subkernel extraction completion | Medium | All monolithic stage bodies in `shaders/kernels/` + Tier-1 oracles; `qgemm.metal` scalar-only or retired |
+| P3.8 | Subkernel extraction completion | Medium | All monolithic stage bodies in `shaders/kernels/` + Tier-1 oracles; `qgemm.metal` retired |
 
 **P3 exit:** ship-quality chat @ 30L on 24 GiB; orchestration drift class prevented by schedule asserts; §6 invariants enforced in debug builds.
 

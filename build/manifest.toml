@@ -305,6 +305,42 @@ quant_formats = [0, 3]
 [[kernel.variants]]
 
 [[kernel]]
+name = "gemm_linear_f32"
+entry = "gemm_linear_f32"
+quant_formats = [0, 3]
+
+[kernel.fc]
+1 = "K_SHAPE_ASSERT"
+2 = "K_DUMP_STAGE"
+3 = "K_QUANT_FORMAT"
+
+[[kernel.variants]]
+
+[[kernel]]
+name = "gemm_q8_linear_f32"
+entry = "gemm_q8_linear_f32"
+quant_formats = [0]
+
+[kernel.fc]
+1 = "K_SHAPE_ASSERT"
+2 = "K_DUMP_STAGE"
+3 = "K_QUANT_FORMAT"
+
+[[kernel.variants]]
+
+[[kernel]]
+name = "gemm_q8_linear_kxn_f32"
+entry = "gemm_q8_linear_kxn_f32"
+quant_formats = [0]
+
+[kernel.fc]
+1 = "K_SHAPE_ASSERT"
+2 = "K_DUMP_STAGE"
+3 = "K_QUANT_FORMAT"
+
+[[kernel.variants]]
+
+[[kernel]]
 name = "gemm_block"
 entry = "gemm_block"
 quant_formats = [0, 3]

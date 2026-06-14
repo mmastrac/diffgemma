@@ -507,12 +507,19 @@ mod q4_gpu_tests {
         }
 
         let mut pool = BufferPool::new();
-        let pipeline = ctx
-            .compile_kernel(include_str!("../../shaders/qgemm.metal"), "f32_q4_linear")
-            .expect("pipeline");
-        let nvfp4_pipeline = ctx
-            .compile_kernel(include_str!("../../shaders/qgemm.metal"), "f32_nvfp4_linear")
-            .expect("nvfp4 pipeline");
+        let prod = crate::kernels::sub::variant::KernelVariant::PRODUCTION;
+        let pipeline = crate::kernels::sub::gemm_linear_f32::pipeline_for(
+            &ctx,
+            crate::kernels::sub::QuantFormat::Q4Affine,
+            prod,
+        )
+        .expect("pipeline");
+        let nvfp4_pipeline = crate::kernels::sub::gemm_linear_f32::pipeline_for(
+            &ctx,
+            crate::kernels::sub::QuantFormat::NvFp4,
+            prod,
+        )
+        .expect("nvfp4 pipeline");
         let mut batch = GpuBatch::begin(&ctx.queue, &mut pool, &ctx.device).expect("batch");
         let buf_a = batch.alloc_f32(&a).expect("a");
         let buf_c = f32_q4_linear_gpu_bufs(
@@ -577,9 +584,9 @@ mod q4_gpu_tests {
         }
 
         let mut pool = BufferPool::new();
-        let pipeline = ctx
-            .compile_kernel(include_str!("../../shaders/qgemm.metal"), "f32_q8_linear")
-            .expect("pipeline");
+        let prod = crate::kernels::sub::variant::KernelVariant::PRODUCTION;
+        let pipeline =
+            crate::kernels::sub::gemm_q8_linear_f32::pipeline_for(&ctx, prod).expect("pipeline");
         let mut batch = GpuBatch::begin(&ctx.queue, &mut pool, &ctx.device).expect("batch");
         let buf_a = batch.alloc_f32(&a).expect("a");
         let buf_c =
@@ -635,12 +642,19 @@ mod q4_gpu_tests {
         }
 
         let mut pool = BufferPool::new();
-        let q4_pipeline = ctx
-            .compile_kernel(include_str!("../../shaders/qgemm.metal"), "f32_q4_linear")
-            .expect("pipeline");
-        let nvfp4_pipeline = ctx
-            .compile_kernel(include_str!("../../shaders/qgemm.metal"), "f32_nvfp4_linear")
-            .expect("nvfp4 pipeline");
+        let prod = crate::kernels::sub::variant::KernelVariant::PRODUCTION;
+        let q4_pipeline = crate::kernels::sub::gemm_linear_f32::pipeline_for(
+            &ctx,
+            crate::kernels::sub::QuantFormat::Q4Affine,
+            prod,
+        )
+        .expect("pipeline");
+        let nvfp4_pipeline = crate::kernels::sub::gemm_linear_f32::pipeline_for(
+            &ctx,
+            crate::kernels::sub::QuantFormat::NvFp4,
+            prod,
+        )
+        .expect("nvfp4 pipeline");
         let mut batch = GpuBatch::begin(&ctx.queue, &mut pool, &ctx.device).expect("batch");
         let buf_a = batch.alloc_f32(&a).expect("a");
         let buf_c = f32_q4_linear_gpu_bufs(
@@ -687,12 +701,13 @@ mod q4_gpu_tests {
             .tensor_f32("model.decoder.layers.0.self_attn.q_proj.weight")
             .expect("cpu dequant");
 
-        let pipeline = ctx
-            .compile_kernel(
-                include_str!("../../shaders/qgemm.metal"),
-                "dequant_nvfp4_matrix",
-            )
-            .expect("pipeline");
+        let prod = crate::kernels::sub::variant::KernelVariant::PRODUCTION;
+        let pipeline = crate::kernels::sub::dequant_block_matrix::pipeline_for(
+            &ctx,
+            crate::kernels::sub::QuantFormat::NvFp4,
+            prod,
+        )
+        .expect("pipeline");
         let mut pool = BufferPool::new();
         let mut batch = GpuBatch::begin(&ctx.queue, &mut pool, &ctx.device).expect("batch");
         let buf_out = batch.alloc_f32_out(cpu.len()).expect("out");

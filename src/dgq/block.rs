@@ -132,7 +132,7 @@ pub(crate) fn q4_weight_at(src: &[u8], row: usize, col: usize, in_dim: usize) ->
     delta * q + min
 }
 
-/// CPU Q4 GEMM matching `f32_q4_linear.metal` (deterministic parity path).
+/// CPU Q4 GEMM matching `gemm_linear_f32` (deterministic parity path).
 pub fn q4_gemm_cpu(a: &[f32], m: usize, k: usize, w_q4: &[u8], n: usize, out: &mut [f32]) {
     assert_eq!(a.len(), m * k);
     assert_eq!(out.len(), m * n);

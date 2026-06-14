@@ -88,7 +88,7 @@ pub(crate) fn dequant_q4_group_cpu(g: &[u8; 20]) -> [f32; 32] {
     crate::kernels::cpu::dequant::dequant_q4_group(g)
 }
 
-/// K-order decode via col-indexed path (mirrors `q4_weight_at` in qgemm.metal).
+/// K-order decode via col-indexed path (mirrors `q4_at_col` in dequant.metal).
 pub(crate) fn q4_weight_at_k_order_group(
     row: &[u8],
     base_k: usize,

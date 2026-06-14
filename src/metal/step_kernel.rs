@@ -29,7 +29,6 @@ use std::path::Path;
 use std::time::Instant;
 
 const STEP_SHADER: &str = shader_include::include_metal!("monolithic/diffgemma_step.metal");
-const QGEMM_SHADER: &str = include_str!("../../shaders/qgemm.metal");
 
 pub const HID: usize = 2816;
 pub const VOCAB: usize = 262144;
@@ -526,7 +525,11 @@ impl StepPipelines {
             router: crate::kernels::sub::moe_router::pipeline_for(ctx, prod)?,
             bucket_count: crate::kernels::sub::moe_bucket_count::pipeline_for(ctx, prod)?,
             bucket_fill: crate::kernels::sub::moe_bucket_fill::pipeline_for(ctx, prod)?,
-            q4_linear: ctx.compile_kernel(QGEMM_SHADER, "f32_q4_linear")?,
+            q4_linear: crate::kernels::sub::gemm_linear_f32::pipeline_for(
+                ctx,
+                crate::kernels::sub::QuantFormat::Q4Affine,
+                prod,
+            )?,
             q4_linear_grouped: crate::kernels::sub::gemm_linear_grouped::pipeline_for(
                 ctx,
                 crate::kernels::sub::QuantFormat::Q4Affine,
@@ -537,7 +540,11 @@ impl StepPipelines {
                 crate::kernels::sub::QuantFormat::NvFp4,
                 prod,
             )?,
-            nvfp4_linear: ctx.compile_kernel(QGEMM_SHADER, "f32_nvfp4_linear")?,
+            nvfp4_linear: crate::kernels::sub::gemm_linear_f32::pipeline_for(
+                ctx,
+                crate::kernels::sub::QuantFormat::NvFp4,
+                prod,
+            )?,
             gather_rows: crate::kernels::sub::gather_rows::pipeline_for(ctx, prod)?,
             gelu_swiglu_gate_up: crate::kernels::sub::swiglu::pipeline_for_moe(ctx, prod)?,
             moe_scatter_weighted: crate::kernels::sub::moe_scatter_weighted::pipeline_for(

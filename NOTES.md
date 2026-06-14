@@ -209,7 +209,11 @@ The first `diffgemma_step.metal` draft had silent-garbage bugs caught only by au
 | Path | Role |
 |------|------|
 | `shaders/diffgemma_step.metal` | All monolithic step kernels + dispatch schedule comment |
-| `shaders/qgemm.metal` | Q4/Q8 dequant reference (scalar linears); grouped MoE GEMM → `shaders/kernels/gemm_linear_grouped.metal` |
+| `shaders/kernels/gemm_linear_f32.metal` | Scalar Q4/NVFP4 f32 GEMM (`C = A @ W^T`) |
+| `shaders/kernels/gemm_q8_linear_f32.metal` | Scalar Q8 f32 GEMM (`C = A @ W^T`) |
+| `shaders/kernels/gemm_q8_linear_kxn_f32.metal` | Scalar Q8 f32 GEMM (`C = A @ W[K,N]`) |
+| `shaders/kernels/gemm_linear_grouped.metal` | Grouped MoE block GEMM |
+| `shaders/kernels/dequant_block_matrix.metal` | Block matrix dequant (MPS fallback path) |
 | `shaders/gemm.metal`, `attention.metal`, `decoder.metal`, `sampler.metal`, `probe.metal` | Engine-path kernels |
 | `src/metal/step_kernel.rs` | Monolithic ABI, layout builder, encode driver, CLI backends |
 | `src/metal/step_generate.rs` | Monolithic generate loop + session |
