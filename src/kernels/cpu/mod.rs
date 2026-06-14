@@ -6,6 +6,7 @@ use crate::tensor::Bf16Slice;
 
 pub mod activations;
 pub mod dequant;
+pub mod sampler;
 
 const GELU_TANH_COEF: f32 = 0.797_884_560_802_865_4; // sqrt(2/pi)
 

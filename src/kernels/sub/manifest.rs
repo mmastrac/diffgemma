@@ -140,6 +140,30 @@ pub static MANIFEST: Manifest = Manifest {
             variants: KernelVariants::Elementwise,
         },
         KernelSpec {
+            name: "sample_rowstats",
+            entry: "sample_rowstats",
+            quant_formats: &[QuantFormat::Q4Affine],
+            variants: KernelVariants::Elementwise,
+        },
+        KernelSpec {
+            name: "sample_commit",
+            entry: "sample_commit",
+            quant_formats: &[QuantFormat::Q4Affine],
+            variants: KernelVariants::Elementwise,
+        },
+        KernelSpec {
+            name: "sample_apply",
+            entry: "sample_apply",
+            quant_formats: &[QuantFormat::Q4Affine],
+            variants: KernelVariants::Elementwise,
+        },
+        KernelSpec {
+            name: "sample_write",
+            entry: "sample_write",
+            quant_formats: &[QuantFormat::Q4Affine],
+            variants: KernelVariants::Elementwise,
+        },
+        KernelSpec {
             name: "gemm_q4",
             entry: "gemm_q4",
             quant_formats: &[QuantFormat::Q4Affine],

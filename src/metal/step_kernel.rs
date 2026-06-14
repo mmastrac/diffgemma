@@ -112,7 +112,7 @@ pub struct ModelLayout {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct StepParams {
     pub kv_len: u32,
     pub max_steps: u32,
@@ -508,10 +508,10 @@ impl StepPipelines {
             sc_softembed: crate::kernels::sub::sc_softembed::pipeline_for(ctx, prod)?,
             half_scale: crate::kernels::sub::half_scale::pipeline_for(ctx, prod)?,
             softcap: crate::kernels::sub::softcap_half::pipeline_for(ctx, prod)?,
-            sample_rowstats: simple("k_sample_rowstats")?,
-            sample_commit: simple("k_sample_commit")?,
-            sample_apply: simple("k_sample_apply")?,
-            sample_write: simple("k_sample_write")?,
+            sample_rowstats: crate::kernels::sub::sample_rowstats::pipeline_for(ctx, prod)?,
+            sample_commit: crate::kernels::sub::sample_commit::pipeline_for(ctx, prod)?,
+            sample_apply: crate::kernels::sub::sample_apply::pipeline_for(ctx, prod)?,
+            sample_write: crate::kernels::sub::sample_write::pipeline_for(ctx, prod)?,
         })
     }
 
@@ -1521,11 +1521,17 @@ impl StepEnc<'_> {
     }
 
     fn encode_step_sampler(&mut self, _layout: &ModelLayout) -> Result<(), Error> {
+        let cols = VOCAB as u32;
+        let canvas = CANVAS as u32;
+        let pad = crate::sample::PAD_TOKEN_ID;
+        let filler = crate::sample::FILLER_TOKEN_ID;
+
         self.sink_set_pipeline(&self.ps.sample_rowstats);
         self.bind_logits(0);
         self.sink_set_buffer(&self.bufs.arena, A_RS_SAMP as usize, 1);
         self.bind_state(2);
         self.bind_params(3);
+        self.sink_set_bytes(&cols, 4);
         let grid = MTLSize {
             width: CANVAS,
             height: 1,
@@ -1541,6 +1547,9 @@ impl StepEnc<'_> {
         self.sink_set_pipeline(&self.ps.sample_commit);
         self.bind_state(0);
         self.bind_params(1);
+        self.sink_set_bytes(&canvas, 2);
+        self.sink_set_bytes(&pad, 3);
+        self.sink_set_bytes(&filler, 4);
         let tg = MTLSize {
             width: 256,
             height: 1,
@@ -1558,6 +1567,7 @@ impl StepEnc<'_> {
         self.sink_set_buffer(&self.bufs.arena, A_RS_SAMP as usize, 1);
         self.bind_state(2);
         self.bind_params(3);
+        self.sink_set_bytes(&cols, 4);
         let grid = MTLSize {
             width: CANVAS,
             height: 1,
@@ -1572,6 +1582,8 @@ impl StepEnc<'_> {
 
         self.sink_set_pipeline(&self.ps.sample_write);
         self.bind_state(0);
+        self.sink_set_bytes(&canvas, 1);
+        self.sink_set_bytes(&cols, 2);
         let grid = MTLSize {
             width: 1,
             height: 1,

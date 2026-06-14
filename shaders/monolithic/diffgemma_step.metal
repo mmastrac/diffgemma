@@ -121,13 +121,6 @@ inline void atomic_add_f32(device atomic_uint* bits, float val) {
         }
     }
 }
-inline ulong lcg_next(ulong s) { return s * 6966169279ul + 1039523323ul; }
-inline float lcg_f32(ulong s)  { return float(uint(s >> 32)) * (1.0f/4294967296.0f); }
-// CPU: cur_step counts max..1; t = t_min + (t_max-t_min)*(cur/n)   (audit item 7)
-inline float temp_at(uint steps_done, constant StepParams& P) {
-    float cur = float(P.max_steps - steps_done);
-    return P.t_min + (P.t_max - P.t_min) * (cur / float(P.max_steps));
-}
 
 // gemm_q4 -> shaders/kernels/gemm_q4.metal
 // gemm_nvfp4 -> shaders/kernels/gemm_nvfp4.metal
@@ -539,162 +532,10 @@ kernel void k_moe_grouped_nvfp4(device const half* moe_in [[buffer(0)]],
 
 // sc_softembed -> shaders/kernels/sc_softembed.metal
 
-// ======================= sampler =======================
-// pass 1: tempered row stats -> A_RS_SAMP; entropy (nats); argmax + changed flag.
-kernel void k_sample_rowstats(device const half* logits [[buffer(0)]],
-                              device float* rowstat [[buffer(1)]],    // A_RS_SAMP
-                              device CanvasState* S [[buffer(2)]],
-                              constant StepParams& P [[buffer(3)]],
-                              uint row [[threadgroup_position_in_grid]],
-                              uint lid [[thread_position_in_threadgroup]],
-                              uint tpg [[threads_per_threadgroup]]) {
-    float t = temp_at(S->step, P);                  // steps completed so far (audit item 7)
-    device const half* lr = logits + (ulong)row * VOCAB;
-    threadgroup float r_mx[8]; threadgroup float r_sum[8]; threadgroup float r_ent[8];
-    threadgroup uint r_am[8]; threadgroup float r_amv[8];
-    float mx = -INFINITY; uint am = 0; float amv = -INFINITY;
-    for (uint v = lid; v < VOCAB; v += tpg) {
-        float x = float(lr[v]) / t;
-        if (x > amv) { amv = x; am = v; }           // first hit -> lower idx on exact tie
-        mx = max(mx, x);
-    }
-    mx = simd_max(mx);
-    for (uint o = 16; o > 0; o >>= 1) {
-        float ov = simd_shuffle_down(amv, o); uint oi = simd_shuffle_down(am, o);
-        if (ov > amv || (ov == amv && oi < am)) { amv = ov; am = oi; }
-    }
-    uint sg = lid/32, nsg = (tpg+31)/32;
-    if ((lid&31)==0) { r_mx[sg]=mx; r_am[sg]=am; r_amv[sg]=amv; }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid == 0) {
-        for (uint i = 1; i < nsg; ++i) {
-            r_mx[0] = max(r_mx[0], r_mx[i]);
-            if (r_amv[i] > r_amv[0] || (r_amv[i] == r_amv[0] && r_am[i] < r_am[0]))
-                { r_amv[0] = r_amv[i]; r_am[0] = r_am[i]; }
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    mx = r_mx[0];
-    float sum = 0.f, ent = 0.f;
-    for (uint v = lid; v < VOCAB; v += tpg) {
-        float x = float(lr[v]) / t;
-        float e = exp(x - mx);
-        sum += e; ent += e * (x - mx);
-    }
-    sum = simd_sum(sum); ent = simd_sum(ent);
-    if ((lid&31)==0) { r_sum[sg]=sum; r_ent[sg]=ent; }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid == 0) {
-        float ts = 0.f, te = 0.f;
-        for (uint i = 0; i < nsg; ++i) { ts += r_sum[i]; te += r_ent[i]; }
-        S->entropy[row] = log(ts) - te/ts;          // H in nats
-        rowstat[row*2] = mx; rowstat[row*2+1] = ts;
-        uint prev = S->prev_argmax[row];
-        S->prev_argmax[row] = r_am[0];
-        if (prev != r_am[0])
-            atomic_store_explicit((device atomic_uint*)&S->argmax_changed, 1u,
-                                  memory_order_relaxed);
-    }
-}
-
-// pass 2 (1 threadgroup): LCG draws (position order), entropy sort,
-// CPU-exact accept rule (audit item 8), stability + early stop, step++.
-kernel void k_sample_commit(device CanvasState* S [[buffer(0)]],
-                            constant StepParams& P [[buffer(1)]],
-                            uint lid [[thread_position_in_threadgroup]]) {
-    threadgroup float ent[CANVAS];
-    if (lid < CANVAS) { ent[lid] = S->entropy[lid]; S->sorted_idx[lid] = lid; S->accept[lid] = 0; }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid == 0) {
-        ulong st = S->rng_state;
-        for (uint i = 0; i < CANVAS; ++i) { st = lcg_next(st); S->u_cat[i] = lcg_f32(st); }
-        S->rng_state = st;
-        for (uint i = 1; i < CANVAS; ++i) {         // insertion sort, ascending entropy
-            uint id = S->sorted_idx[i]; float e = ent[id]; int j = int(i) - 1;
-            while (j >= 0 && ent[S->sorted_idx[j]] > e) { S->sorted_idx[j+1] = S->sorted_idx[j]; --j; }
-            S->sorted_idx[j+1] = id;
-        }
-        // HF/MLX: on the final denoise step (cur_step==1) record stats but do not accept.
-        bool final_step = (S->step + 1 >= P.max_steps);
-        float prefix = 0.f;
-        if (!final_step) {
-            for (uint i = 0; i < CANVAS; ++i) {
-                uint id = S->sorted_idx[i];
-                if (prefix <= P.entropy_bound) { S->accept[id] = 1; prefix += ent[id]; }
-                else break;
-            }
-        }
-        float mean = 0.f;
-        for (uint i = 0; i < CANVAS; ++i) mean += ent[i];
-        S->mean_entropy = mean / float(CANVAS);
-        uint changed = atomic_load_explicit((device atomic_uint*)&S->argmax_changed,
-                                            memory_order_relaxed);
-        S->argmax_stable = changed ? 0u : (S->argmax_stable + 1u);
-        atomic_store_explicit((device atomic_uint*)&S->argmax_changed, 0u, memory_order_relaxed);
-        S->step += 1;
-        bool degenerate = true;
-        uint real_count = 0u;
-        for (uint i = 0; i < CANVAS; ++i) {
-            uint t = S->prev_argmax[i];
-            if (t != 0u && t != 262143u) { degenerate = false; real_count++; }
-        }
-        bool confident_stable = S->mean_entropy < P.conf_threshold
-            && S->argmax_stable >= P.stability_threshold;
-        bool allowed = !degenerate
-            && (S->step >= P.min_early_stop_steps || real_count >= 8u);
-        if (confident_stable && allowed)
-            S->stop_flag = 1;
-        if (S->step >= P.max_steps) S->stop_flag = 1;
-    }
-}
-
-// pass 3: categorical inverse-CDF per row (tempered; tpg MUST be 256: per = VOCAB/256 = 1024)
-kernel void k_sample_apply(device const half* logits [[buffer(0)]],
-                           device const float* rowstat [[buffer(1)]],   // A_RS_SAMP
-                           device CanvasState* S [[buffer(2)]],
-                           constant StepParams& P [[buffer(3)]],
-                           uint row [[threadgroup_position_in_grid]],
-                           uint lid [[thread_position_in_threadgroup]],
-                           uint tpg [[threads_per_threadgroup]]) {
-    float t = temp_at(S->step - 1, P);              // commit already incremented step
-    float mx = rowstat[row*2], Z = rowstat[row*2+1];
-    float target = S->u_cat[row] * Z;
-    device const half* lr = logits + (ulong)row * VOCAB;
-    threadgroup float chunk[256];
-    uint per = VOCAB / tpg;
-    float local = 0.f;
-    for (uint v = lid*per; v < (lid+1)*per; ++v) local += exp(float(lr[v])/t - mx);
-    chunk[lid] = local;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid == 0) {
-        float cum = 0.f; uint pick = VOCAB - 1;
-        for (uint c = 0; c < tpg; ++c) {
-            if (cum + chunk[c] >= target) {
-                for (uint v = c*per; v < (c+1)*per; ++v) {
-                    cum += exp(float(lr[v])/t - mx);
-                    if (cum >= target) { pick = v; break; }
-                }
-                break;
-            }
-            cum += chunk[c];
-        }
-        S->new_sample[row] = pick;
-    }
-}
-
-// pass 4 (1 thread): accepted -> new sample; rejected -> fresh uniform id.
-// Renoise iterates positions 0..255 in order — matches renoise_canvas (audit item 11).
-kernel void k_sample_write(device CanvasState* S [[buffer(0)]],
-                           uint lid [[thread_position_in_threadgroup]]) {
-    if (lid == 0) {
-        ulong st = S->rng_state;
-        for (uint i = 0; i < CANVAS; ++i) {
-            if (S->accept[i]) S->ids[i] = S->new_sample[i];
-            else { st = lcg_next(st); S->ids[i] = uint(st >> 32) % VOCAB; }
-        }
-        S->rng_state = st;
-    }
-}
+// sample_rowstats -> shaders/kernels/sample_rowstats.metal
+// sample_commit -> shaders/kernels/sample_commit.metal
+// sample_apply -> shaders/kernels/sample_apply.metal
+// sample_write -> shaders/kernels/sample_write.metal
 
 // ======================= DISPATCH SCHEDULE (encode once, ICB-replay) =======================
 // NOTE-KV: kvcache layout here is NEW ([pos][K|V][kvh][dim] per layer-region, half).
@@ -729,6 +570,6 @@ kernel void k_sample_write(device CanvasState* S [[buffer(0)]],
 // finish:
 //  11. k_rmsnorm(A_HIDDEN, final_norm) -> A_TMP
 //      k_gemm_q8 lm_head (N=262144, K=2816, weights=embed) -> logits ; k_softcap
-//  12. k_sample_rowstats(tpg 256) ; k_sample_commit(tpg 256) ;
-//      k_sample_apply(grid 256, tpg 256) ; k_sample_write(1)
+//  12. sample_rowstats(tpg 256) ; sample_commit(tpg 256) ;
+//      sample_apply(grid 256, tpg 256) ; sample_write(1)
 // CPU: poll S->stop_flag every step (or every N); on stop read S->ids -> incremental prefill.
