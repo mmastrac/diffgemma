@@ -164,6 +164,18 @@ pub static MANIFEST: Manifest = Manifest {
             variants: KernelVariants::Elementwise,
         },
         KernelSpec {
+            name: "qk_rope_kv",
+            entry: "qk_rope_kv",
+            quant_formats: &[QuantFormat::Q4Affine],
+            variants: KernelVariants::Elementwise,
+        },
+        KernelSpec {
+            name: "attention",
+            entry: "attention",
+            quant_formats: &[QuantFormat::Q4Affine],
+            variants: KernelVariants::Elementwise,
+        },
+        KernelSpec {
             name: "gemm_q4",
             entry: "gemm_q4",
             quant_formats: &[QuantFormat::Q4Affine],

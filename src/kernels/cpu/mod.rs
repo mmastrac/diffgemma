@@ -5,6 +5,7 @@ use crate::fast_slice::{bf16_to_f32_into, FastBf16Slice};
 use crate::tensor::Bf16Slice;
 
 pub mod activations;
+pub mod attention;
 pub mod dequant;
 pub mod sampler;
 

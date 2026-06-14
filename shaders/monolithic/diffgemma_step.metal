@@ -127,111 +127,8 @@ inline void atomic_add_f32(device atomic_uint* bits, float val) {
 // gemm_q8 -> shaders/kernels/gemm_q8.metal
 // gemm_q8_rowk -> shaders/kernels/gemm_q8_rowk.metal
 
-// ============ k_qk_rope_kv: per-head QK-norm + split-half RoPE + KV write ============
-// GRID: x = CANVAS tokens, y = NQ_HEADS + 2*n_kv_heads head slots (32 sliding / 20 full).
-// On full layers (L->v_proj == 0) the V slot reads from the K GEMM output (V1, audit item 6) —
-// driver does NOT alias buffers; selection happens here.
-// RoPE (audit items 4,5): split-half pairs (d, d+rot/2); inv_freq = theta^(-2d/head_dim)
-// — denominator is the FULL head_dim (512 on full layers), rotation spans rot dims only.
-kernel void k_qk_rope_kv(device half* q [[buffer(0)]],
-                         device half* k [[buffer(1)]],
-                         device half* v [[buffer(2)]],
-                         device half* kvcache [[buffer(3)]],
-                         device const uchar* blob [[buffer(4)]],
-                         device const LayerOffsets* L [[buffer(5)]],
-                         constant StepParams& P [[buffer(6)]],
-                         uint2 gid [[thread_position_in_grid]]) {
-    const uint hd = L->head_dim, nkv = L->n_kv_heads;
-    const uint tok = gid.x, h = gid.y;
-    const uint pos = P.kv_len + tok;
-    const bool full = L->is_full != 0;
-    const uint rot = full ? hd / 4 : hd;            // partial_rotary_factor 0.25
-    const float theta = full ? 1.0e6f : 1.0e4f;
-
-    bool isQ = h < NQ_HEADS;
-    bool isK = !isQ && h < NQ_HEADS + nkv;
-    uint hh = isQ ? h : (h - NQ_HEADS) % nkv;
-    device half* src = isQ ? (q + (ulong)tok*NQ_HEADS*hd + hh*hd)
-                     : isK ? (k + (ulong)tok*nkv*hd + hh*hd)
-                     : ((L->v_proj != 0 ? v : k) + (ulong)tok*nkv*hd + hh*hd);
-
-    // per-head RMSNorm: Q/K learned scale; V no-scale (V11/V1)
-    float ss = 0.f;
-    for (uint i = 0; i < hd; ++i) { float t = float(src[i]); ss += t*t; }
-    float inv = rsqrt(ss / float(hd) + RMS_EPS);
-    ulong noff = isQ ? L->q_norm : isK ? L->k_norm : 0ul;
-    // V path must not mutate the shared K buffer on full layers: compute into cache directly.
-    float tmp; // per-element rewrite below
-    if (isQ || isK) {
-        for (uint i = 0; i < hd; ++i) {
-            tmp = float(src[i]) * inv * bf16_bytes(blob + noff + 2ul*i);
-            src[i] = half(tmp);
-        }
-        const uint half_rot = rot / 2;
-        for (uint d = 0; d < half_rot; ++d) {
-            float inv_freq = pow(theta, -2.0f * float(d) / float(hd));   // audit item 5
-            float a = float(pos) * inv_freq, c = cos(a), s = sin(a);
-            float x0 = float(src[d]), x1 = float(src[d + half_rot]);
-            src[d]            = half(x0*c - x1*s);                       // audit item 4
-            src[d + half_rot] = half(x0*s + x1*c);
-        }
-        if (isK) {
-            device half* dst = kvcache + L->kv_region/2 + (ulong)pos*nkv*hd*2 + hh*hd;
-            for (uint i = 0; i < hd; ++i) dst[i] = src[i];
-        }
-    } else {
-        device half* dst = kvcache + L->kv_region/2 + (ulong)pos*nkv*hd*2 + (ulong)nkv*hd + hh*hd;
-        for (uint i = 0; i < hd; ++i) dst[i] = half(float(src[i]) * inv);
-    }
-}
-
-// ===================== k_attention (canvas queries; all_valid mask) =====================
-kernel void k_attention(device const half* q [[buffer(0)]],
-                        device const half* kvcache [[buffer(1)]],
-                        device half* out [[buffer(2)]],
-                        device const LayerOffsets* L [[buffer(3)]],
-                        constant StepParams& P [[buffer(4)]],
-                        uint3 tgid [[threadgroup_position_in_grid]],
-                        uint3 lid [[thread_position_in_threadgroup]],
-                        uint3 tpg [[threads_per_threadgroup]]) {       // tpg = 64
-    const uint hd = L->head_dim, nkv = L->n_kv_heads;
-    const uint tok = tgid.x, qh = tgid.y;
-    const uint ltid = lid.x, tpg_w = tpg.x;
-    const uint kvh = qh / (NQ_HEADS / nkv);
-    const uint T = P.kv_len + CANVAS;
-    device const half* qv = q + (ulong)tok*NQ_HEADS*hd + qh*hd;
-    device const half* base = kvcache + L->kv_region/2;
-    threadgroup float red[8];
-    float m = -INFINITY, l = 0.f;
-    float acc[8];                                  // hd<=512, tpg=64 -> per<=8
-    const uint per = (hd + tpg_w - 1) / tpg_w;
-    for (uint i = 0; i < per; ++i) acc[i] = 0.f;
-    for (uint t = 0; t < T; ++t) {
-        device const half* kk = base + (ulong)t*nkv*hd*2 + kvh*hd;
-        float d = 0.f;
-        for (uint i = ltid; i < hd; i += tpg_w) d += float(qv[i]) * float(kk[i]);
-        d = simd_sum(d);
-        uint sg = ltid/32, nsg = (tpg_w+31)/32;
-        if ((ltid&31)==0) red[sg] = d;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (ltid == 0) { float s = 0.f; for (uint i=0;i<nsg;++i) s += red[i]; red[0] = s; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        d = red[0];                                // raw dot product: no 1/sqrt(d)
-        float mn = max(m, d), corr = exp(m - mn), p = exp(d - mn);
-        l = l*corr + p; m = mn;
-        device const half* vv = base + (ulong)t*nkv*hd*2 + (ulong)nkv*hd + kvh*hd;
-        for (uint i = 0; i < per; ++i) {
-            uint idx = ltid + i*tpg_w;
-            if (idx < hd) acc[i] = acc[i]*corr + p*float(vv[idx]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    device half* ov = out + (ulong)tok*NQ_HEADS*hd + qh*hd;
-    for (uint i = 0; i < per; ++i) {
-        uint idx = ltid + i*tpg_w;
-        if (idx < hd) ov[idx] = half(acc[i] / l);
-    }
-}
+// qk_rope_kv -> shaders/kernels/qk_rope_kv.metal
+// attention -> shaders/kernels/attention.metal
 
 // ===================== k_router (V10; audit item 16: two-level reduction) =====================
 kernel void k_router(device const half* stream [[buffer(0)]],
@@ -554,7 +451,7 @@ kernel void k_moe_grouped_nvfp4(device const half* moe_in [[buffer(0)]],
 //   4. k_rmsnorm(input_ln) -> A_TMP
 //      k_gemm_q4 q (N=4096|8192) -> A_ATTNQ ; k (N=2048|1024) -> A_ATTNK
 //      [sliding only] k_gemm_q4 v -> A_ATTNV
-//   5. k_qk_rope_kv (grid.y = 16 + 2*nkv) ; k_attention (grid = 256 x 16, tpg 64)
+//   5. qk_rope_kv (grid.y = 16 + 2*nkv) ; attention (grid = 256 x 16, tpg 64)
 //      k_gemm_q4 o_proj (N=2816, K=4096|8192) -> A_TMP
 //   6. k_rmsnorm(A_TMP, post_attn) -> A_TMP ; k_residual(A_HIDDEN, A_TMP, 0) -> A_STREAM
 //   7. k_rmsnorm(A_STREAM, pre_ff) -> A_TMP

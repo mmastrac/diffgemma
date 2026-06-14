@@ -185,6 +185,30 @@ quant_formats = [0]
 [[kernel.variants]]
 
 [[kernel]]
+name = "qk_rope_kv"
+entry = "qk_rope_kv"
+quant_formats = [0]
+
+[kernel.fc]
+1 = "K_SHAPE_ASSERT"
+2 = "K_DUMP_STAGE"
+3 = "K_QUANT_FORMAT"
+
+[[kernel.variants]]
+
+[[kernel]]
+name = "attention"
+entry = "attention"
+quant_formats = [0]
+
+[kernel.fc]
+1 = "K_SHAPE_ASSERT"
+2 = "K_DUMP_STAGE"
+3 = "K_QUANT_FORMAT"
+
+[[kernel.variants]]
+
+[[kernel]]
 name = "gemm_nvfp4"
 entry = "gemm_nvfp4"
 quant_formats = [3]

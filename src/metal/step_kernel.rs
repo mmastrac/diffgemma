@@ -483,8 +483,8 @@ impl StepPipelines {
             gemm_nvfp4,
             gemm_q8,
             gemm_q8_rowk,
-            qk_rope_kv: simple("k_qk_rope_kv")?,
-            attention: simple("k_attention")?,
+            qk_rope_kv: crate::kernels::sub::qk_rope_kv::pipeline_for(ctx, prod)?,
+            attention: crate::kernels::sub::attention::pipeline_for(ctx, prod)?,
             residual: crate::kernels::sub::residual_half::pipeline_for(ctx, prod)?,
             residual_f32b: crate::kernels::sub::residual_f32b::pipeline_for(ctx, prod)?,
             glu: crate::kernels::sub::swiglu::pipeline_for(
@@ -1163,6 +1163,11 @@ impl StepEnc<'_> {
             self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 5);
             self.bind_params(6);
         }
+        let attn_dims = crate::kernels::sub::qk_rope_kv::AttnDims {
+            canvas: CANVAS as u32,
+            n_q_heads: STEP_NQ_HEADS as u32,
+        };
+        self.sink_set_bytes(&attn_dims, 7);
         let grid = MTLSize {
             width: CANVAS,
             height: qk_y,
@@ -1183,6 +1188,11 @@ impl StepEnc<'_> {
             self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 3);
             self.bind_params(4);
         }
+        let attn_dims = crate::kernels::sub::qk_rope_kv::AttnDims {
+            canvas: CANVAS as u32,
+            n_q_heads: STEP_NQ_HEADS as u32,
+        };
+        self.sink_set_bytes(&attn_dims, 5);
         let grid = MTLSize {
             width: CANVAS,
             height: 16,
@@ -1404,6 +1414,11 @@ impl StepEnc<'_> {
             self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 5);
             self.bind_params(6);
         }
+        let attn_dims = crate::kernels::sub::qk_rope_kv::AttnDims {
+            canvas: CANVAS as u32,
+            n_q_heads: STEP_NQ_HEADS as u32,
+        };
+        self.sink_set_bytes(&attn_dims, 7);
         let grid = MTLSize {
             width: CANVAS,
             height: qk_y,
@@ -1424,6 +1439,11 @@ impl StepEnc<'_> {
             self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 3);
             self.bind_params(4);
         }
+        let attn_dims = crate::kernels::sub::qk_rope_kv::AttnDims {
+            canvas: CANVAS as u32,
+            n_q_heads: STEP_NQ_HEADS as u32,
+        };
+        self.sink_set_bytes(&attn_dims, 5);
         let grid = MTLSize {
             width: CANVAS,
             height: 16,
