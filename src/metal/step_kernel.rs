@@ -499,8 +499,11 @@ impl StepPipelines {
             q4_linear_grouped: ctx.compile_kernel(QGEMM_SHADER, "f32_q4_linear_grouped")?,
             nvfp4_linear: ctx.compile_kernel(QGEMM_SHADER, "f32_nvfp4_linear")?,
             gelu_swiglu_gate_up: crate::kernels::sub::swiglu::pipeline_for_moe(ctx, prod)?,
-            moe_grouped: simple("k_moe_grouped")?,
-            moe_grouped_nvfp4: simple("k_moe_grouped_nvfp4")?,
+            moe_grouped: crate::kernels::sub::moe_grouped::pipeline_for(ctx, prod)?,
+            moe_grouped_nvfp4: crate::kernels::sub::moe_grouped_nvfp4::pipeline_for(
+                ctx,
+                prod,
+            )?,
             moe_grouped_act_probe: simple("k_moe_grouped_act_probe")?,
             embed_gather: crate::kernels::sub::embed_gather::pipeline_for(ctx, prod)?,
             logit_rowstats: crate::kernels::sub::logit_rowstats::pipeline_for(ctx, prod)?,
@@ -1307,6 +1310,13 @@ impl StepEnc<'_> {
             self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 3);
             self.bind_route(4);
         }
+        let grouped_dims = crate::kernels::sub::moe_grouped::GroupedDims {
+            canvas: CANVAS as u32,
+            hidden: HID as u32,
+            moe_ff: MOE_FF,
+            n_experts: N_EXPERTS as u32,
+        };
+        self.sink_set_bytes(&grouped_dims, 5);
         let grid = MTLSize {
             width: CANVAS,
             height: N_EXPERTS,

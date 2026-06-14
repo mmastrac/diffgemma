@@ -194,6 +194,18 @@ pub static MANIFEST: Manifest = Manifest {
             variants: KernelVariants::Elementwise,
         },
         KernelSpec {
+            name: "moe_grouped",
+            entry: "moe_grouped",
+            quant_formats: &[QuantFormat::Q4Affine],
+            variants: KernelVariants::Elementwise,
+        },
+        KernelSpec {
+            name: "moe_grouped_nvfp4",
+            entry: "moe_grouped_nvfp4",
+            quant_formats: &[QuantFormat::NvFp4],
+            variants: KernelVariants::Elementwise,
+        },
+        KernelSpec {
             name: "gemm_q4",
             entry: "gemm_q4",
             quant_formats: &[QuantFormat::Q4Affine],

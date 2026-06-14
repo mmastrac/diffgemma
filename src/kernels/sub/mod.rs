@@ -21,6 +21,8 @@ pub mod logit_rowstats;
 pub mod qk_rope_kv;
 pub mod moe_bucket_count;
 pub mod moe_bucket_fill;
+pub mod moe_grouped;
+pub mod moe_grouped_nvfp4;
 pub mod moe_router;
 pub mod memzero_bytes;
 pub mod residual_f32b;
