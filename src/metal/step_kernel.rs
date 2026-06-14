@@ -492,9 +492,9 @@ impl StepPipelines {
                 crate::kernels::sub::SwigluSplitVariant::MONOLITH_GLU,
                 prod,
             )?,
-            router: simple("k_router")?,
-            bucket_count: simple("k_bucket_count")?,
-            bucket_fill: simple("k_bucket_fill")?,
+            router: crate::kernels::sub::moe_router::pipeline_for(ctx, prod)?,
+            bucket_count: crate::kernels::sub::moe_bucket_count::pipeline_for(ctx, prod)?,
+            bucket_fill: crate::kernels::sub::moe_bucket_fill::pipeline_for(ctx, prod)?,
             q4_linear: ctx.compile_kernel(QGEMM_SHADER, "f32_q4_linear")?,
             q4_linear_grouped: ctx.compile_kernel(QGEMM_SHADER, "f32_q4_linear_grouped")?,
             nvfp4_linear: ctx.compile_kernel(QGEMM_SHADER, "f32_nvfp4_linear")?,
@@ -1241,6 +1241,13 @@ impl StepEnc<'_> {
         layout: &ModelLayout,
     ) -> Result<(), Error> {
         let layer_off = layer_byte_offset(layer);
+        let router_dims = crate::kernels::sub::moe_router::RouterDims {
+            canvas: CANVAS as u32,
+            hidden: HID as u32,
+            n_experts: N_EXPERTS as u32,
+            top_k: TOP_K as u32,
+            router_hscale: (HID as f32).powf(-0.5),
+        };
         self.sink_set_pipeline(&self.ps.router);
         unsafe {
             self.sink_set_buffer(&self.bufs.arena, A_STREAM as usize, 0);
@@ -1248,6 +1255,7 @@ impl StepEnc<'_> {
             self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 2);
             self.bind_route(3);
         }
+        self.sink_set_bytes(&router_dims, 4);
         let grid = MTLSize {
             width: CANVAS,
             height: 1,
@@ -1262,12 +1270,15 @@ impl StepEnc<'_> {
 
         self.sink_set_pipeline(&self.ps.bucket_count);
         self.bind_route(0);
+        let n_experts = N_EXPERTS as u32;
+        self.sink_set_bytes(&n_experts, 1);
         self.dispatch_1d(&self.ps.bucket_count, 128, 128);
 
         for phase in 0u32..3 {
             self.sink_set_pipeline(&self.ps.bucket_fill);
             self.bind_route(0);
-            self.sink_set_bytes( &phase, 1);
+            self.sink_set_bytes(&phase, 1);
+            self.sink_set_bytes(&router_dims, 2);
             let count = if phase == 1 { 1 } else { CANVAS * TOP_K };
             self.dispatch_1d(&self.ps.bucket_fill, count, 256);
         }

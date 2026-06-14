@@ -209,6 +209,42 @@ quant_formats = [0]
 [[kernel.variants]]
 
 [[kernel]]
+name = "moe_router"
+entry = "moe_router"
+quant_formats = [0]
+
+[kernel.fc]
+1 = "K_SHAPE_ASSERT"
+2 = "K_DUMP_STAGE"
+3 = "K_QUANT_FORMAT"
+
+[[kernel.variants]]
+
+[[kernel]]
+name = "moe_bucket_count"
+entry = "moe_bucket_count"
+quant_formats = [0]
+
+[kernel.fc]
+1 = "K_SHAPE_ASSERT"
+2 = "K_DUMP_STAGE"
+3 = "K_QUANT_FORMAT"
+
+[[kernel.variants]]
+
+[[kernel]]
+name = "moe_bucket_fill"
+entry = "moe_bucket_fill"
+quant_formats = [0]
+
+[kernel.fc]
+1 = "K_SHAPE_ASSERT"
+2 = "K_DUMP_STAGE"
+3 = "K_QUANT_FORMAT"
+
+[[kernel.variants]]
+
+[[kernel]]
 name = "gemm_nvfp4"
 entry = "gemm_nvfp4"
 quant_formats = [3]

@@ -73,7 +73,8 @@ pub use step_kernel::{
     DenoiseStepStats, trace_entropy_enabled, LayerAttnCapture, LayerMoeCapture,
     PreambleCapture, SingleExpertMoeCapture,
     StepBenchResult, StepFinishMode, StepForwardOutput, StepProbeResult, StepQ4MpsParityResult,
-    StepSmokeConfig, StepSmokeResult, CANVAS, CanvasState, LayerOffsets, StepParams,
+    StepSmokeConfig, StepSmokeResult, CANVAS, CanvasState, LayerOffsets, RouteScratch, StepParams,
+    N_EXPERTS, TOP_K,
 };
 pub use step_preamble_dump::{
     hidden_cosine as preamble_hidden_cosine, run_step_preamble_dump, write_step_preamble_dump,

@@ -176,6 +176,24 @@ pub static MANIFEST: Manifest = Manifest {
             variants: KernelVariants::Elementwise,
         },
         KernelSpec {
+            name: "moe_router",
+            entry: "moe_router",
+            quant_formats: &[QuantFormat::Q4Affine],
+            variants: KernelVariants::Elementwise,
+        },
+        KernelSpec {
+            name: "moe_bucket_count",
+            entry: "moe_bucket_count",
+            quant_formats: &[QuantFormat::Q4Affine],
+            variants: KernelVariants::Elementwise,
+        },
+        KernelSpec {
+            name: "moe_bucket_fill",
+            entry: "moe_bucket_fill",
+            quant_formats: &[QuantFormat::Q4Affine],
+            variants: KernelVariants::Elementwise,
+        },
+        KernelSpec {
             name: "gemm_q4",
             entry: "gemm_q4",
             quant_formats: &[QuantFormat::Q4Affine],

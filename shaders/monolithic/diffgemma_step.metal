@@ -130,85 +130,9 @@ inline void atomic_add_f32(device atomic_uint* bits, float val) {
 // qk_rope_kv -> shaders/kernels/qk_rope_kv.metal
 // attention -> shaders/kernels/attention.metal
 
-// ===================== k_router (V10; audit item 16: two-level reduction) =====================
-kernel void k_router(device const half* stream [[buffer(0)]],
-                     device const uchar* blob [[buffer(1)]],
-                     device const LayerOffsets* L [[buffer(2)]],
-                     device RouteScratch* R [[buffer(3)]],
-                     uint tok [[threadgroup_position_in_grid]],
-                     uint e [[thread_position_in_threadgroup]]) {     // tpg = 128
-    threadgroup float logits[N_EXPERTS];
-    threadgroup float red[4];
-    device const half* x = stream + (ulong)tok * HID;
-    float ss = 0.f;
-    for (uint i = e; i < HID; i += N_EXPERTS) { float t = float(x[i]); ss += t*t; }
-    ss = simd_sum(ss);
-    if ((e & 31) == 0) red[e/32] = ss;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (e == 0) red[0] = rsqrt((red[0]+red[1]+red[2]+red[3]) / float(HID) + RMS_EPS);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float norm_inv = red[0];
-    device const uchar* rs = blob + L->router_scale;
-    device const uchar* wr = blob + L->router_proj + (ulong)e * HID * 2ul;
-    float acc = 0.f;
-    for (uint d = 0; d < HID; ++d) {
-        float xn = float(x[d]) * norm_inv * bf16_bytes(rs + 2ul*d) * ROUTER_HSCALE;
-        acc += xn * bf16_bytes(wr + 2ul*d);
-    }
-    logits[e] = acc;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (e == 0) {
-        float mx = logits[0];
-        for (uint i = 1; i < N_EXPERTS; ++i) mx = max(mx, logits[i]);
-        float sum = 0.f;
-        for (uint i = 0; i < N_EXPERTS; ++i) { logits[i] = exp(logits[i]-mx); sum += logits[i]; }
-        float wsum = 0.f; uint pick[TOP_K];
-        for (uint kk = 0; kk < TOP_K; ++kk) {
-            float best = -1.f; uint bi = 0;
-            for (uint i = 0; i < N_EXPERTS; ++i) {
-                bool taken = false;
-                for (uint p = 0; p < kk; ++p) taken = taken || (pick[p] == i);
-                if (!taken && logits[i] > best) { best = logits[i]; bi = i; }  // tie: lower idx
-            }
-            pick[kk] = bi; wsum += logits[bi];
-        }
-        device const uchar* pes = blob + L->per_expert_scale;
-        for (uint kk = 0; kk < TOP_K; ++kk) {
-            R->expert[tok][kk] = pick[kk];
-            R->weight[tok][kk] = half((logits[pick[kk]] / wsum) * bf16_bytes(pes + 2ul*pick[kk]));
-        }
-    }
-}
-
-// ===================== bucketing (3 phases) =====================
-kernel void k_bucket_count(device RouteScratch* R [[buffer(0)]],
-                           uint i [[thread_position_in_grid]]) {
-    if (i < N_EXPERTS) R->count[i] = 0;
-}
-kernel void k_bucket_fill(device RouteScratch* R [[buffer(0)]],
-                          constant uint& phase [[buffer(1)]],
-                          uint i [[thread_position_in_grid]]) {
-    if (phase == 0) {
-        uint tok = i / TOP_K, kk = i % TOP_K;
-        atomic_fetch_add_explicit((device atomic_uint*)&R->count[R->expert[tok][kk]],
-                                  1u, memory_order_relaxed);
-    } else if (phase == 1) {
-        if (i == 0) {
-            uint s = 0;
-            for (uint e = 0; e < N_EXPERTS; ++e) {
-                R->offset[e] = s;
-                s += R->count[e];
-                R->count[e] = 0;
-            }
-            R->num_slots = s;
-        }
-    } else {
-        uint tok = i / TOP_K, kk = i % TOP_K, e = R->expert[tok][kk];
-        uint slot = R->offset[e] + atomic_fetch_add_explicit((device atomic_uint*)&R->count[e],
-                                                             1u, memory_order_relaxed);
-        R->token_list[slot] = tok; R->slot_list[slot] = kk;
-    }
-}
+// moe_router -> shaders/kernels/moe_router.metal
+// moe_bucket_count -> shaders/kernels/moe_bucket_count.metal
+// moe_bucket_fill -> shaders/kernels/moe_bucket_fill.metal
 
 // ===================== k_moe_grouped =====================
 // grid.x = token-in-group, grid.y = expert. moe_out (f32) zeroed by k_memzero first.
@@ -457,8 +381,8 @@ kernel void k_moe_grouped_nvfp4(device const half* moe_in [[buffer(0)]],
 //   7. k_rmsnorm(A_STREAM, pre_ff) -> A_TMP
 //      k_gemm_q4 mlp_gate -> A_FFG ; mlp_up -> A_FFU ; k_glu -> A_FFG
 //      k_gemm_q4 mlp_down -> A_DENSE ; k_rmsnorm(A_DENSE, post_ff_1) -> A_DENSE
-//   8. k_router (grid = 256, tpg 128)
-//      k_bucket_count(128) ; k_bucket_fill phase0(2048) ; phase1(1) ; phase2(2048)
+//   8. moe_router (grid = 256, tpg 128)
+//      moe_bucket_count(128) ; moe_bucket_fill phase0(2048) ; phase1(1) ; phase2(2048)
 //   9. k_rmsnorm(A_STREAM, pre_ff_2) -> A_MOEIN ; k_memzero(A_MOEOUT)
 //      k_moe_grouped (grid = maxM x 128, tpg 128)
 //      [A_MOEOUT f32] -> k_rmsnorm_f32(post_ff_2) -> A_MOEIN
