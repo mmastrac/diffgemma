@@ -498,8 +498,8 @@ impl StepPipelines {
             moe_grouped_nvfp4: simple("k_moe_grouped_nvfp4")?,
             moe_grouped_act_probe: simple("k_moe_grouped_act_probe")?,
             embed_gather: simple("k_embed_gather")?,
-            logit_rowstats: simple("k_logit_rowstats")?,
-            sc_probs: simple("k_sc_probs")?,
+            logit_rowstats: crate::kernels::sub::logit_rowstats::pipeline_for(ctx, prod)?,
+            sc_probs: crate::kernels::sub::sc_probs::pipeline_for(ctx, prod)?,
             sc_softembed: simple("k_sc_softembed")?,
             half_scale: crate::kernels::sub::half_scale::pipeline_for(ctx, prod)?,
             softcap: crate::kernels::sub::softcap_half::pipeline_for(ctx, prod)?,
@@ -1062,16 +1062,9 @@ impl StepEnc<'_> {
         self.sink_set_pipeline(&self.ps.logit_rowstats);
         self.bind_logits(0);
         self.sink_set_buffer(&self.bufs.arena, A_RS_SC as usize, 1);
-        let grid = MTLSize {
-            width: CANVAS,
-            height: 1,
-            depth: 1,
-        };
-        let tg = MTLSize {
-            width: 256,
-            height: 1,
-            depth: 1,
-        };
+        let dims = [CANVAS as u32, VOCAB as u32];
+        self.sink_set_bytes(&dims, 2);
+        let (grid, tg) = crate::kernels::sub::logit_rowstats::dispatch_shape(CANVAS);
         self.sink_dispatch(grid, tg);
     }
 
@@ -1089,16 +1082,9 @@ impl StepEnc<'_> {
             self.bind_logits(0);
             self.sink_set_buffer(&self.bufs.arena, A_RS_SC as usize, 1);
             self.bind_sc_probs(2);
-            let grid = MTLSize {
-                width: CANVAS,
-                height: 1,
-                depth: 1,
-            };
-            let tg = MTLSize {
-                width: 256,
-                height: 1,
-                depth: 1,
-            };
+            let dims = [CANVAS as u32, VOCAB as u32];
+            self.sink_set_bytes(&dims, 3);
+            let (grid, tg) = crate::kernels::sub::sc_probs::dispatch_shape(CANVAS);
             self.sink_dispatch(grid, tg);
 
             self.gemm_q8_probs(A_SOFT, layout.embed, CANVAS as u32, HID as u32, VOCAB as u32)?;

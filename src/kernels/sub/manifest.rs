@@ -116,6 +116,18 @@ pub static MANIFEST: Manifest = Manifest {
             variants: KernelVariants::Gelu,
         },
         KernelSpec {
+            name: "logit_rowstats",
+            entry: "logit_rowstats",
+            quant_formats: &[QuantFormat::Q4Affine],
+            variants: KernelVariants::Elementwise,
+        },
+        KernelSpec {
+            name: "sc_probs",
+            entry: "sc_probs",
+            quant_formats: &[QuantFormat::Q4Affine],
+            variants: KernelVariants::Elementwise,
+        },
+        KernelSpec {
             name: "gemm_q4",
             entry: "gemm_q4",
             quant_formats: &[QuantFormat::Q4Affine],

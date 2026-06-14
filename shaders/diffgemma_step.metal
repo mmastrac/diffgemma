@@ -626,48 +626,8 @@ kernel void k_embed_gather(device const uchar* blob [[buffer(0)]],
     out[(ulong)tok*HID + d] = half(q8_at(row, d, bf16_bytes(row)) * EMBED_SCALE);
 }
 
-// ============ k_logit_rowstats (audit item: was missing) ============
-// max + sumexp over STORED logits (post-softcap, t=1) -> A_RS_SC, for self-conditioning.
-kernel void k_logit_rowstats(device const half* logits [[buffer(0)]],
-                             device float* rowstat [[buffer(1)]],     // [256][2]
-                             uint row [[threadgroup_position_in_grid]],
-                             uint lid [[thread_position_in_threadgroup]],
-                             uint tpg [[threads_per_threadgroup]]) {
-    threadgroup float r_mx[8]; threadgroup float r_sum[8];
-    device const half* lr = logits + (ulong)row * VOCAB;
-    float mx = -INFINITY;
-    for (uint v = lid; v < VOCAB; v += tpg) mx = max(mx, float(lr[v]));
-    mx = simd_max(mx);
-    uint sg = lid/32, nsg = (tpg+31)/32;
-    if ((lid&31)==0) r_mx[sg] = mx;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid == 0) { for (uint i=1;i<nsg;++i) r_mx[0] = max(r_mx[0], r_mx[i]); }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    mx = r_mx[0];
-    float sum = 0.f;
-    for (uint v = lid; v < VOCAB; v += tpg) sum += exp(float(lr[v]) - mx);
-    sum = simd_sum(sum);
-    if ((lid&31)==0) r_sum[sg] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid == 0) {
-        float s = 0.f; for (uint i=0;i<nsg;++i) s += r_sum[i];
-        rowstat[row*2] = mx; rowstat[row*2+1] = s;
-    }
-}
-
-// ============ k_sc_probs: materialize softmax rows for SC GEMM fast path (M3.2) ============
-kernel void k_sc_probs(device const half* logits [[buffer(0)]],
-                       device const float* rowstat [[buffer(1)]],
-                       device half* probs [[buffer(2)]],
-                       uint row [[threadgroup_position_in_grid]],
-                       uint lid [[thread_position_in_threadgroup]],
-                       uint tpg [[threads_per_threadgroup]]) {
-    float mx = rowstat[row*2], sum = rowstat[row*2+1];
-    device const half* lr = logits + (ulong)row * VOCAB;
-    for (uint v = lid; v < VOCAB; v += tpg) {
-        probs[(ulong)row * VOCAB + v] = half(exp(float(lr[v]) - mx) / sum);
-    }
-}
+// logit_rowstats -> shaders/kernels/logit_rowstats.metal
+// sc_probs -> shaders/kernels/sc_probs.metal
 
 // ============ k_sc_softembed: soft[m,d] = (softmax(prev logits) @ embed)[m,d] * sqrt(H) ============
 // Uses A_RS_SC (t=1 stats). first_step -> zeros (SC MLP still runs; VERIFY-SC).
