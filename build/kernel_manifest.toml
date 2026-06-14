@@ -88,9 +88,20 @@ quant_formats = [0]
 [[kernel.variants]]
 
 [[kernel]]
+name = "gemm_nvfp4"
+entry = "gemm_nvfp4"
+quant_formats = [3]
+
+[kernel.fc]
+1 = "IS_FULL_LAYER"
+2 = "GEMM_N"
+3 = "GEMM_K"
+
+[[kernel.variants]]
+
+[[kernel]]
 name = "gemm_q4"
 entry = "gemm_q4"
-# GEMM uses gemm_common.metal FC 1–3 (IS_FULL_LAYER, GEMM_N, GEMM_K); format axis TBD at FC4.
 quant_formats = [0]
 
 [kernel.fc]

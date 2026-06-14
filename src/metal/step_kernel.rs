@@ -438,7 +438,7 @@ impl StepPipelines {
             );
             gemm_nvfp4.insert(
                 (n, k),
-                ctx.compile_gemm_kernel(library, "k_gemm_nvfp4", n, k)?,
+                crate::kernels::sub::gemm_nvfp4::pipeline_for(ctx, n, k)?,
             );
         }
         for &(n, k) in &[
