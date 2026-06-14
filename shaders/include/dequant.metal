@@ -1,9 +1,40 @@
-#ifndef DGQ_KERNEL_DEQUANT_NVFP4_METAL
-#define DGQ_KERNEL_DEQUANT_NVFP4_METAL
+#ifndef DGQ_INCLUDE_DEQUANT_METAL
+#define DGQ_INCLUDE_DEQUANT_METAL
 
 #include <metal_stdlib>
 using namespace metal;
 
+#ifndef DGQ_INCLUDE_COMMON_METAL
+#include "common.metal"
+#endif
+
+// ---- Q4 affine (32-wide groups) ----
+// q4_block: [scale:2][min:2][nibbles:16], w = scale*q + min
+inline void dequant_q4_group(device const uchar *g, thread float *out32) {
+    float s = bf16_bytes(g);
+    float mn = bf16_bytes(g + 2);
+    for (uint i = 0; i < 16; ++i) {
+        uchar b = g[4 + i];
+        out32[2 * i] = s * float(b & 0x0F) + mn;
+        out32[2 * i + 1] = s * float(b >> 4) + mn;
+    }
+}
+
+inline ulong q4_row_bytes(uint K) {
+    return ulong(K / 32) * 20ul;
+}
+
+// ---- Q8 per-row ----
+// q8_row: [scale bf16:2][i8 weights:K], w = scale * q
+inline ulong q8_row_bytes(uint K) {
+    return ulong(K) + 2ul;
+}
+
+inline float q8_at(device const uchar *row_base, uint col, float s) {
+    return float(*((device const char *)(row_base + 2 + col))) * s;
+}
+
+// ---- NVFP4 ----
 // nvfp4_block: [f32 global_scale:4] + per row [data:ceil(K/2)][scales:ceil(K/16)]
 
 inline float fp16_bits_to_f32(ushort bits) {
@@ -49,6 +80,10 @@ inline float e2m1_to_f32(uint q) {
 
 inline ulong nvfp4_row_bytes(uint K) {
     return ulong((K + 1u) / 2u + (K + 15u) / 16u);
+}
+
+inline ulong nvfp4_matrix_bytes(uint out_dim, uint K) {
+    return 4ul + ulong(out_dim) * nvfp4_row_bytes(K);
 }
 
 inline void dequant_nvfp4_group(device const uchar *row, uint K, uint g,

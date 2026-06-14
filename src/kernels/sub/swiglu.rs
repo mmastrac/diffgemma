@@ -13,13 +13,13 @@ pub const MOE_ENTRY: &str = "swiglu_moe_gate_up";
 
 const SHADER: &str = concat!(
     include_str!("../../../shaders/kernels/common.metal"),
-    include_str!("../../../shaders/kernels/activations.metal"),
+    include_str!("../../../shaders/include/activations.metal"),
     include_str!("../../../shaders/kernels/swiglu.metal"),
 );
 
 const MOE_SHADER: &str = concat!(
     include_str!("../../../shaders/kernels/common.metal"),
-    include_str!("../../../shaders/kernels/activations.metal"),
+    include_str!("../../../shaders/include/activations.metal"),
     include_str!("../../../shaders/kernels/swiglu_moe_gate_up.metal"),
 );
 

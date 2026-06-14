@@ -6,8 +6,8 @@ using namespace metal;
 #ifndef DGQ_KERNEL_GEMM_COMMON_METAL
 #include "gemm_common.metal"
 #endif
-#ifndef DGQ_KERNEL_DEQUANT_Q4_METAL
-#include "dequant_q4.metal"
+#ifndef DGQ_INCLUDE_DEQUANT_METAL
+#error "gemm_q4: bundle must include shaders/include/dequant.metal"
 #endif
 
 /// y[M,N] = x[M,K] @ Wq4[N,K]^T ; threadgroup (128,1,1).

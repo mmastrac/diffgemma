@@ -22,16 +22,18 @@ fn shader_bundle_token() -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
     for src in [
+        include_str!("../../shaders/include/common.metal"),
+        include_str!("../../shaders/include/dequant.metal"),
+        include_str!("../../shaders/include/activations.metal"),
         include_str!("../../shaders/gemm.metal"),
         include_str!("../../shaders/qgemm.metal"),
-        include_str!("../../shaders/kernels/activations.metal"),
-        include_str!("../../shaders/kernels/bf16.metal"),
         include_str!("../../shaders/kernels/common.metal"),
-        include_str!("../../shaders/kernels/dequant_nvfp4.metal"),
-        include_str!("../../shaders/kernels/dequant_q4.metal"),
         include_str!("../../shaders/kernels/gemm_common.metal"),
         include_str!("../../shaders/kernels/gemm_nvfp4.metal"),
         include_str!("../../shaders/kernels/gemm_q4.metal"),
+        include_str!("../../shaders/kernels/gemm_q8.metal"),
+        include_str!("../../shaders/kernels/gemm_q8_rowk.metal"),
+        include_str!("../../shaders/kernels/embed_gather.metal"),
         include_str!("../../shaders/kernels/gather_prob_cols.metal"),
         include_str!("../../shaders/kernels/gather_rows.metal"),
         include_str!("../../shaders/kernels/gelu.metal"),
@@ -39,6 +41,8 @@ fn shader_bundle_token() -> u64 {
         include_str!("../../shaders/kernels/swiglu_moe_gate_up.metal"),
         include_str!("../../shaders/kernels/half_scale.metal"),
         include_str!("../../shaders/kernels/half_to_f32.metal"),
+        include_str!("../../shaders/kernels/logit_rowstats.metal"),
+        include_str!("../../shaders/kernels/sc_probs.metal"),
         include_str!("../../shaders/kernels/memzero_bytes.metal"),
         include_str!("../../shaders/kernels/residual_f32b.metal"),
         include_str!("../../shaders/kernels/residual_half.metal"),
@@ -54,7 +58,7 @@ fn shader_bundle_token() -> u64 {
         include_str!("../../shaders/kernels/vec_scale_inplace.metal"),
         include_str!("../../shaders/attention.metal"),
         include_str!("../../shaders/sampler.metal"),
-        include_str!("../../shaders/diffgemma_step.metal"),
+        include_str!("../../shaders/monolithic/diffgemma_step.metal"),
     ] {
         src.hash(&mut h);
     }

@@ -6,8 +6,8 @@ using namespace metal;
 #ifndef DGQ_KERNEL_GEMM_COMMON_METAL
 #include "gemm_common.metal"
 #endif
-#ifndef DGQ_KERNEL_DEQUANT_Q8_METAL
-#include "dequant_q8.metal"
+#ifndef DGQ_INCLUDE_DEQUANT_METAL
+#error "gemm_q8_rowk: bundle must include shaders/include/dequant.metal"
 #endif
 
 /// y[M,N] = x[M,K] @ W[K,N]; weight rows indexed by K (vocab / SC softembed).

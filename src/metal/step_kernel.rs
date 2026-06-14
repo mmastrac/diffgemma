@@ -1,5 +1,5 @@
 //! Monolithic diffgemma denoise-step kernel (parallel smoke path).
-//! See `shaders/diffgemma_step.metal` and dispatch schedule at file bottom.
+//! See `shaders/monolithic/diffgemma_step.metal` and dispatch schedule at file bottom.
 
 use crate::config::{ModelConfig, TextConfig};
 use crate::dgq::DgqStore;
@@ -24,7 +24,12 @@ use std::mem::offset_of;
 use std::path::Path;
 use std::time::Instant;
 
-const STEP_SHADER: &str = include_str!("../../shaders/diffgemma_step.metal");
+const STEP_SHADER: &str = concat!(
+    include_str!("../../shaders/include/common.metal"),
+    include_str!("../../shaders/include/dequant.metal"),
+    include_str!("../../shaders/include/activations.metal"),
+    include_str!("../../shaders/monolithic/diffgemma_step.metal"),
+);
 const QGEMM_SHADER: &str = include_str!("../../shaders/qgemm.metal");
 
 pub const HID: usize = 2816;
@@ -3523,7 +3528,12 @@ mod tests {
         use objc2_metal::MTLSize;
         use std::path::Path;
 
-        const STEP_SHADER: &str = include_str!("../../shaders/diffgemma_step.metal");
+        const STEP_SHADER: &str = concat!(
+    include_str!("../../shaders/include/common.metal"),
+    include_str!("../../shaders/include/dequant.metal"),
+    include_str!("../../shaders/include/activations.metal"),
+    include_str!("../../shaders/monolithic/diffgemma_step.metal"),
+);
 
         let dir = Path::new("/tmp/quantized-weights");
         if !crate::dgq::store::looks_like_dgq_dir(dir) {

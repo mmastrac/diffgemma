@@ -15,7 +15,7 @@ pub const THREADS_PER_TG: usize = 256;
 
 const SHADER: &str = concat!(
     include_str!("../../../shaders/kernels/common.metal"),
-    include_str!("../../../shaders/kernels/bf16.metal"),
+    include_str!("../../../shaders/include/common.metal"),
     include_str!("../../../shaders/kernels/rms_norm_rows_tiled.metal"),
 );
 

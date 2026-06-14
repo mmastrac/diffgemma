@@ -1,13 +1,13 @@
 //! Kernel FC axis manifest — validity contract for pipeline specialization.
 //!
-//! `build/kernel_manifest.toml` is the human-readable spec; this module is the
+//! `build/manifest.toml` is the human-readable spec; this module is the
 //! enforcement layer. Invalid tuples cannot be compiled; tier-1 tests enumerate
 //! every valid variant row.
 
 use super::variant::{ElemDtype, FcBool, FcUInt, KernelVariant, QuantFormat};
 use crate::safetensors::Error;
 
-/// Parsed manifest (static mirror of `build/kernel_manifest.toml`).
+/// Parsed manifest (static mirror of `build/manifest.toml`).
 pub struct Manifest {
     pub kernels: &'static [KernelSpec],
 }
@@ -361,8 +361,8 @@ mod tests {
 
     #[test]
     fn toml_file_present() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("build/kernel_manifest.toml");
-        assert!(path.exists(), "build/kernel_manifest.toml missing");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("build/manifest.toml");
+        assert!(path.exists(), "build/manifest.toml missing");
         let text = std::fs::read_to_string(path).expect("read manifest");
         assert!(text.contains("K_QUANT_FORMAT"));
         assert!(text.contains("rms_norm_rows"));

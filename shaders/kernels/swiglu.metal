@@ -4,8 +4,8 @@ using namespace metal;
 #ifndef DGQ_KERNEL_COMMON_METAL
 #include "common.metal"
 #endif
-#ifndef DGQ_KERNEL_ACTIVATIONS_METAL
-#include "activations.metal"
+#ifndef DGQ_INCLUDE_ACTIVATIONS_METAL
+#error "swiglu: bundle must include shaders/include/activations.metal"
 #endif
 
 constant uint K_IO_DTYPE [[function_constant(4)]];

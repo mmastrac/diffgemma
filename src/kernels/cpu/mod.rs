@@ -4,6 +4,9 @@ use crate::buffer::Buffer;
 use crate::fast_slice::{bf16_to_f32_into, FastBf16Slice};
 use crate::tensor::Bf16Slice;
 
+pub mod activations;
+pub mod dequant;
+
 const GELU_TANH_COEF: f32 = 0.797_884_560_802_865_4; // sqrt(2/pi)
 
 /// RMSNorm without learnable scale (`router` gate input, `v_norm`).

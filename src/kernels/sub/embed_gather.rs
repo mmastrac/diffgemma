@@ -13,8 +13,8 @@ pub const ENTRY: &str = "embed_gather";
 
 const SHADER: &str = concat!(
     include_str!("../../../shaders/kernels/common.metal"),
-    include_str!("../../../shaders/kernels/bf16.metal"),
-    include_str!("../../../shaders/kernels/dequant_q8.metal"),
+    include_str!("../../../shaders/include/common.metal"),
+    include_str!("../../../shaders/include/dequant.metal"),
     include_str!("../../../shaders/kernels/embed_gather.metal"),
 );
 

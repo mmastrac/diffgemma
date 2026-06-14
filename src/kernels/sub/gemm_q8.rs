@@ -11,8 +11,8 @@ pub const ENTRY: &str = "gemm_q8";
 
 const SHADER: &str = concat!(
     include_str!("../../../shaders/kernels/gemm_common.metal"),
-    include_str!("../../../shaders/kernels/bf16.metal"),
-    include_str!("../../../shaders/kernels/dequant_q8.metal"),
+    include_str!("../../../shaders/include/common.metal"),
+    include_str!("../../../shaders/include/dequant.metal"),
     include_str!("../../../shaders/kernels/gemm_q8.metal"),
 );
 

@@ -6,7 +6,7 @@
 //   3  K_QUANT_FORMAT   uint   0=q4_affine 1=q8 2=mxfp4 3=nvfp4
 //
 // Per-kernel semantic axes (4+): declared in that kernel's .metal entry file only.
-// See build/kernel_manifest.toml for the full index map and valid tuples.
+// See build/manifest.toml for the full index map and valid tuples.
 
 #ifndef DGQ_KERNEL_COMMON_METAL
 #define DGQ_KERNEL_COMMON_METAL

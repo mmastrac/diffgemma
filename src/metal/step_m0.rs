@@ -83,17 +83,9 @@ fn check(id: &'static str, pass: bool, detail: impl Into<String>) -> M0Check {
     }
 }
 
-/// CPU mirror of `dequant_q4_group` in `diffgemma_step.metal` (VERIFY-N).
+/// CPU mirror of `dequant_q4_group` in `include/dequant.metal` (VERIFY-N).
 pub(crate) fn dequant_q4_group_cpu(g: &[u8; 20]) -> [f32; 32] {
-    let s = bf16_to_f32(u16::from_le_bytes([g[0], g[1]]));
-    let mn = bf16_to_f32(u16::from_le_bytes([g[2], g[3]]));
-    let mut out = [0.0f32; 32];
-    for i in 0..16 {
-        let b = g[4 + i];
-        out[2 * i] = s * (b & 0x0f) as f32 + mn;
-        out[2 * i + 1] = s * (b >> 4) as f32 + mn;
-    }
-    out
+    crate::kernels::cpu::dequant::dequant_q4_group(g)
 }
 
 /// K-order decode via col-indexed path (mirrors `q4_weight_at` in qgemm.metal).

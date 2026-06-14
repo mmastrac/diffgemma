@@ -4,8 +4,8 @@ using namespace metal;
 #ifndef DGQ_KERNEL_COMMON_METAL
 #include "common.metal"
 #endif
-#ifndef DGQ_KERNEL_ACTIVATIONS_METAL
-#include "activations.metal"
+#ifndef DGQ_INCLUDE_ACTIVATIONS_METAL
+#error "swiglu_moe_gate_up: bundle must include shaders/include/activations.metal"
 #endif
 
 /// MoE gate_up `[batch, 2*moe_inter]` → gelu(gate)*up. Layout is fixed by .dgq manifest.

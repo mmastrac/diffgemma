@@ -11,7 +11,7 @@ pub const ENTRY: &str = "residual_half";
 
 const SHADER: &str = concat!(
     include_str!("../../../shaders/kernels/common.metal"),
-    include_str!("../../../shaders/kernels/bf16.metal"),
+    include_str!("../../../shaders/include/common.metal"),
     include_str!("../../../shaders/kernels/residual_half.metal"),
 );
 

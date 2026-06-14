@@ -4,11 +4,11 @@ using namespace metal;
 #ifndef DGQ_KERNEL_COMMON_METAL
 #include "common.metal"
 #endif
-#ifndef DGQ_KERNEL_BF16_METAL
-#include "bf16.metal"
+#ifndef DGQ_INCLUDE_COMMON_METAL
+#error "embed_gather: bundle must include shaders/include/common.metal"
 #endif
-#ifndef DGQ_KERNEL_DEQUANT_Q8_METAL
-#include "dequant_q8.metal"
+#ifndef DGQ_INCLUDE_DEQUANT_METAL
+#error "embed_gather: bundle must include shaders/include/dequant.metal"
 #endif
 
 /// Gather Q8 embed rows by token id: out[tok,d] = dequant(embed[id], d) * embed_scale.
