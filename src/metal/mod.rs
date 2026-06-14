@@ -38,6 +38,7 @@ mod step_attn_dump;
 mod step_moe_dump;
 mod step_moe_single_dump;
 mod step_kernel;
+mod step_icb;
 mod self_conditioning;
 mod telemetry;
 mod weights;

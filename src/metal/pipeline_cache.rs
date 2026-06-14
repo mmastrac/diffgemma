@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-const CACHE_BUNDLE_TAG: &str = "diffgemma-mps-v1";
+const CACHE_BUNDLE_TAG: &str = "diffgemma-mps-v2-icb";
 
 fn shader_bundle_token() -> u64 {
     use std::collections::hash_map::DefaultHasher;
@@ -165,6 +165,7 @@ impl PipelineArchiveCache {
         let desc = MTLComputePipelineDescriptor::new();
         desc.setComputeFunction(Some(function));
         desc.setLabel(Some(&NSString::from_str(label)));
+        desc.setSupportIndirectCommandBuffers(true);
         let archives = NSArray::from_slice(&[&*self.archive]);
         desc.setBinaryArchives(Some(&archives));
 

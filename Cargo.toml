@@ -28,6 +28,8 @@ objc2-metal = { version = "0.3", optional = true, default-features = false, feat
     "MTLComputeCommandEncoder",
     "MTLComputePipeline",
     "MTLBinaryArchive",
+    "MTLIndirectCommandBuffer",
+    "MTLIndirectCommandEncoder",
     "MTLAllocation",
     "MTLLibrary",
     "MTLBuffer",

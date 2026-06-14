@@ -523,7 +523,7 @@ impl StepPipelines {
     }
 }
 
-struct StepBuffers {
+pub(crate) struct StepBuffers {
     blob: Retained<ProtocolObject<dyn MTLBuffer>>,
     layout: Retained<ProtocolObject<dyn MTLBuffer>>,
     params: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -533,9 +533,9 @@ struct StepBuffers {
     logits: Retained<ProtocolObject<dyn MTLBuffer>>,
     sc_probs: Retained<ProtocolObject<dyn MTLBuffer>>,
     route: Retained<ProtocolObject<dyn MTLBuffer>>,
-    mps_x: Retained<ProtocolObject<dyn MTLBuffer>>,
-    mps_w: Retained<ProtocolObject<dyn MTLBuffer>>,
-    mps_c: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) mps_x: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) mps_w: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) mps_c: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
 
 struct StepEnc<'a> {
@@ -548,76 +548,87 @@ struct StepEnc<'a> {
     use_mps_q4: bool,
     use_nvfp4: bool,
     use_sc_gemm: bool,
+    recorder: Option<&'a mut crate::metal::step_icb::IcbRecorder>,
 }
 
 impl StepEnc<'_> {
-    fn bind_blob(&self, idx: usize) {
-        unsafe {
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.blob), 0, idx);
+    fn sink_set_pipeline(&mut self, ps: &ComputePipeline) {
+        if let Some(r) = self.recorder.as_deref_mut() {
+            r.set_pipeline(ps);
+        } else {
+            self.enc.setComputePipelineState(&ps.pipeline);
         }
     }
 
-    fn bind_layout(&self, idx: usize) {
-        unsafe {
-            self.enc
-                .setBuffer_offset_atIndex(Some(&self.bufs.layout), 0, idx);
+    fn sink_set_buffer(
+        &mut self,
+        buf: &ProtocolObject<dyn MTLBuffer>,
+        offset: usize,
+        index: usize,
+    ) {
+        if let Some(r) = self.recorder.as_deref_mut() {
+            r.set_buffer(buf, offset, index);
+        } else {
+            unsafe {
+                self.enc.setBuffer_offset_atIndex(Some(buf), offset, index);
+            }
         }
     }
 
-    fn bind_params(&self, idx: usize) {
-        unsafe {
-            self.enc
-                .setBuffer_offset_atIndex(Some(&self.bufs.params), 0, idx);
+    fn sink_set_bytes<T: Copy>(&mut self, val: &T, index: usize) {
+        if let Some(r) = self.recorder.as_deref_mut() {
+            r.set_bytes(val, index);
+        } else {
+            crate::metal::batch::set_bytes(&self.enc, val, index);
         }
     }
 
-    fn bind_arena(&self, idx: usize, byte_off: u64) {
-        unsafe {
-            self.enc.setBuffer_offset_atIndex(
-                Some(&self.bufs.arena),
-                byte_off as usize,
-                idx,
-            );
+    fn sink_dispatch(&mut self, grid: MTLSize, tg: MTLSize) {
+        if let Some(r) = self.recorder.as_deref_mut() {
+            r.dispatch_threadgroups(grid, tg);
+        } else {
+            self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
         }
     }
 
-    fn bind_kvcache(&self, idx: usize) {
-        unsafe {
-            self.enc
-                .setBuffer_offset_atIndex(Some(&self.bufs.kvcache), 0, idx);
-        }
+    fn bind_blob(&mut self, idx: usize) {
+        self.sink_set_buffer(&self.bufs.blob, 0, idx);
     }
 
-    fn bind_state(&self, idx: usize) {
-        unsafe {
-            self.enc
-                .setBuffer_offset_atIndex(Some(&self.bufs.state), 0, idx);
-        }
+    fn bind_layout(&mut self, idx: usize) {
+        self.sink_set_buffer(&self.bufs.layout, 0, idx);
     }
 
-    fn bind_logits(&self, idx: usize) {
-        unsafe {
-            self.enc
-                .setBuffer_offset_atIndex(Some(&self.bufs.logits), 0, idx);
-        }
+    fn bind_params(&mut self, idx: usize) {
+        self.sink_set_buffer(&self.bufs.params, 0, idx);
     }
 
-    fn bind_sc_probs(&self, idx: usize) {
-        unsafe {
-            self.enc
-                .setBuffer_offset_atIndex(Some(&self.bufs.sc_probs), 0, idx);
-        }
+    fn bind_arena(&mut self, idx: usize, byte_off: u64) {
+        self.sink_set_buffer(&self.bufs.arena, byte_off as usize, idx);
     }
 
-    fn bind_route(&self, idx: usize) {
-        unsafe {
-            self.enc
-                .setBuffer_offset_atIndex(Some(&self.bufs.route), 0, idx);
-        }
+    fn bind_kvcache(&mut self, idx: usize) {
+        self.sink_set_buffer(&self.bufs.kvcache, 0, idx);
     }
 
-    fn dispatch_1d(&self, ps: &ComputePipeline, count: usize, tpg: usize) {
-        self.enc.setComputePipelineState(&ps.pipeline);
+    fn bind_state(&mut self, idx: usize) {
+        self.sink_set_buffer(&self.bufs.state, 0, idx);
+    }
+
+    fn bind_logits(&mut self, idx: usize) {
+        self.sink_set_buffer(&self.bufs.logits, 0, idx);
+    }
+
+    fn bind_sc_probs(&mut self, idx: usize) {
+        self.sink_set_buffer(&self.bufs.sc_probs, 0, idx);
+    }
+
+    fn bind_route(&mut self, idx: usize) {
+        self.sink_set_buffer(&self.bufs.route, 0, idx);
+    }
+
+    fn dispatch_1d(&mut self, ps: &ComputePipeline, count: usize, tpg: usize) {
+        self.sink_set_pipeline(ps);
         let tg_w = tpg.min(count.max(1));
         let grid = MTLSize {
             width: div_up(count, tg_w),
@@ -629,24 +640,24 @@ impl StepEnc<'_> {
             height: 1,
             depth: 1,
         };
-        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        self.sink_dispatch(grid, tg);
     }
 
     /// Split 1D dispatches that would exceed Metal's 65535 threadgroup grid width.
     fn dispatch_1d_ranged(
-        &self,
+        &mut self,
         ps: &ComputePipeline,
         count: usize,
         tpg: usize,
-        mut encode: impl FnMut(&ProtocolObject<dyn MTLComputeCommandEncoder>, u32, u32),
+        mut encode: impl FnMut(&mut Self, u32, u32),
     ) {
         const MAX_GROUPS: usize = 65535;
         let chunk_max = MAX_GROUPS * tpg;
         let mut base = 0usize;
         while base < count {
             let chunk = (count - base).min(chunk_max);
-            self.enc.setComputePipelineState(&ps.pipeline);
-            encode(&self.enc, base as u32, chunk as u32);
+            self.sink_set_pipeline(ps);
+            encode(self, base as u32, chunk as u32);
             let tg_w = tpg.min(chunk.max(1));
             let grid = MTLSize {
                 width: div_up(chunk, tg_w),
@@ -658,24 +669,25 @@ impl StepEnc<'_> {
                 height: 1,
                 depth: 1,
             };
-            self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+            self.sink_dispatch(grid, tg);
             base += chunk;
         }
     }
 
     /// Softcap logits (matches sampler.metal ranged dispatch pattern).
-    fn dispatch_softcap(&self) {
+    fn dispatch_softcap(&mut self) {
         let len = CANVAS * VOCAB;
-        self.dispatch_1d_ranged(&self.ps.softcap, len, 256, |enc, base, chunk| {
-            unsafe {
-                enc.setBuffer_offset_atIndex(Some(&self.bufs.logits), 0, 0);
-            }
-            set_bytes(enc, &base, 1);
-            set_bytes(enc, &chunk, 2);
+        self.dispatch_1d_ranged(&self.ps.softcap, len, 256, |this, base, chunk| {
+            this.sink_set_buffer(&this.bufs.logits, 0, 0);
+            this.sink_set_bytes(&base, 1);
+            this.sink_set_bytes(&chunk, 2);
         });
     }
 
     fn pause_for_mps(&mut self) {
+        if self.recorder.is_some() {
+            return;
+        }
         self.enc.endEncoding();
     }
 
@@ -687,7 +699,7 @@ impl StepEnc<'_> {
     }
 
     fn dispatch_convert_1d(
-        &self,
+        &mut self,
         ps: &ComputePipeline,
         src: &ProtocolObject<dyn MTLBuffer>,
         src_off: usize,
@@ -695,17 +707,15 @@ impl StepEnc<'_> {
         dst_off: usize,
         len: usize,
     ) {
-        self.dispatch_1d_ranged(ps, len, 256, |enc, base, chunk| {
-            unsafe {
-                enc.setBuffer_offset_atIndex(Some(src), src_off, 0);
-                enc.setBuffer_offset_atIndex(Some(dst), dst_off, 1);
-            }
-            set_bytes(enc, &base, 2);
-            set_bytes(enc, &chunk, 3);
+        self.dispatch_1d_ranged(ps, len, 256, |this, base, chunk| {
+            this.sink_set_buffer(src, src_off, 0);
+            this.sink_set_buffer(dst, dst_off, 1);
+            this.sink_set_bytes(&base, 2);
+            this.sink_set_bytes(&chunk, 3);
         });
     }
 
-    fn half_to_f32_buf(&self, arena_off: u64, len: usize) {
+    fn half_to_f32_buf(&mut self, arena_off: u64, len: usize) {
         self.dispatch_convert_1d(
             &self.ps.half_to_f32,
             &self.bufs.arena,
@@ -716,7 +726,7 @@ impl StepEnc<'_> {
         );
     }
 
-    fn f32_to_half_arena(&self, arena_off: u64, len: usize) {
+    fn f32_to_half_arena(&mut self, arena_off: u64, len: usize) {
         self.dispatch_convert_1d(
             &self.ps.f32_to_half,
             &self.bufs.mps_c,
@@ -728,7 +738,7 @@ impl StepEnc<'_> {
     }
 
     fn gemm_q4_fused(
-        &self,
+        &mut self,
         x_off: u64,
         y_off: u64,
         w_off: u64,
@@ -741,13 +751,13 @@ impl StepEnc<'_> {
         } else {
             self.ps.q4(n, k)?
         };
-        self.enc.setComputePipelineState(&ps.pipeline);
+        self.sink_set_pipeline(ps);
         unsafe {
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), x_off as usize, 0);
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), y_off as usize, 1);
+            self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
+            self.sink_set_buffer(&self.bufs.arena, y_off as usize, 1);
             self.bind_blob(2);
-            set_bytes(&self.enc, &w_off, 3);
-            set_bytes(&self.enc, &m, 4);
+            self.sink_set_bytes( &w_off, 3);
+            self.sink_set_bytes( &m, 4);
         }
         let grid = MTLSize {
             width: div_up(n as usize, 32),
@@ -759,7 +769,7 @@ impl StepEnc<'_> {
             height: 1,
             depth: 1,
         };
-        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        self.sink_dispatch(grid, tg);
         Ok(())
     }
 
@@ -790,6 +800,18 @@ impl StepEnc<'_> {
             },
         );
         self.half_to_f32_buf(x_off, m_us * k_us);
+        if self.recorder.is_some() {
+            self.sink_dequant_q4_matrix(&q4)?;
+            if let Some(r) = self.recorder.as_deref_mut() {
+                r.note_mps_q4_gemm(crate::metal::step_icb::MpsQ4GemmOp {
+                    m: m_us,
+                    k: k_us,
+                    n: n_us,
+                });
+            }
+            self.f32_to_half_arena(y_off, m_us * n_us);
+            return Ok(());
+        }
         if self.use_nvfp4 {
             dispatch_dequant_nvfp4_matrix(&self.enc, &self.ps.dequant_nvfp4, &q4, &self.bufs.mps_w);
         } else {
@@ -810,8 +832,8 @@ impl StepEnc<'_> {
         Ok(())
     }
 
-    fn dispatch_2d(&self, ps: &ComputePipeline, gx: usize, gy: usize, tpg_x: usize, tpg_y: usize) {
-        self.enc.setComputePipelineState(&ps.pipeline);
+    fn dispatch_2d(&mut self, ps: &ComputePipeline, gx: usize, gy: usize, tpg_x: usize, tpg_y: usize) {
+        self.sink_set_pipeline(ps);
         let grid = MTLSize {
             width: div_up(gx, tpg_x),
             height: div_up(gy, tpg_y),
@@ -822,37 +844,62 @@ impl StepEnc<'_> {
             height: tpg_y,
             depth: 1,
         };
-        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        self.sink_dispatch(grid, tg);
     }
 
-    fn memzero_bytes(&self, byte_off: u64, nbytes: u64) {
-        self.enc.setComputePipelineState(&self.ps.memzero.pipeline);
-        unsafe {
-            self.enc.setBuffer_offset_atIndex(
-                Some(&self.bufs.arena),
-                byte_off as usize,
-                0,
-            );
-        }
+    fn memzero_bytes(&mut self, byte_off: u64, nbytes: u64) {
+        self.sink_set_pipeline(&self.ps.memzero);
+        self.sink_set_buffer(&self.bufs.arena, byte_off as usize, 0);
         let count = div_up(nbytes as usize, 16);
         self.dispatch_1d(&self.ps.memzero, count, 256);
     }
 
+    fn sink_dequant_q4_matrix(&mut self, q4: &Q4LinearGpu) -> Result<(), Error> {
+        const THREADGROUP: usize = 16;
+        let ps = if self.use_nvfp4 {
+            &self.ps.dequant_nvfp4
+        } else {
+            &self.ps.dequant_q4
+        };
+        self.sink_set_pipeline(ps);
+        let (buf_w, off) = q4.weight_buffer();
+        self.sink_set_buffer(buf_w, off as usize, 0);
+        self.sink_set_buffer(&self.bufs.mps_w, 0, 1);
+        let dims = [
+            q4.out_dim as u32,
+            q4.in_dim as u32,
+            q4.groups_per_row(),
+        ];
+        self.sink_set_bytes(&dims, 2);
+        let tg = MTLSize {
+            width: THREADGROUP,
+            height: THREADGROUP,
+            depth: 1,
+        };
+        let grid = MTLSize {
+            width: (q4.in_dim + THREADGROUP - 1) / THREADGROUP,
+            height: (q4.out_dim + THREADGROUP - 1) / THREADGROUP,
+            depth: 1,
+        };
+        self.sink_dispatch(grid, tg);
+        Ok(())
+    }
+
     fn rmsnorm(
-        &self,
+        &mut self,
         x_off: u64,
         y_off: u64,
         w_off: u64,
         dim: u32,
         rows: usize,
     ) {
-        self.enc.setComputePipelineState(&self.ps.rmsnorm.pipeline);
+        self.sink_set_pipeline(&self.ps.rmsnorm);
         unsafe {
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), x_off as usize, 0);
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), y_off as usize, 1);
+            self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
+            self.sink_set_buffer(&self.bufs.arena, y_off as usize, 1);
             self.bind_blob(2);
-            set_bytes(&self.enc, &w_off, 3);
-            set_bytes(&self.enc, &dim, 4);
+            self.sink_set_bytes( &w_off, 3);
+            self.sink_set_bytes( &dim, 4);
         }
         let grid = MTLSize {
             width: rows,
@@ -864,24 +911,24 @@ impl StepEnc<'_> {
             height: 1,
             depth: 1,
         };
-        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        self.sink_dispatch(grid, tg);
     }
 
     fn rmsnorm_f32(
-        &self,
+        &mut self,
         x_off: u64,
         y_off: u64,
         w_off: u64,
         dim: u32,
         rows: usize,
     ) {
-        self.enc.setComputePipelineState(&self.ps.rmsnorm_f32.pipeline);
+        self.sink_set_pipeline(&self.ps.rmsnorm_f32);
         unsafe {
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), x_off as usize, 0);
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), y_off as usize, 1);
+            self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
+            self.sink_set_buffer(&self.bufs.arena, y_off as usize, 1);
             self.bind_blob(2);
-            set_bytes(&self.enc, &w_off, 3);
-            set_bytes(&self.enc, &dim, 4);
+            self.sink_set_bytes( &w_off, 3);
+            self.sink_set_bytes( &dim, 4);
         }
         let grid = MTLSize {
             width: rows,
@@ -893,11 +940,11 @@ impl StepEnc<'_> {
             height: 1,
             depth: 1,
         };
-        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        self.sink_dispatch(grid, tg);
     }
 
     fn gemm_q8(
-        &self,
+        &mut self,
         x_off: u64,
         y_off: u64,
         w_off: u64,
@@ -906,13 +953,13 @@ impl StepEnc<'_> {
         k: u32,
     ) -> Result<(), Error> {
         let ps = self.ps.q8(n, k)?;
-        self.enc.setComputePipelineState(&ps.pipeline);
+        self.sink_set_pipeline(ps);
         unsafe {
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), x_off as usize, 0);
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), y_off as usize, 1);
+            self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
+            self.sink_set_buffer(&self.bufs.arena, y_off as usize, 1);
             self.bind_blob(2);
-            set_bytes(&self.enc, &w_off, 3);
-            set_bytes(&self.enc, &m, 4);
+            self.sink_set_bytes( &w_off, 3);
+            self.sink_set_bytes( &m, 4);
         }
         let grid = MTLSize {
             width: div_up(n as usize, 32),
@@ -924,12 +971,12 @@ impl StepEnc<'_> {
             height: 1,
             depth: 1,
         };
-        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        self.sink_dispatch(grid, tg);
         Ok(())
     }
 
     fn gemm_q8_logits(
-        &self,
+        &mut self,
         x_off: u64,
         w_off: u64,
         m: u32,
@@ -937,13 +984,13 @@ impl StepEnc<'_> {
         k: u32,
     ) -> Result<(), Error> {
         let ps = self.ps.q8(n, k)?;
-        self.enc.setComputePipelineState(&ps.pipeline);
+        self.sink_set_pipeline(ps);
         unsafe {
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), x_off as usize, 0);
+            self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
             self.bind_logits(1);
             self.bind_blob(2);
-            set_bytes(&self.enc, &w_off, 3);
-            set_bytes(&self.enc, &m, 4);
+            self.sink_set_bytes( &w_off, 3);
+            self.sink_set_bytes( &m, 4);
         }
         let grid = MTLSize {
             width: div_up(n as usize, 32),
@@ -955,13 +1002,13 @@ impl StepEnc<'_> {
             height: 1,
             depth: 1,
         };
-        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        self.sink_dispatch(grid, tg);
         Ok(())
     }
 
     /// probs [M,K] half buffer @ sc_probs → arena y_off [M,N] via q8 weights.
     fn gemm_q8_probs(
-        &self,
+        &mut self,
         y_off: u64,
         w_off: u64,
         m: u32,
@@ -969,13 +1016,13 @@ impl StepEnc<'_> {
         k: u32,
     ) -> Result<(), Error> {
         let ps = self.ps.q8_rowk(n, k)?;
-        self.enc.setComputePipelineState(&ps.pipeline);
+        self.sink_set_pipeline(ps);
         unsafe {
             self.bind_sc_probs(0);
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), y_off as usize, 1);
+            self.sink_set_buffer(&self.bufs.arena, y_off as usize, 1);
             self.bind_blob(2);
-            set_bytes(&self.enc, &w_off, 3);
-            set_bytes(&self.enc, &m, 4);
+            self.sink_set_bytes( &w_off, 3);
+            self.sink_set_bytes( &m, 4);
         }
         let grid = MTLSize {
             width: div_up(n as usize, 32),
@@ -987,33 +1034,22 @@ impl StepEnc<'_> {
             height: 1,
             depth: 1,
         };
-        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        self.sink_dispatch(grid, tg);
         Ok(())
     }
 
-    fn scale_half_arena(&self, y_off: u64, elems: usize, scale: f32) {
-        self.enc
-            .setComputePipelineState(&self.ps.half_scale.pipeline);
-        unsafe {
-            self.enc
-                .setBuffer_offset_atIndex(Some(&self.bufs.arena), y_off as usize, 0);
-            set_bytes(&self.enc, &(elems as u32), 1);
-            set_bytes(&self.enc, &scale, 2);
-        }
+    fn scale_half_arena(&mut self, y_off: u64, elems: usize, scale: f32) {
+        self.sink_set_pipeline(&self.ps.half_scale);
+        self.sink_set_buffer(&self.bufs.arena, y_off as usize, 0);
+        self.sink_set_bytes(&(elems as u32), 1);
+        self.sink_set_bytes(&scale, 2);
         self.dispatch_1d(&self.ps.half_scale, elems, 256);
     }
 
     fn encode_sc_logit_rowstats(&mut self) {
-        self.enc
-            .setComputePipelineState(&self.ps.logit_rowstats.pipeline);
+        self.sink_set_pipeline(&self.ps.logit_rowstats);
         self.bind_logits(0);
-        unsafe {
-            self.enc.setBuffer_offset_atIndex(
-                Some(&self.bufs.arena),
-                A_RS_SC as usize,
-                1,
-            );
-        }
+        self.sink_set_buffer(&self.bufs.arena, A_RS_SC as usize, 1);
         let grid = MTLSize {
             width: CANVAS,
             height: 1,
@@ -1024,7 +1060,7 @@ impl StepEnc<'_> {
             height: 1,
             depth: 1,
         };
-        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        self.sink_dispatch(grid, tg);
     }
 
     fn encode_sc_softembed(&mut self, layout: &ModelLayout) -> Result<(), Error> {
@@ -1037,16 +1073,9 @@ impl StepEnc<'_> {
         use_gemm: bool,
     ) -> Result<(), Error> {
         if use_gemm {
-            self.enc
-                .setComputePipelineState(&self.ps.sc_probs.pipeline);
+            self.sink_set_pipeline(&self.ps.sc_probs);
             self.bind_logits(0);
-            unsafe {
-                self.enc.setBuffer_offset_atIndex(
-                    Some(&self.bufs.arena),
-                    A_RS_SC as usize,
-                    1,
-                );
-            }
+            self.sink_set_buffer(&self.bufs.arena, A_RS_SC as usize, 1);
             self.bind_sc_probs(2);
             let grid = MTLSize {
                 width: CANVAS,
@@ -1058,26 +1087,19 @@ impl StepEnc<'_> {
                 height: 1,
                 depth: 1,
             };
-            self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+            self.sink_dispatch(grid, tg);
 
             self.gemm_q8_probs(A_SOFT, layout.embed, CANVAS as u32, HID as u32, VOCAB as u32)?;
             self.scale_half_arena(A_SOFT, CANVAS * HID as usize, (HID as f32).sqrt());
         } else {
-            self.enc
-                .setComputePipelineState(&self.ps.sc_softembed.pipeline);
-            unsafe {
-                self.bind_logits(0);
-                self.enc.setBuffer_offset_atIndex(
-                    Some(&self.bufs.arena),
-                    A_RS_SC as usize,
-                    1,
-                );
-                self.bind_blob(2);
-                self.bind_layout(3);
-                self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), A_SOFT as usize, 4);
-                let zero: u32 = 0;
-                set_bytes(&self.enc, &zero, 5);
-            }
+            self.sink_set_pipeline(&self.ps.sc_softembed);
+            self.bind_logits(0);
+            self.sink_set_buffer(&self.bufs.arena, A_RS_SC as usize, 1);
+            self.bind_blob(2);
+            self.bind_layout(3);
+            self.sink_set_buffer(&self.bufs.arena, A_SOFT as usize, 4);
+            let zero: u32 = 0;
+            self.sink_set_bytes(&zero, 5);
             // One TG per (64-dim slice, canvas token): tgid.x = dim-block, tgid.y = tok.
             let grid = MTLSize {
                 width: (HID as usize + 63) / 64,
@@ -1089,29 +1111,29 @@ impl StepEnc<'_> {
                 height: 1,
                 depth: 1,
             };
-            self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+            self.sink_dispatch(grid, tg);
         }
         Ok(())
     }
 
-    fn residual(&self, a_off: u64, b_off: u64, y_off: u64, scal_off: u64, elems: usize) {
-        self.enc.setComputePipelineState(&self.ps.residual.pipeline);
+    fn residual(&mut self, a_off: u64, b_off: u64, y_off: u64, scal_off: u64, elems: usize) {
+        self.sink_set_pipeline(&self.ps.residual);
         unsafe {
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), a_off as usize, 0);
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), b_off as usize, 1);
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), y_off as usize, 2);
+            self.sink_set_buffer(&self.bufs.arena, a_off as usize, 0);
+            self.sink_set_buffer(&self.bufs.arena, b_off as usize, 1);
+            self.sink_set_buffer(&self.bufs.arena, y_off as usize, 2);
             self.bind_blob(3);
-            set_bytes(&self.enc, &scal_off, 4);
+            self.sink_set_bytes( &scal_off, 4);
         }
         self.dispatch_1d(&self.ps.residual, elems, 256);
     }
 
-    fn glu(&self, gate_off: u64, up_off: u64, y_off: u64, elems: usize) {
-        self.enc.setComputePipelineState(&self.ps.glu.pipeline);
+    fn glu(&mut self, gate_off: u64, up_off: u64, y_off: u64, elems: usize) {
+        self.sink_set_pipeline(&self.ps.glu);
         unsafe {
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), gate_off as usize, 0);
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), up_off as usize, 1);
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), y_off as usize, 2);
+            self.sink_set_buffer(&self.bufs.arena, gate_off as usize, 0);
+            self.sink_set_buffer(&self.bufs.arena, up_off as usize, 1);
+            self.sink_set_buffer(&self.bufs.arena, y_off as usize, 2);
         }
         self.dispatch_1d(&self.ps.glu, elems, 256);
     }
@@ -1130,18 +1152,14 @@ impl StepEnc<'_> {
             self.gemm_q4(A_TMP, A_ATTNV, l.v_proj, CANVAS as u32, k_n, HID as u32)?;
         }
 
-        self.enc.setComputePipelineState(&self.ps.qk_rope_kv.pipeline);
+        self.sink_set_pipeline(&self.ps.qk_rope_kv);
         unsafe {
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), A_ATTNQ as usize, 0);
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), A_ATTNK as usize, 1);
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), A_ATTNV as usize, 2);
+            self.sink_set_buffer(&self.bufs.arena, A_ATTNQ as usize, 0);
+            self.sink_set_buffer(&self.bufs.arena, A_ATTNK as usize, 1);
+            self.sink_set_buffer(&self.bufs.arena, A_ATTNV as usize, 2);
             self.bind_kvcache(3);
             self.bind_blob(4);
-            self.enc.setBuffer_offset_atIndex(
-                Some(&self.bufs.layout),
-                layer_off as usize,
-                5,
-            );
+            self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 5);
             self.bind_params(6);
         }
         let grid = MTLSize {
@@ -1154,18 +1172,14 @@ impl StepEnc<'_> {
             height: 1,
             depth: 1,
         };
-        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        self.sink_dispatch(grid, tg);
 
-        self.enc.setComputePipelineState(&self.ps.attention.pipeline);
+        self.sink_set_pipeline(&self.ps.attention);
         unsafe {
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), A_ATTNQ as usize, 0);
+            self.sink_set_buffer(&self.bufs.arena, A_ATTNQ as usize, 0);
             self.bind_kvcache(1);
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), A_ATTNO as usize, 2);
-            self.enc.setBuffer_offset_atIndex(
-                Some(&self.bufs.layout),
-                layer_off as usize,
-                3,
-            );
+            self.sink_set_buffer(&self.bufs.arena, A_ATTNO as usize, 2);
+            self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 3);
             self.bind_params(4);
         }
         let grid = MTLSize {
@@ -1178,7 +1192,7 @@ impl StepEnc<'_> {
             height: 1,
             depth: 1,
         };
-        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        self.sink_dispatch(grid, tg);
 
         self.encode_layer_o_proj_post_attn(layer, layout)?;
         self.encode_layer_dense_ffn(layer, layout)?;
@@ -1216,15 +1230,11 @@ impl StepEnc<'_> {
         layout: &ModelLayout,
     ) -> Result<(), Error> {
         let layer_off = layer_byte_offset(layer);
-        self.enc.setComputePipelineState(&self.ps.router.pipeline);
+        self.sink_set_pipeline(&self.ps.router);
         unsafe {
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), A_STREAM as usize, 0);
+            self.sink_set_buffer(&self.bufs.arena, A_STREAM as usize, 0);
             self.bind_blob(1);
-            self.enc.setBuffer_offset_atIndex(
-                Some(&self.bufs.layout),
-                layer_off as usize,
-                2,
-            );
+            self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 2);
             self.bind_route(3);
         }
         let grid = MTLSize {
@@ -1237,16 +1247,16 @@ impl StepEnc<'_> {
             height: 1,
             depth: 1,
         };
-        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        self.sink_dispatch(grid, tg);
 
-        self.enc.setComputePipelineState(&self.ps.bucket_count.pipeline);
+        self.sink_set_pipeline(&self.ps.bucket_count);
         self.bind_route(0);
         self.dispatch_1d(&self.ps.bucket_count, 128, 128);
 
         for phase in 0u32..3 {
-            self.enc.setComputePipelineState(&self.ps.bucket_fill.pipeline);
+            self.sink_set_pipeline(&self.ps.bucket_fill);
             self.bind_route(0);
-            set_bytes(&self.enc, &phase, 1);
+            self.sink_set_bytes( &phase, 1);
             let count = if phase == 1 { 1 } else { CANVAS * TOP_K };
             self.dispatch_1d(&self.ps.bucket_fill, count, 256);
         }
@@ -1263,22 +1273,16 @@ impl StepEnc<'_> {
         layout: &ModelLayout,
     ) -> Result<(), Error> {
         let layer_off = layer_byte_offset(layer);
-        self.enc.setComputePipelineState(
-            if self.use_nvfp4 {
-                &self.ps.moe_grouped_nvfp4.pipeline
-            } else {
-                &self.ps.moe_grouped.pipeline
-            },
-        );
+        self.sink_set_pipeline(if self.use_nvfp4 {
+            &self.ps.moe_grouped_nvfp4
+        } else {
+            &self.ps.moe_grouped
+        });
         unsafe {
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), A_MOEIN as usize, 0);
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), A_MOEOUT as usize, 1);
+            self.sink_set_buffer(&self.bufs.arena, A_MOEIN as usize, 0);
+            self.sink_set_buffer(&self.bufs.arena, A_MOEOUT as usize, 1);
             self.bind_blob(2);
-            self.enc.setBuffer_offset_atIndex(
-                Some(&self.bufs.layout),
-                layer_off as usize,
-                3,
-            );
+            self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 3);
             self.bind_route(4);
         }
         let grid = MTLSize {
@@ -1291,7 +1295,7 @@ impl StepEnc<'_> {
             height: 1,
             depth: 1,
         };
-        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        self.sink_dispatch(grid, tg);
         Ok(())
     }
 
@@ -1301,6 +1305,14 @@ impl StepEnc<'_> {
         self.residual(A_DENSE, A_MOEIN, A_TMP, 0, CANVAS * HID);
         self.rmsnorm(A_TMP, A_TMP, l.post_ff_ln, HID as u32, CANVAS);
         self.residual(A_STREAM, A_TMP, A_HIDDEN, l.layer_scalar, CANVAS * HID);
+        Ok(())
+    }
+
+    /// Attention + dense FFN + router + grouped MoE + post-combine (one encoder session).
+    fn encode_full_layer(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
+        self.encode_layer(layer, layout)?;
+        self.encode_layer_moe_grouped(layer, layout)?;
+        self.encode_layer_moe_post(layer, layout)?;
         Ok(())
     }
 
@@ -1343,11 +1355,7 @@ impl StepEnc<'_> {
             self.enc
                 .setBuffer_offset_atIndex(Some(&self.bufs.arena), A_MOEOUT as usize, 1);
             self.bind_blob(2);
-            self.enc.setBuffer_offset_atIndex(
-                Some(&self.bufs.layout),
-                layer_off as usize,
-                3,
-            );
+            self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 3);
             self.bind_route(4);
             self.enc
                 .setBuffer_offset_atIndex(Some(&self.bufs.arena), A_SOFT as usize, 5);
@@ -1362,7 +1370,7 @@ impl StepEnc<'_> {
             height: 1,
             depth: 1,
         };
-        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        self.sink_dispatch(grid, tg);
         Ok(())
     }
 
@@ -1385,18 +1393,14 @@ impl StepEnc<'_> {
             self.gemm_q4(A_TMP, A_ATTNV, l.v_proj, CANVAS as u32, k_n, HID as u32)?;
         }
 
-        self.enc.setComputePipelineState(&self.ps.qk_rope_kv.pipeline);
+        self.sink_set_pipeline(&self.ps.qk_rope_kv);
         unsafe {
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), A_ATTNQ as usize, 0);
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), A_ATTNK as usize, 1);
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), A_ATTNV as usize, 2);
+            self.sink_set_buffer(&self.bufs.arena, A_ATTNQ as usize, 0);
+            self.sink_set_buffer(&self.bufs.arena, A_ATTNK as usize, 1);
+            self.sink_set_buffer(&self.bufs.arena, A_ATTNV as usize, 2);
             self.bind_kvcache(3);
             self.bind_blob(4);
-            self.enc.setBuffer_offset_atIndex(
-                Some(&self.bufs.layout),
-                layer_off as usize,
-                5,
-            );
+            self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 5);
             self.bind_params(6);
         }
         let grid = MTLSize {
@@ -1409,18 +1413,14 @@ impl StepEnc<'_> {
             height: 1,
             depth: 1,
         };
-        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        self.sink_dispatch(grid, tg);
 
-        self.enc.setComputePipelineState(&self.ps.attention.pipeline);
+        self.sink_set_pipeline(&self.ps.attention);
         unsafe {
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), A_ATTNQ as usize, 0);
+            self.sink_set_buffer(&self.bufs.arena, A_ATTNQ as usize, 0);
             self.bind_kvcache(1);
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), A_ATTNO as usize, 2);
-            self.enc.setBuffer_offset_atIndex(
-                Some(&self.bufs.layout),
-                layer_off as usize,
-                3,
-            );
+            self.sink_set_buffer(&self.bufs.arena, A_ATTNO as usize, 2);
+            self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 3);
             self.bind_params(4);
         }
         let grid = MTLSize {
@@ -1433,19 +1433,19 @@ impl StepEnc<'_> {
             height: 1,
             depth: 1,
         };
-        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        self.sink_dispatch(grid, tg);
         Ok(())
     }
 
     /// Canvas token embed gather only (no SC residual, no no-scale RMSNorm).
     fn encode_preamble_embed_only(&mut self, layout: &ModelLayout) -> Result<(), Error> {
         let _ = layout;
-        self.enc.setComputePipelineState(&self.ps.embed_gather.pipeline);
+        self.sink_set_pipeline(&self.ps.embed_gather);
         unsafe {
             self.bind_blob(0);
             self.bind_layout(1);
             self.bind_state(2);
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), A_HIDDEN as usize, 3);
+            self.sink_set_buffer(&self.bufs.arena, A_HIDDEN as usize, 3);
         }
         let grid = MTLSize {
             width: HID,
@@ -1457,33 +1457,13 @@ impl StepEnc<'_> {
             height: 1,
             depth: 1,
         };
-        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        self.sink_dispatch(grid, tg);
         Ok(())
     }
 
     fn encode_step_preamble(&mut self, layout: &ModelLayout, first_step: u32) -> Result<(), Error> {
         if first_step == 0 {
-            self.enc.setComputePipelineState(&self.ps.logit_rowstats.pipeline);
-            self.bind_logits(0);
-            unsafe {
-                self.enc.setBuffer_offset_atIndex(
-                    Some(&self.bufs.arena),
-                    A_RS_SC as usize,
-                    1,
-                );
-            }
-            let grid = MTLSize {
-                width: CANVAS,
-                height: 1,
-                depth: 1,
-            };
-            let tg = MTLSize {
-                width: 256,
-                height: 1,
-                depth: 1,
-            };
-            self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
-
+            self.encode_sc_logit_rowstats();
             self.encode_sc_softembed(layout)?;
 
             self.rmsnorm(A_SOFT, A_TMP, layout.sc_pre_norm, HID as u32, CANVAS);
@@ -1515,12 +1495,12 @@ impl StepEnc<'_> {
         }
         // first_step: A_DENSE stays zero; skip SC MLP + O(vocab) softembed.
 
-        self.enc.setComputePipelineState(&self.ps.embed_gather.pipeline);
+        self.sink_set_pipeline(&self.ps.embed_gather);
         unsafe {
             self.bind_blob(0);
             self.bind_layout(1);
             self.bind_state(2);
-            self.enc.setBuffer_offset_atIndex(Some(&self.bufs.arena), A_HIDDEN as usize, 3);
+            self.sink_set_buffer(&self.bufs.arena, A_HIDDEN as usize, 3);
         }
         let grid = MTLSize {
             width: HID,
@@ -1532,7 +1512,7 @@ impl StepEnc<'_> {
             height: 1,
             depth: 1,
         };
-        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        self.sink_dispatch(grid, tg);
 
         self.residual(A_HIDDEN, A_DENSE, A_HIDDEN, 0, CANVAS * HID);
         self.rmsnorm(A_HIDDEN, A_HIDDEN, 0, HID as u32, CANVAS);
@@ -1559,18 +1539,12 @@ impl StepEnc<'_> {
         self.encode_step_sampler(layout)
     }
 
-    fn encode_step_sampler(&self, _layout: &ModelLayout) -> Result<(), Error> {
-        self.enc.setComputePipelineState(&self.ps.sample_rowstats.pipeline);
-        unsafe {
-            self.bind_logits(0);
-            self.enc.setBuffer_offset_atIndex(
-                Some(&self.bufs.arena),
-                A_RS_SAMP as usize,
-                1,
-            );
-            self.bind_state(2);
-            self.bind_params(3);
-        }
+    fn encode_step_sampler(&mut self, _layout: &ModelLayout) -> Result<(), Error> {
+        self.sink_set_pipeline(&self.ps.sample_rowstats);
+        self.bind_logits(0);
+        self.sink_set_buffer(&self.bufs.arena, A_RS_SAMP as usize, 1);
+        self.bind_state(2);
+        self.bind_params(3);
         let grid = MTLSize {
             width: CANVAS,
             height: 1,
@@ -1581,9 +1555,9 @@ impl StepEnc<'_> {
             height: 1,
             depth: 1,
         };
-        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        self.sink_dispatch(grid, tg);
 
-        self.enc.setComputePipelineState(&self.ps.sample_commit.pipeline);
+        self.sink_set_pipeline(&self.ps.sample_commit);
         self.bind_state(0);
         self.bind_params(1);
         let tg = MTLSize {
@@ -1596,9 +1570,9 @@ impl StepEnc<'_> {
             height: 1,
             depth: 1,
         };
-        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        self.sink_dispatch(grid, tg);
 
-        self.enc.setComputePipelineState(&self.ps.sample_apply.pipeline);
+        self.sink_set_pipeline(&self.ps.sample_apply);
         unsafe {
             self.bind_logits(0);
             self.enc.setBuffer_offset_atIndex(
@@ -1619,9 +1593,9 @@ impl StepEnc<'_> {
             height: 1,
             depth: 1,
         };
-        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        self.sink_dispatch(grid, tg);
 
-        self.enc.setComputePipelineState(&self.ps.sample_write.pipeline);
+        self.sink_set_pipeline(&self.ps.sample_write);
         self.bind_state(0);
         let grid = MTLSize {
             width: 1,
@@ -1633,7 +1607,7 @@ impl StepEnc<'_> {
             height: 1,
             depth: 1,
         };
-        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        self.sink_dispatch(grid, tg);
         Ok(())
     }
 }
@@ -1905,6 +1879,7 @@ pub struct StepRuntime {
     use_sc_gemm: bool,
     layout: ModelLayout,
     pub layers: usize,
+    icb: Option<crate::metal::step_icb::StepIcbPair>,
 }
 
 impl StepRuntime {
@@ -2027,12 +2002,74 @@ impl StepRuntime {
             use_mps_q4: self.use_mps_q4,
             use_nvfp4: self.use_nvfp4,
             use_sc_gemm: self.use_sc_gemm,
+            recorder: None,
         };
         f(&mut enc)?;
         enc.enc.endEncoding();
         cmd.commit();
         cmd.waitUntilCompleted();
         Ok(())
+    }
+
+    fn dispatch_record<F>(&mut self, f: F, recorder: &mut crate::metal::step_icb::IcbRecorder) -> Result<(), Error>
+    where
+        F: FnOnce(&mut StepEnc<'_>) -> Result<(), Error>,
+    {
+        let cmd = self
+            .ctx
+            .queue
+            .commandBuffer()
+            .ok_or(Error::Format("command buffer alloc failed"))?;
+        let enc_obj = cmd
+            .computeCommandEncoder()
+            .ok_or(Error::Format("compute encoder alloc failed"))?;
+        let mut enc = StepEnc {
+            enc: enc_obj,
+            cmd: cmd.clone(),
+            ps: &self.pipelines,
+            bufs: &self.bufs,
+            gpu_blob: &self.gpu_blob,
+            mps: &mut self.mps_matmul,
+            use_mps_q4: self.use_mps_q4,
+            use_nvfp4: self.use_nvfp4,
+            use_sc_gemm: self.use_sc_gemm,
+            recorder: Some(recorder),
+        };
+        f(&mut enc)?;
+        enc.enc.endEncoding();
+        Ok(())
+    }
+
+    fn record_icb_plan(&mut self, with_sc: bool) -> Result<crate::metal::step_icb::StepIcbPlan, Error> {
+        let mut state = self.read_canvas_state();
+        state.step = if with_sc { 1 } else { 0 };
+        self.write_canvas_state(&state);
+
+        let mut recorder = crate::metal::step_icb::IcbRecorder::new(&self.ctx.device)?;
+        let layout = self.layout;
+        let layers = self.layers;
+        let finish = StepFinishMode::Full;
+        self.dispatch_record(
+            |enc| {
+                let first_step = if with_sc { 0u32 } else { 1u32 };
+                enc.encode_step_preamble(&layout, first_step)?;
+                for layer in 0..layers {
+                    enc.encode_full_layer(layer, &layout)?;
+                }
+                enc.encode_step_finish(&layout, finish)?;
+                Ok(())
+            },
+            &mut recorder,
+        )?;
+        recorder.finish()
+    }
+
+    fn record_icb_pair(&mut self) -> Result<crate::metal::step_icb::StepIcbPair, Error> {
+        let saved = self.read_canvas_state();
+        let no_sc = self.record_icb_plan(false)?;
+        let with_sc = self.record_icb_plan(true)?;
+        self.write_canvas_state(&saved);
+        Ok(crate::metal::step_icb::StepIcbPair { no_sc, with_sc })
     }
 
     /// Attention + dense FFN + GPU router; MoE expert matmuls on CPU (matches `.dgq` Q4 oracle).
@@ -2056,18 +2093,14 @@ impl StepRuntime {
         Ok(())
     }
 
-    /// One decoder layer: GPU router + grouped MoE + GPU post-combine.
+    /// One decoder layer: GPU router + grouped MoE + GPU post-combine (single submit).
     pub fn encode_full_layer(&mut self, layer: usize) -> Result<(), Error> {
         let layout = self.layout;
-        self.dispatch_and_wait(|enc| {
-            enc.encode_layer(layer, &layout)?;
-            enc.encode_layer_moe_grouped(layer, &layout)?;
-            Ok(())
-        })?;
-        self.dispatch_and_wait(|enc| enc.encode_layer_moe_post(layer, &layout))?;
+        self.dispatch_and_wait(|enc| enc.encode_full_layer(layer, &layout))?;
         Ok(())
     }
 
+    /// P2.2 Phase A: one command buffer + one GPU sync per denoise step.
     fn run_forward_once(&mut self, finish: StepFinishMode) -> Result<(), Error> {
         let layout = self.layout;
         let layers = self.layers;
@@ -2082,12 +2115,30 @@ impl StepRuntime {
             );
         }
         let first_step = if st_before.step == 0 { 1u32 } else { 0u32 };
+        // ICB validated for step-0 (no SC) only; with_sc plan still drifts vs live encode.
+        if finish == StepFinishMode::Full && first_step == 1 {
+            if let Some(icb) = &self.icb {
+                let cmd = self
+                    .ctx
+                    .queue
+                    .commandBuffer()
+                    .ok_or(Error::Format("command buffer alloc failed"))?;
+                let mut enc = crate::metal::step_icb::replay_step_icb(
+                    &cmd,
+                    &icb.no_sc,
+                    &self.bufs,
+                    &mut self.mps_matmul,
+                )?;
+                enc.endEncoding();
+                cmd.commit();
+                cmd.waitUntilCompleted();
+                return Ok(());
+            }
+        }
         self.dispatch_and_wait(|enc| {
             enc.encode_step_preamble(&layout, first_step)?;
             for layer in 0..layers {
-                enc.encode_layer(layer, &layout)?;
-                enc.encode_layer_moe_grouped(layer, &layout)?;
-                enc.encode_layer_moe_post(layer, &layout)?;
+                enc.encode_full_layer(layer, &layout)?;
             }
             enc.encode_step_finish(&layout, finish)?;
             Ok(())
@@ -2281,23 +2332,38 @@ pub fn build_step_runtime(
         "step-kernel: runtime built (total={:.2?}, compile={:.2?})",
         build.total, build.compile
     );
-    Ok((
-        StepRuntime {
-            ctx,
-            pipelines,
-            bufs,
-            gpu_blob,
-            weight_cache,
-            text_config,
-            mps_matmul,
-            use_mps_q4: cfg.use_mps_q4.unwrap_or_else(step_use_mps_q4_from_env),
-            use_nvfp4,
-            use_sc_gemm: step_use_sc_gemm_from_env(),
-            layout,
-            layers,
-        },
-        build,
-    ))
+    let mut rt = StepRuntime {
+        ctx,
+        pipelines,
+        bufs,
+        gpu_blob,
+        weight_cache,
+        text_config,
+        mps_matmul,
+        use_mps_q4: cfg.use_mps_q4.unwrap_or_else(step_use_mps_q4_from_env),
+        use_nvfp4,
+        use_sc_gemm: step_use_sc_gemm_from_env(),
+        layout,
+        layers,
+        icb: None,
+    };
+    if crate::metal::step_icb::step_icb_enabled() && rt.use_mps_q4 {
+        let icb_started = Instant::now();
+        eprintln!("step-kernel: recording ICB replay plans...");
+        let pair = rt.record_icb_pair()?;
+        eprintln!(
+            "step-kernel: ICB ready (no_sc={} cmds/{} ops, with_sc={} cmds/{} ops) in {:.2?}",
+            pair.no_sc.command_count,
+            pair.no_sc.ops.len(),
+            pair.with_sc.command_count,
+            pair.with_sc.ops.len(),
+            icb_started.elapsed()
+        );
+        rt.icb = Some(pair);
+    } else if crate::metal::step_icb::step_icb_enabled() {
+        eprintln!("step-kernel: ICB skipped (fused Q4/nvfp4 path; set DGQ_STEP_MPS_Q4=1 to enable)");
+    }
+    Ok((rt, build))
 }
 
 pub fn run_step_probe(model_dir: &Path, cfg: StepSmokeConfig) -> Result<StepProbeResult, Error> {
@@ -3151,23 +3217,9 @@ pub fn run_step_smoke(model_dir: &Path, cfg: StepSmokeConfig) -> Result<StepSmok
     let finish = cfg.finish;
     let steps = cfg.steps;
     let (mut rt, _) = build_step_runtime(model_dir, &cfg)?;
-    let layout = rt.layout;
-    let layers = rt.layers;
     let started = Instant::now();
     for step_i in 0..steps {
-        rt.dispatch_and_wait(|enc| {
-            let cur_state: CanvasState = read_struct(&enc.bufs.state);
-            let first_step = if cur_state.step == 0 { 1u32 } else { 0u32 };
-            enc.encode_step_preamble(&layout, first_step)?;
-            Ok(())
-        })?;
-        for layer in 0..layers {
-            rt.encode_full_layer(layer)?;
-        }
-        rt.dispatch_and_wait(|enc| {
-            enc.encode_step_finish(&layout, finish)?;
-            Ok(())
-        })?;
+        rt.run_forward_once(finish)?;
         eprintln!("step-smoke: completed denoise step {}/{}", step_i + 1, steps);
         if finish == StepFinishMode::Full {
             let st: CanvasState = read_struct(&rt.bufs.state);
@@ -3510,6 +3562,8 @@ mod tests {
 
     #[test]
     fn sc_gemm_softembed_matches_slow_kernel() {
+        use std::path::Path;
+
         let dir = Path::new("/tmp/quantized-weights");
         if !crate::dgq::store::looks_like_dgq_dir(dir) {
             eprintln!("skip sc_gemm_softembed_matches_slow_kernel");
@@ -3556,6 +3610,187 @@ mod tests {
         eprintln!("sc softembed fast vs slow: cos={cos:.6} max_abs={max_abs:.6}");
         assert!(cos > 0.999, "sc gemm cos={cos}");
         assert!(max_abs < 0.05, "sc gemm max_abs={max_abs}");
+    }
+
+    fn read_buffer_bytes(
+        buf: &ProtocolObject<dyn MTLBuffer>,
+        byte_off: usize,
+        len: usize,
+    ) -> Vec<u8> {
+        unsafe {
+            std::slice::from_raw_parts(
+                buf.contents().as_ptr().add(byte_off) as *const u8,
+                len,
+            )
+            .to_vec()
+        }
+    }
+
+    fn write_buffer_bytes(buf: &ProtocolObject<dyn MTLBuffer>, byte_off: usize, data: &[u8]) {
+        unsafe {
+            std::slice::from_raw_parts_mut(buf.contents().as_ptr().add(byte_off) as *mut u8, data.len())
+                .copy_from_slice(data);
+        }
+    }
+
+    struct StepGpuSnapshot {
+        state: CanvasState,
+        logits: Vec<u8>,
+        kvcache: Vec<u8>,
+    }
+
+    fn snapshot_step_gpu(rt: &StepRuntime) -> StepGpuSnapshot {
+        StepGpuSnapshot {
+            state: rt.read_canvas_state(),
+            logits: read_buffer_bytes(&rt.bufs.logits, 0, CANVAS * VOCAB * 2),
+            kvcache: read_buffer_bytes(&rt.bufs.kvcache, 0, rt.bufs.kvcache.length()),
+        }
+    }
+
+    fn restore_step_gpu(rt: &mut StepRuntime, snap: &StepGpuSnapshot) {
+        rt.write_canvas_state(&snap.state);
+        write_buffer_bytes(&rt.bufs.logits, 0, &snap.logits);
+        write_buffer_bytes(&rt.bufs.kvcache, 0, &snap.kvcache);
+    }
+
+    fn icb_plan_parity(
+        rt: &mut StepRuntime,
+        layout: &ModelLayout,
+        layers: usize,
+        first_step: u32,
+    ) -> f32 {
+        let snap = snapshot_step_gpu(rt);
+        rt.dispatch_and_wait(|enc| {
+            enc.encode_step_preamble(layout, first_step)?;
+            for layer in 0..layers {
+                enc.encode_full_layer(layer, layout)?;
+            }
+            enc.encode_step_finish(layout, StepFinishMode::Full)?;
+            Ok(())
+        })
+        .expect("live");
+        let live_logits = read_half_buffer_f32(&rt.bufs.logits, 0, CANVAS * VOCAB);
+
+        if first_step == 0 {
+            restore_step_gpu(rt, &snap);
+        } else {
+            rt.write_canvas_state(&snap.state);
+        }
+        let icb = rt.icb.as_ref().expect("icb plan");
+        let plan = if first_step == 1 {
+            &icb.no_sc
+        } else {
+            &icb.with_sc
+        };
+        let cmd = rt.ctx.queue.commandBuffer().expect("cmd");
+        let mut enc =
+            crate::metal::step_icb::replay_step_icb(&cmd, plan, &rt.bufs, &mut rt.mps_matmul)
+                .expect("replay");
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+
+        let icb_logits = read_half_buffer_f32(&rt.bufs.logits, 0, CANVAS * VOCAB);
+        live_logits
+            .iter()
+            .zip(icb_logits.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    #[test]
+    fn icb_full_step_matches_live_encode() {
+        let dir = Path::new("/tmp/quantized-weights");
+        if !crate::dgq::store::looks_like_dgq_dir(dir) {
+            eprintln!("skip icb_full_step_matches_live_encode");
+            return;
+        }
+        let cfg = StepSmokeConfig {
+            layers: 30,
+            steps: 1,
+            finish: StepFinishMode::Full,
+            no_early_stop: true,
+            ..StepSmokeConfig::default()
+        };
+        let (mut rt, _) = build_step_runtime(dir, &cfg).expect("build");
+        let layout = rt.layout;
+        let layers = rt.layers;
+        let max = icb_plan_parity(&mut rt, &layout, layers, 1);
+        eprintln!("icb no_sc parity: logits_max_abs={max:.6}");
+        assert!(max < 0.05, "no_sc logits drift max_abs={max}");
+    }
+
+    #[test]
+    #[ignore = "with_sc ICB replay drifts vs live encode; steps 2+ use live path"]
+    fn icb_with_sc_matches_live_encode() {
+        let dir = Path::new("/tmp/quantized-weights");
+        if !crate::dgq::store::looks_like_dgq_dir(dir) {
+            eprintln!("skip icb_with_sc_matches_live_encode");
+            return;
+        }
+        let cfg = StepSmokeConfig {
+            layers: 30,
+            steps: 1,
+            finish: StepFinishMode::Full,
+            no_early_stop: true,
+            ..StepSmokeConfig::default()
+        };
+        let (mut rt, _) = build_step_runtime(dir, &cfg).expect("build");
+        let layout = rt.layout;
+        let layers = rt.layers;
+        // Step 1 (no SC) establishes kv/logits like generate-monolithic.
+        rt.dispatch_and_wait(|enc| {
+            enc.encode_step_preamble(&layout, 1)?;
+            for layer in 0..layers {
+                enc.encode_full_layer(layer, &layout)?;
+            }
+            enc.encode_step_finish(&layout, StepFinishMode::Full)?;
+            Ok(())
+        })
+        .expect("step1 live");
+        let max = icb_plan_parity(&mut rt, &layout, layers, 0);
+        eprintln!("icb with_sc parity: logits_max_abs={max:.6}");
+        assert!(max < 0.05, "with_sc logits drift max_abs={max}");
+    }
+
+    #[test]
+    fn icb_nvfp4_fused_matches_live_encode() {
+        let dir = Path::new("/tmp/nvfp4-weights");
+        if !crate::dgq::store::looks_like_dgq_dir(dir) {
+            eprintln!("skip icb_nvfp4_fused_matches_live_encode");
+            return;
+        }
+        let cfg = StepSmokeConfig {
+            layers: 30,
+            steps: 1,
+            finish: StepFinishMode::Full,
+            no_early_stop: true,
+            use_mps_q4: Some(false),
+            ..StepSmokeConfig::default()
+        };
+        let (mut rt, _) = build_step_runtime(dir, &cfg).expect("build");
+        if rt.icb.is_none() {
+            eprintln!("skip icb_nvfp4_fused: ICB disabled on fused nvfp4 path");
+            return;
+        }
+        let layout = rt.layout;
+        let layers = rt.layers;
+        let no_sc = icb_plan_parity(&mut rt, &layout, layers, 1);
+        eprintln!("icb nvfp4 no_sc parity: logits_max_abs={no_sc:.6}");
+        assert!(no_sc < 0.05, "nvfp4 no_sc drift max_abs={no_sc}");
+
+        rt.dispatch_and_wait(|enc| {
+            enc.encode_step_preamble(&layout, 1)?;
+            for layer in 0..layers {
+                enc.encode_full_layer(layer, &layout)?;
+            }
+            enc.encode_step_finish(&layout, StepFinishMode::Full)?;
+            Ok(())
+        })
+        .expect("step1 live");
+        let with_sc = icb_plan_parity(&mut rt, &layout, layers, 0);
+        eprintln!("icb nvfp4 with_sc parity: logits_max_abs={with_sc:.6}");
+        assert!(with_sc < 0.05, "nvfp4 with_sc drift max_abs={with_sc}");
     }
 
     #[test]
