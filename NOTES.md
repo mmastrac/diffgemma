@@ -277,3 +277,80 @@ cargo run --release -- config
 ---
 
 *Consolidated 2026-06 from PLAN.md (v1), PLAN2.md, PLAN_MONOLITHIC.md. Forward-looking work lives in PLAN.md.*
+
+---
+
+## 9. MLX vs `generate-monolithic` — failure modes & debug playbook
+
+Use this when MLX (or HF bf16) traces disagree with Rust monolithic output. Most regressions we've hit before fall into one of these buckets — check the cheap mismatches first, then bisect forward vs sampler.
+
+**Sources:** this thread ([d6390493](d6390493-6507-4641-8de8-b2607743d5ff)), monolithic bring-up ([bff0ada0 → 58497bad](58497bad-e96e-4335-8afe-c582af1b96e4)), `PLAN.md` P1.6 trace notes. Chat `0a8f1451-458f-4435-9b2e-99957a4919c4` was not present in local agent transcripts; overlap is covered by `PLAN.md` + section 5 here.
+
+### A. Comparison setup traps (looks broken, engine is fine)
+
+| Symptom | Likely cause | Fix / verify |
+|---------|--------------|--------------|
+| Traces diverge from step 0 | **Canvas RNG mismatch** — monolithic uses Rust LCG (`sample::Rng`); MLX default is `mx.random` | MLX dump: `dump_mlx_denoise_trace.py --canvas-rng rust`; Rust: same `--seed` |
+| Token ids differ before denoise | **Chat template vs raw BPE** (`--raw` skips Gemma-4 turn formatting) | Both sides: templated `"Hello"` (not `--raw`) unless fixture says otherwise |
+| MLX accepts ~200+ positions, mono ~1 at step 1 | **Quant format mismatch** — MLX mxfp4 vs `.dgq` q4_affine (different forward, not accept bug) | Expect divergence; compare **entropy curves** first. Documented: MLX ~0.04–1.5 nats vs `.dgq` ~0.5–3.1 nats @ step 1 @ 30L |
+| Flat / nonsense logits @ 30L but OK @ 3L | **Prefill / KV path** — encoder wrote wrong KV (`KV-MPS-1`) or `kv_len=0` smoke vs real prompt | `step-kv-parity`, `step-kv-check`; monolithic prefill must use native Q4 (`encoder_use_mps_q4=false` default) |
+| Different step counts in compare | **`--steps 2` parity default vs 48 production** | Match `--steps` and `--no-early-stop` on both sides for trace compares |
+| `.dgq` in Python | **Format not loadable in HF/MLX** | MLX path uses `quantize_mlx.py` → `model/mlx-mxfp4`; Rust uses `/tmp/quantized-weights` |
+
+### B. Monolithic forward bugs (garbled / flat entropy @ 30L)
+
+See **section 5** for full archaeology. Highest-frequency when MLX/HF match each other but mono doesn't:
+
+| ID / pattern | Symptom | Notes |
+|--------------|---------|-------|
+| **Q4 layout** | Silent garbage matmuls | `[scale][min][nibbles]` at group **front**; not tail |
+| **Q8 scale** | Wrong embed / SC | `[scale:2][i8:K]` at row **front** |
+| **VERIFY-N** | Q4 nibble parity | Even col = low nibble |
+| **VERIFY-K** | MoE / grouped GEMM drift | K-order in `dequant_q4_group` vs `q4_weight_at`; grouped MoE fork drift (q4 vs nvfp4 files) |
+| **RoPE** | Attention garbage | Split-half pairs; proportional-RoPE denominator = **full** head_dim (512) |
+| **Temperature** | Wrong accept timing | Count-**down** schedule (`cur = max_steps - steps_done`) |
+| **Accept rule** | Wrong frozen set | Test-before-add + break on prefix entropy (HF mutual-information bound) |
+| **`k_logit_rowstats` / SC** | SC broken step ≥ 2 | SC needs **pre-temperature** rowstats; separate from sampler stats (`VERIFY-SC`) |
+| **MoE stream input** | MoE uses wrong hidden | Must read **`pre_ff_norm_2(stream)`**, not pre-FF residual |
+| **V aliasing** | Full-attn layers | No `v_proj`; V from k_proj + rms_norm_no_scale, no RoPE |
+| **Prefill MoE** | 30L gibberish, 3L OK | Prefill forced CPU MoE / wrong Q4 path was ~98–155 s and bad KV (PREF-1, P1.8–P1.9) |
+
+### C. Sampler / state bugs (timing OK, telemetry wrong)
+
+| Symptom | Likely cause | Verify |
+|---------|--------------|--------|
+| Argmax all **262143** (vocab−1) | **NaN logits** from stale `BufferPool` / KV | Zero alloc path; `DGQ_CHECK_LOGITS=1`; golden discard |
+| **`mean_ent` ~11+** (max confusion) | **In-process pollution** — `step-verify` then generate same process | Run generate in **fresh process**; step-ci golden may need regen after MoE changes |
+| **`accept/step ≈ 1`**, `min_ent > 0.1` early @ 30L | **CONV-1** — forward not sharpening (quant damage or kernel bug) | Not accept-rule bug if HF agrees on exported logits; use layer hidden dumps |
+| Early stop @ step 2, all `<pad>` | **STOP-1** degenerate argmax | Pad-aware stop (`MIN_EARLY_STOP_STEPS`); `--no-early-stop` for compares |
+| Tokens drift run-to-run | **`DGQ_MPS_Q4=1`** MPS dense nondeterminism | Parity: `DGQ_MPS_Q4=0`; bench may use `=1` |
+| MoE scatter differs ~1 ulp | Atomic f32 scatter | **MOE-1**; parity uses CPU MoE in engine path |
+
+### D. Recommended bisection (MLX vs mono)
+
+1. **Matched setup:** same prompt (`Hello`), `--seed 42`, `--steps 8`, `--no-early-stop`, `--canvas-rng rust` on MLX, same layer count (start **3L** then **30L**).
+2. **Dump traces:**
+   ```bash
+   # Rust (.dgq q4)
+   ./target/release/diffgemma-mps -m /tmp/quantized-weights generate-monolithic \\
+     -p Hello --seed 42 --steps 8 --layers 30 --no-early-stop \\
+     --write-trace /tmp/mono_trace.json
+
+   # MLX (mxfp4)
+   cd python && uv run python scripts/dump_mlx_denoise_trace.py \\
+     --model ../model/mlx-mxfp4 -p Hello --seed 42 --steps 8 --no-early-stop \\
+     --canvas-rng rust -o /tmp/mlx_trace.json
+
+   uv run python scripts/compare_denoise_trace.py /tmp/mono_trace.json /tmp/mlx_trace.json
+   ```
+3. **First diverging step:** if **`initial_canvas_ids` or step-0 entropy** differ → setup bug (A). If step 1 entropy differs but canvas matches → forward/quant (B). If entropy matches but **`accept_count` differs** → sampler (C).
+4. **Layer bisect @ diverging step:** `dump_layer_hidden.py` / `compare_layer_hidden.py` (Rust dump + MLX/HF dump) — see `python/scripts/`.
+5. **Rust-only gates before blaming quant:** `step-verify --layers 3`, `step-parity`, `step-kv-parity` on same weights; `step-probe` for stage max_abs.
+
+### E. What we already know (2026-06 baseline)
+
+- **30L q4 monolithic @ Hello:** timing ~4.8 s/step is plausible; **~1 accept/step early** and gibberish @ 48 steps = CONV-1 (forward/quant), not sampler-only.
+- **MLX mxfp4 vs `.dgq` q4 @ step 1:** argmax may match positions 0–1 then diverge; MLX accepts far more positions because entropies are much lower — **do not** treat as accept-rule regression without logit export parity.
+- **NVFP4 grouped MoE** (2026-06): large speedup; changes outputs — regen goldens / compare in fresh process after kernel changes.
+- **Long prompts:** OOM (exit **137**) on full 48-step × 30L generate — use shorter `--max-new-tokens` or fewer steps for parity runs.
+
