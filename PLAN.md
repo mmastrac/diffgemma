@@ -143,9 +143,154 @@ P1.6 (convergence) remains the quality gate; P2.1 latency work can proceed in pa
 
 ### P3 — Harden & ship
 
-Unchanged — multi-block extend, kv>0 parity, MoE determinism docs, 24 GiB budget, q5 profile, CI default monolithic.
+| # | Task | Impact | Exit |
+|---|------|--------|------|
+| P3.1 | Multi-block extend + kv>0 golden parity | High | `generate-monolithic` multi-block matches engine on fixed seed |
+| P3.2 | MoE determinism policy documented + tested | Medium | Atomic scatter vs CPU scatter tradeoffs in `NOTES.md`; engine parity path explicit |
+| P3.3 | 24 GiB memory budget enforcement | Medium | `--skip-vision` + q4 documented; wired-limit guidance |
+| P3.4 | q5 profile on 36 GiB | Low | Optional quant profile; quality A/B vs q4 @ 30L |
+| P3.5 | CI default monolithic | Medium | `step-ci` + templated gate on monolithic path |
+| P3.6 | **Declarative step dispatch schedule** | High (maintainability) | See [P3.6 detail](#p36-declarative-step-dispatch-schedule) |
+| P3.7 | **GPU debug status / invariant flag** | High (debuggability) | See [P3.7 detail](#p37-gpu-debug-status--invariant-flag) |
+| P3.8 | Subkernel extraction completion | Medium | All monolithic stage bodies in `shaders/kernels/` + Tier-1 oracles; `qgemm.metal` scalar-only or retired |
+
+**P3 exit:** ship-quality chat @ 30L on 24 GiB; orchestration drift class prevented by schedule asserts; §6 invariants enforced in debug builds.
+
+#### P3.6 Declarative step dispatch schedule
+
+**Problem:** `step_kernel.rs` (~4k lines) encodes the denoise-step schedule imperatively (~20 `encode_*` methods, ~216 hand bind/dispatch calls, ~91 arena-offset references). The intended schedule also exists as a *comment* in `shaders/monolithic/diffgemma_step.metal`. Two representations of one program → probe/production forks (`encode_layer_moe_grouped` vs `encode_layer_moe_grouped_act_probe`), silent arena aliasing, and ICB that only replays a host-recorded imperative trace instead of a canonical schedule.
+
+**Not in scope:** moving orchestration into Metal shaders — pipeline construction and buffer binding are host-only; ICB is replay of host-encoded commands, not shader-side control flow.
+
+**Target architecture:**
+
+```rust
+/// One logical stage in a denoise step (layer-local or global).
+enum StepStage {
+    Memzero { buf: BufferSlot, bytes: u64 },
+    RmsNormRows { in: Arena, out: Arena, weight: TensorRef, eps: f32 },
+    GemmBlock { x: Arena, out: Arena, w: TensorRef, m: u32, n: u32, k: u32 },
+    GemmLinearGrouped { a: BufferSlot, c: BufferSlot, jobs: RouteJobs, k: u32, n: u32 },
+    QkRopeKv { /* layer, head layout from ModelLayout */ },
+    Attention { layer: u32, mask: AttnMaskKind },
+    ResidualHalf { a: Arena, b: Arena },
+    Router { layer: u32 },
+    MoeRouterBucket { phase: u32 },
+    GatherRows { src: BufferSlot, indices: RouteField, dst: BufferSlot, hidden: u32 },
+    SwigluMoeGateUp { gu: BufferSlot, act: BufferSlot, moe_ff: u32 },
+    MoeScatterWeighted { expert_out: BufferSlot, moe_out: BufferSlot },
+    MoeGrouped { format: QuantFormat, probe: Option<DumpTarget> },  // one stage, not 6 encode methods
+    ScSoftembed { /* step>0 only */ },
+    LmHeadSoftcapSampler { finish: FinishMode },
+    // ...
+}
+
+struct StepSchedule {
+    preamble: Vec<StepStage>,
+    per_layer: Vec<StepStage>,   // repeated `layers` times with layer index injected
+    finish: Vec<StepStage>,
+}
+
+fn build_step_schedule(layout: &ModelLayout, profile: StepBlockProfile) -> StepSchedule;
+```
+
+**Single interpreter** (`StepInterpreter` or extend `StepEnc`):
+
+1. Walk `Vec<StepStage>`; for each stage resolve buffer handles from `StepBuffers` + arena table.
+2. Select pipeline from manifest variant tuple (`KernelVariant` + per-kernel FC axes — same vocabulary as Tier-1 subkernels).
+3. Bind, dispatch, record to ICB when `record: bool`.
+4. **Liveness check (debug):** each stage declares read/write arena ranges; interpreter asserts no read of a range that is not yet written in the current step, and no concurrent live aliases (catches `A_DENSE` reuse class *before* GPU run).
+5. **Dump/probe mode:** `Stage::MoeGrouped { probe: Some(A_MOEOUT) }` uses the *same* stage list with `KernelVariant { dump_stage: N }` — no parallel `encode_*_probe` methods (STRATEGY.md §4: dump is a mode, not a fork).
+
+**ICB on-ramp:** interpreter with `record=true` populates `IcbRecorder` + `StepReplayOp` list; replay path is `interpret(schedule, record=false, replay=Some(plan))`. Unblocks P2.2 for prefilled KV (`kv_len>0`) because the schedule is data, not hard-coded `kv_len==0` gate.
+
+**Migration plan (incremental, post-P1.6):**
+
+| Phase | Work | Risk |
+|-------|------|------|
+| P3.6a | Inventory: map each `encode_*` → proposed `StepStage`; generate schedule print/diff tool | Read-only |
+| P3.6b | Dual-run: interpreter drives one layer while imperative path remains default; compare buffer checksums | Medium |
+| P3.6c | Replace layer loop with interpreter; delete redundant `encode_*` | High — do one layer type at a time |
+| P3.6d | Fold probe/capture/single-expert forks into stage flags; delete duplicate encode methods | Medium |
+| P3.6e | Wire ICB record/replay through interpreter; lift `kv_len==0` restriction | Medium |
+
+**Exit criteria:**
+
+- `build_step_schedule()` is the sole schedule source; metal-file dispatch comment deleted or generated.
+- Unit tests on schedule data: arena liveness, no probe/production stage-list divergence.
+- `icb_replay_matches_live_tier2` passes via interpreter record path.
+- Engine vs monolithic schedule diff is a data diff (optional cross-check), not manual audit.
+
+**Explicit non-goals for P3.6:** changing kernel math; merging engine and monolithic into one binary schedule (they may differ in buffer ABI — diff tool only).
 
 ---
+
+#### P3.7 GPU debug status / invariant flag
+
+**Problem:** GPU kernels cannot return errors. Precondition violations (index OOB, impossible softmax norm, bad route token) produce finite garbage discovered layers later (cosine hunts). STRATEGY.md §6 lists invariants that should fire *inside* kernels but currently have no reporting channel.
+
+**Target:** debug-gated `DebugStatus` buffer + shared error codes (manifest-owned), complementary to Tier-1 CPU oracles (oracles catch wrong-but-plausible math; flag catches impossible values).
+
+**Metal layout** (`shaders/include/debug_status.metal`, included only when needed):
+
+```metal
+struct DebugStatus {
+    atomic_uint code;       // 0 = ok; else shared ErrorCode enum
+    atomic_uint kernel_id;  // manifest kernel index or hash
+    atomic_uint threadgroup; // tg.x | (tg.y << 16)
+    atomic_uint value;      // offending index / raw bits / count
+};
+
+/// First writer wins — later errors must not clobber root cause.
+inline void debug_set_error(device DebugStatus *st, uint code, uint kernel_id,
+                            uint tg, uint value) {
+    if (!K_SHAPE_ASSERT) return;
+    uint expected = 0u;
+    atomic_compare_exchange_weak_explicit(&st->code, &expected, code,
+        memory_order_relaxed, memory_order_relaxed);
+    if (expected == 0u) {
+        atomic_store_explicit(&st->kernel_id, kernel_id, memory_order_relaxed);
+        atomic_store_explicit(&st->threadgroup, tg, memory_order_relaxed);
+        atomic_store_explicit(&st->value, value, memory_order_relaxed);
+    }
+}
+```
+
+**Error code enum** (shared Rust + Metal via `build/manifest.toml` `[debug_errors]` or kernel manifest extension):
+
+| Code | Meaning | Example kernel |
+|------|---------|----------------|
+| 1 | Index OOB | `gather_rows`, `moe_grouped` |
+| 2 | Route token out of range | `moe_scatter_weighted` |
+| 3 | Softmax normalizer zero | `softmax_rows` |
+| 4 | Non-finite output | any stage output |
+| 5 | Entropy > ln(N) | `sample_rowstats` |
+| 6 | Quant format unsupported | block GEMM stages |
+| 7 | Arena offset OOB (tier-2) | interpreter-only on host; optional GPU bounds |
+
+**Rust wiring:**
+
+- `StepBuffers.debug_status: Option<MTLBuffer>` — 16 bytes, zeroed at step start in debug builds only.
+- `KernelVariant { shape_assert: true }` pipelines compile in `debug_set_error` calls; production `PRODUCTION` variant compiles them out (**zero atomics on hot path**).
+- After debug step: read back; if `code != 0`, panic with decoded `{code, kernel, tg, value}` (same ergonomics as Rust assert).
+- Tier-2 tests: inject bad route fixture → expect panic code 2, not cos 0.02.
+
+**Relationship to existing FC axes:**
+
+- `K_SHAPE_ASSERT` (FC1) gates both bounds checks and error-flag writes — already compile-out in production pipelines.
+- `K_DUMP_STAGE` (FC2) remains separate (diagnostic capture); error flag is not a dump substitute.
+
+**Exit criteria:**
+
+- Manifest lists error codes; Rust decoder unit-tested.
+- At least three hot kernels wired (router/scatter, grouped GEMM bounds, softmax).
+- Debug `step-probe` / `step-smoke` with `KernelVariant::TEST_ASSERT` panics on injected bad fixture.
+- Production `bench-step-kernel` / `generate-monolithic` show no measurable regression (flag path compiled out).
+
+**Explicit non-goals:** replacing Tier-1 cosine oracles; catching wrong GEMM math that stays finite (e.g. the historical `col=gid.x` grouped GEMM bug).
+
+---
+
 
 ## Execution order
 

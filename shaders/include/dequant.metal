@@ -114,4 +114,18 @@ inline void dequant_nvfp4_tile(device const uchar *row, uint K, uint k0,
     dequant_nvfp4_group(row, K, k0 / 16u + 1u, out32 + 16, gscale);
 }
 
+/// Column decode for one NVFP4 matrix row (`matrix` includes 4-byte global scale header).
+inline float nvfp4_at_col(device const uchar *matrix, uint row, uint col, uint K) {
+    float gscale = as_type<float>(*(device const uint *)(matrix));
+    device const uchar *body = matrix + 4u;
+    ulong row_stride = nvfp4_row_bytes(K);
+    device const uchar *row_base = body + ulong(row) * row_stride;
+    uint data_len = (K + 1u) / 2u;
+    uint g = col / 16u;
+    float scale = fp8_e4m3_to_f32(row_base[data_len + g]) * gscale;
+    uchar byte = row_base[col / 2u];
+    uint q = (col & 1u) ? uint(byte >> 4) : uint(byte & 0x0fu);
+    return e2m1_to_f32(q) * scale;
+}
+
 #endif

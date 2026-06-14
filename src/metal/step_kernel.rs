@@ -498,8 +498,16 @@ impl StepPipelines {
                 crate::kernels::sub::rms_norm_rows_tiled::TiledVariant::F32_IN,
                 prod,
             )?,
-            dequant_q4: ctx.compile_kernel(QGEMM_SHADER, "dequant_q4_matrix")?,
-            dequant_nvfp4: ctx.compile_kernel(QGEMM_SHADER, "dequant_nvfp4_matrix")?,
+            dequant_q4: crate::kernels::sub::dequant_block_matrix::pipeline_for(
+                ctx,
+                crate::kernels::sub::QuantFormat::Q4Affine,
+                prod,
+            )?,
+            dequant_nvfp4: crate::kernels::sub::dequant_block_matrix::pipeline_for(
+                ctx,
+                crate::kernels::sub::QuantFormat::NvFp4,
+                prod,
+            )?,
             half_to_f32: crate::kernels::sub::half_to_f32::pipeline_for(ctx, prod)?,
             f32_to_half: crate::kernels::sub::f32_to_half::pipeline_for(ctx, prod)?,
             gemm_q4,

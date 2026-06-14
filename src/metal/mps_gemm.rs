@@ -1,5 +1,7 @@
 //! MPSMatrixMultiplication wrapper for dense f32 linear layers (Q2.5).
 
+use crate::kernels::sub::variant::KernelVariant;
+use crate::kernels::sub::QuantFormat;
 use crate::metal::device::ComputePipeline;
 use crate::metal::dgq_gpu::Q4LinearGpu;
 use crate::safetensors::Error;
@@ -97,64 +99,52 @@ fn matrix_view(
     (desc, mat)
 }
 
-pub fn dispatch_dequant_q4_matrix(
+pub fn dispatch_dequant_block_matrix(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     pipeline: &ComputePipeline,
     q4: &Q4LinearGpu,
     buf_out: &ProtocolObject<dyn MTLBuffer>,
 ) {
-    const THREADGROUP: usize = 16;
     let (buf_w, off) = q4.weight_buffer();
     encoder.setComputePipelineState(&pipeline.pipeline);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(buf_w), off as usize, 0);
         encoder.setBuffer_offset_atIndex(Some(buf_out), 0, 1);
     }
+    let groups_per_row = if q4.is_nvfp4() {
+        0u32
+    } else {
+        q4.groups_per_row()
+    };
     let dims = [
         q4.out_dim as u32,
         q4.in_dim as u32,
-        q4.groups_per_row(),
+        groups_per_row,
     ];
     crate::metal::batch::set_bytes(encoder, &dims, 2);
-    let tg = objc2_metal::MTLSize {
-        width: THREADGROUP,
-        height: THREADGROUP,
-        depth: 1,
-    };
-    let grid = objc2_metal::MTLSize {
-        width: (q4.in_dim + THREADGROUP - 1) / THREADGROUP,
-        height: (q4.out_dim + THREADGROUP - 1) / THREADGROUP,
-        depth: 1,
-    };
+    let (grid, tg) =
+        crate::kernels::sub::dequant_block_matrix::dispatch_shape(q4.out_dim, q4.in_dim);
     encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
 }
 
+/// Q4 block matrix dequant (legacy name).
+pub fn dispatch_dequant_q4_matrix(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    pipeline: &ComputePipeline,
+    q4: &Q4LinearGpu,
+    buf_out: &ProtocolObject<dyn MTLBuffer>,
+) {
+    dispatch_dequant_block_matrix(encoder, pipeline, q4, buf_out);
+}
+
+/// NVFP4 block matrix dequant (legacy name).
 pub fn dispatch_dequant_nvfp4_matrix(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     pipeline: &ComputePipeline,
     block: &Q4LinearGpu,
     buf_out: &ProtocolObject<dyn MTLBuffer>,
 ) {
-    const THREADGROUP: usize = 16;
-    let (buf_w, off) = block.weight_buffer();
-    encoder.setComputePipelineState(&pipeline.pipeline);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(buf_w), off as usize, 0);
-        encoder.setBuffer_offset_atIndex(Some(buf_out), 0, 1);
-    }
-    let dims = [block.out_dim as u32, block.in_dim as u32];
-    crate::metal::batch::set_bytes(encoder, &dims, 2);
-    let tg = objc2_metal::MTLSize {
-        width: THREADGROUP,
-        height: THREADGROUP,
-        depth: 1,
-    };
-    let grid = objc2_metal::MTLSize {
-        width: (block.in_dim + THREADGROUP - 1) / THREADGROUP,
-        height: (block.out_dim + THREADGROUP - 1) / THREADGROUP,
-        depth: 1,
-    };
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    dispatch_dequant_block_matrix(encoder, pipeline, block, buf_out);
 }
 
 /// Q4 weight dequant → f32 scratch → MPS linear. Requires compute encoder pause/resume on batch.
@@ -174,11 +164,7 @@ pub fn q4_dequant_mps_linear(
     let buf_w = batch.alloc_f32_out(n * k)?;
     {
         let enc = batch.encoder();
-        if q4.is_nvfp4() {
-            dispatch_dequant_nvfp4_matrix(enc, dequant_pipeline, q4, &buf_w);
-        } else {
-            dispatch_dequant_q4_matrix(enc, dequant_pipeline, q4, &buf_w);
-        }
+        dispatch_dequant_block_matrix(enc, dequant_pipeline, q4, &buf_w);
     }
     let buf_c = batch.alloc_f32_out(m * n)?;
     batch.pause_compute_for_mps(|cmd| {
@@ -217,18 +203,18 @@ mod tests {
             .tensor_f32("model.decoder.layers.0.self_attn.q_proj.weight")
             .expect("dequant");
 
-        let pipeline = ctx
-            .compile_kernel(
-                include_str!("../../shaders/qgemm.metal"),
-                "dequant_q4_matrix",
-            )
-            .expect("pipeline");
+        let pipeline = crate::kernels::sub::dequant_block_matrix::pipeline_for(
+            &ctx,
+            QuantFormat::Q4Affine,
+            KernelVariant::PRODUCTION,
+        )
+        .expect("pipeline");
         let mut pool = BufferPool::new();
         let mut batch = GpuBatch::begin(&ctx.queue, &mut pool, &ctx.device).expect("batch");
         let buf_out = batch.alloc_f32_out(q4.out_dim * q4.in_dim).expect("out");
         {
             let enc = batch.encoder();
-            dispatch_dequant_q4_matrix(enc, &pipeline, &q4, &buf_out);
+            dispatch_dequant_block_matrix(enc, &pipeline, &q4, &buf_out);
         }
         let mut gpu_w = vec![0.0f32; q4.out_dim * q4.in_dim];
         batch.register_read(buf_out, &mut gpu_w);

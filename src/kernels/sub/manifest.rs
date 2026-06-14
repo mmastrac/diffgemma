@@ -211,6 +211,12 @@ pub static MANIFEST: Manifest = Manifest {
             variants: KernelVariants::Elementwise,
         },
         KernelSpec {
+            name: "dequant_block_matrix",
+            entry: "dequant_block_matrix",
+            quant_formats: &[QuantFormat::Q4Affine, QuantFormat::NvFp4],
+            variants: KernelVariants::Elementwise,
+        },
+        KernelSpec {
             name: "gemm_linear_grouped",
             entry: "gemm_linear_grouped",
             quant_formats: &[QuantFormat::Q4Affine, QuantFormat::NvFp4],

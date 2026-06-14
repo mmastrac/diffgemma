@@ -53,24 +53,6 @@ kernel void f32_q4_linear(
     c[row * n + col] = sum;
 }
 
-/// Dequant full Q4 `[N,K]` matrix to f32 row-major (MPS scratch path).
-kernel void dequant_q4_matrix(
-    device const uchar *q4 [[buffer(0)]],
-    device float *out [[buffer(1)]],
-    constant uint3 &dims [[buffer(2)]],
-    uint2 gid [[thread_position_in_grid]]
-) {
-    uint n = dims.x;
-    uint k_dim = dims.y;
-    uint groups_per_row = dims.z;
-    uint row_stride = groups_per_row * 20u;
-    uint row = gid.y;
-    uint col = gid.x;
-    if (row >= n || col >= k_dim) {
-        return;
-    }
-    out[row * k_dim + col] = q4_weight_at(q4, row, col, k_dim, groups_per_row, row_stride);
-}
 inline float q8_weight_at(
     device const uchar *base,
     uint row,
@@ -225,20 +207,4 @@ kernel void f32_nvfp4_linear(
         sum += av * wv;
     }
     c[row * n + col] = sum;
-}
-
-kernel void dequant_nvfp4_matrix(
-    device const uchar *nvfp4 [[buffer(0)]],
-    device float *out [[buffer(1)]],
-    constant uint2 &dims [[buffer(2)]],
-    uint2 gid [[thread_position_in_grid]]
-) {
-    uint n = dims.x;
-    uint k_dim = dims.y;
-    uint row = gid.y;
-    uint col = gid.x;
-    if (row >= n || col >= k_dim) {
-        return;
-    }
-    out[row * k_dim + col] = nvfp4_weight_at(nvfp4, row, col, k_dim);
 }

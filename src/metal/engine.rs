@@ -20,8 +20,6 @@ const F32_Q4_LINEAR_ENTRY: &str = "f32_q4_linear";
 const F32_Q8_LINEAR_ENTRY: &str = "f32_q8_linear";
 const F32_Q8_LINEAR_KXN_ENTRY: &str = "f32_q8_linear_kxn";
 const F32_NVFP4_LINEAR_ENTRY: &str = "f32_nvfp4_linear";
-const DEQUANT_Q4_MATRIX_ENTRY: &str = "dequant_q4_matrix";
-const DEQUANT_NVFP4_MATRIX_ENTRY: &str = "dequant_nvfp4_matrix";
 
 pub struct GpuDecoderEngine {
     pub ctx: MetalContext,
@@ -66,9 +64,17 @@ impl GpuDecoderEngine {
         let f32_q8_linear_kxn_pipeline =
             ctx.compile_kernel(QGEMM_SHADER, F32_Q8_LINEAR_KXN_ENTRY)?;
         let dequant_q4_matrix_pipeline =
-            ctx.compile_kernel(QGEMM_SHADER, DEQUANT_Q4_MATRIX_ENTRY)?;
+            crate::kernels::sub::dequant_block_matrix::pipeline_for(
+                &ctx,
+                crate::kernels::sub::QuantFormat::Q4Affine,
+                crate::kernels::sub::variant::KernelVariant::PRODUCTION,
+            )?;
         let dequant_nvfp4_matrix_pipeline =
-            ctx.compile_kernel(QGEMM_SHADER, DEQUANT_NVFP4_MATRIX_ENTRY)?;
+            crate::kernels::sub::dequant_block_matrix::pipeline_for(
+                &ctx,
+                crate::kernels::sub::QuantFormat::NvFp4,
+                crate::kernels::sub::variant::KernelVariant::PRODUCTION,
+            )?;
         let mps_matmul = MpsMatmulCache::new(ctx.device.clone());
         let use_mps_q4 = Cell::new(mps_q4_default_from_env());
         let kernels = GpuKernels::new(&ctx)?;
