@@ -4,8 +4,8 @@ using namespace metal;
 #ifndef DGQ_KERNEL_COMMON_METAL
 #include "common.metal"
 #endif
-#ifndef DGQ_KERNEL_BF16_METAL
-#include "bf16.metal"
+#ifndef DGQ_INCLUDE_COMMON_METAL
+#error "residual_half: bundle must include shaders/include/common.metal"
 #endif
 
 kernel void residual_half(

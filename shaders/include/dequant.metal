@@ -5,7 +5,7 @@
 using namespace metal;
 
 #ifndef DGQ_INCLUDE_COMMON_METAL
-#include "common.metal"
+#error "shader bundle must prepend shaders/include/common.metal before dequant.metal"
 #endif
 
 // ---- Q4 affine (32-wide groups) ----

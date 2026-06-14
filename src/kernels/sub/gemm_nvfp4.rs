@@ -11,6 +11,7 @@ pub const ENTRY: &str = "gemm_nvfp4";
 
 const SHADER: &str = concat!(
     include_str!("../../../shaders/kernels/gemm_common.metal"),
+    include_str!("../../../shaders/include/common.metal"),
     include_str!("../../../shaders/include/dequant.metal"),
     include_str!("../../../shaders/kernels/gemm_nvfp4.metal"),
 );

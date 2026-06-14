@@ -4,8 +4,8 @@ using namespace metal;
 #ifndef DGQ_KERNEL_COMMON_METAL
 #include "common.metal"
 #endif
-#ifndef DGQ_KERNEL_BF16_METAL
-#include "bf16.metal"
+#ifndef DGQ_INCLUDE_COMMON_METAL
+#error "rms_norm_rows_tiled: bundle must include shaders/include/common.metal"
 #endif
 
 constant uint K_IN_DTYPE [[function_constant(4)]];
