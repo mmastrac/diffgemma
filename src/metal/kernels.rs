@@ -44,31 +44,27 @@ impl GpuKernels {
             "vec_mul_inplace",
             "vec_scale_inplace",
             "router_scale_rows",
-            "gelu_pytorch_tanh",
-            "swiglu_mul",
         ];
         let pipelines = ctx.compile_kernels(DECODER_SHADER, &names)?;
-        let rms_norm = crate::kernels::sub::rms_norm_rows::pipeline_for(
-            ctx,
-            crate::kernels::sub::variant::KernelVariant::PRODUCTION,
-        )?;
-        let rms_norm_no_scale = crate::kernels::sub::rms_norm_rows_no_scale::pipeline_for(
-            ctx,
-            crate::kernels::sub::variant::KernelVariant::PRODUCTION,
-        )?;
-        let softmax_rows = crate::kernels::sub::softmax_rows::pipeline_for(
-            ctx,
-            crate::kernels::sub::variant::KernelVariant::PRODUCTION,
-        )?;
+        let prod = crate::kernels::sub::variant::KernelVariant::PRODUCTION;
+        let rms_norm = crate::kernels::sub::rms_norm_rows::pipeline_for(ctx, prod)?;
+        let rms_norm_no_scale =
+            crate::kernels::sub::rms_norm_rows_no_scale::pipeline_for(ctx, prod)?;
+        let softmax_rows = crate::kernels::sub::softmax_rows::pipeline_for(ctx, prod)?;
+        let gelu = crate::kernels::sub::gelu_pytorch_tanh::pipeline_for(ctx, prod)?;
+        let swiglu_mul = crate::kernels::sub::swiglu_mul::pipeline_for(ctx, prod)?;
+        let gelu_swiglu_gate_up =
+            crate::kernels::sub::gelu_swiglu_gate_up::pipeline_for(ctx, prod)?;
+        let router_top_k = crate::kernels::sub::router_top_k_rows::pipeline_for(ctx, prod)?;
         let mut it = pipelines.into_iter().rev();
         Ok(Self {
             vec_fill_zero: ctx.compile_kernel(DECODER_SHADER, "vec_fill_zero")?,
             gather_prob_cols: ctx.compile_kernel(DECODER_SHADER, "gather_prob_cols")?,
+            router_top_k,
+            gelu_swiglu_gate_up,
+            swiglu_mul,
+            gelu,
             softmax_rows,
-            router_top_k: ctx.compile_kernel(DECODER_SHADER, "router_top_k_rows")?,
-            gelu_swiglu_gate_up: ctx.compile_kernel(DECODER_SHADER, "gelu_swiglu_gate_up")?,
-            swiglu_mul: it.next().ok_or(Error::Format("pipeline missing"))?,
-            gelu: it.next().ok_or(Error::Format("pipeline missing"))?,
             router_scale: it.next().ok_or(Error::Format("pipeline missing"))?,
             vec_scale: it.next().ok_or(Error::Format("pipeline missing"))?,
             vec_mul: it.next().ok_or(Error::Format("pipeline missing"))?,
@@ -317,14 +313,15 @@ impl GpuKernels {
             .ok_or(Error::Format("Metal buffer alloc failed"))?;
         BufferPool::write_f32(&buf, x);
         let len = x.len() as u32;
+        let buf_dump = dummy_dump_buf(pool, device)?;
         run_1d(queue, &self.gelu.pipeline, x.len(), |enc| {
-            unsafe {
-                enc.setBuffer_offset_atIndex(Some(&buf), 0, 0);
-            }
-            set_bytes(enc, &len, 1);
+            crate::kernels::sub::gelu_pytorch_tanh::bind_gpu_in_place(
+                &enc, &buf, &buf_dump, len,
+            );
         })?;
         BufferPool::read_f32(&buf, x);
         pool.release(bytes, buf);
+        pool.release(4, buf_dump);
         Ok(())
     }
 
@@ -349,16 +346,17 @@ impl GpuKernels {
         BufferPool::write_f32(&buf_g, gate);
         BufferPool::write_f32(&buf_u, up);
         let len = gate.len() as u32;
+        let buf_dump = dummy_dump_buf(pool, device)?;
         run_1d(queue, &self.swiglu_mul.pipeline, gate.len(), |enc| {
-            unsafe {
-                enc.setBuffer_offset_atIndex(Some(&buf_g), 0, 0);
-                enc.setBuffer_offset_atIndex(Some(&buf_u), 0, 1);
-            }
-            set_bytes(enc, &len, 2);
+            crate::kernels::sub::swiglu_mul::bind_gpu_buffers(
+                &enc, &buf_g, &buf_u, &buf_dump, len,
+            );
         })?;
+
         BufferPool::read_f32(&buf_g, gate);
         pool.release(bytes, buf_g);
         pool.release(bytes, buf_u);
+        pool.release(4, buf_dump);
         Ok(())
     }
 }

@@ -105,14 +105,17 @@ pub fn route_gpu_in_batch(
     let buf_idx = batch.alloc_u32_out(seq_len * top_k)?;
     let buf_wt = batch.alloc_f32_out(seq_len * top_k)?;
     let params = [seq_len as u32, experts as u32, top_k as u32];
+    let buf_dump = batch.alloc_f32_out(1)?;
     batch.dispatch_1d(&kernels.router_top_k.pipeline, seq_len, |enc| {
-        unsafe {
-            enc.setBuffer_offset_atIndex(Some(&buf_logits), 0, 0);
-            enc.setBuffer_offset_atIndex(Some(&buf_scale), 0, 1);
-            enc.setBuffer_offset_atIndex(Some(&buf_idx), 0, 2);
-            enc.setBuffer_offset_atIndex(Some(&buf_wt), 0, 3);
-        }
-        set_bytes(enc, &params, 4);
+        crate::kernels::sub::router_top_k_rows::bind_gpu_buffers(
+            &enc,
+            &buf_logits,
+            &buf_scale,
+            &buf_idx,
+            &buf_wt,
+            &buf_dump,
+            &params,
+        );
     });
 
     batch.register_read_u32(buf_idx, &mut route_scratch.indices);

@@ -1,7 +1,7 @@
 //! Elementwise kernels encoded into a shared `GpuBatch`.
 
 use crate::fast_slice::FastSlice;
-use crate::kernels::sub::{rms_norm_rows, rms_norm_rows_no_scale, softmax_rows};
+use crate::kernels::sub::{gelu_pytorch_tanh, rms_norm_rows, rms_norm_rows_no_scale, softmax_rows, swiglu_mul};
 use crate::metal::batch::{set_bytes, GpuBatch};
 use crate::metal::kernels::GpuKernels;
 use crate::safetensors::Error;
@@ -112,11 +112,9 @@ pub fn gelu_pytorch_tanh_gpu_buf(
     len: usize,
 ) -> Result<(), Error> {
     let len_u = len as u32;
+    let buf_dump = batch.alloc_f32_out(1)?;
     batch.dispatch_1d(&kernels.gelu.pipeline, len, |enc| {
-        unsafe {
-            enc.setBuffer_offset_atIndex(Some(buf), 0, 0);
-        }
-        set_bytes(enc, &len_u, 1);
+        gelu_pytorch_tanh::bind_gpu_in_place(&enc, buf, &buf_dump, len_u);
     });
     Ok(())
 }
@@ -129,12 +127,9 @@ pub fn swiglu_mul_gpu_bufs(
     len: usize,
 ) -> Result<(), Error> {
     let len_u = len as u32;
+    let buf_dump = batch.alloc_f32_out(1)?;
     batch.dispatch_1d(&kernels.swiglu_mul.pipeline, len, |enc| {
-        unsafe {
-            enc.setBuffer_offset_atIndex(Some(gate_buf), 0, 0);
-            enc.setBuffer_offset_atIndex(Some(up_buf), 0, 1);
-        }
-        set_bytes(enc, &len_u, 2);
+        swiglu_mul::bind_gpu_buffers(&enc, gate_buf, up_buf, &buf_dump, len_u);
     });
     Ok(())
 }
@@ -151,13 +146,12 @@ pub fn gelu_swiglu_gate_up_gpu(
         return Err(Error::Format("gelu_swiglu_gate_up shape mismatch"));
     }
     let buf_o = batch.alloc_f32_out(out_len)?;
+    let buf_dump = batch.alloc_f32_out(1)?;
     let dims = [batch_size as u32, moe_inter as u32];
     batch.dispatch_1d(&kernels.gelu_swiglu_gate_up.pipeline, out_len, |enc| {
-        unsafe {
-            enc.setBuffer_offset_atIndex(Some(gate_up_buf), 0, 0);
-            enc.setBuffer_offset_atIndex(Some(&buf_o), 0, 1);
-        }
-        set_bytes(enc, &dims, 2);
+        crate::kernels::sub::gelu_swiglu_gate_up::bind_gpu_buffers(
+            &enc, gate_up_buf, &buf_o, &buf_dump, &dims,
+        );
     });
     Ok(buf_o)
 }
