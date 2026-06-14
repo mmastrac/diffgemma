@@ -34,6 +34,8 @@ pub enum KernelVariants {
     Gelu,
     GemmQ4,
     GemmNvfp4,
+    GemmQ8,
+    GemmQ8Rowk,
     Elementwise,
 }
 
@@ -124,6 +126,18 @@ pub static MANIFEST: Manifest = Manifest {
             entry: "gemm_nvfp4",
             quant_formats: &[QuantFormat::NvFp4],
             variants: KernelVariants::GemmNvfp4,
+        },
+        KernelSpec {
+            name: "gemm_q8",
+            entry: "gemm_q8",
+            quant_formats: &[QuantFormat::Q8],
+            variants: KernelVariants::GemmQ8,
+        },
+        KernelSpec {
+            name: "gemm_q8_rowk",
+            entry: "gemm_q8_rowk",
+            quant_formats: &[QuantFormat::Q8],
+            variants: KernelVariants::GemmQ8Rowk,
         },
     ],
 };
@@ -320,6 +334,8 @@ mod tests {
                 KernelVariants::Gelu => {}
                 KernelVariants::GemmQ4 => {}
                 KernelVariants::GemmNvfp4 => {}
+                KernelVariants::GemmQ8 => {}
+                KernelVariants::GemmQ8Rowk => {}
                 KernelVariants::Elementwise => {}
             }
         }

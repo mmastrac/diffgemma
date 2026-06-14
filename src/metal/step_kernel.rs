@@ -448,13 +448,13 @@ impl StepPipelines {
         ] {
             gemm_q8.insert(
                 (n, k),
-                ctx.compile_gemm_kernel(library, "k_gemm_q8", n, k)?,
+                crate::kernels::sub::gemm_q8::pipeline_for(ctx, n, k)?,
             );
         }
         for &(n, k) in &[(HID as u32, VOCAB as u32)] {
             gemm_q8_rowk.insert(
                 (n, k),
-                ctx.compile_gemm_kernel(library, "k_gemm_q8_rowk", n, k)?,
+                crate::kernels::sub::gemm_q8_rowk::pipeline_for(ctx, n, k)?,
             );
         }
         let prod = crate::kernels::sub::variant::KernelVariant::PRODUCTION;

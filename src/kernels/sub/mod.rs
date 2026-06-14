@@ -9,6 +9,8 @@ pub mod gelu;
 pub mod gemm_common;
 pub mod gemm_nvfp4;
 pub mod gemm_q4;
+pub mod gemm_q8;
+pub mod gemm_q8_rowk;
 pub mod gpu_common;
 pub mod half_scale;
 pub mod half_to_f32;

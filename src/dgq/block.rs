@@ -205,6 +205,47 @@ pub fn dequant_matrix_q8(src: &[u8], out_dim: usize, in_dim: usize, dst: &mut [f
     }
 }
 
+#[inline]
+pub(crate) fn q8_weight_at(src: &[u8], row: usize, col: usize, in_dim: usize) -> f32 {
+    let row_bytes = q8_row_bytes(in_dim);
+    let row_off = row * row_bytes;
+    let scale = bf16_to_f32(u16::from_le_bytes([src[row_off], src[row_off + 1]]));
+    let q = src[row_off + 2 + col] as i8 as f32;
+    q * scale
+}
+
+/// CPU Q8 GEMM: `y[M,N] = x[M,K] @ W[N,K]^T` (matches `gemm_q8`).
+pub fn q8_gemm_cpu(a: &[f32], m: usize, k: usize, w_q8: &[u8], n: usize, out: &mut [f32]) {
+    assert_eq!(a.len(), m * k);
+    assert_eq!(out.len(), m * n);
+    assert_eq!(w_q8.len(), q8_matrix_bytes(n, k));
+    for row in 0..m {
+        for col in 0..n {
+            let mut sum = 0.0f32;
+            for p in 0..k {
+                sum += a[row * k + p] * q8_weight_at(w_q8, col, p, k);
+            }
+            out[row * n + col] = sum;
+        }
+    }
+}
+
+/// CPU Q8 GEMM: `y[M,N] = x[M,K] @ W[K,N]` with K-indexed rows (matches `gemm_q8_rowk`).
+pub fn q8_gemm_rowk_cpu(a: &[f32], m: usize, k: usize, w_q8: &[u8], n: usize, out: &mut [f32]) {
+    assert_eq!(a.len(), m * k);
+    assert_eq!(out.len(), m * n);
+    assert_eq!(w_q8.len(), k * q8_row_bytes(n));
+    for row in 0..m {
+        for col in 0..n {
+            let mut sum = 0.0f32;
+            for p in 0..k {
+                sum += a[row * k + p] * q8_weight_at(w_q8, p, col, n);
+            }
+            out[row * n + col] = sum;
+        }
+    }
+}
+
 pub fn quantize_expert_stack_q4(
     src: &[u8],
     experts: usize,

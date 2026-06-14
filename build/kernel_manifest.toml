@@ -110,3 +110,27 @@ quant_formats = [0]
 3 = "GEMM_K"
 
 [[kernel.variants]]
+
+[[kernel]]
+name = "gemm_q8"
+entry = "gemm_q8"
+quant_formats = [1]
+
+[kernel.fc]
+1 = "IS_FULL_LAYER"
+2 = "GEMM_N"
+3 = "GEMM_K"
+
+[[kernel.variants]]
+
+[[kernel]]
+name = "gemm_q8_rowk"
+entry = "gemm_q8_rowk"
+quant_formats = [1]
+
+[kernel.fc]
+1 = "IS_FULL_LAYER"
+2 = "GEMM_N"
+3 = "GEMM_K"
+
+[[kernel.variants]]
