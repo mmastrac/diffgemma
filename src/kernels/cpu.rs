@@ -53,6 +53,22 @@ pub fn rms_norm_rows(
     }
 }
 
+/// Per-row RMSNorm without learnable scale over `[seq_len, hidden]`.
+pub fn rms_norm_rows_no_scale(
+    out: &mut [f32],
+    x: &[f32],
+    seq_len: usize,
+    hidden: usize,
+    eps: f32,
+) {
+    assert_eq!(out.len(), seq_len * hidden);
+    assert_eq!(x.len(), seq_len * hidden);
+    for s in 0..seq_len {
+        let off = s * hidden;
+        rms_norm_no_scale(&mut out[off..off + hidden], &x[off..off + hidden], eps);
+    }
+}
+
 /// `y[seq, out] = x[seq, in] @ W[out, in]^T + b` (PyTorch linear weight layout).
 pub fn linear(
     y: &mut [f32],

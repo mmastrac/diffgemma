@@ -1,5 +1,6 @@
 //! Soft embeddings and related GPU embed ops (`.dgq` q8 table).
 
+use crate::kernels::sub::softmax_rows;
 use crate::metal::batched_kernels as bk;
 use crate::metal::batch::{begin_engine_batch, GpuBatch};
 use crate::metal::dgq_gpu::Q8LinearGpu;
@@ -150,22 +151,11 @@ pub fn softmax_rows_gpu_buf(
     seq_len: usize,
     cols: usize,
 ) {
+    let buf_dump = batch.alloc_f32_out(1).expect("dump buf");
     let dims = [seq_len as u32, cols as u32];
-    let tg = MTLSize {
-        width: 256,
-        height: 1,
-        depth: 1,
-    };
-    let grid = MTLSize {
-        width: 1,
-        height: seq_len,
-        depth: 1,
-    };
+    let (grid, tg) = softmax_rows::dispatch_shape(seq_len);
     batch.dispatch_with_grid(&kernels.softmax_rows.pipeline, grid, tg, |enc| {
-        unsafe {
-            enc.setBuffer_offset_atIndex(Some(buf), 0, 0);
-        }
-        crate::metal::batch::set_bytes(enc, &dims, 1);
+        softmax_rows::bind_gpu_in_place(&enc, buf, &buf_dump, &dims);
     });
 }
 
