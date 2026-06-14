@@ -1,6 +1,6 @@
 //! Phase M0 correctness gates for the monolithic step kernel (`PLAN_MONOLITHIC.md`).
 
-use crate::dgq::block::dequant_row_q4;
+use crate::dgq::block::{dequant_row_q4, q4_weight_at};
 use crate::dgq::layout::GROUP_SIZE;
 use crate::kernels::cpu::bf16_to_f32;
 use crate::metal::decoder::{forward as decoder_forward, load_weight_cache, GpuDecoderScratch};
@@ -84,7 +84,7 @@ fn check(id: &'static str, pass: bool, detail: impl Into<String>) -> M0Check {
 }
 
 /// CPU mirror of `dequant_q4_group` in `diffgemma_step.metal` (VERIFY-N).
-fn dequant_q4_group_cpu(g: &[u8; 20]) -> [f32; 32] {
+pub(crate) fn dequant_q4_group_cpu(g: &[u8; 20]) -> [f32; 32] {
     let s = bf16_to_f32(u16::from_le_bytes([g[0], g[1]]));
     let mn = bf16_to_f32(u16::from_le_bytes([g[2], g[3]]));
     let mut out = [0.0f32; 32];
@@ -92,6 +92,20 @@ fn dequant_q4_group_cpu(g: &[u8; 20]) -> [f32; 32] {
         let b = g[4 + i];
         out[2 * i] = s * (b & 0x0f) as f32 + mn;
         out[2 * i + 1] = s * (b >> 4) as f32 + mn;
+    }
+    out
+}
+
+/// K-order decode via col-indexed path (mirrors `q4_weight_at` in qgemm.metal).
+pub(crate) fn q4_weight_at_k_order_group(
+    row: &[u8],
+    base_k: usize,
+    in_dim: usize,
+) -> [f32; 32] {
+    let mut out = [0.0f32; GROUP_SIZE];
+    for m in 0..GROUP_SIZE {
+        let col = base_k + m;
+        out[m] = q4_weight_at(row, 0, col, in_dim);
     }
     out
 }
@@ -119,6 +133,40 @@ fn verify_q4_nibble_parity() -> M0Check {
         "M0.1 VERIFY-N",
         max_err <= 1e-6,
         format!("q4 nibble parity max_err={max_err:.2e} ({samples} samples)"),
+    )
+}
+
+/// VERIFY-K: sequential `dequant_q4_group` unpack vs col-indexed `q4_weight_at` in K order.
+fn verify_q4_k_order_positions() -> M0Check {
+    use crate::dgq::layout::q4_row_bytes;
+    let mut max_err = 0.0f32;
+    let mut samples = 0usize;
+    for in_dim in [64usize, 128, 2816] {
+        let row_bytes = q4_row_bytes(in_dim);
+        for seed in 0..10u64 {
+            let mut row = vec![0u8; row_bytes];
+            let mut st = seed.wrapping_add(in_dim as u64 * 17);
+            for b in row.iter_mut() {
+                st = st.wrapping_mul(6_966_169_279).wrapping_add(1_039_523_323);
+                *b = (st >> 32) as u8;
+            }
+            for base_k in (0..in_dim).step_by(GROUP_SIZE) {
+                let g_off = (base_k / GROUP_SIZE) * (4 + GROUP_SIZE / 2);
+                let group: &[u8; 20] = row[g_off..g_off + 20].try_into().expect("group");
+                let via_dequant = dequant_q4_group_cpu(group);
+                let via_col = q4_weight_at_k_order_group(&row, base_k, in_dim);
+                for m in 0..GROUP_SIZE {
+                    let err = (via_dequant[m] - via_col[m]).abs();
+                    max_err = max_err.max(err);
+                    samples += 1;
+                }
+            }
+        }
+    }
+    check(
+        "M0.1b VERIFY-K",
+        max_err <= 1e-6,
+        format!("dequant_q4_group vs q4_weight_at K-order max_err={max_err:.2e} ({samples} samples)"),
     )
 }
 
@@ -313,6 +361,7 @@ fn verify_sampler_golden(model_dir: &Path) -> Result<M0Check, Error> {
 pub fn run_step_verify(model_dir: Option<&Path>, probe_layers: usize) -> Result<M0VerifyResult, Error> {
     let mut checks = vec![
         verify_q4_nibble_parity(),
+        verify_q4_k_order_positions(),
         verify_embed_scale(),
         verify_softmax_rowstats(),
         verify_rng_init(),
@@ -473,6 +522,7 @@ mod tests {
     #[test]
     fn m0_unit_checks_pass() {
         assert!(verify_q4_nibble_parity().pass);
+        assert!(verify_q4_k_order_positions().pass);
         assert!(verify_embed_scale().pass);
         assert!(verify_softmax_rowstats().pass);
         assert!(verify_rng_init().pass);

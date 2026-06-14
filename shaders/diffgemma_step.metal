@@ -102,6 +102,7 @@ struct CanvasState {
 struct RouteScratch {
     half weight[256][8]; uint expert[256][8];
     uint count[128]; uint offset[128];
+    uint num_slots; uint _pad_route;
     uint token_list[2048]; uint slot_list[2048];
 };
 
@@ -113,6 +114,18 @@ inline float bf16_to_f32(ushort b) { return as_type<float>(uint(b) << 16); }
 inline float gelu_tanh(float x) {
     float t = clamp(0.7978845608028654f * (x + 0.044715f * x * x * x), -15.0f, 15.0f);
     return 0.5f * x * (1.0f + tanh(t));
+}
+// device atomic_float fetch_add is unreliable on MPS for moe_out scatter; CAS on uint bits.
+inline void atomic_add_f32(device atomic_uint* bits, float val) {
+    uint old = atomic_load_explicit(bits, memory_order_relaxed);
+    for (;;) {
+        float new_f = as_type<float>(old) + val;
+        uint new_bits = as_type<uint>(new_f);
+        if (atomic_compare_exchange_weak_explicit(
+                bits, &old, new_bits, memory_order_relaxed, memory_order_relaxed)) {
+            break;
+        }
+    }
 }
 // q4_block: [scale:2][min:2][nibbles:16], w = scale*q + min  (audit item 1)
 inline void dequant_q4_group(device const uchar* g, thread float* out32) {
@@ -669,7 +682,12 @@ kernel void k_bucket_fill(device RouteScratch* R [[buffer(0)]],
     } else if (phase == 1) {
         if (i == 0) {
             uint s = 0;
-            for (uint e = 0; e < N_EXPERTS; ++e) { R->offset[e] = s; s += R->count[e]; R->count[e] = 0; }
+            for (uint e = 0; e < N_EXPERTS; ++e) {
+                R->offset[e] = s;
+                s += R->count[e];
+                R->count[e] = 0;
+            }
+            R->num_slots = s;
         }
     } else {
         uint tok = i / TOP_K, kk = i % TOP_K, e = R->expert[tok][kk];
@@ -695,7 +713,7 @@ kernel void k_moe_grouped(device const half* moe_in [[buffer(0)]],
                           uint3 tpg [[threads_per_threadgroup]]) {
     const uint e = tgid.y;
     const uint ltid = lid.x, tpg_w = tpg.x;
-    const uint end = (e+1 < N_EXPERTS) ? R->offset[e+1] : CANVAS*TOP_K;
+    const uint end = (e+1 < N_EXPERTS) ? R->offset[e+1] : R->num_slots;
     const uint n_tok = end - R->offset[e];
     if (tgid.x >= n_tok) return;
     const uint slot = R->offset[e] + tgid.x;
@@ -729,9 +747,112 @@ kernel void k_moe_grouped(device const half* moe_in [[buffer(0)]],
             dequant_q4_group(drow + (k0/32)*20ul, wd);
             for (uint i = 0; i < 32; ++i) o += wd[i]*act[k0+i];
         }
-        atomic_fetch_add_explicit((device atomic_float*)&moe_out[(ulong)tok*HID + d],
-                                  w*o, memory_order_relaxed);
+        atomic_add_f32((device atomic_uint*)&moe_out[(ulong)tok*HID + d], w*o);
     }
+}
+
+// Debug variant: dump threadgroup act[704] after barrier (scratch[0..704]) and again at
+// down-loop entry from ltid==0,d==0 (scratch[704..1408]) for barrier/visibility bisection.
+kernel void k_moe_grouped_act_probe(device const half* moe_in [[buffer(0)]],
+                                    device float* moe_out [[buffer(1)]],
+                                    device const uchar* blob [[buffer(2)]],
+                                    device const LayerOffsets* L [[buffer(3)]],
+                                    device const RouteScratch* R [[buffer(4)]],
+                                    device float* act_scratch [[buffer(5)]],
+                                    uint3 tgid [[threadgroup_position_in_grid]],
+                                    uint3 lid [[thread_position_in_threadgroup]],
+                                    uint3 tpg [[threads_per_threadgroup]]) {
+    const uint e = tgid.y;
+    const uint ltid = lid.x, tpg_w = tpg.x;
+    const uint end = (e+1 < N_EXPERTS) ? R->offset[e+1] : R->num_slots;
+    const uint n_tok = end - R->offset[e];
+    if (tgid.x >= n_tok) return;
+    const uint slot = R->offset[e] + tgid.x;
+    const uint tok = R->token_list[slot];
+    const float w = float(R->weight[tok][R->slot_list[slot]]);
+    device const half* x = moe_in + (ulong)tok * HID;
+    if (ltid == 0) {
+        const uint meta = MOE_FF * 2u;
+        act_scratch[meta + 0] = float(tok);
+        act_scratch[meta + 1] = float(slot);
+        act_scratch[meta + 2] = float(e);
+        act_scratch[meta + 3] = w;
+        for (uint i = 0; i < 8u; ++i) act_scratch[meta + 4u + i] = float(x[i]);
+        for (uint i = 0; i < 8u; ++i) act_scratch[meta + 12u + i] = float(moe_in[i]);
+    }
+    const ulong gu = L->experts_gate_up + (ulong)e * 1408ul * q4_row_bytes(HID);
+    const ulong dn = L->experts_down    + (ulong)e * (ulong)HID * q4_row_bytes(MOE_FF);
+    threadgroup float act[MOE_FF];
+    for (uint r = ltid; r < MOE_FF; r += tpg_w) {
+        float g = 0.f, u = 0.f;
+        device const uchar* grow = blob + gu + (ulong)r * q4_row_bytes(HID);
+        device const uchar* urow = blob + gu + (ulong)(r + MOE_FF) * q4_row_bytes(HID);
+        for (uint k0 = 0; k0 < HID; k0 += 32) {
+            float wg[32], wu[32];
+            dequant_q4_group(grow + (k0/32)*20ul, wg);
+            dequant_q4_group(urow + (k0/32)*20ul, wu);
+            for (uint i = 0; i < 32; ++i) {
+                float xv = float(x[k0+i]);
+                g += wg[i]*xv; u += wu[i]*xv;
+            }
+        }
+        act[r] = gelu_tanh(g) * u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ltid == 0) {
+        for (uint r = 0; r < MOE_FF; ++r) act_scratch[r] = act[r];
+    }
+    for (uint d = ltid; d < HID; d += tpg_w) {
+        if (d == 0 && ltid == 0) {
+            for (uint r = 0; r < MOE_FF; ++r) act_scratch[MOE_FF + r] = act[r];
+        }
+        float o = 0.f;
+        device const uchar* drow = blob + dn + (ulong)d * q4_row_bytes(MOE_FF);
+        for (uint k0 = 0; k0 < MOE_FF; k0 += 32) {
+            float wd[32];
+            dequant_q4_group(drow + (k0/32)*20ul, wd);
+            for (uint i = 0; i < 32; ++i) o += wd[i]*act[k0+i];
+        }
+        if (ltid == 0 && d < 8u) {
+            const uint meta = MOE_FF * 2u;
+            act_scratch[meta + 20u + d] = w * o;
+        }
+        // Probe uses direct store (single writer per (tok,d)); production uses atomic_add_f32.
+        moe_out[(ulong)tok * HID + d] = w * o;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ltid == 0) {
+        const uint meta = MOE_FF * 2u;
+        for (uint i = 0; i < 8u; ++i) {
+            act_scratch[meta + 28u + i] = moe_out[(ulong)tok * HID + i];
+        }
+    }
+}
+
+// Debug: K-order decode of one 32-wide Q4 group — path A = dequant_q4_group (k_moe_grouped),
+// path B = col-indexed q4_weight_at-style decode (f32_q4_linear / qgemm).
+inline float q4_at_col(device const uchar* row_base, uint col, uint row_stride) {
+    uint g = col / 32u;
+    uint j = col % 32u;
+    device const uchar* blk = row_base + ulong(g) * 20ul;
+    float delta = bf16_bytes(blk);
+    float mn = bf16_bytes(blk + 2);
+    uchar byte = blk[4u + j / 2u];
+    float q = (j & 1u) ? float(byte >> 4) : float(byte & 0x0fu);
+    return delta * q + mn;
+}
+
+kernel void k_q4_group_k_order_probe(device const uchar* row_base [[buffer(0)]],
+                                     constant uint& k0 [[buffer(1)]],
+                                     constant uint& in_dim [[buffer(2)]],
+                                     device float* out [[buffer(3)]],
+                                     uint i [[thread_position_in_grid]]) {
+    if (i > 0) return;
+    device const uchar* grp = row_base + ulong(k0 / 32u) * 20ul;
+    thread float via_dequant[32];
+    dequant_q4_group(grp, via_dequant);
+    for (uint m = 0; m < 32; ++m) out[m] = via_dequant[m];
+    for (uint m = 0; m < 32; ++m) out[32 + m] = q4_at_col(row_base, k0 + m, q4_row_bytes(in_dim));
 }
 
 kernel void k_moe_grouped_nvfp4(device const half* moe_in [[buffer(0)]],
@@ -744,7 +865,7 @@ kernel void k_moe_grouped_nvfp4(device const half* moe_in [[buffer(0)]],
                                 uint3 tpg [[threads_per_threadgroup]]) {
     const uint e = tgid.y;
     const uint ltid = lid.x, tpg_w = tpg.x;
-    const uint end = (e+1 < N_EXPERTS) ? R->offset[e+1] : CANVAS*TOP_K;
+    const uint end = (e+1 < N_EXPERTS) ? R->offset[e+1] : R->num_slots;
     const uint n_tok = end - R->offset[e];
     if (tgid.x >= n_tok) return;
     const uint slot = R->offset[e] + tgid.x;
@@ -784,8 +905,7 @@ kernel void k_moe_grouped_nvfp4(device const half* moe_in [[buffer(0)]],
             dequant_nvfp4_tile(drow, MOE_FF, k0, wd, dn_scale);
             for (uint i = 0; i < 32; ++i) o += wd[i]*act[k0+i];
         }
-        atomic_fetch_add_explicit((device atomic_float*)&moe_out[(ulong)tok*HID + d],
-                                  w*o, memory_order_relaxed);
+        atomic_add_f32((device atomic_uint*)&moe_out[(ulong)tok*HID + d], w*o);
     }
 }
 

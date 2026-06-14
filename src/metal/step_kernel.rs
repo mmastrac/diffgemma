@@ -1,13 +1,18 @@
 //! Monolithic diffgemma denoise-step kernel (parallel smoke path).
 //! See `shaders/diffgemma_step.metal` and dispatch schedule at file bottom.
 
+use crate::config::{ModelConfig, TextConfig};
 use crate::dgq::DgqStore;
 use crate::metal::batch::set_bytes;
 use crate::metal::device::{ComputePipeline, MetalContext};
 use crate::metal::dgq_gpu::{DgqGpuBlob, Q4LinearGpu};
+use crate::metal::moe::experts_forward_dgq_cpu;
 use crate::metal::mps_gemm::{dispatch_dequant_nvfp4_matrix, dispatch_dequant_q4_matrix, MpsMatmulCache};
+use crate::metal::weights::GpuDecoderWeightCache;
+use crate::model::moe::{MoeScratch, RouteResult};
 use crate::sample::{initialize_canvas, Rng, SamplerConfig, StableConfidentStopper};
 use crate::safetensors::Error;
+use crate::weights::WeightStore;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
@@ -21,6 +26,7 @@ use std::time::Instant;
 
 const STEP_SHADER: &str = include_str!("../../shaders/diffgemma_step.metal");
 const QGEMM_SHADER: &str = include_str!("../../shaders/qgemm.metal");
+const DECODER_SHADER: &str = include_str!("../../shaders/decoder.metal");
 
 pub const HID: usize = 2816;
 pub const VOCAB: usize = 262144;
@@ -30,6 +36,10 @@ pub const N_EXPERTS: usize = 128;
 pub const TOP_K: usize = 8;
 pub const DENSE_FF: u32 = 2112;
 pub const MOE_FF: u32 = 704;
+/// Two act rows (after-barrier + down-read) plus kernel input probe metadata.
+pub const MOE_ACT_PROBE_ACT_FLOATS: usize = (MOE_FF * 2) as usize;
+pub const MOE_ACT_PROBE_META_FLOATS: usize = 36; // tok,slot,e,w,x[8],row0[8], down_o[8], moe_out_tok_row[8]
+pub const MOE_ACT_PROBE_FLOATS: usize = MOE_ACT_PROBE_ACT_FLOATS + MOE_ACT_PROBE_META_FLOATS;
 
 pub const A_HIDDEN: u64 = 0;
 pub const A_ATTNQ: u64 = 2_883_584;
@@ -130,11 +140,14 @@ pub struct CanvasState {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct RouteScratch {
     pub weight: [[u16; TOP_K]; CANVAS],
     pub expert: [[u32; TOP_K]; CANVAS],
     pub count: [u32; N_EXPERTS],
     pub offset: [u32; N_EXPERTS],
+    pub num_slots: u32,
+    pub pad_route: u32,
     pub token_list: [u32; CANVAS * TOP_K],
     pub slot_list: [u32; CANVAS * TOP_K],
 }
@@ -378,8 +391,13 @@ struct StepPipelines {
     router: ComputePipeline,
     bucket_count: ComputePipeline,
     bucket_fill: ComputePipeline,
+    q4_linear: ComputePipeline,
+    q4_linear_grouped: ComputePipeline,
+    nvfp4_linear: ComputePipeline,
+    gelu_swiglu_gate_up: ComputePipeline,
     moe_grouped: ComputePipeline,
     moe_grouped_nvfp4: ComputePipeline,
+    moe_grouped_act_probe: ComputePipeline,
     embed_gather: ComputePipeline,
     logit_rowstats: ComputePipeline,
     sc_probs: ComputePipeline,
@@ -455,8 +473,13 @@ impl StepPipelines {
             router: simple("k_router")?,
             bucket_count: simple("k_bucket_count")?,
             bucket_fill: simple("k_bucket_fill")?,
+            q4_linear: ctx.compile_kernel(QGEMM_SHADER, "f32_q4_linear")?,
+            q4_linear_grouped: ctx.compile_kernel(QGEMM_SHADER, "f32_q4_linear_grouped")?,
+            nvfp4_linear: ctx.compile_kernel(QGEMM_SHADER, "f32_nvfp4_linear")?,
+            gelu_swiglu_gate_up: ctx.compile_kernel(DECODER_SHADER, "gelu_swiglu_gate_up")?,
             moe_grouped: simple("k_moe_grouped")?,
             moe_grouped_nvfp4: simple("k_moe_grouped_nvfp4")?,
+            moe_grouped_act_probe: simple("k_moe_grouped_act_probe")?,
             embed_gather: simple("k_embed_gather")?,
             logit_rowstats: simple("k_logit_rowstats")?,
             sc_probs: simple("k_sc_probs")?,
@@ -1123,8 +1146,6 @@ impl StepEnc<'_> {
         self.encode_layer_o_proj_post_attn(layer, layout)?;
         self.encode_layer_dense_ffn(layer, layout)?;
         self.encode_layer_router_buckets(layer, layout)?;
-        self.encode_layer_moe_grouped(layer, layout)?;
-        self.encode_layer_moe_post(layer, layout)?;
         Ok(())
     }
 
@@ -1243,6 +1264,68 @@ impl StepEnc<'_> {
         self.residual(A_DENSE, A_MOEIN, A_TMP, 0, CANVAS * HID);
         self.rmsnorm(A_TMP, A_TMP, l.post_ff_ln, HID as u32, CANVAS);
         self.residual(A_STREAM, A_TMP, A_HIDDEN, l.layer_scalar, CANVAS * HID);
+        Ok(())
+    }
+
+    /// MoE grouped kernel for one expert at one canvas row (router bypassed).
+    fn encode_layer_moe_single_expert_setup(
+        &mut self,
+        layer: usize,
+        layout: &ModelLayout,
+        position: usize,
+        expert_id: u32,
+    ) {
+        let l = &layout.layers[layer];
+        self.rmsnorm(A_STREAM, A_MOEIN, l.pre_ff_ln_2, HID as u32, CANVAS);
+        self.memzero_bytes(A_MOEOUT, (CANVAS * HID * 4) as u64);
+        write_single_expert_route(&self.bufs.route, position, expert_id);
+    }
+
+    /// Grouped MoE with two-point threadgroup act probe in A_SOFT.
+    fn encode_layer_moe_grouped_act_probe(
+        &mut self,
+        layer: usize,
+        layout: &ModelLayout,
+    ) -> Result<(), Error> {
+        if self.use_nvfp4 {
+            return Err(Error::Format(
+                "k_moe_grouped_act_probe is q4-only (use q8 .dgq weights)",
+            ));
+        }
+        let layer_off = layer_byte_offset(layer);
+        self.memzero_bytes(A_MOEOUT, (CANVAS * HID * 4) as u64);
+        self.memzero_bytes(
+            A_SOFT,
+            (MOE_ACT_PROBE_FLOATS * std::mem::size_of::<f32>()) as u64,
+        );
+        self.enc
+            .setComputePipelineState(&self.ps.moe_grouped_act_probe.pipeline);
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&self.bufs.arena), A_MOEIN as usize, 0);
+            self.enc
+                .setBuffer_offset_atIndex(Some(&self.bufs.arena), A_MOEOUT as usize, 1);
+            self.bind_blob(2);
+            self.enc.setBuffer_offset_atIndex(
+                Some(&self.bufs.layout),
+                layer_off as usize,
+                3,
+            );
+            self.bind_route(4);
+            self.enc
+                .setBuffer_offset_atIndex(Some(&self.bufs.arena), A_SOFT as usize, 5);
+        }
+        let grid = MTLSize {
+            width: CANVAS,
+            height: N_EXPERTS,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        };
+        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
         Ok(())
     }
 
@@ -1592,6 +1675,33 @@ fn zero_buffer(buf: &ProtocolObject<dyn MTLBuffer>) {
     }
 }
 
+/// Synthetic route: one token at `position` routed to `expert_id` with weight 1.0 (f16).
+fn write_single_expert_route(
+    buf: &ProtocolObject<dyn MTLBuffer>,
+    position: usize,
+    expert_id: u32,
+) {
+    assert!(position < CANVAS);
+    assert!((expert_id as usize) < N_EXPERTS);
+    zero_buffer(buf);
+    unsafe {
+        let r = buf.contents().as_ptr() as *mut RouteScratch;
+        (*r).expert[position][0] = expert_id;
+        (*r).weight[position][0] = 0x3c00; // f16 1.0
+        let e = expert_id as usize;
+        let mut s = 0u32;
+        for i in 0..N_EXPERTS {
+            (*r).offset[i] = s;
+            if i == e {
+                s += 1;
+            }
+        }
+        (*r).token_list[0] = position as u32;
+        (*r).slot_list[0] = 0;
+        (*r).num_slots = 1;
+    }
+}
+
 fn read_struct<T: Copy>(buf: &ProtocolObject<dyn MTLBuffer>) -> T {
     unsafe { *(buf.contents().as_ptr() as *const T) }
 }
@@ -1750,6 +1860,8 @@ pub struct StepRuntime {
     pipelines: &'static StepPipelines,
     bufs: StepBuffers,
     gpu_blob: std::sync::Arc<DgqGpuBlob>,
+    weight_cache: GpuDecoderWeightCache,
+    text_config: TextConfig,
     mps_matmul: MpsMatmulCache,
     use_mps_q4: bool,
     use_nvfp4: bool,
@@ -1886,6 +1998,39 @@ impl StepRuntime {
         Ok(())
     }
 
+    /// Attention + dense FFN + GPU router; MoE expert matmuls on CPU (matches `.dgq` Q4 oracle).
+    pub fn fill_moe_out_dgq_cpu(&mut self, layer: usize) -> Result<(), Error> {
+        let route: RouteScratch = read_struct(&self.bufs.route);
+        let routes = routes_from_route_scratch(&route);
+        let moe_in = read_half_buffer_f32(&self.bufs.arena, A_MOEIN as usize, CANVAS * HID);
+        let mut moe_out = vec![0.0f32; CANVAS * HID];
+        let mut scratch = MoeScratch::new(CANVAS, &self.text_config);
+        experts_forward_dgq_cpu(
+            &mut moe_out,
+            &moe_in,
+            &self.weight_cache,
+            layer,
+            &self.text_config,
+            CANVAS,
+            &routes,
+            &mut scratch,
+        )?;
+        write_f32_arena(&self.bufs.arena, A_MOEOUT, &moe_out);
+        Ok(())
+    }
+
+    /// One decoder layer: GPU router + grouped MoE + GPU post-combine.
+    pub fn encode_full_layer(&mut self, layer: usize) -> Result<(), Error> {
+        let layout = self.layout;
+        self.dispatch_and_wait(|enc| {
+            enc.encode_layer(layer, &layout)?;
+            enc.encode_layer_moe_grouped(layer, &layout)?;
+            Ok(())
+        })?;
+        self.dispatch_and_wait(|enc| enc.encode_layer_moe_post(layer, &layout))?;
+        Ok(())
+    }
+
     fn run_forward_once(&mut self, finish: StepFinishMode) -> Result<(), Error> {
         let layout = self.layout;
         let layers = self.layers;
@@ -1902,9 +2047,12 @@ impl StepRuntime {
         self.dispatch_and_wait(|enc| {
             let first_step = if st_before.step == 0 { 1u32 } else { 0u32 };
             enc.encode_step_preamble(&layout, first_step)?;
-            for layer in 0..layers {
-                enc.encode_layer(layer, &layout)?;
-            }
+            Ok(())
+        })?;
+        for layer in 0..layers {
+            self.encode_full_layer(layer)?;
+        }
+        self.dispatch_and_wait(|enc| {
             enc.encode_step_finish(&layout, finish)?;
             Ok(())
         })
@@ -2022,6 +2170,16 @@ pub fn build_step_runtime(
     let state = init_canvas_state(cfg.seed, VOCAB);
     let (mps_x_bytes, mps_w_bytes, mps_c_bytes) = mps_scratch_bytes();
 
+    let model_cfg = ModelConfig::load(model_dir)?;
+    let text_config = model_cfg.text_config;
+    let weight_store = WeightStore::open(model_dir)?;
+    let weight_cache = GpuDecoderWeightCache::load_with_dgq_blob(
+        &weight_store,
+        &text_config,
+        &ctx.device,
+        std::sync::Arc::clone(&gpu_blob),
+    )?;
+
     let bufs = StepBuffers {
         blob: gpu_blob.buffer.clone(),
         layout: {
@@ -2093,6 +2251,8 @@ pub fn build_step_runtime(
             pipelines,
             bufs,
             gpu_blob,
+            weight_cache,
+            text_config,
             mps_matmul,
             use_mps_q4: cfg.use_mps_q4.unwrap_or_else(step_use_mps_q4_from_env),
             use_nvfp4,
@@ -2129,10 +2289,7 @@ pub fn run_step_probe(model_dir: &Path, cfg: StepSmokeConfig) -> Result<StepProb
     push("after_preamble", f, m, n);
 
     for layer in 0..layers {
-        rt.dispatch_and_wait(|enc| {
-            enc.encode_layer(layer, &layout)?;
-            Ok(())
-        })?;
+        rt.encode_full_layer(layer)?;
         let (f, m, n) = arena_hidden_stats(&rt.bufs.arena);
         push(&format!("after_layer_{layer}"), f, m, n);
     }
@@ -2232,10 +2389,7 @@ pub fn run_step_layer_hidden_probe(
     }
 
     for layer in 0..layers {
-        rt.dispatch_and_wait(|enc| {
-            enc.encode_layer(layer, &layout)?;
-            Ok(())
-        })?;
+        rt.encode_full_layer(layer)?;
         let hidden = read_arena_hidden_row(&rt.bufs.arena, A_HIDDEN, position);
         let (hidden_l2, hidden_max_abs) = hidden_vec_stats(&hidden);
         checkpoints.push(LayerHiddenProbeCheckpoint {
@@ -2439,10 +2593,7 @@ pub fn run_step_attn_layer_capture(
         Ok(())
     })?;
     for l in 0..layer {
-        rt.dispatch_and_wait(|enc| {
-            enc.encode_layer(l, &layout)?;
-            Ok(())
-        })?;
+        rt.encode_full_layer(l)?;
     }
 
     let hidden_in = read_arena_hidden_row(&rt.bufs.arena, A_HIDDEN, position);
@@ -2518,6 +2669,46 @@ pub struct LayerMoeCapture {
     pub layer_out: Vec<f32>,
 }
 
+fn routes_from_route_scratch(route: &RouteScratch) -> Vec<RouteResult> {
+    let mut routes = Vec::with_capacity(CANVAS);
+    for tok in 0..CANVAS {
+        let indices = (0..TOP_K)
+            .map(|k| route.expert[tok][k] as usize)
+            .collect();
+        let weights = (0..TOP_K)
+            .map(|k| f16_bits_to_f32(route.weight[tok][k]))
+            .collect();
+        routes.push(RouteResult { indices, weights });
+    }
+    routes
+}
+
+fn write_f32_arena(
+    arena: &ProtocolObject<dyn MTLBuffer>,
+    base: u64,
+    data: &[f32],
+) {
+    let byte_off = base as usize;
+    unsafe {
+        let ptr = arena.contents().as_ptr().add(byte_off) as *mut f32;
+        for (i, &v) in data.iter().enumerate() {
+            *ptr.add(i) = v;
+        }
+    }
+}
+
+fn read_f32_arena(
+    arena: &ProtocolObject<dyn MTLBuffer>,
+    base: u64,
+    elems: usize,
+) -> Vec<f32> {
+    let byte_off = base as usize;
+    unsafe {
+        let ptr = arena.contents().as_ptr().add(byte_off) as *const f32;
+        (0..elems).map(|i| *ptr.add(i)).collect()
+    }
+}
+
 fn read_f32_arena_row(
     arena: &ProtocolObject<dyn MTLBuffer>,
     base: u64,
@@ -2566,10 +2757,7 @@ pub fn run_step_moe_layer_capture(
         Ok(())
     })?;
     for l in 0..layer {
-        rt.dispatch_and_wait(|enc| {
-            enc.encode_layer(l, &layout)?;
-            Ok(())
-        })?;
+        rt.encode_full_layer(l)?;
     }
 
     rt.dispatch_and_wait(|enc| {
@@ -2582,10 +2770,13 @@ pub fn run_step_moe_layer_capture(
     rt.dispatch_and_wait(|enc| enc.encode_layer_dense_ffn(layer, &layout))?;
     let dense_out = read_arena_hidden_row(&rt.bufs.arena, A_DENSE, position);
 
-    rt.dispatch_and_wait(|enc| enc.encode_layer_router_buckets(layer, &layout))?;
+    rt.dispatch_and_wait(|enc| {
+        enc.encode_layer_router_buckets(layer, &layout)?;
+        enc.encode_layer_moe_grouped(layer, &layout)?;
+        Ok(())
+    })?;
     let (experts, expert_weights) = read_route_at_position(&rt.bufs.route, position);
 
-    rt.dispatch_and_wait(|enc| enc.encode_layer_moe_grouped(layer, &layout))?;
     let moe_out = read_f32_arena_row(&rt.bufs.arena, A_MOEOUT, position, HID);
 
     rt.dispatch_and_wait(|enc| enc.encode_layer_moe_post(layer, &layout))?;
@@ -2604,6 +2795,108 @@ pub fn run_step_moe_layer_capture(
         expert_weights,
         moe_out,
         layer_out,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct MoeKernelInputProbe {
+    pub tok: u32,
+    pub slot: u32,
+    pub expert: u32,
+    pub weight: f32,
+    pub x_head: [f32; 8],
+    pub moe_in_row0_head: [f32; 8],
+    pub down_o_head: [f32; 8],
+    pub moe_out_tok_row_head: [f32; 8],
+}
+
+#[derive(Debug, Clone)]
+pub struct SingleExpertMoeCapture {
+    pub layer: usize,
+    pub position: usize,
+    pub expert_id: u32,
+    pub canvas_token: u32,
+    pub token_ids: Vec<u32>,
+    pub kv_len: u32,
+    pub moe_in: Vec<f32>,
+    pub gpu_out: Vec<f32>,
+    pub gpu_act_after_barrier: Vec<f32>,
+    pub gpu_act_at_down_read: Vec<f32>,
+    pub gpu_input: MoeKernelInputProbe,
+}
+
+/// Step-1 forward through `layer`; run grouped MoE for one expert at one row (no router).
+pub fn run_step_moe_single_expert_capture(
+    model_dir: &Path,
+    cfg: &StepSmokeConfig,
+    layer: usize,
+    position: usize,
+    expert_id: u32,
+) -> Result<SingleExpertMoeCapture, Error> {
+    if position >= CANVAS {
+        return Err(Error::Format("single-expert moe capture position out of range"));
+    }
+    if expert_id as usize >= N_EXPERTS {
+        return Err(Error::Format("single-expert moe capture expert_id out of range"));
+    }
+    let layer = layer.min(cfg.layers.saturating_sub(1));
+    let (mut rt, _) = build_step_runtime(model_dir, cfg)?;
+    let layout = rt.layout;
+
+    rt.dispatch_and_wait(|enc| {
+        enc.encode_step_preamble(&layout, 1)?;
+        Ok(())
+    })?;
+    for l in 0..layer {
+        rt.encode_full_layer(l)?;
+    }
+
+    rt.dispatch_and_wait(|enc| {
+        enc.encode_layer_through_attention(layer, &layout)?;
+        enc.encode_layer_o_proj_post_attn(layer, &layout)?;
+        enc.encode_layer_moe_single_expert_setup(layer, &layout, position, expert_id);
+        Ok(())
+    })?;
+
+    let moe_in = read_arena_row(&rt.bufs.arena, A_MOEIN, position, HID);
+
+    rt.dispatch_and_wait(|enc| {
+        enc.encode_layer_moe_grouped_act_probe(layer, &layout)?;
+        Ok(())
+    })?;
+    let gpu_out = read_f32_arena_row(&rt.bufs.arena, A_MOEOUT, position, HID);
+    let act_probe = read_f32_arena(&rt.bufs.arena, A_SOFT, MOE_ACT_PROBE_FLOATS);
+    let moe_ff = MOE_FF as usize;
+    let gpu_act_after_barrier = act_probe[..moe_ff].to_vec();
+    let gpu_act_at_down_read = act_probe[moe_ff..moe_ff * 2].to_vec();
+    let meta = MOE_ACT_PROBE_ACT_FLOATS;
+    let gpu_input = MoeKernelInputProbe {
+        tok: act_probe[meta] as u32,
+        slot: act_probe[meta + 1] as u32,
+        expert: act_probe[meta + 2] as u32,
+        weight: act_probe[meta + 3],
+        x_head: act_probe[meta + 4..meta + 12].try_into().expect("x_head"),
+        moe_in_row0_head: act_probe[meta + 12..meta + 20]
+            .try_into()
+            .expect("row0_head"),
+        down_o_head: act_probe[meta + 20..meta + 28].try_into().expect("down_o"),
+        moe_out_tok_row_head: act_probe[meta + 28..meta + 36]
+            .try_into()
+            .expect("moe_out_tok"),
+    };
+    let state = rt.read_canvas_state();
+    Ok(SingleExpertMoeCapture {
+        layer,
+        position,
+        expert_id,
+        canvas_token: state.ids[position],
+        token_ids: state.ids.to_vec(),
+        kv_len: rt.read_params().kv_len,
+        moe_in,
+        gpu_out,
+        gpu_act_after_barrier,
+        gpu_act_at_down_read,
+        gpu_input,
     })
 }
 
@@ -2830,9 +3123,12 @@ pub fn run_step_smoke(model_dir: &Path, cfg: StepSmokeConfig) -> Result<StepSmok
             let cur_state: CanvasState = read_struct(&enc.bufs.state);
             let first_step = if cur_state.step == 0 { 1u32 } else { 0u32 };
             enc.encode_step_preamble(&layout, first_step)?;
-            for layer in 0..layers {
-                enc.encode_layer(layer, &layout)?;
-            }
+            Ok(())
+        })?;
+        for layer in 0..layers {
+            rt.encode_full_layer(layer)?;
+        }
+        rt.dispatch_and_wait(|enc| {
             enc.encode_step_finish(&layout, finish)?;
             Ok(())
         })?;
@@ -2940,6 +3236,240 @@ mod tests {
             total_accept > MIN_ACCEPT,
             "total accept {total_accept} accept/step={accepts:?} (GEMM tg bug ~1/step, sum~8)",
         );
+    }
+
+    #[test]
+    fn moe_grouped_layer2_expert_offset_and_bytes_parity() {
+        use crate::dgq::layout::q4_matrix_bytes;
+        use crate::metal::moe::expert_forward_staged_dgq;
+        use crate::model::moe::MoeScratch;
+        use std::path::Path;
+
+        let dir = Path::new("/tmp/quantized-weights");
+        if !crate::dgq::store::looks_like_dgq_dir(dir) {
+            eprintln!("skip moe_grouped_layer2_expert_offset_and_bytes_parity");
+            return;
+        }
+        let layer = 2usize;
+        let text = crate::config::ModelConfig::load(dir).expect("cfg").text_config;
+        let store = DgqStore::open(dir).expect("dgq");
+        let ws = WeightStore::open(dir).expect("ws");
+        let ctx = MetalContext::new().expect("metal");
+        let cache = GpuDecoderWeightCache::load(&ws, &text, 0, &ctx.device).expect("cache");
+
+        let offsets = build_offsets_from_store(&store);
+        let layout = build_layout(&offsets, 512);
+        let manifest_gu = offsets
+            .get(&format!("model.decoder.layers.{layer}.experts.gate_up_proj"))
+            .copied()
+            .expect("manifest gate_up");
+        let manifest_dn = offsets
+            .get(&format!("model.decoder.layers.{layer}.experts.down_proj"))
+            .copied()
+            .expect("manifest down");
+        let layout_gu = layout.layers[layer].experts_gate_up;
+        let layout_dn = layout.layers[layer].experts_down;
+        eprintln!(
+            "L{layer} experts_gate_up manifest={manifest_gu} layout={layout_gu} delta={}",
+            manifest_gu as i64 - layout_gu as i64
+        );
+        eprintln!(
+            "L{layer} experts_down   manifest={manifest_dn} layout={layout_dn} delta={}",
+            manifest_dn as i64 - layout_dn as i64
+        );
+        assert_eq!(layout_gu, manifest_gu);
+        assert_eq!(layout_dn, manifest_dn);
+
+        let per_expert = q4_matrix_bytes(text.moe_intermediate_size * 2, text.hidden_size) as u64;
+        let down_per = q4_matrix_bytes(text.hidden_size, text.moe_intermediate_size) as u64;
+        eprintln!("per_expert gate_up={per_expert} down={down_per} fused={}", per_expert + down_per);
+
+        for expert in [0usize, 18] {
+            let cache_gu = cache.expert_gate_up_q4(layer, expert);
+            let kernel_gu = layout_gu + expert as u64 * per_expert;
+            assert_eq!(cache_gu.byte_offset, kernel_gu, "expert {expert} gu offset");
+            let cache_bytes = cache_gu.src_slice();
+            let blob_ptr = unsafe {
+                cache_gu
+                    .weight_buffer()
+                    .0
+                    .contents()
+                    .as_ptr()
+                    .add(kernel_gu as usize)
+            };
+            let kernel_bytes =
+                unsafe { std::slice::from_raw_parts(blob_ptr as *const u8, cache_bytes.len().min(64)) };
+            assert_eq!(
+                &kernel_bytes[..64],
+                &cache_bytes[..64],
+                "expert {expert} first 64 gu bytes"
+            );
+        }
+
+        // Mirror act from cache bytes + dump moe_in should match CPU gate_act, not GPU act.
+        let dump_path = Path::new("/tmp/rust_moe_single_l2_act_probe.json");
+        if !dump_path.exists() {
+            eprintln!("skip act compare: run step-moe-single-dump first");
+            return;
+        }
+        let dump: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dump_path).expect("read dump")).expect("json");
+        let moe_in: Vec<f32> = dump["moe_in"]
+            .as_array()
+            .expect("moe_in")
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
+        let gpu_act: Vec<f32> = dump["gpu_act_after_barrier"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
+        let expert = 18usize;
+        let gate_up = cache.expert_gate_up_q4(layer, expert);
+        let down = cache.expert_down_q4(layer, expert);
+        let mut scratch = MoeScratch::new(1, &text);
+        let staged = expert_forward_staged_dgq(
+            &moe_in,
+            &gate_up,
+            &down,
+            text.moe_intermediate_size,
+            text.hidden_size,
+            &mut scratch,
+        );
+        let cos_staged_gpu_act = {
+            let mut dot = 0.0f64;
+            let mut na = 0.0f64;
+            let mut nb = 0.0f64;
+            for (a, b) in staged.gate_act.iter().zip(gpu_act.iter()) {
+                dot += *a as f64 * *b as f64;
+                na += *a as f64 * *a as f64;
+                nb += *b as f64 * *b as f64;
+            }
+            (dot / (na.sqrt() * nb.sqrt())) as f32
+        };
+        eprintln!(
+            "E18 act: cos(staged_gate_act,gpu_act)={cos_staged_gpu_act:.4} (expect ~0.015)"
+        );
+    }
+
+    #[test]
+    fn q4_group_k_order_l2_e0_gate_probe() {
+        use crate::config::ModelConfig;
+        use crate::dgq::layout::q4_row_bytes;
+        use crate::metal::batch::{set_bytes, GpuBatch};
+        use crate::metal::buffer::BufferPool;
+        use crate::metal::device::MetalContext;
+        use crate::metal::step_m0::{dequant_q4_group_cpu, q4_weight_at_k_order_group};
+        use crate::weights::WeightStore;
+        use objc2_metal::MTLSize;
+        use std::path::Path;
+
+        const STEP_SHADER: &str = include_str!("../../shaders/diffgemma_step.metal");
+
+        let dir = Path::new("/tmp/quantized-weights");
+        if !crate::dgq::store::looks_like_dgq_dir(dir) {
+            eprintln!("skip q4_group_k_order_l2_e0_gate_probe");
+            return;
+        }
+        let layer = 2usize;
+        let expert = 0usize;
+        let text = ModelConfig::load(dir).expect("cfg").text_config;
+        let hidden = text.hidden_size;
+        let ws = WeightStore::open(dir).expect("ws");
+        let ctx = MetalContext::new().expect("metal");
+        let cache = GpuDecoderWeightCache::load(&ws, &text, 0, &ctx.device).expect("cache");
+        let gate_up = cache.expert_gate_up_q4(layer, expert);
+        let row = gate_up.src_slice();
+        let row_bytes = q4_row_bytes(hidden);
+        assert!(row.len() >= row_bytes);
+
+        let pipeline = ctx
+            .compile_kernel(STEP_SHADER, "k_q4_group_k_order_probe")
+            .expect("pipeline");
+        let mut pool = BufferPool::new();
+
+        for k0 in [0usize, 32, 64] {
+            let g_off = (k0 / 32) * 20;
+            let group: &[u8; 20] = row[g_off..g_off + 20].try_into().expect("group");
+            let via_dequant = dequant_q4_group_cpu(group);
+            let via_col = q4_weight_at_k_order_group(row, k0, hidden);
+
+            let mut max_err = 0.0f32;
+            let mut first_mismatch = None;
+            for m in 0..32 {
+                let err = (via_dequant[m] - via_col[m]).abs();
+                max_err = max_err.max(err);
+                if first_mismatch.is_none() && err > 1e-6 {
+                    first_mismatch = Some((m, via_dequant[m], via_col[m]));
+                }
+            }
+            eprintln!(
+                "CPU L{layer} E{expert} gate row0 k0={k0}: max_err={max_err:.2e} mismatch={first_mismatch:?}"
+            );
+            eprintln!(
+                "  dequant[0..8]={:?}",
+                via_dequant[..8]
+                    .iter()
+                    .map(|v| format!("{v:.5}"))
+                    .collect::<Vec<_>>()
+            );
+            eprintln!(
+                "  q4_at [0..8]={:?}",
+                via_col[..8]
+                    .iter()
+                    .map(|v| format!("{v:.5}"))
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                max_err <= 1e-6,
+                "CPU K-order mismatch k0={k0} max_err={max_err}"
+            );
+
+            let mut batch = GpuBatch::begin(&ctx.queue, &mut pool, &ctx.device).expect("batch");
+            let out_buf = batch.alloc_f32_out(64).expect("out");
+            let enc = batch.encoder();
+            let (wbuf, row_off) = gate_up.weight_buffer();
+            let k0_u32 = k0 as u32;
+            let in_dim_u32 = hidden as u32;
+            let mut gpu_out = vec![0.0f32; 64];
+            enc.setComputePipelineState(&pipeline.pipeline);
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(wbuf), row_off as usize, 0);
+                set_bytes(enc, &k0_u32, 1);
+                set_bytes(enc, &in_dim_u32, 2);
+                enc.setBuffer_offset_atIndex(Some(&out_buf), 0, 3);
+            }
+            enc.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            batch.register_read(out_buf, &mut gpu_out);
+            batch.end().expect("end");
+
+            let gpu_vs_dequant = (0..32)
+                .map(|m| (gpu_out[m] - via_dequant[m]).abs())
+                .fold(0.0f32, f32::max);
+            let gpu_vs_q4at = (0..32)
+                .map(|m| (gpu_out[32 + m] - via_col[m]).abs())
+                .fold(0.0f32, f32::max);
+            eprintln!(
+                "GPU L{layer} E{expert} k0={k0}: max_err vs CPU dequant={gpu_vs_dequant:.2e} vs CPU q4_at={gpu_vs_q4at:.2e}"
+            );
+            assert!(
+                gpu_vs_dequant <= 1e-5 && gpu_vs_q4at <= 1e-5,
+                "GPU decode mismatch k0={k0}"
+            );
+        }
     }
 
     #[test]

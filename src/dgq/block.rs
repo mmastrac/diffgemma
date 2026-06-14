@@ -115,7 +115,7 @@ pub fn dequant_matrix_q4(src: &[u8], out_dim: usize, in_dim: usize, dst: &mut [f
 }
 
 #[inline]
-fn q4_weight_at(src: &[u8], row: usize, col: usize, in_dim: usize) -> f32 {
+pub(crate) fn q4_weight_at(src: &[u8], row: usize, col: usize, in_dim: usize) -> f32 {
     let row_bytes = q4_row_bytes(in_dim);
     let row_off = row * row_bytes;
     let g = col / GROUP_SIZE;

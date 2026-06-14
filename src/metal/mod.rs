@@ -36,6 +36,7 @@ mod step_logits_dump;
 mod step_preamble_dump;
 mod step_attn_dump;
 mod step_moe_dump;
+mod step_moe_single_dump;
 mod step_kernel;
 mod self_conditioning;
 mod telemetry;
@@ -61,9 +62,11 @@ pub use sampler::{sampler_step_gpu, upload_logits_gpu};
 pub use step_kernel::{
     bench_step_kernel, build_step_runtime, hello_chat_prefill_token_ids, logits_finite_check_enabled,
     run_denoise_steps, run_single_denoise_step, run_step_attn_layer_capture, run_step_forward,
-    run_step_layer_hidden_probe, run_step_moe_layer_capture, run_step_preamble_capture,
+    run_step_layer_hidden_probe, run_step_moe_layer_capture, run_step_moe_single_expert_capture,
+    run_step_preamble_capture,
     run_step_probe, run_step_smoke, run_embed_row_gpu, run_step_q4_mps_parity, step_use_mps_q4_default,
-    DenoiseStepStats, trace_entropy_enabled, LayerAttnCapture, LayerMoeCapture, PreambleCapture,
+    DenoiseStepStats, trace_entropy_enabled, LayerAttnCapture, LayerMoeCapture,
+    PreambleCapture, SingleExpertMoeCapture,
     StepBenchResult, StepFinishMode, StepForwardOutput, StepProbeResult, StepQ4MpsParityResult,
     StepSmokeConfig, StepSmokeResult, CANVAS,
 };
@@ -75,6 +78,9 @@ pub use step_attn_dump::{
     hidden_cosine, run_step_attn_layer_dump, write_step_attn_layer_dump, StepAttnLayerDump,
 };
 pub use step_moe_dump::{run_step_moe_layer_dump, write_step_moe_layer_dump, StepMoeLayerDump};
+pub use step_moe_single_dump::{
+    run_step_moe_single_expert_dump, write_step_moe_single_expert_dump, StepMoeSingleExpertDump,
+};
 pub use step_logits_dump::{
     parse_positions, run_step_layer_hidden_dump, run_step_logits_dump, write_step_layer_hidden_dump,
     write_step_logits_dump, StepLayerHiddenDump, StepLogitsDump,

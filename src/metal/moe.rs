@@ -1,8 +1,9 @@
 use crate::config::TextConfig;
-use crate::dgq::block::q4_gemm_cpu;
-use crate::dgq::layout::NVFP4_HEADER_BYTES;
+use crate::dgq::block::{q4_gemm_cpu, q4_weight_at};
+use crate::dgq::layout::{q4_matrix_bytes, NVFP4_HEADER_BYTES};
 use crate::dgq::nvfp4::nvfp4_gemm_cpu;
-use crate::kernels::cpu::gelu_pytorch_tanh;
+use crate::dgq::DgqStore;
+use crate::kernels::cpu::{gelu_pytorch_tanh, gelu_pytorch_tanh_f32, linear};
 use crate::metal::batched_kernels::{self as bk};
 use crate::metal::batch::GpuBatch;
 use crate::metal::device::ComputePipeline;
@@ -73,6 +74,143 @@ fn block_gemm_cpu(
     } else {
         q4_gemm_cpu(a, m, k, w.src_slice(), n, out);
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExpertSingleStaged {
+    pub gate_up: Vec<f32>,
+    pub gate_act: Vec<f32>,
+    pub out: Vec<f32>,
+}
+
+/// One expert, one token: gate_up → GELU×up → down (Q4 `.dgq` weights).
+pub fn expert_forward_staged_dgq(
+    x: &[f32],
+    gate_up_w: &Q4LinearGpu,
+    down_w: &Q4LinearGpu,
+    moe_inter: usize,
+    hidden: usize,
+    scratch: &mut MoeScratch,
+) -> ExpertSingleStaged {
+    assert_eq!(x.len(), hidden);
+    block_gemm_cpu(x, 1, hidden, gate_up_w, moe_inter * 2, &mut scratch.gate_up);
+    let (gate, up) = scratch.gate_up.split_at_mut(moe_inter);
+    gelu_pytorch_tanh(gate);
+    for i in 0..moe_inter {
+        scratch.gate_act[i] = gate[i] * up[i];
+    }
+    block_gemm_cpu(
+        &scratch.gate_act,
+        1,
+        moe_inter,
+        down_w,
+        hidden,
+        &mut scratch.expert_out,
+    );
+    ExpertSingleStaged {
+        gate_up: scratch.gate_up.clone(),
+        gate_act: scratch.gate_act.clone(),
+        out: scratch.expert_out.clone(),
+    }
+}
+
+/// BF16-dequant oracle for one expert (same layout as `model::moe::expert_forward_one`).
+pub fn expert_forward_staged_bf16(
+    x: &[f32],
+    gate_up_f32: &[f32],
+    down_f32: &[f32],
+    moe_inter: usize,
+    hidden: usize,
+    scratch: &mut MoeScratch,
+) -> ExpertSingleStaged {
+    assert_eq!(x.len(), hidden);
+    assert_eq!(gate_up_f32.len(), moe_inter * 2 * hidden);
+    assert_eq!(down_f32.len(), hidden * moe_inter);
+    linear(
+        &mut scratch.gate_up,
+        x,
+        gate_up_f32,
+        None,
+        1,
+        hidden,
+        moe_inter * 2,
+    );
+    let (gate, up) = scratch.gate_up.split_at_mut(moe_inter);
+    gelu_pytorch_tanh(gate);
+    for i in 0..moe_inter {
+        scratch.gate_act[i] = gate[i] * up[i];
+    }
+    linear(
+        &mut scratch.expert_out,
+        &scratch.gate_act,
+        down_f32,
+        None,
+        1,
+        moe_inter,
+        hidden,
+    );
+    ExpertSingleStaged {
+        gate_up: scratch.gate_up.clone(),
+        gate_act: scratch.gate_act.clone(),
+        out: scratch.expert_out.clone(),
+    }
+}
+
+/// CPU mirror of `k_moe_grouped` per-token math (dequant loop, not batched GEMM).
+pub fn expert_forward_k_moe_grouped_mirror(
+    x: &[f32],
+    gate_up_w: &Q4LinearGpu,
+    down_w: &Q4LinearGpu,
+    moe_inter: usize,
+    hidden: usize,
+) -> Vec<f32> {
+    assert_eq!(x.len(), hidden);
+    let gu = gate_up_w.src_slice();
+    let dn = down_w.src_slice();
+    let mut act = vec![0.0f32; moe_inter];
+    for r in 0..moe_inter {
+        let mut g = 0.0f32;
+        let mut u = 0.0f32;
+        for k in 0..hidden {
+            g += q4_weight_at(gu, r, k, hidden) * x[k];
+            u += q4_weight_at(gu, r + moe_inter, k, hidden) * x[k];
+        }
+        act[r] = gelu_pytorch_tanh_f32(g) * u;
+    }
+    let mut out = vec![0.0f32; hidden];
+    for d in 0..hidden {
+        let mut o = 0.0f32;
+        for k in 0..moe_inter {
+            o += q4_weight_at(dn, d, k, moe_inter) * act[k];
+        }
+        out[d] = o;
+    }
+    out
+}
+
+pub fn load_expert_bf16_slices(
+    store: &DgqStore,
+    layer: usize,
+    expert: usize,
+    moe_inter: usize,
+    hidden: usize,
+) -> Result<(Vec<f32>, Vec<f32>), Error> {
+    let p = format!("model.decoder.layers.{layer}.");
+    let gu_name = format!("{p}experts.gate_up_proj");
+    let dn_name = format!("{p}experts.down_proj");
+    let gu_all = store.tensor_f32(&gu_name)?;
+    let dn_all = store.tensor_f32(&dn_name)?;
+    let gu_stride = moe_inter * 2 * hidden;
+    let dn_stride = hidden * moe_inter;
+    let gu_off = expert * gu_stride;
+    let dn_off = expert * dn_stride;
+    if gu_off + gu_stride > gu_all.len() || dn_off + dn_stride > dn_all.len() {
+        return Err(Error::Format("expert bf16 slice out of range"));
+    }
+    Ok((
+        gu_all[gu_off..gu_off + gu_stride].to_vec(),
+        dn_all[dn_off..dn_off + dn_stride].to_vec(),
+    ))
 }
 
 pub fn experts_forward_gpu_batched(
@@ -405,33 +543,84 @@ pub fn experts_forward_dgq_cpu(
         for (&expert, &weight) in route.indices.iter().zip(route.weights.iter()) {
             let gate_up = expert_cache.expert_gate_up_q4(layer, expert);
             let down = expert_cache.expert_down_q4(layer, expert);
-            block_gemm_cpu(
-                x,
-                1,
-                hidden,
-                &gate_up,
-                moe_inter * 2,
-                &mut scratch.gate_up,
-            );
-            let (gate, up) = scratch.gate_up.split_at_mut(moe_inter);
-            gelu_pytorch_tanh(gate);
-            for i in 0..moe_inter {
-                scratch.gate_act[i] = gate[i] * up[i];
-            }
-            block_gemm_cpu(
-                &scratch.gate_act,
-                1,
-                moe_inter,
-                &down,
-                hidden,
-                &mut scratch.expert_out,
-            );
+            let staged = expert_forward_staged_dgq(x, &gate_up, &down, moe_inter, hidden, scratch);
             for i in 0..hidden {
-                o[i] += weight * scratch.expert_out[i];
+                o[i] += weight * staged.out[i];
             }
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "metal", target_os = "macos"))]
+mod dgq_expert_tests {
+    use super::*;
+    use crate::config::ModelConfig;
+    use crate::dgq::DgqStore;
+    use crate::metal::device::MetalContext;
+    use crate::metal::weights::GpuDecoderWeightCache;
+    use crate::weights::WeightStore;
+    use std::sync::Arc;
+
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        let mut dot = 0.0f64;
+        let mut na = 0.0f64;
+        let mut nb = 0.0f64;
+        for (x, y) in a.iter().zip(b.iter()) {
+            let xf = *x as f64;
+            let yf = *y as f64;
+            dot += xf * yf;
+            na += xf * xf;
+            nb += yf * yf;
+        }
+        if na > 0.0 && nb > 0.0 {
+            (dot / (na.sqrt() * nb.sqrt())) as f32
+        } else {
+            0.0
+        }
+    }
+
+    #[test]
+    fn dgq_expert_q4_matches_bf16_oracle_and_grouped_mirror() {
+        let dgq_dir = std::path::Path::new("/tmp/quantized-weights");
+        if !dgq_dir.join("model.dgq.json").exists() {
+            eprintln!("skip: /tmp/quantized-weights missing");
+            return;
+        }
+        let text = ModelConfig::load(dgq_dir).expect("config").text_config;
+        let store = DgqStore::open(dgq_dir).expect("dgq");
+        let ws = WeightStore::open(dgq_dir).expect("ws");
+        let ctx = MetalContext::new().expect("metal");
+        let cache = GpuDecoderWeightCache::load(&ws, &text, 0, &ctx.device).expect("cache");
+        let layer = 2usize;
+        let expert = 18usize;
+        let hidden = text.hidden_size;
+        let moe_inter = text.moe_intermediate_size;
+
+        let (gu_bf16, dn_bf16) =
+            load_expert_bf16_slices(&store, layer, expert, moe_inter, hidden).expect("bf16 slices");
+        let gate_up = cache.expert_gate_up_q4(layer, expert);
+        let down = cache.expert_down_q4(layer, expert);
+        assert_eq!(gate_up.q4_byte_len(), q4_matrix_bytes(moe_inter * 2, hidden));
+        assert_eq!(down.q4_byte_len(), q4_matrix_bytes(hidden, moe_inter));
+
+        let x: Vec<f32> = (0..hidden)
+            .map(|i| ((i as f32 * 0.013 + 0.7).sin() * 0.05) as f32)
+            .collect();
+        let mut scratch = MoeScratch::new(1, &text);
+
+        let q4 = expert_forward_staged_dgq(&x, &gate_up, &down, moe_inter, hidden, &mut scratch);
+        let bf16 = expert_forward_staged_bf16(&x, &gu_bf16, &dn_bf16, moe_inter, hidden, &mut scratch);
+        let mirror = expert_forward_k_moe_grouped_mirror(&x, &gate_up, &down, moe_inter, hidden);
+
+        let cos_q4_bf16 = cosine(&q4.out, &bf16.out);
+        let cos_mirror_q4 = cosine(&mirror, &q4.out);
+        eprintln!(
+            "expert L{layer} E{expert}: cos(q4,bf16)={cos_q4_bf16:.6} cos(mirror,q4)={cos_mirror_q4:.6}"
+        );
+        assert!(cos_q4_bf16 > 0.95, "q4 vs bf16 oracle cos={cos_q4_bf16}");
+        assert!(cos_mirror_q4 > 0.999, "grouped mirror vs q4 cos={cos_mirror_q4}");
+    }
 }
 
 /// Per-expert Q4/BF16 MoE in one batch (deterministic; avoids grouped `simd_sum` kernel).

@@ -221,6 +221,17 @@ enum Command {
         layer: usize,
         position: usize,
     },
+    StepMoeSingleDump {
+        prompt: Option<String>,
+        layers: usize,
+        seed: u64,
+        max_seq: usize,
+        raw_prompt: bool,
+        output: PathBuf,
+        layer: usize,
+        position: usize,
+        expert: u32,
+    },
     StepPreambleDump {
         prompt: Option<String>,
         layers: usize,
@@ -443,6 +454,28 @@ fn main() -> ExitCode {
             &output,
             layer,
             position,
+        ),
+        Command::StepMoeSingleDump {
+            prompt,
+            layers,
+            seed,
+            max_seq,
+            raw_prompt,
+            output,
+            layer,
+            position,
+            expert,
+        } => run_step_moe_single_dump_cmd(
+            &cli.model_dir,
+            prompt,
+            layers,
+            seed,
+            max_seq,
+            raw_prompt,
+            &output,
+            layer,
+            position,
+            expert,
         ),
         Command::StepPreambleDump {
             prompt,
@@ -734,6 +767,7 @@ fn run_command(
         Command::StepLayerProbe { .. } => ExitCode::FAILURE,
         Command::StepAttnDump { .. } => ExitCode::FAILURE,
         Command::StepMoeDump { .. } => ExitCode::FAILURE,
+        Command::StepMoeSingleDump { .. } => ExitCode::FAILURE,
         Command::StepPreambleDump { .. } => ExitCode::FAILURE,
         Command::EmbedRowDump { .. } => ExitCode::FAILURE,
         Command::StepVerify { .. } => ExitCode::FAILURE,
@@ -1136,6 +1170,91 @@ fn run_step_moe_dump_cmd(
                 dump.position,
                 dump.kv_len,
                 dump.experts,
+            );
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn run_step_moe_single_dump_cmd(
+    model_dir: &std::path::Path,
+    prompt: Option<String>,
+    layers: usize,
+    seed: u64,
+    max_seq: usize,
+    raw_prompt: bool,
+    output: &std::path::Path,
+    layer: usize,
+    position: usize,
+    expert: u32,
+) -> ExitCode {
+    use metal::{
+        run_step_moe_single_expert_dump, write_step_moe_single_expert_dump, StepSmokeConfig,
+    };
+
+    if !dgq::store::looks_like_dgq_dir(model_dir) {
+        eprintln!("error: step-moe-single-dump requires a .dgq directory");
+        return ExitCode::FAILURE;
+    }
+    let mut cfg = StepSmokeConfig {
+        layers,
+        steps: 2,
+        kv_len: 0,
+        seed,
+        max_seq,
+        finish: metal::StepFinishMode::ForwardOnly,
+        use_mps_q4: None,
+        prefill_token_ids: None,
+        no_early_stop: false,
+        encoder_use_mps_q4: None,
+    };
+    if let Err(err) = attach_step_prefill(
+        &mut cfg,
+        model_dir,
+        0,
+        prompt.as_deref(),
+        raw_prompt,
+    ) {
+        eprintln!("error: {err}");
+        return ExitCode::FAILURE;
+    }
+    let label = prompt.unwrap_or_else(|| "Hello".to_string());
+    match run_step_moe_single_expert_dump(
+        model_dir, &cfg, &label, layer, position, expert,
+    ) {
+        Ok(dump) => {
+            if let Err(err) = write_step_moe_single_expert_dump(output, &dump) {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+            let mut dot = 0.0f64;
+            let mut na = 0.0f64;
+            let mut nb = 0.0f64;
+            for (a, b) in dump.gpu_out.iter().zip(dump.cpu_out.iter()) {
+                let af = *a as f64;
+                let bf = *b as f64;
+                dot += af * bf;
+                na += af * af;
+                nb += bf * bf;
+            }
+            let cos = if na > 0.0 && nb > 0.0 {
+                (dot / (na.sqrt() * nb.sqrt())) as f32
+            } else {
+                0.0
+            };
+            println!(
+                "wrote {} (layer={}, pos={}, expert={}, kv_len={}, gpu_vs_cpu_cos={:.6})",
+                output.display(),
+                dump.layer,
+                dump.position,
+                dump.expert_id,
+                dump.kv_len,
+                cos,
             );
             ExitCode::SUCCESS
         }
@@ -2213,6 +2332,7 @@ fn parse_cli() -> Cli {
     let mut step_logit_top_k = 10usize;
     let mut step_layer_position = 129usize;
     let mut step_attn_layer = 2usize;
+    let mut step_moe_expert = 18u32;
     let mut embed_row_token = 71153u32;
     let mut embed_row_gpu = false;
     let mut bf16_ref_dir: Option<PathBuf> = None;
@@ -2389,6 +2509,14 @@ fn parse_cli() -> Cli {
                 if let Some(v) = args.next() {
                     step_attn_layer = v.parse().unwrap_or_else(|_| {
                         eprintln!("invalid --attn-layer");
+                        std::process::exit(2);
+                    });
+                }
+            }
+            "--expert" => {
+                if let Some(v) = args.next() {
+                    step_moe_expert = v.parse().unwrap_or_else(|_| {
+                        eprintln!("invalid --expert");
                         std::process::exit(2);
                     });
                 }
@@ -2718,6 +2846,25 @@ fn parse_cli() -> Cli {
                 output,
                 layer: step_attn_layer,
                 position: step_layer_position,
+            }
+        }
+        Some("step-moe-single-dump") => {
+            let output = output_dir.unwrap_or_else(|| {
+                eprintln!(
+                    "usage: diffgemma-mps step-moe-single-dump -m MODEL -o OUT.json [--expert 18] [-p Hello] [--layers 30] [--seed 42] [--attn-layer 2] [--layer-position 129]"
+                );
+                std::process::exit(2);
+            });
+            Command::StepMoeSingleDump {
+                prompt: prompt.clone(),
+                layers: bench_layers.max(1).min(30),
+                seed,
+                max_seq: step_max_seq.max(64),
+                raw_prompt,
+                output,
+                layer: step_attn_layer,
+                position: step_layer_position,
+                expert: step_moe_expert,
             }
         }
         Some("step-preamble-dump") => {
