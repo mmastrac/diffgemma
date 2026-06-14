@@ -26,7 +26,6 @@ use std::time::Instant;
 
 const STEP_SHADER: &str = include_str!("../../shaders/diffgemma_step.metal");
 const QGEMM_SHADER: &str = include_str!("../../shaders/qgemm.metal");
-const DECODER_SHADER: &str = include_str!("../../shaders/decoder.metal");
 
 pub const HID: usize = 2816;
 pub const VOCAB: usize = 262144;
@@ -481,7 +480,10 @@ impl StepPipelines {
             q4_linear: ctx.compile_kernel(QGEMM_SHADER, "f32_q4_linear")?,
             q4_linear_grouped: ctx.compile_kernel(QGEMM_SHADER, "f32_q4_linear_grouped")?,
             nvfp4_linear: ctx.compile_kernel(QGEMM_SHADER, "f32_nvfp4_linear")?,
-            gelu_swiglu_gate_up: ctx.compile_kernel(DECODER_SHADER, "gelu_swiglu_gate_up")?,
+            gelu_swiglu_gate_up: crate::kernels::sub::gelu_swiglu_gate_up::pipeline_for(
+                ctx,
+                crate::kernels::sub::variant::KernelVariant::PRODUCTION,
+            )?,
             moe_grouped: simple("k_moe_grouped")?,
             moe_grouped_nvfp4: simple("k_moe_grouped_nvfp4")?,
             moe_grouped_act_probe: simple("k_moe_grouped_act_probe")?,

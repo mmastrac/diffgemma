@@ -1,6 +1,6 @@
 //! Soft embeddings and related GPU embed ops (`.dgq` q8 table).
 
-use crate::kernels::sub::softmax_rows;
+use crate::kernels::sub::{gather_prob_cols, softmax_rows, vec_fill_zero, vec_scale_inplace};
 use crate::metal::batched_kernels as bk;
 use crate::metal::batch::{begin_engine_batch, GpuBatch};
 use crate::metal::dgq_gpu::Q8LinearGpu;
@@ -11,7 +11,7 @@ use crate::model::embed::LM_HEAD_CHUNK;
 use crate::safetensors::Error;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder, MTLSize};
+use objc2_metal::MTLBuffer;
 
 pub fn sc_log_enabled() -> bool {
     std::env::var("DGQ_LOG_SC").ok().as_deref() == Some("1")
@@ -169,28 +169,16 @@ pub fn gather_prob_cols_gpu_buf(
     chunk: usize,
 ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
     let buf_out = batch.alloc_f32_out(seq_len * chunk)?;
+    let buf_dump = batch.alloc_f32_out(1)?;
     let params = [
         seq_len as u32,
         vocab as u32,
         v0 as u32,
         chunk as u32,
     ];
-    let tg = MTLSize {
-        width: 16,
-        height: 16,
-        depth: 1,
-    };
-    let grid = MTLSize {
-        width: (chunk + 15) / 16,
-        height: seq_len,
-        depth: 1,
-    };
+    let (grid, tg) = gather_prob_cols::dispatch_shape(seq_len, chunk);
     batch.dispatch_with_grid(&kernels.gather_prob_cols.pipeline, grid, tg, |enc| {
-        unsafe {
-            enc.setBuffer_offset_atIndex(Some(probs), 0, 0);
-            enc.setBuffer_offset_atIndex(Some(&buf_out), 0, 1);
-        }
-        crate::metal::batch::set_bytes(enc, &params, 2);
+        gather_prob_cols::bind_gpu_buffers(&enc, probs, &buf_out, &buf_dump, &params);
     });
     Ok(buf_out)
 }
@@ -201,12 +189,9 @@ pub fn vec_fill_zero_gpu_buf(
     buf: &ProtocolObject<dyn MTLBuffer>,
     len: usize,
 ) {
+    let buf_dump = batch.alloc_f32_out(1).expect("dump buf");
     batch.dispatch_1d_ranged(&kernels.vec_fill_zero.pipeline, len, |enc, base, chunk| {
-        let range = [base, chunk];
-        unsafe {
-            enc.setBuffer_offset_atIndex(Some(buf), 0, 0);
-        }
-        crate::metal::batch::set_bytes(enc, &range, 1);
+        vec_fill_zero::bind_gpu_buffers(&enc, buf, &buf_dump, base, chunk);
     });
 }
 
@@ -218,12 +203,9 @@ pub fn vec_scale_gpu_buf(
     scale: f32,
 ) {
     let len_u = len as u32;
+    let buf_dump = batch.alloc_f32_out(1).expect("dump buf");
     batch.dispatch_1d(&kernels.vec_scale.pipeline, len, |enc| {
-        unsafe {
-            enc.setBuffer_offset_atIndex(Some(buf), 0, 0);
-        }
-        crate::metal::batch::set_bytes(enc, &scale, 1);
-        crate::metal::batch::set_bytes(enc, &len_u, 2);
+        vec_scale_inplace::bind_gpu_buffers(&enc, buf, &buf_dump, scale, len_u);
     });
 }
 

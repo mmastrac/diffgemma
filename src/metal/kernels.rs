@@ -1,3 +1,4 @@
+use crate::kernels::sub::variant::KernelVariant;
 use crate::metal::buffer::BufferPool;
 use crate::metal::device::{ComputePipeline, MetalContext};
 use crate::safetensors::Error;
@@ -8,7 +9,6 @@ use objc2_metal::{
     MTLComputePipelineState, MTLSize,
 };
 
-const DECODER_SHADER: &str = include_str!("../../shaders/decoder.metal");
 
 /// One-byte scratch for optional dump buffer slot (compiled out when dump_stage=0).
 fn dummy_dump_buf(
@@ -38,40 +38,27 @@ pub struct GpuKernels {
 
 impl GpuKernels {
     pub fn new(ctx: &MetalContext) -> Result<Self, Error> {
-        let names = [
-            "vec_add_inplace",
-            "gather_rows",
-            "vec_mul_inplace",
-            "vec_scale_inplace",
-            "router_scale_rows",
-        ];
-        let pipelines = ctx.compile_kernels(DECODER_SHADER, &names)?;
-        let prod = crate::kernels::sub::variant::KernelVariant::PRODUCTION;
-        let rms_norm = crate::kernels::sub::rms_norm_rows::pipeline_for(ctx, prod)?;
-        let rms_norm_no_scale =
-            crate::kernels::sub::rms_norm_rows_no_scale::pipeline_for(ctx, prod)?;
-        let softmax_rows = crate::kernels::sub::softmax_rows::pipeline_for(ctx, prod)?;
-        let gelu = crate::kernels::sub::gelu_pytorch_tanh::pipeline_for(ctx, prod)?;
-        let swiglu_mul = crate::kernels::sub::swiglu_mul::pipeline_for(ctx, prod)?;
-        let gelu_swiglu_gate_up =
-            crate::kernels::sub::gelu_swiglu_gate_up::pipeline_for(ctx, prod)?;
-        let router_top_k = crate::kernels::sub::router_top_k_rows::pipeline_for(ctx, prod)?;
-        let mut it = pipelines.into_iter().rev();
+        use crate::kernels::sub::{
+            gather_prob_cols, gather_rows, gelu_pytorch_tanh, gelu_swiglu_gate_up, rms_norm_rows,
+            rms_norm_rows_no_scale, router_scale_rows, router_top_k_rows, softmax_rows,
+            swiglu_mul, vec_add_inplace, vec_fill_zero, vec_mul_inplace, vec_scale_inplace,
+        };
+        let prod = KernelVariant::PRODUCTION;
         Ok(Self {
-            vec_fill_zero: ctx.compile_kernel(DECODER_SHADER, "vec_fill_zero")?,
-            gather_prob_cols: ctx.compile_kernel(DECODER_SHADER, "gather_prob_cols")?,
-            router_top_k,
-            gelu_swiglu_gate_up,
-            swiglu_mul,
-            gelu,
-            softmax_rows,
-            router_scale: it.next().ok_or(Error::Format("pipeline missing"))?,
-            vec_scale: it.next().ok_or(Error::Format("pipeline missing"))?,
-            vec_mul: it.next().ok_or(Error::Format("pipeline missing"))?,
-            gather_rows: it.next().ok_or(Error::Format("pipeline missing"))?,
-            vec_add: it.next().ok_or(Error::Format("pipeline missing"))?,
-            rms_norm_no_scale,
-            rms_norm,
+            vec_add: vec_add_inplace::pipeline_for(ctx, prod)?,
+            gather_rows: gather_rows::pipeline_for(ctx, prod)?,
+            vec_mul: vec_mul_inplace::pipeline_for(ctx, prod)?,
+            vec_scale: vec_scale_inplace::pipeline_for(ctx, prod)?,
+            router_scale: router_scale_rows::pipeline_for(ctx, prod)?,
+            gelu: gelu_pytorch_tanh::pipeline_for(ctx, prod)?,
+            swiglu_mul: swiglu_mul::pipeline_for(ctx, prod)?,
+            gelu_swiglu_gate_up: gelu_swiglu_gate_up::pipeline_for(ctx, prod)?,
+            softmax_rows: softmax_rows::pipeline_for(ctx, prod)?,
+            router_top_k: router_top_k_rows::pipeline_for(ctx, prod)?,
+            gather_prob_cols: gather_prob_cols::pipeline_for(ctx, prod)?,
+            vec_fill_zero: vec_fill_zero::pipeline_for(ctx, prod)?,
+            rms_norm_no_scale: rms_norm_rows_no_scale::pipeline_for(ctx, prod)?,
+            rms_norm: rms_norm_rows::pipeline_for(ctx, prod)?,
         })
     }
 
@@ -187,16 +174,16 @@ impl GpuKernels {
         BufferPool::write_f32(&buf_o, out);
         BufferPool::write_f32(&buf_a, addend);
         let len = out.len() as u32;
+        let buf_dump = dummy_dump_buf(pool, device)?;
         run_1d(queue, &self.vec_add.pipeline, out.len(), |enc| {
-            unsafe {
-                enc.setBuffer_offset_atIndex(Some(&buf_o), 0, 0);
-                enc.setBuffer_offset_atIndex(Some(&buf_a), 0, 1);
-            }
-            set_bytes(enc, &len, 2);
+            crate::kernels::sub::vec_add_inplace::bind_gpu_buffers(
+                &enc, &buf_o, &buf_a, &buf_dump, len,
+            );
         })?;
         BufferPool::read_f32(&buf_o, out);
         pool.release(bytes, buf_o);
         pool.release(bytes, buf_a);
+        pool.release(4, buf_dump);
         Ok(())
     }
 
@@ -221,16 +208,16 @@ impl GpuKernels {
         BufferPool::write_f32(&buf_a, a);
         BufferPool::write_f32(&buf_b, b);
         let len = a.len() as u32;
+        let buf_dump = dummy_dump_buf(pool, device)?;
         run_1d(queue, &self.vec_mul.pipeline, a.len(), |enc| {
-            unsafe {
-                enc.setBuffer_offset_atIndex(Some(&buf_a), 0, 0);
-                enc.setBuffer_offset_atIndex(Some(&buf_b), 0, 1);
-            }
-            set_bytes(enc, &len, 2);
+            crate::kernels::sub::vec_mul_inplace::bind_gpu_buffers(
+                &enc, &buf_a, &buf_b, &buf_dump, len,
+            );
         })?;
         BufferPool::read_f32(&buf_a, a);
         pool.release(bytes, buf_a);
         pool.release(bytes, buf_b);
+        pool.release(4, buf_dump);
         Ok(())
     }
 
@@ -248,15 +235,15 @@ impl GpuKernels {
             .ok_or(Error::Format("Metal buffer alloc failed"))?;
         BufferPool::write_f32(&buf, x);
         let len = x.len() as u32;
+        let buf_dump = dummy_dump_buf(pool, device)?;
         run_1d(queue, &self.vec_scale.pipeline, x.len(), |enc| {
-            unsafe {
-                enc.setBuffer_offset_atIndex(Some(&buf), 0, 0);
-            }
-            set_bytes(enc, &scale, 1);
-            set_bytes(enc, &len, 2);
+            crate::kernels::sub::vec_scale_inplace::bind_gpu_buffers(
+                &enc, &buf, &buf_dump, scale, len,
+            );
         })?;
         BufferPool::read_f32(&buf, x);
         pool.release(bytes, buf);
+        pool.release(4, buf_dump);
         Ok(())
     }
 
@@ -286,17 +273,16 @@ impl GpuKernels {
         BufferPool::write_f32(&buf_x, x);
         BufferPool::write_f32(&buf_s, scale);
         let dims = [seq_len as u32, hidden as u32];
+        let buf_dump = dummy_dump_buf(pool, device)?;
         run_1d(queue, &self.router_scale.pipeline, seq_len, |enc| {
-            unsafe {
-                enc.setBuffer_offset_atIndex(Some(&buf_x), 0, 0);
-                enc.setBuffer_offset_atIndex(Some(&buf_s), 0, 1);
-            }
-            set_bytes(enc, &dims, 2);
-            set_bytes(enc, &root, 3);
+            crate::kernels::sub::router_scale_rows::bind_gpu_buffers(
+                &enc, &buf_x, &buf_s, &buf_dump, &dims, root,
+            );
         })?;
         BufferPool::read_f32(&buf_x, x);
         pool.release(x_bytes, buf_x);
         pool.release(s_bytes, buf_s);
+        pool.release(4, buf_dump);
         Ok(())
     }
 
@@ -358,16 +344,6 @@ impl GpuKernels {
         pool.release(bytes, buf_u);
         pool.release(4, buf_dump);
         Ok(())
-    }
-}
-
-fn set_bytes<T>(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, value: &T, index: usize) {
-    unsafe {
-        encoder.setBytes_length_atIndex(
-            std::ptr::NonNull::from_ref(value).cast(),
-            std::mem::size_of_val(value),
-            index,
-        );
     }
 }
 

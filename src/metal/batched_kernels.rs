@@ -1,8 +1,11 @@
 //! Elementwise kernels encoded into a shared `GpuBatch`.
 
 use crate::fast_slice::FastSlice;
-use crate::kernels::sub::{gelu_pytorch_tanh, rms_norm_rows, rms_norm_rows_no_scale, softmax_rows, swiglu_mul};
-use crate::metal::batch::{set_bytes, GpuBatch};
+use crate::kernels::sub::{
+    gather_rows, gelu_pytorch_tanh, rms_norm_rows, rms_norm_rows_no_scale, router_scale_rows,
+    softmax_rows, swiglu_mul, vec_add_inplace, vec_scale_inplace,
+};
+use crate::metal::batch::GpuBatch;
 use crate::metal::kernels::GpuKernels;
 use crate::safetensors::Error;
 use objc2::rc::Retained;
@@ -218,14 +221,12 @@ pub fn router_scale_rows_gpu_buf(
         return Err(Error::Format("router_scale shape mismatch"));
     }
     let buf_scale = batch.alloc_f32(scale)?;
+    let buf_dump = batch.alloc_f32_out(1)?;
     let dims = [seq_len as u32, hidden as u32];
     batch.dispatch_1d(&kernels.router_scale.pipeline, seq_len, |enc| {
-        unsafe {
-            enc.setBuffer_offset_atIndex(Some(buf), 0, 0);
-            enc.setBuffer_offset_atIndex(Some(&buf_scale), 0, 1);
-        }
-        set_bytes(enc, &dims, 2);
-        set_bytes(enc, &root, 3);
+        router_scale_rows::bind_gpu_buffers(
+            &enc, buf, &buf_scale, &buf_dump, &dims, root,
+        );
     });
     Ok(())
 }
@@ -262,17 +263,19 @@ pub fn gather_rows_gpu(
     };
     let buf_idx = batch.alloc_bytes(idx_bytes)?;
     let buf_dst = batch.alloc_f32_out(batch_size * hidden)?;
-    let dims = [0u32, hidden as u32];
+    let buf_dump = batch.alloc_f32_out(1)?;
     let batch_u = batch_size as u32;
     let grid = batch_size * hidden;
     batch.dispatch_1d(&kernels.gather_rows.pipeline, grid, |enc| {
-        unsafe {
-            enc.setBuffer_offset_atIndex(Some(src), 0, 0);
-            enc.setBuffer_offset_atIndex(Some(&buf_idx), 0, 1);
-            enc.setBuffer_offset_atIndex(Some(&buf_dst), 0, 2);
-        }
-        set_bytes(enc, &dims, 3);
-        set_bytes(enc, &batch_u, 4);
+        gather_rows::bind_gpu_buffers(
+            &enc,
+            src,
+            &buf_idx,
+            &buf_dst,
+            &buf_dump,
+            hidden as u32,
+            batch_u,
+        );
     });
     Ok(buf_dst)
 }
@@ -286,12 +289,9 @@ pub fn vec_add_gpu_bufs(
     len: usize,
 ) -> Result<(), Error> {
     let len_u = len as u32;
+    let buf_dump = batch.alloc_f32_out(1)?;
     batch.dispatch_1d(&kernels.vec_add.pipeline, len, |enc| {
-        unsafe {
-            enc.setBuffer_offset_atIndex(Some(out_buf), 0, 0);
-            enc.setBuffer_offset_atIndex(Some(addend_buf), 0, 1);
-        }
-        set_bytes(enc, &len_u, 2);
+        vec_add_inplace::bind_gpu_buffers(&enc, out_buf, addend_buf, &buf_dump, len_u);
     });
     Ok(())
 }
@@ -308,12 +308,9 @@ pub fn vec_add_inplace(
     let buf_o = batch.alloc_f32(out)?;
     let buf_a = batch.alloc_f32(addend)?;
     let len = out.len() as u32;
+    let buf_dump = batch.alloc_f32_out(1)?;
     batch.dispatch_1d(&kernels.vec_add.pipeline, out.len(), |enc| {
-        unsafe {
-            enc.setBuffer_offset_atIndex(Some(&buf_o), 0, 0);
-            enc.setBuffer_offset_atIndex(Some(&buf_a), 0, 1);
-        }
-        set_bytes(enc, &len, 2);
+        vec_add_inplace::bind_gpu_buffers(&enc, &buf_o, &buf_a, &buf_dump, len);
     });
     batch.register_read(buf_o, out);
     Ok(())
@@ -327,12 +324,9 @@ pub fn vec_scale_inplace(
 ) -> Result<(), Error> {
     let buf = batch.alloc_f32(x)?;
     let len = x.len() as u32;
+    let buf_dump = batch.alloc_f32_out(1)?;
     batch.dispatch_1d(&kernels.vec_scale.pipeline, x.len(), |enc| {
-        unsafe {
-            enc.setBuffer_offset_atIndex(Some(&buf), 0, 0);
-        }
-        set_bytes(enc, &scale, 1);
-        set_bytes(enc, &len, 2);
+        vec_scale_inplace::bind_gpu_buffers(&enc, &buf, &buf_dump, scale, len);
     });
     batch.register_read(buf, x);
     Ok(())
