@@ -75,11 +75,41 @@ impl MetalContext {
         gemm_n: u32,
         gemm_k: u32,
     ) -> Result<ComputePipeline, Error> {
+        Self::compile_gemm_subkernel_on_device(device, library, entry, gemm_n, gemm_k, false)
+    }
+
+    /// Specialize a tiled GEMM subkernel from source (N/K function constants 2–3).
+    pub fn compile_gemm_subkernel(
+        &self,
+        source: &str,
+        entry: &str,
+        gemm_n: u32,
+        gemm_k: u32,
+        is_full_layer: bool,
+    ) -> Result<ComputePipeline, Error> {
+        let library = self.compile_library(source)?;
+        Self::compile_gemm_subkernel_on_device(
+            &self.device,
+            &library,
+            entry,
+            gemm_n,
+            gemm_k,
+            is_full_layer,
+        )
+    }
+
+    fn compile_gemm_subkernel_on_device(
+        device: &ProtocolObject<dyn MTLDevice>,
+        library: &ProtocolObject<dyn MTLLibrary>,
+        entry: &str,
+        gemm_n: u32,
+        gemm_k: u32,
+        is_full_layer: bool,
+    ) -> Result<ComputePipeline, Error> {
         let fc = MTLFunctionConstantValues::new();
-        let is_full = false;
         unsafe {
             fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&is_full).cast(),
+                std::ptr::NonNull::from_ref(&is_full_layer).cast(),
                 MTLDataType::Bool,
                 1,
             );

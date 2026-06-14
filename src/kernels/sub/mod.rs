@@ -7,6 +7,8 @@ pub mod gather_prob_cols;
 pub mod gather_rows;
 pub mod gelu_pytorch_tanh;
 pub mod gelu_swiglu_gate_up;
+pub mod gemm_common;
+pub mod gemm_q4;
 pub mod glu_half;
 pub mod gpu_common;
 pub mod half_scale;
