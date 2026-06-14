@@ -53,3 +53,15 @@ pub fn f32_slice_to_f16(data: &[f32]) -> Vec<u16> {
 pub fn f16_slice_to_f32(data: &[u16]) -> Vec<f32> {
     data.iter().map(|&b| f16_bits_to_f32(b)).collect()
 }
+
+/// Round through fp16 like Metal `half(x)`.
+pub fn round_half(v: f32) -> f32 {
+    f16_bits_to_f32(f32_to_f16_bits(v))
+}
+
+pub const SOFTCAP: f32 = 30.0;
+
+pub fn softcap_f32(v: f32) -> f32 {
+    let x = (v / SOFTCAP).clamp(-20.0, 20.0);
+    round_half(x.tanh() * SOFTCAP)
+}

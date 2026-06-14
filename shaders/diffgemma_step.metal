@@ -212,68 +212,6 @@ inline float temp_at(uint steps_done, constant StepParams& P) {
     return P.t_min + (P.t_max - P.t_min) * (cur / float(P.max_steps));
 }
 
-// ===================== k_rmsnorm (row; w_off==0 -> no-scale) =====================
-kernel void k_rmsnorm(device const half* x [[buffer(0)]],
-                      device half* y [[buffer(1)]],
-                      device const uchar* blob [[buffer(2)]],
-                      constant ulong& w_off [[buffer(3)]],
-                      constant uint& dim [[buffer(4)]],
-                      uint row [[threadgroup_position_in_grid]],
-                      uint lid [[thread_position_in_threadgroup]],
-                      uint tpg [[threads_per_threadgroup]]) {
-    threadgroup float red[8];
-    device const half* xr = x + (ulong)row * dim;
-    float acc = 0.f;
-    for (uint i = lid; i < dim; i += tpg) { float v = float(xr[i]); acc += v*v; }
-    acc = simd_sum(acc);
-    uint sg = lid / 32, nsg = (tpg + 31) / 32;
-    if ((lid & 31) == 0) red[sg] = acc;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid == 0) {
-        float t = 0.f;
-        for (uint i = 0; i < nsg; ++i) t += red[i];
-        red[0] = rsqrt(t / float(dim) + RMS_EPS);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float inv = red[0];
-    for (uint i = lid; i < dim; i += tpg) {
-        float v = float(xr[i]) * inv;
-        if (w_off != 0) v *= bf16_bytes(blob + w_off + 2ul*i);
-        y[(ulong)row * dim + i] = half(v);
-    }
-}
-
-// RMSNorm reading f32 activations (MoE scatter output) and writing half.
-kernel void k_rmsnorm_f32(device const float* x [[buffer(0)]],
-                          device half* y [[buffer(1)]],
-                          device const uchar* blob [[buffer(2)]],
-                          constant ulong& w_off [[buffer(3)]],
-                          constant uint& dim [[buffer(4)]],
-                          uint row [[threadgroup_position_in_grid]],
-                          uint lid [[thread_position_in_threadgroup]],
-                          uint tpg [[threads_per_threadgroup]]) {
-    threadgroup float red[8];
-    device const float* xr = x + (ulong)row * dim;
-    float acc = 0.f;
-    for (uint i = lid; i < dim; i += tpg) { float v = xr[i]; acc += v*v; }
-    acc = simd_sum(acc);
-    uint sg = lid / 32, nsg = (tpg + 31) / 32;
-    if ((lid & 31) == 0) red[sg] = acc;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid == 0) {
-        float t = 0.f;
-        for (uint i = 0; i < nsg; ++i) t += red[i];
-        red[0] = rsqrt(t / float(dim) + RMS_EPS);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float inv = red[0];
-    for (uint i = lid; i < dim; i += tpg) {
-        float v = xr[i] * inv;
-        if (w_off != 0) v *= bf16_bytes(blob + w_off + 2ul*i);
-        y[(ulong)row * dim + i] = half(v);
-    }
-}
-
 // Tile GEMM kernels below require threadgroup size (128, 1, 1): ltid = lid.x, loop stride 128.
 // ===================== k_gemm_q4: y[M,N] = x[M,K] @ Wq4[N,K]^T =====================
 kernel void k_gemm_q4(device const half* x [[buffer(0)]],
@@ -586,30 +524,6 @@ kernel void k_attention(device const half* q [[buffer(0)]],
         uint idx = ltid + i*tpg_w;
         if (idx < hd) ov[idx] = half(acc[i] / l);
     }
-}
-
-// ===================== k_residual (+optional layer_scalar, V7) =====================
-kernel void k_residual(device const half* a [[buffer(0)]],
-                       device const half* b [[buffer(1)]],
-                       device half* y [[buffer(2)]],
-                       device const uchar* blob [[buffer(3)]],
-                       constant ulong& scal_off [[buffer(4)]],
-                       uint i [[thread_position_in_grid]]) {
-    float s = scal_off ? bf16_bytes(blob + scal_off) : 1.0f;
-    y[i] = half((float(a[i]) + float(b[i])) * s);
-}
-// add f32 source variant for moe_out
-kernel void k_residual_f32b(device const half* a [[buffer(0)]],
-                            device const float* b [[buffer(1)]],
-                            device half* y [[buffer(2)]],
-                            uint i [[thread_position_in_grid]]) {
-    y[i] = half(float(a[i]) + b[i]);
-}
-kernel void k_glu(device const half* gate [[buffer(0)]],
-                  device const half* up [[buffer(1)]],
-                  device half* y [[buffer(2)]],
-                  uint i [[thread_position_in_grid]]) {
-    y[i] = half(gelu_tanh(float(gate[i])) * float(up[i]));
 }
 
 // ===================== k_router (V10; audit item 16: two-level reduction) =====================
@@ -958,14 +872,6 @@ kernel void k_sc_probs(device const half* logits [[buffer(0)]],
     }
 }
 
-kernel void k_half_scale(device half* y [[buffer(0)]],
-                         constant uint& n [[buffer(1)]],
-                         constant float& scale [[buffer(2)]],
-                         uint gid [[thread_position_in_grid]]) {
-    if (gid >= n) return;
-    y[gid] = half(float(y[gid]) * scale);
-}
-
 // ============ k_sc_softembed: soft[m,d] = (softmax(prev logits) @ embed)[m,d] * sqrt(H) ============
 // Uses A_RS_SC (t=1 stats). first_step -> zeros (SC MLP still runs; VERIFY-SC).
 kernel void k_sc_softembed(device const half* logits [[buffer(0)]],
@@ -989,18 +895,6 @@ kernel void k_sc_softembed(device const half* logits [[buffer(0)]],
     soft[(ulong)tok*HID + d] = half(acc * EMBED_SCALE);
     // PERF: O(vocab*hid) restream per step; replace with materialized-probs tiled q8 GEMM
     // (reuse k_gemm_q8 with probs as x) once parity passes.
-}
-
-kernel void k_softcap(device half* logits [[buffer(0)]],
-                      constant uint& base [[buffer(1)]],
-                      constant uint& len [[buffer(2)]],
-                      uint gid [[thread_position_in_grid]]) {
-    if (gid >= len) return;
-    uint i = base + gid;
-    float v = float(logits[i]);
-    // Metal fast-math tanh overflows for large |x|; clamp preserves softcap saturation.
-    float x = clamp(v / SOFTCAP, -20.0f, 20.0f);
-    logits[i] = half(tanh(x) * SOFTCAP);
 }
 
 // ======================= sampler =======================
