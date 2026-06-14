@@ -122,6 +122,7 @@ Buffer ABI in `diffgemma_step.metal` (version-bump to change).
 | P1.8 | **Encoder prefill path** — respects `StepGenerateConfig.encoder_use_mps_q4`; generate defaults native Q4. | **done** | Correct KV + readable entropy @ 30L with defaults |
 | P1.9 | **MPS encoder KV parity** — `step-kv-parity`; MPS dense + CPU MoE hybrid | **done** | `max_kv_diff` < 0.5 @ 30L |
 | P1.10 | **Step-kernel MPS Q4** — fix `dequant_q4_matrix` grid; `step-q4-parity` gate | **done** | MPS min_ent ≪ ln vocab; |Δmin_ent| < 3 vs native @ 30L |
+| P1.11 | **Step-kernel MPS NVFP4** — `step-nvfp4-parity` gate; fused half-dequant in `gemm_block` | **done** | Parity passes @ 30L; MPS ≈ fused speed on M3 (dequant-bound) |
 | P2.0 | **MTLBinaryArchive pipeline cache** — persist compiled compute pipeline ISA across restarts. | **done** | Archive load/save under `~/.cache/diffgemma-mps/metal-pipelines/` |
 
 **P1 exit (unchanged):** `generate-monolithic -p "Hello"` default flags → coherent reply.

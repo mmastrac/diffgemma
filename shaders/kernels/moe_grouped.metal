@@ -3,6 +3,7 @@ using namespace metal;
 
 #include "fc_axes.metal"
 #include "dequant.metal"
+#include "qgemm_grouped.metal"
 #include "activations.metal"
 #include "attention_device.metal"
 #include "moe_router_device.metal"
@@ -96,14 +97,8 @@ kernel void moe_grouped(
             device const uchar* grow = blob + gu_body + (ulong)r * hid_row;
             device const uchar* urow = blob + gu_body + (ulong)(r + dims.moe_ff) * hid_row;
             for (uint k0 = 0; k0 < dims.hidden; k0 += 32u) {
-                float wg[32], wu[32];
-                dequant_nvfp4_tile(grow, dims.hidden, k0, wg, gu_scale);
-                dequant_nvfp4_tile(urow, dims.hidden, k0, wu, gu_scale);
-                for (uint i = 0; i < 32u; ++i) {
-                    float xv = float(x[k0 + i]);
-                    g += wg[i] * xv;
-                    u += wu[i] * xv;
-                }
+                g += dot_nvfp4_k32_half(x, grow, dims.hidden, k0, gu_scale);
+                u += dot_nvfp4_k32_half(x, urow, dims.hidden, k0, gu_scale);
             }
         } else {
             device const uchar* grow = blob + gu_body + (ulong)r * q4_row_bytes(dims.hidden);
@@ -138,11 +133,7 @@ kernel void moe_grouped(
         if (is_nvfp4) {
             device const uchar* drow = blob + dn_body + (ulong)d * ff_row;
             for (uint k0 = 0; k0 < dims.moe_ff; k0 += 32u) {
-                float wd[32];
-                dequant_nvfp4_tile(drow, dims.moe_ff, k0, wd, dn_scale);
-                for (uint i = 0; i < 32u; ++i) {
-                    o += wd[i] * act[k0 + i];
-                }
+                o += dot_nvfp4_k32_act(act, drow, dims.moe_ff, k0, dn_scale);
             }
         } else {
             device const uchar* drow = blob + dn_body + (ulong)d * q4_row_bytes(dims.moe_ff);

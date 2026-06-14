@@ -18,6 +18,27 @@ inline void dequant_q4_group(device const uchar *g, thread float *out32) {
     }
 }
 
+/// Fused GEMM path: dequant one Q4 group directly to half (skips f32 tile + half() round-trip).
+inline void dequant_q4_group_half(device const uchar *g, thread half *out32) {
+    half s = half(bf16_bytes(g));
+    half mn = half(bf16_bytes(g + 2));
+    for (uint i = 0; i < 16; ++i) {
+        uchar b = g[4 + i];
+        out32[2 * i] = s * half(b & 0x0F) + mn;
+        out32[2 * i + 1] = s * half(b >> 4) + mn;
+    }
+}
+
+inline void dequant_q4_group_half_tg(device const uchar *g, threadgroup half *out32) {
+    half s = half(bf16_bytes(g));
+    half mn = half(bf16_bytes(g + 2));
+    for (uint i = 0; i < 16; ++i) {
+        uchar b = g[4 + i];
+        out32[2 * i] = s * half(b & 0x0F) + mn;
+        out32[2 * i + 1] = s * half(b >> 4) + mn;
+    }
+}
+
 /// Column-indexed Q4 decode (parity vs `dequant_q4_group` / CPU `q4_weight_at`).
 inline float q4_at_col(device const uchar *row_base, uint col, uint K) {
     uint g = col / 32u;
@@ -88,6 +109,21 @@ inline float e2m1_to_f32(uint q) {
     return (q & 8u) ? -mag : mag;
 }
 
+inline half e2m1_to_half(uint q) {
+    const half mags[8] = {
+        half(0), half(0.5), half(1), half(1.5),
+        half(2), half(3), half(4), half(6),
+    };
+    half mag = mags[q & 7u];
+    return (q & 8u) ? -mag : mag;
+}
+
+inline half fp8_e4m3_to_half(uchar b) {
+    ushort v = ushort(b & 127u) << 7;
+    half converted = half(fp16_bits_to_f32(v)) * half(256.0);
+    return (b & 128u) ? -converted : converted;
+}
+
 inline ulong nvfp4_row_bytes(uint K) {
     return ulong((K + 1u) / 2u + (K + 15u) / 16u);
 }
@@ -108,10 +144,67 @@ inline void dequant_nvfp4_group(device const uchar *row, uint K, uint g,
     }
 }
 
+inline void dequant_nvfp4_group_half(device const uchar *row, uint K, uint g,
+                                     thread half *out16, half gscale_h) {
+    uint data_len = (K + 1u) / 2u;
+    half scale = fp8_e4m3_to_half(row[data_len + g]) * gscale_h;
+    device const uchar *packed = row + g * 8u;
+    for (uint i = 0; i < 16u; ++i) {
+        uchar byte = packed[i / 2u];
+        uint q = (i & 1u) ? uint(byte >> 4) : uint(byte & 0x0Fu);
+        out16[i] = e2m1_to_half(q) * scale;
+    }
+}
+
 inline void dequant_nvfp4_tile(device const uchar *row, uint K, uint k0,
                                thread float *out32, float gscale) {
     dequant_nvfp4_group(row, K, k0 / 16u, out32, gscale);
     dequant_nvfp4_group(row, K, k0 / 16u + 1u, out32 + 16, gscale);
+}
+
+inline void dequant_nvfp4_tile_half(device const uchar *row, uint K, uint k0,
+                                    thread half *out32, half gscale_h) {
+    dequant_nvfp4_group_half(row, K, k0 / 16u, out32, gscale_h);
+    dequant_nvfp4_group_half(row, K, k0 / 16u + 1u, out32 + 16, gscale_h);
+}
+
+/// Fused 32-wide NVFP4 tile: two group scales decoded once, direct half output.
+inline void dequant_nvfp4_tile_half_fused(device const uchar *row, uint K, uint k0,
+                                          thread half *out32, half gscale_h) {
+    uint data_len = (K + 1u) / 2u;
+    uint g0 = k0 / 16u;
+    uint g1 = g0 + 1u;
+    half scale0 = fp8_e4m3_to_half(row[data_len + g0]) * gscale_h;
+    half scale1 = fp8_e4m3_to_half(row[data_len + g1]) * gscale_h;
+    device const uchar *packed0 = row + g0 * 8u;
+    device const uchar *packed1 = row + g1 * 8u;
+    for (uint i = 0; i < 16u; ++i) {
+        uchar byte = packed0[i / 2u];
+        uint q = (i & 1u) ? uint(byte >> 4) : uint(byte & 0x0Fu);
+        out32[i] = e2m1_to_half(q) * scale0;
+        byte = packed1[i / 2u];
+        q = (i & 1u) ? uint(byte >> 4) : uint(byte & 0x0Fu);
+        out32[16u + i] = e2m1_to_half(q) * scale1;
+    }
+}
+
+inline void dequant_nvfp4_tile_half_fused_tg(device const uchar *row, uint K, uint k0,
+                                             threadgroup half *out32, half gscale_h) {
+    uint data_len = (K + 1u) / 2u;
+    uint g0 = k0 / 16u;
+    uint g1 = g0 + 1u;
+    half scale0 = fp8_e4m3_to_half(row[data_len + g0]) * gscale_h;
+    half scale1 = fp8_e4m3_to_half(row[data_len + g1]) * gscale_h;
+    device const uchar *packed0 = row + g0 * 8u;
+    device const uchar *packed1 = row + g1 * 8u;
+    for (uint i = 0; i < 16u; ++i) {
+        uchar byte = packed0[i / 2u];
+        uint q = (i & 1u) ? uint(byte >> 4) : uint(byte & 0x0Fu);
+        out32[i] = e2m1_to_half(q) * scale0;
+        byte = packed1[i / 2u];
+        q = (i & 1u) ? uint(byte >> 4) : uint(byte & 0x0Fu);
+        out32[16u + i] = e2m1_to_half(q) * scale1;
+    }
 }
 
 /// Column decode for one NVFP4 matrix row (`matrix` includes 4-byte global scale header).

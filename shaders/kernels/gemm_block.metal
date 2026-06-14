@@ -25,11 +25,11 @@ kernel void gemm_block(
     simdgroup_float8x8 acc0(0.f), acc1(0.f), acc2(0.f), acc3(0.f);
 
     const bool is_nvfp4 = (K_QUANT_FORMAT == QUANT_NVFP4);
-    float gscale = 0.f;
+    half gscale_h = half(0);
     ulong body = w_off;
     ulong rowB = 0ul;
     if (is_nvfp4) {
-        gscale = as_type<float>(*(device const uint *)(blob + w_off));
+        gscale_h = half(as_type<float>(*(device const uint *)(blob + w_off)));
         body = w_off + 4ul;
         rowB = nvfp4_row_bytes(K);
     } else {
@@ -42,17 +42,13 @@ kernel void gemm_block(
             tx[mm][kk] = (m0 + mm < M) ? x[(ulong)(m0 + mm) * K + k0 + kk] : half(0);
         }
         for (uint r = ltid; r < 32; r += 128) {
-            float tmp[32];
             if (is_nvfp4) {
                 device const uchar *row = blob + body + (ulong)(n0 + r) * rowB;
-                dequant_nvfp4_tile(row, K, k0, tmp, gscale);
+                dequant_nvfp4_tile_half_fused_tg(row, K, k0, &tw[r][0], gscale_h);
             } else {
-                dequant_q4_group(
+                dequant_q4_group_half_tg(
                     blob + body + (ulong)(n0 + r) * rowB + (ulong)(k0 / 32) * 20ul,
-                    tmp);
-            }
-            for (uint kk = 0; kk < 32; ++kk) {
-                tw[r][kk] = half(tmp[kk]);
+                    &tw[r][0]);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

@@ -3511,7 +3511,7 @@ pub fn run_step_forward(model_dir: &Path, cfg: &StepSmokeConfig) -> Result<StepF
 }
 
 #[derive(Debug)]
-pub struct StepQ4MpsParityResult {
+pub struct StepBlockMpsParityResult {
     pub layers: usize,
     pub kv_len: u32,
     pub hidden_max_abs: f32,
@@ -3521,15 +3521,18 @@ pub struct StepQ4MpsParityResult {
     pub pass: bool,
 }
 
-/// P1.10: native `k_gemm_q4` vs MPS dequant→matmul forward pass (optional KV prefill).
-pub fn run_step_q4_mps_parity(
+/// Back-compat alias.
+pub type StepQ4MpsParityResult = StepBlockMpsParityResult;
+
+/// Native fused `gemm_block` vs MPS dequant→matmul forward pass (optional KV prefill).
+pub fn run_step_block_mps_parity(
     model_dir: &Path,
     layers: usize,
     kv_len: u32,
     seed: u64,
     max_seq: usize,
     prefill_token_ids: Option<Vec<u32>>,
-) -> Result<StepQ4MpsParityResult, Error> {
+) -> Result<StepBlockMpsParityResult, Error> {
     let base = StepSmokeConfig {
         layers,
         steps: 1,
@@ -3571,7 +3574,7 @@ pub fn run_step_q4_mps_parity(
         && mps_min_ent < ln_vocab - 0.5
         && (native_min_ent - mps_min_ent).abs() < 3.0;
 
-    Ok(StepQ4MpsParityResult {
+    Ok(StepBlockMpsParityResult {
         layers,
         kv_len,
         hidden_max_abs,
@@ -3580,6 +3583,60 @@ pub fn run_step_q4_mps_parity(
         mps_min_ent,
         pass,
     })
+}
+
+/// P1.10 Q4 gate: requires `.dgq` q4/q5 weights.
+pub fn run_step_q4_mps_parity(
+    model_dir: &Path,
+    layers: usize,
+    kv_len: u32,
+    seed: u64,
+    max_seq: usize,
+    prefill_token_ids: Option<Vec<u32>>,
+) -> Result<StepBlockMpsParityResult, Error> {
+    let store = crate::dgq::DgqStore::open(model_dir)?;
+    match store.profile() {
+        crate::dgq::QuantProfile::Q4 | crate::dgq::QuantProfile::Q5 => {}
+        other => {
+            return Err(Error::NotFound(format!(
+                "step-q4-parity requires q4/q5 .dgq weights (got {other:?})"
+            )));
+        }
+    }
+    run_step_block_mps_parity(
+        model_dir,
+        layers,
+        kv_len,
+        seed,
+        max_seq,
+        prefill_token_ids,
+    )
+}
+
+/// NVFP4 dense GEMM gate: requires `.dgq` nvfp4 weights.
+pub fn run_step_nvfp4_mps_parity(
+    model_dir: &Path,
+    layers: usize,
+    kv_len: u32,
+    seed: u64,
+    max_seq: usize,
+    prefill_token_ids: Option<Vec<u32>>,
+) -> Result<StepBlockMpsParityResult, Error> {
+    let store = crate::dgq::DgqStore::open(model_dir)?;
+    if store.profile() != crate::dgq::QuantProfile::Nvfp4 {
+        return Err(Error::NotFound(format!(
+            "step-nvfp4-parity requires nvfp4 .dgq weights (got {:?})",
+            store.profile()
+        )));
+    }
+    run_step_block_mps_parity(
+        model_dir,
+        layers,
+        kv_len,
+        seed,
+        max_seq,
+        prefill_token_ids,
+    )
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -75,7 +75,8 @@ pub use step_kernel::{
     DenoiseStepStats, trace_entropy_enabled, LayerAttnCapture, LayerMoeCapture,
     PreambleCapture, SingleExpertMoeCapture,
     bench_step_kernel_profile, StepBenchResult, StepFinishMode, StepForwardOutput, StepProfileResult,
-    StepProbeResult, StepQ4MpsParityResult,
+    StepProbeResult, StepBlockMpsParityResult, StepQ4MpsParityResult,
+    run_step_block_mps_parity, run_step_nvfp4_mps_parity,
     StepSmokeConfig, StepSmokeResult, CANVAS, CanvasState, LayerOffsets, RouteScratch, StepParams,
     N_EXPERTS, TOP_K,
 };

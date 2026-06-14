@@ -701,7 +701,8 @@ pub fn generate_monolithic_gpu(
         gen_cfg.sampler.clone(),
         gen_cfg.no_early_stop,
     );
-    // MLX-parity path: native monolithic Q4 unless DGQ_STEP_MPS_Q4=1 / DGQ_MPS_Q4=1.
+    // Native fused GEMM by default for both profiles; opt in MPS with DGQ_STEP_MPS_Q4=1
+    // (step-nvfp4-parity / step-q4-parity gate the MPS path).
     cfg.step_use_mps_q4 = Some(monolithic_step_use_mps_q4());
     cfg.encoder_use_mps_q4 = Some(monolithic_encoder_use_mps_q4());
     if gen_cfg.deterministic

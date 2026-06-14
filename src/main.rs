@@ -181,6 +181,15 @@ enum Command {
         max_seq: usize,
         raw_prompt: bool,
     },
+    StepNvfp4Parity {
+        prompt: Option<String>,
+        prompt_len: usize,
+        layers: usize,
+        kv_len: u32,
+        seed: u64,
+        max_seq: usize,
+        raw_prompt: bool,
+    },
     StepLogitsDump {
         prompt: Option<String>,
         layers: usize,
@@ -367,6 +376,24 @@ fn main() -> ExitCode {
             max_seq,
             raw_prompt,
         } => run_step_q4_parity_cmd(
+            &cli.model_dir,
+            prompt,
+            prompt_len,
+            layers,
+            kv_len,
+            seed,
+            max_seq,
+            raw_prompt,
+        ),
+        Command::StepNvfp4Parity {
+            prompt,
+            prompt_len,
+            layers,
+            kv_len,
+            seed,
+            max_seq,
+            raw_prompt,
+        } => run_step_nvfp4_parity_cmd(
             &cli.model_dir,
             prompt,
             prompt_len,
@@ -765,7 +792,7 @@ fn run_command(
         Command::StepKvCheck { .. } => ExitCode::FAILURE,
         Command::StepKvParity { .. } => ExitCode::FAILURE,
         Command::StepAttnProbe { .. } => ExitCode::FAILURE,
-        Command::StepQ4Parity { .. } => ExitCode::FAILURE,
+        Command::StepQ4Parity { .. } | Command::StepNvfp4Parity { .. } => ExitCode::FAILURE,
         Command::StepLogitsDump { .. } => ExitCode::FAILURE,
         Command::StepLayerProbe { .. } => ExitCode::FAILURE,
         Command::StepAttnDump { .. } => ExitCode::FAILURE,
@@ -1723,6 +1750,97 @@ fn run_step_q4_parity_cmd(
             ExitCode::FAILURE
         }
     }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn run_step_nvfp4_parity_cmd(
+    model_dir: &std::path::Path,
+    prompt: Option<String>,
+    prompt_len: usize,
+    layers: usize,
+    kv_len: u32,
+    seed: u64,
+    max_seq: usize,
+    raw_prompt: bool,
+) -> ExitCode {
+    use metal::run_step_nvfp4_mps_parity;
+
+    if !dgq::store::looks_like_dgq_dir(model_dir) {
+        eprintln!("error: step-nvfp4-parity requires a .dgq directory");
+        return ExitCode::FAILURE;
+    }
+    let prefill = if kv_len > 0 || prompt.is_some() {
+        let vocab = match crate::config::ModelConfig::load(model_dir) {
+            Ok(c) => c.text_config.vocab_size,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let plen = if kv_len > 0 {
+            kv_len as usize
+        } else {
+            prompt_len
+        };
+        match build_prompt_tokens(model_dir, prompt.as_deref(), plen, vocab, raw_prompt, &[]) {
+            Ok(ids) => Some(ids),
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+    let kv_len_eff = prefill.as_ref().map(|p| p.len() as u32).unwrap_or(kv_len);
+    eprintln!(
+        "step-nvfp4-parity: layers={} kv_len={}",
+        layers.max(1).min(30),
+        kv_len_eff
+    );
+    match run_step_nvfp4_mps_parity(
+        model_dir,
+        layers,
+        kv_len_eff,
+        seed,
+        max_seq.max(64),
+        prefill,
+    ) {
+        Ok(r) => {
+            println!("step-nvfp4-parity:");
+            println!("  layers:              {}", r.layers);
+            println!("  kv_len:              {}", r.kv_len);
+            println!("  hidden_max_abs:      {:.6}", r.hidden_max_abs);
+            println!("  logits_max_abs:      {:.6}", r.logits_max_abs);
+            println!("  native_min_ent:      {:.4}", r.native_min_ent);
+            println!("  mps_min_ent:         {:.4}", r.mps_min_ent);
+            println!("  pass:                {}", r.pass);
+            if r.pass {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn run_step_nvfp4_parity_cmd(
+    _model_dir: &std::path::Path,
+    _prompt: Option<String>,
+    _prompt_len: usize,
+    _layers: usize,
+    _kv_len: u32,
+    _seed: u64,
+    _max_seq: usize,
+    _raw_prompt: bool,
+) -> ExitCode {
+    eprintln!("error: step-nvfp4-parity requires --features metal on macOS");
+    ExitCode::FAILURE
 }
 
 #[cfg(not(all(feature = "metal", target_os = "macos")))]
@@ -2826,6 +2944,15 @@ fn parse_cli() -> Cli {
             max_seq: step_max_seq.max(64),
             raw_prompt,
         },
+        Some("step-nvfp4-parity") => Command::StepNvfp4Parity {
+            prompt: prompt.clone(),
+            prompt_len,
+            layers: bench_layers.max(1).min(30),
+            kv_len: step_kv_len,
+            seed,
+            max_seq: step_max_seq.max(64),
+            raw_prompt,
+        },
         Some("step-logits-dump") => {
             let output = output_dir.unwrap_or_else(|| {
                 eprintln!(
@@ -2985,7 +3112,7 @@ fn parse_cli() -> Cli {
         Some(cmd) => {
             eprintln!("unknown command: {cmd}");
             eprintln!(
-                "usage: diffgemma-mps [-p PROMPT] [--raw] [summary|config|weights <name>|quantize|convert-model|step-smoke|step-probe|step-kv-check|step-kv-parity|step-q4-parity|step-verify|step-ci|step-parity|bench-step-kernel|bench-step|bench-prefill|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-monolithic|generate-monolithic-parity|generate-parity|chat|tokenize <text>|gemm|attention]"
+                "usage: diffgemma-mps [-p PROMPT] [--raw] [summary|config|weights <name>|quantize|convert-model|step-smoke|step-probe|step-kv-check|step-kv-parity|step-q4-parity|step-nvfp4-parity|step-verify|step-ci|step-parity|bench-step-kernel|bench-step|bench-prefill|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-monolithic|generate-monolithic-parity|generate-parity|chat|tokenize <text>|gemm|attention]"
             );
             eprintln!("  default (no command): generate-gpu with --features metal (or generate-monolithic with DGQ_MONOLITHIC=1 / --monolithic on .dgq)");
             eprintln!("  prompts: chat template applied by default; use --raw for bare BPE (-p \"Hello\" -> [9259])");
