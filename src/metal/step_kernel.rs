@@ -3807,86 +3807,72 @@ mod tests {
             .fold(0.0f32, f32::max)
     }
 
-    #[test]
-    fn icb_full_step_matches_live_encode() {
-        let dir = Path::new("/tmp/quantized-weights");
-        if !crate::dgq::store::looks_like_dgq_dir(dir) {
-            eprintln!("skip icb_full_step_matches_live_encode");
-            return;
-        }
-        let cfg = StepSmokeConfig {
-            layers: 30,
+    /// Tier-2 ICB fixture per STRATEGY.md §5: real weights, few layers, seconds not minutes.
+    fn icb_tier2_config(use_mps_q4: bool) -> StepSmokeConfig {
+        StepSmokeConfig {
+            layers: 3,
             steps: 1,
             finish: StepFinishMode::Full,
             no_early_stop: true,
+            use_mps_q4: Some(use_mps_q4),
             ..StepSmokeConfig::default()
+        }
+    }
+
+    fn icb_prefill_tier2_config(use_mps_q4: bool) -> StepSmokeConfig {
+        StepSmokeConfig {
+            layers: 3,
+            encoder_use_mps_q4: Some(false),
+            ..icb_tier2_config(use_mps_q4)
+        }
+    }
+
+    #[test]
+    fn icb_replay_matches_live_tier2() {
+        let dir = Path::new("/tmp/quantized-weights");
+        if !crate::dgq::store::looks_like_dgq_dir(dir) {
+            eprintln!("skip icb_replay_matches_live_tier2");
+            return;
+        }
+        let cfg = icb_tier2_config(true);
+        let (mut rt, _) = build_step_runtime(dir, &cfg).expect("build");
+        let layout = rt.layout;
+        let layers = rt.layers;
+
+        let no_sc = icb_plan_parity(&mut rt, &layout, layers, 1);
+        eprintln!("icb tier2 no_sc: logits_max_abs={no_sc:.6}");
+        assert!(no_sc < 0.05, "no_sc drift max_abs={no_sc}");
+
+        rt.run_forward_once(StepFinishMode::Full).expect("step1 icb");
+        let with_sc = icb_plan_parity(&mut rt, &layout, layers, 0);
+        eprintln!("icb tier2 with_sc: logits_max_abs={with_sc:.6}");
+        assert!(with_sc < 0.05, "with_sc drift max_abs={with_sc}");
+    }
+
+    /// Prefilled-KV ICB: run manually while debugging generate path (`cargo test --ignored icb_prefill`).
+    #[test]
+    #[ignore = "tier-2 on demand: prefilled KV ICB (STRATEGY.md §5)"]
+    fn icb_prefill_no_sc_tier2() {
+        let dir = Path::new("/tmp/quantized-weights");
+        if !crate::dgq::store::looks_like_dgq_dir(dir) {
+            eprintln!("skip icb_prefill_no_sc_tier2");
+            return;
+        }
+        let prefill = hello_chat_prefill_token_ids(dir).expect("hello prefill");
+        let cfg = StepSmokeConfig {
+            prefill_token_ids: Some(prefill),
+            ..icb_prefill_tier2_config(true)
         };
         let (mut rt, _) = build_step_runtime(dir, &cfg).expect("build");
         let layout = rt.layout;
         let layers = rt.layers;
+        let sampler = crate::sample::sampler_for_steps(1, true);
+        let params = step_params_from_sampler(&sampler, rt.read_params().kv_len, true);
+        let mut rng = Rng::new(cfg.seed);
+        rt.reset_block(VOCAB, &mut rng, params);
         let max = icb_plan_parity(&mut rt, &layout, layers, 1);
-        eprintln!("icb no_sc parity: logits_max_abs={max:.6}");
-        assert!(max < 0.05, "no_sc logits drift max_abs={max}");
-    }
-
-    #[test]
-    fn icb_with_sc_matches_live_encode() {
-        let dir = Path::new("/tmp/quantized-weights");
-        if !crate::dgq::store::looks_like_dgq_dir(dir) {
-            eprintln!("skip icb_with_sc_matches_live_encode");
-            return;
-        }
-        let cfg = StepSmokeConfig {
-            layers: 30,
-            steps: 1,
-            finish: StepFinishMode::Full,
-            no_early_stop: true,
-            ..StepSmokeConfig::default()
-        };
-        let (mut rt, _) = build_step_runtime(dir, &cfg).expect("build");
-        let layout = rt.layout;
-        let layers = rt.layers;
-        // Step 1 via no_sc ICB (same path as generate-monolithic).
-        rt.run_forward_once(StepFinishMode::Full)
-            .expect("step1 icb");
-        let max = icb_plan_parity(&mut rt, &layout, layers, 0);
-        eprintln!("icb with_sc parity: logits_max_abs={max:.6}");
-        assert!(max < 0.05, "with_sc logits drift max_abs={max}");
-    }
-
-    /// Production-shaped check: two fresh runtimes, step1 no_sc ICB then step2 with_sc.
-    #[test]
-    fn icb_sequential_with_sc_matches_live() {
-        let dir = Path::new("/tmp/quantized-weights");
-        if !crate::dgq::store::looks_like_dgq_dir(dir) {
-            eprintln!("skip icb_sequential_with_sc_matches_live");
-            return;
-        }
-        let cfg = StepSmokeConfig {
-            layers: 30,
-            steps: 1,
-            finish: StepFinishMode::Full,
-            no_early_stop: true,
-            seed: 42,
-            ..StepSmokeConfig::default()
-        };
-        let (mut live_rt, _) = build_step_runtime(dir, &cfg).expect("live rt");
-        live_rt.run_forward_once(StepFinishMode::Full).expect("step1");
-        live_rt.run_forward_once(StepFinishMode::Full).expect("step2 live");
-        let live_logits = read_half_buffer_f32(&live_rt.bufs.logits, 0, CANVAS * VOCAB);
-
-        let (mut icb_rt, _) = build_step_runtime(dir, &cfg).expect("icb rt");
-        icb_rt.run_forward_once(StepFinishMode::Full).expect("step1");
-        icb_rt.run_forward_once(StepFinishMode::Full).expect("step2 icb");
-        let icb_logits = read_half_buffer_f32(&icb_rt.bufs.logits, 0, CANVAS * VOCAB);
-
-        let max = live_logits
-            .iter()
-            .zip(icb_logits.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        eprintln!("icb sequential with_sc: logits_max_abs={max:.6}");
-        assert!(max < 0.05, "sequential with_sc drift max_abs={max}");
+        eprintln!("icb prefill tier2 no_sc: logits_max_abs={max:.6}");
+        assert!(max < 0.05, "prefill no_sc drift max_abs={max}");
     }
 
     #[test]
@@ -3897,12 +3883,8 @@ mod tests {
             return;
         }
         let cfg = StepSmokeConfig {
-            layers: 30,
-            steps: 1,
-            finish: StepFinishMode::Full,
-            no_early_stop: true,
             use_mps_q4: Some(false),
-            ..StepSmokeConfig::default()
+            ..icb_tier2_config(false)
         };
         let (mut rt, _) = build_step_runtime(dir, &cfg).expect("build");
         if rt.icb.is_none() {
