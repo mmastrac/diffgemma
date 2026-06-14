@@ -10,7 +10,7 @@ use crate::safetensors::Error;
 pub const ENTRY: &str = "residual_half";
 
 const SHADER: &str = concat!(
-    include_str!("../../../shaders/kernels/common.metal"),
+    include_str!("../../../shaders/include/fc_axes.metal"),
     include_str!("../../../shaders/include/common.metal"),
     include_str!("../../../shaders/kernels/residual_half.metal"),
 );

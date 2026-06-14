@@ -1,8 +1,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#ifndef DGQ_KERNEL_COMMON_METAL
-#include "common.metal"
+#ifndef DGQ_FC_AXES_METAL
+#include "fc_axes.metal"
 #endif
 
 /// Top-k expert routing per row from softmax probs `[rows, experts]`.

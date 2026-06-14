@@ -12,8 +12,8 @@ pub const ENTRY: &str = "sample_apply";
 pub const THREADGROUP_WIDTH: usize = 256;
 
 const SHADER: &str = concat!(
-    include_str!("../../../shaders/kernels/common.metal"),
-    include_str!("../../../shaders/include/sampler.metal"),
+    include_str!("../../../shaders/include/fc_axes.metal"),
+    include_str!("../../../shaders/include/sampler_device.metal"),
     include_str!("../../../shaders/kernels/sample_apply.metal"),
 );
 

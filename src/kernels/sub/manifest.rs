@@ -32,8 +32,7 @@ pub enum KernelVariants {
     },
     SwigluMoeGateUp,
     Gelu,
-    GemmQ4,
-    GemmNvfp4,
+    GemmBlock,
     GemmQ8,
     GemmQ8Rowk,
     Elementwise,
@@ -196,13 +195,13 @@ pub static MANIFEST: Manifest = Manifest {
         KernelSpec {
             name: "moe_grouped",
             entry: "moe_grouped",
-            quant_formats: &[QuantFormat::Q4Affine],
+            quant_formats: &[QuantFormat::Q4Affine, QuantFormat::NvFp4],
             variants: KernelVariants::Elementwise,
         },
         KernelSpec {
-            name: "moe_grouped_nvfp4",
-            entry: "moe_grouped_nvfp4",
-            quant_formats: &[QuantFormat::NvFp4],
+            name: "moe_scatter_weighted",
+            entry: "moe_scatter_weighted",
+            quant_formats: &[QuantFormat::Q4Affine],
             variants: KernelVariants::Elementwise,
         },
         KernelSpec {
@@ -212,16 +211,10 @@ pub static MANIFEST: Manifest = Manifest {
             variants: KernelVariants::Elementwise,
         },
         KernelSpec {
-            name: "gemm_q4",
-            entry: "gemm_q4",
-            quant_formats: &[QuantFormat::Q4Affine],
-            variants: KernelVariants::GemmQ4,
-        },
-        KernelSpec {
-            name: "gemm_nvfp4",
-            entry: "gemm_nvfp4",
-            quant_formats: &[QuantFormat::NvFp4],
-            variants: KernelVariants::GemmNvfp4,
+            name: "gemm_block",
+            entry: "gemm_block",
+            quant_formats: &[QuantFormat::Q4Affine, QuantFormat::NvFp4],
+            variants: KernelVariants::GemmBlock,
         },
         KernelSpec {
             name: "gemm_q8",
@@ -428,8 +421,7 @@ mod tests {
                 KernelVariants::SwigluSplit { rows } => assert_eq!(rows.len(), 2),
                 KernelVariants::SwigluMoeGateUp => {}
                 KernelVariants::Gelu => {}
-                KernelVariants::GemmQ4 => {}
-                KernelVariants::GemmNvfp4 => {}
+                KernelVariants::GemmBlock => {}
                 KernelVariants::GemmQ8 => {}
                 KernelVariants::GemmQ8Rowk => {}
                 KernelVariants::Elementwise => {}
@@ -445,6 +437,71 @@ mod tests {
         assert!(text.contains("K_QUANT_FORMAT"));
         assert!(text.contains("rms_norm_rows"));
         assert!(!text.contains("K_INTERLEAVED"));
+    }
+
+    #[test]
+    fn gemm_block_fc_map_no_collisions() {
+        assert_no_fc_collisions("gemm_block", &[4, 5, 6]).unwrap();
+    }
+
+    #[test]
+    fn metal_shader_basenames_unique() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders");
+        let files = collect_metal_files(&root);
+        let mut basenames = std::collections::HashSet::new();
+        for path in &files {
+            let name = path.file_name().unwrap().to_str().unwrap();
+            assert!(
+                basenames.insert(name.to_string()),
+                "duplicate .metal basename: {name} ({path:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn include_dir_has_no_kernels() {
+        let include = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders/include");
+        for path in collect_metal_files(&include) {
+            let text = std::fs::read_to_string(&path).expect("read include metal");
+            assert!(
+                !text.contains("kernel void"),
+                "include/ must be device-fn headers only: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn kernel_dir_entry_points_present() {
+        let kernels = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders/kernels");
+        for path in collect_metal_files(&kernels) {
+            let text = std::fs::read_to_string(&path).expect("read kernel metal");
+            assert!(
+                text.contains("kernel void"),
+                "kernels/ file must declare at least one entry point: {}",
+                path.display()
+            );
+        }
+    }
+
+    fn collect_metal_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        collect_metal_files_rec(dir, &mut out);
+        out.sort();
+        out
+    }
+
+    fn collect_metal_files_rec(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            if path.is_dir() {
+                collect_metal_files_rec(&path, out);
+            } else if path.extension().is_some_and(|e| e == "metal") {
+                out.push(path);
+            }
+        }
     }
 
     #[test]

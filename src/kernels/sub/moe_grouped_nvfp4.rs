@@ -2,7 +2,7 @@
 
 use super::f16;
 use super::gpu_common;
-use super::moe_grouped::{tiny_fixture as q4_tiny, wide_fixture as q4_wide, Fixture};
+use super::moe_grouped::{tiny_fixture as q4_tiny, wide_fixture as q4_wide, Fixture, THREADGROUP_WIDTH};
 use super::test_util::ElemFormat;
 use super::variant::KernelVariant;
 use crate::dgq::layout::nvfp4_matrix_bytes;
@@ -11,18 +11,17 @@ use crate::kernels::cpu::moe_grouped::moe_grouped_nvfp4;
 use crate::metal::{LayerOffsets, RouteScratch};
 use crate::safetensors::Error;
 
-pub const ENTRY: &str = "moe_grouped_nvfp4";
-pub const THREADGROUP_WIDTH: usize = 128;
+pub const ENTRY: &str = "moe_grouped";
 
 const SHADER: &str = concat!(
-    include_str!("../../../shaders/kernels/common.metal"),
+    include_str!("../../../shaders/include/fc_axes.metal"),
     include_str!("../../../shaders/include/common.metal"),
     include_str!("../../../shaders/include/dequant.metal"),
     include_str!("../../../shaders/include/activations.metal"),
-    include_str!("../../../shaders/include/attention.metal"),
-    include_str!("../../../shaders/include/moe_router.metal"),
-    include_str!("../../../shaders/include/moe_grouped.metal"),
-    include_str!("../../../shaders/kernels/moe_grouped_nvfp4.metal"),
+    include_str!("../../../shaders/include/attention_device.metal"),
+    include_str!("../../../shaders/include/moe_router_device.metal"),
+    include_str!("../../../shaders/include/moe_grouped_device.metal"),
+    include_str!("../../../shaders/kernels/moe_grouped.metal"),
 );
 
 impl Fixture {
@@ -125,7 +124,9 @@ pub fn pipeline_for(
     ctx: &crate::metal::device::MetalContext,
     variant: KernelVariant,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_subkernel(SHADER, ENTRY, variant)
+    let mut v = variant;
+    v.quant_format = super::QuantFormat::NvFp4;
+    super::moe_grouped::pipeline_for(ctx, v)
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]

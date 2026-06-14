@@ -10,7 +10,7 @@ use super::manifest::{self, RmsNormRowsVariant};
 pub const ENTRY: &str = "rms_norm_rows";
 
 const SHADER: &str = concat!(
-    include_str!("../../../shaders/kernels/common.metal"),
+    include_str!("../../../shaders/include/fc_axes.metal"),
     include_str!("../../../shaders/kernels/rms_norm_rows.metal"),
 );
 

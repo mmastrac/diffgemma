@@ -25,6 +25,7 @@ pub mod q4_group_k_order;
 pub mod moe_grouped;
 pub mod moe_grouped_nvfp4;
 pub mod moe_router;
+pub mod moe_scatter_weighted;
 pub mod memzero_bytes;
 pub mod residual_f32b;
 pub mod residual_half;

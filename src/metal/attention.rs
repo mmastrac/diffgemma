@@ -8,7 +8,7 @@ use objc2_metal::{
     MTLComputePipelineState, MTLSize,
 };
 
-const ATTENTION_SHADER: &str = include_str!("../../shaders/attention.metal");
+const ATTENTION_SHADER: &str = include_str!("../../shaders/engine_attention.metal");
 const ROPE_ENTRY: &str = "apply_rope_heads";
 const GQA_ENTRY: &str = "gqa_attention";
 

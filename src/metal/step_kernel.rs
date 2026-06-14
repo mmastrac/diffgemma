@@ -8,7 +8,11 @@ use crate::metal::device::{ComputePipeline, MetalContext};
 use crate::metal::dgq_gpu::{DgqGpuBlob, Q4LinearGpu};
 use crate::metal::moe::experts_forward_dgq_cpu;
 use crate::metal::mps_gemm::{dispatch_dequant_nvfp4_matrix, dispatch_dequant_q4_matrix, MpsMatmulCache};
+use crate::metal::step_quant::{
+    BlockGroupedJob, MoeExecutionStyle, StepBlockProfile,
+};
 use crate::metal::weights::GpuDecoderWeightCache;
+use crate::kernels::sub::QuantFormat;
 use crate::model::moe::{MoeScratch, RouteResult};
 use crate::sample::{initialize_canvas, Rng, SamplerConfig, StableConfidentStopper};
 use crate::safetensors::Error;
@@ -149,7 +153,7 @@ pub struct RouteScratch {
     pub weight: [[u16; TOP_K]; CANVAS],
     pub expert: [[u32; TOP_K]; CANVAS],
     pub count: [u32; N_EXPERTS],
-    pub offset: [u32; N_EXPERTS],
+    pub row_start: [u32; N_EXPERTS + 1],
     pub num_slots: u32,
     pub pad_route: u32,
     pub token_list: [u32; CANVAS * TOP_K],
@@ -234,6 +238,21 @@ pub struct StepBenchResult {
     pub per_step: std::time::Duration,
     pub iters: usize,
     pub finish: StepFinishMode,
+}
+
+/// Wall-clock GPU segments for one forward step (5 submits: preamble, pre-MoE×L, MoE×L, post×L, finish).
+#[derive(Debug, Clone)]
+pub struct StepProfileResult {
+    pub compile: std::time::Duration,
+    pub preamble: std::time::Duration,
+    pub layer_pre_moe: std::time::Duration,
+    pub layer_moe: std::time::Duration,
+    pub layer_post: std::time::Duration,
+    pub finish: std::time::Duration,
+    pub total: std::time::Duration,
+    pub layers: usize,
+    pub finish_mode: StepFinishMode,
+    pub block_format: QuantFormat,
 }
 
 pub fn build_offsets_from_store(store: &DgqStore) -> HashMap<String, u64> {
@@ -373,6 +392,11 @@ pub fn step_use_mps_q4_default() -> bool {
     }
 }
 
+/// Batched grouped MoE (`DGQ_STEP_MOE_GROUPED`, default on). Alias for format-agnostic toggle.
+pub fn step_use_moe_grouped_q4_default() -> bool {
+    crate::metal::step_quant::batched_moe_enabled()
+}
+
 fn step_use_mps_q4_from_env() -> bool {
     match std::env::var("DGQ_STEP_MPS_Q4") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
@@ -402,8 +426,11 @@ struct StepPipelines {
     bucket_fill: ComputePipeline,
     q4_linear: ComputePipeline,
     q4_linear_grouped: ComputePipeline,
+    nvfp4_linear_grouped: ComputePipeline,
     nvfp4_linear: ComputePipeline,
+    gather_rows: ComputePipeline,
     gelu_swiglu_gate_up: ComputePipeline,
+    moe_scatter_weighted: ComputePipeline,
     moe_grouped: ComputePipeline,
     moe_grouped_nvfp4: ComputePipeline,
     /// Q4 grouped MoE with K_DUMP_STAGE=1 (debug capture only — never in forward/generate).
@@ -499,8 +526,13 @@ impl StepPipelines {
             bucket_fill: crate::kernels::sub::moe_bucket_fill::pipeline_for(ctx, prod)?,
             q4_linear: ctx.compile_kernel(QGEMM_SHADER, "f32_q4_linear")?,
             q4_linear_grouped: ctx.compile_kernel(QGEMM_SHADER, "f32_q4_linear_grouped")?,
+            nvfp4_linear_grouped: ctx.compile_kernel(QGEMM_SHADER, "f32_nvfp4_linear_grouped")?,
             nvfp4_linear: ctx.compile_kernel(QGEMM_SHADER, "f32_nvfp4_linear")?,
+            gather_rows: crate::kernels::sub::gather_rows::pipeline_for(ctx, prod)?,
             gelu_swiglu_gate_up: crate::kernels::sub::swiglu::pipeline_for_moe(ctx, prod)?,
+            moe_scatter_weighted: crate::kernels::sub::moe_scatter_weighted::pipeline_for(
+                ctx, prod,
+            )?,
             moe_grouped: crate::kernels::sub::moe_grouped::pipeline_for(ctx, prod)?,
             moe_grouped_nvfp4: crate::kernels::sub::moe_grouped_nvfp4::pipeline_for(
                 ctx,
@@ -543,6 +575,27 @@ impl StepPipelines {
             .get(&(n, k))
             .ok_or(Error::Format("missing q8 rowk pipeline"))
     }
+
+    fn block_gemm(&self, format: QuantFormat, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
+        match format {
+            QuantFormat::NvFp4 => self.nvfp4(n, k),
+            _ => self.q4(n, k),
+        }
+    }
+
+    fn dequant_block(&self, format: QuantFormat) -> &ComputePipeline {
+        match format {
+            QuantFormat::NvFp4 => &self.dequant_nvfp4,
+            _ => &self.dequant_q4,
+        }
+    }
+
+    fn moe_scalar(&self, format: QuantFormat) -> &ComputePipeline {
+        match format {
+            QuantFormat::NvFp4 => &self.moe_grouped_nvfp4,
+            _ => &self.moe_grouped,
+        }
+    }
 }
 
 pub(crate) struct StepBuffers {
@@ -570,9 +623,57 @@ struct StepEnc<'a> {
     gpu_blob: &'a std::sync::Arc<DgqGpuBlob>,
     mps: &'a mut MpsMatmulCache,
     use_mps_q4: bool,
-    use_nvfp4: bool,
+    block_profile: StepBlockProfile,
     use_sc_gemm: bool,
     recorder: Option<&'a mut crate::metal::step_icb::IcbRecorder>,
+}
+
+const MOE_SLOTS: u32 = (CANVAS * TOP_K) as u32;
+
+fn moe_w_byte_off_a() -> usize {
+    0
+}
+
+fn moe_w_byte_off_gu() -> usize {
+    (MOE_SLOTS as usize) * HID * std::mem::size_of::<f32>()
+}
+
+fn layer_moe_block_jobs(
+    l: &LayerOffsets,
+    format: QuantFormat,
+) -> ([BlockGroupedJob; N_EXPERTS], [BlockGroupedJob; N_EXPERTS]) {
+    use crate::dgq::layout::{nvfp4_matrix_bytes, q4_matrix_bytes};
+    let hidden = HID as usize;
+    let moe_ff = MOE_FF as usize;
+    let (gu_stride, dn_stride, gu_gpr, dn_gpr) = match format {
+        QuantFormat::NvFp4 => (
+            nvfp4_matrix_bytes(moe_ff * 2, hidden) as u64,
+            nvfp4_matrix_bytes(hidden, moe_ff) as u64,
+            (hidden as u32).div_ceil(16),
+            (moe_ff as u32).div_ceil(16),
+        ),
+        _ => (
+            q4_matrix_bytes(moe_ff * 2, hidden) as u64,
+            q4_matrix_bytes(hidden, moe_ff) as u64,
+            (hidden as u32).div_ceil(32),
+            (moe_ff as u32).div_ceil(32),
+        ),
+    };
+    let mut gate = [BlockGroupedJob {
+        w_byte_off: 0,
+        groups_per_row: gu_gpr,
+        _pad: 0,
+    }; N_EXPERTS];
+    let mut down = [BlockGroupedJob {
+        w_byte_off: 0,
+        groups_per_row: dn_gpr,
+        _pad: 0,
+    }; N_EXPERTS];
+    for e in 0..N_EXPERTS {
+        gate[e].w_byte_off = l.experts_gate_up + (e as u64) * gu_stride;
+        down[e].w_byte_off = l.experts_down + (e as u64) * dn_stride;
+    }
+    (gate, down)
 }
 
 impl StepEnc<'_> {
@@ -770,11 +871,7 @@ impl StepEnc<'_> {
         n: u32,
         k: u32,
     ) -> Result<(), Error> {
-        let ps = if self.use_nvfp4 {
-            self.ps.nvfp4(n, k)?
-        } else {
-            self.ps.q4(n, k)?
-        };
+        let ps = self.ps.block_gemm(self.block_profile.format, n, k)?;
         self.sink_set_pipeline(ps);
         unsafe {
             self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
@@ -817,7 +914,7 @@ impl StepEnc<'_> {
             w_off,
             n_us,
             k_us,
-            if self.use_nvfp4 {
+            if self.block_profile.is_nvfp4() {
                 crate::dgq::layout::QuantKind::Nvfp4Block
             } else {
                 crate::dgq::layout::QuantKind::Q4Block
@@ -836,10 +933,10 @@ impl StepEnc<'_> {
             self.f32_to_half_arena(y_off, m_us * n_us);
             return Ok(());
         }
-        if self.use_nvfp4 {
-            dispatch_dequant_nvfp4_matrix(&self.enc, &self.ps.dequant_nvfp4, &q4, &self.bufs.mps_w);
+        if self.block_profile.is_nvfp4() {
+            dispatch_dequant_nvfp4_matrix(&self.enc, self.ps.dequant_block(self.block_profile.format), &q4, &self.bufs.mps_w);
         } else {
-            dispatch_dequant_q4_matrix(&self.enc, &self.ps.dequant_q4, &q4, &self.bufs.mps_w);
+            dispatch_dequant_q4_matrix(&self.enc, self.ps.dequant_block(self.block_profile.format), &q4, &self.bufs.mps_w);
         }
         self.pause_for_mps();
         self.mps.encode_f32_linear(
@@ -880,11 +977,7 @@ impl StepEnc<'_> {
 
     fn sink_dequant_q4_matrix(&mut self, q4: &Q4LinearGpu) -> Result<(), Error> {
         const THREADGROUP: usize = 16;
-        let ps = if self.use_nvfp4 {
-            &self.ps.dequant_nvfp4
-        } else {
-            &self.ps.dequant_q4
-        };
+        let ps = self.ps.dequant_block(self.block_profile.format);
         self.sink_set_pipeline(ps);
         let (buf_w, off) = q4.weight_buffer();
         self.sink_set_buffer(buf_w, off as usize, 0);
@@ -1296,17 +1389,129 @@ impl StepEnc<'_> {
         Ok(())
     }
 
-    fn encode_layer_moe_grouped(
+    fn dispatch_block_linear_grouped(
+        &mut self,
+        a_on_mps_x: bool,
+        buf_a_off: usize,
+        buf_c_off: usize,
+        jobs: &[BlockGroupedJob; N_EXPERTS],
+        total_m: u32,
+        k: u32,
+        n: u32,
+    ) -> Result<(), Error> {
+        let grouped_ps = match self.block_profile.format {
+            QuantFormat::Q4Affine => &self.ps.q4_linear_grouped,
+            QuantFormat::NvFp4 => &self.ps.nvfp4_linear_grouped,
+            _ => {
+                return Err(Error::Format(
+                    "batched MoE grouped GEMM unsupported for this block format",
+                ));
+            }
+        };
+        let row_start_off = std::mem::offset_of!(RouteScratch, row_start);
+        self.sink_set_pipeline(grouped_ps);
+        let a_buf = if a_on_mps_x {
+            &self.bufs.mps_x
+        } else {
+            &self.bufs.mps_w
+        };
+        self.sink_set_buffer(a_buf, buf_a_off, 0);
+        self.bind_blob(1);
+        self.sink_set_buffer(&self.bufs.mps_w, buf_c_off, 2);
+        self.sink_set_bytes(jobs, 3);
+        self.sink_set_buffer(&self.bufs.route, row_start_off, 4);
+        let dims = [k, n, N_EXPERTS as u32];
+        self.sink_set_bytes(&dims, 5);
+        let grid = MTLSize {
+            width: n as usize,
+            height: total_m as usize,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        };
+        self.sink_dispatch(grid, tg);
+        Ok(())
+    }
+
+    /// Batched MoE: gather → grouped block GEMM (gate/up, down) → swiglu → weighted scatter.
+    fn encode_layer_moe_batched(
+        &mut self,
+        layer: usize,
+        layout: &ModelLayout,
+    ) -> Result<(), Error> {
+        let l = &layout.layers[layer];
+        let (gate_jobs, down_jobs) = layer_moe_block_jobs(l, self.block_profile.format);
+        let gu_off = moe_w_byte_off_gu();
+        let act_elems = (MOE_SLOTS as usize) * MOE_FF as usize;
+        let token_list_off = std::mem::offset_of!(RouteScratch, token_list);
+
+        self.half_to_f32_buf(A_MOEIN, CANVAS * HID);
+
+        self.sink_set_pipeline(&self.ps.gather_rows);
+        self.sink_set_buffer(&self.bufs.mps_x, 0, 0);
+        self.sink_set_buffer(&self.bufs.route, token_list_off, 1);
+        self.sink_set_buffer(&self.bufs.mps_w, moe_w_byte_off_a(), 2);
+        self.sink_set_buffer(&self.bufs.dummy_dump, 0, 5);
+        let gather_dims = [0u32, HID as u32];
+        self.sink_set_bytes(&gather_dims, 3);
+        self.sink_set_bytes(&MOE_SLOTS, 4);
+        self.dispatch_1d(
+            &self.ps.gather_rows,
+            (MOE_SLOTS as usize) * HID,
+            256,
+        );
+
+        self.dispatch_block_linear_grouped(
+            false,
+            moe_w_byte_off_a(),
+            gu_off,
+            &gate_jobs,
+            MOE_SLOTS,
+            HID as u32,
+            MOE_FF * 2,
+        )?;
+
+        self.sink_set_pipeline(&self.ps.gelu_swiglu_gate_up);
+        self.sink_set_buffer(&self.bufs.mps_w, gu_off, 0);
+        self.sink_set_buffer(&self.bufs.mps_x, 0, 1);
+        self.sink_set_buffer(&self.bufs.dummy_dump, 0, 3);
+        let swiglu_dims = [MOE_SLOTS, MOE_FF];
+        self.sink_set_bytes(&swiglu_dims, 2);
+        self.dispatch_1d(&self.ps.gelu_swiglu_gate_up, act_elems, 256);
+
+        self.dispatch_block_linear_grouped(
+            true,
+            0,
+            moe_w_byte_off_a(),
+            &down_jobs,
+            MOE_SLOTS,
+            MOE_FF,
+            HID as u32,
+        )?;
+
+        self.sink_set_pipeline(&self.ps.moe_scatter_weighted);
+        self.sink_set_buffer(&self.bufs.mps_w, moe_w_byte_off_a(), 0);
+        self.sink_set_buffer(&self.bufs.arena, A_MOEOUT as usize, 1);
+        self.bind_route(2);
+        self.sink_set_bytes(&(HID as u32), 3);
+        self.dispatch_1d(
+            &self.ps.moe_scatter_weighted,
+            (MOE_SLOTS as usize) * HID,
+            256,
+        );
+        Ok(())
+    }
+
+    fn encode_layer_moe_scalar(
         &mut self,
         layer: usize,
         layout: &ModelLayout,
     ) -> Result<(), Error> {
         let layer_off = layer_byte_offset(layer);
-        self.sink_set_pipeline(if self.use_nvfp4 {
-            &self.ps.moe_grouped_nvfp4
-        } else {
-            &self.ps.moe_grouped
-        });
+        self.sink_set_pipeline(self.ps.moe_scalar(self.block_profile.format));
         unsafe {
             self.sink_set_buffer(&self.bufs.arena, A_MOEIN as usize, 0);
             self.sink_set_buffer(&self.bufs.arena, A_MOEOUT as usize, 1);
@@ -1321,7 +1526,7 @@ impl StepEnc<'_> {
             n_experts: N_EXPERTS as u32,
         };
         self.sink_set_bytes(&grouped_dims, 5);
-        if !self.use_nvfp4 {
+        if !self.block_profile.is_nvfp4() {
             self.sink_set_buffer(&self.bufs.dummy_dump, 0, 6);
         }
         let grid = MTLSize {
@@ -1336,6 +1541,17 @@ impl StepEnc<'_> {
         };
         self.sink_dispatch(grid, tg);
         Ok(())
+    }
+
+    fn encode_layer_moe_grouped(
+        &mut self,
+        layer: usize,
+        layout: &ModelLayout,
+    ) -> Result<(), Error> {
+        match self.block_profile.moe_style() {
+            MoeExecutionStyle::BatchedGrouped => self.encode_layer_moe_batched(layer, layout),
+            MoeExecutionStyle::ScalarPerExpert => self.encode_layer_moe_scalar(layer, layout),
+        }
     }
 
     fn encode_layer_moe_post(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
@@ -1375,7 +1591,7 @@ impl StepEnc<'_> {
         layer: usize,
         layout: &ModelLayout,
     ) -> Result<(), Error> {
-        if self.use_nvfp4 {
+        if self.block_profile.is_nvfp4() {
             return Err(Error::Format(
                 "moe_grouped dump mode is q4-only (use q8 .dgq weights)",
             ));
@@ -1740,11 +1956,12 @@ fn write_single_expert_route(
         let e = expert_id as usize;
         let mut s = 0u32;
         for i in 0..N_EXPERTS {
-            (*r).offset[i] = s;
+            (*r).row_start[i] = s;
             if i == e {
                 s += 1;
             }
         }
+        (*r).row_start[N_EXPERTS] = s;
         (*r).token_list[0] = position as u32;
         (*r).slot_list[0] = 0;
         (*r).num_slots = 1;
@@ -1938,7 +2155,7 @@ pub struct StepRuntime {
     text_config: TextConfig,
     mps_matmul: MpsMatmulCache,
     use_mps_q4: bool,
-    use_nvfp4: bool,
+    block_profile: StepBlockProfile,
     use_sc_gemm: bool,
     layout: ModelLayout,
     pub layers: usize,
@@ -2063,7 +2280,7 @@ impl StepRuntime {
             gpu_blob: &self.gpu_blob,
             mps: &mut self.mps_matmul,
             use_mps_q4: self.use_mps_q4,
-            use_nvfp4: self.use_nvfp4,
+            block_profile: self.block_profile,
             use_sc_gemm: self.use_sc_gemm,
             recorder: None,
         };
@@ -2120,7 +2337,7 @@ impl StepRuntime {
             gpu_blob: &self.gpu_blob,
             mps: &mut self.mps_matmul,
             use_mps_q4: self.use_mps_q4,
-            use_nvfp4: self.use_nvfp4,
+            block_profile: self.block_profile,
             use_sc_gemm: self.use_sc_gemm,
             recorder: Some(recorder),
         };
@@ -2230,6 +2447,64 @@ impl StepRuntime {
         let layout = self.layout;
         self.dispatch_and_wait(|enc| enc.encode_full_layer(layer, &layout))?;
         Ok(())
+    }
+
+    /// One forward step with per-phase GPU sync (for profiling; ~4 extra submits vs monolithic).
+    fn profile_forward_once(&mut self, finish: StepFinishMode) -> Result<StepProfileResult, Error> {
+        use std::time::Instant;
+        let layout = self.layout;
+        let layers = self.layers;
+        let st_before: CanvasState = read_struct(&self.bufs.state);
+        let first_step = if st_before.step == 0 { 1u32 } else { 0u32 };
+
+        let t0 = Instant::now();
+        self.dispatch_and_wait(|enc| enc.encode_step_preamble(&layout, first_step))?;
+        let preamble = t0.elapsed();
+
+        let t1 = Instant::now();
+        self.dispatch_and_wait(|enc| {
+            for layer in 0..layers {
+                enc.encode_layer(layer, &layout)?;
+            }
+            Ok(())
+        })?;
+        let layer_pre_moe = t1.elapsed();
+
+        let t2 = Instant::now();
+        self.dispatch_and_wait(|enc| {
+            for layer in 0..layers {
+                enc.encode_layer_moe_grouped(layer, &layout)?;
+            }
+            Ok(())
+        })?;
+        let layer_moe = t2.elapsed();
+
+        let t3 = Instant::now();
+        self.dispatch_and_wait(|enc| {
+            for layer in 0..layers {
+                enc.encode_layer_moe_post(layer, &layout)?;
+            }
+            Ok(())
+        })?;
+        let layer_post = t3.elapsed();
+
+        let t4 = Instant::now();
+        self.dispatch_and_wait(|enc| enc.encode_step_finish(&layout, finish))?;
+        let finish_t = t4.elapsed();
+
+        let total = preamble + layer_pre_moe + layer_moe + layer_post + finish_t;
+        Ok(StepProfileResult {
+            compile: std::time::Duration::ZERO,
+            preamble,
+            layer_pre_moe,
+            layer_moe,
+            layer_post,
+            finish: finish_t,
+            total,
+            layers,
+            finish_mode: finish,
+            block_format: self.block_profile.format,
+        })
     }
 
     /// P2.2 Phase A: one command buffer + one GPU sync per denoise step.
@@ -2371,9 +2646,19 @@ pub fn build_step_runtime(
     let layout = build_layout(&offsets, cfg.max_seq);
     let layers = cfg.layers.min(validated.num_layers).max(1);
 
-    let use_nvfp4 = store.profile() == crate::dgq::layout::QuantProfile::Nvfp4;
-    if use_nvfp4 {
-        eprintln!("step-kernel: nvfp4 block weights");
+    let block_profile = StepBlockProfile::from_store_profile(store.profile());
+    match block_profile.format {
+        QuantFormat::NvFp4 => eprintln!("step-kernel: nvfp4 block weights"),
+        QuantFormat::Q4Affine => eprintln!("step-kernel: q4 block weights"),
+        _ => eprintln!("step-kernel: block weights ({:?})", block_profile.format),
+    }
+    match block_profile.moe_style() {
+        MoeExecutionStyle::BatchedGrouped => {
+            eprintln!("step-kernel: batched grouped MoE");
+        }
+        MoeExecutionStyle::ScalarPerExpert => {
+            eprintln!("step-kernel: scalar per-expert MoE");
+        }
     }
 
     let ctx = MetalContext::new()?;
@@ -2485,7 +2770,7 @@ pub fn build_step_runtime(
         text_config,
         mps_matmul,
         use_mps_q4: cfg.use_mps_q4.unwrap_or_else(step_use_mps_q4_from_env),
-        use_nvfp4,
+        block_profile,
         use_sc_gemm: step_use_sc_gemm_from_env(),
         layout,
         layers,
@@ -3163,6 +3448,18 @@ pub fn bench_step_kernel(
         iters,
         finish,
     })
+}
+
+pub fn bench_step_kernel_profile(
+    model_dir: &Path,
+    cfg: StepSmokeConfig,
+) -> Result<StepProfileResult, Error> {
+    let (mut rt, build) = build_step_runtime(model_dir, &cfg)?;
+    let finish = cfg.finish;
+    rt.run_forward_once(finish)?;
+    let mut prof = rt.profile_forward_once(finish)?;
+    prof.compile = build.compile;
+    Ok(prof)
 }
 
 /// Read `elems` half values from a shared Metal buffer as f32.

@@ -9,7 +9,7 @@ pub const ENTRY: &str = "gather_prob_cols";
 pub const TILE: usize = 16;
 
 const SHADER: &str = concat!(
-    include_str!("../../../shaders/kernels/common.metal"),
+    include_str!("../../../shaders/include/fc_axes.metal"),
     include_str!("../../../shaders/kernels/gather_prob_cols.metal"),
 );
 

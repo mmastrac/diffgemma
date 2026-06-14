@@ -129,9 +129,9 @@ pub fn pack_route_rows(rows: &[RouteRow]) -> Vec<f32> {
 pub fn pack_bucket_state(state: &BucketState, n_experts: usize) -> Vec<f32> {
     let mut out: Vec<f32> = state.offset[..n_experts]
         .iter()
+        .chain(std::iter::once(&state.num_slots))
         .map(|&v| v as f32)
         .collect();
-    out.push(state.num_slots as f32);
     out.extend(state.token_list.iter().map(|&v| v as f32));
     out.extend(state.slot_list.iter().map(|&v| v as f32));
     out

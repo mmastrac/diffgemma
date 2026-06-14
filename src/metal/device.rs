@@ -57,7 +57,7 @@ impl MetalContext {
         Ok(ComputePipeline { pipeline })
     }
 
-    /// Specialize `k_gemm_q4` / `k_gemm_q8` (function constants 1–3).
+    /// Specialize tiled quant GEMM subkernels (FC1–3 global, FC4–6 shape).
     pub fn compile_gemm_kernel(
         &self,
         library: &ProtocolObject<dyn MTLLibrary>,
@@ -75,10 +75,10 @@ impl MetalContext {
         gemm_n: u32,
         gemm_k: u32,
     ) -> Result<ComputePipeline, Error> {
-        Self::compile_gemm_subkernel_on_device(device, library, entry, gemm_n, gemm_k, false)
+        Self::compile_gemm_subkernel_on_device(device, library, entry, gemm_n, gemm_k, false, 0)
     }
 
-    /// Specialize a tiled GEMM subkernel from source (N/K function constants 2–3).
+    /// Specialize a tiled quant GEMM subkernel (FC1–3 global, FC4–6 shape/format).
     pub fn compile_gemm_subkernel(
         &self,
         source: &str,
@@ -86,6 +86,7 @@ impl MetalContext {
         gemm_n: u32,
         gemm_k: u32,
         is_full_layer: bool,
+        quant_format: u32,
     ) -> Result<ComputePipeline, Error> {
         let library = self.compile_library(source)?;
         Self::compile_gemm_subkernel_on_device(
@@ -95,6 +96,7 @@ impl MetalContext {
             gemm_n,
             gemm_k,
             is_full_layer,
+            quant_format,
         )
     }
 
@@ -105,30 +107,48 @@ impl MetalContext {
         gemm_n: u32,
         gemm_k: u32,
         is_full_layer: bool,
+        quant_format: u32,
     ) -> Result<ComputePipeline, Error> {
         let fc = MTLFunctionConstantValues::new();
+        let shape_assert = false;
+        let dump_stage = 0u32;
         unsafe {
             fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&is_full_layer).cast(),
+                std::ptr::NonNull::from_ref(&shape_assert).cast(),
                 MTLDataType::Bool,
                 1,
             );
             fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&gemm_n).cast(),
+                std::ptr::NonNull::from_ref(&dump_stage).cast(),
                 MTLDataType::UInt,
                 2,
             );
             fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&gemm_k).cast(),
+                std::ptr::NonNull::from_ref(&quant_format).cast(),
                 MTLDataType::UInt,
                 3,
+            );
+            fc.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from_ref(&is_full_layer).cast(),
+                MTLDataType::Bool,
+                4,
+            );
+            fc.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from_ref(&gemm_n).cast(),
+                MTLDataType::UInt,
+                5,
+            );
+            fc.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from_ref(&gemm_k).cast(),
+                MTLDataType::UInt,
+                6,
             );
         }
         let name = NSString::from_str(entry);
         let function = library
             .newFunctionWithName_constantValues_error(&name, &fc)
             .map_err(|e| shader_compile_error(e))?;
-        let label = format!("{entry}_n{gemm_n}_k{gemm_k}");
+        let label = format!("{entry}_qf{quant_format}_n{gemm_n}_k{gemm_k}");
         let cache = PipelineArchiveCache::shared(device)?;
         let pipeline = cache.compile_compute(device, &function, &label)?;
         Ok(ComputePipeline { pipeline })

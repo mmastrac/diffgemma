@@ -10,7 +10,8 @@ struct RouteScratch {
     half weight[256][8];
     uint expert[256][8];
     uint count[128];
-    uint offset[128];
+    /// Per-expert slot starts; `row_start[128]` == `num_slots` after bucketing.
+    uint row_start[129];
     uint num_slots;
     uint _pad_route;
     uint token_list[2048];

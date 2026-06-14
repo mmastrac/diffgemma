@@ -9,8 +9,8 @@ use crate::safetensors::Error;
 pub const ENTRY: &str = "moe_bucket_count";
 
 const SHADER: &str = concat!(
-    include_str!("../../../shaders/kernels/common.metal"),
-    include_str!("../../../shaders/include/moe_router.metal"),
+    include_str!("../../../shaders/include/fc_axes.metal"),
+    include_str!("../../../shaders/include/moe_router_device.metal"),
     include_str!("../../../shaders/kernels/moe_bucket_count.metal"),
 );
 
@@ -74,7 +74,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         weight: [[0; crate::metal::TOP_K]; crate::metal::CANVAS],
         expert: [[0; crate::metal::TOP_K]; crate::metal::CANVAS],
         count: [1; N_EXPERTS],
-        offset: [0; N_EXPERTS],
+        row_start: [0; N_EXPERTS + 1],
         num_slots: 99,
         pad_route: 0,
         token_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],

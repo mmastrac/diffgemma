@@ -10,7 +10,8 @@ use crate::safetensors::Error;
 pub const ENTRY: &str = "gemm_q8_rowk";
 
 const SHADER: &str = concat!(
-    include_str!("../../../shaders/kernels/gemm_common.metal"),
+    include_str!("../../../shaders/include/fc_axes.metal"),
+    include_str!("../../../shaders/include/gemm_fc.metal"),
     include_str!("../../../shaders/include/common.metal"),
     include_str!("../../../shaders/include/dequant.metal"),
     include_str!("../../../shaders/kernels/gemm_q8_rowk.metal"),
@@ -93,7 +94,7 @@ pub fn pipeline_for(
     n: u32,
     k: u32,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_gemm_subkernel(SHADER, ENTRY, n, k, false)
+    ctx.compile_gemm_subkernel(SHADER, ENTRY, n, k, false, super::QuantFormat::Q8 as u32)
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]

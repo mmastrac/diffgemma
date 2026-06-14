@@ -1,11 +1,11 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#ifndef DGQ_KERNEL_COMMON_METAL
-#include "common.metal"
+#ifndef DGQ_FC_AXES_METAL
+#include "fc_axes.metal"
 #endif
 #ifndef DGQ_INCLUDE_MOE_ROUTER_METAL
-#include "moe_router.metal"
+#include "moe_router_device.metal"
 #endif
 
 /// Bucketing phases 0/1/2 (monolith k_bucket_fill).
@@ -34,10 +34,11 @@ kernel void moe_bucket_fill(
         if (i == 0u) {
             uint s = 0u;
             for (uint e = 0u; e < dims.n_experts; ++e) {
-                R->offset[e] = s;
+                R->row_start[e] = s;
                 s += R->count[e];
                 R->count[e] = 0u;
             }
+            R->row_start[dims.n_experts] = s;
             R->num_slots = s;
         }
     } else {
@@ -46,7 +47,7 @@ kernel void moe_bucket_fill(
             uint tok = i / dims.top_k;
             uint kk = i % dims.top_k;
             uint e = R->expert[tok][kk];
-            uint slot = R->offset[e]
+            uint slot = R->row_start[e]
                 + atomic_fetch_add_explicit(
                       (device atomic_uint *)&R->count[e], 1u, memory_order_relaxed);
             R->token_list[slot] = tok;

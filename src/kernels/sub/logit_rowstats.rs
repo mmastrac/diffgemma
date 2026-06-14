@@ -10,7 +10,7 @@ pub const ENTRY: &str = "logit_rowstats";
 pub const THREADGROUP_WIDTH: usize = 256;
 
 const SHADER: &str = concat!(
-    include_str!("../../../shaders/kernels/common.metal"),
+    include_str!("../../../shaders/include/fc_axes.metal"),
     include_str!("../../../shaders/kernels/logit_rowstats.metal"),
 );
 

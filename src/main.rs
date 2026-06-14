@@ -270,6 +270,7 @@ enum Command {
         max_seq: usize,
         iters: usize,
         forward_only: bool,
+        profile: bool,
     },
     Chat {
         seed: u64,
@@ -530,6 +531,7 @@ fn main() -> ExitCode {
             max_seq,
             iters,
             forward_only,
+            profile,
         } => run_bench_step_kernel_cmd(
             &cli.model_dir,
             layers,
@@ -538,6 +540,7 @@ fn main() -> ExitCode {
             max_seq,
             iters,
             forward_only,
+            profile,
         ),
         Command::GenerateMonolithic {
             prompt,
@@ -2022,6 +2025,7 @@ fn run_bench_step_kernel_cmd(
     max_seq: usize,
     iters: usize,
     forward_only: bool,
+    profile: bool,
 ) -> ExitCode {
     use metal::bench_step_kernel;
 
@@ -2030,22 +2034,65 @@ fn run_bench_step_kernel_cmd(
         return ExitCode::FAILURE;
     }
     let cfg = step_kernel_config(layers, kv_len, seed, max_seq, forward_only);
-    eprintln!(
-        "bench-step-kernel: layers={layers} kv_len={kv_len} iters={iters} forward_only={forward_only}"
-    );
-    match bench_step_kernel(model_dir, cfg, iters) {
-        Ok(r) => {
-            println!("bench-step-kernel ok");
-            println!("  compile:  {:.2?}", r.compile);
-            println!("  warmup:   {:.2?}", r.warmup);
-            println!("  per_step: {:.2?}", r.per_step);
-            println!("  iters:    {}", r.iters);
-            println!("  mode:     {:?}", r.finish);
-            ExitCode::SUCCESS
+    if profile {
+        use metal::bench_step_kernel_profile;
+        eprintln!(
+            "bench-step-kernel --profile: layers={layers} kv_len={kv_len} forward_only={forward_only}"
+        );
+        match bench_step_kernel_profile(model_dir, cfg) {
+            Ok(p) => {
+                let per_l = |d: std::time::Duration| d / p.layers.max(1) as u32;
+                let pct = |d: std::time::Duration| 100.0 * d.as_secs_f64() / p.total.as_secs_f64();
+                println!("bench-step-kernel profile ok");
+                println!("  compile:       {:.2?}", p.compile);
+                println!("  block_format:  {:?}", p.block_format);
+                println!("  layers:        {}", p.layers);
+                println!("  preamble:      {:.2?}  ({:.1}%)", p.preamble, pct(p.preamble));
+                println!(
+                    "  pre_moe (attn+dense+router): {:.2?}  ({:.1}%, {:.2?}/layer)",
+                    p.layer_pre_moe,
+                    pct(p.layer_pre_moe),
+                    per_l(p.layer_pre_moe)
+                );
+                println!(
+                    "  moe_grouped:   {:.2?}  ({:.1}%, {:.2?}/layer)",
+                    p.layer_moe,
+                    pct(p.layer_moe),
+                    per_l(p.layer_moe)
+                );
+                println!(
+                    "  moe_post:      {:.2?}  ({:.1}%, {:.2?}/layer)",
+                    p.layer_post,
+                    pct(p.layer_post),
+                    per_l(p.layer_post)
+                );
+                println!("  finish:        {:.2?}  ({:.1}%)", p.finish, pct(p.finish));
+                println!("  total:         {:.2?}", p.total);
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("error: {err}");
+                ExitCode::FAILURE
+            }
         }
-        Err(err) => {
-            eprintln!("error: {err}");
-            ExitCode::FAILURE
+    } else {
+        eprintln!(
+            "bench-step-kernel: layers={layers} kv_len={kv_len} iters={iters} forward_only={forward_only}"
+        );
+        match bench_step_kernel(model_dir, cfg, iters) {
+            Ok(r) => {
+                println!("bench-step-kernel ok");
+                println!("  compile:  {:.2?}", r.compile);
+                println!("  warmup:   {:.2?}", r.warmup);
+                println!("  per_step: {:.2?}", r.per_step);
+                println!("  iters:    {}", r.iters);
+                println!("  mode:     {:?}", r.finish);
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("error: {err}");
+                ExitCode::FAILURE
+            }
         }
     }
 }
@@ -2059,6 +2106,7 @@ fn run_bench_step_kernel_cmd(
     _max_seq: usize,
     _iters: usize,
     _forward_only: bool,
+    _profile: bool,
 ) -> ExitCode {
     eprintln!("error: bench-step-kernel requires --features metal on macOS");
     ExitCode::FAILURE
@@ -2328,6 +2376,7 @@ fn parse_cli() -> Cli {
     let mut step_kv_len = 0u32;
     let mut step_max_seq = 512usize;
     let mut step_forward_only = false;
+    let mut step_profile = false;
     let mut step_logit_positions = String::new();
     let mut step_logit_top_k = 10usize;
     let mut step_layer_position = 129usize;
@@ -2484,6 +2533,7 @@ fn parse_cli() -> Cli {
                 }
             }
             "--forward-only" => step_forward_only = true,
+            "--step-profile" => step_profile = true,
             "--logit-positions" => {
                 if let Some(v) = args.next() {
                     step_logit_positions = v;
@@ -2930,6 +2980,7 @@ fn parse_cli() -> Cli {
             max_seq: step_max_seq.max(64),
             iters: bench_iters.max(1),
             forward_only: step_forward_only,
+            profile: step_profile,
         },
         Some(cmd) => {
             eprintln!("unknown command: {cmd}");

@@ -15,13 +15,13 @@ pub const ENTRY: &str = "moe_grouped";
 pub const THREADGROUP_WIDTH: usize = 128;
 
 const SHADER: &str = concat!(
-    include_str!("../../../shaders/kernels/common.metal"),
+    include_str!("../../../shaders/include/fc_axes.metal"),
     include_str!("../../../shaders/include/common.metal"),
     include_str!("../../../shaders/include/dequant.metal"),
     include_str!("../../../shaders/include/activations.metal"),
-    include_str!("../../../shaders/include/attention.metal"),
-    include_str!("../../../shaders/include/moe_router.metal"),
-    include_str!("../../../shaders/include/moe_grouped.metal"),
+    include_str!("../../../shaders/include/attention_device.metal"),
+    include_str!("../../../shaders/include/moe_router_device.metal"),
+    include_str!("../../../shaders/include/moe_grouped_device.metal"),
     include_str!("../../../shaders/kernels/moe_grouped.metal"),
 );
 
@@ -142,11 +142,11 @@ impl Fixture {
             weight: [[0; TOP_K]; crate::metal::CANVAS],
             expert: [[0; TOP_K]; crate::metal::CANVAS],
             count: [0; crate::metal::N_EXPERTS],
-            offset: [0; crate::metal::N_EXPERTS],
+            row_start: [0; crate::metal::N_EXPERTS + 1],
             num_slots: 0,
             pad_route: 0,
-            token_list: [0; crate::metal::CANVAS * TOP_K],
-            slot_list: [0; crate::metal::CANVAS * TOP_K],
+            token_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
+            slot_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
         };
         for (tok, row) in self.expert_ids.iter().enumerate() {
             for (kk, &e) in row.iter().enumerate() {
@@ -155,7 +155,12 @@ impl Fixture {
             }
         }
         for (e, &off) in bucket.offset.iter().enumerate() {
-            route.offset[e] = off;
+            route.row_start[e] = off;
+        }
+        let n = self.n_experts as usize;
+        route.row_start[n] = bucket.num_slots;
+        for e in (n + 1)..=crate::metal::N_EXPERTS {
+            route.row_start[e] = bucket.num_slots;
         }
         route.num_slots = bucket.num_slots;
         let slots = bucket.num_slots as usize;

@@ -1,17 +1,17 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#ifndef DGQ_KERNEL_COMMON_METAL
-#include "common.metal"
+#ifndef DGQ_FC_AXES_METAL
+#include "fc_axes.metal"
 #endif
 #ifndef DGQ_INCLUDE_COMMON_METAL
 // bf16_bytes from include/common.metal (Rust concat)
 #endif
-#ifndef DGQ_INCLUDE_ATTENTION_METAL
-// LayerOffsets from include/attention.metal (Rust concat)
+#ifndef DGQ_INCLUDE_ATTENTION_DEVICE_METAL
+// LayerOffsets from include/attention_device.metal (Rust concat)
 #endif
 #ifndef DGQ_INCLUDE_MOE_ROUTER_METAL
-// RouteScratch + RouterDims from include/moe_router.metal (Rust concat)
+// RouteScratch + RouterDims from include/moe_router_device.metal (Rust concat)
 #endif
 
 /// RMSNorm → router scale → linear → softmax → top-k (monolith k_router).

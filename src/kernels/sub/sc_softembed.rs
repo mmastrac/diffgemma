@@ -13,7 +13,7 @@ pub const ENTRY: &str = "sc_softembed";
 pub const DIM_TILE: usize = 64;
 
 const SHADER: &str = concat!(
-    include_str!("../../../shaders/kernels/common.metal"),
+    include_str!("../../../shaders/include/fc_axes.metal"),
     include_str!("../../../shaders/include/common.metal"),
     include_str!("../../../shaders/include/dequant.metal"),
     include_str!("../../../shaders/kernels/sc_softembed.metal"),

@@ -56,8 +56,9 @@ pub fn build_expert_jobs(routes: &[RouteResult], experts: usize) -> Vec<ExpertJo
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Q4GroupedJob {
-    w_byte_off: u32,
+    w_byte_off: u64,
     groups_per_row: u32,
+    _pad: u32,
 }
 
 fn block_gemm_cpu(
@@ -421,13 +422,15 @@ pub fn experts_forward_gpu_grouped_in_batch(
     for job in jobs {
         let w_gu = expert_cache.expert_gate_up_q4(layer, job.expert);
         gate_jobs.push(Q4GroupedJob {
-            w_byte_off: w_gu.byte_offset as u32,
+            w_byte_off: w_gu.byte_offset,
             groups_per_row: w_gu.groups_per_row(),
+            _pad: 0,
         });
         let w_dn = expert_cache.expert_down_q4(layer, job.expert);
         down_jobs.push(Q4GroupedJob {
-            w_byte_off: w_dn.byte_offset as u32,
+            w_byte_off: w_dn.byte_offset,
             groups_per_row: w_dn.groups_per_row(),
+            _pad: 0,
         });
         token_indices.extend(job.tokens.iter().map(|&(tok, _)| tok as u32));
         row_starts.push(token_indices.len() as u32);

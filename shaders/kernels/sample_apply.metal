@@ -1,11 +1,11 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#ifndef DGQ_KERNEL_COMMON_METAL
-#include "common.metal"
+#ifndef DGQ_FC_AXES_METAL
+#include "fc_axes.metal"
 #endif
 #ifndef DGQ_INCLUDE_SAMPLER_METAL
-#include "sampler.metal"
+#include "sampler_device.metal"
 #endif
 
 /// Categorical inverse-CDF per row (tempered); tpg MUST divide cols evenly.

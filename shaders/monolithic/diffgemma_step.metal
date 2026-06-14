@@ -103,15 +103,14 @@ struct CanvasState {
 };
 struct RouteScratch {
     half weight[256][8]; uint expert[256][8];
-    uint count[128]; uint offset[128];
+    uint count[128]; uint row_start[129];
     uint num_slots; uint _pad_route;
     uint token_list[2048]; uint slot_list[2048];
 };
 
 // ============================ monolith-only helpers ============================
 
-// gemm_q4 -> shaders/kernels/gemm_q4.metal
-// gemm_nvfp4 -> shaders/kernels/gemm_nvfp4.metal
+// gemm_block (Q4+NVFP4 via K_QUANT_FORMAT) -> shaders/kernels/gemm_block.metal
 // gemm_q8 -> shaders/kernels/gemm_q8.metal
 // gemm_q8_rowk -> shaders/kernels/gemm_q8_rowk.metal
 
@@ -122,8 +121,7 @@ struct RouteScratch {
 // moe_bucket_count -> shaders/kernels/moe_bucket_count.metal
 // moe_bucket_fill -> shaders/kernels/moe_bucket_fill.metal
 
-// moe_grouped -> shaders/kernels/moe_grouped.metal (K_DUMP_STAGE probe via buffer 6)
-// moe_grouped_nvfp4 -> shaders/kernels/moe_grouped_nvfp4.metal
+// moe_grouped (Q4+NVFP4 via K_QUANT_FORMAT) -> shaders/kernels/moe_grouped.metal
 // q4_group_k_order -> shaders/kernels/q4_group_k_order.metal (K_DUMP_STAGE)
 
 // embed_gather -> shaders/kernels/embed_gather.metal

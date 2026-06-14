@@ -7,13 +7,14 @@ use crate::dgq::layout::{nvfp4_matrix_bytes, NVFP4_HEADER_BYTES};
 use crate::dgq::nvfp4::{nvfp4_gemm_cpu, quantize_f32_matrix_nvfp4};
 use crate::safetensors::Error;
 
-pub const ENTRY: &str = "gemm_nvfp4";
+pub const ENTRY: &str = "gemm_block";
 
 const SHADER: &str = concat!(
-    include_str!("../../../shaders/kernels/gemm_common.metal"),
+    include_str!("../../../shaders/include/fc_axes.metal"),
+    include_str!("../../../shaders/include/gemm_fc.metal"),
     include_str!("../../../shaders/include/common.metal"),
     include_str!("../../../shaders/include/dequant.metal"),
-    include_str!("../../../shaders/kernels/gemm_nvfp4.metal"),
+    include_str!("../../../shaders/kernels/gemm_block.metal"),
 );
 
 #[derive(Debug, Clone)]
@@ -86,7 +87,14 @@ pub fn pipeline_for(
     n: u32,
     k: u32,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_gemm_subkernel(SHADER, ENTRY, n, k, false)
+    ctx.compile_gemm_subkernel(
+        SHADER,
+        ENTRY,
+        n,
+        k,
+        false,
+        super::QuantFormat::NvFp4 as u32,
+    )
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]

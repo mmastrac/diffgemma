@@ -11,8 +11,8 @@ use crate::safetensors::Error;
 pub const ENTRY: &str = "moe_bucket_fill";
 
 const SHADER: &str = concat!(
-    include_str!("../../../shaders/kernels/common.metal"),
-    include_str!("../../../shaders/include/moe_router.metal"),
+    include_str!("../../../shaders/include/fc_axes.metal"),
+    include_str!("../../../shaders/include/moe_router_device.metal"),
     include_str!("../../../shaders/kernels/moe_bucket_fill.metal"),
 );
 
@@ -72,7 +72,7 @@ fn scratch_from_fixture(f: &Fixture) -> RouteScratch {
         weight: [[0; TOP_K]; crate::metal::CANVAS],
         expert: [[0; TOP_K]; crate::metal::CANVAS],
         count: [0; crate::metal::N_EXPERTS],
-        offset: [0; crate::metal::N_EXPERTS],
+        row_start: [0; crate::metal::N_EXPERTS + 1],
         num_slots: 0,
         pad_route: 0,
         token_list: [0; crate::metal::CANVAS * TOP_K],
@@ -173,7 +173,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         unsafe { std::ptr::read(buf_route.contents().as_ptr() as *const RouteScratch) };
     let slots = out_scratch.num_slots as usize;
     let n = f.n_experts as usize;
-    let mut out: Vec<f32> = out_scratch.offset[..n].iter().map(|&v| v as f32).collect();
+    let mut out: Vec<f32> = out_scratch.row_start[..n].iter().map(|&v| v as f32).collect();
     out.push(out_scratch.num_slots as f32);
     out.extend(out_scratch.token_list[..slots].iter().map(|&v| v as f32));
     out.extend(out_scratch.slot_list[..slots].iter().map(|&v| v as f32));

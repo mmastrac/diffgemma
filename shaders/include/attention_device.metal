@@ -1,5 +1,5 @@
-#ifndef DGQ_INCLUDE_ATTENTION_METAL
-#define DGQ_INCLUDE_ATTENTION_METAL
+#ifndef DGQ_INCLUDE_ATTENTION_DEVICE_METAL
+#define DGQ_INCLUDE_ATTENTION_DEVICE_METAL
 
 // bf16_bytes: shaders/include/common.metal (prepended by Rust concat)
 

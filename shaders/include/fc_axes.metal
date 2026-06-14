@@ -1,15 +1,13 @@
-// Shared *index numbering* for function constants 1–3. Each kernel translation
-// unit re-declares these via #include (a numbering convention, not shared state).
+// Global function-constant axes 1–3 (shared numbering convention; see build/manifest.toml).
 //
 //   1  K_SHAPE_ASSERT   bool   tier-2 bounds checks
 //   2  K_DUMP_STAGE     uint   0 = off; N = which intermediate to dump
 //   3  K_QUANT_FORMAT   uint   0=q4_affine 1=q8 2=mxfp4 3=nvfp4
 //
-// Per-kernel semantic axes (4+): declared in that kernel's .metal entry file only.
-// See build/manifest.toml for the full index map and valid tuples.
+// Per-kernel semantic axes (4+): declared in that kernel's entry file only.
 
-#ifndef DGQ_KERNEL_COMMON_METAL
-#define DGQ_KERNEL_COMMON_METAL
+#ifndef DGQ_FC_AXES_METAL
+#define DGQ_FC_AXES_METAL
 
 constant bool K_SHAPE_ASSERT [[function_constant(1)]];
 constant uint K_DUMP_STAGE [[function_constant(2)]];

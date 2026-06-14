@@ -3,15 +3,15 @@
 #include <metal_simdgroup_matrix>
 using namespace metal;
 
-#ifndef DGQ_KERNEL_GEMM_COMMON_METAL
-#include "gemm_common.metal"
+#ifndef DGQ_INCLUDE_GEMM_FC_METAL
+#include "gemm_fc.metal"
 #endif
 #ifndef DGQ_INCLUDE_DEQUANT_METAL
-#error "gemm_q4: bundle must include shaders/include/dequant.metal"
+#error "gemm_block: bundle must include shaders/include/dequant.metal"
 #endif
 
-/// y[M,N] = x[M,K] @ Wq4[N,K]^T ; threadgroup (128,1,1).
-kernel void gemm_q4(
+/// y[M,N] = x[M,K] @ W[N,K]^T ; format from K_QUANT_FORMAT (FC3). Threadgroup (128,1,1).
+kernel void gemm_block(
     device const half *x [[buffer(0)]],
     device half *y [[buffer(1)]],
     device const uchar *blob [[buffer(2)]],
@@ -27,7 +27,19 @@ kernel void gemm_q4(
     uint m0 = tgid.y * 32, n0 = tgid.x * 32;
     uint ltid = lid.x;
     simdgroup_float8x8 acc0(0.f), acc1(0.f), acc2(0.f), acc3(0.f);
-    const ulong rowB = q4_row_bytes(K);
+
+    const bool is_nvfp4 = (K_QUANT_FORMAT == QUANT_NVFP4);
+    float gscale = 0.f;
+    ulong body = w_off;
+    ulong rowB = 0ul;
+    if (is_nvfp4) {
+        gscale = as_type<float>(*(device const uint *)(blob + w_off));
+        body = w_off + 4ul;
+        rowB = nvfp4_row_bytes(K);
+    } else {
+        rowB = q4_row_bytes(K);
+    }
+
     for (uint k0 = 0; k0 < K; k0 += 32) {
         for (uint i = ltid; i < 32 * 32; i += 128) {
             uint mm = i / 32, kk = i % 32;
@@ -35,8 +47,17 @@ kernel void gemm_q4(
         }
         for (uint r = ltid; r < 32; r += 128) {
             float tmp[32];
-            dequant_q4_group(blob + w_off + (ulong)(n0 + r) * rowB + (ulong)(k0 / 32) * 20ul, tmp);
-            for (uint kk = 0; kk < 32; ++kk) tw[r][kk] = half(tmp[kk]);
+            if (is_nvfp4) {
+                device const uchar *row = blob + body + (ulong)(n0 + r) * rowB;
+                dequant_nvfp4_tile(row, K, k0, tmp, gscale);
+            } else {
+                dequant_q4_group(
+                    blob + body + (ulong)(n0 + r) * rowB + (ulong)(k0 / 32) * 20ul,
+                    tmp);
+            }
+            for (uint kk = 0; kk < 32; ++kk) {
+                tw[r][kk] = half(tmp[kk]);
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint kk = 0; kk < 32; kk += 8) {
@@ -61,6 +82,8 @@ kernel void gemm_q4(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint i = ltid; i < 32 * 32; i += 128) {
         uint mm = i / 32, nn = i % 32;
-        if (m0 + mm < M && n0 + nn < N) y[(ulong)(m0 + mm) * N + n0 + nn] = half(ty[mm][nn]);
+        if (m0 + mm < M && n0 + nn < N) {
+            y[(ulong)(m0 + mm) * N + n0 + nn] = half(ty[mm][nn]);
+        }
     }
 }

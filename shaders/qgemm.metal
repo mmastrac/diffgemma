@@ -45,8 +45,9 @@ inline float dot_q4_group(
 }
 
 struct Q4GroupedJob {
-    uint w_byte_off;
+    ulong w_byte_off;
     uint groups_per_row;
+    uint _pad_job;
 };
 
 /// Grouped MoE Q4 GEMM: flattened `[total_m,K] @ expert weights^T` in one dispatch.
@@ -275,6 +276,105 @@ inline float nvfp4_weight_at(
     uchar byte = row_base[col / 2u];
     uint q = (col & 1u) ? uint(byte >> 4) : uint(byte & 0x0fu);
     return e2m1_to_f32(q) * scale;
+}
+
+inline void dequant_nvfp4_group(
+    device const uchar *row,
+    uint K,
+    uint g,
+    thread float *out16,
+    float gscale
+) {
+    uint data_len = (K + 1u) / 2u;
+    float scale = fp8_e4m3_to_f32(row[data_len + g]) * gscale;
+    device const uchar *packed = row + g * 8u;
+    for (uint i = 0; i < 16u; ++i) {
+        uchar byte = packed[i / 2u];
+        uint q = (i & 1u) ? uint(byte >> 4) : uint(byte & 0x0fu);
+        out16[i] = e2m1_to_f32(q) * scale;
+    }
+}
+
+inline void dequant_nvfp4_tile(
+    device const uchar *row,
+    uint K,
+    uint k0,
+    thread float *out32,
+    float gscale
+) {
+    dequant_nvfp4_group(row, K, k0 / 16u, out32, gscale);
+    dequant_nvfp4_group(row, K, k0 / 16u + 1u, out32 + 16, gscale);
+}
+
+inline float dot_nvfp4_k32(
+    device const float *a_row,
+    device const uchar *row,
+    uint k_dim,
+    uint k0,
+    float gscale
+) {
+    float w32[32];
+    dequant_nvfp4_tile(row, k_dim, k0, w32, gscale);
+    float sum = 0.0f;
+    uint n = min(32u, k_dim - k0);
+    for (uint i = 0; i < n; ++i) {
+        sum = fma(a_row[k0 + i], w32[i], sum);
+    }
+    return sum;
+}
+
+/// Grouped MoE NVFP4 GEMM: flattened `[total_m,K] @ expert weights^T` in one dispatch.
+kernel void f32_nvfp4_linear_grouped(
+    device const float *a [[buffer(0)]],
+    device const uchar *w_blob [[buffer(1)]],
+    device float *c [[buffer(2)]],
+    device const Q4GroupedJob *jobs [[buffer(3)]],
+    device const uint *row_starts [[buffer(4)]],
+    constant uint3 &dims [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]]
+) {
+    uint k = dims.x;
+    uint n = dims.y;
+    uint num_jobs = dims.z;
+    uint global_row = gid.y;
+    uint col = gid.x;
+    if (col >= n) {
+        return;
+    }
+
+    uint lo = 0u;
+    uint hi = num_jobs;
+    while (lo + 1u < hi) {
+        uint mid = (lo + hi) >> 1;
+        if (row_starts[mid] <= global_row) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    uint job_id = lo;
+    if (global_row >= row_starts[job_id + 1u]) {
+        return;
+    }
+
+    Q4GroupedJob job = jobs[job_id];
+    device const uchar *w = w_blob + job.w_byte_off;
+    float gscale = as_type<float>(*(device const uint *)(w));
+    device const uchar *body = w + 4u;
+    uint row_stride = nvfp4_row_bytes(k);
+
+    float sum = 0.0f;
+    uint num_tiles = (k + 31u) / 32u;
+    for (uint t = simd_lane; t < num_tiles; t += 32u) {
+        uint k0 = t * 32u;
+        device const uchar *row = body + (ulong)col * row_stride;
+        sum += dot_nvfp4_k32(a + global_row * k, row, k, k0, gscale);
+    }
+    sum = simd_sum(sum);
+    if (simd_lane == 0u) {
+        c[global_row * n + col] = sum;
+    }
 }
 
 kernel void f32_nvfp4_linear(

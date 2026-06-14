@@ -39,6 +39,7 @@ mod step_moe_dump;
 mod step_moe_single_dump;
 mod step_kernel;
 mod step_icb;
+mod step_quant;
 mod self_conditioning;
 mod telemetry;
 mod weights;
@@ -68,11 +69,13 @@ pub use step_kernel::{
     run_denoise_steps, run_single_denoise_step, run_step_attn_layer_capture, run_step_forward,
     run_step_layer_hidden_probe, run_step_moe_layer_capture, run_step_moe_single_expert_capture,
     run_step_preamble_capture,
-    run_step_probe, run_step_smoke, run_embed_row_gpu, run_step_q4_mps_parity, step_use_mps_q4_default,
+    run_step_probe, run_step_smoke, run_embed_row_gpu, run_step_q4_mps_parity,
+    step_use_moe_grouped_q4_default, step_use_mps_q4_default,
     step_use_sc_gemm_default,
     DenoiseStepStats, trace_entropy_enabled, LayerAttnCapture, LayerMoeCapture,
     PreambleCapture, SingleExpertMoeCapture,
-    StepBenchResult, StepFinishMode, StepForwardOutput, StepProbeResult, StepQ4MpsParityResult,
+    bench_step_kernel_profile, StepBenchResult, StepFinishMode, StepForwardOutput, StepProfileResult,
+    StepProbeResult, StepQ4MpsParityResult,
     StepSmokeConfig, StepSmokeResult, CANVAS, CanvasState, LayerOffsets, RouteScratch, StepParams,
     N_EXPERTS, TOP_K,
 };
@@ -94,6 +97,10 @@ pub use step_logits_dump::{
 pub use step_m0::{run_step_parity, run_step_verify, M0VerifyResult, StepParityConfig, StepParityResult};
 pub use step_config::{log_validated_step_model, validate_step_model, ValidatedStepModel};
 pub use step_generate::{generate_monolithic, generate_with_session, StepGenerateConfig, StepGenerateSession};
+pub use step_quant::{
+    batched_moe_enabled, moe_execution_style, quant_format_from_profile, BlockGroupedJob,
+    MoeExecutionStyle, StepBlockProfile,
+};
 pub use step_kv::{
     extend_monolithic_kv, monolithic_kv_prefix_max_diff, prefill_monolithic_kv_with_cache,
     run_step_kv_audit, run_step_kv_mps_parity, run_step_attn_probe, MonolithicEncoderCache, StepKvAuditResult,

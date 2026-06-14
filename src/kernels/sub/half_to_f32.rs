@@ -9,7 +9,7 @@ use crate::safetensors::Error;
 pub const ENTRY: &str = "half_to_f32";
 
 const SHADER: &str = concat!(
-    include_str!("../../../shaders/kernels/common.metal"),
+    include_str!("../../../shaders/include/fc_axes.metal"),
     include_str!("../../../shaders/kernels/half_to_f32.metal"),
 );
 

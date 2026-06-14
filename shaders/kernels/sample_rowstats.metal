@@ -1,11 +1,11 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#ifndef DGQ_KERNEL_COMMON_METAL
-#include "common.metal"
+#ifndef DGQ_FC_AXES_METAL
+#include "fc_axes.metal"
 #endif
 #ifndef DGQ_INCLUDE_SAMPLER_METAL
-#include "sampler.metal"
+#include "sampler_device.metal"
 #endif
 
 /// Tempered row stats -> rowstat {mx, sum}; per-row entropy (nats); argmax + changed flag.

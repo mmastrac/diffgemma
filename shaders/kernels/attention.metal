@@ -1,14 +1,14 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#ifndef DGQ_KERNEL_COMMON_METAL
-#include "common.metal"
+#ifndef DGQ_FC_AXES_METAL
+#include "fc_axes.metal"
 #endif
-#ifndef DGQ_INCLUDE_ATTENTION_METAL
-#include "attention.metal"
+#ifndef DGQ_INCLUDE_ATTENTION_DEVICE_METAL
+#include "attention_device.metal"
 #endif
 #ifndef DGQ_INCLUDE_SAMPLER_METAL
-#include "sampler.metal"
+#include "sampler_device.metal"
 #endif
 
 /// Canvas queries attend all KV positions 0..kv_len+canvas-1 (no causal mask).

@@ -273,7 +273,7 @@ fn verify_full_layers(model_dir: &Path, layers: usize) -> Result<M0Check, Error>
         seed: 42,
         max_seq: 512,
         finish: StepFinishMode::ForwardOnly,
-        use_mps_q4: None,
+        use_mps_q4: Some(false),
         prefill_token_ids: None,
         no_early_stop: false,
         encoder_use_mps_q4: None,

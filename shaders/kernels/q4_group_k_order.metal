@@ -1,8 +1,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#ifndef DGQ_KERNEL_COMMON_METAL
-#include "common.metal"
+#ifndef DGQ_FC_AXES_METAL
+#include "fc_axes.metal"
 #endif
 #ifndef DGQ_INCLUDE_DEQUANT_METAL
 // dequant_q4_group, q4_at_col from include/dequant.metal (Rust concat)

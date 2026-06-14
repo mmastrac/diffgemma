@@ -8,7 +8,7 @@ use crate::safetensors::Error;
 pub const ENTRY: &str = "vec_mul_inplace";
 
 const SHADER: &str = concat!(
-    include_str!("../../../shaders/kernels/common.metal"),
+    include_str!("../../../shaders/include/fc_axes.metal"),
     include_str!("../../../shaders/kernels/vec_mul_inplace.metal"),
 );
 

@@ -3,8 +3,8 @@
 #include <metal_simdgroup_matrix>
 using namespace metal;
 
-#ifndef DGQ_KERNEL_GEMM_COMMON_METAL
-#include "gemm_common.metal"
+#ifndef DGQ_INCLUDE_GEMM_FC_METAL
+#include "gemm_fc.metal"
 #endif
 #ifndef DGQ_INCLUDE_DEQUANT_METAL
 #error "gemm_q8_rowk: bundle must include shaders/include/dequant.metal"

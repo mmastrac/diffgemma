@@ -12,7 +12,7 @@ use crate::safetensors::Error;
 pub const ENTRY: &str = "embed_gather";
 
 const SHADER: &str = concat!(
-    include_str!("../../../shaders/kernels/common.metal"),
+    include_str!("../../../shaders/include/fc_axes.metal"),
     include_str!("../../../shaders/include/common.metal"),
     include_str!("../../../shaders/include/dequant.metal"),
     include_str!("../../../shaders/kernels/embed_gather.metal"),

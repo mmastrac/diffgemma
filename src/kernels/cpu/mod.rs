@@ -9,6 +9,7 @@ pub mod attention;
 pub mod dequant;
 pub mod moe_grouped;
 pub mod moe_router;
+pub mod moe_scatter_weighted;
 pub mod sampler;
 
 const GELU_TANH_COEF: f32 = 0.797_884_560_802_865_4; // sqrt(2/pi)
