@@ -1,24 +1,12 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#ifndef DGQ_FC_AXES_METAL
 #include "fc_axes.metal"
-#endif
-#ifndef DGQ_INCLUDE_DEQUANT_METAL
-// dequant_q4_group, dequant_nvfp4_tile, nvfp4_* from include/dequant.metal (Rust concat)
-#endif
-#ifndef DGQ_INCLUDE_ACTIVATIONS_METAL
-// gelu_tanh from include/activations.metal (Rust concat)
-#endif
-#ifndef DGQ_INCLUDE_ATTENTION_DEVICE_METAL
-// LayerOffsets from include/attention_device.metal (Rust concat)
-#endif
-#ifndef DGQ_INCLUDE_MOE_ROUTER_METAL
-// RouteScratch from include/moe_router_device.metal (Rust concat)
-#endif
-#ifndef DGQ_INCLUDE_MOE_GROUPED_METAL
-// MoeGroupedDims + atomic_add_f32 from include/moe_grouped_device.metal (Rust concat)
-#endif
+#include "dequant.metal"
+#include "activations.metal"
+#include "attention_device.metal"
+#include "moe_router_device.metal"
+#include "moe_grouped_device.metal"
 
 /// Grouped MoE expert forward: gate||up → GELU×up → down, weighted scatter to moe_out.
 /// Format selected by K_QUANT_FORMAT (FC3): Q4 affine vs NVFP4.

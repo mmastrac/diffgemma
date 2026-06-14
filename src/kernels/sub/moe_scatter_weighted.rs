@@ -9,13 +9,7 @@ use crate::safetensors::Error;
 
 pub const ENTRY: &str = "moe_scatter_weighted";
 
-const SHADER: &str = concat!(
-    "#include <metal_stdlib>\nusing namespace metal;\n",
-    include_str!("../../../shaders/include/fc_axes.metal"),
-    include_str!("../../../shaders/include/moe_router_device.metal"),
-    include_str!("../../../shaders/include/moe_grouped_device.metal"),
-    include_str!("../../../shaders/kernels/moe_scatter_weighted.metal"),
-);
+const SHADER: &str = shader_include::include_metal!("kernels/moe_scatter_weighted.metal");
 
 #[derive(Clone)]
 pub struct Fixture {

@@ -11,17 +11,9 @@ use crate::safetensors::Error;
 pub const ENTRY: &str = "swiglu";
 pub const MOE_ENTRY: &str = "swiglu_moe_gate_up";
 
-const SHADER: &str = concat!(
-    include_str!("../../../shaders/include/fc_axes.metal"),
-    include_str!("../../../shaders/include/activations.metal"),
-    include_str!("../../../shaders/kernels/swiglu.metal"),
-);
+const SHADER: &str = shader_include::include_metal!("kernels/swiglu.metal");
 
-const MOE_SHADER: &str = concat!(
-    include_str!("../../../shaders/include/fc_axes.metal"),
-    include_str!("../../../shaders/include/activations.metal"),
-    include_str!("../../../shaders/kernels/swiglu_moe_gate_up.metal"),
-);
+const MOE_SHADER: &str = shader_include::include_metal!("kernels/swiglu_moe_gate_up.metal");
 
 // --- split f32 in-place (decoder swiglu_mul) ---
 

@@ -1,9 +1,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#ifndef DGQ_FC_AXES_METAL
 #include "fc_axes.metal"
-#endif
 
 kernel void f32_to_half(
     device const float *x [[buffer(0)]],

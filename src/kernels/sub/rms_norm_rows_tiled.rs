@@ -13,11 +13,7 @@ pub const ENTRY: &str = "rms_norm_rows_tiled";
 pub const RMS_EPS: f32 = 1e-6;
 pub const THREADS_PER_TG: usize = 256;
 
-const SHADER: &str = concat!(
-    include_str!("../../../shaders/include/fc_axes.metal"),
-    include_str!("../../../shaders/include/common.metal"),
-    include_str!("../../../shaders/kernels/rms_norm_rows_tiled.metal"),
-);
+const SHADER: &str = shader_include::include_metal!("kernels/rms_norm_rows_tiled.metal");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TiledVariant {

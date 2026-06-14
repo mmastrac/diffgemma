@@ -1,12 +1,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#ifndef DGQ_FC_AXES_METAL
 #include "fc_axes.metal"
-#endif
-#ifndef DGQ_INCLUDE_MOE_ROUTER_METAL
 #include "moe_router_device.metal"
-#endif
 
 /// Bucketing phases 0/1/2 (monolith k_bucket_fill).
 kernel void moe_bucket_fill(

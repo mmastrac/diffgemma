@@ -1,12 +1,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#ifndef DGQ_FC_AXES_METAL
 #include "fc_axes.metal"
-#endif
-#ifndef DGQ_INCLUDE_SAMPLER_METAL
 #include "sampler_device.metal"
-#endif
 
 /// Accepted positions -> new_sample; rejected -> fresh uniform id; updates rng_state.
 kernel void sample_write(

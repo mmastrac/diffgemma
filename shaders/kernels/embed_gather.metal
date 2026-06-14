@@ -1,15 +1,9 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#ifndef DGQ_FC_AXES_METAL
 #include "fc_axes.metal"
-#endif
-#ifndef DGQ_INCLUDE_COMMON_METAL
-#error "embed_gather: bundle must include shaders/include/common.metal"
-#endif
-#ifndef DGQ_INCLUDE_DEQUANT_METAL
-#error "embed_gather: bundle must include shaders/include/dequant.metal"
-#endif
+#include "common.metal"
+#include "dequant.metal"
 
 /// Gather Q8 embed rows by token id: out[tok,d] = dequant(embed[id], d) * embed_scale.
 kernel void embed_gather(

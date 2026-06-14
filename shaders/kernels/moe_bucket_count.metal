@@ -1,12 +1,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#ifndef DGQ_FC_AXES_METAL
 #include "fc_axes.metal"
-#endif
-#ifndef DGQ_INCLUDE_MOE_ROUTER_METAL
 #include "moe_router_device.metal"
-#endif
 
 /// Zero expert slot counts before bucketing.
 kernel void moe_bucket_count(

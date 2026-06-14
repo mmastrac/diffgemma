@@ -1,9 +1,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#ifndef DGQ_FC_AXES_METAL
 #include "fc_axes.metal"
-#endif
 
 constant float SOFTCAP = 30.0f;
 

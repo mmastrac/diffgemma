@@ -9,11 +9,7 @@ use crate::safetensors::Error;
 
 pub const ENTRY: &str = "residual_half";
 
-const SHADER: &str = concat!(
-    include_str!("../../../shaders/include/fc_axes.metal"),
-    include_str!("../../../shaders/include/common.metal"),
-    include_str!("../../../shaders/kernels/residual_half.metal"),
-);
+const SHADER: &str = shader_include::include_metal!("kernels/residual_half.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

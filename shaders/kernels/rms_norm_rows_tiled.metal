@@ -1,12 +1,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#ifndef DGQ_FC_AXES_METAL
 #include "fc_axes.metal"
-#endif
-#ifndef DGQ_INCLUDE_COMMON_METAL
-#error "rms_norm_rows_tiled: bundle must include shaders/include/common.metal"
-#endif
+#include "common.metal"
 
 constant uint K_IN_DTYPE [[function_constant(4)]];
 

@@ -11,13 +11,7 @@ use crate::safetensors::Error;
 
 pub const ENTRY: &str = "qk_rope_kv";
 
-const SHADER: &str = concat!(
-    include_str!("../../../shaders/include/fc_axes.metal"),
-    include_str!("../../../shaders/include/common.metal"),
-    include_str!("../../../shaders/include/sampler_device.metal"),
-    include_str!("../../../shaders/include/attention_device.metal"),
-    include_str!("../../../shaders/kernels/qk_rope_kv.metal"),
-);
+const SHADER: &str = shader_include::include_metal!("kernels/qk_rope_kv.metal");
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]

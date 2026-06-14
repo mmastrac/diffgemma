@@ -1,12 +1,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#ifndef DGQ_FC_AXES_METAL
 #include "fc_axes.metal"
-#endif
-#ifndef DGQ_INCLUDE_DEQUANT_METAL
-// dequant_q4_group, q4_at_col from include/dequant.metal (Rust concat)
-#endif
+#include "dequant.metal"
 
 /// Compare 32-wide Q4 group decode: path A = `dequant_q4_group`, path B = `q4_at_col`.
 /// Writes 64 floats to dump [[buffer(3)]] when K_DUMP_STAGE >= 1 (compiled out otherwise).

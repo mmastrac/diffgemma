@@ -7,10 +7,7 @@ use crate::safetensors::Error;
 
 pub const ENTRY: &str = "router_top_k_rows";
 
-const SHADER: &str = concat!(
-    include_str!("../../../shaders/include/fc_axes.metal"),
-    include_str!("../../../shaders/kernels/router_top_k_rows.metal"),
-);
+const SHADER: &str = shader_include::include_metal!("kernels/router_top_k_rows.metal");
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RouteOut {

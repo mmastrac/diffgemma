@@ -1,9 +1,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#ifndef DGQ_FC_AXES_METAL
 #include "fc_axes.metal"
-#endif
 
 /// Stable row softmax in-place over row-major `[rows, cols]`.
 kernel void softmax_rows(

@@ -3,12 +3,8 @@
 #include <metal_simdgroup_matrix>
 using namespace metal;
 
-#ifndef DGQ_INCLUDE_GEMM_FC_METAL
 #include "gemm_fc.metal"
-#endif
-#ifndef DGQ_INCLUDE_DEQUANT_METAL
-#error "gemm_block: bundle must include shaders/include/dequant.metal"
-#endif
+#include "dequant.metal"
 
 /// y[M,N] = x[M,K] @ W[N,K]^T ; format from K_QUANT_FORMAT (FC3). Threadgroup (128,1,1).
 kernel void gemm_block(

@@ -8,10 +8,7 @@ use crate::safetensors::Error;
 pub const ENTRY: &str = "gather_prob_cols";
 pub const TILE: usize = 16;
 
-const SHADER: &str = concat!(
-    include_str!("../../../shaders/include/fc_axes.metal"),
-    include_str!("../../../shaders/kernels/gather_prob_cols.metal"),
-);
+const SHADER: &str = shader_include::include_metal!("kernels/gather_prob_cols.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

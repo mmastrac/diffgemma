@@ -1,15 +1,9 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#ifndef DGQ_FC_AXES_METAL
 #include "fc_axes.metal"
-#endif
-#ifndef DGQ_INCLUDE_COMMON_METAL
-#error "sc_softembed: bundle must include shaders/include/common.metal"
-#endif
-#ifndef DGQ_INCLUDE_DEQUANT_METAL
-#error "sc_softembed: bundle must include shaders/include/dequant.metal"
-#endif
+#include "common.metal"
+#include "dequant.metal"
 
 /// soft[tok,d] = sum_v softmax(logits[tok,v]) * dequant(embed[v,d]) * embed_scale
 /// first_step != 0 -> zero output (SC MLP still runs on CPU path).

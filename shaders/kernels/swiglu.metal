@@ -1,12 +1,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#ifndef DGQ_FC_AXES_METAL
 #include "fc_axes.metal"
-#endif
-#ifndef DGQ_INCLUDE_ACTIVATIONS_METAL
-#error "swiglu: bundle must include shaders/include/activations.metal"
-#endif
+#include "activations.metal"
 
 constant uint K_IO_DTYPE [[function_constant(4)]];
 constant bool K_GELU_GATE [[function_constant(5)]];

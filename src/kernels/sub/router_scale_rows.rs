@@ -7,10 +7,7 @@ use crate::safetensors::Error;
 
 pub const ENTRY: &str = "router_scale_rows";
 
-const SHADER: &str = concat!(
-    include_str!("../../../shaders/include/fc_axes.metal"),
-    include_str!("../../../shaders/kernels/router_scale_rows.metal"),
-);
+const SHADER: &str = shader_include::include_metal!("kernels/router_scale_rows.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

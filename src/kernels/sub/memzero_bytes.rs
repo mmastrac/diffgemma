@@ -7,10 +7,7 @@ use crate::safetensors::Error;
 
 pub const ENTRY: &str = "memzero_bytes";
 
-const SHADER: &str = concat!(
-    include_str!("../../../shaders/include/fc_axes.metal"),
-    include_str!("../../../shaders/kernels/memzero_bytes.metal"),
-);
+const SHADER: &str = shader_include::include_metal!("kernels/memzero_bytes.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

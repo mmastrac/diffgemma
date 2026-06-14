@@ -12,13 +12,7 @@ use crate::safetensors::Error;
 pub const ENTRY: &str = "attention";
 pub const THREADGROUP_WIDTH: usize = 64;
 
-const SHADER: &str = concat!(
-    include_str!("../../../shaders/include/fc_axes.metal"),
-    include_str!("../../../shaders/include/common.metal"),
-    include_str!("../../../shaders/include/sampler_device.metal"),
-    include_str!("../../../shaders/include/attention_device.metal"),
-    include_str!("../../../shaders/kernels/attention.metal"),
-);
+const SHADER: &str = shader_include::include_metal!("kernels/attention.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

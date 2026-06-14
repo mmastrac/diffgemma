@@ -11,11 +11,7 @@ use crate::safetensors::Error;
 pub const ENTRY: &str = "sample_commit";
 pub const THREADGROUP_WIDTH: usize = 256;
 
-const SHADER: &str = concat!(
-    include_str!("../../../shaders/include/fc_axes.metal"),
-    include_str!("../../../shaders/include/sampler_device.metal"),
-    include_str!("../../../shaders/kernels/sample_commit.metal"),
-);
+const SHADER: &str = shader_include::include_metal!("kernels/sample_commit.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

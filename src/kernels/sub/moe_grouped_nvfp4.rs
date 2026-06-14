@@ -13,16 +13,7 @@ use crate::safetensors::Error;
 
 pub const ENTRY: &str = "moe_grouped";
 
-const SHADER: &str = concat!(
-    include_str!("../../../shaders/include/fc_axes.metal"),
-    include_str!("../../../shaders/include/common.metal"),
-    include_str!("../../../shaders/include/dequant.metal"),
-    include_str!("../../../shaders/include/activations.metal"),
-    include_str!("../../../shaders/include/attention_device.metal"),
-    include_str!("../../../shaders/include/moe_router_device.metal"),
-    include_str!("../../../shaders/include/moe_grouped_device.metal"),
-    include_str!("../../../shaders/kernels/moe_grouped.metal"),
-);
+const SHADER: &str = shader_include::include_metal!("kernels/moe_grouped.metal");
 
 impl Fixture {
     fn gate_up_nvfp4(&self) -> Vec<u8> {

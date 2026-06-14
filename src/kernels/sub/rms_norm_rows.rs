@@ -9,10 +9,7 @@ use super::manifest::{self, RmsNormRowsVariant};
 
 pub const ENTRY: &str = "rms_norm_rows";
 
-const SHADER: &str = concat!(
-    include_str!("../../../shaders/include/fc_axes.metal"),
-    include_str!("../../../shaders/kernels/rms_norm_rows.metal"),
-);
+const SHADER: &str = shader_include::include_metal!("kernels/rms_norm_rows.metal");
 
 /// Synthetic tier-1 fixture (blob-free).
 #[derive(Debug, Clone)]

@@ -7,10 +7,7 @@ use crate::safetensors::Error;
 
 pub const ENTRY: &str = "vec_mul_inplace";
 
-const SHADER: &str = concat!(
-    include_str!("../../../shaders/include/fc_axes.metal"),
-    include_str!("../../../shaders/kernels/vec_mul_inplace.metal"),
-);
+const SHADER: &str = shader_include::include_metal!("kernels/vec_mul_inplace.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

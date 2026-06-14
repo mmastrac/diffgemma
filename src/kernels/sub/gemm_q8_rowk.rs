@@ -9,13 +9,7 @@ use crate::safetensors::Error;
 
 pub const ENTRY: &str = "gemm_q8_rowk";
 
-const SHADER: &str = concat!(
-    include_str!("../../../shaders/include/fc_axes.metal"),
-    include_str!("../../../shaders/include/gemm_fc.metal"),
-    include_str!("../../../shaders/include/common.metal"),
-    include_str!("../../../shaders/include/dequant.metal"),
-    include_str!("../../../shaders/kernels/gemm_q8_rowk.metal"),
-);
+const SHADER: &str = shader_include::include_metal!("kernels/gemm_q8_rowk.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

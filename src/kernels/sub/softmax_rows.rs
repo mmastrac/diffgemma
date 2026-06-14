@@ -9,10 +9,7 @@ use crate::safetensors::Error;
 pub const ENTRY: &str = "softmax_rows";
 pub const THREADGROUP_WIDTH: usize = 256;
 
-const SHADER: &str = concat!(
-    include_str!("../../../shaders/include/fc_axes.metal"),
-    include_str!("../../../shaders/kernels/softmax_rows.metal"),
-);
+const SHADER: &str = shader_include::include_metal!("kernels/softmax_rows.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

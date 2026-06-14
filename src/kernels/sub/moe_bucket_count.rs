@@ -8,11 +8,7 @@ use crate::safetensors::Error;
 
 pub const ENTRY: &str = "moe_bucket_count";
 
-const SHADER: &str = concat!(
-    include_str!("../../../shaders/include/fc_axes.metal"),
-    include_str!("../../../shaders/include/moe_router_device.metal"),
-    include_str!("../../../shaders/kernels/moe_bucket_count.metal"),
-);
+const SHADER: &str = shader_include::include_metal!("kernels/moe_bucket_count.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

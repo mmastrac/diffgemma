@@ -12,13 +12,7 @@ use crate::safetensors::Error;
 pub const ENTRY: &str = "moe_router";
 pub const THREADGROUP_WIDTH: usize = 128;
 
-const SHADER: &str = concat!(
-    include_str!("../../../shaders/include/fc_axes.metal"),
-    include_str!("../../../shaders/include/common.metal"),
-    include_str!("../../../shaders/include/attention_device.metal"),
-    include_str!("../../../shaders/include/moe_router_device.metal"),
-    include_str!("../../../shaders/kernels/moe_router.metal"),
-);
+const SHADER: &str = shader_include::include_metal!("kernels/moe_router.metal");
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]

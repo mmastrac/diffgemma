@@ -1,9 +1,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#ifndef DGQ_FC_AXES_METAL
 #include "fc_axes.metal"
-#endif
 
 /// Materialize softmax rows from precomputed row stats (SC GEMM fast path).
 kernel void sc_probs(

@@ -1,4 +1,5 @@
 /target
+/shader-include/target
 /model
 /python/.venv/
 __pycache__/

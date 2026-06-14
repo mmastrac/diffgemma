@@ -1,15 +1,9 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#ifndef DGQ_FC_AXES_METAL
 #include "fc_axes.metal"
-#endif
-#ifndef DGQ_INCLUDE_MOE_ROUTER_METAL
 #include "moe_router_device.metal"
-#endif
-#ifndef DGQ_INCLUDE_MOE_GROUPED_METAL
 #include "moe_grouped_device.metal"
-#endif
 
 /// Weighted scatter: `[num_slots, hidden]` expert rows → canvas `moe_out`.
 kernel void moe_scatter_weighted(

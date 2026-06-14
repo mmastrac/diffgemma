@@ -1,9 +1,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#ifndef DGQ_FC_AXES_METAL
 #include "fc_axes.metal"
-#endif
 
 /// Top-k expert routing per row from softmax probs `[rows, experts]`.
 /// Tie-break: higher prob wins; equal prob → lower expert index wins (bit-exact vs CPU oracle).

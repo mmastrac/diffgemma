@@ -1,12 +1,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#ifndef DGQ_FC_AXES_METAL
 #include "fc_axes.metal"
-#endif
-#ifndef DGQ_INCLUDE_COMMON_METAL
-#error "residual_half: bundle must include shaders/include/common.metal"
-#endif
+#include "common.metal"
 
 kernel void residual_half(
     device const half *a [[buffer(0)]],

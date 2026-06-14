@@ -1,12 +1,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#ifndef DGQ_FC_AXES_METAL
 #include "fc_axes.metal"
-#endif
-#ifndef DGQ_INCLUDE_ACTIVATIONS_METAL
-#error "swiglu_moe_gate_up: bundle must include shaders/include/activations.metal"
-#endif
+#include "activations.metal"
 
 /// MoE gate_up `[batch, 2*moe_inter]` → gelu(gate)*up. Layout is fixed by .dgq manifest.
 kernel void swiglu_moe_gate_up(

@@ -3,12 +3,8 @@
 #include <metal_simdgroup_matrix>
 using namespace metal;
 
-#ifndef DGQ_INCLUDE_GEMM_FC_METAL
 #include "gemm_fc.metal"
-#endif
-#ifndef DGQ_INCLUDE_DEQUANT_METAL
-#error "gemm_q8: bundle must include shaders/include/dequant.metal"
-#endif
+#include "dequant.metal"
 
 /// y[M,N] = x[M,K] @ Wq8[N,K]^T ; threadgroup (128,1,1).
 kernel void gemm_q8(

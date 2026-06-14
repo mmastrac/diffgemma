@@ -1,8 +1,6 @@
 #ifndef DGQ_INCLUDE_ATTENTION_DEVICE_METAL
 #define DGQ_INCLUDE_ATTENTION_DEVICE_METAL
 
-// bf16_bytes: shaders/include/common.metal (prepended by Rust concat)
-
 constant float ATTN_RMS_EPS = 1e-6f;
 
 struct LayerOffsets {
