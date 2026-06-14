@@ -1,10 +1,14 @@
 //! Isolated subkernels: one Metal body + CPU oracle + tier-1 tests per module.
 
+pub mod f16;
+pub mod f32_to_half;
 pub mod gather_prob_cols;
 pub mod gather_rows;
 pub mod gelu_pytorch_tanh;
 pub mod gelu_swiglu_gate_up;
 pub mod gpu_common;
+pub mod half_to_f32;
+pub mod memzero_bytes;
 pub mod rms_norm_rows;
 pub mod rms_norm_rows_no_scale;
 pub mod router_scale_rows;

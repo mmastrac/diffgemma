@@ -457,14 +457,15 @@ impl StepPipelines {
                 ctx.compile_gemm_kernel(library, "k_gemm_q8_rowk", n, k)?,
             );
         }
+        let prod = crate::kernels::sub::variant::KernelVariant::PRODUCTION;
         Ok(Self {
-            memzero: simple("k_memzero")?,
+            memzero: crate::kernels::sub::memzero_bytes::pipeline_for(ctx, prod)?,
             rmsnorm: simple("k_rmsnorm")?,
             rmsnorm_f32: simple("k_rmsnorm_f32")?,
             dequant_q4: ctx.compile_kernel(QGEMM_SHADER, "dequant_q4_matrix")?,
             dequant_nvfp4: ctx.compile_kernel(QGEMM_SHADER, "dequant_nvfp4_matrix")?,
-            half_to_f32: simple("k_half_to_f32")?,
-            f32_to_half: simple("k_f32_to_half")?,
+            half_to_f32: crate::kernels::sub::half_to_f32::pipeline_for(ctx, prod)?,
+            f32_to_half: crate::kernels::sub::f32_to_half::pipeline_for(ctx, prod)?,
             gemm_q4,
             gemm_nvfp4,
             gemm_q8,

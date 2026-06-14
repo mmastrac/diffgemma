@@ -212,11 +212,6 @@ inline float temp_at(uint steps_done, constant StepParams& P) {
     return P.t_min + (P.t_max - P.t_min) * (cur / float(P.max_steps));
 }
 
-// ===================== k_memzero: generic byte-zero (audit: zero kernels) =====================
-kernel void k_memzero(device uchar4* p [[buffer(0)]], uint i [[thread_position_in_grid]]) {
-    p[i] = uchar4(0);
-}
-
 // ===================== k_rmsnorm (row; w_off==0 -> no-scale) =====================
 kernel void k_rmsnorm(device const half* x [[buffer(0)]],
                       device half* y [[buffer(1)]],
@@ -1006,26 +1001,6 @@ kernel void k_softcap(device half* logits [[buffer(0)]],
     // Metal fast-math tanh overflows for large |x|; clamp preserves softcap saturation.
     float x = clamp(v / SOFTCAP, -20.0f, 20.0f);
     logits[i] = half(tanh(x) * SOFTCAP);
-}
-
-kernel void k_half_to_f32(device const half* x [[buffer(0)]],
-                          device float* y [[buffer(1)]],
-                          constant uint& base [[buffer(2)]],
-                          constant uint& len [[buffer(3)]],
-                          uint gid [[thread_position_in_grid]]) {
-    if (gid >= len) return;
-    uint i = base + gid;
-    y[i] = float(x[i]);
-}
-
-kernel void k_f32_to_half(device const float* x [[buffer(0)]],
-                          device half* y [[buffer(1)]],
-                          constant uint& base [[buffer(2)]],
-                          constant uint& len [[buffer(3)]],
-                          uint gid [[thread_position_in_grid]]) {
-    if (gid >= len) return;
-    uint i = base + gid;
-    y[i] = half(x[i]);
 }
 
 // ======================= sampler =======================
