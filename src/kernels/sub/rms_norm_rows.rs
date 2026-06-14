@@ -5,6 +5,7 @@ use crate::kernels::cpu;
 use crate::safetensors::Error;
 
 pub use super::variant::KernelVariant;
+use super::manifest::{self, RmsNormRowsVariant};
 
 pub const ENTRY: &str = "rms_norm_rows";
 
@@ -62,6 +63,31 @@ pub fn mlp_shape_fixture(_fmt: ElemFormat) -> Fixture {
     }
 }
 
+pub fn tiny_fixture_no_scale(_fmt: ElemFormat) -> Fixture {
+    Fixture {
+        x: vec![1.0, 2.0, 3.0, 4.0, -1.0, 0.5, 2.0, -0.5],
+        weight: vec![1.0; 4],
+        seq_len: 2,
+        hidden: 4,
+        eps: 1e-6,
+    }
+}
+
+pub fn mlp_shape_fixture_no_scale(_fmt: ElemFormat) -> Fixture {
+    let seq_len = 3;
+    let hidden = 64;
+    let len = seq_len * hidden;
+    Fixture {
+        x: (0..len)
+            .map(|i| ((i as f32) * 0.017).sin() * 0.5)
+            .collect(),
+        weight: vec![1.0; hidden],
+        seq_len,
+        hidden,
+        eps: 1e-6,
+    }
+}
+
 /// CPU path wired into the engine reference (`kernels/cpu.rs`).
 pub fn cpu(fix: &Fixture) -> Vec<f32> {
     let mut out = vec![0.0f32; fix.out_len()];
@@ -76,6 +102,18 @@ pub fn cpu(fix: &Fixture) -> Vec<f32> {
     out
 }
 
+pub fn cpu_no_scale(fix: &Fixture) -> Vec<f32> {
+    let mut out = vec![0.0f32; fix.out_len()];
+    cpu::rms_norm_rows_no_scale(
+        &mut out,
+        &fix.x,
+        fix.seq_len,
+        fix.hidden,
+        fix.eps,
+    );
+    out
+}
+
 /// Independent CPU transliteration (oracle for tier-1).
 pub fn cpu_oracle(fix: &Fixture) -> Vec<f32> {
     cpu(fix)
@@ -83,6 +121,16 @@ pub fn cpu_oracle(fix: &Fixture) -> Vec<f32> {
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub fn gpu(fix: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
+    gpu_affine(fix, variant, true)
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn gpu_no_scale(fix: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
+    gpu_affine(fix, variant, false)
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn gpu_affine(fix: &Fixture, variant: KernelVariant, affine: bool) -> Result<Vec<f32>, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
     use objc2::runtime::ProtocolObject;
@@ -92,7 +140,7 @@ pub fn gpu(fix: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     };
 
     let ctx = MetalContext::new()?;
-    let pipeline = pipeline_for(&ctx, variant)?;
+    let pipeline = pipeline_for(&ctx, affine, variant)?;
     let mut pool = BufferPool::new();
     let len = fix.out_len();
     let buf_x = pool
@@ -173,9 +221,20 @@ pub fn shader_source() -> &'static str {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub fn pipeline_for(
     ctx: &crate::metal::device::MetalContext,
+    affine: bool,
     variant: KernelVariant,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_subkernel(SHADER, ENTRY, variant)
+    manifest::validate_shared(ENTRY, variant)?;
+    let local = manifest::rms_norm_rows_variant(affine)?;
+    manifest::assert_no_fc_collisions(ENTRY, &[4])?;
+    ctx.compile_subkernel_ex(
+        SHADER,
+        ENTRY,
+        variant,
+        local.cache_suffix(),
+        &local.local_fcs(),
+        &[],
+    )
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -242,6 +301,30 @@ mod tests {
         cpu_oracle = crate::kernels::sub::rms_norm_rows::cpu_oracle,
         gpu = crate::kernels::sub::rms_norm_rows::gpu,
         fixture = crate::kernels::sub::rms_norm_rows::mlp_shape_fixture,
+        out_len = crate::kernels::sub::rms_norm_rows::fixture_out_len,
+        formats: [F32],
+        max_tol = 1e-5,
+        min_cos = 0.9999,
+    }
+
+    kernel_oracle_matrix! {
+        mod no_scale_tiny,
+        cpu = crate::kernels::sub::rms_norm_rows::cpu_no_scale,
+        cpu_oracle = crate::kernels::sub::rms_norm_rows::cpu_no_scale,
+        gpu = crate::kernels::sub::rms_norm_rows::gpu_no_scale,
+        fixture = crate::kernels::sub::rms_norm_rows::tiny_fixture_no_scale,
+        out_len = crate::kernels::sub::rms_norm_rows::fixture_out_len,
+        formats: [F32],
+        max_tol = 1e-5,
+        min_cos = 0.9999,
+    }
+
+    kernel_oracle_matrix! {
+        mod no_scale_mlp_shape,
+        cpu = crate::kernels::sub::rms_norm_rows::cpu_no_scale,
+        cpu_oracle = crate::kernels::sub::rms_norm_rows::cpu_no_scale,
+        gpu = crate::kernels::sub::rms_norm_rows::gpu_no_scale,
+        fixture = crate::kernels::sub::rms_norm_rows::mlp_shape_fixture_no_scale,
         out_len = crate::kernels::sub::rms_norm_rows::fixture_out_len,
         formats: [F32],
         max_tol = 1e-5,

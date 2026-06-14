@@ -15,7 +15,7 @@ kernel void half_to_f32(
 ) {
     if (K_SHAPE_ASSERT && len == 0u) return;
     if (gid >= len) return;
-    (void)K_USE_FP4;
+    K_ELEMENTWISE_GUARD();
     uint i = base + gid;
     float v = float(x[i]);
     if (K_DUMP_STAGE >= 1u) dump[gid] = v;

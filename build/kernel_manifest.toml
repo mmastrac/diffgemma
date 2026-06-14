@@ -1,0 +1,101 @@
+# Kernel function-constant manifest.
+#
+# FC 1–3 are reserved globally (see shaders/kernels/common.metal).
+# FC 4+ are per-kernel; each kernel lists its full index map under [kernel.fc].
+# Pipeline construction in Rust MUST only build tuples listed under [[kernel.variants]].
+# Tier-1 tests MUST cover every [[kernel.variants]] row (see manifest.rs tests).
+
+[[kernel]]
+name = "rms_norm_rows"
+entry = "rms_norm_rows"
+quant_formats = [0]  # inert; only q4_affine
+
+[kernel.fc]
+1 = "K_SHAPE_ASSERT"
+2 = "K_DUMP_STAGE"
+3 = "K_QUANT_FORMAT"
+4 = "K_AFFINE"
+
+[[kernel.variants]]
+affine = false
+
+[[kernel.variants]]
+affine = true
+
+[[kernel]]
+name = "rms_norm_rows_tiled"
+entry = "rms_norm_rows_tiled"
+quant_formats = [0]
+
+[kernel.fc]
+1 = "K_SHAPE_ASSERT"
+2 = "K_DUMP_STAGE"
+3 = "K_QUANT_FORMAT"
+4 = "K_IN_DTYPE"
+
+[[kernel.variants]]
+in_dtype = 0  # f32 in, half out
+
+[[kernel.variants]]
+in_dtype = 1  # half in, half out
+
+[[kernel]]
+name = "swiglu"
+entry = "swiglu"
+quant_formats = [0]
+
+[kernel.fc]
+1 = "K_SHAPE_ASSERT"
+2 = "K_DUMP_STAGE"
+3 = "K_QUANT_FORMAT"
+4 = "K_IO_DTYPE"
+5 = "K_GELU_GATE"
+6 = "K_IN_PLACE"
+
+[[kernel.variants]]
+io_dtype = 0
+gelu_gate = false
+in_place = true
+
+[[kernel.variants]]
+io_dtype = 1
+gelu_gate = true
+in_place = false
+
+[[kernel]]
+name = "swiglu_moe_gate_up"
+entry = "swiglu_moe_gate_up"
+quant_formats = [0]
+
+[kernel.fc]
+1 = "K_SHAPE_ASSERT"
+2 = "K_DUMP_STAGE"
+3 = "K_QUANT_FORMAT"
+
+[[kernel.variants]]
+# MoE gate_up is always interleaved [batch, 2*moe_inter]; no local FC axes.
+
+[[kernel]]
+name = "gelu"
+entry = "gelu"
+quant_formats = [0]
+
+[kernel.fc]
+1 = "K_SHAPE_ASSERT"
+2 = "K_DUMP_STAGE"
+3 = "K_QUANT_FORMAT"
+
+[[kernel.variants]]
+
+[[kernel]]
+name = "gemm_q4"
+entry = "gemm_q4"
+# GEMM uses gemm_common.metal FC 1–3 (IS_FULL_LAYER, GEMM_N, GEMM_K); format axis TBD at FC4.
+quant_formats = [0]
+
+[kernel.fc]
+1 = "IS_FULL_LAYER"
+2 = "GEMM_N"
+3 = "GEMM_K"
+
+[[kernel.variants]]

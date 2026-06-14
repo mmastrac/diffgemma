@@ -5,7 +5,10 @@ using namespace metal;
 #include "common.metal"
 #endif
 
-/// Per-row Gemma RMSNorm: `out[s,:] = x[s,:] / rms(x[s,:]) * weight`.
+constant bool K_AFFINE [[function_constant(4)]];
+
+/// Per-row Gemma RMSNorm (engine path, 1 thread/row, f32 I/O).
+/// `K_AFFINE`: multiply by weight; else normalize only. Weight buffer unused when false.
 kernel void rms_norm_rows(
     device const float *x [[buffer(0)]],
     device const float *weight [[buffer(1)]],
@@ -15,6 +18,7 @@ kernel void rms_norm_rows(
     device float *dump [[buffer(5)]],
     uint gid [[thread_position_in_grid]]
 ) {
+    K_ELEMENTWISE_GUARD();
     uint seq_len = dims.x;
     uint hidden = dims.y;
     uint s = gid;
@@ -35,8 +39,12 @@ kernel void rms_norm_rows(
     if (K_DUMP_STAGE >= 1u) {
         dump[s] = rms_inv;
     }
-    (void)K_USE_FP4;
+    K_ELEMENTWISE_GUARD();
     for (uint i = 0; i < hidden; i++) {
-        out[off + i] = x[off + i] * rms_inv * weight[i];
+        float v = x[off + i] * rms_inv;
+        if (K_AFFINE) {
+            v *= weight[i];
+        }
+        out[off + i] = v;
     }
 }

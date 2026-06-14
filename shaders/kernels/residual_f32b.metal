@@ -14,6 +14,6 @@ kernel void residual_f32b(
 ) {
     float v = float(a[i]) + b[i];
     if (K_DUMP_STAGE >= 1u) dump[i] = v;
-    (void)K_USE_FP4;
+    K_ELEMENTWISE_GUARD();
     y[i] = half(v);
 }

@@ -1,22 +1,43 @@
-//! Threadgroup RMSNorm: f32 in, half out (MoE post-scatter path).
+//! Threadgroup RMSNorm (monolith): half or f32 in, half out, optional bf16 weight blob.
 
 use super::bf16;
 use super::f16;
 use super::gpu_common;
 use super::test_util::ElemFormat;
-use super::variant::KernelVariant;
+use super::variant::{ElemDtype, FcUInt, KernelVariant};
+use super::manifest::{self, RmsNormRowsTiledVariant};
 use crate::kernels::cpu;
 use crate::safetensors::Error;
 
-pub const ENTRY: &str = "rmsnorm_f32";
+pub const ENTRY: &str = "rms_norm_rows_tiled";
 pub const RMS_EPS: f32 = 1e-6;
 pub const THREADS_PER_TG: usize = 256;
 
 const SHADER: &str = concat!(
     include_str!("../../../shaders/kernels/common.metal"),
     include_str!("../../../shaders/kernels/bf16.metal"),
-    include_str!("../../../shaders/kernels/rmsnorm_f32.metal"),
+    include_str!("../../../shaders/kernels/rms_norm_rows_tiled.metal"),
 );
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TiledVariant {
+    pub in_dtype: ElemDtype,
+}
+
+impl TiledVariant {
+    pub const HALF_IN: Self = Self {
+        in_dtype: ElemDtype::Half,
+    };
+    pub const F32_IN: Self = Self {
+        in_dtype: ElemDtype::F32,
+    };
+
+    fn manifest(self) -> RmsNormRowsTiledVariant {
+        RmsNormRowsTiledVariant {
+            in_dtype: self.in_dtype,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Fixture {
@@ -40,6 +61,15 @@ pub fn tiny_fixture(_: ElemFormat) -> Fixture {
     Fixture {
         x: vec![1.0, 2.0, 3.0, 4.0, -1.0, 0.5, 2.0, -0.5],
         weight: Some(vec![1.0, 0.5, 2.0, 1.5]),
+        rows: 2,
+        dim: 4,
+    }
+}
+
+pub fn no_scale_fixture(_: ElemFormat) -> Fixture {
+    Fixture {
+        x: vec![1.0, -1.0, 2.0, 0.0, 0.5, -0.5, 1.5, 2.0],
+        weight: None,
         rows: 2,
         dim: 4,
     }
@@ -95,9 +125,20 @@ pub fn dispatch_shape(rows: usize) -> (objc2_metal::MTLSize, objc2_metal::MTLSiz
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub fn pipeline_for(
     ctx: &crate::metal::device::MetalContext,
+    tiled: TiledVariant,
     variant: KernelVariant,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_subkernel(SHADER, ENTRY, variant)
+    manifest::validate_shared(ENTRY, variant)?;
+    let local = manifest::rms_norm_rows_tiled_variant(tiled.in_dtype)?;
+    manifest::assert_no_fc_collisions(ENTRY, &[4])?;
+    ctx.compile_subkernel_ex(
+        SHADER,
+        ENTRY,
+        variant,
+        local.cache_suffix(),
+        &[],
+        &local.local_fcs(),
+    )
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -126,15 +167,35 @@ pub fn bind_gpu_buffers(
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
-pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
+pub fn gpu_half(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
+    gpu_tiled(f, variant, TiledVariant::HALF_IN)
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn gpu_f32_in(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
+    gpu_tiled(f, variant, TiledVariant::F32_IN)
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn gpu_tiled(
+    f: &Fixture,
+    variant: KernelVariant,
+    tiled: TiledVariant,
+) -> Result<Vec<f32>, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
 
     let ctx = MetalContext::new()?;
-    let pipeline = pipeline_for(&ctx, variant)?;
+    let pipeline = pipeline_for(&ctx, tiled, variant)?;
     let mut pool = BufferPool::new();
     let len = f.out_len();
-    let buf_x = pool.allocate(&ctx.device, len * 4).ok_or(Error::Format("alloc"))?;
+    let x_bytes = match tiled.in_dtype {
+        ElemDtype::F32 => len * 4,
+        ElemDtype::Half => len * 2,
+    };
+    let buf_x = pool
+        .allocate(&ctx.device, x_bytes)
+        .ok_or(Error::Format("alloc"))?;
     let buf_y = pool.allocate(&ctx.device, len * 2).ok_or(Error::Format("alloc"))?;
     let (blob, w_off) = match &f.weight {
         Some(w) => {
@@ -152,8 +213,14 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     } else {
         4
     };
-    let buf_d = pool.allocate(&ctx.device, dump_bytes).ok_or(Error::Format("alloc"))?;
-    BufferPool::write_f32(&buf_x, &f.x);
+    let buf_d = pool
+        .allocate(&ctx.device, dump_bytes)
+        .ok_or(Error::Format("alloc"))?;
+    if tiled.in_dtype == ElemDtype::F32 {
+        BufferPool::write_f32(&buf_x, &f.x);
+    } else {
+        BufferPool::write_bf16(&buf_x, &f16::f32_slice_to_f16(&f.x));
+    }
     BufferPool::write_bytes(&buf_blob, &blob);
     let (grid, tg) = dispatch_shape(f.rows);
     let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
@@ -179,7 +246,12 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
 }
 
 #[cfg(not(all(feature = "metal", target_os = "macos")))]
-pub fn gpu(_: &Fixture, _: KernelVariant) -> Result<Vec<f32>, Error> {
+pub fn gpu_half(_: &Fixture, _: KernelVariant) -> Result<Vec<f32>, Error> {
+    Err(Error::Format("Metal unavailable"))
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+pub fn gpu_f32_in(_: &Fixture, _: KernelVariant) -> Result<Vec<f32>, Error> {
     Err(Error::Format("Metal unavailable"))
 }
 
@@ -189,12 +261,36 @@ mod tests {
     use crate::kernel_oracle_matrix;
 
     kernel_oracle_matrix! {
-        mod tiny,
-        cpu = crate::kernels::sub::rmsnorm_f32::cpu,
-        cpu_oracle = crate::kernels::sub::rmsnorm_f32::cpu_oracle,
-        gpu = crate::kernels::sub::rmsnorm_f32::gpu,
-        fixture = crate::kernels::sub::rmsnorm_f32::tiny_fixture,
-        out_len = crate::kernels::sub::rmsnorm_f32::fixture_len,
+        mod half_tiny,
+        cpu = crate::kernels::sub::rms_norm_rows_tiled::cpu,
+        cpu_oracle = crate::kernels::sub::rms_norm_rows_tiled::cpu_oracle,
+        gpu = crate::kernels::sub::rms_norm_rows_tiled::gpu_half,
+        fixture = crate::kernels::sub::rms_norm_rows_tiled::tiny_fixture,
+        out_len = crate::kernels::sub::rms_norm_rows_tiled::fixture_len,
+        formats: [F32],
+        max_tol = 1e-2,
+        min_cos = 0.9999,
+    }
+
+    kernel_oracle_matrix! {
+        mod half_no_scale,
+        cpu = crate::kernels::sub::rms_norm_rows_tiled::cpu,
+        cpu_oracle = crate::kernels::sub::rms_norm_rows_tiled::cpu_oracle,
+        gpu = crate::kernels::sub::rms_norm_rows_tiled::gpu_half,
+        fixture = crate::kernels::sub::rms_norm_rows_tiled::no_scale_fixture,
+        out_len = crate::kernels::sub::rms_norm_rows_tiled::fixture_len,
+        formats: [F32],
+        max_tol = 1e-3,
+        min_cos = 0.9999,
+    }
+
+    kernel_oracle_matrix! {
+        mod f32_in_tiny,
+        cpu = crate::kernels::sub::rms_norm_rows_tiled::cpu,
+        cpu_oracle = crate::kernels::sub::rms_norm_rows_tiled::cpu_oracle,
+        gpu = crate::kernels::sub::rms_norm_rows_tiled::gpu_f32_in,
+        fixture = crate::kernels::sub::rms_norm_rows_tiled::tiny_fixture,
+        out_len = crate::kernels::sub::rms_norm_rows_tiled::fixture_len,
         formats: [F32],
         max_tol = 1e-2,
         min_cos = 0.9999,

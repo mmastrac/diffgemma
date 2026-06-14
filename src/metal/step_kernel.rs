@@ -460,8 +460,16 @@ impl StepPipelines {
         let prod = crate::kernels::sub::variant::KernelVariant::PRODUCTION;
         Ok(Self {
             memzero: crate::kernels::sub::memzero_bytes::pipeline_for(ctx, prod)?,
-            rmsnorm: crate::kernels::sub::rmsnorm_half::pipeline_for(ctx, prod)?,
-            rmsnorm_f32: crate::kernels::sub::rmsnorm_f32::pipeline_for(ctx, prod)?,
+            rmsnorm: crate::kernels::sub::rms_norm_rows_tiled::pipeline_for(
+                ctx,
+                crate::kernels::sub::rms_norm_rows_tiled::TiledVariant::HALF_IN,
+                prod,
+            )?,
+            rmsnorm_f32: crate::kernels::sub::rms_norm_rows_tiled::pipeline_for(
+                ctx,
+                crate::kernels::sub::rms_norm_rows_tiled::TiledVariant::F32_IN,
+                prod,
+            )?,
             dequant_q4: ctx.compile_kernel(QGEMM_SHADER, "dequant_q4_matrix")?,
             dequant_nvfp4: ctx.compile_kernel(QGEMM_SHADER, "dequant_nvfp4_matrix")?,
             half_to_f32: crate::kernels::sub::half_to_f32::pipeline_for(ctx, prod)?,
@@ -474,17 +482,18 @@ impl StepPipelines {
             attention: simple("k_attention")?,
             residual: crate::kernels::sub::residual_half::pipeline_for(ctx, prod)?,
             residual_f32b: crate::kernels::sub::residual_f32b::pipeline_for(ctx, prod)?,
-            glu: crate::kernels::sub::glu_half::pipeline_for(ctx, prod)?,
+            glu: crate::kernels::sub::swiglu::pipeline_for(
+                ctx,
+                crate::kernels::sub::SwigluSplitVariant::MONOLITH_GLU,
+                prod,
+            )?,
             router: simple("k_router")?,
             bucket_count: simple("k_bucket_count")?,
             bucket_fill: simple("k_bucket_fill")?,
             q4_linear: ctx.compile_kernel(QGEMM_SHADER, "f32_q4_linear")?,
             q4_linear_grouped: ctx.compile_kernel(QGEMM_SHADER, "f32_q4_linear_grouped")?,
             nvfp4_linear: ctx.compile_kernel(QGEMM_SHADER, "f32_nvfp4_linear")?,
-            gelu_swiglu_gate_up: crate::kernels::sub::gelu_swiglu_gate_up::pipeline_for(
-                ctx,
-                crate::kernels::sub::variant::KernelVariant::PRODUCTION,
-            )?,
+            gelu_swiglu_gate_up: crate::kernels::sub::swiglu::pipeline_for_moe(ctx, prod)?,
             moe_grouped: simple("k_moe_grouped")?,
             moe_grouped_nvfp4: simple("k_moe_grouped_nvfp4")?,
             moe_grouped_act_probe: simple("k_moe_grouped_act_probe")?,
@@ -1133,10 +1142,12 @@ impl StepEnc<'_> {
 
     fn glu(&mut self, gate_off: u64, up_off: u64, y_off: u64, elems: usize) {
         self.sink_set_pipeline(&self.ps.glu);
+        let dims = [elems as u32, 0u32];
         unsafe {
             self.sink_set_buffer(&self.bufs.arena, gate_off as usize, 0);
             self.sink_set_buffer(&self.bufs.arena, up_off as usize, 1);
             self.sink_set_buffer(&self.bufs.arena, y_off as usize, 2);
+            self.sink_set_bytes(&dims, 3);
         }
         self.dispatch_1d(&self.ps.glu, elems, 256);
     }

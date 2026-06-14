@@ -15,7 +15,7 @@ kernel void vec_fill_zero(
     uint len = range.y;
     if (K_SHAPE_ASSERT && len == 0u) return;
     if (gid >= len) return;
-    (void)K_USE_FP4;
+    K_ELEMENTWISE_GUARD();
     uint i = base + gid;
     if (K_DUMP_STAGE >= 1u) dump[gid] = x[i];
     x[i] = 0.0f;

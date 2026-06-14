@@ -4,12 +4,12 @@ using namespace metal;
 #ifndef DGQ_KERNEL_COMMON_METAL
 #include "common.metal"
 #endif
-
 #ifndef DGQ_KERNEL_ACTIVATIONS_METAL
 #include "activations.metal"
 #endif
 
-kernel void gelu_pytorch_tanh(
+/// In-place GELU (PyTorch tanh approximation).
+kernel void gelu(
     device float *x [[buffer(0)]],
     constant uint &len [[buffer(1)]],
     device float *dump [[buffer(2)]],
@@ -21,7 +21,7 @@ kernel void gelu_pytorch_tanh(
     if (gid >= len) {
         return;
     }
-    (void)K_USE_FP4;
+    K_ELEMENTWISE_GUARD();
     float v = x[gid];
     if (K_DUMP_STAGE >= 1u) {
         dump[gid] = v;

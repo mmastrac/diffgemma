@@ -2,8 +2,8 @@
 
 use crate::fast_slice::FastSlice;
 use crate::kernels::sub::{
-    gather_rows, gelu_pytorch_tanh, rms_norm_rows, rms_norm_rows_no_scale, router_scale_rows,
-    softmax_rows, swiglu_mul, vec_add_inplace, vec_scale_inplace,
+    gather_rows, gelu, rms_norm_rows, router_scale_rows,
+    softmax_rows, swiglu, vec_add_inplace, vec_scale_inplace,
 };
 use crate::metal::batch::GpuBatch;
 use crate::metal::kernels::GpuKernels;
@@ -98,11 +98,12 @@ pub fn rms_norm_rows_no_scale_gpu_buf(
 ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
     let len = seq_len * hidden;
     let buf_o = batch.alloc_f32_out(len)?;
+    let buf_w = batch.alloc_f32_out(1)?;
     let buf_dump = batch.alloc_f32_out(1)?;
     let dims = [seq_len as u32, hidden as u32];
     batch.dispatch_1d(&kernels.rms_norm_no_scale.pipeline, seq_len, |enc| {
-        rms_norm_rows_no_scale::bind_gpu_buffers(
-            &enc, x_buf, &buf_o, &buf_dump, &dims, eps,
+        rms_norm_rows::bind_gpu_buffers(
+            &enc, x_buf, &buf_w, &buf_o, &buf_dump, &dims, eps,
         );
     });
     Ok(buf_o)
@@ -117,7 +118,7 @@ pub fn gelu_pytorch_tanh_gpu_buf(
     let len_u = len as u32;
     let buf_dump = batch.alloc_f32_out(1)?;
     batch.dispatch_1d(&kernels.gelu.pipeline, len, |enc| {
-        gelu_pytorch_tanh::bind_gpu_in_place(&enc, buf, &buf_dump, len_u);
+        gelu::bind_gpu_in_place(&enc, buf, &buf_dump, len_u);
     });
     Ok(())
 }
@@ -132,7 +133,7 @@ pub fn swiglu_mul_gpu_bufs(
     let len_u = len as u32;
     let buf_dump = batch.alloc_f32_out(1)?;
     batch.dispatch_1d(&kernels.swiglu_mul.pipeline, len, |enc| {
-        swiglu_mul::bind_gpu_buffers(&enc, gate_buf, up_buf, &buf_dump, len_u);
+        swiglu::bind_split_in_place_f32(&enc, gate_buf, up_buf, &buf_dump, len_u);
     });
     Ok(())
 }
@@ -152,9 +153,7 @@ pub fn gelu_swiglu_gate_up_gpu(
     let buf_dump = batch.alloc_f32_out(1)?;
     let dims = [batch_size as u32, moe_inter as u32];
     batch.dispatch_1d(&kernels.gelu_swiglu_gate_up.pipeline, out_len, |enc| {
-        crate::kernels::sub::gelu_swiglu_gate_up::bind_gpu_buffers(
-            &enc, gate_up_buf, &buf_o, &buf_dump, &dims,
-        );
+        swiglu::bind_moe_gate_up(&enc, gate_up_buf, &buf_o, &buf_dump, &dims);
     });
     Ok(buf_o)
 }

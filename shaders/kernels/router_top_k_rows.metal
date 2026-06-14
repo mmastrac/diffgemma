@@ -25,7 +25,7 @@ kernel void router_top_k_rows(
     if (row >= rows || k == 0u || k > 32u) {
         return;
     }
-    (void)K_USE_FP4;
+    K_ELEMENTWISE_GUARD();
 
     float top_p[32];
     uint top_i[32];

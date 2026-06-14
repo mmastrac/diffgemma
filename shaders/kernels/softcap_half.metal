@@ -16,7 +16,7 @@ kernel void softcap_half(
 ) {
     if (K_SHAPE_ASSERT && len == 0u) return;
     if (gid >= len) return;
-    (void)K_USE_FP4;
+    K_ELEMENTWISE_GUARD();
     uint i = base + gid;
     float v = float(logits[i]);
     float x = clamp(v / SOFTCAP, -20.0f, 20.0f);

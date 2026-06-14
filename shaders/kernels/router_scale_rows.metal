@@ -18,7 +18,7 @@ kernel void router_scale_rows(
     uint s = gid;
     if (K_SHAPE_ASSERT && (hidden == 0u || seq_len == 0u)) return;
     if (s >= seq_len) return;
-    (void)K_USE_FP4;
+    K_ELEMENTWISE_GUARD();
     uint off = s * hidden;
     if (K_DUMP_STAGE >= 1u) dump[s] = root;
     for (uint i = 0; i < hidden; i++) {

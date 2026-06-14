@@ -39,9 +39,9 @@ pub struct GpuKernels {
 impl GpuKernels {
     pub fn new(ctx: &MetalContext) -> Result<Self, Error> {
         use crate::kernels::sub::{
-            gather_prob_cols, gather_rows, gelu_pytorch_tanh, gelu_swiglu_gate_up, rms_norm_rows,
-            rms_norm_rows_no_scale, router_scale_rows, router_top_k_rows, softmax_rows,
-            swiglu_mul, vec_add_inplace, vec_fill_zero, vec_mul_inplace, vec_scale_inplace,
+            gather_prob_cols, gather_rows, gelu, rms_norm_rows, router_scale_rows,
+            router_top_k_rows, softmax_rows, swiglu, vec_add_inplace, vec_fill_zero,
+            vec_mul_inplace, vec_scale_inplace,
         };
         let prod = KernelVariant::PRODUCTION;
         Ok(Self {
@@ -50,15 +50,19 @@ impl GpuKernels {
             vec_mul: vec_mul_inplace::pipeline_for(ctx, prod)?,
             vec_scale: vec_scale_inplace::pipeline_for(ctx, prod)?,
             router_scale: router_scale_rows::pipeline_for(ctx, prod)?,
-            gelu: gelu_pytorch_tanh::pipeline_for(ctx, prod)?,
-            swiglu_mul: swiglu_mul::pipeline_for(ctx, prod)?,
-            gelu_swiglu_gate_up: gelu_swiglu_gate_up::pipeline_for(ctx, prod)?,
+            gelu: gelu::pipeline_for(ctx, prod)?,
+            swiglu_mul: swiglu::pipeline_for(
+                ctx,
+                crate::kernels::sub::SwigluSplitVariant::DECODER_MUL,
+                prod,
+            )?,
+            gelu_swiglu_gate_up: swiglu::pipeline_for_moe(ctx, prod)?,
             softmax_rows: softmax_rows::pipeline_for(ctx, prod)?,
             router_top_k: router_top_k_rows::pipeline_for(ctx, prod)?,
             gather_prob_cols: gather_prob_cols::pipeline_for(ctx, prod)?,
             vec_fill_zero: vec_fill_zero::pipeline_for(ctx, prod)?,
-            rms_norm_no_scale: rms_norm_rows_no_scale::pipeline_for(ctx, prod)?,
-            rms_norm: rms_norm_rows::pipeline_for(ctx, prod)?,
+            rms_norm_no_scale: rms_norm_rows::pipeline_for(ctx, false, prod)?,
+            rms_norm: rms_norm_rows::pipeline_for(ctx, true, prod)?,
         })
     }
 
@@ -135,19 +139,24 @@ impl GpuKernels {
         let buf_o = pool
             .allocate(device, o_bytes)
             .ok_or(Error::Format("Metal buffer alloc failed"))?;
+        let buf_w = pool
+            .allocate(device, 4)
+            .ok_or(Error::Format("Metal buffer alloc failed"))?;
+        BufferPool::write_f32(&buf_w, &[1.0f32]);
         let buf_dump = dummy_dump_buf(pool, device)?;
         BufferPool::write_f32(&buf_x, x);
         BufferPool::write_f32(&buf_o, out);
 
         let dims = [seq_len as u32, hidden as u32];
         run_1d(queue, &self.rms_norm_no_scale.pipeline, seq_len, |enc| {
-            crate::kernels::sub::rms_norm_rows_no_scale::bind_gpu_buffers(
-                &enc, &buf_x, &buf_o, &buf_dump, &dims, eps,
+            crate::kernels::sub::rms_norm_rows::bind_gpu_buffers(
+                &enc, &buf_x, &buf_w, &buf_o, &buf_dump, &dims, eps,
             );
         })?;
 
         BufferPool::read_f32(&buf_o, out);
         pool.release(x_bytes, buf_x);
+        pool.release(4, buf_w);
         pool.release(o_bytes, buf_o);
         pool.release(4, buf_dump);
         Ok(())
@@ -301,9 +310,7 @@ impl GpuKernels {
         let len = x.len() as u32;
         let buf_dump = dummy_dump_buf(pool, device)?;
         run_1d(queue, &self.gelu.pipeline, x.len(), |enc| {
-            crate::kernels::sub::gelu_pytorch_tanh::bind_gpu_in_place(
-                &enc, &buf, &buf_dump, len,
-            );
+            crate::kernels::sub::gelu::bind_gpu_in_place(&enc, &buf, &buf_dump, len);
         })?;
         BufferPool::read_f32(&buf, x);
         pool.release(bytes, buf);
@@ -334,7 +341,7 @@ impl GpuKernels {
         let len = gate.len() as u32;
         let buf_dump = dummy_dump_buf(pool, device)?;
         run_1d(queue, &self.swiglu_mul.pipeline, gate.len(), |enc| {
-            crate::kernels::sub::swiglu_mul::bind_gpu_buffers(
+            crate::kernels::sub::swiglu::bind_split_in_place_f32(
                 &enc, &buf_g, &buf_u, &buf_dump, len,
             );
         })?;

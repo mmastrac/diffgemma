@@ -23,7 +23,7 @@ kernel void softmax_rows(
     if (row >= rows) {
         return;
     }
-    (void)K_USE_FP4;
+    K_ELEMENTWISE_GUARD();
 
     device float *r = x + row * cols;
     threadgroup float scratch[256];

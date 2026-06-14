@@ -16,6 +16,6 @@ kernel void half_scale(
     if (gid >= n) return;
     float v = float(y[gid]) * scale;
     if (K_DUMP_STAGE >= 1u) dump[gid] = v;
-    (void)K_USE_FP4;
+    K_ELEMENTWISE_GUARD();
     y[gid] = half(v);
 }

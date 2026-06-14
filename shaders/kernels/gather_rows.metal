@@ -19,7 +19,7 @@ kernel void gather_rows(
     uint h = gid % hidden;
     if (K_SHAPE_ASSERT && (hidden == 0u || batch_size == 0u)) return;
     if (bi >= batch_size) return;
-    (void)K_USE_FP4;
+    K_ELEMENTWISE_GUARD();
     uint tok = indices[bi];
     float v = src[tok * hidden + h];
     if (K_DUMP_STAGE >= 1u) dump[gid] = float(tok);

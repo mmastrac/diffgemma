@@ -154,7 +154,27 @@ impl MetalContext {
         entry: &str,
         variant: KernelVariant,
     ) -> Result<ComputePipeline, Error> {
-        Self::compile_subkernel_on_device(&self.device, source, entry, variant)
+        Self::compile_subkernel_on_device(&self.device, source, entry, variant, "", &[], &[])
+    }
+
+    pub fn compile_subkernel_ex(
+        &self,
+        source: &str,
+        entry: &str,
+        variant: KernelVariant,
+        extra_label: &str,
+        extra_bools: &[crate::kernels::sub::variant::FcBool],
+        extra_uints: &[crate::kernels::sub::variant::FcUInt],
+    ) -> Result<ComputePipeline, Error> {
+        Self::compile_subkernel_on_device(
+            &self.device,
+            source,
+            entry,
+            variant,
+            extra_label,
+            extra_bools,
+            extra_uints,
+        )
     }
 
     pub fn compile_subkernel_on_device(
@@ -162,6 +182,9 @@ impl MetalContext {
         source: &str,
         entry: &str,
         variant: KernelVariant,
+        extra_label: &str,
+        extra_bools: &[crate::kernels::sub::variant::FcBool],
+        extra_uints: &[crate::kernels::sub::variant::FcUInt],
     ) -> Result<ComputePipeline, Error> {
         let library = {
             let ns_source = NSString::from_str(source);
@@ -172,7 +195,7 @@ impl MetalContext {
         let fc = MTLFunctionConstantValues::new();
         let shape_assert = variant.shape_assert;
         let dump_stage = variant.dump_stage;
-        let use_fp4 = variant.use_fp4;
+        let quant_format = variant.quant_format as u32;
         unsafe {
             fc.setConstantValue_type_atIndex(
                 std::ptr::NonNull::from_ref(&shape_assert).cast(),
@@ -185,16 +208,30 @@ impl MetalContext {
                 2,
             );
             fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&use_fp4).cast(),
-                MTLDataType::Bool,
+                std::ptr::NonNull::from_ref(&quant_format).cast(),
+                MTLDataType::UInt,
                 3,
             );
+            for extra in extra_bools {
+                fc.setConstantValue_type_atIndex(
+                    std::ptr::NonNull::from_ref(&extra.value).cast(),
+                    MTLDataType::Bool,
+                    extra.index as usize,
+                );
+            }
+            for extra in extra_uints {
+                fc.setConstantValue_type_atIndex(
+                    std::ptr::NonNull::from_ref(&extra.value).cast(),
+                    MTLDataType::UInt,
+                    extra.index as usize,
+                );
+            }
         }
         let name = NSString::from_str(entry);
         let function = library
             .newFunctionWithName_constantValues_error(&name, &fc)
             .map_err(|e| shader_compile_error(e))?;
-        let label = variant.cache_label(entry);
+        let label = variant.cache_label_extra(entry, extra_label);
         let cache = PipelineArchiveCache::shared(device)?;
         let pipeline = cache.compile_compute(device, &function, &label)?;
         Ok(ComputePipeline { pipeline })

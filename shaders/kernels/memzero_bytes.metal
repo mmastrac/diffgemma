@@ -10,7 +10,7 @@ kernel void memzero_bytes(
     device float *dump [[buffer(1)]],
     uint i [[thread_position_in_grid]]
 ) {
-    (void)K_USE_FP4;
+    K_ELEMENTWISE_GUARD();
     if (K_DUMP_STAGE >= 1u) dump[i] = 0.0f;
     p[i] = uchar4(0);
 }

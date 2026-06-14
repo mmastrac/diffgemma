@@ -20,6 +20,6 @@ kernel void residual_half(
     float s = scal_off ? bf16_bytes(blob + scal_off) : 1.0f;
     float v = (float(a[i]) + float(b[i])) * s;
     if (K_DUMP_STAGE >= 1u) dump[i] = v;
-    (void)K_USE_FP4;
+    K_ELEMENTWISE_GUARD();
     y[i] = half(v);
 }

@@ -14,7 +14,7 @@ kernel void vec_scale_inplace(
 ) {
     if (K_SHAPE_ASSERT && len == 0u) return;
     if (gid >= len) return;
-    (void)K_USE_FP4;
+    K_ELEMENTWISE_GUARD();
     if (K_DUMP_STAGE >= 1u) dump[gid] = scale;
     x[gid] *= scale;
 }

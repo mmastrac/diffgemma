@@ -20,7 +20,7 @@ kernel void gather_prob_cols(
     uint row = gid.y;
     if (K_SHAPE_ASSERT && (rows == 0u || chunk == 0u || vocab == 0u)) return;
     if (row >= rows || col >= chunk) return;
-    (void)K_USE_FP4;
+    K_ELEMENTWISE_GUARD();
     float v = probs[row * vocab + v0 + col];
     if (K_DUMP_STAGE >= 1u) dump[row * chunk + col] = v;
     out[row * chunk + col] = v;
