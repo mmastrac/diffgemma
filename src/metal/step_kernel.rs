@@ -421,6 +421,8 @@ struct StepPipelines {
     q4_linear: ComputePipeline,
     q4_linear_grouped: ComputePipeline,
     nvfp4_linear_grouped: ComputePipeline,
+    q4_block_grouped: HashMap<(u32, u32), ComputePipeline>,
+    nvfp4_block_grouped: HashMap<(u32, u32), ComputePipeline>,
     nvfp4_linear: ComputePipeline,
     gather_rows: ComputePipeline,
     gelu_swiglu_gate_up: ComputePipeline,
@@ -483,6 +485,28 @@ impl StepPipelines {
                 crate::kernels::sub::gemm_q8_rowk::pipeline_for(ctx, n, k)?,
             );
         }
+        let mut q4_block_grouped = HashMap::new();
+        let mut nvfp4_block_grouped = HashMap::new();
+        for &(n, k) in &[(MOE_FF * 2, HID as u32), (HID as u32, MOE_FF)] {
+            q4_block_grouped.insert(
+                (n, k),
+                crate::kernels::sub::gemm_block_grouped::pipeline_for(
+                    ctx,
+                    n,
+                    k,
+                    crate::kernels::sub::QuantFormat::Q4Affine,
+                )?,
+            );
+            nvfp4_block_grouped.insert(
+                (n, k),
+                crate::kernels::sub::gemm_block_grouped::pipeline_for(
+                    ctx,
+                    n,
+                    k,
+                    crate::kernels::sub::QuantFormat::NvFp4,
+                )?,
+            );
+        }
         let prod = crate::kernels::sub::variant::KernelVariant::PRODUCTION;
         let dump = crate::kernels::sub::variant::KernelVariant::TEST_DUMP;
         Ok(Self {
@@ -540,6 +564,8 @@ impl StepPipelines {
                 crate::kernels::sub::QuantFormat::NvFp4,
                 prod,
             )?,
+            q4_block_grouped,
+            nvfp4_block_grouped,
             nvfp4_linear: crate::kernels::sub::gemm_linear_f32::pipeline_for(
                 ctx,
                 crate::kernels::sub::QuantFormat::NvFp4,
@@ -598,6 +624,25 @@ impl StepPipelines {
             QuantFormat::NvFp4 => self.nvfp4(n, k),
             _ => self.q4(n, k),
         }
+    }
+
+    fn block_grouped(
+        &self,
+        format: QuantFormat,
+        n: u32,
+        k: u32,
+    ) -> Result<&ComputePipeline, Error> {
+        let map = match format {
+            QuantFormat::Q4Affine => &self.q4_block_grouped,
+            QuantFormat::NvFp4 => &self.nvfp4_block_grouped,
+            _ => {
+                return Err(Error::Format(
+                    "batched MoE tiled grouped GEMM unsupported for this block format",
+                ));
+            }
+        };
+        map.get(&(n, k))
+            .ok_or(Error::Format("missing block_grouped pipeline"))
     }
 
     fn dequant_block(&self, format: QuantFormat) -> &ComputePipeline {
@@ -1412,19 +1457,13 @@ impl StepEnc<'_> {
         buf_a_off: usize,
         buf_c_off: usize,
         jobs: &[BlockGroupedJob; N_EXPERTS],
-        total_m: u32,
+        _total_m: u32,
         k: u32,
         n: u32,
     ) -> Result<(), Error> {
-        let grouped_ps = match self.block_profile.format {
-            QuantFormat::Q4Affine => &self.ps.q4_linear_grouped,
-            QuantFormat::NvFp4 => &self.ps.nvfp4_linear_grouped,
-            _ => {
-                return Err(Error::Format(
-                    "batched MoE grouped GEMM unsupported for this block format",
-                ));
-            }
-        };
+        let grouped_ps = self
+            .ps
+            .block_grouped(self.block_profile.format, n, k)?;
         let row_start_off = std::mem::offset_of!(RouteScratch, row_start);
         self.sink_set_pipeline(grouped_ps);
         let a_buf = if a_on_mps_x {
@@ -1432,20 +1471,22 @@ impl StepEnc<'_> {
         } else {
             &self.bufs.mps_w
         };
-        self.sink_set_buffer(a_buf, buf_a_off, 0);
-        self.bind_blob(1);
-        self.sink_set_buffer(&self.bufs.mps_w, buf_c_off, 2);
-        self.sink_set_bytes(jobs, 3);
-        self.sink_set_buffer(&self.bufs.route, row_start_off, 4);
-        let dims = [k, n, N_EXPERTS as u32];
-        self.sink_set_bytes(&dims, 5);
+        unsafe {
+            self.sink_set_buffer(a_buf, buf_a_off, 0);
+            self.bind_blob(1);
+            self.sink_set_buffer(&self.bufs.mps_w, buf_c_off, 2);
+            self.sink_set_bytes(jobs, 3);
+            self.sink_set_buffer(&self.bufs.route, row_start_off, 4);
+        }
+        let num_jobs = N_EXPERTS as u32;
+        self.sink_set_bytes(&num_jobs, 5);
         let grid = MTLSize {
-            width: n as usize,
-            height: total_m as usize,
+            width: crate::kernels::sub::gemm_common::div_up(n as usize, 32),
+            height: N_EXPERTS,
             depth: 1,
         };
         let tg = MTLSize {
-            width: 32,
+            width: crate::kernels::sub::gemm_common::THREADS_PER_TG,
             height: 1,
             depth: 1,
         };

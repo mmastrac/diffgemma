@@ -223,6 +223,12 @@ pub static MANIFEST: Manifest = Manifest {
             variants: KernelVariants::Elementwise,
         },
         KernelSpec {
+            name: "gemm_block_grouped",
+            entry: "gemm_block_grouped",
+            quant_formats: &[QuantFormat::Q4Affine, QuantFormat::NvFp4],
+            variants: KernelVariants::GemmBlock,
+        },
+        KernelSpec {
             name: "gemm_linear_f32",
             entry: "gemm_linear_f32",
             quant_formats: &[QuantFormat::Q4Affine, QuantFormat::NvFp4],
@@ -472,6 +478,11 @@ mod tests {
     #[test]
     fn gemm_block_fc_map_no_collisions() {
         assert_no_fc_collisions("gemm_block", &[4, 5, 6]).unwrap();
+    }
+
+    #[test]
+    fn gemm_block_grouped_fc_map_no_collisions() {
+        assert_no_fc_collisions("gemm_block_grouped", &[4, 5, 6]).unwrap();
     }
 
     #[test]

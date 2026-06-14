@@ -305,6 +305,21 @@ quant_formats = [0, 3]
 [[kernel.variants]]
 
 [[kernel]]
+name = "gemm_block_grouped"
+entry = "gemm_block_grouped"
+quant_formats = [0, 3]
+
+[kernel.fc]
+1 = "K_SHAPE_ASSERT"
+2 = "K_DUMP_STAGE"
+3 = "K_QUANT_FORMAT"
+4 = "IS_FULL_LAYER"
+5 = "GEMM_N"
+6 = "GEMM_K"
+
+[[kernel.variants]]
+
+[[kernel]]
 name = "gemm_linear_f32"
 entry = "gemm_linear_f32"
 quant_formats = [0, 3]

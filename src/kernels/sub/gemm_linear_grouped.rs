@@ -67,7 +67,7 @@ impl Fixture {
     }
 }
 
-fn expert_matrix_bytes(format: QuantFormat, n: usize, k: usize) -> usize {
+pub(crate) fn expert_matrix_bytes(format: QuantFormat, n: usize, k: usize) -> usize {
     match format {
         QuantFormat::NvFp4 => nvfp4_matrix_bytes(n, k),
         _ => q4_matrix_bytes(n, k),
@@ -105,7 +105,12 @@ pub fn tiny_fixture_nvfp4(_: ElemFormat) -> Fixture {
     grouped_fixture(QuantFormat::NvFp4, 64, 32, &[2, 2])
 }
 
-fn grouped_fixture(format: QuantFormat, k: usize, n: usize, rows_per_expert: &[usize]) -> Fixture {
+pub(crate) fn grouped_fixture(
+    format: QuantFormat,
+    k: usize,
+    n: usize,
+    rows_per_expert: &[usize],
+) -> Fixture {
     let mut row_starts = vec![0u32];
     let mut a = Vec::new();
     let mut w_f32_experts = Vec::new();

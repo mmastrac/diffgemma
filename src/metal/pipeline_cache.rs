@@ -31,6 +31,7 @@ fn shader_bundle_token() -> u64 {
         include_str!("../../shaders/include/qgemm_grouped.metal"),
         include_str!("../../shaders/kernels/dequant_block_matrix.metal"),
         include_str!("../../shaders/kernels/gemm_block.metal"),
+        include_str!("../../shaders/kernels/gemm_block_grouped.metal"),
         include_str!("../../shaders/kernels/gemm_linear_f32.metal"),
         include_str!("../../shaders/kernels/gemm_linear_grouped.metal"),
         include_str!("../../shaders/kernels/gemm_q8_linear_f32.metal"),
