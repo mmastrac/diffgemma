@@ -41,7 +41,7 @@ kernel void gemm_linear_grouped(
     if (K_QUANT_FORMAT == QUANT_NVFP4) {
         float gscale = as_type<float>(*(device const uint *)(w));
         device const uchar *body = w + 4u;
-        uint row_stride = nvfp4_row_bytes(k);
+        ulong row_stride = nvfp4_row_bytes(k);
         uint num_tiles = (k + 31u) / 32u;
         for (uint t = simd_lane; t < num_tiles; t += 32u) {
             uint k0 = t * 32u;
@@ -49,9 +49,9 @@ kernel void gemm_linear_grouped(
             sum += dot_nvfp4_k32(a + global_row * k, row, k, k0, gscale);
         }
     } else {
-        uint row_stride = job.groups_per_row * 20u;
+        ulong row_stride = ulong(job.groups_per_row) * 20ul;
         for (uint g = simd_lane; g < job.groups_per_row; g += 32u) {
-            device const uchar *blk = w + col * row_stride + g * 20u;
+            device const uchar *blk = w + (ulong)col * row_stride + (ulong)g * 20ul;
             sum += dot_q4_group(a + global_row * k, blk, g * 32u);
         }
     }

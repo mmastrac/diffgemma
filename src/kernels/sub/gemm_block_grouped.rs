@@ -212,6 +212,107 @@ pub fn gpu_nvfp4(f: &Fixture, variant: super::KernelVariant) -> Result<Vec<f32>,
     )
 }
 
+/// Grouped tiled GEMM against a shared `.dgq` blob (absolute `w_byte_off` in jobs).
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub struct BlobGroupedParams<'a> {
+    pub blob: &'a ProtocolObject<dyn MTLBuffer>,
+    pub a: &'a [f32],
+    pub jobs: &'a [BlockGroupedJob],
+    pub row_starts: &'a [u32],
+    pub k: usize,
+    pub n: usize,
+    pub format: QuantFormat,
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+impl BlobGroupedParams<'_> {
+    pub fn total_m(&self) -> usize {
+        *self.row_starts.last().unwrap_or(&0) as usize
+    }
+
+    pub fn out_len(&self) -> usize {
+        self.total_m() * self.n
+    }
+
+    pub fn num_jobs(&self) -> usize {
+        self.row_starts.len().saturating_sub(1)
+    }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn gpu_on_blob(
+    p: &BlobGroupedParams<'_>,
+    _variant: super::KernelVariant,
+) -> Result<Vec<f32>, Error> {
+    use crate::metal::buffer::BufferPool;
+    use crate::metal::device::MetalContext;
+
+    let ctx = MetalContext::new()?;
+    let pipeline = pipeline_for(&ctx, p.n as u32, p.k as u32, p.format)?;
+    let mut pool = BufferPool::new();
+    let out_len = p.out_len();
+    let num_jobs = p.num_jobs();
+
+    let buf_a = pool
+        .allocate(&ctx.device, p.a.len() * 4)
+        .ok_or(Error::Format("alloc"))?;
+    let buf_c = pool
+        .allocate(&ctx.device, out_len * 4)
+        .ok_or(Error::Format("alloc"))?;
+    let buf_jobs = pool
+        .allocate(
+            &ctx.device,
+            p.jobs.len() * std::mem::size_of::<BlockGroupedJob>(),
+        )
+        .ok_or(Error::Format("alloc"))?;
+    let buf_rs = pool
+        .allocate(&ctx.device, p.row_starts.len() * 4)
+        .ok_or(Error::Format("alloc"))?;
+
+    BufferPool::write_f32(&buf_a, p.a);
+    BufferPool::write_f32(&buf_c, &vec![0.0f32; out_len]);
+    BufferPool::write_bytes(
+        &buf_jobs,
+        unsafe {
+            std::slice::from_raw_parts(
+                p.jobs.as_ptr().cast::<u8>(),
+                p.jobs.len() * std::mem::size_of::<BlockGroupedJob>(),
+            )
+        },
+    );
+    BufferPool::write_bytes(
+        &buf_rs,
+        unsafe {
+            std::slice::from_raw_parts(
+                p.row_starts.as_ptr().cast::<u8>(),
+                p.row_starts.len() * 4,
+            )
+        },
+    );
+
+    let (grid, tg) = dispatch_shape(p.n, num_jobs);
+    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+    enc.setComputePipelineState(&pipeline.pipeline);
+    bind_gpu_buffers(
+        &enc,
+        &buf_a,
+        p.blob,
+        &buf_c,
+        &buf_jobs,
+        &buf_rs,
+        num_jobs as u32,
+    );
+    enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    enc.endEncoding();
+    cmd.commit();
+    cmd.waitUntilCompleted();
+
+    let mut out = vec![0.0f32; out_len];
+    BufferPool::read_f32(&buf_c, &mut out);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

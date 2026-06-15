@@ -105,6 +105,10 @@ pub fn tiny_fixture_nvfp4(_: ElemFormat) -> Fixture {
     grouped_fixture(QuantFormat::NvFp4, 64, 32, &[2, 2])
 }
 
+pub fn tile_fixture_nvfp4(_: ElemFormat) -> Fixture {
+    grouped_fixture(QuantFormat::NvFp4, 128, 128, &[8, 12, 4])
+}
+
 pub(crate) fn grouped_fixture(
     format: QuantFormat,
     k: usize,
@@ -283,9 +287,98 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     Ok(out)
 }
 
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-pub fn gpu(_: &Fixture, _: KernelVariant) -> Result<Vec<f32>, Error> {
-    Err(Error::Format("Metal unavailable"))
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn gpu_on_blob(
+    p: &crate::kernels::sub::gemm_block_grouped::BlobGroupedParams<'_>,
+    _variant: KernelVariant,
+) -> Result<Vec<f32>, Error> {
+    use crate::metal::buffer::BufferPool;
+    use crate::metal::device::MetalContext;
+
+    let ctx = MetalContext::new()?;
+    let pipeline = pipeline_for(&ctx, p.format, KernelVariant::PRODUCTION)?;
+    let mut pool = BufferPool::new();
+    let out_len = p.out_len();
+    let total_m = p.total_m();
+    let num_jobs = p.num_jobs();
+
+    let buf_a = pool
+        .allocate(&ctx.device, p.a.len() * 4)
+        .ok_or(Error::Format("alloc"))?;
+    let buf_c = pool
+        .allocate(&ctx.device, out_len * 4)
+        .ok_or(Error::Format("alloc"))?;
+    let buf_jobs = pool
+        .allocate(
+            &ctx.device,
+            p.jobs.len() * std::mem::size_of::<BlockGroupedJob>(),
+        )
+        .ok_or(Error::Format("alloc"))?;
+    let buf_rs = pool
+        .allocate(&ctx.device, p.row_starts.len() * 4)
+        .ok_or(Error::Format("alloc"))?;
+
+    BufferPool::write_f32(&buf_a, p.a);
+    BufferPool::write_f32(&buf_c, &vec![0.0f32; out_len]);
+    BufferPool::write_bytes(
+        &buf_jobs,
+        unsafe {
+            std::slice::from_raw_parts(
+                p.jobs.as_ptr().cast::<u8>(),
+                p.jobs.len() * std::mem::size_of::<BlockGroupedJob>(),
+            )
+        },
+    );
+    BufferPool::write_bytes(
+        &buf_rs,
+        unsafe {
+            std::slice::from_raw_parts(
+                p.row_starts.as_ptr().cast::<u8>(),
+                p.row_starts.len() * 4,
+            )
+        },
+    );
+
+    let grid = MTLSize {
+        width: p.n,
+        height: total_m,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: 32,
+        height: 1,
+        depth: 1,
+    };
+    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+    enc.setComputePipelineState(&pipeline.pipeline);
+    bind_gpu_buffers(
+        &enc,
+        &buf_a,
+        p.blob,
+        &buf_c,
+        &buf_jobs,
+        &buf_rs,
+        p.k as u32,
+        p.n as u32,
+        num_jobs as u32,
+    );
+    enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    enc.endEncoding();
+    cmd.commit();
+    cmd.waitUntilCompleted();
+
+    let mut out = vec![0.0f32; out_len];
+    BufferPool::read_f32(&buf_c, &mut out);
+    Ok(out)
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn gpu_on_blob_block(
+    p: &crate::kernels::sub::gemm_block_grouped::BlobGroupedParams<'_>,
+    variant: KernelVariant,
+) -> Result<Vec<f32>, Error> {
+    crate::kernels::sub::gemm_block_grouped::gpu_on_blob(p, variant)
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -337,5 +430,36 @@ mod tests {
         formats: [F32],
         max_tol = 1e-4,
         min_cos = 0.9999,
+    }
+
+    kernel_oracle_matrix! {
+        mod tile_nvfp4,
+        cpu = crate::kernels::sub::gemm_linear_grouped::cpu,
+        cpu_oracle = crate::kernels::sub::gemm_linear_grouped::cpu_oracle,
+        gpu = crate::kernels::sub::gemm_linear_grouped::gpu_nvfp4,
+        fixture = crate::kernels::sub::gemm_linear_grouped::tile_fixture_nvfp4,
+        out_len = crate::kernels::sub::gemm_linear_grouped::fixture_len,
+        formats: [F32],
+        max_tol = 0.05,
+        min_cos = 0.999,
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn gpu_tiled_grouped_matches_linear_grouped_nvfp4() {
+        use crate::kernels::sub::gemm_block_grouped;
+        use crate::kernels::sub::test_util::{assert_oracle, ElemFormat};
+        use crate::kernels::sub::variant::KernelVariant;
+
+        for fixture_fn in [
+            gemm_block_grouped::tiny_fixture_nvfp4 as fn(_) -> _,
+            gemm_block_grouped::tile_fixture_nvfp4,
+        ] {
+            let fix = fixture_fn(ElemFormat::F32);
+            let tiled = gemm_block_grouped::gpu_nvfp4(&fix, KernelVariant::PRODUCTION)
+                .expect("gemm_block_grouped gpu");
+            let linear = gpu_nvfp4(&fix, KernelVariant::PRODUCTION).expect("gemm_linear_grouped gpu");
+            assert_oracle(&tiled, &linear, 0.05, 0.999);
+        }
     }
 }
