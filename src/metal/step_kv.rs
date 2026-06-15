@@ -1057,6 +1057,8 @@ pub struct StepKvMpsParityResult {
     pub max_kv_diff_pos: usize,
     pub native_min_ent: f32,
     pub mps_min_ent: f32,
+    pub min_ent_diff: f32,
+    pub entropy_pass: bool,
     pub ln_vocab: f32,
     pub pass: bool,
 }
@@ -1124,9 +1126,12 @@ pub fn run_step_kv_mps_parity(
     let mps_min_ent = step_min_entropy_with_kv(model_dir, &mps_buf, kv_len, layers, max_seq, seed)?;
 
     let ln_vocab = (VOCAB as f32).ln();
+    let min_ent_diff = (mps_min_ent - native_min_ent).abs();
     let kv_ok = max_kv_diff < 0.5 && mps_prefix_max_l0 > 1e-4;
-    let ent_ok = (mps_min_ent - native_min_ent).abs() < 1.0;
-    let pass = kv_ok && ent_ok;
+    // KV bytes can match while forward entropy diverges (MPS vs native encoder path).
+    const MAX_MIN_ENT_DIFF: f32 = 0.25;
+    let entropy_pass = min_ent_diff < MAX_MIN_ENT_DIFF;
+    let pass = kv_ok && entropy_pass;
 
     Ok(StepKvMpsParityResult {
         kv_len,
@@ -1138,6 +1143,8 @@ pub fn run_step_kv_mps_parity(
         max_kv_diff_pos,
         native_min_ent,
         mps_min_ent,
+        min_ent_diff,
+        entropy_pass,
         ln_vocab,
         pass,
     })
