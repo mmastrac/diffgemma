@@ -1,7 +1,9 @@
 //! CPU oracle for grouped MoE block GEMM (`gemm_linear_grouped`).
 
 use crate::dgq::block::q4_gemm_cpu;
-use crate::dgq::layout::{nvfp4_matrix_bytes, q4_matrix_bytes, NVFP4_HEADER_BYTES};
+use crate::dgq::layout::{
+    blob_offset_usize, nvfp4_matrix_bytes, q4_matrix_bytes, NVFP4_HEADER_BYTES,
+};
 use crate::dgq::nvfp4::nvfp4_gemm_cpu;
 use crate::kernels::sub::QuantFormat;
 use crate::metal::BlockGroupedJob;
@@ -43,7 +45,7 @@ pub fn gemm_linear_grouped_cpu(
             continue;
         }
         let job = jobs[job_id];
-        let w_off = job.w_byte_off as usize;
+        let w_off = blob_offset_usize(job.w_byte_off).expect("grouped job w_byte_off");
         let w_len = match format {
             QuantFormat::NvFp4 => nvfp4_matrix_bytes(n, k),
             _ => q4_matrix_bytes(n, k),

@@ -56,7 +56,10 @@ fn raw_blob_bf16_to_f32(
     let blob = &view.blob.buffer;
     let ptr = blob.contents().as_ptr() as *const u8;
     let src = unsafe {
-        std::slice::from_raw_parts(ptr.add(view.byte_offset as usize), view.byte_len as usize)
+        std::slice::from_raw_parts(
+            ptr.add(crate::dgq::layout::blob_offset_for_mtl(view.byte_offset)),
+            crate::dgq::layout::blob_offset_for_mtl(view.byte_len),
+        )
     };
     if src.len() != view.numel * 2 {
         return Err(Error::Format("raw bf16 norm size mismatch"));

@@ -97,6 +97,32 @@ pub fn align_offset(offset: u64) -> u64 {
     (offset + 63) & !63
 }
 
+/// Convert a `.dgq` blob byte offset for host pointer / MTL buffer slicing.
+/// NVFP4 blobs can exceed `u32::MAX`; never truncate to u32 before this call.
+pub fn blob_offset_usize(off: u64) -> Result<usize, Error> {
+    usize::try_from(off).map_err(|_| Error::Format("dgq blob offset exceeds host address space"))
+}
+
+/// `(start, end)` byte indices into a blob slice, with bounds checks.
+pub fn blob_slice_range(off: u64, len: u64, blob_len: u64) -> Result<(usize, usize), Error> {
+    let start = blob_offset_usize(off)?;
+    let len_usize = blob_offset_usize(len)?;
+    let end = start
+        .checked_add(len_usize)
+        .ok_or(Error::Format("dgq tensor slice overflow"))?;
+    let blob_end = blob_offset_usize(blob_len)?;
+    if end > blob_end {
+        return Err(Error::Format("dgq tensor extends past blob"));
+    }
+    Ok((start, end))
+}
+
+/// Hot GPU dispatch path: offsets are validated when the layout is built.
+#[inline]
+pub fn blob_offset_for_mtl(off: u64) -> usize {
+    blob_offset_usize(off).expect("dgq blob offset exceeds host address space")
+}
+
 /// Bytes for one Q4 block covering `GROUP_SIZE` weights along K.
 pub const Q4_BLOCK_BYTES: usize = 4 + GROUP_SIZE / 2; // fp16 scale + fp16 min + 16 nibbles
 

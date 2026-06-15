@@ -1,7 +1,10 @@
 //! Mmap-backed `.dgq` weight store.
 
 use crate::dgq::dequant::dequant_to_f32;
-use crate::dgq::layout::{dgq_version_supported, parse_quant_kind, DgqManifest, QuantKind, BLOB_FILE, MANIFEST_FILE};
+use crate::dgq::layout::{
+    blob_slice_range, dgq_version_supported, parse_quant_kind, DgqManifest, QuantKind, BLOB_FILE,
+    MANIFEST_FILE,
+};
 use crate::safetensors::{DType, Error};
 use crate::tensor::TensorView;
 use memmap2::Mmap;
@@ -65,11 +68,8 @@ impl DgqStore {
         let entry = self
             .get_entry(name)
             .ok_or_else(|| Error::NotFound(name.to_string()))?;
-        let start = entry.meta.offset as usize;
-        let end = start + entry.meta.byte_len as usize;
-        if end > self.blob.len() {
-            return Err(Error::Format("dgq tensor extends past blob"));
-        }
+        let (start, end) =
+            blob_slice_range(entry.meta.offset, entry.meta.byte_len, self.blob_bytes())?;
         Ok(&self.blob[start..end])
     }
 

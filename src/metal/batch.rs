@@ -344,7 +344,11 @@ impl<'a> GpuBatch<'a> {
         encoder.setComputePipelineState(pipeline);
         unsafe {
             encoder.setBuffer_offset_atIndex(Some(buf_a), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(buf_w), w_byte_offset as usize, 1);
+            encoder.setBuffer_offset_atIndex(
+                Some(buf_w),
+                crate::dgq::layout::blob_offset_for_mtl(w_byte_offset),
+                1,
+            );
             encoder.setBuffer_offset_atIndex(Some(buf_c), 0, 2);
         }
         let dims = [m as u32, n as u32, k as u32, groups_per_row];
@@ -378,7 +382,11 @@ impl<'a> GpuBatch<'a> {
         encoder.setComputePipelineState(pipeline);
         unsafe {
             encoder.setBuffer_offset_atIndex(Some(buf_a), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(buf_w), w_byte_offset as usize, 1);
+            encoder.setBuffer_offset_atIndex(
+                Some(buf_w),
+                crate::dgq::layout::blob_offset_for_mtl(w_byte_offset),
+                1,
+            );
             encoder.setBuffer_offset_atIndex(Some(buf_c), 0, 2);
         }
         let dims = [m as u32, n as u32, k as u32];
@@ -452,7 +460,11 @@ impl<'a> GpuBatch<'a> {
         encoder.setComputePipelineState(pipeline);
         unsafe {
             encoder.setBuffer_offset_atIndex(Some(buf_a), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(buf_w), w_byte_offset as usize, 1);
+            encoder.setBuffer_offset_atIndex(
+                Some(buf_w),
+                crate::dgq::layout::blob_offset_for_mtl(w_byte_offset),
+                1,
+            );
             encoder.setBuffer_offset_atIndex(Some(buf_c), 0, 2);
         }
         let dims = [m as u32, n as u32, k as u32];

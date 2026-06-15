@@ -1,8 +1,8 @@
 //! Zero-copy `.dgq` blob → `MTLBuffer` and per-tensor GPU views.
 
 use crate::dgq::layout::{
-    dgq_version_supported, nvfp4_matrix_bytes, nvfp4_row_bytes, q4_matrix_bytes, q8_row_bytes,
-    QuantKind, NVFP4_HEADER_BYTES, MANIFEST_FILE,
+    blob_offset_for_mtl, dgq_version_supported, nvfp4_matrix_bytes, nvfp4_row_bytes,
+    q4_matrix_bytes, q8_row_bytes, QuantKind, NVFP4_HEADER_BYTES, MANIFEST_FILE,
 };
 use crate::dgq::DgqStore;
 use crate::safetensors::Error;
@@ -143,7 +143,7 @@ impl Q4LinearGpu {
                 .buffer
                 .contents()
                 .as_ptr()
-                .add(self.byte_offset as usize) as *const u8
+                .add(blob_offset_for_mtl(self.byte_offset)) as *const u8
         };
         f32::from_le_bytes([
             unsafe { *ptr },
@@ -166,7 +166,7 @@ impl Q4LinearGpu {
                 .buffer
                 .contents()
                 .as_ptr()
-                .add(self.byte_offset as usize) as *const u8;
+                .add(blob_offset_for_mtl(self.byte_offset)) as *const u8;
             std::slice::from_raw_parts(ptr, len)
         }
     }
@@ -258,7 +258,7 @@ impl Q8LinearGpu {
     pub fn row_scale_f32(&self, row: usize) -> f32 {
         let stride = self.row_stride();
         let (_, base) = self.weight_buffer();
-        let byte = base as usize + row * stride;
+        let byte = blob_offset_for_mtl(base) + row * stride;
         let ptr = unsafe {
             self.blob.buffer.contents().as_ptr().add(byte) as *const u8
         };
@@ -730,5 +730,282 @@ mod q4_gpu_tests {
             worst.0, worst.1, worst.2, worst.3
         );
         assert!(max_err < 0.01, "max_err={max_err}");
+    }
+
+    fn grouped_stats(cpu: &[f32], gpu: &[f32]) -> (f32, f64) {
+        assert_eq!(cpu.len(), gpu.len());
+        let mut max_err = 0.0f32;
+        let mut dot = 0.0f64;
+        let mut na = 0.0f64;
+        let mut nb = 0.0f64;
+        for (a, b) in cpu.iter().zip(gpu.iter()) {
+            let err = (*a - *b).abs();
+            if err.is_finite() {
+                max_err = max_err.max(err);
+            }
+            if a.is_finite() && b.is_finite() {
+                dot += *a as f64 * *b as f64;
+                na += *a as f64 * *a as f64;
+                nb += *b as f64 * *b as f64;
+            }
+        }
+        let cos = if na > 0.0 && nb > 0.0 {
+            dot / (na.sqrt() * nb.sqrt())
+        } else {
+            0.0
+        };
+        (max_err, cos)
+    }
+
+    /// Converter writes one 4-byte FP32 global scale per expert matrix; kernel stride must match.
+    #[test]
+    fn nvfp4_expert_stack_per_expert_header_on_disk() {
+        use crate::dgq::layout::nvfp4_matrix_bytes;
+
+        let dgq_dir = std::path::Path::new("/tmp/nvfp4-weights");
+        if !dgq_dir.join("model.dgq.json").exists() {
+            eprintln!("skip: /tmp/nvfp4-weights missing");
+            return;
+        }
+        let store = DgqStore::open(dgq_dir).expect("open dgq");
+        let name = "model.decoder.layers.0.experts.gate_up_proj";
+        let entry = store.get_entry(name).expect("gate_up");
+        let out_dim = entry.meta.shape[1] as usize;
+        let in_dim = entry.meta.shape[2] as usize;
+        let experts = entry.meta.shape[0] as usize;
+        let per_expert = nvfp4_matrix_bytes(out_dim, in_dim);
+        assert_eq!(entry.meta.byte_len as usize, experts * per_expert);
+
+        let blob_path = dgq_dir.join(crate::dgq::layout::BLOB_FILE);
+        let blob = std::fs::read(&blob_path).expect("read blob");
+        let base = crate::dgq::layout::blob_offset_usize(entry.meta.offset).expect("tensor offset");
+        for e in [0usize, 1, 2, experts - 1] {
+            let off = base + e * per_expert;
+            let gscale = f32::from_le_bytes(blob[off..off + 4].try_into().expect("header"));
+            eprintln!("expert {e} gscale={gscale:.6} off={off}");
+            assert!(
+                gscale.is_finite() && gscale > 0.0,
+                "expert {e} missing per-expert header at off={off}"
+            );
+        }
+        // If stride omitted the 4-byte header, E1 would start 4 bytes early inside E0 body.
+        let wrong_e1 = base + per_expert - 4;
+        let bogus = f32::from_le_bytes(blob[wrong_e1..wrong_e1 + 4].try_into().expect("tail"));
+        let actual_e1 =
+            f32::from_le_bytes(blob[base + per_expert..base + per_expert + 4].try_into().expect("e1"));
+        eprintln!("misaligned E1 gscale (no-header stride)={bogus:.6} actual E1={actual_e1:.6}");
+        assert!((actual_e1 - 1.0).abs() < 1e-5);
+        assert!((bogus - 1.0).abs() > 1e-3, "tail bytes must not look like gscale=1");
+    }
+
+    /// `.dgq` blob offsets exceed 4 GiB; grouped MoE jobs on late layers must use u64/ulong paths.
+    #[test]
+    fn dgq_blob_offset_width_audit() {
+        let dgq_dir = std::path::Path::new("/tmp/nvfp4-weights");
+        if !dgq_dir.join("model.dgq.json").exists() {
+            eprintln!("skip: /tmp/nvfp4-weights missing");
+            return;
+        }
+        use crate::dgq::layout::nvfp4_matrix_bytes;
+        use crate::metal::step_kernel::{build_layout, build_offsets_from_store, MOE_FF, HID};
+
+        let store = DgqStore::open(dgq_dir).expect("open dgq");
+        let offsets = build_offsets_from_store(&store);
+        let layout = build_layout(&offsets, 512);
+        let gu_stride = nvfp4_matrix_bytes(MOE_FF as usize * 2, HID) as u64;
+        let dn_stride = nvfp4_matrix_bytes(HID, MOE_FF as usize) as u64;
+
+        let mut max_end = 0u64;
+        for entry in store.tensor_entries() {
+            max_end = max_end.max(entry.meta.offset + entry.meta.byte_len);
+        }
+        eprintln!(
+            "dgq blob end={max_end} bytes ({:.3} GiB) exceeds u32={}",
+            max_end as f64 / (1024.0_f64.powi(3)),
+            max_end > u32::MAX as u64
+        );
+        assert!(max_end > u32::MAX as u64, "fixture should exceed 4 GiB");
+        assert_eq!(std::mem::size_of::<usize>(), 8, "dgq metal path requires 64-bit host");
+
+        for entry in store.tensor_entries() {
+            let off = crate::dgq::layout::blob_offset_usize(entry.meta.offset)
+                .expect("manifest tensor offset");
+            let end = off
+                + crate::dgq::layout::blob_offset_usize(entry.meta.byte_len)
+                    .expect("manifest tensor byte_len");
+            assert!(
+                end <= store.blob_bytes() as usize,
+                "tensor {} OOB",
+                entry.name
+            );
+        }
+        assert!(
+            store
+                .tensor_entries()
+                .iter()
+                .any(|e| e.meta.offset > u32::MAX as u64),
+            "fixture should contain tensors past 4 GiB"
+        );
+        let late = store
+            .tensor_entries()
+            .iter()
+            .filter(|e| e.name.contains("layers.29.experts"))
+            .count();
+        assert!(late >= 2, "expected L29 expert tensors in fixture");
+
+        let l29 = &layout.layers[29];
+        let gate127 = l29.experts_gate_up + 127 * gu_stride;
+        let down127 = l29.experts_down + 127 * dn_stride;
+        for (label, off) in [("gate127", gate127), ("down127", down127)] {
+            let idx = crate::dgq::layout::blob_offset_usize(off).expect(label);
+            assert!(idx > u32::MAX as usize, "{label} must exceed u32 after conversion");
+        }
+        eprintln!(
+            "L29 E127 gate_off={gate127} down_off={down127} (>u32: gate={} down={})",
+            gate127 > u32::MAX as u64,
+            down127 > u32::MAX as u64
+        );
+        assert!(gate127 > u32::MAX as u64);
+        assert!(down127 > u32::MAX as u64);
+
+        assert_eq!(std::mem::size_of::<crate::metal::BlockGroupedJob>(), 16);
+    }
+
+    /// Real nvfp4 MoE gate/up and down grouped GEMM vs CPU oracle (includes >4 GiB expert offsets).
+    #[test]
+    fn nvfp4_block_grouped_real_moe_weights_match_cpu() {
+        use crate::kernels::cpu::gemm_linear_grouped::gemm_linear_grouped_cpu;
+        use crate::kernels::sub::gemm_block_grouped::{gpu_on_blob, BlobGroupedParams};
+        use crate::kernels::sub::QuantFormat;
+        use crate::metal::step_kernel::{build_layout, build_offsets_from_store, MOE_FF, HID};
+        use crate::metal::BlockGroupedJob;
+
+        let dgq_dir = std::path::Path::new("/tmp/nvfp4-weights");
+        if !dgq_dir.join("model.dgq.json").exists() {
+            eprintln!("skip: /tmp/nvfp4-weights missing");
+            return;
+        }
+        let store = DgqStore::open(dgq_dir).expect("open dgq");
+        let ctx = MetalContext::new().expect("metal");
+        let blob = DgqGpuBlob::from_store(&store, &ctx.device).expect("blob");
+        let offsets = build_offsets_from_store(&store);
+        let layout = build_layout(&offsets, 512);
+        let layer = 29usize;
+        let l = &layout.layers[layer];
+        let hidden = HID;
+        let moe_ff = MOE_FF as usize;
+        let gu_stride = crate::dgq::layout::nvfp4_matrix_bytes(moe_ff * 2, hidden) as u64;
+        let dn_stride = crate::dgq::layout::nvfp4_matrix_bytes(hidden, moe_ff) as u64;
+        let gu_gpr = (hidden as u32).div_ceil(16);
+        let dn_gpr = (moe_ff as u32).div_ceil(16);
+
+        let blob_bytes = unsafe {
+            std::slice::from_raw_parts(blob.buffer.contents().as_ptr().cast::<u8>(), blob.len)
+        };
+        let variant = crate::kernels::sub::variant::KernelVariant::PRODUCTION;
+
+        struct Case {
+            label: &'static str,
+            k: usize,
+            n: usize,
+            experts: [usize; 2],
+            w_base: u64,
+            stride: u64,
+            gpr: u32,
+        }
+
+        let cases = [
+            Case {
+                label: "gate_up L0",
+                k: hidden,
+                n: moe_ff * 2,
+                experts: [34, 77],
+                w_base: layout.layers[0].experts_gate_up,
+                stride: gu_stride,
+                gpr: gu_gpr,
+            },
+            Case {
+                label: "gate_up L29 (>4GiB)",
+                k: hidden,
+                n: moe_ff * 2,
+                experts: [34, 127],
+                w_base: l.experts_gate_up,
+                stride: gu_stride,
+                gpr: gu_gpr,
+            },
+            Case {
+                label: "down L29 (>4GiB)",
+                k: moe_ff,
+                n: hidden,
+                experts: [77, 127],
+                w_base: l.experts_down,
+                stride: dn_stride,
+                gpr: dn_gpr,
+            },
+        ];
+
+        for case in cases {
+            let jobs = [
+                BlockGroupedJob {
+                    w_byte_off: case.w_base + case.experts[0] as u64 * case.stride,
+                    groups_per_row: case.gpr,
+                    _pad: 0,
+                },
+                BlockGroupedJob {
+                    w_byte_off: case.w_base + case.experts[1] as u64 * case.stride,
+                    groups_per_row: case.gpr,
+                    _pad: 0,
+                },
+            ];
+            eprintln!(
+                "{} job offs [{}, {}] (>u32: [{}, {}])",
+                case.label,
+                jobs[0].w_byte_off,
+                jobs[1].w_byte_off,
+                jobs[0].w_byte_off > u32::MAX as u64,
+                jobs[1].w_byte_off > u32::MAX as u64
+            );
+
+            let row_starts = [0u32, 1, 3];
+            let total_m = 3usize;
+            let mut a = vec![0.0f32; total_m * case.k];
+            for (row, slot) in a.chunks_mut(case.k).enumerate() {
+                for (i, v) in slot.iter_mut().enumerate() {
+                    *v = ((row * 17 + i) as f32 * 0.0007).sin() * 0.02;
+                }
+            }
+
+            let cpu = gemm_linear_grouped_cpu(
+                &a,
+                total_m,
+                case.k,
+                case.n,
+                blob_bytes,
+                &jobs,
+                &row_starts,
+                QuantFormat::NvFp4,
+            );
+            let params = BlobGroupedParams {
+                blob: &blob.buffer,
+                a: &a,
+                jobs: &jobs,
+                row_starts: &row_starts,
+                k: case.k,
+                n: case.n,
+                format: QuantFormat::NvFp4,
+            };
+            let gpu = gpu_on_blob(&params, variant).expect("gpu block grouped");
+            let cpu_max = cpu.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let gpu_max = gpu.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let (max_err, cos) = grouped_stats(&cpu, &gpu);
+            eprintln!(
+                "{}: cpu_max={cpu_max:.6} gpu_max={gpu_max:.6} max_err={max_err:.6} cos={cos:.6}",
+                case.label
+            );
+            assert!(cpu_max > 1e-4, "{} cpu oracle produced zeros", case.label);
+            assert!(gpu_max > 1e-4, "{} gpu block grouped produced zeros", case.label);
+            assert!(max_err < 0.08, "{} max_err={max_err}", case.label);
+            assert!(cos > 0.999, "{} cos={cos}", case.label);
+        }
     }
 }
