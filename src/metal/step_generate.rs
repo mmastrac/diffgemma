@@ -292,10 +292,12 @@ pub fn generate_with_session(
             let step_elapsed = step_started.elapsed();
             let step_ms = step_elapsed.as_secs_f64() * 1000.0;
             let readback_bytes = StepRuntime::denoise_step_host_readback_bytes(check_logits);
+            let mut forward = ForwardTelemetry::monolithic_gpu_step(readback_bytes);
+            rt.fill_expert_forward_telemetry(&mut forward);
             session_telemetry.steps.push(StepPhaseTelemetry {
                 decoder_ms: step_ms,
                 sampler_ms: 0.0,
-                forward: ForwardTelemetry::monolithic_gpu_step(readback_bytes),
+                forward,
             });
             denoise_steps_run += 1;
             block_step_count += 1;

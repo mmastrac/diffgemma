@@ -675,6 +675,8 @@ pub(crate) struct StepBuffers {
     pub(crate) mps_x: Retained<ProtocolObject<dyn MTLBuffer>>,
     pub(crate) mps_w: Retained<ProtocolObject<dyn MTLBuffer>>,
     pub(crate) mps_c: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// Per-layer unique routed experts (written by moe_bucket_fill phase 1).
+    expert_layer_unique: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
 
 struct StepEnc<'a> {
@@ -692,6 +694,18 @@ struct StepEnc<'a> {
 
 const MOE_SLOTS: u32 = (CANVAS * TOP_K) as u32;
 
+fn grouped_expert_blob_bytes_per_expert(format: crate::kernels::sub::QuantFormat) -> u64 {
+    use crate::dgq::layout::{nvfp4_matrix_bytes, q4_matrix_bytes};
+    let hidden = HID;
+    let moe_ff = MOE_FF as usize;
+    match format {
+        crate::kernels::sub::QuantFormat::NvFp4 => {
+            (nvfp4_matrix_bytes(moe_ff * 2, hidden) + nvfp4_matrix_bytes(hidden, moe_ff)) as u64
+        }
+        _ => (q4_matrix_bytes(moe_ff * 2, hidden) + q4_matrix_bytes(hidden, moe_ff)) as u64,
+    }
+}
+
 fn moe_w_byte_off_a() -> usize {
     0
 }
@@ -700,7 +714,15 @@ fn moe_w_byte_off_gu() -> usize {
     (MOE_SLOTS as usize) * HID * std::mem::size_of::<f32>()
 }
 
-fn layer_moe_block_jobs(
+/// Grouped MoE gate/up and down job table for one decoder layer.
+pub fn layer_moe_block_jobs(
+    l: &LayerOffsets,
+    format: QuantFormat,
+) -> ([BlockGroupedJob; N_EXPERTS], [BlockGroupedJob; N_EXPERTS]) {
+    layer_moe_block_jobs_impl(l, format)
+}
+
+fn layer_moe_block_jobs_impl(
     l: &LayerOffsets,
     format: QuantFormat,
 ) -> ([BlockGroupedJob; N_EXPERTS], [BlockGroupedJob; N_EXPERTS]) {
@@ -1441,6 +1463,11 @@ impl StepEnc<'_> {
             self.bind_route(0);
             self.sink_set_bytes(&phase, 1);
             self.sink_set_bytes(&router_dims, 2);
+            unsafe {
+                self.sink_set_buffer(&self.bufs.expert_layer_unique, 0, 3);
+            }
+            let layer_idx = layer as u32;
+            self.sink_set_bytes(&layer_idx, 4);
             let count = if phase == 1 { 1 } else { CANVAS * TOP_K };
             self.dispatch_1d(&self.ps.bucket_fill, count, 256);
         }
@@ -1500,14 +1527,17 @@ impl StepEnc<'_> {
         layer: usize,
         layout: &ModelLayout,
     ) -> Result<(), Error> {
-        let l = &layout.layers[layer];
-        let (gate_jobs, down_jobs) = layer_moe_block_jobs(l, self.block_profile.format);
-        let gu_off = moe_w_byte_off_gu();
-        let act_elems = (MOE_SLOTS as usize) * MOE_FF as usize;
+        self.encode_moe_batched_gather()?;
+        self.encode_moe_batched_gate_up(layer, layout)?;
+        self.encode_moe_batched_swiglu()?;
+        self.encode_moe_batched_down(layer, layout)?;
+        self.encode_moe_batched_scatter()?;
+        Ok(())
+    }
+
+    fn encode_moe_batched_gather(&mut self) -> Result<(), Error> {
         let token_list_off = std::mem::offset_of!(RouteScratch, token_list);
-
         self.half_to_f32_buf(A_MOEIN, CANVAS * HID);
-
         self.sink_set_pipeline(&self.ps.gather_rows);
         self.sink_set_buffer(&self.bufs.mps_x, 0, 0);
         self.sink_set_buffer(&self.bufs.route, token_list_off, 1);
@@ -1521,17 +1551,30 @@ impl StepEnc<'_> {
             (MOE_SLOTS as usize) * HID,
             256,
         );
+        Ok(())
+    }
 
+    fn encode_moe_batched_gate_up(
+        &mut self,
+        layer: usize,
+        layout: &ModelLayout,
+    ) -> Result<(), Error> {
+        let l = &layout.layers[layer];
+        let (gate_jobs, _) = layer_moe_block_jobs_impl(l, self.block_profile.format);
         self.dispatch_block_linear_grouped(
             false,
             moe_w_byte_off_a(),
-            gu_off,
+            moe_w_byte_off_gu(),
             &gate_jobs,
             MOE_SLOTS,
             HID as u32,
             MOE_FF * 2,
-        )?;
+        )
+    }
 
+    fn encode_moe_batched_swiglu(&mut self) -> Result<(), Error> {
+        let gu_off = moe_w_byte_off_gu();
+        let act_elems = (MOE_SLOTS as usize) * MOE_FF as usize;
         self.sink_set_pipeline(&self.ps.gelu_swiglu_gate_up);
         self.sink_set_buffer(&self.bufs.mps_w, gu_off, 0);
         self.sink_set_buffer(&self.bufs.mps_x, 0, 1);
@@ -1539,7 +1582,16 @@ impl StepEnc<'_> {
         let swiglu_dims = [MOE_SLOTS, MOE_FF];
         self.sink_set_bytes(&swiglu_dims, 2);
         self.dispatch_1d(&self.ps.gelu_swiglu_gate_up, act_elems, 256);
+        Ok(())
+    }
 
+    fn encode_moe_batched_down(
+        &mut self,
+        layer: usize,
+        layout: &ModelLayout,
+    ) -> Result<(), Error> {
+        let l = &layout.layers[layer];
+        let (_, down_jobs) = layer_moe_block_jobs_impl(l, self.block_profile.format);
         self.dispatch_block_linear_grouped(
             true,
             0,
@@ -1548,8 +1600,10 @@ impl StepEnc<'_> {
             MOE_SLOTS,
             MOE_FF,
             HID as u32,
-        )?;
+        )
+    }
 
+    fn encode_moe_batched_scatter(&mut self) -> Result<(), Error> {
         self.sink_set_pipeline(&self.ps.moe_scatter_weighted);
         self.sink_set_buffer(&self.bufs.mps_w, moe_w_byte_off_a(), 0);
         self.sink_set_buffer(&self.bufs.arena, A_MOEOUT as usize, 1);
@@ -2288,7 +2342,16 @@ impl StepRuntime {
     }
 
     pub fn run_denoise_step(&mut self) -> Result<(), Error> {
+        zero_buffer(&self.bufs.expert_layer_unique);
         self.run_forward_once(StepFinishMode::Full)
+    }
+
+    /// Populate forward telemetry from per-layer expert counts (grouped MoE path).
+    pub fn fill_expert_forward_telemetry(&self, forward: &mut crate::metal::ForwardTelemetry) {
+        let ptr = self.bufs.expert_layer_unique.contents().as_ptr() as *const u32;
+        let counts = unsafe { std::slice::from_raw_parts(ptr, self.layers) };
+        let weight_bytes = grouped_expert_blob_bytes_per_expert(self.block_profile.format);
+        forward.record_expert_layers_grouped(counts, weight_bytes);
     }
 
     /// Host readback size for one `CanvasState` poll (shared buffer, no extra sync).
@@ -2783,7 +2846,9 @@ pub fn build_step_runtime(
         mps_x: alloc_buffer(&ctx.device, mps_x_bytes)?,
         mps_w: alloc_buffer(&ctx.device, mps_w_bytes)?,
         mps_c: alloc_buffer(&ctx.device, mps_c_bytes)?,
+        expert_layer_unique: alloc_buffer(&ctx.device, N_LAYERS * std::mem::size_of::<u32>())?,
     };
+    zero_buffer(&bufs.expert_layer_unique);
     zero_buffer(&bufs.arena);
     zero_buffer(&bufs.kvcache);
     zero_buffer(&bufs.logits);
@@ -3315,6 +3380,280 @@ fn read_route_at_position(
             .collect();
         (experts, expert_weights)
     }
+}
+
+/// Router bucket state after `encode_layer_router_buckets` (denoise path).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RouteScratchStats {
+    pub num_slots: u32,
+    pub expected_num_slots: u32,
+    pub row_start: Vec<u32>,
+    pub count: Vec<u32>,
+    pub per_expert_slots: Vec<u32>,
+    pub experts_used: u32,
+    pub slots_ok: bool,
+}
+
+pub fn route_scratch_stats(route: &RouteScratch) -> RouteScratchStats {
+    let expected = (CANVAS * TOP_K) as u32;
+    let row_start: Vec<u32> = route.row_start.to_vec();
+    let count: Vec<u32> = route.count.to_vec();
+    let mut per_expert = Vec::with_capacity(N_EXPERTS);
+    let mut experts_used = 0u32;
+    for e in 0..N_EXPERTS {
+        let n = row_start[e + 1].saturating_sub(row_start[e]);
+        per_expert.push(n);
+        if n > 0 {
+            experts_used += 1;
+        }
+    }
+    let slots_ok = route.num_slots == expected && row_start[N_EXPERTS] == expected;
+    RouteScratchStats {
+        num_slots: route.num_slots,
+        expected_num_slots: expected,
+        row_start,
+        count,
+        per_expert_slots: per_expert,
+        experts_used,
+        slots_ok,
+    }
+}
+
+fn vector_l2(data: &[f32]) -> f32 {
+    data.iter().map(|x| x * x).sum::<f32>().sqrt()
+}
+
+fn cosine_f32(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    let mut dot = 0.0f64;
+    let mut na = 0.0f64;
+    let mut nb = 0.0f64;
+    for i in 0..n {
+        let xf = a[i] as f64;
+        let yf = b[i] as f64;
+        dot += xf * yf;
+        na += xf * xf;
+        nb += yf * yf;
+    }
+    if na > 0.0 && nb > 0.0 {
+        (dot / (na.sqrt() * nb.sqrt())) as f32
+    } else {
+        0.0
+    }
+}
+
+fn rel_l2_f32(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    let mut diff2 = 0.0f64;
+    let mut na = 0.0f64;
+    for i in 0..n {
+        let d = b[i] as f64 - a[i] as f64;
+        diff2 += d * d;
+        na += a[i] as f64 * a[i] as f64;
+    }
+    if na > 0.0 {
+        (diff2.sqrt() / na.sqrt()) as f32
+    } else {
+        0.0
+    }
+}
+
+fn count_nonzero_f32(data: &[f32], eps: f32) -> usize {
+    data.iter().filter(|x| x.abs() > eps).count()
+}
+
+/// Capture MoE router bucketing on denoise step 1 (`encode_layer` through router buckets).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MoeRouteCapture {
+    pub layer: usize,
+    pub step: u32,
+    pub kv_len: u32,
+    pub use_mps_q4: bool,
+    pub encoder_use_mps_q4: bool,
+    pub moe_style: String,
+    pub route: RouteScratchStats,
+    pub grouped_dispatched: bool,
+    pub moe_out_l2: Option<f32>,
+    pub moe_out_nonzero: Option<usize>,
+    /// Full-canvas cosine: batched grouped GPU `moe_out` vs `fill_moe_out_dgq_cpu` oracle.
+    pub moe_out_gpu_cpu_cos: Option<f32>,
+    pub moe_out_gpu_cpu_rel_l2: Option<f32>,
+}
+
+fn read_mps_f32(buf: &ProtocolObject<dyn MTLBuffer>, byte_off: usize, elems: usize) -> Vec<f32> {
+    unsafe {
+        let ptr = buf.contents().as_ptr().add(byte_off) as *const f32;
+        (0..elems).map(|i| *ptr.add(i)).collect()
+    }
+}
+
+/// Per-stage GPU vs CPU oracle cosines inside the batched MoE pipeline.
+pub fn run_step_moe_batched_pin_capture(
+    model_dir: &Path,
+    cfg: &StepSmokeConfig,
+    layer: usize,
+) -> Result<crate::kernels::sub::moe_batched_pin::MoeBatchedPinDump, Error> {
+    use crate::kernels::sub::moe_batched_pin::{
+        verify_batched_stages_cpu, MoeBatchedPinDump, MoeBatchedPinRoute,
+    };
+
+    const SCHEMA: u32 = 1;
+    let layer = layer.min(cfg.layers.saturating_sub(1));
+    let (mut rt, _) = build_step_runtime(model_dir, cfg)?;
+    let layout = rt.layout;
+    let format = rt.block_profile.format;
+
+    rt.dispatch_and_wait(|enc| {
+        enc.encode_step_preamble(&layout, 1)?;
+        for l in 0..layer {
+            enc.encode_full_layer(l, &layout)?;
+        }
+        enc.encode_layer(layer, &layout)?;
+        Ok(())
+    })?;
+
+    let route: RouteScratch = read_struct(&rt.bufs.route);
+    let moe_in = read_half_buffer_f32(&rt.bufs.arena, A_MOEIN as usize, CANVAS * HID);
+    let slots = route.num_slots as usize;
+    let gu_elems = slots * (MOE_FF as usize) * 2;
+    let act_elems = slots * MOE_FF as usize;
+    let slot_elems = slots * HID;
+
+    rt.dispatch_and_wait(|enc| {
+        enc.encode_moe_batched_gather()?;
+        Ok(())
+    })?;
+    let gpu_gather = read_mps_f32(&rt.bufs.mps_w, moe_w_byte_off_a(), slot_elems);
+
+    rt.dispatch_and_wait(|enc| {
+        enc.encode_moe_batched_gate_up(layer, &layout)?;
+        Ok(())
+    })?;
+    let gpu_gate_up = read_mps_f32(&rt.bufs.mps_w, moe_w_byte_off_gu(), gu_elems);
+
+    rt.dispatch_and_wait(|enc| {
+        enc.encode_moe_batched_swiglu()?;
+        Ok(())
+    })?;
+    let gpu_swiglu = read_mps_f32(&rt.bufs.mps_x, 0, act_elems);
+
+    rt.dispatch_and_wait(|enc| {
+        enc.encode_moe_batched_down(layer, &layout)?;
+        Ok(())
+    })?;
+    let gpu_down = read_mps_f32(&rt.bufs.mps_w, moe_w_byte_off_a(), slot_elems);
+
+    rt.dispatch_and_wait(|enc| {
+        enc.encode_moe_batched_scatter()?;
+        Ok(())
+    })?;
+    let gpu_scatter = read_f32_arena(&rt.bufs.arena, A_MOEOUT, CANVAS * HID);
+
+    let blob = unsafe {
+        std::slice::from_raw_parts(
+            rt.gpu_blob.buffer.contents().as_ptr().cast::<u8>(),
+            rt.gpu_blob.len,
+        )
+    };
+    let layer_off = &layout.layers[layer];
+    let (stages, rel_l2) = verify_batched_stages_cpu(
+        &moe_in,
+        &route,
+        blob,
+        layer_off,
+        format,
+        &gpu_gather,
+        &gpu_gate_up,
+        &gpu_swiglu,
+        &gpu_down,
+        &gpu_scatter,
+    );
+
+    Ok(MoeBatchedPinDump {
+        schema_version: SCHEMA,
+        prompt: cfg
+            .prefill_token_ids
+            .as_ref()
+            .map(|_| "prefill".to_string())
+            .unwrap_or_else(|| "Hello".to_string()),
+        seed: cfg.seed,
+        layer,
+        kv_len: rt.read_params().kv_len,
+        format: format!("{format:?}"),
+        route: MoeBatchedPinRoute::from_route(&route),
+        stages,
+        rel_l2,
+    })
+}
+
+pub fn run_step_moe_route_capture(
+    model_dir: &Path,
+    cfg: &StepSmokeConfig,
+    layer: usize,
+    run_grouped: bool,
+) -> Result<MoeRouteCapture, Error> {
+    let layer = layer.min(cfg.layers.saturating_sub(1));
+    let (mut rt, _) = build_step_runtime(model_dir, cfg)?;
+    let layout = rt.layout;
+    let moe_style = match rt.block_profile.moe_style() {
+        MoeExecutionStyle::BatchedGrouped => "batched_grouped",
+        MoeExecutionStyle::ScalarPerExpert => "scalar_per_expert",
+    }
+    .to_string();
+
+    rt.dispatch_and_wait(|enc| {
+        enc.encode_step_preamble(&layout, 1)?;
+        for l in 0..layer {
+            enc.encode_full_layer(l, &layout)?;
+        }
+        enc.encode_layer(layer, &layout)?;
+        Ok(())
+    })?;
+
+    let route: RouteScratch = read_struct(&rt.bufs.route);
+    let route_stats = route_scratch_stats(&route);
+
+    let mut grouped_dispatched = false;
+    let mut moe_out_l2 = None;
+    let mut moe_out_nonzero = None;
+    let mut moe_out_gpu_cpu_cos = None;
+    let mut moe_out_gpu_cpu_rel_l2 = None;
+    let moe_style = if run_grouped {
+        moe_style
+    } else {
+        "scalar_per_expert".to_string()
+    };
+    rt.dispatch_and_wait(|enc| {
+        if run_grouped {
+            enc.encode_layer_moe_grouped(layer, &layout)?;
+        } else {
+            enc.encode_layer_moe_scalar(layer, &layout)?;
+        }
+        Ok(())
+    })?;
+    grouped_dispatched = true;
+    let moe_out_gpu = read_f32_arena(&rt.bufs.arena, A_MOEOUT, CANVAS * HID);
+    moe_out_l2 = Some(vector_l2(&moe_out_gpu));
+    moe_out_nonzero = Some(count_nonzero_f32(&moe_out_gpu, 1e-9));
+    rt.fill_moe_out_dgq_cpu(layer)?;
+    let moe_out_cpu = read_f32_arena(&rt.bufs.arena, A_MOEOUT, CANVAS * HID);
+    moe_out_gpu_cpu_cos = Some(cosine_f32(&moe_out_gpu, &moe_out_cpu));
+    moe_out_gpu_cpu_rel_l2 = Some(rel_l2_f32(&moe_out_cpu, &moe_out_gpu));
+
+    Ok(MoeRouteCapture {
+        layer,
+        step: 1,
+        kv_len: rt.read_params().kv_len,
+        use_mps_q4: rt.use_mps_q4,
+        encoder_use_mps_q4: cfg.encoder_use_mps_q4.unwrap_or(false),
+        moe_style,
+        route: route_stats,
+        grouped_dispatched,
+        moe_out_l2,
+        moe_out_nonzero,
+        moe_out_gpu_cpu_cos,
+        moe_out_gpu_cpu_rel_l2,
+    })
 }
 
 /// Step-1 forward through `layer` FFN/MoE; read checkpoints at one canvas row.

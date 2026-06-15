@@ -36,6 +36,8 @@ mod step_logits_dump;
 mod step_preamble_dump;
 mod step_attn_dump;
 mod step_moe_dump;
+mod step_moe_batched_pin_dump;
+mod step_moe_route_dump;
 mod step_moe_single_dump;
 mod step_kernel;
 mod step_icb;
@@ -67,18 +69,21 @@ pub use sampler::{sampler_step_gpu, upload_logits_gpu};
 pub use step_kernel::{
     bench_step_kernel, build_step_runtime, hello_chat_prefill_token_ids, logits_finite_check_enabled,
     run_denoise_steps, run_single_denoise_step, run_step_attn_layer_capture, run_step_forward,
-    run_step_layer_hidden_probe, run_step_moe_layer_capture, run_step_moe_single_expert_capture,
+    run_step_layer_hidden_probe, run_step_moe_layer_capture, run_step_moe_batched_pin_capture,
+    run_step_moe_route_capture,
+    run_step_moe_single_expert_capture,
     run_step_preamble_capture,
     run_step_probe, run_step_smoke, run_embed_row_gpu, run_step_q4_mps_parity,
     step_use_moe_grouped_q4_default, step_use_mps_q4_default,
-    step_use_sc_gemm_default,
-    DenoiseStepStats, trace_entropy_enabled, LayerAttnCapture, LayerMoeCapture,
+    step_use_sc_gemm_default, layer_moe_block_jobs,
+    DenoiseStepStats, trace_entropy_enabled, LayerAttnCapture, LayerMoeCapture, MoeRouteCapture,
+    RouteScratchStats,
     PreambleCapture, SingleExpertMoeCapture,
     bench_step_kernel_profile, StepBenchResult, StepFinishMode, StepForwardOutput, StepProfileResult,
     StepProbeResult, StepBlockMpsParityResult, StepQ4MpsParityResult,
     run_step_block_mps_parity, run_step_nvfp4_mps_parity,
     StepSmokeConfig, StepSmokeResult, CANVAS, CanvasState, LayerOffsets, RouteScratch, StepParams,
-    N_EXPERTS, TOP_K,
+    N_EXPERTS, TOP_K, HID, MOE_FF,
 };
 pub use step_preamble_dump::{
     hidden_cosine as preamble_hidden_cosine, run_step_preamble_dump, write_step_preamble_dump,
@@ -88,6 +93,14 @@ pub use step_attn_dump::{
     hidden_cosine, run_step_attn_layer_dump, write_step_attn_layer_dump, StepAttnLayerDump,
 };
 pub use step_moe_dump::{run_step_moe_layer_dump, write_step_moe_layer_dump, StepMoeLayerDump};
+pub use step_moe_batched_pin_dump::{
+    print_pin_summary as print_batched_pin_summary, run_step_moe_batched_pin_dump,
+    write_step_moe_batched_pin_dump,
+};
+pub use crate::kernels::sub::moe_batched_pin::MoeBatchedPinDump;
+pub use step_moe_route_dump::{
+    print_route_summary, run_step_moe_route_dump, write_step_moe_route_dump, StepMoeRouteDump,
+};
 pub use step_moe_single_dump::{
     run_step_moe_single_expert_dump, write_step_moe_single_expert_dump, StepMoeSingleExpertDump,
 };

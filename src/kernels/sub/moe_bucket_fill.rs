@@ -110,16 +110,20 @@ fn run_phases(
     enc: &objc2::runtime::ProtocolObject<dyn MTLComputeCommandEncoder>,
     pipeline: &crate::metal::device::ComputePipeline,
     buf_route: &objc2::runtime::ProtocolObject<dyn MTLBuffer>,
+    buf_expert_unique: &objc2::runtime::ProtocolObject<dyn MTLBuffer>,
     f: &Fixture,
 ) {
     let dims = f.dims();
+    let layer_idx = 0u32;
     for phase in 0u32..3 {
         enc.setComputePipelineState(&pipeline.pipeline);
         unsafe {
             enc.setBuffer_offset_atIndex(Some(buf_route), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(buf_expert_unique), 0, 3);
         }
         gpu_common::set_bytes(enc, &phase, 1);
         gpu_common::set_bytes(enc, &dims, 2);
+        gpu_common::set_bytes(enc, &layer_idx, 4);
         let count = if phase == 1 { 1 } else { f.canvas() * f.top_k as usize };
         enc.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize {
@@ -147,6 +151,9 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let buf_route = pool
         .allocate(&ctx.device, std::mem::size_of::<RouteScratch>())
         .ok_or(Error::Format("alloc"))?;
+    let buf_expert_unique = pool
+        .allocate(&ctx.device, std::mem::size_of::<u32>())
+        .ok_or(Error::Format("alloc"))?;
     let scratch = scratch_from_fixture(f);
     BufferPool::write_bytes(
         &buf_route,
@@ -160,7 +167,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
 
     let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
     let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
-    run_phases(&enc, &pipeline, &buf_route, f);
+    run_phases(&enc, &pipeline, &buf_route, &buf_expert_unique, f);
     enc.endEncoding();
     cmd.commit();
     cmd.waitUntilCompleted();

@@ -80,6 +80,22 @@ pub fn moe_routing_fixture(_: ElemFormat) -> Fixture {
     }
 }
 
+/// 64-slot gather order from Calgary L0 batched MoE capture (seed 42).
+pub fn moe_batched_pin_l0_fixture(_: ElemFormat) -> Fixture {
+    let hidden = 64;
+    let num_tokens = crate::metal::CANVAS;
+    let token_list = crate::kernels::sub::moe_batched_pin::calgary_l0_token_list();
+    let src: Vec<f32> = (0..num_tokens * hidden)
+        .map(|i| ((i as f32) * 0.0023).sin() * 0.5 + 0.25)
+        .collect();
+    Fixture {
+        src,
+        indices: token_list.to_vec(),
+        hidden,
+        num_tokens,
+    }
+}
+
 pub fn cpu(f: &Fixture) -> Vec<f32> {
     let mut out = vec![0.0f32; f.out_len()];
     for (bi, &tok) in f.indices.iter().enumerate() {
@@ -207,6 +223,18 @@ mod tests {
         cpu_oracle = crate::kernels::sub::gather_rows::cpu_oracle,
         gpu = crate::kernels::sub::gather_rows::gpu,
         fixture = crate::kernels::sub::gather_rows::moe_routing_fixture,
+        out_len = crate::kernels::sub::gather_rows::fixture_len,
+        formats: [F32],
+        max_tol = 1e-6,
+        min_cos = 0.9999,
+    }
+
+    kernel_oracle_matrix! {
+        mod moe_batched_pin_l0,
+        cpu = crate::kernels::sub::gather_rows::cpu,
+        cpu_oracle = crate::kernels::sub::gather_rows::cpu_oracle,
+        gpu = crate::kernels::sub::gather_rows::gpu,
+        fixture = crate::kernels::sub::gather_rows::moe_batched_pin_l0_fixture,
         out_len = crate::kernels::sub::gather_rows::fixture_len,
         formats: [F32],
         max_tol = 1e-6,

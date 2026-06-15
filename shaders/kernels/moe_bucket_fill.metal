@@ -9,6 +9,8 @@ kernel void moe_bucket_fill(
     device RouteScratch *R [[buffer(0)]],
     constant uint &phase [[buffer(1)]],
     constant RouterDims &dims [[buffer(2)]],
+    device uint *layer_expert_unique [[buffer(3)]],
+    constant uint &layer_idx [[buffer(4)]],
     uint i [[thread_position_in_grid]]
 ) {
     if (K_SHAPE_ASSERT && (dims.canvas == 0u || dims.top_k == 0u || dims.n_experts == 0u)) {
@@ -29,13 +31,18 @@ kernel void moe_bucket_fill(
     } else if (phase == 1u) {
         if (i == 0u) {
             uint s = 0u;
+            uint used = 0u;
             for (uint e = 0u; e < dims.n_experts; ++e) {
+                if (R->count[e] > 0u) {
+                    used++;
+                }
                 R->row_start[e] = s;
                 s += R->count[e];
                 R->count[e] = 0u;
             }
             R->row_start[dims.n_experts] = s;
             R->num_slots = s;
+            layer_expert_unique[layer_idx] = used;
         }
     } else {
         uint slots = dims.canvas * dims.top_k;

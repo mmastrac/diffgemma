@@ -55,6 +55,19 @@ impl ForwardTelemetry {
             unique_experts as u64 * expert_entry_bytes(text);
     }
 
+    /// Monolithic grouped MoE: per-layer unique counts + `.dgq` blob bytes/expert.
+    pub fn record_expert_layers_grouped(
+        &mut self,
+        counts: &[u32],
+        weight_bytes_per_expert: u64,
+    ) {
+        self.expert_unique_per_layer = counts.to_vec();
+        if weight_bytes_per_expert > 0 {
+            let total_unique: u64 = counts.iter().map(|&u| u as u64).sum();
+            self.expert_weight_bytes_touched = total_unique * weight_bytes_per_expert;
+        }
+    }
+
     pub fn expert_unique_mean(&self) -> f64 {
         if self.expert_unique_per_layer.is_empty() {
             return 0.0;

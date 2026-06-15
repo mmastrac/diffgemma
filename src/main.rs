@@ -230,6 +230,25 @@ enum Command {
         layer: usize,
         position: usize,
     },
+    StepMoeRouteDump {
+        prompt: Option<String>,
+        layers: usize,
+        seed: u64,
+        max_seq: usize,
+        raw_prompt: bool,
+        output: PathBuf,
+        layer: usize,
+        run_grouped: bool,
+    },
+    StepMoeBatchedPinDump {
+        prompt: Option<String>,
+        layers: usize,
+        seed: u64,
+        max_seq: usize,
+        raw_prompt: bool,
+        output: PathBuf,
+        layer: usize,
+    },
     StepMoeSingleDump {
         prompt: Option<String>,
         layers: usize,
@@ -482,6 +501,44 @@ fn main() -> ExitCode {
             &output,
             layer,
             position,
+        ),
+        Command::StepMoeRouteDump {
+            prompt,
+            layers,
+            seed,
+            max_seq,
+            raw_prompt,
+            output,
+            layer,
+            run_grouped,
+        } => run_step_moe_route_dump_cmd(
+            &cli.model_dir,
+            prompt,
+            layers,
+            seed,
+            max_seq,
+            raw_prompt,
+            &output,
+            layer,
+            run_grouped,
+        ),
+        Command::StepMoeBatchedPinDump {
+            prompt,
+            layers,
+            seed,
+            max_seq,
+            raw_prompt,
+            output,
+            layer,
+        } => run_step_moe_batched_pin_dump_cmd(
+            &cli.model_dir,
+            prompt,
+            layers,
+            seed,
+            max_seq,
+            raw_prompt,
+            &output,
+            layer,
         ),
         Command::StepMoeSingleDump {
             prompt,
@@ -797,6 +854,8 @@ fn run_command(
         Command::StepLayerProbe { .. } => ExitCode::FAILURE,
         Command::StepAttnDump { .. } => ExitCode::FAILURE,
         Command::StepMoeDump { .. } => ExitCode::FAILURE,
+        Command::StepMoeRouteDump { .. } => ExitCode::FAILURE,
+        Command::StepMoeBatchedPinDump { .. } => ExitCode::FAILURE,
         Command::StepMoeSingleDump { .. } => ExitCode::FAILURE,
         Command::StepPreambleDump { .. } => ExitCode::FAILURE,
         Command::EmbedRowDump { .. } => ExitCode::FAILURE,
@@ -1211,6 +1270,166 @@ fn run_step_moe_dump_cmd(
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
+fn run_step_moe_route_dump_cmd(
+    model_dir: &std::path::Path,
+    prompt: Option<String>,
+    layers: usize,
+    seed: u64,
+    max_seq: usize,
+    raw_prompt: bool,
+    output: &std::path::Path,
+    layer: usize,
+    run_grouped: bool,
+) -> ExitCode {
+    use metal::{
+        print_route_summary, run_step_moe_route_dump, write_step_moe_route_dump, StepFinishMode,
+        StepSmokeConfig,
+    };
+
+    if !dgq::store::looks_like_dgq_dir(model_dir) {
+        eprintln!("error: step-moe-route-dump requires a .dgq directory");
+        return ExitCode::FAILURE;
+    }
+    let mut cfg = StepSmokeConfig {
+        layers,
+        steps: 1,
+        kv_len: 0,
+        seed,
+        max_seq,
+        finish: StepFinishMode::ForwardOnly,
+        use_mps_q4: Some(false),
+        prefill_token_ids: None,
+        no_early_stop: false,
+        encoder_use_mps_q4: Some(false),
+    };
+    if let Err(err) = attach_step_prefill(
+        &mut cfg,
+        model_dir,
+        0,
+        prompt.as_deref(),
+        raw_prompt,
+    ) {
+        eprintln!("error: {err}");
+        return ExitCode::FAILURE;
+    }
+    let label = prompt.unwrap_or_else(|| "Hello".to_string());
+    match run_step_moe_route_dump(model_dir, &cfg, &label, layer, run_grouped) {
+        Ok(dump) => {
+            print_route_summary(&dump);
+            if let Err(err) = write_step_moe_route_dump(output, &dump) {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+            println!("wrote {} (layer={}, slots_ok={})", output.display(), dump.layer, dump.slots_ok);
+            if !dump.slots_ok {
+                eprintln!("error: MoE bucketing failed (num_slots={})", dump.num_slots);
+                return ExitCode::FAILURE;
+            }
+            if dump.grouped_dispatched {
+                if dump.moe_out_l2.unwrap_or(0.0) < 1e-6 {
+                    eprintln!("error: MoE produced zero moe_out");
+                    return ExitCode::FAILURE;
+                }
+                if dump.moe_out_gpu_cpu_cos.unwrap_or(1.0) < 0.99 {
+                    eprintln!(
+                        "error: moe_out vs CPU oracle cos={:.6} (need >= 0.99, style={})",
+                        dump.moe_out_gpu_cpu_cos.unwrap_or(0.0),
+                        dump.moe_style
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn run_step_moe_batched_pin_dump_cmd(
+    model_dir: &std::path::Path,
+    prompt: Option<String>,
+    layers: usize,
+    seed: u64,
+    max_seq: usize,
+    raw_prompt: bool,
+    output: &std::path::Path,
+    layer: usize,
+) -> ExitCode {
+    use metal::{
+        print_batched_pin_summary, run_step_moe_batched_pin_dump, write_step_moe_batched_pin_dump,
+        StepFinishMode, StepSmokeConfig,
+    };
+
+    if !dgq::store::looks_like_dgq_dir(model_dir) {
+        eprintln!("error: step-moe-batched-pin-dump requires a .dgq directory");
+        return ExitCode::FAILURE;
+    }
+    let mut cfg = StepSmokeConfig {
+        layers,
+        steps: 1,
+        kv_len: 0,
+        seed,
+        max_seq,
+        finish: StepFinishMode::ForwardOnly,
+        use_mps_q4: Some(false),
+        prefill_token_ids: None,
+        no_early_stop: false,
+        encoder_use_mps_q4: Some(false),
+    };
+    if let Err(err) = attach_step_prefill(
+        &mut cfg,
+        model_dir,
+        0,
+        prompt.as_deref(),
+        raw_prompt,
+    ) {
+        eprintln!("error: {err}");
+        return ExitCode::FAILURE;
+    }
+    let label = prompt.unwrap_or_else(|| "Hello".to_string());
+    match run_step_moe_batched_pin_dump(model_dir, &cfg, &label, layer) {
+        Ok(dump) => {
+            print_batched_pin_summary(&dump);
+            if let Err(err) = write_step_moe_batched_pin_dump(output, &dump) {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+            println!(
+                "wrote {} (layer={}, gather_cos={:.6}, gate_up_cos={:.6}, down_cos={:.6}, scatter_cos={:.6})",
+                output.display(),
+                dump.layer,
+                dump.stages.gather,
+                dump.stages.gate_up,
+                dump.stages.down,
+                dump.stages.scatter,
+            );
+            let fail_stage = [
+                ("gather", dump.stages.gather),
+                ("gate_up", dump.stages.gate_up),
+                ("swiglu", dump.stages.swiglu),
+                ("down", dump.stages.down),
+                ("scatter", dump.stages.scatter),
+            ]
+            .into_iter()
+            .find(|(_, cos)| *cos < 0.99);
+            if let Some((name, cos)) = fail_stage {
+                eprintln!("error: batched pin stage `{name}` cos={cos:.6} (need >= 0.99)");
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
 fn run_step_moe_single_dump_cmd(
     model_dir: &std::path::Path,
     prompt: Option<String>,
@@ -1584,8 +1803,15 @@ fn run_step_kv_parity_cmd(
             );
             println!("  native_min_ent:      {:.4}", r.native_min_ent);
             println!("  mps_min_ent:         {:.4}", r.mps_min_ent);
+            println!("  min_ent_diff:        {:.4}", r.min_ent_diff);
+            println!("  entropy_pass:        {}", r.entropy_pass);
             println!("  ln_vocab:            {:.4}", r.ln_vocab);
             println!("  pass:                {}", r.pass);
+            if !r.entropy_pass {
+                eprintln!(
+                    "  note: KV matched but forward entropy diverged — use step-moe-route-dump on denoise path"
+                );
+            }
             if r.pass {
                 ExitCode::SUCCESS
             } else {
@@ -2500,6 +2726,7 @@ fn parse_cli() -> Cli {
     let mut step_layer_position = 129usize;
     let mut step_attn_layer = 2usize;
     let mut step_moe_expert = 18u32;
+    let mut step_moe_route_grouped = true;
     let mut embed_row_token = 71153u32;
     let mut embed_row_gpu = false;
     let mut bf16_ref_dir: Option<PathBuf> = None;
@@ -2566,6 +2793,7 @@ fn parse_cli() -> Cli {
             "--compare-cpu" => compare_cpu = true,
             "--repeat-prefill" => bench_repeat_prefill = true,
             "--no-early-stop" => no_early_stop = true,
+            "--skip-grouped" => step_moe_route_grouped = false,
             "--write-golden" => {
                 if let Some(v) = args.next() {
                     write_golden = Some(v);
@@ -3023,6 +3251,41 @@ fn parse_cli() -> Cli {
                 output,
                 layer: step_attn_layer,
                 position: step_layer_position,
+            }
+        }
+        Some("step-moe-route-dump") => {
+            let output = output_dir.unwrap_or_else(|| {
+                eprintln!(
+                    "usage: diffgemma-mps step-moe-route-dump -m MODEL -o OUT.json [-p Hello] [--layers 30] [--seed 42] [--attn-layer 0] [--skip-grouped]"
+                );
+                std::process::exit(2);
+            });
+            Command::StepMoeRouteDump {
+                prompt: prompt.clone(),
+                layers: bench_layers.max(1).min(30),
+                seed,
+                max_seq: step_max_seq.max(64),
+                raw_prompt,
+                output,
+                layer: step_attn_layer,
+                run_grouped: step_moe_route_grouped,
+            }
+        }
+        Some("step-moe-batched-pin-dump") => {
+            let output = output_dir.unwrap_or_else(|| {
+                eprintln!(
+                    "usage: diffgemma-mps step-moe-batched-pin-dump -m MODEL -o OUT.json [-p Hello] [--layers 30] [--seed 42] [--attn-layer 0]"
+                );
+                std::process::exit(2);
+            });
+            Command::StepMoeBatchedPinDump {
+                prompt: prompt.clone(),
+                layers: bench_layers.max(1).min(30),
+                seed,
+                max_seq: step_max_seq.max(64),
+                raw_prompt,
+                output,
+                layer: step_attn_layer,
             }
         }
         Some("step-moe-single-dump") => {
