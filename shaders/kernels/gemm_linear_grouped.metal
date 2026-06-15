@@ -3,6 +3,7 @@
 using namespace metal;
 
 #include "fc_axes.metal"
+#include "debug_status.metal"
 #include "qgemm_grouped.metal"
 
 /// Grouped MoE block GEMM: flattened `[total_m,K] @ expert weights^T` in one dispatch.

@@ -2,6 +2,7 @@
 using namespace metal;
 
 #include "fc_axes.metal"
+#include "debug_status.metal"
 #include "dequant.metal"
 
 /// `C[M,N] = A[M,K] @ W[K,N]` — weight rows indexed by K (embed / SC softembed).

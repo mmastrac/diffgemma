@@ -2,6 +2,7 @@
 using namespace metal;
 
 #include "fc_axes.metal"
+#include "debug_status.metal"
 
 kernel void memzero_bytes(
     device uchar4 *p [[buffer(0)]],

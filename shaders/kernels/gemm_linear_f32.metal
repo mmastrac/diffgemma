@@ -2,6 +2,7 @@
 using namespace metal;
 
 #include "fc_axes.metal"
+#include "debug_status.metal"
 #include "dequant.metal"
 
 /// `C[M,N] = A[M,K] @ W[N,K]^T` scalar f32 GEMM; format from K_QUANT_FORMAT (Q4 or NVFP4).

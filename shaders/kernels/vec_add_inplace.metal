@@ -2,6 +2,7 @@
 using namespace metal;
 
 #include "fc_axes.metal"
+#include "debug_status.metal"
 
 kernel void vec_add_inplace(
     device float *out [[buffer(0)]],

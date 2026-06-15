@@ -1,0 +1,57 @@
+// Canonical per-kernel IDs for debug status reporting (P3.7).
+// Keep in sync with src/kernels/sub/dbg_kernel.rs.
+
+#ifndef DGQ_KERNELS_METAL
+#define DGQ_KERNELS_METAL
+
+enum DbgKernelId : uint {
+    DbgKernelUnknown = 0u,
+    DbgKernelEmbedGather = 1u,
+    DbgKernelHalfToF32 = 2u,
+    DbgKernelF32ToHalf = 3u,
+    DbgKernelMemzeroBytes = 4u,
+    DbgKernelRmsNormRows = 5u,
+    DbgKernelRmsNormRowsTiled = 6u,
+    DbgKernelResidualHalf = 7u,
+    DbgKernelResidualF32b = 8u,
+    DbgKernelGelu = 9u,
+    DbgKernelSwiglu = 10u,
+    DbgKernelSwigluMoeGateUp = 11u,
+    DbgKernelHalfScale = 12u,
+    DbgKernelSoftcapHalf = 13u,
+    DbgKernelGatherRows = 14u,
+    DbgKernelGatherProbCols = 15u,
+    DbgKernelGemmBlock = 16u,
+    DbgKernelGemmBlockGrouped = 17u,
+    DbgKernelGemmLinearGrouped = 18u,
+    DbgKernelGemmLinearF32 = 19u,
+    DbgKernelGemmQ4 = 20u,
+    DbgKernelGemmQ8 = 21u,
+    DbgKernelGemmQ8Rowk = 22u,
+    DbgKernelGemmNvfp4 = 23u,
+    DbgKernelDequantBlockMatrix = 24u,
+    DbgKernelQkRopeKv = 25u,
+    DbgKernelAttention = 26u,
+    DbgKernelMoeRouter = 27u,
+    DbgKernelMoeBucketCount = 28u,
+    DbgKernelMoeBucketFill = 29u,
+    DbgKernelMoeGrouped = 30u,
+    DbgKernelMoeScatterWeighted = 31u,
+    DbgKernelRouterTopKRows = 32u,
+    DbgKernelRouterScaleRows = 33u,
+    DbgKernelScProbs = 34u,
+    DbgKernelScSoftembed = 35u,
+    DbgKernelSoftmaxRows = 36u,
+    DbgKernelSampleRowstats = 37u,
+    DbgKernelSampleCommit = 38u,
+    DbgKernelSampleApply = 39u,
+    DbgKernelSampleWrite = 40u,
+    DbgKernelLogitRowstats = 41u,
+    DbgKernelPackEncoderKv = 42u,
+    DbgKernelVecAddInplace = 43u,
+    DbgKernelVecScaleInplace = 44u,
+    DbgKernelVecMulInplace = 45u,
+    DbgKernelVecFillZero = 46u,
+};
+
+#endif

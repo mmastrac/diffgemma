@@ -2,6 +2,7 @@
 using namespace metal;
 
 #include "fc_axes.metal"
+#include "debug_status.metal"
 
 /// Pack engine f32 K/V prefix into monolithic b4 layer region (matches CPU pack layout).
 kernel void pack_encoder_kv(

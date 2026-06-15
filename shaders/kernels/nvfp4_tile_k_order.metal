@@ -2,6 +2,7 @@
 using namespace metal;
 
 #include "fc_axes.metal"
+#include "debug_status.metal"
 #include "dequant.metal"
 
 /// Compare 32-wide NVFP4 tile decode: path A = fused half tile, path B = `nvfp4_at_col`.

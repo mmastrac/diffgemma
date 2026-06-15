@@ -2,6 +2,7 @@
 using namespace metal;
 
 #include "fc_axes.metal"
+#include "debug_status.metal"
 #include "dequant.metal"
 #include "qgemm_grouped.metal"
 #include "activations.metal"

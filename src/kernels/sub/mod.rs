@@ -54,6 +54,7 @@ pub mod softcap_half;
 pub mod swiglu;
 pub mod test_util;
 pub mod variant;
+pub mod dbg_kernel;
 pub mod vec_add_inplace;
 pub mod vec_fill_zero;
 pub mod vec_mul_inplace;

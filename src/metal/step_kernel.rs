@@ -26,6 +26,9 @@ use std::mem::offset_of;
 use std::path::Path;
 use std::time::Instant;
 
+#[path = "step_schedule.rs"]
+mod step_schedule;
+
 const STEP_SHADER: &str = shader_include::include_metal!("monolithic/diffgemma_step.metal");
 
 pub const HID: usize = 2816;
@@ -1579,8 +1582,8 @@ impl StepEnc<'_> {
         Ok(())
     }
 
-    /// QK-RoPE-KV write + attention (expects Q/K/V already in arena).
-    fn encode_layer_qk_rope_and_attention(
+    /// QK-RoPE-KV write (expects Q/K/V already in arena).
+    fn encode_layer_qk_rope_kv_dispatch(
         &mut self,
         layer: usize,
         layout: &ModelLayout,
@@ -1613,7 +1616,15 @@ impl StepEnc<'_> {
             depth: 1,
         };
         self.sink_dispatch(grid, tg);
+        Ok(())
+    }
 
+    fn encode_layer_attention_dispatch(
+        &mut self,
+        layer: usize,
+        _layout: &ModelLayout,
+    ) -> Result<(), Error> {
+        let layer_off = layer_byte_offset(layer);
         self.sink_set_pipeline(&self.ps.attention);
         self.sink_set_buffer(&self.bufs.arena, A_ATTNQ as usize, 0);
         self.bind_kvcache(1);
@@ -1639,7 +1650,159 @@ impl StepEnc<'_> {
         Ok(())
     }
 
-    /// Run one decoder layer through QK-RoPE-KV + attention only (stops before o_proj).
+    /// QK-RoPE-KV write + attention (expects Q/K/V already in arena).
+    fn encode_layer_qk_rope_and_attention(
+        &mut self,
+        layer: usize,
+        layout: &ModelLayout,
+    ) -> Result<(), Error> {
+        self.encode_layer_qk_rope_kv_dispatch(layer, layout)?;
+        self.encode_layer_attention_dispatch(layer, layout)
+    }
+
+    fn exec_stage(
+        &mut self,
+        stage: step_schedule::StepStage,
+        layer: usize,
+        layout: &ModelLayout,
+        finish: StepFinishMode,
+    ) -> Result<(), Error> {
+        let _ = layout;
+        use step_schedule::StepStage;
+        match stage {
+            StepStage::ScLogitRowstats => {
+                self.encode_sc_logit_rowstats();
+                Ok(())
+            }
+            StepStage::ScSoftembed => self.encode_sc_softembed(layout),
+            StepStage::ScPreNorm => {
+                self.rmsnorm(A_SOFT, A_TMP, layout.sc_pre_norm, HID as u32, CANVAS);
+                Ok(())
+            }
+            StepStage::ScGateGemm => {
+                self.gemm_q8(
+                    A_TMP,
+                    A_FFG,
+                    layout.sc_gate,
+                    CANVAS as u32,
+                    DENSE_FF,
+                    HID as u32,
+                )
+            }
+            StepStage::ScUpGemm => {
+                self.gemm_q8(
+                    A_TMP,
+                    A_FFU,
+                    layout.sc_up,
+                    CANVAS as u32,
+                    DENSE_FF,
+                    HID as u32,
+                )
+            }
+            StepStage::ScGlu => {
+                self.glu(A_FFG, A_FFU, A_FFG, CANVAS * DENSE_FF as usize);
+                Ok(())
+            }
+            StepStage::ScDownGemm => {
+                self.gemm_q8(
+                    A_FFG,
+                    A_DENSE,
+                    layout.sc_down,
+                    CANVAS as u32,
+                    HID as u32,
+                    DENSE_FF,
+                )
+            }
+            StepStage::EmbedGather => {
+                self.dispatch_embed_gather(layout.embed);
+                Ok(())
+            }
+            StepStage::RmsNormHidden => {
+                self.rmsnorm(A_HIDDEN, A_HIDDEN, 0, HID as u32, CANVAS);
+                Ok(())
+            }
+            StepStage::LayerInputNormQkv => self.encode_layer_qkv_gemm(layer, layout),
+            StepStage::LayerQkRopeKv => self.encode_layer_qk_rope_kv_dispatch(layer, layout),
+            StepStage::LayerAttention => self.encode_layer_attention_dispatch(layer, layout),
+            StepStage::LayerOProjPostAttn => self.encode_layer_o_proj_post_attn(layer, layout),
+            StepStage::LayerDenseFfn => self.encode_layer_dense_ffn(layer, layout),
+            StepStage::LayerRouter => self.encode_layer_router_buckets(layer, layout),
+            StepStage::MoeBatchedGather => self.encode_moe_batched_gather(),
+            StepStage::MoeBatchedGateUp => self.encode_moe_batched_gate_up(layer, layout),
+            StepStage::MoeBatchedSwiglu => self.encode_moe_batched_swiglu(),
+            StepStage::MoeBatchedDown => self.encode_moe_batched_down(layer, layout),
+            StepStage::MoeBatchedScatter => self.encode_moe_batched_scatter(),
+            StepStage::MoeGroupedScalar => self.encode_layer_moe_scalar(layer, layout),
+            StepStage::LayerMoePostNorm => self.encode_layer_moe_post_norm(layer, layout),
+            StepStage::LayerMoePostCombine => self.encode_layer_moe_post_combine(layer, layout),
+            StepStage::FinalNorm => {
+                self.rmsnorm(A_HIDDEN, A_TMP, layout.final_norm, HID as u32, CANVAS);
+                Ok(())
+            }
+            StepStage::LmHeadGemm => {
+                self.gemm_q8_logits(
+                    A_TMP,
+                    layout.embed,
+                    CANVAS as u32,
+                    VOCAB as u32,
+                    HID as u32,
+                )
+            }
+            StepStage::Softcap => {
+                self.dispatch_softcap();
+                Ok(())
+            }
+            StepStage::SampleRowstats
+            | StepStage::SampleCommit
+            | StepStage::SampleApply
+            | StepStage::SampleWrite => {
+                if finish == StepFinishMode::Full {
+                    self.encode_step_sampler(layout)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn interpret_step(
+        &mut self,
+        layout: &ModelLayout,
+        layers: usize,
+        first_step: u32,
+        finish: StepFinishMode,
+    ) -> Result<(), Error> {
+        let schedule =
+            step_schedule::build_step_schedule(&self.block_profile, finish == StepFinishMode::Full);
+        for stage in step_schedule::build_preamble(first_step) {
+            self.exec_stage(stage, 0, layout, finish)?;
+        }
+        for layer in 0..layers {
+            for &stage in &schedule.per_layer {
+                self.exec_stage(stage, layer, layout, finish)?;
+            }
+        }
+        let mut sampler_done = false;
+        for &stage in &schedule.finish {
+            if matches!(
+                stage,
+                step_schedule::StepStage::SampleRowstats
+                    | step_schedule::StepStage::SampleCommit
+                    | step_schedule::StepStage::SampleApply
+                    | step_schedule::StepStage::SampleWrite
+            ) {
+                if !sampler_done && finish == StepFinishMode::Full {
+                    self.encode_step_sampler(layout)?;
+                    sampler_done = true;
+                }
+                continue;
+            }
+            self.exec_stage(stage, 0, layout, finish)?;
+        }
+        Ok(())
+    }
+
+    /// Canvas token embed gather only (no SC residual, no no-scale RMSNorm).
     fn encode_layer_through_attention(
         &mut self,
         layer: usize,
@@ -2244,16 +2407,9 @@ impl StepRuntime {
         let layout = self.layout;
         let layers = self.layers;
         let finish = StepFinishMode::Full;
+        let first_step = if with_sc { 0u32 } else { 1u32 };
         self.dispatch_record(
-            |enc| {
-                let first_step = if with_sc { 0u32 } else { 1u32 };
-                enc.encode_step_preamble(&layout, first_step)?;
-                for layer in 0..layers {
-                    enc.encode_full_layer(layer, &layout)?;
-                }
-                enc.encode_step_finish(&layout, finish)?;
-                Ok(())
-            },
+            |enc| enc.interpret_step(&layout, layers, first_step, finish),
             &mut recorder,
         )?;
         recorder.finish()
@@ -2436,12 +2592,7 @@ impl StepRuntime {
             }
         }
         self.dispatch_and_wait(|enc| {
-            enc.encode_step_preamble(&layout, first_step)?;
-            for layer in 0..layers {
-                enc.encode_full_layer(layer, &layout)?;
-            }
-            enc.encode_step_finish(&layout, finish)?;
-            Ok(())
+            enc.interpret_step(&layout, layers, first_step, finish)
         })
     }
 }

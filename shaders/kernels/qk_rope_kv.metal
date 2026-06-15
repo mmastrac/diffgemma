@@ -2,6 +2,7 @@
 using namespace metal;
 
 #include "fc_axes.metal"
+#include "debug_status.metal"
 #include "common.metal"
 #include "attention_device.metal"
 #include "sampler_device.metal"

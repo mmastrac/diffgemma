@@ -2,6 +2,7 @@
 using namespace metal;
 
 #include "fc_axes.metal"
+#include "debug_status.metal"
 #include "dequant.metal"
 
 /// `C[M,N] = A[M,K] @ W[N,K]^T` with Q8 row weights (`[scale:2][i8:K]` per row).

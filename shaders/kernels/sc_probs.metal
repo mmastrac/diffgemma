@@ -2,6 +2,7 @@
 using namespace metal;
 
 #include "fc_axes.metal"
+#include "debug_status.metal"
 
 /// Materialize softmax rows from precomputed row stats (SC GEMM fast path).
 kernel void sc_probs(

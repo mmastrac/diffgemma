@@ -2,6 +2,7 @@
 using namespace metal;
 
 #include "fc_axes.metal"
+#include "debug_status.metal"
 
 /// Top-k expert routing per row from raw logits `[rows, experts]`.
 /// MLX/Gemma4: select top-k raw scores, softmax only over the selected experts.

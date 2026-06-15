@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "description": "P3.6 schedule-port regression oracle. Refresh with generate-monolithic --write-trace when GPU is idle (one run at a time).",
+  "weights_dir": "/tmp/quantized-weights",
+  "seed": 42,
+  "no_early_stop": true,
+  "cases": [
+    {
+      "name": "hello_l3_s4",
+      "command": "generate-monolithic -p Hello --seed 42 --layers 3 --steps 4 --no-early-stop",
+      "prompt": "Hello",
+      "layers": 3,
+      "steps": 4,
+      "source_fixture": "denoise_trace_hello_layers3_steps4_seed42.json",
+      "min_entropy_per_step": [9.592558, 9.655014, 9.582015, 9.554397],
+      "accept_per_step": [1, 1, 1, 1],
+      "denoise_steps_run": 4,
+      "blocks_committed": 1,
+      "output_token_ids_prefix": [2, 105, 2364, 107, 9259, 106, 107, 105, 4368, 107, 100, 45518, 107, 101, 28]
+    },
+    {
+      "name": "hello_full_s48",
+      "command": "generate-monolithic -p hello --seed 42 --layers 30 --steps 48 --no-early-stop",
+      "prompt": "hello",
+      "layers": 30,
+      "steps": 48,
+      "status": "pending_capture",
+      "note": "Capture live when Metal is healthy; compare min_entropy/step and accept/step from --write-trace"
+    },
+    {
+      "name": "calgary_full_s48",
+      "command": "generate-monolithic -p \"What's the best way to get from Calgary to Namibia?\" --seed 42 --layers 30 --steps 48 --no-early-stop",
+      "prompt": "What's the best way to get from Calgary to Namibia?",
+      "layers": 30,
+      "steps": 48,
+      "status": "pending_capture",
+      "note": "README: @12 steps MLX min_entropy drops faster; full 48-step oracle TBD"
+    }
+  ]
+}

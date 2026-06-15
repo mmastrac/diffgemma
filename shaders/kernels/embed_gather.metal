@@ -2,6 +2,7 @@
 using namespace metal;
 
 #include "fc_axes.metal"
+#include "debug_status.metal"
 #include "common.metal"
 #include "dequant.metal"
 
@@ -19,7 +20,8 @@ kernel void embed_gather(
     const uint num_tokens = dims.y;
     const uint tok = gid.y;
     const uint d = gid.x;
-    if (K_SHAPE_ASSERT && (hidden == 0u || num_tokens == 0u)) {
+    dgq_assert_dims_nonzero(nullptr, DbgKernelEmbedGather, hidden, num_tokens);
+    if (dgq_debug_fast_enabled() && (tok >= num_tokens || d >= hidden)) {
         return;
     }
     if (tok >= num_tokens || d >= hidden) {

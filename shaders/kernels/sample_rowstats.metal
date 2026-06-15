@@ -2,6 +2,7 @@
 using namespace metal;
 
 #include "fc_axes.metal"
+#include "debug_status.metal"
 #include "sampler_device.metal"
 
 /// Tempered row stats -> rowstat {mx, sum}; per-row entropy (nats); argmax + changed flag.

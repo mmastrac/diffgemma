@@ -2,6 +2,7 @@
 using namespace metal;
 
 #include "fc_axes.metal"
+#include "debug_status.metal"
 #include "moe_router_device.metal"
 
 /// Bucketing phases 0/1/2 (monolith k_bucket_fill).

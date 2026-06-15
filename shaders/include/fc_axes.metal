@@ -1,8 +1,10 @@
 // Global function-constant axes 1–3 (shared numbering convention; see build/manifest.toml).
 //
-//   1  K_SHAPE_ASSERT   bool   tier-2 bounds checks
+//   1  K_SHAPE_ASSERT   bool   tier-2 bounds checks (legacy; implies fast asserts)
 //   2  K_DUMP_STAGE     uint   0 = off; N = which intermediate to dump
 //   3  K_QUANT_FORMAT   uint   0=q4_affine 1=q8 2=mxfp4 3=nvfp4
+//   7  K_DEBUG_FAST     bool   shape/dim/index bounds (cheap; P3.7)
+//   8  K_DEBUG_DEEP     bool   NaN/Inf scans (expensive; P3.7)
 //
 // Per-kernel semantic axes (4+): declared in that kernel's entry file only.
 
@@ -12,6 +14,8 @@
 constant bool K_SHAPE_ASSERT [[function_constant(1)]];
 constant uint K_DUMP_STAGE [[function_constant(2)]];
 constant uint K_QUANT_FORMAT [[function_constant(3)]];
+constant bool K_DEBUG_FAST [[function_constant(7)]];
+constant bool K_DEBUG_DEEP [[function_constant(8)]];
 
 constant uint QUANT_Q4_AFFINE = 0u;
 constant uint QUANT_Q8 = 1u;

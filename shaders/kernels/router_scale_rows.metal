@@ -2,6 +2,7 @@
 using namespace metal;
 
 #include "fc_axes.metal"
+#include "debug_status.metal"
 
 kernel void router_scale_rows(
     device float *x [[buffer(0)]],

@@ -2,6 +2,7 @@
 using namespace metal;
 
 #include "fc_axes.metal"
+#include "debug_status.metal"
 
 kernel void half_to_f32(
     device const half *x [[buffer(0)]],

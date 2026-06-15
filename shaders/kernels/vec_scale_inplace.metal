@@ -2,6 +2,7 @@
 using namespace metal;
 
 #include "fc_axes.metal"
+#include "debug_status.metal"
 
 kernel void vec_scale_inplace(
     device float *x [[buffer(0)]],

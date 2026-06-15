@@ -2,6 +2,7 @@
 using namespace metal;
 
 #include "fc_axes.metal"
+#include "debug_status.metal"
 
 constant bool K_AFFINE [[function_constant(4)]];
 

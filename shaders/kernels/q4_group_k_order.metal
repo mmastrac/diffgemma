@@ -2,6 +2,7 @@
 using namespace metal;
 
 #include "fc_axes.metal"
+#include "debug_status.metal"
 #include "dequant.metal"
 
 /// Compare 32-wide Q4 group decode: path A = `dequant_q4_group`, path B = `q4_at_col`.

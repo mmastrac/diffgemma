@@ -2,6 +2,7 @@
 using namespace metal;
 
 #include "fc_axes.metal"
+#include "debug_status.metal"
 
 /// Stable row softmax in-place over row-major `[rows, cols]`.
 kernel void softmax_rows(

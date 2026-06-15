@@ -2,6 +2,7 @@
 using namespace metal;
 
 #include "fc_axes.metal"
+#include "debug_status.metal"
 #include "sampler_device.metal"
 
 /// Categorical inverse-CDF per row (tempered); tpg MUST divide cols evenly.

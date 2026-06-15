@@ -2,6 +2,7 @@
 using namespace metal;
 
 #include "fc_axes.metal"
+#include "debug_status.metal"
 #include "activations.metal"
 
 /// MoE gate_up `[batch, 2*moe_inter]` → gelu(gate)*up. Layout is fixed by .dgq manifest.

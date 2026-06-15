@@ -2,6 +2,7 @@
 using namespace metal;
 
 #include "fc_axes.metal"
+#include "debug_status.metal"
 #include "sampler_device.metal"
 
 /// LCG u_cat draws, entropy sort, accept mask, stability / early stop, step++.

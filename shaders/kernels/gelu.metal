@@ -2,6 +2,7 @@
 using namespace metal;
 
 #include "fc_axes.metal"
+#include "debug_status.metal"
 #include "activations.metal"
 
 /// In-place GELU (PyTorch tanh approximation).

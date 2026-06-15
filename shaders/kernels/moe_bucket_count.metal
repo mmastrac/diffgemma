@@ -2,6 +2,7 @@
 using namespace metal;
 
 #include "fc_axes.metal"
+#include "debug_status.metal"
 #include "moe_router_device.metal"
 
 /// Zero expert slot counts before bucketing.

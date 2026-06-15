@@ -2,6 +2,7 @@
 using namespace metal;
 
 #include "fc_axes.metal"
+#include "debug_status.metal"
 #include "common.metal"
 
 constant uint K_IN_DTYPE [[function_constant(4)]];

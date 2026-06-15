@@ -2,6 +2,7 @@
 using namespace metal;
 
 #include "fc_axes.metal"
+#include "debug_status.metal"
 #include "dequant.metal"
 
 /// Dequant block weight matrix `[N,K]` to f32 row-major (scratch / validation).

@@ -2,6 +2,7 @@
 using namespace metal;
 
 #include "fc_axes.metal"
+#include "debug_status.metal"
 
 kernel void gather_prob_cols(
     device const float *probs [[buffer(0)]],

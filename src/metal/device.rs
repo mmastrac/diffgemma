@@ -91,6 +91,8 @@ impl MetalContext {
         let fc = MTLFunctionConstantValues::new();
         let shape_assert = false;
         let dump_stage = 0u32;
+        let debug_fast = false;
+        let debug_deep = false;
         unsafe {
             fc.setConstantValue_type_atIndex(
                 std::ptr::NonNull::from_ref(&shape_assert).cast(),
@@ -106,6 +108,16 @@ impl MetalContext {
                 std::ptr::NonNull::from_ref(&quant_format).cast(),
                 MTLDataType::UInt,
                 3,
+            );
+            fc.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from_ref(&debug_fast).cast(),
+                MTLDataType::Bool,
+                7,
+            );
+            fc.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from_ref(&debug_deep).cast(),
+                MTLDataType::Bool,
+                8,
             );
             fc.setConstantValue_type_atIndex(
                 std::ptr::NonNull::from_ref(&is_full_layer).cast(),
@@ -195,6 +207,8 @@ impl MetalContext {
         let shape_assert = variant.shape_assert;
         let dump_stage = variant.dump_stage;
         let quant_format = variant.quant_format as u32;
+        let debug_fast = variant.debug_fast || variant.shape_assert;
+        let debug_deep = variant.debug_deep;
         unsafe {
             fc.setConstantValue_type_atIndex(
                 std::ptr::NonNull::from_ref(&shape_assert).cast(),
@@ -210,6 +224,16 @@ impl MetalContext {
                 std::ptr::NonNull::from_ref(&quant_format).cast(),
                 MTLDataType::UInt,
                 3,
+            );
+            fc.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from_ref(&debug_fast).cast(),
+                MTLDataType::Bool,
+                7,
+            );
+            fc.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from_ref(&debug_deep).cast(),
+                MTLDataType::Bool,
+                8,
             );
             for extra in extra_bools {
                 fc.setConstantValue_type_atIndex(

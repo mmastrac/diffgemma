@@ -27,6 +27,10 @@ pub enum ElemDtype {
 pub struct KernelVariant {
     /// Extra GPU-side bounds checks (tier-2 debug).
     pub shape_assert: bool,
+    /// Cheap shape/dim/index asserts (P3.7 FC7).
+    pub debug_fast: bool,
+    /// Expensive NaN/Inf scans (P3.7 FC8).
+    pub debug_deep: bool,
     /// 0 = off; >0 writes chosen intermediates to optional dump buffer.
     pub dump_stage: u32,
     /// Quant format selector (FC3). Inert on elementwise bodies (must be Q4Affine).
@@ -36,26 +40,34 @@ pub struct KernelVariant {
 impl KernelVariant {
     pub const PRODUCTION: Self = Self {
         shape_assert: false,
+        debug_fast: false,
+        debug_deep: false,
         dump_stage: 0,
         quant_format: QuantFormat::INERT,
     };
 
     pub const TEST_ASSERT: Self = Self {
         shape_assert: true,
+        debug_fast: true,
+        debug_deep: false,
         dump_stage: 0,
         quant_format: QuantFormat::INERT,
     };
 
     pub const TEST_DUMP: Self = Self {
         shape_assert: true,
+        debug_fast: true,
+        debug_deep: false,
         dump_stage: 1,
         quant_format: QuantFormat::INERT,
     };
 
     pub fn cache_label(&self, entry: &str) -> String {
         format!(
-            "{entry}_sa{}_d{}_qf{}",
+            "{entry}_sa{}_df{}_dd{}_d{}_qf{}",
             u8::from(self.shape_assert),
+            u8::from(self.debug_fast),
+            u8::from(self.debug_deep),
             self.dump_stage,
             self.quant_format as u32,
         )

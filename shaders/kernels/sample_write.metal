@@ -2,6 +2,7 @@
 using namespace metal;
 
 #include "fc_axes.metal"
+#include "debug_status.metal"
 #include "sampler_device.metal"
 
 /// Accepted positions -> new_sample; rejected -> fresh uniform id; updates rng_state.
