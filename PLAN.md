@@ -31,8 +31,9 @@ Interpretation:
 - **3L + prompt KV is dead** (min_ent ≈ uniform ≈ 10 nats). Parity goldens use **kv_len=0**; chat always prefills kv≈14. Do not judge chat quality at 3L.
 - **`step-kv-check` passes** @ kv=64, 3L — KV pack is not totally zeroed, but 3L cannot use prompt context effectively.
 - **Prefill ~100 s** in `generate-monolithic` was initially blamed on cold reload (P1.8). **`bench-prefill` isolates the engine path at ~2.6 s/run** for 14 tokens @ 30L — so most of the gap is monolithic-specific overhead, not intrinsic encoder forward cost.
-- **Hypotheses (P1.8):** ~~duplicate `.dgq` GPU blob~~ fixed; monolithic encoder now respects `encoder_use_mps_q4` / env. **Fast MPS encoder prefill blocked on P1.9** (MPS Q4 encoder KV ≠ native → flat logits @ 30L). Native encoder prefill ~31 s @ 14 tok / 30L (CPU MoE + fused Q4); MPS path ~1.7 s but wrong KV.
+- **Hypotheses (P1.8):** ~~duplicate `.dgq` GPU blob~~ fixed; monolithic encoder now respects `encoder_use_mps_q4` / env. **Fast encoder prefill** landed in PREF-2 (GPU grouped MoE default).
 - **P1.9 findings (2026-06):** `step-kv-parity` @ 30L now **passes** (`max_kv_diff≈0.008`). Root cause was transposed `dequant_q4_matrix` grid + GPU grouped MoE diverging from CPU MoE; encoder uses MPS dense + CPU MoE.
+- **PREF-2 (2026-06):** Encoder prefill now defaults to **grouped GPU MoE** (`experts_forward_gpu_batched` → `gemm_linear_grouped`). ~**1.4 s** @ 22 tok / 30L (was ~30–62 s on CPU MoE). `step-kv-parity` and CPU-vs-GPU-MoE KV test pass @ 22 tok Calgary prompt (`max_kv_diff` < 0.02). Opt out: `DGQ_ENCODER_GPU_MOE=0`. Longer prompts degrading to repetition (`"the the the"`) reproduce on **both** CPU and GPU MoE — not a prefill-path bug; tracks **P1.6** q4 canvas convergence / prompt-length sensitivity (Hello @ 12 steps readable; Calgary @ 12 steps still gibberish).
 - **P1.10 (2026-06):** `dequant_q4_matrix` dispatch had `width`/`height` swapped vs shader `row=gid.y, col=gid.x` for `[N,K]` weights — transposed dequant broke all MPS Q4 dense paths. Fixed; `step-q4-parity` @ 30L passes. Step + encoder MPS Q4 re-enabled by default (`DGQ_*_Q4=0` to opt out).
 - **MTLBinaryArchive** (P2.0): runtime pipeline ISA cache at `~/.cache/diffgemma-mps/metal-pipelines/` (`DGQ_METAL_PIPELINE_CACHE=0` to disable). Skips recompiling our `.metal` kernels on restart; MPS matmul internals remain uncached.
 
@@ -102,7 +103,7 @@ Buffer ABI in `diffgemma_step.metal` (version-bump to change).
 | **P2.1** Monolithic generate hot path: 1 sync/step, ~12 KiB readback/step | done |
 | Plan consolidation (`NOTES.md`, retired PLAN2/MONOLITHIC) | done |
 
-**Measured baseline (M3 Pro, `/tmp/quantized-weights`):** monolithic forward ~4.8 s/step; MPS encoder prefill ~1.7 s @ 14 tok / 30L; `step-kv-parity` + `step-q4-parity` pass @ 30L.
+**Measured baseline (M3 Pro, `/tmp/quantized-weights`):** monolithic forward ~1.8 s/step; encoder prefill ~1.4 s @ 22 tok / 30L (GPU grouped MoE); `step-kv-parity` + encoder MoE KV test pass @ 30L.
 
 ---
 
@@ -120,7 +121,7 @@ Buffer ABI in `diffgemma_step.metal` (version-bump to change).
 | P1.6 | **Canvas convergence** — see telemetry findings above. Open: raise simultaneous low-H positions (forward/quant/KV/SC) or validate HF parity on same weights. | **open** | `low_ent` ≥ 15 late-block OR readable Hello @ 30L |
 | P1.7 | HF accept parity (unit + `sampler_accept_entropy.json`) | **done** | Fixture tests pass; Metal uses equivalent prefix rule |
 | P1.8 | **Encoder prefill path** — respects `StepGenerateConfig.encoder_use_mps_q4`; generate defaults native Q4. | **done** | Correct KV + readable entropy @ 30L with defaults |
-| P1.9 | **MPS encoder KV parity** — `step-kv-parity`; MPS dense + CPU MoE hybrid | **done** | `max_kv_diff` < 0.5 @ 30L |
+| P1.9 | **MPS encoder KV parity** — `step-kv-parity`; MPS dense + GPU grouped MoE | **done** | `max_kv_diff` < 0.5 @ 30L |
 | P1.10 | **Step-kernel MPS Q4** — fix `dequant_q4_matrix` grid; `step-q4-parity` gate | **done** | MPS min_ent ≪ ln vocab; |Δmin_ent| < 3 vs native @ 30L |
 | P1.11 | **Step-kernel MPS NVFP4** — `step-nvfp4-parity` gate; fused half-dequant in `gemm_block` | **done** | Parity passes @ 30L; MPS ≈ fused speed on M3 (dequant-bound) |
 | P2.0 | **MTLBinaryArchive pipeline cache** — persist compiled compute pipeline ISA across restarts. | **done** | Archive load/save under `~/.cache/diffgemma-mps/metal-pipelines/` |
@@ -312,7 +313,7 @@ P2.1 done; P2.2–P2.6 (latency) in parallel with P1.6 experiments
 | Accept/entropy fix changes token goldens | Synthetic-entropy fixtures only; token goldens keep `--raw` + fixed `--steps` |
 | q4 quality insufficient for 30L chat | q5 on 36 GiB; ablate embed/lm_head; CPU MoE parity isolate forward |
 | Half logits rowstats numerically wrong @ 262K vocab | P1.6: f32 rowstats experiment behind flag |
-| Prefill dominates short prompts | MPS encoder ~1.7 s @ 14 tok / 30L (P1.9–P1.10 fixed); CPU MoE remains on encoder path |
+| Prefill dominates short prompts | Encoder prefill ~1.4–2.7 s @ 14–22 tok / 30L (PREF-2 GPU MoE default); denoise still ~1.8 s/step |
 | MPS encoder KV wrong → flat logits | `step-kv-parity` gate (passes @ 30L) |
 | MPS step Q4 wrong → flat logits | `step-q4-parity` gate (passes @ 30L) |
 | 24 GiB cap tight | q4 + `--skip-vision`; document `iogpu.wired_limit_mb` |

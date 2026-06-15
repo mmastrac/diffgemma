@@ -1149,3 +1149,99 @@ pub fn run_step_kv_mps_parity(
         pass,
     })
 }
+
+/// Compare monolithic b4 KV from encoder prefill with CPU MoE vs grouped GPU MoE (same dense path).
+pub fn run_encoder_moe_kv_parity(
+    model_dir: &Path,
+    token_ids: &[u32],
+    layers: usize,
+    max_seq: usize,
+    use_mps_q4: bool,
+) -> Result<(f32, usize, usize), Error> {
+    if token_ids.is_empty() {
+        return Err(Error::Format("encoder moe kv parity requires at least one token"));
+    }
+    let layers = layers.max(1).min(N_LAYERS);
+    let store = DgqStore::open(model_dir)?;
+    let layout = build_layout(&build_offsets_from_store(&store), max_seq);
+    let ctx = MetalContext::new()?;
+    let kv_bytes = kv_cache_total_bytes(&layout, max_seq) as usize;
+
+    let alloc_kv = || -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
+        ctx.device
+            .newBufferWithLength_options(kv_bytes, MTLResourceOptions::StorageModeShared)
+            .ok_or(Error::Format("encoder moe kv buffer alloc failed"))
+    };
+
+    let mut cpu_cache =
+        MonolithicEncoderCache::open_opt(model_dir, CANVAS, max_seq, None, Some(use_mps_q4))?;
+    cpu_cache.engine.set_encoder_gpu_moe(false);
+    let mut gpu_cache =
+        MonolithicEncoderCache::open_opt(model_dir, CANVAS, max_seq, None, Some(use_mps_q4))?;
+    gpu_cache.engine.set_encoder_gpu_moe(true);
+
+    let cpu_buf = alloc_kv()?;
+    let gpu_buf = alloc_kv()?;
+
+    let (cpu_kv_len, _) = prefill_monolithic_kv_with_cache(
+        &mut cpu_cache,
+        token_ids,
+        &cpu_buf,
+        &layout,
+        max_seq,
+        layers,
+    )?;
+    let (gpu_kv_len, _) = prefill_monolithic_kv_with_cache(
+        &mut gpu_cache,
+        token_ids,
+        &gpu_buf,
+        &layout,
+        max_seq,
+        layers,
+    )?;
+    if gpu_kv_len != cpu_kv_len {
+        return Err(Error::Format("cpu/gpu encoder moe prefill kv_len mismatch"));
+    }
+    let (max_diff, layer, pos) =
+        monolithic_kv_prefix_max_diff(&cpu_buf, &gpu_buf, &layout, cpu_kv_len, layers);
+    Ok((max_diff, layer, pos))
+}
+
+#[cfg(all(test, feature = "metal", target_os = "macos"))]
+mod encoder_moe_kv_tests {
+    use super::*;
+    use crate::chat_template::{format_chat_token_ids, ChatFormatOptions, ChatTurn};
+    use crate::tokenizer::Tokenizer;
+
+    fn calgary_prefill(model_dir: &Path) -> Vec<u32> {
+        let tok = Tokenizer::load(&model_dir.join("tokenizer.json")).expect("tokenizer");
+        format_chat_token_ids(
+            &tok,
+            &[ChatTurn::user(
+                "How can I get from Calgary to Namibia?",
+            )],
+            &ChatFormatOptions::default(),
+        )
+        .expect("prefill ids")
+    }
+
+    #[test]
+    fn encoder_moe_kv_matches_cpu_for_calgary_prompt() {
+        let dir = std::path::Path::new("/tmp/quantized-weights");
+        if !dir.join("model.dgq.json").exists() {
+            eprintln!("skip: /tmp/quantized-weights missing");
+            return;
+        }
+        let ids = calgary_prefill(dir);
+        assert_eq!(ids.len(), 22);
+        let (max_diff, layer, pos) =
+            run_encoder_moe_kv_parity(dir, &ids, 30, 512, false).expect("parity");
+        eprintln!(
+            "encoder moe kv parity (Calgary, 22 tok): max_diff={max_diff:.6} layer={layer} pos={pos}"
+        );
+        assert!(
+            max_diff < 0.02,
+            "cpu vs gpu encoder MoE KV diverged: {max_diff} @ L{layer} pos {pos}"
+        );
+    }
+}

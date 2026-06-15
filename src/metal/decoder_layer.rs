@@ -284,8 +284,8 @@ fn forward_layer_ff_dgq_gpu(
         eps,
     )?;
 
-    // Dense Q4 may use MPS matmul; router + MoE stay on the proven CPU path (GPU grouped
-    // MoE diverges from CPU MoE — breaks encoder KV parity when use_mps_q4=true).
+    // Dense Q4 may use MPS matmul; router stays CPU (small readback). MoE uses grouped GPU
+    // by default (`gemm_linear_grouped`); opt out with `DGQ_ENCODER_GPU_MOE=0`.
     scratch.dense_out.resize(len, 0.0);
     scratch.moe_input.resize(len, 0.0);
     batch.register_read(buf_ff.clone(), &mut scratch.dense_out);
@@ -323,26 +323,52 @@ fn forward_layer_ff_dgq_gpu(
     }
 
     if !jobs.is_empty() {
-        prepare_expert_input(
-            &mut scratch.normed,
-            &scratch.moe_input,
-            cached.pre_ff_norm_2.as_slice(),
-            seq_len,
-            hidden,
-            eps,
-        );
         scratch.moe_branch.resize(len, 0.0);
         scratch.moe_branch.fill(0.0);
-        experts_forward_dgq_cpu(
-            &mut scratch.moe_branch,
-            &scratch.normed,
-            expert_cache,
-            layer,
-            cfg,
-            seq_len,
-            &routes,
-            &mut scratch.cpu.moe,
-        )?;
+        if engine.encoder_gpu_moe() {
+            let telemetry = engine.batch_telemetry();
+            experts_forward_gpu_batched(
+                &mut scratch.moe_branch,
+                &scratch.moe_input,
+                cached.pre_ff_norm_2.as_slice(),
+                eps,
+                None,
+                expert_cache,
+                layer,
+                cfg,
+                seq_len,
+                &routes,
+                &mut scratch.moe_token_indices,
+                &mut scratch.moe_batch_out,
+                &engine.ctx,
+                &mut engine.pool,
+                &engine.kernels,
+                &engine.f32_bf16_linear_pipeline,
+                &engine.f32_q4_linear_pipeline,
+                &engine.f32_nvfp4_linear_pipeline,
+                &engine.f32_q4_linear_grouped_pipeline,
+                telemetry,
+            )?;
+        } else {
+            prepare_expert_input(
+                &mut scratch.normed,
+                &scratch.moe_input,
+                cached.pre_ff_norm_2.as_slice(),
+                seq_len,
+                hidden,
+                eps,
+            );
+            experts_forward_dgq_cpu(
+                &mut scratch.moe_branch,
+                &scratch.normed,
+                expert_cache,
+                layer,
+                cfg,
+                seq_len,
+                &routes,
+                &mut scratch.cpu.moe,
+            )?;
+        }
         batch = Some(begin_engine_batch(
             &engine.ctx.queue,
             &mut engine.pool,

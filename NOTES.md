@@ -206,7 +206,8 @@ Systematic check: for each kernel, find every dimension bounded by a tile consta
 | STOP-1 | Early stop fires on degenerate all-pad/filler stable argmax | done (P1.1) |
 | CONV-1 | ~1 accept/step; min_ent > 0.1 early, only ~5 positions H<0.1 late @ 30L q4 | P1.6 |
 | PREF-1 | Monolithic encoder prefill forced CPU MoE (`use_mps_q4=false`); ~98–155 s → native path ~31 s @ 14 tok | done (P1.8) |
-| KV-MPS-1 | MPS encoder Q4 prefill KV ≠ native → flat step logits @ 30L | done (P1.9–P1.10): dequant grid + CPU MoE hybrid |
+| PREF-2 | Encoder prefill CPU MoE bottleneck (~30–60 s @ 14–22 tok / 30L) | done (2026-06): **GPU grouped MoE default** (`gemm_linear_grouped`); ~1.4–2.7 s @ 14–22 tok / 30L; `DGQ_ENCODER_GPU_MOE=0` to opt out |
+| KV-MPS-1 | MPS encoder Q4 prefill KV ≠ native → flat step logits @ 30L | done (P1.9–P1.10): dequant grid fix; encoder MoE now GPU grouped (PREF-2) |
 | QUAL-1 | Templated chat + default --steps 2 -> no readable reply | done (P1.2) |
 | CLI-1 | `--steps` default 2 (parity) vs model-card up to 48 | P1.2 |
 | CHAT-1 | Display decodes full 256 block incl. pads | P1.4 |

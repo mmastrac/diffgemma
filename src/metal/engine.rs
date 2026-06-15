@@ -33,6 +33,8 @@ pub struct GpuDecoderEngine {
     pub mps_matmul: MpsMatmulCache,
     /// When false, `.dgq` q4 linears use the native Metal kernel instead of MPS (deterministic).
     use_mps_q4: Cell<bool>,
+    /// When true, encoder `.dgq` MoE uses grouped GPU GEMM (`DGQ_ENCODER_GPU_MOE=0` to opt out).
+    encoder_gpu_moe: Cell<bool>,
     pub kernels: GpuKernels,
     pub attention: GpuAttentionKernels,
     pub sampler_kernels: GpuSamplerKernels,
@@ -81,6 +83,7 @@ impl GpuDecoderEngine {
             )?;
         let mps_matmul = MpsMatmulCache::new(ctx.device.clone());
         let use_mps_q4 = Cell::new(mps_q4_default_from_env());
+        let encoder_gpu_moe = Cell::new(encoder_gpu_moe_from_env());
         let kernels = GpuKernels::new(&ctx)?;
         let attention = GpuAttentionKernels::new(&ctx)?;
         let sampler_kernels = GpuSamplerKernels::new(&ctx)?;
@@ -100,6 +103,7 @@ impl GpuDecoderEngine {
             dequant_nvfp4_matrix_pipeline,
             mps_matmul,
             use_mps_q4,
+            encoder_gpu_moe,
             kernels,
             attention,
             sampler_kernels,
@@ -157,6 +161,21 @@ impl GpuDecoderEngine {
 
     pub fn set_use_mps_q4(&self, enabled: bool) {
         self.use_mps_q4.set(enabled);
+    }
+
+    pub fn encoder_gpu_moe(&self) -> bool {
+        self.encoder_gpu_moe.get()
+    }
+
+    pub fn set_encoder_gpu_moe(&self, enabled: bool) {
+        self.encoder_gpu_moe.set(enabled);
+    }
+}
+
+fn encoder_gpu_moe_from_env() -> bool {
+    match std::env::var("DGQ_ENCODER_GPU_MOE") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
     }
 }
 
