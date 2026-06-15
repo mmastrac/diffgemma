@@ -1,5 +1,7 @@
 //! CPU twins for `shaders/include/dequant.metal` — single decode reference.
 
+use crate::dgq::layout::{nvfp4_row_bytes, NVFP4_HEADER_BYTES};
+use crate::dgq::nvfp4::nvfp4_weight_at;
 use crate::kernels::cpu::bf16_to_f32;
 
 /// Mirror of `dequant_q4_group` (32 floats from one 20-byte Q4 block).
@@ -40,6 +42,48 @@ pub fn q4_group_k_order_row(row_base: &[u8], k0: usize, _in_dim: usize) -> Vec<f
     out.extend_from_slice(&via_dequant);
     for m in 0..32 {
         out.push(q4_at_col(row_base, k0 + m));
+    }
+    out
+}
+
+/// CPU oracle for `nvfp4_tile_k_order` dump layout (64 floats).
+pub fn nvfp4_tile_k_order_matrix(
+    matrix: &[u8],
+    row: usize,
+    k0: usize,
+    k_dim: usize,
+) -> Vec<f32> {
+    let gscale = f32::from_le_bytes(
+        matrix[..NVFP4_HEADER_BYTES]
+            .try_into()
+            .expect("nvfp4 header"),
+    );
+    let body = &matrix[NVFP4_HEADER_BYTES..];
+    let row_stride = nvfp4_row_bytes(k_dim);
+    let row_base = &body[row * row_stride..(row + 1) * row_stride];
+    let data_len = (k_dim + 1) / 2;
+    let mut via_tile = [0.0f32; 32];
+    for g in 0..2 {
+        let g_idx = k0 / 16 + g;
+        let scale = {
+            let bits = row_base[data_len + g_idx];
+            crate::dgq::fp4::fp8_e4m3_to_f32(bits) * gscale
+        };
+        let packed = &row_base[g_idx * 8..g_idx * 8 + 8];
+        for i in 0..16 {
+            let byte = packed[i / 2];
+            let q = if i & 1 != 0 {
+                byte >> 4
+            } else {
+                byte & 0x0f
+            };
+            via_tile[g * 16 + i] = crate::dgq::fp4::e2m1_to_f32(q) * scale;
+        }
+    }
+    let mut out = Vec::with_capacity(64);
+    out.extend_from_slice(&via_tile);
+    for m in 0..32 {
+        out.push(nvfp4_weight_at(body, row, k0 + m, k_dim, gscale));
     }
     out
 }

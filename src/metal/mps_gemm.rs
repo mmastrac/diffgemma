@@ -108,7 +108,11 @@ pub fn dispatch_dequant_block_matrix(
     let (buf_w, off) = q4.weight_buffer();
     encoder.setComputePipelineState(&pipeline.pipeline);
     unsafe {
-        encoder.setBuffer_offset_atIndex(Some(buf_w), off as usize, 0);
+        encoder.setBuffer_offset_atIndex(
+            Some(buf_w),
+            crate::dgq::layout::blob_offset_for_mtl(off),
+            0,
+        );
         encoder.setBuffer_offset_atIndex(Some(buf_out), 0, 1);
     }
     let groups_per_row = if q4.is_nvfp4() {

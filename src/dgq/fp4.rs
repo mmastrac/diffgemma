@@ -50,14 +50,17 @@ pub fn e2m1_from_f32(x: f32) -> u8 {
 
 /// FP8 E4M3 (PyTorch e4m3fn) → f32 (matches MLX `fp8_e4m3` operator float).
 pub fn fp8_e4m3_to_f32(bits: u8) -> f32 {
-    let v = ((bits & 127) as u16) << 7;
-    let half = f16_bits_to_f32(v);
-    let converted = half * 256.0;
-    if bits & 128 != 0 {
-        -converted
+    let s = (bits >> 7) & 1;
+    let e = (bits >> 3) & 0xF;
+    let m = bits & 0x7;
+    let val = if e == 0 {
+        (m as f32) * 2f32.powi(-9)
+    } else if e == 15 && m == 7 {
+        f32::NAN
     } else {
-        converted
-    }
+        (1.0 + (m as f32) * 0.125) * 2f32.powi(e as i32 - 7)
+    };
+    if s != 0 { -val } else { val }
 }
 
 /// f32 → FP8 E4M3 (PyTorch e4m3fn, matches MLX `fp8_e4m3` constructor).
@@ -82,31 +85,6 @@ pub fn fp8_e4m3_from_f32(f: f32) -> u8 {
     bits | ((sign >> 24) as u8)
 }
 
-fn f16_bits_to_f32(bits: u16) -> f32 {
-    let sign = ((bits >> 15) & 1) as u32;
-    let exp = ((bits >> 10) & 0x1f) as u32;
-    let mant = (bits & 0x3ff) as u32;
-    if exp == 0 {
-        if mant == 0 {
-            return if sign == 1 { -0.0 } else { 0.0 };
-        }
-        let val = (mant as f32) * 2f32.powi(-24);
-        return if sign == 1 { -val } else { val };
-    }
-    if exp == 0x1f {
-        return if mant == 0 {
-            if sign == 1 {
-                f32::NEG_INFINITY
-            } else {
-                f32::INFINITY
-            }
-        } else {
-            f32::NAN
-        };
-    }
-    f32::from_bits((sign << 31) | ((exp + 112) << 23) | (mant << 13))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +104,74 @@ mod tests {
             assert!((e2m1_to_f32(bits) - val).abs() < 1e-6, "bits={bits}");
             assert_eq!(e2m1_from_f32(val), bits);
             assert_eq!(e2m1_from_f32(-val), bits | 0x8);
+        }
+    }
+
+    #[test]
+    fn fp8_e4m3_encoder_known_table() {
+        let table: &[(f32, u8)] = &[
+            (0.0, 0x00),
+            (1.0 / 512.0, 0x01),
+            (1.0 / 64.0, 0x08),
+            (0.25, 0x28),
+            (0.5, 0x30),
+            (1.0, 0x38),
+            (1.5, 0x3C),
+            (2.0, 0x40),
+            (8.0, 0x50),
+            (448.0, 0x7E),
+        ];
+        for &(value, expected_bits) in table {
+            let got = fp8_e4m3_from_f32(value);
+            assert_eq!(
+                got, expected_bits,
+                "encode({value}): got 0x{got:02X} expected 0x{expected_bits:02X}"
+            );
+            assert!(
+                (fp8_e4m3_to_f32(got) - value).abs() < 1e-3 * value.abs().max(1e-6),
+                "encode/decode roundtrip for {value}: got {}",
+                fp8_e4m3_to_f32(got)
+            );
+        }
+    }
+
+    #[test]
+    fn fp8_e4m3_known_table() {
+        let table: &[(u8, f32)] = &[
+            (0x00, 0.0),
+            (0x01, 2f32.powi(-9)),
+            (0x08, 2f32.powi(-6)),
+            (0x38, 1.0),
+            (0x3C, 1.5),
+            (0x40, 2.0),
+            (0x7E, 448.0),
+        ];
+        for &(bits, expected) in table {
+            let got = fp8_e4m3_to_f32(bits);
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "0x{bits:02X}: got {got} expected {expected}"
+            );
+        }
+        assert!(fp8_e4m3_to_f32(0x7F).is_nan());
+    }
+
+    #[test]
+    fn fp8_e4m3_roundtrip_non_nan() {
+        for bits in 0u8..=0x7E {
+            if bits == 0x7F {
+                continue;
+            }
+            let decoded = fp8_e4m3_to_f32(bits);
+            if decoded.is_nan() || decoded == 0.0 {
+                continue;
+            }
+            let reenc = fp8_e4m3_from_f32(decoded);
+            let again = fp8_e4m3_to_f32(reenc);
+            assert!(
+                (again - decoded).abs() < 0.02 * decoded.abs().max(1e-3),
+                "bits=0x{bits:02X} decoded={decoded} reenc=0x{reenc:02X} again={again}"
+            );
         }
     }
 

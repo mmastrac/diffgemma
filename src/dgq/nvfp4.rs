@@ -124,10 +124,21 @@ pub fn dequant_matrix_nvfp4(
 
 /// Quantize `[out, in]` f32 matrix; `dst` includes 4-byte global scale prefix (written as 1.0).
 pub fn quantize_f32_matrix_nvfp4(src: &[f32], out_dim: usize, in_dim: usize, dst: &mut [u8]) {
+    quantize_f32_matrix_nvfp4_with_scale(src, out_dim, in_dim, dst, 1.0);
+}
+
+/// Quantize `[out, in]` f32 matrix with an explicit per-tensor FP32 global scale prefix.
+pub fn quantize_f32_matrix_nvfp4_with_scale(
+    src: &[f32],
+    out_dim: usize,
+    in_dim: usize,
+    dst: &mut [u8],
+    global_scale: f32,
+) {
     let need = nvfp4_matrix_bytes(out_dim, in_dim);
     assert_eq!(dst.len(), need);
     assert_eq!(src.len(), out_dim * in_dim);
-    write_f32_le(&mut dst[..NVFP4_HEADER_BYTES], 1.0);
+    write_f32_le(&mut dst[..NVFP4_HEADER_BYTES], global_scale);
     let body = &mut dst[NVFP4_HEADER_BYTES..];
     let row_bytes = nvfp4_row_bytes(in_dim);
     for row in 0..out_dim {
@@ -135,7 +146,7 @@ pub fn quantize_f32_matrix_nvfp4(src: &[f32], out_dim: usize, in_dim: usize, dst
             &src[row * in_dim..(row + 1) * in_dim],
             in_dim,
             &mut body[row * row_bytes..],
-            1.0,
+            global_scale,
         );
     }
 }

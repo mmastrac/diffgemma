@@ -72,6 +72,10 @@ pub fn tiny_fixture_nvfp4(_: ElemFormat) -> Fixture {
     matrix_fixture(QuantFormat::NvFp4, 8, 64)
 }
 
+pub fn wide_fixture_nvfp4(_: ElemFormat) -> Fixture {
+    matrix_fixture(QuantFormat::NvFp4, 16, 128)
+}
+
 fn matrix_fixture(format: QuantFormat, n: usize, k: usize) -> Fixture {
     let w_f32: Vec<f32> = (0..n * k)
         .map(|i| ((i as f32) * 0.011).sin() * 0.15)
@@ -235,6 +239,18 @@ mod tests {
         cpu_oracle = crate::kernels::sub::dequant_block_matrix::cpu_oracle,
         gpu = crate::kernels::sub::dequant_block_matrix::gpu_nvfp4,
         fixture = crate::kernels::sub::dequant_block_matrix::tiny_fixture_nvfp4,
+        out_len = crate::kernels::sub::dequant_block_matrix::fixture_len,
+        formats: [F32],
+        max_tol = 1e-4,
+        min_cos = 0.9999,
+    }
+
+    kernel_oracle_matrix! {
+        mod wide_nvfp4,
+        cpu = crate::kernels::sub::dequant_block_matrix::cpu,
+        cpu_oracle = crate::kernels::sub::dequant_block_matrix::cpu_oracle,
+        gpu = crate::kernels::sub::dequant_block_matrix::gpu_nvfp4,
+        fixture = crate::kernels::sub::dequant_block_matrix::wide_fixture_nvfp4,
         out_len = crate::kernels::sub::dequant_block_matrix::fixture_len,
         formats: [F32],
         max_tol = 1e-4,

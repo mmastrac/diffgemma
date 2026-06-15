@@ -211,6 +211,18 @@ pub static MANIFEST: Manifest = Manifest {
             variants: KernelVariants::Elementwise,
         },
         KernelSpec {
+            name: "fp8_e4m3_table",
+            entry: "fp8_e4m3_table",
+            quant_formats: &[QuantFormat::Q4Affine],
+            variants: KernelVariants::Elementwise,
+        },
+        KernelSpec {
+            name: "nvfp4_tile_k_order",
+            entry: "nvfp4_tile_k_order",
+            quant_formats: &[QuantFormat::Q4Affine],
+            variants: KernelVariants::Elementwise,
+        },
+        KernelSpec {
             name: "dequant_block_matrix",
             entry: "dequant_block_matrix",
             quant_formats: &[QuantFormat::Q4Affine, QuantFormat::NvFp4],

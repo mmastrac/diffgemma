@@ -6,7 +6,7 @@ use super::variant::KernelVariant;
 use super::QuantFormat;
 use crate::dgq::block::quantize_row_q4;
 use crate::dgq::layout::{nvfp4_matrix_bytes, q4_matrix_bytes, q4_row_bytes};
-use crate::dgq::nvfp4::quantize_f32_matrix_nvfp4;
+use crate::dgq::nvfp4::quantize_f32_matrix_nvfp4_with_scale;
 use crate::kernels::cpu::gemm_linear_f32::gemm_linear_f32_cpu;
 use crate::safetensors::Error;
 
@@ -24,6 +24,7 @@ pub struct Fixture {
     pub n: usize,
     pub k: usize,
     pub format: QuantFormat,
+    pub global_scale: f32,
 }
 
 impl Fixture {
@@ -35,7 +36,13 @@ impl Fixture {
         match self.format {
             QuantFormat::NvFp4 => {
                 let mut dst = vec![0u8; nvfp4_matrix_bytes(self.n, self.k)];
-                quantize_f32_matrix_nvfp4(&self.w_f32, self.n, self.k, &mut dst);
+                quantize_f32_matrix_nvfp4_with_scale(
+                    &self.w_f32,
+                    self.n,
+                    self.k,
+                    &mut dst,
+                    self.global_scale,
+                );
                 dst
             }
             _ => {
@@ -85,6 +92,7 @@ fn matrix_fixture(format: QuantFormat, m: usize, n: usize, k: usize) -> Fixture 
         n,
         k,
         format,
+        global_scale: 1.0,
     }
 }
 

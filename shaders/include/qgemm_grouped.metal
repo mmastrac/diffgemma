@@ -31,11 +31,10 @@ inline float dot_nvfp4_k32(
     float gscale
 ) {
     uint data_len = (k_dim + 1u) / 2u;
-    half gscale_h = half(gscale);
     uint g0 = k0 / 16u;
     uint g1 = g0 + 1u;
-    half scale0 = fp8_e4m3_to_half(row[data_len + g0]) * gscale_h;
-    half scale1 = fp8_e4m3_to_half(row[data_len + g1]) * gscale_h;
+    float scale0 = fp8_e4m3_to_f32(row[data_len + g0]) * gscale;
+    float scale1 = fp8_e4m3_to_f32(row[data_len + g1]) * gscale;
     device const uchar *packed0 = row + g0 * 8u;
     device const uchar *packed1 = row + g1 * 8u;
     float sum = 0.0f;
@@ -43,11 +42,11 @@ inline float dot_nvfp4_k32(
     for (uint i = 0; i < n; ++i) {
         uint local = i & 15u;
         bool upper = (i >= 16u);
-        half scale = upper ? scale1 : scale0;
+        float scale = upper ? scale1 : scale0;
         device const uchar *packed = upper ? packed1 : packed0;
         uchar byte = packed[local / 2u];
         uint q = (local & 1u) ? uint(byte >> 4) : uint(byte & 0x0Fu);
-        sum = fma(a_row[k0 + i], float(e2m1_to_half(q) * scale), sum);
+        sum = fma(a_row[k0 + i], e2m1_to_f32(q) * scale, sum);
     }
     return sum;
 }
@@ -60,11 +59,10 @@ inline float dot_nvfp4_k32_half(
     float gscale
 ) {
     uint data_len = (k_dim + 1u) / 2u;
-    half gscale_h = half(gscale);
     uint g0 = k0 / 16u;
     uint g1 = g0 + 1u;
-    half scale0 = fp8_e4m3_to_half(row[data_len + g0]) * gscale_h;
-    half scale1 = fp8_e4m3_to_half(row[data_len + g1]) * gscale_h;
+    float scale0 = fp8_e4m3_to_f32(row[data_len + g0]) * gscale;
+    float scale1 = fp8_e4m3_to_f32(row[data_len + g1]) * gscale;
     device const uchar *packed0 = row + g0 * 8u;
     device const uchar *packed1 = row + g1 * 8u;
     float sum = 0.0f;
@@ -72,11 +70,11 @@ inline float dot_nvfp4_k32_half(
     for (uint i = 0; i < n; ++i) {
         uint local = i & 15u;
         bool upper = (i >= 16u);
-        half scale = upper ? scale1 : scale0;
+        float scale = upper ? scale1 : scale0;
         device const uchar *packed = upper ? packed1 : packed0;
         uchar byte = packed[local / 2u];
         uint q = (local & 1u) ? uint(byte >> 4) : uint(byte & 0x0Fu);
-        sum = fma(float(a_row[k0 + i]), float(e2m1_to_half(q) * scale), sum);
+        sum = fma(float(a_row[k0 + i]), e2m1_to_f32(q) * scale, sum);
     }
     return sum;
 }
@@ -89,11 +87,10 @@ inline float dot_nvfp4_k32_act(
     float gscale
 ) {
     uint data_len = (k_dim + 1u) / 2u;
-    half gscale_h = half(gscale);
     uint g0 = k0 / 16u;
     uint g1 = g0 + 1u;
-    half scale0 = fp8_e4m3_to_half(row[data_len + g0]) * gscale_h;
-    half scale1 = fp8_e4m3_to_half(row[data_len + g1]) * gscale_h;
+    float scale0 = fp8_e4m3_to_f32(row[data_len + g0]) * gscale;
+    float scale1 = fp8_e4m3_to_f32(row[data_len + g1]) * gscale;
     device const uchar *packed0 = row + g0 * 8u;
     device const uchar *packed1 = row + g1 * 8u;
     float sum = 0.0f;
@@ -101,11 +98,11 @@ inline float dot_nvfp4_k32_act(
     for (uint i = 0; i < n; ++i) {
         uint local = i & 15u;
         bool upper = (i >= 16u);
-        half scale = upper ? scale1 : scale0;
+        float scale = upper ? scale1 : scale0;
         device const uchar *packed = upper ? packed1 : packed0;
         uchar byte = packed[local / 2u];
         uint q = (local & 1u) ? uint(byte >> 4) : uint(byte & 0x0Fu);
-        sum = fma(a_row[k0 + i], float(e2m1_to_half(q) * scale), sum);
+        sum = fma(a_row[k0 + i], e2m1_to_f32(q) * scale, sum);
     }
     return sum;
 }

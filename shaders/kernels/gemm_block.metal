@@ -25,11 +25,11 @@ kernel void gemm_block(
     simdgroup_float8x8 acc0(0.f), acc1(0.f), acc2(0.f), acc3(0.f);
 
     const bool is_nvfp4 = (K_QUANT_FORMAT == QUANT_NVFP4);
-    half gscale_h = half(0);
+    float gscale = 0.f;
     ulong body = w_off;
     ulong rowB = 0ul;
     if (is_nvfp4) {
-        gscale_h = half(as_type<float>(*(device const uint *)(blob + w_off)));
+        gscale = as_type<float>(*(device const uint *)(blob + w_off));
         body = w_off + 4ul;
         rowB = nvfp4_row_bytes(K);
     } else {
@@ -44,7 +44,7 @@ kernel void gemm_block(
         for (uint r = ltid; r < 32; r += 128) {
             if (is_nvfp4) {
                 device const uchar *row = blob + body + (ulong)(n0 + r) * rowB;
-                dequant_nvfp4_tile_half_fused_tg(row, K, k0, &tw[r][0], gscale_h);
+                dequant_nvfp4_tile_half_fused_tg(row, K, k0, &tw[r][0], gscale);
             } else {
                 dequant_q4_group_half_tg(
                     blob + body + (ulong)(n0 + r) * rowB + (ulong)(k0 / 32) * 20ul,

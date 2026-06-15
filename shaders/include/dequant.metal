@@ -68,30 +68,19 @@ inline float q8_at(device const uchar *row_base, uint col, float s) {
 // ---- NVFP4 ----
 // nvfp4_block: [f32 global_scale:4] + per row [data:ceil(K/2)][scales:ceil(K/16)]
 
-inline float fp16_bits_to_f32(ushort bits) {
-    uint sign = (bits >> 15) & 1u;
-    uint exp = (bits >> 10) & 0x1fu;
-    uint mant = bits & 0x3ffu;
-    if (exp == 0u) {
-        if (mant == 0u) {
-            return sign ? -0.0f : 0.0f;
-        }
-        return (sign ? -1.0f : 1.0f) * float(mant) * exp2(-24.0f);
-    }
-    if (exp == 0x1fu) {
-        if (mant == 0u) {
-            return sign ? -INFINITY : INFINITY;
-        }
-        return NAN;
-    }
-    uint f32_bits = (sign << 31) | ((exp + 112u) << 23) | (mant << 13);
-    return as_type<float>(f32_bits);
-}
-
 inline float fp8_e4m3_to_f32(uchar b) {
-    ushort v = ushort(b & 127u) << 7;
-    float converted = fp16_bits_to_f32(v) * 256.0f;
-    return (b & 128u) ? -converted : converted;
+    uint s = (b >> 7) & 1u;
+    uint e = (b >> 3) & 0xFu;
+    uint m = b & 0x7u;
+    float val;
+    if (e == 0u) {
+        val = float(m) * exp2(-9.0f);
+    } else if (e == 15u && m == 7u) {
+        val = NAN;
+    } else {
+        val = (1.0f + float(m) * 0.125f) * exp2(float(int(e) - 7));
+    }
+    return s ? -val : val;
 }
 
 inline float e2m1_to_f32(uint q) {
@@ -119,9 +108,7 @@ inline half e2m1_to_half(uint q) {
 }
 
 inline half fp8_e4m3_to_half(uchar b) {
-    ushort v = ushort(b & 127u) << 7;
-    half converted = half(fp16_bits_to_f32(v)) * half(256.0);
-    return (b & 128u) ? -converted : converted;
+    return half(fp8_e4m3_to_f32(b));
 }
 
 inline ulong nvfp4_row_bytes(uint K) {
@@ -145,14 +132,14 @@ inline void dequant_nvfp4_group(device const uchar *row, uint K, uint g,
 }
 
 inline void dequant_nvfp4_group_half(device const uchar *row, uint K, uint g,
-                                     thread half *out16, half gscale_h) {
+                                     thread half *out16, float gscale) {
     uint data_len = (K + 1u) / 2u;
-    half scale = fp8_e4m3_to_half(row[data_len + g]) * gscale_h;
+    float scale = fp8_e4m3_to_f32(row[data_len + g]) * gscale;
     device const uchar *packed = row + g * 8u;
     for (uint i = 0; i < 16u; ++i) {
         uchar byte = packed[i / 2u];
         uint q = (i & 1u) ? uint(byte >> 4) : uint(byte & 0x0Fu);
-        out16[i] = e2m1_to_half(q) * scale;
+        out16[i] = half(e2m1_to_f32(q) * scale);
     }
 }
 
@@ -163,47 +150,47 @@ inline void dequant_nvfp4_tile(device const uchar *row, uint K, uint k0,
 }
 
 inline void dequant_nvfp4_tile_half(device const uchar *row, uint K, uint k0,
-                                    thread half *out32, half gscale_h) {
-    dequant_nvfp4_group_half(row, K, k0 / 16u, out32, gscale_h);
-    dequant_nvfp4_group_half(row, K, k0 / 16u + 1u, out32 + 16, gscale_h);
+                                    thread half *out32, float gscale) {
+    dequant_nvfp4_group_half(row, K, k0 / 16u, out32, gscale);
+    dequant_nvfp4_group_half(row, K, k0 / 16u + 1u, out32 + 16, gscale);
 }
 
 /// Fused 32-wide NVFP4 tile: two group scales decoded once, direct half output.
 inline void dequant_nvfp4_tile_half_fused(device const uchar *row, uint K, uint k0,
-                                          thread half *out32, half gscale_h) {
+                                          thread half *out32, float gscale) {
     uint data_len = (K + 1u) / 2u;
     uint g0 = k0 / 16u;
     uint g1 = g0 + 1u;
-    half scale0 = fp8_e4m3_to_half(row[data_len + g0]) * gscale_h;
-    half scale1 = fp8_e4m3_to_half(row[data_len + g1]) * gscale_h;
+    float scale0 = fp8_e4m3_to_f32(row[data_len + g0]) * gscale;
+    float scale1 = fp8_e4m3_to_f32(row[data_len + g1]) * gscale;
     device const uchar *packed0 = row + g0 * 8u;
     device const uchar *packed1 = row + g1 * 8u;
     for (uint i = 0; i < 16u; ++i) {
         uchar byte = packed0[i / 2u];
         uint q = (i & 1u) ? uint(byte >> 4) : uint(byte & 0x0Fu);
-        out32[i] = e2m1_to_half(q) * scale0;
+        out32[i] = half(e2m1_to_f32(q) * scale0);
         byte = packed1[i / 2u];
         q = (i & 1u) ? uint(byte >> 4) : uint(byte & 0x0Fu);
-        out32[16u + i] = e2m1_to_half(q) * scale1;
+        out32[16u + i] = half(e2m1_to_f32(q) * scale1);
     }
 }
 
 inline void dequant_nvfp4_tile_half_fused_tg(device const uchar *row, uint K, uint k0,
-                                             threadgroup half *out32, half gscale_h) {
+                                             threadgroup half *out32, float gscale) {
     uint data_len = (K + 1u) / 2u;
     uint g0 = k0 / 16u;
     uint g1 = g0 + 1u;
-    half scale0 = fp8_e4m3_to_half(row[data_len + g0]) * gscale_h;
-    half scale1 = fp8_e4m3_to_half(row[data_len + g1]) * gscale_h;
+    float scale0 = fp8_e4m3_to_f32(row[data_len + g0]) * gscale;
+    float scale1 = fp8_e4m3_to_f32(row[data_len + g1]) * gscale;
     device const uchar *packed0 = row + g0 * 8u;
     device const uchar *packed1 = row + g1 * 8u;
     for (uint i = 0; i < 16u; ++i) {
         uchar byte = packed0[i / 2u];
         uint q = (i & 1u) ? uint(byte >> 4) : uint(byte & 0x0Fu);
-        out32[i] = e2m1_to_half(q) * scale0;
+        out32[i] = half(e2m1_to_f32(q) * scale0);
         byte = packed1[i / 2u];
         q = (i & 1u) ? uint(byte >> 4) : uint(byte & 0x0Fu);
-        out32[16u + i] = e2m1_to_half(q) * scale1;
+        out32[16u + i] = half(e2m1_to_f32(q) * scale1);
     }
 }
 
