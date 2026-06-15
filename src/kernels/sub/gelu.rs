@@ -52,7 +52,7 @@ pub fn cpu_oracle(fix: &Fixture) -> Vec<f32> {
 pub fn gpu(fix: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
-    use objc2::runtime::ProtocolObject;
+    
     use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize};
 
     let ctx = MetalContext::new()?;

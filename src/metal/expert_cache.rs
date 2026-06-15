@@ -191,40 +191,6 @@ impl ExpertLruCache {
         self.touch(layer, expert);
     }
 
-    fn with_gate_up<R>(
-        &mut self,
-        layer: usize,
-        gate_up: Bf16Slice<'_>,
-        down: Bf16Slice<'_>,
-        expert: usize,
-        device: &ProtocolObject<dyn MTLDevice>,
-        pool: &mut BufferPool,
-        f: impl FnOnce(&ProtocolObject<dyn MTLBuffer>) -> R,
-    ) -> R {
-        self.ensure_expert_weights(layer, gate_up, down, expert, device, pool);
-        let buf = self.layers[layer].gate_up[expert]
-            .as_ref()
-            .expect("expert gate_up");
-        f(buf)
-    }
-
-    fn with_down<R>(
-        &mut self,
-        layer: usize,
-        gate_up: Bf16Slice<'_>,
-        down: Bf16Slice<'_>,
-        expert: usize,
-        device: &ProtocolObject<dyn MTLDevice>,
-        pool: &mut BufferPool,
-        f: impl FnOnce(&ProtocolObject<dyn MTLBuffer>) -> R,
-    ) -> R {
-        self.ensure_expert_weights(layer, gate_up, down, expert, device, pool);
-        let buf = self.layers[layer].down[expert]
-            .as_ref()
-            .expect("expert down");
-        f(buf)
-    }
-
     fn resident_bytes(&self) -> u64 {
         self.used_bytes
     }
@@ -247,34 +213,6 @@ impl ExpertWeightCache {
 
     pub fn resident_bytes(&self) -> u64 {
         self.inner.resident_bytes()
-    }
-
-    pub fn with_expert_gate_up_buf<R>(
-        &mut self,
-        layer: usize,
-        gate_up: Bf16Slice<'_>,
-        down: Bf16Slice<'_>,
-        expert: usize,
-        device: &ProtocolObject<dyn MTLDevice>,
-        pool: &mut BufferPool,
-        f: impl FnOnce(&ProtocolObject<dyn MTLBuffer>) -> R,
-    ) -> R {
-        self.inner
-            .with_gate_up(layer, gate_up, down, expert, device, pool, f)
-    }
-
-    pub fn with_expert_down_buf<R>(
-        &mut self,
-        layer: usize,
-        gate_up: Bf16Slice<'_>,
-        down: Bf16Slice<'_>,
-        expert: usize,
-        device: &ProtocolObject<dyn MTLDevice>,
-        pool: &mut BufferPool,
-        f: impl FnOnce(&ProtocolObject<dyn MTLBuffer>) -> R,
-    ) -> R {
-        self.inner
-            .with_down(layer, gate_up, down, expert, device, pool, f)
     }
 
     pub fn prefetch_expert(

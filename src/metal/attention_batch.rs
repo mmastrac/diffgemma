@@ -198,34 +198,6 @@ pub fn decoder_gqa_gpu_kv_batched_chained(
     .ok_or(Error::Format("gqa gpu kv missing output buffer"))
 }
 
-pub fn gqa_batched(
-    batch: &mut GpuBatch<'_>,
-    kernels: &GpuAttentionKernels,
-    attn_out: &mut [f32],
-    q: &[f32],
-    k: &[f32],
-    v: &[f32],
-    seq_len: usize,
-    total_kv: usize,
-    params: &AttentionParams,
-    mask: GqaMask<'_>,
-) -> Result<(), Error> {
-    gqa_batched_inner(
-        batch,
-        kernels,
-        Some(attn_out),
-        q,
-        Some((k, v)),
-        None,
-        seq_len,
-        total_kv,
-        params,
-        mask,
-        None,
-    )?;
-    Ok(())
-}
-
 pub fn gqa_batched_chained(
     batch: &mut GpuBatch<'_>,
     kernels: &GpuAttentionKernels,
@@ -251,35 +223,6 @@ pub fn gqa_batched_chained(
         None,
     )?
     .ok_or(Error::Format("gqa missing output buffer"))
-}
-
-/// GQA with K/V already resident in GPU buffers (`k_buf`/`v_buf` hold prefix+canvas).
-pub fn gqa_batched_gpu_kv(
-    batch: &mut GpuBatch<'_>,
-    kernels: &GpuAttentionKernels,
-    attn_out: &mut [f32],
-    q: &[f32],
-    k_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
-    v_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
-    seq_len: usize,
-    total_kv: usize,
-    params: &AttentionParams,
-    mask: GqaMask<'_>,
-) -> Result<(), Error> {
-    gqa_batched_inner(
-        batch,
-        kernels,
-        Some(attn_out),
-        q,
-        None,
-        Some((k_buf, v_buf)),
-        seq_len,
-        total_kv,
-        params,
-        mask,
-        None,
-    )?;
-    Ok(())
 }
 
 fn gqa_batched_inner(
@@ -552,7 +495,7 @@ mod prefill_attn_tests {
 
         let kernels = GpuAttentionKernels::new(&ctx).expect("attn kernels");
         let mut pool = BufferPool::new();
-        let mut batch = GpuBatch::begin(&ctx.queue, &mut pool, &ctx.device).expect("batch");
+        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None).expect("batch");
         let mut gpu_out = vec![0.0f32; q_dim];
         decoder_gqa_gpu_kv_batched(
             &mut batch,

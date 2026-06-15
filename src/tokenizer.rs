@@ -38,7 +38,6 @@ struct Symbol {
     byte_len: usize,
 }
 
-#[allow(dead_code)]
 pub struct Tokenizer {
     vocab: HashMap<String, u32>,
     special_tokens: HashMap<String, u32>,
@@ -109,24 +108,9 @@ impl Tokenizer {
         self.special_tokens.get(token).copied()
     }
 
-    pub fn bos_token_id(&self) -> Option<u32> {
-        self.special_token_id("<bos>")
-    }
-
     /// Append BPE-encoded text (no added-token splitting).
     pub fn encode_append(&self, out: &mut Vec<u32>, text: &str) {
         out.extend(self.encode(text, false));
-    }
-
-    pub fn vocab_size(&self) -> usize {
-        self.vocab.len()
-    }
-
-    pub fn token_to_id(&self, token: &str) -> Option<u32> {
-        self.special_tokens
-            .get(token)
-            .copied()
-            .or_else(|| self.vocab.get(token).copied())
     }
 
     pub fn id_to_token(&self, id: u32) -> Option<&str> {

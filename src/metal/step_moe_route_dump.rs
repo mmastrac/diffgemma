@@ -1,7 +1,7 @@
 //! MoE router bucketing state on the fused denoise path.
 
 use crate::metal::step_kernel::{
-    run_step_moe_route_capture, StepSmokeConfig, CANVAS, HID, N_EXPERTS, TOP_K,
+    run_step_moe_route_capture, StepSmokeConfig, CANVAS, HID, N_EXPERTS,
 };
 use crate::safetensors::Error;
 use serde::Serialize;
@@ -143,7 +143,10 @@ pub fn print_route_summary(dump: &StepMoeRouteDump) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metal::step_kernel::{hello_chat_prefill_token_ids, StepFinishMode, StepSmokeConfig};
+    use crate::metal::TOP_K;
+    use crate::metal::step_kernel::{
+        hello_chat_prefill_token_ids, StepFinishMode, StepSmokeConfig,
+    };
 
     #[test]
     fn moe_route_denoise_layer0_q4() {

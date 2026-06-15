@@ -124,6 +124,7 @@ fn dequant_raw_tensor(src: &[u8], shape: &[i64], dst: &mut [f32]) -> Result<(), 
 }
 
 /// Max abs error vs bf16 reference for a 2-D Q4 matrix.
+#[cfg(test)]
 pub fn q4_max_abs_error_vs_bf16(src_bf16: &[u8], out_dim: usize, in_dim: usize) -> f32 {
     let mut q = vec![0u8; q4_matrix_bytes(out_dim, in_dim)];
     crate::dgq::block::quantize_bf16_matrix_q4(src_bf16, out_dim, in_dim, &mut q);

@@ -239,6 +239,7 @@ pub fn accept_mask_from_entropies(entropies: &[f32], entropy_bound: f32) -> Vec<
     mask
 }
 
+#[cfg(test)]
 pub fn accept_count_from_entropies(entropies: &[f32], entropy_bound: f32) -> usize {
     accept_mask_from_entropies(entropies, entropy_bound)
         .iter()

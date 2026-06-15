@@ -1,16 +1,14 @@
 //! Elementwise kernels encoded into a shared `GpuBatch`.
 
-use crate::fast_slice::FastSlice;
 use crate::kernels::sub::{
-    gather_rows, gelu, rms_norm_rows, router_scale_rows,
-    softmax_rows, swiglu, vec_add_inplace, vec_scale_inplace,
+    gather_rows, gelu, rms_norm_rows, router_scale_rows, swiglu, vec_add_inplace,
 };
 use crate::metal::batch::GpuBatch;
 use crate::metal::kernels::GpuKernels;
 use crate::safetensors::Error;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder, MTLComputePipelineState};
+use objc2_metal::{MTLBuffer, MTLComputePipelineState};
 
 pub fn rms_norm_rows(
     batch: &mut GpuBatch<'_>,
@@ -158,40 +156,6 @@ pub fn gelu_swiglu_gate_up_gpu(
     Ok(buf_o)
 }
 
-pub fn f32_bf16_gemm_gpu_out(
-    batch: &mut GpuBatch<'_>,
-    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
-    a: &[f32],
-    b: FastSlice<'_, u16>,
-    m: usize,
-    k: usize,
-    n: usize,
-) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
-    if a.len() != m * k || b.len() != k * n {
-        return Err(Error::Format("f32_bf16 gemm shape mismatch"));
-    }
-    let buf_a = batch.alloc_f32(a)?;
-    f32_bf16_gemm_gpu_in_out(batch, pipeline, &buf_a, b, m, k, n)
-}
-
-pub fn f32_bf16_gemm_gpu_in_out(
-    batch: &mut GpuBatch<'_>,
-    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
-    a_buf: &ProtocolObject<dyn MTLBuffer>,
-    b: FastSlice<'_, u16>,
-    m: usize,
-    k: usize,
-    n: usize,
-) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
-    if b.len() != k * n {
-        return Err(Error::Format("f32_bf16 gemm shape mismatch"));
-    }
-    let buf_b = batch.alloc_bf16_fast(b)?;
-    let buf_c = batch.alloc_f32_out(m * n)?;
-    batch.dispatch_gemm(pipeline, a_buf, &buf_b, &buf_c, m, n, k);
-    Ok(buf_c)
-}
-
 /// `C = A @ W^T` with f32 weights already on GPU (router proj).
 pub fn f32_f32_linear_gpu_bufs(
     batch: &mut GpuBatch<'_>,
@@ -296,42 +260,6 @@ pub fn vec_add_gpu_bufs(
     Ok(())
 }
 
-pub fn vec_add_inplace(
-    batch: &mut GpuBatch<'_>,
-    kernels: &GpuKernels,
-    out: &mut [f32],
-    addend: &[f32],
-) -> Result<(), Error> {
-    if out.len() != addend.len() {
-        return Err(Error::Format("vec_add shape mismatch"));
-    }
-    let buf_o = batch.alloc_f32(out)?;
-    let buf_a = batch.alloc_f32(addend)?;
-    let len = out.len() as u32;
-    let buf_dump = batch.alloc_f32_out(1)?;
-    batch.dispatch_1d(&kernels.vec_add.pipeline, out.len(), |enc| {
-        vec_add_inplace::bind_gpu_buffers(&enc, &buf_o, &buf_a, &buf_dump, len);
-    });
-    batch.register_read(buf_o, out);
-    Ok(())
-}
-
-pub fn vec_scale_inplace(
-    batch: &mut GpuBatch<'_>,
-    kernels: &GpuKernels,
-    x: &mut [f32],
-    scale: f32,
-) -> Result<(), Error> {
-    let buf = batch.alloc_f32(x)?;
-    let len = x.len() as u32;
-    let buf_dump = batch.alloc_f32_out(1)?;
-    batch.dispatch_1d(&kernels.vec_scale.pipeline, x.len(), |enc| {
-        vec_scale_inplace::bind_gpu_buffers(&enc, &buf, &buf_dump, scale, len);
-    });
-    batch.register_read(buf, x);
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,9 +276,13 @@ mod tests {
         gelu_pytorch_tanh(&mut cpu);
         let ctx = MetalContext::new().expect("metal");
         let kernels = GpuKernels::new(&ctx).expect("kernels");
-        kernels
-            .gelu_pytorch_tanh(&ctx.queue, &mut crate::metal::buffer::BufferPool::new(), &ctx.device, &mut gpu)
-            .expect("gelu");
+        let mut pool = crate::metal::buffer::BufferPool::new();
+        let mut batch =
+            GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None).expect("batch");
+        let buf = batch.alloc_f32(&gpu).expect("buf");
+        gelu_pytorch_tanh_gpu_buf(&mut batch, &kernels, &buf, gpu.len()).expect("gelu");
+        batch.register_read(buf, &mut gpu);
+        batch.end().expect("end");
         assert!(gpu[0].is_finite(), "gpu={}", gpu[0]);
         assert!((cpu[0] - gpu[0]).abs() < 1e-4);
     }
@@ -365,7 +297,8 @@ mod tests {
         let ctx = MetalContext::new().expect("metal");
         let kernels = GpuKernels::new(&ctx).expect("kernels");
         let mut pool = crate::metal::buffer::BufferPool::new();
-        let mut batch = GpuBatch::begin(&ctx.queue, &mut pool, &ctx.device).expect("batch");
+        let mut batch =
+            GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None).expect("batch");
         let buf = batch.alloc_f32(&gpu).expect("buf");
         gelu_pytorch_tanh_gpu_buf(&mut batch, &kernels, &buf, gpu.len()).expect("gelu");
         batch.register_read(buf, &mut gpu);
@@ -387,9 +320,13 @@ mod tests {
 
         let ctx = MetalContext::new().expect("metal");
         let kernels = GpuKernels::new(&ctx).expect("kernels");
-        kernels
-            .gelu_pytorch_tanh(&ctx.queue, &mut crate::metal::buffer::BufferPool::new(), &ctx.device, &mut gpu)
-            .expect("gelu");
+        let mut pool = crate::metal::buffer::BufferPool::new();
+        let mut batch =
+            GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None).expect("batch");
+        let buf = batch.alloc_f32(&gpu).expect("buf");
+        gelu_pytorch_tanh_gpu_buf(&mut batch, &kernels, &buf, len).expect("gelu");
+        batch.register_read(buf, &mut gpu);
+        batch.end().expect("end");
 
         let nan = gpu.iter().filter(|v| !v.is_finite()).count();
         assert_eq!(nan, 0, "gpu gelu produced {nan} non-finite values");
@@ -400,25 +337,4 @@ mod tests {
             .fold(0.0f32, f32::max);
         assert!(max_diff < 1e-4, "max_diff={max_diff}");
     }
-}
-
-pub fn f32_bf16_gemm(
-    batch: &mut GpuBatch<'_>,
-    pipeline: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-    c: &mut [f32],
-    a: &[f32],
-    b: FastSlice<'_, u16>,
-    m: usize,
-    k: usize,
-    n: usize,
-) -> Result<(), Error> {
-    if a.len() != m * k || b.len() != k * n || c.len() != m * n {
-        return Err(Error::Format("f32_bf16 gemm shape mismatch"));
-    }
-    let buf_a = batch.alloc_f32(a)?;
-    let buf_b = batch.alloc_bf16_fast(b)?;
-    let buf_c = batch.alloc_f32_out(c.len())?;
-    batch.dispatch_gemm(pipeline, &buf_a, &buf_b, &buf_c, m, n, k);
-    batch.register_read(buf_c, c);
-    Ok(())
 }

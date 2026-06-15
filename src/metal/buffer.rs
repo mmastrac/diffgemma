@@ -48,10 +48,6 @@ impl BufferPool {
         }
     }
 
-    pub fn retained_bytes(&self) -> usize {
-        self.free.iter().map(|(cap, _)| *cap).sum()
-    }
-
     pub fn write_f32(buffer: &ProtocolObject<dyn MTLBuffer>, data: &[f32]) {
         let ptr = buffer.contents().as_ptr() as *mut f32;
         unsafe {

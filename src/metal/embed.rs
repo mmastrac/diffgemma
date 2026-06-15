@@ -6,7 +6,7 @@ use crate::metal::batch::{begin_engine_batch, GpuBatch};
 use crate::metal::dgq_gpu::Q8LinearGpu;
 use crate::metal::engine::GpuDecoderEngine;
 use crate::metal::kernels::GpuKernels;
-use crate::metal::linear::{f32_q8_linear_gpu_bufs, f32_q8_linear_kxn_gpu_bufs};
+use crate::metal::linear::f32_q8_linear_kxn_gpu_bufs;
 use crate::model::embed::LM_HEAD_CHUNK;
 use crate::safetensors::Error;
 use objc2::rc::Retained;
@@ -29,7 +29,7 @@ pub struct F32RowStats {
 /// Sample one row of a shared f32 buffer (e.g. logits row 0).
 pub fn f32_row_stats(buf: &ProtocolObject<dyn MTLBuffer>, row: usize, cols: usize) -> F32RowStats {
     let byte_off = row * cols * 4;
-    let ptr = unsafe { buf.contents().as_ptr().add(byte_off) as *const f32 };
+    let ptr = unsafe { buf.contents().as_ptr().add(byte_off) } as *const f32;
     let mut min = f32::INFINITY;
     let mut max = f32::NEG_INFINITY;
     let mut n_nan = 0u32;
@@ -87,7 +87,7 @@ pub struct F32BufStats {
 }
 
 pub fn f32_buf_stats(buf: &ProtocolObject<dyn MTLBuffer>, len: usize) -> F32BufStats {
-    let ptr = unsafe { buf.contents().as_ptr() as *const f32 };
+    let ptr = buf.contents().as_ptr() as *const f32;
     let mut finite = 0usize;
     let mut max_abs = 0.0f32;
     for i in 0..len {
@@ -106,7 +106,7 @@ pub fn f32_buf_stats(buf: &ProtocolObject<dyn MTLBuffer>, len: usize) -> F32BufS
 
 fn f32_row_sum(buf: &ProtocolObject<dyn MTLBuffer>, row: usize, cols: usize) -> f32 {
     let byte_off = row * cols * 4;
-    let ptr = unsafe { buf.contents().as_ptr().add(byte_off) as *const f32 };
+    let ptr = unsafe { buf.contents().as_ptr().add(byte_off) } as *const f32;
     let mut sum = 0.0f32;
     for c in 0..cols {
         let v = unsafe { *ptr.add(c) };

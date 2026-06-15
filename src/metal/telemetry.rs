@@ -36,11 +36,6 @@ impl ForwardTelemetry {
         }
     }
 
-    /// Backward-compatible alias (assumes P2.1 hot-path readback budget).
-    pub fn monolithic_gpu_step_default() -> Self {
-        Self::monolithic_gpu_step(0)
-    }
-
     pub fn record_expert_layer(
         &mut self,
         layer: usize,

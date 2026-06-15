@@ -4,7 +4,7 @@ use crate::kernels::cpu::gemm_linear_grouped::gemm_linear_grouped_cpu;
 use crate::kernels::cpu::moe_scatter_weighted::moe_scatter_weighted;
 use crate::kernels::sub::swiglu::InterleavedFixture;
 use crate::kernels::sub::QuantFormat;
-use crate::metal::{layer_moe_block_jobs, BlockGroupedJob, LayerOffsets, RouteScratch, CANVAS, HID, MOE_FF, N_EXPERTS};
+use crate::metal::{layer_moe_block_jobs, LayerOffsets, RouteScratch, HID, MOE_FF, N_EXPERTS};
 use serde::{Deserialize, Serialize};
 
 fn cosine_f32(a: &[f32], b: &[f32]) -> f32 {
@@ -460,6 +460,7 @@ pub fn calgary_l0_token_list() -> [u32; PIN_SLOTS] {
 mod tests {
     use super::*;
     use crate::kernels::sub::gather_rows::Fixture as GatherFixture;
+    use crate::metal::CANVAS;
 
     #[test]
     fn pin_gather_routing_matches_cpu_oracle() {

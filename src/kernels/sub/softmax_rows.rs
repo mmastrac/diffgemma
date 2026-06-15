@@ -104,8 +104,8 @@ pub fn assert_row_invariants(out: &[f32], rows: usize, cols: usize) {
 pub fn gpu(fix: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
-    use objc2::runtime::ProtocolObject;
-    use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLSize};
+    
+    use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
 
     let ctx = MetalContext::new()?;
     let pipeline = pipeline_for(&ctx, variant)?;

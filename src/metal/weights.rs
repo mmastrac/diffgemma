@@ -5,7 +5,7 @@ use crate::config::TextConfig;
 use crate::dgq::DgqStore;
 use crate::fast_slice::{bf16_to_f32_into, FastBf16Slice};
 use crate::metal::dgq_gpu::{
-    load_block_expert_stack, load_block_linear, load_q4_expert_stack, load_q4_linear,
+    load_block_expert_stack, load_block_linear,
     load_q8_linear, load_raw_view, DgqGpuBlob,
     Q4ExpertStackGpu, Q8LinearGpu,
 };
@@ -326,13 +326,13 @@ struct Bf16LayerSlot {
     cache: Option<GpuLayerWeightCache>,
 }
 
-struct Bf16Paged {
+pub struct Bf16Paged {
     final_norm: Buffer<f32>,
     layer: RefCell<Bf16LayerSlot>,
     expert_cache: RefCell<ExpertWeightCache>,
 }
 
-struct DgqResident {
+pub struct DgqResident {
     blob: Arc<DgqGpuBlob>,
     final_norm: Buffer<f32>,
     embed_q8: Option<Q8LinearGpu>,

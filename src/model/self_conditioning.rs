@@ -97,20 +97,6 @@ impl SelfConditioningScratch {
 }
 
 /// `inputs_embeds += MLP(pre_norm(soft_signal))`, then RMSNorm without scale on the sum.
-pub fn apply(
-    out: &mut [f32],
-    inputs_embeds: &[f32],
-    soft_signal: &[f32],
-    weights: &SelfConditioningWeights<'_>,
-    cfg: &TextConfig,
-    seq_len: usize,
-    scratch: &mut SelfConditioningScratch,
-) -> Result<(), Error> {
-    scratch.load_weights(weights)?;
-    apply_loaded(out, inputs_embeds, soft_signal, cfg, seq_len, scratch)
-}
-
-/// Same as `apply`, but loads bf16 or `.dgq` weights into `scratch` once.
 pub fn apply_from_store(
     out: &mut [f32],
     inputs_embeds: &[f32],

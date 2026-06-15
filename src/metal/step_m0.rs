@@ -2,7 +2,6 @@
 
 use crate::dgq::block::{dequant_row_q4, q4_weight_at};
 use crate::dgq::layout::GROUP_SIZE;
-use crate::kernels::cpu::bf16_to_f32;
 use crate::metal::decoder::{forward as decoder_forward, load_weight_cache, GpuDecoderScratch};
 use crate::metal::GpuDecoderEngine;
 use crate::metal::step_kernel::{

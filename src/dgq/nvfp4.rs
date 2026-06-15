@@ -8,6 +8,7 @@ use crate::dgq::layout::{
 use crate::kernels::cpu::bf16_to_f32;
 use crate::safetensors::Error;
 
+#[cfg(test)]
 fn f32_to_bf16_bits(v: f32) -> u16 {
     (v.to_bits() >> 16) as u16
 }
@@ -166,29 +167,6 @@ pub fn quantize_bf16_matrix_nvfp4(src: &[u8], out_dim: usize, in_dim: usize, dst
     }
 }
 
-pub fn quantize_expert_stack_f32_nvfp4(
-    src: &[f32],
-    experts: usize,
-    out_dim: usize,
-    in_dim: usize,
-    dst: &mut [u8],
-) -> Result<(), Error> {
-    let per_expert = nvfp4_matrix_bytes(out_dim, in_dim);
-    let need = experts * per_expert;
-    if dst.len() != need || src.len() != experts * out_dim * in_dim {
-        return Err(Error::Format("expert nvfp4 dst size mismatch"));
-    }
-    for e in 0..experts {
-        quantize_f32_matrix_nvfp4(
-            &src[e * out_dim * in_dim..(e + 1) * out_dim * in_dim],
-            out_dim,
-            in_dim,
-            &mut dst[e * per_expert..(e + 1) * per_expert],
-        );
-    }
-    Ok(())
-}
-
 pub fn dequant_matrix_nvfp4_payload(
     src: &[u8],
     out_dim: usize,
@@ -242,7 +220,7 @@ pub fn nvfp4_gemm_cpu(
     for row in 0..m {
         for col in 0..n {
             let mut sum = 0.0f32;
-            let row_off = col * row_bytes;
+            let _row_off = col * row_bytes;
             for p in 0..k {
                 sum += a[row * k + p] * nvfp4_weight_at(w_nvfp4, col, p, k, global_scale);
             }

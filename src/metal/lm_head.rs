@@ -168,7 +168,7 @@ mod tests {
         let kernels = GpuKernels::new(&ctx).expect("kernels");
 
         let mut cpu_logits = vec![0.0f32; seq_len * vocab];
-        let mut batch = GpuBatch::begin(&ctx.queue, &mut pool, &ctx.device).expect("batch");
+        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None).expect("batch");
         lm_head_tied_q8_gpu(
             &mut batch,
             &q8_pipeline,
@@ -186,7 +186,7 @@ mod tests {
         logits_buf
             .ensure(&ctx.device, &mut pool, seq_len * vocab)
             .expect("ensure");
-        let mut batch = GpuBatch::begin(&ctx.queue, &mut pool, &ctx.device).expect("batch");
+        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None).expect("batch");
         lm_head_tied_q8_gpu_buf(
             &mut batch,
             &q8_pipeline,

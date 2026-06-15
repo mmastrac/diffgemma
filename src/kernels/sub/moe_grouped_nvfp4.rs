@@ -122,7 +122,7 @@ pub fn pipeline_for(
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
     MTLSize,
 };
 

@@ -1,6 +1,6 @@
 //! Step-kernel quantization profile: one algorithm, format selects kernels (STRATEGY.md §4).
 
-use crate::dgq::layout::{QuantKind, QuantProfile};
+use crate::dgq::layout::QuantProfile;
 use crate::kernels::sub::QuantFormat;
 
 /// Block-quantized weight format active for this step runtime (dense + MoE experts).
@@ -16,10 +16,6 @@ impl StepBlockProfile {
         }
     }
 
-    pub fn quant_kind(self) -> QuantKind {
-        quant_kind_for_format(self.format)
-    }
-
     pub fn is_nvfp4(self) -> bool {
         self.format == QuantFormat::NvFp4
     }
@@ -33,13 +29,6 @@ pub fn quant_format_from_profile(p: QuantProfile) -> QuantFormat {
     match p {
         QuantProfile::Nvfp4 => QuantFormat::NvFp4,
         QuantProfile::Q4 | QuantProfile::Q5 => QuantFormat::Q4Affine,
-    }
-}
-
-pub fn quant_kind_for_format(format: QuantFormat) -> QuantKind {
-    match format {
-        QuantFormat::NvFp4 => QuantKind::Nvfp4Block,
-        QuantFormat::Q4Affine | QuantFormat::MxFp4 | QuantFormat::Q8 => QuantKind::Q4Block,
     }
 }
 

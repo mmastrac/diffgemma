@@ -50,7 +50,7 @@ pub fn moe_fixture(_fmt: ElemFormat) -> Fixture {
     let rows = 4;
     let experts = 128;
     let top_k = 8;
-    let len = rows * experts;
+    let _len = rows * experts;
     Fixture {
         probs: {
             let len = rows * experts;
@@ -87,7 +87,7 @@ pub fn cpu_oracle(fix: &Fixture) -> RouteOut {
 pub fn gpu(fix: &Fixture, variant: KernelVariant) -> Result<RouteOut, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
-    use objc2::runtime::ProtocolObject;
+    
     use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize};
 
     let ctx = MetalContext::new()?;

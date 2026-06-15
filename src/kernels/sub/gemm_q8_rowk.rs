@@ -143,7 +143,7 @@ pub fn gpu(f: &Fixture, _variant: super::KernelVariant) -> Result<Vec<f32>, Erro
     enc.endEncoding();
     cmd.commit();
     cmd.waitUntilCompleted();
-    let ptr = unsafe { buf_y.contents().as_ptr() as *const u16 };
+    let ptr = buf_y.contents().as_ptr() as *const u16;
     Ok((0..f.out_len())
         .map(|i| f16::f16_bits_to_f32(unsafe { *ptr.add(i) }))
         .collect())

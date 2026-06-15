@@ -47,7 +47,7 @@ pub fn tiny_fixture(_: ElemFormat) -> Fixture {
     let rows = 4usize;
     let cols = 256usize;
     let logits: Vec<f32> = (0..rows * cols)
-        .map(|i| ((i as f32 * 0.05).cos() * 2.0))
+        .map(|i| (i as f32 * 0.05).cos() * 2.0)
         .collect();
     let logits = f16::f16_slice_to_f32(&f16::f32_slice_to_f16(&logits));
     let step = 2u32;
@@ -165,10 +165,8 @@ pub fn pipeline_for(
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
-use objc2::runtime::ProtocolObject;
-#[cfg(all(feature = "metal", target_os = "macos"))]
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
     MTLSize,
 };
 

@@ -58,11 +58,6 @@ impl DenoiseTrace {
         let text = serde_json::to_string_pretty(self).map_err(crate::safetensors::Error::Json)?;
         std::fs::write(path, text).map_err(crate::safetensors::Error::Io)
     }
-
-    pub fn load(path: &std::path::Path) -> Result<Self, crate::safetensors::Error> {
-        let text = std::fs::read_to_string(path).map_err(crate::safetensors::Error::Io)?;
-        serde_json::from_str(&text).map_err(crate::safetensors::Error::Json)
-    }
 }
 
 pub fn step_trace_from_stats(

@@ -71,13 +71,13 @@ pub fn tiny_fixture(_: ElemFormat) -> Fixture {
     let kv_len_flat = canvas * n_kv * hd;
     Fixture {
         q: (0..q_len)
-            .map(|i| ((i as f32 * 0.13).sin() * 0.5))
+            .map(|i| (i as f32 * 0.13).sin() * 0.5)
             .collect(),
         k: (0..kv_len_flat)
-            .map(|i| ((i as f32 * 0.17).cos() * 0.4))
+            .map(|i| (i as f32 * 0.17).cos() * 0.4)
             .collect(),
         v: (0..kv_len_flat)
-            .map(|i| ((i as f32 * 0.11).sin() * 0.3))
+            .map(|i| (i as f32 * 0.11).sin() * 0.3)
             .collect(),
         kvcache: vec![0.0; (kv_len as usize + canvas) * n_kv * hd * 2],
         q_norm_w: vec![1.0; hd],
@@ -133,7 +133,7 @@ pub fn full_attn_v_alias_fixture(fmt: ElemFormat) -> Fixture {
 }
 
 /// Full-attention hd=512 (production full layers) with V-alias.
-pub fn full_hd512_v_alias_fixture(fmt: ElemFormat) -> Fixture {
+pub fn full_hd512_v_alias_fixture(_fmt: ElemFormat) -> Fixture {
     let canvas = 1usize;
     let n_q_heads = 16usize;
     let n_kv = 2usize;
@@ -143,10 +143,10 @@ pub fn full_hd512_v_alias_fixture(fmt: ElemFormat) -> Fixture {
     let kv_len_flat = canvas * n_kv * hd;
     Fixture {
         q: (0..q_len)
-            .map(|i| ((i as f32 * 0.031).sin() * 0.55))
+            .map(|i| (i as f32 * 0.031).sin() * 0.55)
             .collect(),
         k: (0..kv_len_flat)
-            .map(|i| ((i as f32 * 0.029).cos() * 0.48))
+            .map(|i| (i as f32 * 0.029).cos() * 0.48)
             .collect(),
         v: vec![0.0; kv_len_flat],
         kvcache: vec![0.0; (kv_len as usize + canvas) * n_kv * hd * 2],
@@ -261,7 +261,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let ctx = MetalContext::new()?;
     let pipeline = pipeline_for(&ctx, variant)?;
     let mut pool = BufferPool::new();
-    let hd = f.head_dim();
+    let _hd = f.head_dim();
     let buf_q = pool
         .allocate(&ctx.device, f.q.len() * 2)
         .ok_or(Error::Format("alloc"))?;
@@ -348,7 +348,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let mut k = vec![0.0f32; f.k.len()];
     let mut kvcache = vec![0.0f32; f.kvcache.len()];
     let read_half = |buf: &objc2::runtime::ProtocolObject<dyn MTLBuffer>, out: &mut [f32]| {
-        let ptr = unsafe { buf.contents().as_ptr() as *const u16 };
+        let ptr = buf.contents().as_ptr() as *const u16;
         for (i, o) in out.iter_mut().enumerate() {
             *o = f16::f16_bits_to_f32(unsafe { *ptr.add(i) });
         }

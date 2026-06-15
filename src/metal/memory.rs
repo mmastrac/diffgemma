@@ -79,7 +79,7 @@ pub fn estimate_decoder_forward(text: &TextConfig, seq_len: usize, kv_len: usize
 fn layer_attn_scratch_bytes_gpu(
     text: &TextConfig,
     seq: u64,
-    total_kv: u64,
+    _total_kv: u64,
     hidden: u64,
     inter: u64,
     moe_inter: u64,

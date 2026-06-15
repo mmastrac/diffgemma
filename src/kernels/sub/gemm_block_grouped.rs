@@ -114,7 +114,7 @@ pub fn dispatch_shape(n: usize, num_jobs: usize) -> (MTLSize, MTLSize) {
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
-pub fn gpu(f: &Fixture, variant: super::KernelVariant) -> Result<Vec<f32>, Error> {
+pub fn gpu(f: &Fixture, _variant: super::KernelVariant) -> Result<Vec<f32>, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
 

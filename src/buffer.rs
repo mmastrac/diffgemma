@@ -45,10 +45,6 @@ impl<T> Buffer<T> {
         self.len
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
     pub fn ensure_len(&mut self, len: usize)
     where
         T: Copy,
@@ -97,20 +93,6 @@ impl<T> Buffer<T> {
 
     pub fn as_slice_mut(&mut self) -> &mut [T] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
-    }
-}
-
-impl<T: Copy> Buffer<T> {
-    pub fn from_fast_slice_mut(data: FastSliceMut<'_, T>) -> Self {
-        let len = data.len();
-        let mut buf = Self::with_capacity(len);
-        buf.len = len;
-        if len > 0 {
-            unsafe {
-                std::ptr::copy_nonoverlapping(data.ptr, buf.ptr, len);
-            }
-        }
-        buf
     }
 }
 

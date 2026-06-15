@@ -174,12 +174,12 @@ fn run_encoder_prefill(
 #[cfg(all(feature = "metal", target_os = "macos"))]
 fn extend_encoder_kv(
     backend: &mut DecoderBackend<'_>,
-    store: &WeightStore,
-    cfg: &ModelConfig,
+    _store: &WeightStore,
+    _cfg: &ModelConfig,
     kv_cache: &mut KvCache,
     token_ids: &[u32],
     enc_scratch: &mut EncoderScratch,
-    max_layers: Option<usize>,
+    _max_layers: Option<usize>,
 ) -> Result<(), Error> {
     match backend {
         DecoderBackend::Gpu {
@@ -697,7 +697,7 @@ pub fn generate_monolithic_gpu(
         .max_layers
         .unwrap_or(validated.num_layers)
         .min(validated.num_layers);
-    let mut cfg = StepGenerateConfig::from_generate(
+    let cfg = StepGenerateConfig::from_generate(
         gen_cfg.seed,
         gen_cfg.max_new_tokens,
         max_seq,

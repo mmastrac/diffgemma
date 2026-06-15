@@ -57,27 +57,6 @@ impl MetalContext {
         Ok(ComputePipeline { pipeline })
     }
 
-    /// Specialize tiled quant GEMM subkernels (FC1–3 global, FC4–6 shape).
-    pub fn compile_gemm_kernel(
-        &self,
-        library: &ProtocolObject<dyn MTLLibrary>,
-        entry: &str,
-        gemm_n: u32,
-        gemm_k: u32,
-    ) -> Result<ComputePipeline, Error> {
-        Self::compile_gemm_kernel_on_device(&self.device, library, entry, gemm_n, gemm_k)
-    }
-
-    pub fn compile_gemm_kernel_on_device(
-        device: &ProtocolObject<dyn MTLDevice>,
-        library: &ProtocolObject<dyn MTLLibrary>,
-        entry: &str,
-        gemm_n: u32,
-        gemm_k: u32,
-    ) -> Result<ComputePipeline, Error> {
-        Self::compile_gemm_subkernel_on_device(device, library, entry, gemm_n, gemm_k, false, 0)
-    }
-
     /// Specialize a tiled quant GEMM subkernel (FC1–3 global, FC4–6 shape/format).
     pub fn compile_gemm_subkernel(
         &self,
@@ -261,8 +240,6 @@ impl MetalContext {
 pub struct ComputePipeline {
     pub pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
-
-pub type Bf16GemmPipeline = ComputePipeline;
 
 fn shader_compile_error(err: Retained<NSError>) -> Error {
     Error::NotFound(format!(

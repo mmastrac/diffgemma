@@ -2,13 +2,13 @@
 
 use crate::config::TextConfig;
 use crate::metal::batched_kernels::{self as bk, f32_f32_linear_gpu_bufs};
-use crate::metal::batch::{set_bytes, GpuBatch};
+use crate::metal::batch::GpuBatch;
 use crate::metal::kernels::GpuKernels;
 use crate::metal::weights::GpuLayerWeightCache;
 use crate::model::moe::RouteResult;
 use crate::safetensors::Error;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder};
+use objc2_metal::MTLBuffer;
 
 pub struct GpuRouteScratch {
     pub indices: Vec<u32>,
@@ -173,7 +173,7 @@ mod tests {
         )
         .expect("cpu route");
 
-        let mut batch = GpuBatch::begin(&engine.ctx.queue, &mut pool, &engine.ctx.device)
+        let mut batch = GpuBatch::begin_with_telemetry(&engine.ctx.queue, &mut pool, &engine.ctx.device, None)
             .expect("batch");
         let buf_res = batch.alloc_f32(&residual).expect("buf");
         let mut route_scratch = GpuRouteScratch::new(seq_len, text.top_k_experts);

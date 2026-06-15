@@ -108,7 +108,7 @@ pub fn tiny_fixture(_: ElemFormat) -> Fixture {
     let top_k = 3usize;
     Fixture {
         stream: (0..canvas * hidden)
-            .map(|i| ((i as f32 * 0.09).sin() * 0.7))
+            .map(|i| (i as f32 * 0.09).sin() * 0.7)
             .collect(),
         router_scale: vec![1.0; hidden],
         router_proj: (0..n_experts * hidden)

@@ -1,6 +1,6 @@
 use crate::config::TextConfig;
 use crate::dgq::block::{q4_gemm_cpu, q4_weight_at};
-use crate::dgq::layout::{q4_matrix_bytes, NVFP4_HEADER_BYTES};
+use crate::dgq::layout::NVFP4_HEADER_BYTES;
 use crate::dgq::nvfp4::nvfp4_gemm_cpu;
 use crate::dgq::DgqStore;
 use crate::kernels::cpu::{gelu_pytorch_tanh, gelu_pytorch_tanh_f32, linear};
@@ -73,7 +73,6 @@ fn block_gemm_cpu(
 
 #[derive(Debug, Clone)]
 pub struct ExpertSingleStaged {
-    pub gate_up: Vec<f32>,
     pub gate_act: Vec<f32>,
     pub out: Vec<f32>,
 }
@@ -103,7 +102,6 @@ pub fn expert_forward_staged_dgq(
         &mut scratch.expert_out,
     );
     ExpertSingleStaged {
-        gate_up: scratch.gate_up.clone(),
         gate_act: scratch.gate_act.clone(),
         out: scratch.expert_out.clone(),
     }
@@ -145,7 +143,6 @@ pub fn expert_forward_staged_bf16(
         hidden,
     );
     ExpertSingleStaged {
-        gate_up: scratch.gate_up.clone(),
         gate_act: scratch.gate_act.clone(),
         out: scratch.expert_out.clone(),
     }
@@ -406,7 +403,7 @@ pub fn experts_forward_gpu_grouped_in_batch(
     q4_grouped_pipeline: &ComputePipeline,
     nvfp4_grouped_pipeline: &ComputePipeline,
 ) -> Result<(), Error> {
-    let hidden = cfg.hidden_size;
+    let _hidden = cfg.hidden_size;
     let moe_inter = cfg.moe_intermediate_size;
     let num_jobs = jobs.len();
     let w_blob = expert_cache
@@ -565,6 +562,7 @@ mod dgq_expert_tests {
     use super::*;
     use crate::config::ModelConfig;
     use crate::dgq::DgqStore;
+    use crate::dgq::layout::q4_matrix_bytes;
     use crate::metal::device::MetalContext;
     use crate::metal::weights::GpuDecoderWeightCache;
     use crate::weights::WeightStore;

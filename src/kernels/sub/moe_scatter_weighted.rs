@@ -164,7 +164,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
             f.hidden as u32,
             0,
         );
-    });
+    })?;
     let mut out = vec![0.0f32; out_len];
     BufferPool::read_f32(&buf_out, &mut out);
     Ok(out)

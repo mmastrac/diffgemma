@@ -1,8 +1,8 @@
 //! Zero-copy `.dgq` blob → `MTLBuffer` and per-tensor GPU views.
 
 use crate::dgq::layout::{
-    blob_offset_for_mtl, dgq_version_supported, nvfp4_matrix_bytes, nvfp4_row_bytes,
-    q4_matrix_bytes, q8_row_bytes, QuantKind, NVFP4_HEADER_BYTES, MANIFEST_FILE,
+    blob_offset_for_mtl, dgq_version_supported, nvfp4_matrix_bytes,
+    q4_matrix_bytes, q8_row_bytes, QuantKind, MANIFEST_FILE,
 };
 use crate::dgq::DgqStore;
 use crate::safetensors::Error;
@@ -12,7 +12,6 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 use std::ffi::c_void;
 use std::fs::File;
-use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
@@ -58,11 +57,6 @@ impl DgqGpuBlob {
             len,
         }))
     }
-
-    pub fn open(model_dir: impl AsRef<Path>, device: &ProtocolObject<dyn MTLDevice>) -> Result<Arc<Self>, Error> {
-        let store = DgqStore::open(model_dir)?;
-        Self::from_store(&store, device)
-    }
 }
 
 /// Quantized linear weight view into a shared blob buffer (PyTorch `[out, in]`).
@@ -102,24 +96,6 @@ impl Q4LinearGpu {
             QuantKind::Nvfp4Block => nvfp4_matrix_bytes(self.out_dim, self.in_dim),
             _ => panic!("not a block linear"),
         }
-    }
-
-    pub fn row_byte_len(&self) -> usize {
-        match self.kind {
-            QuantKind::Q4Block => crate::dgq::layout::q4_row_bytes(self.in_dim),
-            QuantKind::Nvfp4Block => nvfp4_row_bytes(self.in_dim),
-            _ => panic!("not a block linear"),
-        }
-    }
-
-    /// Payload after optional nvfp4 global-scale header.
-    pub fn body_offset(&self) -> u64 {
-        self.byte_offset
-            + if self.is_nvfp4() {
-                NVFP4_HEADER_BYTES as u64
-            } else {
-                0
-            }
     }
 
     pub fn q4_byte_len(&self) -> usize {
@@ -187,7 +163,6 @@ pub struct Q4ExpertStackGpu {
     pub kind: QuantKind,
     pub blob: Arc<DgqGpuBlob>,
     pub byte_offset: u64,
-    pub experts: usize,
     pub out_dim: usize,
     pub in_dim: usize,
 }
@@ -376,27 +351,6 @@ pub fn load_block_linear(store: &DgqStore, blob: Arc<DgqGpuBlob>, name: &str) ->
     Ok(Q4LinearGpu::from_entry(blob, entry.meta.offset, out, inp, kind))
 }
 
-pub fn load_q4_linear(store: &DgqStore, blob: Arc<DgqGpuBlob>, name: &str) -> Result<Q4LinearGpu, Error> {
-    let entry = store
-        .get_entry(name)
-        .ok_or_else(|| Error::NotFound(name.to_string()))?;
-    if parse_kind(&entry.meta.kind)? != QuantKind::Q4Block {
-        return Err(Error::Format("expected q4_block linear"));
-    }
-    if entry.meta.shape.len() != 2 {
-        return Err(Error::Format("q4 linear expects rank 2"));
-    }
-    let out = entry.meta.shape[0] as usize;
-    let inp = entry.meta.shape[1] as usize;
-    Ok(Q4LinearGpu::from_entry(
-        blob,
-        entry.meta.offset,
-        out,
-        inp,
-        QuantKind::Q4Block,
-    ))
-}
-
 pub fn load_block_expert_stack(
     store: &DgqStore,
     blob: Arc<DgqGpuBlob>,
@@ -416,31 +370,6 @@ pub fn load_block_expert_stack(
         kind,
         blob,
         byte_offset: entry.meta.offset,
-        experts: entry.meta.shape[0] as usize,
-        out_dim: entry.meta.shape[1] as usize,
-        in_dim: entry.meta.shape[2] as usize,
-    })
-}
-
-pub fn load_q4_expert_stack(
-    store: &DgqStore,
-    blob: Arc<DgqGpuBlob>,
-    name: &str,
-) -> Result<Q4ExpertStackGpu, Error> {
-    let entry = store
-        .get_entry(name)
-        .ok_or_else(|| Error::NotFound(name.to_string()))?;
-    if parse_kind(&entry.meta.kind)? != QuantKind::Q4Block {
-        return Err(Error::Format("expected q4_block expert stack"));
-    }
-    if entry.meta.shape.len() != 3 {
-        return Err(Error::Format("q4 expert expects rank 3"));
-    }
-    Ok(Q4ExpertStackGpu {
-        kind: QuantKind::Q4Block,
-        blob,
-        byte_offset: entry.meta.offset,
-        experts: entry.meta.shape[0] as usize,
         out_dim: entry.meta.shape[1] as usize,
         in_dim: entry.meta.shape[2] as usize,
     })
@@ -480,7 +409,7 @@ mod q4_gpu_tests {
         let store = DgqStore::open(dgq_dir).expect("open dgq");
         let ctx = MetalContext::new().expect("metal");
         let blob = DgqGpuBlob::from_store(&store, &ctx.device).expect("blob");
-        let q4 = load_q4_linear(
+        let q4 = load_block_linear(
             &store,
             Arc::clone(&blob),
             "model.decoder.layers.0.self_attn.q_proj.weight",
@@ -520,7 +449,7 @@ mod q4_gpu_tests {
             prod,
         )
         .expect("nvfp4 pipeline");
-        let mut batch = GpuBatch::begin(&ctx.queue, &mut pool, &ctx.device).expect("batch");
+        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None).expect("batch");
         let buf_a = batch.alloc_f32(&a).expect("a");
         let buf_c = f32_q4_linear_gpu_bufs(
             &mut batch,
@@ -587,7 +516,7 @@ mod q4_gpu_tests {
         let prod = crate::kernels::sub::variant::KernelVariant::PRODUCTION;
         let pipeline =
             crate::kernels::sub::gemm_q8_linear_f32::pipeline_for(&ctx, prod).expect("pipeline");
-        let mut batch = GpuBatch::begin(&ctx.queue, &mut pool, &ctx.device).expect("batch");
+        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None).expect("batch");
         let buf_a = batch.alloc_f32(&a).expect("a");
         let buf_c =
             crate::metal::linear::f32_q8_linear_gpu_bufs(&mut batch, &pipeline, &buf_a, &q8, m, k, n)
@@ -655,7 +584,7 @@ mod q4_gpu_tests {
             prod,
         )
         .expect("nvfp4 pipeline");
-        let mut batch = GpuBatch::begin(&ctx.queue, &mut pool, &ctx.device).expect("batch");
+        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None).expect("batch");
         let buf_a = batch.alloc_f32(&a).expect("a");
         let buf_c = f32_q4_linear_gpu_bufs(
             &mut batch,
@@ -727,7 +656,7 @@ mod q4_gpu_tests {
         )
         .expect("nvfp4 pipeline");
         let mut pool = BufferPool::new();
-        let mut batch = GpuBatch::begin(&ctx.queue, &mut pool, &ctx.device).expect("batch");
+        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None).expect("batch");
         let buf_a = batch.alloc_f32(&a).expect("a");
         let buf_c = f32_q4_linear_gpu_bufs(
             &mut batch,
@@ -786,7 +715,7 @@ mod q4_gpu_tests {
         )
         .expect("pipeline");
         let mut pool = BufferPool::new();
-        let mut batch = GpuBatch::begin(&ctx.queue, &mut pool, &ctx.device).expect("batch");
+        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None).expect("batch");
         let buf_out = batch.alloc_f32_out(cpu.len()).expect("out");
         dispatch_dequant_block_matrix(batch.encoder(), &pipeline, &q4, &buf_out);
         let mut gpu = vec![0.0f32; cpu.len()];

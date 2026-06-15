@@ -2468,7 +2468,7 @@ fn run_step_smoke_cmd(
     prompt: Option<&str>,
     raw_prompt: bool,
 ) -> ExitCode {
-    use metal::{run_step_smoke, StepSmokeConfig};
+    use metal::run_step_smoke;
 
     if !dgq::store::looks_like_dgq_dir(model_dir) {
         eprintln!("error: step-smoke requires a .dgq directory (-m /path/to/quantized-weights)");
@@ -4339,7 +4339,7 @@ fn run_bench_prefill(
                 prefill_token_ids: None,
                 no_early_stop: false,
             };
-            let (mut rt, build) = match build_step_runtime(model_dir, &smoke_cfg) {
+            let (rt, build) = match build_step_runtime(model_dir, &smoke_cfg) {
                 Ok(v) => v,
                 Err(err) => {
                     eprintln!("error: {err}");

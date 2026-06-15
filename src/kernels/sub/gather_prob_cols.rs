@@ -95,7 +95,7 @@ pub fn pipeline_for(
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use objc2::runtime::ProtocolObject;
 #[cfg(all(feature = "metal", target_os = "macos"))]
-use objc2_metal::{MTLBuffer, MTLCommandEncoder, MTLComputeCommandEncoder};
+use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder};
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub fn bind_gpu_buffers(

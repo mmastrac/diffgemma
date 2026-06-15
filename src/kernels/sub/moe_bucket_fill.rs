@@ -172,8 +172,9 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     cmd.commit();
     cmd.waitUntilCompleted();
 
-    let out_scratch: RouteScratch =
-        unsafe { std::ptr::read(buf_route.contents().as_ptr() as *const RouteScratch) };
+    let out_scratch: RouteScratch = unsafe {
+        std::ptr::read(buf_route.contents().as_ptr() as *const RouteScratch)
+    };
     let slots = out_scratch.num_slots as usize;
     let n = f.n_experts as usize;
     let mut out: Vec<f32> = out_scratch.row_start[..n].iter().map(|&v| v as f32).collect();

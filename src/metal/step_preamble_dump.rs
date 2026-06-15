@@ -83,15 +83,3 @@ pub fn write_step_preamble_dump(path: &Path, dump: &StepPreambleDump) -> Result<
     let text = serde_json::to_string_pretty(dump).map_err(Error::Json)?;
     std::fs::write(path, text).map_err(Error::Io)
 }
-
-pub fn hidden_cosine(a: &[f32], b: &[f32]) -> f32 {
-    let n = a.len().min(b.len());
-    let dot: f32 = (0..n).map(|i| a[i] * b[i]).sum();
-    let na = vec_l2(&a[..n]);
-    let nb = vec_l2(&b[..n]);
-    if na > 1e-12 && nb > 1e-12 {
-        dot / (na * nb)
-    } else {
-        f32::NAN
-    }
-}

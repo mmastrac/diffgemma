@@ -97,7 +97,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     gpu_common::dispatch_1d(&ctx.queue, &pipeline.pipeline, count, |enc| {
         bind_gpu_buffers(enc, &buf, &buf_d, f.zero_off);
     })?;
-    let ptr = unsafe { buf.contents().as_ptr() as *const u8 };
+    let ptr = buf.contents().as_ptr() as *const u8;
     let out: Vec<f32> = (0..f.zero_len)
         .map(|i| unsafe { *ptr.add(f.zero_off + i) } as f32)
         .collect();

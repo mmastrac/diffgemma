@@ -59,8 +59,5 @@ pub mod vec_fill_zero;
 pub mod vec_mul_inplace;
 pub mod vec_scale_inplace;
 
-pub use variant::{ElemDtype, FcBool, FcUInt, KernelVariant, QuantFormat};
-pub use manifest::{
-    assert_no_fc_collisions, validate_shared, RmsNormRowsTiledVariant, RmsNormRowsVariant,
-    SwigluSplitVariant,
-};
+pub use variant::{KernelVariant, QuantFormat};
+pub use manifest::SwigluSplitVariant;

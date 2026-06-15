@@ -1,6 +1,5 @@
 //! Batched Metal dispatches: many kernels, one `commit` + `waitUntilCompleted`.
 
-use crate::fast_slice::FastSlice;
 use crate::metal::buffer::BufferPool;
 use crate::metal::telemetry::ForwardTelemetry;
 use crate::safetensors::Error;
@@ -22,7 +21,6 @@ struct PendingRead {
 }
 
 pub struct GpuBatch<'a> {
-    queue: &'a ProtocolObject<dyn MTLCommandQueue>,
     pub(crate) pool: &'a mut BufferPool,
     pub(crate) device: &'a ProtocolObject<dyn MTLDevice>,
     cmd: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
@@ -33,14 +31,6 @@ pub struct GpuBatch<'a> {
 }
 
 impl<'a> GpuBatch<'a> {
-    pub fn begin(
-        queue: &'a ProtocolObject<dyn MTLCommandQueue>,
-        pool: &'a mut BufferPool,
-        device: &'a ProtocolObject<dyn MTLDevice>,
-    ) -> Result<GpuBatch<'a>, Error> {
-        Self::begin_with_telemetry(queue, pool, device, None)
-    }
-
     pub fn begin_with_telemetry(
         queue: &'a ProtocolObject<dyn MTLCommandQueue>,
         pool: &'a mut BufferPool,
@@ -54,7 +44,6 @@ impl<'a> GpuBatch<'a> {
             .computeCommandEncoder()
             .ok_or(Error::Format("Metal compute encoder alloc failed"))?;
         Ok(Self {
-            queue,
             pool,
             device,
             cmd: Some(cmd),
@@ -156,27 +145,6 @@ impl<'a> GpuBatch<'a> {
             .allocate(self.device, bytes)
             .ok_or(Error::Format("Metal buffer alloc failed"))?;
         BufferPool::write_f32(&buf, data);
-        self.track_release(bytes, buf.clone());
-        Ok(buf)
-    }
-
-    pub fn alloc_bf16(
-        &mut self,
-        data: &[u16],
-    ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
-        unsafe { self.alloc_bf16_fast(FastSlice::from_ptr(data.as_ptr(), data.len())) }
-    }
-
-    pub fn alloc_bf16_fast(
-        &mut self,
-        data: FastSlice<'_, u16>,
-    ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
-        let bytes = data.len() * 2;
-        let buf = self
-            .pool
-            .allocate(self.device, bytes)
-            .ok_or(Error::Format("Metal buffer alloc failed"))?;
-        BufferPool::write_bf16_ptr(&buf, data.ptr, data.len());
         self.track_release(bytes, buf.clone());
         Ok(buf)
     }
@@ -297,19 +265,6 @@ impl<'a> GpuBatch<'a> {
         encode(self.encoder());
         self.encoder()
             .dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
-    }
-
-    pub fn dispatch_gemm(
-        &self,
-        pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
-        buf_a: &ProtocolObject<dyn MTLBuffer>,
-        buf_b: &ProtocolObject<dyn MTLBuffer>,
-        buf_c: &ProtocolObject<dyn MTLBuffer>,
-        m: usize,
-        n: usize,
-        k: usize,
-    ) {
-        Self::dispatch_matmul(self.encoder(), pipeline, buf_a, buf_b, buf_c, m, n, k);
     }
 
     /// `C[M,N] = A[M,K] @ W[N,K]^T` with PyTorch row-major `W`.
@@ -524,39 +479,6 @@ impl<'a> GpuBatch<'a> {
         if let Some(cell) = self.telemetry.as_ref() {
             cell.borrow_mut().dense_gpu_upload_bytes += bytes;
         }
-    }
-
-    /// Commit, wait, and run pending readbacks without releasing GPU buffers.
-    pub fn flush_reads(&mut self) -> Result<(), Error> {
-        let readback_bytes: u64 = self.reads.iter().map(|r| r.len_bytes as u64).sum();
-        if let Some(enc) = self.enc.take() {
-            enc.endEncoding();
-        }
-        let cmd = self.cmd.as_ref().expect("batch command buffer missing");
-        cmd.commit();
-        cmd.waitUntilCompleted();
-
-        if let Some(cell) = self.telemetry.as_ref() {
-            let mut tel = cell.borrow_mut();
-            tel.gpu_syncs += 1;
-            tel.gpu_readback_bytes += readback_bytes;
-        }
-
-        for read in self.reads.drain(..) {
-            Self::run_pending_read(read);
-        }
-
-        self.cmd = Some(
-            self.queue
-                .commandBuffer()
-                .ok_or(Error::Format("Metal command buffer alloc failed"))?,
-        );
-        self.enc = self
-            .cmd
-            .as_ref()
-            .expect("cmd")
-            .computeCommandEncoder();
-        Ok(())
     }
 
     pub fn end(mut self) -> Result<(), Error> {

@@ -20,10 +20,6 @@ pub enum GqaMask<'a> {
     DecoderBitmap(&'a DecoderAttnMask),
 }
 
-pub fn pack_decoder_mask(mask: &DecoderAttnMask) -> Vec<u8> {
-    mask.attend.iter().map(|&b| u8::from(b)).collect()
-}
-
 pub struct AttentionParams {
     pub n_heads: usize,
     pub n_kv_heads: usize,
@@ -717,136 +713,6 @@ pub fn forward_decoder(
     Ok(())
 }
 
-/// Layer decoder score probe: raw Q·K stats after QK-norm + RoPE (CPU oracle path).
-pub fn probe_decoder_attn_stats(
-    hidden: &[f32],
-    weights: &DecoderLayerWeights<'_>,
-    cfg: &TextConfig,
-    layer: usize,
-    seq_len: usize,
-    positions: &[i64],
-    kv: LayerKvView<'_>,
-    mask: &DecoderAttnMask,
-    scratch: &mut AttentionScratch,
-) -> Result<(AttnScoreStats, f32, f32), Error> {
-    let hidden_size = cfg.hidden_size;
-    let eps = cfg.rms_norm_eps as f32;
-    let params = AttentionParams::for_layer(cfg, layer)?;
-    let q_dim = params.n_heads * params.head_dim;
-    let kv_dim = params.n_kv_heads * params.head_dim;
-    let total_kv = scratch.total_kv_len;
-
-    scratch.load_weights(weights)?;
-    let input_norm_w = weights.input_layernorm.bf16()?.to_f32_vec();
-    rms_norm_rows(
-        &mut scratch.normed,
-        hidden,
-        &input_norm_w,
-        seq_len,
-        hidden_size,
-        eps,
-    );
-    linear(
-        &mut scratch.q,
-        &scratch.normed,
-        &scratch.q_w,
-        None,
-        seq_len,
-        hidden_size,
-        q_dim,
-    );
-    linear(
-        &mut scratch.k,
-        &scratch.normed,
-        &scratch.k_w,
-        None,
-        seq_len,
-        hidden_size,
-        kv_dim,
-    );
-    if let Some(v_w) = &scratch.v_w {
-        linear(
-            &mut scratch.v,
-            &scratch.normed,
-            v_w,
-            None,
-            seq_len,
-            hidden_size,
-            kv_dim,
-        );
-    } else {
-        scratch.v.copy_from_slice(&scratch.k);
-    }
-    let q_norm_w = scratch.q_norm_w.clone();
-    let k_norm_w = scratch.k_norm_w.clone();
-    normalize_qkv_heads(
-        &mut scratch.q,
-        &mut scratch.k,
-        &mut scratch.v,
-        seq_len,
-        &params,
-        eps,
-        &mut scratch.head_buf,
-        &q_norm_w,
-        &k_norm_w,
-    );
-    let rope_kind = rope_kind_for_layer(cfg, layer).ok_or(Error::Format("rope kind"))?;
-    compute_rope_freqs(&mut scratch.rope_freqs, positions, rope_kind);
-    apply_rope_tensor(
-        &mut scratch.q,
-        seq_len,
-        params.n_heads,
-        params.head_dim,
-        &scratch.rope_freqs,
-        params.rotary_dim,
-    );
-    apply_rope_tensor(
-        &mut scratch.k,
-        seq_len,
-        params.n_kv_heads,
-        params.head_dim,
-        &scratch.rope_freqs,
-        params.rotary_dim,
-    );
-    concat_kv_cache(
-        &mut scratch.k_full,
-        &mut scratch.v_full,
-        kv,
-        &scratch.k,
-        &scratch.v,
-        &params,
-    );
-
-    let q_rms = head_rms_mean(&scratch.q, seq_len, params.n_heads, params.head_dim);
-    let k_rms = head_rms_mean(&scratch.k_full, total_kv, params.n_kv_heads, params.head_dim);
-    let stats = attn_score_stats_decoder(
-        &scratch.q,
-        &scratch.k_full,
-        seq_len,
-        total_kv,
-        &params,
-        mask,
-    );
-    Ok((stats, q_rms, k_rms))
-}
-
-fn head_rms_mean(buf: &[f32], seq_len: usize, n_heads: usize, head_dim: usize) -> f32 {
-    let mut sum = 0.0f32;
-    let n = (seq_len * n_heads).max(1) as f32;
-    for s in 0..seq_len {
-        for h in 0..n_heads {
-            let off = (s * n_heads + h) * head_dim;
-            let mut ss = 0.0f32;
-            for d in 0..head_dim {
-                let v = buf[off + d];
-                ss += v * v;
-            }
-            sum += (ss / head_dim as f32).sqrt();
-        }
-    }
-    sum / n
-}
-
 pub fn normalize_qkv_heads(
     q: &mut [f32],
     k: &mut [f32],
@@ -1001,16 +867,6 @@ fn apply_attention_mask(scores: &mut [f32], seq_len: usize, params: &AttentionPa
     }
 }
 
-fn attention_output_gqa(
-    out: &mut [f32],
-    scores: &[f32],
-    v: &[f32],
-    seq_len: usize,
-    params: &AttentionParams,
-) {
-    attention_output_gqa_ext(out, scores, v, seq_len, seq_len, params);
-}
-
 fn attention_scores_gqa_ext(
     scores: &mut [f32],
     q: &[f32],
@@ -1092,7 +948,6 @@ pub struct AttnScoreStats {
     pub raw_dot_min: f32,
     pub mean_row_softmax_entropy: f32,
     pub mean_row_max_prob: f32,
-    pub mean_row_argmax_count: f32,
     /// Unmasked key slots per row (must match softmax support size).
     pub keys_per_row: usize,
     /// Mean over rows of Σ_t p_t after normalization (must be 1.0).
@@ -1173,7 +1028,6 @@ pub fn attn_score_stats_decoder(
         raw_dot_min: raw_min,
         mean_row_softmax_entropy: ent_sum / n,
         mean_row_max_prob: max_prob_sum / n,
-        mean_row_argmax_count: 0.0,
         keys_per_row: active_keys,
         mean_weight_sum: weight_sum_acc / n,
     }

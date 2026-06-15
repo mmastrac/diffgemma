@@ -4,7 +4,7 @@ use super::bf16;
 use super::f16;
 use super::gpu_common;
 use super::test_util::ElemFormat;
-use super::variant::{ElemDtype, FcUInt, KernelVariant};
+use super::variant::{ElemDtype, KernelVariant};
 use super::manifest::{self, RmsNormRowsTiledVariant};
 use crate::kernels::cpu;
 use crate::safetensors::Error;
@@ -235,7 +235,7 @@ fn gpu_tiled(
     enc.endEncoding();
     cmd.commit();
     cmd.waitUntilCompleted();
-    let ptr = unsafe { buf_y.contents().as_ptr() as *const u16 };
+    let ptr = buf_y.contents().as_ptr() as *const u16;
     Ok((0..len)
         .map(|i| f16::f16_bits_to_f32(unsafe { *ptr.add(i) }))
         .collect())

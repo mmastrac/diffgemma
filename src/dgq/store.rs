@@ -2,10 +2,10 @@
 
 use crate::dgq::dequant::dequant_to_f32;
 use crate::dgq::layout::{
-    blob_slice_range, dgq_version_supported, parse_quant_kind, DgqManifest, QuantKind, BLOB_FILE,
+    blob_slice_range, dgq_version_supported, parse_quant_kind, DgqManifest, QuantKind,
     MANIFEST_FILE,
 };
-use crate::safetensors::{DType, Error};
+use crate::safetensors::Error;
 use crate::tensor::TensorView;
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -49,10 +49,6 @@ impl DgqStore {
 
     pub fn blob_bytes(&self) -> u64 {
         self.blob.len() as u64
-    }
-
-    pub fn tensor_count(&self) -> usize {
-        self.manifest.tensors.len()
     }
 
     pub fn tensor_entries(&self) -> &[crate::dgq::layout::DgqTensorEntry] {
@@ -103,10 +99,6 @@ impl DgqStore {
             &entry.meta.shape,
             src,
         ))
-    }
-
-    pub fn is_quantized(&self) -> bool {
-        true
     }
 
     pub fn summarize(&self) -> crate::weights::Summary {

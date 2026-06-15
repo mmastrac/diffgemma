@@ -101,7 +101,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         bind_gpu_buffers(enc, &buf_x, &buf_y, &buf_d, f.base, f.len);
     })?;
     let mut y_bits = vec![0u16; out_elems];
-    let ptr = unsafe { buf_y.contents().as_ptr() as *const u16 };
+    let ptr = buf_y.contents().as_ptr() as *const u16;
     for (i, slot) in y_bits.iter_mut().enumerate() {
         *slot = unsafe { *ptr.add(i) };
     }

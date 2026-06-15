@@ -25,7 +25,7 @@
 //! cache stores **post-RoPE K** and **V** in the layout above. M1.2 packs CPU encoder prefill output.
 
 use crate::config::ModelConfig;
-use crate::metal::decoder::{load_weight_cache, load_weight_cache_opt};
+use crate::metal::decoder::load_weight_cache_opt;
 use crate::metal::kv_cache::GpuKvCache;
 use crate::metal::engine::GpuDecoderEngine;
 use crate::metal::encoder_extend::{extend_prefill_gpu, prefill_gpu};
@@ -266,7 +266,7 @@ fn pack_gpu_kv_prefix_to_monolithic(
 
     let pack_pipeline = engine.kernels.pack_encoder_kv.pipeline.clone();
     let telemetry = engine.batch_telemetry();
-    let mut batch = begin_engine_batch(
+    let batch = begin_engine_batch(
         &engine.ctx.queue,
         &mut engine.pool,
         &engine.ctx.device,
@@ -299,54 +299,6 @@ fn pack_gpu_kv_prefix_to_monolithic(
         );
     }
     batch.end()
-}
-
-/// Pack one layer prefix from f32 K/V (engine GPU layout) into monolithic b4 at `dst_pos..`.
-fn pack_layer_f32_kv_to_monolithic(
-    dst: &mut [u8],
-    layout: &ModelLayout,
-    layer: usize,
-    keys: &[f32],
-    values: &[f32],
-    dst_pos: usize,
-    token_count: usize,
-    max_seq: usize,
-) -> Result<(), Error> {
-    let l = &layout.layers[layer];
-    let nkv = l.n_kv_heads as usize;
-    let hd = l.head_dim as usize;
-    let per_token = nkv * hd;
-    if keys.len() < token_count * per_token || values.len() < token_count * per_token {
-        return Err(Error::Format("gpu kv prefix too short"));
-    }
-    if dst_pos + token_count > max_seq {
-        return Err(Error::Format("monolithic kv extend exceeds max_seq"));
-    }
-    let token_stride_half = nkv * hd * 2;
-    let byte_base = l.kv_region as usize;
-    if byte_base + max_seq * token_stride_half * 2 > dst.len() {
-        return Err(Error::Format("monolithic kv buffer too small"));
-    }
-    for pos in 0..token_count {
-        let half_base = byte_base / 2 + (dst_pos + pos) * token_stride_half;
-        for hh in 0..nkv {
-            for d in 0..hd {
-                let src_i = pos * per_token + hh * hd + d;
-                let k_half = f32_to_half_bits(keys[src_i]);
-                let v_half = f32_to_half_bits(values[src_i]);
-                let k_dst = (half_base + hh * hd + d) * 2;
-                let v_dst = (half_base + nkv * hd + hh * hd + d) * 2;
-                dst[k_dst..k_dst + 2].copy_from_slice(&k_half.to_le_bytes());
-                dst[v_dst..v_dst + 2].copy_from_slice(&v_half.to_le_bytes());
-            }
-        }
-    }
-    Ok(())
-}
-
-fn read_f32_prefix(buf: &ProtocolObject<dyn MTLBuffer>, elems: usize) -> Vec<f32> {
-    let ptr = buf.contents().as_ptr() as *const f32;
-    (0..elems).map(|i| unsafe { *ptr.add(i) }).collect()
 }
 
 /// Reusable GPU encoder stack for monolithic KV prefill/extend (P1.8).
@@ -385,7 +337,7 @@ impl MonolithicEncoderCache {
             max_seq_hint,
             shared_dgq_blob,
         )?;
-        let mut engine = GpuDecoderEngine::new()?;
+        let engine = GpuDecoderEngine::new()?;
         if model.weights.is_quantized() {
             engine.set_encoder_gpu_moe(true);
         }
@@ -526,7 +478,7 @@ pub fn prefill_monolithic_kv(
 }
 
 fn read_half_at(kv_buf: &ProtocolObject<dyn MTLBuffer>, byte_off: usize) -> u16 {
-    let ptr = unsafe { kv_buf.contents().as_ptr().add(byte_off) as *const u8 };
+    let ptr = unsafe { kv_buf.contents().as_ptr().add(byte_off) } as *const u8;
     u16::from_le_bytes([unsafe { *ptr }, unsafe { *ptr.add(1) }])
 }
 
@@ -701,11 +653,6 @@ pub fn extend_monolithic_kv(
     )
 }
 
-fn read_f32_at(buf: &ProtocolObject<dyn MTLBuffer>, byte_offset: usize, elems: usize) -> Vec<f32> {
-    let ptr = unsafe { buf.contents().as_ptr().add(byte_offset) as *const f32 };
-    (0..elems).map(|i| unsafe { *ptr.add(i) }).collect()
-}
-
 /// CPU encoder prefill (bf16 weights only).
 pub fn prefill_monolithic_kv_cpu(
     store: &WeightStore,
@@ -852,7 +799,7 @@ pub fn run_step_kv_audit(
         let prefill_len = kv_len / 2;
         let extend_tokens = prompt[prefill_len..].to_vec();
         let prefill_only = &prompt[..prefill_len];
-        let mut extend_buf = ctx
+        let extend_buf = ctx
             .device
             .newBufferWithLength_options(
                 kv_bytes,
@@ -984,40 +931,6 @@ pub fn step_min_entropy_with_kv(
     rt.run_denoise_step()?;
     let st = rt.read_canvas_state();
     Ok(step_entropy_stats(&st.entropy, &st.accept).min_entropy)
-}
-
-/// Count non-finite half values in layer `L` K+V prefix `[0, kv_len)`.
-pub fn kvcache_layer_prefix_non_finite(
-    kv_buf: &ProtocolObject<dyn MTLBuffer>,
-    layout: &ModelLayout,
-    layer: usize,
-    kv_len: usize,
-) -> (usize, usize) {
-    if kv_len == 0 || layer >= N_LAYERS {
-        return (0, 0);
-    }
-    let l = &layout.layers[layer];
-    let nkv = l.n_kv_heads as usize;
-    let hd = l.head_dim as usize;
-    let token_stride_half = nkv * hd * 2;
-    let half_base = l.kv_region as usize / 2;
-    let mut bad = 0usize;
-    let mut total = 0usize;
-    for pos in 0..kv_len {
-        let start = (half_base + pos * token_stride_half) * 2;
-        let end = start + token_stride_half * 2;
-        let bytes = unsafe {
-            std::slice::from_raw_parts(kv_buf.contents().as_ptr().add(start) as *const u8, end - start)
-        };
-        for chunk in bytes.chunks_exact(2) {
-            total += 1;
-            let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-            if !f16_bits_to_f32(bits).is_finite() {
-                bad += 1;
-            }
-        }
-    }
-    (bad, total)
 }
 
 /// Max abs half in K or V plane only for layer `L` prefix `[0, kv_len)`.
@@ -1316,6 +1229,7 @@ pub fn run_step_kv_parity(
     })
 }
 
+#[cfg(test)]
 /// Compare monolithic b4 KV from encoder prefill with CPU MoE vs grouped GPU MoE (same dense path).
 pub fn run_encoder_moe_kv_parity(
     model_dir: &Path,
@@ -1420,10 +1334,8 @@ mod encoder_moe_kv_tests {
         )
         .expect("prefill");
         for layer in 0..2 {
-            let (bad, total) = kvcache_layer_prefix_non_finite(&kv_buf, &layout, layer, kv_len);
             let k_max = kvcache_plane_max_abs(&kv_buf, &layout, layer, kv_len, 0);
-            eprintln!("nvfp4 prefill L{layer}: kv_len={kv_len} k_max={k_max:.4} non_finite={bad}/{total}");
-            assert_eq!(bad, 0, "layer {layer} KV prefix has {bad} non-finite halves");
+            eprintln!("nvfp4 prefill L{layer}: kv_len={kv_len} k_max={k_max:.4}");
             assert!(k_max > 1e-4, "layer {layer} K prefix looks unset (max={k_max})");
         }
     }

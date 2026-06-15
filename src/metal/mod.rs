@@ -46,80 +46,60 @@ mod self_conditioning;
 mod telemetry;
 mod weights;
 
-pub(crate) use buffer::BufferPool;
-pub(crate) use device::{ComputePipeline, MetalContext};
 
 pub use memory::{
     estimate_decoder_forward, estimate_paged_layer_bytes, estimate_weight_cache,
-    log_expert_cache_stats, MemoryEstimate,
+    log_expert_cache_stats,
 };
 
-pub use attention::{GpuAttention, GpuAttentionKernels};
+pub use attention::GpuAttention;
 pub use decoder::{
     bench_forward, forward as decoder_forward, load_weight_cache, BenchConfig, GpuDecoderScratch,
 };
-pub use encoder_extend::{extend_prefill_gpu, prefill_gpu};
+pub use encoder_extend::prefill_gpu;
 pub use weights::GpuDecoderWeightCache;
 pub use kv_cache::GpuKvCache;
 pub use engine::GpuDecoderEngine;
 pub use gemm::{bf16_matmul_cpu, f32_to_bf16, Bf16Gemm};
-pub use probe::{print_probe_result, probe_device, DeviceProbeResult};
+pub use probe::{print_probe_result, probe_device};
 pub use bench_gemm::{bench_custom_kernel, bench_mpsgraph_oracle, parse_shapes, print_bench_rows};
-pub use sampler::{sampler_step_gpu, upload_logits_gpu};
+pub use sampler::sampler_step_gpu;
 pub use step_kernel::{
-    bench_step_kernel, build_step_runtime, hello_chat_prefill_token_ids, logits_finite_check_enabled,
-    run_denoise_steps, run_single_denoise_step, run_step_attn_layer_capture, run_step_forward,
-    run_step_layer_hidden_probe, run_step_moe_layer_capture, run_step_moe_batched_pin_capture,
-    run_step_moe_route_capture,
-    run_step_moe_single_expert_capture,
-    run_step_preamble_capture,
-    run_step_probe, run_step_smoke, run_embed_row_gpu,
-    step_use_moe_grouped_q4_default,
-    step_use_sc_gemm_default, layer_moe_block_jobs,
-    DenoiseStepStats, trace_entropy_enabled, LayerAttnCapture, LayerMoeCapture, MoeRouteCapture,
-    RouteScratchStats,
-    PreambleCapture, SingleExpertMoeCapture,
-    bench_step_kernel_profile, StepBenchResult, StepFinishMode, StepForwardOutput, StepProfileResult,
-    StepProbeResult,
-    StepSmokeConfig, StepSmokeResult, CANVAS, CanvasState, LayerOffsets, RouteScratch, StepParams,
+    bench_step_kernel, build_step_runtime,
+    run_step_probe, run_step_smoke, run_embed_row_gpu, layer_moe_block_jobs, trace_entropy_enabled,
+    bench_step_kernel_profile, StepFinishMode,
+    StepSmokeConfig, CANVAS, CanvasState, LayerOffsets, RouteScratch, StepParams,
     N_EXPERTS, TOP_K, HID, MOE_FF,
 };
 pub use step_preamble_dump::{
-    hidden_cosine as preamble_hidden_cosine, run_step_preamble_dump, write_step_preamble_dump,
-    StepPreambleDump,
+    run_step_preamble_dump, write_step_preamble_dump,
 };
 pub use step_attn_dump::{
-    hidden_cosine, run_step_attn_layer_dump, write_step_attn_layer_dump, StepAttnLayerDump,
+    run_step_attn_layer_dump, write_step_attn_layer_dump,
 };
-pub use step_moe_dump::{run_step_moe_layer_dump, write_step_moe_layer_dump, StepMoeLayerDump};
+pub use step_moe_dump::{run_step_moe_layer_dump, write_step_moe_layer_dump};
 pub use step_moe_batched_pin_dump::{
     print_pin_summary as print_batched_pin_summary, run_step_moe_batched_pin_dump,
     write_step_moe_batched_pin_dump,
 };
-pub use crate::kernels::sub::moe_batched_pin::MoeBatchedPinDump;
 pub use step_moe_route_dump::{
-    print_route_summary, run_step_moe_route_dump, write_step_moe_route_dump, StepMoeRouteDump,
+    print_route_summary, run_step_moe_route_dump, write_step_moe_route_dump,
 };
 pub use step_moe_single_dump::{
-    run_step_moe_single_expert_dump, write_step_moe_single_expert_dump, StepMoeSingleExpertDump,
+    run_step_moe_single_expert_dump, write_step_moe_single_expert_dump,
 };
 pub use step_logits_dump::{
     parse_positions, run_step_bf16_oracle_logits_dump, run_step_bf16_oracle_logits_dump_gpu_kv,
     run_step_layer_hidden_dump,
     run_step_logits_dump, write_step_layer_hidden_dump, write_step_logits_dump,
-    StepLayerHiddenDump, StepLogitsDump,
 };
-pub use step_m0::{run_step_parity, run_step_verify, M0VerifyResult, StepParityConfig, StepParityResult};
-pub use step_config::{log_validated_step_model, validate_step_model, ValidatedStepModel};
+pub use step_m0::{run_step_parity, run_step_verify, StepParityConfig};
+pub use step_config::{log_validated_step_model, validate_step_model};
 pub use step_generate::{generate_monolithic, generate_with_session, StepGenerateConfig, StepGenerateSession};
-pub use step_quant::{
-    batched_moe_enabled, moe_execution_style, quant_format_from_profile, BlockGroupedJob,
-    MoeExecutionStyle, StepBlockProfile,
-};
+pub use step_quant::BlockGroupedJob;
 pub use step_kv::{
-    extend_monolithic_kv, monolithic_kv_prefix_max_diff, prefill_monolithic_kv_with_cache,
+    prefill_monolithic_kv_with_cache,
     run_step_kv_audit, run_step_kv_parity, run_step_kv_bf16_cross_parity,
-    run_step_attn_probe, MonolithicEncoderCache, StepKvAuditResult, StepKvBf16CrossResult,
-    StepKvParityResult,
+    run_step_attn_probe, MonolithicEncoderCache,
 };
 pub use telemetry::{ForwardTelemetry, SessionTelemetry, StepPhaseTelemetry};

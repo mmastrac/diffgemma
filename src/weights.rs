@@ -1,6 +1,6 @@
 use crate::dgq::store::looks_like_dgq_dir;
 use crate::dgq::DgqStore;
-use crate::pack::{PackedStore, TensorLayout};
+use crate::pack::PackedStore;
 use crate::safetensors::{Error, SafetensorsFile, TensorInfo};
 use crate::tensor::TensorView;
 use serde::Deserialize;
@@ -70,10 +70,6 @@ impl SafetensorStore {
             .ok_or_else(|| Error::NotFound(name.to_string()))?;
         let data = shard.data(info);
         Ok(TensorView::from_info(&info.name, info, data))
-    }
-
-    pub fn tensor_layout(&self, _name: &str) -> TensorLayout {
-        TensorLayout::Raw
     }
 
     pub fn is_packed(&self) -> bool {
@@ -153,19 +149,6 @@ impl WeightStore {
 
     pub fn is_quantized(&self) -> bool {
         matches!(self, Self::Dgq(_))
-    }
-
-    pub fn tensor_layout(&self, name: &str) -> TensorLayout {
-        match self {
-            Self::Safetensors(s) => s.tensor_layout(name),
-            Self::Packed(s) => s.tensor_layout(name),
-            Self::Dgq(_) => TensorLayout::Raw,
-        }
-    }
-
-    pub fn experts_pretransposed(&self) -> bool {
-        self.tensor_layout("model.decoder.layers.0.experts.gate_up_proj")
-            == TensorLayout::ExpertGateUpT
     }
 
     pub fn tensor(&self, name: &str) -> Result<TensorView<'_>, Error> {

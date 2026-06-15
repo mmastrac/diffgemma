@@ -28,16 +28,6 @@ impl TensorLayout {
             Self::ExpertDownT => "expert_down_t",
         }
     }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "raw" => Some(Self::Raw),
-            "gemm_bf16_t" => Some(Self::GemmBf16T),
-            "expert_gate_up_t" => Some(Self::ExpertGateUpT),
-            "expert_down_t" => Some(Self::ExpertDownT),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

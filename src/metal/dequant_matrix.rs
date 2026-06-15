@@ -1,10 +1,15 @@
 //! Full-matrix block dequant kernels (test / validation helpers).
 
+#[cfg(test)]
 use crate::metal::device::ComputePipeline;
+#[cfg(test)]
 use crate::metal::dgq_gpu::Q4LinearGpu;
+#[cfg(test)]
 use objc2::runtime::ProtocolObject;
+#[cfg(test)]
 use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder};
 
+#[cfg(test)]
 pub fn dispatch_dequant_block_matrix(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     pipeline: &ComputePipeline,
@@ -46,7 +51,7 @@ mod tests {
     use crate::metal::batch::GpuBatch;
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
-    use crate::metal::dgq_gpu::{load_q4_linear, DgqGpuBlob};
+    use crate::metal::dgq_gpu::{load_block_linear, DgqGpuBlob};
     use std::sync::Arc;
 
     #[test]
@@ -59,7 +64,7 @@ mod tests {
         let store = DgqStore::open(dgq_dir).expect("open dgq");
         let ctx = MetalContext::new().expect("metal");
         let blob = DgqGpuBlob::from_store(&store, &ctx.device).expect("blob");
-        let q4 = load_q4_linear(
+        let q4 = load_block_linear(
             &store,
             Arc::clone(&blob),
             "model.decoder.layers.0.self_attn.q_proj.weight",
@@ -76,7 +81,7 @@ mod tests {
         )
         .expect("pipeline");
         let mut pool = BufferPool::new();
-        let mut batch = GpuBatch::begin(&ctx.queue, &mut pool, &ctx.device).expect("batch");
+        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None).expect("batch");
         let buf_out = batch.alloc_f32_out(q4.out_dim * q4.in_dim).expect("out");
         {
             let enc = batch.encoder();

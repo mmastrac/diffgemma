@@ -359,19 +359,6 @@ pub fn sampler_step_gpu(
     })
 }
 
-/// Upload processed logits back to the persistent GPU buffer (self-conditioning path).
-pub fn upload_logits_gpu(
-    scratch: &mut GpuSamplerScratch,
-    _engine: &mut GpuDecoderEngine,
-    logits: &[f32],
-) -> Result<(), Error> {
-    let Some(buf) = scratch.logits.as_buf() else {
-        return Err(Error::Format("gpu logits buffer missing"));
-    };
-    BufferPool::write_f32(buf, logits);
-    Ok(())
-}
-
 #[cfg(all(test, feature = "metal", target_os = "macos"))]
 mod tests {
     use super::*;
@@ -420,7 +407,7 @@ mod tests {
         let mut scratch = GpuSamplerScratch::new(canvas_len, vocab);
         scratch.sample_rand.copy_from_slice(&rand_vals);
 
-        let mut batch = GpuBatch::begin(&ctx.queue, &mut pool, &ctx.device).expect("batch");
+        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None).expect("batch");
         let logits_ref = logits_buf.as_buf().expect("buf");
         dispatch_logit_softcapping(&mut batch, &sk, logits_ref, total, 30.0);
         dispatch_scale_logits(&mut batch, &sk, logits_ref, total, temperature);

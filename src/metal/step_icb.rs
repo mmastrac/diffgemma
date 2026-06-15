@@ -7,7 +7,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSRange;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder, MTLDevice,
+    MTLBuffer, MTLCommandBuffer, MTLComputeCommandEncoder, MTLDevice,
     MTLIndirectCommandBuffer, MTLIndirectCommandBufferDescriptor, MTLIndirectCommandType,
     MTLIndirectComputeCommand, MTLResourceOptions, MTLSize,
 };
@@ -22,7 +22,6 @@ const ICB_CONST_ALIGN: usize = 256;
 pub struct StepIcbPlan {
     pub icb: Retained<ProtocolObject<dyn MTLIndirectCommandBuffer>>,
     pub command_count: u32,
-    pub const_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
 
 pub struct StepIcbPair {
@@ -151,7 +150,6 @@ impl IcbRecorder {
         Ok(StepIcbPlan {
             icb: self.icb,
             command_count: self.cmd_idx,
-            const_buf: self.const_buf,
         })
     }
 }

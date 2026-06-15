@@ -139,7 +139,7 @@ pub fn cpu_interleaved(f: &InterleavedFixture) -> Vec<f32> {
 }
 
 pub fn cpu_oracle_interleaved(f: &InterleavedFixture) -> Vec<f32> {
-    let mut gate: Vec<f32> = f
+    let gate: Vec<f32> = f
         .gate_up
         .chunks(f.moe_inter * 2)
         .flat_map(|row| {
@@ -319,7 +319,7 @@ pub fn gpu_half_glu(f: &HalfFixture, variant: KernelVariant) -> Result<Vec<f32>,
             len as u32,
         );
     })?;
-    let ptr = unsafe { buf_y.contents().as_ptr() as *const u16 };
+    let ptr = buf_y.contents().as_ptr() as *const u16;
     Ok((0..len)
         .map(|i| f16::f16_bits_to_f32(unsafe { *ptr.add(i) }))
         .collect())

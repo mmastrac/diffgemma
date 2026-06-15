@@ -1,6 +1,6 @@
 //! CPU reference for monolithic sampler kernels (tempered rowstats, commit, apply, write).
 
-use crate::sample::{accept_mask_from_entropies, early_stop_allowed, FILLER_TOKEN_ID, PAD_TOKEN_ID};
+use crate::sample::{accept_mask_from_entropies, early_stop_allowed};
 
 /// Temperature after `steps_done` denoise iterations (matches `temp_at` in Metal).
 pub fn temp_at(steps_done: u32, max_steps: u32, t_min: f32, t_max: f32) -> f32 {
@@ -195,6 +195,7 @@ pub fn sample_write_cpu(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sample::{FILLER_TOKEN_ID, PAD_TOKEN_ID};
 
     #[test]
     fn temp_at_matches_sample_rs() {

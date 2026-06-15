@@ -62,7 +62,7 @@ pub fn tiny_fixture(_: ElemFormat) -> Fixture {
     }
     Fixture {
         q: (0..canvas * n_q_heads * hd)
-            .map(|i| ((i as f32 * 0.11).sin() * 0.6))
+            .map(|i| (i as f32 * 0.11).sin() * 0.6)
             .collect(),
         kvcache,
         layer: LayerAttnParams {
@@ -134,7 +134,7 @@ fn model_attn_fixture(
     }
     Fixture {
         q: (0..canvas * n_q_heads * hd)
-            .map(|i| ((i as f32 * 0.017).sin() * 0.5 + 0.02 * (i % hd) as f32))
+            .map(|i| (i as f32 * 0.017).sin() * 0.5 + 0.02 * (i % hd) as f32)
             .collect(),
         kvcache,
         layer: LayerAttnParams {
@@ -303,7 +303,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     cmd.waitUntilCompleted();
 
     let mut out = vec![0.0f32; f.out_len()];
-    let ptr = unsafe { buf_out.contents().as_ptr() as *const u16 };
+    let ptr = buf_out.contents().as_ptr() as *const u16;
     for (i, o) in out.iter_mut().enumerate() {
         *o = f16::f16_bits_to_f32(unsafe { *ptr.add(i) });
     }

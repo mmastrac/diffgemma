@@ -350,17 +350,16 @@ fn forward_inner(
     let gpu_kv_ref = scratch.gpu_kv.as_ref();
     // Canvas K/V are fully overwritten per layer in write_canvas_kv_pre_rope; do not
     // zero the suffix here — clearing all layers before each forward caused repeat drift.
-    let mut bf16_layer_weights = None;
     for layer in 0..n_layers {
         let layer_scratch = scratch.layer.ensure(cfg, seq_len, input.kv_cache.kv_len, layer)?;
-        let lw = if weights.is_dgq() {
+        let layer_weights = if weights.is_dgq() {
             None
         } else {
-            bf16_layer_weights = Some(crate::model::layer_weights::DecoderLayerWeights::load(
+            Some(crate::model::layer_weights::DecoderLayerWeights::load(
                 store, layer, text,
-            )?);
-            bf16_layer_weights.as_ref()
+            )?)
         };
+        let lw = layer_weights.as_ref();
         weights.ensure_layer(store, text, layer, &engine.ctx.device, &mut engine.pool)?;
         {
             let layer_cache = weights.layer_ref(layer);

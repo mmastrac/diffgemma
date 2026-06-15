@@ -1,6 +1,6 @@
 //! Mmap-backed weight store for `iris.pack` models.
 
-use crate::pack::layout::{PackManifest, TensorLayout, MANIFEST_FILE};
+use crate::pack::layout::{PackManifest, MANIFEST_FILE};
 use crate::safetensors::{DType, Error};
 use crate::tensor::TensorView;
 use memmap2::Mmap;
@@ -41,13 +41,6 @@ impl PackedStore {
 
     pub fn is_packed(&self) -> bool {
         true
-    }
-
-    pub fn tensor_layout(&self, name: &str) -> TensorLayout {
-        self.index
-            .get(name)
-            .and_then(|&i| TensorLayout::parse(&self.manifest.tensors[i].meta.layout))
-            .unwrap_or(TensorLayout::Raw)
     }
 
     pub fn tensor(&self, name: &str) -> Result<TensorView<'_>, Error> {

@@ -3,7 +3,7 @@
 use crate::denoise_trace::{step_trace_from_stats, DenoiseTrace, SCHEMA_VERSION};
 use crate::generate::GenerateOutput;
 use crate::metal::step_kernel::{
-    build_step_runtime, denoise_parity_log_enabled, init_canvas_state_from_rng, log_denoise_parity_step,
+    build_step_runtime, denoise_parity_log_enabled, log_denoise_parity_step,
     step_params_from_sampler, trace_entropy_enabled, StepFinishMode, StepRuntime, StepSmokeConfig,
     CANVAS, N_LAYERS, VOCAB,
 };
@@ -131,14 +131,6 @@ impl StepGenerateSession {
             build.compile,
         ))
     }
-
-    pub fn runtime(&self) -> &StepRuntime {
-        &self.rt
-    }
-
-    pub fn runtime_mut(&mut self) -> &mut StepRuntime {
-        &mut self.rt
-    }
 }
 
 /// Monolithic generate: prefill prompt → denoise blocks → extend KV (matches `generate_inner` structure).
@@ -255,7 +247,7 @@ pub fn generate_with_session(
         let mut min_entropy_hist = Vec::new();
         let mut mean_entropy_hist = Vec::new();
         let mut low_ent_hist = Vec::new();
-        let mut last_st = None;
+        let mut last_st;
         let mut stopper = StableConfidentStopper::new(
             cfg.sampler.stability_threshold,
             if cfg.no_early_stop {
@@ -283,7 +275,7 @@ pub fn generate_with_session(
             denoise_steps_run += 1;
             block_step_count += 1;
             let st = rt.read_canvas_state();
-            last_st = Some(st);
+            last_st = st;
             if denoise_parity_log_enabled() {
                 log_denoise_parity_step(
                     &format!("block={block_idx} step_index={block_step_count}"),
@@ -362,7 +354,7 @@ pub fn generate_with_session(
                 break;
             }
         }
-        let st = last_st.expect("denoise loop ran at least one step");
+        let st = last_st;
         let block_elapsed = block_started.elapsed();
         denoise_elapsed += block_elapsed;
         block_steps_eff.push(block_step_count);
@@ -475,7 +467,7 @@ pub fn generate_with_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metal::step_kernel::{logits_finite_check_enabled, StepRuntime};
+    use crate::metal::step_kernel::{logits_finite_check_enabled, init_canvas_state_from_rng, StepRuntime};
     use crate::sample::initialize_canvas;
 
     #[test]

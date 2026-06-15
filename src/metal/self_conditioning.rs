@@ -40,7 +40,7 @@ pub fn apply_gpu(
         telemetry,
     )?;
     let buf_soft = batch.alloc_f32(soft_signal)?;
-    let buf_embed = batch.alloc_f32(embed_buf)?;
+    let _buf_embed = batch.alloc_f32(embed_buf)?;
     let buf_normed = bk::rms_norm_rows_gpu_buf(
         &mut batch,
         &engine.kernels,

@@ -5,11 +5,9 @@ use crate::metal::engine::GpuDecoderEngine;
 use crate::metal::linear::linear_cached_batched_in_buf;
 use crate::metal::moe::{
     build_expert_jobs, experts_forward_dgq_cpu, experts_forward_gpu_batched,
-    experts_forward_gpu_grouped_in_batch, experts_forward_gpu_per_job,
-    scatter_weighted_expert_outputs,
 };
-use crate::model::moe::{prepare_expert_input, route_with_cached_weights};
-use crate::metal::router::{pack_routes, route_gpu_in_batch, GpuRouteScratch};
+use crate::model::moe::prepare_expert_input;
+use crate::metal::router::{route_gpu_in_batch, GpuRouteScratch};
 use crate::metal::weights::{GpuDecoderWeightCache, GpuLayerWeightCache};
 use crate::metal::decoder_attention::{
     forward_decoder_attention, forward_encoder_extend_attention, forward_encoder_prefill_attention,
@@ -28,15 +26,11 @@ pub struct GpuDecoderLayerScratch {
     pub attn_out: Vec<f32>,
     pub residual: Vec<f32>,
     pub normed: Vec<f32>,
-    pub gate: Vec<f32>,
-    pub mlp_hidden: Vec<f32>,
     pub dense_out: Vec<f32>,
     pub moe_branch: Vec<f32>,
     pub moe_input: Vec<f32>,
     pub moe_token_indices: Vec<u32>,
     pub moe_batch_out: Vec<f32>,
-    pub route_indices: Vec<u32>,
-    pub route_weights: Vec<f32>,
 }
 
 impl GpuDecoderLayerScratch {
@@ -47,7 +41,6 @@ impl GpuDecoderLayerScratch {
         kv_cache_len: usize,
     ) -> Result<Self, Error> {
         let hidden = cfg.hidden_size;
-        let inter = cfg.intermediate_size;
         let attn_params = AttentionParams::for_layer(cfg, layer)?;
         Ok(Self {
             cpu: DecoderLayerScratch::with_kv_len(seq_len, cfg, layer, kv_cache_len)?,
@@ -55,15 +48,11 @@ impl GpuDecoderLayerScratch {
             attn_out: vec![0.0; seq_len * hidden],
             residual: vec![0.0; seq_len * hidden],
             normed: vec![0.0; seq_len * hidden],
-            gate: vec![0.0; seq_len * inter],
-            mlp_hidden: vec![0.0; seq_len * inter],
             dense_out: vec![0.0; seq_len * hidden],
             moe_branch: vec![0.0; seq_len * hidden],
             moe_input: vec![0.0; seq_len * hidden],
             moe_token_indices: Vec::new(),
             moe_batch_out: Vec::new(),
-            route_indices: vec![0; seq_len * cfg.top_k_experts],
-            route_weights: vec![0.0; seq_len * cfg.top_k_experts],
         })
     }
 }
@@ -272,7 +261,6 @@ fn forward_layer_ff_dgq_gpu(
     batch.register_read(buf_stream.clone(), &mut scratch.moe_input);
     batch.end()?;
     let routes = route_scratch.into_routes(seq_len, top_k);
-    let mut batch = None;
 
     let jobs = build_expert_jobs(&routes, experts);
     if let Some(cell) = &telemetry {
@@ -342,32 +330,16 @@ fn forward_layer_ff_dgq_gpu(
                 &mut scratch.cpu.moe,
             )?;
         }
-        batch = Some(begin_engine_batch(
-            &engine.ctx.queue,
-            &mut engine.pool,
-            &engine.ctx.device,
-            telemetry.clone(),
-        )?);
-        buf_ff = batch.as_mut().expect("combine batch").alloc_f32(&scratch.dense_out)?;
-        buf_stream = batch
-            .as_mut()
-            .expect("combine batch")
-            .alloc_f32(&scratch.moe_input)?;
-    } else {
-        batch = Some(begin_engine_batch(
-            &engine.ctx.queue,
-            &mut engine.pool,
-            &engine.ctx.device,
-            telemetry.clone(),
-        )?);
-        buf_ff = batch.as_mut().expect("combine batch").alloc_f32(&scratch.dense_out)?;
-        buf_stream = batch
-            .as_mut()
-            .expect("combine batch")
-            .alloc_f32(&scratch.moe_input)?;
     }
 
-    let mut batch = batch.expect("ff combine batch");
+    let mut batch = begin_engine_batch(
+        &engine.ctx.queue,
+        &mut engine.pool,
+        &engine.ctx.device,
+        telemetry.clone(),
+    )?;
+    buf_ff = batch.alloc_f32(&scratch.dense_out)?;
+    buf_stream = batch.alloc_f32(&scratch.moe_input)?;
 
     let buf_moe = batch.alloc_f32(&scratch.moe_branch)?;
     let buf_moe_n = bk::rms_norm_rows_gpu_buf(
@@ -613,8 +585,8 @@ pub fn forward_encoder_extend(
     engine: &mut GpuDecoderEngine,
     gpu_kv: &GpuKvCache,
 ) -> Result<(), Error> {
-    let hidden = cfg.hidden_size;
-    let eps = cfg.rms_norm_eps as f32;
+    let _hidden = cfg.hidden_size;
+    let _eps = cfg.rms_norm_eps as f32;
 
     forward_encoder_extend_attention(
         &mut scratch.attn_out,
@@ -1789,11 +1761,9 @@ mod determinism_tests {
         )
         .expect("scratch_b");
         if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {
-            gpu_kv.clear_canvas_suffix(canvas_len).expect("clear");
         }
         let a = ctx.run_layer(0, &hidden_in, &mut scratch_a);
         if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {
-            gpu_kv.clear_canvas_suffix(canvas_len).expect("clear");
         }
         let b = ctx.run_layer(0, &hidden_in, &mut scratch_b);
         if a != b {
@@ -1813,7 +1783,7 @@ mod determinism_tests {
         let mut ctx = LayerTestCtx::new(2);
         let canvas_len = ctx.cfg.canvas_length;
         let hidden_in = ctx.hidden_in.clone();
-        let run_once = |ctx: &mut LayerTestCtx, clear_kv: bool| {
+        let run_once = |ctx: &mut LayerTestCtx, _clear_kv: bool| {
             let mut scratch = GpuDecoderLayerScratch::with_kv_len(
                 canvas_len,
                 &ctx.cfg.text_config,
@@ -1821,13 +1791,6 @@ mod determinism_tests {
                 ctx.kv.kv_len,
             )
             .expect("scratch");
-            if clear_kv {
-                if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {
-                    gpu_kv
-                        .clear_canvas_suffix(canvas_len)
-                        .expect("clear canvas kv");
-                }
-            }
             ctx.run_layer(0, &hidden_in, &mut scratch)
         };
         let a = run_once(&mut ctx, false);
@@ -1868,11 +1831,9 @@ mod determinism_tests {
         let mut s2a = GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 2, kv_len).expect("s2a");
         let mut s2b = GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 2, kv_len).expect("s2b");
         if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {
-            gpu_kv.clear_canvas_suffix(canvas_len).expect("clear kv");
         }
         let a = ctx.run_layer(2, &h1, &mut s2a);
         if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {
-            gpu_kv.clear_canvas_suffix(canvas_len).expect("clear kv");
         }
         let b = ctx.run_layer(2, &h1, &mut s2b);
         if a != b {
@@ -1898,7 +1859,6 @@ mod determinism_tests {
         let mut s1a = GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 1, kv_len).expect("s1a");
         let mut s2a = GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 2, kv_len).expect("s2a");
         if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {
-            gpu_kv.clear_canvas_suffix(canvas_len).expect("clear kv");
         }
         let h0a = ctx.run_layer(0, &hidden_in, &mut s0a);
         let h1a = ctx.run_layer(1, &h0a, &mut s1a);
@@ -1908,7 +1868,6 @@ mod determinism_tests {
         let mut s1b = GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 1, kv_len).expect("s1b");
         let mut s2b = GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 2, kv_len).expect("s2b");
         if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {
-            gpu_kv.clear_canvas_suffix(canvas_len).expect("clear kv");
         }
         let h0b = ctx.run_layer(0, &hidden_in, &mut s0b);
         let h1b = ctx.run_layer(1, &h0b, &mut s1b);
@@ -2116,7 +2075,6 @@ mod determinism_tests {
         let cached = ctx.weights.layer_ref(2);
         let kv_view = LayerKvView::from_layer(ctx.kv.layer(2).expect("kv"), kv_len);
         if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {
-            gpu_kv.clear_canvas_suffix(canvas_len).expect("clear canvas kv");
         }
         let mut a = vec![0.0f32; canvas_len * hidden_dim];
         let mut b = vec![0.0f32; canvas_len * hidden_dim];
@@ -2143,7 +2101,6 @@ mod determinism_tests {
         )
         .expect("scratch_b");
         if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {
-            gpu_kv.clear_canvas_suffix(canvas_len).expect("clear canvas kv");
         }
         forward_decoder_attention(
             &mut b,

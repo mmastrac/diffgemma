@@ -1,7 +1,7 @@
 //! Per-layer attention dumps (Q/K/scores/attn_out) for MLX parity at a canvas row.
 
 use crate::metal::step_kernel::{
-    build_step_runtime, run_step_attn_layer_capture, LayerAttnCapture, StepSmokeConfig,
+    run_step_attn_layer_capture, LayerAttnCapture, StepSmokeConfig,
 };
 use crate::safetensors::Error;
 use serde::Serialize;
@@ -106,16 +106,4 @@ pub fn write_step_attn_layer_dump(path: &Path, dump: &StepAttnLayerDump) -> Resu
     }
     let text = serde_json::to_string_pretty(dump).map_err(Error::Json)?;
     std::fs::write(path, text).map_err(Error::Io)
-}
-
-pub fn hidden_cosine(a: &[f32], b: &[f32]) -> f32 {
-    let n = a.len().min(b.len());
-    let dot: f32 = (0..n).map(|i| a[i] * b[i]).sum();
-    let na = (0..n).map(|i| a[i] * a[i]).sum::<f32>().sqrt();
-    let nb = (0..n).map(|i| b[i] * b[i]).sum::<f32>().sqrt();
-    if na > 1e-12 && nb > 1e-12 {
-        dot / (na * nb)
-    } else {
-        f32::NAN
-    }
 }

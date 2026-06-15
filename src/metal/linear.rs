@@ -38,9 +38,6 @@ impl GpuLinearWeight {
         }
     }
 
-    pub fn is_q4(&self) -> bool {
-        matches!(self, Self::Q4(_))
-    }
 }
 
 /// GPU linear weight in PyTorch `[out_dim, in_dim]` bf16 layout (no transpose).
@@ -191,34 +188,6 @@ pub fn linear_batched_in_cpu_out(
     Ok(())
 }
 
-/// Batched `y = x @ W^T` with pre-transposed weights; readback on `batch.end()`.
-pub fn linear_cached_batched(
-    batch: &mut GpuBatch<'_>,
-    bf16_pipeline: &ComputePipeline,
-    q4_pipeline: &ComputePipeline,
-    nvfp4_pipeline: &ComputePipeline,
-    y: &mut [f32],
-    x: &[f32],
-    w: &GpuLinearWeight,
-    seq_len: usize,
-) -> Result<(), Error> {
-    if x.len() != seq_len * w.in_dim() || y.len() != seq_len * w.out_dim() {
-        return Err(Error::Format("linear_cached_batched shape mismatch"));
-    }
-    let buf_a = batch.alloc_f32(x)?;
-    let buf_c = linear_batched_in_buf(
-        batch,
-        bf16_pipeline,
-        q4_pipeline,
-        nvfp4_pipeline,
-        &buf_a,
-        w,
-        seq_len,
-    )?;
-    batch.register_read(buf_c, y);
-    Ok(())
-}
-
 /// `y = x_buf @ W^T`; output stays on GPU until the batch ends.
 pub fn linear_cached_batched_in_buf(
     batch: &mut GpuBatch<'_>,
@@ -349,38 +318,4 @@ pub fn f32_q8_linear_kxn_gpu_bufs(
         k,
     );
     Ok(buf_c)
-}
-
-pub fn f32_linear_gpu_bufs(
-    batch: &mut GpuBatch<'_>,
-    bf16_pipeline: &ComputePipeline,
-    q4_pipeline: &ComputePipeline,
-    nvfp4_pipeline: &ComputePipeline,
-    x_buf: &ProtocolObject<dyn MTLBuffer>,
-    w: &GpuLinearWeight,
-    m: usize,
-    k: usize,
-    n: usize,
-) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
-    match w {
-        GpuLinearWeight::Bf16(cached) => {
-            let mut upload = 0u64;
-            let buf_w = cached.gpu_weight_tracked(batch.device, batch.pool, Some(&mut upload));
-            batch.record_dense_upload(upload);
-            let buf_c = batch.alloc_f32_out(m * n)?;
-            batch.dispatch_linear(
-                &bf16_pipeline.pipeline,
-                x_buf,
-                &buf_w,
-                &buf_c,
-                m,
-                n,
-                k,
-            );
-            Ok(buf_c)
-        }
-        GpuLinearWeight::Q4(q4) => {
-            f32_q4_linear_gpu_bufs(batch, q4_pipeline, nvfp4_pipeline, x_buf, q4, m, k, n)
-        }
-    }
 }

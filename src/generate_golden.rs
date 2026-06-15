@@ -191,6 +191,7 @@ impl ChatQualityFixture {
     }
 }
 
+#[cfg(test)]
 pub fn default_chat_quality_fixture() -> ChatQualityFixture {
     ChatQualityFixture {
         name: "chat_quality_hello_layers3".into(),

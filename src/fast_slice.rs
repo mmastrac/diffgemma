@@ -30,14 +30,6 @@ impl<'a, T> FastSlice<'a, T> {
         }
     }
 
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
     #[inline(always)]
     pub unsafe fn read_unchecked(&self, index: usize) -> T
     where
@@ -65,10 +57,6 @@ impl<'a, T> FastSliceMut<'a, T> {
 
     pub fn len(&self) -> usize {
         self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
     }
 
     #[inline(always)]
@@ -110,10 +98,6 @@ impl<'a> FastBf16Slice<'a> {
 
     pub fn len(&self) -> usize {
         self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
     }
 
     /// View into `[elem_off .. elem_off + elem_len)` bf16 elements.

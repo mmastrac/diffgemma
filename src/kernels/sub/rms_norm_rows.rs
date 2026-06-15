@@ -5,7 +5,7 @@ use crate::kernels::cpu;
 use crate::safetensors::Error;
 
 pub use super::variant::KernelVariant;
-use super::manifest::{self, RmsNormRowsVariant};
+use super::manifest::{self};
 
 pub const ENTRY: &str = "rms_norm_rows";
 
@@ -130,9 +130,9 @@ pub fn gpu_no_scale(fix: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, E
 fn gpu_affine(fix: &Fixture, variant: KernelVariant, affine: bool) -> Result<Vec<f32>, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
-    use objc2::runtime::ProtocolObject;
+    
     use objc2_metal::{
-        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+        MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
         MTLSize,
     };
 

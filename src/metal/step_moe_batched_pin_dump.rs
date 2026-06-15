@@ -7,8 +7,6 @@ use std::path::Path;
 
 pub use crate::kernels::sub::moe_batched_pin::print_pin_summary;
 
-pub const SCHEMA_VERSION: u32 = 1;
-
 pub fn run_step_moe_batched_pin_dump(
     model_dir: &Path,
     cfg: &StepSmokeConfig,

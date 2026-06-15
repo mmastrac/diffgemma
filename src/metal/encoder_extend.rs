@@ -88,15 +88,14 @@ pub fn prefill_gpu(
         );
     }
     let mut use_a_input = true;
-    let mut bf16_layer_weights = None;
     for layer in 0..n_layers {
         let layer_started = std::time::Instant::now();
-        let lw = if weights.is_dgq() {
+        let layer_weights = if weights.is_dgq() {
             None
         } else {
-            bf16_layer_weights = Some(DecoderLayerWeights::load(store, layer, text)?);
-            bf16_layer_weights.as_ref()
+            Some(DecoderLayerWeights::load(store, layer, text)?)
         };
+        let lw = layer_weights.as_ref();
         weights.ensure_layer(store, text, layer, &engine.ctx.device, &mut engine.pool)?;
         {
             let layer_cache = weights.layer_ref(layer);
@@ -228,14 +227,13 @@ pub fn extend_prefill_gpu(
         .unwrap_or(text.num_hidden_layers)
         .min(text.num_hidden_layers);
     let mut use_a_input = true;
-    let mut bf16_layer_weights = None;
     for layer in 0..n_layers {
-        let lw = if weights.is_dgq() {
+        let layer_weights = if weights.is_dgq() {
             None
         } else {
-            bf16_layer_weights = Some(DecoderLayerWeights::load(store, layer, text)?);
-            bf16_layer_weights.as_ref()
+            Some(DecoderLayerWeights::load(store, layer, text)?)
         };
+        let lw = layer_weights.as_ref();
         weights.ensure_layer(store, text, layer, &engine.ctx.device, &mut engine.pool)?;
         {
             let layer_cache = weights.layer_ref(layer);
