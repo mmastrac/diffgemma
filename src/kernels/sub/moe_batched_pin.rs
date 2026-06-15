@@ -209,11 +209,11 @@ impl MoeBatchedPinRoute {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MoeBatchedPinLayout {
-    /// Bytes: gathered A rows live at `mps_w[0..moe_w_off_gu)`.
+    /// Bytes: gathered A rows live at `gemm_b[0..moe_w_off_gu)`.
     pub moe_w_off_gu_bytes: usize,
-    /// Gate/up GEMM output `[num_slots, moe_ff*2]` f32 at `mps_w[moe_w_off_gu..]`.
+    /// Gate/up GEMM output `[num_slots, moe_ff*2]` f32 at `gemm_b[moe_w_off_gu..]`.
     pub gate_up_elems: usize,
-    /// Post-swiglu activations `[num_slots, moe_ff]` f32 at `mps_x[0..]`.
+    /// Post-swiglu activations `[num_slots, moe_ff]` f32 at `gemm_a[0..]`.
     pub swiglu_elems: usize,
     pub hidden: usize,
     pub moe_ff: usize,
@@ -222,11 +222,11 @@ pub struct MoeBatchedPinLayout {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MoeBatchedPinStageCos {
     pub gather: f32,
-    /// Raw gate_up GEMM: `mps_w@gu_off` vs CPU `gemm_block_grouped` (before swiglu).
+    /// Raw gate_up GEMM: `gemm_b@gu_off` vs CPU `gemm_block_grouped` (before swiglu).
     pub gate_up_gemm: f32,
-    /// Post-swiglu: `mps_x` vs CPU swiglu(CPU gate_up GEMM).
+    /// Post-swiglu: `gemm_a` vs CPU swiglu(CPU gate_up GEMM).
     pub swiglu_post: f32,
-    /// Swiglu isolated: `mps_x` vs CPU swiglu(GPU gate_up GEMM readback).
+    /// Swiglu isolated: `gemm_a` vs CPU swiglu(GPU gate_up GEMM readback).
     pub swiglu_isolated: f32,
     pub down: f32,
     pub scatter: f32,
@@ -363,9 +363,9 @@ fn first_divergent_stage(stages: &MoeBatchedPinStageCos) -> &'static str {
 pub fn decisive_verdict(stages: &MoeBatchedPinStageCos) -> &'static str {
     const THRESH: f32 = 0.99;
     if stages.gate_up_gemm < THRESH {
-        "BUG: gemm_block_grouped gate_up GEMM (mps_w@gu_off vs CPU oracle)"
+        "BUG: gemm_block_grouped gate_up GEMM (gemm_b@gu_off vs CPU oracle)"
     } else if stages.swiglu_isolated < THRESH {
-        "BUG: swiglu_moe_gate_up (GPU gate_up OK; post-swiglu mps_x diverges from CPU∘GPU_gemm)"
+        "BUG: swiglu_moe_gate_up (GPU gate_up OK; post-swiglu gemm_a diverges from CPU∘GPU_gemm)"
     } else if stages.swiglu_post < THRESH {
         "BUG: swiglu chain (unlikely if isolated passed; check CPU gate_up oracle)"
     } else if stages.down < THRESH {
@@ -412,28 +412,28 @@ pub fn print_pin_summary(dump: &MoeBatchedPinDump) {
         dump.layer, dump.kv_len, dump.route.num_slots, dump.format
     );
     eprintln!(
-        "  mps_w layout: A[0..{}B] gathered slots×hid | gate_up@{}B [{} elems = slots×2×moe_ff]",
+        "  gemm_b layout: A[0..{}B] gathered slots×hid | gate_up@{}B [{} elems = slots×2×moe_ff]",
         lay.moe_w_off_gu_bytes,
         lay.moe_w_off_gu_bytes,
         lay.gate_up_elems,
     );
     eprintln!(
-        "  mps_x layout: swiglu_out[0..{} elems = slots×moe_ff] (hid={}, moe_ff={})",
+        "  gemm_a layout: swiglu_out[0..{} elems = slots×moe_ff] (hid={}, moe_ff={})",
         lay.swiglu_elems, lay.hidden, lay.moe_ff,
     );
     let s = &dump.stages;
     eprintln!("  DECISIVE gate_up / swiglu split:");
     eprintln!(
-        "    gate_up GEMM  mps_w@gu_off vs CPU gemm_block_grouped: cos={:.6} rel_l2={:.6}",
+        "    gate_up GEMM  gemm_b@gu_off vs CPU gemm_block_grouped: cos={:.6} rel_l2={:.6}",
         s.gate_up_gemm, dump.rel_l2.gate_up_gemm,
     );
     print_gate_up_diff(&dump.gate_up_diff);
     eprintln!(
-        "    swiglu post   mps_x vs CPU swiglu(CPU gemm):         cos={:.6} rel_l2={:.6}",
+        "    swiglu post   gemm_a vs CPU swiglu(CPU gemm):         cos={:.6} rel_l2={:.6}",
         s.swiglu_post, dump.rel_l2.swiglu_post,
     );
     eprintln!(
-        "    swiglu isol.  mps_x vs CPU swiglu(GPU gemm readback): cos={:.6} rel_l2={:.6}",
+        "    swiglu isol.  gemm_a vs CPU swiglu(GPU gemm readback): cos={:.6} rel_l2={:.6}",
         s.swiglu_isolated, dump.rel_l2.swiglu_isolated,
     );
     eprintln!(

@@ -20,7 +20,7 @@ mod lm_head;
 mod kv_cache;
 mod memory;
 mod moe;
-mod mps_gemm;
+mod dequant_matrix;
 mod pipeline_cache;
 mod probe;
 mod dgq_gpu;
@@ -64,7 +64,7 @@ pub use kv_cache::GpuKvCache;
 pub use engine::GpuDecoderEngine;
 pub use gemm::{bf16_matmul_cpu, f32_to_bf16, Bf16Gemm};
 pub use probe::{print_probe_result, probe_device, DeviceProbeResult};
-pub use bench_gemm::{bench_custom_kernel, bench_mps_oracle, parse_shapes, print_bench_rows};
+pub use bench_gemm::{bench_custom_kernel, bench_mpsgraph_oracle, parse_shapes, print_bench_rows};
 pub use sampler::{sampler_step_gpu, upload_logits_gpu};
 pub use step_kernel::{
     bench_step_kernel, build_step_runtime, hello_chat_prefill_token_ids, logits_finite_check_enabled,
@@ -73,15 +73,14 @@ pub use step_kernel::{
     run_step_moe_route_capture,
     run_step_moe_single_expert_capture,
     run_step_preamble_capture,
-    run_step_probe, run_step_smoke, run_embed_row_gpu, run_step_q4_mps_parity,
-    step_use_moe_grouped_q4_default, step_use_mps_q4_default,
+    run_step_probe, run_step_smoke, run_embed_row_gpu,
+    step_use_moe_grouped_q4_default,
     step_use_sc_gemm_default, layer_moe_block_jobs,
     DenoiseStepStats, trace_entropy_enabled, LayerAttnCapture, LayerMoeCapture, MoeRouteCapture,
     RouteScratchStats,
     PreambleCapture, SingleExpertMoeCapture,
     bench_step_kernel_profile, StepBenchResult, StepFinishMode, StepForwardOutput, StepProfileResult,
-    StepProbeResult, StepBlockMpsParityResult, StepQ4MpsParityResult,
-    run_step_block_mps_parity, run_step_nvfp4_mps_parity,
+    StepProbeResult,
     StepSmokeConfig, StepSmokeResult, CANVAS, CanvasState, LayerOffsets, RouteScratch, StepParams,
     N_EXPERTS, TOP_K, HID, MOE_FF,
 };
@@ -119,8 +118,8 @@ pub use step_quant::{
 };
 pub use step_kv::{
     extend_monolithic_kv, monolithic_kv_prefix_max_diff, prefill_monolithic_kv_with_cache,
-    run_step_kv_audit, run_step_kv_mps_parity, run_step_kv_bf16_cross_parity,
+    run_step_kv_audit, run_step_kv_parity, run_step_kv_bf16_cross_parity,
     run_step_attn_probe, MonolithicEncoderCache, StepKvAuditResult, StepKvBf16CrossResult,
-    StepKvMpsParityResult,
+    StepKvParityResult,
 };
 pub use telemetry::{ForwardTelemetry, SessionTelemetry, StepPhaseTelemetry};

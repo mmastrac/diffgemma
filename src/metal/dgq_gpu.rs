@@ -759,7 +759,7 @@ mod q4_gpu_tests {
 
     #[test]
     fn nvfp4_gpu_dequant_matrix_matches_cpu() {
-        use crate::metal::mps_gemm::dispatch_dequant_nvfp4_matrix;
+        use crate::metal::dequant_matrix::dispatch_dequant_block_matrix;
         let dgq_dir = std::path::Path::new("/tmp/nvfp4-weights");
         if !dgq_dir.join("model.dgq.json").exists() {
             eprintln!("skip: /tmp/nvfp4-weights missing");
@@ -788,7 +788,7 @@ mod q4_gpu_tests {
         let mut pool = BufferPool::new();
         let mut batch = GpuBatch::begin(&ctx.queue, &mut pool, &ctx.device).expect("batch");
         let buf_out = batch.alloc_f32_out(cpu.len()).expect("out");
-        dispatch_dequant_nvfp4_matrix(batch.encoder(), &pipeline, &q4, &buf_out);
+        dispatch_dequant_block_matrix(batch.encoder(), &pipeline, &q4, &buf_out);
         let mut gpu = vec![0.0f32; cpu.len()];
         batch.register_read(buf_out, &mut gpu);
         batch.end().expect("end");

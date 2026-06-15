@@ -374,3 +374,72 @@ pub fn soft_embeddings_q8_gpu_from_buf(
     }
     Ok(())
 }
+
+/// Q8 embed-table gather for encoder prefill (`.dgq` only).
+pub fn embed_token_ids_q8_gpu(
+    engine: &mut GpuDecoderEngine,
+    embed: &Q8LinearGpu,
+    blob: &ProtocolObject<dyn MTLBuffer>,
+    token_ids: &[u32],
+    seq_len: usize,
+    hidden: usize,
+    out: &mut [f32],
+) -> Result<(), Error> {
+    let len = seq_len * hidden;
+    if token_ids.len() != seq_len || out.len() < len {
+        return Err(Error::Format("embed_token_ids_q8_gpu shape mismatch"));
+    }
+    use crate::dgq::embed_row::EMBED_SCALE;
+    use crate::kernels::sub::{embed_gather, half_to_f32};
+
+    let embed_pipeline = engine.kernels.embed_gather.pipeline.clone();
+    let half_pipeline = engine.kernels.half_to_f32.pipeline.clone();
+    let telemetry = engine.batch_telemetry();
+    let mut batch = begin_engine_batch(
+        &engine.ctx.queue,
+        &mut engine.pool,
+        &engine.ctx.device,
+        telemetry,
+    )?;
+    let buf_ids = batch.alloc_bytes(unsafe {
+        std::slice::from_raw_parts(
+            token_ids.as_ptr() as *const u8,
+            token_ids.len() * 4,
+        )
+    })?;
+    let half_len = len * 2;
+    let buf_half = batch
+        .alloc_bytes(&vec![0u8; half_len])
+        .map_err(|_| Error::Format("embed half alloc failed"))?;
+    let buf_f32 = batch.alloc_f32_out(len)?;
+    let dump = batch.alloc_f32_out(1)?;
+
+    let w_off = embed.byte_offset;
+    let (grid, tg) = embed_gather::dispatch_shape(hidden, seq_len);
+    batch.dispatch_with_grid(
+        &embed_pipeline,
+        grid,
+        tg,
+        |enc| {
+            embed_gather::bind_gpu_buffers(
+                enc,
+                blob,
+                &buf_ids,
+                &buf_half,
+                w_off,
+                hidden as u32,
+                seq_len as u32,
+                EMBED_SCALE,
+            );
+        },
+    );
+
+    let base = 0u32;
+    let len_u32 = len as u32;
+    batch.dispatch_1d(&half_pipeline, len, |enc| {
+        half_to_f32::bind_gpu_buffers(enc, &buf_half, &buf_f32, &dump, base, len_u32);
+    });
+
+    batch.register_read(buf_f32, &mut out[..len]);
+    batch.end()
+}

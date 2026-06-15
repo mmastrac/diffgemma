@@ -1,4 +1,4 @@
-//! Block matrix dequant for MPS dense scratch path.
+//! Block matrix dequant to f32 scratch (validation / tests).
 
 use super::gpu_common;
 use super::test_util::ElemFormat;

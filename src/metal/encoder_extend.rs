@@ -46,20 +46,37 @@ pub fn prefill_gpu(
         .ok_or(Error::Format("gpu kv cache missing"))?;
     gpu_kv.reset_len();
 
-    embed_tokens_from_store(
-        store,
-        &mut enc_scratch.embed_buf[..seq_len * hidden],
-        input.token_ids,
-        hidden,
-        embed_scale,
-    )?;
+    if weights.is_dgq() {
+        let embed = weights
+            .embed_q8()
+            .ok_or(Error::Format("dgq embed table missing"))?;
+        let blob = weights
+            .dgq_blob()
+            .ok_or(Error::Format("dgq blob missing"))?;
+        crate::metal::embed::embed_token_ids_q8_gpu(
+            engine,
+            embed,
+            &blob,
+            input.token_ids,
+            seq_len,
+            hidden,
+            &mut enc_scratch.hidden_a[..seq_len * hidden],
+        )?;
+    } else {
+        embed_tokens_from_store(
+            store,
+            &mut enc_scratch.embed_buf[..seq_len * hidden],
+            input.token_ids,
+            hidden,
+            embed_scale,
+        )?;
+        enc_scratch.hidden_a[..seq_len * hidden]
+            .copy_from_slice(&enc_scratch.embed_buf[..seq_len * hidden]);
+    }
 
     let positions: Vec<i64> = (0..seq_len as i64)
         .map(|i| input.position_offset + i)
         .collect();
-
-    enc_scratch.hidden_a[..seq_len * hidden]
-        .copy_from_slice(&enc_scratch.embed_buf[..seq_len * hidden]);
 
     let n_layers = max_layers
         .unwrap_or(text.num_hidden_layers)
@@ -175,20 +192,37 @@ pub fn extend_prefill_gpu(
         return Err(Error::Format("gpu/cpu kv_len mismatch"));
     }
 
-    embed_tokens_from_store(
-        store,
-        &mut enc_scratch.embed_buf[..seq_len * hidden],
-        token_ids,
-        hidden,
-        embed_scale,
-    )?;
+    if weights.is_dgq() {
+        let embed = weights
+            .embed_q8()
+            .ok_or(Error::Format("dgq embed table missing"))?;
+        let blob = weights
+            .dgq_blob()
+            .ok_or(Error::Format("dgq blob missing"))?;
+        crate::metal::embed::embed_token_ids_q8_gpu(
+            engine,
+            embed,
+            &blob,
+            token_ids,
+            seq_len,
+            hidden,
+            &mut enc_scratch.hidden_a[..seq_len * hidden],
+        )?;
+    } else {
+        embed_tokens_from_store(
+            store,
+            &mut enc_scratch.embed_buf[..seq_len * hidden],
+            token_ids,
+            hidden,
+            embed_scale,
+        )?;
+        enc_scratch.hidden_a[..seq_len * hidden]
+            .copy_from_slice(&enc_scratch.embed_buf[..seq_len * hidden]);
+    }
 
     let positions: Vec<i64> = (0..seq_len as i64)
         .map(|i| kv_len_before as i64 + i)
         .collect();
-
-    enc_scratch.hidden_a[..seq_len * hidden]
-        .copy_from_slice(&enc_scratch.embed_buf[..seq_len * hidden]);
 
     let n_layers = max_layers
         .unwrap_or(text.num_hidden_layers)

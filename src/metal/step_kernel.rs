@@ -7,7 +7,6 @@ use crate::metal::batch::set_bytes;
 use crate::metal::device::{ComputePipeline, MetalContext};
 use crate::metal::dgq_gpu::{DgqGpuBlob, Q4LinearGpu};
 use crate::metal::moe::experts_forward_dgq_cpu;
-use crate::metal::mps_gemm::{dispatch_dequant_nvfp4_matrix, dispatch_dequant_q4_matrix, MpsMatmulCache};
 use crate::metal::step_quant::{
     BlockGroupedJob, MoeExecutionStyle, StepBlockProfile,
 };
@@ -170,14 +169,10 @@ pub struct StepSmokeConfig {
     pub seed: u64,
     pub max_seq: usize,
     pub finish: StepFinishMode,
-    /// When set, overrides `DGQ_MPS_Q4` for this run (deterministic goldens use `false`).
-    pub use_mps_q4: Option<bool>,
     /// Prompt token ids for encoder prefill into b4 (M1). When set, `StepParams.kv_len` = len.
     pub prefill_token_ids: Option<Vec<u32>>,
     /// Match `generate-monolithic --no-early-stop` (disables confidence early stop).
     pub no_early_stop: bool,
-    /// Encoder prefill/extend Q4 path (`DGQ_MPS_Q4` when `None`).
-    pub encoder_use_mps_q4: Option<bool>,
 }
 
 impl Default for StepSmokeConfig {
@@ -189,10 +184,8 @@ impl Default for StepSmokeConfig {
             seed: 42,
             max_seq: 512,
             finish: StepFinishMode::Full,
-            use_mps_q4: None,
             prefill_token_ids: None,
             no_early_stop: false,
-            encoder_use_mps_q4: None,
         }
     }
 }
@@ -354,8 +347,8 @@ fn div_up(v: usize, g: usize) -> usize {
     (v + g - 1) / g
 }
 
-/// Scratch byte sizes for the MPS Q4 path (max over all step-kernel GEMM shapes).
-fn mps_scratch_bytes() -> (usize, usize, usize) {
+/// Scratch byte sizes for step-kernel grouped GEMM (max over all MoE/dense shapes).
+fn gemm_scratch_bytes() -> (usize, usize, usize) {
     let shapes = [
         (CANVAS, 4096u32, HID as u32),
         (CANVAS, 2048, HID as u32),
@@ -412,24 +405,9 @@ fn logits_finite_sample_bytes() -> u64 {
     (logits_finite_sample_count().min(CANVAS * VOCAB) * 2) as u64
 }
 
-/// Step-kernel dense GEMM backend. Default is MPS dequant→matmul (opt out with `DGQ_STEP_MPS_Q4=0`).
-pub fn step_use_mps_q4_default() -> bool {
-    match std::env::var("DGQ_STEP_MPS_Q4") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
-    }
-}
-
 /// Batched grouped MoE (`DGQ_STEP_MOE_GROUPED`, default on). Alias for format-agnostic toggle.
 pub fn step_use_moe_grouped_q4_default() -> bool {
     crate::metal::step_quant::batched_moe_enabled()
-}
-
-fn step_use_mps_q4_from_env() -> bool {
-    match std::env::var("DGQ_STEP_MPS_Q4") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => crate::metal::engine::default_use_mps_q4(),
-    }
 }
 
 struct StepPipelines {
@@ -706,9 +684,9 @@ pub(crate) struct StepBuffers {
     route: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// Inert 4B buffer for optional dump slots (K_DUMP_STAGE=0 kernels).
     dummy_dump: Retained<ProtocolObject<dyn MTLBuffer>>,
-    pub(crate) mps_x: Retained<ProtocolObject<dyn MTLBuffer>>,
-    pub(crate) mps_w: Retained<ProtocolObject<dyn MTLBuffer>>,
-    pub(crate) mps_c: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) gemm_a: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) gemm_b: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) gemm_c: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// Per-layer unique routed experts (written by moe_bucket_fill phase 1).
     expert_layer_unique: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
@@ -719,8 +697,6 @@ struct StepEnc<'a> {
     ps: &'a StepPipelines,
     bufs: &'a StepBuffers,
     gpu_blob: &'a std::sync::Arc<DgqGpuBlob>,
-    mps: &'a mut MpsMatmulCache,
-    use_mps_q4: bool,
     block_profile: StepBlockProfile,
     use_sc_gemm: bool,
     tensor_offsets: &'a HashMap<String, u64>,
@@ -936,20 +912,6 @@ impl StepEnc<'_> {
         });
     }
 
-    fn pause_for_mps(&mut self) {
-        if self.recorder.is_some() {
-            return;
-        }
-        self.enc.endEncoding();
-    }
-
-    fn resume_compute_after_mps(&mut self) {
-        self.enc = self
-            .cmd
-            .computeCommandEncoder()
-            .expect("compute encoder alloc failed");
-    }
-
     fn dispatch_convert_1d(
         &mut self,
         ps: &ComputePipeline,
@@ -972,7 +934,7 @@ impl StepEnc<'_> {
             &self.ps.half_to_f32,
             &self.bufs.arena,
             arena_off as usize,
-            &self.bufs.mps_x,
+            &self.bufs.gemm_a,
             0,
             len,
         );
@@ -981,7 +943,7 @@ impl StepEnc<'_> {
     fn f32_to_half_arena(&mut self, arena_off: u64, len: usize) {
         self.dispatch_convert_1d(
             &self.ps.f32_to_half,
-            &self.bufs.mps_c,
+            &self.bufs.gemm_c,
             0,
             &self.bufs.arena,
             arena_off as usize,
@@ -1030,54 +992,7 @@ impl StepEnc<'_> {
         n: u32,
         k: u32,
     ) -> Result<(), Error> {
-        if !self.use_mps_q4 {
-            return self.gemm_q4_fused(x_off, y_off, w_off, m, n, k);
-        }
-        let m_us = m as usize;
-        let n_us = n as usize;
-        let k_us = k as usize;
-        let q4 = Q4LinearGpu::from_entry(
-            std::sync::Arc::clone(self.gpu_blob),
-            w_off,
-            n_us,
-            k_us,
-            if self.block_profile.is_nvfp4() {
-                crate::dgq::layout::QuantKind::Nvfp4Block
-            } else {
-                crate::dgq::layout::QuantKind::Q4Block
-            },
-        );
-        self.half_to_f32_buf(x_off, m_us * k_us);
-        if self.recorder.is_some() {
-            self.sink_dequant_q4_matrix(&q4)?;
-            if let Some(r) = self.recorder.as_deref_mut() {
-                r.note_mps_q4_gemm(crate::metal::step_icb::MpsQ4GemmOp {
-                    m: m_us,
-                    k: k_us,
-                    n: n_us,
-                });
-            }
-            self.f32_to_half_arena(y_off, m_us * n_us);
-            return Ok(());
-        }
-        if self.block_profile.is_nvfp4() {
-            dispatch_dequant_nvfp4_matrix(&self.enc, self.ps.dequant_block(self.block_profile.format), &q4, &self.bufs.mps_w);
-        } else {
-            dispatch_dequant_q4_matrix(&self.enc, self.ps.dequant_block(self.block_profile.format), &q4, &self.bufs.mps_w);
-        }
-        self.pause_for_mps();
-        self.mps.encode_f32_linear(
-            &self.cmd,
-            &self.bufs.mps_x,
-            &self.bufs.mps_w,
-            &self.bufs.mps_c,
-            m_us,
-            k_us,
-            n_us,
-        );
-        self.resume_compute_after_mps();
-        self.f32_to_half_arena(y_off, m_us * n_us);
-        Ok(())
+        self.gemm_q4_fused(x_off, y_off, w_off, m, n, k)
     }
 
     fn dispatch_2d(&mut self, ps: &ComputePipeline, gx: usize, gy: usize, tpg_x: usize, tpg_y: usize) {
@@ -1100,33 +1015,6 @@ impl StepEnc<'_> {
         self.sink_set_buffer(&self.bufs.arena, byte_off as usize, 0);
         let count = div_up(nbytes as usize, 16);
         self.dispatch_1d(&self.ps.memzero, count, 256);
-    }
-
-    fn sink_dequant_q4_matrix(&mut self, q4: &Q4LinearGpu) -> Result<(), Error> {
-        const THREADGROUP: usize = 16;
-        let ps = self.ps.dequant_block(self.block_profile.format);
-        self.sink_set_pipeline(ps);
-        let (buf_w, off) = q4.weight_buffer();
-        self.sink_set_buffer(buf_w, off as usize, 0);
-        self.sink_set_buffer(&self.bufs.mps_w, 0, 1);
-        let dims = [
-            q4.out_dim as u32,
-            q4.in_dim as u32,
-            q4.groups_per_row(),
-        ];
-        self.sink_set_bytes(&dims, 2);
-        let tg = MTLSize {
-            width: THREADGROUP,
-            height: THREADGROUP,
-            depth: 1,
-        };
-        let grid = MTLSize {
-            width: (q4.in_dim + THREADGROUP - 1) / THREADGROUP,
-            height: (q4.out_dim + THREADGROUP - 1) / THREADGROUP,
-            depth: 1,
-        };
-        self.sink_dispatch(grid, tg);
-        Ok(())
     }
 
     fn rmsnorm(
@@ -1523,7 +1411,7 @@ impl StepEnc<'_> {
 
     fn dispatch_block_linear_grouped(
         &mut self,
-        a_on_mps_x: bool,
+        a_on_gemm_a: bool,
         buf_a_off: usize,
         buf_c_off: usize,
         jobs: &[BlockGroupedJob; N_EXPERTS],
@@ -1536,15 +1424,15 @@ impl StepEnc<'_> {
             .block_grouped(self.block_profile.format, n, k)?;
         let row_start_off = std::mem::offset_of!(RouteScratch, row_start);
         self.sink_set_pipeline(grouped_ps);
-        let a_buf = if a_on_mps_x {
-            &self.bufs.mps_x
+        let a_buf = if a_on_gemm_a {
+            &self.bufs.gemm_a
         } else {
-            &self.bufs.mps_w
+            &self.bufs.gemm_b
         };
         unsafe {
             self.sink_set_buffer(a_buf, buf_a_off, 0);
             self.bind_blob(1);
-            self.sink_set_buffer(&self.bufs.mps_w, buf_c_off, 2);
+            self.sink_set_buffer(&self.bufs.gemm_b, buf_c_off, 2);
             self.sink_set_bytes(jobs, 3);
             self.sink_set_buffer(&self.bufs.route, row_start_off, 4);
         }
@@ -1584,9 +1472,9 @@ impl StepEnc<'_> {
         let gather_dims = [0u32, HID as u32];
         let gather_count = (MOE_SLOTS as usize) * HID;
         self.dispatch_1d_ranged(&self.ps.gather_rows, gather_count, 256, |this, base, _chunk| {
-            this.sink_set_buffer(&this.bufs.mps_x, 0, 0);
+            this.sink_set_buffer(&this.bufs.gemm_a, 0, 0);
             this.sink_set_buffer(&this.bufs.route, token_list_off, 1);
-            this.sink_set_buffer(&this.bufs.mps_w, moe_w_byte_off_a(), 2);
+            this.sink_set_buffer(&this.bufs.gemm_b, moe_w_byte_off_a(), 2);
             this.sink_set_buffer(&this.bufs.dummy_dump, 0, 5);
             this.sink_set_bytes(&gather_dims, 3);
             this.sink_set_bytes(&MOE_SLOTS, 4);
@@ -1621,8 +1509,8 @@ impl StepEnc<'_> {
         let gu_off = moe_w_byte_off_gu();
         let act_elems = (MOE_SLOTS as usize) * MOE_FF as usize;
         self.sink_set_pipeline(&self.ps.gelu_swiglu_gate_up);
-        self.sink_set_buffer(&self.bufs.mps_w, gu_off, 0);
-        self.sink_set_buffer(&self.bufs.mps_x, 0, 1);
+        self.sink_set_buffer(&self.bufs.gemm_b, gu_off, 0);
+        self.sink_set_buffer(&self.bufs.gemm_a, 0, 1);
         self.sink_set_buffer(&self.bufs.dummy_dump, 0, 3);
         let swiglu_dims = [MOE_SLOTS, MOE_FF];
         self.sink_set_bytes(&swiglu_dims, 2);
@@ -1651,7 +1539,7 @@ impl StepEnc<'_> {
     fn encode_moe_batched_scatter(&mut self) -> Result<(), Error> {
         let scatter_count = (MOE_SLOTS as usize) * HID;
         self.dispatch_1d_ranged(&self.ps.moe_scatter_weighted, scatter_count, 256, |this, base, _chunk| {
-            this.sink_set_buffer(&this.bufs.mps_w, moe_w_byte_off_a(), 0);
+            this.sink_set_buffer(&this.bufs.gemm_b, moe_w_byte_off_a(), 0);
             this.sink_set_buffer(&this.bufs.arena, A_MOEOUT as usize, 1);
             this.bind_route(2);
             this.sink_set_bytes(&(HID as u32), 3);
@@ -2165,9 +2053,9 @@ struct GpuBufferSnapshot {
     sc_probs: Vec<u8>,
     kvcache: Vec<u8>,
     route: Vec<u8>,
-    mps_x: Vec<u8>,
-    mps_w: Vec<u8>,
-    mps_c: Vec<u8>,
+    gemm_a: Vec<u8>,
+    gemm_b: Vec<u8>,
+    gemm_c: Vec<u8>,
 }
 
 fn copy_buffer_bytes(buf: &ProtocolObject<dyn MTLBuffer>, byte_off: usize, len: usize) -> Vec<u8> {
@@ -2339,8 +2227,6 @@ pub struct StepRuntime {
     gpu_blob: std::sync::Arc<DgqGpuBlob>,
     weight_cache: GpuDecoderWeightCache,
     text_config: TextConfig,
-    mps_matmul: MpsMatmulCache,
-    use_mps_q4: bool,
     block_profile: StepBlockProfile,
     use_sc_gemm: bool,
     layout: ModelLayout,
@@ -2352,10 +2238,6 @@ pub struct StepRuntime {
 impl StepRuntime {
     pub fn layout(&self) -> &ModelLayout {
         &self.layout
-    }
-
-    pub fn use_mps_q4(&self) -> bool {
-        self.use_mps_q4
     }
 
     pub fn kvcache(&self) -> &ProtocolObject<dyn MTLBuffer> {
@@ -2474,8 +2356,6 @@ impl StepRuntime {
             ps: &self.pipelines,
             bufs: &self.bufs,
             gpu_blob: &self.gpu_blob,
-            mps: &mut self.mps_matmul,
-            use_mps_q4: self.use_mps_q4,
             block_profile: self.block_profile,
             use_sc_gemm: self.use_sc_gemm,
             tensor_offsets: &self.tensor_offsets,
@@ -2496,9 +2376,9 @@ impl StepRuntime {
             sc_probs: copy_buffer_bytes(&self.bufs.sc_probs, 0, self.bufs.sc_probs.length()),
             kvcache: copy_buffer_bytes(&self.bufs.kvcache, 0, self.bufs.kvcache.length()),
             route: copy_buffer_bytes(&self.bufs.route, 0, self.bufs.route.length()),
-            mps_x: copy_buffer_bytes(&self.bufs.mps_x, 0, self.bufs.mps_x.length()),
-            mps_w: copy_buffer_bytes(&self.bufs.mps_w, 0, self.bufs.mps_w.length()),
-            mps_c: copy_buffer_bytes(&self.bufs.mps_c, 0, self.bufs.mps_c.length()),
+            gemm_a: copy_buffer_bytes(&self.bufs.gemm_a, 0, self.bufs.gemm_a.length()),
+            gemm_b: copy_buffer_bytes(&self.bufs.gemm_b, 0, self.bufs.gemm_b.length()),
+            gemm_c: copy_buffer_bytes(&self.bufs.gemm_c, 0, self.bufs.gemm_c.length()),
         }
     }
 
@@ -2509,9 +2389,9 @@ impl StepRuntime {
         write_buffer_region(&self.bufs.sc_probs, 0, &snap.sc_probs);
         write_buffer_region(&self.bufs.kvcache, 0, &snap.kvcache);
         write_buffer_region(&self.bufs.route, 0, &snap.route);
-        write_buffer_region(&self.bufs.mps_x, 0, &snap.mps_x);
-        write_buffer_region(&self.bufs.mps_w, 0, &snap.mps_w);
-        write_buffer_region(&self.bufs.mps_c, 0, &snap.mps_c);
+        write_buffer_region(&self.bufs.gemm_a, 0, &snap.gemm_a);
+        write_buffer_region(&self.bufs.gemm_b, 0, &snap.gemm_b);
+        write_buffer_region(&self.bufs.gemm_c, 0, &snap.gemm_c);
     }
 
     fn dispatch_record<F>(&mut self, f: F, recorder: &mut crate::metal::step_icb::IcbRecorder) -> Result<(), Error>
@@ -2532,8 +2412,6 @@ impl StepRuntime {
             ps: &self.pipelines,
             bufs: &self.bufs,
             gpu_blob: &self.gpu_blob,
-            mps: &mut self.mps_matmul,
-            use_mps_q4: self.use_mps_q4,
             block_profile: self.block_profile,
             use_sc_gemm: self.use_sc_gemm,
             tensor_offsets: &self.tensor_offsets,
@@ -2573,9 +2451,8 @@ impl StepRuntime {
         let started = Instant::now();
         let no_sc = self.record_icb_plan(false)?;
         eprintln!(
-            "step-kernel: no_sc ICB ready (kv_len={kv_len}, {} cmds/{} ops) in {:.2?}",
+            "step-kernel: no_sc ICB ready (kv_len={kv_len}, {} cmds) in {:.2?}",
             no_sc.command_count,
-            no_sc.ops.len(),
             started.elapsed()
         );
         let pair = self.icb.get_or_insert_with(|| crate::metal::step_icb::StepIcbPair {
@@ -2604,7 +2481,7 @@ impl StepRuntime {
         eprintln!(
             "step-kernel: with_sc ICB ready ({} cmds/{} ops) in {:.2?}",
             with_sc.command_count,
-            with_sc.ops.len(),
+            with_sc.command_count,
             started.elapsed()
         );
         self.icb.as_mut().expect("icb").with_sc = Some(with_sc);
@@ -2739,12 +2616,7 @@ impl StepRuntime {
                     .queue
                     .commandBuffer()
                     .ok_or(Error::Format("command buffer alloc failed"))?;
-                let mut enc = crate::metal::step_icb::replay_step_icb(
-                    &cmd,
-                    plan,
-                    &self.bufs,
-                    &mut self.mps_matmul,
-                )?;
+                let mut enc = crate::metal::step_icb::replay_step_icb(&cmd, plan)?;
                 enc.endEncoding();
                 cmd.commit();
                 cmd.waitUntilCompleted();
@@ -2786,9 +2658,9 @@ pub fn log_step_memory_budget(blob_bytes: u64, max_seq: usize, layout: &ModelLay
     let logits = (CANVAS * VOCAB * 2) as u64;
     let sc_probs = if use_sc_gemm { logits } else { 0 };
     let arena = ARENA_BYTES;
-    let (mx, mw, mc) = mps_scratch_bytes();
-    let mps = (mx + mw + mc) as u64;
-    let gpu_static = kv + logits + sc_probs + arena + mps;
+    let (mx, mw, mc) = gemm_scratch_bytes();
+    let gemm_scratch = (mx + mw + mc) as u64;
+    let gpu_static = kv + logits + sc_probs + arena + gemm_scratch;
     let total = blob_bytes + gpu_static;
     eprintln!("step-kernel memory budget:");
     eprintln!(
@@ -2812,8 +2684,8 @@ pub fn log_step_memory_budget(blob_bytes: u64, max_seq: usize, layout: &ModelLay
         sc_probs as f64 / (1024.0 * 1024.0)
     );
     eprintln!(
-        "  mps scratch:{:.2} MiB",
-        mps as f64 / (1024.0 * 1024.0)
+        "  gemm scratch:{:.2} MiB",
+        gemm_scratch as f64 / (1024.0 * 1024.0)
     );
     eprintln!(
         "  gpu static: {:.2} GiB (excl. blob)",
@@ -2881,7 +2753,7 @@ pub fn build_step_runtime(
         .unwrap_or(cfg.kv_len);
     let params = step_params_from_sampler(&sampler, prefill_len, cfg.no_early_stop);
     let state = init_canvas_state(cfg.seed, VOCAB);
-    let (mps_x_bytes, mps_w_bytes, mps_c_bytes) = mps_scratch_bytes();
+    let (gemm_a_bytes, gemm_b_bytes, gemm_c_bytes) = gemm_scratch_bytes();
 
     let model_cfg = ModelConfig::load(model_dir)?;
     let text_config = model_cfg.text_config;
@@ -2920,9 +2792,9 @@ pub fn build_step_runtime(
             b
         },
         dummy_dump: alloc_buffer(&ctx.device, 4)?,
-        mps_x: alloc_buffer(&ctx.device, mps_x_bytes)?,
-        mps_w: alloc_buffer(&ctx.device, mps_w_bytes)?,
-        mps_c: alloc_buffer(&ctx.device, mps_c_bytes)?,
+        gemm_a: alloc_buffer(&ctx.device, gemm_a_bytes)?,
+        gemm_b: alloc_buffer(&ctx.device, gemm_b_bytes)?,
+        gemm_c: alloc_buffer(&ctx.device, gemm_c_bytes)?,
         expert_layer_unique: alloc_buffer(&ctx.device, N_LAYERS * std::mem::size_of::<u32>())?,
     };
     zero_buffer(&bufs.expert_layer_unique);
@@ -2936,7 +2808,6 @@ pub fn build_step_runtime(
             CANVAS,
             cfg.max_seq,
             Some(std::sync::Arc::clone(&gpu_blob)),
-            cfg.encoder_use_mps_q4,
         )?;
         let (kv_len, _) = crate::metal::step_kv::prefill_monolithic_kv_with_cache(
             &mut encoder,
@@ -2952,7 +2823,6 @@ pub fn build_step_runtime(
         eprintln!("step-kernel: prefilled kv_len={kv_len} tokens");
     }
 
-    let mps_matmul = MpsMatmulCache::new(ctx.device.clone());
     let build = StepRuntimeBuildTiming {
         compile,
         total: build_started.elapsed(),
@@ -2968,8 +2838,6 @@ pub fn build_step_runtime(
         gpu_blob,
         weight_cache,
         text_config,
-        mps_matmul,
-        use_mps_q4: cfg.use_mps_q4.unwrap_or_else(step_use_mps_q4_from_env),
         block_profile,
         use_sc_gemm: step_use_sc_gemm_from_env(),
         layout,
@@ -2977,11 +2845,9 @@ pub fn build_step_runtime(
         layers,
         icb: None,
     };
-    if crate::metal::step_icb::step_icb_enabled() && rt.use_mps_q4 {
+    if crate::metal::step_icb::step_icb_enabled() {
         eprintln!("step-kernel: ICB replay enabled (lazy record per kv_len/step)");
         rt.icb = Some(rt.record_icb_pair()?);
-    } else if crate::metal::step_icb::step_icb_enabled() {
-        eprintln!("step-kernel: ICB skipped (fused Q4/nvfp4 path; set DGQ_STEP_MPS_Q4=1 to enable)");
     }
     Ok((rt, build))
 }
@@ -3643,8 +3509,6 @@ pub struct MoeRouteCapture {
     pub layer: usize,
     pub step: u32,
     pub kv_len: u32,
-    pub use_mps_q4: bool,
-    pub encoder_use_mps_q4: bool,
     pub moe_style: String,
     pub route: RouteScratchStats,
     pub grouped_dispatched: bool,
@@ -3655,7 +3519,7 @@ pub struct MoeRouteCapture {
     pub moe_out_gpu_cpu_rel_l2: Option<f32>,
 }
 
-fn read_mps_f32(buf: &ProtocolObject<dyn MTLBuffer>, byte_off: usize, elems: usize) -> Vec<f32> {
+fn read_scratch_f32(buf: &ProtocolObject<dyn MTLBuffer>, byte_off: usize, elems: usize) -> Vec<f32> {
     unsafe {
         let ptr = buf.contents().as_ptr().add(byte_off) as *const f32;
         (0..elems).map(|i| *ptr.add(i)).collect()
@@ -3699,25 +3563,25 @@ pub fn run_step_moe_batched_pin_capture(
         enc.encode_moe_batched_gather()?;
         Ok(())
     })?;
-    let gpu_gather = read_mps_f32(&rt.bufs.mps_w, moe_w_byte_off_a(), slot_elems);
+    let gpu_gather = read_scratch_f32(&rt.bufs.gemm_b, moe_w_byte_off_a(), slot_elems);
 
     rt.dispatch_and_wait(|enc| {
         enc.encode_moe_batched_gate_up(layer, &layout)?;
         Ok(())
     })?;
-    let gpu_gate_up = read_mps_f32(&rt.bufs.mps_w, moe_w_byte_off_gu(), gu_elems);
+    let gpu_gate_up = read_scratch_f32(&rt.bufs.gemm_b, moe_w_byte_off_gu(), gu_elems);
 
     rt.dispatch_and_wait(|enc| {
         enc.encode_moe_batched_swiglu()?;
         Ok(())
     })?;
-    let gpu_swiglu = read_mps_f32(&rt.bufs.mps_x, 0, act_elems);
+    let gpu_swiglu = read_scratch_f32(&rt.bufs.gemm_a, 0, act_elems);
 
     rt.dispatch_and_wait(|enc| {
         enc.encode_moe_batched_down(layer, &layout)?;
         Ok(())
     })?;
-    let gpu_down = read_mps_f32(&rt.bufs.mps_w, moe_w_byte_off_a(), slot_elems);
+    let gpu_down = read_scratch_f32(&rt.bufs.gemm_b, moe_w_byte_off_a(), slot_elems);
 
     rt.dispatch_and_wait(|enc| {
         enc.encode_moe_batched_scatter()?;
@@ -3829,8 +3693,6 @@ pub fn run_step_moe_route_capture(
         layer,
         step: 1,
         kv_len: rt.read_params().kv_len,
-        use_mps_q4: rt.use_mps_q4,
-        encoder_use_mps_q4: cfg.encoder_use_mps_q4.unwrap_or(false),
         moe_style,
         route: route_stats,
         grouped_dispatched,
@@ -4128,135 +3990,6 @@ pub fn run_step_forward(model_dir: &Path, cfg: &StepSmokeConfig) -> Result<StepF
     })
 }
 
-#[derive(Debug)]
-pub struct StepBlockMpsParityResult {
-    pub layers: usize,
-    pub kv_len: u32,
-    pub hidden_max_abs: f32,
-    pub logits_max_abs: f32,
-    pub native_min_ent: f32,
-    pub mps_min_ent: f32,
-    pub pass: bool,
-}
-
-/// Back-compat alias.
-pub type StepQ4MpsParityResult = StepBlockMpsParityResult;
-
-/// Native fused `gemm_block` vs MPS dequant→matmul forward pass (optional KV prefill).
-pub fn run_step_block_mps_parity(
-    model_dir: &Path,
-    layers: usize,
-    kv_len: u32,
-    seed: u64,
-    max_seq: usize,
-    prefill_token_ids: Option<Vec<u32>>,
-) -> Result<StepBlockMpsParityResult, Error> {
-    let base = StepSmokeConfig {
-        layers,
-        steps: 1,
-        kv_len,
-        seed,
-        max_seq,
-        finish: StepFinishMode::ForwardOnly,
-        use_mps_q4: Some(false),
-        prefill_token_ids,
-        no_early_stop: false,
-        encoder_use_mps_q4: None,
-    };
-    let mut mps_cfg = base.clone();
-    mps_cfg.use_mps_q4 = Some(true);
-
-    let native = run_step_forward(model_dir, &base)?;
-    let mps = run_step_forward(model_dir, &mps_cfg)?;
-
-    let hidden_max_abs = native
-        .norm_hidden
-        .iter()
-        .zip(mps.norm_hidden.iter())
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
-    let logits_max_abs = native
-        .logits
-        .iter()
-        .zip(mps.logits.iter())
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
-
-    let ln_vocab = (VOCAB as f32).ln();
-    let native_ent = crate::sample::token_entropy(&native.logits, CANVAS, VOCAB);
-    let mps_ent = crate::sample::token_entropy(&mps.logits, CANVAS, VOCAB);
-    let native_min_ent = native_ent.iter().cloned().fold(f32::INFINITY, f32::min);
-    let mps_min_ent = mps_ent.iter().cloned().fold(f32::INFINITY, f32::min);
-
-    let pass = native_min_ent < ln_vocab - 0.5
-        && mps_min_ent < ln_vocab - 0.5
-        && (native_min_ent - mps_min_ent).abs() < 3.0;
-
-    Ok(StepBlockMpsParityResult {
-        layers,
-        kv_len,
-        hidden_max_abs,
-        logits_max_abs,
-        native_min_ent,
-        mps_min_ent,
-        pass,
-    })
-}
-
-/// P1.10 Q4 gate: requires `.dgq` q4/q5 weights.
-pub fn run_step_q4_mps_parity(
-    model_dir: &Path,
-    layers: usize,
-    kv_len: u32,
-    seed: u64,
-    max_seq: usize,
-    prefill_token_ids: Option<Vec<u32>>,
-) -> Result<StepBlockMpsParityResult, Error> {
-    let store = crate::dgq::DgqStore::open(model_dir)?;
-    match store.profile() {
-        crate::dgq::QuantProfile::Q4 | crate::dgq::QuantProfile::Q5 => {}
-        other => {
-            return Err(Error::NotFound(format!(
-                "step-q4-parity requires q4/q5 .dgq weights (got {other:?})"
-            )));
-        }
-    }
-    run_step_block_mps_parity(
-        model_dir,
-        layers,
-        kv_len,
-        seed,
-        max_seq,
-        prefill_token_ids,
-    )
-}
-
-/// NVFP4 dense GEMM gate: requires `.dgq` nvfp4 weights.
-pub fn run_step_nvfp4_mps_parity(
-    model_dir: &Path,
-    layers: usize,
-    kv_len: u32,
-    seed: u64,
-    max_seq: usize,
-    prefill_token_ids: Option<Vec<u32>>,
-) -> Result<StepBlockMpsParityResult, Error> {
-    let store = crate::dgq::DgqStore::open(model_dir)?;
-    if store.profile() != crate::dgq::QuantProfile::Nvfp4 {
-        return Err(Error::NotFound(format!(
-            "step-nvfp4-parity requires nvfp4 .dgq weights (got {:?})",
-            store.profile()
-        )));
-    }
-    run_step_block_mps_parity(
-        model_dir,
-        layers,
-        kv_len,
-        seed,
-        max_seq,
-        prefill_token_ids,
-    )
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct DenoiseStepStats {
     pub accept_count: u32,
@@ -4387,7 +4120,6 @@ mod tests {
         let cfg = StepSmokeConfig {
             layers: 3,
             finish: StepFinishMode::ForwardOnly,
-            use_mps_q4: Some(false),
             ..StepSmokeConfig::default()
         };
         let out = run_step_forward(dir, &cfg).expect("forward");
@@ -4423,8 +4155,6 @@ mod tests {
             seed: 42,
             max_seq: 512,
             finish: StepFinishMode::Full,
-            use_mps_q4: Some(false),
-            encoder_use_mps_q4: Some(false),
             prefill_token_ids: Some(prefill),
             no_early_stop: true,
         };
@@ -4762,9 +4492,9 @@ mod tests {
         sc_probs: Vec<u8>,
         kvcache: Vec<u8>,
         route: Vec<u8>,
-        mps_x: Vec<u8>,
-        mps_w: Vec<u8>,
-        mps_c: Vec<u8>,
+        gemm_a: Vec<u8>,
+        gemm_b: Vec<u8>,
+        gemm_c: Vec<u8>,
     }
 
     fn snapshot_step_gpu(rt: &StepRuntime) -> StepGpuSnapshot {
@@ -4775,9 +4505,9 @@ mod tests {
             sc_probs: read_buffer_bytes(&rt.bufs.sc_probs, 0, rt.bufs.sc_probs.length()),
             kvcache: read_buffer_bytes(&rt.bufs.kvcache, 0, rt.bufs.kvcache.length()),
             route: read_buffer_bytes(&rt.bufs.route, 0, rt.bufs.route.length()),
-            mps_x: read_buffer_bytes(&rt.bufs.mps_x, 0, rt.bufs.mps_x.length()),
-            mps_w: read_buffer_bytes(&rt.bufs.mps_w, 0, rt.bufs.mps_w.length()),
-            mps_c: read_buffer_bytes(&rt.bufs.mps_c, 0, rt.bufs.mps_c.length()),
+            gemm_a: read_buffer_bytes(&rt.bufs.gemm_a, 0, rt.bufs.gemm_a.length()),
+            gemm_b: read_buffer_bytes(&rt.bufs.gemm_b, 0, rt.bufs.gemm_b.length()),
+            gemm_c: read_buffer_bytes(&rt.bufs.gemm_c, 0, rt.bufs.gemm_c.length()),
         }
     }
 
@@ -4788,9 +4518,9 @@ mod tests {
         write_buffer_bytes(&rt.bufs.sc_probs, 0, &snap.sc_probs);
         write_buffer_bytes(&rt.bufs.kvcache, 0, &snap.kvcache);
         write_buffer_bytes(&rt.bufs.route, 0, &snap.route);
-        write_buffer_bytes(&rt.bufs.mps_x, 0, &snap.mps_x);
-        write_buffer_bytes(&rt.bufs.mps_w, 0, &snap.mps_w);
-        write_buffer_bytes(&rt.bufs.mps_c, 0, &snap.mps_c);
+        write_buffer_bytes(&rt.bufs.gemm_a, 0, &snap.gemm_a);
+        write_buffer_bytes(&rt.bufs.gemm_b, 0, &snap.gemm_b);
+        write_buffer_bytes(&rt.bufs.gemm_c, 0, &snap.gemm_c);
     }
 
     fn icb_plan_parity(
@@ -4826,7 +4556,7 @@ mod tests {
         };
         let cmd = rt.ctx.queue.commandBuffer().expect("cmd");
         let mut enc =
-            crate::metal::step_icb::replay_step_icb(&cmd, plan, &rt.bufs, &mut rt.mps_matmul)
+            crate::metal::step_icb::replay_step_icb(&cmd, plan)
                 .expect("replay");
         enc.endEncoding();
         cmd.commit();
@@ -4841,23 +4571,18 @@ mod tests {
     }
 
     /// Tier-2 ICB fixture per STRATEGY.md §5: real weights, few layers, seconds not minutes.
-    fn icb_tier2_config(use_mps_q4: bool) -> StepSmokeConfig {
+    fn icb_tier2_config() -> StepSmokeConfig {
         StepSmokeConfig {
             layers: 3,
             steps: 1,
             finish: StepFinishMode::Full,
             no_early_stop: true,
-            use_mps_q4: Some(use_mps_q4),
             ..StepSmokeConfig::default()
         }
     }
 
-    fn icb_prefill_tier2_config(use_mps_q4: bool) -> StepSmokeConfig {
-        StepSmokeConfig {
-            layers: 3,
-            encoder_use_mps_q4: Some(false),
-            ..icb_tier2_config(use_mps_q4)
-        }
+    fn icb_prefill_tier2_config() -> StepSmokeConfig {
+        icb_tier2_config()
     }
 
     #[test]
@@ -4867,7 +4592,7 @@ mod tests {
             eprintln!("skip icb_replay_matches_live_tier2");
             return;
         }
-        let cfg = icb_tier2_config(true);
+        let cfg = icb_tier2_config();
         let (mut rt, _) = build_step_runtime(dir, &cfg).expect("build");
         let layout = rt.layout;
         let layers = rt.layers;
@@ -4894,7 +4619,7 @@ mod tests {
         let prefill = hello_chat_prefill_token_ids(dir).expect("hello prefill");
         let cfg = StepSmokeConfig {
             prefill_token_ids: Some(prefill),
-            ..icb_prefill_tier2_config(true)
+            ..icb_prefill_tier2_config()
         };
         let (mut rt, _) = build_step_runtime(dir, &cfg).expect("build");
         let layout = rt.layout;
@@ -4916,8 +4641,7 @@ mod tests {
             return;
         }
         let cfg = StepSmokeConfig {
-            use_mps_q4: Some(false),
-            ..icb_tier2_config(false)
+            ..icb_tier2_config()
         };
         let (mut rt, _) = build_step_runtime(dir, &cfg).expect("build");
         if rt.icb.is_none() {

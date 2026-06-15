@@ -3,7 +3,6 @@ use crate::metal::batch::GpuBatch;
 use crate::metal::buffer::BufferPool;
 use crate::metal::device::ComputePipeline;
 use crate::metal::dgq_gpu::{Q4LinearGpu, Q8LinearGpu};
-use crate::metal::mps_gemm::{q4_dequant_mps_linear, MpsMatmulCache};
 use crate::safetensors::Error;
 use crate::tensor::Bf16Slice;
 use objc2::rc::Retained;
@@ -112,11 +111,6 @@ pub fn linear_batched_in_buf(
     bf16_pipeline: &ComputePipeline,
     q4_pipeline: &ComputePipeline,
     nvfp4_pipeline: &ComputePipeline,
-    q4_mps: Option<(
-        &mut MpsMatmulCache,
-        &ComputePipeline,
-        &ComputePipeline,
-    )>,
     x_buf: &ProtocolObject<dyn MTLBuffer>,
     w: &GpuLinearWeight,
     seq_len: usize,
@@ -140,51 +134,33 @@ pub fn linear_batched_in_buf(
             Ok(buf_c)
         }
         GpuLinearWeight::Q4(q4) => {
-            if let Some((mps, dequant_q4, dequant_nvfp4)) = q4_mps {
-                let dequant = if q4.is_nvfp4() {
-                    dequant_nvfp4
-                } else {
-                    dequant_q4
-                };
-                q4_dequant_mps_linear(
-                    batch,
-                    dequant,
-                    mps,
+            let buf_c = batch.alloc_f32_out(out_len)?;
+            let (buf_w, off) = q4.weight_buffer();
+            if q4.is_nvfp4() {
+                batch.dispatch_nvfp4_linear(
+                    &nvfp4_pipeline.pipeline,
                     x_buf,
-                    q4,
+                    buf_w,
+                    off,
+                    &buf_c,
                     seq_len,
-                    w.in_dim(),
                     w.out_dim(),
-                )
+                    w.in_dim(),
+                );
             } else {
-                let buf_c = batch.alloc_f32_out(out_len)?;
-                let (buf_w, off) = q4.weight_buffer();
-                if q4.is_nvfp4() {
-                    batch.dispatch_nvfp4_linear(
-                        &nvfp4_pipeline.pipeline,
-                        x_buf,
-                        buf_w,
-                        off,
-                        &buf_c,
-                        seq_len,
-                        w.out_dim(),
-                        w.in_dim(),
-                    );
-                } else {
-                    batch.dispatch_q4_linear(
-                        &q4_pipeline.pipeline,
-                        x_buf,
-                        buf_w,
-                        off,
-                        &buf_c,
-                        seq_len,
-                        w.out_dim(),
-                        w.in_dim(),
-                        q4.groups_per_row(),
-                    );
-                }
-                Ok(buf_c)
+                batch.dispatch_q4_linear(
+                    &q4_pipeline.pipeline,
+                    x_buf,
+                    buf_w,
+                    off,
+                    &buf_c,
+                    seq_len,
+                    w.out_dim(),
+                    w.in_dim(),
+                    q4.groups_per_row(),
+                );
             }
+            Ok(buf_c)
         }
     }
 }
@@ -194,11 +170,6 @@ pub fn linear_batched_in_cpu_out(
     bf16_pipeline: &ComputePipeline,
     q4_pipeline: &ComputePipeline,
     nvfp4_pipeline: &ComputePipeline,
-    q4_mps: Option<(
-        &mut MpsMatmulCache,
-        &ComputePipeline,
-        &ComputePipeline,
-    )>,
     y: &mut [f32],
     x_buf: &ProtocolObject<dyn MTLBuffer>,
     w: &GpuLinearWeight,
@@ -212,7 +183,6 @@ pub fn linear_batched_in_cpu_out(
         bf16_pipeline,
         q4_pipeline,
         nvfp4_pipeline,
-        q4_mps,
         x_buf,
         w,
         seq_len,
@@ -241,7 +211,6 @@ pub fn linear_cached_batched(
         bf16_pipeline,
         q4_pipeline,
         nvfp4_pipeline,
-        None,
         &buf_a,
         w,
         seq_len,
@@ -256,11 +225,6 @@ pub fn linear_cached_batched_in_buf(
     bf16_pipeline: &ComputePipeline,
     q4_pipeline: &ComputePipeline,
     nvfp4_pipeline: &ComputePipeline,
-    q4_mps: Option<(
-        &mut MpsMatmulCache,
-        &ComputePipeline,
-        &ComputePipeline,
-    )>,
     x_buf: &ProtocolObject<dyn MTLBuffer>,
     w: &GpuLinearWeight,
     seq_len: usize,
@@ -270,7 +234,6 @@ pub fn linear_cached_batched_in_buf(
         bf16_pipeline,
         q4_pipeline,
         nvfp4_pipeline,
-        q4_mps,
         x_buf,
         w,
         seq_len,
@@ -283,11 +246,6 @@ pub fn linear_cached_batched_in_cpu_out(
     bf16_pipeline: &ComputePipeline,
     q4_pipeline: &ComputePipeline,
     nvfp4_pipeline: &ComputePipeline,
-    q4_mps: Option<(
-        &mut MpsMatmulCache,
-        &ComputePipeline,
-        &ComputePipeline,
-    )>,
     y: &mut [f32],
     x_buf: &ProtocolObject<dyn MTLBuffer>,
     w: &GpuLinearWeight,
@@ -298,7 +256,6 @@ pub fn linear_cached_batched_in_cpu_out(
         bf16_pipeline,
         q4_pipeline,
         nvfp4_pipeline,
-        q4_mps,
         y,
         x_buf,
         w,

@@ -1,4 +1,4 @@
-//! MoE router bucketing state on the native fused denoise path (`use_mps_q4=false`).
+//! MoE router bucketing state on the fused denoise path.
 
 use crate::metal::step_kernel::{
     run_step_moe_route_capture, StepSmokeConfig, CANVAS, HID, N_EXPERTS, TOP_K,
@@ -19,8 +19,6 @@ pub struct StepMoeRouteDump {
     pub layer: usize,
     pub step: u32,
     pub kv_len: u32,
-    pub use_mps_q4: bool,
-    pub encoder_use_mps_q4: bool,
     pub moe_style: String,
     pub expected_num_slots: u32,
     pub num_slots: u32,
@@ -52,8 +50,6 @@ impl StepMoeRouteDump {
             layer: cap.layer,
             step: cap.step,
             kv_len: cap.kv_len,
-            use_mps_q4: cap.use_mps_q4,
-            encoder_use_mps_q4: cap.encoder_use_mps_q4,
             moe_style: cap.moe_style.clone(),
             expected_num_slots: cap.route.expected_num_slots,
             num_slots: cap.route.num_slots,
@@ -97,8 +93,8 @@ pub fn write_step_moe_route_dump(path: &Path, dump: &StepMoeRouteDump) -> Result
 
 pub fn print_route_summary(dump: &StepMoeRouteDump) {
     eprintln!(
-        "step-moe-route-dump: layer={} step={} kv_len={} use_mps_q4={} moe_style={}",
-        dump.layer, dump.step, dump.kv_len, dump.use_mps_q4, dump.moe_style
+        "step-moe-route-dump: layer={} step={} kv_len={} moe_style={}",
+        dump.layer, dump.step, dump.kv_len, dump.moe_style
     );
     eprintln!(
         "  num_slots={} expected={} slots_ok={} experts_used={}/{}",
@@ -164,10 +160,8 @@ mod tests {
             seed: 42,
             max_seq: 512,
             finish: StepFinishMode::ForwardOnly,
-            use_mps_q4: Some(false),
             prefill_token_ids: Some(prefill),
             no_early_stop: false,
-            encoder_use_mps_q4: Some(false),
         };
         let dump = run_step_moe_route_dump(dir, &cfg, "Hello", 0, true).expect("route dump");
         print_route_summary(&dump);

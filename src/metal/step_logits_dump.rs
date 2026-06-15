@@ -292,7 +292,7 @@ pub fn run_step_bf16_oracle_logits_dump_gpu_kv(
         .newBufferWithLength_options(kv_bytes, MTLResourceOptions::StorageModeShared)
         .ok_or(Error::Format("gpu-kv oracle buffer alloc failed"))?;
     let mut enc_cache =
-        MonolithicEncoderCache::open_opt(dgq_dir, CANVAS, max_seq, None, None)?;
+        MonolithicEncoderCache::open_opt(dgq_dir, CANVAS, max_seq, None)?;
     let (kv_len, _) = prefill_monolithic_kv_with_cache(
         &mut enc_cache,
         prompt,

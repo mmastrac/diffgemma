@@ -1,4 +1,4 @@
-//! GEMM throughput bench: full-call vs resident compute vs MPS oracle.
+//! GEMM throughput bench: full-call vs resident compute vs MPSGraph oracle.
 
 use crate::metal::buffer::BufferPool;
 use crate::metal::gemm::Bf16Gemm;
@@ -161,12 +161,12 @@ fn gflops(m: usize, k: usize, n: usize, iters: usize, secs: f64) -> f64 {
     flops / secs / 1e9
 }
 
-/// Run `bench/mps_gemm.swift` (MPSGraph matmul oracle).
-pub fn bench_mps_oracle(shapes: &[GemmShape], iters: usize) -> Result<Vec<GemmBenchRow>, Error> {
-    let script = Path::new("bench/mps_gemm.swift");
+/// Run `bench/mpsgraph_gemm.swift` (MetalPerformanceShaders matmul oracle).
+pub fn bench_mpsgraph_oracle(shapes: &[GemmShape], iters: usize) -> Result<Vec<GemmBenchRow>, Error> {
+    let script = Path::new("bench/mpsgraph_gemm.swift");
     if !script.is_file() {
         return Err(Error::Format(
-            "MPS oracle script missing: bench/mps_gemm.swift",
+            "MPSGraph oracle script missing: bench/mpsgraph_gemm.swift",
         ));
     }
     let mut rows = Vec::new();

@@ -4,7 +4,7 @@ using namespace metal;
 #include "fc_axes.metal"
 #include "dequant.metal"
 
-/// Dequant block weight matrix `[N,K]` to f32 row-major (MPS scratch path).
+/// Dequant block weight matrix `[N,K]` to f32 row-major (scratch / validation).
 /// Format from K_QUANT_FORMAT (FC3): Q4 affine or NVFP4.
 /// Dispatch: `row = gid.y`, `col = gid.x`; grid width = K, height = N (see P1.10).
 kernel void dequant_block_matrix(

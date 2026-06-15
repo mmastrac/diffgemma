@@ -46,6 +46,7 @@ fn shader_bundle_token() -> u64 {
         include_str!("../../shaders/kernels/swiglu_moe_gate_up.metal"),
         include_str!("../../shaders/kernels/half_scale.metal"),
         include_str!("../../shaders/kernels/half_to_f32.metal"),
+        include_str!("../../shaders/kernels/pack_encoder_kv.metal"),
         include_str!("../../shaders/kernels/logit_rowstats.metal"),
         include_str!("../../shaders/kernels/sc_probs.metal"),
         include_str!("../../shaders/kernels/sc_softembed.metal"),

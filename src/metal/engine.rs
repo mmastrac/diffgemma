@@ -2,13 +2,12 @@ use crate::metal::attention::GpuAttentionKernels;
 use crate::metal::buffer::BufferPool;
 use crate::metal::device::{ComputePipeline, MetalContext};
 use crate::metal::kernels::GpuKernels;
-use crate::metal::mps_gemm::MpsMatmulCache;
 use crate::metal::sampler_kernels::GpuSamplerKernels;
 use crate::metal::telemetry::ForwardTelemetry;
 use crate::safetensors::Error;
 use std::cell::Cell;
-use std::rc::Rc;
 use std::cell::RefCell;
+use std::rc::Rc;
 
 const GEMM_SHADER: &str = include_str!("../../shaders/gemm.metal");
 const GEMM_ENTRY: &str = "bf16_gemm";
@@ -29,11 +28,6 @@ pub struct GpuDecoderEngine {
     pub f32_nvfp4_linear_grouped_pipeline: ComputePipeline,
     pub f32_q8_linear_pipeline: ComputePipeline,
     pub f32_q8_linear_kxn_pipeline: ComputePipeline,
-    pub dequant_q4_matrix_pipeline: ComputePipeline,
-    pub dequant_nvfp4_matrix_pipeline: ComputePipeline,
-    pub mps_matmul: MpsMatmulCache,
-    /// When false, `.dgq` q4 linears use the native Metal kernel instead of MPS (deterministic).
-    use_mps_q4: Cell<bool>,
     /// When true, encoder `.dgq` MoE uses grouped GPU GEMM (`DGQ_ENCODER_GPU_MOE=0` to opt out).
     encoder_gpu_moe: Cell<bool>,
     pub kernels: GpuKernels,
@@ -76,20 +70,6 @@ impl GpuDecoderEngine {
             crate::kernels::sub::gemm_q8_linear_f32::pipeline_for(&ctx, prod)?;
         let f32_q8_linear_kxn_pipeline =
             crate::kernels::sub::gemm_q8_linear_kxn_f32::pipeline_for(&ctx, prod)?;
-        let dequant_q4_matrix_pipeline =
-            crate::kernels::sub::dequant_block_matrix::pipeline_for(
-                &ctx,
-                crate::kernels::sub::QuantFormat::Q4Affine,
-                crate::kernels::sub::variant::KernelVariant::PRODUCTION,
-            )?;
-        let dequant_nvfp4_matrix_pipeline =
-            crate::kernels::sub::dequant_block_matrix::pipeline_for(
-                &ctx,
-                crate::kernels::sub::QuantFormat::NvFp4,
-                crate::kernels::sub::variant::KernelVariant::PRODUCTION,
-            )?;
-        let mps_matmul = MpsMatmulCache::new(ctx.device.clone());
-        let use_mps_q4 = Cell::new(mps_q4_default_from_env());
         let encoder_gpu_moe = Cell::new(encoder_gpu_moe_from_env());
         let kernels = GpuKernels::new(&ctx)?;
         let attention = GpuAttentionKernels::new(&ctx)?;
@@ -107,10 +87,6 @@ impl GpuDecoderEngine {
             f32_nvfp4_linear_grouped_pipeline,
             f32_q8_linear_pipeline,
             f32_q8_linear_kxn_pipeline,
-            dequant_q4_matrix_pipeline,
-            dequant_nvfp4_matrix_pipeline,
-            mps_matmul,
-            use_mps_q4,
             encoder_gpu_moe,
             kernels,
             attention,
@@ -143,34 +119,6 @@ impl GpuDecoderEngine {
             .then(|| self.telemetry_handle())
     }
 
-    /// MPS dense path for `.dgq` block linears (dequant scratch + MPSMatrixMultiplication).
-    pub fn q4_mps_triple(
-        &mut self,
-        enabled: bool,
-    ) -> Option<(
-        &mut MpsMatmulCache,
-        &ComputePipeline,
-        &ComputePipeline,
-    )> {
-        if enabled {
-            Some((
-                &mut self.mps_matmul,
-                &self.dequant_q4_matrix_pipeline,
-                &self.dequant_nvfp4_matrix_pipeline,
-            ))
-        } else {
-            None
-        }
-    }
-
-    pub fn use_mps_q4(&self) -> bool {
-        self.use_mps_q4.get()
-    }
-
-    pub fn set_use_mps_q4(&self, enabled: bool) {
-        self.use_mps_q4.set(enabled);
-    }
-
     pub fn encoder_gpu_moe(&self) -> bool {
         self.encoder_gpu_moe.get()
     }
@@ -185,16 +133,4 @@ fn encoder_gpu_moe_from_env() -> bool {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
         Err(_) => true,
     }
-}
-
-fn mps_q4_default_from_env() -> bool {
-    match std::env::var("DGQ_MPS_Q4") {
-        Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
-        Err(_) => true,
-    }
-}
-
-/// Default MPS Q4 dense path for production (`true` unless `DGQ_MPS_Q4=0`).
-pub fn default_use_mps_q4() -> bool {
-    mps_q4_default_from_env()
 }

@@ -66,7 +66,6 @@ enum Command {
         max_new_tokens: usize,
         max_layers: Option<usize>,
         no_early_stop: bool,
-        engine_fallback: bool,
         write_golden: Option<String>,
         write_trace: Option<PathBuf>,
     },
@@ -177,24 +176,6 @@ enum Command {
         prompt: Option<String>,
         prompt_len: usize,
         layer: usize,
-        seed: u64,
-        max_seq: usize,
-        raw_prompt: bool,
-    },
-    StepQ4Parity {
-        prompt: Option<String>,
-        prompt_len: usize,
-        layers: usize,
-        kv_len: u32,
-        seed: u64,
-        max_seq: usize,
-        raw_prompt: bool,
-    },
-    StepNvfp4Parity {
-        prompt: Option<String>,
-        prompt_len: usize,
-        layers: usize,
-        kv_len: u32,
         seed: u64,
         max_seq: usize,
         raw_prompt: bool,
@@ -422,42 +403,6 @@ fn main() -> ExitCode {
             prompt,
             prompt_len,
             layer,
-            seed,
-            max_seq,
-            raw_prompt,
-        ),
-        Command::StepQ4Parity {
-            prompt,
-            prompt_len,
-            layers,
-            kv_len,
-            seed,
-            max_seq,
-            raw_prompt,
-        } => run_step_q4_parity_cmd(
-            &cli.model_dir,
-            prompt,
-            prompt_len,
-            layers,
-            kv_len,
-            seed,
-            max_seq,
-            raw_prompt,
-        ),
-        Command::StepNvfp4Parity {
-            prompt,
-            prompt_len,
-            layers,
-            kv_len,
-            seed,
-            max_seq,
-            raw_prompt,
-        } => run_step_nvfp4_parity_cmd(
-            &cli.model_dir,
-            prompt,
-            prompt_len,
-            layers,
-            kv_len,
             seed,
             max_seq,
             raw_prompt,
@@ -700,7 +645,6 @@ fn main() -> ExitCode {
             max_new_tokens,
             max_layers,
             no_early_stop,
-            engine_fallback,
             write_golden,
             write_trace,
         } => run_generate_monolithic_cmd(
@@ -712,7 +656,6 @@ fn main() -> ExitCode {
             max_new_tokens,
             max_layers,
             no_early_stop,
-            engine_fallback,
             write_golden,
             write_trace,
             cli.raw_prompt,
@@ -916,7 +859,6 @@ fn run_command(
         Command::StepKvParity { .. } => ExitCode::FAILURE,
         Command::StepKvBf16Cross { .. } => ExitCode::FAILURE,
         Command::StepAttnProbe { .. } => ExitCode::FAILURE,
-        Command::StepQ4Parity { .. } | Command::StepNvfp4Parity { .. } => ExitCode::FAILURE,
         Command::StepLogitsDump { .. } => ExitCode::FAILURE,
         Command::StepBf16OracleLogitsDump { .. } => ExitCode::FAILURE,
         Command::StepLayerProbe { .. } => ExitCode::FAILURE,
@@ -954,10 +896,8 @@ fn step_kernel_config(
         } else {
             metal::StepFinishMode::Full
         },
-        use_mps_q4: None,
         prefill_token_ids: None,
         no_early_stop: false,
-        encoder_use_mps_q4: None,
     }
 }
 
@@ -1011,10 +951,8 @@ fn run_step_probe_cmd(
         seed,
         max_seq,
         finish: StepFinishMode::ForwardOnly,
-        use_mps_q4: None,
         prefill_token_ids: None,
         no_early_stop: false,
-        encoder_use_mps_q4: None,
     };
     if let Err(err) = attach_step_prefill(&mut cfg, model_dir, kv_len, prompt, raw_prompt) {
         eprintln!("error: {err}");
@@ -1078,10 +1016,8 @@ fn run_step_logits_dump_cmd(
         seed,
         max_seq,
         finish: metal::StepFinishMode::ForwardOnly,
-        use_mps_q4: None,
         prefill_token_ids: None,
         no_early_stop: false,
-        encoder_use_mps_q4: None,
     };
     if let Err(err) = attach_step_prefill(
         &mut cfg,
@@ -1160,10 +1096,8 @@ fn run_step_bf16_oracle_logits_dump_cmd(
         seed,
         max_seq,
         finish: metal::StepFinishMode::ForwardOnly,
-        use_mps_q4: None,
         prefill_token_ids: None,
         no_early_stop: false,
-        encoder_use_mps_q4: None,
     };
     if let Err(err) = attach_step_prefill(&mut cfg, dgq_dir, 0, prompt.as_deref(), raw_prompt) {
         eprintln!("error: {err}");
@@ -1264,10 +1198,8 @@ fn run_step_layer_probe_cmd(
         seed,
         max_seq,
         finish: metal::StepFinishMode::ForwardOnly,
-        use_mps_q4: None,
         prefill_token_ids: None,
         no_early_stop: false,
-        encoder_use_mps_q4: None,
     };
     if let Err(err) = attach_step_prefill(
         &mut cfg,
@@ -1341,10 +1273,8 @@ fn run_step_attn_dump_cmd(
         seed,
         max_seq,
         finish: metal::StepFinishMode::ForwardOnly,
-        use_mps_q4: None,
         prefill_token_ids: None,
         no_early_stop: false,
-        encoder_use_mps_q4: None,
     };
     if let Err(err) = attach_step_prefill(
         &mut cfg,
@@ -1404,10 +1334,8 @@ fn run_step_moe_dump_cmd(
         seed,
         max_seq,
         finish: metal::StepFinishMode::ForwardOnly,
-        use_mps_q4: None,
         prefill_token_ids: None,
         no_early_stop: false,
-        encoder_use_mps_q4: None,
     };
     if let Err(err) = attach_step_prefill(
         &mut cfg,
@@ -1471,10 +1399,8 @@ fn run_step_moe_route_dump_cmd(
         seed,
         max_seq,
         finish: StepFinishMode::ForwardOnly,
-        use_mps_q4: Some(false),
         prefill_token_ids: None,
         no_early_stop: false,
-        encoder_use_mps_q4: Some(false),
     };
     if let Err(err) = attach_step_prefill(
         &mut cfg,
@@ -1549,10 +1475,8 @@ fn run_step_moe_batched_pin_dump_cmd(
         seed,
         max_seq,
         finish: StepFinishMode::ForwardOnly,
-        use_mps_q4: Some(false),
         prefill_token_ids: None,
         no_early_stop: false,
-        encoder_use_mps_q4: Some(false),
     };
     if let Err(err) = attach_step_prefill(
         &mut cfg,
@@ -1630,10 +1554,8 @@ fn run_step_moe_single_dump_cmd(
         seed,
         max_seq,
         finish: metal::StepFinishMode::ForwardOnly,
-        use_mps_q4: None,
         prefill_token_ids: None,
         no_early_stop: false,
-        encoder_use_mps_q4: None,
     };
     if let Err(err) = attach_step_prefill(
         &mut cfg,
@@ -1711,10 +1633,8 @@ fn run_step_preamble_dump_cmd(
         seed,
         max_seq,
         finish: metal::StepFinishMode::ForwardOnly,
-        use_mps_q4: None,
         prefill_token_ids: None,
         no_early_stop: false,
-        encoder_use_mps_q4: None,
     };
     if let Err(err) = attach_step_prefill(
         &mut cfg,
@@ -1783,10 +1703,8 @@ fn run_embed_row_dump_cmd(
             seed: 0,
             max_seq,
             finish: StepFinishMode::ForwardOnly,
-            use_mps_q4: None,
             prefill_token_ids: None,
             no_early_stop: false,
-            encoder_use_mps_q4: None,
         };
         if let Err(err) = attach_step_prefill(
             &mut cfg,
@@ -2016,7 +1934,7 @@ fn run_step_kv_parity_cmd(
     max_seq: usize,
     raw_prompt: bool,
 ) -> ExitCode {
-    use metal::run_step_kv_mps_parity;
+    use metal::run_step_kv_parity;
 
     if !dgq::store::looks_like_dgq_dir(model_dir) {
         eprintln!("error: step-kv-parity requires a .dgq directory");
@@ -2048,7 +1966,7 @@ fn run_step_kv_parity_cmd(
         token_ids.len(),
         layers.max(1).min(30)
     );
-    match run_step_kv_mps_parity(
+    match run_step_kv_parity(
         model_dir,
         &token_ids,
         layers,
@@ -2059,14 +1977,14 @@ fn run_step_kv_parity_cmd(
             println!("step-kv-parity:");
             println!("  kv_len:              {}", r.kv_len);
             println!("  layers:              {}", r.layers);
-            println!("  native_prefix_l0:    {:.6}", r.native_prefix_max_l0);
-            println!("  mps_prefix_l0:       {:.6}", r.mps_prefix_max_l0);
+            println!("  prefix_l0:           {:.6}", r.prefix_max_l0);
+            println!("  prefix_l0_b:         {:.6}", r.prefix_max_l0_b);
             println!(
                 "  max_kv_diff:         {:.6} (layer {} pos {})",
                 r.max_kv_diff, r.max_kv_diff_layer, r.max_kv_diff_pos
             );
-            println!("  native_min_ent:      {:.4}", r.native_min_ent);
-            println!("  mps_min_ent:         {:.4}", r.mps_min_ent);
+            println!("  min_ent:             {:.4}", r.min_ent);
+            println!("  min_ent_b:           {:.4}", r.min_ent_b);
             println!("  min_ent_diff:        {:.4}", r.min_ent_diff);
             println!("  entropy_pass:        {}", r.entropy_pass);
             println!("  ln_vocab:            {:.4}", r.ln_vocab);
@@ -2164,188 +2082,6 @@ fn run_step_attn_probe_cmd(
             ExitCode::FAILURE
         }
     }
-}
-
-#[cfg(all(feature = "metal", target_os = "macos"))]
-fn run_step_q4_parity_cmd(
-    model_dir: &std::path::Path,
-    prompt: Option<String>,
-    prompt_len: usize,
-    layers: usize,
-    kv_len: u32,
-    seed: u64,
-    max_seq: usize,
-    raw_prompt: bool,
-) -> ExitCode {
-    use metal::run_step_q4_mps_parity;
-
-    if !dgq::store::looks_like_dgq_dir(model_dir) {
-        eprintln!("error: step-q4-parity requires a .dgq directory");
-        return ExitCode::FAILURE;
-    }
-    let prefill = if kv_len > 0 || prompt.is_some() {
-        let vocab = match crate::config::ModelConfig::load(model_dir) {
-            Ok(c) => c.text_config.vocab_size,
-            Err(err) => {
-                eprintln!("error: {err}");
-                return ExitCode::FAILURE;
-            }
-        };
-        let plen = if kv_len > 0 {
-            kv_len as usize
-        } else {
-            prompt_len
-        };
-        match build_prompt_tokens(model_dir, prompt.as_deref(), plen, vocab, raw_prompt, &[]) {
-            Ok(ids) => Some(ids),
-            Err(err) => {
-                eprintln!("error: {err}");
-                return ExitCode::FAILURE;
-            }
-        }
-    } else {
-        None
-    };
-    let kv_len_eff = prefill.as_ref().map(|p| p.len() as u32).unwrap_or(kv_len);
-    eprintln!(
-        "step-q4-parity: layers={} kv_len={}",
-        layers.max(1).min(30),
-        kv_len_eff
-    );
-    match run_step_q4_mps_parity(
-        model_dir,
-        layers,
-        kv_len_eff,
-        seed,
-        max_seq.max(64),
-        prefill,
-    ) {
-        Ok(r) => {
-            println!("step-q4-parity:");
-            println!("  layers:              {}", r.layers);
-            println!("  kv_len:              {}", r.kv_len);
-            println!("  hidden_max_abs:      {:.6}", r.hidden_max_abs);
-            println!("  logits_max_abs:      {:.6}", r.logits_max_abs);
-            println!("  native_min_ent:      {:.4}", r.native_min_ent);
-            println!("  mps_min_ent:         {:.4}", r.mps_min_ent);
-            println!("  pass:                {}", r.pass);
-            if r.pass {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
-        }
-        Err(err) => {
-            eprintln!("error: {err}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-#[cfg(all(feature = "metal", target_os = "macos"))]
-fn run_step_nvfp4_parity_cmd(
-    model_dir: &std::path::Path,
-    prompt: Option<String>,
-    prompt_len: usize,
-    layers: usize,
-    kv_len: u32,
-    seed: u64,
-    max_seq: usize,
-    raw_prompt: bool,
-) -> ExitCode {
-    use metal::run_step_nvfp4_mps_parity;
-
-    if !dgq::store::looks_like_dgq_dir(model_dir) {
-        eprintln!("error: step-nvfp4-parity requires a .dgq directory");
-        return ExitCode::FAILURE;
-    }
-    let prefill = if kv_len > 0 || prompt.is_some() {
-        let vocab = match crate::config::ModelConfig::load(model_dir) {
-            Ok(c) => c.text_config.vocab_size,
-            Err(err) => {
-                eprintln!("error: {err}");
-                return ExitCode::FAILURE;
-            }
-        };
-        let plen = if kv_len > 0 {
-            kv_len as usize
-        } else {
-            prompt_len
-        };
-        match build_prompt_tokens(model_dir, prompt.as_deref(), plen, vocab, raw_prompt, &[]) {
-            Ok(ids) => Some(ids),
-            Err(err) => {
-                eprintln!("error: {err}");
-                return ExitCode::FAILURE;
-            }
-        }
-    } else {
-        None
-    };
-    let kv_len_eff = prefill.as_ref().map(|p| p.len() as u32).unwrap_or(kv_len);
-    eprintln!(
-        "step-nvfp4-parity: layers={} kv_len={}",
-        layers.max(1).min(30),
-        kv_len_eff
-    );
-    match run_step_nvfp4_mps_parity(
-        model_dir,
-        layers,
-        kv_len_eff,
-        seed,
-        max_seq.max(64),
-        prefill,
-    ) {
-        Ok(r) => {
-            println!("step-nvfp4-parity:");
-            println!("  layers:              {}", r.layers);
-            println!("  kv_len:              {}", r.kv_len);
-            println!("  hidden_max_abs:      {:.6}", r.hidden_max_abs);
-            println!("  logits_max_abs:      {:.6}", r.logits_max_abs);
-            println!("  native_min_ent:      {:.4}", r.native_min_ent);
-            println!("  mps_min_ent:         {:.4}", r.mps_min_ent);
-            println!("  pass:                {}", r.pass);
-            if r.pass {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
-        }
-        Err(err) => {
-            eprintln!("error: {err}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-fn run_step_nvfp4_parity_cmd(
-    _model_dir: &std::path::Path,
-    _prompt: Option<String>,
-    _prompt_len: usize,
-    _layers: usize,
-    _kv_len: u32,
-    _seed: u64,
-    _max_seq: usize,
-    _raw_prompt: bool,
-) -> ExitCode {
-    eprintln!("error: step-nvfp4-parity requires --features metal on macOS");
-    ExitCode::FAILURE
-}
-
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-fn run_step_q4_parity_cmd(
-    _model_dir: &std::path::Path,
-    _prompt: Option<String>,
-    _prompt_len: usize,
-    _layers: usize,
-    _kv_len: u32,
-    _seed: u64,
-    _max_seq: usize,
-    _raw_prompt: bool,
-) -> ExitCode {
-    eprintln!("error: step-q4-parity requires --features metal on macOS");
-    ExitCode::FAILURE
 }
 
 #[cfg(not(all(feature = "metal", target_os = "macos")))]
@@ -2876,7 +2612,7 @@ fn run_probe_device() -> ExitCode {
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 fn run_bench_gemm(shapes: &str, oracle: Option<&str>, iters: usize) -> ExitCode {
-    use metal::{bench_custom_kernel, bench_mps_oracle, parse_shapes, print_bench_rows};
+    use metal::{bench_custom_kernel, bench_mpsgraph_oracle, parse_shapes, print_bench_rows};
     let parsed = match parse_shapes(shapes) {
         Ok(s) => s,
         Err(err) => {
@@ -2891,8 +2627,8 @@ fn run_bench_gemm(shapes: &str, oracle: Option<&str>, iters: usize) -> ExitCode 
             return ExitCode::FAILURE;
         }
     };
-    if oracle == Some("mps") {
-        match bench_mps_oracle(&parsed, iters) {
+    if matches!(oracle, Some("mps") | Some("mpsgraph")) {
+        match bench_mpsgraph_oracle(&parsed, iters) {
             Ok(mut mps) => rows.append(&mut mps),
             Err(err) => {
                 eprintln!("warning: {err}");
@@ -3247,7 +2983,7 @@ fn parse_cli() -> Cli {
         Some("layer0") => Command::Layer0,
         Some("decoder") => Command::Decoder,
         Some("prefill") => Command::Prefill,
-        Some("generate") if use_monolithic => Command::GenerateMonolithic {
+        Some("generate") if dgq_dir_uses_monolithic(&model_dir) => Command::GenerateMonolithic {
             prompt: prompt.clone(),
             seed,
             steps: steps_production,
@@ -3255,7 +2991,6 @@ fn parse_cli() -> Cli {
             max_new_tokens,
             max_layers: parity_layers,
             no_early_stop,
-            engine_fallback: true,
             write_golden: None,
             write_trace: None,
         },
@@ -3268,7 +3003,7 @@ fn parse_cli() -> Cli {
             max_layers: parity_layers,
             no_early_stop,
         },
-        Some("generate-gpu") if use_monolithic => Command::GenerateMonolithic {
+        Some("generate-gpu") if dgq_dir_uses_monolithic(&model_dir) => Command::GenerateMonolithic {
             prompt: prompt.clone(),
             seed,
             steps: steps_production,
@@ -3276,9 +3011,8 @@ fn parse_cli() -> Cli {
             max_new_tokens,
             max_layers: parity_layers,
             no_early_stop,
-            engine_fallback: true,
-            write_golden: None,
-            write_trace: None,
+            write_golden,
+            write_trace,
         },
         Some("generate-gpu") => Command::GenerateGpu {
             prompt: prompt.clone(),
@@ -3299,7 +3033,6 @@ fn parse_cli() -> Cli {
             max_new_tokens,
             max_layers: parity_layers,
             no_early_stop,
-            engine_fallback: false,
             write_golden,
             write_trace,
         },
@@ -3447,24 +3180,6 @@ fn parse_cli() -> Cli {
             layer: bench_layers,
             seed,
             max_seq: step_max_seq.max(512),
-            raw_prompt,
-        },
-        Some("step-q4-parity") => Command::StepQ4Parity {
-            prompt: prompt.clone(),
-            prompt_len,
-            layers: bench_layers.max(1).min(30),
-            kv_len: step_kv_len,
-            seed,
-            max_seq: step_max_seq.max(64),
-            raw_prompt,
-        },
-        Some("step-nvfp4-parity") => Command::StepNvfp4Parity {
-            prompt: prompt.clone(),
-            prompt_len,
-            layers: bench_layers.max(1).min(30),
-            kv_len: step_kv_len,
-            seed,
-            max_seq: step_max_seq.max(64),
             raw_prompt,
         },
         Some("step-logits-dump") => {
@@ -3691,9 +3406,9 @@ fn parse_cli() -> Cli {
         Some(cmd) => {
             eprintln!("unknown command: {cmd}");
             eprintln!(
-                "usage: diffgemma-mps [-p PROMPT] [--raw] [summary|config|weights <name>|quantize|convert-model|step-smoke|step-probe|step-kv-check|step-kv-parity|step-q4-parity|step-nvfp4-parity|step-verify|step-ci|step-parity|bench-step-kernel|bench-step|bench-prefill|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-monolithic|generate-monolithic-parity|generate-parity|chat|tokenize <text>|gemm|attention]"
+                "usage: diffgemma-mps [-p PROMPT] [--raw] [summary|config|weights <name>|quantize|convert-model|step-smoke|step-probe|step-kv-check|step-kv-parity|step-verify|step-ci|step-parity|bench-step-kernel|bench-step|bench-prefill|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-monolithic|generate-monolithic-parity|generate-parity|chat|tokenize <text>|gemm|attention]"
             );
-            eprintln!("  default (no command): generate-gpu with --features metal (or generate-monolithic with DGQ_MONOLITHIC=1 / --monolithic on .dgq)");
+            eprintln!("  default (no command): generate-monolithic on .dgq, else generate-gpu (bf16) with --features metal");
             eprintln!("  prompts: chat template applied by default; use --raw for bare BPE (-p \"Hello\" -> [9259])");
             eprintln!("  chat: interactive REPL (monolithic .dgq); optional -p for first user turn");
             eprintln!("  generate-parity: GPU vs checked-in golden (use --compare-cpu for slow CPU path; use --raw for legacy goldens)");
@@ -3726,6 +3441,16 @@ fn monolithic_from_env() -> bool {
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
+fn dgq_dir_uses_monolithic(model_dir: &std::path::Path) -> bool {
+    dgq::store::looks_like_dgq_dir(model_dir)
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn dgq_dir_uses_monolithic(_model_dir: &std::path::Path) -> bool {
+    false
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
 fn default_generate_command(
     model_dir: &std::path::Path,
     prompt: Option<String>,
@@ -3735,9 +3460,9 @@ fn default_generate_command(
     max_new_tokens: usize,
     max_layers: Option<usize>,
     no_early_stop: bool,
-    use_monolithic: bool,
+    _use_monolithic: bool,
 ) -> Command {
-    if use_monolithic && dgq::store::looks_like_dgq_dir(model_dir) {
+    if dgq_dir_uses_monolithic(model_dir) {
         return Command::GenerateMonolithic {
             prompt,
             seed,
@@ -3746,7 +3471,6 @@ fn default_generate_command(
             max_new_tokens,
             max_layers,
             no_early_stop,
-            engine_fallback: true,
             write_golden: None,
             write_trace: None,
         };
@@ -4612,10 +4336,8 @@ fn run_bench_prefill(
                 seed,
                 max_seq,
                 finish: StepFinishMode::Full,
-                use_mps_q4: None,
                 prefill_token_ids: None,
                 no_early_stop: false,
-                encoder_use_mps_q4: None,
             };
             let (mut rt, build) = match build_step_runtime(model_dir, &smoke_cfg) {
                 Ok(v) => v,
@@ -4638,7 +4360,6 @@ fn run_bench_prefill(
                 CANVAS,
                 max_seq,
                 Some(shared_blob),
-                None,
             ) {
                 Ok(c) => c,
                 Err(err) => {
@@ -5200,27 +4921,12 @@ fn run_generate_monolithic_cmd(
     max_new_tokens: usize,
     max_layers: Option<usize>,
     no_early_stop: bool,
-    engine_fallback: bool,
     write_golden: Option<String>,
     write_trace: Option<PathBuf>,
     raw_prompt: bool,
 ) -> ExitCode {
     if !dgq::store::looks_like_dgq_dir(model_dir) {
         eprintln!("error: generate-monolithic requires a .dgq directory (-m /path/to/quantized-weights)");
-        if engine_fallback {
-            eprintln!("note: falling back to generate-gpu (not a .dgq path)");
-            return run_generate_engine_fallback(
-                model_dir,
-                prompt_text,
-                seed,
-                steps,
-                prompt_len,
-                max_new_tokens,
-                max_layers,
-                no_early_stop,
-                raw_prompt,
-            );
-        }
         return ExitCode::FAILURE;
     }
 
@@ -5318,20 +5024,6 @@ fn run_generate_monolithic_cmd(
         }
         Err(err) => {
             eprintln!("error: {err}");
-            if engine_fallback {
-                eprintln!("note: monolithic failed; falling back to generate-gpu");
-                return run_generate_engine_fallback(
-                    model_dir,
-                    prompt_text,
-                    seed,
-                    steps,
-                    prompt_len,
-                    max_new_tokens,
-                    max_layers,
-                    no_early_stop,
-                    raw_prompt,
-                );
-            }
             ExitCode::FAILURE
         }
     }
@@ -5490,41 +5182,6 @@ fn run_generate_monolithic_parity_cmd(
     ExitCode::FAILURE
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
-fn run_generate_engine_fallback(
-    model_dir: &std::path::Path,
-    prompt_text: Option<String>,
-    seed: u64,
-    steps: usize,
-    prompt_len: usize,
-    max_new_tokens: usize,
-    max_layers: Option<usize>,
-    no_early_stop: bool,
-    raw_prompt: bool,
-) -> ExitCode {
-    match model::Model::open(model_dir) {
-        Ok(m) => run_generate(
-            &m,
-            model_dir,
-            prompt_text,
-            seed,
-            steps,
-            prompt_len,
-            max_new_tokens,
-            max_layers,
-            no_early_stop,
-            true,
-            None,
-            None,
-            raw_prompt,
-        ),
-        Err(err) => {
-            eprintln!("error: engine fallback failed: {err}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
 #[cfg(not(all(feature = "metal", target_os = "macos")))]
 fn run_generate_monolithic_cmd(
     _model_dir: &std::path::Path,
@@ -5535,8 +5192,8 @@ fn run_generate_monolithic_cmd(
     _max_new_tokens: usize,
     _max_layers: Option<usize>,
     _no_early_stop: bool,
-    _engine_fallback: bool,
     _write_golden: Option<String>,
+    _write_trace: Option<PathBuf>,
     _raw_prompt: bool,
 ) -> ExitCode {
     eprintln!("error: generate-monolithic requires --features metal on macOS");
@@ -5576,6 +5233,11 @@ fn run_generate(
         }
     };
     let prompt_len = prompt.len();
+
+    if use_gpu && m.weights.is_quantized() {
+        eprintln!("error: generate-gpu on .dgq is removed; use generate-monolithic");
+        return ExitCode::FAILURE;
+    }
 
     let enc_seq = prompt_len.max(canvas);
     let mut enc_scratch = model::encoder::EncoderScratch::new(enc_seq, &m.config);
@@ -5773,6 +5435,11 @@ fn run_generate_parity(
         };
 
         let prompt_label = prompt_text.clone().unwrap_or_else(|| format!("prompt_len={prompt_len}"));
+
+        if m.weights.is_quantized() {
+            eprintln!("error: generate-parity on .dgq is removed; use generate-monolithic-parity");
+            return ExitCode::FAILURE;
+        }
 
         if let Some(n) = max_layers {
             eprintln!("generate-parity: decoder layers limited to {n}");

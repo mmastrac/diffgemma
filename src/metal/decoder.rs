@@ -341,9 +341,7 @@ fn forward_inner(
     let mut out_buf = &mut scratch.cpu.hidden_b;
 
     let n_layers = max_layers.min(text.num_hidden_layers);
-    if !engine.use_mps_q4() {
-        engine.pool.clear();
-    }
+    engine.pool.clear();
     let expert_before = if engine.telemetry_enabled() {
         Some(weights.expert_cache_stats())
     } else {

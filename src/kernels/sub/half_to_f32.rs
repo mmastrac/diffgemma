@@ -1,4 +1,4 @@
-//! Convert fp16 arena slice to f32 (monolith MPS-Q4 path).
+//! Convert fp16 arena slice to f32 (monolith step-kernel path).
 
 use super::f16;
 use super::gpu_common;

@@ -120,21 +120,26 @@ fn run_encoder_prefill(
     let kv_cache = match decoder {
         DecoderBackend::Gpu {
             scratch,
-            weights,
             engine,
-            ..
-        } => crate::metal::prefill_gpu(
             store,
             cfg,
-            &input,
-            enc_scratch,
-            scratch,
-            weights,
-            engine,
-            max_encoder_kv,
-            canvas_len,
-            gen_cfg.max_layers,
-        )?,
+            ..
+        } => {
+            if store.is_quantized() {
+                return Err(Error::Format(
+                    ".dgq encoder prefill for generate-gpu is removed; use generate-monolithic",
+                ));
+            }
+            let out = prefill(store, cfg, &input, enc_scratch)?;
+            scratch.ensure_gpu_kv(
+                &engine.ctx.device,
+                &cfg.text_config,
+                max_encoder_kv,
+                canvas_len,
+            )?;
+            scratch.sync_gpu_kv_from_cpu(&out.kv_cache, canvas_len)?;
+            out.kv_cache
+        }
         DecoderBackend::Cpu { .. } => {
             let out = prefill(store, cfg, &input, enc_scratch)?;
             out.kv_cache
@@ -179,20 +184,25 @@ fn extend_encoder_kv(
     match backend {
         DecoderBackend::Gpu {
             scratch,
-            weights,
             engine,
-            ..
-        } => crate::metal::extend_prefill_gpu(
             store,
             cfg,
-            kv_cache,
-            token_ids,
-            enc_scratch,
-            scratch,
-            weights,
-            engine,
-            max_layers,
-        ),
+            ..
+        } => {
+            if store.is_quantized() {
+                return Err(Error::Format(
+                    ".dgq encoder extend for generate-gpu is removed; use generate-monolithic",
+                ));
+            }
+            extend_prefill(store, cfg, kv_cache, token_ids, enc_scratch)?;
+            scratch.ensure_gpu_kv(
+                &engine.ctx.device,
+                &cfg.text_config,
+                kv_cache.kv_len,
+                cfg.canvas_length,
+            )?;
+            scratch.sync_gpu_kv_from_cpu(kv_cache, cfg.canvas_length)
+        }
         DecoderBackend::Cpu { store, cfg, .. } => {
             extend_prefill(store, cfg, kv_cache, token_ids, enc_scratch)
         }
@@ -662,12 +672,6 @@ pub fn generate_gpu(
     engine: &mut crate::metal::GpuDecoderEngine,
 ) -> Result<GenerateOutput, Error> {
     dec_scratch.use_gpu_sampler = weights.is_dgq() && !gen_cfg.deterministic;
-    if gen_cfg.deterministic || std::env::var("DGQ_DETERMINISTIC")
-        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(false)
-    {
-        engine.set_use_mps_q4(false);
-    }
     engine.pool.clear();
     let mut decoder = DecoderBackend::Gpu {
         store,
@@ -701,37 +705,7 @@ pub fn generate_monolithic_gpu(
         gen_cfg.sampler.clone(),
         gen_cfg.no_early_stop,
     );
-    // Native fused GEMM by default for both profiles; opt in MPS with DGQ_STEP_MPS_Q4=1
-    // (step-nvfp4-parity / step-q4-parity gate the MPS path).
-    cfg.step_use_mps_q4 = Some(monolithic_step_use_mps_q4());
-    cfg.encoder_use_mps_q4 = Some(monolithic_encoder_use_mps_q4());
-    if gen_cfg.deterministic
-        || std::env::var("DGQ_DETERMINISTIC")
-            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-            .unwrap_or(false)
-    {
-        cfg.step_use_mps_q4 = Some(false);
-        cfg.encoder_use_mps_q4 = Some(false);
-    }
     generate_monolithic(model_dir, prompt_token_ids, &cfg, prompt_label)
-}
-
-/// Native monolithic step GEMM by default; opt in with `DGQ_STEP_MPS_Q4=1`.
-#[cfg(all(feature = "metal", target_os = "macos"))]
-fn monolithic_step_use_mps_q4() -> bool {
-    match std::env::var("DGQ_STEP_MPS_Q4") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => false,
-    }
-}
-
-/// Native monolithic encoder prefill by default; opt in with `DGQ_MPS_Q4=1`.
-#[cfg(all(feature = "metal", target_os = "macos"))]
-fn monolithic_encoder_use_mps_q4() -> bool {
-    match std::env::var("DGQ_MPS_Q4") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => false,
-    }
 }
 
 #[cfg(all(test, feature = "metal", target_os = "macos"))]
@@ -780,7 +754,6 @@ mod gpu_determinism {
         kv_cache: &KvCache,
         max_layers: usize,
     ) -> Result<Vec<f32>, Error> {
-        engine.set_use_mps_q4(false);
         dec.use_gpu_sampler = false;
         let canvas = cfg.canvas_length;
         let vocab = cfg.text_config.vocab_size;
@@ -822,7 +795,6 @@ mod gpu_determinism {
             token_ids: &DGQ_HELLO_PROMPT,
             position_offset: 0,
         };
-        engine.set_use_mps_q4(false);
         dec.use_gpu_sampler = false;
         let kv = prefill_gpu(
             store,
@@ -1076,8 +1048,7 @@ mod gpu_determinism {
             let mut engine = GpuDecoderEngine::new().expect("engine");
             let mut enc = EncoderScratch::new(canvas.max(1), &cfg);
             let mut dec = GpuDecoderScratch::new(canvas, &cfg);
-            engine.set_use_mps_q4(false);
-            dec.use_gpu_sampler = false;
+                dec.use_gpu_sampler = false;
             let input = EncoderPrefillInput {
                 token_ids: &DGQ_HELLO_PROMPT,
                 position_offset: 0,
@@ -1139,8 +1110,7 @@ mod gpu_determinism {
             let mut engine = GpuDecoderEngine::new().expect("engine");
             let mut enc = EncoderScratch::new(canvas.max(1), &cfg);
             let mut dec = GpuDecoderScratch::new(canvas, &cfg);
-            engine.set_use_mps_q4(false);
-            dec.use_gpu_sampler = false;
+                dec.use_gpu_sampler = false;
             let input = EncoderPrefillInput {
                 token_ids: &DGQ_HELLO_PROMPT,
                 position_offset: 0,
@@ -1369,49 +1339,20 @@ mod gpu_determinism {
         }
     }
 
-    /// Native Q4 + CPU sampler should be repeatable.
+    /// Monolithic generate should be repeatable in deterministic mode.
     #[test]
     fn dgq_generate_stable_deterministic_mode() {
         let Some(dgq_dir) = dgq_fixture_dir() else {
             eprintln!("skip: /tmp/quantized-weights missing");
             return;
         };
-        let store = WeightStore::open(&dgq_dir).expect("open");
-        let cfg = crate::config::ModelConfig::load(&dgq_dir).expect("cfg");
         let prompt = DGQ_HELLO_PROMPT.to_vec();
         let gen_cfg = hello_gen_cfg();
-        let canvas = cfg.canvas_length;
-        let max_kv = prompt.len() + gen_cfg.max_new_tokens;
-
-        let mut weights = load_weight_cache(&store, &cfg.text_config, canvas, max_kv).expect("cache");
-        let mut engine = GpuDecoderEngine::new().expect("engine");
-        let mut enc = EncoderScratch::new(prompt.len().max(canvas), &cfg);
-        let mut dec = GpuDecoderScratch::new(canvas, &cfg);
-        let out_a = generate_gpu(
-            &store,
-            &cfg,
-            &prompt,
-            &gen_cfg,
-            &mut enc,
-            &mut dec,
-            &mut weights,
-            &mut engine,
-        )
-        .expect("generate a");
-        let mut enc = EncoderScratch::new(prompt.len().max(canvas), &cfg);
-        let mut dec = GpuDecoderScratch::new(canvas, &cfg);
-        let mut engine = GpuDecoderEngine::new().expect("engine");
-        let out_b = generate_gpu(
-            &store,
-            &cfg,
-            &prompt,
-            &gen_cfg,
-            &mut enc,
-            &mut dec,
-            &mut weights,
-            &mut engine,
-        )
-        .expect("generate b");
+        let max_seq = prompt.len() + gen_cfg.max_new_tokens;
+        let out_a = generate_monolithic_gpu(&dgq_dir, &prompt, &gen_cfg, max_seq, "hello")
+            .expect("generate a");
+        let out_b = generate_monolithic_gpu(&dgq_dir, &prompt, &gen_cfg, max_seq, "hello")
+            .expect("generate b");
         if out_a.token_ids != out_b.token_ids {
             let idx = out_a
                 .token_ids

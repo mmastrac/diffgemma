@@ -24,10 +24,6 @@ pub struct StepGenerateConfig {
     pub layers: usize,
     pub sampler: SamplerConfig,
     pub no_early_stop: bool,
-    /// Step-kernel dense GEMM (`DGQ_STEP_MPS_Q4`, default native Q4).
-    pub step_use_mps_q4: Option<bool>,
-    /// Encoder prefill/extend (`DGQ_MPS_Q4` when `None`).
-    pub encoder_use_mps_q4: Option<bool>,
     /// Override random canvas (256 ids) for parity with MLX/HF traces.
     pub initial_canvas_ids: Option<Vec<u32>>,
 }
@@ -48,8 +44,6 @@ impl StepGenerateConfig {
             layers,
             sampler,
             no_early_stop,
-            step_use_mps_q4: None,
-            encoder_use_mps_q4: None,
             initial_canvas_ids: None,
         }
     }
@@ -63,10 +57,8 @@ fn smoke_config(cfg: &StepGenerateConfig) -> StepSmokeConfig {
         seed: cfg.seed,
         max_seq: cfg.max_seq,
         finish: StepFinishMode::Full,
-        use_mps_q4: cfg.step_use_mps_q4,
         prefill_token_ids: None,
         no_early_stop: false,
-        encoder_use_mps_q4: cfg.encoder_use_mps_q4,
     }
 }
 
@@ -125,9 +117,8 @@ impl StepGenerateSession {
     pub fn open(model_dir: &Path, cfg: &StepGenerateConfig) -> Result<(Self, Duration), Error> {
         let layers = cfg.layers.min(N_LAYERS).max(1);
         let (rt, build) = build_step_runtime(model_dir, &smoke_config(cfg))?;
-        let step_mps_q4 = rt.use_mps_q4();
         eprintln!(
-            "step-generate: runtime ready (total={:.2?}, compile={:.2?}, step_use_mps_q4={step_mps_q4})",
+            "step-generate: runtime ready (total={:.2?}, compile={:.2?})",
             build.total, build.compile
         );
         Ok((
@@ -147,10 +138,6 @@ impl StepGenerateSession {
 
     pub fn runtime_mut(&mut self) -> &mut StepRuntime {
         &mut self.rt
-    }
-
-    pub fn step_use_mps_q4(&self) -> bool {
-        self.rt.use_mps_q4()
     }
 }
 
@@ -186,15 +173,9 @@ pub fn generate_with_session(
             canvas_len,
             cfg.max_seq,
             Some(shared_blob),
-            cfg.encoder_use_mps_q4,
         )?);
-        let enc_mps = session
-            .encoder
-            .as_ref()
-            .expect("encoder cache")
-            .use_mps_q4();
         eprintln!(
-            "step-generate: encoder cache ready ({:.2?}, encoder_use_mps_q4={enc_mps})",
+            "step-generate: encoder cache ready ({:.2?})",
             encoder_started.elapsed()
         );
     }

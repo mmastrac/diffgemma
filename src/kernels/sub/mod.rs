@@ -28,6 +28,7 @@ pub mod qk_rope_kv;
 pub mod moe_bucket_count;
 pub mod moe_bucket_fill;
 pub mod nvfp4_tile_k_order;
+pub mod pack_encoder_kv;
 pub mod fp8_e4m3_table;
 pub mod q4_group_k_order;
 pub mod moe_batched_pin;

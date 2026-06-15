@@ -99,7 +99,6 @@ pub fn forward_decoder(
         &mut scratch.attn,
         engine,
         gpu_kv,
-        engine.use_mps_q4(),
     )?;
 
     forward_layer_ff(
@@ -186,8 +185,6 @@ fn forward_layer_ff_dgq_gpu(
     let len = seq_len * hidden;
     let experts = cfg.num_experts;
     let top_k = cfg.top_k_experts;
-    let use_mps_q4 = engine.use_mps_q4();
-
     let telemetry = engine.batch_telemetry();
     let mut batch = begin_engine_batch(
         &engine.ctx.queue,
@@ -222,15 +219,6 @@ fn forward_layer_ff_dgq_gpu(
         &engine.f32_bf16_linear_pipeline,
         &engine.f32_q4_linear_pipeline,
         &engine.f32_nvfp4_linear_pipeline,
-        if use_mps_q4 {
-            Some((
-                &mut engine.mps_matmul,
-                &engine.dequant_q4_matrix_pipeline,
-                &engine.dequant_nvfp4_matrix_pipeline,
-            ))
-        } else {
-            None
-        },
         &buf_normed,
         &cached.mlp_gate,
         seq_len,
@@ -240,15 +228,6 @@ fn forward_layer_ff_dgq_gpu(
         &engine.f32_bf16_linear_pipeline,
         &engine.f32_q4_linear_pipeline,
         &engine.f32_nvfp4_linear_pipeline,
-        if use_mps_q4 {
-            Some((
-                &mut engine.mps_matmul,
-                &engine.dequant_q4_matrix_pipeline,
-                &engine.dequant_nvfp4_matrix_pipeline,
-            ))
-        } else {
-            None
-        },
         &buf_normed,
         &cached.mlp_up,
         seq_len,
@@ -261,15 +240,6 @@ fn forward_layer_ff_dgq_gpu(
         &engine.f32_bf16_linear_pipeline,
         &engine.f32_q4_linear_pipeline,
         &engine.f32_nvfp4_linear_pipeline,
-        if use_mps_q4 {
-            Some((
-                &mut engine.mps_matmul,
-                &engine.dequant_q4_matrix_pipeline,
-                &engine.dequant_nvfp4_matrix_pipeline,
-            ))
-        } else {
-            None
-        },
         &buf_gate,
         &cached.mlp_down,
         seq_len,
@@ -284,22 +254,24 @@ fn forward_layer_ff_dgq_gpu(
         eps,
     )?;
 
-    // Dense Q4 may use MPS matmul; router stays CPU (small readback). MoE uses grouped GPU
-    // by default (`gemm_linear_grouped`); opt out with `DGQ_ENCODER_GPU_MOE=0`.
+    // Dense Q4 fused kernels; GPU router + grouped MoE (monolithic encoder always GPU MoE on .dgq).
     scratch.dense_out.resize(len, 0.0);
     scratch.moe_input.resize(len, 0.0);
+    let mut route_scratch = GpuRouteScratch::new(seq_len, top_k);
+    route_gpu_in_batch(
+        &mut batch,
+        &engine.kernels,
+        &engine.f32_f32_linear_pipeline.pipeline,
+        &buf_stream,
+        cached,
+        cfg,
+        seq_len,
+        &mut route_scratch,
+    )?;
     batch.register_read(buf_ff.clone(), &mut scratch.dense_out);
     batch.register_read(buf_stream.clone(), &mut scratch.moe_input);
     batch.end()?;
-    let routes = route_with_cached_weights(
-        &scratch.moe_input,
-        cached.router_proj.as_slice(),
-        cached.router_scale.as_slice(),
-        cached.per_expert_scale.as_slice(),
-        cfg,
-        seq_len,
-        &mut scratch.cpu.moe,
-    )?;
+    let routes = route_scratch.into_routes(seq_len, top_k);
     let mut batch = None;
 
     let jobs = build_expert_jobs(&routes, experts);
@@ -473,7 +445,6 @@ fn forward_layer_ff_bf16(
             &engine.f32_bf16_linear_pipeline,
             &engine.f32_q4_linear_pipeline,
             &engine.f32_nvfp4_linear_pipeline,
-            None,
             &buf_normed,
             &cached.mlp_gate,
             seq_len,
@@ -483,7 +454,6 @@ fn forward_layer_ff_bf16(
             &engine.f32_bf16_linear_pipeline,
             &engine.f32_q4_linear_pipeline,
             &engine.f32_nvfp4_linear_pipeline,
-            None,
             &buf_normed,
             &cached.mlp_up,
             seq_len,
@@ -496,7 +466,6 @@ fn forward_layer_ff_bf16(
             &engine.f32_bf16_linear_pipeline,
             &engine.f32_q4_linear_pipeline,
             &engine.f32_nvfp4_linear_pipeline,
-            None,
             &buf_gate,
             &cached.mlp_down,
             seq_len,
@@ -613,7 +582,6 @@ pub fn forward_encoder_prefill(
         &mut scratch.attn,
         engine,
         gpu_kv,
-        engine.use_mps_q4(),
     )?;
 
     forward_layer_ff(
@@ -660,7 +628,6 @@ pub fn forward_encoder_extend(
         &mut scratch.attn,
         engine,
         gpu_kv,
-        engine.use_mps_q4(),
     )?;
 
     forward_layer_ff(
@@ -759,8 +726,7 @@ mod determinism_tests {
             let mut weights =
                 load_weight_cache(&store, text, canvas, max_kv).expect("cache");
             let mut engine = GpuDecoderEngine::new().expect("engine");
-            engine.set_use_mps_q4(false);
-            let mut enc = EncoderScratch::new(canvas.max(1), &cfg);
+                let mut enc = EncoderScratch::new(canvas.max(1), &cfg);
             let mut dec = GpuDecoderScratch::new(canvas, &cfg);
             dec.use_gpu_sampler = false;
             let kv = prefill_gpu(
@@ -921,7 +887,6 @@ mod determinism_tests {
             &ctx.engine.f32_bf16_linear_pipeline,
             &ctx.engine.f32_q4_linear_pipeline,
             &ctx.engine.f32_nvfp4_linear_pipeline,
-            None,
             &buf_normed,
             &cached.mlp_gate,
             seq_len,
@@ -932,7 +897,6 @@ mod determinism_tests {
             &ctx.engine.f32_bf16_linear_pipeline,
             &ctx.engine.f32_q4_linear_pipeline,
             &ctx.engine.f32_nvfp4_linear_pipeline,
-            None,
             &buf_normed,
             &cached.mlp_up,
             seq_len,
@@ -946,7 +910,6 @@ mod determinism_tests {
             &ctx.engine.f32_bf16_linear_pipeline,
             &ctx.engine.f32_q4_linear_pipeline,
             &ctx.engine.f32_nvfp4_linear_pipeline,
-            None,
             &buf_gate,
             &cached.mlp_down,
             seq_len,
@@ -994,7 +957,6 @@ mod determinism_tests {
             .expect("layer0");
         let cached = ctx.weights.layer_ref(0);
         let kv_view = LayerKvView::from_layer(ctx.kv.layer(0).expect("kv"), kv_len);
-        ctx.engine.set_use_mps_q4(false);
         forward_decoder_attention(
             &mut a,
             &hidden_in,
@@ -1008,7 +970,6 @@ mod determinism_tests {
             &mut scratch.attn,
             &mut ctx.engine,
             ctx.dec.gpu_kv.as_ref(),
-            false,
         )
         .expect("attn a");
         forward_decoder_attention(
@@ -1024,7 +985,6 @@ mod determinism_tests {
             &mut scratch.attn,
             &mut ctx.engine,
             ctx.dec.gpu_kv.as_ref(),
-            false,
         )
         .expect("attn b");
         ctx.weights.release_layer();
@@ -1063,7 +1023,6 @@ mod determinism_tests {
             &mut scratch.attn,
             &mut ctx.engine,
             ctx.dec.gpu_kv.as_ref(),
-            false,
         )?;
         let eps = text.rms_norm_eps as f32;
         let len = canvas_len * hidden_dim;
@@ -1197,7 +1156,6 @@ mod determinism_tests {
                 &mut scratch.attn,
                 &mut ctx.engine,
                 ctx.dec.gpu_kv.as_ref(),
-                false,
             )
             .expect("attn");
         }
@@ -1228,7 +1186,6 @@ mod determinism_tests {
         .expect("scratch");
         let hidden_in = ctx.hidden_in.clone();
         let kv_view = LayerKvView::from_layer(ctx.kv.layer(0).expect("kv"), kv_len);
-        ctx.engine.set_use_mps_q4(false);
         ctx.weights
             .ensure_layer(
                 &ctx.store,
@@ -1253,7 +1210,6 @@ mod determinism_tests {
                 &mut scratch.attn,
                 &mut ctx.engine,
                 ctx.dec.gpu_kv.as_ref(),
-                false,
             )
             .expect("attn");
         }
@@ -1316,7 +1272,6 @@ mod determinism_tests {
             kv_len,
         )
         .expect("scratch1");
-        ctx.engine.set_use_mps_q4(false);
         ctx.weights
             .ensure_layer(
                 &ctx.store,
@@ -1342,7 +1297,6 @@ mod determinism_tests {
                 &mut scratch1.attn,
                 &mut ctx.engine,
                 ctx.dec.gpu_kv.as_ref(),
-                false,
             )
             .expect("attn");
         }
@@ -1418,7 +1372,6 @@ mod determinism_tests {
             kv_len,
         )
         .expect("scratch2");
-        ctx.engine.set_use_mps_q4(false);
         ctx.weights
             .ensure_layer(
                 &ctx.store,
@@ -1444,7 +1397,6 @@ mod determinism_tests {
                 &mut scratch2.attn,
                 &mut ctx.engine,
                 ctx.dec.gpu_kv.as_ref(),
-                false,
             )
             .expect("attn");
         }
@@ -1517,7 +1469,6 @@ mod determinism_tests {
             .expect("layer1");
         let cached = ctx.weights.layer_ref(1);
         let kv_view = LayerKvView::from_layer(ctx.kv.layer(1).expect("kv"), kv_len);
-        ctx.engine.set_use_mps_q4(false);
         let mut a = vec![0.0f32; canvas_len * hidden_dim];
         let mut b = vec![0.0f32; canvas_len * hidden_dim];
         forward_decoder_attention(
@@ -1533,7 +1484,6 @@ mod determinism_tests {
             &mut scratch.attn,
             &mut ctx.engine,
             ctx.dec.gpu_kv.as_ref(),
-            false,
         )
         .expect("attn a");
         forward_decoder_attention(
@@ -1549,7 +1499,6 @@ mod determinism_tests {
             &mut scratch.attn,
             &mut ctx.engine,
             ctx.dec.gpu_kv.as_ref(),
-            false,
         )
         .expect("attn b");
         ctx.weights.release_layer();
@@ -1767,7 +1716,6 @@ mod determinism_tests {
                 .expect("layer0");
             let cached = ctx.weights.layer_ref(0);
             let kv_view = LayerKvView::from_layer(ctx.kv.layer(0).expect("kv"), ctx.kv.kv_len);
-            ctx.engine.set_use_mps_q4(false);
             let mut out = vec![0.0f32; canvas_len * hidden_dim];
             forward_decoder_attention(
                 &mut out,
@@ -1782,7 +1730,6 @@ mod determinism_tests {
                 &mut scratch.attn,
                 &mut ctx.engine,
                 ctx.dec.gpu_kv.as_ref(),
-                false,
             )
             .expect("attn");
             ctx.weights.release_layer();
@@ -2168,7 +2115,6 @@ mod determinism_tests {
             .expect("layer2");
         let cached = ctx.weights.layer_ref(2);
         let kv_view = LayerKvView::from_layer(ctx.kv.layer(2).expect("kv"), kv_len);
-        ctx.engine.set_use_mps_q4(false);
         if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {
             gpu_kv.clear_canvas_suffix(canvas_len).expect("clear canvas kv");
         }
@@ -2187,7 +2133,6 @@ mod determinism_tests {
             &mut scratch.attn,
             &mut ctx.engine,
             ctx.dec.gpu_kv.as_ref(),
-            false,
         )
         .expect("attn a");
         let mut scratch_b = GpuDecoderLayerScratch::with_kv_len(
@@ -2213,7 +2158,6 @@ mod determinism_tests {
             &mut scratch_b.attn,
             &mut ctx.engine,
             ctx.dec.gpu_kv.as_ref(),
-            false,
         )
         .expect("attn b");
         ctx.weights.release_layer();

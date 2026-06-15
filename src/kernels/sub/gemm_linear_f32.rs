@@ -1,4 +1,4 @@
-//! Scalar f32 block GEMM: `C[M,N] = A[M,K] @ W[N,K]^T` (engine / MPS fallback path).
+//! Scalar f32 block GEMM: `C[M,N] = A[M,K] @ W[N,K]^T` (engine reference path).
 
 use super::gpu_common;
 use super::test_util::ElemFormat;

@@ -273,10 +273,8 @@ fn verify_full_layers(model_dir: &Path, layers: usize) -> Result<M0Check, Error>
         seed: 42,
         max_seq: 512,
         finish: StepFinishMode::ForwardOnly,
-        use_mps_q4: Some(false),
         prefill_token_ids: None,
         no_early_stop: false,
-        encoder_use_mps_q4: None,
     };
     let probe = run_step_probe(model_dir, cfg)?;
     let bad: Vec<_> = probe
@@ -317,10 +315,8 @@ fn verify_sampler_golden(model_dir: &Path) -> Result<M0Check, Error> {
             seed,
             max_seq: 512,
             finish: StepFinishMode::Full,
-            use_mps_q4: Some(false),
             prefill_token_ids: None,
             no_early_stop: false,
-            encoder_use_mps_q4: None,
         };
         let r = run_step_smoke(model_dir, cfg)?;
         if !r.logits_finite {
@@ -409,7 +405,6 @@ pub(crate) fn engine_forward(
         kv_len,
     )?;
     let mut engine = GpuDecoderEngine::new()?;
-    engine.set_use_mps_q4(false);
     scratch.ensure_gpu_kv(&engine.ctx.device, &model.config.text_config, kv_len, canvas_len)?;
     scratch.sync_gpu_kv_from_cpu(&kv_cache, canvas_len)?;
 
@@ -479,10 +474,8 @@ pub fn run_step_parity(
         seed: cfg.seed,
         max_seq: cfg.max_seq,
         finish: StepFinishMode::ForwardOnly,
-        use_mps_q4: Some(false),
         prefill_token_ids: None,
         no_early_stop: false,
-        encoder_use_mps_q4: None,
     };
     let mono: StepForwardOutput = run_step_forward(model_dir, &step_cfg)?;
 
@@ -547,10 +540,8 @@ mod parity_debug {
             seed: 42,
             max_seq: 512,
             finish: StepFinishMode::ForwardOnly,
-            use_mps_q4: Some(false),
             prefill_token_ids: None,
             no_early_stop: false,
-            encoder_use_mps_q4: None,
         };
         let mono = run_step_forward(dir, &step_cfg).expect("mono");
         let (eng_h, eng_l) = engine_forward(&model, &token_ids, 0, 1).expect("eng");

@@ -1,6 +1,6 @@
 #!/usr/bin/env swift
-// MPS matrix-multiply oracle for bench-gemm (Q2.5).
-// Usage: swift bench/mps_gemm.swift M K N ITERS
+// MetalPerformanceShaders matmul oracle for bench-gemm (Q2.5).
+// Usage: swift bench/mpsgraph_gemm.swift M K N ITERS
 // C[M,N] = A[M,K] @ W[N,K]^T  (PyTorch linear layout), f32 activations/weights.
 // Prints one line: GFLOP/s (resident buffers, batched encodes, single sync).
 
@@ -13,7 +13,7 @@ guard CommandLine.arguments.count == 5,
       let k = Int(CommandLine.arguments[2]),
       let n = Int(CommandLine.arguments[3]),
       let iters = Int(CommandLine.arguments[4]) else {
-    fputs("usage: mps_gemm.swift M K N ITERS\n", stderr)
+    fputs("usage: mpsgraph_gemm.swift M K N ITERS\n", stderr)
     exit(1)
 }
 

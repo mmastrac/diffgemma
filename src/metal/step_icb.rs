@@ -1,9 +1,7 @@
-//! P2.2 Phase B: record monolithic denoise-step dispatches into an indirect command buffer (ICB)
-//! and replay with live MPS Q4 GEMM segments interleaved.
+//! P2.2: record monolithic denoise-step compute dispatches into an indirect command buffer (ICB)
+//! and replay on subsequent steps (fused Q4/nvfp4 path only).
 
 use crate::metal::device::ComputePipeline;
-use crate::metal::mps_gemm::MpsMatmulCache;
-use crate::metal::step_kernel::StepBuffers;
 use crate::safetensors::Error;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -21,23 +19,9 @@ const ICB_MAX_COMMANDS: usize = 16384;
 const ICB_CONST_BYTES: usize = 4 * 1024 * 1024;
 const ICB_CONST_ALIGN: usize = 256;
 
-#[derive(Clone, Copy, Debug)]
-pub struct MpsQ4GemmOp {
-    pub m: usize,
-    pub k: usize,
-    pub n: usize,
-}
-
-#[derive(Clone, Debug)]
-pub enum StepReplayOp {
-    Icb { start: u32, count: u32 },
-    MpsQ4(MpsQ4GemmOp),
-}
-
 pub struct StepIcbPlan {
     pub icb: Retained<ProtocolObject<dyn MTLIndirectCommandBuffer>>,
     pub command_count: u32,
-    pub ops: Vec<StepReplayOp>,
     pub const_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
 
@@ -52,8 +36,6 @@ pub struct StepIcbPair {
 pub struct IcbRecorder {
     icb: Retained<ProtocolObject<dyn MTLIndirectCommandBuffer>>,
     cmd_idx: u32,
-    segment_start: u32,
-    ops: Vec<StepReplayOp>,
     const_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     const_pool: Vec<u8>,
     cmd_open: bool,
@@ -81,8 +63,6 @@ impl IcbRecorder {
         Ok(Self {
             icb,
             cmd_idx: 0,
-            segment_start: 0,
-            ops: Vec::new(),
             const_buf,
             const_pool: Vec::new(),
             cmd_open: false,
@@ -162,37 +142,15 @@ impl IcbRecorder {
         self.cmd_open = false;
     }
 
-    pub fn note_mps_q4_gemm(&mut self, op: MpsQ4GemmOp) {
-        if self.cmd_open {
-            self.cmd_idx += 1;
-            self.cmd_open = false;
-        }
-        if self.cmd_idx > self.segment_start {
-            self.ops.push(StepReplayOp::Icb {
-                start: self.segment_start,
-                count: self.cmd_idx - self.segment_start,
-            });
-        }
-        self.ops.push(StepReplayOp::MpsQ4(op));
-        self.segment_start = self.cmd_idx;
-    }
-
     pub fn finish(mut self) -> Result<StepIcbPlan, Error> {
         self.sync_const_pool();
         if self.cmd_open {
             self.cmd_idx += 1;
             self.cmd_open = false;
         }
-        if self.cmd_idx > self.segment_start {
-            self.ops.push(StepReplayOp::Icb {
-                start: self.segment_start,
-                count: self.cmd_idx - self.segment_start,
-            });
-        }
         Ok(StepIcbPlan {
             icb: self.icb,
             command_count: self.cmd_idx,
-            ops: self.ops,
             const_buf: self.const_buf,
         })
     }
@@ -208,37 +166,16 @@ pub fn step_icb_enabled() -> bool {
 pub fn replay_step_icb(
     cmd: &ProtocolObject<dyn MTLCommandBuffer>,
     plan: &StepIcbPlan,
-    bufs: &StepBuffers,
-    mps: &mut MpsMatmulCache,
 ) -> Result<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>, Error> {
-    let mut enc = cmd
+    let enc = cmd
         .computeCommandEncoder()
         .ok_or(Error::Format("compute encoder alloc failed"))?;
-
-    for op in &plan.ops {
-        match op {
-            StepReplayOp::Icb { start, count } if *count > 0 => unsafe {
-                enc.executeCommandsInBuffer_withRange(
-                    &plan.icb,
-                    NSRange::new(*start as usize, *count as usize),
-                );
-            },
-            StepReplayOp::MpsQ4(g) => {
-                enc.endEncoding();
-                mps.encode_f32_linear(
-                    cmd,
-                    &bufs.mps_x,
-                    &bufs.mps_w,
-                    &bufs.mps_c,
-                    g.m,
-                    g.k,
-                    g.n,
-                );
-                enc = cmd
-                    .computeCommandEncoder()
-                    .ok_or(Error::Format("compute encoder resume failed"))?;
-            }
-            StepReplayOp::Icb { .. } => {}
+    if plan.command_count > 0 {
+        unsafe {
+            enc.executeCommandsInBuffer_withRange(
+                &plan.icb,
+                NSRange::new(0, plan.command_count as usize),
+            );
         }
     }
     Ok(enc)

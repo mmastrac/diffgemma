@@ -23,7 +23,7 @@ jobs:
       - name: generate-monolithic-parity (requires local weights)
         run: |
           if [ -f /tmp/quantized-weights/model.dgq.json ]; then
-            DGQ_MPS_Q4=0 cargo run --release --features metal -- \
+            cargo run --release --features metal -- \
               -m /tmp/quantized-weights generate-monolithic-parity \
               -p hello --raw --layers 3 --steps 4 --seed 42 --no-early-stop
           else

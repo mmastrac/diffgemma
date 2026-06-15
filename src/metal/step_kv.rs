@@ -25,7 +25,8 @@
 //! cache stores **post-RoPE K** and **V** in the layout above. M1.2 packs CPU encoder prefill output.
 
 use crate::config::ModelConfig;
-use crate::metal::decoder::load_weight_cache_opt;
+use crate::metal::decoder::{load_weight_cache, load_weight_cache_opt};
+use crate::metal::kv_cache::GpuKvCache;
 use crate::metal::engine::GpuDecoderEngine;
 use crate::metal::encoder_extend::{extend_prefill_gpu, prefill_gpu};
 use crate::metal::step_kernel::{
@@ -217,7 +218,7 @@ pub fn run_step_kv_bf16_cross_parity(
     let gpu_buf = alloc_kv()?;
     let cpu_buf = alloc_kv()?;
     let mut gpu_cache =
-        MonolithicEncoderCache::open_opt(dgq_dir, CANVAS, max_seq, None, None)?;
+        MonolithicEncoderCache::open_opt(dgq_dir, CANVAS, max_seq, None)?;
     let (kv_len, _) = prefill_monolithic_kv_with_cache(
         &mut gpu_cache,
         token_ids,
@@ -248,6 +249,56 @@ pub fn run_step_kv_bf16_cross_parity(
         gpu_prefix_max_l0: kvcache_prefix_max_abs(&gpu_buf, &layout, 0, kv_len),
         cpu_prefix_max_l0: kvcache_prefix_max_abs(&cpu_buf, &layout, 0, kv_len),
     })
+}
+
+fn pack_gpu_kv_prefix_to_monolithic(
+    engine: &mut GpuDecoderEngine,
+    gpu_kv: &GpuKvCache,
+    kv_buf: &ProtocolObject<dyn MTLBuffer>,
+    layout: &ModelLayout,
+    token_count: usize,
+    layers: usize,
+    dst_pos: usize,
+    src_pos: usize,
+) -> Result<(), Error> {
+    use crate::kernels::sub::pack_encoder_kv;
+    use crate::metal::batch::begin_engine_batch;
+
+    let pack_pipeline = engine.kernels.pack_encoder_kv.pipeline.clone();
+    let telemetry = engine.batch_telemetry();
+    let mut batch = begin_engine_batch(
+        &engine.ctx.queue,
+        &mut engine.pool,
+        &engine.ctx.device,
+        telemetry,
+    )?;
+    for layer in 0..layers {
+        let l = &layout.layers[layer];
+        let nkv = l.n_kv_heads as usize;
+        let hd = l.head_dim as usize;
+        let (k_buf, v_buf) = gpu_kv.layer_buffers(layer)?;
+        let (grid, tg) = pack_encoder_kv::dispatch_shape(token_count, nkv, hd);
+        batch.dispatch_with_grid(
+            &pack_pipeline,
+            grid,
+            tg,
+            |enc| {
+                pack_encoder_kv::bind_gpu_buffers(
+                    enc,
+                    &k_buf,
+                    &v_buf,
+                    kv_buf,
+                    token_count as u32,
+                    dst_pos as u32,
+                    nkv as u32,
+                    hd as u32,
+                    l.kv_region,
+                    src_pos as u32,
+                );
+            },
+        );
+    }
+    batch.end()
 }
 
 /// Pack one layer prefix from f32 K/V (engine GPU layout) into monolithic b4 at `dst_pos..`.
@@ -315,11 +366,7 @@ pub struct MonolithicPrefillTiming {
 
 impl MonolithicEncoderCache {
     pub fn open(model_dir: &Path, canvas: usize, max_seq_hint: usize) -> Result<Self, Error> {
-        Self::open_opt(model_dir, canvas, max_seq_hint, None, None)
-    }
-
-    pub fn use_mps_q4(&self) -> bool {
-        self.engine.use_mps_q4()
+        Self::open_opt(model_dir, canvas, max_seq_hint, None)
     }
 
     pub fn open_opt(
@@ -327,7 +374,6 @@ impl MonolithicEncoderCache {
         canvas: usize,
         max_seq_hint: usize,
         shared_dgq_blob: Option<std::sync::Arc<crate::metal::dgq_gpu::DgqGpuBlob>>,
-        use_mps_q4: Option<bool>,
     ) -> Result<Self, Error> {
         let open_started = std::time::Instant::now();
         let model = Model::open(model_dir)?;
@@ -340,14 +386,13 @@ impl MonolithicEncoderCache {
             shared_dgq_blob,
         )?;
         let mut engine = GpuDecoderEngine::new()?;
-        if let Some(v) = use_mps_q4 {
-            engine.set_use_mps_q4(v);
+        if model.weights.is_quantized() {
+            engine.set_encoder_gpu_moe(true);
         }
         let dec_scratch = GpuDecoderScratch::new(canvas, &model.config);
         eprintln!(
-            "monolithic-encoder: cache open {:.2?} (model + engine weights, use_mps_q4={})",
+            "monolithic-encoder: cache open {:.2?} (model + engine weights)",
             open_started.elapsed(),
-            engine.use_mps_q4(),
         );
         Ok(Self {
             model,
@@ -436,16 +481,16 @@ pub fn prefill_monolithic_kv_with_cache_timed(
     dst.fill(0);
 
     let pack_started = std::time::Instant::now();
-    for layer in 0..layers {
-        let l = &layout.layers[layer];
-        let nkv = l.n_kv_heads as usize;
-        let hd = l.head_dim as usize;
-        let elems = kv_len * nkv * hd;
-        let (k_buf, v_buf) = gpu_kv.layer_buffers(layer)?;
-        let keys = read_f32_prefix(&k_buf, elems);
-        let values = read_f32_prefix(&v_buf, elems);
-        pack_layer_f32_kv_to_monolithic(dst, layout, layer, &keys, &values, 0, kv_len, max_seq)?;
-    }
+    pack_gpu_kv_prefix_to_monolithic(
+        &mut cache.engine,
+        gpu_kv,
+        kv_buf,
+        layout,
+        kv_len,
+        layers,
+        0,
+        0,
+    )?;
     let kv_pack_ms = pack_started.elapsed().as_secs_f64() * 1000.0;
     let timing = MonolithicPrefillTiming {
         gpu_forward_ms,
@@ -453,8 +498,7 @@ pub fn prefill_monolithic_kv_with_cache_timed(
         total_ms: total_started.elapsed().as_secs_f64() * 1000.0,
     };
     eprintln!(
-        "monolithic-prefill: kv_len={kv_len} use_mps_q4={} gpu_forward={gpu_forward_ms:.1}ms kv_pack={kv_pack_ms:.1}ms total={:.1}ms",
-        cache.engine.use_mps_q4(),
+        "monolithic-prefill: kv_len={kv_len} gpu_forward={gpu_forward_ms:.1}ms kv_pack={kv_pack_ms:.1}ms total={:.1}ms",
         timing.total_ms
     );
     Ok((kv_len, timing))
@@ -621,31 +665,17 @@ pub fn extend_monolithic_kv_with_cache(
     if kv_buf.length() < need {
         return Err(Error::Format("monolithic kv buffer too small"));
     }
-    let dst = unsafe {
-        std::slice::from_raw_parts_mut(kv_buf.contents().as_ptr() as *mut u8, need)
-    };
 
-    for layer in 0..layers {
-        let l = &layout.layers[layer];
-        let nkv = l.n_kv_heads as usize;
-        let hd = l.head_dim as usize;
-        let per_token = nkv * hd;
-        let elems = append_len * per_token;
-        let (k_buf, v_buf) = gpu_kv.layer_buffers(layer)?;
-        let byte_off = kv_len_before * per_token * 4;
-        let keys = read_f32_at(&k_buf, byte_off, elems);
-        let values = read_f32_at(&v_buf, byte_off, elems);
-        pack_layer_f32_kv_to_monolithic(
-            dst,
-            layout,
-            layer,
-            &keys,
-            &values,
-            kv_len_before,
-            append_len,
-            max_seq,
-        )?;
-    }
+    pack_gpu_kv_prefix_to_monolithic(
+        &mut cache.engine,
+        gpu_kv,
+        kv_buf,
+        layout,
+        append_len,
+        layers,
+        kv_len_before,
+        kv_len_before,
+    )?;
     Ok(new_kv_len)
 }
 
@@ -772,10 +802,8 @@ pub fn run_step_kv_audit(
         seed,
         max_seq,
         finish: StepFinishMode::ForwardOnly,
-        use_mps_q4: Some(false),
         prefill_token_ids: None,
         no_early_stop: false,
-        encoder_use_mps_q4: None,
     };
     let zero = run_step_forward(model_dir, &base_cfg)?;
     let mut kv_cfg = base_cfg.clone();
@@ -943,10 +971,8 @@ pub fn step_min_entropy_with_kv(
         seed,
         max_seq,
         finish: StepFinishMode::Full,
-        use_mps_q4: Some(false),
         prefill_token_ids: None,
         no_early_stop: false,
-        encoder_use_mps_q4: None,
     };
     let (mut rt, _) = build_step_runtime(model_dir, &cfg)?;
     let kv_bytes = kv_cache_total_bytes(rt.layout(), max_seq) as usize;
@@ -1081,7 +1107,7 @@ pub fn run_step_attn_probe(
         )
         .ok_or(Error::Format("kv buffer alloc failed"))?;
     let mut native_cache =
-        MonolithicEncoderCache::open_opt(model_dir, canvas_len, max_seq, None, Some(false))?;
+        MonolithicEncoderCache::open_opt(model_dir, canvas_len, max_seq, None)?;
     let (kv_len, _) = prefill_monolithic_kv_with_cache(
         &mut native_cache,
         token_ids,
@@ -1188,30 +1214,30 @@ fn head_rms_probe(buf: &[f32], seq_len: usize, n_heads: usize, head_dim: usize) 
 }
 
 #[derive(Debug)]
-pub struct StepKvMpsParityResult {
+pub struct StepKvParityResult {
     pub kv_len: usize,
     pub layers: usize,
-    pub native_prefix_max_l0: f32,
-    pub mps_prefix_max_l0: f32,
+    pub prefix_max_l0: f32,
+    pub prefix_max_l0_b: f32,
     pub max_kv_diff: f32,
     pub max_kv_diff_layer: usize,
     pub max_kv_diff_pos: usize,
-    pub native_min_ent: f32,
-    pub mps_min_ent: f32,
+    pub min_ent: f32,
+    pub min_ent_b: f32,
     pub min_ent_diff: f32,
     pub entropy_pass: bool,
     pub ln_vocab: f32,
     pub pass: bool,
 }
 
-/// P1.9: compare monolithic b4 KV from native vs MPS encoder prefill, then one denoise step.
-pub fn run_step_kv_mps_parity(
+/// Compare monolithic b4 KV from two independent encoder prefills, then one denoise step each.
+pub fn run_step_kv_parity(
     model_dir: &Path,
     token_ids: &[u32],
     layers: usize,
     max_seq: usize,
     seed: u64,
-) -> Result<StepKvMpsParityResult, Error> {
+) -> Result<StepKvParityResult, Error> {
     if token_ids.is_empty() {
         return Err(Error::Format("step-kv-parity requires at least one token"));
     }
@@ -1230,60 +1256,59 @@ pub fn run_step_kv_mps_parity(
             .ok_or(Error::Format("kv parity buffer alloc failed"))
     };
 
-    let mut native_cache =
-        MonolithicEncoderCache::open_opt(model_dir, CANVAS, max_seq, None, Some(false))?;
-    let mut mps_cache =
-        MonolithicEncoderCache::open_opt(model_dir, CANVAS, max_seq, None, Some(true))?;
+    let mut cache_a =
+        MonolithicEncoderCache::open_opt(model_dir, CANVAS, max_seq, None)?;
+    let mut cache_b =
+        MonolithicEncoderCache::open_opt(model_dir, CANVAS, max_seq, None)?;
 
-    let native_buf = alloc_kv()?;
-    let mps_buf = alloc_kv()?;
+    let buf_a = alloc_kv()?;
+    let buf_b = alloc_kv()?;
 
     let (kv_len, _) = prefill_monolithic_kv_with_cache(
-        &mut native_cache,
+        &mut cache_a,
         token_ids,
-        &native_buf,
+        &buf_a,
         &layout,
         max_seq,
         layers,
     )?;
-    let (mps_kv_len, _) = prefill_monolithic_kv_with_cache(
-        &mut mps_cache,
+    let (kv_len_b, _) = prefill_monolithic_kv_with_cache(
+        &mut cache_b,
         token_ids,
-        &mps_buf,
+        &buf_b,
         &layout,
         max_seq,
         layers,
     )?;
-    if mps_kv_len != kv_len {
-        return Err(Error::Format("mps/native prefill kv_len mismatch"));
+    if kv_len_b != kv_len {
+        return Err(Error::Format("encoder prefill kv_len mismatch"));
     }
 
-    let native_prefix_max_l0 = kvcache_prefix_max_abs(&native_buf, &layout, 0, kv_len);
-    let mps_prefix_max_l0 = kvcache_prefix_max_abs(&mps_buf, &layout, 0, kv_len);
+    let prefix_max_l0 = kvcache_prefix_max_abs(&buf_a, &layout, 0, kv_len);
+    let prefix_max_l0_b = kvcache_prefix_max_abs(&buf_b, &layout, 0, kv_len);
     let (max_kv_diff, max_kv_diff_layer, max_kv_diff_pos) =
-        monolithic_kv_prefix_max_diff(&native_buf, &mps_buf, &layout, kv_len, layers);
+        monolithic_kv_prefix_max_diff(&buf_a, &buf_b, &layout, kv_len, layers);
 
-    let native_min_ent = step_min_entropy_with_kv(model_dir, &native_buf, kv_len, layers, max_seq, seed)?;
-    let mps_min_ent = step_min_entropy_with_kv(model_dir, &mps_buf, kv_len, layers, max_seq, seed)?;
+    let min_ent = step_min_entropy_with_kv(model_dir, &buf_a, kv_len, layers, max_seq, seed)?;
+    let min_ent_b = step_min_entropy_with_kv(model_dir, &buf_b, kv_len, layers, max_seq, seed)?;
 
     let ln_vocab = (VOCAB as f32).ln();
-    let min_ent_diff = (mps_min_ent - native_min_ent).abs();
-    let kv_ok = max_kv_diff < 0.5 && mps_prefix_max_l0 > 1e-4;
-    // KV bytes can match while forward entropy diverges (MPS vs native encoder path).
+    let min_ent_diff = (min_ent_b - min_ent).abs();
+    let kv_ok = max_kv_diff < 0.5 && prefix_max_l0_b > 1e-4;
     const MAX_MIN_ENT_DIFF: f32 = 0.25;
     let entropy_pass = min_ent_diff < MAX_MIN_ENT_DIFF;
     let pass = kv_ok && entropy_pass;
 
-    Ok(StepKvMpsParityResult {
+    Ok(StepKvParityResult {
         kv_len,
         layers,
-        native_prefix_max_l0,
-        mps_prefix_max_l0,
+        prefix_max_l0,
+        prefix_max_l0_b,
         max_kv_diff,
         max_kv_diff_layer,
         max_kv_diff_pos,
-        native_min_ent,
-        mps_min_ent,
+        min_ent,
+        min_ent_b,
         min_ent_diff,
         entropy_pass,
         ln_vocab,
@@ -1297,7 +1322,6 @@ pub fn run_encoder_moe_kv_parity(
     token_ids: &[u32],
     layers: usize,
     max_seq: usize,
-    use_mps_q4: bool,
 ) -> Result<(f32, usize, usize), Error> {
     if token_ids.is_empty() {
         return Err(Error::Format("encoder moe kv parity requires at least one token"));
@@ -1315,10 +1339,10 @@ pub fn run_encoder_moe_kv_parity(
     };
 
     let mut cpu_cache =
-        MonolithicEncoderCache::open_opt(model_dir, CANVAS, max_seq, None, Some(use_mps_q4))?;
+        MonolithicEncoderCache::open_opt(model_dir, CANVAS, max_seq, None)?;
     cpu_cache.engine.set_encoder_gpu_moe(false);
     let mut gpu_cache =
-        MonolithicEncoderCache::open_opt(model_dir, CANVAS, max_seq, None, Some(use_mps_q4))?;
+        MonolithicEncoderCache::open_opt(model_dir, CANVAS, max_seq, None)?;
     gpu_cache.engine.set_encoder_gpu_moe(true);
 
     let cpu_buf = alloc_kv()?;
@@ -1383,7 +1407,7 @@ mod encoder_moe_kv_tests {
             .device
             .newBufferWithLength_options(kv_bytes, MTLResourceOptions::StorageModeShared)
             .expect("kv buf");
-        let mut cache = MonolithicEncoderCache::open_opt(dir, CANVAS, 512, None, Some(false))
+        let mut cache = MonolithicEncoderCache::open_opt(dir, CANVAS, 512, None)
             .expect("encoder cache");
         cache.engine.set_encoder_gpu_moe(true);
         let (kv_len, _) = prefill_monolithic_kv_with_cache(
@@ -1414,7 +1438,7 @@ mod encoder_moe_kv_tests {
         let ids = calgary_prefill(dir);
         assert_eq!(ids.len(), 22);
         let (max_diff, layer, pos) =
-            run_encoder_moe_kv_parity(dir, &ids, 30, 512, false).expect("parity");
+            run_encoder_moe_kv_parity(dir, &ids, 30, 512).expect("parity");
         eprintln!(
             "encoder moe kv parity (Calgary, 22 tok): max_diff={max_diff:.6} layer={layer} pos={pos}"
         );

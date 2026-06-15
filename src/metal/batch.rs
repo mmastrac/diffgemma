@@ -526,23 +526,6 @@ impl<'a> GpuBatch<'a> {
         }
     }
 
-    /// End the compute encoder, run MPS on the command buffer, reopen compute encoding.
-    pub fn pause_compute_for_mps(
-        &mut self,
-        encode: impl FnOnce(&ProtocolObject<dyn MTLCommandBuffer>),
-    ) {
-        if let Some(enc) = self.enc.take() {
-            enc.endEncoding();
-        }
-        if let Some(cmd) = self.cmd.as_ref() {
-            encode(cmd);
-        }
-        if self.cmd.is_some() {
-            let cmd = self.cmd.as_ref().expect("cmd");
-            self.enc = cmd.computeCommandEncoder();
-        }
-    }
-
     /// Commit, wait, and run pending readbacks without releasing GPU buffers.
     pub fn flush_reads(&mut self) -> Result<(), Error> {
         let readback_bytes: u64 = self.reads.iter().map(|r| r.len_bytes as u64).sum();
