@@ -50,15 +50,25 @@ kernel void qk_rope_kv(
     float inv = rsqrt(ss / float(hd) + ATTN_RMS_EPS);
     ulong noff = isQ ? L->q_norm : isK ? L->k_norm : 0ul;
     if (isQ || isK) {
+        // Full-attn layers alias V from raw k_proj: do not mutate `k` in place on the K path.
+        float head[512];
         for (uint i = 0u; i < hd; ++i) {
-            float tmp = float(src[i]) * inv * bf16_bytes(blob + noff + 2ul * i);
-            src[i] = half(tmp);
+            head[i] = float(src[i]) * inv * bf16_bytes(blob + noff + 2ul * i);
         }
-        apply_split_half_rope(src, rot, hd, theta, pos);
+        apply_split_half_rope_f32(head, rot, hd, theta, pos);
         if (isK) {
             device half *dst = kvcache + L->kv_region / 2 + (ulong)pos * nkv * hd * 2u + hh * hd;
             for (uint i = 0u; i < hd; ++i) {
-                dst[i] = src[i];
+                dst[i] = half(head[i]);
+            }
+            if (L->v_proj != 0ul) {
+                for (uint i = 0u; i < hd; ++i) {
+                    src[i] = half(head[i]);
+                }
+            }
+        } else {
+            for (uint i = 0u; i < hd; ++i) {
+                src[i] = half(head[i]);
             }
         }
     } else {

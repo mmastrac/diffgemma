@@ -114,11 +114,16 @@ pub fn qk_rope_kv(
             let w = if is_q { q_norm_w } else { k_norm_w };
             rms_norm_head(&mut tmp, Some(w), RMS_EPS);
             apply_split_half_rope(&mut tmp, rot, layer.head_dim, theta, pos);
-            head.copy_from_slice(&tmp);
 
             if is_k {
                 let dst_off = kv_half_base + (pos as usize * nkv * hd * 2) + hh * hd;
                 kvcache[dst_off..dst_off + hd].copy_from_slice(&tmp);
+                // Full-attn: V aliases raw k_proj — leave `k` untouched for the V pass.
+                if layer.v_proj != 0 {
+                    head.copy_from_slice(&tmp);
+                }
+            } else {
+                head.copy_from_slice(&tmp);
             }
         }
     }

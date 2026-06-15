@@ -124,6 +124,14 @@ pub fn full_layer_fixture(_: ElemFormat) -> Fixture {
     f
 }
 
+/// Full-attention layer with no `v_proj` (V aliases raw k_proj, per MLX).
+pub fn full_attn_v_alias_fixture(fmt: ElemFormat) -> Fixture {
+    let mut f = full_layer_fixture(fmt);
+    f.v_proj = 0;
+    f.layer.v_proj = 0;
+    f
+}
+
 fn layer_offsets(f: &Fixture) -> LayerOffsets {
     LayerOffsets {
         input_ln: 0,
@@ -343,6 +351,18 @@ mod tests {
         cpu_oracle = crate::kernels::sub::qk_rope_kv::cpu_oracle,
         gpu = crate::kernels::sub::qk_rope_kv::gpu,
         fixture = crate::kernels::sub::qk_rope_kv::full_layer_fixture,
+        out_len = crate::kernels::sub::qk_rope_kv::fixture_len,
+        formats: [F32],
+        max_tol = 1e-2,
+        min_cos = 0.9999,
+    }
+
+    kernel_oracle_matrix! {
+        mod full_attn_v_alias,
+        cpu = crate::kernels::sub::qk_rope_kv::cpu,
+        cpu_oracle = crate::kernels::sub::qk_rope_kv::cpu_oracle,
+        gpu = crate::kernels::sub::qk_rope_kv::gpu,
+        fixture = crate::kernels::sub::qk_rope_kv::full_attn_v_alias_fixture,
         out_len = crate::kernels::sub::qk_rope_kv::fixture_len,
         formats: [F32],
         max_tol = 1e-2,

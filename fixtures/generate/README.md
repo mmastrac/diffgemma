@@ -77,6 +77,27 @@ cargo run --release --features metal -- -m /tmp/quantized-weights generate-monol
   --write-trace fixtures/generate/denoise_trace_hello_layers3_steps4_seed42.json
 ```
 
+**MLX reference** (local `model/mlx-mxfp4`; run **alone**, not parallel with Rust generate):
+
+```bash
+# 1) Rust trace first
+cargo run --release --features metal -- -m /tmp/quantized-weights generate-monolithic \
+  -p 'How can I get from Calgary to Namibia?' --seed 42 --layers 30 --steps 12 --no-early-stop \
+  --write-trace /tmp/calgary_mono_trace.json
+
+# 2) Extract canvas array for MLX (dump script expects a JSON list, not the full trace)
+python3 -c "import json; json.dump(json.load(open('/tmp/calgary_mono_trace.json'))['initial_canvas_ids'], open('/tmp/calgary_canvas_ids.json','w'))"
+
+# 3) MLX trace (sequential; do not run HF 26B on laptop — OOM)
+cd python && uv run python scripts/dump_mlx_denoise_trace.py --model ../model/mlx-mxfp4 \
+  -p 'How can I get from Calgary to Namibia?' --seed 42 --steps 12 --no-early-stop \
+  --canvas-ids /tmp/calgary_canvas_ids.json -o /tmp/calgary_mlx_trace.json
+
+uv run python scripts/compare_denoise_trace.py /tmp/calgary_mlx_trace.json /tmp/calgary_mono_trace.json
+```
+
+Calgary @ 12 steps (matched canvas, 22-tok prefill): argmax agrees at pos 0 from step 1; MLX `min_entropy` drops faster and accepts ramp to 110/step vs mono ~1/step — forward/quant gap, not sampler. HF `dump_denoise_trace.py` needs discrete GPU (26B); `device_map=auto` meta-tensor failure on MPS-only laptop.
+
 **HuggingFace reference** (requires GPU + full weights; optional `uv sync --extra model`):
 
 ```bash

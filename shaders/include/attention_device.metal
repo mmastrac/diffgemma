@@ -21,6 +21,26 @@ struct AttnDims {
 };
 
 /// Split-half RoPE on the first `rot` dims; inv_freq denominator is full `head_dim`.
+inline void apply_split_half_rope_f32(
+    thread float *src,
+    uint rot,
+    uint head_dim,
+    float theta,
+    uint pos
+) {
+    const uint half_rot = rot / 2u;
+    for (uint d = 0u; d < half_rot; ++d) {
+        float inv_freq = pow(theta, -2.0f * float(d) / float(head_dim));
+        float a = float(pos) * inv_freq;
+        float c = cos(a);
+        float s = sin(a);
+        float x0 = src[d];
+        float x1 = src[d + half_rot];
+        src[d] = x0 * c - x1 * s;
+        src[d + half_rot] = x0 * s + x1 * c;
+    }
+}
+
 inline void apply_split_half_rope(
     device half *src,
     uint rot,
