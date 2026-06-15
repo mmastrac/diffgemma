@@ -26,6 +26,7 @@ pub struct GpuDecoderEngine {
     pub f32_q4_linear_pipeline: ComputePipeline,
     pub f32_nvfp4_linear_pipeline: ComputePipeline,
     pub f32_q4_linear_grouped_pipeline: ComputePipeline,
+    pub f32_nvfp4_linear_grouped_pipeline: ComputePipeline,
     pub f32_q8_linear_pipeline: ComputePipeline,
     pub f32_q8_linear_kxn_pipeline: ComputePipeline,
     pub dequant_q4_matrix_pipeline: ComputePipeline,
@@ -65,6 +66,12 @@ impl GpuDecoderEngine {
             crate::kernels::sub::QuantFormat::Q4Affine,
             prod,
         )?;
+        let f32_nvfp4_linear_grouped_pipeline =
+            crate::kernels::sub::gemm_linear_grouped::pipeline_for(
+                &ctx,
+                crate::kernels::sub::QuantFormat::NvFp4,
+                prod,
+            )?;
         let f32_q8_linear_pipeline =
             crate::kernels::sub::gemm_q8_linear_f32::pipeline_for(&ctx, prod)?;
         let f32_q8_linear_kxn_pipeline =
@@ -97,6 +104,7 @@ impl GpuDecoderEngine {
             f32_q4_linear_pipeline,
             f32_nvfp4_linear_pipeline,
             f32_q4_linear_grouped_pipeline,
+            f32_nvfp4_linear_grouped_pipeline,
             f32_q8_linear_pipeline,
             f32_q8_linear_kxn_pipeline,
             dequant_q4_matrix_pipeline,

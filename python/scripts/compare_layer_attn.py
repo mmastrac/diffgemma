@@ -64,6 +64,8 @@ def main() -> int:
     for label, key in [
         ("hidden_in", "hidden_in"),
         ("hidden_ln", "hidden_ln"),
+        ("q_raw_proj", "q_raw_proj"),
+        ("q_pre_rope", "q_pre_rope"),
         ("q_post_rope", "q_post_rope"),
         ("attn_out", "attn_out"),
     ]:

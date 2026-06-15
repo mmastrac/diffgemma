@@ -450,3 +450,152 @@ fn dispatch_2d(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, width: us
     };
     encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
 }
+
+#[cfg(all(test, feature = "metal", target_os = "macos"))]
+mod prefill_attn_tests {
+    use super::*;
+    use crate::config::ModelConfig;
+    use crate::kernels::cpu::{apply_rope_tensor, compute_rope_freqs, rope_kind_for_layer};
+    use crate::metal::attention::GpuAttentionKernels;
+    use crate::metal::batch::GpuBatch;
+    use crate::metal::buffer::BufferPool;
+    use crate::metal::device::MetalContext;
+    use crate::metal::kv_cache::GpuKvCache;
+    use crate::model::attention::gqa_attention;
+
+    fn dgq_fixture_dir() -> Option<std::path::PathBuf> {
+        for dir in ["/tmp/nvfp4-weights", "/tmp/quantized-weights"] {
+            let p = std::path::Path::new(dir);
+            if p.join("model.dgq.json").exists() {
+                return Some(p.to_path_buf());
+            }
+        }
+        None
+    }
+
+    fn fill_synthetic(src: &mut [f32], seed: f32) {
+        for (i, x) in src.iter_mut().enumerate() {
+            let t = i as f32 * 0.0011 + seed;
+            *x = t.sin() * 0.04 + (t * 0.7).cos() * 0.02;
+        }
+    }
+
+    /// Encoder prefill attention: `decoder_gqa_gpu_kv_batched` at model L0 dims, `seq_len=25`.
+    #[test]
+    fn decoder_gqa_gpu_kv_prefill_seq_len_matches_cpu() {
+        let Some(model_dir) = dgq_fixture_dir() else {
+            eprintln!("skip: no .dgq weights under /tmp");
+            return;
+        };
+        let cfg = ModelConfig::load(&model_dir).expect("cfg");
+        let text = &cfg.text_config;
+        let layer = 0usize;
+        let params = AttentionParams::for_layer(text, layer).expect("L0 params");
+        let seq_len = 25usize;
+        let total_kv = seq_len;
+        let positions: Vec<i64> = (0..seq_len as i64).collect();
+
+        let q_dim = seq_len * params.n_heads * params.head_dim;
+        let kv_dim = seq_len * params.n_kv_heads * params.head_dim;
+        let mut q_pre = vec![0.0f32; q_dim];
+        let mut k_pre = vec![0.0f32; kv_dim];
+        let mut v_pre = vec![0.0f32; kv_dim];
+        fill_synthetic(&mut q_pre, 0.1);
+        fill_synthetic(&mut k_pre, 0.2);
+        fill_synthetic(&mut v_pre, 0.3);
+
+        let mut freqs = vec![0.0f32; seq_len * params.rotary_dim];
+        let rope_kind = rope_kind_for_layer(text, layer).expect("rope kind");
+        compute_rope_freqs(&mut freqs, &positions, rope_kind);
+
+        let mut q_cpu = q_pre.clone();
+        let mut k_cpu = k_pre.clone();
+        apply_rope_tensor(
+            &mut q_cpu,
+            seq_len,
+            params.n_heads,
+            params.head_dim,
+            &freqs,
+            params.rotary_dim,
+        );
+        apply_rope_tensor(
+            &mut k_cpu,
+            seq_len,
+            params.n_kv_heads,
+            params.head_dim,
+            &freqs,
+            params.rotary_dim,
+        );
+
+        let mut cpu_out = vec![0.0f32; q_dim];
+        let mut scores = vec![0.0f32; seq_len * params.n_heads * total_kv];
+        gqa_attention(
+            &mut cpu_out,
+            &mut scores,
+            &q_cpu,
+            &k_cpu,
+            &v_pre,
+            seq_len,
+            total_kv,
+            &params,
+            GqaMask::CausalSliding,
+        );
+
+        let ctx = MetalContext::new().expect("metal");
+        let gpu_kv = GpuKvCache::new(&ctx.device, text, seq_len, 0).expect("gpu kv");
+        gpu_kv
+            .write_canvas_kv_pre_rope(layer, seq_len, &k_pre, &v_pre)
+            .expect("kv write");
+        let k_off = gpu_kv.canvas_k_elem_offset(layer).expect("k off");
+        assert_eq!(k_off, 0);
+        let (k_buf, v_buf) = gpu_kv.layer_buffers(layer).expect("layer bufs");
+
+        let kernels = GpuAttentionKernels::new(&ctx).expect("attn kernels");
+        let mut pool = BufferPool::new();
+        let mut batch = GpuBatch::begin(&ctx.queue, &mut pool, &ctx.device).expect("batch");
+        let mut gpu_out = vec![0.0f32; q_dim];
+        decoder_gqa_gpu_kv_batched(
+            &mut batch,
+            &kernels,
+            Some(&mut gpu_out),
+            &q_pre,
+            k_buf,
+            v_buf,
+            k_off,
+            &freqs,
+            seq_len,
+            total_kv,
+            &params,
+            GqaMask::CausalSliding,
+        )
+        .expect("decoder gqa");
+        batch.end().expect("batch end");
+
+        let mut max_err = 0.0f32;
+        let mut nan = 0usize;
+        let mut dot = 0.0f64;
+        let mut na = 0.0f64;
+        let mut nb = 0.0f64;
+        for (a, b) in cpu_out.iter().zip(gpu_out.iter()) {
+            if !b.is_finite() {
+                nan += 1;
+            }
+            max_err = max_err.max((a - b).abs());
+            dot += *a as f64 * *b as f64;
+            na += *a as f64 * *a as f64;
+            nb += *b as f64 * *b as f64;
+        }
+        let cos = if na > 0.0 && nb > 0.0 {
+            (dot / (na.sqrt() * nb.sqrt())) as f32
+        } else {
+            0.0
+        };
+        eprintln!(
+            "decoder_gqa prefill L{layer} seq_len={seq_len} heads={} kv_heads={} hd={} max_err={max_err:.6} cos={cos:.6} nan={nan}",
+            params.n_heads, params.n_kv_heads, params.head_dim
+        );
+        assert_eq!(nan, 0, "gpu attention produced {nan} non-finite values");
+        assert!(cos > 0.999, "cos={cos}");
+        assert!(max_err < 0.05, "max_err={max_err}");
+    }
+}

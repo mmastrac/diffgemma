@@ -1,6 +1,6 @@
 use crate::config::TextConfig;
 use crate::kernels::cpu::{
-    gelu_pytorch_tanh, linear_bf16_slice, rms_norm_no_scale, rms_norm_rows, softmax_rows,
+    gelu_pytorch_tanh, linear_bf16_slice, rms_norm_no_scale, rms_norm_rows,
 };
 use crate::model::layer_weights::DecoderLayerWeights;
 use crate::safetensors::Error;
@@ -47,7 +47,7 @@ impl MoeScratch {
     }
 }
 
-/// Gemma4 router: RMSNorm(no scale) → scale * hidden^-0.5 → linear → softmax → top-k.
+/// Gemma4 router: RMSNorm(no scale) → scale * hidden^-0.5 → linear → top-k → softmax(top-k).
 pub fn route(
     residual: &[f32],
     weights: &DecoderLayerWeights<'_>,
@@ -85,12 +85,14 @@ pub fn route(
         hidden,
         experts,
     );
-    softmax_rows(&mut scratch.router_logits, seq_len, experts);
-
     let mut routes = Vec::with_capacity(seq_len);
     for s in 0..seq_len {
         let row = &scratch.router_logits[s * experts..(s + 1) * experts];
-        routes.push(top_k_route(row, top_k, &scratch.per_expert_scale));
+        routes.push(top_k_route_from_raw_logits(
+            row,
+            top_k,
+            &scratch.per_expert_scale,
+        ));
     }
     Ok(routes)
 }
@@ -134,16 +136,44 @@ pub fn route_with_cached_weights(
         hidden,
         experts,
     );
-    softmax_rows(&mut scratch.router_logits, seq_len, experts);
-
     let mut routes = Vec::with_capacity(seq_len);
     for s in 0..seq_len {
         let row = &scratch.router_logits[s * experts..(s + 1) * experts];
-        routes.push(top_k_route(row, top_k, per_expert_scale));
+        routes.push(top_k_route_from_raw_logits(row, top_k, per_expert_scale));
     }
     Ok(routes)
 }
 
+/// MLX/Gemma4: argpartition top-k on raw logits, softmax only over selected experts.
+pub fn top_k_route_from_raw_logits(
+    logits: &[f32],
+    k: usize,
+    per_expert_scale: &[f32],
+) -> RouteResult {
+    let mut ranked: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+    ranked.sort_by(|(ia, pa), (ib, pb)| {
+        pb.partial_cmp(pa)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(ia.cmp(ib))
+    });
+    let top = &ranked[..k];
+    let indices: Vec<usize> = top.iter().map(|(i, _)| *i).collect();
+    let raw: Vec<f32> = top.iter().map(|(_, s)| *s).collect();
+    let mx = raw.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = raw.iter().map(|&x| (x - mx).exp()).collect();
+    let sum: f32 = exps.iter().sum();
+    let mut weights: Vec<f32> = if sum > 0.0 {
+        exps.iter().map(|e| e / sum).collect()
+    } else {
+        vec![1.0 / k as f32; k]
+    };
+    for (w, &idx) in weights.iter_mut().zip(indices.iter()) {
+        *w *= per_expert_scale[idx];
+    }
+    RouteResult { weights, indices }
+}
+
+/// Top-k from a full softmax probability row (legacy; renormalizes selected probs).
 pub fn top_k_route(probs: &[f32], k: usize, per_expert_scale: &[f32]) -> RouteResult {
     let mut ranked: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
     ranked.sort_by(|(ia, pa), (ib, pb)| {

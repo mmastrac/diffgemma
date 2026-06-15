@@ -55,19 +55,9 @@ kernel void moe_router(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (e == 0u) {
-        float mx = logits[0];
-        for (uint i = 1u; i < dims.n_experts; ++i) {
-            mx = max(mx, logits[i]);
-        }
-        float sum = 0.f;
-        for (uint i = 0u; i < dims.n_experts; ++i) {
-            logits[i] = exp(logits[i] - mx);
-            sum += logits[i];
-        }
-        float wsum = 0.f;
         uint pick[8];
         for (uint kk = 0u; kk < dims.top_k; ++kk) {
-            float best = -1.f;
+            float best = -1e30f;
             uint bi = 0u;
             for (uint i = 0u; i < dims.n_experts; ++i) {
                 bool taken = false;
@@ -80,12 +70,21 @@ kernel void moe_router(
                 }
             }
             pick[kk] = bi;
-            wsum += logits[bi];
+        }
+        float mx = logits[pick[0]];
+        for (uint kk = 1u; kk < dims.top_k; ++kk) {
+            mx = max(mx, logits[pick[kk]]);
+        }
+        float sum = 0.f;
+        for (uint kk = 0u; kk < dims.top_k; ++kk) {
+            sum += exp(logits[pick[kk]] - mx);
         }
         device const uchar *pes = blob + L->per_expert_scale;
+        float inv = (sum > 0.f) ? (1.f / sum) : 0.f;
         for (uint kk = 0u; kk < dims.top_k; ++kk) {
+            float w = exp(logits[pick[kk]] - mx) * inv * bf16_bytes(pes + 2ul * pick[kk]);
             R->expert[tok][kk] = pick[kk];
-            R->weight[tok][kk] = half((logits[pick[kk]] / wsum) * bf16_bytes(pes + 2ul * pick[kk]));
+            R->weight[tok][kk] = half(w);
         }
     }
 }

@@ -1,4 +1,4 @@
-//! Monolithic MoE router: RMSNorm → scale → linear → softmax → top-k.
+//! Monolithic MoE router: RMSNorm → scale → linear → top-k → softmax(top-k).
 
 use super::bf16;
 use super::f16;

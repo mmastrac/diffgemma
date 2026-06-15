@@ -55,7 +55,11 @@ kernel void qk_rope_kv(
         for (uint i = 0u; i < hd; ++i) {
             head[i] = float(src[i]) * inv * bf16_bytes(blob + noff + 2ul * i);
         }
-        apply_split_half_rope_f32(head, rot, hd, theta, pos);
+        if (full) {
+            apply_proportional_rope_f32(head, rot, hd, theta, pos);
+        } else {
+            apply_split_half_rope_f32(head, rot, hd, theta, pos);
+        }
         if (isK) {
             device half *dst = kvcache + L->kv_region / 2 + (ulong)pos * nkv * hd * 2u + hh * hd;
             for (uint i = 0u; i < hd; ++i) {

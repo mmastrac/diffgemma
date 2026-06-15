@@ -93,13 +93,17 @@ def dump_mlx_layer_moe(args: argparse.Namespace) -> dict:
     mx.eval(dense_out)
 
     flat = residual2.reshape(-1, residual2.shape[-1])
+    router = target.router
+    router_in = mx.fast.rms_norm(flat, None, router.eps)
+    router_in = router_in * router.scale * router._root_size
+    router_scores = router.proj(router_in)
     top_k_indices, top_k_weights = target.router(flat)
     h2_in = target.pre_feedforward_layernorm_2(flat)
     moe_raw = target.experts(h2_in, top_k_indices, top_k_weights)
     moe_out_ln = target.post_feedforward_layernorm_2(moe_raw.reshape(residual2.shape))
     combined = target.post_feedforward_layernorm(dense_out + moe_out_ln)
     layer_out = (residual2 + combined) * target.layer_scalar
-    mx.eval(moe_raw, moe_out_ln, layer_out, top_k_indices, top_k_weights)
+    mx.eval(dense_out, router_scores, moe_raw, moe_out_ln, layer_out, top_k_indices, top_k_weights)
 
     experts = [int(x) for x in top_k_indices[pos].tolist()]
     expert_weights = [float(x) for x in top_k_weights[pos].tolist()]
@@ -118,6 +122,7 @@ def dump_mlx_layer_moe(args: argparse.Namespace) -> dict:
         "experts": experts,
         "expert_weights": expert_weights,
         "post_attn": [float(x) for x in post_attn[0, pos].tolist()],
+        "router_logits": [float(x) for x in router_scores[pos].tolist()],
         "dense_out": [float(x) for x in dense_out[0, pos].tolist()],
         "moe_out": [float(x) for x in moe_raw[pos].tolist()],
         "moe_out_ln": [float(x) for x in moe_out_ln[0, pos].tolist()],

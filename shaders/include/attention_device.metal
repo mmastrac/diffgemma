@@ -41,6 +41,28 @@ inline void apply_split_half_rope_f32(
     }
 }
 
+/// Gemma proportional RoPE: rotate left[i] with right[i] for i < rot/2.
+inline void apply_proportional_rope_f32(
+    thread float *src,
+    uint rotary_dim,
+    uint head_dim,
+    float theta,
+    uint pos
+) {
+    const uint half_head = head_dim / 2u;
+    const uint half_rot = rotary_dim / 2u;
+    for (uint d = 0u; d < half_rot; ++d) {
+        float inv_freq = pow(theta, -2.0f * float(d) / float(head_dim));
+        float a = float(pos) * inv_freq;
+        float c = cos(a);
+        float s = sin(a);
+        float x0 = src[d];
+        float x1 = src[half_head + d];
+        src[d] = x0 * c - x1 * s;
+        src[half_head + d] = x0 * s + x1 * c;
+    }
+}
+
 inline void apply_split_half_rope(
     device half *src,
     uint rot,

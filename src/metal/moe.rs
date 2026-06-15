@@ -228,6 +228,7 @@ pub fn experts_forward_gpu_batched(
     q4_pipeline: &ComputePipeline,
     nvfp4_pipeline: &ComputePipeline,
     q4_grouped_pipeline: &ComputePipeline,
+    nvfp4_grouped_pipeline: &ComputePipeline,
     telemetry: Option<Rc<RefCell<ForwardTelemetry>>>,
 ) -> Result<(), Error> {
     let hidden = cfg.hidden_size;
@@ -296,6 +297,7 @@ pub fn experts_forward_gpu_batched(
             pool,
             kernels,
             q4_grouped_pipeline,
+            nvfp4_grouped_pipeline,
             telemetry,
         )?;
     } else {
@@ -358,6 +360,7 @@ fn experts_forward_gpu_grouped_dgq(
     pool: &mut crate::metal::buffer::BufferPool,
     kernels: &GpuKernels,
     q4_grouped_pipeline: &ComputePipeline,
+    nvfp4_grouped_pipeline: &ComputePipeline,
     telemetry: Option<Rc<RefCell<ForwardTelemetry>>>,
 ) -> Result<(), Error> {
     let mut batch = GpuBatch::begin_with_telemetry(
@@ -381,6 +384,7 @@ fn experts_forward_gpu_grouped_dgq(
         token_indices,
         kernels,
         q4_grouped_pipeline,
+        nvfp4_grouped_pipeline,
     )?;
     batch.end()?;
     Ok(())
@@ -400,6 +404,7 @@ pub fn experts_forward_gpu_grouped_in_batch(
     token_indices: &mut Vec<u32>,
     kernels: &GpuKernels,
     q4_grouped_pipeline: &ComputePipeline,
+    nvfp4_grouped_pipeline: &ComputePipeline,
 ) -> Result<(), Error> {
     let hidden = cfg.hidden_size;
     let moe_inter = cfg.moe_intermediate_size;
@@ -473,10 +478,16 @@ pub fn experts_forward_gpu_grouped_in_batch(
     let buf_down_jobs = batch.alloc_bytes(down_jobs_bytes)?;
     let buf_row_starts = batch.alloc_bytes(row_starts_bytes)?;
 
+    let grouped_pipeline = if expert_cache.expert_gate_up_q4(layer, 0).is_nvfp4() {
+        nvfp4_grouped_pipeline
+    } else {
+        q4_grouped_pipeline
+    };
+
     let gate_n = moe_inter * 2;
     let buf_gu = batch.alloc_f32_out(total_m * gate_n)?;
     batch.dispatch_q4_linear_grouped(
-        &q4_grouped_pipeline.pipeline,
+        &grouped_pipeline.pipeline,
         &buf_a,
         w_blob,
         &buf_gu,
@@ -500,7 +511,7 @@ pub fn experts_forward_gpu_grouped_in_batch(
 
     let buf_out = batch.alloc_f32_out(total_m * cfg.hidden_size)?;
     batch.dispatch_q4_linear_grouped(
-        &q4_grouped_pipeline.pipeline,
+        &grouped_pipeline.pipeline,
         &buf_act,
         w_blob,
         &buf_out,

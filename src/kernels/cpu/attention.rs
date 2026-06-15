@@ -31,6 +31,7 @@ impl LayerAttnParams {
     }
 }
 
+/// Standard split-half RoPE: rotate pairs `(d, d + rot/2)` within the first `rot` dims.
 pub fn apply_split_half_rope(src: &mut [f32], rot: u32, head_dim: u32, theta: f32, pos: u32) {
     let half_rot = (rot / 2) as usize;
     let hd = head_dim as usize;
@@ -44,6 +45,27 @@ pub fn apply_split_half_rope(src: &mut [f32], rot: u32, head_dim: u32, theta: f3
         src[d + half_rot] = x0 * s + x1 * c;
     }
     let _ = hd;
+}
+
+/// Gemma proportional RoPE: rotate `left[i]` with `right[i]` for `i < rot/2`.
+pub fn apply_proportional_rope(
+    src: &mut [f32],
+    rotary_dim: u32,
+    head_dim: u32,
+    theta: f32,
+    pos: u32,
+) {
+    let half_head = (head_dim / 2) as usize;
+    let half_rot = (rotary_dim / 2) as usize;
+    for d in 0..half_rot {
+        let inv_freq = theta.powf(-2.0 * d as f32 / head_dim as f32);
+        let a = pos as f32 * inv_freq;
+        let (c, s) = (a.cos(), a.sin());
+        let x0 = src[d];
+        let x1 = src[half_head + d];
+        src[d] = x0 * c - x1 * s;
+        src[half_head + d] = x0 * s + x1 * c;
+    }
 }
 
 pub fn rms_norm_head(src: &mut [f32], weight: Option<&[f32]>, eps: f32) {
@@ -113,7 +135,11 @@ pub fn qk_rope_kv(
             let mut tmp = head.to_vec();
             let w = if is_q { q_norm_w } else { k_norm_w };
             rms_norm_head(&mut tmp, Some(w), RMS_EPS);
-            apply_split_half_rope(&mut tmp, rot, layer.head_dim, theta, pos);
+            if layer.is_full {
+                apply_proportional_rope(&mut tmp, rot, layer.head_dim, theta, pos);
+            } else {
+                apply_split_half_rope(&mut tmp, rot, layer.head_dim, theta, pos);
+            }
 
             if is_k {
                 let dst_off = kv_half_base + (pos as usize * nkv * hd * 2) + hh * hd;
@@ -191,5 +217,16 @@ mod tests {
         apply_split_half_rope(&mut v, 4, 4, 1.0e4, 0);
         assert!((v[0] - 1.0).abs() < 1e-5);
         assert!((v[2] - 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn proportional_rope_pairs_across_head_halves() {
+        let hd = 8usize;
+        let mut v = (0..hd).map(|i| i as f32 * 0.1).collect::<Vec<_>>();
+        let before = v.clone();
+        apply_proportional_rope(&mut v, 4, hd as u32, 1.0e6, 1);
+        assert!((v[0] - before[0]).abs() > 1e-6 || (v[4] - before[4]).abs() > 1e-6);
+        assert!((v[2] - before[2]).abs() < 1e-6);
+        assert!((v[6] - before[6]).abs() < 1e-6);
     }
 }

@@ -164,6 +164,15 @@ enum Command {
         max_seq: usize,
         raw_prompt: bool,
     },
+    StepKvBf16Cross {
+        prompt: Option<String>,
+        prompt_len: usize,
+        layers: usize,
+        seed: u64,
+        max_seq: usize,
+        raw_prompt: bool,
+        bf16_ref_dir: PathBuf,
+    },
     StepAttnProbe {
         prompt: Option<String>,
         prompt_len: usize,
@@ -200,6 +209,19 @@ enum Command {
         output: PathBuf,
         positions: String,
         top_k: usize,
+    },
+    StepBf16OracleLogitsDump {
+        prompt: Option<String>,
+        layers: usize,
+        steps: usize,
+        seed: u64,
+        max_seq: usize,
+        raw_prompt: bool,
+        output: PathBuf,
+        positions: String,
+        top_k: usize,
+        bf16_ref_dir: PathBuf,
+        gpu_kv: bool,
     },
     StepLayerProbe {
         prompt: Option<String>,
@@ -370,6 +392,24 @@ fn main() -> ExitCode {
             max_seq,
             raw_prompt,
         ),
+        Command::StepKvBf16Cross {
+            prompt,
+            prompt_len,
+            layers,
+            seed,
+            max_seq,
+            raw_prompt,
+            bf16_ref_dir,
+        } => run_step_kv_bf16_cross_cmd(
+            &cli.model_dir,
+            &bf16_ref_dir,
+            prompt,
+            prompt_len,
+            layers,
+            seed,
+            max_seq,
+            raw_prompt,
+        ),
         Command::StepAttnProbe {
             prompt,
             prompt_len,
@@ -443,6 +483,32 @@ fn main() -> ExitCode {
             &output,
             &positions,
             top_k,
+        ),
+        Command::StepBf16OracleLogitsDump {
+            prompt,
+            layers,
+            steps,
+            seed,
+            max_seq,
+            raw_prompt,
+            output,
+            positions,
+            top_k,
+            bf16_ref_dir,
+            gpu_kv,
+        } => run_step_bf16_oracle_logits_dump_cmd(
+            &cli.model_dir,
+            &bf16_ref_dir,
+            prompt,
+            layers,
+            steps,
+            seed,
+            max_seq,
+            raw_prompt,
+            &output,
+            &positions,
+            top_k,
+            gpu_kv,
         ),
         Command::StepLayerProbe {
             prompt,
@@ -848,9 +914,11 @@ fn run_command(
         Command::StepProbe { .. } => ExitCode::FAILURE,
         Command::StepKvCheck { .. } => ExitCode::FAILURE,
         Command::StepKvParity { .. } => ExitCode::FAILURE,
+        Command::StepKvBf16Cross { .. } => ExitCode::FAILURE,
         Command::StepAttnProbe { .. } => ExitCode::FAILURE,
         Command::StepQ4Parity { .. } | Command::StepNvfp4Parity { .. } => ExitCode::FAILURE,
         Command::StepLogitsDump { .. } => ExitCode::FAILURE,
+        Command::StepBf16OracleLogitsDump { .. } => ExitCode::FAILURE,
         Command::StepLayerProbe { .. } => ExitCode::FAILURE,
         Command::StepAttnDump { .. } => ExitCode::FAILURE,
         Command::StepMoeDump { .. } => ExitCode::FAILURE,
@@ -891,6 +959,11 @@ fn step_kernel_config(
         no_early_stop: false,
         encoder_use_mps_q4: None,
     }
+}
+
+/// MLX parity dumps default to the full 30-layer decoder unless `--layers` is set.
+fn layers_for_parity_dump(parity_layers: Option<usize>) -> usize {
+    parity_layers.unwrap_or(30).max(1).min(30)
 }
 
 fn attach_step_prefill(
@@ -1047,6 +1120,107 @@ fn run_step_logits_dump_cmd(
             ExitCode::FAILURE
         }
     }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn run_step_bf16_oracle_logits_dump_cmd(
+    dgq_dir: &std::path::Path,
+    bf16_dir: &std::path::Path,
+    prompt: Option<String>,
+    layers: usize,
+    steps: usize,
+    seed: u64,
+    max_seq: usize,
+    raw_prompt: bool,
+    output: &std::path::Path,
+    positions: &str,
+    top_k: usize,
+    gpu_kv: bool,
+) -> ExitCode {
+    use metal::{
+        parse_positions, run_step_bf16_oracle_logits_dump,
+        run_step_bf16_oracle_logits_dump_gpu_kv, write_step_logits_dump, StepSmokeConfig,
+    };
+
+    if !dgq::store::looks_like_dgq_dir(dgq_dir) {
+        eprintln!("error: step-bf16-logits-dump requires -m pointing at a .dgq directory (prefill)");
+        return ExitCode::FAILURE;
+    }
+    if !bf16_dir.join("config.json").is_file() {
+        eprintln!(
+            "error: step-bf16-logits-dump --bf16-ref must contain config.json ({})",
+            bf16_dir.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    let mut cfg = StepSmokeConfig {
+        layers,
+        steps: steps.max(1),
+        kv_len: 0,
+        seed,
+        max_seq,
+        finish: metal::StepFinishMode::ForwardOnly,
+        use_mps_q4: None,
+        prefill_token_ids: None,
+        no_early_stop: false,
+        encoder_use_mps_q4: None,
+    };
+    if let Err(err) = attach_step_prefill(&mut cfg, dgq_dir, 0, prompt.as_deref(), raw_prompt) {
+        eprintln!("error: {err}");
+        return ExitCode::FAILURE;
+    }
+    let pos = match parse_positions(positions) {
+        Ok(v) => v,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let label = prompt.unwrap_or_else(|| "Hello".to_string());
+    let dump_result = if gpu_kv {
+        run_step_bf16_oracle_logits_dump_gpu_kv(dgq_dir, bf16_dir, &cfg, &label, &pos, top_k.max(1))
+    } else {
+        run_step_bf16_oracle_logits_dump(bf16_dir, &cfg, &label, &pos, top_k.max(1))
+    };
+    match dump_result {
+        Ok(dump) => {
+            if let Err(err) = write_step_logits_dump(output, &dump) {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+            println!(
+                "wrote {} ({}, T={:.4}, {} rows)",
+                output.display(),
+                dump.source,
+                dump.temperature,
+                dump.rows.len()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn run_step_bf16_oracle_logits_dump_cmd(
+    _dgq_dir: &std::path::Path,
+    _bf16_dir: &std::path::Path,
+    _prompt: Option<String>,
+    _layers: usize,
+    _steps: usize,
+    _seed: u64,
+    _max_seq: usize,
+    _raw_prompt: bool,
+    _output: &std::path::Path,
+    _positions: &str,
+    _top_k: usize,
+    _gpu_kv: bool,
+) -> ExitCode {
+    eprintln!("error: step-bf16-logits-dump requires --features metal on macOS");
+    ExitCode::FAILURE
 }
 
 #[cfg(not(all(feature = "metal", target_os = "macos")))]
@@ -1739,6 +1913,97 @@ fn run_step_kv_check_cmd(
             ExitCode::FAILURE
         }
     }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn run_step_kv_bf16_cross_cmd(
+    dgq_dir: &std::path::Path,
+    bf16_dir: &std::path::Path,
+    prompt: Option<String>,
+    prompt_len: usize,
+    layers: usize,
+    _seed: u64,
+    max_seq: usize,
+    raw_prompt: bool,
+) -> ExitCode {
+    use metal::run_step_kv_bf16_cross_parity;
+
+    if !dgq::store::looks_like_dgq_dir(dgq_dir) {
+        eprintln!("error: step-kv-bf16-cross requires a .dgq directory");
+        return ExitCode::FAILURE;
+    }
+    if !bf16_dir.join("config.json").is_file() {
+        eprintln!(
+            "error: step-kv-bf16-cross --bf16-ref must contain config.json ({})",
+            bf16_dir.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    let vocab = match crate::config::ModelConfig::load(dgq_dir) {
+        Ok(c) => c.text_config.vocab_size,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let token_ids = match build_prompt_tokens(
+        dgq_dir,
+        prompt.as_deref(),
+        prompt_len,
+        vocab,
+        raw_prompt,
+        &[],
+    ) {
+        Ok(ids) => ids,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!(
+        "step-kv-bf16-cross: {} prompt tokens, layers={}",
+        token_ids.len(),
+        layers.max(1).min(30)
+    );
+    match run_step_kv_bf16_cross_parity(
+        dgq_dir,
+        bf16_dir,
+        &token_ids,
+        layers,
+        max_seq.max(64),
+    ) {
+        Ok(r) => {
+            println!("step-kv-bf16-cross:");
+            println!("  kv_len:              {}", r.kv_len);
+            println!("  layers:              {}", r.layers);
+            println!("  gpu_prefix_l0:       {:.6}", r.gpu_prefix_max_l0);
+            println!("  cpu_prefix_l0:       {:.6}", r.cpu_prefix_max_l0);
+            println!(
+                "  max_kv_diff:         {:.6} (layer {} pos {})",
+                r.max_kv_diff, r.max_kv_diff_layer, r.max_kv_diff_pos
+            );
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn run_step_kv_bf16_cross_cmd(
+    _dgq_dir: &std::path::Path,
+    _bf16_dir: &std::path::Path,
+    _prompt: Option<String>,
+    _prompt_len: usize,
+    _layers: usize,
+    _seed: u64,
+    _max_seq: usize,
+    _raw_prompt: bool,
+) -> ExitCode {
+    eprintln!("error: step-kv-bf16-cross requires --features metal on macOS");
+    ExitCode::FAILURE
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -2729,6 +2994,7 @@ fn parse_cli() -> Cli {
     let mut embed_row_token = 71153u32;
     let mut embed_row_gpu = false;
     let mut bf16_ref_dir: Option<PathBuf> = None;
+    let mut step_gpu_kv = false;
     let mut use_monolithic = false;
     let mut raw_prompt = false;
 
@@ -2792,6 +3058,7 @@ fn parse_cli() -> Cli {
             "--compare-cpu" => compare_cpu = true,
             "--repeat-prefill" => bench_repeat_prefill = true,
             "--no-early-stop" => no_early_stop = true,
+            "--gpu-kv" => step_gpu_kv = true,
             "--skip-grouped" => step_moe_route_grouped = false,
             "--write-golden" => {
                 if let Some(v) = args.next() {
@@ -3154,6 +3421,26 @@ fn parse_cli() -> Cli {
             max_seq: step_max_seq.max(64),
             raw_prompt,
         },
+        Some("step-kv-bf16-cross") => {
+            let bf16_ref_dir = bf16_ref_dir.unwrap_or_else(|| {
+                let p = PathBuf::from("model/transformer");
+                if p.join("config.json").is_file() {
+                    p
+                } else {
+                    eprintln!("error: step-kv-bf16-cross requires --bf16-ref or model/transformer");
+                    std::process::exit(2);
+                }
+            });
+            Command::StepKvBf16Cross {
+                prompt: prompt.clone(),
+                prompt_len,
+                layers: layers_for_parity_dump(parity_layers),
+                seed,
+                max_seq: step_max_seq.max(64),
+                raw_prompt,
+                bf16_ref_dir,
+            }
+        }
         Some("step-attn-probe") => Command::StepAttnProbe {
             prompt: prompt.clone(),
             prompt_len,
@@ -3189,7 +3476,7 @@ fn parse_cli() -> Cli {
             });
             Command::StepLogitsDump {
                 prompt: prompt.clone(),
-                layers: bench_layers.max(1).min(30),
+                layers: layers_for_parity_dump(parity_layers),
                 steps: steps_parity.max(1),
                 seed,
                 max_seq: step_max_seq.max(64),
@@ -3197,6 +3484,36 @@ fn parse_cli() -> Cli {
                 output,
                 positions: step_logit_positions,
                 top_k: step_logit_top_k,
+            }
+        }
+        Some("step-bf16-logits-dump") => {
+            let output = output_dir.unwrap_or_else(|| {
+                eprintln!(
+                    "usage: diffgemma-mps step-bf16-logits-dump -m DGQ_DIR --bf16-ref BF16_DIR -o OUT.json [-p Hello] [--layers 30] [--steps 2] [--seed 42] [--logit-positions 0,1] [--gpu-kv]"
+                );
+                std::process::exit(2);
+            });
+            let bf16_ref_dir = bf16_ref_dir.unwrap_or_else(|| {
+                let p = PathBuf::from("model/transformer");
+                if p.join("config.json").is_file() {
+                    p
+                } else {
+                    eprintln!("error: step-bf16-logits-dump requires --bf16-ref or model/transformer");
+                    std::process::exit(2);
+                }
+            });
+            Command::StepBf16OracleLogitsDump {
+                prompt: prompt.clone(),
+                layers: layers_for_parity_dump(parity_layers),
+                steps: steps_parity.max(1),
+                seed,
+                max_seq: step_max_seq.max(64),
+                raw_prompt,
+                output,
+                positions: step_logit_positions,
+                top_k: step_logit_top_k,
+                bf16_ref_dir,
+                gpu_kv: step_gpu_kv,
             }
         }
         Some("step-layer-probe") => {
@@ -3208,7 +3525,7 @@ fn parse_cli() -> Cli {
             });
             Command::StepLayerProbe {
                 prompt: prompt.clone(),
-                layers: bench_layers.max(1).min(30),
+                layers: layers_for_parity_dump(parity_layers),
                 seed,
                 max_seq: step_max_seq.max(64),
                 raw_prompt,
@@ -3225,7 +3542,7 @@ fn parse_cli() -> Cli {
             });
             Command::StepAttnDump {
                 prompt: prompt.clone(),
-                layers: bench_layers.max(1).min(30),
+                layers: layers_for_parity_dump(parity_layers),
                 seed,
                 max_seq: step_max_seq.max(64),
                 raw_prompt,
@@ -3243,7 +3560,7 @@ fn parse_cli() -> Cli {
             });
             Command::StepMoeDump {
                 prompt: prompt.clone(),
-                layers: bench_layers.max(1).min(30),
+                layers: layers_for_parity_dump(parity_layers),
                 seed,
                 max_seq: step_max_seq.max(64),
                 raw_prompt,
@@ -3261,7 +3578,7 @@ fn parse_cli() -> Cli {
             });
             Command::StepMoeRouteDump {
                 prompt: prompt.clone(),
-                layers: bench_layers.max(1).min(30),
+                layers: layers_for_parity_dump(parity_layers),
                 seed,
                 max_seq: step_max_seq.max(64),
                 raw_prompt,
@@ -3279,7 +3596,7 @@ fn parse_cli() -> Cli {
             });
             Command::StepMoeBatchedPinDump {
                 prompt: prompt.clone(),
-                layers: bench_layers.max(1).min(30),
+                layers: layers_for_parity_dump(parity_layers),
                 seed,
                 max_seq: step_max_seq.max(64),
                 raw_prompt,
@@ -3296,7 +3613,7 @@ fn parse_cli() -> Cli {
             });
             Command::StepMoeSingleDump {
                 prompt: prompt.clone(),
-                layers: bench_layers.max(1).min(30),
+                layers: layers_for_parity_dump(parity_layers),
                 seed,
                 max_seq: step_max_seq.max(64),
                 raw_prompt,
@@ -3315,7 +3632,7 @@ fn parse_cli() -> Cli {
             });
             Command::StepPreambleDump {
                 prompt: prompt.clone(),
-                layers: bench_layers.max(1).min(30),
+                layers: layers_for_parity_dump(parity_layers),
                 seed,
                 max_seq: step_max_seq.max(64),
                 raw_prompt,
@@ -3341,7 +3658,7 @@ fn parse_cli() -> Cli {
             });
             Command::EmbedRowDump {
                 token: embed_row_token,
-                layers: bench_layers.max(1).min(30),
+                layers: layers_for_parity_dump(parity_layers),
                 max_seq: step_max_seq.max(64),
                 prompt: prompt.clone(),
                 raw_prompt,
@@ -4818,15 +5135,27 @@ fn print_generate_output(
     }
 
     if let Ok(tokenizer) = tokenizer::Tokenizer::load(model_dir.join("tokenizer.json")) {
-        let display_ids = sample::strip_degenerate_token_ids(
-            &out.token_ids.get(prompt_len..).unwrap_or(&[]),
-        );
+        let generated = out.token_ids.get(prompt_len..).unwrap_or(&[]);
+        let display_ids = sample::strip_degenerate_token_ids(generated);
         if !display_ids.is_empty() {
             let text = tokenizer.decode(&display_ids);
             if !text.is_empty() {
                 let preview: String = text.chars().take(200).collect();
                 println!("  text: {preview}");
             }
+        } else if !generated.is_empty() {
+            let pad = generated
+                .iter()
+                .filter(|&&t| t == sample::PAD_TOKEN_ID)
+                .count();
+            let filler = generated
+                .iter()
+                .filter(|&&t| t == sample::FILLER_TOKEN_ID)
+                .count();
+            eprintln!(
+                "  text: (empty after stripping pad/filler; generated={} pad={pad} filler={filler})",
+                generated.len()
+            );
         }
     }
 
@@ -4837,6 +5166,19 @@ fn print_generate_output(
         .map(|t| t.to_string())
         .collect();
     println!("  token_ids[0..16]: [{}]", preview.join(", "));
+    if out.token_ids.len() > prompt_len {
+        let gen_preview: Vec<String> = out
+            .token_ids
+            .iter()
+            .skip(prompt_len)
+            .take(16)
+            .map(|t| t.to_string())
+            .collect();
+        println!(
+            "  generated[0..16]: [{}]",
+            gen_preview.join(", ")
+        );
+    }
 }
 
 fn infer_golden_name(

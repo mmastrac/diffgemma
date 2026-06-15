@@ -1,8 +1,8 @@
-//! Top-k MoE routing from softmax probs per row.
+//! Top-k MoE routing from raw logits per row.
 
 use super::test_util::ElemFormat;
 use super::variant::KernelVariant;
-use crate::model::moe::top_k_route;
+use crate::model::moe::top_k_route_from_raw_logits;
 use crate::safetensors::Error;
 
 pub const ENTRY: &str = "router_top_k_rows";
@@ -37,10 +37,8 @@ pub fn tiny_fixture(_fmt: ElemFormat) -> Fixture {
         1.0, 2.0, 3.0, 0.0, -1.0, 0.5, //
         0.5, 1.0, 1.5, 2.0, 0.0, -0.5,
     ];
-    let mut probs = logits.clone();
-    crate::kernels::cpu::softmax_rows(&mut probs, rows, experts);
     Fixture {
-        probs,
+        probs: logits,
         per_expert_scale: vec![1.0; experts],
         rows,
         experts,
@@ -55,16 +53,10 @@ pub fn moe_fixture(_fmt: ElemFormat) -> Fixture {
     let len = rows * experts;
     Fixture {
         probs: {
-            let mut v: Vec<f32> = (0..len).map(|i| ((i as f32) * 0.01).sin() + 1.0).collect();
-            // softmax-ish positive weights per row for oracle
-            for r in 0..rows {
-                let row = &mut v[r * experts..(r + 1) * experts];
-                let s: f32 = row.iter().sum();
-                for p in row.iter_mut() {
-                    *p /= s;
-                }
-            }
-            v
+            let len = rows * experts;
+            (0..len)
+                .map(|i| ((i as f32) * 0.01).sin() + (i % 17) as f32 * 0.02)
+                .collect()
         },
         per_expert_scale: (0..experts).map(|i| 1.0 + (i as f32) * 0.001).collect(),
         rows,
@@ -78,7 +70,7 @@ pub fn cpu(fix: &Fixture) -> RouteOut {
     let mut weights = Vec::with_capacity(fix.out_indices_len());
     for r in 0..fix.rows {
         let row = &fix.probs[r * fix.experts..(r + 1) * fix.experts];
-        let route = top_k_route(row, fix.top_k, &fix.per_expert_scale);
+        let route = top_k_route_from_raw_logits(row, fix.top_k, &fix.per_expert_scale);
         for &idx in &route.indices {
             indices.push(idx as u32);
         }

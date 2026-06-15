@@ -177,12 +177,185 @@ pub fn run_step_logits_dump(
     let mut fwd_cfg = cfg.clone();
     fwd_cfg.finish = StepFinishMode::ForwardOnly;
     let out = run_step_forward(model_dir, &fwd_cfg)?;
+    build_logits_dump_from_forward(cfg, prompt_label, positions, top_k, out, "rust-monolithic")
+}
+
+/// CPU decoder forward with bf16 safetensors (oracle for Q4 monolithic logic).
+pub fn run_step_bf16_oracle_logits_dump(
+    bf16_dir: &Path,
+    cfg: &StepSmokeConfig,
+    prompt_label: &str,
+    positions: &[usize],
+    top_k: usize,
+) -> Result<StepLogitsDump, Error> {
+    use crate::model::decoder::{forward, DecoderForwardInput, DecoderScratch};
+    use crate::model::encoder::{prefill, EncoderPrefillInput, EncoderScratch};
+    use crate::model::mask::DecoderAttnMask;
+    use crate::model::Model;
+    use crate::metal::step_kernel::init_canvas_state;
+
+    let model = Model::open(bf16_dir)?;
+    if model.weights.is_quantized() {
+        return Err(Error::Format(
+            "bf16 oracle dump requires bf16 safetensors, not .dgq",
+        ));
+    }
+    let prompt = cfg
+        .prefill_token_ids
+        .as_ref()
+        .ok_or_else(|| Error::Format("bf16 oracle dump requires prefill token ids"))?;
+    let layers = cfg.layers.min(model.config.text_config.num_hidden_layers).max(1);
+    let kv_len = prompt.len();
+    let mut enc_scratch = EncoderScratch::new(kv_len.max(CANVAS), &model.config);
+    let prefill_out = prefill(
+        &model.weights,
+        &model.config,
+        &EncoderPrefillInput {
+            token_ids: prompt,
+            position_offset: 0,
+        },
+        &mut enc_scratch,
+    )?;
+    let canvas = init_canvas_state(cfg.seed, VOCAB);
+    let token_ids: Vec<u32> = canvas.ids.to_vec();
+    let mask = DecoderAttnMask::all_valid(CANVAS, kv_len);
+    let mut dec_scratch = DecoderScratch::new(CANVAS, &model.config);
+    let mut logits = vec![0.0f32; CANVAS * VOCAB];
+    let mut input = DecoderForwardInput {
+        mask: Some(&mask),
+        logits_out: Some(&mut logits),
+        self_conditioning_logits: None,
+        ..DecoderForwardInput::new(&token_ids, &prefill_out.kv_cache)
+    };
+    let out = forward(
+        &model.weights,
+        &model.config,
+        &mut input,
+        &mut dec_scratch,
+        Some(layers),
+    )?;
+    build_logits_dump_from_forward(
+        cfg,
+        prompt_label,
+        positions,
+        top_k,
+        StepForwardOutput {
+            norm_hidden: out.hidden_states,
+            logits,
+            token_ids,
+        },
+        "rust-bf16-oracle",
+    )
+}
+
+/// CPU bf16 decoder with KV from GPU monolithic encoder (.dgq) — isolates decoder vs KV drift.
+pub fn run_step_bf16_oracle_logits_dump_gpu_kv(
+    dgq_dir: &Path,
+    bf16_dir: &Path,
+    cfg: &StepSmokeConfig,
+    prompt_label: &str,
+    positions: &[usize],
+    top_k: usize,
+) -> Result<StepLogitsDump, Error> {
+    use crate::model::decoder::{forward, DecoderForwardInput, DecoderScratch};
+    use crate::model::mask::DecoderAttnMask;
+    use crate::model::Model;
+    use crate::metal::step_kernel::{
+        build_layout, build_offsets_from_store, init_canvas_state,
+    };
+    use crate::metal::step_kv::{
+        prefill_monolithic_kv_with_cache, read_monolithic_kv_prefix_to_cpu_cache,
+        MonolithicEncoderCache, kv_cache_total_bytes,
+    };
+    use crate::dgq::DgqStore;
+    use crate::metal::device::MetalContext;
+    use objc2_metal::{MTLDevice, MTLResourceOptions};
+
+    let model = Model::open(bf16_dir)?;
+    if model.weights.is_quantized() {
+        return Err(Error::Format(
+            "bf16 gpu-kv oracle requires bf16 safetensors, not .dgq",
+        ));
+    }
+    let prompt = cfg
+        .prefill_token_ids
+        .as_ref()
+        .ok_or_else(|| Error::Format("bf16 gpu-kv oracle requires prefill token ids"))?;
+    let layers = cfg.layers.min(model.config.text_config.num_hidden_layers).max(1);
+    let max_seq = cfg.max_seq.max(prompt.len()).max(CANVAS);
+    let dgq_store = DgqStore::open(dgq_dir)?;
+    let layout = build_layout(&build_offsets_from_store(&dgq_store), max_seq);
+    let ctx = MetalContext::new()?;
+    let kv_bytes = kv_cache_total_bytes(&layout, max_seq) as usize;
+    let gpu_buf = ctx
+        .device
+        .newBufferWithLength_options(kv_bytes, MTLResourceOptions::StorageModeShared)
+        .ok_or(Error::Format("gpu-kv oracle buffer alloc failed"))?;
+    let mut enc_cache =
+        MonolithicEncoderCache::open_opt(dgq_dir, CANVAS, max_seq, None, None)?;
+    let (kv_len, _) = prefill_monolithic_kv_with_cache(
+        &mut enc_cache,
+        prompt,
+        &gpu_buf,
+        &layout,
+        max_seq,
+        layers,
+    )?;
+    let kv_cache = read_monolithic_kv_prefix_to_cpu_cache(
+        &gpu_buf,
+        &layout,
+        &model.config,
+        kv_len,
+    )?;
+    let canvas = init_canvas_state(cfg.seed, VOCAB);
+    let token_ids: Vec<u32> = canvas.ids.to_vec();
+    let mask = DecoderAttnMask::all_valid(CANVAS, kv_len);
+    let mut dec_scratch = DecoderScratch::new(CANVAS, &model.config);
+    let mut logits = vec![0.0f32; CANVAS * VOCAB];
+    let mut input = DecoderForwardInput {
+        mask: Some(&mask),
+        logits_out: Some(&mut logits),
+        self_conditioning_logits: None,
+        ..DecoderForwardInput::new(&token_ids, &kv_cache)
+    };
+    let out = forward(
+        &model.weights,
+        &model.config,
+        &mut input,
+        &mut dec_scratch,
+        Some(layers),
+    )?;
+    build_logits_dump_from_forward(
+        cfg,
+        prompt_label,
+        positions,
+        top_k,
+        StepForwardOutput {
+            norm_hidden: out.hidden_states,
+            logits,
+            token_ids,
+        },
+        "rust-bf16-oracle-gpu-kv",
+    )
+}
+
+fn build_logits_dump_from_forward(
+    cfg: &StepSmokeConfig,
+    prompt_label: &str,
+    positions: &[usize],
+    top_k: usize,
+    out: StepForwardOutput,
+    source: &str,
+) -> Result<StepLogitsDump, Error> {
     let params = crate::metal::step_kernel::step_params_from_sampler(
         &SamplerConfig {
             max_denoising_steps: cfg.steps.max(1),
             ..SamplerConfig::default()
         },
-        cfg.prefill_token_ids.as_ref().map(|t| t.len() as u32).unwrap_or(cfg.kv_len),
+        cfg.prefill_token_ids
+            .as_ref()
+            .map(|t| t.len() as u32)
+            .unwrap_or(cfg.kv_len),
         cfg.no_early_stop,
     );
     let temperature = scheduled_temperature(0, &params);
@@ -192,7 +365,7 @@ pub fn run_step_logits_dump(
         .collect::<Result<Vec<_>, _>>()?;
     Ok(StepLogitsDump {
         schema_version: SCHEMA_VERSION,
-        source: "rust-monolithic".into(),
+        source: source.into(),
         prompt: prompt_label.to_string(),
         prompt_token_ids: cfg.prefill_token_ids.clone().unwrap_or_default(),
         initial_canvas_ids: out.token_ids,

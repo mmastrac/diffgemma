@@ -240,14 +240,18 @@ pub fn compute_rope_freqs(freqs: &mut [f32], positions: &[i64], kind: RopeKind) 
 pub fn apply_rope(vec: &mut [f32], freqs: &[f32], rotary_dim: usize) {
     assert!(rotary_dim <= vec.len());
     assert_eq!(freqs.len(), rotary_dim);
+    let head_dim = vec.len();
     let half = rotary_dim / 2;
+    let half_head = head_dim / 2;
+    let proportional = rotary_dim < head_dim;
     for d in 0..half {
         let cos = freqs[2 * d];
         let sin = freqs[2 * d + 1];
+        let i1 = if proportional { half_head + d } else { d + half };
         let x0 = vec[d];
-        let x1 = vec[d + half];
+        let x1 = vec[i1];
         vec[d] = x0 * cos - x1 * sin;
-        vec[d + half] = x0 * sin + x1 * cos;
+        vec[i1] = x0 * sin + x1 * cos;
     }
 }
 

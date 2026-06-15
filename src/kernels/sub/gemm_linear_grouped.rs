@@ -115,6 +115,15 @@ pub fn tile_fixture_nvfp4(_: ElemFormat) -> Fixture {
     grouped_fixture(QuantFormat::NvFp4, 128, 128, &[100, 48, 4])
 }
 
+/// Encoder prefill MoE row volume: 25 prompt tokens × 8 experts = 200 grouped rows.
+pub fn prefill_moe_fixture_nvfp4(_: ElemFormat) -> Fixture {
+    grouped_fixture(QuantFormat::NvFp4, 128, 128, &[25, 25, 25, 25, 25, 25, 25, 25])
+}
+
+pub fn prefill_moe_fixture_q4(_: ElemFormat) -> Fixture {
+    grouped_fixture(QuantFormat::Q4Affine, 128, 128, &[25, 25, 25, 25, 25, 25, 25, 25])
+}
+
 pub(crate) fn grouped_fixture(
     format: QuantFormat,
     k: usize,
@@ -460,6 +469,30 @@ mod tests {
         formats: [F32],
         max_tol = 0.05,
         min_cos = 0.999,
+    }
+
+    kernel_oracle_matrix! {
+        mod prefill_moe_nvfp4,
+        cpu = crate::kernels::sub::gemm_linear_grouped::cpu,
+        cpu_oracle = crate::kernels::sub::gemm_linear_grouped::cpu_oracle,
+        gpu = crate::kernels::sub::gemm_linear_grouped::gpu_nvfp4,
+        fixture = crate::kernels::sub::gemm_linear_grouped::prefill_moe_fixture_nvfp4,
+        out_len = crate::kernels::sub::gemm_linear_grouped::fixture_len,
+        formats: [F32],
+        max_tol = 0.05,
+        min_cos = 0.999,
+    }
+
+    kernel_oracle_matrix! {
+        mod prefill_moe_q4,
+        cpu = crate::kernels::sub::gemm_linear_grouped::cpu,
+        cpu_oracle = crate::kernels::sub::gemm_linear_grouped::cpu_oracle,
+        gpu = crate::kernels::sub::gemm_linear_grouped::gpu_q4,
+        fixture = crate::kernels::sub::gemm_linear_grouped::prefill_moe_fixture_q4,
+        out_len = crate::kernels::sub::gemm_linear_grouped::fixture_len,
+        formats: [F32],
+        max_tol = 1e-4,
+        min_cos = 0.9999,
     }
 
     #[cfg(all(feature = "metal", target_os = "macos"))]

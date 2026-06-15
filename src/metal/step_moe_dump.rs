@@ -25,7 +25,9 @@ pub struct StepMoeLayerDump {
     pub expert_weights: Vec<u16>,
     pub post_attn: Vec<f32>,
     pub dense_out: Vec<f32>,
+    pub router_logits: Vec<f32>,
     pub moe_out: Vec<f32>,
+    pub moe_out_ln: Vec<f32>,
     pub layer_out: Vec<f32>,
 }
 
@@ -50,7 +52,9 @@ fn dump_from_capture(
         expert_weights: cap.expert_weights.clone(),
         post_attn: cap.post_attn.clone(),
         dense_out: cap.dense_out.clone(),
+        router_logits: cap.router_logits.clone(),
         moe_out: cap.moe_out.clone(),
+        moe_out_ln: cap.moe_out_ln.clone(),
         layer_out: cap.layer_out.clone(),
     }
 }

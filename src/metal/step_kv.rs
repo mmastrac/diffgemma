@@ -143,6 +143,113 @@ pub fn write_monolithic_kv_buffer(
     pack_kv_cache_to_monolithic(dst, layout, kv, max_seq)
 }
 
+/// Read monolithic b4 KV prefix into CPU `KvCache` (inverse of `pack_kv_cache_to_monolithic`).
+pub fn read_monolithic_kv_prefix_to_cpu_cache(
+    buf: &ProtocolObject<dyn MTLBuffer>,
+    layout: &ModelLayout,
+    cfg: &ModelConfig,
+    kv_len: usize,
+) -> Result<KvCache, Error> {
+    let mut kv = KvCache::empty(&cfg.text_config)?;
+    kv.kv_len = kv_len;
+    for layer in 0..N_LAYERS.min(kv.layers.len()) {
+        let l = &layout.layers[layer];
+        let kv_layer = kv.layer_mut(layer).ok_or(Error::Format("missing kv layer"))?;
+        let nkv = l.n_kv_heads as usize;
+        let hd = l.head_dim as usize;
+        let per_token = nkv * hd;
+        kv_layer.keys.resize(kv_len * per_token, 0.0);
+        kv_layer.values.resize(kv_len * per_token, 0.0);
+        let token_stride_half = nkv * hd * 2;
+        let half_base_region = l.kv_region as usize / 2;
+        for pos in 0..kv_len {
+            let half_base = half_base_region + pos * token_stride_half;
+            for hh in 0..nkv {
+                for d in 0..hd {
+                    let src_i = pos * per_token + hh * hd + d;
+                    let k_dst = (half_base + hh * hd + d) * 2;
+                    let v_dst = (half_base + nkv * hd + hh * hd + d) * 2;
+                    kv_layer.keys[src_i] = f16_bits_to_f32(read_half_at(buf, k_dst));
+                    kv_layer.values[src_i] = f16_bits_to_f32(read_half_at(buf, v_dst));
+                }
+            }
+        }
+    }
+    Ok(kv)
+}
+
+#[derive(Debug)]
+pub struct StepKvBf16CrossResult {
+    pub kv_len: usize,
+    pub layers: usize,
+    pub max_kv_diff: f32,
+    pub max_kv_diff_layer: usize,
+    pub max_kv_diff_pos: usize,
+    pub gpu_prefix_max_l0: f32,
+    pub cpu_prefix_max_l0: f32,
+}
+
+/// Compare GPU monolithic encoder KV (.dgq) vs CPU bf16 encoder KV (safetensors).
+pub fn run_step_kv_bf16_cross_parity(
+    dgq_dir: &Path,
+    bf16_dir: &Path,
+    token_ids: &[u32],
+    layers: usize,
+    max_seq: usize,
+) -> Result<StepKvBf16CrossResult, Error> {
+    if token_ids.is_empty() {
+        return Err(Error::Format("kv cross parity requires at least one token"));
+    }
+    let layers = layers.max(1).min(N_LAYERS);
+    let dgq_store = DgqStore::open(dgq_dir)?;
+    let layout = build_layout(&build_offsets_from_store(&dgq_store), max_seq);
+    let bf16_model = Model::open(bf16_dir)?;
+    if bf16_model.weights.is_quantized() {
+        return Err(Error::Format("bf16 cross parity requires bf16 safetensors dir"));
+    }
+    let ctx = MetalContext::new()?;
+    let kv_bytes = kv_cache_total_bytes(&layout, max_seq) as usize;
+    let alloc_kv = || -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
+        ctx.device
+            .newBufferWithLength_options(kv_bytes, MTLResourceOptions::StorageModeShared)
+            .ok_or(Error::Format("kv cross buffer alloc failed"))
+    };
+    let gpu_buf = alloc_kv()?;
+    let cpu_buf = alloc_kv()?;
+    let mut gpu_cache =
+        MonolithicEncoderCache::open_opt(dgq_dir, CANVAS, max_seq, None, None)?;
+    let (kv_len, _) = prefill_monolithic_kv_with_cache(
+        &mut gpu_cache,
+        token_ids,
+        &gpu_buf,
+        &layout,
+        max_seq,
+        layers,
+    )?;
+    let cpu_kv_len = prefill_monolithic_kv_cpu(
+        &bf16_model.weights,
+        &bf16_model.config,
+        token_ids,
+        &cpu_buf,
+        &layout,
+        max_seq,
+    )?;
+    if cpu_kv_len != kv_len {
+        return Err(Error::Format("gpu/cpu bf16 cross kv_len mismatch"));
+    }
+    let (max_kv_diff, max_kv_diff_layer, max_kv_diff_pos) =
+        monolithic_kv_prefix_max_diff(&gpu_buf, &cpu_buf, &layout, kv_len, layers);
+    Ok(StepKvBf16CrossResult {
+        kv_len,
+        layers,
+        max_kv_diff,
+        max_kv_diff_layer,
+        max_kv_diff_pos,
+        gpu_prefix_max_l0: kvcache_prefix_max_abs(&gpu_buf, &layout, 0, kv_len),
+        cpu_prefix_max_l0: kvcache_prefix_max_abs(&cpu_buf, &layout, 0, kv_len),
+    })
+}
+
 /// Pack one layer prefix from f32 K/V (engine GPU layout) into monolithic b4 at `dst_pos..`.
 fn pack_layer_f32_kv_to_monolithic(
     dst: &mut [u8],
@@ -853,6 +960,40 @@ pub fn step_min_entropy_with_kv(
     Ok(step_entropy_stats(&st.entropy, &st.accept).min_entropy)
 }
 
+/// Count non-finite half values in layer `L` K+V prefix `[0, kv_len)`.
+pub fn kvcache_layer_prefix_non_finite(
+    kv_buf: &ProtocolObject<dyn MTLBuffer>,
+    layout: &ModelLayout,
+    layer: usize,
+    kv_len: usize,
+) -> (usize, usize) {
+    if kv_len == 0 || layer >= N_LAYERS {
+        return (0, 0);
+    }
+    let l = &layout.layers[layer];
+    let nkv = l.n_kv_heads as usize;
+    let hd = l.head_dim as usize;
+    let token_stride_half = nkv * hd * 2;
+    let half_base = l.kv_region as usize / 2;
+    let mut bad = 0usize;
+    let mut total = 0usize;
+    for pos in 0..kv_len {
+        let start = (half_base + pos * token_stride_half) * 2;
+        let end = start + token_stride_half * 2;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(kv_buf.contents().as_ptr().add(start) as *const u8, end - start)
+        };
+        for chunk in bytes.chunks_exact(2) {
+            total += 1;
+            let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+            if !f16_bits_to_f32(bits).is_finite() {
+                bad += 1;
+            }
+        }
+    }
+    (bad, total)
+}
+
 /// Max abs half in K or V plane only for layer `L` prefix `[0, kv_len)`.
 pub fn kvcache_plane_max_abs(
     kv_buf: &ProtocolObject<dyn MTLBuffer>,
@@ -1211,6 +1352,7 @@ pub fn run_encoder_moe_kv_parity(
 mod encoder_moe_kv_tests {
     use super::*;
     use crate::chat_template::{format_chat_token_ids, ChatFormatOptions, ChatTurn};
+    use crate::metal::device::MetalContext;
     use crate::tokenizer::Tokenizer;
 
     fn calgary_prefill(model_dir: &Path) -> Vec<u32> {
@@ -1223,6 +1365,43 @@ mod encoder_moe_kv_tests {
             &ChatFormatOptions::default(),
         )
         .expect("prefill ids")
+    }
+
+    #[test]
+    fn nvfp4_encoder_prefill_long_prompt_kv_finite() {
+        let dir = std::path::Path::new("/tmp/nvfp4-weights");
+        if !dir.join("model.dgq.json").exists() {
+            eprintln!("skip: /tmp/nvfp4-weights missing");
+            return;
+        }
+        let ids = calgary_prefill(dir);
+        assert!(ids.len() >= 20, "expected long chat prompt, got {}", ids.len());
+        let ctx = MetalContext::new().expect("metal");
+        let layout = build_layout(&build_offsets_from_store(&DgqStore::open(dir).expect("dgq")), 512);
+        let kv_bytes = kv_cache_total_bytes(&layout, 512) as usize;
+        let kv_buf = ctx
+            .device
+            .newBufferWithLength_options(kv_bytes, MTLResourceOptions::StorageModeShared)
+            .expect("kv buf");
+        let mut cache = MonolithicEncoderCache::open_opt(dir, CANVAS, 512, None, Some(false))
+            .expect("encoder cache");
+        cache.engine.set_encoder_gpu_moe(true);
+        let (kv_len, _) = prefill_monolithic_kv_with_cache(
+            &mut cache,
+            &ids,
+            &kv_buf,
+            &layout,
+            512,
+            2,
+        )
+        .expect("prefill");
+        for layer in 0..2 {
+            let (bad, total) = kvcache_layer_prefix_non_finite(&kv_buf, &layout, layer, kv_len);
+            let k_max = kvcache_plane_max_abs(&kv_buf, &layout, layer, kv_len, 0);
+            eprintln!("nvfp4 prefill L{layer}: kv_len={kv_len} k_max={k_max:.4} non_finite={bad}/{total}");
+            assert_eq!(bad, 0, "layer {layer} KV prefix has {bad} non-finite halves");
+            assert!(k_max > 1e-4, "layer {layer} K prefix looks unset (max={k_max})");
+        }
     }
 
     #[test]

@@ -88,7 +88,9 @@ def _capture_layer_attention(
         offset = _cache_offset(cache)
 
     queries = attn.q_proj(x).reshape(B, L, attn.n_heads, attn.head_dim)
+    q_raw = queries
     queries = attn.q_norm(queries).transpose(0, 2, 1, 3)
+    q_pre_rope = queries
     queries = attn.rope(queries, offset=offset)
 
     keys = attn.k_proj(x).reshape(B, L, attn.n_kv_heads, attn.head_dim)
@@ -125,8 +127,8 @@ def _capture_layer_attention(
         queries, keys, values, cache=attn_cache, scale=attn.scale, mask=mask
     )
     output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-    mx.eval(queries, keys, output)
-    return queries, keys, output
+    mx.eval(q_raw, q_pre_rope, queries, keys, output)
+    return q_raw, q_pre_rope, queries, keys, output
 
 
 def dump_mlx_layer_attn(args: argparse.Namespace) -> dict:
@@ -193,20 +195,24 @@ def dump_mlx_layer_attn(args: argparse.Namespace) -> dict:
     mx.eval(h_ln)
     hidden_ln = [float(x) for x in h_ln[0, pos].tolist()]
 
-    queries, keys, attn_pre_o = _capture_layer_attention(
+    queries_raw, queries_pre, queries, keys, attn_pre_o = _capture_layer_attention(
         target.self_attn,
         h_ln,
         mask_mapping.get(target.layer_type),
         kv_cache[layer_idx],
         offset,
     )
-    mx.eval(queries, keys, attn_pre_o)
+    mx.eval(queries_raw, queries_pre, queries, keys, attn_pre_o)
 
     n_heads = int(target.self_attn.n_heads)
     n_kv = int(target.self_attn.n_kv_heads)
     hd = int(target.self_attn.head_dim)
     total_kv = int(keys.shape[2])
 
+    q_raw_row = queries_raw[0, pos].reshape(n_heads * hd)
+    q_raw_flat = [float(x) for x in q_raw_row.tolist()]
+    q_pre_row = queries_pre[0].transpose(1, 0, 2).reshape(canvas_length, n_heads * hd)[pos]
+    q_pre_flat = [float(x) for x in q_pre_row.tolist()]
     q_row = queries[0].transpose(1, 0, 2).reshape(canvas_length, n_heads * hd)[pos]
     q_flat = [float(x) for x in q_row.tolist()]
     k_flat = [float(x) for x in keys[0].reshape(n_kv, total_kv, hd).transpose(1, 0, 2).reshape(-1).tolist()]
@@ -249,6 +255,8 @@ def dump_mlx_layer_attn(args: argparse.Namespace) -> dict:
         "is_full": is_full,
         "hidden_in": hidden_in,
         "hidden_ln": hidden_ln,
+        "q_raw_proj": q_raw_flat,
+        "q_pre_rope": q_pre_flat,
         "q_post_rope": q_flat,
         "attn_out": attn_out,
         "raw_scores": raw_scores,

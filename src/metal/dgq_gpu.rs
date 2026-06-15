@@ -680,6 +680,83 @@ mod q4_gpu_tests {
         assert!(max_err < 0.08, "max_err={max_err}");
     }
 
+    /// Encoder prefill uses `seq_len` batched linears (e.g. 22–25 prompt tokens), not M=4.
+    #[test]
+    fn nvfp4_gpu_linear_prefill_seq_len() {
+        let dgq_dir = std::path::Path::new("/tmp/nvfp4-weights");
+        if !dgq_dir.join("model.dgq.json").exists() {
+            eprintln!("skip: /tmp/nvfp4-weights missing");
+            return;
+        }
+        let store = DgqStore::open(dgq_dir).expect("open dgq");
+        let ctx = MetalContext::new().expect("metal");
+        let blob = DgqGpuBlob::from_store(&store, &ctx.device).expect("blob");
+        let tensor = "model.decoder.layers.1.self_attn.k_proj.weight";
+        let q4 = load_block_linear(&store, Arc::clone(&blob), tensor).expect("nvfp4 view");
+        assert!(q4.is_nvfp4());
+
+        let m = 25usize;
+        let k = q4.in_dim;
+        let n = q4.out_dim;
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32 * 0.0009).sin() * 0.03 + (i % 17) as f32 * 0.0001))
+            .collect();
+        let f32_w = store.tensor_f32(tensor).expect("dequant");
+        let mut cpu_out = vec![0.0f32; m * n];
+        for row in 0..m {
+            for col in 0..n {
+                let mut sum = 0.0f32;
+                for p in 0..k {
+                    sum += a[row * k + p] * f32_w[col * k + p];
+                }
+                cpu_out[row * n + col] = sum;
+            }
+        }
+
+        let prod = crate::kernels::sub::variant::KernelVariant::PRODUCTION;
+        let q4_pipeline = crate::kernels::sub::gemm_linear_f32::pipeline_for(
+            &ctx,
+            crate::kernels::sub::QuantFormat::Q4Affine,
+            prod,
+        )
+        .expect("pipeline");
+        let nvfp4_pipeline = crate::kernels::sub::gemm_linear_f32::pipeline_for(
+            &ctx,
+            crate::kernels::sub::QuantFormat::NvFp4,
+            prod,
+        )
+        .expect("nvfp4 pipeline");
+        let mut pool = BufferPool::new();
+        let mut batch = GpuBatch::begin(&ctx.queue, &mut pool, &ctx.device).expect("batch");
+        let buf_a = batch.alloc_f32(&a).expect("a");
+        let buf_c = f32_q4_linear_gpu_bufs(
+            &mut batch,
+            &q4_pipeline,
+            &nvfp4_pipeline,
+            &buf_a,
+            &q4,
+            m,
+            k,
+            n,
+        )
+        .expect("gemm");
+        let mut gpu_out = vec![0.0f32; m * n];
+        batch.register_read(buf_c, &mut gpu_out);
+        batch.end().expect("end");
+
+        let mut max_err = 0.0f32;
+        let mut nan = 0usize;
+        for (a, b) in cpu_out.iter().zip(gpu_out.iter()) {
+            if !b.is_finite() {
+                nan += 1;
+            }
+            max_err = max_err.max((a - b).abs());
+        }
+        eprintln!("nvfp4 m={m} linear max_err={max_err:.6} nan={nan}");
+        assert_eq!(nan, 0, "gpu linear produced {nan} non-finite outputs");
+        assert!(max_err < 0.08, "max_err={max_err}");
+    }
+
     #[test]
     fn nvfp4_gpu_dequant_matrix_matches_cpu() {
         use crate::metal::mps_gemm::dispatch_dequant_nvfp4_matrix;

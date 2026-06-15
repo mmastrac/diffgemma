@@ -105,8 +105,10 @@ pub use step_moe_single_dump::{
     run_step_moe_single_expert_dump, write_step_moe_single_expert_dump, StepMoeSingleExpertDump,
 };
 pub use step_logits_dump::{
-    parse_positions, run_step_layer_hidden_dump, run_step_logits_dump, write_step_layer_hidden_dump,
-    write_step_logits_dump, StepLayerHiddenDump, StepLogitsDump,
+    parse_positions, run_step_bf16_oracle_logits_dump, run_step_bf16_oracle_logits_dump_gpu_kv,
+    run_step_layer_hidden_dump,
+    run_step_logits_dump, write_step_layer_hidden_dump, write_step_logits_dump,
+    StepLayerHiddenDump, StepLogitsDump,
 };
 pub use step_m0::{run_step_parity, run_step_verify, M0VerifyResult, StepParityConfig, StepParityResult};
 pub use step_config::{log_validated_step_model, validate_step_model, ValidatedStepModel};
@@ -117,7 +119,8 @@ pub use step_quant::{
 };
 pub use step_kv::{
     extend_monolithic_kv, monolithic_kv_prefix_max_diff, prefill_monolithic_kv_with_cache,
-    run_step_kv_audit, run_step_kv_mps_parity, run_step_attn_probe, MonolithicEncoderCache, StepKvAuditResult,
+    run_step_kv_audit, run_step_kv_mps_parity, run_step_kv_bf16_cross_parity,
+    run_step_attn_probe, MonolithicEncoderCache, StepKvAuditResult, StepKvBf16CrossResult,
     StepKvMpsParityResult,
 };
 pub use telemetry::{ForwardTelemetry, SessionTelemetry, StepPhaseTelemetry};

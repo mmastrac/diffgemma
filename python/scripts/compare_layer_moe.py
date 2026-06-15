@@ -106,12 +106,20 @@ def main() -> int:
         )
 
     ref_ln = ref.get("moe_out_ln") or []
+    cand_ln = cand.get("moe_out_ln") or []
     cand_moe = cand.get("moe_out") or []
-    if ref_ln and cand_moe:
+    if ref_ln and cand_ln:
+        s = vec_stats(ref_ln, cand_ln)
+        mark = "  <-- divergence" if s["cosine"] < 0.99 else ""
+        print(
+            f"  moe_out_ln  : cos={s['cosine']:.6f}  rel_l2={s['rel_l2']:.4f}  "
+            f"max_abs={s['max_abs']:.4f}{mark}"
+        )
+    elif ref_ln and cand_moe:
         s = vec_stats(ref_ln, cand_moe)
         print(
             f"  moe_out_ln vs cand.moe_out (pre-norm): cos={s['cosine']:.6f}  "
-            f"(MLX post_ff_ln_2 vs Rust pre-norm raw)"
+            f"(MLX post_ff_ln_2 vs Rust pre-norm raw; re-dump with moe_out_ln)"
         )
 
     for label, key in fields:
@@ -121,6 +129,29 @@ def main() -> int:
 
     if cliff:
         print(f"\nfirst checkpoint with cos < 0.99: {cliff}")
+
+    ref_logits = ref.get("router_logits") or []
+    cand_logits = cand.get("router_logits") or []
+    if ref_logits and cand_logits and len(ref_logits) == len(cand_logits):
+        s = vec_stats(ref_logits, cand_logits)
+        print(
+            f"  router_logits: cos={s['cosine']:.6f}  rel_l2={s['rel_l2']:.4f}  "
+            f"max_abs={s['max_abs']:.4f}"
+        )
+        border = sorted({53, 54, 120, 124, 6, 69, 102, 123} & set(ref_experts) & set(cand_experts))
+        border.extend([e for e in (53, 54, 120, 124) if e not in border])
+        print("  router logits (borderline / selected):")
+        for e in sorted(set(border)):
+            if e < len(ref_logits):
+                print(
+                    f"    expert {e:3d}: ref={ref_logits[e]:+.4f}  "
+                    f"cand={cand_logits[e]:+.4f}  d={cand_logits[e]-ref_logits[e]:+.4f}"
+                )
+        top_ref = sorted(range(len(ref_logits)), key=lambda i: (-ref_logits[i], i))[:10]
+        top_cand = sorted(range(len(cand_logits)), key=lambda i: (-cand_logits[i], i))[:10]
+        print(f"  top-10 experts ref:  {[(i, round(ref_logits[i], 4)) for i in top_ref]}")
+        print(f"  top-10 experts cand: {[(i, round(cand_logits[i], 4)) for i in top_cand]}")
+
     return 0
 
 

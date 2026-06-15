@@ -1,9 +1,8 @@
-//! GPU MoE router: RMSNorm → scale → linear → softmax → top-k.
+//! GPU MoE router: RMSNorm → scale → linear → top-k → softmax(top-k).
 
 use crate::config::TextConfig;
 use crate::metal::batched_kernels::{self as bk, f32_f32_linear_gpu_bufs};
 use crate::metal::batch::{set_bytes, GpuBatch};
-use crate::metal::embed::softmax_rows_gpu_buf;
 use crate::metal::kernels::GpuKernels;
 use crate::metal::weights::GpuLayerWeightCache;
 use crate::model::moe::RouteResult;
@@ -99,8 +98,6 @@ pub fn route_gpu_in_batch(
         hidden,
         experts,
     )?;
-    softmax_rows_gpu_buf(batch, kernels, &buf_logits, seq_len, experts);
-
     let buf_scale = batch.alloc_f32(cached.per_expert_scale.as_slice())?;
     let buf_idx = batch.alloc_u32_out(seq_len * top_k)?;
     let buf_wt = batch.alloc_f32_out(seq_len * top_k)?;

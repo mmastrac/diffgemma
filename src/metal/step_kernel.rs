@@ -1709,12 +1709,23 @@ impl StepEnc<'_> {
         }
     }
 
-    fn encode_layer_moe_post(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
+    fn encode_layer_moe_post_norm(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
         let l = &layout.layers[layer];
         self.rmsnorm_f32(A_MOEOUT, A_MOEIN, l.post_ff_ln_2, HID as u32, CANVAS);
+        Ok(())
+    }
+
+    fn encode_layer_moe_post_combine(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
+        let l = &layout.layers[layer];
         self.residual(A_DENSE, A_MOEIN, A_TMP, 0, CANVAS * HID);
         self.rmsnorm(A_TMP, A_TMP, l.post_ff_ln, HID as u32, CANVAS);
         self.residual(A_STREAM, A_TMP, A_HIDDEN, l.layer_scalar, CANVAS * HID);
+        Ok(())
+    }
+
+    fn encode_layer_moe_post(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
+        self.encode_layer_moe_post_norm(layer, layout)?;
+        self.encode_layer_moe_post_combine(layer, layout)?;
         Ok(())
     }
 
@@ -1787,8 +1798,8 @@ impl StepEnc<'_> {
         Ok(())
     }
 
-    /// Run one decoder layer through QK-RoPE-KV + attention only (stops before o_proj).
-    fn encode_layer_through_attention(
+    /// Input layernorm + Q/K/V projections only (stops before qk_rope_kv).
+    fn encode_layer_qkv_gemm(
         &mut self,
         layer: usize,
         layout: &ModelLayout,
@@ -1796,8 +1807,6 @@ impl StepEnc<'_> {
         let l = &layout.layers[layer];
         let q_n = if l.is_full != 0 { 8192 } else { 4096 };
         let k_n = if l.is_full != 0 { 1024 } else { 2048 };
-        let qk_y = (16 + 2 * l.n_kv_heads) as usize;
-        let layer_off = layer_byte_offset(layer);
 
         self.rmsnorm(A_HIDDEN, A_TMP, l.input_ln, HID as u32, CANVAS);
         self.gemm_q4(A_TMP, A_ATTNQ, l.q_proj, CANVAS as u32, q_n, HID as u32)?;
@@ -1805,6 +1814,18 @@ impl StepEnc<'_> {
         if l.v_proj != 0 {
             self.gemm_q4(A_TMP, A_ATTNV, l.v_proj, CANVAS as u32, k_n, HID as u32)?;
         }
+        Ok(())
+    }
+
+    /// QK-RoPE-KV write + attention (expects Q/K/V already in arena).
+    fn encode_layer_qk_rope_and_attention(
+        &mut self,
+        layer: usize,
+        layout: &ModelLayout,
+    ) -> Result<(), Error> {
+        let l = &layout.layers[layer];
+        let qk_y = (16 + 2 * l.n_kv_heads) as usize;
+        let layer_off = layer_byte_offset(layer);
 
         self.sink_set_pipeline(&self.ps.qk_rope_kv);
         unsafe {
@@ -1858,6 +1879,16 @@ impl StepEnc<'_> {
         };
         self.sink_dispatch(grid, tg);
         Ok(())
+    }
+
+    /// Run one decoder layer through QK-RoPE-KV + attention only (stops before o_proj).
+    fn encode_layer_through_attention(
+        &mut self,
+        layer: usize,
+        layout: &ModelLayout,
+    ) -> Result<(), Error> {
+        self.encode_layer_qkv_gemm(layer, layout)?;
+        self.encode_layer_qk_rope_and_attention(layer, layout)
     }
 
     fn dispatch_embed_gather(&mut self, embed_off: u64) {
@@ -3189,6 +3220,8 @@ pub struct LayerAttnCapture {
     pub is_full: bool,
     pub hidden_in: Vec<f32>,
     pub hidden_ln: Vec<f32>,
+    pub q_raw_proj: Vec<f32>,
+    pub q_pre_rope: Vec<f32>,
     pub q_post_rope: Vec<f32>,
     pub attn_out: Vec<f32>,
     pub raw_scores: Vec<f32>,
@@ -3290,7 +3323,7 @@ pub fn run_step_attn_layer_capture(
     let hidden_in = read_arena_hidden_row(&rt.bufs.arena, A_HIDDEN, position);
 
     rt.dispatch_and_wait(|enc| {
-        enc.encode_layer_through_attention(layer, &layout)?;
+        enc.encode_layer_qkv_gemm(layer, &layout)?;
         Ok(())
     })?;
 
@@ -3303,6 +3336,24 @@ pub fn run_step_attn_layer_capture(
     let total_kv = kv_len as usize + CANVAS;
 
     let hidden_ln = read_arena_hidden_row(&rt.bufs.arena, A_TMP, position);
+    let q_raw_proj = read_arena_row(&rt.bufs.arena, A_ATTNQ, position, q_width);
+    let q_norm_w = DgqStore::open(model_dir)?
+        .tensor_f32(&format!("model.decoder.layers.{layer}.self_attn.q_norm.weight"))?;
+    let mut q_pre_rope = q_raw_proj.clone();
+    for h in 0..n_heads {
+        let off = h * hd;
+        crate::kernels::cpu::attention::rms_norm_head(
+            &mut q_pre_rope[off..off + hd],
+            Some(&q_norm_w),
+            crate::kernels::cpu::attention::RMS_EPS,
+        );
+    }
+
+    rt.dispatch_and_wait(|enc| {
+        enc.encode_layer_qk_rope_and_attention(layer, &layout)?;
+        Ok(())
+    })?;
+
     let q_all = read_half_buffer_f32(&rt.bufs.arena, A_ATTNQ as usize, CANVAS * q_width);
     let q_post_rope = read_arena_row(&rt.bufs.arena, A_ATTNQ, position, q_width);
     let attn_out = read_arena_row(&rt.bufs.arena, A_ATTNO, position, q_width);
@@ -3337,6 +3388,8 @@ pub fn run_step_attn_layer_capture(
         is_full: l.is_full != 0,
         hidden_in,
         hidden_ln,
+        q_raw_proj,
+        q_pre_rope,
         q_post_rope,
         attn_out,
         raw_scores,
@@ -3354,9 +3407,12 @@ pub struct LayerMoeCapture {
     pub kv_len: u32,
     pub post_attn: Vec<f32>,
     pub dense_out: Vec<f32>,
+    pub router_logits: Vec<f32>,
     pub experts: Vec<u32>,
     pub expert_weights: Vec<u16>,
     pub moe_out: Vec<f32>,
+    /// MoE output after `post_ff_ln_2` (matches MLX `moe_out_ln`).
+    pub moe_out_ln: Vec<f32>,
     pub layer_out: Vec<f32>,
 }
 
@@ -3409,6 +3465,78 @@ fn read_f32_arena_row(
     let byte_off = base as usize + row * width * 4;
     let ptr = unsafe { arena.contents().as_ptr().add(byte_off) as *const f32 };
     (0..width).map(|i| unsafe { *ptr.add(i) }).collect()
+}
+
+fn rebucket_route_scratch(route: &mut RouteScratch) {
+    let experts: Vec<Vec<u32>> = route.expert.iter().map(|row| row.to_vec()).collect();
+    let state = crate::kernels::cpu::moe_router::moe_bucket_phases(
+        &experts,
+        N_EXPERTS as u32,
+        TOP_K as u32,
+    );
+    route.count = [0; N_EXPERTS];
+    for e in 0..N_EXPERTS {
+        route.row_start[e] = state.offset[e];
+    }
+    route.row_start[N_EXPERTS] = state.num_slots;
+    route.num_slots = state.num_slots;
+    for (i, &tok) in state.token_list.iter().enumerate() {
+        route.token_list[i] = tok;
+        route.slot_list[i] = state.slot_list[i];
+    }
+}
+
+fn patch_route_position(
+    route: &mut RouteScratch,
+    position: usize,
+    experts: &[u32],
+    weights: &[u16],
+) {
+    assert!(position < CANVAS);
+    for k in 0..TOP_K {
+        route.expert[position][k] = experts[k];
+        route.weight[position][k] = weights[k];
+    }
+    rebucket_route_scratch(route);
+}
+
+fn f32_to_f16_bits(v: f32) -> u16 {
+    crate::kernels::sub::f16::f32_to_f16_bits(v)
+}
+
+fn route_override_from_ref_json(
+    path: &Path,
+    position: usize,
+) -> Result<Option<(Vec<u32>, Vec<u16>)>, Error> {
+    let text = std::fs::read_to_string(path).map_err(Error::Io)?;
+    let doc: serde_json::Value = serde_json::from_str(&text).map_err(Error::Json)?;
+    if doc.get("position").and_then(|v| v.as_u64()) != Some(position as u64) {
+        return Ok(None);
+    }
+    let experts: Vec<u32> = doc
+        .get("experts")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| Error::Format("route ref missing experts"))?
+        .iter()
+        .map(|v| v.as_u64().unwrap_or(0) as u32)
+        .collect();
+    let weights: Vec<u16> = doc
+        .get("expert_weights")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| Error::Format("route ref missing expert_weights"))?
+        .iter()
+        .map(|v| {
+            if let Some(n) = v.as_u64() {
+                n as u16
+            } else {
+                f32_to_f16_bits(v.as_f64().unwrap_or(0.0) as f32)
+            }
+        })
+        .collect();
+    if experts.len() != TOP_K || weights.len() != TOP_K {
+        return Err(Error::Format("route ref experts/weights must be top_k"));
+    }
+    Ok(Some((experts, weights)))
 }
 
 fn read_route_at_position(
@@ -3742,19 +3870,45 @@ pub fn run_step_moe_layer_capture(
     })?;
     let post_attn = read_arena_hidden_row(&rt.bufs.arena, A_STREAM, position);
 
+    let store = DgqStore::open(model_dir)?;
+    let p = format!("model.decoder.layers.{layer}.router");
+    let router_scale = store.tensor_f32(&format!("{p}.scale"))?;
+    let router_proj = store.tensor_f32(&format!("{p}.proj.weight"))?;
+    let router_logits = crate::kernels::cpu::moe_router::router_logits_row(
+        &post_attn,
+        &router_scale,
+        &router_proj,
+        HID,
+        N_EXPERTS,
+    );
+
     rt.dispatch_and_wait(|enc| enc.encode_layer_dense_ffn(layer, &layout))?;
     let dense_out = read_arena_hidden_row(&rt.bufs.arena, A_DENSE, position);
 
-    rt.dispatch_and_wait(|enc| {
-        enc.encode_layer_router_buckets(layer, &layout)?;
-        enc.encode_layer_moe_grouped(layer, &layout)?;
-        Ok(())
-    })?;
+    rt.dispatch_and_wait(|enc| enc.encode_layer_router_buckets(layer, &layout))?;
+
+    if let Ok(path) = std::env::var("DGQ_MOE_ROUTE_REF") {
+        if let Some((experts, weights)) =
+            route_override_from_ref_json(Path::new(&path), position)?
+        {
+            let mut route: RouteScratch = read_struct(&rt.bufs.route);
+            patch_route_position(&mut route, position, &experts, &weights);
+            write_struct(&rt.bufs.route, &route);
+            eprintln!(
+                "moe-capture: route override pos={position} experts={experts:?} (from {path})"
+            );
+        }
+    }
+
+    rt.dispatch_and_wait(|enc| enc.encode_layer_moe_grouped(layer, &layout))?;
     let (experts, expert_weights) = read_route_at_position(&rt.bufs.route, position);
 
     let moe_out = read_f32_arena_row(&rt.bufs.arena, A_MOEOUT, position, HID);
 
-    rt.dispatch_and_wait(|enc| enc.encode_layer_moe_post(layer, &layout))?;
+    rt.dispatch_and_wait(|enc| enc.encode_layer_moe_post_norm(layer, &layout))?;
+    let moe_out_ln = read_arena_hidden_row(&rt.bufs.arena, A_MOEIN, position);
+
+    rt.dispatch_and_wait(|enc| enc.encode_layer_moe_post_combine(layer, &layout))?;
     let layer_out = read_arena_hidden_row(&rt.bufs.arena, A_HIDDEN, position);
 
     let state = rt.read_canvas_state();
@@ -3766,9 +3920,11 @@ pub fn run_step_moe_layer_capture(
         kv_len: rt.read_params().kv_len,
         post_attn,
         dense_out,
+        router_logits,
         experts,
         expert_weights,
         moe_out,
+        moe_out_ln,
         layer_out,
     })
 }
@@ -3938,10 +4094,35 @@ pub struct StepForwardOutput {
 /// Forward-only monolithic pass: final norm hidden + softcapped logits.
 pub fn run_step_forward(model_dir: &Path, cfg: &StepSmokeConfig) -> Result<StepForwardOutput, Error> {
     let (mut rt, _) = build_step_runtime(model_dir, cfg)?;
-    rt.run_forward_once(StepFinishMode::ForwardOnly)?;
+    let layout = rt.layout;
+    let layers = rt.layers;
+    let st_before: CanvasState = read_struct(&rt.bufs.state);
+    let first_step = if st_before.step == 0 { 1u32 } else { 0u32 };
+
+    rt.dispatch_and_wait(|enc| enc.encode_step_preamble(&layout, first_step))?;
+    for layer in 0..layers {
+        rt.dispatch_and_wait(|enc| enc.encode_full_layer(layer, &layout))?;
+    }
+    // Snapshot final norm before lm_head; gemm_q8_logits clobbers A_TMP on GPU.
+    rt.dispatch_and_wait(|enc| {
+        enc.rmsnorm(A_HIDDEN, A_TMP, layout.final_norm, HID as u32, CANVAS);
+        Ok(())
+    })?;
+    let norm_hidden = read_half_buffer_f32(&rt.bufs.arena, A_TMP as usize, CANVAS * HID);
+    rt.dispatch_and_wait(|enc| {
+        enc.gemm_q8_logits(
+            A_TMP,
+            layout.embed,
+            CANVAS as u32,
+            VOCAB as u32,
+            HID as u32,
+        )?;
+        enc.dispatch_softcap();
+        Ok(())
+    })?;
     let state: CanvasState = read_struct(&rt.bufs.state);
     Ok(StepForwardOutput {
-        norm_hidden: read_half_buffer_f32(&rt.bufs.arena, A_TMP as usize, CANVAS * HID),
+        norm_hidden,
         logits: read_half_buffer_f32(&rt.bufs.logits, 0, CANVAS * VOCAB),
         token_ids: state.ids.to_vec(),
     })

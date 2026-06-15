@@ -1,7 +1,7 @@
 //! CPU reference for monolithic MoE router + expert bucketing.
 
-use crate::kernels::cpu::{linear, rms_norm_no_scale, softmax_rows};
-use crate::model::moe::top_k_route;
+use crate::kernels::cpu::{linear, rms_norm_no_scale};
+use crate::model::moe::top_k_route_from_raw_logits;
 
 pub const RMS_EPS: f32 = 1e-6;
 
@@ -54,17 +54,43 @@ pub fn moe_router_rows(
         hidden,
         experts,
     );
-    softmax_rows(&mut logits, canvas, experts);
     let mut out = Vec::with_capacity(canvas);
     for tok in 0..canvas {
         let row = &logits[tok * experts..(tok + 1) * experts];
-        let route = top_k_route(row, top_k, per_expert_scale);
+        let route = top_k_route_from_raw_logits(row, top_k, per_expert_scale);
         out.push(RouteRow {
             experts: route.indices.iter().map(|&i| i as u32).collect(),
             weights: route.weights,
         });
     }
     out
+}
+
+/// Raw router logits for one canvas row (before top-k / softmax).
+pub fn router_logits_row(
+    stream_row: &[f32],
+    router_scale: &[f32],
+    router_proj: &[f32],
+    hidden: usize,
+    n_experts: usize,
+) -> Vec<f32> {
+    let hscale = (hidden as f32).powf(-0.5);
+    let mut normed = vec![0.0f32; hidden];
+    rms_norm_no_scale(&mut normed, stream_row, RMS_EPS);
+    for d in 0..hidden {
+        normed[d] *= router_scale[d] * hscale;
+    }
+    let mut logits = vec![0.0f32; n_experts];
+    linear(
+        &mut logits,
+        &normed,
+        router_proj,
+        None,
+        1,
+        hidden,
+        n_experts,
+    );
+    logits
 }
 
 #[derive(Debug, Clone)]

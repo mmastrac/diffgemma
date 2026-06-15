@@ -347,6 +347,7 @@ fn forward_layer_ff_dgq_gpu(
                 &engine.f32_q4_linear_pipeline,
                 &engine.f32_nvfp4_linear_pipeline,
                 &engine.f32_q4_linear_grouped_pipeline,
+                &engine.f32_nvfp4_linear_grouped_pipeline,
                 telemetry,
             )?;
         } else {
@@ -545,6 +546,7 @@ fn forward_layer_ff_bf16(
         &engine.f32_q4_linear_pipeline,
         &engine.f32_nvfp4_linear_pipeline,
         &engine.f32_q4_linear_grouped_pipeline,
+        &engine.f32_nvfp4_linear_grouped_pipeline,
         telemetry,
     )?;
 

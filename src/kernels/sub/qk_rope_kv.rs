@@ -132,6 +132,42 @@ pub fn full_attn_v_alias_fixture(fmt: ElemFormat) -> Fixture {
     f
 }
 
+/// Full-attention hd=512 (production full layers) with V-alias.
+pub fn full_hd512_v_alias_fixture(fmt: ElemFormat) -> Fixture {
+    let canvas = 1usize;
+    let n_q_heads = 16usize;
+    let n_kv = 2usize;
+    let hd = 512usize;
+    let kv_len = 22u32;
+    let q_len = canvas * n_q_heads * hd;
+    let kv_len_flat = canvas * n_kv * hd;
+    Fixture {
+        q: (0..q_len)
+            .map(|i| ((i as f32 * 0.031).sin() * 0.55))
+            .collect(),
+        k: (0..kv_len_flat)
+            .map(|i| ((i as f32 * 0.029).cos() * 0.48))
+            .collect(),
+        v: vec![0.0; kv_len_flat],
+        kvcache: vec![0.0; (kv_len as usize + canvas) * n_kv * hd * 2],
+        q_norm_w: (0..hd).map(|i| 1.0 + (i as f32 * 0.0001)).collect(),
+        k_norm_w: (0..hd).map(|i| 1.0 - (i as f32 * 0.00005)).collect(),
+        layer: LayerAttnParams {
+            head_dim: hd as u32,
+            n_kv_heads: n_kv as u32,
+            is_full: true,
+            v_proj: 0,
+            kv_region: 0,
+            q_norm_off: 0,
+            k_norm_off: (hd * 2) as u64,
+        },
+        canvas,
+        n_q_heads,
+        kv_len,
+        v_proj: 0,
+    }
+}
+
 fn layer_offsets(f: &Fixture) -> LayerOffsets {
     LayerOffsets {
         input_ln: 0,
@@ -367,5 +403,17 @@ mod tests {
         formats: [F32],
         max_tol = 1e-2,
         min_cos = 0.9999,
+    }
+
+    kernel_oracle_matrix! {
+        mod full_hd512_v_alias,
+        cpu = crate::kernels::sub::qk_rope_kv::cpu,
+        cpu_oracle = crate::kernels::sub::qk_rope_kv::cpu_oracle,
+        gpu = crate::kernels::sub::qk_rope_kv::gpu,
+        fixture = crate::kernels::sub::qk_rope_kv::full_hd512_v_alias_fixture,
+        out_len = crate::kernels::sub::qk_rope_kv::fixture_len,
+        formats: [F32],
+        max_tol = 2e-2,
+        min_cos = 0.999,
     }
 }
