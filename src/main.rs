@@ -1399,18 +1399,17 @@ fn run_step_moe_batched_pin_dump_cmd(
                 return ExitCode::FAILURE;
             }
             println!(
-                "wrote {} (layer={}, gather_cos={:.6}, gate_up_cos={:.6}, down_cos={:.6}, scatter_cos={:.6})",
+                "wrote {} (layer={}, gate_up_gemm_cos={:.6}, swiglu_post_cos={:.6}, swiglu_isolated_cos={:.6})",
                 output.display(),
                 dump.layer,
-                dump.stages.gather,
-                dump.stages.gate_up,
-                dump.stages.down,
-                dump.stages.scatter,
+                dump.stages.gate_up_gemm,
+                dump.stages.swiglu_post,
+                dump.stages.swiglu_isolated,
             );
             let fail_stage = [
-                ("gather", dump.stages.gather),
-                ("gate_up", dump.stages.gate_up),
-                ("swiglu", dump.stages.swiglu),
+                ("gate_up_gemm", dump.stages.gate_up_gemm),
+                ("swiglu_post", dump.stages.swiglu_post),
+                ("swiglu_isolated", dump.stages.swiglu_isolated),
                 ("down", dump.stages.down),
                 ("scatter", dump.stages.scatter),
             ]

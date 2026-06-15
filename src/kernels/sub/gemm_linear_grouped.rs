@@ -97,16 +97,22 @@ pub fn fixture_len(f: &Fixture) -> usize {
     f.out_len()
 }
 
+/// One expert with M=100 (>32 M-tile stress) plus a smaller second expert.
 pub fn tiny_fixture_q4(_: ElemFormat) -> Fixture {
-    grouped_fixture(QuantFormat::Q4Affine, 64, 32, &[2, 2])
+    grouped_fixture(QuantFormat::Q4Affine, 64, 32, &[100, 4])
 }
 
 pub fn tiny_fixture_nvfp4(_: ElemFormat) -> Fixture {
-    grouped_fixture(QuantFormat::NvFp4, 64, 32, &[2, 2])
+    grouped_fixture(QuantFormat::NvFp4, 64, 32, &[100, 4])
+}
+
+/// M=100 with N/K=128. Scalar grouped path tiles M via `grid.height = total_m` (no in-kernel M cap).
+pub fn tile_fixture_q4(_: ElemFormat) -> Fixture {
+    grouped_fixture(QuantFormat::Q4Affine, 128, 128, &[100, 48, 4])
 }
 
 pub fn tile_fixture_nvfp4(_: ElemFormat) -> Fixture {
-    grouped_fixture(QuantFormat::NvFp4, 128, 128, &[8, 12, 4])
+    grouped_fixture(QuantFormat::NvFp4, 128, 128, &[100, 48, 4])
 }
 
 pub(crate) fn grouped_fixture(
@@ -433,6 +439,18 @@ mod tests {
     }
 
     kernel_oracle_matrix! {
+        mod tile_q4,
+        cpu = crate::kernels::sub::gemm_linear_grouped::cpu,
+        cpu_oracle = crate::kernels::sub::gemm_linear_grouped::cpu_oracle,
+        gpu = crate::kernels::sub::gemm_linear_grouped::gpu_q4,
+        fixture = crate::kernels::sub::gemm_linear_grouped::tile_fixture_q4,
+        out_len = crate::kernels::sub::gemm_linear_grouped::fixture_len,
+        formats: [F32],
+        max_tol = 0.05,
+        min_cos = 0.999,
+    }
+
+    kernel_oracle_matrix! {
         mod tile_nvfp4,
         cpu = crate::kernels::sub::gemm_linear_grouped::cpu,
         cpu_oracle = crate::kernels::sub::gemm_linear_grouped::cpu_oracle,
@@ -454,6 +472,8 @@ mod tests {
         for fixture_fn in [
             gemm_block_grouped::tiny_fixture_nvfp4 as fn(_) -> _,
             gemm_block_grouped::tile_fixture_nvfp4,
+            tiny_fixture_nvfp4,
+            tile_fixture_nvfp4,
         ] {
             let fix = fixture_fn(ElemFormat::F32);
             let tiled = gemm_block_grouped::gpu_nvfp4(&fix, KernelVariant::PRODUCTION)

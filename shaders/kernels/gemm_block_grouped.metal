@@ -66,53 +66,56 @@ kernel void gemm_block_grouped(
         rowB = q4_row_bytes(K);
     }
 
-    simdgroup_float8x8 acc0(0.f), acc1(0.f), acc2(0.f), acc3(0.f);
+    for (uint m_base = 0u; m_base < M; m_base += 32u) {
+        const uint M_tile = min(32u, M - m_base);
+        simdgroup_float8x8 acc0(0.f), acc1(0.f), acc2(0.f), acc3(0.f);
 
-    for (uint k0 = 0u; k0 < K; k0 += 32u) {
+        for (uint k0 = 0u; k0 < K; k0 += 32u) {
+            for (uint i = ltid; i < 32u * 32u; i += 128u) {
+                const uint mm = i / 32u;
+                const uint kk = i % 32u;
+                tx[mm][kk] = (mm < M_tile)
+                    ? half(a[(ulong)(m0 + m_base + mm) * K + k0 + kk])
+                    : half(0);
+            }
+            for (uint r = ltid; r < 32u; r += 128u) {
+                if (is_nvfp4) {
+                    device const uchar *row = blob + body + (ulong)(n0 + r) * rowB;
+                    dequant_nvfp4_tile_half_fused_tg(row, K, k0, &tw[r][0], gscale);
+                } else {
+                    dequant_q4_group_half_tg(
+                        blob + body + (ulong)(n0 + r) * rowB + (ulong)(k0 / 32u) * 20ul,
+                        &tw[r][0]);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint kk = 0u; kk < 32u; kk += 8u) {
+                simdgroup_half8x8 a_tile, b0, b1, b2, b3;
+                simdgroup_load(a_tile, &tx[8u * sgid][kk], 32);
+                simdgroup_load(b0, &tw[0][kk], 32, ulong2(0, 0), true);
+                simdgroup_load(b1, &tw[8][kk], 32, ulong2(0, 0), true);
+                simdgroup_load(b2, &tw[16][kk], 32, ulong2(0, 0), true);
+                simdgroup_load(b3, &tw[24][kk], 32, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(acc0, a_tile, b0, acc0);
+                simdgroup_multiply_accumulate(acc1, a_tile, b1, acc1);
+                simdgroup_multiply_accumulate(acc2, a_tile, b2, acc2);
+                simdgroup_multiply_accumulate(acc3, a_tile, b3, acc3);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        threadgroup float ty[32][32];
+        simdgroup_store(acc0, &ty[8u * sgid][0], 32);
+        simdgroup_store(acc1, &ty[8u * sgid][8], 32);
+        simdgroup_store(acc2, &ty[8u * sgid][16], 32);
+        simdgroup_store(acc3, &ty[8u * sgid][24], 32);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint i = ltid; i < 32u * 32u; i += 128u) {
             const uint mm = i / 32u;
-            const uint kk = i % 32u;
-            tx[mm][kk] = (mm < M)
-                ? half(a[(ulong)(m0 + mm) * K + k0 + kk])
-                : half(0);
-        }
-        for (uint r = ltid; r < 32u; r += 128u) {
-            if (is_nvfp4) {
-                device const uchar *row = blob + body + (ulong)(n0 + r) * rowB;
-                dequant_nvfp4_tile_half_fused_tg(row, K, k0, &tw[r][0], gscale);
-            } else {
-                dequant_q4_group_half_tg(
-                    blob + body + (ulong)(n0 + r) * rowB + (ulong)(k0 / 32u) * 20ul,
-                    &tw[r][0]);
+            const uint nn = i % 32u;
+            if (mm < M_tile && n0 + nn < N) {
+                c[(ulong)(m0 + m_base + mm) * N + n0 + nn] = ty[mm][nn];
             }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint kk = 0u; kk < 32u; kk += 8u) {
-            simdgroup_half8x8 a_tile, b0, b1, b2, b3;
-            simdgroup_load(a_tile, &tx[8u * sgid][kk], 32);
-            simdgroup_load(b0, &tw[0][kk], 32, ulong2(0, 0), true);
-            simdgroup_load(b1, &tw[8][kk], 32, ulong2(0, 0), true);
-            simdgroup_load(b2, &tw[16][kk], 32, ulong2(0, 0), true);
-            simdgroup_load(b3, &tw[24][kk], 32, ulong2(0, 0), true);
-            simdgroup_multiply_accumulate(acc0, a_tile, b0, acc0);
-            simdgroup_multiply_accumulate(acc1, a_tile, b1, acc1);
-            simdgroup_multiply_accumulate(acc2, a_tile, b2, acc2);
-            simdgroup_multiply_accumulate(acc3, a_tile, b3, acc3);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    threadgroup float ty[32][32];
-    simdgroup_store(acc0, &ty[8u * sgid][0], 32);
-    simdgroup_store(acc1, &ty[8u * sgid][8], 32);
-    simdgroup_store(acc2, &ty[8u * sgid][16], 32);
-    simdgroup_store(acc3, &ty[8u * sgid][24], 32);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = ltid; i < 32u * 32u; i += 128u) {
-        const uint mm = i / 32u;
-        const uint nn = i % 32u;
-        if (mm < M && n0 + nn < N) {
-            c[(ulong)(m0 + mm) * N + n0 + nn] = ty[mm][nn];
         }
     }
 }

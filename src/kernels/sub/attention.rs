@@ -111,6 +111,57 @@ pub fn wide_fixture(_: ElemFormat) -> Fixture {
     }
 }
 
+fn model_attn_fixture(
+    canvas: usize,
+    n_q_heads: usize,
+    n_kv: usize,
+    hd: usize,
+    kv_len: u32,
+    is_full: bool,
+) -> Fixture {
+    assert_eq!(n_q_heads % n_kv, 0);
+    let t_total = kv_len as usize + canvas;
+    let mut kvcache = vec![0.0f32; t_total * n_kv * hd * 2];
+    for t in 0..t_total {
+        for h in 0..n_kv {
+            for d in 0..hd {
+                let k_i = t * n_kv * hd * 2 + h * hd + d;
+                let v_i = k_i + n_kv * hd;
+                kvcache[k_i] = ((t * 19 + h * 7 + d) as f32 * 0.0031).sin() * 0.4;
+                kvcache[v_i] = ((t * 23 + h * 11 + d) as f32 * 0.0027).cos() * 0.35;
+            }
+        }
+    }
+    Fixture {
+        q: (0..canvas * n_q_heads * hd)
+            .map(|i| ((i as f32 * 0.017).sin() * 0.5 + 0.02 * (i % hd) as f32))
+            .collect(),
+        kvcache,
+        layer: LayerAttnParams {
+            head_dim: hd as u32,
+            n_kv_heads: n_kv as u32,
+            is_full,
+            v_proj: if is_full { 0 } else { 1 },
+            kv_region: 0,
+            q_norm_off: 0,
+            k_norm_off: 0,
+        },
+        canvas,
+        n_q_heads,
+        kv_len,
+    }
+}
+
+/// Full-attention layer: hd=512, tpg_w=64 → per=8 (exact `acc[8]` fit).
+pub fn full_hd512_fixture(_: ElemFormat) -> Fixture {
+    model_attn_fixture(4, 16, 8, 512, 28, true)
+}
+
+/// Sliding layer: hd=256, per=4; longer KV (kv_len=128) exercises runtime T loop.
+pub fn sliding_hd256_fixture(_: ElemFormat) -> Fixture {
+    model_attn_fixture(4, 16, 8, 256, 128, false)
+}
+
 fn layer_offsets(f: &Fixture) -> LayerOffsets {
     LayerOffsets {
         input_ln: 0,
@@ -287,6 +338,30 @@ mod tests {
         cpu_oracle = crate::kernels::sub::attention::cpu_oracle,
         gpu = crate::kernels::sub::attention::gpu,
         fixture = crate::kernels::sub::attention::wide_fixture,
+        out_len = crate::kernels::sub::attention::fixture_len,
+        formats: [F32],
+        max_tol = 2e-2,
+        min_cos = 0.9999,
+    }
+
+    kernel_oracle_matrix! {
+        mod full_hd512,
+        cpu = crate::kernels::sub::attention::cpu,
+        cpu_oracle = crate::kernels::sub::attention::cpu_oracle,
+        gpu = crate::kernels::sub::attention::gpu,
+        fixture = crate::kernels::sub::attention::full_hd512_fixture,
+        out_len = crate::kernels::sub::attention::fixture_len,
+        formats: [F32],
+        max_tol = 2e-2,
+        min_cos = 0.9999,
+    }
+
+    kernel_oracle_matrix! {
+        mod sliding_hd256,
+        cpu = crate::kernels::sub::attention::cpu,
+        cpu_oracle = crate::kernels::sub::attention::cpu_oracle,
+        gpu = crate::kernels::sub::attention::gpu,
+        fixture = crate::kernels::sub::attention::sliding_hd256_fixture,
         out_len = crate::kernels::sub::attention::fixture_len,
         formats: [F32],
         max_tol = 2e-2,

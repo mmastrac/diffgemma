@@ -63,7 +63,7 @@ Never fork a kernel into `k_foo`, `k_foo_fp8`, `k_foo_debug`, `k_foo_mps`. Forks
 The tests were slow *and* missed the bugs because they ran whole pipelines to exercise small logic. Fix both at once by pushing assertions to the smallest unit with the smallest fixture.
 
 **Tier 1 — per-kernel unit tests. Synthetic, blob-free, milliseconds. Run on every save.**
-One test per kernel against a CPU transliteration of *that kernel*, on a tiny hand-built fixture (e.g. 2 experts, 64 hidden, 4 tokens) — **never the 15 GiB blob**. The moment a "unit" test mmaps the real model it leaves the inner loop. This tier catches the entire class of bugs that took multi-turn hunts (route resolution, decode K-order, transpose, grid collapse) in milliseconds. Every kernel has a permanent CPU twin; the twin is the oracle forever. Promote ad-hoc hunt transliterations (e.g. the MoE mirror) into permanent Tier-1 references.
+One test per kernel against a CPU transliteration of *that kernel*, on a tiny hand-built fixture (e.g. 2 experts, M up to 100 routed rows, 64 hidden) — **never the 15 GiB blob**. The moment a "unit" test mmaps the real model it leaves the inner loop. This tier catches the entire class of bugs that took multi-turn hunts (route resolution, decode K-order, transpose, grid collapse, **grouped M>32 truncation**) in milliseconds. Every kernel has a permanent CPU twin; the twin is the oracle forever. Promote ad-hoc hunt transliterations (e.g. the MoE mirror) into permanent Tier-1 references. For grouped MoE: `rows_per_expert` must include **>32** for `gemm_block_grouped` (M striped in-kernel); `gemm_linear_grouped` tiles M via `grid.height` but still benefits from realistic counts for cross-kernel parity tests.
 
 **Tier 2 — staged comparison. Real weights, reduced stages, flagged dump depth. Seconds. On demand / pre-push.**
 2–3 layers, 1 step, intermediate-dump ON, comparing GPU vs CPU (vs MLX where available) at each stage. Catches *integration* bugs between correct kernels — wrong wiring, wrong buffer, stale read — that unit tests can't. Bounded (few layers/steps), not the full matrix.
@@ -89,6 +89,14 @@ Property assertions need no oracle and catch the "catastrophic but novel" class 
 - **Not all-pad / all-filler** on a converged block before early-stop fires. (The premature-commit quality bug.)
 - **Offsets in `ulong`** for all blob addressing — the blob exceeds uint32; a uint intermediate truncates silently.
 - **Quant K-order:** sequential `dequant_q4_group[m]` == `q4_weight_at(row, base+m)` in K-order, not just as a set (VERIFY-K — the blind spot that hid behind VERIFY-N).
+- **Tile-bound dimensions:** For every kernel, list each compile-time tile (32, 64, 128, 65535 grid width) and ask whether a **data-dependent** dimension can exceed it. If yes, there must be either **grid tiling** (`gemm_block`: `m0 = tgid.y * 32`), an **in-kernel striping loop** (`gemm_block_grouped`: `m_base += 32`), or **`dispatch_1d_ranged`** for grid overflow. Tier-1 fixtures must exceed the worst tile (e.g. `rows_per_expert ≥ 33`). See `NOTES.md` §5 tile audit.
+
+**Three states of this bug class in the codebase:**
+1. **Firing** — fixed array/tile vs data index overflows today (`gemm_block_grouped` M≤32 per expert; Calgary gate_up cos≈0.76).
+2. **Exact-fit fragile** — correct at current config, zero margin (`attention` `acc[8]` when `hd=512` and `tpg_w=64` gives `per=8` exactly; `K_SHAPE_ASSERT per≤8` added).
+3. **Ranged correctly** — dimension can grow unbounded via loop or ranged dispatch (`attention` KV loop `0..T`; vocab via `dispatch_1d_ranged`).
+
+**Mechanical audit:** grep for fixed-size threadgroup/private arrays (`float acc[N]`, `threadgroup float x[N]`) and check whether any index is runtime-bounded by a value that can exceed `N`. That catches `acc[8]`, `red[8]`, and siblings in one pass.
 
 ---
 

@@ -10,16 +10,18 @@ kernel void gather_rows(
     constant uint2 &dims [[buffer(3)]],
     constant uint &batch_size [[buffer(4)]],
     device float *dump [[buffer(5)]],
+    constant uint &elem_base [[buffer(6)]],
     uint gid [[thread_position_in_grid]]
 ) {
     uint hidden = dims.y;
-    uint bi = gid / hidden;
-    uint h = gid % hidden;
+    uint elem = elem_base + gid;
+    uint bi = elem / hidden;
+    uint h = elem % hidden;
     if (K_SHAPE_ASSERT && (hidden == 0u || batch_size == 0u)) return;
     if (bi >= batch_size) return;
     K_ELEMENTWISE_GUARD();
     uint tok = indices[bi];
     float v = src[tok * hidden + h];
     if (K_DUMP_STAGE >= 1u) dump[gid] = float(tok);
-    dst[bi * hidden + h] = v;
+    dst[elem] = v;
 }

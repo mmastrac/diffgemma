@@ -257,6 +257,40 @@ pub fn build_offsets_from_store(store: &DgqStore) -> HashMap<String, u64> {
     offsets
 }
 
+/// Per-expert weight byte offset from `.dgq` manifest (stack base + expert × matrix bytes).
+pub fn manifest_offset(
+    offsets: &HashMap<String, u64>,
+    layer: usize,
+    expert: usize,
+    kind: &str,
+    format: QuantFormat,
+) -> u64 {
+    use crate::dgq::layout::{nvfp4_matrix_bytes, q4_matrix_bytes};
+    let hidden = HID;
+    let moe_ff = MOE_FF as usize;
+    let (tensor, n, k) = match kind {
+        "gate_up" => (
+            format!("model.decoder.layers.{layer}.experts.gate_up_proj"),
+            moe_ff * 2,
+            hidden,
+        ),
+        "down" => (
+            format!("model.decoder.layers.{layer}.experts.down_proj"),
+            hidden,
+            moe_ff,
+        ),
+        _ => panic!("manifest_offset: unknown kind {kind:?}"),
+    };
+    let base = *offsets
+        .get(&tensor)
+        .unwrap_or_else(|| panic!("manifest_offset: missing tensor {tensor}"));
+    let stride = match format {
+        QuantFormat::NvFp4 => nvfp4_matrix_bytes(n, k) as u64,
+        _ => q4_matrix_bytes(n, k) as u64,
+    };
+    base + expert as u64 * stride
+}
+
 pub fn build_layout(offsets: &HashMap<String, u64>, max_seq: usize) -> ModelLayout {
     let g = |n: &str| *offsets.get(n).unwrap_or_else(|| panic!("missing tensor {n}"));
     let opt = |n: &str| offsets.get(n).copied().unwrap_or(0);
@@ -689,6 +723,7 @@ struct StepEnc<'a> {
     use_mps_q4: bool,
     block_profile: StepBlockProfile,
     use_sc_gemm: bool,
+    tensor_offsets: &'a HashMap<String, u64>,
     recorder: Option<&'a mut crate::metal::step_icb::IcbRecorder>,
 }
 
@@ -719,12 +754,13 @@ pub fn layer_moe_block_jobs(
     l: &LayerOffsets,
     format: QuantFormat,
 ) -> ([BlockGroupedJob; N_EXPERTS], [BlockGroupedJob; N_EXPERTS]) {
-    layer_moe_block_jobs_impl(l, format)
+    layer_moe_block_jobs_impl(l, format, None)
 }
 
 fn layer_moe_block_jobs_impl(
     l: &LayerOffsets,
     format: QuantFormat,
+    manifest: Option<(usize, &HashMap<String, u64>)>,
 ) -> ([BlockGroupedJob; N_EXPERTS], [BlockGroupedJob; N_EXPERTS]) {
     use crate::dgq::layout::{nvfp4_matrix_bytes, q4_matrix_bytes};
     let hidden = HID as usize;
@@ -756,6 +792,13 @@ fn layer_moe_block_jobs_impl(
     for e in 0..N_EXPERTS {
         gate[e].w_byte_off = l.experts_gate_up + (e as u64) * gu_stride;
         down[e].w_byte_off = l.experts_down + (e as u64) * dn_stride;
+        if let Some((layer, offsets)) = manifest {
+            debug_assert_eq!(
+                gate[e].w_byte_off,
+                manifest_offset(offsets, layer, e, "gate_up", format),
+                "gate_up L{layer} E{e}: computed stride offset != manifest"
+            );
+        }
     }
     (gate, down)
 }
@@ -1538,19 +1581,17 @@ impl StepEnc<'_> {
     fn encode_moe_batched_gather(&mut self) -> Result<(), Error> {
         let token_list_off = std::mem::offset_of!(RouteScratch, token_list);
         self.half_to_f32_buf(A_MOEIN, CANVAS * HID);
-        self.sink_set_pipeline(&self.ps.gather_rows);
-        self.sink_set_buffer(&self.bufs.mps_x, 0, 0);
-        self.sink_set_buffer(&self.bufs.route, token_list_off, 1);
-        self.sink_set_buffer(&self.bufs.mps_w, moe_w_byte_off_a(), 2);
-        self.sink_set_buffer(&self.bufs.dummy_dump, 0, 5);
         let gather_dims = [0u32, HID as u32];
-        self.sink_set_bytes(&gather_dims, 3);
-        self.sink_set_bytes(&MOE_SLOTS, 4);
-        self.dispatch_1d(
-            &self.ps.gather_rows,
-            (MOE_SLOTS as usize) * HID,
-            256,
-        );
+        let gather_count = (MOE_SLOTS as usize) * HID;
+        self.dispatch_1d_ranged(&self.ps.gather_rows, gather_count, 256, |this, base, _chunk| {
+            this.sink_set_buffer(&this.bufs.mps_x, 0, 0);
+            this.sink_set_buffer(&this.bufs.route, token_list_off, 1);
+            this.sink_set_buffer(&this.bufs.mps_w, moe_w_byte_off_a(), 2);
+            this.sink_set_buffer(&this.bufs.dummy_dump, 0, 5);
+            this.sink_set_bytes(&gather_dims, 3);
+            this.sink_set_bytes(&MOE_SLOTS, 4);
+            this.sink_set_bytes(&base, 6);
+        });
         Ok(())
     }
 
@@ -1560,7 +1601,11 @@ impl StepEnc<'_> {
         layout: &ModelLayout,
     ) -> Result<(), Error> {
         let l = &layout.layers[layer];
-        let (gate_jobs, _) = layer_moe_block_jobs_impl(l, self.block_profile.format);
+        let (gate_jobs, _) = layer_moe_block_jobs_impl(
+            l,
+            self.block_profile.format,
+            Some((layer, self.tensor_offsets)),
+        );
         self.dispatch_block_linear_grouped(
             false,
             moe_w_byte_off_a(),
@@ -1591,7 +1636,7 @@ impl StepEnc<'_> {
         layout: &ModelLayout,
     ) -> Result<(), Error> {
         let l = &layout.layers[layer];
-        let (_, down_jobs) = layer_moe_block_jobs_impl(l, self.block_profile.format);
+        let (_, down_jobs) = layer_moe_block_jobs_impl(l, self.block_profile.format, None);
         self.dispatch_block_linear_grouped(
             true,
             0,
@@ -1604,16 +1649,14 @@ impl StepEnc<'_> {
     }
 
     fn encode_moe_batched_scatter(&mut self) -> Result<(), Error> {
-        self.sink_set_pipeline(&self.ps.moe_scatter_weighted);
-        self.sink_set_buffer(&self.bufs.mps_w, moe_w_byte_off_a(), 0);
-        self.sink_set_buffer(&self.bufs.arena, A_MOEOUT as usize, 1);
-        self.bind_route(2);
-        self.sink_set_bytes(&(HID as u32), 3);
-        self.dispatch_1d(
-            &self.ps.moe_scatter_weighted,
-            (MOE_SLOTS as usize) * HID,
-            256,
-        );
+        let scatter_count = (MOE_SLOTS as usize) * HID;
+        self.dispatch_1d_ranged(&self.ps.moe_scatter_weighted, scatter_count, 256, |this, base, _chunk| {
+            this.sink_set_buffer(&this.bufs.mps_w, moe_w_byte_off_a(), 0);
+            this.sink_set_buffer(&this.bufs.arena, A_MOEOUT as usize, 1);
+            this.bind_route(2);
+            this.sink_set_bytes(&(HID as u32), 3);
+            this.sink_set_bytes(&base, 4);
+        });
         Ok(())
     }
 
@@ -2270,6 +2313,7 @@ pub struct StepRuntime {
     block_profile: StepBlockProfile,
     use_sc_gemm: bool,
     layout: ModelLayout,
+    tensor_offsets: HashMap<String, u64>,
     pub layers: usize,
     icb: Option<crate::metal::step_icb::StepIcbPair>,
 }
@@ -2403,6 +2447,7 @@ impl StepRuntime {
             use_mps_q4: self.use_mps_q4,
             block_profile: self.block_profile,
             use_sc_gemm: self.use_sc_gemm,
+            tensor_offsets: &self.tensor_offsets,
             recorder: None,
         };
         f(&mut enc)?;
@@ -2460,6 +2505,7 @@ impl StepRuntime {
             use_mps_q4: self.use_mps_q4,
             block_profile: self.block_profile,
             use_sc_gemm: self.use_sc_gemm,
+            tensor_offsets: &self.tensor_offsets,
             recorder: Some(recorder),
         };
         f(&mut enc)?;
@@ -2896,6 +2942,7 @@ pub fn build_step_runtime(
         block_profile,
         use_sc_gemm: step_use_sc_gemm_from_env(),
         layout,
+        tensor_offsets: offsets,
         layers,
         icb: None,
     };
@@ -3494,10 +3541,11 @@ pub fn run_step_moe_batched_pin_capture(
     layer: usize,
 ) -> Result<crate::kernels::sub::moe_batched_pin::MoeBatchedPinDump, Error> {
     use crate::kernels::sub::moe_batched_pin::{
-        verify_batched_stages_cpu, MoeBatchedPinDump, MoeBatchedPinRoute,
+        verify_batched_stages_cpu_with_verdict, MoeBatchedPinDump, MoeBatchedPinLayout,
+        MoeBatchedPinRoute,
     };
 
-    const SCHEMA: u32 = 1;
+    const SCHEMA: u32 = 3;
     let layer = layer.min(cfg.layers.saturating_sub(1));
     let (mut rt, _) = build_step_runtime(model_dir, cfg)?;
     let layout = rt.layout;
@@ -3556,7 +3604,7 @@ pub fn run_step_moe_batched_pin_capture(
         )
     };
     let layer_off = &layout.layers[layer];
-    let (stages, rel_l2) = verify_batched_stages_cpu(
+    let (stages, rel_l2, gate_up_diff, first_divergent_stage) = verify_batched_stages_cpu_with_verdict(
         &moe_in,
         &route,
         blob,
@@ -3580,9 +3628,18 @@ pub fn run_step_moe_batched_pin_capture(
         layer,
         kv_len: rt.read_params().kv_len,
         format: format!("{format:?}"),
+        layout: MoeBatchedPinLayout {
+            moe_w_off_gu_bytes: moe_w_byte_off_gu(),
+            gate_up_elems: gu_elems,
+            swiglu_elems: act_elems,
+            hidden: HID,
+            moe_ff: MOE_FF as usize,
+        },
         route: MoeBatchedPinRoute::from_route(&route),
         stages,
         rel_l2,
+        gate_up_diff,
+        first_divergent_stage,
     })
 }
 

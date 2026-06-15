@@ -167,6 +167,24 @@ The first `diffgemma_step.metal` draft had silent-garbage bugs caught only by au
 - **`pool.trim` per layer caused 3x slowdown** — trim at section boundaries only.
 - **Never chain readback on the same buffer within a batch** (Metal hazard).
 - **Grouped MoE GEMM column index (`gemm_linear_grouped`, 2026-06):** dispatch is `n` threadgroups in X × 32 threads (one output column per threadgroup; lanes split K-groups and `simd_sum` within the simdgroup). Bug used `col = thread_position_in_grid.x`, so lanes 0..31 in a simdgroup mapped to columns 0..31 and `simd_sum` mixed partial dot products across columns. Symptom: batched `moe_out` cos ≈ 0.02–0.24 vs scalar `moe_grouped` ~0.99; tier-1 `gemm_linear_grouped` GPU tests failed the same way. Fix: `col = threadgroup_position_in_grid.x`, `global_row = threadgroup_position_in_grid.y`. Not a Q4 dequant / K-order issue — see subkernel `shaders/kernels/gemm_linear_grouped.metal`.
+- **Grouped tiled MoE GEMM M-striping (`gemm_block_grouped`, 2026-06):** batched path uses `gemm_block_grouped` (simdgroup 32×32 tiles along N and K). Each threadgroup handles one expert (`tgid.y`) and one N-tile (`tgid.x`), but the kernel only loaded/stored A rows `m0+mm` for `mm ∈ [0,31]` with **no outer loop over M**. Production routing assigns up to **185 rows per expert** (L0 Calgary: expert 0 has M=96; 22 experts with M>32). Rows past 32 got zeros/garbage while CPU oracle computed them. Symptom: `step-moe-batched-pin` `gate_up_gemm` cos ≈ **0.76** (slots 32–39 cos **0.0**); `swiglu_isolated` cos **1.0** (swiglu cleared). Down GEMM uses the **same kernel** — `down` cos ≈ 0.52 was partly inherited gate_up error, partly the same M-drop (fixed together). Tier-1 fixtures missed it: `rows_per_expert` capped at **12** (`[8,12,4]`) — exercised N/K tiling only, not M. **`gemm_block` (dense) is fine:** `m0 = tgid.y * 32`, M tiled via grid height. **`gemm_linear_grouped` (scalar grouped) is fine:** one threadgroup per `global_row` (`grid.height = total_m`), no per-expert M cap. Fix: `for (m_base = 0; m_base < M; m_base += 32)` with `M_tile = min(32, M - m_base)` in `shaders/kernels/gemm_block_grouped.metal`. Fixtures bumped to **M=100** (`[100,4]` tiny, `[100,48,4]` tile) on both grouped kernels; real-weight harness `row_starts = [0,50,100]`.
+
+### Tile-bound dimension audit (2026-06)
+
+Systematic check: for each kernel, find every dimension bounded by a tile constant; ask whether the real value can exceed it and whether a loop/grid tiles it.
+
+| Kernel / dispatch | Tile bound | Real max (today) | Tiling mechanism | Status |
+|-------------------|------------|------------------|------------------|--------|
+| `gemm_block` | M tile 32 | arbitrary M | `grid.height = div_up(M,32)`, `m0 = tgid.y*32` | OK |
+| `gemm_block_grouped` | M tile 32 in TG | **185 rows/expert** | was none; now `m_base` loop | **fixed** |
+| `gemm_linear_grouped` | none on M | 2048 slots | `grid.height = total_m` | OK |
+| `attention` KV loop | `acc[8]` for V accum | T = kv_len+256 ≤ 768; hd ≤ 512 | `for (t=0; t<T; t++)` streaming softmax — **KV axis bound-safe** | OK |
+| `attention` head tiling | `acc[8]`, `red[8]` | hd=512, tpg=64 → **per=8 exact** | per-thread stride + simdgroup reduce | **exact-fit fragile** — `K_SHAPE_ASSERT per≤8, nsg≤8` added; not Calgary cause |
+| `moe_router` / `bucket_*` | 128 experts | 128 | 128-wide TG, phase-1 loops `0..N_EXPERTS` | OK (`row_start` sum=2048 verified) |
+| `dispatch_softcap` / rowstats | grid 65535 | CANVAS×VOCAB | `dispatch_1d_ranged` | OK (pattern to copy) |
+| `gather_rows` / `moe_scatter_weighted` | grid 65535 | MOE_SLOTS×HID/256 ≈ **22534** TG | `dispatch_1d_ranged` + `elem_base` | **ranged** (was safe, now consistent) |
+
+**Smell:** vocab and logits already use `dispatch_1d_ranged`; grouped MoE M did not. Inconsistent overflow discipline caused the batched MoE bug class. Attention KV streaming was never the hazard — fixed score buffers would have been, but this kernel streams online softmax instead.
 
 ---
 
@@ -213,6 +231,7 @@ The first `diffgemma_step.metal` draft had silent-garbage bugs caught only by au
 | `shaders/kernels/gemm_q8_linear_f32.metal` | Scalar Q8 f32 GEMM (`C = A @ W^T`) |
 | `shaders/kernels/gemm_q8_linear_kxn_f32.metal` | Scalar Q8 f32 GEMM (`C = A @ W[K,N]`) |
 | `shaders/kernels/gemm_linear_grouped.metal` | Grouped MoE block GEMM |
+| `shaders/kernels/gemm_block_grouped.metal` | Tiled grouped MoE GEMM (batched path; M/N/K striping) |
 | `shaders/kernels/dequant_block_matrix.metal` | Block matrix dequant (MPS fallback path) |
 | `shaders/gemm.metal`, `attention.metal`, `decoder.metal`, `sampler.metal`, `probe.metal` | Engine-path kernels |
 | `src/metal/step_kernel.rs` | Monolithic ABI, layout builder, encode driver, CLI backends |
@@ -311,7 +330,7 @@ See **section 5** for full archaeology. Highest-frequency when MLX/HF match each
 | **Q4 layout** | Silent garbage matmuls | `[scale][min][nibbles]` at group **front**; not tail |
 | **Q8 scale** | Wrong embed / SC | `[scale:2][i8:K]` at row **front** |
 | **VERIFY-N** | Q4 nibble parity | Even col = low nibble |
-| **VERIFY-K** | MoE / grouped GEMM drift | Primary batched failure (2026-06): **`col = gid.x` with `simd_sum`** — must use `threadgroup_position_in_grid.x` (see section 5). Also watch K-order in `dequant_q4_group` vs `q4_weight_at` |
+| **VERIFY-K** | MoE / grouped GEMM drift | Primary batched failures (2026-06): (1) **`col = gid.x` with `simd_sum`** in `gemm_linear_grouped` — use `threadgroup_position_in_grid.x`. (2) **M>32 per expert** in `gemm_block_grouped` — need `m_base` striping; tier-1 fixtures must use `rows_per_expert ≥ 33`. Also watch K-order in `dequant_q4_group` vs `q4_weight_at` |
 | **RoPE** | Attention garbage | Split-half pairs; proportional-RoPE denominator = **full** head_dim (512) |
 | **Temperature** | Wrong accept timing | Count-**down** schedule (`cur = max_steps - steps_done`) |
 | **Accept rule** | Wrong frozen set | Test-before-add + break on prefix entropy (HF mutual-information bound) |

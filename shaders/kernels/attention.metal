@@ -40,6 +40,15 @@ kernel void attention(
     float l = 0.f;
     float acc[8];
     const uint per = (hd + tpg_w - 1u) / tpg_w;
+    const uint nsg = (tpg_w + 31u) / 32u;
+    // KV axis: T is runtime (kv_len + canvas); loop 0..T streams softmax — no fixed score buffer.
+    // acc[8]/red[8] are sized for max head_dim=512 @ tpg_w=64 (per=8, nsg=2); assert under tier-2.
+    if (K_SHAPE_ASSERT && (per > 8u || nsg > 8u)) {
+        if (tok == 0u && qh == 0u && ltid == 0u) {
+            out[0] = half(as_type<float>(0x7fc00000u));
+        }
+        return;
+    }
     for (uint i = 0u; i < per; ++i) {
         acc[i] = 0.f;
     }
@@ -51,7 +60,6 @@ kernel void attention(
         }
         d = simd_sum(d);
         uint sg = ltid / 32u;
-        uint nsg = (tpg_w + 31u) / 32u;
         if ((ltid & 31u) == 0u) {
             red[sg] = d;
         }

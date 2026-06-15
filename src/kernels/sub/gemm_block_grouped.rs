@@ -17,20 +17,22 @@ pub fn fixture_len(f: &Fixture) -> usize {
     f.out_len()
 }
 
+/// One expert with M=100 (>32 M-tile) plus smaller segments for multi-expert routing.
 pub fn tiny_fixture_q4(_: ElemFormat) -> Fixture {
-    grouped_fixture(QuantFormat::Q4Affine, 64, 32, &[2, 2])
+    grouped_fixture(QuantFormat::Q4Affine, 64, 32, &[100, 4])
 }
 
 pub fn tiny_fixture_nvfp4(_: ElemFormat) -> Fixture {
-    grouped_fixture(QuantFormat::NvFp4, 64, 32, &[2, 2])
+    grouped_fixture(QuantFormat::NvFp4, 64, 32, &[100, 4])
 }
 
+/// M=100 with N/K tiling (128×128).
 pub fn tile_fixture_q4(_: ElemFormat) -> Fixture {
-    grouped_fixture(QuantFormat::Q4Affine, 128, 128, &[8, 12, 4])
+    grouped_fixture(QuantFormat::Q4Affine, 128, 128, &[100, 48, 4])
 }
 
 pub fn tile_fixture_nvfp4(_: ElemFormat) -> Fixture {
-    grouped_fixture(QuantFormat::NvFp4, 128, 128, &[8, 12, 4])
+    grouped_fixture(QuantFormat::NvFp4, 128, 128, &[100, 48, 4])
 }
 
 pub fn cpu(f: &Fixture) -> Vec<f32> {

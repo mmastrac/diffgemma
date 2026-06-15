@@ -114,6 +114,7 @@ pub fn bind_gpu_buffers(
     moe_out: &ProtocolObject<dyn MTLBuffer>,
     route: &ProtocolObject<dyn MTLBuffer>,
     hidden: u32,
+    elem_base: u32,
 ) {
     unsafe {
         enc.setBuffer_offset_atIndex(Some(expert_out), 0, 0);
@@ -121,6 +122,7 @@ pub fn bind_gpu_buffers(
         enc.setBuffer_offset_atIndex(Some(route), 0, 2);
     }
     gpu_common::set_bytes(enc, &hidden, 3);
+    gpu_common::set_bytes(enc, &elem_base, 4);
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -160,6 +162,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
             &buf_out,
             &buf_route,
             f.hidden as u32,
+            0,
         );
     });
     let mut out = vec![0.0f32; out_len];

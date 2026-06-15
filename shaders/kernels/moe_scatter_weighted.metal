@@ -11,14 +11,16 @@ kernel void moe_scatter_weighted(
     device float *moe_out [[buffer(1)]],
     device const RouteScratch *R [[buffer(2)]],
     constant uint &hidden [[buffer(3)]],
+    constant uint &elem_base [[buffer(4)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (K_SHAPE_ASSERT && hidden == 0u) {
         return;
     }
     K_ELEMENTWISE_GUARD();
-    uint slot = gid / hidden;
-    uint d = gid % hidden;
+    uint elem = elem_base + gid;
+    uint slot = elem / hidden;
+    uint d = elem % hidden;
     if (slot >= R->num_slots) {
         return;
     }

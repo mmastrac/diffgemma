@@ -73,8 +73,9 @@ mod tests {
         .expect("pin capture");
         print_pin_summary(&dump);
         assert!(dump.stages.gather >= 0.99, "gather cos={}", dump.stages.gather);
-        assert!(dump.stages.gate_up >= 0.99, "gate_up cos={}", dump.stages.gate_up);
-        assert!(dump.stages.swiglu >= 0.99, "swiglu cos={}", dump.stages.swiglu);
+        assert!(dump.stages.gate_up_gemm >= 0.99, "gate_up_gemm cos={}", dump.stages.gate_up_gemm);
+        assert!(dump.stages.swiglu_post >= 0.99, "swiglu_post cos={}", dump.stages.swiglu_post);
+        assert!(dump.stages.swiglu_isolated >= 0.99, "swiglu_isolated cos={}", dump.stages.swiglu_isolated);
         assert!(dump.stages.down >= 0.99, "down cos={}", dump.stages.down);
         assert!(dump.stages.scatter >= 0.99, "scatter cos={}", dump.stages.scatter);
     }
@@ -89,8 +90,9 @@ mod tests {
         .expect("pin capture");
         print_pin_summary(&dump);
         assert!(dump.stages.gather >= 0.99, "gather cos={}", dump.stages.gather);
-        assert!(dump.stages.gate_up >= 0.99, "gate_up cos={}", dump.stages.gate_up);
-        assert!(dump.stages.swiglu >= 0.99, "swiglu cos={}", dump.stages.swiglu);
+        assert!(dump.stages.gate_up_gemm >= 0.99, "gate_up_gemm cos={}", dump.stages.gate_up_gemm);
+        assert!(dump.stages.swiglu_post >= 0.99, "swiglu_post cos={}", dump.stages.swiglu_post);
+        assert!(dump.stages.swiglu_isolated >= 0.99, "swiglu_isolated cos={}", dump.stages.swiglu_isolated);
         assert!(dump.stages.down >= 0.99, "down cos={}", dump.stages.down);
         assert!(dump.stages.scatter >= 0.99, "scatter cos={}", dump.stages.scatter);
     }

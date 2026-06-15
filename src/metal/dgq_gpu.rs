@@ -966,8 +966,8 @@ mod q4_gpu_tests {
                 jobs[1].w_byte_off > u32::MAX as u64
             );
 
-            let row_starts = [0u32, 1, 3];
-            let total_m = 3usize;
+            let row_starts = [0u32, 50, 100];
+            let total_m = 100usize;
             let mut a = vec![0.0f32; total_m * case.k];
             for (row, slot) in a.chunks_mut(case.k).enumerate() {
                 for (i, v) in slot.iter_mut().enumerate() {

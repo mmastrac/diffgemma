@@ -133,6 +133,7 @@ pub fn bind_gpu_buffers(
     dump: &ProtocolObject<dyn MTLBuffer>,
     hidden: u32,
     batch_size: u32,
+    elem_base: u32,
 ) {
     let dims = [0u32, hidden];
     unsafe {
@@ -143,6 +144,7 @@ pub fn bind_gpu_buffers(
     }
     gpu_common::set_bytes(enc, &dims, 3);
     gpu_common::set_bytes(enc, &batch_size, 4);
+    gpu_common::set_bytes(enc, &elem_base, 6);
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -176,6 +178,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
             &buf_d,
             f.hidden as u32,
             f.batch_size() as u32,
+            0,
         );
     })?;
     let mut out = vec![0.0f32; out_len];

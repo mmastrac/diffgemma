@@ -274,6 +274,7 @@ pub fn gather_rows_gpu(
             &buf_dump,
             hidden as u32,
             batch_u,
+            0,
         );
     });
     Ok(buf_dst)
