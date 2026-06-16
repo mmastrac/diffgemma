@@ -66,8 +66,14 @@ fn shader_bundle_token() -> u64 {
         include_str!("../../shaders/kernels/vec_scale_inplace.metal"),
         include_str!("../../shaders/include/gqa_device.metal"),
         include_str!("../../shaders/kernels/apply_rope_heads.metal"),
+        include_str!("../../shaders/kernels/argmax_rows.metal"),
+        include_str!("../../shaders/kernels/copy_f32.metal"),
         include_str!("../../shaders/kernels/gqa_attention.metal"),
-        include_str!("../../shaders/sampler.metal"),
+        include_str!("../../shaders/kernels/logit_softcapping.metal"),
+        include_str!("../../shaders/kernels/row_entropy.metal"),
+        include_str!("../../shaders/kernels/sample_from_probs_rows.metal"),
+        include_str!("../../shaders/kernels/scale_logits.metal"),
+        include_str!("../../shaders/kernels/scatter_vocab_chunk.metal"),
         include_str!("../../shaders/monolithic/diffgemma_step.metal"),
     ] {
         src.hash(&mut h);

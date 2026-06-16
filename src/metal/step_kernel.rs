@@ -911,7 +911,7 @@ impl StepEnc<'_> {
         }
     }
 
-    /// Softcap logits (matches sampler.metal ranged dispatch pattern).
+    /// Softcap logits (matches ranged logit_softcapping dispatch pattern).
     fn dispatch_softcap(&mut self) {
         let len = CANVAS * VOCAB;
         self.dispatch_1d_ranged(&self.ps.softcap, len, 256, |this, base, chunk| {

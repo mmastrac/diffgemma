@@ -194,15 +194,14 @@ fn dispatch_softmax_rows(
     probs: &ProtocolObject<dyn MTLBuffer>,
     canvas_len: usize,
     vocab: usize,
-) {
+) -> Result<(), Error> {
     let dims = [canvas_len as u32, vocab as u32];
     let (grid, tg) = row_grid(canvas_len);
+    let buf_dump = batch.alloc_f32_out(4)?;
     batch.dispatch_with_grid(&sk.softmax_rows.pipeline, grid, tg, |enc| {
-        unsafe {
-            enc.setBuffer_offset_atIndex(Some(probs), 0, 0);
-        }
-        set_bytes(enc, &dims, 1);
+        crate::kernels::sub::softmax_rows::bind_gpu_in_place(enc, probs, &buf_dump, &dims);
     });
+    Ok(())
 }
 
 fn dispatch_sample_from_probs(
@@ -317,7 +316,7 @@ pub fn sampler_step_gpu(
         &buf_probs,
         canvas_len,
         vocab,
-    );
+    )?;
 
     let buf_rand = batch.alloc_f32(&scratch.sample_rand)?;
     let buf_denoiser = batch.alloc_u32_out(canvas_len)?;
@@ -424,7 +423,7 @@ mod tests {
         dispatch_argmax_rows(&mut batch, &sk, logits_ref, &buf_argmax, canvas_len, vocab);
         let buf_probs = batch.alloc_f32_out(total).expect("probs");
         dispatch_copy_f32(&mut batch, &sk, logits_ref, &buf_probs, total);
-        dispatch_softmax_rows(&mut batch, &sk, &buf_probs, canvas_len, vocab);
+        dispatch_softmax_rows(&mut batch, &sk, &buf_probs, canvas_len, vocab).expect("softmax");
         let buf_rand = batch.alloc_f32(&scratch.sample_rand).expect("rand");
         let buf_denoiser = batch.alloc_u32_out(canvas_len).expect("denoiser");
         dispatch_sample_from_probs(
