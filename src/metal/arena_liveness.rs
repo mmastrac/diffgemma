@@ -193,6 +193,10 @@ pub fn stage_arena_access(stage: StepStage, ctx: LivenessCtx<'_>) -> StageArenaA
             reads: &[],
             writes: &[ArenaPlane::Hidden],
         },
+        EmbedScResidual => StageArenaAccess {
+            reads: &[ArenaPlane::Hidden, ArenaPlane::Dense],
+            writes: &[ArenaPlane::Hidden],
+        },
         RmsNormHidden => StageArenaAccess {
             reads: &[ArenaPlane::Hidden],
             writes: &[ArenaPlane::Hidden],
@@ -310,6 +314,10 @@ pub fn check_step_arena_liveness(
 ) -> Result<(), ArenaLivenessError> {
     let schedule = build_step_schedule(profile, finish == StepFinishMode::Full);
     let mut live = ArenaLiveness::new();
+    // Arena is zeroed each step; when SC MLP is skipped, dense is never written but reads as zero.
+    if first_step > 0 {
+        live.mark_valid(ArenaPlane::Dense);
+    }
 
     for stage in build_preamble(first_step) {
         let ctx = LivenessCtx {

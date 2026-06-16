@@ -16,6 +16,8 @@ pub enum StepStage {
     ScGlu,
     ScDownGemm,
     EmbedGather,
+    /// `residual(hidden, dense, scal=0) -> hidden` after token embed (metal schedule step 3).
+    EmbedScResidual,
     RmsNormHidden,
 
     // --- per decoder layer ---
@@ -65,7 +67,11 @@ pub fn sc_preamble_stages() -> &'static [StepStage] {
 }
 
 pub fn core_preamble_stages() -> &'static [StepStage] {
-    const STAGES: &[StepStage] = &[StepStage::EmbedGather, StepStage::RmsNormHidden];
+    const STAGES: &[StepStage] = &[
+        StepStage::EmbedGather,
+        StepStage::EmbedScResidual,
+        StepStage::RmsNormHidden,
+    ];
     STAGES
 }
 
@@ -159,6 +165,13 @@ mod tests {
             })
             .count();
         assert_eq!(moe_count, 5);
+    }
+
+    #[test]
+    fn core_preamble_includes_embed_residual() {
+        let stages = core_preamble_stages();
+        assert_eq!(stages.len(), 3);
+        assert_eq!(stages[1], StepStage::EmbedScResidual);
     }
 
     #[test]

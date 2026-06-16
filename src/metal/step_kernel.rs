@@ -1757,6 +1757,16 @@ impl StepEnc<'_> {
                 self.dispatch_embed_gather(layout.embed);
                 Ok(())
             }
+            StepStage::EmbedScResidual => {
+                self.residual(
+                    self.arena().hidden_off(),
+                    self.arena().dense_off(),
+                    self.arena().hidden_off(),
+                    0,
+                    CANVAS * HID,
+                );
+                Ok(())
+            }
             StepStage::RmsNormHidden => {
                 self.rmsnorm(self.arena().hidden_off(), self.arena().hidden_off(), 0, HID as u32, CANVAS);
                 Ok(())
@@ -1853,7 +1863,7 @@ impl StepEnc<'_> {
         Ok(())
     }
 
-    /// Canvas token embed gather only (no SC residual, no no-scale RMSNorm).
+    /// Canvas token embed gather only (no no-scale RMSNorm).
     fn encode_layer_through_attention(
         &mut self,
         layer: usize,
@@ -1881,7 +1891,7 @@ impl StepEnc<'_> {
         self.sink_dispatch(grid, tg);
     }
 
-    /// Canvas token embed gather only (no SC residual, no no-scale RMSNorm).
+    /// Canvas token embed gather only (no no-scale RMSNorm).
     fn encode_preamble_embed_only(&mut self, layout: &ModelLayout) -> Result<(), Error> {
         self.dispatch_embed_gather(layout.embed);
         Ok(())
@@ -1922,6 +1932,13 @@ impl StepEnc<'_> {
         // first_step: self.arena().dense_off() stays zero; skip SC MLP + O(vocab) softembed.
 
         self.dispatch_embed_gather(layout.embed);
+        self.residual(
+            self.arena().hidden_off(),
+            self.arena().dense_off(),
+            self.arena().hidden_off(),
+            0,
+            CANVAS * HID,
+        );
         self.rmsnorm(self.arena().hidden_off(), self.arena().hidden_off(), 0, HID as u32, CANVAS);
         Ok(())
     }
