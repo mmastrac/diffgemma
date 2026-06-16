@@ -2498,8 +2498,26 @@ impl StepRuntime {
         recorder.finish()
     }
 
+    fn icb_replay_allowed(&self, finish: StepFinishMode) -> bool {
+        finish == StepFinishMode::Full
+            && self.icb.is_some()
+            // Assert/deep variants compile different pipelines; ICB bakes pipeline state at record.
+            && !crate::kernels::sub::variant::runtime_kernel_debug_enabled()
+    }
+
+    fn current_icb_pipeline_key(&self) -> StepPipelineKey {
+        step_pipeline_key(crate::kernels::sub::variant::runtime_step_variant())
+    }
+
     fn ensure_no_sc_icb(&mut self) -> Result<(), Error> {
         let kv_len = self.read_params().kv_len;
+        let key = self.current_icb_pipeline_key();
+        if let Some(pair) = self.icb.as_ref() {
+            if pair.no_sc.is_some() && pair.no_sc_kv_len == kv_len && pair.pipeline_key == key.0 {
+                return Ok(());
+            }
+        }
+        let prev_key = self.icb.as_ref().map(|p| p.pipeline_key);
         let started = Instant::now();
         let no_sc = self.record_icb_plan(false)?;
         eprintln!(
@@ -2511,32 +2529,41 @@ impl StepRuntime {
             no_sc: None,
             with_sc: None,
             no_sc_kv_len: u32::MAX,
+            pipeline_key: u8::MAX,
         });
         pair.no_sc = Some(no_sc);
         pair.no_sc_kv_len = kv_len;
-        pair.with_sc = None;
+        pair.pipeline_key = key.0;
+        if prev_key != Some(key.0) {
+            pair.with_sc = None;
+        }
         Ok(())
     }
 
     /// Record with_sc against the current GPU buffers (post step 1).
     fn ensure_with_sc_icb(&mut self) -> Result<(), Error> {
-        if self
-            .icb
-            .as_ref()
-            .and_then(|p| p.with_sc.as_ref())
-            .is_some()
-        {
-            return Ok(());
+        let key = self.current_icb_pipeline_key();
+        if let Some(pair) = self.icb.as_ref() {
+            if pair.with_sc.is_some() && pair.pipeline_key == key.0 {
+                return Ok(());
+            }
         }
         let started = Instant::now();
         let with_sc = self.record_icb_plan(true)?;
         eprintln!(
-            "step-kernel: with_sc ICB ready ({} cmds/{} ops) in {:.2?}",
-            with_sc.command_count,
+            "step-kernel: with_sc ICB ready (kv_len={}, {} cmds) in {:.2?}",
+            self.read_params().kv_len,
             with_sc.command_count,
             started.elapsed()
         );
-        self.icb.as_mut().expect("icb").with_sc = Some(with_sc);
+        let pair = self.icb.get_or_insert_with(|| crate::metal::step_icb::StepIcbPair {
+            no_sc: None,
+            with_sc: None,
+            no_sc_kv_len: u32::MAX,
+            pipeline_key: u8::MAX,
+        });
+        pair.with_sc = Some(with_sc);
+        pair.pipeline_key = key.0;
         Ok(())
     }
 
@@ -2545,6 +2572,7 @@ impl StepRuntime {
             no_sc: None,
             with_sc: None,
             no_sc_kv_len: u32::MAX,
+            pipeline_key: u8::MAX,
         })
     }
 
@@ -2651,9 +2679,7 @@ impl StepRuntime {
             );
         }
         let first_step = if st_before.step == 0 { 1u32 } else { 0u32 };
-        // ICB parity validated at kv_len=0 (step-smoke). Prefilled KV paths still use live encode.
-        let icb_ok = self.read_params().kv_len == 0;
-        if finish == StepFinishMode::Full && icb_ok && self.icb.is_some() {
+        if self.icb_replay_allowed(finish) {
             if first_step == 1 {
                 self.ensure_no_sc_icb()?;
             } else {
@@ -2925,7 +2951,7 @@ pub fn build_step_runtime(
         icb: None,
     };
     if crate::metal::step_icb::step_icb_enabled() {
-        eprintln!("step-kernel: ICB replay enabled (lazy record per kv_len/step)");
+        eprintln!("step-kernel: ICB replay enabled (lazy record; kv_len from live StepParams)");
         rt.icb = Some(rt.record_icb_pair()?);
     }
     Ok((rt, build))
@@ -4657,9 +4683,8 @@ mod tests {
         assert!(with_sc < 0.05, "with_sc drift max_abs={with_sc}");
     }
 
-    /// Prefilled-KV ICB: run manually while debugging generate path (`cargo test --ignored icb_prefill`).
+    /// Prefilled-KV ICB parity (hello prefill, 3L).
     #[test]
-    #[ignore = "tier-2 on demand: prefilled KV ICB (STRATEGY.md §5)"]
     fn icb_prefill_no_sc_tier2() {
         let dir = Path::new("/tmp/quantized-weights");
         if !crate::dgq::store::looks_like_dgq_dir(dir) {

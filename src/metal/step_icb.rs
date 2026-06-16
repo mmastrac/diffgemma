@@ -28,8 +28,10 @@ pub struct StepIcbPair {
     pub no_sc: Option<StepIcbPlan>,
     /// Recorded lazily after step 1 (needs prefilled KV + step-1 canvas state).
     pub with_sc: Option<StepIcbPlan>,
-    /// `StepParams.kv_len` used when `no_sc` was recorded (re-record on change).
+    /// `StepParams.kv_len` when `no_sc` was recorded (audit only; replay reads live params).
     pub no_sc_kv_len: u32,
+    /// `StepPipelineKey` bits at record time; invalidate cached plans when assert/deep toggles.
+    pub pipeline_key: u8,
 }
 
 pub struct IcbRecorder {
