@@ -42,24 +42,27 @@ pub const MOE_FF: u32 = 704;
 /// Two act rows (after-barrier + down-read) plus kernel input probe metadata.
 pub const MOE_ACT_PROBE_ACT_FLOATS: usize = (MOE_FF * 2) as usize;
 pub const MOE_ACT_PROBE_META_FLOATS: usize = 36; // tok,slot,e,w,x[8],row0[8], down_o[8], moe_out_tok_row[8]
-pub const MOE_ACT_PROBE_FLOATS: usize = MOE_ACT_PROBE_ACT_FLOATS + MOE_ACT_PROBE_META_FLOATS;
 
-pub const A_HIDDEN: u64 = 0;
-pub const A_ATTNQ: u64 = 2_883_584;
-pub const A_ATTNK: u64 = 7_077_888;
-pub const A_ATTNV: u64 = 8_126_464;
-pub const A_ATTNO: u64 = 9_175_040;
-pub const A_FFG: u64 = 13_369_344;
-pub const A_FFU: u64 = 14_450_688;
-pub const A_MOEIN: u64 = 15_532_032;
-pub const A_DENSE: u64 = 16_973_824;
-pub const A_MOEOUT: u64 = 18_415_616;
-pub const A_SOFT: u64 = 21_299_200;
-pub const A_STREAM: u64 = 22_740_992;
-pub const A_TMP: u64 = 24_182_784;
-pub const A_RS_SC: u64 = 25_624_576;
-pub const A_RS_SAMP: u64 = 25_626_624;
-pub const ARENA_BYTES: u64 = 25_628_672;
+use crate::metal::arena_layout::{build_arena_layout, ArenaLayout, ArenaLayoutParams};
+
+pub const MAX_ATTN_Q_COLS: usize = 8192;
+pub const MAX_ATTN_KV_COLS: usize = 2048;
+
+pub fn step_arena_params() -> ArenaLayoutParams {
+    ArenaLayoutParams {
+        canvas: CANVAS,
+        hidden: HID,
+        dense_ff: DENSE_FF as usize,
+        max_attn_q_cols: MAX_ATTN_Q_COLS,
+        max_attn_kv_cols: MAX_ATTN_KV_COLS,
+    }
+}
+
+pub fn step_arena_layout() -> ArenaLayout {
+    build_arena_layout(&step_arena_params())
+}
+
+pub const MOE_ACT_PROBE_FLOATS: usize = MOE_ACT_PROBE_ACT_FLOATS + MOE_ACT_PROBE_META_FLOATS;
 
 pub const FULL_LAYERS: [usize; 5] = [5, 11, 17, 23, 29];
 
@@ -634,6 +637,11 @@ pub(crate) struct StepBuffers {
     pub(crate) gemm_b: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// Per-layer unique routed experts (written by moe_bucket_fill phase 1).
     expert_layer_unique: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// Scratch plane byte offsets (host-built, mirrored on GPU as b8).
+    pub(crate) arena_map: ArenaLayout,
+    /// GPU copy of `arena_map` (b8); bound when kernels need device-side plane table.
+    #[allow(dead_code)]
+    arena_layout_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
 
 struct StepEnc<'a> {
@@ -644,6 +652,13 @@ struct StepEnc<'a> {
     use_sc_gemm: bool,
     tensor_offsets: &'a HashMap<String, u64>,
     recorder: Option<&'a mut crate::metal::step_icb::IcbRecorder>,
+}
+
+impl<'a> StepEnc<'a> {
+    #[inline]
+    fn arena(&self) -> &ArenaLayout {
+        &self.bufs.arena_map
+    }
 }
 
 const MOE_SLOTS: u32 = (CANVAS * TOP_K) as u32;
@@ -752,6 +767,11 @@ impl StepEnc<'_> {
         } else {
             crate::metal::batch::set_bytes(&self.enc, val, index);
         }
+    }
+
+    #[allow(dead_code)]
+    fn bind_arena_layout_buf(&mut self, index: usize) {
+        self.sink_set_buffer(&self.bufs.arena_layout_buf, 0, index);
     }
 
     fn bind_debug_status(&mut self, index: usize) {
@@ -1086,7 +1106,7 @@ impl StepEnc<'_> {
     fn encode_sc_logit_rowstats(&mut self) {
         self.sink_set_pipeline(&self.ps.logit_rowstats);
         self.bind_logits(0);
-        self.sink_set_buffer(&self.bufs.arena, A_RS_SC as usize, 1);
+        self.sink_set_buffer(&self.bufs.arena, self.arena().rs_sc_off() as usize, 1);
         let dims = [CANVAS as u32, VOCAB as u32];
         self.sink_set_bytes(&dims, 2);
         self.bind_debug_status(3);
@@ -1106,7 +1126,7 @@ impl StepEnc<'_> {
         if use_gemm {
             self.sink_set_pipeline(&self.ps.sc_probs);
             self.bind_logits(0);
-            self.sink_set_buffer(&self.bufs.arena, A_RS_SC as usize, 1);
+            self.sink_set_buffer(&self.bufs.arena, self.arena().rs_sc_off() as usize, 1);
             self.bind_sc_probs(2);
             let dims = [CANVAS as u32, VOCAB as u32];
             self.sink_set_bytes(&dims, 3);
@@ -1114,16 +1134,16 @@ impl StepEnc<'_> {
             let (grid, tg) = crate::kernels::sub::sc_probs::dispatch_shape(CANVAS);
             self.sink_dispatch(grid, tg);
 
-            self.gemm_q8_probs(A_SOFT, layout.embed, CANVAS as u32, HID as u32, VOCAB as u32)?;
-            self.scale_half_arena(A_SOFT, CANVAS * HID as usize, (HID as f32).sqrt());
+            self.gemm_q8_probs(self.arena().soft_off(), layout.embed, CANVAS as u32, HID as u32, VOCAB as u32)?;
+            self.scale_half_arena(self.arena().soft_off(), CANVAS * HID as usize, (HID as f32).sqrt());
         } else {
             use crate::dgq::embed_row::EMBED_SCALE;
 
             self.sink_set_pipeline(&self.ps.sc_softembed);
             self.bind_logits(0);
-            self.sink_set_buffer(&self.bufs.arena, A_RS_SC as usize, 1);
+            self.sink_set_buffer(&self.bufs.arena, self.arena().rs_sc_off() as usize, 1);
             self.bind_blob(2);
-            self.sink_set_buffer(&self.bufs.arena, A_SOFT as usize, 3);
+            self.sink_set_buffer(&self.bufs.arena, self.arena().soft_off() as usize, 3);
             let first_step: u32 = 0;
             self.sink_set_bytes(&layout.embed, 4);
             self.sink_set_bytes(&first_step, 5);
@@ -1165,17 +1185,17 @@ impl StepEnc<'_> {
         let qk_y = (16 + 2 * l.n_kv_heads) as usize;
         let layer_off = layer_byte_offset(layer);
 
-        self.rmsnorm(A_HIDDEN, A_TMP, l.input_ln, HID as u32, CANVAS);
-        self.gemm_q4(A_TMP, A_ATTNQ, l.q_proj, CANVAS as u32, q_n, HID as u32)?;
-        self.gemm_q4(A_TMP, A_ATTNK, l.k_proj, CANVAS as u32, k_n, HID as u32)?;
+        self.rmsnorm(self.arena().hidden_off(), self.arena().tmp_off(), l.input_ln, HID as u32, CANVAS);
+        self.gemm_q4(self.arena().tmp_off(), self.arena().attnq_off(), l.q_proj, CANVAS as u32, q_n, HID as u32)?;
+        self.gemm_q4(self.arena().tmp_off(), self.arena().attnk_off(), l.k_proj, CANVAS as u32, k_n, HID as u32)?;
         if l.v_proj != 0 {
-            self.gemm_q4(A_TMP, A_ATTNV, l.v_proj, CANVAS as u32, k_n, HID as u32)?;
+            self.gemm_q4(self.arena().tmp_off(), self.arena().attnv_off(), l.v_proj, CANVAS as u32, k_n, HID as u32)?;
         }
 
         self.sink_set_pipeline(&self.ps.qk_rope_kv);
-        self.sink_set_buffer(&self.bufs.arena, A_ATTNQ as usize, 0);
-        self.sink_set_buffer(&self.bufs.arena, A_ATTNK as usize, 1);
-        self.sink_set_buffer(&self.bufs.arena, A_ATTNV as usize, 2);
+        self.sink_set_buffer(&self.bufs.arena, self.arena().attnq_off() as usize, 0);
+        self.sink_set_buffer(&self.bufs.arena, self.arena().attnk_off() as usize, 1);
+        self.sink_set_buffer(&self.bufs.arena, self.arena().attnv_off() as usize, 2);
         self.bind_kvcache(3);
         self.bind_blob(4);
         self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 5);
@@ -1198,9 +1218,9 @@ impl StepEnc<'_> {
         self.sink_dispatch(grid, tg);
 
         self.sink_set_pipeline(&self.ps.attention);
-        self.sink_set_buffer(&self.bufs.arena, A_ATTNQ as usize, 0);
+        self.sink_set_buffer(&self.bufs.arena, self.arena().attnq_off() as usize, 0);
         self.bind_kvcache(1);
-        self.sink_set_buffer(&self.bufs.arena, A_ATTNO as usize, 2);
+        self.sink_set_buffer(&self.bufs.arena, self.arena().attno_off() as usize, 2);
         self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 3);
         self.bind_params(4);
         let attn_dims = crate::kernels::sub::qk_rope_kv::AttnDims {
@@ -1233,20 +1253,20 @@ impl StepEnc<'_> {
     ) -> Result<(), Error> {
         let l = &layout.layers[layer];
         let o_k = if l.is_full != 0 { 8192 } else { 4096 };
-        self.gemm_q4(A_ATTNO, A_TMP, l.o_proj, CANVAS as u32, HID as u32, o_k)?;
-        self.rmsnorm(A_TMP, A_TMP, l.post_attn_ln, HID as u32, CANVAS);
-        self.residual(A_HIDDEN, A_TMP, A_STREAM, 0, CANVAS * HID);
+        self.gemm_q4(self.arena().attno_off(), self.arena().tmp_off(), l.o_proj, CANVAS as u32, HID as u32, o_k)?;
+        self.rmsnorm(self.arena().tmp_off(), self.arena().tmp_off(), l.post_attn_ln, HID as u32, CANVAS);
+        self.residual(self.arena().hidden_off(), self.arena().tmp_off(), self.arena().stream_off(), 0, CANVAS * HID);
         Ok(())
     }
 
     fn encode_layer_dense_ffn(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
         let l = &layout.layers[layer];
-        self.rmsnorm(A_STREAM, A_TMP, l.pre_ff_ln, HID as u32, CANVAS);
-        self.gemm_q4(A_TMP, A_FFG, l.mlp_gate, CANVAS as u32, DENSE_FF, HID as u32)?;
-        self.gemm_q4(A_TMP, A_FFU, l.mlp_up, CANVAS as u32, DENSE_FF, HID as u32)?;
-        self.glu(A_FFG, A_FFU, A_FFG, CANVAS * DENSE_FF as usize);
-        self.gemm_q4(A_FFG, A_DENSE, l.mlp_down, CANVAS as u32, HID as u32, DENSE_FF)?;
-        self.rmsnorm(A_DENSE, A_DENSE, l.post_ff_ln_1, HID as u32, CANVAS);
+        self.rmsnorm(self.arena().stream_off(), self.arena().tmp_off(), l.pre_ff_ln, HID as u32, CANVAS);
+        self.gemm_q4(self.arena().tmp_off(), self.arena().ffg_off(), l.mlp_gate, CANVAS as u32, DENSE_FF, HID as u32)?;
+        self.gemm_q4(self.arena().tmp_off(), self.arena().ffu_off(), l.mlp_up, CANVAS as u32, DENSE_FF, HID as u32)?;
+        self.glu(self.arena().ffg_off(), self.arena().ffu_off(), self.arena().ffg_off(), CANVAS * DENSE_FF as usize);
+        self.gemm_q4(self.arena().ffg_off(), self.arena().dense_off(), l.mlp_down, CANVAS as u32, HID as u32, DENSE_FF)?;
+        self.rmsnorm(self.arena().dense_off(), self.arena().dense_off(), l.post_ff_ln_1, HID as u32, CANVAS);
         Ok(())
     }
 
@@ -1264,7 +1284,7 @@ impl StepEnc<'_> {
             router_hscale: (HID as f32).powf(-0.5),
         };
         self.sink_set_pipeline(&self.ps.router);
-        self.sink_set_buffer(&self.bufs.arena, A_STREAM as usize, 0);
+        self.sink_set_buffer(&self.bufs.arena, self.arena().stream_off() as usize, 0);
         self.bind_blob(1);
         self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 2);
         self.bind_route(3);
@@ -1302,8 +1322,8 @@ impl StepEnc<'_> {
         }
 
         let l = &layout.layers[layer];
-        self.rmsnorm(A_STREAM, A_MOEIN, l.pre_ff_ln_2, HID as u32, CANVAS);
-        self.memzero_bytes(A_MOEOUT, (CANVAS * HID * 4) as u64);
+        self.rmsnorm(self.arena().stream_off(), self.arena().moein_off(), l.pre_ff_ln_2, HID as u32, CANVAS);
+        self.memzero_bytes(self.arena().moeout_off(), (CANVAS * HID * 4) as u64);
         Ok(())
     }
 
@@ -1364,7 +1384,7 @@ impl StepEnc<'_> {
 
     fn encode_moe_batched_gather(&mut self) -> Result<(), Error> {
         let token_list_off = std::mem::offset_of!(RouteScratch, token_list);
-        self.half_to_f32_buf(A_MOEIN, CANVAS * HID);
+        self.half_to_f32_buf(self.arena().moein_off(), CANVAS * HID);
         let gather_dims = [0u32, HID as u32];
         let gather_count = (MOE_SLOTS as usize) * HID;
         self.dispatch_1d_ranged(&self.ps.gather_rows, gather_count, 256, |this, base, _chunk| {
@@ -1436,7 +1456,7 @@ impl StepEnc<'_> {
         let scatter_count = (MOE_SLOTS as usize) * HID;
         self.dispatch_1d_ranged(&self.ps.moe_scatter_weighted, scatter_count, 256, |this, base, _chunk| {
             this.sink_set_buffer(&this.bufs.gemm_b, moe_w_byte_off_a(), 0);
-            this.sink_set_buffer(&this.bufs.arena, A_MOEOUT as usize, 1);
+            this.sink_set_buffer(&this.bufs.arena, this.arena().moeout_off() as usize, 1);
             this.bind_route(2);
             this.sink_set_bytes(&(HID as u32), 3);
             this.sink_set_bytes(&base, 4);
@@ -1451,8 +1471,8 @@ impl StepEnc<'_> {
     ) -> Result<(), Error> {
         let layer_off = layer_byte_offset(layer);
         self.sink_set_pipeline(self.ps.moe_scalar(self.block_profile.format));
-        self.sink_set_buffer(&self.bufs.arena, A_MOEIN as usize, 0);
-        self.sink_set_buffer(&self.bufs.arena, A_MOEOUT as usize, 1);
+        self.sink_set_buffer(&self.bufs.arena, self.arena().moein_off() as usize, 0);
+        self.sink_set_buffer(&self.bufs.arena, self.arena().moeout_off() as usize, 1);
         self.bind_blob(2);
         self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 3);
         self.bind_route(4);
@@ -1493,15 +1513,15 @@ impl StepEnc<'_> {
 
     fn encode_layer_moe_post_norm(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
         let l = &layout.layers[layer];
-        self.rmsnorm_f32(A_MOEOUT, A_MOEIN, l.post_ff_ln_2, HID as u32, CANVAS);
+        self.rmsnorm_f32(self.arena().moeout_off(), self.arena().moein_off(), l.post_ff_ln_2, HID as u32, CANVAS);
         Ok(())
     }
 
     fn encode_layer_moe_post_combine(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
         let l = &layout.layers[layer];
-        self.residual(A_DENSE, A_MOEIN, A_TMP, 0, CANVAS * HID);
-        self.rmsnorm(A_TMP, A_TMP, l.post_ff_ln, HID as u32, CANVAS);
-        self.residual(A_STREAM, A_TMP, A_HIDDEN, l.layer_scalar, CANVAS * HID);
+        self.residual(self.arena().dense_off(), self.arena().moein_off(), self.arena().tmp_off(), 0, CANVAS * HID);
+        self.rmsnorm(self.arena().tmp_off(), self.arena().tmp_off(), l.post_ff_ln, HID as u32, CANVAS);
+        self.residual(self.arena().stream_off(), self.arena().tmp_off(), self.arena().hidden_off(), l.layer_scalar, CANVAS * HID);
         Ok(())
     }
 
@@ -1528,8 +1548,8 @@ impl StepEnc<'_> {
         expert_id: u32,
     ) {
         let l = &layout.layers[layer];
-        self.rmsnorm(A_STREAM, A_MOEIN, l.pre_ff_ln_2, HID as u32, CANVAS);
-        self.memzero_bytes(A_MOEOUT, (CANVAS * HID * 4) as u64);
+        self.rmsnorm(self.arena().stream_off(), self.arena().moein_off(), l.pre_ff_ln_2, HID as u32, CANVAS);
+        self.memzero_bytes(self.arena().moeout_off(), (CANVAS * HID * 4) as u64);
         write_single_expert_route(&self.bufs.route, position, expert_id);
     }
 
@@ -1545,18 +1565,18 @@ impl StepEnc<'_> {
             ));
         }
         let layer_off = layer_byte_offset(layer);
-        self.memzero_bytes(A_MOEOUT, (CANVAS * HID * 4) as u64);
+        self.memzero_bytes(self.arena().moeout_off(), (CANVAS * HID * 4) as u64);
         self.memzero_bytes(
-            A_SOFT,
+            self.arena().soft_off(),
             (MOE_ACT_PROBE_FLOATS * std::mem::size_of::<f32>()) as u64,
         );
         self.sink_set_pipeline(&self.ps.moe_grouped_dump);
-        self.sink_set_buffer(&self.bufs.arena, A_MOEIN as usize, 0);
-        self.sink_set_buffer(&self.bufs.arena, A_MOEOUT as usize, 1);
+        self.sink_set_buffer(&self.bufs.arena, self.arena().moein_off() as usize, 0);
+        self.sink_set_buffer(&self.bufs.arena, self.arena().moeout_off() as usize, 1);
         self.bind_blob(2);
         self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 3);
         self.bind_route(4);
-        self.sink_set_buffer(&self.bufs.arena, A_SOFT as usize, 6);
+        self.sink_set_buffer(&self.bufs.arena, self.arena().soft_off() as usize, 6);
         let grouped_dims = crate::kernels::sub::moe_grouped::GroupedDims {
             canvas: CANVAS as u32,
             hidden: HID as u32,
@@ -1588,11 +1608,11 @@ impl StepEnc<'_> {
         let q_n = if l.is_full != 0 { 8192 } else { 4096 };
         let k_n = if l.is_full != 0 { 1024 } else { 2048 };
 
-        self.rmsnorm(A_HIDDEN, A_TMP, l.input_ln, HID as u32, CANVAS);
-        self.gemm_q4(A_TMP, A_ATTNQ, l.q_proj, CANVAS as u32, q_n, HID as u32)?;
-        self.gemm_q4(A_TMP, A_ATTNK, l.k_proj, CANVAS as u32, k_n, HID as u32)?;
+        self.rmsnorm(self.arena().hidden_off(), self.arena().tmp_off(), l.input_ln, HID as u32, CANVAS);
+        self.gemm_q4(self.arena().tmp_off(), self.arena().attnq_off(), l.q_proj, CANVAS as u32, q_n, HID as u32)?;
+        self.gemm_q4(self.arena().tmp_off(), self.arena().attnk_off(), l.k_proj, CANVAS as u32, k_n, HID as u32)?;
         if l.v_proj != 0 {
-            self.gemm_q4(A_TMP, A_ATTNV, l.v_proj, CANVAS as u32, k_n, HID as u32)?;
+            self.gemm_q4(self.arena().tmp_off(), self.arena().attnv_off(), l.v_proj, CANVAS as u32, k_n, HID as u32)?;
         }
         Ok(())
     }
@@ -1608,9 +1628,9 @@ impl StepEnc<'_> {
         let layer_off = layer_byte_offset(layer);
 
         self.sink_set_pipeline(&self.ps.qk_rope_kv);
-        self.sink_set_buffer(&self.bufs.arena, A_ATTNQ as usize, 0);
-        self.sink_set_buffer(&self.bufs.arena, A_ATTNK as usize, 1);
-        self.sink_set_buffer(&self.bufs.arena, A_ATTNV as usize, 2);
+        self.sink_set_buffer(&self.bufs.arena, self.arena().attnq_off() as usize, 0);
+        self.sink_set_buffer(&self.bufs.arena, self.arena().attnk_off() as usize, 1);
+        self.sink_set_buffer(&self.bufs.arena, self.arena().attnv_off() as usize, 2);
         self.bind_kvcache(3);
         self.bind_blob(4);
         self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 5);
@@ -1642,9 +1662,9 @@ impl StepEnc<'_> {
     ) -> Result<(), Error> {
         let layer_off = layer_byte_offset(layer);
         self.sink_set_pipeline(&self.ps.attention);
-        self.sink_set_buffer(&self.bufs.arena, A_ATTNQ as usize, 0);
+        self.sink_set_buffer(&self.bufs.arena, self.arena().attnq_off() as usize, 0);
         self.bind_kvcache(1);
-        self.sink_set_buffer(&self.bufs.arena, A_ATTNO as usize, 2);
+        self.sink_set_buffer(&self.bufs.arena, self.arena().attno_off() as usize, 2);
         self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 3);
         self.bind_params(4);
         let attn_dims = crate::kernels::sub::qk_rope_kv::AttnDims {
@@ -1693,13 +1713,13 @@ impl StepEnc<'_> {
             }
             StepStage::ScSoftembed => self.encode_sc_softembed(layout),
             StepStage::ScPreNorm => {
-                self.rmsnorm(A_SOFT, A_TMP, layout.sc_pre_norm, HID as u32, CANVAS);
+                self.rmsnorm(self.arena().soft_off(), self.arena().tmp_off(), layout.sc_pre_norm, HID as u32, CANVAS);
                 Ok(())
             }
             StepStage::ScGateGemm => {
                 self.gemm_q8(
-                    A_TMP,
-                    A_FFG,
+                    self.arena().tmp_off(),
+                    self.arena().ffg_off(),
                     layout.sc_gate,
                     CANVAS as u32,
                     DENSE_FF,
@@ -1708,8 +1728,8 @@ impl StepEnc<'_> {
             }
             StepStage::ScUpGemm => {
                 self.gemm_q8(
-                    A_TMP,
-                    A_FFU,
+                    self.arena().tmp_off(),
+                    self.arena().ffu_off(),
                     layout.sc_up,
                     CANVAS as u32,
                     DENSE_FF,
@@ -1717,13 +1737,13 @@ impl StepEnc<'_> {
                 )
             }
             StepStage::ScGlu => {
-                self.glu(A_FFG, A_FFU, A_FFG, CANVAS * DENSE_FF as usize);
+                self.glu(self.arena().ffg_off(), self.arena().ffu_off(), self.arena().ffg_off(), CANVAS * DENSE_FF as usize);
                 Ok(())
             }
             StepStage::ScDownGemm => {
                 self.gemm_q8(
-                    A_FFG,
-                    A_DENSE,
+                    self.arena().ffg_off(),
+                    self.arena().dense_off(),
                     layout.sc_down,
                     CANVAS as u32,
                     HID as u32,
@@ -1735,7 +1755,7 @@ impl StepEnc<'_> {
                 Ok(())
             }
             StepStage::RmsNormHidden => {
-                self.rmsnorm(A_HIDDEN, A_HIDDEN, 0, HID as u32, CANVAS);
+                self.rmsnorm(self.arena().hidden_off(), self.arena().hidden_off(), 0, HID as u32, CANVAS);
                 Ok(())
             }
             StepStage::LayerInputNormQkv => self.encode_layer_qkv_gemm(layer, layout),
@@ -1753,12 +1773,12 @@ impl StepEnc<'_> {
             StepStage::LayerMoePostNorm => self.encode_layer_moe_post_norm(layer, layout),
             StepStage::LayerMoePostCombine => self.encode_layer_moe_post_combine(layer, layout),
             StepStage::FinalNorm => {
-                self.rmsnorm(A_HIDDEN, A_TMP, layout.final_norm, HID as u32, CANVAS);
+                self.rmsnorm(self.arena().hidden_off(), self.arena().tmp_off(), layout.final_norm, HID as u32, CANVAS);
                 Ok(())
             }
             StepStage::LmHeadGemm => {
                 self.gemm_q8_logits(
-                    A_TMP,
+                    self.arena().tmp_off(),
                     layout.embed,
                     CANVAS as u32,
                     VOCAB as u32,
@@ -1835,7 +1855,7 @@ impl StepEnc<'_> {
         self.sink_set_pipeline(&self.ps.embed_gather);
         self.bind_blob(0);
         self.bind_state(1);
-        self.sink_set_buffer(&self.bufs.arena, A_HIDDEN as usize, 2);
+        self.sink_set_buffer(&self.bufs.arena, self.arena().hidden_off() as usize, 2);
         self.sink_set_bytes(&embed_off, 3);
         let dims = [HID as u32, CANVAS as u32];
         self.sink_set_bytes(&dims, 4);
@@ -1858,37 +1878,37 @@ impl StepEnc<'_> {
             self.encode_sc_logit_rowstats();
             self.encode_sc_softembed(layout)?;
 
-            self.rmsnorm(A_SOFT, A_TMP, layout.sc_pre_norm, HID as u32, CANVAS);
+            self.rmsnorm(self.arena().soft_off(), self.arena().tmp_off(), layout.sc_pre_norm, HID as u32, CANVAS);
             self.gemm_q8(
-                A_TMP,
-                A_FFG,
+                self.arena().tmp_off(),
+                self.arena().ffg_off(),
                 layout.sc_gate,
                 CANVAS as u32,
                 DENSE_FF,
                 HID as u32,
             )?;
             self.gemm_q8(
-                A_TMP,
-                A_FFU,
+                self.arena().tmp_off(),
+                self.arena().ffu_off(),
                 layout.sc_up,
                 CANVAS as u32,
                 DENSE_FF,
                 HID as u32,
             )?;
-            self.glu(A_FFG, A_FFU, A_FFG, CANVAS * DENSE_FF as usize);
+            self.glu(self.arena().ffg_off(), self.arena().ffu_off(), self.arena().ffg_off(), CANVAS * DENSE_FF as usize);
             self.gemm_q8(
-                A_FFG,
-                A_DENSE,
+                self.arena().ffg_off(),
+                self.arena().dense_off(),
                 layout.sc_down,
                 CANVAS as u32,
                 HID as u32,
                 DENSE_FF,
             )?;
         }
-        // first_step: A_DENSE stays zero; skip SC MLP + O(vocab) softembed.
+        // first_step: self.arena().dense_off() stays zero; skip SC MLP + O(vocab) softembed.
 
         self.dispatch_embed_gather(layout.embed);
-        self.rmsnorm(A_HIDDEN, A_HIDDEN, 0, HID as u32, CANVAS);
+        self.rmsnorm(self.arena().hidden_off(), self.arena().hidden_off(), 0, HID as u32, CANVAS);
         Ok(())
     }
 
@@ -1897,9 +1917,9 @@ impl StepEnc<'_> {
         layout: &ModelLayout,
         mode: StepFinishMode,
     ) -> Result<(), Error> {
-        self.rmsnorm(A_HIDDEN, A_TMP, layout.final_norm, HID as u32, CANVAS);
+        self.rmsnorm(self.arena().hidden_off(), self.arena().tmp_off(), layout.final_norm, HID as u32, CANVAS);
         self.gemm_q8_logits(
-            A_TMP,
+            self.arena().tmp_off(),
             layout.embed,
             CANVAS as u32,
             VOCAB as u32,
@@ -1920,7 +1940,7 @@ impl StepEnc<'_> {
 
         self.sink_set_pipeline(&self.ps.sample_rowstats);
         self.bind_logits(0);
-        self.sink_set_buffer(&self.bufs.arena, A_RS_SAMP as usize, 1);
+        self.sink_set_buffer(&self.bufs.arena, self.arena().rs_samp_off() as usize, 1);
         self.bind_state(2);
         self.bind_params(3);
         self.sink_set_bytes(&cols, 4);
@@ -1958,7 +1978,7 @@ impl StepEnc<'_> {
 
         self.sink_set_pipeline(&self.ps.sample_apply);
         self.bind_logits(0);
-        self.sink_set_buffer(&self.bufs.arena, A_RS_SAMP as usize, 1);
+        self.sink_set_buffer(&self.bufs.arena, self.arena().rs_samp_off() as usize, 1);
         self.bind_state(2);
         self.bind_params(3);
         self.sink_set_bytes(&cols, 4);
@@ -2243,9 +2263,9 @@ fn half_buffer_stats(
     (finite, max_abs)
 }
 
-fn arena_hidden_stats(arena: &ProtocolObject<dyn MTLBuffer>) -> (bool, f32, usize) {
+fn arena_hidden_stats(arena: &ProtocolObject<dyn MTLBuffer>, layout: &ArenaLayout) -> (bool, f32, usize) {
     let (finite, max_abs) =
-        half_buffer_stats(arena, A_HIDDEN as usize, CANVAS * HID, CANVAS * HID);
+        half_buffer_stats(arena, layout.hidden_off() as usize, CANVAS * HID, CANVAS * HID);
     let non_finite = if finite { 0 } else { 1 };
     (finite, max_abs, non_finite)
 }
@@ -2501,7 +2521,7 @@ impl StepRuntime {
     pub fn fill_moe_out_dgq_cpu(&mut self, layer: usize) -> Result<(), Error> {
         let route: RouteScratch = read_struct(&self.bufs.route);
         let routes = routes_from_route_scratch(&route);
-        let moe_in = read_half_buffer_f32(&self.bufs.arena, A_MOEIN as usize, CANVAS * HID);
+        let moe_in = read_half_buffer_f32(&self.bufs.arena, self.bufs.arena_map.moein_off() as usize, CANVAS * HID);
         let mut moe_out = vec![0.0f32; CANVAS * HID];
         let mut scratch = MoeScratch::new(CANVAS, &self.text_config);
         experts_forward_dgq_cpu(
@@ -2514,7 +2534,7 @@ impl StepRuntime {
             &routes,
             &mut scratch,
         )?;
-        write_f32_arena(&self.bufs.arena, A_MOEOUT, &moe_out);
+        write_f32_arena(&self.bufs.arena, self.bufs.arena_map.moeout_off(), &moe_out);
         Ok(())
     }
 
@@ -2671,7 +2691,7 @@ pub fn log_step_memory_budget(blob_bytes: u64, max_seq: usize, layout: &ModelLay
     let kv = kv_cache_bytes(layout, max_seq);
     let logits = (CANVAS * VOCAB * 2) as u64;
     let sc_probs = if use_sc_gemm { logits } else { 0 };
-    let arena = ARENA_BYTES;
+    let arena = step_arena_layout().bytes();
     let (mx, mw) = gemm_scratch_bytes();
     let gemm_scratch = (mx + mw) as u64;
     let gpu_static = kv + logits + sc_probs + arena + gemm_scratch;
@@ -2779,6 +2799,7 @@ pub fn build_step_runtime(
         std::sync::Arc::clone(&gpu_blob),
     )?;
 
+    let arena_map = step_arena_layout();
     let bufs = StepBuffers {
         blob: gpu_blob.buffer.clone(),
         layout: {
@@ -2791,7 +2812,7 @@ pub fn build_step_runtime(
             write_struct(&b, &params);
             b
         },
-        arena: alloc_buffer(&ctx.device, ARENA_BYTES as usize)?,
+        arena: alloc_buffer(&ctx.device, arena_map.bytes() as usize)?,
         kvcache: alloc_buffer(&ctx.device, kv_bytes)?,
         state: {
             let b = alloc_buffer(&ctx.device, std::mem::size_of::<CanvasState>())?;
@@ -2817,6 +2838,12 @@ pub fn build_step_runtime(
         gemm_a: alloc_buffer(&ctx.device, gemm_a_bytes)?,
         gemm_b: alloc_buffer(&ctx.device, gemm_b_bytes)?,
         expert_layer_unique: alloc_buffer(&ctx.device, N_LAYERS * std::mem::size_of::<u32>())?,
+        arena_map,
+        arena_layout_buf: {
+            let b = alloc_buffer(&ctx.device, std::mem::size_of::<ArenaLayout>())?;
+            write_struct(&b, &arena_map);
+            b
+        },
     };
     zero_buffer(&bufs.expert_layer_unique);
     zero_buffer(&bufs.arena);
@@ -2893,19 +2920,19 @@ pub fn run_step_probe(model_dir: &Path, cfg: StepSmokeConfig) -> Result<StepProb
         enc.encode_step_preamble(&layout, first_step)?;
         Ok(())
     })?;
-    let (f, m, _n) = arena_hidden_stats(&rt.bufs.arena);
+    let (f, m, _n) = arena_hidden_stats(&rt.bufs.arena, &rt.bufs.arena_map);
     push("after_preamble", f, m);
 
     for layer in 0..layers {
         rt.encode_full_layer(layer)?;
-        let (f, m, _n) = arena_hidden_stats(&rt.bufs.arena);
+        let (f, m, _n) = arena_hidden_stats(&rt.bufs.arena, &rt.bufs.arena_map);
         push(&format!("after_layer_{layer}"), f, m);
     }
 
     rt.dispatch_and_wait(|enc| {
-        enc.rmsnorm(A_HIDDEN, A_TMP, layout.final_norm, HID as u32, CANVAS);
+        enc.rmsnorm(enc.arena().hidden_off(), enc.arena().tmp_off(), layout.final_norm, HID as u32, CANVAS);
         enc.gemm_q8_logits(
-            A_TMP,
+            enc.arena().tmp_off(),
             layout.embed,
             CANVAS as u32,
             VOCAB as u32,
@@ -2983,7 +3010,7 @@ pub fn run_step_layer_hidden_probe(
         Ok(())
     })?;
     {
-        let hidden = read_arena_hidden_row(&rt.bufs.arena, A_HIDDEN, position);
+        let hidden = read_arena_hidden_row(&rt.bufs.arena, rt.bufs.arena_map.hidden_off(), position);
         let (hidden_l2, hidden_max_abs) = hidden_vec_stats(&hidden);
         checkpoints.push(LayerHiddenProbeCheckpoint {
             label: "after_preamble".into(),
@@ -2996,7 +3023,7 @@ pub fn run_step_layer_hidden_probe(
 
     for layer in 0..layers {
         rt.encode_full_layer(layer)?;
-        let hidden = read_arena_hidden_row(&rt.bufs.arena, A_HIDDEN, position);
+        let hidden = read_arena_hidden_row(&rt.bufs.arena, rt.bufs.arena_map.hidden_off(), position);
         let (hidden_l2, hidden_max_abs) = hidden_vec_stats(&hidden);
         checkpoints.push(LayerHiddenProbeCheckpoint {
             label: format!("after_layer_{layer}"),
@@ -3008,11 +3035,11 @@ pub fn run_step_layer_hidden_probe(
     }
 
     rt.dispatch_and_wait(|enc| {
-        enc.rmsnorm(A_HIDDEN, A_TMP, layout.final_norm, HID as u32, CANVAS);
+        enc.rmsnorm(enc.arena().hidden_off(), enc.arena().tmp_off(), layout.final_norm, HID as u32, CANVAS);
         Ok(())
     })?;
     {
-        let hidden = read_arena_hidden_row(&rt.bufs.arena, A_TMP, position);
+        let hidden = read_arena_hidden_row(&rt.bufs.arena, rt.bufs.arena_map.tmp_off(), position);
         let (hidden_l2, hidden_max_abs) = hidden_vec_stats(&hidden);
         checkpoints.push(LayerHiddenProbeCheckpoint {
             label: "after_final_norm".into(),
@@ -3055,10 +3082,10 @@ pub fn run_step_preamble_capture(
     let layout = rt.layout;
 
     rt.dispatch_and_wait(|enc| enc.encode_preamble_embed_only(&layout))?;
-    let embed_scaled = read_arena_hidden_row(&rt.bufs.arena, A_HIDDEN, position);
+    let embed_scaled = read_arena_hidden_row(&rt.bufs.arena, rt.bufs.arena_map.hidden_off(), position);
 
     rt.dispatch_and_wait(|enc| enc.encode_step_preamble(&layout, 1))?;
-    let after_preamble = read_arena_hidden_row(&rt.bufs.arena, A_HIDDEN, position);
+    let after_preamble = read_arena_hidden_row(&rt.bufs.arena, rt.bufs.arena_map.hidden_off(), position);
 
     let state = rt.read_canvas_state();
     Ok(PreambleCapture {
@@ -3083,7 +3110,7 @@ pub fn run_embed_row_gpu(
     rt.write_canvas_state(&state);
     let layout = rt.layout;
     rt.dispatch_and_wait(|enc| enc.encode_preamble_embed_only(&layout))?;
-    Ok(read_arena_hidden_row(&rt.bufs.arena, A_HIDDEN, 0))
+    Ok(read_arena_hidden_row(&rt.bufs.arena, rt.bufs.arena_map.hidden_off(), 0))
 }
 
 /// Query heads in the monolithic step-kernel shader (`NQ_HEADS` in diffgemma_step.metal).
@@ -3203,7 +3230,7 @@ pub fn run_step_attn_layer_capture(
         rt.encode_full_layer(l)?;
     }
 
-    let hidden_in = read_arena_hidden_row(&rt.bufs.arena, A_HIDDEN, position);
+    let hidden_in = read_arena_hidden_row(&rt.bufs.arena, rt.bufs.arena_map.hidden_off(), position);
 
     rt.dispatch_and_wait(|enc| {
         enc.encode_layer_qkv_gemm(layer, &layout)?;
@@ -3218,8 +3245,8 @@ pub fn run_step_attn_layer_capture(
     let kv_len = rt.read_params().kv_len;
     let total_kv = kv_len as usize + CANVAS;
 
-    let hidden_ln = read_arena_hidden_row(&rt.bufs.arena, A_TMP, position);
-    let q_raw_proj = read_arena_row(&rt.bufs.arena, A_ATTNQ, position, q_width);
+    let hidden_ln = read_arena_hidden_row(&rt.bufs.arena, rt.bufs.arena_map.tmp_off(), position);
+    let q_raw_proj = read_arena_row(&rt.bufs.arena, rt.bufs.arena_map.attnq_off(), position, q_width);
     let q_norm_w = DgqStore::open(model_dir)?
         .tensor_f32(&format!("model.decoder.layers.{layer}.self_attn.q_norm.weight"))?;
     let mut q_pre_rope = q_raw_proj.clone();
@@ -3237,9 +3264,9 @@ pub fn run_step_attn_layer_capture(
         Ok(())
     })?;
 
-    let q_all = read_half_buffer_f32(&rt.bufs.arena, A_ATTNQ as usize, CANVAS * q_width);
-    let q_post_rope = read_arena_row(&rt.bufs.arena, A_ATTNQ, position, q_width);
-    let attn_out = read_arena_row(&rt.bufs.arena, A_ATTNO, position, q_width);
+    let q_all = read_half_buffer_f32(&rt.bufs.arena, rt.bufs.arena_map.attnq_off() as usize, CANVAS * q_width);
+    let q_post_rope = read_arena_row(&rt.bufs.arena, rt.bufs.arena_map.attnq_off(), position, q_width);
+    let attn_out = read_arena_row(&rt.bufs.arena, rt.bufs.arena_map.attno_off(), position, q_width);
     let k_cache = read_layer_k_cache_f32(rt.kvcache(), &layout, layer, total_kv);
 
     let raw_scores = row_raw_scores(&q_all, &k_cache, position, total_kv, n_heads, nkv, hd);
@@ -3570,7 +3597,7 @@ pub fn run_step_moe_batched_pin_capture(
     })?;
 
     let route: RouteScratch = read_struct(&rt.bufs.route);
-    let moe_in = read_half_buffer_f32(&rt.bufs.arena, A_MOEIN as usize, CANVAS * HID);
+    let moe_in = read_half_buffer_f32(&rt.bufs.arena, rt.bufs.arena_map.moein_off() as usize, CANVAS * HID);
     let slots = route.num_slots as usize;
     let gu_elems = slots * (MOE_FF as usize) * 2;
     let act_elems = slots * MOE_FF as usize;
@@ -3604,7 +3631,7 @@ pub fn run_step_moe_batched_pin_capture(
         enc.encode_moe_batched_scatter()?;
         Ok(())
     })?;
-    let gpu_scatter = read_f32_arena(&rt.bufs.arena, A_MOEOUT, CANVAS * HID);
+    let gpu_scatter = read_f32_arena(&rt.bufs.arena, rt.bufs.arena_map.moeout_off(), CANVAS * HID);
 
     let blob = unsafe {
         std::slice::from_raw_parts(
@@ -3688,11 +3715,11 @@ pub fn run_step_moe_route_capture(
         Ok(())
     })?;
     let grouped_dispatched = true;
-    let moe_out_gpu = read_f32_arena(&rt.bufs.arena, A_MOEOUT, CANVAS * HID);
+    let moe_out_gpu = read_f32_arena(&rt.bufs.arena, rt.bufs.arena_map.moeout_off(), CANVAS * HID);
     let moe_out_l2 = Some(vector_l2(&moe_out_gpu));
     let moe_out_nonzero = Some(count_nonzero_f32(&moe_out_gpu, 1e-9));
     rt.fill_moe_out_dgq_cpu(layer)?;
-    let moe_out_cpu = read_f32_arena(&rt.bufs.arena, A_MOEOUT, CANVAS * HID);
+    let moe_out_cpu = read_f32_arena(&rt.bufs.arena, rt.bufs.arena_map.moeout_off(), CANVAS * HID);
     let moe_out_gpu_cpu_cos = Some(cosine_f32(&moe_out_gpu, &moe_out_cpu));
     let moe_out_gpu_cpu_rel_l2 = Some(rel_l2_f32(&moe_out_cpu, &moe_out_gpu));
 
@@ -3737,7 +3764,7 @@ pub fn run_step_moe_layer_capture(
         enc.encode_layer_o_proj_post_attn(layer, &layout)?;
         Ok(())
     })?;
-    let post_attn = read_arena_hidden_row(&rt.bufs.arena, A_STREAM, position);
+    let post_attn = read_arena_hidden_row(&rt.bufs.arena, rt.bufs.arena_map.stream_off(), position);
 
     let store = DgqStore::open(model_dir)?;
     let p = format!("model.decoder.layers.{layer}.router");
@@ -3752,7 +3779,7 @@ pub fn run_step_moe_layer_capture(
     );
 
     rt.dispatch_and_wait(|enc| enc.encode_layer_dense_ffn(layer, &layout))?;
-    let dense_out = read_arena_hidden_row(&rt.bufs.arena, A_DENSE, position);
+    let dense_out = read_arena_hidden_row(&rt.bufs.arena, rt.bufs.arena_map.dense_off(), position);
 
     rt.dispatch_and_wait(|enc| enc.encode_layer_router_buckets(layer, &layout))?;
 
@@ -3772,13 +3799,13 @@ pub fn run_step_moe_layer_capture(
     rt.dispatch_and_wait(|enc| enc.encode_layer_moe_grouped(layer, &layout))?;
     let (experts, expert_weights) = read_route_at_position(&rt.bufs.route, position);
 
-    let moe_out = read_f32_arena_row(&rt.bufs.arena, A_MOEOUT, position, HID);
+    let moe_out = read_f32_arena_row(&rt.bufs.arena, rt.bufs.arena_map.moeout_off(), position, HID);
 
     rt.dispatch_and_wait(|enc| enc.encode_layer_moe_post_norm(layer, &layout))?;
-    let moe_out_ln = read_arena_hidden_row(&rt.bufs.arena, A_MOEIN, position);
+    let moe_out_ln = read_arena_hidden_row(&rt.bufs.arena, rt.bufs.arena_map.moein_off(), position);
 
     rt.dispatch_and_wait(|enc| enc.encode_layer_moe_post_combine(layer, &layout))?;
-    let layer_out = read_arena_hidden_row(&rt.bufs.arena, A_HIDDEN, position);
+    let layer_out = read_arena_hidden_row(&rt.bufs.arena, rt.bufs.arena_map.hidden_off(), position);
 
     let state = rt.read_canvas_state();
     Ok(LayerMoeCapture {
@@ -3858,14 +3885,14 @@ pub fn run_step_moe_single_expert_capture(
         Ok(())
     })?;
 
-    let moe_in = read_arena_row(&rt.bufs.arena, A_MOEIN, position, HID);
+    let moe_in = read_arena_row(&rt.bufs.arena, rt.bufs.arena_map.moein_off(), position, HID);
 
     rt.dispatch_and_wait(|enc| {
         enc.encode_layer_moe_grouped_act_probe(layer, &layout)?;
         Ok(())
     })?;
-    let gpu_out = read_f32_arena_row(&rt.bufs.arena, A_MOEOUT, position, HID);
-    let act_probe = read_f32_arena(&rt.bufs.arena, A_SOFT, MOE_ACT_PROBE_FLOATS);
+    let gpu_out = read_f32_arena_row(&rt.bufs.arena, rt.bufs.arena_map.moeout_off(), position, HID);
+    let act_probe = read_f32_arena(&rt.bufs.arena, rt.bufs.arena_map.soft_off(), MOE_ACT_PROBE_FLOATS);
     let moe_ff = MOE_FF as usize;
     let gpu_act_after_barrier = act_probe[..moe_ff].to_vec();
     let gpu_act_at_down_read = act_probe[moe_ff..moe_ff * 2].to_vec();
@@ -3972,15 +3999,15 @@ pub fn run_step_forward(model_dir: &Path, cfg: &StepSmokeConfig) -> Result<StepF
     for layer in 0..layers {
         rt.dispatch_and_wait(|enc| enc.encode_full_layer(layer, &layout))?;
     }
-    // Snapshot final norm before lm_head; gemm_q8_logits clobbers A_TMP on GPU.
+    // Snapshot final norm before lm_head; gemm_q8_logits clobbers self.arena().tmp_off() on GPU.
     rt.dispatch_and_wait(|enc| {
-        enc.rmsnorm(A_HIDDEN, A_TMP, layout.final_norm, HID as u32, CANVAS);
+        enc.rmsnorm(enc.arena().hidden_off(), enc.arena().tmp_off(), layout.final_norm, HID as u32, CANVAS);
         Ok(())
     })?;
-    let norm_hidden = read_half_buffer_f32(&rt.bufs.arena, A_TMP as usize, CANVAS * HID);
+    let norm_hidden = read_half_buffer_f32(&rt.bufs.arena, rt.bufs.arena_map.tmp_off() as usize, CANVAS * HID);
     rt.dispatch_and_wait(|enc| {
         enc.gemm_q8_logits(
-            A_TMP,
+            enc.arena().tmp_off(),
             layout.embed,
             CANVAS as u32,
             VOCAB as u32,
@@ -4433,7 +4460,7 @@ mod tests {
             Ok(())
         })
         .expect("slow sc softembed");
-        let slow = read_half_buffer_f32(&rt.bufs.arena, A_SOFT as usize, soft_elems);
+        let slow = read_half_buffer_f32(&rt.bufs.arena, rt.bufs.arena_map.soft_off() as usize, soft_elems);
 
         rt.dispatch_and_wait(|enc| {
             enc.encode_sc_logit_rowstats();
@@ -4441,7 +4468,7 @@ mod tests {
             Ok(())
         })
         .expect("fast sc gemm softembed");
-        let fast = read_half_buffer_f32(&rt.bufs.arena, A_SOFT as usize, soft_elems);
+        let fast = read_half_buffer_f32(&rt.bufs.arena, rt.bufs.arena_map.soft_off() as usize, soft_elems);
 
         let mut dot = 0.0f64;
         let mut na = 0.0f64;
@@ -4494,7 +4521,7 @@ mod tests {
     fn snapshot_step_gpu(rt: &StepRuntime) -> StepGpuSnapshot {
         StepGpuSnapshot {
             state: rt.read_canvas_state(),
-            arena: read_buffer_bytes(&rt.bufs.arena, 0, ARENA_BYTES as usize),
+            arena: read_buffer_bytes(&rt.bufs.arena, 0, rt.bufs.arena_map.bytes() as usize),
             logits: read_buffer_bytes(&rt.bufs.logits, 0, CANVAS * VOCAB * 2),
             sc_probs: read_buffer_bytes(&rt.bufs.sc_probs, 0, rt.bufs.sc_probs.length()),
             kvcache: read_buffer_bytes(&rt.bufs.kvcache, 0, rt.bufs.kvcache.length()),

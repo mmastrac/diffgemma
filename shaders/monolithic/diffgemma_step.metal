@@ -14,6 +14,7 @@
 //                                         Safe: serial dispatches within an encoder + command
 //                                         buffer completion order across replays.
 // b7  route    device RouteScratch*
+// b8  arena_layout  device const ArenaLayout*  scratch plane byte offsets (host-built)
 //
 // FORMATS (authoritative: src/dgq/block.rs, shaders/include/dequant.metal):
 //   q4_block group (20B): [scale bf16:2][min bf16:2][nibbles:16]; w = scale*q + min;
@@ -38,6 +39,7 @@ using namespace metal;
 
 #include "dequant.metal"
 #include "activations.metal"
+#include "arena_layout.metal"
 
 constant uint  HID = 2816;
 constant uint  VOCAB = 262144;
@@ -55,25 +57,7 @@ constant bool IS_FULL_LAYER [[function_constant(1)]];
 constant uint GEMM_N [[function_constant(2)]];
 constant uint GEMM_K [[function_constant(3)]];
 
-// ---- arena BYTE offsets (driver binds b3 sub-ranges; all 16B-aligned) ----
-// half planes unless noted f32
-constant uint A_HIDDEN  = 0;         // [256][2816] h
-constant uint A_RESID   = 1441792;   // [256][2816] h
-constant uint A_ATTNQ   = 2883584;   // [256][8192] h (max: full-layer Q)
-constant uint A_ATTNK   = 7077888;   // [256][2048] h (max: sliding K)
-constant uint A_ATTNV   = 8126464;   // [256][2048] h
-constant uint A_ATTNO   = 9175040;   // [256][8192] h
-constant uint A_FFG     = 13369344;  // [256][2112] h
-constant uint A_FFU     = 14450688;  // [256][2112] h
-constant uint A_MOEIN   = 15532032;  // [256][2816] h
-constant uint A_DENSE   = 16973824;  // [256][2816] h
-constant uint A_MOEOUT  = 18415616;  // [256][2816] f32
-constant uint A_SOFT    = 21299200;  // [256][2816] h
-constant uint A_STREAM  = 22740992;  // [256][2816] h
-constant uint A_TMP     = 24182784;  // [256][2816] h
-constant uint A_RS_SC   = 25624576;  // [256][2]   f32  (t=1 stats for SC)
-constant uint A_RS_SAMP = 25626624;  // [256][2]   f32  (tempered stats for sampler)
-// arena total: 25,628,672 B
+// Arena plane offsets: see ArenaLayout (b8), built by Rust build_arena_layout().
 
 struct LayerOffsets {
     ulong input_ln, q_proj, q_norm, k_proj, k_norm, v_proj, o_proj, post_attn_ln;
@@ -144,32 +128,32 @@ struct RouteScratch {
 // this layout before integration. Encoder prefill kernels are intentionally out of scope.
 //
 // step start:
-//   0. [step>0] k_logit_rowstats(logits)                      -> A_RS_SC
-//   1. k_sc_softembed(logits, A_RS_SC, first_step=S.step==0)  -> A_SOFT
-//   2. k_rmsnorm(A_SOFT, sc_pre_norm)                         -> A_TMP
-//      k_gemm_q8(sc_gate: N=2112,K=2816) -> A_FFG ; k_gemm_q8(sc_up) -> A_FFU
-//      k_glu -> A_FFG ; k_gemm_q8(sc_down: N=2816,K=2112)     -> A_DENSE (reuse)
-//   3. k_embed_gather -> A_HIDDEN ; k_residual(A_HIDDEN, A_DENSE, scal=0) -> A_HIDDEN
-//      k_rmsnorm(A_HIDDEN, w=0 no-scale)                      -> A_HIDDEN
+//   0. [step>0] k_logit_rowstats(logits)                      -> arena.a_rs_sc
+//   1. k_sc_softembed(logits, a_rs_sc, first_step=S.step==0)  -> arena.a_soft
+//   2. k_rmsnorm(a_soft, sc_pre_norm)                         -> arena.a_tmp
+//      k_gemm_q8(sc_gate: N=2112,K=2816) -> a_ffg ; k_gemm_q8(sc_up) -> a_ffu
+//      k_glu -> a_ffg ; k_gemm_q8(sc_down: N=2816,K=2112)     -> a_dense (reuse)
+//   3. k_embed_gather -> a_hidden ; k_residual(a_hidden, a_dense, scal=0) -> a_hidden
+//      k_rmsnorm(a_hidden, w=0 no-scale)                      -> a_hidden
 // per layer L (pipelines specialized by IS_FULL_LAYER + GEMM_N/K):
-//   4. k_rmsnorm(input_ln) -> A_TMP
-//      k_gemm_q4 q (N=4096|8192) -> A_ATTNQ ; k (N=2048|1024) -> A_ATTNK
-//      [sliding only] k_gemm_q4 v -> A_ATTNV
+//   4. k_rmsnorm(input_ln) -> a_tmp
+//      k_gemm_q4 q (N=4096|8192) -> a_attnq ; k (N=2048|1024) -> a_attnk
+//      [sliding only] k_gemm_q4 v -> a_attnv
 //   5. qk_rope_kv (grid.y = 16 + 2*nkv) ; attention (grid = 256 x 16, tpg 64)
-//      k_gemm_q4 o_proj (N=2816, K=4096|8192) -> A_TMP
-//   6. k_rmsnorm(A_TMP, post_attn) -> A_TMP ; k_residual(A_HIDDEN, A_TMP, 0) -> A_STREAM
-//   7. k_rmsnorm(A_STREAM, pre_ff) -> A_TMP
-//      k_gemm_q4 mlp_gate -> A_FFG ; mlp_up -> A_FFU ; k_glu -> A_FFG
-//      k_gemm_q4 mlp_down -> A_DENSE ; k_rmsnorm(A_DENSE, post_ff_1) -> A_DENSE
+//      k_gemm_q4 o_proj (N=2816, K=4096|8192) -> a_tmp
+//   6. k_rmsnorm(a_tmp, post_attn) -> a_tmp ; k_residual(a_hidden, a_tmp, 0) -> a_stream
+//   7. k_rmsnorm(a_stream, pre_ff) -> a_tmp
+//      k_gemm_q4 mlp_gate -> a_ffg ; mlp_up -> a_ffu ; k_glu -> a_ffg
+//      k_gemm_q4 mlp_down -> a_dense ; k_rmsnorm(a_dense, post_ff_1) -> a_dense
 //   8. moe_router (grid = 256, tpg 128)
 //      moe_bucket_count(128) ; moe_bucket_fill phase0(2048) ; phase1(1) ; phase2(2048)
-//   9. k_rmsnorm(A_STREAM, pre_ff_2) -> A_MOEIN ; k_memzero(A_MOEOUT)
+//   9. k_rmsnorm(a_stream, pre_ff_2) -> a_moein ; k_memzero(a_moeout)
 //      moe_grouped (grid = maxM x 128, tpg 128) — production K_DUMP_STAGE=0 only
-//      [A_MOEOUT f32] -> k_rmsnorm_f32(post_ff_2) -> A_MOEIN
-//  10. k_residual(A_DENSE, A_MOEIN, 0) -> A_TMP ; k_rmsnorm(A_TMP, post_ff) -> A_TMP
-//      k_residual(A_STREAM, A_TMP, layer_scalar) -> A_HIDDEN
+//      [a_moeout f32] -> k_rmsnorm_f32(post_ff_2) -> a_moein
+//  10. k_residual(a_dense, a_moein, 0) -> a_tmp ; k_rmsnorm(a_tmp, post_ff) -> a_tmp
+//      k_residual(a_stream, a_tmp, layer_scalar) -> a_hidden
 // finish:
-//  11. k_rmsnorm(A_HIDDEN, final_norm) -> A_TMP
+//  11. k_rmsnorm(a_hidden, final_norm) -> a_tmp
 //      k_gemm_q8 lm_head (N=262144, K=2816, weights=embed) -> logits ; k_softcap
 //  12. sample_rowstats(tpg 256) ; sample_commit(tpg 256) ;
 //      sample_apply(grid 256, tpg 256) ; sample_write(1)
