@@ -29,6 +29,9 @@ use std::time::Instant;
 #[path = "step_schedule.rs"]
 mod step_schedule;
 
+#[path = "arena_liveness.rs"]
+pub(crate) mod arena_liveness;
+
 const STEP_SHADER: &str = shader_include::include_metal!("monolithic/diffgemma_step.metal");
 
 pub const HID: usize = 2816;
@@ -1809,6 +1812,17 @@ impl StepEnc<'_> {
         first_step: u32,
         finish: StepFinishMode,
     ) -> Result<(), Error> {
+        if arena_liveness::runtime_arena_liveness_enabled() {
+            if let Err(e) = arena_liveness::check_step_arena_liveness(
+                &self.block_profile,
+                layout,
+                layers,
+                first_step,
+                finish,
+            ) {
+                panic!("{e}");
+            }
+        }
         let schedule =
             step_schedule::build_step_schedule(&self.block_profile, finish == StepFinishMode::Full);
         for stage in step_schedule::build_preamble(first_step) {
