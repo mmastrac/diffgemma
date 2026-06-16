@@ -43,6 +43,7 @@ pub mod rms_norm_rows;
 pub mod rms_norm_rows_tiled;
 pub mod router_scale_rows;
 pub mod router_top_k_rows;
+pub mod sc_prob_cols;
 pub mod sc_probs;
 pub mod sc_softembed;
 pub mod sample_apply;

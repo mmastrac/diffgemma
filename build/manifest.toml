@@ -125,6 +125,18 @@ quant_formats = [1]
 [[kernel.variants]]
 
 [[kernel]]
+name = "sc_prob_cols"
+entry = "sc_prob_cols"
+quant_formats = [0]
+
+[kernel.fc]
+1 = "K_SHAPE_ASSERT"
+2 = "K_DUMP_STAGE"
+3 = "K_QUANT_FORMAT"
+
+[[kernel.variants]]
+
+[[kernel]]
 name = "sc_probs"
 entry = "sc_probs"
 quant_formats = [0]
