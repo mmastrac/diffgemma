@@ -1,5 +1,6 @@
 //! Stable row softmax — CPU oracle, GPU dispatch, tier-1 tests + invariants.
 
+use super::sampler_ranged::{CANVAS_LEN, VOCAB};
 use super::test_util::ElemFormat;
 use super::variant::KernelVariant;
 use crate::kernels::cpu;
@@ -58,6 +59,20 @@ pub fn wide_cols_fixture(_fmt: ElemFormat) -> Fixture {
     Fixture {
         logits: (0..len)
             .map(|i| (i as f32 % 17.0) - 8.0)
+            .collect(),
+        rows,
+        cols,
+    }
+}
+
+/// Production canvas × vocab softmax (256 rows, 262k cols).
+pub fn canvas_vocab_fixture(_fmt: ElemFormat) -> Fixture {
+    let rows = CANVAS_LEN;
+    let cols = VOCAB;
+    let len = rows * cols;
+    Fixture {
+        logits: (0..len)
+            .map(|i| ((i as f32) * 0.000007).sin() * 0.6 + ((i as f32) * 0.000003).cos() * 0.3)
             .collect(),
         rows,
         cols,
@@ -249,6 +264,18 @@ mod tests {
         out_len = crate::kernels::sub::softmax_rows::fixture_len,
         formats: [F32],
         max_tol = 1e-5,
+        min_cos = 0.9999,
+    }
+
+    kernel_oracle_matrix! {
+        mod canvas_vocab,
+        cpu = crate::kernels::sub::softmax_rows::cpu,
+        cpu_oracle = crate::kernels::sub::softmax_rows::cpu_oracle,
+        gpu = crate::kernels::sub::softmax_rows::gpu,
+        fixture = crate::kernels::sub::softmax_rows::canvas_vocab_fixture,
+        out_len = crate::kernels::sub::softmax_rows::fixture_len,
+        formats: [F32],
+        max_tol = 1e-4,
         min_cos = 0.9999,
     }
 

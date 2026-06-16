@@ -170,7 +170,76 @@ pub fn full_layer_fixture(_: ElemFormat) -> Fixture {
     }
 }
 
-/// Decoder canvas attention: 32 canvas queries × (14 prompt + 32 canvas) KV.
+/// Decoder canvas with sparse attend mask (not all_valid).
+pub fn sparse_decoder_bitmap_fixture(_: ElemFormat) -> Fixture {
+    let canvas_len = 32usize;
+    let kv_cache_len = 14usize;
+    let total_kv = kv_cache_len + canvas_len;
+    let n_heads = 16usize;
+    let n_kv_heads = 8usize;
+    let head_dim = 256usize;
+    let (q, k, v) = qkv(canvas_len, total_kv, n_heads, n_kv_heads, head_dim, 0.018, 0.015);
+    let mut attend = vec![true; canvas_len * total_kv];
+    for q in 0..canvas_len {
+        for k in kv_cache_len..total_kv {
+            if (q + k) % 5 == 0 {
+                attend[q * total_kv + k] = false;
+            }
+        }
+        if q % 7 == 0 {
+            for k in 0..kv_cache_len {
+                attend[q * total_kv + k] = false;
+            }
+        }
+    }
+    Fixture {
+        q,
+        k,
+        v,
+        params: AttentionParams {
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            rotary_dim: head_dim,
+            n_groups: n_heads / n_kv_heads,
+            sliding_window: None,
+        },
+        seq_len: canvas_len,
+        total_kv,
+        mask: MaskMode::DecoderBitmap(DecoderAttnMask {
+            canvas_len,
+            kv_cache_len,
+            attend,
+        }),
+    }
+}
+
+/// Sliding window smaller than seq — exercises distant-past masking.
+pub fn sliding_tight_fixture(_: ElemFormat) -> Fixture {
+    let seq_len = 128usize;
+    let n_heads = 16usize;
+    let n_kv_heads = 8usize;
+    let head_dim = 256usize;
+    let (q, k, v) = qkv(seq_len, seq_len, n_heads, n_kv_heads, head_dim, 0.012, 0.010);
+    Fixture {
+        q,
+        k,
+        v,
+        params: AttentionParams {
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            rotary_dim: head_dim,
+            n_groups: n_heads / n_kv_heads,
+            sliding_window: Some(32),
+        },
+        seq_len,
+        total_kv: seq_len,
+        mask: MaskMode::CausalSliding,
+    }
+}
+
+/// Decoder canvas attention: 32 canvas queries × (14 prompt + 32 canvas) KV, all_valid mask.
 pub fn decoder_bitmap_fixture(_: ElemFormat) -> Fixture {
     let canvas_len = 32usize;
     let kv_cache_len = 14usize;
@@ -390,6 +459,16 @@ mod tests {
         run_matrix(decoder_bitmap_fixture, 1e-4);
     }
 
+    #[test]
+    fn cpu_sparse_decoder_bitmap() {
+        run_matrix(sparse_decoder_bitmap_fixture, 1e-4);
+    }
+
+    #[test]
+    fn cpu_sliding_tight() {
+        run_matrix(sliding_tight_fixture, 1e-4);
+    }
+
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn gpu_tiny() {
@@ -418,5 +497,17 @@ mod tests {
     #[test]
     fn gpu_decoder_bitmap() {
         run_matrix(decoder_bitmap_fixture, 1e-4);
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn gpu_sparse_decoder_bitmap() {
+        run_matrix(sparse_decoder_bitmap_fixture, 1e-4);
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn gpu_sliding_tight() {
+        run_matrix(sliding_tight_fixture, 1e-4);
     }
 }
