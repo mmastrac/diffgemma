@@ -284,6 +284,7 @@ fn generate_inner(
             gen_cfg.sampler.confidence_threshold,
             gen_cfg.sampler.accept_plateau_threshold,
             gen_cfg.sampler.plateau_prefix_mean_max,
+            1,
         );
         stopper.reset();
 

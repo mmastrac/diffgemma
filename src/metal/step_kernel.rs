@@ -37,6 +37,7 @@ const STEP_SHADER: &str = shader_include::include_metal!("monolithic/diffgemma_s
 pub const HID: usize = 2816;
 pub const VOCAB: usize = 262144;
 pub const CANVAS: usize = 256;
+pub const ARGMAX_HIST_MAX: usize = crate::sample::ARGMAX_HIST_MAX;
 pub const N_LAYERS: usize = 30;
 pub const N_EXPERTS: usize = 128;
 pub const TOP_K: usize = 8;
@@ -129,6 +130,7 @@ pub struct StepParams {
     pub min_early_stop_steps: u32,
     pub accept_plateau_threshold: u32,
     pub plateau_prefix_mean_max: f32,
+    pub eos_token_id: u32,
 }
 
 #[repr(C)]
@@ -144,8 +146,10 @@ pub struct CanvasState {
     pub rng_state: u64,
     pub step: u32,
     pub stop_flag: u32,
-    pub argmax_stable: u32,
-    pub argmax_changed: u32,
+    pub argmax_hist_len: u32,
+    pub argmax_hist_base: u32,
+    pub argmax_hist: [u32; CANVAS * ARGMAX_HIST_MAX],
+    pub canvas_stable: u32,
     pub mean_entropy: f32,
     pub accept_plateau: u32,
     pub prev_accept_sig: u32,
@@ -411,6 +415,15 @@ fn step_use_sc_chunked_from_env() -> bool {
     match std::env::var("DGQ_SC_CHUNKED") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
         Err(_) => step_use_sc_chunked_default(),
+    }
+}
+
+/// Monolithic SC reads logits produced at the previous finish. MLX applies temperature
+/// before the soft-embed softmax; set `DGQ_SC_PRE_TEMP=1` to keep legacy pre-temperature logits.
+fn monolithic_sc_pre_temp() -> bool {
+    match std::env::var("DGQ_SC_PRE_TEMP") {
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        Err(_) => false,
     }
 }
 
@@ -1148,6 +1161,15 @@ impl StepEnc<'_> {
         self.sink_set_buffer(&self.bufs.arena, y_off as usize, 0);
         self.sink_set_bytes(&(elems as u32), 1);
         self.sink_set_bytes(&scale, 2);
+        self.dispatch_1d(&self.ps.half_scale, elems, 256);
+    }
+
+    fn scale_half_logits(&mut self, elems: usize, scale: f32) {
+        self.sink_set_pipeline(&self.ps.half_scale);
+        self.bind_logits(0);
+        self.sink_set_bytes(&(elems as u32), 1);
+        self.sink_set_bytes(&scale, 2);
+        self.sink_set_buffer(&self.bufs.dummy_dump, 0, 3);
         self.dispatch_1d(&self.ps.half_scale, elems, 256);
     }
 
@@ -2085,7 +2107,9 @@ impl StepEnc<'_> {
         self.sink_set_bytes(&cols, 4);
         self.sink_set_bytes(&pad, 5);
         self.sink_set_bytes(&filler, 6);
-        self.bind_debug_status(7);
+        let eos = read_struct::<StepParams>(&self.bufs.params).eos_token_id;
+        self.sink_set_bytes(&eos, 7);
+        self.bind_debug_status(8);
         let grid = MTLSize {
             width: CANVAS,
             height: 1,
@@ -2104,7 +2128,9 @@ impl StepEnc<'_> {
         self.sink_set_bytes(&canvas, 2);
         self.sink_set_bytes(&pad, 3);
         self.sink_set_bytes(&filler, 4);
-        self.bind_debug_status(5);
+        let eos = read_struct::<StepParams>(&self.bufs.params).eos_token_id;
+        self.sink_set_bytes(&eos, 5);
+        self.bind_debug_status(6);
         let tg = MTLSize {
             width: 256,
             height: 1,
@@ -2152,6 +2178,13 @@ impl StepEnc<'_> {
             depth: 1,
         };
         self.sink_dispatch(grid, tg);
+
+        if !monolithic_sc_pre_temp() {
+            let st: CanvasState = read_struct(&self.bufs.state);
+            let params: StepParams = read_struct(&self.bufs.params);
+            let t = scheduled_temperature(st.step, &params).max(1e-6);
+            self.scale_half_logits(CANVAS * VOCAB, 1.0 / t);
+        }
         Ok(())
     }
 }
@@ -2176,8 +2209,10 @@ pub fn init_canvas_state_from_rng(vocab: usize, rng: &mut Rng) -> CanvasState {
         rng_state: rng.state(),
         step: 0,
         stop_flag: 0,
-        argmax_stable: 0,
-        argmax_changed: 0,
+        argmax_hist_len: 0,
+        argmax_hist_base: 0,
+        argmax_hist: [0; CANVAS * ARGMAX_HIST_MAX],
+        canvas_stable: 0,
         mean_entropy: 0.0,
         accept_plateau: 0,
         prev_accept_sig: 0,
@@ -2188,6 +2223,7 @@ pub fn step_params_from_sampler(
     sampler: &SamplerConfig,
     kv_len: u32,
     no_early_stop: bool,
+    eos_token_id: u32,
 ) -> StepParams {
     let conf_threshold = if no_early_stop {
         f32::MAX
@@ -2215,6 +2251,7 @@ pub fn step_params_from_sampler(
         min_early_stop_steps: crate::sample::MIN_EARLY_STOP_STEPS,
         accept_plateau_threshold: plateau_thresh,
         plateau_prefix_mean_max: plateau_mean,
+        eos_token_id,
     }
 }
 
@@ -2311,13 +2348,22 @@ pub fn final_entropy_log_enabled() -> bool {
     }
 }
 
+/// Decode answer-prefix argmax each denoise step (`DGQ_LOG_STEP_TEXT=1`).
+pub fn step_text_log_enabled() -> bool {
+    match std::env::var("DGQ_LOG_STEP_TEXT") {
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        Err(_) => false,
+    }
+}
+
 /// Per-position entropy at end of a denoise block (`DGQ_LOG_FINAL_ENTROPY=1`).
-pub fn log_final_per_token_entropy(label: &str, state: &CanvasState, stop_flag: u32) {
-    use crate::sample::{
-        decode_early_stop_flag, is_active_token, mean_entropy_active, EarlyStopKind, FILLER_TOKEN_ID,
-        PAD_TOKEN_ID,
-    };
-    let prefix_mean = mean_entropy_active(&state.entropy, &state.ids);
+pub fn log_final_per_token_entropy(
+    label: &str,
+    state: &CanvasState,
+    stop_flag: u32,
+    eos_token_id: u32,
+) {
+    use crate::sample::{decode_early_stop_flag, is_active_token, EarlyStopKind, FILLER_TOKEN_ID, PAD_TOKEN_ID};
     let stop_kind = match decode_early_stop_flag(stop_flag) {
         Some(EarlyStopKind::Confident) => "confident_stable",
         Some(EarlyStopKind::Plateau) => "plateau_stop",
@@ -2325,8 +2371,8 @@ pub fn log_final_per_token_entropy(label: &str, state: &CanvasState, stop_flag: 
         None => "none",
     };
     eprintln!(
-        "step-generate: {label} denoise_steps={} stop_flag={stop_flag} ({stop_kind}) prefix_mean={prefix_mean:.4} plateau={} stable={}",
-        state.step, state.accept_plateau, state.argmax_stable,
+        "step-generate: {label} denoise_steps={} stop_flag={stop_flag} ({stop_kind}) mean_ent={:.4} plateau={} stable={}",
+        state.step, state.accept_plateau, state.mean_entropy, state.canvas_stable,
     );
     for pos in 0..CANVAS {
         let id = state.ids[pos];
@@ -2563,8 +2609,10 @@ impl StepRuntime {
         let mut state = init_canvas_state_from_rng(vocab, rng);
         state.step = 0;
         state.stop_flag = 0;
-        state.argmax_stable = 0;
-        state.argmax_changed = 0;
+        state.argmax_hist_len = 0;
+        state.argmax_hist_base = 0;
+        state.argmax_hist = [0; CANVAS * ARGMAX_HIST_MAX];
+        state.canvas_stable = 0;
         state.mean_entropy = 0.0;
         state.accept_plateau = 0;
         state.prev_accept_sig = 0;
@@ -3066,11 +3114,12 @@ pub fn build_step_runtime(
         .as_ref()
         .map(|t| t.len() as u32)
         .unwrap_or(cfg.kv_len);
-    let params = step_params_from_sampler(&sampler, prefill_len, cfg.no_early_stop);
+    let model_cfg = ModelConfig::load(model_dir)?;
+    let eos_token_id = model_cfg.eos_token_id_u32();
+    let params = step_params_from_sampler(&sampler, prefill_len, cfg.no_early_stop, eos_token_id);
     let state = init_canvas_state(cfg.seed, VOCAB);
     let (gemm_a_bytes, gemm_b_bytes) = gemm_scratch_bytes();
 
-    let model_cfg = ModelConfig::load(model_dir)?;
     let text_config = model_cfg.text_config;
     let weight_store = WeightStore::open(model_dir)?;
     let weight_cache = GpuDecoderWeightCache::load_with_dgq_blob(
@@ -4372,7 +4421,12 @@ pub fn run_denoise_steps(
     let steps = cfg.steps.max(1);
     let (mut rt, _) = build_step_runtime(model_dir, cfg)?;
     let sampler = crate::sample::sampler_for_steps(steps, cfg.no_early_stop);
-    let params = step_params_from_sampler(&sampler, rt.read_params().kv_len, cfg.no_early_stop);
+    let params = step_params_from_sampler(
+        &sampler,
+        rt.read_params().kv_len,
+        cfg.no_early_stop,
+        rt.read_params().eos_token_id,
+    );
     let mut rng = Rng::new(cfg.seed);
     rt.reset_block(VOCAB, &mut rng, params);
     let mut stopper = StableConfidentStopper::new(
@@ -5126,7 +5180,7 @@ mod tests {
         let layout = rt.layout;
         let layers = rt.layers;
         let sampler = crate::sample::sampler_for_steps(1, true);
-        let params = step_params_from_sampler(&sampler, rt.read_params().kv_len, true);
+        let params = step_params_from_sampler(&sampler, rt.read_params().kv_len, true, 1);
         let mut rng = Rng::new(cfg.seed);
         rt.reset_block(VOCAB, &mut rng, params);
         let max = icb_plan_parity(&mut rt, &layout, layers, 1);

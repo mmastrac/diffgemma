@@ -45,9 +45,144 @@ pub fn decode_early_stop_flag(stop_flag: u32) -> Option<EarlyStopKind> {
     }
 }
 
+/// Early stop (confident or plateau) encoded in `stop_flag`; excludes max-steps-only (3).
+pub fn is_early_stop_flag(stop_flag: u32) -> bool {
+    matches!(
+        decode_early_stop_flag(stop_flag),
+        Some(EarlyStopKind::Confident | EarlyStopKind::Plateau)
+    )
+}
+
+/// Ring slots for MLX-style argmax canvas history (`_diffusion_stable_and_confident`).
+pub const ARGMAX_HIST_MAX: usize = 8;
+/// Fixed canvas slots in argmax history (matches `DGQ_SAMPLER_MAX_CANVAS`).
+pub const SAMPLER_CANVAS: usize = 256;
+
+/// Inputs mirroring post-commit `CanvasState` + `StepParams` for early-stop parity.
+#[derive(Debug, Clone, Copy)]
+pub struct EarlyStopSnapshot {
+    pub canvas_stable: u32,
+    pub mean_entropy: f32,
+    pub accept_plateau: u32,
+    pub conf_threshold: f32,
+    pub accept_plateau_threshold: u32,
+    pub plateau_prefix_mean_max: f32,
+}
+
+/// Count positions where `a` and `b` differ within `len`.
+pub fn count_argmax_diff(a: &[u32], b: &[u32], len: usize) -> usize {
+    let n = len.min(a.len()).min(b.len());
+    (0..n).filter(|&i| a[i] != b[i]).count()
+}
+
+/// MLX `_diffusion_stable_and_confident` canvas stability (before history append).
+pub fn diffusion_argmax_canvas_stable(
+    current: &[u32],
+    hist_len: u32,
+    hist_base: u32,
+    hist: &[u32],
+    canvas_size: usize,
+    stability_threshold: u32,
+) -> bool {
+    let thresh = stability_threshold as usize;
+    if thresh == 0 {
+        return true;
+    }
+    if hist_len as usize != thresh {
+        return false;
+    }
+    let ring_cap = thresh.min(ARGMAX_HIST_MAX);
+    for s in 0..thresh {
+        let slot = (hist_base as usize + s) % ring_cap;
+        let off = slot * SAMPLER_CANVAS;
+        if current[..canvas_size] != hist[off..off + canvas_size] {
+            return false;
+        }
+    }
+    true
+}
+
+/// Append `current` argmax to MLX-style ring history; returns `(hist_len, hist_base)`.
+pub fn diffusion_append_argmax_hist(
+    hist: &mut [u32],
+    hist_len: u32,
+    hist_base: u32,
+    current: &[u32],
+    canvas_size: usize,
+    stability_threshold: u32,
+) -> (u32, u32) {
+    let thresh = stability_threshold.max(1) as usize;
+    let ring_cap = thresh.min(ARGMAX_HIST_MAX);
+    let mut len = hist_len;
+    let mut base = hist_base;
+    if (len as usize) < thresh {
+        let slot = (base as usize + len as usize) % ring_cap;
+        let off = slot * SAMPLER_CANVAS;
+        hist[off..off + canvas_size].copy_from_slice(&current[..canvas_size]);
+        len += 1;
+    } else {
+        let off = (base as usize % ring_cap) * SAMPLER_CANVAS;
+        hist[off..off + canvas_size].copy_from_slice(&current[..canvas_size]);
+        base = (base + 1) % ring_cap as u32;
+    }
+    (len, base)
+}
+
+/// Replicate `sample_commit` early-stop from post-commit GPU state.
+pub fn early_stop_from_snapshot(snap: &EarlyStopSnapshot) -> bool {
+    let confident =
+        snap.canvas_stable != 0 && snap.mean_entropy < snap.conf_threshold;
+    let plateau = snap.accept_plateau >= snap.accept_plateau_threshold
+        && snap.mean_entropy < snap.plateau_prefix_mean_max;
+    confident || plateau
+}
+
 /// True when token id is neither pad nor filler.
 pub fn is_active_token(id: u32) -> bool {
     id != PAD_TOKEN_ID && id != FILLER_TOKEN_ID
+}
+
+/// Exclusive end index for the answer prefix: positions `0..end` include the first EOS.
+pub fn answer_region_end(ids: &[u32], eos_token_id: u32) -> usize {
+    for (i, &id) in ids.iter().enumerate() {
+        if id == eos_token_id {
+            return i + 1;
+        }
+    }
+    ids.len()
+}
+
+/// `token_ids[0..answer_region_end(ids)]` for step text / early-stop scoping.
+pub fn answer_prefix_ids<'a>(token_ids: &'a [u32], ids: &[u32], eos_token_id: u32) -> &'a [u32] {
+    let end = answer_region_end(ids, eos_token_id).min(token_ids.len());
+    &token_ids[..end]
+}
+
+/// Mean entropy over pad/filler-free positions in `0..first-EOS` (answer region).
+pub fn mean_entropy_answer_prefix(
+    entropies: &[f32],
+    ids: &[u32],
+    eos_token_id: u32,
+) -> f32 {
+    let end = answer_region_end(ids, eos_token_id).min(entropies.len()).min(ids.len());
+    let mut sum = 0.0f32;
+    let mut n = 0usize;
+    for i in 0..end {
+        if is_active_token(ids[i]) {
+            sum += entropies[i];
+            n += 1;
+        }
+    }
+    if n == 0 {
+        f32::MAX
+    } else {
+        sum / n as f32
+    }
+}
+
+/// Mean entropy over non-pad, non-filler canvas positions (legacy; prefer answer prefix).
+pub fn mean_entropy_active(entropies: &[f32], ids: &[u32]) -> f32 {
+    mean_entropy_answer_prefix(entropies, ids, u32::MAX)
 }
 
 /// True when every canvas position argmax is pad or filler.
@@ -221,23 +356,6 @@ pub fn mean_entropy(entropies: &[f32]) -> f32 {
     }
 }
 
-/// Mean entropy over non-pad, non-filler canvas positions (for early stop).
-pub fn mean_entropy_active(entropies: &[f32], ids: &[u32]) -> f32 {
-    let mut sum = 0.0f32;
-    let mut n = 0usize;
-    for (&e, &id) in entropies.iter().zip(ids.iter()) {
-        if is_active_token(id) {
-            sum += e;
-            n += 1;
-        }
-    }
-    if n == 0 {
-        f32::MAX
-    } else {
-        sum / n as f32
-    }
-}
-
 /// Per-step sampler diagnostics (monolithic readback of `CanvasState.entropy`).
 #[derive(Debug, Clone, Copy)]
 pub struct StepEntropyStats {
@@ -407,23 +525,32 @@ pub fn sample_canvas(
     out
 }
 
-/// True when any active canvas position's argmax changed since `prev`.
-pub fn active_argmax_changed(prev: &[u32], cur: &[u32], ids: &[u32]) -> bool {
-    prev.iter()
-        .zip(cur.iter())
-        .zip(ids.iter())
-        .any(|((&pa, &ca), &id)| is_active_token(id) && pa != ca)
+/// True when any answer-region canvas position's argmax changed since `prev`.
+pub fn answer_argmax_changed(
+    prev: &[u32],
+    cur: &[u32],
+    ids: &[u32],
+    eos_token_id: u32,
+) -> bool {
+    let end = answer_region_end(ids, eos_token_id).min(prev.len()).min(cur.len()).min(ids.len());
+    (0..end).any(|i| is_active_token(ids[i]) && prev[i] != cur[i])
 }
 
-/// Adaptive stopping: prefix argmax stability, active mean entropy, or accept plateau.
+/// True when any active canvas position's argmax changed since `prev`.
+pub fn active_argmax_changed(prev: &[u32], cur: &[u32], ids: &[u32]) -> bool {
+    answer_argmax_changed(prev, cur, ids, u32::MAX)
+}
+
+/// Adaptive stopping: MLX argmax canvas history, full-canvas mean entropy, or accept plateau.
 #[derive(Debug)]
 pub struct StableConfidentStopper {
     stability_threshold: usize,
     confidence_threshold: f32,
     accept_plateau_threshold: usize,
     plateau_prefix_mean_max: f32,
-    last_argmax: Option<Vec<u32>>,
-    argmax_stable: u32,
+    argmax_hist: Vec<u32>,
+    argmax_hist_len: u32,
+    argmax_hist_base: u32,
     prev_accept_sig: Option<u32>,
     accept_plateau: u32,
 }
@@ -435,7 +562,12 @@ impl StableConfidentStopper {
             confidence_threshold,
             ACCEPT_PLATEAU_THRESHOLD as usize,
             PLATEAU_MAX_PREFIX_MEAN,
+            1,
         )
+    }
+
+    pub fn with_eos_token_id(self, _eos_token_id: u32) -> Self {
+        self
     }
 
     pub fn with_plateau(
@@ -443,22 +575,25 @@ impl StableConfidentStopper {
         confidence_threshold: f32,
         accept_plateau_threshold: usize,
         plateau_prefix_mean_max: f32,
+        _eos_token_id: u32,
     ) -> Self {
         Self {
             stability_threshold,
             confidence_threshold,
             accept_plateau_threshold,
             plateau_prefix_mean_max,
-            last_argmax: None,
-            argmax_stable: 0,
+            argmax_hist: Vec::new(),
+            argmax_hist_len: 0,
+            argmax_hist_base: 0,
             prev_accept_sig: None,
             accept_plateau: 0,
         }
     }
 
     pub fn reset(&mut self) {
-        self.last_argmax = None;
-        self.argmax_stable = 0;
+        self.argmax_hist.clear();
+        self.argmax_hist_len = 0;
+        self.argmax_hist_base = 0;
         self.prev_accept_sig = None;
         self.accept_plateau = 0;
     }
@@ -482,9 +617,9 @@ impl StableConfidentStopper {
         &mut self,
         argmax: &[u32],
         entropies: &[f32],
-        ids: &[u32],
+        _ids: &[u32],
         accept: &[u32],
-        steps_done: u32,
+        _steps_done: u32,
     ) -> bool {
         let sig = accept_mask_sig(accept);
         if let Some(prev) = self.prev_accept_sig {
@@ -496,31 +631,41 @@ impl StableConfidentStopper {
         }
         self.prev_accept_sig = Some(sig);
 
-        let changed = self
-            .last_argmax
-            .as_ref()
-            .is_some_and(|prev| active_argmax_changed(prev, argmax, ids));
-        if changed {
-            self.argmax_stable = 0;
-        } else if self.last_argmax.is_some() {
-            self.argmax_stable = self.argmax_stable.saturating_add(1);
+        let canvas_len = argmax.len();
+        if self.argmax_hist.len() < ARGMAX_HIST_MAX * SAMPLER_CANVAS {
+            self.argmax_hist.resize(ARGMAX_HIST_MAX * SAMPLER_CANVAS, 0);
         }
-        self.last_argmax = Some(argmax.to_vec());
+        let canvas_stable = diffusion_argmax_canvas_stable(
+            argmax,
+            self.argmax_hist_len,
+            self.argmax_hist_base,
+            &self.argmax_hist,
+            canvas_len,
+            self.stability_threshold as u32,
+        );
+        let (len, base) = diffusion_append_argmax_hist(
+            &mut self.argmax_hist,
+            self.argmax_hist_len,
+            self.argmax_hist_base,
+            argmax,
+            canvas_len,
+            self.stability_threshold as u32,
+        );
+        self.argmax_hist_len = len;
+        self.argmax_hist_base = base;
 
-        if !early_stop_allowed(steps_done, argmax) {
-            return false;
-        }
-
-        let prefix_mean = mean_entropy_active(entropies, ids);
-        let stable = self.stability_threshold == 0
-            || self.argmax_stable >= self.stability_threshold as u32;
-        let confident = prefix_mean < self.confidence_threshold;
-        if stable && confident {
+        let mean_entropy = if canvas_len > 0 {
+            entropies[..canvas_len].iter().sum::<f32>() / canvas_len as f32
+        } else {
+            f32::MAX
+        };
+        let confident = canvas_stable && mean_entropy < self.confidence_threshold;
+        if confident {
             return true;
         }
 
         let plateau_stop = self.accept_plateau >= self.accept_plateau_threshold as u32
-            && prefix_mean < self.plateau_prefix_mean_max;
+            && mean_entropy < self.plateau_prefix_mean_max;
         plateau_stop
     }
 }
@@ -618,12 +763,14 @@ mod tests {
         apply_temperature(&mut processed, 48, &SamplerConfig::default());
         let argmax = argmax_canvas(&processed, canvas_len, vocab);
         let ids = argmax.clone();
+        let accept = vec![0u32; canvas_len];
 
-        assert!(!stopper.should_stop(
-            &argmax, &processed, canvas_len, vocab, &ids, &[0, 0], 1
+        let ent = token_entropy(&processed, canvas_len, vocab);
+        assert!(!stopper.should_stop_with_entropies(
+            &argmax, &ent, &ids, &accept, 1
         ));
-        assert!(stopper.should_stop(
-            &argmax, &processed, canvas_len, vocab, &ids, &[0, 0], MIN_EARLY_STOP_STEPS
+        assert!(stopper.should_stop_with_entropies(
+            &argmax, &ent, &ids, &accept, 2
         ));
     }
 
@@ -640,59 +787,71 @@ mod tests {
             &entropies,
             &ids,
             &accept,
-            MIN_EARLY_STOP_STEPS
+            1,
         ));
     }
 
     #[test]
     fn stopper_matches_mlx_calgary_late_step() {
-        // MLX calgary/seed42 stops at step 29 when mean_H=0.0019 and argmax stable.
         let mut stopper = StableConfidentStopper::new(1, 0.005);
         let argmax = vec![42u32; 256];
         let ids = vec![42u32; 256];
-        // Rust nvfp4 late-window (~73/256 below 0.1): mean stays ~0.07, must not stop.
         let ent: Vec<f32> = vec![0.05f32; 73]
             .into_iter()
             .chain(std::iter::repeat(0.12f32).take(256 - 73))
             .collect();
         let accept = vec![0u32; 256];
         assert!(!stopper.should_stop_with_entropies(
-            &argmax,
-            &ent,
-            &ids,
-            &accept,
-            MIN_EARLY_STOP_STEPS
+            &argmax, &ent, &ids, &accept, 1
         ));
         assert!(!stopper.should_stop_with_entropies(
-            &argmax,
-            &ent,
-            &ids,
-            &accept,
-            MIN_EARLY_STOP_STEPS + 1
+            &argmax, &ent, &ids, &accept, 2
         ));
 
         stopper.reset();
         let ent = vec![0.001f32; 256];
-        assert!(!stopper.should_stop_with_entropies(&argmax, &ent, &ids, &accept, 12));
-        assert!(stopper.should_stop_with_entropies(&argmax, &ent, &ids, &accept, 13));
+        assert!(!stopper.should_stop_with_entropies(&argmax, &ent, &ids, &accept, 1));
+        assert!(stopper.should_stop_with_entropies(&argmax, &ent, &ids, &accept, 2));
+    }
+
+    #[test]
+    fn mean_entropy_answer_prefix_excludes_eos_tail() {
+        let eos = 1u32;
+        let mut ids = vec![42u32; 12];
+        ids.push(eos);
+        ids.extend(std::iter::repeat(eos).take(4));
+        let mut ent = vec![0.001f32; 17];
+        for e in ent.iter_mut().skip(13) {
+            *e = 2.0;
+        }
+        let prefix = mean_entropy_answer_prefix(&ent, &ids, eos);
+        let full_active = mean_entropy_active(&ent, &ids);
+        assert!(
+            prefix < 0.01,
+            "expected low prefix mean over answer only, got {prefix}"
+        );
+        assert!(
+            full_active > prefix * 5.0,
+            "full active mean {full_active} should dwarf answer prefix {prefix}"
+        );
     }
 
     #[test]
     fn stopper_accept_plateau_triggers_early() {
         let mut stopper =
-            StableConfidentStopper::with_plateau(usize::MAX, f32::MAX, 2, 0.05);
+            StableConfidentStopper::with_plateau(usize::MAX, f32::MAX, 2, 0.05, 1);
         let argmax = vec![42u32; 256];
         let ids = vec![42u32; 256];
         let ent = vec![0.01f32; 256];
         let accept = vec![1u32; 40].into_iter().chain(vec![0u32; 216]).collect::<Vec<_>>();
         assert!(!stopper.should_stop_with_entropies(
-            &argmax, &ent, &ids, &accept, MIN_EARLY_STOP_STEPS
+            &argmax, &ent, &ids, &accept, 1
         ));
         assert!(!stopper.should_stop_with_entropies(
-            &argmax, &ent, &ids, &accept, MIN_EARLY_STOP_STEPS + 1
+            &argmax, &ent, &ids, &accept, 2
         ));
         assert!(stopper.should_stop_with_entropies(
-            &argmax, &ent, &ids, &accept, MIN_EARLY_STOP_STEPS + 2
+            &argmax, &ent, &ids, &accept, 3
         ));
     }
 

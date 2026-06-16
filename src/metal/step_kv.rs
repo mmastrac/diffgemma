@@ -925,7 +925,7 @@ pub fn step_min_entropy_with_kv(
     let kv_bytes = kv_cache_total_bytes(rt.layout(), max_seq) as usize;
     copy_metal_buffer(rt.kvcache(), kv_src, kv_bytes);
     rt.set_kv_len(kv_len as u32);
-    let params = step_params_from_sampler(&SamplerConfig::default(), kv_len as u32, false);
+    let params = step_params_from_sampler(&SamplerConfig::default(), kv_len as u32, false, 1);
     let mut rng = Rng::new(seed);
     rt.reset_block(VOCAB, &mut rng, params);
     rt.run_denoise_step()?;

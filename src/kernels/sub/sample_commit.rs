@@ -5,6 +5,7 @@ use super::test_util::ElemFormat;
 use super::variant::KernelVariant;
 use crate::kernels::cpu::sampler::{sample_commit_cpu, CommitParams};
 use crate::metal::{CanvasState, StepParams, CANVAS};
+use crate::sample::ARGMAX_HIST_MAX;
 use crate::sample::{FILLER_TOKEN_ID, PAD_TOKEN_ID};
 use crate::safetensors::Error;
 
@@ -19,8 +20,8 @@ pub struct Fixture {
     pub prev_argmax: Vec<u32>,
     pub canvas_size: usize,
     pub step: u32,
-    pub argmax_stable: u32,
-    pub argmax_changed: u32,
+    pub argmax_hist_len: u32,
+    pub argmax_hist_base: u32,
     pub rng_state: u64,
     pub params: StepParams,
     pub pad_token: u32,
@@ -29,7 +30,7 @@ pub struct Fixture {
 
 impl Fixture {
     pub fn out_len(&self) -> usize {
-        self.canvas_size * 3 + 5
+        self.canvas_size * 3 + 6
     }
 }
 
@@ -43,8 +44,8 @@ pub fn tiny_fixture(_: ElemFormat) -> Fixture {
         prev_argmax: vec![10, 20, 30, 40],
         canvas_size: 4,
         step: 1,
-        argmax_stable: 1,
-        argmax_changed: 0,
+        argmax_hist_len: 1,
+        argmax_hist_base: 0,
         rng_state: 42,
         params: StepParams {
             kv_len: 0,
@@ -57,6 +58,7 @@ pub fn tiny_fixture(_: ElemFormat) -> Fixture {
             min_early_stop_steps: 12,
             accept_plateau_threshold: 2,
             plateau_prefix_mean_max: 0.05,
+            eos_token_id: 1,
         },
         pad_token: PAD_TOKEN_ID,
         filler_token: FILLER_TOKEN_ID,
@@ -71,14 +73,15 @@ pub fn final_step_fixture(_: ElemFormat) -> Fixture {
 }
 
 fn pack_out(state: &CanvasState, canvas: usize) -> Vec<f32> {
-    let mut out = Vec::with_capacity(canvas * 3 + 5);
+    let mut out = Vec::with_capacity(canvas * 3 + 6);
     for i in 0..canvas {
         out.push(state.u_cat[i]);
         out.push(state.accept[i] as f32);
         out.push(state.sorted_idx[i] as f32);
     }
     out.push(state.mean_entropy);
-    out.push(state.argmax_stable as f32);
+    out.push(state.canvas_stable as f32);
+    out.push(state.argmax_hist_len as f32);
     out.push(state.step as f32);
     out.push(state.stop_flag as f32);
     out.push(state.rng_state as f32);
@@ -86,11 +89,10 @@ fn pack_out(state: &CanvasState, canvas: usize) -> Vec<f32> {
 }
 
 pub fn cpu(f: &Fixture) -> Vec<f32> {
-    let state = blank_state(f);
+    let mut state = blank_state(f);
+    let mut hist = state.argmax_hist;
     let out = sample_commit_cpu(
         f.step,
-        f.argmax_stable,
-        f.argmax_changed,
         f.rng_state,
         CommitParams {
             max_steps: f.params.max_steps,
@@ -103,26 +105,31 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
             canvas_size: f.canvas_size,
             pad_token: f.pad_token,
             filler_token: f.filler_token,
-            ids: &state.ids[..f.canvas_size],
+            eos_token_id: f.params.eos_token_id,
             entropy: &f.entropy,
             prev_argmax: &f.prev_argmax,
             accept_plateau: state.accept_plateau,
             prev_accept_sig: state.prev_accept_sig,
+            argmax_hist_len: f.argmax_hist_len,
+            argmax_hist_base: f.argmax_hist_base,
+            argmax_hist: &mut hist,
         },
     );
-    let mut state = state;
     for i in 0..f.canvas_size {
         state.u_cat[i] = out.u_cat[i];
         state.accept[i] = out.accept[i];
         state.sorted_idx[i] = out.sorted_idx[i];
     }
     state.mean_entropy = out.mean_entropy;
-    state.argmax_stable = out.argmax_stable;
+    state.canvas_stable = out.canvas_stable;
+    state.argmax_hist_len = out.argmax_hist_len;
+    state.argmax_hist_base = out.argmax_hist_base;
     state.step = out.step;
     state.stop_flag = out.stop_flag;
     state.rng_state = out.rng_state;
     state.accept_plateau = out.accept_plateau;
     state.prev_accept_sig = out.prev_accept_sig;
+    state.argmax_hist = hist;
     pack_out(&state, f.canvas_size)
 }
 
@@ -150,8 +157,10 @@ fn blank_state(f: &Fixture) -> CanvasState {
         rng_state: f.rng_state,
         step: f.step,
         stop_flag: 0,
-        argmax_stable: f.argmax_stable,
-        argmax_changed: f.argmax_changed,
+        argmax_hist_len: f.argmax_hist_len,
+        argmax_hist_base: f.argmax_hist_base,
+        argmax_hist: [0; CANVAS * ARGMAX_HIST_MAX],
+        canvas_stable: 0,
         mean_entropy: 0.0,
         accept_plateau: 0,
         prev_accept_sig: 0,
@@ -215,6 +224,8 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     gpu_common::set_bytes(&enc, &canvas, 2);
     gpu_common::set_bytes(&enc, &f.pad_token, 3);
     gpu_common::set_bytes(&enc, &f.filler_token, 4);
+    let eos = f.params.eos_token_id;
+    gpu_common::set_bytes(&enc, &eos, 5);
     enc.dispatchThreadgroups_threadsPerThreadgroup(
         MTLSize {
             width: 1,

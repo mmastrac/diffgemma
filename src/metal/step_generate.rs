@@ -4,7 +4,7 @@ use crate::denoise_trace::{step_trace_from_stats, DenoiseTrace, SCHEMA_VERSION};
 use crate::generate::GenerateOutput;
 use crate::metal::step_kernel::{
     build_step_runtime, denoise_parity_log_enabled, final_entropy_log_enabled,
-    log_denoise_parity_step, log_final_per_token_entropy,
+    log_denoise_parity_step, log_final_per_token_entropy, step_text_log_enabled,
     step_params_from_sampler, trace_entropy_enabled, StepFinishMode, StepRuntime, StepSmokeConfig,
     CANVAS, N_LAYERS, VOCAB,
 };
@@ -12,8 +12,9 @@ use crate::metal::step_kv::{
     extend_monolithic_kv_with_cache, prefill_monolithic_kv_with_cache, MonolithicEncoderCache,
 };
 use crate::metal::{ForwardTelemetry, SessionTelemetry, StepPhaseTelemetry};
-use crate::sample::{Rng, SamplerConfig, StableConfidentStopper, step_entropy_stats};
+use crate::sample::{Rng, SamplerConfig, step_entropy_stats};
 use crate::safetensors::Error;
+use crate::tokenizer::Tokenizer;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -85,7 +86,14 @@ fn log_denoise_step_progress(
     max_steps: usize,
     stats: &crate::sample::StepEntropyStats,
     mean_entropy_gpu: f32,
-    argmax_stable: u32,
+    prefix_mean: Option<f32>,
+    region_end: Option<usize>,
+    answer_text: Option<&str>,
+    canvas_stable: u32,
+    prefix_stable: u32,
+    full_argmax_diff: Option<usize>,
+    prefix_argmax_diff: Option<usize>,
+    argmax_hist_len: u32,
     accept_plateau: u32,
     step_elapsed: Duration,
     block_elapsed: Duration,
@@ -101,12 +109,46 @@ fn log_denoise_step_progress(
         DenoiseStopReason::Plateau => " plateau_stop",
         DenoiseStopReason::MaxSteps => " max_steps",
     };
+    let mut extra = String::new();
+    if let Some(pm) = prefix_mean {
+        extra.push_str(&format!(" prefix_mean={pm:.4}"));
+    }
+    if let Some(re) = region_end {
+        extra.push_str(&format!(" ans_len={re}"));
+    }
+    if let Some(text) = answer_text {
+        let one_line = text.replace(['\n', '\r'], "\\n");
+        let shown = if one_line.len() > 72 {
+            format!("{}...", &one_line[..72])
+        } else {
+            one_line
+        };
+        extra.push_str(&format!(" text={shown:?}"));
+    }
+    if let Some(d) = full_argmax_diff {
+        extra.push_str(&format!(" full_diff={d}"));
+    }
+    if let Some(d) = prefix_argmax_diff {
+        extra.push_str(&format!(" prefix_diff={d}"));
+    }
     eprintln!(
-        "step-generate: block {block_idx}/{max_blocks} step {step_idx}/{max_steps} accept={} low_ent={} min_ent={:.4} mean_ent={mean_entropy_gpu:.4} stable={argmax_stable} plateau={accept_plateau} step={step_elapsed:.2?} block={block_elapsed:.2?} denoise={denoise_elapsed:.2?}{stop_note}",
+        "step-generate: block {block_idx}/{max_blocks} step {step_idx}/{max_steps} accept={} low_ent={} min_ent={:.4} mean_ent={mean_entropy_gpu:.4} canvas_stable={canvas_stable} prefix_stable={prefix_stable} hist_len={argmax_hist_len} plateau={accept_plateau}{extra} step={step_elapsed:.2?} block={block_elapsed:.2?} denoise={denoise_elapsed:.2?}{stop_note}",
         stats.accept_count,
         stats.low_entropy_positions,
         stats.min_entropy,
     );
+}
+
+fn step_answer_text(
+    tokenizer: Option<&Tokenizer>,
+    prev_argmax: &[u32],
+    ids: &[u32],
+    eos_token_id: u32,
+) -> (usize, Option<String>) {
+    let region_end = crate::sample::answer_region_end(ids, eos_token_id);
+    let prefix = crate::sample::answer_prefix_ids(prev_argmax, ids, eos_token_id);
+    let text = tokenizer.map(|tok| tok.decode(prefix));
+    (region_end, text)
 }
 
 /// Reusable monolithic runtime across prompts (M4.3).
@@ -115,6 +157,7 @@ pub struct StepGenerateSession {
     model_dir: PathBuf,
     layers: usize,
     encoder: Option<MonolithicEncoderCache>,
+    step_text_tokenizer: Option<Tokenizer>,
 }
 
 impl StepGenerateSession {
@@ -131,6 +174,7 @@ impl StepGenerateSession {
                 model_dir: model_dir.to_path_buf(),
                 layers,
                 encoder: None,
+                step_text_tokenizer: None,
             },
             build.compile,
         ))
@@ -178,6 +222,19 @@ pub fn generate_with_session(
     let encoder = session.encoder.as_mut().expect("encoder cache");
     let rt = &mut session.rt;
 
+    if step_text_log_enabled() && session.step_text_tokenizer.is_none() {
+        let tok_path = session.model_dir.join("tokenizer.json");
+        match Tokenizer::load(&tok_path) {
+            Ok(tok) => session.step_text_tokenizer = Some(tok),
+            Err(err) => {
+                eprintln!(
+                    "step-generate: DGQ_LOG_STEP_TEXT=1 but failed to load {}: {err}",
+                    tok_path.display()
+                );
+            }
+        }
+    }
+
     let prefill_started = Instant::now();
     let (kv_len, prefill_timing) = prefill_monolithic_kv_with_cache(
         encoder,
@@ -222,6 +279,7 @@ pub fn generate_with_session(
             &cfg.sampler,
             rt.read_params().kv_len,
             cfg.no_early_stop,
+            rt.read_params().eos_token_id,
         );
         rt.reset_block(VOCAB, &mut rng, params);
         if let Some(ref ids) = cfg.initial_canvas_ids {
@@ -252,25 +310,8 @@ pub fn generate_with_session(
         let mut mean_entropy_hist = Vec::new();
         let mut low_ent_hist = Vec::new();
         let mut last_st;
-        let mut stopper = StableConfidentStopper::with_plateau(
-            cfg.sampler.stability_threshold,
-            if cfg.no_early_stop {
-                f32::MAX
-            } else {
-                cfg.sampler.confidence_threshold
-            },
-            if cfg.no_early_stop {
-                usize::MAX
-            } else {
-                cfg.sampler.accept_plateau_threshold
-            },
-            if cfg.no_early_stop {
-                f32::MAX
-            } else {
-                cfg.sampler.plateau_prefix_mean_max
-            },
-        );
-        stopper.reset();
+        let mut prev_step_argmax: Option<[u32; CANVAS]> = None;
+        let mut prefix_stable_streak = 0u32;
         loop {
             let step_started = Instant::now();
             rt.run_denoise_step()?;
@@ -311,16 +352,36 @@ pub fn generate_with_session(
             mean_entropy_hist.push(st.mean_entropy);
             low_ent_hist.push(stats.low_entropy_positions);
             let max_steps_reached = st.step >= max_steps as u32;
+            let params = rt.read_params();
+            let region_end = crate::sample::answer_region_end(&st.ids, params.eos_token_id);
+            let (full_diff, prefix_diff, prefix_stable_streak) = match prev_step_argmax {
+                Some(prev) => {
+                    let full =
+                        crate::sample::count_argmax_diff(&st.prev_argmax, &prev, CANVAS);
+                    let prefix =
+                        crate::sample::count_argmax_diff(&st.prev_argmax, &prev, region_end);
+                    let streak = if prefix == 0 {
+                        prefix_stable_streak.saturating_add(1)
+                    } else {
+                        0
+                    };
+                    (Some(full), Some(prefix), streak)
+                }
+                None => (None, None, 0),
+            };
+            prev_step_argmax = Some(st.prev_argmax);
             let early_stop = crate::sample::decode_early_stop_flag(st.stop_flag);
-            let _early_stop = !cfg.no_early_stop && early_stop.is_some();
-            let cpu_confident = !cfg.no_early_stop
-                && stopper.should_stop_with_entropies(
-                    &st.prev_argmax,
-                    &st.entropy,
-                    &st.ids,
-                    &st.accept,
-                    st.step,
-                );
+            let snap = crate::sample::EarlyStopSnapshot {
+                canvas_stable: st.canvas_stable,
+                mean_entropy: st.mean_entropy,
+                accept_plateau: st.accept_plateau,
+                conf_threshold: params.conf_threshold,
+                accept_plateau_threshold: params.accept_plateau_threshold,
+                plateau_prefix_mean_max: params.plateau_prefix_mean_max,
+            };
+            let cpu_early =
+                !cfg.no_early_stop && crate::sample::early_stop_from_snapshot(&snap);
+            let gpu_early = !cfg.no_early_stop && crate::sample::is_early_stop_flag(st.stop_flag);
             let stop_reason = match early_stop {
                 Some(crate::sample::EarlyStopKind::Confident) => DenoiseStopReason::Confident,
                 Some(crate::sample::EarlyStopKind::Plateau) => DenoiseStopReason::Plateau,
@@ -332,35 +393,50 @@ pub fn generate_with_session(
                 .ok()
                 .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             {
-                if (st.stop_flag != 0) != cpu_confident {
+                if gpu_early != cpu_early {
                     eprintln!(
-                        "step-generate: early-stop mismatch step={} gpu_flag={} cpu_confident={cpu_confident} accept_plateau={} mean_ent={:.4} stable={} threshold={:.4}",
+                        "step-generate: early-stop mismatch step={} gpu_flag={} gpu_early={gpu_early} cpu_early={cpu_early} accept_plateau={} mean_ent={:.4} stable={} threshold={:.4}",
                         st.step,
                         st.stop_flag,
                         st.accept_plateau,
                         st.mean_entropy,
-                        st.argmax_stable,
-                        cfg.sampler.confidence_threshold,
+                        st.canvas_stable,
+                        params.conf_threshold,
                     );
-                } else if early_stop.is_some() {
+                } else if gpu_early {
                     let kind = match early_stop {
                         Some(crate::sample::EarlyStopKind::Confident) => "confident_stable",
                         Some(crate::sample::EarlyStopKind::Plateau) => "plateau_stop",
-                        Some(crate::sample::EarlyStopKind::MaxSteps) => "max_steps",
-                        None => "none",
+                        _ => "early_stop",
                     };
-                    let prefix_mean =
-                        crate::sample::mean_entropy_active(&st.entropy, &st.ids);
                     eprintln!(
-                        "step-generate: early-stop step={} reason={kind} stop_flag={} accept_plateau={} prefix_mean={prefix_mean:.4} stable={} accept={}",
+                        "step-generate: early-stop step={} reason={kind} stop_flag={} accept_plateau={} mean_ent={:.4} stable={} accept={}",
                         st.step,
                         st.stop_flag,
                         st.accept_plateau,
-                        st.argmax_stable,
+                        st.mean_entropy,
+                        st.canvas_stable,
                         stats.accept_count,
                     );
                 }
             }
+            let (prefix_mean_log, region_end_log, answer_text_log) = if step_text_log_enabled() {
+                let pm = crate::sample::mean_entropy_answer_prefix(
+                    &st.entropy,
+                    &st.ids,
+                    params.eos_token_id,
+                );
+                let (re, text) = step_answer_text(
+                    session.step_text_tokenizer.as_ref(),
+                    &st.prev_argmax,
+                    &st.ids,
+                    params.eos_token_id,
+                );
+                (Some(pm), Some(re), text)
+            } else {
+                (None, None, None)
+            };
+            let answer_text_ref = answer_text_log.as_deref();
             step_traces.push(step_trace_from_stats(
                 block_idx as u32,
                 block_step_count,
@@ -381,7 +457,14 @@ pub fn generate_with_session(
                 max_steps,
                 &stats,
                 st.mean_entropy,
-                st.argmax_stable,
+                prefix_mean_log,
+                region_end_log,
+                answer_text_ref,
+                st.canvas_stable,
+                prefix_stable_streak,
+                full_diff,
+                prefix_diff,
+                st.argmax_hist_len,
                 st.accept_plateau,
                 step_elapsed,
                 block_started.elapsed(),
@@ -439,6 +522,7 @@ pub fn generate_with_session(
                 &format!("block {block_idx} final"),
                 &st,
                 st.stop_flag,
+                rt.read_params().eos_token_id,
             );
         }
 

@@ -12,7 +12,8 @@ kernel void sample_commit(
     constant uint &canvas_size [[buffer(2)]],
     constant uint &pad_token [[buffer(3)]],
     constant uint &filler_token [[buffer(4)]],
-    device DebugStatus *dbg [[buffer(5)]],
+    constant uint &eos_token [[buffer(5)]],
+    device DebugStatus *dbg [[buffer(6)]],
     uint lid [[thread_position_in_threadgroup]]
 ) {
     if (K_SHAPE_ASSERT && (canvas_size == 0u || canvas_size > DGQ_SAMPLER_MAX_CANVAS)) {
@@ -72,48 +73,67 @@ kernel void sample_commit(
         S->prev_accept_sig = sig;
 
         float mean = 0.f;
-        float active_mean = 0.f;
-        uint active_n = 0u;
         for (uint i = 0u; i < canvas_size; ++i) {
             mean += ent[i];
-            uint id = S->ids[i];
-            if (id != pad_token && id != filler_token) {
-                active_mean += ent[i];
-                active_n += 1u;
-            }
         }
         S->mean_entropy = mean / float(canvas_size);
         dgq_assert_entropy_nonneg(dbg, DbgKernelSampleCommit, S->mean_entropy, canvas_size);
-        float prefix_mean = active_n > 0u ? active_mean / float(active_n) : 1e9f;
-        uint changed = atomic_load_explicit((device atomic_uint *)&S->argmax_changed,
-                                            memory_order_relaxed);
-        S->argmax_stable = changed ? 0u : (S->argmax_stable + 1u);
-        atomic_store_explicit((device atomic_uint *)&S->argmax_changed, 0u,
-                              memory_order_relaxed);
-        S->step += 1u;
-        bool degenerate = true;
-        uint real_count = 0u;
-        for (uint i = 0u; i < canvas_size; ++i) {
-            uint t = S->prev_argmax[i];
-            if (t != pad_token && t != filler_token) {
-                degenerate = false;
-                real_count++;
+
+        // MLX `_diffusion_stable_and_confident`: full-canvas argmax history + mean entropy.
+        bool canvas_stable = false;
+        uint thresh = P.stability_threshold;
+        if (thresh == 0u) {
+            canvas_stable = true;
+        } else if (S->argmax_hist_len == thresh) {
+            canvas_stable = true;
+            uint ring_cap = min(thresh, DGQ_SAMPLER_ARGMAX_HIST_MAX);
+            for (uint s = 0u; s < thresh && canvas_stable; ++s) {
+                uint slot = (S->argmax_hist_base + s) % ring_cap;
+                ulong off = ulong(slot) * ulong(DGQ_SAMPLER_MAX_CANVAS);
+                for (uint i = 0u; i < canvas_size; ++i) {
+                    if (S->prev_argmax[i] != S->argmax_hist[off + ulong(i)]) {
+                        canvas_stable = false;
+                        break;
+                    }
+                }
             }
         }
-        bool plateau_stop = S->accept_plateau >= P.accept_plateau_threshold
-            && prefix_mean < P.plateau_prefix_mean_max;
-        bool confident_stable = prefix_mean < P.conf_threshold
-            && S->argmax_stable >= P.stability_threshold;
-        bool allowed = !degenerate
-            && (S->step >= P.min_early_stop_steps || real_count >= 8u);
-        S->stop_flag = 0u;
-        if (allowed && confident_stable) {
-            S->stop_flag = 1u;
-        } else if (allowed && plateau_stop) {
-            S->stop_flag = 2u;
+        S->canvas_stable = canvas_stable ? 1u : 0u;
+
+        if (thresh > 0u) {
+            uint ring_cap = min(thresh, DGQ_SAMPLER_ARGMAX_HIST_MAX);
+            if (S->argmax_hist_len < thresh) {
+                uint slot = (S->argmax_hist_base + S->argmax_hist_len) % ring_cap;
+                ulong off = ulong(slot) * ulong(DGQ_SAMPLER_MAX_CANVAS);
+                for (uint i = 0u; i < canvas_size; ++i) {
+                    S->argmax_hist[off + ulong(i)] = S->prev_argmax[i];
+                }
+                S->argmax_hist_len += 1u;
+            } else {
+                ulong off = ulong(S->argmax_hist_base) * ulong(DGQ_SAMPLER_MAX_CANVAS);
+                for (uint i = 0u; i < canvas_size; ++i) {
+                    S->argmax_hist[off + ulong(i)] = S->prev_argmax[i];
+                }
+                S->argmax_hist_base = (S->argmax_hist_base + 1u) % ring_cap;
+            }
         }
-        if (S->step >= P.max_steps) {
+
+        S->step += 1u;
+
+        bool confident_stable = canvas_stable && S->mean_entropy < P.conf_threshold;
+        bool plateau_stop = S->accept_plateau >= P.accept_plateau_threshold
+            && S->mean_entropy < P.plateau_prefix_mean_max;
+        S->stop_flag = 0u;
+        if (confident_stable) {
+            S->stop_flag = 1u;
+        } else if (plateau_stop) {
+            S->stop_flag = 2u;
+        } else if (S->step >= P.max_steps) {
             S->stop_flag = 3u;
         }
+
+        (void)pad_token;
+        (void)filler_token;
+        (void)eos_token;
     }
 }

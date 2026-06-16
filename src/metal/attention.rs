@@ -1,38 +1,18 @@
+use crate::kernels::sub::engine_gqa_common::{self, GqaParams};
 use crate::metal::buffer::BufferPool;
 use crate::metal::device::{ComputePipeline, MetalContext};
-use crate::model::attention::{AttentionParams, GqaMask, MASK_NEG};
+use crate::model::attention::{AttentionParams, GqaMask};
 use crate::safetensors::Error;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLSize,
+    MTLComputePipelineState,
 };
 
-const ATTENTION_SHADER: &str = include_str!("../../shaders/engine_attention.metal");
+const ROPE_SHADER: &str = shader_include::include_metal!("kernels/apply_rope_heads.metal");
+const GQA_SHADER: &str = shader_include::include_metal!("kernels/gqa_attention.metal");
 const ROPE_ENTRY: &str = "apply_rope_heads";
 const GQA_ENTRY: &str = "gqa_attention";
-
-const MASK_CAUSAL_SLIDING: u32 = 0;
-const MASK_ENCODER_EXTEND: u32 = 1;
-const MASK_DECODER_BITMAP: u32 = 2;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct GqaParams {
-    seq_len: u32,
-    total_kv: u32,
-    n_heads: u32,
-    n_kv_heads: u32,
-    head_dim: u32,
-    n_groups: u32,
-    mask_kind: u32,
-    sliding_window: u32,
-    kv_cache_len: u32,
-    mask_neg: f32,
-    rotary_dim: u32,
-    num_heads_rope: u32,
-    elem_offset: u32,
-}
 
 pub struct GpuAttentionKernels {
     pub rope_pipeline: ComputePipeline,
@@ -41,9 +21,10 @@ pub struct GpuAttentionKernels {
 
 impl GpuAttentionKernels {
     pub fn new(ctx: &MetalContext) -> Result<Self, Error> {
-        let mut pipelines = ctx.compile_kernels(ATTENTION_SHADER, &[ROPE_ENTRY, GQA_ENTRY])?;
-        let attn_pipeline = pipelines.pop().ok_or(Error::Format("Metal pipeline missing"))?;
-        let rope_pipeline = pipelines.pop().ok_or(Error::Format("Metal pipeline missing"))?;
+        let mut rope = ctx.compile_kernels(ROPE_SHADER, &[ROPE_ENTRY])?;
+        let mut attn = ctx.compile_kernels(GQA_SHADER, &[GQA_ENTRY])?;
+        let attn_pipeline = attn.pop().ok_or(Error::Format("Metal pipeline missing"))?;
+        let rope_pipeline = rope.pop().ok_or(Error::Format("Metal pipeline missing"))?;
         Ok(Self {
             rope_pipeline,
             attn_pipeline,
@@ -95,21 +76,7 @@ impl GpuAttention {
         BufferPool::write_f32(&buf_x, x);
         BufferPool::write_f32(&buf_f, freqs);
 
-        let params = GqaParams {
-            seq_len: seq_len as u32,
-            total_kv: 0,
-            n_heads: 0,
-            n_kv_heads: 0,
-            head_dim: head_dim as u32,
-            n_groups: 0,
-            mask_kind: 0,
-            sliding_window: 0,
-            kv_cache_len: 0,
-            mask_neg: MASK_NEG,
-            rotary_dim: rotary_dim as u32,
-            num_heads_rope: num_heads as u32,
-            elem_offset: 0,
-        };
+        let params = GqaParams::for_rope(seq_len, num_heads, head_dim, rotary_dim, 0);
 
         run_kernel(
             &self.ctx.queue,
@@ -119,8 +86,8 @@ impl GpuAttention {
                     encoder.setBuffer_offset_atIndex(Some(&buf_x), 0, 0);
                     encoder.setBuffer_offset_atIndex(Some(&buf_f), 0, 1);
                 }
-                set_params(encoder, &params, 2);
-                dispatch_2d(encoder, num_heads, seq_len);
+                engine_gqa_common::set_params(encoder, &params, 2);
+                engine_gqa_common::dispatch_head_query_2d(encoder, num_heads, seq_len);
             },
         )?;
 
@@ -150,12 +117,22 @@ impl GpuAttention {
         }
 
         let (mask_kind, kv_cache_len, positions, decoder_mask) = match mask {
-            GqaMask::CausalSliding => (MASK_CAUSAL_SLIDING, 0usize, None, None),
+            GqaMask::CausalSliding => (engine_gqa_common::MASK_CAUSAL_SLIDING, 0usize, None, None),
             GqaMask::EncoderExtend {
                 kv_cache_len,
                 positions,
-            } => (MASK_ENCODER_EXTEND, kv_cache_len, Some(positions), None),
-            GqaMask::DecoderBitmap(m) => (MASK_DECODER_BITMAP, m.kv_cache_len, None, Some(m)),
+            } => (
+                engine_gqa_common::MASK_ENCODER_EXTEND,
+                kv_cache_len,
+                Some(positions),
+                None,
+            ),
+            GqaMask::DecoderBitmap(m) => (
+                engine_gqa_common::MASK_DECODER_BITMAP,
+                m.kv_cache_len,
+                None,
+                Some(m),
+            ),
         };
 
         let q_bytes = q.len() * 4;
@@ -208,21 +185,7 @@ impl GpuAttention {
             buf_pos = Some((pos_bytes, b));
         }
 
-        let gpu_params = GqaParams {
-            seq_len: seq_len as u32,
-            total_kv: total_kv as u32,
-            n_heads: params.n_heads as u32,
-            n_kv_heads: params.n_kv_heads as u32,
-            head_dim: params.head_dim as u32,
-            n_groups: params.n_groups as u32,
-            mask_kind,
-            sliding_window: params.sliding_window.unwrap_or(0) as u32,
-            kv_cache_len: kv_cache_len as u32,
-            mask_neg: MASK_NEG,
-            rotary_dim: params.rotary_dim as u32,
-            num_heads_rope: 0,
-            elem_offset: 0,
-        };
+        let gpu_params = GqaParams::for_attention(seq_len, total_kv, params, mask_kind, kv_cache_len);
 
         run_kernel(
             &self.ctx.queue,
@@ -244,8 +207,8 @@ impl GpuAttention {
                         encoder.setBuffer_offset_atIndex(Some(pos_buf), 0, 5);
                     }
                 }
-                set_params(encoder, &gpu_params, 6);
-                dispatch_2d(encoder, params.n_heads, seq_len);
+                engine_gqa_common::set_params(encoder, &gpu_params, 6);
+                engine_gqa_common::dispatch_head_query_2d(encoder, params.n_heads, seq_len);
             },
         )?;
 
@@ -290,34 +253,6 @@ impl GpuAttention {
     }
 }
 
-fn set_params(
-    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-    params: &GqaParams,
-    index: usize,
-) {
-    unsafe {
-        encoder.setBytes_length_atIndex(
-            std::ptr::NonNull::from_ref(params).cast(),
-            std::mem::size_of::<GqaParams>(),
-            index,
-        );
-    }
-}
-
-fn dispatch_2d(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, width: usize, height: usize) {
-    let grid = MTLSize {
-        width,
-        height,
-        depth: 1,
-    };
-    let tg = MTLSize {
-        width: 1,
-        height: 1,
-        depth: 1,
-    };
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
-}
-
 fn run_kernel(
     queue: &ProtocolObject<dyn MTLCommandQueue>,
     pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
@@ -335,73 +270,4 @@ fn run_kernel(
     cmd_buf.commit();
     cmd_buf.waitUntilCompleted();
     Ok(())
-}
-
-#[cfg(all(test, feature = "metal", target_os = "macos"))]
-mod tests {
-    use super::*;
-    use crate::model::attention::gqa_attention as gqa_attention_cpu;
-
-    #[test]
-    fn gpu_gqa_matches_cpu_small() {
-        let seq_len = 4usize;
-        let n_heads = 2usize;
-        let n_kv_heads = 1usize;
-        let head_dim = 8usize;
-        let params = AttentionParams {
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            rotary_dim: head_dim,
-            n_groups: n_heads / n_kv_heads,
-            sliding_window: Some(2),
-        };
-
-        let q_dim = seq_len * n_heads * head_dim;
-        let kv_dim = seq_len * n_kv_heads * head_dim;
-        let q: Vec<f32> = (0..q_dim).map(|i| (i as f32) * 0.03 - 0.2).collect();
-        let k: Vec<f32> = (0..kv_dim).map(|i| (i as f32) * 0.02 - 0.1).collect();
-        let v: Vec<f32> = (0..kv_dim).map(|i| (i as f32) * 0.01).collect();
-        let mut cpu_out = vec![0.0f32; q_dim];
-        let mut cpu_scores = vec![0.0f32; seq_len * n_heads * seq_len];
-        gqa_attention_cpu(
-            &mut cpu_out,
-            &mut cpu_scores,
-            &q,
-            &k,
-            &v,
-            seq_len,
-            seq_len,
-            &crate::model::attention::AttentionParams {
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                rotary_dim: head_dim,
-                n_groups: n_heads / n_kv_heads,
-                sliding_window: Some(2),
-            },
-            GqaMask::CausalSliding,
-        );
-
-        let mut gpu = GpuAttention::new().expect("gpu");
-        let mut gpu_out = vec![0.0f32; q_dim];
-        gpu.gqa_attention(
-            &mut gpu_out,
-            &q,
-            &k,
-            &v,
-            seq_len,
-            seq_len,
-            &params,
-            GqaMask::CausalSliding,
-        )
-        .expect("gpu attention");
-
-        let max_diff = cpu_out
-            .iter()
-            .zip(gpu_out.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        assert!(max_diff < 1e-4, "max_diff={max_diff}");
-    }
 }

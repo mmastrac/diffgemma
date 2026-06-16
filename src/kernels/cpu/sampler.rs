@@ -1,6 +1,9 @@
 //! CPU reference for monolithic sampler kernels (tempered rowstats, commit, apply, write).
 
-use crate::sample::{accept_mask_from_entropies, accept_mask_sig, early_stop_allowed, mean_entropy_active};
+use crate::sample::{
+    accept_mask_from_entropies, accept_mask_sig, diffusion_append_argmax_hist,
+    diffusion_argmax_canvas_stable, ARGMAX_HIST_MAX,
+};
 use crate::sample::{STOP_FLAG_CONFIDENT, STOP_FLAG_MAX_STEPS, STOP_FLAG_PLATEAU};
 
 /// Temperature after `steps_done` denoise iterations (matches `temp_at` in Metal).
@@ -78,11 +81,14 @@ pub struct CommitParams<'a> {
     pub canvas_size: usize,
     pub pad_token: u32,
     pub filler_token: u32,
-    pub ids: &'a [u32],
+    pub eos_token_id: u32,
     pub entropy: &'a [f32],
     pub prev_argmax: &'a [u32],
     pub accept_plateau: u32,
     pub prev_accept_sig: u32,
+    pub argmax_hist_len: u32,
+    pub argmax_hist_base: u32,
+    pub argmax_hist: &'a mut [u32],
 }
 
 pub struct CommitOut {
@@ -90,7 +96,9 @@ pub struct CommitOut {
     pub accept: Vec<u32>,
     pub sorted_idx: Vec<u32>,
     pub mean_entropy: f32,
-    pub argmax_stable: u32,
+    pub canvas_stable: u32,
+    pub argmax_hist_len: u32,
+    pub argmax_hist_base: u32,
     pub step: u32,
     pub stop_flag: u32,
     pub rng_state: u64,
@@ -101,8 +109,6 @@ pub struct CommitOut {
 /// Matches `sample_commit`.
 pub fn sample_commit_cpu(
     step: u32,
-    argmax_stable: u32,
-    argmax_changed: u32,
     rng_state: u64,
     p: CommitParams<'_>,
 ) -> CommitOut {
@@ -142,7 +148,6 @@ pub fn sample_commit_cpu(
     } else {
         0.0
     };
-    let prefix_mean = mean_entropy_active(p.entropy, p.ids);
 
     let sig = accept_mask_sig(&accept);
     let accept_plateau = if sig == p.prev_accept_sig {
@@ -151,30 +156,33 @@ pub fn sample_commit_cpu(
         0
     };
 
-    let new_stable = if argmax_changed != 0 {
-        0
-    } else {
-        argmax_stable + 1
-    };
+    let canvas_stable = diffusion_argmax_canvas_stable(
+        p.prev_argmax,
+        p.argmax_hist_len,
+        p.argmax_hist_base,
+        p.argmax_hist,
+        canvas,
+        p.stability_threshold,
+    );
+    let (hist_len, hist_base) = diffusion_append_argmax_hist(
+        p.argmax_hist,
+        p.argmax_hist_len,
+        p.argmax_hist_base,
+        p.prev_argmax,
+        canvas,
+        p.stability_threshold,
+    );
     let new_step = step + 1;
 
-    let argmax: Vec<u32> = p.prev_argmax.to_vec();
-    let degenerate = argmax
-        .iter()
-        .take(canvas)
-        .all(|&t| t == p.pad_token || t == p.filler_token);
+    let confident_stable = canvas_stable && mean_entropy < p.conf_threshold;
     let plateau_stop = accept_plateau >= p.accept_plateau_threshold
-        && prefix_mean < p.plateau_prefix_mean_max;
-    let confident_stable =
-        prefix_mean < p.conf_threshold && new_stable >= p.stability_threshold;
-    let allowed = early_stop_allowed(new_step, &argmax[..canvas]);
+        && mean_entropy < p.plateau_prefix_mean_max;
     let mut stop_flag = 0u32;
-    if allowed && !degenerate && confident_stable {
+    if confident_stable {
         stop_flag = STOP_FLAG_CONFIDENT;
-    } else if allowed && !degenerate && plateau_stop {
+    } else if plateau_stop {
         stop_flag = STOP_FLAG_PLATEAU;
-    }
-    if new_step >= p.max_steps {
+    } else if new_step >= p.max_steps {
         stop_flag = STOP_FLAG_MAX_STEPS;
     }
 
@@ -183,7 +191,9 @@ pub fn sample_commit_cpu(
         accept,
         sorted_idx,
         mean_entropy,
-        argmax_stable: new_stable,
+        canvas_stable: u32::from(canvas_stable),
+        argmax_hist_len: hist_len,
+        argmax_hist_base: hist_base,
         step: new_step,
         stop_flag,
         rng_state: st,
@@ -238,10 +248,8 @@ mod tests {
     fn commit_respects_pad_filler() {
         let entropy = vec![0.1, 0.2, 0.3, 0.4];
         let prev = vec![PAD_TOKEN_ID, FILLER_TOKEN_ID, 42, 43];
-        let ids = vec![42, 43, 44, 45];
+        let mut hist = vec![0u32; 4 * ARGMAX_HIST_MAX];
         let out = sample_commit_cpu(
-            0,
-            0,
             0,
             12345,
             CommitParams {
@@ -255,11 +263,14 @@ mod tests {
                 canvas_size: 4,
                 pad_token: PAD_TOKEN_ID,
                 filler_token: FILLER_TOKEN_ID,
-                ids: &ids,
+                eos_token_id: 1,
                 entropy: &entropy,
                 prev_argmax: &prev,
                 accept_plateau: 0,
                 prev_accept_sig: 0,
+                argmax_hist_len: 0,
+                argmax_hist_base: 0,
+                argmax_hist: &mut hist,
             },
         );
         assert_eq!(out.accept.iter().filter(|&&a| a != 0).count(), 2);

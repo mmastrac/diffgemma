@@ -357,6 +357,7 @@ fn build_logits_dump_from_forward(
             .map(|t| t.len() as u32)
             .unwrap_or(cfg.kv_len),
         cfg.no_early_stop,
+        1,
     );
     let temperature = scheduled_temperature(0, &params);
     let rows = positions

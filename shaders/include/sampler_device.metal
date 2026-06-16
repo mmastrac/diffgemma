@@ -3,6 +3,7 @@
 
 /// Shared sampler state layouts (must match `step_kernel.rs` CanvasState / StepParams).
 constant uint DGQ_SAMPLER_MAX_CANVAS = 256u;
+constant uint DGQ_SAMPLER_ARGMAX_HIST_MAX = 8u;
 
 struct StepParams {
     uint kv_len;
@@ -15,6 +16,7 @@ struct StepParams {
     uint min_early_stop_steps;
     uint accept_plateau_threshold;
     float plateau_prefix_mean_max;
+    uint eos_token_id;
 };
 
 struct CanvasState {
@@ -28,8 +30,10 @@ struct CanvasState {
     ulong rng_state;
     uint step;
     uint stop_flag;
-    uint argmax_stable;
-    uint argmax_changed;
+    uint argmax_hist_len;
+    uint argmax_hist_base;
+    uint argmax_hist[2048];
+    uint canvas_stable;
     float mean_entropy;
     uint accept_plateau;
     uint prev_accept_sig;

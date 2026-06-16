@@ -79,5 +79,31 @@ def trace_step_record(
     return row
 
 
+def diffusion_stable_and_confident(
+    argmax_ids: list[int],
+    entropies: list[float],
+    history: list[list[int]],
+    *,
+    stability_threshold: int = 1,
+    confidence_threshold: float = 0.005,
+) -> tuple[bool, list[list[int]]]:
+    """Match mlx_vlm ``_diffusion_stable_and_confident`` (returns stop, updated history)."""
+    if stability_threshold == 0:
+        stable = True
+    elif len(history) == stability_threshold:
+        stable = all(argmax_ids == canvas for canvas in history)
+    else:
+        stable = False
+    history = [list(row) for row in history]
+    history.append(list(argmax_ids))
+    if len(history) > stability_threshold:
+        history.pop(0)
+    if not stable:
+        return False, history
+    mean_ent = sum(entropies) / len(entropies) if entropies else float("inf")
+    confident = mean_ent < confidence_threshold
+    return stable and confident, history
+
+
 def stats_dict(stats: StepStats) -> dict[str, Any]:
     return asdict(stats)

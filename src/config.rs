@@ -84,6 +84,18 @@ pub struct VisionConfig {
 }
 
 impl ModelConfig {
+    /// Gemma-style EOS id from `config.json` (scalar or single-element list).
+    pub fn eos_token_id_u32(&self) -> u32 {
+        match &self.eos_token_id {
+            serde_json::Value::Number(n) => n.as_u64().unwrap_or(1) as u32,
+            serde_json::Value::Array(a) => a
+                .first()
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1) as u32,
+            _ => 1,
+        }
+    }
+
     pub fn load(model_dir: impl AsRef<Path>) -> Result<Self, Error> {
         let path = model_dir.as_ref().join("config.json");
         let json = std::fs::read_to_string(&path)?;

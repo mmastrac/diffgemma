@@ -20,6 +20,7 @@ pub enum GqaMask<'a> {
     DecoderBitmap(&'a DecoderAttnMask),
 }
 
+#[derive(Debug, Clone)]
 pub struct AttentionParams {
     pub n_heads: usize,
     pub n_kv_heads: usize,

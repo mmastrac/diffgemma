@@ -6,7 +6,7 @@ use super::test_util::ElemFormat;
 use super::variant::KernelVariant;
 use crate::kernels::cpu::sampler::{temp_at, tempered_row_stats};
 use crate::metal::{CanvasState, StepParams, CANVAS};
-use crate::sample::{is_active_token, PAD_TOKEN_ID};
+use crate::sample::PAD_TOKEN_ID;
 use crate::safetensors::Error;
 
 pub const ENTRY: &str = "sample_rowstats";
@@ -27,7 +27,7 @@ pub struct Fixture {
 
 impl Fixture {
     pub fn out_len(&self) -> usize {
-        self.rows * 4 + 1
+        self.rows * 4
     }
 
     pub fn temperature(&self) -> f32 {
@@ -65,6 +65,7 @@ pub fn tiny_fixture(_: ElemFormat) -> Fixture {
             min_early_stop_steps: 12,
             accept_plateau_threshold: 2,
             plateau_prefix_mean_max: 0.05,
+            eos_token_id: 1,
         },
         prev_argmax: vec![u32::MAX; rows],
         ids: (0..rows).map(|i| 100 + i as u32).collect(),
@@ -92,6 +93,7 @@ pub fn wide_fixture(_: ElemFormat) -> Fixture {
             min_early_stop_steps: 12,
             accept_plateau_threshold: 2,
             plateau_prefix_mean_max: 0.05,
+            eos_token_id: 1,
         },
         prev_argmax: (0..rows).map(|i| i as u32 * 3).collect(),
         ids: (0..rows).map(|i| 200 + i as u32).collect(),
@@ -105,21 +107,15 @@ pub fn pad_tail_fixture(_: ElemFormat) -> Fixture {
     f
 }
 
-fn pack_out(
-    rowstat: &[f32],
-    entropy: &[f32],
-    prev_argmax: &[u32],
-    argmax_changed: u32,
-) -> Vec<f32> {
+fn pack_out(rowstat: &[f32], entropy: &[f32], prev_argmax: &[u32]) -> Vec<f32> {
     let rows = entropy.len();
-    let mut out = Vec::with_capacity(rows * 4 + 1);
+    let mut out = Vec::with_capacity(rows * 4);
     for row in 0..rows {
         out.push(rowstat[row * 2]);
         out.push(rowstat[row * 2 + 1]);
         out.push(entropy[row]);
         out.push(prev_argmax[row] as f32);
     }
-    out.push(argmax_changed as f32);
     out
 }
 
@@ -129,19 +125,15 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
     let mut rowstat = vec![0.0f32; f.rows * 2];
     let mut entropy = vec![0.0f32; f.rows];
     let mut prev = f.prev_argmax.clone();
-    let mut changed = 0u32;
     for row in 0..f.rows {
         let lr = &logits[row * f.cols..(row + 1) * f.cols];
         let st = tempered_row_stats(lr, t);
         rowstat[row * 2] = st.mx;
         rowstat[row * 2 + 1] = st.sum;
         entropy[row] = st.entropy;
-        if is_active_token(f.ids[row]) && prev[row] != st.argmax {
-            changed = 1;
-        }
         prev[row] = st.argmax;
     }
-    pack_out(&rowstat, &entropy, &prev, changed)
+    pack_out(&rowstat, &entropy, &prev)
 }
 
 pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
@@ -168,8 +160,10 @@ fn canvas_state_for_gpu(f: &Fixture) -> CanvasState {
         rng_state: 0,
         step: f.step,
         stop_flag: 0,
-        argmax_stable: 0,
-        argmax_changed: 0,
+        argmax_hist_len: 0,
+        argmax_hist_base: 0,
+        argmax_hist: [0; CANVAS * crate::sample::ARGMAX_HIST_MAX],
+        canvas_stable: 0,
         mean_entropy: 0.0,
         accept_plateau: 0,
         prev_accept_sig: 0,
@@ -247,6 +241,8 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let filler = crate::sample::FILLER_TOKEN_ID;
     gpu_common::set_bytes(&enc, &pad, 5);
     gpu_common::set_bytes(&enc, &filler, 6);
+    let eos = f.params.eos_token_id;
+    gpu_common::set_bytes(&enc, &eos, 7);
     enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
     enc.endEncoding();
     cmd.commit();
@@ -266,18 +262,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         std::mem::offset_of!(CanvasState, prev_argmax),
         &mut prev,
     );
-    let mut changed = [0u32; 1];
-    BufferPool::read_u32_at_offset(
-        &buf_state,
-        std::mem::offset_of!(CanvasState, argmax_changed),
-        &mut changed,
-    );
-    Ok(pack_out(
-        &rowstat,
-        &entropy,
-        &prev,
-        changed[0],
-    ))
+    Ok(pack_out(&rowstat, &entropy, &prev))
 }
 
 #[cfg(not(all(feature = "metal", target_os = "macos")))]
@@ -326,21 +311,4 @@ mod tests {
         min_cos = 0.9999,
     }
 
-    #[test]
-    fn pad_tail_argmax_changed_only_on_active_rows() {
-        let f = pad_tail_fixture(ElemFormat::F32);
-        let warm = cpu(&f);
-        let rows = f.rows;
-        let mut prev: Vec<u32> = (0..rows)
-            .map(|r| warm[r * 4 + 3] as u32)
-            .collect();
-        // Flip pad rows' prev only — must not affect changed flag.
-        prev[0] = prev[0].wrapping_add(1);
-        prev[1] = prev[1].wrapping_add(1);
-        let mut f2 = f.clone();
-        f2.prev_argmax = prev;
-        let out = cpu(&f2);
-        let changed = out[out.len() - 1];
-        assert_eq!(changed, 0.0, "pad/filler rows must not set argmax_changed");
-    }
 }

@@ -249,6 +249,7 @@ fn verify_temperature_schedule() -> M0Check {
         min_early_stop_steps: crate::sample::MIN_EARLY_STOP_STEPS,
         accept_plateau_threshold: cfg.accept_plateau_threshold as u32,
         plateau_prefix_mean_max: cfg.plateau_prefix_mean_max,
+        eos_token_id: 1,
     };
     let mut max_err = 0.0f32;
     let n = cfg.max_denoising_steps.max(1);

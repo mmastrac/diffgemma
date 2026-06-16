@@ -5,7 +5,7 @@ using namespace metal;
 #include "debug_status.metal"
 #include "sampler_device.metal"
 
-/// Tempered row stats -> rowstat {mx, sum}; per-row entropy (nats); argmax + changed flag.
+/// Tempered row stats -> rowstat {mx, sum}; per-row entropy (nats); argmax.
 kernel void sample_rowstats(
     device const half *logits [[buffer(0)]],
     device float *rowstat [[buffer(1)]],
@@ -14,7 +14,8 @@ kernel void sample_rowstats(
     constant uint &cols [[buffer(4)]],
     constant uint &pad_token [[buffer(5)]],
     constant uint &filler_token [[buffer(6)]],
-    device DebugStatus *dbg [[buffer(7)]],
+    constant uint &eos_token [[buffer(7)]],
+    device DebugStatus *dbg [[buffer(8)]],
     uint row [[threadgroup_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]],
     uint tpg [[threads_per_threadgroup]]
@@ -25,6 +26,7 @@ kernel void sample_rowstats(
     K_ELEMENTWISE_GUARD();
 
     float t = temp_at(S->step, P);
+
     device const half *lr = logits + (ulong)row * cols;
     threadgroup float r_mx[8];
     threadgroup float r_sum[8];
@@ -96,13 +98,9 @@ kernel void sample_rowstats(
         S->entropy[row] = ent_val;
         rowstat[row * 2u] = mx;
         rowstat[row * 2u + 1u] = ts;
-        uint prev = S->prev_argmax[row];
         S->prev_argmax[row] = r_am[0];
-        uint id = S->ids[row];
-        bool active = (id != pad_token && id != filler_token);
-        if (active && prev != r_am[0]) {
-            atomic_store_explicit((device atomic_uint *)&S->argmax_changed, 1u,
-                                  memory_order_relaxed);
-        }
+        (void)pad_token;
+        (void)filler_token;
+        (void)eos_token;
     }
 }

@@ -1,36 +1,15 @@
 //! Attention kernels batched through `GpuBatch` (shared engine pool/queue).
 
+use crate::kernels::sub::engine_gqa_common::{self, GqaParams};
 use crate::metal::batch::{set_bytes, GpuBatch};
 use crate::metal::device::ComputePipeline;
 use crate::model::attention::{AttentionParams, GqaMask, MASK_NEG};
 use crate::safetensors::Error;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize};
+use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder, MTLComputePipelineState};
 
 use super::attention::GpuAttentionKernels;
-
-const MASK_CAUSAL_SLIDING: u32 = 0;
-const MASK_ENCODER_EXTEND: u32 = 1;
-const MASK_DECODER_BITMAP: u32 = 2;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct GqaParams {
-    seq_len: u32,
-    total_kv: u32,
-    n_heads: u32,
-    n_kv_heads: u32,
-    head_dim: u32,
-    n_groups: u32,
-    mask_kind: u32,
-    sliding_window: u32,
-    kv_cache_len: u32,
-    mask_neg: f32,
-    rotary_dim: u32,
-    num_heads_rope: u32,
-    elem_offset: u32,
-}
 
 pub fn rope_qk_batched(
     batch: &mut GpuBatch<'_>,
@@ -351,12 +330,22 @@ fn gqa_batched_inner(
     }
 
     let (mask_kind, kv_cache_len, positions, decoder_mask) = match mask {
-        GqaMask::CausalSliding => (MASK_CAUSAL_SLIDING, 0usize, None, None),
+        GqaMask::CausalSliding => (engine_gqa_common::MASK_CAUSAL_SLIDING, 0usize, None, None),
         GqaMask::EncoderExtend {
             kv_cache_len,
             positions,
-        } => (MASK_ENCODER_EXTEND, kv_cache_len, Some(positions), None),
-        GqaMask::DecoderBitmap(m) => (MASK_DECODER_BITMAP, m.kv_cache_len, None, Some(m)),
+        } => (
+            engine_gqa_common::MASK_ENCODER_EXTEND,
+            kv_cache_len,
+            Some(positions),
+            None,
+        ),
+        GqaMask::DecoderBitmap(m) => (
+            engine_gqa_common::MASK_DECODER_BITMAP,
+            m.kv_cache_len,
+            None,
+            Some(m),
+        ),
     };
 
     let buf_q = if let Some(buf) = q_gpu {
@@ -382,21 +371,7 @@ fn gqa_batched_inner(
         pos_buf = Some(batch.alloc_i64(pos)?);
     }
 
-    let gpu_params = GqaParams {
-        seq_len: seq_len as u32,
-        total_kv: total_kv as u32,
-        n_heads: params.n_heads as u32,
-        n_kv_heads: params.n_kv_heads as u32,
-        head_dim: params.head_dim as u32,
-        n_groups: params.n_groups as u32,
-        mask_kind,
-        sliding_window: params.sliding_window.unwrap_or(0) as u32,
-        kv_cache_len: kv_cache_len as u32,
-        mask_neg: MASK_NEG,
-        rotary_dim: params.rotary_dim as u32,
-        num_heads_rope: 0,
-        elem_offset: 0,
-    };
+    let gpu_params = GqaParams::for_attention(seq_len, total_kv, params, mask_kind, kv_cache_len);
 
     encode_gqa(
         batch,
@@ -434,8 +409,8 @@ fn encode_rope(
         batch.encoder().setBuffer_offset_atIndex(Some(buf_x), 0, 0);
         batch.encoder().setBuffer_offset_atIndex(Some(buf_f), 0, 1);
     }
-    set_bytes(batch.encoder(), params, 2);
-    dispatch_2d(batch.encoder(), num_heads, seq_len);
+    engine_gqa_common::set_params(batch.encoder(), params, 2);
+    engine_gqa_common::dispatch_head_query_2d(batch.encoder(), num_heads, seq_len);
 }
 
 fn encode_gqa(
@@ -468,22 +443,8 @@ fn encode_gqa(
             batch.encoder().setBuffer_offset_atIndex(Some(pos), 0, 5);
         }
     }
-    set_bytes(batch.encoder(), params, 6);
-    dispatch_2d(batch.encoder(), n_heads, seq_len);
-}
-
-fn dispatch_2d(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, width: usize, height: usize) {
-    let grid = MTLSize {
-        width,
-        height,
-        depth: 1,
-    };
-    let tg = MTLSize {
-        width: 1,
-        height: 1,
-        depth: 1,
-    };
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    engine_gqa_common::set_params(batch.encoder(), params, 6);
+    engine_gqa_common::dispatch_head_query_2d(batch.encoder(), n_heads, seq_len);
 }
 
 #[cfg(all(test, feature = "metal", target_os = "macos"))]

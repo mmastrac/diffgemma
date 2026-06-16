@@ -25,7 +25,7 @@
 // ===================== REMAINING VERIFY / DRIVER ITEMS =====================
 // VERIFY-N   q4 nibble parity (even j = low nibble) — confirm against q4_weight_at tail.
 // VERIFY-SC  soft mix gets sqrt(hidden) scale like token embeds; softmax over stored
-//            (post-softcap, t=1) logits via k_logit_rowstats.
+//            post-softcap logits (temperature-scaled at finish for MLX parity).
 // V1(ok'd)   full layers: V aliased from k_proj output, rms_norm_no_scale, no RoPE.
 // DRIVER     pipeline table (function constants per shape/layer-type), ICB encode,
 //            prefill/extend writer for the NEW kv layout (NOTE-KV), CanvasState init
@@ -78,6 +78,7 @@ struct StepParams {
     uint min_early_stop_steps;
     uint accept_plateau_threshold;
     float plateau_prefix_mean_max;
+    uint eos_token_id;
 };
 struct CanvasState {
     uint ids[256]; uint prev_argmax[256]; uint new_sample[256];
@@ -85,8 +86,10 @@ struct CanvasState {
     ulong rng_state;
     uint step;                     // steps completed (0 before first)
     uint stop_flag;
-    uint argmax_stable;            // consecutive unchanged steps
-    uint argmax_changed;           // per-step scratch flag (atomic)
+    uint argmax_hist_len;
+    uint argmax_hist_base;
+    uint argmax_hist[2048];
+    uint canvas_stable;
     float mean_entropy; uint accept_plateau; uint prev_accept_sig;
 };
 struct RouteScratch {

@@ -4,7 +4,7 @@ using namespace metal;
 #include "fc_axes.metal"
 #include "debug_status.metal"
 
-/// Per-row max + sumexp over half logits (post-softcap, t=1) -> rowstat[row*2] = {mx, sum}.
+/// Per-row max + sumexp over half logits (post-softcap; tempered when stored for SC) -> {mx, sum}.
 kernel void logit_rowstats(
     device const half *logits [[buffer(0)]],
     device float *rowstat [[buffer(1)]],
