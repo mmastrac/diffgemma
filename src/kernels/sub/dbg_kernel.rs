@@ -66,4 +66,5 @@ pub enum DbgErrorCode {
     QuantUnsupported = 6,
     ArenaOob = 7,
     BadDim = 8,
+    NegativeEntropy = 9,
 }

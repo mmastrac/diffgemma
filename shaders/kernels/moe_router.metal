@@ -14,6 +14,7 @@ kernel void moe_router(
     device const LayerOffsets *L [[buffer(2)]],
     device RouteScratch *R [[buffer(3)]],
     constant RouterDims &dims [[buffer(4)]],
+    device DebugStatus *dbg [[buffer(5)]],
     uint tok [[threadgroup_position_in_grid]],
     uint e [[thread_position_in_threadgroup]]
 ) {
@@ -84,6 +85,7 @@ kernel void moe_router(
         float inv = (sum > 0.f) ? (1.f / sum) : 0.f;
         for (uint kk = 0u; kk < dims.top_k; ++kk) {
             float w = exp(logits[pick[kk]] - mx) * inv * bf16_bytes(pes + 2ul * pick[kk]);
+            dgq_assert_index(dbg, DbgKernelMoeRouter, pick[kk], dims.n_experts);
             R->expert[tok][kk] = pick[kk];
             R->weight[tok][kk] = half(w);
         }

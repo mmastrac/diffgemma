@@ -17,6 +17,7 @@ kernel void sc_softembed(
     constant uint &first_step [[buffer(5)]],
     constant uint3 &dims [[buffer(6)]],
     constant float &embed_scale [[buffer(7)]],
+    device DebugStatus *dbg [[buffer(8)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 lid [[thread_position_in_threadgroup]]
 ) {
@@ -38,6 +39,9 @@ kernel void sc_softembed(
     }
     float mx = rowstat[tok * 2u];
     float sum = rowstat[tok * 2u + 1u];
+    if (lid.x == 0u && d == 0u) {
+        dgq_assert_positive_f32(dbg, DbgKernelScSoftembed, sum, tok);
+    }
     device const half *lr = logits + (ulong)tok * vocab;
     float acc = 0.f;
     for (uint v = 0; v < vocab; ++v) {

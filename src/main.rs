@@ -66,6 +66,8 @@ enum Command {
         max_new_tokens: usize,
         max_layers: Option<usize>,
         no_early_stop: bool,
+        kernel_assert: bool,
+        kernel_debug_deep: bool,
         write_golden: Option<String>,
         write_trace: Option<PathBuf>,
     },
@@ -645,6 +647,8 @@ fn main() -> ExitCode {
             max_new_tokens,
             max_layers,
             no_early_stop,
+            kernel_assert,
+            kernel_debug_deep,
             write_golden,
             write_trace,
         } => run_generate_monolithic_cmd(
@@ -656,6 +660,8 @@ fn main() -> ExitCode {
             max_new_tokens,
             max_layers,
             no_early_stop,
+            kernel_assert,
+            kernel_debug_deep,
             write_golden,
             write_trace,
             cli.raw_prompt,
@@ -2711,6 +2717,8 @@ fn parse_cli() -> Cli {
     let mut write_golden: Option<String> = None;
     let mut write_trace: Option<PathBuf> = None;
     let mut no_early_stop = false;
+    let mut kernel_assert = false;
+    let mut kernel_debug_deep = false;
     let mut output_dir: Option<PathBuf> = None;
     let mut quant_profile = String::from("q4");
     let mut bench_gemm_shapes = String::from("256x2816x2816,33x2816x1408");
@@ -2794,6 +2802,8 @@ fn parse_cli() -> Cli {
             "--compare-cpu" => compare_cpu = true,
             "--repeat-prefill" => bench_repeat_prefill = true,
             "--no-early-stop" => no_early_stop = true,
+            "--assert" => kernel_assert = true,
+            "--debug-deep" => kernel_debug_deep = true,
             "--gpu-kv" => step_gpu_kv = true,
             "--skip-grouped" => step_moe_route_grouped = false,
             "--write-golden" => {
@@ -2991,6 +3001,8 @@ fn parse_cli() -> Cli {
             max_new_tokens,
             max_layers: parity_layers,
             no_early_stop,
+            kernel_assert,
+            kernel_debug_deep,
             write_golden: None,
             write_trace: None,
         },
@@ -3011,6 +3023,8 @@ fn parse_cli() -> Cli {
             max_new_tokens,
             max_layers: parity_layers,
             no_early_stop,
+            kernel_assert,
+            kernel_debug_deep,
             write_golden,
             write_trace,
         },
@@ -3033,6 +3047,8 @@ fn parse_cli() -> Cli {
             max_new_tokens,
             max_layers: parity_layers,
             no_early_stop,
+            kernel_assert,
+            kernel_debug_deep,
             write_golden,
             write_trace,
         },
@@ -3412,7 +3428,7 @@ fn parse_cli() -> Cli {
             eprintln!("  prompts: chat template applied by default; use --raw for bare BPE (-p \"Hello\" -> [9259])");
             eprintln!("  chat: interactive REPL (monolithic .dgq); optional -p for first user turn");
             eprintln!("  generate-parity: GPU vs checked-in golden (use --compare-cpu for slow CPU path; use --raw for legacy goldens)");
-            eprintln!("  options: ... --golden NAME --write-golden NAME --compare-cpu --no-early-stop");
+            eprintln!("  options: ... --golden NAME --write-golden NAME --compare-cpu --no-early-stop --assert --debug-deep");
             eprintln!("  gemm options: --size N (default 512, requires --features metal)");
             eprintln!("  attention: layer 0 GQA parity (requires --features metal)");
             eprintln!("  decoder-gpu: full decoder CPU vs GPU parity at seq=256 (requires --features metal)");
@@ -3471,6 +3487,8 @@ fn default_generate_command(
             max_new_tokens,
             max_layers,
             no_early_stop,
+            kernel_assert: false,
+            kernel_debug_deep: false,
             write_golden: None,
             write_trace: None,
         };
@@ -4921,6 +4939,8 @@ fn run_generate_monolithic_cmd(
     max_new_tokens: usize,
     max_layers: Option<usize>,
     no_early_stop: bool,
+    kernel_assert: bool,
+    kernel_debug_deep: bool,
     write_golden: Option<String>,
     write_trace: Option<PathBuf>,
     raw_prompt: bool,
@@ -4929,6 +4949,8 @@ fn run_generate_monolithic_cmd(
         eprintln!("error: generate-monolithic requires a .dgq directory (-m /path/to/quantized-weights)");
         return ExitCode::FAILURE;
     }
+
+    crate::kernels::sub::variant::set_runtime_kernel_debug(kernel_assert, kernel_debug_deep);
 
     let vocab = match crate::config::ModelConfig::load(model_dir) {
         Ok(c) => c.text_config.vocab_size,
@@ -4973,8 +4995,10 @@ fn run_generate_monolithic_cmd(
     };
 
     let stop_note = if no_early_stop { ", no_early_stop" } else { "" };
+    let assert_note = if kernel_assert { ", assert" } else { "" };
+    let deep_note = if kernel_debug_deep { ", debug-deep" } else { "" };
     eprintln!(
-        "running generate-monolithic (prompt_len={prompt_len}, steps={steps}, layers={layers}, max_new_tokens={max_new_tokens}, seed={seed}{stop_note})..."
+        "running generate-monolithic (prompt_len={prompt_len}, steps={steps}, layers={layers}, max_new_tokens={max_new_tokens}, seed={seed}{stop_note}{assert_note}{deep_note})..."
     );
     let started = std::time::Instant::now();
 
@@ -5192,6 +5216,8 @@ fn run_generate_monolithic_cmd(
     _max_new_tokens: usize,
     _max_layers: Option<usize>,
     _no_early_stop: bool,
+    _kernel_assert: bool,
+    _kernel_debug_deep: bool,
     _write_golden: Option<String>,
     _write_trace: Option<PathBuf>,
     _raw_prompt: bool,

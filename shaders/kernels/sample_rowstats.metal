@@ -12,6 +12,7 @@ kernel void sample_rowstats(
     device CanvasState *S [[buffer(2)]],
     constant StepParams &P [[buffer(3)]],
     constant uint &cols [[buffer(4)]],
+    device DebugStatus *dbg [[buffer(5)]],
     uint row [[threadgroup_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]],
     uint tpg [[threads_per_threadgroup]]
@@ -86,7 +87,11 @@ kernel void sample_rowstats(
             ts += r_sum[i];
             te += r_ent[i];
         }
-        S->entropy[row] = log(ts) - te / ts;
+        dgq_assert_positive_f32(dbg, DbgKernelSampleRowstats, ts, row);
+        float ent_val = log(ts) - te / ts;
+        dgq_assert_entropy_nonneg(dbg, DbgKernelSampleRowstats, ent_val, row);
+        dgq_assert_index(dbg, DbgKernelSampleRowstats, r_am[0], cols);
+        S->entropy[row] = ent_val;
         rowstat[row * 2u] = mx;
         rowstat[row * 2u + 1u] = ts;
         uint prev = S->prev_argmax[row];

@@ -161,6 +161,8 @@ pub fn bind_gpu_buffers(
     hidden: u32,
     num_tokens: u32,
     embed_scale: f32,
+    vocab: u32,
+    debug_status: Option<&ProtocolObject<dyn MTLBuffer>>,
 ) {
     let dims = [hidden, num_tokens];
     unsafe {
@@ -171,6 +173,12 @@ pub fn bind_gpu_buffers(
     gpu_common::set_bytes(enc, &w_off, 3);
     gpu_common::set_bytes(enc, &dims, 4);
     gpu_common::set_bytes(enc, &embed_scale, 5);
+    gpu_common::set_bytes(enc, &vocab, 6);
+    if let Some(dbg) = debug_status {
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(dbg), 0, 7);
+        }
+    }
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -191,6 +199,9 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let buf_out = pool
         .allocate(&ctx.device, f.out_len() * 2)
         .ok_or(Error::Format("alloc"))?;
+    let buf_dbg = pool
+        .allocate(&ctx.device, crate::metal::debug_status::DEBUG_STATUS_BYTES)
+        .ok_or(Error::Format("alloc"))?;
     BufferPool::write_bytes(&buf_blob, &embed_q8);
     let idx_bytes = unsafe {
         std::slice::from_raw_parts(f.ids.as_ptr().cast::<u8>(), f.ids.len() * 4)
@@ -209,6 +220,12 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         f.hidden as u32,
         f.num_tokens as u32,
         f.embed_scale,
+        (f.embed_f32.len() / f.hidden) as u32,
+        if variant.debug_fast || variant.shape_assert || variant.debug_deep {
+            Some(&buf_dbg)
+        } else {
+            None
+        },
     );
     enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
     enc.endEncoding();

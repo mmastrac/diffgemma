@@ -14,20 +14,31 @@ kernel void embed_gather(
     constant ulong &w_off [[buffer(3)]],
     constant uint2 &dims [[buffer(4)]],
     constant float &embed_scale [[buffer(5)]],
+    constant uint &vocab [[buffer(6)]],
+    device DebugStatus *dbg [[buffer(7)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     const uint hidden = dims.x;
     const uint num_tokens = dims.y;
     const uint tok = gid.y;
     const uint d = gid.x;
-    dgq_assert_dims_nonzero(nullptr, DbgKernelEmbedGather, hidden, num_tokens);
-    if (dgq_debug_fast_enabled() && (tok >= num_tokens || d >= hidden)) {
-        return;
-    }
+    dgq_assert_dims_nonzero(dbg, DbgKernelEmbedGather, hidden, num_tokens);
     if (tok >= num_tokens || d >= hidden) {
+        if (dgq_debug_fast_enabled()) {
+            dgq_assert_index(dbg, DbgKernelEmbedGather, tok, num_tokens);
+            dgq_assert_index(dbg, DbgKernelEmbedGather, d, hidden);
+        }
         return;
     }
     K_ELEMENTWISE_GUARD();
-    device const uchar *row = blob + w_off + (ulong)ids[tok] * q8_row_bytes(hidden);
-    out[(ulong)tok * hidden + d] = half(q8_at(row, d, bf16_bytes(row)) * embed_scale);
+    const uint id = ids[tok];
+    if (d == 0u) {
+        dgq_assert_token_id(dbg, DbgKernelEmbedGather, id, vocab);
+    }
+    device const uchar *row = blob + w_off + (ulong)id * q8_row_bytes(hidden);
+    half v = half(q8_at(row, d, bf16_bytes(row)) * embed_scale);
+    if (dgq_debug_deep_enabled() && d == 0u) {
+        dgq_assert_finite_f32(dbg, DbgKernelEmbedGather, float(v), tok);
+    }
+    out[(ulong)tok * hidden + d] = v;
 }

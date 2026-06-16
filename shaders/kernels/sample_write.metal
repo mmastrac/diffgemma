@@ -10,6 +10,7 @@ kernel void sample_write(
     device CanvasState *S [[buffer(0)]],
     constant uint &canvas_size [[buffer(1)]],
     constant uint &vocab_size [[buffer(2)]],
+    device DebugStatus *dbg [[buffer(3)]],
     uint lid [[thread_position_in_threadgroup]]
 ) {
     if (K_SHAPE_ASSERT && (canvas_size == 0u || canvas_size > DGQ_SAMPLER_MAX_CANVAS || vocab_size == 0u)) {
@@ -21,10 +22,14 @@ kernel void sample_write(
         ulong st = S->rng_state;
         for (uint i = 0u; i < canvas_size; ++i) {
             if (S->accept[i] != 0u) {
-                S->ids[i] = S->new_sample[i];
+                uint t = S->new_sample[i];
+                dgq_assert_token_id(dbg, DbgKernelSampleWrite, t, vocab_size);
+                S->ids[i] = t;
             } else {
                 st = lcg_next(st);
-                S->ids[i] = uint(st >> 32) % vocab_size;
+                uint t = uint(st >> 32) % vocab_size;
+                dgq_assert_token_id(dbg, DbgKernelSampleWrite, t, vocab_size);
+                S->ids[i] = t;
             }
         }
         S->rng_state = st;

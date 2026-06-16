@@ -17,6 +17,7 @@ kernel void qk_rope_kv(
     device const LayerOffsets *L [[buffer(5)]],
     constant StepParams &P [[buffer(6)]],
     constant AttnDims &dims [[buffer(7)]],
+    device DebugStatus *dbg [[buffer(8)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     if (K_SHAPE_ASSERT && (dims.canvas == 0u || dims.n_q_heads == 0u)) {
@@ -25,6 +26,7 @@ kernel void qk_rope_kv(
     K_ELEMENTWISE_GUARD();
 
     const uint hd = L->head_dim;
+    dgq_assert_fast(hd > 0u && hd <= 512u, dbg, DbgErrBadDim, DbgKernelQkRopeKv, hd);
     const uint nkv = L->n_kv_heads;
     const uint tok = gid.x;
     const uint h = gid.y;
@@ -49,6 +51,7 @@ kernel void qk_rope_kv(
         ss += t * t;
     }
     float inv = rsqrt(ss / float(hd) + ATTN_RMS_EPS);
+    dgq_assert_finite_f32(dbg, DbgKernelQkRopeKv, inv, tok);
     ulong noff = isQ ? L->q_norm : isK ? L->k_norm : 0ul;
     if (isQ || isK) {
         // Full-attn layers alias V from raw k_proj: do not mutate `k` in place on the K path.

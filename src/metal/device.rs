@@ -88,11 +88,12 @@ impl MetalContext {
         is_full_layer: bool,
         quant_format: u32,
     ) -> Result<ComputePipeline, Error> {
+        let variant = crate::kernels::sub::variant::runtime_step_variant();
         let fc = MTLFunctionConstantValues::new();
-        let shape_assert = false;
+        let shape_assert = variant.shape_assert;
         let dump_stage = 0u32;
-        let debug_fast = false;
-        let debug_deep = false;
+        let debug_fast = variant.debug_fast;
+        let debug_deep = variant.debug_deep;
         unsafe {
             fc.setConstantValue_type_atIndex(
                 std::ptr::NonNull::from_ref(&shape_assert).cast(),
@@ -139,7 +140,12 @@ impl MetalContext {
         let function = library
             .newFunctionWithName_constantValues_error(&name, &fc)
             .map_err(|e| shader_compile_error(e))?;
-        let label = format!("{entry}_qf{quant_format}_n{gemm_n}_k{gemm_k}");
+        let label = format!(
+            "{entry}_qf{quant_format}_n{gemm_n}_k{gemm_k}_sa{}_df{}_dd{}",
+            u8::from(shape_assert),
+            u8::from(debug_fast),
+            u8::from(debug_deep),
+        );
         let cache = PipelineArchiveCache::shared(device)?;
         let pipeline = cache.compile_compute(device, &function, &label)?;
         Ok(ComputePipeline { pipeline })

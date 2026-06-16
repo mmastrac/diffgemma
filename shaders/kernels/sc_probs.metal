@@ -10,6 +10,7 @@ kernel void sc_probs(
     device const float *rowstat [[buffer(1)]],
     device half *probs [[buffer(2)]],
     constant uint2 &dims [[buffer(3)]],
+    device DebugStatus *dbg [[buffer(4)]],
     uint row [[threadgroup_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]],
     uint tpg [[threads_per_threadgroup]]
@@ -25,6 +26,9 @@ kernel void sc_probs(
 
     float mx = rowstat[row * 2u];
     float sum = rowstat[row * 2u + 1u];
+    if (lid == 0u) {
+        dgq_assert_positive_f32(dbg, DbgKernelScProbs, sum, row);
+    }
     device const half *lr = logits + (ulong)row * cols;
     for (uint v = lid; v < cols; v += tpg) {
         probs[(ulong)row * cols + v] = half(exp(float(lr[v]) - mx) / sum);

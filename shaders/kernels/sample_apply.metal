@@ -12,6 +12,7 @@ kernel void sample_apply(
     device CanvasState *S [[buffer(2)]],
     constant StepParams &P [[buffer(3)]],
     constant uint &cols [[buffer(4)]],
+    device DebugStatus *dbg [[buffer(5)]],
     uint row [[threadgroup_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]],
     uint tpg [[threads_per_threadgroup]]
@@ -23,6 +24,7 @@ kernel void sample_apply(
 
     float t = temp_at(S->step - 1u, P);
     float mx = rowstat[row * 2u], Z = rowstat[row * 2u + 1u];
+    dgq_assert_positive_f32(dbg, DbgKernelSampleApply, Z, row);
     float target = S->u_cat[row] * Z;
     device const half *lr = logits + (ulong)row * cols;
     threadgroup float chunk[256];
@@ -49,6 +51,7 @@ kernel void sample_apply(
             }
             cum += chunk[c];
         }
+        dgq_assert_index(dbg, DbgKernelSampleApply, pick, cols);
         S->new_sample[row] = pick;
     }
 }

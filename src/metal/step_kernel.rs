@@ -439,7 +439,7 @@ struct StepPipelines {
 }
 
 impl StepPipelines {
-    fn new(ctx: &MetalContext) -> Result<Self, Error> {
+    fn new(ctx: &MetalContext, variant: crate::kernels::sub::variant::KernelVariant) -> Result<Self, Error> {
         let mut gemm_q4 = HashMap::new();
         let mut gemm_nvfp4 = HashMap::new();
         let mut gemm_q8 = HashMap::new();
@@ -502,7 +502,7 @@ impl StepPipelines {
                 )?,
             );
         }
-        let prod = crate::kernels::sub::variant::KernelVariant::PRODUCTION;
+        let prod = variant;
         let dump = crate::kernels::sub::variant::KernelVariant::TEST_DUMP;
         Ok(Self {
             memzero: crate::kernels::sub::memzero_bytes::pipeline_for(ctx, prod)?,
@@ -628,6 +628,8 @@ pub(crate) struct StepBuffers {
     route: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// Inert 4B buffer for optional dump slots (K_DUMP_STAGE=0 kernels).
     dummy_dump: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// P3.7 assert reporting (`--assert`); 16 bytes, zeroed each forward step.
+    debug_status: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
     pub(crate) gemm_a: Retained<ProtocolObject<dyn MTLBuffer>>,
     pub(crate) gemm_b: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// Per-layer unique routed experts (written by moe_bucket_fill phase 1).
@@ -752,6 +754,12 @@ impl StepEnc<'_> {
         }
     }
 
+    fn bind_debug_status(&mut self, index: usize) {
+        if let Some(ref dbg) = self.bufs.debug_status {
+            self.sink_set_buffer(dbg, 0, index);
+        }
+    }
+
     fn sink_dispatch(&mut self, grid: MTLSize, tg: MTLSize) {
         if let Some(r) = self.recorder.as_deref_mut() {
             r.dispatch_threadgroups(grid, tg);
@@ -842,6 +850,8 @@ impl StepEnc<'_> {
             this.sink_set_buffer(&this.bufs.logits, 0, 0);
             this.sink_set_bytes(&base, 1);
             this.sink_set_bytes(&chunk, 2);
+            this.sink_set_buffer(&this.bufs.dummy_dump, 0, 3);
+            this.bind_debug_status(4);
         });
     }
 
@@ -1079,6 +1089,7 @@ impl StepEnc<'_> {
         self.sink_set_buffer(&self.bufs.arena, A_RS_SC as usize, 1);
         let dims = [CANVAS as u32, VOCAB as u32];
         self.sink_set_bytes(&dims, 2);
+        self.bind_debug_status(3);
         let (grid, tg) = crate::kernels::sub::logit_rowstats::dispatch_shape(CANVAS);
         self.sink_dispatch(grid, tg);
     }
@@ -1099,6 +1110,7 @@ impl StepEnc<'_> {
             self.bind_sc_probs(2);
             let dims = [CANVAS as u32, VOCAB as u32];
             self.sink_set_bytes(&dims, 3);
+            self.bind_debug_status(4);
             let (grid, tg) = crate::kernels::sub::sc_probs::dispatch_shape(CANVAS);
             self.sink_dispatch(grid, tg);
 
@@ -1118,6 +1130,7 @@ impl StepEnc<'_> {
             let dims = [HID as u32, CANVAS as u32, VOCAB as u32];
             self.sink_set_bytes(&dims, 6);
             self.sink_set_bytes(&EMBED_SCALE, 7);
+            self.bind_debug_status(8);
             let (grid, tg) =
                 crate::kernels::sub::sc_softembed::dispatch_shape(HID, CANVAS);
             self.sink_dispatch(grid, tg);
@@ -1256,6 +1269,7 @@ impl StepEnc<'_> {
         self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 2);
         self.bind_route(3);
         self.sink_set_bytes(&router_dims, 4);
+        self.bind_debug_status(5);
         let grid = MTLSize {
             width: CANVAS,
             height: 1,
@@ -1279,9 +1293,10 @@ impl StepEnc<'_> {
             self.bind_route(0);
             self.sink_set_bytes(&phase, 1);
             self.sink_set_bytes(&router_dims, 2);
-                self.sink_set_buffer(&self.bufs.expert_layer_unique, 0, 3);
+            self.sink_set_buffer(&self.bufs.expert_layer_unique, 0, 3);
             let layer_idx = layer as u32;
             self.sink_set_bytes(&layer_idx, 4);
+            self.bind_debug_status(5);
             let count = if phase == 1 { 1 } else { CANVAS * TOP_K };
             self.dispatch_1d(&self.ps.bucket_fill, count, 256);
         }
@@ -1605,6 +1620,7 @@ impl StepEnc<'_> {
             n_q_heads: STEP_NQ_HEADS as u32,
         };
         self.sink_set_bytes(&attn_dims, 7);
+        self.bind_debug_status(8);
         let grid = MTLSize {
             width: CANVAS,
             height: qk_y,
@@ -1636,6 +1652,7 @@ impl StepEnc<'_> {
             n_q_heads: STEP_NQ_HEADS as u32,
         };
         self.sink_set_bytes(&attn_dims, 5);
+        self.bind_debug_status(6);
         let grid = MTLSize {
             width: CANVAS,
             height: 16,
@@ -1823,6 +1840,9 @@ impl StepEnc<'_> {
         let dims = [HID as u32, CANVAS as u32];
         self.sink_set_bytes(&dims, 4);
         self.sink_set_bytes(&EMBED_SCALE, 5);
+        let vocab = VOCAB as u32;
+        self.sink_set_bytes(&vocab, 6);
+        self.bind_debug_status(7);
         let (grid, tg) = crate::kernels::sub::embed_gather::dispatch_shape(HID, CANVAS);
         self.sink_dispatch(grid, tg);
     }
@@ -1904,6 +1924,7 @@ impl StepEnc<'_> {
         self.bind_state(2);
         self.bind_params(3);
         self.sink_set_bytes(&cols, 4);
+        self.bind_debug_status(5);
         let grid = MTLSize {
             width: CANVAS,
             height: 1,
@@ -1922,6 +1943,7 @@ impl StepEnc<'_> {
         self.sink_set_bytes(&canvas, 2);
         self.sink_set_bytes(&pad, 3);
         self.sink_set_bytes(&filler, 4);
+        self.bind_debug_status(5);
         let tg = MTLSize {
             width: 256,
             height: 1,
@@ -1940,6 +1962,7 @@ impl StepEnc<'_> {
         self.bind_state(2);
         self.bind_params(3);
         self.sink_set_bytes(&cols, 4);
+        self.bind_debug_status(5);
         let grid = MTLSize {
             width: CANVAS,
             height: 1,
@@ -1956,6 +1979,7 @@ impl StepEnc<'_> {
         self.bind_state(0);
         self.sink_set_bytes(&canvas, 1);
         self.sink_set_bytes(&cols, 2);
+        self.bind_debug_status(3);
         let grid = MTLSize {
             width: 1,
             height: 1,
@@ -2345,6 +2369,14 @@ impl StepRuntime {
         Ok(())
     }
 
+    fn check_debug_status(&self) -> Result<(), Error> {
+        if let Some(ref dbg) = self.bufs.debug_status {
+            let st = crate::metal::debug_status::read_buffer(dbg);
+            crate::metal::debug_status::check_status(st)?;
+        }
+        Ok(())
+    }
+
     fn dispatch_and_wait<F>(&mut self, f: F) -> Result<(), Error>
     where
         F: FnOnce(&mut StepEnc<'_>) -> Result<(), Error>,
@@ -2552,6 +2584,9 @@ impl StepRuntime {
 
     /// P2.2 Phase A: one command buffer + one GPU sync per denoise step.
     fn run_forward_once(&mut self, finish: StepFinishMode) -> Result<(), Error> {
+        if let Some(ref dbg) = self.bufs.debug_status {
+            crate::metal::debug_status::zero_buffer(dbg);
+        }
         let layout = self.layout;
         let layers = self.layers;
         let st_before: CanvasState = read_struct(&self.bufs.state);
@@ -2593,27 +2628,43 @@ impl StepRuntime {
         }
         self.dispatch_and_wait(|enc| {
             enc.interpret_step(&layout, layers, first_step, finish)
-        })
+        })?;
+        self.check_debug_status()
     }
 }
 
-static STEP_PIPELINES: std::sync::OnceLock<Result<StepPipelines, String>> =
-    std::sync::OnceLock::new();
+static STEP_PIPELINES_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<StepPipelineKey, &'static StepPipelines>>,
+> = std::sync::OnceLock::new();
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct StepPipelineKey(u8);
+
+fn step_pipeline_key(variant: crate::kernels::sub::variant::KernelVariant) -> StepPipelineKey {
+    StepPipelineKey(
+        u8::from(variant.shape_assert)
+            | (u8::from(variant.debug_fast) << 1)
+            | (u8::from(variant.debug_deep) << 2),
+    )
+}
 
 fn shared_step_pipelines(ctx: &MetalContext) -> Result<&'static StepPipelines, Error> {
-    STEP_PIPELINES
-        .get_or_init(|| {
-            let result = ctx
-                .compile_library(STEP_SHADER)
-                .and_then(|_| StepPipelines::new(ctx))
-                .map_err(|e| e.to_string());
-            if result.is_ok() {
-                crate::metal::pipeline_cache::PipelineArchiveCache::flush_global();
-            }
-            result
-        })
-        .as_ref()
-        .map_err(|msg| Error::Format(msg.as_str()))
+    let variant = crate::kernels::sub::variant::runtime_step_variant();
+    let key = step_pipeline_key(variant);
+    let cache = STEP_PIPELINES_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut guard = cache
+        .lock()
+        .map_err(|_| Error::Format("step pipelines cache poisoned"))?;
+    if let Some(&pipelines) = guard.get(&key) {
+        return Ok(pipelines);
+    }
+
+    ctx.compile_library(STEP_SHADER)?;
+    let pipelines = StepPipelines::new(ctx, variant)?;
+    let leaked: &'static StepPipelines = Box::leak(Box::new(pipelines));
+    guard.insert(key, leaked);
+    crate::metal::pipeline_cache::PipelineArchiveCache::flush_global();
+    Ok(leaked)
 }
 
 pub fn log_step_memory_budget(blob_bytes: u64, max_seq: usize, layout: &ModelLayout, use_sc_gemm: bool) {
@@ -2755,6 +2806,14 @@ pub fn build_step_runtime(
             b
         },
         dummy_dump: alloc_buffer(&ctx.device, 4)?,
+        debug_status: if crate::kernels::sub::variant::runtime_kernel_debug_enabled() {
+            Some(alloc_buffer(
+                &ctx.device,
+                crate::metal::debug_status::DEBUG_STATUS_BYTES,
+            )?)
+        } else {
+            None
+        },
         gemm_a: alloc_buffer(&ctx.device, gemm_a_bytes)?,
         gemm_b: alloc_buffer(&ctx.device, gemm_b_bytes)?,
         expert_layer_unique: alloc_buffer(&ctx.device, N_LAYERS * std::mem::size_of::<u32>())?,

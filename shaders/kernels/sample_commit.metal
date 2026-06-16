@@ -12,6 +12,7 @@ kernel void sample_commit(
     constant uint &canvas_size [[buffer(2)]],
     constant uint &pad_token [[buffer(3)]],
     constant uint &filler_token [[buffer(4)]],
+    device DebugStatus *dbg [[buffer(5)]],
     uint lid [[thread_position_in_threadgroup]]
 ) {
     if (K_SHAPE_ASSERT && (canvas_size == 0u || canvas_size > DGQ_SAMPLER_MAX_CANVAS)) {
@@ -24,13 +25,16 @@ kernel void sample_commit(
         ent[lid] = S->entropy[lid];
         S->sorted_idx[lid] = lid;
         S->accept[lid] = 0u;
+        dgq_assert_entropy_nonneg(dbg, DbgKernelSampleCommit, ent[lid], lid);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lid == 0u) {
         ulong st = S->rng_state;
         for (uint i = 0u; i < canvas_size; ++i) {
             st = lcg_next(st);
-            S->u_cat[i] = lcg_f32(st);
+            float u = lcg_f32(st);
+            dgq_assert_fast(u >= 0.f && u < 1.f, dbg, DbgErrNonFinite, DbgKernelSampleCommit, i);
+            S->u_cat[i] = u;
         }
         S->rng_state = st;
         for (uint i = 1u; i < canvas_size; ++i) {
@@ -61,6 +65,7 @@ kernel void sample_commit(
             mean += ent[i];
         }
         S->mean_entropy = mean / float(canvas_size);
+        dgq_assert_entropy_nonneg(dbg, DbgKernelSampleCommit, S->mean_entropy, canvas_size);
         uint changed = atomic_load_explicit((device atomic_uint *)&S->argmax_changed,
                                             memory_order_relaxed);
         S->argmax_stable = changed ? 0u : (S->argmax_stable + 1u);

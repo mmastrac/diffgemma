@@ -430,6 +430,8 @@ pub fn embed_token_ids_q8_gpu(
                 hidden as u32,
                 seq_len as u32,
                 EMBED_SCALE,
+                embed.out_dim as u32,
+                None,
             );
         },
     );

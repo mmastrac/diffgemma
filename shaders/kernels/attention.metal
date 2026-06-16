@@ -14,6 +14,7 @@ kernel void attention(
     device const LayerOffsets *L [[buffer(3)]],
     constant StepParams &P [[buffer(4)]],
     constant AttnDims &dims [[buffer(5)]],
+    device DebugStatus *dbg [[buffer(6)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 lid [[thread_position_in_threadgroup]],
     uint3 tpg [[threads_per_threadgroup]]
@@ -89,10 +90,15 @@ kernel void attention(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     device half *ov = out + (ulong)tok * dims.n_q_heads * hd + qh * hd;
+    if (ltid == 0u) {
+        dgq_assert_positive_f32(dbg, DbgKernelAttention, l, (tok << 16u) | qh);
+    }
     for (uint i = 0u; i < per; ++i) {
         uint idx = ltid + i * tpg_w;
         if (idx < hd) {
-            ov[idx] = half(acc[i] / l);
+            float y = acc[i] / l;
+            dgq_assert_finite_f32(dbg, DbgKernelAttention, y, idx);
+            ov[idx] = half(y);
         }
     }
 }

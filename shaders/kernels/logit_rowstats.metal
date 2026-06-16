@@ -9,6 +9,7 @@ kernel void logit_rowstats(
     device const half *logits [[buffer(0)]],
     device float *rowstat [[buffer(1)]],
     constant uint2 &dims [[buffer(2)]],
+    device DebugStatus *dbg [[buffer(3)]],
     uint row [[threadgroup_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]],
     uint tpg [[threads_per_threadgroup]]
@@ -56,6 +57,7 @@ kernel void logit_rowstats(
         for (uint i = 0u; i < nsg; ++i) {
             s += r_sum[i];
         }
+        dgq_assert_positive_f32(dbg, DbgKernelLogitRowstats, s, row);
         rowstat[row * 2u] = mx;
         rowstat[row * 2u + 1u] = s;
     }

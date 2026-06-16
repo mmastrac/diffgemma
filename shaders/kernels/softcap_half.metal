@@ -11,6 +11,7 @@ kernel void softcap_half(
     constant uint &base [[buffer(1)]],
     constant uint &len [[buffer(2)]],
     device float *dump [[buffer(3)]],
+    device DebugStatus *dbg [[buffer(4)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (K_SHAPE_ASSERT && len == 0u) return;
@@ -21,5 +22,6 @@ kernel void softcap_half(
     float x = clamp(v / SOFTCAP, -20.0f, 20.0f);
     float out = tanh(x) * SOFTCAP;
     if (K_DUMP_STAGE >= 1u) dump[gid] = out;
+    dgq_assert_finite_f32(dbg, DbgKernelSoftcapHalf, out, gid);
     logits[i] = half(out);
 }

@@ -12,6 +12,7 @@ kernel void moe_bucket_fill(
     constant RouterDims &dims [[buffer(2)]],
     device uint *layer_expert_unique [[buffer(3)]],
     constant uint &layer_idx [[buffer(4)]],
+    device DebugStatus *dbg [[buffer(5)]],
     uint i [[thread_position_in_grid]]
 ) {
     if (K_SHAPE_ASSERT && (dims.canvas == 0u || dims.top_k == 0u || dims.n_experts == 0u)) {
@@ -24,6 +25,8 @@ kernel void moe_bucket_fill(
         if (i < slots) {
             uint tok = i / dims.top_k;
             uint kk = i % dims.top_k;
+            uint e = R->expert[tok][kk];
+            dgq_assert_index(dbg, DbgKernelMoeBucketFill, e, dims.n_experts);
             atomic_fetch_add_explicit(
                 (device atomic_uint *)&R->count[R->expert[tok][kk]],
                 1u,
@@ -51,6 +54,7 @@ kernel void moe_bucket_fill(
             uint tok = i / dims.top_k;
             uint kk = i % dims.top_k;
             uint e = R->expert[tok][kk];
+            dgq_assert_index(dbg, DbgKernelMoeBucketFill, e, dims.n_experts);
             uint slot = R->row_start[e]
                 + atomic_fetch_add_explicit(
                       (device atomic_uint *)&R->count[e], 1u, memory_order_relaxed);

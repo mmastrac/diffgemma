@@ -8,6 +8,7 @@ pub(crate) mod buffer;
 mod decoder;
 mod decoder_attention;
 mod decoder_layer;
+pub(crate) mod debug_status;
 pub(crate) mod device;
 mod expert_cache;
 mod encoder_extend;

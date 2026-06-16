@@ -15,12 +15,13 @@ enum DbgErrorCode : uint {
     DbgErrQuantUnsupported = 6u,
     DbgErrArenaOob = 7u,
     DbgErrBadDim = 8u,
+    DbgErrNegativeEntropy = 9u,
 };
 
 struct DebugStatus {
     atomic_uint code;
     atomic_uint kernel_id;
-    atomic_uint threadgroup;
+    atomic_uint tg_id; // threadgroup id: tg.x | (tg.y << 16)
     atomic_uint value;
 };
 
@@ -46,7 +47,7 @@ inline void debug_set_error(device DebugStatus *st, uint code, uint kernel_id,
         &st->code, &expected, code, memory_order_relaxed, memory_order_relaxed);
     if (expected == 0u) {
         atomic_store_explicit(&st->kernel_id, kernel_id, memory_order_relaxed);
-        atomic_store_explicit(&st->threadgroup, tg, memory_order_relaxed);
+        atomic_store_explicit(&st->tg_id, tg, memory_order_relaxed);
         atomic_store_explicit(&st->value, value, memory_order_relaxed);
     }
 }
@@ -88,6 +89,33 @@ inline void dgq_assert_finite_f32(device DebugStatus *st, uint kernel_id, float 
     }
     if (!dgq_is_finite_f32(x)) {
         debug_set_error(st, DbgErrNonFinite, kernel_id, 0u, tag);
+    }
+}
+
+inline void dgq_assert_positive_f32(device DebugStatus *st, uint kernel_id, float x, uint tag) {
+    if (!dgq_debug_fast_enabled()) {
+        return;
+    }
+    if (!(x > 0.f) || !dgq_is_finite_f32(x)) {
+        debug_set_error(st, DbgErrSoftmaxNormZero, kernel_id, 0u, tag);
+    }
+}
+
+inline void dgq_assert_token_id(device DebugStatus *st, uint kernel_id, uint id, uint vocab) {
+    if (!dgq_debug_fast_enabled()) {
+        return;
+    }
+    if (id >= vocab) {
+        debug_set_error(st, DbgErrIndexOob, kernel_id, 0u, (vocab << 16u) | id);
+    }
+}
+
+inline void dgq_assert_entropy_nonneg(device DebugStatus *st, uint kernel_id, float ent, uint row) {
+    if (!dgq_debug_fast_enabled()) {
+        return;
+    }
+    if (!dgq_is_finite_f32(ent) || ent < -1e-4f) {
+        debug_set_error(st, DbgErrNegativeEntropy, kernel_id, row, as_type<uint>(ent));
     }
 }
 

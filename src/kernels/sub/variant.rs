@@ -1,5 +1,55 @@
 //! Compile-time subkernel variant tuple (STRATEGY.md §4).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static RUNTIME_ASSERT: AtomicBool = AtomicBool::new(false);
+static RUNTIME_DEBUG_DEEP: AtomicBool = AtomicBool::new(false);
+
+/// Enable GPU fast/shape asserts for step pipelines (`--assert` on generate-monolithic).
+pub fn set_runtime_assert_enabled(enabled: bool) {
+    RUNTIME_ASSERT.store(enabled, Ordering::Relaxed);
+}
+
+pub fn runtime_assert_enabled() -> bool {
+    RUNTIME_ASSERT.load(Ordering::Relaxed)
+}
+
+/// Enable expensive NaN/Inf scans (`--debug-deep`, typically with `--assert`).
+pub fn set_runtime_debug_deep_enabled(enabled: bool) {
+    RUNTIME_DEBUG_DEEP.store(enabled, Ordering::Relaxed);
+}
+
+pub fn runtime_debug_deep_enabled() -> bool {
+    RUNTIME_DEBUG_DEEP.load(Ordering::Relaxed)
+}
+
+/// Either fast asserts or deep finite scans (debug-status buffer + pipeline variant).
+pub fn runtime_kernel_debug_enabled() -> bool {
+    runtime_assert_enabled() || runtime_debug_deep_enabled()
+}
+
+/// Configure both debug flags (call before first step pipeline compile).
+pub fn set_runtime_kernel_debug(assert: bool, deep: bool) {
+    set_runtime_assert_enabled(assert);
+    set_runtime_debug_deep_enabled(deep);
+}
+
+/// Subkernel variant for monolithic step pipelines.
+pub fn runtime_step_variant() -> KernelVariant {
+    let assert = runtime_assert_enabled();
+    let deep = runtime_debug_deep_enabled();
+    if !assert && !deep {
+        return KernelVariant::PRODUCTION;
+    }
+    KernelVariant {
+        shape_assert: assert,
+        debug_fast: assert,
+        debug_deep: deep,
+        dump_stage: 0,
+        quant_format: QuantFormat::INERT,
+    }
+}
+
 /// Quantized weight format axis (FC3). One uint, no invalid bool combinations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u32)]
