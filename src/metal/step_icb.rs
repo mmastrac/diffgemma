@@ -22,6 +22,7 @@ const ICB_CONST_ALIGN: usize = 256;
 pub struct StepIcbPlan {
     pub icb: Retained<ProtocolObject<dyn MTLIndirectCommandBuffer>>,
     pub command_count: u32,
+    pub const_bytes: u32,
 }
 
 pub struct StepIcbPair {
@@ -106,7 +107,8 @@ impl IcbRecorder {
         self.const_pool.extend_from_slice(unsafe {
             std::slice::from_raw_parts(val as *const T as *const u8, size)
         });
-        self.sync_const_pool();
+        // Defer GPU upload until finish() — syncing on every bind was O(n^2) and froze the host
+        // while recording a 30L step (~thousands of small constants).
         unsafe {
             icmd.setKernelBuffer_offset_atIndex(&self.const_buf, off, index);
         }
@@ -146,20 +148,30 @@ impl IcbRecorder {
     pub fn finish(mut self) -> Result<StepIcbPlan, Error> {
         self.sync_const_pool();
         if self.cmd_open {
-            self.cmd_idx += 1;
+            // Discard a trailing set_pipeline/bind without dispatch — do not execute a no-op ICB slot.
+            self.icmd().reset();
             self.cmd_open = false;
         }
         Ok(StepIcbPlan {
             icb: self.icb,
             command_count: self.cmd_idx,
+            const_bytes: self.const_pool.len() as u32,
         })
     }
 }
 
 pub fn step_icb_enabled() -> bool {
     match std::env::var("DGQ_STEP_ICB") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        Err(_) => false,
+    }
+}
+
+/// Opt-in `with_sc` ICB replay (step ≥ 2). Default off until 30L parity is stable.
+pub fn step_icb_with_sc_enabled() -> bool {
+    match std::env::var("DGQ_STEP_ICB_SC") {
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        Err(_) => false,
     }
 }
 

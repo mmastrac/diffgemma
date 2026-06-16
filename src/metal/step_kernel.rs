@@ -2505,6 +2505,21 @@ impl StepRuntime {
             && !crate::kernels::sub::variant::runtime_kernel_debug_enabled()
     }
 
+    /// `with_sc` ICB replay is still being validated at full layer count.
+    fn icb_replay_plan<'a>(
+        &'a self,
+        first_step: u32,
+    ) -> Option<&'a crate::metal::step_icb::StepIcbPlan> {
+        let pair = self.icb.as_ref()?;
+        if first_step == 1 {
+            pair.no_sc.as_ref()
+        } else if crate::metal::step_icb::step_icb_with_sc_enabled() {
+            pair.with_sc.as_ref()
+        } else {
+            None
+        }
+    }
+
     fn current_icb_pipeline_key(&self) -> StepPipelineKey {
         step_pipeline_key(crate::kernels::sub::variant::runtime_step_variant())
     }
@@ -2518,11 +2533,15 @@ impl StepRuntime {
             }
         }
         let prev_key = self.icb.as_ref().map(|p| p.pipeline_key);
+        eprintln!(
+            "step-kernel: recording no_sc ICB plan (kv_len={kv_len}, one-time compile)..."
+        );
         let started = Instant::now();
         let no_sc = self.record_icb_plan(false)?;
         eprintln!(
-            "step-kernel: no_sc ICB ready (kv_len={kv_len}, {} cmds) in {:.2?}",
+            "step-kernel: no_sc ICB ready (kv_len={kv_len}, {} cmds, const {:.1} KiB) in {:.2?}",
             no_sc.command_count,
+            no_sc.const_bytes as f64 / 1024.0,
             started.elapsed()
         );
         let pair = self.icb.get_or_insert_with(|| crate::metal::step_icb::StepIcbPair {
@@ -2548,12 +2567,14 @@ impl StepRuntime {
                 return Ok(());
             }
         }
+        eprintln!("step-kernel: recording with_sc ICB plan (one-time compile)...");
         let started = Instant::now();
         let with_sc = self.record_icb_plan(true)?;
         eprintln!(
-            "step-kernel: with_sc ICB ready (kv_len={}, {} cmds) in {:.2?}",
+            "step-kernel: with_sc ICB ready (kv_len={}, {} cmds, const {:.1} KiB) in {:.2?}",
             self.read_params().kv_len,
             with_sc.command_count,
+            with_sc.const_bytes as f64 / 1024.0,
             started.elapsed()
         );
         let pair = self.icb.get_or_insert_with(|| crate::metal::step_icb::StepIcbPair {
@@ -2682,15 +2703,10 @@ impl StepRuntime {
         if self.icb_replay_allowed(finish) {
             if first_step == 1 {
                 self.ensure_no_sc_icb()?;
-            } else {
+            } else if crate::metal::step_icb::step_icb_with_sc_enabled() {
                 self.ensure_with_sc_icb()?;
             }
-            if let Some(icb) = &self.icb {
-                let plan = if first_step == 1 {
-                    icb.no_sc.as_ref().ok_or(Error::Format("no_sc ICB missing"))?
-                } else {
-                    icb.with_sc.as_ref().ok_or(Error::Format("with_sc ICB missing"))?
-                };
+            if let Some(plan) = self.icb_replay_plan(first_step) {
                 let cmd = self
                     .ctx
                     .queue
@@ -2951,7 +2967,9 @@ pub fn build_step_runtime(
         icb: None,
     };
     if crate::metal::step_icb::step_icb_enabled() {
-        eprintln!("step-kernel: ICB replay enabled (lazy record; kv_len from live StepParams)");
+        eprintln!(
+            "step-kernel: ICB replay enabled (no_sc; DGQ_STEP_ICB_SC=1 for with_sc)"
+        );
         rt.icb = Some(rt.record_icb_pair()?);
     }
     Ok((rt, build))
