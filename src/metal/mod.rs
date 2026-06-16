@@ -69,7 +69,7 @@ pub use sampler::sampler_step_gpu;
 pub use step_kernel::{
     bench_step_kernel, build_step_runtime,
     run_step_probe, run_step_smoke, run_embed_row_gpu, layer_moe_block_jobs, trace_entropy_enabled,
-    bench_step_kernel_profile, StepFinishMode,
+    bench_step_kernel_profile, bench_step_kernel_profile_steps, StepFinishMode,
     StepSmokeConfig, CANVAS, CanvasState, LayerOffsets, RouteScratch, StepParams,
     N_EXPERTS, TOP_K, HID, MOE_FF,
 };

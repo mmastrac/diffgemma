@@ -4167,6 +4167,33 @@ pub fn bench_step_kernel_profile(
     Ok(prof)
 }
 
+/// Profile the first `n_steps` denoise forwards (canvas `st.step` 0..n_steps-1).
+/// Step 0 has no SC preamble; step >= 1 includes self-conditioning.
+pub fn bench_step_kernel_profile_steps(
+    model_dir: &Path,
+    cfg: &StepSmokeConfig,
+    n_steps: usize,
+) -> Result<Vec<(u32, StepProfileResult)>, Error> {
+    if cfg.finish != StepFinishMode::Full {
+        return Err(Error::Format(
+            "bench_step_kernel_profile_steps requires StepFinishMode::Full",
+        ));
+    }
+    let n_steps = n_steps.max(1);
+    let (mut rt, build) = build_step_runtime(model_dir, cfg)?;
+    let finish = StepFinishMode::Full;
+    let mut out = Vec::with_capacity(n_steps);
+    for i in 0..n_steps {
+        let st: CanvasState = read_struct(&rt.bufs.state);
+        let mut prof = rt.profile_forward_once(finish)?;
+        if i == 0 {
+            prof.compile = build.compile;
+        }
+        out.push((st.step, prof));
+    }
+    Ok(out)
+}
+
 /// Read `elems` half values from a shared Metal buffer as f32.
 pub fn read_half_buffer_f32(
     buf: &ProtocolObject<dyn MTLBuffer>,

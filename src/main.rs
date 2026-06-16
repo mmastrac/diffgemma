@@ -304,6 +304,7 @@ enum Command {
         iters: usize,
         forward_only: bool,
         profile: bool,
+        profile_steps: usize,
     },
     Chat {
         seed: u64,
@@ -629,6 +630,7 @@ fn main() -> ExitCode {
             iters,
             forward_only,
             profile,
+            profile_steps,
         } => run_bench_step_kernel_cmd(
             &cli.model_dir,
             layers,
@@ -638,6 +640,7 @@ fn main() -> ExitCode {
             iters,
             forward_only,
             profile,
+            profile_steps,
         ),
         Command::GenerateMonolithic {
             prompt,
@@ -2376,6 +2379,7 @@ fn run_bench_step_kernel_cmd(
     iters: usize,
     forward_only: bool,
     profile: bool,
+    profile_steps: usize,
 ) -> ExitCode {
     use metal::bench_step_kernel;
 
@@ -2384,7 +2388,54 @@ fn run_bench_step_kernel_cmd(
         return ExitCode::FAILURE;
     }
     let cfg = step_kernel_config(layers, kv_len, seed, max_seq, forward_only);
-    if profile {
+    if profile_steps > 0 {
+        use metal::bench_step_kernel_profile_steps;
+        eprintln!(
+            "bench-step-kernel --profile-steps {profile_steps}: layers={layers} kv_len={kv_len}"
+        );
+        match bench_step_kernel_profile_steps(model_dir, &cfg, profile_steps) {
+            Ok(rows) => {
+                println!("bench-step-kernel profile-steps ok ({} forwards)", rows.len());
+                for (canvas_step, p) in rows {
+                    let sc = if canvas_step == 0 { "no SC" } else { "SC" };
+                    let per_l = |d: std::time::Duration| d / p.layers.max(1) as u32;
+                    let pct = |d: std::time::Duration| 100.0 * d.as_secs_f64() / p.total.as_secs_f64();
+                    println!("--- canvas st.step={canvas_step} ({sc}) ---");
+                    if canvas_step == 0 {
+                        println!("  compile:       {:.2?}", p.compile);
+                        println!("  block_format:  {:?}", p.block_format);
+                        println!("  layers:        {}", p.layers);
+                    }
+                    println!("  preamble:      {:.2?}  ({:.1}%)", p.preamble, pct(p.preamble));
+                    println!(
+                        "  pre_moe:       {:.2?}  ({:.1}%, {:.2?}/layer)",
+                        p.layer_pre_moe,
+                        pct(p.layer_pre_moe),
+                        per_l(p.layer_pre_moe)
+                    );
+                    println!(
+                        "  moe_grouped:   {:.2?}  ({:.1}%, {:.2?}/layer)",
+                        p.layer_moe,
+                        pct(p.layer_moe),
+                        per_l(p.layer_moe)
+                    );
+                    println!(
+                        "  moe_post:      {:.2?}  ({:.1}%, {:.2?}/layer)",
+                        p.layer_post,
+                        pct(p.layer_post),
+                        per_l(p.layer_post)
+                    );
+                    println!("  finish:        {:.2?}  ({:.1}%)", p.finish, pct(p.finish));
+                    println!("  total:         {:.2?}", p.total);
+                }
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("error: {err}");
+                ExitCode::FAILURE
+            }
+        }
+    } else if profile {
         use metal::bench_step_kernel_profile;
         eprintln!(
             "bench-step-kernel --profile: layers={layers} kv_len={kv_len} forward_only={forward_only}"
@@ -2457,6 +2508,7 @@ fn run_bench_step_kernel_cmd(
     _iters: usize,
     _forward_only: bool,
     _profile: bool,
+    _profile_steps: usize,
 ) -> ExitCode {
     eprintln!("error: bench-step-kernel requires --features metal on macOS");
     ExitCode::FAILURE
@@ -2729,6 +2781,7 @@ fn parse_cli() -> Cli {
     let mut step_max_seq = 512usize;
     let mut step_forward_only = false;
     let mut step_profile = false;
+    let mut step_profile_steps = 0usize;
     let mut step_logit_positions = String::new();
     let mut step_logit_top_k = 10usize;
     let mut step_layer_position = 129usize;
@@ -2892,6 +2945,14 @@ fn parse_cli() -> Cli {
             }
             "--forward-only" => step_forward_only = true,
             "--step-profile" => step_profile = true,
+            "--profile-steps" => {
+                if let Some(v) = args.next() {
+                    step_profile_steps = v.parse().unwrap_or_else(|_| {
+                        eprintln!("error: --profile-steps requires a positive integer");
+                        std::process::exit(1);
+                    });
+                }
+            }
             "--logit-positions" => {
                 if let Some(v) = args.next() {
                     step_logit_positions = v;
@@ -3418,6 +3479,7 @@ fn parse_cli() -> Cli {
             iters: bench_iters.max(1),
             forward_only: step_forward_only,
             profile: step_profile,
+            profile_steps: step_profile_steps,
         },
         Some(cmd) => {
             eprintln!("unknown command: {cmd}");
