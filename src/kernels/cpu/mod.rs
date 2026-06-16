@@ -235,8 +235,9 @@ pub fn compute_rope_freqs(freqs: &mut [f32], positions: &[i64], kind: RopeKind) 
     }
 }
 
-/// Apply RoPE in-place to `vec` (length `head_dim`) using interleaved cos/sin freqs
-/// for the first `rotary_dim` elements; remaining dims are unchanged (partial RoPE).
+/// Apply RoPE in-place to `vec` (length `head_dim`) using interleaved cos/sin freqs.
+/// When `rotary_dim < head_dim` (proportional partial RoPE), pairs `vec[d]` with
+/// `vec[head_dim/2 + d]` for `d < rotary_dim/2`; dims outside those pairs are unchanged.
 pub fn apply_rope(vec: &mut [f32], freqs: &[f32], rotary_dim: usize) {
     assert!(rotary_dim <= vec.len());
     assert_eq!(freqs.len(), rotary_dim);
@@ -366,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_rope_leaves_tail_dims() {
+    fn proportional_partial_rope_leaves_non_rotated_dims() {
         let mut freqs = [0.0f32; 4];
         compute_rope_freqs(
             &mut freqs,
@@ -378,8 +379,11 @@ mod tests {
         );
         let mut vec = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
         apply_rope(&mut vec, &freqs, 4);
-        assert!((vec[4] - 5.0).abs() < 1e-6);
+        // rotary_dim=4 on head_dim=6: pairs (0,3) and (1,4); dims 2 and 5 untouched.
+        assert!((vec[2] - 3.0).abs() < 1e-6);
         assert!((vec[5] - 6.0).abs() < 1e-6);
+        assert!((vec[0] - 1.0).abs() > 1e-6 || (vec[3] - 4.0).abs() > 1e-6);
+        assert!((vec[1] - 2.0).abs() > 1e-6 || (vec[4] - 5.0).abs() > 1e-6);
     }
 
     #[test]
