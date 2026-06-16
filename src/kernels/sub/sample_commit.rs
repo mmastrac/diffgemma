@@ -55,6 +55,8 @@ pub fn tiny_fixture(_: ElemFormat) -> Fixture {
             conf_threshold: f32::MAX,
             stability_threshold: 99,
             min_early_stop_steps: 12,
+            accept_plateau_threshold: 2,
+            plateau_prefix_mean_max: 0.05,
         },
         pad_token: PAD_TOKEN_ID,
         filler_token: FILLER_TOKEN_ID,
@@ -84,6 +86,7 @@ fn pack_out(state: &CanvasState, canvas: usize) -> Vec<f32> {
 }
 
 pub fn cpu(f: &Fixture) -> Vec<f32> {
+    let state = blank_state(f);
     let out = sample_commit_cpu(
         f.step,
         f.argmax_stable,
@@ -95,14 +98,19 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
             conf_threshold: f.params.conf_threshold,
             stability_threshold: f.params.stability_threshold,
             min_early_stop_steps: f.params.min_early_stop_steps,
+            accept_plateau_threshold: f.params.accept_plateau_threshold,
+            plateau_prefix_mean_max: f.params.plateau_prefix_mean_max,
             canvas_size: f.canvas_size,
             pad_token: f.pad_token,
             filler_token: f.filler_token,
+            ids: &state.ids[..f.canvas_size],
             entropy: &f.entropy,
             prev_argmax: &f.prev_argmax,
+            accept_plateau: state.accept_plateau,
+            prev_accept_sig: state.prev_accept_sig,
         },
     );
-    let mut state = blank_state(f);
+    let mut state = state;
     for i in 0..f.canvas_size {
         state.u_cat[i] = out.u_cat[i];
         state.accept[i] = out.accept[i];
@@ -113,6 +121,8 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
     state.step = out.step;
     state.stop_flag = out.stop_flag;
     state.rng_state = out.rng_state;
+    state.accept_plateau = out.accept_plateau;
+    state.prev_accept_sig = out.prev_accept_sig;
     pack_out(&state, f.canvas_size)
 }
 
@@ -123,12 +133,14 @@ pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
 fn blank_state(f: &Fixture) -> CanvasState {
     let mut entropy = [0.0f32; CANVAS];
     let mut prev = [0u32; CANVAS];
+    let mut ids = [0u32; CANVAS];
     for i in 0..f.canvas_size {
         entropy[i] = f.entropy[i];
         prev[i] = f.prev_argmax[i];
+        ids[i] = 100 + i as u32;
     }
     CanvasState {
-        ids: [0; CANVAS],
+        ids,
         prev_argmax: prev,
         new_sample: [0; CANVAS],
         entropy,
@@ -141,7 +153,8 @@ fn blank_state(f: &Fixture) -> CanvasState {
         argmax_stable: f.argmax_stable,
         argmax_changed: f.argmax_changed,
         mean_entropy: 0.0,
-        _pad2: 0,
+        accept_plateau: 0,
+        prev_accept_sig: 0,
     }
 }
 

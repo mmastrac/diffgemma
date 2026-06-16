@@ -96,7 +96,8 @@ fn canvas_state_for_gpu(f: &Fixture) -> CanvasState {
         argmax_stable: 0,
         argmax_changed: 0,
         mean_entropy: 0.0,
-        _pad2: 0,
+        accept_plateau: 0,
+        prev_accept_sig: 0,
     }
 }
 

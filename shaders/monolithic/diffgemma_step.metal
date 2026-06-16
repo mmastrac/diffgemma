@@ -76,6 +76,8 @@ struct StepParams {
     float entropy_bound; float t_min; float t_max; float conf_threshold;
     uint stability_threshold;
     uint min_early_stop_steps;
+    uint accept_plateau_threshold;
+    float plateau_prefix_mean_max;
 };
 struct CanvasState {
     uint ids[256]; uint prev_argmax[256]; uint new_sample[256];
@@ -85,7 +87,7 @@ struct CanvasState {
     uint stop_flag;
     uint argmax_stable;            // consecutive unchanged steps
     uint argmax_changed;           // per-step scratch flag (atomic)
-    float mean_entropy; uint _pad2;
+    float mean_entropy; uint accept_plateau; uint prev_accept_sig;
 };
 struct RouteScratch {
     half weight[256][8]; uint expert[256][8];

@@ -60,12 +60,31 @@ kernel void sample_commit(
                 }
             }
         }
+        uint sig = 0u;
+        for (uint i = 0u; i < canvas_size; ++i) {
+            sig = sig * 31u + S->accept[i];
+        }
+        if (sig == S->prev_accept_sig) {
+            S->accept_plateau += 1u;
+        } else {
+            S->accept_plateau = 0u;
+        }
+        S->prev_accept_sig = sig;
+
         float mean = 0.f;
+        float active_mean = 0.f;
+        uint active_n = 0u;
         for (uint i = 0u; i < canvas_size; ++i) {
             mean += ent[i];
+            uint id = S->ids[i];
+            if (id != pad_token && id != filler_token) {
+                active_mean += ent[i];
+                active_n += 1u;
+            }
         }
         S->mean_entropy = mean / float(canvas_size);
         dgq_assert_entropy_nonneg(dbg, DbgKernelSampleCommit, S->mean_entropy, canvas_size);
+        float prefix_mean = active_n > 0u ? active_mean / float(active_n) : 1e9f;
         uint changed = atomic_load_explicit((device atomic_uint *)&S->argmax_changed,
                                             memory_order_relaxed);
         S->argmax_stable = changed ? 0u : (S->argmax_stable + 1u);
@@ -81,15 +100,20 @@ kernel void sample_commit(
                 real_count++;
             }
         }
-        bool confident_stable = S->mean_entropy < P.conf_threshold
+        bool plateau_stop = S->accept_plateau >= P.accept_plateau_threshold
+            && prefix_mean < P.plateau_prefix_mean_max;
+        bool confident_stable = prefix_mean < P.conf_threshold
             && S->argmax_stable >= P.stability_threshold;
         bool allowed = !degenerate
             && (S->step >= P.min_early_stop_steps || real_count >= 8u);
-        if (confident_stable && allowed) {
+        S->stop_flag = 0u;
+        if (allowed && confident_stable) {
             S->stop_flag = 1u;
+        } else if (allowed && plateau_stop) {
+            S->stop_flag = 2u;
         }
         if (S->step >= P.max_steps) {
-            S->stop_flag = 1u;
+            S->stop_flag = 3u;
         }
     }
 }

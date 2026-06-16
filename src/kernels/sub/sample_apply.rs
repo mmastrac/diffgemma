@@ -60,6 +60,8 @@ pub fn tiny_fixture(_: ElemFormat) -> Fixture {
         conf_threshold: 0.5,
         stability_threshold: 2,
         min_early_stop_steps: 12,
+        accept_plateau_threshold: 2,
+        plateau_prefix_mean_max: 0.05,
     };
     let t = temp_at(step.saturating_sub(1), params.max_steps, params.t_min, params.t_max);
     let mut rowstat = vec![0.0f32; rows * 2];
@@ -111,6 +113,8 @@ pub fn wide_fixture(_: ElemFormat) -> Fixture {
             conf_threshold: 0.4,
             stability_threshold: 3,
             min_early_stop_steps: 12,
+            accept_plateau_threshold: 2,
+            plateau_prefix_mean_max: 0.05,
         },
     }
 }
@@ -152,7 +156,8 @@ fn canvas_state_for_gpu(f: &Fixture) -> CanvasState {
         argmax_stable: 0,
         argmax_changed: 0,
         mean_entropy: 0.0,
-        _pad2: 0,
+        accept_plateau: 0,
+        prev_accept_sig: 0,
     }
 }
 

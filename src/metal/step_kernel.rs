@@ -127,6 +127,8 @@ pub struct StepParams {
     pub conf_threshold: f32,
     pub stability_threshold: u32,
     pub min_early_stop_steps: u32,
+    pub accept_plateau_threshold: u32,
+    pub plateau_prefix_mean_max: f32,
 }
 
 #[repr(C)]
@@ -145,7 +147,8 @@ pub struct CanvasState {
     pub argmax_stable: u32,
     pub argmax_changed: u32,
     pub mean_entropy: f32,
-    pub _pad2: u32,
+    pub accept_plateau: u32,
+    pub prev_accept_sig: u32,
 }
 
 #[repr(C)]
@@ -2080,7 +2083,9 @@ impl StepEnc<'_> {
         self.bind_state(2);
         self.bind_params(3);
         self.sink_set_bytes(&cols, 4);
-        self.bind_debug_status(5);
+        self.sink_set_bytes(&pad, 5);
+        self.sink_set_bytes(&filler, 6);
+        self.bind_debug_status(7);
         let grid = MTLSize {
             width: CANVAS,
             height: 1,
@@ -2174,7 +2179,8 @@ pub fn init_canvas_state_from_rng(vocab: usize, rng: &mut Rng) -> CanvasState {
         argmax_stable: 0,
         argmax_changed: 0,
         mean_entropy: 0.0,
-        _pad2: 0,
+        accept_plateau: 0,
+        prev_accept_sig: 0,
     }
 }
 
@@ -2188,6 +2194,16 @@ pub fn step_params_from_sampler(
     } else {
         sampler.confidence_threshold
     };
+    let plateau_thresh = if no_early_stop {
+        u32::MAX
+    } else {
+        sampler.accept_plateau_threshold as u32
+    };
+    let plateau_mean = if no_early_stop {
+        f32::MAX
+    } else {
+        sampler.plateau_prefix_mean_max
+    };
     StepParams {
         kv_len,
         max_steps: sampler.max_denoising_steps.max(1) as u32,
@@ -2197,6 +2213,8 @@ pub fn step_params_from_sampler(
         conf_threshold,
         stability_threshold: sampler.stability_threshold as u32,
         min_early_stop_steps: crate::sample::MIN_EARLY_STOP_STEPS,
+        accept_plateau_threshold: plateau_thresh,
+        plateau_prefix_mean_max: plateau_mean,
     }
 }
 
@@ -2283,6 +2301,73 @@ pub fn trace_entropy_enabled() -> bool {
     match std::env::var("DGQ_TRACE_ENTROPY") {
         Ok(v) => v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("full"),
         Err(_) => false,
+    }
+}
+
+pub fn final_entropy_log_enabled() -> bool {
+    match std::env::var("DGQ_LOG_FINAL_ENTROPY") {
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("full"),
+        Err(_) => false,
+    }
+}
+
+/// Per-position entropy at end of a denoise block (`DGQ_LOG_FINAL_ENTROPY=1`).
+pub fn log_final_per_token_entropy(label: &str, state: &CanvasState, stop_flag: u32) {
+    use crate::sample::{
+        decode_early_stop_flag, is_active_token, mean_entropy_active, EarlyStopKind, FILLER_TOKEN_ID,
+        PAD_TOKEN_ID,
+    };
+    let prefix_mean = mean_entropy_active(&state.entropy, &state.ids);
+    let stop_kind = match decode_early_stop_flag(stop_flag) {
+        Some(EarlyStopKind::Confident) => "confident_stable",
+        Some(EarlyStopKind::Plateau) => "plateau_stop",
+        Some(EarlyStopKind::MaxSteps) => "max_steps",
+        None => "none",
+    };
+    eprintln!(
+        "step-generate: {label} denoise_steps={} stop_flag={stop_flag} ({stop_kind}) prefix_mean={prefix_mean:.4} plateau={} stable={}",
+        state.step, state.accept_plateau, state.argmax_stable,
+    );
+    for pos in 0..CANVAS {
+        let id = state.ids[pos];
+        let am = state.prev_argmax[pos];
+        let ent = state.entropy[pos];
+        let acc = state.accept[pos];
+        let tag = if id == PAD_TOKEN_ID {
+            "pad"
+        } else if id == FILLER_TOKEN_ID {
+            "filler"
+        } else {
+            "active"
+        };
+        eprintln!(
+            "  pos={pos:3} {tag:6} id={id:6} argmax={am:6} ent={ent:8.4} accept={acc}",
+        );
+    }
+    let mut high_ent_active = Vec::new();
+    for pos in 0..CANVAS {
+        if is_active_token(state.ids[pos]) && state.entropy[pos] > 0.1 {
+            high_ent_active.push((pos, state.entropy[pos], state.ids[pos], state.prev_argmax[pos]));
+        }
+    }
+    high_ent_active.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    if !high_ent_active.is_empty() {
+        eprintln!("step-generate: {label} high_ent active (>0.1 nats, top 16):");
+        for &(pos, ent, id, am) in high_ent_active.iter().take(16) {
+            eprintln!("  pos={pos:3} ent={ent:7.4} id={id:6} argmax={am:6}");
+        }
+    }
+    if let Some(start) = state.ids.iter().position(|&id| id == PAD_TOKEN_ID) {
+        let tail = &state.entropy[start..];
+        let tail_mean = if tail.is_empty() {
+            f32::NAN
+        } else {
+            tail.iter().sum::<f32>() / tail.len() as f32
+        };
+        eprintln!(
+            "step-generate: {label} pad_tail: first_pad_pos={start} len={} tail_mean_ent={tail_mean:.4}",
+            tail.len(),
+        );
     }
 }
 
@@ -2481,6 +2566,8 @@ impl StepRuntime {
         state.argmax_stable = 0;
         state.argmax_changed = 0;
         state.mean_entropy = 0.0;
+        state.accept_plateau = 0;
+        state.prev_accept_sig = 0;
         self.write_canvas_state(&state);
         self.write_params(params);
     }
@@ -4309,8 +4396,7 @@ pub fn run_denoise_steps(
             low_entropy_positions: ent.low_entropy_positions,
         });
         let max_steps_reached = st.step >= params.max_steps;
-        let confident_stop = !cfg.no_early_stop
-            && stopper.should_stop_with_entropies(&st.prev_argmax, &st.entropy, st.step);
+        let confident_stop = !cfg.no_early_stop && st.stop_flag != 0;
         if confident_stop || max_steps_reached {
             break;
         }

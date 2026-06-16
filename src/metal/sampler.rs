@@ -345,12 +345,19 @@ pub fn sampler_step_gpu(
         canvas_len,
         sampler.entropy_bound,
     );
+    let canvas_for_stop: Vec<u32> = current_canvas.to_vec();
+    let accept_u32: Vec<u32> = accepted_mask.iter().map(|&m| u32::from(m)).collect();
     let renoised = renoise_canvas(&accepted, &accepted_mask, vocab, rng);
     current_canvas.copy_from_slice(&renoised);
 
     let steps_done = denoise_steps_completed(sampler.max_denoising_steps, cur_step);
-    let finished =
-        stopper.should_stop_with_entropies(&scratch.argmax, &scratch.entropies, steps_done);
+    let finished = stopper.should_stop_with_entropies(
+        &scratch.argmax,
+        &scratch.entropies,
+        &canvas_for_stop,
+        &accept_u32,
+        steps_done,
+    );
 
     Ok(GpuSamplerStepOut {
         argmax: scratch.argmax.clone(),

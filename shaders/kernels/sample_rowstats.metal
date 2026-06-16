@@ -12,7 +12,9 @@ kernel void sample_rowstats(
     device CanvasState *S [[buffer(2)]],
     constant StepParams &P [[buffer(3)]],
     constant uint &cols [[buffer(4)]],
-    device DebugStatus *dbg [[buffer(5)]],
+    constant uint &pad_token [[buffer(5)]],
+    constant uint &filler_token [[buffer(6)]],
+    device DebugStatus *dbg [[buffer(7)]],
     uint row [[threadgroup_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]],
     uint tpg [[threads_per_threadgroup]]
@@ -96,7 +98,9 @@ kernel void sample_rowstats(
         rowstat[row * 2u + 1u] = ts;
         uint prev = S->prev_argmax[row];
         S->prev_argmax[row] = r_am[0];
-        if (prev != r_am[0]) {
+        uint id = S->ids[row];
+        bool active = (id != pad_token && id != filler_token);
+        if (active && prev != r_am[0]) {
             atomic_store_explicit((device atomic_uint *)&S->argmax_changed, 1u,
                                   memory_order_relaxed);
         }

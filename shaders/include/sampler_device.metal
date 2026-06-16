@@ -13,6 +13,8 @@ struct StepParams {
     float conf_threshold;
     uint stability_threshold;
     uint min_early_stop_steps;
+    uint accept_plateau_threshold;
+    float plateau_prefix_mean_max;
 };
 
 struct CanvasState {
@@ -29,7 +31,8 @@ struct CanvasState {
     uint argmax_stable;
     uint argmax_changed;
     float mean_entropy;
-    uint _pad2;
+    uint accept_plateau;
+    uint prev_accept_sig;
 };
 
 inline ulong lcg_next(ulong s) { return s * 6966169279ul + 1039523323ul; }

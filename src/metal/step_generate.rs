@@ -3,7 +3,8 @@
 use crate::denoise_trace::{step_trace_from_stats, DenoiseTrace, SCHEMA_VERSION};
 use crate::generate::GenerateOutput;
 use crate::metal::step_kernel::{
-    build_step_runtime, denoise_parity_log_enabled, log_denoise_parity_step,
+    build_step_runtime, denoise_parity_log_enabled, final_entropy_log_enabled,
+    log_denoise_parity_step, log_final_per_token_entropy,
     step_params_from_sampler, trace_entropy_enabled, StepFinishMode, StepRuntime, StepSmokeConfig,
     CANVAS, N_LAYERS, VOCAB,
 };
@@ -73,6 +74,7 @@ fn progress_enabled() -> bool {
 enum DenoiseStopReason {
     None,
     Confident,
+    Plateau,
     MaxSteps,
 }
 
@@ -84,6 +86,7 @@ fn log_denoise_step_progress(
     stats: &crate::sample::StepEntropyStats,
     mean_entropy_gpu: f32,
     argmax_stable: u32,
+    accept_plateau: u32,
     step_elapsed: Duration,
     block_elapsed: Duration,
     denoise_elapsed: Duration,
@@ -95,10 +98,11 @@ fn log_denoise_step_progress(
     let stop_note = match stop {
         DenoiseStopReason::None => "",
         DenoiseStopReason::Confident => " confident_stop",
+        DenoiseStopReason::Plateau => " plateau_stop",
         DenoiseStopReason::MaxSteps => " max_steps",
     };
     eprintln!(
-        "step-generate: block {block_idx}/{max_blocks} step {step_idx}/{max_steps} accept={} low_ent={} min_ent={:.4} mean_ent={mean_entropy_gpu:.4} stable={argmax_stable} step={step_elapsed:.2?} block={block_elapsed:.2?} denoise={denoise_elapsed:.2?}{stop_note}",
+        "step-generate: block {block_idx}/{max_blocks} step {step_idx}/{max_steps} accept={} low_ent={} min_ent={:.4} mean_ent={mean_entropy_gpu:.4} stable={argmax_stable} plateau={accept_plateau} step={step_elapsed:.2?} block={block_elapsed:.2?} denoise={denoise_elapsed:.2?}{stop_note}",
         stats.accept_count,
         stats.low_entropy_positions,
         stats.min_entropy,
@@ -248,12 +252,22 @@ pub fn generate_with_session(
         let mut mean_entropy_hist = Vec::new();
         let mut low_ent_hist = Vec::new();
         let mut last_st;
-        let mut stopper = StableConfidentStopper::new(
+        let mut stopper = StableConfidentStopper::with_plateau(
             cfg.sampler.stability_threshold,
             if cfg.no_early_stop {
                 f32::MAX
             } else {
                 cfg.sampler.confidence_threshold
+            },
+            if cfg.no_early_stop {
+                usize::MAX
+            } else {
+                cfg.sampler.accept_plateau_threshold
+            },
+            if cfg.no_early_stop {
+                f32::MAX
+            } else {
+                cfg.sampler.plateau_prefix_mean_max
             },
         );
         stopper.reset();
@@ -297,32 +311,55 @@ pub fn generate_with_session(
             mean_entropy_hist.push(st.mean_entropy);
             low_ent_hist.push(stats.low_entropy_positions);
             let max_steps_reached = st.step >= max_steps as u32;
-            let confident_stop = !cfg.no_early_stop
+            let early_stop = crate::sample::decode_early_stop_flag(st.stop_flag);
+            let _early_stop = !cfg.no_early_stop && early_stop.is_some();
+            let cpu_confident = !cfg.no_early_stop
                 && stopper.should_stop_with_entropies(
                     &st.prev_argmax,
                     &st.entropy,
+                    &st.ids,
+                    &st.accept,
                     st.step,
                 );
-            let stop_reason = if confident_stop {
-                DenoiseStopReason::Confident
-            } else if max_steps_reached {
-                DenoiseStopReason::MaxSteps
-            } else {
-                DenoiseStopReason::None
+            let stop_reason = match early_stop {
+                Some(crate::sample::EarlyStopKind::Confident) => DenoiseStopReason::Confident,
+                Some(crate::sample::EarlyStopKind::Plateau) => DenoiseStopReason::Plateau,
+                Some(crate::sample::EarlyStopKind::MaxSteps) => DenoiseStopReason::MaxSteps,
+                None if max_steps_reached => DenoiseStopReason::MaxSteps,
+                None => DenoiseStopReason::None,
             };
             if std::env::var("DGQ_LOG_EARLY_STOP")
                 .ok()
                 .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                && (st.stop_flag != 0) != confident_stop
             {
-                eprintln!(
-                    "step-generate: early-stop mismatch step={} gpu_flag={} cpu_confident={confident_stop} mean_ent={:.4} stable={} threshold={:.4}",
-                    st.step,
-                    st.stop_flag,
-                    st.mean_entropy,
-                    st.argmax_stable,
-                    cfg.sampler.confidence_threshold,
-                );
+                if (st.stop_flag != 0) != cpu_confident {
+                    eprintln!(
+                        "step-generate: early-stop mismatch step={} gpu_flag={} cpu_confident={cpu_confident} accept_plateau={} mean_ent={:.4} stable={} threshold={:.4}",
+                        st.step,
+                        st.stop_flag,
+                        st.accept_plateau,
+                        st.mean_entropy,
+                        st.argmax_stable,
+                        cfg.sampler.confidence_threshold,
+                    );
+                } else if early_stop.is_some() {
+                    let kind = match early_stop {
+                        Some(crate::sample::EarlyStopKind::Confident) => "confident_stable",
+                        Some(crate::sample::EarlyStopKind::Plateau) => "plateau_stop",
+                        Some(crate::sample::EarlyStopKind::MaxSteps) => "max_steps",
+                        None => "none",
+                    };
+                    let prefix_mean =
+                        crate::sample::mean_entropy_active(&st.entropy, &st.ids);
+                    eprintln!(
+                        "step-generate: early-stop step={} reason={kind} stop_flag={} accept_plateau={} prefix_mean={prefix_mean:.4} stable={} accept={}",
+                        st.step,
+                        st.stop_flag,
+                        st.accept_plateau,
+                        st.argmax_stable,
+                        stats.accept_count,
+                    );
+                }
             }
             step_traces.push(step_trace_from_stats(
                 block_idx as u32,
@@ -345,6 +382,7 @@ pub fn generate_with_session(
                 &stats,
                 st.mean_entropy,
                 st.argmax_stable,
+                st.accept_plateau,
                 step_elapsed,
                 block_started.elapsed(),
                 denoise_elapsed + block_started.elapsed(),
@@ -391,10 +429,18 @@ pub fn generate_with_session(
             .and_then(|s| s.iter().copied().reduce(f32::min))
             .unwrap_or(f32::NAN);
         eprintln!(
-            "step-generate: block {} late-window (last 8 steps): accept_sum={late_accept} min_ent={late_min_ent:.4} mean_ent={late_mean_ent:.4} max_low_ent={late_low_ent} (early stop needs mean_ent<{:.4} + stable argmax)",
+            "step-generate: block {} late-window (last 8 steps): accept_sum={late_accept} min_ent={late_min_ent:.4} mean_ent={late_mean_ent:.4} max_low_ent={late_low_ent} (early stop: accept plateau>={} or prefix mean_ent<{:.4} + stable argmax)",
             block_idx,
+            crate::sample::ACCEPT_PLATEAU_THRESHOLD,
             cfg.sampler.confidence_threshold,
         );
+        if final_entropy_log_enabled() {
+            log_final_per_token_entropy(
+                &format!("block {block_idx} final"),
+                &st,
+                st.stop_flag,
+            );
+        }
 
         let argmax_tokens: Vec<u32> = st.prev_argmax.to_vec();
         sequences.extend_from_slice(&argmax_tokens);

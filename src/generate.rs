@@ -279,9 +279,11 @@ fn generate_inner(
         let mut finished = false;
         let mut have_sc_logits = false;
 
-        let mut stopper = StableConfidentStopper::new(
+        let mut stopper = StableConfidentStopper::with_plateau(
             gen_cfg.sampler.stability_threshold,
             gen_cfg.sampler.confidence_threshold,
+            gen_cfg.sampler.accept_plateau_threshold,
+            gen_cfg.sampler.plateau_prefix_mean_max,
         );
         stopper.reset();
 
@@ -404,14 +406,18 @@ fn generate_inner(
                     vocab,
                     gen_cfg.sampler.entropy_bound,
                 );
+                let canvas_for_stop = current_canvas.clone();
+                let accept_u32: Vec<u32> = accepted_mask.iter().map(|&m| u32::from(m)).collect();
                 current_canvas = renoise_canvas(&accepted, &accepted_mask, vocab, &mut rng);
                 let steps_done =
                     denoise_steps_completed(gen_cfg.sampler.max_denoising_steps, cur_step);
-                let step_finished = stopper.should_stop(
+                let entropies =
+                    crate::sample::token_entropy(&processed_logits, canvas_len, vocab);
+                let step_finished = stopper.should_stop_with_entropies(
                     &new_argmax,
-                    &processed_logits,
-                    canvas_len,
-                    vocab,
+                    &entropies,
+                    &canvas_for_stop,
+                    &accept_u32,
                     steps_done,
                 );
                 sc_logits.copy_from_slice(&processed_logits);
@@ -453,14 +459,18 @@ fn generate_inner(
                     vocab,
                     gen_cfg.sampler.entropy_bound,
                 );
+                let canvas_for_stop = current_canvas.clone();
+                let accept_u32: Vec<u32> = accepted_mask.iter().map(|&m| u32::from(m)).collect();
                 current_canvas = renoise_canvas(&accepted, &accepted_mask, vocab, &mut rng);
                 let steps_done =
                     denoise_steps_completed(gen_cfg.sampler.max_denoising_steps, cur_step);
-                let step_finished = stopper.should_stop(
+                let entropies =
+                    crate::sample::token_entropy(&processed_logits, canvas_len, vocab);
+                let step_finished = stopper.should_stop_with_entropies(
                     &new_argmax,
-                    &processed_logits,
-                    canvas_len,
-                    vocab,
+                    &entropies,
+                    &canvas_for_stop,
+                    &accept_u32,
                     steps_done,
                 );
                 sc_logits.copy_from_slice(&processed_logits);

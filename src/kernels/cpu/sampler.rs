@@ -1,6 +1,7 @@
 //! CPU reference for monolithic sampler kernels (tempered rowstats, commit, apply, write).
 
-use crate::sample::{accept_mask_from_entropies, early_stop_allowed};
+use crate::sample::{accept_mask_from_entropies, accept_mask_sig, early_stop_allowed, mean_entropy_active};
+use crate::sample::{STOP_FLAG_CONFIDENT, STOP_FLAG_MAX_STEPS, STOP_FLAG_PLATEAU};
 
 /// Temperature after `steps_done` denoise iterations (matches `temp_at` in Metal).
 pub fn temp_at(steps_done: u32, max_steps: u32, t_min: f32, t_max: f32) -> f32 {
@@ -72,11 +73,16 @@ pub struct CommitParams<'a> {
     pub conf_threshold: f32,
     pub stability_threshold: u32,
     pub min_early_stop_steps: u32,
+    pub accept_plateau_threshold: u32,
+    pub plateau_prefix_mean_max: f32,
     pub canvas_size: usize,
     pub pad_token: u32,
     pub filler_token: u32,
+    pub ids: &'a [u32],
     pub entropy: &'a [f32],
     pub prev_argmax: &'a [u32],
+    pub accept_plateau: u32,
+    pub prev_accept_sig: u32,
 }
 
 pub struct CommitOut {
@@ -88,6 +94,8 @@ pub struct CommitOut {
     pub step: u32,
     pub stop_flag: u32,
     pub rng_state: u64,
+    pub accept_plateau: u32,
+    pub prev_accept_sig: u32,
 }
 
 /// Matches `sample_commit`.
@@ -134,6 +142,14 @@ pub fn sample_commit_cpu(
     } else {
         0.0
     };
+    let prefix_mean = mean_entropy_active(p.entropy, p.ids);
+
+    let sig = accept_mask_sig(&accept);
+    let accept_plateau = if sig == p.prev_accept_sig {
+        p.accept_plateau.saturating_add(1)
+    } else {
+        0
+    };
 
     let new_stable = if argmax_changed != 0 {
         0
@@ -147,15 +163,19 @@ pub fn sample_commit_cpu(
         .iter()
         .take(canvas)
         .all(|&t| t == p.pad_token || t == p.filler_token);
+    let plateau_stop = accept_plateau >= p.accept_plateau_threshold
+        && prefix_mean < p.plateau_prefix_mean_max;
     let confident_stable =
-        mean_entropy < p.conf_threshold && new_stable >= p.stability_threshold;
+        prefix_mean < p.conf_threshold && new_stable >= p.stability_threshold;
     let allowed = early_stop_allowed(new_step, &argmax[..canvas]);
     let mut stop_flag = 0u32;
-    if confident_stable && allowed && !degenerate {
-        stop_flag = 1;
+    if allowed && !degenerate && confident_stable {
+        stop_flag = STOP_FLAG_CONFIDENT;
+    } else if allowed && !degenerate && plateau_stop {
+        stop_flag = STOP_FLAG_PLATEAU;
     }
     if new_step >= p.max_steps {
-        stop_flag = 1;
+        stop_flag = STOP_FLAG_MAX_STEPS;
     }
 
     CommitOut {
@@ -167,6 +187,8 @@ pub fn sample_commit_cpu(
         step: new_step,
         stop_flag,
         rng_state: st,
+        accept_plateau,
+        prev_accept_sig: sig,
     }
 }
 
@@ -216,6 +238,7 @@ mod tests {
     fn commit_respects_pad_filler() {
         let entropy = vec![0.1, 0.2, 0.3, 0.4];
         let prev = vec![PAD_TOKEN_ID, FILLER_TOKEN_ID, 42, 43];
+        let ids = vec![42, 43, 44, 45];
         let out = sample_commit_cpu(
             0,
             0,
@@ -227,11 +250,16 @@ mod tests {
                 conf_threshold: f32::MAX,
                 stability_threshold: 99,
                 min_early_stop_steps: 12,
+                accept_plateau_threshold: 2,
+                plateau_prefix_mean_max: 0.05,
                 canvas_size: 4,
                 pad_token: PAD_TOKEN_ID,
                 filler_token: FILLER_TOKEN_ID,
+                ids: &ids,
                 entropy: &entropy,
                 prev_argmax: &prev,
+                accept_plateau: 0,
+                prev_accept_sig: 0,
             },
         );
         assert_eq!(out.accept.iter().filter(|&&a| a != 0).count(), 2);
