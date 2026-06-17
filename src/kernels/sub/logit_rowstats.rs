@@ -1,6 +1,6 @@
 //! Per-row max + sumexp over half logits (SC row stats at t=1).
 
-use super::f16;
+use super::bf16;
 use super::gpu_common;
 use super::test_util::ElemFormat;
 use super::variant::KernelVariant;
@@ -47,8 +47,10 @@ pub fn wide_fixture(_: ElemFormat) -> Fixture {
 
 pub fn cpu(f: &Fixture) -> Vec<f32> {
     let mut out = vec![0.0f32; f.out_len()];
+    // GPU reads bf16-rounded logits; mirror that here for parity.
+    let logits = bf16::bf16_slice_to_f32(&bf16::f32_slice_to_bf16_bits(&f.logits));
     for row in 0..f.rows {
-        let lr = &f.logits[row * f.cols..(row + 1) * f.cols];
+        let lr = &logits[row * f.cols..(row + 1) * f.cols];
         let mx = lr.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let sum: f32 = lr.iter().map(|&x| (x - mx).exp()).sum();
         out[row * 2] = mx;
@@ -119,7 +121,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let buf_out = pool
         .allocate(&ctx.device, f.out_len() * 4)
         .ok_or(Error::Format("alloc"))?;
-    BufferPool::write_bf16(&buf_logits, &f16::f32_slice_to_f16(&f.logits));
+    BufferPool::write_bf16(&buf_logits, &bf16::f32_slice_to_bf16_bits(&f.logits));
     let dims = [f.rows as u32, f.cols as u32];
     let (grid, tg) = dispatch_shape(f.rows);
     let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;

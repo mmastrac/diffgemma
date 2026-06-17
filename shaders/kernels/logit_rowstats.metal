@@ -3,10 +3,11 @@ using namespace metal;
 
 #include "fc_axes.metal"
 #include "debug_status.metal"
+#include "arena.metal"
 
-/// Per-row max + sumexp over half logits (post-softcap; tempered when stored for SC) -> {mx, sum}.
+/// Per-row max + sumexp over bf16 logits (post-softcap; tempered when stored for SC) -> {mx, sum}.
 kernel void logit_rowstats(
-    device const half *logits [[buffer(0)]],
+    device const ushort *logits [[buffer(0)]],
     device float *rowstat [[buffer(1)]],
     constant uint2 &dims [[buffer(2)]],
     device DebugStatus *dbg [[buffer(3)]],
@@ -25,10 +26,10 @@ kernel void logit_rowstats(
 
     threadgroup float r_mx[8];
     threadgroup float r_sum[8];
-    device const half *lr = logits + (ulong)row * cols;
+    device const ushort *lr = logits + (ulong)row * cols;
     float mx = -INFINITY;
     for (uint v = lid; v < cols; v += tpg) {
-        mx = max(mx, float(lr[v]));
+        mx = max(mx, arena_load(lr, v));
     }
     mx = simd_max(mx);
     uint sg = lid / 32u, nsg = (tpg + 31u) / 32u;
@@ -45,7 +46,7 @@ kernel void logit_rowstats(
     mx = r_mx[0];
     float sum = 0.f;
     for (uint v = lid; v < cols; v += tpg) {
-        sum += exp(float(lr[v]) - mx);
+        sum += exp(arena_load(lr, v) - mx);
     }
     sum = simd_sum(sum);
     if ((lid & 31u) == 0u) {

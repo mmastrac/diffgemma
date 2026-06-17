@@ -4,10 +4,11 @@ using namespace metal;
 #include "fc_axes.metal"
 #include "debug_status.metal"
 #include "sampler_device.metal"
+#include "arena.metal"
 
 /// Tempered row stats -> rowstat {mx, sum}; per-row entropy (nats); argmax.
 kernel void sample_rowstats(
-    device const half *logits [[buffer(0)]],
+    device const ushort *logits [[buffer(0)]],
     device float *rowstat [[buffer(1)]],
     device CanvasState *S [[buffer(2)]],
     constant StepParams &P [[buffer(3)]],
@@ -38,7 +39,7 @@ kernel void sample_rowstats(
 
     float t = temp_at(S->step, P);
 
-    device const half *lr = logits + (ulong)row * cols;
+    device const ushort *lr = logits + (ulong)row * cols;
     threadgroup float r_mx[8];
     threadgroup float r_sum[8];
     threadgroup float r_ent[8];
@@ -48,7 +49,7 @@ kernel void sample_rowstats(
     uint am = 0u;
     float amv = -INFINITY;
     for (uint v = lid; v < cols; v += tpg) {
-        float x = float(lr[v]) / t;
+        float x = arena_load(lr, v) / t;
         if (x > amv) {
             amv = x;
             am = v;
@@ -84,7 +85,7 @@ kernel void sample_rowstats(
     mx = r_mx[0];
     float sum = 0.f, ent = 0.f;
     for (uint v = lid; v < cols; v += tpg) {
-        float x = float(lr[v]) / t;
+        float x = arena_load(lr, v) / t;
         float e = exp(x - mx);
         sum += e;
         ent += e * (x - mx);

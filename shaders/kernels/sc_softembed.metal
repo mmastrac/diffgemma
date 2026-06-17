@@ -10,7 +10,7 @@ using namespace metal;
 /// soft[tok,d] = sum_v softmax(logits[tok,v]) * dequant(embed[v,d]) * embed_scale
 /// first_step != 0 -> zero output (SC MLP still runs on CPU path).
 kernel void sc_softembed(
-    device const half *logits [[buffer(0)]],
+    device const ushort *logits [[buffer(0)]],
     device const float *rowstat [[buffer(1)]],
     device const uchar *blob [[buffer(2)]],
     device ushort *soft [[buffer(3)]],
@@ -43,10 +43,10 @@ kernel void sc_softembed(
     if (lid.x == 0u && d == 0u) {
         dgq_assert_positive_f32(dbg, DbgKernelScSoftembed, sum, tok);
     }
-    device const half *lr = logits + (ulong)tok * vocab;
+    device const ushort *lr = logits + (ulong)tok * vocab;
     float acc = 0.f;
     for (uint v = 0; v < vocab; ++v) {
-        float p = exp(float(lr[v]) - mx) / sum;
+        float p = exp(arena_load(lr, v) - mx) / sum;
         device const uchar *row = blob + w_off + (ulong)v * q8_row_bytes(hidden);
         acc += p * q8_at(row, d, bf16_bytes(row));
     }

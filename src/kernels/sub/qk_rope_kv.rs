@@ -1,7 +1,6 @@
 //! Q/K RMSNorm + RoPE + KV cache write (monolithic step path).
 
 use super::bf16;
-use super::f16;
 use super::gpu_common;
 use super::test_util::ElemFormat;
 use super::variant::KernelVariant;
@@ -236,7 +235,7 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
         *v = bf16::store_bf16_round_half(*v);
     }
     for v in kvcache.iter_mut() {
-        *v = f16::round_half(bf16::round_bf16_f32(*v));
+        *v = bf16::round_bf16_f32(*v);
     }
     pack_out(&q, &k, &kvcache, f)
 }
@@ -295,7 +294,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     BufferPool::write_bf16(&buf_q, &bf16::f32_slice_to_bf16_bits(&f.q));
     BufferPool::write_bf16(&buf_k, &bf16::f32_slice_to_bf16_bits(&f.k));
     BufferPool::write_bf16(&buf_v, &bf16::f32_slice_to_bf16_bits(&f.v));
-    BufferPool::write_bf16(&buf_kv, &f16::f32_slice_to_f16(&f.kvcache));
+    BufferPool::write_bf16(&buf_kv, &bf16::f32_slice_to_bf16_bits(&f.kvcache));
     BufferPool::write_bytes(&buf_blob, &blob);
     let layer = layer_offsets(f);
     let layer_bytes = unsafe {
@@ -364,10 +363,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     };
     read_half(&buf_q, &mut q);
     read_half(&buf_k, &mut k);
-    let ptr_kv = buf_kv.contents().as_ptr() as *const u16;
-    for (i, o) in kvcache.iter_mut().enumerate() {
-        *o = f16::f16_bits_to_f32(unsafe { *ptr_kv.add(i) });
-    }
+    read_half(&buf_kv, &mut kvcache);
     Ok(pack_out(&q, &k, &kvcache, f))
 }
 

@@ -11,7 +11,7 @@ using namespace metal;
 /// Canvas queries attend all KV positions 0..kv_len+canvas-1 (no causal mask).
 kernel void attention(
     device const ushort *q [[buffer(0)]],
-    device const half *kvcache [[buffer(1)]],
+    device const ushort *kvcache [[buffer(1)]],
     device ushort *out [[buffer(2)]],
     device const LayerOffsets *L [[buffer(3)]],
     constant StepParams &P [[buffer(4)]],
@@ -38,7 +38,7 @@ kernel void attention(
     const uint kvh = qh / (dims.n_q_heads / nkv);
     const uint T = P.kv_len + dims.canvas;
     device const ushort *qv = q + (ulong)tok * dims.n_q_heads * hd + qh * hd;
-    device const half *base = kvcache + L->kv_region / 2;
+    device const ushort *base = kvcache + L->kv_region / 2;
     threadgroup float red[8];
     float m = -INFINITY;
     float l = 0.f;
@@ -57,10 +57,10 @@ kernel void attention(
         acc[i] = 0.f;
     }
     for (uint t = 0u; t < T; ++t) {
-        device const half *kk = base + (ulong)t * nkv * hd * 2u + kvh * hd;
+        device const ushort *kk = base + (ulong)t * nkv * hd * 2u + kvh * hd;
         float d = 0.f;
         for (uint i = ltid; i < hd; i += tpg_w) {
-            d += arena_load(qv, i) * float(kk[i]);
+            d += arena_load(qv, i) * arena_load(kk, i);
         }
         d = simd_sum(d);
         const uint sg = ltid / 32u;
@@ -77,11 +77,11 @@ kernel void attention(
         float p = exp(d - mn);
         l = l * corr + p;
         m = mn;
-        device const half *vv = base + (ulong)t * nkv * hd * 2u + (ulong)nkv * hd + kvh * hd;
+        device const ushort *vv = base + (ulong)t * nkv * hd * 2u + (ulong)nkv * hd + kvh * hd;
         for (uint i = 0u; i < per; ++i) {
             uint idx = ltid + i * tpg_w;
             if (idx < hd) {
-                acc[i] = acc[i] * corr + p * float(vv[idx]);
+                acc[i] = acc[i] * corr + p * arena_load(vv, idx);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

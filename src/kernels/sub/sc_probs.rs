@@ -1,6 +1,6 @@
 //! Materialize softmax rows from logits + precomputed row stats (SC GEMM path).
 
-use super::f16;
+use super::bf16;
 use super::gpu_common;
 use super::test_util::ElemFormat;
 use super::variant::KernelVariant;
@@ -61,7 +61,7 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
         let sum = rowstat[row * 2 + 1];
         for v in 0..f.cols {
             let x = f.logits[row * f.cols + v];
-            out[row * f.cols + v] = f16::round_half(((x - mx).exp()) / sum);
+            out[row * f.cols + v] = bf16::round_bf16_f32(((x - mx).exp()) / sum);
         }
     }
     out
@@ -123,7 +123,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let buf_probs = pool
         .allocate(&ctx.device, f.out_len() * 2)
         .ok_or(Error::Format("alloc"))?;
-    BufferPool::write_bf16(&buf_logits, &f16::f32_slice_to_f16(&f.logits));
+    BufferPool::write_bf16(&buf_logits, &bf16::f32_slice_to_bf16_bits(&f.logits));
     BufferPool::write_f32(&buf_rowstat, &rowstat);
     let dims = [f.rows as u32, f.cols as u32];
     let (grid, tg) = dispatch_shape(f.rows);
@@ -137,7 +137,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     cmd.waitUntilCompleted();
     let ptr = buf_probs.contents().as_ptr() as *const u16;
     Ok((0..f.out_len())
-        .map(|i| f16::f16_bits_to_f32(unsafe { *ptr.add(i) }))
+        .map(|i| bf16::bf16_bits_to_f32(unsafe { *ptr.add(i) }))
         .collect())
 }
 

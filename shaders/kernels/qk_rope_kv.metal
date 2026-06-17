@@ -12,7 +12,7 @@ kernel void qk_rope_kv(
     device ushort *q [[buffer(0)]],
     device ushort *k [[buffer(1)]],
     device ushort *v [[buffer(2)]],
-    device half *kvcache [[buffer(3)]],
+    device ushort *kvcache [[buffer(3)]],
     device const uchar *blob [[buffer(4)]],
     device const LayerOffsets *L [[buffer(5)]],
     constant StepParams &P [[buffer(6)]],
@@ -65,9 +65,9 @@ kernel void qk_rope_kv(
             apply_split_half_rope_f32(head, rot, hd, theta, pos);
         }
         if (isK) {
-            device half *dst = kvcache + L->kv_region / 2 + (ulong)pos * nkv * hd * 2u + hh * hd;
+            device ushort *dst = kvcache + L->kv_region / 2 + (ulong)pos * nkv * hd * 2u + hh * hd;
             for (uint i = 0u; i < hd; ++i) {
-                dst[i] = half(f32_round_bf16(head[i]));
+                arena_store(dst, i, head[i]);
             }
             if (L->v_proj != 0ul) {
                 for (uint i = 0u; i < hd; ++i) {
@@ -80,10 +80,10 @@ kernel void qk_rope_kv(
             }
         }
     } else {
-        device half *dst = kvcache + L->kv_region / 2 + (ulong)pos * nkv * hd * 2u
+        device ushort *dst = kvcache + L->kv_region / 2 + (ulong)pos * nkv * hd * 2u
             + (ulong)nkv * hd + hh * hd;
         for (uint i = 0u; i < hd; ++i) {
-            dst[i] = half(f32_round_bf16(arena_load(src, i) * inv));
+            arena_store(dst, i, arena_load(src, i) * inv);
         }
     }
 }

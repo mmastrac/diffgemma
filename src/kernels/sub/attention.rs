@@ -1,7 +1,6 @@
 //! All-valid GQA attention over monolithic KV cache (online softmax).
 
 use super::bf16;
-use super::f16;
 use super::gpu_common;
 use super::test_util::ElemFormat;
 use super::variant::KernelVariant;
@@ -197,7 +196,7 @@ fn layer_offsets(f: &Fixture) -> LayerOffsets {
 
 pub fn cpu(f: &Fixture) -> Vec<f32> {
     let q = bf16::bf16_slice_to_f32(&bf16::f32_slice_to_bf16_bits(&f.q));
-    let kvcache = f16::f16_slice_to_f32(&f16::f32_slice_to_f16(&f.kvcache));
+    let kvcache = bf16::bf16_slice_to_f32(&bf16::f32_slice_to_bf16_bits(&f.kvcache));
     let mut out = vec![0.0f32; f.out_len()];
     attention::attention(
         &mut out,
@@ -254,7 +253,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         .ok_or(Error::Format("alloc"))?;
 
     BufferPool::write_bf16(&buf_q, &bf16::f32_slice_to_bf16_bits(&f.q));
-    BufferPool::write_bf16(&buf_kv, &f16::f32_slice_to_f16(&f.kvcache));
+    BufferPool::write_bf16(&buf_kv, &bf16::f32_slice_to_bf16_bits(&f.kvcache));
     let layer = layer_offsets(f);
     let layer_bytes = unsafe {
         std::slice::from_raw_parts(

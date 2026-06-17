@@ -1,7 +1,6 @@
 //! O(vocab*hidden) SC softembed fallback: weighted Q8 embed rows by softmax(logits).
 
 use super::bf16;
-use super::f16;
 use super::gpu_common;
 use super::test_util::ElemFormat;
 use super::variant::KernelVariant;
@@ -90,13 +89,15 @@ pub fn sc_softembed_cpu(f: &Fixture) -> Vec<f32> {
     }
     let rowstat = f.rowstat();
     let embed_q8 = f.embed_q8();
+    // GPU reads bf16-rounded logits; mirror that here for parity.
+    let logits_bf16 = bf16::bf16_slice_to_f32(&bf16::f32_slice_to_bf16_bits(&f.logits));
     for tok in 0..f.rows {
         let mx = rowstat[tok * 2];
         let sum = rowstat[tok * 2 + 1];
         for d in 0..f.hidden {
             let mut acc = 0.0f32;
             for v in 0..f.vocab {
-                let p = ((f.logits[tok * f.vocab + v] - mx).exp()) / sum;
+                let p = ((logits_bf16[tok * f.vocab + v] - mx).exp()) / sum;
                 acc += p * q8_weight_at(&embed_q8, v, d, f.hidden);
             }
             out[tok * f.hidden + d] = bf16::round_bf16_f32(acc * f.embed_scale);
@@ -192,7 +193,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let buf_out = pool
         .allocate(&ctx.device, f.out_len() * 2)
         .ok_or(Error::Format("alloc"))?;
-    BufferPool::write_bf16(&buf_logits, &f16::f32_slice_to_f16(&f.logits));
+    BufferPool::write_bf16(&buf_logits, &bf16::f32_slice_to_bf16_bits(&f.logits));
     BufferPool::write_f32(&buf_rowstat, &rowstat);
     BufferPool::write_bytes(&buf_blob, &embed_q8);
     let first_step = u32::from(f.first_step);

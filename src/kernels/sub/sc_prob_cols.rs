@@ -1,6 +1,6 @@
 //! Chunked SC softmax columns from logits + row stats (avoids full vocab prob matrix).
 
-use super::f16;
+use super::bf16;
 use super::gpu_common;
 use super::test_util::ElemFormat;
 use super::variant::KernelVariant;
@@ -77,7 +77,7 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
                 break;
             }
             let x = f.logits[row * f.vocab + v];
-            out[row * f.chunk + col] = f16::round_half(((x - mx).exp()) / sum);
+            out[row * f.chunk + col] = bf16::round_bf16_f32(((x - mx).exp()) / sum);
         }
     }
     out
@@ -166,7 +166,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let buf_o = pool
         .allocate(&ctx.device, f.out_len() * 2)
         .ok_or(Error::Format("alloc"))?;
-    BufferPool::write_bf16(&buf_l, &f16::f32_slice_to_f16(&f.logits));
+    BufferPool::write_bf16(&buf_l, &bf16::f32_slice_to_bf16_bits(&f.logits));
     BufferPool::write_f32(&buf_rs, &rowstat);
     let params = [
         f.rows as u32,
@@ -185,7 +185,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     cmd.waitUntilCompleted();
     let ptr = buf_o.contents().as_ptr() as *const u16;
     Ok((0..f.out_len())
-        .map(|i| f16::f16_bits_to_f32(unsafe { *ptr.add(i) }))
+        .map(|i| bf16::bf16_bits_to_f32(unsafe { *ptr.add(i) }))
         .collect())
 }
 

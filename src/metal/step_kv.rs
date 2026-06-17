@@ -2,20 +2,20 @@
 //!
 //! # Layout (M1.1)
 //!
-//! One unified `half` blob (b4). Per decoder layer `L` (0..29), `LayerOffsets.kv_region` is the
-//! **byte** offset of that layer's region. Shaders index halves via `kvcache + kv_region/2`.
+//! One unified bf16 blob (b4). Per decoder layer `L` (0..29), `LayerOffsets.kv_region` is the
+//! **byte** offset of that layer's region. Shaders index bf16 slots via `kvcache + kv_region/2`.
 //!
 //! ```text
 //! b4 layout (per layer L):
-//!   region_bytes = max_seq * n_kv_heads(L) * head_dim(L) * 2 * sizeof(half)
+//!   region_bytes = max_seq * n_kv_heads(L) * head_dim(L) * 2 * sizeof(bf16)
 //!   layer L+1 kv_region = layer L kv_region + region_bytes(L)
 //!
 //! Per absolute token position pos in [0, max_seq):
-//!   half_base = kv_region/2 + pos * (n_kv * head_dim * 2)
-//!   [K: n_kv * head_dim halves][V: n_kv * head_dim halves]   // K then V, head-major
+//!   slot_base = kv_region/2 + pos * (n_kv * head_dim * 2)
+//!   [K: n_kv * head_dim bf16 slots][V: n_kv * head_dim bf16 slots]   // K then V, head-major
 //!
-//! Sliding layers (not in FULL_LAYERS): n_kv=8, head_dim=256  -> 4096 halves/token
-//! Full layers (5,11,17,23,29):         n_kv=2, head_dim=512  -> 2048 halves/token
+//! Sliding layers (not in FULL_LAYERS): n_kv=8, head_dim=256  -> 4096 slots/token
+//! Full layers (5,11,17,23,29):         n_kv=2, head_dim=512  -> 2048 slots/token
 //!
 //! Read path (`k_attention`): T = P.kv_len + CANVAS; attends positions 0..T-1.
 //! Write path (`k_qk_rope_kv`): canvas tokens write at pos = P.kv_len + tok (post-RoPE K, normed V).
@@ -25,12 +25,13 @@
 //! cache stores **post-RoPE K** and **V** in the layout above. M1.2 packs CPU encoder prefill output.
 
 use crate::config::ModelConfig;
+use crate::kernels::sub::bf16::{bf16_bits_to_f32, f32_to_bf16_bits};
 use crate::metal::decoder::load_weight_cache_opt;
 use crate::metal::kv_cache::GpuKvCache;
 use crate::metal::engine::GpuDecoderEngine;
 use crate::metal::encoder_extend::{extend_prefill_gpu, prefill_gpu};
 use crate::metal::step_kernel::{
-    build_layout, build_offsets_from_store, build_step_runtime, f16_bits_to_f32,
+    build_layout, build_offsets_from_store, build_step_runtime,
     step_params_from_sampler, ModelLayout, CANVAS, N_LAYERS, StepFinishMode, StepSmokeConfig,
     VOCAB, run_step_forward,
 };
@@ -62,28 +63,7 @@ pub fn kv_cache_total_bytes(layout: &ModelLayout, max_seq: usize) -> u64 {
         .sum()
 }
 
-fn f32_to_half_bits(v: f32) -> u16 {
-    let bits = v.clamp(-65504.0, 65504.0).to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exp = ((bits >> 23) & 0xff) as i32;
-    let mant = (bits & 0x7fffff) as u32;
-    if exp == 0xff {
-        return sign | if mant == 0 { 0 } else { 0x7e00 };
-    }
-    if exp == 0 {
-        return sign;
-    }
-    let new_exp = exp - 127 + 15;
-    if new_exp >= 0x1f {
-        return sign | 0x7c00;
-    }
-    if new_exp <= 0 {
-        return sign;
-    }
-    sign | ((new_exp as u16) << 10) | ((mant >> 13) as u16)
-}
-
-/// Pack CPU post-RoPE encoder KV into monolithic b4 layout (half, K then V per token).
+/// Pack CPU post-RoPE encoder KV into monolithic b4 layout (bf16, K then V per token).
 pub fn pack_kv_cache_to_monolithic(
     dst: &mut [u8],
     layout: &ModelLayout,
@@ -103,23 +83,23 @@ pub fn pack_kv_cache_to_monolithic(
         }
         let nkv = l.n_kv_heads as usize;
         let hd = l.head_dim as usize;
-        let token_stride_half = nkv * hd * 2;
+        let token_stride = nkv * hd * 2;
         let byte_base = l.kv_region as usize;
-        if byte_base + max_seq * token_stride_half * 2 > dst.len() {
+        if byte_base + max_seq * token_stride * 2 > dst.len() {
             return Err(Error::Format("monolithic kv buffer too small"));
         }
         let per_token = nkv * hd;
         for pos in 0..kv.kv_len {
-            let half_base = byte_base / 2 + pos * token_stride_half;
+            let slot_base = byte_base / 2 + pos * token_stride;
             for hh in 0..nkv {
                 for d in 0..hd {
                     let src_i = pos * per_token + hh * hd + d;
-                    let k_half = f32_to_half_bits(kv_layer.keys[src_i]);
-                    let v_half = f32_to_half_bits(kv_layer.values[src_i]);
-                    let k_dst = (half_base + hh * hd + d) * 2;
-                    let v_dst = (half_base + nkv * hd + hh * hd + d) * 2;
-                    dst[k_dst..k_dst + 2].copy_from_slice(&k_half.to_le_bytes());
-                    dst[v_dst..v_dst + 2].copy_from_slice(&v_half.to_le_bytes());
+                    let k_bits = f32_to_bf16_bits(kv_layer.keys[src_i]);
+                    let v_bits = f32_to_bf16_bits(kv_layer.values[src_i]);
+                    let k_dst = (slot_base + hh * hd + d) * 2;
+                    let v_dst = (slot_base + nkv * hd + hh * hd + d) * 2;
+                    dst[k_dst..k_dst + 2].copy_from_slice(&k_bits.to_le_bytes());
+                    dst[v_dst..v_dst + 2].copy_from_slice(&v_bits.to_le_bytes());
                 }
             }
         }
@@ -161,17 +141,17 @@ pub fn read_monolithic_kv_prefix_to_cpu_cache(
         let per_token = nkv * hd;
         kv_layer.keys.resize(kv_len * per_token, 0.0);
         kv_layer.values.resize(kv_len * per_token, 0.0);
-        let token_stride_half = nkv * hd * 2;
-        let half_base_region = l.kv_region as usize / 2;
+        let token_stride = nkv * hd * 2;
+        let slot_base_region = l.kv_region as usize / 2;
         for pos in 0..kv_len {
-            let half_base = half_base_region + pos * token_stride_half;
+            let slot_base = slot_base_region + pos * token_stride;
             for hh in 0..nkv {
                 for d in 0..hd {
                     let src_i = pos * per_token + hh * hd + d;
-                    let k_dst = (half_base + hh * hd + d) * 2;
-                    let v_dst = (half_base + nkv * hd + hh * hd + d) * 2;
-                    kv_layer.keys[src_i] = f16_bits_to_f32(read_half_at(buf, k_dst));
-                    kv_layer.values[src_i] = f16_bits_to_f32(read_half_at(buf, v_dst));
+                    let k_dst = (slot_base + hh * hd + d) * 2;
+                    let v_dst = (slot_base + nkv * hd + hh * hd + d) * 2;
+                    kv_layer.keys[src_i] = bf16_bits_to_f32(read_half_at(buf, k_dst));
+                    kv_layer.values[src_i] = bf16_bits_to_f32(read_half_at(buf, v_dst));
                 }
             }
         }
@@ -496,16 +476,16 @@ pub fn read_layer_k_cache_f32(
     let nkv = l.n_kv_heads as usize;
     let hd = l.head_dim as usize;
     let per_token = nkv * hd;
-    let token_stride_half = nkv * hd * 2;
+    let token_stride = nkv * hd * 2;
     let byte_base = l.kv_region as usize;
     let mut keys = vec![0f32; total_kv * per_token];
     for pos in 0..total_kv {
-        let half_base = byte_base / 2 + pos * token_stride_half;
+        let slot_base = byte_base / 2 + pos * token_stride;
         for hh in 0..nkv {
             for d in 0..hd {
                 let dst_i = pos * per_token + hh * hd + d;
-                let k_byte = (half_base + hh * hd + d) * 2;
-                keys[dst_i] = f16_bits_to_f32(read_half_at(kv_buf, k_byte));
+                let k_byte = (slot_base + hh * hd + d) * 2;
+                keys[dst_i] = bf16_bits_to_f32(read_half_at(kv_buf, k_byte));
             }
         }
     }
@@ -530,19 +510,19 @@ fn hydrate_gpu_kv_from_monolithic(
         let nkv = l.n_kv_heads as usize;
         let hd = l.head_dim as usize;
         let per_token = nkv * hd;
-        let token_stride_half = nkv * hd * 2;
+        let token_stride = nkv * hd * 2;
         let byte_base = l.kv_region as usize;
         let mut keys = vec![0f32; kv_len * per_token];
         let mut values = vec![0f32; kv_len * per_token];
         for pos in 0..kv_len {
-            let half_base = byte_base / 2 + pos * token_stride_half;
+            let slot_base = byte_base / 2 + pos * token_stride;
             for hh in 0..nkv {
                 for d in 0..hd {
                     let dst_i = pos * per_token + hh * hd + d;
-                    let k_byte = (half_base + hh * hd + d) * 2;
-                    let v_byte = (half_base + nkv * hd + hh * hd + d) * 2;
-                    keys[dst_i] = f16_bits_to_f32(read_half_at(kv_buf, k_byte));
-                    values[dst_i] = f16_bits_to_f32(read_half_at(kv_buf, v_byte));
+                    let k_byte = (slot_base + hh * hd + d) * 2;
+                    let v_byte = (slot_base + nkv * hd + hh * hd + d) * 2;
+                    keys[dst_i] = bf16_bits_to_f32(read_half_at(kv_buf, k_byte));
+                    values[dst_i] = bf16_bits_to_f32(read_half_at(kv_buf, v_byte));
                 }
             }
         }
@@ -700,19 +680,19 @@ pub fn kvcache_prefix_max_abs(
     let l = &layout.layers[layer];
     let nkv = l.n_kv_heads as usize;
     let hd = l.head_dim as usize;
-    let token_stride_half = nkv * hd * 2;
+    let token_stride = nkv * hd * 2;
     let byte_base = l.kv_region as usize;
-    let half_base = byte_base / 2;
+    let slot_base = byte_base / 2;
     let mut max_abs = 0.0f32;
     for pos in 0..kv_len {
-        let start = (half_base + pos * token_stride_half) * 2;
-        let end = start + token_stride_half * 2;
+        let start = (slot_base + pos * token_stride) * 2;
+        let end = start + token_stride * 2;
         let bytes = unsafe {
             std::slice::from_raw_parts(kv_buf.contents().as_ptr().add(start) as *const u8, end - start)
         };
         for chunk in bytes.chunks_exact(2) {
             let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-            max_abs = max_abs.max(f16_bits_to_f32(bits).abs());
+            max_abs = max_abs.max(bf16_bits_to_f32(bits).abs());
         }
     }
     max_abs
@@ -883,13 +863,13 @@ pub fn monolithic_kv_prefix_max_diff(
         let l = &layout.layers[layer];
         let nkv = l.n_kv_heads as usize;
         let hd = l.head_dim as usize;
-        let token_stride_half = nkv * hd * 2;
-        let half_base = l.kv_region as usize / 2;
+        let token_stride = nkv * hd * 2;
+        let slot_base = l.kv_region as usize / 2;
         for pos in 0..kv_len {
-            for hidx in 0..token_stride_half {
-                let byte = (half_base + pos * token_stride_half + hidx) * 2;
-                let va = f16_bits_to_f32(read_half_at(a, byte));
-                let vb = f16_bits_to_f32(read_half_at(b, byte));
+            for hidx in 0..token_stride {
+                let byte = (slot_base + pos * token_stride + hidx) * 2;
+                let va = bf16_bits_to_f32(read_half_at(a, byte));
+                let vb = bf16_bits_to_f32(read_half_at(b, byte));
                 let d = (va - vb).abs();
                 if d > max_diff {
                     max_diff = d;
@@ -947,20 +927,20 @@ pub fn kvcache_plane_max_abs(
     let l = &layout.layers[layer];
     let nkv = l.n_kv_heads as usize;
     let hd = l.head_dim as usize;
-    let plane_halfs = nkv * hd;
-    let token_stride_half = plane_halfs * 2;
-    let half_base = l.kv_region as usize / 2;
-    let plane_off = if plane == 0 { 0 } else { plane_halfs };
+    let plane_slots = nkv * hd;
+    let token_stride = plane_slots * 2;
+    let slot_base = l.kv_region as usize / 2;
+    let plane_off = if plane == 0 { 0 } else { plane_slots };
     let mut max_abs = 0.0f32;
     for pos in 0..kv_len {
-        let start = (half_base + pos * token_stride_half + plane_off) * 2;
-        let end = start + plane_halfs * 2;
+        let start = (slot_base + pos * token_stride + plane_off) * 2;
+        let end = start + plane_slots * 2;
         let bytes = unsafe {
             std::slice::from_raw_parts(kv_buf.contents().as_ptr().add(start) as *const u8, end - start)
         };
         for chunk in bytes.chunks_exact(2) {
             let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-            max_abs = max_abs.max(f16_bits_to_f32(bits).abs());
+            max_abs = max_abs.max(bf16_bits_to_f32(bits).abs());
         }
     }
     max_abs
@@ -1044,18 +1024,18 @@ pub fn run_step_attn_probe(
     let kv_dim = nkv * hd;
     let q_dim = nheads * hd;
     let l = &layout.layers[layer];
-    let half_base = l.kv_region as usize / 2;
-    let token_stride_half = nkv * hd * 2;
+    let slot_base = l.kv_region as usize / 2;
+    let token_stride = nkv * hd * 2;
 
     let mut k_full = vec![0.0f32; total_kv * kv_dim];
     let mut v_full = vec![0.0f32; total_kv * kv_dim];
     for pos in 0..kv_len {
         let k_off = pos * kv_dim;
-        let byte_k = (half_base + pos * token_stride_half) * 2;
+        let byte_k = (slot_base + pos * token_stride) * 2;
         let byte_v = byte_k + nkv * hd * 2;
         for i in 0..nkv * hd {
-            k_full[k_off + i] = f16_bits_to_f32(read_half_at(&native_buf, byte_k + i * 2));
-            v_full[k_off + i] = f16_bits_to_f32(read_half_at(&native_buf, byte_v + i * 2));
+            k_full[k_off + i] = bf16_bits_to_f32(read_half_at(&native_buf, byte_k + i * 2));
+            v_full[k_off + i] = bf16_bits_to_f32(read_half_at(&native_buf, byte_v + i * 2));
         }
     }
 

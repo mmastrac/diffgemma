@@ -4,10 +4,11 @@ using namespace metal;
 #include "fc_axes.metal"
 #include "debug_status.metal"
 #include "sampler_device.metal"
+#include "arena.metal"
 
 /// Categorical inverse-CDF per row (tempered); tpg MUST divide cols evenly.
 kernel void sample_apply(
-    device const half *logits [[buffer(0)]],
+    device const ushort *logits [[buffer(0)]],
     device const float *rowstat [[buffer(1)]],
     device CanvasState *S [[buffer(2)]],
     constant StepParams &P [[buffer(3)]],
@@ -30,12 +31,12 @@ kernel void sample_apply(
     float mx = rowstat[row * 2u], Z = rowstat[row * 2u + 1u];
     dgq_assert_positive_f32(dbg, DbgKernelSampleApply, Z, row);
     float target = S->u_cat[row] * Z;
-    device const half *lr = logits + (ulong)row * cols;
+    device const ushort *lr = logits + (ulong)row * cols;
     threadgroup float chunk[256];
     uint per = cols / tpg;
     float local = 0.f;
     for (uint v = lid * per; v < (lid + 1u) * per; ++v) {
-        local += exp(float(lr[v]) / t - mx);
+        local += exp(arena_load(lr, v) / t - mx);
     }
     chunk[lid] = local;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -45,7 +46,7 @@ kernel void sample_apply(
         for (uint c = 0u; c < tpg; ++c) {
             if (cum + chunk[c] >= target) {
                 for (uint v = c * per; v < (c + 1u) * per; ++v) {
-                    cum += exp(float(lr[v]) / t - mx);
+                    cum += exp(arena_load(lr, v) / t - mx);
                     if (cum >= target) {
                         pick = v;
                         break;

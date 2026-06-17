@@ -3,12 +3,13 @@ using namespace metal;
 
 #include "fc_axes.metal"
 #include "debug_status.metal"
+#include "arena.metal"
 
 /// Softmax a vocab column slice for SC: probs[row, v0+col] from logits + rowstat.
 kernel void sc_prob_cols(
-    device const half *logits [[buffer(0)]],
+    device const ushort *logits [[buffer(0)]],
     device const float *rowstat [[buffer(1)]],
-    device half *probs [[buffer(2)]],
+    device ushort *probs [[buffer(2)]],
     constant uint4 &params [[buffer(3)]],
     device DebugStatus *dbg [[buffer(4)]],
     uint2 gid [[thread_position_in_grid]]
@@ -34,9 +35,9 @@ kernel void sc_prob_cols(
     }
     uint v = v0 + col;
     if (v >= vocab) {
-        probs[(ulong)row * chunk + col] = half(0);
+        arena_store(probs, (ulong)row * chunk + col, 0.f);
         return;
     }
-    float x = float(logits[(ulong)row * vocab + v]);
-    probs[(ulong)row * chunk + col] = half(exp(x - mx) / sum);
+    float x = arena_load(logits, (ulong)row * vocab + v);
+    arena_store(probs, (ulong)row * chunk + col, exp(x - mx) / sum);
 }

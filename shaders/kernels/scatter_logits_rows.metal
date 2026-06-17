@@ -1,10 +1,12 @@
 #include <metal_stdlib>
 using namespace metal;
 
+#include "arena.metal"
+
 /// Scatter compact `[num_active, vocab]` logits rows into full `[canvas, vocab]` buffer.
 kernel void scatter_logits_rows(
-    device const half *compact [[buffer(0)]],
-    device half *logits [[buffer(1)]],
+    device const ushort *compact [[buffer(0)]],
+    device ushort *logits [[buffer(1)]],
     device const uint *row_map [[buffer(2)]],
     constant uint2 &dims [[buffer(3)]],
     uint2 gid [[thread_position_in_grid]]
@@ -17,5 +19,6 @@ kernel void scatter_logits_rows(
         return;
     }
     uint dst_row = row_map[bi];
+    // bf16 bits copy verbatim (no rounding needed — pure bit move).
     logits[(ulong)dst_row * vocab + col] = compact[(ulong)bi * vocab + col];
 }

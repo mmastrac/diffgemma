@@ -1,6 +1,6 @@
 //! Sampler pass 3: categorical inverse-CDF per row from tempered logits.
 
-use super::f16;
+use super::bf16;
 use super::gpu_common;
 use super::test_util::ElemFormat;
 use super::variant::KernelVariant;
@@ -49,7 +49,7 @@ pub fn tiny_fixture(_: ElemFormat) -> Fixture {
     let logits: Vec<f32> = (0..rows * cols)
         .map(|i| (i as f32 * 0.05).cos() * 2.0)
         .collect();
-    let logits = f16::f16_slice_to_f32(&f16::f32_slice_to_f16(&logits));
+    let logits = bf16::bf16_slice_to_f32(&bf16::f32_slice_to_bf16_bits(&logits));
     let step = 2u32;
     let params = StepParams {
         kv_len: 0,
@@ -89,7 +89,7 @@ pub fn wide_fixture(_: ElemFormat) -> Fixture {
     let logits: Vec<f32> = (0..rows * cols)
         .map(|i| (i as f32 % 19.0) - 9.0)
         .collect();
-    let logits = f16::f16_slice_to_f32(&f16::f32_slice_to_f16(&logits));
+    let logits = bf16::bf16_slice_to_f32(&bf16::f32_slice_to_bf16_bits(&logits));
     let t = temp_at(1, 8, 0.25, 0.95);
     let mut rowstat = vec![0.0f32; rows * 2];
     for row in 0..rows {
@@ -122,7 +122,7 @@ pub fn wide_fixture(_: ElemFormat) -> Fixture {
 }
 
 pub fn cpu(f: &Fixture) -> Vec<f32> {
-    let logits = f16::f16_slice_to_f32(&f16::f32_slice_to_f16(&f.logits));
+    let logits = bf16::bf16_slice_to_f32(&bf16::f32_slice_to_bf16_bits(&f.logits));
     let t = f.temperature();
     let mut out = vec![0.0f32; f.rows];
     for row in 0..f.rows {
@@ -197,7 +197,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let buf_state = pool
         .allocate(&ctx.device, std::mem::size_of::<CanvasState>())
         .ok_or(Error::Format("alloc"))?;
-    BufferPool::write_bf16(&buf_logits, &f16::f32_slice_to_f16(&f.logits));
+    BufferPool::write_bf16(&buf_logits, &bf16::f32_slice_to_bf16_bits(&f.logits));
     BufferPool::write_f32(&buf_rowstat, &f.rowstat);
     let state = canvas_state_for_gpu(f);
     let bytes = unsafe {

@@ -3,11 +3,12 @@ using namespace metal;
 
 #include "fc_axes.metal"
 #include "debug_status.metal"
+#include "arena.metal"
 
 constant float SOFTCAP = 30.0f;
 
 kernel void softcap_half(
-    device half *logits [[buffer(0)]],
+    device ushort *logits [[buffer(0)]],
     constant uint &base [[buffer(1)]],
     constant uint &len [[buffer(2)]],
     device float *dump [[buffer(3)]],
@@ -18,10 +19,10 @@ kernel void softcap_half(
     if (gid >= len) return;
     K_ELEMENTWISE_GUARD();
     uint i = base + gid;
-    float v = float(logits[i]);
+    float v = arena_load(logits, i);
     float x = clamp(v / SOFTCAP, -20.0f, 20.0f);
     float out = tanh(x) * SOFTCAP;
     if (K_DUMP_STAGE >= 1u) dump[gid] = out;
     dgq_assert_finite_f32(dbg, DbgKernelSoftcapHalf, out, gid);
-    logits[i] = half(out);
+    arena_store(logits, i, out);
 }

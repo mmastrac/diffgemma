@@ -1,6 +1,6 @@
 //! Logit softcap: `tanh(v/30)*30` in fp16.
 
-use super::f16;
+use super::{bf16, f16};
 use super::gpu_common;
 use super::test_util::ElemFormat;
 use super::variant::KernelVariant;
@@ -38,7 +38,10 @@ pub fn tiny_fixture(_: ElemFormat) -> Fixture {
 pub fn cpu(f: &Fixture) -> Vec<f32> {
     f.logits[f.base as usize..(f.base + f.len) as usize]
         .iter()
-        .map(|&v| f16::softcap_f32(v))
+        .map(|&v| {
+            let x = (v / f16::SOFTCAP).clamp(-20.0, 20.0);
+            bf16::round_bf16_f32(x.tanh() * f16::SOFTCAP)
+        })
         .collect()
 }
 
@@ -92,13 +95,13 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         4
     };
     let buf_d = pool.allocate(&ctx.device, dump_bytes).ok_or(Error::Format("alloc"))?;
-    BufferPool::write_bf16(&buf, &f16::f32_slice_to_f16(&f.logits));
+    BufferPool::write_bf16(&buf, &bf16::f32_slice_to_bf16_bits(&f.logits));
     gpu_common::dispatch_1d(&ctx.queue, &pipeline.pipeline, f.len as usize, |enc| {
         bind_gpu_buffers(enc, &buf, &buf_d, f.base, f.len);
     })?;
     let ptr = buf.contents().as_ptr() as *const u16;
     Ok((f.base..f.base + f.len)
-        .map(|i| f16::f16_bits_to_f32(unsafe { *ptr.add(i as usize) }))
+        .map(|i| bf16::bf16_bits_to_f32(unsafe { *ptr.add(i as usize) }))
         .collect())
 }
 

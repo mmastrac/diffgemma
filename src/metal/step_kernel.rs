@@ -3008,28 +3008,6 @@ fn read_struct<T: Copy>(buf: &ProtocolObject<dyn MTLBuffer>) -> T {
     unsafe { *(buf.contents().as_ptr() as *const T) }
 }
 
-pub fn f16_bits_to_f32(bits: u16) -> f32 {
-    let sign = ((bits >> 15) & 1) as u32;
-    let exp = ((bits >> 10) & 0x1f) as u32;
-    let mant = (bits & 0x3ff) as u32;
-    if exp == 0 {
-        if mant == 0 {
-            return if sign == 1 { -0.0 } else { 0.0 };
-        }
-        let val = (mant as f32) * 2f32.powi(-24);
-        return if sign == 1 { -val } else { val };
-    }
-    if exp == 0x1f {
-        return if mant == 0 {
-            if sign == 1 { f32::NEG_INFINITY } else { f32::INFINITY }
-        } else {
-            f32::NAN
-        };
-    }
-    let val = f32::from_bits((sign << 31) | ((exp + 112) << 23) | (mant << 13));
-    val
-}
-
 pub fn trace_entropy_enabled() -> bool {
     match std::env::var("DGQ_TRACE_ENTROPY") {
         Ok(v) => v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("full"),
@@ -3135,9 +3113,10 @@ pub fn scheduled_temperature(steps_done: u32, params: &StepParams) -> f32 {
 }
 
 fn read_logit_f32(logits: &ProtocolObject<dyn MTLBuffer>, row: usize, col: u32) -> f32 {
+    use crate::kernels::sub::bf16;
     let byte_off = (row * VOCAB + col as usize) * 2;
     let ptr = unsafe { logits.contents().as_ptr().add(byte_off) as *const u16 };
-    f16_bits_to_f32(unsafe { *ptr })
+    bf16::bf16_bits_to_f32(unsafe { *ptr })
 }
 
 /// Log GPU vs CPU accept masks and per-position entropy/argmax (for MLX/HF parity iteration).
@@ -3174,12 +3153,13 @@ pub fn log_denoise_parity_step(
 
 
 fn count_non_finite_half(buf: &ProtocolObject<dyn MTLBuffer>, elems: usize) -> (usize, f32) {
+    use crate::kernels::sub::bf16;
     let ptr = buf.contents().as_ptr() as *const u16;
     let mut bad = 0usize;
     let mut max_abs = 0.0f32;
     for i in 0..elems {
         unsafe {
-            let v = f16_bits_to_f32(*ptr.add(i));
+            let v = bf16::bf16_bits_to_f32(*ptr.add(i));
             if !v.is_finite() {
                 bad += 1;
             }
@@ -3199,6 +3179,7 @@ fn half_buffer_stats(
     elems: usize,
     sample: usize,
 ) -> (bool, f32) {
+    use crate::kernels::sub::bf16;
     let ptr = unsafe { buf.contents().as_ptr().add(byte_off) as *const u16 };
     let mut max_abs = 0.0f32;
     let mut finite = true;
@@ -3208,7 +3189,7 @@ fn half_buffer_stats(
     unsafe {
         let mut i = 0usize;
         while i < elems {
-            let v = f16_bits_to_f32(*ptr.add(i));
+            let v = bf16::bf16_bits_to_f32(*ptr.add(i));
             if !v.is_finite() {
                 finite = false;
                 non_finite += 1;
@@ -5384,15 +5365,16 @@ pub fn read_arena_buffer_f32(
         .collect()
 }
 
-/// Read `elems` fp16 values from a shared Metal buffer as f32 (logits / KV cache).
+/// Read `elems` bf16 values from a shared Metal buffer as f32 (logits / KV cache).
 pub fn read_half_buffer_f32(
     buf: &ProtocolObject<dyn MTLBuffer>,
     byte_off: usize,
     elems: usize,
 ) -> Vec<f32> {
+    use crate::kernels::sub::bf16;
     let ptr = unsafe { buf.contents().as_ptr().add(byte_off) as *const u16 };
     (0..elems)
-        .map(|i| unsafe { f16_bits_to_f32(*ptr.add(i)) })
+        .map(|i| unsafe { bf16::bf16_bits_to_f32(*ptr.add(i)) })
         .collect()
 }
 

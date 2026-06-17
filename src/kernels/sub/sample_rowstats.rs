@@ -1,6 +1,6 @@
 //! Tempered row stats + entropy + argmax for monolithic sampler pass 1.
 
-use super::f16;
+use super::bf16;
 use super::gpu_common;
 use super::test_util::ElemFormat;
 use super::variant::KernelVariant;
@@ -120,7 +120,7 @@ fn pack_out(rowstat: &[f32], entropy: &[f32], prev_argmax: &[u32]) -> Vec<f32> {
 }
 
 pub fn cpu(f: &Fixture) -> Vec<f32> {
-    let logits = f16::f16_slice_to_f32(&f16::f32_slice_to_f16(&f.logits));
+    let logits = bf16::bf16_slice_to_f32(&bf16::f32_slice_to_bf16_bits(&f.logits));
     let t = f.temperature();
     let mut rowstat = vec![0.0f32; f.rows * 2];
     let mut entropy = vec![0.0f32; f.rows];
@@ -216,7 +216,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let buf_state = pool
         .allocate(&ctx.device, std::mem::size_of::<CanvasState>())
         .ok_or(Error::Format("alloc"))?;
-    BufferPool::write_bf16(&buf_logits, &f16::f32_slice_to_f16(&f.logits));
+    BufferPool::write_bf16(&buf_logits, &bf16::f32_slice_to_bf16_bits(&f.logits));
     let state = canvas_state_for_gpu(f);
     let state_bytes = unsafe {
         std::slice::from_raw_parts(
