@@ -100,6 +100,7 @@ impl MetalContext {
         let dump_stage = 0u32;
         let debug_fast = variant.debug_fast;
         let debug_deep = variant.debug_deep;
+        let gemm_n_tile = crate::kernels::sub::gemm_common::n_tile() as u32;
         unsafe {
             fc.setConstantValue_type_atIndex(
                 std::ptr::NonNull::from_ref(&shape_assert).cast(),
@@ -151,13 +152,18 @@ impl MetalContext {
                 MTLDataType::Bool,
                 10,
             );
+            fc.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from_ref(&gemm_n_tile).cast(),
+                MTLDataType::UInt,
+                11,
+            );
         }
         let name = NSString::from_str(entry);
         let function = library
             .newFunctionWithName_constantValues_error(&name, &fc)
             .map_err(|e| shader_compile_error(e))?;
         let label = format!(
-            "{entry}_qf{quant_format}_n{gemm_n}_k{gemm_k}_yfp16{}_xfp16{}_sa{}_df{}_dd{}",
+            "{entry}_qf{quant_format}_n{gemm_n}_k{gemm_k}_nt{gemm_n_tile}_yfp16{}_xfp16{}_sa{}_df{}_dd{}",
             u8::from(y_fp16),
             u8::from(x_fp16),
             u8::from(shape_assert),

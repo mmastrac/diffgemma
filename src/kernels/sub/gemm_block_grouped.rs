@@ -108,7 +108,7 @@ pub fn bind_gpu_buffers(
 pub fn dispatch_shape(n: usize, num_jobs: usize) -> (MTLSize, MTLSize) {
     (
         MTLSize {
-            width: gemm_common::div_up(n, 32),
+            width: gemm_common::div_up(n, gemm_common::n_tile()),
             height: num_jobs,
             depth: 1,
         },

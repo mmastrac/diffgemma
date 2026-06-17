@@ -4,6 +4,7 @@
 using namespace metal;
 
 #include "gemm_fc.metal"
+#include "gemm_block_tile.metal"
 #include "dequant.metal"
 #include "qgemm_grouped.metal"
 
@@ -42,7 +43,7 @@ kernel void gemm_block_grouped(
         return;
     }
 
-    const uint n0 = tgid.x * 32u;
+    const uint n0 = tgid.x * GEMM_N_TILE;
     if (n0 >= N) {
         return;
     }
@@ -50,8 +51,8 @@ kernel void gemm_block_grouped(
     const GroupedJob job = jobs[e];
     const ulong w_off = job.w_byte_off;
 
-    threadgroup half tx[32][32];
-    threadgroup half tw[32][32];
+    threadgroup half tx[GEMM_M_TILE][GEMM_K_TILE];
+    threadgroup half tw[GEMM_N_TILE_MAX][GEMM_K_TILE];
     const uint ltid = lid.x;
 
     const bool is_nvfp4 = (K_QUANT_FORMAT == QUANT_NVFP4);
@@ -64,20 +65,21 @@ kernel void gemm_block_grouped(
         rowB = q4_row_bytes(K);
     }
 
-    for (uint m_base = 0u; m_base < M; m_base += 32u) {
-        const uint M_tile = min(32u, M - m_base);
+    for (uint m_base = 0u; m_base < M; m_base += GEMM_M_TILE) {
+        const uint M_tile = min(GEMM_M_TILE, M - m_base);
         const uint row0 = m0 + m_base;
         simdgroup_float8x8 acc0(0.f), acc1(0.f), acc2(0.f), acc3(0.f);
+        simdgroup_float8x8 acc4(0.f), acc5(0.f), acc6(0.f), acc7(0.f);
+        simdgroup_float8x8 acc8(0.f), acc9(0.f), acc10(0.f), acc11(0.f);
+        simdgroup_float8x8 acc12(0.f), acc13(0.f), acc14(0.f), acc15(0.f);
 
-        for (uint k0 = 0u; k0 < K; k0 += 32u) {
+        for (uint k0 = 0u; k0 < K; k0 += GEMM_K_TILE) {
             gemm_load_a_tile_f32(a, M_tile, K, row0, k0, ltid, tx);
-            if (ltid < 32u) {
+            if (ltid < GEMM_N_TILE) {
                 const uint r = ltid;
                 const uint global_n = n0 + r;
                 if (global_n >= N) {
-                    for (uint i = 0u; i < 32u; ++i) {
-                        tw[r][i] = half(0);
-                    }
+                    gemm_block_zero_tw_row(tw, r);
                 } else if (is_nvfp4) {
                     device const uchar *row = blob + body + (ulong)global_n * rowB;
                     const float gscale = as_type<float>(*(device const uint *)(blob + w_off));
@@ -89,30 +91,20 @@ kernel void gemm_block_grouped(
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint kk = 0u; kk < 32u; kk += 8u) {
-                simdgroup_half8x8 a_tile, b0, b1, b2, b3;
-                simdgroup_load(a_tile, &tx[8u * sgid][kk], 32);
-                simdgroup_load(b0, &tw[0][kk], 32, ulong2(0, 0), true);
-                simdgroup_load(b1, &tw[8][kk], 32, ulong2(0, 0), true);
-                simdgroup_load(b2, &tw[16][kk], 32, ulong2(0, 0), true);
-                simdgroup_load(b3, &tw[24][kk], 32, ulong2(0, 0), true);
-                simdgroup_multiply_accumulate(acc0, a_tile, b0, acc0);
-                simdgroup_multiply_accumulate(acc1, a_tile, b1, acc1);
-                simdgroup_multiply_accumulate(acc2, a_tile, b2, acc2);
-                simdgroup_multiply_accumulate(acc3, a_tile, b3, acc3);
-            }
+            gemm_block_mma_k32(
+                tx, tw, sgid, acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7, acc8, acc9, acc10,
+                acc11, acc12, acc13, acc14, acc15);
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
-        threadgroup float ty[32][32];
-        simdgroup_store(acc0, &ty[8u * sgid][0], 32);
-        simdgroup_store(acc1, &ty[8u * sgid][8], 32);
-        simdgroup_store(acc2, &ty[8u * sgid][16], 32);
-        simdgroup_store(acc3, &ty[8u * sgid][24], 32);
+        threadgroup float ty[GEMM_M_TILE][GEMM_N_TILE_MAX];
+        gemm_block_mma_store(
+            ty, sgid, acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7, acc8, acc9, acc10, acc11,
+            acc12, acc13, acc14, acc15);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint i = ltid; i < 32u * 32u; i += 128u) {
-            const uint mm = i / 32u;
-            const uint nn = i % 32u;
+        for (uint i = ltid; i < GEMM_M_TILE * GEMM_N_TILE; i += 128u) {
+            const uint mm = i / GEMM_N_TILE;
+            const uint nn = i % GEMM_N_TILE;
             if (mm < M_tile && n0 + nn < N) {
                 c[(ulong)(m0 + m_base + mm) * N + n0 + nn] = f32_round_bf16(ty[mm][nn]);
             }

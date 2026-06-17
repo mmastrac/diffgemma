@@ -4,6 +4,7 @@
 using namespace metal;
 
 #include "gemm_fc.metal"
+#include "gemm_block_tile.metal"
 #include "dequant.metal"
 #include "arena.metal"
 
@@ -19,11 +20,15 @@ kernel void gemm_block(
     uint sgid [[simdgroup_index_in_threadgroup]]
 ) {
     const uint N = GEMM_N, K = GEMM_K;
-    threadgroup half tx[32][32];
-    threadgroup half tw[32][32];
-    uint m0 = tgid.y * 32, n0 = tgid.x * 32;
-    uint ltid = lid.x;
+    threadgroup half tx[GEMM_M_TILE][GEMM_K_TILE];
+    threadgroup half tw[GEMM_N_TILE_MAX][GEMM_K_TILE];
+    const uint m0 = tgid.y * GEMM_M_TILE;
+    const uint n0 = tgid.x * GEMM_N_TILE;
+    const uint ltid = lid.x;
     simdgroup_float8x8 acc0(0.f), acc1(0.f), acc2(0.f), acc3(0.f);
+    simdgroup_float8x8 acc4(0.f), acc5(0.f), acc6(0.f), acc7(0.f);
+    simdgroup_float8x8 acc8(0.f), acc9(0.f), acc10(0.f), acc11(0.f);
+    simdgroup_float8x8 acc12(0.f), acc13(0.f), acc14(0.f), acc15(0.f);
 
     const bool is_nvfp4 = (K_QUANT_FORMAT == QUANT_NVFP4);
     ulong body = w_off;
@@ -35,47 +40,40 @@ kernel void gemm_block(
         rowB = q4_row_bytes(K);
     }
 
-    for (uint k0 = 0; k0 < K; k0 += 32) {
+    for (uint k0 = 0u; k0 < K; k0 += GEMM_K_TILE) {
         gemm_load_a_tile(x, M, K, m0, k0, ltid, tx);
-        if (ltid < 32u) {
+        if (ltid < GEMM_N_TILE) {
             const uint r = ltid;
             if (is_nvfp4) {
-                device const uchar *row = blob + body + (ulong)(n0 + r) * rowB;
-                const float gscale = as_type<float>(*(device const uint *)(blob + w_off));
-                dequant_nvfp4_tile_half_fused_tg(row, K, k0, &tw[r][0], gscale);
+                if (n0 + r < N) {
+                    device const uchar *row = blob + body + (ulong)(n0 + r) * rowB;
+                    const float gscale = as_type<float>(*(device const uint *)(blob + w_off));
+                    dequant_nvfp4_tile_half_fused_tg(row, K, k0, &tw[r][0], gscale);
+                } else {
+                    gemm_block_zero_tw_row(tw, r);
+                }
             } else if (n0 + r < N) {
                 dequant_q4_group_half_tg(
                     blob + body + (ulong)(n0 + r) * rowB + (ulong)(k0 / 32u) * 20ul,
                     &tw[r][0]);
             } else {
-                for (uint i = 0u; i < 32u; ++i) {
-                    tw[r][i] = half(0);
-                }
+                gemm_block_zero_tw_row(tw, r);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint kk = 0; kk < 32; kk += 8) {
-            simdgroup_half8x8 a, b0, b1, b2, b3;
-            simdgroup_load(a, &tx[8 * sgid][kk], 32);
-            simdgroup_load(b0, &tw[0][kk], 32, ulong2(0, 0), true);
-            simdgroup_load(b1, &tw[8][kk], 32, ulong2(0, 0), true);
-            simdgroup_load(b2, &tw[16][kk], 32, ulong2(0, 0), true);
-            simdgroup_load(b3, &tw[24][kk], 32, ulong2(0, 0), true);
-            simdgroup_multiply_accumulate(acc0, a, b0, acc0);
-            simdgroup_multiply_accumulate(acc1, a, b1, acc1);
-            simdgroup_multiply_accumulate(acc2, a, b2, acc2);
-            simdgroup_multiply_accumulate(acc3, a, b3, acc3);
-        }
+        gemm_block_mma_k32(
+            tx, tw, sgid, acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7, acc8, acc9, acc10,
+            acc11, acc12, acc13, acc14, acc15);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    threadgroup float ty[32][32];
-    simdgroup_store(acc0, &ty[8 * sgid][0], 32);
-    simdgroup_store(acc1, &ty[8 * sgid][8], 32);
-    simdgroup_store(acc2, &ty[8 * sgid][16], 32);
-    simdgroup_store(acc3, &ty[8 * sgid][24], 32);
+    threadgroup float ty[GEMM_M_TILE][GEMM_N_TILE_MAX];
+    gemm_block_mma_store(
+        ty, sgid, acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7, acc8, acc9, acc10, acc11,
+        acc12, acc13, acc14, acc15);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = ltid; i < 32 * 32; i += 128) {
-        uint mm = i / 32, nn = i % 32;
+    for (uint i = ltid; i < GEMM_M_TILE * GEMM_N_TILE; i += 128u) {
+        const uint mm = i / GEMM_N_TILE;
+        const uint nn = i % GEMM_N_TILE;
         if (m0 + mm < M && n0 + nn < N) {
             arena_store(y, (ulong)(m0 + mm) * N + n0 + nn, ty[mm][nn]);
         }

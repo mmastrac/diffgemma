@@ -4,6 +4,7 @@
 using namespace metal;
 
 #include "gemm_fc.metal"
+#include "gemm_block_tile.metal"
 #include "dequant.metal"
 #include "arena.metal"
 #include "gemm_stacked.metal"
@@ -18,15 +19,18 @@ inline void gemm_block_stacked_q4_impl(
     uint3 tgid,
     uint ltid,
     uint sgid,
-    threadgroup half tx[32][32],
-    threadgroup half tw[32][32],
-    threadgroup float ty[32][32]
+    threadgroup half tx[GEMM_M_TILE][GEMM_K_TILE],
+    threadgroup half tw[GEMM_N_TILE_MAX][GEMM_K_TILE],
+    threadgroup float ty[GEMM_M_TILE][GEMM_N_TILE_MAX]
 ) {
     const uint N = GEMM_N;
     const uint K = GEMM_K;
-    const uint m0 = tgid.y * 32u;
-    const uint n0 = tgid.x * 32u;
+    const uint m0 = tgid.y * GEMM_M_TILE;
+    const uint n0 = tgid.x * GEMM_N_TILE;
     simdgroup_float8x8 acc0(0.f), acc1(0.f), acc2(0.f), acc3(0.f);
+    simdgroup_float8x8 acc4(0.f), acc5(0.f), acc6(0.f), acc7(0.f);
+    simdgroup_float8x8 acc8(0.f), acc9(0.f), acc10(0.f), acc11(0.f);
+    simdgroup_float8x8 acc12(0.f), acc13(0.f), acc14(0.f), acc15(0.f);
 
     const ulong rowB = q4_row_bytes(K);
 
@@ -49,15 +53,13 @@ inline void gemm_block_stacked_q4_impl(
         seg_body2 = segs[2].w_off;
     }
 
-    for (uint k0 = 0u; k0 < K; k0 += 32u) {
+    for (uint k0 = 0u; k0 < K; k0 += GEMM_K_TILE) {
         gemm_load_a_tile(x, M, K, m0, k0, ltid, tx);
-        if (ltid < 32u) {
+        if (ltid < GEMM_N_TILE) {
             const uint r = ltid;
             const uint global_n = n0 + r;
             if (global_n >= N) {
-                for (uint i = 0u; i < 32u; ++i) {
-                    tw[r][i] = half(0);
-                }
+                gemm_block_zero_tw_row(tw, r);
             } else {
                 const uint seg = stacked_seg_index_fast(global_n, n_segs, seg_end0, seg_end1, seg_end2);
                 const uint local_n = stacked_local_col_fast(global_n, seg, seg_end0, seg_end1);
@@ -68,28 +70,18 @@ inline void gemm_block_stacked_q4_impl(
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint kk = 0u; kk < 32u; kk += 8u) {
-            simdgroup_half8x8 a, b0, b1, b2, b3;
-            simdgroup_load(a, &tx[8u * sgid][kk], 32);
-            simdgroup_load(b0, &tw[0][kk], 32, ulong2(0, 0), true);
-            simdgroup_load(b1, &tw[8][kk], 32, ulong2(0, 0), true);
-            simdgroup_load(b2, &tw[16][kk], 32, ulong2(0, 0), true);
-            simdgroup_load(b3, &tw[24][kk], 32, ulong2(0, 0), true);
-            simdgroup_multiply_accumulate(acc0, a, b0, acc0);
-            simdgroup_multiply_accumulate(acc1, a, b1, acc1);
-            simdgroup_multiply_accumulate(acc2, a, b2, acc2);
-            simdgroup_multiply_accumulate(acc3, a, b3, acc3);
-        }
+        gemm_block_mma_k32(
+            tx, tw, sgid, acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7, acc8, acc9, acc10,
+            acc11, acc12, acc13, acc14, acc15);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    simdgroup_store(acc0, &ty[8u * sgid][0], 32);
-    simdgroup_store(acc1, &ty[8u * sgid][8], 32);
-    simdgroup_store(acc2, &ty[8u * sgid][16], 32);
-    simdgroup_store(acc3, &ty[8u * sgid][24], 32);
+    gemm_block_mma_store(
+        ty, sgid, acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7, acc8, acc9, acc10, acc11,
+        acc12, acc13, acc14, acc15);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = ltid; i < 32u * 32u; i += 128u) {
-        const uint mm = i / 32u;
-        const uint nn = i % 32u;
+    for (uint i = ltid; i < GEMM_M_TILE * GEMM_N_TILE; i += 128u) {
+        const uint mm = i / GEMM_N_TILE;
+        const uint nn = i % GEMM_N_TILE;
         const uint global_n = n0 + nn;
         if (m0 + mm < M && global_n < N) {
             const uint seg = stacked_seg_index_fast(global_n, n_segs, seg_end0, seg_end1, seg_end2);
@@ -112,15 +104,18 @@ inline void gemm_block_stacked_nvfp4_impl(
     uint3 tgid,
     uint ltid,
     uint sgid,
-    threadgroup half tx[32][32],
-    threadgroup half tw[32][32],
-    threadgroup float ty[32][32]
+    threadgroup half tx[GEMM_M_TILE][GEMM_K_TILE],
+    threadgroup half tw[GEMM_N_TILE_MAX][GEMM_K_TILE],
+    threadgroup float ty[GEMM_M_TILE][GEMM_N_TILE_MAX]
 ) {
     const uint N = GEMM_N;
     const uint K = GEMM_K;
-    const uint m0 = tgid.y * 32u;
-    const uint n0 = tgid.x * 32u;
+    const uint m0 = tgid.y * GEMM_M_TILE;
+    const uint n0 = tgid.x * GEMM_N_TILE;
     simdgroup_float8x8 acc0(0.f), acc1(0.f), acc2(0.f), acc3(0.f);
+    simdgroup_float8x8 acc4(0.f), acc5(0.f), acc6(0.f), acc7(0.f);
+    simdgroup_float8x8 acc8(0.f), acc9(0.f), acc10(0.f), acc11(0.f);
+    simdgroup_float8x8 acc12(0.f), acc13(0.f), acc14(0.f), acc15(0.f);
 
     uint seg_end0 = 0u;
     uint seg_end1 = 0u;
@@ -151,15 +146,13 @@ inline void gemm_block_stacked_nvfp4_impl(
     const device uchar *body1 = blob + seg_w1 + 4ul;
     const device uchar *body2 = blob + seg_w2 + 4ul;
 
-    for (uint k0 = 0u; k0 < K; k0 += 32u) {
+    for (uint k0 = 0u; k0 < K; k0 += GEMM_K_TILE) {
         gemm_load_a_tile(x, M, K, m0, k0, ltid, tx);
-        if (ltid < 32u) {
+        if (ltid < GEMM_N_TILE) {
             const uint r = ltid;
             const uint global_n = n0 + r;
             if (global_n >= N) {
-                for (uint i = 0u; i < 32u; ++i) {
-                    tw[r][i] = half(0);
-                }
+                gemm_block_zero_tw_row(tw, r);
             } else {
                 const uint seg = stacked_seg_index_fast(global_n, n_segs, seg_end0, seg_end1, seg_end2);
                 const uint local_n = stacked_local_col_fast(global_n, seg, seg_end0, seg_end1);
@@ -170,28 +163,18 @@ inline void gemm_block_stacked_nvfp4_impl(
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint kk = 0u; kk < 32u; kk += 8u) {
-            simdgroup_half8x8 a, b0, b1, b2, b3;
-            simdgroup_load(a, &tx[8u * sgid][kk], 32);
-            simdgroup_load(b0, &tw[0][kk], 32, ulong2(0, 0), true);
-            simdgroup_load(b1, &tw[8][kk], 32, ulong2(0, 0), true);
-            simdgroup_load(b2, &tw[16][kk], 32, ulong2(0, 0), true);
-            simdgroup_load(b3, &tw[24][kk], 32, ulong2(0, 0), true);
-            simdgroup_multiply_accumulate(acc0, a, b0, acc0);
-            simdgroup_multiply_accumulate(acc1, a, b1, acc1);
-            simdgroup_multiply_accumulate(acc2, a, b2, acc2);
-            simdgroup_multiply_accumulate(acc3, a, b3, acc3);
-        }
+        gemm_block_mma_k32(
+            tx, tw, sgid, acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7, acc8, acc9, acc10,
+            acc11, acc12, acc13, acc14, acc15);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    simdgroup_store(acc0, &ty[8u * sgid][0], 32);
-    simdgroup_store(acc1, &ty[8u * sgid][8], 32);
-    simdgroup_store(acc2, &ty[8u * sgid][16], 32);
-    simdgroup_store(acc3, &ty[8u * sgid][24], 32);
+    gemm_block_mma_store(
+        ty, sgid, acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7, acc8, acc9, acc10, acc11,
+        acc12, acc13, acc14, acc15);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = ltid; i < 32u * 32u; i += 128u) {
-        const uint mm = i / 32u;
-        const uint nn = i % 32u;
+    for (uint i = ltid; i < GEMM_M_TILE * GEMM_N_TILE; i += 128u) {
+        const uint mm = i / GEMM_N_TILE;
+        const uint nn = i % GEMM_N_TILE;
         const uint global_n = n0 + nn;
         if (m0 + mm < M && global_n < N) {
             const uint seg = stacked_seg_index_fast(global_n, n_segs, seg_end0, seg_end1, seg_end2);
@@ -218,9 +201,9 @@ kernel void gemm_block_stacked(
     uint sgid [[simdgroup_index_in_threadgroup]]
 ) {
     const uint ltid = lid.x;
-    threadgroup half tx[32][32];
-    threadgroup half tw[32][32];
-    threadgroup float ty[32][32];
+    threadgroup half tx[GEMM_M_TILE][GEMM_K_TILE];
+    threadgroup half tw[GEMM_N_TILE_MAX][GEMM_K_TILE];
+    threadgroup float ty[GEMM_M_TILE][GEMM_N_TILE_MAX];
     if (K_QUANT_FORMAT == QUANT_NVFP4) {
         gemm_block_stacked_nvfp4_impl(x, y_arena, blob, segs, n_segs, M, tgid, ltid, sgid, tx, tw, ty);
     } else {
