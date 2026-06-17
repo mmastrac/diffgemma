@@ -80,6 +80,7 @@ fn shader_bundle_token() -> u64 {
         include_str!("../../shaders/kernels/scatter_vocab_chunk.metal"),
         include_str!("../../shaders/kernels/compact_active_rows.metal"),
         include_str!("../../shaders/kernels/gather_rows_bf16.metal"),
+        include_str!("../../shaders/kernels/gather_rows_bf16_to_f32.metal"),
         include_str!("../../shaders/kernels/scatter_logits_rows.metal"),
         include_str!("../../shaders/monolithic/diffgemma_step.metal"),
     ] {

@@ -680,6 +680,7 @@ struct StepPipelines {
     q4_block_grouped: HashMap<(u32, u32), ComputePipeline>,
     nvfp4_block_grouped: HashMap<(u32, u32), ComputePipeline>,
     gather_rows: ComputePipeline,
+    gather_rows_bf16_to_f32: ComputePipeline,
     gelu_swiglu_gate_up: ComputePipeline,
     moe_scatter_weighted: ComputePipeline,
     moe_grouped: ComputePipeline,
@@ -817,6 +818,9 @@ impl StepPipelines {
             q4_block_grouped,
             nvfp4_block_grouped,
             gather_rows: crate::kernels::sub::gather_rows::pipeline_for(ctx, prod)?,
+            gather_rows_bf16_to_f32: crate::kernels::sub::gather_rows_bf16_to_f32::pipeline_for(
+                ctx, prod,
+            )?,
             gelu_swiglu_gate_up: crate::kernels::sub::swiglu::pipeline_for_moe(ctx, prod)?,
             moe_scatter_weighted: crate::kernels::sub::moe_scatter_weighted::pipeline_for(
                 ctx, prod,
@@ -1856,15 +1860,41 @@ impl StepEnc<'_> {
     }
 
     fn encode_moe_batched_gather(&mut self) -> Result<(), Error> {
-        self.encode_moe_batched_half_to_f32()?;
-        self.encode_moe_batched_gather_rows()
+        self.encode_moe_batched_gather_bf16_to_f32()
     }
 
+    fn encode_moe_batched_gather_bf16_to_f32(&mut self) -> Result<(), Error> {
+        let token_list_off = std::mem::offset_of!(RouteScratch, token_list);
+        let gather_dims = [0u32, HID as u32];
+        let gather_count = (MOE_SLOTS as usize) * HID;
+        self.dispatch_1d_ranged(
+            &self.ps.gather_rows_bf16_to_f32,
+            gather_count,
+            256,
+            |this, base, _chunk| {
+                this.sink_set_buffer(
+                    &this.bufs.arena,
+                    this.arena().moein_off() as usize,
+                    0,
+                );
+                this.sink_set_buffer(&this.bufs.route, token_list_off, 1);
+                this.sink_set_buffer(&this.bufs.gemm_b, moe_w_byte_off_a(), 2);
+                this.sink_set_buffer(&this.bufs.dummy_dump, 0, 5);
+                this.sink_set_bytes(&gather_dims, 3);
+                this.sink_set_bytes(&MOE_SLOTS, 4);
+                this.sink_set_bytes(&base, 6);
+            },
+        );
+        Ok(())
+    }
+
+    #[allow(dead_code)]
     fn encode_moe_batched_half_to_f32(&mut self) -> Result<(), Error> {
         self.half_to_f32_buf(self.arena().moein_off(), CANVAS * HID);
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn encode_moe_batched_gather_rows(&mut self) -> Result<(), Error> {
         let token_list_off = std::mem::offset_of!(RouteScratch, token_list);
         let gather_dims = [0u32, HID as u32];
@@ -3577,9 +3607,8 @@ impl StepRuntime {
         }
 
         for layer in 0..layers {
-            moe_prof.half_to_f32 +=
-                self.time_enc_stage(|e| e.encode_moe_batched_half_to_f32())?;
-            moe_prof.gather += self.time_enc_stage(|e| e.encode_moe_batched_gather_rows())?;
+            moe_prof.gather +=
+                self.time_enc_stage(|e| e.encode_moe_batched_gather_bf16_to_f32())?;
             moe_prof.gate_up +=
                 self.time_enc_stage(|e| e.encode_moe_batched_gate_up(layer, &layout))?;
             moe_prof.swiglu += self.time_enc_stage(|e| e.encode_moe_batched_swiglu())?;
