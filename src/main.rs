@@ -2670,7 +2670,10 @@ fn run_probe_device() -> ExitCode {
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 fn run_bench_gemm(shapes: &str, oracle: Option<&str>, iters: usize) -> ExitCode {
-    use metal::{bench_custom_kernel, bench_mpsgraph_oracle, parse_shapes, print_bench_rows};
+    use metal::{
+        bench_custom_kernel, bench_gemm_block_q4, bench_mpsgraph_oracle, parse_shapes,
+        print_bench_rows,
+    };
     let parsed = match parse_shapes(shapes) {
         Ok(s) => s,
         Err(err) => {
@@ -2685,6 +2688,10 @@ fn run_bench_gemm(shapes: &str, oracle: Option<&str>, iters: usize) -> ExitCode 
             return ExitCode::FAILURE;
         }
     };
+    match bench_gemm_block_q4(&parsed, iters) {
+        Ok(mut q4) => rows.append(&mut q4),
+        Err(err) => eprintln!("warning: gemm_block bench: {err}"),
+    }
     if matches!(oracle, Some("mps") | Some("mpsgraph")) {
         match bench_mpsgraph_oracle(&parsed, iters) {
             Ok(mut mps) => rows.append(&mut mps),

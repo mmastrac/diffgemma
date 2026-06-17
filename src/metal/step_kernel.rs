@@ -431,10 +431,8 @@ fn gemm_scratch_bytes() -> (usize, usize) {
         max_mk = max_mk.max(m * k as usize);
         max_nk = max_nk.max(_n as usize * k as usize);
     }
-    (
-        max_mk * std::mem::size_of::<f32>(),
-        max_nk * std::mem::size_of::<f32>(),
-    )
+    let f32 = std::mem::size_of::<f32>();
+    (max_mk * f32, max_nk * f32)
 }
 
 fn sc_probs_buffer_bytes(use_sc_gemm: bool, use_sc_chunked: bool) -> usize {
@@ -1049,7 +1047,7 @@ impl StepEnc<'_> {
         );
     }
 
-    fn gemm_q4_fused(
+    fn gemm_q4(
         &mut self,
         x_off: u64,
         y_off: u64,
@@ -1077,18 +1075,6 @@ impl StepEnc<'_> {
         };
         self.sink_dispatch(grid, tg);
         Ok(())
-    }
-
-    fn gemm_q4(
-        &mut self,
-        x_off: u64,
-        y_off: u64,
-        w_off: u64,
-        m: u32,
-        n: u32,
-        k: u32,
-    ) -> Result<(), Error> {
-        self.gemm_q4_fused(x_off, y_off, w_off, m, n, k)
     }
 
     fn memzero_bytes(&mut self, byte_off: u64, nbytes: u64) {

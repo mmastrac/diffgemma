@@ -1,5 +1,6 @@
 //! GEMM throughput bench: full-call vs resident compute vs MPSGraph oracle.
 
+use crate::kernels::sub::bf16;
 use crate::metal::buffer::BufferPool;
 use crate::metal::gemm::Bf16Gemm;
 use crate::safetensors::Error;
@@ -76,6 +77,81 @@ pub fn bench_custom_kernel(shapes: &[GemmShape], iters: usize) -> Result<Vec<Gem
             label: format!("custom/batched_x{iters}"),
             gflops: batched,
         });
+    }
+    Ok(rows)
+}
+
+/// Fused Q4 `gemm_block` (step-kernel dense path): bf16 activations, on-the-fly dequant.
+pub fn bench_gemm_block_q4(shapes: &[GemmShape], iters: usize) -> Result<Vec<GemmBenchRow>, Error> {
+    use crate::kernels::sub::gemm_common;
+    use crate::kernels::sub::gemm_q4;
+    use crate::metal::device::MetalContext;
+    use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+
+    let ctx = MetalContext::new()?;
+    let warmup = 3usize;
+    let mut rows = Vec::new();
+    let mut pool = BufferPool::new();
+
+    for &shape in shapes {
+        let GemmShape { m, k, n } = shape;
+        let pipeline = gemm_q4::pipeline_for(&ctx, n as u32, k as u32)?;
+        let w_f32: Vec<f32> = (0..n * k)
+            .map(|i| ((i as f32) * 0.0007).cos() * 0.02)
+            .collect();
+        let fixture = gemm_q4::Fixture {
+            x: vec![0.01f32; m * k],
+            w_f32,
+            m,
+            n,
+            k,
+        };
+        let w_q4 = fixture.w_q4();
+        let buf_x = pool
+            .allocate(&ctx.device, m * k * 2)
+            .ok_or(Error::Format("bench gemm_block x"))?;
+        let buf_y = pool
+            .allocate(&ctx.device, m * n * 2)
+            .ok_or(Error::Format("bench gemm_block y"))?;
+        let buf_w = pool
+            .allocate(&ctx.device, w_q4.len())
+            .ok_or(Error::Format("bench gemm_block w"))?;
+        BufferPool::write_bf16(&buf_x, &bf16::f32_slice_to_bf16_bits(&fixture.x));
+        BufferPool::write_bytes(&buf_w, &w_q4);
+        let (grid, tg) = gemm_common::dispatch_shape(m, n);
+
+        let dispatch = |count: usize| -> Result<(), Error> {
+            let cmd = ctx
+                .queue
+                .commandBuffer()
+                .ok_or(Error::Format("cmd"))?;
+            let enc = cmd
+                .computeCommandEncoder()
+                .ok_or(Error::Format("enc"))?;
+            for _ in 0..count {
+                enc.setComputePipelineState(&pipeline.pipeline);
+                gemm_q4::bind_gpu_buffers(&enc, &buf_x, &buf_y, &buf_w, 0, m as u32);
+                enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+            }
+            enc.endEncoding();
+            cmd.commit();
+            cmd.waitUntilCompleted();
+            Ok(())
+        };
+
+        dispatch(warmup)?;
+        let started = Instant::now();
+        dispatch(iters)?;
+        let rate = gflops(m, k, n, iters, started.elapsed().as_secs_f64());
+        rows.push(GemmBenchRow {
+            shape,
+            label: format!("gemm_block/batched_x{iters}"),
+            gflops: rate,
+        });
+
+        pool.release(m * k * 2, buf_x);
+        pool.release(m * n * 2, buf_y);
+        pool.release(w_q4.len(), buf_w);
     }
     Ok(rows)
 }
