@@ -13,7 +13,8 @@ struct RouteScratch {
     /// Per-expert slot starts; `row_start[128]` == `num_slots` after bucketing.
     uint row_start[129];
     uint num_slots;
-    uint _pad_route;
+    uint num_active_experts;
+    uint active_expert[128];
     uint token_list[2048];
     uint slot_list[2048];
     /// Inverse map: `token_slot[tok][kk]` → flat slot index in `token_list`.

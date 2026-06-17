@@ -7,7 +7,7 @@ use super::bf16;
 use super::QuantFormat;
 use crate::kernels::cpu::gemm_linear_grouped::gemm_linear_grouped_cpu;
 use crate::kernels::sub::gemm_linear_grouped::{grouped_fixture, Fixture};
-use crate::metal::BlockGroupedJob;
+use crate::metal::{BlockGroupedJob, RouteScratch};
 use crate::safetensors::Error;
 
 pub const ENTRY: &str = "gemm_block_grouped";
@@ -57,6 +57,29 @@ pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
     cpu(f)
 }
 
+fn route_from_fixture(f: &Fixture) -> RouteScratch {
+    let num_jobs = f.num_jobs();
+    let mut route = RouteScratch {
+        weight: [[0; crate::metal::TOP_K]; crate::metal::CANVAS],
+        expert: [[0; crate::metal::TOP_K]; crate::metal::CANVAS],
+        count: [0; crate::metal::N_EXPERTS],
+        row_start: [0; crate::metal::N_EXPERTS + 1],
+        num_slots: 0,
+        num_active_experts: num_jobs as u32,
+        active_expert: [0; crate::metal::N_EXPERTS],
+        token_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
+        slot_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
+        token_slot: [[0; crate::metal::TOP_K]; crate::metal::CANVAS],
+    };
+    for (i, &rs) in f.row_starts.iter().enumerate().take(num_jobs + 1) {
+        route.row_start[i] = rs;
+    }
+    for e in 0..num_jobs {
+        route.active_expert[e] = e as u32;
+    }
+    route
+}
+
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub fn pipeline_for(
     ctx: &crate::metal::device::MetalContext,
@@ -92,6 +115,7 @@ pub fn bind_gpu_buffers(
     c: &ProtocolObject<dyn MTLBuffer>,
     jobs: &ProtocolObject<dyn MTLBuffer>,
     row_starts: &ProtocolObject<dyn MTLBuffer>,
+    route: &ProtocolObject<dyn MTLBuffer>,
     num_jobs: u32,
 ) {
     unsafe {
@@ -100,16 +124,17 @@ pub fn bind_gpu_buffers(
         enc.setBuffer_offset_atIndex(Some(c), 0, 2);
         enc.setBuffer_offset_atIndex(Some(jobs), 0, 3);
         enc.setBuffer_offset_atIndex(Some(row_starts), 0, 4);
+        enc.setBuffer_offset_atIndex(Some(route), 0, 6);
     }
     gpu_common::set_bytes(enc, &num_jobs, 5);
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
-pub fn dispatch_shape(n: usize, num_jobs: usize) -> (MTLSize, MTLSize) {
+pub fn dispatch_shape(n: usize, num_active: usize) -> (MTLSize, MTLSize) {
     (
         MTLSize {
             width: gemm_common::div_up(n, gemm_common::n_tile()),
-            height: num_jobs,
+            height: num_active,
             depth: 1,
         },
         MTLSize {
@@ -148,6 +173,10 @@ pub fn gpu(f: &Fixture, _variant: super::KernelVariant) -> Result<Vec<f32>, Erro
     let buf_rs = pool
         .allocate(&ctx.device, f.row_starts.len() * 4)
         .ok_or(Error::Format("alloc"))?;
+    let route = route_from_fixture(f);
+    let buf_route = pool
+        .allocate(&ctx.device, std::mem::size_of::<RouteScratch>())
+        .ok_or(Error::Format("alloc"))?;
 
     BufferPool::write_f32(&buf_a, &f.a);
     BufferPool::write_bytes(&buf_w, &w_blob);
@@ -169,6 +198,15 @@ pub fn gpu(f: &Fixture, _variant: super::KernelVariant) -> Result<Vec<f32>, Erro
             )
         },
     );
+    BufferPool::write_bytes(
+        &buf_route,
+        unsafe {
+            std::slice::from_raw_parts(
+                &route as *const RouteScratch as *const u8,
+                std::mem::size_of::<RouteScratch>(),
+            )
+        },
+    );
     BufferPool::write_f32(&buf_c, &vec![0.0f32; out_len]);
 
     let (grid, tg) = dispatch_shape(f.n, num_jobs);
@@ -182,6 +220,7 @@ pub fn gpu(f: &Fixture, _variant: super::KernelVariant) -> Result<Vec<f32>, Erro
         &buf_c,
         &buf_jobs,
         &buf_rs,
+        &buf_route,
         num_jobs as u32,
     );
     enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
@@ -277,6 +316,27 @@ pub fn gpu_on_blob(
     let buf_rs = pool
         .allocate(&ctx.device, p.row_starts.len() * 4)
         .ok_or(Error::Format("alloc"))?;
+    let mut route = RouteScratch {
+        weight: [[0; crate::metal::TOP_K]; crate::metal::CANVAS],
+        expert: [[0; crate::metal::TOP_K]; crate::metal::CANVAS],
+        count: [0; crate::metal::N_EXPERTS],
+        row_start: [0; crate::metal::N_EXPERTS + 1],
+        num_slots: 0,
+        num_active_experts: num_jobs as u32,
+        active_expert: [0; crate::metal::N_EXPERTS],
+        token_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
+        slot_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
+        token_slot: [[0; crate::metal::TOP_K]; crate::metal::CANVAS],
+    };
+    for (i, &rs) in p.row_starts.iter().enumerate().take(num_jobs + 1) {
+        route.row_start[i] = rs;
+    }
+    for e in 0..num_jobs {
+        route.active_expert[e] = e as u32;
+    }
+    let buf_route = pool
+        .allocate(&ctx.device, std::mem::size_of::<RouteScratch>())
+        .ok_or(Error::Format("alloc"))?;
 
     BufferPool::write_f32(&buf_a, p.a);
     BufferPool::write_f32(&buf_c, &vec![0.0f32; out_len]);
@@ -298,6 +358,15 @@ pub fn gpu_on_blob(
             )
         },
     );
+    BufferPool::write_bytes(
+        &buf_route,
+        unsafe {
+            std::slice::from_raw_parts(
+                &route as *const RouteScratch as *const u8,
+                std::mem::size_of::<RouteScratch>(),
+            )
+        },
+    );
 
     let (grid, tg) = dispatch_shape(p.n, num_jobs);
     let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
@@ -310,6 +379,7 @@ pub fn gpu_on_blob(
         &buf_c,
         &buf_jobs,
         &buf_rs,
+        &buf_route,
         num_jobs as u32,
     );
     enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);

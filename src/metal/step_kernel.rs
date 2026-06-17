@@ -229,7 +229,8 @@ pub struct RouteScratch {
     pub count: [u32; N_EXPERTS],
     pub row_start: [u32; N_EXPERTS + 1],
     pub num_slots: u32,
-    pub pad_route: u32,
+    pub num_active_experts: u32,
+    pub active_expert: [u32; N_EXPERTS],
     pub token_list: [u32; CANVAS * TOP_K],
     pub slot_list: [u32; CANVAS * TOP_K],
     pub token_slot: [[u32; TOP_K]; CANVAS],
@@ -332,6 +333,70 @@ pub struct StepProfileResult {
     pub total: std::time::Duration,
     pub layers: usize,
     pub block_format: QuantFormat,
+}
+
+/// Per-layer `encode_layer` GPU segments (summed over all layers; each timed via its own submit).
+#[derive(Debug, Default, Clone)]
+pub struct LayerEncodeSubProfile {
+    pub qkv_gemm: std::time::Duration,
+    pub qk_rope_kv: std::time::Duration,
+    pub attention: std::time::Duration,
+    pub o_proj_gemm: std::time::Duration,
+    pub o_proj_tail: std::time::Duration,
+    pub dense_pre_norm: std::time::Duration,
+    pub dense_gate_up: std::time::Duration,
+    pub dense_glu: std::time::Duration,
+    pub dense_down: std::time::Duration,
+    pub dense_post_norm: std::time::Duration,
+    pub router: std::time::Duration,
+}
+
+impl LayerEncodeSubProfile {
+    pub fn total(&self) -> std::time::Duration {
+        self.qkv_gemm
+            + self.qk_rope_kv
+            + self.attention
+            + self.o_proj_gemm
+            + self.o_proj_tail
+            + self.dense_pre_norm
+            + self.dense_gate_up
+            + self.dense_glu
+            + self.dense_down
+            + self.dense_post_norm
+            + self.router
+    }
+}
+
+/// Per-layer MoE grouped path (summed over all layers).
+#[derive(Debug, Default, Clone)]
+pub struct MoeEncodeSubProfile {
+    pub half_to_f32: std::time::Duration,
+    pub gather: std::time::Duration,
+    pub gate_up: std::time::Duration,
+    pub swiglu: std::time::Duration,
+    pub down: std::time::Duration,
+    pub scatter: std::time::Duration,
+    pub post: std::time::Duration,
+}
+
+impl MoeEncodeSubProfile {
+    pub fn total(&self) -> std::time::Duration {
+        self.half_to_f32
+            + self.gather
+            + self.gate_up
+            + self.swiglu
+            + self.down
+            + self.scatter
+            + self.post
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct EncodeSubProfileResult {
+    pub compile: std::time::Duration,
+    pub layers: usize,
+    pub layer: LayerEncodeSubProfile,
+    pub moe: MoeEncodeSubProfile,
 }
 
 pub fn build_offsets_from_store(store: &DgqStore) -> HashMap<String, u64> {
@@ -874,11 +939,33 @@ pub(crate) struct StepBuffers {
     pub(crate) gemm_b: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// Per-layer unique routed experts (written by moe_bucket_fill phase 1).
     expert_layer_unique: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// GPU-written `threadgroupsPerGrid` for grouped MoE gate_up (slot 0) and down (slot 1).
+    moe_grouped_indirect: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// Scratch plane byte offsets (host-built, mirrored on GPU as b8).
     pub(crate) arena_map: ArenaLayout,
     /// GPU copy of `arena_map` (b8); bound when kernels need device-side plane table.
     #[allow(dead_code)]
     arena_layout_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MoeGroupedGridInfo {
+    gate_n: u32,
+    hid: u32,
+    n_tile: u32,
+    tpg: u32,
+}
+
+const MOE_GROUPED_INDIRECT_BYTES: usize = 2 * 3 * std::mem::size_of::<u32>();
+
+fn moe_grouped_grid_info() -> MoeGroupedGridInfo {
+    MoeGroupedGridInfo {
+        gate_n: MOE_FF * 2,
+        hid: HID as u32,
+        n_tile: crate::kernels::sub::gemm_common::n_tile() as u32,
+        tpg: crate::kernels::sub::gemm_common::THREADS_PER_TG as u32,
+    }
 }
 
 struct StepEnc<'a> {
@@ -1026,6 +1113,29 @@ impl StepEnc<'_> {
             r.dispatch_threadgroups(grid, tg);
         } else {
             self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        }
+    }
+
+    fn sink_dispatch_indirect(&mut self, indirect_offset: usize, n: u32, tg: MTLSize) {
+        if self.recorder.is_some() {
+            // ICB replay uses fixed grids; compact indirect is only on the live encoder path.
+            let grid = MTLSize {
+                width: crate::kernels::sub::gemm_common::div_up(
+                    n as usize,
+                    crate::kernels::sub::gemm_common::n_tile(),
+                ),
+                height: N_EXPERTS,
+                depth: 1,
+            };
+            self.sink_dispatch(grid, tg);
+            return;
+        }
+        unsafe {
+            self.enc.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+                &self.bufs.moe_grouped_indirect,
+                indirect_offset,
+                tg,
+            );
         }
     }
 
@@ -1543,9 +1653,25 @@ impl StepEnc<'_> {
         layer: usize,
         layout: &ModelLayout,
     ) -> Result<(), Error> {
+        self.encode_layer_o_proj_gemm(layer, layout)?;
+        self.encode_layer_o_proj_tail(layer, layout)
+    }
+
+    fn encode_layer_o_proj_gemm(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
         let l = &layout.layers[layer];
         let o_k = if l.is_full != 0 { 8192 } else { 4096 };
-        self.gemm_q4(self.arena().attno_off(), self.arena().tmp_off(), l.o_proj, CANVAS as u32, HID as u32, o_k)?;
+        self.gemm_q4(
+            self.arena().attno_off(),
+            self.arena().tmp_off(),
+            l.o_proj,
+            CANVAS as u32,
+            HID as u32,
+            o_k,
+        )
+    }
+
+    fn encode_layer_o_proj_tail(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
+        let l = &layout.layers[layer];
         self.rmsnorm(self.arena().tmp_off(), self.arena().tmp_off(), l.post_attn_ln, HID as u32, CANVAS);
         self.residual(self.arena().hidden_off(), self.arena().tmp_off(), self.arena().stream_off(), 0, CANVAS * HID);
         Ok(())
@@ -1554,6 +1680,38 @@ impl StepEnc<'_> {
     fn encode_layer_dense_ffn(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
         let l = &layout.layers[layer];
         self.rmsnorm(self.arena().stream_off(), self.arena().tmp_off(), l.pre_ff_ln, HID as u32, CANVAS);
+        self.encode_layer_dense_gate_up(layer, layout)?;
+        self.glu(
+            self.arena().ffg_off(),
+            self.arena().ffu_off(),
+            self.arena().ffg_off(),
+            CANVAS * DENSE_FF as usize,
+        );
+        self.encode_layer_dense_down(layer, layout)?;
+        self.rmsnorm(
+            self.arena().dense_off(),
+            self.arena().dense_off(),
+            l.post_ff_ln_1,
+            HID as u32,
+            CANVAS,
+        );
+        Ok(())
+    }
+
+    fn encode_layer_dense_down(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
+        let l = &layout.layers[layer];
+        self.gemm_q4(
+            self.arena().ffg_off(),
+            self.arena().dense_off(),
+            l.mlp_down,
+            CANVAS as u32,
+            HID as u32,
+            DENSE_FF,
+        )
+    }
+
+    fn encode_layer_dense_gate_up(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
+        let l = &layout.layers[layer];
         if fused_gate_up_enabled() {
             let (segs, n_total) = gate_up_stacked_segments(l, self.arena());
             self.gemm_q4_stacked(
@@ -1581,27 +1739,6 @@ impl StepEnc<'_> {
                 HID as u32,
             )?;
         }
-        self.glu(
-            self.arena().ffg_off(),
-            self.arena().ffu_off(),
-            self.arena().ffg_off(),
-            CANVAS * DENSE_FF as usize,
-        );
-        self.gemm_q4(
-            self.arena().ffg_off(),
-            self.arena().dense_off(),
-            l.mlp_down,
-            CANVAS as u32,
-            HID as u32,
-            DENSE_FF,
-        )?;
-        self.rmsnorm(
-            self.arena().dense_off(),
-            self.arena().dense_off(),
-            l.post_ff_ln_1,
-            HID as u32,
-            CANVAS,
-        );
         Ok(())
     }
 
@@ -1652,6 +1789,9 @@ impl StepEnc<'_> {
             let layer_idx = layer as u32;
             self.sink_set_bytes(&layer_idx, 4);
             self.bind_debug_status(5);
+            self.sink_set_buffer(&self.bufs.moe_grouped_indirect, 0, 6);
+            let grid_info = moe_grouped_grid_info();
+            self.sink_set_bytes(&grid_info, 7);
             let count = if phase == 1 { 1 } else { CANVAS * TOP_K };
             self.dispatch_1d(&self.ps.bucket_fill, count, 256);
         }
@@ -1671,6 +1811,7 @@ impl StepEnc<'_> {
         _total_m: u32,
         k: u32,
         n: u32,
+        indirect_slot: usize,
     ) -> Result<(), Error> {
         let grouped_ps = self
             .ps
@@ -1689,17 +1830,14 @@ impl StepEnc<'_> {
             self.sink_set_buffer(&self.bufs.route, row_start_off, 4);
         let num_jobs = N_EXPERTS as u32;
         self.sink_set_bytes(&num_jobs, 5);
-        let grid = MTLSize {
-            width: crate::kernels::sub::gemm_common::div_up(n as usize, crate::kernels::sub::gemm_common::n_tile()),
-            height: N_EXPERTS,
-            depth: 1,
-        };
+        self.bind_route(6);
         let tg = MTLSize {
             width: crate::kernels::sub::gemm_common::THREADS_PER_TG,
             height: 1,
             depth: 1,
         };
-        self.sink_dispatch(grid, tg);
+        let indirect_offset = indirect_slot * 3 * std::mem::size_of::<u32>();
+        self.sink_dispatch_indirect(indirect_offset, n, tg);
         Ok(())
     }
 
@@ -1718,8 +1856,17 @@ impl StepEnc<'_> {
     }
 
     fn encode_moe_batched_gather(&mut self) -> Result<(), Error> {
-        let token_list_off = std::mem::offset_of!(RouteScratch, token_list);
+        self.encode_moe_batched_half_to_f32()?;
+        self.encode_moe_batched_gather_rows()
+    }
+
+    fn encode_moe_batched_half_to_f32(&mut self) -> Result<(), Error> {
         self.half_to_f32_buf(self.arena().moein_off(), CANVAS * HID);
+        Ok(())
+    }
+
+    fn encode_moe_batched_gather_rows(&mut self) -> Result<(), Error> {
+        let token_list_off = std::mem::offset_of!(RouteScratch, token_list);
         let gather_dims = [0u32, HID as u32];
         let gather_count = (MOE_SLOTS as usize) * HID;
         self.dispatch_1d_ranged(&self.ps.gather_rows, gather_count, 256, |this, base, _chunk| {
@@ -1753,6 +1900,7 @@ impl StepEnc<'_> {
             MOE_SLOTS,
             HID as u32,
             MOE_FF * 2,
+            0,
         )
     }
 
@@ -1784,6 +1932,7 @@ impl StepEnc<'_> {
             MOE_SLOTS,
             MOE_FF,
             HID as u32,
+            1,
         )
     }
 
@@ -3355,6 +3504,103 @@ impl StepRuntime {
         })
     }
 
+    fn time_enc_stage<F>(&mut self, f: F) -> Result<std::time::Duration, Error>
+    where
+        F: FnOnce(&mut StepEnc<'_>) -> Result<(), Error>,
+    {
+        use std::time::Instant;
+        let t0 = Instant::now();
+        self.dispatch_and_wait(f)?;
+        Ok(t0.elapsed())
+    }
+
+    /// Per-stage GPU timing inside `encode_layer` + MoE grouped/post (one submit per stage×layer).
+    fn profile_encode_subprofile(&mut self) -> Result<EncodeSubProfileResult, Error> {
+        let layout = self.layout;
+        let layers = self.layers;
+        let st_before: CanvasState = read_struct(&self.bufs.state);
+        let first_step = if st_before.step == 0 { 1u32 } else { 0u32 };
+
+        self.dispatch_and_wait(|enc| enc.encode_step_preamble(&layout, first_step))?;
+
+        let mut layer_prof = LayerEncodeSubProfile::default();
+        let mut moe_prof = MoeEncodeSubProfile::default();
+
+        for layer in 0..layers {
+            layer_prof.qkv_gemm +=
+                self.time_enc_stage(|e| e.encode_layer_qkv_gemm(layer, &layout))?;
+            layer_prof.qk_rope_kv +=
+                self.time_enc_stage(|e| e.encode_layer_qk_rope_kv_dispatch(layer, &layout))?;
+            layer_prof.attention +=
+                self.time_enc_stage(|e| e.encode_layer_attention_dispatch(layer, &layout))?;
+            layer_prof.o_proj_gemm +=
+                self.time_enc_stage(|e| e.encode_layer_o_proj_gemm(layer, &layout))?;
+            layer_prof.o_proj_tail +=
+                self.time_enc_stage(|e| e.encode_layer_o_proj_tail(layer, &layout))?;
+
+            let l = &layout.layers[layer];
+            layer_prof.dense_pre_norm += self.time_enc_stage(|e| {
+                e.rmsnorm(
+                    e.arena().stream_off(),
+                    e.arena().tmp_off(),
+                    l.pre_ff_ln,
+                    HID as u32,
+                    CANVAS,
+                );
+                Ok(())
+            })?;
+            layer_prof.dense_gate_up +=
+                self.time_enc_stage(|e| e.encode_layer_dense_gate_up(layer, &layout))?;
+            layer_prof.dense_glu += self.time_enc_stage(|e| {
+                e.glu(
+                    e.arena().ffg_off(),
+                    e.arena().ffu_off(),
+                    e.arena().ffg_off(),
+                    CANVAS * DENSE_FF as usize,
+                );
+                Ok(())
+            })?;
+            layer_prof.dense_down +=
+                self.time_enc_stage(|e| e.encode_layer_dense_down(layer, &layout))?;
+            layer_prof.dense_post_norm += self.time_enc_stage(|e| {
+                e.rmsnorm(
+                    e.arena().dense_off(),
+                    e.arena().dense_off(),
+                    l.post_ff_ln_1,
+                    HID as u32,
+                    CANVAS,
+                );
+                Ok(())
+            })?;
+            layer_prof.router +=
+                self.time_enc_stage(|e| e.encode_layer_router_buckets(layer, &layout))?;
+        }
+
+        for layer in 0..layers {
+            moe_prof.half_to_f32 +=
+                self.time_enc_stage(|e| e.encode_moe_batched_half_to_f32())?;
+            moe_prof.gather += self.time_enc_stage(|e| e.encode_moe_batched_gather_rows())?;
+            moe_prof.gate_up +=
+                self.time_enc_stage(|e| e.encode_moe_batched_gate_up(layer, &layout))?;
+            moe_prof.swiglu += self.time_enc_stage(|e| e.encode_moe_batched_swiglu())?;
+            moe_prof.down += self.time_enc_stage(|e| e.encode_moe_batched_down(layer, &layout))?;
+            moe_prof.scatter += self.time_enc_stage(|e| e.encode_moe_batched_scatter())?;
+        }
+
+        for layer in 0..layers {
+            moe_prof.post += self.time_enc_stage(|e| e.encode_layer_moe_post_norm(layer, &layout))?;
+            moe_prof.post +=
+                self.time_enc_stage(|e| e.encode_layer_moe_post_combine(layer, &layout))?;
+        }
+
+        Ok(EncodeSubProfileResult {
+            compile: std::time::Duration::ZERO,
+            layers,
+            layer: layer_prof,
+            moe: moe_prof,
+        })
+    }
+
     /// P2.2 Phase A: one command buffer + one GPU sync per denoise step.
     fn run_forward_once(&mut self, finish: StepFinishMode) -> Result<(), Error> {
         if let Some(ref dbg) = self.bufs.debug_status {
@@ -3601,6 +3847,7 @@ pub fn build_step_runtime(
         gemm_a: alloc_buffer(&ctx.device, gemm_a_bytes)?,
         gemm_b: alloc_buffer(&ctx.device, gemm_b_bytes)?,
         expert_layer_unique: alloc_buffer(&ctx.device, N_LAYERS * std::mem::size_of::<u32>())?,
+        moe_grouped_indirect: alloc_buffer(&ctx.device, MOE_GROUPED_INDIRECT_BYTES)?,
         arena_map,
         arena_layout_buf: {
             let b = alloc_buffer(&ctx.device, std::mem::size_of::<ArenaLayout>())?;
@@ -3609,6 +3856,7 @@ pub fn build_step_runtime(
         },
     };
     zero_buffer(&bufs.expert_layer_unique);
+    zero_buffer(&bufs.moe_grouped_indirect);
     zero_buffer(&bufs.arena);
     zero_buffer(&bufs.kvcache);
     zero_buffer(&bufs.logits);
@@ -4159,6 +4407,20 @@ fn rebucket_route_scratch(route: &mut RouteScratch) {
     }
     route.row_start[N_EXPERTS] = state.num_slots;
     route.num_slots = state.num_slots;
+    let mut has = [false; N_EXPERTS];
+    for row in &experts {
+        for &e in row {
+            has[e as usize] = true;
+        }
+    }
+    let mut active = 0u32;
+    for e in 0..N_EXPERTS {
+        if has[e] {
+            route.active_expert[active as usize] = e as u32;
+            active += 1;
+        }
+    }
+    route.num_active_experts = active;
     for (i, &tok) in state.token_list.iter().enumerate() {
         route.token_list[i] = tok;
         route.slot_list[i] = state.slot_list[i];
@@ -4734,6 +4996,17 @@ pub fn bench_step_kernel_profile(
     let finish = cfg.finish;
     rt.run_forward_once(finish)?;
     let mut prof = rt.profile_forward_once(finish)?;
+    prof.compile = build.compile;
+    Ok(prof)
+}
+
+pub fn bench_step_kernel_encode_subprofile(
+    model_dir: &Path,
+    cfg: StepSmokeConfig,
+) -> Result<EncodeSubProfileResult, Error> {
+    let (mut rt, build) = build_step_runtime(model_dir, &cfg)?;
+    rt.run_forward_once(cfg.finish)?;
+    let mut prof = rt.profile_encode_subprofile()?;
     prof.compile = build.compile;
     Ok(prof)
 }

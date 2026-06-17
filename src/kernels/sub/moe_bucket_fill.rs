@@ -70,7 +70,8 @@ fn scratch_from_fixture(f: &Fixture) -> RouteScratch {
         count: [0; crate::metal::N_EXPERTS],
         row_start: [0; crate::metal::N_EXPERTS + 1],
         num_slots: 0,
-        pad_route: 0,
+        num_active_experts: 0,
+        active_expert: [0; crate::metal::N_EXPERTS],
         token_list: [0; crate::metal::CANVAS * TOP_K],
         slot_list: [0; crate::metal::CANVAS * TOP_K],
         token_slot: [[0; TOP_K]; crate::metal::CANVAS],
@@ -106,25 +107,42 @@ use objc2_metal::{
     MTLSize,
 };
 
+#[repr(C)]
+struct MoeGroupedGridInfo {
+    gate_n: u32,
+    hid: u32,
+    n_tile: u32,
+    tpg: u32,
+}
+
 #[cfg(all(feature = "metal", target_os = "macos"))]
 fn run_phases(
     enc: &objc2::runtime::ProtocolObject<dyn MTLComputeCommandEncoder>,
     pipeline: &crate::metal::device::ComputePipeline,
     buf_route: &objc2::runtime::ProtocolObject<dyn MTLBuffer>,
     buf_expert_unique: &objc2::runtime::ProtocolObject<dyn MTLBuffer>,
+    buf_indirect: &objc2::runtime::ProtocolObject<dyn MTLBuffer>,
     f: &Fixture,
 ) {
     let dims = f.dims();
     let layer_idx = 0u32;
+    let grid_info = MoeGroupedGridInfo {
+        gate_n: 1408,
+        hid: 2816,
+        n_tile: 128,
+        tpg: 128,
+    };
     for phase in 0u32..3 {
         enc.setComputePipelineState(&pipeline.pipeline);
         unsafe {
             enc.setBuffer_offset_atIndex(Some(buf_route), 0, 0);
             enc.setBuffer_offset_atIndex(Some(buf_expert_unique), 0, 3);
+            enc.setBuffer_offset_atIndex(Some(buf_indirect), 0, 6);
         }
         gpu_common::set_bytes(enc, &phase, 1);
         gpu_common::set_bytes(enc, &dims, 2);
         gpu_common::set_bytes(enc, &layer_idx, 4);
+        gpu_common::set_bytes(enc, &grid_info, 7);
         let count = if phase == 1 { 1 } else { f.canvas() * f.top_k as usize };
         enc.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize {
@@ -155,6 +173,9 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let buf_expert_unique = pool
         .allocate(&ctx.device, std::mem::size_of::<u32>())
         .ok_or(Error::Format("alloc"))?;
+    let buf_indirect = pool
+        .allocate(&ctx.device, 24)
+        .ok_or(Error::Format("alloc"))?;
     let scratch = scratch_from_fixture(f);
     BufferPool::write_bytes(
         &buf_route,
@@ -168,7 +189,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
 
     let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
     let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
-    run_phases(&enc, &pipeline, &buf_route, &buf_expert_unique, f);
+    run_phases(&enc, &pipeline, &buf_route, &buf_expert_unique, &buf_indirect, f);
     enc.endEncoding();
     cmd.commit();
     cmd.waitUntilCompleted();

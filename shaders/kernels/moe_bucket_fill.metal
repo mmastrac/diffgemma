@@ -4,6 +4,7 @@ using namespace metal;
 #include "fc_axes.metal"
 #include "debug_status.metal"
 #include "moe_router_device.metal"
+#include "moe_grouped_dispatch.metal"
 
 /// Bucketing phases 0/1/2 (monolith k_bucket_fill).
 kernel void moe_bucket_fill(
@@ -13,6 +14,8 @@ kernel void moe_bucket_fill(
     device uint *layer_expert_unique [[buffer(3)]],
     constant uint &layer_idx [[buffer(4)]],
     device DebugStatus *dbg [[buffer(5)]],
+    device MoeGroupedIndirectGrid *indirect [[buffer(6)]],
+    constant MoeGroupedGridInfo &grid_info [[buffer(7)]],
     uint i [[thread_position_in_grid]]
 ) {
     if (K_SHAPE_ASSERT && (dims.canvas == 0u || dims.top_k == 0u || dims.n_experts == 0u)) {
@@ -36,8 +39,11 @@ kernel void moe_bucket_fill(
         if (i == 0u) {
             uint s = 0u;
             uint used = 0u;
+            uint ai = 0u;
             for (uint e = 0u; e < dims.n_experts; ++e) {
                 if (R->count[e] > 0u) {
+                    R->active_expert[ai] = e;
+                    ai++;
                     used++;
                 }
                 R->row_start[e] = s;
@@ -46,7 +52,19 @@ kernel void moe_bucket_fill(
             }
             R->row_start[dims.n_experts] = s;
             R->num_slots = s;
+            R->num_active_experts = used;
             layer_expert_unique[layer_idx] = used;
+            if (indirect != nullptr) {
+                const uint n_tile = max(grid_info.n_tile, 1u);
+                const uint gate_w = (grid_info.gate_n + n_tile - 1u) / n_tile;
+                const uint down_w = (grid_info.hid + n_tile - 1u) / n_tile;
+                indirect[0].threadgroups_per_grid[0] = gate_w;
+                indirect[0].threadgroups_per_grid[1] = used;
+                indirect[0].threadgroups_per_grid[2] = 1u;
+                indirect[1].threadgroups_per_grid[0] = down_w;
+                indirect[1].threadgroups_per_grid[1] = used;
+                indirect[1].threadgroups_per_grid[2] = 1u;
+            }
         }
     } else {
         uint slots = dims.canvas * dims.top_k;

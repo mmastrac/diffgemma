@@ -96,7 +96,7 @@ struct CanvasState {
 struct RouteScratch {
     half weight[256][8]; uint expert[256][8];
     uint count[128]; uint row_start[129];
-    uint num_slots; uint _pad_route;
+    uint num_slots; uint num_active_experts; uint active_expert[128];
     uint token_list[2048]; uint slot_list[2048];
     uint token_slot[256][8];
 };

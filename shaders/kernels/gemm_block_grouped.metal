@@ -7,6 +7,7 @@ using namespace metal;
 #include "gemm_block_tile.metal"
 #include "dequant.metal"
 #include "qgemm_grouped.metal"
+#include "moe_router_device.metal"
 
 /// Tiled grouped MoE GEMM: one expert segment per threadgroup row.
 /// `C[m,N] = A[m,K] @ W[job]^T` for rows `m in [row_starts[e], row_starts[e+1])`.
@@ -18,14 +19,15 @@ kernel void gemm_block_grouped(
     device const GroupedJob *jobs [[buffer(3)]],
     device const uint *row_starts [[buffer(4)]],
     constant uint &num_jobs [[buffer(5)]],
+    device const RouteScratch *route [[buffer(6)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 lid [[thread_position_in_threadgroup]],
     uint sgid [[simdgroup_index_in_threadgroup]]
 ) {
     const uint N = GEMM_N;
     const uint K = GEMM_K;
-    const uint e = tgid.y;
-    if (e >= num_jobs) {
+    const uint e = route->active_expert[tgid.y];
+    if (tgid.y >= route->num_active_experts || e >= num_jobs) {
         return;
     }
 

@@ -305,6 +305,7 @@ enum Command {
         forward_only: bool,
         profile: bool,
         profile_steps: usize,
+        layer_profile: bool,
     },
     BenchGemmFusion {
         layers: usize,
@@ -638,6 +639,7 @@ fn main() -> ExitCode {
             forward_only,
             profile,
             profile_steps,
+            layer_profile,
         } => run_bench_step_kernel_cmd(
             &cli.model_dir,
             layers,
@@ -648,6 +650,7 @@ fn main() -> ExitCode {
             forward_only,
             profile,
             profile_steps,
+            layer_profile,
         ),
         Command::BenchGemmFusion {
             layers,
@@ -2392,6 +2395,79 @@ fn run_step_parity_cmd(
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
+fn print_encode_subprofile(p: &metal::EncodeSubProfileResult) {
+    use metal::{LayerEncodeSubProfile, MoeEncodeSubProfile};
+    let layers = p.layers.max(1) as u32;
+    let layer_total = p.layer.total();
+    let moe_total = p.moe.total();
+    let grand = layer_total + moe_total;
+    let per_l = |d: std::time::Duration| d / layers;
+    let pct = |d: std::time::Duration| {
+        if grand.is_zero() {
+            0.0
+        } else {
+            100.0 * d.as_secs_f64() / grand.as_secs_f64()
+        }
+    };
+    let print_layer_rows = |label: &str, prof: &LayerEncodeSubProfile| {
+        let rows: [(&str, std::time::Duration); 11] = [
+            ("qkv_gemm", prof.qkv_gemm),
+            ("qk_rope_kv", prof.qk_rope_kv),
+            ("attention", prof.attention),
+            ("o_proj_gemm", prof.o_proj_gemm),
+            ("o_proj_tail", prof.o_proj_tail),
+            ("dense_pre_norm", prof.dense_pre_norm),
+            ("dense_gate_up", prof.dense_gate_up),
+            ("dense_glu", prof.dense_glu),
+            ("dense_down", prof.dense_down),
+            ("dense_post_norm", prof.dense_post_norm),
+            ("router", prof.router),
+        ];
+        println!("{label} (total {:.2?}, {:.1}%):", prof.total(), pct(prof.total()));
+        let mut ranked: Vec<_> = rows.iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        for (name, d) in ranked {
+            println!(
+                "  {:16} {:.2?}  ({:.1}%, {:.2?}/layer)",
+                name,
+                d,
+                pct(*d),
+                per_l(*d)
+            );
+        }
+    };
+    let print_moe_rows = |label: &str, prof: &MoeEncodeSubProfile| {
+        let rows: [(&str, std::time::Duration); 7] = [
+            ("half_to_f32", prof.half_to_f32),
+            ("gather", prof.gather),
+            ("gate_up", prof.gate_up),
+            ("swiglu", prof.swiglu),
+            ("down", prof.down),
+            ("scatter", prof.scatter),
+            ("post", prof.post),
+        ];
+        println!("{label} (total {:.2?}, {:.1}%):", prof.total(), pct(prof.total()));
+        let mut ranked: Vec<_> = rows.iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        for (name, d) in ranked {
+            println!(
+                "  {:16} {:.2?}  ({:.1}%, {:.2?}/layer)",
+                name,
+                d,
+                pct(*d),
+                per_l(*d)
+            );
+        }
+    };
+    println!("bench-step-kernel layer-profile ok");
+    println!("  compile:       {:.2?}", p.compile);
+    println!("  layers:        {}", p.layers);
+    print_layer_rows("encode_layer", &p.layer);
+    print_moe_rows("moe_grouped+post", &p.moe);
+    println!("  grand_total:   {:.2?}", grand);
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
 fn run_bench_step_kernel_cmd(
     model_dir: &std::path::Path,
     layers: usize,
@@ -2402,6 +2478,7 @@ fn run_bench_step_kernel_cmd(
     forward_only: bool,
     profile: bool,
     profile_steps: usize,
+    layer_profile: bool,
 ) -> ExitCode {
     use metal::bench_step_kernel;
 
@@ -2410,7 +2487,22 @@ fn run_bench_step_kernel_cmd(
         return ExitCode::FAILURE;
     }
     let cfg = step_kernel_config(layers, kv_len, seed, max_seq, forward_only);
-    if profile_steps > 0 {
+    if layer_profile {
+        use metal::bench_step_kernel_encode_subprofile;
+        eprintln!(
+            "bench-step-kernel --layer-profile: layers={layers} kv_len={kv_len} forward_only={forward_only}"
+        );
+        match bench_step_kernel_encode_subprofile(model_dir, cfg) {
+            Ok(p) => {
+                print_encode_subprofile(&p);
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("error: {err}");
+                ExitCode::FAILURE
+            }
+        }
+    } else if profile_steps > 0 {
         use metal::bench_step_kernel_profile_steps;
         eprintln!(
             "bench-step-kernel --profile-steps {profile_steps}: layers={layers} kv_len={kv_len}"
@@ -2531,6 +2623,7 @@ fn run_bench_step_kernel_cmd(
     _forward_only: bool,
     _profile: bool,
     _profile_steps: usize,
+    _layer_profile: bool,
 ) -> ExitCode {
     eprintln!("error: bench-step-kernel requires --features metal on macOS");
     ExitCode::FAILURE
@@ -2878,6 +2971,7 @@ fn parse_cli() -> Cli {
     let mut step_forward_only = false;
     let mut step_profile = false;
     let mut step_profile_steps = 0usize;
+    let mut step_layer_profile = false;
     let mut step_logit_positions = String::new();
     let mut step_logit_top_k = 10usize;
     let mut step_layer_position = 129usize;
@@ -3041,6 +3135,7 @@ fn parse_cli() -> Cli {
             }
             "--forward-only" => step_forward_only = true,
             "--step-profile" => step_profile = true,
+            "--layer-profile" => step_layer_profile = true,
             "--profile-steps" => {
                 if let Some(v) = args.next() {
                     step_profile_steps = v.parse().unwrap_or_else(|_| {
@@ -3576,6 +3671,7 @@ fn parse_cli() -> Cli {
             forward_only: step_forward_only,
             profile: step_profile,
             profile_steps: step_profile_steps,
+            layer_profile: step_layer_profile,
         },
         Some("bench-gemm-fusion") => Command::BenchGemmFusion {
             layers: bench_layers.max(1).min(30),
