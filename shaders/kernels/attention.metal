@@ -63,20 +63,15 @@ kernel void attention(
             d += arena_load(qv, i) * float(kk[i]);
         }
         d = simd_sum(d);
-        uint sg = ltid / 32u;
+        const uint sg = ltid / 32u;
         if ((ltid & 31u) == 0u) {
             red[sg] = d;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (ltid == 0u) {
-            float s = 0.f;
-            for (uint i = 0u; i < nsg; ++i) {
-                s += red[i];
-            }
-            red[0] = s;
+        d = 0.f;
+        for (uint i = 0u; i < nsg; ++i) {
+            d += red[i];
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        d = red[0];
         float mn = max(m, d);
         float corr = exp(m - mn);
         float p = exp(d - mn);

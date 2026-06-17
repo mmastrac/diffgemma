@@ -142,6 +142,47 @@ P1 quality gate cleared; focus shifts to step latency (ICB, SC fast path, fusion
 | P2.5 | lm_head over uncommitted positions only (`frozen[]` mask, compact→gather→partial GEMM→scatter) | Medium | **done** | Hello @ 30L: ~25% denoise time vs full lm_head (`DGQ_PARTIAL_LM_HEAD=0`); +33% denoise tok/s (36.8 vs 27.6) |
 | P2.6 | MPS Q8 lm_head; f16/f32 sweep | Medium | open | step <= 1.4 s stretch |
 
+#### P2.7 Profile-guided step kernel perf (`bench-step-kernel --layer-profile`)
+
+**Baseline (M3 Pro, `model/q4`, 30L, kv_len=0, 2026-06):** ~2.0–2.1 s/step full; layer sub-profile grand total ~1.5 s (excludes preamble/finish). Tooling: `--layer-profile` per-stage GPU timing inside `encode_layer` + MoE.
+
+**Done**
+
+| Target | ~Cost | Fix | Commit / status |
+|--------|-------|-----|-----------------|
+| MoE `gate_up` (grouped GEMM) | ~375–390 ms (25%) | Compact `active_expert[]` + indirect grid height (~62 vs 128 experts/layer) | `041d6fa` — modest e2e (~3–5%); empty-expert TGs were already cheap |
+| `half_to_f32` + `gather_rows` | ~8 + ~23 ms | Fused `gather_rows_bf16_to_f32` (bf16 `moein` → f32 scratch, no full-canvas convert) | `a99be6d` — bandwidth win; small wall time |
+| Stacked QKV / gate_up GEMM + 128 N-tile | part of pre_moe | `gemm_block_stacked` FC segments, default `N_TILE=128` | `4f5d1be`, `4727a04`, `8b45396` — isolated GEMM ~10% faster; neutral e2e |
+| Attention barrier merge (simdgroup dot sum) | part of attention | All threads sum `red[]` after one TG barrier; drop thread-0-only publish | 3→2 barriers/KV step; tail barrier kept for parity |
+
+**Open — `encode_layer` (pre-MoE)**
+
+| Priority | Stage | ~Cost | Options |
+|----------|-------|-------|---------|
+| 1 | **attention** | ~305 ms (20%) | Flash-style KV tiling (amortize softmax over `T`); **barrier reduction** — merged simdgroup dot-product barriers (3→2 per KV step; tail barrier required for `fusion_matches_unfused` parity); larger `tpg` / head tiling |
+| 2 | **qkv_gemm** | ~157 ms (11%) | Diminishing returns on tile size; fuse QK norm + RoPE adjacency to QKV dispatch |
+| 3 | **o_proj_gemm** | ~105 ms (7%) | Same as QKV — stacked fusion in place |
+| 4 | **dense_gate_up** | ~87 ms (6%) | Stacked fusion; optional fuse with pre-FF RMSNorm / GLU |
+| 5 | **router** | ~68 ms (5%) | Bucket kernels already GPU; profile bucket_fill phases |
+
+**Open — MoE grouped**
+
+| Priority | Stage | ~Cost | Options |
+|----------|-------|-------|---------|
+| 1 | **gate_up** + **down** | ~535 ms combined (~35%) | Grouped GEMM occupancy for small per-expert `M` (~33 tok/expert); fewer TG barriers per K-tile; **not** MPS grouped (NOTES: ~3.7k encodes/step) |
+| 2 | **scatter** | ~73 ms (5%) | Smaller grid or fuse with down output |
+| 3 | **swiglu** | ~10 ms | Fuse with gate_up output (low ROI) |
+
+**Open — coarse phases (`--step-profile`, not in layer sub-profile)**
+
+| Phase | ~Share | Options |
+|-------|--------|---------|
+| **Preamble (SC)** | ~20% (step ≥ 1) | Q8 SC GEMMs + softembed; cache SC params; ICB fast path (P2.2 / P2.3) |
+| **finish (lm_head)** | ~11% | Partial lm_head on (P2.5); Q8 lm_head tuning (P2.6) |
+| **Sync / submit** | implicit | Monolithic ICB replay; fewer command buffers per step |
+
+**Suggested execution order:** attention barriers/tiling → grouped GEMM small-`M` occupancy → SC/ICB (multi-step denoise) → cross-stage fusion (QKV+rope).
+
 **P2 exit:** `bench-step-kernel` <= 1.8 s/step @ 30L; >= 8 tok/s e2e with P1 active.
 
 ### P3 — Harden & ship
