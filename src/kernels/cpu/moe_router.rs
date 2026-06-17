@@ -142,12 +142,15 @@ pub fn moe_bucket_phases(experts: &[Vec<u32>], n_experts: u32, top_k: u32) -> Bu
 }
 
 pub fn pack_route_rows(rows: &[RouteRow]) -> Vec<f32> {
+    use crate::kernels::sub::bf16;
     let mut out = Vec::new();
     for row in rows {
         for &e in &row.experts {
             out.push(e as f32);
         }
-        out.extend_from_slice(&row.weights);
+        for &w in &row.weights {
+            out.push(bf16::store_bf16_round_half(w));
+        }
     }
     out
 }

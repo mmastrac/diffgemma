@@ -454,7 +454,9 @@ struct StepPipelines {
     gemm_q4: HashMap<(u32, u32), ComputePipeline>,
     gemm_nvfp4: HashMap<(u32, u32), ComputePipeline>,
     gemm_q8: HashMap<(u32, u32), ComputePipeline>,
+    gemm_q8_logits: HashMap<(u32, u32), ComputePipeline>,
     gemm_q8_rowk: HashMap<(u32, u32), ComputePipeline>,
+    gemm_q8_rowk_xfp16: HashMap<(u32, u32), ComputePipeline>,
     qk_rope_kv: ComputePipeline,
     attention: ComputePipeline,
     residual: ComputePipeline,
@@ -477,6 +479,7 @@ struct StepPipelines {
     sc_probs: ComputePipeline,
     sc_softembed: ComputePipeline,
     half_scale: ComputePipeline,
+    half_scale_fp16: ComputePipeline,
     softcap: ComputePipeline,
     sample_rowstats: ComputePipeline,
     sample_commit: ComputePipeline,
@@ -489,7 +492,9 @@ impl StepPipelines {
         let mut gemm_q4 = HashMap::new();
         let mut gemm_nvfp4 = HashMap::new();
         let mut gemm_q8 = HashMap::new();
+        let mut gemm_q8_logits = HashMap::new();
         let mut gemm_q8_rowk = HashMap::new();
+        let mut gemm_q8_rowk_xfp16 = HashMap::new();
         for &(n, k) in &[
             (4096u32, HID as u32),
             (2048, HID as u32),
@@ -519,6 +524,12 @@ impl StepPipelines {
                 (n, k),
                 crate::kernels::sub::gemm_q8::pipeline_for(ctx, n, k)?,
             );
+            if (n, k) == (VOCAB as u32, HID as u32) {
+                gemm_q8_logits.insert(
+                    (n, k),
+                    crate::kernels::sub::gemm_q8::pipeline_for_logits(ctx, n, k)?,
+                );
+            }
         }
         for &(n, k) in &[
             (HID as u32, VOCAB as u32),
@@ -527,6 +538,10 @@ impl StepPipelines {
             gemm_q8_rowk.insert(
                 (n, k),
                 crate::kernels::sub::gemm_q8_rowk::pipeline_for(ctx, n, k)?,
+            );
+            gemm_q8_rowk_xfp16.insert(
+                (n, k),
+                crate::kernels::sub::gemm_q8_rowk::pipeline_for_fp16_input(ctx, n, k)?,
             );
         }
         let mut q4_block_grouped = HashMap::new();
@@ -569,7 +584,9 @@ impl StepPipelines {
             gemm_q4,
             gemm_nvfp4,
             gemm_q8,
+            gemm_q8_logits,
             gemm_q8_rowk,
+            gemm_q8_rowk_xfp16,
             qk_rope_kv: crate::kernels::sub::qk_rope_kv::pipeline_for(ctx, prod)?,
             attention: crate::kernels::sub::attention::pipeline_for(ctx, prod)?,
             residual: crate::kernels::sub::residual_half::pipeline_for(ctx, prod)?,
@@ -600,6 +617,7 @@ impl StepPipelines {
             sc_probs: crate::kernels::sub::sc_probs::pipeline_for(ctx, prod)?,
             sc_softembed: crate::kernels::sub::sc_softembed::pipeline_for(ctx, prod)?,
             half_scale: crate::kernels::sub::half_scale::pipeline_for(ctx, prod)?,
+            half_scale_fp16: crate::kernels::sub::half_scale_fp16::pipeline_for(ctx, prod)?,
             softcap: crate::kernels::sub::softcap_half::pipeline_for(ctx, prod)?,
             sample_rowstats: crate::kernels::sub::sample_rowstats::pipeline_for(ctx, prod)?,
             sample_commit: crate::kernels::sub::sample_commit::pipeline_for(ctx, prod)?,
@@ -624,6 +642,18 @@ impl StepPipelines {
         self.gemm_q8
             .get(&(n, k))
             .ok_or(Error::Format("missing q8 pipeline"))
+    }
+
+    fn q8_logits(&self, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
+        self.gemm_q8_logits
+            .get(&(n, k))
+            .ok_or(Error::Format("missing q8 logits pipeline"))
+    }
+
+    fn q8_rowk_xfp16(&self, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
+        self.gemm_q8_rowk_xfp16
+            .get(&(n, k))
+            .ok_or(Error::Format("missing q8 rowk fp16-input pipeline"))
     }
 
     fn q8_rowk(&self, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
@@ -1092,7 +1122,7 @@ impl StepEnc<'_> {
         n: u32,
         k: u32,
     ) -> Result<(), Error> {
-        let ps = self.ps.q8(n, k)?;
+        let ps = self.ps.q8_logits(n, k)?;
         self.sink_set_pipeline(ps);
         self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
         self.bind_logits(1);
@@ -1123,7 +1153,7 @@ impl StepEnc<'_> {
         n: u32,
         k: u32,
     ) -> Result<(), Error> {
-        let ps = self.ps.q8_rowk(n, k)?;
+        let ps = self.ps.q8_rowk_xfp16(n, k)?;
         self.sink_set_pipeline(ps);
         self.sink_set_buffer(x_buf, 0, 0);
         self.sink_set_buffer(&self.bufs.arena, y_off as usize, 1);
@@ -1165,12 +1195,12 @@ impl StepEnc<'_> {
     }
 
     fn scale_half_logits(&mut self, elems: usize, scale: f32) {
-        self.sink_set_pipeline(&self.ps.half_scale);
+        self.sink_set_pipeline(&self.ps.half_scale_fp16);
         self.bind_logits(0);
         self.sink_set_bytes(&(elems as u32), 1);
         self.sink_set_bytes(&scale, 2);
         self.sink_set_buffer(&self.bufs.dummy_dump, 0, 3);
-        self.dispatch_1d(&self.ps.half_scale, elems, 256);
+        self.dispatch_1d(&self.ps.half_scale_fp16, elems, 256);
     }
 
     fn encode_sc_logit_rowstats(&mut self) {
@@ -2531,8 +2561,15 @@ fn half_buffer_stats(
 }
 
 fn arena_hidden_stats(arena: &ProtocolObject<dyn MTLBuffer>, layout: &ArenaLayout) -> (bool, f32, usize) {
-    let (finite, max_abs) =
-        half_buffer_stats(arena, layout.hidden_off() as usize, CANVAS * HID, CANVAS * HID);
+    let sample = read_arena_buffer_f32(arena, layout.hidden_off() as usize, CANVAS * HID);
+    let mut max_abs = 0.0f32;
+    let mut finite = true;
+    for v in sample.iter().step_by(HID) {
+        if !v.is_finite() {
+            finite = false;
+        }
+        max_abs = max_abs.max(v.abs());
+    }
     let non_finite = if finite { 0 } else { 1 };
     (finite, max_abs, non_finite)
 }
@@ -2844,7 +2881,7 @@ impl StepRuntime {
     pub fn fill_moe_out_dgq_cpu(&mut self, layer: usize) -> Result<(), Error> {
         let route: RouteScratch = read_struct(&self.bufs.route);
         let routes = routes_from_route_scratch(&route);
-        let moe_in = read_half_buffer_f32(&self.bufs.arena, self.bufs.arena_map.moein_off() as usize, CANVAS * HID);
+        let moe_in = read_arena_buffer_f32(&self.bufs.arena, self.bufs.arena_map.moein_off() as usize, CANVAS * HID);
         let mut moe_out = vec![0.0f32; CANVAS * HID];
         let mut scratch = MoeScratch::new(CANVAS, &self.text_config);
         experts_forward_dgq_cpu(
@@ -3317,7 +3354,7 @@ fn read_arena_row(
     width: usize,
 ) -> Vec<f32> {
     let byte_off = base as usize + row * width * 2;
-    read_half_buffer_f32(arena, byte_off, width)
+    read_arena_buffer_f32(arena, byte_off, width)
 }
 
 fn hidden_vec_stats(v: &[f32]) -> (f32, f32) {
@@ -3599,7 +3636,7 @@ pub fn run_step_attn_layer_capture(
         Ok(())
     })?;
 
-    let q_all = read_half_buffer_f32(&rt.bufs.arena, rt.bufs.arena_map.attnq_off() as usize, CANVAS * q_width);
+    let q_all = read_arena_buffer_f32(&rt.bufs.arena, rt.bufs.arena_map.attnq_off() as usize, CANVAS * q_width);
     let q_post_rope = read_arena_row(&rt.bufs.arena, rt.bufs.arena_map.attnq_off(), position, q_width);
     let attn_out = read_arena_row(&rt.bufs.arena, rt.bufs.arena_map.attno_off(), position, q_width);
     let k_cache = read_layer_k_cache_f32(rt.kvcache(), &layout, layer, total_kv);
@@ -3668,7 +3705,7 @@ fn routes_from_route_scratch(route: &RouteScratch) -> Vec<RouteResult> {
             .map(|k| route.expert[tok][k] as usize)
             .collect();
         let weights = (0..TOP_K)
-            .map(|k| f16_bits_to_f32(route.weight[tok][k]))
+            .map(|k| crate::kernels::sub::bf16::bf16_bits_to_f32(route.weight[tok][k]))
             .collect();
         routes.push(RouteResult { indices, weights });
     }
@@ -4330,7 +4367,20 @@ pub fn bench_step_kernel_profile_steps(
     Ok(out)
 }
 
-/// Read `elems` half values from a shared Metal buffer as f32.
+/// Read `elems` bf16 arena values from a shared Metal buffer as f32.
+pub fn read_arena_buffer_f32(
+    buf: &ProtocolObject<dyn MTLBuffer>,
+    byte_off: usize,
+    elems: usize,
+) -> Vec<f32> {
+    use crate::kernels::sub::bf16;
+    let ptr = unsafe { buf.contents().as_ptr().add(byte_off) as *const u16 };
+    (0..elems)
+        .map(|i| unsafe { bf16::bf16_bits_to_f32(*ptr.add(i)) })
+        .collect()
+}
+
+/// Read `elems` fp16 values from a shared Metal buffer as f32 (logits / KV cache).
 pub fn read_half_buffer_f32(
     buf: &ProtocolObject<dyn MTLBuffer>,
     byte_off: usize,
@@ -4366,7 +4416,7 @@ pub fn run_step_forward(model_dir: &Path, cfg: &StepSmokeConfig) -> Result<StepF
         enc.rmsnorm(enc.arena().hidden_off(), enc.arena().tmp_off(), layout.final_norm, HID as u32, CANVAS);
         Ok(())
     })?;
-    let norm_hidden = read_half_buffer_f32(&rt.bufs.arena, rt.bufs.arena_map.tmp_off() as usize, CANVAS * HID);
+    let norm_hidden = read_arena_buffer_f32(&rt.bufs.arena, rt.bufs.arena_map.tmp_off() as usize, CANVAS * HID);
     rt.dispatch_and_wait(|enc| {
         enc.gemm_q8_logits(
             enc.arena().tmp_off(),
@@ -4829,7 +4879,7 @@ mod tests {
             Ok(())
         })
         .expect("slow sc softembed");
-        let slow = read_half_buffer_f32(&rt.bufs.arena, rt.bufs.arena_map.soft_off() as usize, soft_elems);
+        let slow = read_arena_buffer_f32(&rt.bufs.arena, rt.bufs.arena_map.soft_off() as usize, soft_elems);
 
         rt.dispatch_and_wait(|enc| {
             enc.encode_sc_logit_rowstats();
@@ -4837,7 +4887,7 @@ mod tests {
             Ok(())
         })
         .expect("chunked sc softembed");
-        let fast = read_half_buffer_f32(&rt.bufs.arena, rt.bufs.arena_map.soft_off() as usize, soft_elems);
+        let fast = read_arena_buffer_f32(&rt.bufs.arena, rt.bufs.arena_map.soft_off() as usize, soft_elems);
 
         let mut dot = 0.0f64;
         let mut na = 0.0f64;
@@ -4887,7 +4937,7 @@ mod tests {
             Ok(())
         })
         .expect("full prob sc softembed");
-        let full = read_half_buffer_f32(&rt.bufs.arena, rt.bufs.arena_map.soft_off() as usize, soft_elems);
+        let full = read_arena_buffer_f32(&rt.bufs.arena, rt.bufs.arena_map.soft_off() as usize, soft_elems);
 
         rt.dispatch_and_wait(|enc| {
             enc.encode_sc_logit_rowstats();
@@ -4895,7 +4945,7 @@ mod tests {
             Ok(())
         })
         .expect("chunked sc softembed");
-        let chunked = read_half_buffer_f32(&rt.bufs.arena, rt.bufs.arena_map.soft_off() as usize, soft_elems);
+        let chunked = read_arena_buffer_f32(&rt.bufs.arena, rt.bufs.arena_map.soft_off() as usize, soft_elems);
 
         let mut dot = 0.0f64;
         let mut na = 0.0f64;
@@ -5011,7 +5061,7 @@ mod tests {
         })
         .expect("gpu chunked");
         let gpu_chunked =
-            read_half_buffer_f32(&rt.bufs.arena, rt.bufs.arena_map.soft_off() as usize, CANVAS * HID);
+            read_arena_buffer_f32(&rt.bufs.arena, rt.bufs.arena_map.soft_off() as usize, CANVAS * HID);
 
         let mut max_gpu = 0.0f32;
         for (a, b) in cpu_chunked.iter().zip(gpu_chunked.iter()) {

@@ -49,7 +49,7 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
     f.a
         .iter()
         .zip(f.b.iter())
-        .map(|(&a, &b)| f16::round_half((a + b) * s))
+        .map(|(&a, &b)| bf16::store_bf16_round_half((a + b) * s))
         .collect()
 }
 
@@ -99,8 +99,8 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let pipeline = pipeline_for(&ctx, variant)?;
     let mut pool = BufferPool::new();
     let len = f.len();
-    let a_f16 = f16::f32_slice_to_f16(&f.a);
-    let b_f16 = f16::f32_slice_to_f16(&f.b);
+    let a_f16 = bf16::f32_slice_to_bf16_bits(&f.a);
+    let b_f16 = bf16::f32_slice_to_bf16_bits(&f.b);
     let buf_a = pool.allocate(&ctx.device, len * 2).ok_or(Error::Format("alloc"))?;
     let buf_b = pool.allocate(&ctx.device, len * 2).ok_or(Error::Format("alloc"))?;
     let buf_y = pool.allocate(&ctx.device, len * 2).ok_or(Error::Format("alloc"))?;
@@ -125,7 +125,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     })?;
     let ptr = buf_y.contents().as_ptr() as *const u16;
     Ok((0..len)
-        .map(|i| f16::f16_bits_to_f32(unsafe { *ptr.add(i) }))
+        .map(|i| bf16::bf16_bits_to_f32(unsafe { *ptr.add(i) }))
         .collect())
 }
 

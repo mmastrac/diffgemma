@@ -1,6 +1,6 @@
-//! Convert fp16 arena slice to f32 (monolith step-kernel path).
+//! Convert bf16 arena slice to f32 (monolith step-kernel path).
 
-use super::f16;
+use super::bf16;
 use super::gpu_common;
 use super::test_util::ElemFormat;
 use super::variant::KernelVariant;
@@ -82,9 +82,9 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let ctx = MetalContext::new()?;
     let pipeline = pipeline_for(&ctx, variant)?;
     let mut pool = BufferPool::new();
-    let x_f16 = f16::f32_slice_to_f16(&f.x);
+    let x_bf16 = bf16::f32_slice_to_bf16_bits(&f.x);
     let buf_x = pool
-        .allocate(&ctx.device, x_f16.len() * 2)
+        .allocate(&ctx.device, x_bf16.len() * 2)
         .ok_or(Error::Format("alloc"))?;
     let buf_y = pool
         .allocate(&ctx.device, f.x.len() * 4)
@@ -95,7 +95,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         4
     };
     let buf_d = pool.allocate(&ctx.device, dump_bytes).ok_or(Error::Format("alloc"))?;
-    BufferPool::write_bf16(&buf_x, &x_f16);
+    BufferPool::write_bf16(&buf_x, &x_bf16);
     gpu_common::dispatch_1d(&ctx.queue, &pipeline.pipeline, f.len as usize, |enc| {
         bind_gpu_buffers(enc, &buf_x, &buf_y, &buf_d, f.base, f.len);
     })?;

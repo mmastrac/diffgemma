@@ -216,9 +216,9 @@ fn pack_out(q: &[f32], k: &[f32], kvcache: &[f32], f: &Fixture) -> Vec<f32> {
 }
 
 pub fn cpu(f: &Fixture) -> Vec<f32> {
-    let mut q = f16::f16_slice_to_f32(&f16::f32_slice_to_f16(&f.q));
-    let mut k = f16::f16_slice_to_f32(&f16::f32_slice_to_f16(&f.k));
-    let mut v = f16::f16_slice_to_f32(&f16::f32_slice_to_f16(&f.v));
+    let mut q = bf16::bf16_slice_to_f32(&bf16::f32_slice_to_bf16_bits(&f.q));
+    let mut k = bf16::bf16_slice_to_f32(&bf16::f32_slice_to_bf16_bits(&f.k));
+    let mut v = bf16::bf16_slice_to_f32(&bf16::f32_slice_to_bf16_bits(&f.v));
     let mut kvcache = f.kvcache.clone();
     attention::qk_rope_kv(
         &mut q,
@@ -232,6 +232,12 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
         f.n_q_heads,
         f.kv_len,
     );
+    for v in q.iter_mut().chain(k.iter_mut()) {
+        *v = bf16::store_bf16_round_half(*v);
+    }
+    for v in kvcache.iter_mut() {
+        *v = f16::round_half(bf16::round_bf16_f32(*v));
+    }
     pack_out(&q, &k, &kvcache, f)
 }
 
@@ -286,9 +292,9 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         .allocate(&ctx.device, std::mem::size_of::<LayerOffsets>())
         .ok_or(Error::Format("alloc"))?;
 
-    BufferPool::write_bf16(&buf_q, &f16::f32_slice_to_f16(&f.q));
-    BufferPool::write_bf16(&buf_k, &f16::f32_slice_to_f16(&f.k));
-    BufferPool::write_bf16(&buf_v, &f16::f32_slice_to_f16(&f.v));
+    BufferPool::write_bf16(&buf_q, &bf16::f32_slice_to_bf16_bits(&f.q));
+    BufferPool::write_bf16(&buf_k, &bf16::f32_slice_to_bf16_bits(&f.k));
+    BufferPool::write_bf16(&buf_v, &bf16::f32_slice_to_bf16_bits(&f.v));
     BufferPool::write_bf16(&buf_kv, &f16::f32_slice_to_f16(&f.kvcache));
     BufferPool::write_bytes(&buf_blob, &blob);
     let layer = layer_offsets(f);
@@ -353,12 +359,15 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let read_half = |buf: &objc2::runtime::ProtocolObject<dyn MTLBuffer>, out: &mut [f32]| {
         let ptr = buf.contents().as_ptr() as *const u16;
         for (i, o) in out.iter_mut().enumerate() {
-            *o = f16::f16_bits_to_f32(unsafe { *ptr.add(i) });
+            *o = bf16::bf16_bits_to_f32(unsafe { *ptr.add(i) });
         }
     };
     read_half(&buf_q, &mut q);
     read_half(&buf_k, &mut k);
-    read_half(&buf_kv, &mut kvcache);
+    let ptr_kv = buf_kv.contents().as_ptr() as *const u16;
+    for (i, o) in kvcache.iter_mut().enumerate() {
+        *o = f16::f16_bits_to_f32(unsafe { *ptr_kv.add(i) });
+    }
     Ok(pack_out(&q, &k, &kvcache, f))
 }
 

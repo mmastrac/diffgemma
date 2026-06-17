@@ -3,15 +3,15 @@ using namespace metal;
 
 #include "fc_axes.metal"
 #include "debug_status.metal"
-#include "common.metal"
+#include "arena.metal"
 #include "attention_device.metal"
 #include "sampler_device.metal"
 
 /// Per-head Q/K RMSNorm + split-half RoPE + KV cache write (monolith step path).
 kernel void qk_rope_kv(
-    device half *q [[buffer(0)]],
-    device half *k [[buffer(1)]],
-    device half *v [[buffer(2)]],
+    device ushort *q [[buffer(0)]],
+    device ushort *k [[buffer(1)]],
+    device ushort *v [[buffer(2)]],
     device half *kvcache [[buffer(3)]],
     device const uchar *blob [[buffer(4)]],
     device const LayerOffsets *L [[buffer(5)]],
@@ -41,13 +41,13 @@ kernel void qk_rope_kv(
     const bool isQ = h < dims.n_q_heads;
     const bool isK = !isQ && h < (dims.n_q_heads + nkv);
     const uint hh = isQ ? h : (h - dims.n_q_heads) % nkv;
-    device half *src = isQ ? (q + (ulong)tok * dims.n_q_heads * hd + hh * hd)
+    device ushort *src = isQ ? (q + (ulong)tok * dims.n_q_heads * hd + hh * hd)
                      : isK ? (k + (ulong)tok * nkv * hd + hh * hd)
                      : ((L->v_proj != 0ul ? v : k) + (ulong)tok * nkv * hd + hh * hd);
 
     float ss = 0.f;
     for (uint i = 0u; i < hd; ++i) {
-        float t = float(src[i]);
+        float t = arena_load(src, i);
         ss += t * t;
     }
     float inv = rsqrt(ss / float(hd) + ATTN_RMS_EPS);
@@ -57,7 +57,7 @@ kernel void qk_rope_kv(
         // Full-attn layers alias V from raw k_proj: do not mutate `k` in place on the K path.
         float head[512];
         for (uint i = 0u; i < hd; ++i) {
-            head[i] = float(src[i]) * inv * bf16_bytes(blob + noff + 2ul * i);
+            head[i] = arena_load(src, i) * inv * bf16_bytes(blob + noff + 2ul * i);
         }
         if (full) {
             apply_proportional_rope_f32(head, rot, hd, theta, pos);
@@ -67,23 +67,23 @@ kernel void qk_rope_kv(
         if (isK) {
             device half *dst = kvcache + L->kv_region / 2 + (ulong)pos * nkv * hd * 2u + hh * hd;
             for (uint i = 0u; i < hd; ++i) {
-                dst[i] = half(head[i]);
+                dst[i] = half(f32_round_bf16(head[i]));
             }
             if (L->v_proj != 0ul) {
                 for (uint i = 0u; i < hd; ++i) {
-                    src[i] = half(head[i]);
+                    arena_store(src, i, head[i]);
                 }
             }
         } else {
             for (uint i = 0u; i < hd; ++i) {
-                src[i] = half(head[i]);
+                arena_store(src, i, head[i]);
             }
         }
     } else {
         device half *dst = kvcache + L->kv_region / 2 + (ulong)pos * nkv * hd * 2u
             + (ulong)nkv * hd + hh * hd;
         for (uint i = 0u; i < hd; ++i) {
-            dst[i] = half(float(src[i]) * inv);
+            dst[i] = half(f32_round_bf16(arena_load(src, i) * inv));
         }
     }
 }

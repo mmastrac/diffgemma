@@ -1,7 +1,7 @@
 //! Weighted scatter of batched MoE expert outputs to canvas rows.
 
+use super::bf16;
 use super::gpu_common;
-use super::f16;
 use super::test_util::ElemFormat;
 use super::variant::KernelVariant;
 use crate::metal::RouteScratch;
@@ -36,8 +36,8 @@ pub fn tiny_fixture(_: ElemFormat) -> Fixture {
         token_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
         slot_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
     };
-    route.weight[0][0] = f16::f32_to_f16_bits(0.5);
-    route.weight[1][0] = f16::f32_to_f16_bits(1.0);
+    route.weight[0][0] = bf16::f32_to_bf16_bits(0.5);
+    route.weight[1][0] = bf16::f32_to_bf16_bits(1.0);
     route.token_list[0] = 0;
     route.token_list[1] = 1;
     route.row_start[0] = 0;
@@ -64,14 +64,14 @@ pub fn moe_routing_fixture(_: ElemFormat) -> Fixture {
     };
     route.token_list[..8].copy_from_slice(&[5, 5, 17, 33, 17, 99, 12, 44]);
     route.slot_list[..8].copy_from_slice(&[0, 1, 0, 0, 1, 0, 0, 0]);
-    route.weight[5][0] = f16::f32_to_f16_bits(0.6);
-    route.weight[5][1] = f16::f32_to_f16_bits(0.4);
-    route.weight[17][0] = f16::f32_to_f16_bits(0.75);
-    route.weight[17][1] = f16::f32_to_f16_bits(0.25);
-    route.weight[33][0] = f16::f32_to_f16_bits(1.0);
-    route.weight[99][0] = f16::f32_to_f16_bits(0.5);
-    route.weight[12][0] = f16::f32_to_f16_bits(0.8);
-    route.weight[44][0] = f16::f32_to_f16_bits(0.3);
+    route.weight[5][0] = bf16::f32_to_bf16_bits(0.6);
+    route.weight[5][1] = bf16::f32_to_bf16_bits(0.4);
+    route.weight[17][0] = bf16::f32_to_bf16_bits(0.75);
+    route.weight[17][1] = bf16::f32_to_bf16_bits(0.25);
+    route.weight[33][0] = bf16::f32_to_bf16_bits(1.0);
+    route.weight[99][0] = bf16::f32_to_bf16_bits(0.5);
+    route.weight[12][0] = bf16::f32_to_bf16_bits(0.8);
+    route.weight[44][0] = bf16::f32_to_bf16_bits(0.3);
     let expert_out: Vec<f32> = (0..8 * hidden)
         .map(|i| (i as f32 + 1.0) * 0.1)
         .collect();

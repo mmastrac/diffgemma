@@ -3,10 +3,11 @@ using namespace metal;
 
 #include "fc_axes.metal"
 #include "debug_status.metal"
+#include "arena.metal"
 
 kernel void f32_to_half(
     device const float *x [[buffer(0)]],
-    device half *y [[buffer(1)]],
+    device ushort *y [[buffer(1)]],
     constant uint &base [[buffer(2)]],
     constant uint &len [[buffer(3)]],
     device float *dump [[buffer(4)]],
@@ -18,5 +19,5 @@ kernel void f32_to_half(
     uint i = base + gid;
     float v = x[i];
     if (K_DUMP_STAGE >= 1u) dump[gid] = v;
-    y[i] = half(v);
+    arena_store(y, i, v);
 }

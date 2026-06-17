@@ -3,9 +3,10 @@ using namespace metal;
 
 #include "fc_axes.metal"
 #include "debug_status.metal"
+#include "arena.metal"
 
 kernel void half_to_f32(
-    device const half *x [[buffer(0)]],
+    device const ushort *x [[buffer(0)]],
     device float *y [[buffer(1)]],
     constant uint &base [[buffer(2)]],
     constant uint &len [[buffer(3)]],
@@ -16,7 +17,7 @@ kernel void half_to_f32(
     if (gid >= len) return;
     K_ELEMENTWISE_GUARD();
     uint i = base + gid;
-    float v = float(x[i]);
+    float v = arena_load(x, i);
     if (K_DUMP_STAGE >= 1u) dump[gid] = v;
     y[i] = v;
 }

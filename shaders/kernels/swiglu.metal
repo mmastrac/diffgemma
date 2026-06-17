@@ -3,7 +3,9 @@ using namespace metal;
 
 #include "fc_axes.metal"
 #include "debug_status.metal"
+#include "common.metal"
 #include "activations.metal"
+#include "arena.metal"
 
 constant uint K_IO_DTYPE [[function_constant(4)]];
 constant bool K_GELU_GATE [[function_constant(5)]];
@@ -34,11 +36,11 @@ kernel void swiglu(
     }
 
     if (K_IO_DTYPE == ELEM_HALF) {
-        device const half *gate = (device const half *)gate_base;
-        device const half *up = (device const half *)up_buf;
-        device half *out = (device half *)out_buf;
-        float g = float(gate[gid]);
-        float u = float(up[gid]);
+        device const ushort *gate = (device const ushort *)gate_base;
+        device const ushort *up = (device const ushort *)up_buf;
+        device ushort *out = (device ushort *)out_buf;
+        float g = arena_load(gate, gid);
+        float u = arena_load(up, gid);
         if (K_GELU_GATE) {
             g = gelu_tanh(g);
         }
@@ -46,7 +48,7 @@ kernel void swiglu(
         if (K_DUMP_STAGE >= 1u) {
             dump[gid] = v;
         }
-        out[gid] = half(v);
+        arena_store(out, gid, v);
         return;
     }
 

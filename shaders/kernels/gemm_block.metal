@@ -5,11 +5,12 @@ using namespace metal;
 
 #include "gemm_fc.metal"
 #include "dequant.metal"
+#include "arena.metal"
 
 /// y[M,N] = x[M,K] @ W[N,K]^T ; format from K_QUANT_FORMAT (FC3). Threadgroup (128,1,1).
 kernel void gemm_block(
-    device const half *x [[buffer(0)]],
-    device half *y [[buffer(1)]],
+    device const ushort *x [[buffer(0)]],
+    device ushort *y [[buffer(1)]],
     device const uchar *blob [[buffer(2)]],
     constant ulong &w_off [[buffer(3)]],
     constant uint &M [[buffer(4)]],
@@ -39,7 +40,7 @@ kernel void gemm_block(
     for (uint k0 = 0; k0 < K; k0 += 32) {
         for (uint i = ltid; i < 32 * 32; i += 128) {
             uint mm = i / 32, kk = i % 32;
-            tx[mm][kk] = (m0 + mm < M) ? x[(ulong)(m0 + mm) * K + k0 + kk] : half(0);
+            tx[mm][kk] = (m0 + mm < M) ? half(arena_load(x, (ulong)(m0 + mm) * K + k0 + kk)) : half(0);
         }
         for (uint r = ltid; r < 32; r += 128) {
             if (is_nvfp4) {
@@ -75,7 +76,7 @@ kernel void gemm_block(
     for (uint i = ltid; i < 32 * 32; i += 128) {
         uint mm = i / 32, nn = i % 32;
         if (m0 + mm < M && n0 + nn < N) {
-            y[(ulong)(m0 + mm) * N + n0 + nn] = half(ty[mm][nn]);
+            arena_store(y, (ulong)(m0 + mm) * N + n0 + nn, ty[mm][nn]);
         }
     }
 }

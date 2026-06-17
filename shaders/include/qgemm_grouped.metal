@@ -2,6 +2,7 @@
 #define DGQ_INCLUDE_QGEMM_GROUPED_METAL
 
 #include "dequant.metal"
+#include "arena.metal"
 
 struct GroupedJob {
     ulong w_byte_off;
@@ -52,7 +53,7 @@ inline float dot_nvfp4_k32(
 }
 
 inline float dot_nvfp4_k32_half(
-    device const half *a_row,
+    device const ushort *a_row,
     device const uchar *row,
     uint k_dim,
     uint k0,
@@ -74,7 +75,7 @@ inline float dot_nvfp4_k32_half(
         device const uchar *packed = upper ? packed1 : packed0;
         uchar byte = packed[local / 2u];
         uint q = (local & 1u) ? uint(byte >> 4) : uint(byte & 0x0Fu);
-        sum = fma(float(a_row[k0 + i]), e2m1_to_f32(q) * scale, sum);
+        sum = fma(arena_load(a_row, k0 + i), e2m1_to_f32(q) * scale, sum);
     }
     return sum;
 }

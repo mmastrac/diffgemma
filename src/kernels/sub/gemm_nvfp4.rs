@@ -1,5 +1,6 @@
 //! Tiled NVFP4 GEMM: `y[M,N] = x[M,K] @ Wnvfp4[N,K]^T` (monolith `k_gemm_nvfp4` body).
 
+use super::bf16;
 use super::f16;
 use super::gemm_common;
 use super::test_util::ElemFormat;
@@ -88,7 +89,7 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
     let body = &w[NVFP4_HEADER_BYTES..];
     let mut out = vec![0.0f32; f.out_len()];
     nvfp4_gemm_cpu(&f.x, f.m, f.k, body, f.n, gscale, &mut out);
-    out.iter().map(|&v| f16::round_half(v)).collect()
+    out.iter().map(|&v| bf16::store_bf16_round_half(v)).collect()
 }
 
 pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
@@ -108,6 +109,8 @@ pub fn pipeline_for(
         k,
         false,
         super::QuantFormat::NvFp4 as u32,
+        false,
+        false,
     )
 }
 
@@ -154,7 +157,7 @@ pub fn gpu(f: &Fixture, _variant: super::KernelVariant) -> Result<Vec<f32>, Erro
     let buf_w = pool
         .allocate(&ctx.device, w_nvfp4.len())
         .ok_or(Error::Format("alloc"))?;
-    BufferPool::write_bf16(&buf_x, &f16::f32_slice_to_f16(&f.x));
+    BufferPool::write_bf16(&buf_x, &bf16::f32_slice_to_bf16_bits(&f.x));
     BufferPool::write_bytes(&buf_w, &w_nvfp4);
     let (grid, tg) = gemm_common::dispatch_shape(f.m, f.n);
     let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
@@ -167,7 +170,7 @@ pub fn gpu(f: &Fixture, _variant: super::KernelVariant) -> Result<Vec<f32>, Erro
     cmd.waitUntilCompleted();
     let ptr = buf_y.contents().as_ptr() as *const u16;
     Ok((0..f.out_len())
-        .map(|i| f16::f16_bits_to_f32(unsafe { *ptr.add(i) }))
+        .map(|i| bf16::bf16_bits_to_f32(unsafe { *ptr.add(i) }))
         .collect())
 }
 

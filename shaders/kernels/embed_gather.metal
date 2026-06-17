@@ -3,14 +3,14 @@ using namespace metal;
 
 #include "fc_axes.metal"
 #include "debug_status.metal"
-#include "common.metal"
+#include "arena.metal"
 #include "dequant.metal"
 
 /// Gather Q8 embed rows by token id: out[tok,d] = dequant(embed[id], d) * embed_scale.
 kernel void embed_gather(
     device const uchar *blob [[buffer(0)]],
     device const uint *ids [[buffer(1)]],
-    device half *out [[buffer(2)]],
+    device ushort *out [[buffer(2)]],
     constant ulong &w_off [[buffer(3)]],
     constant uint2 &dims [[buffer(4)]],
     constant float &embed_scale [[buffer(5)]],
@@ -36,9 +36,9 @@ kernel void embed_gather(
         dgq_assert_token_id(dbg, DbgKernelEmbedGather, id, vocab);
     }
     device const uchar *row = blob + w_off + (ulong)id * q8_row_bytes(hidden);
-    half v = half(q8_at(row, d, bf16_bytes(row)) * embed_scale);
+    float v = q8_at(row, d, bf16_bytes(row)) * embed_scale;
     if (dgq_debug_deep_enabled() && d == 0u) {
-        dgq_assert_finite_f32(dbg, DbgKernelEmbedGather, float(v), tok);
+        dgq_assert_finite_f32(dbg, DbgKernelEmbedGather, v, tok);
     }
-    out[(ulong)tok * hidden + d] = v;
+    arena_store(out, (ulong)tok * hidden + d, v);
 }

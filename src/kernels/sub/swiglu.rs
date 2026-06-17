@@ -1,5 +1,6 @@
 //! SwiGLU family: gate×up with layout/dtype/gelu/in-place compile-time axes.
 
+use super::bf16;
 use super::f16;
 use super::gpu_common;
 use super::test_util::ElemFormat;
@@ -77,7 +78,7 @@ pub fn cpu_half_glu(f: &HalfFixture) -> Vec<f32> {
     f.gate
         .iter()
         .zip(f.up.iter())
-        .map(|(&g, &u)| f16::round_half(gelu_pytorch_tanh_f32(g) * u))
+        .map(|(&g, &u)| bf16::store_bf16_round_half(gelu_pytorch_tanh_f32(g) * u))
         .collect()
 }
 
@@ -86,7 +87,7 @@ pub fn cpu_oracle_half_glu(f: &HalfFixture) -> Vec<f32> {
     gelu_pytorch_tanh(&mut gate);
     gate.iter()
         .zip(f.up.iter())
-        .map(|(&g, &u)| f16::round_half(g * u))
+        .map(|(&g, &u)| bf16::store_bf16_round_half(g * u))
         .collect()
 }
 
@@ -132,7 +133,7 @@ pub fn cpu_interleaved(f: &InterleavedFixture) -> Vec<f32> {
             let off = b * (2 * mi) + j;
             let g = gelu_pytorch_tanh_f32(f.gate_up[off]);
             let u = f.gate_up[off + mi];
-            out[b * mi + j] = g * u;
+            out[b * mi + j] = bf16::round_bf16_f32(g * u);
         }
     }
     out
@@ -148,7 +149,7 @@ pub fn cpu_oracle_interleaved(f: &InterleavedFixture) -> Vec<f32> {
             gelu_pytorch_tanh(&mut g);
             g.into_iter()
                 .zip(row[mi..].iter())
-                .map(|(gv, &u)| gv * u)
+                .map(|(gv, &u)| bf16::round_bf16_f32(gv * u))
                 .collect::<Vec<_>>()
         })
         .collect();
@@ -307,8 +308,8 @@ pub fn gpu_half_glu(f: &HalfFixture, variant: KernelVariant) -> Result<Vec<f32>,
     let buf_y = pool.allocate(&ctx.device, len * 2).ok_or(Error::Format("alloc"))?;
     let dump_bytes = if variant.dump_stage > 0 { len * 4 } else { 4 };
     let buf_d = pool.allocate(&ctx.device, dump_bytes).ok_or(Error::Format("alloc"))?;
-    BufferPool::write_bf16(&buf_g, &f16::f32_slice_to_f16(&f.gate));
-    BufferPool::write_bf16(&buf_u, &f16::f32_slice_to_f16(&f.up));
+    BufferPool::write_bf16(&buf_g, &bf16::f32_slice_to_bf16_bits(&f.gate));
+    BufferPool::write_bf16(&buf_u, &bf16::f32_slice_to_bf16_bits(&f.up));
     gpu_common::dispatch_1d(&ctx.queue, &pipeline.pipeline, len, |enc| {
         bind_split_half(
             enc,
@@ -321,7 +322,7 @@ pub fn gpu_half_glu(f: &HalfFixture, variant: KernelVariant) -> Result<Vec<f32>,
     })?;
     let ptr = buf_y.contents().as_ptr() as *const u16;
     Ok((0..len)
-        .map(|i| f16::f16_bits_to_f32(unsafe { *ptr.add(i) }))
+        .map(|i| bf16::bf16_bits_to_f32(unsafe { *ptr.add(i) }))
         .collect())
 }
 

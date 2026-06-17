@@ -4,6 +4,7 @@ using namespace metal;
 #include "fc_axes.metal"
 #include "debug_status.metal"
 #include "common.metal"
+#include "arena.metal"
 
 constant uint K_IN_DTYPE [[function_constant(4)]];
 
@@ -12,7 +13,7 @@ constant float RMS_EPS = 1e-6f;
 /// Threadgroup RMSNorm (monolith): f32 or half in, half out, optional bf16 weight blob.
 kernel void rms_norm_rows_tiled(
     device const float *x_base [[buffer(0)]],
-    device half *y [[buffer(1)]],
+    device ushort *y [[buffer(1)]],
     device const uchar *blob [[buffer(2)]],
     constant ulong &w_off [[buffer(3)]],
     constant uint &dim [[buffer(4)]],
@@ -35,10 +36,9 @@ kernel void rms_norm_rows_tiled(
             acc += v * v;
         }
     } else {
-        device const half *xh = (device const half *)x_base;
-        device const half *xr = xh + (ulong)row * dim;
+        device const ushort *xr = (device const ushort *)x_base + (ulong)row * dim;
         for (uint i = lid; i < dim; i += tpg) {
-            float v = float(xr[i]);
+            float v = arena_load(xr, i);
             acc += v * v;
         }
     }
@@ -58,13 +58,12 @@ kernel void rms_norm_rows_tiled(
         float v;
         if (K_IN_DTYPE == ELEM_F32) {
             device const float *xr = x_base + (ulong)row * dim;
-            v = xr[i] * inv;
+            v = f32_round_bf16(xr[i]) * inv;
         } else {
-            device const half *xh = (device const half *)x_base;
-            device const half *xr = xh + (ulong)row * dim;
-            v = float(xr[i]) * inv;
+            device const ushort *xr = (device const ushort *)x_base + (ulong)row * dim;
+            v = arena_load(xr, i) * inv;
         }
         if (w_off != 0) v *= bf16_bytes(blob + w_off + 2ul * i);
-        y[(ulong)row * dim + i] = half(v);
+        arena_store(y, (ulong)row * dim + i, v);
     }
 }

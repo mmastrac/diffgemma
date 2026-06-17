@@ -3,8 +3,10 @@ using namespace metal;
 
 #include "fc_axes.metal"
 #include "debug_status.metal"
+#include "common.metal"
 #include "moe_router_device.metal"
 #include "moe_grouped_device.metal"
+#include "arena.metal"
 
 /// Weighted scatter: `[num_slots, hidden]` expert rows → canvas `moe_out`.
 kernel void moe_scatter_weighted(
@@ -27,8 +29,7 @@ kernel void moe_scatter_weighted(
     }
     uint tok = R->token_list[slot];
     uint kk = R->slot_list[slot];
-    float w = float(R->weight[tok][kk]);
-    atomic_add_f32(
-        (device atomic_uint *)&moe_out[(ulong)tok * hidden + d],
-        w * expert_out[(ulong)slot * hidden + d]);
+    float w = bf16_to_f32(as_type<ushort>(R->weight[tok][kk]));
+    float v = f32_round_bf16(w * f32_round_bf16(expert_out[(ulong)slot * hidden + d]));
+    atomic_add_f32((device atomic_uint *)&moe_out[(ulong)tok * hidden + d], v);
 }

@@ -114,7 +114,7 @@ kernel void gemm_block_grouped(
             const uint mm = i / 32u;
             const uint nn = i % 32u;
             if (mm < M_tile && n0 + nn < N) {
-                c[(ulong)(m0 + m_base + mm) * N + n0 + nn] = ty[mm][nn];
+                c[(ulong)(m0 + m_base + mm) * N + n0 + nn] = f32_round_bf16(ty[mm][nn]);
             }
         }
     }

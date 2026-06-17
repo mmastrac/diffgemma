@@ -3,14 +3,16 @@ using namespace metal;
 
 #include "fc_axes.metal"
 #include "debug_status.metal"
+#include "common.metal"
 #include "attention_device.metal"
+#include "arena.metal"
 #include "sampler_device.metal"
 
 /// Canvas queries attend all KV positions 0..kv_len+canvas-1 (no causal mask).
 kernel void attention(
-    device const half *q [[buffer(0)]],
+    device const ushort *q [[buffer(0)]],
     device const half *kvcache [[buffer(1)]],
-    device half *out [[buffer(2)]],
+    device ushort *out [[buffer(2)]],
     device const LayerOffsets *L [[buffer(3)]],
     constant StepParams &P [[buffer(4)]],
     constant AttnDims &dims [[buffer(5)]],
@@ -35,7 +37,7 @@ kernel void attention(
     const uint tpg_w = tpg.x;
     const uint kvh = qh / (dims.n_q_heads / nkv);
     const uint T = P.kv_len + dims.canvas;
-    device const half *qv = q + (ulong)tok * dims.n_q_heads * hd + qh * hd;
+    device const ushort *qv = q + (ulong)tok * dims.n_q_heads * hd + qh * hd;
     device const half *base = kvcache + L->kv_region / 2;
     threadgroup float red[8];
     float m = -INFINITY;
@@ -47,7 +49,7 @@ kernel void attention(
     // acc[8]/red[8] are sized for max head_dim=512 @ tpg_w=64 (per=8, nsg=2); assert under tier-2.
     if (K_SHAPE_ASSERT && (per > 8u || nsg > 8u)) {
         if (tok == 0u && qh == 0u && ltid == 0u) {
-            out[0] = half(as_type<float>(0x7fc00000u));
+            arena_store(out, 0, as_type<float>(0x7fc00000u));
         }
         return;
     }
@@ -58,7 +60,7 @@ kernel void attention(
         device const half *kk = base + (ulong)t * nkv * hd * 2u + kvh * hd;
         float d = 0.f;
         for (uint i = ltid; i < hd; i += tpg_w) {
-            d += float(qv[i]) * float(kk[i]);
+            d += arena_load(qv, i) * float(kk[i]);
         }
         d = simd_sum(d);
         uint sg = ltid / 32u;
@@ -89,7 +91,7 @@ kernel void attention(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    device half *ov = out + (ulong)tok * dims.n_q_heads * hd + qh * hd;
+    device ushort *ov = out + (ulong)tok * dims.n_q_heads * hd + qh * hd;
     if (ltid == 0u) {
         dgq_assert_positive_f32(dbg, DbgKernelAttention, l, (tok << 16u) | qh);
     }
@@ -98,7 +100,7 @@ kernel void attention(
         if (idx < hd) {
             float y = acc[i] / l;
             dgq_assert_finite_f32(dbg, DbgKernelAttention, y, idx);
-            ov[idx] = half(y);
+            arena_store(ov, idx, y);
         }
     }
 }

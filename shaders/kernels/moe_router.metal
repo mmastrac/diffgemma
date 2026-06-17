@@ -6,10 +6,11 @@ using namespace metal;
 #include "common.metal"
 #include "attention_device.metal"
 #include "moe_router_device.metal"
+#include "arena.metal"
 
 /// RMSNorm → router scale → linear → softmax → top-k (monolith k_router).
 kernel void moe_router(
-    device const half *stream [[buffer(0)]],
+    device const ushort *stream [[buffer(0)]],
     device const uchar *blob [[buffer(1)]],
     device const LayerOffsets *L [[buffer(2)]],
     device RouteScratch *R [[buffer(3)]],
@@ -29,10 +30,10 @@ kernel void moe_router(
 
     threadgroup float logits[128];
     threadgroup float red[4];
-    device const half *x = stream + (ulong)tok * dims.hidden;
+    device const ushort *x = stream + (ulong)tok * dims.hidden;
     float ss = 0.f;
     for (uint i = e; i < dims.hidden; i += 128u) {
-        float t = float(x[i]);
+        float t = arena_load(x, i);
         ss += t * t;
     }
     ss = simd_sum(ss);
@@ -50,7 +51,7 @@ kernel void moe_router(
         device const uchar *wr = blob + L->router_proj + (ulong)e * dims.hidden * 2ul;
         float acc = 0.f;
         for (uint d = 0u; d < dims.hidden; ++d) {
-            float xn = float(x[d]) * norm_inv * bf16_bytes(rs + 2ul * d) * dims.router_hscale;
+            float xn = arena_load(x, d) * norm_inv * bf16_bytes(rs + 2ul * d) * dims.router_hscale;
             acc += xn * bf16_bytes(wr + 2ul * d);
         }
         logits[e] = acc;
@@ -87,7 +88,7 @@ kernel void moe_router(
             float w = exp(logits[pick[kk]] - mx) * inv * bf16_bytes(pes + 2ul * pick[kk]);
             dgq_assert_index(dbg, DbgKernelMoeRouter, pick[kk], dims.n_experts);
             R->expert[tok][kk] = pick[kk];
-            R->weight[tok][kk] = half(w);
+            R->weight[tok][kk] = as_type<half>(arena_f32_to_bits(w));
         }
     }
 }

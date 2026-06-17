@@ -1,6 +1,6 @@
-//! In-place half scale (token embed path).
+//! In-place bf16 arena scale (token embed path).
 
-use super::f16;
+use super::bf16;
 use super::gpu_common;
 use super::test_util::ElemFormat;
 use super::variant::KernelVariant;
@@ -36,7 +36,7 @@ pub fn tiny_fixture(_: ElemFormat) -> Fixture {
 pub fn cpu(f: &Fixture) -> Vec<f32> {
     f.y
         .iter()
-        .map(|&v| f16::round_half(v * f.scale))
+        .map(|&v| bf16::round_bf16_f32(v * f.scale))
         .collect()
 }
 
@@ -85,13 +85,13 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let buf_y = pool.allocate(&ctx.device, len * 2).ok_or(Error::Format("alloc"))?;
     let dump_bytes = if variant.dump_stage > 0 { len * 4 } else { 4 };
     let buf_d = pool.allocate(&ctx.device, dump_bytes).ok_or(Error::Format("alloc"))?;
-    BufferPool::write_bf16(&buf_y, &f16::f32_slice_to_f16(&f.y));
+    BufferPool::write_bf16(&buf_y, &bf16::f32_slice_to_bf16_bits(&f.y));
     gpu_common::dispatch_1d(&ctx.queue, &pipeline.pipeline, len, |enc| {
         bind_gpu_buffers(enc, &buf_y, &buf_d, len as u32, f.scale);
     })?;
     let ptr = buf_y.contents().as_ptr() as *const u16;
     Ok((0..len)
-        .map(|i| f16::f16_bits_to_f32(unsafe { *ptr.add(i) }))
+        .map(|i| bf16::bf16_bits_to_f32(unsafe { *ptr.add(i) }))
         .collect())
 }
 

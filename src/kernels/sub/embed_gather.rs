@@ -1,5 +1,6 @@
 //! Q8 embed-table gather: dequant row by token id and apply embed scale.
 
+use super::bf16;
 use super::f16;
 use super::gpu_common;
 use super::test_util::ElemFormat;
@@ -98,7 +99,7 @@ pub fn embed_gather_cpu(
         );
         let dst = tok * hidden;
         for d in 0..hidden {
-            out[dst + d] = f16::round_half(raw[d] * embed_scale);
+            out[dst + d] = bf16::store_bf16_round_half(raw[d] * embed_scale);
         }
     }
 }
@@ -233,7 +234,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     cmd.waitUntilCompleted();
     let ptr = buf_out.contents().as_ptr() as *const u16;
     Ok((0..f.out_len())
-        .map(|i| f16::f16_bits_to_f32(unsafe { *ptr.add(i) }))
+        .map(|i| bf16::bf16_bits_to_f32(unsafe { *ptr.add(i) }))
         .collect())
 }
 

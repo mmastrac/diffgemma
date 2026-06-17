@@ -57,7 +57,7 @@ impl MetalContext {
         Ok(ComputePipeline { pipeline })
     }
 
-    /// Specialize a tiled quant GEMM subkernel (FC1–3 global, FC4–6 shape/format).
+    /// Specialize a tiled quant GEMM subkernel (FC1–3 global, FC4–6 shape/format, FC9 I/O layout).
     pub fn compile_gemm_subkernel(
         &self,
         source: &str,
@@ -66,6 +66,8 @@ impl MetalContext {
         gemm_k: u32,
         is_full_layer: bool,
         quant_format: u32,
+        y_fp16: bool,
+        x_fp16: bool,
     ) -> Result<ComputePipeline, Error> {
         let library = self.compile_library(source)?;
         Self::compile_gemm_subkernel_on_device(
@@ -76,6 +78,8 @@ impl MetalContext {
             gemm_k,
             is_full_layer,
             quant_format,
+            y_fp16,
+            x_fp16,
         )
     }
 
@@ -87,6 +91,8 @@ impl MetalContext {
         gemm_k: u32,
         is_full_layer: bool,
         quant_format: u32,
+        y_fp16: bool,
+        x_fp16: bool,
     ) -> Result<ComputePipeline, Error> {
         let variant = crate::kernels::sub::variant::runtime_step_variant();
         let fc = MTLFunctionConstantValues::new();
@@ -135,13 +141,25 @@ impl MetalContext {
                 MTLDataType::UInt,
                 6,
             );
+            fc.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from_ref(&y_fp16).cast(),
+                MTLDataType::Bool,
+                9,
+            );
+            fc.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from_ref(&x_fp16).cast(),
+                MTLDataType::Bool,
+                10,
+            );
         }
         let name = NSString::from_str(entry);
         let function = library
             .newFunctionWithName_constantValues_error(&name, &fc)
             .map_err(|e| shader_compile_error(e))?;
         let label = format!(
-            "{entry}_qf{quant_format}_n{gemm_n}_k{gemm_k}_sa{}_df{}_dd{}",
+            "{entry}_qf{quant_format}_n{gemm_n}_k{gemm_k}_yfp16{}_xfp16{}_sa{}_df{}_dd{}",
+            u8::from(y_fp16),
+            u8::from(x_fp16),
             u8::from(shape_assert),
             u8::from(debug_fast),
             u8::from(debug_deep),

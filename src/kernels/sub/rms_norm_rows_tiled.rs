@@ -80,7 +80,7 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
             let mut row = vec![0.0f32; f.dim];
             cpu::rms_norm(&mut row, x, w, RMS_EPS);
             for i in 0..f.dim {
-                out[off + i] = f16::round_half(row[i]);
+                out[off + i] = bf16::store_bf16_round_half(row[i]);
             }
         }
     } else {
@@ -90,11 +90,21 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
             let mut row = vec![0.0f32; f.dim];
             cpu::rms_norm_no_scale(&mut row, x, RMS_EPS);
             for i in 0..f.dim {
-                out[off + i] = f16::round_half(row[i]);
+                out[off + i] = bf16::store_bf16_round_half(row[i]);
             }
         }
     }
     out
+}
+
+pub fn cpu_f32_in(f: &Fixture) -> Vec<f32> {
+    let mut rounded = f.clone();
+    rounded.x = f
+        .x
+        .iter()
+        .map(|&v| bf16::round_bf16_f32(v))
+        .collect();
+    cpu(&rounded)
 }
 
 pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
@@ -215,7 +225,7 @@ fn gpu_tiled(
     if tiled.in_dtype == ElemDtype::F32 {
         BufferPool::write_f32(&buf_x, &f.x);
     } else {
-        BufferPool::write_bf16(&buf_x, &f16::f32_slice_to_f16(&f.x));
+        BufferPool::write_bf16(&buf_x, &bf16::f32_slice_to_bf16_bits(&f.x));
     }
     BufferPool::write_bytes(&buf_blob, &blob);
     let (grid, tg) = dispatch_shape(f.rows);
@@ -237,7 +247,7 @@ fn gpu_tiled(
     cmd.waitUntilCompleted();
     let ptr = buf_y.contents().as_ptr() as *const u16;
     Ok((0..len)
-        .map(|i| f16::f16_bits_to_f32(unsafe { *ptr.add(i) }))
+        .map(|i| bf16::bf16_bits_to_f32(unsafe { *ptr.add(i) }))
         .collect())
 }
 
@@ -282,8 +292,8 @@ mod tests {
 
     kernel_oracle_matrix! {
         mod f32_in_tiny,
-        cpu = crate::kernels::sub::rms_norm_rows_tiled::cpu,
-        cpu_oracle = crate::kernels::sub::rms_norm_rows_tiled::cpu_oracle,
+        cpu = crate::kernels::sub::rms_norm_rows_tiled::cpu_f32_in,
+        cpu_oracle = crate::kernels::sub::rms_norm_rows_tiled::cpu_f32_in,
         gpu = crate::kernels::sub::rms_norm_rows_tiled::gpu_f32_in,
         fixture = crate::kernels::sub::rms_norm_rows_tiled::tiny_fixture,
         out_len = crate::kernels::sub::rms_norm_rows_tiled::fixture_len,

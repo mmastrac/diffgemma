@@ -150,7 +150,7 @@ fn route_from_scratch(route: &RouteScratch, f: &Fixture) -> Vec<f32> {
             out.push(route.expert[tok][kk] as f32);
         }
         for kk in 0..f.top_k {
-            out.push(f16::f16_bits_to_f32(route.weight[tok][kk]));
+            out.push(bf16::bf16_bits_to_f32(route.weight[tok][kk]));
         }
     }
     out
@@ -158,7 +158,7 @@ fn route_from_scratch(route: &RouteScratch, f: &Fixture) -> Vec<f32> {
 
 pub fn cpu(f: &Fixture) -> Vec<f32> {
     let rows = moe_router_rows(
-        &f16::f16_slice_to_f32(&f16::f32_slice_to_f16(&f.stream)),
+        &bf16::bf16_slice_to_f32(&bf16::f32_slice_to_bf16_bits(&f.stream)),
         &f.router_scale,
         &f.router_proj,
         &f.per_expert_scale,
@@ -213,7 +213,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         .allocate(&ctx.device, std::mem::size_of::<RouteScratch>())
         .ok_or(Error::Format("alloc"))?;
 
-    BufferPool::write_bf16(&buf_stream, &f16::f32_slice_to_f16(&f.stream));
+    BufferPool::write_bf16(&buf_stream, &bf16::f32_slice_to_bf16_bits(&f.stream));
     BufferPool::write_bytes(&buf_blob, &blob);
     let layer = f.layer_offsets();
     BufferPool::write_bytes(

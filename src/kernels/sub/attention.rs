@@ -1,5 +1,6 @@
 //! All-valid GQA attention over monolithic KV cache (online softmax).
 
+use super::bf16;
 use super::f16;
 use super::gpu_common;
 use super::test_util::ElemFormat;
@@ -195,7 +196,7 @@ fn layer_offsets(f: &Fixture) -> LayerOffsets {
 }
 
 pub fn cpu(f: &Fixture) -> Vec<f32> {
-    let q = f16::f16_slice_to_f32(&f16::f32_slice_to_f16(&f.q));
+    let q = bf16::bf16_slice_to_f32(&bf16::f32_slice_to_bf16_bits(&f.q));
     let kvcache = f16::f16_slice_to_f32(&f16::f32_slice_to_f16(&f.kvcache));
     let mut out = vec![0.0f32; f.out_len()];
     attention::attention(
@@ -207,6 +208,9 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
         f.n_q_heads,
         f.kv_len,
     );
+    for o in out.iter_mut() {
+        *o = bf16::store_bf16_round_half(*o);
+    }
     out
 }
 
@@ -249,7 +253,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         .allocate(&ctx.device, std::mem::size_of::<LayerOffsets>())
         .ok_or(Error::Format("alloc"))?;
 
-    BufferPool::write_bf16(&buf_q, &f16::f32_slice_to_f16(&f.q));
+    BufferPool::write_bf16(&buf_q, &bf16::f32_slice_to_bf16_bits(&f.q));
     BufferPool::write_bf16(&buf_kv, &f16::f32_slice_to_f16(&f.kvcache));
     let layer = layer_offsets(f);
     let layer_bytes = unsafe {
@@ -308,7 +312,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let mut out = vec![0.0f32; f.out_len()];
     let ptr = buf_out.contents().as_ptr() as *const u16;
     for (i, o) in out.iter_mut().enumerate() {
-        *o = f16::f16_bits_to_f32(unsafe { *ptr.add(i) });
+        *o = bf16::bf16_bits_to_f32(unsafe { *ptr.add(i) });
     }
     Ok(out)
 }

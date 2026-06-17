@@ -1,6 +1,12 @@
 #ifndef DGQ_INCLUDE_ATTENTION_DEVICE_METAL
 #define DGQ_INCLUDE_ATTENTION_DEVICE_METAL
 
+#include <metal_stdlib>
+using namespace metal;
+
+#include "common.metal"
+#include "arena.metal"
+
 constant float ATTN_RMS_EPS = 1e-6f;
 
 struct LayerOffsets {
@@ -64,7 +70,7 @@ inline void apply_proportional_rope_f32(
 }
 
 inline void apply_split_half_rope(
-    device half *src,
+    device ushort *src,
     uint rot,
     uint head_dim,
     float theta,
@@ -76,10 +82,10 @@ inline void apply_split_half_rope(
         float a = float(pos) * inv_freq;
         float c = cos(a);
         float s = sin(a);
-        float x0 = float(src[d]);
-        float x1 = float(src[d + half_rot]);
-        src[d] = half(x0 * c - x1 * s);
-        src[d + half_rot] = half(x0 * s + x1 * c);
+        float x0 = arena_load(src, d);
+        float x1 = arena_load(src, d + half_rot);
+        arena_store(src, d, x0 * c - x1 * s);
+        arena_store(src, d + half_rot, x0 * s + x1 * c);
     }
 }
 

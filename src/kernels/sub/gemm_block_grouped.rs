@@ -3,6 +3,7 @@
 use super::gemm_common;
 use super::gpu_common;
 use super::test_util::ElemFormat;
+use super::bf16;
 use super::QuantFormat;
 use crate::kernels::cpu::gemm_linear_grouped::gemm_linear_grouped_cpu;
 use crate::kernels::sub::gemm_linear_grouped::{grouped_fixture, Fixture};
@@ -36,7 +37,7 @@ pub fn tile_fixture_nvfp4(_: ElemFormat) -> Fixture {
 }
 
 pub fn cpu(f: &Fixture) -> Vec<f32> {
-    gemm_linear_grouped_cpu(
+    let mut out = gemm_linear_grouped_cpu(
         &f.a,
         f.total_m(),
         f.k,
@@ -45,7 +46,11 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
         &f.jobs(),
         &f.row_starts,
         f.format,
-    )
+    );
+    for v in out.iter_mut() {
+        *v = bf16::round_bf16_f32(*v);
+    }
+    out
 }
 
 pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
@@ -66,6 +71,8 @@ pub fn pipeline_for(
         k,
         false,
         format as u32,
+        false,
+        false,
     )
 }
 

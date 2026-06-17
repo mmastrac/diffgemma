@@ -1,5 +1,6 @@
 //! Grouped MoE NVFP4: per-expert gate||up → GELU×up → down, weighted scatter.
 
+use super::bf16;
 use super::f16;
 use super::gpu_common;
 use super::moe_grouped::{tiny_fixture as q4_tiny, wide_fixture as q4_wide, Fixture, THREADGROUP_WIDTH};
@@ -93,7 +94,7 @@ pub fn wide_fixture(fmt: ElemFormat) -> Fixture {
 }
 
 pub fn cpu(f: &Fixture) -> Vec<f32> {
-    let moe_in: Vec<f32> = f16::f16_slice_to_f32(&f16::f32_slice_to_f16(&f.moe_in));
+    let moe_in: Vec<f32> = bf16::bf16_slice_to_f32(&bf16::f32_slice_to_bf16_bits(&f.moe_in));
     let mut out = vec![0.0f32; f.out_len()];
     moe_grouped_nvfp4(
         &mut out,
@@ -134,7 +135,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let ctx = MetalContext::new()?;
     let pipeline = pipeline_for(&ctx, variant)?;
     let mut pool = BufferPool::new();
-    let moe_in_f16 = f16::f32_slice_to_f16(&f.moe_in);
+    let moe_in_f16 = bf16::f32_slice_to_bf16_bits(&f.moe_in);
     let buf_in = pool
         .allocate(&ctx.device, moe_in_f16.len() * 2)
         .ok_or(Error::Format("alloc"))?;

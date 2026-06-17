@@ -1,5 +1,6 @@
 //! O(vocab*hidden) SC softembed fallback: weighted Q8 embed rows by softmax(logits).
 
+use super::bf16;
 use super::f16;
 use super::gpu_common;
 use super::test_util::ElemFormat;
@@ -98,7 +99,7 @@ pub fn sc_softembed_cpu(f: &Fixture) -> Vec<f32> {
                 let p = ((f.logits[tok * f.vocab + v] - mx).exp()) / sum;
                 acc += p * q8_weight_at(&embed_q8, v, d, f.hidden);
             }
-            out[tok * f.hidden + d] = f16::round_half(acc * f.embed_scale);
+            out[tok * f.hidden + d] = bf16::round_bf16_f32(acc * f.embed_scale);
         }
     }
     out
@@ -218,7 +219,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     cmd.waitUntilCompleted();
     let ptr = buf_out.contents().as_ptr() as *const u16;
     Ok((0..f.out_len())
-        .map(|i| f16::f16_bits_to_f32(unsafe { *ptr.add(i) }))
+        .map(|i| bf16::bf16_bits_to_f32(unsafe { *ptr.add(i) }))
         .collect())
 }
 

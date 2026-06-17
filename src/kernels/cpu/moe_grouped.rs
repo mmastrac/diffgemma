@@ -4,6 +4,7 @@ use crate::dgq::block::q4_weight_at;
 use crate::dgq::layout::{q4_row_bytes, NVFP4_HEADER_BYTES};
 use crate::dgq::nvfp4::nvfp4_weight_at;
 use crate::kernels::cpu::gelu_pytorch_tanh_f32;
+use crate::kernels::sub::bf16;
 
 #[derive(Debug, Clone, Copy)]
 pub struct MoeGroupedDims {
@@ -30,7 +31,7 @@ pub fn expert_forward_q4_mirror(
             g += q4_weight_at(gate_up, r, k, hidden) * x[k];
             u += q4_weight_at(gate_up, r + moe_ff, k, hidden) * x[k];
         }
-        act[r] = gelu_pytorch_tanh_f32(g) * u;
+        act[r] = bf16::round_bf16_f32(gelu_pytorch_tanh_f32(g) * u);
     }
     let mut out = vec![0.0f32; hidden];
     for d in 0..hidden {
@@ -38,7 +39,7 @@ pub fn expert_forward_q4_mirror(
         for k in 0..moe_ff {
             o += q4_weight_at(down, d, k, moe_ff) * act[k];
         }
-        out[d] = o;
+        out[d] = bf16::round_bf16_f32(o);
     }
     out
 }
@@ -65,7 +66,7 @@ pub fn expert_forward_nvfp4_mirror(
             g += nvfp4_weight_at(gu_body, r, k, hidden, gu_scale) * x[k];
             u += nvfp4_weight_at(gu_body, r + moe_ff, k, hidden, gu_scale) * x[k];
         }
-        act[r] = gelu_pytorch_tanh_f32(g) * u;
+        act[r] = bf16::round_bf16_f32(gelu_pytorch_tanh_f32(g) * u);
     }
     let mut out = vec![0.0f32; hidden];
     for d in 0..hidden {
@@ -73,7 +74,7 @@ pub fn expert_forward_nvfp4_mirror(
         for k in 0..moe_ff {
             o += nvfp4_weight_at(dn_body, d, k, moe_ff, dn_scale) * act[k];
         }
-        out[d] = o;
+        out[d] = bf16::round_bf16_f32(o);
     }
     out
 }
@@ -123,7 +124,7 @@ pub fn moe_grouped_q4(
             let expert_out = expert_forward_q4_mirror(x, gu, dn, moe_ff, hidden);
             let out_row = &mut moe_out[tok * hidden..(tok + 1) * hidden];
             for (o, &v) in out_row.iter_mut().zip(expert_out.iter()) {
-                *o += w * v;
+                *o += bf16::round_bf16_f32(w * v);
             }
         }
     }
@@ -164,7 +165,7 @@ pub fn moe_grouped_nvfp4(
             let expert_out = expert_forward_nvfp4_mirror(x, gu, dn, moe_ff, hidden);
             let out_row = &mut moe_out[tok * hidden..(tok + 1) * hidden];
             for (o, &v) in out_row.iter_mut().zip(expert_out.iter()) {
-                *o += w * v;
+                *o += bf16::round_bf16_f32(w * v);
             }
         }
     }

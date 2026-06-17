@@ -1,5 +1,6 @@
 //! Residual add: half + f32 -> half (MoE scatter path).
 
+use super::bf16;
 use super::f16;
 use super::gpu_common;
 use super::test_util::ElemFormat;
@@ -37,7 +38,7 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
     f.a
         .iter()
         .zip(f.b.iter())
-        .map(|(&a, &b)| f16::round_half(a + b))
+        .map(|(&a, &b)| bf16::store_bf16_round_half(a + b))
         .collect()
 }
 
@@ -88,14 +89,14 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let buf_y = pool.allocate(&ctx.device, len * 2).ok_or(Error::Format("alloc"))?;
     let dump_bytes = if variant.dump_stage > 0 { len * 4 } else { 4 };
     let buf_d = pool.allocate(&ctx.device, dump_bytes).ok_or(Error::Format("alloc"))?;
-    BufferPool::write_bf16(&buf_a, &f16::f32_slice_to_f16(&f.a));
+    BufferPool::write_bf16(&buf_a, &bf16::f32_slice_to_bf16_bits(&f.a));
     BufferPool::write_f32(&buf_b, &f.b);
     gpu_common::dispatch_1d(&ctx.queue, &pipeline.pipeline, len, |enc| {
         bind_gpu_buffers(enc, &buf_a, &buf_b, &buf_y, &buf_d);
     })?;
     let ptr = buf_y.contents().as_ptr() as *const u16;
     Ok((0..len)
-        .map(|i| f16::f16_bits_to_f32(unsafe { *ptr.add(i) }))
+        .map(|i| bf16::bf16_bits_to_f32(unsafe { *ptr.add(i) }))
         .collect())
 }
 

@@ -1,6 +1,6 @@
-//! Convert f32 buffer slice to fp16 arena layout (monolith step-kernel path).
+//! Convert f32 buffer slice to bf16 arena layout (monolith step-kernel path).
 
-use super::f16;
+use super::bf16;
 use super::gpu_common;
 use super::test_util::ElemFormat;
 use super::variant::KernelVariant;
@@ -37,7 +37,7 @@ pub fn tiny_fixture(_: ElemFormat) -> Fixture {
 
 pub fn cpu(f: &Fixture) -> Vec<f32> {
     let slice = &f.x[f.base as usize..(f.base + f.len) as usize];
-    f16::f16_slice_to_f32(&f16::f32_slice_to_f16(slice))
+    bf16::bf16_slice_to_f32(&bf16::f32_slice_to_bf16_bits(slice))
 }
 
 pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
@@ -105,7 +105,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     for (i, slot) in y_bits.iter_mut().enumerate() {
         *slot = unsafe { *ptr.add(i) };
     }
-    Ok(f16::f16_slice_to_f32(
+    Ok(bf16::bf16_slice_to_f32(
         &y_bits[f.base as usize..(f.base + f.len) as usize],
     ))
 }

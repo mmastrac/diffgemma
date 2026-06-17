@@ -3,7 +3,7 @@ using namespace metal;
 
 #include "fc_axes.metal"
 #include "debug_status.metal"
-#include "dequant.metal"
+#include "arena.metal"
 #include "qgemm_grouped.metal"
 #include "activations.metal"
 #include "attention_device.metal"
@@ -14,7 +14,7 @@ using namespace metal;
 /// Format selected by K_QUANT_FORMAT (FC3): Q4 affine vs NVFP4.
 /// K_DUMP_STAGE >= 1: write act/metadata to dump [[buffer(6)]] (Q4 debug path).
 kernel void moe_grouped(
-    device const half* moe_in [[buffer(0)]],
+    device const ushort* moe_in [[buffer(0)]],
     device float* moe_out [[buffer(1)]],
     device const uchar* blob [[buffer(2)]],
     device const LayerOffsets* L [[buffer(3)]],
@@ -47,8 +47,8 @@ kernel void moe_grouped(
     }
     const uint slot = R->row_start[e] + tgid.x;
     const uint tok = R->token_list[slot];
-    const float w = float(R->weight[tok][R->slot_list[slot]]);
-    device const half* x = moe_in + (ulong)tok * dims.hidden;
+    const float w = bf16_to_f32(as_type<ushort>(R->weight[tok][R->slot_list[slot]]));
+    device const ushort* x = moe_in + (ulong)tok * dims.hidden;
     const bool is_nvfp4 = (K_QUANT_FORMAT == QUANT_NVFP4);
     const bool probe = (K_DUMP_STAGE >= 1u);
     if (probe && ltid == 0u) {
@@ -58,10 +58,10 @@ kernel void moe_grouped(
         dump[meta + 2] = float(e);
         dump[meta + 3] = w;
         for (uint i = 0u; i < 8u; ++i) {
-            dump[meta + 4u + i] = float(x[i]);
+            dump[meta + 4u + i] = arena_load(x, i);
         }
         for (uint i = 0u; i < 8u; ++i) {
-            dump[meta + 12u + i] = float(moe_in[i]);
+            dump[meta + 12u + i] = arena_load(moe_in, i);
         }
     }
 
@@ -110,13 +110,13 @@ kernel void moe_grouped(
                 dequant_q4_group(grow + (k0 / 32u) * 20ul, wg);
                 dequant_q4_group(urow + (k0 / 32u) * 20ul, wu);
                 for (uint i = 0; i < 32u; ++i) {
-                    float xv = float(x[k0 + i]);
+                    float xv = arena_load(x, k0 + i);
                     g += wg[i] * xv;
                     u += wu[i] * xv;
                 }
             }
         }
-        act[r] = gelu_tanh(g) * u;
+        act[r] = f32_round_bf16(gelu_tanh(g) * u);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (probe && ltid == 0u) {
@@ -146,14 +146,15 @@ kernel void moe_grouped(
                 }
             }
         }
+        float contrib = f32_round_bf16(w * f32_round_bf16(o));
         if (probe) {
             if (ltid == 0u && d < 8u) {
                 const uint meta = dims.moe_ff * 2u;
-                dump[meta + 20u + d] = w * o;
+                dump[meta + 20u + d] = contrib;
             }
-            moe_out[(ulong)tok * dims.hidden + d] = w * o;
+            moe_out[(ulong)tok * dims.hidden + d] = contrib;
         } else {
-            atomic_add_f32((device atomic_uint*)&moe_out[(ulong)tok * dims.hidden + d], w * o);
+            atomic_add_f32((device atomic_uint*)&moe_out[(ulong)tok * dims.hidden + d], contrib);
         }
     }
     if (probe) {

@@ -1,5 +1,6 @@
 //! Tiled Q8 GEMM: `y[M,N] = x[M,K] @ Wq8[N,K]^T` (monolith `k_gemm_q8` body).
 
+use super::bf16;
 use super::f16;
 use super::gemm_common;
 use super::test_util::ElemFormat;
@@ -74,7 +75,7 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
     let w_q8 = f.w_q8();
     let mut out = vec![0.0f32; f.out_len()];
     q8_gemm_cpu(&f.x, f.m, f.k, &w_q8, f.n, &mut out);
-    out.iter().map(|&v| f16::round_half(v)).collect()
+    out.iter().map(|&v| bf16::store_bf16_round_half(v)).collect()
 }
 
 pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
@@ -87,7 +88,16 @@ pub fn pipeline_for(
     n: u32,
     k: u32,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_gemm_subkernel(SHADER, ENTRY, n, k, false, super::QuantFormat::Q8 as u32)
+    ctx.compile_gemm_subkernel(SHADER, ENTRY, n, k, false, super::QuantFormat::Q8 as u32, false, false)
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn pipeline_for_logits(
+    ctx: &crate::metal::device::MetalContext,
+    n: u32,
+    k: u32,
+) -> Result<crate::metal::device::ComputePipeline, Error> {
+    ctx.compile_gemm_subkernel(SHADER, ENTRY, n, k, false, super::QuantFormat::Q8 as u32, true, false)
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -131,7 +141,7 @@ pub fn gpu(f: &Fixture, _variant: super::KernelVariant) -> Result<Vec<f32>, Erro
     let buf_w = pool
         .allocate(&ctx.device, w_q8.len())
         .ok_or(Error::Format("alloc"))?;
-    BufferPool::write_bf16(&buf_x, &f16::f32_slice_to_f16(&f.x));
+    BufferPool::write_bf16(&buf_x, &bf16::f32_slice_to_bf16_bits(&f.x));
     BufferPool::write_bytes(&buf_w, &w_q8);
     let (grid, tg) = gemm_common::dispatch_shape(f.m, f.n);
     let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
@@ -144,7 +154,7 @@ pub fn gpu(f: &Fixture, _variant: super::KernelVariant) -> Result<Vec<f32>, Erro
     cmd.waitUntilCompleted();
     let ptr = buf_y.contents().as_ptr() as *const u16;
     Ok((0..f.out_len())
-        .map(|i| f16::f16_bits_to_f32(unsafe { *ptr.add(i) }))
+        .map(|i| bf16::bf16_bits_to_f32(unsafe { *ptr.add(i) }))
         .collect())
 }
 

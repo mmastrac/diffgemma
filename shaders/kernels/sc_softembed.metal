@@ -5,6 +5,7 @@ using namespace metal;
 #include "debug_status.metal"
 #include "common.metal"
 #include "dequant.metal"
+#include "arena.metal"
 
 /// soft[tok,d] = sum_v softmax(logits[tok,v]) * dequant(embed[v,d]) * embed_scale
 /// first_step != 0 -> zero output (SC MLP still runs on CPU path).
@@ -12,7 +13,7 @@ kernel void sc_softembed(
     device const half *logits [[buffer(0)]],
     device const float *rowstat [[buffer(1)]],
     device const uchar *blob [[buffer(2)]],
-    device half *soft [[buffer(3)]],
+    device ushort *soft [[buffer(3)]],
     constant ulong &w_off [[buffer(4)]],
     constant uint &first_step [[buffer(5)]],
     constant uint3 &dims [[buffer(6)]],
@@ -34,7 +35,7 @@ kernel void sc_softembed(
     }
     K_ELEMENTWISE_GUARD();
     if (first_step != 0u) {
-        soft[(ulong)tok * hidden + d] = half(0);
+        arena_store(soft, (ulong)tok * hidden + d, 0.f);
         return;
     }
     float mx = rowstat[tok * 2u];
@@ -49,5 +50,5 @@ kernel void sc_softembed(
         device const uchar *row = blob + w_off + (ulong)v * q8_row_bytes(hidden);
         acc += p * q8_at(row, d, bf16_bytes(row));
     }
-    soft[(ulong)tok * hidden + d] = half(acc * embed_scale);
+    arena_store(soft, (ulong)tok * hidden + d, acc * embed_scale);
 }

@@ -5,11 +5,14 @@ using namespace metal;
 
 #include "gemm_fc.metal"
 #include "dequant.metal"
+#include "arena.metal"
+
+constant bool K_X_FP16 [[function_constant(10)]];
 
 /// y[M,N] = x[M,K] @ W[K,N]; weight rows indexed by K (vocab / SC softembed).
 kernel void gemm_q8_rowk(
-    device const half *x [[buffer(0)]],
-    device half *y [[buffer(1)]],
+    device const ushort *x [[buffer(0)]],
+    device ushort *y [[buffer(1)]],
     device const uchar *blob [[buffer(2)]],
     constant ulong &w_off [[buffer(3)]],
     constant uint &M [[buffer(4)]],
@@ -27,7 +30,12 @@ kernel void gemm_q8_rowk(
     for (uint k0 = 0; k0 < K; k0 += 32) {
         for (uint i = ltid; i < 32 * 32; i += 128) {
             uint mm = i / 32, kk = i % 32;
-            tx[mm][kk] = (m0 + mm < M) ? x[(ulong)(m0 + mm) * K + k0 + kk] : half(0);
+            float xv = (m0 + mm < M)
+                ? (K_X_FP16
+                    ? float(((device const half *)x)[(ulong)(m0 + mm) * K + k0 + kk])
+                    : arena_load(x, (ulong)(m0 + mm) * K + k0 + kk))
+                : 0.f;
+            tx[mm][kk] = half(xv);
         }
         for (uint i = ltid; i < 32 * 32; i += 128) {
             uint nn = i / 32, kk = i % 32;
@@ -57,6 +65,7 @@ kernel void gemm_q8_rowk(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint i = ltid; i < 32 * 32; i += 128) {
         uint mm = i / 32, nn = i % 32;
-        if (m0 + mm < M && n0 + nn < N) y[(ulong)(m0 + mm) * N + n0 + nn] = half(ty[mm][nn]);
+        if (m0 + mm < M && n0 + nn < N)
+            arena_store(y, (ulong)(m0 + mm) * N + n0 + nn, ty[mm][nn]);
     }
 }
