@@ -155,16 +155,17 @@ P1 quality gate cleared; focus shifts to step latency (ICB, SC fast path, fusion
 | Stacked QKV / gate_up GEMM + 128 N-tile | part of pre_moe | `gemm_block_stacked` FC segments, default `N_TILE=128` | `4f5d1be`, `4727a04`, `8b45396` — isolated GEMM ~10% faster; neutral e2e |
 | Attention barrier merge (simdgroup dot sum) | part of attention | All threads sum `red[]` after one TG barrier; drop thread-0-only publish | 3→2 barriers/KV step; tail barrier kept for parity |
 | Grouped GEMM double-buffered K-tile | ~535 ms combined (35%) | Ping-pong `tx_buf[2]`+`tw_buf[2]`; MMA on tile i overlaps dequant of tile i+1; `ty` aliased over `tw_buf` to fit 32 KB TG limit; 2→1 barrier/K-tile | `a37ca36` — 2.07→1.95 s/step (~6%); fusion parity maintained |
-| SC softembed chunked f32-accumulate | ~390 ms preamble (22.8%) | Vocab-chunked GEMM with f32 accumulator in `gemm_b` (avoids per-chunk bf16 round); `f32_to_half_scale` converts once at end; bit-identical to full GEMM path (cos=1.0, max_abs=0.0) | `pending` — preamble 389→227 ms; 1.95→1.84 s/step (~6%); chunked now default |
+| SC softembed chunked f32-accumulate | ~390 ms preamble (22.8%) | Vocab-chunked GEMM with f32 accumulator in `gemm_b` (avoids per-chunk bf16 round); `f32_to_half_scale` converts once at end; bit-identical to full GEMM path (cos=1.0, max_abs=0.0) | `9acc9dc` — preamble 389→227 ms; 1.95→1.84 s/step (~6%); chunked now default |
+| `gemm_block` + `gemm_block_stacked` double-buffered K-tile | ~245 ms (o_proj+dense) + ~157 ms (qkv) | Same ping-pong technique as grouped; `ty` aliased over `tw_buf` to fit 32 KB TG limit; 2→1 barrier/K-tile | `pending` — 1.78→1.71 s/step (~4%); all tier-1 + fusion parity pass |
 
 **Open — `encode_layer` (pre-MoE)**
 
 | Priority | Stage | ~Cost | Options |
 |----------|-------|-------|---------|
 | 1 | **attention** | ~305 ms (20%) | Flash-style KV tiling (amortize softmax over `T`); **barrier reduction** — merged simdgroup dot-product barriers (3→2 per KV step; tail barrier required for `fusion_matches_unfused` parity); larger `tpg` / head tiling |
-| 2 | **qkv_gemm** | ~157 ms (11%) | Diminishing returns on tile size; fuse QK norm + RoPE adjacency to QKV dispatch |
-| 3 | **o_proj_gemm** | ~105 ms (7%) | Same as QKV — stacked fusion in place |
-| 4 | **dense_gate_up** | ~87 ms (6%) | Stacked fusion; optional fuse with pre-FF RMSNorm / GLU |
+| 2 | **qkv_gemm** | ~155 ms (10%) | **Double-buffered K-tile landed** (2→1 barrier/K-tile via `gemm_block_stacked`); further: fuse QK norm + RoPE adjacency to QKV dispatch |
+| 3 | **o_proj_gemm** | ~140 ms (8%) | **Double-buffered K-tile landed** (via `gemm_block`); same stacked fusion in place |
+| 4 | **dense_gate_up** | ~91 ms (5%) | **Double-buffered K-tile landed** (via `gemm_block`); optional fuse with pre-FF RMSNorm / GLU |
 | 5 | **router** | ~68 ms (5%) | Bucket kernels already GPU; profile bucket_fill phases |
 
 **Open — MoE grouped**
