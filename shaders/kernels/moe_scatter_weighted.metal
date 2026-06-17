@@ -5,31 +5,40 @@ using namespace metal;
 #include "debug_status.metal"
 #include "common.metal"
 #include "moe_router_device.metal"
-#include "moe_grouped_device.metal"
 #include "arena.metal"
 
 /// Weighted scatter: `[num_slots, hidden]` expert rows → canvas `moe_out`.
+/// One threadgroup per `(tok, d)`; 8 threads reduce top-k expert slots (no float atomics).
 kernel void moe_scatter_weighted(
     device const float *expert_out [[buffer(0)]],
     device float *moe_out [[buffer(1)]],
     device const RouteScratch *R [[buffer(2)]],
     constant uint &hidden [[buffer(3)]],
-    constant uint &elem_base [[buffer(4)]],
-    uint gid [[thread_position_in_grid]]
+    constant uint &canvas [[buffer(4)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint kk [[thread_index_in_threadgroup]]
 ) {
-    if (K_SHAPE_ASSERT && hidden == 0u) {
+    if (K_SHAPE_ASSERT && (hidden == 0u || canvas == 0u)) {
         return;
     }
     K_ELEMENTWISE_GUARD();
-    uint elem = elem_base + gid;
-    uint slot = elem / hidden;
-    uint d = elem % hidden;
-    if (slot >= R->num_slots) {
+    uint d = tgid.x;
+    uint tok = tgid.y;
+    if (tok >= canvas || d >= hidden || kk >= MOE_MAX_TOP_K) {
         return;
     }
-    uint tok = R->token_list[slot];
-    uint kk = R->slot_list[slot];
+
+    threadgroup float terms[MOE_MAX_TOP_K];
+    uint slot = R->token_slot[tok][kk];
     float w = bf16_to_f32(as_type<ushort>(R->weight[tok][kk]));
-    float v = f32_round_bf16(w * f32_round_bf16(expert_out[(ulong)slot * hidden + d]));
-    atomic_add_f32((device atomic_uint *)&moe_out[(ulong)tok * hidden + d], v);
+    float v = expert_out[(ulong)slot * hidden + d];
+    terms[kk] = f32_round_bf16(w * f32_round_bf16(v));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (kk == 0u) {
+        float sum = 0.f;
+        for (uint i = 0u; i < MOE_MAX_TOP_K; ++i) {
+            sum += terms[i];
+        }
+        moe_out[(ulong)tok * hidden + d] = sum;
+    }
 }

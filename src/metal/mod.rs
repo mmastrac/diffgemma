@@ -71,7 +71,7 @@ pub use step_kernel::{
     run_step_probe, run_step_smoke, run_embed_row_gpu, layer_moe_block_jobs, trace_entropy_enabled,
     bench_step_kernel_profile, bench_step_kernel_profile_steps, StepFinishMode,
     StepSmokeConfig, CANVAS, CanvasState, LayerOffsets, RouteScratch, StepParams,
-    N_EXPERTS, TOP_K, HID, MOE_FF,
+    fill_token_slot, N_EXPERTS, TOP_K, HID, MOE_FF,
 };
 pub use step_preamble_dump::{
     run_step_preamble_dump, write_step_preamble_dump,

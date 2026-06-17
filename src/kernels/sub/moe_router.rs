@@ -234,6 +234,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         pad_route: 0,
         token_list: [0; crate::metal::CANVAS * TOP_K],
         slot_list: [0; crate::metal::CANVAS * TOP_K],
+        token_slot: [[0; TOP_K]; crate::metal::CANVAS],
     };
     BufferPool::write_bytes(
         &buf_route,

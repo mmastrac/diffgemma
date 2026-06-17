@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from diffgemma_parity.vec_stats import fp16_bits_to_f32, vec_l2, vec_stats
+from diffgemma_parity.vec_stats import bf16_bits_to_f32, vec_l2, vec_stats
 
 
 def load(path: Path) -> dict:
@@ -18,7 +18,7 @@ def load(path: Path) -> dict:
 
 
 def decode_rust_weights(raw: list[int]) -> list[float]:
-    return [fp16_bits_to_f32(int(x)) for x in raw]
+    return [bf16_bits_to_f32(int(x)) for x in raw]
 
 
 def expert_match(ref: list[int], cand: list[int]) -> tuple[int, int, list[int], list[int]]:

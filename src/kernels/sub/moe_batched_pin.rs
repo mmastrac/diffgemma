@@ -230,6 +230,8 @@ pub struct MoeBatchedPinStageCos {
     pub swiglu_isolated: f32,
     pub down: f32,
     pub scatter: f32,
+    /// CPU scatter(GPU down) vs GPU scatter — isolates scatter kernel from down GEMM drift.
+    pub scatter_isolated: f32,
     pub pipeline: f32,
 }
 
@@ -315,6 +317,7 @@ pub fn verify_batched_stages_cpu(
         format,
     );
     let scatter_cpu = moe_scatter_weighted(&down_cpu, route, hidden);
+    let scatter_from_gpu_down = moe_scatter_weighted(gpu_down, route, hidden);
 
     let cos = |a: &[f32], b: &[f32]| cosine_f32(a, b);
     let rel = |a: &[f32], b: &[f32]| rel_l2_f32(a, b);
@@ -326,6 +329,7 @@ pub fn verify_batched_stages_cpu(
         swiglu_isolated: cos(&swiglu_from_gpu_gate, gpu_swiglu),
         down: cos(&down_cpu, gpu_down),
         scatter: cos(&scatter_cpu, gpu_scatter),
+        scatter_isolated: cos(&scatter_from_gpu_down, gpu_scatter),
         pipeline: cos(&scatter_cpu, gpu_scatter),
     };
     let rel_l2 = MoeBatchedPinStageCos {
@@ -335,6 +339,7 @@ pub fn verify_batched_stages_cpu(
         swiglu_isolated: rel(&swiglu_from_gpu_gate, gpu_swiglu),
         down: rel(&down_cpu, gpu_down),
         scatter: rel(&scatter_cpu, gpu_scatter),
+        scatter_isolated: rel(&scatter_from_gpu_down, gpu_scatter),
         pipeline: rel(&scatter_cpu, gpu_scatter),
     };
     let gate_up_diff = analyze_gate_up_diff(gpu_gate_up, &gate_up_cpu, slots, moe_ff * 2);
@@ -437,8 +442,8 @@ pub fn print_pin_summary(dump: &MoeBatchedPinDump) {
         s.swiglu_isolated, dump.rel_l2.swiglu_isolated,
     );
     eprintln!(
-        "  other cos  gather={:.6} down={:.6} scatter={:.6}",
-        s.gather, s.down, s.scatter,
+        "  other cos  gather={:.6} down={:.6} scatter={:.6} scatter_isolated={:.6}",
+        s.gather, s.down, s.scatter, s.scatter_isolated,
     );
     eprintln!("  VERDICT: {}", decisive_verdict(s));
     if dump.first_divergent_stage != "none" {

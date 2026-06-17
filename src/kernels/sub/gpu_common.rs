@@ -138,3 +138,35 @@ pub fn dispatch_1d(
     cmd.waitUntilCompleted();
     Ok(())
 }
+
+/// 2D grid with fixed threadgroup width (e.g. MoE scatter: one TG per `(d, tok)`).
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn dispatch_grid(
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
+    pipeline: &ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+    width: usize,
+    height: usize,
+    tg_width: usize,
+    encode: impl FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>),
+) -> Result<(), Error> {
+    let cmd = queue.commandBuffer().ok_or(Error::Format("command buffer"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("encoder"))?;
+    enc.setComputePipelineState(pipeline);
+    encode(&enc);
+    enc.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: width,
+            height: height,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_width,
+            height: 1,
+            depth: 1,
+        },
+    );
+    enc.endEncoding();
+    cmd.commit();
+    cmd.waitUntilCompleted();
+    Ok(())
+}

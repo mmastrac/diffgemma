@@ -11,17 +11,7 @@ struct MoeGroupedDims {
     uint n_experts;
 };
 
-// device atomic_float fetch_add is unreliable on MPS for moe_out scatter; CAS on uint bits.
-inline void atomic_add_f32(device atomic_uint* bits, float val) {
-    uint old = atomic_load_explicit(bits, memory_order_relaxed);
-    for (;;) {
-        float new_f = as_type<float>(old) + val;
-        uint new_bits = as_type<uint>(new_f);
-        if (atomic_compare_exchange_weak_explicit(
-                bits, &old, new_bits, memory_order_relaxed, memory_order_relaxed)) {
-            break;
-        }
-    }
-}
+// Legacy: float atomic_add via CAS was unreliable on MPS for MoE scatter (removed).
+// MoE scatter now uses per-(tok,d) threadgroup reduction in moe_scatter_weighted.metal.
 
 #endif

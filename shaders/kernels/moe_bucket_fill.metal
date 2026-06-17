@@ -60,6 +60,7 @@ kernel void moe_bucket_fill(
                       (device atomic_uint *)&R->count[e], 1u, memory_order_relaxed);
             R->token_list[slot] = tok;
             R->slot_list[slot] = kk;
+            R->token_slot[tok][kk] = slot;
         }
     }
 }

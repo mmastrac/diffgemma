@@ -73,6 +73,7 @@ fn scratch_from_fixture(f: &Fixture) -> RouteScratch {
         pad_route: 0,
         token_list: [0; crate::metal::CANVAS * TOP_K],
         slot_list: [0; crate::metal::CANVAS * TOP_K],
+        token_slot: [[0; TOP_K]; crate::metal::CANVAS],
     };
     for (tok, row) in f.experts.iter().enumerate() {
         for (kk, &e) in row.iter().enumerate() {

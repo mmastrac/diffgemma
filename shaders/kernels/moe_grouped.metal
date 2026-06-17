@@ -10,12 +10,12 @@ using namespace metal;
 #include "moe_router_device.metal"
 #include "moe_grouped_device.metal"
 
-/// Grouped MoE expert forward: gate||up → GELU×up → down, weighted scatter to moe_out.
-/// Format selected by K_QUANT_FORMAT (FC3): Q4 affine vs NVFP4.
-/// K_DUMP_STAGE >= 1: write act/metadata to dump [[buffer(6)]] (Q4 debug path).
+/// Grouped MoE expert forward: gate||up → GELU×up → down.
+/// Production: unweighted down rows → `slot_out` (batched scatter applies router weights).
+/// K_DUMP_STAGE >= 1: probe writes weighted contrib to `slot_out` for readback.
 kernel void moe_grouped(
     device const ushort* moe_in [[buffer(0)]],
-    device float* moe_out [[buffer(1)]],
+    device float* slot_out [[buffer(1)]],
     device const uchar* blob [[buffer(2)]],
     device const LayerOffsets* L [[buffer(3)]],
     device const RouteScratch* R [[buffer(4)]],
@@ -146,15 +146,16 @@ kernel void moe_grouped(
                 }
             }
         }
-        float contrib = f32_round_bf16(w * f32_round_bf16(o));
+        float o_round = f32_round_bf16(o);
         if (probe) {
+            float contrib = f32_round_bf16(w * o_round);
             if (ltid == 0u && d < 8u) {
                 const uint meta = dims.moe_ff * 2u;
                 dump[meta + 20u + d] = contrib;
             }
-            moe_out[(ulong)tok * dims.hidden + d] = contrib;
+            slot_out[(ulong)tok * dims.hidden + d] = contrib;
         } else {
-            atomic_add_f32((device atomic_uint*)&moe_out[(ulong)tok * dims.hidden + d], contrib);
+            slot_out[(ulong)slot * dims.hidden + d] = o_round;
         }
     }
     if (probe) {
@@ -162,7 +163,7 @@ kernel void moe_grouped(
         if (ltid == 0u) {
             const uint meta = dims.moe_ff * 2u;
             for (uint i = 0u; i < 8u; ++i) {
-                dump[meta + 28u + i] = moe_out[(ulong)tok * dims.hidden + i];
+                dump[meta + 28u + i] = slot_out[(ulong)tok * dims.hidden + i];
             }
         }
     }

@@ -16,6 +16,8 @@ struct RouteScratch {
     uint _pad_route;
     uint token_list[2048];
     uint slot_list[2048];
+    /// Inverse map: `token_slot[tok][kk]` → flat slot index in `token_list`.
+    uint token_slot[256][8];
 };
 
 struct RouterDims {

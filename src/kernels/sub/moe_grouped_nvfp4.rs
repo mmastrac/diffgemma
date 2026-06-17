@@ -139,6 +139,12 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let buf_in = pool
         .allocate(&ctx.device, moe_in_f16.len() * 2)
         .ok_or(Error::Format("alloc"))?;
+    let route = f.route_scratch();
+    let slots = route.num_slots as usize;
+    let slot_elems = slots * f.hidden;
+    let buf_slots = pool
+        .allocate(&ctx.device, slot_elems * 4)
+        .ok_or(Error::Format("alloc"))?;
     let buf_out = pool
         .allocate(&ctx.device, f.out_len() * 4)
         .ok_or(Error::Format("alloc"))?;
@@ -154,6 +160,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         .ok_or(Error::Format("alloc"))?;
 
     BufferPool::write_bf16(&buf_in, &moe_in_f16);
+    BufferPool::write_f32(&buf_slots, &vec![0.0f32; slot_elems]);
     BufferPool::write_f32(&buf_out, &vec![0.0f32; f.out_len()]);
     BufferPool::write_bytes(&buf_blob, &blob);
     let layer = f.nvfp4_layer_offsets();
@@ -183,7 +190,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     enc.setComputePipelineState(&pipeline.pipeline);
     unsafe {
         enc.setBuffer_offset_atIndex(Some(&buf_in), 0, 0);
-        enc.setBuffer_offset_atIndex(Some(&buf_out), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(&buf_slots), 0, 1);
         enc.setBuffer_offset_atIndex(Some(&buf_blob), 0, 2);
         enc.setBuffer_offset_atIndex(Some(&buf_layer), 0, 3);
         enc.setBuffer_offset_atIndex(Some(&buf_route), 0, 4);
@@ -204,6 +211,26 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     enc.endEncoding();
     cmd.commit();
     cmd.waitUntilCompleted();
+
+    let scatter_ps =
+        crate::kernels::sub::moe_scatter_weighted::pipeline_for(&ctx, variant)?;
+    gpu_common::dispatch_grid(
+        &ctx.queue,
+        &scatter_ps.pipeline,
+        f.hidden,
+        f.canvas,
+        8,
+        |enc| {
+            crate::kernels::sub::moe_scatter_weighted::bind_gpu_buffers(
+                enc,
+                &buf_slots,
+                &buf_out,
+                &buf_route,
+                f.hidden as u32,
+                f.canvas as u32,
+            );
+        },
+    )?;
 
     let mut out = vec![0.0f32; f.out_len()];
     BufferPool::read_f32(&buf_out, &mut out);

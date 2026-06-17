@@ -97,6 +97,7 @@ struct RouteScratch {
     uint count[128]; uint row_start[129];
     uint num_slots; uint _pad_route;
     uint token_list[2048]; uint slot_list[2048];
+    uint token_slot[256][8];
 };
 
 // ============================ monolith-only helpers ============================

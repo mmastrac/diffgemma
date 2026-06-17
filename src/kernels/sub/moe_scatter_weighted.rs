@@ -35,6 +35,7 @@ pub fn tiny_fixture(_: ElemFormat) -> Fixture {
         pad_route: 0,
         token_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
         slot_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
+        token_slot: [[0; crate::metal::TOP_K]; crate::metal::CANVAS],
     };
     route.weight[0][0] = bf16::f32_to_bf16_bits(0.5);
     route.weight[1][0] = bf16::f32_to_bf16_bits(1.0);
@@ -42,6 +43,10 @@ pub fn tiny_fixture(_: ElemFormat) -> Fixture {
     route.token_list[1] = 1;
     route.row_start[0] = 0;
     route.row_start[1] = 2;
+    route.num_slots = 2;
+    route.slot_list[0] = 0;
+    route.slot_list[1] = 0;
+    crate::metal::fill_token_slot(&mut route);
     Fixture {
         expert_out: vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0],
         route,
@@ -61,6 +66,7 @@ pub fn moe_routing_fixture(_: ElemFormat) -> Fixture {
         pad_route: 0,
         token_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
         slot_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
+        token_slot: [[0; crate::metal::TOP_K]; crate::metal::CANVAS],
     };
     route.token_list[..8].copy_from_slice(&[5, 5, 17, 33, 17, 99, 12, 44]);
     route.slot_list[..8].copy_from_slice(&[0, 1, 0, 0, 1, 0, 0, 0]);
@@ -72,6 +78,7 @@ pub fn moe_routing_fixture(_: ElemFormat) -> Fixture {
     route.weight[99][0] = bf16::f32_to_bf16_bits(0.5);
     route.weight[12][0] = bf16::f32_to_bf16_bits(0.8);
     route.weight[44][0] = bf16::f32_to_bf16_bits(0.3);
+    crate::metal::fill_token_slot(&mut route);
     let expert_out: Vec<f32> = (0..8 * hidden)
         .map(|i| (i as f32 + 1.0) * 0.1)
         .collect();
@@ -114,7 +121,7 @@ pub fn bind_gpu_buffers(
     moe_out: &ProtocolObject<dyn MTLBuffer>,
     route: &ProtocolObject<dyn MTLBuffer>,
     hidden: u32,
-    elem_base: u32,
+    canvas: u32,
 ) {
     unsafe {
         enc.setBuffer_offset_atIndex(Some(expert_out), 0, 0);
@@ -122,7 +129,7 @@ pub fn bind_gpu_buffers(
         enc.setBuffer_offset_atIndex(Some(route), 0, 2);
     }
     gpu_common::set_bytes(enc, &hidden, 3);
-    gpu_common::set_bytes(enc, &elem_base, 4);
+    gpu_common::set_bytes(enc, &canvas, 4);
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -134,7 +141,6 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let pipeline = pipeline_for(&ctx, variant)?;
     let mut pool = BufferPool::new();
     let out_len = f.out_len();
-    let grid = f.route.num_slots as usize * f.hidden;
     let buf_ex = pool
         .allocate(&ctx.device, f.expert_out.len() * 4)
         .ok_or(Error::Format("alloc"))?;
@@ -155,16 +161,23 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
             )
         },
     );
-    gpu_common::dispatch_1d(&ctx.queue, &pipeline.pipeline, grid, |enc| {
-        bind_gpu_buffers(
-            enc,
-            &buf_ex,
-            &buf_out,
-            &buf_route,
-            f.hidden as u32,
-            0,
-        );
-    })?;
+    gpu_common::dispatch_grid(
+        &ctx.queue,
+        &pipeline.pipeline,
+        f.hidden,
+        crate::metal::CANVAS,
+        8,
+        |enc| {
+            bind_gpu_buffers(
+                enc,
+                &buf_ex,
+                &buf_out,
+                &buf_route,
+                f.hidden as u32,
+                crate::metal::CANVAS as u32,
+            );
+        },
+    )?;
     let mut out = vec![0.0f32; out_len];
     BufferPool::read_f32(&buf_out, &mut out);
     Ok(out)

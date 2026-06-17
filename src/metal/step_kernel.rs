@@ -166,6 +166,20 @@ pub struct RouteScratch {
     pub pad_route: u32,
     pub token_list: [u32; CANVAS * TOP_K],
     pub slot_list: [u32; CANVAS * TOP_K],
+    pub token_slot: [[u32; TOP_K]; CANVAS],
+}
+
+/// Fill `token_slot[tok][kk]` from flat `token_list` / `slot_list` after bucketing.
+pub fn fill_token_slot(route: &mut RouteScratch) {
+    route.token_slot = [[0; TOP_K]; CANVAS];
+    let slots = route.num_slots as usize;
+    for slot in 0..slots {
+        let tok = route.token_list[slot] as usize;
+        let kk = route.slot_list[slot] as usize;
+        if tok < CANVAS && kk < TOP_K {
+            route.token_slot[tok][kk] = slot as u32;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1616,26 +1630,37 @@ impl StepEnc<'_> {
     }
 
     fn encode_moe_batched_scatter(&mut self) -> Result<(), Error> {
-        let scatter_count = (MOE_SLOTS as usize) * HID;
-        self.dispatch_1d_ranged(&self.ps.moe_scatter_weighted, scatter_count, 256, |this, base, _chunk| {
-            this.sink_set_buffer(&this.bufs.gemm_b, moe_w_byte_off_a(), 0);
-            this.sink_set_buffer(&this.bufs.arena, this.arena().moeout_off() as usize, 1);
-            this.bind_route(2);
-            this.sink_set_bytes(&(HID as u32), 3);
-            this.sink_set_bytes(&base, 4);
-        });
+        self.sink_set_pipeline(&self.ps.moe_scatter_weighted);
+        self.sink_set_buffer(&self.bufs.gemm_b, moe_w_byte_off_a(), 0);
+        self.sink_set_buffer(&self.bufs.arena, self.arena().moeout_off() as usize, 1);
+        self.bind_route(2);
+        let hidden = HID as u32;
+        let canvas = CANVAS as u32;
+        self.sink_set_bytes(&hidden, 3);
+        self.sink_set_bytes(&canvas, 4);
+        let grid = MTLSize {
+            width: hidden as usize,
+            height: canvas as usize,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 8,
+            height: 1,
+            depth: 1,
+        };
+        self.sink_dispatch(grid, tg);
         Ok(())
     }
 
     fn encode_layer_moe_scalar(
         &mut self,
         layer: usize,
-        _layout: &ModelLayout,
+        layout: &ModelLayout,
     ) -> Result<(), Error> {
         let layer_off = layer_byte_offset(layer);
         self.sink_set_pipeline(self.ps.moe_scalar(self.block_profile.format));
         self.sink_set_buffer(&self.bufs.arena, self.arena().moein_off() as usize, 0);
-        self.sink_set_buffer(&self.bufs.arena, self.arena().moeout_off() as usize, 1);
+        self.sink_set_buffer(&self.bufs.gemm_b, moe_w_byte_off_a(), 1);
         self.bind_blob(2);
         self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 3);
         self.bind_route(4);
@@ -1660,7 +1685,7 @@ impl StepEnc<'_> {
             depth: 1,
         };
         self.sink_dispatch(grid, tg);
-        Ok(())
+        self.encode_moe_batched_scatter()
     }
 
     fn encode_layer_moe_grouped(
@@ -3766,6 +3791,7 @@ fn rebucket_route_scratch(route: &mut RouteScratch) {
         route.token_list[i] = tok;
         route.slot_list[i] = state.slot_list[i];
     }
+    fill_token_slot(route);
 }
 
 fn patch_route_position(
@@ -3969,7 +3995,7 @@ pub fn run_step_moe_batched_pin_capture(
     })?;
 
     let route: RouteScratch = read_struct(&rt.bufs.route);
-    let moe_in = read_half_buffer_f32(&rt.bufs.arena, rt.bufs.arena_map.moein_off() as usize, CANVAS * HID);
+    let moe_in = read_arena_buffer_f32(&rt.bufs.arena, rt.bufs.arena_map.moein_off() as usize, CANVAS * HID);
     let slots = route.num_slots as usize;
     let gu_elems = slots * (MOE_FF as usize) * 2;
     let act_elems = slots * MOE_FF as usize;
