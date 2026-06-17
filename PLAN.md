@@ -137,7 +137,7 @@ P1 quality gate cleared; focus shifts to step latency (ICB, SC fast path, fusion
 |---|------|--------|--------|------|
 | P2.1 | GPU round-trip elimination | High | **done** | ≤3 syncs/step, ≤1 MB readback/step on generate hot path |
 | P2.2 | ICB record/replay | High | open | steady-state encode ~= 0 |
-| P2.3 | SC softembed fast path | High @ step>0 | open | SC <= few % of step |
+| P2.3 | SC softembed fast path | High @ step>0 | **done** | Chunked f32-accumulate default; preamble 389→227 ms |
 | P2.4 | Dispatch fusion | Medium | open | dispatch count down |
 | P2.5 | lm_head over uncommitted positions only (`frozen[]` mask, compact→gather→partial GEMM→scatter) | Medium | **done** | Hello @ 30L: ~25% denoise time vs full lm_head (`DGQ_PARTIAL_LM_HEAD=0`); +33% denoise tok/s (36.8 vs 27.6) |
 | P2.6 | MPS Q8 lm_head; f16/f32 sweep | Medium | open | step <= 1.4 s stretch |
@@ -154,7 +154,8 @@ P1 quality gate cleared; focus shifts to step latency (ICB, SC fast path, fusion
 | `half_to_f32` + `gather_rows` | ~8 + ~23 ms | Fused `gather_rows_bf16_to_f32` (bf16 `moein` → f32 scratch, no full-canvas convert) | `a99be6d` — bandwidth win; small wall time |
 | Stacked QKV / gate_up GEMM + 128 N-tile | part of pre_moe | `gemm_block_stacked` FC segments, default `N_TILE=128` | `4f5d1be`, `4727a04`, `8b45396` — isolated GEMM ~10% faster; neutral e2e |
 | Attention barrier merge (simdgroup dot sum) | part of attention | All threads sum `red[]` after one TG barrier; drop thread-0-only publish | 3→2 barriers/KV step; tail barrier kept for parity |
-| Grouped GEMM double-buffered K-tile | ~535 ms combined (35%) | Ping-pong `tx_buf[2]`+`tw_buf[2]`; MMA on tile i overlaps dequant of tile i+1; `ty` aliased over `tw_buf` to fit 32 KB TG limit; 2→1 barrier/K-tile | `pending` — 2.07→1.95 s/step (~6%); fusion parity maintained |
+| Grouped GEMM double-buffered K-tile | ~535 ms combined (35%) | Ping-pong `tx_buf[2]`+`tw_buf[2]`; MMA on tile i overlaps dequant of tile i+1; `ty` aliased over `tw_buf` to fit 32 KB TG limit; 2→1 barrier/K-tile | `a37ca36` — 2.07→1.95 s/step (~6%); fusion parity maintained |
+| SC softembed chunked f32-accumulate | ~390 ms preamble (22.8%) | Vocab-chunked GEMM with f32 accumulator in `gemm_b` (avoids per-chunk bf16 round); `f32_to_half_scale` converts once at end; bit-identical to full GEMM path (cos=1.0, max_abs=0.0) | `pending` — preamble 389→227 ms; 1.95→1.84 s/step (~6%); chunked now default |
 
 **Open — `encode_layer` (pre-MoE)**
 
@@ -178,7 +179,7 @@ P1 quality gate cleared; focus shifts to step latency (ICB, SC fast path, fusion
 
 | Phase | ~Share | Options |
 |-------|--------|---------|
-| **Preamble (SC)** | ~20% (step ≥ 1) | Q8 SC GEMMs + softembed; cache SC params; ICB fast path (P2.2 / P2.3) |
+| **Preamble (SC)** | ~12% (step ≥ 1) | **Chunked f32-accumulate landed** (389→227 ms); Q8 SC GEMMs + softembed; cache SC params; ICB fast path (P2.2) |
 | **finish (lm_head)** | ~11% | Partial lm_head on (P2.5); Q8 lm_head tuning (P2.6) |
 | **Sync / submit** | implicit | Monolithic ICB replay; fewer command buffers per step |
 
