@@ -54,6 +54,7 @@ From `config.json` + CPU reference (`kernels/cpu.rs`, `decoder_layer.rs`, `atten
 ### Embedding / lm_head
 - Embed scale `sqrt(hidden) = sqrt(2816) ~= 53.066` on gather.
 - Tied lm_head (`logits = final_hidden @ embed^T`), then softcap.
+- **Partial lm_head (P2.5):** after positions are accepted (`frozen[]`), skip full `256×262144` GEMM on those rows; compact unfrozen rows → gather → `M_active×VOCAB` GEMM → scatter. Default on; `DGQ_PARTIAL_LM_HEAD=0` for A/B. Disables ICB replay when active (schedule differs).
 
 ### Self-conditioning (the part not guessable from public material)
 - 4 tensors: pre_norm, gate_proj, up_proj, down_proj (q8 in `.dgq`).
@@ -71,6 +72,7 @@ From `config.json` + CPU reference (`kernels/cpu.rs`, `decoder_layer.rs`, `atten
 - Entropy computed from temperature-scaled logits (despite a stale comment in `sample.rs` saying "before temperature").
 - Denoiser sample: categorical draw from row softmax of tempered logits (inverse-CDF, `rng.next_f32()`).
 - **Accept rule**: sort positions ascending entropy; `if prefix_sum <= entropy_bound { accept; prefix_sum += ent[idx] } else break`. Test-before-add, with break — the first position is always accepted when bound > 0. (An add-before-test implementation diverges — see section 5.)
+- **Frozen mask (P2.5):** after accept, `sample_write` sets `frozen[i]` sticky until block reset. Partial lm_head skips vocab GEMM + rowstats/apply on frozen rows; entropy forced to 0, `new_sample = ids`. Opt out: `DGQ_PARTIAL_LM_HEAD=0`.
 - Renoise rejected positions in position order 0..255 (matches `renoise_canvas`).
 - Early stop: mean_entropy < 0.005 AND argmax stable for `stability_threshold` prior steps.
 - RNG: LCG `state = state*6966169279 + 1039523323`, uniform via high 32 bits. `Rng::new(seed)` => state = seed + 1. (VERIFY if `initialize_canvas` consumes from the same stream — then GPU state must start post-init, not seed+1; see RNG-1.)
@@ -114,14 +116,19 @@ Measured bf16 (steps=48): 106,480 expert-cache evictions at ~78 ms each (CPU tra
 ### Step-time progression (engine, 30L, M3 Pro)
 107 s (bf16 thrash) -> 18.8 s (residency) -> 11.9 s (dense->MPS) -> **5.29 s (grouped MoE)**. Remaining wall after this is Q3: readback + sync + CPU sampler/router.
 
-### Engine vs monolithic (M3 Pro, /tmp/quantized-weights, DGQ_MPS_Q4=1)
-| Benchmark | Monolithic | Engine | Notes |
-|-----------|-----------|--------|-------|
-| Forward-only 3L | 2.33 s/step | 2.44 s/step | step-kernel kv=0; engine prefill @ 64 |
-| 30L forward-only | **4.80 s/step** | 7.87 s/step | monolithic ~39% faster (152 syncs, 1.3 GiB readback engine-side) |
-| 30L generate e2e | **6.58 tok/s** (8 steps/block) | 3.89 tok/s (~33 s/step, early-stop @ 2) | monolithic ~69% faster denoise |
-| Pipeline compile (repeat) | ~3 ms | — | OnceLock cache (was ~65 ms) |
-| Sampler readback | ~3 KB/step | — | full GPU sampler |
+### Engine vs monolithic (M3 Pro, model/q4, 2026-06)
+
+Historical engine numbers used `/tmp/quantized-weights` and pre-P1.6 monolithic. **Current production defaults** (native Q4 step kernel + GPU grouped encoder MoE, partial lm_head on):
+
+| Benchmark | Monolithic (current) | Engine (historical) | Notes |
+|-----------|-------------------|---------------------|-------|
+| Forward-only 3L | ~2.3 s/step | ~2.4 s/step | kv=0 smoke vs engine prefill @ 64 |
+| 30L forward-only | ~4.8 s/step (pre-P2.5 baseline) | ~7.9 s/step | monolithic ~39% faster; 152 syncs engine-side |
+| **Hello @ 30L, seed 42** | **4 denoise steps**, coherent reply | — | `accept/step` [239,252,256,256]; `confident_stop` |
+| Denoise tok/s @ Hello | **~37 tok/s** (partial lm_head on) | ~3.9 tok/s | partial OFF ~28 tok/s same run class |
+| Mean step @ Hello | **~1.74 s** (partial on) | ~33 s/step (early-stop @ 2, old) | P2.5: ~25% denoise vs full lm_head |
+| Pipeline compile (repeat) | ~3 ms (archive cache) | — | `~/.cache/diffgemma-mps/metal-pipelines/` |
+| Sampler readback | ~30 KiB/step (CanvasState) | — | P2.1 hot path; `DGQ_CHECK_LOGITS=1` opt-in full scan |
 
 ### .dgq blob facts
 15.35 GiB, 1047 tensors: 454 q4_block (decoder matrices), 4 q8_row (embed + 3 SC projections), 589 raw (norms, router, scales, layer_scalars, vision). Vision = 356 tensors, ~0.37 GiB quantized. All offsets 64B-aligned. q4_block group = 20 B `[scale bf16:2][min bf16:2][nibbles:16]`, `w = scale*q + min`, ~5.0 bpw. q8_row = `[scale bf16:2][i8:K]`, `w = scale*q`. Convert ~214 s streaming; mmap load ~40 ms GPU cache init.
@@ -132,7 +139,7 @@ step_time ~= max( W_step / BW , F_step / (TFLOPS * MFU) ) + sync + sampler
 F_step ~= 2 * 3.8e9 active * 256 tokens ~= 1.95 TFLOP
          (dense-shaped ~1.22 TFLOP + experts ~0.73 GFLOP)
 ```
-M3 Pro forecast at MPS dense (3.35 historical / 2.22 re-bench) + grouped MoE target 0.8-1.5 TF/s: step ~0.9-1.3 s -> ~9-13 tok/s once GPU round-trips are gone. M3 Pro lands at the 8 tok/s floor with thin margin; it is the hardest target (weak GPU, irrelevant bandwidth advantage at canvas=256).
+M3 Pro forecast at MPS dense + grouped MoE + partial lm_head: Hello-class prompts already **~37 tok/s denoise-only** with 4-step early stop; stretch target remains **<= 1.4 s/step** mean (P2.6 / ICB / SC fast path).
 
 ---
 
@@ -153,7 +160,7 @@ The first `diffgemma_step.metal` draft had silent-garbage bugs caught only by au
 ### Nondeterminism hunt (2026-06)
 - **Primary:** `MPSMatrixMultiplication` on `.dgq` Q4 dense linears changed tokens at canvas index >= 1 between runs. Fix: `use_mps_q4` toggle (`DGQ_MPS_Q4`) — on for bench, **off** for parity/deterministic.
 - **NaN logits:** fresh/reused `BufferPool` MTLBuffers weren't zeroed -> stale bytes -> full-tensor NaN after lm_head -> argmax to token 262143. Fix: zero every buffer in `allocate`, zero KV at creation, `pool.clear()` at generate start.
-- **GPU MoE Q4 scatter:** nondeterministic across fresh engines/repeats. Parity path uses CPU MoE.
+- **GPU MoE Q4 scatter:** monolithic batched path had unreliable float atomics (2026-06, fixed — see MoE scatter entry). Engine parity path may still use CPU MoE for determinism.
 - **GPU router top-k:** flaky readback (zeros on repeat) until typed u32 readback.
 - **MoE stream input bug:** per-job path used pre-FF residual instead of `pre_ff_norm_2(stream)`.
 - **Even-layer ping-pong:** final norm read the wrong hidden buffer.
@@ -169,6 +176,7 @@ The first `diffgemma_step.metal` draft had silent-garbage bugs caught only by au
 - **Grouped MoE GEMM column index (`gemm_linear_grouped`, 2026-06):** dispatch is `n` threadgroups in X × 32 threads (one output column per threadgroup; lanes split K-groups and `simd_sum` within the simdgroup). Bug used `col = thread_position_in_grid.x`, so lanes 0..31 in a simdgroup mapped to columns 0..31 and `simd_sum` mixed partial dot products across columns. Symptom: batched `moe_out` cos ≈ 0.02–0.24 vs scalar `moe_grouped` ~0.99; tier-1 `gemm_linear_grouped` GPU tests failed the same way. Fix: `col = threadgroup_position_in_grid.x`, `global_row = threadgroup_position_in_grid.y`. Not a Q4 dequant / K-order issue — see subkernel `shaders/kernels/gemm_linear_grouped.metal`.
 - **Grouped tiled MoE GEMM M-striping (`gemm_block_grouped`, 2026-06):** batched path uses `gemm_block_grouped` (simdgroup 32×32 tiles along N and K). Each threadgroup handles one expert (`tgid.y`) and one N-tile (`tgid.x`), but the kernel only loaded/stored A rows `m0+mm` for `mm ∈ [0,31]` with **no outer loop over M**. Production routing assigns up to **185 rows per expert** (L0 Calgary: expert 0 has M=96; 22 experts with M>32). Rows past 32 got zeros/garbage while CPU oracle computed them. Symptom: `step-moe-batched-pin` `gate_up_gemm` cos ≈ **0.76** (slots 32–39 cos **0.0**); `swiglu_isolated` cos **1.0** (swiglu cleared). Down GEMM uses the **same kernel** — `down` cos ≈ 0.52 was partly inherited gate_up error, partly the same M-drop (fixed together). Tier-1 fixtures missed it: `rows_per_expert` capped at **12** (`[8,12,4]`) — exercised N/K tiling only, not M. **`gemm_block` (dense) is fine:** `m0 = tgid.y * 32`, M tiled via grid height. **`gemm_linear_grouped` (scalar grouped) is fine:** one threadgroup per `global_row` (`grid.height = total_m`), no per-expert M cap. Fix: `for (m_base = 0; m_base < M; m_base += 32)` with `M_tile = min(32, M - m_base)` in `shaders/kernels/gemm_block_grouped.metal`. Fixtures bumped to **M=100** (`[100,4]` tiny, `[100,48,4]` tile) on both grouped kernels; real-weight harness `row_starts = [0,50,100]`.
 - **`qk_rope_kv` V-alias on full layers (2026-06):** when `v_proj==0`, V must read **raw** k_proj and apply `rms_norm_no_scale` only (MLX: `values = keys` before `k_norm`/`rope`). GPU K path normed+rotated `k` **in place** while V threads read the same buffer (race + wrong semantics). CPU oracle had the same ordering bug (V after K in the head loop). Affects layers **5, 11, 17, 23, 29** every step — not prompt-length-specific, but can tip longer/harder prompts into repetition. Fix: K writes kvcache from thread-local head; skip in-place `k` mutation when `v_proj==0`. Tier-1 `full_attn_v_alias` fixture added (`v_proj=0`).
+- **MoE weighted scatter float atomics (2026-06):** `moe_scatter_weighted` and fused `moe_grouped` used `atomic_add_f32` CAS on `device float*` — unreliable on MPS at scale (8 experts × 2816 dims). Symptom: layer-2 `moe_out` cos ~0.40 vs MLX, batched-pin scatter cos ~0.67. Fix: one threadgroup per `(tok, d)` with 8-thread reduction into `token_slot[tok][kk]` inverse map; scalar `moe_grouped` writes slot buffer then calls scatter kernel. GPU vs CPU moe oracle cos ~1.0; MLX layer hidden cos ~0.99 post-fix.
 
 ### Tile-bound dimension audit (2026-06)
 
@@ -183,7 +191,8 @@ Systematic check: for each kernel, find every dimension bounded by a tile consta
 | `attention` head tiling | `acc[8]`, `red[8]` | hd=512, tpg=64 → **per=8 exact** | per-thread stride + simdgroup reduce | **exact-fit fragile** — `K_SHAPE_ASSERT per≤8, nsg≤8` added; not Calgary cause |
 | `moe_router` / `bucket_*` | 128 experts | 128 | 128-wide TG, phase-1 loops `0..N_EXPERTS` | OK (`row_start` sum=2048 verified) |
 | `dispatch_softcap` / rowstats | grid 65535 | CANVAS×VOCAB | `dispatch_1d_ranged` | OK (pattern to copy) |
-| `gather_rows` / `moe_scatter_weighted` | grid 65535 | MOE_SLOTS×HID/256 ≈ **22534** TG | `dispatch_1d_ranged` + `elem_base` | **ranged** (was safe, now consistent) |
+| `gather_rows` / `gather_rows_bf16` | grid 65535 | MOE_SLOTS×HID/256 ≈ **22534** TG | `dispatch_1d_ranged` + `elem_base` | **ranged** |
+| `moe_scatter_weighted` | TG width 8 | canvas×hidden TG | `(d, tok)` grid + per-slot reduction | **fixed** (was float atomics) |
 
 **Smell:** vocab and logits already use `dispatch_1d_ranged`; grouped MoE M did not. Inconsistent overflow discipline caused the batched MoE bug class. Attention KV streaming was never the hazard — fixed score buffers would have been, but this kernel streams online softmax instead.
 
@@ -202,25 +211,26 @@ Systematic check: for each kernel, find every dimension bounded by a tile consta
 
 ## 7. Known issues carried forward (IDs referenced in PLAN.md)
 
-| ID | Issue | Lives in PLAN as |
-|----|-------|------------------|
-| STOP-1 | Early stop fires on degenerate all-pad/filler stable argmax | done (P1.1) |
-| CONV-1 | ~1 accept/step; min_ent > 0.1 early, only ~5 positions H<0.1 late @ 30L q4 | P1.6 |
-| PREF-1 | Monolithic encoder prefill forced CPU MoE (`use_mps_q4=false`); ~98–155 s → native path ~31 s @ 14 tok | done (P1.8) |
-| PREF-2 | Encoder prefill CPU MoE bottleneck (~30–60 s @ 14–22 tok / 30L) | done (2026-06): **GPU grouped MoE default** (`gemm_linear_grouped`); ~1.4–2.7 s @ 14–22 tok / 30L; `DGQ_ENCODER_GPU_MOE=0` to opt out |
-| KV-MPS-1 | MPS encoder Q4 prefill KV ≠ native → flat step logits @ 30L | done (P1.9–P1.10): dequant grid fix; encoder MoE now GPU grouped (PREF-2) |
-| QUAL-1 | Templated chat + default --steps 2 -> no readable reply | done (P1.2) |
-| CLI-1 | `--steps` default 2 (parity) vs model-card up to 48 | P1.2 |
-| CHAT-1 | Display decodes full 256 block incl. pads | P1.4 |
-| SC-1 | `k_sc_softembed` O(vocab x hidden)/step | P2.3 |
-| DISPATCH-1 | ~130 encoder calls/step/layer | P2.4 |
-| MOE-1 | Atomic f32 scatter nondeterministic (~1 ulp) | P3.3 |
-| MEM-1 | MPS Q4 weight scratch up to ~92 MiB | P3.4 |
-| RNG-1 | `init_canvas_state` may not match `Rng::new(seed+1)` if canvas init shares the draw stream | section 2 / P3.2 |
-| FULL-1 | 5 full-attention layers need shape-specialized pipelines | done (M0.4) |
-| METAL-1 | `tanh` large-input NaN | done (clamp) |
-| BENCH-1 | Historical benches used kv_len=0 vs engine 64 | reconciled in section 4 |
-| RT-1 | Generate scanned 134 MiB logits/step for NaN guard | done (P2.1): opt-in `DGQ_CHECK_LOGITS=1`; hot path ~12 KiB/step |
+| ID | Issue | Status |
+|----|-------|--------|
+| STOP-1 | Early stop fires on degenerate all-pad/filler stable argmax | **done** (P1.1) |
+| CONV-1 | ~1 accept/step; gibberish @ 48 steps @ 30L q4 | **done** (P1.6): MoE scatter fix + q4; Hello seed 42 → 4 steps, readable reply |
+| PREF-1 | Monolithic encoder prefill forced CPU MoE; ~98–155 s | **done** (P1.8) |
+| PREF-2 | Encoder prefill CPU MoE bottleneck | **done**: GPU grouped MoE default; ~1.4 s @ 22 tok / 30L |
+| KV-MPS-1 | MPS encoder Q4 prefill KV ≠ native | **done** (P1.9–P1.10) |
+| QUAL-1 | Templated chat + `--steps 2` → no readable reply | **done** (P1.2; production `--steps 48`) |
+| CLI-1 | `--steps` default 2 vs 48 | **done** (P1.2) |
+| CHAT-1 | Display decodes full 256 block incl. pads | **done** (P1.4) |
+| SC-1 | `k_sc_softembed` O(vocab × hidden)/step | open (P2.3) |
+| DISPATCH-1 | ~130 encoder calls/step/layer | open (P2.4) |
+| LM-PARTIAL-1 | Full 256×262k lm_head every step | **done** (P2.5): frozen mask + partial GEMM; ~25% denoise on Hello |
+| MOE-1 | Float atomic scatter nondeterministic / wrong | **done** monolithic batched path (per-TG reduce); engine CPU MoE parity path unchanged |
+| MEM-1 | MPS Q4 weight scratch up to ~92 MiB | open (P3.4) |
+| RNG-1 | Canvas init vs `Rng::new(seed+1)` stream | open (section 2) |
+| FULL-1 | 5 full-attention layers need shape-specialized pipelines | **done** (M0.4) |
+| METAL-1 | `tanh` large-input NaN | **done** (clamp) |
+| BENCH-1 | Historical benches used kv_len=0 vs engine 64 | reconciled (section 4) |
+| RT-1 | Generate scanned 134 MiB logits/step for NaN guard | **done** (P2.1): opt-in `DGQ_CHECK_LOGITS=1` |
 
 ---
 
@@ -228,7 +238,11 @@ Systematic check: for each kernel, find every dimension bounded by a tile consta
 
 | Path | Role |
 |------|------|
-| `shaders/diffgemma_step.metal` | All monolithic step kernels + dispatch schedule comment |
+| `shaders/kernels/moe_scatter_weighted.metal` | Weighted expert → canvas scatter (per-(tok,d) TG reduce, no float atomics) |
+| `shaders/kernels/compact_active_rows.metal` | Partial lm_head: list unfrozen canvas rows |
+| `shaders/kernels/gather_rows_bf16.metal` | Gather bf16 arena rows for partial lm_head |
+| `shaders/kernels/scatter_logits_rows.metal` | Scatter compact lm_head logits into full `[canvas,vocab]` buffer |
+| `shaders/monolithic/diffgemma_step.metal` | Monolithic ABI + dispatch schedule comment |
 | `shaders/kernels/gemm_linear_f32.metal` | Scalar Q4/NVFP4 f32 GEMM (`C = A @ W^T`) |
 | `shaders/kernels/gemm_q8_linear_f32.metal` | Scalar Q8 f32 GEMM (`C = A @ W^T`) |
 | `shaders/kernels/gemm_q8_linear_kxn_f32.metal` | Scalar Q8 f32 GEMM (`C = A @ W[K,N]`) |
@@ -252,12 +266,11 @@ Systematic check: for each kernel, find every dimension bounded by a tile consta
 Bring-up, micro-benches, and unit tests — useful when debugging a subsystem, not for everyday generate/chat.
 
 ```bash
-# Default entrypoint (no subcommand): same as generate-gpu on metal; CPU-only build uses generate
-cargo run --release --features metal -- -m $WEIGHTS -p "Hello" --seed 42 --steps 2
+# Default on .dgq + metal: generate-monolithic
+cargo run --release --features metal -- -m model/q4 -p "Hello" --seed 42
 
-# Route default to monolithic on .dgq (env or flag; same as generate-monolithic)
-DGQ_MONOLITHIC=1 cargo run --release --features metal -- -m $WEIGHTS -p "Hello" --seed 42
-cargo run --release --features metal -- -m $WEIGHTS --monolithic -p "Hello" --seed 42
+# Engine path (multi-kernel); slower but golden-locked
+cargo run --release --features metal -- generate-gpu -m model/q4 -p "Hello" --seed 42 --steps 2
 
 # Unit / integration tests (CI runs both)
 cargo test
@@ -289,7 +302,7 @@ cargo run --release -- config
 
 | Command | What it does |
 |---------|--------------|
-| *(no subcommand)* | Shorthand for `generate-gpu` with `-p` / `--steps` / etc. On `.dgq` + `DGQ_MONOLITHIC=1` or `--monolithic`, routes to `generate-monolithic` instead. |
+| *(no subcommand)* | On `.dgq` + metal: **`generate-monolithic`**. Otherwise `generate-gpu` or CPU `generate`. |
 | `cargo test` | Rust unit tests on Linux CI; kernel/sampler logic without Metal. |
 | `cargo test --features metal` | Full suite including Metal paths; add `-- --skip gpu_determinism` locally for faster iteration. |
 | `step-probe` | Single monolithic forward with per-stage activation checkpoints (`finite`, `max_abs`). Use when `step-smoke` passes but you need to localize a bad layer/stage. |
@@ -347,10 +360,10 @@ See **section 5** for full archaeology. Highest-frequency when MLX/HF match each
 |---------|--------------|--------|
 | Argmax all **262143** (vocab−1) | **NaN logits** from stale `BufferPool` / KV | Zero alloc path; `DGQ_CHECK_LOGITS=1`; golden discard |
 | **`mean_ent` ~11+** (max confusion) | **In-process pollution** — `step-verify` then generate same process | Run generate in **fresh process**; step-ci golden may need regen after MoE changes |
-| **`accept/step ≈ 1`**, `min_ent > 0.1` early @ 30L | **CONV-1** — forward not sharpening (quant damage or kernel bug) | Not accept-rule bug if HF agrees on exported logits; use layer hidden dumps |
+| **`accept/step ≈ 1`**, gibberish @ 48 steps | **CONV-1 (historical)** — MoE scatter + forward; fixed P1.6 | If regression: layer bisect `compare_layer_moe.py`; check scatter cos |
 | Early stop @ step 2, all `<pad>` | **STOP-1** degenerate argmax | Pad-aware stop (`MIN_EARLY_STOP_STEPS`); `--no-early-stop` for compares |
 | Tokens drift run-to-run | **`DGQ_MPS_Q4=1`** MPS dense nondeterminism | Parity: `DGQ_MPS_Q4=0`; bench may use `=1` |
-| MoE scatter differs ~1 ulp | Atomic f32 scatter | **MOE-1**; parity uses CPU MoE in engine path |
+| MoE scatter wrong / layer cliff | Float atomics on scatter | **Fixed 2026-06** — use `moe_scatter_weighted` TG reduce; `token_slot` map |
 
 ### D. Recommended bisection (MLX vs mono)
 
@@ -375,8 +388,9 @@ See **section 5** for full archaeology. Highest-frequency when MLX/HF match each
 
 ### E. What we already know (2026-06 baseline)
 
-- **30L q4 monolithic @ Hello:** timing ~4.8 s/step is plausible; **~1 accept/step early** and gibberish @ 48 steps = CONV-1 (forward/quant), not sampler-only.
+- **30L q4 monolithic @ Hello, seed 42:** **4 denoise steps**, `accept/step` [239,252,256,256], text *"Hello! How can I help you today?"* — P1.6 gate met. Denoise **~7.0 s** / **~37 tok/s** with partial lm_head (P2.5); **~9.3 s** / **~28 tok/s** with `DGQ_PARTIAL_LM_HEAD=0` (same quality).
+- **Early-run P1.6 telemetry (pre-scatter-fix):** 48-step runs showed min_ent eventually < 0.1 but only ~5 low-H positions late — superseded by scatter fix + 4-step `confident_stop` path above.
 - **MLX mxfp4 vs `.dgq` q4 @ step 1:** argmax may match positions 0–1 then diverge; MLX accepts far more positions because entropies are much lower — **do not** treat as accept-rule regression without logit export parity.
-- **NVFP4 grouped MoE** (2026-06): large speedup; changes outputs — regen goldens / compare in fresh process after kernel changes.
+- **NVFP4 grouped MoE:** large speedup; changes outputs — regen goldens / compare in fresh process after kernel changes.
 - **Long prompts:** OOM (exit **137**) on full 48-step × 30L generate — use shorter `--max-new-tokens` or fewer steps for parity runs.
 
