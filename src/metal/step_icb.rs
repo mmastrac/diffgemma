@@ -175,7 +175,7 @@ pub fn step_icb_with_sc_enabled() -> bool {
     }
 }
 
-pub fn replay_step_icb(
+pub fn replay_step_icb( 
     cmd: &ProtocolObject<dyn MTLCommandBuffer>,
     plan: &StepIcbPlan,
 ) -> Result<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>, Error> {

@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-const CACHE_BUNDLE_TAG: &str = "diffgemma-mps-v2-icb";
+const CACHE_BUNDLE_TAG: &str = "diffgemma-mps-v6-gemm-dequant-ltid32";
 
 fn shader_bundle_token() -> u64 {
     use std::collections::hash_map::DefaultHasher;
@@ -31,7 +31,9 @@ fn shader_bundle_token() -> u64 {
         include_str!("../../shaders/include/qgemm_grouped.metal"),
         include_str!("../../shaders/kernels/dequant_block_matrix.metal"),
         include_str!("../../shaders/kernels/gemm_block.metal"),
+        include_str!("../../shaders/kernels/gemm_block_stacked.metal"),
         include_str!("../../shaders/kernels/gemm_block_grouped.metal"),
+        include_str!("../../shaders/include/gemm_stacked.metal"),
         include_str!("../../shaders/kernels/gemm_linear_f32.metal"),
         include_str!("../../shaders/kernels/gemm_linear_grouped.metal"),
         include_str!("../../shaders/kernels/gemm_q8_linear_f32.metal"),

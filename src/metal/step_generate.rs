@@ -10,6 +10,7 @@ use crate::metal::step_kernel::{
 };
 use crate::metal::step_kv::{
     extend_monolithic_kv_with_cache, prefill_monolithic_kv_with_cache, MonolithicEncoderCache,
+    MonolithicPrefillTiming,
 };
 use crate::metal::{ForwardTelemetry, SessionTelemetry, StepPhaseTelemetry};
 use crate::sample::{Rng, SamplerConfig, step_entropy_stats};
@@ -51,7 +52,7 @@ impl StepGenerateConfig {
     }
 }
 
-fn smoke_config(cfg: &StepGenerateConfig) -> StepSmokeConfig {
+fn smoke_config(cfg: &StepGenerateConfig, prefill_token_ids: Option<Vec<u32>>) -> StepSmokeConfig {
     StepSmokeConfig {
         layers: cfg.layers.min(N_LAYERS).max(1),
         steps: cfg.sampler.max_denoising_steps.max(1),
@@ -59,7 +60,7 @@ fn smoke_config(cfg: &StepGenerateConfig) -> StepSmokeConfig {
         seed: cfg.seed,
         max_seq: cfg.max_seq,
         finish: StepFinishMode::Full,
-        prefill_token_ids: None,
+        prefill_token_ids,
         no_early_stop: false,
     }
 }
@@ -161,9 +162,13 @@ pub struct StepGenerateSession {
 }
 
 impl StepGenerateSession {
-    pub fn open(model_dir: &Path, cfg: &StepGenerateConfig) -> Result<(Self, Duration), Error> {
+    pub fn open(
+        model_dir: &Path,
+        cfg: &StepGenerateConfig,
+        prefill_token_ids: Option<Vec<u32>>,
+    ) -> Result<(Self, Duration), Error> {
         let layers = cfg.layers.min(N_LAYERS).max(1);
-        let (rt, build) = build_step_runtime(model_dir, &smoke_config(cfg))?;
+        let (rt, build) = build_step_runtime(model_dir, &smoke_config(cfg, prefill_token_ids))?;
         eprintln!(
             "step-generate: runtime ready (total={:.2?}, compile={:.2?})",
             build.total, build.compile
@@ -188,7 +193,11 @@ pub fn generate_monolithic(
     cfg: &StepGenerateConfig,
     prompt_label: &str,
 ) -> Result<GenerateOutput, Error> {
-    let (mut session, _) = StepGenerateSession::open(model_dir, cfg)?;
+    let (mut session, _) = StepGenerateSession::open(
+        model_dir,
+        cfg,
+        Some(prompt_token_ids.to_vec()),
+    )?;
     generate_with_session(&mut session, prompt_token_ids, cfg, prompt_label)
 }
 
@@ -206,20 +215,6 @@ pub fn generate_with_session(
     let max_blocks = cfg.max_new_tokens.div_ceil(canvas_len).max(1);
     let model_dir = session.model_dir.as_path();
     let shared_blob = session.rt.shared_dgq_blob();
-    if session.encoder.is_none() {
-        let encoder_started = Instant::now();
-        session.encoder = Some(MonolithicEncoderCache::open_opt(
-            model_dir,
-            canvas_len,
-            cfg.max_seq,
-            Some(shared_blob),
-        )?);
-        eprintln!(
-            "step-generate: encoder cache ready ({:.2?})",
-            encoder_started.elapsed()
-        );
-    }
-    let encoder = session.encoder.as_mut().expect("encoder cache");
     let rt = &mut session.rt;
 
     if step_text_log_enabled() && session.step_text_tokenizer.is_none() {
@@ -236,21 +231,50 @@ pub fn generate_with_session(
     }
 
     let prefill_started = Instant::now();
-    let (kv_len, prefill_timing) = prefill_monolithic_kv_with_cache(
-        encoder,
-        prompt_token_ids,
-        rt.kvcache(),
-        rt.layout(),
-        cfg.max_seq,
-        layers,
-    )?;
-    rt.set_kv_len(kv_len as u32);
-    let prefill_elapsed = prefill_started.elapsed();
-    eprintln!(
-        "step-generate: prefilled kv_len={kv_len} ({prefill_elapsed:.2?}, gpu_forward={:.1}ms kv_pack={:.1}ms)",
-        prefill_timing.gpu_forward_ms,
-        prefill_timing.kv_pack_ms
-    );
+    let existing_kv = rt.read_params().kv_len as usize;
+    let (kv_len, prefill_timing, prefill_elapsed) = if existing_kv >= prompt_token_ids.len()
+        && existing_kv > 0
+    {
+        eprintln!("step-generate: using step-kernel prefill kv_len={existing_kv}");
+        (
+            existing_kv,
+            MonolithicPrefillTiming::default(),
+            Duration::ZERO,
+        )
+    } else {
+        if session.encoder.is_none() {
+            let encoder_started = Instant::now();
+            session.encoder = Some(MonolithicEncoderCache::open_opt(
+                model_dir,
+                canvas_len,
+                cfg.max_seq,
+                Some(std::sync::Arc::clone(&shared_blob)),
+            )?);
+            eprintln!(
+                "step-generate: encoder cache ready ({:.2?})",
+                encoder_started.elapsed()
+            );
+        }
+        let encoder = session.encoder.as_mut().expect("encoder cache");
+        let (kv_len, prefill_timing) = prefill_monolithic_kv_with_cache(
+            encoder,
+            prompt_token_ids,
+            rt.kvcache(),
+            rt.layout(),
+            cfg.max_seq,
+            layers,
+        )?;
+        rt.set_kv_len(kv_len as u32);
+        let prefill_elapsed = prefill_started.elapsed();
+        (kv_len, prefill_timing, prefill_elapsed)
+    };
+    if prefill_elapsed > Duration::ZERO {
+        eprintln!(
+            "step-generate: prefilled kv_len={kv_len} ({prefill_elapsed:.2?}, gpu_forward={:.1}ms kv_pack={:.1}ms)",
+            prefill_timing.gpu_forward_ms,
+            prefill_timing.kv_pack_ms
+        );
+    }
 
     let mut sequences = prompt_token_ids.to_vec();
     let mut rng = Rng::new(cfg.seed);
@@ -533,6 +557,15 @@ pub fn generate_with_session(
         if !is_last_block {
             let extend_started = Instant::now();
             let kv_before = rt.read_params().kv_len as usize;
+            if session.encoder.is_none() {
+                session.encoder = Some(MonolithicEncoderCache::open_opt(
+                    model_dir,
+                    canvas_len,
+                    cfg.max_seq,
+                    Some(std::sync::Arc::clone(&shared_blob)),
+                )?);
+            }
+            let encoder = session.encoder.as_mut().expect("encoder cache");
             let new_kv_len = extend_monolithic_kv_with_cache(
                 encoder,
                 rt.kvcache(),

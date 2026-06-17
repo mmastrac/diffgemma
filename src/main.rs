@@ -306,6 +306,13 @@ enum Command {
         profile: bool,
         profile_steps: usize,
     },
+    BenchGemmFusion {
+        layers: usize,
+        kv_len: u32,
+        seed: u64,
+        max_seq: usize,
+        iters: usize,
+    },
     Chat {
         seed: u64,
         steps: usize,
@@ -642,6 +649,20 @@ fn main() -> ExitCode {
             profile,
             profile_steps,
         ),
+        Command::BenchGemmFusion {
+            layers,
+            kv_len,
+            seed,
+            max_seq,
+            iters,
+        } => run_bench_gemm_fusion_cmd(
+            &cli.model_dir,
+            layers,
+            kv_len,
+            seed,
+            max_seq,
+            iters,
+        ),
         Command::GenerateMonolithic {
             prompt,
             seed,
@@ -882,6 +903,7 @@ fn run_command(
         Command::StepCi { .. } => ExitCode::FAILURE,
         Command::StepParity { .. } => ExitCode::FAILURE,
         Command::BenchStepKernel { .. } => ExitCode::FAILURE,
+        Command::BenchGemmFusion { .. } => ExitCode::FAILURE,
         Command::GenerateMonolithic { .. } => ExitCode::FAILURE,
         Command::GenerateMonolithicParity { .. } => ExitCode::FAILURE,
     }
@@ -2515,6 +2537,73 @@ fn run_bench_step_kernel_cmd(
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
+fn run_bench_gemm_fusion_cmd(
+    model_dir: &std::path::Path,
+    layers: usize,
+    kv_len: u32,
+    seed: u64,
+    max_seq: usize,
+    iters: usize,
+) -> ExitCode {
+    use metal::bench_fused_gemm_dispatches;
+
+    if !dgq::store::looks_like_dgq_dir(model_dir) {
+        eprintln!("error: bench-gemm-fusion requires a .dgq directory");
+        return ExitCode::FAILURE;
+    }
+    let cfg = step_kernel_config(layers, kv_len, seed, max_seq, true);
+    eprintln!(
+        "bench-gemm-fusion: layers={layers} kv_len={kv_len} iters={iters} (QKV + gate/up GEMM isolation)"
+    );
+    match bench_fused_gemm_dispatches(model_dir, cfg, iters) {
+        Ok(r) => {
+            let pct = |a: std::time::Duration, b: std::time::Duration| {
+                if b.is_zero() {
+                    0.0
+                } else {
+                    100.0 * (1.0 - a.as_secs_f64() / b.as_secs_f64())
+                }
+            };
+            let per_l = |d: std::time::Duration| d / r.layers.max(1) as u32;
+            println!("bench-gemm-fusion ok");
+            println!("  compile:  {:.2?}", r.compile);
+            println!("  layers:   {}", r.layers);
+            println!("  iters:    {}", r.iters);
+            println!("  dispatches/pass: qkv stacked={} split={} gate_up stacked=1/L split=2/L", r.qkv_stacked_dispatches_per_pass, r.qkv_split_dispatches_per_pass);
+            println!("--- QKV GEMM only (per-layer rmsnorm prep + timed GEMM submit) ---");
+            println!("  stacked: {:.2?}  ({:.2?}/layer)", r.qkv_gemm_stacked, per_l(r.qkv_gemm_stacked));
+            println!("  split:   {:.2?}  ({:.2?}/layer)", r.qkv_gemm_split, per_l(r.qkv_gemm_split));
+            println!("  delta:   {:+.1}% stacked vs split", pct(r.qkv_gemm_stacked, r.qkv_gemm_split));
+            println!("--- gate/up GEMM only (per-layer rmsnorm prep + timed GEMM submit) ---");
+            println!("  stacked: {:.2?}  ({:.2?}/layer)", r.gate_up_gemm_stacked, per_l(r.gate_up_gemm_stacked));
+            println!("  split:   {:.2?}  ({:.2?}/layer)", r.gate_up_gemm_split, per_l(r.gate_up_gemm_split));
+            println!("  delta:   {:+.1}% stacked vs split", pct(r.gate_up_gemm_stacked, r.gate_up_gemm_split));
+            println!("--- batched pass (1 CB, interleaved rmsnorm+GEMM per layer) ---");
+            println!("  qkv stacked: {:.2?}  split: {:.2?}  ({:+.1}%)", r.qkv_batched_stacked, r.qkv_batched_split, pct(r.qkv_batched_stacked, r.qkv_batched_split));
+            println!("  gate_up stacked: {:.2?}  split: {:.2?}  ({:+.1}%)", r.gate_up_batched_stacked, r.gate_up_batched_split, pct(r.gate_up_batched_stacked, r.gate_up_batched_split));
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn run_bench_gemm_fusion_cmd(
+    _model_dir: &std::path::Path,
+    _layers: usize,
+    _kv_len: u32,
+    _seed: u64,
+    _max_seq: usize,
+    _iters: usize,
+) -> ExitCode {
+    eprintln!("error: bench-gemm-fusion requires --features metal on macOS");
+    ExitCode::FAILURE
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
 fn run_step_smoke_cmd(
     model_dir: &std::path::Path,
     layers: usize,
@@ -3487,6 +3576,13 @@ fn parse_cli() -> Cli {
             forward_only: step_forward_only,
             profile: step_profile,
             profile_steps: step_profile_steps,
+        },
+        Some("bench-gemm-fusion") => Command::BenchGemmFusion {
+            layers: bench_layers.max(1).min(30),
+            kv_len: step_kv_len,
+            seed,
+            max_seq: step_max_seq.max(64),
+            iters: bench_iters.max(1),
         },
         Some(cmd) => {
             eprintln!("unknown command: {cmd}");
@@ -4757,7 +4853,7 @@ fn run_chat_cmd(
         no_early_stop,
     );
 
-    let mut session = match StepGenerateSession::open(model_dir, &step_cfg) {
+    let mut session = match StepGenerateSession::open(model_dir, &step_cfg, None) {
         Ok((s, compile)) => {
             eprintln!("chat: session ready ({compile:.2?}, layers={layers})");
             s

@@ -39,6 +39,79 @@ inline void dequant_q4_group_half_tg(device const uchar *g, threadgroup half *ou
     }
 }
 
+/// Partial Q4 group decode into threadgroup tile (8 consecutive columns).
+inline void dequant_q4_group_half_tg_range(
+    device const uchar *g,
+    threadgroup half *out,
+    uint col_start,
+    uint col_count
+) {
+    half s = half(bf16_bytes(g));
+    half mn = half(bf16_bytes(g + 2));
+    for (uint i = 0u; i < col_count; ++i) {
+        const uint j = col_start + i;
+        uchar b = g[4u + j / 2u];
+        const float q = (j & 1u) ? float(b >> 4) : float(b & 0x0fu);
+        out[i] = s * half(q) + mn;
+    }
+}
+
+/// Load one 32×32 activation K-tile (f32 activations) with all 128 threads.
+inline void gemm_load_a_tile_f32(
+    device const float *a,
+    uint M_tile,
+    uint K,
+    uint row0,
+    uint k0,
+    uint ltid,
+    threadgroup half tx[32][32]
+) {
+    for (uint i = ltid; i < 32u * 32u; i += 128u) {
+        const uint mm = i / 32u;
+        const uint kk = i % 32u;
+        tx[mm][kk] = (mm < M_tile)
+            ? half(a[(ulong)(row0 + mm) * K + k0 + kk])
+            : half(0);
+    }
+}
+
+inline void gemm_prefetch_a_tile_f32(
+    device const float *a,
+    uint M_tile,
+    uint K,
+    uint row0,
+    uint k_next,
+    uint ltid,
+    threadgroup half tx_next[32][32]
+) {
+    for (uint i = ltid - 32u; i < 32u * 32u; i += 96u) {
+        const uint mm = i / 32u;
+        const uint kk = i % 32u;
+        tx_next[mm][kk] = (mm < M_tile)
+            ? half(a[(ulong)(row0 + mm) * K + k_next + kk])
+            : half(0);
+    }
+}
+
+/// Load one 32×32 bf16 activation K-tile with all 128 threads.
+inline void gemm_load_a_tile(
+    device const ushort *x,
+    uint M,
+    uint K,
+    uint m0,
+    uint k0,
+    uint ltid,
+    threadgroup half tx[32][32]
+) {
+    for (uint i = ltid; i < 32u * 32u; i += 128u) {
+        const uint mm = i / 32u;
+        const uint kk = i % 32u;
+        tx[mm][kk] = (m0 + mm < M)
+            ? half(bf16_to_f32(x[(ulong)(m0 + mm) * K + k0 + kk]))
+            : half(0);
+    }
+}
+
 /// Column-indexed Q4 decode (parity vs `dequant_q4_group` / CPU `q4_weight_at`).
 inline float q4_at_col(device const uchar *row_base, uint col, uint K) {
     uint g = col / 32u;
@@ -49,6 +122,18 @@ inline float q4_at_col(device const uchar *row_base, uint col, uint K) {
     uchar byte = blk[4u + j / 2u];
     float q = (j & 1u) ? float(byte >> 4) : float(byte & 0x0fu);
     return delta * q + mn;
+}
+
+/// Half-precision column decode for parallel GEMM tile fill.
+inline half q4_at_col_half(device const uchar *row_base, uint col) {
+    uint g = col / 32u;
+    uint j = col % 32u;
+    device const uchar *blk = row_base + ulong(g) * 20ul;
+    half s = half(bf16_bytes(blk));
+    half mn = half(bf16_bytes(blk + 2));
+    uchar byte = blk[4u + j / 2u];
+    float q = (j & 1u) ? float(byte >> 4) : float(byte & 0x0fu);
+    return s * half(q) + mn;
 }
 
 inline ulong q4_row_bytes(uint K) {
@@ -194,6 +279,136 @@ inline void dequant_nvfp4_tile_half_fused_tg(device const uchar *row, uint K, ui
     }
 }
 
+/// Partial NVFP4 32-wide K-tile decode (8 consecutive columns).
+inline void dequant_nvfp4_tile_half_fused_tg_range(
+    device const uchar *row,
+    uint K,
+    uint k0,
+    threadgroup half *out,
+    float gscale,
+    uint col_start,
+    uint col_count
+) {
+    uint data_len = (K + 1u) / 2u;
+    for (uint i = 0u; i < col_count; ++i) {
+        const uint col = col_start + i;
+        const uint g = col / 16u;
+        const float scale = fp8_e4m3_to_f32(row[data_len + g]) * gscale;
+        device const uchar *packed = row + g * 8u;
+        const uint j = col % 16u;
+        uchar byte = packed[j / 2u];
+        uint q = (j & 1u) ? uint(byte >> 4) : uint(byte & 0x0Fu);
+        out[i] = half(e2m1_to_f32(q) * scale);
+    }
+}
+
+/// 128-thread cooperative weight tile: threads 0-31 run fast row decode; 32-127 prefetch
+/// the next activation K-slice into `tx_next` while weights decode (software pipeline).
+inline void dequant_q4_tw_tile_cooperative(
+    device const uchar *blob,
+    ulong body,
+    ulong rowB,
+    uint k0,
+    uint n0,
+    uint N,
+    uint ltid,
+    threadgroup half tw[32][32],
+    device const ushort *x,
+    uint M,
+    uint K,
+    uint m0,
+    uint k_next,
+    threadgroup half tx_next[32][32]
+) {
+    if (ltid < 32u) {
+        const uint r = ltid;
+        const uint global_n = n0 + r;
+        if (global_n >= N) {
+            for (uint i = 0u; i < 32u; ++i) {
+                tw[r][i] = half(0);
+            }
+        } else {
+            dequant_q4_group_half_tg(
+                blob + body + (ulong)global_n * rowB + (ulong)(k0 / 32u) * 20ul,
+                &tw[r][0]);
+        }
+    } else if (k_next < K) {
+        for (uint i = ltid - 32u; i < 32u * 32u; i += 96u) {
+            const uint mm = i / 32u;
+            const uint kk = i % 32u;
+            tx_next[mm][kk] = (m0 + mm < M)
+                ? half(bf16_to_f32(x[(ulong)(m0 + mm) * K + k_next + kk]))
+                : half(0);
+        }
+    }
+}
+
+inline void dequant_nvfp4_tw_tile_cooperative(
+    device const uchar *matrix,
+    uint K,
+    uint k0,
+    uint n0,
+    uint N,
+    uint ltid,
+    threadgroup half tw[32][32],
+    device const ushort *x,
+    uint M,
+    uint m0,
+    uint k_next,
+    threadgroup half tx_next[32][32]
+) {
+    const float gscale = as_type<float>(*(device const uint *)(matrix));
+    const device uchar *body = matrix + 4u;
+    const ulong rowB = nvfp4_row_bytes(K);
+    if (ltid < 32u) {
+        const uint r = ltid;
+        const uint global_n = n0 + r;
+        if (global_n >= N) {
+            for (uint i = 0u; i < 32u; ++i) {
+                tw[r][i] = half(0);
+            }
+        } else {
+            device const uchar *row = body + (ulong)global_n * rowB;
+            dequant_nvfp4_tile_half_fused_tg(row, K, k0, &tw[r][0], gscale);
+        }
+    } else if (k_next < K) {
+        for (uint i = ltid - 32u; i < 32u * 32u; i += 96u) {
+            const uint mm = i / 32u;
+            const uint kk = i % 32u;
+            tx_next[mm][kk] = (m0 + mm < M)
+                ? half(bf16_to_f32(x[(ulong)(m0 + mm) * K + k_next + kk]))
+                : half(0);
+        }
+    }
+}
+
+/// 128-thread parallel fill: 4 threads × 32 rows, 8 columns each.
+inline void dequant_nvfp4_tw_tile_parallel(
+    device const uchar *matrix,
+    uint K,
+    uint k0,
+    uint n0,
+    uint N,
+    uint ltid,
+    threadgroup half tw[32][32]
+) {
+    const float gscale = as_type<float>(*(device const uint *)(matrix));
+    const device uchar *body = matrix + 4u;
+    const ulong rowB = nvfp4_row_bytes(K);
+    const uint r = ltid / 4u;
+    const uint part = ltid % 4u;
+    const uint col_start = part * 8u;
+    const uint global_n = n0 + r;
+    if (global_n >= N) {
+        for (uint i = 0u; i < 8u; ++i) {
+            tw[r][col_start + i] = half(0);
+        }
+        return;
+    }
+    device const uchar *row = body + (ulong)global_n * rowB;
+    dequant_nvfp4_tile_half_fused_tg_range(row, K, k0, &tw[r][col_start], gscale, col_start, 8u);
+}
+
 /// Column decode for one NVFP4 matrix row (`matrix` includes 4-byte global scale header).
 inline float nvfp4_at_col(device const uchar *matrix, uint row, uint col, uint K) {
     float gscale = as_type<float>(*(device const uint *)(matrix));
@@ -206,6 +421,10 @@ inline float nvfp4_at_col(device const uchar *matrix, uint row, uint col, uint K
     uchar byte = row_base[col / 2u];
     uint q = (col & 1u) ? uint(byte >> 4) : uint(byte & 0x0fu);
     return e2m1_to_f32(q) * scale;
+}
+
+inline half nvfp4_at_col_half(device const uchar *matrix, uint row, uint col, uint K) {
+    return half(nvfp4_at_col(matrix, row, col, K));
 }
 
 #endif

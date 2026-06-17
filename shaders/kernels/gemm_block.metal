@@ -26,11 +26,9 @@ kernel void gemm_block(
     simdgroup_float8x8 acc0(0.f), acc1(0.f), acc2(0.f), acc3(0.f);
 
     const bool is_nvfp4 = (K_QUANT_FORMAT == QUANT_NVFP4);
-    float gscale = 0.f;
     ulong body = w_off;
     ulong rowB = 0ul;
     if (is_nvfp4) {
-        gscale = as_type<float>(*(device const uint *)(blob + w_off));
         body = w_off + 4ul;
         rowB = nvfp4_row_bytes(K);
     } else {
@@ -38,18 +36,21 @@ kernel void gemm_block(
     }
 
     for (uint k0 = 0; k0 < K; k0 += 32) {
-        for (uint i = ltid; i < 32 * 32; i += 128) {
-            uint mm = i / 32, kk = i % 32;
-            tx[mm][kk] = (m0 + mm < M) ? half(arena_load(x, (ulong)(m0 + mm) * K + k0 + kk)) : half(0);
-        }
-        for (uint r = ltid; r < 32; r += 128) {
+        gemm_load_a_tile(x, M, K, m0, k0, ltid, tx);
+        if (ltid < 32u) {
+            const uint r = ltid;
             if (is_nvfp4) {
                 device const uchar *row = blob + body + (ulong)(n0 + r) * rowB;
+                const float gscale = as_type<float>(*(device const uint *)(blob + w_off));
                 dequant_nvfp4_tile_half_fused_tg(row, K, k0, &tw[r][0], gscale);
-            } else {
+            } else if (n0 + r < N) {
                 dequant_q4_group_half_tg(
-                    blob + body + (ulong)(n0 + r) * rowB + (ulong)(k0 / 32) * 20ul,
+                    blob + body + (ulong)(n0 + r) * rowB + (ulong)(k0 / 32u) * 20ul,
                     &tw[r][0]);
+            } else {
+                for (uint i = 0u; i < 32u; ++i) {
+                    tw[r][i] = half(0);
+                }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

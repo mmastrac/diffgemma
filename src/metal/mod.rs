@@ -49,6 +49,7 @@ mod telemetry;
 mod weights;
 
 
+pub use dgq_gpu::DgqGpuBlob;
 pub use memory::{
     estimate_decoder_forward, estimate_paged_layer_bytes, estimate_weight_cache,
     log_expert_cache_stats,
@@ -67,7 +68,7 @@ pub use probe::{print_probe_result, probe_device};
 pub use bench_gemm::{bench_custom_kernel, bench_gemm_block_q4, bench_mpsgraph_oracle, parse_shapes, print_bench_rows};
 pub use sampler::sampler_step_gpu;
 pub use step_kernel::{
-    bench_step_kernel, build_step_runtime,
+    bench_fused_gemm_dispatches, bench_step_kernel, build_offsets_from_store, build_step_runtime,
     run_step_probe, run_step_smoke, run_embed_row_gpu, layer_moe_block_jobs, trace_entropy_enabled,
     bench_step_kernel_profile, bench_step_kernel_profile_steps, StepFinishMode,
     StepSmokeConfig, CANVAS, CanvasState, LayerOffsets, RouteScratch, StepParams,
