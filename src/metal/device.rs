@@ -83,6 +83,174 @@ impl MetalContext {
         )
     }
 
+    /// Specialize stacked GEMM: base FC1–11 plus segment table FC12–27.
+    pub fn compile_gemm_stacked_subkernel(
+        &self,
+        source: &str,
+        entry: &str,
+        gemm_n: u32,
+        gemm_k: u32,
+        quant_format: u32,
+        stacked: &crate::kernels::sub::gemm_block_stacked::StackedSegFc,
+    ) -> Result<ComputePipeline, Error> {
+        let library = self.compile_library(source)?;
+        Self::compile_gemm_stacked_subkernel_on_device(
+            &self.device,
+            &library,
+            entry,
+            gemm_n,
+            gemm_k,
+            quant_format,
+            stacked,
+        )
+    }
+
+    fn compile_gemm_stacked_subkernel_on_device(
+        device: &ProtocolObject<dyn MTLDevice>,
+        library: &ProtocolObject<dyn MTLLibrary>,
+        entry: &str,
+        gemm_n: u32,
+        gemm_k: u32,
+        quant_format: u32,
+        stacked: &crate::kernels::sub::gemm_block_stacked::StackedSegFc,
+    ) -> Result<ComputePipeline, Error> {
+        let variant = crate::kernels::sub::variant::runtime_step_variant();
+        let fc = MTLFunctionConstantValues::new();
+        let shape_assert = variant.shape_assert;
+        let dump_stage = 0u32;
+        let debug_fast = variant.debug_fast;
+        let debug_deep = variant.debug_deep;
+        let gemm_n_tile = crate::kernels::sub::gemm_common::n_tile() as u32;
+        let is_full_layer = false;
+        let y_fp16 = false;
+        let x_fp16 = false;
+        unsafe {
+            fc.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from_ref(&shape_assert).cast(),
+                MTLDataType::Bool,
+                1,
+            );
+            fc.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from_ref(&dump_stage).cast(),
+                MTLDataType::UInt,
+                2,
+            );
+            fc.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from_ref(&quant_format).cast(),
+                MTLDataType::UInt,
+                3,
+            );
+            fc.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from_ref(&debug_fast).cast(),
+                MTLDataType::Bool,
+                7,
+            );
+            fc.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from_ref(&debug_deep).cast(),
+                MTLDataType::Bool,
+                8,
+            );
+            fc.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from_ref(&is_full_layer).cast(),
+                MTLDataType::Bool,
+                4,
+            );
+            fc.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from_ref(&gemm_n).cast(),
+                MTLDataType::UInt,
+                5,
+            );
+            fc.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from_ref(&gemm_k).cast(),
+                MTLDataType::UInt,
+                6,
+            );
+            fc.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from_ref(&y_fp16).cast(),
+                MTLDataType::Bool,
+                9,
+            );
+            fc.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from_ref(&x_fp16).cast(),
+                MTLDataType::Bool,
+                10,
+            );
+            fc.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from_ref(&gemm_n_tile).cast(),
+                MTLDataType::UInt,
+                11,
+            );
+            fc.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from_ref(&stacked.n_segs).cast(),
+                MTLDataType::UInt,
+                12,
+            );
+            fc.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from_ref(&stacked.end0).cast(),
+                MTLDataType::UInt,
+                13,
+            );
+            fc.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from_ref(&stacked.end1).cast(),
+                MTLDataType::UInt,
+                14,
+            );
+            fc.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from_ref(&stacked.end2).cast(),
+                MTLDataType::UInt,
+                15,
+            );
+            for (i, w_off) in stacked.w_off.iter().enumerate() {
+                fc.setConstantValue_type_atIndex(
+                    std::ptr::NonNull::from_ref(w_off).cast(),
+                    MTLDataType::ULong,
+                    16 + i,
+                );
+            }
+            for (i, y_off) in stacked.y_byte_off.iter().enumerate() {
+                fc.setConstantValue_type_atIndex(
+                    std::ptr::NonNull::from_ref(y_off).cast(),
+                    MTLDataType::ULong,
+                    19 + i,
+                );
+            }
+            for (i, col0) in stacked.y_col0.iter().enumerate() {
+                fc.setConstantValue_type_atIndex(
+                    std::ptr::NonNull::from_ref(col0).cast(),
+                    MTLDataType::UInt,
+                    22 + i,
+                );
+            }
+            for (i, row_cols) in stacked.y_row_cols.iter().enumerate() {
+                fc.setConstantValue_type_atIndex(
+                    std::ptr::NonNull::from_ref(row_cols).cast(),
+                    MTLDataType::UInt,
+                    25 + i,
+                );
+            }
+        }
+        let name = NSString::from_str(entry);
+        let function = library
+            .newFunctionWithName_constantValues_error(&name, &fc)
+            .map_err(|e| shader_compile_error(e))?;
+        let label = format!(
+            "{entry}_qf{quant_format}_n{gemm_n}_k{gemm_k}_nt{gemm_n_tile}_ns{}_e{}_{}_{}_w{}_{}_{}_y{}_{}_{}",
+            stacked.n_segs,
+            stacked.end0,
+            stacked.end1,
+            stacked.end2,
+            stacked.w_off[0],
+            stacked.w_off[1],
+            stacked.w_off[2],
+            stacked.y_byte_off[0],
+            stacked.y_byte_off[1],
+            stacked.y_byte_off[2],
+        );
+        let cache = PipelineArchiveCache::shared(device)?;
+        let pipeline = cache.compile_compute(device, &function, &label)?;
+        Ok(ComputePipeline { pipeline })
+    }
+
     fn compile_gemm_subkernel_on_device(
         device: &ProtocolObject<dyn MTLDevice>,
         library: &ProtocolObject<dyn MTLLibrary>,
@@ -293,6 +461,14 @@ impl MetalContext {
 
 pub struct ComputePipeline {
     pub pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+}
+
+impl Clone for ComputePipeline {
+    fn clone(&self) -> Self {
+        Self {
+            pipeline: self.pipeline.clone(),
+        }
+    }
 }
 
 fn shader_compile_error(err: Retained<NSError>) -> Error {

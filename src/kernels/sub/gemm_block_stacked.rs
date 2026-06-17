@@ -15,7 +15,7 @@ const SHADER: &str = shader_include::include_metal!("kernels/gemm_block_stacked.
 
 /// Must match `shaders/include/gemm_stacked.metal`.
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
 pub struct GemmStackedSeg {
     pub n_cols: u32,
     pub y_col0: u32,
@@ -23,6 +23,78 @@ pub struct GemmStackedSeg {
     pub _pad: u32,
     pub w_off: u64,
     pub y_byte_off: u64,
+}
+
+/// Function-constant segment table (FC12–27) for `gemm_block_stacked`.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub struct StackedSegFc {
+    pub n_segs: u32,
+    pub end0: u32,
+    pub end1: u32,
+    pub end2: u32,
+    pub w_off: [u64; 3],
+    pub y_byte_off: [u64; 3],
+    pub y_col0: [u32; 3],
+    pub y_row_cols: [u32; 3],
+}
+
+impl StackedSegFc {
+    pub fn from_segments(segs: &[GemmStackedSeg]) -> Result<Self, Error> {
+        if segs.is_empty() || segs.len() > 3 {
+            return Err(Error::Format("stacked GEMM supports 1..=3 segments"));
+        }
+        let mut w_off = [0u64; 3];
+        let mut y_byte_off = [0u64; 3];
+        let mut y_col0 = [0u32; 3];
+        let mut y_row_cols = [0u32; 3];
+        let mut end0 = 0u32;
+        let mut end1 = 0u32;
+        let mut end2 = 0u32;
+        for (i, s) in segs.iter().enumerate() {
+            w_off[i] = s.w_off;
+            y_byte_off[i] = s.y_byte_off;
+            y_col0[i] = s.y_col0;
+            y_row_cols[i] = s.y_row_cols;
+        }
+        if segs.len() >= 1 {
+            end0 = segs[0].n_cols;
+        }
+        if segs.len() >= 2 {
+            end1 = end0 + segs[1].n_cols;
+        }
+        if segs.len() >= 3 {
+            end2 = end1 + segs[2].n_cols;
+        }
+        Ok(Self {
+            n_segs: segs.len() as u32,
+            end0,
+            end1,
+            end2,
+            w_off,
+            y_byte_off,
+            y_col0,
+            y_row_cols,
+        })
+    }
+}
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct StackedPipelineKey {
+    n: u32,
+    k: u32,
+    format: u32,
+    stacked: StackedSegFc,
+}
+
+impl StackedPipelineKey {
+    fn new(n: u32, k: u32, format: QuantFormat, stacked: StackedSegFc) -> Self {
+        Self {
+            n,
+            k,
+            format: format as u32,
+            stacked,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -274,17 +346,43 @@ pub fn pipeline_for(
     n: u32,
     k: u32,
     format: QuantFormat,
+    segs: &[GemmStackedSeg],
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_gemm_subkernel(
+    Ok((*stacked_pipeline_for(ctx, n, k, format, segs)?).clone())
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn stacked_pipeline_for(
+    ctx: &crate::metal::device::MetalContext,
+    n: u32,
+    k: u32,
+    format: QuantFormat,
+    segs: &[GemmStackedSeg],
+) -> Result<std::sync::Arc<crate::metal::device::ComputePipeline>, Error> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static CACHE: OnceLock<Mutex<HashMap<StackedPipelineKey, std::sync::Arc<crate::metal::device::ComputePipeline>>>> =
+        OnceLock::new();
+    let stacked = StackedSegFc::from_segments(segs)?;
+    let key = StackedPipelineKey::new(n, k, format, stacked);
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache
+        .lock()
+        .map_err(|_| Error::Format("stacked pipeline cache poisoned"))?;
+    if let Some(pipe) = guard.get(&key) {
+        return Ok(std::sync::Arc::clone(pipe));
+    }
+    let pipe = std::sync::Arc::new(ctx.compile_gemm_stacked_subkernel(
         SHADER,
         ENTRY,
         n,
         k,
-        false,
         format as u32,
-        false,
-        false,
-    )
+        &stacked,
+    )?);
+    guard.insert(key, std::sync::Arc::clone(&pipe));
+    Ok(pipe)
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -300,18 +398,14 @@ pub fn bind_gpu_buffers(
     x: &ProtocolObject<dyn MTLBuffer>,
     y: &ProtocolObject<dyn MTLBuffer>,
     blob: &ProtocolObject<dyn MTLBuffer>,
-    segs: &ProtocolObject<dyn MTLBuffer>,
-    n_segs: u32,
     m: u32,
 ) {
     unsafe {
         enc.setBuffer_offset_atIndex(Some(x), 0, 0);
         enc.setBuffer_offset_atIndex(Some(y), 0, 1);
         enc.setBuffer_offset_atIndex(Some(blob), 0, 2);
-        enc.setBuffer_offset_atIndex(Some(segs), 0, 3);
     }
-    gpu_common::set_bytes(enc, &n_segs, 4);
-    gpu_common::set_bytes(enc, &m, 5);
+    gpu_common::set_bytes(enc, &m, 3);
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -321,7 +415,8 @@ pub fn gpu_q4(f: &StackedFixture, _variant: super::variant::KernelVariant) -> Re
 
     let ctx = MetalContext::new()?;
     let n = f.n_total() as u32;
-    let pipeline = pipeline_for(&ctx, n, f.k as u32, QuantFormat::Q4Affine)?;
+    let segs = f.gpu_segments();
+    let pipeline = pipeline_for(&ctx, n, f.k as u32, QuantFormat::Q4Affine, &segs)?;
     let mut pool = BufferPool::new();
     let w_q4 = f.w_blob();
     let buf_x = pool
@@ -333,34 +428,13 @@ pub fn gpu_q4(f: &StackedFixture, _variant: super::variant::KernelVariant) -> Re
     let buf_w = pool
         .allocate(&ctx.device, w_q4.len())
         .ok_or(Error::Format("alloc"))?;
-    let segs = f.gpu_segments();
-    let buf_segs = pool
-        .allocate(&ctx.device, segs.len() * std::mem::size_of::<GemmStackedSeg>())
-        .ok_or(Error::Format("alloc"))?;
     BufferPool::write_bf16(&buf_x, &bf16::f32_slice_to_bf16_bits(&f.x));
     BufferPool::write_bytes(&buf_w, &w_q4);
-    BufferPool::write_bytes(
-        &buf_segs,
-        unsafe {
-            std::slice::from_raw_parts(
-                segs.as_ptr() as *const u8,
-                segs.len() * std::mem::size_of::<GemmStackedSeg>(),
-            )
-        },
-    );
     let (grid, tg) = gemm_common::dispatch_shape(f.m, f.n_total());
     let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
     let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
     enc.setComputePipelineState(&pipeline.pipeline);
-    bind_gpu_buffers(
-        &enc,
-        &buf_x,
-        &buf_y,
-        &buf_w,
-        &buf_segs,
-        segs.len() as u32,
-        f.m as u32,
-    );
+    bind_gpu_buffers(&enc, &buf_x, &buf_y, &buf_w, f.m as u32);
     enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
     enc.endEncoding();
     cmd.commit();
@@ -735,35 +809,16 @@ mod tests {
         let buf_x = pool.allocate(&ctx.device, m * k * 2).expect("x");
         let buf_y_stacked = pool.allocate(&ctx.device, plane_bytes * 2).expect("y stacked");
         let buf_y_split = pool.allocate(&ctx.device, plane_bytes * 2).expect("y split");
-        let buf_segs = pool
-            .allocate(&ctx.device, segs.len() * std::mem::size_of::<GemmStackedSeg>())
-            .expect("segs");
         BufferPool::write_bf16(&buf_x, &bf16::f32_slice_to_bf16_bits(&x));
-        BufferPool::write_bytes(
-            &buf_segs,
-            unsafe {
-                std::slice::from_raw_parts(
-                    segs.as_ptr() as *const u8,
-                    segs.len() * std::mem::size_of::<GemmStackedSeg>(),
-                )
-            },
-        );
 
         let n_total = (n * 2) as u32;
-        let pipeline = pipeline_for(&ctx, n_total, k as u32, QuantFormat::Q4Affine).expect("pipe");
+        let pipeline =
+            pipeline_for(&ctx, n_total, k as u32, QuantFormat::Q4Affine, &segs).expect("pipe");
         let (grid, tg) = gemm_common::dispatch_shape(m, n_total as usize);
         let cmd = ctx.queue.commandBuffer().expect("cmd");
         let enc = cmd.computeCommandEncoder().expect("enc");
         enc.setComputePipelineState(&pipeline.pipeline);
-        bind_gpu_buffers(
-            &enc,
-            &buf_x,
-            &buf_y_stacked,
-            &gpu_blob.buffer,
-            &buf_segs,
-            segs.len() as u32,
-            m as u32,
-        );
+        bind_gpu_buffers(&enc, &buf_x, &buf_y_stacked, &gpu_blob.buffer, m as u32);
         enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
         enc.endEncoding();
         cmd.commit();
@@ -876,35 +931,16 @@ mod tests {
         let buf_x = pool.allocate(&ctx.device, m * k * 2).expect("x");
         let buf_y_stacked = pool.allocate(&ctx.device, y_bytes).expect("y stacked");
         let buf_y_split = pool.allocate(&ctx.device, y_bytes).expect("y split");
-        let buf_segs = pool
-            .allocate(&ctx.device, segs.len() * std::mem::size_of::<GemmStackedSeg>())
-            .expect("segs");
         BufferPool::write_bf16(&buf_x, &bf16::f32_slice_to_bf16_bits(&x));
-        BufferPool::write_bytes(
-            &buf_segs,
-            unsafe {
-                std::slice::from_raw_parts(
-                    segs.as_ptr() as *const u8,
-                    segs.len() * std::mem::size_of::<GemmStackedSeg>(),
-                )
-            },
-        );
 
         let n_total = (nq + nk + nk) as u32;
-        let pipeline = pipeline_for(&ctx, n_total, k as u32, QuantFormat::Q4Affine).expect("pipe");
+        let pipeline =
+            pipeline_for(&ctx, n_total, k as u32, QuantFormat::Q4Affine, &segs).expect("pipe");
         let (grid, tg) = gemm_common::dispatch_shape(m, n_total as usize);
         let cmd = ctx.queue.commandBuffer().expect("cmd");
         let enc = cmd.computeCommandEncoder().expect("enc");
         enc.setComputePipelineState(&pipeline.pipeline);
-        bind_gpu_buffers(
-            &enc,
-            &buf_x,
-            &buf_y_stacked,
-            &gpu_blob.buffer,
-            &buf_segs,
-            segs.len() as u32,
-            m as u32,
-        );
+        bind_gpu_buffers(&enc, &buf_x, &buf_y_stacked, &gpu_blob.buffer, m as u32);
         enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
         enc.endEncoding();
         cmd.commit();

@@ -601,8 +601,6 @@ struct StepPipelines {
     half_to_f32: ComputePipeline,
     gemm_q4: HashMap<(u32, u32), ComputePipeline>,
     gemm_nvfp4: HashMap<(u32, u32), ComputePipeline>,
-    gemm_stacked_q4: HashMap<(u32, u32), ComputePipeline>,
-    gemm_stacked_nvfp4: HashMap<(u32, u32), ComputePipeline>,
     gemm_q8: HashMap<(u32, u32), ComputePipeline>,
     gemm_q8_logits: HashMap<(u32, u32), ComputePipeline>,
     gemm_q8_rowk: HashMap<(u32, u32), ComputePipeline>,
@@ -644,8 +642,6 @@ impl StepPipelines {
     fn new(ctx: &MetalContext, variant: crate::kernels::sub::variant::KernelVariant) -> Result<Self, Error> {
         let mut gemm_q4 = HashMap::new();
         let mut gemm_nvfp4 = HashMap::new();
-        let mut gemm_stacked_q4 = HashMap::new();
-        let mut gemm_stacked_nvfp4 = HashMap::new();
         let mut gemm_q8 = HashMap::new();
         let mut gemm_q8_logits = HashMap::new();
         let mut gemm_q8_rowk = HashMap::new();
@@ -721,26 +717,6 @@ impl StepPipelines {
                 )?,
             );
         }
-        for &(n, k) in &[(9216u32, HID as u32), (8192, HID as u32), (DENSE_FF * 2, HID as u32)] {
-            gemm_stacked_q4.insert(
-                (n, k),
-                crate::kernels::sub::gemm_block_stacked::pipeline_for(
-                    ctx,
-                    n,
-                    k,
-                    crate::kernels::sub::QuantFormat::Q4Affine,
-                )?,
-            );
-            gemm_stacked_nvfp4.insert(
-                (n, k),
-                crate::kernels::sub::gemm_block_stacked::pipeline_for(
-                    ctx,
-                    n,
-                    k,
-                    crate::kernels::sub::QuantFormat::NvFp4,
-                )?,
-            );
-        }
         let prod = variant;
         let dump = crate::kernels::sub::variant::KernelVariant::TEST_DUMP;
         Ok(Self {
@@ -758,8 +734,6 @@ impl StepPipelines {
             half_to_f32: crate::kernels::sub::half_to_f32::pipeline_for(ctx, prod)?,
             gemm_q4,
             gemm_nvfp4,
-            gemm_stacked_q4,
-            gemm_stacked_nvfp4,
             gemm_q8,
             gemm_q8_logits,
             gemm_q8_rowk,
@@ -855,15 +829,6 @@ impl StepPipelines {
         }
     }
 
-    fn block_stacked(&self, format: QuantFormat, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
-        let map = match format {
-            QuantFormat::NvFp4 => &self.gemm_stacked_nvfp4,
-            _ => &self.gemm_stacked_q4,
-        };
-        map.get(&(n, k))
-            .ok_or(Error::Format("missing block_stacked pipeline"))
-    }
-
     fn block_grouped(
         &self,
         format: QuantFormat,
@@ -918,6 +883,7 @@ pub(crate) struct StepBuffers {
 
 struct StepEnc<'a> {
     enc: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
+    ctx: &'a MetalContext,
     ps: &'a StepPipelines,
     bufs: &'a StepBuffers,
     block_profile: StepBlockProfile,
@@ -1216,30 +1182,19 @@ impl StepEnc<'_> {
         k: u32,
         n_total: u32,
     ) -> Result<(), Error> {
-        // Inline the segment table per dispatch via set_bytes. A shared device buffer
-        // would be overwritten by later stacked dispatches batched into the same command
-        // buffer (host writes are immediate but the GPU reads at execution time), so every
-        // dispatch would observe the last layer's segments. set_bytes copies the table into
-        // per-command storage (direct encoder transient args / ICB const pool).
         debug_assert!(segs.len() <= STACKED_SEG_MAX, "too many stacked segments");
-        let mut seg_arr = [crate::kernels::sub::gemm_block_stacked::GemmStackedSeg {
-            n_cols: 0,
-            y_col0: 0,
-            y_row_cols: 0,
-            _pad: 0,
-            w_off: 0,
-            y_byte_off: 0,
-        }; STACKED_SEG_MAX];
-        seg_arr[..segs.len()].copy_from_slice(segs);
-        let ps = self.ps.block_stacked(self.block_profile.format, n_total, k)?;
-        self.sink_set_pipeline(ps);
+        let ps = crate::kernels::sub::gemm_block_stacked::stacked_pipeline_for(
+            self.ctx,
+            n_total,
+            k,
+            self.block_profile.format,
+            segs,
+        )?;
+        self.sink_set_pipeline(ps.as_ref());
         self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
         self.sink_set_buffer(&self.bufs.arena, 0, 1);
         self.bind_blob(2);
-        self.sink_set_bytes(&seg_arr, 3);
-        let n_segs = segs.len() as u32;
-        self.sink_set_bytes(&n_segs, 4);
-        self.sink_set_bytes(&m, 5);
+        self.sink_set_bytes(&m, 3);
         let grid = MTLSize {
             width: div_up(n_total as usize, crate::kernels::sub::gemm_common::n_tile()),
             height: div_up(m as usize, crate::kernels::sub::gemm_common::M_TILE),
@@ -3153,6 +3108,7 @@ impl StepRuntime {
             enc: cmd
                 .computeCommandEncoder()
                 .ok_or(Error::Format("compute encoder alloc failed"))?,
+            ctx: &self.ctx,
             ps: &self.pipelines,
             bufs: &self.bufs,
             block_profile: self.block_profile,
@@ -3183,6 +3139,7 @@ impl StepRuntime {
             .ok_or(Error::Format("compute encoder alloc failed"))?;
         let mut enc = StepEnc {
             enc: enc_obj,
+            ctx: &self.ctx,
             ps: &self.pipelines,
             bufs: &self.bufs,
             block_profile: self.block_profile,
@@ -5939,7 +5896,7 @@ mod tests {
 
     #[test]
     fn fused_gate_up_gemm_matches_split_in_full_arena() {
-        use crate::kernels::sub::gemm_block_stacked::{bind_gpu_buffers, pipeline_for};
+        use crate::kernels::sub::gemm_block_stacked::pipeline_for;
         use crate::kernels::sub::gemm_q4;
         use crate::kernels::sub::QuantFormat;
         use crate::metal::buffer::BufferPool;
@@ -5988,12 +5945,6 @@ mod tests {
         let arena = pool
             .allocate(&ctx.device, arena_map.bytes() as usize)
             .expect("arena");
-        let buf_segs = pool
-            .allocate(
-                &ctx.device,
-                segs.len() * std::mem::size_of::<crate::kernels::sub::gemm_block_stacked::GemmStackedSeg>(),
-            )
-            .expect("segs");
 
         let m = CANVAS;
         let k = HID;
@@ -6005,32 +5956,26 @@ mod tests {
             let dst = arena.contents().as_ptr().add(arena_map.tmp_off() as usize) as *mut u16;
             std::ptr::copy_nonoverlapping(x_bits.as_ptr(), dst, x_bits.len());
         }
-        BufferPool::write_bytes(
-            &buf_segs,
-            unsafe {
-                std::slice::from_raw_parts(
-                    segs.as_ptr() as *const u8,
-                    segs.len()
-                        * std::mem::size_of::<crate::kernels::sub::gemm_block_stacked::GemmStackedSeg>(),
-                )
-            },
-        );
 
-        let pipeline = pipeline_for(&ctx, n_total, k as u32, QuantFormat::Q4Affine).expect("pipe");
+        let pipeline = pipeline_for(
+            &ctx,
+            n_total,
+            k as u32,
+            QuantFormat::Q4Affine,
+            &segs,
+        )
+        .expect("pipe");
         let (grid, tg) = crate::kernels::sub::gemm_common::dispatch_shape(m, n_total as usize);
         let cmd = ctx.queue.commandBuffer().expect("cmd");
         let enc = cmd.computeCommandEncoder().expect("enc");
         enc.setComputePipelineState(&pipeline.pipeline);
+        let m_u32 = m as u32;
         unsafe {
             enc.setBuffer_offset_atIndex(Some(&arena), arena_map.tmp_off() as usize, 0);
             enc.setBuffer_offset_atIndex(Some(&arena), 0, 1);
             enc.setBuffer_offset_atIndex(Some(&gpu_blob.buffer), 0, 2);
-            enc.setBuffer_offset_atIndex(Some(&buf_segs), 0, 3);
         }
-        let n_segs = segs.len() as u32;
-        let m_u32 = m as u32;
-        crate::kernels::sub::gpu_common::set_bytes(&enc, &n_segs, 4);
-        crate::kernels::sub::gpu_common::set_bytes(&enc, &m_u32, 5);
+        crate::kernels::sub::gpu_common::set_bytes(&enc, &m_u32, 3);
         enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
         enc.endEncoding();
         cmd.commit();
