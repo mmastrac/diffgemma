@@ -66,7 +66,6 @@ impl MetalContext {
         gemm_k: u32,
         is_full_layer: bool,
         quant_format: u32,
-        y_fp16: bool,
         x_fp16: bool,
     ) -> Result<ComputePipeline, Error> {
         let library = self.compile_library(source)?;
@@ -78,7 +77,6 @@ impl MetalContext {
             gemm_k,
             is_full_layer,
             quant_format,
-            y_fp16,
             x_fp16,
         )
     }
@@ -122,7 +120,6 @@ impl MetalContext {
         let debug_deep = variant.debug_deep;
         let gemm_n_tile = crate::kernels::sub::gemm_common::n_tile() as u32;
         let is_full_layer = false;
-        let y_fp16 = false;
         let x_fp16 = false;
         unsafe {
             fc.setConstantValue_type_atIndex(
@@ -164,11 +161,6 @@ impl MetalContext {
                 std::ptr::NonNull::from_ref(&gemm_k).cast(),
                 MTLDataType::UInt,
                 6,
-            );
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&y_fp16).cast(),
-                MTLDataType::Bool,
-                9,
             );
             fc.setConstantValue_type_atIndex(
                 std::ptr::NonNull::from_ref(&x_fp16).cast(),
@@ -259,7 +251,6 @@ impl MetalContext {
         gemm_k: u32,
         is_full_layer: bool,
         quant_format: u32,
-        y_fp16: bool,
         x_fp16: bool,
     ) -> Result<ComputePipeline, Error> {
         let variant = crate::kernels::sub::variant::runtime_step_variant();
@@ -311,11 +302,6 @@ impl MetalContext {
                 6,
             );
             fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&y_fp16).cast(),
-                MTLDataType::Bool,
-                9,
-            );
-            fc.setConstantValue_type_atIndex(
                 std::ptr::NonNull::from_ref(&x_fp16).cast(),
                 MTLDataType::Bool,
                 10,
@@ -331,8 +317,7 @@ impl MetalContext {
             .newFunctionWithName_constantValues_error(&name, &fc)
             .map_err(|e| shader_compile_error(e))?;
         let label = format!(
-            "{entry}_qf{quant_format}_n{gemm_n}_k{gemm_k}_nt{gemm_n_tile}_yfp16{}_xfp16{}_sa{}_df{}_dd{}",
-            u8::from(y_fp16),
+            "{entry}_qf{quant_format}_n{gemm_n}_k{gemm_k}_nt{gemm_n_tile}_xfp16{}_sa{}_df{}_dd{}",
             u8::from(x_fp16),
             u8::from(shape_assert),
             u8::from(debug_fast),

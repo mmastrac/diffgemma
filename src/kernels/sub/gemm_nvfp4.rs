@@ -110,7 +110,6 @@ pub fn pipeline_for(
         false,
         super::QuantFormat::NvFp4 as u32,
         false,
-        false,
     )
 }
 

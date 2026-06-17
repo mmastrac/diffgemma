@@ -88,7 +88,7 @@ pub fn pipeline_for(
     n: u32,
     k: u32,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_gemm_subkernel(SHADER, ENTRY, n, k, false, super::QuantFormat::Q8 as u32, false, false)
+    ctx.compile_gemm_subkernel(SHADER, ENTRY, n, k, false, super::QuantFormat::Q8 as u32, false)
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -97,7 +97,9 @@ pub fn pipeline_for_logits(
     n: u32,
     k: u32,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_gemm_subkernel(SHADER, ENTRY, n, k, false, super::QuantFormat::Q8 as u32, true, false)
+    // Logits buffer is bf16 (arena layout); same kernel as pipeline_for —
+    // kept as a distinct entry point so call sites document intent (lm_head → logits buf).
+    ctx.compile_gemm_subkernel(SHADER, ENTRY, n, k, false, super::QuantFormat::Q8 as u32, false)
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]

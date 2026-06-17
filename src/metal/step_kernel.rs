@@ -782,7 +782,6 @@ impl StepPipelines {
                         k,
                         false,
                         crate::kernels::sub::QuantFormat::Q8 as u32,
-                        false,
                         true,
                     )?,
                 );

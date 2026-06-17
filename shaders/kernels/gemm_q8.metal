@@ -7,8 +7,6 @@ using namespace metal;
 #include "dequant.metal"
 #include "arena.metal"
 
-constant bool K_Y_FP16 [[function_constant(9)]];
-
 /// y[M,N] = x[M,K] @ Wq8[N,K]^T ; threadgroup (128,1,1).
 kernel void gemm_q8(
     device const ushort *x [[buffer(0)]],
@@ -62,11 +60,7 @@ kernel void gemm_q8(
         uint mm = i / 32, nn = i % 32;
         if (m0 + mm < M && n0 + nn < N) {
             ulong oi = (ulong)(m0 + mm) * N + n0 + nn;
-            if (K_Y_FP16) {
-                ((device half *)y)[oi] = half_store_bf16_round(ty[mm][nn]);
-            } else {
-                arena_store(y, oi, ty[mm][nn]);
-            }
+            arena_store(y, oi, ty[mm][nn]);
         }
     }
 }

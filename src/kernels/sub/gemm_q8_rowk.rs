@@ -89,7 +89,7 @@ pub fn pipeline_for(
     n: u32,
     k: u32,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_gemm_subkernel(SHADER, ENTRY, n, k, false, super::QuantFormat::Q8 as u32, false, false)
+    ctx.compile_gemm_subkernel(SHADER, ENTRY, n, k, false, super::QuantFormat::Q8 as u32, false)
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -98,7 +98,7 @@ pub fn pipeline_for_fp16_input(
     n: u32,
     k: u32,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_gemm_subkernel(SHADER, ENTRY, n, k, false, super::QuantFormat::Q8 as u32, false, true)
+    ctx.compile_gemm_subkernel(SHADER, ENTRY, n, k, false, super::QuantFormat::Q8 as u32, true)
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]

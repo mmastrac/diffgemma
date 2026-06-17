@@ -96,7 +96,6 @@ pub fn pipeline_for(
         false,
         super::QuantFormat::Q4Affine as u32,
         false,
-        false,
     )
 }
 

@@ -95,7 +95,6 @@ pub fn pipeline_for(
         false,
         format as u32,
         false,
-        false,
     )
 }
 

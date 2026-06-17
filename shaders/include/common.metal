@@ -17,11 +17,4 @@ inline float f32_round_bf16(float x) {
     return as_type<float>(as_type<uint>(x) & 0xFFFF0000u);
 }
 
-/// fp16 buffer store: bf16-round then IEEE fp16.
-/// Only used by GEMM kernels' optional `K_Y_FP16` output path (default off — bf16 arena path
-/// is used everywhere else). Kept here so the fp16 GEMM output branch still compiles.
-inline half half_store_bf16_round(float x) {
-    return half(f32_round_bf16(x));
-}
-
 #endif
