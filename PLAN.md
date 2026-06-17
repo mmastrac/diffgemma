@@ -15,7 +15,7 @@ End-to-end generation works on GPU through **two** engines that share weights, t
 
 The monolithic path is the production target.
 
-**Honest status (post-P1.1–P1.9):** Infrastructure for readable chat is in place. **`generate-monolithic` defaults to native Q4 for both step kernel and encoder prefill** (see P1.9). With those defaults, templated `"Hello"` @ 30L shows real entropy (`min_ent` ≪ ln vocab) but output can still be gibberish after 48 steps — canvas convergence (P1.6) remains the quality bottleneck.
+**Honest status (post-P1.1–P1.9):** Infrastructure for readable chat is in place. **`generate-monolithic` defaults to native Q4** for both step kernel and encoder prefill (see P1.9). Templated `"Hello"` @ 30L, seed 42: **coherent reply in 4 denoise steps** (`confident_stop`); P1.6 convergence gate met for default Hello path (2026-06).
 
 ### P1.6 telemetry findings (2026-06, seed 42, templated "Hello")
 
@@ -119,7 +119,7 @@ Buffer ABI in `diffgemma_step.metal` (version-bump to change).
 | P1.3 | `steps_eff` + accept/step telemetry | **done** | Visible in generate output |
 | P1.4 | Decode hygiene (display only) | **done** | Chat preview strips pad/filler |
 | P1.5 | Templated-chat quality gate (`step-ci`) | **done** | CI fails pad-heavy regression |
-| P1.6 | **Canvas convergence** — see telemetry findings above. Open: raise simultaneous low-H positions (forward/quant/KV/SC) or validate HF parity on same weights. | **open** | `low_ent` ≥ 15 late-block OR readable Hello @ 30L |
+| P1.6 | **Canvas convergence** — MoE scatter fix + q4 @ 30L. Hello seed 42: 4 steps, `accept/step` [239,252,256,256], text *"Hello! How can I help you today?"* | **done** | Readable Hello @ 30L |
 | P1.7 | HF accept parity (unit + `sampler_accept_entropy.json`) | **done** | Fixture tests pass; Metal uses equivalent prefix rule |
 | P1.8 | **Encoder prefill path** — respects `StepGenerateConfig.encoder_use_mps_q4`; generate defaults native Q4. | **done** | Correct KV + readable entropy @ 30L with defaults |
 | P1.9 | **MPS encoder KV parity** — `step-kv-parity`; MPS dense + GPU grouped MoE | **done** | `max_kv_diff` < 0.5 @ 30L |
@@ -127,20 +127,20 @@ Buffer ABI in `diffgemma_step.metal` (version-bump to change).
 | P1.11 | **Step-kernel MPS NVFP4** — `step-nvfp4-parity` gate; fused half-dequant in `gemm_block` | **done** | Parity passes @ 30L; MPS ≈ fused speed on M3 (dequant-bound) |
 | P2.0 | **MTLBinaryArchive pipeline cache** — persist compiled compute pipeline ISA across restarts. | **done** | Archive load/save under `~/.cache/diffgemma-mps/metal-pipelines/` |
 
-**P1 exit (unchanged):** `generate-monolithic -p "Hello"` default flags → coherent reply.
+**P1 exit:** met — `generate-monolithic -p "Hello"` @ 30L → coherent reply in 4 steps (seed 42).
 
 ### P2 — Close the latency gap to interactive
 
-P1.6 (convergence) remains the quality gate; P2.1 latency work can proceed in parallel.
+P1 quality gate cleared; focus shifts to step latency (ICB, SC fast path, fusion).
 
-| # | Task | Impact | Exit |
-|---|------|--------|------|
+| # | Task | Impact | Status | Exit |
+|---|------|--------|--------|------|
 | P2.1 | GPU round-trip elimination | High | **done** | ≤3 syncs/step, ≤1 MB readback/step on generate hot path |
-| P2.2 | ICB record/replay | High | steady-state encode ~= 0 |
-| P2.3 | SC softembed fast path | High @ step>0 | SC <= few % of step |
-| P2.4 | Dispatch fusion | Medium | dispatch count down |
-| P2.5 | lm_head over uncommitted positions only | Medium | +>=15% tok/s |
-| P2.6 | MPS Q8 lm_head; f16/f32 sweep | Medium | step <= 1.4 s stretch |
+| P2.2 | ICB record/replay | High | open | steady-state encode ~= 0 |
+| P2.3 | SC softembed fast path | High @ step>0 | open | SC <= few % of step |
+| P2.4 | Dispatch fusion | Medium | open | dispatch count down |
+| P2.5 | lm_head over uncommitted positions only (`frozen[]` mask, compact→gather→partial GEMM→scatter) | Medium | **done** | Hello @ 30L: ~25% denoise time vs full lm_head (`DGQ_PARTIAL_LM_HEAD=0`); +33% denoise tok/s (36.8 vs 27.6) |
+| P2.6 | MPS Q8 lm_head; f16/f32 sweep | Medium | open | step <= 1.4 s stretch |
 
 **P2 exit:** `bench-step-kernel` <= 1.8 s/step @ 30L; >= 8 tok/s e2e with P1 active.
 
@@ -298,12 +298,12 @@ inline void debug_set_error(device DebugStatus *st, uint code, uint kernel_id,
 ## Execution order
 
 ```
-P1.6 (convergence)  -->  ship quality
-P2.1 done; P2.2–P2.6 (latency) in parallel with P1.6 experiments
-     P1.7–P1.10 done (accept rule, MPS Q4 fix, parity gates)
+P1.6 done (Hello @ 30L)  -->  quality shipped
+P2.1 + P2.5 done (hot path + partial lm_head)
+P2.2 (ICB) → P2.3 (SC fast path)  -->  interactive latency
 ```
 
-**Critical path to interactive:** P1.6 → P2.2 (ICB) → P2.3 (SC fast path).
+**Critical path to interactive:** P2.2 (ICB) → P2.3 (SC fast path); partial lm_head (P2.5) already cuts denoise ~25%.
 
 ---
 

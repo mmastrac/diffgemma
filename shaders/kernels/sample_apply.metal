@@ -22,6 +22,10 @@ kernel void sample_apply(
     }
     K_ELEMENTWISE_GUARD();
 
+    if (frozen_at(S, row)) {
+        return;
+    }
+
     float t = temp_at(S->step - 1u, P);
     float mx = rowstat[row * 2u], Z = rowstat[row * 2u + 1u];
     dgq_assert_positive_f32(dbg, DbgKernelSampleApply, Z, row);

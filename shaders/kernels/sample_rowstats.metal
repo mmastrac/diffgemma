@@ -25,6 +25,17 @@ kernel void sample_rowstats(
     }
     K_ELEMENTWISE_GUARD();
 
+    if (frozen_at(S, row)) {
+        if (lid == 0u) {
+            S->entropy[row] = 0.f;
+            S->prev_argmax[row] = S->ids[row];
+            rowstat[row * 2u] = 0.f;
+            rowstat[row * 2u + 1u] = 1.f;
+            S->new_sample[row] = S->ids[row];
+        }
+        return;
+    }
+
     float t = temp_at(S->step, P);
 
     device const half *lr = logits + (ulong)row * cols;

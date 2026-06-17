@@ -164,6 +164,7 @@ fn blank_state(f: &Fixture) -> CanvasState {
         mean_entropy: 0.0,
         accept_plateau: 0,
         prev_accept_sig: 0,
+        frozen: [0; crate::metal::FROZEN_WORDS],
     }
 }
 

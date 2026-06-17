@@ -74,6 +74,9 @@ fn shader_bundle_token() -> u64 {
         include_str!("../../shaders/kernels/sample_from_probs_rows.metal"),
         include_str!("../../shaders/kernels/scale_logits.metal"),
         include_str!("../../shaders/kernels/scatter_vocab_chunk.metal"),
+        include_str!("../../shaders/kernels/compact_active_rows.metal"),
+        include_str!("../../shaders/kernels/gather_rows_bf16.metal"),
+        include_str!("../../shaders/kernels/scatter_logits_rows.metal"),
         include_str!("../../shaders/monolithic/diffgemma_step.metal"),
     ] {
         src.hash(&mut h);

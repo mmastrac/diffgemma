@@ -37,6 +37,7 @@ const STEP_SHADER: &str = shader_include::include_metal!("monolithic/diffgemma_s
 pub const HID: usize = 2816;
 pub const VOCAB: usize = 262144;
 pub const CANVAS: usize = 256;
+pub const FROZEN_WORDS: usize = CANVAS / 32;
 pub const ARGMAX_HIST_MAX: usize = crate::sample::ARGMAX_HIST_MAX;
 pub const N_LAYERS: usize = 30;
 pub const N_EXPERTS: usize = 128;
@@ -153,6 +154,45 @@ pub struct CanvasState {
     pub mean_entropy: f32,
     pub accept_plateau: u32,
     pub prev_accept_sig: u32,
+    pub frozen: [u32; FROZEN_WORDS],
+}
+
+/// P2.5: skip lm_head on canvas rows committed in prior denoise steps within this block.
+pub fn partial_lm_head_enabled() -> bool {
+    match std::env::var("DGQ_PARTIAL_LM_HEAD") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
+/// Minimum frozen rows before partial lm_head (avoids compact/gather overhead on step 1).
+const PARTIAL_LM_MIN_FROZEN: usize = 8;
+
+#[inline]
+pub fn frozen_at(state: &CanvasState, i: usize) -> bool {
+    (state.frozen[i >> 5] >> (i & 31)) & 1 != 0
+}
+
+pub fn count_unfrozen(state: &CanvasState) -> u32 {
+    let mut n = 0u32;
+    for i in 0..CANVAS {
+        if !frozen_at(state, i) {
+            n += 1;
+        }
+    }
+    n
+}
+
+pub fn partial_lm_active_rows(state: &CanvasState) -> u32 {
+    if !partial_lm_head_enabled() {
+        return CANVAS as u32;
+    }
+    let frozen = CANVAS - count_unfrozen(state) as usize;
+    if frozen < PARTIAL_LM_MIN_FROZEN {
+        CANVAS as u32
+    } else {
+        count_unfrozen(state)
+    }
 }
 
 #[repr(C)]
@@ -499,6 +539,9 @@ struct StepPipelines {
     sample_commit: ComputePipeline,
     sample_apply: ComputePipeline,
     sample_write: ComputePipeline,
+    compact_active_rows: ComputePipeline,
+    gather_rows_bf16: ComputePipeline,
+    scatter_logits_rows: ComputePipeline,
 }
 
 impl StepPipelines {
@@ -637,6 +680,15 @@ impl StepPipelines {
             sample_commit: crate::kernels::sub::sample_commit::pipeline_for(ctx, prod)?,
             sample_apply: crate::kernels::sub::sample_apply::pipeline_for(ctx, prod)?,
             sample_write: crate::kernels::sub::sample_write::pipeline_for(ctx, prod)?,
+            compact_active_rows: ctx.compile_kernel(
+                shader_include::include_metal!("kernels/compact_active_rows.metal"),
+                "compact_active_rows",
+            )?,
+            gather_rows_bf16: crate::kernels::sub::gather_rows_bf16::pipeline_for(ctx, prod)?,
+            scatter_logits_rows: ctx.compile_kernel(
+                shader_include::include_metal!("kernels/scatter_logits_rows.metal"),
+                "scatter_logits_rows",
+            )?,
         })
     }
 
@@ -744,6 +796,8 @@ struct StepEnc<'a> {
     use_sc_chunked: bool,
     tensor_offsets: &'a HashMap<String, u64>,
     recorder: Option<&'a mut crate::metal::step_icb::IcbRecorder>,
+    /// Active canvas rows for lm_head (P2.5); `CANVAS` when full lm_head.
+    partial_lm_m: u32,
 }
 
 impl<'a> StepEnc<'a> {
@@ -1135,11 +1189,12 @@ impl StepEnc<'_> {
         m: u32,
         n: u32,
         k: u32,
+        logits_byte_off: usize,
     ) -> Result<(), Error> {
         let ps = self.ps.q8_logits(n, k)?;
         self.sink_set_pipeline(ps);
         self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
-        self.bind_logits(1);
+        self.sink_set_buffer(&self.bufs.logits, logits_byte_off, 1);
         self.bind_blob(2);
         self.sink_set_bytes( &w_off, 3);
         self.sink_set_bytes( &m, 4);
@@ -1975,13 +2030,19 @@ impl StepEnc<'_> {
                 Ok(())
             }
             StepStage::LmHeadGemm => {
-                self.gemm_q8_logits(
-                    self.arena().tmp_off(),
-                    layout.embed,
-                    CANVAS as u32,
-                    VOCAB as u32,
-                    HID as u32,
-                )
+                let m = self.partial_lm_m;
+                if partial_lm_head_enabled() && m < CANVAS as u32 {
+                    self.encode_partial_lm_head(layout, m)
+                } else {
+                    self.gemm_q8_logits(
+                        self.arena().tmp_off(),
+                        layout.embed,
+                        CANVAS as u32,
+                        VOCAB as u32,
+                        HID as u32,
+                        0,
+                    )
+                }
             }
             StepStage::Softcap => {
                 self.dispatch_softcap();
@@ -2128,19 +2189,92 @@ impl StepEnc<'_> {
         Ok(())
     }
 
+    fn encode_partial_lm_head(
+        &mut self,
+        layout: &ModelLayout,
+        m: u32,
+    ) -> Result<(), Error> {
+        let token_list_off = std::mem::offset_of!(RouteScratch, token_list);
+        let num_slots_off = std::mem::offset_of!(RouteScratch, num_slots);
+        let compact_row = CANVAS as u32 - m;
+        let logits_off = (compact_row as usize) * VOCAB * 2;
+
+        self.sink_set_pipeline(&self.ps.compact_active_rows);
+        self.bind_state(0);
+        self.sink_set_buffer(&self.bufs.route, token_list_off, 1);
+        self.sink_set_buffer(&self.bufs.route, num_slots_off, 2);
+        let grid = MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        self.sink_dispatch(grid, tg);
+
+        let gather_dims = [0u32, HID as u32];
+        let gather_count = (m as usize) * HID;
+        self.dispatch_1d_ranged(&self.ps.gather_rows_bf16, gather_count, 256, |this, base, _chunk| {
+            this.sink_set_buffer(&this.bufs.arena, this.arena().tmp_off() as usize, 0);
+            this.sink_set_buffer(&this.bufs.route, token_list_off, 1);
+            this.sink_set_buffer(&this.bufs.arena, this.arena().dense_off() as usize, 2);
+            this.sink_set_buffer(&this.bufs.dummy_dump, 0, 5);
+            this.sink_set_bytes(&gather_dims, 3);
+            this.sink_set_bytes(&m, 4);
+            this.sink_set_bytes(&base, 6);
+        });
+
+        self.gemm_q8_logits(
+            self.arena().dense_off(),
+            layout.embed,
+            m,
+            VOCAB as u32,
+            HID as u32,
+            logits_off,
+        )?;
+
+        let dims = [m, VOCAB as u32];
+        self.sink_set_pipeline(&self.ps.scatter_logits_rows);
+        self.sink_set_buffer(&self.bufs.logits, logits_off, 0);
+        self.sink_set_buffer(&self.bufs.logits, 0, 1);
+        self.sink_set_buffer(&self.bufs.route, token_list_off, 2);
+        self.sink_set_bytes(&dims, 3);
+        let grid = MTLSize {
+            width: VOCAB,
+            height: m as usize,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+        self.sink_dispatch(grid, tg);
+        Ok(())
+    }
+
     fn encode_step_finish(
         &mut self,
         layout: &ModelLayout,
         mode: StepFinishMode,
     ) -> Result<(), Error> {
         self.rmsnorm(self.arena().hidden_off(), self.arena().tmp_off(), layout.final_norm, HID as u32, CANVAS);
-        self.gemm_q8_logits(
-            self.arena().tmp_off(),
-            layout.embed,
-            CANVAS as u32,
-            VOCAB as u32,
-            HID as u32,
-        )?;
+        let m = self.partial_lm_m;
+        if partial_lm_head_enabled() && m < CANVAS as u32 {
+            self.encode_partial_lm_head(layout, m)?;
+        } else {
+            self.gemm_q8_logits(
+                self.arena().tmp_off(),
+                layout.embed,
+                CANVAS as u32,
+                VOCAB as u32,
+                HID as u32,
+                0,
+            )?;
+        }
         self.dispatch_softcap();
         if mode == StepFinishMode::ForwardOnly {
             return Ok(());
@@ -2271,6 +2405,7 @@ pub fn init_canvas_state_from_rng(vocab: usize, rng: &mut Rng) -> CanvasState {
         mean_entropy: 0.0,
         accept_plateau: 0,
         prev_accept_sig: 0,
+        frozen: [0; FROZEN_WORDS],
     }
 }
 
@@ -2678,6 +2813,7 @@ impl StepRuntime {
         state.mean_entropy = 0.0;
         state.accept_plateau = 0;
         state.prev_accept_sig = 0;
+        state.frozen = [0; FROZEN_WORDS];
         self.write_canvas_state(&state);
         self.write_params(params);
     }
@@ -2751,6 +2887,7 @@ impl StepRuntime {
             use_sc_chunked: self.use_sc_chunked,
             tensor_offsets: &self.tensor_offsets,
             recorder: None,
+            partial_lm_m: CANVAS as u32,
         };
         f(&mut enc)?;
         enc.enc.endEncoding();
@@ -2780,6 +2917,7 @@ impl StepRuntime {
             use_sc_chunked: self.use_sc_chunked,
             tensor_offsets: &self.tensor_offsets,
             recorder: Some(recorder),
+            partial_lm_m: CANVAS as u32,
         };
         f(&mut enc)?;
         enc.enc.endEncoding();
@@ -3005,7 +3143,9 @@ impl StepRuntime {
             );
         }
         let first_step = if st_before.step == 0 { 1u32 } else { 0u32 };
-        if self.icb_replay_allowed(finish) {
+        let partial_lm_m = partial_lm_active_rows(&st_before);
+        let use_partial_lm = partial_lm_m < CANVAS as u32;
+        if self.icb_replay_allowed(finish) && !use_partial_lm {
             if first_step == 1 {
                 self.ensure_no_sc_icb()?;
             } else if crate::metal::step_icb::step_icb_with_sc_enabled() {
@@ -3025,6 +3165,7 @@ impl StepRuntime {
             }
         }
         self.dispatch_and_wait(|enc| {
+            enc.partial_lm_m = partial_lm_m;
             enc.interpret_step(&layout, layers, first_step, finish)
         })?;
         self.check_debug_status()
@@ -3334,6 +3475,7 @@ pub fn run_step_probe(model_dir: &Path, cfg: StepSmokeConfig) -> Result<StepProb
             CANVAS as u32,
             VOCAB as u32,
             HID as u32,
+            0,
         )?;
         enc.dispatch_softcap();
         Ok(())
@@ -4450,6 +4592,7 @@ pub fn run_step_forward(model_dir: &Path, cfg: &StepSmokeConfig) -> Result<StepF
             CANVAS as u32,
             VOCAB as u32,
             HID as u32,
+            0,
         )?;
         enc.dispatch_softcap();
         Ok(())

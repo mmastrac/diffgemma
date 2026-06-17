@@ -25,6 +25,7 @@ kernel void sample_write(
                 uint t = S->new_sample[i];
                 dgq_assert_token_id(dbg, DbgKernelSampleWrite, t, vocab_size);
                 S->ids[i] = t;
+                set_frozen(S, i);
             } else {
                 st = lcg_next(st);
                 uint t = uint(st >> 32) % vocab_size;

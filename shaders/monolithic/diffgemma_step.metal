@@ -91,6 +91,7 @@ struct CanvasState {
     uint argmax_hist[2048];
     uint canvas_stable;
     float mean_entropy; uint accept_plateau; uint prev_accept_sig;
+    uint frozen[8];
 };
 struct RouteScratch {
     half weight[256][8]; uint expert[256][8];

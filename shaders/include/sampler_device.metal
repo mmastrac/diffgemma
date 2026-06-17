@@ -4,6 +4,7 @@
 /// Shared sampler state layouts (must match `step_kernel.rs` CanvasState / StepParams).
 constant uint DGQ_SAMPLER_MAX_CANVAS = 256u;
 constant uint DGQ_SAMPLER_ARGMAX_HIST_MAX = 8u;
+constant uint DGQ_SAMPLER_FROZEN_WORDS = 8u;
 
 struct StepParams {
     uint kv_len;
@@ -37,7 +38,16 @@ struct CanvasState {
     float mean_entropy;
     uint accept_plateau;
     uint prev_accept_sig;
+    uint frozen[8];
 };
+
+inline bool frozen_at(device const CanvasState *S, uint i) {
+    return ((S->frozen[i >> 5] >> (i & 31u)) & 1u) != 0u;
+}
+
+inline void set_frozen(device CanvasState *S, uint i) {
+    S->frozen[i >> 5] |= 1u << (i & 31u);
+}
 
 inline ulong lcg_next(ulong s) { return s * 6966169279ul + 1039523323ul; }
 inline float lcg_f32(ulong s) { return float(uint(s >> 32)) * (1.0f / 4294967296.0f); }
