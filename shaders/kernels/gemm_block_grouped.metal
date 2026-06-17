@@ -12,6 +12,9 @@ using namespace metal;
 /// Tiled grouped MoE GEMM: one expert segment per threadgroup row.
 /// `C[m,N] = A[m,K] @ W[job]^T` for rows `m in [row_starts[e], row_starts[e+1])`.
 /// Format from K_QUANT_FORMAT (FC3). N/K from GEMM_N/GEMM_K (FC5–6).
+///
+/// Double-buffered K-tile: MMA on tile i overlaps with dequant of tile i+1.
+/// One barrier per K-tile (vs two in the single-buffered variant).
 kernel void gemm_block_grouped(
     device const float *a [[buffer(0)]],
     device const uchar *blob [[buffer(1)]],
@@ -32,7 +35,6 @@ kernel void gemm_block_grouped(
     }
 
     // Tier-2: distinguish "expert has 0 tokens" from "bucketing never ran".
-    // row_starts[num_jobs] is total assignments; must be >0 when canvas has tokens.
     if (K_SHAPE_ASSERT && e == 0u && tgid.x == 0u && lid.x == 0u && row_starts[num_jobs] == 0u) {
         c[0] = as_type<float>(0x7fc00000u);
         return;
@@ -53,8 +55,9 @@ kernel void gemm_block_grouped(
     const GroupedJob job = jobs[e];
     const ulong w_off = job.w_byte_off;
 
-    threadgroup half tx[GEMM_M_TILE][GEMM_K_TILE];
-    threadgroup half tw[GEMM_N_TILE_MAX][GEMM_K_TILE];
+    // Double-buffered K-tile storage: ping-pong so MMA on tile i overlaps with load of tile i+1.
+    threadgroup half tx_buf[2u][GEMM_M_TILE][GEMM_K_TILE];
+    threadgroup half tw_buf[2u][GEMM_N_TILE_MAX][GEMM_K_TILE];
     const uint ltid = lid.x;
 
     const bool is_nvfp4 = (K_QUANT_FORMAT == QUANT_NVFP4);
@@ -70,36 +73,76 @@ kernel void gemm_block_grouped(
     for (uint m_base = 0u; m_base < M; m_base += GEMM_M_TILE) {
         const uint M_tile = min(GEMM_M_TILE, M - m_base);
         const uint row0 = m0 + m_base;
+
         simdgroup_float8x8 acc0(0.f), acc1(0.f), acc2(0.f), acc3(0.f);
         simdgroup_float8x8 acc4(0.f), acc5(0.f), acc6(0.f), acc7(0.f);
         simdgroup_float8x8 acc8(0.f), acc9(0.f), acc10(0.f), acc11(0.f);
         simdgroup_float8x8 acc12(0.f), acc13(0.f), acc14(0.f), acc15(0.f);
 
-        for (uint k0 = 0u; k0 < K; k0 += GEMM_K_TILE) {
-            gemm_load_a_tile_f32(a, M_tile, K, row0, k0, ltid, tx);
+        const uint n_k_tiles = (K + GEMM_K_TILE - 1u) / GEMM_K_TILE;
+
+        // --- Prime: load tile 0 into buffer 0 ---
+        {
+            const uint k0 = 0u;
+            gemm_load_a_tile_f32(a, M_tile, K, row0, k0, ltid, tx_buf[0u]);
             if (ltid < GEMM_N_TILE) {
                 const uint r = ltid;
                 const uint global_n = n0 + r;
                 if (global_n >= N) {
-                    gemm_block_zero_tw_row(tw, r);
+                    gemm_block_zero_tw_row(tw_buf[0u], r);
                 } else if (is_nvfp4) {
                     device const uchar *row = blob + body + (ulong)global_n * rowB;
                     const float gscale = as_type<float>(*(device const uint *)(blob + w_off));
-                    dequant_nvfp4_tile_half_fused_tg(row, K, k0, &tw[r][0], gscale);
+                    dequant_nvfp4_tile_half_fused_tg(row, K, k0, &tw_buf[0u][r][0], gscale);
                 } else {
                     dequant_q4_group_half_tg(
                         blob + body + (ulong)global_n * rowB + (ulong)(k0 / 32u) * 20ul,
-                        &tw[r][0]);
+                        &tw_buf[0u][r][0]);
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        // --- Steady state: MMA on cur buffer, prefetch into nxt buffer ---
+        for (uint ti = 0u; ti < n_k_tiles; ++ti) {
+            const uint cur = ti & 1u;
+            const uint nxt = 1u - cur;
+
+            // MMA on `cur` buffer (already loaded + barriered before this iter).
             gemm_block_mma_k32(
-                tx, tw, sgid, acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7, acc8, acc9, acc10,
-                acc11, acc12, acc13, acc14, acc15);
+                tx_buf[cur], tw_buf[cur], sgid,
+                acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7,
+                acc8, acc9, acc10, acc11, acc12, acc13, acc14, acc15);
+
+            // Prefetch next K-tile into `nxt` buffer (if any). Overlaps with MMA above.
+            if (ti + 1u < n_k_tiles) {
+                const uint k0 = (ti + 1u) * GEMM_K_TILE;
+                gemm_load_a_tile_f32(a, M_tile, K, row0, k0, ltid, tx_buf[nxt]);
+                if (ltid < GEMM_N_TILE) {
+                    const uint r = ltid;
+                    const uint global_n = n0 + r;
+                    if (global_n >= N) {
+                        gemm_block_zero_tw_row(tw_buf[nxt], r);
+                    } else if (is_nvfp4) {
+                        device const uchar *row = blob + body + (ulong)global_n * rowB;
+                        const float gscale = as_type<float>(*(device const uint *)(blob + w_off));
+                        dequant_nvfp4_tile_half_fused_tg(row, K, k0, &tw_buf[nxt][r][0], gscale);
+                    } else {
+                        dequant_q4_group_half_tg(
+                            blob + body + (ulong)global_n * rowB + (ulong)(k0 / 32u) * 20ul,
+                            &tw_buf[nxt][r][0]);
+                    }
+                }
+            }
+
+            // Single barrier: ensures prefetch into `nxt` completes before next iter's MMA reads it,
+            // and MMA on `cur` completes before a later iter reuses `cur` as `nxt`.
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
-        threadgroup float ty[GEMM_M_TILE][GEMM_N_TILE_MAX];
+        // Store accumulators to threadgroup f32 tile (aliased over tw_buf, which is dead after MMA),
+        // then to global memory. ty[32][128] float (16KB) overlays tw_buf[2][128][32] half (16KB).
+        threadgroup float (*ty)[GEMM_N_TILE_MAX] = (threadgroup float (*)[GEMM_N_TILE_MAX]) tw_buf;
         gemm_block_mma_store(
             ty, sgid, acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7, acc8, acc9, acc10, acc11,
             acc12, acc13, acc14, acc15);
@@ -111,5 +154,8 @@ kernel void gemm_block_grouped(
                 c[(ulong)(m0 + m_base + mm) * N + n0 + nn] = f32_round_bf16(ty[mm][nn]);
             }
         }
+
+        // Barrier before next m_base iteration reuses tx_buf/tw_buf.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }

@@ -154,6 +154,7 @@ P1 quality gate cleared; focus shifts to step latency (ICB, SC fast path, fusion
 | `half_to_f32` + `gather_rows` | ~8 + ~23 ms | Fused `gather_rows_bf16_to_f32` (bf16 `moein` → f32 scratch, no full-canvas convert) | `a99be6d` — bandwidth win; small wall time |
 | Stacked QKV / gate_up GEMM + 128 N-tile | part of pre_moe | `gemm_block_stacked` FC segments, default `N_TILE=128` | `4f5d1be`, `4727a04`, `8b45396` — isolated GEMM ~10% faster; neutral e2e |
 | Attention barrier merge (simdgroup dot sum) | part of attention | All threads sum `red[]` after one TG barrier; drop thread-0-only publish | 3→2 barriers/KV step; tail barrier kept for parity |
+| Grouped GEMM double-buffered K-tile | ~535 ms combined (35%) | Ping-pong `tx_buf[2]`+`tw_buf[2]`; MMA on tile i overlaps dequant of tile i+1; `ty` aliased over `tw_buf` to fit 32 KB TG limit; 2→1 barrier/K-tile | `pending` — 2.07→1.95 s/step (~6%); fusion parity maintained |
 
 **Open — `encode_layer` (pre-MoE)**
 
@@ -169,7 +170,7 @@ P1 quality gate cleared; focus shifts to step latency (ICB, SC fast path, fusion
 
 | Priority | Stage | ~Cost | Options |
 |----------|-------|-------|---------|
-| 1 | **gate_up** + **down** | ~535 ms combined (~35%) | Grouped GEMM occupancy for small per-expert `M` (~33 tok/expert); fewer TG barriers per K-tile; **not** MPS grouped (NOTES: ~3.7k encodes/step) |
+| 1 | **gate_up** + **down** | ~451 ms combined (~33%) | Grouped GEMM occupancy for small per-expert `M` (~33 tok/expert); **double-buffered K-tile landed** (2→1 barrier/K-tile); further: larger `tpg` / head tiling, MPS grouped (NOTES: ~3.7k encodes/step) |
 | 2 | **scatter** | ~73 ms (5%) | Smaller grid or fuse with down output |
 | 3 | **swiglu** | ~10 ms | Fuse with gate_up output (low ROI) |
 
