@@ -782,7 +782,9 @@ impl StepPipelines {
                         k,
                         false,
                         crate::kernels::sub::QuantFormat::Q8 as u32,
-                        true,
+                        // x (sc_probs) is bf16, not fp16: x_fp16 must be false or the
+                        // bf16 prob bits get reinterpreted as fp16 (garbage softembed).
+                        false,
                     )?,
                 );
             }
@@ -1499,7 +1501,9 @@ impl StepEnc<'_> {
         n: u32,
         k: u32,
     ) -> Result<(), Error> {
-        let ps = self.ps.q8_rowk_xfp16(n, k)?;
+        // x (sc_probs) is bf16, so use the bf16-input pipeline (not xfp16) — reading
+        // bf16 prob bits as fp16 produces garbage softembed.
+        let ps = self.ps.q8_rowk(n, k)?;
         self.sink_set_pipeline(ps);
         self.sink_set_buffer(x_buf, 0, 0);
         self.sink_set_buffer(&self.bufs.arena, y_off as usize, 1);
@@ -1577,8 +1581,11 @@ impl StepEnc<'_> {
     ) {
         self.sink_set_pipeline(&self.ps.f32_to_half_scale);
         self.sink_set_buffer(src_buf, 0, 0);
+        // Arena is already bound at `y_off`; the shader adds `base` on top of the
+        // binding offset, so `base` must be 0 (passing `y_off` here double-applies
+        // the offset and leaves the real slot at zero).
         self.sink_set_buffer(&self.bufs.arena, y_off as usize, 1);
-        self.sink_set_bytes(&(y_off as u32), 2);
+        self.sink_set_bytes(&0u32, 2);
         self.sink_set_bytes(&(len as u32), 3);
         self.sink_set_bytes(&scale, 4);
         self.sink_set_buffer(&self.bufs.dummy_dump, 0, 5);
