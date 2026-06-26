@@ -344,6 +344,7 @@ mod tests {
                 token_ids,
                 denoise_steps_run: 2,
                 blocks_committed: 1,
+                stopped_on_eot: false,
                 block_steps_eff: block_steps,
                 last_block_accept_hist: vec![16, 16],
                 last_block_min_entropy_hist: vec![0.05, 0.04],

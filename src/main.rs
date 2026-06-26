@@ -4939,15 +4939,27 @@ fn run_chat_cmd(
         }
     };
 
+    // Full-message chat: generate until the model emits its end-of-turn token
+    // rather than a fixed token budget. `--max-new-tokens` (default 256) becomes
+    // a per-turn safety cap; raise it so a normal reply can span several 256-token
+    // blocks. The KV arena is sized once at session open and is fixed thereafter,
+    // so pick a roomy `max_seq` up front (4096 ≈ 960 MiB KV @ 240 KiB/token).
+    const CHAT_MAX_SEQ: usize = 4096;
+    let full_message_cap = max_new_tokens.max(1024);
+
+    let stop_token_ids = config::load_generation_stop_tokens(model_dir);
+    eprintln!("chat: full-message stop tokens = {stop_token_ids:?}, cap = {full_message_cap}");
+
     let sampler = sample::sampler_for_steps(steps, no_early_stop);
     let mut step_cfg = StepGenerateConfig::from_generate(
         seed,
-        max_new_tokens,
-        512,
+        full_message_cap,
+        CHAT_MAX_SEQ,
         layers,
         sampler,
         no_early_stop,
     );
+    step_cfg.stop_token_ids = stop_token_ids;
 
     let mut session = match StepGenerateSession::open(model_dir, &step_cfg, None) {
         Ok((s, compile)) => {
@@ -4977,7 +4989,16 @@ fn run_chat_cmd(
      -> Result<(), safetensors::Error> {
         let prompt = build_chat_prompt_tokens(model_dir, history, raw_prompt)?;
         let prompt_len = prompt.len();
-        step_cfg.max_seq = (prompt_len + max_new_tokens).max(512);
+        // KV arena is fixed at session open (CHAT_MAX_SEQ); clamp the per-turn
+        // cap to whatever budget the prompt leaves.
+        let budget = CHAT_MAX_SEQ.saturating_sub(prompt_len);
+        if budget == 0 {
+            println!("model> (prompt fills the {CHAT_MAX_SEQ}-token context; cannot generate)");
+            history.push(chat_template::ChatTurn::model(String::new()));
+            *turn_idx = turn_idx.wrapping_add(1);
+            return Ok(());
+        }
+        step_cfg.max_new_tokens = full_message_cap.min(budget);
         step_cfg.seed = seed.wrapping_add(*turn_idx);
         *turn_idx = turn_idx.wrapping_add(1);
 
@@ -4995,9 +5016,14 @@ fn run_chat_cmd(
             println!("model> {reply}");
         }
         let new_tokens = out.token_ids.len().saturating_sub(prompt_len);
+        let stop_note = if out.stopped_on_eot {
+            "turn ended"
+        } else {
+            "hit token cap (reply may be truncated)"
+        };
         eprintln!(
-            "  turn: {new_tokens} new tokens, {} denoise steps, {:.2?}",
-            out.denoise_steps_run, elapsed
+            "  turn: {new_tokens} new tokens, {} blocks, {} denoise steps, {:.2?} ({stop_note})",
+            out.blocks_committed, out.denoise_steps_run, elapsed
         );
         history.push(chat_template::ChatTurn::model(reply));
         Ok(())

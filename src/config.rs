@@ -5,6 +5,44 @@ use crate::safetensors::Error;
 use serde::Deserialize;
 use std::path::Path;
 
+/// Parse the `eos_token_id` config field (scalar or list) into a stop-token set,
+/// defaulting to `[1]` when absent or empty.
+fn parse_eos_token_ids(value: &serde_json::Value) -> Vec<u32> {
+    let ids: Vec<u32> = match value {
+        serde_json::Value::Number(n) => vec![n.as_u64().unwrap_or(1) as u32],
+        serde_json::Value::Array(a) => a
+            .iter()
+            .filter_map(|v| v.as_u64())
+            .map(|v| v as u32)
+            .collect(),
+        _ => Vec::new(),
+    };
+    if ids.is_empty() {
+        vec![1]
+    } else {
+        ids
+    }
+}
+
+/// Generation stop-token ids, preferring `generation_config.json`'s
+/// `eos_token_id` (authoritative for decoding — Gemma 4 lists
+/// `[<eos>=1, <turn|>=106, <|tool_response>=50]`) and falling back to
+/// `config.json`, then `[1]`.
+pub fn load_generation_stop_tokens(model_dir: impl AsRef<Path>) -> Vec<u32> {
+    let dir = model_dir.as_ref();
+    let gen_path = dir.join("generation_config.json");
+    if let Ok(json) = std::fs::read_to_string(&gen_path) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json) {
+            if let Some(eos) = value.get("eos_token_id") {
+                return parse_eos_token_ids(eos);
+            }
+        }
+    }
+    ModelConfig::load(dir)
+        .map(|c| c.eos_token_ids())
+        .unwrap_or_else(|_| vec![1])
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelConfig {
     pub architectures: Vec<String>,
@@ -96,6 +134,13 @@ impl ModelConfig {
         }
     }
 
+    /// All configured end-of-sequence / end-of-turn ids. Gemma 4 chat sets this
+    /// to `[<eos>=1, <turn|>=106]`; any of them ends a generated turn. Falls back
+    /// to `[1]` when the field is missing or empty.
+    pub fn eos_token_ids(&self) -> Vec<u32> {
+        parse_eos_token_ids(&self.eos_token_id)
+    }
+
     pub fn load(model_dir: impl AsRef<Path>) -> Result<Self, Error> {
         let path = model_dir.as_ref().join("config.json");
         let json = std::fs::read_to_string(&path)?;
@@ -173,5 +218,27 @@ impl ModelConfig {
         for (i, kind) in t.layer_types.iter().enumerate() {
             println!("    layer {i:2}: {kind}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_eos_token_ids;
+    use serde_json::json;
+
+    #[test]
+    fn parses_gemma_eos_turn_pair() {
+        assert_eq!(parse_eos_token_ids(&json!([1, 106])), vec![1, 106]);
+    }
+
+    #[test]
+    fn parses_scalar_eos() {
+        assert_eq!(parse_eos_token_ids(&json!(1)), vec![1]);
+    }
+
+    #[test]
+    fn defaults_to_one_when_missing_or_empty() {
+        assert_eq!(parse_eos_token_ids(&json!(null)), vec![1]);
+        assert_eq!(parse_eos_token_ids(&json!([])), vec![1]);
     }
 }

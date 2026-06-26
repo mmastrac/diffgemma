@@ -46,6 +46,10 @@ pub struct GenerateOutput {
     pub token_ids: Vec<u32>,
     pub denoise_steps_run: usize,
     pub blocks_committed: usize,
+    /// True when generation ended because a committed block emitted an
+    /// end-of-turn / EOS token (full-message mode) rather than exhausting the
+    /// `max_new_tokens` budget.
+    pub stopped_on_eot: bool,
     /// Effective denoise steps per committed block (monolithic path).
     pub block_steps_eff: Vec<u32>,
     /// Accepted positions per step in the last committed block.
@@ -615,6 +619,7 @@ fn generate_inner(
         token_ids: sequences,
         denoise_steps_run,
         blocks_committed,
+        stopped_on_eot: false,
         block_steps_eff: {
             #[cfg(all(feature = "metal", target_os = "macos"))]
             {

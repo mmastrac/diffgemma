@@ -29,6 +29,11 @@ pub struct StepGenerateConfig {
     pub no_early_stop: bool,
     /// Override random canvas (256 ids) for parity with MLX/HF traces.
     pub initial_canvas_ids: Option<Vec<u32>>,
+    /// End-of-turn / EOS ids that terminate a "full message". When non-empty,
+    /// generation stops (and the sequence is truncated) as soon as a committed
+    /// block emits any of these. Empty preserves the fixed `max_new_tokens`
+    /// budget behavior used by parity/golden paths.
+    pub stop_token_ids: Vec<u32>,
 }
 
 impl StepGenerateConfig {
@@ -48,6 +53,7 @@ impl StepGenerateConfig {
             sampler,
             no_early_stop,
             initial_canvas_ids: None,
+            stop_token_ids: Vec::new(),
         }
     }
 }
@@ -289,6 +295,7 @@ pub fn generate_with_session(
     let mut step_traces = Vec::new();
     let max_steps = cfg.sampler.max_denoising_steps.max(1);
     let mut initial_canvas_ids: Option<Vec<u32>> = None;
+    let mut stopped_on_eot = false;
 
     for _block in 0..max_blocks {
         if sequences.len() >= prompt_token_ids.len() + cfg.max_new_tokens {
@@ -551,8 +558,30 @@ pub fn generate_with_session(
         }
 
         let argmax_tokens: Vec<u32> = st.prev_argmax.to_vec();
+        let block_base = sequences.len();
         sequences.extend_from_slice(&argmax_tokens);
         blocks_committed += 1;
+
+        // Full-message stop: end the turn as soon as the committed block emits a
+        // stop token (e.g. <turn|> or <eos>). Trim it and everything after so the
+        // reply is exactly the model's turn, and skip the KV extend.
+        if !cfg.stop_token_ids.is_empty() {
+            if let Some(rel) = argmax_tokens
+                .iter()
+                .position(|id| cfg.stop_token_ids.contains(id))
+            {
+                sequences.truncate(block_base + rel);
+                stopped_on_eot = true;
+                if progress_enabled() {
+                    eprintln!(
+                        "step-generate: block {block_idx} hit stop token {} at offset {rel}; ending turn ({} new tokens)",
+                        argmax_tokens[rel],
+                        sequences.len() - prompt_token_ids.len()
+                    );
+                }
+                break;
+            }
+        }
 
         if !is_last_block {
             let extend_started = Instant::now();
@@ -599,6 +628,7 @@ pub fn generate_with_session(
         token_ids: sequences.clone(),
         denoise_steps_run,
         blocks_committed,
+        stopped_on_eot,
         block_steps_eff,
         last_block_accept_hist,
         last_block_min_entropy_hist,

@@ -188,7 +188,12 @@ fn write_q8_tensor(out: &mut impl Write, src: &[u8], shape: &[i64]) -> Result<u6
 }
 
 fn copy_sidecar_files(source: &Path, dest: &Path) -> Result<(), Error> {
-    for name in ["config.json", "tokenizer.json", "tokenizer_config.json"] {
+    for name in [
+        "config.json",
+        "generation_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ] {
         let src = source.join(name);
         if src.is_file() {
             fs::copy(&src, dest.join(name))?;
