@@ -37,6 +37,11 @@ const STEP_SHADER: &str = shader_include::include_metal!("monolithic/diffgemma_s
 pub const HID: usize = 2816;
 pub const VOCAB: usize = 262144;
 pub const CANVAS: usize = 256;
+/// Up-scale applied to SC softembed probs before the fp16 GEMM tiles and divided
+/// back out of the final scale. Must match `SC_PROB_GEMM_SCALE` in
+/// `shaders/include/sc_prob_scale.metal`. Keeps near-uniform probs (~2^-18) out
+/// of fp16's denormal range (normal min 2^-14).
+pub const SC_PROB_GEMM_SCALE: f32 = 4096.0;
 pub const FROZEN_WORDS: usize = CANVAS / 32;
 pub const ARGMAX_HIST_MAX: usize = crate::sample::ARGMAX_HIST_MAX;
 pub const N_LAYERS: usize = 30;
@@ -1663,10 +1668,10 @@ impl StepEnc<'_> {
             )?;
             v0 += chunk;
         }
-        // Convert f32 accumulator → bf16 arena soft slot, applying embed_scale * sqrt(HID).
-        // (Original half path scales by sqrt(HID); softembed kernel applies embed_scale.
-        //  Here we fold both into one scale since we skip the sc_softembed kernel's scale.)
-        let scale = (HID as f32).sqrt();
+        // Convert f32 accumulator → bf16 arena soft slot, applying embed_scale
+        // (== sqrt(HID)) and dividing out the SC_PROB_GEMM_SCALE that sc_prob_cols
+        // multiplied into the probs to keep them in fp16's normal range.
+        let scale = (HID as f32).sqrt() / SC_PROB_GEMM_SCALE;
         self.f32_to_half_scale(
             &self.bufs.gemm_b,
             self.arena().soft_off(),
@@ -1704,7 +1709,11 @@ impl StepEnc<'_> {
                 HID as u32,
                 VOCAB as u32,
             )?;
-            self.scale_half_arena(self.arena().soft_off(), CANVAS * HID as usize, (HID as f32).sqrt());
+            self.scale_half_arena(
+                self.arena().soft_off(),
+                CANVAS * HID as usize,
+                (HID as f32).sqrt() / SC_PROB_GEMM_SCALE,
+            );
         } else {
             use crate::dgq::embed_row::EMBED_SCALE;
 
@@ -5847,9 +5856,13 @@ mod tests {
     fn sc_gemm_softembed_matches_slow_kernel() {
         use std::path::Path;
 
-        let dir = [Path::new("/tmp/quantized-weights"), Path::new("model/q4")]
-            .into_iter()
-            .find(|p| crate::dgq::store::looks_like_dgq_dir(p));
+        let dir = [
+            Path::new("/tmp/quantized-weights"),
+            Path::new("model/diffusiongemma-q4"),
+            Path::new("model/q4"),
+        ]
+        .into_iter()
+        .find(|p| crate::dgq::store::looks_like_dgq_dir(p));
         let Some(dir) = dir else {
             eprintln!("skip sc_gemm_softembed_matches_slow_kernel");
             return;
@@ -5865,13 +5878,19 @@ mod tests {
             .expect("seed logits from step 1");
 
         let soft_elems = CANVAS * HID;
+        let soft_off = rt.bufs.arena_map.soft_off() as usize;
         rt.dispatch_and_wait(|enc| {
             enc.encode_sc_logit_rowstats();
             enc.encode_sc_softembed_path(&layout, false, false)?;
             Ok(())
         })
         .expect("slow sc softembed");
-        let slow = read_arena_buffer_f32(&rt.bufs.arena, rt.bufs.arena_map.soft_off() as usize, soft_elems);
+        let slow = read_arena_buffer_f32(&rt.bufs.arena, soft_off, soft_elems);
+
+        // Clear soft_off so a GEMM path that writes the wrong slot (the
+        // double-offset bug) is caught instead of comparing the slow values that
+        // were left in place.
+        write_buffer_bytes(&rt.bufs.arena, soft_off, &vec![0u8; soft_elems * 2]);
 
         rt.dispatch_and_wait(|enc| {
             enc.encode_sc_logit_rowstats();
@@ -5904,9 +5923,13 @@ mod tests {
         unsafe {
             std::env::set_var("DGQ_SC_CHUNKED", "0");
         }
-        let dir = [Path::new("/tmp/quantized-weights"), Path::new("model/q4")]
-            .into_iter()
-            .find(|p| crate::dgq::store::looks_like_dgq_dir(p));
+        let dir = [
+            Path::new("/tmp/quantized-weights"),
+            Path::new("model/diffusiongemma-q4"),
+            Path::new("model/q4"),
+        ]
+        .into_iter()
+        .find(|p| crate::dgq::store::looks_like_dgq_dir(p));
         let Some(dir) = dir else {
             eprintln!("skip sc_chunked_matches_full_gemm_softembed");
             return;
@@ -5922,13 +5945,15 @@ mod tests {
             .expect("seed logits from step 1");
 
         let soft_elems = CANVAS * HID;
+        let soft_off = rt.bufs.arena_map.soft_off() as usize;
         rt.dispatch_and_wait(|enc| {
             enc.encode_sc_logit_rowstats();
             enc.encode_sc_softembed_path(&layout, true, false)?;
             Ok(())
         })
         .expect("full prob sc softembed");
-        let full = read_arena_buffer_f32(&rt.bufs.arena, rt.bufs.arena_map.soft_off() as usize, soft_elems);
+        let full = read_arena_buffer_f32(&rt.bufs.arena, soft_off, soft_elems);
+        write_buffer_bytes(&rt.bufs.arena, soft_off, &vec![0u8; soft_elems * 2]);
 
         rt.dispatch_and_wait(|enc| {
             enc.encode_sc_logit_rowstats();

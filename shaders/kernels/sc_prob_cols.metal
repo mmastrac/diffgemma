@@ -4,6 +4,7 @@ using namespace metal;
 #include "fc_axes.metal"
 #include "debug_status.metal"
 #include "arena.metal"
+#include "sc_prob_scale.metal"
 
 /// Softmax a vocab column slice for SC: probs[row, v0+col] from logits + rowstat.
 kernel void sc_prob_cols(
@@ -39,5 +40,8 @@ kernel void sc_prob_cols(
         return;
     }
     float x = arena_load(logits, (ulong)row * vocab + v);
-    arena_store(probs, (ulong)row * chunk + col, exp(x - mx) / sum);
+    // Scale into fp16's normal range before the half-precision GEMM tiles: a
+    // near-uniform prob (~2^-18) is an fp16 denormal (normal min 2^-14), which
+    // corrupts spread distributions. The GEMM caller divides this back out.
+    arena_store(probs, (ulong)row * chunk + col, (exp(x - mx) / sum) * SC_PROB_GEMM_SCALE);
 }

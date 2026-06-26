@@ -4,6 +4,7 @@ using namespace metal;
 #include "fc_axes.metal"
 #include "debug_status.metal"
 #include "arena.metal"
+#include "sc_prob_scale.metal"
 
 /// Materialize softmax rows from precomputed row stats (SC GEMM fast path).
 kernel void sc_probs(
@@ -31,7 +32,9 @@ kernel void sc_probs(
         dgq_assert_positive_f32(dbg, DbgKernelScProbs, sum, row);
     }
     device const ushort *lr = logits + (ulong)row * cols;
+    // Scale into fp16's normal range for the half-precision GEMM tiles (see
+    // sc_prob_scale.metal); the GEMM caller divides this back out.
     for (uint v = lid; v < cols; v += tpg) {
-        arena_store(probs, (ulong)row * cols + v, exp(arena_load(lr, v) - mx) / sum);
+        arena_store(probs, (ulong)row * cols + v, (exp(arena_load(lr, v) - mx) / sum) * SC_PROB_GEMM_SCALE);
     }
 }
