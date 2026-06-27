@@ -13,6 +13,10 @@ use objc2_metal::{MTLBuffer, MTLDevice};
 pub enum GpuLinearWeight {
     Bf16(CachedLinear),
     Q4(Q4LinearGpu),
+    /// q8 blob view (`.dgq` mixed-precision attention/FFN). Held by the CPU
+    /// experts-reference cache, which never GPU-dispatches these — the monolithic
+    /// forward reads them straight from the blob.
+    Q8(Q8LinearGpu),
 }
 
 impl GpuLinearWeight {
@@ -24,10 +28,15 @@ impl GpuLinearWeight {
         Self::Q4(view)
     }
 
+    pub fn q8(view: Q8LinearGpu) -> Self {
+        Self::Q8(view)
+    }
+
     pub fn in_dim(&self) -> usize {
         match self {
             Self::Bf16(w) => w.in_dim,
             Self::Q4(w) => w.in_dim,
+            Self::Q8(w) => w.in_dim,
         }
     }
 
@@ -35,6 +44,7 @@ impl GpuLinearWeight {
         match self {
             Self::Bf16(w) => w.out_dim,
             Self::Q4(w) => w.out_dim,
+            Self::Q8(w) => w.out_dim,
         }
     }
 
@@ -108,6 +118,7 @@ pub fn linear_batched_in_buf(
     bf16_pipeline: &ComputePipeline,
     q4_pipeline: &ComputePipeline,
     nvfp4_pipeline: &ComputePipeline,
+    q8_pipeline: &ComputePipeline,
     x_buf: &ProtocolObject<dyn MTLBuffer>,
     w: &GpuLinearWeight,
     seq_len: usize,
@@ -159,6 +170,21 @@ pub fn linear_batched_in_buf(
             }
             Ok(buf_c)
         }
+        GpuLinearWeight::Q8(q8) => {
+            let buf_c = batch.alloc_f32_out(out_len)?;
+            let (buf_w, off) = q8.weight_buffer();
+            batch.dispatch_q8_linear(
+                &q8_pipeline.pipeline,
+                x_buf,
+                buf_w,
+                off,
+                &buf_c,
+                seq_len,
+                w.out_dim(),
+                w.in_dim(),
+            );
+            Ok(buf_c)
+        }
     }
 }
 
@@ -167,6 +193,7 @@ pub fn linear_batched_in_cpu_out(
     bf16_pipeline: &ComputePipeline,
     q4_pipeline: &ComputePipeline,
     nvfp4_pipeline: &ComputePipeline,
+    q8_pipeline: &ComputePipeline,
     y: &mut [f32],
     x_buf: &ProtocolObject<dyn MTLBuffer>,
     w: &GpuLinearWeight,
@@ -180,6 +207,7 @@ pub fn linear_batched_in_cpu_out(
         bf16_pipeline,
         q4_pipeline,
         nvfp4_pipeline,
+        q8_pipeline,
         x_buf,
         w,
         seq_len,
@@ -194,6 +222,7 @@ pub fn linear_cached_batched_in_buf(
     bf16_pipeline: &ComputePipeline,
     q4_pipeline: &ComputePipeline,
     nvfp4_pipeline: &ComputePipeline,
+    q8_pipeline: &ComputePipeline,
     x_buf: &ProtocolObject<dyn MTLBuffer>,
     w: &GpuLinearWeight,
     seq_len: usize,
@@ -203,6 +232,7 @@ pub fn linear_cached_batched_in_buf(
         bf16_pipeline,
         q4_pipeline,
         nvfp4_pipeline,
+        q8_pipeline,
         x_buf,
         w,
         seq_len,
@@ -215,6 +245,7 @@ pub fn linear_cached_batched_in_cpu_out(
     bf16_pipeline: &ComputePipeline,
     q4_pipeline: &ComputePipeline,
     nvfp4_pipeline: &ComputePipeline,
+    q8_pipeline: &ComputePipeline,
     y: &mut [f32],
     x_buf: &ProtocolObject<dyn MTLBuffer>,
     w: &GpuLinearWeight,
@@ -225,6 +256,7 @@ pub fn linear_cached_batched_in_cpu_out(
         bf16_pipeline,
         q4_pipeline,
         nvfp4_pipeline,
+        q8_pipeline,
         y,
         x_buf,
         w,

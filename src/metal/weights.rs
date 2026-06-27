@@ -78,6 +78,25 @@ fn layer_scalar_from_bytes(src: &[u8]) -> Result<f32, Error> {
     }
 }
 
+/// Load an attention/dense-FFN linear by its stored kind: mixed-precision `.dgq`
+/// keeps these at q8, older uniform-q4 checkpoints at q4. Held only by the CPU
+/// experts-reference cache (never GPU-dispatched), so the q8 view is just a blob
+/// handle.
+fn load_attn_ffn_linear(
+    store: &DgqStore,
+    blob: Arc<DgqGpuBlob>,
+    name: &str,
+) -> Result<GpuLinearWeight, Error> {
+    let kind = store
+        .get_entry(name)
+        .and_then(|e| crate::dgq::layout::parse_quant_kind(&e.meta.kind).ok());
+    if kind == Some(crate::dgq::layout::QuantKind::Q8Row) {
+        Ok(GpuLinearWeight::q8(load_q8_linear(store, blob, name)?))
+    } else {
+        Ok(GpuLinearWeight::q4(load_block_linear(store, blob, name)?))
+    }
+}
+
 pub struct GpuLayerWeightCache {
     pub input_layernorm: Buffer<f32>,
     pub q_norm: Buffer<f32>,
@@ -171,29 +190,13 @@ impl GpuLayerWeightCache {
                 Arc::clone(&blob),
                 &keys.k_norm,
             )?)?,
-            q_proj: GpuLinearWeight::q4(load_block_linear(
-                store,
-                Arc::clone(&blob),
-                &keys.q_proj,
-            )?),
-            k_proj: GpuLinearWeight::q4(load_block_linear(
-                store,
-                Arc::clone(&blob),
-                &keys.k_proj,
-            )?),
+            q_proj: load_attn_ffn_linear(store, Arc::clone(&blob), &keys.q_proj)?,
+            k_proj: load_attn_ffn_linear(store, Arc::clone(&blob), &keys.k_proj)?,
             v_proj: match &shapes.v_proj {
-                Some(_) => Some(GpuLinearWeight::q4(load_block_linear(
-                    store,
-                    Arc::clone(&blob),
-                    &keys.v_proj,
-                )?)),
+                Some(_) => Some(load_attn_ffn_linear(store, Arc::clone(&blob), &keys.v_proj)?),
                 None => None,
             },
-            o_proj: GpuLinearWeight::q4(load_block_linear(
-                store,
-                Arc::clone(&blob),
-                &keys.o_proj,
-            )?),
+            o_proj: load_attn_ffn_linear(store, Arc::clone(&blob), &keys.o_proj)?,
             post_attn_norm: raw_blob_bf16_to_f32(&load_raw_view(
                 store,
                 Arc::clone(&blob),
@@ -224,21 +227,9 @@ impl GpuLayerWeightCache {
                 Arc::clone(&blob),
                 &keys.post_feedforward_layernorm_2,
             )?)?,
-            mlp_gate: GpuLinearWeight::q4(load_block_linear(
-                store,
-                Arc::clone(&blob),
-                &keys.mlp_gate,
-            )?),
-            mlp_up: GpuLinearWeight::q4(load_block_linear(
-                store,
-                Arc::clone(&blob),
-                &keys.mlp_up,
-            )?),
-            mlp_down: GpuLinearWeight::q4(load_block_linear(
-                store,
-                Arc::clone(&blob),
-                &keys.mlp_down,
-            )?),
+            mlp_gate: load_attn_ffn_linear(store, Arc::clone(&blob), &keys.mlp_gate)?,
+            mlp_up: load_attn_ffn_linear(store, Arc::clone(&blob), &keys.mlp_up)?,
+            mlp_down: load_attn_ffn_linear(store, Arc::clone(&blob), &keys.mlp_down)?,
             router_proj: raw_blob_bf16_to_f32(&load_raw_view(
                 store,
                 Arc::clone(&blob),
