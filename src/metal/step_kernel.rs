@@ -172,12 +172,12 @@ pub fn partial_lm_head_enabled() -> bool {
 
 /// Block-sparse (megablocks-style) MoE expert GEMM: pre-tile the ragged M into
 /// fixed <=32-row blocks and run one block per threadgroup (vs one
-/// variable-length threadgroup per expert). Bit-identical to the grouped path;
-/// `DGQ_MOE_BLOCK_SPARSE=1` on. Default off while it's being measured.
+/// variable-length threadgroup per expert). Bit-identical to the grouped path,
+/// ~6% faster per step — **default on**; `DGQ_MOE_BLOCK_SPARSE=0` to opt out.
 pub fn moe_block_sparse_enabled() -> bool {
     match std::env::var("DGQ_MOE_BLOCK_SPARSE") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
