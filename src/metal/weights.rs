@@ -87,13 +87,25 @@ fn load_attn_ffn_linear(
     blob: Arc<DgqGpuBlob>,
     name: &str,
 ) -> Result<GpuLinearWeight, Error> {
+    use crate::metal::linear::CachedLinear;
     let kind = store
         .get_entry(name)
         .and_then(|e| crate::dgq::layout::parse_quant_kind(&e.meta.kind).ok());
-    if kind == Some(crate::dgq::layout::QuantKind::Q8Row) {
-        Ok(GpuLinearWeight::q8(load_q8_linear(store, blob, name)?))
-    } else {
-        Ok(GpuLinearWeight::q4(load_block_linear(store, blob, name)?))
+    match kind {
+        Some(crate::dgq::layout::QuantKind::Raw) => {
+            // bf16 (mixed-precision attention/FFN): materialize a resident bf16 view.
+            let entry = store
+                .get_entry(name)
+                .ok_or_else(|| Error::NotFound(name.to_string()))?;
+            let out = entry.meta.shape[0] as usize;
+            let inp = entry.meta.shape[1] as usize;
+            let f32 = raw_blob_bf16_to_f32(&load_raw_view(store, blob, name)?)?;
+            Ok(GpuLinearWeight::Bf16(CachedLinear::from_f32(f32.as_slice(), out, inp)))
+        }
+        Some(crate::dgq::layout::QuantKind::Q8Row) => {
+            Ok(GpuLinearWeight::q8(load_q8_linear(store, blob, name)?))
+        }
+        _ => Ok(GpuLinearWeight::q4(load_block_linear(store, blob, name)?)),
     }
 }
 

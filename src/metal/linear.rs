@@ -78,6 +78,25 @@ impl CachedLinear {
         }
     }
 
+    /// Build from f32 weights (rounded to bf16). Used to materialize a bf16 (`Raw`)
+    /// .dgq linear into the resident bf16 cache.
+    pub fn from_f32(w: &[f32], out_dim: usize, in_dim: usize) -> Self {
+        assert_eq!(w.len(), out_dim * in_dim);
+        let mut buf = Buffer::new(w.len());
+        {
+            let dst = buf.as_slice_mut();
+            for (d, &v) in dst.iter_mut().zip(w.iter()) {
+                *d = crate::metal::gemm::f32_to_bf16(v);
+            }
+        }
+        Self {
+            w: buf,
+            in_dim,
+            out_dim,
+            gpu_w: std::cell::RefCell::new(None),
+        }
+    }
+
     pub fn gpu_weight(
         &self,
         device: &ProtocolObject<dyn MTLDevice>,

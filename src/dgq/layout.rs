@@ -173,12 +173,12 @@ pub fn classify_tensor(name: &str, shape: &[i64], profile: QuantProfile) -> Quan
         return QuantKind::Q8Row;
     }
     if shape.len() == 2 && is_gemm_linear(name) {
-        // Attention (q/k/v/o_proj) and the dense FFN (gate/up/down) keep 8-bit,
-        // matching MLX's mixed-precision 4-bit checkpoints. These tensors are ~8x
-        // more accurate at q8 than q4 and only ~2x larger; only the bulky MoE
-        // experts go to 4-bit. nvfp4 keeps its uniform block format.
+        // Attention (q/k/v/o_proj) and the dense FFN (gate/up/down) stay bf16
+        // (Raw): they are only ~2x larger than q8 but lossless into the half GEMM
+        // tiles (the source weights are bf16), beating MLX's q8 on these tensors.
+        // Only the bulky MoE experts go to 4-bit. nvfp4 keeps its block format.
         return match profile {
-            QuantProfile::Q4 | QuantProfile::Q5 => QuantKind::Q8Row,
+            QuantProfile::Q4 | QuantProfile::Q5 => QuantKind::Raw,
             QuantProfile::Nvfp4 => QuantKind::Nvfp4Block,
         };
     }

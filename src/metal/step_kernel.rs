@@ -672,6 +672,7 @@ struct StepPipelines {
     gemm_q4: HashMap<(u32, u32), ComputePipeline>,
     gemm_nvfp4: HashMap<(u32, u32), ComputePipeline>,
     gemm_q8: HashMap<(u32, u32), ComputePipeline>,
+    gemm_bf16: HashMap<(u32, u32), ComputePipeline>,
     gemm_q8_logits: HashMap<(u32, u32), ComputePipeline>,
     gemm_q8_rowk: HashMap<(u32, u32), ComputePipeline>,
     gemm_q8_rowk_xfp16: HashMap<(u32, u32), ComputePipeline>,
@@ -718,6 +719,7 @@ impl StepPipelines {
         let mut gemm_q4 = HashMap::new();
         let mut gemm_nvfp4 = HashMap::new();
         let mut gemm_q8 = HashMap::new();
+        let mut gemm_bf16 = HashMap::new();
         let mut gemm_q8_logits = HashMap::new();
         let mut gemm_q8_rowk = HashMap::new();
         let mut gemm_q8_rowk_xfp16 = HashMap::new();
@@ -739,6 +741,11 @@ impl StepPipelines {
             gemm_nvfp4.insert(
                 (n, k),
                 crate::kernels::sub::gemm_nvfp4::pipeline_for(ctx, n, k)?,
+            );
+            // bf16-weight GEMM for the mixed-precision attention/dense-FFN path.
+            gemm_bf16.insert(
+                (n, k),
+                crate::kernels::sub::gemm_bf16::pipeline_for(ctx, n, k)?,
             );
         }
         for &(n, k) in &[
@@ -846,6 +853,7 @@ impl StepPipelines {
             gemm_q4,
             gemm_nvfp4,
             gemm_q8,
+            gemm_bf16,
             gemm_q8_logits,
             gemm_q8_rowk,
             gemm_q8_rowk_xfp16,
@@ -918,6 +926,12 @@ impl StepPipelines {
         self.gemm_q8
             .get(&(n, k))
             .ok_or(Error::Format("missing q8 pipeline"))
+    }
+
+    fn bf16(&self, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
+        self.gemm_bf16
+            .get(&(n, k))
+            .ok_or(Error::Format("missing bf16 pipeline"))
     }
 
     fn q8_logits(&self, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
@@ -1034,6 +1048,9 @@ struct StepEnc<'a> {
     /// Attention + dense-FFN weights are stored q8 (mixed-precision .dgq): route
     /// their GEMMs through the q8 kernel and skip the q4-only fused stacked path.
     attn_ffn_q8: bool,
+    /// Attention + dense-FFN weights are stored bf16 (Raw): route their GEMMs
+    /// through the bf16 kernel and skip the q4-only fused stacked path.
+    attn_ffn_bf16: bool,
 }
 
 impl<'a> StepEnc<'a> {
@@ -1318,7 +1335,11 @@ impl StepEnc<'_> {
         k: u32,
     ) -> Result<(), Error> {
         // Attention/dense-FFN weights are the only tensors routed through gemm_q4;
-        // in mixed-precision .dgq they are stored q8, so dispatch the q8 kernel.
+        // in mixed-precision .dgq they are stored bf16 (or q8 on older checkpoints),
+        // so dispatch the matching kernel.
+        if self.attn_ffn_bf16 {
+            return self.gemm_bf16(x_off, y_off, w_off, m, n, k);
+        }
         if self.attn_ffn_q8 {
             return self.gemm_q8(x_off, y_off, w_off, m, n, k);
         }
@@ -1467,6 +1488,38 @@ impl StepEnc<'_> {
             self.bind_blob(2);
             self.sink_set_bytes( &w_off, 3);
             self.sink_set_bytes( &m, 4);
+        let grid = MTLSize {
+            width: div_up(n as usize, 32),
+            height: div_up(m as usize, crate::kernels::sub::gemm_common::M_TILE),
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: GEMM_THREADS_PER_TG,
+            height: 1,
+            depth: 1,
+        };
+        self.sink_dispatch(grid, tg);
+        Ok(())
+    }
+
+    /// bf16-weight GEMM (mixed-precision attention/dense-FFN). Same shape/dispatch
+    /// as gemm_q8; weights at `w_off` are bf16 [N,K] (no dequant).
+    fn gemm_bf16(
+        &mut self,
+        x_off: u64,
+        y_off: u64,
+        w_off: u64,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) -> Result<(), Error> {
+        let ps = self.ps.bf16(n, k)?;
+        self.sink_set_pipeline(ps);
+        self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
+        self.sink_set_buffer(&self.bufs.arena, y_off as usize, 1);
+        self.bind_blob(2);
+        self.sink_set_bytes(&w_off, 3);
+        self.sink_set_bytes(&m, 4);
         let grid = MTLSize {
             width: div_up(n as usize, 32),
             height: div_up(m as usize, crate::kernels::sub::gemm_common::M_TILE),
@@ -1845,7 +1898,7 @@ impl StepEnc<'_> {
 
     fn encode_layer_dense_gate_up(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
         let l = &layout.layers[layer];
-        if fused_gate_up_enabled() && !self.attn_ffn_q8 {
+        if fused_gate_up_enabled() && !self.attn_ffn_q8 && !self.attn_ffn_bf16 {
             let (segs, n_total) = gate_up_stacked_segments(l, self.arena());
             self.gemm_q4_stacked(
                 self.arena().tmp_off(),
@@ -2266,7 +2319,7 @@ impl StepEnc<'_> {
             HID as u32,
             CANVAS,
         );
-        if fused_qkv_enabled() && !self.attn_ffn_q8 {
+        if fused_qkv_enabled() && !self.attn_ffn_q8 && !self.attn_ffn_bf16 {
             let (segs, n_total) = qkv_stacked_segments(l, self.arena());
             self.gemm_q4_stacked(
                 self.arena().tmp_off(),
@@ -3262,6 +3315,7 @@ pub struct StepRuntime {
     use_sc_gemm: bool,
     use_sc_chunked: bool,
     attn_ffn_q8: bool,
+    attn_ffn_bf16: bool,
     layout: ModelLayout,
     tensor_offsets: HashMap<String, u64>,
     pub layers: usize,
@@ -3408,6 +3462,7 @@ impl StepRuntime {
             recorder: None,
             partial_lm_m: CANVAS as u32,
             attn_ffn_q8: self.attn_ffn_q8,
+            attn_ffn_bf16: self.attn_ffn_bf16,
         };
         f(&mut enc)?;
         enc.enc.endEncoding();
@@ -3440,6 +3495,7 @@ impl StepRuntime {
             recorder: Some(recorder),
             partial_lm_m: CANVAS as u32,
             attn_ffn_q8: self.attn_ffn_q8,
+            attn_ffn_bf16: self.attn_ffn_bf16,
         };
         f(&mut enc)?;
         enc.enc.endEncoding();
@@ -3893,13 +3949,14 @@ pub fn build_step_runtime(
     let layout = build_layout(&offsets, cfg.max_seq);
     let layers = cfg.layers.min(validated.num_layers).max(1);
 
-    // Mixed-precision .dgq keeps attention + dense-FFN at q8; detect it from the
-    // actual stored kind so old (uniform-q4) checkpoints still dispatch q4.
-    let attn_ffn_q8 = store
+    // Mixed-precision .dgq stores attention + dense-FFN as bf16 (Raw) — or q8 on
+    // earlier checkpoints. Detect from the actual stored kind so any vintage
+    // dispatches correctly (bf16 / q8 / uniform-q4).
+    let attn_ffn_kind = store
         .get_entry("model.decoder.layers.0.self_attn.q_proj.weight")
-        .and_then(|e| crate::dgq::layout::parse_quant_kind(&e.meta.kind).ok())
-        .map(|k| k == crate::dgq::layout::QuantKind::Q8Row)
-        .unwrap_or(false);
+        .and_then(|e| crate::dgq::layout::parse_quant_kind(&e.meta.kind).ok());
+    let attn_ffn_q8 = attn_ffn_kind == Some(crate::dgq::layout::QuantKind::Q8Row);
+    let attn_ffn_bf16 = attn_ffn_kind == Some(crate::dgq::layout::QuantKind::Raw);
 
     let block_profile = StepBlockProfile::from_store_profile(store.profile());
     match block_profile.format {
@@ -4051,6 +4108,7 @@ pub fn build_step_runtime(
         use_sc_gemm,
         use_sc_chunked,
         attn_ffn_q8,
+        attn_ffn_bf16,
         layout,
         tensor_offsets: offsets,
         layers,
