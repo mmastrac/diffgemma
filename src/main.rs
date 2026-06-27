@@ -5011,6 +5011,28 @@ fn run_chat_cmd(
         }
     };
 
+    // COLD-START-1: the first generation in a fresh session converges instantly to
+    // an empty/EOS reply (uninitialized first-forward state → peaked step-1 logits).
+    // Burn one throwaway generation, then reset KV so the first real turn prefills
+    // fresh. Must run before the `run_turn` closure captures `session`/`step_cfg`.
+    match build_chat_prompt_tokens(
+        model_dir,
+        &[chat_template::ChatTurn::user("Hi")],
+        raw_prompt,
+    ) {
+        Ok(warm) => {
+            let saved_cap = step_cfg.max_new_tokens;
+            step_cfg.max_new_tokens = 256;
+            eprintln!("chat: warming up session (cold-start workaround)...");
+            if let Err(err) = generate_with_session(&mut session, &warm, &step_cfg, "warmup") {
+                eprintln!("chat: warm-up generate failed: {err}");
+            }
+            step_cfg.max_new_tokens = saved_cap;
+            session.reset_kv();
+        }
+        Err(err) => eprintln!("chat: warm-up prompt build failed: {err}"),
+    }
+
     let mut history: Vec<chat_template::ChatTurn> = Vec::new();
     let mut turn_idx = 0u64;
 
