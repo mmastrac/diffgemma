@@ -51,7 +51,7 @@ Per-step is now bounded by MoE (q4 grouped GEMM) + dispatch/sync overhead, not t
 
 ### P2.7 open profile targets
 
-Tier-1 GEMM K-tile double-buffering, stacked QKV/gate-up, SC chunked f32-accumulate, partial lm_head, bf16/fp16 unification, and **block-sparse MoE GEMM** are **done** (see `NOTES.md` §4).
+Tier-1 GEMM K-tile double-buffering, stacked QKV/gate-up, SC chunked f32-accumulate, partial lm_head, bf16/fp16 unification, **block-sparse MoE GEMM** (§11), and **GQA matrix-unit attention** (§12, `DGQ_ATTN_MMA` default-on) are **done**.
 
 > **Profiling caveat:** `bench-step-kernel --layer-profile` inserts a GPU sync after every stage, so per-stage times collapse toward sync latency (~2.8s) — it flattens RMSNorms/router to look as costly as GEMMs and is **unreliable for compute breakdown**. Use `--profile-steps N` (whole forwards, production 1-sync structure). The honest 30-layer steady-state (SC) split below is from `--profile-steps`.
 
@@ -59,11 +59,11 @@ Tier-1 GEMM K-tile double-buffering, stacked QKV/gate-up, SC chunked f32-accumul
 
 | Priority | Stage | ~Cost | Options |
 |----------|-------|-------|---------|
-| 1 | MoE `gate_up` + `down` | ~17–21% | **Block-sparse landed (~6% step, bit-identical, `NOTES.md` §12).** Remaining: hoist W dequant out of per-block work; cut partial-last-tile padding |
+| 1 | MoE `gate_up` + `down` | ~17–21% | **Block-sparse landed (~6% step, bit-identical, `NOTES.md` §11).** Remaining: hoist W dequant out of per-block work; cut partial-last-tile padding |
 | 2 | qkv / o_proj / dense | ~24% (pre_moe) | Largest bucket. Fuse QK-norm + RoPE into QKV dispatch; fuse pre-FF RMSNorm/GLU |
 | 3 | finish (lm_head) | ~20% | Q8 lm_head tuning (P2.6); already has partial-lm-head |
 | 4 | preamble (SC) | ~19% | SC soft-embed is O(vocab); ICB fast path (P2.2) |
-| 5 | attention | small @ short ctx | Flash-style KV tiling matters once committed context grows (P2.8 windowing) |
+| 5 | attention | small @ short ctx | **GQA matrix-unit attention landed (§12, 1.63× sliding, ~3–4.5% step, default-on).** Further KV tiling matters once committed context grows (P2.8 windowing) |
 
 **Suggested order (revised by honest profile):** block-sparse MoE ✓ → dispatch/sync overhead (ICB, touches all buckets) → pre_moe fusion → finish/preamble.
 

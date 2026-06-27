@@ -181,6 +181,22 @@ pub fn moe_block_sparse_enabled() -> bool {
     }
 }
 
+/// GQA-grouped matrix-unit attention (`attention_mma2`) for sliding layers: 2 Q
+/// heads per threadgroup sharing K/V staging on the simdgroup_matrix units. ~1.6x
+/// vs the scalar online-softmax kernel at hd=256; only valid for sliding layers
+/// (full hd=512 layers keep scalar — 2-head O won't fit threadgroup memory).
+/// **Default on** (~3-4.5% per step); `DGQ_ATTN_MMA=0` to opt out (scalar path).
+/// Non-bit-identical (f16 MMA vs f32 scalar, cos 0.9999) but quality-neutral:
+/// the wobble is the same trajectory chaos the scalar path exhibits (verified
+/// multi-seed), and MMA is no further from the MLX-4bit reference than scalar
+/// (60 vs 69 matched-canvas mismatches). Sliding layers only; full hd=512 scalar.
+pub fn attn_mma_enabled() -> bool {
+    match std::env::var("DGQ_ATTN_MMA") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
 /// Algebraic fusion: QKV and dense gate+up as one stacked GEMM.
 /// `DGQ_FUSED_ALGEBRA=0` disables both; `DGQ_FUSED_QKV=0` / `DGQ_FUSED_GATE_UP=0` opt out individually.
 pub fn fused_algebra_enabled() -> bool {
@@ -704,6 +720,8 @@ struct StepPipelines {
     f32_to_half_scale: ComputePipeline,
     qk_rope_kv: ComputePipeline,
     attention: ComputePipeline,
+    /// GQA-grouped MMA attention for sliding layers (`DGQ_ATTN_MMA`); scalar `attention` is the fallback/oracle.
+    attention_mma2: ComputePipeline,
     residual: ComputePipeline,
     glu: ComputePipeline,
     router: ComputePipeline,
@@ -932,6 +950,7 @@ impl StepPipelines {
             f32_to_half_scale,
             qk_rope_kv: crate::kernels::sub::qk_rope_kv::pipeline_for(ctx, prod)?,
             attention: crate::kernels::sub::attention::pipeline_for(ctx, prod)?,
+            attention_mma2: crate::kernels::sub::attention::pipeline_mma2_for(ctx, prod)?,
             residual: crate::kernels::sub::residual_half::pipeline_for(ctx, prod)?,
             glu: crate::kernels::sub::swiglu::pipeline_for(
                 ctx,
@@ -2704,10 +2723,19 @@ impl StepEnc<'_> {
     fn encode_layer_attention_dispatch(
         &mut self,
         layer: usize,
-        _layout: &ModelLayout,
+        layout: &ModelLayout,
     ) -> Result<(), Error> {
         let layer_off = layer_byte_offset(layer);
-        self.sink_set_pipeline(&self.ps.attention);
+        let l = &layout.layers[layer];
+        // GQA-grouped MMA attention (`DGQ_ATTN_MMA`) only handles sliding layers
+        // (hd=256); full hd=512 layers keep the scalar kernel. Identical buffer
+        // layout — only the pipeline + dispatch grid differ.
+        let use_mma2 = attn_mma_enabled() && l.is_full == 0;
+        if use_mma2 {
+            self.sink_set_pipeline(&self.ps.attention_mma2);
+        } else {
+            self.sink_set_pipeline(&self.ps.attention);
+        }
         self.sink_set_buffer(&self.bufs.arena, self.arena().attnq_off() as usize, 0);
         self.bind_kvcache(1);
         self.sink_set_buffer(&self.bufs.arena, self.arena().attno_off() as usize, 2);
@@ -2719,10 +2747,20 @@ impl StepEnc<'_> {
         };
         self.sink_set_bytes(&attn_dims, 5);
         self.bind_debug_status(6);
-        let grid = MTLSize {
-            width: CANVAS,
-            height: 16,
-            depth: 1,
+        // Scalar: one threadgroup per (canvas token, Q head). MMA2: one per
+        // (MT-row query tile, KV head), 2 simdgroups = the 2 Q heads in the group.
+        let grid = if use_mma2 {
+            MTLSize {
+                width: CANVAS.div_ceil(crate::kernels::sub::attention::MMA_M_TILE),
+                height: l.n_kv_heads as usize,
+                depth: 1,
+            }
+        } else {
+            MTLSize {
+                width: CANVAS,
+                height: 16,
+                depth: 1,
+            }
         };
         let tg = MTLSize {
             width: 64,

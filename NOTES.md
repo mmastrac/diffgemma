@@ -435,3 +435,19 @@ Fix: pre-tile the ragged M into fixed ≤32-row blocks in `moe_bucket_fill` phas
 **Why ~6% not the ~8–10% ceiling:** the restructure fixes *load balance / scheduling*, not the two remaining wastes — W is still re-dequantized per block, and the partial-last-tile padding is unchanged. Honest profiling (PLAN P2.7, `--profile-steps`) also showed the expert GEMM is ~17–21% of the step (not the ~35% an older note assumed), so the bit-identical ceiling here is modest. Remaining levers if revisited: hoist W dequant out of per-block work; shrink/eliminate partial-tile padding.
 
 **Guard methodology:** validated bit-identicality via the entropy-curve / step-count comparison (generate accept curve + smoketest step counts) per `STRATEGY.md` §8/§11 — a GEMM restructure that drifted would surface as changed accepts/step-count, not an obvious crash. Contrast `partial-forward` (separate branch), which the same guard *rejected* as irreducibly lossy.
+
+---
+
+## 12. GQA-grouped matrix-unit attention (`DGQ_ATTN_MMA`, 2026-06)
+
+**Landed default-on; ~3–4.5% per step, non-bit-identical but quality-neutral.** `DGQ_ATTN_MMA=0` to opt out.
+
+The scalar attention (`attention.metal`, one threadgroup per (token, q-head), streaming online softmax) was the one core GEMM not on the Apple matrix units. `attention_mma2` moves Q·K and P·V onto `simdgroup_float8x8`, exploiting GQA (16 Q / 8 KV → 2 Q heads share each K/V): one threadgroup (QG=2 simdgroups, 64 lanes) handles both Q heads of a KV group, staging K/V **once** for both. That shared staging is the win — the first attempt (`attention_mma`, 1 head/threadgroup) was *slower* than scalar (0.69–0.80×) because the bf16→half staging tax and occupancy dominated, not softmax cycles. mma2 hits **1.63× vs scalar on sliding layers (hd256)**. Full hd=512 layers keep scalar (two-head O = 32 KiB > threadgroup limit).
+
+End-to-end: ~3% smoketest (1.70→1.65 s/step), ~4.5% on `--profile-steps` steady-state (1.55→1.48 s). Modest because attention is a small step fraction at short context; grows with multi-block context (P2.8).
+
+**Non-bit-identical (f16 MMA vs f32 scalar): cos 0.9999 / max_tol 2e-2 parity — ~16× looser than the chunked-SC precedent (cos 0.999994).** The single precision source is the **f16 softmax-prob cast** (`ph = half(p)`) feeding P·V; Q·K is effectively lossless (bf16→f16 widens the mantissa). Despite the looser parity it is **quality-neutral**, verified two ways:
+- *Multi-seed chaos symmetry:* across seeds 42/43/44 the scalar path glitches as much or more ("At Transformer is a type", "because to a phenomenon", "Transformer Transformer", channel-token leaks); step counts wobble both directions. The smoketest's "due of"/"neural learning" were chaotic samples, not deterministic MMA defects (didn't reproduce in fresh runs). The wobble is the model's existing trajectory chaos, not MMA degradation.
+- *MLX bench (matched canvas, sky blue, seed 42):* Rust converges in 14 steps vs MLX-4bit 16; both diverge from MLX ~step 1–3 from the **quant gap, not attention**. MMA is **no further from MLX than scalar — marginally closer (60 vs 69 mismatches)**. Precision-tightening the f16-prob is therefore unwarranted: the attention error is below the dominant Rust-vs-MLX quant gap and doesn't register.
+
+24 attention parity tests green; smoketest 16/16 both ways. `attention` (scalar) stays as the oracle/fallback and the full-layer path.
