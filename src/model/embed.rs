@@ -32,16 +32,31 @@ pub fn embed_tokens_from_store(
                 .get(1)
                 .filter(|&&d| d as usize == hidden)
                 .ok_or(Error::Format("embed hidden mismatch"))?;
+            let is_raw = crate::dgq::layout::parse_quant_kind(&entry.meta.kind).ok()
+                == Some(crate::dgq::layout::QuantKind::Raw);
             let src = dgq.tensor_bytes(EMBED_KEY)?;
-            let row_bytes = q8_row_bytes(hidden);
             assert_eq!(out.len(), token_ids.len() * hidden);
-            for (t, &id) in token_ids.iter().enumerate() {
-                let row = id as usize;
-                let row_src = &src[row * row_bytes..(row + 1) * row_bytes];
-                let out_row = &mut out[t * hidden..(t + 1) * hidden];
-                dequant_row_q8(row_src, hidden, out_row);
-                for v in out_row.iter_mut() {
-                    *v *= scale;
+            if is_raw {
+                // bf16 embed table: 2 bytes/elem, no per-row dequant.
+                for (t, &id) in token_ids.iter().enumerate() {
+                    let row = id as usize;
+                    let row_src = &src[row * hidden * 2..(row + 1) * hidden * 2];
+                    let out_row = &mut out[t * hidden..(t + 1) * hidden];
+                    for (o, b) in out_row.iter_mut().zip(row_src.chunks_exact(2)) {
+                        let bits = u16::from_le_bytes([b[0], b[1]]);
+                        *o = f32::from_bits((bits as u32) << 16) * scale;
+                    }
+                }
+            } else {
+                let row_bytes = q8_row_bytes(hidden);
+                for (t, &id) in token_ids.iter().enumerate() {
+                    let row = id as usize;
+                    let row_src = &src[row * row_bytes..(row + 1) * row_bytes];
+                    let out_row = &mut out[t * hidden..(t + 1) * hidden];
+                    dequant_row_q8(row_src, hidden, out_row);
+                    for v in out_row.iter_mut() {
+                        *v *= scale;
+                    }
                 }
             }
             Ok(())

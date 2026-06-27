@@ -46,10 +46,7 @@ pub fn prefill_gpu(
         .ok_or(Error::Format("gpu kv cache missing"))?;
     gpu_kv.reset_len();
 
-    if weights.is_dgq() {
-        let embed = weights
-            .embed_q8()
-            .ok_or(Error::Format("dgq embed table missing"))?;
+    if let Some(embed) = weights.embed_q8() {
         let blob = weights
             .dgq_blob()
             .ok_or(Error::Format("dgq blob missing"))?;
@@ -63,6 +60,7 @@ pub fn prefill_gpu(
             &mut enc_scratch.hidden_a[..seq_len * hidden],
         )?;
     } else {
+        // Non-dgq (bf16 store) or dgq with bf16 (Raw) embed table: CPU gather.
         embed_tokens_from_store(
             store,
             &mut enc_scratch.embed_buf[..seq_len * hidden],
@@ -191,10 +189,7 @@ pub fn extend_prefill_gpu(
         return Err(Error::Format("gpu/cpu kv_len mismatch"));
     }
 
-    if weights.is_dgq() {
-        let embed = weights
-            .embed_q8()
-            .ok_or(Error::Format("dgq embed table missing"))?;
+    if let Some(embed) = weights.embed_q8() {
         let blob = weights
             .dgq_blob()
             .ok_or(Error::Format("dgq blob missing"))?;
@@ -208,6 +203,7 @@ pub fn extend_prefill_gpu(
             &mut enc_scratch.hidden_a[..seq_len * hidden],
         )?;
     } else {
+        // Non-dgq (bf16 store) or dgq with bf16 (Raw) embed table: CPU gather.
         embed_tokens_from_store(
             store,
             &mut enc_scratch.embed_buf[..seq_len * hidden],

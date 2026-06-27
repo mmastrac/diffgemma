@@ -169,7 +169,14 @@ pub fn classify_tensor(name: &str, shape: &[i64], profile: QuantProfile) -> Quan
     if name.contains("_norm") || name.ends_with(".scale") || name.contains("layer_scalar") {
         return QuantKind::Raw;
     }
-    if name.contains("embed_tokens") || name.contains("self_conditioning") {
+    if name.contains("embed_tokens") {
+        // Tied to the lm_head (logits = hidden @ embed^T) and the SC soft-embed.
+        // bf16 (Raw, lossless) keeps logits sharp on hard tail tokens — q8 per-row
+        // is ~1.76x coarser than MLX's group-64 affine and stalls tail convergence.
+        // Only ~+0.74 GiB (one tensor), unlike the bulky experts.
+        return QuantKind::Raw;
+    }
+    if name.contains("self_conditioning") {
         return QuantKind::Q8Row;
     }
     if shape.len() == 2 && is_gemm_linear(name) {
@@ -235,10 +242,20 @@ mod tests {
             ),
             QuantKind::Raw,
         );
+        // embed_tokens is bf16 (Raw): tied lm_head + SC need accurate logits.
         assert_eq!(
             classify_tensor(
                 "model.decoder.embed_tokens.weight",
                 &[262144, 2816],
+                QuantProfile::Q4,
+            ),
+            QuantKind::Raw,
+        );
+        // self_conditioning stays q8 per-row.
+        assert_eq!(
+            classify_tensor(
+                "model.decoder.self_conditioning.gate_proj.weight",
+                &[2112, 2816],
                 QuantProfile::Q4,
             ),
             QuantKind::Q8Row,

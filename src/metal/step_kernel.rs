@@ -698,10 +698,16 @@ struct StepPipelines {
     /// Q4 grouped MoE with K_DUMP_STAGE=1 (debug capture only — never in forward/generate).
     moe_grouped_dump: ComputePipeline,
     embed_gather: ComputePipeline,
+    /// bf16-embed input gather (embed_tokens stored Raw).
+    embed_gather_bf16: ComputePipeline,
     logit_rowstats: ComputePipeline,
     sc_prob_cols: ComputePipeline,
     sc_probs: ComputePipeline,
     sc_softembed: ComputePipeline,
+    /// bf16-embed slow SC softembed (DGQ_SC_GEMM=0 on Raw-embed blobs).
+    sc_softembed_bf16: ComputePipeline,
+    /// f32-accumulate chunked SC softembed with bf16 embed (keyed (HID, LM_HEAD_CHUNK)).
+    gemm_bf16_rowk_acc_f32: HashMap<(u32, u32), ComputePipeline>,
     half_scale: ComputePipeline,
     half_scale_fp16: ComputePipeline,
     softcap: ComputePipeline,
@@ -808,6 +814,26 @@ impl StepPipelines {
                 );
             }
         }
+        let mut gemm_bf16_rowk_acc_f32 = HashMap::new();
+        {
+            // bf16-embed variant of the chunked SC softembed f32-accumulate GEMM.
+            const ACC_BF16_SHADER: &str =
+                shader_include::include_metal!("kernels/gemm_bf16_rowk_acc_f32.metal");
+            for &(n, k) in &[(HID as u32, crate::model::embed::LM_HEAD_CHUNK as u32)] {
+                gemm_bf16_rowk_acc_f32.insert(
+                    (n, k),
+                    ctx.compile_gemm_subkernel(
+                        ACC_BF16_SHADER,
+                        "gemm_bf16_rowk_acc_f32",
+                        n,
+                        k,
+                        false,
+                        crate::kernels::sub::QuantFormat::Q8 as u32,
+                        true, // sc_probs is fp16
+                    )?,
+                );
+            }
+        }
         let f32_to_half_scale = ctx.compile_subkernel(
             shader_include::include_metal!("kernels/f32_to_half_scale.metal"),
             "f32_to_half_scale",
@@ -858,6 +884,7 @@ impl StepPipelines {
             gemm_q8_rowk,
             gemm_q8_rowk_xfp16,
             gemm_q8_rowk_acc_f32,
+            gemm_bf16_rowk_acc_f32,
             f32_to_half_scale,
             qk_rope_kv: crate::kernels::sub::qk_rope_kv::pipeline_for(ctx, prod)?,
             attention: crate::kernels::sub::attention::pipeline_for(ctx, prod)?,
@@ -887,10 +914,20 @@ impl StepPipelines {
             )?,
             moe_grouped_dump: crate::kernels::sub::moe_grouped::pipeline_for(ctx, dump)?,
             embed_gather: crate::kernels::sub::embed_gather::pipeline_for(ctx, prod)?,
+            embed_gather_bf16: ctx.compile_subkernel(
+                shader_include::include_metal!("kernels/embed_gather_bf16.metal"),
+                "embed_gather_bf16",
+                prod,
+            )?,
             logit_rowstats: crate::kernels::sub::logit_rowstats::pipeline_for(ctx, prod)?,
             sc_prob_cols: crate::kernels::sub::sc_prob_cols::pipeline_for(ctx, prod)?,
             sc_probs: crate::kernels::sub::sc_probs::pipeline_for(ctx, prod)?,
             sc_softembed: crate::kernels::sub::sc_softembed::pipeline_for(ctx, prod)?,
+            sc_softembed_bf16: ctx.compile_subkernel(
+                shader_include::include_metal!("kernels/sc_softembed_bf16.metal"),
+                "sc_softembed_bf16",
+                prod,
+            )?,
             half_scale: crate::kernels::sub::half_scale::pipeline_for(ctx, prod)?,
             half_scale_fp16: crate::kernels::sub::half_scale_fp16::pipeline_for(ctx, prod)?,
             softcap: crate::kernels::sub::softcap_half::pipeline_for(ctx, prod)?,
@@ -1051,6 +1088,9 @@ struct StepEnc<'a> {
     /// Attention + dense-FFN weights are stored bf16 (Raw): route their GEMMs
     /// through the bf16 kernel and skip the q4-only fused stacked path.
     attn_ffn_bf16: bool,
+    /// Embed (tied lm_head + SC soft-embed) is stored bf16 (Raw) rather than
+    /// q8-per-row: dispatch the bf16 gather / lm_head / softembed paths.
+    embed_bf16: bool,
 }
 
 impl<'a> StepEnc<'a> {
@@ -1534,6 +1574,38 @@ impl StepEnc<'_> {
         Ok(())
     }
 
+    /// Tied lm_head with bf16 embed: logits = hidden @ embed^T. Reuses the bf16
+    /// GEMM kernel (writes the logits buffer instead of the arena).
+    fn gemm_bf16_logits(
+        &mut self,
+        x_off: u64,
+        w_off: u64,
+        m: u32,
+        n: u32,
+        k: u32,
+        logits_byte_off: usize,
+    ) -> Result<(), Error> {
+        let ps = self.ps.bf16(n, k)?;
+        self.sink_set_pipeline(ps);
+        self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
+        self.sink_set_buffer(&self.bufs.logits, logits_byte_off, 1);
+        self.bind_blob(2);
+        self.sink_set_bytes(&w_off, 3);
+        self.sink_set_bytes(&m, 4);
+        let grid = MTLSize {
+            width: div_up(n as usize, crate::kernels::sub::gemm_common::n_tile()),
+            height: div_up(m as usize, crate::kernels::sub::gemm_common::M_TILE),
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: GEMM_THREADS_PER_TG,
+            height: 1,
+            depth: 1,
+        };
+        self.sink_dispatch(grid, tg);
+        Ok(())
+    }
+
     fn gemm_q8_logits(
         &mut self,
         x_off: u64,
@@ -1644,6 +1716,40 @@ impl StepEnc<'_> {
         Ok(())
     }
 
+    /// bf16-embed variant of `gemm_q8_rowk_acc_f32` (chunked SC softembed accumulate).
+    fn gemm_bf16_rowk_acc_f32(
+        &mut self,
+        y_buf: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        w_off: u64,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) -> Result<(), Error> {
+        let ps = self
+            .ps
+            .gemm_bf16_rowk_acc_f32
+            .get(&(n, k))
+            .ok_or(Error::Format("missing gemm_bf16_rowk_acc_f32 pipeline"))?;
+        self.sink_set_pipeline(ps);
+        self.sink_set_buffer(&self.bufs.sc_probs, 0, 0);
+        self.sink_set_buffer(y_buf, 0, 1);
+        self.bind_blob(2);
+        self.sink_set_bytes(&w_off, 3);
+        self.sink_set_bytes(&m, 4);
+        let grid = MTLSize {
+            width: div_up(n as usize, 32),
+            height: div_up(m as usize, crate::kernels::sub::gemm_common::M_TILE),
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: GEMM_THREADS_PER_TG,
+            height: 1,
+            depth: 1,
+        };
+        self.sink_dispatch(grid, tg);
+        Ok(())
+    }
+
     /// Convert f32 buffer → bf16 arena slot with scale: `arena[base+i] = f32_buf[i] * scale`.
     fn f32_to_half_scale(
         &mut self,
@@ -1726,14 +1832,25 @@ impl StepEnc<'_> {
         while v0 < VOCAB as u32 {
             let chunk = (VOCAB as u32 - v0).min(chunk_max);
             self.dispatch_sc_prob_cols(v0, chunk);
-            let w_off = layout.embed + (v0 as u64) * row_bytes;
-            self.gemm_q8_rowk_acc_f32(
-                &self.bufs.gemm_b,
-                w_off,
-                CANVAS as u32,
-                HID as u32,
-                chunk,
-            )?;
+            if self.embed_bf16 {
+                let w_off = layout.embed + (v0 as u64) * (HID as u64) * 2;
+                self.gemm_bf16_rowk_acc_f32(
+                    &self.bufs.gemm_b,
+                    w_off,
+                    CANVAS as u32,
+                    HID as u32,
+                    chunk,
+                )?;
+            } else {
+                let w_off = layout.embed + (v0 as u64) * row_bytes;
+                self.gemm_q8_rowk_acc_f32(
+                    &self.bufs.gemm_b,
+                    w_off,
+                    CANVAS as u32,
+                    HID as u32,
+                    chunk,
+                )?;
+            }
             v0 += chunk;
         }
         // Convert f32 accumulator → bf16 arena soft slot, applying embed_scale
@@ -1758,6 +1875,13 @@ impl StepEnc<'_> {
         if use_gemm {
             if use_chunked {
                 return self.encode_sc_softembed_chunked(layout);
+            }
+            if self.embed_bf16 {
+                // The full (non-chunked) GEMM SC path reads embed via the q8 rowk
+                // kernel; bf16 embed is only wired through the chunked + slow paths.
+                return Err(Error::Format(
+                    "bf16 embed: full SC GEMM path unsupported (use chunked, DGQ_SC_CHUNKED=1)",
+                ));
             }
             self.encode_sc_logit_rowstats();
             self.sink_set_pipeline(&self.ps.sc_probs);
@@ -1785,7 +1909,12 @@ impl StepEnc<'_> {
         } else {
             use crate::dgq::embed_row::EMBED_SCALE;
 
-            self.sink_set_pipeline(&self.ps.sc_softembed);
+            let sc_ps = if self.embed_bf16 {
+                &self.ps.sc_softembed_bf16
+            } else {
+                &self.ps.sc_softembed
+            };
+            self.sink_set_pipeline(sc_ps);
             self.bind_logits(0);
             self.sink_set_buffer(&self.bufs.arena, self.arena().rs_sc_off() as usize, 1);
             self.bind_blob(2);
@@ -2620,7 +2749,18 @@ impl StepEnc<'_> {
             }
             StepStage::LmHeadGemm => {
                 let m = self.partial_lm_m;
-                if partial_lm_head_enabled() && m < CANVAS as u32 {
+                if self.embed_bf16 {
+                    // bf16 embed: full tied lm_head via the bf16 GEMM (partial lm_head
+                    // is the q8-only fast path; correctness over that optimization here).
+                    self.gemm_bf16_logits(
+                        self.arena().tmp_off(),
+                        layout.embed,
+                        CANVAS as u32,
+                        VOCAB as u32,
+                        HID as u32,
+                        0,
+                    )
+                } else if partial_lm_head_enabled() && m < CANVAS as u32 {
                     self.encode_partial_lm_head(layout, m)
                 } else {
                     self.gemm_q8_logits(
@@ -2711,7 +2851,12 @@ impl StepEnc<'_> {
     fn dispatch_embed_gather(&mut self, embed_off: u64) {
         use crate::dgq::embed_row::EMBED_SCALE;
 
-        self.sink_set_pipeline(&self.ps.embed_gather);
+        let ps = if self.embed_bf16 {
+            &self.ps.embed_gather_bf16
+        } else {
+            &self.ps.embed_gather
+        };
+        self.sink_set_pipeline(ps);
         self.bind_blob(0);
         self.bind_state(1);
         self.sink_set_buffer(&self.bufs.arena, self.arena().hidden_off() as usize, 2);
@@ -3316,6 +3461,7 @@ pub struct StepRuntime {
     use_sc_chunked: bool,
     attn_ffn_q8: bool,
     attn_ffn_bf16: bool,
+    embed_bf16: bool,
     layout: ModelLayout,
     tensor_offsets: HashMap<String, u64>,
     pub layers: usize,
@@ -3463,6 +3609,7 @@ impl StepRuntime {
             partial_lm_m: CANVAS as u32,
             attn_ffn_q8: self.attn_ffn_q8,
             attn_ffn_bf16: self.attn_ffn_bf16,
+            embed_bf16: self.embed_bf16,
         };
         f(&mut enc)?;
         enc.enc.endEncoding();
@@ -3496,6 +3643,7 @@ impl StepRuntime {
             partial_lm_m: CANVAS as u32,
             attn_ffn_q8: self.attn_ffn_q8,
             attn_ffn_bf16: self.attn_ffn_bf16,
+            embed_bf16: self.embed_bf16,
         };
         f(&mut enc)?;
         enc.enc.endEncoding();
@@ -3958,6 +4106,17 @@ pub fn build_step_runtime(
     let attn_ffn_q8 = attn_ffn_kind == Some(crate::dgq::layout::QuantKind::Q8Row);
     let attn_ffn_bf16 = attn_ffn_kind == Some(crate::dgq::layout::QuantKind::Raw);
 
+    // Embed (tied lm_head + SC soft-embed) is q8-per-row on most checkpoints, bf16
+    // (Raw) on newer ones. Detect from the stored kind so all three embed consumers
+    // (input gather, lm_head, SC softembed) dispatch the matching precision.
+    let embed_bf16 = store
+        .get_entry("model.decoder.embed_tokens.weight")
+        .and_then(|e| crate::dgq::layout::parse_quant_kind(&e.meta.kind).ok())
+        == Some(crate::dgq::layout::QuantKind::Raw);
+    if embed_bf16 {
+        eprintln!("step-kernel: bf16 embed (tied lm_head + SC)");
+    }
+
     let block_profile = StepBlockProfile::from_store_profile(store.profile());
     match block_profile.format {
         QuantFormat::NvFp4 => eprintln!("step-kernel: nvfp4 block weights"),
@@ -4109,6 +4268,7 @@ pub fn build_step_runtime(
         use_sc_chunked,
         attn_ffn_q8,
         attn_ffn_bf16,
+        embed_bf16,
         layout,
         tensor_offsets: offsets,
         layers,
