@@ -1,25 +1,25 @@
 {
-  "_comment": "Smoketest gate for commits. `max_steps` = denoise-step budget; ratchet DOWN as the engine improves. Adherence prompts gate on both the (single) correct answer AND convergence. Run: diffgemma-mps -m <model.dgq> smoketest [--layers 30 --seed 42]. Answer match is whole-word, case/punctuation-insensitive. A warm-up generation runs first (cold-start emits empty). Thresholds set to warm actuals + margin for ~+/-4-step run-to-run variance; tighten as convergence improves.",
+  "_comment": "Smoketest gate for commits. `max_steps` = denoise-step budget; ratchet DOWN as the engine improves. Adherence prompts gate on both the (single) correct answer AND convergence. Run: diffgemma-mps -m <model.dgq> smoketest [--layers 30 --seed 42]. Answer match is whole-word, case/punctuation-insensitive. A warm-up generation runs first (cold-start emits empty). Generation is deterministic at fixed seed (NONDET-SC-1 fixed), so thresholds are set tight to the seed-42 actuals + ~2-step margin; tighten further as convergence improves.",
 
   "adherence": [
-    { "id": "one_plus_one",       "prompt": "Print the result of 1 + 1 as a single English word in lowercase, with no other text.", "answer": "two",     "max_steps": 8 },
-    { "id": "capital_france",     "prompt": "What is the capital of France? Reply with only the city name.",                          "answer": "paris",   "max_steps": 8 },
-    { "id": "seven_times_eight",  "prompt": "What is 7 times 8? Reply with only the number.",                                        "answer": "56",      "max_steps": 8 },
-    { "id": "raining_cats_and_dogs", "prompt": "It is raining ____ and dogs. What word replaces ____?",                              "answer": "cats",    "max_steps": 8 },
-    { "id": "blue_plus_yellow",   "prompt": "What color do you get by mixing blue and yellow paint? Reply with one lowercase word.",  "answer": "green",   "max_steps": 8 },
-    { "id": "days_in_week",       "prompt": "How many days are in a week? Reply with only a number.",                                 "answer": "7",       "accept": ["seven"], "max_steps": 8 },
-    { "id": "opposite_of_hot",    "prompt": "The opposite of the word 'hot' is what? Reply with one lowercase word.",                 "answer": "cold",    "max_steps": 8 },
-    { "id": "water_formula",      "prompt": "What is the chemical formula for water? Reply with only the formula.",                   "answer": "h2o",     "max_steps": 8 },
-    { "id": "romeo_author_first", "prompt": "What is the first name of the author of Romeo and Juliet? Reply with one word.",         "answer": "william", "max_steps": 8 },
-    { "id": "largest_planet",     "prompt": "What is the largest planet in our solar system? Reply with only its name.",             "answer": "jupiter", "max_steps": 8 },
-    { "id": "water_freeze_c",     "prompt": "At what temperature in degrees Celsius does pure water freeze at sea level? Reply with only the number.", "answer": "0", "accept": ["zero"], "max_steps": 8 }
+    { "id": "one_plus_one",       "prompt": "Print the result of 1 + 1 as a single English word in lowercase, with no other text.", "answer": "two",     "max_steps": 7 },
+    { "id": "capital_france",     "prompt": "What is the capital of France? Reply with only the city name.",                          "answer": "paris",   "max_steps": 7 },
+    { "id": "seven_times_eight",  "prompt": "What is 7 times 8? Reply with only the number.",                                        "answer": "56",      "max_steps": 7 },
+    { "id": "raining_cats_and_dogs", "prompt": "It is raining ____ and dogs. What word replaces ____?",                              "answer": "cats",    "max_steps": 7 },
+    { "id": "blue_plus_yellow",   "prompt": "What color do you get by mixing blue and yellow paint? Reply with one lowercase word.",  "answer": "green",   "max_steps": 7 },
+    { "id": "days_in_week",       "prompt": "How many days are in a week? Reply with only a number.",                                 "answer": "7",       "accept": ["seven"], "max_steps": 7 },
+    { "id": "opposite_of_hot",    "prompt": "The opposite of the word 'hot' is what? Reply with one lowercase word.",                 "answer": "cold",    "max_steps": 7 },
+    { "id": "water_formula",      "prompt": "What is the chemical formula for water? Reply with only the formula.",                   "answer": "h2o",     "max_steps": 7 },
+    { "id": "romeo_author_first", "prompt": "What is the first name of the author of Romeo and Juliet? Reply with one word.",         "answer": "william", "max_steps": 7 },
+    { "id": "largest_planet",     "prompt": "What is the largest planet in our solar system? Reply with only its name.",             "answer": "jupiter", "max_steps": 7 },
+    { "id": "water_freeze_c",     "prompt": "At what temperature in degrees Celsius does pure water freeze at sea level? Reply with only the number.", "answer": "0", "accept": ["zero"], "max_steps": 7 }
   ],
 
   "convergence": [
-    { "id": "sky_blue",       "prompt": "Why is the sky blue?",                                  "max_steps": 36 },
-    { "id": "transformer",    "prompt": "Explain how a transformer neural network works.",       "max_steps": 40 },
-    { "id": "haiku_ocean",    "prompt": "Write a haiku about the ocean.",                         "max_steps": 12 },
-    { "id": "primary_colors", "prompt": "List the three primary colors.",                         "max_steps": 12 },
-    { "id": "water_cycle",    "prompt": "Summarize the water cycle in two sentences.",            "max_steps": 14 }
+    { "id": "sky_blue",       "prompt": "Why is the sky blue?",                                  "max_steps": 30 },
+    { "id": "transformer",    "prompt": "Explain how a transformer neural network works.",       "max_steps": 35 },
+    { "id": "haiku_ocean",    "prompt": "Write a haiku about the ocean.",                         "max_steps": 9 },
+    { "id": "primary_colors", "prompt": "List the three primary colors.",                         "max_steps": 16 },
+    { "id": "water_cycle",    "prompt": "Summarize the water cycle in two sentences.",            "max_steps": 11 }
   ]
 }
