@@ -15,6 +15,7 @@ pub mod gemm_linear_f32;
 pub mod gemm_block_grouped;
 pub mod gemm_block_sparse;
 pub mod gemm_block_stacked;
+pub mod gemm_bf16_stacked;
 pub mod gemm_linear_grouped;
 pub mod gemm_q8_linear_f32;
 pub mod gemm_q8_linear_kxn_f32;

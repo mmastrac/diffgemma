@@ -1532,6 +1532,39 @@ impl StepEnc<'_> {
         Ok(())
     }
 
+    /// bf16 fused stacked GEMM (QKV / gate+up on the bf16 path) — same N-segment
+    /// layout as `gemm_q4_stacked` but reads bf16 weights (no dequant).
+    fn gemm_bf16_stacked(
+        &mut self,
+        x_off: u64,
+        segs: &[crate::kernels::sub::gemm_block_stacked::GemmStackedSeg],
+        m: u32,
+        k: u32,
+        n_total: u32,
+    ) -> Result<(), Error> {
+        debug_assert!(segs.len() <= STACKED_SEG_MAX, "too many stacked segments");
+        let ps = crate::kernels::sub::gemm_bf16_stacked::stacked_pipeline_for(
+            self.ctx, n_total, k, segs,
+        )?;
+        self.sink_set_pipeline(ps.as_ref());
+        self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
+        self.sink_set_buffer(&self.bufs.arena, 0, 1);
+        self.bind_blob(2);
+        self.sink_set_bytes(&m, 3);
+        let grid = MTLSize {
+            width: div_up(n_total as usize, crate::kernels::sub::gemm_common::n_tile()),
+            height: div_up(m as usize, crate::kernels::sub::gemm_common::M_TILE),
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: GEMM_THREADS_PER_TG,
+            height: 1,
+            depth: 1,
+        };
+        self.sink_dispatch(grid, tg);
+        Ok(())
+    }
+
     fn memzero_bytes(&mut self, byte_off: u64, nbytes: u64) {
         self.sink_set_pipeline(&self.ps.memzero);
         self.sink_set_buffer(&self.bufs.arena, byte_off as usize, 0);
@@ -2126,7 +2159,16 @@ impl StepEnc<'_> {
 
     fn encode_layer_dense_gate_up(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
         let l = &layout.layers[layer];
-        if fused_gate_up_enabled() && !self.attn_ffn_q8 && !self.attn_ffn_bf16 {
+        if fused_gate_up_enabled() && self.attn_ffn_bf16 {
+            let (segs, n_total) = gate_up_stacked_segments(l, self.arena());
+            self.gemm_bf16_stacked(
+                self.arena().tmp_off(),
+                &segs,
+                CANVAS as u32,
+                HID as u32,
+                n_total,
+            )?;
+        } else if fused_gate_up_enabled() && !self.attn_ffn_q8 && !self.attn_ffn_bf16 {
             let (segs, n_total) = gate_up_stacked_segments(l, self.arena());
             self.gemm_q4_stacked(
                 self.arena().tmp_off(),
@@ -2552,7 +2594,16 @@ impl StepEnc<'_> {
             HID as u32,
             CANVAS,
         );
-        if fused_qkv_enabled() && !self.attn_ffn_q8 && !self.attn_ffn_bf16 {
+        if fused_qkv_enabled() && self.attn_ffn_bf16 {
+            let (segs, n_total) = qkv_stacked_segments(l, self.arena());
+            self.gemm_bf16_stacked(
+                self.arena().tmp_off(),
+                &segs,
+                CANVAS as u32,
+                HID as u32,
+                n_total,
+            )?;
+        } else if fused_qkv_enabled() && !self.attn_ffn_q8 && !self.attn_ffn_bf16 {
             let (segs, n_total) = qkv_stacked_segments(l, self.arena());
             self.gemm_q4_stacked(
                 self.arena().tmp_off(),
@@ -3734,10 +3785,18 @@ impl StepRuntime {
             attn_ffn_bf16: self.attn_ffn_bf16,
             embed_bf16: self.embed_bf16,
         };
+        let time_dispatch = std::env::var("DGQ_TIME_DISPATCH").is_ok();
+        let t_enc = std::time::Instant::now();
         f(&mut enc)?;
         enc.enc.endEncoding();
+        let enc_ms = t_enc.elapsed().as_secs_f64() * 1e3;
+        let t_gpu = std::time::Instant::now();
         cmd.commit();
         cmd.waitUntilCompleted();
+        if time_dispatch {
+            let gpu_ms = t_gpu.elapsed().as_secs_f64() * 1e3;
+            eprintln!("dispatch: encode={enc_ms:.2}ms gpu(commit+wait)={gpu_ms:.2}ms");
+        }
         Ok(())
     }
 
