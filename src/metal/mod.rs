@@ -65,7 +65,7 @@ pub use kv_cache::GpuKvCache;
 pub use engine::GpuDecoderEngine;
 pub use gemm::{bf16_matmul_cpu, f32_to_bf16, Bf16Gemm};
 pub use probe::{print_probe_result, probe_device};
-pub use bench_gemm::{bench_custom_kernel, bench_gemm_block_q4, bench_mpsgraph_oracle, parse_shapes, print_bench_rows};
+pub use bench_gemm::{bench_custom_kernel, bench_gemm_bf16, bench_gemm_block_q4, bench_mpsgraph_oracle, parse_shapes, print_bench_rows};
 pub use sampler::sampler_step_gpu;
 pub use step_kernel::{
     bench_fused_gemm_dispatches, bench_step_kernel, build_offsets_from_store, build_step_runtime,

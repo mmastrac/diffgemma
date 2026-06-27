@@ -156,6 +156,67 @@ pub fn bench_gemm_block_q4(shapes: &[GemmShape], iters: usize) -> Result<Vec<Gem
     Ok(rows)
 }
 
+/// Tiled bf16-weight `gemm_bf16` (step-kernel mixed-precision attention/FFN path):
+/// bf16 activations, bf16 weights read straight into the half tile (no dequant).
+pub fn bench_gemm_bf16(shapes: &[GemmShape], iters: usize) -> Result<Vec<GemmBenchRow>, Error> {
+    use crate::kernels::sub::gemm_bf16;
+    use crate::kernels::sub::gemm_common;
+    use crate::kernels::sub::gemm_q8;
+    use crate::metal::device::MetalContext;
+    use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+
+    let ctx = MetalContext::new()?;
+    let warmup = 3usize;
+    let mut rows = Vec::new();
+    let mut pool = BufferPool::new();
+
+    for &shape in shapes {
+        let GemmShape { m, k, n } = shape;
+        let pipeline = gemm_bf16::pipeline_for(&ctx, n as u32, k as u32)?;
+        let buf_x = pool
+            .allocate(&ctx.device, m * k * 2)
+            .ok_or(Error::Format("bench gemm_bf16 x"))?;
+        let buf_y = pool
+            .allocate(&ctx.device, m * n * 2)
+            .ok_or(Error::Format("bench gemm_bf16 y"))?;
+        let buf_w = pool
+            .allocate(&ctx.device, n * k * 2)
+            .ok_or(Error::Format("bench gemm_bf16 w"))?;
+        BufferPool::write_bf16(&buf_x, &vec![0x3f00u16; m * k]);
+        BufferPool::write_bf16(&buf_w, &vec![0x3f80u16; n * k]);
+        let (grid, tg) = gemm_common::dispatch_shape(m, n);
+
+        let dispatch = |count: usize| -> Result<(), Error> {
+            let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
+            let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+            for _ in 0..count {
+                enc.setComputePipelineState(&pipeline.pipeline);
+                gemm_q8::bind_gpu_buffers(&enc, &buf_x, &buf_y, &buf_w, 0, m as u32);
+                enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+            }
+            enc.endEncoding();
+            cmd.commit();
+            cmd.waitUntilCompleted();
+            Ok(())
+        };
+
+        dispatch(warmup)?;
+        let started = Instant::now();
+        dispatch(iters)?;
+        let rate = gflops(m, k, n, iters, started.elapsed().as_secs_f64());
+        rows.push(GemmBenchRow {
+            shape,
+            label: format!("gemm_bf16/batched_x{iters}"),
+            gflops: rate,
+        });
+
+        pool.release(m * k * 2, buf_x);
+        pool.release(m * n * 2, buf_y);
+        pool.release(n * k * 2, buf_w);
+    }
+    Ok(rows)
+}
+
 fn bench_full_call(
     gemm: &mut Bf16Gemm,
     m: usize,
