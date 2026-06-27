@@ -45,7 +45,7 @@ Per-step is now bounded by MoE (q4 grouped GEMM) + dispatch/sync overhead, not t
 
 | # | Task | Impact | Status | Exit |
 |---|------|--------|--------|------|
-| P2.2 | ICB record/replay | High | open | steady-state encode ≈ 0; lift `kv_len==0` gate |
+| P2.2 | ICB record/replay | ~~High~~ **DROP** | won't-fix | Measured 2026-06 (§13, `DGQ_TIME_DISPATCH`): CPU encode is ~0.2ms/step vs ~1600ms GPU. Dispatch/sync is negligible; ICB would save nothing. Step is GPU-compute-bound. |
 | P2.4 | Dispatch fusion | Medium | open | dispatch count down |
 | P2.6 | MPS Q8 lm_head; f16/f32 sweep | Medium | open | step ≤ 1.4 s stretch |
 
@@ -60,7 +60,7 @@ Tier-1 GEMM K-tile double-buffering, stacked QKV/gate-up, SC chunked f32-accumul
 | Priority | Stage | ~Cost | Options |
 |----------|-------|-------|---------|
 | 1 | MoE `gate_up` + `down` | ~17–21% | **Block-sparse landed (~6% step, bit-identical, `NOTES.md` §11).** Remaining: hoist W dequant out of per-block work; cut partial-last-tile padding |
-| 2 | qkv / o_proj / dense | ~24% (pre_moe) | Largest bucket. Fuse QK-norm + RoPE into QKV dispatch; fuse pre-FF RMSNorm/GLU |
+| 2 | qkv / o_proj / dense | ~24% (pre_moe) | **bf16 stacked QKV + gate/up landed (§13, ~1.3% prod / ~4.8% fwd, bit-identical).** Remaining: fuse QK-norm+RoPE into QKV; o_proj/down can't stack (single output). Dispatch/sync is NOT a lever — encode is ~0.2ms/step (§13), step is GPU-compute-bound |
 | 3 | finish (lm_head) | ~20% | Q8 lm_head tuning (P2.6); already has partial-lm-head |
 | 4 | preamble (SC) | ~19% | SC soft-embed is O(vocab); ICB fast path (P2.2) |
 | 5 | attention | small @ short ctx | **GQA matrix-unit attention landed (§12, 1.63× sliding, ~3–4.5% step, default-on).** Further KV tiling matters once committed context grows (P2.8 windowing) |
