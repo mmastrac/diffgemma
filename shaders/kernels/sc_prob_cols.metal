@@ -36,12 +36,14 @@ kernel void sc_prob_cols(
     }
     uint v = v0 + col;
     if (v >= vocab) {
-        arena_store(probs, (ulong)row * chunk + col, 0.f);
+        ((device half *)probs)[(ulong)row * chunk + col] = half(0);
         return;
     }
     float x = arena_load(logits, (ulong)row * vocab + v);
-    // Scale into fp16's normal range before the half-precision GEMM tiles: a
-    // near-uniform prob (~2^-18) is an fp16 denormal (normal min 2^-14), which
-    // corrupts spread distributions. The GEMM caller divides this back out.
-    arena_store(probs, (ulong)row * chunk + col, (exp(x - mx) / sum) * SC_PROB_GEMM_SCALE);
+    // Store probs as fp16 (10 mantissa bits), not bf16 (7): the soft-embed sums
+    // over the full vocab, and bf16-rounding each prob adds noise worst for
+    // spread distributions. SC_PROB_GEMM_SCALE pushes a near-uniform prob
+    // (~2^-18, an fp16 denormal below the 2^-14 normal min) into fp16's normal
+    // range; the GEMM caller (x_fp16=true) divides it back out.
+    ((device half *)probs)[(ulong)row * chunk + col] = half((exp(x - mx) / sum) * SC_PROB_GEMM_SCALE);
 }

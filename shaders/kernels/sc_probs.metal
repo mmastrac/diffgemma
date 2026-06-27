@@ -32,9 +32,10 @@ kernel void sc_probs(
         dgq_assert_positive_f32(dbg, DbgKernelScProbs, sum, row);
     }
     device const ushort *lr = logits + (ulong)row * cols;
-    // Scale into fp16's normal range for the half-precision GEMM tiles (see
-    // sc_prob_scale.metal); the GEMM caller divides this back out.
+    // Store probs as fp16 (10 mantissa bits), not bf16 (7) — see sc_prob_cols.metal.
+    // SC_PROB_GEMM_SCALE keeps a near-uniform prob out of fp16's denormal range
+    // (sc_prob_scale.metal); the GEMM caller (x_fp16=true) divides it back out.
     for (uint v = lid; v < cols; v += tpg) {
-        arena_store(probs, (ulong)row * cols + v, (exp(arena_load(lr, v) - mx) / sum) * SC_PROB_GEMM_SCALE);
+        ((device half *)probs)[(ulong)row * cols + v] = half((exp(arena_load(lr, v) - mx) / sum) * SC_PROB_GEMM_SCALE);
     }
 }

@@ -1,7 +1,7 @@
 #pragma once
 
-// Self-conditioning softembed: probs are stored bf16 then fed through fp16
-// (`half`) GEMM tiles. fp16's normal range bottoms out at 2^-14, but softmax
+// Self-conditioning softembed: probs are stored fp16 (10 mantissa bits) then fed
+// through fp16 (`half`) GEMM tiles. fp16's normal range bottoms out at 2^-14, but softmax
 // probs over the ~262k vocab reach ~2^-18 (denormal) for spread distributions,
 // which loses precision and corrupts the soft-embedding. We scale probs up into
 // fp16's normal range before the GEMM and divide the same factor back out of the

@@ -801,9 +801,9 @@ impl StepPipelines {
                         k,
                         false,
                         crate::kernels::sub::QuantFormat::Q8 as u32,
-                        // x (sc_probs) is bf16, not fp16: x_fp16 must be false or the
-                        // bf16 prob bits get reinterpreted as fp16 (garbage softembed).
-                        false,
+                        // x (sc_probs) is fp16 (10-mantissa probs, sc_prob_cols.metal):
+                        // read it as fp16 so the prob precision survives into the tile.
+                        true,
                     )?,
                 );
             }
@@ -1574,9 +1574,9 @@ impl StepEnc<'_> {
         n: u32,
         k: u32,
     ) -> Result<(), Error> {
-        // x (sc_probs) is bf16, so use the bf16-input pipeline (not xfp16) — reading
-        // bf16 prob bits as fp16 produces garbage softembed.
-        let ps = self.ps.q8_rowk(n, k)?;
+        // x (sc_probs) is fp16 (10-mantissa probs, sc_probs.metal): use the
+        // fp16-input pipeline so the prob precision survives into the GEMM tile.
+        let ps = self.ps.q8_rowk_xfp16(n, k)?;
         self.sink_set_pipeline(ps);
         self.sink_set_buffer(x_buf, 0, 0);
         self.sink_set_buffer(&self.bufs.arena, y_off as usize, 1);

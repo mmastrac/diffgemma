@@ -1,6 +1,7 @@
 //! Materialize softmax rows from logits + precomputed row stats (SC GEMM path).
 
 use super::bf16;
+use super::f16;
 use super::gpu_common;
 use super::test_util::ElemFormat;
 use super::variant::KernelVariant;
@@ -8,6 +9,9 @@ use crate::safetensors::Error;
 
 pub const ENTRY: &str = "sc_probs";
 pub const THREADGROUP_WIDTH: usize = 256;
+/// Prob up-scale before the fp16 GEMM tiles; must match `SC_PROB_GEMM_SCALE` in
+/// shaders/include/sc_prob_scale.metal and src/metal/step_kernel.rs.
+const SC_PROB_GEMM_SCALE: f32 = 4096.0;
 
 const SHADER: &str = shader_include::include_metal!("kernels/sc_probs.metal");
 
@@ -61,7 +65,10 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
         let sum = rowstat[row * 2 + 1];
         for v in 0..f.cols {
             let x = f.logits[row * f.cols + v];
-            out[row * f.cols + v] = bf16::round_bf16_f32(((x - mx).exp()) / sum);
+            // Kernel stores fp16(prob * SCALE); recover the prob (caller divides
+            // SCALE back out) so the test compares probs at the kernel's precision.
+            let prob = ((x - mx).exp()) / sum;
+            out[row * f.cols + v] = f16::round_half(prob * SC_PROB_GEMM_SCALE) / SC_PROB_GEMM_SCALE;
         }
     }
     out
@@ -135,9 +142,11 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     enc.endEncoding();
     cmd.commit();
     cmd.waitUntilCompleted();
+    // Kernel writes fp16 probs scaled by SC_PROB_GEMM_SCALE; read fp16 and divide
+    // the scale back out to recover the prob (matches the cpu reference).
     let ptr = buf_probs.contents().as_ptr() as *const u16;
     Ok((0..f.out_len())
-        .map(|i| bf16::bf16_bits_to_f32(unsafe { *ptr.add(i) }))
+        .map(|i| f16::f16_bits_to_f32(unsafe { *ptr.add(i) }) / SC_PROB_GEMM_SCALE)
         .collect())
 }
 
