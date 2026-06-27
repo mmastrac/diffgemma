@@ -18,8 +18,8 @@ use crate::weights::WeightStore;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLDevice, MTLResourceOptions, MTLSize,
+    MTLBarrierScope, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions, MTLSize,
 };
 use std::collections::HashMap;
 use std::mem::offset_of;
@@ -1227,6 +1227,13 @@ impl StepEnc<'_> {
         }
     }
 
+    /// Buffer-scope memory barrier on the live encoder (no-op when recording).
+    fn sink_memory_barrier(&mut self) {
+        if self.recorder.is_none() {
+            self.enc.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+        }
+    }
+
     fn sink_dispatch_indirect(&mut self, indirect_offset: usize, n: u32, tg: MTLSize) {
         if self.recorder.is_some() {
             // ICB replay uses fixed grids; compact indirect is only on the live encoder path.
@@ -1829,6 +1836,7 @@ impl StepEnc<'_> {
         // f32 accumulator in gemm_b (free during preamble, before layer GEMMs).
         let acc_bytes = (CANVAS * HID * std::mem::size_of::<f32>()) as u64;
         self.memzero_buffer(&self.bufs.gemm_b, acc_bytes);
+        self.sink_memory_barrier(); // memzero gemm_b before the first `+=`
 
         let row_bytes = q8_row_bytes(HID as usize) as u64;
         let chunk_max = LM_HEAD_CHUNK as u32;
@@ -1855,6 +1863,7 @@ impl StepEnc<'_> {
                     chunk,
                 )?;
             }
+            self.sink_memory_barrier(); // serialize the cross-chunk `+=` into gemm_b
             v0 += chunk;
         }
         // Convert f32 accumulator → bf16 arena soft slot, applying embed_scale
