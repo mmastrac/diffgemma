@@ -1442,7 +1442,10 @@ impl StepEnc<'_> {
     fn memzero_bytes(&mut self, byte_off: u64, nbytes: u64) {
         self.sink_set_pipeline(&self.ps.memzero);
         self.sink_set_buffer(&self.bufs.arena, byte_off as usize, 0);
-        let count = div_up(nbytes as usize, 16);
+        // memzero_bytes.metal zeros one uchar4 (4 bytes) per thread, so count is
+        // div_up(nbytes, 4). (Was /16 — only cleared a quarter of the range,
+        // which left the chunked SC f32 accumulator stale past row 64 → NONDET-SC-1.)
+        let count = div_up(nbytes as usize, 4);
         self.dispatch_1d(&self.ps.memzero, count, 256);
     }
 
@@ -1454,7 +1457,8 @@ impl StepEnc<'_> {
     ) {
         self.sink_set_pipeline(&self.ps.memzero);
         self.sink_set_buffer(buf, 0, 0);
-        let count = div_up(nbytes as usize, 16);
+        // 4 bytes (one uchar4) per thread — see memzero_bytes.
+        let count = div_up(nbytes as usize, 4);
         self.dispatch_1d(&self.ps.memzero, count, 256);
     }
 
@@ -6095,6 +6099,98 @@ mod tests {
                 "GPU decode mismatch k0={k0}"
             );
         }
+    }
+
+    /// NONDET-SC-1 diagnostic: run the chunked SC softembed twice on identical
+    /// seeded logits and diff. Isolates the run-to-run nondeterminism to a single
+    /// softembed invocation (no generation loop). `--ignored` (needs a model dir).
+    #[test]
+    #[ignore]
+    fn sc_chunked_softembed_nondeterminism_probe() {
+        use std::path::Path;
+
+        let dir = [
+            Path::new("model/diffusiongemma-q4emb"),
+            Path::new("/tmp/quantized-weights"),
+            Path::new("model/diffusiongemma-q4"),
+            Path::new("model/q4"),
+        ]
+        .into_iter()
+        .find(|p| crate::dgq::store::looks_like_dgq_dir(p));
+        let Some(dir) = dir else {
+            eprintln!("skip sc_chunked_softembed_nondeterminism_probe");
+            return;
+        };
+        let cfg = StepSmokeConfig {
+            finish: StepFinishMode::Full,
+            steps: 1,
+            ..StepSmokeConfig::default()
+        };
+        let (mut rt, _) = build_step_runtime(dir, &cfg).expect("runtime");
+        let layout = rt.layout;
+        rt.run_forward_once(StepFinishMode::Full)
+            .expect("seed logits");
+        let soft_elems = CANVAS * HID;
+        let soft_off = rt.bufs.arena_map.soft_off() as usize;
+
+        // (soft bf16-as-f32, gemm_b f32 accumulator). If gemm_b differs the
+        // accumulate/GEMM is the source; if only soft differs the convert is.
+        let run_chunked = |rt: &mut StepRuntime| -> (Vec<f32>, Vec<f32>) {
+            write_buffer_bytes(&rt.bufs.arena, soft_off, &vec![0u8; soft_elems * 2]);
+            rt.dispatch_and_wait(|enc| {
+                enc.encode_sc_logit_rowstats();
+                enc.encode_sc_softembed_path(&layout, true, true)?;
+                Ok(())
+            })
+            .expect("chunked sc softembed");
+            let soft = read_arena_buffer_f32(&rt.bufs.arena, soft_off, soft_elems);
+            let gb_ptr = rt.bufs.gemm_b.contents().as_ptr() as *const f32;
+            let gb = (0..soft_elems).map(|i| unsafe { *gb_ptr.add(i) }).collect();
+            (soft, gb)
+        };
+
+        let (run1, gb1) = run_chunked(&mut rt);
+        let (run2, gb2) = run_chunked(&mut rt);
+        let (run3, _gb3) = run_chunked(&mut rt);
+
+        // Where does the f32 accumulator (gemm_b) first diverge?
+        let mut gb_max = 0.0f32;
+        let mut gb_first = None;
+        for (i, (a, b)) in gb1.iter().zip(gb2.iter()).enumerate() {
+            let d = (a - b).abs();
+            if d > 0.0 && gb_first.is_none() {
+                gb_first = Some((i, i / HID, i % HID, *a, *b));
+            }
+            gb_max = gb_max.max(d);
+        }
+        eprintln!("NONDET-SC gemm_b accumulator run1-vs-run2: max_abs={gb_max:.6} first(idx,row,col,a,b)={gb_first:?}");
+
+        let mut max_abs = 0.0f32;
+        let mut ndiff = 0usize;
+        let mut first = None;
+        for (i, (a, b)) in run1.iter().zip(run2.iter()).enumerate() {
+            let d = (a - b).abs();
+            if d > 0.0 {
+                ndiff += 1;
+                if first.is_none() {
+                    first = Some((i, *a, *b));
+                }
+            }
+            max_abs = max_abs.max(d);
+        }
+        let diff13 = run1
+            .iter()
+            .zip(run3.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!(
+            "NONDET-SC chunked softembed run1-vs-run2: max_abs={max_abs:.6} ndiff={ndiff}/{soft_elems} first={first:?}; run1-vs-run3 max_abs={diff13:.6}"
+        );
+        // Regression guard for the memzero-coverage bug (NONDET-SC-1): the chunked
+        // SC softembed must be bit-deterministic on identical seeded logits.
+        assert_eq!(gb_max, 0.0, "gemm_b accumulator nondeterministic");
+        assert_eq!(max_abs, 0.0, "chunked softembed nondeterministic");
+        assert_eq!(diff13, 0.0, "chunked softembed nondeterministic (run3)");
     }
 
     #[test]
