@@ -78,6 +78,31 @@ impl MetalContext {
             is_full_layer,
             quant_format,
             x_fp16,
+            false,
+        )
+    }
+
+    /// As `compile_gemm_subkernel` but sets GATHER_A (FC28) — the fused-MoE
+    /// gate_up path that gathers bf16 `moein` rows in the A-load (buffer 7).
+    pub fn compile_gemm_subkernel_gather(
+        &self,
+        source: &str,
+        entry: &str,
+        gemm_n: u32,
+        gemm_k: u32,
+        quant_format: u32,
+    ) -> Result<ComputePipeline, Error> {
+        let library = self.compile_library(source)?;
+        Self::compile_gemm_subkernel_on_device(
+            &self.device,
+            &library,
+            entry,
+            gemm_n,
+            gemm_k,
+            false,
+            quant_format,
+            false,
+            true,
         )
     }
 
@@ -252,6 +277,7 @@ impl MetalContext {
         is_full_layer: bool,
         quant_format: u32,
         x_fp16: bool,
+        gather_a: bool,
     ) -> Result<ComputePipeline, Error> {
         let variant = crate::kernels::sub::variant::runtime_step_variant();
         let fc = MTLFunctionConstantValues::new();
@@ -311,17 +337,25 @@ impl MetalContext {
                 MTLDataType::UInt,
                 11,
             );
+            if gather_a {
+                fc.setConstantValue_type_atIndex(
+                    std::ptr::NonNull::from_ref(&gather_a).cast(),
+                    MTLDataType::Bool,
+                    28,
+                );
+            }
         }
         let name = NSString::from_str(entry);
         let function = library
             .newFunctionWithName_constantValues_error(&name, &fc)
             .map_err(|e| shader_compile_error(e))?;
         let label = format!(
-            "{entry}_qf{quant_format}_n{gemm_n}_k{gemm_k}_nt{gemm_n_tile}_xfp16{}_sa{}_df{}_dd{}",
+            "{entry}_qf{quant_format}_n{gemm_n}_k{gemm_k}_nt{gemm_n_tile}_xfp16{}_sa{}_df{}_dd{}_g{}",
             u8::from(x_fp16),
             u8::from(shape_assert),
             u8::from(debug_fast),
             u8::from(debug_deep),
+            u8::from(gather_a),
         );
         let cache = PipelineArchiveCache::shared(device)?;
         let pipeline = cache.compile_compute(device, &function, &label)?;

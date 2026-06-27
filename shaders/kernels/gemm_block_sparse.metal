@@ -9,6 +9,12 @@ using namespace metal;
 #include "qgemm_grouped.metal"
 #include "moe_router_device.metal"
 
+// Fused gather: when set, load A by gathering bf16 `moein` rows via
+// `route->token_list` instead of reading a pre-gathered f32 buffer. Defaults
+// false so existing compiles (which don't set FC28) keep the f32 path.
+constant bool GATHER_A_DEF [[function_constant(28)]];
+constant bool GATHER_A = is_function_constant_defined(GATHER_A_DEF) ? GATHER_A_DEF : false;
+
 /// Block-sparse grouped MoE GEMM (megablocks-style ragged GEMM).
 ///
 /// Identical math to `gemm_block_grouped`, but the ragged M dimension is
@@ -26,6 +32,7 @@ kernel void gemm_block_sparse(
     device const uint *row_starts [[buffer(4)]],
     constant uint &num_jobs [[buffer(5)]],
     device const RouteScratch *route [[buffer(6)]],
+    device const ushort *moein [[buffer(7)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 lid [[thread_position_in_threadgroup]],
     uint sgid [[simdgroup_index_in_threadgroup]]
@@ -81,7 +88,11 @@ kernel void gemm_block_sparse(
     // --- Prime: load K-tile 0 into buffer 0 ---
     {
         const uint k0 = 0u;
-        gemm_load_a_tile_f32(a, M_tile, K, row0, k0, ltid, tx_buf[0u]);
+        if (GATHER_A) {
+            gemm_load_a_tile_gather_bf16(moein, route->token_list, M_tile, K, row0, k0, ltid, tx_buf[0u]);
+        } else {
+            gemm_load_a_tile_f32(a, M_tile, K, row0, k0, ltid, tx_buf[0u]);
+        }
         if (ltid < GEMM_N_TILE) {
             const uint r = ltid;
             const uint global_n = n0 + r;
@@ -112,7 +123,11 @@ kernel void gemm_block_sparse(
 
         if (ti + 1u < n_k_tiles) {
             const uint k0 = (ti + 1u) * GEMM_K_TILE;
-            gemm_load_a_tile_f32(a, M_tile, K, row0, k0, ltid, tx_buf[nxt]);
+            if (GATHER_A) {
+                gemm_load_a_tile_gather_bf16(moein, route->token_list, M_tile, K, row0, k0, ltid, tx_buf[nxt]);
+            } else {
+                gemm_load_a_tile_f32(a, M_tile, K, row0, k0, ltid, tx_buf[nxt]);
+            }
             if (ltid < GEMM_N_TILE) {
                 const uint r = ltid;
                 const uint global_n = n0 + r;

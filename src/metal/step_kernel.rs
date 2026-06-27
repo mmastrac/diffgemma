@@ -181,6 +181,19 @@ pub fn moe_block_sparse_enabled() -> bool {
     }
 }
 
+/// Fuse the MoE gather into the gate_up block-sparse GEMM (A-load reads bf16
+/// `moein` rows via route->token_list). Skips the separate gather pass + its
+/// 23MB/layer f32 round-trip. **Default on** (~28ms/step, bit-identical to
+/// gather+f32, smoketest 16/16); `DGQ_MOE_FUSE_GATHER=0` opts out. Requires
+/// block-sparse (auto-off if `DGQ_MOE_BLOCK_SPARSE=0`).
+pub fn moe_fuse_gather_enabled() -> bool {
+    moe_block_sparse_enabled()
+        && match std::env::var("DGQ_MOE_FUSE_GATHER") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
+}
+
 /// GQA-grouped matrix-unit attention (`attention_mma2`) for sliding layers: 2 Q
 /// heads per threadgroup sharing K/V staging on the simdgroup_matrix units. ~1.6x
 /// vs the scalar online-softmax kernel at hd=256; only valid for sliding layers
@@ -731,6 +744,9 @@ struct StepPipelines {
     nvfp4_block_grouped: HashMap<(u32, u32), ComputePipeline>,
     q4_block_sparse: HashMap<(u32, u32), ComputePipeline>,
     nvfp4_block_sparse: HashMap<(u32, u32), ComputePipeline>,
+    /// Fused-gather gate_up variant, keyed by (n,k); built only when
+    /// DGQ_MOE_FUSE_GATHER is on. Q4 only (the production MoE format).
+    block_sparse_gather: HashMap<(u32, u32), ComputePipeline>,
     gather_rows: ComputePipeline,
     gather_rows_bf16_to_f32: ComputePipeline,
     gelu_swiglu_gate_up: ComputePipeline,
@@ -885,6 +901,20 @@ impl StepPipelines {
         let mut nvfp4_block_grouped = HashMap::new();
         let mut q4_block_sparse = HashMap::new();
         let mut nvfp4_block_sparse = HashMap::new();
+        let mut block_sparse_gather = HashMap::new();
+        if moe_fuse_gather_enabled() {
+            // Only gate_up gathers (down's A is the swiglu output, not gathered).
+            let (n, k) = (MOE_FF * 2, HID as u32);
+            block_sparse_gather.insert(
+                (n, k),
+                crate::kernels::sub::gemm_block_sparse::pipeline_for_gather(
+                    ctx,
+                    n,
+                    k,
+                    crate::kernels::sub::QuantFormat::Q4Affine,
+                )?,
+            );
+        }
         for &(n, k) in &[(MOE_FF * 2, HID as u32), (HID as u32, MOE_FF)] {
             q4_block_grouped.insert(
                 (n, k),
@@ -964,6 +994,7 @@ impl StepPipelines {
             nvfp4_block_grouped,
             q4_block_sparse,
             nvfp4_block_sparse,
+            block_sparse_gather,
             gather_rows: crate::kernels::sub::gather_rows::pipeline_for(ctx, prod)?,
             gather_rows_bf16_to_f32: crate::kernels::sub::gather_rows_bf16_to_f32::pipeline_for(
                 ctx, prod,
@@ -1097,6 +1128,11 @@ impl StepPipelines {
         };
         map.get(&(n, k))
             .ok_or(Error::Format("missing block_sparse pipeline"))
+    }
+
+    /// Fused-gather gate_up pipeline if built (DGQ_MOE_FUSE_GATHER), else None.
+    fn block_sparse_gather(&self, n: u32, k: u32) -> Option<&ComputePipeline> {
+        self.block_sparse_gather.get(&(n, k))
     }
 
     fn moe_scalar(&self, format: QuantFormat) -> &ComputePipeline {
@@ -2268,9 +2304,23 @@ impl StepEnc<'_> {
         k: u32,
         n: u32,
         indirect_slot: usize,
+        gather: bool,
     ) -> Result<(), Error> {
         let block_sparse = moe_block_sparse_enabled();
-        let grouped_ps = if block_sparse {
+        // Fused-gather gate_up: A-load pulls bf16 `moein` rows via token_list
+        // (buffer 7), so no separate gather pass / f32 staging buffer. The caller
+        // skips the gather pass iff `gather`; if the pipeline for this shape is
+        // missing we'd read a stale A buffer, so fail loud rather than silently.
+        let gather_ps = if gather { self.ps.block_sparse_gather(n, k) } else { None };
+        if gather && gather_ps.is_none() {
+            return Err(Error::Format(
+                "fused MoE gather requested but no gather pipeline for this shape",
+            ));
+        }
+        let use_gather = gather_ps.is_some();
+        let grouped_ps = if let Some(p) = gather_ps {
+            p
+        } else if block_sparse {
             self.ps.block_sparse(self.block_profile.format, n, k)?
         } else {
             self.ps.block_grouped(self.block_profile.format, n, k)?
@@ -2290,6 +2340,9 @@ impl StepEnc<'_> {
         let num_jobs = N_EXPERTS as u32;
         self.sink_set_bytes(&num_jobs, 5);
         self.bind_route(6);
+        if use_gather {
+            self.sink_set_buffer(&self.bufs.arena, self.arena().moein_off() as usize, 7);
+        }
         let tg = MTLSize {
             width: crate::kernels::sub::gemm_common::THREADS_PER_TG,
             height: 1,
@@ -2308,7 +2361,9 @@ impl StepEnc<'_> {
         layer: usize,
         layout: &ModelLayout,
     ) -> Result<(), Error> {
-        self.encode_moe_batched_gather()?;
+        if !moe_fuse_gather_enabled() {
+            self.encode_moe_batched_gather()?;
+        }
         self.encode_moe_batched_gate_up(layer, layout)?;
         self.encode_moe_batched_swiglu()?;
         self.encode_moe_batched_down(layer, layout)?;
@@ -2388,6 +2443,7 @@ impl StepEnc<'_> {
             HID as u32,
             MOE_FF * 2,
             0,
+            moe_fuse_gather_enabled(),
         )
     }
 
@@ -2420,6 +2476,7 @@ impl StepEnc<'_> {
             MOE_FF,
             HID as u32,
             1,
+            false,
         )
     }
 
@@ -2432,13 +2489,14 @@ impl StepEnc<'_> {
         let canvas = CANVAS as u32;
         self.sink_set_bytes(&hidden, 3);
         self.sink_set_bytes(&canvas, 4);
+        // One threadgroup per (token, 256-wide d-tile); 256 threads, one per d.
         let grid = MTLSize {
-            width: hidden as usize,
+            width: div_up(hidden as usize, 256),
             height: canvas as usize,
             depth: 1,
         };
         let tg = MTLSize {
-            width: 8,
+            width: 256,
             height: 1,
             depth: 1,
         };
@@ -2909,7 +2967,14 @@ impl StepEnc<'_> {
             StepStage::LayerOProjPostAttn => self.encode_layer_o_proj_post_attn(layer, layout),
             StepStage::LayerDenseFfn => self.encode_layer_dense_ffn(layer, layout),
             StepStage::LayerRouter => self.encode_layer_router_buckets(layer, layout),
-            StepStage::MoeBatchedGather => self.encode_moe_batched_gather(),
+            StepStage::MoeBatchedGather => {
+                // Fused gather folds the token gather into the gate_up A-load.
+                if moe_fuse_gather_enabled() {
+                    Ok(())
+                } else {
+                    self.encode_moe_batched_gather()
+                }
+            }
             StepStage::MoeBatchedGateUp => self.encode_moe_batched_gate_up(layer, layout),
             StepStage::MoeBatchedSwiglu => self.encode_moe_batched_swiglu(),
             StepStage::MoeBatchedDown => self.encode_moe_batched_down(layer, layout),

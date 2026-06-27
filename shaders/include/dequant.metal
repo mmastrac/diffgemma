@@ -75,6 +75,33 @@ inline void gemm_load_a_tile_f32(
     }
 }
 
+/// Gathering A-tile load for fused MoE gate_up: instead of a pre-materialized
+/// [slots, K] f32 buffer, read the source token row straight from the bf16
+/// `moein` [canvas, K] via `token_list[slot]`. Saves the separate gather pass +
+/// the 23MB/layer f32 round-trip; `moein` is only `canvas` rows (cache-hot,
+/// TOP_K-reused). bf16->f32->half == bf16->half, so bit-identical to gather+f32.
+inline void gemm_load_a_tile_gather_bf16(
+    device const ushort *moein,
+    device const uint *token_list,
+    uint M_tile,
+    uint K,
+    uint row0,
+    uint k0,
+    uint ltid,
+    threadgroup half tx[32][32]
+) {
+    for (uint i = ltid; i < 32u * 32u; i += 128u) {
+        const uint mm = i / 32u;
+        const uint kk = i % 32u;
+        if (mm < M_tile) {
+            const uint tok = token_list[row0 + mm];
+            tx[mm][kk] = half(bf16_to_f32(moein[(ulong)tok * K + k0 + kk]));
+        } else {
+            tx[mm][kk] = half(0);
+        }
+    }
+}
+
 inline void gemm_prefetch_a_tile_f32(
     device const float *a,
     uint M_tile,

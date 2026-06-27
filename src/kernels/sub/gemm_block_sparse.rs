@@ -19,3 +19,16 @@ pub fn pipeline_for(
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
     ctx.compile_gemm_subkernel(SHADER, ENTRY, n, k, false, format as u32, false)
 }
+
+/// Fused-gather variant (GATHER_A): A-load gathers bf16 `moein` rows via
+/// `route->token_list` (buffer 7) instead of a pre-gathered f32 buffer. Used for
+/// MoE gate_up to skip the separate gather pass.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn pipeline_for_gather(
+    ctx: &crate::metal::device::MetalContext,
+    n: u32,
+    k: u32,
+    format: QuantFormat,
+) -> Result<crate::metal::device::ComputePipeline, Error> {
+    ctx.compile_gemm_subkernel_gather(SHADER, ENTRY, n, k, format as u32)
+}
