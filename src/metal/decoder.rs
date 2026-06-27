@@ -139,8 +139,19 @@ impl GpuDecoderScratch {
         max_encoder_kv: usize,
         max_canvas: usize,
     ) -> Result<(), Error> {
-        if self.gpu_kv.is_none() {
-            self.gpu_kv = Some(GpuKvCache::new(device, cfg, max_encoder_kv, max_canvas)?);
+        // Capacity is `max_encoder_kv + max_canvas`, fixed per allocation. Grow
+        // (reallocate) when the current cache is too small — the caller always
+        // re-hydrates / re-prefills afterward, so discarding contents is safe.
+        // Without this, a session reused across prompts (smoketest) or a
+        // 3+-block generation would keep the first (small) capacity and overflow.
+        let need = max_encoder_kv + max_canvas;
+        let have = self.gpu_kv.as_ref().map(|kv| kv.capacity_tokens()).unwrap_or(0);
+        if have < need {
+            // Grow with headroom (round encoder budget up to whole canvas blocks)
+            // to avoid reallocating on every block extend.
+            let blocks = max_encoder_kv.div_ceil(max_canvas.max(1)) + 1;
+            let grown_encoder_kv = blocks * max_canvas.max(1);
+            self.gpu_kv = Some(GpuKvCache::new(device, cfg, grown_encoder_kv, max_canvas)?);
         }
         Ok(())
     }

@@ -81,8 +81,11 @@ Tier-1 GEMM K-tile double-buffering, stacked QKV/gate-up, SC chunked f32-accumul
 | P3.8 | Subkernel extraction completion | Medium | All monolithic stage bodies in `shaders/kernels/` + Tier-1 oracles; legacy `qgemm.metal` retired |
 
 **Loose ends to fold into P3:**
+- **COLD-START-1 (real chat UX bug):** the *first* generation in a fresh session emits an empty reply (0 tokens, immediate end-of-turn) for short-answer prompts; the 2nd+ generations in the same session answer correctly. Confirmed via smoketest (1st prompt empty, rest fine) and standalone chat (always "first" → empty for "capital of France", "7×8", etc.; same prompts answer correctly as a warm 2nd turn). The smoketest works around it with a throwaway warm-up generation, but real chat's first user turn is affected. Likely a session warm-up/init issue (cf. NOTES "in-process pollution / fresh process"). Root-cause in `generate_with_session` / session open.
 - `gemm_q8` / `gemm_q8_rowk` standalone GPU oracle tests fail (32-tile kernel vs `dispatch_shape` n_tile=128 mismatch); production dispatch is correct. Either migrate those kernels to the fast 128-tile (like `gemm_bf16`) or fix the test dispatch. (7 pre-existing test failures total incl. one sampler test.)
 - RNG-1: canvas init vs `Rng::new(seed+1)` stream alignment (minor).
+
+**Smoketest gate (`smoketest` subcommand, `fixtures/smoketest/prompts.json`):** convergence prompts (must converge ≤ N denoise steps, ratchet N down) + adherence prompts (single correct answer + convergence). Run `diffgemma-mps -m <model.dgq> smoketest --layers 30 --seed 42`; exit 0 = all pass. Use as the pre-commit gate; tighten `max_steps` as the engine improves.
 
 **P3 exit:** ship-quality chat @ 30L on 24 GiB; orchestration drift prevented by schedule asserts; `STRATEGY.md` §6 invariants enforced in debug builds.
 

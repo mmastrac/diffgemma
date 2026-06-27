@@ -190,6 +190,13 @@ impl StepGenerateSession {
             build.compile,
         ))
     }
+
+    /// Drop the prefilled KV so the next `generate_with_session` re-prefills from
+    /// scratch. Use for *independent* prompts (smoketest); chat relies on the
+    /// KV-reuse continuation path instead.
+    pub fn reset_kv(&mut self) {
+        self.rt.set_kv_len(0);
+    }
 }
 
 /// Monolithic generate: prefill prompt → denoise blocks → extend KV (matches `generate_inner` structure).

@@ -53,6 +53,11 @@ impl GpuKvCache {
         Ok(Self { layers, kv_len: 0 })
     }
 
+    /// Allocated token capacity (`max_encoder_kv + max_canvas`); 0 if no layers.
+    pub fn capacity_tokens(&self) -> usize {
+        self.layers.first().map(|l| l.capacity_tokens).unwrap_or(0)
+    }
+
     pub fn sync_all_from_cpu(
         &mut self,
         cpu: &KvCache,

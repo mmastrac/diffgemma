@@ -322,6 +322,12 @@ enum Command {
         no_early_stop: bool,
         initial_prompt: Option<String>,
     },
+    Smoketest {
+        prompts_path: Option<PathBuf>,
+        seed: u64,
+        steps: usize,
+        max_layers: Option<usize>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -733,6 +739,19 @@ fn main() -> ExitCode {
             no_early_stop,
             cli.raw_prompt,
         ),
+        Command::Smoketest {
+            prompts_path,
+            seed,
+            steps,
+            max_layers,
+        } => run_smoketest_cmd(
+            &cli.model_dir,
+            prompts_path.as_deref(),
+            seed,
+            steps,
+            max_layers,
+            cli.raw_prompt,
+        ),
         Command::Quantize { output, profile } => run_quantize(&cli.model_dir, &output, &profile),
         Command::Tokenize(text) => run_tokenize(&cli.model_dir, &text, cli.raw_prompt),
         Command::Gemm { size } => run_gemm(size),
@@ -880,6 +899,7 @@ fn run_command(
             raw_prompt,
         ),
         Command::Chat { .. } => ExitCode::FAILURE,
+        Command::Smoketest { .. } => ExitCode::FAILURE,
         Command::Tokenize(_) => ExitCode::FAILURE,
         Command::Gemm { .. } => ExitCode::FAILURE,
         Command::ProbeDevice { .. } => ExitCode::FAILURE,
@@ -3327,6 +3347,12 @@ fn parse_cli() -> Cli {
             no_early_stop,
             initial_prompt: prompt.clone(),
         },
+        Some("smoketest") => Command::Smoketest {
+            prompts_path: positional.get(1).map(PathBuf::from),
+            seed,
+            steps: steps_production,
+            max_layers: parity_layers,
+        },
         Some("generate-parity") => Command::GenerateParity {
             prompt: prompt.clone(),
             seed,
@@ -5076,6 +5102,241 @@ fn run_chat_cmd(
     ExitCode::SUCCESS
 }
 
+/// Smoketest prompt spec (`fixtures/smoketest/prompts.json`).
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[derive(serde::Deserialize)]
+struct SmoketestSpec {
+    #[serde(default)]
+    convergence: Vec<SmokeConvergence>,
+    #[serde(default)]
+    adherence: Vec<SmokeAdherence>,
+}
+
+/// Free-form prompt that must converge within `max_steps` denoise steps.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[derive(serde::Deserialize)]
+struct SmokeConvergence {
+    id: String,
+    prompt: String,
+    max_steps: usize,
+}
+
+/// Prompt with exactly one correct answer; gated on both answer + convergence.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[derive(serde::Deserialize)]
+struct SmokeAdherence {
+    id: String,
+    prompt: String,
+    answer: String,
+    /// Additional acceptable spellings (e.g. "h2o", "h₂o").
+    #[serde(default)]
+    accept: Vec<String>,
+    max_steps: usize,
+}
+
+/// Lowercase, alphanumeric-only, single-spaced — for word-boundary matching.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn smoke_normalize(s: &str) -> String {
+    let mut out = String::new();
+    let mut prev_space = true;
+    for c in s.chars() {
+        if c.is_alphanumeric() {
+            for lc in c.to_lowercase() {
+                out.push(lc);
+            }
+            prev_space = false;
+        } else if !prev_space {
+            out.push(' ');
+            prev_space = true;
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Does `reply` contain `answer` (or an accepted alternate) as a whole word run?
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn smoke_answer_matches(reply: &str, answer: &str, accept: &[String]) -> bool {
+    let r = format!(" {} ", smoke_normalize(reply));
+    std::iter::once(answer)
+        .chain(accept.iter().map(String::as_str))
+        .any(|a| {
+            let an = smoke_normalize(a);
+            !an.is_empty() && r.contains(&format!(" {an} "))
+        })
+}
+
+/// Convergence + adherence gate over a prompt set. Reuses the chat session path
+/// so each prompt is a fresh single-turn generation; reports actual vs threshold
+/// denoise steps (ratchet thresholds down in the JSON as the engine improves).
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn run_smoketest_cmd(
+    model_dir: &std::path::Path,
+    prompts_path: Option<&std::path::Path>,
+    seed: u64,
+    steps: usize,
+    max_layers: Option<usize>,
+    raw_prompt: bool,
+) -> ExitCode {
+    use metal::{generate_with_session, StepGenerateConfig, StepGenerateSession};
+
+    if !dgq::store::looks_like_dgq_dir(model_dir) {
+        eprintln!("error: smoketest requires a .dgq directory (-m /path/to/quantized-weights)");
+        return ExitCode::FAILURE;
+    }
+
+    let default_path = std::path::PathBuf::from("fixtures/smoketest/prompts.json");
+    let path = prompts_path.unwrap_or(default_path.as_path());
+    let spec: SmoketestSpec = match std::fs::read_to_string(path) {
+        Ok(text) => match serde_json::from_str(&text) {
+            Ok(s) => s,
+            Err(err) => {
+                eprintln!("error: parse {}: {err}", path.display());
+                return ExitCode::FAILURE;
+            }
+        },
+        Err(err) => {
+            eprintln!("error: read {}: {err}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let layers = match resolve_model_layers(model_dir, max_layers) {
+        Ok(n) => n,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Per-step denoise progress would drown the gate report.
+    if std::env::var_os("DGQ_QUIET").is_none() {
+        unsafe { std::env::set_var("DGQ_QUIET", "1") };
+    }
+
+    const SMOKE_MAX_SEQ: usize = 2048;
+    const SMOKE_GEN_CAP: usize = 512; // ~2 canvas blocks; bounds gate time + KV
+    let stop_token_ids = config::load_generation_stop_tokens(model_dir);
+    let sampler = sample::sampler_for_steps(steps, false);
+    let mut step_cfg =
+        StepGenerateConfig::from_generate(seed, 1024, SMOKE_MAX_SEQ, layers, sampler, false);
+    step_cfg.stop_token_ids = stop_token_ids;
+
+    let mut session = match StepGenerateSession::open(model_dir, &step_cfg, None) {
+        Ok((s, compile)) => {
+            eprintln!("smoketest: session ready ({compile:.2?}, {layers}L, sampler cap {steps})");
+            s
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let tok_path = model_dir.join("tokenizer.json");
+    let tokenizer = match tokenizer::Tokenizer::load(&tok_path) {
+        Ok(t) => t,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // (denoise_steps, reply) for one fresh single-turn generation.
+    let mut run_one =
+        |prompt_text: &str| -> Result<(usize, String), safetensors::Error> {
+            // Each prompt is independent — drop prior KV so we re-prefill fresh
+            // (chat's KV-reuse continuation would otherwise answer the first prompt).
+            session.reset_kv();
+            let history = vec![chat_template::ChatTurn::user(prompt_text)];
+            let prompt = build_chat_prompt_tokens(model_dir, &history, raw_prompt)?;
+            let prompt_len = prompt.len();
+            // Bound generation (and thus time + KV) — a gate doesn't need essays.
+            step_cfg.max_new_tokens = SMOKE_GEN_CAP.min(SMOKE_MAX_SEQ.saturating_sub(prompt_len).max(1));
+            let out = generate_with_session(&mut session, &prompt, &step_cfg, "smoketest")?;
+            let new_ids = sample::strip_degenerate_token_ids(
+                out.token_ids.get(prompt_len..).unwrap_or(&[]),
+            );
+            let reply = chat_template::sanitize_model_reply(&tokenizer.decode(&new_ids));
+            Ok((out.denoise_steps_run, reply))
+        };
+
+    // Warm-up: the first generation in a fresh session produces a degenerate
+    // (empty) reply for short-answer prompts — a cold-start bug (see NOTES). Burn
+    // one throwaway generation so every gated prompt runs in the warm state.
+    let _ = run_one("Say hello.");
+
+    let mut passed = 0usize;
+    let mut total = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+
+    println!(
+        "\nsmoketest: {} (seed {seed}, {layers}L, sampler cap {steps} steps)",
+        model_dir.display()
+    );
+
+    if !spec.adherence.is_empty() {
+        println!("\n[adherence]");
+        for p in &spec.adherence {
+            total += 1;
+            let (st, reply) = match run_one(&p.prompt) {
+                Ok(v) => v,
+                Err(err) => {
+                    println!("  {:<22} ERROR  {err}", p.id);
+                    failures.push(p.id.clone());
+                    continue;
+                }
+            };
+            let answer_ok = smoke_answer_matches(&reply, &p.answer, &p.accept);
+            let conv_ok = st <= p.max_steps;
+            let ok = answer_ok && conv_ok;
+            if ok {
+                passed += 1;
+            } else {
+                failures.push(p.id.clone());
+            }
+            let prev = reply.chars().take(56).collect::<String>().replace('\n', " ");
+            let mark = if ok { "PASS" } else { "FAIL" };
+            let af = if answer_ok { "ok " } else { "BAD" };
+            let max = p.max_steps;
+            let ans = &p.answer;
+            println!("  {id:<22} {mark:<4} steps {st:>3}/{max:<3} answer {af} \"{ans}\"  | {prev}", id = p.id);
+        }
+    }
+
+    if !spec.convergence.is_empty() {
+        println!("\n[convergence]");
+        for p in &spec.convergence {
+            total += 1;
+            let (st, reply) = match run_one(&p.prompt) {
+                Ok(v) => v,
+                Err(err) => {
+                    println!("  {:<22} ERROR  {err}", p.id);
+                    failures.push(p.id.clone());
+                    continue;
+                }
+            };
+            let ok = st <= p.max_steps && !reply.trim().is_empty();
+            if ok {
+                passed += 1;
+            } else {
+                failures.push(p.id.clone());
+            }
+            let mark = if ok { "PASS" } else { "FAIL" };
+            let max = p.max_steps;
+            let prev = reply.chars().take(72).collect::<String>().replace('\n', " ");
+            println!("  {id:<22} {mark:<4} steps {st:>3}/{max:<3}  | {prev}", id = p.id);
+        }
+    }
+
+    println!("\nsmoketest: {passed}/{total} passed");
+    if passed == total {
+        ExitCode::SUCCESS
+    } else {
+        println!("failed: {}", failures.join(", "));
+        ExitCode::FAILURE
+    }
+}
+
 #[cfg(not(all(feature = "metal", target_os = "macos")))]
 fn run_chat_cmd(
     _model_dir: &std::path::Path,
@@ -5088,6 +5349,19 @@ fn run_chat_cmd(
     _raw_prompt: bool,
 ) -> ExitCode {
     eprintln!("error: chat requires --features metal on macOS");
+    ExitCode::FAILURE
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn run_smoketest_cmd(
+    _model_dir: &std::path::Path,
+    _prompts_path: Option<&std::path::Path>,
+    _seed: u64,
+    _steps: usize,
+    _max_layers: Option<usize>,
+    _raw_prompt: bool,
+) -> ExitCode {
+    eprintln!("error: smoketest requires --features metal on macOS");
     ExitCode::FAILURE
 }
 
