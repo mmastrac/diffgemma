@@ -168,12 +168,14 @@ pub struct CanvasState {
 
 /// P2.5: skip lm_head on canvas rows committed in prior denoise steps within this block.
 /// Sparse SC softembed (top-survivors gather instead of the full vocab GEMM).
-/// APPROXIMATE (drops prob tail below e^-10 of row max; smoketest-validated
-/// 16/16). Opt-in (`DGQ_SC_SPARSE=1`) pending sign-off; needs bf16 embed.
+/// APPROXIMATE (drops prob tail below e^-10 of row max). **Default on** (signed
+/// off): ~16% faster/step (1.50→1.26 s/step), smoketest 16/16, output-level
+/// equivalent to MLX-4bit (8-step convergence). `DGQ_SC_SPARSE=0` opts out.
+/// Needs bf16 embed (gated at call site).
 pub fn sc_sparse_enabled() -> bool {
     match std::env::var("DGQ_SC_SPARSE") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
