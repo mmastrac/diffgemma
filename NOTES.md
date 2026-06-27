@@ -54,10 +54,11 @@ From `config.json` + CPU reference (`kernels/cpu.rs`, `decoder_layer.rs`, `atten
 ### Embedding / lm_head
 - Embed scale `sqrt(hidden) = sqrt(2816) ~= 53.066` on gather.
 - Tied lm_head (`logits = final_hidden @ embed^T`), then softcap.
+- **`embed_tokens` is stored bf16 (Raw), not q8** (since the bf16-embed fix, §10): the tied lm_head and SC soft-embed both read it, and q8-per-row coarseness flattened logits on hard tail tokens → tail-convergence stall. bf16 is lossless and +0.74 GiB on one tensor. Kind is auto-detected (`embed_bf16` flag), so old q8-embed blobs still dispatch the q8 gather/lm_head/SC paths.
 - **Partial lm_head (P2.5):** after positions are accepted (`frozen[]`), skip full `256×262144` GEMM on those rows; compact unfrozen rows → gather → `M_active×VOCAB` GEMM → scatter. Default on; `DGQ_PARTIAL_LM_HEAD=0` for A/B. Disables ICB replay when active (schedule differs).
 
 ### Self-conditioning (the part not guessable from public material)
-- 4 tensors: pre_norm, gate_proj, up_proj, down_proj (q8 in `.dgq`).
+- 4 tensors: pre_norm, gate_proj, up_proj, down_proj (gate/up/down q8 in `.dgq`; pre_norm raw). The SC soft-embed itself uses the (now bf16) `embed_tokens` table.
 - Fed back: **softmax-weighted embedding mix of the previous step's processed logits** (`soft_embeddings_from_logits`) — not argmax, not raw logits.
 - Injected before layer 0 only: `hidden = inputs_embeds + down(gelu_tanh(gate) * up(RMSNorm_w(soft_signal)))`, then rms_norm_no_scale.
 - Step 1: self_conditioning_logits = None -> zero signal, but the SC MLP still runs on zeros.
@@ -131,7 +132,7 @@ Historical engine numbers used `/tmp/quantized-weights` and pre-P1.6 monolithic.
 | Sampler readback | ~30 KiB/step (CanvasState) | — | P2.1 hot path; `DGQ_CHECK_LOGITS=1` opt-in full scan |
 
 ### .dgq blob facts
-15.35 GiB, 1047 tensors: 454 q4_block (decoder matrices), 4 q8_row (embed + 3 SC projections), 589 raw (norms, router, scales, layer_scalars, vision). Vision = 356 tensors, ~0.37 GiB quantized. All offsets 64B-aligned. q4_block group = 20 B `[scale bf16:2][min bf16:2][nibbles:16]`, `w = scale*q + min`, ~5.0 bpw. q8_row = `[scale bf16:2][i8:K]`, `w = scale*q`. Convert ~214 s streaming; mmap load ~40 ms GPU cache init.
+**Current default profile (mixed precision), ~18.9 GiB, 1047 tensors:** 60 q4_block (MoE experts only), 3 q8_row (SC gate/up/down), 984 raw — bf16 attention q/k/v/o + dense FFN gate/up/down + **bf16 embed_tokens** + norms/router/scales/layer_scalars/vision. Earlier uniform-q4 profile was 15.35 GiB (454 q4_block + q8 embed); the engine auto-detects each tensor's kind, so old blobs still load. Quant evolution: uniform q4 (15.35) → bf16 attn/FFN (16.1) → +q8→bf16 embed-attn upgrades → bf16 embed (18.9). All offsets 64B-aligned. q4_block group = 20 B `[scale bf16:2][min bf16:2][nibbles:16]`, `w = scale*q + min`, ~5.0 bpw. q8_row = `[scale bf16:2][i8:K]`, `w = scale*q`. nvfp4_block = E2M1 nibbles + FP8 E4M3 scale/16, ~4.5 bpw (supported, not in default profile — see §10). Convert ~210 s streaming; mmap load ~ms GPU cache init.
 
 ### Throughput model (calibrate, don't trust constants)
 ```
@@ -201,7 +202,9 @@ Systematic check: for each kernel, find every dimension bounded by a tile consta
 ## 6. Decisions & rationale
 
 - **Checkpoint-orientation quant layout** (not pre-transposed): the 78 ms/miss transpose was a kernel-orientation artifact, not a layout necessity. Keeping `[out,in]` row-major gives a streaming converter, shared CPU/GPU layout, and parity indices that match the checkpoint. Row-interleaving reserved as a converter-side format-version bump iff profiling shows load-bound expert GEMMs.
-- **int4 affine, not FP4/e2m1** — Metal has no native 4-bit; everything dequantizes to nibbles in-kernel anyway, and affine int4 matches weight distributions better and is better characterized.
+- **Mixed precision: bf16 where it's cheap, q4 only for the bulk.** Attention (q/k/v/o), dense FFN (gate/up/down), and `embed_tokens` are bf16 (Raw) — only ~2× q8 but lossless into the half GEMM tiles (source weights are bf16), beating MLX's q8 on those tensors. Only the MoE experts (the bulk) are q4. Driven by the equivalence work (§10): q8/q4 on attention and embed flattened logits and stalled convergence.
+- **Experts stay ~4-bit — hard memory constraint.** bf16 experts ≈ 4× the q4 expert bytes, blowing the unified-memory budget; not acceptable without paged/swapped experts. MLX itself uses 4-bit experts and converges fine, so 4-bit is sufficient. Close any expert-quant gap memory-neutrally (better 4-bit scheme), never with resident bf16 experts.
+- **int4 affine, not FP4/e2m1 for experts** — Metal has no native 4-bit; everything dequantizes to nibbles in-kernel anyway, and affine int4 matches weight distributions better and is better characterized. nvfp4 (microscaling fp4, MLX-mxfp4-compatible) is implemented but did **not** improve convergence over q4 group-32 in testing (§10).
 - **Router stays f16 weights / f32 accum + f32 logits** — routing is control flow; near-boundary logit noise flips experts discretely and f16 compare breaks CPU/GPU tie-break parity. Quantizing the ~22 MB router saves nothing.
 - **MoE quant sensitivity** — only 3.8B active, so q4 damage behaves like quantizing a ~4B dense model, not a 26B one. If quality drops, bump shared expert + first/last layers before routed experts (cheap; routed experts hold the bytes).
 - **q4 vs q5 on M3 is a quality choice, not speed** — compute-bound at canvas=256, so q5 is ~free in wall-clock on 36 GiB.
@@ -221,7 +224,7 @@ Systematic check: for each kernel, find every dimension bounded by a tile consta
 | QUAL-1 | Templated chat + `--steps 2` → no readable reply | **done** (P1.2; production `--steps 48`) |
 | CLI-1 | `--steps` default 2 vs 48 | **done** (P1.2) |
 | CHAT-1 | Display decodes full 256 block incl. pads | **done** (P1.4) |
-| SC-1 | `k_sc_softembed` O(vocab × hidden)/step | open (P2.3) |
+| SC-1 | `k_sc_softembed` O(vocab × hidden)/step | **done** (P2.3): chunked f32-accumulate GEMM is default; slow O(vocab) kept only as `DGQ_SC_GEMM=0` reference |
 | DISPATCH-1 | ~130 encoder calls/step/layer | open (P2.4) |
 | LM-PARTIAL-1 | Full 256×262k lm_head every step | **done** (P2.5): frozen mask + partial GEMM; ~25% denoise on Hello |
 | MOE-1 | Float atomic scatter nondeterministic / wrong | **done** monolithic batched path (per-TG reduce); engine CPU MoE parity path unchanged |
@@ -231,6 +234,7 @@ Systematic check: for each kernel, find every dimension bounded by a tile consta
 | METAL-1 | `tanh` large-input NaN | **done** (clamp) |
 | BENCH-1 | Historical benches used kv_len=0 vs engine 64 | reconciled (section 4) |
 | RT-1 | Generate scanned 134 MiB logits/step for NaN guard | **done** (P2.1): opt-in `DGQ_CHECK_LOGITS=1` |
+| TEST-1 | `gemm_q8` / `gemm_q8_rowk` standalone GPU oracle tests fail | open (P3): kernels are 32-N-tile but `dispatch_shape` uses `n_tile=128` → cols 32..127 unwritten. Production dispatch uses `div_up(n,32)` (correct); only the standalone tests are mis-dispatched. Fix by migrating to the fast 128-tile (`gemm_bf16` template) or correcting the test dispatch. |
 
 ---
 
@@ -393,4 +397,25 @@ See **section 5** for full archaeology. Highest-frequency when MLX/HF match each
 - **MLX mxfp4 vs `.dgq` q4 @ step 1:** argmax may match positions 0–1 then diverge; MLX accepts far more positions because entropies are much lower — **do not** treat as accept-rule regression without logit export parity.
 - **NVFP4 grouped MoE:** large speedup; changes outputs — regen goldens / compare in fresh process after kernel changes.
 - **Long prompts:** OOM (exit **137**) on full 48-step × 30L generate — use shorter `--max-new-tokens` or fewer steps for parity runs.
+
+---
+
+## 10. MLX generation equivalence — investigation (2026-06)
+
+Goal: match MLX-4bit (`mlx-community/diffusiongemma-26B-A4B-it-4bit`) output quality. Reference chosen over vLLM (not integrated here). Tooling in `python/scripts/`: `mlx_generate.py` (ground-truth full-message gen), `dump_mlx_denoise_trace.py --canvas-ids` (per-step trace on a matched initial canvas), `compare_denoise_trace.py`, `compare_generation.py`.
+
+**Baseline gap:** on matched-canvas "Why is the sky blue?", Rust took **31 denoise steps vs MLX-4bit 13** (mlx-mxfp4 17). Steps 1–8 matched MLX closely; divergence was entirely in the **tail (step ≥9)** — MLX entropy plunged to ~0, ours stalled/oscillated at 0.15–0.26. The hard, last-to-resolve canvas positions were systematically flatter (higher entropy) in our model.
+
+**Root cause = embed quant, fixed.** lm_head is tied to `embed_tokens` (`logits = hidden @ embed^T`), and our embed was q8 **per-row symmetric** — measured relerr 0.0094 vs MLX's 8-bit **group-64 affine** 0.0053 (1.76× coarser; grouping is the win, asymmetry minor). Coarse embed → flat logits on hard tokens → tail stall. Storing `embed_tokens` as **bf16 (Raw, lossless)** dropped convergence to **16 steps** (commit `d61cc24`); the tail entropy now decays smoothly tracking MLX. Full chat: 59→37 steps, 137→93 s (~1.5×); the pervasive long-gen token-doubling ("the the", "pass pass", "been been") is largely gone.
+
+**Ruled out — experts (decisively, all memory-neutral):**
+- MLX-4bit (13 steps) uses 4-bit **group-64 affine** experts; ours are q4 **group-32** — *finer*, not under-resolved.
+- Step-1 logits matched MLX (the quantized forward, incl. experts, is accurate; the gap was downstream/tail).
+- Rebuilding with **nvfp4 experts** (fp4 group-16) gave 36 steps ≈ q4's 31, identical tail-divergence — swapping the expert quant format did nothing.
+
+**Ruled out — chunked SC GEMM as a "bug":** the default chunked SC softembed vs the slow O(vocab) reference differs in step count (e.g. chunked 31 vs slow 22 on one prompt) but the order **reverses** on another prompt (chunked 26 vs slow 30) — it's **chaotic trajectory divergence** from tiny per-step soft-embed differences flipping entropy-boundary accept decisions (per-step parity is cos 0.999994), not a systematic precision bug. Do not "fix" chunked to match slow; both are valid. (A real precision bump was still made — SC probs fp16 not bf16, commit `0042d92` — but it does not materially change convergence.)
+
+**Attention GEMM was the per-step bottleneck, fixed:** the bf16/q8 attention+FFN+lm_head kernel was a basic 32×32 simdgroup tile at ~185 GFLOP/s. Ported `gemm_block`'s tiling (128-N tile, double-buffered K, 16 accumulators) onto `gemm_bf16` → ~2400 GFLOP/s (commit `f1900f4`), removing the bf16-vs-q8 per-step penalty.
+
+**Remaining (open, PLAN Q4/Q5):** bf16-embed 16 vs MLX-4bit 13 (~3 steps) + a few residual "as as" doublings — likely experts (q4 vs MLX 4-bit, but nvfp4 didn't help) or chunked-SC chaos. Per-step is also ~1.9× slower than MLX (MoE q4 + CPU↔GPU sync), separate from step count. Caveat: most matched-canvas comparisons used the correct MLX-4bit reference; one early trace used mlx-mxfp4 — prefer 4bit.
 

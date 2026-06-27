@@ -32,6 +32,10 @@ When output is wrong, follow this order. Do not skip to optimization or to rewri
 
 7. **A contradiction is a second bug, not an anomaly.** "act went 0.015 → 1.0 but gpu_out is bit-identical" cannot happen in a correct pipeline. When a fix changes an intermediate but not the output, you are measuring two different code paths (probe vs production) or reading a stale buffer. Resolve contradictions; do not note-and-move-on.
 
+8. **Reproduce a gap across inputs before attributing it to a bug.** A difference measured on one prompt/seed can be *chaos*, not a defect: in a sensitive iterative system (the denoise loop), a sub-1e-4 per-step difference can flip an entropy-boundary accept decision and cascade into a different — but equally valid — trajectory. The chunked-vs-slow SC "10-step regression" looked like a bug on "sky blue" (chunked 31 vs slow 22) and reversed on the next prompt (chunked 26 vs slow 30) — it was trajectory chaos, and per-step parity was cos 0.999994. Before chasing a single-input delta, check that it's *systematic* (same direction across prompts/seeds) and that per-unit parity is actually broken. Otherwise you'll "fix" noise.
+
+9. **Localize the gap to the right axis, then change one thing.** A quality gap can live in any of {sampler, forward precision, a specific quantized tensor}. Bisect to the axis before rebuilding: the MLX convergence gap was localized to the *tail* (step ≥9) and to *embed* quant specifically by (a) matching steps 1–8, (b) ruling out experts with a memory-neutral nvfp4 rebuild that changed nothing, (c) measuring embed quant relerr directly (1.76× worse than MLX). Each step changed exactly one variable. A "rebuild with everything different" tells you nothing.
+
 ---
 
 ## 3. Measure before optimizing — always
