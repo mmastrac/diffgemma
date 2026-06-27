@@ -49,6 +49,10 @@ pub const N_EXPERTS: usize = 128;
 pub const TOP_K: usize = 8;
 pub const DENSE_FF: u32 = 2112;
 pub const MOE_FF: u32 = 704;
+/// Max survivors per row for the sparse SC softembed (select+gather). 8192 fits
+/// gemm_a (prob f16) + a gemm_b tail (idx u32). Overflow is monitored; the -10
+/// threshold keeps far fewer in practice.
+pub const SC_SPARSE_MAXK: u32 = 8192;
 /// Two act rows (after-barrier + down-read) plus kernel input probe metadata.
 pub const MOE_ACT_PROBE_ACT_FLOATS: usize = (MOE_FF * 2) as usize;
 pub const MOE_ACT_PROBE_META_FLOATS: usize = 36; // tok,slot,e,w,x[8],row0[8], down_o[8], moe_out_tok_row[8]
@@ -163,6 +167,16 @@ pub struct CanvasState {
 }
 
 /// P2.5: skip lm_head on canvas rows committed in prior denoise steps within this block.
+/// Sparse SC softembed (top-survivors gather instead of the full vocab GEMM).
+/// APPROXIMATE (drops prob tail below e^-10 of row max; smoketest-validated
+/// 16/16). Opt-in (`DGQ_SC_SPARSE=1`) pending sign-off; needs bf16 embed.
+pub fn sc_sparse_enabled() -> bool {
+    match std::env::var("DGQ_SC_SPARSE") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
 pub fn partial_lm_head_enabled() -> bool {
     match std::env::var("DGQ_PARTIAL_LM_HEAD") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
@@ -776,6 +790,8 @@ struct StepPipelines {
     compact_active_rows: ComputePipeline,
     gather_rows_bf16: ComputePipeline,
     scatter_logits_rows: ComputePipeline,
+    sc_sparse_select: ComputePipeline,
+    sc_sparse_gather: ComputePipeline,
 }
 
 impl StepPipelines {
@@ -1039,6 +1055,14 @@ impl StepPipelines {
             scatter_logits_rows: ctx.compile_kernel(
                 shader_include::include_metal!("kernels/scatter_logits_rows.metal"),
                 "scatter_logits_rows",
+            )?,
+            sc_sparse_select: ctx.compile_kernel(
+                shader_include::include_metal!("kernels/sc_sparse_select.metal"),
+                "sc_sparse_select",
+            )?,
+            sc_sparse_gather: ctx.compile_kernel(
+                shader_include::include_metal!("kernels/sc_sparse_gather.metal"),
+                "sc_sparse_gather",
             )?,
         })
     }
@@ -2034,6 +2058,56 @@ impl StepEnc<'_> {
         Ok(())
     }
 
+    /// Sparse SC softembed: select per-row survivors (prob within e^-10 of row
+    /// max), then gather-weighted-sum their embed rows — instead of the full vocab
+    /// GEMM. APPROXIMATE (drops the prob tail). Scratch: prob+cnt in gemm_a, idx +
+    /// f32 accumulator in gemm_b (both free during preamble). rowstat from the
+    /// prior ScLogitRowstats stage.
+    fn encode_sc_softembed_sparse(&mut self, layout: &ModelLayout) -> Result<(), Error> {
+        let maxk = SC_SPARSE_MAXK;
+        // gemm_b: [0..acc_bytes) = f32 accumulator; idx at IDX_OFF.
+        // gemm_a: [0..) = fp16 prob; cnt at CNT_OFF.
+        const IDX_OFF: usize = 4 * 1024 * 1024;
+        const PROB_OFF: usize = 0;
+        const CNT_OFF: usize = 4 * 1024 * 1024;
+
+        // Pass 1: per-row threshold select + compact.
+        self.sink_set_pipeline(&self.ps.sc_sparse_select);
+        self.bind_logits(0);
+        self.sink_set_buffer(&self.bufs.arena, self.arena().rs_sc_off() as usize, 1);
+        self.sink_set_buffer(&self.bufs.gemm_b, IDX_OFF, 2);
+        self.sink_set_buffer(&self.bufs.gemm_a, PROB_OFF, 3);
+        self.sink_set_buffer(&self.bufs.gemm_a, CNT_OFF, 4);
+        let p1 = [CANVAS as u32, VOCAB as u32, maxk, 0u32];
+        self.sink_set_bytes(&p1, 5);
+        self.sink_dispatch(
+            MTLSize { width: CANVAS, height: 1, depth: 1 },
+            MTLSize { width: 256, height: 1, depth: 1 },
+        );
+        self.sink_memory_barrier();
+
+        // Pass 2: gather-weighted-sum embed rows → f32 accumulator (gemm_b[0..]).
+        self.sink_set_pipeline(&self.ps.sc_sparse_gather);
+        self.sink_set_buffer(&self.bufs.gemm_b, IDX_OFF, 0);
+        self.sink_set_buffer(&self.bufs.gemm_a, PROB_OFF, 1);
+        self.sink_set_buffer(&self.bufs.gemm_a, CNT_OFF, 2);
+        self.bind_blob(3);
+        self.sink_set_bytes(&layout.embed, 4);
+        self.sink_set_buffer(&self.bufs.gemm_b, 0, 5);
+        let p2 = [CANVAS as u32, HID as u32, maxk, 0u32];
+        self.sink_set_bytes(&p2, 6);
+        self.sink_dispatch(
+            MTLSize { width: CANVAS, height: 1, depth: 1 },
+            MTLSize { width: 256, height: 1, depth: 1 },
+        );
+        self.sink_memory_barrier();
+
+        // Finalize: f32 accumulator → bf16 soft slot (÷ SC_PROB_GEMM_SCALE, × √HID).
+        let scale = (HID as f32).sqrt() / SC_PROB_GEMM_SCALE;
+        self.f32_to_half_scale(&self.bufs.gemm_b, self.arena().soft_off(), CANVAS * HID, scale);
+        Ok(())
+    }
+
     fn encode_sc_softembed_path(
         &mut self,
         layout: &ModelLayout,
@@ -2041,6 +2115,9 @@ impl StepEnc<'_> {
         use_chunked: bool,
     ) -> Result<(), Error> {
         if use_gemm {
+            if self.embed_bf16 && sc_sparse_enabled() {
+                return self.encode_sc_softembed_sparse(layout);
+            }
             if use_chunked {
                 return self.encode_sc_softembed_chunked(layout);
             }
