@@ -77,6 +77,9 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         token_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
         slot_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
         token_slot: [[0; crate::metal::TOP_K]; crate::metal::CANVAS],
+        block_expert: [0; crate::metal::MOE_MAX_BLOCKS],
+        block_row0: [0; crate::metal::MOE_MAX_BLOCKS],
+        num_blocks: 0,
     };
     BufferPool::write_bytes(
         &buf_route,

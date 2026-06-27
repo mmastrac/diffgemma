@@ -419,3 +419,19 @@ Goal: match MLX-4bit (`mlx-community/diffusiongemma-26B-A4B-it-4bit`) output qua
 
 **Remaining (open, PLAN Q4/Q5):** bf16-embed 16 vs MLX-4bit 13 (~3 steps) + a few residual "as as" doublings — likely experts (q4 vs MLX 4-bit, but nvfp4 didn't help) or chunked-SC chaos. Per-step is also ~1.9× slower than MLX (MoE q4 + CPU↔GPU sync), separate from step count. Caveat: most matched-canvas comparisons used the correct MLX-4bit reference; one early trace used mlx-mxfp4 — prefer 4bit.
 
+
+---
+
+## 11. Block-sparse (megablocks-style) MoE GEMM (2026-06)
+
+**Landed default-on (`DGQ_MOE_BLOCK_SPARSE`, opt-out with `=0`); ~6% per-step, bit-identical.**
+
+Context: at canvas=256 top-8/128, ~76 experts are active/layer averaging ~33 tokens each (§3 working-set wall). The grouped GEMM (`gemm_block_grouped`) ran one threadgroup per active expert, each looping its rows in 32-row `m_base` tiles — variable-length threadgroups (load imbalance) + a partial last M-tile per expert.
+
+Fix: pre-tile the ragged M into fixed ≤32-row blocks in `moe_bucket_fill` phase 1 (`route->block_expert[b]`, `block_row0[b]`, `num_blocks`; bounded by n_active + num_slots/32 ≤ 192, `MOE_MAX_BLOCKS=256`). New `gemm_block_sparse` kernel runs one block per threadgroup (grid `(N_tiles, num_blocks)` via indirect slots 2/3), no `m_base` loop — uniform, independently-schedulable work units. Same MMA math → bit-identical.
+
+**Measured (M3 Pro, q4emb, "sky blue" seed 42):** grouped ~1758 ms/step vs block-sparse ~1653 ms/step (3 runs each, every on-run < every off-run). Bit-identical: exact same tokens + accept curve + 14 steps; all 11 smoketest prompts PASS with identical step counts.
+
+**Why ~6% not the ~8–10% ceiling:** the restructure fixes *load balance / scheduling*, not the two remaining wastes — W is still re-dequantized per block, and the partial-last-tile padding is unchanged. Honest profiling (PLAN P2.7, `--profile-steps`) also showed the expert GEMM is ~17–21% of the step (not the ~35% an older note assumed), so the bit-identical ceiling here is modest. Remaining levers if revisited: hoist W dequant out of per-block work; shrink/eliminate partial-tile padding.
+
+**Guard methodology:** validated bit-identicality via the entropy-curve / step-count comparison (generate accept curve + smoketest step counts) per `STRATEGY.md` §8/§11 — a GEMM restructure that drifted would surface as changed accepts/step-count, not an obvious crash. Contrast `partial-forward` (separate branch), which the same guard *rejected* as irreducibly lossy.

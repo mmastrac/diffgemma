@@ -49,19 +49,23 @@ Per-step is now bounded by MoE (q4 grouped GEMM) + dispatch/sync overhead, not t
 | P2.4 | Dispatch fusion | Medium | open | dispatch count down |
 | P2.6 | MPS Q8 lm_head; f16/f32 sweep | Medium | open | step ≤ 1.4 s stretch |
 
-### P2.7 open profile targets (`bench-step-kernel --layer-profile`)
+### P2.7 open profile targets
 
-Tier-1 GEMM K-tile double-buffering, stacked QKV/gate-up, SC chunked f32-accumulate, partial lm_head, and bf16/fp16 unification are **done** (see `NOTES.md` §4). Remaining hotspots:
+Tier-1 GEMM K-tile double-buffering, stacked QKV/gate-up, SC chunked f32-accumulate, partial lm_head, bf16/fp16 unification, and **block-sparse MoE GEMM** are **done** (see `NOTES.md` §4).
+
+> **Profiling caveat:** `bench-step-kernel --layer-profile` inserts a GPU sync after every stage, so per-stage times collapse toward sync latency (~2.8s) — it flattens RMSNorms/router to look as costly as GEMMs and is **unreliable for compute breakdown**. Use `--profile-steps N` (whole forwards, production 1-sync structure). The honest 30-layer steady-state (SC) split below is from `--profile-steps`.
+
+**Honest per-step split (30L, `--profile-steps`, 2026-06):** pre_moe (qkv+attn+o_proj+dense GEMMs) **24%** · finish (lm_head) **20.5%** · moe_grouped (expert GEMM) **21%** · preamble (SC) **18.6%** · moe_post (norms+combine) **15.4%**. No single dominant bucket — every single-stage win is capped ~20%.
 
 | Priority | Stage | ~Cost | Options |
 |----------|-------|-------|---------|
-| 1 | MoE `gate_up` + `down` | ~33% | Grouped-GEMM occupancy for small per-expert M (~33 tok/expert); larger `tpg`/head tiling; MPS grouped (NOTES: ~3.7k encodes/step tradeoff) |
-| 2 | attention | ~20% | Flash-style KV tiling (amortize softmax over T); head tiling |
-| 3 | MoE scatter | ~5% | Smaller grid or fuse with down output |
-| 4 | qkv / o_proj / dense | ~part | Fuse QK-norm + RoPE adjacency into QKV dispatch; fuse pre-FF RMSNorm/GLU |
-| 5 | Preamble (SC) / finish (lm_head) / sync | ~12% / ~11% | ICB fast path (P2.2); Q8 lm_head tuning (P2.6); fewer command buffers/step |
+| 1 | MoE `gate_up` + `down` | ~17–21% | **Block-sparse landed (~6% step, bit-identical, `NOTES.md` §12).** Remaining: hoist W dequant out of per-block work; cut partial-last-tile padding |
+| 2 | qkv / o_proj / dense | ~24% (pre_moe) | Largest bucket. Fuse QK-norm + RoPE into QKV dispatch; fuse pre-FF RMSNorm/GLU |
+| 3 | finish (lm_head) | ~20% | Q8 lm_head tuning (P2.6); already has partial-lm-head |
+| 4 | preamble (SC) | ~19% | SC soft-embed is O(vocab); ICB fast path (P2.2) |
+| 5 | attention | small @ short ctx | Flash-style KV tiling matters once committed context grows (P2.8 windowing) |
 
-**Suggested order:** MoE small-M occupancy → attention tiling → ICB (multi-step denoise) → cross-stage fusion (QKV+rope).
+**Suggested order (revised by honest profile):** block-sparse MoE ✓ → dispatch/sync overhead (ICB, touches all buckets) → pre_moe fusion → finish/preamble.
 
 **P2 exit:** `bench-step-kernel` ≤ 1.8 s/step @ 30L; ≥ 8 tok/s e2e.
 
