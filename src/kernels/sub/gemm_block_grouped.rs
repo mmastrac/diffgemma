@@ -70,6 +70,9 @@ fn route_from_fixture(f: &Fixture) -> RouteScratch {
         token_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
         slot_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
         token_slot: [[0; crate::metal::TOP_K]; crate::metal::CANVAS],
+        block_expert: [0; crate::metal::MOE_MAX_BLOCKS],
+        block_row0: [0; crate::metal::MOE_MAX_BLOCKS],
+        num_blocks: 0,
     };
     for (i, &rs) in f.row_starts.iter().enumerate().take(num_jobs + 1) {
         route.row_start[i] = rs;
@@ -326,6 +329,9 @@ pub fn gpu_on_blob(
         token_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
         slot_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
         token_slot: [[0; crate::metal::TOP_K]; crate::metal::CANVAS],
+        block_expert: [0; crate::metal::MOE_MAX_BLOCKS],
+        block_row0: [0; crate::metal::MOE_MAX_BLOCKS],
+        num_blocks: 0,
     };
     for (i, &rs) in p.row_starts.iter().enumerate().take(num_jobs + 1) {
         route.row_start[i] = rs;

@@ -19,6 +19,11 @@ struct RouteScratch {
     uint slot_list[2048];
     /// Inverse map: `token_slot[tok][kk]` → flat slot index in `token_list`.
     uint token_slot[256][8];
+    /// Block-sparse MoE GEMM: one entry per <=32-row tile (built in bucket_fill
+    /// phase 1). block_expert[b] = expert; block_row0[b] = global row start.
+    uint block_expert[256];
+    uint block_row0[256];
+    uint num_blocks;
 };
 
 struct RouterDims {

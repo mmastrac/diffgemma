@@ -73,7 +73,7 @@ pub use step_kernel::{
     bench_step_kernel_profile, bench_step_kernel_profile_steps, bench_step_kernel_encode_subprofile,
     EncodeSubProfileResult, LayerEncodeSubProfile, MoeEncodeSubProfile, StepFinishMode,
     StepSmokeConfig, CANVAS, CanvasState, LayerOffsets, RouteScratch, StepParams,
-    fill_token_slot, N_EXPERTS, TOP_K, HID, MOE_FF, FROZEN_WORDS,
+    fill_token_slot, N_EXPERTS, TOP_K, HID, MOE_FF, FROZEN_WORDS, MOE_MAX_BLOCKS,
 };
 pub use step_preamble_dump::{
     run_step_preamble_dump, write_step_preamble_dump,

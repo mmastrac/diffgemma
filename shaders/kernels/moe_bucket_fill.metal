@@ -40,19 +40,29 @@ kernel void moe_bucket_fill(
             uint s = 0u;
             uint used = 0u;
             uint ai = 0u;
+            uint blk = 0u;
             for (uint e = 0u; e < dims.n_experts; ++e) {
-                if (R->count[e] > 0u) {
+                const uint c = R->count[e];
+                if (c > 0u) {
                     R->active_expert[ai] = e;
                     ai++;
                     used++;
+                    // Block-sparse: one <=32-row tile per chunk of this expert.
+                    const uint nb = (c + 31u) / 32u;
+                    for (uint b = 0u; b < nb; ++b) {
+                        R->block_expert[blk] = e;
+                        R->block_row0[blk] = s + b * 32u;
+                        blk++;
+                    }
                 }
                 R->row_start[e] = s;
-                s += R->count[e];
+                s += c;
                 R->count[e] = 0u;
             }
             R->row_start[dims.n_experts] = s;
             R->num_slots = s;
             R->num_active_experts = used;
+            R->num_blocks = blk;
             layer_expert_unique[layer_idx] = used;
             if (indirect != nullptr) {
                 const uint n_tile = max(grid_info.n_tile, 1u);
@@ -64,6 +74,13 @@ kernel void moe_bucket_fill(
                 indirect[1].threadgroups_per_grid[0] = down_w;
                 indirect[1].threadgroups_per_grid[1] = used;
                 indirect[1].threadgroups_per_grid[2] = 1u;
+                // Slots 2/3: block-sparse variants (height = num_blocks).
+                indirect[2].threadgroups_per_grid[0] = gate_w;
+                indirect[2].threadgroups_per_grid[1] = blk;
+                indirect[2].threadgroups_per_grid[2] = 1u;
+                indirect[3].threadgroups_per_grid[0] = down_w;
+                indirect[3].threadgroups_per_grid[1] = blk;
+                indirect[3].threadgroups_per_grid[2] = 1u;
             }
         }
     } else {

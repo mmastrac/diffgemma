@@ -37,6 +37,9 @@ pub fn tiny_fixture(_: ElemFormat) -> Fixture {
         token_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
         slot_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
         token_slot: [[0; crate::metal::TOP_K]; crate::metal::CANVAS],
+        block_expert: [0; crate::metal::MOE_MAX_BLOCKS],
+        block_row0: [0; crate::metal::MOE_MAX_BLOCKS],
+        num_blocks: 0,
     };
     route.weight[0][0] = bf16::f32_to_bf16_bits(0.5);
     route.weight[1][0] = bf16::f32_to_bf16_bits(1.0);
@@ -69,6 +72,9 @@ pub fn moe_routing_fixture(_: ElemFormat) -> Fixture {
         token_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
         slot_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
         token_slot: [[0; crate::metal::TOP_K]; crate::metal::CANVAS],
+        block_expert: [0; crate::metal::MOE_MAX_BLOCKS],
+        block_row0: [0; crate::metal::MOE_MAX_BLOCKS],
+        num_blocks: 0,
     };
     route.token_list[..8].copy_from_slice(&[5, 5, 17, 33, 17, 99, 12, 44]);
     route.slot_list[..8].copy_from_slice(&[0, 1, 0, 0, 1, 0, 0, 0]);

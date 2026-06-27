@@ -170,6 +170,17 @@ pub fn partial_lm_head_enabled() -> bool {
     }
 }
 
+/// Block-sparse (megablocks-style) MoE expert GEMM: pre-tile the ragged M into
+/// fixed <=32-row blocks and run one block per threadgroup (vs one
+/// variable-length threadgroup per expert). Bit-identical to the grouped path;
+/// `DGQ_MOE_BLOCK_SPARSE=1` on. Default off while it's being measured.
+pub fn moe_block_sparse_enabled() -> bool {
+    match std::env::var("DGQ_MOE_BLOCK_SPARSE") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
 /// Algebraic fusion: QKV and dense gate+up as one stacked GEMM.
 /// `DGQ_FUSED_ALGEBRA=0` disables both; `DGQ_FUSED_QKV=0` / `DGQ_FUSED_GATE_UP=0` opt out individually.
 pub fn fused_algebra_enabled() -> bool {
@@ -239,7 +250,18 @@ pub struct RouteScratch {
     pub token_list: [u32; CANVAS * TOP_K],
     pub slot_list: [u32; CANVAS * TOP_K],
     pub token_slot: [[u32; TOP_K]; CANVAS],
+    /// Block-sparse MoE GEMM (DGQ_MOE_BLOCK_SPARSE): one entry per <=32-row tile.
+    /// `block_expert[b]` = expert owning block b; `block_row0[b]` = its global row
+    /// start into the gathered A / token_list. `num_blocks` = total. Built in
+    /// `moe_bucket_fill` phase 1. Bounded by num_active_experts + num_slots/32.
+    pub block_expert: [u32; MOE_MAX_BLOCKS],
+    pub block_row0: [u32; MOE_MAX_BLOCKS],
+    pub num_blocks: u32,
 }
+
+/// Max block-sparse MoE tiles: sum_e ceil(count_e/32) <= n_active + num_slots/32
+/// <= 128 + 2048/32 = 192. Rounded up.
+pub const MOE_MAX_BLOCKS: usize = 256;
 
 /// Fill `token_slot[tok][kk]` from flat `token_list` / `slot_list` after bucketing.
 pub fn fill_token_slot(route: &mut RouteScratch) {
@@ -689,6 +711,8 @@ struct StepPipelines {
     bucket_fill: ComputePipeline,
     q4_block_grouped: HashMap<(u32, u32), ComputePipeline>,
     nvfp4_block_grouped: HashMap<(u32, u32), ComputePipeline>,
+    q4_block_sparse: HashMap<(u32, u32), ComputePipeline>,
+    nvfp4_block_sparse: HashMap<(u32, u32), ComputePipeline>,
     gather_rows: ComputePipeline,
     gather_rows_bf16_to_f32: ComputePipeline,
     gelu_swiglu_gate_up: ComputePipeline,
@@ -841,6 +865,8 @@ impl StepPipelines {
         )?;
         let mut q4_block_grouped = HashMap::new();
         let mut nvfp4_block_grouped = HashMap::new();
+        let mut q4_block_sparse = HashMap::new();
+        let mut nvfp4_block_sparse = HashMap::new();
         for &(n, k) in &[(MOE_FF * 2, HID as u32), (HID as u32, MOE_FF)] {
             q4_block_grouped.insert(
                 (n, k),
@@ -854,6 +880,24 @@ impl StepPipelines {
             nvfp4_block_grouped.insert(
                 (n, k),
                 crate::kernels::sub::gemm_block_grouped::pipeline_for(
+                    ctx,
+                    n,
+                    k,
+                    crate::kernels::sub::QuantFormat::NvFp4,
+                )?,
+            );
+            q4_block_sparse.insert(
+                (n, k),
+                crate::kernels::sub::gemm_block_sparse::pipeline_for(
+                    ctx,
+                    n,
+                    k,
+                    crate::kernels::sub::QuantFormat::Q4Affine,
+                )?,
+            );
+            nvfp4_block_sparse.insert(
+                (n, k),
+                crate::kernels::sub::gemm_block_sparse::pipeline_for(
                     ctx,
                     n,
                     k,
@@ -899,6 +943,8 @@ impl StepPipelines {
             bucket_fill: crate::kernels::sub::moe_bucket_fill::pipeline_for(ctx, prod)?,
             q4_block_grouped,
             nvfp4_block_grouped,
+            q4_block_sparse,
+            nvfp4_block_sparse,
             gather_rows: crate::kernels::sub::gather_rows::pipeline_for(ctx, prod)?,
             gather_rows_bf16_to_f32: crate::kernels::sub::gather_rows_bf16_to_f32::pipeline_for(
                 ctx, prod,
@@ -1015,6 +1061,25 @@ impl StepPipelines {
             .ok_or(Error::Format("missing block_grouped pipeline"))
     }
 
+    fn block_sparse(
+        &self,
+        format: QuantFormat,
+        n: u32,
+        k: u32,
+    ) -> Result<&ComputePipeline, Error> {
+        let map = match format {
+            QuantFormat::Q4Affine => &self.q4_block_sparse,
+            QuantFormat::NvFp4 => &self.nvfp4_block_sparse,
+            _ => {
+                return Err(Error::Format(
+                    "block-sparse MoE GEMM unsupported for this block format",
+                ));
+            }
+        };
+        map.get(&(n, k))
+            .ok_or(Error::Format("missing block_sparse pipeline"))
+    }
+
     fn moe_scalar(&self, format: QuantFormat) -> &ComputePipeline {
         match format {
             QuantFormat::NvFp4 => &self.moe_grouped_nvfp4,
@@ -1059,7 +1124,9 @@ struct MoeGroupedGridInfo {
     tpg: u32,
 }
 
-const MOE_GROUPED_INDIRECT_BYTES: usize = 2 * 3 * std::mem::size_of::<u32>();
+// Slots 0/1: per-expert grouped (gate_up/down), height = num_active_experts.
+// Slots 2/3: block-sparse (gate_up/down), height = num_blocks.
+const MOE_GROUPED_INDIRECT_BYTES: usize = 4 * 3 * std::mem::size_of::<u32>();
 
 fn moe_grouped_grid_info() -> MoeGroupedGridInfo {
     MoeGroupedGridInfo {
@@ -2141,9 +2208,12 @@ impl StepEnc<'_> {
         n: u32,
         indirect_slot: usize,
     ) -> Result<(), Error> {
-        let grouped_ps = self
-            .ps
-            .block_grouped(self.block_profile.format, n, k)?;
+        let block_sparse = moe_block_sparse_enabled();
+        let grouped_ps = if block_sparse {
+            self.ps.block_sparse(self.block_profile.format, n, k)?
+        } else {
+            self.ps.block_grouped(self.block_profile.format, n, k)?
+        };
         let row_start_off = std::mem::offset_of!(RouteScratch, row_start);
         self.sink_set_pipeline(grouped_ps);
         let a_buf = if a_on_gemm_a {
@@ -2164,7 +2234,9 @@ impl StepEnc<'_> {
             height: 1,
             depth: 1,
         };
-        let indirect_offset = indirect_slot * 3 * std::mem::size_of::<u32>();
+        // Block-sparse uses indirect slots 2/3 (height = num_blocks); grouped 0/1.
+        let slot = if block_sparse { indirect_slot + 2 } else { indirect_slot };
+        let indirect_offset = slot * 3 * std::mem::size_of::<u32>();
         self.sink_dispatch_indirect(indirect_offset, n, tg);
         Ok(())
     }
@@ -3980,7 +4052,7 @@ impl StepRuntime {
         let first_step = if st_before.step == 0 { 1u32 } else { 0u32 };
         let partial_lm_m = partial_lm_active_rows(&st_before);
         let use_partial_lm = partial_lm_m < CANVAS as u32;
-        if self.icb_replay_allowed(finish) && !use_partial_lm {
+        if self.icb_replay_allowed(finish) && !use_partial_lm && !moe_block_sparse_enabled() {
             if first_step == 1 {
                 self.ensure_no_sc_icb()?;
             } else if crate::metal::step_icb::step_icb_with_sc_enabled() {
