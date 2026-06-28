@@ -226,6 +226,19 @@ pub fn attn_mma_enabled() -> bool {
     }
 }
 
+/// Matrix-unit attention for FULL/GLOBAL layers (hd=512) via `attention_mma_full`
+/// (register-resident O + QG-grouped K/V sharing). The full-layer analog of
+/// `attention_mma2`; targets the scalar full-attention cost that grows with
+/// kv_len (the dominant real-world attention cost). Non-bit-identical (f16 MMA vs
+/// f32 scalar) → **default OFF** pending quality sign-off; `DGQ_ATTN_MMA_FULL=1`
+/// to enable.
+pub fn attn_mma_full_enabled() -> bool {
+    match std::env::var("DGQ_ATTN_MMA_FULL") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
 /// Algebraic fusion: QKV and dense gate+up as one stacked GEMM.
 /// `DGQ_FUSED_ALGEBRA=0` disables both; `DGQ_FUSED_QKV=0` / `DGQ_FUSED_GATE_UP=0` opt out individually.
 pub fn fused_algebra_enabled() -> bool {
@@ -751,6 +764,8 @@ struct StepPipelines {
     attention: ComputePipeline,
     /// GQA-grouped MMA attention for sliding layers (`DGQ_ATTN_MMA`); scalar `attention` is the fallback/oracle.
     attention_mma2: ComputePipeline,
+    /// MMA attention for full/global layers (`DGQ_ATTN_MMA_FULL`, register-O); scalar `attention` is the fallback/oracle.
+    attention_mma_full: ComputePipeline,
     residual: ComputePipeline,
     glu: ComputePipeline,
     router: ComputePipeline,
@@ -999,6 +1014,7 @@ impl StepPipelines {
             qk_rope_kv: crate::kernels::sub::qk_rope_kv::pipeline_for(ctx, prod)?,
             attention: crate::kernels::sub::attention::pipeline_for(ctx, prod)?,
             attention_mma2: crate::kernels::sub::attention::pipeline_mma2_for(ctx, prod)?,
+            attention_mma_full: crate::kernels::sub::attention::pipeline_mma_full_for(ctx, prod)?,
             residual: crate::kernels::sub::residual_half::pipeline_for(ctx, prod)?,
             glu: crate::kernels::sub::swiglu::pipeline_for(
                 ctx,
@@ -2915,12 +2931,18 @@ impl StepEnc<'_> {
     ) -> Result<(), Error> {
         let layer_off = layer_byte_offset(layer);
         let l = &layout.layers[layer];
-        // GQA-grouped MMA attention (`DGQ_ATTN_MMA`) only handles sliding layers
-        // (hd=256); full hd=512 layers keep the scalar kernel. Identical buffer
-        // layout — only the pipeline + dispatch grid differ.
+        // GQA-grouped MMA attention (`DGQ_ATTN_MMA`) handles sliding layers (hd=256)
+        // via attention_mma2; full hd=512 layers use attention_mma_full
+        // (`DGQ_ATTN_MMA_FULL`, register-resident O + group K/V sharing) when
+        // enabled, else the scalar kernel. Identical buffer layout — only the
+        // pipeline + dispatch grid differ. mma_full is non-bit-identical (quality
+        // gate): default OFF.
         let use_mma2 = attn_mma_enabled() && l.is_full == 0;
+        let use_mma_full = attn_mma_full_enabled() && l.is_full == 1;
         if use_mma2 {
             self.sink_set_pipeline(&self.ps.attention_mma2);
+        } else if use_mma_full {
+            self.sink_set_pipeline(&self.ps.attention_mma_full);
         } else {
             self.sink_set_pipeline(&self.ps.attention);
         }
@@ -2936,12 +2958,21 @@ impl StepEnc<'_> {
         self.sink_set_bytes(&attn_dims, 5);
         self.bind_debug_status(6);
         // Scalar: one threadgroup per (canvas token, Q head). MMA2: one per
-        // (MT-row query tile, KV head), 2 simdgroups = the 2 Q heads in the group.
+        // (MT-row tile, KV head), 2 simdgroups = the 2 Q heads in the group.
+        // MMA_full: one per (MT-row tile, KV head, QG-head sub-group), QG
+        // simdgroups sharing K/V; (group/QG) sub-groups along z.
         let grid = if use_mma2 {
             MTLSize {
                 width: CANVAS.div_ceil(crate::kernels::sub::attention::MMA_M_TILE),
                 height: l.n_kv_heads as usize,
                 depth: 1,
+            }
+        } else if use_mma_full {
+            let group = STEP_NQ_HEADS / l.n_kv_heads as usize; // 8 for full
+            MTLSize {
+                width: CANVAS.div_ceil(crate::kernels::sub::attention::MMA_M_TILE),
+                height: l.n_kv_heads as usize,
+                depth: group / crate::kernels::sub::attention::MMA_FULL_QG,
             }
         } else {
             MTLSize {
@@ -2950,8 +2981,13 @@ impl StepEnc<'_> {
                 depth: 1,
             }
         };
+        // mma_full uses QG*32 lanes; scalar/mma2 use 64.
         let tg = MTLSize {
-            width: 64,
+            width: if use_mma_full {
+                crate::kernels::sub::attention::MMA_FULL_QG * 32
+            } else {
+                64
+            },
             height: 1,
             depth: 1,
         };

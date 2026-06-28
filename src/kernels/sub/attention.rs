@@ -25,6 +25,13 @@ const SHADER_MMA: &str = shader_include::include_metal!("kernels/attention_mma.m
 pub const ENTRY_MMA2: &str = "attention_mma2";
 const SHADER_MMA2: &str = shader_include::include_metal!("kernels/attention_mma2.metal");
 
+/// MMA attention for full/global layers (hd=512): register-resident O + QG-grouped
+/// K/V sharing. `attention` stays the oracle. QG simdgroups per threadgroup, 32
+/// lanes each; (group/QG) sub-groups along grid.z.
+pub const ENTRY_MMA_FULL: &str = "attention_mma_full";
+pub const MMA_FULL_QG: usize = 2;
+const SHADER_MMA_FULL: &str = shader_include::include_metal!("kernels/attention_mma_full.metal");
+
 #[derive(Debug, Clone)]
 pub struct Fixture {
     pub q: Vec<f32>,
@@ -166,6 +173,13 @@ fn model_attn_fixture(
 /// Full-attention layer: hd=512, tpg_w=64 → per=8 (exact `acc[8]` fit).
 pub fn full_hd512_fixture(_: ElemFormat) -> Fixture {
     model_attn_fixture(4, 16, 8, 512, 28, true)
+}
+
+/// Real full/global layer shape: hd=512, nkv=2, GQA group 8 (16 Q / 2 KV).
+/// canvas=16 → 2 MT tiles; group/QG=4 sub-groups → exercises grid.z for
+/// `attention_mma_full`. kv_len=28 → T=44 spans ragged key-tile tails.
+pub fn full_grp8_hd512_fixture(_: ElemFormat) -> Fixture {
+    model_attn_fixture(16, 16, 2, 512, 28, true)
 }
 
 /// Sliding layer: hd=256, per=4; longer KV (kv_len=128) exercises runtime T loop.
@@ -515,6 +529,95 @@ pub fn gpu_mma2(_: &Fixture, _: KernelVariant) -> Result<Vec<f32>, Error> {
     Err(Error::Format("Metal unavailable"))
 }
 
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn pipeline_mma_full_for(
+    ctx: &crate::metal::device::MetalContext,
+    variant: KernelVariant,
+) -> Result<crate::metal::device::ComputePipeline, Error> {
+    ctx.compile_subkernel(SHADER_MMA_FULL, ENTRY_MMA_FULL, variant)
+}
+
+/// Full-layer MMA attention path (hd=512). One threadgroup per (MT-row tile, KV
+/// head, QG-head sub-group); QG simdgroups (32 lanes each) share K/V staging,
+/// O accumulator is register-resident. Identical buffer layout to `gpu_mma`.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn gpu_mma_full(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
+    use crate::metal::buffer::BufferPool;
+    use crate::metal::device::MetalContext;
+
+    let ctx = MetalContext::new()?;
+    let pipeline = pipeline_mma_full_for(&ctx, variant)?;
+    let mut pool = BufferPool::new();
+    let buf_q = pool.allocate(&ctx.device, f.q.len() * 2).ok_or(Error::Format("alloc"))?;
+    let buf_kv = pool.allocate(&ctx.device, f.kvcache.len() * 2).ok_or(Error::Format("alloc"))?;
+    let buf_out = pool.allocate(&ctx.device, f.out_len() * 2).ok_or(Error::Format("alloc"))?;
+    let buf_layer = pool
+        .allocate(&ctx.device, std::mem::size_of::<LayerOffsets>())
+        .ok_or(Error::Format("alloc"))?;
+
+    BufferPool::write_bf16(&buf_q, &bf16::f32_slice_to_bf16_bits(&f.q));
+    BufferPool::write_bf16(&buf_kv, &bf16::f32_slice_to_bf16_bits(&f.kvcache));
+    let layer = layer_offsets(f);
+    let layer_bytes = unsafe {
+        std::slice::from_raw_parts(
+            &layer as *const LayerOffsets as *const u8,
+            std::mem::size_of::<LayerOffsets>(),
+        )
+    };
+    BufferPool::write_bytes(&buf_layer, layer_bytes);
+
+    let params = StepParams {
+        kv_len: f.kv_len,
+        max_steps: 8,
+        entropy_bound: 0.0,
+        t_min: 0.0,
+        t_max: 1.0,
+        conf_threshold: 0.0,
+        stability_threshold: 0,
+        min_early_stop_steps: 0,
+        accept_plateau_threshold: 0,
+        plateau_prefix_mean_max: f32::MAX,
+        eos_token_id: 1,
+    };
+    let dims = AttnDims { canvas: f.canvas as u32, n_q_heads: f.n_q_heads as u32 };
+    let group = f.n_q_heads / f.n_kv();
+
+    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+    enc.setComputePipelineState(&pipeline.pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(&buf_q), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(&buf_kv), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(&buf_out), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(&buf_layer), 0, 3);
+    }
+    gpu_common::set_bytes(&enc, &params, 4);
+    gpu_common::set_bytes(&enc, &dims, 5);
+    enc.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: f.canvas.div_ceil(MMA_M_TILE),
+            height: f.n_kv(),
+            depth: group / MMA_FULL_QG,
+        },
+        MTLSize { width: MMA_FULL_QG * 32, height: 1, depth: 1 },
+    );
+    enc.endEncoding();
+    cmd.commit();
+    cmd.waitUntilCompleted();
+
+    let mut out = vec![0.0f32; f.out_len()];
+    let ptr = buf_out.contents().as_ptr() as *const u16;
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = bf16::bf16_bits_to_f32(unsafe { *ptr.add(i) });
+    }
+    Ok(out)
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+pub fn gpu_mma_full(_: &Fixture, _: KernelVariant) -> Result<Vec<f32>, Error> {
+    Err(Error::Format("Metal unavailable"))
+}
+
 /// Model-shaped attention fixture (canvas=256, 16 Q / 8 KV heads) for benching.
 pub fn model_bench_fixture(hd: usize, kv_len: u32, is_full: bool) -> Fixture {
     model_attn_fixture(256, 16, 8, hd, kv_len, is_full)
@@ -535,6 +638,7 @@ pub fn bench_path(f: &Fixture, iters: usize, path: u8) -> Result<f64, Error> {
     let pipeline = match path {
         1 => pipeline_mma_for(&ctx, prod)?,
         2 => pipeline_mma2_for(&ctx, prod)?,
+        3 => pipeline_mma_full_for(&ctx, prod)?,
         _ => pipeline_for(&ctx, prod)?,
     };
     let mut pool = BufferPool::new();
@@ -576,6 +680,14 @@ pub fn bench_path(f: &Fixture, iters: usize, path: u8) -> Result<f64, Error> {
         2 => (
             MTLSize { width: f.canvas.div_ceil(MMA_M_TILE), height: f.n_kv(), depth: 1 },
             MTLSize { width: 64, height: 1, depth: 1 },
+        ),
+        3 => (
+            MTLSize {
+                width: f.canvas.div_ceil(MMA_M_TILE),
+                height: f.n_kv(),
+                depth: (f.n_q_heads / f.n_kv()) / MMA_FULL_QG,
+            },
+            MTLSize { width: MMA_FULL_QG * 32, height: 1, depth: 1 },
         ),
         _ => (
             MTLSize { width: f.canvas, height: f.n_q_heads, depth: 1 },
@@ -709,6 +821,32 @@ mod tests {
         cpu_oracle = crate::kernels::sub::attention::cpu_oracle,
         gpu = crate::kernels::sub::attention::gpu_mma,
         fixture = crate::kernels::sub::attention::sliding_hd256_fixture,
+        out_len = crate::kernels::sub::attention::fixture_len,
+        formats: [F32],
+        max_tol = 2e-2,
+        min_cos = 0.9999,
+    }
+
+    // ---- Full-layer MMA path (register-O, QG-grouped K/V): parity vs oracle ----
+
+    kernel_oracle_matrix! {
+        mod mma_full_grp2,
+        cpu = crate::kernels::sub::attention::cpu,
+        cpu_oracle = crate::kernels::sub::attention::cpu_oracle,
+        gpu = crate::kernels::sub::attention::gpu_mma_full,
+        fixture = crate::kernels::sub::attention::full_hd512_fixture,
+        out_len = crate::kernels::sub::attention::fixture_len,
+        formats: [F32],
+        max_tol = 2e-2,
+        min_cos = 0.9999,
+    }
+
+    kernel_oracle_matrix! {
+        mod mma_full_grp8,
+        cpu = crate::kernels::sub::attention::cpu,
+        cpu_oracle = crate::kernels::sub::attention::cpu_oracle,
+        gpu = crate::kernels::sub::attention::gpu_mma_full,
+        fixture = crate::kernels::sub::attention::full_grp8_hd512_fixture,
         out_len = crate::kernels::sub::attention::fixture_len,
         formats: [F32],
         max_tol = 2e-2,

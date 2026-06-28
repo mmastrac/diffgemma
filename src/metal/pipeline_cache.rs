@@ -73,6 +73,7 @@ fn shader_bundle_token() -> u64 {
         include_str!("../../shaders/kernels/argmax_rows.metal"),
         include_str!("../../shaders/kernels/copy_f32.metal"),
         include_str!("../../shaders/kernels/gqa_attention.metal"),
+        include_str!("../../shaders/kernels/attention_mma_full.metal"),
         include_str!("../../shaders/kernels/logit_softcapping.metal"),
         include_str!("../../shaders/kernels/row_entropy.metal"),
         include_str!("../../shaders/kernels/sample_from_probs_rows.metal"),
