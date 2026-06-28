@@ -2228,8 +2228,8 @@ fn run_step_parity_cmd(
                 r.hidden_max_abs, r.hidden_tol
             );
             println!(
-                "  logits max_abs={:.4} (tol {:.1})",
-                r.logits_max_abs, r.logits_tol
+                "  logits mean|Δ|={:.4} (tol {:.1})",
+                r.logits_mean_diff, r.logits_tol
             );
             if r.pass {
                 println!("step-parity ok");

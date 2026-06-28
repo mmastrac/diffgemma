@@ -397,11 +397,14 @@ fn forward_inner(
             &engine.ctx.device,
             telemetry,
         )?;
+        // Final RMSNorm: normalize the last layer's output (`norm_in`, = in_buf
+        // after the loop's final swap) INTO `norm_out`, which lm_head + the
+        // returned hidden_states read below. rms_norm_rows is (out, x).
         bk::rms_norm_rows(
             &mut batch,
             &engine.kernels,
-            norm_in,
             norm_out,
+            norm_in,
             weights.final_norm(),
             seq_len,
             hidden,
