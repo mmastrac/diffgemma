@@ -4187,6 +4187,76 @@ impl StepRuntime {
         Ok(t0.elapsed())
     }
 
+    /// Per-stage bf16 activation-range trace: runs the forward stage-by-stage
+    /// (one submit per stage so buffers are valid) and records max|x| of each
+    /// stage's bf16 arena output. Answers "does any activation exceed f16's 65504
+    /// range?" before trying f16/scaled-f16 arenas. `DGQ_TRACE_RANGES=1`.
+    fn trace_step_ranges(&mut self) -> Result<(), Error> {
+        use std::collections::BTreeMap;
+        let layout = self.layout;
+        let layers = self.layers;
+        let st_before: CanvasState = read_struct(&self.bufs.state);
+        let first_step = if st_before.step == 0 { 1u32 } else { 0u32 };
+        const SAMPLE: usize = 4096;
+        // (label) -> (max_abs across layers, any_non_finite)
+        let mut peak: BTreeMap<&'static str, (f32, bool)> = BTreeMap::new();
+        let mut probe = |this: &Self, label: &'static str, off: u64, elems: usize| {
+            let (nf, mx) = half_buffer_stats(&this.bufs.arena, off as usize, elems, SAMPLE);
+            let e = peak.entry(label).or_insert((0.0, false));
+            e.0 = e.0.max(mx);
+            e.1 |= nf;
+        };
+
+        self.dispatch_and_wait(|enc| enc.encode_step_preamble(&layout, first_step))?;
+        probe(self, "preamble:soft", self.bufs.arena_map.soft_off(), CANVAS * HID);
+
+        for layer in 0..layers {
+            let a = &self.bufs.arena_map;
+            let (hidden, attnq, attno, tmp, ffg, dense, moein) = (
+                a.hidden_off(), a.attnq_off(), a.attno_off(), a.tmp_off(),
+                a.ffg_off(), a.dense_off(), a.moein_off(),
+            );
+            self.time_enc_stage(|e| e.encode_layer_qkv_gemm(layer, &layout))?;
+            probe(self, "layer:qkv(Q)", attnq, CANVAS * 4096);
+            self.time_enc_stage(|e| e.encode_layer_qk_rope_kv_dispatch(layer, &layout))?;
+            self.time_enc_stage(|e| e.encode_layer_attention_dispatch(layer, &layout))?;
+            probe(self, "layer:attn_out", attno, CANVAS * 4096);
+            self.time_enc_stage(|e| e.encode_layer_o_proj_gemm(layer, &layout))?;
+            probe(self, "layer:o_proj", tmp, CANVAS * HID);
+            self.time_enc_stage(|e| e.encode_layer_o_proj_tail(layer, &layout))?;
+            probe(self, "layer:resid_pre_moe(hidden)", hidden, CANVAS * HID);
+            let l = &layout.layers[layer];
+            self.time_enc_stage(|e| { e.rmsnorm(e.arena().stream_off(), e.arena().tmp_off(), l.pre_ff_ln, HID as u32, CANVAS); Ok(()) })?;
+            self.time_enc_stage(|e| e.encode_layer_dense_gate_up(layer, &layout))?;
+            probe(self, "layer:gate_up", ffg, CANVAS * DENSE_FF as usize);
+            self.time_enc_stage(|e| { e.glu(e.arena().ffg_off(), e.arena().ffu_off(), e.arena().ffg_off(), CANVAS * DENSE_FF as usize); Ok(()) })?;
+            probe(self, "layer:swiglu", ffg, CANVAS * DENSE_FF as usize);
+            self.time_enc_stage(|e| e.encode_layer_dense_down(layer, &layout))?;
+            probe(self, "layer:dense_down", dense, CANVAS * HID);
+            self.time_enc_stage(|e| { e.rmsnorm(e.arena().dense_off(), e.arena().dense_off(), l.post_ff_ln_1, HID as u32, CANVAS); Ok(()) })?;
+            self.time_enc_stage(|e| e.encode_layer_router_buckets(layer, &layout))?;
+            // MoE
+            self.time_enc_stage(|e| e.encode_moe_batched_gate_up(layer, &layout))?;
+            self.time_enc_stage(|e| e.encode_moe_batched_swiglu())?;
+            self.time_enc_stage(|e| e.encode_moe_batched_down(layer, &layout))?;
+            self.time_enc_stage(|e| e.encode_moe_batched_scatter())?;
+            self.time_enc_stage(|e| e.encode_layer_moe_post_norm(layer, &layout))?;
+            probe(self, "layer:moe_norm(moein)", moein, CANVAS * HID);
+            self.time_enc_stage(|e| e.encode_layer_moe_post_combine(layer, &layout))?;
+            probe(self, "layer:resid_post_moe(hidden)", hidden, CANVAS * HID);
+            // Per-layer residual peak (the f16-overflow suspect).
+            let (_, hmx) = half_buffer_stats(&self.bufs.arena, hidden as usize, CANVAS * HID, SAMPLE);
+            eprintln!("  layer {layer:>2}: residual(hidden) max|x| = {hmx:.1}");
+        }
+
+        eprintln!("=== bf16 activation ranges (max|x| across {layers} layers) — f16 max = 65504 ===");
+        for (label, (mx, nf)) in &peak {
+            let flag = if *mx > 65504.0 { "  <-- OVERFLOWS f16" } else if *mx > 16384.0 { "  (tight)" } else { "" };
+            eprintln!("  {label:<28} {mx:>12.1}{}{}", if *nf { " [non-finite!]" } else { "" }, flag);
+        }
+        Ok(())
+    }
+
     /// Per-stage GPU timing inside `encode_layer` + MoE grouped/post (one submit per stage×layer).
     fn profile_encode_subprofile(&mut self) -> Result<EncodeSubProfileResult, Error> {
         let layout = self.layout;
@@ -5701,6 +5771,11 @@ pub fn bench_step_kernel_encode_subprofile(
 ) -> Result<EncodeSubProfileResult, Error> {
     let (mut rt, build) = build_step_runtime(model_dir, &cfg)?;
     rt.run_forward_once(cfg.finish)?;
+    if std::env::var("DGQ_TRACE_RANGES").is_ok() {
+        // Warm to a steady-state (denoised) step, then trace one step's ranges.
+        rt.run_forward_once(cfg.finish)?;
+        rt.trace_step_ranges()?;
+    }
     let mut prof = rt.profile_encode_subprofile()?;
     prof.compile = build.compile;
     Ok(prof)
