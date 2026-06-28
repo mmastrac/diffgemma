@@ -23,10 +23,12 @@ Training/LoRA, multi-user serving, CUDA/Linux, vision (deferred; `--skip-vision`
 ---
 
 ## Shipped this cycle (perf, all validated)
-block-sparse MoE GEMM · GQA matrix-unit attention (`DGQ_ATTN_MMA`) · bf16 stacked QKV+gate/up · **MoE gather-fusion + scatter rewrite** (~100 ms, bit-identical) · **sparse SC softembed** (`DGQ_SC_SPARSE`, default-on, ~16%/step, smoketest 16/16, MLX-equivalent — *approximate*, drops prob tail < e⁻¹⁰ of row max). Cumulative this session: 1.61 → 1.26 s/step.
+block-sparse MoE GEMM · GQA matrix-unit attention sliding (`DGQ_ATTN_MMA`) · **flash full-attention MMA** (`DGQ_ATTN_MMA_FULL`, default-on, register-resident O + QG-grouped K/V sharing; attention −29% / step −11% at kv=512, oracle cos≥0.9999, smoketest 16/16, MLX-equivalent) · bf16 stacked QKV+gate/up · **MoE gather-fusion + scatter rewrite** (~100 ms, bit-identical) · **sparse SC softembed** (`DGQ_SC_SPARSE`, default-on, ~16%/step, smoketest 16/16, MLX-equivalent — *approximate*, drops prob tail < e⁻¹⁰ of row max) · **GEMM-kernel consolidation** (4 shaders folded into gemm_block/_stacked/rowk-acc via FC, all bit-identical). Cumulative this session: 1.61 → 1.26 s/step (single-block); attention scales with context — full-attention MMA cuts ~11% at kv=512.
+
+**Attention is the real-world #1 cost** (kv_len sweep: 40% of step at kv=512, grows linearly; synthetic kv_len=0 bench understates it ~3×). Sliding (mma2) + full (mma_full) now both MMA. Next attention lever: device-resident Q to lift QG (more K/V sharing).
 
 ## Disproven non-levers (do NOT re-attempt without new info — see `NOTES.md`/memory)
-2D dense-GEMM register-blocking (production 1D wide-N already beats it at M=256 fat-N) · SC softembed tiling (occupancy-bound; wide-N/bigger-chunk/coalesce all worse) · full-layer (hd=512) 1-head attention MMA (staging/occupancy-bound, ties scalar) · partial bf16 lm_head (frozen rows' hidden states still evolve → breaks convergence) · partial-forward (K/V staleness) · dispatch/ICB (~0.2 ms/step encode) · bounds-check removal · load_unsafe · nvfp4 experts.
+2D dense-GEMM register-blocking (production 1D wide-N already beats it at M=256 fat-N) · SC softembed tiling (occupancy-bound; wide-N/bigger-chunk/coalesce all worse) · full-layer 1-head attention MMA *with tgmem O tile* (superseded — register-resident-O version now shipped) · partial bf16 lm_head (frozen rows' hidden states still evolve → breaks convergence) · partial-forward (K/V staleness) · dispatch/ICB (~0.2 ms/step encode) · bounds-check removal · load_unsafe · nvfp4 experts.
 
 ---
 

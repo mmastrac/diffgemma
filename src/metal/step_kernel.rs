@@ -230,12 +230,14 @@ pub fn attn_mma_enabled() -> bool {
 /// (register-resident O + QG-grouped K/V sharing). The full-layer analog of
 /// `attention_mma2`; targets the scalar full-attention cost that grows with
 /// kv_len (the dominant real-world attention cost). Non-bit-identical (f16 MMA vs
-/// f32 scalar) → **default OFF** pending quality sign-off; `DGQ_ATTN_MMA_FULL=1`
-/// to enable.
+/// f32 scalar) but quality-neutral (sign-off 2026-06-28: oracle cos≥0.9999,
+/// smoketest 16/16, MLX-ref equivalent — 29 vs 30 steps, no convergence
+/// regression; attention −29% / step −11% at kv=512). **Default on**;
+/// `DGQ_ATTN_MMA_FULL=0` to opt out (scalar path).
 pub fn attn_mma_full_enabled() -> bool {
     match std::env::var("DGQ_ATTN_MMA_FULL") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
