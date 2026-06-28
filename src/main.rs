@@ -327,6 +327,8 @@ enum Command {
         seed: u64,
         steps: usize,
         max_layers: Option<usize>,
+        /// Substring (case-insensitive) on prompt id; only matching prompts run.
+        filter: Option<String>,
     },
 }
 
@@ -744,6 +746,7 @@ fn main() -> ExitCode {
             seed,
             steps,
             max_layers,
+            filter,
         } => run_smoketest_cmd(
             &cli.model_dir,
             prompts_path.as_deref(),
@@ -751,6 +754,7 @@ fn main() -> ExitCode {
             steps,
             max_layers,
             cli.raw_prompt,
+            filter.as_deref(),
         ),
         Command::Quantize { output, profile } => run_quantize(&cli.model_dir, &output, &profile),
         Command::Tokenize(text) => run_tokenize(&cli.model_dir, &text, cli.raw_prompt),
@@ -2978,6 +2982,7 @@ fn parse_cli() -> Cli {
     let mut parity_kv: Option<usize> = None;
     let mut parity_layers: Option<usize> = None;
     let mut golden_name: Option<String> = None;
+    let mut smoke_filter: Option<String> = None;
     let mut compare_cpu = false;
     let mut write_golden: Option<String> = None;
     let mut write_trace: Option<PathBuf> = None;
@@ -3086,6 +3091,11 @@ fn parse_cli() -> Cli {
             "--golden" => {
                 if let Some(v) = args.next() {
                     golden_name = Some(v);
+                }
+            }
+            "--filter" => {
+                if let Some(v) = args.next() {
+                    smoke_filter = Some(v);
                 }
             }
             "--size" => {
@@ -3352,6 +3362,7 @@ fn parse_cli() -> Cli {
             seed,
             steps: steps_production,
             max_layers: parity_layers,
+            filter: smoke_filter.clone(),
         },
         Some("generate-parity") => Command::GenerateParity {
             prompt: prompt.clone(),
@@ -5198,6 +5209,7 @@ fn run_smoketest_cmd(
     steps: usize,
     max_layers: Option<usize>,
     raw_prompt: bool,
+    filter: Option<&str>,
 ) -> ExitCode {
     use metal::{generate_with_session, StepGenerateConfig, StepGenerateSession};
 
@@ -5208,7 +5220,7 @@ fn run_smoketest_cmd(
 
     let default_path = std::path::PathBuf::from("fixtures/smoketest/prompts.json");
     let path = prompts_path.unwrap_or(default_path.as_path());
-    let spec: SmoketestSpec = match std::fs::read_to_string(path) {
+    let mut spec: SmoketestSpec = match std::fs::read_to_string(path) {
         Ok(text) => match serde_json::from_str(&text) {
             Ok(s) => s,
             Err(err) => {
@@ -5221,6 +5233,19 @@ fn run_smoketest_cmd(
             return ExitCode::FAILURE;
         }
     };
+
+    // `--filter <pat>`: keep only prompts whose id contains <pat> (case-insensitive).
+    if let Some(pat) = filter {
+        let pat = pat.to_ascii_lowercase();
+        spec.adherence.retain(|p| p.id.to_ascii_lowercase().contains(&pat));
+        spec.convergence.retain(|p| p.id.to_ascii_lowercase().contains(&pat));
+        let kept = spec.adherence.len() + spec.convergence.len();
+        if kept == 0 {
+            eprintln!("smoketest: no prompts match filter {pat:?}");
+            return ExitCode::FAILURE;
+        }
+        eprintln!("smoketest: filter {pat:?} -> {kept} prompt(s)");
+    }
 
     let layers = match resolve_model_layers(model_dir, max_layers) {
         Ok(n) => n,
