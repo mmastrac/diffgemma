@@ -870,45 +870,41 @@ impl StepPipelines {
                 crate::kernels::sub::gemm_q8_rowk::pipeline_for_fp16_input(ctx, n, k)?,
             );
         }
+        // Unified rowk f32-accumulate SC-softembed GEMM (one shader; weight format
+        // = K_QUANT_FORMAT: Raw bf16 embed or Q8 embed). x is fp16 sc_probs.
+        const ROWK_ACC_SHADER: &str =
+            shader_include::include_metal!("kernels/gemm_bf16_rowk_acc_f32.metal");
         let mut gemm_q8_rowk_acc_f32 = HashMap::new();
         {
-            // f32-accumulate variant for chunked SC softembed; x is half (sc_probs), y is f32.
-            const ACC_SHADER: &str =
-                shader_include::include_metal!("kernels/gemm_q8_rowk_acc_f32.metal");
             for &(n, k) in &[
                 (HID as u32, crate::model::embed::LM_HEAD_CHUNK as u32),
             ] {
                 gemm_q8_rowk_acc_f32.insert(
                     (n, k),
                     ctx.compile_gemm_subkernel(
-                        ACC_SHADER,
-                        "gemm_q8_rowk_acc_f32",
+                        ROWK_ACC_SHADER,
+                        "gemm_bf16_rowk_acc_f32",
                         n,
                         k,
                         false,
                         crate::kernels::sub::QuantFormat::Q8 as u32,
-                        // x (sc_probs) is fp16 (10-mantissa probs, sc_prob_cols.metal):
-                        // read it as fp16 so the prob precision survives into the tile.
-                        true,
+                        true, // sc_probs is fp16
                     )?,
                 );
             }
         }
         let mut gemm_bf16_rowk_acc_f32 = HashMap::new();
         {
-            // bf16-embed variant of the chunked SC softembed f32-accumulate GEMM.
-            const ACC_BF16_SHADER: &str =
-                shader_include::include_metal!("kernels/gemm_bf16_rowk_acc_f32.metal");
             for &(n, k) in &[(HID as u32, crate::model::embed::LM_HEAD_CHUNK as u32)] {
                 gemm_bf16_rowk_acc_f32.insert(
                     (n, k),
                     ctx.compile_gemm_subkernel(
-                        ACC_BF16_SHADER,
+                        ROWK_ACC_SHADER,
                         "gemm_bf16_rowk_acc_f32",
                         n,
                         k,
                         false,
-                        crate::kernels::sub::QuantFormat::Q8 as u32,
+                        crate::kernels::sub::QuantFormat::Raw as u32,  // bf16 embed -> Raw branch
                         true, // sc_probs is fp16
                     )?,
                 );

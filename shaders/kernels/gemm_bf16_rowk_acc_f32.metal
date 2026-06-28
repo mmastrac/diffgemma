@@ -40,7 +40,12 @@ kernel void gemm_bf16_rowk_acc_f32(
         }
         for (uint i = ltid; i < 32 * 32; i += 128) {
             uint nn = i / 32, kk = i % 32;
-            tw[nn][kk] = half(bf16_to_f32(w[(ulong)(k0 + kk) * N + n0 + nn]));
+            if (K_QUANT_FORMAT == QUANT_Q8) {
+                device const uchar *rb = blob + w_off + (ulong)(k0 + kk) * q8_row_bytes(N);
+                tw[nn][kk] = half(q8_at(rb, n0 + nn, bf16_bytes(rb)));
+            } else {  // QUANT_RAW: bf16 [K,N] weights, no dequant
+                tw[nn][kk] = half(bf16_to_f32(w[(ulong)(k0 + kk) * N + n0 + nn]));
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint kk = 0; kk < 32; kk += 8) {
