@@ -126,9 +126,6 @@ fn layer_attn_scratch_bytes_cpu(
     attn_bufs + scores + attn_weights + ff_bufs + moe_router
 }
 
-pub fn estimate_weight_cache(cache: &GpuDecoderWeightCache) -> u64 {
-    cache.resident_bytes()
-}
 
 fn max_kv_dim(text: &TextConfig) -> u64 {
     let sliding = text.num_key_value_heads as u64 * text.head_dim as u64;
@@ -234,17 +231,6 @@ pub fn log_gpu_memory_plan(
     );
 }
 
-pub fn log_expert_cache_stats(stats: ExpertCacheStats) {
-    if stats.evictions > 0 {
-        eprintln!(
-            "  expert LRU: {:.1}/{:.1} MiB, {} entries, {} evictions",
-            stats.used_bytes as f64 / (1024.0 * 1024.0),
-            stats.budget_bytes as f64 / (1024.0 * 1024.0),
-            stats.entries,
-            stats.evictions,
-        );
-    }
-}
 
 pub fn estimate_paged_layer_bytes(text: &TextConfig) -> u64 {
     let hidden = text.hidden_size as u64;

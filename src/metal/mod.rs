@@ -50,14 +50,11 @@ mod weights;
 
 
 pub use dgq_gpu::DgqGpuBlob;
-pub use memory::{
-    estimate_decoder_forward, estimate_paged_layer_bytes, estimate_weight_cache,
-    log_expert_cache_stats,
-};
+pub use memory::{estimate_decoder_forward, estimate_paged_layer_bytes};
 
 pub use attention::GpuAttention;
 pub use decoder::{
-    bench_forward, forward as decoder_forward, load_weight_cache, BenchConfig, GpuDecoderScratch,
+    forward as decoder_forward, load_weight_cache, BenchConfig, GpuDecoderScratch,
 };
 pub use encoder_extend::prefill_gpu;
 pub use weights::GpuDecoderWeightCache;
@@ -66,7 +63,6 @@ pub use engine::GpuDecoderEngine;
 pub use gemm::{bf16_matmul_cpu, f32_to_bf16, Bf16Gemm};
 pub use probe::{print_probe_result, probe_device};
 pub use bench_gemm::{bench_custom_kernel, bench_gemm_bf16, bench_gemm_block_q4, bench_mpsgraph_oracle, parse_shapes, print_bench_rows};
-pub use sampler::sampler_step_gpu;
 pub use step_kernel::{
     bench_fused_gemm_dispatches, bench_step_kernel, build_offsets_from_store, build_step_runtime,
     run_step_probe, run_step_smoke, run_embed_row_gpu, layer_moe_block_jobs, trace_entropy_enabled,

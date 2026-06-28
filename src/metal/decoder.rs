@@ -182,25 +182,6 @@ pub struct BenchConfig {
     pub max_layers: usize,
 }
 
-pub fn bench_forward(
-    store: &WeightStore,
-    cfg: &ModelConfig,
-    input: &mut DecoderForwardInput<'_>,
-    scratch: &mut GpuDecoderScratch,
-    weights: &GpuDecoderWeightCache,
-    engine: &mut GpuDecoderEngine,
-    bench: &BenchConfig,
-) -> Result<DecoderForwardOutput, Error> {
-    forward_inner(
-        store,
-        cfg,
-        input,
-        scratch,
-        weights,
-        engine,
-        bench.max_layers,
-    )
-}
 
 pub fn forward(
     store: &WeightStore,

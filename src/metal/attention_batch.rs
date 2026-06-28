@@ -147,36 +147,6 @@ pub fn decoder_gqa_gpu_kv_batched(
     )
 }
 
-/// RoPE + GQA over GPU KV; returns attention output buffer when `attn_out` is `None`.
-pub fn decoder_gqa_gpu_kv_batched_chained(
-    batch: &mut GpuBatch<'_>,
-    kernels: &GpuAttentionKernels,
-    q_pre_rope: &[f32],
-    k_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
-    v_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
-    k_canvas_elem_offset: usize,
-    freqs: &[f32],
-    seq_len: usize,
-    total_kv: usize,
-    params: &AttentionParams,
-    mask: GqaMask<'_>,
-) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
-    decoder_gqa_gpu_kv_batched(
-        batch,
-        kernels,
-        None,
-        q_pre_rope,
-        k_buf,
-        v_buf,
-        k_canvas_elem_offset,
-        freqs,
-        seq_len,
-        total_kv,
-        params,
-        mask,
-    )?
-    .ok_or(Error::Format("gqa gpu kv missing output buffer"))
-}
 
 /// Device-to-device f32 copy: `dst[dst_byte_off/4 .. +len] = src[0..len]`.
 pub fn dispatch_copy_f32_to_buf(
