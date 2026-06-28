@@ -11,13 +11,13 @@ using namespace metal;
 #include "gemm_stacked_fc.metal"
 
 /// Dequant one N-tile row into tw_buf slot `slot` at K-tile `k0`.
-/// Shared by q4/nvfp4 stacked variants.
+/// Shared by q4/nvfp4/raw(bf16) stacked variants.
 inline void stacked_load_tw(
     device const uchar *blob,
     uint N, uint n0, uint ltid, uint k0,
     ulong body0, ulong body1, ulong body2,
     float gscale0, float gscale1, float gscale2,
-    ulong rowB, bool is_nvfp4,
+    ulong rowB, bool is_nvfp4, bool is_raw,
     threadgroup half tw_buf[2u][GEMM_N_TILE_MAX][GEMM_K_TILE],
     uint slot
 ) {
@@ -28,7 +28,27 @@ inline void stacked_load_tw(
         gemm_block_zero_tw_row(tw_buf[slot], r);
         return;
     }
-    if (is_nvfp4) {
+    if (is_raw) {
+        // bf16 [N,K] weights read straight into the half tile (no dequant).
+        // Resolve segment -> (wbase, local_n); rowB = K*2, body{0,1,2} = seg w_off.
+        ulong wbase;
+        uint local_n;
+        if (STACKED_N_SEGS == 1u) {
+            wbase = body0; local_n = global_n;
+        } else if (STACKED_N_SEGS == 2u) {
+            if (global_n < STACKED_END0) { wbase = body0; local_n = global_n; }
+            else { wbase = body1; local_n = global_n - STACKED_END0; }
+        } else {
+            if (global_n < STACKED_END0) { wbase = body0; local_n = global_n; }
+            else if (global_n < STACKED_END1) { wbase = body1; local_n = global_n - STACKED_END0; }
+            else { wbase = body2; local_n = global_n - STACKED_END1; }
+        }
+        device const ushort *row =
+            (device const ushort *)(blob + wbase + (ulong)local_n * rowB) + k0;
+        for (uint kk = 0u; kk < GEMM_K_TILE; ++kk) {
+            tw_buf[slot][r][kk] = half(bf16_to_f32(row[kk]));
+        }
+    } else if (is_nvfp4) {
         if (STACKED_N_SEGS == 1u) {
             device const uchar *row = blob + body0 + (ulong)global_n * rowB;
             dequant_nvfp4_tile_half_fused_tg(row, GEMM_K, k0, &tw_buf[slot][r][0], gscale0);
@@ -112,13 +132,16 @@ inline void gemm_block_stacked_impl(
     simdgroup_float8x8 acc12(0.f), acc13(0.f), acc14(0.f), acc15(0.f);
 
     const bool is_nvfp4 = (K_QUANT_FORMAT == QUANT_NVFP4);
+    const bool is_raw = (K_QUANT_FORMAT == QUANT_RAW);  // bf16 [N,K], no dequant
     ulong rowB = 0ul;
     if (is_nvfp4) {
         rowB = nvfp4_row_bytes(K);
+    } else if (is_raw) {
+        rowB = (ulong)K * 2ul;  // bf16 row stride in bytes
     } else {
         rowB = q4_row_bytes(K);
     }
-    // Body offsets (skip 4-byte gscale header for nvfp4 segments).
+    // Body offsets (skip 4-byte gscale header for nvfp4 segments; raw/q4 have none).
     const ulong body0 = STACKED_W_OFF0 + (is_nvfp4 ? 4ul : 0ul);
     const ulong body1 = STACKED_W_OFF1 + (is_nvfp4 ? 4ul : 0ul);
     const ulong body2 = STACKED_W_OFF2 + (is_nvfp4 ? 4ul : 0ul);
@@ -135,7 +158,7 @@ inline void gemm_block_stacked_impl(
         stacked_load_tw(
             blob, N, n0, ltid, k0,
             body0, body1, body2, gscale0, gscale1, gscale2,
-            rowB, is_nvfp4, tw_buf, 0u);
+            rowB, is_nvfp4, is_raw, tw_buf, 0u);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
@@ -154,7 +177,7 @@ inline void gemm_block_stacked_impl(
             stacked_load_tw(
                 blob, N, n0, ltid, k0,
                 body0, body1, body2, gscale0, gscale1, gscale2,
-                rowB, is_nvfp4, tw_buf, nxt);
+                rowB, is_nvfp4, is_raw, tw_buf, nxt);
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
