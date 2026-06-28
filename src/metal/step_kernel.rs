@@ -6031,10 +6031,14 @@ pub fn read_arena_buffer_f32(
     byte_off: usize,
     elems: usize,
 ) -> Vec<f32> {
-    use crate::kernels::sub::bf16;
+    use crate::kernels::sub::{bf16, f16};
+    let as_f16 = crate::kernels::sub::variant::act_f16_enabled();
     let ptr = unsafe { buf.contents().as_ptr().add(byte_off) as *const u16 };
     (0..elems)
-        .map(|i| unsafe { bf16::bf16_bits_to_f32(*ptr.add(i)) })
+        .map(|i| unsafe {
+            let b = *ptr.add(i);
+            if as_f16 { f16::f16_bits_to_f32(b) } else { bf16::bf16_bits_to_f32(b) }
+        })
         .collect()
 }
 
