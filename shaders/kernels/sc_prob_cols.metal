@@ -39,7 +39,7 @@ kernel void sc_prob_cols(
         ((device half *)probs)[(ulong)row * chunk + col] = half(0);
         return;
     }
-    float x = arena_load(logits, (ulong)row * vocab + v);
+    float x = arena_load_bf16(logits, (ulong)row * vocab + v);
     // Store probs as fp16 (10 mantissa bits), not bf16 (7): the soft-embed sums
     // over the full vocab, and bf16-rounding each prob adds noise worst for
     // spread distributions. SC_PROB_GEMM_SCALE pushes a near-uniform prob

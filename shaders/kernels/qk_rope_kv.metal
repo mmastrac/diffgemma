@@ -67,7 +67,7 @@ kernel void qk_rope_kv(
         if (isK) {
             device ushort *dst = kvcache + L->kv_region / 2 + (ulong)pos * nkv * hd * 2u + hh * hd;
             for (uint i = 0u; i < hd; ++i) {
-                arena_store(dst, i, head[i]);
+                arena_store_bf16(dst, i, head[i]);  // KV cache stays bf16 (shared w/ encoder)
             }
             if (L->v_proj != 0ul) {
                 for (uint i = 0u; i < hd; ++i) {
@@ -83,7 +83,7 @@ kernel void qk_rope_kv(
         device ushort *dst = kvcache + L->kv_region / 2 + (ulong)pos * nkv * hd * 2u
             + (ulong)nkv * hd + hh * hd;
         for (uint i = 0u; i < hd; ++i) {
-            arena_store(dst, i, arena_load(src, i) * inv);
+            arena_store_bf16(dst, i, arena_load(src, i) * inv);  // KV cache stays bf16
         }
     }
 }

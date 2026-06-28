@@ -49,7 +49,7 @@ kernel void sample_rowstats(
     uint am = 0u;
     float amv = -INFINITY;
     for (uint v = lid; v < cols; v += tpg) {
-        float x = arena_load(lr, v) / t;
+        float x = arena_load_bf16(lr, v) / t;
         if (x > amv) {
             amv = x;
             am = v;
@@ -85,7 +85,7 @@ kernel void sample_rowstats(
     mx = r_mx[0];
     float sum = 0.f, ent = 0.f;
     for (uint v = lid; v < cols; v += tpg) {
-        float x = arena_load(lr, v) / t;
+        float x = arena_load_bf16(lr, v) / t;
         float e = exp(x - mx);
         sum += e;
         ent += e * (x - mx);

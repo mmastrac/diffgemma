@@ -38,7 +38,7 @@ kernel void sc_sparse_select(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint v = lid.x; v < vocab; v += 256u) {
-        const float x = arena_load(logits, (ulong)row * vocab + v);
+        const float x = arena_load_bf16(logits, (ulong)row * vocab + v);
         if (x - mx >= SC_SPARSE_THRESH) {
             const uint slot = atomic_fetch_add_explicit(&cnt, 1u, memory_order_relaxed);
             if (slot < maxk) {

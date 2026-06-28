@@ -86,7 +86,7 @@ kernel void attention_mma2(
                 uint key = i / 8u, d = i % 8u;
                 uint t = t0 + key;
                 ks[key][d] = (t < T)
-                    ? half(arena_load(base + (ulong)t * nkv * hd * 2u + kvh * hd, kd + d))
+                    ? half(arena_load_bf16(base + (ulong)t * nkv * hd * 2u + kvh * hd, kd + d))
                     : half(0);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -127,7 +127,7 @@ kernel void attention_mma2(
                 uint key = i / 8u, d = i % 8u;
                 uint t = t0 + key;
                 vs[key][d] = (t < T)
-                    ? half(arena_load(
+                    ? half(arena_load_bf16(
                           base + (ulong)t * nkv * hd * 2u + (ulong)nkv * hd + kvh * hd, kd + d))
                     : half(0);
             }

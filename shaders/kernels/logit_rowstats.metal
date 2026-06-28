@@ -29,7 +29,7 @@ kernel void logit_rowstats(
     device const ushort *lr = logits + (ulong)row * cols;
     float mx = -INFINITY;
     for (uint v = lid; v < cols; v += tpg) {
-        mx = max(mx, arena_load(lr, v));
+        mx = max(mx, arena_load_bf16(lr, v));
     }
     mx = simd_max(mx);
     uint sg = lid / 32u, nsg = (tpg + 31u) / 32u;
@@ -46,7 +46,7 @@ kernel void logit_rowstats(
     mx = r_mx[0];
     float sum = 0.f;
     for (uint v = lid; v < cols; v += tpg) {
-        sum += exp(arena_load(lr, v) - mx);
+        sum += exp(arena_load_bf16(lr, v) - mx);
     }
     sum = simd_sum(sum);
     if ((lid & 31u) == 0u) {

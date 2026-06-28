@@ -36,7 +36,7 @@ kernel void sample_apply(
     uint per = cols / tpg;
     float local = 0.f;
     for (uint v = lid * per; v < (lid + 1u) * per; ++v) {
-        local += exp(arena_load(lr, v) / t - mx);
+        local += exp(arena_load_bf16(lr, v) / t - mx);
     }
     chunk[lid] = local;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -46,7 +46,7 @@ kernel void sample_apply(
         for (uint c = 0u; c < tpg; ++c) {
             if (cum + chunk[c] >= target) {
                 for (uint v = c * per; v < (c + 1u) * per; ++v) {
-                    cum += exp(arena_load(lr, v) / t - mx);
+                    cum += exp(arena_load_bf16(lr, v) / t - mx);
                     if (cum >= target) {
                         pick = v;
                         break;

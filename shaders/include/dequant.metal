@@ -5,6 +5,13 @@
 using namespace metal;
 
 #include "common.metal"
+#include "act_fc.metal"   // K_ACT_F16 (FC9 only)
+
+/// Read one activation arena slot into half: f16 reinterpret when K_ACT_F16, else
+/// bf16->f32->half. Matches arena_store's precision (arena.metal).
+inline half arena_act_half(device const ushort *x, ulong i) {
+    return K_ACT_F16 ? as_type<half>(x[i]) : half(bf16_to_f32(x[i]));
+}
 
 // ---- Q4 affine (32-wide groups) ----
 // q4_block: [scale:2][min:2][nibbles:16], w = scale*q + min
@@ -95,7 +102,7 @@ inline void gemm_load_a_tile_gather_bf16(
         const uint kk = i % 32u;
         if (mm < M_tile) {
             const uint tok = token_list[row0 + mm];
-            tx[mm][kk] = half(bf16_to_f32(moein[(ulong)tok * K + k0 + kk]));
+            tx[mm][kk] = arena_act_half(moein, (ulong)tok * K + k0 + kk);
         } else {
             tx[mm][kk] = half(0);
         }
@@ -134,7 +141,7 @@ inline void gemm_load_a_tile(
         const uint mm = i / 32u;
         const uint kk = i % 32u;
         tx[mm][kk] = (m0 + mm < M)
-            ? half(bf16_to_f32(x[(ulong)(m0 + mm) * K + k0 + kk]))
+            ? arena_act_half(x, (ulong)(m0 + mm) * K + k0 + kk)
             : half(0);
     }
 }
@@ -364,7 +371,7 @@ inline void dequant_q4_tw_tile_cooperative(
             const uint mm = i / 32u;
             const uint kk = i % 32u;
             tx_next[mm][kk] = (m0 + mm < M)
-                ? half(bf16_to_f32(x[(ulong)(m0 + mm) * K + k_next + kk]))
+                ? arena_act_half(x, (ulong)(m0 + mm) * K + k_next + kk)
                 : half(0);
         }
     }
@@ -403,7 +410,7 @@ inline void dequant_nvfp4_tw_tile_cooperative(
             const uint mm = i / 32u;
             const uint kk = i % 32u;
             tx_next[mm][kk] = (m0 + mm < M)
-                ? half(bf16_to_f32(x[(ulong)(m0 + mm) * K + k_next + kk]))
+                ? arena_act_half(x, (ulong)(m0 + mm) * K + k_next + kk)
                 : half(0);
         }
     }

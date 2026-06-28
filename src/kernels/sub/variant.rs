@@ -28,6 +28,15 @@ pub fn runtime_kernel_debug_enabled() -> bool {
     runtime_assert_enabled() || runtime_debug_deep_enabled()
 }
 
+/// f16 (10-mantissa) activation arena instead of bf16 (7) — `DGQ_ACT_F16=1`.
+/// Logits/large-range buffers stay bf16 (explicit `*_bf16`).
+pub fn act_f16_enabled() -> bool {
+    match std::env::var("DGQ_ACT_F16") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
 /// Configure both debug flags (call before first step pipeline compile).
 pub fn set_runtime_kernel_debug(assert: bool, deep: bool) {
     set_runtime_assert_enabled(assert);
@@ -38,7 +47,8 @@ pub fn set_runtime_kernel_debug(assert: bool, deep: bool) {
 pub fn runtime_step_variant() -> KernelVariant {
     let assert = runtime_assert_enabled();
     let deep = runtime_debug_deep_enabled();
-    if !assert && !deep {
+    let act_f16 = act_f16_enabled();
+    if !assert && !deep && !act_f16 {
         return KernelVariant::PRODUCTION;
     }
     KernelVariant {
@@ -47,6 +57,7 @@ pub fn runtime_step_variant() -> KernelVariant {
         debug_deep: deep,
         dump_stage: 0,
         quant_format: QuantFormat::INERT,
+        act_f16,
     }
 }
 
@@ -85,6 +96,9 @@ pub struct KernelVariant {
     pub dump_stage: u32,
     /// Quant format selector (FC3). Inert on elementwise bodies (must be Q4Affine).
     pub quant_format: QuantFormat,
+    /// f16 activation arena (FC9). Toggles arena_store/arena_load precision;
+    /// logits/large buffers use the explicit *_bf16 path and ignore this.
+    pub act_f16: bool,
 }
 
 impl KernelVariant {
@@ -94,6 +108,7 @@ impl KernelVariant {
         debug_deep: false,
         dump_stage: 0,
         quant_format: QuantFormat::INERT,
+        act_f16: false,
     };
 
     pub const TEST_ASSERT: Self = Self {
@@ -102,6 +117,7 @@ impl KernelVariant {
         debug_deep: false,
         dump_stage: 0,
         quant_format: QuantFormat::INERT,
+        act_f16: false,
     };
 
     pub const TEST_DUMP: Self = Self {
@@ -110,16 +126,18 @@ impl KernelVariant {
         debug_deep: false,
         dump_stage: 1,
         quant_format: QuantFormat::INERT,
+        act_f16: false,
     };
 
     pub fn cache_label(&self, entry: &str) -> String {
         format!(
-            "{entry}_sa{}_df{}_dd{}_d{}_qf{}",
+            "{entry}_sa{}_df{}_dd{}_d{}_qf{}_a{}",
             u8::from(self.shape_assert),
             u8::from(self.debug_fast),
             u8::from(self.debug_deep),
             self.dump_stage,
             self.quant_format as u32,
+            u8::from(self.act_f16),
         )
     }
 

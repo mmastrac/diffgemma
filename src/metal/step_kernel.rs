@@ -825,10 +825,14 @@ impl StepPipelines {
                 crate::kernels::sub::gemm_nvfp4::pipeline_for(ctx, n, k)?,
             );
             // bf16-weight GEMM for the mixed-precision attention/dense-FFN path.
-            gemm_bf16.insert(
-                (n, k),
-                crate::kernels::sub::gemm_bf16::pipeline_for(ctx, n, k)?,
-            );
+            // lm_head logits (n=VOCAB) forces bf16 output (range); others follow
+            // K_ACT_F16 for their activation output.
+            let bf16_ps = if n == VOCAB as u32 {
+                crate::kernels::sub::gemm_bf16::pipeline_for_logits(ctx, n, k)?
+            } else {
+                crate::kernels::sub::gemm_bf16::pipeline_for(ctx, n, k)?
+            };
+            gemm_bf16.insert((n, k), bf16_ps);
         }
         for &(n, k) in &[
             (DENSE_FF, HID as u32),
@@ -3727,6 +3731,10 @@ fn half_buffer_stats(
 ) -> (bool, f32) {
     use crate::kernels::sub::bf16;
     let ptr = unsafe { buf.contents().as_ptr().add(byte_off) as *const u16 };
+    // Read the stored precision: f16 when the f16-activation arena is active, so
+    // the range trace reflects real activations (a buffer whose producer didn't
+    // flip shows garbage → that's the mismatch).
+    let as_f16 = crate::kernels::sub::variant::act_f16_enabled();
     let mut max_abs = 0.0f32;
     let mut finite = true;
     let mut non_finite = 0usize;
@@ -3735,7 +3743,11 @@ fn half_buffer_stats(
     unsafe {
         let mut i = 0usize;
         while i < elems {
-            let v = bf16::bf16_bits_to_f32(*ptr.add(i));
+            let v = if as_f16 {
+                crate::kernels::sub::f16::f16_bits_to_f32(*ptr.add(i))
+            } else {
+                bf16::bf16_bits_to_f32(*ptr.add(i))
+            };
             if !v.is_finite() {
                 finite = false;
                 non_finite += 1;

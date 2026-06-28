@@ -99,7 +99,12 @@ kernel void gemm_bf16(
         const uint mm = i / GEMM_N_TILE;
         const uint nn = i % GEMM_N_TILE;
         if (m0 + mm < M && n0 + nn < N) {
-            arena_store(y, (ulong)(m0 + mm) * N + n0 + nn, ty[mm][nn]);
+            const ulong oi = (ulong)(m0 + mm) * N + n0 + nn;
+            if (K_OUT_BF16) {
+                arena_store_bf16(y, oi, ty[mm][nn]);  // logits stay bf16
+            } else {
+                arena_store(y, oi, ty[mm][nn]);
+            }
         }
     }
 }
