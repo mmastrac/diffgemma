@@ -69,6 +69,8 @@ pub enum QuantFormat {
     Q8 = 1,
     MxFp4 = 2,
     NvFp4 = 3,
+    /// bf16 weights, no dequant (Raw .dgq path; unifies gemm_bf16 into gemm_block).
+    Raw = 4,
 }
 
 impl QuantFormat {

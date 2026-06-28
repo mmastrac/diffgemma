@@ -36,11 +36,14 @@ kernel void gemm_block(
     simdgroup_float8x8 acc12(0.f), acc13(0.f), acc14(0.f), acc15(0.f);
 
     const bool is_nvfp4 = (K_QUANT_FORMAT == QUANT_NVFP4);
+    const bool is_raw = (K_QUANT_FORMAT == QUANT_RAW);   // bf16 weights, no dequant
     ulong body = w_off;
     ulong rowB = 0ul;
     if (is_nvfp4) {
         body = w_off + 4ul;
         rowB = nvfp4_row_bytes(K);
+    } else if (is_raw) {
+        rowB = (ulong)K * 2ul;   // bf16 [N,K] row bytes
     } else {
         rowB = q4_row_bytes(K);
     }
@@ -53,7 +56,16 @@ kernel void gemm_block(
         gemm_load_a_tile(x, M, K, m0, k0, ltid, tx_buf[0u]);
         if (ltid < GEMM_N_TILE) {
             const uint r = ltid;
-            if (is_nvfp4) {
+            if (is_raw) {
+                if (n0 + r < N) {
+                    device const ushort *wr = (device const ushort *)(blob + body + (ulong)(n0 + r) * rowB);
+                    for (uint kk = 0u; kk < GEMM_K_TILE; ++kk) {
+                        tw_buf[0u][r][kk] = half(bf16_to_f32(wr[k0 + kk]));
+                    }
+                } else {
+                    gemm_block_zero_tw_row(tw_buf[0u], r);
+                }
+            } else if (is_nvfp4) {
                 if (n0 + r < N) {
                     device const uchar *row = blob + body + (ulong)(n0 + r) * rowB;
                     const float gscale = as_type<float>(*(device const uint *)(blob + w_off));
@@ -88,7 +100,16 @@ kernel void gemm_block(
             gemm_load_a_tile(x, M, K, m0, k0, ltid, tx_buf[nxt]);
             if (ltid < GEMM_N_TILE) {
                 const uint r = ltid;
-                if (is_nvfp4) {
+                if (is_raw) {
+                    if (n0 + r < N) {
+                        device const ushort *wr = (device const ushort *)(blob + body + (ulong)(n0 + r) * rowB);
+                        for (uint kk = 0u; kk < GEMM_K_TILE; ++kk) {
+                            tw_buf[nxt][r][kk] = half(bf16_to_f32(wr[k0 + kk]));
+                        }
+                    } else {
+                        gemm_block_zero_tw_row(tw_buf[nxt], r);
+                    }
+                } else if (is_nvfp4) {
                     if (n0 + r < N) {
                         device const uchar *row = blob + body + (ulong)(n0 + r) * rowB;
                         const float gscale = as_type<float>(*(device const uint *)(blob + w_off));
@@ -122,7 +143,12 @@ kernel void gemm_block(
         const uint mm = i / GEMM_N_TILE;
         const uint nn = i % GEMM_N_TILE;
         if (m0 + mm < M && n0 + nn < N) {
-            arena_store(y, (ulong)(m0 + mm) * N + n0 + nn, ty[mm][nn]);
+            const ulong oi = (ulong)(m0 + mm) * N + n0 + nn;
+            if (K_OUT_BF16) {
+                arena_store_bf16(y, oi, ty[mm][nn]);  // logits stay bf16
+            } else {
+                arena_store(y, oi, ty[mm][nn]);
+            }
         }
     }
 }

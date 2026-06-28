@@ -21,6 +21,7 @@ constant uint QUANT_Q4_AFFINE = 0u;
 constant uint QUANT_Q8 = 1u;
 constant uint QUANT_MXFP4 = 2u;
 constant uint QUANT_NVFP4 = 3u;
+constant uint QUANT_RAW = 4u;  // bf16 weights, no dequant (Raw/.dgq bf16 path)
 
 /// Element dtype for K_ELEM_DTYPE / K_IO_DTYPE axes (FC4+): 0=f32, 1=half.
 constant uint ELEM_F32 = 0u;

@@ -1,13 +1,14 @@
 //! Tiled bf16-weight GEMM: `y[M,N] = x[M,K] @ W[N,K]^T` with bf16 weights (no
-//! quantization). Same tiling as `gemm_q8` but reads the weight tile straight
-//! from bf16 rows — lossless into the half tiles since the weights are bf16.
-//! Used for the mixed-precision `.dgq` attention/dense-FFN path.
+//! quantization). CONSOLIDATED into `gemm_block` (the unified plain GEMM) via the
+//! `Raw` weight format — same tiling as q4/nvfp4, just a direct bf16→half weight
+//! load instead of dequant. This module is the bf16 entry point into it.
 
 use crate::safetensors::Error;
 
-pub const ENTRY: &str = "gemm_bf16";
+pub const ENTRY: &str = "gemm_block";
 
-const SHADER: &str = shader_include::include_metal!("kernels/gemm_bf16.metal");
+const SHADER: &str = shader_include::include_metal!("kernels/gemm_block.metal");
+const RAW: u32 = super::QuantFormat::Raw as u32;
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub fn pipeline_for(
@@ -15,8 +16,7 @@ pub fn pipeline_for(
     n: u32,
     k: u32,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    // quant_format / x_fp16 are unused by the bf16 kernel; pass inert values.
-    ctx.compile_gemm_subkernel(SHADER, ENTRY, n, k, false, super::QuantFormat::Q8 as u32, false)
+    ctx.compile_gemm_subkernel(SHADER, ENTRY, n, k, false, RAW, false)
 }
 
 /// lm_head logits pipeline: forces bf16 output (FC29) so logits keep bf16's range
@@ -27,7 +27,7 @@ pub fn pipeline_for_logits(
     n: u32,
     k: u32,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_gemm_subkernel_out_bf16(SHADER, ENTRY, n, k, super::QuantFormat::Q8 as u32)
+    ctx.compile_gemm_subkernel_out_bf16(SHADER, ENTRY, n, k, RAW)
 }
 
 #[cfg(not(all(feature = "metal", target_os = "macos")))]
