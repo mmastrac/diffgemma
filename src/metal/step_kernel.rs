@@ -800,7 +800,6 @@ struct StepPipelines {
     /// f32-accumulate chunked SC softembed with bf16 embed (keyed (HID, LM_HEAD_CHUNK)).
     gemm_bf16_rowk_acc_f32: HashMap<(u32, u32), ComputePipeline>,
     half_scale: ComputePipeline,
-    half_scale_fp16: ComputePipeline,
     softcap: ComputePipeline,
     sample_rowstats: ComputePipeline,
     sample_commit: ComputePipeline,
@@ -1055,13 +1054,8 @@ impl StepPipelines {
             sc_prob_cols: crate::kernels::sub::sc_prob_cols::pipeline_for(ctx, prod)?,
             sc_probs: crate::kernels::sub::sc_probs::pipeline_for(ctx, prod)?,
             sc_softembed: crate::kernels::sub::sc_softembed::pipeline_for(ctx, prod)?,
-            sc_softembed_bf16: ctx.compile_subkernel(
-                shader_include::include_metal!("kernels/sc_softembed_bf16.metal"),
-                "sc_softembed_bf16",
-                prod,
-            )?,
+            sc_softembed_bf16: crate::kernels::sub::sc_softembed::pipeline_raw_for(ctx, prod)?,
             half_scale: crate::kernels::sub::half_scale::pipeline_for(ctx, prod)?,
-            half_scale_fp16: crate::kernels::sub::half_scale_fp16::pipeline_for(ctx, prod)?,
             softcap: crate::kernels::sub::softcap_half::pipeline_for(ctx, prod)?,
             sample_rowstats: crate::kernels::sub::sample_rowstats::pipeline_for(ctx, prod)?,
             sample_commit: crate::kernels::sub::sample_commit::pipeline_for(ctx, prod)?,
@@ -1990,12 +1984,14 @@ impl StepEnc<'_> {
     }
 
     fn scale_half_logits(&mut self, elems: usize, scale: f32) {
-        self.sink_set_pipeline(&self.ps.half_scale_fp16);
+        // Same kernel as scale_half_arena (half_scale); only the bound buffer differs
+        // (logits vs arena). Both are byte-identical in-place bf16 scales.
+        self.sink_set_pipeline(&self.ps.half_scale);
         self.bind_logits(0);
         self.sink_set_bytes(&(elems as u32), 1);
         self.sink_set_bytes(&scale, 2);
         self.sink_set_buffer(&self.bufs.dummy_dump, 0, 3);
-        self.dispatch_1d(&self.ps.half_scale_fp16, elems, 256);
+        self.dispatch_1d(&self.ps.half_scale, elems, 256);
     }
 
     fn encode_sc_logit_rowstats(&mut self) {

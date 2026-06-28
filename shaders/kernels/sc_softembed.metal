@@ -7,7 +7,9 @@ using namespace metal;
 #include "dequant.metal"
 #include "arena.metal"
 
-/// soft[tok,d] = sum_v softmax(logits[tok,v]) * dequant(embed[v,d]) * embed_scale
+/// soft[tok,d] = sum_v softmax(logits[tok,v]) * embed[v,d] * embed_scale.
+/// Embed format from K_QUANT_FORMAT (FC3): QUANT_RAW = bf16 [vocab,hidden] direct
+/// read; else q8 per-row dequant. (Folds the old sc_softembed_bf16.)
 /// first_step != 0 -> zero output (SC MLP still runs on CPU path).
 kernel void sc_softembed(
     device const ushort *logits [[buffer(0)]],
@@ -45,10 +47,18 @@ kernel void sc_softembed(
     }
     device const ushort *lr = logits + (ulong)tok * vocab;
     float acc = 0.f;
-    for (uint v = 0; v < vocab; ++v) {
-        float p = exp(arena_load(lr, v) - mx) / sum;
-        device const uchar *row = blob + w_off + (ulong)v * q8_row_bytes(hidden);
-        acc += p * q8_at(row, d, bf16_bytes(row));
+    if (K_QUANT_FORMAT == QUANT_RAW) {
+        device const ushort *emb = (device const ushort *)(blob + w_off);
+        for (uint v = 0; v < vocab; ++v) {
+            float p = exp(arena_load(lr, v) - mx) / sum;
+            acc += p * bf16_to_f32(emb[(ulong)v * hidden + d]);
+        }
+    } else {  // QUANT_Q8 / inert: per-row q8 dequant
+        for (uint v = 0; v < vocab; ++v) {
+            float p = exp(arena_load(lr, v) - mx) / sum;
+            device const uchar *row = blob + w_off + (ulong)v * q8_row_bytes(hidden);
+            acc += p * q8_at(row, d, bf16_bytes(row));
+        }
     }
     arena_store(soft, (ulong)tok * hidden + d, acc * embed_scale);
 }

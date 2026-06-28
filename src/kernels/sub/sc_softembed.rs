@@ -122,6 +122,21 @@ pub fn pipeline_for(
     ctx.compile_subkernel(SHADER, ENTRY, variant)
 }
 
+/// bf16-embed variant of `sc_softembed`: same kernel specialized with
+/// K_QUANT_FORMAT=Raw (direct bf16 [vocab,hidden] read, no q8 dequant). Folds
+/// the old sc_softembed_bf16.metal.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn pipeline_raw_for(
+    ctx: &crate::metal::device::MetalContext,
+    variant: KernelVariant,
+) -> Result<crate::metal::device::ComputePipeline, Error> {
+    let v = KernelVariant {
+        quant_format: super::variant::QuantFormat::Raw,
+        ..variant
+    };
+    ctx.compile_subkernel(SHADER, ENTRY, v)
+}
+
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub fn dispatch_shape(hidden: usize, num_tokens: usize) -> (objc2_metal::MTLSize, objc2_metal::MTLSize) {
     use objc2_metal::MTLSize;
