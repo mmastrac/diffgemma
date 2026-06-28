@@ -8,7 +8,7 @@ Single forward-looking plan: **open work only.** Resolved work, measured data, a
 
 ## Where we are (2026-06)
 
-`generate-monolithic` (single-encoder step kernel) is the production path. **Mixed-precision `.dgq`** (`model/diffusiongemma-q4emb`): bf16 attention + dense FFN, bf16 embed (tied lm_head + SC), q8 SC-MLP, **q4 experts** (only bulk-quantized tensor — memory constraint). Blob ~18.9 GiB.
+`ask` (single-encoder step kernel; formerly `generate-monolithic`, kept as alias) is the production path. The non-monolithic decoder/engine path is retired to validation-only — the f32 `GpuDecoderEngine` survives solely as the `step-parity` oracle. **Mixed-precision `.dgq`** (`model/diffusiongemma-q4emb`): bf16 attention + dense FFN, bf16 embed (tied lm_head + SC), q8 SC-MLP, **q4 experts** (only bulk-quantized tensor — memory constraint). Blob ~18.9 GiB.
 
 **Quality vs MLX-4bit** (`mlx-community/diffusiongemma-26B-A4B-it-4bit`, matched-canvas "sky blue"): output-level equivalent — coherent, correct, ~8-step convergence; smoketest 16/16. Residual: a few steps behind MLX-13 on the hard tail; minor long-chat doubling.
 
@@ -96,7 +96,7 @@ block-sparse MoE GEMM · GQA matrix-unit attention sliding (`DGQ_ATTN_MMA`) · *
 
 ```bash
 # Generate / chat
-cargo run --release --features metal -- -m $WEIGHTS generate-monolithic -p "Hello" --layers 30 --seed 42
+cargo run --release --features metal -- -m $WEIGHTS ask -p "Hello" --layers 30 --seed 42
 cargo run --release --features metal -- -m $WEIGHTS chat -p "Hello" --layers 30 --seed 42
 # Gate / bench
 cargo run --release --features metal -- -m $WEIGHTS smoketest --layers 30 --seed 42
