@@ -40,7 +40,6 @@ fn shader_bundle_token() -> u64 {
         include_str!("../../shaders/kernels/gemm_linear_grouped.metal"),
         include_str!("../../shaders/kernels/gemm_q8_linear_f32.metal"),
         include_str!("../../shaders/kernels/gemm_q8_linear_kxn_f32.metal"),
-        include_str!("../../shaders/kernels/gemm_q8.metal"),
         include_str!("../../shaders/kernels/gemm_q8_rowk.metal"),
         include_str!("../../shaders/kernels/f32_to_half_scale.metal"),
         include_str!("../../shaders/kernels/embed_gather.metal"),

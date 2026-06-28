@@ -103,8 +103,7 @@ struct RouteScratch {
 
 // ============================ monolith-only helpers ============================
 
-// gemm_block (Q4+NVFP4 via K_QUANT_FORMAT) -> shaders/kernels/gemm_block.metal
-// gemm_q8 -> shaders/kernels/gemm_q8.metal
+// gemm_block (Q4+Q8+NVFP4 via K_QUANT_FORMAT) -> shaders/kernels/gemm_block.metal
 // gemm_q8_rowk -> shaders/kernels/gemm_q8_rowk.metal
 
 // qk_rope_kv -> shaders/kernels/qk_rope_kv.metal

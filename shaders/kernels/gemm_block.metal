@@ -37,6 +37,7 @@ kernel void gemm_block(
 
     const bool is_nvfp4 = (K_QUANT_FORMAT == QUANT_NVFP4);
     const bool is_raw = (K_QUANT_FORMAT == QUANT_RAW);   // bf16 weights, no dequant
+    const bool is_q8 = (K_QUANT_FORMAT == QUANT_Q8);     // int8 per-row scale, no dequant tile
     ulong body = w_off;
     ulong rowB = 0ul;
     if (is_nvfp4) {
@@ -44,6 +45,8 @@ kernel void gemm_block(
         rowB = nvfp4_row_bytes(K);
     } else if (is_raw) {
         rowB = (ulong)K * 2ul;   // bf16 [N,K] row bytes
+    } else if (is_q8) {
+        rowB = q8_row_bytes(K);  // [scale bf16:2][i8:K]
     } else {
         rowB = q4_row_bytes(K);
     }
@@ -61,6 +64,15 @@ kernel void gemm_block(
                     device const ushort *wr = (device const ushort *)(blob + body + (ulong)(n0 + r) * rowB);
                     for (uint kk = 0u; kk < GEMM_K_TILE; ++kk) {
                         tw_buf[0u][r][kk] = half(bf16_to_f32(wr[k0 + kk]));
+                    }
+                } else {
+                    gemm_block_zero_tw_row(tw_buf[0u], r);
+                }
+            } else if (is_q8) {
+                if (n0 + r < N) {
+                    device const uchar *rb = blob + body + (ulong)(n0 + r) * rowB;
+                    for (uint kk = 0u; kk < GEMM_K_TILE; ++kk) {
+                        tw_buf[0u][r][kk] = half(q8_at(rb, k0 + kk, bf16_bytes(rb)));
                     }
                 } else {
                     gemm_block_zero_tw_row(tw_buf[0u], r);
@@ -105,6 +117,15 @@ kernel void gemm_block(
                         device const ushort *wr = (device const ushort *)(blob + body + (ulong)(n0 + r) * rowB);
                         for (uint kk = 0u; kk < GEMM_K_TILE; ++kk) {
                             tw_buf[nxt][r][kk] = half(bf16_to_f32(wr[k0 + kk]));
+                        }
+                    } else {
+                        gemm_block_zero_tw_row(tw_buf[nxt], r);
+                    }
+                } else if (is_q8) {
+                    if (n0 + r < N) {
+                        device const uchar *rb = blob + body + (ulong)(n0 + r) * rowB;
+                        for (uint kk = 0u; kk < GEMM_K_TILE; ++kk) {
+                            tw_buf[nxt][r][kk] = half(q8_at(rb, k0 + kk, bf16_bytes(rb)));
                         }
                     } else {
                         gemm_block_zero_tw_row(tw_buf[nxt], r);

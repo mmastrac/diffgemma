@@ -394,7 +394,7 @@ quant_formats = [0]
 [[kernel]]
 name = "gemm_block"
 entry = "gemm_block"
-quant_formats = [0, 3]
+quant_formats = [0, 1, 3]
 
 [kernel.fc]
 1 = "K_SHAPE_ASSERT"
@@ -410,21 +410,6 @@ quant_formats = [0, 3]
 name = "gemm_block_stacked"
 entry = "gemm_block_stacked"
 quant_formats = [0, 3]
-
-[kernel.fc]
-1 = "K_SHAPE_ASSERT"
-2 = "K_DUMP_STAGE"
-3 = "K_QUANT_FORMAT"
-4 = "IS_FULL_LAYER"
-5 = "GEMM_N"
-6 = "GEMM_K"
-
-[[kernel.variants]]
-
-[[kernel]]
-name = "gemm_q8"
-entry = "gemm_q8"
-quant_formats = [1]
 
 [kernel.fc]
 1 = "K_SHAPE_ASSERT"

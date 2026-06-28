@@ -33,7 +33,6 @@ pub enum KernelVariants {
     SwigluMoeGateUp,
     Gelu,
     GemmBlock,
-    GemmQ8,
     GemmQ8Rowk,
     Elementwise,
 }
@@ -267,14 +266,8 @@ pub static MANIFEST: Manifest = Manifest {
         KernelSpec {
             name: "gemm_block",
             entry: "gemm_block",
-            quant_formats: &[QuantFormat::Q4Affine, QuantFormat::NvFp4],
+            quant_formats: &[QuantFormat::Q4Affine, QuantFormat::Q8, QuantFormat::NvFp4],
             variants: KernelVariants::GemmBlock,
-        },
-        KernelSpec {
-            name: "gemm_q8",
-            entry: "gemm_q8",
-            quant_formats: &[QuantFormat::Q8],
-            variants: KernelVariants::GemmQ8,
         },
         KernelSpec {
             name: "gemm_q8_rowk",
@@ -476,7 +469,6 @@ mod tests {
                 KernelVariants::SwigluMoeGateUp => {}
                 KernelVariants::Gelu => {}
                 KernelVariants::GemmBlock => {}
-                KernelVariants::GemmQ8 => {}
                 KernelVariants::GemmQ8Rowk => {}
                 KernelVariants::Elementwise => {}
             }

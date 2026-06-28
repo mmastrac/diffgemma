@@ -8,9 +8,9 @@ use crate::dgq::block::{q8_gemm_cpu, quantize_row_q8};
 use crate::dgq::layout::{q8_matrix_bytes, q8_row_bytes};
 use crate::safetensors::Error;
 
-pub const ENTRY: &str = "gemm_q8";
+pub const ENTRY: &str = "gemm_block";
 
-const SHADER: &str = shader_include::include_metal!("kernels/gemm_q8.metal");
+const SHADER: &str = shader_include::include_metal!("kernels/gemm_block.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {
@@ -97,9 +97,9 @@ pub fn pipeline_for_logits(
     n: u32,
     k: u32,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    // Logits buffer is bf16 (arena layout); same kernel as pipeline_for —
-    // kept as a distinct entry point so call sites document intent (lm_head → logits buf).
-    ctx.compile_gemm_subkernel(SHADER, ENTRY, n, k, false, super::QuantFormat::Q8 as u32, false)
+    // Logits buffer is bf16-range; force bf16 output (FC29) so the f16 activation
+    // path still writes bf16 logits. Under default bf16 this is identical to pipeline_for.
+    ctx.compile_gemm_subkernel_out_bf16(SHADER, ENTRY, n, k, super::QuantFormat::Q8 as u32)
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]

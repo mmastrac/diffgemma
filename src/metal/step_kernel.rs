@@ -1721,7 +1721,7 @@ impl StepEnc<'_> {
             self.sink_set_bytes( &w_off, 3);
             self.sink_set_bytes( &m, 4);
         let grid = MTLSize {
-            width: div_up(n as usize, 32),
+            width: div_up(n as usize, crate::kernels::sub::gemm_common::n_tile()),
             height: div_up(m as usize, crate::kernels::sub::gemm_common::M_TILE),
             depth: 1,
         };
@@ -1815,7 +1815,7 @@ impl StepEnc<'_> {
         self.sink_set_bytes( &w_off, 3);
         self.sink_set_bytes( &m, 4);
         let grid = MTLSize {
-            width: div_up(n as usize, 32),
+            width: div_up(n as usize, crate::kernels::sub::gemm_common::n_tile()),
             height: div_up(m as usize, crate::kernels::sub::gemm_common::M_TILE),
             depth: 1,
         };
