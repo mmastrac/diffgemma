@@ -3723,6 +3723,26 @@ fn check_logits_finite(logits: &ProtocolObject<dyn MTLBuffer>) -> (bool, f32) {
     half_buffer_stats(logits, 0, CANVAS * VOCAB, CANVAS * VOCAB)
 }
 
+/// Strided (signed-sum, abs-max) over an f32 buffer region — for probing the MoE
+/// f32 intermediates (gemm_a/gemm_b) during f16 bisection.
+fn f32_buffer_fingerprint(
+    buf: &ProtocolObject<dyn MTLBuffer>,
+    byte_off: usize,
+    elems: usize,
+) -> (f64, f32) {
+    let ptr = unsafe { buf.contents().as_ptr().add(byte_off) as *const f32 };
+    let stride = (elems / 512).max(1);
+    let (mut sum, mut mx) = (0f64, 0f32);
+    let mut i = 0usize;
+    while i < elems {
+        let v = unsafe { *ptr.add(i) };
+        sum += v as f64;
+        mx = mx.max(v.abs());
+        i += stride;
+    }
+    (sum, mx)
+}
+
 fn half_buffer_stats(
     buf: &ProtocolObject<dyn MTLBuffer>,
     byte_off: usize,
@@ -4265,11 +4285,28 @@ impl StepRuntime {
             probe(self, "layer:dense_down", dense, CANVAS * HID);
             self.time_enc_stage(|e| { e.rmsnorm(e.arena().dense_off(), e.arena().dense_off(), l.post_ff_ln_1, HID as u32, CANVAS); Ok(()) })?;
             self.time_enc_stage(|e| e.encode_layer_router_buckets(layer, &layout))?;
+            if bisect && layer == 0 {
+                // moein INPUT (after router rmsnorm, before MoE consumes it).
+                let (nf, mx) = half_buffer_stats(&self.bufs.arena, moein as usize, CANVAS * HID, SAMPLE);
+                eprintln!("  BISECT L0 moe:moein_INPUT          absmax={mx:.4} nf={nf}");
+                let nb = read_struct::<RouteScratch>(&self.bufs.route).num_blocks;
+                eprintln!("  BISECT L0 moe:num_blocks           {nb}");
+            }
             // MoE
             self.time_enc_stage(|e| e.encode_moe_batched_gate_up(layer, &layout))?;
             self.time_enc_stage(|e| e.encode_moe_batched_swiglu())?;
             self.time_enc_stage(|e| e.encode_moe_batched_down(layer, &layout))?;
             self.time_enc_stage(|e| e.encode_moe_batched_scatter())?;
+            if bisect && layer == 0 {
+                let (s_gu, m_gu) = f32_buffer_fingerprint(&self.bufs.gemm_b, moe_w_byte_off_gu(), MOE_SLOTS as usize * 2 * MOE_FF as usize);
+                let (s_sw, m_sw) = f32_buffer_fingerprint(&self.bufs.gemm_a, 0, MOE_SLOTS as usize * MOE_FF as usize);
+                let (s_dn, m_dn) = f32_buffer_fingerprint(&self.bufs.gemm_b, moe_w_byte_off_a(), MOE_SLOTS as usize * HID);
+                let (s_mo, m_mo) = f32_buffer_fingerprint(&self.bufs.arena, self.bufs.arena_map.moeout_off() as usize, CANVAS * HID);
+                eprintln!("  BISECT L0 moe:gate_up_out(f32)     checksum={s_gu:+.2} absmax={m_gu:.3}");
+                eprintln!("  BISECT L0 moe:swiglu_out(f32)      checksum={s_sw:+.2} absmax={m_sw:.3}");
+                eprintln!("  BISECT L0 moe:down_out(f32)        checksum={s_dn:+.2} absmax={m_dn:.3}");
+                eprintln!("  BISECT L0 moe:moeout(f32)          checksum={s_mo:+.2} absmax={m_mo:.3}");
+            }
             self.time_enc_stage(|e| e.encode_layer_moe_post_norm(layer, &layout))?;
             probe(self, "layer:moe_norm(moein)", moein, CANVAS * HID);
             self.time_enc_stage(|e| e.encode_layer_moe_post_combine(layer, &layout))?;

@@ -88,7 +88,11 @@ kernel void moe_router(
             float w = exp(logits[pick[kk]] - mx) * inv * bf16_bytes(pes + 2ul * pick[kk]);
             dgq_assert_index(dbg, DbgKernelMoeRouter, pick[kk], dims.n_experts);
             R->expert[tok][kk] = pick[kk];
-            R->weight[tok][kk] = as_type<half>(arena_f32_to_bits(w));
+            // Router weight is stored bf16 and read back as bf16 by the scatter
+            // (bf16_to_f32(as_type<ushort>(...))). Must use the ALWAYS-bf16 packer,
+            // not the toggleable arena one — else under K_ACT_F16 the router writes
+            // f16 bits that the scatter misreads as bf16 -> ~zero weights -> MoE=0.
+            R->weight[tok][kk] = as_type<half>(arena_bf16_bits(w));
         }
     }
 }
