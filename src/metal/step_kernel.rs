@@ -4212,11 +4212,29 @@ impl StepRuntime {
         const SAMPLE: usize = 4096;
         // (label) -> (max_abs across layers, any_non_finite)
         let mut peak: BTreeMap<&'static str, (f32, bool)> = BTreeMap::new();
+        let bisect = std::env::var("DGQ_TRACE_BISECT").is_ok();
+        let mut seen: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
         let mut probe = |this: &Self, label: &'static str, off: u64, elems: usize| {
             let (nf, mx) = half_buffer_stats(&this.bufs.arena, off as usize, elems, SAMPLE);
             let e = peak.entry(label).or_insert((0.0, false));
             e.0 = e.0.max(mx);
             e.1 |= nf;
+            // First occurrence (layer 0) fingerprint for f16-vs-bf16 bisection:
+            // a fixed-element value + a strided signed checksum.
+            if bisect && seen.insert(label) {
+                let as_f16 = crate::kernels::sub::variant::act_f16_enabled();
+                let ptr = unsafe { (this.bufs.arena.contents().as_ptr() as *const u8).add(off as usize) as *const u16 };
+                let rd = |i: usize| -> f32 {
+                    let b = unsafe { *ptr.add(i) };
+                    if as_f16 { crate::kernels::sub::f16::f16_bits_to_f32(b) } else { crate::kernels::sub::bf16::bf16_bits_to_f32(b) }
+                };
+                let v = rd(1000.min(elems - 1));
+                let mut sum = 0f64;
+                let stride = (elems / 512).max(1);
+                let mut i = 0usize;
+                while i < elems { sum += rd(i) as f64; i += stride; }
+                eprintln!("  BISECT L0 {label:<28} v1000={v:+.5} checksum={sum:+.4} absmax={mx:.2}");
+            }
         };
 
         self.dispatch_and_wait(|enc| enc.encode_step_preamble(&layout, first_step))?;
