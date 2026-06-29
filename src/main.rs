@@ -270,6 +270,9 @@ enum Command {
         max_layers: Option<usize>,
         /// Substring (case-insensitive) on prompt id; only matching prompts run.
         filter: Option<String>,
+        /// Repeat the whole (filtered) prompt sequence N times in ONE session
+        /// (no re-warmup) — surfaces reset_kv session-state carryover.
+        repeat: usize,
     },
 }
 
@@ -688,6 +691,7 @@ fn main() -> ExitCode {
             steps,
             max_layers,
             filter,
+            repeat,
         } => run_smoketest_cmd(
             &cli.model_dir,
             prompts_path.as_deref(),
@@ -696,6 +700,7 @@ fn main() -> ExitCode {
             max_layers,
             cli.raw_prompt,
             filter.as_deref(),
+            repeat,
         ),
         Command::Quantize { output, profile } => run_quantize(&cli.model_dir, &output, &profile),
         Command::Tokenize(text) => run_tokenize(&cli.model_dir, &text, cli.raw_prompt),
@@ -2823,6 +2828,7 @@ fn parse_cli() -> Cli {
     let mut parity_layers: Option<usize> = None;
     let mut golden_name: Option<String> = None;
     let mut smoke_filter: Option<String> = None;
+    let mut smoke_repeat: usize = 1;
     let mut compare_cpu = false;
     let mut write_golden: Option<String> = None;
     let mut write_trace: Option<PathBuf> = None;
@@ -2936,6 +2942,14 @@ fn parse_cli() -> Cli {
             "--filter" => {
                 if let Some(v) = args.next() {
                     smoke_filter = Some(v);
+                }
+            }
+            "--repeat" => {
+                if let Some(v) = args.next() {
+                    smoke_repeat = v.parse().unwrap_or_else(|_| {
+                        eprintln!("invalid --repeat");
+                        std::process::exit(2);
+                    });
                 }
             }
             "--size" => {
@@ -3160,6 +3174,7 @@ fn parse_cli() -> Cli {
             steps: steps_production,
             max_layers: parity_layers,
             filter: smoke_filter.clone(),
+            repeat: smoke_repeat.max(1),
         },
         Some("tokenize") => {
             let text = positional.get(1).cloned().unwrap_or_else(|| {
@@ -4084,6 +4099,7 @@ fn run_smoketest_cmd(
     max_layers: Option<usize>,
     raw_prompt: bool,
     filter: Option<&str>,
+    repeat: usize,
 ) -> ExitCode {
     use metal::{generate_with_session, StepGenerateConfig, StepGenerateSession};
 
@@ -4195,6 +4211,10 @@ fn run_smoketest_cmd(
         model_dir.display()
     );
 
+    for iter in 0..repeat {
+        if repeat > 1 {
+            println!("\n===== iteration {}/{repeat} (same session, no re-warmup) =====", iter + 1);
+        }
     if !spec.adherence.is_empty() {
         println!("\n[adherence]");
         for p in &spec.adherence {
@@ -4248,6 +4268,7 @@ fn run_smoketest_cmd(
             println!("  {id:<22} {mark:<4} steps {st:>3}/{max:<3}  | {prev}", id = p.id);
         }
     }
+    } // end repeat loop
 
     println!("\nsmoketest: {passed}/{total} passed");
     if passed == total {
@@ -4281,6 +4302,8 @@ fn run_smoketest_cmd(
     _steps: usize,
     _max_layers: Option<usize>,
     _raw_prompt: bool,
+    _filter: Option<&str>,
+    _repeat: usize,
 ) -> ExitCode {
     eprintln!("error: smoketest requires --features metal on macOS");
     ExitCode::FAILURE
