@@ -3162,8 +3162,33 @@ impl StepEnc<'_> {
         }
         let schedule =
             step_schedule::build_step_schedule(&self.block_profile, finish == StepFinishMode::Full);
-        for stage in step_schedule::build_preamble(first_step) {
-            self.exec_stage(stage, 0, layout, finish)?;
+        if first_step == 1 {
+            // Deterministic first-step self-conditioning. The first denoise step has
+            // no prior prediction, so the normal SC path is skipped — but the model
+            // is degenerate with SC=0 (cold-start empty reply), and leaving dense_off
+            // as a prior generation's residual makes reused sessions nondeterministic
+            // (reset_kv carryover). Seed it deterministically: treat the initial
+            // canvas as the step-0 prediction and run the SC MLP on its embedding
+            // (ScPreNorm reads hidden after EmbedGather, in place of soft_off).
+            use step_schedule::StepStage;
+            self.exec_stage(StepStage::EmbedGather, 0, layout, finish)?;
+            self.rmsnorm(
+                self.arena().hidden_off(),
+                self.arena().tmp_off(),
+                layout.sc_pre_norm,
+                HID as u32,
+                CANVAS,
+            );
+            self.exec_stage(StepStage::ScGateGemm, 0, layout, finish)?;
+            self.exec_stage(StepStage::ScUpGemm, 0, layout, finish)?;
+            self.exec_stage(StepStage::ScGlu, 0, layout, finish)?;
+            self.exec_stage(StepStage::ScDownGemm, 0, layout, finish)?;
+            self.exec_stage(StepStage::EmbedScResidual, 0, layout, finish)?;
+            self.exec_stage(StepStage::RmsNormHidden, 0, layout, finish)?;
+        } else {
+            for stage in step_schedule::build_preamble(first_step) {
+                self.exec_stage(stage, 0, layout, finish)?;
+            }
         }
         for layer in 0..layers {
             for &stage in &schedule.per_layer {
