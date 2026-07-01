@@ -3911,27 +3911,9 @@ fn run_chat_cmd(
         }
     };
 
-    // COLD-START-1: the first generation in a fresh session converges instantly to
-    // an empty/EOS reply (uninitialized first-forward state → peaked step-1 logits).
-    // Burn one throwaway generation, then reset KV so the first real turn prefills
-    // fresh. Must run before the `run_turn` closure captures `session`/`step_cfg`.
-    match build_chat_prompt_tokens(
-        model_dir,
-        &[chat_template::ChatTurn::user("Hi")],
-        raw_prompt,
-    ) {
-        Ok(warm) => {
-            let saved_cap = step_cfg.max_new_tokens;
-            step_cfg.max_new_tokens = 256;
-            eprintln!("chat: warming up session (cold-start workaround)...");
-            if let Err(err) = generate_with_session(&mut session, &warm, &step_cfg, "warmup") {
-                eprintln!("chat: warm-up generate failed: {err}");
-            }
-            step_cfg.max_new_tokens = saved_cap;
-            session.reset_kv();
-        }
-        Err(err) => eprintln!("chat: warm-up prompt build failed: {err}"),
-    }
+    // (No warm-up: COLD-START-1 — the first fresh-session generation returning an
+    // empty/EOS reply — is fixed at the root by the deterministic first-step SC
+    // seed. The throwaway warm-up generation is no longer needed.)
 
     let mut history: Vec<chat_template::ChatTurn> = Vec::new();
     let mut turn_idx = 0u64;
@@ -4197,14 +4179,8 @@ fn run_smoketest_cmd(
             Ok((out.denoise_steps_run, reply))
         };
 
-    // Warm-up: historically the first generation in a fresh session produced a
-    // degenerate (empty) reply for short-answer prompts (cold-start). That's now
-    // fixed at the root (deterministic first-step SC seed), so the warm-up is
-    // redundant; `DGQ_SMOKE_NO_WARMUP=1` skips it (also isolates the warm-up's
-    // interaction with fast prefill).
-    if std::env::var_os("DGQ_SMOKE_NO_WARMUP").is_none() {
-        let _ = run_one("Say hello.");
-    }
+    // (No warm-up: cold-start is fixed at the root by the deterministic first-step
+    // SC seed. Verified engine 16/16 with the warm-up removed.)
 
     let mut passed = 0usize;
     let mut total = 0usize;
