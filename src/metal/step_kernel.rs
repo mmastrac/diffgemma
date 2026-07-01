@@ -2945,9 +2945,10 @@ impl StepEnc<'_> {
         // enabled, else the scalar kernel. Identical buffer layout — only the
         // pipeline + dispatch grid differ. mma_full is non-bit-identical (quality
         // gate): default OFF.
-        // Prefill forces the scalar causal kernel (mma2/mma_full have no causal mask).
-        let use_mma2 = !self.prefill_causal && attn_mma_enabled() && l.is_full == 0;
-        let use_mma_full = !self.prefill_causal && attn_mma_full_enabled() && l.is_full == 1;
+        // Both mma2 and mma_full honor the causal mask (AttnDims.causal), so prefill
+        // uses the fast MMA path too; the scalar kernel is the fallback/oracle.
+        let use_mma2 = attn_mma_enabled() && l.is_full == 0;
+        let use_mma_full = attn_mma_full_enabled() && l.is_full == 1;
         if use_mma2 {
             self.sink_set_pipeline(&self.ps.attention_mma2);
         } else if use_mma_full {

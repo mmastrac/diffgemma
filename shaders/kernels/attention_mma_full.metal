@@ -64,6 +64,9 @@ kernel void attention_mma_full(
     const uint nlanes = QG * 32u;
     const uint qh = kvh * group + sub * QG + sg;  // global Q head for this simdgroup
     const uint T = P.kv_len + dims.canvas;
+    // Causal (prefill): row r is at abs pos kv_len+tok0+r, attends only [0..pos].
+    const bool causal = dims.causal != 0u;
+    const uint T_eff = causal ? min(T, P.kv_len + tok0 + MT) : T;
     device const ushort *base = kvcache + L->kv_region / 2;
 
     // Shared K/V staging (one chunk, reused by all QG simdgroups).
@@ -106,7 +109,7 @@ kernel void attention_mma_full(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint t0 = 0u; t0 < T; t0 += 8u) {
+    for (uint t0 = 0u; t0 < T_eff; t0 += 8u) {
         // ---- S[MT x 8] = Q . K^T over head_dim chunks (per simdgroup) ----
         simdgroup_float8x8 sacc(0.f);
         for (uint c = 0u; c < NCH; ++c) {
@@ -130,9 +133,11 @@ kernel void attention_mma_full(
 
         // ---- online softmax over this 8-key tile (per row) ----
         if (lane < MT) {
+            const uint qpos = P.kv_len + tok0 + lane;  // causal cutoff for this row
             float tmax = -INFINITY;
             for (uint t = 0u; t < 8u; ++t) {
-                if (t0 + t < T) {
+                bool valid = (t0 + t < T) && (!causal || t0 + t <= qpos);
+                if (valid) {
                     tmax = max(tmax, st[sg][lane][t]);
                 }
             }
@@ -141,7 +146,8 @@ kernel void attention_mma_full(
             corr[sg][lane] = cc;
             float lsum = 0.f;
             for (uint t = 0u; t < 8u; ++t) {
-                float p = (t0 + t < T) ? exp(st[sg][lane][t] - mnew) : 0.f;
+                bool valid = (t0 + t < T) && (!causal || t0 + t <= qpos);
+                float p = valid ? exp(st[sg][lane][t] - mnew) : 0.f;
                 ph[sg][lane][t] = half(p);
                 lsum += p;
             }

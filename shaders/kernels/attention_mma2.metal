@@ -46,6 +46,11 @@ kernel void attention_mma2(
     const uint lane = lid.x % 32u;  // lane within simdgroup
     const uint qh = kvh * QG + sg;  // model group size == QG
     const uint T = P.kv_len + dims.canvas;
+    // Causal (prefill): query row r is at absolute pos kv_len+tok0+r and attends
+    // only [0..pos]. Skip key-tiles fully past the tile's max query pos, and mask
+    // within-tile keys per row in the softmax.
+    const bool causal = dims.causal != 0u;
+    const uint T_eff = causal ? min(T, P.kv_len + tok0 + MT) : T;
     device const ushort *base = kvcache + L->kv_region / 2;
 
     threadgroup half qs[QG][MT][HD_MAX];   // staged Q per head
@@ -78,7 +83,7 @@ kernel void attention_mma2(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint t0 = 0u; t0 < T; t0 += 8u) {
+    for (uint t0 = 0u; t0 < T_eff; t0 += 8u) {
         // ---- S[MT x 8] = Q . K^T over head_dim chunks (K shared by both heads) ----
         simdgroup_float8x8 sacc(0.f);
         for (uint kd = 0u; kd < hd; kd += 8u) {
@@ -101,9 +106,11 @@ kernel void attention_mma2(
 
         // ---- online softmax over this 8-key tile (per head) ----
         if (lane < MT) {
+            const uint qpos = P.kv_len + tok0 + lane;  // causal cutoff for this row
             float tmax = -INFINITY;
             for (uint t = 0u; t < 8u; ++t) {
-                if (t0 + t < T) {
+                bool valid = (t0 + t < T) && (!causal || t0 + t <= qpos);
+                if (valid) {
                     tmax = max(tmax, st[sg][lane][t]);
                 }
             }
@@ -112,7 +119,8 @@ kernel void attention_mma2(
             corr[sg][lane] = c;
             float lsum = 0.f;
             for (uint t = 0u; t < 8u; ++t) {
-                float p = (t0 + t < T) ? exp(st[sg][lane][t] - mnew) : 0.f;
+                bool valid = (t0 + t < T) && (!causal || t0 + t <= qpos);
+                float p = valid ? exp(st[sg][lane][t] - mnew) : 0.f;
                 ph[sg][lane][t] = half(p);
                 lsum += p;
             }
