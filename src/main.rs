@@ -4197,10 +4197,14 @@ fn run_smoketest_cmd(
             Ok((out.denoise_steps_run, reply))
         };
 
-    // Warm-up: the first generation in a fresh session produces a degenerate
-    // (empty) reply for short-answer prompts — a cold-start bug (see NOTES). Burn
-    // one throwaway generation so every gated prompt runs in the warm state.
-    let _ = run_one("Say hello.");
+    // Warm-up: historically the first generation in a fresh session produced a
+    // degenerate (empty) reply for short-answer prompts (cold-start). That's now
+    // fixed at the root (deterministic first-step SC seed), so the warm-up is
+    // redundant; `DGQ_SMOKE_NO_WARMUP=1` skips it (also isolates the warm-up's
+    // interaction with fast prefill).
+    if std::env::var_os("DGQ_SMOKE_NO_WARMUP").is_none() {
+        let _ = run_one("Say hello.");
+    }
 
     let mut passed = 0usize;
     let mut total = 0usize;

@@ -241,6 +241,12 @@ pub fn attn_mma_full_enabled() -> bool {
     }
 }
 
+/// Fast monolithic prefill (quantized + causal, on the step kernels) instead of
+/// the slow f32 engine. Default OFF until output-parity validated.
+pub fn fast_prefill_enabled() -> bool {
+    matches!(std::env::var("DGQ_FAST_PREFILL").as_deref(), Ok("1") | Ok("true"))
+}
+
 /// Algebraic fusion: QKV and dense gate+up as one stacked GEMM.
 /// `DGQ_FUSED_ALGEBRA=0` disables both; `DGQ_FUSED_QKV=0` / `DGQ_FUSED_GATE_UP=0` opt out individually.
 pub fn fused_algebra_enabled() -> bool {
@@ -1251,6 +1257,9 @@ struct StepEnc<'a> {
     /// Embed (tied lm_head + SC soft-embed) is stored bf16 (Raw) rather than
     /// q8-per-row: dispatch the bf16 gather / lm_head / softembed paths.
     embed_bf16: bool,
+    /// Prefill mode: attention is CAUSAL (scalar kernel only; mma variants have no
+    /// causal mask) and the SC/sampler/lm_head stages are skipped (KV-only forward).
+    prefill_causal: bool,
 }
 
 impl<'a> StepEnc<'a> {
@@ -2905,6 +2914,7 @@ impl StepEnc<'_> {
         let attn_dims = crate::kernels::sub::qk_rope_kv::AttnDims {
             canvas: CANVAS as u32,
             n_q_heads: STEP_NQ_HEADS as u32,
+            causal: 0,
         };
         self.sink_set_bytes(&attn_dims, 7);
         self.bind_debug_status(8);
@@ -2935,8 +2945,9 @@ impl StepEnc<'_> {
         // enabled, else the scalar kernel. Identical buffer layout — only the
         // pipeline + dispatch grid differ. mma_full is non-bit-identical (quality
         // gate): default OFF.
-        let use_mma2 = attn_mma_enabled() && l.is_full == 0;
-        let use_mma_full = attn_mma_full_enabled() && l.is_full == 1;
+        // Prefill forces the scalar causal kernel (mma2/mma_full have no causal mask).
+        let use_mma2 = !self.prefill_causal && attn_mma_enabled() && l.is_full == 0;
+        let use_mma_full = !self.prefill_causal && attn_mma_full_enabled() && l.is_full == 1;
         if use_mma2 {
             self.sink_set_pipeline(&self.ps.attention_mma2);
         } else if use_mma_full {
@@ -2952,6 +2963,7 @@ impl StepEnc<'_> {
         let attn_dims = crate::kernels::sub::qk_rope_kv::AttnDims {
             canvas: CANVAS as u32,
             n_q_heads: STEP_NQ_HEADS as u32,
+            causal: u32::from(self.prefill_causal),
         };
         self.sink_set_bytes(&attn_dims, 5);
         self.bind_debug_status(6);
@@ -3211,6 +3223,24 @@ impl StepEnc<'_> {
                 continue;
             }
             self.exec_stage(stage, 0, layout, finish)?;
+        }
+        Ok(())
+    }
+
+    /// KV-only causal forward over one prompt chunk (the canvas holds chunk tokens).
+    /// Embed + no-weight norm + the full per-layer stack (qkv → qk_rope_kv writes
+    /// KV → CAUSAL attention → o_proj → dense FFN → MoE), with NO SC preamble, NO
+    /// sampler, NO lm_head. The fast monolithic analog of the f32-engine prefill.
+    fn encode_prefill_chunk(&mut self, layout: &ModelLayout, layers: usize) -> Result<(), Error> {
+        use step_schedule::StepStage;
+        self.prefill_causal = true;
+        self.exec_stage(StepStage::EmbedGather, 0, layout, StepFinishMode::ForwardOnly)?;
+        self.exec_stage(StepStage::RmsNormHidden, 0, layout, StepFinishMode::ForwardOnly)?;
+        let per_layer = step_schedule::per_layer_stages(&self.block_profile);
+        for layer in 0..layers {
+            for &stage in &per_layer {
+                self.exec_stage(stage, layer, layout, StepFinishMode::ForwardOnly)?;
+            }
         }
         Ok(())
     }
@@ -3904,6 +3934,40 @@ impl StepRuntime {
         self.write_params(params);
     }
 
+    /// Fast prefill on the monolithic kernels: process the prompt in CANVAS-sized
+    /// chunks, each a KV-only CAUSAL forward writing K/V into the b4 cache at
+    /// [chunk_start, chunk_start+chunk_len). The last chunk is padded to CANVAS;
+    /// padding K/V lands beyond prompt_len (overwritten by the first denoise block)
+    /// and causal masking keeps real tokens from attending to it. Replaces the
+    /// ~70s f32-engine prefill. Returns kv_len (= prompt length). Causal w/o window
+    /// is correct for prompts <= sliding_window (1024); longer prompts would need
+    /// windowing on sliding layers (not yet implemented).
+    pub fn prefill_chunks(&mut self, prompt_token_ids: &[u32]) -> Result<usize, Error> {
+        let layout = self.layout;
+        let layers = self.layers;
+        let n = prompt_token_ids.len();
+        let mut pos = 0usize;
+        while pos < n {
+            let chunk_len = (n - pos).min(CANVAS);
+            let mut ids = [0u32; CANVAS];
+            ids[..chunk_len].copy_from_slice(&prompt_token_ids[pos..pos + chunk_len]);
+            self.set_canvas_ids(&ids)?;
+            self.set_kv_len(pos as u32);
+            self.dispatch_and_wait(|enc| enc.encode_prefill_chunk(&layout, layers))?;
+            pos += chunk_len;
+        }
+        self.set_kv_len(n as u32);
+        // The prefill dirtied scratch (arena hidden/dense, MoE routing buffers,
+        // logits); re-zero to the same clean state the (self-contained) engine
+        // prefill leaves — mirrors the post-open zeros minus kvcache (holds the
+        // prompt KV). Leaving residual here made some short prompts degenerate.
+        zero_buffer(&self.bufs.arena);
+        zero_buffer(&self.bufs.logits);
+        zero_buffer(&self.bufs.expert_layer_unique);
+        zero_buffer(&self.bufs.moe_grouped_indirect);
+        Ok(n)
+    }
+
     pub fn read_canvas_state(&self) -> CanvasState {
         read_struct(&self.bufs.state)
     }
@@ -4015,6 +4079,7 @@ impl StepRuntime {
             attn_ffn_q8: self.attn_ffn_q8,
             attn_ffn_bf16: self.attn_ffn_bf16,
             embed_bf16: self.embed_bf16,
+            prefill_causal: false,
         };
         let time_dispatch = std::env::var("DGQ_TIME_DISPATCH").is_ok();
         let t_enc = std::time::Instant::now();
@@ -4057,6 +4122,7 @@ impl StepRuntime {
             attn_ffn_q8: self.attn_ffn_q8,
             attn_ffn_bf16: self.attn_ffn_bf16,
             embed_bf16: self.embed_bf16,
+            prefill_causal: false,
         };
         f(&mut enc)?;
         enc.enc.endEncoding();
@@ -4745,25 +4811,30 @@ pub fn build_step_runtime(
     zero_buffer(&bufs.kvcache);
     zero_buffer(&bufs.logits);
 
+    // Fast-prefill (DGQ_FAST_PREFILL) runs on the step kernels AFTER `rt` is built
+    // (prefill_chunks is a StepRuntime method); the slow f32-engine prefill runs
+    // here at open time otherwise.
     if let Some(ref token_ids) = cfg.prefill_token_ids {
-        let mut encoder = crate::metal::step_kv::MonolithicEncoderCache::open_opt(
-            model_dir,
-            CANVAS,
-            cfg.max_seq,
-            Some(std::sync::Arc::clone(&gpu_blob)),
-        )?;
-        let (kv_len, _) = crate::metal::step_kv::prefill_monolithic_kv_with_cache(
-            &mut encoder,
-            token_ids,
-            &bufs.kvcache,
-            &layout,
-            cfg.max_seq,
-            layers,
-        )?;
-        if kv_len as u32 != prefill_len {
-            return Err(Error::Format("prefill kv_len mismatch"));
+        if !fast_prefill_enabled() {
+            let mut encoder = crate::metal::step_kv::MonolithicEncoderCache::open_opt(
+                model_dir,
+                CANVAS,
+                cfg.max_seq,
+                Some(std::sync::Arc::clone(&gpu_blob)),
+            )?;
+            let (kv_len, _) = crate::metal::step_kv::prefill_monolithic_kv_with_cache(
+                &mut encoder,
+                token_ids,
+                &bufs.kvcache,
+                &layout,
+                cfg.max_seq,
+                layers,
+            )?;
+            if kv_len as u32 != prefill_len {
+                return Err(Error::Format("prefill kv_len mismatch"));
+            }
+            eprintln!("step-kernel: prefilled kv_len={kv_len} tokens");
         }
-        eprintln!("step-kernel: prefilled kv_len={kv_len} tokens");
     }
 
     let build = StepRuntimeBuildTiming {
@@ -4799,6 +4870,19 @@ pub fn build_step_runtime(
         rt.icb = Some(rt.record_icb_pair()?);
     } else if use_sc_chunked {
         eprintln!("step-kernel: chunked SC softembed (DGQ_SC_CHUNKED=0 for full prob matrix)");
+    }
+    if fast_prefill_enabled() {
+        if let Some(ref token_ids) = cfg.prefill_token_ids {
+            let started = Instant::now();
+            let kv_len = rt.prefill_chunks(token_ids)?;
+            if kv_len as u32 != prefill_len {
+                return Err(Error::Format("fast-prefill kv_len mismatch"));
+            }
+            eprintln!(
+                "step-kernel: fast-prefilled kv_len={kv_len} tokens ({:.2?})",
+                started.elapsed()
+            );
+        }
     }
     Ok((rt, build))
 }

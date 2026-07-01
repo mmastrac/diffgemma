@@ -304,6 +304,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let dims = AttnDims {
         canvas: f.canvas as u32,
         n_q_heads: f.n_q_heads as u32,
+        causal: 0,
     };
 
     let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
@@ -404,6 +405,7 @@ pub fn gpu_mma(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let dims = AttnDims {
         canvas: f.canvas as u32,
         n_q_heads: f.n_q_heads as u32,
+        causal: 0,
     };
 
     let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
@@ -495,7 +497,7 @@ pub fn gpu_mma2(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> 
         plateau_prefix_mean_max: f32::MAX,
         eos_token_id: 1,
     };
-    let dims = AttnDims { canvas: f.canvas as u32, n_q_heads: f.n_q_heads as u32 };
+    let dims = AttnDims::new(f.canvas as u32, f.n_q_heads as u32);
 
     let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
     let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
@@ -579,7 +581,7 @@ pub fn gpu_mma_full(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Err
         plateau_prefix_mean_max: f32::MAX,
         eos_token_id: 1,
     };
-    let dims = AttnDims { canvas: f.canvas as u32, n_q_heads: f.n_q_heads as u32 };
+    let dims = AttnDims::new(f.canvas as u32, f.n_q_heads as u32);
     let group = f.n_q_heads / f.n_kv();
 
     let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
@@ -671,7 +673,7 @@ pub fn bench_path(f: &Fixture, iters: usize, path: u8) -> Result<f64, Error> {
         plateau_prefix_mean_max: f32::MAX,
         eos_token_id: 1,
     };
-    let dims = AttnDims { canvas: f.canvas as u32, n_q_heads: f.n_q_heads as u32 };
+    let dims = AttnDims::new(f.canvas as u32, f.n_q_heads as u32);
     let (grid, tpg) = match path {
         1 => (
             MTLSize { width: f.canvas.div_ceil(MMA_M_TILE), height: f.n_q_heads, depth: 1 },

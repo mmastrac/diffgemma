@@ -8,7 +8,10 @@ using namespace metal;
 #include "arena.metal"
 #include "sampler_device.metal"
 
-/// Canvas queries attend all KV positions 0..kv_len+canvas-1 (no causal mask).
+/// Canvas queries attend all KV positions 0..kv_len+canvas-1 (no causal mask)
+/// when dims.causal==0 (denoise). When dims.causal!=0 (prefill), query at absolute
+/// position kv_len+tok attends only [0..kv_len+tok] (causal); window<=1024 so for
+/// prompts <=1024 plain causal == the engine's causal-sliding.
 kernel void attention(
     device const ushort *q [[buffer(0)]],
     device const ushort *kvcache [[buffer(1)]],
@@ -36,7 +39,9 @@ kernel void attention(
     const uint ltid = lid.x;
     const uint tpg_w = tpg.x;
     const uint kvh = qh / (dims.n_q_heads / nkv);
-    const uint T = P.kv_len + dims.canvas;
+    // Causal (prefill): query at absolute pos kv_len+tok attends only [0..pos].
+    const uint T_all = P.kv_len + dims.canvas;
+    const uint T = (dims.causal != 0u) ? min(T_all, P.kv_len + tok + 1u) : T_all;
     device const ushort *qv = q + (ulong)tok * dims.n_q_heads * hd + qh * hd;
     device const ushort *base = kvcache + L->kv_region / 2;
     threadgroup float red[8];

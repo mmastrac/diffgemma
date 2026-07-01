@@ -78,6 +78,12 @@ fn progress_enabled() -> bool {
     }
 }
 
+/// Fast monolithic prefill (quantized + causal, on the step kernels) instead of
+/// the slow f32 engine. Default OFF until output-parity validated.
+fn fast_prefill_enabled() -> bool {
+    matches!(std::env::var("DGQ_FAST_PREFILL").as_deref(), Ok("1") | Ok("true"))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DenoiseStopReason {
     None,
@@ -254,6 +260,15 @@ pub fn generate_with_session(
             MonolithicPrefillTiming::default(),
             Duration::ZERO,
         )
+    } else if fast_prefill_enabled() {
+        // Fast monolithic prefill: quantized + causal forward over prompt chunks,
+        // writing the b4 KV directly (no f32 engine, no pack conversion).
+        let kv_len = rt.prefill_chunks(prompt_token_ids)?;
+        let prefill_elapsed = prefill_started.elapsed();
+        eprintln!(
+            "step-generate: fast-prefill kv_len={kv_len} ({prefill_elapsed:.2?})"
+        );
+        (kv_len, MonolithicPrefillTiming::default(), prefill_elapsed)
     } else {
         if session.encoder.is_none() {
             let encoder_started = Instant::now();

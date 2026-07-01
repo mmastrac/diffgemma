@@ -17,6 +17,14 @@ const SHADER: &str = shader_include::include_metal!("kernels/qk_rope_kv.metal");
 pub struct AttnDims {
     pub canvas: u32,
     pub n_q_heads: u32,
+    /// 0 = bidirectional all-valid (denoise); 1 = causal (prefill).
+    pub causal: u32,
+}
+
+impl AttnDims {
+    pub fn new(canvas: u32, n_q_heads: u32) -> Self {
+        Self { canvas, n_q_heads, causal: 0 }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -321,6 +329,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let dims = AttnDims {
         canvas: f.canvas as u32,
         n_q_heads: f.n_q_heads as u32,
+        causal: 0,
     };
 
     let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;

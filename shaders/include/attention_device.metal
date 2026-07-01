@@ -24,6 +24,7 @@ struct LayerOffsets {
 struct AttnDims {
     uint canvas;
     uint n_q_heads;
+    uint causal;   // 0 = bidirectional all-valid (denoise); 1 = causal (prefill)
 };
 
 /// Split-half RoPE on the first `rot` dims; inv_freq denominator is full `head_dim`.
