@@ -241,10 +241,22 @@ pub fn attn_mma_full_enabled() -> bool {
     }
 }
 
-/// Fast monolithic prefill (quantized + causal, on the step kernels) instead of
-/// the slow f32 engine. Default OFF until output-parity validated.
-pub fn fast_prefill_enabled() -> bool {
-    matches!(std::env::var("DGQ_FAST_PREFILL").as_deref(), Ok("1") | Ok("true"))
+/// Min prompt length (tokens) for the fast quantized prefill under the heuristic
+/// default. Short prompts stay on the accurate f32 engine (prefill is cheap there,
+/// and that's where the half-precision prompt KV tips borderline short-answer
+/// prompts into a degenerate early-stop); long prompts — where the ~10x speedup
+/// matters and outputs aren't on the early-stop knife-edge — use the fast path.
+pub const FAST_PREFILL_MIN_TOKENS: usize = 256;
+
+/// Whether to use the fast monolithic prefill (quantized + causal) for a prompt of
+/// `prompt_len` tokens vs the slow f32 engine. `DGQ_FAST_PREFILL=1|0` forces on/off
+/// for all lengths; unset uses the length heuristic (fast only for long prompts).
+pub fn should_fast_prefill(prompt_len: usize) -> bool {
+    match std::env::var("DGQ_FAST_PREFILL").as_deref() {
+        Ok("1") | Ok("true") => true,
+        Ok("0") | Ok("false") => false,
+        _ => prompt_len > FAST_PREFILL_MIN_TOKENS,
+    }
 }
 
 /// Algebraic fusion: QKV and dense gate+up as one stacked GEMM.
@@ -2945,10 +2957,11 @@ impl StepEnc<'_> {
         // enabled, else the scalar kernel. Identical buffer layout — only the
         // pipeline + dispatch grid differ. mma_full is non-bit-identical (quality
         // gate): default OFF.
-        // Both mma2 and mma_full honor the causal mask (AttnDims.causal), so prefill
-        // uses the fast MMA path too; the scalar kernel is the fallback/oracle.
-        let use_mma2 = attn_mma_enabled() && l.is_full == 0;
-        let use_mma_full = attn_mma_full_enabled() && l.is_full == 1;
+        // mma2/mma_full honor the causal mask (AttnDims.causal) so they *can* run
+        // prefill, but their f16 attention is lossier than the scalar f32 kernel and
+        // hurts fast-prefill accuracy (11/16 vs 14/16); prefill uses scalar for now.
+        let use_mma2 = !self.prefill_causal && attn_mma_enabled() && l.is_full == 0;
+        let use_mma_full = !self.prefill_causal && attn_mma_full_enabled() && l.is_full == 1;
         if use_mma2 {
             self.sink_set_pipeline(&self.ps.attention_mma2);
         } else if use_mma_full {
@@ -4816,7 +4829,7 @@ pub fn build_step_runtime(
     // (prefill_chunks is a StepRuntime method); the slow f32-engine prefill runs
     // here at open time otherwise.
     if let Some(ref token_ids) = cfg.prefill_token_ids {
-        if !fast_prefill_enabled() {
+        if !should_fast_prefill(token_ids.len()) {
             let mut encoder = crate::metal::step_kv::MonolithicEncoderCache::open_opt(
                 model_dir,
                 CANVAS,
@@ -4872,8 +4885,8 @@ pub fn build_step_runtime(
     } else if use_sc_chunked {
         eprintln!("step-kernel: chunked SC softembed (DGQ_SC_CHUNKED=0 for full prob matrix)");
     }
-    if fast_prefill_enabled() {
-        if let Some(ref token_ids) = cfg.prefill_token_ids {
+    if let Some(ref token_ids) = cfg.prefill_token_ids {
+        if should_fast_prefill(token_ids.len()) {
             let started = Instant::now();
             let kv_len = rt.prefill_chunks(token_ids)?;
             if kv_len as u32 != prefill_len {
