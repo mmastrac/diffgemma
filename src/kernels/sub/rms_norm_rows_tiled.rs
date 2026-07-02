@@ -147,6 +147,34 @@ pub fn pipeline_for(
     )
 }
 
+/// f32 hidden/stream-plane variants (DGQ_HIDDEN_F32): input is the f32 hidden
+/// plane WITHOUT the legacy bf16 pre-round (K_HIDDEN_A_F32, FC30); `y_f32`
+/// additionally stores f32 (K_HIDDEN_Y_F32, FC31 — the in-place RmsNormHidden).
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn pipeline_for_hidden_f32(
+    ctx: &crate::metal::device::MetalContext,
+    y_f32: bool,
+    variant: KernelVariant,
+) -> Result<crate::metal::device::ComputePipeline, Error> {
+    use crate::kernels::sub::variant::FcBool;
+    manifest::validate_shared(ENTRY, variant)?;
+    let local = manifest::rms_norm_rows_tiled_variant(TiledVariant::F32_IN.in_dtype)?;
+    manifest::assert_no_fc_collisions(ENTRY, &[4, 30, 31])?;
+    let mut fcs = vec![FcBool { index: 30, value: true }];
+    if y_f32 {
+        fcs.push(FcBool { index: 31, value: true });
+    }
+    let label = if y_f32 { "hf32io" } else { "hf32i" };
+    ctx.compile_subkernel_ex(
+        SHADER,
+        ENTRY,
+        variant,
+        &format!("{}{}", local.cache_suffix(), label),
+        &fcs,
+        &local.local_fcs(),
+    )
+}
+
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use objc2::runtime::ProtocolObject;
 #[cfg(all(feature = "metal", target_os = "macos"))]

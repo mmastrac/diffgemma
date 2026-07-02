@@ -62,6 +62,20 @@ use crate::metal::arena_layout::{build_arena_layout, ArenaLayout, ArenaLayoutPar
 pub const MAX_ATTN_Q_COLS: usize = 8192;
 pub const MAX_ATTN_KV_COLS: usize = 2048;
 
+/// f32 hidden + stream planes (`DGQ_HIDDEN_F32=1`, default off): keeps the
+/// residual accumulator at 23-bit mantissa across all 30 layers instead of
+/// re-rounding to bf16 at every residual add — the dominant per-step self-noise
+/// vs the f32 engine (layer-26 hidden cos 0.975 → target ~0.99+). GEMM inputs
+/// and every other plane stay bf16, so per-layer compute is unchanged.
+pub fn hidden_f32_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("DGQ_HIDDEN_F32")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 pub fn step_arena_params() -> ArenaLayoutParams {
     ArenaLayoutParams {
         canvas: CANVAS,
@@ -69,6 +83,7 @@ pub fn step_arena_params() -> ArenaLayoutParams {
         dense_ff: DENSE_FF as usize,
         max_attn_q_cols: MAX_ATTN_Q_COLS,
         max_attn_kv_cols: MAX_ATTN_KV_COLS,
+        hidden_f32: hidden_f32_enabled(),
     }
 }
 
@@ -795,6 +810,10 @@ struct StepPipelines {
     memzero: ComputePipeline,
     rmsnorm: ComputePipeline,
     rmsnorm_f32: ComputePipeline,
+    /// f32 hidden/stream input (DGQ_HIDDEN_F32), bf16 out.
+    rmsnorm_hf32_in: ComputePipeline,
+    /// f32 hidden in AND out (RmsNormHidden in-place under DGQ_HIDDEN_F32).
+    rmsnorm_hf32_inout: ComputePipeline,
     half_to_f32: ComputePipeline,
     gemm_q4: HashMap<(u32, u32), ComputePipeline>,
     gemm_nvfp4: HashMap<(u32, u32), ComputePipeline>,
@@ -814,8 +833,12 @@ struct StepPipelines {
     /// MMA attention for full/global layers (`DGQ_ATTN_MMA_FULL`, register-O); scalar `attention` is the fallback/oracle.
     attention_mma_full: ComputePipeline,
     residual: ComputePipeline,
+    /// f32 hidden/stream a-input + y-output (DGQ_HIDDEN_F32); b stays bf16.
+    residual_hf32: ComputePipeline,
     glu: ComputePipeline,
     router: ComputePipeline,
+    /// f32 stream input (DGQ_HIDDEN_F32).
+    router_hf32: ComputePipeline,
     bucket_count: ComputePipeline,
     bucket_fill: ComputePipeline,
     q4_block_grouped: HashMap<(u32, u32), ComputePipeline>,
@@ -834,8 +857,12 @@ struct StepPipelines {
     /// Q4 grouped MoE with K_DUMP_STAGE=1 (debug capture only — never in forward/generate).
     moe_grouped_dump: ComputePipeline,
     embed_gather: ComputePipeline,
+    /// f32 hidden output (DGQ_HIDDEN_F32).
+    embed_gather_hf32: ComputePipeline,
     /// bf16-embed input gather (embed_tokens stored Raw).
     embed_gather_bf16: ComputePipeline,
+    /// bf16 embed table, f32 hidden output (DGQ_HIDDEN_F32).
+    embed_gather_bf16_hf32: ComputePipeline,
     logit_rowstats: ComputePipeline,
     sc_prob_cols: ComputePipeline,
     sc_probs: ComputePipeline,
@@ -1046,6 +1073,12 @@ impl StepPipelines {
                 crate::kernels::sub::rms_norm_rows_tiled::TiledVariant::F32_IN,
                 prod,
             )?,
+            rmsnorm_hf32_in: crate::kernels::sub::rms_norm_rows_tiled::pipeline_for_hidden_f32(
+                ctx, false, prod,
+            )?,
+            rmsnorm_hf32_inout: crate::kernels::sub::rms_norm_rows_tiled::pipeline_for_hidden_f32(
+                ctx, true, prod,
+            )?,
             half_to_f32: crate::kernels::sub::half_to_f32::pipeline_for(ctx, prod)?,
             gemm_q4,
             gemm_nvfp4,
@@ -1062,12 +1095,14 @@ impl StepPipelines {
             attention_mma2: crate::kernels::sub::attention::pipeline_mma2_for(ctx, prod)?,
             attention_mma_full: crate::kernels::sub::attention::pipeline_mma_full_for(ctx, prod)?,
             residual: crate::kernels::sub::residual_half::pipeline_for(ctx, prod)?,
+            residual_hf32: crate::kernels::sub::residual_half::pipeline_for_hidden_f32(ctx, prod)?,
             glu: crate::kernels::sub::swiglu::pipeline_for(
                 ctx,
                 crate::kernels::sub::SwigluSplitVariant::MONOLITH_GLU,
                 prod,
             )?,
             router: crate::kernels::sub::moe_router::pipeline_for(ctx, prod)?,
+            router_hf32: crate::kernels::sub::moe_router::pipeline_for_hidden_f32(ctx, prod)?,
             bucket_count: crate::kernels::sub::moe_bucket_count::pipeline_for(ctx, prod)?,
             bucket_fill: crate::kernels::sub::moe_bucket_fill::pipeline_for(ctx, prod)?,
             q4_block_grouped,
@@ -1090,10 +1125,19 @@ impl StepPipelines {
             )?,
             moe_grouped_dump: crate::kernels::sub::moe_grouped::pipeline_for(ctx, dump)?,
             embed_gather: crate::kernels::sub::embed_gather::pipeline_for(ctx, prod)?,
+            embed_gather_hf32: crate::kernels::sub::embed_gather::pipeline_for_hidden_f32(ctx, prod)?,
             embed_gather_bf16: ctx.compile_subkernel(
                 shader_include::include_metal!("kernels/embed_gather_bf16.metal"),
                 "embed_gather_bf16",
                 prod,
+            )?,
+            embed_gather_bf16_hf32: ctx.compile_subkernel_ex(
+                shader_include::include_metal!("kernels/embed_gather_bf16.metal"),
+                "embed_gather_bf16",
+                prod,
+                "hf32",
+                &[crate::kernels::sub::variant::FcBool { index: 31, value: true }],
+                &[],
             )?,
             logit_rowstats: crate::kernels::sub::logit_rowstats::pipeline_for(ctx, prod)?,
             sc_prob_cols: crate::kernels::sub::sc_prob_cols::pipeline_for(ctx, prod)?,
@@ -1720,7 +1764,25 @@ impl StepEnc<'_> {
         dim: u32,
         rows: usize,
     ) {
-        self.sink_set_pipeline(&self.ps.rmsnorm);
+        // DGQ_HIDDEN_F32: the hidden/stream planes are f32; pick the typed
+        // variant BY OFFSET so no call site can miss it. y is only ever a
+        // hidden-plane for the in-place RmsNormHidden (hidden -> hidden).
+        let ps = if hidden_f32_enabled() {
+            let a = self.arena();
+            let x_h = x_off == a.hidden_off() || x_off == a.stream_off();
+            let y_h = y_off == a.hidden_off() || y_off == a.stream_off();
+            if x_h && y_h {
+                &self.ps.rmsnorm_hf32_inout
+            } else if x_h {
+                &self.ps.rmsnorm_hf32_in
+            } else {
+                debug_assert!(!y_h, "rmsnorm: bf16 input into f32 hidden plane");
+                &self.ps.rmsnorm
+            }
+        } else {
+            &self.ps.rmsnorm
+        };
+        self.sink_set_pipeline(ps);
             self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
             self.sink_set_buffer(&self.bufs.arena, y_off as usize, 1);
             self.bind_blob(2);
@@ -2245,13 +2307,30 @@ impl StepEnc<'_> {
     }
 
     fn residual(&mut self, a_off: u64, b_off: u64, y_off: u64, scal_off: u64, elems: usize) {
-        self.sink_set_pipeline(&self.ps.residual);
+        // DGQ_HIDDEN_F32: every residual touching the hidden/stream planes has
+        // a on one f32 plane and y on one f32 plane (b is always a bf16
+        // branch); the pure-bf16 site (dense+moein -> tmp) keeps the plain
+        // pipeline. Selected by offset so call sites cannot miss it. NOTE
+        // dispatch_1d sets the pipeline, so the selection happens there.
+        let hf32 = if hidden_f32_enabled() {
+            let a = self.arena();
+            let a_h = a_off == a.hidden_off() || a_off == a.stream_off();
+            let y_h = y_off == a.hidden_off() || y_off == a.stream_off();
+            debug_assert_eq!(a_h, y_h, "residual: mixed hidden-plane operands");
+            a_h && y_h
+        } else {
+            false
+        };
             self.sink_set_buffer(&self.bufs.arena, a_off as usize, 0);
             self.sink_set_buffer(&self.bufs.arena, b_off as usize, 1);
             self.sink_set_buffer(&self.bufs.arena, y_off as usize, 2);
             self.bind_blob(3);
             self.sink_set_bytes( &scal_off, 4);
-        self.dispatch_1d(&self.ps.residual, elems, 256);
+        if hf32 {
+            self.dispatch_1d(&self.ps.residual_hf32, elems, 256);
+        } else {
+            self.dispatch_1d(&self.ps.residual, elems, 256);
+        }
     }
 
     fn glu(&mut self, gate_off: u64, up_off: u64, y_off: u64, elems: usize) {
@@ -2390,7 +2469,12 @@ impl StepEnc<'_> {
             top_k: TOP_K as u32,
             router_hscale: (HID as f32).powf(-0.5),
         };
-        self.sink_set_pipeline(&self.ps.router);
+        let router_ps = if hidden_f32_enabled() {
+            &self.ps.router_hf32
+        } else {
+            &self.ps.router
+        };
+        self.sink_set_pipeline(router_ps);
         self.sink_set_buffer(&self.bufs.arena, self.arena().stream_off() as usize, 0);
         self.bind_blob(1);
         self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 2);
@@ -3314,10 +3398,11 @@ impl StepEnc<'_> {
     fn dispatch_embed_gather(&mut self, embed_off: u64) {
         use crate::dgq::embed_row::EMBED_SCALE;
 
-        let ps = if self.embed_bf16 {
-            &self.ps.embed_gather_bf16
-        } else {
-            &self.ps.embed_gather
+        let ps = match (self.embed_bf16, hidden_f32_enabled()) {
+            (true, false) => &self.ps.embed_gather_bf16,
+            (true, true) => &self.ps.embed_gather_bf16_hf32,
+            (false, false) => &self.ps.embed_gather,
+            (false, true) => &self.ps.embed_gather_hf32,
         };
         self.sink_set_pipeline(ps);
         self.bind_blob(0);
@@ -5055,6 +5140,18 @@ fn read_arena_hidden_row(
     base: u64,
     row: usize,
 ) -> Vec<f32> {
+    let map = step_arena_layout();
+    if hidden_f32_enabled() && (base == map.hidden_off() || base == map.stream_off()) {
+        // Only the hidden/stream planes are f32 under DGQ_HIDDEN_F32; other
+        // planes (tmp for final-norm readbacks, etc.) stay bf16.
+        let byte_off = base as usize + row * HID * 4;
+        let mut out = vec![0.0f32; HID];
+        unsafe {
+            let ptr = (arena.contents().as_ptr() as *const u8).add(byte_off) as *const f32;
+            std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), HID);
+        }
+        return out;
+    }
     read_arena_row(arena, base, row, HID)
 }
 

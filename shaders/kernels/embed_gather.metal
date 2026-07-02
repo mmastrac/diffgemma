@@ -5,6 +5,7 @@ using namespace metal;
 #include "debug_status.metal"
 #include "arena.metal"
 #include "dequant.metal"
+#include "hidden_fc.metal"
 
 /// Gather Q8 embed rows by token id: out[tok,d] = dequant(embed[id], d) * embed_scale.
 kernel void embed_gather(
@@ -40,5 +41,9 @@ kernel void embed_gather(
     if (dgq_debug_deep_enabled() && d == 0u) {
         dgq_assert_finite_f32(dbg, DbgKernelEmbedGather, v, tok);
     }
-    arena_store(out, (ulong)tok * hidden + d, v);
+    if (K_HIDDEN_Y_F32) {
+        ((device float *)out)[(ulong)tok * hidden + d] = v;
+    } else {
+        arena_store(out, (ulong)tok * hidden + d, v);
+    }
 }

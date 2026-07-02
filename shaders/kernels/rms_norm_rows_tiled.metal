@@ -5,6 +5,7 @@ using namespace metal;
 #include "debug_status.metal"
 #include "common.metal"
 #include "arena.metal"
+#include "hidden_fc.metal"
 
 constant uint K_IN_DTYPE [[function_constant(4)]];
 
@@ -58,12 +59,19 @@ kernel void rms_norm_rows_tiled(
         float v;
         if (K_IN_DTYPE == ELEM_F32) {
             device const float *xr = x_base + (ulong)row * dim;
-            v = f32_round_bf16(xr[i]) * inv;
+            // The legacy f32-in path rounds x to bf16 for parity with the bf16
+            // pipeline. The f32-hidden pipelines (K_HIDDEN_A_F32) keep full
+            // precision — that is their whole point.
+            v = (K_HIDDEN_A_F32 ? xr[i] : f32_round_bf16(xr[i])) * inv;
         } else {
             device const ushort *xr = (device const ushort *)x_base + (ulong)row * dim;
             v = arena_load(xr, i) * inv;
         }
         if (w_off != 0) v *= bf16_bytes(blob + w_off + 2ul * i);
-        arena_store(y, (ulong)row * dim + i, v);
+        if (K_HIDDEN_Y_F32) {
+            ((device float *)y)[(ulong)row * dim + i] = v;
+        } else {
+            arena_store(y, (ulong)row * dim + i, v);
+        }
     }
 }

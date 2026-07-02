@@ -185,6 +185,23 @@ pub fn pipeline_for(
     ctx.compile_subkernel(SHADER, ENTRY, variant)
 }
 
+/// f32 stream-plane variant (DGQ_HIDDEN_F32): router input reads f32 (FC30).
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn pipeline_for_hidden_f32(
+    ctx: &crate::metal::device::MetalContext,
+    variant: KernelVariant,
+) -> Result<crate::metal::device::ComputePipeline, Error> {
+    use crate::kernels::sub::variant::FcBool;
+    ctx.compile_subkernel_ex(
+        SHADER,
+        ENTRY,
+        variant,
+        "hf32",
+        &[FcBool { index: 30, value: true }],
+        &[],
+    )
+}
+
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,

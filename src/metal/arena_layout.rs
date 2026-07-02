@@ -35,6 +35,11 @@ pub struct ArenaLayoutParams {
     pub max_attn_q_cols: usize,
     /// Max K/V projection width per token.
     pub max_attn_kv_cols: usize,
+    /// f32 hidden + stream planes (`DGQ_HIDDEN_F32`): the residual accumulator
+    /// keeps 23-bit mantissas across the 30 layers instead of re-rounding to
+    /// bf16 (7-bit) at every residual add — the dominant per-step self-noise
+    /// vs the f32 engine (layer-26 cos 0.975). All other planes stay bf16.
+    pub hidden_f32: bool,
 }
 
 fn align16(off: u64) -> u64 {
@@ -56,9 +61,16 @@ fn rowstat_plane_bytes(canvas: usize) -> u64 {
 /// Stack arena planes in the order used by the step schedule; 16-byte align between planes.
 pub fn build_arena_layout(p: &ArenaLayoutParams) -> ArenaLayout {
     let mut off = 0u64;
+    let hidden_plane = |canvas: usize, cols: usize| {
+        if p.hidden_f32 {
+            f32_plane_bytes(canvas, cols)
+        } else {
+            half_plane_bytes(canvas, cols)
+        }
+    };
 
     let a_hidden = off;
-    off = align16(off + half_plane_bytes(p.canvas, p.hidden));
+    off = align16(off + hidden_plane(p.canvas, p.hidden));
 
     let a_resid = off;
     off = align16(off + half_plane_bytes(p.canvas, p.hidden));
@@ -94,7 +106,7 @@ pub fn build_arena_layout(p: &ArenaLayoutParams) -> ArenaLayout {
     off = align16(off + half_plane_bytes(p.canvas, p.hidden));
 
     let a_stream = off;
-    off = align16(off + half_plane_bytes(p.canvas, p.hidden));
+    off = align16(off + hidden_plane(p.canvas, p.hidden));
 
     let a_tmp = off;
     off = align16(off + half_plane_bytes(p.canvas, p.hidden));
@@ -215,6 +227,7 @@ mod tests {
             dense_ff: 2112,
             max_attn_q_cols: 8192,
             max_attn_kv_cols: 2048,
+            hidden_f32: false,
         });
         assert_eq!(layout.a_hidden, 0);
         assert_eq!(layout.a_resid, 1_441_792);

@@ -7,6 +7,7 @@ using namespace metal;
 #include "attention_device.metal"
 #include "moe_router_device.metal"
 #include "arena.metal"
+#include "hidden_fc.metal"
 
 /// RMSNorm → router scale → linear → softmax → top-k (monolith k_router).
 kernel void moe_router(
@@ -31,9 +32,12 @@ kernel void moe_router(
     threadgroup float logits[128];
     threadgroup float red[4];
     device const ushort *x = stream + (ulong)tok * dims.hidden;
+    // f32 stream plane (DGQ_HIDDEN_F32): index from the buffer BASE as float —
+    // ushort pointer arithmetic would scale the row offset by 2, not 4.
+    device const float *xf = ((device const float *)stream) + (ulong)tok * dims.hidden;
     float ss = 0.f;
     for (uint i = e; i < dims.hidden; i += 128u) {
-        float t = arena_load(x, i);
+        float t = K_HIDDEN_A_F32 ? xf[i] : arena_load(x, i);
         ss += t * t;
     }
     ss = simd_sum(ss);
@@ -51,7 +55,8 @@ kernel void moe_router(
         device const uchar *wr = blob + L->router_proj + (ulong)e * dims.hidden * 2ul;
         float acc = 0.f;
         for (uint d = 0u; d < dims.hidden; ++d) {
-            float xn = arena_load(x, d) * norm_inv * bf16_bytes(rs + 2ul * d) * dims.router_hscale;
+            float xv = K_HIDDEN_A_F32 ? xf[d] : arena_load(x, d);
+            float xn = xv * norm_inv * bf16_bytes(rs + 2ul * d) * dims.router_hscale;
             acc += xn * bf16_bytes(wr + 2ul * d);
         }
         logits[e] = acc;

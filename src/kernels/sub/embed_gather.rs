@@ -130,6 +130,24 @@ pub fn pipeline_for(
     ctx.compile_subkernel(SHADER, ENTRY, variant)
 }
 
+/// f32 hidden-plane output variant (DGQ_HIDDEN_F32): gathered embeddings store
+/// f32 into the hidden plane (FC31).
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn pipeline_for_hidden_f32(
+    ctx: &crate::metal::device::MetalContext,
+    variant: KernelVariant,
+) -> Result<crate::metal::device::ComputePipeline, Error> {
+    use crate::kernels::sub::variant::FcBool;
+    ctx.compile_subkernel_ex(
+        SHADER,
+        ENTRY,
+        variant,
+        "hf32",
+        &[FcBool { index: 31, value: true }],
+        &[],
+    )
+}
+
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub fn dispatch_shape(hidden: usize, num_tokens: usize) -> (objc2_metal::MTLSize, objc2_metal::MTLSize) {
     use objc2_metal::MTLSize;

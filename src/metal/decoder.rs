@@ -332,6 +332,25 @@ fn forward_inner(
     let mut in_buf = &mut scratch.cpu.hidden_a;
     let mut out_buf = &mut scratch.cpu.hidden_b;
 
+    // Env-gated per-layer hidden capture for the drift decomposition
+    // (DGQ_ENGINE_LAYER_DUMP=<json path>, DGQ_ENGINE_LAYER_POS=<canvas row>):
+    // the engine round-trips hidden through these CPU slices anyway, so this is
+    // a free probe. Emits the step-layer-probe JSON schema for
+    // compare_layer_hidden.py.
+    let layer_dump_path = std::env::var("DGQ_ENGINE_LAYER_DUMP").ok();
+    let layer_dump_pos: usize = std::env::var("DGQ_ENGINE_LAYER_POS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(129);
+    let mut layer_dump_rows: Vec<(String, Vec<f32>)> = Vec::new();
+    if layer_dump_path.is_some() && layer_dump_pos < seq_len {
+        let off = layer_dump_pos * hidden;
+        layer_dump_rows.push((
+            "after_preamble".into(),
+            in_buf[off..off + hidden].to_vec(),
+        ));
+    }
+
     let n_layers = max_layers.min(text.num_hidden_layers);
     engine.pool.clear();
     let expert_before = if engine.telemetry_enabled() {
@@ -381,6 +400,13 @@ fn forward_inner(
         if !weights.is_dgq() {
             weights.release_layer();
         }
+        if layer_dump_path.is_some() && layer_dump_pos < seq_len {
+            let off = layer_dump_pos * hidden;
+            layer_dump_rows.push((
+                format!("after_layer_{layer}"),
+                out_buf[off..off + hidden].to_vec(),
+            ));
+        }
         std::mem::swap(&mut in_buf, &mut out_buf);
     }
 
@@ -413,6 +439,46 @@ fn forward_inner(
         batch.end()?;
     }
     engine.pool.trim(4);
+
+    if let Some(path) = &layer_dump_path {
+        if layer_dump_pos < seq_len {
+            let off = layer_dump_pos * hidden;
+            layer_dump_rows.push((
+                "after_final_norm".into(),
+                norm_out[off..off + hidden].to_vec(),
+            ));
+            let checkpoints: Vec<serde_json::Value> = layer_dump_rows
+                .iter()
+                .map(|(label, h)| {
+                    let l2 = h.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>().sqrt();
+                    let max_abs = h.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                    serde_json::json!({
+                        "label": label,
+                        "hidden": h,
+                        "hidden_l2": l2 as f32,
+                        "hidden_max_abs": max_abs,
+                    })
+                })
+                .collect();
+            let doc = serde_json::json!({
+                "schema_version": 1,
+                "source": "engine-layer-dump",
+                "prompt": "",
+                "prompt_token_ids": [],
+                "initial_canvas_ids": input.token_ids,
+                "seed": 0,
+                "layers": n_layers,
+                "position": layer_dump_pos,
+                "canvas_token": input.token_ids.get(layer_dump_pos).copied().unwrap_or(0),
+                "checkpoints": checkpoints,
+            });
+            if let Err(e) = std::fs::write(path, serde_json::to_string(&doc).unwrap_or_default()) {
+                eprintln!("engine-layer-dump: write failed: {e}");
+            } else {
+                eprintln!("engine-layer-dump: wrote {path} (pos={layer_dump_pos})");
+            }
+        }
+    }
 
     if let Some(before) = expert_before {
         let after = weights.expert_cache_stats();
