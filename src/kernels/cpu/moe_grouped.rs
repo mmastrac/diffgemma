@@ -116,15 +116,17 @@ pub fn moe_grouped_q4(
         };
         for slot in route.offset[e]..end {
             let tok = route.token_list[slot as usize] as usize;
-            let kk = route.slot_list[slot as usize] as usize;
-            let w = route.weight[tok][kk];
+            // The kernel writes UNWEIGHTED per-SLOT rows (slot_out[slot] =
+            // f32_round_bf16(o)); the router weight is applied downstream by
+            // moe_scatter_weighted. The old weighted per-token accumulate here
+            // predated that split and made these oracles fail (cos ~0.34).
             let x = &moe_in[tok * hidden..(tok + 1) * hidden];
             let gu = &gate_up_blob[e * gu_stride..(e + 1) * gu_stride];
             let dn = &down_blob[e * dn_stride..(e + 1) * dn_stride];
             let expert_out = expert_forward_q4_mirror(x, gu, dn, moe_ff, hidden);
-            let out_row = &mut moe_out[tok * hidden..(tok + 1) * hidden];
+            let out_row = &mut moe_out[slot as usize * hidden..(slot as usize + 1) * hidden];
             for (o, &v) in out_row.iter_mut().zip(expert_out.iter()) {
-                *o += bf16::round_bf16_f32(w * v);
+                *o = bf16::round_bf16_f32(v);
             }
         }
     }
@@ -157,15 +159,14 @@ pub fn moe_grouped_nvfp4(
         };
         for slot in route.offset[e]..end {
             let tok = route.token_list[slot as usize] as usize;
-            let kk = route.slot_list[slot as usize] as usize;
-            let w = route.weight[tok][kk];
+            // Kernel contract: unweighted per-SLOT rows (see moe_grouped_q4).
             let x = &moe_in[tok * hidden..(tok + 1) * hidden];
             let gu = &gate_up_blob[e * gu_stride..(e + 1) * gu_stride];
             let dn = &down_blob[e * dn_stride..(e + 1) * dn_stride];
             let expert_out = expert_forward_nvfp4_mirror(x, gu, dn, moe_ff, hidden);
-            let out_row = &mut moe_out[tok * hidden..(tok + 1) * hidden];
+            let out_row = &mut moe_out[slot as usize * hidden..(slot as usize + 1) * hidden];
             for (o, &v) in out_row.iter_mut().zip(expert_out.iter()) {
-                *o += bf16::round_bf16_f32(w * v);
+                *o = bf16::round_bf16_f32(v);
             }
         }
     }

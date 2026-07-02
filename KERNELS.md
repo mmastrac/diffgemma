@@ -70,10 +70,17 @@ q4/nvfp4 (QUANT_FORMAT), sc_softembed bf16 variant.
 - `gemm_q8_rowk` oracle tests dispatched 128-wide n-tiles against the 32×32
   kernel (cols 32–127 unwritten → the long-standing cos≈0.34 failures). Fixed:
   harness now dispatches the production 32-tile grid.
-- `moe_grouped(+nvfp4)` fixtures went stale against the compact-dispatch
-  RouteScratch changes (kernel verified correct in production); fix in flight.
-- `sample::stopper_blocks_degenerate_all_pad_argmax`: pre-existing; fix in
-  flight.
+- `moe_grouped(+nvfp4)` oracle tests (8): the kernel is verified correct in
+  production (`DGQ_MOE_BLOCK_SPARSE=0` generates correctly); the failures are
+  test-side. Diagnosed so far: (a) the CPU oracle computed the OLD weighted
+  per-token accumulate while the kernel emits unweighted per-SLOT rows
+  (weighting moved to `moe_scatter_weighted`) — fixed; (b) a deeper residual
+  remains: even at weight=1.0 (tiny fixture) GPU vs CPU cos is 0.34, so
+  `expert_forward_q4_mirror` (CPU) has drifted from the kernel's expert math
+  itself. Needs focused archaeology against moe_grouped.metal's gate/up/act/
+  down sequence and scales.
+- `sample::stopper_blocks_degenerate_all_pad_argmax`: pre-existing CPU test;
+  undiagnosed.
 
 ## Notes
 
