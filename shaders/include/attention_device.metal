@@ -25,6 +25,7 @@ struct AttnDims {
     uint canvas;
     uint n_q_heads;
     uint causal;   // 0 = bidirectional all-valid (denoise); 1 = causal (prefill)
+    uint window;   // sliding-window size (0 = unwindowed/full-attention layer)
 };
 
 /// Split-half RoPE on the first `rot` dims; inv_freq denominator is full `head_dim`.

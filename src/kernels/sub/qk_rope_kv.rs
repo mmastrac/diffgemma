@@ -19,11 +19,17 @@ pub struct AttnDims {
     pub n_q_heads: u32,
     /// 0 = bidirectional all-valid (denoise); 1 = causal (prefill).
     pub causal: u32,
+    /// Sliding-window size (1024 for sliding layers, 0 = unwindowed/full).
+    /// Denoise (causal=0): canvas attends encoder keys [max(0, kv_len-(window-1)), kv_len)
+    /// + all canvas (MLX `_make_decoder_masks` semantics). Causal (prefill):
+    /// query at pos q attends [max(0, q-(window-1)), q] (engine CausalSliding).
+    /// No-op while kv_len+tok < window, so short contexts are bit-identical.
+    pub window: u32,
 }
 
 impl AttnDims {
     pub fn new(canvas: u32, n_q_heads: u32) -> Self {
-        Self { canvas, n_q_heads, causal: 0 }
+        Self { canvas, n_q_heads, causal: 0, window: 0 }
     }
 }
 
@@ -330,6 +336,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         canvas: f.canvas as u32,
         n_q_heads: f.n_q_heads as u32,
         causal: 0,
+        window: 0,
     };
 
     let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;

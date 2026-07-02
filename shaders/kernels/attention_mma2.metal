@@ -51,6 +51,18 @@ kernel void attention_mma2(
     // within-tile keys per row in the softmax.
     const bool causal = dims.causal != 0u;
     const uint T_eff = causal ? min(T, P.kv_len + tok0 + MT) : T;
+    // Sliding window (dims.window != 0): keys below the window start are masked.
+    // Denoise: canvas attends the last window-1 encoder positions + all canvas
+    // (uniform across rows). Causal: per-row [qpos-(window-1), qpos]; the tile
+    // loop starts at the OLDEST row's window start, per-row softmax masking does
+    // the rest. t_lo = 0 (bit-identical) until the context outgrows the window.
+    const uint wm1 = (dims.window != 0u) ? (dims.window - 1u) : 0u;
+    uint t_lo = 0u;
+    if (dims.window != 0u) {
+        const uint qpos0 = causal ? (P.kv_len + tok0) : P.kv_len;
+        t_lo = (qpos0 > wm1) ? (qpos0 - wm1) : 0u;
+    }
+    const uint t_start = (t_lo / 8u) * 8u;  // tile-aligned; softmax masks the edge
     device const ushort *base = kvcache + L->kv_region / 2;
 
     threadgroup half qs[QG][MT][HD_MAX];   // staged Q per head
@@ -83,7 +95,7 @@ kernel void attention_mma2(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint t0 = 0u; t0 < T_eff; t0 += 8u) {
+    for (uint t0 = t_start; t0 < T_eff; t0 += 8u) {
         // ---- S[MT x 8] = Q . K^T over head_dim chunks (K shared by both heads) ----
         simdgroup_float8x8 sacc(0.f);
         for (uint kd = 0u; kd < hd; kd += 8u) {
@@ -107,9 +119,13 @@ kernel void attention_mma2(
         // ---- online softmax over this 8-key tile (per head) ----
         if (lane < MT) {
             const uint qpos = P.kv_len + tok0 + lane;  // causal cutoff for this row
+            // Per-row window start: causal rows each have their own; denoise is uniform.
+            const uint row_lo = (dims.window == 0u)
+                ? 0u
+                : (causal ? ((qpos > wm1) ? qpos - wm1 : 0u) : t_lo);
             float tmax = -INFINITY;
             for (uint t = 0u; t < 8u; ++t) {
-                bool valid = (t0 + t < T) && (!causal || t0 + t <= qpos);
+                bool valid = (t0 + t < T) && (t0 + t >= row_lo) && (!causal || t0 + t <= qpos);
                 if (valid) {
                     tmax = max(tmax, st[sg][lane][t]);
                 }
@@ -119,7 +135,7 @@ kernel void attention_mma2(
             corr[sg][lane] = c;
             float lsum = 0.f;
             for (uint t = 0u; t < 8u; ++t) {
-                bool valid = (t0 + t < T) && (!causal || t0 + t <= qpos);
+                bool valid = (t0 + t < T) && (t0 + t >= row_lo) && (!causal || t0 + t <= qpos);
                 float p = valid ? exp(st[sg][lane][t] - mnew) : 0.f;
                 ph[sg][lane][t] = half(p);
                 lsum += p;

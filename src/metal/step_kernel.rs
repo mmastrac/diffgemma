@@ -241,6 +241,19 @@ pub fn attn_mma_full_enabled() -> bool {
     }
 }
 
+/// Sliding-window masking on sliding-attention layers (model spec: canvas
+/// attends only the last window-1 encoder positions; matches MLX
+/// `_make_decoder_masks`). Bit-identical for contexts within the window; for
+/// longer contexts it is BOTH more correct and O(window) instead of
+/// O(context) on 25/30 layers. `DGQ_ATTN_WINDOW=0` disables (old unwindowed
+/// behavior) for A/B.
+pub fn attn_window_enabled() -> bool {
+    match std::env::var("DGQ_ATTN_WINDOW") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
 /// Min prompt length (tokens) for the fast quantized prefill under the heuristic
 /// default. Short prompts stay on the accurate f32 engine (prefill is cheap there,
 /// and that's where the half-precision prompt KV tips borderline short-answer
@@ -1272,6 +1285,8 @@ struct StepEnc<'a> {
     /// Prefill mode: attention is CAUSAL (scalar kernel only; mma variants have no
     /// causal mask) and the SC/sampler/lm_head stages are skipped (KV-only forward).
     prefill_causal: bool,
+    /// Model sliding-window size (Gemma-4: 1024) for sliding-attention layers.
+    sliding_window: u32,
 }
 
 impl<'a> StepEnc<'a> {
@@ -2927,6 +2942,7 @@ impl StepEnc<'_> {
             canvas: CANVAS as u32,
             n_q_heads: STEP_NQ_HEADS as u32,
             causal: 0,
+            window: 0, // KV write only; the window applies at attention read time
         };
         self.sink_set_bytes(&attn_dims, 7);
         self.bind_debug_status(8);
@@ -2974,10 +2990,22 @@ impl StepEnc<'_> {
         self.sink_set_buffer(&self.bufs.arena, self.arena().attno_off() as usize, 2);
         self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 3);
         self.bind_params(4);
+        // Sliding layers (is_full==0) attend a bounded window (Gemma-4
+        // sliding_window=1024): denoise canvas sees only the last window-1
+        // encoder positions + the canvas (MLX `_make_decoder_masks`); causal
+        // prefill queries see [q-(window-1), q] (engine CausalSliding). This is
+        // both the model spec for kv_len>window-1 AND keeps 25/30 layers
+        // O(window) instead of O(context). No-op (bit-identical) below that.
+        let window = if l.is_full == 0 && attn_window_enabled() {
+            self.sliding_window
+        } else {
+            0
+        };
         let attn_dims = crate::kernels::sub::qk_rope_kv::AttnDims {
             canvas: CANVAS as u32,
             n_q_heads: STEP_NQ_HEADS as u32,
             causal: u32::from(self.prefill_causal),
+            window,
         };
         self.sink_set_bytes(&attn_dims, 5);
         self.bind_debug_status(6);
@@ -3657,6 +3685,18 @@ fn read_struct<T: Copy>(buf: &ProtocolObject<dyn MTLBuffer>) -> T {
     unsafe { *(buf.contents().as_ptr() as *const T) }
 }
 
+/// Debug: dump the raw bytes of a buffer to `path` (for KV-cache fast-vs-engine
+/// diffs). Bytes are bf16 in KV-cache layout; the diff tool reinterprets them.
+fn dump_buffer_raw(buf: &ProtocolObject<dyn MTLBuffer>, path: &str) {
+    let bytes = unsafe {
+        std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, buf.length())
+    };
+    match std::fs::write(path, bytes) {
+        Ok(()) => eprintln!("step-kernel: dumped {} bytes to {path}", bytes.len()),
+        Err(e) => eprintln!("step-kernel: DGQ_DUMP_KV write failed: {e}"),
+    }
+}
+
 pub fn trace_entropy_enabled() -> bool {
     match std::env::var("DGQ_TRACE_ENTROPY") {
         Ok(v) => v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("full"),
@@ -3914,6 +3954,10 @@ pub struct StepRuntime {
     layout: ModelLayout,
     tensor_offsets: HashMap<String, u64>,
     pub layers: usize,
+    /// KV-cache capacity (positions per layer) the buffers were sized for. Every
+    /// denoise block writes a CANVAS-wide canvas at [kv_len..kv_len+CANVAS], so
+    /// kv_len + CANVAS must never exceed this — checked in `set_kv_len`.
+    max_seq: usize,
     icb: Option<crate::metal::step_icb::StepIcbPair>,
 }
 
@@ -3943,6 +3987,17 @@ impl StepRuntime {
     }
 
     pub fn set_kv_len(&mut self, kv_len: u32) {
+        // A denoise block (and each prefill chunk) writes a CANVAS-wide canvas at
+        // [kv_len..kv_len+CANVAS] into the KV cache. If that exceeds the cache
+        // capacity, the write silently spills into the next layer's region (or off
+        // the buffer) and corrupts attention into word-salad. Fail loudly instead —
+        // callers must size max_seq >= prompt + generated + CANVAS.
+        assert!(
+            kv_len as usize + CANVAS <= self.max_seq,
+            "KV cache overflow: kv_len={kv_len} + CANVAS={CANVAS} > max_seq={}; \
+             size max_seq >= prompt_len + max_new_tokens + CANVAS",
+            self.max_seq,
+        );
         let mut params = self.read_params();
         params.kv_len = kv_len;
         self.write_params(params);
@@ -4094,6 +4149,7 @@ impl StepRuntime {
             attn_ffn_bf16: self.attn_ffn_bf16,
             embed_bf16: self.embed_bf16,
             prefill_causal: false,
+            sliding_window: self.text_config.sliding_window as u32,
         };
         let time_dispatch = std::env::var("DGQ_TIME_DISPATCH").is_ok();
         let t_enc = std::time::Instant::now();
@@ -4137,6 +4193,7 @@ impl StepRuntime {
             attn_ffn_bf16: self.attn_ffn_bf16,
             embed_bf16: self.embed_bf16,
             prefill_causal: false,
+            sliding_window: self.text_config.sliding_window as u32,
         };
         f(&mut enc)?;
         enc.enc.endEncoding();
@@ -4875,6 +4932,7 @@ pub fn build_step_runtime(
         layout,
         tensor_offsets: offsets,
         layers,
+        max_seq: cfg.max_seq,
         icb: None,
     };
     if crate::metal::step_icb::step_icb_enabled() {
@@ -4897,6 +4955,9 @@ pub fn build_step_runtime(
                 started.elapsed()
             );
         }
+    }
+    if let Ok(path) = std::env::var("DGQ_DUMP_KV") {
+        dump_buffer_raw(&rt.bufs.kvcache, &path);
     }
     Ok((rt, build))
 }

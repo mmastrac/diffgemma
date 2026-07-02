@@ -42,6 +42,18 @@ kernel void attention(
     // Causal (prefill): query at absolute pos kv_len+tok attends only [0..pos].
     const uint T_all = P.kv_len + dims.canvas;
     const uint T = (dims.causal != 0u) ? min(T_all, P.kv_len + tok + 1u) : T_all;
+    // Sliding window (dims.window != 0, sliding layers): keys below t_lo are
+    // masked out. Denoise (bidirectional): canvas attends the last window-1
+    // encoder positions + all canvas -> t_lo = kv_len - (window-1) (MLX
+    // _make_decoder_masks). Causal prefill: query q attends [q-(window-1), q]
+    // (engine CausalSliding). Keys are contiguous, so the mask is just a loop
+    // start; t_lo = 0 (bit-identical) until the context outgrows the window.
+    uint t_lo = 0u;
+    if (dims.window != 0u) {
+        const uint wm1 = dims.window - 1u;
+        const uint qpos = (dims.causal != 0u) ? (P.kv_len + tok) : P.kv_len;
+        t_lo = (qpos > wm1) ? (qpos - wm1) : 0u;
+    }
     device const ushort *qv = q + (ulong)tok * dims.n_q_heads * hd + qh * hd;
     device const ushort *base = kvcache + L->kv_region / 2;
     threadgroup float red[8];
@@ -61,7 +73,7 @@ kernel void attention(
     for (uint i = 0u; i < per; ++i) {
         acc[i] = 0.f;
     }
-    for (uint t = 0u; t < T; ++t) {
+    for (uint t = t_lo; t < T; ++t) {
         device const ushort *kk = base + (ulong)t * nkv * hd * 2u + kvh * hd;
         float d = 0.f;
         for (uint i = ltid; i < hd; i += tpg_w) {

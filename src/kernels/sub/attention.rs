@@ -305,6 +305,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         canvas: f.canvas as u32,
         n_q_heads: f.n_q_heads as u32,
         causal: 0,
+        window: 0,
     };
 
     let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
@@ -406,6 +407,7 @@ pub fn gpu_mma(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         canvas: f.canvas as u32,
         n_q_heads: f.n_q_heads as u32,
         causal: 0,
+        window: 0,
     };
 
     let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
