@@ -241,6 +241,20 @@ pub fn attn_mma_full_enabled() -> bool {
     }
 }
 
+/// Per-row entropy cap on sampler accepts (`DGQ_ACCEPT_ROW_CAP=<nats>`, 0/unset
+/// = off = exact MLX prefix rule). Closes the unconditional-first-accept hole
+/// that freezes an uncertain token on flat/creative canvases (the "grebe me"
+/// wart class); inert on factual prompts whose early accepts are ~0-entropy.
+pub fn accept_row_cap() -> f32 {
+    static CAP: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("DGQ_ACCEPT_ROW_CAP")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.0)
+    })
+}
+
 /// Sliding-window masking on sliding-attention layers (model spec: canvas
 /// attends only the last window-1 encoder positions; matches MLX
 /// `_make_decoder_masks`). Bit-identical for contexts within the window; for
@@ -3503,6 +3517,8 @@ impl StepEnc<'_> {
         let eos = read_struct::<StepParams>(&self.bufs.params).eos_token_id;
         self.sink_set_bytes(&eos, 5);
         self.bind_debug_status(6);
+        let row_cap = accept_row_cap();
+        self.sink_set_bytes(&row_cap, 7);
         let tg = MTLSize {
             width: 256,
             height: 1,
@@ -3815,8 +3831,12 @@ pub fn log_denoise_parity_step(
     params: &StepParams,
     logits: &ProtocolObject<dyn MTLBuffer>,
 ) {
-    use crate::sample::accept_mask_from_entropies;
-    let cpu_mask = accept_mask_from_entropies(&state.entropy, params.entropy_bound);
+    use crate::sample::accept_mask_from_entropies_capped;
+    let cpu_mask = accept_mask_from_entropies_capped(
+        &state.entropy,
+        params.entropy_bound,
+        accept_row_cap(),
+    );
     let cpu_accept = cpu_mask.iter().filter(|&&m| m).count() as u32;
     let gpu_accept = state.accept.iter().filter(|&&a| a != 0).count();
     let temp = scheduled_temperature(state.step.saturating_sub(1), params);

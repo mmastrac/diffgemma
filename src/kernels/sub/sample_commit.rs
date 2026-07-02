@@ -26,6 +26,8 @@ pub struct Fixture {
     pub params: StepParams,
     pub pad_token: u32,
     pub filler_token: u32,
+    /// Per-row accept cap (<=0 disables); bound as buffer(7), not in StepParams.
+    pub accept_row_ent_max: f32,
 }
 
 impl Fixture {
@@ -62,7 +64,16 @@ pub fn tiny_fixture(_: ElemFormat) -> Fixture {
         },
         pad_token: PAD_TOKEN_ID,
         filler_token: FILLER_TOKEN_ID,
+        accept_row_ent_max: 0.0,
     }
+}
+
+/// Cap 0.2 on entropies [0.05,0.15,0.25,0.35] (bound 0.4): uncapped accepts
+/// rows {0,1,2}; the cap stops at row 2 (0.25 > 0.2) -> accepts {0,1}.
+pub fn row_cap_fixture(_: ElemFormat) -> Fixture {
+    let mut f = tiny_fixture(ElemFormat::F32);
+    f.accept_row_ent_max = 0.2;
+    f
 }
 
 pub fn final_step_fixture(_: ElemFormat) -> Fixture {
@@ -97,6 +108,7 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
         CommitParams {
             max_steps: f.params.max_steps,
             entropy_bound: f.params.entropy_bound,
+            accept_row_ent_max: f.accept_row_ent_max,
             conf_threshold: f.params.conf_threshold,
             stability_threshold: f.params.stability_threshold,
             min_early_stop_steps: f.params.min_early_stop_steps,
@@ -227,6 +239,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     gpu_common::set_bytes(&enc, &f.filler_token, 4);
     let eos = f.params.eos_token_id;
     gpu_common::set_bytes(&enc, &eos, 5);
+    gpu_common::set_bytes(&enc, &f.accept_row_ent_max, 7);
     enc.dispatchThreadgroups_threadsPerThreadgroup(
         MTLSize {
             width: 1,
@@ -271,6 +284,18 @@ mod tests {
         cpu_oracle = crate::kernels::sub::sample_commit::cpu_oracle,
         gpu = crate::kernels::sub::sample_commit::gpu,
         fixture = crate::kernels::sub::sample_commit::tiny_fixture,
+        out_len = crate::kernels::sub::sample_commit::fixture_len,
+        formats: [F32],
+        max_tol = 1e-5,
+        min_cos = 0.9999,
+    }
+
+    kernel_oracle_matrix! {
+        mod row_cap,
+        cpu = crate::kernels::sub::sample_commit::cpu,
+        cpu_oracle = crate::kernels::sub::sample_commit::cpu_oracle,
+        gpu = crate::kernels::sub::sample_commit::gpu,
+        fixture = crate::kernels::sub::sample_commit::row_cap_fixture,
         out_len = crate::kernels::sub::sample_commit::fixture_len,
         formats: [F32],
         max_tol = 1e-5,
