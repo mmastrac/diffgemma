@@ -244,6 +244,54 @@ pub fn gather_rows_gpu(
     Ok(buf_dst)
 }
 
+/// Weighted scatter of grouped-MoE arena rows back to `[seq, hidden]` token rows.
+/// `rows`/`weights` are per-token top_k lists in expert-JOB order (see
+/// `build_scatter_lists`) so the f32 sum order matches the CPU scatter exactly.
+pub fn scatter_rows_weighted_gpu(
+    batch: &mut GpuBatch<'_>,
+    kernels: &GpuKernels,
+    arena_buf: &ProtocolObject<dyn MTLBuffer>,
+    rows: &[u32],
+    weights: &[f32],
+    seq_len: usize,
+    hidden: usize,
+    top_k: usize,
+) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
+    if rows.len() != seq_len * top_k || weights.len() != seq_len * top_k {
+        return Err(Error::Format("scatter_rows_weighted shape mismatch"));
+    }
+    let rows_bytes = unsafe {
+        std::slice::from_raw_parts(rows.as_ptr().cast::<u8>(), rows.len() * 4)
+    };
+    let buf_rows = batch.alloc_bytes(rows_bytes)?;
+    let buf_w = batch.alloc_f32(weights)?;
+    let buf_out = batch.alloc_f32_out(seq_len * hidden)?;
+    let buf_dump = batch.alloc_f32_out(1)?;
+    let dims = [seq_len as u32, hidden as u32, top_k as u32];
+    batch.dispatch_1d(&kernels.scatter_rows_weighted.pipeline, seq_len * hidden, |enc| {
+        crate::kernels::sub::scatter_rows_weighted::bind_gpu_buffers(
+            &enc, arena_buf, &buf_rows, &buf_w, &buf_out, &buf_dump, &dims,
+        );
+    });
+    Ok(buf_out)
+}
+
+/// `buf *= scale` in place on GPU (engine analog of the CPU layer_scalar multiply).
+pub fn vec_scale_gpu_buf(
+    batch: &mut GpuBatch<'_>,
+    kernels: &GpuKernels,
+    buf: &ProtocolObject<dyn MTLBuffer>,
+    len: usize,
+    scale: f32,
+) -> Result<(), Error> {
+    let len_u = len as u32;
+    let buf_dump = batch.alloc_f32_out(1)?;
+    batch.dispatch_1d(&kernels.vec_scale.pipeline, len, |enc| {
+        crate::kernels::sub::vec_scale_inplace::bind_gpu_buffers(&enc, buf, &buf_dump, scale, len_u);
+    });
+    Ok(())
+}
+
 /// `out_buf += addend_buf` on GPU (in-place on `out_buf`).
 pub fn vec_add_gpu_bufs(
     batch: &mut GpuBatch<'_>,

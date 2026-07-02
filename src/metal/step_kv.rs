@@ -380,6 +380,8 @@ pub fn prefill_monolithic_kv_with_cache_timed(
     }
 
     let gpu_started = std::time::Instant::now();
+    let telemetry_was_on = cache.engine.telemetry_enabled();
+    cache.engine.reset_forward_telemetry();
     let _cpu_kv = prefill_gpu(
         &cache.model.weights,
         &cache.model.config,
@@ -396,6 +398,21 @@ pub fn prefill_monolithic_kv_with_cache_timed(
         Some(layers),
     )?;
     let gpu_forward_ms = gpu_started.elapsed().as_secs_f64() * 1000.0;
+    {
+        // Sync/readback profile of the engine prefill (each gpu_sync is a
+        // commit+waitUntilCompleted with host round-trips — the suspected
+        // dominant cost vs MLX's single-graph prefill).
+        let tel = cache.engine.telemetry_handle();
+        let t = tel.borrow();
+        eprintln!(
+            "monolithic-prefill: engine telemetry gpu_syncs={} readback={:.2} MiB",
+            t.gpu_syncs,
+            t.gpu_readback_bytes as f64 / (1024.0 * 1024.0),
+        );
+    }
+    if !telemetry_was_on {
+        let _ = cache.engine.take_forward_telemetry();
+    }
 
     let gpu_kv = cache
         .dec_scratch

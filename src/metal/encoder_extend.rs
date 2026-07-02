@@ -80,6 +80,77 @@ pub fn prefill_gpu(
         .unwrap_or(text.num_hidden_layers)
         .min(text.num_hidden_layers);
     let prefill_started = std::time::Instant::now();
+
+    // GPU-resident prefill (default): hidden state stays on GPU across all
+    // layers — 2 syncs/layer (route flush + MoE batch) instead of 4 with
+    // multi-MiB host round-trips. Bit-identical kernels/order to the classic
+    // path. `DGQ_PREFILL_RESIDENT=0` falls back to the classic per-layer path.
+    let resident = weights.is_dgq()
+        && engine.encoder_gpu_moe()
+        && std::env::var("DGQ_PREFILL_RESIDENT").map(|v| v != "0").unwrap_or(true);
+    if resident {
+        if progress_enabled() {
+            eprintln!(
+                "encoder: prefill starting ({n_layers} layers, {seq_len} tokens, gpu-resident)..."
+            );
+        }
+        let bufs = crate::metal::decoder_layer::PrefillResidentBufs::new(
+            engine, seq_len, hidden,
+        )?;
+        bufs.upload_hidden(0, &enc_scratch.hidden_a[..seq_len * hidden])?;
+        // Tiny reusable scratch — the resident path never touches the CPU
+        // attention/MoE buffers a full per-layer GpuDecoderLayerScratch carries.
+        let mut rope_freqs: Vec<f32> = Vec::new();
+        let mut token_indices: Vec<u32> = Vec::new();
+        let mut in_idx = 0usize;
+        for layer in 0..n_layers {
+            let layer_started = std::time::Instant::now();
+            weights.ensure_layer(store, text, layer, &engine.ctx.device, &mut engine.pool)?;
+            {
+                let layer_cache = weights.layer_ref(layer);
+                crate::metal::decoder_layer::forward_encoder_prefill_resident(
+                    &bufs,
+                    in_idx,
+                    &layer_cache,
+                    weights,
+                    text,
+                    layer,
+                    seq_len,
+                    &positions,
+                    &mut rope_freqs,
+                    &mut token_indices,
+                    engine,
+                    &gpu_kv,
+                )?;
+            }
+            if progress_enabled()
+                && (layer == 0 || layer + 1 == n_layers || (layer + 1) % 5 == 0)
+            {
+                eprintln!(
+                    "encoder: prefill layer {}/{} ({layer_elapsed:.2?}, cumulative {cum:.2?})",
+                    layer + 1,
+                    n_layers,
+                    layer_elapsed = layer_started.elapsed(),
+                    cum = prefill_started.elapsed(),
+                );
+            }
+            in_idx = 1 - in_idx;
+        }
+        bufs.release(engine);
+        engine.pool.trim(0);
+        if progress_enabled() {
+            eprintln!(
+                "encoder: prefill done ({:.2?}, kv_len={seq_len})",
+                prefill_started.elapsed()
+            );
+        }
+        gpu_kv.advance_kv_len(seq_len)?;
+        dec_scratch.gpu_kv = Some(gpu_kv);
+        let mut kv_cache = KvCache::empty(text)?;
+        kv_cache.kv_len = seq_len;
+        return Ok(kv_cache);
+    }
+
     if progress_enabled() {
         eprintln!(
             "encoder: prefill starting ({n_layers} layers, {seq_len} tokens)..."

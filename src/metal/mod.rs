@@ -2,7 +2,7 @@
 
 mod attention;
 mod attention_batch;
-mod batch;
+pub(crate) mod batch;
 mod batched_kernels;
 pub(crate) mod buffer;
 mod decoder;

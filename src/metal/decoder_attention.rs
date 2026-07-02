@@ -114,7 +114,8 @@ fn fused_input_qkv_heads(
     batch.end()
 }
 
-/// Input layernorm + Q/K/V projections + per-head norms; Q/K/V stay on GPU (no readback).
+/// Input layernorm + Q/K/V projections + per-head norms; input and Q/K/V stay
+/// on GPU (no readback).
 fn encode_input_qkv_gpu_bufs(
     batch: &mut crate::metal::batch::GpuBatch<'_>,
     kernels: &crate::metal::kernels::GpuKernels,
@@ -122,7 +123,7 @@ fn encode_input_qkv_gpu_bufs(
     f32_q4: &crate::metal::device::ComputePipeline,
     f32_nvfp4: &crate::metal::device::ComputePipeline,
     f32_q8: &crate::metal::device::ComputePipeline,
-    hidden: &[f32],
+    hidden_buf: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
     cached: &GpuLayerWeightCache,
     seq_len: usize,
     hidden_size: usize,
@@ -136,10 +137,10 @@ fn encode_input_qkv_gpu_bufs(
     ),
     Error,
 > {
-    let buf_normed = bk::rms_norm_rows_gpu(
+    let buf_normed = bk::rms_norm_rows_gpu_buf(
         batch,
         kernels,
-        hidden,
+        hidden_buf,
         cached.input_layernorm.as_slice(),
         seq_len,
         hidden_size,
@@ -211,6 +212,91 @@ fn encode_input_qkv_gpu_bufs(
     Ok((buf_q, buf_k, buf_v))
 }
 
+/// Encode QKV → KV suffix write → RoPE/GQA → o_proj into an open batch; the
+/// hidden input and the o_proj output stay on GPU. Core of both the classic
+/// (CPU-out) attention and the GPU-resident prefill path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_fused_gpu_kv_attention_buf(
+    batch: &mut crate::metal::batch::GpuBatch<'_>,
+    kernels: &crate::metal::kernels::GpuKernels,
+    attention: &crate::metal::attention::GpuAttentionKernels,
+    copy_pipeline: &crate::metal::device::ComputePipeline,
+    f32_bf16: &crate::metal::device::ComputePipeline,
+    f32_q4: &crate::metal::device::ComputePipeline,
+    f32_nvfp4: &crate::metal::device::ComputePipeline,
+    f32_q8: &crate::metal::device::ComputePipeline,
+    hidden_buf: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+    cached: &GpuLayerWeightCache,
+    seq_len: usize,
+    hidden_size: usize,
+    eps: f32,
+    params: &AttentionParams,
+    freqs: &[f32],
+    k_buf: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+    v_buf: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+    k_canvas_elem_offset: usize,
+    kv_suffix_byte_off: usize,
+    kv_suffix_elems: usize,
+    total_kv: usize,
+    mask: GqaMask<'_>,
+    o_proj: &crate::metal::linear::GpuLinearWeight,
+) -> Result<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>, Error>
+{
+    let (buf_q, buf_k, buf_v) = encode_input_qkv_gpu_bufs(
+        batch,
+        kernels,
+        f32_bf16,
+        f32_q4,
+        f32_nvfp4,
+        f32_q8,
+        hidden_buf,
+        cached,
+        seq_len,
+        hidden_size,
+        eps,
+        params,
+    )?;
+    dispatch_copy_f32_to_buf(
+        batch,
+        copy_pipeline,
+        &buf_k,
+        &k_buf,
+        kv_suffix_byte_off,
+        kv_suffix_elems,
+    );
+    dispatch_copy_f32_to_buf(
+        batch,
+        copy_pipeline,
+        &buf_v,
+        &v_buf,
+        kv_suffix_byte_off,
+        kv_suffix_elems,
+    );
+    let buf_attn = decoder_gqa_gpu_kv_batched_chained_qbuf(
+        batch,
+        attention,
+        buf_q,
+        k_buf,
+        v_buf,
+        k_canvas_elem_offset,
+        freqs,
+        seq_len,
+        total_kv,
+        params,
+        mask,
+    )?;
+    linear_cached_batched_in_buf(
+        batch,
+        f32_bf16,
+        f32_q4,
+        f32_nvfp4,
+        f32_q8,
+        &buf_attn,
+        o_proj,
+        seq_len,
+    )
+}
+
 /// One batch: QKV on GPU → KV suffix write → RoPE/GQA/o_proj; single sync, output readback only.
 fn fused_gpu_kv_attention(
     engine: &mut GpuDecoderEngine,
@@ -238,60 +324,33 @@ fn fused_gpu_kv_attention(
         &engine.ctx.device,
         telemetry,
     )?;
-    let (buf_q, buf_k, buf_v) = encode_input_qkv_gpu_bufs(
+    let buf_hidden = batch.alloc_f32(hidden)?;
+    let buf_o = encode_fused_gpu_kv_attention_buf(
         &mut batch,
         &engine.kernels,
+        &engine.attention,
+        &engine.sampler_kernels.copy_f32,
         &engine.f32_bf16_linear_pipeline,
         &engine.f32_q4_linear_pipeline,
         &engine.f32_nvfp4_linear_pipeline,
         &engine.f32_q8_linear_pipeline,
-        hidden,
+        &buf_hidden,
         cached,
         seq_len,
         hidden_size,
         eps,
         params,
-    )?;
-    dispatch_copy_f32_to_buf(
-        &mut batch,
-        &engine.sampler_kernels.copy_f32,
-        &buf_k,
-        &k_buf,
-        kv_suffix_byte_off,
-        kv_suffix_elems,
-    );
-    dispatch_copy_f32_to_buf(
-        &mut batch,
-        &engine.sampler_kernels.copy_f32,
-        &buf_v,
-        &v_buf,
-        kv_suffix_byte_off,
-        kv_suffix_elems,
-    );
-    let buf_attn = decoder_gqa_gpu_kv_batched_chained_qbuf(
-        &mut batch,
-        &engine.attention,
-        buf_q,
+        freqs,
         k_buf,
         v_buf,
         k_canvas_elem_offset,
-        freqs,
-        seq_len,
+        kv_suffix_byte_off,
+        kv_suffix_elems,
         total_kv,
-        params,
         mask,
-    )?;
-    linear_cached_batched_in_cpu_out(
-        &mut batch,
-        &engine.f32_bf16_linear_pipeline,
-        &engine.f32_q4_linear_pipeline,
-        &engine.f32_nvfp4_linear_pipeline,
-        &engine.f32_q8_linear_pipeline,
-        out,
-        &buf_attn,
         o_proj,
-        seq_len,
     )?;
+    batch.register_read(buf_o, out);
     batch.end()
 }
 

@@ -19,14 +19,15 @@ pub struct GpuKernels {
     pub(crate) embed_gather: ComputePipeline,
     pub(crate) half_to_f32: ComputePipeline,
     pub(crate) pack_encoder_kv: ComputePipeline,
+    pub(crate) scatter_rows_weighted: ComputePipeline,
 }
 
 impl GpuKernels {
     pub fn new(ctx: &MetalContext) -> Result<Self, Error> {
         use crate::kernels::sub::{
             embed_gather, gather_prob_cols, gather_rows, gelu, half_to_f32, pack_encoder_kv,
-            rms_norm_rows, router_scale_rows, router_top_k_rows, softmax_rows, swiglu,
-            vec_add_inplace, vec_fill_zero, vec_scale_inplace,
+            rms_norm_rows, router_scale_rows, router_top_k_rows, scatter_rows_weighted,
+            softmax_rows, swiglu, vec_add_inplace, vec_fill_zero, vec_scale_inplace,
         };
         let prod = KernelVariant::PRODUCTION;
         Ok(Self {
@@ -50,6 +51,7 @@ impl GpuKernels {
             embed_gather: embed_gather::pipeline_for(ctx, prod)?,
             half_to_f32: half_to_f32::pipeline_for(ctx, prod)?,
             pack_encoder_kv: pack_encoder_kv::pipeline_for(ctx, prod)?,
+            scatter_rows_weighted: scatter_rows_weighted::pipeline_for(ctx, prod)?,
         })
     }
 }

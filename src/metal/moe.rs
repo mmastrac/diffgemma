@@ -17,6 +17,7 @@ use std::rc::Rc;
 use crate::model::layer_weights::DecoderLayerWeights;
 use crate::model::moe::{MoeScratch, RouteResult};
 use crate::safetensors::Error;
+use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLBuffer;
 
@@ -403,6 +404,44 @@ pub fn experts_forward_gpu_grouped_in_batch(
     q4_grouped_pipeline: &ComputePipeline,
     nvfp4_grouped_pipeline: &ComputePipeline,
 ) -> Result<(), Error> {
+    if let Some(buf_out) = experts_forward_gpu_grouped_in_batch_buf(
+        batch,
+        residual_buf,
+        pre_ff_norm_2,
+        eps,
+        expert_cache,
+        layer,
+        cfg,
+        seq_len,
+        jobs,
+        token_indices,
+        kernels,
+        q4_grouped_pipeline,
+        nvfp4_grouped_pipeline,
+    )? {
+        batch.register_read(buf_out, out_arena);
+    }
+    Ok(())
+}
+
+/// Same as `experts_forward_gpu_grouped_in_batch` but leaves the `[total_m, hidden]`
+/// expert-output arena on GPU (no readback) — for the GPU-resident prefill path.
+/// Returns `None` when there is no routed work.
+pub fn experts_forward_gpu_grouped_in_batch_buf(
+    batch: &mut GpuBatch<'_>,
+    residual_buf: &ProtocolObject<dyn MTLBuffer>,
+    pre_ff_norm_2: &[f32],
+    eps: f32,
+    expert_cache: &GpuDecoderWeightCache,
+    layer: usize,
+    cfg: &TextConfig,
+    seq_len: usize,
+    jobs: &[ExpertJob],
+    token_indices: &mut Vec<u32>,
+    kernels: &GpuKernels,
+    q4_grouped_pipeline: &ComputePipeline,
+    nvfp4_grouped_pipeline: &ComputePipeline,
+) -> Result<Option<Retained<ProtocolObject<dyn MTLBuffer>>>, Error> {
     let _hidden = cfg.hidden_size;
     let moe_inter = cfg.moe_intermediate_size;
     let num_jobs = jobs.len();
@@ -433,7 +472,7 @@ pub fn experts_forward_gpu_grouped_in_batch(
     }
     let total_m = token_indices.len();
     if total_m == 0 {
-        return Ok(());
+        return Ok(None);
     }
 
     let gate_jobs_bytes = unsafe {
@@ -519,8 +558,38 @@ pub fn experts_forward_gpu_grouped_in_batch(
         cfg.hidden_size,
         num_jobs,
     );
-    batch.register_read(buf_out, out_arena);
-    Ok(())
+    Ok(Some(buf_out))
+}
+
+/// Per-token `(arena_row, weight)` lists for `scatter_rows_weighted`, flattened
+/// to `[seq_len * top_k]`. Rows are the positions each token's entries occupy in
+/// `token_indices` (i.e. the grouped-GEMM arena rows), listed in expert-JOB
+/// order — the exact accumulation order of `scatter_weighted_expert_outputs`,
+/// so the GPU scatter's f32 sums are bit-identical to the CPU scatter. Tokens
+/// with fewer than `top_k` routed entries (shouldn't happen: the router always
+/// emits top_k) are padded with `(row 0, weight 0.0)` — an exact f32 no-op.
+pub(crate) fn build_scatter_lists(
+    jobs: &[ExpertJob],
+    seq_len: usize,
+    top_k: usize,
+) -> (Vec<u32>, Vec<f32>) {
+    let mut rows = vec![0u32; seq_len * top_k];
+    let mut weights = vec![0.0f32; seq_len * top_k];
+    let mut fill = vec![0usize; seq_len];
+    let mut arena_row = 0u32;
+    for job in jobs {
+        for &(tok, w) in &job.tokens {
+            let k = fill[tok];
+            debug_assert!(k < top_k, "token {tok} routed to more than top_k experts");
+            if k < top_k {
+                rows[tok * top_k + k] = arena_row;
+                weights[tok * top_k + k] = w;
+                fill[tok] = k + 1;
+            }
+            arena_row += 1;
+        }
+    }
+    (rows, weights)
 }
 
 /// Deterministic CPU expert forward for `.dgq` (native Q4 GEMM matches Metal kernel).

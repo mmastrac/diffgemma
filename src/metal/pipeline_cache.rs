@@ -66,6 +66,7 @@ fn shader_bundle_token() -> u64 {
         include_str!("../../shaders/kernels/vec_add_inplace.metal"),
         include_str!("../../shaders/kernels/vec_fill_zero.metal"),
         include_str!("../../shaders/kernels/vec_scale_inplace.metal"),
+        include_str!("../../shaders/kernels/scatter_rows_weighted.metal"),
         include_str!("../../shaders/include/gqa_device.metal"),
         include_str!("../../shaders/kernels/apply_rope_heads.metal"),
         include_str!("../../shaders/kernels/argmax_rows.metal"),

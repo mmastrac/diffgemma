@@ -35,6 +35,7 @@ pub mod engine_gqa_common;
 pub mod gqa_attention;
 pub mod row_entropy;
 pub mod sampler_ranged;
+pub mod scatter_rows_weighted;
 pub mod scatter_vocab_chunk;
 pub mod logit_rowstats;
 pub mod qk_rope_kv;

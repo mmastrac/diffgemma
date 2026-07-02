@@ -576,6 +576,328 @@ pub fn forward_encoder_prefill(
     )
 }
 
+/// Persistent GPU buffers for the GPU-resident encoder prefill: allocated once
+/// per prefill, alive across batch boundaries (batch-local allocs are recycled
+/// by the pool at every `batch.end()`, so cross-batch tensors must live here).
+pub struct PrefillResidentBufs {
+    /// Layer input/output hidden-state ping-pong, `[seq, hidden]` f32 each.
+    pub hidden: [objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>; 2],
+    /// Post-attention residual stream (the MoE input), `[seq, hidden]`.
+    pub stream: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+    /// Dense-FF branch after post_ff_norm_1, `[seq, hidden]`.
+    pub ff: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+    len: usize,
+}
+
+impl PrefillResidentBufs {
+    pub fn new(engine: &mut GpuDecoderEngine, seq_len: usize, hidden: usize) -> Result<Self, Error> {
+        let len = seq_len * hidden;
+        let bytes = len * 4;
+        let mut alloc = || {
+            engine
+                .pool
+                .allocate(&engine.ctx.device, bytes)
+                .ok_or(Error::Format("prefill resident buffer alloc failed"))
+        };
+        Ok(Self {
+            hidden: [alloc()?, alloc()?],
+            stream: alloc()?,
+            ff: alloc()?,
+            len,
+        })
+    }
+
+    /// Upload the embedding output into the layer-0 input buffer.
+    pub fn upload_hidden(&self, idx: usize, data: &[f32]) -> Result<(), Error> {
+        if data.len() != self.len {
+            return Err(Error::Format("prefill resident hidden size mismatch"));
+        }
+        crate::metal::buffer::BufferPool::write_f32(&self.hidden[idx], data);
+        Ok(())
+    }
+
+    /// Return the buffers to the pool at end of prefill.
+    pub fn release(self, engine: &mut GpuDecoderEngine) {
+        let bytes = self.len * 4;
+        let [h0, h1] = self.hidden;
+        for buf in [h0, h1, self.stream, self.ff] {
+            engine.pool.release(bytes, buf);
+        }
+    }
+}
+
+/// GPU-resident causal prefill layer: identical kernels and dispatch order to
+/// `forward_encoder_prefill` + `forward_layer_ff_dgq_gpu` (bit-identical KV and
+/// hidden), but the hidden state never leaves the GPU. Two syncs per layer —
+/// the router flush (~32 KB) and the MoE/combine batch end (no readback) —
+/// instead of four syncs with ~3.5 MiB of hidden-state round-trips.
+///
+/// Input hidden is `bufs.hidden[in_idx]`; output is written to
+/// `bufs.hidden[1 - in_idx]`. `.dgq` + GPU-MoE only (the production configuration).
+#[allow(clippy::too_many_arguments)]
+pub fn forward_encoder_prefill_resident(
+    bufs: &PrefillResidentBufs,
+    in_idx: usize,
+    cached: &GpuLayerWeightCache,
+    expert_cache: &GpuDecoderWeightCache,
+    cfg: &TextConfig,
+    layer: usize,
+    seq_len: usize,
+    positions: &[i64],
+    // Tiny reusable scratch (the full GpuDecoderLayerScratch allocates CPU
+    // attention/MoE buffers this GPU-resident path never touches).
+    rope_freqs: &mut Vec<f32>,
+    token_indices: &mut Vec<u32>,
+    engine: &mut GpuDecoderEngine,
+    gpu_kv: &GpuKvCache,
+) -> Result<(), Error> {
+    use crate::kernels::cpu::{compute_rope_freqs, rope_kind_for_layer};
+    use crate::metal::attention_batch::dispatch_copy_f32_to_buf;
+    use crate::metal::decoder_attention::encode_fused_gpu_kv_attention_buf;
+    use crate::metal::moe::{build_scatter_lists, experts_forward_gpu_grouped_in_batch_buf};
+    use crate::model::attention::GqaMask;
+
+    let layer_entry = std::time::Instant::now();
+    let hidden_size = cfg.hidden_size;
+    let eps = cfg.rms_norm_eps as f32;
+    let len = seq_len * hidden_size;
+    let experts = cfg.num_experts;
+    let top_k = cfg.top_k_experts;
+    let params = AttentionParams::for_layer(cfg, layer)?;
+
+    assert_eq!(gpu_kv.kv_len, 0);
+    let rope_kind = rope_kind_for_layer(cfg, layer).ok_or(Error::Format("rope kind"))?;
+    rope_freqs.clear();
+    rope_freqs.resize(seq_len * params.rotary_dim, 0.0);
+    compute_rope_freqs(rope_freqs, positions, rope_kind);
+
+    let k_canvas_off = gpu_kv.canvas_k_elem_offset(layer)?;
+    let kv_suffix_elems = seq_len * params.n_kv_heads * params.head_dim;
+    let kv_suffix_byte_off = k_canvas_off * std::mem::size_of::<f32>();
+    let (k_buf, v_buf) = gpu_kv.layer_buffers(layer)?;
+
+    let telemetry = engine.batch_telemetry();
+
+    // ---- Batch A: attention + dense FF + router; readback = routes only ----
+    let mut batch = begin_engine_batch(
+        &engine.ctx.queue,
+        &mut engine.pool,
+        &engine.ctx.device,
+        telemetry.clone(),
+    )?;
+    let buf_hidden = &bufs.hidden[in_idx];
+    let buf_attn = encode_fused_gpu_kv_attention_buf(
+        &mut batch,
+        &engine.kernels,
+        &engine.attention,
+        &engine.sampler_kernels.copy_f32,
+        &engine.f32_bf16_linear_pipeline,
+        &engine.f32_q4_linear_pipeline,
+        &engine.f32_nvfp4_linear_pipeline,
+        &engine.f32_q8_linear_pipeline,
+        buf_hidden,
+        cached,
+        seq_len,
+        hidden_size,
+        eps,
+        &params,
+        rope_freqs,
+        k_buf,
+        v_buf,
+        k_canvas_off,
+        kv_suffix_byte_off,
+        kv_suffix_elems,
+        seq_len,
+        GqaMask::CausalSliding,
+        &cached.o_proj,
+    )?;
+    let t_attn_encoded = std::time::Instant::now();
+    // Dense FF — mirrors forward_layer_ff_dgq_gpu's first batch exactly.
+    let buf_stream = bk::rms_norm_rows_gpu_buf(
+        &mut batch,
+        &engine.kernels,
+        &buf_attn,
+        cached.post_attn_norm.as_slice(),
+        seq_len,
+        hidden_size,
+        eps,
+    )?;
+    bk::vec_add_gpu_bufs(&mut batch, &engine.kernels, &buf_stream, buf_hidden, len)?;
+    let buf_normed = bk::rms_norm_rows_gpu_buf(
+        &mut batch,
+        &engine.kernels,
+        &buf_stream,
+        cached.pre_ff_norm.as_slice(),
+        seq_len,
+        hidden_size,
+        eps,
+    )?;
+    let buf_gate = linear_cached_batched_in_buf(
+        &mut batch,
+        &engine.f32_bf16_linear_pipeline,
+        &engine.f32_q4_linear_pipeline,
+        &engine.f32_nvfp4_linear_pipeline,
+        &engine.f32_q8_linear_pipeline,
+        &buf_normed,
+        &cached.mlp_gate,
+        seq_len,
+    )?;
+    let buf_up = linear_cached_batched_in_buf(
+        &mut batch,
+        &engine.f32_bf16_linear_pipeline,
+        &engine.f32_q4_linear_pipeline,
+        &engine.f32_nvfp4_linear_pipeline,
+        &engine.f32_q8_linear_pipeline,
+        &buf_normed,
+        &cached.mlp_up,
+        seq_len,
+    )?;
+    let act_len = seq_len * cached.mlp_gate.out_dim();
+    bk::gelu_pytorch_tanh_gpu_buf(&mut batch, &engine.kernels, &buf_gate, act_len)?;
+    bk::swiglu_mul_gpu_bufs(&mut batch, &engine.kernels, &buf_gate, &buf_up, act_len)?;
+    let buf_down = linear_cached_batched_in_buf(
+        &mut batch,
+        &engine.f32_bf16_linear_pipeline,
+        &engine.f32_q4_linear_pipeline,
+        &engine.f32_nvfp4_linear_pipeline,
+        &engine.f32_q8_linear_pipeline,
+        &buf_gate,
+        &cached.mlp_down,
+        seq_len,
+    )?;
+    let buf_ff = bk::rms_norm_rows_gpu_buf(
+        &mut batch,
+        &engine.kernels,
+        &buf_down,
+        cached.post_ff_norm_1.as_slice(),
+        seq_len,
+        hidden_size,
+        eps,
+    )?;
+    let t_dense_encoded = std::time::Instant::now();
+    let mut route_scratch = GpuRouteScratch::new(seq_len, top_k);
+    route_gpu_in_batch(
+        &mut batch,
+        &engine.kernels,
+        &engine.f32_f32_linear_pipeline.pipeline,
+        &buf_stream,
+        cached,
+        cfg,
+        seq_len,
+        &mut route_scratch,
+    )?;
+    // Persist the two tensors batch B needs (batch-local bufs are recycled at end()).
+    dispatch_copy_f32_to_buf(
+        &mut batch,
+        &engine.sampler_kernels.copy_f32,
+        &buf_stream,
+        &bufs.stream,
+        0,
+        len,
+    );
+    dispatch_copy_f32_to_buf(
+        &mut batch,
+        &engine.sampler_kernels.copy_f32,
+        &buf_ff,
+        &bufs.ff,
+        0,
+        len,
+    );
+    let phase_a_started = std::time::Instant::now();
+    batch.end()?;
+    let phase_a = phase_a_started.elapsed();
+
+    let routes = route_scratch.into_routes(seq_len, top_k);
+    let jobs = build_expert_jobs(&routes, experts);
+    if let Some(cell) = &telemetry {
+        cell.borrow_mut().record_expert_layer(layer, jobs.len(), cfg);
+    }
+
+    // ---- Batch B: MoE + scatter + combine + layer_scalar; no readback ----
+    let mut batch = begin_engine_batch(
+        &engine.ctx.queue,
+        &mut engine.pool,
+        &engine.ctx.device,
+        telemetry,
+    )?;
+    let buf_arena = experts_forward_gpu_grouped_in_batch_buf(
+        &mut batch,
+        &bufs.stream,
+        cached.pre_ff_norm_2.as_slice(),
+        eps,
+        expert_cache,
+        layer,
+        cfg,
+        seq_len,
+        &jobs,
+        token_indices,
+        &engine.kernels,
+        &engine.f32_q4_linear_grouped_pipeline,
+        &engine.f32_nvfp4_linear_grouped_pipeline,
+    )?;
+    let buf_moe = match buf_arena {
+        Some(arena) => {
+            let (rows, weights) = build_scatter_lists(&jobs, seq_len, top_k);
+            bk::scatter_rows_weighted_gpu(
+                &mut batch,
+                &engine.kernels,
+                &arena,
+                &rows,
+                &weights,
+                seq_len,
+                hidden_size,
+                top_k,
+            )?
+        }
+        // No routed work: the classic path's moe_branch is all-zero.
+        None => batch.alloc_f32_out(len)?,
+    };
+    let buf_moe_n = bk::rms_norm_rows_gpu_buf(
+        &mut batch,
+        &engine.kernels,
+        &buf_moe,
+        cached.post_ff_norm_2.as_slice(),
+        seq_len,
+        hidden_size,
+        eps,
+    )?;
+    bk::vec_add_gpu_bufs(&mut batch, &engine.kernels, &bufs.ff, &buf_moe_n, len)?;
+    let buf_out = bk::rms_norm_rows_gpu_buf(
+        &mut batch,
+        &engine.kernels,
+        &bufs.ff,
+        cached.post_ff_norm.as_slice(),
+        seq_len,
+        hidden_size,
+        eps,
+    )?;
+    bk::vec_add_gpu_bufs(&mut batch, &engine.kernels, &buf_out, &bufs.stream, len)?;
+    // GPU analog of the CPU `out[i] *= layer_scalar` epilogue (same f32 multiply).
+    bk::vec_scale_gpu_buf(&mut batch, &engine.kernels, &buf_out, len, cached.layer_scalar)?;
+    dispatch_copy_f32_to_buf(
+        &mut batch,
+        &engine.sampler_kernels.copy_f32,
+        &buf_out,
+        &bufs.hidden[1 - in_idx],
+        0,
+        len,
+    );
+    let phase_b_started = std::time::Instant::now();
+    batch.end()?;
+    if std::env::var("DGQ_PREFILL_PROFILE").is_ok() {
+        eprintln!(
+            "  prefill layer {layer}: encAttn={:.1?} encDense={:.1?} encRoute={:.1?} waitA={phase_a:.1?} encB={:.1?} waitB={:.1?} jobs={}",
+            t_attn_encoded - layer_entry,
+            t_dense_encoded - t_attn_encoded,
+            phase_a_started - t_dense_encoded,
+            phase_b_started - (phase_a_started + phase_a),
+            phase_b_started.elapsed(),
+            jobs.len(),
+        );
+    }
+    Ok(())
+}
+
 pub fn forward_encoder_extend(
     out: &mut [f32],
     hidden_states: &[f32],
