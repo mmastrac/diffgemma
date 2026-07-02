@@ -50,12 +50,12 @@ kernel void sc_softembed(
     if (K_QUANT_FORMAT == QUANT_RAW) {
         device const ushort *emb = (device const ushort *)(blob + w_off);
         for (uint v = 0; v < vocab; ++v) {
-            float p = exp(arena_load(lr, v) - mx) / sum;
+            float p = exp(arena_load_bf16(lr, v) - mx) / sum;
             acc += p * bf16_to_f32(emb[(ulong)v * hidden + d]);
         }
     } else {  // QUANT_Q8 / inert: per-row q8 dequant
         for (uint v = 0; v < vocab; ++v) {
-            float p = exp(arena_load(lr, v) - mx) / sum;
+            float p = exp(arena_load_bf16(lr, v) - mx) / sum;
             device const uchar *row = blob + w_off + (ulong)v * q8_row_bytes(hidden);
             acc += p * q8_at(row, d, bf16_bytes(row));
         }

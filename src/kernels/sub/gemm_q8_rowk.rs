@@ -144,7 +144,20 @@ pub fn gpu(f: &Fixture, _variant: super::KernelVariant) -> Result<Vec<f32>, Erro
         .ok_or(Error::Format("alloc"))?;
     BufferPool::write_bf16(&buf_x, &bf16::f32_slice_to_bf16_bits(&f.x));
     BufferPool::write_bytes(&buf_w, &w_q8);
-    let (grid, tg) = gemm_common::dispatch_shape(f.m, f.n);
+    // gemm_q8_rowk is hardcoded to 32x32 tiles (tgid.{x,y} * 32) — production
+    // dispatches div_up(n,32) x div_up(m,32). gemm_common::dispatch_shape's
+    // 128-wide n-tile left columns 32..127 of each block unwritten (the
+    // long-standing cos~0.34 harness failure).
+    let grid = objc2_metal::MTLSize {
+        width: f.n.div_ceil(32),
+        height: f.m.div_ceil(32),
+        depth: 1,
+    };
+    let tg = objc2_metal::MTLSize {
+        width: 128,
+        height: 1,
+        depth: 1,
+    };
     let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
     let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
     enc.setComputePipelineState(&pipeline.pipeline);

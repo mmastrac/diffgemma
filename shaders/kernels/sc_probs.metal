@@ -36,6 +36,6 @@ kernel void sc_probs(
     // SC_PROB_GEMM_SCALE keeps a near-uniform prob out of fp16's denormal range
     // (sc_prob_scale.metal); the GEMM caller (x_fp16=true) divides it back out.
     for (uint v = lid; v < cols; v += tpg) {
-        ((device half *)probs)[(ulong)row * cols + v] = half((exp(arena_load(lr, v) - mx) / sum) * SC_PROB_GEMM_SCALE);
+        ((device half *)probs)[(ulong)row * cols + v] = half((exp(arena_load_bf16(lr, v) - mx) / sum) * SC_PROB_GEMM_SCALE);
     }
 }
