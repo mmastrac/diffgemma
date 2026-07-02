@@ -4442,7 +4442,12 @@ fn run_generate_monolithic_cmd(
         }
     };
     let prompt_len = prompt.len();
-    let max_seq = (prompt_len + max_new_tokens).max(512);
+    // Each denoise block places a CANVAS-wide (256) canvas at [kv_len..kv_len+CANVAS]
+    // and writes its K/V there, so the cache must hold prompt + all generated tokens
+    // PLUS one canvas block of headroom. Omitting the +CANVAS silently overflowed the
+    // KV region for prompts >256 tokens (kv_len+256 > max_seq), corrupting attention
+    // into word-salad. See run_chat_cmd's roomy CHAT_MAX_SEQ for the same reasoning.
+    let max_seq = (prompt_len + max_new_tokens + metal::CANVAS).max(512);
 
     let layers = match resolve_model_layers(model_dir, max_layers) {
         Ok(n) => n,
@@ -4564,7 +4569,12 @@ fn run_generate_monolithic_parity_cmd(
         }
     };
     let prompt_len = prompt.len();
-    let max_seq = (prompt_len + max_new_tokens).max(512);
+    // Each denoise block places a CANVAS-wide (256) canvas at [kv_len..kv_len+CANVAS]
+    // and writes its K/V there, so the cache must hold prompt + all generated tokens
+    // PLUS one canvas block of headroom. Omitting the +CANVAS silently overflowed the
+    // KV region for prompts >256 tokens (kv_len+256 > max_seq), corrupting attention
+    // into word-salad. See run_chat_cmd's roomy CHAT_MAX_SEQ for the same reasoning.
+    let max_seq = (prompt_len + max_new_tokens + metal::CANVAS).max(512);
     let prompt_label = prompt_text.clone().unwrap_or_else(|| format!("prompt_len={prompt_len}"));
 
     let gen_cfg = generate::GenerateConfig {
