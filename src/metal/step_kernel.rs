@@ -256,6 +256,21 @@ pub fn attn_mma_full_enabled() -> bool {
     }
 }
 
+/// Router-as-GEMM (`DGQ_ROUTER_GEMM=1`, default off): compute the MoE router
+/// logits with the fast bf16 GEMM (scaled-norm(stream) @ router_proj^T) plus a
+/// tiny top-k tail kernel, instead of `moe_router`'s serial per-thread dot
+/// products (~77 GFLOP/s, ~2.4ms/layer = ~70ms/step). Non-bit-identical
+/// (bf16-rounded logits can flip near-tie expert picks) -> quality gate before
+/// default-on.
+pub fn router_gemm_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("DGQ_ROUTER_GEMM")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 /// Per-row entropy cap on sampler accepts (`DGQ_ACCEPT_ROW_CAP=<nats>`, 0/unset
 /// = off = exact MLX prefix rule). Closes the unconditional-first-accept hole
 /// that freezes an uncertain token on flat/creative canvases (the "grebe me"
@@ -839,6 +854,8 @@ struct StepPipelines {
     router: ComputePipeline,
     /// f32 stream input (DGQ_HIDDEN_F32).
     router_hf32: ComputePipeline,
+    /// Top-k tail over precomputed logits (DGQ_ROUTER_GEMM).
+    router_topk: ComputePipeline,
     bucket_count: ComputePipeline,
     bucket_fill: ComputePipeline,
     q4_block_grouped: HashMap<(u32, u32), ComputePipeline>,
@@ -903,6 +920,8 @@ impl StepPipelines {
             (DENSE_FF, HID as u32),
             (2816, DENSE_FF),
             (VOCAB as u32, HID as u32),
+            // Router logits GEMM (DGQ_ROUTER_GEMM): [256, HID] @ router_proj^T[128, HID].
+            (N_EXPERTS as u32, HID as u32),
         ] {
             gemm_q4.insert(
                 (n, k),
@@ -1103,6 +1122,11 @@ impl StepPipelines {
             )?,
             router: crate::kernels::sub::moe_router::pipeline_for(ctx, prod)?,
             router_hf32: crate::kernels::sub::moe_router::pipeline_for_hidden_f32(ctx, prod)?,
+            router_topk: ctx.compile_subkernel(
+                shader_include::include_metal!("kernels/moe_router_topk.metal"),
+                "moe_router_topk",
+                prod,
+            )?,
             bucket_count: crate::kernels::sub::moe_bucket_count::pipeline_for(ctx, prod)?,
             bucket_fill: crate::kernels::sub::moe_bucket_fill::pipeline_for(ctx, prod)?,
             q4_block_grouped,
@@ -2469,29 +2493,64 @@ impl StepEnc<'_> {
             top_k: TOP_K as u32,
             router_hscale: (HID as f32).powf(-0.5),
         };
-        let router_ps = if hidden_f32_enabled() {
-            &self.ps.router_hf32
+        if router_gemm_enabled() {
+            // Router-as-GEMM: xn = rmsnorm_noscale(stream) * router_scale[d]
+            // (exactly what fn rmsnorm computes with w=router_scale; same 1e-6
+            // eps as MOE_ROUTER_RMS_EPS) -> bf16 GEMM against router_proj
+            // (n=128 experts) into the free ffg plane -> top-k tail applies
+            // the uniform router_hscale (linear in the input, so folding it
+            // out of the GEMM is exact up to bf16 logit rounding).
+            let l = &layout.layers[layer];
+            self.rmsnorm(
+                self.arena().stream_off(),
+                self.arena().tmp_off(),
+                l.router_scale,
+                HID as u32,
+                CANVAS,
+            );
+            self.gemm_bf16(
+                self.arena().tmp_off(),
+                self.arena().ffg_off(),
+                l.router_proj,
+                CANVAS as u32,
+                N_EXPERTS as u32,
+                HID as u32,
+            )?;
+            self.sink_set_pipeline(&self.ps.router_topk);
+            self.sink_set_buffer(&self.bufs.arena, self.arena().ffg_off() as usize, 0);
+            self.bind_blob(1);
+            self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 2);
+            self.bind_route(3);
+            self.sink_set_bytes(&router_dims, 4);
+            self.bind_debug_status(5);
+            let grid = MTLSize { width: CANVAS.div_ceil(64), height: 1, depth: 1 };
+            let tg = MTLSize { width: 64, height: 1, depth: 1 };
+            self.sink_dispatch(grid, tg);
         } else {
-            &self.ps.router
-        };
-        self.sink_set_pipeline(router_ps);
-        self.sink_set_buffer(&self.bufs.arena, self.arena().stream_off() as usize, 0);
-        self.bind_blob(1);
-        self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 2);
-        self.bind_route(3);
-        self.sink_set_bytes(&router_dims, 4);
-        self.bind_debug_status(5);
-        let grid = MTLSize {
-            width: CANVAS,
-            height: 1,
-            depth: 1,
-        };
-        let tg = MTLSize {
-            width: 128,
-            height: 1,
-            depth: 1,
-        };
-        self.sink_dispatch(grid, tg);
+            let router_ps = if hidden_f32_enabled() {
+                &self.ps.router_hf32
+            } else {
+                &self.ps.router
+            };
+            self.sink_set_pipeline(router_ps);
+            self.sink_set_buffer(&self.bufs.arena, self.arena().stream_off() as usize, 0);
+            self.bind_blob(1);
+            self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 2);
+            self.bind_route(3);
+            self.sink_set_bytes(&router_dims, 4);
+            self.bind_debug_status(5);
+            let grid = MTLSize {
+                width: CANVAS,
+                height: 1,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            };
+            self.sink_dispatch(grid, tg);
+        }
 
         self.sink_set_pipeline(&self.ps.bucket_count);
         self.bind_route(0);
