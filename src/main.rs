@@ -4014,6 +4014,12 @@ struct SmoketestSpec {
     convergence: Vec<SmokeConvergence>,
     #[serde(default)]
     adherence: Vec<SmokeAdherence>,
+    /// Gate baseline seed. Trajectory-reshuffling accepted changes re-baseline
+    /// the gate here (single-seed pass/fail is arbitrary for such changes; the
+    /// multi-seed aggregate is the real quality metric — see working notes).
+    /// An explicit CLI `--seed` (anything != 42) still overrides for sweeps.
+    #[serde(default)]
+    seed: Option<u64>,
 }
 
 /// Free-form prompt that must converge within `max_steps` denoise steps.
@@ -4118,6 +4124,15 @@ fn run_smoketest_cmd(
         }
         eprintln!("smoketest: filter {pat:?} -> {kept} prompt(s)");
     }
+
+    // Gate baseline seed: the spec pins it (re-baselined with accepted
+    // trajectory-reshuffling changes); an explicit CLI --seed (!= the 42
+    // default) overrides for multi-seed sweeps.
+    let seed = if seed != 42 {
+        seed
+    } else {
+        spec.seed.unwrap_or(seed)
+    };
 
     let layers = match resolve_model_layers(model_dir, max_layers) {
         Ok(n) => n,

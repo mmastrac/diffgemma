@@ -256,18 +256,22 @@ pub fn attn_mma_full_enabled() -> bool {
     }
 }
 
-/// Router-as-GEMM (`DGQ_ROUTER_GEMM=1`, default off): compute the MoE router
-/// logits with the fast bf16 GEMM (scaled-norm(stream) @ router_proj^T) plus a
-/// tiny top-k tail kernel, instead of `moe_router`'s serial per-thread dot
-/// products (~77 GFLOP/s, ~2.4ms/layer = ~70ms/step). Non-bit-identical
-/// (bf16-rounded logits can flip near-tie expert picks) -> quality gate before
-/// default-on.
+/// Router-as-GEMM (default ON; `DGQ_ROUTER_GEMM=0` opts out): compute the MoE
+/// router logits with the fast bf16 GEMM (scaled-norm(stream) @ router_proj^T)
+/// plus a tiny top-k tail kernel, instead of `moe_router`'s serial per-thread
+/// dot products (~77 GFLOP/s, ~2.4ms/layer = ~70ms/step). ~30ms/step (2.5%).
+/// Non-bit-identical: bf16-rounded logits flip near-tie expert picks (a
+/// trajectory re-roll, not a bias). Accepted 2026-07-02 (user sign-off) on
+/// multi-seed evidence: gate aggregate 44/51 vs baseline 46/51 across seeds
+/// {42, 7, 123} (baseline itself lands 12/17 at seed 123), greentext wart
+/// census 2-3/10 vs baseline 4/10. Gate seed re-baselined alongside (see
+/// fixtures/smoketest/prompts.json).
 pub fn router_gemm_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var("DGQ_ROUTER_GEMM")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true)
     })
 }
 
