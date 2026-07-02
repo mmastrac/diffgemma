@@ -93,12 +93,27 @@ fn load_attn_ffn_linear(
         .and_then(|e| crate::dgq::layout::parse_quant_kind(&e.meta.kind).ok());
     match kind {
         Some(crate::dgq::layout::QuantKind::Raw) => {
-            // bf16 (mixed-precision attention/FFN): materialize a resident bf16 view.
+            // bf16 (mixed-precision attention/FFN): bind straight from the
+            // GPU-resident blob at a byte offset — skips both the bf16→f32→bf16
+            // CPU materialization at load AND the ~130 MB/layer first-dispatch
+            // upload (which dominated one-shot engine prefill). Same weight
+            // bytes + same kernel → bit-identical output. Misaligned offsets
+            // (never expected from the .dgq writer) fall back to the copy path.
             let entry = store
                 .get_entry(name)
                 .ok_or_else(|| Error::NotFound(name.to_string()))?;
             let out = entry.meta.shape[0] as usize;
             let inp = entry.meta.shape[1] as usize;
+            if entry.meta.offset % 4 == 0 {
+                return Ok(GpuLinearWeight::Bf16Blob(
+                    crate::metal::linear::Bf16BlobLinear {
+                        buffer: blob.buffer.clone(),
+                        byte_offset: entry.meta.offset,
+                        out_dim: out,
+                        in_dim: inp,
+                    },
+                ));
+            }
             let f32 = raw_blob_bf16_to_f32(&load_raw_view(store, blob, name)?)?;
             Ok(GpuLinearWeight::Bf16(CachedLinear::from_f32(f32.as_slice(), out, inp)))
         }

@@ -281,6 +281,47 @@ impl<'a> GpuBatch<'a> {
         Self::dispatch_matmul(self.encoder(), pipeline, buf_a, buf_w, buf_c, m, n, k);
     }
 
+    /// `dispatch_linear` with the weight bound at a byte offset (bf16 weights
+    /// read straight from the resident `.dgq` blob — no upload).
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_linear_w_off(
+        &self,
+        pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+        buf_a: &ProtocolObject<dyn MTLBuffer>,
+        buf_w: &ProtocolObject<dyn MTLBuffer>,
+        w_byte_offset: u64,
+        buf_c: &ProtocolObject<dyn MTLBuffer>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        const THREADGROUP: usize = 16;
+        let encoder = self.encoder();
+        encoder.setComputePipelineState(pipeline);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(buf_a), 0, 0);
+            encoder.setBuffer_offset_atIndex(
+                Some(buf_w),
+                crate::dgq::layout::blob_offset_for_mtl(w_byte_offset),
+                1,
+            );
+            encoder.setBuffer_offset_atIndex(Some(buf_c), 0, 2);
+        }
+        let dims = [m as u32, n as u32, k as u32];
+        set_bytes(encoder, &dims, 3);
+        let tg = MTLSize {
+            width: THREADGROUP,
+            height: THREADGROUP,
+            depth: 1,
+        };
+        let grid = MTLSize {
+            width: div_up(n, THREADGROUP),
+            height: div_up(m, THREADGROUP),
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    }
+
     /// `C[M,N] = A[M,K] @ W[N,K]^T` with Q4 weights at `buf_w` + byte offset.
     pub fn dispatch_q4_linear(
         &self,

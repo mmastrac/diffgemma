@@ -12,11 +12,23 @@ use objc2_metal::{MTLBuffer, MTLDevice};
 /// GPU linear weight: bf16 upload path (safetensors) or q4 blob view (`.dgq`).
 pub enum GpuLinearWeight {
     Bf16(CachedLinear),
+    /// bf16 (`Raw`) weight bound straight from the GPU-resident `.dgq` blob at a
+    /// byte offset — no CPU materialization at load and no per-weight GPU upload
+    /// at first dispatch (the ~130 MB/layer that dominated one-shot engine prefill).
+    Bf16Blob(Bf16BlobLinear),
     Q4(Q4LinearGpu),
     /// q8 blob view (`.dgq` mixed-precision attention/FFN). Held by the CPU
     /// experts-reference cache, which never GPU-dispatches these — the monolithic
     /// forward reads them straight from the blob.
     Q8(Q8LinearGpu),
+}
+
+/// bf16 weight view into the resident `.dgq` blob (PyTorch `[out,in]` layout).
+pub struct Bf16BlobLinear {
+    pub buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub byte_offset: u64,
+    pub out_dim: usize,
+    pub in_dim: usize,
 }
 
 impl GpuLinearWeight {
@@ -35,6 +47,7 @@ impl GpuLinearWeight {
     pub fn in_dim(&self) -> usize {
         match self {
             Self::Bf16(w) => w.in_dim,
+            Self::Bf16Blob(w) => w.in_dim,
             Self::Q4(w) => w.in_dim,
             Self::Q8(w) => w.in_dim,
         }
@@ -43,6 +56,7 @@ impl GpuLinearWeight {
     pub fn out_dim(&self) -> usize {
         match self {
             Self::Bf16(w) => w.out_dim,
+            Self::Bf16Blob(w) => w.out_dim,
             Self::Q4(w) => w.out_dim,
             Self::Q8(w) => w.out_dim,
         }
@@ -153,6 +167,20 @@ pub fn linear_batched_in_buf(
                 &bf16_pipeline.pipeline,
                 x_buf,
                 &buf_w,
+                &buf_c,
+                seq_len,
+                w.out_dim(),
+                w.in_dim(),
+            );
+            Ok(buf_c)
+        }
+        GpuLinearWeight::Bf16Blob(view) => {
+            let buf_c = batch.alloc_f32_out(out_len)?;
+            batch.dispatch_linear_w_off(
+                &bf16_pipeline.pipeline,
+                x_buf,
+                &view.buffer,
+                view.byte_offset,
                 &buf_c,
                 seq_len,
                 w.out_dim(),
