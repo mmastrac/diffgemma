@@ -63,17 +63,21 @@ inline void dequant_q4_group_half_tg_range(
     }
 }
 
-/// Load one 32×32 activation K-tile (f32 activations) with all 128 threads.
+/// Load one tile_rows×32 activation K-tile (f32 activations) with all 128
+/// threads. `tile_rows` is the storage tile height (compile-time GEMM_M_TILE at
+/// call sites); rows in [M_tile, tile_rows) are zero-filled, rows >= tile_rows
+/// are never touched (nor read by the matching MMA mapping).
 inline void gemm_load_a_tile_f32(
     device const float *a,
     uint M_tile,
+    uint tile_rows,
     uint K,
     uint row0,
     uint k0,
     uint ltid,
     threadgroup half tx[32][32]
 ) {
-    for (uint i = ltid; i < 32u * 32u; i += 128u) {
+    for (uint i = ltid; i < tile_rows * 32u; i += 128u) {
         const uint mm = i / 32u;
         const uint kk = i % 32u;
         tx[mm][kk] = (mm < M_tile)
@@ -91,13 +95,14 @@ inline void gemm_load_a_tile_gather_bf16(
     device const ushort *moein,
     device const uint *token_list,
     uint M_tile,
+    uint tile_rows,
     uint K,
     uint row0,
     uint k0,
     uint ltid,
     threadgroup half tx[32][32]
 ) {
-    for (uint i = ltid; i < 32u * 32u; i += 128u) {
+    for (uint i = ltid; i < tile_rows * 32u; i += 128u) {
         const uint mm = i / 32u;
         const uint kk = i % 32u;
         if (mm < M_tile) {

@@ -80,6 +80,59 @@ impl MetalContext {
             x_fp16,
             false,
             false,
+            false,
+        )
+    }
+
+    /// As `compile_gemm_subkernel` but sets GEMM_M_ADAPT (FC32) — the
+    /// block-sparse MoE pipeline picks the smallest simdgroup M-mapping
+    /// (8/16/32 rows) per block at runtime (DGQ_MOE_TILE_ADAPT).
+    pub fn compile_gemm_subkernel_adaptive(
+        &self,
+        source: &str,
+        entry: &str,
+        gemm_n: u32,
+        gemm_k: u32,
+        quant_format: u32,
+    ) -> Result<ComputePipeline, Error> {
+        let library = self.compile_library(source)?;
+        Self::compile_gemm_subkernel_on_device(
+            &self.device,
+            &library,
+            entry,
+            gemm_n,
+            gemm_k,
+            false,
+            quant_format,
+            false,
+            false,
+            false,
+            true,
+        )
+    }
+
+    /// GATHER_A + GEMM_M_ADAPT combined (adaptive fused-gather MoE gate_up).
+    pub fn compile_gemm_subkernel_gather_adaptive(
+        &self,
+        source: &str,
+        entry: &str,
+        gemm_n: u32,
+        gemm_k: u32,
+        quant_format: u32,
+    ) -> Result<ComputePipeline, Error> {
+        let library = self.compile_library(source)?;
+        Self::compile_gemm_subkernel_on_device(
+            &self.device,
+            &library,
+            entry,
+            gemm_n,
+            gemm_k,
+            false,
+            quant_format,
+            false,
+            true,
+            false,
+            true,
         )
     }
 
@@ -105,6 +158,7 @@ impl MetalContext {
             false,
             false,
             true,
+            false,
         )
     }
 
@@ -129,6 +183,7 @@ impl MetalContext {
             quant_format,
             false,
             true,
+            false,
             false,
         )
     }
@@ -313,6 +368,7 @@ impl MetalContext {
         x_fp16: bool,
         gather_a: bool,
         out_bf16: bool,
+        m_adapt: bool,
     ) -> Result<ComputePipeline, Error> {
         let variant = crate::kernels::sub::variant::runtime_step_variant();
         let fc = MTLFunctionConstantValues::new();
@@ -392,13 +448,20 @@ impl MetalContext {
                     29,
                 );
             }
+            if m_adapt {
+                fc.setConstantValue_type_atIndex(
+                    std::ptr::NonNull::from_ref(&m_adapt).cast(),
+                    MTLDataType::Bool,
+                    32,
+                );
+            }
         }
         let name = NSString::from_str(entry);
         let function = library
             .newFunctionWithName_constantValues_error(&name, &fc)
             .map_err(|e| shader_compile_error(e))?;
         let label = format!(
-            "{entry}_qf{quant_format}_n{gemm_n}_k{gemm_k}_nt{gemm_n_tile}_xfp16{}_sa{}_df{}_dd{}_g{}_a{}_o{}",
+            "{entry}_qf{quant_format}_n{gemm_n}_k{gemm_k}_nt{gemm_n_tile}_xfp16{}_sa{}_df{}_dd{}_g{}_a{}_o{}_ad{}",
             u8::from(x_fp16),
             u8::from(shape_assert),
             u8::from(debug_fast),
@@ -406,6 +469,7 @@ impl MetalContext {
             u8::from(gather_a),
             u8::from(variant.act_f16),
             u8::from(out_bf16),
+            u8::from(m_adapt),
         );
         let cache = PipelineArchiveCache::shared(device)?;
         let pipeline = cache.compile_compute(device, &function, &label)?;

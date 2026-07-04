@@ -10,7 +10,7 @@ kernel exist / merge / change dtype"; re-audit when a family gains members.
 |---|---|---|---|
 | dense GEMMs (qkv / o_proj / FFN, `gemm_block*`) | ~380 | 1.8–2.3 TF/s ≈ peak | at the wall |
 | attention (`attention_mma2` / `attention_mma_full`) | ~190 | attention-typical | tuned levers disproven; window-clipped ≥1024 |
-| MoE experts (`gemm_block_sparse` + scatter) | ~315 | 1.3 TF/s, tiny-M-bound | ONLY remaining perf chunk (see PLAN / task queue) |
+| MoE experts (`gemm_block_sparse` + scatter) | ~315 | ~2.3 TF/s on USEFUL flops ≈ dense wall | at the wall; M-tile levers disproven (see below) |
 | SC preamble (`sc_sparse_*`, SC MLP q8, rowstats) | ~165 | occupancy-bound | tiling levers disproven |
 | finish (lm_head `gemm_block` Raw, softcap, sampler) | ~150 | at flops bound | at the wall |
 | router (`gemm_block` + `moe_router_topk`) | ~22 | occupancy-limited N=128 | accepted (was 69 ms serial-dot) |
@@ -63,7 +63,32 @@ q4/nvfp4 (QUANT_FORMAT), sc_softembed bf16 variant.
 - `scatter_vocab_chunk`: validation placeholder.
 - Env-gated graveyard (keep, documented as disproven): partial-lm trio
   (`compact_active_rows`, `scatter_logits_rows`, partial lm_head path),
-  `DGQ_ACCEPT_ROW_CAP`, `DGQ_HIDDEN_F32`.
+  `DGQ_ACCEPT_ROW_CAP`, `DGQ_HIDDEN_F32`, `DGQ_MOE_TILE_ADAPT` (below).
+
+## MoE tiny-M investigation (2026-07-02) — CLOSED, no lever
+
+The old "1.3 TF/s tiny-M-bound" verdict was stale (isolated `bench-gemm` M=33
+numbers, not the production step). Measured on the production step: useful MoE
+flops = 24.5 GFLOP/layer at ~10.5 ms/layer = **~2.3 TF/s useful ≈ the
+dense-GEMM wall** — there was never a 60-90 ms chunk to recover.
+
+Two implementations built and measured (routing IS heavily skewed — step-1
+sample: 38-71 active experts of 128, median m_e≈6, +59% padded rows at 32-row
+tiles — the padding is real, it just isn't on the critical path):
+
+- **M-tile classes** (3 pipelines, 32/16/8-row tails, class-partitioned block
+  list): ~4% SLOWER. Cause isolated with an all-C32 diagnostic: the extra
+  indirect dispatches cost ~0.12 ms each even at ZERO height (~0.5 ms/layer
+  for 4 empty dispatches) — Metal hazard tracking serializes same-buffer
+  dispatches. Machinery removed. **Rule: never split a hot GEMM into multiple
+  same-encoder dispatches on this path.**
+- **Adaptive-M** (`DGQ_MOE_TILE_ADAPT`, kept env-gated default-off): single
+  dispatch, per-block runtime simdgroup remap (8/16/32 rows) — bit-identical
+  (subkernel bitwise tests q4+nvfp4, E2E token-identical on/off). Perf: wash
+  (+~1.5%). Removing 50-75% of the MMA work from ~1/3 of threadgroups moved
+  wall time ~0% → per-TG cost is weight-dequant/fixed-dominated, not
+  MMA-bound. Any future MoE lever must cut per-TG weight traffic (fewer
+  threadgroups touching each expert's rows), not M padding.
 
 ## Test-harness debt
 

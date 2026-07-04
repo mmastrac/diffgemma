@@ -212,6 +212,21 @@ pub fn moe_block_sparse_enabled() -> bool {
     }
 }
 
+/// Adaptive M-tile for the block-sparse MoE GEMMs (GEMM_M_ADAPT): each block's
+/// threadgroup picks the smallest simdgroup M-mapping (8/16/32 rows) covering
+/// its actual row count, killing the MMA padding waste of tiny-M expert tails.
+/// Same block list, same single dispatch, same scheduling; bit-identical per
+/// output element (same K-accumulation chain, only the simdgroup->work mapping
+/// changes). `DGQ_MOE_TILE_ADAPT=1` opts in (bring-up; default off until
+/// verified). Requires block-sparse (auto-off if `DGQ_MOE_BLOCK_SPARSE=0`).
+pub fn moe_tile_adapt_enabled() -> bool {
+    moe_block_sparse_enabled()
+        && match std::env::var("DGQ_MOE_TILE_ADAPT") {
+            Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+            Err(_) => false,
+        }
+}
+
 /// Fuse the MoE gather into the gate_up block-sparse GEMM (A-load reads bf16
 /// `moein` rows via route->token_list). Skips the separate gather pass + its
 /// 23MB/layer f32 round-trip. **Default on** (~28ms/step, bit-identical to
@@ -864,11 +879,13 @@ struct StepPipelines {
     bucket_fill: ComputePipeline,
     q4_block_grouped: HashMap<(u32, u32), ComputePipeline>,
     nvfp4_block_grouped: HashMap<(u32, u32), ComputePipeline>,
-    q4_block_sparse: HashMap<(u32, u32), ComputePipeline>,
-    nvfp4_block_sparse: HashMap<(u32, u32), ComputePipeline>,
-    /// Fused-gather gate_up variant, keyed by (n,k); built only when
+    /// Block-sparse MoE GEMMs, keyed by (n, k, adaptive). adaptive = the
+    /// GEMM_M_ADAPT pipeline (DGQ_MOE_TILE_ADAPT runtime per-block M-mapping).
+    q4_block_sparse: HashMap<(u32, u32, bool), ComputePipeline>,
+    nvfp4_block_sparse: HashMap<(u32, u32, bool), ComputePipeline>,
+    /// Fused-gather gate_up variant, keyed by (n,k,adaptive); built only when
     /// DGQ_MOE_FUSE_GATHER is on. Q4 only (the production MoE format).
-    block_sparse_gather: HashMap<(u32, u32), ComputePipeline>,
+    block_sparse_gather: HashMap<(u32, u32, bool), ComputePipeline>,
     gather_rows: ComputePipeline,
     gather_rows_bf16_to_f32: ComputePipeline,
     gelu_swiglu_gate_up: ComputePipeline,
@@ -1035,7 +1052,7 @@ impl StepPipelines {
             // Only gate_up gathers (down's A is the swiglu output, not gathered).
             let (n, k) = (MOE_FF * 2, HID as u32);
             block_sparse_gather.insert(
-                (n, k),
+                (n, k, false),
                 crate::kernels::sub::gemm_block_sparse::pipeline_for_gather(
                     ctx,
                     n,
@@ -1043,6 +1060,17 @@ impl StepPipelines {
                     crate::kernels::sub::QuantFormat::Q4Affine,
                 )?,
             );
+            if moe_tile_adapt_enabled() {
+                block_sparse_gather.insert(
+                    (n, k, true),
+                    crate::kernels::sub::gemm_block_sparse::pipeline_for_gather_adaptive(
+                        ctx,
+                        n,
+                        k,
+                        crate::kernels::sub::QuantFormat::Q4Affine,
+                    )?,
+                );
+            }
         }
         for &(n, k) in &[(MOE_FF * 2, HID as u32), (HID as u32, MOE_FF)] {
             q4_block_grouped.insert(
@@ -1064,7 +1092,7 @@ impl StepPipelines {
                 )?,
             );
             q4_block_sparse.insert(
-                (n, k),
+                (n, k, false),
                 crate::kernels::sub::gemm_block_sparse::pipeline_for(
                     ctx,
                     n,
@@ -1073,7 +1101,7 @@ impl StepPipelines {
                 )?,
             );
             nvfp4_block_sparse.insert(
-                (n, k),
+                (n, k, false),
                 crate::kernels::sub::gemm_block_sparse::pipeline_for(
                     ctx,
                     n,
@@ -1081,6 +1109,26 @@ impl StepPipelines {
                     crate::kernels::sub::QuantFormat::NvFp4,
                 )?,
             );
+            if moe_tile_adapt_enabled() {
+                q4_block_sparse.insert(
+                    (n, k, true),
+                    crate::kernels::sub::gemm_block_sparse::pipeline_for_adaptive(
+                        ctx,
+                        n,
+                        k,
+                        crate::kernels::sub::QuantFormat::Q4Affine,
+                    )?,
+                );
+                nvfp4_block_sparse.insert(
+                    (n, k, true),
+                    crate::kernels::sub::gemm_block_sparse::pipeline_for_adaptive(
+                        ctx,
+                        n,
+                        k,
+                        crate::kernels::sub::QuantFormat::NvFp4,
+                    )?,
+                );
+            }
         }
         let prod = variant;
         let dump = crate::kernels::sub::variant::KernelVariant::TEST_DUMP;
@@ -1266,11 +1314,13 @@ impl StepPipelines {
             .ok_or(Error::Format("missing block_grouped pipeline"))
     }
 
+    /// Block-sparse pipeline; `adaptive` = GEMM_M_ADAPT (DGQ_MOE_TILE_ADAPT).
     fn block_sparse(
         &self,
         format: QuantFormat,
         n: u32,
         k: u32,
+        adaptive: bool,
     ) -> Result<&ComputePipeline, Error> {
         let map = match format {
             QuantFormat::Q4Affine => &self.q4_block_sparse,
@@ -1281,13 +1331,13 @@ impl StepPipelines {
                 ));
             }
         };
-        map.get(&(n, k))
+        map.get(&(n, k, adaptive))
             .ok_or(Error::Format("missing block_sparse pipeline"))
     }
 
     /// Fused-gather gate_up pipeline if built (DGQ_MOE_FUSE_GATHER), else None.
-    fn block_sparse_gather(&self, n: u32, k: u32) -> Option<&ComputePipeline> {
-        self.block_sparse_gather.get(&(n, k))
+    fn block_sparse_gather(&self, n: u32, k: u32, adaptive: bool) -> Option<&ComputePipeline> {
+        self.block_sparse_gather.get(&(n, k, adaptive))
     }
 
     fn moe_scalar(&self, format: QuantFormat) -> &ComputePipeline {
@@ -2597,11 +2647,16 @@ impl StepEnc<'_> {
         gather: bool,
     ) -> Result<(), Error> {
         let block_sparse = moe_block_sparse_enabled();
+        let adaptive = block_sparse && moe_tile_adapt_enabled();
         // Fused-gather gate_up: A-load pulls bf16 `moein` rows via token_list
         // (buffer 7), so no separate gather pass / f32 staging buffer. The caller
         // skips the gather pass iff `gather`; if the pipeline for this shape is
         // missing we'd read a stale A buffer, so fail loud rather than silently.
-        let gather_ps = if gather { self.ps.block_sparse_gather(n, k) } else { None };
+        let gather_ps = if gather {
+            self.ps.block_sparse_gather(n, k, adaptive)
+        } else {
+            None
+        };
         if gather && gather_ps.is_none() {
             return Err(Error::Format(
                 "fused MoE gather requested but no gather pipeline for this shape",
@@ -2611,7 +2666,7 @@ impl StepEnc<'_> {
         let grouped_ps = if let Some(p) = gather_ps {
             p
         } else if block_sparse {
-            self.ps.block_sparse(self.block_profile.format, n, k)?
+            self.ps.block_sparse(self.block_profile.format, n, k, adaptive)?
         } else {
             self.ps.block_grouped(self.block_profile.format, n, k)?
         };

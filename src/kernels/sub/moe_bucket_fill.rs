@@ -176,8 +176,9 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let buf_expert_unique = pool
         .allocate(&ctx.device, std::mem::size_of::<u32>())
         .ok_or(Error::Format("alloc"))?;
+    // 4 grids × 3 u32 (grouped 0/1, block-sparse 2/3).
     let buf_indirect = pool
-        .allocate(&ctx.device, 24)
+        .allocate(&ctx.device, 4 * 3 * std::mem::size_of::<u32>())
         .ok_or(Error::Format("alloc"))?;
     let scratch = scratch_from_fixture(f);
     BufferPool::write_bytes(
@@ -242,4 +243,5 @@ mod tests {
         max_tol = 0.0,
         min_cos = 1.0,
     }
+
 }

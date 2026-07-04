@@ -84,7 +84,7 @@ kernel void gemm_block_grouped(
         // --- Prime: load tile 0 into buffer 0 ---
         {
             const uint k0 = 0u;
-            gemm_load_a_tile_f32(a, M_tile, K, row0, k0, ltid, tx_buf[0u]);
+            gemm_load_a_tile_f32(a, M_tile, GEMM_M_TILE, K, row0, k0, ltid, tx_buf[0u]);
             if (ltid < GEMM_N_TILE) {
                 const uint r = ltid;
                 const uint global_n = n0 + r;
@@ -117,7 +117,7 @@ kernel void gemm_block_grouped(
             // Prefetch next K-tile into `nxt` buffer (if any). Overlaps with MMA above.
             if (ti + 1u < n_k_tiles) {
                 const uint k0 = (ti + 1u) * GEMM_K_TILE;
-                gemm_load_a_tile_f32(a, M_tile, K, row0, k0, ltid, tx_buf[nxt]);
+                gemm_load_a_tile_f32(a, M_tile, GEMM_M_TILE, K, row0, k0, ltid, tx_buf[nxt]);
                 if (ltid < GEMM_N_TILE) {
                     const uint r = ltid;
                     const uint global_n = n0 + r;

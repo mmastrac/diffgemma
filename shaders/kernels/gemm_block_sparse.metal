@@ -55,6 +55,11 @@ kernel void gemm_block_sparse(
     if (M_tile == 0u) {
         return;
     }
+    // Adaptive M (GEMM_M_ADAPT): smallest simdgroup mapping covering this
+    // block's rows (threadgroup-uniform). Legacy pipelines fold to 32.
+    const uint m_map = GEMM_M_ADAPT
+        ? (M_tile <= 8u ? 8u : (M_tile <= 16u ? 16u : 32u))
+        : GEMM_M_TILE;
 
     const uint n0 = tgid.x * GEMM_N_TILE;
     if (n0 >= N) {
@@ -64,7 +69,7 @@ kernel void gemm_block_sparse(
     const GroupedJob job = jobs[e];
     const ulong w_off = job.w_byte_off;
 
-    threadgroup half tx_buf[2u][GEMM_M_TILE][GEMM_K_TILE];
+    threadgroup half tx_buf[2u][GEMM_M_TILE_MAX][GEMM_K_TILE];
     threadgroup half tw_buf[2u][GEMM_N_TILE_MAX][GEMM_K_TILE];
     const uint ltid = lid.x;
 
@@ -89,9 +94,9 @@ kernel void gemm_block_sparse(
     {
         const uint k0 = 0u;
         if (GATHER_A) {
-            gemm_load_a_tile_gather_bf16(moein, route->token_list, M_tile, K, row0, k0, ltid, tx_buf[0u]);
+            gemm_load_a_tile_gather_bf16(moein, route->token_list, M_tile, m_map, K, row0, k0, ltid, tx_buf[0u]);
         } else {
-            gemm_load_a_tile_f32(a, M_tile, K, row0, k0, ltid, tx_buf[0u]);
+            gemm_load_a_tile_f32(a, M_tile, m_map, K, row0, k0, ltid, tx_buf[0u]);
         }
         if (ltid < GEMM_N_TILE) {
             const uint r = ltid;
@@ -116,17 +121,17 @@ kernel void gemm_block_sparse(
         const uint cur = ti & 1u;
         const uint nxt = 1u - cur;
 
-        gemm_block_mma_k32(
-            tx_buf[cur], tw_buf[cur], sgid,
+        gemm_block_mma_k32_adapt(
+            m_map, tx_buf[cur], tw_buf[cur], sgid,
             acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7,
             acc8, acc9, acc10, acc11, acc12, acc13, acc14, acc15);
 
         if (ti + 1u < n_k_tiles) {
             const uint k0 = (ti + 1u) * GEMM_K_TILE;
             if (GATHER_A) {
-                gemm_load_a_tile_gather_bf16(moein, route->token_list, M_tile, K, row0, k0, ltid, tx_buf[nxt]);
+                gemm_load_a_tile_gather_bf16(moein, route->token_list, M_tile, m_map, K, row0, k0, ltid, tx_buf[nxt]);
             } else {
-                gemm_load_a_tile_f32(a, M_tile, K, row0, k0, ltid, tx_buf[nxt]);
+                gemm_load_a_tile_f32(a, M_tile, m_map, K, row0, k0, ltid, tx_buf[nxt]);
             }
             if (ltid < GEMM_N_TILE) {
                 const uint r = ltid;
@@ -149,11 +154,11 @@ kernel void gemm_block_sparse(
     }
 
     threadgroup float (*ty)[GEMM_N_TILE_MAX] = (threadgroup float (*)[GEMM_N_TILE_MAX]) tw_buf;
-    gemm_block_mma_store(
-        ty, sgid, acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7, acc8, acc9, acc10, acc11,
-        acc12, acc13, acc14, acc15);
+    gemm_block_mma_store_adapt(
+        m_map, ty, sgid, acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7, acc8, acc9, acc10,
+        acc11, acc12, acc13, acc14, acc15);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = ltid; i < GEMM_M_TILE * GEMM_N_TILE; i += 128u) {
+    for (uint i = ltid; i < m_map * GEMM_N_TILE; i += 128u) {
         const uint mm = i / GEMM_N_TILE;
         const uint nn = i % GEMM_N_TILE;
         if (mm < M_tile && n0 + nn < N) {
