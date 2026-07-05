@@ -461,6 +461,14 @@ impl GpuDecoderWeightCache {
         }
     }
 
+    /// Expert-region buffer + base offset (region 2 on split blobs).
+    pub fn dgq_expert_region(&self) -> Option<(&ProtocolObject<dyn MTLBuffer>, u64)> {
+        match self {
+            Self::Dgq(d) => Some(d.blob.expert_region()),
+            Self::Bf16(_) => None,
+        }
+    }
+
     pub fn embed_q8(&self) -> Option<&Q8LinearGpu> {
         match self {
             Self::Dgq(d) => d.embed_q8.as_ref(),

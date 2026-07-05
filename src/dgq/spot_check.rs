@@ -63,6 +63,7 @@ pub fn spot_check(
             .ok_or_else(|| Error::NotFound(name.to_string()))?;
         let kind = match entry.meta.kind.as_str() {
             "q4_block" => QuantKind::Q4Block,
+            "q6_block" => QuantKind::Q6Block,
             "nvfp4_block" => QuantKind::Nvfp4Block,
             "q8_row" => QuantKind::Q8Row,
             "raw" => QuantKind::Raw,

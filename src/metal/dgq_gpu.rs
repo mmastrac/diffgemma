@@ -19,7 +19,12 @@ use std::sync::Arc;
 pub struct DgqGpuBlob {
     _file: File,
     _mmap: Mmap,
+    /// Region 1: [0, expert_split) when split, else the whole blob.
     pub buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// Region 2 [expert_split, len) when the blob exceeds max buffer length.
+    pub buffer_experts: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    /// 0 when single-buffer.
+    pub expert_split: u64,
     pub len: usize,
 }
 
@@ -40,22 +45,101 @@ impl DgqGpuBlob {
         let mmap = unsafe { Mmap::map(&file)? };
         let len = mmap.len();
         let ptr = NonNull::new(mmap.as_ptr() as *mut c_void).ok_or(Error::Format("dgq mmap null"))?;
+        let max_buf = device.maxBufferLength();
+        if len <= max_buf {
+            let buffer = unsafe {
+                device
+                    .newBufferWithBytesNoCopy_length_options_deallocator(
+                        ptr,
+                        len,
+                        MTLResourceOptions::StorageModeShared,
+                        None,
+                    )
+                    .ok_or(Error::Format("dgq gpu blob alloc failed"))?
+            };
+            return Ok(Arc::new(Self {
+                _file: file,
+                _mmap: mmap,
+                buffer,
+                buffer_experts: None,
+                expert_split: 0,
+                len,
+            }));
+        }
+        // Blob exceeds the device's max single-buffer length: wrap it as two
+        // no-copy regions split at the (page-aligned) expert boundary the
+        // converter recorded (experts are written last).
+        let split = manifest.expert_split.ok_or(Error::Format(
+            "dgq blob exceeds device max buffer length and manifest has no expert_split — re-convert with the experts-last converter",
+        ))? as usize;
+        if split % 16384 != 0 || split == 0 || split >= len {
+            return Err(Error::Format("dgq expert_split invalid"));
+        }
+        if split > max_buf || (len - split) > max_buf {
+            return Err(Error::Format(
+                "dgq blob region exceeds device max buffer length even after expert split",
+            ));
+        }
+        eprintln!(
+            "dgq blob: {:.2} GiB > max buffer {:.2} GiB — split at {:.2} GiB (experts region {:.2} GiB)",
+            len as f64 / 1073741824.0,
+            max_buf as f64 / 1073741824.0,
+            split as f64 / 1073741824.0,
+            (len - split) as f64 / 1073741824.0
+        );
         let buffer = unsafe {
             device
                 .newBufferWithBytesNoCopy_length_options_deallocator(
                     ptr,
-                    len,
+                    split,
                     MTLResourceOptions::StorageModeShared,
                     None,
                 )
-                .ok_or(Error::Format("dgq gpu blob alloc failed"))?
+                .ok_or(Error::Format("dgq gpu blob region1 alloc failed"))?
+        };
+        let ptr2 = NonNull::new(unsafe { (mmap.as_ptr() as *mut u8).add(split) } as *mut c_void)
+            .ok_or(Error::Format("dgq mmap region2 null"))?;
+        let buffer_experts = unsafe {
+            device
+                .newBufferWithBytesNoCopy_length_options_deallocator(
+                    ptr2,
+                    len - split,
+                    MTLResourceOptions::StorageModeShared,
+                    None,
+                )
+                .ok_or(Error::Format("dgq gpu blob region2 alloc failed"))?
         };
         Ok(Arc::new(Self {
             _file: file,
             _mmap: mmap,
             buffer,
+            buffer_experts: Some(buffer_experts),
+            expert_split: split as u64,
             len,
         }))
+    }
+
+    /// (buffer, rebased offset) for an absolute blob offset.
+    pub fn buffer_for(&self, off: u64) -> (&ProtocolObject<dyn MTLBuffer>, u64) {
+        match (&self.buffer_experts, off >= self.expert_split && self.expert_split > 0) {
+            (Some(b2), true) => (b2, off - self.expert_split),
+            _ => (&self.buffer, off),
+        }
+    }
+
+    /// The buffer holding expert tensors (region 2 when split, else region 1)
+    /// plus the base offset to subtract from absolute expert offsets.
+    pub fn expert_region(&self) -> (&ProtocolObject<dyn MTLBuffer>, u64) {
+        match &self.buffer_experts {
+            Some(b2) => (b2, self.expert_split),
+            None => (&self.buffer, 0),
+        }
+    }
+
+    /// Host pointer at an absolute blob offset (region-independent: reads the
+    /// underlying mmap directly).
+    pub fn host_ptr(&self, off: u64) -> *const u8 {
+        unsafe { self._mmap.as_ptr().add(blob_offset_for_mtl(off)) }
     }
 }
 
@@ -119,13 +203,7 @@ impl Q4LinearGpu {
         if !self.is_nvfp4() {
             return 1.0;
         }
-        let ptr = unsafe {
-            self.blob
-                .buffer
-                .contents()
-                .as_ptr()
-                .add(blob_offset_for_mtl(self.byte_offset)) as *const u8
-        };
+        let ptr = self.blob.host_ptr(self.byte_offset);
         f32::from_le_bytes([
             unsafe { *ptr },
             unsafe { *ptr.add(1) },
@@ -135,21 +213,18 @@ impl Q4LinearGpu {
     }
 
     pub fn weight_buffer(&self) -> (&ProtocolObject<dyn MTLBuffer>, u64) {
-        (&self.blob.buffer, self.byte_offset)
+        self.blob.buffer_for(self.byte_offset)
     }
 
     /// CPU-readable view of Q4 bytes (shared mmap; matches GPU blob layout).
     pub fn src_slice(&self) -> &[u8] {
         let len = self.q4_byte_len();
-        unsafe {
-            let ptr = self
-                .blob
-                .buffer
-                .contents()
-                .as_ptr()
-                .add(blob_offset_for_mtl(self.byte_offset)) as *const u8;
-            std::slice::from_raw_parts(ptr, len)
-        }
+        unsafe { std::slice::from_raw_parts(self.blob.host_ptr(self.byte_offset), len) }
+    }
+
+    /// (MTLBuffer, rebased offset) for GPU binds — region-aware.
+    pub fn mtl_buffer_and_offset(&self) -> (&ProtocolObject<dyn MTLBuffer>, u64) {
+        self.blob.buffer_for(self.byte_offset)
     }
 }
 
@@ -176,6 +251,7 @@ impl Q4ExpertStackGpu {
     pub fn matrix_stride(&self) -> usize {
         match self.kind {
             QuantKind::Q4Block => q4_matrix_bytes(self.out_dim, self.in_dim),
+            QuantKind::Q6Block => crate::dgq::layout::q6_matrix_bytes(self.out_dim, self.in_dim),
             QuantKind::Nvfp4Block => nvfp4_matrix_bytes(self.out_dim, self.in_dim),
             _ => panic!("not a block expert stack"),
         }
@@ -231,7 +307,7 @@ impl Q8LinearGpu {
 
     pub fn weight_buffer(&self) -> (&ProtocolObject<dyn MTLBuffer>, u64) {
         let off = self.byte_offset + self.row_offset as u64 * self.row_stride() as u64;
-        (&self.blob.buffer, off)
+        self.blob.buffer_for(off)
     }
 
     /// Decode per-row bf16 scale at row `r` (CPU reference for q8 row layout).
@@ -318,6 +394,7 @@ pub fn log_q8_chunk_scale_histogram(w: &Q8LinearGpu, k_dim: usize, hidden: usize
 pub fn parse_kind(s: &str) -> Result<QuantKind, Error> {
     match s {
         "q4_block" => Ok(QuantKind::Q4Block),
+        "q6_block" => Ok(QuantKind::Q6Block),
         "nvfp4_block" => Ok(QuantKind::Nvfp4Block),
         "q8_row" => Ok(QuantKind::Q8Row),
         "raw" => Ok(QuantKind::Raw),
@@ -365,8 +442,10 @@ pub fn load_block_expert_stack(
         .get_entry(name)
         .ok_or_else(|| Error::NotFound(name.to_string()))?;
     let kind = parse_kind(&entry.meta.kind)?;
-    if kind != QuantKind::Q4Block && kind != QuantKind::Nvfp4Block {
-        return Err(Error::Format("expected q4_block or nvfp4_block expert stack"));
+    if kind != QuantKind::Q4Block && kind != QuantKind::Q6Block && kind != QuantKind::Nvfp4Block {
+        return Err(Error::Format(
+            "expected q4_block/q6_block/nvfp4_block expert stack",
+        ));
     }
     if entry.meta.shape.len() != 3 {
         return Err(Error::Format("block expert expects rank 3"));

@@ -89,6 +89,11 @@ pub struct DgqManifest {
     pub profile: QuantProfile,
     pub source_model: String,
     pub blob_file: String,
+    /// Page-aligned byte offset where the expert-tensor region begins (experts
+    /// are written LAST so blobs above the device max single-buffer length can
+    /// be wrapped as two no-copy MTLBuffers). None on pre-split manifests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expert_split: Option<u64>,
     pub tensors: Vec<DgqTensorEntry>,
 }
 

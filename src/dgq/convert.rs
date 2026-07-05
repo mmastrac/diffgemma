@@ -48,6 +48,18 @@ pub fn quantize_model(opts: QuantizeOptions) -> Result<QuantizeSummary, Error> {
 
     let mut names: Vec<String> = store.weight_map.keys().cloned().collect();
     names.sort();
+    // Experts LAST: lets the loader wrap [0, split) + [split, end) as two
+    // no-copy MTLBuffers when the blob exceeds the device's max single-buffer
+    // length (M3 Pro/36GB: 20.25 GiB; q6 blob: ~24 GiB).
+    let is_expert = |n: &str| -> bool {
+        store
+            .get(n)
+            .map(|(_, info)| n.contains(".experts.") && info.shape.len() == 3)
+            .unwrap_or(false)
+    };
+    names.sort_by_key(|n| (is_expert(n), n.clone()));
+    let mut expert_split: Option<u64> = None;
+    const EXPERT_SPLIT_ALIGN: u64 = 16384; // page alignment for no-copy regions
     for (i, name) in names.iter().enumerate() {
         let (shard, info) = store
             .get(name)
@@ -56,6 +68,10 @@ pub fn quantize_model(opts: QuantizeOptions) -> Result<QuantizeSummary, Error> {
         let kind = classify_tensor(name, &info.shape, opts.profile);
 
         offset = align_offset(offset);
+        if expert_split.is_none() && is_expert(name) {
+            offset = (offset + EXPERT_SPLIT_ALIGN - 1) & !(EXPERT_SPLIT_ALIGN - 1);
+            expert_split = Some(offset);
+        }
         let start = offset;
         if start > bytes_written {
             let pad = (start - bytes_written) as usize;
@@ -113,6 +129,7 @@ pub fn quantize_model(opts: QuantizeOptions) -> Result<QuantizeSummary, Error> {
     let manifest = DgqManifest {
         version: dgq_version_for_profile(opts.profile),
         profile: opts.profile,
+        expert_split,
         source_model: opts.source_dir.display().to_string(),
         blob_file: BLOB_FILE.to_string(),
         tensors: entries,

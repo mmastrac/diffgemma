@@ -448,8 +448,9 @@ pub fn experts_forward_gpu_grouped_in_batch_buf(
     let moe_inter = cfg.moe_intermediate_size;
     let num_jobs = jobs.len();
     let w_blob = expert_cache
-        .dgq_blob()
-        .ok_or(Error::Format("grouped moe requires .dgq blob"))?;
+        .dgq_expert_region()
+        .ok_or(Error::Format("grouped moe requires .dgq blob"))?
+        .0;
 
     let mut gate_jobs = Vec::with_capacity(num_jobs);
     let mut down_jobs = Vec::with_capacity(num_jobs);
@@ -457,15 +458,17 @@ pub fn experts_forward_gpu_grouped_in_batch_buf(
     row_starts.push(0);
     token_indices.clear();
     for job in jobs {
+        // Region-rebased offsets: jobs index the bound (possibly split-off
+        // experts) buffer, not the absolute blob.
         let w_gu = expert_cache.expert_gate_up_q4(layer, job.expert);
         gate_jobs.push(BlockGroupedJob {
-            w_byte_off: w_gu.byte_offset,
+            w_byte_off: w_gu.weight_buffer().1,
             groups_per_row: w_gu.groups_per_row(),
             _pad: 0,
         });
         let w_dn = expert_cache.expert_down_q4(layer, job.expert);
         down_jobs.push(BlockGroupedJob {
-            w_byte_off: w_dn.byte_offset,
+            w_byte_off: w_dn.weight_buffer().1,
             groups_per_row: w_dn.groups_per_row(),
             _pad: 0,
         });

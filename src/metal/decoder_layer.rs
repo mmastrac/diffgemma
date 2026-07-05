@@ -858,7 +858,13 @@ pub fn forward_encoder_prefill_resident(
         &jobs,
         token_indices,
         &engine.kernels,
-        &engine.f32_q4_linear_grouped_pipeline,
+        if expert_cache.expert_gate_up_q4(layer, 0).quant_kind()
+            == crate::dgq::layout::QuantKind::Q6Block
+        {
+            &engine.f32_q6_linear_grouped_pipeline
+        } else {
+            &engine.f32_q4_linear_grouped_pipeline
+        },
         &engine.f32_nvfp4_linear_grouped_pipeline,
     )?;
     let buf_moe = match buf_arena {

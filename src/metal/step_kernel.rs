@@ -1495,6 +1495,10 @@ impl StepPipelines {
 
 pub(crate) struct StepBuffers {
     blob: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// Expert-region blob buffer (region 2 on split blobs, else == blob) and
+    /// the base to subtract from absolute expert offsets.
+    blob_experts: Retained<ProtocolObject<dyn MTLBuffer>>,
+    blob_expert_base: u64,
     layout: Retained<ProtocolObject<dyn MTLBuffer>>,
     params: Retained<ProtocolObject<dyn MTLBuffer>>,
     arena: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -1608,13 +1612,14 @@ pub fn layer_moe_block_jobs(
     l: &LayerOffsets,
     format: QuantFormat,
 ) -> ([BlockGroupedJob; N_EXPERTS], [BlockGroupedJob; N_EXPERTS]) {
-    layer_moe_block_jobs_impl(l, format, None)
+    layer_moe_block_jobs_impl(l, format, None, 0)
 }
 
 fn layer_moe_block_jobs_impl(
     l: &LayerOffsets,
     format: QuantFormat,
     manifest: Option<(usize, &HashMap<String, u64>)>,
+    expert_base: u64,
 ) -> ([BlockGroupedJob; N_EXPERTS], [BlockGroupedJob; N_EXPERTS]) {
     use crate::dgq::layout::{nvfp4_matrix_bytes, q4_matrix_bytes, q6_matrix_bytes};
     let hidden = HID as usize;
@@ -1659,6 +1664,9 @@ fn layer_moe_block_jobs_impl(
                 "gate_up L{layer} E{e}: computed stride offset != manifest"
             );
         }
+        // Rebase into the expert blob region (0 on single-buffer blobs).
+        gate[e].w_byte_off -= expert_base;
+        down[e].w_byte_off -= expert_base;
     }
     (gate, down)
 }
@@ -1746,6 +1754,13 @@ impl StepEnc<'_> {
 
     fn bind_blob(&mut self, idx: usize) {
         self.sink_set_buffer(&self.bufs.blob, 0, idx);
+    }
+
+    /// Expert weights live in the second blob region on split blobs; job
+    /// offsets are rebased to match (layer_moe_block_jobs_impl expert_base).
+    fn bind_blob_experts(&mut self, idx: usize) {
+        let buf = self.bufs.blob_experts.clone();
+        self.sink_set_buffer(&buf, 0, idx);
     }
 
     fn bind_params(&mut self, idx: usize) {
@@ -2916,7 +2931,9 @@ impl StepEnc<'_> {
             &self.bufs.gemm_b
         };
             self.sink_set_buffer(a_buf, buf_a_off, 0);
-            self.bind_blob(1);
+            // Expert weights: region-2 buffer on split blobs (job offsets are
+            // rebased to match in layer_moe_block_jobs_impl).
+            self.bind_blob_experts(1);
             self.sink_set_buffer(&self.bufs.gemm_b, buf_c_off, 2);
             self.sink_set_bytes(jobs, 3);
             self.sink_set_buffer(&self.bufs.route, row_start_off, 4);
@@ -3022,6 +3039,7 @@ impl StepEnc<'_> {
             l,
             self.block_profile.format,
             Some((layer, self.tensor_offsets)),
+            self.bufs.blob_expert_base,
         );
         self.dispatch_block_linear_grouped(
             false,
@@ -3055,7 +3073,12 @@ impl StepEnc<'_> {
         layout: &ModelLayout,
     ) -> Result<(), Error> {
         let l = &layout.layers[layer];
-        let (_, down_jobs) = layer_moe_block_jobs_impl(l, self.block_profile.format, None);
+        let (_, down_jobs) = layer_moe_block_jobs_impl(
+            l,
+            self.block_profile.format,
+            None,
+            self.bufs.blob_expert_base,
+        );
         self.dispatch_block_linear_grouped(
             true,
             0,
@@ -5299,6 +5322,11 @@ pub fn build_step_runtime(
     let arena_map = step_arena_layout();
     let bufs = StepBuffers {
         blob: gpu_blob.buffer.clone(),
+        blob_experts: {
+            let (b, _) = gpu_blob.expert_region();
+            objc2::rc::Retained::from(b)
+        },
+        blob_expert_base: gpu_blob.expert_region().1,
         layout: {
             let b = alloc_buffer(&ctx.device, std::mem::size_of::<ModelLayout>())?;
             write_struct(&b, &layout);
