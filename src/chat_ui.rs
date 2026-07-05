@@ -16,8 +16,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-/// Consecutive-step repeats required before a position streams (2 sightings).
-const STABLE_STREAK: u32 = 1;
+/// Consecutive-step repeats required before a position streams (3 sightings —
+/// 2 proved too eager on fast-converging replies).
+const STABLE_STREAK: u32 = 2;
 
 struct StreamInner {
     last_argmax: Vec<u32>,
@@ -214,8 +215,14 @@ impl ChatStream {
                 println!("{}", &reply[st.printed.len()..]);
             } else {
                 // The preview diverged from the final commit (rare: a late
-                // argmax revision). Reprint authoritatively.
-                println!();
+                // argmax revision). Erase the draft (cursor-up per printed
+                // newline; wrapped long lines may leave residue — acceptable)
+                // and reprint authoritatively.
+                clear_line();
+                for _ in 0..st.printed.matches('\n').count() {
+                    print!("\x1b[1A\x1b[2K");
+                }
+                print!("\r");
                 println!("model> {reply}");
             }
         } else {

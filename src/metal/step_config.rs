@@ -120,10 +120,12 @@ pub fn validate_step_model(model_dir: &Path) -> Result<ValidatedStepModel, Error
 }
 
 pub fn log_validated_step_model(v: &ValidatedStepModel) {
-    eprintln!(
-        "step-kernel model config ok (canvas={}, vocab={}, hidden={}, layers={})",
-        v.canvas_length, v.vocab_size, v.hidden_size, v.num_layers
-    );
+    if crate::flags::progress_enabled() {
+        eprintln!(
+            "step-kernel model config ok (canvas={}, vocab={}, hidden={}, layers={})",
+            v.canvas_length, v.vocab_size, v.hidden_size, v.num_layers
+        );
+    }
 }
 
 #[cfg(test)]
