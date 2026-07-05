@@ -639,6 +639,11 @@ impl StableConfidentStopper {
         accept: &[u32],
         _steps_done: u32,
     ) -> bool {
+        // Pad-aware gate: never stop on an all-pad/filler canvas (a degenerate
+        // forward, not a converged answer); mirrors sample_commit on the GPU.
+        if argmax_is_degenerate(argmax) {
+            return false;
+        }
         let sig = accept_mask_sig(accept);
         if let Some(prev) = self.prev_accept_sig {
             if sig == prev {

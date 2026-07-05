@@ -127,8 +127,19 @@ kernel void sample_commit(
 
         S->step += 1u;
 
-        bool confident_stable = canvas_stable && S->mean_entropy < P.conf_threshold;
-        bool plateau_stop = S->accept_plateau >= P.accept_plateau_threshold
+        // Pad-aware gate: an all-pad/filler argmax is a degenerate forward,
+        // not a converged answer — suppress confident/plateau stops so the
+        // denoiser gets more steps to recover (mirrors the CPU stopper).
+        bool degenerate = true;
+        for (uint i = 0u; i < canvas_size && degenerate; ++i) {
+            uint t = S->prev_argmax[i];
+            if (t != pad_token && t != filler_token) {
+                degenerate = false;
+            }
+        }
+
+        bool confident_stable = !degenerate && canvas_stable && S->mean_entropy < P.conf_threshold;
+        bool plateau_stop = !degenerate && S->accept_plateau >= P.accept_plateau_threshold
             && S->mean_entropy < P.plateau_prefix_mean_max;
         S->stop_flag = 0u;
         if (confident_stable) {
@@ -139,8 +150,6 @@ kernel void sample_commit(
             S->stop_flag = 3u;
         }
 
-        (void)pad_token;
-        (void)filler_token;
         (void)eos_token;
     }
 }

@@ -244,16 +244,23 @@ pub fn wide_fixture(_: ElemFormat) -> Fixture {
 
 pub fn cpu(f: &Fixture) -> Vec<f32> {
     let moe_in: Vec<f32> = bf16::bf16_slice_to_f32(&bf16::f32_slice_to_bf16_bits(&f.moe_in));
-    let mut out = vec![0.0f32; f.out_len()];
+    // Production chain: kernel writes UNWEIGHTED per-slot rows, then
+    // moe_scatter_weighted applies router weights into canvas rows. Mirror both.
+    let mut slot_rows = vec![0.0f32; f.out_len()];
     moe_grouped_q4(
-        &mut out,
+        &mut slot_rows,
         &moe_in,
         &f.gate_up_q4(),
         &f.down_q4(),
         &f.grouped_route(),
         f.dims().into(),
     );
-    out
+    let scattered = crate::kernels::cpu::moe_scatter_weighted::moe_scatter_weighted(
+        &slot_rows,
+        &f.route_scratch(),
+        f.hidden,
+    );
+    scattered[..f.out_len()].to_vec()
 }
 
 pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
@@ -369,12 +376,14 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
 
     let scatter_ps =
         crate::kernels::sub::moe_scatter_weighted::pipeline_for(&ctx, variant)?;
+    // Production layout: one TG per (256-wide d-tile, token), 256 threads
+    // (d = tgid.x * 256 + tid) — matches encode_moe_batched_scatter.
     gpu_common::dispatch_grid(
         &ctx.queue,
         &scatter_ps.pipeline,
-        f.hidden,
+        f.hidden.div_ceil(256),
         f.canvas,
-        8,
+        256,
         |enc| {
             crate::kernels::sub::moe_scatter_weighted::bind_gpu_buffers(
                 enc,

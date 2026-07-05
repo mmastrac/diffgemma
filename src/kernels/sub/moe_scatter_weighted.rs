@@ -169,12 +169,15 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
             )
         },
     );
+    // Production layout: one TG per (256-wide d-tile, token), 256 threads
+    // (d = tgid.x * 256 + tid) — matches encode_moe_batched_scatter. The old
+    // (hidden, CANVAS, 8) shape only covered d < 8 and passed by fixture luck.
     gpu_common::dispatch_grid(
         &ctx.queue,
         &pipeline.pipeline,
-        f.hidden,
+        f.hidden.div_ceil(256),
         crate::metal::CANVAS,
-        8,
+        256,
         |enc| {
             bind_gpu_buffers(
                 enc,

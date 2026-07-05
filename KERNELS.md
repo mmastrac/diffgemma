@@ -172,17 +172,20 @@ like ours; keep our dequant math + bf16 I/O rounding) — verify per element.
 - `gemm_q8_rowk` oracle tests dispatched 128-wide n-tiles against the 32×32
   kernel (cols 32–127 unwritten → the long-standing cos≈0.34 failures). Fixed:
   harness now dispatches the production 32-tile grid.
-- `moe_grouped(+nvfp4)` oracle tests (8): the kernel is verified correct in
-  production (`DGQ_MOE_BLOCK_SPARSE=0` generates correctly); the failures are
-  test-side. Diagnosed so far: (a) the CPU oracle computed the OLD weighted
-  per-token accumulate while the kernel emits unweighted per-SLOT rows
-  (weighting moved to `moe_scatter_weighted`) — fixed; (b) a deeper residual
-  remains: even at weight=1.0 (tiny fixture) GPU vs CPU cos is 0.34, so
-  `expert_forward_q4_mirror` (CPU) has drifted from the kernel's expert math
-  itself. Needs focused archaeology against moe_grouped.metal's gate/up/act/
-  down sequence and scales.
-- `sample::stopper_blocks_degenerate_all_pad_argmax`: pre-existing CPU test;
-  undiagnosed.
+- `moe_grouped(+nvfp4)` oracle tests (8): FIXED 2026-07-05. Root cause was the
+  SAME class as the gemm_q8_rowk item above — stale test dispatch, not expert
+  math: `moe_scatter_weighted` was rewritten to a (d-tile, token)×256-thread
+  layout (`d = tgid.x*256 + tid`) but the sub-tests still dispatched the old
+  (hidden, canvas)×8 grid, so only d<8 was ever written (hence cos≈0.34 at
+  weight=1). Harnesses now dispatch the production grid, and the CPU side
+  mirrors the full production chain (unweighted per-slot rows →
+  `moe_scatter_weighted` CPU mirror). The scatter's own sub-test had the same
+  stale shape but passed by fixture luck (hidden ≤ 8) — also fixed.
+- `sample::stopper_blocks_degenerate_all_pad_argmax`: FIXED 2026-07-05. The
+  pad-aware degenerate gate documented on `early_stop_allowed` was never wired
+  into the stoppers; now enforced in BOTH `StableConfidentStopper` (CPU) and
+  `sample_commit.metal` (GPU: all-pad/filler argmax suppresses confident/
+  plateau stops; inert on normal prompts — gate 17/17 verified after).
 
 ## Notes
 
