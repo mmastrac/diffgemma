@@ -5347,6 +5347,8 @@ pub fn build_step_runtime(
             "step-kernel: ICB replay enabled (no_sc; DGQ_STEP_ICB_SC=1 for with_sc)"
         );
         rt.icb = Some(rt.record_icb_pair()?);
+    } else if rt.embed_bf16 && sc_sparse_enabled() {
+        eprintln!("step-kernel: sparse SC softembed (DGQ_SC_SPARSE=0 for the exact chunked path)");
     } else if use_sc_chunked {
         eprintln!("step-kernel: chunked SC softembed (DGQ_SC_CHUNKED=0 for full prob matrix)");
     }

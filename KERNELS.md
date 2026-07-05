@@ -25,7 +25,7 @@ kernel exist / merge / change dtype"; re-audit when a family gains members.
 | dense GEMMs (qkv / o_proj / FFN, `gemm_block*`) | ~380 | 1.8–2.3 TF/s ≈ our-kernel wall | ~1.5x headroom vs MPS/MLX (see correction above) |
 | attention (`attention_mma2` / `attention_mma_full`) | ~190 | attention-typical | tuned levers disproven; window-clipped ≥1024 |
 | MoE experts (`gemm_block_sparse` + scatter) | ~315 | ~2.3 TF/s on USEFUL flops ≈ dense wall | at the wall; M-tile levers disproven (see below) |
-| SC preamble (`sc_sparse_*`, SC MLP q8, rowstats) | ~165 | occupancy-bound | tiling levers disproven |
+| SC preamble (`sc_sparse_*`, SC MLP q8, rowstats) | ~165 | occupancy/gather-bound | tiling levers disproven; NOT the vocab GEMM (sparse-SC active at default on bf16-embed; rowk chunked only runs with DGQ_SC_SPARSE=0) — rowk tunable port has NO production surface (2026-07-02) |
 | finish (lm_head `gemm_block` Raw, softcap, sampler) | ~150 | at flops bound | at the wall |
 | router (`gemm_block` + `moe_router_topk`) | ~22 | occupancy-limited N=128 | accepted (was 69 ms serial-dot) |
 
