@@ -173,8 +173,14 @@ impl Render {
         }
         print!("\x1b7"); // save cursor at end of permanent text
         self.drawn = true;
-        // Transient status row (one line): live draft tail, or a thinking line.
+        // Transient status: drawn at the cursor (NO leading newline — a leading
+        // `\n` scrolls at the screen bottom and, because DECSC/DECRC don't track
+        // scrolling, leaves stale saved positions that pile up as blank lines).
+        // A separator space keeps the spinner off any mid-line committed text.
         let frame = SPINNER[self.spinner % SPINNER.len()];
+        let at_line_start =
+            self.printed_upto == 0 || self.text[..self.printed_upto].ends_with('\n');
+        let sep = if at_line_start { "" } else { " " };
         let draft = self.text[self.printed_upto..].replace('\n', " ");
         let draft = draft.trim();
         let body = if self.prefill {
@@ -185,17 +191,24 @@ impl Render {
                 self.block, self.step, self.max_steps, self.locked, self.canvas
             )
         } else {
-            // Show the tail of the forming draft so long drafts stay on one row.
+            // Tail of the forming draft, so long drafts stay on one row.
             let cap = self.cols.saturating_sub(6);
-            let tail: String = if draft.chars().count() > cap {
-                format!("…{}", draft.chars().rev().take(cap).collect::<Vec<_>>().into_iter().rev().collect::<String>())
+            if draft.chars().count() > cap {
+                let tail: String = draft
+                    .chars()
+                    .rev()
+                    .take(cap)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                format!("…{tail}")
             } else {
                 draft.to_string()
-            };
-            tail
+            }
         };
         print!(
-            "\n{}",
+            "{sep}{}",
             truncate_cols(&format!("{frame} {body}"), self.cols.saturating_sub(1))
         );
         let _ = std::io::stdout().flush();
