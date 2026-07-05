@@ -6,6 +6,7 @@ using namespace metal;
 #include "gemm_fc.metal"
 #include "dequant.metal"
 #include "arena.metal"
+#include "gemm_stacked_fc.metal"
 
 /// TUNABLE GEMM (task #19): fragment-level block GEMM.
 ///
@@ -36,6 +37,70 @@ constant uint BK = 32u;
 constant uint PAD = 40u; // BK + 8 halfs: bank-conflict pad
 constant uint TM = BM / 16u; // 8x8 fragments per simdgroup along M
 constant uint TN = BN / 16u; // 8x8 fragments per simdgroup along N
+
+/// A-tile loader: vectorized 4-wide bf16(or f16)->half loads, per-4 row guard.
+inline void tunable_load_a(
+    device const ushort *x,
+    threadgroup half Xs[TUNE_BM][40],
+    uint m0,
+    uint M,
+    uint K,
+    uint k0,
+    uint ltid
+) {
+    for (uint i = ltid * 4u; i < BM * BK; i += 128u * 4u) {
+        const uint mm = i / BK;
+        const uint kk = i % BK;
+        half4 h;
+        if (m0 + mm < M) {
+            const ushort4 u = *(device const ushort4 *)(x + (ulong)(m0 + mm) * K + k0 + kk);
+            if (K_ACT_F16) {
+                h = as_type<half4>(u);
+            } else {
+                h = half4(as_type<float4>(uint4(u) << 16u));
+            }
+        } else {
+            h = half4(0);
+        }
+        *(threadgroup half4 *)(&Xs[mm][kk]) = h;
+    }
+}
+
+/// One BK-wide MMA phase: per-lane fragment loads + TMxTN accumulate.
+inline void tunable_mma_ktile(
+    threadgroup half Xs[TUNE_BM][40],
+    threadgroup half Ws[TUNE_BN][40],
+    thread simdgroup_float8x8 (&C)[TM][TN],
+    uint sr,
+    uint sc,
+    uint fm,
+    uint fn
+) {
+    for (uint kk = 0u; kk < BK; kk += 8u) {
+        simdgroup_barrier(mem_flags::mem_none);
+        // A fragments: element (fm, fn) of frag i = Xs[sr + 8i + fm][kk + fn].
+        simdgroup_half8x8 A[TM];
+        for (uint i = 0u; i < TM; ++i) {
+            thread half2 &ea = reinterpret_cast<thread half2 &>(A[i].thread_elements());
+            ea[0] = Xs[sr + 8u * i + fm][kk + fn];
+            ea[1] = Xs[sr + 8u * i + fm][kk + fn + 1u];
+        }
+        simdgroup_barrier(mem_flags::mem_none);
+        // B fragments: element (k=fm, n=fn) of frag j = Ws[sc + 8j + fn][kk + fm].
+        simdgroup_half8x8 B[TN];
+        for (uint j = 0u; j < TN; ++j) {
+            thread half2 &eb = reinterpret_cast<thread half2 &>(B[j].thread_elements());
+            eb[0] = Ws[sc + 8u * j + fn][kk + fm];
+            eb[1] = Ws[sc + 8u * j + fn + 1u][kk + fm];
+        }
+        simdgroup_barrier(mem_flags::mem_none);
+        for (uint i = 0u; i < TM; ++i) {
+            for (uint j = 0u; j < TN; ++j) {
+                simdgroup_multiply_accumulate(C[i][j], A[i], B[j], C[i][j]);
+            }
+        }
+    }
+}
 
 kernel void gemm_tunable(
     device const ushort *x [[buffer(0)]],
@@ -83,24 +148,7 @@ kernel void gemm_tunable(
 
     for (uint k0 = 0u; k0 < K; k0 += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        // A tile BMxBK: vectorized 4-wide loads + converts (K and kk are
-        // 4-aligned; Metal buffers are 256B-aligned), per-4 row guard only.
-        for (uint i = ltid * 4u; i < BM * BK; i += 128u * 4u) {
-            const uint mm = i / BK;
-            const uint kk = i % BK;
-            half4 h;
-            if (m0 + mm < M) {
-                const ushort4 u = *(device const ushort4 *)(x + (ulong)(m0 + mm) * K + k0 + kk);
-                if (K_ACT_F16) {
-                    h = as_type<half4>(u);
-                } else {
-                    h = half4(as_type<float4>(uint4(u) << 16u));
-                }
-            } else {
-                h = half4(0);
-            }
-            *(threadgroup half4 *)(&Xs[mm][kk]) = h;
-        }
+        tunable_load_a(x, Xs, m0, M, K, k0, ltid);
         // W tile BNxBK.
         {
             const uint gn = n0 + w_r;
@@ -153,30 +201,7 @@ kernel void gemm_tunable(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint kk = 0u; kk < BK; kk += 8u) {
-            simdgroup_barrier(mem_flags::mem_none);
-            // A fragments: element (fm, fn) of frag i = Xs[sr + 8i + fm][kk + fn].
-            simdgroup_half8x8 A[TM];
-            for (uint i = 0u; i < TM; ++i) {
-                thread half2 &ea = reinterpret_cast<thread half2 &>(A[i].thread_elements());
-                ea[0] = Xs[sr + 8u * i + fm][kk + fn];
-                ea[1] = Xs[sr + 8u * i + fm][kk + fn + 1u];
-            }
-            simdgroup_barrier(mem_flags::mem_none);
-            // B fragments: element (k=fm, n=fn) of frag j = Ws[sc + 8j + fn][kk + fm].
-            simdgroup_half8x8 B[TN];
-            for (uint j = 0u; j < TN; ++j) {
-                thread half2 &eb = reinterpret_cast<thread half2 &>(B[j].thread_elements());
-                eb[0] = Ws[sc + 8u * j + fn][kk + fm];
-                eb[1] = Ws[sc + 8u * j + fn + 1u][kk + fm];
-            }
-            simdgroup_barrier(mem_flags::mem_none);
-            for (uint i = 0u; i < TM; ++i) {
-                for (uint j = 0u; j < TN; ++j) {
-                    simdgroup_multiply_accumulate(C[i][j], A[i], B[j], C[i][j]);
-                }
-            }
-        }
+        tunable_mma_ktile(Xs, Ws, C, sr, sc, fm, fn);
     }
 
     // Per-lane direct store: lane owns C elements (fm, fn) and (fm, fn+1).
@@ -203,6 +228,124 @@ kernel void gemm_tunable(
                 } else {
                     arena_store(y, (ulong)row * N + col + 1u, ec[1]);
                 }
+            }
+        }
+    }
+}
+
+/// Stacked tunable GEMM: segment table via FC12-27 (same contract as
+/// gemm_block_stacked) — qkv and dense gate/up fused dispatches. Raw + q4
+/// weight formats (production stacked paths); per-element segment resolve on
+/// W load and store. Same accumulation chain as gemm_block_stacked ->
+/// BIT-EXACT expected.
+kernel void gemm_tunable_stacked(
+    device const ushort *x [[buffer(0)]],
+    device ushort *y_arena [[buffer(1)]],
+    device const uchar *blob [[buffer(2)]],
+    constant uint &M [[buffer(3)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint3 lid [[thread_position_in_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint N = GEMM_N, K = GEMM_K;
+    threadgroup half Xs[BM][PAD];
+    threadgroup half Ws[BN][PAD]; // row-major [n][k]
+
+    const uint m0 = tgid.y * BM;
+    const uint n0 = tgid.x * BN;
+    const uint ltid = lid.x;
+
+    const bool is_raw = (K_QUANT_FORMAT == QUANT_RAW);
+    const ulong rowB = is_raw ? (ulong)K * 2ul : q4_row_bytes(K);
+
+    const uint qid = lane / 4u;
+    const uint fm = (qid & 4u) + ((lane / 2u) % 4u);
+    const uint fn = (qid & 2u) * 2u + (lane % 2u) * 2u;
+
+    simdgroup_float8x8 C[TM][TN];
+    for (uint i = 0u; i < TM; ++i) {
+        for (uint j = 0u; j < TN; ++j) {
+            C[i][j] = simdgroup_float8x8(0.f);
+        }
+    }
+    const uint sr = (BM / 2u) * (sgid >> 1u);
+    const uint sc = (BN / 2u) * (sgid & 1u);
+
+    const uint w_tpr = 128u / BN;
+    const uint w_cols = BK / w_tpr;
+    const uint w_r = ltid / w_tpr;
+    const uint w_q = (ltid % w_tpr) * w_cols;
+    // Segment resolve for this thread's W row (row-constant across K).
+    const uint gn = n0 + w_r;
+    const uint w_seg = stacked_fc_seg_index(gn);
+    const uint w_local_n = stacked_fc_local_n(gn, w_seg);
+    const ulong w_base = stacked_fc_w_off(w_seg);
+
+    for (uint k0 = 0u; k0 < K; k0 += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        tunable_load_a(x, Xs, m0, M, K, k0, ltid);
+        {
+            if (gn < N) {
+                if (is_raw) {
+                    device const ushort *wr =
+                        (device const ushort *)(blob + w_base + (ulong)w_local_n * rowB);
+                    for (uint j = 0u; j < w_cols; j += 4u) {
+                        const ushort4 u = *(device const ushort4 *)(wr + k0 + w_q + j);
+                        *(threadgroup half4 *)(&Ws[w_r][w_q + j]) =
+                            half4(as_type<float4>(uint4(u) << 16u));
+                    }
+                } else {
+                    device const uchar *g =
+                        blob + w_base + (ulong)w_local_n * rowB + (ulong)(k0 / 32u) * 20ul;
+                    const half s = half(bf16_bytes(g));
+                    const half mn = half(bf16_bytes(g + 2));
+                    for (uint j8 = 0u; j8 < w_cols; j8 += 8u) {
+                        const uint jj = w_q + j8;
+                        device const uchar *pp = g + 4u + jj / 2u;
+                        const uint v = uint(pp[0]) | (uint(pp[1]) << 8u) |
+                            (uint(pp[2]) << 16u) | (uint(pp[3]) << 24u);
+                        const half4 q0 = half4(
+                            half(v & 0xFu), half((v >> 4u) & 0xFu),
+                            half((v >> 8u) & 0xFu), half((v >> 12u) & 0xFu));
+                        const half4 q1 = half4(
+                            half((v >> 16u) & 0xFu), half((v >> 20u) & 0xFu),
+                            half((v >> 24u) & 0xFu), half(v >> 28u));
+                        *(threadgroup half4 *)(&Ws[w_r][jj]) = s * q0 + half4(mn);
+                        *(threadgroup half4 *)(&Ws[w_r][jj + 4u]) = s * q1 + half4(mn);
+                    }
+                }
+            } else {
+                for (uint j = 0u; j < w_cols; j += 4u) {
+                    *(threadgroup half4 *)(&Ws[w_r][w_q + j]) = half4(0);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        tunable_mma_ktile(Xs, Ws, C, sr, sc, fm, fn);
+    }
+
+    // Per-lane store with per-element segment resolve (cols may straddle a
+    // segment boundary; y offsets/strides are per segment).
+    for (uint i = 0u; i < TM; ++i) {
+        const uint row = m0 + sr + 8u * i + fm;
+        if (row >= M) {
+            continue;
+        }
+        for (uint j = 0u; j < TN; ++j) {
+            const thread float2 &ec = reinterpret_cast<thread float2 &>(C[i][j].thread_elements());
+            for (uint e = 0u; e < 2u; ++e) {
+                const uint col = n0 + sc + 8u * j + fn + e;
+                if (col >= N) {
+                    continue;
+                }
+                const uint seg = stacked_fc_seg_index(col);
+                const uint local_n = stacked_fc_local_n(col, seg);
+                const ulong out_idx = (ulong)row * (ulong)stacked_fc_y_row_cols(seg)
+                    + (ulong)stacked_fc_y_col0(seg) + (ulong)local_n;
+                device ushort *dst =
+                    (device ushort *)((device uchar *)y_arena + stacked_fc_y_byte_off(seg));
+                arena_store(dst, out_idx, e == 0u ? ec[0] : ec[1]);
             }
         }
     }

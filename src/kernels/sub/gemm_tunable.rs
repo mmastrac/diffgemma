@@ -49,3 +49,43 @@ pub fn pipeline_for_logits(
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
     ctx.compile_gemm_subkernel_out_bf16(&tuned_source(TUNE_BM, TUNE_BN), ENTRY, n, k, format as u32)
 }
+
+pub const ENTRY_STACKED: &str = "gemm_tunable_stacked";
+
+/// Stacked variant (segment table FC12-27, same contract as
+/// gemm_block_stacked): qkv + dense gate/up fused dispatches. Cached per
+/// (n, k, format, segment table) like the legacy stacked pipeline.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn stacked_pipeline_for(
+    ctx: &crate::metal::device::MetalContext,
+    n: u32,
+    k: u32,
+    format: QuantFormat,
+    segs: &[crate::kernels::sub::gemm_block_stacked::GemmStackedSeg],
+) -> Result<std::sync::Arc<crate::metal::device::ComputePipeline>, Error> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Key = crate::kernels::sub::gemm_block_stacked::StackedPipelineKey;
+
+    static CACHE: OnceLock<Mutex<HashMap<Key, std::sync::Arc<crate::metal::device::ComputePipeline>>>> =
+        OnceLock::new();
+    let stacked = crate::kernels::sub::gemm_block_stacked::StackedSegFc::from_segments(segs)?;
+    let key = Key::new(n, k, format, stacked);
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache
+        .lock()
+        .map_err(|_| Error::Format("tunable stacked pipeline cache poisoned"))?;
+    if let Some(pipe) = guard.get(&key) {
+        return Ok(std::sync::Arc::clone(pipe));
+    }
+    let pipe = std::sync::Arc::new(ctx.compile_gemm_stacked_subkernel(
+        &tuned_source(TUNE_BM, TUNE_BN),
+        ENTRY_STACKED,
+        n,
+        k,
+        format as u32,
+        &stacked,
+    )?);
+    guard.insert(key, std::sync::Arc::clone(&pipe));
+    Ok(pipe)
+}

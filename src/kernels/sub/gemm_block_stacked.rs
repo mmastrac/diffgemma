@@ -79,7 +79,7 @@ impl StackedSegFc {
 }
 
 #[derive(Clone, Hash, PartialEq, Eq)]
-struct StackedPipelineKey {
+pub(crate) struct StackedPipelineKey {
     n: u32,
     k: u32,
     format: u32,
@@ -87,7 +87,7 @@ struct StackedPipelineKey {
 }
 
 impl StackedPipelineKey {
-    fn new(n: u32, k: u32, format: QuantFormat, stacked: StackedSegFc) -> Self {
+    pub(crate) fn new(n: u32, k: u32, format: QuantFormat, stacked: StackedSegFc) -> Self {
         Self {
             n,
             k,

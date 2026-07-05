@@ -1859,19 +1859,38 @@ impl StepEnc<'_> {
         n_total: u32,
     ) -> Result<(), Error> {
         debug_assert!(segs.len() <= STACKED_SEG_MAX, "too many stacked segments");
-        let ps = crate::kernels::sub::gemm_bf16_stacked::stacked_pipeline_for(
-            self.ctx, n_total, k, segs,
-        )?;
+        let (ps, grid) = if gemm_tunable_enabled() {
+            (
+                crate::kernels::sub::gemm_tunable::stacked_pipeline_for(
+                    self.ctx,
+                    n_total,
+                    k,
+                    crate::kernels::sub::QuantFormat::Raw,
+                    segs,
+                )?,
+                MTLSize {
+                    width: div_up(n_total as usize, crate::kernels::sub::gemm_tunable::TUNE_BN),
+                    height: div_up(m as usize, crate::kernels::sub::gemm_tunable::TUNE_BM),
+                    depth: 1,
+                },
+            )
+        } else {
+            (
+                crate::kernels::sub::gemm_bf16_stacked::stacked_pipeline_for(
+                    self.ctx, n_total, k, segs,
+                )?,
+                MTLSize {
+                    width: div_up(n_total as usize, crate::kernels::sub::gemm_common::n_tile()),
+                    height: div_up(m as usize, crate::kernels::sub::gemm_common::M_TILE),
+                    depth: 1,
+                },
+            )
+        };
         self.sink_set_pipeline(ps.as_ref());
         self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
         self.sink_set_buffer(&self.bufs.arena, 0, 1);
         self.bind_blob(2);
         self.sink_set_bytes(&m, 3);
-        let grid = MTLSize {
-            width: div_up(n_total as usize, crate::kernels::sub::gemm_common::n_tile()),
-            height: div_up(m as usize, crate::kernels::sub::gemm_common::M_TILE),
-            depth: 1,
-        };
         let tg = MTLSize {
             width: GEMM_THREADS_PER_TG,
             height: 1,
