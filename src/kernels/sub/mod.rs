@@ -4,7 +4,6 @@ pub mod bf16;
 pub mod dequant_block_matrix;
 pub mod embed_gather;
 pub mod f16;
-pub mod f32_to_half;
 pub mod gather_prob_cols;
 pub mod gather_rows;
 pub mod gather_rows_bf16;

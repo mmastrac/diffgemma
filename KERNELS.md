@@ -71,13 +71,29 @@ q4/nvfp4 (QUANT_FORMAT), sc_softembed bf16 variant.
 - `residual_half` (monolith, scalar+hidden-f32 axes) vs `vec_add_inplace`
   (engine): different paths, both production.
 
-**Dead / test-only (candidates for deletion)**
-- `attention_mma` (1-head): superseded twice (mma2, mma_full); test-only.
-- `f32_to_half` plain: no production dispatch (scale variant is used).
-- `scatter_vocab_chunk`: validation placeholder.
-- Env-gated graveyard (keep, documented as disproven): partial-lm trio
-  (`compact_active_rows`, `scatter_logits_rows`, partial lm_head path),
-  `DGQ_ACCEPT_ROW_CAP`, `DGQ_HIDDEN_F32`.
+**Deleted (2026-07-02 cleanup after tunable landed)**
+- `attention_mma` (1-head): superseded twice (mma2, mma_full); was test-only.
+- `f32_to_half` plain: had no production dispatch (scale variant remains).
+- `gemm_block_sq`: bench research prototype, superseded by `gemm_tunable`.
+
+**Kept (correction: NOT dead)**
+- `scatter_vocab_chunk`: the ENGINE-validation lm_head (lm_head.rs via
+  sampler_kernels) dispatches it — engine-validation-only, not a placeholder.
+
+**Deprecation candidates (need a stable tunable cycle first — do NOT delete yet)**
+- Legacy `gemm_block` / `gemm_block_stacked` / `gemm_block_sparse`: still the
+  DGQ_GEMM_TUNABLE=0 fallback, the non-bf16-checkpoint stacked-q4 path, the
+  nvfp4 expert path, AND the bit-exactness ORACLE the tunable bench rows
+  verify against. Revisit after a few stable weeks.
+- Legacy adaptive-M machinery (`DGQ_MOE_TILE_ADAPT` + m16/m8 helpers in
+  gemm_block_tile + classed pipelines): superseded by gemm_tunable_sparse at
+  default (only live at DGQ_GEMM_TUNABLE=0). User signed it default-on
+  2026-07-02; removal needs their nod.
+- `gemm_block_grouped` (pre-sparse MoE): DGQ_MOE_BLOCK_SPARSE=0 fallback only.
+
+**Env-gated graveyard (keep, documented as disproven):** partial-lm trio
+(`compact_active_rows`, `scatter_logits_rows`, partial lm_head path),
+`DGQ_ACCEPT_ROW_CAP`, `DGQ_HIDDEN_F32`.
 
 ## MoE tiny-M investigation (2026-07-02) — CLOSED, no lever
 

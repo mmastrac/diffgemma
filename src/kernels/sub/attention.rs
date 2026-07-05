@@ -14,11 +14,7 @@ pub const THREADGROUP_WIDTH: usize = 64;
 
 const SHADER: &str = shader_include::include_metal!("kernels/attention.metal");
 
-/// Flash-style matrix-unit attention (simdgroup_float8x8). Same semantics as
-/// `attention`, validated against it / the CPU oracle. M=8 query rows per tile.
-pub const ENTRY_MMA: &str = "attention_mma";
 pub const MMA_M_TILE: usize = 8;
-const SHADER_MMA: &str = shader_include::include_metal!("kernels/attention_mma.metal");
 
 /// GQA-grouped MMA attention (2 Q heads / threadgroup, shared K/V staging).
 /// Group size 2, hd <= 256 only (sliding layers). `attention` stays the oracle.
@@ -348,107 +344,6 @@ pub fn gpu(_: &Fixture, _: KernelVariant) -> Result<Vec<f32>, Error> {
     Err(Error::Format("Metal unavailable"))
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
-pub fn pipeline_mma_for(
-    ctx: &crate::metal::device::MetalContext,
-    variant: KernelVariant,
-) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_subkernel(SHADER_MMA, ENTRY_MMA, variant)
-}
-
-/// Matrix-unit attention path. Identical buffer layout to `gpu`; differs only in
-/// pipeline + grid (one threadgroup per (MMA_M_TILE-row query tile, q_head), 32 lanes).
-#[cfg(all(feature = "metal", target_os = "macos"))]
-pub fn gpu_mma(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
-    use crate::metal::buffer::BufferPool;
-    use crate::metal::device::MetalContext;
-
-    let ctx = MetalContext::new()?;
-    let pipeline = pipeline_mma_for(&ctx, variant)?;
-    let mut pool = BufferPool::new();
-    let buf_q = pool
-        .allocate(&ctx.device, f.q.len() * 2)
-        .ok_or(Error::Format("alloc"))?;
-    let buf_kv = pool
-        .allocate(&ctx.device, f.kvcache.len() * 2)
-        .ok_or(Error::Format("alloc"))?;
-    let buf_out = pool
-        .allocate(&ctx.device, f.out_len() * 2)
-        .ok_or(Error::Format("alloc"))?;
-    let buf_layer = pool
-        .allocate(&ctx.device, std::mem::size_of::<LayerOffsets>())
-        .ok_or(Error::Format("alloc"))?;
-
-    BufferPool::write_bf16(&buf_q, &bf16::f32_slice_to_bf16_bits(&f.q));
-    BufferPool::write_bf16(&buf_kv, &bf16::f32_slice_to_bf16_bits(&f.kvcache));
-    let layer = layer_offsets(f);
-    let layer_bytes = unsafe {
-        std::slice::from_raw_parts(
-            &layer as *const LayerOffsets as *const u8,
-            std::mem::size_of::<LayerOffsets>(),
-        )
-    };
-    BufferPool::write_bytes(&buf_layer, layer_bytes);
-
-    let params = StepParams {
-        kv_len: f.kv_len,
-        max_steps: 8,
-        entropy_bound: 0.0,
-        t_min: 0.0,
-        t_max: 1.0,
-        conf_threshold: 0.0,
-        stability_threshold: 0,
-        min_early_stop_steps: 0,
-        accept_plateau_threshold: 0,
-        plateau_prefix_mean_max: f32::MAX,
-        eos_token_id: 1,
-    };
-    let dims = AttnDims {
-        canvas: f.canvas as u32,
-        n_q_heads: f.n_q_heads as u32,
-        causal: 0,
-        window: 0,
-    };
-
-    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
-    enc.setComputePipelineState(&pipeline.pipeline);
-    unsafe {
-        enc.setBuffer_offset_atIndex(Some(&buf_q), 0, 0);
-        enc.setBuffer_offset_atIndex(Some(&buf_kv), 0, 1);
-        enc.setBuffer_offset_atIndex(Some(&buf_out), 0, 2);
-        enc.setBuffer_offset_atIndex(Some(&buf_layer), 0, 3);
-    }
-    gpu_common::set_bytes(&enc, &params, 4);
-    gpu_common::set_bytes(&enc, &dims, 5);
-    enc.dispatchThreadgroups_threadsPerThreadgroup(
-        MTLSize {
-            width: f.canvas.div_ceil(MMA_M_TILE),
-            height: f.n_q_heads,
-            depth: 1,
-        },
-        MTLSize {
-            width: 32,
-            height: 1,
-            depth: 1,
-        },
-    );
-    enc.endEncoding();
-    cmd.commit();
-    cmd.waitUntilCompleted();
-
-    let mut out = vec![0.0f32; f.out_len()];
-    let ptr = buf_out.contents().as_ptr() as *const u16;
-    for (i, o) in out.iter_mut().enumerate() {
-        *o = bf16::bf16_bits_to_f32(unsafe { *ptr.add(i) });
-    }
-    Ok(out)
-}
-
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-pub fn gpu_mma(_: &Fixture, _: KernelVariant) -> Result<Vec<f32>, Error> {
-    Err(Error::Format("Metal unavailable"))
-}
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub fn pipeline_mma2_for(
@@ -640,7 +535,6 @@ pub fn bench_path(f: &Fixture, iters: usize, path: u8) -> Result<f64, Error> {
     let ctx = MetalContext::new()?;
     let prod = KernelVariant::PRODUCTION;
     let pipeline = match path {
-        1 => pipeline_mma_for(&ctx, prod)?,
         2 => pipeline_mma2_for(&ctx, prod)?,
         3 => pipeline_mma_full_for(&ctx, prod)?,
         _ => pipeline_for(&ctx, prod)?,
@@ -677,10 +571,6 @@ pub fn bench_path(f: &Fixture, iters: usize, path: u8) -> Result<f64, Error> {
     };
     let dims = AttnDims::new(f.canvas as u32, f.n_q_heads as u32);
     let (grid, tpg) = match path {
-        1 => (
-            MTLSize { width: f.canvas.div_ceil(MMA_M_TILE), height: f.n_q_heads, depth: 1 },
-            MTLSize { width: 32, height: 1, depth: 1 },
-        ),
         2 => (
             MTLSize { width: f.canvas.div_ceil(MMA_M_TILE), height: f.n_kv(), depth: 1 },
             MTLSize { width: 64, height: 1, depth: 1 },
@@ -781,55 +671,12 @@ mod tests {
         min_cos = 0.9999,
     }
 
-    // ---- Matrix-unit (flash) path: parity vs the same CPU oracle ----
+    // ---- Matrix-unit (flash) paths: parity vs the same CPU oracle ----
+    // (1-head attention_mma deleted 2026-07-02: superseded by mma2/mma_full.)
 
-    kernel_oracle_matrix! {
-        mod mma_tiny,
-        cpu = crate::kernels::sub::attention::cpu,
-        cpu_oracle = crate::kernels::sub::attention::cpu_oracle,
-        gpu = crate::kernels::sub::attention::gpu_mma,
-        fixture = crate::kernels::sub::attention::tiny_fixture,
-        out_len = crate::kernels::sub::attention::fixture_len,
-        formats: [F32],
-        max_tol = 1e-2,
-        min_cos = 0.9999,
-    }
 
-    kernel_oracle_matrix! {
-        mod mma_wide,
-        cpu = crate::kernels::sub::attention::cpu,
-        cpu_oracle = crate::kernels::sub::attention::cpu_oracle,
-        gpu = crate::kernels::sub::attention::gpu_mma,
-        fixture = crate::kernels::sub::attention::wide_fixture,
-        out_len = crate::kernels::sub::attention::fixture_len,
-        formats: [F32],
-        max_tol = 2e-2,
-        min_cos = 0.9999,
-    }
 
-    kernel_oracle_matrix! {
-        mod mma_full_hd512,
-        cpu = crate::kernels::sub::attention::cpu,
-        cpu_oracle = crate::kernels::sub::attention::cpu_oracle,
-        gpu = crate::kernels::sub::attention::gpu_mma,
-        fixture = crate::kernels::sub::attention::full_hd512_fixture,
-        out_len = crate::kernels::sub::attention::fixture_len,
-        formats: [F32],
-        max_tol = 2e-2,
-        min_cos = 0.9999,
-    }
 
-    kernel_oracle_matrix! {
-        mod mma_sliding_hd256,
-        cpu = crate::kernels::sub::attention::cpu,
-        cpu_oracle = crate::kernels::sub::attention::cpu_oracle,
-        gpu = crate::kernels::sub::attention::gpu_mma,
-        fixture = crate::kernels::sub::attention::sliding_hd256_fixture,
-        out_len = crate::kernels::sub::attention::fixture_len,
-        formats: [F32],
-        max_tol = 2e-2,
-        min_cos = 0.9999,
-    }
 
     // ---- Full-layer MMA path (register-O, QG-grouped K/V): parity vs oracle ----
 

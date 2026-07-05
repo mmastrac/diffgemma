@@ -10,7 +10,7 @@ using namespace metal;
 
 /// TUNABLE GEMM (task #19): fragment-level block GEMM.
 ///
-/// The bench prototype (gemm_block_sq) proved macro tiling alone cannot reach
+/// The 2026-07-02 bench prototypes proved macro tiling alone cannot reach
 /// the MPS/MLX 3.4-4.4 TF/s at our shapes; the delta is fragment-level
 /// codegen. This kernel replicates MLX steel's machinery in our framework:
 /// - per-lane thread_elements() fragment loads with compile-time strides
