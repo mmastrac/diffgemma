@@ -26,8 +26,11 @@ use std::time::Duration;
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// Terminal columns (macOS TIOCGWINSZ), falling back to `$COLUMNS` then 80.
-fn terminal_cols() -> usize {
+const DIM: &str = "\x1b[2m";
+const UNDIM: &str = "\x1b[0m";
+
+/// Terminal (cols, rows) via macOS TIOCGWINSZ, falling back to $COLUMNS/80 × 24.
+fn terminal_size() -> (usize, usize) {
     #[repr(C)]
     struct WinSize {
         row: u16,
@@ -47,45 +50,74 @@ fn terminal_cols() -> usize {
     };
     let ok = unsafe { ioctl(1, TIOCGWINSZ, &mut ws as *mut WinSize) } == 0;
     if ok && ws.col > 0 {
-        return ws.col as usize;
+        return (ws.col as usize, (ws.row as usize).max(2));
     }
-    std::env::var("COLUMNS")
+    let cols = std::env::var("COLUMNS")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|&c| c > 0)
-        .unwrap_or(80)
+        .unwrap_or(80);
+    (cols, 24)
 }
 
-/// Truncate to at most `cols` chars (approx display width; good enough for the
-/// mostly-ASCII status row).
-fn truncate_cols(s: &str, cols: usize) -> String {
-    if s.chars().count() <= cols {
-        s.to_string()
-    } else {
-        s.chars().take(cols.saturating_sub(1)).collect::<String>() + "…"
+/// Terminal rows a string occupies at `cols` width (counting wrapping; a
+/// trailing display-width approximated by char count, adequate for our text).
+fn rows_for(text: &str, cols: usize) -> usize {
+    let cols = cols.max(1);
+    text.split('\n')
+        .map(|line| {
+            let w = line.chars().count();
+            if w == 0 { 1 } else { w.div_ceil(cols) }
+        })
+        .sum()
+}
+
+/// Keep only the last `max_rows` wrapped rows of `text`, prefixing "…\n" when
+/// content was dropped. Bounds the redrawable region to the screen so the
+/// relative-cursor-up clear never runs off the top.
+fn clamp_tail_rows(text: &str, cols: usize, max_rows: usize) -> String {
+    if max_rows == 0 {
+        return String::new();
     }
+    if rows_for(text, cols) <= max_rows {
+        return text.to_string();
+    }
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut kept: Vec<&str> = Vec::new();
+    let mut rows = 1; // reserve one row for the "…" marker
+    for &line in lines.iter().rev() {
+        let r = rows_for(line, cols);
+        if rows + r > max_rows && !kept.is_empty() {
+            break;
+        }
+        kept.push(line);
+        rows += r;
+    }
+    kept.reverse();
+    format!("…\n{}", kept.join("\n"))
 }
 
-/// Terminal render state, mutated by events and painted by the ticker.
+/// Terminal render state: inline dimmed streaming with no status line.
 ///
-/// Layout invariant: immutable **committed** text is printed permanently and
-/// append-only (it may wrap freely; never re-cleared). A single transient
-/// status row lives below it, drawn via cursor save/restore (`\x1b7`/`\x1b8`):
-/// each repaint restores to the saved end-of-permanent, clears everything below
-/// (`\x1b[0J`), flushes any new committed text, re-saves, and prints one status
-/// line. This is prose-safe (committed streams immediately, not only on
-/// newlines) and wrap-safe (clear-to-end-of-screen handles any width).
+/// Layout: committed (block-final) text is printed permanently as NORMAL text,
+/// append-only, flushed only on complete lines so it always ends at a line
+/// boundary — it may wrap and scroll freely and is never re-touched. Below it, a
+/// **transient** region shows the current block's still-forming tail DIMMED,
+/// exactly where the text will land; when the block commits, that text is
+/// re-emitted permanently as normal (un-dimmed). The transient is redrawn each
+/// tick via relative cursor-up (`\x1b[1A\r\x1b[2K` per row) and is clamped to
+/// the screen height, so the clear never runs off the top — scroll-safe with no
+/// DECSC/DECRC (which don't survive scrolling).
 struct Render {
-    /// Full visible text; `[0, committed_len)` is immutable/committed.
+    /// Full visible answer text; `[0, committed_len)` is immutable/committed.
     text: String,
     committed_len: usize,
-    /// Bytes of the committed region already printed permanently.
-    printed_upto: usize,
+    /// Bytes of committed text already flushed permanently (ends at '\n' or 0).
+    printed: usize,
     /// True once the permanent "model> " prefix has been printed.
     prefixed: bool,
-    /// True once a transient status row has been drawn (guards `\x1b8`).
-    drawn: bool,
-    // Status telemetry.
+    /// Terminal rows the transient region currently occupies.
+    transient_rows: usize,
     prefill: bool,
     block: usize,
     step: u32,
@@ -94,16 +126,17 @@ struct Render {
     locked: usize,
     spinner: usize,
     cols: usize,
+    rows: usize,
 }
 
 impl Render {
-    fn new(cols: usize) -> Self {
+    fn new(cols: usize, rows: usize) -> Self {
         Render {
             text: String::new(),
             committed_len: 0,
-            printed_upto: 0,
+            printed: 0,
             prefixed: false,
-            drawn: false,
+            transient_rows: 0,
             prefill: true,
             block: 0,
             step: 0,
@@ -112,6 +145,7 @@ impl Render {
             locked: 0,
             spinner: 0,
             cols,
+            rows,
         }
     }
 
@@ -136,89 +170,81 @@ impl Render {
             ChatEvent::Text { committed, text } => {
                 self.text = text.clone();
                 self.committed_len = *committed;
-                if self.printed_upto > self.committed_len {
-                    // Committed prefix shrank (rare re-sanitize divergence);
-                    // never re-print, just stop advancing past the new bound.
-                    self.printed_upto = self.committed_len;
+                if self.printed > self.committed_len {
+                    self.printed = self.committed_len; // committed prefix shrank (rare)
                 }
             }
-            // Rewind only affects the transient draft (redrawn each tick);
-            // BlockCommit/TurnStart/Done carry no extra terminal state.
             _ => {}
         }
     }
 
-    /// Erase the transient region, returning the cursor to end-of-permanent.
-    fn erase_transient(&self) {
-        if self.drawn {
-            print!("\x1b8\x1b[0J"); // restore to saved end-of-permanent, clear below
-        } else {
-            print!("\r\x1b[2K"); // first paint: just clear the current row
+    /// Erase the transient region, leaving the cursor at its top (== end of the
+    /// permanent committed text, always column 0 since committed ends at '\n').
+    fn erase_transient(&mut self) {
+        if self.transient_rows == 0 {
+            return;
         }
+        // `\x1b[G` (cursor to column 1) rather than `\r`: a CSI sequence is
+        // immune to CR→NL output translation (OCRNL), which would otherwise
+        // walk the cursor down and stack the redraws instead of clearing.
+        print!("\x1b[G\x1b[2K");
+        for _ in 1..self.transient_rows {
+            print!("\x1b[1A\x1b[G\x1b[2K");
+        }
+        self.transient_rows = 0;
     }
 
-    /// Repaint: flush any new committed text permanently, then draw the single
-    /// transient status row. Sole stdout writer during a turn.
+    /// Repaint. Sole stdout writer during a turn.
     fn paint(&mut self) {
         self.erase_transient();
-        // Flush all newly-committed (immutable) text permanently.
+        // Flush newly-committed COMPLETE lines permanently (normal text). This
+        // keeps the permanent region ending at a line boundary so the transient
+        // below always starts at column 0.
         let region_end = self.committed_len.min(self.text.len());
-        if self.printed_upto < region_end {
-            if !self.prefixed {
-                print!("model> ");
-                self.prefixed = true;
+        if self.printed < region_end {
+            if let Some(rel) = self.text[self.printed..region_end].rfind('\n') {
+                let end = self.printed + rel + 1;
+                if !self.prefixed {
+                    print!("model> ");
+                    self.prefixed = true;
+                }
+                print!("{}", &self.text[self.printed..end]);
+                self.printed = end;
             }
-            print!("{}", &self.text[self.printed_upto..region_end]);
-            self.printed_upto = region_end;
         }
-        print!("\x1b7"); // save cursor at end of permanent text
-        self.drawn = true;
-        // Transient status: drawn at the cursor (NO leading newline — a leading
-        // `\n` scrolls at the screen bottom and, because DECSC/DECRC don't track
-        // scrolling, leaves stale saved positions that pile up as blank lines).
-        // A separator space keeps the spinner off any mid-line committed text.
+        // Transient: the still-forming tail (uncommitted + any partial committed
+        // line), dimmed, clamped to the screen so its redraw stays on-screen.
+        // `styled` carries the dim/spinner escapes; `visible` is the same text
+        // without escapes, used to count the rows to clear next tick.
         let frame = SPINNER[self.spinner % SPINNER.len()];
-        let at_line_start =
-            self.printed_upto == 0 || self.text[..self.printed_upto].ends_with('\n');
-        let sep = if at_line_start { "" } else { " " };
-        let draft = self.text[self.printed_upto..].replace('\n', " ");
-        let draft = draft.trim();
-        let body = if self.prefill {
-            "prefilling…".to_string()
-        } else if draft.is_empty() {
-            format!(
-                "thinking · block {} · step {}/{} · {}/{} locked",
+        let tail = &self.text[self.printed..];
+        let (styled, visible) = if self.prefill {
+            let s = format!("{frame} thinking…");
+            (s.clone(), s)
+        } else if tail.trim().is_empty() {
+            let s = format!(
+                "{frame} thinking · block {} · step {}/{} · {}/{} locked",
                 self.block, self.step, self.max_steps, self.locked, self.canvas
-            )
+            );
+            (s.clone(), s)
         } else {
-            // Tail of the forming draft, so long drafts stay on one row.
-            let cap = self.cols.saturating_sub(6);
-            if draft.chars().count() > cap {
-                let tail: String = draft
-                    .chars()
-                    .rev()
-                    .take(cap)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect();
-                format!("…{tail}")
-            } else {
-                draft.to_string()
-            }
+            let prefix = if self.prefixed { "" } else { "model> " };
+            let body = clamp_tail_rows(tail, self.cols, self.rows.saturating_sub(1));
+            (
+                format!("{prefix}{DIM}{body}{UNDIM} {frame}"),
+                format!("{prefix}{body} {frame}"),
+            )
         };
-        print!(
-            "{sep}{}",
-            truncate_cols(&format!("{frame} {body}"), self.cols.saturating_sub(1))
-        );
+        print!("{styled}");
+        self.transient_rows = rows_for(&visible, self.cols);
         let _ = std::io::stdout().flush();
         self.spinner = self.spinner.wrapping_add(1);
     }
 
     /// Reconcile against the authoritative reply and end the line.
     fn finish(&mut self, reply: &str) {
-        self.erase_transient(); // cursor now at end of permanent committed text
-        let shown = &self.text[..self.printed_upto.min(self.text.len())];
+        self.erase_transient();
+        let shown = &self.text[..self.printed.min(self.text.len())];
         if reply.is_empty() {
             if self.prefixed {
                 println!();
@@ -230,12 +256,11 @@ impl Render {
         if !self.prefixed {
             println!("model> {reply}");
         } else if let Some(rest) = reply.strip_prefix(shown) {
-            // Continue the committed line with the authoritative remainder.
+            // Re-emit the remaining (previously-dimmed) text permanently, normal.
             print!("{rest}");
             println!();
         } else {
-            // The streamed prefix diverged from the final commit (rare late
-            // revision); reprint the authoritative reply fresh.
+            // Streamed prefix diverged from the final commit (rare); reprint.
             println!();
             println!("model> {reply}");
         }
@@ -288,7 +313,10 @@ impl ChatStream {
         let shared = Arc::new(Mutex::new(Shared {
             decoder: StreamDecoder::new(Arc::clone(&tokenizer), stop_token_ids),
             json,
-            render: Render::new(terminal_cols()),
+            render: {
+                let (cols, rows) = terminal_size();
+                Render::new(cols, rows)
+            },
             interactive,
         }));
         {
