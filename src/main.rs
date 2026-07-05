@@ -1,6 +1,8 @@
 mod buffer;
 mod chat_template;
 #[cfg(all(feature = "metal", target_os = "macos"))]
+mod chat_protocol;
+#[cfg(all(feature = "metal", target_os = "macos"))]
 mod chat_ui;
 mod config;
 mod denoise_trace;
@@ -265,8 +267,9 @@ enum Command {
         max_layers: Option<usize>,
         no_early_stop: bool,
         initial_prompt: Option<String>,
-    
         verbose: bool,
+        events_path: Option<PathBuf>,
+        json: bool,
     },
     Smoketest {
         prompts_path: Option<PathBuf>,
@@ -681,6 +684,8 @@ fn main() -> ExitCode {
             no_early_stop,
             initial_prompt,
             verbose,
+            events_path,
+            json,
         } => run_chat_cmd(
             &cli.model_dir,
             initial_prompt,
@@ -691,6 +696,8 @@ fn main() -> ExitCode {
             no_early_stop,
             cli.raw_prompt,
             verbose,
+            events_path,
+            json,
         ),
         Command::Smoketest {
             prompts_path,
@@ -2847,6 +2854,8 @@ fn parse_cli() -> Cli {
     let mut write_trace: Option<PathBuf> = None;
     let mut no_early_stop = false;
     let mut chat_verbose = false;
+    let mut chat_events_path: Option<PathBuf> = None;
+    let mut chat_json = false;
     let mut kernel_assert = false;
     let mut kernel_debug_deep = false;
     let mut output_dir: Option<PathBuf> = None;
@@ -2934,6 +2943,12 @@ fn parse_cli() -> Cli {
             "--repeat-prefill" => bench_repeat_prefill = true,
             "--no-early-stop" => no_early_stop = true,
             "--verbose" => chat_verbose = true,
+            "--json" => chat_json = true,
+            "--events" => {
+                if let Some(v) = args.next() {
+                    chat_events_path = Some(PathBuf::from(v));
+                }
+            }
             "--assert" => kernel_assert = true,
             "--debug-deep" => kernel_debug_deep = true,
             "--gpu-kv" => step_gpu_kv = true,
@@ -3178,8 +3193,9 @@ fn parse_cli() -> Cli {
             max_layers: parity_layers,
             no_early_stop,
             initial_prompt: prompt.clone(),
-        
             verbose: chat_verbose,
+            events_path: chat_events_path.clone(),
+            json: chat_json,
         },
         Some("smoketest") => Command::Smoketest {
             prompts_path: positional.get(1).map(PathBuf::from),
@@ -3853,18 +3869,50 @@ fn run_chat_cmd(
     no_early_stop: bool,
     raw_prompt: bool,
     verbose: bool,
+    events_path: Option<PathBuf>,
+    json: bool,
 ) -> ExitCode {
     use metal::{generate_with_session, StepGenerateConfig, StepGenerateSession};
     use std::io::{self, IsTerminal, Write};
 
     // Quiet by default: chat is a UI, not a log. `--verbose` restores the
-    // step/prefill/session logs (equivalent to leaving DGQ_QUIET unset).
+    // step/prefill/session logs; `--json` routes the event stream to stdout so
+    // no human chrome may pollute it.
     if !verbose && std::env::var_os("DGQ_QUIET").is_none() {
         unsafe {
             std::env::set_var("DGQ_QUIET", "1");
         }
     }
-    let interactive = !verbose && io::stdout().is_terminal();
+    // `--json`: JSONL to stdout, all human output suppressed. Otherwise the
+    // spinner/streaming renderer runs on an interactive tty (not under
+    // --verbose). `--events <path>` tees the JSONL to a file either way.
+    let interactive = !json && !verbose && io::stdout().is_terminal();
+    let events_file = match &events_path {
+        Some(p) => match std::fs::File::create(p) {
+            Ok(f) => Some(f),
+            Err(err) => {
+                eprintln!("error: cannot open --events {}: {err}", p.display());
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+    // Per-turn JSON sink factory: stdout for --json, a cloned handle to the
+    // events file otherwise. `None` when neither is requested.
+    let make_json_sink = |turn_active: bool| -> Option<Box<dyn Write + Send>> {
+        if !turn_active {
+            return None;
+        }
+        if json {
+            Some(Box::new(io::stdout()))
+        } else {
+            events_file
+                .as_ref()
+                .and_then(|f| f.try_clone().ok())
+                .map(|f| Box::new(f) as Box<dyn Write + Send>)
+        }
+    };
+    let want_json = json || events_file.is_some();
 
     if !dgq::store::looks_like_dgq_dir(model_dir) {
         eprintln!("error: chat requires a .dgq directory (-m /path/to/quantized-weights)");
@@ -3879,23 +3927,28 @@ fn run_chat_cmd(
         }
     };
 
-    // Full-message chat: generate until the model emits its end-of-turn token
-    // rather than a fixed token budget. `--max-new-tokens` (default 256) becomes
-    // a per-turn safety cap; raise it so a normal reply can span several 256-token
-    // blocks. The KV arena is sized once at session open and is fixed thereafter,
-    // so pick a roomy `max_seq` up front (4096 ≈ 960 MiB KV @ 240 KiB/token).
-    const CHAT_MAX_SEQ: usize = 4096;
-    let full_message_cap = max_new_tokens.max(1024);
+    // Full-message chat: generate until the model emits its end-of-turn token,
+    // limited only by the context window (no per-turn token cap — long replies
+    // stream freely). The KV arena is sized once at session open and fixed
+    // thereafter, so pick a roomy `max_seq` up front (8192 ≈ 1.7 GiB KV; leaves
+    // ~8k tokens of headroom for a long poem etc.). `--max-new-tokens`, if the
+    // caller raises it above the default, becomes an optional hard ceiling.
+    const CHAT_MAX_SEQ: usize = 8192;
+    let explicit_cap = if max_new_tokens > 256 {
+        Some(max_new_tokens)
+    } else {
+        None
+    };
 
     let stop_token_ids = config::load_generation_stop_tokens(model_dir);
     if verbose {
-        eprintln!("chat: full-message stop tokens = {stop_token_ids:?}, cap = {full_message_cap}");
+        eprintln!("chat: full-message stop tokens = {stop_token_ids:?}, cap = {explicit_cap:?}");
     }
 
     let sampler = sample::sampler_for_steps(steps, no_early_stop);
     let mut step_cfg = StepGenerateConfig::from_generate(
         seed,
-        full_message_cap,
+        CHAT_MAX_SEQ,
         CHAT_MAX_SEQ,
         layers,
         sampler,
@@ -3944,17 +3997,21 @@ fn run_chat_cmd(
      -> Result<(), safetensors::Error> {
         let prompt = build_chat_prompt_tokens(model_dir, history, raw_prompt)?;
         let prompt_len = prompt.len();
-        // KV arena is fixed at session open (CHAT_MAX_SEQ); clamp the per-turn
-        // cap to whatever budget the prompt leaves.
+        // KV arena is fixed at session open (CHAT_MAX_SEQ); the reply may use
+        // the whole remaining context (no artificial cap), or the caller's
+        // explicit ceiling if one was given.
         let budget = CHAT_MAX_SEQ.saturating_sub(prompt_len);
         if budget == 0 {
-            println!("model> (prompt fills the {CHAT_MAX_SEQ}-token context; cannot generate)");
+            if !json {
+                println!("model> (prompt fills the {CHAT_MAX_SEQ}-token context; cannot generate)");
+            }
             history.push(chat_template::ChatTurn::model(String::new()));
             *turn_idx = turn_idx.wrapping_add(1);
             return Ok(());
         }
-        step_cfg.max_new_tokens = full_message_cap.min(budget);
+        step_cfg.max_new_tokens = explicit_cap.map_or(budget, |c| c.min(budget));
         step_cfg.seed = seed.wrapping_add(*turn_idx);
+        let this_turn = *turn_idx;
         *turn_idx = turn_idx.wrapping_add(1);
 
         let started = std::time::Instant::now();
@@ -3962,6 +4019,9 @@ fn run_chat_cmd(
             std::sync::Arc::clone(&tokenizer),
             step_cfg.stop_token_ids.clone(),
             interactive,
+            make_json_sink(want_json),
+            this_turn,
+            prompt_len,
         );
         step_cfg.step_observer = Some(stream.observer());
         let out = generate_with_session(&mut session, &prompt, &step_cfg, "chat")?;
@@ -3972,15 +4032,27 @@ fn run_chat_cmd(
             out.token_ids.get(prompt_len..).unwrap_or(&[]),
         );
         let reply = chat_template::sanitize_model_reply(&tokenizer.decode(&new_ids));
-        stream.finish(&reply);
         let new_tokens = out.token_ids.len().saturating_sub(prompt_len);
         let secs = elapsed.as_secs_f64();
-        let cap_note = if out.stopped_on_eot { "" } else { " · hit token cap" };
-        println!(
-            "  ({new_tokens} tok · {} steps · {secs:.1}s · {:.1} tok/s{cap_note})",
-            out.denoise_steps_run,
-            new_tokens as f64 / secs.max(1e-9),
-        );
+        stream.finish(&reply, new_tokens, out.denoise_steps_run, secs, out.stopped_on_eot);
+
+        if !interactive && !json {
+            // Non-interactive human output (piped / --verbose): print the reply
+            // once, since the terminal renderer was disabled.
+            if reply.is_empty() {
+                println!("model> (empty response)");
+            } else {
+                println!("model> {reply}");
+            }
+        }
+        if !json {
+            let cap_note = if out.stopped_on_eot { "" } else { " · hit context limit" };
+            println!(
+                "  ({new_tokens} tok · {} steps · {secs:.1}s · {:.1} tok/s{cap_note})",
+                out.denoise_steps_run,
+                new_tokens as f64 / secs.max(1e-9),
+            );
+        }
         history.push(chat_template::ChatTurn::model(reply));
         Ok(())
     };
@@ -3996,11 +4068,15 @@ fn run_chat_cmd(
         }
     }
 
-    println!("chat ready (type 'exit' or 'quit' to end; Ctrl-D also exits)");
+    if !json {
+        println!("chat ready (type 'exit' or 'quit' to end; Ctrl-D also exits)");
+    }
     let stdin = io::stdin();
     loop {
-        print!("you> ");
-        let _ = io::stdout().flush();
+        if !json {
+            print!("you> ");
+            let _ = io::stdout().flush();
+        }
         let mut line = String::new();
         match stdin.read_line(&mut line) {
             Ok(0) => break,

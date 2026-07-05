@@ -338,6 +338,14 @@ impl Tokenizer {
     /// Decode token ids to text (Gemma SentencePiece: ▁ marks word starts).
     pub fn decode(&self, ids: &[u32]) -> String {
         let mut out = String::new();
+        self.decode_append(&mut out, ids);
+        out
+    }
+
+    /// Incremental decode: appends the text for `ids` to `out`. This mirrors
+    /// [`decode`](Self::decode) but lets callers reuse a buffer across calls so
+    /// streaming UIs don't re-decode the whole committed prefix every step.
+    pub fn decode_append(&self, out: &mut String, ids: &[u32]) {
         for &id in ids {
             let Some(piece) = self.id_to_token(id) else {
                 continue;
@@ -351,7 +359,6 @@ impl Tokenizer {
                 out.push_str(piece);
             }
         }
-        out
     }
 }
 

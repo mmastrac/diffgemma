@@ -1,232 +1,341 @@
-//! Live chat rendering: thinking spinner + stable-prefix token streaming.
+//! Live chat rendering, driven by the `ChatEvent` protocol (`chat_protocol`).
 //!
-//! Streaming rule: a canvas position's argmax counts as *stable* once it has
-//! held the same value for 2 consecutive denoise steps. The longest stable
-//! prefix of the answer (cut at the first stop token) is decoded and printed
-//! incrementally. Under the MLX-exact sampler the block's final commit IS the
-//! last step's argmax, so this preview converges to the real reply; printing
-//! is monotone (text is only ever appended when the new decode extends what
-//! is already on screen) and `finish()` reconciles against the authoritative
-//! final reply.
+//! Two sinks consume the event stream:
+//! - **JSONL** (optional): every event as one JSON line, to a file (`--events`)
+//!   or stdout (`--json`). This is the observable ground truth.
+//! - **Terminal** (default, interactive tty): a spinner + streamed text.
+//!
+//! The terminal renderer is robust against the failure that plagued the old
+//! append-based version (corruption once text wraps across terminal rows):
+//! - A background **ticker** thread is the *sole* writer to stdout and repaints
+//!   on a fixed timer, so the spinner keeps moving even across the silent
+//!   KV-extend / prefill gaps between blocks (the previous "lockup").
+//! - Only **immutable committed whole lines** are ever printed permanently
+//!   (append-only, may wrap freely — never re-cleared). The speculative draft
+//!   and the status live in a single transient status row that is truncated to
+//!   the terminal width and cleared with `\r\x1b[2K` — one row, no wrap, no
+//!   cursor-up gymnastics.
 
+use crate::chat_protocol::{ChatEvent, StreamDecoder};
 use crate::metal::{StepObserver, StepProgressEvent};
 use crate::tokenizer::Tokenizer;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-/// Consecutive-step repeats required before a position streams (3 sightings —
-/// 2 proved too eager on fast-converging replies).
-const STABLE_STREAK: u32 = 2;
+const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-struct StreamInner {
-    last_argmax: Vec<u32>,
-    streak: Vec<u32>,
-    block_idx: usize,
-    /// Final ids of committed blocks (already cut at the first stop token).
-    committed_ids: Vec<u32>,
-    /// Stop token seen — no further text will be shown.
-    ended: bool,
-    /// Text already written to stdout (after "model> ").
-    printed: String,
-    started_text: bool,
-    status: String,
+/// Terminal columns (macOS TIOCGWINSZ), falling back to `$COLUMNS` then 80.
+fn terminal_cols() -> usize {
+    #[repr(C)]
+    struct WinSize {
+        row: u16,
+        col: u16,
+        xpix: u16,
+        ypix: u16,
+    }
+    unsafe extern "C" {
+        fn ioctl(fd: i32, request: u64, ...) -> i32;
+    }
+    const TIOCGWINSZ: u64 = 0x4008_7468; // macOS
+    let mut ws = WinSize {
+        row: 0,
+        col: 0,
+        xpix: 0,
+        ypix: 0,
+    };
+    let ok = unsafe { ioctl(1, TIOCGWINSZ, &mut ws as *mut WinSize) } == 0;
+    if ok && ws.col > 0 {
+        return ws.col as usize;
+    }
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&c| c > 0)
+        .unwrap_or(80)
+}
+
+/// Truncate to at most `cols` chars (approx display width; good enough for the
+/// mostly-ASCII status row).
+fn truncate_cols(s: &str, cols: usize) -> String {
+    if s.chars().count() <= cols {
+        s.to_string()
+    } else {
+        s.chars().take(cols.saturating_sub(1)).collect::<String>() + "…"
+    }
+}
+
+/// Terminal render state, mutated by events and painted by the ticker.
+///
+/// Layout invariant: immutable **committed** text is printed permanently and
+/// append-only (it may wrap freely; never re-cleared). A single transient
+/// status row lives below it, drawn via cursor save/restore (`\x1b7`/`\x1b8`):
+/// each repaint restores to the saved end-of-permanent, clears everything below
+/// (`\x1b[0J`), flushes any new committed text, re-saves, and prints one status
+/// line. This is prose-safe (committed streams immediately, not only on
+/// newlines) and wrap-safe (clear-to-end-of-screen handles any width).
+struct Render {
+    /// Full visible text; `[0, committed_len)` is immutable/committed.
+    text: String,
+    committed_len: usize,
+    /// Bytes of the committed region already printed permanently.
+    printed_upto: usize,
+    /// True once the permanent "model> " prefix has been printed.
+    prefixed: bool,
+    /// True once a transient status row has been drawn (guards `\x1b8`).
+    drawn: bool,
+    // Status telemetry.
+    prefill: bool,
+    block: usize,
+    step: u32,
+    max_steps: usize,
+    canvas: usize,
+    locked: usize,
+    spinner: usize,
+    cols: usize,
+}
+
+impl Render {
+    fn new(cols: usize) -> Self {
+        Render {
+            text: String::new(),
+            committed_len: 0,
+            printed_upto: 0,
+            prefixed: false,
+            drawn: false,
+            prefill: true,
+            block: 0,
+            step: 0,
+            max_steps: 0,
+            canvas: 0,
+            locked: 0,
+            spinner: 0,
+            cols,
+        }
+    }
+
+    fn apply(&mut self, ev: &ChatEvent) {
+        match ev {
+            ChatEvent::BlockStart { block } => self.block = *block,
+            ChatEvent::Status {
+                block,
+                step,
+                max_steps,
+                canvas,
+                locked,
+                ..
+            } => {
+                self.prefill = false;
+                self.block = *block;
+                self.step = *step;
+                self.max_steps = *max_steps;
+                self.canvas = *canvas;
+                self.locked = *locked;
+            }
+            ChatEvent::Text { committed, text } => {
+                self.text = text.clone();
+                self.committed_len = *committed;
+                if self.printed_upto > self.committed_len {
+                    // Committed prefix shrank (rare re-sanitize divergence);
+                    // never re-print, just stop advancing past the new bound.
+                    self.printed_upto = self.committed_len;
+                }
+            }
+            // Rewind only affects the transient draft (redrawn each tick);
+            // BlockCommit/TurnStart/Done carry no extra terminal state.
+            _ => {}
+        }
+    }
+
+    /// Erase the transient region, returning the cursor to end-of-permanent.
+    fn erase_transient(&self) {
+        if self.drawn {
+            print!("\x1b8\x1b[0J"); // restore to saved end-of-permanent, clear below
+        } else {
+            print!("\r\x1b[2K"); // first paint: just clear the current row
+        }
+    }
+
+    /// Repaint: flush any new committed text permanently, then draw the single
+    /// transient status row. Sole stdout writer during a turn.
+    fn paint(&mut self) {
+        self.erase_transient();
+        // Flush all newly-committed (immutable) text permanently.
+        let region_end = self.committed_len.min(self.text.len());
+        if self.printed_upto < region_end {
+            if !self.prefixed {
+                print!("model> ");
+                self.prefixed = true;
+            }
+            print!("{}", &self.text[self.printed_upto..region_end]);
+            self.printed_upto = region_end;
+        }
+        print!("\x1b7"); // save cursor at end of permanent text
+        self.drawn = true;
+        // Transient status row (one line): live draft tail, or a thinking line.
+        let frame = SPINNER[self.spinner % SPINNER.len()];
+        let draft = self.text[self.printed_upto..].replace('\n', " ");
+        let draft = draft.trim();
+        let body = if self.prefill {
+            "prefilling…".to_string()
+        } else if draft.is_empty() {
+            format!(
+                "thinking · block {} · step {}/{} · {}/{} locked",
+                self.block, self.step, self.max_steps, self.locked, self.canvas
+            )
+        } else {
+            // Show the tail of the forming draft so long drafts stay on one row.
+            let cap = self.cols.saturating_sub(6);
+            let tail: String = if draft.chars().count() > cap {
+                format!("…{}", draft.chars().rev().take(cap).collect::<Vec<_>>().into_iter().rev().collect::<String>())
+            } else {
+                draft.to_string()
+            };
+            tail
+        };
+        print!(
+            "\n{}",
+            truncate_cols(&format!("{frame} {body}"), self.cols.saturating_sub(1))
+        );
+        let _ = std::io::stdout().flush();
+        self.spinner = self.spinner.wrapping_add(1);
+    }
+
+    /// Reconcile against the authoritative reply and end the line.
+    fn finish(&mut self, reply: &str) {
+        self.erase_transient(); // cursor now at end of permanent committed text
+        let shown = &self.text[..self.printed_upto.min(self.text.len())];
+        if reply.is_empty() {
+            if self.prefixed {
+                println!();
+            } else {
+                println!("model> (empty response)");
+            }
+            return;
+        }
+        if !self.prefixed {
+            println!("model> {reply}");
+        } else if let Some(rest) = reply.strip_prefix(shown) {
+            // Continue the committed line with the authoritative remainder.
+            print!("{rest}");
+            println!();
+        } else {
+            // The streamed prefix diverged from the final commit (rare late
+            // revision); reprint the authoritative reply fresh.
+            println!();
+            println!("model> {reply}");
+        }
+    }
+}
+
+/// Shared state behind one mutex: the decoder + JSON sink (touched by the
+/// generation thread via the observer) and the terminal render state (painted
+/// by the ticker). Only the ticker and `finish` write to stdout.
+struct Shared {
+    decoder: StreamDecoder<Arc<Tokenizer>>,
+    json: Option<Box<dyn Write + Send>>,
+    render: Render,
+    interactive: bool,
+}
+
+impl Shared {
+    fn emit(&mut self, ev: &ChatEvent) {
+        if let Some(w) = self.json.as_mut() {
+            if serde_json::to_writer(&mut *w, ev).is_ok() {
+                let _ = w.write_all(b"\n");
+                let _ = w.flush();
+            }
+        }
+        if self.interactive {
+            self.render.apply(ev);
+        }
+    }
 }
 
 pub struct ChatStream {
-    inner: Arc<Mutex<StreamInner>>,
+    shared: Arc<Mutex<Shared>>,
     done: Arc<AtomicBool>,
-    tokenizer: Arc<Tokenizer>,
-    stop_token_ids: Vec<u32>,
     interactive: bool,
     ticker: Option<std::thread::JoinHandle<()>>,
 }
 
-fn clear_line() {
-    print!("\r\x1b[2K");
-}
-
 impl ChatStream {
-    /// `interactive=false` (piped stdout / --verbose) disables the spinner and
-    /// streaming; only the final reply is printed by `finish`.
+    /// `interactive` enables the terminal spinner/streaming (an interactive
+    /// tty). `json` is an optional JSONL sink (file or stdout). `turn` /
+    /// `prompt_tokens` seed the opening `TurnStart` event.
     pub fn start(
         tokenizer: Arc<Tokenizer>,
         stop_token_ids: Vec<u32>,
         interactive: bool,
+        json: Option<Box<dyn Write + Send>>,
+        turn: u64,
+        prompt_tokens: usize,
     ) -> Self {
-        let inner = Arc::new(Mutex::new(StreamInner {
-            last_argmax: Vec::new(),
-            streak: Vec::new(),
-            block_idx: 0,
-            committed_ids: Vec::new(),
-            ended: false,
-            printed: String::new(),
-            started_text: false,
-            status: "prefilling…".to_string(),
+        let shared = Arc::new(Mutex::new(Shared {
+            decoder: StreamDecoder::new(Arc::clone(&tokenizer), stop_token_ids),
+            json,
+            render: Render::new(terminal_cols()),
+            interactive,
         }));
+        {
+            let mut s = shared.lock().unwrap();
+            s.emit(&ChatEvent::TurnStart {
+                turn,
+                prompt_tokens,
+            });
+        }
         let done = Arc::new(AtomicBool::new(false));
-
         let ticker = if interactive {
-            let inner_t = Arc::clone(&inner);
+            let shared_t = Arc::clone(&shared);
             let done_t = Arc::clone(&done);
-            Some(std::thread::spawn(move || {
-                let mut frame = 0usize;
-                loop {
-                    if done_t.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    {
-                        let st = inner_t.lock().unwrap();
-                        if st.started_text {
-                            break; // text is streaming; spinner retired
-                        }
-                        clear_line();
-                        print!(
-                            "{} thinking · {}",
-                            SPINNER_FRAMES[frame % SPINNER_FRAMES.len()],
-                            st.status
-                        );
-                        let _ = std::io::stdout().flush();
-                    }
-                    frame += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(120));
+            Some(std::thread::spawn(move || loop {
+                if done_t.load(Ordering::Relaxed) {
+                    break;
                 }
+                shared_t.lock().unwrap().render.paint();
+                std::thread::sleep(Duration::from_millis(100));
             }))
         } else {
             None
         };
-
         Self {
-            inner,
+            shared,
             done,
-            tokenizer,
-            stop_token_ids,
             interactive,
             ticker,
         }
     }
 
-    /// The observer to install as `StepGenerateConfig::step_observer`.
+    /// Observer to install as `StepGenerateConfig::step_observer`.
     pub fn observer(&self) -> StepObserver {
-        let inner = Arc::clone(&self.inner);
-        let tokenizer = Arc::clone(&self.tokenizer);
-        let stops = self.stop_token_ids.clone();
-        let interactive = self.interactive;
+        let shared = Arc::clone(&self.shared);
         Arc::new(move |ev: &StepProgressEvent<'_>| {
-            let mut st = inner.lock().unwrap();
-            if st.ended {
-                return;
-            }
-            if ev.block_idx != st.block_idx {
-                st.block_idx = ev.block_idx;
-                st.last_argmax.clear();
-                st.streak.clear();
-            }
-            if st.last_argmax.len() != ev.argmax.len() {
-                st.last_argmax = ev.argmax.to_vec();
-                st.streak = vec![0; ev.argmax.len()];
-            } else {
-                for i in 0..ev.argmax.len() {
-                    if ev.argmax[i] == st.last_argmax[i] {
-                        st.streak[i] = st.streak[i].saturating_add(1);
-                    } else {
-                        st.streak[i] = 0;
-                        st.last_argmax[i] = ev.argmax[i];
-                    }
-                }
-            }
-            st.status = format!(
-                "step {}/{} · {}/{} locked",
-                ev.step_in_block,
-                ev.max_steps,
-                ev.accept_count,
-                ev.argmax.len()
-            );
-
-            // Display ids = committed blocks + this block's stable prefix
-            // (block_done: the whole block is final), cut at the first stop.
-            let mut ids = st.committed_ids.clone();
-            let prefix_end = if ev.block_done {
-                ev.argmax.len()
-            } else {
-                st.streak
-                    .iter()
-                    .position(|&k| k < STABLE_STREAK)
-                    .unwrap_or(ev.argmax.len())
-            };
-            let mut hit_stop = false;
-            for &id in &ev.argmax[..prefix_end] {
-                if stops.contains(&id) {
-                    hit_stop = true;
-                    break;
-                }
-                ids.push(id);
-            }
-            if ev.block_done {
-                st.committed_ids = ids.clone();
-                st.last_argmax.clear();
-                st.streak.clear();
-                if hit_stop {
-                    st.ended = true;
-                }
-            }
-
-            if !interactive {
-                return;
-            }
-            let shown = crate::sample::strip_degenerate_token_ids(&ids);
-            if shown.is_empty() {
-                return;
-            }
-            let text = crate::chat_template::sanitize_model_reply(&tokenizer.decode(&shown));
-            if text.len() > st.printed.len() && text.starts_with(&st.printed) {
-                let delta = text[st.printed.len()..].to_string();
-                if !st.started_text {
-                    clear_line();
-                    print!("model> ");
-                    st.started_text = true;
-                }
-                print!("{delta}");
-                let _ = std::io::stdout().flush();
-                st.printed = text;
+            let mut s = shared.lock().unwrap();
+            let events = s.decoder.on_step(ev);
+            for e in &events {
+                s.emit(e);
             }
         })
     }
 
-    /// Reconcile the streamed preview against the authoritative final reply
-    /// and terminate the line. Returns nothing; prints the remainder (or the
-    /// whole reply when nothing streamed / the preview diverged).
-    pub fn finish(mut self, reply: &str) {
+    /// Reconcile the stream against the authoritative reply, terminate the
+    /// line, and close the JSON stream with a `Done` event.
+    pub fn finish(mut self, reply: &str, tokens: usize, steps: usize, secs: f64, stopped: bool) {
         self.done.store(true, Ordering::Relaxed);
         if let Some(t) = self.ticker.take() {
             let _ = t.join();
         }
-        let st = self.inner.lock().unwrap();
-        if self.interactive && !st.started_text {
-            clear_line();
+        let mut s = self.shared.lock().unwrap();
+        if self.interactive {
+            s.render.finish(reply);
         }
-        if reply.is_empty() {
-            println!("model> (empty response)");
-            return;
-        }
-        if st.started_text {
-            if reply.starts_with(&st.printed) {
-                println!("{}", &reply[st.printed.len()..]);
-            } else {
-                // The preview diverged from the final commit (rare: a late
-                // argmax revision). Erase the draft (cursor-up per printed
-                // newline; wrapped long lines may leave residue — acceptable)
-                // and reprint authoritatively.
-                clear_line();
-                for _ in 0..st.printed.matches('\n').count() {
-                    print!("\x1b[1A\x1b[2K");
-                }
-                print!("\r");
-                println!("model> {reply}");
-            }
-        } else {
-            println!("model> {reply}");
-        }
+        s.emit(&ChatEvent::Done {
+            tokens,
+            steps,
+            secs,
+            stopped,
+            text: reply.to_string(),
+        });
     }
 }
