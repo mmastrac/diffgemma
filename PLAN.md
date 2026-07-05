@@ -32,7 +32,6 @@ multi-seed gate aggregate + wart census + explicit user approval.
 
 | Item | Note |
 |---|---|
-| Chat-mode polish | quiet-by-default, thinking animation, stable-prefix streaming |
 | Seed-123 empty-reply artifact | short factual prompts, both prefill paths (engine 5 / fast 2 of 17 at that seed); trajectory-level, pre-existing |
 | Legacy GEMM retirement | `gemm_block*` legacy pipelines after a stable tunable cycle (KERNELS.md deprecation list; needs user nod) |
 | Mechanical kernel merges | embed_gather / gather_rows / f32_to_half families (KERNELS.md) |
