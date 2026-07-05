@@ -1,109 +1,61 @@
-# diffgemma-mps — production plan
+# diffgemma-mps — plan
 
-Low-dependency Rust + Metal inference engine for [DiffusionGemma](https://huggingface.co/google/diffusiongemma-26B-A4B-it) (Gemma-4 26B-A4B MoE, discrete block diffusion) on Apple Silicon.
+Low-dependency Rust + Metal inference engine for
+[DiffusionGemma](https://huggingface.co/google/diffusiongemma-26B-A4B-it)
+(Gemma-4 26B-A4B MoE, discrete block diffusion) on Apple Silicon.
 
-Single forward-looking plan: **open work only.** Resolved work, measured data, and bug archaeology live in `NOTES.md`. How to work on the code: `STRATEGY.md`. Model semantics: `ARCHITECTURE.md`.
+Docs: **SPEC.md** = the implemented generation contract. **KERNELS.md** =
+kernel verdicts + precision policy. **STRATEGY.md** = how to work here.
+**src/flags.rs** = every env flag. History lives in git + agent memory,
+not here.
 
----
+## Where we are (2026-07-05 — near done)
 
-## Where we are (2026-06)
+The engine is in ship shape:
 
-`ask` (single-encoder step kernel; formerly `generate-monolithic`, kept as alias) is the production path. The non-monolithic decoder/engine path is retired to validation-only — the f32 `GpuDecoderEngine` survives solely as the `step-parity` oracle. **Mixed-precision `.dgq`** (`model/diffusiongemma-q4emb`): bf16 attention + dense FFN, bf16 embed (tied lm_head + SC), q8 SC-MLP, **q4 experts** (only bulk-quantized tensor — memory constraint). Blob ~18.9 GiB.
+- **Perf**: ~0.93–0.97 s/step (M3 Pro, 30L) — under MLX-4bit's 0.94 s/step
+  pace, with fewer denoise steps. Tunable GEMM, block-sparse MoE, MMA
+  attention, sparse SC all default-on and validated.
+- **Quality**: MLX-exact sampler semantics default (no-freeze + argmax commit,
+  signed off 2026-07-05). Wart census 0/10 (was 4/10). Smoketest 17/17 at the
+  spec seed. Fast-prefill degenerate class fixed as a side effect.
+- **Correctness**: full test suite green (704). Step-parity oracle valid.
+  Quantization exonerated as a quality lever (q6 experiment).
+- **Model**: `model/diffusiongemma-q4emb` (bf16 attn/dense/embed, q8 SC, q4
+  experts, ~18.9 GiB blob). q6/nvfp4 profiles + split-blob supported.
 
-**Quality vs MLX-4bit** (`mlx-community/diffusiongemma-26B-A4B-it-4bit`, matched-canvas "sky blue"): output-level equivalent — coherent, correct, ~8-step convergence; smoketest 16/16. Residual: a few steps behind MLX-13 on the hard tail; minor long-chat doubling.
+**Standing rule: quality never ratchets without a human sign-off.**
+Bit-identical changes ship on identity evidence; anything else needs the
+multi-seed gate aggregate + wart census + explicit user approval.
 
-**Latency (M3 Pro, 30L, sparse SC default-on):** **~1.26 s/step**, **1.34× slower/step than MLX-4bit (0.94 s)** — down from 1.71× at the start of this cycle. Step is GPU-compute-bound across many kernels already near peak MFU; no single dominant bucket.
+## Open items (all small)
 
-### Target
-Sustained **≥ 8 tok/s e2e on 24 GiB base; 25+ on Pro/Max 36 GiB**, MLX-quality chat. Per-step ≤ 1.2 s stretch.
-
-### Non-goals (this cycle)
-Training/LoRA, multi-user serving, CUDA/Linux, vision (deferred; `--skip-vision`).
-
----
-
-## Shipped this cycle (perf, all validated)
-block-sparse MoE GEMM · GQA matrix-unit attention sliding (`DGQ_ATTN_MMA`) · **flash full-attention MMA** (`DGQ_ATTN_MMA_FULL`, default-on, register-resident O + QG-grouped K/V sharing; attention −29% / step −11% at kv=512, oracle cos≥0.9999, smoketest 16/16, MLX-equivalent) · bf16 stacked QKV+gate/up · **MoE gather-fusion + scatter rewrite** (~100 ms, bit-identical) · **sparse SC softembed** (`DGQ_SC_SPARSE`, default-on, ~16%/step, smoketest 16/16, MLX-equivalent — *approximate*, drops prob tail < e⁻¹⁰ of row max) · **GEMM-kernel consolidation** (4 shaders folded into gemm_block/_stacked/rowk-acc via FC, all bit-identical). Cumulative this session: 1.61 → 1.26 s/step (single-block); attention scales with context — full-attention MMA cuts ~11% at kv=512.
-
-**Attention is the real-world #1 cost** (kv_len sweep: 40% of step at kv=512, grows linearly; synthetic kv_len=0 bench understates it ~3×). Sliding (mma2) + full (mma_full) now both MMA. Full-attn QG stays at 2: lifting QG via per-chunk device-Q is disproven (per-key-tile Q re-read adds a T/8 factor that worsens with context — see memory).
-
-## Disproven non-levers (do NOT re-attempt without new info — see `NOTES.md`/memory)
-2D dense-GEMM register-blocking (production 1D wide-N already beats it at M=256 fat-N) · SC softembed tiling (occupancy-bound; wide-N/bigger-chunk/coalesce all worse) · full-layer 1-head attention MMA *with tgmem O tile* (superseded — register-resident-O version now shipped) · partial bf16 lm_head (frozen rows' hidden states still evolve → breaks convergence) · partial-forward (K/V staleness) · dispatch/ICB (~0.2 ms/step encode) · bounds-check removal · load_unsafe · nvfp4 experts.
-
----
-
-## Q — MLX equivalence (active)
-
-| # | Task | Exit |
-|---|------|------|
-| Q4 | Close last few steps to MLX-4bit (hard-tail convergence) + residual long-chat doubling | matched-canvas ≤ 14 steps; no visible doubling |
-| Q5 | Confirm equivalence on long multi-block generations (not just single-block) | side-by-side long-gen quality table |
-
-**Q4 leads (memory-neutral only — no resident bf16 experts):** bf16 (7-mantissa) vs MLX f16 (10-mantissa) **activation** precision is the leading hypothesis — per-layer cos drift accumulates 0–29 (NOTES §10), memory-neutral to test (bf16→f16 arena, check f16 overflow vs ~100s-magnitude residual stream). NOT experts (nvfp4 didn't help) and NOT embed (bf16-embed fix holds, after_preamble cos 1.0). Tooling: `--write-trace` + `DGQ_TRACE_ENTROPY=1` → `dump_mlx_denoise_trace.py --canvas-ids` → `compare_denoise_trace.py`.
-
----
-
-## P2 — Latency
-
-**Largely closed this cycle (1.71×→1.34×).** Remaining levers are low-EV; the step is compute-bound at good MFU.
-
-**Honest per-step split (30L, `--profile-steps`, post-sparse-SC):** pre_moe (qkv+attn+o_proj+dense) ~43% · moe_grouped (experts) ~22% (was ~26%, gather/scatter shipped) · finish (lm_head) ~15% · preamble (SC) ~10% (was ~16%, sparse shipped) · moe_post ~0.3%.
-> Use `--profile-steps N`, NOT `--layer-profile` (per-stage sync flattens the breakdown).
-
-| # | Task | Status / note |
-|---|------|------|
-| P2.6 | lm_head MPS/precision sweep | open — finish ~15%, partial-lm-head is q8-only (bf16 partial breaks convergence) |
-| P2.8 | KV windowing for full layers as committed context grows | open — full/global layers (hd=512, 5 of 30) dominate attention in long context |
-| P2.9 | Flash full-attention kernel (register-resident O → group-8 K/V sharing) | open, **meaty + non-bit-identical + uncertain**; only real attention lever left, bigger payoff in long-context |
-
-**P2 exit:** ≤ 1.2 s/step @ 30L; ≥ 8 tok/s e2e.
-
----
-
-## P3 — Harden & ship
-
-| # | Task | Exit |
-|---|------|------|
-| P3.1 | Multi-block extend + `kv>0` golden parity | multi-block matches engine on fixed seed |
-| P3.3 | 24 GiB memory budget enforcement | `--skip-vision` + q4 documented; `iogpu.wired_limit_mb` guidance |
-| P3.5 | CI default monolithic | `step-ci` + templated gate on monolithic path |
-| P3.6 | Declarative step dispatch schedule | `build_step_schedule()` sole source; arena-liveness unit tests; probe=mode-not-fork. (`step_kernel.rs` ~4k lines imperative + a duplicate comment-schedule → drift risk) |
-| P3.7 | GPU debug status / invariant flag | debug-gated `DebugStatus` buffer + shared error codes; ≥3 hot kernels wired; zero prod regression |
-| P3.8 | Subkernel extraction completion | all monolithic stage bodies in `shaders/kernels/` + Tier-1 oracles; retire legacy `qgemm.metal` |
-
-**Resolved loose ends** (now in NOTES): NONDET-SC-1, COLD-START-1 (warm-up workaround). **Still open:** `gemm_q8`/`gemm_q8_rowk` standalone oracle tests fail (32-tile vs `dispatch_shape` n_tile=128; production dispatch correct) — migrate to 128-tile or fix test dispatch (7 pre-existing failures incl. 1 sampler).
-
-**Smoketest gate** (`smoketest` subcommand, `fixtures/smoketest/prompts.json`): convergence + adherence prompts; pre-commit gate, ratchet `max_steps` down. `diffgemma-mps -m <model.dgq> smoketest --layers 30 --seed 42`.
-
-**P3 exit:** ship-quality chat @ 30L on 24 GiB; schedule asserts prevent drift; `STRATEGY.md` §6 invariants enforced in debug.
-
----
-
-## Risk register
-
-| Risk | Mitigation |
-|------|------------|
-| Sparse SC softembed quality drift on flat distributions | MAXK=8192 overflow keeps first-found not top-K (doesn't trigger at 16/16); `DGQ_SC_SPARSE=0` opt-out; monitor |
-| Accept/entropy changes shift token goldens | synthetic-entropy fixtures; goldens keep `--raw` + fixed `--steps` |
-| 24 GiB cap tight (blob ~18.9 GiB) | q4 experts + `--skip-vision`; `iogpu.wired_limit_mb` |
-| MoE scatter nondeterminism | `moe_scatter_weighted` TG-reduce (no float atomics); determinism golden |
-
----
+| Item | Note |
+|---|---|
+| Chat-mode polish | quiet-by-default, thinking animation, stable-prefix streaming |
+| Seed-123 empty-reply artifact | short factual prompts, both prefill paths (engine 5 / fast 2 of 17 at that seed); trajectory-level, pre-existing |
+| Legacy GEMM retirement | `gemm_block*` legacy pipelines after a stable tunable cycle (KERNELS.md deprecation list; needs user nod) |
+| Mechanical kernel merges | embed_gather / gather_rows / f32_to_half families (KERNELS.md) |
+| Inert padding-KV write | fast prefill writes garbage KV at [n..256), provably overwritten (SPEC.md §3) |
 
 ## Command reference
 
-`WEIGHTS=model/diffusiongemma-q4emb`. Chat template by default; `--raw` for parity goldens.
+`WEIGHTS=model/diffusiongemma-q4emb`; binary at `target/release/diffgemma-mps`
+(build: `cargo build --release --features metal,blas`).
 
 ```bash
 # Generate / chat
-cargo run --release --features metal -- -m $WEIGHTS ask -p "Hello" --layers 30 --seed 42
-cargo run --release --features metal -- -m $WEIGHTS chat -p "Hello" --layers 30 --seed 42
-# Gate / bench
-cargo run --release --features metal -- -m $WEIGHTS smoketest --layers 30 --seed 42
-cargo run --release --features metal -- -m $WEIGHTS bench-step-kernel --layers 30 --iters 8 --profile-steps 8
-cargo run --release --features metal -- bench-gemm --shapes 256x2816x8192 --iters 5
-# MLX equivalence
-HF_HUB_OFFLINE=1 python/.venv/bin/python python/scripts/compare_generation.py -p "Why is the sky blue?" --rust-model $WEIGHTS
+diffgemma-mps ask  -m $WEIGHTS -p "Hello" --seed 42
+diffgemma-mps chat -m $WEIGHTS
+# Gate / bench / tests
+diffgemma-mps smoketest -m $WEIGHTS            # 17/17 required before commit
+diffgemma-mps bench-step-kernel -m $WEIGHTS --profile-steps 8
+cargo test --release --features metal,blas
+# Requantize from HF safetensors
+diffgemma-mps quantize -m model/transformer -o model/diffusiongemma-q4emb --profile q4
+# MLX reference comparison (SERIALIZE with our runs — never in parallel)
+python/.venv/bin/python python/scripts/mlx_generate.py -p "..." -o /tmp/mlx.json
 ```
 
-Auxiliary commands (`step-probe`, `bench-prefill`, `convert-model`, `probe-device`) documented in `NOTES.md`.
+Wart census: `bash <scratchpad>/wart_census.sh $WEIGHTS out.txt` (10-seed
+greentext; the sensitive sampler probe — 0/10 is the baseline).

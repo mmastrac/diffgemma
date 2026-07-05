@@ -1,8 +1,8 @@
 # diffgemma-mps — engineering strategy for agents
 
-Read this before writing kernels, tests, or chasing bugs. It is not a task list (that's `PLAN.md`) or a data archive (that's `NOTES.md`). It is **how to work on this codebase without repeating the mistakes that have already cost days.**
+Read this before writing kernels, tests, or chasing bugs. It is not a task list (that's `PLAN.md`) or the behavior contract (that's `SPEC.md`). It is **how to work on this codebase without repeating the mistakes that have already cost days.**
 
-The project: a Rust + Metal inference engine for DiffusionGemma (Gemma-4 26B-A4B MoE, discrete block diffusion) on Apple Silicon. Model semantics are in `ARCHITECTURE.md`; authoritative numeric behavior is in the CPU reference (`src/kernels/cpu.rs`, `sample.rs`) and the manifest (`model.dgq.json`).
+The project: a Rust + Metal inference engine for DiffusionGemma (Gemma-4 26B-A4B MoE, discrete block diffusion) on Apple Silicon. Model semantics: `ARCHITECTURE.md` (concept) + `SPEC.md` (implemented contract); authoritative numeric behavior is in the CPU reference (`src/kernels/cpu/`, `sample.rs`) and the manifest (`model.dgq.json`).
 
 ---
 
@@ -93,12 +93,12 @@ Property assertions need no oracle and catch the "catastrophic but novel" class 
 - **Not all-pad / all-filler** on a converged block before early-stop fires. (The premature-commit quality bug.)
 - **Offsets in `ulong`** for all blob addressing — the blob exceeds uint32; a uint intermediate truncates silently.
 - **Quant K-order:** sequential `dequant_q4_group[m]` == `q4_weight_at(row, base+m)` in K-order, not just as a set (VERIFY-K — the blind spot that hid behind VERIFY-N).
-- **Tile-bound dimensions:** For every kernel, list each compile-time tile (32, 64, 128, 65535 grid width) and ask whether a **data-dependent** dimension can exceed it. If yes, there must be either **grid tiling** (`gemm_block`: `m0 = tgid.y * 32`), an **in-kernel striping loop** (`gemm_block_grouped`: `m_base += 32`), or **`dispatch_1d_ranged`** for grid overflow. Tier-1 fixtures must exceed the worst tile (e.g. `rows_per_expert ≥ 33`). See `NOTES.md` §5 tile audit.
+- **Tile-bound dimensions:** For every kernel, list each compile-time tile (32, 64, 128, 65535 grid width) and ask whether a **data-dependent** dimension can exceed it. If yes, there must be either **grid tiling** (`gemm_block`: `m0 = tgid.y * 32`), an **in-kernel striping loop** (`gemm_block_grouped`: `m_base += 32`), or **`dispatch_1d_ranged`** for grid overflow. Tier-1 fixtures must exceed the worst tile (e.g. `rows_per_expert ≥ 33`). Audit mechanically (grep below).
 
-**Three states of this bug class in the codebase:**
-1. **Firing** — fixed array/tile vs data index overflows today (`gemm_block_grouped` M≤32 per expert; Calgary gate_up cos≈0.76).
-2. **Exact-fit fragile** — correct at current config, zero margin (`attention` `acc[8]` when `hd=512` and `tpg_w=64` gives `per=8` exactly; `K_SHAPE_ASSERT per≤8` added).
-3. **Ranged correctly** — dimension can grow unbounded via loop or ranged dispatch (`attention` KV loop `0..T`; vocab via `dispatch_1d_ranged`).
+**Three states of this bug class** (all historical "firing" instances are fixed; the taxonomy is what to check for in NEW kernels):
+1. **Firing** — fixed array/tile vs data index overflows.
+2. **Exact-fit fragile** — correct at current config, zero margin (add a `K_SHAPE_ASSERT`).
+3. **Ranged correctly** — dimension can grow unbounded via loop or ranged dispatch.
 
 **Mechanical audit:** grep for fixed-size threadgroup/private arrays (`float acc[N]`, `threadgroup float x[N]`) and check whether any index is runtime-bounded by a value that can exceed `N`. That catches `acc[8]`, `red[8]`, and siblings in one pass.
 
@@ -108,7 +108,7 @@ Property assertions need no oracle and catch the "catastrophic but novel" class 
 
 - **Numeric behavior:** the CPU reference (`sample.rs`, `kernels/cpu.rs`) is the oracle. When GPU and CPU disagree and parity-vs-HF historically passed, the CPU is right and the GPU path is the suspect.
 - **Weight layout:** `model.dgq.json` manifest is authoritative for shapes, offsets, and tensor orientation. When a kernel's addressing assumption (stride, transpose, fused-vs-separate tensors) is in question, the manifest decides — not memory, not the comment. (The SC GEMM `A@W` vs `A@W^T` and the MoE fused-1408 questions were both settled by the manifest.)
-- **Model semantics:** `ARCHITECTURE.md` and the spec section of `NOTES.md` (RoPE split-half pairing, proportional-RoPE full-head-dim denominator, temperature count-down, test-before-add accept rule, QK-norm folding the attention scale, no separate `query_pre_attn_scalar`). These are checkpoint-specific and several are counterintuitive — do not "correct" them from general Gemma knowledge without checking the reference.
+- **Model semantics:** `SPEC.md` (esp. §2.1 forward-pass details: RoPE split-half pairing, proportional-RoPE full-head-dim denominator, temperature count-down, prefix-sum accept rule, QK-norm folding the attention scale, V aliased from raw k_proj on full layers). These are checkpoint-specific and several are counterintuitive — do not "correct" them from general Gemma knowledge without checking the reference.
 - **Do not trust comments over code/manifest.** A stale comment ("entropy before temperature") has already misled. Verify against the authoritative source.
 
 ---
@@ -120,4 +120,4 @@ Property assertions need no oracle and catch the "catastrophic but novel" class 
 - **Every bug fixed gets a regression test at the lowest tier that would have caught it.** This is how the test suite stops missing the bug class it keeps missing.
 - **No path ships without a golden.** If you add a kernel variant, dense backend, or code path, it gets a matrix row before it's "done." Untested path = next bug.
 - **Don't optimize against a dirty baseline.** Probes out, path confirmed, time attributed — then optimize.
-- **Keep `PLAN.md` (forward work) and `NOTES.md` (data/history) current;** record resolved bugs in `NOTES.md` so they can't be re-litigated, and re-file open issues in `PLAN.md` by their P-number.
+- **Keep `PLAN.md` (open work) and `SPEC.md` (behavior contract) current.** Resolved-bug history lives in git + agent memory; settled kernel verdicts in `KERNELS.md`. Update SPEC.md whenever generation behavior changes.

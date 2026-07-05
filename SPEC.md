@@ -37,10 +37,48 @@ Sampler config (generation_config.json — we implement these defaults):
 ## 2. Two attention phases
 
 - **Prefill (encoder role)**: causal attention over prompt (and later, each
-  committed block) → KV cache. Sliding layers mask to the last window−1
-  positions (matches MLX `_make_decoder_masks`; `DGQ_ATTN_WINDOW=0` for A/B).
-- **Denoise (decoder role)**: canvas attends bidirectionally to itself and
-  causally to the whole KV cache. No causal mask within the canvas.
+  committed block) → KV cache. Sliding layers: query q attends [q−(window−1), q].
+- **Denoise (decoder role)**: canvas attends bidirectionally to itself and to
+  the KV cache. On sliding layers the canvas sees only the **last window−1
+  encoder positions** plus all canvas (matches MLX `_make_decoder_masks`;
+  `DGQ_ATTN_WINDOW=0` restores unwindowed for A/B). Canvas position ids are
+  `kv_len .. kv_len+255` (continuation after prefill). No timestep/noise-level
+  embedding exists.
+
+## 2.1 Forward-pass details (checkpoint-specific; several are counterintuitive)
+
+Settled against the reference implementations and the CPU oracle — do NOT
+"correct" these from general Gemma knowledge:
+
+- **Norms**: classic Gemma RMSNorm (`x/sqrt(mean(x²)+eps) · w`, eps 1e-6) —
+  not `(1+w)`. Pre-norm everywhere. QK-norm = per-head RMSNorm with learned
+  weights; V gets `rms_norm_no_scale`. The FF sandwich has SEVEN norms
+  (input, post_attn, pre_ff, post_ff_1, pre_ff_2, post_ff_2, post_ff) — drop
+  none. A per-layer bf16 `layer_scalar` multiplies the whole layer output.
+- **RoPE**: rotation pairs are **split-half** `(d, d+rotary_dim/2)`, NOT
+  interleaved. Sliding layers: full rotary, theta 1e4. Full layers: theta 1e6,
+  `partial_rotary_factor 0.25` (128 of 512 dims), rope_type "proportional" —
+  and the frequency exponent uses the FULL head_dim (512) as denominator, not
+  the rotated subset (128).
+- **No explicit 1/sqrt(d) attention scale** — raw dots → mask → softmax (the
+  QK-norm folds the scale).
+- **Full-attention layers have no v_proj.** V aliases the RAW k_proj output
+  (`rms_norm_no_scale`, no RoPE) — `values = keys` before k_norm/rope. The
+  kernel must not mutate the K buffer in place before V reads it.
+- **MoE order**: rms_norm_no_scale(stream) → `router_scale[i]·hidden^-0.5` →
+  linear → softmax over 128 → top-8 → renormalize the 8 to sum 1 → multiply
+  by `per_expert_scale[expert]`. Tie-break: higher prob wins; equal prob →
+  lower expert index (CPU and GPU must match). No separate shared expert —
+  the dense MLP runs in parallel as the always-on path. `gate_up_proj`
+  trailing dim 1408 = fused [gate‖up], 704 each. Activation gelu_pytorch_tanh,
+  NOT SiLU.
+- **SC injection**: before layer 0 only —
+  `hidden = embeds + down(gelu_tanh(gate(x))·up(x))` where
+  `x = RMSNorm_w(soft_signal)`; then rms_norm_no_scale. The soft mix gets the
+  same sqrt(hidden) scale as token embeds.
+- **RNG**: LCG `state = state·6966169279 + 1039523323`, uniform from the high
+  32 bits; `Rng::new(seed)` → state = seed+1; GPU resumes the post-canvas-init
+  state.
 
 ## 3. Prefill path selection
 
