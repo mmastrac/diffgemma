@@ -6,9 +6,15 @@ kernel exist / merge / change dtype"; re-audit when a family gains members.
 
 ## Hot-path budget (steady denoise step ≈ 1.22 s, kv=25, all-GPU)
 
+> **2026-07-02 CORRECTION: the GEMM "walls" below are OUR-KERNEL walls, not
+> machine walls.** At our exact production shapes on this M3 Pro: MPS matmul
+> 3.4–3.7 TF/s (f32!) / 3.7–4.2 (f16); MLX steel/qmm 4.0–4.4 (f16 and q4g32,
+> verified CSE-defeated + per-eval). Our best: 2.4–2.9. ~1.5–1.7× kernel
+> headroom across ~1.0s of the 1.22s step. See "GEMM headroom investigation".
+
 | Bucket | ms | Rate vs roofline | Verdict |
 |---|---|---|---|
-| dense GEMMs (qkv / o_proj / FFN, `gemm_block*`) | ~380 | 1.8–2.3 TF/s ≈ peak | at the wall |
+| dense GEMMs (qkv / o_proj / FFN, `gemm_block*`) | ~380 | 1.8–2.3 TF/s ≈ our-kernel wall | ~1.5x headroom vs MPS/MLX (see correction above) |
 | attention (`attention_mma2` / `attention_mma_full`) | ~190 | attention-typical | tuned levers disproven; window-clipped ≥1024 |
 | MoE experts (`gemm_block_sparse` + scatter) | ~315 | ~2.3 TF/s on USEFUL flops ≈ dense wall | at the wall; M-tile levers disproven (see below) |
 | SC preamble (`sc_sparse_*`, SC MLP q8, rowstats) | ~165 | occupancy-bound | tiling levers disproven |
@@ -89,6 +95,39 @@ tiles — the padding is real, it just isn't on the critical path):
   wall time ~0% → per-TG cost is weight-dequant/fixed-dominated, not
   MMA-bound. Any future MoE lever must cut per-TG weight traffic (fewer
   threadgroups touching each expert's rows), not M padding.
+
+## GEMM headroom investigation (2026-07-02) — OPEN, the next big lever
+
+MPS/MLX prove ~1.5–1.7× GEMM headroom at our shapes (numbers above). Root
+cause hunted with a bench-only prototype (`gemm_block_sq`, wired into
+`bench-gemm` as `gemm_block_sq/*` rows, correctness-checked vs gemm_block):
+
+**Exonerated (each measured null on this machine):**
+- Occupancy alone: 32x32x32 @ ~9KB tgmem (3 TGs/core vs production's 1 at
+  20KB) TIES gemm_block (~2.3). But N_TILE=32 at UNCHANGED 20KB = 1.47 —
+  narrow tiles need small tgmem to break even; occupancy matters, it's just
+  not the MLX delta.
+- bf16 A-load conversion: x_fp16 reinterpret variant = no change.
+- W-dequant lane utilization (32→128 threads): no change.
+- Transposed tgmem B loads (store-W-transposed variant): no change.
+- f16 accumulation: MLX BlockMMA AccumType defaults to FLOAT — they
+  accumulate f32 like us.
+
+**Partial win, shippable:** 64x64x32 tile (4 simdgroups, 32x32 quadrant, 16
+accs) at ~10KB via aliasing the f32 store tile over the dead load buffers:
++7% over production at MoE shapes (3.07 vs 2.88 @ 2048x704x2816), tie at
+M=256, and **bit-exact vs gemm_block (max|d| = 0.0)** — the K-chain per
+output is unchanged by tiling.
+
+**Where the rest lives:** MLX steel's fragment-level machinery — per-lane
+`vec<T,2>` register-tile loads with compile-time strides (never
+`simdgroup_load` from tgmem), `simdgroup_barrier(mem_none)` scheduling hints,
+software-pipelined loader/MMA overlap (BlockLoader/BlockMMA in the mlx wheel
+headers, MIT). Capturing it = a real GEMM-engineering project: port
+steel-style loaders+MMA tiles into our FC/dequant/bf16 framework. Payoff is
+measured, not speculative: up to ~300ms/step (1.22 → ~0.9s, past MLX).
+Bit-identity is plausibly preservable (steel's kk order is ascending 8-chunks
+like ours; keep our dequant math + bf16 I/O rounding) — verify per element.
 
 ## Test-harness debt
 
