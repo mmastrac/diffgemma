@@ -215,15 +215,18 @@ pub fn moe_block_sparse_enabled() -> bool {
 /// Adaptive M-tile for the block-sparse MoE GEMMs (GEMM_M_ADAPT): each block's
 /// threadgroup picks the smallest simdgroup M-mapping (8/16/32 rows) covering
 /// its actual row count, killing the MMA padding waste of tiny-M expert tails.
-/// Same block list, same single dispatch, same scheduling; bit-identical per
+/// Same block list, same single dispatch, same scheduling; BIT-IDENTICAL per
 /// output element (same K-accumulation chain, only the simdgroup->work mapping
-/// changes). `DGQ_MOE_TILE_ADAPT=1` opts in (bring-up; default off until
-/// verified). Requires block-sparse (auto-off if `DGQ_MOE_BLOCK_SPARSE=0`).
+/// changes). Perf today: wash (per-TG cost is pipeline-bound, see KERNELS.md
+/// GEMM headroom investigation) — **default ON** (user 2026-07-02) as a latent
+/// win that activates when the steel-class GEMM port (task #19) makes the
+/// kernel compute-bound. `DGQ_MOE_TILE_ADAPT=0` opts out. Requires
+/// block-sparse (auto-off if `DGQ_MOE_BLOCK_SPARSE=0`).
 pub fn moe_tile_adapt_enabled() -> bool {
     moe_block_sparse_enabled()
         && match std::env::var("DGQ_MOE_TILE_ADAPT") {
-            Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
-            Err(_) => false,
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
         }
 }
 

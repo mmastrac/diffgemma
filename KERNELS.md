@@ -69,7 +69,7 @@ q4/nvfp4 (QUANT_FORMAT), sc_softembed bf16 variant.
 - `scatter_vocab_chunk`: validation placeholder.
 - Env-gated graveyard (keep, documented as disproven): partial-lm trio
   (`compact_active_rows`, `scatter_logits_rows`, partial lm_head path),
-  `DGQ_ACCEPT_ROW_CAP`, `DGQ_HIDDEN_F32`, `DGQ_MOE_TILE_ADAPT` (below).
+  `DGQ_ACCEPT_ROW_CAP`, `DGQ_HIDDEN_F32`.
 
 ## MoE tiny-M investigation (2026-07-02) — CLOSED, no lever
 
@@ -88,13 +88,16 @@ tiles — the padding is real, it just isn't on the critical path):
   for 4 empty dispatches) — Metal hazard tracking serializes same-buffer
   dispatches. Machinery removed. **Rule: never split a hot GEMM into multiple
   same-encoder dispatches on this path.**
-- **Adaptive-M** (`DGQ_MOE_TILE_ADAPT`, kept env-gated default-off): single
-  dispatch, per-block runtime simdgroup remap (8/16/32 rows) — bit-identical
-  (subkernel bitwise tests q4+nvfp4, E2E token-identical on/off). Perf: wash
-  (+~1.5%). Removing 50-75% of the MMA work from ~1/3 of threadgroups moved
-  wall time ~0% → per-TG cost is weight-dequant/fixed-dominated, not
-  MMA-bound. Any future MoE lever must cut per-TG weight traffic (fewer
-  threadgroups touching each expert's rows), not M padding.
+- **Adaptive-M** (`DGQ_MOE_TILE_ADAPT`, **default ON** since 2026-07-02 —
+  user call; `=0` opts out): single dispatch, per-block runtime simdgroup
+  remap (8/16/32 rows) — bit-identical (subkernel bitwise tests q4+nvfp4,
+  E2E token-identical on/off, gate 17/17 at default). Perf: wash (adjacent
+  A/Bs ±1.5%, overlapping). Removing 50-75% of the MMA work from ~1/3 of
+  threadgroups moved wall time ~0% → per-TG cost is pipeline/fixed-dominated
+  (see GEMM headroom investigation), not MMA-bound. Enabled anyway as a
+  LATENT win: once the steel-class GEMM port (task #19) makes per-TG cost
+  compute-bound, the padding savings activate — carry the adaptive M-mapping
+  into that port.
 
 ## GEMM headroom investigation (2026-07-02) — OPEN, the next big lever
 
