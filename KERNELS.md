@@ -33,10 +33,10 @@ kernel exist / merge / change dtype"; re-audit when a family gains members.
 
 - **Weights**: bf16 lossless (attention / dense FFN / embed), q4 group-32
   experts (memory constraint), q8 SC-MLP. No changes.
-- **Activation planes**: bf16 (`arena_load/store`, toggleable to f16 via
-  `K_ACT_F16` for experiments only). The global-f16 flip, the f32 residual
-  stream (`DGQ_HIDDEN_F32`, kept default-off), and finer expert formats were
-  each built and measured: none improves quality; each just re-rolls
+- **Activation planes**: bf16 (`arena_load/store`). The global-f16 flip
+  (K_ACT_F16), the f32 residual stream (DGQ_HIDDEN_F32), and finer expert
+  formats were each built, measured, DISPROVEN, and their machinery DELETED
+  in the 2026-07-05 flag cleanup: none improves quality; each just re-rolls
   borderline-prompt trajectories. Do not re-litigate without new evidence.
 - **f16 where values are bounded [0,1]**: `sc_probs` (fp16 + GEMM prob scale),
   attention P tiles (half). Already done; nothing else qualifies.
@@ -57,7 +57,7 @@ q4/nvfp4 (QUANT_FORMAT), sc_softembed bf16 variant.
 
 **Merge (mechanical, bit-identical, low priority)**
 - `embed_gather` + `embed_gather_bf16` → one shader, quant FC (q8/raw) —
-  halves the pipeline variants (now ×2 again for `K_HIDDEN_Y_F32`).
+  halves the pipeline variants (the hf32 variants are gone as of 2026-07-05).
 - `gather_rows` / `gather_rows_bf16` / `gather_rows_bf16_to_f32` → one shader,
   in/out dtype FCs.
 - `f32_to_half` + `f32_to_half_scale` → scale FC (plain variant currently has
@@ -68,7 +68,7 @@ q4/nvfp4 (QUANT_FORMAT), sc_softembed bf16 variant.
   algorithms and geometries; scalar is the causal-prefill + oracle path.
 - `rms_norm_rows` vs `rms_norm_rows_tiled`: engine-vs-monolith dispatch
   patterns differ.
-- `residual_half` (monolith, scalar+hidden-f32 axes) vs `vec_add_inplace`
+- `residual_half` (monolith, scalar axis) vs `vec_add_inplace`
   (engine): different paths, both production.
 
 **Deleted (2026-07-02 cleanup after tunable landed)**
@@ -91,9 +91,14 @@ q4/nvfp4 (QUANT_FORMAT), sc_softembed bf16 variant.
   2026-07-02; removal needs their nod.
 - `gemm_block_grouped` (pre-sparse MoE): DGQ_MOE_BLOCK_SPARSE=0 fallback only.
 
-**Env-gated graveyard (keep, documented as disproven):** partial-lm trio
-(`compact_active_rows`, `scatter_logits_rows`, partial lm_head path),
-`DGQ_ACCEPT_ROW_CAP`, `DGQ_HIDDEN_F32`.
+**Graveyard (disproven machinery DELETED in the 2026-07-05 flag cleanup):**
+DGQ_HIDDEN_F32 (f32 hidden planes + hf32 kernel variants), K_ACT_F16 (f16
+arena FC), ICB record/replay (step_icb), DGQ_ACCEPT_ROW_CAP (superseded by the
+no-freeze fix), DGQ_SC_PRE_TEMP, the slow + full-prob SC softembed paths
+(sc_softembed.metal deleted; chunked + sparse remain), scalar-per-expert MoE
+env toggle, DGQ_GEMM_N_TILE (fixed 128), DGQ_MONOLITHIC, DGQ_TIME_DISPATCH,
+DGQ_TRACE_BISECT. The partial-lm trio stays (live under DGQ_FREEZE=1).
+**All surviving flags live in `src/flags.rs` — the single registry.**
 
 ## MoE tiny-M investigation (2026-07-02) — CLOSED, no lever
 

@@ -7,14 +7,9 @@ pub fn div_up(value: usize, group: usize) -> usize {
     (value + group - 1) / group
 }
 
-/// N-axis tile width for block GEMM (`DGQ_GEMM_N_TILE`: 128 default, set `32` to opt out).
+/// N-axis tile width for the block GEMM family.
 pub fn n_tile() -> usize {
-    static TILE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *TILE.get_or_init(|| match std::env::var("DGQ_GEMM_N_TILE").as_deref() {
-        Ok("32") => 32,
-        Ok(v) => v.parse::<usize>().unwrap_or(128),
-        Err(_) => 128,
-    })
+    128
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]

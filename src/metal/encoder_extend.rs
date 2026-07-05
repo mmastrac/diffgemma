@@ -12,12 +12,7 @@ use crate::model::layer_weights::DecoderLayerWeights;
 use crate::safetensors::Error;
 use crate::weights::WeightStore;
 
-fn progress_enabled() -> bool {
-    match std::env::var("DGQ_QUIET") {
-        Ok(v) => v != "1" && !v.eq_ignore_ascii_case("true"),
-        Err(_) => true,
-    }
-}
+use crate::flags::progress_enabled;
 
 pub fn prefill_gpu(
     store: &WeightStore,
@@ -87,7 +82,7 @@ pub fn prefill_gpu(
     // path. `DGQ_PREFILL_RESIDENT=0` falls back to the classic per-layer path.
     let resident = weights.is_dgq()
         && engine.encoder_gpu_moe()
-        && std::env::var("DGQ_PREFILL_RESIDENT").map(|v| v != "0").unwrap_or(true);
+        && crate::flags::prefill_resident_enabled();
     if resident {
         if progress_enabled() {
             eprintln!(

@@ -224,7 +224,7 @@ Systematic check: for each kernel, find every dimension bounded by a tile consta
 | QUAL-1 | Templated chat + `--steps 2` → no readable reply | **done** (P1.2; production `--steps 48`) |
 | CLI-1 | `--steps` default 2 vs 48 | **done** (P1.2) |
 | CHAT-1 | Display decodes full 256 block incl. pads | **done** (P1.4) |
-| SC-1 | `k_sc_softembed` O(vocab × hidden)/step | **done** (P2.3): chunked f32-accumulate GEMM is default; slow O(vocab) kept only as `DGQ_SC_GEMM=0` reference |
+| SC-1 | `k_sc_softembed` O(vocab × hidden)/step | **done** (P2.3): chunked f32-accumulate GEMM is default (slow O(vocab) reference DELETED in the 2026-07-05 flag cleanup) |
 | DISPATCH-1 | ~130 encoder calls/step/layer | open (P2.4) |
 | LM-PARTIAL-1 | Full 256×262k lm_head every step | **done** (P2.5): frozen mask + partial GEMM; ~25% denoise on Hello |
 | MOE-1 | Float atomic scatter nondeterministic / wrong | **done** monolithic batched path (per-TG reduce); engine CPU MoE parity path unchanged |
@@ -460,10 +460,10 @@ End-to-end: ~3% smoketest (1.70→1.65 s/step), ~4.5% on `--profile-steps` stead
 
 ## 13. bf16 stacked QKV / gate+up GEMM (2026-06)
 
-**Landed default-on; bit-identical; ~1.3% production (short ctx) / ~4.8% forward-only.** Fuses the per-layer QKV (q‖k‖v) and dense gate‖up projections into one stacked GEMM each on the **bf16 default path** (previously only the q4/nvfp4 path stacked; bf16 ran 3 separate q/k/v + 2 gate/up GEMMs). New `gemm_bf16_stacked.metal` = `gemm_block_stacked` minus dequant (reads bf16 [N,K] rows), reusing the FC segment table (`qkv_stacked_segments`/`gate_up_stacked_segments` are format-agnostic blob offsets) + output scatter. Wired in `encode_layer_qkv_gemm`/`encode_layer_dense_gate_up` under `attn_ffn_bf16`; gated by the existing `DGQ_FUSED_QKV`/`DGQ_FUSED_GATE_UP` (default on; `=0` opts each out).
+**Landed default-on; bit-identical; ~1.3% production (short ctx) / ~4.8% forward-only.** Fuses the per-layer QKV (q‖k‖v) and dense gate‖up projections into one stacked GEMM each on the **bf16 default path** (previously only the q4/nvfp4 path stacked; bf16 ran 3 separate q/k/v + 2 gate/up GEMMs). New `gemm_bf16_stacked.metal` = `gemm_block_stacked` minus dequant (reads bf16 [N,K] rows), reusing the FC segment table (`qkv_stacked_segments`/`gate_up_stacked_segments` are format-agnostic blob offsets) + output scatter. Wired in `encode_layer_qkv_gemm`/`encode_layer_dense_gate_up` under `attn_ffn_bf16`; gated by `DGQ_FUSED_ALGEBRA` (default on; the per-GEMM sub-flags were collapsed in the 2026-07-05 flag cleanup).
 
 **Win is GPU utilization, not bandwidth:** 5 small sequential GEMMs (q N=4096, k/v N=2048, gate/up N=2112) underutilize vs 2 fused (qkv N=8192, gate_up N=4224); weights are distinct so bandwidth is unchanged. Forward-only (`bench-step-kernel --profile-steps`, clean) = 1.475 vs 1.55 s/step (~4.8%); full-generate production ~1.3% (diluted by the constant preamble/SC/finish/sampler/readback overhead, which is a large fraction at short single-block context — the win grows with context). Bit-identical: same per-column dot products + tiling as the split path — verified same tokens + accept curve (scalar-attn A/B).
 
 **Methodology note — don't trust `bench-gemm-fusion` as-is:** it reported "stacked +20%" but compares `gemm_q4_stacked` (q4, ¼ the weight bytes) vs the bf16 split — a q4-bandwidth confound. The real bf16-stacked-vs-bf16-split is ~1.3–4.8%, an order of magnitude less. Always measure the same dtype on both sides.
 
-(Also added env-gated `DGQ_TIME_DISPATCH` in `dispatch_and_wait`: prints encode-vs-GPU split. Confirmed CPU encode is ~0.2 ms/step vs ~1600 ms GPU — so dispatch/sync overhead is negligible and the step is GPU-compute-bound; ICB replay (P2.2) would save nothing. The MLX per-step gap is real kernel compute, not overhead.)
+(A since-removed dispatch-timing probe confirmed CPU encode is ~0.2 ms/step vs ~1600 ms GPU — so dispatch/sync overhead is negligible and the step is GPU-compute-bound; ICB replay (P2.2) would save nothing. The MLX per-step gap is real kernel compute, not overhead.)

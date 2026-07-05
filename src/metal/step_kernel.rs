@@ -59,22 +59,20 @@ pub const MOE_ACT_PROBE_META_FLOATS: usize = 36; // tok,slot,e,w,x[8],row0[8], d
 
 use crate::metal::arena_layout::{build_arena_layout, ArenaLayout, ArenaLayoutParams};
 
+// All DGQ_* env flags live in crate::flags; re-exported here so existing
+// `step_kernel::<flag>()` call sites keep working.
+pub use crate::flags::{
+    attn_mma_enabled, attn_mma_full_enabled, attn_window_enabled, denoise_parity_log_enabled,
+    denoise_parity_log_positions, denoiser_argmax_enabled, final_entropy_log_enabled,
+    freeze_enabled, fused_algebra_enabled, fused_gate_up_enabled, fused_qkv_enabled,
+    gemm_tunable_enabled, logits_finite_check_enabled, logits_finite_sample_count,
+    moe_block_sparse_enabled, moe_fuse_gather_enabled, moe_tile_adapt_enabled,
+    partial_lm_head_enabled, router_gemm_enabled, sc_sparse_enabled, should_fast_prefill,
+    step_text_log_enabled, trace_entropy_enabled, FAST_PREFILL_MIN_TOKENS,
+};
+
 pub const MAX_ATTN_Q_COLS: usize = 8192;
 pub const MAX_ATTN_KV_COLS: usize = 2048;
-
-/// f32 hidden + stream planes (`DGQ_HIDDEN_F32=1`, default off): keeps the
-/// residual accumulator at 23-bit mantissa across all 30 layers instead of
-/// re-rounding to bf16 at every residual add — the dominant per-step self-noise
-/// vs the f32 engine (layer-26 hidden cos 0.975 → target ~0.99+). GEMM inputs
-/// and every other plane stay bf16, so per-layer compute is unchanged.
-pub fn hidden_f32_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("DGQ_HIDDEN_F32")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
-}
 
 pub fn step_arena_params() -> ArenaLayoutParams {
     ArenaLayoutParams {
@@ -83,7 +81,6 @@ pub fn step_arena_params() -> ArenaLayoutParams {
         dense_ff: DENSE_FF as usize,
         max_attn_q_cols: MAX_ATTN_Q_COLS,
         max_attn_kv_cols: MAX_ATTN_KV_COLS,
-        hidden_f32: hidden_f32_enabled(),
     }
 }
 
@@ -181,232 +178,22 @@ pub struct CanvasState {
     pub frozen: [u32; FROZEN_WORDS],
 }
 
-/// P2.5: skip lm_head on canvas rows committed in prior denoise steps within this block.
-/// Sparse SC softembed (top-survivors gather instead of the full vocab GEMM).
-/// APPROXIMATE (drops prob tail below e^-10 of row max). **Default on** (signed
-/// off): ~16% faster/step (1.50→1.26 s/step), smoketest 16/16, output-level
-/// equivalent to MLX-4bit (8-step convergence). `DGQ_SC_SPARSE=0` opts out.
-/// Needs bf16 embed (gated at call site).
-pub fn sc_sparse_enabled() -> bool {
-    match std::env::var("DGQ_SC_SPARSE") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
-    }
-}
 
-pub fn partial_lm_head_enabled() -> bool {
-    match std::env::var("DGQ_PARTIAL_LM_HEAD") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
-    }
-}
 
-/// Block-sparse (megablocks-style) MoE expert GEMM: pre-tile the ragged M into
-/// fixed <=32-row blocks and run one block per threadgroup (vs one
-/// variable-length threadgroup per expert). Bit-identical to the grouped path,
-/// ~6% faster per step — **default on**; `DGQ_MOE_BLOCK_SPARSE=0` to opt out.
-pub fn moe_block_sparse_enabled() -> bool {
-    match std::env::var("DGQ_MOE_BLOCK_SPARSE") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
-    }
-}
 
-/// Adaptive M-tile for the block-sparse MoE GEMMs (GEMM_M_ADAPT): each block's
-/// threadgroup picks the smallest simdgroup M-mapping (8/16/32 rows) covering
-/// its actual row count, killing the MMA padding waste of tiny-M expert tails.
-/// Same block list, same single dispatch, same scheduling; BIT-IDENTICAL per
-/// output element (same K-accumulation chain, only the simdgroup->work mapping
-/// changes). Perf today: wash (per-TG cost is pipeline-bound, see KERNELS.md
-/// GEMM headroom investigation) — **default ON** (user 2026-07-02) as a latent
-/// win that activates when the tunable GEMM port (task #19) makes the
-/// kernel compute-bound. `DGQ_MOE_TILE_ADAPT=0` opts out. Requires
-/// block-sparse (auto-off if `DGQ_MOE_BLOCK_SPARSE=0`).
-pub fn moe_tile_adapt_enabled() -> bool {
-    moe_block_sparse_enabled()
-        && match std::env::var("DGQ_MOE_TILE_ADAPT") {
-            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-            Err(_) => true,
-        }
-}
 
-/// Tunable GEMM (task #19): fragment-level 64x64 kernels for the plain Raw
-/// (o_proj/dense/router/lm_head-bf16), q8 (lm_head on q8-embed), stacked
-/// (qkv/gate-up), and block-sparse MoE (q4 experts) paths. BIT-EXACT vs the
-/// legacy kernels (verified per element at all production shapes + E2E
-/// token-identical), step 1.22 -> 0.97s. **Default ON** (2026-07-02, phases
-/// 1-4 landed same-day with identity evidence at each); `DGQ_GEMM_TUNABLE=0`
-/// opts out.
-pub fn gemm_tunable_enabled() -> bool {
-    match std::env::var("DGQ_GEMM_TUNABLE") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
-    }
-}
 
-/// Fuse the MoE gather into the gate_up block-sparse GEMM (A-load reads bf16
-/// `moein` rows via route->token_list). Skips the separate gather pass + its
-/// 23MB/layer f32 round-trip. **Default on** (~28ms/step, bit-identical to
-/// gather+f32, smoketest 16/16); `DGQ_MOE_FUSE_GATHER=0` opts out. Requires
-/// block-sparse (auto-off if `DGQ_MOE_BLOCK_SPARSE=0`).
-pub fn moe_fuse_gather_enabled() -> bool {
-    moe_block_sparse_enabled()
-        && match std::env::var("DGQ_MOE_FUSE_GATHER") {
-            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-            Err(_) => true,
-        }
-}
 
-/// GQA-grouped matrix-unit attention (`attention_mma2`) for sliding layers: 2 Q
-/// heads per threadgroup sharing K/V staging on the simdgroup_matrix units. ~1.6x
-/// vs the scalar online-softmax kernel at hd=256; only valid for sliding layers
-/// (full hd=512 layers keep scalar — 2-head O won't fit threadgroup memory).
-/// **Default on** (~3-4.5% per step); `DGQ_ATTN_MMA=0` to opt out (scalar path).
-/// Non-bit-identical (f16 MMA vs f32 scalar, cos 0.9999) but quality-neutral:
-/// the wobble is the same trajectory chaos the scalar path exhibits (verified
-/// multi-seed), and MMA is no further from the MLX-4bit reference than scalar
-/// (60 vs 69 matched-canvas mismatches). Sliding layers only; full hd=512 scalar.
-pub fn attn_mma_enabled() -> bool {
-    match std::env::var("DGQ_ATTN_MMA") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
-    }
-}
 
-/// Matrix-unit attention for FULL/GLOBAL layers (hd=512) via `attention_mma_full`
-/// (register-resident O + QG-grouped K/V sharing). The full-layer analog of
-/// `attention_mma2`; targets the scalar full-attention cost that grows with
-/// kv_len (the dominant real-world attention cost). Non-bit-identical (f16 MMA vs
-/// f32 scalar) but quality-neutral (sign-off 2026-06-28: oracle cos≥0.9999,
-/// smoketest 16/16, MLX-ref equivalent — 29 vs 30 steps, no convergence
-/// regression; attention −29% / step −11% at kv=512). **Default on**;
-/// `DGQ_ATTN_MMA_FULL=0` to opt out (scalar path).
-pub fn attn_mma_full_enabled() -> bool {
-    match std::env::var("DGQ_ATTN_MMA_FULL") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
-    }
-}
 
-/// Router-as-GEMM (default ON; `DGQ_ROUTER_GEMM=0` opts out): compute the MoE
-/// router logits with the fast bf16 GEMM (scaled-norm(stream) @ router_proj^T)
-/// plus a tiny top-k tail kernel, instead of `moe_router`'s serial per-thread
-/// dot products (~77 GFLOP/s, ~2.4ms/layer = ~70ms/step). ~30ms/step (2.5%).
-/// Non-bit-identical: bf16-rounded logits flip near-tie expert picks (a
-/// trajectory re-roll, not a bias). Accepted 2026-07-02 (user sign-off) on
-/// multi-seed evidence: gate aggregate 44/51 vs baseline 46/51 across seeds
-/// {42, 7, 123} (baseline itself lands 12/17 at seed 123), greentext wart
-/// census 2-3/10 vs baseline 4/10. Gate seed re-baselined alongside (see
-/// fixtures/smoketest/prompts.json).
-pub fn router_gemm_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("DGQ_ROUTER_GEMM")
-            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-            .unwrap_or(true)
-    })
-}
 
-/// Hard-freeze of accepted canvas rows (`DGQ_FREEZE=1` re-enables the legacy
-/// behavior). Default OFF since 2026-07-05 (user sign-off): the freeze was
-/// PROVEN to be the flat-row wart driver (census 4/10 warty -> 0/10). OFF =
-/// MLX/HF reference semantics (matches our CPU sampler in `sample.rs`): the
-/// accept set is re-decided from fresh entropies every step, accepted rows
-/// take that step's fresh denoiser token, dropped rows renoise, and the final
-/// commit is the true full-canvas last-step argmax. ON additionally feeds the
-/// partial-lm_head row skip (dormant at default).
-pub fn freeze_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("DGQ_FREEZE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
-}
 
-/// Commit the row argmax instead of the tempered categorical sample
-/// (`DGQ_DENOISER_ARGMAX=0` restores HF categorical). Default ON since
-/// 2026-07-05 (user sign-off): matches MLX's default user temperature=0
-/// denoiser — the linear schedule temperature only shapes entropy and the SC
-/// soft-embed, never the committed token. With no-freeze this is the
-/// MLX-exact config (gate 16,16,11; census 0/10 warty).
-pub fn denoiser_argmax_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("DGQ_DENOISER_ARGMAX")
-            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-            .unwrap_or(true)
-    })
-}
 
-/// Per-row entropy cap on sampler accepts (`DGQ_ACCEPT_ROW_CAP=<nats>`, 0/unset
-/// = off = exact MLX prefix rule). Closes the unconditional-first-accept hole
-/// that freezes an uncertain token on flat/creative canvases (the "grebe me"
-/// wart class); inert on factual prompts whose early accepts are ~0-entropy.
-pub fn accept_row_cap() -> f32 {
-    static CAP: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *CAP.get_or_init(|| {
-        std::env::var("DGQ_ACCEPT_ROW_CAP")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(0.0)
-    })
-}
 
-/// Sliding-window masking on sliding-attention layers (model spec: canvas
-/// attends only the last window-1 encoder positions; matches MLX
-/// `_make_decoder_masks`). Bit-identical for contexts within the window; for
-/// longer contexts it is BOTH more correct and O(window) instead of
-/// O(context) on 25/30 layers. `DGQ_ATTN_WINDOW=0` disables (old unwindowed
-/// behavior) for A/B.
-pub fn attn_window_enabled() -> bool {
-    match std::env::var("DGQ_ATTN_WINDOW") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
-    }
-}
 
-/// Min prompt length (tokens) for the fast quantized prefill under the heuristic
-/// default. Short prompts stay on the accurate f32 engine (prefill is cheap there,
-/// and that's where the half-precision prompt KV tips borderline short-answer
-/// prompts into a degenerate early-stop); long prompts — where the ~10x speedup
-/// matters and outputs aren't on the early-stop knife-edge — use the fast path.
-pub const FAST_PREFILL_MIN_TOKENS: usize = 256;
 
-/// Whether to use the fast monolithic prefill (quantized + causal) for a prompt of
-/// `prompt_len` tokens vs the slow f32 engine. `DGQ_FAST_PREFILL=1|0` forces on/off
-/// for all lengths; unset uses the length heuristic (fast only for long prompts).
-pub fn should_fast_prefill(prompt_len: usize) -> bool {
-    match std::env::var("DGQ_FAST_PREFILL").as_deref() {
-        Ok("1") | Ok("true") => true,
-        Ok("0") | Ok("false") => false,
-        _ => prompt_len > FAST_PREFILL_MIN_TOKENS,
-    }
-}
 
-/// Algebraic fusion: QKV and dense gate+up as one stacked GEMM.
-/// `DGQ_FUSED_ALGEBRA=0` disables both; `DGQ_FUSED_QKV=0` / `DGQ_FUSED_GATE_UP=0` opt out individually.
-pub fn fused_algebra_enabled() -> bool {
-    match std::env::var("DGQ_FUSED_ALGEBRA") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
-    }
-}
 
-fn fused_env_on(name: &str) -> bool {
-    match std::env::var(name) {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
-    }
-}
-
-pub fn fused_qkv_enabled() -> bool {
-    fused_algebra_enabled() && fused_env_on("DGQ_FUSED_QKV")
-}
-
-pub fn fused_gate_up_enabled() -> bool {
-    fused_algebra_enabled() && fused_env_on("DGQ_FUSED_GATE_UP")
-}
 
 const STACKED_SEG_MAX: usize = 3;
 
@@ -827,64 +614,12 @@ fn gemm_scratch_bytes() -> (usize, usize) {
     (max_mk * f32, max_nk * f32)
 }
 
-fn sc_probs_buffer_bytes(use_sc_gemm: bool, use_sc_chunked: bool) -> usize {
-    let logits_bytes = CANVAS * VOCAB * 2;
-    if !use_sc_gemm {
-        return 1;
-    }
-    if use_sc_chunked {
-        CANVAS * crate::model::embed::LM_HEAD_CHUNK * 2
-    } else {
-        logits_bytes
-    }
-}
-/// Slow O(vocab*hidden) kernel: `DGQ_SC_GEMM=0`.
-pub fn step_use_sc_gemm_default() -> bool {
-    true
+/// SC prob staging: one vocab chunk of fp16 probs (the chunked softembed path).
+fn sc_probs_buffer_bytes() -> usize {
+    CANVAS * crate::model::embed::LM_HEAD_CHUNK * 2
 }
 
-pub fn step_use_sc_chunked_default() -> bool {
-    // Chunked path with f32 accumulation matches full GEMM bit-for-bit (cos=1.0, max_abs=0.0).
-    true
-}
 
-fn step_use_sc_gemm_from_env() -> bool {
-    match std::env::var("DGQ_SC_GEMM") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => step_use_sc_gemm_default(),
-    }
-}
-
-fn step_use_sc_chunked_from_env() -> bool {
-    match std::env::var("DGQ_SC_CHUNKED") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => step_use_sc_chunked_default(),
-    }
-}
-
-/// Monolithic SC reads logits produced at the previous finish. MLX applies temperature
-/// before the soft-embed softmax; set `DGQ_SC_PRE_TEMP=1` to keep legacy pre-temperature logits.
-fn monolithic_sc_pre_temp() -> bool {
-    match std::env::var("DGQ_SC_PRE_TEMP") {
-        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
-        Err(_) => false,
-    }
-}
-
-/// Opt-in logits NaN guard on generate hot path (`DGQ_CHECK_LOGITS=1`).
-pub fn logits_finite_check_enabled() -> bool {
-    match std::env::var("DGQ_CHECK_LOGITS") {
-        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
-        Err(_) => false,
-    }
-}
-
-fn logits_finite_sample_count() -> usize {
-    match std::env::var("DGQ_CHECK_LOGITS_SAMPLES") {
-        Ok(v) => v.parse().unwrap_or(4096),
-        Err(_) => 4096,
-    }
-}
 
 fn logits_finite_sample_bytes() -> u64 {
     (logits_finite_sample_count().min(CANVAS * VOCAB) * 2) as u64
@@ -894,10 +629,6 @@ struct StepPipelines {
     memzero: ComputePipeline,
     rmsnorm: ComputePipeline,
     rmsnorm_f32: ComputePipeline,
-    /// f32 hidden/stream input (DGQ_HIDDEN_F32), bf16 out.
-    rmsnorm_hf32_in: ComputePipeline,
-    /// f32 hidden in AND out (RmsNormHidden in-place under DGQ_HIDDEN_F32).
-    rmsnorm_hf32_inout: ComputePipeline,
     half_to_f32: ComputePipeline,
     gemm_q4: HashMap<(u32, u32), ComputePipeline>,
     /// Tunable Raw pipelines (DGQ_GEMM_TUNABLE), keyed (n,k);
@@ -925,12 +656,8 @@ struct StepPipelines {
     /// MMA attention for full/global layers (`DGQ_ATTN_MMA_FULL`, register-O); scalar `attention` is the fallback/oracle.
     attention_mma_full: ComputePipeline,
     residual: ComputePipeline,
-    /// f32 hidden/stream a-input + y-output (DGQ_HIDDEN_F32); b stays bf16.
-    residual_hf32: ComputePipeline,
     glu: ComputePipeline,
     router: ComputePipeline,
-    /// f32 stream input (DGQ_HIDDEN_F32).
-    router_hf32: ComputePipeline,
     /// Top-k tail over precomputed logits (DGQ_ROUTER_GEMM).
     router_topk: ComputePipeline,
     bucket_count: ComputePipeline,
@@ -955,18 +682,10 @@ struct StepPipelines {
     /// Q4 grouped MoE with K_DUMP_STAGE=1 (debug capture only — never in forward/generate).
     moe_grouped_dump: ComputePipeline,
     embed_gather: ComputePipeline,
-    /// f32 hidden output (DGQ_HIDDEN_F32).
-    embed_gather_hf32: ComputePipeline,
     /// bf16-embed input gather (embed_tokens stored Raw).
     embed_gather_bf16: ComputePipeline,
-    /// bf16 embed table, f32 hidden output (DGQ_HIDDEN_F32).
-    embed_gather_bf16_hf32: ComputePipeline,
     logit_rowstats: ComputePipeline,
     sc_prob_cols: ComputePipeline,
-    sc_probs: ComputePipeline,
-    sc_softembed: ComputePipeline,
-    /// bf16-embed slow SC softembed (DGQ_SC_GEMM=0 on Raw-embed blobs).
-    sc_softembed_bf16: ComputePipeline,
     /// f32-accumulate chunked SC softembed with bf16 embed (keyed (HID, LM_HEAD_CHUNK)).
     gemm_bf16_rowk_acc_f32: HashMap<(u32, u32), ComputePipeline>,
     half_scale: ComputePipeline,
@@ -1293,12 +1012,6 @@ impl StepPipelines {
                 crate::kernels::sub::rms_norm_rows_tiled::TiledVariant::F32_IN,
                 prod,
             )?,
-            rmsnorm_hf32_in: crate::kernels::sub::rms_norm_rows_tiled::pipeline_for_hidden_f32(
-                ctx, false, prod,
-            )?,
-            rmsnorm_hf32_inout: crate::kernels::sub::rms_norm_rows_tiled::pipeline_for_hidden_f32(
-                ctx, true, prod,
-            )?,
             half_to_f32: crate::kernels::sub::half_to_f32::pipeline_for(ctx, prod)?,
             gemm_q4,
             gemm_tunable_raw,
@@ -1318,14 +1031,12 @@ impl StepPipelines {
             attention_mma2: crate::kernels::sub::attention::pipeline_mma2_for(ctx, prod)?,
             attention_mma_full: crate::kernels::sub::attention::pipeline_mma_full_for(ctx, prod)?,
             residual: crate::kernels::sub::residual_half::pipeline_for(ctx, prod)?,
-            residual_hf32: crate::kernels::sub::residual_half::pipeline_for_hidden_f32(ctx, prod)?,
             glu: crate::kernels::sub::swiglu::pipeline_for(
                 ctx,
                 crate::kernels::sub::SwigluSplitVariant::MONOLITH_GLU,
                 prod,
             )?,
             router: crate::kernels::sub::moe_router::pipeline_for(ctx, prod)?,
-            router_hf32: crate::kernels::sub::moe_router::pipeline_for_hidden_f32(ctx, prod)?,
             router_topk: ctx.compile_subkernel(
                 shader_include::include_metal!("kernels/moe_router_topk.metal"),
                 "moe_router_topk",
@@ -1355,25 +1066,13 @@ impl StepPipelines {
             )?,
             moe_grouped_dump: crate::kernels::sub::moe_grouped::pipeline_for(ctx, dump)?,
             embed_gather: crate::kernels::sub::embed_gather::pipeline_for(ctx, prod)?,
-            embed_gather_hf32: crate::kernels::sub::embed_gather::pipeline_for_hidden_f32(ctx, prod)?,
             embed_gather_bf16: ctx.compile_subkernel(
                 shader_include::include_metal!("kernels/embed_gather_bf16.metal"),
                 "embed_gather_bf16",
                 prod,
             )?,
-            embed_gather_bf16_hf32: ctx.compile_subkernel_ex(
-                shader_include::include_metal!("kernels/embed_gather_bf16.metal"),
-                "embed_gather_bf16",
-                prod,
-                "hf32",
-                &[crate::kernels::sub::variant::FcBool { index: 31, value: true }],
-                &[],
-            )?,
             logit_rowstats: crate::kernels::sub::logit_rowstats::pipeline_for(ctx, prod)?,
             sc_prob_cols: crate::kernels::sub::sc_prob_cols::pipeline_for(ctx, prod)?,
-            sc_probs: crate::kernels::sub::sc_probs::pipeline_for(ctx, prod)?,
-            sc_softembed: crate::kernels::sub::sc_softembed::pipeline_for(ctx, prod)?,
-            sc_softembed_bf16: crate::kernels::sub::sc_softembed::pipeline_raw_for(ctx, prod)?,
             half_scale: crate::kernels::sub::half_scale::pipeline_for(ctx, prod)?,
             softcap: crate::kernels::sub::softcap_half::pipeline_for(ctx, prod)?,
             sample_rowstats: crate::kernels::sub::sample_rowstats::pipeline_for(ctx, prod)?,
@@ -1588,10 +1287,7 @@ struct StepEnc<'a> {
     ps: &'a StepPipelines,
     bufs: &'a StepBuffers,
     block_profile: StepBlockProfile,
-    use_sc_gemm: bool,
-    use_sc_chunked: bool,
     tensor_offsets: &'a HashMap<String, u64>,
-    recorder: Option<&'a mut crate::metal::step_icb::IcbRecorder>,
     /// Active canvas rows for lm_head (P2.5); `CANVAS` when full lm_head.
     partial_lm_m: u32,
     /// Attention + dense-FFN weights are stored q8 (mixed-precision .dgq): route
@@ -1705,11 +1401,7 @@ fn layer_moe_block_jobs_impl(
 
 impl StepEnc<'_> {
     fn sink_set_pipeline(&mut self, ps: &ComputePipeline) {
-        if let Some(r) = self.recorder.as_deref_mut() {
-            r.set_pipeline(ps);
-        } else {
-            self.enc.setComputePipelineState(&ps.pipeline);
-        }
+        self.enc.setComputePipelineState(&ps.pipeline);
     }
 
     fn sink_set_buffer(
@@ -1718,21 +1410,13 @@ impl StepEnc<'_> {
         offset: usize,
         index: usize,
     ) {
-        if let Some(r) = self.recorder.as_deref_mut() {
-            r.set_buffer(buf, offset, index);
-        } else {
-            unsafe {
-                self.enc.setBuffer_offset_atIndex(Some(buf), offset, index);
-            }
+        unsafe {
+            self.enc.setBuffer_offset_atIndex(Some(buf), offset, index);
         }
     }
 
     fn sink_set_bytes<T: Copy>(&mut self, val: &T, index: usize) {
-        if let Some(r) = self.recorder.as_deref_mut() {
-            r.set_bytes(val, index);
-        } else {
-            crate::metal::batch::set_bytes(&self.enc, val, index);
-        }
+        crate::metal::batch::set_bytes(&self.enc, val, index);
     }
 
     #[allow(dead_code)]
@@ -1747,34 +1431,15 @@ impl StepEnc<'_> {
     }
 
     fn sink_dispatch(&mut self, grid: MTLSize, tg: MTLSize) {
-        if let Some(r) = self.recorder.as_deref_mut() {
-            r.dispatch_threadgroups(grid, tg);
-        } else {
-            self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
-        }
+        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
     }
 
-    /// Buffer-scope memory barrier on the live encoder (no-op when recording).
+    /// Buffer-scope memory barrier on the live encoder.
     fn sink_memory_barrier(&mut self) {
-        if self.recorder.is_none() {
-            self.enc.memoryBarrierWithScope(MTLBarrierScope::Buffers);
-        }
+        self.enc.memoryBarrierWithScope(MTLBarrierScope::Buffers);
     }
 
-    fn sink_dispatch_indirect(&mut self, indirect_offset: usize, n: u32, tg: MTLSize) {
-        if self.recorder.is_some() {
-            // ICB replay uses fixed grids; compact indirect is only on the live encoder path.
-            let grid = MTLSize {
-                width: crate::kernels::sub::gemm_common::div_up(
-                    n as usize,
-                    crate::kernels::sub::gemm_common::n_tile(),
-                ),
-                height: N_EXPERTS,
-                depth: 1,
-            };
-            self.sink_dispatch(grid, tg);
-            return;
-        }
+    fn sink_dispatch_indirect(&mut self, indirect_offset: usize, _n: u32, tg: MTLSize) {
         unsafe {
             self.enc.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
                 &self.bufs.moe_grouped_indirect,
@@ -2063,25 +1728,7 @@ impl StepEnc<'_> {
         dim: u32,
         rows: usize,
     ) {
-        // DGQ_HIDDEN_F32: the hidden/stream planes are f32; pick the typed
-        // variant BY OFFSET so no call site can miss it. y is only ever a
-        // hidden-plane for the in-place RmsNormHidden (hidden -> hidden).
-        let ps = if hidden_f32_enabled() {
-            let a = self.arena();
-            let x_h = x_off == a.hidden_off() || x_off == a.stream_off();
-            let y_h = y_off == a.hidden_off() || y_off == a.stream_off();
-            if x_h && y_h {
-                &self.ps.rmsnorm_hf32_inout
-            } else if x_h {
-                &self.ps.rmsnorm_hf32_in
-            } else {
-                debug_assert!(!y_h, "rmsnorm: bf16 input into f32 hidden plane");
-                &self.ps.rmsnorm
-            }
-        } else {
-            &self.ps.rmsnorm
-        };
-        self.sink_set_pipeline(ps);
+        self.sink_set_pipeline(&self.ps.rmsnorm);
             self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
             self.sink_set_buffer(&self.bufs.arena, y_off as usize, 1);
             self.bind_blob(2);
@@ -2333,19 +1980,6 @@ impl StepEnc<'_> {
     }
 
     /// probs [M,K] half buffer @ sc_probs → arena y_off [M,N] via q8 weights.
-    fn gemm_q8_probs(
-        &mut self,
-        y_off: u64,
-        w_off: u64,
-        m: u32,
-        n: u32,
-        k: u32,
-    ) -> Result<(), Error> {
-        self.gemm_q8_rowk_half(&self.bufs.sc_probs, y_off, w_off, m, n, k)
-    }
-
-    /// probs [M,K] half @ sc_probs → f32 y_buf [M,N] (accumulate +=) via q8 weights indexed by K.
-    /// Used by chunked SC softembed to avoid per-chunk bf16 rounding.
     fn gemm_q8_rowk_acc_f32(
         &mut self,
         y_buf: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
@@ -2465,7 +2099,10 @@ impl StepEnc<'_> {
     }
 
     fn encode_sc_softembed(&mut self, layout: &ModelLayout) -> Result<(), Error> {
-        self.encode_sc_softembed_path(layout, self.use_sc_gemm, self.use_sc_chunked)
+        if self.embed_bf16 && sc_sparse_enabled() {
+            return self.encode_sc_softembed_sparse(layout);
+        }
+        self.encode_sc_softembed_exact(layout)
     }
 
     fn dispatch_sc_prob_cols(&mut self, v0: u32, chunk: u32) {
@@ -2583,101 +2220,19 @@ impl StepEnc<'_> {
         Ok(())
     }
 
-    fn encode_sc_softembed_path(
-        &mut self,
-        layout: &ModelLayout,
-        use_gemm: bool,
-        use_chunked: bool,
-    ) -> Result<(), Error> {
-        if use_gemm {
-            if self.embed_bf16 && sc_sparse_enabled() {
-                return self.encode_sc_softembed_sparse(layout);
-            }
-            if use_chunked {
-                return self.encode_sc_softembed_chunked(layout);
-            }
-            if self.embed_bf16 {
-                // The full (non-chunked) GEMM SC path reads embed via the q8 rowk
-                // kernel; bf16 embed is only wired through the chunked + slow paths.
-                return Err(Error::Format(
-                    "bf16 embed: full SC GEMM path unsupported (use chunked, DGQ_SC_CHUNKED=1)",
-                ));
-            }
-            self.encode_sc_logit_rowstats();
-            self.sink_set_pipeline(&self.ps.sc_probs);
-            self.bind_logits(0);
-            self.sink_set_buffer(&self.bufs.arena, self.arena().rs_sc_off() as usize, 1);
-            self.bind_sc_probs(2);
-            let dims = [CANVAS as u32, VOCAB as u32];
-            self.sink_set_bytes(&dims, 3);
-            self.bind_debug_status(4);
-            let (grid, tg) = crate::kernels::sub::sc_probs::dispatch_shape(CANVAS);
-            self.sink_dispatch(grid, tg);
-
-            self.gemm_q8_probs(
-                self.arena().soft_off(),
-                layout.embed,
-                CANVAS as u32,
-                HID as u32,
-                VOCAB as u32,
-            )?;
-            self.scale_half_arena(
-                self.arena().soft_off(),
-                CANVAS * HID as usize,
-                (HID as f32).sqrt() / SC_PROB_GEMM_SCALE,
-            );
-        } else {
-            use crate::dgq::embed_row::EMBED_SCALE;
-
-            let sc_ps = if self.embed_bf16 {
-                &self.ps.sc_softembed_bf16
-            } else {
-                &self.ps.sc_softembed
-            };
-            self.sink_set_pipeline(sc_ps);
-            self.bind_logits(0);
-            self.sink_set_buffer(&self.bufs.arena, self.arena().rs_sc_off() as usize, 1);
-            self.bind_blob(2);
-            self.sink_set_buffer(&self.bufs.arena, self.arena().soft_off() as usize, 3);
-            let first_step: u32 = 0;
-            self.sink_set_bytes(&layout.embed, 4);
-            self.sink_set_bytes(&first_step, 5);
-            let dims = [HID as u32, CANVAS as u32, VOCAB as u32];
-            self.sink_set_bytes(&dims, 6);
-            self.sink_set_bytes(&EMBED_SCALE, 7);
-            self.bind_debug_status(8);
-            let (grid, tg) =
-                crate::kernels::sub::sc_softembed::dispatch_shape(HID, CANVAS);
-            self.sink_dispatch(grid, tg);
-        }
-        Ok(())
+    /// Exact (non-sparse) softembed = the chunked path; sparse is the
+    /// default approximation on bf16-embed models (DGQ_SC_SPARSE=0 opts out).
+    fn encode_sc_softembed_exact(&mut self, layout: &ModelLayout) -> Result<(), Error> {
+        self.encode_sc_softembed_chunked(layout)
     }
 
     fn residual(&mut self, a_off: u64, b_off: u64, y_off: u64, scal_off: u64, elems: usize) {
-        // DGQ_HIDDEN_F32: every residual touching the hidden/stream planes has
-        // a on one f32 plane and y on one f32 plane (b is always a bf16
-        // branch); the pure-bf16 site (dense+moein -> tmp) keeps the plain
-        // pipeline. Selected by offset so call sites cannot miss it. NOTE
-        // dispatch_1d sets the pipeline, so the selection happens there.
-        let hf32 = if hidden_f32_enabled() {
-            let a = self.arena();
-            let a_h = a_off == a.hidden_off() || a_off == a.stream_off();
-            let y_h = y_off == a.hidden_off() || y_off == a.stream_off();
-            debug_assert_eq!(a_h, y_h, "residual: mixed hidden-plane operands");
-            a_h && y_h
-        } else {
-            false
-        };
             self.sink_set_buffer(&self.bufs.arena, a_off as usize, 0);
             self.sink_set_buffer(&self.bufs.arena, b_off as usize, 1);
             self.sink_set_buffer(&self.bufs.arena, y_off as usize, 2);
             self.bind_blob(3);
             self.sink_set_bytes( &scal_off, 4);
-        if hf32 {
-            self.dispatch_1d(&self.ps.residual_hf32, elems, 256);
-        } else {
-            self.dispatch_1d(&self.ps.residual, elems, 256);
-        }
+        self.dispatch_1d(&self.ps.residual, elems, 256);
     }
 
     fn glu(&mut self, gate_off: u64, up_off: u64, y_off: u64, elems: usize) {
@@ -2850,12 +2405,7 @@ impl StepEnc<'_> {
             let tg = MTLSize { width: 64, height: 1, depth: 1 };
             self.sink_dispatch(grid, tg);
         } else {
-            let router_ps = if hidden_f32_enabled() {
-                &self.ps.router_hf32
-            } else {
-                &self.ps.router
-            };
-            self.sink_set_pipeline(router_ps);
+            self.sink_set_pipeline(&self.ps.router);
             self.sink_set_buffer(&self.bufs.arena, self.arena().stream_off() as usize, 0);
             self.bind_blob(1);
             self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 2);
@@ -3815,11 +3365,10 @@ impl StepEnc<'_> {
     fn dispatch_embed_gather(&mut self, embed_off: u64) {
         use crate::dgq::embed_row::EMBED_SCALE;
 
-        let ps = match (self.embed_bf16, hidden_f32_enabled()) {
-            (true, false) => &self.ps.embed_gather_bf16,
-            (true, true) => &self.ps.embed_gather_bf16_hf32,
-            (false, false) => &self.ps.embed_gather,
-            (false, true) => &self.ps.embed_gather_hf32,
+        let ps = if self.embed_bf16 {
+            &self.ps.embed_gather_bf16
+        } else {
+            &self.ps.embed_gather
         };
         self.sink_set_pipeline(ps);
         self.bind_blob(0);
@@ -4019,8 +3568,6 @@ impl StepEnc<'_> {
         let eos = read_struct::<StepParams>(&self.bufs.params).eos_token_id;
         self.sink_set_bytes(&eos, 5);
         self.bind_debug_status(6);
-        let row_cap = accept_row_cap();
-        self.sink_set_bytes(&row_cap, 7);
         let tg = MTLSize {
             width: 256,
             height: 1,
@@ -4073,12 +3620,11 @@ impl StepEnc<'_> {
         };
         self.sink_dispatch(grid, tg);
 
-        if !monolithic_sc_pre_temp() {
-            let st: CanvasState = read_struct(&self.bufs.state);
-            let params: StepParams = read_struct(&self.bufs.params);
-            let t = scheduled_temperature(st.step, &params).max(1e-6);
-            self.scale_half_logits(CANVAS * VOCAB, 1.0 / t);
-        }
+        // MLX applies the schedule temperature before the SC soft-embed softmax.
+        let st: CanvasState = read_struct(&self.bufs.state);
+        let params: StepParams = read_struct(&self.bufs.params);
+        let t = scheduled_temperature(st.step, &params).max(1e-6);
+        self.scale_half_logits(CANVAS * VOCAB, 1.0 / t);
         Ok(())
     }
 }
@@ -4219,27 +3765,8 @@ fn dump_buffer_raw(buf: &ProtocolObject<dyn MTLBuffer>, path: &str) {
     }
 }
 
-pub fn trace_entropy_enabled() -> bool {
-    match std::env::var("DGQ_TRACE_ENTROPY") {
-        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("full"),
-        Err(_) => false,
-    }
-}
 
-pub fn final_entropy_log_enabled() -> bool {
-    match std::env::var("DGQ_LOG_FINAL_ENTROPY") {
-        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("full"),
-        Err(_) => false,
-    }
-}
 
-/// Decode answer-prefix argmax each denoise step (`DGQ_LOG_STEP_TEXT=1`).
-pub fn step_text_log_enabled() -> bool {
-    match std::env::var("DGQ_LOG_STEP_TEXT") {
-        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
-        Err(_) => false,
-    }
-}
 
 /// Per-position entropy at end of a denoise block (`DGQ_LOG_FINAL_ENTROPY=1`).
 pub fn log_final_per_token_entropy(
@@ -4302,19 +3829,7 @@ pub fn log_final_per_token_entropy(
     }
 }
 
-pub fn denoise_parity_log_enabled() -> bool {
-    match std::env::var("DGQ_LOG_DENOISE") {
-        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
-        Err(_) => false,
-    }
-}
 
-fn denoise_parity_log_positions() -> usize {
-    match std::env::var("DGQ_LOG_DENOISE_POS") {
-        Ok(v) => v.parse().unwrap_or(8),
-        Err(_) => 8,
-    }
-}
 
 /// HF linear schedule: temperature at start of denoise step `steps_done` (0 = first step).
 pub fn scheduled_temperature(steps_done: u32, params: &StepParams) -> f32 {
@@ -4337,12 +3852,8 @@ pub fn log_denoise_parity_step(
     params: &StepParams,
     logits: &ProtocolObject<dyn MTLBuffer>,
 ) {
-    use crate::sample::accept_mask_from_entropies_capped;
-    let cpu_mask = accept_mask_from_entropies_capped(
-        &state.entropy,
-        params.entropy_bound,
-        accept_row_cap(),
-    );
+    let cpu_mask =
+        crate::sample::accept_mask_from_entropies(&state.entropy, params.entropy_bound);
     let cpu_accept = cpu_mask.iter().filter(|&&m| m).count() as u32;
     let gpu_accept = state.accept.iter().filter(|&&a| a != 0).count();
     let temp = scheduled_temperature(state.step.saturating_sub(1), params);
@@ -4388,26 +3899,6 @@ fn check_logits_finite(logits: &ProtocolObject<dyn MTLBuffer>) -> (bool, f32) {
     half_buffer_stats(logits, 0, CANVAS * VOCAB, CANVAS * VOCAB)
 }
 
-/// Strided (signed-sum, abs-max) over an f32 buffer region — for probing the MoE
-/// f32 intermediates (gemm_a/gemm_b) during f16 bisection.
-fn f32_buffer_fingerprint(
-    buf: &ProtocolObject<dyn MTLBuffer>,
-    byte_off: usize,
-    elems: usize,
-) -> (f64, f32) {
-    let ptr = unsafe { buf.contents().as_ptr().add(byte_off) as *const f32 };
-    let stride = (elems / 512).max(1);
-    let (mut sum, mut mx) = (0f64, 0f32);
-    let mut i = 0usize;
-    while i < elems {
-        let v = unsafe { *ptr.add(i) };
-        sum += v as f64;
-        mx = mx.max(v.abs());
-        i += stride;
-    }
-    (sum, mx)
-}
-
 fn half_buffer_stats(
     buf: &ProtocolObject<dyn MTLBuffer>,
     byte_off: usize,
@@ -4416,10 +3907,6 @@ fn half_buffer_stats(
 ) -> (bool, f32) {
     use crate::kernels::sub::bf16;
     let ptr = unsafe { buf.contents().as_ptr().add(byte_off) as *const u16 };
-    // Read the stored precision: f16 when the f16-activation arena is active, so
-    // the range trace reflects real activations (a buffer whose producer didn't
-    // flip shows garbage → that's the mismatch).
-    let as_f16 = crate::kernels::sub::variant::act_f16_enabled();
     let mut max_abs = 0.0f32;
     let mut finite = true;
     let mut non_finite = 0usize;
@@ -4428,11 +3915,7 @@ fn half_buffer_stats(
     unsafe {
         let mut i = 0usize;
         while i < elems {
-            let v = if as_f16 {
-                crate::kernels::sub::f16::f16_bits_to_f32(*ptr.add(i))
-            } else {
-                bf16::bf16_bits_to_f32(*ptr.add(i))
-            };
+            let v = bf16::bf16_bits_to_f32(*ptr.add(i));
             if !v.is_finite() {
                 finite = false;
                 non_finite += 1;
@@ -4472,8 +3955,6 @@ pub struct StepRuntime {
     weight_cache: GpuDecoderWeightCache,
     text_config: TextConfig,
     block_profile: StepBlockProfile,
-    use_sc_gemm: bool,
-    use_sc_chunked: bool,
     attn_ffn_q8: bool,
     attn_ffn_bf16: bool,
     embed_bf16: bool,
@@ -4484,7 +3965,6 @@ pub struct StepRuntime {
     /// denoise block writes a CANVAS-wide canvas at [kv_len..kv_len+CANVAS], so
     /// kv_len + CANVAS must never exceed this — checked in `set_kv_len`.
     max_seq: usize,
-    icb: Option<crate::metal::step_icb::StepIcbPair>,
 }
 
 impl StepRuntime {
@@ -4666,10 +4146,7 @@ impl StepRuntime {
             ps: &self.pipelines,
             bufs: &self.bufs,
             block_profile: self.block_profile,
-            use_sc_gemm: self.use_sc_gemm,
-            use_sc_chunked: self.use_sc_chunked,
             tensor_offsets: &self.tensor_offsets,
-            recorder: None,
             partial_lm_m: CANVAS as u32,
             attn_ffn_q8: self.attn_ffn_q8,
             attn_ffn_bf16: self.attn_ffn_bf16,
@@ -4677,169 +4154,11 @@ impl StepRuntime {
             prefill_causal: false,
             sliding_window: self.text_config.sliding_window as u32,
         };
-        let time_dispatch = std::env::var("DGQ_TIME_DISPATCH").is_ok();
-        let t_enc = std::time::Instant::now();
         f(&mut enc)?;
         enc.enc.endEncoding();
-        let enc_ms = t_enc.elapsed().as_secs_f64() * 1e3;
-        let t_gpu = std::time::Instant::now();
         cmd.commit();
         cmd.waitUntilCompleted();
-        if time_dispatch {
-            let gpu_ms = t_gpu.elapsed().as_secs_f64() * 1e3;
-            eprintln!("dispatch: encode={enc_ms:.2}ms gpu(commit+wait)={gpu_ms:.2}ms");
-        }
         Ok(())
-    }
-
-    fn dispatch_record<F>(&mut self, f: F, recorder: &mut crate::metal::step_icb::IcbRecorder) -> Result<(), Error>
-    where
-        F: FnOnce(&mut StepEnc<'_>) -> Result<(), Error>,
-    {
-        let cmd = self
-            .ctx
-            .queue
-            .commandBuffer()
-            .ok_or(Error::Format("command buffer alloc failed"))?;
-        let enc_obj = cmd
-            .computeCommandEncoder()
-            .ok_or(Error::Format("compute encoder alloc failed"))?;
-        let mut enc = StepEnc {
-            enc: enc_obj,
-            ctx: &self.ctx,
-            ps: &self.pipelines,
-            bufs: &self.bufs,
-            block_profile: self.block_profile,
-            use_sc_gemm: self.use_sc_gemm,
-            use_sc_chunked: self.use_sc_chunked,
-            tensor_offsets: &self.tensor_offsets,
-            recorder: Some(recorder),
-            partial_lm_m: CANVAS as u32,
-            attn_ffn_q8: self.attn_ffn_q8,
-            attn_ffn_bf16: self.attn_ffn_bf16,
-            embed_bf16: self.embed_bf16,
-            prefill_causal: false,
-            sliding_window: self.text_config.sliding_window as u32,
-        };
-        f(&mut enc)?;
-        enc.enc.endEncoding();
-        Ok(())
-    }
-
-    fn record_icb_plan(&mut self, with_sc: bool) -> Result<crate::metal::step_icb::StepIcbPlan, Error> {
-        let mut state = self.read_canvas_state();
-        state.step = if with_sc { 1 } else { 0 };
-        self.write_canvas_state(&state);
-
-        let mut recorder = crate::metal::step_icb::IcbRecorder::new(&self.ctx.device)?;
-        let layout = self.layout;
-        let layers = self.layers;
-        let finish = StepFinishMode::Full;
-        let first_step = if with_sc { 0u32 } else { 1u32 };
-        self.dispatch_record(
-            |enc| enc.interpret_step(&layout, layers, first_step, finish),
-            &mut recorder,
-        )?;
-        recorder.finish()
-    }
-
-    fn icb_replay_allowed(&self, finish: StepFinishMode) -> bool {
-        finish == StepFinishMode::Full
-            && self.icb.is_some()
-            // Assert/deep variants compile different pipelines; ICB bakes pipeline state at record.
-            && !crate::kernels::sub::variant::runtime_kernel_debug_enabled()
-    }
-
-    /// `with_sc` ICB replay is still being validated at full layer count.
-    fn icb_replay_plan<'a>(
-        &'a self,
-        first_step: u32,
-    ) -> Option<&'a crate::metal::step_icb::StepIcbPlan> {
-        let pair = self.icb.as_ref()?;
-        if first_step == 1 {
-            pair.no_sc.as_ref()
-        } else if crate::metal::step_icb::step_icb_with_sc_enabled() {
-            pair.with_sc.as_ref()
-        } else {
-            None
-        }
-    }
-
-    fn current_icb_pipeline_key(&self) -> StepPipelineKey {
-        step_pipeline_key(crate::kernels::sub::variant::runtime_step_variant())
-    }
-
-    fn ensure_no_sc_icb(&mut self) -> Result<(), Error> {
-        let kv_len = self.read_params().kv_len;
-        let key = self.current_icb_pipeline_key();
-        if let Some(pair) = self.icb.as_ref() {
-            if pair.no_sc.is_some() && pair.no_sc_kv_len == kv_len && pair.pipeline_key == key.0 {
-                return Ok(());
-            }
-        }
-        let prev_key = self.icb.as_ref().map(|p| p.pipeline_key);
-        eprintln!(
-            "step-kernel: recording no_sc ICB plan (kv_len={kv_len}, one-time compile)..."
-        );
-        let started = Instant::now();
-        let no_sc = self.record_icb_plan(false)?;
-        eprintln!(
-            "step-kernel: no_sc ICB ready (kv_len={kv_len}, {} cmds, const {:.1} KiB) in {:.2?}",
-            no_sc.command_count,
-            no_sc.const_bytes as f64 / 1024.0,
-            started.elapsed()
-        );
-        let pair = self.icb.get_or_insert_with(|| crate::metal::step_icb::StepIcbPair {
-            no_sc: None,
-            with_sc: None,
-            no_sc_kv_len: u32::MAX,
-            pipeline_key: u8::MAX,
-        });
-        pair.no_sc = Some(no_sc);
-        pair.no_sc_kv_len = kv_len;
-        pair.pipeline_key = key.0;
-        if prev_key != Some(key.0) {
-            pair.with_sc = None;
-        }
-        Ok(())
-    }
-
-    /// Record with_sc against the current GPU buffers (post step 1).
-    fn ensure_with_sc_icb(&mut self) -> Result<(), Error> {
-        let key = self.current_icb_pipeline_key();
-        if let Some(pair) = self.icb.as_ref() {
-            if pair.with_sc.is_some() && pair.pipeline_key == key.0 {
-                return Ok(());
-            }
-        }
-        eprintln!("step-kernel: recording with_sc ICB plan (one-time compile)...");
-        let started = Instant::now();
-        let with_sc = self.record_icb_plan(true)?;
-        eprintln!(
-            "step-kernel: with_sc ICB ready (kv_len={}, {} cmds, const {:.1} KiB) in {:.2?}",
-            self.read_params().kv_len,
-            with_sc.command_count,
-            with_sc.const_bytes as f64 / 1024.0,
-            started.elapsed()
-        );
-        let pair = self.icb.get_or_insert_with(|| crate::metal::step_icb::StepIcbPair {
-            no_sc: None,
-            with_sc: None,
-            no_sc_kv_len: u32::MAX,
-            pipeline_key: u8::MAX,
-        });
-        pair.with_sc = Some(with_sc);
-        pair.pipeline_key = key.0;
-        Ok(())
-    }
-
-    fn record_icb_pair(&mut self) -> Result<crate::metal::step_icb::StepIcbPair, Error> {
-        Ok(crate::metal::step_icb::StepIcbPair {
-            no_sc: None,
-            with_sc: None,
-            no_sc_kv_len: u32::MAX,
-            pipeline_key: u8::MAX,
-        })
     }
 
     /// Attention + dense FFN + GPU router; MoE expert matmuls on CPU (matches `.dgq` Q4 oracle).
@@ -4950,29 +4269,11 @@ impl StepRuntime {
         const SAMPLE: usize = 4096;
         // (label) -> (max_abs across layers, any_non_finite)
         let mut peak: BTreeMap<&'static str, (f32, bool)> = BTreeMap::new();
-        let bisect = std::env::var("DGQ_TRACE_BISECT").is_ok();
-        let mut seen: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
         let mut probe = |this: &Self, label: &'static str, off: u64, elems: usize| {
             let (nf, mx) = half_buffer_stats(&this.bufs.arena, off as usize, elems, SAMPLE);
             let e = peak.entry(label).or_insert((0.0, false));
             e.0 = e.0.max(mx);
             e.1 |= nf;
-            // First occurrence (layer 0) fingerprint for f16-vs-bf16 bisection:
-            // a fixed-element value + a strided signed checksum.
-            if bisect && seen.insert(label) {
-                let as_f16 = crate::kernels::sub::variant::act_f16_enabled();
-                let ptr = unsafe { (this.bufs.arena.contents().as_ptr() as *const u8).add(off as usize) as *const u16 };
-                let rd = |i: usize| -> f32 {
-                    let b = unsafe { *ptr.add(i) };
-                    if as_f16 { crate::kernels::sub::f16::f16_bits_to_f32(b) } else { crate::kernels::sub::bf16::bf16_bits_to_f32(b) }
-                };
-                let v = rd(1000.min(elems - 1));
-                let mut sum = 0f64;
-                let stride = (elems / 512).max(1);
-                let mut i = 0usize;
-                while i < elems { sum += rd(i) as f64; i += stride; }
-                eprintln!("  BISECT L0 {label:<28} v1000={v:+.5} checksum={sum:+.4} absmax={mx:.2}");
-            }
         };
 
         self.dispatch_and_wait(|enc| enc.encode_step_preamble(&layout, first_step))?;
@@ -5003,28 +4304,11 @@ impl StepRuntime {
             probe(self, "layer:dense_down", dense, CANVAS * HID);
             self.time_enc_stage(|e| { e.rmsnorm(e.arena().dense_off(), e.arena().dense_off(), l.post_ff_ln_1, HID as u32, CANVAS); Ok(()) })?;
             self.time_enc_stage(|e| e.encode_layer_router_buckets(layer, &layout))?;
-            if bisect && layer == 0 {
-                // moein INPUT (after router rmsnorm, before MoE consumes it).
-                let (nf, mx) = half_buffer_stats(&self.bufs.arena, moein as usize, CANVAS * HID, SAMPLE);
-                eprintln!("  BISECT L0 moe:moein_INPUT          absmax={mx:.4} nf={nf}");
-                let nb = read_struct::<RouteScratch>(&self.bufs.route).num_blocks;
-                eprintln!("  BISECT L0 moe:num_blocks           {nb}");
-            }
             // MoE
             self.time_enc_stage(|e| e.encode_moe_batched_gate_up(layer, &layout))?;
             self.time_enc_stage(|e| e.encode_moe_batched_swiglu())?;
             self.time_enc_stage(|e| e.encode_moe_batched_down(layer, &layout))?;
             self.time_enc_stage(|e| e.encode_moe_batched_scatter())?;
-            if bisect && layer == 0 {
-                let (s_gu, m_gu) = f32_buffer_fingerprint(&self.bufs.gemm_b, moe_w_byte_off_gu(), MOE_SLOTS as usize * 2 * MOE_FF as usize);
-                let (s_sw, m_sw) = f32_buffer_fingerprint(&self.bufs.gemm_a, 0, MOE_SLOTS as usize * MOE_FF as usize);
-                let (s_dn, m_dn) = f32_buffer_fingerprint(&self.bufs.gemm_b, moe_w_byte_off_a(), MOE_SLOTS as usize * HID);
-                let (s_mo, m_mo) = f32_buffer_fingerprint(&self.bufs.arena, self.bufs.arena_map.moeout_off() as usize, CANVAS * HID);
-                eprintln!("  BISECT L0 moe:gate_up_out(f32)     checksum={s_gu:+.2} absmax={m_gu:.3}");
-                eprintln!("  BISECT L0 moe:swiglu_out(f32)      checksum={s_sw:+.2} absmax={m_sw:.3}");
-                eprintln!("  BISECT L0 moe:down_out(f32)        checksum={s_dn:+.2} absmax={m_dn:.3}");
-                eprintln!("  BISECT L0 moe:moeout(f32)          checksum={s_mo:+.2} absmax={m_mo:.3}");
-            }
             self.time_enc_stage(|e| e.encode_layer_moe_post_norm(layer, &layout))?;
             probe(self, "layer:moe_norm(moein)", moein, CANVAS * HID);
             self.time_enc_stage(|e| e.encode_layer_moe_post_combine(layer, &layout))?;
@@ -5147,26 +4431,6 @@ impl StepRuntime {
         }
         let first_step = if st_before.step == 0 { 1u32 } else { 0u32 };
         let partial_lm_m = partial_lm_active_rows(&st_before);
-        let use_partial_lm = partial_lm_m < CANVAS as u32;
-        if self.icb_replay_allowed(finish) && !use_partial_lm && !moe_block_sparse_enabled() {
-            if first_step == 1 {
-                self.ensure_no_sc_icb()?;
-            } else if crate::metal::step_icb::step_icb_with_sc_enabled() {
-                self.ensure_with_sc_icb()?;
-            }
-            if let Some(plan) = self.icb_replay_plan(first_step) {
-                let cmd = self
-                    .ctx
-                    .queue
-                    .commandBuffer()
-                    .ok_or(Error::Format("command buffer alloc failed"))?;
-                let enc = crate::metal::step_icb::replay_step_icb(&cmd, plan)?;
-                enc.endEncoding();
-                cmd.commit();
-                cmd.waitUntilCompleted();
-                return Ok(());
-            }
-        }
         self.dispatch_and_wait(|enc| {
             enc.partial_lm_m = partial_lm_m;
             enc.interpret_step(&layout, layers, first_step, finish)
@@ -5213,12 +4477,10 @@ pub fn log_step_memory_budget(
     blob_bytes: u64,
     max_seq: usize,
     layout: &ModelLayout,
-    use_sc_gemm: bool,
-    use_sc_chunked: bool,
 ) {
     let kv = kv_cache_bytes(layout, max_seq);
     let logits = (CANVAS * VOCAB * 2) as u64;
-    let sc_probs = sc_probs_buffer_bytes(use_sc_gemm, use_sc_chunked) as u64;
+    let sc_probs = sc_probs_buffer_bytes() as u64;
     let arena = step_arena_layout().bytes();
     let (mx, mw) = gemm_scratch_bytes();
     let gemm_scratch = (mx + mw) as u64;
@@ -5321,17 +4583,13 @@ pub fn build_step_runtime(
     let gpu_blob = DgqGpuBlob::from_store(&store, &ctx.device)?;
     let gpu_blob = std::sync::Arc::clone(&gpu_blob);
     let kv_bytes = kv_cache_bytes(&layout, cfg.max_seq) as usize;
-    let use_sc_gemm = step_use_sc_gemm_from_env();
-    let use_sc_chunked = step_use_sc_chunked_from_env() && use_sc_gemm;
     let logits_bytes = CANVAS * VOCAB * 2;
-    let sc_probs_bytes = sc_probs_buffer_bytes(use_sc_gemm, use_sc_chunked);
+    let sc_probs_bytes = sc_probs_buffer_bytes();
 
     log_step_memory_budget(
         store.blob_bytes(),
         cfg.max_seq,
         &layout,
-        use_sc_gemm,
-        use_sc_chunked,
     );
 
     let sampler = crate::sample::sampler_for_steps(cfg.steps.max(1), cfg.no_early_stop);
@@ -5455,8 +4713,6 @@ pub fn build_step_runtime(
         weight_cache,
         text_config,
         block_profile,
-        use_sc_gemm,
-        use_sc_chunked,
         attn_ffn_q8,
         attn_ffn_bf16,
         embed_bf16,
@@ -5464,17 +4720,11 @@ pub fn build_step_runtime(
         tensor_offsets: offsets,
         layers,
         max_seq: cfg.max_seq,
-        icb: None,
     };
-    if crate::metal::step_icb::step_icb_enabled() {
-        eprintln!(
-            "step-kernel: ICB replay enabled (no_sc; DGQ_STEP_ICB_SC=1 for with_sc)"
-        );
-        rt.icb = Some(rt.record_icb_pair()?);
-    } else if rt.embed_bf16 && sc_sparse_enabled() {
+    if rt.embed_bf16 && sc_sparse_enabled() {
         eprintln!("step-kernel: sparse SC softembed (DGQ_SC_SPARSE=0 for the exact chunked path)");
-    } else if use_sc_chunked {
-        eprintln!("step-kernel: chunked SC softembed (DGQ_SC_CHUNKED=0 for full prob matrix)");
+    } else {
+        eprintln!("step-kernel: chunked SC softembed");
     }
     if let Some(ref token_ids) = cfg.prefill_token_ids {
         if should_fast_prefill(token_ids.len()) {
@@ -5489,7 +4739,7 @@ pub fn build_step_runtime(
             );
         }
     }
-    if let Ok(path) = std::env::var("DGQ_DUMP_KV") {
+    if let Some(path) = crate::flags::dump_kv_path() {
         dump_buffer_raw(&rt.bufs.kvcache, &path);
     }
     Ok((rt, build))
@@ -5568,18 +4818,6 @@ fn read_arena_hidden_row(
     base: u64,
     row: usize,
 ) -> Vec<f32> {
-    let map = step_arena_layout();
-    if hidden_f32_enabled() && (base == map.hidden_off() || base == map.stream_off()) {
-        // Only the hidden/stream planes are f32 under DGQ_HIDDEN_F32; other
-        // planes (tmp for final-norm readbacks, etc.) stay bf16.
-        let byte_off = base as usize + row * HID * 4;
-        let mut out = vec![0.0f32; HID];
-        unsafe {
-            let ptr = (arena.contents().as_ptr() as *const u8).add(byte_off) as *const f32;
-            std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), HID);
-        }
-        return out;
-    }
     read_arena_row(arena, base, row, HID)
 }
 
@@ -6406,7 +5644,7 @@ pub fn run_step_moe_layer_capture(
 
     rt.dispatch_and_wait(|enc| enc.encode_layer_router_buckets(layer, &layout))?;
 
-    if let Ok(path) = std::env::var("DGQ_MOE_ROUTE_REF") {
+    if let Some(path) = crate::flags::moe_route_ref_path() {
         if let Some((experts, weights)) =
             route_override_from_ref_json(Path::new(&path), position)?
         {
@@ -6597,7 +5835,7 @@ pub fn bench_step_kernel_encode_subprofile(
 ) -> Result<EncodeSubProfileResult, Error> {
     let (mut rt, build) = build_step_runtime(model_dir, &cfg)?;
     rt.run_forward_once(cfg.finish)?;
-    if std::env::var("DGQ_TRACE_RANGES").is_ok() {
+    if crate::flags::trace_ranges_enabled() {
         // Warm to a steady-state (denoised) step, then trace one step's ranges.
         rt.run_forward_once(cfg.finish)?;
         rt.trace_step_ranges()?;
@@ -6845,14 +6083,10 @@ pub fn read_arena_buffer_f32(
     byte_off: usize,
     elems: usize,
 ) -> Vec<f32> {
-    use crate::kernels::sub::{bf16, f16};
-    let as_f16 = crate::kernels::sub::variant::act_f16_enabled();
+    use crate::kernels::sub::bf16;
     let ptr = unsafe { buf.contents().as_ptr().add(byte_off) as *const u16 };
     (0..elems)
-        .map(|i| unsafe {
-            let b = *ptr.add(i);
-            if as_f16 { f16::f16_bits_to_f32(b) } else { bf16::bf16_bits_to_f32(b) }
-        })
+        .map(|i| unsafe { bf16::bf16_bits_to_f32(*ptr.add(i)) })
         .collect()
 }
 
@@ -7366,7 +6600,7 @@ mod tests {
             write_buffer_bytes(&rt.bufs.arena, soft_off, &vec![0u8; soft_elems * 2]);
             rt.dispatch_and_wait(|enc| {
                 enc.encode_sc_logit_rowstats();
-                enc.encode_sc_softembed_path(&layout, true, true)?;
+                enc.encode_sc_softembed_exact(&layout)?;
                 Ok(())
             })
             .expect("chunked sc softembed");
@@ -7418,138 +6652,6 @@ mod tests {
         assert_eq!(gb_max, 0.0, "gemm_b accumulator nondeterministic");
         assert_eq!(max_abs, 0.0, "chunked softembed nondeterministic");
         assert_eq!(diff13, 0.0, "chunked softembed nondeterministic (run3)");
-    }
-
-    #[test]
-    fn sc_gemm_softembed_matches_slow_kernel() {
-        use std::path::Path;
-
-        let dir = [
-            Path::new("/tmp/quantized-weights"),
-            Path::new("model/diffusiongemma-q4"),
-            Path::new("model/q4"),
-        ]
-        .into_iter()
-        .find(|p| crate::dgq::store::looks_like_dgq_dir(p));
-        let Some(dir) = dir else {
-            eprintln!("skip sc_gemm_softembed_matches_slow_kernel");
-            return;
-        };
-        let cfg = StepSmokeConfig {
-            finish: StepFinishMode::Full,
-            steps: 1,
-            ..StepSmokeConfig::default()
-        };
-        let (mut rt, _) = build_step_runtime(dir, &cfg).expect("runtime");
-        let layout = rt.layout;
-        rt.run_forward_once(StepFinishMode::Full)
-            .expect("seed logits from step 1");
-
-        let soft_elems = CANVAS * HID;
-        let soft_off = rt.bufs.arena_map.soft_off() as usize;
-        rt.dispatch_and_wait(|enc| {
-            enc.encode_sc_logit_rowstats();
-            enc.encode_sc_softembed_path(&layout, false, false)?;
-            Ok(())
-        })
-        .expect("slow sc softembed");
-        let slow = read_arena_buffer_f32(&rt.bufs.arena, soft_off, soft_elems);
-
-        // Clear soft_off so a GEMM path that writes the wrong slot (the
-        // double-offset bug) is caught instead of comparing the slow values that
-        // were left in place.
-        write_buffer_bytes(&rt.bufs.arena, soft_off, &vec![0u8; soft_elems * 2]);
-
-        rt.dispatch_and_wait(|enc| {
-            enc.encode_sc_logit_rowstats();
-            enc.encode_sc_softembed_path(&layout, true, true)?;
-            Ok(())
-        })
-        .expect("chunked sc softembed");
-        let fast = read_arena_buffer_f32(&rt.bufs.arena, rt.bufs.arena_map.soft_off() as usize, soft_elems);
-
-        let mut dot = 0.0f64;
-        let mut na = 0.0f64;
-        let mut nb = 0.0f64;
-        let mut max_abs = 0.0f32;
-        for (a, b) in slow.iter().zip(fast.iter()) {
-            dot += *a as f64 * *b as f64;
-            na += *a as f64 * *a as f64;
-            nb += *b as f64 * *b as f64;
-            max_abs = max_abs.max((a - b).abs());
-        }
-        let cos = (dot / (na.sqrt() * nb.sqrt())) as f32;
-        eprintln!("sc softembed chunked vs slow: cos={cos:.6} max_abs={max_abs:.6}");
-        assert!(cos > 0.999, "chunked vs slow cos={cos}");
-        assert!(max_abs < 0.05, "chunked vs slow max_abs={max_abs}");
-    }
-
-    #[test]
-    fn sc_chunked_matches_full_gemm_softembed() {
-        use std::path::Path;
-
-        unsafe {
-            std::env::set_var("DGQ_SC_CHUNKED", "0");
-        }
-        let dir = [
-            Path::new("/tmp/quantized-weights"),
-            Path::new("model/diffusiongemma-q4"),
-            Path::new("model/q4"),
-        ]
-        .into_iter()
-        .find(|p| crate::dgq::store::looks_like_dgq_dir(p));
-        let Some(dir) = dir else {
-            eprintln!("skip sc_chunked_matches_full_gemm_softembed");
-            return;
-        };
-        let cfg = StepSmokeConfig {
-            finish: StepFinishMode::Full,
-            steps: 1,
-            ..StepSmokeConfig::default()
-        };
-        let (mut rt, _) = build_step_runtime(dir, &cfg).expect("runtime");
-        let layout = rt.layout;
-        rt.run_forward_once(StepFinishMode::Full)
-            .expect("seed logits from step 1");
-
-        let soft_elems = CANVAS * HID;
-        let soft_off = rt.bufs.arena_map.soft_off() as usize;
-        rt.dispatch_and_wait(|enc| {
-            enc.encode_sc_logit_rowstats();
-            enc.encode_sc_softembed_path(&layout, true, false)?;
-            Ok(())
-        })
-        .expect("full prob sc softembed");
-        let full = read_arena_buffer_f32(&rt.bufs.arena, soft_off, soft_elems);
-        write_buffer_bytes(&rt.bufs.arena, soft_off, &vec![0u8; soft_elems * 2]);
-
-        rt.dispatch_and_wait(|enc| {
-            enc.encode_sc_logit_rowstats();
-            enc.encode_sc_softembed_path(&layout, true, true)?;
-            Ok(())
-        })
-        .expect("chunked sc softembed");
-        let chunked = read_arena_buffer_f32(&rt.bufs.arena, rt.bufs.arena_map.soft_off() as usize, soft_elems);
-
-        let mut dot = 0.0f64;
-        let mut na = 0.0f64;
-        let mut nb = 0.0f64;
-        let mut max_abs = 0.0f32;
-        for (a, b) in full.iter().zip(chunked.iter()) {
-            dot += *a as f64 * *b as f64;
-            na += *a as f64 * *a as f64;
-            nb += *b as f64 * *b as f64;
-            max_abs = max_abs.max((a - b).abs());
-        }
-        let cos = (dot / (na.sqrt() * nb.sqrt())) as f32;
-        let nf = |v: &[f32]| v.iter().map(|x| *x as f64 * *x as f64).sum::<f64>().sqrt();
-        eprintln!(
-            "sc softembed chunked vs full gemm: cos={cos:.6} max_abs={max_abs:.6} norm_full={:.4} norm_chunked={:.4}",
-            nf(&full),
-            nf(&chunked)
-        );
-        assert!(cos > 0.999, "chunked vs full cos={cos}");
-        assert!(max_abs < 0.05, "chunked vs full max_abs={max_abs}");
     }
 
     #[test]
@@ -7641,7 +6743,7 @@ mod tests {
 
         rt.dispatch_and_wait(|enc| {
             enc.encode_sc_logit_rowstats();
-            enc.encode_sc_softembed_path(&layout, true, true)?;
+            enc.encode_sc_softembed_exact(&layout)?;
             Ok(())
         })
         .expect("gpu chunked");
@@ -7712,150 +6814,6 @@ mod tests {
         write_buffer_bytes(&rt.bufs.route, 0, &snap.route);
         write_buffer_bytes(&rt.bufs.gemm_a, 0, &snap.gemm_a);
         write_buffer_bytes(&rt.bufs.gemm_b, 0, &snap.gemm_b);
-    }
-
-    fn icb_plan_parity(
-        rt: &mut StepRuntime,
-        layout: &ModelLayout,
-        layers: usize,
-        first_step: u32,
-    ) -> f32 {
-        if first_step == 1 {
-            rt.ensure_no_sc_icb().expect("no_sc icb");
-        } else {
-            rt.ensure_with_sc_icb().expect("with_sc icb");
-        }
-        let snap = snapshot_step_gpu(rt);
-        rt.dispatch_and_wait(|enc| {
-            enc.encode_step_preamble(layout, first_step)?;
-            for layer in 0..layers {
-                enc.encode_full_layer(layer, layout)?;
-            }
-            enc.encode_step_finish(layout, StepFinishMode::Full)?;
-            Ok(())
-        })
-        .expect("live");
-        let live_logits = read_half_buffer_f32(&rt.bufs.logits, 0, CANVAS * VOCAB);
-
-        // Sequential generate never rewinds arena/kv between live reference and ICB replay.
-        rt.write_canvas_state(&snap.state);
-        let icb = rt.icb.as_ref().expect("icb plan");
-        let plan = if first_step == 1 {
-            icb.no_sc.as_ref().expect("no_sc plan")
-        } else {
-            icb.with_sc.as_ref().expect("with_sc plan")
-        };
-        let cmd = rt.ctx.queue.commandBuffer().expect("cmd");
-        let mut enc =
-            crate::metal::step_icb::replay_step_icb(&cmd, plan)
-                .expect("replay");
-        enc.endEncoding();
-        cmd.commit();
-        cmd.waitUntilCompleted();
-
-        let icb_logits = read_half_buffer_f32(&rt.bufs.logits, 0, CANVAS * VOCAB);
-        live_logits
-            .iter()
-            .zip(icb_logits.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max)
-    }
-
-    /// Tier-2 ICB fixture per STRATEGY.md §5: real weights, few layers, seconds not minutes.
-    fn icb_tier2_config() -> StepSmokeConfig {
-        StepSmokeConfig {
-            layers: 3,
-            steps: 1,
-            finish: StepFinishMode::Full,
-            no_early_stop: true,
-            ..StepSmokeConfig::default()
-        }
-    }
-
-    fn icb_prefill_tier2_config() -> StepSmokeConfig {
-        icb_tier2_config()
-    }
-
-    #[test]
-    fn icb_replay_matches_live_tier2() {
-        let dir = Path::new("/tmp/quantized-weights");
-        if !crate::dgq::store::looks_like_dgq_dir(dir) {
-            eprintln!("skip icb_replay_matches_live_tier2");
-            return;
-        }
-        let cfg = icb_tier2_config();
-        let (mut rt, _) = build_step_runtime(dir, &cfg).expect("build");
-        let layout = rt.layout;
-        let layers = rt.layers;
-
-        let no_sc = icb_plan_parity(&mut rt, &layout, layers, 1);
-        eprintln!("icb tier2 no_sc: logits_max_abs={no_sc:.6}");
-        assert!(no_sc < 0.05, "no_sc drift max_abs={no_sc}");
-
-        rt.run_forward_once(StepFinishMode::Full).expect("step1 icb");
-        let with_sc = icb_plan_parity(&mut rt, &layout, layers, 0);
-        eprintln!("icb tier2 with_sc: logits_max_abs={with_sc:.6}");
-        assert!(with_sc < 0.05, "with_sc drift max_abs={with_sc}");
-    }
-
-    /// Prefilled-KV ICB parity (hello prefill, 3L).
-    #[test]
-    fn icb_prefill_no_sc_tier2() {
-        let dir = Path::new("/tmp/quantized-weights");
-        if !crate::dgq::store::looks_like_dgq_dir(dir) {
-            eprintln!("skip icb_prefill_no_sc_tier2");
-            return;
-        }
-        let prefill = hello_chat_prefill_token_ids(dir).expect("hello prefill");
-        let cfg = StepSmokeConfig {
-            prefill_token_ids: Some(prefill),
-            ..icb_prefill_tier2_config()
-        };
-        let (mut rt, _) = build_step_runtime(dir, &cfg).expect("build");
-        let layout = rt.layout;
-        let layers = rt.layers;
-        let sampler = crate::sample::sampler_for_steps(1, true);
-        let params = step_params_from_sampler(&sampler, rt.read_params().kv_len, true, 1);
-        let mut rng = Rng::new(cfg.seed);
-        rt.reset_block(VOCAB, &mut rng, params);
-        let max = icb_plan_parity(&mut rt, &layout, layers, 1);
-        eprintln!("icb prefill tier2 no_sc: logits_max_abs={max:.6}");
-        assert!(max < 0.05, "prefill no_sc drift max_abs={max}");
-    }
-
-    #[test]
-    fn icb_nvfp4_fused_matches_live_encode() {
-        let dir = Path::new("/tmp/nvfp4-weights");
-        if !crate::dgq::store::looks_like_dgq_dir(dir) {
-            eprintln!("skip icb_nvfp4_fused_matches_live_encode");
-            return;
-        }
-        let cfg = StepSmokeConfig {
-            ..icb_tier2_config()
-        };
-        let (mut rt, _) = build_step_runtime(dir, &cfg).expect("build");
-        if rt.icb.is_none() {
-            eprintln!("skip icb_nvfp4_fused: ICB disabled on fused nvfp4 path");
-            return;
-        }
-        let layout = rt.layout;
-        let layers = rt.layers;
-        let no_sc = icb_plan_parity(&mut rt, &layout, layers, 1);
-        eprintln!("icb nvfp4 no_sc parity: logits_max_abs={no_sc:.6}");
-        assert!(no_sc < 0.05, "nvfp4 no_sc drift max_abs={no_sc}");
-
-        rt.dispatch_and_wait(|enc| {
-            enc.encode_step_preamble(&layout, 1)?;
-            for layer in 0..layers {
-                enc.encode_full_layer(layer, &layout)?;
-            }
-            enc.encode_step_finish(&layout, StepFinishMode::Full)?;
-            Ok(())
-        })
-        .expect("step1 live");
-        let with_sc = icb_plan_parity(&mut rt, &layout, layers, 0);
-        eprintln!("icb nvfp4 with_sc parity: logits_max_abs={with_sc:.6}");
-        assert!(with_sc < 0.05, "nvfp4 with_sc drift max_abs={with_sc}");
     }
 
     #[test]
@@ -8050,27 +7008,12 @@ mod tests {
                 .fold(0.0f32, f32::max)
         }
 
-        fn forward_row0_logits(
-            dir: &Path,
-            cfg: &StepSmokeConfig,
-            fused_qkv: bool,
-            fused_gate: bool,
-        ) -> Vec<f32> {
+        fn forward_row0_logits(dir: &Path, cfg: &StepSmokeConfig, fused: bool) -> Vec<f32> {
             unsafe {
-                if fused_qkv || fused_gate {
+                if fused {
                     std::env::remove_var("DGQ_FUSED_ALGEBRA");
                 } else {
                     std::env::set_var("DGQ_FUSED_ALGEBRA", "0");
-                }
-                if fused_qkv {
-                    std::env::remove_var("DGQ_FUSED_QKV");
-                } else {
-                    std::env::set_var("DGQ_FUSED_QKV", "0");
-                }
-                if fused_gate {
-                    std::env::remove_var("DGQ_FUSED_GATE_UP");
-                } else {
-                    std::env::set_var("DGQ_FUSED_GATE_UP", "0");
                 }
             }
             let mut cfg = cfg.clone();
@@ -8105,23 +7048,17 @@ mod tests {
             ..StepSmokeConfig::default()
         };
 
-        let off = forward_row0_logits(dir, &cfg, false, false);
-        let on = forward_row0_logits(dir, &cfg, true, true);
-        let gate_only = forward_row0_logits(dir, &cfg, false, true);
-        let qkv_only = forward_row0_logits(dir, &cfg, true, false);
-        let off2 = forward_row0_logits(dir, &cfg, false, false);
+        let off = forward_row0_logits(dir, &cfg, false);
+        let on = forward_row0_logits(dir, &cfg, true);
+        let off2 = forward_row0_logits(dir, &cfg, false);
         unsafe {
             std::env::remove_var("DGQ_FUSED_ALGEBRA");
-            std::env::remove_var("DGQ_FUSED_QKV");
-            std::env::remove_var("DGQ_FUSED_GATE_UP");
         }
 
         let max = row0_max_abs_diff(&off, &on);
-        let gate = row0_max_abs_diff(&off, &gate_only);
-        let qkv = row0_max_abs_diff(&off, &qkv_only);
         let baseline = row0_max_abs_diff(&off, &off2);
         eprintln!(
-            "fusion row0 logits max_abs: both={max:.4e} gate_only={gate:.4e} qkv_only={qkv:.4e} unfused_repeat={baseline:.4e}"
+            "fusion row0 logits max_abs: fused={max:.4e} unfused_repeat={baseline:.4e}"
         );
         assert!(baseline < 1e-5, "unfused not deterministic: {baseline}");
 

@@ -69,9 +69,7 @@ pub fn step_trace_from_stats(
     entropies: Option<&[f32]>,
     early_stop: bool,
 ) -> DenoiseStepTrace {
-    let full_trace = std::env::var("DGQ_TRACE_ENTROPY")
-        .map(|v| v.eq_ignore_ascii_case("full"))
-        .unwrap_or(false);
+    let full_trace = crate::flags::trace_entropy_full();
     let prefix_len = if full_trace {
         argmax.len()
     } else {

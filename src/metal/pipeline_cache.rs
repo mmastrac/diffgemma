@@ -54,7 +54,6 @@ fn shader_bundle_token() -> u64 {
         include_str!("../../shaders/kernels/logit_rowstats.metal"),
         include_str!("../../shaders/kernels/sc_prob_cols.metal"),
         include_str!("../../shaders/kernels/sc_probs.metal"),
-        include_str!("../../shaders/kernels/sc_softembed.metal"),
         include_str!("../../shaders/kernels/memzero_bytes.metal"),
         include_str!("../../shaders/kernels/residual_half.metal"),
         include_str!("../../shaders/kernels/rms_norm_rows.metal"),

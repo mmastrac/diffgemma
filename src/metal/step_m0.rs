@@ -507,7 +507,7 @@ pub fn run_step_parity(
 
     let (hidden_max_abs, _) = max_abs_diff(&mono.norm_hidden, &eng_hidden);
     let logits_mean_diff = mean_abs_diff(&mono.logits, &eng_logits);
-    if std::env::var_os("DGQ_PARITY_DEBUG").is_some() {
+    if crate::flags::parity_debug_enabled() {
         // top-1 argmax agreement per token row — the generation-relevant check.
         let rows = mono.logits.len() / VOCAB;
         let argmax = |v: &[f32]| {

@@ -65,27 +65,6 @@ pub fn pipeline_for(
     ctx.compile_subkernel(SHADER, ENTRY, variant)
 }
 
-/// f32 hidden/stream-plane variant (DGQ_HIDDEN_F32): `a` input and `y` output
-/// are the f32 hidden/stream planes; `b` stays bf16 (FC30 + FC31).
-#[cfg(all(feature = "metal", target_os = "macos"))]
-pub fn pipeline_for_hidden_f32(
-    ctx: &crate::metal::device::MetalContext,
-    variant: KernelVariant,
-) -> Result<crate::metal::device::ComputePipeline, Error> {
-    use crate::kernels::sub::variant::FcBool;
-    ctx.compile_subkernel_ex(
-        SHADER,
-        ENTRY,
-        variant,
-        "hf32",
-        &[
-            FcBool { index: 30, value: true },
-            FcBool { index: 31, value: true },
-        ],
-        &[],
-    )
-}
-
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use objc2::runtime::ProtocolObject;
 #[cfg(all(feature = "metal", target_os = "macos"))]

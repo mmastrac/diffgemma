@@ -254,12 +254,6 @@ impl MetalContext {
                 MTLDataType::Bool,
                 8,
             );
-            let act_f16 = variant.act_f16;
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&act_f16).cast(),
-                MTLDataType::Bool,
-                9,
-            );
             fc.setConstantValue_type_atIndex(
                 std::ptr::NonNull::from_ref(&is_full_layer).cast(),
                 MTLDataType::Bool,
@@ -339,8 +333,7 @@ impl MetalContext {
             .newFunctionWithName_constantValues_error(&name, &fc)
             .map_err(|e| shader_compile_error(e))?;
         let label = format!(
-            "{entry}_qf{quant_format}_n{gemm_n}_k{gemm_k}_nt{gemm_n_tile}_a{}_ns{}_e{}_{}_{}_w{}_{}_{}_y{}_{}_{}",
-            u8::from(variant.act_f16),
+            "{entry}_qf{quant_format}_n{gemm_n}_k{gemm_k}_nt{gemm_n_tile}_ns{}_e{}_{}_{}_w{}_{}_{}_y{}_{}_{}",
             stacked.n_segs,
             stacked.end0,
             stacked.end1,
@@ -403,12 +396,6 @@ impl MetalContext {
                 MTLDataType::Bool,
                 8,
             );
-            let act_f16 = variant.act_f16;
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&act_f16).cast(),
-                MTLDataType::Bool,
-                9,
-            );
             fc.setConstantValue_type_atIndex(
                 std::ptr::NonNull::from_ref(&is_full_layer).cast(),
                 MTLDataType::Bool,
@@ -461,13 +448,12 @@ impl MetalContext {
             .newFunctionWithName_constantValues_error(&name, &fc)
             .map_err(|e| shader_compile_error(e))?;
         let label = format!(
-            "{entry}_qf{quant_format}_n{gemm_n}_k{gemm_k}_nt{gemm_n_tile}_xfp16{}_sa{}_df{}_dd{}_g{}_a{}_o{}_ad{}",
+            "{entry}_qf{quant_format}_n{gemm_n}_k{gemm_k}_nt{gemm_n_tile}_xfp16{}_sa{}_df{}_dd{}_g{}_o{}_ad{}",
             u8::from(x_fp16),
             u8::from(shape_assert),
             u8::from(debug_fast),
             u8::from(debug_deep),
             u8::from(gather_a),
-            u8::from(variant.act_f16),
             u8::from(out_bf16),
             u8::from(m_adapt),
         );
@@ -565,12 +551,6 @@ impl MetalContext {
                 std::ptr::NonNull::from_ref(&debug_deep).cast(),
                 MTLDataType::Bool,
                 8,
-            );
-            let act_f16 = variant.act_f16;
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&act_f16).cast(),
-                MTLDataType::Bool,
-                9,
             );
             for extra in extra_bools {
                 fc.setConstantValue_type_atIndex(

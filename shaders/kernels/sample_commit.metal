@@ -14,7 +14,6 @@ kernel void sample_commit(
     constant uint &filler_token [[buffer(4)]],
     constant uint &eos_token [[buffer(5)]],
     device DebugStatus *dbg [[buffer(6)]],
-    constant float &accept_row_ent_max [[buffer(7)]],
     uint lid [[thread_position_in_threadgroup]]
 ) {
     if (K_SHAPE_ASSERT && (canvas_size == 0u || canvas_size > DGQ_SAMPLER_MAX_CANVAS)) {
@@ -55,13 +54,6 @@ kernel void sample_commit(
             for (uint i = 0u; i < canvas_size; ++i) {
                 uint id = S->sorted_idx[i];
                 if (prefix > P.entropy_bound) {
-                    break;
-                }
-                // Optional per-row cap (<=0 disables): the plain prefix rule
-                // accepts the first sorted row unconditionally, freezing a
-                // genuinely uncertain token on flat canvases. Sorted ascending,
-                // so the first over-cap row ends the scan.
-                if (accept_row_ent_max > 0.f && ent[id] > accept_row_ent_max) {
                     break;
                 }
                 S->accept[id] = 1u;

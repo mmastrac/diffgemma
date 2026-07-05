@@ -3,6 +3,7 @@ mod chat_template;
 mod config;
 mod denoise_trace;
 mod fast_slice;
+mod flags;
 mod generate;
 mod generate_golden;
 #[allow(dead_code)]
@@ -2863,7 +2864,6 @@ fn parse_cli() -> Cli {
     let mut embed_row_gpu = false;
     let mut bf16_ref_dir: Option<PathBuf> = None;
     let mut step_gpu_kv = false;
-    let mut use_monolithic = false;
     let mut raw_prompt = false;
 
     while let Some(arg) = args.next() {
@@ -3089,7 +3089,6 @@ fn parse_cli() -> Cli {
                     bf16_ref_dir = Some(PathBuf::from(v));
                 }
             }
-            "--monolithic" => use_monolithic = true,
             "--raw" => raw_prompt = true,
             "--max-seq" => {
                 if let Some(v) = args.next() {
@@ -3111,7 +3110,6 @@ fn parse_cli() -> Cli {
         }
     }
 
-    let use_monolithic = use_monolithic || monolithic_from_env();
     let steps_production = resolve_steps(steps_override, false);
     let steps_parity = resolve_steps(steps_override, true);
 
@@ -3125,7 +3123,6 @@ fn parse_cli() -> Cli {
             max_new_tokens,
             parity_layers,
             no_early_stop,
-            use_monolithic,
         ),
         Some("summary") => Command::Summary,
         Some("config") => Command::Config,
@@ -3526,18 +3523,6 @@ fn parse_cli() -> Cli {
     }
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
-fn monolithic_from_env() -> bool {
-    match std::env::var("DGQ_MONOLITHIC") {
-        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
-        Err(_) => false,
-    }
-}
-
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-fn monolithic_from_env() -> bool {
-    false
-}
 
 
 
@@ -3551,7 +3536,6 @@ fn default_generate_command(
     max_new_tokens: usize,
     max_layers: Option<usize>,
     no_early_stop: bool,
-    _use_monolithic: bool,
 ) -> Command {
     let _ = model_dir;
     // The non-monolithic generate surface is retired; `ask`/`generate` always
@@ -3581,7 +3565,6 @@ fn default_generate_command(
     max_new_tokens: usize,
     max_layers: Option<usize>,
     no_early_stop: bool,
-    _use_monolithic: bool,
 ) -> Command {
     Command::GenerateMonolithic {
         prompt,

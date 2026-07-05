@@ -392,25 +392,10 @@ pub fn step_entropy_stats(entropies: &[f32], accept: &[u32]) -> StepEntropyStats
     }
 }
 
-/// HuggingFace `EntropyBoundSampler.accept_canvas` selection mask:
-/// accept sorted position `i` when `sum(entropy[0..i-1]) <= bound`.
+/// HuggingFace/MLX `EntropyBoundSampler` selection mask: accept sorted
+/// position `i` when `sum(entropy[0..i-1]) <= bound` (entropy-sorted
+/// prefix-sum; the first sorted row is always accepted).
 pub fn accept_mask_from_entropies(entropies: &[f32], entropy_bound: f32) -> Vec<bool> {
-    accept_mask_from_entropies_capped(entropies, entropy_bound, 0.0)
-}
-
-/// Entropy-sorted prefix-sum accept (MLX rule) with an optional per-row cap:
-/// a row must itself have entropy <= `row_cap` to be accepted (`row_cap <= 0`
-/// disables = exact MLX rule). The uncapped rule accepts the FIRST sorted row
-/// unconditionally (prefix 0 <= bound before any addition), which on
-/// flat/creative canvases freezes a genuinely uncertain token at step 1
-/// (observed at row entropy 0.61 — the "grebe me" wart class). The cap defers
-/// those accepts until the row sharpens; rows are sorted ascending so the
-/// first over-cap row ends the scan.
-pub fn accept_mask_from_entropies_capped(
-    entropies: &[f32],
-    entropy_bound: f32,
-    row_cap: f32,
-) -> Vec<bool> {
     let n = entropies.len();
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|&a, &b| {
@@ -423,9 +408,6 @@ pub fn accept_mask_from_entropies_capped(
     let mut prefix = 0.0f32;
     for &idx in &order {
         if prefix > entropy_bound {
-            break;
-        }
-        if row_cap > 0.0 && entropies[idx] > row_cap {
             break;
         }
         mask[idx] = true;

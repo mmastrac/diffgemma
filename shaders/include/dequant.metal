@@ -5,12 +5,11 @@
 using namespace metal;
 
 #include "common.metal"
-#include "act_fc.metal"   // K_ACT_F16 (FC9 only)
 
-/// Read one activation arena slot into half: f16 reinterpret when K_ACT_F16, else
+/// Read one bf16 activation arena slot into half.
 /// bf16->f32->half. Matches arena_store's precision (arena.metal).
 inline half arena_act_half(device const ushort *x, ulong i) {
-    return K_ACT_F16 ? as_type<half>(x[i]) : half(bf16_to_f32(x[i]));
+    return half(bf16_to_f32(x[i]));
 }
 
 // ---- Q4 affine (32-wide groups) ----

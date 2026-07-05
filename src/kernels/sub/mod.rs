@@ -58,7 +58,6 @@ pub mod router_scale_rows;
 pub mod router_top_k_rows;
 pub mod sc_prob_cols;
 pub mod sc_probs;
-pub mod sc_softembed;
 pub mod sample_apply;
 pub mod sample_commit;
 pub mod sample_rowstats;

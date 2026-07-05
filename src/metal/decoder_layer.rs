@@ -916,7 +916,7 @@ pub fn forward_encoder_prefill_resident(
     );
     let phase_b_started = std::time::Instant::now();
     batch.end()?;
-    if std::env::var("DGQ_PREFILL_PROFILE").is_ok() {
+    if crate::flags::prefill_profile_enabled() {
         eprintln!(
             "  prefill layer {layer}: encAttn={:.1?} encDense={:.1?} encRoute={:.1?} waitA={phase_a:.1?} encB={:.1?} waitB={:.1?} jobs={}",
             t_attn_encoded - layer_entry,

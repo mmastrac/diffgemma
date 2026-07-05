@@ -73,8 +73,6 @@ pub fn tempered_sample_row(row: &[f32], mx: f32, z: f32, u: f32, temperature: f3
 pub struct CommitParams<'a> {
     pub max_steps: u32,
     pub entropy_bound: f32,
-    /// Per-row accept cap (<=0 disables): see `accept_mask_from_entropies_capped`.
-    pub accept_row_ent_max: f32,
     pub conf_threshold: f32,
     pub stability_threshold: u32,
     pub min_early_stop_steps: u32,
@@ -137,11 +135,7 @@ pub fn sample_commit_cpu(
     let final_step = step + 1 >= p.max_steps;
     let mut accept = vec![0u32; canvas];
     if !final_step {
-        let mask = crate::sample::accept_mask_from_entropies_capped(
-            p.entropy,
-            p.entropy_bound,
-            p.accept_row_ent_max,
-        );
+        let mask = crate::sample::accept_mask_from_entropies(p.entropy, p.entropy_bound);
         for (i, &m) in mask.iter().enumerate() {
             if m {
                 accept[i] = 1;
@@ -261,7 +255,6 @@ mod tests {
             CommitParams {
                 max_steps: 4,
                 entropy_bound: 0.25,
-                accept_row_ent_max: 0.0,
                 conf_threshold: f32::MAX,
                 stability_threshold: 99,
                 min_early_stop_steps: 12,

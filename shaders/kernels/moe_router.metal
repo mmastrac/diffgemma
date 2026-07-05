@@ -7,7 +7,6 @@ using namespace metal;
 #include "attention_device.metal"
 #include "moe_router_device.metal"
 #include "arena.metal"
-#include "hidden_fc.metal"
 
 /// RMSNorm → router scale → linear → softmax → top-k (monolith k_router).
 kernel void moe_router(
@@ -37,7 +36,7 @@ kernel void moe_router(
     device const float *xf = ((device const float *)stream) + (ulong)tok * dims.hidden;
     float ss = 0.f;
     for (uint i = e; i < dims.hidden; i += 128u) {
-        float t = K_HIDDEN_A_F32 ? xf[i] : arena_load(x, i);
+        float t = arena_load(x, i);
         ss += t * t;
     }
     ss = simd_sum(ss);
@@ -55,7 +54,7 @@ kernel void moe_router(
         device const uchar *wr = blob + L->router_proj + (ulong)e * dims.hidden * 2ul;
         float acc = 0.f;
         for (uint d = 0u; d < dims.hidden; ++d) {
-            float xv = K_HIDDEN_A_F32 ? xf[d] : arena_load(x, d);
+            float xv = arena_load(x, d);
             float xn = xv * norm_inv * bf16_bytes(rs + 2ul * d) * dims.router_hscale;
             acc += xn * bf16_bytes(wr + 2ul * d);
         }
@@ -95,7 +94,7 @@ kernel void moe_router(
             R->expert[tok][kk] = pick[kk];
             // Router weight is stored bf16 and read back as bf16 by the scatter
             // (bf16_to_f32(as_type<ushort>(...))). Must use the ALWAYS-bf16 packer,
-            // not the toggleable arena one — else under K_ACT_F16 the router writes
+            // the bf16 one — the router writes
             // f16 bits that the scatter misreads as bf16 -> ~zero weights -> MoE=0.
             R->weight[tok][kk] = as_type<half>(arena_bf16_bits(w));
         }

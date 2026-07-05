@@ -42,26 +42,14 @@ pub enum MoeExecutionStyle {
     ScalarPerExpert,
 }
 
-/// Batched MoE grouped GEMM uses the fast path when enabled for supported formats.
-pub fn batched_moe_enabled() -> bool {
-    match std::env::var("DGQ_STEP_MOE_GROUPED") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
-    }
-}
-
 pub fn moe_execution_style(format: QuantFormat) -> MoeExecutionStyle {
-    // Q6 has no scalar-per-expert kernel: always batched-grouped.
-    if format == QuantFormat::Q6 {
-        return MoeExecutionStyle::BatchedGrouped;
-    }
-    if batched_moe_enabled() {
-        match format {
-            QuantFormat::Q4Affine | QuantFormat::NvFp4 => MoeExecutionStyle::BatchedGrouped,
-            _ => MoeExecutionStyle::ScalarPerExpert,
+    match format {
+        QuantFormat::Q4Affine | QuantFormat::NvFp4 | QuantFormat::Q6 => {
+            MoeExecutionStyle::BatchedGrouped
         }
-    } else {
-        MoeExecutionStyle::ScalarPerExpert
+        // Unreachable for real expert formats; the scalar kernel survives as
+        // the route-dump probe + oracle-test surface.
+        _ => MoeExecutionStyle::ScalarPerExpert,
     }
 }
 

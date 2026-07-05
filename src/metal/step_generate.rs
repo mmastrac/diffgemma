@@ -71,12 +71,7 @@ fn smoke_config(cfg: &StepGenerateConfig, prefill_token_ids: Option<Vec<u32>>) -
     }
 }
 
-fn progress_enabled() -> bool {
-    match std::env::var("DGQ_QUIET") {
-        Ok(v) => v != "1" && !v.eq_ignore_ascii_case("true"),
-        Err(_) => true,
-    }
-}
+use crate::flags::progress_enabled;
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -387,7 +382,7 @@ pub fn generate_with_session(
                     rt.logits(),
                 );
             }
-            if std::env::var("DGQ_LOG_SC").ok().as_deref() == Some("1") {
+            if crate::flags::sc_log_enabled() {
                 eprintln!(
                     "monolithic denoise: step_index={block_step_count} st.step={} sc_active_next={}",
                     st.step,
@@ -437,10 +432,7 @@ pub fn generate_with_session(
                 None if max_steps_reached => DenoiseStopReason::MaxSteps,
                 None => DenoiseStopReason::None,
             };
-            if std::env::var("DGQ_LOG_EARLY_STOP")
-                .ok()
-                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            {
+            if crate::flags::log_early_stop_enabled() {
                 if gpu_early != cpu_early {
                     eprintln!(
                         "step-generate: early-stop mismatch step={} gpu_flag={} gpu_early={gpu_early} cpu_early={cpu_early} accept_plateau={} mean_ent={:.4} stable={} threshold={:.4}",

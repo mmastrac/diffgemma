@@ -13,9 +13,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLBuffer;
 
-pub fn sc_log_enabled() -> bool {
-    std::env::var("DGQ_LOG_SC").ok().as_deref() == Some("1")
-}
+pub use crate::flags::sc_log_enabled;
 
 #[derive(Debug, Clone, Copy)]
 pub struct F32RowStats {

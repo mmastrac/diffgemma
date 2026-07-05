@@ -306,7 +306,7 @@ fn forward_inner(
         }
     }
 
-    if std::env::var("DGQ_LOG_SC").ok().as_deref() == Some("1") {
+    if crate::flags::sc_log_enabled() {
         let sc_used = scratch.have_gpu_sc_logits || input.self_conditioning_logits.is_some();
         let sc_max = if sc_used {
             scratch
@@ -337,11 +337,8 @@ fn forward_inner(
     // the engine round-trips hidden through these CPU slices anyway, so this is
     // a free probe. Emits the step-layer-probe JSON schema for
     // compare_layer_hidden.py.
-    let layer_dump_path = std::env::var("DGQ_ENGINE_LAYER_DUMP").ok();
-    let layer_dump_pos: usize = std::env::var("DGQ_ENGINE_LAYER_POS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(129);
+    let layer_dump_path = crate::flags::engine_layer_dump_path();
+    let layer_dump_pos: usize = crate::flags::engine_layer_dump_pos();
     let mut layer_dump_rows: Vec<(String, Vec<f32>)> = Vec::new();
     if layer_dump_path.is_some() && layer_dump_pos < seq_len {
         let off = layer_dump_pos * hidden;

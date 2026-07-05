@@ -54,11 +54,7 @@ inline void tunable_load_a(
         half4 h;
         if (m0 + mm < M) {
             const ushort4 u = *(device const ushort4 *)(x + (ulong)(m0 + mm) * K + k0 + kk);
-            if (K_ACT_F16) {
-                h = as_type<half4>(u);
-            } else {
-                h = half4(as_type<float4>(uint4(u) << 16u));
-            }
+            h = half4(as_type<float4>(uint4(u) << 16u));
         } else {
             h = half4(0);
         }
@@ -448,11 +444,7 @@ kernel void gemm_tunable_sparse(
                     const uint tok = route->token_list[row0 + mm];
                     const ushort4 u =
                         *(device const ushort4 *)(moein + (ulong)tok * K + k0 + kk);
-                    if (K_ACT_F16) {
-                        h = as_type<half4>(u);
-                    } else {
-                        h = half4(as_type<float4>(uint4(u) << 16u));
-                    }
+                    h = half4(as_type<float4>(uint4(u) << 16u));
                 } else {
                     const float4 f =
                         *(device const float4 *)(a + (ulong)(row0 + mm) * K + k0 + kk);

@@ -69,7 +69,7 @@ kernel void moe_router_topk(
         float w = exp(logits[pick[kk]] - mx) * inv * bf16_bytes(pes + 2ul * pick[kk]);
         dgq_assert_index(dbg, DbgKernelMoeRouter, pick[kk], dims.n_experts);
         R->expert[tok][kk] = pick[kk];
-        // ALWAYS-bf16 weight bits (scatter reads bf16 regardless of K_ACT_F16).
+        // ALWAYS-bf16 weight bits (scatter reads bf16).
         R->weight[tok][kk] = as_type<half>(arena_bf16_bits(w));
     }
 }

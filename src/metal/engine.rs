@@ -139,8 +139,5 @@ impl GpuDecoderEngine {
 }
 
 fn encoder_gpu_moe_from_env() -> bool {
-    match std::env::var("DGQ_ENCODER_GPU_MOE") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
-    }
+    crate::flags::encoder_gpu_moe_enabled()
 }
