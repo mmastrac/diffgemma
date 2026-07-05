@@ -24,6 +24,7 @@
 //! Engine `GpuKvCache` uses separate f32 K/V buffers with RoPE applied at read time; the monolithic
 //! cache stores **post-RoPE K** and **V** in the layout above. M1.2 packs CPU encoder prefill output.
 
+use crate::flags::progress_enabled;
 use crate::config::ModelConfig;
 use crate::kernels::sub::bf16::{bf16_bits_to_f32, f32_to_bf16_bits};
 use crate::metal::decoder::load_weight_cache_opt;
@@ -322,10 +323,12 @@ impl MonolithicEncoderCache {
             engine.set_encoder_gpu_moe(true);
         }
         let dec_scratch = GpuDecoderScratch::new(canvas, &model.config);
+        if progress_enabled() {
         eprintln!(
             "monolithic-encoder: cache open {:.2?} (model + engine weights)",
             open_started.elapsed(),
         );
+        }
         Ok(Self {
             model,
             weights,
@@ -404,11 +407,13 @@ pub fn prefill_monolithic_kv_with_cache_timed(
         // dominant cost vs MLX's single-graph prefill).
         let tel = cache.engine.telemetry_handle();
         let t = tel.borrow();
+        if progress_enabled() {
         eprintln!(
             "monolithic-prefill: engine telemetry gpu_syncs={} readback={:.2} MiB",
             t.gpu_syncs,
             t.gpu_readback_bytes as f64 / (1024.0 * 1024.0),
         );
+        }
     }
     if !telemetry_was_on {
         let _ = cache.engine.take_forward_telemetry();
@@ -446,10 +451,12 @@ pub fn prefill_monolithic_kv_with_cache_timed(
         kv_pack_ms,
         total_ms: total_started.elapsed().as_secs_f64() * 1000.0,
     };
+    if progress_enabled() {
     eprintln!(
         "monolithic-prefill: kv_len={kv_len} gpu_forward={gpu_forward_ms:.1}ms kv_pack={kv_pack_ms:.1}ms total={:.1}ms",
         timing.total_ms
     );
+    }
     Ok((kv_len, timing))
 }
 

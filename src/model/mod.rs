@@ -25,11 +25,13 @@ impl Model {
         let model_dir = model_dir.as_ref();
         let weights = WeightStore::open(model_dir)?;
         if weights.is_quantized() {
-            eprintln!(
-                "loaded .dgq quantized weights from {} ({:.2?})",
-                model_dir.display(),
-                open_started.elapsed()
-            );
+            if crate::flags::progress_enabled() {
+                eprintln!(
+                    "loaded .dgq quantized weights from {} ({:.2?})",
+                    model_dir.display(),
+                    open_started.elapsed()
+                );
+            }
         } else if weights.is_packed() {
             eprintln!(
                 "loaded iris.pack weights from {} ({:.2?})",

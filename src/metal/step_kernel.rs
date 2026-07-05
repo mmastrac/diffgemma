@@ -4486,6 +4486,7 @@ pub fn log_step_memory_budget(
     let gemm_scratch = (mx + mw) as u64;
     let gpu_static = kv + logits + sc_probs + arena + gemm_scratch;
     let total = blob_bytes + gpu_static;
+    if crate::flags::progress_enabled() {
     eprintln!("step-kernel memory budget:");
     eprintln!(
         "  blob:       {:.2} GiB",
@@ -4519,6 +4520,7 @@ pub fn log_step_memory_budget(
         "  total est:  {:.2} GiB",
         total as f64 / (1024.0_f64.powi(3))
     );
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4556,22 +4558,23 @@ pub fn build_step_runtime(
         .get_entry("model.decoder.embed_tokens.weight")
         .and_then(|e| crate::dgq::layout::parse_quant_kind(&e.meta.kind).ok())
         == Some(crate::dgq::layout::QuantKind::Raw);
-    if embed_bf16 {
-        eprintln!("step-kernel: bf16 embed (tied lm_head + SC)");
-    }
-
     let block_profile = StepBlockProfile::from_store_profile(store.profile());
-    match block_profile.format {
-        QuantFormat::NvFp4 => eprintln!("step-kernel: nvfp4 block weights"),
-        QuantFormat::Q4Affine => eprintln!("step-kernel: q4 block weights"),
-        _ => eprintln!("step-kernel: block weights ({:?})", block_profile.format),
-    }
-    match block_profile.moe_style() {
-        MoeExecutionStyle::BatchedGrouped => {
-            eprintln!("step-kernel: batched grouped MoE");
+    if crate::flags::progress_enabled() {
+        if embed_bf16 {
+            eprintln!("step-kernel: bf16 embed (tied lm_head + SC)");
         }
-        MoeExecutionStyle::ScalarPerExpert => {
-            eprintln!("step-kernel: scalar per-expert MoE");
+        match block_profile.format {
+            QuantFormat::NvFp4 => eprintln!("step-kernel: nvfp4 block weights"),
+            QuantFormat::Q4Affine => eprintln!("step-kernel: q4 block weights"),
+            _ => eprintln!("step-kernel: block weights ({:?})", block_profile.format),
+        }
+        match block_profile.moe_style() {
+            MoeExecutionStyle::BatchedGrouped => {
+                eprintln!("step-kernel: batched grouped MoE");
+            }
+            MoeExecutionStyle::ScalarPerExpert => {
+                eprintln!("step-kernel: scalar per-expert MoE");
+            }
         }
     }
 
@@ -4701,10 +4704,12 @@ pub fn build_step_runtime(
         compile,
         total: build_started.elapsed(),
     };
-    eprintln!(
-        "step-kernel: runtime built (total={:.2?}, compile={:.2?})",
-        build.total, build.compile
-    );
+    if crate::flags::progress_enabled() {
+        eprintln!(
+            "step-kernel: runtime built (total={:.2?}, compile={:.2?})",
+            build.total, build.compile
+        );
+    }
     let mut rt = StepRuntime {
         ctx,
         pipelines,
@@ -4721,10 +4726,12 @@ pub fn build_step_runtime(
         layers,
         max_seq: cfg.max_seq,
     };
-    if rt.embed_bf16 && sc_sparse_enabled() {
-        eprintln!("step-kernel: sparse SC softembed (DGQ_SC_SPARSE=0 for the exact chunked path)");
-    } else {
-        eprintln!("step-kernel: chunked SC softembed");
+    if crate::flags::progress_enabled() {
+        if rt.embed_bf16 && sc_sparse_enabled() {
+            eprintln!("step-kernel: sparse SC softembed (DGQ_SC_SPARSE=0 for the exact chunked path)");
+        } else {
+            eprintln!("step-kernel: chunked SC softembed");
+        }
     }
     if let Some(ref token_ids) = cfg.prefill_token_ids {
         if should_fast_prefill(token_ids.len()) {
@@ -4733,10 +4740,12 @@ pub fn build_step_runtime(
             if kv_len as u32 != prefill_len {
                 return Err(Error::Format("fast-prefill kv_len mismatch"));
             }
-            eprintln!(
-                "step-kernel: fast-prefilled kv_len={kv_len} tokens ({:.2?})",
-                started.elapsed()
-            );
+            if crate::flags::progress_enabled() {
+                eprintln!(
+                    "step-kernel: fast-prefilled kv_len={kv_len} tokens ({:.2?})",
+                    started.elapsed()
+                );
+            }
         }
     }
     if let Some(path) = crate::flags::dump_kv_path() {

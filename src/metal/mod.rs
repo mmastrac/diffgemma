@@ -94,7 +94,7 @@ pub use step_logits_dump::{
 };
 pub use step_m0::{run_step_parity, run_step_verify, StepParityConfig};
 pub use step_config::{log_validated_step_model, validate_step_model};
-pub use step_generate::{generate_monolithic, generate_with_session, StepGenerateConfig, StepGenerateSession};
+pub use step_generate::{generate_monolithic, generate_with_session, StepGenerateConfig, StepGenerateSession, StepObserver, StepProgressEvent};
 pub use step_quant::BlockGroupedJob;
 pub use step_kv::{
     prefill_monolithic_kv_with_cache,

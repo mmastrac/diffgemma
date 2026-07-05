@@ -1,5 +1,7 @@
 mod buffer;
 mod chat_template;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+mod chat_ui;
 mod config;
 mod denoise_trace;
 mod fast_slice;
@@ -263,6 +265,8 @@ enum Command {
         max_layers: Option<usize>,
         no_early_stop: bool,
         initial_prompt: Option<String>,
+    
+        verbose: bool,
     },
     Smoketest {
         prompts_path: Option<PathBuf>,
@@ -676,6 +680,7 @@ fn main() -> ExitCode {
             max_layers,
             no_early_stop,
             initial_prompt,
+            verbose,
         } => run_chat_cmd(
             &cli.model_dir,
             initial_prompt,
@@ -685,6 +690,7 @@ fn main() -> ExitCode {
             max_layers,
             no_early_stop,
             cli.raw_prompt,
+            verbose,
         ),
         Command::Smoketest {
             prompts_path,
@@ -2840,6 +2846,7 @@ fn parse_cli() -> Cli {
     let mut write_golden: Option<String> = None;
     let mut write_trace: Option<PathBuf> = None;
     let mut no_early_stop = false;
+    let mut chat_verbose = false;
     let mut kernel_assert = false;
     let mut kernel_debug_deep = false;
     let mut output_dir: Option<PathBuf> = None;
@@ -2926,6 +2933,7 @@ fn parse_cli() -> Cli {
             "--compare-cpu" => compare_cpu = true,
             "--repeat-prefill" => bench_repeat_prefill = true,
             "--no-early-stop" => no_early_stop = true,
+            "--verbose" => chat_verbose = true,
             "--assert" => kernel_assert = true,
             "--debug-deep" => kernel_debug_deep = true,
             "--gpu-kv" => step_gpu_kv = true,
@@ -3170,6 +3178,8 @@ fn parse_cli() -> Cli {
             max_layers: parity_layers,
             no_early_stop,
             initial_prompt: prompt.clone(),
+        
+            verbose: chat_verbose,
         },
         Some("smoketest") => Command::Smoketest {
             prompts_path: positional.get(1).map(PathBuf::from),
@@ -3832,6 +3842,7 @@ fn build_chat_prompt_tokens(
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
 fn run_chat_cmd(
     model_dir: &std::path::Path,
     initial_prompt: Option<String>,
@@ -3841,9 +3852,19 @@ fn run_chat_cmd(
     max_layers: Option<usize>,
     no_early_stop: bool,
     raw_prompt: bool,
+    verbose: bool,
 ) -> ExitCode {
     use metal::{generate_with_session, StepGenerateConfig, StepGenerateSession};
-    use std::io::{self, Write};
+    use std::io::{self, IsTerminal, Write};
+
+    // Quiet by default: chat is a UI, not a log. `--verbose` restores the
+    // step/prefill/session logs (equivalent to leaving DGQ_QUIET unset).
+    if !verbose && std::env::var_os("DGQ_QUIET").is_none() {
+        unsafe {
+            std::env::set_var("DGQ_QUIET", "1");
+        }
+    }
+    let interactive = !verbose && io::stdout().is_terminal();
 
     if !dgq::store::looks_like_dgq_dir(model_dir) {
         eprintln!("error: chat requires a .dgq directory (-m /path/to/quantized-weights)");
@@ -3867,7 +3888,9 @@ fn run_chat_cmd(
     let full_message_cap = max_new_tokens.max(1024);
 
     let stop_token_ids = config::load_generation_stop_tokens(model_dir);
-    eprintln!("chat: full-message stop tokens = {stop_token_ids:?}, cap = {full_message_cap}");
+    if verbose {
+        eprintln!("chat: full-message stop tokens = {stop_token_ids:?}, cap = {full_message_cap}");
+    }
 
     let sampler = sample::sampler_for_steps(steps, no_early_stop);
     let mut step_cfg = StepGenerateConfig::from_generate(
@@ -3880,9 +3903,18 @@ fn run_chat_cmd(
     );
     step_cfg.stop_token_ids = stop_token_ids;
 
+    if interactive {
+        print!("loading model… ");
+        let _ = io::stdout().flush();
+    }
+    let open_started = std::time::Instant::now();
     let mut session = match StepGenerateSession::open(model_dir, &step_cfg, None) {
         Ok((s, compile)) => {
-            eprintln!("chat: session ready ({compile:.2?}, layers={layers})");
+            if interactive {
+                println!("ready ({:.1}s)", open_started.elapsed().as_secs_f64());
+            } else if verbose {
+                eprintln!("chat: session ready ({compile:.2?}, layers={layers})");
+            }
             s
         }
         Err(err) => {
@@ -3893,7 +3925,7 @@ fn run_chat_cmd(
 
     let tok_path = model_dir.join("tokenizer.json");
     let tokenizer = match tokenizer::Tokenizer::load(&tok_path) {
-        Ok(t) => t,
+        Ok(t) => std::sync::Arc::new(t),
         Err(err) => {
             eprintln!("error: {err}");
             return ExitCode::FAILURE;
@@ -3926,27 +3958,28 @@ fn run_chat_cmd(
         *turn_idx = turn_idx.wrapping_add(1);
 
         let started = std::time::Instant::now();
+        let stream = chat_ui::ChatStream::start(
+            std::sync::Arc::clone(&tokenizer),
+            step_cfg.stop_token_ids.clone(),
+            interactive,
+        );
+        step_cfg.step_observer = Some(stream.observer());
         let out = generate_with_session(&mut session, &prompt, &step_cfg, "chat")?;
+        step_cfg.step_observer = None;
         let elapsed = started.elapsed();
 
         let new_ids = sample::strip_degenerate_token_ids(
             out.token_ids.get(prompt_len..).unwrap_or(&[]),
         );
         let reply = chat_template::sanitize_model_reply(&tokenizer.decode(&new_ids));
-        if reply.is_empty() {
-            println!("model> (empty response)");
-        } else {
-            println!("model> {reply}");
-        }
+        stream.finish(&reply);
         let new_tokens = out.token_ids.len().saturating_sub(prompt_len);
-        let stop_note = if out.stopped_on_eot {
-            "turn ended"
-        } else {
-            "hit token cap (reply may be truncated)"
-        };
-        eprintln!(
-            "  turn: {new_tokens} new tokens, {} blocks, {} denoise steps, {:.2?} ({stop_note})",
-            out.blocks_committed, out.denoise_steps_run, elapsed
+        let secs = elapsed.as_secs_f64();
+        let cap_note = if out.stopped_on_eot { "" } else { " · hit token cap" };
+        println!(
+            "  ({new_tokens} tok · {} steps · {secs:.1}s · {:.1} tok/s{cap_note})",
+            out.denoise_steps_run,
+            new_tokens as f64 / secs.max(1e-9),
         );
         history.push(chat_template::ChatTurn::model(reply));
         Ok(())
@@ -3963,7 +3996,7 @@ fn run_chat_cmd(
         }
     }
 
-    eprintln!("chat ready (type 'exit' or 'quit' to end; Ctrl-D also exits)");
+    println!("chat ready (type 'exit' or 'quit' to end; Ctrl-D also exits)");
     let stdin = io::stdin();
     loop {
         print!("you> ");

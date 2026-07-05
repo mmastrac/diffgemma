@@ -19,7 +19,29 @@ use crate::tokenizer::Tokenizer;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone)]
+/// Per-denoise-step progress snapshot for live UIs (chat streaming/spinner).
+/// `argmax` is the current full-canvas argmax — under the MLX-exact sampler
+/// the block's final commit IS the last step's argmax, so a stable prefix of
+/// this is a faithful preview of the final text.
+pub struct StepProgressEvent<'a> {
+    /// 1-based committed-block index this step belongs to.
+    pub block_idx: usize,
+    /// 1-based denoise step within the block.
+    pub step_in_block: u32,
+    pub max_steps: usize,
+    /// Full-canvas argmax of this step (CANVAS entries).
+    pub argmax: &'a [u32],
+    /// Positions accepted by the entropy-bound rule this step.
+    pub accept_count: u32,
+    /// True when this was the block's final step (its argmax got committed).
+    pub block_done: bool,
+}
+
+/// Called after every denoise step with the current canvas snapshot. Must be
+/// cheap; runs on the generation thread.
+pub type StepObserver = std::sync::Arc<dyn Fn(&StepProgressEvent<'_>) + Send + Sync>;
+
+#[derive(Clone)]
 pub struct StepGenerateConfig {
     pub seed: u64,
     pub max_new_tokens: usize,
@@ -34,6 +56,23 @@ pub struct StepGenerateConfig {
     /// block emits any of these. Empty preserves the fixed `max_new_tokens`
     /// budget behavior used by parity/golden paths.
     pub stop_token_ids: Vec<u32>,
+    /// Optional per-step progress callback (chat streaming / spinner).
+    pub step_observer: Option<StepObserver>,
+}
+
+impl std::fmt::Debug for StepGenerateConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StepGenerateConfig")
+            .field("seed", &self.seed)
+            .field("max_new_tokens", &self.max_new_tokens)
+            .field("max_seq", &self.max_seq)
+            .field("layers", &self.layers)
+            .field("sampler", &self.sampler)
+            .field("no_early_stop", &self.no_early_stop)
+            .field("stop_token_ids", &self.stop_token_ids)
+            .field("step_observer", &self.step_observer.is_some())
+            .finish()
+    }
 }
 
 impl StepGenerateConfig {
@@ -54,6 +93,7 @@ impl StepGenerateConfig {
             no_early_stop,
             initial_canvas_ids: None,
             stop_token_ids: Vec::new(),
+            step_observer: None,
         }
     }
 }
@@ -171,10 +211,12 @@ impl StepGenerateSession {
     ) -> Result<(Self, Duration), Error> {
         let layers = cfg.layers.min(N_LAYERS).max(1);
         let (rt, build) = build_step_runtime(model_dir, &smoke_config(cfg, prefill_token_ids))?;
+        if progress_enabled() {
         eprintln!(
             "step-generate: runtime ready (total={:.2?}, compile={:.2?})",
             build.total, build.compile
         );
+        }
         Ok((
             Self {
                 rt,
@@ -244,7 +286,7 @@ pub fn generate_with_session(
     let (kv_len, prefill_timing, prefill_elapsed) = if existing_kv >= prompt_token_ids.len()
         && existing_kv > 0
     {
-        eprintln!("step-generate: using step-kernel prefill kv_len={existing_kv}");
+        if progress_enabled() { eprintln!("step-generate: using step-kernel prefill kv_len={existing_kv}"); }
         (
             existing_kv,
             MonolithicPrefillTiming::default(),
@@ -255,9 +297,11 @@ pub fn generate_with_session(
         // writing the b4 KV directly (no f32 engine, no pack conversion).
         let kv_len = rt.prefill_chunks(prompt_token_ids)?;
         let prefill_elapsed = prefill_started.elapsed();
-        eprintln!(
-            "step-generate: fast-prefill kv_len={kv_len} ({prefill_elapsed:.2?})"
-        );
+        if progress_enabled() {
+            eprintln!(
+                "step-generate: fast-prefill kv_len={kv_len} ({prefill_elapsed:.2?})"
+            );
+        }
         (kv_len, MonolithicPrefillTiming::default(), prefill_elapsed)
     } else {
         if session.encoder.is_none() {
@@ -268,10 +312,12 @@ pub fn generate_with_session(
                 cfg.max_seq,
                 Some(std::sync::Arc::clone(&shared_blob)),
             )?);
-            eprintln!(
-                "step-generate: encoder cache ready ({:.2?})",
-                encoder_started.elapsed()
-            );
+            if progress_enabled() {
+                eprintln!(
+                    "step-generate: encoder cache ready ({:.2?})",
+                    encoder_started.elapsed()
+                );
+            }
         }
         let encoder = session.encoder.as_mut().expect("encoder cache");
         let (kv_len, prefill_timing) = prefill_monolithic_kv_with_cache(
@@ -286,7 +332,7 @@ pub fn generate_with_session(
         let prefill_elapsed = prefill_started.elapsed();
         (kv_len, prefill_timing, prefill_elapsed)
     };
-    if prefill_elapsed > Duration::ZERO {
+    if progress_enabled() && prefill_elapsed > Duration::ZERO {
         eprintln!(
             "step-generate: prefilled kv_len={kv_len} ({prefill_elapsed:.2?}, gpu_forward={:.1}ms kv_pack={:.1}ms)",
             prefill_timing.gpu_forward_ms,
@@ -511,6 +557,16 @@ pub fn generate_with_session(
                 denoise_elapsed + block_started.elapsed(),
                 stop_reason,
             );
+            if let Some(ref observer) = cfg.step_observer {
+                observer(&StepProgressEvent {
+                    block_idx,
+                    step_in_block: block_step_count,
+                    max_steps,
+                    argmax: &st.prev_argmax,
+                    accept_count: stats.accept_count,
+                    block_done: stop_reason != DenoiseStopReason::None,
+                });
+            }
             if stop_reason != DenoiseStopReason::None {
                 break;
             }
@@ -531,6 +587,7 @@ pub fn generate_with_session(
             .get(late..)
             .and_then(|s| s.iter().copied().reduce(u32::max))
             .unwrap_or(0);
+        if progress_enabled() {
         eprintln!(
             "step-generate: block {} denoise={block_elapsed:.2?} steps_eff={block_step_count} accept/step={accept_hist:?}",
             block_idx
@@ -557,6 +614,7 @@ pub fn generate_with_session(
             crate::sample::ACCEPT_PLATEAU_THRESHOLD,
             cfg.sampler.confidence_threshold,
         );
+        }
         if final_entropy_log_enabled() {
             log_final_per_token_entropy(
                 &format!("block {block_idx} final"),
@@ -616,10 +674,12 @@ pub fn generate_with_session(
             rt.set_kv_len(new_kv_len as u32);
             let block_extend = extend_started.elapsed();
             extend_elapsed += block_extend;
+            if progress_enabled() {
             eprintln!(
                 "step-generate: extended kv {kv_before} -> {new_kv_len} (+{} tokens) ({block_extend:.2?})",
                 argmax_tokens.len()
             );
+            }
         }
     }
 

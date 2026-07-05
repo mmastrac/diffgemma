@@ -182,12 +182,14 @@ impl PipelineArchiveCache {
                 ))
             })?;
 
-        eprintln!(
-            "metal pipeline cache: {} ({}, {:.2?})",
-            cache_file.display(),
-            if existed { "loaded" } else { "new" },
-            open_started.elapsed()
-        );
+        if crate::flags::progress_enabled() {
+            eprintln!(
+                "metal pipeline cache: {} ({}, {:.2?})",
+                cache_file.display(),
+                if existed { "loaded" } else { "new" },
+                open_started.elapsed()
+            );
+        }
 
         Ok(Self {
             archive,
@@ -252,11 +254,15 @@ impl PipelineArchiveCache {
         };
         let save_started = std::time::Instant::now();
         match self.archive.serializeToURL_error(&url) {
-            Ok(()) => eprintln!(
-                "metal pipeline cache: saved {} ({:.2?})",
-                self.cache_file.display(),
-                save_started.elapsed()
-            ),
+            Ok(()) => {
+                if crate::flags::progress_enabled() {
+                    eprintln!(
+                        "metal pipeline cache: saved {} ({:.2?})",
+                        self.cache_file.display(),
+                        save_started.elapsed()
+                    );
+                }
+            }
             Err(e) => eprintln!(
                 "warning: metal pipeline cache serialize failed: {}",
                 e.localizedDescription()
