@@ -307,6 +307,35 @@ pub fn router_gemm_enabled() -> bool {
     })
 }
 
+/// Hard-freeze of accepted canvas rows (`DGQ_FREEZE=0` disables). Default ON
+/// (historic behavior): first accept pins a row's token forever and feeds the
+/// partial-lm_head row skip. OFF = MLX/HF reference semantics (matches our CPU
+/// sampler in `sample.rs`): the accept set is re-decided from fresh entropies
+/// every step, accepted rows take that step's fresh denoiser token, dropped
+/// rows renoise, and the final commit is the true full-canvas last-step argmax.
+/// QUALITY-AFFECTING: sign-off required before changing the default.
+pub fn freeze_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("DGQ_FREEZE")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true)
+    })
+}
+
+/// Commit the row argmax instead of the tempered categorical sample
+/// (`DGQ_DENOISER_ARGMAX=1`). Matches MLX's default user temperature=0
+/// denoiser: the linear schedule temperature then only shapes entropy and the
+/// SC soft-embed, never the committed token. Default OFF = HF categorical.
+pub fn denoiser_argmax_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("DGQ_DENOISER_ARGMAX")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 /// Per-row entropy cap on sampler accepts (`DGQ_ACCEPT_ROW_CAP=<nats>`, 0/unset
 /// = off = exact MLX prefix rule). Closes the unconditional-first-accept hole
 /// that freezes an uncertain token on flat/creative canvases (the "grebe me"
@@ -4025,6 +4054,10 @@ impl StepEnc<'_> {
         self.sink_set_bytes(&canvas, 1);
         self.sink_set_bytes(&cols, 2);
         self.bind_debug_status(3);
+        let freeze: u32 = freeze_enabled() as u32;
+        let use_argmax: u32 = denoiser_argmax_enabled() as u32;
+        self.sink_set_bytes(&freeze, 4);
+        self.sink_set_bytes(&use_argmax, 5);
         let grid = MTLSize {
             width: 1,
             height: 1,

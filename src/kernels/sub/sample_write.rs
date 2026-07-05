@@ -147,6 +147,10 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     }
     gpu_common::set_bytes(&enc, &canvas, 1);
     gpu_common::set_bytes(&enc, &f.vocab_size, 2);
+    let freeze_enable: u32 = 1; // historic default; CPU mirror has no freeze concept
+    let use_argmax: u32 = 0;
+    gpu_common::set_bytes(&enc, &freeze_enable, 4);
+    gpu_common::set_bytes(&enc, &use_argmax, 5);
     enc.dispatchThreadgroups_threadsPerThreadgroup(
         MTLSize {
             width: 1,
