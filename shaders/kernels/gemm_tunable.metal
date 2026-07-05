@@ -350,3 +350,187 @@ kernel void gemm_tunable_stacked(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Block-sparse MoE variant.
+// ---------------------------------------------------------------------------
+#include "qgemm_grouped.metal"
+#include "moe_router_device.metal"
+
+// Fused gather (FC28, same contract as gemm_block_sparse): A rows come from
+// bf16 `moein` via route->token_list instead of a pre-gathered f32 buffer.
+constant bool TUNE_GATHER_A_DEF [[function_constant(28)]];
+constant bool TUNE_GATHER_A =
+    is_function_constant_defined(TUNE_GATHER_A_DEF) ? TUNE_GATHER_A_DEF : false;
+
+/// Block-sparse tunable GEMM: one <=32-row expert block x one BN-wide N-tile
+/// per threadgroup (grid = (N/BN, num_blocks) via indirect slots 4/5).
+/// Compile with TUNE_BM=32 (block height is fixed by moe_bucket_fill).
+/// Fragment-native adaptive-M: simdgroups/fragments covering rows beyond the
+/// block's actual row count skip their loads and MMAs entirely (bit-exact —
+/// dead fragments are never stored; barriers remain TG-uniform).
+/// Same per-output accumulation chain + dequant + f32_round_bf16 store as
+/// gemm_block_sparse -> BIT-EXACT expected.
+kernel void gemm_tunable_sparse(
+    device const float *a [[buffer(0)]],
+    device const uchar *blob [[buffer(1)]],
+    device float *c [[buffer(2)]],
+    device const GroupedJob *jobs [[buffer(3)]],
+    device const uint *row_starts [[buffer(4)]],
+    constant uint &num_jobs [[buffer(5)]],
+    device const RouteScratch *route [[buffer(6)]],
+    device const ushort *moein [[buffer(7)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint3 lid [[thread_position_in_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint N = GEMM_N, K = GEMM_K;
+    threadgroup half Xs[BM][PAD];
+    threadgroup half Ws[BN][PAD];
+
+    const uint b = tgid.y;
+    if (b >= route->num_blocks) {
+        return;
+    }
+    const uint e = route->block_expert[b];
+    if (e >= num_jobs) {
+        return;
+    }
+    const uint row0 = route->block_row0[b];
+    const uint m1 = row_starts[e + 1u];
+    const uint M_tile = min(BM, m1 - row0);
+    if (M_tile == 0u) {
+        return;
+    }
+    const uint n0 = tgid.x * BN;
+    if (n0 >= N) {
+        return;
+    }
+    const ulong w_off = jobs[e].w_byte_off;
+    const ulong rowB = q4_row_bytes(K);
+    const uint ltid = lid.x;
+
+    const uint qid = lane / 4u;
+    const uint fm = (qid & 4u) + ((lane / 2u) % 4u);
+    const uint fn = (qid & 2u) * 2u + (lane % 2u) * 2u;
+
+    simdgroup_float8x8 C[TM][TN];
+    for (uint i = 0u; i < TM; ++i) {
+        for (uint j = 0u; j < TN; ++j) {
+            C[i][j] = simdgroup_float8x8(0.f);
+        }
+    }
+    const uint sr = (BM / 2u) * (sgid >> 1u);
+    const uint sc = (BN / 2u) * (sgid & 1u);
+    // NOTE: no runtime adaptive-M here — runtime-bounded fragment loops break
+    // compile-time unrolling and spill the accumulator array (measured 2x
+    // slower). Dead rows are zero-filled and simply never stored; the MMA
+    // padding cost is immaterial (the adaptive-M wash proved it).
+
+    const uint w_tpr = 128u / BN;
+    const uint w_cols = BK / w_tpr;
+    const uint w_r = ltid / w_tpr;
+    const uint w_q = (ltid % w_tpr) * w_cols;
+
+    for (uint k0 = 0u; k0 < K; k0 += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // A tile: gather bf16 moein rows via token_list, or the f32 slot
+        // buffer (down GEMM). Rows >= M_tile zero-filled (their fragments are
+        // skipped, but keep the tile defined).
+        for (uint i = ltid * 4u; i < BM * BK; i += 128u * 4u) {
+            const uint mm = i / BK;
+            const uint kk = i % BK;
+            half4 h;
+            if (mm < M_tile) {
+                if (TUNE_GATHER_A) {
+                    const uint tok = route->token_list[row0 + mm];
+                    const ushort4 u =
+                        *(device const ushort4 *)(moein + (ulong)tok * K + k0 + kk);
+                    if (K_ACT_F16) {
+                        h = as_type<half4>(u);
+                    } else {
+                        h = half4(as_type<float4>(uint4(u) << 16u));
+                    }
+                } else {
+                    const float4 f =
+                        *(device const float4 *)(a + (ulong)(row0 + mm) * K + k0 + kk);
+                    h = half4(f);
+                }
+            } else {
+                h = half4(0);
+            }
+            *(threadgroup half4 *)(&Xs[mm][kk]) = h;
+        }
+        // W tile: expert q4 rows (vectorized nibble decode).
+        {
+            const uint gn = n0 + w_r;
+            if (gn < N) {
+                device const uchar *g =
+                    blob + w_off + (ulong)gn * rowB + (ulong)(k0 / 32u) * 20ul;
+                const half s = half(bf16_bytes(g));
+                const half mn = half(bf16_bytes(g + 2));
+                for (uint j8 = 0u; j8 < w_cols; j8 += 8u) {
+                    const uint jj = w_q + j8;
+                    device const uchar *pp = g + 4u + jj / 2u;
+                    const uint v = uint(pp[0]) | (uint(pp[1]) << 8u) |
+                        (uint(pp[2]) << 16u) | (uint(pp[3]) << 24u);
+                    const half4 q0 = half4(
+                        half(v & 0xFu), half((v >> 4u) & 0xFu),
+                        half((v >> 8u) & 0xFu), half((v >> 12u) & 0xFu));
+                    const half4 q1 = half4(
+                        half((v >> 16u) & 0xFu), half((v >> 20u) & 0xFu),
+                        half((v >> 24u) & 0xFu), half(v >> 28u));
+                    *(threadgroup half4 *)(&Ws[w_r][jj]) = s * q0 + half4(mn);
+                    *(threadgroup half4 *)(&Ws[w_r][jj + 4u]) = s * q1 + half4(mn);
+                }
+            } else {
+                for (uint j = 0u; j < w_cols; j += 4u) {
+                    *(threadgroup half4 *)(&Ws[w_r][w_q + j]) = half4(0);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kk = 0u; kk < BK; kk += 8u) {
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_half8x8 A[TM];
+            for (uint i = 0u; i < TM; ++i) {
+                thread half2 &ea = reinterpret_cast<thread half2 &>(A[i].thread_elements());
+                ea[0] = Xs[sr + 8u * i + fm][kk + fn];
+                ea[1] = Xs[sr + 8u * i + fm][kk + fn + 1u];
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_half8x8 B[TN];
+            for (uint j = 0u; j < TN; ++j) {
+                thread half2 &eb = reinterpret_cast<thread half2 &>(B[j].thread_elements());
+                eb[0] = Ws[sc + 8u * j + fn][kk + fm];
+                eb[1] = Ws[sc + 8u * j + fn + 1u][kk + fm];
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            for (uint i = 0u; i < TM; ++i) {
+                for (uint j = 0u; j < TN; ++j) {
+                    simdgroup_multiply_accumulate(C[i][j], A[i], B[j], C[i][j]);
+                }
+            }
+        }
+    }
+
+    // Store: f32 slot rows, bf16-rounded values (matches gemm_block_sparse).
+    for (uint i = 0u; i < TM; ++i) {
+        const uint mm = sr + 8u * i + fm;
+        if (mm >= M_tile) {
+            continue;
+        }
+        for (uint j = 0u; j < TN; ++j) {
+            const thread float2 &ec = reinterpret_cast<thread float2 &>(C[i][j].thread_elements());
+            const uint col = n0 + sc + 8u * j + fn;
+            if (col < N) {
+                c[(ulong)(row0 + mm) * N + col] = f32_round_bf16(ec[0]);
+            }
+            if (col + 1u < N) {
+                c[(ulong)(row0 + mm) * N + col + 1u] = f32_round_bf16(ec[1]);
+            }
+        }
+    }
+}

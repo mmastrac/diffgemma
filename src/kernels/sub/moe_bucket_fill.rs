@@ -116,6 +116,7 @@ struct MoeGroupedGridInfo {
     hid: u32,
     n_tile: u32,
     tpg: u32,
+    tunable_n_tile: u32,
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -134,6 +135,7 @@ fn run_phases(
         hid: 2816,
         n_tile: 128,
         tpg: 128,
+        tunable_n_tile: 64,
     };
     for phase in 0u32..3 {
         enc.setComputePipelineState(&pipeline.pipeline);
@@ -176,9 +178,9 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let buf_expert_unique = pool
         .allocate(&ctx.device, std::mem::size_of::<u32>())
         .ok_or(Error::Format("alloc"))?;
-    // 4 grids × 3 u32 (grouped 0/1, block-sparse 2/3).
+    // 6 grids × 3 u32 (grouped 0/1, block-sparse 2/3, tunable sparse 4/5).
     let buf_indirect = pool
-        .allocate(&ctx.device, 4 * 3 * std::mem::size_of::<u32>())
+        .allocate(&ctx.device, 6 * 3 * std::mem::size_of::<u32>())
         .ok_or(Error::Format("alloc"))?;
     let scratch = scratch_from_fixture(f);
     BufferPool::write_bytes(

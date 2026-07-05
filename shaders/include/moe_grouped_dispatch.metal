@@ -14,6 +14,8 @@ struct MoeGroupedGridInfo {
     uint hid;
     uint n_tile;
     uint tpg;
+    /// N-tile width of the tunable sparse pipelines (indirect slots 4/5).
+    uint tunable_n_tile;
 };
 
 #endif

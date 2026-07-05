@@ -81,6 +81,14 @@ kernel void moe_bucket_fill(
                 indirect[3].threadgroups_per_grid[0] = down_w;
                 indirect[3].threadgroups_per_grid[1] = blk;
                 indirect[3].threadgroups_per_grid[2] = 1u;
+                // Slots 4/5: tunable block-sparse (BN-wide N-tiles).
+                const uint tn = max(grid_info.tunable_n_tile, 1u);
+                indirect[4].threadgroups_per_grid[0] = (grid_info.gate_n + tn - 1u) / tn;
+                indirect[4].threadgroups_per_grid[1] = blk;
+                indirect[4].threadgroups_per_grid[2] = 1u;
+                indirect[5].threadgroups_per_grid[0] = (grid_info.hid + tn - 1u) / tn;
+                indirect[5].threadgroups_per_grid[1] = blk;
+                indirect[5].threadgroups_per_grid[2] = 1u;
             }
         }
     } else {

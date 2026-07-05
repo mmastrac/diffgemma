@@ -870,6 +870,9 @@ struct StepPipelines {
     gemm_tunable_raw: HashMap<(u32, u32), ComputePipeline>,
     /// Tunable q8 pipelines (DGQ_GEMM_TUNABLE), keyed (n,k); VOCAB = logits.
     gemm_tunable_q8: HashMap<(u32, u32), ComputePipeline>,
+    /// Tunable block-sparse MoE pipelines (DGQ_GEMM_TUNABLE, q4 experts),
+    /// keyed (n, k, gather).
+    gemm_tunable_sparse: HashMap<(u32, u32, bool), ComputePipeline>,
     gemm_nvfp4: HashMap<(u32, u32), ComputePipeline>,
     gemm_q8: HashMap<(u32, u32), ComputePipeline>,
     gemm_bf16: HashMap<(u32, u32), ComputePipeline>,
@@ -947,6 +950,7 @@ impl StepPipelines {
         let mut gemm_q4 = HashMap::new();
         let mut gemm_tunable_raw = HashMap::new();
         let mut gemm_tunable_q8 = HashMap::new();
+        let mut gemm_tunable_sparse = HashMap::new();
         let mut gemm_nvfp4 = HashMap::new();
         let mut gemm_q8 = HashMap::new();
         let mut gemm_bf16 = HashMap::new();
@@ -1187,6 +1191,18 @@ impl StepPipelines {
                     )?,
                 );
             }
+            if gemm_tunable_enabled() {
+                gemm_tunable_sparse.insert(
+                    (n, k, false),
+                    crate::kernels::sub::gemm_tunable::pipeline_for_sparse(ctx, n, k, false)?,
+                );
+                if moe_fuse_gather_enabled() && (n, k) == (MOE_FF * 2, HID as u32) {
+                    gemm_tunable_sparse.insert(
+                        (n, k, true),
+                        crate::kernels::sub::gemm_tunable::pipeline_for_sparse(ctx, n, k, true)?,
+                    );
+                }
+            }
         }
         let prod = variant;
         let dump = crate::kernels::sub::variant::KernelVariant::TEST_DUMP;
@@ -1212,6 +1228,7 @@ impl StepPipelines {
             gemm_q4,
             gemm_tunable_raw,
             gemm_tunable_q8,
+            gemm_tunable_sparse,
             gemm_nvfp4,
             gemm_q8,
             gemm_bf16,
@@ -1340,6 +1357,11 @@ impl StepPipelines {
         self.gemm_tunable_q8.get(&(n, k))
     }
 
+    /// Tunable block-sparse pipeline (q4 experts) if built (DGQ_GEMM_TUNABLE).
+    fn sparse_tunable(&self, n: u32, k: u32, gather: bool) -> Option<&ComputePipeline> {
+        self.gemm_tunable_sparse.get(&(n, k, gather))
+    }
+
     fn q8_logits(&self, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
         self.gemm_q8_logits
             .get(&(n, k))
@@ -1452,11 +1474,14 @@ struct MoeGroupedGridInfo {
     hid: u32,
     n_tile: u32,
     tpg: u32,
+    /// N-tile width of the tunable sparse pipelines (indirect slots 4/5).
+    tunable_n_tile: u32,
 }
 
 // Slots 0/1: per-expert grouped (gate_up/down), height = num_active_experts.
 // Slots 2/3: block-sparse (gate_up/down), height = num_blocks.
-const MOE_GROUPED_INDIRECT_BYTES: usize = 4 * 3 * std::mem::size_of::<u32>();
+// Slots 4/5: tunable block-sparse (gate_up/down, BN-wide N-tiles).
+const MOE_GROUPED_INDIRECT_BYTES: usize = 6 * 3 * std::mem::size_of::<u32>();
 
 fn moe_grouped_grid_info() -> MoeGroupedGridInfo {
     MoeGroupedGridInfo {
@@ -1464,6 +1489,7 @@ fn moe_grouped_grid_info() -> MoeGroupedGridInfo {
         hid: HID as u32,
         n_tile: crate::kernels::sub::gemm_common::n_tile() as u32,
         tpg: crate::kernels::sub::gemm_common::THREADS_PER_TG as u32,
+        tunable_n_tile: crate::kernels::sub::gemm_tunable::SPARSE_BN as u32,
     }
 }
 
@@ -2785,12 +2811,21 @@ impl StepEnc<'_> {
     ) -> Result<(), Error> {
         let block_sparse = moe_block_sparse_enabled();
         let adaptive = block_sparse && moe_tile_adapt_enabled();
+        // Tunable block-sparse (q4 experts): fragment kernel with built-in
+        // adaptive-M; indirect slots 4/5 (BN-wide N-tiles).
+        let tunable = block_sparse
+            && matches!(self.block_profile.format, QuantFormat::Q4Affine)
+            && self.ps.sparse_tunable(n, k, gather).is_some();
         // Fused-gather gate_up: A-load pulls bf16 `moein` rows via token_list
         // (buffer 7), so no separate gather pass / f32 staging buffer. The caller
         // skips the gather pass iff `gather`; if the pipeline for this shape is
         // missing we'd read a stale A buffer, so fail loud rather than silently.
         let gather_ps = if gather {
-            self.ps.block_sparse_gather(n, k, adaptive)
+            if tunable {
+                self.ps.sparse_tunable(n, k, true)
+            } else {
+                self.ps.block_sparse_gather(n, k, adaptive)
+            }
         } else {
             None
         };
@@ -2802,6 +2837,10 @@ impl StepEnc<'_> {
         let use_gather = gather_ps.is_some();
         let grouped_ps = if let Some(p) = gather_ps {
             p
+        } else if tunable {
+            self.ps
+                .sparse_tunable(n, k, false)
+                .ok_or(Error::Format("missing tunable sparse pipeline"))?
         } else if block_sparse {
             self.ps.block_sparse(self.block_profile.format, n, k, adaptive)?
         } else {
@@ -2830,8 +2869,14 @@ impl StepEnc<'_> {
             height: 1,
             depth: 1,
         };
-        // Block-sparse uses indirect slots 2/3 (height = num_blocks); grouped 0/1.
-        let slot = if block_sparse { indirect_slot + 2 } else { indirect_slot };
+        // Indirect slots: tunable sparse 4/5; legacy block-sparse 2/3; grouped 0/1.
+        let slot = if tunable {
+            indirect_slot + 4
+        } else if block_sparse {
+            indirect_slot + 2
+        } else {
+            indirect_slot
+        };
         let indirect_offset = slot * 3 * std::mem::size_of::<u32>();
         self.sink_dispatch_indirect(indirect_offset, n, tg);
         Ok(())
