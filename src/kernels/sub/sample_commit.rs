@@ -227,6 +227,8 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     gpu_common::set_bytes(&enc, &f.filler_token, 4);
     let eos = f.params.eos_token_id;
     gpu_common::set_bytes(&enc, &eos, 5);
+    let early_stop_mean_ent: f32 = 0.0; // entropy-only stop disabled in unit tests
+    gpu_common::set_bytes(&enc, &early_stop_mean_ent, 7);
     enc.dispatchThreadgroups_threadsPerThreadgroup(
         MTLSize {
             width: 1,

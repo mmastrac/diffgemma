@@ -14,6 +14,7 @@ kernel void sample_commit(
     constant uint &filler_token [[buffer(4)]],
     constant uint &eos_token [[buffer(5)]],
     device DebugStatus *dbg [[buffer(6)]],
+    constant float &early_stop_mean_ent [[buffer(7)]],
     uint lid [[thread_position_in_threadgroup]]
 ) {
     if (K_SHAPE_ASSERT && (canvas_size == 0u || canvas_size > DGQ_SAMPLER_MAX_CANVAS)) {
@@ -133,8 +134,14 @@ kernel void sample_commit(
         bool confident_stable = !degenerate && canvas_stable && S->mean_entropy < P.conf_threshold;
         bool plateau_stop = !degenerate && S->accept_plateau >= P.accept_plateau_threshold
             && S->mean_entropy < P.plateau_prefix_mean_max;
+        // Entropy-only early stop (DGQ_EARLY_STOP_MEAN_ENT): stop once the mean
+        // entropy is low enough, without waiting for full argmax stability —
+        // the answer text is settled well before the argmax fully locks.
+        bool ent_stop = !degenerate && early_stop_mean_ent > 0.f
+            && S->step >= P.min_early_stop_steps
+            && S->mean_entropy < early_stop_mean_ent;
         S->stop_flag = 0u;
-        if (confident_stable) {
+        if (confident_stable || ent_stop) {
             S->stop_flag = 1u;
         } else if (plateau_stop) {
             S->stop_flag = 2u;

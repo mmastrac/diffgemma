@@ -3568,6 +3568,8 @@ impl StepEnc<'_> {
         let eos = read_struct::<StepParams>(&self.bufs.params).eos_token_id;
         self.sink_set_bytes(&eos, 5);
         self.bind_debug_status(6);
+        let es_ent = crate::flags::early_stop_mean_ent();
+        self.sink_set_bytes(&es_ent, 7);
         let tg = MTLSize {
             width: 256,
             height: 1,
