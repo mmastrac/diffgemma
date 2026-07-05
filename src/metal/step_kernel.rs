@@ -307,32 +307,35 @@ pub fn router_gemm_enabled() -> bool {
     })
 }
 
-/// Hard-freeze of accepted canvas rows (`DGQ_FREEZE=0` disables). Default ON
-/// (historic behavior): first accept pins a row's token forever and feeds the
-/// partial-lm_head row skip. OFF = MLX/HF reference semantics (matches our CPU
-/// sampler in `sample.rs`): the accept set is re-decided from fresh entropies
-/// every step, accepted rows take that step's fresh denoiser token, dropped
-/// rows renoise, and the final commit is the true full-canvas last-step argmax.
-/// QUALITY-AFFECTING: sign-off required before changing the default.
+/// Hard-freeze of accepted canvas rows (`DGQ_FREEZE=1` re-enables the legacy
+/// behavior). Default OFF since 2026-07-05 (user sign-off): the freeze was
+/// PROVEN to be the flat-row wart driver (census 4/10 warty -> 0/10). OFF =
+/// MLX/HF reference semantics (matches our CPU sampler in `sample.rs`): the
+/// accept set is re-decided from fresh entropies every step, accepted rows
+/// take that step's fresh denoiser token, dropped rows renoise, and the final
+/// commit is the true full-canvas last-step argmax. ON additionally feeds the
+/// partial-lm_head row skip (dormant at default).
 pub fn freeze_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var("DGQ_FREEZE")
-            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-            .unwrap_or(true)
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
     })
 }
 
 /// Commit the row argmax instead of the tempered categorical sample
-/// (`DGQ_DENOISER_ARGMAX=1`). Matches MLX's default user temperature=0
-/// denoiser: the linear schedule temperature then only shapes entropy and the
-/// SC soft-embed, never the committed token. Default OFF = HF categorical.
+/// (`DGQ_DENOISER_ARGMAX=0` restores HF categorical). Default ON since
+/// 2026-07-05 (user sign-off): matches MLX's default user temperature=0
+/// denoiser — the linear schedule temperature only shapes entropy and the SC
+/// soft-embed, never the committed token. With no-freeze this is the
+/// MLX-exact config (gate 16,16,11; census 0/10 warty).
 pub fn denoiser_argmax_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var("DGQ_DENOISER_ARGMAX")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true)
     })
 }
 

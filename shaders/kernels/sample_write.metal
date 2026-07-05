@@ -7,13 +7,15 @@ using namespace metal;
 
 /// Accepted positions -> new_sample; rejected -> fresh uniform id; updates rng_state.
 ///
-/// `freeze_enable=0` (DGQ_FREEZE=0) skips the frozen bit entirely: every row
-/// stays live, the accept set is re-decided from fresh entropies each step and
-/// accepted rows take that step's fresh denoiser token — the MLX/HF reference
-/// semantics (our CPU sampler). `use_argmax!=0` (DGQ_DENOISER_ARGMAX=1) commits
-/// the row argmax instead of the tempered categorical sample, matching MLX's
-/// default temperature=0 denoiser (the schedule temp then only shapes
-/// entropy/SC, never the token choice).
+/// `freeze_enable=0` (default; DGQ_FREEZE=1 re-enables) skips the frozen bit
+/// entirely: every row stays live, the accept set is re-decided from fresh
+/// entropies each step and accepted rows take that step's fresh denoiser
+/// token — the MLX/HF reference semantics (our CPU sampler). The legacy
+/// freeze was proven to be the flat-row wart driver (2026-07-05).
+/// `use_argmax!=0` (default; DGQ_DENOISER_ARGMAX=0 restores HF categorical)
+/// commits the row argmax instead of the tempered categorical sample,
+/// matching MLX's default temperature=0 denoiser (the schedule temp then
+/// only shapes entropy/SC, never the token choice).
 kernel void sample_write(
     device CanvasState *S [[buffer(0)]],
     constant uint &canvas_size [[buffer(1)]],
