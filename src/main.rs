@@ -2751,6 +2751,10 @@ fn run_bench_gemm(shapes: &str, oracle: Option<&str>, iters: usize) -> ExitCode 
         Ok(mut sq) => rows.append(&mut sq),
         Err(err) => eprintln!("warning: gemm_block_sq bench: {err}"),
     }
+    match metal::bench_gemm_tunable(&parsed, iters) {
+        Ok(mut t) => rows.append(&mut t),
+        Err(err) => eprintln!("warning: gemm_tunable bench: {err}"),
+    }
     if matches!(oracle, Some("mps") | Some("mpsgraph")) {
         match bench_mpsgraph_oracle(&parsed, iters) {
             Ok(mut mps) => rows.append(&mut mps),

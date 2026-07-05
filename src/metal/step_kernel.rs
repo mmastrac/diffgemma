@@ -230,6 +230,18 @@ pub fn moe_tile_adapt_enabled() -> bool {
         }
 }
 
+/// Tunable steel-class GEMM (task #19) for the plain Raw (bf16-weight) path:
+/// o_proj / dense FFN / router / lm_head. 64x64 fragment-level kernel,
+/// BIT-EXACT vs gemm_block (verified per element at all production shapes),
+/// +40-63% GEMM throughput in bench. `DGQ_GEMM_TUNABLE=1` opts in (bring-up;
+/// flip default after production A/B + gate).
+pub fn gemm_tunable_enabled() -> bool {
+    match std::env::var("DGQ_GEMM_TUNABLE") {
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        Err(_) => false,
+    }
+}
+
 /// Fuse the MoE gather into the gate_up block-sparse GEMM (A-load reads bf16
 /// `moein` rows via route->token_list). Skips the separate gather pass + its
 /// 23MB/layer f32 round-trip. **Default on** (~28ms/step, bit-identical to
@@ -853,6 +865,9 @@ struct StepPipelines {
     rmsnorm_hf32_inout: ComputePipeline,
     half_to_f32: ComputePipeline,
     gemm_q4: HashMap<(u32, u32), ComputePipeline>,
+    /// Tunable steel-class Raw pipelines (DGQ_GEMM_TUNABLE), keyed (n,k);
+    /// VOCAB shape uses the logits (K_OUT_BF16) variant.
+    gemm_tunable_raw: HashMap<(u32, u32), ComputePipeline>,
     gemm_nvfp4: HashMap<(u32, u32), ComputePipeline>,
     gemm_q8: HashMap<(u32, u32), ComputePipeline>,
     gemm_bf16: HashMap<(u32, u32), ComputePipeline>,
@@ -928,6 +943,7 @@ struct StepPipelines {
 impl StepPipelines {
     fn new(ctx: &MetalContext, variant: crate::kernels::sub::variant::KernelVariant) -> Result<Self, Error> {
         let mut gemm_q4 = HashMap::new();
+        let mut gemm_tunable_raw = HashMap::new();
         let mut gemm_nvfp4 = HashMap::new();
         let mut gemm_q8 = HashMap::new();
         let mut gemm_bf16 = HashMap::new();
@@ -964,6 +980,24 @@ impl StepPipelines {
                 crate::kernels::sub::gemm_bf16::pipeline_for(ctx, n, k)?
             };
             gemm_bf16.insert((n, k), bf16_ps);
+            if gemm_tunable_enabled() {
+                let t = if n == VOCAB as u32 {
+                    crate::kernels::sub::gemm_tunable::pipeline_for_logits(
+                        ctx,
+                        n,
+                        k,
+                        crate::kernels::sub::QuantFormat::Raw,
+                    )?
+                } else {
+                    crate::kernels::sub::gemm_tunable::pipeline_for(
+                        ctx,
+                        n,
+                        k,
+                        crate::kernels::sub::QuantFormat::Raw,
+                    )?
+                };
+                gemm_tunable_raw.insert((n, k), t);
+            }
         }
         for &(n, k) in &[
             (DENSE_FF, HID as u32),
@@ -1155,6 +1189,7 @@ impl StepPipelines {
             )?,
             half_to_f32: crate::kernels::sub::half_to_f32::pipeline_for(ctx, prod)?,
             gemm_q4,
+            gemm_tunable_raw,
             gemm_nvfp4,
             gemm_q8,
             gemm_bf16,
@@ -1271,6 +1306,11 @@ impl StepPipelines {
         self.gemm_bf16
             .get(&(n, k))
             .ok_or(Error::Format("missing bf16 pipeline"))
+    }
+
+    /// Tunable Raw pipeline if built for this shape (DGQ_GEMM_TUNABLE).
+    fn bf16_tunable(&self, n: u32, k: u32) -> Option<&ComputePipeline> {
+        self.gemm_tunable_raw.get(&(n, k))
     }
 
     fn q8_logits(&self, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
@@ -1950,18 +1990,30 @@ impl StepEnc<'_> {
         n: u32,
         k: u32,
     ) -> Result<(), Error> {
-        let ps = self.ps.bf16(n, k)?;
+        let (ps, grid) = match self.ps.bf16_tunable(n, k) {
+            Some(t) => (
+                t,
+                MTLSize {
+                    width: div_up(n as usize, crate::kernels::sub::gemm_tunable::TUNE_BN),
+                    height: div_up(m as usize, crate::kernels::sub::gemm_tunable::TUNE_BM),
+                    depth: 1,
+                },
+            ),
+            None => (
+                self.ps.bf16(n, k)?,
+                MTLSize {
+                    width: div_up(n as usize, crate::kernels::sub::gemm_common::n_tile()),
+                    height: div_up(m as usize, crate::kernels::sub::gemm_common::M_TILE),
+                    depth: 1,
+                },
+            ),
+        };
         self.sink_set_pipeline(ps);
         self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
         self.sink_set_buffer(&self.bufs.arena, y_off as usize, 1);
         self.bind_blob(2);
         self.sink_set_bytes(&w_off, 3);
         self.sink_set_bytes(&m, 4);
-        let grid = MTLSize {
-            width: div_up(n as usize, crate::kernels::sub::gemm_common::n_tile()),
-            height: div_up(m as usize, crate::kernels::sub::gemm_common::M_TILE),
-            depth: 1,
-        };
         let tg = MTLSize {
             width: GEMM_THREADS_PER_TG,
             height: 1,
@@ -1982,18 +2034,30 @@ impl StepEnc<'_> {
         k: u32,
         logits_byte_off: usize,
     ) -> Result<(), Error> {
-        let ps = self.ps.bf16(n, k)?;
+        let (ps, grid) = match self.ps.bf16_tunable(n, k) {
+            Some(t) => (
+                t,
+                MTLSize {
+                    width: div_up(n as usize, crate::kernels::sub::gemm_tunable::TUNE_BN),
+                    height: div_up(m as usize, crate::kernels::sub::gemm_tunable::TUNE_BM),
+                    depth: 1,
+                },
+            ),
+            None => (
+                self.ps.bf16(n, k)?,
+                MTLSize {
+                    width: div_up(n as usize, crate::kernels::sub::gemm_common::n_tile()),
+                    height: div_up(m as usize, crate::kernels::sub::gemm_common::M_TILE),
+                    depth: 1,
+                },
+            ),
+        };
         self.sink_set_pipeline(ps);
         self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
         self.sink_set_buffer(&self.bufs.logits, logits_byte_off, 1);
         self.bind_blob(2);
         self.sink_set_bytes(&w_off, 3);
         self.sink_set_bytes(&m, 4);
-        let grid = MTLSize {
-            width: div_up(n as usize, crate::kernels::sub::gemm_common::n_tile()),
-            height: div_up(m as usize, crate::kernels::sub::gemm_common::M_TILE),
-            depth: 1,
-        };
         let tg = MTLSize {
             width: GEMM_THREADS_PER_TG,
             height: 1,

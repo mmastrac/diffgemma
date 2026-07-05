@@ -122,6 +122,17 @@ accs) at ~10KB via aliasing the f32 store tile over the dead load buffers:
 M=256, and **bit-exact vs gemm_block (max|d| = 0.0)** — the K-chain per
 output is unchanged by tiling.
 
+**TUNABLE GEMM SHIPPING (task #19, phase 1 landed 2026-07-02,
+`DGQ_GEMM_TUNABLE=1` bring-up flag):** `gemm_tunable.metal` — fragment-level
+(per-lane thread_elements() loads, mem_none hints, per-lane C store) +
+vectorized loaders (4-wide bf16 converts, 8-nibble q4 decode), TUNE_BM/BN via
+#define prepend; 64x64 won every production shape. Bench: q4 3.5-3.8 TF/s,
+Raw 3.61 (production kernels: 2.2-2.9) — ALL configs BIT-EXACT vs gemm_block
+per element. Phase 1 wires the plain Raw path (o_proj / dense down / router /
+lm_head-bf16): pre_moe 564-567 → 524-530 ms/step, token-identical, gate
+17/17. Remaining phases: stacked (qkv, dense gate/up), q8 (lm_head on q4emb
+is q8-embed), rowk (SC softembed), block-sparse MoE (carry adaptive-M).
+
 **Where the rest lives:** MLX steel's fragment-level machinery — per-lane
 `vec<T,2>` register-tile loads with compile-time strides (never
 `simdgroup_load` from tgmem), `simdgroup_barrier(mem_none)` scheduling hints,

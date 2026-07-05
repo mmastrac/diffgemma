@@ -309,6 +309,207 @@ pub fn bench_gemm_block_sq(shapes: &[GemmShape], iters: usize) -> Result<Vec<Gem
     Ok(rows)
 }
 
+
+/// Tunable steel-class GEMM (task #19): sweeps TUNE_BM/TUNE_BN configs via
+/// #define prepend; per-lane fragment loads (no simdgroup_load from tgmem).
+/// Each config is correctness-checked against gemm_block (expected BIT-exact:
+/// same K-chain, dequant, and bf16 rounding).
+pub fn bench_gemm_tunable(shapes: &[GemmShape], iters: usize) -> Result<Vec<GemmBenchRow>, Error> {
+    use crate::kernels::sub::gemm_q4;
+    use crate::metal::device::MetalContext;
+    use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize};
+
+    const SHADER_TUNE: &str = shader_include::include_metal!("kernels/gemm_tunable.metal");
+    const CONFIGS: &[(usize, usize)] = &[(32, 32), (64, 32), (32, 64), (64, 64)];
+    let ctx = MetalContext::new()?;
+    let warmup = 3usize;
+    let mut rows = Vec::new();
+    let mut pool = BufferPool::new();
+
+    for &shape in shapes {
+        let GemmShape { m, k, n } = shape;
+        let w_f32: Vec<f32> = (0..n * k)
+            .map(|i| ((i as f32) * 0.0007).cos() * 0.02)
+            .collect();
+        let fixture = gemm_q4::Fixture {
+            x: (0..m * k).map(|i| ((i as f32) * 0.013).sin() * 0.2).collect(),
+            w_f32,
+            m,
+            n,
+            k,
+        };
+        let w_q4 = fixture.w_q4();
+        let buf_x = pool
+            .allocate(&ctx.device, m * k * 2)
+            .ok_or(Error::Format("bench tunable x"))?;
+        let buf_y = pool
+            .allocate(&ctx.device, m * n * 2)
+            .ok_or(Error::Format("bench tunable y"))?;
+        let buf_ref = pool
+            .allocate(&ctx.device, m * n * 2)
+            .ok_or(Error::Format("bench tunable ref"))?;
+        let buf_w = pool
+            .allocate(&ctx.device, w_q4.len())
+            .ok_or(Error::Format("bench tunable w"))?;
+        BufferPool::write_bf16(&buf_x, &bf16::f32_slice_to_bf16_bits(&fixture.x));
+        BufferPool::write_bytes(&buf_w, &w_q4);
+
+        // Reference output from the production kernel.
+        {
+            let ref_pipe = gemm_q4::pipeline_for(&ctx, n as u32, k as u32)?;
+            let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
+            let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+            enc.setComputePipelineState(&ref_pipe.pipeline);
+            gemm_q4::bind_gpu_buffers(&enc, &buf_x, &buf_ref, &buf_w, 0, m as u32);
+            let (rgrid, rtg) = crate::kernels::sub::gemm_common::dispatch_shape(m, n);
+            enc.dispatchThreadgroups_threadsPerThreadgroup(rgrid, rtg);
+            enc.endEncoding();
+            cmd.commit();
+            cmd.waitUntilCompleted();
+        }
+
+        for &(bm, bn) in CONFIGS {
+            let src = format!("#define TUNE_BM {bm}\n#define TUNE_BN {bn}\n{SHADER_TUNE}");
+            let pipeline = ctx.compile_gemm_subkernel(
+                &src,
+                "gemm_tunable",
+                n as u32,
+                k as u32,
+                false,
+                crate::kernels::sub::QuantFormat::Q4Affine as u32,
+                false,
+            )?;
+            let grid = MTLSize { width: n.div_ceil(bn), height: m.div_ceil(bm), depth: 1 };
+            let tg = MTLSize { width: 128, height: 1, depth: 1 };
+            let dispatch = |count: usize| -> Result<(), Error> {
+                let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
+                let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+                for _ in 0..count {
+                    enc.setComputePipelineState(&pipeline.pipeline);
+                    gemm_q4::bind_gpu_buffers(&enc, &buf_x, &buf_y, &buf_w, 0, m as u32);
+                    enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+                }
+                enc.endEncoding();
+                cmd.commit();
+                cmd.waitUntilCompleted();
+                Ok(())
+            };
+            dispatch(1)?;
+            // Correctness: bitwise compare vs production output.
+            let mut mismatches = 0usize;
+            let mut maxd = 0f32;
+            {
+                let ry = buf_ref.contents().as_ptr() as *const u16;
+                let sy = buf_y.contents().as_ptr() as *const u16;
+                for i in 0..(m * n) {
+                    let rb = unsafe { *ry.add(i) };
+                    let sb = unsafe { *sy.add(i) };
+                    if rb != sb {
+                        mismatches += 1;
+                        let a = bf16::bf16_bits_to_f32(rb);
+                        let b = bf16::bf16_bits_to_f32(sb);
+                        maxd = maxd.max((a - b).abs());
+                    }
+                }
+            }
+            dispatch(warmup)?;
+            let started = Instant::now();
+            dispatch(iters)?;
+            let rate = gflops(m, k, n, iters, started.elapsed().as_secs_f64());
+            let bits = if mismatches == 0 {
+                "BITEXACT".to_string()
+            } else {
+                format!("MISMATCH x{mismatches} max|d|={maxd:.5}")
+            };
+            rows.push(GemmBenchRow {
+                shape,
+                label: format!("tunable_{bm}x{bn}/x{iters} [{bits}]"),
+                gflops: rate,
+            });
+        }
+
+        pool.release(w_q4.len(), buf_w);
+
+        // Raw (bf16 weights) 64x64 row: reference = gemm_block Raw (the
+        // production dense/lm_head path), bitwise-compared.
+        {
+            let w_bits = bf16::f32_slice_to_bf16_bits(&fixture.w_f32);
+            let buf_wr = pool
+                .allocate(&ctx.device, w_bits.len() * 2)
+                .ok_or(Error::Format("bench tunable wraw"))?;
+            BufferPool::write_bf16(&buf_wr, &w_bits);
+            {
+                let ref_pipe = crate::kernels::sub::gemm_bf16::pipeline_for(&ctx, n as u32, k as u32)?;
+                let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
+                let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+                enc.setComputePipelineState(&ref_pipe.pipeline);
+                gemm_q4::bind_gpu_buffers(&enc, &buf_x, &buf_ref, &buf_wr, 0, m as u32);
+                let (rgrid, rtg) = crate::kernels::sub::gemm_common::dispatch_shape(m, n);
+                enc.dispatchThreadgroups_threadsPerThreadgroup(rgrid, rtg);
+                enc.endEncoding();
+                cmd.commit();
+                cmd.waitUntilCompleted();
+            }
+            let src = format!("#define TUNE_BM 64\n#define TUNE_BN 64\n{SHADER_TUNE}");
+            let pipeline = ctx.compile_gemm_subkernel(
+                &src,
+                "gemm_tunable",
+                n as u32,
+                k as u32,
+                false,
+                crate::kernels::sub::QuantFormat::Raw as u32,
+                false,
+            )?;
+            let grid = MTLSize { width: n.div_ceil(64), height: m.div_ceil(64), depth: 1 };
+            let tg = MTLSize { width: 128, height: 1, depth: 1 };
+            let dispatch = |count: usize| -> Result<(), Error> {
+                let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
+                let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+                for _ in 0..count {
+                    enc.setComputePipelineState(&pipeline.pipeline);
+                    gemm_q4::bind_gpu_buffers(&enc, &buf_x, &buf_y, &buf_wr, 0, m as u32);
+                    enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+                }
+                enc.endEncoding();
+                cmd.commit();
+                cmd.waitUntilCompleted();
+                Ok(())
+            };
+            dispatch(1)?;
+            let mut mismatches = 0usize;
+            {
+                let ry = buf_ref.contents().as_ptr() as *const u16;
+                let sy = buf_y.contents().as_ptr() as *const u16;
+                for i in 0..(m * n) {
+                    if unsafe { *ry.add(i) } != unsafe { *sy.add(i) } {
+                        mismatches += 1;
+                    }
+                }
+            }
+            dispatch(warmup)?;
+            let started = Instant::now();
+            dispatch(iters)?;
+            let rate = gflops(m, k, n, iters, started.elapsed().as_secs_f64());
+            let bits = if mismatches == 0 {
+                "BITEXACT".to_string()
+            } else {
+                format!("MISMATCH x{mismatches}")
+            };
+            rows.push(GemmBenchRow {
+                shape,
+                label: format!("tunable_raw_64x64/x{iters} [{bits}]"),
+                gflops: rate,
+            });
+            pool.release(w_bits.len() * 2, buf_wr);
+        }
+
+        pool.release(m * k * 2, buf_x);
+        pool.release(m * n * 2, buf_y);
+        pool.release(m * n * 2, buf_ref);
+    }
+    Ok(rows)
+}
+
 /// Tiled bf16-weight `gemm_bf16` (step-kernel mixed-precision attention/FFN path):
 /// bf16 activations, bf16 weights read straight into the half tile (no dequant).
 pub fn bench_gemm_bf16(shapes: &[GemmShape], iters: usize) -> Result<Vec<GemmBenchRow>, Error> {
