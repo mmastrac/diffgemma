@@ -230,15 +230,17 @@ pub fn moe_tile_adapt_enabled() -> bool {
         }
 }
 
-/// Tunable GEMM (task #19) for the plain Raw (bf16-weight) path:
-/// o_proj / dense FFN / router / lm_head. 64x64 tunable fragment-level kernel,
-/// BIT-EXACT vs gemm_block (verified per element at all production shapes),
-/// +40-63% GEMM throughput in bench. `DGQ_GEMM_TUNABLE=1` opts in (bring-up;
-/// flip default after production A/B + gate).
+/// Tunable GEMM (task #19): fragment-level 64x64 kernels for the plain Raw
+/// (o_proj/dense/router/lm_head-bf16), q8 (lm_head on q8-embed), stacked
+/// (qkv/gate-up), and block-sparse MoE (q4 experts) paths. BIT-EXACT vs the
+/// legacy kernels (verified per element at all production shapes + E2E
+/// token-identical), step 1.22 -> 0.97s. **Default ON** (2026-07-02, phases
+/// 1-4 landed same-day with identity evidence at each); `DGQ_GEMM_TUNABLE=0`
+/// opts out.
 pub fn gemm_tunable_enabled() -> bool {
     match std::env::var("DGQ_GEMM_TUNABLE") {
-        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
-        Err(_) => false,
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
     }
 }
 

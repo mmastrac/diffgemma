@@ -4,7 +4,15 @@ Full pass over the 72 Metal kernels: aggregation, genericization, perf, and
 per-step precision. Verdicts below are the source of truth for "should this
 kernel exist / merge / change dtype"; re-audit when a family gains members.
 
-## Hot-path budget (steady denoise step ≈ 1.22 s, kv=25, all-GPU)
+## Hot-path budget (steady denoise step ≈ 0.97 s since tunable GEMM, kv=25)
+
+> **2026-07-02 REBASE: tunable GEMM default-ON** (phases 1-4, all BIT-EXACT +
+> token-identical): pre_moe ~565→449 ms, MoE ~320→234, finish ~150→106.
+> Step 1.22 → 0.97 s — at/under MLX's 0.94 per-step pace with fewer steps.
+> The table below predates tunable; treat its ms as the LEGACY baseline and
+> its "wall" verdicts as legacy-kernel walls.
+
+## Legacy hot-path budget (pre-tunable, kv=25, all-GPU)
 
 > **2026-07-02 CORRECTION: the GEMM "walls" below are OUR-KERNEL walls, not
 > machine walls.** At our exact production shapes on this M3 Pro: MPS matmul
