@@ -1,3 +1,8 @@
+> This is the conceptual overview. The precise implemented contract — sampler
+> semantics (accept rule, argmax commit, no-freeze/unfreezing, early stop),
+> prefill selection, SC details, and every deliberate divergence from the
+> MLX/HF reference — lives in SPEC.md.
+
 ## The core trade: memory bandwidth → compute
 
 The fundamental motivation is the AR decode bottleneck. Standard autoregressive models are memory-bandwidth-bound — each forward pass produces exactly one token, and the GPU sweeps all model weights through HBM just to advance one vocabulary lookup. Tensor cores sit largely idle because the arithmetic intensity of per-token decode is too low to saturate them.
@@ -38,7 +43,7 @@ This is the critical inference-time mechanism. After each denoising step, the sa
 
 Every denoising step re-samples all canvas positions, but only the positions the model is confident about are kept; the rest are discarded and replaced with fresh random tokens for the next step. Confidence is measured by the entropy of each position's predicted distribution — low entropy means the model has largely made up its mind.
 
-The recommended production config (from the model card) runs with entropy bound = 0.1 bits for token selection, max 48 steps, and a linear temperature decay from 0.8 → 0.4. Early stopping requires both: (a) average canvas entropy below 0.005, AND (b) argmax predictions identical across two consecutive steps. Both conditions must hold simultaneously. Simpler tasks (structured code, constrained output) converge faster; more open-ended generation uses more steps.
+The recommended production config (from the model card) runs with entropy bound = 0.1 nats for token selection (natural-log entropy, per the reference code), max 48 steps, and a linear temperature decay from 0.8 → 0.4. Early stopping requires both: (a) average canvas entropy below 0.005, AND (b) argmax predictions identical across two consecutive steps. Both conditions must hold simultaneously. Simpler tasks (structured code, constrained output) converge faster; more open-ended generation uses more steps.
 
 ## Block-autoregressive chaining
 
