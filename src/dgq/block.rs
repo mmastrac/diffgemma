@@ -1,6 +1,6 @@
 //! Affine int4 / int8 quantization blocks (groups along K).
 
-use crate::dgq::layout::{q4_matrix_bytes, q4_row_bytes, q8_matrix_bytes, q8_row_bytes, GROUP_SIZE};
+use crate::dgq::layout::{q4_matrix_bytes, q4_row_bytes, q6_matrix_bytes, q6_row_bytes, q8_matrix_bytes, q8_row_bytes, GROUP_SIZE};
 use crate::kernels::cpu::bf16_to_f32;
 use crate::safetensors::Error;
 
@@ -301,5 +301,182 @@ mod tests {
             max_err = max_err.max((a - b).abs());
         }
         assert!(max_err < 0.15, "max_err={max_err}");
+    }
+}
+
+
+pub fn quantize_expert_stack_q6(
+    src: &[u8],
+    experts: usize,
+    out_dim: usize,
+    in_dim: usize,
+    dst: &mut [u8],
+) -> Result<(), Error> {
+    let stride = out_dim * in_dim * 2;
+    let expert_q = q6_matrix_bytes(out_dim, in_dim);
+    if src.len() != experts * stride {
+        return Err(Error::Format("expert bf16 size mismatch"));
+    }
+    if dst.len() != experts * expert_q {
+        return Err(Error::Format("expert q6 dst size mismatch"));
+    }
+    for e in 0..experts {
+        quantize_bf16_matrix_q6(
+            &src[e * stride..(e + 1) * stride],
+            out_dim,
+            in_dim,
+            &mut dst[e * expert_q..(e + 1) * expert_q],
+        );
+    }
+    Ok(())
+}
+
+/// Quantize one row to Q6 blocks: [scale bf16:2][min bf16:2][24B codes] per
+/// 32-wide group. Codes are 6-bit (0..63), packed 4-per-24-bit-LE-word
+/// (v = q0 | q1<<6 | q2<<12 | q3<<18 -> 3 bytes). Same affine semantics and
+/// bf16 scale/min storage as q4 (scale precision measured immaterial).
+pub fn quantize_row_q6(row: &[f32], in_dim: usize, dst: &mut [u8]) -> usize {
+    let need = q6_row_bytes(in_dim);
+    assert!(dst.len() >= need);
+    let mut off = 0usize;
+    let mut gi = 0;
+    while gi < in_dim {
+        let g_end = (gi + GROUP_SIZE).min(in_dim);
+        let g_len = g_end - gi;
+        let mut min = f32::INFINITY;
+        let mut max = f32::NEG_INFINITY;
+        for &v in &row[gi..g_end] {
+            min = min.min(v);
+            max = max.max(v);
+        }
+        if min == f32::INFINITY {
+            min = 0.0;
+            max = 0.0;
+        }
+        let delta = if max - min < 1e-8 {
+            1.0f32
+        } else {
+            (max - min) / 63.0
+        };
+        let scale_bits = f32_to_bf16_bits(delta).to_le_bytes();
+        let min_bits = f32_to_bf16_bits(min).to_le_bytes();
+        dst[off] = scale_bits[0];
+        dst[off + 1] = scale_bits[1];
+        dst[off + 2] = min_bits[0];
+        dst[off + 3] = min_bits[1];
+        off += 4;
+        let mut codes = [0u8; GROUP_SIZE];
+        for j in 0..g_len {
+            codes[j] = if delta <= 0.0 {
+                0u8
+            } else {
+                ((row[gi + j] - min) / delta).round().clamp(0.0, 63.0) as u8
+            };
+        }
+        for w in 0..GROUP_SIZE / 4 {
+            let v: u32 = (codes[w * 4] as u32)
+                | ((codes[w * 4 + 1] as u32) << 6)
+                | ((codes[w * 4 + 2] as u32) << 12)
+                | ((codes[w * 4 + 3] as u32) << 18);
+            dst[off] = (v & 0xFF) as u8;
+            dst[off + 1] = ((v >> 8) & 0xFF) as u8;
+            dst[off + 2] = ((v >> 16) & 0xFF) as u8;
+            off += 3;
+        }
+        gi = g_end;
+    }
+    need
+}
+
+/// Quantize `[out, in]` bf16 row-major to Q6 blocks.
+pub fn quantize_bf16_matrix_q6(src: &[u8], out_dim: usize, in_dim: usize, dst: &mut [u8]) {
+    let need = q6_matrix_bytes(out_dim, in_dim);
+    assert_eq!(dst.len(), need);
+    let mut row_f32 = vec![0.0f32; in_dim];
+    let mut off = 0usize;
+    for row in 0..out_dim {
+        let row_src = &src[(row * in_dim * 2)..(row + 1) * in_dim * 2];
+        bf16_bytes_to_f32(row_src, &mut row_f32);
+        off += quantize_row_q6(&row_f32, in_dim, &mut dst[off..]);
+    }
+}
+
+/// Dequantize one Q6 value (CPU mirror of the kernel decode; kernel computes
+/// half-precision s*q+mn, this returns the f32 pre-rounding value for tests).
+pub fn q6_weight_at(row_base: &[u8], col: usize) -> f32 {
+    const BLOCK: usize = 4 + GROUP_SIZE * 6 / 8;
+    let g = col / GROUP_SIZE;
+    let j = col % GROUP_SIZE;
+    let blk = &row_base[g * BLOCK..];
+    let scale = bf16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+    let mn = bf16_to_f32(u16::from_le_bytes([blk[2], blk[3]]));
+    let w = j / 4;
+    let r = j % 4;
+    let b = &blk[4 + w * 3..];
+    let v: u32 = (b[0] as u32) | ((b[1] as u32) << 8) | ((b[2] as u32) << 16);
+    let q = (v >> (6 * r)) & 0x3F;
+    scale * q as f32 + mn
+}
+
+/// CPU q6 GEMM (engine fallback): y[m,n] = a[m,k] @ Wq6[n,k]^T.
+pub fn q6_gemm_cpu(a: &[f32], m: usize, k: usize, w_q6: &[u8], n: usize, out: &mut [f32]) {
+    let row_bytes = q6_row_bytes(k);
+    let mut wrow = vec![0.0f32; k];
+    for col in 0..n {
+        let row = &w_q6[col * row_bytes..(col + 1) * row_bytes];
+        for (c, w) in wrow.iter_mut().enumerate() {
+            *w = q6_weight_at(row, c);
+        }
+        for r in 0..m {
+            let mut acc = 0.0f32;
+            for p in 0..k {
+                acc += a[r * k + p] * wrow[p];
+            }
+            out[r * n + col] = acc;
+        }
+    }
+}
+
+#[cfg(test)]
+mod q6_tests {
+    use super::*;
+
+    #[test]
+    fn q6_roundtrip_error_bound() {
+        let in_dim = 128usize;
+        let row: Vec<f32> = (0..in_dim)
+            .map(|i| ((i as f32) * 0.37).sin() * 0.11 - 0.02)
+            .collect();
+        let mut dst = vec![0u8; q6_row_bytes(in_dim)];
+        quantize_row_q6(&row, in_dim, &mut dst);
+        let mut max_err = 0f32;
+        let mut sq = 0f64;
+        let mut ref_sq = 0f64;
+        for (c, &w) in row.iter().enumerate() {
+            let d = q6_weight_at(&dst, c) - w;
+            max_err = max_err.max(d.abs());
+            sq += (d as f64) * (d as f64);
+            ref_sq += (w as f64) * (w as f64);
+        }
+        let rel = (sq / ref_sq).sqrt();
+        // 6-bit affine on a smooth signal: well under 2% rel-RMS; each error
+        // bounded by ~delta/2 + bf16 scale rounding.
+        assert!(rel < 0.02, "rel-RMS {rel}");
+        assert!(max_err < 0.006, "max err {max_err}");
+    }
+
+    #[test]
+    fn q6_packing_exact_codes() {
+        // Values on the exact quant lattice roundtrip code-exactly: (i*7)%64
+        // covers 0..=63 (min 0, max 63 -> delta exactly 1.0, bf16-exact), so
+        // codes == values and every 6-bit pack position is exercised.
+        let in_dim = 32usize;
+        let row: Vec<f32> = (0..in_dim).map(|i| ((i * 7) % 64) as f32).collect();
+        let mut dst = vec![0u8; q6_row_bytes(in_dim)];
+        quantize_row_q6(&row, in_dim, &mut dst);
+        for (c, &w) in row.iter().enumerate() {
+            let d = (q6_weight_at(&dst, c) - w).abs();
+            assert!(d < 1e-6, "col {c}: {d}");
+        }
     }
 }

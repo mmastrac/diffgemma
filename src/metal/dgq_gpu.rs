@@ -90,9 +90,14 @@ impl Q4LinearGpu {
         self.kind == QuantKind::Nvfp4Block
     }
 
+    pub fn quant_kind(&self) -> QuantKind {
+        self.kind
+    }
+
     pub fn matrix_byte_len(&self) -> usize {
         match self.kind {
             QuantKind::Q4Block => q4_matrix_bytes(self.out_dim, self.in_dim),
+            QuantKind::Q6Block => crate::dgq::layout::q6_matrix_bytes(self.out_dim, self.in_dim),
             QuantKind::Nvfp4Block => nvfp4_matrix_bytes(self.out_dim, self.in_dim),
             _ => panic!("not a block linear"),
         }
@@ -104,7 +109,7 @@ impl Q4LinearGpu {
 
     pub fn groups_per_row(&self) -> u32 {
         match self.kind {
-            QuantKind::Q4Block => self.in_dim.div_ceil(32) as u32,
+            QuantKind::Q4Block | QuantKind::Q6Block => self.in_dim.div_ceil(32) as u32,
             QuantKind::Nvfp4Block => self.in_dim.div_ceil(16) as u32,
             _ => panic!("not a block linear"),
         }

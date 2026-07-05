@@ -307,9 +307,23 @@ fn forward_layer_ff_dgq_gpu(
                 &mut engine.pool,
                 &engine.kernels,
                 &engine.f32_bf16_linear_pipeline,
-                &engine.f32_q4_linear_pipeline,
+                // q6 experts ride the "q4" slots (selected by expert kind);
+                // the nvfp4 slots keep their own kind-based pick downstream.
+                if expert_cache.expert_gate_up_q4(layer, 0).quant_kind()
+                    == crate::dgq::layout::QuantKind::Q6Block
+                {
+                    &engine.f32_q6_linear_pipeline
+                } else {
+                    &engine.f32_q4_linear_pipeline
+                },
                 &engine.f32_nvfp4_linear_pipeline,
-                &engine.f32_q4_linear_grouped_pipeline,
+                if expert_cache.expert_gate_up_q4(layer, 0).quant_kind()
+                    == crate::dgq::layout::QuantKind::Q6Block
+                {
+                    &engine.f32_q6_linear_grouped_pipeline
+                } else {
+                    &engine.f32_q4_linear_grouped_pipeline
+                },
                 &engine.f32_nvfp4_linear_grouped_pipeline,
                 telemetry,
             )?;
@@ -490,9 +504,21 @@ fn forward_layer_ff_bf16(
         &mut engine.pool,
         &engine.kernels,
         &engine.f32_bf16_linear_pipeline,
-        &engine.f32_q4_linear_pipeline,
+        if expert_cache.expert_gate_up_q4(layer, 0).quant_kind()
+            == crate::dgq::layout::QuantKind::Q6Block
+        {
+            &engine.f32_q6_linear_pipeline
+        } else {
+            &engine.f32_q4_linear_pipeline
+        },
         &engine.f32_nvfp4_linear_pipeline,
-        &engine.f32_q4_linear_grouped_pipeline,
+        if expert_cache.expert_gate_up_q4(layer, 0).quant_kind()
+            == crate::dgq::layout::QuantKind::Q6Block
+        {
+            &engine.f32_q6_linear_grouped_pipeline
+        } else {
+            &engine.f32_q4_linear_grouped_pipeline
+        },
         &engine.f32_nvfp4_linear_grouped_pipeline,
         telemetry,
     )?;

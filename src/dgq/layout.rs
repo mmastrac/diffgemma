@@ -12,7 +12,7 @@ pub const DGQ_VERSION_NVFP4: u32 = 2;
 pub fn dgq_version_for_profile(profile: QuantProfile) -> u32 {
     match profile {
         QuantProfile::Nvfp4 => DGQ_VERSION_NVFP4,
-        QuantProfile::Q4 | QuantProfile::Q5 => DGQ_VERSION_AFFINE,
+        QuantProfile::Q4 | QuantProfile::Q5 | QuantProfile::Q6 => DGQ_VERSION_AFFINE,
     }
 }
 
@@ -31,6 +31,7 @@ pub const NVFP4_HEADER_BYTES: usize = 4;
 pub enum QuantProfile {
     Q4,
     Q5,
+    Q6,
     Nvfp4,
 }
 
@@ -39,6 +40,9 @@ pub enum QuantProfile {
 pub enum QuantKind {
     /// Affine int4 blocks along K (Q4_1-style: fp16 scale + fp16 min + nibbles).
     Q4Block,
+    /// Affine int6 blocks along K: bf16 scale + bf16 min + 24B of 6-bit codes
+    /// (24-bit LE words, 4 codes each). Experts-only; ~2% rel-RMS vs q4's ~8%.
+    Q6Block,
     /// NVFP4 blocks: E2M1 nibbles + FP8 E4M3 scale per 16 weights (MLX-compatible 2-tier).
     Nvfp4Block,
     /// Per-row int8 + fp16 scale (embed / self-conditioning).
@@ -51,6 +55,7 @@ impl QuantKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Q4Block => "q4_block",
+            Self::Q6Block => "q6_block",
             Self::Nvfp4Block => "nvfp4_block",
             Self::Q8Row => "q8_row",
             Self::Raw => "raw",
@@ -61,6 +66,7 @@ impl QuantKind {
 pub fn parse_quant_kind(s: &str) -> Result<QuantKind, Error> {
     match s {
         "q4_block" => Ok(QuantKind::Q4Block),
+        "q6_block" => Ok(QuantKind::Q6Block),
         "nvfp4_block" => Ok(QuantKind::Nvfp4Block),
         "q8_row" => Ok(QuantKind::Q8Row),
         "raw" => Ok(QuantKind::Raw),
@@ -135,6 +141,18 @@ pub fn q4_matrix_bytes(out_dim: usize, in_dim: usize) -> usize {
     out_dim * q4_row_bytes(in_dim)
 }
 
+/// Bytes for one Q6 block covering `GROUP_SIZE` weights along K.
+pub const Q6_BLOCK_BYTES: usize = 4 + GROUP_SIZE * 6 / 8; // bf16 scale + bf16 min + 24B codes
+
+pub fn q6_row_bytes(in_dim: usize) -> usize {
+    let groups = in_dim.div_ceil(GROUP_SIZE);
+    groups * Q6_BLOCK_BYTES
+}
+
+pub fn q6_matrix_bytes(out_dim: usize, in_dim: usize) -> usize {
+    out_dim * q6_row_bytes(in_dim)
+}
+
 /// Packed E2M1 nibbles per row (2 codes per byte, low nibble first).
 pub fn nvfp4_data_row_bytes(in_dim: usize) -> usize {
     in_dim.div_ceil(2)
@@ -185,13 +203,14 @@ pub fn classify_tensor(name: &str, shape: &[i64], profile: QuantProfile) -> Quan
         // tiles (the source weights are bf16), beating MLX's q8 on these tensors.
         // Only the bulky MoE experts go to 4-bit. nvfp4 keeps its block format.
         return match profile {
-            QuantProfile::Q4 | QuantProfile::Q5 => QuantKind::Raw,
+            QuantProfile::Q4 | QuantProfile::Q5 | QuantProfile::Q6 => QuantKind::Raw,
             QuantProfile::Nvfp4 => QuantKind::Nvfp4Block,
         };
     }
     if name.contains(".experts.") && shape.len() == 3 {
         return match profile {
             QuantProfile::Q4 | QuantProfile::Q5 => QuantKind::Q4Block,
+            QuantProfile::Q6 => QuantKind::Q6Block,
             QuantProfile::Nvfp4 => QuantKind::Nvfp4Block,
         };
     }

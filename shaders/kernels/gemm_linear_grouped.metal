@@ -49,6 +49,12 @@ kernel void gemm_linear_grouped(
             device const uchar *row = body + (ulong)col * row_stride;
             sum += dot_nvfp4_k32(a + global_row * k, row, k, k0, gscale);
         }
+    } else if (K_QUANT_FORMAT == QUANT_Q6) {
+        ulong row_stride = ulong(job.groups_per_row) * 28ul;
+        for (uint g = simd_lane; g < job.groups_per_row; g += 32u) {
+            device const uchar *blk = w + (ulong)col * row_stride + (ulong)g * 28ul;
+            sum += dot_q6_group(a + global_row * k, blk, g * 32u);
+        }
     } else {
         ulong row_stride = ulong(job.groups_per_row) * 20ul;
         for (uint g = simd_lane; g < job.groups_per_row; g += 32u) {

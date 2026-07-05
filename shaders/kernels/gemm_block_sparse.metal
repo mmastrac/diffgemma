@@ -74,11 +74,14 @@ kernel void gemm_block_sparse(
     const uint ltid = lid.x;
 
     const bool is_nvfp4 = (K_QUANT_FORMAT == QUANT_NVFP4);
+    const bool is_q6 = (K_QUANT_FORMAT == QUANT_Q6);
     ulong body = w_off;
     ulong rowB = 0ul;
     if (is_nvfp4) {
         body = w_off + 4ul;
         rowB = nvfp4_row_bytes(K);
+    } else if (is_q6) {
+        rowB = q6_row_bytes(K);
     } else {
         rowB = q4_row_bytes(K);
     }
@@ -107,6 +110,10 @@ kernel void gemm_block_sparse(
                 device const uchar *row = blob + body + (ulong)global_n * rowB;
                 const float gscale = as_type<float>(*(device const uint *)(blob + w_off));
                 dequant_nvfp4_tile_half_fused_tg(row, K, k0, &tw_buf[0u][r][0], gscale);
+            } else if (is_q6) {
+                dequant_q6_group_half_tg(
+                    blob + body + (ulong)global_n * rowB + (ulong)(k0 / 32u) * 28ul,
+                    &tw_buf[0u][r][0]);
             } else {
                 dequant_q4_group_half_tg(
                     blob + body + (ulong)global_n * rowB + (ulong)(k0 / 32u) * 20ul,
@@ -142,6 +149,10 @@ kernel void gemm_block_sparse(
                     device const uchar *row = blob + body + (ulong)global_n * rowB;
                     const float gscale = as_type<float>(*(device const uint *)(blob + w_off));
                     dequant_nvfp4_tile_half_fused_tg(row, K, k0, &tw_buf[nxt][r][0], gscale);
+                } else if (is_q6) {
+                    dequant_q6_group_half_tg(
+                        blob + body + (ulong)global_n * rowB + (ulong)(k0 / 32u) * 28ul,
+                        &tw_buf[nxt][r][0]);
                 } else {
                     dequant_q4_group_half_tg(
                         blob + body + (ulong)global_n * rowB + (ulong)(k0 / 32u) * 20ul,

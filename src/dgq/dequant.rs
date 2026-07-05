@@ -15,10 +15,36 @@ pub fn dequant_to_f32(
 ) -> Result<(), Error> {
     match kind {
         QuantKind::Q4Block => dequant_q4_tensor(src, shape, dst),
+        QuantKind::Q6Block => dequant_q6_tensor(src, shape, dst),
         QuantKind::Nvfp4Block => dequant_nvfp4_tensor(src, shape, dst),
         QuantKind::Q8Row => dequant_q8_tensor(src, shape, dst),
         QuantKind::Raw => dequant_raw_tensor(src, shape, dst),
     }
+}
+
+fn dequant_q6_tensor(src: &[u8], shape: &[i64], dst: &mut [f32]) -> Result<(), Error> {
+    use crate::dgq::block::q6_weight_at;
+    use crate::dgq::layout::q6_matrix_bytes;
+    let (mats, out, inp) = match shape.len() {
+        2 => (1usize, shape[0] as usize, shape[1] as usize),
+        3 => (shape[0] as usize, shape[1] as usize, shape[2] as usize),
+        _ => return Err(Error::Format("q6 tensor must be 2D or 3D")),
+    };
+    let mat_bytes = q6_matrix_bytes(out, inp);
+    let row_bytes = crate::dgq::layout::q6_row_bytes(inp);
+    if src.len() != mats * mat_bytes || dst.len() != mats * out * inp {
+        return Err(Error::Format("q6 shape/size mismatch"));
+    }
+    for m in 0..mats {
+        for r in 0..out {
+            let row = &src[m * mat_bytes + r * row_bytes..m * mat_bytes + (r + 1) * row_bytes];
+            let base = (m * out + r) * inp;
+            for c in 0..inp {
+                dst[base + c] = q6_weight_at(row, c);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn dequant_q4_tensor(src: &[u8], shape: &[i64], dst: &mut [f32]) -> Result<(), Error> {

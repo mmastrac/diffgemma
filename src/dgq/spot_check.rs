@@ -199,6 +199,7 @@ mod tests {
             );
             match r.kind {
                 QuantKind::Q4Block => assert!(r.max_abs_err < 0.2, "q4 {}", r.name),
+                QuantKind::Q6Block => assert!(r.max_abs_err < 0.05, "q6 {}", r.name),
                 QuantKind::Nvfp4Block => assert!(r.max_abs_err < 0.35, "nvfp4 {}", r.name),
                 QuantKind::Q8Row => assert!(r.max_abs_err < 0.05, "q8 {}", r.name),
                 QuantKind::Raw => assert!(r.max_abs_err < 1e-5, "raw {}", r.name),

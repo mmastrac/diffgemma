@@ -24,6 +24,20 @@ inline float dot_q4_group(
     return sum;
 }
 
+inline float dot_q6_group(
+    device const float *a_row,
+    device const uchar *blk,
+    uint base_k
+) {
+    thread float w32[32];
+    dequant_q6_group(blk, w32);
+    float sum = 0.0f;
+    for (uint i = 0; i < 32u; ++i) {
+        sum = fma(a_row[base_k + i], w32[i], sum);
+    }
+    return sum;
+}
+
 inline float dot_nvfp4_k32(
     device const float *a_row,
     device const uchar *row,

@@ -634,6 +634,7 @@ pub fn manifest_offset(
         .unwrap_or_else(|| panic!("manifest_offset: missing tensor {tensor}"));
     let stride = match format {
         QuantFormat::NvFp4 => nvfp4_matrix_bytes(n, k) as u64,
+        QuantFormat::Q6 => crate::dgq::layout::q6_matrix_bytes(n, k) as u64,
         _ => q4_matrix_bytes(n, k) as u64,
     };
     base + expert as u64 * stride
@@ -872,9 +873,9 @@ struct StepPipelines {
     gemm_tunable_raw: HashMap<(u32, u32), ComputePipeline>,
     /// Tunable q8 pipelines (DGQ_GEMM_TUNABLE), keyed (n,k); VOCAB = logits.
     gemm_tunable_q8: HashMap<(u32, u32), ComputePipeline>,
-    /// Tunable block-sparse MoE pipelines (DGQ_GEMM_TUNABLE, q4 experts),
-    /// keyed (n, k, gather).
-    gemm_tunable_sparse: HashMap<(u32, u32, bool), ComputePipeline>,
+    /// Tunable block-sparse MoE pipelines (DGQ_GEMM_TUNABLE, q4/q6 experts),
+    /// keyed (n, k, gather, format as u32).
+    gemm_tunable_sparse: HashMap<(u32, u32, bool, u32), ComputePipeline>,
     gemm_nvfp4: HashMap<(u32, u32), ComputePipeline>,
     gemm_q8: HashMap<(u32, u32), ComputePipeline>,
     gemm_bf16: HashMap<(u32, u32), ComputePipeline>,
@@ -907,6 +908,8 @@ struct StepPipelines {
     /// Block-sparse MoE GEMMs, keyed by (n, k, adaptive). adaptive = the
     /// GEMM_M_ADAPT pipeline (DGQ_MOE_TILE_ADAPT runtime per-block M-mapping).
     q4_block_sparse: HashMap<(u32, u32, bool), ComputePipeline>,
+    q6_block_sparse: HashMap<(u32, u32, bool), ComputePipeline>,
+    q6_block_grouped: HashMap<(u32, u32), ComputePipeline>,
     nvfp4_block_sparse: HashMap<(u32, u32, bool), ComputePipeline>,
     /// Fused-gather gate_up variant, keyed by (n,k,adaptive); built only when
     /// DGQ_MOE_FUSE_GATHER is on. Q4 only (the production MoE format).
@@ -1110,6 +1113,8 @@ impl StepPipelines {
         let mut q4_block_grouped = HashMap::new();
         let mut nvfp4_block_grouped = HashMap::new();
         let mut q4_block_sparse = HashMap::new();
+        let mut q6_block_sparse = HashMap::new();
+        let mut q6_block_grouped = HashMap::new();
         let mut nvfp4_block_sparse = HashMap::new();
         let mut block_sparse_gather = HashMap::new();
         if moe_fuse_gather_enabled() {
@@ -1173,7 +1178,34 @@ impl StepPipelines {
                     crate::kernels::sub::QuantFormat::NvFp4,
                 )?,
             );
+            q6_block_sparse.insert(
+                (n, k, false),
+                crate::kernels::sub::gemm_block_sparse::pipeline_for(
+                    ctx,
+                    n,
+                    k,
+                    crate::kernels::sub::QuantFormat::Q6,
+                )?,
+            );
+            q6_block_grouped.insert(
+                (n, k),
+                crate::kernels::sub::gemm_block_grouped::pipeline_for(
+                    ctx,
+                    n,
+                    k,
+                    crate::kernels::sub::QuantFormat::Q6,
+                )?,
+            );
             if moe_tile_adapt_enabled() {
+                q6_block_sparse.insert(
+                    (n, k, true),
+                    crate::kernels::sub::gemm_block_sparse::pipeline_for_adaptive(
+                        ctx,
+                        n,
+                        k,
+                        crate::kernels::sub::QuantFormat::Q6,
+                    )?,
+                );
                 q4_block_sparse.insert(
                     (n, k, true),
                     crate::kernels::sub::gemm_block_sparse::pipeline_for_adaptive(
@@ -1194,15 +1226,24 @@ impl StepPipelines {
                 );
             }
             if gemm_tunable_enabled() {
-                gemm_tunable_sparse.insert(
-                    (n, k, false),
-                    crate::kernels::sub::gemm_tunable::pipeline_for_sparse(ctx, n, k, false)?,
-                );
-                if moe_fuse_gather_enabled() && (n, k) == (MOE_FF * 2, HID as u32) {
+                for fmt in [
+                    crate::kernels::sub::QuantFormat::Q4Affine,
+                    crate::kernels::sub::QuantFormat::Q6,
+                ] {
                     gemm_tunable_sparse.insert(
-                        (n, k, true),
-                        crate::kernels::sub::gemm_tunable::pipeline_for_sparse(ctx, n, k, true)?,
+                        (n, k, false, fmt as u32),
+                        crate::kernels::sub::gemm_tunable::pipeline_for_sparse(
+                            ctx, n, k, false, fmt,
+                        )?,
                     );
+                    if moe_fuse_gather_enabled() && (n, k) == (MOE_FF * 2, HID as u32) {
+                        gemm_tunable_sparse.insert(
+                            (n, k, true, fmt as u32),
+                            crate::kernels::sub::gemm_tunable::pipeline_for_sparse(
+                                ctx, n, k, true, fmt,
+                            )?,
+                        );
+                    }
                 }
             }
         }
@@ -1263,6 +1304,8 @@ impl StepPipelines {
             q4_block_grouped,
             nvfp4_block_grouped,
             q4_block_sparse,
+            q6_block_sparse,
+            q6_block_grouped,
             nvfp4_block_sparse,
             block_sparse_gather,
             gather_rows: crate::kernels::sub::gather_rows::pipeline_for(ctx, prod)?,
@@ -1359,9 +1402,15 @@ impl StepPipelines {
         self.gemm_tunable_q8.get(&(n, k))
     }
 
-    /// Tunable block-sparse pipeline (q4 experts) if built (DGQ_GEMM_TUNABLE).
-    fn sparse_tunable(&self, n: u32, k: u32, gather: bool) -> Option<&ComputePipeline> {
-        self.gemm_tunable_sparse.get(&(n, k, gather))
+    /// Tunable block-sparse pipeline (q4/q6 experts) if built (DGQ_GEMM_TUNABLE).
+    fn sparse_tunable_fmt(
+        &self,
+        format: QuantFormat,
+        n: u32,
+        k: u32,
+        gather: bool,
+    ) -> Option<&ComputePipeline> {
+        self.gemm_tunable_sparse.get(&(n, k, gather, format as u32))
     }
 
     fn q8_logits(&self, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
@@ -1397,6 +1446,7 @@ impl StepPipelines {
     ) -> Result<&ComputePipeline, Error> {
         let map = match format {
             QuantFormat::Q4Affine => &self.q4_block_grouped,
+            QuantFormat::Q6 => &self.q6_block_grouped,
             QuantFormat::NvFp4 => &self.nvfp4_block_grouped,
             _ => {
                 return Err(Error::Format(
@@ -1418,6 +1468,7 @@ impl StepPipelines {
     ) -> Result<&ComputePipeline, Error> {
         let map = match format {
             QuantFormat::Q4Affine => &self.q4_block_sparse,
+            QuantFormat::Q6 => &self.q6_block_sparse,
             QuantFormat::NvFp4 => &self.nvfp4_block_sparse,
             _ => {
                 return Err(Error::Format(
@@ -1565,7 +1616,7 @@ fn layer_moe_block_jobs_impl(
     format: QuantFormat,
     manifest: Option<(usize, &HashMap<String, u64>)>,
 ) -> ([BlockGroupedJob; N_EXPERTS], [BlockGroupedJob; N_EXPERTS]) {
-    use crate::dgq::layout::{nvfp4_matrix_bytes, q4_matrix_bytes};
+    use crate::dgq::layout::{nvfp4_matrix_bytes, q4_matrix_bytes, q6_matrix_bytes};
     let hidden = HID as usize;
     let moe_ff = MOE_FF as usize;
     let (gu_stride, dn_stride, gu_gpr, dn_gpr) = match format {
@@ -1574,6 +1625,12 @@ fn layer_moe_block_jobs_impl(
             nvfp4_matrix_bytes(hidden, moe_ff) as u64,
             (hidden as u32).div_ceil(16),
             (moe_ff as u32).div_ceil(16),
+        ),
+        QuantFormat::Q6 => (
+            q6_matrix_bytes(moe_ff * 2, hidden) as u64,
+            q6_matrix_bytes(hidden, moe_ff) as u64,
+            (hidden as u32).div_ceil(32),
+            (moe_ff as u32).div_ceil(32),
         ),
         _ => (
             q4_matrix_bytes(moe_ff * 2, hidden) as u64,
@@ -2816,15 +2873,18 @@ impl StepEnc<'_> {
         // Tunable block-sparse (q4 experts): fragment kernel with built-in
         // adaptive-M; indirect slots 4/5 (BN-wide N-tiles).
         let tunable = block_sparse
-            && matches!(self.block_profile.format, QuantFormat::Q4Affine)
-            && self.ps.sparse_tunable(n, k, gather).is_some();
+            && matches!(
+                self.block_profile.format,
+                QuantFormat::Q4Affine | QuantFormat::Q6
+            )
+            && self.ps.sparse_tunable_fmt(self.block_profile.format, n, k, gather).is_some();
         // Fused-gather gate_up: A-load pulls bf16 `moein` rows via token_list
         // (buffer 7), so no separate gather pass / f32 staging buffer. The caller
         // skips the gather pass iff `gather`; if the pipeline for this shape is
         // missing we'd read a stale A buffer, so fail loud rather than silently.
         let gather_ps = if gather {
             if tunable {
-                self.ps.sparse_tunable(n, k, true)
+                self.ps.sparse_tunable_fmt(self.block_profile.format, n, k, true)
             } else {
                 self.ps.block_sparse_gather(n, k, adaptive)
             }
@@ -2841,7 +2901,7 @@ impl StepEnc<'_> {
             p
         } else if tunable {
             self.ps
-                .sparse_tunable(n, k, false)
+                .sparse_tunable_fmt(self.block_profile.format, n, k, false)
                 .ok_or(Error::Format("missing tunable sparse pipeline"))?
         } else if block_sparse {
             self.ps.block_sparse(self.block_profile.format, n, k, adaptive)?

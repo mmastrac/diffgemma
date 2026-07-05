@@ -67,6 +67,8 @@ fn block_gemm_cpu(
     if w.is_nvfp4() {
         let body = &w.src_slice()[NVFP4_HEADER_BYTES..];
         nvfp4_gemm_cpu(a, m, k, body, n, w.global_scale_f32(), out);
+    } else if w.quant_kind() == crate::dgq::layout::QuantKind::Q6Block {
+        crate::dgq::block::q6_gemm_cpu(a, m, k, w.src_slice(), n, out);
     } else {
         q4_gemm_cpu(a, m, k, w.src_slice(), n, out);
     }

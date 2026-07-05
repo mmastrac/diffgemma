@@ -97,27 +97,20 @@ pub const SPARSE_BN: usize = 64;
 
 pub const ENTRY_SPARSE: &str = "gemm_tunable_sparse";
 
-/// Block-sparse variant (q4 experts); `gather` sets GATHER_A (FC28) for the
-/// fused-gather gate_up A-load.
+/// Block-sparse variant (q4/q6 experts); `gather` sets GATHER_A (FC28) for
+/// the fused-gather gate_up A-load.
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub fn pipeline_for_sparse(
     ctx: &crate::metal::device::MetalContext,
     n: u32,
     k: u32,
     gather: bool,
+    format: QuantFormat,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
     let src = tuned_source(SPARSE_BM, SPARSE_BN);
     if gather {
-        ctx.compile_gemm_subkernel_gather(&src, ENTRY_SPARSE, n, k, QuantFormat::Q4Affine as u32)
+        ctx.compile_gemm_subkernel_gather(&src, ENTRY_SPARSE, n, k, format as u32)
     } else {
-        ctx.compile_gemm_subkernel(
-            &src,
-            ENTRY_SPARSE,
-            n,
-            k,
-            false,
-            QuantFormat::Q4Affine as u32,
-            false,
-        )
+        ctx.compile_gemm_subkernel(&src, ENTRY_SPARSE, n, k, false, format as u32, false)
     }
 }

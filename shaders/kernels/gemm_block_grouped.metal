@@ -61,11 +61,14 @@ kernel void gemm_block_grouped(
     const uint ltid = lid.x;
 
     const bool is_nvfp4 = (K_QUANT_FORMAT == QUANT_NVFP4);
+    const bool is_q6 = (K_QUANT_FORMAT == QUANT_Q6);
     ulong body = w_off;
     ulong rowB = 0ul;
     if (is_nvfp4) {
         body = w_off + 4ul;
         rowB = nvfp4_row_bytes(K);
+    } else if (is_q6) {
+        rowB = q6_row_bytes(K);
     } else {
         rowB = q4_row_bytes(K);
     }

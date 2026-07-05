@@ -29,6 +29,7 @@ pub fn quant_format_from_profile(p: QuantProfile) -> QuantFormat {
     match p {
         QuantProfile::Nvfp4 => QuantFormat::NvFp4,
         QuantProfile::Q4 | QuantProfile::Q5 => QuantFormat::Q4Affine,
+        QuantProfile::Q6 => QuantFormat::Q6,
     }
 }
 
@@ -50,6 +51,10 @@ pub fn batched_moe_enabled() -> bool {
 }
 
 pub fn moe_execution_style(format: QuantFormat) -> MoeExecutionStyle {
+    // Q6 has no scalar-per-expert kernel: always batched-grouped.
+    if format == QuantFormat::Q6 {
+        return MoeExecutionStyle::BatchedGrouped;
+    }
     if batched_moe_enabled() {
         match format {
             QuantFormat::Q4Affine | QuantFormat::NvFp4 => MoeExecutionStyle::BatchedGrouped,

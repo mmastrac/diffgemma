@@ -32,6 +32,13 @@ kernel void gemm_linear_f32(
             float av = a[row * k_dim + p];
             sum += av * nvfp4_at_col(w, col, p, k_dim);
         }
+    } else if (K_QUANT_FORMAT == QUANT_Q6) {
+        uint row_stride = groups_per_row * 28u;
+        device const uchar *row_base = w + ulong(col) * row_stride;
+        for (uint p = 0u; p < k_dim; p++) {
+            float av = a[row * k_dim + p];
+            sum += av * q6_at_col(row_base, p);
+        }
     } else {
         uint row_stride = groups_per_row * 20u;
         device const uchar *row_base = w + ulong(col) * row_stride;

@@ -1,6 +1,6 @@
 //! Safetensors → `.dgq` offline quantizer (always from raw bf16 weights).
 
-use crate::dgq::block::{quantize_bf16_matrix_q4, quantize_bf16_matrix_q8, quantize_expert_stack_q4};
+use crate::dgq::block::{quantize_bf16_matrix_q4, quantize_bf16_matrix_q6, quantize_bf16_matrix_q8, quantize_expert_stack_q4, quantize_expert_stack_q6};
 use crate::dgq::layout::{
     align_offset, classify_tensor, dgq_version_for_profile, DgqManifest, DgqTensorEntry,
     DgqTensorMeta, QuantKind, QuantProfile, BLOB_FILE, MANIFEST_FILE,
@@ -22,6 +22,7 @@ pub struct QuantizeSummary {
     pub tensor_count: usize,
     pub blob_bytes: u64,
     pub q4_tensors: usize,
+    pub q6_tensors: usize,
     pub nvfp4_tensors: usize,
     pub q8_tensors: usize,
     pub raw_tensors: usize,
@@ -40,6 +41,7 @@ pub fn quantize_model(opts: QuantizeOptions) -> Result<QuantizeSummary, Error> {
     let mut bytes_written = 0u64;
     let mut entries = Vec::with_capacity(store.weight_map.len());
     let mut q4_tensors = 0usize;
+    let mut q6_tensors = 0usize;
     let mut nvfp4_tensors = 0usize;
     let mut q8_tensors = 0usize;
     let mut raw_tensors = 0usize;
@@ -69,6 +71,10 @@ pub fn quantize_model(opts: QuantizeOptions) -> Result<QuantizeSummary, Error> {
             QuantKind::Q4Block => {
                 q4_tensors += 1;
                 write_q4_tensor(&mut blob, src, &info.shape)?
+            }
+            QuantKind::Q6Block => {
+                q6_tensors += 1;
+                write_q6_tensor(&mut blob, src, &info.shape)?
             }
             QuantKind::Nvfp4Block => {
                 nvfp4_tensors += 1;
@@ -118,10 +124,37 @@ pub fn quantize_model(opts: QuantizeOptions) -> Result<QuantizeSummary, Error> {
         tensor_count: names.len(),
         blob_bytes: offset,
         q4_tensors,
+        q6_tensors,
         nvfp4_tensors,
         q8_tensors,
         raw_tensors,
     })
+}
+
+fn write_q6_tensor(out: &mut impl Write, src: &[u8], shape: &[i64]) -> Result<u64, Error> {
+    match shape.len() {
+        2 => {
+            let out_dim = shape[0] as usize;
+            let in_dim = shape[1] as usize;
+            let need = crate::dgq::layout::q6_matrix_bytes(out_dim, in_dim);
+            let mut buf = vec![0u8; need];
+            quantize_bf16_matrix_q6(src, out_dim, in_dim, &mut buf)
+;
+            out.write_all(&buf)?;
+            Ok(need as u64)
+        }
+        3 => {
+            let experts = shape[0] as usize;
+            let out_dim = shape[1] as usize;
+            let in_dim = shape[2] as usize;
+            let need = experts * crate::dgq::layout::q6_matrix_bytes(out_dim, in_dim);
+            let mut buf = vec![0u8; need];
+            quantize_expert_stack_q6(src, experts, out_dim, in_dim, &mut buf)?;
+            out.write_all(&buf)?;
+            Ok(need as u64)
+        }
+        _ => Err(Error::Format("q6 tensor must be 2D or 3D")),
+    }
 }
 
 fn write_q4_tensor(out: &mut impl Write, src: &[u8], shape: &[i64]) -> Result<u64, Error> {

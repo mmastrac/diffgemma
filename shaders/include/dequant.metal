@@ -179,6 +179,60 @@ inline ulong q4_row_bytes(uint K) {
     return ulong(K / 32) * 20ul;
 }
 
+// ---- Q6 affine (32-wide groups) ----
+// q6_block: [scale bf16:2][min bf16:2][24B codes]; 4 codes per 24-bit LE word
+// (v = q0 | q1<<6 | q2<<12 | q3<<18); w = scale*q + min, q in 0..63.
+inline ulong q6_row_bytes(uint K) {
+    return ulong(K / 32) * 28ul;
+}
+
+inline void dequant_q6_group(device const uchar *g, thread float *out32) {
+    const float s = bf16_bytes(g);
+    const float mn = bf16_bytes(g + 2);
+    for (uint w = 0u; w < 8u; ++w) {
+        device const uchar *b = g + 4u + w * 3u;
+        const uint v = uint(b[0]) | (uint(b[1]) << 8u) | (uint(b[2]) << 16u);
+        out32[w * 4u + 0u] = s * float(v & 0x3Fu) + mn;
+        out32[w * 4u + 1u] = s * float((v >> 6u) & 0x3Fu) + mn;
+        out32[w * 4u + 2u] = s * float((v >> 12u) & 0x3Fu) + mn;
+        out32[w * 4u + 3u] = s * float((v >> 18u) & 0x3Fu) + mn;
+    }
+}
+
+/// Half-precision partial decode into a threadgroup tile (matches the q4
+/// helpers' half s*q+mn math).
+inline void dequant_q6_group_half_tg_range(
+    device const uchar *g,
+    threadgroup half *out,
+    uint col_start,
+    uint col_count
+) {
+    const half s = half(bf16_bytes(g));
+    const half mn = half(bf16_bytes(g + 2));
+    for (uint i = 0u; i < col_count; ++i) {
+        const uint j = col_start + i;
+        device const uchar *b = g + 4u + (j / 4u) * 3u;
+        const uint v = uint(b[0]) | (uint(b[1]) << 8u) | (uint(b[2]) << 16u);
+        const uint q = (v >> (6u * (j % 4u))) & 0x3Fu;
+        out[i] = s * half(q) + mn;
+    }
+}
+
+inline void dequant_q6_group_half_tg(device const uchar *g, threadgroup half *out32) {
+    dequant_q6_group_half_tg_range(g, out32, 0u, 32u);
+}
+
+/// Column-indexed Q6 decode (parity vs CPU `q6_weight_at`).
+inline float q6_at_col(device const uchar *row_base, uint col) {
+    device const uchar *blk = row_base + ulong(col / 32u) * 28ul;
+    const uint j = col % 32u;
+    const float s = bf16_bytes(blk);
+    const float mn = bf16_bytes(blk + 2);
+    device const uchar *b = blk + 4u + (j / 4u) * 3u;
+    const uint v = uint(b[0]) | (uint(b[1]) << 8u) | (uint(b[2]) << 16u);
+    return s * float((v >> (6u * (j % 4u))) & 0x3Fu) + mn;
+}
+
 // ---- Q8 per-row ----
 // q8_row: [scale bf16:2][i8 weights:K], w = scale * q
 inline ulong q8_row_bytes(uint K) {

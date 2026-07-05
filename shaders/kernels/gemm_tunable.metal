@@ -407,8 +407,9 @@ kernel void gemm_tunable_sparse(
     if (n0 >= N) {
         return;
     }
+    const bool is_q6 = (K_QUANT_FORMAT == QUANT_Q6);
     const ulong w_off = jobs[e].w_byte_off;
-    const ulong rowB = q4_row_bytes(K);
+    const ulong rowB = is_q6 ? q6_row_bytes(K) : q4_row_bytes(K);
     const uint ltid = lid.x;
 
     const uint qid = lane / 4u;
@@ -462,27 +463,33 @@ kernel void gemm_tunable_sparse(
             }
             *(threadgroup half4 *)(&Xs[mm][kk]) = h;
         }
-        // W tile: expert q4 rows (vectorized nibble decode).
+        // W tile: expert q4/q6 rows.
         {
             const uint gn = n0 + w_r;
             if (gn < N) {
-                device const uchar *g =
-                    blob + w_off + (ulong)gn * rowB + (ulong)(k0 / 32u) * 20ul;
-                const half s = half(bf16_bytes(g));
-                const half mn = half(bf16_bytes(g + 2));
-                for (uint j8 = 0u; j8 < w_cols; j8 += 8u) {
-                    const uint jj = w_q + j8;
-                    device const uchar *pp = g + 4u + jj / 2u;
-                    const uint v = uint(pp[0]) | (uint(pp[1]) << 8u) |
-                        (uint(pp[2]) << 16u) | (uint(pp[3]) << 24u);
-                    const half4 q0 = half4(
-                        half(v & 0xFu), half((v >> 4u) & 0xFu),
-                        half((v >> 8u) & 0xFu), half((v >> 12u) & 0xFu));
-                    const half4 q1 = half4(
-                        half((v >> 16u) & 0xFu), half((v >> 20u) & 0xFu),
-                        half((v >> 24u) & 0xFu), half(v >> 28u));
-                    *(threadgroup half4 *)(&Ws[w_r][jj]) = s * q0 + half4(mn);
-                    *(threadgroup half4 *)(&Ws[w_r][jj + 4u]) = s * q1 + half4(mn);
+                if (is_q6) {
+                    dequant_q6_group_half_tg_range(
+                        blob + w_off + (ulong)gn * rowB + (ulong)(k0 / 32u) * 28ul,
+                        &Ws[w_r][w_q], w_q, w_cols);
+                } else {
+                    device const uchar *g =
+                        blob + w_off + (ulong)gn * rowB + (ulong)(k0 / 32u) * 20ul;
+                    const half s = half(bf16_bytes(g));
+                    const half mn = half(bf16_bytes(g + 2));
+                    for (uint j8 = 0u; j8 < w_cols; j8 += 8u) {
+                        const uint jj = w_q + j8;
+                        device const uchar *pp = g + 4u + jj / 2u;
+                        const uint v = uint(pp[0]) | (uint(pp[1]) << 8u) |
+                            (uint(pp[2]) << 16u) | (uint(pp[3]) << 24u);
+                        const half4 q0 = half4(
+                            half(v & 0xFu), half((v >> 4u) & 0xFu),
+                            half((v >> 8u) & 0xFu), half((v >> 12u) & 0xFu));
+                        const half4 q1 = half4(
+                            half((v >> 16u) & 0xFu), half((v >> 20u) & 0xFu),
+                            half((v >> 24u) & 0xFu), half(v >> 28u));
+                        *(threadgroup half4 *)(&Ws[w_r][jj]) = s * q0 + half4(mn);
+                        *(threadgroup half4 *)(&Ws[w_r][jj + 4u]) = s * q1 + half4(mn);
+                    }
                 }
             } else {
                 for (uint j = 0u; j < w_cols; j += 4u) {

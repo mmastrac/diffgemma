@@ -2653,9 +2653,10 @@ fn run_quantize(source_dir: &std::path::Path, output: &std::path::Path, profile:
     let profile = match profile {
         "q4" => QuantProfile::Q4,
         "q5" => QuantProfile::Q5,
+        "q6" => QuantProfile::Q6,
         "nvfp4" => QuantProfile::Nvfp4,
         other => {
-            eprintln!("error: unknown profile {other} (use q4, q5, or nvfp4)");
+            eprintln!("error: unknown profile {other} (use q4, q5, q6, or nvfp4)");
             return ExitCode::FAILURE;
         }
     };
@@ -2684,6 +2685,7 @@ fn run_quantize(source_dir: &std::path::Path, output: &std::path::Path, profile:
             println!("  tensors:       {}", summary.tensor_count);
             println!("  blob size:     {gib:.2} GiB");
             println!("  q4 tensors:    {}", summary.q4_tensors);
+            println!("  q6 tensors:    {}", summary.q6_tensors);
             println!("  nvfp4 tensors: {}", summary.nvfp4_tensors);
             println!("  q8 tensors:    {}", summary.q8_tensors);
             println!("  raw tensors:   {}", summary.raw_tensors);
@@ -3197,7 +3199,7 @@ fn parse_cli() -> Cli {
         },
         Some("quantize") => {
             let out = output_dir.unwrap_or_else(|| {
-                eprintln!("usage: diffgemma-mps quantize -o OUTPUT_DIR -m SOURCE [--profile q4|q5|nvfp4]");
+                eprintln!("usage: diffgemma-mps quantize -o OUTPUT_DIR -m SOURCE [--profile q4|q5|q6|nvfp4]");
                 std::process::exit(2);
             });
             Command::Quantize {

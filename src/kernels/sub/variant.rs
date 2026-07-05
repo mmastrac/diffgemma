@@ -71,6 +71,8 @@ pub enum QuantFormat {
     NvFp4 = 3,
     /// bf16 weights, no dequant (Raw .dgq path; unifies gemm_bf16 into gemm_block).
     Raw = 4,
+    /// Affine int6 groups of 32 (`q6_block`, experts).
+    Q6 = 5,
 }
 
 impl QuantFormat {
