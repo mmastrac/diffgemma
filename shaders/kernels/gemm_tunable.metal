@@ -7,7 +7,7 @@ using namespace metal;
 #include "dequant.metal"
 #include "arena.metal"
 
-/// TUNABLE GEMM (task #19): steel-class fragment-level block GEMM.
+/// TUNABLE GEMM (task #19): fragment-level block GEMM.
 ///
 /// The bench prototype (gemm_block_sq) proved macro tiling alone cannot reach
 /// the MPS/MLX 3.4-4.4 TF/s at our shapes; the delta is fragment-level
@@ -57,7 +57,8 @@ kernel void gemm_tunable(
     const uint ltid = lid.x;
 
     const bool is_raw = (K_QUANT_FORMAT == QUANT_RAW);
-    const ulong rowB = is_raw ? (ulong)K * 2ul : q4_row_bytes(K);
+    const bool is_q8 = (K_QUANT_FORMAT == QUANT_Q8);
+    const ulong rowB = is_raw ? (ulong)K * 2ul : (is_q8 ? q8_row_bytes(K) : q4_row_bytes(K));
 
     // Steel lane->element coordinates within an 8x8 fragment: this lane owns
     // elements (fm, fn) and (fm, fn+1).
@@ -111,6 +112,16 @@ kernel void gemm_tunable(
                         const ushort4 u = *(device const ushort4 *)(wr + k0 + w_q + j);
                         *(threadgroup half4 *)(&Ws[w_r][w_q + j]) =
                             half4(as_type<float4>(uint4(u) << 16u));
+                    }
+                } else if (is_q8) {
+                    // Same per-element math as gemm_block's q8_at path:
+                    // half(float(int8) * f32_scale).
+                    device const uchar *rb = blob + w_off + (ulong)gn * rowB;
+                    const float sq8 = bf16_bytes(rb);
+                    for (uint j = 0u; j < w_cols; ++j) {
+                        const char qv =
+                            *((device const char *)(rb + 2u + k0 + w_q + j));
+                        Ws[w_r][w_q + j] = half(float(qv) * sq8);
                     }
                 } else {
                     // Vectorized q4 decode: 8 nibbles per assembled u32; same

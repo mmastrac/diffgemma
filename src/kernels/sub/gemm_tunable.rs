@@ -1,4 +1,4 @@
-//! Tunable steel-class GEMM (task #19): fragment-level block GEMM with
+//! Tunable GEMM (task #19): fragment-level block GEMM with
 //! per-lane thread_elements() loads and vectorized loaders; tile geometry via
 //! TUNE_BM/TUNE_BN #define prepend. BIT-EXACT vs gemm_block (same ascending-K
 //! accumulation chain, dequant math, and store rounding) — verified per

@@ -95,7 +95,7 @@ tiles — the padding is real, it just isn't on the critical path):
   A/Bs ±1.5%, overlapping). Removing 50-75% of the MMA work from ~1/3 of
   threadgroups moved wall time ~0% → per-TG cost is pipeline/fixed-dominated
   (see GEMM headroom investigation), not MMA-bound. Enabled anyway as a
-  LATENT win: once the steel-class GEMM port (task #19) makes per-TG cost
+  LATENT win: once the tunable GEMM port (task #19) makes per-TG cost
   compute-bound, the padding savings activate — carry the adaptive M-mapping
   into that port.
 
