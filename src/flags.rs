@@ -56,22 +56,22 @@ pub fn denoiser_argmax_enabled() -> bool {
     *ON.get_or_init(|| on_unless_zero("DGQ_DENOISER_ARGMAX"))
 }
 
-/// Entropy-only early stop (`DGQ_EARLY_STOP_MEAN_ENT=<nats>`, 0/unset = off).
-/// When > 0, a denoise block stops as soon as the full-canvas mean entropy
-/// falls below this (after `min_early_stop_steps`), WITHOUT waiting for full
-/// argmax stability. Our forward converges the answer text long before the
-/// argmax fully locks (the last ~10 steps only micro-flip near-tie positions
-/// and shrink entropy from ~0.1 to ~0.0001), so a threshold around 0.02-0.05
-/// cuts ~25-30% of steps. QUALITY-AFFECTING: needs the multi-seed gate +
-/// wart census + sign-off before the default changes.
+/// Entropy-only early stop (`DGQ_EARLY_STOP_MEAN_ENT=<nats>`; 0 disables).
+/// A denoise block stops as soon as the full-canvas mean entropy falls below
+/// this (after `min_early_stop_steps`), WITHOUT waiting for full argmax
+/// stability. Our forward converges the answer text long before the argmax
+/// fully locks (the last ~10 steps only micro-flip near-tie positions and
+/// shrink entropy from ~0.1 to ~0.0001), so 0.05 cuts ~25-35% of steps on
+/// long replies. DEFAULT ON at 0.05 (user sign-off 2026-07-06; evidence:
+/// probe answers byte-identical, multi-seed gate + wart census neutral).
 pub fn early_stop_mean_ent() -> f32 {
     static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
         std::env::var("DGQ_EARLY_STOP_MEAN_ENT")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
-            .filter(|&x| x > 0.0)
-            .unwrap_or(0.0)
+            .filter(|&x| x >= 0.0)
+            .unwrap_or(0.05)
     })
 }
 

@@ -166,6 +166,14 @@ Per step, given softcapped logits `L[256, 262144]`:
    - **pad gate (OURS, superset)**: an all-pad/filler argmax NEVER stops
      (degenerate forward, not a converged answer) — enforced in both
      `sample_commit.metal` and the CPU stopper;
+   - **entropy-only stop (OURS, DEFAULT ON at 0.05 nats)**: after the
+     min-early-stop floor (12 steps), stop when full-canvas mean H <
+     `DGQ_EARLY_STOP_MEAN_ENT` WITHOUT waiting for argmax stability — the
+     answer text settles ~10 steps before the argmax fully locks; the tail
+     only micro-flips near-tie positions. `=0` disables. Signed off
+     2026-07-06: probe answers byte-identical, gate aggregate 43→45/51
+     (sky_blue converges under budget), census-neutral, −15% steps on the
+     gate set / −25-35% on long replies;
    - max_steps = 48.
 7. **Final commit = the full-canvas argmax of the last executed step** — not
    the accepted canvas. Accepted tokens only ever shape intermediate
@@ -227,6 +235,7 @@ quality lever (task #20).
 | 7 | Length-heuristic prefill (engine f32 ≤ 256 tokens) | ours only | §3 — wall-clock decomposition; MLX prefills one way |
 | 8 | Canvas init RNG (seeded LCG) | different RNG than mx.random | noise is noise; parity tooling pins exact canvases via `initial_canvas_ids` |
 | 9 | Entropy accept + stop thresholds in nats | same as MLX (natural log) | noted because prose sometimes says "bits" — the code is nats everywhere |
+| 10 | Entropy-only early stop (mean H < 0.05, §6) | ours only | tail steps only micro-flip near-ties; sign-off 2026-07-06, gate 45/51 ≥ baseline 43/51, census-neutral |
 
 Historical divergences that were BUGS, since fixed to match the reference:
 hard-freeze of accepted rows (§6.1, the wart driver); SC logits not
