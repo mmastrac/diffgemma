@@ -52,6 +52,19 @@ struct AttnDims {
     uint window;   // sliding-window size (0 = unwindowed/full-attention layer)
 };
 
+/// KV block range for flash-decode style sequential-block attention
+/// (full-attention layers at long kv). Blocks are dispatched IN ORDER with
+/// the online-softmax state (m, l, unnormalized O — all f32) persisted in a
+/// scratch buffer between dispatches, so the result is bit-identical to one
+/// monolithic pass; the win is SLC locality (every threadgroup streams the
+/// same <=block-sized key window per dispatch instead of the whole cache).
+struct AttnBlockRange {
+    uint t_begin;    // first key position of this block (8-aligned)
+    uint t_end;      // one past the last key position of this block
+    uint is_first;   // init state instead of loading it
+    uint is_last;    // normalize + write `out` instead of storing state
+};
+
 /// Split-half RoPE on the first `rot` dims; inv_freq denominator is full `head_dim`.
 inline void apply_split_half_rope_f32(
     thread float *src,

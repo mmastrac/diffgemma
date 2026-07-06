@@ -1270,6 +1270,9 @@ pub(crate) struct StepBuffers {
     expert_layer_unique: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// GPU-written `threadgroupsPerGrid` for grouped MoE gate_up (slot 0) and down (slot 1).
     moe_grouped_indirect: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// Online-softmax state (f32 m/l + unnormalized O per head x canvas row)
+    /// persisted between sequential kv-block dispatches of attention_mma_full.
+    attn_state: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// Scratch plane byte offsets (host-built, mirrored on GPU as b8).
     pub(crate) arena_map: ArenaLayout,
     /// GPU copy of `arena_map` (b8); bound when kernels need device-side plane table.
@@ -3099,6 +3102,11 @@ impl StepEnc<'_> {
         };
         self.sink_set_bytes(&attn_dims, 5);
         self.bind_debug_status(6);
+        // Full-attention kernel takes a kv-block range + state scratch
+        // (buffers 7/8); the range is (re)set per dispatch below.
+        if use_mma_full {
+            self.sink_set_buffer(&self.bufs.attn_state, 0, 8);
+        }
         // Scalar: one threadgroup per (canvas token, Q head). MMA2: one per
         // (MT-row tile, KV head), 2 simdgroups = the 2 Q heads in the group.
         // MMA_full: one per (MT-row tile, KV head, QG-head sub-group), QG
@@ -3135,7 +3143,36 @@ impl StepEnc<'_> {
             height: 1,
             depth: 1,
         };
-        self.sink_dispatch(grid, tg);
+        if use_mma_full {
+            // Flash-decode sequential kv blocks (DGQ_ATTN_KV_BLOCK, 0=off):
+            // in-order dispatches over block-sized key ranges with f32
+            // softmax state persisted in attn_state — bit-identical to one
+            // monolithic pass, but each dispatch's threadgroups all stream
+            // the same <=block key window (SLC-served instead of
+            // DRAM-thrashed; the 256-consumer redundancy made the kernel
+            // DRAM-bound past ~8k keys).
+            let t_total = read_struct::<StepParams>(&self.bufs.params).kv_len as usize + CANVAS;
+            let block = crate::flags::attn_kv_block();
+            let blocks = if block > 0 && t_total > block {
+                t_total.div_ceil(block)
+            } else {
+                1
+            };
+            for b in 0..blocks {
+                let t_begin = b * block;
+                let t_end = if blocks == 1 { t_total } else { ((b + 1) * block).min(t_total) };
+                let blk = [
+                    t_begin as u32,
+                    t_end as u32,
+                    u32::from(b == 0),
+                    u32::from(b + 1 == blocks),
+                ];
+                self.sink_set_bytes(&blk, 7);
+                self.sink_dispatch(grid, tg);
+            }
+        } else {
+            self.sink_dispatch(grid, tg);
+        }
         Ok(())
     }
 
@@ -4706,6 +4743,11 @@ pub fn build_step_runtime(
         gemm_b: alloc_buffer(&ctx.device, gemm_b_bytes)?,
         expert_layer_unique: alloc_buffer(&ctx.device, N_LAYERS * std::mem::size_of::<u32>())?,
         moe_grouped_indirect: alloc_buffer(&ctx.device, MOE_GROUPED_INDIRECT_BYTES)?,
+        // {m,l} + O[512] per (16 heads x 256 rows), f32: ~8.4 MiB.
+        attn_state: alloc_buffer(
+            &ctx.device,
+            STEP_NQ_HEADS * CANVAS * (2 + 512) * std::mem::size_of::<f32>(),
+        )?,
         arena_map,
         arena_layout_buf: {
             let b = alloc_buffer(&ctx.device, std::mem::size_of::<ArenaLayout>())?;

@@ -182,6 +182,27 @@ pub fn kv_reuse_enabled() -> bool {
     on_unless_zero("DGQ_KV_REUSE")
 }
 
+/// KV block size for sequential-block full-attention (`DGQ_ATTN_KV_BLOCK=
+/// <keys>`; DEFAULT 0 = OFF). When on and kv_len+canvas exceeds the block,
+/// full-attention layers run as in-order dispatches over block-sized key
+/// ranges with f32 online-softmax state persisted in `attn_state` —
+/// BIT-IDENTICAL to the monolithic pass (verified: 6.5k traces byte-equal).
+/// DISPROVEN AS A PERF LEVER 2026-07-06: the hoped-for SLC-locality win does
+/// not exist — threadgroups already sweep keys in near-lockstep, so the SLC
+/// already serves the shared stream (measured effective bandwidth 171 GB/s >
+/// DRAM's ~150 at kv 32k). Blocking only adds state round-trips: 33k prefill
+/// 165.7 -> 177.7 s, denoise unchanged. Kept as scaffolding (the state
+/// machinery is the base for a future parallel-split or quantized-KV pass).
+pub fn attn_kv_block() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DGQ_ATTN_KV_BLOCK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0)
+    })
+}
+
 /// MMA attention in the fast prefill (`DGQ_PREFILL_MMA=0` restores the scalar
 /// prefill attention). The MMA kernels honor the causal mask + sliding window;
 /// scalar prefill was kept from the freeze era when f16 prefill attention

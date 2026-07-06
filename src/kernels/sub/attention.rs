@@ -503,6 +503,11 @@ pub fn gpu_mma_full(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Err
     };
     let dims = AttnDims::new(f.canvas as u32, f.n_q_heads as u32);
     let group = f.n_q_heads / f.n_kv();
+    // kv-block state scratch (single-block dispatch here: first+last).
+    let buf_state = pool
+        .allocate(&ctx.device, f.n_q_heads * f.canvas * (2 + 512) * 4)
+        .ok_or(Error::Format("alloc"))?;
+    let blk = [0u32, f.kv_len + f.canvas as u32, 1, 1];
 
     let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
     let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
@@ -512,9 +517,11 @@ pub fn gpu_mma_full(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Err
         enc.setBuffer_offset_atIndex(Some(&buf_kv), 0, 1);
         enc.setBuffer_offset_atIndex(Some(&buf_out), 0, 2);
         enc.setBuffer_offset_atIndex(Some(&buf_layer), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(&buf_state), 0, 8);
     }
     gpu_common::set_bytes(&enc, &params, 4);
     gpu_common::set_bytes(&enc, &dims, 5);
+    gpu_common::set_bytes(&enc, &blk, 7);
     enc.dispatchThreadgroups_threadsPerThreadgroup(
         // One tg per (query tile, kv head, Q head); the QG simdgroups split
         // head_dim, so depth is the full GQA group.
@@ -620,6 +627,12 @@ pub fn bench_path(f: &Fixture, iters: usize, path: u8) -> Result<f64, Error> {
         ),
     };
 
+    // kv-block state scratch for the mma_full path (single-block: first+last).
+    let buf_state = pool
+        .allocate(&ctx.device, f.n_q_heads * f.canvas * (2 + 512) * 4)
+        .ok_or(Error::Format("alloc"))?;
+    let blk = [0u32, f.kv_len + f.canvas as u32, 1, 1];
+
     // 1 warm-up + several timed rounds (each one command buffer with `iters`
     // dispatches); report the MIN ms/dispatch to factor out GPU clock ramp/throttle.
     let mut best = f64::INFINITY;
@@ -633,9 +646,11 @@ pub fn bench_path(f: &Fixture, iters: usize, path: u8) -> Result<f64, Error> {
             enc.setBuffer_offset_atIndex(Some(&buf_kv), 0, 1);
             enc.setBuffer_offset_atIndex(Some(&buf_out), 0, 2);
             enc.setBuffer_offset_atIndex(Some(&buf_layer), 0, 3);
+            enc.setBuffer_offset_atIndex(Some(&buf_state), 0, 8);
         }
         gpu_common::set_bytes(&enc, &params, 4);
         gpu_common::set_bytes(&enc, &dims, 5);
+        gpu_common::set_bytes(&enc, &blk, 7);
         for _ in 0..iters {
             enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tpg);
         }

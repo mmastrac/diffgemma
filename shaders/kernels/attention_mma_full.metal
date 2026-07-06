@@ -43,6 +43,11 @@ kernel void attention_mma_full(
     constant StepParams &P [[buffer(4)]],
     constant AttnDims &dims [[buffer(5)]],
     device DebugStatus *dbg [[buffer(6)]],
+    constant AttnBlockRange &blk [[buffer(7)]],
+    // Per-(head, row) online-softmax state across kv-block dispatches:
+    // layout [qh][tok] -> {m, l} in the first 2*NQ*CANVAS floats, then
+    // [qh][tok][d] unnormalized O. f32 round-trip = bit-identical.
+    device float *attn_state [[buffer(8)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 lid [[thread_position_in_threadgroup]]
 ) {
@@ -71,6 +76,19 @@ kernel void attention_mma_full(
     // Causal (prefill): row r is at abs pos kv_len+tok0+r, attends only [0..pos].
     const bool causal = dims.causal != 0u;
     const uint T_eff = causal ? min(T, P.kv_len + tok0 + MT) : T;
+
+    // Middle block with no keys for this query tile (causal cutoff before the
+    // block): state passes through untouched, nothing to do. The LAST block
+    // must still run to normalize + write `out`.
+    if (blk.is_first == 0u && blk.is_last == 0u && blk.t_begin >= T_eff) {
+        return;
+    }
+    // State planes: {m, l} per (head, row), then unnormalized O.
+    const uint ml_base = (qh * dims.canvas + tok0) * 2u;
+    device float *st_ml = attn_state + ml_base;
+    device float *st_o = attn_state
+        + (ulong)dims.n_q_heads * dims.canvas * 2u
+        + ((ulong)qh * dims.canvas + tok0) * HD;
     // KV cache is f16: K/V tiles are simdgroup_load'ed STRAIGHT from device
     // memory (row stride = one key), no bf16->half staging pass at all. Tail
     // keys of a ragged tile read in-bounds pad/stale slots (finite; the layer
@@ -93,8 +111,18 @@ kernel void attention_mma_full(
     const uint r0 = lane / 8u;          // 0..3
     const uint r1 = r0 + 4u;            // 4..7
     float oreg[2u * NCH_H];
-    for (uint j = 0u; j < 2u * NCH_H; ++j) {
-        oreg[j] = 0.f;
+    if (blk.is_first != 0u) {
+        for (uint j = 0u; j < 2u * NCH_H; ++j) {
+            oreg[j] = 0.f;
+        }
+    } else {
+        // Resume: reload this lane's O slice from the state buffer (f32
+        // round-trip, exact).
+        for (uint c = 0u; c < NCH_H; ++c) {
+            uint d = dlo + c * 8u + dcol;
+            oreg[2u * c] = st_o[(ulong)r0 * HD + d];
+            oreg[2u * c + 1u] = st_o[(ulong)r1 * HD + d];
+        }
     }
 
     // Stage Q[MT x HD] -> half (all lanes cooperate).
@@ -106,12 +134,18 @@ kernel void attention_mma_full(
             : half(0);
     }
     if (lid.x < MT) {
-        mrow[lid.x] = -INFINITY;
-        lrow[lid.x] = 0.f;
+        if (blk.is_first != 0u) {
+            mrow[lid.x] = -INFINITY;
+            lrow[lid.x] = 0.f;
+        } else {
+            mrow[lid.x] = st_ml[lid.x * 2u];
+            lrow[lid.x] = st_ml[lid.x * 2u + 1u];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint t0 = 0u; t0 < T_eff; t0 += 8u) {
+    const uint t_stop = min(T_eff, blk.t_end);
+    for (uint t0 = blk.t_begin; t0 < t_stop; t0 += 8u) {
         // ---- partial S = Q . K^T over THIS half's chunks (direct device K) ----
         device const half *kb = kv16 + (ulong)t0 * kstride + kvh * hd;
         simdgroup_float8x8 sacc(0.f);
@@ -172,6 +206,21 @@ kernel void attention_mma_full(
             simdgroup_barrier(mem_flags::mem_threadgroup);
         }
         // ph/corr are rewritten only after the next tile's tg barrier.
+    }
+
+    if (blk.is_last == 0u) {
+        // Persist state for the next kv-block dispatch (f32, exact).
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid.x < MT) {
+            st_ml[lid.x * 2u] = mrow[lid.x];
+            st_ml[lid.x * 2u + 1u] = lrow[lid.x];
+        }
+        for (uint c = 0u; c < NCH_H; ++c) {
+            uint d = dlo + c * 8u + dcol;
+            st_o[(ulong)r0 * HD + d] = oreg[2u * c];
+            st_o[(ulong)r1 * HD + d] = oreg[2u * c + 1u];
+        }
+        return;
     }
 
     if (lid.x < MT) {
