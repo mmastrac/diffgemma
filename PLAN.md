@@ -20,7 +20,10 @@ The engine is in ship shape:
   parity; ~1.6× FASTER than the mxfp4 checkpoint; the old "2× step gap" was a
   mixed-config single-seed artifact — quant format alone swings MLX's own
   convergence 12↔27 steps on one canvas). Chat: cross-turn KV reuse (turn-3
-  prefill −71%) + optional entropy early stop.
+  prefill −71%), entropy early stop default-on (0.05, signed off), fast
+  between-block extend (~10s → 0.85s/block). Wall-clock vs MLX-4bit (their
+  fastest config, temp 0, natural finish): short/medium replies WIN
+  (3.2 vs 3.7s; 26.0 vs 27.6s), ~940-token reply 66 vs 59s (1.12×).
 - **Quality**: MLX-exact sampler semantics default (no-freeze + argmax commit,
   signed off 2026-07-05). Wart census 0/10 (was 4/10). Smoketest 17/17 at the
   spec seed. Fast-prefill degenerate class fixed as a side effect.
