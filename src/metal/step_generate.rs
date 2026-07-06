@@ -689,24 +689,33 @@ pub fn generate_with_session(
         if !is_last_block {
             let extend_started = Instant::now();
             let kv_before = rt.read_params().kv_len as usize;
-            if session.encoder.is_none() {
-                session.encoder = Some(MonolithicEncoderCache::open_opt(
-                    model_dir,
-                    canvas_len,
+            let new_kv_len = if crate::flags::fast_block_extend_enabled() {
+                // Fast quantized causal extend of the committed canvas — the
+                // same offset-resume as the cross-turn delta prefill. The
+                // engine extend costs ~10s per 256-token block (the dominant
+                // cost of multi-block replies); this is one prefill-chunk
+                // forward (~0.85s).
+                rt.prefill_chunks_from(kv_before, &argmax_tokens)?
+            } else {
+                if session.encoder.is_none() {
+                    session.encoder = Some(MonolithicEncoderCache::open_opt(
+                        model_dir,
+                        canvas_len,
+                        cfg.max_seq,
+                        Some(std::sync::Arc::clone(&shared_blob)),
+                    )?);
+                }
+                let encoder = session.encoder.as_mut().expect("encoder cache");
+                extend_monolithic_kv_with_cache(
+                    encoder,
+                    rt.kvcache(),
+                    rt.layout(),
+                    kv_before,
+                    &argmax_tokens,
                     cfg.max_seq,
-                    Some(std::sync::Arc::clone(&shared_blob)),
-                )?);
-            }
-            let encoder = session.encoder.as_mut().expect("encoder cache");
-            let new_kv_len = extend_monolithic_kv_with_cache(
-                encoder,
-                rt.kvcache(),
-                rt.layout(),
-                kv_before,
-                &argmax_tokens,
-                cfg.max_seq,
-                layers,
-            )?;
+                    layers,
+                )?
+            };
             rt.set_kv_len(new_kv_len as u32);
             let block_extend = extend_started.elapsed();
             extend_elapsed += block_extend;

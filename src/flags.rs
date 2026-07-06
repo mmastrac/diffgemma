@@ -182,6 +182,16 @@ pub fn kv_reuse_enabled() -> bool {
     on_unless_zero("DGQ_KV_REUSE")
 }
 
+/// Fast (quantized) between-block KV extend (`DGQ_FAST_BLOCK_EXTEND=0` restores
+/// the f32 engine extend). After a canvas block commits, its 256 tokens are
+/// causally extended into KV via `prefill_chunks_from` (~0.85s) instead of the
+/// engine (~10s/block — the dominant cost of multi-block replies; a 4-block
+/// reply paid ~30s in extends). Same quality class as the fast-vs-engine
+/// prefill approximation and cross-turn reuse; gate-validated on flip.
+pub fn fast_block_extend_enabled() -> bool {
+    on_unless_zero("DGQ_FAST_BLOCK_EXTEND")
+}
+
 /// Buffer-resident engine prefill (merged batches, no CPU round-trips).
 /// `DGQ_PREFILL_RESIDENT=0` restores the legacy per-batch readback path.
 pub fn prefill_resident_enabled() -> bool {
