@@ -124,7 +124,12 @@ pub struct LayerOffsets {
     pub head_dim: u32,
     pub n_kv_heads: u32,
     pub is_full: u32,
-    pub _pad: u32,
+    /// KV slot mapping: 0 = linear (full layers, every position kept);
+    /// else a power-of-two-minus-1 ring mask (sliding layers, slot = pos & mask).
+    /// A sliding layer only ever attends the last window-1 (1023) keys + the
+    /// 256-wide canvas, so a 2048-slot ring holds every live position — this is
+    /// what makes 100k+ context affordable (KV goes ~220 KB/token -> ~20).
+    pub kv_ring_mask: u32,
 }
 
 #[repr(C)]
@@ -459,6 +464,19 @@ pub fn manifest_offset(
     base + expert as u64 * stride
 }
 
+/// KV slots a layer's region holds. Full layers keep every position (linear,
+/// max_seq). Sliding layers only ever attend the last window-1 (1023) keys plus
+/// the 256 canvas/chunk positions, so a power-of-two ring >= 1280 suffices at
+/// any context length; below that, the next power of two covering max_seq
+/// (no wrap possible = trivially identical to linear).
+pub fn layer_kv_slots(is_full: bool, max_seq: usize) -> usize {
+    if is_full {
+        max_seq
+    } else {
+        max_seq.next_power_of_two().min(2048)
+    }
+}
+
 pub fn build_layout(offsets: &HashMap<String, u64>, max_seq: usize) -> ModelLayout {
     let g = |n: &str| *offsets.get(n).unwrap_or_else(|| panic!("missing tensor {n}"));
     let opt = |n: &str| offsets.get(n).copied().unwrap_or(0);
@@ -468,6 +486,7 @@ pub fn build_layout(offsets: &HashMap<String, u64>, max_seq: usize) -> ModelLayo
         let p = format!("model.decoder.layers.{i}.");
         let full = FULL_LAYERS.contains(&i);
         let (hd, nkv) = if full { (512u32, 2u32) } else { (256, 8) };
+        let slots = layer_kv_slots(full, max_seq);
         *l = LayerOffsets {
             input_ln: g(&format!("{p}input_layernorm.weight")),
             q_proj: g(&format!("{p}self_attn.q_proj.weight")),
@@ -495,9 +514,9 @@ pub fn build_layout(offsets: &HashMap<String, u64>, max_seq: usize) -> ModelLayo
             head_dim: hd,
             n_kv_heads: nkv,
             is_full: full as u32,
-            _pad: 0,
+            kv_ring_mask: if full { 0 } else { (slots - 1) as u32 },
         };
-        kv_off += (max_seq as u64) * (nkv as u64) * (hd as u64) * 2 * 2;
+        kv_off += (slots as u64) * (nkv as u64) * (hd as u64) * 2 * 2;
     }
     ModelLayout {
         embed: g("model.decoder.embed_tokens.weight"),

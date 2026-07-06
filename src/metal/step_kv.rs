@@ -51,15 +51,32 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 use std::path::Path;
 
-pub fn kv_region_bytes(n_kv_heads: u32, head_dim: u32, max_seq: usize) -> u64 {
-    (max_seq as u64) * (n_kv_heads as u64) * (head_dim as u64) * 2 * 2
+pub fn kv_region_bytes(n_kv_heads: u32, head_dim: u32, slots: usize) -> u64 {
+    (slots as u64) * (n_kv_heads as u64) * (head_dim as u64) * 2 * 2
+}
+
+/// Per-layer KV slots — MUST agree with `build_layout`'s region offsets: full
+/// layers are linear (max_seq slots), sliding layers a power-of-two ring
+/// (only the last window-1 + canvas positions are ever live).
+fn layer_slots(l: &crate::metal::step_kernel::LayerOffsets, max_seq: usize) -> usize {
+    crate::metal::step_kernel::layer_kv_slots(l.is_full != 0, max_seq)
+}
+
+/// Absolute position -> slot within the layer's KV region.
+#[inline]
+fn kv_slot(l: &crate::metal::step_kernel::LayerOffsets, pos: usize) -> usize {
+    if l.kv_ring_mask != 0 {
+        pos & (l.kv_ring_mask as usize)
+    } else {
+        pos
+    }
 }
 
 pub fn kv_cache_total_bytes(layout: &ModelLayout, max_seq: usize) -> u64 {
     (0..N_LAYERS)
         .map(|i| {
             let l = &layout.layers[i];
-            kv_region_bytes(l.n_kv_heads, l.head_dim, max_seq)
+            kv_region_bytes(l.n_kv_heads, l.head_dim, layer_slots(l, max_seq))
         })
         .sum()
 }
@@ -86,12 +103,12 @@ pub fn pack_kv_cache_to_monolithic(
         let hd = l.head_dim as usize;
         let token_stride = nkv * hd * 2;
         let byte_base = l.kv_region as usize;
-        if byte_base + max_seq * token_stride * 2 > dst.len() {
+        if byte_base + layer_slots(l, max_seq) * token_stride * 2 > dst.len() {
             return Err(Error::Format("monolithic kv buffer too small"));
         }
         let per_token = nkv * hd;
         for pos in 0..kv.kv_len {
-            let slot_base = byte_base / 2 + pos * token_stride;
+            let slot_base = byte_base / 2 + kv_slot(l, pos) * token_stride;
             for hh in 0..nkv {
                 for d in 0..hd {
                     let src_i = pos * per_token + hh * hd + d;
@@ -145,7 +162,7 @@ pub fn read_monolithic_kv_prefix_to_cpu_cache(
         let token_stride = nkv * hd * 2;
         let slot_base_region = l.kv_region as usize / 2;
         for pos in 0..kv_len {
-            let slot_base = slot_base_region + pos * token_stride;
+            let slot_base = slot_base_region + kv_slot(l, pos) * token_stride;
             for hh in 0..nkv {
                 for d in 0..hd {
                     let src_i = pos * per_token + hh * hd + d;
@@ -275,6 +292,7 @@ fn pack_gpu_kv_prefix_to_monolithic(
                     hd as u32,
                     l.kv_region,
                     src_pos as u32,
+                    l.kv_ring_mask,
                 );
             },
         );

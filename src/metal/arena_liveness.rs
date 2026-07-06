@@ -416,7 +416,7 @@ mod tests {
             head_dim: 256,
             n_kv_heads: 2,
             is_full: 0,
-            _pad: 0,
+            kv_ring_mask: 0,
         }; N_LAYERS];
         for l in layers.iter_mut().take(26) {
             l.is_full = 1;

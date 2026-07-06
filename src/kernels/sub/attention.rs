@@ -211,7 +211,7 @@ fn layer_offsets(f: &Fixture) -> LayerOffsets {
         head_dim: f.layer.head_dim,
         n_kv_heads: f.layer.n_kv_heads,
         is_full: u32::from(f.layer.is_full),
-        _pad: 0,
+        kv_ring_mask: 0,
     }
 }
 

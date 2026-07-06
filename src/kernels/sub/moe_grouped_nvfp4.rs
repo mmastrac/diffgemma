@@ -61,7 +61,7 @@ impl Fixture {
             head_dim: 0,
             n_kv_heads: 0,
             is_full: 0,
-            _pad: 0,
+            kv_ring_mask: 0,
         }
     }
 }

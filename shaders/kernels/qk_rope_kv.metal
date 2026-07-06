@@ -65,7 +65,9 @@ kernel void qk_rope_kv(
             apply_split_half_rope_f32(head, rot, hd, theta, pos);
         }
         if (isK) {
-            device ushort *dst = kvcache + L->kv_region / 2 + (ulong)pos * nkv * hd * 2u + hh * hd;
+            // RoPE uses the ABSOLUTE pos; only the storage slot is ring-mapped.
+            device ushort *dst = kvcache + L->kv_region / 2
+                + (ulong)kv_slot_of(L, pos) * nkv * hd * 2u + hh * hd;
             for (uint i = 0u; i < hd; ++i) {
                 arena_store_bf16(dst, i, head[i]);  // KV cache stays bf16 (shared w/ encoder)
             }
@@ -80,8 +82,8 @@ kernel void qk_rope_kv(
             }
         }
     } else {
-        device ushort *dst = kvcache + L->kv_region / 2 + (ulong)pos * nkv * hd * 2u
-            + (ulong)nkv * hd + hh * hd;
+        device ushort *dst = kvcache + L->kv_region / 2
+            + (ulong)kv_slot_of(L, pos) * nkv * hd * 2u + (ulong)nkv * hd + hh * hd;
         for (uint i = 0u; i < hd; ++i) {
             arena_store_bf16(dst, i, arena_load(src, i) * inv);  // KV cache stays bf16
         }

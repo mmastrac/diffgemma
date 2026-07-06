@@ -74,7 +74,8 @@ kernel void attention(
         acc[i] = 0.f;
     }
     for (uint t = t_lo; t < T; ++t) {
-        device const ushort *kk = base + (ulong)t * nkv * hd * 2u + kvh * hd;
+        const uint ts = kv_slot_of(L, t);
+        device const ushort *kk = base + (ulong)ts * nkv * hd * 2u + kvh * hd;
         float d = 0.f;
         for (uint i = ltid; i < hd; i += tpg_w) {
             d += arena_load(qv, i) * arena_load_bf16(kk, i);  // K from bf16 KV cache
@@ -94,7 +95,7 @@ kernel void attention(
         float p = exp(d - mn);
         l = l * corr + p;
         m = mn;
-        device const ushort *vv = base + (ulong)t * nkv * hd * 2u + (ulong)nkv * hd + kvh * hd;
+        device const ushort *vv = base + (ulong)ts * nkv * hd * 2u + (ulong)nkv * hd + kvh * hd;
         for (uint i = 0u; i < per; ++i) {
             uint idx = ltid + i * tpg_w;
             if (idx < hd) {

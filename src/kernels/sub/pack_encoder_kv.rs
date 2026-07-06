@@ -32,6 +32,7 @@ pub fn bind_gpu_buffers(
     hd: u32,
     kv_region_bytes: u64,
     src_pos: u32,
+    kv_ring_mask: u32,
 ) {
     let shape = [token_count, dst_pos, nkv, hd];
     unsafe {
@@ -42,6 +43,7 @@ pub fn bind_gpu_buffers(
     super::gpu_common::set_bytes(enc, &shape, 3);
     super::gpu_common::set_bytes(enc, &kv_region_bytes, 4);
     super::gpu_common::set_bytes(enc, &src_pos, 5);
+    super::gpu_common::set_bytes(enc, &kv_ring_mask, 6);
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]

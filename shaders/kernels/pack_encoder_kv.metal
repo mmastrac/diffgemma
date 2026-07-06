@@ -13,6 +13,7 @@ kernel void pack_encoder_kv(
     constant uint4 &shape [[buffer(3)]],
     constant ulong &kv_region_bytes [[buffer(4)]],
     constant uint &src_pos [[buffer(5)]],
+    constant uint &kv_ring_mask [[buffer(6)]],
     uint3 gid [[thread_position_in_grid]]
 ) {
     const uint pos = gid.x;
@@ -32,7 +33,11 @@ kernel void pack_encoder_kv(
     const uint per_token = nkv * hd;
     const uint src_i = (src_pos + pos) * per_token + hh * hd + d;
     const uint token_stride = nkv * hd * 2u;
-    const ulong base_idx = kv_region_bytes / 2ul + ulong(dst_pos + pos) * ulong(token_stride);
+    // Sliding layers store KV in a power-of-two ring (slot = pos & mask);
+    // full layers are linear (mask 0).
+    const uint abs_pos = dst_pos + pos;
+    const uint slot = (kv_ring_mask != 0u) ? (abs_pos & kv_ring_mask) : abs_pos;
+    const ulong base_idx = kv_region_bytes / 2ul + ulong(slot) * ulong(token_stride);
     const ulong k_idx = base_idx + ulong(hh * hd + d);
     const ulong v_idx = base_idx + ulong(nkv * hd + hh * hd + d);
     // KV cache is always bf16 (shared with the bf16 encoder + read as bf16 in

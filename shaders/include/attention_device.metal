@@ -18,8 +18,19 @@ struct LayerOffsets {
     uint head_dim;
     uint n_kv_heads;
     uint is_full;
-    uint _pad;
+    // KV slot mapping: 0 = linear (full layers); else pow2-1 ring mask
+    // (sliding layers, slot = pos & mask — only the last window-1 + canvas
+    // positions are live, so the ring never aliases a readable key).
+    uint kv_ring_mask;
 };
+
+/// Absolute KV position -> slot index within the layer's region.
+inline uint kv_slot_of(constant LayerOffsets *L, uint pos) {
+    return (L->kv_ring_mask != 0u) ? (pos & L->kv_ring_mask) : pos;
+}
+inline uint kv_slot_of(device const LayerOffsets *L, uint pos) {
+    return (L->kv_ring_mask != 0u) ? (pos & L->kv_ring_mask) : pos;
+}
 
 struct AttnDims {
     uint canvas;
