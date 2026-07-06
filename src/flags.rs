@@ -171,6 +171,17 @@ pub fn encoder_gpu_moe_enabled() -> bool {
     on_unless_zero("DGQ_ENCODER_GPU_MOE")
 }
 
+/// Cross-turn KV reuse in chat (`DGQ_KV_REUSE=0` disables): keep the causal KV
+/// for the longest common prefix of the prior sequence and the new prompt, and
+/// prefill only the delta at that offset. Big multi-turn win (turn N no longer
+/// re-prefills the whole conversation history). NOT byte-identical to a full
+/// re-prefill (the reused prefix and the engine-prefilled delta can differ in
+/// precision from a single fast prefill of the whole prompt) but quality-
+/// equivalent — same class as the fast-vs-engine prefill approximation.
+pub fn kv_reuse_enabled() -> bool {
+    on_unless_zero("DGQ_KV_REUSE")
+}
+
 /// Buffer-resident engine prefill (merged batches, no CPU round-trips).
 /// `DGQ_PREFILL_RESIDENT=0` restores the legacy per-batch readback path.
 pub fn prefill_resident_enabled() -> bool {

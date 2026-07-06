@@ -194,6 +194,11 @@ fn step_answer_text(
     (region_end, text)
 }
 
+/// Longest common prefix length (in tokens) of two id slices.
+fn longest_common_prefix(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+}
+
 /// Reusable monolithic runtime across prompts (M4.3).
 pub struct StepGenerateSession {
     rt: StepRuntime,
@@ -201,6 +206,10 @@ pub struct StepGenerateSession {
     layers: usize,
     encoder: Option<MonolithicEncoderCache>,
     step_text_tokenizer: Option<Tokenizer>,
+    /// Token sequence whose *causal* KV is currently valid in `rt` (== the KV
+    /// length). Cross-turn reuse prefills only the delta past the common prefix
+    /// of this and the next prompt. Cleared by `reset_kv`.
+    kv_valid_tokens: Vec<u32>,
 }
 
 impl StepGenerateSession {
@@ -224,6 +233,7 @@ impl StepGenerateSession {
                 layers,
                 encoder: None,
                 step_text_tokenizer: None,
+                kv_valid_tokens: Vec::new(),
             },
             build.compile,
         ))
@@ -231,9 +241,10 @@ impl StepGenerateSession {
 
     /// Drop the prefilled KV so the next `generate_with_session` re-prefills from
     /// scratch. Use for *independent* prompts (smoketest); chat relies on the
-    /// KV-reuse continuation path instead.
+    /// cross-turn KV-reuse continuation path instead.
     pub fn reset_kv(&mut self) {
         self.rt.set_kv_len(0);
+        self.kv_valid_tokens.clear();
     }
 }
 
@@ -283,15 +294,52 @@ pub fn generate_with_session(
 
     let prefill_started = Instant::now();
     let existing_kv = rt.read_params().kv_len as usize;
-    let (kv_len, prefill_timing, prefill_elapsed) = if existing_kv >= prompt_token_ids.len()
-        && existing_kv > 0
-    {
+    let n_prompt = prompt_token_ids.len();
+    // Cross-turn KV reuse: the session's `kv_valid_tokens` are already causal in
+    // the KV. Reuse the longest common prefix (capped at what the runtime
+    // actually holds) and prefill only the delta at that offset.
+    let reuse = if crate::flags::kv_reuse_enabled() {
+        longest_common_prefix(&session.kv_valid_tokens, prompt_token_ids).min(existing_kv)
+    } else {
+        0
+    };
+    let (kv_len, prefill_timing, prefill_elapsed) = if existing_kv >= n_prompt && existing_kv > 0 {
+        // Whole prompt already prefilled (session-open prefill, or full reuse).
         if progress_enabled() { eprintln!("step-generate: using step-kernel prefill kv_len={existing_kv}"); }
         (
-            existing_kv,
+            existing_kv.min(n_prompt),
             MonolithicPrefillTiming::default(),
             Duration::ZERO,
         )
+    } else if reuse > 0 {
+        // Keep KV[0..reuse] (causally valid), prefill the delta [reuse..] at
+        // that offset via the engine causal path (same as multi-block extend).
+        if session.encoder.is_none() {
+            session.encoder = Some(MonolithicEncoderCache::open_opt(
+                model_dir,
+                canvas_len,
+                cfg.max_seq,
+                Some(std::sync::Arc::clone(&shared_blob)),
+            )?);
+        }
+        let encoder = session.encoder.as_mut().expect("encoder cache");
+        let kv_len = extend_monolithic_kv_with_cache(
+            encoder,
+            rt.kvcache(),
+            rt.layout(),
+            reuse,
+            &prompt_token_ids[reuse..],
+            cfg.max_seq,
+            layers,
+        )?;
+        let prefill_elapsed = prefill_started.elapsed();
+        if progress_enabled() {
+            eprintln!(
+                "step-generate: cross-turn KV reuse: kept {reuse}/{n_prompt}, prefilled {} delta tokens ({prefill_elapsed:.2?})",
+                n_prompt - reuse
+            );
+        }
+        (kv_len, MonolithicPrefillTiming::default(), prefill_elapsed)
     } else if crate::metal::step_kernel::should_fast_prefill(prompt_token_ids.len()) {
         // Fast monolithic prefill: quantized + causal forward over prompt chunks,
         // writing the b4 KV directly (no f32 engine, no pack conversion).
@@ -332,6 +380,10 @@ pub fn generate_with_session(
         let prefill_elapsed = prefill_started.elapsed();
         (kv_len, prefill_timing, prefill_elapsed)
     };
+    // Canvas denoise writes at [kv_len..kv_len+CANVAS]; ensure the runtime's
+    // kv_len is exactly the prompt length (the reuse/extend paths update KV but
+    // not params; a full-reuse KV may also hold stale tokens past the prompt).
+    rt.set_kv_len(kv_len as u32);
     if progress_enabled() && prefill_elapsed > Duration::ZERO {
         eprintln!(
             "step-generate: prefilled kv_len={kv_len} ({prefill_elapsed:.2?}, gpu_forward={:.1}ms kv_pack={:.1}ms)",
@@ -692,6 +744,14 @@ pub fn generate_with_session(
             agg.gpu_readback_bytes as f64 / 1024.0 / n
         );
     }
+
+    // Record the tokens whose causal KV is now valid (== the runtime kv_len):
+    // the prompt plus any committed blocks that were causally extended. The
+    // final (last/stopped) block's canvas KV is bidirectional, so it is NOT
+    // counted — the next turn re-prefills it as prompt content. This is what
+    // the next turn's cross-turn reuse diffs against.
+    let valid_len = (rt.read_params().kv_len as usize).min(sequences.len());
+    session.kv_valid_tokens = sequences[..valid_len].to_vec();
 
     Ok(GenerateOutput {
         token_ids: sequences.clone(),
