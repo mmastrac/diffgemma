@@ -4020,14 +4020,30 @@ impl StepRuntime {
     /// is correct for prompts <= sliding_window (1024); longer prompts would need
     /// windowing on sliding layers (not yet implemented).
     pub fn prefill_chunks(&mut self, prompt_token_ids: &[u32]) -> Result<usize, Error> {
+        self.prefill_chunks_from(0, prompt_token_ids)
+    }
+
+    /// Fast (quantized, causal) prefill of `delta_token_ids` starting at KV
+    /// position `offset`. The delta chunks attend causally to the KV already
+    /// present at [0..offset] (e.g. the reused cross-turn prefix), so this
+    /// resumes a prefill without recomputing the prefix. Because each position's
+    /// KV is fixed by its causal context (independent of chunk grouping), the
+    /// result at [offset..] is identical to a full `prefill_chunks` of the whole
+    /// sequence when [0..offset] was itself fast-prefilled. Returns the new
+    /// kv_len (`offset + delta.len()`).
+    pub fn prefill_chunks_from(
+        &mut self,
+        offset: usize,
+        delta_token_ids: &[u32],
+    ) -> Result<usize, Error> {
         let layout = self.layout;
         let layers = self.layers;
-        let n = prompt_token_ids.len();
-        let mut pos = 0usize;
+        let n = offset + delta_token_ids.len();
+        let mut pos = offset;
         while pos < n {
             let chunk_len = (n - pos).min(CANVAS);
             let mut ids = [0u32; CANVAS];
-            ids[..chunk_len].copy_from_slice(&prompt_token_ids[pos..pos + chunk_len]);
+            ids[..chunk_len].copy_from_slice(&delta_token_ids[pos - offset..pos - offset + chunk_len]);
             self.set_canvas_ids(&ids)?;
             self.set_kv_len(pos as u32);
             self.dispatch_and_wait(|enc| enc.encode_prefill_chunk(&layout, layers))?;

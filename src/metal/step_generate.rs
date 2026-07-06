@@ -312,30 +312,14 @@ pub fn generate_with_session(
             Duration::ZERO,
         )
     } else if reuse > 0 {
-        // Keep KV[0..reuse] (causally valid), prefill the delta [reuse..] at
-        // that offset via the engine causal path (same as multi-block extend).
-        if session.encoder.is_none() {
-            session.encoder = Some(MonolithicEncoderCache::open_opt(
-                model_dir,
-                canvas_len,
-                cfg.max_seq,
-                Some(std::sync::Arc::clone(&shared_blob)),
-            )?);
-        }
-        let encoder = session.encoder.as_mut().expect("encoder cache");
-        let kv_len = extend_monolithic_kv_with_cache(
-            encoder,
-            rt.kvcache(),
-            rt.layout(),
-            reuse,
-            &prompt_token_ids[reuse..],
-            cfg.max_seq,
-            layers,
-        )?;
+        // Keep KV[0..reuse] (causally valid), fast-prefill the delta [reuse..]
+        // at that offset. The delta chunks attend causally to the reused KV, so
+        // this resumes the prefill without the engine's ~1.3s fixed sync cost.
+        let kv_len = rt.prefill_chunks_from(reuse, &prompt_token_ids[reuse..])?;
         let prefill_elapsed = prefill_started.elapsed();
         if progress_enabled() {
             eprintln!(
-                "step-generate: cross-turn KV reuse: kept {reuse}/{n_prompt}, prefilled {} delta tokens ({prefill_elapsed:.2?})",
+                "step-generate: cross-turn KV reuse: kept {reuse}/{n_prompt}, fast-prefilled {} delta tokens ({prefill_elapsed:.2?})",
                 n_prompt - reuse
             );
         }
