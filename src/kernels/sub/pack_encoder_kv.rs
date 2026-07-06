@@ -15,6 +15,16 @@ pub fn pipeline_for(
     ctx.compile_subkernel(SHADER, ENTRY, variant)
 }
 
+/// q8-KV variant (function constant 4): grid depth = head_dim/32 groups.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn pipeline_q8_for(
+    ctx: &crate::metal::device::MetalContext,
+    variant: KernelVariant,
+) -> Result<crate::metal::device::ComputePipeline, Error> {
+    let bools = [crate::kernels::sub::variant::FcBool { index: 4, value: true }];
+    ctx.compile_subkernel_ex(SHADER, ENTRY, variant, "kvq8", &bools, &[])
+}
+
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use objc2::runtime::ProtocolObject;
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -51,13 +61,15 @@ pub fn dispatch_shape(
     token_count: usize,
     nkv: usize,
     hd: usize,
+    kv_q8: bool,
 ) -> (objc2_metal::MTLSize, objc2_metal::MTLSize) {
     use objc2_metal::MTLSize;
     (
         MTLSize {
             width: token_count,
             height: nkv,
-            depth: hd,
+            // q8: one thread per 32-group (quantizes K + V); f16: per element.
+            depth: if kv_q8 { hd / 32 } else { hd },
         },
         MTLSize {
             width: 1,

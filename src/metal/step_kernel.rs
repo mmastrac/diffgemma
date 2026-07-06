@@ -481,6 +481,10 @@ pub fn layer_kv_slots(is_full: bool, max_seq: usize) -> usize {
 }
 
 pub fn build_layout(offsets: &HashMap<String, u64>, max_seq: usize) -> ModelLayout {
+    // KV storage format is a per-session decision keyed off max_seq (plus the
+    // DGQ_KV_Q8 override) — every sizing/pack/kernel site derives it the same
+    // way so the layout stays coherent.
+    let kv_q8 = crate::flags::kv_q8(max_seq);
     let g = |n: &str| *offsets.get(n).unwrap_or_else(|| panic!("missing tensor {n}"));
     let opt = |n: &str| offsets.get(n).copied().unwrap_or(0);
     let mut layers = [LayerOffsets::default(); N_LAYERS];
@@ -519,7 +523,7 @@ pub fn build_layout(offsets: &HashMap<String, u64>, max_seq: usize) -> ModelLayo
             is_full: full as u32,
             kv_ring_mask: if full { 0 } else { (slots - 1) as u32 },
         };
-        kv_off += (slots as u64) * (nkv as u64) * (hd as u64) * 2 * 2;
+        kv_off += crate::metal::step_kv::kv_region_bytes(nkv, hd, slots, kv_q8);
     }
     ModelLayout {
         embed: g("model.decoder.embed_tokens.weight"),
@@ -724,7 +728,11 @@ struct StepPipelines {
 }
 
 impl StepPipelines {
-    fn new(ctx: &MetalContext, variant: crate::kernels::sub::variant::KernelVariant) -> Result<Self, Error> {
+    fn new(
+        ctx: &MetalContext,
+        variant: crate::kernels::sub::variant::KernelVariant,
+        kv_q8: bool,
+    ) -> Result<Self, Error> {
         let mut gemm_q4 = HashMap::new();
         let mut gemm_tunable_raw = HashMap::new();
         let mut gemm_tunable_q8 = HashMap::new();
@@ -1048,10 +1056,12 @@ impl StepPipelines {
             gemm_q8_rowk_acc_f32,
             gemm_bf16_rowk_acc_f32,
             f32_to_half_scale,
-            qk_rope_kv: crate::kernels::sub::qk_rope_kv::pipeline_for(ctx, prod)?,
-            attention: crate::kernels::sub::attention::pipeline_for(ctx, prod)?,
-            attention_mma2: crate::kernels::sub::attention::pipeline_mma2_for(ctx, prod)?,
-            attention_mma_full: crate::kernels::sub::attention::pipeline_mma_full_for(ctx, prod)?,
+            qk_rope_kv: crate::kernels::sub::qk_rope_kv::pipeline_for_kv(ctx, prod, kv_q8)?,
+            attention: crate::kernels::sub::attention::pipeline_for_kv(ctx, prod, kv_q8)?,
+            attention_mma2: crate::kernels::sub::attention::pipeline_mma2_for_kv(ctx, prod, kv_q8)?,
+            attention_mma_full: crate::kernels::sub::attention::pipeline_mma_full_for_kv(
+                ctx, prod, kv_q8,
+            )?,
             residual: crate::kernels::sub::residual_half::pipeline_for(ctx, prod)?,
             glu: crate::kernels::sub::swiglu::pipeline_for(
                 ctx,
@@ -4528,17 +4538,21 @@ static STEP_PIPELINES_CACHE: std::sync::OnceLock<
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct StepPipelineKey(u8);
 
-fn step_pipeline_key(variant: crate::kernels::sub::variant::KernelVariant) -> StepPipelineKey {
+fn step_pipeline_key(
+    variant: crate::kernels::sub::variant::KernelVariant,
+    kv_q8: bool,
+) -> StepPipelineKey {
     StepPipelineKey(
         u8::from(variant.shape_assert)
             | (u8::from(variant.debug_fast) << 1)
-            | (u8::from(variant.debug_deep) << 2),
+            | (u8::from(variant.debug_deep) << 2)
+            | (u8::from(kv_q8) << 3),
     )
 }
 
-fn shared_step_pipelines(ctx: &MetalContext) -> Result<&'static StepPipelines, Error> {
+fn shared_step_pipelines(ctx: &MetalContext, kv_q8: bool) -> Result<&'static StepPipelines, Error> {
     let variant = crate::kernels::sub::variant::runtime_step_variant();
-    let key = step_pipeline_key(variant);
+    let key = step_pipeline_key(variant, kv_q8);
     let cache = STEP_PIPELINES_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let mut guard = cache
         .lock()
@@ -4548,7 +4562,7 @@ fn shared_step_pipelines(ctx: &MetalContext) -> Result<&'static StepPipelines, E
     }
 
     ctx.compile_library(STEP_SHADER)?;
-    let pipelines = StepPipelines::new(ctx, variant)?;
+    let pipelines = StepPipelines::new(ctx, variant, kv_q8)?;
     let leaked: &'static StepPipelines = Box::leak(Box::new(pipelines));
     guard.insert(key, leaked);
     crate::metal::pipeline_cache::PipelineArchiveCache::flush_global();
@@ -4662,7 +4676,8 @@ pub fn build_step_runtime(
 
     let ctx = MetalContext::new()?;
     let compile_started = Instant::now();
-    let pipelines = shared_step_pipelines(&ctx)?;
+    let kv_q8 = crate::flags::kv_q8(cfg.max_seq);
+    let pipelines = shared_step_pipelines(&ctx, kv_q8)?;
     let compile = compile_started.elapsed();
 
     let gpu_blob = DgqGpuBlob::from_store(&store, &ctx.device)?;

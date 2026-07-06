@@ -182,6 +182,24 @@ pub fn kv_reuse_enabled() -> bool {
     on_unless_zero("DGQ_KV_REUSE")
 }
 
+/// q8 KV cache storage (`DGQ_KV_Q8=1` opts in; DEFAULT OFF). Group-32
+/// symmetric i8 + f16 scales (0.92% rel-RMS on real KV), halves KV memory.
+/// DISPROVEN AS A SPEED LEVER 2026-07-06: at 33k tokens q8 is prefill +9% /
+/// denoise +54% vs f16 even with vectorized group dequant — the f16
+/// direct-load kernels are ISSUE-bound at SLC-served ~171 GB/s effective,
+/// not byte-starved, so halving bytes while adding a dequant staging pass
+/// (tgmem round-trip + 4 tg barriers/key-tile) loses. Same physics rules out
+/// rotated lower-bit KV (TurboQuant-class) as a speed lever here. Use ONLY
+/// when KV memory itself binds (e.g. ~262k ctx: f16 5.3 GiB -> q8 2.8).
+/// Quality: forced-q8 gate aggregate 45/51 = baseline (reshuffle-neutral);
+/// 33k needle retrieval exact. The format is fixed per session at open;
+/// every KV writer/reader compiles a matching function-constant variant.
+pub fn kv_q8(max_seq: usize) -> bool {
+    let _ = max_seq;
+    static FORCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCE.get_or_init(|| on_if_one("DGQ_KV_Q8"))
+}
+
 /// KV block size for sequential-block full-attention (`DGQ_ATTN_KV_BLOCK=
 /// <keys>`; DEFAULT 0 = OFF). When on and kv_len+canvas exceeds the block,
 /// full-attention layers run as in-order dispatches over block-sized key

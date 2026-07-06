@@ -51,8 +51,18 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 use std::path::Path;
 
-pub fn kv_region_bytes(n_kv_heads: u32, head_dim: u32, slots: usize) -> u64 {
-    (slots as u64) * (n_kv_heads as u64) * (head_dim as u64) * 2 * 2
+/// Bytes of one (slot, head, K-or-V) row. q8: hd i8 + hd/32 f16 group scales;
+/// f16: hd halfs. MUST match attention_device.metal `kv_row_bytes`.
+pub fn kv_row_bytes(head_dim: u32, kv_q8: bool) -> u64 {
+    if kv_q8 {
+        head_dim as u64 + (head_dim as u64 / 32) * 2
+    } else {
+        head_dim as u64 * 2
+    }
+}
+
+pub fn kv_region_bytes(n_kv_heads: u32, head_dim: u32, slots: usize, kv_q8: bool) -> u64 {
+    (slots as u64) * (n_kv_heads as u64) * 2 * kv_row_bytes(head_dim, kv_q8)
 }
 
 /// Per-layer KV slots — MUST agree with `build_layout`'s region offsets: full
@@ -73,10 +83,11 @@ fn kv_slot(l: &crate::metal::step_kernel::LayerOffsets, pos: usize) -> usize {
 }
 
 pub fn kv_cache_total_bytes(layout: &ModelLayout, max_seq: usize) -> u64 {
+    let kv_q8 = crate::flags::kv_q8(max_seq);
     (0..N_LAYERS)
         .map(|i| {
             let l = &layout.layers[i];
-            kv_region_bytes(l.n_kv_heads, l.head_dim, layer_slots(l, max_seq))
+            kv_region_bytes(l.n_kv_heads, l.head_dim, layer_slots(l, max_seq), kv_q8)
         })
         .sum()
 }
@@ -101,28 +112,61 @@ pub fn pack_kv_cache_to_monolithic(
         }
         let nkv = l.n_kv_heads as usize;
         let hd = l.head_dim as usize;
-        let token_stride = nkv * hd * 2;
+        let kv_q8 = crate::flags::kv_q8(max_seq);
+        let row_b = kv_row_bytes(l.head_dim, kv_q8) as usize;
+        let slot_stride_b = 2 * nkv * row_b;
         let byte_base = l.kv_region as usize;
-        if byte_base + layer_slots(l, max_seq) * token_stride * 2 > dst.len() {
+        if byte_base + layer_slots(l, max_seq) * slot_stride_b > dst.len() {
             return Err(Error::Format("monolithic kv buffer too small"));
         }
         let per_token = nkv * hd;
         for pos in 0..kv.kv_len {
-            let slot_base = byte_base / 2 + kv_slot(l, pos) * token_stride;
+            let slot_b = byte_base + kv_slot(l, pos) * slot_stride_b;
             for hh in 0..nkv {
-                for d in 0..hd {
-                    let src_i = pos * per_token + hh * hd + d;
-                    let k_bits = f32_to_f16_bits(kv_layer.keys[src_i]);
-                    let v_bits = f32_to_f16_bits(kv_layer.values[src_i]);
-                    let k_dst = (slot_base + hh * hd + d) * 2;
-                    let v_dst = (slot_base + nkv * hd + hh * hd + d) * 2;
-                    dst[k_dst..k_dst + 2].copy_from_slice(&k_bits.to_le_bytes());
-                    dst[v_dst..v_dst + 2].copy_from_slice(&v_bits.to_le_bytes());
+                let ksrc = pos * per_token + hh * hd;
+                if kv_q8 {
+                    kv_q8_pack_row(&mut dst[slot_b + hh * row_b..], &kv_layer.keys[ksrc..ksrc + hd]);
+                    kv_q8_pack_row(
+                        &mut dst[slot_b + (nkv + hh) * row_b..],
+                        &kv_layer.values[ksrc..ksrc + hd],
+                    );
+                } else {
+                    for d in 0..hd {
+                        let k_bits = f32_to_f16_bits(kv_layer.keys[ksrc + d]);
+                        let v_bits = f32_to_f16_bits(kv_layer.values[ksrc + d]);
+                        let k_dst = slot_b + hh * row_b + d * 2;
+                        let v_dst = slot_b + (nkv + hh) * row_b + d * 2;
+                        dst[k_dst..k_dst + 2].copy_from_slice(&k_bits.to_le_bytes());
+                        dst[v_dst..v_dst + 2].copy_from_slice(&v_bits.to_le_bytes());
+                    }
                 }
             }
         }
     }
     Ok(())
+}
+
+/// Quantize one head-vector into a q8 row (group-32 symmetric; mirrors the
+/// Metal `kv_q8_store_group` bit-for-bit: f16-rounded scale, round-half-even).
+fn kv_q8_pack_row(row: &mut [u8], src: &[f32]) {
+    let hd = src.len();
+    for g in 0..hd / 32 {
+        let grp = &src[g * 32..g * 32 + 32];
+        let mx = grp.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+        let scale_bits = f32_to_f16_bits((mx / 127.0).max(1e-8));
+        let sf = f16_bits_to_f32(scale_bits);
+        row[hd + g * 2..hd + g * 2 + 2].copy_from_slice(&scale_bits.to_le_bytes());
+        for j in 0..32 {
+            let q = (grp[j] / sf).round_ties_even().clamp(-127.0, 127.0);
+            row[g * 32 + j] = (q as i8) as u8;
+        }
+    }
+}
+
+/// Dequantize one element of a q8 row (inverse of `kv_q8_pack_row`).
+fn kv_q8_read(row: &[u8], d: usize, hd: usize) -> f32 {
+    let s = f16_bits_to_f32(u16::from_le_bytes([row[hd + (d / 32) * 2], row[hd + (d / 32) * 2 + 1]]));
+    (row[d] as i8) as f32 * s
 }
 
 pub fn write_monolithic_kv_buffer(
@@ -143,6 +187,8 @@ pub fn write_monolithic_kv_buffer(
 }
 
 /// Read monolithic b4 KV prefix into CPU `KvCache` (inverse of `pack_kv_cache_to_monolithic`).
+/// f16 sessions only (parity tooling; q8 sessions would need group dequant — all
+/// current callers are small-max_seq harnesses).
 pub fn read_monolithic_kv_prefix_to_cpu_cache(
     buf: &ProtocolObject<dyn MTLBuffer>,
     layout: &ModelLayout,
@@ -258,11 +304,16 @@ fn pack_gpu_kv_prefix_to_monolithic(
     layers: usize,
     dst_pos: usize,
     src_pos: usize,
+    kv_q8: bool,
 ) -> Result<(), Error> {
     use crate::kernels::sub::pack_encoder_kv;
     use crate::metal::batch::begin_engine_batch;
 
-    let pack_pipeline = engine.kernels.pack_encoder_kv.pipeline.clone();
+    let pack_pipeline = if kv_q8 {
+        engine.kernels.pack_encoder_kv_q8.pipeline.clone()
+    } else {
+        engine.kernels.pack_encoder_kv.pipeline.clone()
+    };
     let telemetry = engine.batch_telemetry();
     let batch = begin_engine_batch(
         &engine.ctx.queue,
@@ -275,7 +326,7 @@ fn pack_gpu_kv_prefix_to_monolithic(
         let nkv = l.n_kv_heads as usize;
         let hd = l.head_dim as usize;
         let (k_buf, v_buf) = gpu_kv.layer_buffers(layer)?;
-        let (grid, tg) = pack_encoder_kv::dispatch_shape(token_count, nkv, hd);
+        let (grid, tg) = pack_encoder_kv::dispatch_shape(token_count, nkv, hd, kv_q8);
         batch.dispatch_with_grid(
             &pack_pipeline,
             grid,
@@ -462,6 +513,7 @@ pub fn prefill_monolithic_kv_with_cache_timed(
         layers,
         0,
         0,
+        crate::flags::kv_q8(max_seq),
     )?;
     let kv_pack_ms = pack_started.elapsed().as_secs_f64() * 1000.0;
     let timing = MonolithicPrefillTiming {
@@ -649,6 +701,7 @@ pub fn extend_monolithic_kv_with_cache(
         layers,
         kv_len_before,
         kv_len_before,
+        crate::flags::kv_q8(max_seq),
     )?;
     Ok(new_kv_len)
 }

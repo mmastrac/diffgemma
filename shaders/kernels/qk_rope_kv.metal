@@ -7,6 +7,11 @@ using namespace metal;
 #include "attention_device.metal"
 #include "sampler_device.metal"
 
+// Session-wide KV storage format: q8 (group-32) for long-context sessions,
+// f16 otherwise. Unset (oracle/test compiles) = f16.
+constant bool KV_Q8_FC [[function_constant(4)]];
+constant bool KV_Q8 = is_function_constant_defined(KV_Q8_FC) ? KV_Q8_FC : false;
+
 /// Per-head Q/K RMSNorm + split-half RoPE + KV cache write (monolith step path).
 kernel void qk_rope_kv(
     device ushort *q [[buffer(0)]],
@@ -66,10 +71,17 @@ kernel void qk_rope_kv(
         }
         if (isK) {
             // RoPE uses the ABSOLUTE pos; only the storage slot is ring-mapped.
-            device ushort *dst = kvcache + L->kv_region / 2
-                + (ulong)kv_slot_of(L, pos) * nkv * hd * 2u + hh * hd;
-            for (uint i = 0u; i < hd; ++i) {
-                kv_store(dst, i, head[i]);  // KV cache is f16 (see kv_store)
+            if (KV_Q8) {
+                device uchar *row = (device uchar *)kvcache + L->kv_region
+                    + (ulong)kv_slot_of(L, pos) * kv_slot_stride_bytes(nkv, hd, true)
+                    + hh * kv_row_bytes(hd, true);
+                kv_q8_store_row(row, head, hd);
+            } else {
+                device ushort *dst = kvcache + L->kv_region / 2
+                    + (ulong)kv_slot_of(L, pos) * nkv * hd * 2u + hh * hd;
+                for (uint i = 0u; i < hd; ++i) {
+                    kv_store(dst, i, head[i]);  // KV cache is f16 (see kv_store)
+                }
             }
             if (L->v_proj != 0ul) {
                 for (uint i = 0u; i < hd; ++i) {
@@ -82,10 +94,21 @@ kernel void qk_rope_kv(
             }
         }
     } else {
-        device ushort *dst = kvcache + L->kv_region / 2
-            + (ulong)kv_slot_of(L, pos) * nkv * hd * 2u + (ulong)nkv * hd + hh * hd;
-        for (uint i = 0u; i < hd; ++i) {
-            kv_store(dst, i, arena_load(src, i) * inv);  // KV cache is f16
+        if (KV_Q8) {
+            float head[512];
+            for (uint i = 0u; i < hd; ++i) {
+                head[i] = arena_load(src, i) * inv;
+            }
+            device uchar *row = (device uchar *)kvcache + L->kv_region
+                + (ulong)kv_slot_of(L, pos) * kv_slot_stride_bytes(nkv, hd, true)
+                + ((ulong)nkv + hh) * kv_row_bytes(hd, true);
+            kv_q8_store_row(row, head, hd);
+        } else {
+            device ushort *dst = kvcache + L->kv_region / 2
+                + (ulong)kv_slot_of(L, pos) * nkv * hd * 2u + (ulong)nkv * hd + hh * hd;
+            for (uint i = 0u; i < hd; ++i) {
+                kv_store(dst, i, arena_load(src, i) * inv);  // KV cache is f16
+            }
         }
     }
 }

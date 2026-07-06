@@ -8,6 +8,11 @@ using namespace metal;
 #include "arena.metal"
 #include "sampler_device.metal"
 
+// Session-wide KV storage format: q8 (group-32) for long-context sessions,
+// f16 otherwise. Unset (oracle/test compiles) = f16.
+constant bool KV_Q8_FC [[function_constant(4)]];
+constant bool KV_Q8 = is_function_constant_defined(KV_Q8_FC) ? KV_Q8_FC : false;
+
 /// Canvas queries attend all KV positions 0..kv_len+canvas-1 (no causal mask)
 /// when dims.causal==0 (denoise). When dims.causal!=0 (prefill), query at absolute
 /// position kv_len+tok attends only [0..kv_len+tok] (causal); window<=1024 so for
@@ -73,12 +78,17 @@ kernel void attention(
     for (uint i = 0u; i < per; ++i) {
         acc[i] = 0.f;
     }
+    device const uchar *base_b = (device const uchar *)kvcache + L->kv_region;
+    const ulong q8_stride = kv_slot_stride_bytes(nkv, hd, true);
+    const ulong q8_row = kv_row_bytes(hd, true);
     for (uint t = t_lo; t < T; ++t) {
         const uint ts = kv_slot_of(L, t);
         device const ushort *kk = base + (ulong)ts * nkv * hd * 2u + kvh * hd;
+        device const uchar *krow = base_b + (ulong)ts * q8_stride + kvh * q8_row;
         float d = 0.f;
         for (uint i = ltid; i < hd; i += tpg_w) {
-            d += arena_load(qv, i) * kv_load(kk, i);  // K from f16 KV cache
+            const float kvv = KV_Q8 ? kv_q8_load(krow, i, hd) : kv_load(kk, i);
+            d += arena_load(qv, i) * kvv;
         }
         d = simd_sum(d);
         const uint sg = ltid / 32u;
@@ -96,10 +106,12 @@ kernel void attention(
         l = l * corr + p;
         m = mn;
         device const ushort *vv = base + (ulong)ts * nkv * hd * 2u + (ulong)nkv * hd + kvh * hd;
+        device const uchar *vrow = base_b + (ulong)ts * q8_stride + ((ulong)nkv + kvh) * q8_row;
         for (uint i = 0u; i < per; ++i) {
             uint idx = ltid + i * tpg_w;
             if (idx < hd) {
-                acc[i] = acc[i] * corr + p * kv_load(vv, idx);  // V from f16 KV cache
+                const float vval = KV_Q8 ? kv_q8_load(vrow, idx, hd) : kv_load(vv, idx);
+                acc[i] = acc[i] * corr + p * vval;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

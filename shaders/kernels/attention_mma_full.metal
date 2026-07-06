@@ -35,6 +35,12 @@ constant uint MT = 8u;          // query rows per tile
 constant uint QG = 2u;          // simdgroups per tg = d-halves (tg width 64)
 constant uint NCH_H = NCH / QG; // chunks per d-half (32)
 
+// Session-wide KV storage format: q8 (group-32) for long-context sessions,
+// f16 otherwise. Unset (oracle/test compiles) = f16. The q8 path stages
+// dequantized half tiles through tgmem (simdgroup_load can't read i8).
+constant bool KV_Q8_FC [[function_constant(4)]];
+constant bool KV_Q8 = is_function_constant_defined(KV_Q8_FC) ? KV_Q8_FC : false;
+
 kernel void attention_mma_full(
     device const ushort *q [[buffer(0)]],
     device const ushort *kvcache [[buffer(1)]],
@@ -98,6 +104,9 @@ kernel void attention_mma_full(
 
     // Q tile, shared by both d-halves (staged once).
     threadgroup half qs[MT][HD];        // 8 KiB
+    // q8 path only: dequantized K (then V) tile, blocked 8x8 (8 KiB;
+    // dead-stripped from f16 pipelines).
+    threadgroup half kq8[NCH][8][8];
     threadgroup float st[QG][MT][8];    // per-half partial QK scores
     threadgroup half ph[MT][8];         // softmax probs (shared)
     threadgroup float pvt[QG][MT][8];   // P.V chunk per half
@@ -144,16 +153,37 @@ kernel void attention_mma_full(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    device const uchar *kvb = (device const uchar *)kvcache + L->kv_region;
+    const ulong q8_stride = kv_slot_stride_bytes(nkv, hd, true);
+    const ulong q8_row = kv_row_bytes(hd, true);
+
     const uint t_stop = min(T_eff, blk.t_end);
     for (uint t0 = blk.t_begin; t0 < t_stop; t0 += 8u) {
-        // ---- partial S = Q . K^T over THIS half's chunks (direct device K) ----
+        // ---- partial S = Q . K^T over THIS half's chunks ----
         device const half *kb = kv16 + (ulong)t0 * kstride + kvh * hd;
+        if (KV_Q8) {
+            // Dequantize the full K tile into tgmem: one (key, 32-group) per
+            // work item, vectorized (2 items/lane at HD=512).
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint i = lid.x; i < 8u * (HD / 32u); i += nlanes) {
+                const uint key = i >> 4u;      // / (HD/32 = 16)
+                const uint g = i & 15u;
+                device const uchar *row =
+                    kvb + (ulong)(t0 + key) * q8_stride + kvh * q8_row;
+                kv_q8_dequant_group_blocked(row, g, HD, key, &kq8[0][0][0]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
         simdgroup_float8x8 sacc(0.f);
         for (uint c = 0u; c < NCH_H; ++c) {
             uint kd = dlo + c * 8u;
             simdgroup_half8x8 a, b;
             simdgroup_load(a, &qs[0][kd], HD);
-            simdgroup_load(b, kb + kd, kstride, ulong2(0, 0), true);  // -> b[d][key]
+            if (KV_Q8) {
+                simdgroup_load(b, &kq8[kd / 8u][0][0], 8, ulong2(0, 0), true);
+            } else {
+                simdgroup_load(b, kb + kd, kstride, ulong2(0, 0), true);  // -> b[d][key]
+            }
             simdgroup_multiply_accumulate(sacc, a, b, sacc);
         }
         simdgroup_store(sacc, &st[sg][0][0], 8);
@@ -190,14 +220,30 @@ kernel void attention_mma_full(
         const float cr0 = corr[r0];
         const float cr1 = corr[r1];
 
-        // ---- O = O*corr + P . V over THIS half's chunks (direct device V) ----
+        // ---- O = O*corr + P . V over THIS half's chunks ----
         device const half *vb = kv16 + (ulong)t0 * kstride + (ulong)nkv * hd + kvh * hd;
+        if (KV_Q8) {
+            // Both halves are done with K; reuse kq8 for the V tile.
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint i = lid.x; i < 8u * (HD / 32u); i += nlanes) {
+                const uint key = i >> 4u;
+                const uint g = i & 15u;
+                device const uchar *row = kvb + (ulong)(t0 + key) * q8_stride
+                    + ((ulong)nkv + kvh) * q8_row;
+                kv_q8_dequant_group_blocked(row, g, HD, key, &kq8[0][0][0]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
         for (uint c = 0u; c < NCH_H; ++c) {
             uint kd = dlo + c * 8u;
             simdgroup_float8x8 pvacc(0.f);
             simdgroup_half8x8 a, b;
             simdgroup_load(a, &ph[0][0], 8);       // P[row][key]
-            simdgroup_load(b, vb + kd, kstride);   // V[key][d]
+            if (KV_Q8) {
+                simdgroup_load(b, &kq8[kd / 8u][0][0], 8);
+            } else {
+                simdgroup_load(b, vb + kd, kstride);   // V[key][d]
+            }
             simdgroup_multiply_accumulate(pvacc, a, b, pvacc);
             simdgroup_store(pvacc, &pvt[sg][0][0], 8);
             simdgroup_barrier(mem_flags::mem_threadgroup);

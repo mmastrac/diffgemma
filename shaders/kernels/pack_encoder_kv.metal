@@ -4,6 +4,15 @@ using namespace metal;
 #include "fc_axes.metal"
 #include "debug_status.metal"
 #include "arena.metal"
+#include "common.metal"
+#include "attention_device.metal"
+
+// Session-wide KV storage format (must match the attention kernels).
+// Unset (oracle/test compiles) = f16. Under q8 the grid's z axis is
+// head_dim/32 GROUPS (one thread quantizes a 32-group of K and of V);
+// under f16 it is head_dim elements.
+constant bool KV_Q8_FC [[function_constant(4)]];
+constant bool KV_Q8 = is_function_constant_defined(KV_Q8_FC) ? KV_Q8_FC : false;
 
 /// Pack engine f32 K/V prefix into monolithic b4 layer region (matches CPU pack layout).
 kernel void pack_encoder_kv(
@@ -31,12 +40,32 @@ kernel void pack_encoder_kv(
     }
     K_ELEMENTWISE_GUARD();
     const uint per_token = nkv * hd;
-    const uint src_i = (src_pos + pos) * per_token + hh * hd + d;
-    const uint token_stride = nkv * hd * 2u;
     // Sliding layers store KV in a power-of-two ring (slot = pos & mask);
     // full layers are linear (mask 0).
     const uint abs_pos = dst_pos + pos;
     const uint slot = (kv_ring_mask != 0u) ? (abs_pos & kv_ring_mask) : abs_pos;
+
+    if (KV_Q8) {
+        // gid.z = group index; quantize one 32-group of K and of V.
+        const uint g = d;
+        device uchar *slot_base = dst + kv_region_bytes
+            + ulong(slot) * kv_slot_stride_bytes(nkv, hd, true);
+        device uchar *krow = slot_base + hh * kv_row_bytes(hd, true);
+        device uchar *vrow = slot_base + ((ulong)nkv + hh) * kv_row_bytes(hd, true);
+        const uint src_base = (src_pos + pos) * per_token + hh * hd + g * KV_Q8_GROUP;
+        float kg[KV_Q8_GROUP];
+        float vg[KV_Q8_GROUP];
+        for (uint j = 0u; j < KV_Q8_GROUP; ++j) {
+            kg[j] = keys[src_base + j];
+            vg[j] = values[src_base + j];
+        }
+        kv_q8_store_group(krow, g, kg, hd);
+        kv_q8_store_group(vrow, g, vg, hd);
+        return;
+    }
+
+    const uint src_i = (src_pos + pos) * per_token + hh * hd + d;
+    const uint token_stride = nkv * hd * 2u;
     const ulong base_idx = kv_region_bytes / 2ul + ulong(slot) * ulong(token_stride);
     const ulong k_idx = base_idx + ulong(hh * hd + d);
     const ulong v_idx = base_idx + ulong(nkv * hd + hh * hd + d);
