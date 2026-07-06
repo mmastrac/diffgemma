@@ -23,7 +23,7 @@ kernel exist / merge / change dtype"; re-audit when a family gains members.
 | Bucket | ms | Rate vs roofline | Verdict |
 |---|---|---|---|
 | dense GEMMs (qkv / o_proj / FFN, `gemm_block*`) | ~380 | 1.8–2.3 TF/s ≈ our-kernel wall | ~1.5x headroom vs MPS/MLX (see correction above) |
-| attention (`attention_mma2` / `attention_mma_full`) | ~190 | attention-typical | tuned levers disproven; window-clipped ≥1024 |
+| attention (`attention_mma2` / `attention_mma_full`) | ~89 @kv64, ~372 @kv1024 (was ~212/~894) | 2.4–2.8x over prior | OCCUPANCY was the wall, not barriers/tuning (2026-07-06): mma2's 16 KiB tgmem O tile → 1 tg/core → kv-scaling latencies never overlapped. Fixes: mma2 O → registers (bit-identical, 2.7x); mma_full d-SPLIT across the 2 simdgroups (oreg 128→64/lane, ~10 KiB tgmem; QK needs a cross-half partial-sum → NOT bit-identical, gate-neutral 45/51, 1.6x). Full-tile K/V staging + fewer-barrier variants were TESTED AND SLOWER (wide-stride simdgroup_load + serial MMA chain); QG=1 mma_full also slower (register-bound, halved staging lanes). Window-clipped ≥1024 |
 | MoE experts (`gemm_block_sparse` + scatter) | ~315 | ~2.3 TF/s on USEFUL flops ≈ dense wall | at the wall; M-tile levers disproven (see below) |
 | SC preamble (`sc_sparse_*`, SC MLP q8, rowstats) | ~165 | occupancy/gather-bound | tiling levers disproven; NOT the vocab GEMM (sparse-SC active at default on bf16-embed; rowk chunked only runs with DGQ_SC_SPARSE=0) — rowk tunable port has NO production surface (2026-07-02) |
 | finish (lm_head `gemm_block` Raw, softcap, sampler) | ~150 | at flops bound | at the wall |

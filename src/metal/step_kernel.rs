@@ -3086,10 +3086,12 @@ impl StepEnc<'_> {
             }
         } else if use_mma_full {
             let group = STEP_NQ_HEADS / l.n_kv_heads as usize; // 8 for full
+            // One tg per (query tile, kv head, Q head); the QG simdgroups
+            // split head_dim, so depth is the full GQA group.
             MTLSize {
                 width: CANVAS.div_ceil(crate::kernels::sub::attention::MMA_M_TILE),
                 height: l.n_kv_heads as usize,
-                depth: group / crate::kernels::sub::attention::MMA_FULL_QG,
+                depth: group,
             }
         } else {
             MTLSize {

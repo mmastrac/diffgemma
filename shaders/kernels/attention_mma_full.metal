@@ -14,23 +14,26 @@ using namespace metal;
 // softmax, no 1/sqrt(d) — folded into QK-norm upstream); `attention` stays the
 // oracle.
 //
-// vs `attention_mma` (QG=1, 16 KiB tgmem O tile, no K/V sharing — ties scalar):
-//   (1) O accumulator is REGISTER-RESIDENT (oreg[2*NCH] per lane), not a tgmem
-//       tile — frees ~16 KiB tgmem, lifts concurrent-threadgroup occupancy.
-//   (2) QG simdgroups (one Q head each) share K/V staging per threadgroup, so
-//       each KV element is read from device once per QG heads (not once per
-//       head) — the bandwidth that grows with kv_len. Mirrors attention_mma2's
-//       group-sharing, but at hd=512 the per-head O can't live in tgmem, hence
-//       the register accumulator.
+// One threadgroup per (8-query tile, KV head, Q head); the two simdgroups
+// SPLIT head_dim (each owns a 256-wide half). vs the previous
+// two-heads-per-tg layout this halves the per-lane O register footprint
+// (oreg[64], the profile that made attention_mma2 4-7x scalar) and drops
+// threadgroup memory to ~10 KiB, so several threadgroups stay resident per
+// core and the per-chunk staging latencies — the term that grows with
+// kv_len — overlap across threadgroups. Q/K/V are still read from device
+// once per (tile, head): the halves partition d, they don't duplicate it.
+// The QK dot needs a cross-simdgroup partial-sum per key-tile (st[0]+st[1]);
+// PV/O run entirely simdgroup-local.
 //
-// hd is COMPILE-TIME (HD=512) so the head-dim chunk loops unroll and oreg stays
-// in registers. nkv / n_q_heads stay runtime (KV addressing only). Full layers
-// only — assert head_dim==512.
+// hd is COMPILE-TIME (HD=512) so the head-dim chunk loops unroll and oreg
+// stays in registers. nkv / n_q_heads stay runtime (KV addressing only).
+// Full layers only — assert head_dim==512.
 
-constant uint HD = 512u;       // full-layer head_dim (compile-time)
-constant uint NCH = HD / 8u;   // 64 head-dim chunks of 8
-constant uint MT = 8u;         // query rows per tile
-constant uint QG = 2u;         // Q heads (simdgroups) per threadgroup; share K/V
+constant uint HD = 512u;        // full-layer head_dim (compile-time)
+constant uint NCH = HD / 8u;    // 64 head-dim chunks of 8
+constant uint MT = 8u;          // query rows per tile
+constant uint QG = 2u;          // simdgroups per tg = d-halves (tg width 64)
+constant uint NCH_H = NCH / QG; // chunks per d-half (32)
 
 kernel void attention_mma_full(
     device const ushort *q [[buffer(0)]],
@@ -54,147 +57,150 @@ kernel void attention_mma_full(
 
     const uint group = dims.n_q_heads / nkv;   // 8 for full layers
     const uint kvh = tgid.y;                    // KV head
-    const uint sub = tgid.z;                    // sub-group of QG heads within this kvh
+    const uint sub = tgid.z;                    // Q head within this kvh's group
     const uint tok0 = tgid.x * MT;
     if (kvh >= nkv || tok0 >= dims.canvas) {
         return;
     }
-    const uint sg = lid.x / 32u;                // simdgroup index -> local head in [0,QG)
+    const uint sg = lid.x / 32u;                // simdgroup index -> d-half
     const uint lane = lid.x % 32u;
     const uint nlanes = QG * 32u;
-    const uint qh = kvh * group + sub * QG + sg;  // global Q head for this simdgroup
+    const uint dlo = sg * (HD / QG);            // this simdgroup's d-half base
+    const uint qh = kvh * group + sub;          // global Q head for this tg
     const uint T = P.kv_len + dims.canvas;
     // Causal (prefill): row r is at abs pos kv_len+tok0+r, attends only [0..pos].
     const bool causal = dims.causal != 0u;
     const uint T_eff = causal ? min(T, P.kv_len + tok0 + MT) : T;
     device const ushort *base = kvcache + L->kv_region / 2;
 
-    // Shared K/V staging (one chunk, reused by all QG simdgroups).
-    threadgroup half ks[MT][8];
-    threadgroup half vs[MT][8];
-    // Per-head (per-simdgroup) staging / softmax scratch.
-    threadgroup half qs[QG][MT][HD];   // staged Q (bf16 -> half), QG*8 KiB
-    threadgroup float st[QG][MT][8];   // QK scores S[row][key]
-    threadgroup half ph[QG][MT][8];    // softmax probs P[row][key]
-    threadgroup float pvt[QG][MT][8];  // P.V chunk [row][d]
-    threadgroup float mrow[QG][MT];    // running max per row
-    threadgroup float lrow[QG][MT];    // running denom per row
-    threadgroup float corr[QG][MT];    // rescale per row for this key-tile
+    // Q tile, shared by both d-halves (staged once).
+    threadgroup half qs[MT][HD];        // 8 KiB
+    // Per-simdgroup K/V chunk staging (each half stages its own d-range).
+    threadgroup half ks[QG][MT][8];
+    threadgroup half vs[QG][MT][8];
+    threadgroup float st[QG][MT][8];    // per-half partial QK scores
+    threadgroup half ph[MT][8];         // softmax probs (shared)
+    threadgroup float pvt[QG][MT][8];   // P.V chunk per half
+    threadgroup float mrow[MT];         // running max per row (shared)
+    threadgroup float lrow[MT];         // running denom per row (shared)
+    threadgroup float corr[MT];         // rescale per row for this key-tile
 
-    // Register-resident O accumulator. Lane owns rows {r0, r1} and column dcol of
-    // every 8-wide head-dim chunk: oreg[2c] = O[r0][8c+dcol], oreg[2c+1] = O[r1][..].
+    // Register-resident O accumulator for THIS d-half: lane owns rows {r0, r1}
+    // at column dcol of each 8-wide chunk in [dlo, dlo+256).
     const uint dcol = lane % 8u;
     const uint r0 = lane / 8u;          // 0..3
     const uint r1 = r0 + 4u;            // 4..7
-    float oreg[2u * NCH];
-    for (uint j = 0u; j < 2u * NCH; ++j) {
+    float oreg[2u * NCH_H];
+    for (uint j = 0u; j < 2u * NCH_H; ++j) {
         oreg[j] = 0.f;
     }
 
-    // Stage Q[QG][MT x HD] -> half (all lanes cooperate).
-    for (uint i = lid.x; i < QG * MT * HD; i += nlanes) {
-        uint h = i / (MT * HD);
-        uint rem = i % (MT * HD);
-        uint r = rem / HD, d = rem % HD;
+    // Stage Q[MT x HD] -> half (all lanes cooperate).
+    for (uint i = lid.x; i < MT * HD; i += nlanes) {
+        uint r = i / HD, d = i % HD;
         uint tok = tok0 + r;
-        uint qhh = kvh * group + sub * QG + h;
-        qs[h][r][d] = (tok < dims.canvas)
-            ? half(arena_load(q + (ulong)tok * dims.n_q_heads * hd + qhh * hd, d))
+        qs[r][d] = (tok < dims.canvas)
+            ? half(arena_load(q + (ulong)tok * dims.n_q_heads * hd + qh * hd, d))
             : half(0);
     }
-    if (lid.x < QG * MT) {
-        uint h = lid.x / MT, r = lid.x % MT;
-        mrow[h][r] = -INFINITY;
-        lrow[h][r] = 0.f;
+    if (lid.x < MT) {
+        mrow[lid.x] = -INFINITY;
+        lrow[lid.x] = 0.f;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint t0 = 0u; t0 < T_eff; t0 += 8u) {
-        // ---- S[MT x 8] = Q . K^T over head_dim chunks (per simdgroup) ----
+        // ---- partial S = Q . K^T over THIS half's chunks (simdgroup-local) ----
         simdgroup_float8x8 sacc(0.f);
-        for (uint c = 0u; c < NCH; ++c) {
-            uint kd = c * 8u;
-            for (uint i = lid.x; i < 8u * 8u; i += nlanes) {
+        for (uint c = 0u; c < NCH_H; ++c) {
+            uint kd = dlo + c * 8u;
+            for (uint i = lane; i < 8u * 8u; i += 32u) {
                 uint key = i / 8u, d = i % 8u;
                 uint t = t0 + key;
-                ks[key][d] = (t < T)
+                ks[sg][key][d] = (t < T)
                     ? half(arena_load_bf16(base + (ulong)t * nkv * hd * 2u + kvh * hd, kd + d))
                     : half(0);
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
             simdgroup_half8x8 a, b;
-            simdgroup_load(a, &qs[sg][0][kd], HD);
-            simdgroup_load(b, &ks[0][0], 8, ulong2(0, 0), true);  // -> b[d][key]
+            simdgroup_load(a, &qs[0][kd], HD);
+            simdgroup_load(b, &ks[sg][0][0], 8, ulong2(0, 0), true);  // -> b[d][key]
             simdgroup_multiply_accumulate(sacc, a, b, sacc);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
         }
         simdgroup_store(sacc, &st[sg][0][0], 8);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // ---- online softmax over this 8-key tile (per row) ----
-        if (lane < MT) {
-            const uint qpos = P.kv_len + tok0 + lane;  // causal cutoff for this row
+        // ---- cross-half sum + online softmax over this 8-key tile (sg0) ----
+        if (lid.x < MT) {
+            const uint row = lid.x;
+            const uint qpos = P.kv_len + tok0 + row;  // causal cutoff for this row
+            float s[8];
             float tmax = -INFINITY;
             for (uint t = 0u; t < 8u; ++t) {
                 bool valid = (t0 + t < T) && (!causal || t0 + t <= qpos);
+                s[t] = st[0][row][t] + st[1][row][t];
                 if (valid) {
-                    tmax = max(tmax, st[sg][lane][t]);
+                    tmax = max(tmax, s[t]);
                 }
             }
-            float mnew = max(mrow[sg][lane], tmax);
-            float cc = isinf(mrow[sg][lane]) ? 0.f : exp(mrow[sg][lane] - mnew);
-            corr[sg][lane] = cc;
+            float mnew = max(mrow[row], tmax);
+            float cc = isinf(mrow[row]) ? 0.f : exp(mrow[row] - mnew);
+            corr[row] = cc;
             float lsum = 0.f;
             for (uint t = 0u; t < 8u; ++t) {
                 bool valid = (t0 + t < T) && (!causal || t0 + t <= qpos);
-                float p = valid ? exp(st[sg][lane][t] - mnew) : 0.f;
-                ph[sg][lane][t] = half(p);
+                float p = valid ? exp(s[t] - mnew) : 0.f;
+                ph[row][t] = half(p);
                 lsum += p;
             }
-            lrow[sg][lane] = lrow[sg][lane] * cc + lsum;
-            mrow[sg][lane] = mnew;
+            lrow[row] = lrow[row] * cc + lsum;
+            mrow[row] = mnew;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        const float cr0 = corr[sg][r0];
-        const float cr1 = corr[sg][r1];
+        const float cr0 = corr[r0];
+        const float cr1 = corr[r1];
 
-        // ---- O = O*corr + P . V over head_dim chunks (into registers) ----
-        for (uint c = 0u; c < NCH; ++c) {
-            uint kd = c * 8u;
-            for (uint i = lid.x; i < 8u * 8u; i += nlanes) {
+        // ---- O = O*corr + P . V over THIS half's chunks (simdgroup-local) ----
+        for (uint c = 0u; c < NCH_H; ++c) {
+            uint kd = dlo + c * 8u;
+            for (uint i = lane; i < 8u * 8u; i += 32u) {
                 uint key = i / 8u, d = i % 8u;
                 uint t = t0 + key;
-                vs[key][d] = (t < T)
+                vs[sg][key][d] = (t < T)
                     ? half(arena_load_bf16(
                           base + (ulong)t * nkv * hd * 2u + (ulong)nkv * hd + kvh * hd, kd + d))
                     : half(0);
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
             simdgroup_float8x8 pvacc(0.f);
             simdgroup_half8x8 a, b;
-            simdgroup_load(a, &ph[sg][0][0], 8);   // P[row][key]
-            simdgroup_load(b, &vs[0][0], 8);       // V[key][d]
+            simdgroup_load(a, &ph[0][0], 8);       // P[row][key]
+            simdgroup_load(b, &vs[sg][0][0], 8);   // V[key][d]
             simdgroup_multiply_accumulate(pvacc, a, b, pvacc);
             simdgroup_store(pvacc, &pvt[sg][0][0], 8);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
             oreg[2u * c] = oreg[2u * c] * cr0 + pvt[sg][r0][dcol];
             oreg[2u * c + 1u] = oreg[2u * c + 1u] * cr1 + pvt[sg][r1][dcol];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
         }
+        // Next tile's K staging reuses ks[sg]/vs[sg] simdgroup-locally; the
+        // shared ph/corr are rewritten only after the next tile's tg barrier.
     }
 
-    if (lane < MT) {
-        dgq_assert_positive_f32(dbg, DbgKernelAttention, lrow[sg][lane], (tok0 << 16u) | qh);
+    if (lid.x < MT) {
+        dgq_assert_positive_f32(dbg, DbgKernelAttention, lrow[lid.x], (tok0 << 16u) | qh);
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Store O (register accumulator / denom) for rows r0, r1.
-    const float l0 = lrow[sg][r0];
-    const float l1 = lrow[sg][r1];
+    // Store O (register accumulator / denom) for rows r0, r1, this d-half.
+    const float l0 = lrow[r0];
+    const float l1 = lrow[r1];
     const uint t_r0 = tok0 + r0;
     const uint t_r1 = tok0 + r1;
-    for (uint c = 0u; c < NCH; ++c) {
-        uint d = c * 8u + dcol;
+    for (uint c = 0u; c < NCH_H; ++c) {
+        uint d = dlo + c * 8u + dcol;
         if (t_r0 < dims.canvas) {
             float y = (l0 > 0.f) ? oreg[2u * c] / l0 : 0.f;
             dgq_assert_finite_f32(dbg, DbgKernelAttention, y, d);

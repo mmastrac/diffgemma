@@ -15,12 +15,19 @@ using namespace metal;
 // bf16->half staging tax that sank the 1-head MMA path, and the staging itself
 // runs on 64 lanes. Each simdgroup owns one Q head's QK / softmax / O.
 //
-// Only valid for group size 2 and hd <= 256 (sliding layers): O for two heads is
-// 2*8*256*4 = 16 KiB; at hd=512 it would be 32 KiB and blow the threadgroup limit.
-// Full-attention layers keep the scalar/1-head path. Same semantics as `attention`
-// (online softmax, all-valid, no 1/sqrt(d) scale); `attention` stays the oracle.
+// Only valid for group size 2 and hd <= 256 (sliding layers). Full-attention
+// layers use `attention_mma_full`. Same semantics as `attention` (online
+// softmax, all-valid, no 1/sqrt(d) scale); `attention` stays the oracle.
+//
+// The O accumulator is REGISTER-RESIDENT (oreg, mma_full's pattern): the old
+// 16 KiB threadgroup O tile put the whole kernel at ~26 KiB tgmem = 1 resident
+// threadgroup/core, so nothing hid the per-chunk barrier+load latencies (the
+// term that grows with kv_len). Register O drops tgmem to ~10 KiB (3x
+// occupancy). Loops touching oreg are compile-time bounded (NCH_MAX) with an
+// `8c < hd` guard so oreg never spills for runtime hd <= 256.
 
 constant uint HD_MAX = 256u;
+constant uint NCH_MAX = HD_MAX / 8u;  // 32 head-dim chunks of 8
 constant uint MT = 8u;
 constant uint QG = 2u;
 
@@ -66,7 +73,6 @@ kernel void attention_mma2(
     device const ushort *base = kvcache + L->kv_region / 2;
 
     threadgroup half qs[QG][MT][HD_MAX];   // staged Q per head
-    threadgroup float ot[QG][MT][HD_MAX];  // running O per head
     threadgroup half ks[MT][8];            // shared K chunk [key][d]
     threadgroup half vs[MT][8];            // shared V chunk [key][d]
     threadgroup half ph[QG][MT][8];        // softmax probs per head
@@ -76,7 +82,17 @@ kernel void attention_mma2(
     threadgroup float lrow[QG][MT];
     threadgroup float corr[QG][MT];
 
-    // Stage Q for both heads (all 64 lanes) and zero O.
+    // Register-resident O accumulator (mma_full's pattern): lane owns rows
+    // {r0, r1} at column dcol of every 8-wide head-dim chunk.
+    const uint dcol = lane % 8u;
+    const uint r0 = lane / 8u;          // 0..3
+    const uint r1 = r0 + 4u;            // 4..7
+    float oreg[2u * NCH_MAX];
+    for (uint j = 0u; j < 2u * NCH_MAX; ++j) {
+        oreg[j] = 0.f;
+    }
+
+    // Stage Q for both heads (all 64 lanes).
     for (uint i = lid.x; i < QG * MT * hd; i += 64u) {
         uint h = i / (MT * hd);
         uint rem = i % (MT * hd);
@@ -86,7 +102,6 @@ kernel void attention_mma2(
         qs[h][r][d] = (tok < dims.canvas)
             ? half(arena_load(q + (ulong)tok * dims.n_q_heads * hd + qhh * hd, d))
             : half(0);
-        ot[h][r][d] = 0.f;
     }
     if (lid.x < QG * MT) {
         uint h = lid.x / MT, r = lid.x % MT;
@@ -145,8 +160,15 @@ kernel void attention_mma2(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // ---- O = O*corr + P . V over head_dim chunks (V shared by both heads) ----
-        for (uint kd = 0u; kd < hd; kd += 8u) {
+        const float cr0 = corr[sg][r0];
+        const float cr1 = corr[sg][r1];
+
+        // ---- O = O*corr + P . V over head_dim chunks (into registers) ----
+        for (uint c = 0u; c < NCH_MAX; ++c) {
+            const uint kd = c * 8u;
+            if (kd >= hd) {
+                break;
+            }
             for (uint i = lid.x; i < 8u * 8u; i += 64u) {
                 uint key = i / 8u, d = i % 8u;
                 uint t = t0 + key;
@@ -163,10 +185,8 @@ kernel void attention_mma2(
             simdgroup_multiply_accumulate(pvacc, a, b, pvacc);
             simdgroup_store(pvacc, &pvt[sg][0][0], 8);
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint i = lane; i < MT * 8u; i += 32u) {
-                uint r = i / 8u, d = i % 8u;
-                ot[sg][r][kd + d] = ot[sg][r][kd + d] * corr[sg][r] + pvt[sg][r][d];
-            }
+            oreg[2u * c] = oreg[2u * c] * cr0 + pvt[sg][r0][dcol];
+            oreg[2u * c + 1u] = oreg[2u * c + 1u] * cr1 + pvt[sg][r1][dcol];
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     }
@@ -174,14 +194,26 @@ kernel void attention_mma2(
     if (lane < MT) {
         dgq_assert_positive_f32(dbg, DbgKernelAttention, lrow[sg][lane], (tok0 << 16u) | qh);
     }
-    for (uint i = lane; i < MT * hd; i += 32u) {
-        uint r = i / hd, d = i % hd;
-        uint tok = tok0 + r;
-        if (tok < dims.canvas) {
-            float l = lrow[sg][r];
-            float y = (l > 0.f) ? ot[sg][r][d] / l : 0.f;
+
+    // Store O (register accumulator / denom) for rows r0, r1.
+    const float l0 = lrow[sg][r0];
+    const float l1 = lrow[sg][r1];
+    const uint t_r0 = tok0 + r0;
+    const uint t_r1 = tok0 + r1;
+    for (uint c = 0u; c < NCH_MAX; ++c) {
+        uint d = c * 8u + dcol;
+        if (d >= hd) {
+            break;
+        }
+        if (t_r0 < dims.canvas) {
+            float y = (l0 > 0.f) ? oreg[2u * c] / l0 : 0.f;
             dgq_assert_finite_f32(dbg, DbgKernelAttention, y, d);
-            arena_store(out + (ulong)tok * dims.n_q_heads * hd + qh * hd, d, y);
+            arena_store(out + (ulong)t_r0 * dims.n_q_heads * hd + qh * hd, d, y);
+        }
+        if (t_r1 < dims.canvas) {
+            float y = (l1 > 0.f) ? oreg[2u * c + 1u] / l1 : 0.f;
+            dgq_assert_finite_f32(dbg, DbgKernelAttention, y, d);
+            arena_store(out + (ulong)t_r1 * dims.n_q_heads * hd + qh * hd, d, y);
         }
     }
 }

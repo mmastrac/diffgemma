@@ -493,10 +493,12 @@ pub fn gpu_mma_full(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Err
     gpu_common::set_bytes(&enc, &params, 4);
     gpu_common::set_bytes(&enc, &dims, 5);
     enc.dispatchThreadgroups_threadsPerThreadgroup(
+        // One tg per (query tile, kv head, Q head); the QG simdgroups split
+        // head_dim, so depth is the full GQA group.
         MTLSize {
             width: f.canvas.div_ceil(MMA_M_TILE),
             height: f.n_kv(),
-            depth: group / MMA_FULL_QG,
+            depth: group,
         },
         MTLSize { width: MMA_FULL_QG * 32, height: 1, depth: 1 },
     );
@@ -579,7 +581,7 @@ pub fn bench_path(f: &Fixture, iters: usize, path: u8) -> Result<f64, Error> {
             MTLSize {
                 width: f.canvas.div_ceil(MMA_M_TILE),
                 height: f.n_kv(),
-                depth: (f.n_q_heads / f.n_kv()) / MMA_FULL_QG,
+                depth: f.n_q_heads / f.n_kv(),
             },
             MTLSize { width: MMA_FULL_QG * 32, height: 1, depth: 1 },
         ),
@@ -737,26 +739,27 @@ mod tests {
     #[ignore]
     fn attn_mma_bench() {
         use crate::kernels::sub::attention::{bench_path, model_bench_fixture};
-        let iters = 200usize;
-        for (name, hd, kv_len, is_full) in
-            [("sliding hd256", 256usize, 64u32, false), ("full hd512", 512usize, 64u32, true)]
-        {
-            let f = model_bench_fixture(hd, kv_len, is_full);
-            let scalar = bench_path(&f, iters, 0).unwrap();
-            let mma = bench_path(&f, iters, 1).unwrap();
-            // mma2 (2 heads/tg) only valid for hd<=256 (sliding layers).
-            if hd <= 256 {
-                let mma2 = bench_path(&f, iters, 2).unwrap();
-                println!(
-                    "{name:>14}  scalar {scalar:7.3}  mma {mma:7.3} ({:.2}x)  mma2 {mma2:7.3} ({:.2}x)",
-                    scalar / mma,
-                    scalar / mma2
-                );
-            } else {
-                println!(
-                    "{name:>14}  scalar {scalar:7.3}  mma {mma:7.3} ({:.2}x)  mma2 n/a (hd>256)",
-                    scalar / mma
-                );
+        let iters = 50usize;
+        for kv_len in [64u32, 512, 1024] {
+            for (name, hd, is_full) in
+                [("sliding hd256", 256usize, false), ("full hd512", 512usize, true)]
+            {
+                let f = model_bench_fixture(hd, kv_len, is_full);
+                let scalar = bench_path(&f, iters, 0).unwrap();
+                if hd <= 256 {
+                    // mma2 (2 heads/tg) only valid for hd<=256 (sliding layers).
+                    let mma2 = bench_path(&f, iters, 2).unwrap();
+                    println!(
+                        "kv{kv_len:>5} {name:>14}  scalar {scalar:7.3}  mma2 {mma2:7.3} ({:.2}x)",
+                        scalar / mma2
+                    );
+                } else {
+                    let mma_full = bench_path(&f, iters, 3).unwrap();
+                    println!(
+                        "kv{kv_len:>5} {name:>14}  scalar {scalar:7.3}  mma_full {mma_full:7.3} ({:.2}x)",
+                        scalar / mma_full
+                    );
+                }
             }
         }
     }
