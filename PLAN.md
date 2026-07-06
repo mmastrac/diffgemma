@@ -14,8 +14,13 @@ not here.
 The engine is in ship shape:
 
 - **Perf**: ~0.93–0.97 s/step (M3 Pro, 30L) — under MLX-4bit's 0.94 s/step
-  pace, with fewer denoise steps. Tunable GEMM, block-sparse MoE, MMA
-  attention, sparse SC all default-on and validated.
+  pace. Tunable GEMM, block-sparse MoE, MMA attention, sparse SC all
+  default-on and validated. **Convergence steps: parity-class** (matched-canvas
+  multi-seed 2026-07-05: ~1.15× vs MLX's best config = end-to-end denoise
+  parity; ~1.6× FASTER than the mxfp4 checkpoint; the old "2× step gap" was a
+  mixed-config single-seed artifact — quant format alone swings MLX's own
+  convergence 12↔27 steps on one canvas). Chat: cross-turn KV reuse (turn-3
+  prefill −71%) + optional entropy early stop.
 - **Quality**: MLX-exact sampler semantics default (no-freeze + argmax commit,
   signed off 2026-07-05). Wart census 0/10 (was 4/10). Smoketest 17/17 at the
   spec seed. Fast-prefill degenerate class fixed as a side effect.
