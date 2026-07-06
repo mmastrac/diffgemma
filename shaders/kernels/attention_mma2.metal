@@ -70,11 +70,15 @@ kernel void attention_mma2(
         t_lo = (qpos0 > wm1) ? (qpos0 - wm1) : 0u;
     }
     const uint t_start = (t_lo / 8u) * 8u;  // tile-aligned; softmax masks the edge
-    device const ushort *base = kvcache + L->kv_region / 2;
+    // KV cache is f16: K/V tiles are simdgroup_load'ed STRAIGHT from device
+    // memory (no staging). Ring layers: an 8-aligned tile of 8 positions never
+    // straddles the ring wrap (ring size is a multiple of 8), so the tile's
+    // slot rows are contiguous at slot(t0). Ragged-tail keys read in-bounds
+    // finite pad/stale slots and are zeroed by the softmax mask.
+    device const half *kv16 = (device const half *)(kvcache + L->kv_region / 2);
+    const ulong kstride = (ulong)nkv * hd * 2u;  // elements between key rows
 
     threadgroup half qs[QG][MT][HD_MAX];   // staged Q per head
-    threadgroup half ks[MT][8];            // shared K chunk [key][d]
-    threadgroup half vs[MT][8];            // shared V chunk [key][d]
     threadgroup half ph[QG][MT][8];        // softmax probs per head
     threadgroup float st[QG][MT][8];       // QK scores per head
     threadgroup float pvt[QG][MT][8];      // P·V chunk per head
@@ -111,26 +115,18 @@ kernel void attention_mma2(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint t0 = t_start; t0 < T_eff; t0 += 8u) {
-        // ---- S[MT x 8] = Q . K^T over head_dim chunks (K shared by both heads) ----
+        // ---- S[MT x 8] = Q . K^T over head_dim chunks (direct device K) ----
+        const ulong slot0 = kv_slot_of(L, t0);  // 8-aligned; tile rows contiguous
+        device const half *kb = kv16 + slot0 * kstride + kvh * hd;
         simdgroup_float8x8 sacc(0.f);
         for (uint kd = 0u; kd < hd; kd += 8u) {
-            for (uint i = lid.x; i < 8u * 8u; i += 64u) {
-                uint key = i / 8u, d = i % 8u;
-                uint t = t0 + key;
-                ks[key][d] = (t < T)
-                    ? half(arena_load_bf16(
-                          base + (ulong)kv_slot_of(L, t) * nkv * hd * 2u + kvh * hd, kd + d))
-                    : half(0);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
             simdgroup_half8x8 a, b;
             simdgroup_load(a, &qs[sg][0][kd], HD_MAX);
-            simdgroup_load(b, &ks[0][0], 8, ulong2(0, 0), true);
+            simdgroup_load(b, kb + kd, kstride, ulong2(0, 0), true);
             simdgroup_multiply_accumulate(sacc, a, b, sacc);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         simdgroup_store(sacc, &st[sg][0][0], 8);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
 
         // ---- online softmax over this 8-key tile (per head) ----
         if (lane < MT) {
@@ -159,37 +155,30 @@ kernel void attention_mma2(
             lrow[sg][lane] = lrow[sg][lane] * c + lsum;
             mrow[sg][lane] = mnew;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // All state (st/ph/corr/pvt/oreg) is simdgroup-local now that K/V come
+        // straight from device — no cross-simdgroup sync needed anywhere.
+        simdgroup_barrier(mem_flags::mem_threadgroup);
 
         const float cr0 = corr[sg][r0];
         const float cr1 = corr[sg][r1];
 
-        // ---- O = O*corr + P . V over head_dim chunks (into registers) ----
+        // ---- O = O*corr + P . V over head_dim chunks (direct device V) ----
+        device const half *vb = kv16 + slot0 * kstride + (ulong)nkv * hd + kvh * hd;
         for (uint c = 0u; c < NCH_MAX; ++c) {
             const uint kd = c * 8u;
             if (kd >= hd) {
                 break;
             }
-            for (uint i = lid.x; i < 8u * 8u; i += 64u) {
-                uint key = i / 8u, d = i % 8u;
-                uint t = t0 + key;
-                vs[key][d] = (t < T)
-                    ? half(arena_load_bf16(
-                          base + (ulong)kv_slot_of(L, t) * nkv * hd * 2u + (ulong)nkv * hd
-                              + kvh * hd, kd + d))
-                    : half(0);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
             simdgroup_float8x8 pvacc(0.f);
             simdgroup_half8x8 a, b;
             simdgroup_load(a, &ph[sg][0][0], 8);
-            simdgroup_load(b, &vs[0][0], 8);
+            simdgroup_load(b, vb + kd, kstride);
             simdgroup_multiply_accumulate(pvacc, a, b, pvacc);
             simdgroup_store(pvacc, &pvt[sg][0][0], 8);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
             oreg[2u * c] = oreg[2u * c] * cr0 + pvt[sg][r0][dcol];
             oreg[2u * c + 1u] = oreg[2u * c + 1u] * cr1 + pvt[sg][r1][dcol];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
         }
     }
 

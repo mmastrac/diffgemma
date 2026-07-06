@@ -248,8 +248,9 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
     for v in q.iter_mut().chain(k.iter_mut()) {
         *v = bf16::store_bf16_round_half(*v);
     }
+    // KV cache stores f16 (attention_device.metal kv_store).
     for v in kvcache.iter_mut() {
-        *v = bf16::round_bf16_f32(*v);
+        *v = crate::kernels::sub::f16::f16_bits_to_f32(crate::kernels::sub::f16::f32_to_f16_bits(*v));
     }
     pack_out(&q, &k, &kvcache, f)
 }
@@ -308,7 +309,8 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     BufferPool::write_bf16(&buf_q, &bf16::f32_slice_to_bf16_bits(&f.q));
     BufferPool::write_bf16(&buf_k, &bf16::f32_slice_to_bf16_bits(&f.k));
     BufferPool::write_bf16(&buf_v, &bf16::f32_slice_to_bf16_bits(&f.v));
-    BufferPool::write_bf16(&buf_kv, &bf16::f32_slice_to_bf16_bits(&f.kvcache));
+    // KV cache stores f16 (attention_device.metal kv_store); q/k/v stay bf16 (arena).
+    BufferPool::write_bf16(&buf_kv, &crate::kernels::sub::f16::f32_slice_to_f16(&f.kvcache));
     BufferPool::write_bytes(&buf_blob, &blob);
     let layer = layer_offsets(f);
     let layer_bytes = unsafe {
@@ -379,7 +381,13 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     };
     read_half(&buf_q, &mut q);
     read_half(&buf_k, &mut k);
-    read_half(&buf_kv, &mut kvcache);
+    // kvcache is f16, not bf16.
+    {
+        let ptr = buf_kv.contents().as_ptr() as *const u16;
+        for (i, o) in kvcache.iter_mut().enumerate() {
+            *o = crate::kernels::sub::f16::f16_bits_to_f32(unsafe { *ptr.add(i) });
+        }
+    }
     Ok(pack_out(&q, &k, &kvcache, f))
 }
 

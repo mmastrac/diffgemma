@@ -471,7 +471,10 @@ pub fn manifest_offset(
 /// (no wrap possible = trivially identical to linear).
 pub fn layer_kv_slots(is_full: bool, max_seq: usize) -> usize {
     if is_full {
-        max_seq
+        // +8/round-to-8: the direct-load MMA kernels read whole 8-key tiles;
+        // the softmax masks the tail keys but the reads must stay in-buffer
+        // (layer 29 — the last region — is a full layer).
+        (max_seq + 8).next_multiple_of(8)
     } else {
         max_seq.next_power_of_two().min(2048)
     }

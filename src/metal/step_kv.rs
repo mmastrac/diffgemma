@@ -26,7 +26,7 @@
 
 use crate::flags::progress_enabled;
 use crate::config::ModelConfig;
-use crate::kernels::sub::bf16::{bf16_bits_to_f32, f32_to_bf16_bits};
+use crate::kernels::sub::f16::{f16_bits_to_f32, f32_to_f16_bits};
 use crate::metal::decoder::load_weight_cache_opt;
 use crate::metal::kv_cache::GpuKvCache;
 use crate::metal::engine::GpuDecoderEngine;
@@ -112,8 +112,8 @@ pub fn pack_kv_cache_to_monolithic(
             for hh in 0..nkv {
                 for d in 0..hd {
                     let src_i = pos * per_token + hh * hd + d;
-                    let k_bits = f32_to_bf16_bits(kv_layer.keys[src_i]);
-                    let v_bits = f32_to_bf16_bits(kv_layer.values[src_i]);
+                    let k_bits = f32_to_f16_bits(kv_layer.keys[src_i]);
+                    let v_bits = f32_to_f16_bits(kv_layer.values[src_i]);
                     let k_dst = (slot_base + hh * hd + d) * 2;
                     let v_dst = (slot_base + nkv * hd + hh * hd + d) * 2;
                     dst[k_dst..k_dst + 2].copy_from_slice(&k_bits.to_le_bytes());
@@ -168,8 +168,8 @@ pub fn read_monolithic_kv_prefix_to_cpu_cache(
                     let src_i = pos * per_token + hh * hd + d;
                     let k_dst = (slot_base + hh * hd + d) * 2;
                     let v_dst = (slot_base + nkv * hd + hh * hd + d) * 2;
-                    kv_layer.keys[src_i] = bf16_bits_to_f32(read_half_at(buf, k_dst));
-                    kv_layer.values[src_i] = bf16_bits_to_f32(read_half_at(buf, v_dst));
+                    kv_layer.keys[src_i] = f16_bits_to_f32(read_half_at(buf, k_dst));
+                    kv_layer.values[src_i] = f16_bits_to_f32(read_half_at(buf, v_dst));
                 }
             }
         }
@@ -527,7 +527,7 @@ pub fn read_layer_k_cache_f32(
             for d in 0..hd {
                 let dst_i = pos * per_token + hh * hd + d;
                 let k_byte = (slot_base + hh * hd + d) * 2;
-                keys[dst_i] = bf16_bits_to_f32(read_half_at(kv_buf, k_byte));
+                keys[dst_i] = f16_bits_to_f32(read_half_at(kv_buf, k_byte));
             }
         }
     }
@@ -563,8 +563,8 @@ fn hydrate_gpu_kv_from_monolithic(
                     let dst_i = pos * per_token + hh * hd + d;
                     let k_byte = (slot_base + hh * hd + d) * 2;
                     let v_byte = (slot_base + nkv * hd + hh * hd + d) * 2;
-                    keys[dst_i] = bf16_bits_to_f32(read_half_at(kv_buf, k_byte));
-                    values[dst_i] = bf16_bits_to_f32(read_half_at(kv_buf, v_byte));
+                    keys[dst_i] = f16_bits_to_f32(read_half_at(kv_buf, k_byte));
+                    values[dst_i] = f16_bits_to_f32(read_half_at(kv_buf, v_byte));
                 }
             }
         }
@@ -734,7 +734,7 @@ pub fn kvcache_prefix_max_abs(
         };
         for chunk in bytes.chunks_exact(2) {
             let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-            max_abs = max_abs.max(bf16_bits_to_f32(bits).abs());
+            max_abs = max_abs.max(f16_bits_to_f32(bits).abs());
         }
     }
     max_abs
@@ -910,8 +910,8 @@ pub fn monolithic_kv_prefix_max_diff(
         for pos in 0..kv_len {
             for hidx in 0..token_stride {
                 let byte = (slot_base + pos * token_stride + hidx) * 2;
-                let va = bf16_bits_to_f32(read_half_at(a, byte));
-                let vb = bf16_bits_to_f32(read_half_at(b, byte));
+                let va = f16_bits_to_f32(read_half_at(a, byte));
+                let vb = f16_bits_to_f32(read_half_at(b, byte));
                 let d = (va - vb).abs();
                 if d > max_diff {
                     max_diff = d;
@@ -982,7 +982,7 @@ pub fn kvcache_plane_max_abs(
         };
         for chunk in bytes.chunks_exact(2) {
             let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-            max_abs = max_abs.max(bf16_bits_to_f32(bits).abs());
+            max_abs = max_abs.max(f16_bits_to_f32(bits).abs());
         }
     }
     max_abs
@@ -1076,8 +1076,8 @@ pub fn run_step_attn_probe(
         let byte_k = (slot_base + pos * token_stride) * 2;
         let byte_v = byte_k + nkv * hd * 2;
         for i in 0..nkv * hd {
-            k_full[k_off + i] = bf16_bits_to_f32(read_half_at(&native_buf, byte_k + i * 2));
-            v_full[k_off + i] = bf16_bits_to_f32(read_half_at(&native_buf, byte_v + i * 2));
+            k_full[k_off + i] = f16_bits_to_f32(read_half_at(&native_buf, byte_k + i * 2));
+            v_full[k_off + i] = f16_bits_to_f32(read_half_at(&native_buf, byte_v + i * 2));
         }
     }
 

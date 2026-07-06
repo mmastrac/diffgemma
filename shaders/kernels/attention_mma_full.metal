@@ -71,13 +71,15 @@ kernel void attention_mma_full(
     // Causal (prefill): row r is at abs pos kv_len+tok0+r, attends only [0..pos].
     const bool causal = dims.causal != 0u;
     const uint T_eff = causal ? min(T, P.kv_len + tok0 + MT) : T;
-    device const ushort *base = kvcache + L->kv_region / 2;
+    // KV cache is f16: K/V tiles are simdgroup_load'ed STRAIGHT from device
+    // memory (row stride = one key), no bf16->half staging pass at all. Tail
+    // keys of a ragged tile read in-bounds pad/stale slots (finite; the layer
+    // region is over-allocated by 8 rows) and are zeroed by the softmax mask.
+    device const half *kv16 = (device const half *)(kvcache + L->kv_region / 2);
+    const ulong kstride = (ulong)nkv * hd * 2u;  // elements between key rows
 
     // Q tile, shared by both d-halves (staged once).
     threadgroup half qs[MT][HD];        // 8 KiB
-    // Per-simdgroup K/V chunk staging (each half stages its own d-range).
-    threadgroup half ks[QG][MT][8];
-    threadgroup half vs[QG][MT][8];
     threadgroup float st[QG][MT][8];    // per-half partial QK scores
     threadgroup half ph[MT][8];         // softmax probs (shared)
     threadgroup float pvt[QG][MT][8];   // P.V chunk per half
@@ -110,23 +112,15 @@ kernel void attention_mma_full(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint t0 = 0u; t0 < T_eff; t0 += 8u) {
-        // ---- partial S = Q . K^T over THIS half's chunks (simdgroup-local) ----
+        // ---- partial S = Q . K^T over THIS half's chunks (direct device K) ----
+        device const half *kb = kv16 + (ulong)t0 * kstride + kvh * hd;
         simdgroup_float8x8 sacc(0.f);
         for (uint c = 0u; c < NCH_H; ++c) {
             uint kd = dlo + c * 8u;
-            for (uint i = lane; i < 8u * 8u; i += 32u) {
-                uint key = i / 8u, d = i % 8u;
-                uint t = t0 + key;
-                ks[sg][key][d] = (t < T)
-                    ? half(arena_load_bf16(base + (ulong)t * nkv * hd * 2u + kvh * hd, kd + d))
-                    : half(0);
-            }
-            simdgroup_barrier(mem_flags::mem_threadgroup);
             simdgroup_half8x8 a, b;
             simdgroup_load(a, &qs[0][kd], HD);
-            simdgroup_load(b, &ks[sg][0][0], 8, ulong2(0, 0), true);  // -> b[d][key]
+            simdgroup_load(b, kb + kd, kstride, ulong2(0, 0), true);  // -> b[d][key]
             simdgroup_multiply_accumulate(sacc, a, b, sacc);
-            simdgroup_barrier(mem_flags::mem_threadgroup);
         }
         simdgroup_store(sacc, &st[sg][0][0], 8);
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -162,22 +156,14 @@ kernel void attention_mma_full(
         const float cr0 = corr[r0];
         const float cr1 = corr[r1];
 
-        // ---- O = O*corr + P . V over THIS half's chunks (simdgroup-local) ----
+        // ---- O = O*corr + P . V over THIS half's chunks (direct device V) ----
+        device const half *vb = kv16 + (ulong)t0 * kstride + (ulong)nkv * hd + kvh * hd;
         for (uint c = 0u; c < NCH_H; ++c) {
             uint kd = dlo + c * 8u;
-            for (uint i = lane; i < 8u * 8u; i += 32u) {
-                uint key = i / 8u, d = i % 8u;
-                uint t = t0 + key;
-                vs[sg][key][d] = (t < T)
-                    ? half(arena_load_bf16(
-                          base + (ulong)t * nkv * hd * 2u + (ulong)nkv * hd + kvh * hd, kd + d))
-                    : half(0);
-            }
-            simdgroup_barrier(mem_flags::mem_threadgroup);
             simdgroup_float8x8 pvacc(0.f);
             simdgroup_half8x8 a, b;
             simdgroup_load(a, &ph[0][0], 8);       // P[row][key]
-            simdgroup_load(b, &vs[sg][0][0], 8);   // V[key][d]
+            simdgroup_load(b, vb + kd, kstride);   // V[key][d]
             simdgroup_multiply_accumulate(pvacc, a, b, pvacc);
             simdgroup_store(pvacc, &pvt[sg][0][0], 8);
             simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -185,8 +171,7 @@ kernel void attention_mma_full(
             oreg[2u * c + 1u] = oreg[2u * c + 1u] * cr1 + pvt[sg][r1][dcol];
             simdgroup_barrier(mem_flags::mem_threadgroup);
         }
-        // Next tile's K staging reuses ks[sg]/vs[sg] simdgroup-locally; the
-        // shared ph/corr are rewritten only after the next tile's tg barrier.
+        // ph/corr are rewritten only after the next tile's tg barrier.
     }
 
     if (lid.x < MT) {

@@ -78,7 +78,7 @@ kernel void attention(
         device const ushort *kk = base + (ulong)ts * nkv * hd * 2u + kvh * hd;
         float d = 0.f;
         for (uint i = ltid; i < hd; i += tpg_w) {
-            d += arena_load(qv, i) * arena_load_bf16(kk, i);  // K from bf16 KV cache
+            d += arena_load(qv, i) * kv_load(kk, i);  // K from f16 KV cache
         }
         d = simd_sum(d);
         const uint sg = ltid / 32u;
@@ -99,7 +99,7 @@ kernel void attention(
         for (uint i = 0u; i < per; ++i) {
             uint idx = ltid + i * tpg_w;
             if (idx < hd) {
-                acc[i] = acc[i] * corr + p * arena_load_bf16(vv, idx);  // V from bf16 KV cache
+                acc[i] = acc[i] * corr + p * kv_load(vv, idx);  // V from f16 KV cache
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

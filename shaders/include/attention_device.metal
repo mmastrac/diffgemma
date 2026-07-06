@@ -32,6 +32,19 @@ inline uint kv_slot_of(device const LayerOffsets *L, uint pos) {
     return (L->kv_ring_mask != 0u) ? (pos & L->kv_ring_mask) : pos;
 }
 
+/// KV cache element load/store. The cache stores **f16** (was bf16): the
+/// values are RMS-normed K (post-RoPE) and V with |x| <~ 22 (measured), well
+/// inside f16 range, and f16's 10 mantissa bits beat bf16's 7 everywhere in
+/// the live range. f16 storage also lets the MMA attention kernels
+/// simdgroup_load K/V tiles STRAIGHT from device memory (no bf16->half
+/// staging pass) — the enabler for long-context attention throughput.
+inline float kv_load(device const ushort *p, uint i) {
+    return float(as_type<half>(p[i]));
+}
+inline void kv_store(device ushort *p, uint i, float v) {
+    p[i] = as_type<ushort>(half(v));
+}
+
 struct AttnDims {
     uint canvas;
     uint n_q_heads;

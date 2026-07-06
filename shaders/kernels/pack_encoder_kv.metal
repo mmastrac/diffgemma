@@ -40,10 +40,10 @@ kernel void pack_encoder_kv(
     const ulong base_idx = kv_region_bytes / 2ul + ulong(slot) * ulong(token_stride);
     const ulong k_idx = base_idx + ulong(hh * hd + d);
     const ulong v_idx = base_idx + ulong(nkv * hd + hh * hd + d);
-    // KV cache is always bf16 (shared with the bf16 encoder + read as bf16 in
-    // attention); pack as bf16, not the toggleable arena precision.
-    const ushort kb = arena_bf16_bits(keys[src_i]);
-    const ushort vb = arena_bf16_bits(values[src_i]);
+    // KV cache is f16 (see attention_device.metal kv_store): pack engine f32
+    // KV as f16, not the toggleable arena precision.
+    const ushort kb = as_type<ushort>(half(keys[src_i]));
+    const ushort vb = as_type<ushort>(half(values[src_i]));
     device ushort *k_dst = (device ushort *)(dst + k_idx * 2ul);
     device ushort *v_dst = (device ushort *)(dst + v_idx * 2ul);
     k_dst[0] = kb;

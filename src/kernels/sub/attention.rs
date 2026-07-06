@@ -217,7 +217,12 @@ fn layer_offsets(f: &Fixture) -> LayerOffsets {
 
 pub fn cpu(f: &Fixture) -> Vec<f32> {
     let q = bf16::bf16_slice_to_f32(&bf16::f32_slice_to_bf16_bits(&f.q));
-    let kvcache = bf16::bf16_slice_to_f32(&bf16::f32_slice_to_bf16_bits(&f.kvcache));
+    // KV cache stores f16 (see attention_device.metal kv_store).
+    let kvcache: Vec<f32> = f
+        .kvcache
+        .iter()
+        .map(|&v| crate::kernels::sub::f16::f16_bits_to_f32(crate::kernels::sub::f16::f32_to_f16_bits(v)))
+        .collect();
     let mut out = vec![0.0f32; f.out_len()];
     attention::attention(
         &mut out,
@@ -264,7 +269,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         .allocate(&ctx.device, f.q.len() * 2)
         .ok_or(Error::Format("alloc"))?;
     let buf_kv = pool
-        .allocate(&ctx.device, f.kvcache.len() * 2)
+        .allocate(&ctx.device, (f.kvcache.len() + 8 * f.n_kv() * f.head_dim() * 2) * 2)
         .ok_or(Error::Format("alloc"))?;
     let buf_out = pool
         .allocate(&ctx.device, f.out_len() * 2)
@@ -274,7 +279,13 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         .ok_or(Error::Format("alloc"))?;
 
     BufferPool::write_bf16(&buf_q, &bf16::f32_slice_to_bf16_bits(&f.q));
-    BufferPool::write_bf16(&buf_kv, &bf16::f32_slice_to_bf16_bits(&f.kvcache));
+    {
+        // f16 KV + 8 zero pad rows (direct-load kernels read whole 8-key tiles;
+        // the softmax masks the tail, but the bytes must be in-bounds + finite).
+        let mut bits = crate::kernels::sub::f16::f32_slice_to_f16(&f.kvcache);
+        bits.resize(bits.len() + 8 * f.n_kv() * f.head_dim() * 2, 0);
+        BufferPool::write_bf16(&buf_kv, &bits);
+    }
     let layer = layer_offsets(f);
     let layer_bytes = unsafe {
         std::slice::from_raw_parts(
@@ -364,14 +375,20 @@ pub fn gpu_mma2(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> 
     let pipeline = pipeline_mma2_for(&ctx, variant)?;
     let mut pool = BufferPool::new();
     let buf_q = pool.allocate(&ctx.device, f.q.len() * 2).ok_or(Error::Format("alloc"))?;
-    let buf_kv = pool.allocate(&ctx.device, f.kvcache.len() * 2).ok_or(Error::Format("alloc"))?;
+    let buf_kv = pool.allocate(&ctx.device, (f.kvcache.len() + 8 * f.n_kv() * f.head_dim() * 2) * 2).ok_or(Error::Format("alloc"))?;
     let buf_out = pool.allocate(&ctx.device, f.out_len() * 2).ok_or(Error::Format("alloc"))?;
     let buf_layer = pool
         .allocate(&ctx.device, std::mem::size_of::<LayerOffsets>())
         .ok_or(Error::Format("alloc"))?;
 
     BufferPool::write_bf16(&buf_q, &bf16::f32_slice_to_bf16_bits(&f.q));
-    BufferPool::write_bf16(&buf_kv, &bf16::f32_slice_to_bf16_bits(&f.kvcache));
+    {
+        // f16 KV + 8 zero pad rows (direct-load kernels read whole 8-key tiles;
+        // the softmax masks the tail, but the bytes must be in-bounds + finite).
+        let mut bits = crate::kernels::sub::f16::f32_slice_to_f16(&f.kvcache);
+        bits.resize(bits.len() + 8 * f.n_kv() * f.head_dim() * 2, 0);
+        BufferPool::write_bf16(&buf_kv, &bits);
+    }
     let layer = layer_offsets(f);
     let layer_bytes = unsafe {
         std::slice::from_raw_parts(
@@ -448,14 +465,20 @@ pub fn gpu_mma_full(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Err
     let pipeline = pipeline_mma_full_for(&ctx, variant)?;
     let mut pool = BufferPool::new();
     let buf_q = pool.allocate(&ctx.device, f.q.len() * 2).ok_or(Error::Format("alloc"))?;
-    let buf_kv = pool.allocate(&ctx.device, f.kvcache.len() * 2).ok_or(Error::Format("alloc"))?;
+    let buf_kv = pool.allocate(&ctx.device, (f.kvcache.len() + 8 * f.n_kv() * f.head_dim() * 2) * 2).ok_or(Error::Format("alloc"))?;
     let buf_out = pool.allocate(&ctx.device, f.out_len() * 2).ok_or(Error::Format("alloc"))?;
     let buf_layer = pool
         .allocate(&ctx.device, std::mem::size_of::<LayerOffsets>())
         .ok_or(Error::Format("alloc"))?;
 
     BufferPool::write_bf16(&buf_q, &bf16::f32_slice_to_bf16_bits(&f.q));
-    BufferPool::write_bf16(&buf_kv, &bf16::f32_slice_to_bf16_bits(&f.kvcache));
+    {
+        // f16 KV + 8 zero pad rows (direct-load kernels read whole 8-key tiles;
+        // the softmax masks the tail, but the bytes must be in-bounds + finite).
+        let mut bits = crate::kernels::sub::f16::f32_slice_to_f16(&f.kvcache);
+        bits.resize(bits.len() + 8 * f.n_kv() * f.head_dim() * 2, 0);
+        BufferPool::write_bf16(&buf_kv, &bits);
+    }
     let layer = layer_offsets(f);
     let layer_bytes = unsafe {
         std::slice::from_raw_parts(
@@ -543,13 +566,19 @@ pub fn bench_path(f: &Fixture, iters: usize, path: u8) -> Result<f64, Error> {
     };
     let mut pool = BufferPool::new();
     let buf_q = pool.allocate(&ctx.device, f.q.len() * 2).ok_or(Error::Format("alloc"))?;
-    let buf_kv = pool.allocate(&ctx.device, f.kvcache.len() * 2).ok_or(Error::Format("alloc"))?;
+    let buf_kv = pool.allocate(&ctx.device, (f.kvcache.len() + 8 * f.n_kv() * f.head_dim() * 2) * 2).ok_or(Error::Format("alloc"))?;
     let buf_out = pool.allocate(&ctx.device, f.out_len() * 2).ok_or(Error::Format("alloc"))?;
     let buf_layer = pool
         .allocate(&ctx.device, std::mem::size_of::<LayerOffsets>())
         .ok_or(Error::Format("alloc"))?;
     BufferPool::write_bf16(&buf_q, &bf16::f32_slice_to_bf16_bits(&f.q));
-    BufferPool::write_bf16(&buf_kv, &bf16::f32_slice_to_bf16_bits(&f.kvcache));
+    {
+        // f16 KV + 8 zero pad rows (direct-load kernels read whole 8-key tiles;
+        // the softmax masks the tail, but the bytes must be in-bounds + finite).
+        let mut bits = crate::kernels::sub::f16::f32_slice_to_f16(&f.kvcache);
+        bits.resize(bits.len() + 8 * f.n_kv() * f.head_dim() * 2, 0);
+        BufferPool::write_bf16(&buf_kv, &bits);
+    }
     let layer = layer_offsets(f);
     let layer_bytes = unsafe {
         std::slice::from_raw_parts(
@@ -740,12 +769,23 @@ mod tests {
     fn attn_mma_bench() {
         use crate::kernels::sub::attention::{bench_path, model_bench_fixture};
         let iters = 50usize;
-        for kv_len in [64u32, 512, 1024] {
+        for kv_len in [64u32, 512, 1024, 8192, 32768] {
             for (name, hd, is_full) in
                 [("sliding hd256", 256usize, false), ("full hd512", 512usize, true)]
             {
+                // Sliding layers are window-clamped (1024) in production —
+                // benching them unwindowed at long kv is meaningless.
+                if !is_full && kv_len > 1024 {
+                    continue;
+                }
                 let f = model_bench_fixture(hd, kv_len, is_full);
-                let scalar = bench_path(&f, iters, 0).unwrap();
+                // Scalar at long kv is minutes per measurement and adds no
+                // information (linear serial loop); report the MMA paths only.
+                let scalar = if kv_len <= 8192 {
+                    bench_path(&f, iters, 0).unwrap()
+                } else {
+                    f64::NAN
+                };
                 if hd <= 256 {
                     // mma2 (2 heads/tg) only valid for hd<=256 (sliding layers).
                     let mma2 = bench_path(&f, iters, 2).unwrap();
