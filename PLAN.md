@@ -45,17 +45,19 @@ Model supports 262k positions natively. Shipped: **ring-buffer sliding KV**
 **MMA prefill attention** (6.5k prefill 98.6→31.4s), **f16 KV +
 direct-device simdgroup_load** (staging deleted; mma_full 22.6→7.8 ms/layer
 @kv1024; gate IMPROVED to 47/51), `chat --ctx N`. Needle retrieval EXACT at
-6.5k and 33.4k (prefill 166s, ~2s/step there). Remaining walls (next arc):
-full-layer attention is DRAM-bound at long kv (256× K/V stream redundancy →
-flash-decode layout: more query rows per stream + kv-split & merge), and
-prefill is chunk-serial (M=256 forwards; multi-chunk batching is the deep
-fix). See agent memory `long-context-100k`.
+6.5k, 33.4k (prefill 166s, ~2s/step) and **105k (prefill 1085s, ~4.5s/step,
+KV 2.4 GiB)**. Flash-decode sequential blocking was built (bit-identical,
+`DGQ_ATTN_KV_BLOCK`) and DISPROVEN — the lockstep threadgroup sweep already
+gets SLC service (171 > 150 GB/s DRAM at 32k); default off. Remaining
+levers: KV quantization (q8 = 2× bytes; TurboQuant-style rotated low-bit =
+4-5×, arXiv 2504.19874) and batched multi-chunk prefill (the M=256
+chunk-serial floor). See agent memory `long-context-100k`.
 
 ## Open items
 
 | Item | Note |
 |---|---|
-| Long-context speed | flash-decode full-attention + batched prefill (above) |
+| Long-context speed | KV quantization (q8 / TurboQuant) + batched prefill (above) |
 | Seed-123 empty-reply artifact | short factual prompts, both prefill paths (engine 5 / fast 2 of 17 at that seed); trajectory-level, pre-existing |
 | Legacy GEMM retirement | `gemm_block*` legacy pipelines after a stable tunable cycle (KERNELS.md deprecation list; needs user nod) |
 | Mechanical kernel merges | embed_gather / gather_rows / f32_to_half families (KERNELS.md) |
