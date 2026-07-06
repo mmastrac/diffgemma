@@ -273,7 +273,8 @@ enum Command {
     },
     Smoketest {
         prompts_path: Option<PathBuf>,
-        seed: u64,
+        /// None = spec-pinned gate seed; Some = explicit CLI --seed sweep.
+        seed: Option<u64>,
         steps: usize,
         max_layers: Option<usize>,
         /// Substring (case-insensitive) on prompt id; only matching prompts run.
@@ -2833,6 +2834,7 @@ fn parse_cli() -> Cli {
     let mut model_dir = PathBuf::from("model/transformer");
     let mut positional = Vec::new();
     let mut seed = 42u64;
+    let mut seed_explicit = false;
     let mut steps_override: Option<usize> = None;
     let mut prompt_len = 8usize;
     let mut max_new_tokens = 256usize;
@@ -2905,6 +2907,7 @@ fn parse_cli() -> Cli {
                         eprintln!("invalid --seed");
                         std::process::exit(2);
                     });
+                    seed_explicit = true;
                 }
             }
             "--steps" => {
@@ -3199,7 +3202,7 @@ fn parse_cli() -> Cli {
         },
         Some("smoketest") => Command::Smoketest {
             prompts_path: positional.get(1).map(PathBuf::from),
-            seed,
+            seed: seed_explicit.then_some(seed),
             steps: steps_production,
             max_layers: parity_layers,
             filter: smoke_filter.clone(),
@@ -4180,7 +4183,7 @@ fn smoke_answer_matches(reply: &str, answer: &str, accept: &[String]) -> bool {
 fn run_smoketest_cmd(
     model_dir: &std::path::Path,
     prompts_path: Option<&std::path::Path>,
-    seed: u64,
+    seed: Option<u64>,
     steps: usize,
     max_layers: Option<usize>,
     raw_prompt: bool,
@@ -4224,13 +4227,11 @@ fn run_smoketest_cmd(
     }
 
     // Gate baseline seed: the spec pins it (re-baselined with accepted
-    // trajectory-reshuffling changes); an explicit CLI --seed (!= the 42
-    // default) overrides for multi-seed sweeps.
-    let seed = if seed != 42 {
-        seed
-    } else {
-        spec.seed.unwrap_or(seed)
-    };
+    // trajectory-reshuffling changes); an explicit CLI --seed overrides for
+    // multi-seed sweeps. (Formerly `--seed 42` was indistinguishable from the
+    // CLI default and silently ran the spec seed — sweeps that included 42
+    // were double-counting the gate seed.)
+    let seed = seed.or(spec.seed).unwrap_or(42);
 
     let layers = match resolve_model_layers(model_dir, max_layers) {
         Ok(n) => n,
