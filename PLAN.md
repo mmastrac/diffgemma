@@ -38,10 +38,24 @@ The engine is in ship shape:
 Bit-identical changes ship on identity evidence; anything else needs the
 multi-seed gate aggregate + wart census + explicit user approval.
 
-## Open items (all small)
+## Long context (2026-07-06 — works to 100k+, speed work remains)
+
+Model supports 262k positions natively. Shipped: **ring-buffer sliding KV**
+(~20 KB/token + ~410 MiB fixed; 100k ≈ 2.4 GiB, was an impossible 22 GiB),
+**MMA prefill attention** (6.5k prefill 98.6→31.4s), **f16 KV +
+direct-device simdgroup_load** (staging deleted; mma_full 22.6→7.8 ms/layer
+@kv1024; gate IMPROVED to 47/51), `chat --ctx N`. Needle retrieval EXACT at
+6.5k and 33.4k (prefill 166s, ~2s/step there). Remaining walls (next arc):
+full-layer attention is DRAM-bound at long kv (256× K/V stream redundancy →
+flash-decode layout: more query rows per stream + kv-split & merge), and
+prefill is chunk-serial (M=256 forwards; multi-chunk batching is the deep
+fix). See agent memory `long-context-100k`.
+
+## Open items
 
 | Item | Note |
 |---|---|
+| Long-context speed | flash-decode full-attention + batched prefill (above) |
 | Seed-123 empty-reply artifact | short factual prompts, both prefill paths (engine 5 / fast 2 of 17 at that seed); trajectory-level, pre-existing |
 | Legacy GEMM retirement | `gemm_block*` legacy pipelines after a stable tunable cycle (KERNELS.md deprecation list; needs user nod) |
 | Mechanical kernel merges | embed_gather / gather_rows / f32_to_half families (KERNELS.md) |
