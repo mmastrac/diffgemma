@@ -270,6 +270,8 @@ enum Command {
         verbose: bool,
         events_path: Option<PathBuf>,
         json: bool,
+        /// Context window (max_seq) override; None = default 8192.
+        ctx: Option<usize>,
     },
     Smoketest {
         prompts_path: Option<PathBuf>,
@@ -687,6 +689,7 @@ fn main() -> ExitCode {
             verbose,
             events_path,
             json,
+            ctx,
         } => run_chat_cmd(
             &cli.model_dir,
             initial_prompt,
@@ -699,6 +702,7 @@ fn main() -> ExitCode {
             verbose,
             events_path,
             json,
+            ctx,
         ),
         Command::Smoketest {
             prompts_path,
@@ -2835,6 +2839,7 @@ fn parse_cli() -> Cli {
     let mut positional = Vec::new();
     let mut seed = 42u64;
     let mut seed_explicit = false;
+    let mut chat_ctx: Option<usize> = None;
     let mut steps_override: Option<usize> = None;
     let mut prompt_len = 8usize;
     let mut max_new_tokens = 256usize;
@@ -2947,6 +2952,14 @@ fn parse_cli() -> Cli {
             "--no-early-stop" => no_early_stop = true,
             "--verbose" => chat_verbose = true,
             "--json" => chat_json = true,
+            "--ctx" => {
+                if let Some(v) = args.next() {
+                    chat_ctx = Some(v.parse().unwrap_or_else(|_| {
+                        eprintln!("invalid --ctx");
+                        std::process::exit(2);
+                    }));
+                }
+            }
             "--events" => {
                 if let Some(v) = args.next() {
                     chat_events_path = Some(PathBuf::from(v));
@@ -3199,6 +3212,7 @@ fn parse_cli() -> Cli {
             verbose: chat_verbose,
             events_path: chat_events_path.clone(),
             json: chat_json,
+            ctx: chat_ctx,
         },
         Some("smoketest") => Command::Smoketest {
             prompts_path: positional.get(1).map(PathBuf::from),
@@ -3874,6 +3888,7 @@ fn run_chat_cmd(
     verbose: bool,
     events_path: Option<PathBuf>,
     json: bool,
+    ctx: Option<usize>,
 ) -> ExitCode {
     use metal::{generate_with_session, StepGenerateConfig, StepGenerateSession};
     use std::io::{self, IsTerminal, Write};
@@ -3933,10 +3948,12 @@ fn run_chat_cmd(
     // Full-message chat: generate until the model emits its end-of-turn token,
     // limited only by the context window (no per-turn token cap — long replies
     // stream freely). The KV arena is sized once at session open and fixed
-    // thereafter, so pick a roomy `max_seq` up front (8192 ≈ 1.7 GiB KV; leaves
-    // ~8k tokens of headroom for a long poem etc.). `--max-new-tokens`, if the
-    // caller raises it above the default, becomes an optional hard ceiling.
-    const CHAT_MAX_SEQ: usize = 8192;
+    // thereafter, so pick a roomy `max_seq` up front. `--ctx N` overrides for
+    // long-context sessions (ring-buffer sliding KV keeps this cheap:
+    // ~20 KB/token + ~410 MiB fixed; 131072 ≈ 3 GiB). `--max-new-tokens`, if
+    // the caller raises it above the default, becomes an optional hard ceiling.
+    #[allow(non_snake_case)]
+    let CHAT_MAX_SEQ: usize = ctx.unwrap_or(8192);
     let explicit_cap = if max_new_tokens > 256 {
         Some(max_new_tokens)
     } else {
