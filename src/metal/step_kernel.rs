@@ -6681,6 +6681,96 @@ mod tests {
         assert_eq!(diff13, 0.0, "chunked softembed nondeterministic (run3)");
     }
 
+    /// Offset-prefill bit-identity (cross-turn KV reuse, e3f79cd):
+    /// `prefill_chunks(prefix)` + `prefill_chunks_from(offset, delta)` must
+    /// produce KV bytes identical to a single `prefill_chunks(all)` over the
+    /// valid positions [0..n), every layer. The offset is deliberately NOT a
+    /// chunk multiple so the delta chunk boundary lands mid-canvas. `--ignored`
+    /// (needs a model dir).
+    #[test]
+    #[ignore]
+    fn offset_prefill_kv_bit_identity() {
+        use std::path::Path;
+
+        let dir = [
+            Path::new("model/diffusiongemma-q4emb"),
+            Path::new("/tmp/quantized-weights"),
+            Path::new("model/diffusiongemma-q4"),
+            Path::new("model/q4"),
+        ]
+        .into_iter()
+        .find(|p| crate::dgq::store::looks_like_dgq_dir(p));
+        let Some(dir) = dir else {
+            eprintln!("skip offset_prefill_kv_bit_identity");
+            return;
+        };
+        let cfg = StepSmokeConfig {
+            finish: StepFinishMode::Full,
+            steps: 1,
+            // Mid-chunk offset resume writes up to offset+CANVAS: needs headroom.
+            max_seq: 1024,
+            ..StepSmokeConfig::default()
+        };
+        let (mut rt, _) = build_step_runtime(dir, &cfg).expect("runtime");
+        let layout = rt.layout;
+
+        // Spans two chunks in the full run; split point mid-chunk.
+        let n = 400usize;
+        let offset = 300usize;
+        let tokens: Vec<u32> = (0..n)
+            .map(|i| ((i.wrapping_mul(2654435761)) % 200_000) as u32 + 5)
+            .collect();
+
+        let read_kv_prefix = |rt: &StepRuntime, n: usize| -> Vec<Vec<u8>> {
+            let ptr = rt.bufs.kvcache.contents().as_ptr() as *const u8;
+            (0..N_LAYERS)
+                .map(|layer| {
+                    let l = &layout.layers[layer];
+                    let token_stride =
+                        (l.n_kv_heads as usize) * (l.head_dim as usize) * 2 * 2;
+                    let base = l.kv_region as usize;
+                    unsafe {
+                        std::slice::from_raw_parts(ptr.add(base), n * token_stride)
+                            .to_vec()
+                    }
+                })
+                .collect()
+        };
+
+        let kv_len = rt.prefill_chunks(&tokens).expect("full prefill");
+        assert_eq!(kv_len, n);
+        let full = read_kv_prefix(&rt, n);
+
+        zero_buffer(&rt.bufs.kvcache);
+        let k1 = rt.prefill_chunks(&tokens[..offset]).expect("prefix prefill");
+        assert_eq!(k1, offset);
+        let k2 = rt
+            .prefill_chunks_from(offset, &tokens[offset..])
+            .expect("offset prefill");
+        assert_eq!(k2, n);
+        let split = read_kv_prefix(&rt, n);
+
+        let mut bad = 0usize;
+        for layer in 0..N_LAYERS {
+            if full[layer] != split[layer] {
+                let l = &layout.layers[layer];
+                let token_stride =
+                    (l.n_kv_heads as usize) * (l.head_dim as usize) * 2 * 2;
+                let first = full[layer]
+                    .iter()
+                    .zip(split[layer].iter())
+                    .position(|(a, b)| a != b)
+                    .unwrap();
+                eprintln!(
+                    "layer {layer}: KV mismatch first at byte {first} (pos {})",
+                    first / token_stride
+                );
+                bad += 1;
+            }
+        }
+        assert_eq!(bad, 0, "offset prefill not bit-identical to full prefill");
+    }
+
     #[test]
     #[ignore = "pre-existing CPU chunked decomposition bug (max_abs=3.7); GPU parity passes"]
     fn sc_chunked_cpu_oracle() {
