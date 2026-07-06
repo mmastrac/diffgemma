@@ -182,6 +182,16 @@ pub fn kv_reuse_enabled() -> bool {
     on_unless_zero("DGQ_KV_REUSE")
 }
 
+/// MMA attention in the fast prefill (`DGQ_PREFILL_MMA=0` restores the scalar
+/// prefill attention). The MMA kernels honor the causal mask + sliding window;
+/// scalar prefill was kept from the freeze era when f16 prefill attention
+/// scored 11/16 vs 14/16 — re-validated after no-freeze (which fixed the
+/// fast-prefill degeneration class): gate-neutral, and scalar prefill is
+/// O(kv_len) serial per query = unusable at long context (6.5k prompt: 98.6s).
+pub fn prefill_mma_enabled() -> bool {
+    on_unless_zero("DGQ_PREFILL_MMA")
+}
+
 /// Fast (quantized) between-block KV extend (`DGQ_FAST_BLOCK_EXTEND=0` restores
 /// the f32 engine extend). After a canvas block commits, its 256 tokens are
 /// causally extended into KV via `prefill_chunks_from` (~0.85s) instead of the

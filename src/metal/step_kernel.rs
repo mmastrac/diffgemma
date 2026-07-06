@@ -3057,11 +3057,14 @@ impl StepEnc<'_> {
         // enabled, else the scalar kernel. Identical buffer layout — only the
         // pipeline + dispatch grid differ. mma_full is non-bit-identical (quality
         // gate): default OFF.
-        // mma2/mma_full honor the causal mask (AttnDims.causal) so they *can* run
-        // prefill, but their f16 attention is lossier than the scalar f32 kernel and
-        // hurts fast-prefill accuracy (11/16 vs 14/16); prefill uses scalar for now.
-        let use_mma2 = !self.prefill_causal && attn_mma_enabled() && l.is_full == 0;
-        let use_mma_full = !self.prefill_causal && attn_mma_full_enabled() && l.is_full == 1;
+        // mma2/mma_full honor the causal mask (AttnDims.causal) + sliding window,
+        // so they run prefill too (DGQ_PREFILL_MMA=0 restores scalar prefill).
+        // The old "f16 prefill hurts accuracy (11/16 vs 14/16)" verdict was from
+        // the freeze era; no-freeze fixed that degeneration class, and scalar
+        // prefill is O(kv_len) serial per query — unusable at long context.
+        let mma_ok = !self.prefill_causal || crate::flags::prefill_mma_enabled();
+        let use_mma2 = mma_ok && attn_mma_enabled() && l.is_full == 0;
+        let use_mma_full = mma_ok && attn_mma_full_enabled() && l.is_full == 1;
         if use_mma2 {
             self.sink_set_pipeline(&self.ps.attention_mma2);
         } else if use_mma_full {
