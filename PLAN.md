@@ -21,9 +21,11 @@ The engine is in ship shape:
   mixed-config single-seed artifact — quant format alone swings MLX's own
   convergence 12↔27 steps on one canvas). Chat: cross-turn KV reuse (turn-3
   prefill −71%), entropy early stop default-on (0.05, signed off), fast
-  between-block extend (~10s → 0.85s/block). Wall-clock vs MLX-4bit (their
-  fastest config, temp 0, natural finish): short/medium replies WIN
-  (3.2 vs 3.7s; 26.0 vs 27.6s), ~940-token reply 66 vs 59s (1.12×).
+  between-block extend (~10s → 0.85s/block), attention occupancy fix
+  (2.4-2.8×, kv-scaling halved). **Wall-clock vs MLX-4bit (their fastest
+  config, temp 0, natural finish): ours WINS on every probe** — capital
+  2.9 vs 3.7s; sky ~410tok 22.0 vs 27.6s (18.6 tok/s); transformer ~840tok
+  50.2 vs 59.2s (16.7 tok/s).
 - **Quality**: MLX-exact sampler semantics default (no-freeze + argmax commit,
   signed off 2026-07-05). Wart census 0/10 (was 4/10). Smoketest 17/17 at the
   spec seed. Fast-prefill degenerate class fixed as a side effect.
