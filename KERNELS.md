@@ -41,7 +41,15 @@ kernel exist / merge / change dtype"; re-audit when a family gains members.
 - **f16 where values are bounded [0,1]**: `sc_probs` (fp16 + GEMM prob scale),
   attention P tiles (half). Already done; nothing else qualifies.
 - **Always-bf16 buffers** (range or cross-path layout): logits (`FC29` forced),
-  KV cache (b4 layout shared with the engine), RouteScratch weights.
+  RouteScratch weights.
+- **KV cache: f16 (2026-07-06, was bf16).** Range-checked (max|KV| = 21.9 on a
+  real prompt; f16 max 65504) — f16's 10 mantissa bits beat bf16's 7
+  everywhere in the live range (gate went 45/51 -> 47/51 on the flip). The
+  real motive: f16 lets the MMA attention kernels `simdgroup_load` K/V tiles
+  straight from device memory, deleting the whole bf16->half staging pass —
+  the long-context attention enabler. All writers (qk_rope_kv,
+  pack_encoder_kv, CPU pack) and readers converted together; the
+  producer/consumer-mismatch rule below applies doubly here.
 - **Always-f32**: moeout plane, rowstats planes, MoE grouped scratch.
 - **The real precision hazard is producer/consumer dtype mismatch**, not the
   choice of dtype. Audit found exactly one (latent): `sc_probs` /
