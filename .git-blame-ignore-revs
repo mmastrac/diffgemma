@@ -1,0 +1,7 @@
+# Revisions to ignore in `git blame` (mechanical, non-functional changes).
+# Enable locally with:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+# GitHub honors this file automatically.
+
+# style: apply cargo fmt across the tree
+2ef3476834a1b8198476589e8c04732274f14b36
