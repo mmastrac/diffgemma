@@ -98,10 +98,7 @@ pub fn per_layer_stages(profile: &StepBlockProfile) -> Vec<StepStage> {
         StepStage::LayerRouter,
     ];
     stages.extend(moe_stages(profile));
-    stages.extend([
-        StepStage::LayerMoePostNorm,
-        StepStage::LayerMoePostCombine,
-    ]);
+    stages.extend([StepStage::LayerMoePostNorm, StepStage::LayerMoePostCombine]);
     stages
 }
 

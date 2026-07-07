@@ -129,8 +129,8 @@ mod tests {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn gpu_shader_table_matches_reference() {
-        use crate::kernels::sub::variant::KernelVariant;
         use crate::kernels::sub::test_util::assert_oracle;
+        use crate::kernels::sub::variant::KernelVariant;
 
         let fix = table_fixture(ElemFormat::F32);
         let gpu_out = gpu(&fix, KernelVariant::PRODUCTION).expect("gpu decode");

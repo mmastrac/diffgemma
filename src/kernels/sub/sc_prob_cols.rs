@@ -57,9 +57,7 @@ pub fn chunk_fixture(_: ElemFormat) -> Fixture {
     let vocab = 512usize;
     let v0 = 128usize;
     let chunk = 64usize;
-    let logits: Vec<f32> = (0..rows * vocab)
-        .map(|i| (i as f32 % 17.0) - 8.0)
-        .collect();
+    let logits: Vec<f32> = (0..rows * vocab).map(|i| (i as f32 % 17.0) - 8.0).collect();
     Fixture {
         logits,
         rows,
@@ -84,7 +82,8 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
             // Kernel stores fp16(prob * SCALE); recover the prob (caller divides
             // SCALE back out) so the test compares probs at the kernel's precision.
             let prob = ((x - mx).exp()) / sum;
-            out[row * f.chunk + col] = f16::round_half(prob * SC_PROB_GEMM_SCALE) / SC_PROB_GEMM_SCALE;
+            out[row * f.chunk + col] =
+                f16::round_half(prob * SC_PROB_GEMM_SCALE) / SC_PROB_GEMM_SCALE;
         }
     }
     out
@@ -137,7 +136,9 @@ pub fn dispatch_shape(rows: usize, chunk: usize) -> (objc2_metal::MTLSize, objc2
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use objc2::runtime::ProtocolObject;
 #[cfg(all(feature = "metal", target_os = "macos"))]
-use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+};
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub fn bind_gpu_buffers(
@@ -175,12 +176,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         .ok_or(Error::Format("alloc"))?;
     BufferPool::write_bf16(&buf_l, &bf16::f32_slice_to_bf16_bits(&f.logits));
     BufferPool::write_f32(&buf_rs, &rowstat);
-    let params = [
-        f.rows as u32,
-        f.vocab as u32,
-        f.v0 as u32,
-        f.chunk as u32,
-    ];
+    let params = [f.rows as u32, f.vocab as u32, f.v0 as u32, f.chunk as u32];
     let (grid, tg) = dispatch_shape(f.rows, f.chunk);
     let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
     let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;

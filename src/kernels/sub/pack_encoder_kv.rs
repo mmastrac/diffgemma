@@ -23,7 +23,10 @@ pub fn pipeline_fmt_for(
     variant: KernelVariant,
     fmt: crate::kernels::sub::kv_quant::KvFormat,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    let uints = [crate::kernels::sub::variant::FcUInt { index: 4, value: fmt.code() }];
+    let uints = [crate::kernels::sub::variant::FcUInt {
+        index: 4,
+        value: fmt.code(),
+    }];
     ctx.compile_subkernel_ex(SHADER, ENTRY, variant, fmt.label(), &[], &uints)
 }
 

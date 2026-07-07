@@ -94,7 +94,9 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     } else {
         4
     };
-    let buf_d = pool.allocate(&ctx.device, dump_bytes).ok_or(Error::Format("alloc"))?;
+    let buf_d = pool
+        .allocate(&ctx.device, dump_bytes)
+        .ok_or(Error::Format("alloc"))?;
     BufferPool::write_bf16(&buf_x, &x_bf16);
     gpu_common::dispatch_1d(&ctx.queue, &pipeline.pipeline, f.len as usize, |enc| {
         bind_gpu_buffers(enc, &buf_x, &buf_y, &buf_d, f.base, f.len);

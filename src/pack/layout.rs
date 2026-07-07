@@ -59,7 +59,11 @@ pub fn align_offset(offset: u64) -> u64 {
 }
 
 /// Classify a safetensors tensor for inference-oriented packing.
-pub fn classify_tensor(name: &str, shape: &[i64], dtype: crate::safetensors::DType) -> TensorLayout {
+pub fn classify_tensor(
+    name: &str,
+    shape: &[i64],
+    dtype: crate::safetensors::DType,
+) -> TensorLayout {
     if name.ends_with(".experts.gate_up_proj") && shape.len() == 3 {
         return TensorLayout::ExpertGateUpT;
     }

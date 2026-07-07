@@ -2,10 +2,10 @@
 
 use crate::config::ModelConfig;
 use crate::metal::decoder_layer::{forward_encoder_extend, forward_encoder_prefill};
-use crate::model::encoder::EncoderPrefillInput;
 use crate::metal::engine::GpuDecoderEngine;
 use crate::metal::weights::GpuDecoderWeightCache;
 use crate::model::embed::embed_tokens_from_store;
+use crate::model::encoder::EncoderPrefillInput;
 use crate::model::encoder::EncoderScratch;
 use crate::model::kv_cache::KvCache;
 use crate::model::layer_weights::DecoderLayerWeights;
@@ -80,18 +80,15 @@ pub fn prefill_gpu(
     // layers — 2 syncs/layer (route flush + MoE batch) instead of 4 with
     // multi-MiB host round-trips. Bit-identical kernels/order to the classic
     // path. `DGQ_PREFILL_RESIDENT=0` falls back to the classic per-layer path.
-    let resident = weights.is_dgq()
-        && engine.encoder_gpu_moe()
-        && crate::flags::prefill_resident_enabled();
+    let resident =
+        weights.is_dgq() && engine.encoder_gpu_moe() && crate::flags::prefill_resident_enabled();
     if resident {
         if progress_enabled() {
             eprintln!(
                 "encoder: prefill starting ({n_layers} layers, {seq_len} tokens, gpu-resident)..."
             );
         }
-        let bufs = crate::metal::decoder_layer::PrefillResidentBufs::new(
-            engine, seq_len, hidden,
-        )?;
+        let bufs = crate::metal::decoder_layer::PrefillResidentBufs::new(engine, seq_len, hidden)?;
         bufs.upload_hidden(0, &enc_scratch.hidden_a[..seq_len * hidden])?;
         // Tiny reusable scratch — the resident path never touches the CPU
         // attention/MoE buffers a full per-layer GpuDecoderLayerScratch carries.
@@ -118,9 +115,7 @@ pub fn prefill_gpu(
                     &gpu_kv,
                 )?;
             }
-            if progress_enabled()
-                && (layer == 0 || layer + 1 == n_layers || (layer + 1) % 5 == 0)
-            {
+            if progress_enabled() && (layer == 0 || layer + 1 == n_layers || (layer + 1) % 5 == 0) {
                 eprintln!(
                     "encoder: prefill layer {}/{} ({layer_elapsed:.2?}, cumulative {cum:.2?})",
                     layer + 1,
@@ -147,9 +142,7 @@ pub fn prefill_gpu(
     }
 
     if progress_enabled() {
-        eprintln!(
-            "encoder: prefill starting ({n_layers} layers, {seq_len} tokens)..."
-        );
+        eprintln!("encoder: prefill starting ({n_layers} layers, {seq_len} tokens)...");
     }
     let mut use_a_input = true;
     for layer in 0..n_layers {
@@ -199,9 +192,7 @@ pub fn prefill_gpu(
         if !weights.is_dgq() {
             weights.release_layer();
         }
-        if progress_enabled()
-            && (layer == 0 || layer + 1 == n_layers || (layer + 1) % 5 == 0)
-        {
+        if progress_enabled() && (layer == 0 || layer + 1 == n_layers || (layer + 1) % 5 == 0) {
             eprintln!(
                 "encoder: prefill layer {}/{} ({layer_elapsed:.2?}, cumulative {cum:.2?})",
                 layer + 1,

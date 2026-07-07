@@ -112,7 +112,9 @@ pub fn gpu(f: &Fixture, _variant: super::KernelVariant) -> Result<Vec<f32>, Erro
     use crate::kernels::sub::gemm_q8;
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
-    use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+    use objc2_metal::{
+        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+    };
 
     let ctx = MetalContext::new()?;
     let pipeline = pipeline_for(&ctx, f.n as u32, f.k as u32)?;

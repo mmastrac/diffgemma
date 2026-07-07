@@ -67,8 +67,9 @@ pub fn stacked_pipeline_for(
     use std::sync::{Mutex, OnceLock};
     type Key = crate::kernels::sub::gemm_block_stacked::StackedPipelineKey;
 
-    static CACHE: OnceLock<Mutex<HashMap<Key, std::sync::Arc<crate::metal::device::ComputePipeline>>>> =
-        OnceLock::new();
+    static CACHE: OnceLock<
+        Mutex<HashMap<Key, std::sync::Arc<crate::metal::device::ComputePipeline>>>,
+    > = OnceLock::new();
     let stacked = crate::kernels::sub::gemm_block_stacked::StackedSegFc::from_segments(segs)?;
     let key = Key::new(n, k, format, stacked);
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));

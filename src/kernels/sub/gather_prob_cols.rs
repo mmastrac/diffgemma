@@ -117,7 +117,9 @@ pub fn bind_gpu_buffers(
 pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
-    use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+    use objc2_metal::{
+        MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+    };
 
     let ctx = MetalContext::new()?;
     let pipeline = pipeline_for(&ctx, variant)?;
@@ -126,9 +128,17 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let buf_p = pool
         .allocate(&ctx.device, f.probs.len() * 4)
         .ok_or(Error::Format("alloc"))?;
-    let buf_o = pool.allocate(&ctx.device, out_len * 4).ok_or(Error::Format("alloc"))?;
-    let dump_bytes = if variant.dump_stage > 0 { out_len * 4 } else { 4 };
-    let buf_d = pool.allocate(&ctx.device, dump_bytes).ok_or(Error::Format("alloc"))?;
+    let buf_o = pool
+        .allocate(&ctx.device, out_len * 4)
+        .ok_or(Error::Format("alloc"))?;
+    let dump_bytes = if variant.dump_stage > 0 {
+        out_len * 4
+    } else {
+        4
+    };
+    let buf_d = pool
+        .allocate(&ctx.device, dump_bytes)
+        .ok_or(Error::Format("alloc"))?;
     BufferPool::write_f32(&buf_p, &f.probs);
     let params = [f.rows as u32, f.vocab as u32, f.v0 as u32, f.chunk as u32];
     let (grid, tg) = dispatch_shape(f.rows, f.chunk);

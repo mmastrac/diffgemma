@@ -24,27 +24,26 @@
 //! Engine `GpuKvCache` uses separate f32 K/V buffers with RoPE applied at read time; the monolithic
 //! cache stores **post-RoPE K** and **V** in the layout above. M1.2 packs CPU encoder prefill output.
 
-use crate::flags::progress_enabled;
 use crate::config::ModelConfig;
-use crate::kernels::sub::f16::{f16_bits_to_f32, f32_to_f16_bits};
-use crate::metal::decoder::load_weight_cache_opt;
-use crate::metal::kv_cache::GpuKvCache;
-use crate::metal::engine::GpuDecoderEngine;
-use crate::metal::encoder_extend::{extend_prefill_gpu, prefill_gpu};
-use crate::metal::step_kernel::{
-    build_layout, build_offsets_from_store, build_step_runtime,
-    step_params_from_sampler, ModelLayout, CANVAS, N_LAYERS, StepFinishMode, StepSmokeConfig,
-    VOCAB, run_step_forward,
-};
-use crate::sample::{step_entropy_stats, Rng, SamplerConfig};
-use crate::metal::device::MetalContext;
 use crate::dgq::DgqStore;
+use crate::flags::progress_enabled;
+use crate::kernels::sub::f16::{f16_bits_to_f32, f32_to_f16_bits};
 use crate::metal::GpuDecoderScratch;
+use crate::metal::decoder::load_weight_cache_opt;
+use crate::metal::device::MetalContext;
+use crate::metal::encoder_extend::{extend_prefill_gpu, prefill_gpu};
+use crate::metal::engine::GpuDecoderEngine;
+use crate::metal::kv_cache::GpuKvCache;
+use crate::metal::step_kernel::{
+    CANVAS, ModelLayout, N_LAYERS, StepFinishMode, StepSmokeConfig, VOCAB, build_layout,
+    build_offsets_from_store, build_step_runtime, run_step_forward, step_params_from_sampler,
+};
 use crate::metal::weights::GpuDecoderWeightCache;
 use crate::model::Model;
 use crate::model::encoder::{EncoderPrefillInput, EncoderScratch};
 use crate::model::kv_cache::KvCache;
 use crate::safetensors::Error;
+use crate::sample::{Rng, SamplerConfig, step_entropy_stats};
 use crate::weights::WeightStore;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -102,9 +101,7 @@ pub fn pack_kv_cache_to_monolithic(
     }
     for layer in 0..N_LAYERS.min(kv.layers.len()) {
         let l = &layout.layers[layer];
-        let kv_layer = kv
-            .layer(layer)
-            .ok_or(Error::Format("missing kv layer"))?;
+        let kv_layer = kv.layer(layer).ok_or(Error::Format("missing kv layer"))?;
         if kv_layer.n_kv_heads as u32 != l.n_kv_heads || kv_layer.head_dim as u32 != l.head_dim {
             return Err(Error::Format("kv layer head dims mismatch"));
         }
@@ -126,7 +123,10 @@ pub fn pack_kv_cache_to_monolithic(
             for hh in 0..nkv {
                 let ksrc = pos * per_token + hh * hd;
                 if fmt == KvFormat::Q8 {
-                    kv_q8_pack_row(&mut dst[slot_b + hh * row_b..], &kv_layer.keys[ksrc..ksrc + hd]);
+                    kv_q8_pack_row(
+                        &mut dst[slot_b + hh * row_b..],
+                        &kv_layer.keys[ksrc..ksrc + hd],
+                    );
                     kv_q8_pack_row(
                         &mut dst[slot_b + (nkv + hh) * row_b..],
                         &kv_layer.values[ksrc..ksrc + hd],
@@ -166,7 +166,10 @@ fn kv_q8_pack_row(row: &mut [u8], src: &[f32]) {
 
 /// Dequantize one element of a q8 row (inverse of `kv_q8_pack_row`).
 fn kv_q8_read(row: &[u8], d: usize, hd: usize) -> f32 {
-    let s = f16_bits_to_f32(u16::from_le_bytes([row[hd + (d / 32) * 2], row[hd + (d / 32) * 2 + 1]]));
+    let s = f16_bits_to_f32(u16::from_le_bytes([
+        row[hd + (d / 32) * 2],
+        row[hd + (d / 32) * 2 + 1],
+    ]));
     (row[d] as i8) as f32 * s
 }
 
@@ -180,9 +183,7 @@ pub fn write_monolithic_kv_buffer(
     if buf.length() < need {
         return Err(Error::Format("monolithic kv buffer too small"));
     }
-    let dst = unsafe {
-        std::slice::from_raw_parts_mut(buf.contents().as_ptr() as *mut u8, need)
-    };
+    let dst = unsafe { std::slice::from_raw_parts_mut(buf.contents().as_ptr() as *mut u8, need) };
     dst.fill(0);
     pack_kv_cache_to_monolithic(dst, layout, kv, max_seq)
 }
@@ -200,7 +201,9 @@ pub fn read_monolithic_kv_prefix_to_cpu_cache(
     kv.kv_len = kv_len;
     for layer in 0..N_LAYERS.min(kv.layers.len()) {
         let l = &layout.layers[layer];
-        let kv_layer = kv.layer_mut(layer).ok_or(Error::Format("missing kv layer"))?;
+        let kv_layer = kv
+            .layer_mut(layer)
+            .ok_or(Error::Format("missing kv layer"))?;
         let nkv = l.n_kv_heads as usize;
         let hd = l.head_dim as usize;
         let per_token = nkv * hd;
@@ -251,7 +254,9 @@ pub fn run_step_kv_bf16_cross_parity(
     let layout = build_layout(&build_offsets_from_store(&dgq_store), max_seq);
     let bf16_model = Model::open(bf16_dir)?;
     if bf16_model.weights.is_quantized() {
-        return Err(Error::Format("bf16 cross parity requires bf16 safetensors dir"));
+        return Err(Error::Format(
+            "bf16 cross parity requires bf16 safetensors dir",
+        ));
     }
     let ctx = MetalContext::new()?;
     let kv_bytes = kv_cache_total_bytes(&layout, max_seq) as usize;
@@ -262,8 +267,7 @@ pub fn run_step_kv_bf16_cross_parity(
     };
     let gpu_buf = alloc_kv()?;
     let cpu_buf = alloc_kv()?;
-    let mut gpu_cache =
-        MonolithicEncoderCache::open_opt(dgq_dir, CANVAS, max_seq, None)?;
+    let mut gpu_cache = MonolithicEncoderCache::open_opt(dgq_dir, CANVAS, max_seq, None)?;
     let (kv_len, _) = prefill_monolithic_kv_with_cache(
         &mut gpu_cache,
         token_ids,
@@ -329,26 +333,21 @@ fn pack_gpu_kv_prefix_to_monolithic(
         let hd = l.head_dim as usize;
         let (k_buf, v_buf) = gpu_kv.layer_buffers(layer)?;
         let (grid, tg) = pack_encoder_kv::dispatch_shape(token_count, nkv, hd, fmt);
-        batch.dispatch_with_grid(
-            &pack_pipeline,
-            grid,
-            tg,
-            |enc| {
-                pack_encoder_kv::bind_gpu_buffers(
-                    enc,
-                    &k_buf,
-                    &v_buf,
-                    kv_buf,
-                    token_count as u32,
-                    dst_pos as u32,
-                    nkv as u32,
-                    hd as u32,
-                    l.kv_region,
-                    src_pos as u32,
-                    l.kv_ring_mask,
-                );
-            },
-        );
+        batch.dispatch_with_grid(&pack_pipeline, grid, tg, |enc| {
+            pack_encoder_kv::bind_gpu_buffers(
+                enc,
+                &k_buf,
+                &v_buf,
+                kv_buf,
+                token_count as u32,
+                dst_pos as u32,
+                nkv as u32,
+                hd as u32,
+                l.kv_region,
+                src_pos as u32,
+                l.kv_ring_mask,
+            );
+        });
     }
     batch.end()
 }
@@ -382,23 +381,18 @@ impl MonolithicEncoderCache {
         let open_started = std::time::Instant::now();
         let model = Model::open(model_dir)?;
         let text = &model.config.text_config;
-        let weights = load_weight_cache_opt(
-            &model.weights,
-            text,
-            canvas,
-            max_seq_hint,
-            shared_dgq_blob,
-        )?;
+        let weights =
+            load_weight_cache_opt(&model.weights, text, canvas, max_seq_hint, shared_dgq_blob)?;
         let engine = GpuDecoderEngine::new()?;
         if model.weights.is_quantized() {
             engine.set_encoder_gpu_moe(true);
         }
         let dec_scratch = GpuDecoderScratch::new(canvas, &model.config);
         if progress_enabled() {
-        eprintln!(
-            "monolithic-encoder: cache open {:.2?} (model + engine weights)",
-            open_started.elapsed(),
-        );
+            eprintln!(
+                "monolithic-encoder: cache open {:.2?} (model + engine weights)",
+                open_started.elapsed(),
+            );
         }
         Ok(Self {
             model,
@@ -418,14 +412,7 @@ pub fn prefill_monolithic_kv_with_cache(
     max_seq: usize,
     max_layers: usize,
 ) -> Result<(usize, MonolithicPrefillTiming), Error> {
-    prefill_monolithic_kv_with_cache_timed(
-        cache,
-        token_ids,
-        kv_buf,
-        layout,
-        max_seq,
-        max_layers,
-    )
+    prefill_monolithic_kv_with_cache_timed(cache, token_ids, kv_buf, layout, max_seq, max_layers)
 }
 
 pub fn prefill_monolithic_kv_with_cache_timed(
@@ -479,11 +466,11 @@ pub fn prefill_monolithic_kv_with_cache_timed(
         let tel = cache.engine.telemetry_handle();
         let t = tel.borrow();
         if progress_enabled() {
-        eprintln!(
-            "monolithic-prefill: engine telemetry gpu_syncs={} readback={:.2} MiB",
-            t.gpu_syncs,
-            t.gpu_readback_bytes as f64 / (1024.0 * 1024.0),
-        );
+            eprintln!(
+                "monolithic-prefill: engine telemetry gpu_syncs={} readback={:.2} MiB",
+                t.gpu_syncs,
+                t.gpu_readback_bytes as f64 / (1024.0 * 1024.0),
+            );
         }
     }
     if !telemetry_was_on {
@@ -500,9 +487,8 @@ pub fn prefill_monolithic_kv_with_cache_timed(
     if kv_buf.length() < need {
         return Err(Error::Format("monolithic kv buffer too small"));
     }
-    let dst = unsafe {
-        std::slice::from_raw_parts_mut(kv_buf.contents().as_ptr() as *mut u8, need)
-    };
+    let dst =
+        unsafe { std::slice::from_raw_parts_mut(kv_buf.contents().as_ptr() as *mut u8, need) };
     dst.fill(0);
 
     let pack_started = std::time::Instant::now();
@@ -524,10 +510,10 @@ pub fn prefill_monolithic_kv_with_cache_timed(
         total_ms: total_started.elapsed().as_secs_f64() * 1000.0,
     };
     if progress_enabled() {
-    eprintln!(
-        "monolithic-prefill: kv_len={kv_len} gpu_forward={gpu_forward_ms:.1}ms kv_pack={kv_pack_ms:.1}ms total={:.1}ms",
-        timing.total_ms
-    );
+        eprintln!(
+            "monolithic-prefill: kv_len={kv_len} gpu_forward={gpu_forward_ms:.1}ms kv_pack={kv_pack_ms:.1}ms total={:.1}ms",
+            timing.total_ms
+        );
     }
     Ok((kv_len, timing))
 }
@@ -543,12 +529,7 @@ pub fn prefill_monolithic_kv(
 ) -> Result<usize, Error> {
     let mut cache = MonolithicEncoderCache::open(model_dir, CANVAS, max_seq)?;
     Ok(prefill_monolithic_kv_with_cache(
-        &mut cache,
-        token_ids,
-        kv_buf,
-        layout,
-        max_seq,
-        max_layers,
+        &mut cache, token_ids, kv_buf, layout, max_seq, max_layers,
     )?
     .0)
 }
@@ -653,12 +634,9 @@ pub fn extend_monolithic_kv_with_cache(
     let mut enc_scratch = EncoderScratch::new(new_token_ids.len(), &cache.model.config);
     let encoder_kv_cap = (kv_len_before + new_token_ids.len()).min(max_seq);
 
-    cache.dec_scratch.ensure_gpu_kv(
-        &cache.engine.ctx.device,
-        text,
-        encoder_kv_cap,
-        canvas,
-    )?;
+    cache
+        .dec_scratch
+        .ensure_gpu_kv(&cache.engine.ctx.device, text, encoder_kv_cap, canvas)?;
     let mut gpu_kv = cache
         .dec_scratch
         .gpu_kv
@@ -785,7 +763,10 @@ pub fn kvcache_prefix_max_abs(
         let start = (slot_base + pos * token_stride) * 2;
         let end = start + token_stride * 2;
         let bytes = unsafe {
-            std::slice::from_raw_parts(kv_buf.contents().as_ptr().add(start) as *const u8, end - start)
+            std::slice::from_raw_parts(
+                kv_buf.contents().as_ptr().add(start) as *const u8,
+                end - start,
+            )
         };
         for chunk in bytes.chunks_exact(2) {
             let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
@@ -840,19 +821,9 @@ pub fn run_step_kv_audit(
     let kv_bytes = kv_cache_total_bytes(&layout, max_seq) as usize;
     let kv_buf = ctx
         .device
-        .newBufferWithLength_options(
-            kv_bytes,
-            objc2_metal::MTLResourceOptions::StorageModeShared,
-        )
+        .newBufferWithLength_options(kv_bytes, objc2_metal::MTLResourceOptions::StorageModeShared)
         .ok_or(Error::Format("kv audit buffer alloc failed"))?;
-    let actual_kv = prefill_monolithic_kv(
-        model_dir,
-        &prompt,
-        &kv_buf,
-        &layout,
-        max_seq,
-        layers,
-    )?;
+    let actual_kv = prefill_monolithic_kv(model_dir, &prompt, &kv_buf, &layout, max_seq, layers)?;
     let prefix_max = kvcache_prefix_max_abs(&kv_buf, &layout, 0, actual_kv);
 
     let hidden_diff = zero
@@ -1033,7 +1004,10 @@ pub fn kvcache_plane_max_abs(
         let start = (slot_base + pos * token_stride + plane_off) * 2;
         let end = start + plane_slots * 2;
         let bytes = unsafe {
-            std::slice::from_raw_parts(kv_buf.contents().as_ptr().add(start) as *const u8, end - start)
+            std::slice::from_raw_parts(
+                kv_buf.contents().as_ptr().add(start) as *const u8,
+                end - start,
+            )
         };
         for chunk in bytes.chunks_exact(2) {
             let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
@@ -1074,7 +1048,9 @@ pub fn run_step_attn_probe(
     max_seq: usize,
 ) -> Result<StepAttnProbeResult, Error> {
     use crate::kernels::cpu::rms_norm;
-    use crate::model::attention::{attn_score_stats_decoder, qk_norm_weight_stats, AttentionParams};
+    use crate::model::attention::{
+        AttentionParams, attn_score_stats_decoder, qk_norm_weight_stats,
+    };
     use crate::model::mask::DecoderAttnMask;
     use crate::sample::Rng;
 
@@ -1096,8 +1072,7 @@ pub fn run_step_attn_probe(
             MTLResourceOptions::StorageModeShared,
         )
         .ok_or(Error::Format("kv buffer alloc failed"))?;
-    let mut native_cache =
-        MonolithicEncoderCache::open_opt(model_dir, canvas_len, max_seq, None)?;
+    let mut native_cache = MonolithicEncoderCache::open_opt(model_dir, canvas_len, max_seq, None)?;
     let (kv_len, _) = prefill_monolithic_kv_with_cache(
         &mut native_cache,
         token_ids,
@@ -1246,10 +1221,8 @@ pub fn run_step_kv_parity(
             .ok_or(Error::Format("kv parity buffer alloc failed"))
     };
 
-    let mut cache_a =
-        MonolithicEncoderCache::open_opt(model_dir, CANVAS, max_seq, None)?;
-    let mut cache_b =
-        MonolithicEncoderCache::open_opt(model_dir, CANVAS, max_seq, None)?;
+    let mut cache_a = MonolithicEncoderCache::open_opt(model_dir, CANVAS, max_seq, None)?;
+    let mut cache_b = MonolithicEncoderCache::open_opt(model_dir, CANVAS, max_seq, None)?;
 
     let buf_a = alloc_kv()?;
     let buf_b = alloc_kv()?;
@@ -1315,7 +1288,9 @@ pub fn run_encoder_moe_kv_parity(
     max_seq: usize,
 ) -> Result<(f32, usize, usize), Error> {
     if token_ids.is_empty() {
-        return Err(Error::Format("encoder moe kv parity requires at least one token"));
+        return Err(Error::Format(
+            "encoder moe kv parity requires at least one token",
+        ));
     }
     let layers = layers.max(1).min(N_LAYERS);
     let store = DgqStore::open(model_dir)?;
@@ -1329,11 +1304,9 @@ pub fn run_encoder_moe_kv_parity(
             .ok_or(Error::Format("encoder moe kv buffer alloc failed"))
     };
 
-    let mut cpu_cache =
-        MonolithicEncoderCache::open_opt(model_dir, CANVAS, max_seq, None)?;
+    let mut cpu_cache = MonolithicEncoderCache::open_opt(model_dir, CANVAS, max_seq, None)?;
     cpu_cache.engine.set_encoder_gpu_moe(false);
-    let mut gpu_cache =
-        MonolithicEncoderCache::open_opt(model_dir, CANVAS, max_seq, None)?;
+    let mut gpu_cache = MonolithicEncoderCache::open_opt(model_dir, CANVAS, max_seq, None)?;
     gpu_cache.engine.set_encoder_gpu_moe(true);
 
     let cpu_buf = alloc_kv()?;
@@ -1366,7 +1339,7 @@ pub fn run_encoder_moe_kv_parity(
 #[cfg(all(test, feature = "metal", target_os = "macos"))]
 mod encoder_moe_kv_tests {
     use super::*;
-    use crate::chat_template::{format_chat_token_ids, ChatFormatOptions, ChatTurn};
+    use crate::chat_template::{ChatFormatOptions, ChatTurn, format_chat_token_ids};
     use crate::metal::device::MetalContext;
     use crate::tokenizer::Tokenizer;
 
@@ -1374,9 +1347,7 @@ mod encoder_moe_kv_tests {
         let tok = Tokenizer::load(&model_dir.join("tokenizer.json")).expect("tokenizer");
         format_chat_token_ids(
             &tok,
-            &[ChatTurn::user(
-                "How can I get from Calgary to Namibia?",
-            )],
+            &[ChatTurn::user("How can I get from Calgary to Namibia?")],
             &ChatFormatOptions::default(),
         )
         .expect("prefill ids")
@@ -1390,30 +1361,34 @@ mod encoder_moe_kv_tests {
             return;
         }
         let ids = calgary_prefill(dir);
-        assert!(ids.len() >= 20, "expected long chat prompt, got {}", ids.len());
+        assert!(
+            ids.len() >= 20,
+            "expected long chat prompt, got {}",
+            ids.len()
+        );
         let ctx = MetalContext::new().expect("metal");
-        let layout = build_layout(&build_offsets_from_store(&DgqStore::open(dir).expect("dgq")), 512);
+        let layout = build_layout(
+            &build_offsets_from_store(&DgqStore::open(dir).expect("dgq")),
+            512,
+        );
         let kv_bytes = kv_cache_total_bytes(&layout, 512) as usize;
         let kv_buf = ctx
             .device
             .newBufferWithLength_options(kv_bytes, MTLResourceOptions::StorageModeShared)
             .expect("kv buf");
-        let mut cache = MonolithicEncoderCache::open_opt(dir, CANVAS, 512, None)
-            .expect("encoder cache");
+        let mut cache =
+            MonolithicEncoderCache::open_opt(dir, CANVAS, 512, None).expect("encoder cache");
         cache.engine.set_encoder_gpu_moe(true);
-        let (kv_len, _) = prefill_monolithic_kv_with_cache(
-            &mut cache,
-            &ids,
-            &kv_buf,
-            &layout,
-            512,
-            2,
-        )
-        .expect("prefill");
+        let (kv_len, _) =
+            prefill_monolithic_kv_with_cache(&mut cache, &ids, &kv_buf, &layout, 512, 2)
+                .expect("prefill");
         for layer in 0..2 {
             let k_max = kvcache_plane_max_abs(&kv_buf, &layout, layer, kv_len, 0);
             eprintln!("nvfp4 prefill L{layer}: kv_len={kv_len} k_max={k_max:.4}");
-            assert!(k_max > 1e-4, "layer {layer} K prefix looks unset (max={k_max})");
+            assert!(
+                k_max > 1e-4,
+                "layer {layer} K prefix looks unset (max={k_max})"
+            );
         }
     }
 
@@ -1426,8 +1401,7 @@ mod encoder_moe_kv_tests {
         }
         let ids = calgary_prefill(dir);
         assert_eq!(ids.len(), 22);
-        let (max_diff, layer, pos) =
-            run_encoder_moe_kv_parity(dir, &ids, 30, 512).expect("parity");
+        let (max_diff, layer, pos) = run_encoder_moe_kv_parity(dir, &ids, 30, 512).expect("parity");
         eprintln!(
             "encoder moe kv parity (Calgary, 22 tok): max_diff={max_diff:.6} layer={layer} pos={pos}"
         );

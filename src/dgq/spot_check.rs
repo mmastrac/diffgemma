@@ -128,7 +128,11 @@ pub fn spot_check_embed_row(
         max_abs_err: max_abs,
         mean_abs_err: sum_abs / hidden as f32,
         cosine: {
-            let dot: f32 = orig_row.iter().zip(dec_row.iter()).map(|(a, b)| a * b).sum();
+            let dot: f32 = orig_row
+                .iter()
+                .zip(dec_row.iter())
+                .map(|(a, b)| a * b)
+                .sum();
             let na: f32 = orig_row.iter().map(|x| x * x).sum::<f32>().sqrt();
             let nb: f32 = dec_row.iter().map(|x| x * x).sum::<f32>().sqrt();
             if na > 1e-12 && nb > 1e-12 {
@@ -232,9 +236,7 @@ mod tests {
         let bf16 = t.bf16().expect("bf16").as_bytes();
         let orig: Vec<f32> = bf16
             .chunks_exact(2)
-            .map(|c| {
-                crate::kernels::cpu::bf16_to_f32(u16::from_le_bytes([c[0], c[1]]))
-            })
+            .map(|c| crate::kernels::cpu::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect();
 
         let q4_path = std::path::Path::new("/tmp/quantized-weights");
@@ -252,9 +254,9 @@ mod tests {
             );
         }
 
+        use crate::dgq::block::{dequant_matrix_q4, quantize_bf16_matrix_q4};
         use crate::dgq::layout::{nvfp4_matrix_bytes, q4_matrix_bytes};
         use crate::dgq::nvfp4::{dequant_matrix_nvfp4_payload, quantize_bf16_matrix_nvfp4};
-        use crate::dgq::block::{dequant_matrix_q4, quantize_bf16_matrix_q4};
 
         let mut q4 = vec![0u8; q4_matrix_bytes(out_dim, in_dim)];
         quantize_bf16_matrix_q4(bf16, out_dim, in_dim, &mut q4);

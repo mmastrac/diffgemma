@@ -172,7 +172,11 @@ fn apply_loaded(
     for s in 0..seq_len {
         let off = s * hidden;
         scratch.normed[off..off + hidden].copy_from_slice(&out[off..off + hidden]);
-        rms_norm_no_scale(&mut out[off..off + hidden], &scratch.normed[off..off + hidden], eps);
+        rms_norm_no_scale(
+            &mut out[off..off + hidden],
+            &scratch.normed[off..off + hidden],
+            eps,
+        );
     }
     Ok(())
 }

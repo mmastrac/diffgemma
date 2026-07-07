@@ -1,8 +1,8 @@
 //! CPU reference for monolithic sampler kernels (tempered rowstats, commit, apply, write).
 
 use crate::sample::{
-    accept_mask_from_entropies, accept_mask_sig, diffusion_append_argmax_hist,
-    diffusion_argmax_canvas_stable, ARGMAX_HIST_MAX,
+    ARGMAX_HIST_MAX, accept_mask_from_entropies, accept_mask_sig, diffusion_append_argmax_hist,
+    diffusion_argmax_canvas_stable,
 };
 use crate::sample::{STOP_FLAG_CONFIDENT, STOP_FLAG_MAX_STEPS, STOP_FLAG_PLATEAU};
 
@@ -107,11 +107,7 @@ pub struct CommitOut {
 }
 
 /// Matches `sample_commit`.
-pub fn sample_commit_cpu(
-    step: u32,
-    rng_state: u64,
-    p: CommitParams<'_>,
-) -> CommitOut {
+pub fn sample_commit_cpu(step: u32, rng_state: u64, p: CommitParams<'_>) -> CommitOut {
     let canvas = p.canvas_size;
     let mut u_cat = vec![0.0f32; canvas];
     let mut st = rng_state;
@@ -175,8 +171,8 @@ pub fn sample_commit_cpu(
     let new_step = step + 1;
 
     let confident_stable = canvas_stable && mean_entropy < p.conf_threshold;
-    let plateau_stop = accept_plateau >= p.accept_plateau_threshold
-        && mean_entropy < p.plateau_prefix_mean_max;
+    let plateau_stop =
+        accept_plateau >= p.accept_plateau_threshold && mean_entropy < p.plateau_prefix_mean_max;
     let mut stop_flag = 0u32;
     if confident_stable {
         stop_flag = STOP_FLAG_CONFIDENT;
@@ -240,7 +236,10 @@ mod tests {
                 cfg.t_min,
                 cfg.t_max,
             );
-            assert!((cpu - metal).abs() < 1e-6, "step={step} cpu={cpu} metal={metal}");
+            assert!(
+                (cpu - metal).abs() < 1e-6,
+                "step={step} cpu={cpu} metal={metal}"
+            );
         }
     }
 

@@ -1,7 +1,7 @@
 //! Attention kernels batched through `GpuBatch` (shared engine pool/queue).
 
 use crate::kernels::sub::engine_gqa_common::{self, GqaParams};
-use crate::metal::batch::{set_bytes, GpuBatch};
+use crate::metal::batch::{GpuBatch, set_bytes};
 use crate::metal::device::ComputePipeline;
 use crate::model::attention::{AttentionParams, GqaMask, MASK_NEG};
 use crate::safetensors::Error;
@@ -54,8 +54,24 @@ pub fn rope_qk_batched(
         ..rope_q
     };
 
-    encode_rope(batch, &kernels.rope_pipeline.pipeline, &buf_q, &buf_f, &rope_q, n_heads, seq_len);
-    encode_rope(batch, &kernels.rope_pipeline.pipeline, &buf_k, &buf_f, &rope_k, n_kv_heads, seq_len);
+    encode_rope(
+        batch,
+        &kernels.rope_pipeline.pipeline,
+        &buf_q,
+        &buf_f,
+        &rope_q,
+        n_heads,
+        seq_len,
+    );
+    encode_rope(
+        batch,
+        &kernels.rope_pipeline.pipeline,
+        &buf_k,
+        &buf_f,
+        &rope_k,
+        n_kv_heads,
+        seq_len,
+    );
 
     batch.register_read(buf_q, q);
     batch.register_read(buf_k, k);
@@ -146,7 +162,6 @@ pub fn decoder_gqa_gpu_kv_batched(
         Some(buf_q),
     )
 }
-
 
 /// Device-to-device f32 copy: `dst[dst_byte_off/4 .. +len] = src[0..len]`.
 pub fn dispatch_copy_f32_to_buf(
@@ -272,7 +287,10 @@ fn gqa_batched_inner(
     attn_out: Option<&mut [f32]>,
     q: &[f32],
     kv_cpu: Option<(&[f32], &[f32])>,
-    kv_gpu: Option<(Retained<ProtocolObject<dyn MTLBuffer>>, Retained<ProtocolObject<dyn MTLBuffer>>)>,
+    kv_gpu: Option<(
+        Retained<ProtocolObject<dyn MTLBuffer>>,
+        Retained<ProtocolObject<dyn MTLBuffer>>,
+    )>,
     seq_len: usize,
     total_kv: usize,
     params: &AttentionParams,
@@ -518,7 +536,8 @@ mod prefill_attn_tests {
 
         let kernels = GpuAttentionKernels::new(&ctx).expect("attn kernels");
         let mut pool = BufferPool::new();
-        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None).expect("batch");
+        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None)
+            .expect("batch");
         let mut gpu_out = vec![0.0f32; q_dim];
         decoder_gqa_gpu_kv_batched(
             &mut batch,

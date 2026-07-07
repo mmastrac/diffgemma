@@ -58,11 +58,7 @@ impl GpuKvCache {
         self.layers.first().map(|l| l.capacity_tokens).unwrap_or(0)
     }
 
-    pub fn sync_all_from_cpu(
-        &mut self,
-        cpu: &KvCache,
-        canvas_len: usize,
-    ) -> Result<(), Error> {
+    pub fn sync_all_from_cpu(&mut self, cpu: &KvCache, canvas_len: usize) -> Result<(), Error> {
         if cpu.kv_len + canvas_len > self.layers.first().map(|l| l.capacity_tokens).unwrap_or(0) {
             return Err(Error::Format("GPU kv cache capacity exceeded"));
         }
@@ -120,11 +116,7 @@ impl GpuKvCache {
     }
 
     pub fn advance_kv_len(&mut self, append_len: usize) -> Result<(), Error> {
-        let cap = self
-            .layers
-            .first()
-            .map(|l| l.capacity_tokens)
-            .unwrap_or(0);
+        let cap = self.layers.first().map(|l| l.capacity_tokens).unwrap_or(0);
         if self.kv_len + append_len > cap {
             return Err(Error::Format("GPU kv cache capacity exceeded"));
         }

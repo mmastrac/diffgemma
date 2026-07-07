@@ -1,10 +1,10 @@
 //! Zero-copy `.dgq` blob → `MTLBuffer` and per-tensor GPU views.
 
-use crate::dgq::layout::{
-    blob_offset_for_mtl, dgq_version_supported, nvfp4_matrix_bytes,
-    q4_matrix_bytes, q8_row_bytes, QuantKind, MANIFEST_FILE,
-};
 use crate::dgq::DgqStore;
+use crate::dgq::layout::{
+    MANIFEST_FILE, QuantKind, blob_offset_for_mtl, dgq_version_supported, nvfp4_matrix_bytes,
+    q4_matrix_bytes, q8_row_bytes,
+};
 use crate::safetensors::Error;
 use memmap2::Mmap;
 use objc2::rc::Retained;
@@ -44,7 +44,8 @@ impl DgqGpuBlob {
         let file = File::open(&blob_path)?;
         let mmap = unsafe { Mmap::map(&file)? };
         let len = mmap.len();
-        let ptr = NonNull::new(mmap.as_ptr() as *mut c_void).ok_or(Error::Format("dgq mmap null"))?;
+        let ptr =
+            NonNull::new(mmap.as_ptr() as *mut c_void).ok_or(Error::Format("dgq mmap null"))?;
         let max_buf = device.maxBufferLength();
         if len <= max_buf {
             let buffer = unsafe {
@@ -121,7 +122,10 @@ impl DgqGpuBlob {
 
     /// (buffer, rebased offset) for an absolute blob offset.
     pub fn buffer_for(&self, off: u64) -> (&ProtocolObject<dyn MTLBuffer>, u64) {
-        match (&self.buffer_experts, off >= self.expert_split && self.expert_split > 0) {
+        match (
+            &self.buffer_experts,
+            off >= self.expert_split && self.expert_split > 0,
+        ) {
             (Some(b2), true) => (b2, off - self.expert_split),
             _ => (&self.buffer, off),
         }
@@ -315,9 +319,7 @@ impl Q8LinearGpu {
         let stride = self.row_stride();
         let (_, base) = self.weight_buffer();
         let byte = blob_offset_for_mtl(base) + row * stride;
-        let ptr = unsafe {
-            self.blob.buffer.contents().as_ptr().add(byte) as *const u8
-        };
+        let ptr = unsafe { self.blob.buffer.contents().as_ptr().add(byte) as *const u8 };
         let bits = u16::from_le_bytes([unsafe { *ptr }, unsafe { *ptr.add(1) }]);
         bf16_bits_to_f32(bits)
     }
@@ -376,9 +378,7 @@ pub fn log_q8_chunk_scale_histogram(w: &Q8LinearGpu, k_dim: usize, hidden: usize
     let (_, base) = w.weight_buffer();
     for col in 0..wrong_rows {
         let byte = base as usize + col * wrong_stride;
-        let ptr = unsafe {
-            w.blob.buffer.contents().as_ptr().add(byte) as *const u8
-        };
+        let ptr = unsafe { w.blob.buffer.contents().as_ptr().add(byte) as *const u8 };
         let bits = u16::from_le_bytes([unsafe { *ptr }, unsafe { *ptr.add(1) }]);
         let s = bf16_bits_to_f32(bits);
         wrong_max = wrong_max.max(s.abs());
@@ -402,7 +402,11 @@ pub fn parse_kind(s: &str) -> Result<QuantKind, Error> {
     }
 }
 
-pub fn load_q8_linear(store: &DgqStore, blob: Arc<DgqGpuBlob>, name: &str) -> Result<Q8LinearGpu, Error> {
+pub fn load_q8_linear(
+    store: &DgqStore,
+    blob: Arc<DgqGpuBlob>,
+    name: &str,
+) -> Result<Q8LinearGpu, Error> {
     let entry = store
         .get_entry(name)
         .ok_or_else(|| Error::NotFound(name.to_string()))?;
@@ -417,7 +421,11 @@ pub fn load_q8_linear(store: &DgqStore, blob: Arc<DgqGpuBlob>, name: &str) -> Re
     Ok(Q8LinearGpu::from_entry(blob, entry.meta.offset, out, inp))
 }
 
-pub fn load_block_linear(store: &DgqStore, blob: Arc<DgqGpuBlob>, name: &str) -> Result<Q4LinearGpu, Error> {
+pub fn load_block_linear(
+    store: &DgqStore,
+    blob: Arc<DgqGpuBlob>,
+    name: &str,
+) -> Result<Q4LinearGpu, Error> {
     let entry = store
         .get_entry(name)
         .ok_or_else(|| Error::NotFound(name.to_string()))?;
@@ -430,7 +438,13 @@ pub fn load_block_linear(store: &DgqStore, blob: Arc<DgqGpuBlob>, name: &str) ->
     }
     let out = entry.meta.shape[0] as usize;
     let inp = entry.meta.shape[1] as usize;
-    Ok(Q4LinearGpu::from_entry(blob, entry.meta.offset, out, inp, kind))
+    Ok(Q4LinearGpu::from_entry(
+        blob,
+        entry.meta.offset,
+        out,
+        inp,
+        kind,
+    ))
 }
 
 pub fn load_block_expert_stack(
@@ -459,7 +473,11 @@ pub fn load_block_expert_stack(
     })
 }
 
-pub fn load_raw_view(store: &DgqStore, blob: Arc<DgqGpuBlob>, name: &str) -> Result<RawBlobView, Error> {
+pub fn load_raw_view(
+    store: &DgqStore,
+    blob: Arc<DgqGpuBlob>,
+    name: &str,
+) -> Result<RawBlobView, Error> {
     let entry = store
         .get_entry(name)
         .ok_or_else(|| Error::NotFound(name.to_string()))?;
@@ -503,7 +521,9 @@ mod q4_gpu_tests {
         let m = 4usize;
         let k = q4.in_dim;
         let n = q4.out_dim;
-        let a: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.001 - 0.5).sin() * 0.01).collect();
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| (i as f32 * 0.001 - 0.5).sin() * 0.01)
+            .collect();
 
         let f32_w = store
             .tensor_f32("model.decoder.layers.0.self_attn.q_proj.weight")
@@ -533,19 +553,12 @@ mod q4_gpu_tests {
             prod,
         )
         .expect("nvfp4 pipeline");
-        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None).expect("batch");
+        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None)
+            .expect("batch");
         let buf_a = batch.alloc_f32(&a).expect("a");
-        let buf_c = f32_q4_linear_gpu_bufs(
-            &mut batch,
-            &pipeline,
-            &nvfp4_pipeline,
-            &buf_a,
-            &q4,
-            m,
-            k,
-            n,
-        )
-        .expect("gemm");
+        let buf_c =
+            f32_q4_linear_gpu_bufs(&mut batch, &pipeline, &nvfp4_pipeline, &buf_a, &q4, m, k, n)
+                .expect("gemm");
         let mut gpu_out = vec![0.0f32; m * n];
         batch.register_read(buf_c, &mut gpu_out);
         batch.end().expect("end");
@@ -579,7 +592,9 @@ mod q4_gpu_tests {
         let m = 4usize;
         let k = q8.in_dim;
         let n = q8.out_dim;
-        let a: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.001 - 0.5).sin() * 0.01).collect();
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| (i as f32 * 0.001 - 0.5).sin() * 0.01)
+            .collect();
 
         let f32_w = store
             .tensor_f32("model.decoder.embed_tokens.weight")
@@ -600,11 +615,13 @@ mod q4_gpu_tests {
         let prod = crate::kernels::sub::variant::KernelVariant::PRODUCTION;
         let pipeline =
             crate::kernels::sub::gemm_q8_linear_f32::pipeline_for(&ctx, prod).expect("pipeline");
-        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None).expect("batch");
+        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None)
+            .expect("batch");
         let buf_a = batch.alloc_f32(&a).expect("a");
-        let buf_c =
-            crate::metal::linear::f32_q8_linear_gpu_bufs(&mut batch, &pipeline, &buf_a, &q8, m, k, n)
-                .expect("gemm");
+        let buf_c = crate::metal::linear::f32_q8_linear_gpu_bufs(
+            &mut batch, &pipeline, &buf_a, &q8, m, k, n,
+        )
+        .expect("gemm");
         let mut gpu_out = vec![0.0f32; m * n];
         batch.register_read(buf_c, &mut gpu_out);
         batch.end().expect("end");
@@ -638,7 +655,9 @@ mod q4_gpu_tests {
         let m = 4usize;
         let k = q4.in_dim;
         let n = q4.out_dim;
-        let a: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.001 - 0.5).sin() * 0.01).collect();
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| (i as f32 * 0.001 - 0.5).sin() * 0.01)
+            .collect();
 
         let f32_w = store
             .tensor_f32("model.decoder.layers.0.self_attn.q_proj.weight")
@@ -668,7 +687,8 @@ mod q4_gpu_tests {
             prod,
         )
         .expect("nvfp4 pipeline");
-        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None).expect("batch");
+        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None)
+            .expect("batch");
         let buf_a = batch.alloc_f32(&a).expect("a");
         let buf_c = f32_q4_linear_gpu_bufs(
             &mut batch,
@@ -740,7 +760,8 @@ mod q4_gpu_tests {
         )
         .expect("nvfp4 pipeline");
         let mut pool = BufferPool::new();
-        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None).expect("batch");
+        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None)
+            .expect("batch");
         let buf_a = batch.alloc_f32(&a).expect("a");
         let buf_c = f32_q4_linear_gpu_bufs(
             &mut batch,
@@ -799,7 +820,8 @@ mod q4_gpu_tests {
         )
         .expect("pipeline");
         let mut pool = BufferPool::new();
-        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None).expect("batch");
+        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None)
+            .expect("batch");
         let buf_out = batch.alloc_f32_out(cpu.len()).expect("out");
         dispatch_dequant_block_matrix(batch.encoder(), &pipeline, &q4, &buf_out);
         let mut gpu = vec![0.0f32; cpu.len()];
@@ -881,11 +903,17 @@ mod q4_gpu_tests {
         // If stride omitted the 4-byte header, E1 would start 4 bytes early inside E0 body.
         let wrong_e1 = base + per_expert - 4;
         let bogus = f32::from_le_bytes(blob[wrong_e1..wrong_e1 + 4].try_into().expect("tail"));
-        let actual_e1 =
-            f32::from_le_bytes(blob[base + per_expert..base + per_expert + 4].try_into().expect("e1"));
+        let actual_e1 = f32::from_le_bytes(
+            blob[base + per_expert..base + per_expert + 4]
+                .try_into()
+                .expect("e1"),
+        );
         eprintln!("misaligned E1 gscale (no-header stride)={bogus:.6} actual E1={actual_e1:.6}");
         assert!((actual_e1 - 1.0).abs() < 1e-5);
-        assert!((bogus - 1.0).abs() > 1e-3, "tail bytes must not look like gscale=1");
+        assert!(
+            (bogus - 1.0).abs() > 1e-3,
+            "tail bytes must not look like gscale=1"
+        );
     }
 
     /// `.dgq` blob offsets exceed 4 GiB; grouped MoE jobs on late layers must use u64/ulong paths.
@@ -897,7 +925,7 @@ mod q4_gpu_tests {
             return;
         }
         use crate::dgq::layout::nvfp4_matrix_bytes;
-        use crate::metal::step_kernel::{build_layout, build_offsets_from_store, MOE_FF, HID};
+        use crate::metal::step_kernel::{HID, MOE_FF, build_layout, build_offsets_from_store};
 
         let store = DgqStore::open(dgq_dir).expect("open dgq");
         let offsets = build_offsets_from_store(&store);
@@ -915,7 +943,11 @@ mod q4_gpu_tests {
             max_end > u32::MAX as u64
         );
         assert!(max_end > u32::MAX as u64, "fixture should exceed 4 GiB");
-        assert_eq!(std::mem::size_of::<usize>(), 8, "dgq metal path requires 64-bit host");
+        assert_eq!(
+            std::mem::size_of::<usize>(),
+            8,
+            "dgq metal path requires 64-bit host"
+        );
 
         for entry in store.tensor_entries() {
             let off = crate::dgq::layout::blob_offset_usize(entry.meta.offset)
@@ -948,7 +980,10 @@ mod q4_gpu_tests {
         let down127 = l29.experts_down + 127 * dn_stride;
         for (label, off) in [("gate127", gate127), ("down127", down127)] {
             let idx = crate::dgq::layout::blob_offset_usize(off).expect(label);
-            assert!(idx > u32::MAX as usize, "{label} must exceed u32 after conversion");
+            assert!(
+                idx > u32::MAX as usize,
+                "{label} must exceed u32 after conversion"
+            );
         }
         eprintln!(
             "L29 E127 gate_off={gate127} down_off={down127} (>u32: gate={} down={})",
@@ -965,10 +1000,10 @@ mod q4_gpu_tests {
     #[test]
     fn nvfp4_block_grouped_real_moe_weights_match_cpu() {
         use crate::kernels::cpu::gemm_linear_grouped::gemm_linear_grouped_cpu;
-        use crate::kernels::sub::gemm_block_grouped::{gpu_on_blob, BlobGroupedParams};
         use crate::kernels::sub::QuantFormat;
-        use crate::metal::step_kernel::{build_layout, build_offsets_from_store, MOE_FF, HID};
+        use crate::kernels::sub::gemm_block_grouped::{BlobGroupedParams, gpu_on_blob};
         use crate::metal::BlockGroupedJob;
+        use crate::metal::step_kernel::{HID, MOE_FF, build_layout, build_offsets_from_store};
 
         let dgq_dir = std::path::Path::new("/tmp/nvfp4-weights");
         if !dgq_dir.join("model.dgq.json").exists() {
@@ -1093,7 +1128,11 @@ mod q4_gpu_tests {
                 case.label
             );
             assert!(cpu_max > 1e-4, "{} cpu oracle produced zeros", case.label);
-            assert!(gpu_max > 1e-4, "{} gpu block grouped produced zeros", case.label);
+            assert!(
+                gpu_max > 1e-4,
+                "{} gpu block grouped produced zeros",
+                case.label
+            );
             assert!(max_err < 0.08, "{} max_err={max_err}", case.label);
             assert!(cos > 0.999, "{} cos={cos}", case.label);
         }

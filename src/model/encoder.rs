@@ -1,12 +1,12 @@
 use crate::config::ModelConfig;
 use crate::kernels::cpu::rms_norm_rows;
 use crate::model::decoder_layer::{
-    forward_encoder as layer_forward_encoder, forward_encoder_extend as layer_forward_encoder_extend,
-    DecoderLayerScratch,
+    DecoderLayerScratch, forward_encoder as layer_forward_encoder,
+    forward_encoder_extend as layer_forward_encoder_extend,
 };
-use crate::model::kv_cache::LayerKvView;
 use crate::model::embed::embed_tokens;
 use crate::model::kv_cache::KvCache;
+use crate::model::kv_cache::LayerKvView;
 use crate::model::layer_weights::DecoderLayerWeights;
 use crate::safetensors::Error;
 use crate::weights::WeightStore;
@@ -68,8 +68,7 @@ pub fn prefill(
         .map(|i| input.position_offset + i)
         .collect();
 
-    scratch.hidden_a[..seq_len * hidden]
-        .copy_from_slice(&scratch.embed_buf[..seq_len * hidden]);
+    scratch.hidden_a[..seq_len * hidden].copy_from_slice(&scratch.embed_buf[..seq_len * hidden]);
 
     let mut use_a_input = true;
     for layer in 0..text.num_hidden_layers {
@@ -115,7 +114,10 @@ pub fn prefill(
         &scratch.hidden_a[..seq_len * hidden]
     };
 
-    scratch.norm_w = store.tensor("model.decoder.norm.weight")?.bf16()?.to_f32_vec();
+    scratch.norm_w = store
+        .tensor("model.decoder.norm.weight")?
+        .bf16()?
+        .to_f32_vec();
     let mut hidden_out = vec![0.0f32; seq_len * hidden];
     rms_norm_rows(
         &mut hidden_out,
@@ -159,12 +161,9 @@ pub fn extend_prefill(
         embed_scale,
     )?;
 
-    let positions: Vec<i64> = (0..seq_len as i64)
-        .map(|i| position_offset + i)
-        .collect();
+    let positions: Vec<i64> = (0..seq_len as i64).map(|i| position_offset + i).collect();
 
-    scratch.hidden_a[..seq_len * hidden]
-        .copy_from_slice(&scratch.embed_buf[..seq_len * hidden]);
+    scratch.hidden_a[..seq_len * hidden].copy_from_slice(&scratch.embed_buf[..seq_len * hidden]);
 
     let kv_len_before = kv_cache.kv_len;
     let mut use_a_input = true;
@@ -206,11 +205,7 @@ pub fn extend_prefill(
         let kv_out = kv_cache
             .layer_mut(layer)
             .ok_or(Error::Format("missing kv layer"))?;
-        kv_out.append_kv(
-            &layer_scratch.attn.k,
-            &layer_scratch.attn.v,
-            seq_len,
-        )?;
+        kv_out.append_kv(&layer_scratch.attn.k, &layer_scratch.attn.v, seq_len)?;
         use_a_input = !use_a_input;
     }
 

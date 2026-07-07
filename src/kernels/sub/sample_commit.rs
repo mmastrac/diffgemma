@@ -3,11 +3,11 @@
 use super::gpu_common;
 use super::test_util::ElemFormat;
 use super::variant::KernelVariant;
-use crate::kernels::cpu::sampler::{sample_commit_cpu, CommitParams};
-use crate::metal::{CanvasState, StepParams, CANVAS};
+use crate::kernels::cpu::sampler::{CommitParams, sample_commit_cpu};
+use crate::metal::{CANVAS, CanvasState, StepParams};
+use crate::safetensors::Error;
 use crate::sample::ARGMAX_HIST_MAX;
 use crate::sample::{FILLER_TOKEN_ID, PAD_TOKEN_ID};
-use crate::safetensors::Error;
 
 pub const ENTRY: &str = "sample_commit";
 pub const THREADGROUP_WIDTH: usize = 256;

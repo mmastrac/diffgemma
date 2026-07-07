@@ -1,6 +1,8 @@
 //! Encoder-path GQA attention (f32, naive softmax, mask modes for prefill/extend).
 
-use super::engine_gqa_common::{self, GqaParams, MASK_CAUSAL_SLIDING, MASK_DECODER_BITMAP, MASK_ENCODER_EXTEND};
+use super::engine_gqa_common::{
+    self, GqaParams, MASK_CAUSAL_SLIDING, MASK_DECODER_BITMAP, MASK_ENCODER_EXTEND,
+};
 use super::test_util::ElemFormat;
 use crate::model::attention::{self, AttentionParams, GqaMask};
 use crate::model::mask::DecoderAttnMask;
@@ -95,7 +97,9 @@ pub fn sliding_prefill_fixture(_: ElemFormat) -> Fixture {
     let n_heads = 16usize;
     let n_kv_heads = 8usize;
     let head_dim = 256usize;
-    let (q, k, v) = qkv(seq_len, seq_len, n_heads, n_kv_heads, head_dim, 0.011, 0.009);
+    let (q, k, v) = qkv(
+        seq_len, seq_len, n_heads, n_kv_heads, head_dim, 0.011, 0.009,
+    );
     Fixture {
         q,
         k,
@@ -122,7 +126,9 @@ pub fn encoder_extend_fixture(_: ElemFormat) -> Fixture {
     let n_heads = 16usize;
     let n_kv_heads = 8usize;
     let head_dim = 256usize;
-    let (q, k, v) = qkv(seq_len, total_kv, n_heads, n_kv_heads, head_dim, 0.014, 0.012);
+    let (q, k, v) = qkv(
+        seq_len, total_kv, n_heads, n_kv_heads, head_dim, 0.014, 0.012,
+    );
     let positions: Vec<i64> = (kv_cache_len as i64..kv_cache_len as i64 + seq_len as i64).collect();
     Fixture {
         q,
@@ -151,7 +157,9 @@ pub fn full_layer_fixture(_: ElemFormat) -> Fixture {
     let n_heads = 16usize;
     let n_kv_heads = 2usize;
     let head_dim = 512usize;
-    let (q, k, v) = qkv(seq_len, seq_len, n_heads, n_kv_heads, head_dim, 0.008, 0.007);
+    let (q, k, v) = qkv(
+        seq_len, seq_len, n_heads, n_kv_heads, head_dim, 0.008, 0.007,
+    );
     Fixture {
         q,
         k,
@@ -178,7 +186,9 @@ pub fn sparse_decoder_bitmap_fixture(_: ElemFormat) -> Fixture {
     let n_heads = 16usize;
     let n_kv_heads = 8usize;
     let head_dim = 256usize;
-    let (q, k, v) = qkv(canvas_len, total_kv, n_heads, n_kv_heads, head_dim, 0.018, 0.015);
+    let (q, k, v) = qkv(
+        canvas_len, total_kv, n_heads, n_kv_heads, head_dim, 0.018, 0.015,
+    );
     let mut attend = vec![true; canvas_len * total_kv];
     for q in 0..canvas_len {
         for k in kv_cache_len..total_kv {
@@ -220,7 +230,9 @@ pub fn sliding_tight_fixture(_: ElemFormat) -> Fixture {
     let n_heads = 16usize;
     let n_kv_heads = 8usize;
     let head_dim = 256usize;
-    let (q, k, v) = qkv(seq_len, seq_len, n_heads, n_kv_heads, head_dim, 0.012, 0.010);
+    let (q, k, v) = qkv(
+        seq_len, seq_len, n_heads, n_kv_heads, head_dim, 0.012, 0.010,
+    );
     Fixture {
         q,
         k,
@@ -247,7 +259,9 @@ pub fn decoder_bitmap_fixture(_: ElemFormat) -> Fixture {
     let n_heads = 16usize;
     let n_kv_heads = 8usize;
     let head_dim = 256usize;
-    let (q, k, v) = qkv(canvas_len, total_kv, n_heads, n_kv_heads, head_dim, 0.016, 0.013);
+    let (q, k, v) = qkv(
+        canvas_len, total_kv, n_heads, n_kv_heads, head_dim, 0.016, 0.013,
+    );
     Fixture {
         q,
         k,
@@ -272,7 +286,12 @@ fn mask_kind_and_side_data(f: &Fixture) -> (u32, usize, Option<&[i64]>, Option<&
         MaskMode::EncoderExtend {
             kv_cache_len,
             positions,
-        } => (MASK_ENCODER_EXTEND, *kv_cache_len, Some(positions.as_slice()), None),
+        } => (
+            MASK_ENCODER_EXTEND,
+            *kv_cache_len,
+            Some(positions.as_slice()),
+            None,
+        ),
         MaskMode::DecoderBitmap(m) => (MASK_DECODER_BITMAP, m.kv_cache_len, None, Some(m)),
     }
 }
@@ -339,10 +358,18 @@ pub fn gpu(f: &Fixture) -> Result<Vec<f32>, Error> {
     let v_bytes = f.v.len() * 4;
     let o_bytes = f.out_len() * 4;
 
-    let buf_q = pool.allocate(&ctx.device, q_bytes).ok_or(Error::Format("alloc"))?;
-    let buf_k = pool.allocate(&ctx.device, k_bytes).ok_or(Error::Format("alloc"))?;
-    let buf_v = pool.allocate(&ctx.device, v_bytes).ok_or(Error::Format("alloc"))?;
-    let buf_o = pool.allocate(&ctx.device, o_bytes).ok_or(Error::Format("alloc"))?;
+    let buf_q = pool
+        .allocate(&ctx.device, q_bytes)
+        .ok_or(Error::Format("alloc"))?;
+    let buf_k = pool
+        .allocate(&ctx.device, k_bytes)
+        .ok_or(Error::Format("alloc"))?;
+    let buf_v = pool
+        .allocate(&ctx.device, v_bytes)
+        .ok_or(Error::Format("alloc"))?;
+    let buf_o = pool
+        .allocate(&ctx.device, o_bytes)
+        .ok_or(Error::Format("alloc"))?;
 
     BufferPool::write_f32(&buf_q, &f.q);
     BufferPool::write_f32(&buf_k, &f.k);
@@ -355,7 +382,9 @@ pub fn gpu(f: &Fixture) -> Result<Vec<f32>, Error> {
     if let Some(m) = decoder_mask {
         let packed: Vec<u8> = m.attend.iter().map(|&b| u8::from(b)).collect();
         let mask_bytes = packed.len();
-        let b = pool.allocate(&ctx.device, mask_bytes).ok_or(Error::Format("alloc"))?;
+        let b = pool
+            .allocate(&ctx.device, mask_bytes)
+            .ok_or(Error::Format("alloc"))?;
         BufferPool::write_bytes(&b, &packed);
         buf_mask = Some((mask_bytes, b));
     }
@@ -363,12 +392,15 @@ pub fn gpu(f: &Fixture) -> Result<Vec<f32>, Error> {
     let mut buf_pos = None;
     if let Some(pos) = positions {
         let pos_bytes = pos.len() * 8;
-        let b = pool.allocate(&ctx.device, pos_bytes).ok_or(Error::Format("alloc"))?;
+        let b = pool
+            .allocate(&ctx.device, pos_bytes)
+            .ok_or(Error::Format("alloc"))?;
         BufferPool::write_i64(&b, pos);
         buf_pos = Some((pos_bytes, b));
     }
 
-    let params = GqaParams::for_attention(f.seq_len, f.total_kv, &f.params, mask_kind, kv_cache_len);
+    let params =
+        GqaParams::for_attention(f.seq_len, f.total_kv, &f.params, mask_kind, kv_cache_len);
 
     let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
     let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
@@ -419,7 +451,7 @@ pub fn gpu(_: &Fixture) -> Result<Vec<f32>, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::sub::test_util::{assert_oracle, ElemFormat};
+    use crate::kernels::sub::test_util::{ElemFormat, assert_oracle};
 
     fn run_matrix(fixture_fn: fn(ElemFormat) -> Fixture, max_tol: f32) {
         let fix = fixture_fn(ElemFormat::F32);

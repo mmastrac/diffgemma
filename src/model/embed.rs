@@ -106,7 +106,15 @@ pub fn soft_embeddings_from_logits(
     for s in 0..seq_len {
         let logit_row = &logits[s * vocab..(s + 1) * vocab];
         let out_row = &mut out[s * hidden..(s + 1) * hidden];
-        soft_embed_row_from_table(out_row, logit_row, &table, vocab, hidden, scale, prob_scratch);
+        soft_embed_row_from_table(
+            out_row,
+            logit_row,
+            &table,
+            vocab,
+            hidden,
+            scale,
+            prob_scratch,
+        );
     }
 }
 
@@ -270,7 +278,9 @@ pub fn lm_head_tied_from_store(
         }
         _ => {
             let embed = store.tensor(EMBED_KEY)?;
-            lm_head_tied_bf16(logits, hidden, embed, seq_len, hidden_dim, vocab_size, w_chunk)
+            lm_head_tied_bf16(
+                logits, hidden, embed, seq_len, hidden_dim, vocab_size, w_chunk,
+            )
         }
     }
 }

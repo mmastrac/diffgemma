@@ -76,7 +76,9 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
     let w_q8 = f.w_q8();
     let mut out = vec![0.0f32; f.out_len()];
     q8_gemm_rowk_cpu(&f.x, f.m, f.k, &w_q8, f.n, &mut out);
-    out.iter().map(|&v| bf16::store_bf16_round_half(v)).collect()
+    out.iter()
+        .map(|&v| bf16::store_bf16_round_half(v))
+        .collect()
 }
 
 pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
@@ -89,7 +91,15 @@ pub fn pipeline_for(
     n: u32,
     k: u32,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_gemm_subkernel(SHADER, ENTRY, n, k, false, super::QuantFormat::Q8 as u32, false)
+    ctx.compile_gemm_subkernel(
+        SHADER,
+        ENTRY,
+        n,
+        k,
+        false,
+        super::QuantFormat::Q8 as u32,
+        false,
+    )
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -98,13 +108,23 @@ pub fn pipeline_for_fp16_input(
     n: u32,
     k: u32,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_gemm_subkernel(SHADER, ENTRY, n, k, false, super::QuantFormat::Q8 as u32, true)
+    ctx.compile_gemm_subkernel(
+        SHADER,
+        ENTRY,
+        n,
+        k,
+        false,
+        super::QuantFormat::Q8 as u32,
+        true,
+    )
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use objc2::runtime::ProtocolObject;
 #[cfg(all(feature = "metal", target_os = "macos"))]
-use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+};
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub fn bind_gpu_buffers(

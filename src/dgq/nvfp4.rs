@@ -1,9 +1,11 @@
 //! NVFP4 block quant/dequant (MLX 2-tier: E2M1 + per-block FP8 E4M3 scale).
 
-use crate::dgq::fp4::{e2m1_from_f32, e2m1_to_f32, fp8_e4m3_from_f32, fp8_e4m3_to_f32, FP4_E2M1_MAX};
+use crate::dgq::fp4::{
+    FP4_E2M1_MAX, e2m1_from_f32, e2m1_to_f32, fp8_e4m3_from_f32, fp8_e4m3_to_f32,
+};
 use crate::dgq::layout::{
-    nvfp4_data_row_bytes, nvfp4_matrix_bytes, nvfp4_row_bytes, nvfp4_scales_row_bytes,
-    NVFP4_GROUP_SIZE, NVFP4_HEADER_BYTES,
+    NVFP4_GROUP_SIZE, NVFP4_HEADER_BYTES, nvfp4_data_row_bytes, nvfp4_matrix_bytes,
+    nvfp4_row_bytes, nvfp4_scales_row_bytes,
 };
 use crate::kernels::cpu::bf16_to_f32;
 use crate::safetensors::Error;
@@ -93,11 +95,7 @@ pub fn dequant_row_nvfp4(src: &[u8], in_dim: usize, dst: &mut [f32], global_scal
 
     for idx in 0..in_dim {
         let byte = data[idx / 2];
-        let q = if idx % 2 == 0 {
-            byte & 0x0f
-        } else {
-            byte >> 4
-        };
+        let q = if idx % 2 == 0 { byte & 0x0f } else { byte >> 4 };
         let scale = fp8_e4m3_to_f32(scales[idx / NVFP4_GROUP_SIZE]);
         dst[idx] = e2m1_to_f32(q) * scale * global_scale;
     }
@@ -178,7 +176,13 @@ pub fn dequant_matrix_nvfp4_payload(
         return Err(Error::Format("nvfp4 matrix size mismatch"));
     }
     let global_scale = read_f32_le(&src[..NVFP4_HEADER_BYTES]);
-    dequant_matrix_nvfp4(&src[NVFP4_HEADER_BYTES..], out_dim, in_dim, dst, global_scale);
+    dequant_matrix_nvfp4(
+        &src[NVFP4_HEADER_BYTES..],
+        out_dim,
+        in_dim,
+        dst,
+        global_scale,
+    );
     Ok(global_scale)
 }
 
@@ -194,11 +198,7 @@ pub fn nvfp4_weight_at(
     let row_off = row * row_bytes;
     let data_len = nvfp4_data_row_bytes(in_dim);
     let byte = src[row_off + col / 2];
-    let q = if col % 2 == 0 {
-        byte & 0x0f
-    } else {
-        byte >> 4
-    };
+    let q = if col % 2 == 0 { byte & 0x0f } else { byte >> 4 };
     let scale = fp8_e4m3_to_f32(src[row_off + data_len + col / NVFP4_GROUP_SIZE]);
     e2m1_to_f32(q) * scale * global_scale
 }
@@ -289,9 +289,7 @@ mod tests {
     #[test]
     fn nvfp4_matches_mlx_linspace_row() {
         // Reference: mlx.quantize(linspace(-3,3,32), group_size=16, mode=nvfp4)
-        let row: Vec<f32> = (0..32)
-            .map(|i| -3.0 + (i as f32) * (6.0 / 31.0))
-            .collect();
+        let row: Vec<f32> = (0..32).map(|i| -3.0 + (i as f32) * (6.0 / 31.0)).collect();
         let in_dim = row.len();
         let mut packed = vec![0u8; nvfp4_row_bytes(in_dim)];
         quantize_row_nvfp4(&row, in_dim, &mut packed, 1.0);
@@ -301,9 +299,9 @@ mod tests {
         let mut dec = vec![0.0f32; in_dim];
         dequant_row_nvfp4(&packed, in_dim, &mut dec, 1.0);
         let mlx_ref = [
-            -3.0, -3.0, -3.0, -2.0, -2.0, -2.0, -2.0, -1.5, -1.5, -1.5, -1.0, -0.75, -0.75,
-            -0.5, -0.25, -0.0, 0.0, 0.25, 0.5, 0.75, 0.75, 1.0, 1.5, 1.5, 1.5, 2.0, 2.0, 2.0,
-            2.0, 3.0, 3.0, 3.0,
+            -3.0, -3.0, -3.0, -2.0, -2.0, -2.0, -2.0, -1.5, -1.5, -1.5, -1.0, -0.75, -0.75, -0.5,
+            -0.25, -0.0, 0.0, 0.25, 0.5, 0.75, 0.75, 1.0, 1.5, 1.5, 1.5, 2.0, 2.0, 2.0, 2.0, 3.0,
+            3.0, 3.0,
         ];
         for (got, want) in dec.iter().zip(mlx_ref.iter()) {
             assert!(

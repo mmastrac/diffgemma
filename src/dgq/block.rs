@@ -1,6 +1,9 @@
 //! Affine int4 / int8 quantization blocks (groups along K).
 
-use crate::dgq::layout::{q4_matrix_bytes, q4_row_bytes, q6_matrix_bytes, q6_row_bytes, q8_matrix_bytes, q8_row_bytes, GROUP_SIZE};
+use crate::dgq::layout::{
+    GROUP_SIZE, q4_matrix_bytes, q4_row_bytes, q6_matrix_bytes, q6_row_bytes, q8_matrix_bytes,
+    q8_row_bytes,
+};
 use crate::kernels::cpu::bf16_to_f32;
 use crate::safetensors::Error;
 
@@ -303,7 +306,6 @@ mod tests {
         assert!(max_err < 0.15, "max_err={max_err}");
     }
 }
-
 
 pub fn quantize_expert_stack_q6(
     src: &[u8],

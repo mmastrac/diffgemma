@@ -1,7 +1,7 @@
 //! MoE router bucketing state on the fused denoise path.
 
 use crate::metal::step_kernel::{
-    run_step_moe_route_capture, StepSmokeConfig, CANVAS, HID, N_EXPERTS,
+    CANVAS, HID, N_EXPERTS, StepSmokeConfig, run_step_moe_route_capture,
 };
 use crate::safetensors::Error;
 use serde::Serialize;
@@ -98,18 +98,17 @@ pub fn print_route_summary(dump: &StepMoeRouteDump) {
     );
     eprintln!(
         "  num_slots={} expected={} slots_ok={} experts_used={}/{}",
-        dump.num_slots,
-        dump.expected_num_slots,
-        dump.slots_ok,
-        dump.experts_used,
-        N_EXPERTS
+        dump.num_slots, dump.expected_num_slots, dump.slots_ok, dump.experts_used, N_EXPERTS
     );
     if dump.num_slots == 0 {
         eprintln!("  FAIL: num_slots=0 → grouped GEMM sees M=0, MoE contributes nothing");
     }
     let sum: u32 = dump.per_expert_slots.iter().sum();
     if sum != dump.num_slots {
-        eprintln!("  WARN: per_expert_slots sum {sum} != num_slots {}", dump.num_slots);
+        eprintln!(
+            "  WARN: per_expert_slots sum {sum} != num_slots {}",
+            dump.num_slots
+        );
     }
     if dump.grouped_dispatched {
         let path = if dump.moe_style == "scalar_per_expert" {
@@ -119,7 +118,10 @@ pub fn print_route_summary(dump: &StepMoeRouteDump) {
         };
         match (dump.moe_out_l2, dump.moe_out_nonzero) {
             (Some(l2), Some(nz)) => {
-                eprintln!("  {path} GEMM: moe_out_l2={l2:.4} nonzero_elems={nz}/{}", CANVAS * HID);
+                eprintln!(
+                    "  {path} GEMM: moe_out_l2={l2:.4} nonzero_elems={nz}/{}",
+                    CANVAS * HID
+                );
                 if l2 < 1e-6 {
                     eprintln!("  FAIL: moe_out near zero after {path} dispatch");
                 }
@@ -145,7 +147,7 @@ mod tests {
     use super::*;
     use crate::metal::TOP_K;
     use crate::metal::step_kernel::{
-        hello_chat_prefill_token_ids, StepFinishMode, StepSmokeConfig,
+        StepFinishMode, StepSmokeConfig, hello_chat_prefill_token_ids,
     };
 
     #[test]

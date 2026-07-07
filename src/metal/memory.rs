@@ -2,8 +2,8 @@
 
 use crate::config::TextConfig;
 use crate::metal::expert_cache::{
-    expert_entry_bytes, ExpertCacheStats, BUFFER_POOL_FUDGE_BYTES, BUFFER_POOL_LARGE_BYTES,
-    EXPERT_MAX_FRACTION_OF_RESIDENT_CAP, GPU_RESIDENT_FRACTION,
+    BUFFER_POOL_FUDGE_BYTES, BUFFER_POOL_LARGE_BYTES, EXPERT_MAX_FRACTION_OF_RESIDENT_CAP,
+    ExpertCacheStats, GPU_RESIDENT_FRACTION, expert_entry_bytes,
 };
 use crate::metal::weights::GpuDecoderWeightCache;
 
@@ -32,16 +32,38 @@ impl MemoryEstimate {
 
     pub fn print_summary(&self, label: &str) {
         println!("{label} memory estimate (resident, approximate):");
-        println!("  weight cache:   {:.1} MiB", self.weight_cache_bytes as f64 / (1024.0 * 1024.0));
-        println!("  layer scratch:  {:.1} MiB", self.layer_scratch_bytes as f64 / (1024.0 * 1024.0));
-        println!("  kv cache:       {:.1} MiB", self.kv_cache_bytes as f64 / (1024.0 * 1024.0));
-        println!("  activations:    {:.1} MiB", self.activations_bytes as f64 / (1024.0 * 1024.0));
-        println!("  logits:         {:.1} MiB", self.logits_bytes as f64 / (1024.0 * 1024.0));
-        println!("  total:          {:.1} MiB", self.total_bytes() as f64 / (1024.0 * 1024.0));
+        println!(
+            "  weight cache:   {:.1} MiB",
+            self.weight_cache_bytes as f64 / (1024.0 * 1024.0)
+        );
+        println!(
+            "  layer scratch:  {:.1} MiB",
+            self.layer_scratch_bytes as f64 / (1024.0 * 1024.0)
+        );
+        println!(
+            "  kv cache:       {:.1} MiB",
+            self.kv_cache_bytes as f64 / (1024.0 * 1024.0)
+        );
+        println!(
+            "  activations:    {:.1} MiB",
+            self.activations_bytes as f64 / (1024.0 * 1024.0)
+        );
+        println!(
+            "  logits:         {:.1} MiB",
+            self.logits_bytes as f64 / (1024.0 * 1024.0)
+        );
+        println!(
+            "  total:          {:.1} MiB",
+            self.total_bytes() as f64 / (1024.0 * 1024.0)
+        );
     }
 }
 
-pub fn estimate_decoder_forward(text: &TextConfig, seq_len: usize, kv_len: usize) -> MemoryEstimate {
+pub fn estimate_decoder_forward(
+    text: &TextConfig,
+    seq_len: usize,
+    kv_len: usize,
+) -> MemoryEstimate {
     let hidden = text.hidden_size as u64;
     let inter = text.intermediate_size as u64;
     let moe_inter = text.moe_intermediate_size as u64;
@@ -54,9 +76,8 @@ pub fn estimate_decoder_forward(text: &TextConfig, seq_len: usize, kv_len: usize
 
     let weight_cache_bytes = estimate_paged_layer_bytes(text) + hidden * 4;
 
-    let layer_scratch_bytes = layer_attn_scratch_bytes_gpu(
-        text, seq, total_kv, hidden, inter, moe_inter, experts,
-    ) * 2;
+    let layer_scratch_bytes =
+        layer_attn_scratch_bytes_gpu(text, seq, total_kv, hidden, inter, moe_inter, experts) * 2;
 
     // GPU KV is sized for encoder prefix capacity + canvas (see `GpuKvCache::new`).
     let kv_dim = max_kv_dim(text);
@@ -92,7 +113,9 @@ fn layer_attn_scratch_bytes_gpu(
     let q_dim = sliding_q.max(full_q);
     let kv_dim = sliding_kv.max(full_kv);
     // GPU path: no k_full/v_full/scores (KV on Metal buffers).
-    let attn_bufs = (seq * hidden * 2 + seq * q_dim * 2 + seq * kv_dim * 4
+    let attn_bufs = (seq * hidden * 2
+        + seq * q_dim * 2
+        + seq * kv_dim * 4
         + seq * text.global_head_dim.max(text.head_dim) as u64 * 4)
         * 4;
     let ff_bufs = seq * (hidden * 5 + inter * 2 + moe_inter * 3) * 4;
@@ -117,7 +140,10 @@ fn layer_attn_scratch_bytes_cpu(
     let q_dim = sliding_q.max(full_q);
     let kv_dim = sliding_kv.max(full_kv);
     let scores = seq * text.num_attention_heads as u64 * total_kv * 4;
-    let attn_bufs = (seq * hidden * 2 + seq * q_dim * 2 + seq * kv_dim * 4 + total_kv * kv_dim * 8
+    let attn_bufs = (seq * hidden * 2
+        + seq * q_dim * 2
+        + seq * kv_dim * 4
+        + total_kv * kv_dim * 8
         + seq * text.global_head_dim.max(text.head_dim) as u64 * 4)
         * 4;
     let attn_weights = (hidden * q_dim + hidden * kv_dim + q_dim * hidden + hidden * kv_dim) * 4;
@@ -125,7 +151,6 @@ fn layer_attn_scratch_bytes_cpu(
     let moe_router = seq * (hidden + experts) * 4;
     attn_bufs + scores + attn_weights + ff_bufs + moe_router
 }
-
 
 fn max_kv_dim(text: &TextConfig) -> u64 {
     let sliding = text.num_key_value_heads as u64 * text.head_dim as u64;
@@ -192,9 +217,7 @@ pub fn expert_cache_budget_bytes(
     let forward = estimate_session_resident_bytes(text, seq_len, kv_len);
     let entry = expert_entry_bytes(text);
     let expert_cap = (cap as f64 * EXPERT_MAX_FRACTION_OF_RESIDENT_CAP) as u64;
-    cap.saturating_sub(forward)
-        .min(expert_cap)
-        .max(entry)
+    cap.saturating_sub(forward).min(expert_cap).max(entry)
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -211,7 +234,11 @@ pub fn log_gpu_memory_plan(
     let expert_cap = (cap as f64 * EXPERT_MAX_FRACTION_OF_RESIDENT_CAP) as u64;
     let entry = expert_entry_bytes(text);
     let max_experts = expert_budget / entry.max(1);
-    let unified = if device.hasUnifiedMemory() { "yes" } else { "no" };
+    let unified = if device.hasUnifiedMemory() {
+        "yes"
+    } else {
+        "no"
+    };
     eprintln!(
         "  GPU memory: working_set={:.1} GiB, unified={unified}, resident cap={:.0}% ({:.1} GiB)",
         working_set as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -231,16 +258,13 @@ pub fn log_gpu_memory_plan(
     );
 }
 
-
 pub fn estimate_paged_layer_bytes(text: &TextConfig) -> u64 {
     let hidden = text.hidden_size as u64;
     let inter = text.intermediate_size as u64;
     let per_layer_dense = 2 * (inter * hidden + hidden * inter) + inter * hidden;
     // Attention + MLP transposed bf16 (q/k/v/o + gate/up/down); norms in f32.
     let attn_dense = (hidden * hidden * 4) as u64 * 2; // rough upper bound q+k+v+o
-    let per_layer_f32 = hidden * 9
-        + text.num_experts as u64 * hidden
-        + hidden
-        + text.num_experts as u64;
+    let per_layer_f32 =
+        hidden * 9 + text.num_experts as u64 * hidden + hidden + text.num_experts as u64;
     per_layer_dense * 2 + attn_dense + per_layer_f32 * 4
 }

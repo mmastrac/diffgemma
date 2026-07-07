@@ -1,9 +1,9 @@
 //! Block matrix dequant to f32 scratch (validation / tests).
 
+use super::QuantFormat;
 use super::gpu_common;
 use super::test_util::ElemFormat;
 use super::variant::KernelVariant;
-use super::QuantFormat;
 use crate::dgq::block::quantize_row_q4;
 use crate::dgq::layout::{nvfp4_matrix_bytes, q4_matrix_bytes, q4_row_bytes};
 use crate::dgq::nvfp4::quantize_f32_matrix_nvfp4;

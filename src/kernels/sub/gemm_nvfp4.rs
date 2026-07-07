@@ -4,7 +4,7 @@ use super::bf16;
 use super::f16;
 use super::gemm_common;
 use super::test_util::ElemFormat;
-use crate::dgq::layout::{nvfp4_matrix_bytes, NVFP4_HEADER_BYTES};
+use crate::dgq::layout::{NVFP4_HEADER_BYTES, nvfp4_matrix_bytes};
 use crate::dgq::nvfp4::{nvfp4_gemm_cpu, quantize_f32_matrix_nvfp4_with_scale};
 use crate::safetensors::Error;
 
@@ -54,7 +54,14 @@ pub fn tiny_fixture(_: ElemFormat) -> Fixture {
     let w_f32: Vec<f32> = (0..n * k)
         .map(|i| ((i as f32) * 0.007).cos() * 0.02)
         .collect();
-    Fixture { x, w_f32, m, n, k, global_scale: 1.0 }
+    Fixture {
+        x,
+        w_f32,
+        m,
+        n,
+        k,
+        global_scale: 1.0,
+    }
 }
 
 pub fn tile_fixture(_: ElemFormat) -> Fixture {
@@ -89,7 +96,9 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
     let body = &w[NVFP4_HEADER_BYTES..];
     let mut out = vec![0.0f32; f.out_len()];
     nvfp4_gemm_cpu(&f.x, f.m, f.k, body, f.n, gscale, &mut out);
-    out.iter().map(|&v| bf16::store_bf16_round_half(v)).collect()
+    out.iter()
+        .map(|&v| bf16::store_bf16_round_half(v))
+        .collect()
 }
 
 pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
@@ -182,9 +191,9 @@ pub fn gpu(_: &Fixture, _: super::KernelVariant) -> Result<Vec<f32>, Error> {
 mod tests {
     use super::*;
     use crate::kernel_oracle_matrix;
-    use crate::kernels::sub::test_util::{assert_oracle, ElemFormat};
-    use crate::kernels::sub::variant::KernelVariant;
     use crate::kernels::sub::QuantFormat;
+    use crate::kernels::sub::test_util::{ElemFormat, assert_oracle};
+    use crate::kernels::sub::variant::KernelVariant;
 
     kernel_oracle_matrix! {
         mod tiny,

@@ -45,7 +45,12 @@ impl LayerKv {
         Ok(())
     }
 
-    pub fn append_kv(&mut self, keys: &[f32], values: &[f32], append_len: usize) -> Result<(), Error> {
+    pub fn append_kv(
+        &mut self,
+        keys: &[f32],
+        values: &[f32],
+        append_len: usize,
+    ) -> Result<(), Error> {
         let dim = self.per_token_dim();
         if keys.len() != append_len * dim || values.len() != append_len * dim {
             return Err(Error::Format("kv append length mismatch"));

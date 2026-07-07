@@ -3,9 +3,9 @@
 use super::bf16;
 use super::f16;
 use super::gpu_common;
+use super::manifest::{self, RmsNormRowsTiledVariant};
 use super::test_util::ElemFormat;
 use super::variant::{ElemDtype, KernelVariant};
-use super::manifest::{self, RmsNormRowsTiledVariant};
 use crate::kernels::cpu;
 use crate::safetensors::Error;
 
@@ -99,11 +99,7 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
 
 pub fn cpu_f32_in(f: &Fixture) -> Vec<f32> {
     let mut rounded = f.clone();
-    rounded.x = f
-        .x
-        .iter()
-        .map(|&v| bf16::round_bf16_f32(v))
-        .collect();
+    rounded.x = f.x.iter().map(|&v| bf16::round_bf16_f32(v)).collect();
     cpu(&rounded)
 }
 
@@ -150,7 +146,9 @@ pub fn pipeline_for(
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use objc2::runtime::ProtocolObject;
 #[cfg(all(feature = "metal", target_os = "macos"))]
-use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+};
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub fn bind_gpu_buffers(
@@ -183,11 +181,7 @@ pub fn gpu_f32_in(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
-fn gpu_tiled(
-    f: &Fixture,
-    variant: KernelVariant,
-    tiled: TiledVariant,
-) -> Result<Vec<f32>, Error> {
+fn gpu_tiled(f: &Fixture, variant: KernelVariant, tiled: TiledVariant) -> Result<Vec<f32>, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
 
@@ -202,7 +196,9 @@ fn gpu_tiled(
     let buf_x = pool
         .allocate(&ctx.device, x_bytes)
         .ok_or(Error::Format("alloc"))?;
-    let buf_y = pool.allocate(&ctx.device, len * 2).ok_or(Error::Format("alloc"))?;
+    let buf_y = pool
+        .allocate(&ctx.device, len * 2)
+        .ok_or(Error::Format("alloc"))?;
     let (blob, w_off) = match &f.weight {
         Some(w) => {
             let mut b = vec![0u8; 2];
@@ -232,15 +228,7 @@ fn gpu_tiled(
     let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
     let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
     enc.setComputePipelineState(&pipeline.pipeline);
-    bind_gpu_buffers(
-        &enc,
-        &buf_x,
-        &buf_y,
-        &buf_blob,
-        &buf_d,
-        w_off,
-        f.dim as u32,
-    );
+    bind_gpu_buffers(&enc, &buf_x, &buf_y, &buf_blob, &buf_d, w_off, f.dim as u32);
     enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
     enc.endEncoding();
     cmd.commit();

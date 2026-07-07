@@ -94,7 +94,9 @@ pub fn empty_reply_check(
     let eos = crate::config::ModelConfig::load(model_dir)
         .ok()?
         .eos_token_id_u32();
-    Some(std::sync::Arc::new(empty_reply_predicate(tok, stop_ids, eos)))
+    Some(std::sync::Arc::new(empty_reply_predicate(
+        tok, stop_ids, eos,
+    )))
 }
 
 fn role_name(role: ChatRole) -> &'static str {
@@ -164,10 +166,7 @@ pub fn format_chat_prompt(turns: &[ChatTurn], opts: &ChatFormatOptions) -> Strin
 
 /// Wrap a single user message (debug string).
 pub fn format_user_prompt(user_text: &str) -> String {
-    format_chat_prompt(
-        &[ChatTurn::user(user_text)],
-        &ChatFormatOptions::default(),
-    )
+    format_chat_prompt(&[ChatTurn::user(user_text)], &ChatFormatOptions::default())
 }
 
 /// Strip control tokens from decoded model output before storing in history.
@@ -237,8 +236,8 @@ mod tests {
         )
         .expect("format");
         let expected = [
-            2, 105, 2364, 107, 11355, 563, 506, 7217, 3730, 236881, 106, 107, 105, 4368, 107,
-            100, 45518, 107, 101,
+            2, 105, 2364, 107, 11355, 563, 506, 7217, 3730, 236881, 106, 107, 105, 4368, 107, 100,
+            45518, 107, 101,
         ];
         assert_eq!(ids, expected);
     }

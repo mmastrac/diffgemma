@@ -1,7 +1,7 @@
 //! Tier-1 pin: per-stage GPU vs CPU oracle inside batched MoE (gather → GEMM×2 → swiglu → scatter).
 
 use crate::kernels::sub::moe_batched_pin::MoeBatchedPinDump;
-use crate::metal::step_kernel::{run_step_moe_batched_pin_capture, StepSmokeConfig};
+use crate::metal::step_kernel::{StepSmokeConfig, run_step_moe_batched_pin_capture};
 use crate::safetensors::Error;
 use std::path::Path;
 
@@ -29,7 +29,9 @@ pub fn write_step_moe_batched_pin_dump(path: &Path, dump: &MoeBatchedPinDump) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metal::step_kernel::{hello_chat_prefill_token_ids, StepFinishMode, StepSmokeConfig};
+    use crate::metal::step_kernel::{
+        StepFinishMode, StepSmokeConfig, hello_chat_prefill_token_ids,
+    };
 
     fn calgary_cfg(prefill: Vec<u32>) -> StepSmokeConfig {
         StepSmokeConfig {
@@ -62,34 +64,68 @@ mod tests {
     #[test]
     #[ignore = "tier-1 pin on demand: batched MoE L0 Calgary (requires /tmp/quantized-weights)"]
     fn batched_pin_l0_calgary_stages() {
-        let dump = run_pin_layer(
-            0,
-            "What's the best way to get from calgary to namibia?",
-        )
-        .expect("pin capture");
+        let dump = run_pin_layer(0, "What's the best way to get from calgary to namibia?")
+            .expect("pin capture");
         print_pin_summary(&dump);
-        assert!(dump.stages.gather >= 0.99, "gather cos={}", dump.stages.gather);
-        assert!(dump.stages.gate_up_gemm >= 0.99, "gate_up_gemm cos={}", dump.stages.gate_up_gemm);
-        assert!(dump.stages.swiglu_post >= 0.99, "swiglu_post cos={}", dump.stages.swiglu_post);
-        assert!(dump.stages.swiglu_isolated >= 0.99, "swiglu_isolated cos={}", dump.stages.swiglu_isolated);
+        assert!(
+            dump.stages.gather >= 0.99,
+            "gather cos={}",
+            dump.stages.gather
+        );
+        assert!(
+            dump.stages.gate_up_gemm >= 0.99,
+            "gate_up_gemm cos={}",
+            dump.stages.gate_up_gemm
+        );
+        assert!(
+            dump.stages.swiglu_post >= 0.99,
+            "swiglu_post cos={}",
+            dump.stages.swiglu_post
+        );
+        assert!(
+            dump.stages.swiglu_isolated >= 0.99,
+            "swiglu_isolated cos={}",
+            dump.stages.swiglu_isolated
+        );
         assert!(dump.stages.down >= 0.99, "down cos={}", dump.stages.down);
-        assert!(dump.stages.scatter >= 0.99, "scatter cos={}", dump.stages.scatter);
+        assert!(
+            dump.stages.scatter >= 0.99,
+            "scatter cos={}",
+            dump.stages.scatter
+        );
     }
 
     #[test]
     #[ignore = "tier-1 pin on demand: batched MoE L1 Calgary (requires /tmp/quantized-weights)"]
     fn batched_pin_l1_calgary_stages() {
-        let dump = run_pin_layer(
-            1,
-            "What's the best way to get from calgary to namibia?",
-        )
-        .expect("pin capture");
+        let dump = run_pin_layer(1, "What's the best way to get from calgary to namibia?")
+            .expect("pin capture");
         print_pin_summary(&dump);
-        assert!(dump.stages.gather >= 0.99, "gather cos={}", dump.stages.gather);
-        assert!(dump.stages.gate_up_gemm >= 0.99, "gate_up_gemm cos={}", dump.stages.gate_up_gemm);
-        assert!(dump.stages.swiglu_post >= 0.99, "swiglu_post cos={}", dump.stages.swiglu_post);
-        assert!(dump.stages.swiglu_isolated >= 0.99, "swiglu_isolated cos={}", dump.stages.swiglu_isolated);
+        assert!(
+            dump.stages.gather >= 0.99,
+            "gather cos={}",
+            dump.stages.gather
+        );
+        assert!(
+            dump.stages.gate_up_gemm >= 0.99,
+            "gate_up_gemm cos={}",
+            dump.stages.gate_up_gemm
+        );
+        assert!(
+            dump.stages.swiglu_post >= 0.99,
+            "swiglu_post cos={}",
+            dump.stages.swiglu_post
+        );
+        assert!(
+            dump.stages.swiglu_isolated >= 0.99,
+            "swiglu_isolated cos={}",
+            dump.stages.swiglu_isolated
+        );
         assert!(dump.stages.down >= 0.99, "down cos={}", dump.stages.down);
-        assert!(dump.stages.scatter >= 0.99, "scatter cos={}", dump.stages.scatter);
+        assert!(
+            dump.stages.scatter >= 0.99,
+            "scatter cos={}",
+            dump.stages.scatter
+        );
     }
 }

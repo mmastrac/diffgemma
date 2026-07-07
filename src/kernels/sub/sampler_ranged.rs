@@ -171,18 +171,12 @@ pub fn gpu(_: &Fixture) -> Result<Vec<f32>, Error> {
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
-pub fn gpu_variant(
-    f: &Fixture,
-    _: super::variant::KernelVariant,
-) -> Result<Vec<f32>, Error> {
+pub fn gpu_variant(f: &Fixture, _: super::variant::KernelVariant) -> Result<Vec<f32>, Error> {
     gpu(f)
 }
 
 #[cfg(not(all(feature = "metal", target_os = "macos")))]
-pub fn gpu_variant(
-    _: &Fixture,
-    _: super::variant::KernelVariant,
-) -> Result<Vec<f32>, Error> {
+pub fn gpu_variant(_: &Fixture, _: super::variant::KernelVariant) -> Result<Vec<f32>, Error> {
     Err(Error::Format("Metal unavailable"))
 }
 

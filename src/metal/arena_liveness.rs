@@ -3,8 +3,8 @@
 //! Before each GPU stage, verifies every arena plane read is initialized for the
 //! current step. Layer scratch planes are invalidated at each decoder-layer boundary.
 
-use super::{LayerOffsets, ModelLayout, StepFinishMode, N_LAYERS};
-use super::step_schedule::{build_preamble, build_step_schedule, StepStage};
+use super::step_schedule::{StepStage, build_preamble, build_step_schedule};
+use super::{LayerOffsets, ModelLayout, N_LAYERS, StepFinishMode};
 use crate::metal::step_quant::StepBlockProfile;
 
 /// Scratch plane in the monolithic arena (matches `ArenaLayout` fields).
@@ -62,7 +62,11 @@ pub enum ArenaLivenessError {
 impl std::fmt::Display for ArenaLivenessError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UninitializedRead { stage, layer, plane } => {
+            Self::UninitializedRead {
+                stage,
+                layer,
+                plane,
+            } => {
                 write!(
                     f,
                     "arena liveness: {:?} layer {layer} read uninitialized plane {:?}",
@@ -123,7 +127,11 @@ impl ArenaLiveness {
     ) -> Result<(), ArenaLivenessError> {
         for &p in access.reads {
             if !self.is_valid(p) {
-                return Err(ArenaLivenessError::UninitializedRead { stage, layer, plane: p });
+                return Err(ArenaLivenessError::UninitializedRead {
+                    stage,
+                    layer,
+                    plane: p,
+                });
             }
         }
         for &p in access.writes {
@@ -202,9 +210,15 @@ pub fn stage_arena_access(stage: StepStage, ctx: LivenessCtx<'_>) -> StageArenaA
             writes: &[ArenaPlane::Hidden],
         },
         LayerInputNormQkv => {
-            let mut writes: &'static [ArenaPlane] = &[ArenaPlane::Tmp, ArenaPlane::AttnQ, ArenaPlane::AttnK];
+            let mut writes: &'static [ArenaPlane] =
+                &[ArenaPlane::Tmp, ArenaPlane::AttnQ, ArenaPlane::AttnK];
             if ctx.layer_info.is_some_and(|l| l.v_proj != 0) {
-                writes = &[ArenaPlane::Tmp, ArenaPlane::AttnQ, ArenaPlane::AttnK, ArenaPlane::AttnV];
+                writes = &[
+                    ArenaPlane::Tmp,
+                    ArenaPlane::AttnQ,
+                    ArenaPlane::AttnK,
+                    ArenaPlane::AttnV,
+                ];
             }
             StageArenaAccess {
                 reads: &[ArenaPlane::Hidden],
@@ -225,7 +239,12 @@ pub fn stage_arena_access(stage: StepStage, ctx: LivenessCtx<'_>) -> StageArenaA
         },
         LayerDenseFfn => StageArenaAccess {
             reads: &[ArenaPlane::Stream],
-            writes: &[ArenaPlane::Tmp, ArenaPlane::FfG, ArenaPlane::FfU, ArenaPlane::Dense],
+            writes: &[
+                ArenaPlane::Tmp,
+                ArenaPlane::FfG,
+                ArenaPlane::FfU,
+                ArenaPlane::Dense,
+            ],
         },
         LayerRouter => StageArenaAccess {
             reads: &[ArenaPlane::Stream],

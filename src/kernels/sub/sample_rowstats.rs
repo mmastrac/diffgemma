@@ -5,9 +5,9 @@ use super::gpu_common;
 use super::test_util::ElemFormat;
 use super::variant::KernelVariant;
 use crate::kernels::cpu::sampler::{temp_at, tempered_row_stats};
-use crate::metal::{CanvasState, StepParams, CANVAS};
-use crate::sample::PAD_TOKEN_ID;
+use crate::metal::{CANVAS, CanvasState, StepParams};
 use crate::safetensors::Error;
+use crate::sample::PAD_TOKEN_ID;
 
 pub const ENTRY: &str = "sample_rowstats";
 pub const THREADGROUP_WIDTH: usize = 256;
@@ -76,9 +76,7 @@ pub fn wide_fixture(_: ElemFormat) -> Fixture {
     let rows = 8usize;
     let cols = 512usize;
     Fixture {
-        logits: (0..rows * cols)
-            .map(|i| (i as f32 % 23.0) - 11.0)
-            .collect(),
+        logits: (0..rows * cols).map(|i| (i as f32 % 23.0) - 11.0).collect(),
         rows,
         cols,
         step: 2,
@@ -311,5 +309,4 @@ mod tests {
         max_tol = 1e-3,
         min_cos = 0.9999,
     }
-
 }

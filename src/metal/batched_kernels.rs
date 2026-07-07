@@ -100,9 +100,7 @@ pub fn rms_norm_rows_no_scale_gpu_buf(
     let buf_dump = batch.alloc_f32_out(1)?;
     let dims = [seq_len as u32, hidden as u32];
     batch.dispatch_1d(&kernels.rms_norm_no_scale.pipeline, seq_len, |enc| {
-        rms_norm_rows::bind_gpu_buffers(
-            &enc, x_buf, &buf_w, &buf_o, &buf_dump, &dims, eps,
-        );
+        rms_norm_rows::bind_gpu_buffers(&enc, x_buf, &buf_w, &buf_o, &buf_dump, &dims, eps);
     });
     Ok(buf_o)
 }
@@ -187,9 +185,7 @@ pub fn router_scale_rows_gpu_buf(
     let buf_dump = batch.alloc_f32_out(1)?;
     let dims = [seq_len as u32, hidden as u32];
     batch.dispatch_1d(&kernels.router_scale.pipeline, seq_len, |enc| {
-        router_scale_rows::bind_gpu_buffers(
-            &enc, buf, &buf_scale, &buf_dump, &dims, root,
-        );
+        router_scale_rows::bind_gpu_buffers(&enc, buf, &buf_scale, &buf_dump, &dims, root);
     });
     Ok(())
 }
@@ -221,9 +217,8 @@ pub fn gather_rows_gpu(
     if batch_size == 0 {
         return Err(Error::Format("gather_rows empty batch"));
     }
-    let idx_bytes = unsafe {
-        std::slice::from_raw_parts(indices.as_ptr().cast::<u8>(), batch_size * 4)
-    };
+    let idx_bytes =
+        unsafe { std::slice::from_raw_parts(indices.as_ptr().cast::<u8>(), batch_size * 4) };
     let buf_idx = batch.alloc_bytes(idx_bytes)?;
     let buf_dst = batch.alloc_f32_out(batch_size * hidden)?;
     let buf_dump = batch.alloc_f32_out(1)?;
@@ -260,19 +255,22 @@ pub fn scatter_rows_weighted_gpu(
     if rows.len() != seq_len * top_k || weights.len() != seq_len * top_k {
         return Err(Error::Format("scatter_rows_weighted shape mismatch"));
     }
-    let rows_bytes = unsafe {
-        std::slice::from_raw_parts(rows.as_ptr().cast::<u8>(), rows.len() * 4)
-    };
+    let rows_bytes =
+        unsafe { std::slice::from_raw_parts(rows.as_ptr().cast::<u8>(), rows.len() * 4) };
     let buf_rows = batch.alloc_bytes(rows_bytes)?;
     let buf_w = batch.alloc_f32(weights)?;
     let buf_out = batch.alloc_f32_out(seq_len * hidden)?;
     let buf_dump = batch.alloc_f32_out(1)?;
     let dims = [seq_len as u32, hidden as u32, top_k as u32];
-    batch.dispatch_1d(&kernels.scatter_rows_weighted.pipeline, seq_len * hidden, |enc| {
-        crate::kernels::sub::scatter_rows_weighted::bind_gpu_buffers(
-            &enc, arena_buf, &buf_rows, &buf_w, &buf_out, &buf_dump, &dims,
-        );
-    });
+    batch.dispatch_1d(
+        &kernels.scatter_rows_weighted.pipeline,
+        seq_len * hidden,
+        |enc| {
+            crate::kernels::sub::scatter_rows_weighted::bind_gpu_buffers(
+                &enc, arena_buf, &buf_rows, &buf_w, &buf_out, &buf_dump, &dims,
+            );
+        },
+    );
     Ok(buf_out)
 }
 
@@ -287,7 +285,9 @@ pub fn vec_scale_gpu_buf(
     let len_u = len as u32;
     let buf_dump = batch.alloc_f32_out(1)?;
     batch.dispatch_1d(&kernels.vec_scale.pipeline, len, |enc| {
-        crate::kernels::sub::vec_scale_inplace::bind_gpu_buffers(&enc, buf, &buf_dump, scale, len_u);
+        crate::kernels::sub::vec_scale_inplace::bind_gpu_buffers(
+            &enc, buf, &buf_dump, scale, len_u,
+        );
     });
     Ok(())
 }
@@ -325,8 +325,8 @@ mod tests {
         let ctx = MetalContext::new().expect("metal");
         let kernels = GpuKernels::new(&ctx).expect("kernels");
         let mut pool = crate::metal::buffer::BufferPool::new();
-        let mut batch =
-            GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None).expect("batch");
+        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None)
+            .expect("batch");
         let buf = batch.alloc_f32(&gpu).expect("buf");
         gelu_pytorch_tanh_gpu_buf(&mut batch, &kernels, &buf, gpu.len()).expect("gelu");
         batch.register_read(buf, &mut gpu);
@@ -345,8 +345,8 @@ mod tests {
         let ctx = MetalContext::new().expect("metal");
         let kernels = GpuKernels::new(&ctx).expect("kernels");
         let mut pool = crate::metal::buffer::BufferPool::new();
-        let mut batch =
-            GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None).expect("batch");
+        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None)
+            .expect("batch");
         let buf = batch.alloc_f32(&gpu).expect("buf");
         gelu_pytorch_tanh_gpu_buf(&mut batch, &kernels, &buf, gpu.len()).expect("gelu");
         batch.register_read(buf, &mut gpu);
@@ -369,8 +369,8 @@ mod tests {
         let ctx = MetalContext::new().expect("metal");
         let kernels = GpuKernels::new(&ctx).expect("kernels");
         let mut pool = crate::metal::buffer::BufferPool::new();
-        let mut batch =
-            GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None).expect("batch");
+        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None)
+            .expect("batch");
         let buf = batch.alloc_f32(&gpu).expect("buf");
         gelu_pytorch_tanh_gpu_buf(&mut batch, &kernels, &buf, len).expect("gelu");
         batch.register_read(buf, &mut gpu);

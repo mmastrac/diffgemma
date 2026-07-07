@@ -1,7 +1,7 @@
 //! CPU dequant: quantized blob slices → f32 (oracle / parity path).
 
 use crate::dgq::block::{dequant_matrix_q4, dequant_matrix_q8};
-use crate::dgq::layout::{q4_matrix_bytes, q8_matrix_bytes, QuantKind};
+use crate::dgq::layout::{QuantKind, q4_matrix_bytes, q8_matrix_bytes};
 use crate::dgq::nvfp4::dequant_matrix_nvfp4_payload;
 use crate::kernels::cpu::bf16_to_f32;
 use crate::safetensors::Error;
@@ -192,8 +192,13 @@ mod tests {
         let mut q = vec![0u8; q4_matrix_bytes(out, inp)];
         quantize_bf16_matrix_q4(&bf16, out, inp, &mut q);
         let mut f32_out = vec![0.0f32; out * inp];
-        dequant_to_f32(QuantKind::Q4Block, &q, &[out as i64, inp as i64], &mut f32_out)
-            .unwrap();
+        dequant_to_f32(
+            QuantKind::Q4Block,
+            &q,
+            &[out as i64, inp as i64],
+            &mut f32_out,
+        )
+        .unwrap();
         let err = q4_max_abs_error_vs_bf16(&bf16, out, inp);
         assert!(err < 0.15, "err={err}");
     }

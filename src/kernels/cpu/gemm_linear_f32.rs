@@ -1,7 +1,7 @@
 //! CPU oracle for scalar f32 block GEMM (`gemm_linear_f32`).
 
 use crate::dgq::block::q4_gemm_cpu;
-use crate::dgq::layout::{nvfp4_matrix_bytes, q4_matrix_bytes, NVFP4_HEADER_BYTES};
+use crate::dgq::layout::{NVFP4_HEADER_BYTES, nvfp4_matrix_bytes, q4_matrix_bytes};
 use crate::dgq::nvfp4::nvfp4_gemm_cpu;
 use crate::kernels::sub::QuantFormat;
 

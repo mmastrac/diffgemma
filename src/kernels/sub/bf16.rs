@@ -49,6 +49,9 @@ mod tests {
         let v = 1.234567f32;
         assert_eq!(store_bf16_round_half(v), round_bf16_f32(v));
         let w = 0.001234567f32;
-        assert_eq!(store_bf16_round_half(w), bf16_bits_to_f32(f32_to_bf16_bits(w)));
+        assert_eq!(
+            store_bf16_round_half(w),
+            bf16_bits_to_f32(f32_to_bf16_bits(w))
+        );
     }
 }

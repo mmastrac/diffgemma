@@ -2,7 +2,7 @@
 
 use crate::dgq::block::q4_gemm_cpu;
 use crate::dgq::layout::{
-    blob_offset_usize, nvfp4_matrix_bytes, q4_matrix_bytes, NVFP4_HEADER_BYTES,
+    NVFP4_HEADER_BYTES, blob_offset_usize, nvfp4_matrix_bytes, q4_matrix_bytes,
 };
 use crate::dgq::nvfp4::nvfp4_gemm_cpu;
 use crate::kernels::sub::QuantFormat;
@@ -50,7 +50,10 @@ pub fn gemm_linear_grouped_cpu(
             QuantFormat::NvFp4 => nvfp4_matrix_bytes(n, k),
             _ => q4_matrix_bytes(n, k),
         };
-        assert!(w_off + w_len <= w_blob.len(), "grouped job weight slice OOB");
+        assert!(
+            w_off + w_len <= w_blob.len(),
+            "grouped job weight slice OOB"
+        );
         let w = &w_blob[w_off..w_off + w_len];
         let row_out = &mut out[global_row * n..(global_row + 1) * n];
         let row_a = &a[global_row * k..(global_row + 1) * k];

@@ -40,7 +40,11 @@ fn quantize_f32_matrix_q4(rows: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
     let row_bytes = q4_row_bytes(in_dim);
     for row in 0..out_dim {
         let off = row * in_dim;
-        quantize_row_q4(&rows[off..off + in_dim], in_dim, &mut dst[row * row_bytes..]);
+        quantize_row_q4(
+            &rows[off..off + in_dim],
+            in_dim,
+            &mut dst[row * row_bytes..],
+        );
     }
     dst
 }
@@ -75,7 +79,9 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
     let w_q4 = f.w_q4();
     let mut out = vec![0.0f32; f.out_len()];
     q4_gemm_cpu(&f.x, f.m, f.k, &w_q4, f.n, &mut out);
-    out.iter().map(|&v| bf16::store_bf16_round_half(v)).collect()
+    out.iter()
+        .map(|&v| bf16::store_bf16_round_half(v))
+        .collect()
 }
 
 pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
@@ -102,7 +108,9 @@ pub fn pipeline_for(
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use objc2::runtime::ProtocolObject;
 #[cfg(all(feature = "metal", target_os = "macos"))]
-use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+};
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub fn bind_gpu_buffers(

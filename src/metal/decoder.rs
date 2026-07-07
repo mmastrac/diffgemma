@@ -1,15 +1,15 @@
 use crate::config::{LayerType, ModelConfig, TextConfig};
-use crate::metal::decoder_layer::{forward_decoder as layer_forward, GpuDecoderLayerScratch};
+use crate::kernels::cpu::rms_norm_no_scale;
+use crate::metal::decoder_layer::{GpuDecoderLayerScratch, forward_decoder as layer_forward};
 use crate::metal::engine::GpuDecoderEngine;
+use crate::metal::kv_cache::GpuKvCache;
+use crate::metal::weights::GpuDecoderWeightCache;
 use crate::model::decoder::{DecoderForwardInput, DecoderForwardOutput, DecoderScratch};
 use crate::model::embed::{embed_tokens_from_store, lm_head_tied_from_store, logit_softcapping};
 use crate::model::kv_cache::LayerKvView;
 use crate::model::self_conditioning::apply_from_store;
 use crate::safetensors::Error;
-use crate::metal::weights::GpuDecoderWeightCache;
-use crate::metal::kv_cache::GpuKvCache;
 use crate::weights::WeightStore;
-use crate::kernels::cpu::rms_norm_no_scale;
 
 pub fn load_weight_cache(
     store: &WeightStore,
@@ -30,7 +30,9 @@ pub fn load_weight_cache_opt(
     use crate::metal::device::MetalContext;
     use crate::metal::memory::{expert_cache_budget_bytes, log_gpu_memory_plan};
 
-    if crate::flags::progress_enabled() { eprintln!("initializing GPU weight cache..."); }
+    if crate::flags::progress_enabled() {
+        eprintln!("initializing GPU weight cache...");
+    }
     let warm = std::time::Instant::now();
     let ctx = MetalContext::new()?;
     let expert_budget = if store.is_quantized() {
@@ -149,7 +151,11 @@ impl GpuDecoderScratch {
         // Without this, a session reused across prompts (smoketest) or a
         // 3+-block generation would keep the first (small) capacity and overflow.
         let need = max_encoder_kv + max_canvas;
-        let have = self.gpu_kv.as_ref().map(|kv| kv.capacity_tokens()).unwrap_or(0);
+        let have = self
+            .gpu_kv
+            .as_ref()
+            .map(|kv| kv.capacity_tokens())
+            .unwrap_or(0);
         if have < need {
             // Grow with headroom (round encoder budget up to whole canvas blocks)
             // to avoid reallocating on every block extend.
@@ -185,7 +191,6 @@ impl GpuDecoderScratch {
 pub struct BenchConfig {
     pub max_layers: usize,
 }
-
 
 pub fn forward(
     store: &WeightStore,
@@ -227,10 +232,9 @@ fn forward_inner(
 
     let eps = text.rms_norm_eps as f32;
     if scratch.have_gpu_sc_logits {
-        if let (Some(embed_q8), Some(logits_buf)) = (
-            weights.embed_q8(),
-            scratch.sampler.logits.as_buf(),
-        ) {
+        if let (Some(embed_q8), Some(logits_buf)) =
+            (weights.embed_q8(), scratch.sampler.logits.as_buf())
+        {
             crate::metal::embed::soft_embeddings_q8_gpu_from_buf(
                 engine,
                 logits_buf,
@@ -293,11 +297,7 @@ fn forward_inner(
         }
     } else {
         scratch.cpu.hidden_a.copy_from_slice(&scratch.cpu.embed_buf);
-        scratch
-            .cpu
-            .self_cond
-            .normed
-            .resize(seq_len * hidden, 0.0);
+        scratch.cpu.self_cond.normed.resize(seq_len * hidden, 0.0);
         for s in 0..seq_len {
             let off = s * hidden;
             scratch.cpu.self_cond.normed[off..off + hidden]
@@ -346,10 +346,7 @@ fn forward_inner(
     let mut layer_dump_rows: Vec<(String, Vec<f32>)> = Vec::new();
     if layer_dump_path.is_some() && layer_dump_pos < seq_len {
         let off = layer_dump_pos * hidden;
-        layer_dump_rows.push((
-            "after_preamble".into(),
-            in_buf[off..off + hidden].to_vec(),
-        ));
+        layer_dump_rows.push(("after_preamble".into(), in_buf[off..off + hidden].to_vec()));
     }
 
     let n_layers = max_layers.min(text.num_hidden_layers);
@@ -363,7 +360,9 @@ fn forward_inner(
     // Canvas K/V are fully overwritten per layer in write_canvas_kv_pre_rope; do not
     // zero the suffix here — clearing all layers before each forward caused repeat drift.
     for layer in 0..n_layers {
-        let layer_scratch = scratch.layer.ensure(cfg, seq_len, input.kv_cache.kv_len, layer)?;
+        let layer_scratch = scratch
+            .layer
+            .ensure(cfg, seq_len, input.kv_cache.kv_len, layer)?;
         let layer_weights = if weights.is_dgq() {
             None
         } else {
@@ -415,8 +414,8 @@ fn forward_inner(
     let (norm_in, norm_out) = (in_buf, out_buf);
 
     {
-        use crate::metal::batched_kernels as bk;
         use crate::metal::batch::begin_engine_batch;
+        use crate::metal::batched_kernels as bk;
         let telemetry = engine.batch_telemetry();
         let mut batch = begin_engine_batch(
             &engine.ctx.queue,
@@ -451,7 +450,11 @@ fn forward_inner(
             let checkpoints: Vec<serde_json::Value> = layer_dump_rows
                 .iter()
                 .map(|(label, h)| {
-                    let l2 = h.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>().sqrt();
+                    let l2 = h
+                        .iter()
+                        .map(|v| (*v as f64) * (*v as f64))
+                        .sum::<f64>()
+                        .sqrt();
                     let max_abs = h.iter().fold(0.0f32, |m, v| m.max(v.abs()));
                     serde_json::json!({
                         "label": label,
@@ -491,10 +494,8 @@ fn forward_inner(
     }
     if engine.telemetry_enabled() && input.compute_logits {
         if !scratch.use_gpu_sampler {
-            engine
-                .telemetry_handle()
-                .borrow_mut()
-                .lm_head_logits_bytes = (seq_len * vocab * 4) as u64;
+            engine.telemetry_handle().borrow_mut().lm_head_logits_bytes =
+                (seq_len * vocab * 4) as u64;
         }
     }
 

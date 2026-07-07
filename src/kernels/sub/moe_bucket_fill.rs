@@ -151,7 +151,11 @@ fn run_phases(
         gpu_common::set_bytes(enc, &dims, 2);
         gpu_common::set_bytes(enc, &layer_idx, 4);
         gpu_common::set_bytes(enc, &grid_info, 7);
-        let count = if phase == 1 { 1 } else { f.canvas() * f.top_k as usize };
+        let count = if phase == 1 {
+            1
+        } else {
+            f.canvas() * f.top_k as usize
+        };
         enc.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize {
                 width: count,
@@ -186,29 +190,35 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         .allocate(&ctx.device, 6 * 3 * std::mem::size_of::<u32>())
         .ok_or(Error::Format("alloc"))?;
     let scratch = scratch_from_fixture(f);
-    BufferPool::write_bytes(
-        &buf_route,
-        unsafe {
-            std::slice::from_raw_parts(
-                &scratch as *const RouteScratch as *const u8,
-                std::mem::size_of::<RouteScratch>(),
-            )
-        },
-    );
+    BufferPool::write_bytes(&buf_route, unsafe {
+        std::slice::from_raw_parts(
+            &scratch as *const RouteScratch as *const u8,
+            std::mem::size_of::<RouteScratch>(),
+        )
+    });
 
     let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
     let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
-    run_phases(&enc, &pipeline, &buf_route, &buf_expert_unique, &buf_indirect, f);
+    run_phases(
+        &enc,
+        &pipeline,
+        &buf_route,
+        &buf_expert_unique,
+        &buf_indirect,
+        f,
+    );
     enc.endEncoding();
     cmd.commit();
     cmd.waitUntilCompleted();
 
-    let out_scratch: RouteScratch = unsafe {
-        std::ptr::read(buf_route.contents().as_ptr() as *const RouteScratch)
-    };
+    let out_scratch: RouteScratch =
+        unsafe { std::ptr::read(buf_route.contents().as_ptr() as *const RouteScratch) };
     let slots = out_scratch.num_slots as usize;
     let n = f.n_experts as usize;
-    let mut out: Vec<f32> = out_scratch.row_start[..n].iter().map(|&v| v as f32).collect();
+    let mut out: Vec<f32> = out_scratch.row_start[..n]
+        .iter()
+        .map(|&v| v as f32)
+        .collect();
     out.push(out_scratch.num_slots as f32);
     out.extend(out_scratch.token_list[..slots].iter().map(|&v| v as f32));
     out.extend(out_scratch.slot_list[..slots].iter().map(|&v| v as f32));
@@ -248,5 +258,4 @@ mod tests {
         max_tol = 0.0,
         min_cos = 1.0,
     }
-
 }

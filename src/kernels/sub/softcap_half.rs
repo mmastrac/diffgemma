@@ -1,9 +1,9 @@
 //! Logit softcap: `tanh(v/30)*30` in fp16.
 
-use super::{bf16, f16};
 use super::gpu_common;
 use super::test_util::ElemFormat;
 use super::variant::KernelVariant;
+use super::{bf16, f16};
 use crate::safetensors::Error;
 
 pub const ENTRY: &str = "softcap_half";
@@ -94,7 +94,9 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     } else {
         4
     };
-    let buf_d = pool.allocate(&ctx.device, dump_bytes).ok_or(Error::Format("alloc"))?;
+    let buf_d = pool
+        .allocate(&ctx.device, dump_bytes)
+        .ok_or(Error::Format("alloc"))?;
     BufferPool::write_bf16(&buf, &bf16::f32_slice_to_bf16_bits(&f.logits));
     gpu_common::dispatch_1d(&ctx.queue, &pipeline.pipeline, f.len as usize, |enc| {
         bind_gpu_buffers(enc, &buf, &buf_d, f.base, f.len);

@@ -1,23 +1,21 @@
 use crate::config::TextConfig;
-use crate::metal::batched_kernels::{self as bk};
 use crate::metal::batch::begin_engine_batch;
-use crate::metal::engine::GpuDecoderEngine;
-use crate::metal::linear::linear_cached_batched_in_buf;
-use crate::metal::moe::{
-    build_expert_jobs, experts_forward_dgq_cpu, experts_forward_gpu_batched,
-};
-use crate::model::moe::prepare_expert_input;
-use crate::metal::router::{route_gpu_in_batch, GpuRouteScratch};
-use crate::metal::weights::{GpuDecoderWeightCache, GpuLayerWeightCache};
+use crate::metal::batched_kernels::{self as bk};
 use crate::metal::decoder_attention::{
     forward_decoder_attention, forward_encoder_extend_attention, forward_encoder_prefill_attention,
 };
+use crate::metal::engine::GpuDecoderEngine;
 use crate::metal::kv_cache::GpuKvCache;
+use crate::metal::linear::linear_cached_batched_in_buf;
+use crate::metal::moe::{build_expert_jobs, experts_forward_dgq_cpu, experts_forward_gpu_batched};
+use crate::metal::router::{GpuRouteScratch, route_gpu_in_batch};
+use crate::metal::weights::{GpuDecoderWeightCache, GpuLayerWeightCache};
 use crate::model::attention::{AttentionParams, AttentionScratch};
-use crate::model::decoder_layer::{forward_decoder as cpu_forward_decoder, DecoderLayerScratch};
-use crate::model::layer_weights::DecoderLayerWeights;
+use crate::model::decoder_layer::{DecoderLayerScratch, forward_decoder as cpu_forward_decoder};
 use crate::model::kv_cache::LayerKvView;
+use crate::model::layer_weights::DecoderLayerWeights;
 use crate::model::mask::DecoderAttnMask;
+use crate::model::moe::prepare_expert_input;
 use crate::safetensors::Error;
 
 pub struct GpuDecoderLayerScratch {
@@ -208,7 +206,7 @@ fn forward_layer_ff_dgq_gpu(
         &engine.f32_bf16_linear_pipeline,
         &engine.f32_q4_linear_pipeline,
         &engine.f32_nvfp4_linear_pipeline,
-            &engine.f32_q8_linear_pipeline,
+        &engine.f32_q8_linear_pipeline,
         &buf_normed,
         &cached.mlp_gate,
         seq_len,
@@ -218,7 +216,7 @@ fn forward_layer_ff_dgq_gpu(
         &engine.f32_bf16_linear_pipeline,
         &engine.f32_q4_linear_pipeline,
         &engine.f32_nvfp4_linear_pipeline,
-            &engine.f32_q8_linear_pipeline,
+        &engine.f32_q8_linear_pipeline,
         &buf_normed,
         &cached.mlp_up,
         seq_len,
@@ -231,7 +229,7 @@ fn forward_layer_ff_dgq_gpu(
         &engine.f32_bf16_linear_pipeline,
         &engine.f32_q4_linear_pipeline,
         &engine.f32_nvfp4_linear_pipeline,
-            &engine.f32_q8_linear_pipeline,
+        &engine.f32_q8_linear_pipeline,
         &buf_gate,
         &cached.mlp_down,
         seq_len,
@@ -607,7 +605,8 @@ pub fn forward_encoder_prefill(
 /// by the pool at every `batch.end()`, so cross-batch tensors must live here).
 pub struct PrefillResidentBufs {
     /// Layer input/output hidden-state ping-pong, `[seq, hidden]` f32 each.
-    pub hidden: [objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>; 2],
+    pub hidden:
+        [objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>; 2],
     /// Post-attention residual stream (the MoE input), `[seq, hidden]`.
     pub stream: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
     /// Dense-FF branch after post_ff_norm_1, `[seq, hidden]`.
@@ -616,7 +615,11 @@ pub struct PrefillResidentBufs {
 }
 
 impl PrefillResidentBufs {
-    pub fn new(engine: &mut GpuDecoderEngine, seq_len: usize, hidden: usize) -> Result<Self, Error> {
+    pub fn new(
+        engine: &mut GpuDecoderEngine,
+        seq_len: usize,
+        hidden: usize,
+    ) -> Result<Self, Error> {
         let len = seq_len * hidden;
         let bytes = len * 4;
         let mut alloc = || {
@@ -836,7 +839,8 @@ pub fn forward_encoder_prefill_resident(
     let routes = route_scratch.into_routes(seq_len, top_k);
     let jobs = build_expert_jobs(&routes, experts);
     if let Some(cell) = &telemetry {
-        cell.borrow_mut().record_expert_layer(layer, jobs.len(), cfg);
+        cell.borrow_mut()
+            .record_expert_layer(layer, jobs.len(), cfg);
     }
 
     // ---- Batch B: MoE + scatter + combine + layer_scalar; no readback ----
@@ -905,7 +909,13 @@ pub fn forward_encoder_prefill_resident(
     )?;
     bk::vec_add_gpu_bufs(&mut batch, &engine.kernels, &buf_out, &bufs.stream, len)?;
     // GPU analog of the CPU `out[i] *= layer_scalar` epilogue (same f32 multiply).
-    bk::vec_scale_gpu_buf(&mut batch, &engine.kernels, &buf_out, len, cached.layer_scalar)?;
+    bk::vec_scale_gpu_buf(
+        &mut batch,
+        &engine.kernels,
+        &buf_out,
+        len,
+        cached.layer_scalar,
+    )?;
     dispatch_copy_f32_to_buf(
         &mut batch,
         &engine.sampler_kernels.copy_f32,
@@ -1008,20 +1018,20 @@ pub fn forward_decoder_cpu(
 mod determinism_tests {
     use super::*;
     use crate::config::ModelConfig;
-    use crate::metal::decoder_attention::forward_decoder_attention;
-    use crate::metal::decoder::load_weight_cache;
-    use crate::metal::router::{pack_routes, route_gpu_in_batch, GpuRouteScratch};
+    use crate::metal::GpuDecoderScratch;
     use crate::metal::batch::begin_engine_batch;
     use crate::metal::batched_kernels as bk;
-    use crate::metal::linear::linear_cached_batched_in_buf;
+    use crate::metal::decoder::load_weight_cache;
+    use crate::metal::decoder_attention::forward_decoder_attention;
     use crate::metal::encoder_extend::prefill_gpu;
-    use crate::metal::GpuDecoderScratch;
+    use crate::metal::linear::linear_cached_batched_in_buf;
+    use crate::metal::router::{GpuRouteScratch, pack_routes, route_gpu_in_batch};
     use crate::model::embed::embed_tokens_from_store;
     use crate::model::encoder::EncoderPrefillInput;
     use crate::model::encoder::EncoderScratch;
     use crate::model::kv_cache::{KvCache, LayerKvView};
     use crate::model::mask::DecoderAttnMask;
-    use crate::sample::{initialize_canvas, Rng};
+    use crate::sample::{Rng, initialize_canvas};
     use crate::weights::WeightStore;
 
     fn dgq_dir() -> Option<std::path::PathBuf> {
@@ -1055,10 +1065,9 @@ mod determinism_tests {
             let canvas = cfg.canvas_length;
             let hidden = text.hidden_size;
             let max_kv = 1 + 256;
-            let mut weights =
-                load_weight_cache(&store, text, canvas, max_kv).expect("cache");
+            let mut weights = load_weight_cache(&store, text, canvas, max_kv).expect("cache");
             let mut engine = GpuDecoderEngine::new().expect("engine");
-                let mut enc = EncoderScratch::new(canvas.max(1), &cfg);
+            let mut enc = EncoderScratch::new(canvas.max(1), &cfg);
             let mut dec = GpuDecoderScratch::new(canvas, &cfg);
             dec.use_gpu_sampler = false;
             let kv = prefill_gpu(
@@ -1105,7 +1114,12 @@ mod determinism_tests {
             }
         }
 
-        fn run_layer(&mut self, layer: usize, hidden: &[f32], scratch: &mut GpuDecoderLayerScratch) -> Vec<f32> {
+        fn run_layer(
+            &mut self,
+            layer: usize,
+            hidden: &[f32],
+            scratch: &mut GpuDecoderLayerScratch,
+        ) -> Vec<f32> {
             let text = &self.cfg.text_config;
             let canvas = self.cfg.canvas_length;
             let hidden_dim = text.hidden_size;
@@ -1120,10 +1134,8 @@ mod determinism_tests {
                 .expect("layer weights");
             let cached = self.weights.layer_ref(layer);
             let mut out = vec![0.0f32; canvas * hidden_dim];
-            let kv_view = LayerKvView::from_layer(
-                self.kv.layer(layer).expect("kv layer"),
-                self.kv.kv_len,
-            );
+            let kv_view =
+                LayerKvView::from_layer(self.kv.layer(layer).expect("kv layer"), self.kv.kv_len);
             forward_decoder(
                 &mut out,
                 hidden,
@@ -1150,7 +1162,13 @@ mod determinism_tests {
         a.iter()
             .zip(b.iter())
             .enumerate()
-            .find_map(|(i, (&x, &y))| if x.to_bits() != y.to_bits() { Some((i, x, y)) } else { None })
+            .find_map(|(i, (&x, &y))| {
+                if x.to_bits() != y.to_bits() {
+                    Some((i, x, y))
+                } else {
+                    None
+                }
+            })
     }
 
     fn assert_f32_repeatable<F>(label: &str, mut run: F)
@@ -1177,7 +1195,13 @@ mod determinism_tests {
     ) -> Vec<f32> {
         let text = &ctx.cfg.text_config;
         ctx.weights
-            .ensure_layer(&ctx.store, text, layer, &ctx.engine.ctx.device, &mut ctx.engine.pool)
+            .ensure_layer(
+                &ctx.store,
+                text,
+                layer,
+                &ctx.engine.ctx.device,
+                &mut ctx.engine.pool,
+            )
             .expect("layer weights");
         let cached = ctx.weights.layer_ref(layer);
         let seq_len = canvas_len;
@@ -1203,7 +1227,8 @@ mod determinism_tests {
             eps,
         )
         .expect("post_attn_norm");
-        bk::vec_add_gpu_bufs(&mut batch, &ctx.engine.kernels, &buf_stream, &buf_res, len).expect("add");
+        bk::vec_add_gpu_bufs(&mut batch, &ctx.engine.kernels, &buf_stream, &buf_res, len)
+            .expect("add");
         let buf_normed = bk::rms_norm_rows_gpu_buf(
             &mut batch,
             &ctx.engine.kernels,
@@ -1237,8 +1262,10 @@ mod determinism_tests {
         )
         .expect("up");
         let act_len = seq_len * cached.mlp_gate.out_dim();
-        bk::gelu_pytorch_tanh_gpu_buf(&mut batch, &ctx.engine.kernels, &buf_gate, act_len).expect("gelu");
-        bk::swiglu_mul_gpu_bufs(&mut batch, &ctx.engine.kernels, &buf_gate, &buf_up, act_len).expect("swiglu");
+        bk::gelu_pytorch_tanh_gpu_buf(&mut batch, &ctx.engine.kernels, &buf_gate, act_len)
+            .expect("gelu");
+        bk::swiglu_mul_gpu_bufs(&mut batch, &ctx.engine.kernels, &buf_gate, &buf_up, act_len)
+            .expect("swiglu");
         let buf_down = linear_cached_batched_in_buf(
             &mut batch,
             &ctx.engine.f32_bf16_linear_pipeline,
@@ -1277,18 +1304,20 @@ mod determinism_tests {
         let canvas_len = ctx.cfg.canvas_length;
         let kv_len = ctx.kv.kv_len;
         let hidden_dim = ctx.cfg.text_config.hidden_size;
-        let mut scratch = GpuDecoderLayerScratch::with_kv_len(
-            canvas_len,
-            &ctx.cfg.text_config,
-            0,
-            kv_len,
-        )
-        .expect("scratch");
+        let mut scratch =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 0, kv_len)
+                .expect("scratch");
         let hidden_in = ctx.hidden_in.clone();
         let mut a = vec![0.0f32; canvas_len * hidden_dim];
         let mut b = vec![0.0f32; canvas_len * hidden_dim];
         ctx.weights
-            .ensure_layer(&ctx.store, &ctx.cfg.text_config, 0, &ctx.engine.ctx.device, &mut ctx.engine.pool)
+            .ensure_layer(
+                &ctx.store,
+                &ctx.cfg.text_config,
+                0,
+                &ctx.engine.ctx.device,
+                &mut ctx.engine.pool,
+            )
             .expect("layer0");
         let cached = ctx.weights.layer_ref(0);
         let kv_view = LayerKvView::from_layer(ctx.kv.layer(0).expect("kv"), kv_len);
@@ -1341,8 +1370,13 @@ mod determinism_tests {
         let hidden_dim = ctx.cfg.text_config.hidden_size;
         let text = &ctx.cfg.text_config;
         let kv_len = ctx.kv.kv_len;
-        ctx.weights
-            .ensure_layer(&ctx.store, text, layer, &ctx.engine.ctx.device, &mut ctx.engine.pool)?;
+        ctx.weights.ensure_layer(
+            &ctx.store,
+            text,
+            layer,
+            &ctx.engine.ctx.device,
+            &mut ctx.engine.pool,
+        )?;
         let cached = ctx.weights.layer_ref(layer);
         let kv_view = LayerKvView::from_layer(ctx.kv.layer(layer).expect("kv"), kv_len);
         forward_decoder_attention(
@@ -1402,8 +1436,9 @@ mod determinism_tests {
         let mut ctx = LayerTestCtx::new(2);
         let canvas_len = ctx.cfg.canvas_length;
         let top_k = ctx.cfg.text_config.top_k_experts;
-        let mut scratch = GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 0, ctx.kv.kv_len)
-            .expect("scratch");
+        let mut scratch =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 0, ctx.kv.kv_len)
+                .expect("scratch");
         let hidden_in = ctx.hidden_in.clone();
         let stream = stream_residual_for_ff(&mut ctx, &mut scratch, &hidden_in, 0).expect("stream");
         let cached = ctx.weights.layer_ref(0);
@@ -1431,7 +1466,12 @@ mod determinism_tests {
             )
             .expect("route");
             batch.end().expect("end");
-            let packed = pack_routes(&route_scratch.indices, &route_scratch.weights, canvas_len, top_k);
+            let packed = pack_routes(
+                &route_scratch.indices,
+                &route_scratch.weights,
+                canvas_len,
+                top_k,
+            );
             if let Some(ref prev) = first {
                 assert_eq!(packed.len(), prev.len(), "layer 0 route count drift");
                 for (i, (ra, rb)) in packed.iter().zip(prev.iter()).enumerate() {
@@ -1464,17 +1504,19 @@ mod determinism_tests {
         let canvas_len = ctx.cfg.canvas_length;
         let hidden_dim = ctx.cfg.text_config.hidden_size;
         let eps = ctx.cfg.text_config.rms_norm_eps as f32;
-        let mut scratch = GpuDecoderLayerScratch::with_kv_len(
-            canvas_len,
-            &ctx.cfg.text_config,
-            0,
-            ctx.kv.kv_len,
-        )
-        .expect("scratch");
+        let mut scratch =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 0, ctx.kv.kv_len)
+                .expect("scratch");
         let hidden_in = ctx.hidden_in.clone();
         let kv_view = LayerKvView::from_layer(ctx.kv.layer(0).expect("kv"), ctx.kv.kv_len);
         ctx.weights
-            .ensure_layer(&ctx.store, &ctx.cfg.text_config, 0, &ctx.engine.ctx.device, &mut ctx.engine.pool)
+            .ensure_layer(
+                &ctx.store,
+                &ctx.cfg.text_config,
+                0,
+                &ctx.engine.ctx.device,
+                &mut ctx.engine.pool,
+            )
             .expect("layer0");
         {
             let cached = ctx.weights.layer_ref(0);
@@ -1512,13 +1554,9 @@ mod determinism_tests {
         let kv_len = ctx.kv.kv_len;
         let hidden_dim = ctx.cfg.text_config.hidden_size;
         let eps = ctx.cfg.text_config.rms_norm_eps as f32;
-        let mut scratch = GpuDecoderLayerScratch::with_kv_len(
-            canvas_len,
-            &ctx.cfg.text_config,
-            0,
-            kv_len,
-        )
-        .expect("scratch");
+        let mut scratch =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 0, kv_len)
+                .expect("scratch");
         let hidden_in = ctx.hidden_in.clone();
         let kv_view = LayerKvView::from_layer(ctx.kv.layer(0).expect("kv"), kv_len);
         ctx.weights
@@ -1591,22 +1629,14 @@ mod determinism_tests {
         let kv_len = ctx.kv.kv_len;
         let hidden_dim = ctx.cfg.text_config.hidden_size;
         let eps = ctx.cfg.text_config.rms_norm_eps as f32;
-        let mut scratch0 = GpuDecoderLayerScratch::with_kv_len(
-            canvas_len,
-            &ctx.cfg.text_config,
-            0,
-            kv_len,
-        )
-        .expect("scratch0");
+        let mut scratch0 =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 0, kv_len)
+                .expect("scratch0");
         let hidden_in = ctx.hidden_in.clone();
         let h0 = ctx.run_layer(0, &hidden_in, &mut scratch0);
-        let mut scratch1 = GpuDecoderLayerScratch::with_kv_len(
-            canvas_len,
-            &ctx.cfg.text_config,
-            1,
-            kv_len,
-        )
-        .expect("scratch1");
+        let mut scratch1 =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 1, kv_len)
+                .expect("scratch1");
         ctx.weights
             .ensure_layer(
                 &ctx.store,
@@ -1683,30 +1713,18 @@ mod determinism_tests {
         let kv_len = ctx.kv.kv_len;
         let hidden_dim = ctx.cfg.text_config.hidden_size;
         let eps = ctx.cfg.text_config.rms_norm_eps as f32;
-        let mut scratch0 = GpuDecoderLayerScratch::with_kv_len(
-            canvas_len,
-            &ctx.cfg.text_config,
-            0,
-            kv_len,
-        )
-        .expect("scratch0");
+        let mut scratch0 =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 0, kv_len)
+                .expect("scratch0");
         let hidden_in = ctx.hidden_in.clone();
         let h0 = ctx.run_layer(0, &hidden_in, &mut scratch0);
-        let mut scratch1 = GpuDecoderLayerScratch::with_kv_len(
-            canvas_len,
-            &ctx.cfg.text_config,
-            1,
-            kv_len,
-        )
-        .expect("scratch1");
+        let mut scratch1 =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 1, kv_len)
+                .expect("scratch1");
         let h1 = ctx.run_layer(1, &h0, &mut scratch1);
-        let mut scratch2 = GpuDecoderLayerScratch::with_kv_len(
-            canvas_len,
-            &ctx.cfg.text_config,
-            2,
-            kv_len,
-        )
-        .expect("scratch2");
+        let mut scratch2 =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 2, kv_len)
+                .expect("scratch2");
         ctx.weights
             .ensure_layer(
                 &ctx.store,
@@ -1782,25 +1800,23 @@ mod determinism_tests {
         let canvas_len = ctx.cfg.canvas_length;
         let kv_len = ctx.kv.kv_len;
         let hidden_dim = ctx.cfg.text_config.hidden_size;
-        let mut scratch0 = GpuDecoderLayerScratch::with_kv_len(
-            canvas_len,
-            &ctx.cfg.text_config,
-            0,
-            kv_len,
-        )
-        .expect("scratch0");
+        let mut scratch0 =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 0, kv_len)
+                .expect("scratch0");
         let hidden_in = ctx.hidden_in.clone();
         let h0 = ctx.run_layer(0, &hidden_in, &mut scratch0);
         let h0_fixed = h0.clone();
-        let mut scratch = GpuDecoderLayerScratch::with_kv_len(
-            canvas_len,
-            &ctx.cfg.text_config,
-            1,
-            kv_len,
-        )
-        .expect("scratch");
+        let mut scratch =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 1, kv_len)
+                .expect("scratch");
         ctx.weights
-            .ensure_layer(&ctx.store, &ctx.cfg.text_config, 1, &ctx.engine.ctx.device, &mut ctx.engine.pool)
+            .ensure_layer(
+                &ctx.store,
+                &ctx.cfg.text_config,
+                1,
+                &ctx.engine.ctx.device,
+                &mut ctx.engine.pool,
+            )
             .expect("layer1");
         let cached = ctx.weights.layer_ref(1);
         let kv_view = LayerKvView::from_layer(ctx.kv.layer(1).expect("kv"), kv_len);
@@ -1879,7 +1895,8 @@ mod determinism_tests {
             .expect("scratch");
             scratch.attn_out.copy_from_slice(&attn_fixed);
             scratch.residual.copy_from_slice(&res_fixed);
-            setup.weights
+            setup
+                .weights
                 .ensure_layer(
                     &setup.store,
                     &setup.cfg.text_config,
@@ -1929,7 +1946,8 @@ mod determinism_tests {
         )
         .expect("scratch");
         let hidden_in = setup.hidden_in.clone();
-        let stream = stream_residual_for_ff(&mut setup, &mut scratch, &hidden_in, 0).expect("stream");
+        let stream =
+            stream_residual_for_ff(&mut setup, &mut scratch, &hidden_in, 0).expect("stream");
         let attn_fixed = scratch.attn_out.clone();
         let res_fixed = scratch.residual.clone();
 
@@ -1946,7 +1964,13 @@ mod determinism_tests {
             scratch.attn_out.copy_from_slice(&attn_fixed);
             scratch.residual.copy_from_slice(&res_fixed);
             ctx.weights
-                .ensure_layer(&ctx.store, &ctx.cfg.text_config, 0, &ctx.engine.ctx.device, &mut ctx.engine.pool)
+                .ensure_layer(
+                    &ctx.store,
+                    &ctx.cfg.text_config,
+                    0,
+                    &ctx.engine.ctx.device,
+                    &mut ctx.engine.pool,
+                )
                 .expect("layer0");
             let cached = ctx.weights.layer_ref(0);
             let mut out = vec![0.0f32; canvas_len * hidden_dim];
@@ -1988,13 +2012,20 @@ mod determinism_tests {
         )
         .expect("scratch");
         let hidden_in = setup.hidden_in.clone();
-        let stream = stream_residual_for_ff(&mut setup, &mut scratch, &hidden_in, 0).expect("stream");
+        let stream =
+            stream_residual_for_ff(&mut setup, &mut scratch, &hidden_in, 0).expect("stream");
 
         let mut unique = std::collections::HashSet::new();
         for trial in 0..8 {
             let mut ctx = LayerTestCtx::new(3);
             ctx.weights
-                .ensure_layer(&ctx.store, &ctx.cfg.text_config, 0, &ctx.engine.ctx.device, &mut ctx.engine.pool)
+                .ensure_layer(
+                    &ctx.store,
+                    &ctx.cfg.text_config,
+                    0,
+                    &ctx.engine.ctx.device,
+                    &mut ctx.engine.pool,
+                )
                 .expect("layer0");
             let cached = ctx.weights.layer_ref(0);
             let telemetry = ctx.engine.batch_telemetry();
@@ -2019,13 +2050,22 @@ mod determinism_tests {
             )
             .expect("route");
             batch.end().expect("end");
-            let routes = pack_routes(&route_scratch.indices, &route_scratch.weights, canvas_len, top_k);
+            let routes = pack_routes(
+                &route_scratch.indices,
+                &route_scratch.weights,
+                canvas_len,
+                top_k,
+            );
             let tag = routes[1].indices.clone();
             eprintln!("layer0 route fresh trial {trial}: experts={tag:?}");
             unique.insert(tag);
             ctx.weights.release_layer();
         }
-        assert_eq!(unique.len(), 1, "layer0 route fresh-engine drift: {unique:?}");
+        assert_eq!(
+            unique.len(),
+            1,
+            "layer0 route fresh-engine drift: {unique:?}"
+        );
     }
 
     #[test]
@@ -2047,7 +2087,13 @@ mod determinism_tests {
             )
             .expect("scratch");
             ctx.weights
-                .ensure_layer(&ctx.store, &ctx.cfg.text_config, 0, &ctx.engine.ctx.device, &mut ctx.engine.pool)
+                .ensure_layer(
+                    &ctx.store,
+                    &ctx.cfg.text_config,
+                    0,
+                    &ctx.engine.ctx.device,
+                    &mut ctx.engine.pool,
+                )
                 .expect("layer0");
             let cached = ctx.weights.layer_ref(0);
             let kv_view = LayerKvView::from_layer(ctx.kv.layer(0).expect("kv"), ctx.kv.kv_len);
@@ -2072,7 +2118,11 @@ mod determinism_tests {
             eprintln!("layer0 attn fresh trial {trial}: {tag:?}");
             unique.insert(tag);
         }
-        assert_eq!(unique.len(), 1, "layer0 attn fresh-engine drift: {unique:?}");
+        assert_eq!(
+            unique.len(),
+            1,
+            "layer0 attn fresh-engine drift: {unique:?}"
+        );
     }
 
     #[test]
@@ -2109,25 +2159,15 @@ mod determinism_tests {
         let mut ctx = LayerTestCtx::new(2);
         let canvas_len = ctx.cfg.canvas_length;
         let hidden_in = ctx.hidden_in.clone();
-        let mut scratch_a = GpuDecoderLayerScratch::with_kv_len(
-            canvas_len,
-            &ctx.cfg.text_config,
-            0,
-            ctx.kv.kv_len,
-        )
-        .expect("scratch_a");
-        let mut scratch_b = GpuDecoderLayerScratch::with_kv_len(
-            canvas_len,
-            &ctx.cfg.text_config,
-            0,
-            ctx.kv.kv_len,
-        )
-        .expect("scratch_b");
-        if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {
-        }
+        let mut scratch_a =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 0, ctx.kv.kv_len)
+                .expect("scratch_a");
+        let mut scratch_b =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 0, ctx.kv.kv_len)
+                .expect("scratch_b");
+        if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {}
         let a = ctx.run_layer(0, &hidden_in, &mut scratch_a);
-        if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {
-        }
+        if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {}
         let b = ctx.run_layer(0, &hidden_in, &mut scratch_b);
         if a != b {
             let detail = first_f32_diff(&a, &b)
@@ -2184,20 +2224,28 @@ mod determinism_tests {
         let canvas_len = ctx.cfg.canvas_length;
         let kv_len = ctx.kv.kv_len;
         let hidden_in = ctx.hidden_in.clone();
-        let mut s0 = GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 0, kv_len).expect("s0");
-        let mut s1 = GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 1, kv_len).expect("s1");
-        let mut s2 = GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 2, kv_len).expect("s2");
+        let mut s0 =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 0, kv_len)
+                .expect("s0");
+        let mut s1 =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 1, kv_len)
+                .expect("s1");
+        let mut s2 =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 2, kv_len)
+                .expect("s2");
         let h0 = ctx.run_layer(0, &hidden_in, &mut s0);
         let h1 = ctx.run_layer(1, &h0, &mut s1);
         let _ = ctx.run_layer(2, &h1, &mut s2);
 
-        let mut s2a = GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 2, kv_len).expect("s2a");
-        let mut s2b = GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 2, kv_len).expect("s2b");
-        if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {
-        }
+        let mut s2a =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 2, kv_len)
+                .expect("s2a");
+        let mut s2b =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 2, kv_len)
+                .expect("s2b");
+        if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {}
         let a = ctx.run_layer(2, &h1, &mut s2a);
-        if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {
-        }
+        if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {}
         let b = ctx.run_layer(2, &h1, &mut s2b);
         if a != b {
             let detail = first_f32_diff(&a, &b)
@@ -2218,20 +2266,30 @@ mod determinism_tests {
         let kv_len = ctx.kv.kv_len;
         let hidden_in = ctx.hidden_in.clone();
 
-        let mut s0a = GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 0, kv_len).expect("s0a");
-        let mut s1a = GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 1, kv_len).expect("s1a");
-        let mut s2a = GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 2, kv_len).expect("s2a");
-        if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {
-        }
+        let mut s0a =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 0, kv_len)
+                .expect("s0a");
+        let mut s1a =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 1, kv_len)
+                .expect("s1a");
+        let mut s2a =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 2, kv_len)
+                .expect("s2a");
+        if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {}
         let h0a = ctx.run_layer(0, &hidden_in, &mut s0a);
         let h1a = ctx.run_layer(1, &h0a, &mut s1a);
         let a = ctx.run_layer(2, &h1a, &mut s2a);
 
-        let mut s0b = GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 0, kv_len).expect("s0b");
-        let mut s1b = GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 1, kv_len).expect("s1b");
-        let mut s2b = GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 2, kv_len).expect("s2b");
-        if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {
-        }
+        let mut s0b =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 0, kv_len)
+                .expect("s0b");
+        let mut s1b =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 1, kv_len)
+                .expect("s1b");
+        let mut s2b =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 2, kv_len)
+                .expect("s2b");
+        if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {}
         let h0b = ctx.run_layer(0, &hidden_in, &mut s0b);
         let h1b = ctx.run_layer(1, &h0b, &mut s1b);
         let b = ctx.run_layer(2, &h1b, &mut s2b);
@@ -2255,27 +2313,15 @@ mod determinism_tests {
             let mut ctx = LayerTestCtx::new(3);
             let canvas_len = ctx.cfg.canvas_length;
             let kv_len = ctx.kv.kv_len;
-            let mut scratch0 = GpuDecoderLayerScratch::with_kv_len(
-                canvas_len,
-                &ctx.cfg.text_config,
-                0,
-                kv_len,
-            )
-            .expect("scratch0");
-            let mut scratch1 = GpuDecoderLayerScratch::with_kv_len(
-                canvas_len,
-                &ctx.cfg.text_config,
-                1,
-                kv_len,
-            )
-            .expect("scratch1");
-            let mut scratch2 = GpuDecoderLayerScratch::with_kv_len(
-                canvas_len,
-                &ctx.cfg.text_config,
-                2,
-                kv_len,
-            )
-            .expect("scratch2");
+            let mut scratch0 =
+                GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 0, kv_len)
+                    .expect("scratch0");
+            let mut scratch1 =
+                GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 1, kv_len)
+                    .expect("scratch1");
+            let mut scratch2 =
+                GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 2, kv_len)
+                    .expect("scratch2");
             let hidden_in = ctx.hidden_in.clone();
             let h0 = ctx.run_layer(0, &hidden_in, &mut scratch0);
             let h1 = ctx.run_layer(1, &h0, &mut scratch1);
@@ -2301,20 +2347,12 @@ mod determinism_tests {
         let mut setup = LayerTestCtx::new(3);
         let canvas_len = setup.cfg.canvas_length;
         let kv_len = setup.kv.kv_len;
-        let mut scratch0 = GpuDecoderLayerScratch::with_kv_len(
-            canvas_len,
-            &setup.cfg.text_config,
-            0,
-            kv_len,
-        )
-        .expect("scratch0");
-        let mut scratch1 = GpuDecoderLayerScratch::with_kv_len(
-            canvas_len,
-            &setup.cfg.text_config,
-            1,
-            kv_len,
-        )
-        .expect("scratch1");
+        let mut scratch0 =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &setup.cfg.text_config, 0, kv_len)
+                .expect("scratch0");
+        let mut scratch1 =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &setup.cfg.text_config, 1, kv_len)
+                .expect("scratch1");
         let hidden_in = setup.hidden_in.clone();
         let h0 = setup.run_layer(0, &hidden_in, &mut scratch0);
         let h1 = setup.run_layer(1, &h0, &mut scratch1);
@@ -2324,13 +2362,9 @@ mod determinism_tests {
         let mut unique_hashes = std::collections::HashSet::new();
         for trial in 0..8 {
             let mut ctx = LayerTestCtx::new(3);
-            let mut scratch2 = GpuDecoderLayerScratch::with_kv_len(
-                canvas_len,
-                &ctx.cfg.text_config,
-                2,
-                kv_len,
-            )
-            .expect("scratch2");
+            let mut scratch2 =
+                GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 2, kv_len)
+                    .expect("scratch2");
             let out = ctx.run_layer(2, &h1_fixed, &mut scratch2);
             let nan_n = out.iter().filter(|v| v.is_nan()).count();
             let hash = out.iter().take(16).map(|v| v.to_bits()).collect::<Vec<_>>();
@@ -2354,39 +2388,23 @@ mod determinism_tests {
         let mut ctx = LayerTestCtx::new(3);
         let canvas_len = ctx.cfg.canvas_length;
         let kv_len = ctx.kv.kv_len;
-        let mut scratch0 = GpuDecoderLayerScratch::with_kv_len(
-            canvas_len,
-            &ctx.cfg.text_config,
-            0,
-            kv_len,
-        )
-        .expect("scratch0");
-        let mut scratch1 = GpuDecoderLayerScratch::with_kv_len(
-            canvas_len,
-            &ctx.cfg.text_config,
-            1,
-            kv_len,
-        )
-        .expect("scratch1");
+        let mut scratch0 =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 0, kv_len)
+                .expect("scratch0");
+        let mut scratch1 =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 1, kv_len)
+                .expect("scratch1");
         let hidden_in = ctx.hidden_in.clone();
         let h0 = ctx.run_layer(0, &hidden_in, &mut scratch0);
         let h1 = ctx.run_layer(1, &h0, &mut scratch1);
         let h1_fixed = h1.clone();
 
-        let mut scratch2a = GpuDecoderLayerScratch::with_kv_len(
-            canvas_len,
-            &ctx.cfg.text_config,
-            2,
-            kv_len,
-        )
-        .expect("scratch2a");
-        let mut scratch2b = GpuDecoderLayerScratch::with_kv_len(
-            canvas_len,
-            &ctx.cfg.text_config,
-            2,
-            kv_len,
-        )
-        .expect("scratch2b");
+        let mut scratch2a =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 2, kv_len)
+                .expect("scratch2a");
+        let mut scratch2b =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 2, kv_len)
+                .expect("scratch2b");
         let a = ctx.run_layer(2, &h1_fixed, &mut scratch2a);
         let b = ctx.run_layer(2, &h1_fixed, &mut scratch2b);
         if a != b {
@@ -2407,38 +2425,31 @@ mod determinism_tests {
         let canvas_len = ctx.cfg.canvas_length;
         let kv_len = ctx.kv.kv_len;
         let hidden_dim = ctx.cfg.text_config.hidden_size;
-        let mut scratch0 = GpuDecoderLayerScratch::with_kv_len(
-            canvas_len,
-            &ctx.cfg.text_config,
-            0,
-            kv_len,
-        )
-        .expect("scratch0");
-        let mut scratch1 = GpuDecoderLayerScratch::with_kv_len(
-            canvas_len,
-            &ctx.cfg.text_config,
-            1,
-            kv_len,
-        )
-        .expect("scratch1");
+        let mut scratch0 =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 0, kv_len)
+                .expect("scratch0");
+        let mut scratch1 =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 1, kv_len)
+                .expect("scratch1");
         let hidden_in = ctx.hidden_in.clone();
         let h0 = ctx.run_layer(0, &hidden_in, &mut scratch0);
         let h1 = ctx.run_layer(1, &h0, &mut scratch1);
         let h1_fixed = h1.clone();
-        let mut scratch = GpuDecoderLayerScratch::with_kv_len(
-            canvas_len,
-            &ctx.cfg.text_config,
-            2,
-            kv_len,
-        )
-        .expect("scratch");
+        let mut scratch =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 2, kv_len)
+                .expect("scratch");
         ctx.weights
-            .ensure_layer(&ctx.store, &ctx.cfg.text_config, 2, &ctx.engine.ctx.device, &mut ctx.engine.pool)
+            .ensure_layer(
+                &ctx.store,
+                &ctx.cfg.text_config,
+                2,
+                &ctx.engine.ctx.device,
+                &mut ctx.engine.pool,
+            )
             .expect("layer2");
         let cached = ctx.weights.layer_ref(2);
         let kv_view = LayerKvView::from_layer(ctx.kv.layer(2).expect("kv"), kv_len);
-        if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {
-        }
+        if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {}
         let mut a = vec![0.0f32; canvas_len * hidden_dim];
         let mut b = vec![0.0f32; canvas_len * hidden_dim];
         forward_decoder_attention(
@@ -2456,15 +2467,10 @@ mod determinism_tests {
             ctx.dec.gpu_kv.as_ref(),
         )
         .expect("attn a");
-        let mut scratch_b = GpuDecoderLayerScratch::with_kv_len(
-            canvas_len,
-            &ctx.cfg.text_config,
-            2,
-            kv_len,
-        )
-        .expect("scratch_b");
-        if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {
-        }
+        let mut scratch_b =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 2, kv_len)
+                .expect("scratch_b");
+        if let Some(gpu_kv) = ctx.dec.gpu_kv.as_ref() {}
         forward_decoder_attention(
             &mut b,
             &h1_fixed,
@@ -2498,31 +2504,19 @@ mod determinism_tests {
         let mut ctx = LayerTestCtx::new(2);
         let canvas_len = ctx.cfg.canvas_length;
         let kv_len = ctx.kv.kv_len;
-        let mut scratch0 = GpuDecoderLayerScratch::with_kv_len(
-            canvas_len,
-            &ctx.cfg.text_config,
-            0,
-            kv_len,
-        )
-        .expect("scratch0");
+        let mut scratch0 =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 0, kv_len)
+                .expect("scratch0");
         let hidden_in = ctx.hidden_in.clone();
         let h0 = ctx.run_layer(0, &hidden_in, &mut scratch0);
         let h0_fixed = h0.clone();
 
-        let mut scratch1a = GpuDecoderLayerScratch::with_kv_len(
-            canvas_len,
-            &ctx.cfg.text_config,
-            1,
-            kv_len,
-        )
-        .expect("scratch1a");
-        let mut scratch1b = GpuDecoderLayerScratch::with_kv_len(
-            canvas_len,
-            &ctx.cfg.text_config,
-            1,
-            kv_len,
-        )
-        .expect("scratch1b");
+        let mut scratch1a =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 1, kv_len)
+                .expect("scratch1a");
+        let mut scratch1b =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 1, kv_len)
+                .expect("scratch1b");
         let a = ctx.run_layer(1, &h0_fixed, &mut scratch1a);
         let b = ctx.run_layer(1, &h0_fixed, &mut scratch1b);
         if a != b {
@@ -2542,23 +2536,15 @@ mod determinism_tests {
         let mut ctx = LayerTestCtx::new(2);
         let canvas_len = ctx.cfg.canvas_length;
         let kv_len = ctx.kv.kv_len;
-        let mut scratch0 = GpuDecoderLayerScratch::with_kv_len(
-            canvas_len,
-            &ctx.cfg.text_config,
-            0,
-            kv_len,
-        )
-        .expect("scratch0");
+        let mut scratch0 =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 0, kv_len)
+                .expect("scratch0");
         let hidden_in = ctx.hidden_in.clone();
         let h0_a = ctx.run_layer(0, &hidden_in, &mut scratch0);
         let h0_fixed = h0_a.clone();
-        let mut scratch1 = GpuDecoderLayerScratch::with_kv_len(
-            canvas_len,
-            &ctx.cfg.text_config,
-            1,
-            kv_len,
-        )
-        .expect("scratch1");
+        let mut scratch1 =
+            GpuDecoderLayerScratch::with_kv_len(canvas_len, &ctx.cfg.text_config, 1, kv_len)
+                .expect("scratch1");
         let _ = ctx.run_layer(1, &h0_fixed, &mut scratch1);
         let h0_b = ctx.run_layer(0, &hidden_in, &mut scratch0);
         if h0_a != h0_b {

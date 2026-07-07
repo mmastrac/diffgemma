@@ -1,8 +1,8 @@
 //! Gather bf16 arena rows by index into f32 (MoE batched path; fuses half_to_f32 + gather).
 
 use super::bf16;
-use super::gpu_common;
 use super::gather_rows;
+use super::gpu_common;
 use super::test_util::ElemFormat;
 use super::variant::KernelVariant;
 use crate::safetensors::Error;
@@ -126,16 +126,23 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let buf_idx = pool
         .allocate(&ctx.device, f.indices.len() * 4)
         .ok_or(Error::Format("alloc"))?;
-    let buf_dst = pool.allocate(&ctx.device, out_len * 4).ok_or(Error::Format("alloc"))?;
-    let dump_bytes = if variant.dump_stage > 0 { out_len * 4 } else { 4 };
-    let buf_d = pool.allocate(&ctx.device, dump_bytes).ok_or(Error::Format("alloc"))?;
+    let buf_dst = pool
+        .allocate(&ctx.device, out_len * 4)
+        .ok_or(Error::Format("alloc"))?;
+    let dump_bytes = if variant.dump_stage > 0 {
+        out_len * 4
+    } else {
+        4
+    };
+    let buf_d = pool
+        .allocate(&ctx.device, dump_bytes)
+        .ok_or(Error::Format("alloc"))?;
     let src_bytes = unsafe {
         std::slice::from_raw_parts(f.src_bf16.as_ptr().cast::<u8>(), f.src_bf16.len() * 2)
     };
     BufferPool::write_bytes(&buf_src, src_bytes);
-    let idx_bytes = unsafe {
-        std::slice::from_raw_parts(f.indices.as_ptr().cast::<u8>(), f.indices.len() * 4)
-    };
+    let idx_bytes =
+        unsafe { std::slice::from_raw_parts(f.indices.as_ptr().cast::<u8>(), f.indices.len() * 4) };
     BufferPool::write_bytes(&buf_idx, idx_bytes);
     gpu_common::dispatch_1d(&ctx.queue, &pipeline.pipeline, grid, |enc| {
         bind_gpu_buffers(

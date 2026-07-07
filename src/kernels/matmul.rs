@@ -113,16 +113,8 @@ fn matmul_naive(
         for j in 0..n {
             let mut sum = 0.0f32;
             for p in 0..k {
-                let av = if trans_a {
-                    a[p * m + i]
-                } else {
-                    a[i * k + p]
-                };
-                let bv = if trans_b {
-                    b[j * k + p]
-                } else {
-                    b[p * n + j]
-                };
+                let av = if trans_a { a[p * m + i] } else { a[i * k + p] };
+                let bv = if trans_b { b[j * k + p] } else { b[p * n + j] };
                 sum += av * bv;
             }
             c[i * n + j] = alpha * sum + beta * c[i * n + j];

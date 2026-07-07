@@ -57,7 +57,9 @@ pub fn pipeline_for_gather_adaptive(
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
-use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize};
+use objc2_metal::{
+    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
+};
 
 /// Run the block-sparse kernel on a grouped fixture with CPU-built blocks
 /// (bucket_fill's legacy emission). `adaptive` selects the GEMM_M_ADAPT
@@ -106,11 +108,20 @@ pub fn gpu_sparse(
         route.num_blocks = blk as u32;
     }
 
-    let buf_a = pool.allocate(&ctx.device, f.a.len() * 4).ok_or(Error::Format("alloc"))?;
-    let buf_w = pool.allocate(&ctx.device, w_blob.len()).ok_or(Error::Format("alloc"))?;
-    let buf_c = pool.allocate(&ctx.device, out_len * 4).ok_or(Error::Format("alloc"))?;
+    let buf_a = pool
+        .allocate(&ctx.device, f.a.len() * 4)
+        .ok_or(Error::Format("alloc"))?;
+    let buf_w = pool
+        .allocate(&ctx.device, w_blob.len())
+        .ok_or(Error::Format("alloc"))?;
+    let buf_c = pool
+        .allocate(&ctx.device, out_len * 4)
+        .ok_or(Error::Format("alloc"))?;
     let buf_jobs = pool
-        .allocate(&ctx.device, jobs.len() * std::mem::size_of::<BlockGroupedJob>())
+        .allocate(
+            &ctx.device,
+            jobs.len() * std::mem::size_of::<BlockGroupedJob>(),
+        )
         .ok_or(Error::Format("alloc"))?;
     let buf_rs = pool
         .allocate(&ctx.device, f.row_starts.len() * 4)
@@ -137,10 +148,8 @@ pub fn gpu_sparse(
     });
     BufferPool::write_f32(&buf_c, &vec![0.0f32; out_len]);
 
-    let n_tiles = crate::kernels::sub::gemm_common::div_up(
-        f.n,
-        crate::kernels::sub::gemm_common::n_tile(),
-    );
+    let n_tiles =
+        crate::kernels::sub::gemm_common::div_up(f.n, crate::kernels::sub::gemm_common::n_tile());
     let tg = MTLSize {
         width: crate::kernels::sub::gemm_common::THREADS_PER_TG,
         height: 1,
@@ -165,7 +174,11 @@ pub fn gpu_sparse(
         num_jobs as u32,
     );
     enc.dispatchThreadgroups_threadsPerThreadgroup(
-        MTLSize { width: n_tiles, height: route.num_blocks as usize, depth: 1 },
+        MTLSize {
+            width: n_tiles,
+            height: route.num_blocks as usize,
+            depth: 1,
+        },
         tg,
     );
     enc.endEncoding();

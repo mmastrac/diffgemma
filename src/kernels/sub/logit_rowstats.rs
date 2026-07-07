@@ -39,9 +39,7 @@ pub fn tiny_fixture(_: ElemFormat) -> Fixture {
 pub fn wide_fixture(_: ElemFormat) -> Fixture {
     let rows = 4usize;
     let cols = 512usize;
-    let logits: Vec<f32> = (0..rows * cols)
-        .map(|i| (i as f32 % 17.0) - 8.0)
-        .collect();
+    let logits: Vec<f32> = (0..rows * cols).map(|i| (i as f32 % 17.0) - 8.0).collect();
     Fixture { logits, rows, cols }
 }
 
@@ -91,7 +89,9 @@ pub fn dispatch_shape(rows: usize) -> (objc2_metal::MTLSize, objc2_metal::MTLSiz
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use objc2::runtime::ProtocolObject;
 #[cfg(all(feature = "metal", target_os = "macos"))]
-use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+};
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub fn bind_gpu_buffers(

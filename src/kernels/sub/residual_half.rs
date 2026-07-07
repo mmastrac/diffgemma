@@ -46,8 +46,7 @@ pub fn no_scale_fixture(_: ElemFormat) -> Fixture {
 
 pub fn cpu(f: &Fixture) -> Vec<f32> {
     let s = f.scale.unwrap_or(1.0);
-    f.a
-        .iter()
+    f.a.iter()
         .zip(f.b.iter())
         .map(|(&a, &b)| bf16::store_bf16_round_half((a + b) * s))
         .collect()
@@ -101,9 +100,15 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let len = f.len();
     let a_f16 = bf16::f32_slice_to_bf16_bits(&f.a);
     let b_f16 = bf16::f32_slice_to_bf16_bits(&f.b);
-    let buf_a = pool.allocate(&ctx.device, len * 2).ok_or(Error::Format("alloc"))?;
-    let buf_b = pool.allocate(&ctx.device, len * 2).ok_or(Error::Format("alloc"))?;
-    let buf_y = pool.allocate(&ctx.device, len * 2).ok_or(Error::Format("alloc"))?;
+    let buf_a = pool
+        .allocate(&ctx.device, len * 2)
+        .ok_or(Error::Format("alloc"))?;
+    let buf_b = pool
+        .allocate(&ctx.device, len * 2)
+        .ok_or(Error::Format("alloc"))?;
+    let buf_y = pool
+        .allocate(&ctx.device, len * 2)
+        .ok_or(Error::Format("alloc"))?;
     let (blob, scal_off) = match f.scale {
         Some(v) => {
             let mut b = vec![0u8; 2];
@@ -116,7 +121,9 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         .allocate(&ctx.device, blob.len())
         .ok_or(Error::Format("alloc"))?;
     let dump_bytes = if variant.dump_stage > 0 { len * 4 } else { 4 };
-    let buf_d = pool.allocate(&ctx.device, dump_bytes).ok_or(Error::Format("alloc"))?;
+    let buf_d = pool
+        .allocate(&ctx.device, dump_bytes)
+        .ok_or(Error::Format("alloc"))?;
     BufferPool::write_bf16(&buf_a, &a_f16);
     BufferPool::write_bf16(&buf_b, &b_f16);
     BufferPool::write_bytes(&buf_blob, &blob);

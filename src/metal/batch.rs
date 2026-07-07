@@ -3,14 +3,14 @@
 use crate::metal::buffer::BufferPool;
 use crate::metal::telemetry::ForwardTelemetry;
 use crate::safetensors::Error;
-use std::cell::RefCell;
-use std::rc::Rc;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
     MTLComputePipelineState, MTLDevice, MTLSize,
 };
+use std::cell::RefCell;
+use std::rc::Rc;
 
 struct PendingRead {
     buf: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -62,11 +62,7 @@ impl<'a> GpuBatch<'a> {
         self.releases.push((bytes, buf));
     }
 
-    fn track_read(
-        &mut self,
-        buf: Retained<ProtocolObject<dyn MTLBuffer>>,
-        out: &mut [f32],
-    ) {
+    fn track_read(&mut self, buf: Retained<ProtocolObject<dyn MTLBuffer>>, out: &mut [f32]) {
         self.reads.push(PendingRead {
             buf,
             dst: out.as_mut_ptr() as *mut u8,
@@ -76,11 +72,7 @@ impl<'a> GpuBatch<'a> {
         });
     }
 
-    pub fn register_read(
-        &mut self,
-        buf: Retained<ProtocolObject<dyn MTLBuffer>>,
-        out: &mut [f32],
-    ) {
+    pub fn register_read(&mut self, buf: Retained<ProtocolObject<dyn MTLBuffer>>, out: &mut [f32]) {
         self.track_read(buf, out);
     }
 
@@ -115,18 +107,16 @@ impl<'a> GpuBatch<'a> {
 
     fn run_pending_read(read: PendingRead) {
         if read.read_u32 {
-            let out = unsafe {
-                std::slice::from_raw_parts_mut(read.dst as *mut u32, read.len_bytes / 4)
-            };
+            let out =
+                unsafe { std::slice::from_raw_parts_mut(read.dst as *mut u32, read.len_bytes / 4) };
             if read.src_byte_offset == 0 {
                 BufferPool::read_u32(&read.buf, out);
             } else {
                 BufferPool::read_u32_at_offset(&read.buf, read.src_byte_offset, out);
             }
         } else {
-            let out = unsafe {
-                std::slice::from_raw_parts_mut(read.dst as *mut f32, read.len_bytes / 4)
-            };
+            let out =
+                unsafe { std::slice::from_raw_parts_mut(read.dst as *mut f32, read.len_bytes / 4) };
             if read.src_byte_offset == 0 {
                 BufferPool::read_f32(&read.buf, out);
             } else {
@@ -149,7 +139,10 @@ impl<'a> GpuBatch<'a> {
         Ok(buf)
     }
 
-    pub fn alloc_f32_out(&mut self, len: usize) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
+    pub fn alloc_f32_out(
+        &mut self,
+        len: usize,
+    ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
         let bytes = len * 4;
         let buf = self
             .pool
@@ -164,7 +157,10 @@ impl<'a> GpuBatch<'a> {
         Ok(buf)
     }
 
-    pub fn alloc_u32_out(&mut self, len: usize) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
+    pub fn alloc_u32_out(
+        &mut self,
+        len: usize,
+    ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
         self.alloc_f32_out(len)
     }
 
@@ -560,7 +556,11 @@ pub fn begin_engine_batch<'a>(
     GpuBatch::begin_with_telemetry(queue, pool, device, telemetry)
 }
 
-pub fn set_bytes<T>(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, value: &T, index: usize) {
+pub fn set_bytes<T>(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    value: &T,
+    index: usize,
+) {
     unsafe {
         encoder.setBytes_length_atIndex(
             std::ptr::NonNull::from_ref(value).cast(),

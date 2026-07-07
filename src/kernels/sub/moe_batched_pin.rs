@@ -2,9 +2,9 @@
 
 use crate::kernels::cpu::gemm_linear_grouped::gemm_linear_grouped_cpu;
 use crate::kernels::cpu::moe_scatter_weighted::moe_scatter_weighted;
-use crate::kernels::sub::swiglu::InterleavedFixture;
 use crate::kernels::sub::QuantFormat;
-use crate::metal::{layer_moe_block_jobs, LayerOffsets, RouteScratch, HID, MOE_FF, N_EXPERTS};
+use crate::kernels::sub::swiglu::InterleavedFixture;
+use crate::metal::{HID, LayerOffsets, MOE_FF, N_EXPERTS, RouteScratch, layer_moe_block_jobs};
 use serde::{Deserialize, Serialize};
 
 fn cosine_f32(a: &[f32], b: &[f32]) -> f32 {
@@ -41,7 +41,12 @@ pub struct GateUpDiffAnalysis {
     pub scale_ratio: f32,
 }
 
-pub fn analyze_gate_up_diff(gpu: &[f32], cpu: &[f32], slots: usize, n: usize) -> GateUpDiffAnalysis {
+pub fn analyze_gate_up_diff(
+    gpu: &[f32],
+    cpu: &[f32],
+    slots: usize,
+    n: usize,
+) -> GateUpDiffAnalysis {
     assert_eq!(gpu.len(), cpu.len());
     assert_eq!(gpu.len(), slots * n);
     let moe_ff = n / 2;
@@ -123,9 +128,15 @@ pub fn print_gate_up_diff(analysis: &GateUpDiffAnalysis) {
     );
     eprintln!(
         "    up cols [{}..{}):     cos={:.6} rel_l2={:.6}",
-        MOE_FF, MOE_FF * 2, analysis.cos_up_half, analysis.rel_l2_up_half,
+        MOE_FF,
+        MOE_FF * 2,
+        analysis.cos_up_half,
+        analysis.rel_l2_up_half,
     );
-    eprintln!("    scale_ratio dot(g,c)/dot(c,c)={:.6}", analysis.scale_ratio);
+    eprintln!(
+        "    scale_ratio dot(g,c)/dot(c,c)={:.6}",
+        analysis.scale_ratio
+    );
     let mut peaks: Vec<(usize, f32)> = analysis
         .col_mod32_mean_abs_err
         .iter()
@@ -284,7 +295,11 @@ pub fn verify_batched_stages_cpu(
     gpu_swiglu: &[f32],
     gpu_down: &[f32],
     gpu_scatter: &[f32],
-) -> (MoeBatchedPinStageCos, MoeBatchedPinStageCos, GateUpDiffAnalysis) {
+) -> (
+    MoeBatchedPinStageCos,
+    MoeBatchedPinStageCos,
+    GateUpDiffAnalysis,
+) {
     let hidden = HID;
     let moe_ff = MOE_FF as usize;
     let slots = route.num_slots as usize;
@@ -393,7 +408,12 @@ pub fn verify_batched_stages_cpu_with_verdict(
     gpu_swiglu: &[f32],
     gpu_down: &[f32],
     gpu_scatter: &[f32],
-) -> (MoeBatchedPinStageCos, MoeBatchedPinStageCos, GateUpDiffAnalysis, String) {
+) -> (
+    MoeBatchedPinStageCos,
+    MoeBatchedPinStageCos,
+    GateUpDiffAnalysis,
+    String,
+) {
     let (stages, rel_l2, gate_up_diff) = verify_batched_stages_cpu(
         moe_in,
         route,
@@ -418,9 +438,7 @@ pub fn print_pin_summary(dump: &MoeBatchedPinDump) {
     );
     eprintln!(
         "  gemm_b layout: A[0..{}B] gathered slots×hid | gate_up@{}B [{} elems = slots×2×moe_ff]",
-        lay.moe_w_off_gu_bytes,
-        lay.moe_w_off_gu_bytes,
-        lay.gate_up_elems,
+        lay.moe_w_off_gu_bytes, lay.moe_w_off_gu_bytes, lay.gate_up_elems,
     );
     eprintln!(
         "  gemm_a layout: swiglu_out[0..{} elems = slots×moe_ff] (hid={}, moe_ff={})",

@@ -31,11 +31,7 @@ pub fn dispatch_dequant_block_matrix(
     } else {
         q4.groups_per_row()
     };
-    let dims = [
-        q4.out_dim as u32,
-        q4.in_dim as u32,
-        groups_per_row,
-    ];
+    let dims = [q4.out_dim as u32, q4.in_dim as u32, groups_per_row];
     crate::metal::batch::set_bytes(encoder, &dims, 2);
     let (grid, tg) =
         crate::kernels::sub::dequant_block_matrix::dispatch_shape(q4.out_dim, q4.in_dim);
@@ -46,12 +42,12 @@ pub fn dispatch_dequant_block_matrix(
 mod tests {
     use super::*;
     use crate::dgq::DgqStore;
-    use crate::kernels::sub::variant::KernelVariant;
     use crate::kernels::sub::QuantFormat;
+    use crate::kernels::sub::variant::KernelVariant;
     use crate::metal::batch::GpuBatch;
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
-    use crate::metal::dgq_gpu::{load_block_linear, DgqGpuBlob};
+    use crate::metal::dgq_gpu::{DgqGpuBlob, load_block_linear};
     use std::sync::Arc;
 
     #[test]
@@ -81,7 +77,8 @@ mod tests {
         )
         .expect("pipeline");
         let mut pool = BufferPool::new();
-        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None).expect("batch");
+        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None)
+            .expect("batch");
         let buf_out = batch.alloc_f32_out(q4.out_dim * q4.in_dim).expect("out");
         {
             let enc = batch.encoder();

@@ -92,11 +92,7 @@ pub fn embed_gather_cpu(
     for tok in 0..num_tokens {
         let row = ids[tok] as usize;
         let row_off = row * row_bytes;
-        dequant_row_q8(
-            &embed_q8[row_off..row_off + row_bytes],
-            hidden,
-            &mut raw,
-        );
+        dequant_row_q8(&embed_q8[row_off..row_off + row_bytes], hidden, &mut raw);
         let dst = tok * hidden;
         for d in 0..hidden {
             out[dst + d] = bf16::store_bf16_round_half(raw[d] * embed_scale);
@@ -131,7 +127,10 @@ pub fn pipeline_for(
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
-pub fn dispatch_shape(hidden: usize, num_tokens: usize) -> (objc2_metal::MTLSize, objc2_metal::MTLSize) {
+pub fn dispatch_shape(
+    hidden: usize,
+    num_tokens: usize,
+) -> (objc2_metal::MTLSize, objc2_metal::MTLSize) {
     use objc2_metal::MTLSize;
     (
         MTLSize {
@@ -150,7 +149,9 @@ pub fn dispatch_shape(hidden: usize, num_tokens: usize) -> (objc2_metal::MTLSize
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use objc2::runtime::ProtocolObject;
 #[cfg(all(feature = "metal", target_os = "macos"))]
-use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+};
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub fn bind_gpu_buffers(
@@ -204,9 +205,8 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         .allocate(&ctx.device, crate::metal::debug_status::DEBUG_STATUS_BYTES)
         .ok_or(Error::Format("alloc"))?;
     BufferPool::write_bytes(&buf_blob, &embed_q8);
-    let idx_bytes = unsafe {
-        std::slice::from_raw_parts(f.ids.as_ptr().cast::<u8>(), f.ids.len() * 4)
-    };
+    let idx_bytes =
+        unsafe { std::slice::from_raw_parts(f.ids.as_ptr().cast::<u8>(), f.ids.len() * 4) };
     BufferPool::write_bytes(&buf_ids, idx_bytes);
     let (grid, tg) = dispatch_shape(f.hidden, f.num_tokens);
     let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;

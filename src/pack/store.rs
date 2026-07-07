@@ -1,6 +1,6 @@
 //! Mmap-backed weight store for `iris.pack` models.
 
-use crate::pack::layout::{PackManifest, MANIFEST_FILE};
+use crate::pack::layout::{MANIFEST_FILE, PackManifest};
 use crate::safetensors::{DType, Error};
 use crate::tensor::TensorView;
 use memmap2::Mmap;

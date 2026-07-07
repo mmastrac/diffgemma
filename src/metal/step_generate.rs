@@ -1,20 +1,20 @@
 //! M2/M4: end-to-end monolithic generate loop (prefill → denoise blocks → KV extend).
 
-use crate::denoise_trace::{step_trace_from_stats, DenoiseTrace, SCHEMA_VERSION};
+use crate::denoise_trace::{DenoiseTrace, SCHEMA_VERSION, step_trace_from_stats};
 use crate::generate::GenerateOutput;
 use crate::metal::step_kernel::{
-    build_step_runtime, denoise_parity_log_enabled, final_entropy_log_enabled,
-    log_denoise_parity_step, log_final_per_token_entropy, step_text_log_enabled,
-    step_params_from_sampler, trace_entropy_enabled, StepFinishMode, StepRuntime, StepSmokeConfig,
-    CANVAS, N_LAYERS, VOCAB,
+    CANVAS, N_LAYERS, StepFinishMode, StepRuntime, StepSmokeConfig, VOCAB, build_step_runtime,
+    denoise_parity_log_enabled, final_entropy_log_enabled, log_denoise_parity_step,
+    log_final_per_token_entropy, step_params_from_sampler, step_text_log_enabled,
+    trace_entropy_enabled,
 };
 use crate::metal::step_kv::{
-    extend_monolithic_kv_with_cache, prefill_monolithic_kv_with_cache, MonolithicEncoderCache,
-    MonolithicPrefillTiming,
+    MonolithicEncoderCache, MonolithicPrefillTiming, extend_monolithic_kv_with_cache,
+    prefill_monolithic_kv_with_cache,
 };
 use crate::metal::{ForwardTelemetry, SessionTelemetry, StepPhaseTelemetry};
-use crate::sample::{Rng, SamplerConfig, step_entropy_stats};
 use crate::safetensors::Error;
+use crate::sample::{Rng, SamplerConfig, step_entropy_stats};
 use crate::tokenizer::Tokenizer;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -77,7 +77,10 @@ impl std::fmt::Debug for StepGenerateConfig {
             .field("sampler", &self.sampler)
             .field("no_early_stop", &self.no_early_stop)
             .field("stop_token_ids", &self.stop_token_ids)
-            .field("degenerate_reply_check", &self.degenerate_reply_check.is_some())
+            .field(
+                "degenerate_reply_check",
+                &self.degenerate_reply_check.is_some(),
+            )
             .field("step_observer", &self.step_observer.is_some())
             .finish()
     }
@@ -121,7 +124,6 @@ fn smoke_config(cfg: &StepGenerateConfig, prefill_token_ids: Option<Vec<u32>>) -
 }
 
 use crate::flags::progress_enabled;
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DenoiseStopReason {
@@ -185,9 +187,7 @@ fn log_denoise_step_progress(
     }
     eprintln!(
         "step-generate: block {block_idx}/{max_blocks} step {step_idx}/{max_steps} accept={} low_ent={} min_ent={:.4} mean_ent={mean_entropy_gpu:.4} canvas_stable={canvas_stable} prefix_stable={prefix_stable} hist_len={argmax_hist_len} plateau={accept_plateau}{extra} step={step_elapsed:.2?} block={block_elapsed:.2?} denoise={denoise_elapsed:.2?}{stop_note}",
-        stats.accept_count,
-        stats.low_entropy_positions,
-        stats.min_entropy,
+        stats.accept_count, stats.low_entropy_positions, stats.min_entropy,
     );
 }
 
@@ -230,10 +230,10 @@ impl StepGenerateSession {
         let layers = cfg.layers.min(N_LAYERS).max(1);
         let (rt, build) = build_step_runtime(model_dir, &smoke_config(cfg, prefill_token_ids))?;
         if progress_enabled() {
-        eprintln!(
-            "step-generate: runtime ready (total={:.2?}, compile={:.2?})",
-            build.total, build.compile
-        );
+            eprintln!(
+                "step-generate: runtime ready (total={:.2?}, compile={:.2?})",
+                build.total, build.compile
+            );
         }
         Ok((
             Self {
@@ -264,11 +264,8 @@ pub fn generate_monolithic(
     cfg: &StepGenerateConfig,
     prompt_label: &str,
 ) -> Result<GenerateOutput, Error> {
-    let (mut session, _) = StepGenerateSession::open(
-        model_dir,
-        cfg,
-        Some(prompt_token_ids.to_vec()),
-    )?;
+    let (mut session, _) =
+        StepGenerateSession::open(model_dir, cfg, Some(prompt_token_ids.to_vec()))?;
     generate_with_session(&mut session, prompt_token_ids, cfg, prompt_label)
 }
 
@@ -314,7 +311,9 @@ pub fn generate_with_session(
     };
     let (kv_len, prefill_timing, prefill_elapsed) = if existing_kv >= n_prompt && existing_kv > 0 {
         // Whole prompt already prefilled (session-open prefill, or full reuse).
-        if progress_enabled() { eprintln!("step-generate: using step-kernel prefill kv_len={existing_kv}"); }
+        if progress_enabled() {
+            eprintln!("step-generate: using step-kernel prefill kv_len={existing_kv}");
+        }
         (
             existing_kv.min(n_prompt),
             MonolithicPrefillTiming::default(),
@@ -339,9 +338,7 @@ pub fn generate_with_session(
         let kv_len = rt.prefill_chunks(prompt_token_ids)?;
         let prefill_elapsed = prefill_started.elapsed();
         if progress_enabled() {
-            eprintln!(
-                "step-generate: fast-prefill kv_len={kv_len} ({prefill_elapsed:.2?})"
-            );
+            eprintln!("step-generate: fast-prefill kv_len={kv_len} ({prefill_elapsed:.2?})");
         }
         (kv_len, MonolithicPrefillTiming::default(), prefill_elapsed)
     } else {
@@ -380,8 +377,7 @@ pub fn generate_with_session(
     if progress_enabled() && prefill_elapsed > Duration::ZERO {
         eprintln!(
             "step-generate: prefilled kv_len={kv_len} ({prefill_elapsed:.2?}, gpu_forward={:.1}ms kv_pack={:.1}ms)",
-            prefill_timing.gpu_forward_ms,
-            prefill_timing.kv_pack_ms
+            prefill_timing.gpu_forward_ms, prefill_timing.kv_pack_ms
         );
     }
 
@@ -447,219 +443,219 @@ pub fn generate_with_session(
             0
         };
         let mut empty_retry_attempt = 0u32;
-        let (st, block_step_count, accept_hist, min_entropy_hist, mean_entropy_hist, low_ent_hist) =
-            'attempt: loop {
-                let mut block_step_count = 0u32;
-                let mut accept_hist = Vec::new();
-                let mut min_entropy_hist = Vec::new();
-                let mut mean_entropy_hist = Vec::new();
-                let mut low_ent_hist = Vec::new();
-                let mut last_st;
-                let mut prev_step_argmax: Option<[u32; CANVAS]> = None;
-                let mut prefix_stable_streak = 0u32;
-                loop {
-            let step_started = Instant::now();
-            rt.run_denoise_step()?;
-            let check_logits = crate::metal::step_kernel::logits_finite_check_enabled();
-            rt.check_logits_finite()?;
-            let step_elapsed = step_started.elapsed();
-            let step_ms = step_elapsed.as_secs_f64() * 1000.0;
-            let readback_bytes = StepRuntime::denoise_step_host_readback_bytes(check_logits);
-            let mut forward = ForwardTelemetry::monolithic_gpu_step(readback_bytes);
-            rt.fill_expert_forward_telemetry(&mut forward);
-            session_telemetry.steps.push(StepPhaseTelemetry {
-                decoder_ms: step_ms,
-                sampler_ms: 0.0,
-                forward,
-            });
-            denoise_steps_run += 1;
-            block_step_count += 1;
-            let st = rt.read_canvas_state();
-            last_st = st;
-            if denoise_parity_log_enabled() {
-                log_denoise_parity_step(
-                    &format!("block={block_idx} step_index={block_step_count}"),
-                    &st,
-                    &rt.read_params(),
-                    rt.logits(),
-                );
-            }
-            if crate::flags::sc_log_enabled() {
-                eprintln!(
-                    "monolithic denoise: step_index={block_step_count} st.step={} sc_active_next={}",
-                    st.step,
-                    st.step >= 1
-                );
-            }
-            let stats = step_entropy_stats(&st.entropy, &st.accept);
-            accept_hist.push(stats.accept_count);
-            min_entropy_hist.push(stats.min_entropy);
-            mean_entropy_hist.push(st.mean_entropy);
-            low_ent_hist.push(stats.low_entropy_positions);
-            let max_steps_reached = st.step >= max_steps as u32;
-            let params = rt.read_params();
-            let region_end = crate::sample::answer_region_end(&st.ids, params.eos_token_id);
-            let (full_diff, prefix_diff, prefix_stable_streak) = match prev_step_argmax {
-                Some(prev) => {
-                    let full =
-                        crate::sample::count_argmax_diff(&st.prev_argmax, &prev, CANVAS);
-                    let prefix =
-                        crate::sample::count_argmax_diff(&st.prev_argmax, &prev, region_end);
-                    let streak = if prefix == 0 {
-                        prefix_stable_streak.saturating_add(1)
-                    } else {
-                        0
-                    };
-                    (Some(full), Some(prefix), streak)
-                }
-                None => (None, None, 0),
-            };
-            prev_step_argmax = Some(st.prev_argmax);
-            let early_stop = crate::sample::decode_early_stop_flag(st.stop_flag);
-            let snap = crate::sample::EarlyStopSnapshot {
-                canvas_stable: st.canvas_stable,
-                mean_entropy: st.mean_entropy,
-                accept_plateau: st.accept_plateau,
-                conf_threshold: params.conf_threshold,
-                accept_plateau_threshold: params.accept_plateau_threshold,
-                plateau_prefix_mean_max: params.plateau_prefix_mean_max,
-            };
-            let cpu_early =
-                !cfg.no_early_stop && crate::sample::early_stop_from_snapshot(&snap);
-            let gpu_early = !cfg.no_early_stop && crate::sample::is_early_stop_flag(st.stop_flag);
-            let stop_reason = match early_stop {
-                Some(crate::sample::EarlyStopKind::Confident) => DenoiseStopReason::Confident,
-                Some(crate::sample::EarlyStopKind::Plateau) => DenoiseStopReason::Plateau,
-                Some(crate::sample::EarlyStopKind::MaxSteps) => DenoiseStopReason::MaxSteps,
-                None if max_steps_reached => DenoiseStopReason::MaxSteps,
-                None => DenoiseStopReason::None,
-            };
-            if crate::flags::log_early_stop_enabled() {
-                if gpu_early != cpu_early {
-                    eprintln!(
-                        "step-generate: early-stop mismatch step={} gpu_flag={} gpu_early={gpu_early} cpu_early={cpu_early} accept_plateau={} mean_ent={:.4} stable={} threshold={:.4}",
-                        st.step,
-                        st.stop_flag,
-                        st.accept_plateau,
-                        st.mean_entropy,
-                        st.canvas_stable,
-                        params.conf_threshold,
-                    );
-                } else if gpu_early {
-                    let kind = match early_stop {
-                        Some(crate::sample::EarlyStopKind::Confident) => "confident_stable",
-                        Some(crate::sample::EarlyStopKind::Plateau) => "plateau_stop",
-                        _ => "early_stop",
-                    };
-                    eprintln!(
-                        "step-generate: early-stop step={} reason={kind} stop_flag={} accept_plateau={} mean_ent={:.4} stable={} accept={}",
-                        st.step,
-                        st.stop_flag,
-                        st.accept_plateau,
-                        st.mean_entropy,
-                        st.canvas_stable,
-                        stats.accept_count,
-                    );
-                }
-            }
-            let (prefix_mean_log, region_end_log, answer_text_log) = if step_text_log_enabled() {
-                let pm = crate::sample::mean_entropy_answer_prefix(
-                    &st.entropy,
-                    &st.ids,
-                    params.eos_token_id,
-                );
-                let (re, text) = step_answer_text(
-                    session.step_text_tokenizer.as_ref(),
-                    &st.prev_argmax,
-                    &st.ids,
-                    params.eos_token_id,
-                );
-                (Some(pm), Some(re), text)
-            } else {
-                (None, None, None)
-            };
-            let answer_text_ref = answer_text_log.as_deref();
-            step_traces.push(step_trace_from_stats(
-                block_idx as u32,
-                block_step_count,
-                max_steps,
-                &stats,
-                &st.prev_argmax,
-                if trace_entropy_enabled() {
-                    Some(&st.entropy)
-                } else {
-                    None
-                },
-                stop_reason != DenoiseStopReason::None,
-            ));
-            log_denoise_step_progress(
-                block_idx,
-                max_blocks,
-                block_step_count,
-                max_steps,
-                &stats,
-                st.mean_entropy,
-                prefix_mean_log,
-                region_end_log,
-                answer_text_ref,
-                st.canvas_stable,
-                prefix_stable_streak,
-                full_diff,
-                prefix_diff,
-                st.argmax_hist_len,
-                st.accept_plateau,
-                step_elapsed,
-                block_started.elapsed(),
-                denoise_elapsed + block_started.elapsed(),
-                stop_reason,
-            );
-            if let Some(ref observer) = cfg.step_observer {
-                observer(&StepProgressEvent {
-                    block_idx,
-                    step_in_block: block_step_count,
-                    max_steps,
-                    argmax: &st.prev_argmax,
-                    accept_count: stats.accept_count,
-                    block_done: stop_reason != DenoiseStopReason::None,
+        let (st, block_step_count, accept_hist, min_entropy_hist, mean_entropy_hist, low_ent_hist) = 'attempt: loop {
+            let mut block_step_count = 0u32;
+            let mut accept_hist = Vec::new();
+            let mut min_entropy_hist = Vec::new();
+            let mut mean_entropy_hist = Vec::new();
+            let mut low_ent_hist = Vec::new();
+            let mut last_st;
+            let mut prev_step_argmax: Option<[u32; CANVAS]> = None;
+            let mut prefix_stable_streak = 0u32;
+            loop {
+                let step_started = Instant::now();
+                rt.run_denoise_step()?;
+                let check_logits = crate::metal::step_kernel::logits_finite_check_enabled();
+                rt.check_logits_finite()?;
+                let step_elapsed = step_started.elapsed();
+                let step_ms = step_elapsed.as_secs_f64() * 1000.0;
+                let readback_bytes = StepRuntime::denoise_step_host_readback_bytes(check_logits);
+                let mut forward = ForwardTelemetry::monolithic_gpu_step(readback_bytes);
+                rt.fill_expert_forward_telemetry(&mut forward);
+                session_telemetry.steps.push(StepPhaseTelemetry {
+                    decoder_ms: step_ms,
+                    sampler_ms: 0.0,
+                    forward,
                 });
-            }
-            if stop_reason != DenoiseStopReason::None {
-                break;
-            }
-        }
-        let st = last_st;
-        // Empty/degenerate-reply detection: does the committed argmax render as
-        // an empty user-facing reply (eos-first canvas OR `<|channel>thought`
-        // ceremony)? Checked against the real decoded+sanitized output (E6
-        // attractor). Re-roll the canvas from the advancing rng and retry.
-        let degenerate = cfg
-            .degenerate_reply_check
-            .as_ref()
-            .is_some_and(|check| check(&st.prev_argmax));
-        if empty_retry_attempt < empty_retry_max && degenerate {
-            empty_retry_attempt += 1;
-            if progress_enabled() {
-                eprintln!(
-                    "step-generate: block {block_idx} empty/degenerate reply; re-rolling canvas (attempt {empty_retry_attempt}/{empty_retry_max})"
+                denoise_steps_run += 1;
+                block_step_count += 1;
+                let st = rt.read_canvas_state();
+                last_st = st;
+                if denoise_parity_log_enabled() {
+                    log_denoise_parity_step(
+                        &format!("block={block_idx} step_index={block_step_count}"),
+                        &st,
+                        &rt.read_params(),
+                        rt.logits(),
+                    );
+                }
+                if crate::flags::sc_log_enabled() {
+                    eprintln!(
+                        "monolithic denoise: step_index={block_step_count} st.step={} sc_active_next={}",
+                        st.step,
+                        st.step >= 1
+                    );
+                }
+                let stats = step_entropy_stats(&st.entropy, &st.accept);
+                accept_hist.push(stats.accept_count);
+                min_entropy_hist.push(stats.min_entropy);
+                mean_entropy_hist.push(st.mean_entropy);
+                low_ent_hist.push(stats.low_entropy_positions);
+                let max_steps_reached = st.step >= max_steps as u32;
+                let params = rt.read_params();
+                let region_end = crate::sample::answer_region_end(&st.ids, params.eos_token_id);
+                let (full_diff, prefix_diff, prefix_stable_streak) = match prev_step_argmax {
+                    Some(prev) => {
+                        let full = crate::sample::count_argmax_diff(&st.prev_argmax, &prev, CANVAS);
+                        let prefix =
+                            crate::sample::count_argmax_diff(&st.prev_argmax, &prev, region_end);
+                        let streak = if prefix == 0 {
+                            prefix_stable_streak.saturating_add(1)
+                        } else {
+                            0
+                        };
+                        (Some(full), Some(prefix), streak)
+                    }
+                    None => (None, None, 0),
+                };
+                prev_step_argmax = Some(st.prev_argmax);
+                let early_stop = crate::sample::decode_early_stop_flag(st.stop_flag);
+                let snap = crate::sample::EarlyStopSnapshot {
+                    canvas_stable: st.canvas_stable,
+                    mean_entropy: st.mean_entropy,
+                    accept_plateau: st.accept_plateau,
+                    conf_threshold: params.conf_threshold,
+                    accept_plateau_threshold: params.accept_plateau_threshold,
+                    plateau_prefix_mean_max: params.plateau_prefix_mean_max,
+                };
+                let cpu_early =
+                    !cfg.no_early_stop && crate::sample::early_stop_from_snapshot(&snap);
+                let gpu_early =
+                    !cfg.no_early_stop && crate::sample::is_early_stop_flag(st.stop_flag);
+                let stop_reason = match early_stop {
+                    Some(crate::sample::EarlyStopKind::Confident) => DenoiseStopReason::Confident,
+                    Some(crate::sample::EarlyStopKind::Plateau) => DenoiseStopReason::Plateau,
+                    Some(crate::sample::EarlyStopKind::MaxSteps) => DenoiseStopReason::MaxSteps,
+                    None if max_steps_reached => DenoiseStopReason::MaxSteps,
+                    None => DenoiseStopReason::None,
+                };
+                if crate::flags::log_early_stop_enabled() {
+                    if gpu_early != cpu_early {
+                        eprintln!(
+                            "step-generate: early-stop mismatch step={} gpu_flag={} gpu_early={gpu_early} cpu_early={cpu_early} accept_plateau={} mean_ent={:.4} stable={} threshold={:.4}",
+                            st.step,
+                            st.stop_flag,
+                            st.accept_plateau,
+                            st.mean_entropy,
+                            st.canvas_stable,
+                            params.conf_threshold,
+                        );
+                    } else if gpu_early {
+                        let kind = match early_stop {
+                            Some(crate::sample::EarlyStopKind::Confident) => "confident_stable",
+                            Some(crate::sample::EarlyStopKind::Plateau) => "plateau_stop",
+                            _ => "early_stop",
+                        };
+                        eprintln!(
+                            "step-generate: early-stop step={} reason={kind} stop_flag={} accept_plateau={} mean_ent={:.4} stable={} accept={}",
+                            st.step,
+                            st.stop_flag,
+                            st.accept_plateau,
+                            st.mean_entropy,
+                            st.canvas_stable,
+                            stats.accept_count,
+                        );
+                    }
+                }
+                let (prefix_mean_log, region_end_log, answer_text_log) = if step_text_log_enabled()
+                {
+                    let pm = crate::sample::mean_entropy_answer_prefix(
+                        &st.entropy,
+                        &st.ids,
+                        params.eos_token_id,
+                    );
+                    let (re, text) = step_answer_text(
+                        session.step_text_tokenizer.as_ref(),
+                        &st.prev_argmax,
+                        &st.ids,
+                        params.eos_token_id,
+                    );
+                    (Some(pm), Some(re), text)
+                } else {
+                    (None, None, None)
+                };
+                let answer_text_ref = answer_text_log.as_deref();
+                step_traces.push(step_trace_from_stats(
+                    block_idx as u32,
+                    block_step_count,
+                    max_steps,
+                    &stats,
+                    &st.prev_argmax,
+                    if trace_entropy_enabled() {
+                        Some(&st.entropy)
+                    } else {
+                        None
+                    },
+                    stop_reason != DenoiseStopReason::None,
+                ));
+                log_denoise_step_progress(
+                    block_idx,
+                    max_blocks,
+                    block_step_count,
+                    max_steps,
+                    &stats,
+                    st.mean_entropy,
+                    prefix_mean_log,
+                    region_end_log,
+                    answer_text_ref,
+                    st.canvas_stable,
+                    prefix_stable_streak,
+                    full_diff,
+                    prefix_diff,
+                    st.argmax_hist_len,
+                    st.accept_plateau,
+                    step_elapsed,
+                    block_started.elapsed(),
+                    denoise_elapsed + block_started.elapsed(),
+                    stop_reason,
                 );
+                if let Some(ref observer) = cfg.step_observer {
+                    observer(&StepProgressEvent {
+                        block_idx,
+                        step_in_block: block_step_count,
+                        max_steps,
+                        argmax: &st.prev_argmax,
+                        accept_count: stats.accept_count,
+                        block_done: stop_reason != DenoiseStopReason::None,
+                    });
+                }
+                if stop_reason != DenoiseStopReason::None {
+                    break;
+                }
             }
-            let params = step_params_from_sampler(
-                &cfg.sampler,
-                rt.read_params().kv_len,
-                cfg.no_early_stop,
-                rt.read_params().eos_token_id,
+            let st = last_st;
+            // Empty/degenerate-reply detection: does the committed argmax render as
+            // an empty user-facing reply (eos-first canvas OR `<|channel>thought`
+            // ceremony)? Checked against the real decoded+sanitized output (E6
+            // attractor). Re-roll the canvas from the advancing rng and retry.
+            let degenerate = cfg
+                .degenerate_reply_check
+                .as_ref()
+                .is_some_and(|check| check(&st.prev_argmax));
+            if empty_retry_attempt < empty_retry_max && degenerate {
+                empty_retry_attempt += 1;
+                if progress_enabled() {
+                    eprintln!(
+                        "step-generate: block {block_idx} empty/degenerate reply; re-rolling canvas (attempt {empty_retry_attempt}/{empty_retry_max})"
+                    );
+                }
+                let params = step_params_from_sampler(
+                    &cfg.sampler,
+                    rt.read_params().kv_len,
+                    cfg.no_early_stop,
+                    rt.read_params().eos_token_id,
+                );
+                rt.reset_block(VOCAB, &mut rng, params);
+                continue 'attempt;
+            }
+            break 'attempt (
+                st,
+                block_step_count,
+                accept_hist,
+                min_entropy_hist,
+                mean_entropy_hist,
+                low_ent_hist,
             );
-            rt.reset_block(VOCAB, &mut rng, params);
-            continue 'attempt;
-        }
-        break 'attempt (
-            st,
-            block_step_count,
-            accept_hist,
-            min_entropy_hist,
-            mean_entropy_hist,
-            low_ent_hist,
-        );
         };
         let block_elapsed = block_started.elapsed();
         denoise_elapsed += block_elapsed;
@@ -677,32 +673,32 @@ pub fn generate_with_session(
             .and_then(|s| s.iter().copied().reduce(u32::max))
             .unwrap_or(0);
         if progress_enabled() {
-        eprintln!(
-            "step-generate: block {} denoise={block_elapsed:.2?} steps_eff={block_step_count} accept/step={accept_hist:?}",
-            block_idx
-        );
-        eprintln!(
-            "step-generate: block {} min_ent/step={min_entropy_hist:?}",
-            block_idx
-        );
-        eprintln!(
-            "step-generate: block {} mean_ent/step={mean_entropy_hist:?}",
-            block_idx
-        );
-        eprintln!(
-            "step-generate: block {} low_ent(<0.1)/step={low_ent_hist:?}",
-            block_idx
-        );
-        let late_mean_ent = mean_entropy_hist
-            .get(late..)
-            .and_then(|s| s.iter().copied().reduce(f32::min))
-            .unwrap_or(f32::NAN);
-        eprintln!(
-            "step-generate: block {} late-window (last 8 steps): accept_sum={late_accept} min_ent={late_min_ent:.4} mean_ent={late_mean_ent:.4} max_low_ent={late_low_ent} (early stop: accept plateau>={} or prefix mean_ent<{:.4} + stable argmax)",
-            block_idx,
-            crate::sample::ACCEPT_PLATEAU_THRESHOLD,
-            cfg.sampler.confidence_threshold,
-        );
+            eprintln!(
+                "step-generate: block {} denoise={block_elapsed:.2?} steps_eff={block_step_count} accept/step={accept_hist:?}",
+                block_idx
+            );
+            eprintln!(
+                "step-generate: block {} min_ent/step={min_entropy_hist:?}",
+                block_idx
+            );
+            eprintln!(
+                "step-generate: block {} mean_ent/step={mean_entropy_hist:?}",
+                block_idx
+            );
+            eprintln!(
+                "step-generate: block {} low_ent(<0.1)/step={low_ent_hist:?}",
+                block_idx
+            );
+            let late_mean_ent = mean_entropy_hist
+                .get(late..)
+                .and_then(|s| s.iter().copied().reduce(f32::min))
+                .unwrap_or(f32::NAN);
+            eprintln!(
+                "step-generate: block {} late-window (last 8 steps): accept_sum={late_accept} min_ent={late_min_ent:.4} mean_ent={late_mean_ent:.4} max_low_ent={late_low_ent} (early stop: accept plateau>={} or prefix mean_ent<{:.4} + stable argmax)",
+                block_idx,
+                crate::sample::ACCEPT_PLATEAU_THRESHOLD,
+                cfg.sampler.confidence_threshold,
+            );
         }
         if final_entropy_log_enabled() {
             log_final_per_token_entropy(
@@ -773,10 +769,10 @@ pub fn generate_with_session(
             let block_extend = extend_started.elapsed();
             extend_elapsed += block_extend;
             if progress_enabled() {
-            eprintln!(
-                "step-generate: extended kv {kv_before} -> {new_kv_len} (+{} tokens) ({block_extend:.2?})",
-                argmax_tokens.len()
-            );
+                eprintln!(
+                    "step-generate: extended kv {kv_before} -> {new_kv_len} (+{} tokens) ({block_extend:.2?})",
+                    argmax_tokens.len()
+                );
             }
         }
     }
@@ -835,7 +831,9 @@ pub fn generate_with_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metal::step_kernel::{logits_finite_check_enabled, init_canvas_state_from_rng, StepRuntime};
+    use crate::metal::step_kernel::{
+        StepRuntime, init_canvas_state_from_rng, logits_finite_check_enabled,
+    };
     use crate::sample::initialize_canvas;
 
     #[test]

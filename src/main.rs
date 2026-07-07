@@ -1,11 +1,12 @@
 mod buffer;
-mod chat_template;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod chat_protocol;
+mod chat_template;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod chat_ui;
 mod config;
 mod denoise_trace;
+mod dgq;
 mod fast_slice;
 mod flags;
 mod generate;
@@ -16,9 +17,8 @@ mod kernels;
 mod metal;
 mod model;
 mod pack;
-mod dgq;
-mod sample;
 mod safetensors;
+mod sample;
 mod tensor;
 mod tokenizer;
 mod weights;
@@ -66,7 +66,9 @@ enum Command {
         write_golden: Option<String>,
     },
     Tokenize(String),
-    Gemm { size: usize },
+    Gemm {
+        size: usize,
+    },
     Attention,
     ProbeDevice,
     BenchGemm {
@@ -621,14 +623,7 @@ fn main() -> ExitCode {
             seed,
             max_seq,
             iters,
-        } => run_bench_gemm_fusion_cmd(
-            &cli.model_dir,
-            layers,
-            kv_len,
-            seed,
-            max_seq,
-            iters,
-        ),
+        } => run_bench_gemm_fusion_cmd(&cli.model_dir, layers, kv_len, seed, max_seq, iters),
         Command::GenerateMonolithic {
             prompt,
             seed,
@@ -725,7 +720,11 @@ fn main() -> ExitCode {
         Command::Tokenize(text) => run_tokenize(&cli.model_dir, &text, cli.raw_prompt),
         Command::Gemm { size } => run_gemm(size),
         Command::ProbeDevice => run_probe_device(),
-        Command::BenchGemm { shapes, oracle, iters } => run_bench_gemm(&shapes, oracle.as_deref(), iters),
+        Command::BenchGemm {
+            shapes,
+            oracle,
+            iters,
+        } => run_bench_gemm(&shapes, oracle.as_deref(), iters),
         command => {
             eprintln!("loading from {}", cli.model_dir.display());
             match model::Model::open(&cli.model_dir) {
@@ -838,12 +837,10 @@ fn attach_step_prefill(
     if kv_len == 0 && prompt.is_none() {
         return Ok(());
     }
-    let vocab = crate::config::ModelConfig::load(model_dir)?.text_config.vocab_size;
-    let prompt_len = if kv_len > 0 {
-        kv_len as usize
-    } else {
-        64
-    };
+    let vocab = crate::config::ModelConfig::load(model_dir)?
+        .text_config
+        .vocab_size;
+    let prompt_len = if kv_len > 0 { kv_len as usize } else { 64 };
     let ids = build_prompt_tokens(model_dir, prompt, prompt_len, vocab, raw_prompt, &[])?;
     eprintln!("step-kernel: prefill {} prompt tokens", ids.len());
     cfg.prefill_token_ids = Some(ids);
@@ -860,7 +857,7 @@ fn run_step_probe_cmd(
     prompt: Option<&str>,
     raw_prompt: bool,
 ) -> ExitCode {
-    use metal::{run_step_probe, StepFinishMode, StepSmokeConfig};
+    use metal::{StepFinishMode, StepSmokeConfig, run_step_probe};
 
     if !dgq::store::looks_like_dgq_dir(model_dir) {
         eprintln!("error: step-probe requires a .dgq directory");
@@ -925,7 +922,7 @@ fn run_step_logits_dump_cmd(
     positions: &str,
     top_k: usize,
 ) -> ExitCode {
-    use metal::{parse_positions, run_step_logits_dump, write_step_logits_dump, StepSmokeConfig};
+    use metal::{StepSmokeConfig, parse_positions, run_step_logits_dump, write_step_logits_dump};
 
     if !dgq::store::looks_like_dgq_dir(model_dir) {
         eprintln!("error: step-logits-dump requires a .dgq directory");
@@ -941,13 +938,7 @@ fn run_step_logits_dump_cmd(
         prefill_token_ids: None,
         no_early_stop: false,
     };
-    if let Err(err) = attach_step_prefill(
-        &mut cfg,
-        model_dir,
-        0,
-        prompt.as_deref(),
-        raw_prompt,
-    ) {
+    if let Err(err) = attach_step_prefill(&mut cfg, model_dir, 0, prompt.as_deref(), raw_prompt) {
         eprintln!("error: {err}");
         return ExitCode::FAILURE;
     }
@@ -996,12 +987,14 @@ fn run_step_bf16_oracle_logits_dump_cmd(
     gpu_kv: bool,
 ) -> ExitCode {
     use metal::{
-        parse_positions, run_step_bf16_oracle_logits_dump,
-        run_step_bf16_oracle_logits_dump_gpu_kv, write_step_logits_dump, StepSmokeConfig,
+        StepSmokeConfig, parse_positions, run_step_bf16_oracle_logits_dump,
+        run_step_bf16_oracle_logits_dump_gpu_kv, write_step_logits_dump,
     };
 
     if !dgq::store::looks_like_dgq_dir(dgq_dir) {
-        eprintln!("error: step-bf16-logits-dump requires -m pointing at a .dgq directory (prefill)");
+        eprintln!(
+            "error: step-bf16-logits-dump requires -m pointing at a .dgq directory (prefill)"
+        );
         return ExitCode::FAILURE;
     }
     if !bf16_dir.join("config.json").is_file() {
@@ -1107,7 +1100,7 @@ fn run_step_layer_probe_cmd(
     output: &std::path::Path,
     position: usize,
 ) -> ExitCode {
-    use metal::{run_step_layer_hidden_dump, write_step_layer_hidden_dump, StepSmokeConfig};
+    use metal::{StepSmokeConfig, run_step_layer_hidden_dump, write_step_layer_hidden_dump};
 
     if !dgq::store::looks_like_dgq_dir(model_dir) {
         eprintln!("error: step-layer-probe requires a .dgq directory");
@@ -1123,13 +1116,7 @@ fn run_step_layer_probe_cmd(
         prefill_token_ids: None,
         no_early_stop: false,
     };
-    if let Err(err) = attach_step_prefill(
-        &mut cfg,
-        model_dir,
-        0,
-        prompt.as_deref(),
-        raw_prompt,
-    ) {
+    if let Err(err) = attach_step_prefill(&mut cfg, model_dir, 0, prompt.as_deref(), raw_prompt) {
         eprintln!("error: {err}");
         return ExitCode::FAILURE;
     }
@@ -1182,7 +1169,7 @@ fn run_step_attn_dump_cmd(
     layer: usize,
     position: usize,
 ) -> ExitCode {
-    use metal::{run_step_attn_layer_dump, write_step_attn_layer_dump, StepSmokeConfig};
+    use metal::{StepSmokeConfig, run_step_attn_layer_dump, write_step_attn_layer_dump};
 
     if !dgq::store::looks_like_dgq_dir(model_dir) {
         eprintln!("error: step-attn-dump requires a .dgq directory");
@@ -1198,13 +1185,7 @@ fn run_step_attn_dump_cmd(
         prefill_token_ids: None,
         no_early_stop: false,
     };
-    if let Err(err) = attach_step_prefill(
-        &mut cfg,
-        model_dir,
-        0,
-        prompt.as_deref(),
-        raw_prompt,
-    ) {
+    if let Err(err) = attach_step_prefill(&mut cfg, model_dir, 0, prompt.as_deref(), raw_prompt) {
         eprintln!("error: {err}");
         return ExitCode::FAILURE;
     }
@@ -1243,7 +1224,7 @@ fn run_step_moe_dump_cmd(
     layer: usize,
     position: usize,
 ) -> ExitCode {
-    use metal::{run_step_moe_layer_dump, write_step_moe_layer_dump, StepSmokeConfig};
+    use metal::{StepSmokeConfig, run_step_moe_layer_dump, write_step_moe_layer_dump};
 
     if !dgq::store::looks_like_dgq_dir(model_dir) {
         eprintln!("error: step-moe-dump requires a .dgq directory");
@@ -1259,13 +1240,7 @@ fn run_step_moe_dump_cmd(
         prefill_token_ids: None,
         no_early_stop: false,
     };
-    if let Err(err) = attach_step_prefill(
-        &mut cfg,
-        model_dir,
-        0,
-        prompt.as_deref(),
-        raw_prompt,
-    ) {
+    if let Err(err) = attach_step_prefill(&mut cfg, model_dir, 0, prompt.as_deref(), raw_prompt) {
         eprintln!("error: {err}");
         return ExitCode::FAILURE;
     }
@@ -1306,8 +1281,8 @@ fn run_step_moe_route_dump_cmd(
     run_grouped: bool,
 ) -> ExitCode {
     use metal::{
-        print_route_summary, run_step_moe_route_dump, write_step_moe_route_dump, StepFinishMode,
-        StepSmokeConfig,
+        StepFinishMode, StepSmokeConfig, print_route_summary, run_step_moe_route_dump,
+        write_step_moe_route_dump,
     };
 
     if !dgq::store::looks_like_dgq_dir(model_dir) {
@@ -1324,13 +1299,7 @@ fn run_step_moe_route_dump_cmd(
         prefill_token_ids: None,
         no_early_stop: false,
     };
-    if let Err(err) = attach_step_prefill(
-        &mut cfg,
-        model_dir,
-        0,
-        prompt.as_deref(),
-        raw_prompt,
-    ) {
+    if let Err(err) = attach_step_prefill(&mut cfg, model_dir, 0, prompt.as_deref(), raw_prompt) {
         eprintln!("error: {err}");
         return ExitCode::FAILURE;
     }
@@ -1342,7 +1311,12 @@ fn run_step_moe_route_dump_cmd(
                 eprintln!("error: {err}");
                 return ExitCode::FAILURE;
             }
-            println!("wrote {} (layer={}, slots_ok={})", output.display(), dump.layer, dump.slots_ok);
+            println!(
+                "wrote {} (layer={}, slots_ok={})",
+                output.display(),
+                dump.layer,
+                dump.slots_ok
+            );
             if !dump.slots_ok {
                 eprintln!("error: MoE bucketing failed (num_slots={})", dump.num_slots);
                 return ExitCode::FAILURE;
@@ -1382,8 +1356,8 @@ fn run_step_moe_batched_pin_dump_cmd(
     layer: usize,
 ) -> ExitCode {
     use metal::{
-        print_batched_pin_summary, run_step_moe_batched_pin_dump, write_step_moe_batched_pin_dump,
-        StepFinishMode, StepSmokeConfig,
+        StepFinishMode, StepSmokeConfig, print_batched_pin_summary, run_step_moe_batched_pin_dump,
+        write_step_moe_batched_pin_dump,
     };
 
     if !dgq::store::looks_like_dgq_dir(model_dir) {
@@ -1400,13 +1374,7 @@ fn run_step_moe_batched_pin_dump_cmd(
         prefill_token_ids: None,
         no_early_stop: false,
     };
-    if let Err(err) = attach_step_prefill(
-        &mut cfg,
-        model_dir,
-        0,
-        prompt.as_deref(),
-        raw_prompt,
-    ) {
+    if let Err(err) = attach_step_prefill(&mut cfg, model_dir, 0, prompt.as_deref(), raw_prompt) {
         eprintln!("error: {err}");
         return ExitCode::FAILURE;
     }
@@ -1462,7 +1430,7 @@ fn run_step_moe_single_dump_cmd(
     expert: u32,
 ) -> ExitCode {
     use metal::{
-        run_step_moe_single_expert_dump, write_step_moe_single_expert_dump, StepSmokeConfig,
+        StepSmokeConfig, run_step_moe_single_expert_dump, write_step_moe_single_expert_dump,
     };
 
     if !dgq::store::looks_like_dgq_dir(model_dir) {
@@ -1479,20 +1447,12 @@ fn run_step_moe_single_dump_cmd(
         prefill_token_ids: None,
         no_early_stop: false,
     };
-    if let Err(err) = attach_step_prefill(
-        &mut cfg,
-        model_dir,
-        0,
-        prompt.as_deref(),
-        raw_prompt,
-    ) {
+    if let Err(err) = attach_step_prefill(&mut cfg, model_dir, 0, prompt.as_deref(), raw_prompt) {
         eprintln!("error: {err}");
         return ExitCode::FAILURE;
     }
     let label = prompt.unwrap_or_else(|| "Hello".to_string());
-    match run_step_moe_single_expert_dump(
-        model_dir, &cfg, &label, layer, position, expert,
-    ) {
+    match run_step_moe_single_expert_dump(model_dir, &cfg, &label, layer, position, expert) {
         Ok(dump) => {
             if let Err(err) = write_step_moe_single_expert_dump(output, &dump) {
                 eprintln!("error: {err}");
@@ -1542,7 +1502,7 @@ fn run_step_preamble_dump_cmd(
     output: &std::path::Path,
     position: usize,
 ) -> ExitCode {
-    use metal::{run_step_preamble_dump, write_step_preamble_dump, StepSmokeConfig};
+    use metal::{StepSmokeConfig, run_step_preamble_dump, write_step_preamble_dump};
 
     if !dgq::store::looks_like_dgq_dir(model_dir) {
         eprintln!("error: step-preamble-dump requires a .dgq directory");
@@ -1558,13 +1518,7 @@ fn run_step_preamble_dump_cmd(
         prefill_token_ids: None,
         no_early_stop: false,
     };
-    if let Err(err) = attach_step_prefill(
-        &mut cfg,
-        model_dir,
-        0,
-        prompt.as_deref(),
-        raw_prompt,
-    ) {
+    if let Err(err) = attach_step_prefill(&mut cfg, model_dir, 0, prompt.as_deref(), raw_prompt) {
         eprintln!("error: {err}");
         return ExitCode::FAILURE;
     }
@@ -1617,7 +1571,7 @@ fn run_embed_row_dump_cmd(
 
     #[cfg(all(feature = "metal", target_os = "macos"))]
     let gpu_scaled = if gpu {
-        use metal::{run_embed_row_gpu, StepFinishMode, StepSmokeConfig};
+        use metal::{StepFinishMode, StepSmokeConfig, run_embed_row_gpu};
         let mut cfg = StepSmokeConfig {
             layers,
             steps: 1,
@@ -1628,13 +1582,8 @@ fn run_embed_row_dump_cmd(
             prefill_token_ids: None,
             no_early_stop: false,
         };
-        if let Err(err) = attach_step_prefill(
-            &mut cfg,
-            model_dir,
-            0,
-            prompt.as_deref(),
-            raw_prompt,
-        ) {
+        if let Err(err) = attach_step_prefill(&mut cfg, model_dir, 0, prompt.as_deref(), raw_prompt)
+        {
             eprintln!("error: {err}");
             return ExitCode::FAILURE;
         }
@@ -1805,13 +1754,7 @@ fn run_step_kv_bf16_cross_cmd(
         token_ids.len(),
         layers.max(1).min(30)
     );
-    match run_step_kv_bf16_cross_parity(
-        dgq_dir,
-        bf16_dir,
-        &token_ids,
-        layers,
-        max_seq.max(64),
-    ) {
+    match run_step_kv_bf16_cross_parity(dgq_dir, bf16_dir, &token_ids, layers, max_seq.max(64)) {
         Ok(r) => {
             println!("step-kv-bf16-cross:");
             println!("  kv_len:              {}", r.kv_len);
@@ -1888,13 +1831,7 @@ fn run_step_kv_parity_cmd(
         token_ids.len(),
         layers.max(1).min(30)
     );
-    match run_step_kv_parity(
-        model_dir,
-        &token_ids,
-        layers,
-        max_seq.max(64),
-        seed,
-    ) {
+    match run_step_kv_parity(model_dir, &token_ids, layers, max_seq.max(64), seed) {
         Ok(r) => {
             println!("step-kv-parity:");
             println!("  kv_len:              {}", r.kv_len);
@@ -1977,20 +1914,38 @@ fn run_step_attn_probe_cmd(
             println!("step-attn-probe:");
             println!("  kv_len (prefix):        {}", r.kv_len);
             println!("  canvas_len:             {}", r.canvas_len);
-            println!("  attn keys T:            {} (= kv_len + canvas_len)", r.attn_keys_t);
+            println!(
+                "  attn keys T:            {} (= kv_len + canvas_len)",
+                r.attn_keys_t
+            );
             println!("  layer:                  {}", r.layer);
             println!("  monolithic K max L0:    {:.4}", r.k_plane_max_l0);
             println!("  monolithic V max L0:    {:.4}", r.v_plane_max_l0);
-            println!("  q_norm weight mean|w|: {:.4}  rms: {:.4}", r.q_norm_weight_mean_abs, r.q_norm_weight_rms);
-            println!("  k_norm weight mean|w|: {:.4}  rms: {:.4}", r.k_norm_weight_mean_abs, r.k_norm_weight_rms);
-            println!("  CPU Q·K raw max/min:    {:.2} / {:.2}", r.cpu_raw_dot_max, r.cpu_raw_dot_min);
+            println!(
+                "  q_norm weight mean|w|: {:.4}  rms: {:.4}",
+                r.q_norm_weight_mean_abs, r.q_norm_weight_rms
+            );
+            println!(
+                "  k_norm weight mean|w|: {:.4}  rms: {:.4}",
+                r.k_norm_weight_mean_abs, r.k_norm_weight_rms
+            );
+            println!(
+                "  CPU Q·K raw max/min:    {:.2} / {:.2}",
+                r.cpu_raw_dot_max, r.cpu_raw_dot_min
+            );
             println!(
                 "  CPU softmax row ent:    {:.4} nats (ln T = {:.4}, active keys/row = {})",
                 r.cpu_mean_softmax_entropy, ln_uniform, r.cpu_keys_per_row
             );
             println!("  CPU softmax max prob:   {:.4}", r.cpu_mean_max_prob);
-            println!("  CPU weight sum/row:     {:.6} (expect 1.0)", r.cpu_mean_weight_sum);
-            println!("  CPU Q/K head RMS:       {:.4} / {:.4}", r.cpu_q_head_rms, r.cpu_k_head_rms);
+            println!(
+                "  CPU weight sum/row:     {:.6} (expect 1.0)",
+                r.cpu_mean_weight_sum
+            );
+            println!(
+                "  CPU Q/K head RMS:       {:.4} / {:.4}",
+                r.cpu_q_head_rms, r.cpu_k_head_rms
+            );
             if r.cpu_mean_softmax_entropy > ln_uniform + 1e-3 {
                 eprintln!(
                     "  WARNING: entropy {:.4} > ln(T) {:.4} — probe bug or invalid softmax",
@@ -2129,7 +2084,7 @@ fn run_step_ci_cmd(model_dir: &std::path::Path, layers: usize) -> ExitCode {
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 fn run_chat_quality_gate(model_dir: &std::path::Path, layers: usize) -> ExitCode {
-    use generate_golden::{check_chat_quality, ChatQualityFixture};
+    use generate_golden::{ChatQualityFixture, check_chat_quality};
 
     let path = generate_golden::resolve_fixture("chat_quality_hello_layers3");
     let gate = match ChatQualityFixture::load(&path) {
@@ -2140,8 +2095,7 @@ fn run_chat_quality_gate(model_dir: &std::path::Path, layers: usize) -> ExitCode
         }
     };
 
-    let history: Vec<chat_template::ChatTurn> =
-        vec![chat_template::ChatTurn::user(&gate.prompt)];
+    let history: Vec<chat_template::ChatTurn> = vec![chat_template::ChatTurn::user(&gate.prompt)];
     let prompt = match build_chat_prompt_tokens(model_dir, &history, false) {
         Ok(ids) => ids,
         Err(err) => {
@@ -2187,10 +2141,7 @@ fn run_chat_quality_gate(model_dir: &std::path::Path, layers: usize) -> ExitCode
             let (total, real) = generate_golden::count_new_tokens(&out, prompt_len);
             println!(
                 "chat-quality ok ({}: {}/{} real new tokens, block_steps_eff={:?})",
-                gate.name,
-                real,
-                total,
-                out.block_steps_eff
+                gate.name, real, total, out.block_steps_eff
             );
             ExitCode::SUCCESS
         }
@@ -2220,7 +2171,7 @@ fn run_step_parity_cmd(
     seed: u64,
     max_seq: usize,
 ) -> ExitCode {
-    use metal::{run_step_parity, StepParityConfig};
+    use metal::{StepParityConfig, run_step_parity};
 
     if !dgq::store::looks_like_dgq_dir(model_dir) {
         eprintln!("error: step-parity requires a .dgq directory");
@@ -2311,7 +2262,11 @@ fn print_encode_subprofile(p: &metal::EncodeSubProfileResult) {
             ("dense_post_norm", prof.dense_post_norm),
             ("router", prof.router),
         ];
-        println!("{label} (total {:.2?}, {:.1}%):", prof.total(), pct(prof.total()));
+        println!(
+            "{label} (total {:.2?}, {:.1}%):",
+            prof.total(),
+            pct(prof.total())
+        );
         let mut ranked: Vec<_> = rows.iter().collect();
         ranked.sort_by(|a, b| b.1.cmp(&a.1));
         for (name, d) in ranked {
@@ -2334,7 +2289,11 @@ fn print_encode_subprofile(p: &metal::EncodeSubProfileResult) {
             ("scatter", prof.scatter),
             ("post", prof.post),
         ];
-        println!("{label} (total {:.2?}, {:.1}%):", prof.total(), pct(prof.total()));
+        println!(
+            "{label} (total {:.2?}, {:.1}%):",
+            prof.total(),
+            pct(prof.total())
+        );
         let mut ranked: Vec<_> = rows.iter().collect();
         ranked.sort_by(|a, b| b.1.cmp(&a.1));
         for (name, d) in ranked {
@@ -2397,18 +2356,26 @@ fn run_bench_step_kernel_cmd(
         );
         match bench_step_kernel_profile_steps(model_dir, &cfg, profile_steps) {
             Ok(rows) => {
-                println!("bench-step-kernel profile-steps ok ({} forwards)", rows.len());
+                println!(
+                    "bench-step-kernel profile-steps ok ({} forwards)",
+                    rows.len()
+                );
                 for (canvas_step, p) in rows {
                     let sc = if canvas_step == 0 { "no SC" } else { "SC" };
                     let per_l = |d: std::time::Duration| d / p.layers.max(1) as u32;
-                    let pct = |d: std::time::Duration| 100.0 * d.as_secs_f64() / p.total.as_secs_f64();
+                    let pct =
+                        |d: std::time::Duration| 100.0 * d.as_secs_f64() / p.total.as_secs_f64();
                     println!("--- canvas st.step={canvas_step} ({sc}) ---");
                     if canvas_step == 0 {
                         println!("  compile:       {:.2?}", p.compile);
                         println!("  block_format:  {:?}", p.block_format);
                         println!("  layers:        {}", p.layers);
                     }
-                    println!("  preamble:      {:.2?}  ({:.1}%)", p.preamble, pct(p.preamble));
+                    println!(
+                        "  preamble:      {:.2?}  ({:.1}%)",
+                        p.preamble,
+                        pct(p.preamble)
+                    );
                     println!(
                         "  pre_moe:       {:.2?}  ({:.1}%, {:.2?}/layer)",
                         p.layer_pre_moe,
@@ -2450,7 +2417,11 @@ fn run_bench_step_kernel_cmd(
                 println!("  compile:       {:.2?}", p.compile);
                 println!("  block_format:  {:?}", p.block_format);
                 println!("  layers:        {}", p.layers);
-                println!("  preamble:      {:.2?}  ({:.1}%)", p.preamble, pct(p.preamble));
+                println!(
+                    "  preamble:      {:.2?}  ({:.1}%)",
+                    p.preamble,
+                    pct(p.preamble)
+                );
                 println!(
                     "  pre_moe (attn+dense+router): {:.2?}  ({:.1}%, {:.2?}/layer)",
                     p.layer_pre_moe,
@@ -2550,18 +2521,53 @@ fn run_bench_gemm_fusion_cmd(
             println!("  compile:  {:.2?}", r.compile);
             println!("  layers:   {}", r.layers);
             println!("  iters:    {}", r.iters);
-            println!("  dispatches/pass: qkv stacked={} split={} gate_up stacked=1/L split=2/L", r.qkv_stacked_dispatches_per_pass, r.qkv_split_dispatches_per_pass);
+            println!(
+                "  dispatches/pass: qkv stacked={} split={} gate_up stacked=1/L split=2/L",
+                r.qkv_stacked_dispatches_per_pass, r.qkv_split_dispatches_per_pass
+            );
             println!("--- QKV GEMM only (per-layer rmsnorm prep + timed GEMM submit) ---");
-            println!("  stacked: {:.2?}  ({:.2?}/layer)", r.qkv_gemm_stacked, per_l(r.qkv_gemm_stacked));
-            println!("  split:   {:.2?}  ({:.2?}/layer)", r.qkv_gemm_split, per_l(r.qkv_gemm_split));
-            println!("  delta:   {:+.1}% stacked vs split", pct(r.qkv_gemm_stacked, r.qkv_gemm_split));
+            println!(
+                "  stacked: {:.2?}  ({:.2?}/layer)",
+                r.qkv_gemm_stacked,
+                per_l(r.qkv_gemm_stacked)
+            );
+            println!(
+                "  split:   {:.2?}  ({:.2?}/layer)",
+                r.qkv_gemm_split,
+                per_l(r.qkv_gemm_split)
+            );
+            println!(
+                "  delta:   {:+.1}% stacked vs split",
+                pct(r.qkv_gemm_stacked, r.qkv_gemm_split)
+            );
             println!("--- gate/up GEMM only (per-layer rmsnorm prep + timed GEMM submit) ---");
-            println!("  stacked: {:.2?}  ({:.2?}/layer)", r.gate_up_gemm_stacked, per_l(r.gate_up_gemm_stacked));
-            println!("  split:   {:.2?}  ({:.2?}/layer)", r.gate_up_gemm_split, per_l(r.gate_up_gemm_split));
-            println!("  delta:   {:+.1}% stacked vs split", pct(r.gate_up_gemm_stacked, r.gate_up_gemm_split));
+            println!(
+                "  stacked: {:.2?}  ({:.2?}/layer)",
+                r.gate_up_gemm_stacked,
+                per_l(r.gate_up_gemm_stacked)
+            );
+            println!(
+                "  split:   {:.2?}  ({:.2?}/layer)",
+                r.gate_up_gemm_split,
+                per_l(r.gate_up_gemm_split)
+            );
+            println!(
+                "  delta:   {:+.1}% stacked vs split",
+                pct(r.gate_up_gemm_stacked, r.gate_up_gemm_split)
+            );
             println!("--- batched pass (1 CB, interleaved rmsnorm+GEMM per layer) ---");
-            println!("  qkv stacked: {:.2?}  split: {:.2?}  ({:+.1}%)", r.qkv_batched_stacked, r.qkv_batched_split, pct(r.qkv_batched_stacked, r.qkv_batched_split));
-            println!("  gate_up stacked: {:.2?}  split: {:.2?}  ({:+.1}%)", r.gate_up_batched_stacked, r.gate_up_batched_split, pct(r.gate_up_batched_stacked, r.gate_up_batched_split));
+            println!(
+                "  qkv stacked: {:.2?}  split: {:.2?}  ({:+.1}%)",
+                r.qkv_batched_stacked,
+                r.qkv_batched_split,
+                pct(r.qkv_batched_stacked, r.qkv_batched_split)
+            );
+            println!(
+                "  gate_up stacked: {:.2?}  split: {:.2?}  ({:+.1}%)",
+                r.gate_up_batched_stacked,
+                r.gate_up_batched_split,
+                pct(r.gate_up_batched_stacked, r.gate_up_batched_split)
+            );
             ExitCode::SUCCESS
         }
         Err(err) => {
@@ -2624,10 +2630,7 @@ fn run_step_smoke_cmd(
             println!("  logits_finite: {}", r.logits_finite);
             println!("  max_abs_logit: {:.4}", r.max_abs_logit);
             println!("  elapsed:       {:.2?}", r.elapsed);
-            println!(
-                "  ids[0..8]:     {:?}",
-                &r.ids[..8.min(r.ids.len())]
-            );
+            println!("  ids[0..8]:     {:?}", &r.ids[..8.min(r.ids.len())]);
             if r.step >= 1 {
                 if !r.logits_finite {
                     eprintln!(
@@ -2666,7 +2669,7 @@ fn run_step_smoke_cmd(
 
 fn run_quantize(source_dir: &std::path::Path, output: &std::path::Path, profile: &str) -> ExitCode {
     use dgq::layout::QuantProfile;
-    use dgq::{quantize_model, QuantizeOptions};
+    use dgq::{QuantizeOptions, quantize_model};
 
     let profile_name = profile;
     let profile = match profile {
@@ -2709,7 +2712,11 @@ fn run_quantize(source_dir: &std::path::Path, output: &std::path::Path, profile:
             println!("  q8 tensors:    {}", summary.q8_tensors);
             println!("  raw tensors:   {}", summary.raw_tensors);
             println!("  elapsed:       {:.2?}", started.elapsed());
-            println!("  manifest:      {}/{}", out_dir.display(), dgq::layout::MANIFEST_FILE);
+            println!(
+                "  manifest:      {}/{}",
+                out_dir.display(),
+                dgq::layout::MANIFEST_FILE
+            );
             ExitCode::SUCCESS
         }
         Err(err) => {
@@ -2805,7 +2812,7 @@ fn run_bench_gemm(_shapes: &str, _oracle: Option<&str>, _iters: usize) -> ExitCo
 }
 
 fn run_convert_model(source_dir: &std::path::Path, output_dir: &std::path::Path) -> ExitCode {
-    use pack::{convert_model, ConvertOptions};
+    use pack::{ConvertOptions, convert_model};
     eprintln!(
         "convert-model: {} -> {}",
         source_dir.display(),
@@ -2818,11 +2825,18 @@ fn run_convert_model(source_dir: &std::path::Path, output_dir: &std::path::Path)
         Ok(summary) => {
             println!("convert-model ok");
             println!("  tensors:           {}", summary.tensor_count);
-            println!("  blob size:         {:.2} GiB", summary.blob_bytes as f64 / (1024.0_f64.powi(3)));
+            println!(
+                "  blob size:         {:.2} GiB",
+                summary.blob_bytes as f64 / (1024.0_f64.powi(3))
+            );
             println!("  gemm transposed:   {}", summary.transposed_gemm);
             println!("  expert transposed: {}", summary.transposed_experts);
             println!("  raw copied:        {}", summary.raw_copied);
-            println!("  manifest:          {}/{}", output_dir.display(), pack::layout::MANIFEST_FILE);
+            println!(
+                "  manifest:          {}/{}",
+                output_dir.display(),
+                pack::layout::MANIFEST_FILE
+            );
             ExitCode::SUCCESS
         }
         Err(err) => {
@@ -3191,20 +3205,21 @@ fn parse_cli() -> Cli {
         // kept as an alias). `generate`/`generate-gpu` also route here — the
         // non-monolithic generate/decoder/prefill surface is retired; the f32
         // engine survives only as the step-parity validation oracle.
-        Some("ask") | Some("generate-monolithic") | Some("generate") | Some("generate-gpu")
-            => Command::GenerateMonolithic {
-            prompt: prompt.clone(),
-            seed,
-            steps: steps_production,
-            prompt_len,
-            max_new_tokens,
-            max_layers: parity_layers,
-            no_early_stop,
-            kernel_assert,
-            kernel_debug_deep,
-            write_golden,
-            write_trace,
-        },
+        Some("ask") | Some("generate-monolithic") | Some("generate") | Some("generate-gpu") => {
+            Command::GenerateMonolithic {
+                prompt: prompt.clone(),
+                seed,
+                steps: steps_production,
+                prompt_len,
+                max_new_tokens,
+                max_layers: parity_layers,
+                no_early_stop,
+                kernel_assert,
+                kernel_debug_deep,
+                write_golden,
+                write_trace,
+            }
+        }
         Some("generate-monolithic-parity") => Command::GenerateMonolithicParity {
             prompt: prompt.clone(),
             seed,
@@ -3357,7 +3372,9 @@ fn parse_cli() -> Cli {
                 if p.join("config.json").is_file() {
                     p
                 } else {
-                    eprintln!("error: step-bf16-logits-dump requires --bf16-ref or model/transformer");
+                    eprintln!(
+                        "error: step-bf16-logits-dump requires --bf16-ref or model/transformer"
+                    );
                     std::process::exit(2);
                 }
             });
@@ -3561,14 +3578,26 @@ fn parse_cli() -> Cli {
             eprintln!(
                 "usage: diffgemma-mps [-p PROMPT] [--raw] [summary|config|weights <name>|quantize|convert-model|step-smoke|step-probe|step-kv-check|step-kv-parity|step-verify|step-ci|step-parity|bench-step-kernel|bench-step|bench-prefill|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-monolithic|generate-monolithic-parity|generate-parity|chat|tokenize <text>|gemm|attention]"
             );
-            eprintln!("  default (no command): generate-monolithic on .dgq, else generate-gpu (bf16) with --features metal");
-            eprintln!("  prompts: chat template applied by default; use --raw for bare BPE (-p \"Hello\" -> [9259])");
-            eprintln!("  chat: interactive REPL (monolithic .dgq); optional -p for first user turn");
-            eprintln!("  generate-parity: GPU vs checked-in golden (use --compare-cpu for slow CPU path; use --raw for legacy goldens)");
-            eprintln!("  options: ... --golden NAME --write-golden NAME --compare-cpu --no-early-stop --assert --debug-deep");
+            eprintln!(
+                "  default (no command): generate-monolithic on .dgq, else generate-gpu (bf16) with --features metal"
+            );
+            eprintln!(
+                "  prompts: chat template applied by default; use --raw for bare BPE (-p \"Hello\" -> [9259])"
+            );
+            eprintln!(
+                "  chat: interactive REPL (monolithic .dgq); optional -p for first user turn"
+            );
+            eprintln!(
+                "  generate-parity: GPU vs checked-in golden (use --compare-cpu for slow CPU path; use --raw for legacy goldens)"
+            );
+            eprintln!(
+                "  options: ... --golden NAME --write-golden NAME --compare-cpu --no-early-stop --assert --debug-deep"
+            );
             eprintln!("  gemm options: --size N (default 512, requires --features metal)");
             eprintln!("  attention: layer 0 GQA parity (requires --features metal)");
-            eprintln!("  decoder-gpu: full decoder CPU vs GPU parity at seq=256 (requires --features metal)");
+            eprintln!(
+                "  decoder-gpu: full decoder CPU vs GPU parity at seq=256 (requires --features metal)"
+            );
             std::process::exit(2);
         }
     };
@@ -3579,9 +3608,6 @@ fn parse_cli() -> Cli {
         raw_prompt,
     }
 }
-
-
-
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 fn default_generate_command(
@@ -3720,16 +3746,10 @@ fn gib(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0 * 1024.0)
 }
 
-
-
-
-
-
-
 fn run_gemm(size: usize) -> ExitCode {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     {
-        use metal::{bf16_matmul_cpu, f32_to_bf16, Bf16Gemm};
+        use metal::{Bf16Gemm, bf16_matmul_cpu, f32_to_bf16};
 
         let n = size.max(1);
         let m = n;
@@ -3874,10 +3894,7 @@ fn build_chat_prompt_tokens(
     let tok_path = model_dir.join("tokenizer.json");
     let tokenizer = tokenizer::Tokenizer::load(&tok_path)?;
     if raw_prompt {
-        let text = history
-            .last()
-            .map(|t| t.content.as_str())
-            .unwrap_or("");
+        let text = history.last().map(|t| t.content.as_str()).unwrap_or("");
         Ok(tokenizer.encode(text, false))
     } else {
         chat_template::format_chat_token_ids(
@@ -3904,7 +3921,7 @@ fn run_chat_cmd(
     json: bool,
     ctx: Option<usize>,
 ) -> ExitCode {
-    use metal::{generate_with_session, StepGenerateConfig, StepGenerateSession};
+    use metal::{StepGenerateConfig, StepGenerateSession, generate_with_session};
     use std::io::{self, IsTerminal, Write};
 
     // Quiet by default: chat is a UI, not a log. `--verbose` restores the
@@ -4064,13 +4081,18 @@ fn run_chat_cmd(
         step_cfg.step_observer = None;
         let elapsed = started.elapsed();
 
-        let new_ids = sample::strip_degenerate_token_ids(
-            out.token_ids.get(prompt_len..).unwrap_or(&[]),
-        );
+        let new_ids =
+            sample::strip_degenerate_token_ids(out.token_ids.get(prompt_len..).unwrap_or(&[]));
         let reply = chat_template::sanitize_model_reply(&tokenizer.decode(&new_ids));
         let new_tokens = out.token_ids.len().saturating_sub(prompt_len);
         let secs = elapsed.as_secs_f64();
-        stream.finish(&reply, new_tokens, out.denoise_steps_run, secs, out.stopped_on_eot);
+        stream.finish(
+            &reply,
+            new_tokens,
+            out.denoise_steps_run,
+            secs,
+            out.stopped_on_eot,
+        );
 
         if !interactive && !json {
             // Non-interactive human output (piped / --verbose): print the reply
@@ -4082,7 +4104,11 @@ fn run_chat_cmd(
             }
         }
         if !json {
-            let cap_note = if out.stopped_on_eot { "" } else { " · hit context limit" };
+            let cap_note = if out.stopped_on_eot {
+                ""
+            } else {
+                " · hit context limit"
+            };
             println!(
                 "  ({new_tokens} tok · {} steps · {secs:.1}s · {:.1} tok/s{cap_note})",
                 out.denoise_steps_run,
@@ -4223,7 +4249,7 @@ fn run_smoketest_cmd(
     filter: Option<&str>,
     repeat: usize,
 ) -> ExitCode {
-    use metal::{generate_with_session, StepGenerateConfig, StepGenerateSession};
+    use metal::{StepGenerateConfig, StepGenerateSession, generate_with_session};
 
     if !dgq::store::looks_like_dgq_dir(model_dir) {
         eprintln!("error: smoketest requires a .dgq directory (-m /path/to/quantized-weights)");
@@ -4249,8 +4275,10 @@ fn run_smoketest_cmd(
     // `--filter <pat>`: keep only prompts whose id contains <pat> (case-insensitive).
     if let Some(pat) = filter {
         let pat = pat.to_ascii_lowercase();
-        spec.adherence.retain(|p| p.id.to_ascii_lowercase().contains(&pat));
-        spec.convergence.retain(|p| p.id.to_ascii_lowercase().contains(&pat));
+        spec.adherence
+            .retain(|p| p.id.to_ascii_lowercase().contains(&pat));
+        spec.convergence
+            .retain(|p| p.id.to_ascii_lowercase().contains(&pat));
         let kept = spec.adherence.len() + spec.convergence.len();
         if kept == 0 {
             eprintln!("smoketest: no prompts match filter {pat:?}");
@@ -4310,29 +4338,28 @@ fn run_smoketest_cmd(
     };
 
     // (denoise_steps, reply) for one fresh single-turn generation.
-    let mut run_one =
-        |prompt_text: &str| -> Result<(usize, String), safetensors::Error> {
-            // Each prompt is independent — drop prior KV so we re-prefill fresh
-            // (chat's KV-reuse continuation would otherwise answer the first prompt).
-            session.reset_kv();
-            let history = vec![chat_template::ChatTurn::user(prompt_text)];
-            let prompt = build_chat_prompt_tokens(model_dir, &history, raw_prompt)?;
-            let prompt_len = prompt.len();
-            // Bound generation (and thus time + KV) — a gate doesn't need essays.
-            step_cfg.max_new_tokens = SMOKE_GEN_CAP.min(SMOKE_MAX_SEQ.saturating_sub(prompt_len).max(1));
-            let out = generate_with_session(&mut session, &prompt, &step_cfg, "smoketest")?;
-            let new_ids = sample::strip_degenerate_token_ids(
-                out.token_ids.get(prompt_len..).unwrap_or(&[]),
-            );
-            let reply = chat_template::sanitize_model_reply(&tokenizer.decode(&new_ids));
-            // Convergence gate = steps of the COMMITTED blocks (block_steps_eff),
-            // not total denoise work. Identical to denoise_steps_run unless the
-            // empty-reply retry (DGQ_EMPTY_REPLY_RETRY>0) re-rolled a degenerate
-            // first block — discarded re-roll steps are latency, not a convergence
-            // regression, so they must not count against the per-prompt budget.
-            let committed_steps: usize = out.block_steps_eff.iter().map(|&s| s as usize).sum();
-            Ok((committed_steps, reply))
-        };
+    let mut run_one = |prompt_text: &str| -> Result<(usize, String), safetensors::Error> {
+        // Each prompt is independent — drop prior KV so we re-prefill fresh
+        // (chat's KV-reuse continuation would otherwise answer the first prompt).
+        session.reset_kv();
+        let history = vec![chat_template::ChatTurn::user(prompt_text)];
+        let prompt = build_chat_prompt_tokens(model_dir, &history, raw_prompt)?;
+        let prompt_len = prompt.len();
+        // Bound generation (and thus time + KV) — a gate doesn't need essays.
+        step_cfg.max_new_tokens =
+            SMOKE_GEN_CAP.min(SMOKE_MAX_SEQ.saturating_sub(prompt_len).max(1));
+        let out = generate_with_session(&mut session, &prompt, &step_cfg, "smoketest")?;
+        let new_ids =
+            sample::strip_degenerate_token_ids(out.token_ids.get(prompt_len..).unwrap_or(&[]));
+        let reply = chat_template::sanitize_model_reply(&tokenizer.decode(&new_ids));
+        // Convergence gate = steps of the COMMITTED blocks (block_steps_eff),
+        // not total denoise work. Identical to denoise_steps_run unless the
+        // empty-reply retry (DGQ_EMPTY_REPLY_RETRY>0) re-rolled a degenerate
+        // first block — discarded re-roll steps are latency, not a convergence
+        // regression, so they must not count against the per-prompt budget.
+        let committed_steps: usize = out.block_steps_eff.iter().map(|&s| s as usize).sum();
+        Ok((committed_steps, reply))
+    };
 
     // (No warm-up: cold-start is fixed at the root by the deterministic first-step
     // SC seed. Verified engine 16/16 with the warm-up removed.)
@@ -4348,61 +4375,78 @@ fn run_smoketest_cmd(
 
     for iter in 0..repeat {
         if repeat > 1 {
-            println!("\n===== iteration {}/{repeat} (same session, no re-warmup) =====", iter + 1);
+            println!(
+                "\n===== iteration {}/{repeat} (same session, no re-warmup) =====",
+                iter + 1
+            );
         }
-    if !spec.adherence.is_empty() {
-        println!("\n[adherence]");
-        for p in &spec.adherence {
-            total += 1;
-            let (st, reply) = match run_one(&p.prompt) {
-                Ok(v) => v,
-                Err(err) => {
-                    println!("  {:<22} ERROR  {err}", p.id);
+        if !spec.adherence.is_empty() {
+            println!("\n[adherence]");
+            for p in &spec.adherence {
+                total += 1;
+                let (st, reply) = match run_one(&p.prompt) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        println!("  {:<22} ERROR  {err}", p.id);
+                        failures.push(p.id.clone());
+                        continue;
+                    }
+                };
+                let answer_ok = smoke_answer_matches(&reply, &p.answer, &p.accept);
+                let conv_ok = st <= p.max_steps;
+                let ok = answer_ok && conv_ok;
+                if ok {
+                    passed += 1;
+                } else {
                     failures.push(p.id.clone());
-                    continue;
                 }
-            };
-            let answer_ok = smoke_answer_matches(&reply, &p.answer, &p.accept);
-            let conv_ok = st <= p.max_steps;
-            let ok = answer_ok && conv_ok;
-            if ok {
-                passed += 1;
-            } else {
-                failures.push(p.id.clone());
+                let prev = reply
+                    .chars()
+                    .take(56)
+                    .collect::<String>()
+                    .replace('\n', " ");
+                let mark = if ok { "PASS" } else { "FAIL" };
+                let af = if answer_ok { "ok " } else { "BAD" };
+                let max = p.max_steps;
+                let ans = &p.answer;
+                println!(
+                    "  {id:<22} {mark:<4} steps {st:>3}/{max:<3} answer {af} \"{ans}\"  | {prev}",
+                    id = p.id
+                );
             }
-            let prev = reply.chars().take(56).collect::<String>().replace('\n', " ");
-            let mark = if ok { "PASS" } else { "FAIL" };
-            let af = if answer_ok { "ok " } else { "BAD" };
-            let max = p.max_steps;
-            let ans = &p.answer;
-            println!("  {id:<22} {mark:<4} steps {st:>3}/{max:<3} answer {af} \"{ans}\"  | {prev}", id = p.id);
         }
-    }
 
-    if !spec.convergence.is_empty() {
-        println!("\n[convergence]");
-        for p in &spec.convergence {
-            total += 1;
-            let (st, reply) = match run_one(&p.prompt) {
-                Ok(v) => v,
-                Err(err) => {
-                    println!("  {:<22} ERROR  {err}", p.id);
+        if !spec.convergence.is_empty() {
+            println!("\n[convergence]");
+            for p in &spec.convergence {
+                total += 1;
+                let (st, reply) = match run_one(&p.prompt) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        println!("  {:<22} ERROR  {err}", p.id);
+                        failures.push(p.id.clone());
+                        continue;
+                    }
+                };
+                let ok = st <= p.max_steps && !reply.trim().is_empty();
+                if ok {
+                    passed += 1;
+                } else {
                     failures.push(p.id.clone());
-                    continue;
                 }
-            };
-            let ok = st <= p.max_steps && !reply.trim().is_empty();
-            if ok {
-                passed += 1;
-            } else {
-                failures.push(p.id.clone());
+                let mark = if ok { "PASS" } else { "FAIL" };
+                let max = p.max_steps;
+                let prev = reply
+                    .chars()
+                    .take(72)
+                    .collect::<String>()
+                    .replace('\n', " ");
+                println!(
+                    "  {id:<22} {mark:<4} steps {st:>3}/{max:<3}  | {prev}",
+                    id = p.id
+                );
             }
-            let mark = if ok { "PASS" } else { "FAIL" };
-            let max = p.max_steps;
-            let prev = reply.chars().take(72).collect::<String>().replace('\n', " ");
-            println!("  {id:<22} {mark:<4} steps {st:>3}/{max:<3}  | {prev}", id = p.id);
         }
-    }
     } // end repeat loop
 
     println!("\nsmoketest: {passed}/{total} passed");
@@ -4449,7 +4493,6 @@ fn print_generate_elapsed(label: &str, elapsed: std::time::Duration) {
     println!("  {label} elapsed: {secs:.2}s ({elapsed:.2?})");
 }
 
-
 fn print_generate_output(
     label: &str,
     out: &generate::GenerateOutput,
@@ -4473,10 +4516,22 @@ fn print_generate_output(
         println!("  min_entropy/step:  {:?}", out.last_block_min_entropy_hist);
     }
     print_generate_elapsed(label, elapsed);
-    println!("  prefill:  {:.2}s ({:.2?})", out.prefill_elapsed.as_secs_f64(), out.prefill_elapsed);
-    println!("  denoise:  {:.2}s ({:.2?})", out.denoise_elapsed.as_secs_f64(), out.denoise_elapsed);
+    println!(
+        "  prefill:  {:.2}s ({:.2?})",
+        out.prefill_elapsed.as_secs_f64(),
+        out.prefill_elapsed
+    );
+    println!(
+        "  denoise:  {:.2}s ({:.2?})",
+        out.denoise_elapsed.as_secs_f64(),
+        out.denoise_elapsed
+    );
     if out.extend_elapsed.as_secs_f64() > 0.0 {
-        println!("  extend:   {:.2}s ({:.2?})", out.extend_elapsed.as_secs_f64(), out.extend_elapsed);
+        println!(
+            "  extend:   {:.2}s ({:.2?})",
+            out.extend_elapsed.as_secs_f64(),
+            out.extend_elapsed
+        );
     }
     if out.denoise_elapsed.as_secs_f64() > 0.0 && new_tokens > 0 {
         let tok_s = new_tokens as f64 / out.denoise_elapsed.as_secs_f64();
@@ -4544,13 +4599,9 @@ fn print_generate_output(
             .take(16)
             .map(|t| t.to_string())
             .collect();
-        println!(
-            "  generated[0..16]: [{}]",
-            gen_preview.join(", ")
-        );
+        println!("  generated[0..16]: [{}]", gen_preview.join(", "));
     }
 }
-
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 fn run_generate_monolithic_cmd(
@@ -4569,7 +4620,9 @@ fn run_generate_monolithic_cmd(
     raw_prompt: bool,
 ) -> ExitCode {
     if !dgq::store::looks_like_dgq_dir(model_dir) {
-        eprintln!("error: generate-monolithic requires a .dgq directory (-m /path/to/quantized-weights)");
+        eprintln!(
+            "error: generate-monolithic requires a .dgq directory (-m /path/to/quantized-weights)"
+        );
         return ExitCode::FAILURE;
     }
 
@@ -4624,20 +4677,18 @@ fn run_generate_monolithic_cmd(
 
     let stop_note = if no_early_stop { ", no_early_stop" } else { "" };
     let assert_note = if kernel_assert { ", assert" } else { "" };
-    let deep_note = if kernel_debug_deep { ", debug-deep" } else { "" };
+    let deep_note = if kernel_debug_deep {
+        ", debug-deep"
+    } else {
+        ""
+    };
     eprintln!(
         "running generate-monolithic (prompt_len={prompt_len}, steps={steps}, layers={layers}, max_new_tokens={max_new_tokens}, seed={seed}{stop_note}{assert_note}{deep_note})..."
     );
     let started = std::time::Instant::now();
 
     let prompt_label = prompt_text.clone().unwrap_or_default();
-    match generate::generate_monolithic_gpu(
-        model_dir,
-        &prompt,
-        &gen_cfg,
-        max_seq,
-        &prompt_label,
-    ) {
+    match generate::generate_monolithic_gpu(model_dir, &prompt, &gen_cfg, max_seq, &prompt_label) {
         Ok(out) => {
             if let Some(ref name) = write_golden {
                 let prompt_str = prompt_text.clone().unwrap_or_default();
@@ -4730,7 +4781,9 @@ fn run_generate_monolithic_parity_cmd(
     // KV region for prompts >256 tokens (kv_len+256 > max_seq), corrupting attention
     // into word-salad. See run_chat_cmd's roomy CHAT_MAX_SEQ for the same reasoning.
     let max_seq = (prompt_len + max_new_tokens + metal::CANVAS).max(512);
-    let prompt_label = prompt_text.clone().unwrap_or_else(|| format!("prompt_len={prompt_len}"));
+    let prompt_label = prompt_text
+        .clone()
+        .unwrap_or_else(|| format!("prompt_len={prompt_len}"));
 
     let gen_cfg = generate::GenerateConfig {
         sampler: sample::sampler_for_steps(steps, no_early_stop),
@@ -4766,25 +4819,15 @@ fn run_generate_monolithic_parity_cmd(
     let profile = generate_golden::monolithic_weights_profile();
 
     if let Some(ref name) = write_golden {
-        if let Err(err) = write_generate_golden(
-            name,
-            &prompt_label,
-            &gen_cfg,
-            steps,
-            profile,
-            &out,
-        ) {
+        if let Err(err) = write_generate_golden(name, &prompt_label, &gen_cfg, steps, profile, &out)
+        {
             eprintln!("error: {err}");
             return ExitCode::FAILURE;
         }
     }
 
     let fixture_name = golden_name.or_else(|| {
-        generate_golden::infer_monolithic_fixture_name(
-            prompt_text.as_deref(),
-            steps,
-            max_layers,
-        )
+        generate_golden::infer_monolithic_fixture_name(prompt_text.as_deref(), steps, max_layers)
     });
 
     if let Some(name) = fixture_name {
@@ -4859,7 +4902,6 @@ fn run_generate_monolithic_cmd(
     ExitCode::FAILURE
 }
 
-
 fn write_generate_golden(
     name: &str,
     prompt: &str,
@@ -4886,12 +4928,11 @@ fn write_generate_golden(
     Ok(())
 }
 
-
 fn run_attention_parity(m: &model::Model) -> ExitCode {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     {
         use metal::GpuAttention;
-        use model::attention::{forward_to_attn_out, prepare_qkv_pre_rope, AttentionParams};
+        use model::attention::{AttentionParams, forward_to_attn_out, prepare_qkv_pre_rope};
 
         const SEQ_LEN: usize = 16;
         let hidden = m.config.text_config.hidden_size;
@@ -5001,7 +5042,10 @@ fn run_attention_parity(m: &model::Model) -> ExitCode {
         }
 
         println!("layer 0 attention parity ok");
-        println!("  shape: [{SEQ_LEN}, {}, {}]", params.n_heads, params.head_dim);
+        println!(
+            "  shape: [{SEQ_LEN}, {}, {}]",
+            params.n_heads, params.head_dim
+        );
         println!("  gpu elapsed: {gpu_elapsed:.2?}");
         println!("  max_abs_diff: {max_abs:.6} at index {max_idx}");
         println!(
@@ -5033,29 +5077,24 @@ fn run_layer0_forward(m: &model::Model) -> ExitCode {
     const SEQ_LEN: usize = 16;
     let hidden = m.config.text_config.hidden_size;
 
-    let layer = match model::layer_weights::DecoderLayerWeights::load(
-        &m.weights,
-        0,
-        &m.config.text_config,
-    ) {
-        Ok(layer) => layer,
-        Err(err) => {
-            eprintln!("error: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let layer =
+        match model::layer_weights::DecoderLayerWeights::load(&m.weights, 0, &m.config.text_config)
+        {
+            Ok(layer) => layer,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
 
-    let mut scratch = match model::decoder_layer::DecoderLayerScratch::new(
-        SEQ_LEN,
-        &m.config.text_config,
-        0,
-    ) {
-        Ok(scratch) => scratch,
-        Err(err) => {
-            eprintln!("error: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let mut scratch =
+        match model::decoder_layer::DecoderLayerScratch::new(SEQ_LEN, &m.config.text_config, 0) {
+            Ok(scratch) => scratch,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
 
     let mut input = vec![0.0f32; SEQ_LEN * hidden];
     let mut output = vec![0.0f32; SEQ_LEN * hidden];

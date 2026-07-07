@@ -60,7 +60,6 @@ impl DecoderLayerKeys {
             layer_scalar: format!("{p}.layer_scalar"),
         }
     }
-
 }
 
 /// Expected weight shapes derived from `TextConfig` (PyTorch linear: `[out_features, in_features]`).

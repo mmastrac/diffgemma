@@ -14,11 +14,7 @@ pub fn e2m1_to_f32(bits: u8) -> f32 {
         6 => 4.0,
         _ => 6.0,
     };
-    if bits & 0x8 != 0 {
-        -mag
-    } else {
-        mag
-    }
+    if bits & 0x8 != 0 { -mag } else { mag }
 }
 
 /// Quantize `x` to E2M1 (matches `mlx/backend/metal/kernels/fp4.h`).

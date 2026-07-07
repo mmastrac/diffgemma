@@ -87,9 +87,7 @@ pub fn moe_routing_fixture(_: ElemFormat) -> Fixture {
     route.weight[12][0] = bf16::f32_to_bf16_bits(0.8);
     route.weight[44][0] = bf16::f32_to_bf16_bits(0.3);
     crate::metal::fill_token_slot(&mut route);
-    let expert_out: Vec<f32> = (0..8 * hidden)
-        .map(|i| (i as f32 + 1.0) * 0.1)
-        .collect();
+    let expert_out: Vec<f32> = (0..8 * hidden).map(|i| (i as f32 + 1.0) * 0.1).collect();
     Fixture {
         expert_out,
         route,
@@ -160,15 +158,12 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         .ok_or(Error::Format("alloc"))?;
     BufferPool::write_f32(&buf_ex, &f.expert_out);
     BufferPool::write_f32(&buf_out, &vec![0.0f32; out_len]);
-    BufferPool::write_bytes(
-        &buf_route,
-        unsafe {
-            std::slice::from_raw_parts(
-                &f.route as *const RouteScratch as *const u8,
-                std::mem::size_of::<RouteScratch>(),
-            )
-        },
-    );
+    BufferPool::write_bytes(&buf_route, unsafe {
+        std::slice::from_raw_parts(
+            &f.route as *const RouteScratch as *const u8,
+            std::mem::size_of::<RouteScratch>(),
+        )
+    });
     // Production layout: one TG per (256-wide d-tile, token), 256 threads
     // (d = tgid.x * 256 + tid) — matches encode_moe_batched_scatter. The old
     // (hidden, CANVAS, 8) shape only covered d < 8 and passed by fixture luck.

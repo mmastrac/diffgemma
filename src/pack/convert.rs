@@ -1,9 +1,9 @@
 //! Offline conversion: safetensors → `iris.pack` (pre-transposed for Metal GEMM).
 
-use crate::fast_slice::{transpose_bf16_weight_into, FastBf16Slice, FastSliceMut};
+use crate::fast_slice::{FastBf16Slice, FastSliceMut, transpose_bf16_weight_into};
 use crate::pack::layout::{
-    align_offset, classify_tensor, PackManifest, PackTensorEntry, PackTensorMeta, TensorLayout,
-    BLOB_FILE, MANIFEST_FILE, PACK_VERSION,
+    BLOB_FILE, MANIFEST_FILE, PACK_VERSION, PackManifest, PackTensorEntry, PackTensorMeta,
+    TensorLayout, align_offset, classify_tensor,
 };
 use crate::safetensors::Error;
 use crate::tensor::Bf16Slice;
@@ -127,7 +127,12 @@ fn write_gemm_transpose(
     let slice = Bf16Slice::from_bytes(src);
     let fast = FastBf16Slice::from_bf16(slice);
     let mut tmp = vec![0u16; in_dim * out_dim];
-    transpose_bf16_weight_into(fast, FastSliceMut::from_slice_mut(&mut tmp), out_dim, in_dim);
+    transpose_bf16_weight_into(
+        fast,
+        FastSliceMut::from_slice_mut(&mut tmp),
+        out_dim,
+        in_dim,
+    );
     write_u16_le(out, &tmp)?;
     Ok((tmp.len() * 2) as u64)
 }
@@ -200,10 +205,7 @@ fn copy_sidecar_files(source: &Path, dest: &Path) -> Result<(), Error> {
         }
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with("model.safetensors")
-            || name == MANIFEST_FILE
-            || name == BLOB_FILE
-        {
+        if name.starts_with("model.safetensors") || name == MANIFEST_FILE || name == BLOB_FILE {
             continue;
         }
         fs::copy(&path, dest.join(name.as_ref()))?;
@@ -251,7 +253,11 @@ mod tests {
             TensorLayout::Raw
         );
         assert_eq!(
-            classify_tensor("model.decoder.embed_tokens.weight", &[262144, 2816], DType::BF16),
+            classify_tensor(
+                "model.decoder.embed_tokens.weight",
+                &[262144, 2816],
+                DType::BF16
+            ),
             TensorLayout::Raw
         );
     }

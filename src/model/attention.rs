@@ -558,14 +558,7 @@ pub fn forward_encoder(
     scratch: &mut AttentionScratch,
 ) -> Result<(), Error> {
     forward(
-        out,
-        hidden,
-        weights,
-        cfg,
-        layer,
-        seq_len,
-        positions,
-        scratch,
+        out, hidden, weights, cfg, layer, seq_len, positions, scratch,
     )?;
     let params = AttentionParams::for_layer(cfg, layer)?;
     kv_out.n_kv_heads = params.n_kv_heads;
@@ -678,7 +671,14 @@ pub fn forward_decoder(
         params.rotary_dim,
     );
 
-    concat_kv_cache(&mut scratch.k_full, &mut scratch.v_full, kv, &scratch.k, &scratch.v, &params);
+    concat_kv_cache(
+        &mut scratch.k_full,
+        &mut scratch.v_full,
+        kv,
+        &scratch.k,
+        &scratch.v,
+        &params,
+    );
 
     attention_scores_gqa_ext(
         &mut scratch.scores,
@@ -729,28 +729,14 @@ pub fn normalize_qkv_heads(
         for h in 0..params.n_heads {
             let off = (s * params.n_heads + h) * params.head_dim;
             head_buf.copy_from_slice(&q[off..off + params.head_dim]);
-            rms_norm(
-                &mut q[off..off + params.head_dim],
-                head_buf,
-                q_norm_w,
-                eps,
-            );
+            rms_norm(&mut q[off..off + params.head_dim], head_buf, q_norm_w, eps);
         }
         for h in 0..params.n_kv_heads {
             let off = (s * params.n_kv_heads + h) * params.head_dim;
             head_buf.copy_from_slice(&k[off..off + params.head_dim]);
-            rms_norm(
-                &mut k[off..off + params.head_dim],
-                head_buf,
-                k_norm_w,
-                eps,
-            );
+            rms_norm(&mut k[off..off + params.head_dim], head_buf, k_norm_w, eps);
             head_buf.copy_from_slice(&v[off..off + params.head_dim]);
-            rms_norm_no_scale(
-                &mut v[off..off + params.head_dim],
-                head_buf,
-                eps,
-            );
+            rms_norm_no_scale(&mut v[off..off + params.head_dim], head_buf, eps);
         }
     }
 }
@@ -801,7 +787,8 @@ fn attention_scores_gqa(
         for h in 0..params.n_heads {
             let kv_h = h / params.n_groups;
             let q_off = (qi * params.n_heads + h) * hd;
-            let row = &mut scores[(qi * params.n_heads + h) * seq_len..(qi * params.n_heads + h + 1) * seq_len];
+            let row = &mut scores
+                [(qi * params.n_heads + h) * seq_len..(qi * params.n_heads + h + 1) * seq_len];
             for ki in 0..seq_len {
                 let k_off = (ki * params.n_kv_heads + kv_h) * hd;
                 let mut dot = 0.0f32;
@@ -825,7 +812,8 @@ fn apply_encoder_extend_mask(
     for qi in 0..seq_len {
         let pos_q = positions[qi];
         for h in 0..params.n_heads {
-            let row = &mut scores[(qi * params.n_heads + h) * total_kv..(qi * params.n_heads + h + 1) * total_kv];
+            let row = &mut scores
+                [(qi * params.n_heads + h) * total_kv..(qi * params.n_heads + h + 1) * total_kv];
             for ki in 0..total_kv {
                 let pos_k = if ki < kv_cache_len {
                     ki as i64
@@ -849,7 +837,8 @@ fn apply_encoder_extend_mask(
 fn apply_attention_mask(scores: &mut [f32], seq_len: usize, params: &AttentionParams) {
     for qi in 0..seq_len {
         for h in 0..params.n_heads {
-            let row = &mut scores[(qi * params.n_heads + h) * seq_len..(qi * params.n_heads + h + 1) * seq_len];
+            let row = &mut scores
+                [(qi * params.n_heads + h) * seq_len..(qi * params.n_heads + h + 1) * seq_len];
             for ki in 0..seq_len {
                 let mut masked = false;
                 if ki > qi {
@@ -882,7 +871,8 @@ fn attention_scores_gqa_ext(
         for h in 0..params.n_heads {
             let kv_h = h / params.n_groups;
             let q_off = (qi * params.n_heads + h) * hd;
-            let row = &mut scores[(qi * params.n_heads + h) * total_kv..(qi * params.n_heads + h + 1) * total_kv];
+            let row = &mut scores
+                [(qi * params.n_heads + h) * total_kv..(qi * params.n_heads + h + 1) * total_kv];
             for ki in 0..total_kv {
                 let k_off = ki * kv_dim + kv_h * hd;
                 let mut dot = 0.0f32;
@@ -904,7 +894,8 @@ fn apply_decoder_mask(
 ) {
     for qi in 0..seq_len {
         for h in 0..params.n_heads {
-            let row = &mut scores[(qi * params.n_heads + h) * total_kv..(qi * params.n_heads + h + 1) * total_kv];
+            let row = &mut scores
+                [(qi * params.n_heads + h) * total_kv..(qi * params.n_heads + h + 1) * total_kv];
             for ki in 0..total_kv {
                 if !mask.can_attend(qi, ki) {
                     row[ki] = MASK_NEG;
@@ -928,8 +919,8 @@ fn attention_output_gqa_ext(
     for qi in 0..seq_len {
         for h in 0..params.n_heads {
             let kv_h = h / params.n_groups;
-            let score_row =
-                &scores[(qi * params.n_heads + h) * total_kv..(qi * params.n_heads + h + 1) * total_kv];
+            let score_row = &scores
+                [(qi * params.n_heads + h) * total_kv..(qi * params.n_heads + h + 1) * total_kv];
             let o_off = (qi * params.n_heads + h) * hd;
             for ki in 0..total_kv {
                 let w = score_row[ki];
@@ -977,7 +968,8 @@ pub fn attn_score_stats_decoder(
 
     for qi in 0..seq_len {
         for h in 0..params.n_heads {
-            let row = &scores[(qi * params.n_heads + h) * total_kv..(qi * params.n_heads + h + 1) * total_kv];
+            let row = &scores
+                [(qi * params.n_heads + h) * total_kv..(qi * params.n_heads + h + 1) * total_kv];
             let mut row_max = f32::NEG_INFINITY;
             let mut row_active = 0usize;
             for &s in row {

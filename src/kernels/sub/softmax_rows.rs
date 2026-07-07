@@ -43,9 +43,7 @@ pub fn router_fixture(_fmt: ElemFormat) -> Fixture {
     let cols = 128;
     let len = rows * cols;
     Fixture {
-        logits: (0..len)
-            .map(|i| ((i as f32) * 0.03).sin() * 2.0)
-            .collect(),
+        logits: (0..len).map(|i| ((i as f32) * 0.03).sin() * 2.0).collect(),
         rows,
         cols,
     }
@@ -57,9 +55,7 @@ pub fn wide_cols_fixture(_fmt: ElemFormat) -> Fixture {
     let cols = 512;
     let len = rows * cols;
     Fixture {
-        logits: (0..len)
-            .map(|i| (i as f32 % 17.0) - 8.0)
-            .collect(),
+        logits: (0..len).map(|i| (i as f32 % 17.0) - 8.0).collect(),
         rows,
         cols,
     }
@@ -95,10 +91,7 @@ pub fn assert_row_invariants(out: &[f32], rows: usize, cols: usize) {
         let row = &out[r * cols..(r + 1) * cols];
         assert!(row.iter().all(|v| v.is_finite() && *v >= 0.0));
         let sum: f32 = row.iter().sum();
-        assert!(
-            (sum - 1.0).abs() < 1e-4,
-            "row {r} sum={sum} (expected 1.0)"
-        );
+        assert!((sum - 1.0).abs() < 1e-4, "row {r} sum={sum} (expected 1.0)");
         let max_p = row.iter().copied().fold(0.0f32, f32::max);
         if max_p > 0.0 {
             let ent: f32 = -row
@@ -119,7 +112,7 @@ pub fn assert_row_invariants(out: &[f32], rows: usize, cols: usize) {
 pub fn gpu(fix: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
-    
+
     use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
 
     let ctx = MetalContext::new()?;

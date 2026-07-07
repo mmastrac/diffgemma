@@ -1,14 +1,14 @@
 use crate::config::TextConfig;
 use crate::kernels::cpu::{gelu_pytorch_tanh, linear, rms_norm_rows};
 use crate::model::attention::{
-    forward as attention_forward, forward_decoder as attention_forward_decoder,
+    AttentionScratch, forward as attention_forward, forward_decoder as attention_forward_decoder,
     forward_encoder as attention_forward_encoder,
-    forward_encoder_extend as attention_forward_encoder_extend, AttentionScratch,
+    forward_encoder_extend as attention_forward_encoder_extend,
 };
 use crate::model::kv_cache::{LayerKv, LayerKvView};
-use crate::model::mask::DecoderAttnMask;
 use crate::model::layer_weights::DecoderLayerWeights;
-use crate::model::moe::{experts_forward, prepare_expert_input, route, MoeScratch};
+use crate::model::mask::DecoderAttnMask;
+use crate::model::moe::{MoeScratch, experts_forward, prepare_expert_input, route};
 use crate::safetensors::Error;
 
 pub struct DecoderLayerScratch {

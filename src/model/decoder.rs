@@ -1,12 +1,12 @@
 use crate::buffer::Buffer;
 use crate::config::ModelConfig;
 use crate::kernels::cpu::rms_norm_rows;
-use crate::model::decoder_layer::{forward_decoder as layer_forward, DecoderLayerScratch};
+use crate::model::decoder_layer::{DecoderLayerScratch, forward_decoder as layer_forward};
 use crate::model::embed::{embed_tokens_from_store, lm_head_tied_from_store, logit_softcapping};
 use crate::model::kv_cache::{KvCache, LayerKvView};
 use crate::model::layer_weights::DecoderLayerWeights;
 use crate::model::mask::DecoderAttnMask;
-use crate::model::self_conditioning::{apply_from_store, SelfConditioningScratch};
+use crate::model::self_conditioning::{SelfConditioningScratch, apply_from_store};
 use crate::safetensors::Error;
 use crate::weights::WeightStore;
 
@@ -119,7 +119,8 @@ pub fn forward(
     )?;
 
     let mask = input.mask;
-    let positions: Vec<i64> = (input.kv_cache.kv_len as i64..input.kv_cache.kv_len as i64 + seq_len as i64).collect();
+    let positions: Vec<i64> =
+        (input.kv_cache.kv_len as i64..input.kv_cache.kv_len as i64 + seq_len as i64).collect();
 
     let mut in_buf = &mut scratch.hidden_a;
     let mut out_buf = &mut scratch.hidden_b;
@@ -151,7 +152,10 @@ pub fn forward(
         std::mem::swap(&mut in_buf, &mut out_buf);
     }
 
-    scratch.norm_w = store.tensor("model.decoder.norm.weight")?.bf16()?.to_f32_vec();
+    scratch.norm_w = store
+        .tensor("model.decoder.norm.weight")?
+        .bf16()?
+        .to_f32_vec();
     rms_norm_rows(
         out_buf,
         in_buf,
@@ -188,7 +192,10 @@ pub fn forward(
                 vocab,
                 &mut scratch.lm_head_chunk,
             )?;
-            logit_softcapping(scratch.logits_buf.as_slice_mut(), text.final_logit_softcapping as f32);
+            logit_softcapping(
+                scratch.logits_buf.as_slice_mut(),
+                text.final_logit_softcapping as f32,
+            );
         }
     }
 

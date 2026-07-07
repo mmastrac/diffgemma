@@ -97,19 +97,20 @@ mod tests {
         let ctx = MetalContext::new().expect("metal");
         let pipeline = pipeline_for(&ctx, KernelVariant::PRODUCTION).expect("pipeline");
         let mut pool = BufferPool::new();
-        let mut batch =
-            GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None).expect("batch");
+        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None)
+            .expect("batch");
         let buf_arena = batch.alloc_f32(&arena).expect("arena");
-        let rows_bytes = unsafe {
-            std::slice::from_raw_parts(rows.as_ptr().cast::<u8>(), rows.len() * 4)
-        };
+        let rows_bytes =
+            unsafe { std::slice::from_raw_parts(rows.as_ptr().cast::<u8>(), rows.len() * 4) };
         let buf_rows = batch.alloc_bytes(rows_bytes).expect("rows");
         let buf_w = batch.alloc_f32(&weights).expect("weights");
         let buf_out = batch.alloc_f32_out(seq_len * hidden).expect("out");
         let buf_dump = batch.alloc_f32_out(1).expect("dump");
         let dims = [seq_len as u32, hidden as u32, top_k as u32];
         batch.dispatch_1d(&pipeline.pipeline, seq_len * hidden, |enc| {
-            bind_gpu_buffers(&enc, &buf_arena, &buf_rows, &buf_w, &buf_out, &buf_dump, &dims);
+            bind_gpu_buffers(
+                &enc, &buf_arena, &buf_rows, &buf_w, &buf_out, &buf_dump, &dims,
+            );
         });
         let mut gpu = vec![0.0f32; seq_len * hidden];
         batch.register_read(buf_out, &mut gpu);

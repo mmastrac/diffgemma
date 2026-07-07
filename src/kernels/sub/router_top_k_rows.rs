@@ -87,22 +87,36 @@ pub fn cpu_oracle(fix: &Fixture) -> RouteOut {
 pub fn gpu(fix: &Fixture, variant: KernelVariant) -> Result<RouteOut, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
-    
-    use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize};
+
+    use objc2_metal::{
+        MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
+    };
 
     let ctx = MetalContext::new()?;
     let pipeline = pipeline_for(&ctx, variant)?;
     let mut pool = BufferPool::new();
     let prob_len = fix.probs.len();
     let out_len = fix.out_indices_len();
-    let buf_p = pool.allocate(&ctx.device, prob_len * 4).ok_or(Error::Format("alloc"))?;
+    let buf_p = pool
+        .allocate(&ctx.device, prob_len * 4)
+        .ok_or(Error::Format("alloc"))?;
     let buf_s = pool
         .allocate(&ctx.device, fix.experts * 4)
         .ok_or(Error::Format("alloc"))?;
-    let buf_i = pool.allocate(&ctx.device, out_len * 4).ok_or(Error::Format("alloc"))?;
-    let buf_w = pool.allocate(&ctx.device, out_len * 4).ok_or(Error::Format("alloc"))?;
-    let dump_bytes = if variant.dump_stage > 0 { fix.rows * 8 } else { 4 };
-    let buf_dump = pool.allocate(&ctx.device, dump_bytes).ok_or(Error::Format("alloc"))?;
+    let buf_i = pool
+        .allocate(&ctx.device, out_len * 4)
+        .ok_or(Error::Format("alloc"))?;
+    let buf_w = pool
+        .allocate(&ctx.device, out_len * 4)
+        .ok_or(Error::Format("alloc"))?;
+    let dump_bytes = if variant.dump_stage > 0 {
+        fix.rows * 8
+    } else {
+        4
+    };
+    let buf_dump = pool
+        .allocate(&ctx.device, dump_bytes)
+        .ok_or(Error::Format("alloc"))?;
 
     BufferPool::write_f32(&buf_p, &fix.probs);
     BufferPool::write_f32(&buf_s, &fix.per_expert_scale);
@@ -113,8 +127,16 @@ pub fn gpu(fix: &Fixture, variant: KernelVariant) -> Result<RouteOut, Error> {
     let params = [fix.rows as u32, fix.experts as u32, fix.top_k as u32];
     bind_gpu_buffers(&enc, &buf_p, &buf_s, &buf_i, &buf_w, &buf_dump, &params);
     enc.dispatchThreadgroups_threadsPerThreadgroup(
-        MTLSize { width: fix.rows, height: 1, depth: 1 },
-        MTLSize { width: 1, height: 1, depth: 1 },
+        MTLSize {
+            width: fix.rows,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
     );
     enc.endEncoding();
     cmd.commit();

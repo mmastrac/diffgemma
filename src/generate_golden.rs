@@ -7,11 +7,7 @@ use std::path::Path;
 
 /// Weight format tag for fixture selection (`safetensors` vs `dgq_q4` vs `monolithic`).
 pub fn weights_profile_name(quantized: bool) -> &'static str {
-    if quantized {
-        "dgq_q4"
-    } else {
-        "safetensors"
-    }
+    if quantized { "dgq_q4" } else { "safetensors" }
 }
 
 pub fn monolithic_weights_profile() -> &'static str {

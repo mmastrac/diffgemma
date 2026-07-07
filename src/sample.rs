@@ -130,8 +130,7 @@ pub fn diffusion_append_argmax_hist(
 
 /// Replicate `sample_commit` early-stop from post-commit GPU state.
 pub fn early_stop_from_snapshot(snap: &EarlyStopSnapshot) -> bool {
-    let confident =
-        snap.canvas_stable != 0 && snap.mean_entropy < snap.conf_threshold;
+    let confident = snap.canvas_stable != 0 && snap.mean_entropy < snap.conf_threshold;
     let plateau = snap.accept_plateau >= snap.accept_plateau_threshold
         && snap.mean_entropy < snap.plateau_prefix_mean_max;
     confident || plateau
@@ -159,12 +158,10 @@ pub fn answer_prefix_ids<'a>(token_ids: &'a [u32], ids: &[u32], eos_token_id: u3
 }
 
 /// Mean entropy over pad/filler-free positions in `0..first-EOS` (answer region).
-pub fn mean_entropy_answer_prefix(
-    entropies: &[f32],
-    ids: &[u32],
-    eos_token_id: u32,
-) -> f32 {
-    let end = answer_region_end(ids, eos_token_id).min(entropies.len()).min(ids.len());
+pub fn mean_entropy_answer_prefix(entropies: &[f32], ids: &[u32], eos_token_id: u32) -> f32 {
+    let end = answer_region_end(ids, eos_token_id)
+        .min(entropies.len())
+        .min(ids.len());
     let mut sum = 0.0f32;
     let mut n = 0usize;
     for i in 0..end {
@@ -173,11 +170,7 @@ pub fn mean_entropy_answer_prefix(
             n += 1;
         }
     }
-    if n == 0 {
-        f32::MAX
-    } else {
-        sum / n as f32
-    }
+    if n == 0 { f32::MAX } else { sum / n as f32 }
 }
 
 /// Mean entropy over non-pad, non-filler canvas positions (legacy; prefer answer prefix).
@@ -250,11 +243,7 @@ impl Rng {
     }
 
     pub fn uniform_below(&mut self, high: u32) -> u32 {
-        if high == 0 {
-            0
-        } else {
-            self.next_u32() % high
-        }
+        if high == 0 { 0 } else { self.next_u32() % high }
     }
 
     pub fn state(&self) -> u64 {
@@ -318,9 +307,7 @@ impl SamplerConfig {
 
 pub fn initialize_canvas(canvas_len: usize, vocab_size: usize, rng: &mut Rng) -> Vec<u32> {
     let vocab = vocab_size.max(1) as u32;
-    (0..canvas_len)
-        .map(|_| rng.uniform_below(vocab))
-        .collect()
+    (0..canvas_len).map(|_| rng.uniform_below(vocab)).collect()
 }
 
 pub fn apply_temperature(logits: &mut [f32], cur_step: usize, cfg: &SamplerConfig) {
@@ -368,17 +355,16 @@ pub struct StepEntropyStats {
 }
 
 pub fn count_low_entropy_positions(entropies: &[f32], threshold: f32) -> u32 {
-    entropies
-        .iter()
-        .filter(|&&e| e < threshold)
-        .count() as u32
+    entropies.iter().filter(|&&e| e < threshold).count() as u32
 }
 
 pub fn step_entropy_stats(entropies: &[f32], accept: &[u32]) -> StepEntropyStats {
     let accept_count = accept.iter().filter(|&&a| a != 0).count() as u32;
-    let (min_entropy, max_entropy) = entropies.iter().fold((f32::INFINITY, 0.0f32), |(mn, mx), &e| {
-        (mn.min(e), mx.max(e))
-    });
+    let (min_entropy, max_entropy) = entropies
+        .iter()
+        .fold((f32::INFINITY, 0.0f32), |(mn, mx), &e| {
+            (mn.min(e), mx.max(e))
+        });
     StepEntropyStats {
         accept_count,
         low_entropy_positions: count_low_entropy_positions(entropies, 0.1),
@@ -526,13 +512,11 @@ pub fn sample_canvas(
 }
 
 /// True when any answer-region canvas position's argmax changed since `prev`.
-pub fn answer_argmax_changed(
-    prev: &[u32],
-    cur: &[u32],
-    ids: &[u32],
-    eos_token_id: u32,
-) -> bool {
-    let end = answer_region_end(ids, eos_token_id).min(prev.len()).min(cur.len()).min(ids.len());
+pub fn answer_argmax_changed(prev: &[u32], cur: &[u32], ids: &[u32], eos_token_id: u32) -> bool {
+    let end = answer_region_end(ids, eos_token_id)
+        .min(prev.len())
+        .min(cur.len())
+        .min(ids.len());
     (0..end).any(|i| is_active_token(ids[i]) && prev[i] != cur[i])
 }
 
@@ -721,14 +705,8 @@ mod tests {
         apply_temperature(&mut processed, 48, &SamplerConfig::default());
         let current = vec![0, 1, 2, 3];
         let denoiser = vec![4, 5, 6, 7];
-        let (accepted, mask) = accept_canvas(
-            &current,
-            &denoiser,
-            &processed,
-            canvas_len,
-            vocab,
-            0.5,
-        );
+        let (accepted, mask) =
+            accept_canvas(&current, &denoiser, &processed, canvas_len, vocab, 0.5);
         assert!(mask.iter().filter(|&&m| m).count() >= 1);
         for i in 0..canvas_len {
             if mask[i] {
@@ -771,12 +749,8 @@ mod tests {
         let accept = vec![0u32; canvas_len];
 
         let ent = token_entropy(&processed, canvas_len, vocab);
-        assert!(!stopper.should_stop_with_entropies(
-            &argmax, &ent, &ids, &accept, 1
-        ));
-        assert!(stopper.should_stop_with_entropies(
-            &argmax, &ent, &ids, &accept, 2
-        ));
+        assert!(!stopper.should_stop_with_entropies(&argmax, &ent, &ids, &accept, 1));
+        assert!(stopper.should_stop_with_entropies(&argmax, &ent, &ids, &accept, 2));
     }
 
     #[test]
@@ -787,13 +761,7 @@ mod tests {
         let entropies = vec![0.0f32; canvas_len];
         let ids = vec![PAD_TOKEN_ID; canvas_len];
         let accept = vec![0u32; canvas_len];
-        assert!(!stopper.should_stop_with_entropies(
-            &argmax,
-            &entropies,
-            &ids,
-            &accept,
-            1,
-        ));
+        assert!(!stopper.should_stop_with_entropies(&argmax, &entropies, &ids, &accept, 1,));
     }
 
     #[test]
@@ -806,12 +774,8 @@ mod tests {
             .chain(std::iter::repeat(0.12f32).take(256 - 73))
             .collect();
         let accept = vec![0u32; 256];
-        assert!(!stopper.should_stop_with_entropies(
-            &argmax, &ent, &ids, &accept, 1
-        ));
-        assert!(!stopper.should_stop_with_entropies(
-            &argmax, &ent, &ids, &accept, 2
-        ));
+        assert!(!stopper.should_stop_with_entropies(&argmax, &ent, &ids, &accept, 1));
+        assert!(!stopper.should_stop_with_entropies(&argmax, &ent, &ids, &accept, 2));
 
         stopper.reset();
         let ent = vec![0.001f32; 256];
@@ -843,28 +807,27 @@ mod tests {
 
     #[test]
     fn stopper_accept_plateau_triggers_early() {
-        let mut stopper =
-            StableConfidentStopper::with_plateau(usize::MAX, f32::MAX, 2, 0.05, 1);
+        let mut stopper = StableConfidentStopper::with_plateau(usize::MAX, f32::MAX, 2, 0.05, 1);
         let argmax = vec![42u32; 256];
         let ids = vec![42u32; 256];
         let ent = vec![0.01f32; 256];
-        let accept = vec![1u32; 40].into_iter().chain(vec![0u32; 216]).collect::<Vec<_>>();
-        assert!(!stopper.should_stop_with_entropies(
-            &argmax, &ent, &ids, &accept, 1
-        ));
-        assert!(!stopper.should_stop_with_entropies(
-            &argmax, &ent, &ids, &accept, 2
-        ));
-        assert!(stopper.should_stop_with_entropies(
-            &argmax, &ent, &ids, &accept, 3
-        ));
+        let accept = vec![1u32; 40]
+            .into_iter()
+            .chain(vec![0u32; 216])
+            .collect::<Vec<_>>();
+        assert!(!stopper.should_stop_with_entropies(&argmax, &ent, &ids, &accept, 1));
+        assert!(!stopper.should_stop_with_entropies(&argmax, &ent, &ids, &accept, 2));
+        assert!(stopper.should_stop_with_entropies(&argmax, &ent, &ids, &accept, 3));
     }
 
     #[test]
     fn accept_mask_sig_differs_when_count_matches() {
         let a = vec![1u32, 0, 1, 0];
         let b = vec![1u32, 1, 0, 0];
-        assert_eq!(a.iter().filter(|&&x| x != 0).count(), b.iter().filter(|&&x| x != 0).count());
+        assert_eq!(
+            a.iter().filter(|&&x| x != 0).count(),
+            b.iter().filter(|&&x| x != 0).count()
+        );
         assert_ne!(accept_mask_sig(&a), accept_mask_sig(&b));
     }
 

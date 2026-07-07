@@ -6,14 +6,14 @@
 use crate::safetensors::Error;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::{NSArray, NSURL, NSString};
+use objc2_foundation::{NSArray, NSString, NSURL};
 use objc2_metal::{
     MTLBinaryArchive, MTLBinaryArchiveDescriptor, MTLComputePipelineDescriptor,
     MTLComputePipelineState, MTLDevice, MTLFunction, MTLPipelineOption,
 };
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 const CACHE_BUNDLE_TAG: &str = "diffgemma-mps-v8-stacked-seg-fc";
 
@@ -137,7 +137,8 @@ static GLOBAL_CACHE: OnceLock<Result<Arc<PipelineArchiveCache>, String>> = OnceL
 
 impl PipelineArchiveCache {
     pub fn shared(device: &ProtocolObject<dyn MTLDevice>) -> Result<Arc<Self>, Error> {
-        match GLOBAL_CACHE.get_or_init(|| Self::open(device).map(Arc::new).map_err(|e| e.to_string()))
+        match GLOBAL_CACHE
+            .get_or_init(|| Self::open(device).map(Arc::new).map_err(|e| e.to_string()))
         {
             Ok(c) => Ok(Arc::clone(c)),
             Err(msg) => Err(Error::NotFound(msg.clone())),
@@ -157,9 +158,8 @@ impl PipelineArchiveCache {
         }
 
         let cache_dir = cache_root_dir();
-        std::fs::create_dir_all(&cache_dir).map_err(|e| {
-            Error::NotFound(format!("metal pipeline cache mkdir failed: {e}"))
-        })?;
+        std::fs::create_dir_all(&cache_dir)
+            .map_err(|e| Error::NotFound(format!("metal pipeline cache mkdir failed: {e}")))?;
 
         let device_name = sanitize_device_name(&device.name().to_string());
         let token = shader_bundle_token();

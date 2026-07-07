@@ -61,7 +61,6 @@ impl GpuLinearWeight {
             Self::Q8(w) => w.out_dim,
         }
     }
-
 }
 
 /// GPU linear weight in PyTorch `[out_dim, in_dim]` bf16 layout (no transpose).
@@ -324,16 +323,7 @@ pub fn f32_q4_linear_gpu_bufs(
     let buf_c = batch.alloc_f32_out(m * n)?;
     let (buf_w, off) = w.weight_buffer();
     if w.is_nvfp4() {
-        batch.dispatch_nvfp4_linear(
-            &nvfp4_pipeline.pipeline,
-            x_buf,
-            buf_w,
-            off,
-            &buf_c,
-            m,
-            n,
-            k,
-        );
+        batch.dispatch_nvfp4_linear(&nvfp4_pipeline.pipeline, x_buf, buf_w, off, &buf_c, m, n, k);
     } else {
         batch.dispatch_q4_linear(
             &q4_pipeline.pipeline,
@@ -361,16 +351,7 @@ pub fn f32_q8_linear_gpu_bufs(
 ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
     let buf_c = batch.alloc_f32_out(m * n)?;
     let (buf_w, off) = w.weight_buffer();
-    batch.dispatch_q8_linear(
-        &q8_pipeline.pipeline,
-        x_buf,
-        buf_w,
-        off,
-        &buf_c,
-        m,
-        n,
-        k,
-    );
+    batch.dispatch_q8_linear(&q8_pipeline.pipeline, x_buf, buf_w, off, &buf_c, m, n, k);
     Ok(buf_c)
 }
 
@@ -386,15 +367,6 @@ pub fn f32_q8_linear_kxn_gpu_bufs(
 ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
     let buf_c = batch.alloc_f32_out(m * n)?;
     let (buf_w, off) = w.weight_buffer();
-    batch.dispatch_q8_linear(
-        &q8_pipeline.pipeline,
-        x_buf,
-        buf_w,
-        off,
-        &buf_c,
-        m,
-        n,
-        k,
-    );
+    batch.dispatch_q8_linear(&q8_pipeline.pipeline, x_buf, buf_w, off, &buf_c, m, n, k);
     Ok(buf_c)
 }

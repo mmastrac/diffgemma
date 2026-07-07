@@ -1,8 +1,8 @@
 //! GPU MoE router: RMSNorm → scale → linear → top-k → softmax(top-k).
 
 use crate::config::TextConfig;
-use crate::metal::batched_kernels::{self as bk, f32_f32_linear_gpu_bufs};
 use crate::metal::batch::GpuBatch;
+use crate::metal::batched_kernels::{self as bk, f32_f32_linear_gpu_bufs};
 use crate::metal::kernels::GpuKernels;
 use crate::metal::weights::GpuLayerWeightCache;
 use crate::model::moe::RouteResult;
@@ -65,19 +65,14 @@ pub fn route_gpu_in_batch(
     let eps = cfg.rms_norm_eps as f32;
     let root = (hidden as f32).powf(-0.5);
 
-    if route_scratch.indices.len() != seq_len * top_k || route_scratch.weights.len() != seq_len * top_k
+    if route_scratch.indices.len() != seq_len * top_k
+        || route_scratch.weights.len() != seq_len * top_k
     {
         return Err(Error::Format("route scratch size mismatch"));
     }
 
-    let buf_router_in = bk::rms_norm_rows_no_scale_gpu_buf(
-        batch,
-        kernels,
-        residual_buf,
-        seq_len,
-        hidden,
-        eps,
-    )?;
+    let buf_router_in =
+        bk::rms_norm_rows_no_scale_gpu_buf(batch, kernels, residual_buf, seq_len, hidden, eps)?;
     bk::router_scale_rows_gpu_buf(
         batch,
         kernels,
@@ -125,8 +120,8 @@ mod tests {
     use super::*;
     use crate::metal::batch::GpuBatch;
     use crate::metal::buffer::BufferPool;
-        use crate::metal::engine::GpuDecoderEngine;
-    use crate::model::moe::{route_with_cached_weights, MoeScratch};
+    use crate::metal::engine::GpuDecoderEngine;
+    use crate::model::moe::{MoeScratch, route_with_cached_weights};
     use crate::weights::WeightStore;
 
     fn open_model() -> Option<(WeightStore, crate::config::TextConfig)> {
@@ -173,8 +168,9 @@ mod tests {
         )
         .expect("cpu route");
 
-        let mut batch = GpuBatch::begin_with_telemetry(&engine.ctx.queue, &mut pool, &engine.ctx.device, None)
-            .expect("batch");
+        let mut batch =
+            GpuBatch::begin_with_telemetry(&engine.ctx.queue, &mut pool, &engine.ctx.device, None)
+                .expect("batch");
         let buf_res = batch.alloc_f32(&residual).expect("buf");
         let mut route_scratch = GpuRouteScratch::new(seq_len, text.top_k_experts);
         route_gpu_in_batch(
@@ -207,7 +203,8 @@ mod tests {
             assert!(
                 max_w_err < 0.25,
                 "route weight drift too large: max_err={max_w_err} gpu={:?} cpu={:?}",
-                g.weights, c.weights
+                g.weights,
+                c.weights
             );
         }
     }

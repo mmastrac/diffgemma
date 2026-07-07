@@ -1,9 +1,12 @@
 //! Safetensors → `.dgq` offline quantizer (always from raw bf16 weights).
 
-use crate::dgq::block::{quantize_bf16_matrix_q4, quantize_bf16_matrix_q6, quantize_bf16_matrix_q8, quantize_expert_stack_q4, quantize_expert_stack_q6};
+use crate::dgq::block::{
+    quantize_bf16_matrix_q4, quantize_bf16_matrix_q6, quantize_bf16_matrix_q8,
+    quantize_expert_stack_q4, quantize_expert_stack_q6,
+};
 use crate::dgq::layout::{
-    align_offset, classify_tensor, dgq_version_for_profile, DgqManifest, DgqTensorEntry,
-    DgqTensorMeta, QuantKind, QuantProfile, BLOB_FILE, MANIFEST_FILE,
+    BLOB_FILE, DgqManifest, DgqTensorEntry, DgqTensorMeta, MANIFEST_FILE, QuantKind, QuantProfile,
+    align_offset, classify_tensor, dgq_version_for_profile,
 };
 use crate::dgq::nvfp4::{quantize_bf16_matrix_nvfp4, quantize_expert_stack_nvfp4};
 use crate::safetensors::Error;
@@ -155,8 +158,7 @@ fn write_q6_tensor(out: &mut impl Write, src: &[u8], shape: &[i64]) -> Result<u6
             let in_dim = shape[1] as usize;
             let need = crate::dgq::layout::q6_matrix_bytes(out_dim, in_dim);
             let mut buf = vec![0u8; need];
-            quantize_bf16_matrix_q6(src, out_dim, in_dim, &mut buf)
-;
+            quantize_bf16_matrix_q6(src, out_dim, in_dim, &mut buf);
             out.write_all(&buf)?;
             Ok(need as u64)
         }

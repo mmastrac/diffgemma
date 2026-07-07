@@ -148,13 +148,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
     enc.setComputePipelineState(&pipeline.pipeline);
     bind_gpu_buffers(
-        &enc,
-        &buf_a,
-        &buf_w,
-        &buf_c,
-        f.m as u32,
-        f.n as u32,
-        f.k as u32,
+        &enc, &buf_a, &buf_w, &buf_c, f.m as u32, f.n as u32, f.k as u32,
     );
     enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
     enc.endEncoding();

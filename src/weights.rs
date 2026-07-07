@@ -1,5 +1,5 @@
-use crate::dgq::store::looks_like_dgq_dir;
 use crate::dgq::DgqStore;
+use crate::dgq::store::looks_like_dgq_dir;
 use crate::pack::PackedStore;
 use crate::safetensors::{Error, SafetensorsFile, TensorInfo};
 use crate::tensor::TensorView;
@@ -198,7 +198,11 @@ pub(crate) fn format_shape(shape: &[i64]) -> String {
     } else {
         format!(
             "[{}]",
-            shape.iter().map(i64::to_string).collect::<Vec<_>>().join(", ")
+            shape
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
         )
     }
 }

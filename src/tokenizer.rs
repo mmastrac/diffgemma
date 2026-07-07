@@ -255,7 +255,11 @@ impl Tokenizer {
             let left = symbols[i].id;
             let right = symbols[i + 1].id;
             if let Some(&(rank, new_id)) = self.merge_ranks.get(&(left, right)) {
-                heap.push(MergeJob { rank, pos: i, new_id });
+                heap.push(MergeJob {
+                    rank,
+                    pos: i,
+                    new_id,
+                });
             }
         }
 

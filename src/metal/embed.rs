@@ -1,8 +1,8 @@
 //! Soft embeddings and related GPU embed ops (`.dgq` q8 table).
 
 use crate::kernels::sub::{gather_prob_cols, softmax_rows, vec_fill_zero, vec_scale_inplace};
+use crate::metal::batch::{GpuBatch, begin_engine_batch};
 use crate::metal::batched_kernels as bk;
-use crate::metal::batch::{begin_engine_batch, GpuBatch};
 use crate::metal::dgq_gpu::Q8LinearGpu;
 use crate::metal::engine::GpuDecoderEngine;
 use crate::metal::kernels::GpuKernels;
@@ -168,12 +168,7 @@ pub fn gather_prob_cols_gpu_buf(
 ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
     let buf_out = batch.alloc_f32_out(seq_len * chunk)?;
     let buf_dump = batch.alloc_f32_out(1)?;
-    let params = [
-        seq_len as u32,
-        vocab as u32,
-        v0 as u32,
-        chunk as u32,
-    ];
+    let params = [seq_len as u32, vocab as u32, v0 as u32, chunk as u32];
     let (grid, tg) = gather_prob_cols::dispatch_shape(seq_len, chunk);
     batch.dispatch_with_grid(&kernels.gather_prob_cols.pipeline, grid, tg, |enc| {
         gather_prob_cols::bind_gpu_buffers(&enc, probs, &buf_out, &buf_dump, &params);
@@ -400,10 +395,7 @@ pub fn embed_token_ids_q8_gpu(
         telemetry,
     )?;
     let buf_ids = batch.alloc_bytes(unsafe {
-        std::slice::from_raw_parts(
-            token_ids.as_ptr() as *const u8,
-            token_ids.len() * 4,
-        )
+        std::slice::from_raw_parts(token_ids.as_ptr() as *const u8, token_ids.len() * 4)
     })?;
     let half_len = len * 2;
     let buf_half = batch
@@ -414,25 +406,20 @@ pub fn embed_token_ids_q8_gpu(
 
     let w_off = embed.byte_offset;
     let (grid, tg) = embed_gather::dispatch_shape(hidden, seq_len);
-    batch.dispatch_with_grid(
-        &embed_pipeline,
-        grid,
-        tg,
-        |enc| {
-            embed_gather::bind_gpu_buffers(
-                enc,
-                blob,
-                &buf_ids,
-                &buf_half,
-                w_off,
-                hidden as u32,
-                seq_len as u32,
-                EMBED_SCALE,
-                embed.out_dim as u32,
-                None,
-            );
-        },
-    );
+    batch.dispatch_with_grid(&embed_pipeline, grid, tg, |enc| {
+        embed_gather::bind_gpu_buffers(
+            enc,
+            blob,
+            &buf_ids,
+            &buf_half,
+            w_off,
+            hidden as u32,
+            seq_len as u32,
+            EMBED_SCALE,
+            embed.out_dim as u32,
+            None,
+        );
+    });
 
     let base = 0u32;
     let len_u32 = len as u32;

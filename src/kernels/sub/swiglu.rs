@@ -3,8 +3,8 @@
 use super::bf16;
 use super::f16;
 use super::gpu_common;
-use super::test_util::ElemFormat;
 use super::manifest::{self, SwigluSplitVariant};
+use super::test_util::ElemFormat;
 use super::variant::KernelVariant;
 use crate::kernels::cpu::{gelu_pytorch_tanh, gelu_pytorch_tanh_f32};
 use crate::safetensors::Error;
@@ -258,10 +258,16 @@ fn gpu_split(
     let pipeline = pipeline_for(&ctx, split, variant)?;
     let mut pool = BufferPool::new();
     let len = f.len();
-    let buf_g = pool.allocate(&ctx.device, len * 4).ok_or(Error::Format("alloc"))?;
-    let buf_u = pool.allocate(&ctx.device, len * 4).ok_or(Error::Format("alloc"))?;
+    let buf_g = pool
+        .allocate(&ctx.device, len * 4)
+        .ok_or(Error::Format("alloc"))?;
+    let buf_u = pool
+        .allocate(&ctx.device, len * 4)
+        .ok_or(Error::Format("alloc"))?;
     let dump_bytes = if variant.dump_stage > 0 { len * 4 } else { 4 };
-    let buf_dump = pool.allocate(&ctx.device, dump_bytes).ok_or(Error::Format("alloc"))?;
+    let buf_dump = pool
+        .allocate(&ctx.device, dump_bytes)
+        .ok_or(Error::Format("alloc"))?;
     BufferPool::write_f32(&buf_g, &f.gate);
     BufferPool::write_f32(&buf_u, &f.up);
     let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
@@ -303,22 +309,23 @@ pub fn gpu_half_glu(f: &HalfFixture, variant: KernelVariant) -> Result<Vec<f32>,
     let pipeline = pipeline_for(&ctx, SwigluSplitVariant::MONOLITH_GLU, variant)?;
     let mut pool = BufferPool::new();
     let len = f.len();
-    let buf_g = pool.allocate(&ctx.device, len * 2).ok_or(Error::Format("alloc"))?;
-    let buf_u = pool.allocate(&ctx.device, len * 2).ok_or(Error::Format("alloc"))?;
-    let buf_y = pool.allocate(&ctx.device, len * 2).ok_or(Error::Format("alloc"))?;
+    let buf_g = pool
+        .allocate(&ctx.device, len * 2)
+        .ok_or(Error::Format("alloc"))?;
+    let buf_u = pool
+        .allocate(&ctx.device, len * 2)
+        .ok_or(Error::Format("alloc"))?;
+    let buf_y = pool
+        .allocate(&ctx.device, len * 2)
+        .ok_or(Error::Format("alloc"))?;
     let dump_bytes = if variant.dump_stage > 0 { len * 4 } else { 4 };
-    let buf_d = pool.allocate(&ctx.device, dump_bytes).ok_or(Error::Format("alloc"))?;
+    let buf_d = pool
+        .allocate(&ctx.device, dump_bytes)
+        .ok_or(Error::Format("alloc"))?;
     BufferPool::write_bf16(&buf_g, &bf16::f32_slice_to_bf16_bits(&f.gate));
     BufferPool::write_bf16(&buf_u, &bf16::f32_slice_to_bf16_bits(&f.up));
     gpu_common::dispatch_1d(&ctx.queue, &pipeline.pipeline, len, |enc| {
-        bind_split_half(
-            enc,
-            &buf_g,
-            &buf_u,
-            &buf_y,
-            &buf_d,
-            len as u32,
-        );
+        bind_split_half(enc, &buf_g, &buf_u, &buf_y, &buf_d, len as u32);
     })?;
     let ptr = buf_y.contents().as_ptr() as *const u16;
     Ok((0..len)
@@ -337,14 +344,20 @@ pub fn gpu_interleaved(f: &InterleavedFixture, variant: KernelVariant) -> Result
     let mut pool = BufferPool::new();
     let in_len = f.gate_up.len();
     let out_len = f.out_len();
-    let buf_in = pool.allocate(&ctx.device, in_len * 4).ok_or(Error::Format("alloc"))?;
-    let buf_out = pool.allocate(&ctx.device, out_len * 4).ok_or(Error::Format("alloc"))?;
+    let buf_in = pool
+        .allocate(&ctx.device, in_len * 4)
+        .ok_or(Error::Format("alloc"))?;
+    let buf_out = pool
+        .allocate(&ctx.device, out_len * 4)
+        .ok_or(Error::Format("alloc"))?;
     let dump_bytes = if variant.dump_stage > 0 {
         out_len * 4
     } else {
         4
     };
-    let buf_dump = pool.allocate(&ctx.device, dump_bytes).ok_or(Error::Format("alloc"))?;
+    let buf_dump = pool
+        .allocate(&ctx.device, dump_bytes)
+        .ok_or(Error::Format("alloc"))?;
     BufferPool::write_f32(&buf_in, &f.gate_up);
     let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
     let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;

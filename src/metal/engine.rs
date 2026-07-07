@@ -53,11 +53,12 @@ impl GpuDecoderEngine {
             crate::kernels::sub::QuantFormat::NvFp4,
             prod,
         )?;
-        let f32_q4_linear_grouped_pipeline = crate::kernels::sub::gemm_linear_grouped::pipeline_for(
-            &ctx,
-            crate::kernels::sub::QuantFormat::Q4Affine,
-            prod,
-        )?;
+        let f32_q4_linear_grouped_pipeline =
+            crate::kernels::sub::gemm_linear_grouped::pipeline_for(
+                &ctx,
+                crate::kernels::sub::QuantFormat::Q4Affine,
+                prod,
+            )?;
         let f32_nvfp4_linear_grouped_pipeline =
             crate::kernels::sub::gemm_linear_grouped::pipeline_for(
                 &ctx,
@@ -125,8 +126,7 @@ impl GpuDecoderEngine {
     }
 
     pub fn batch_telemetry(&self) -> Option<Rc<RefCell<ForwardTelemetry>>> {
-        self.telemetry_enabled()
-            .then(|| self.telemetry_handle())
+        self.telemetry_enabled().then(|| self.telemetry_handle())
     }
 
     pub fn encoder_gpu_moe(&self) -> bool {

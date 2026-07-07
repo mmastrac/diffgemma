@@ -4,15 +4,13 @@ use crate::metal::attention_batch::{
     decoder_gqa_gpu_kv_batched_chained_qbuf, dispatch_copy_f32_to_buf, gqa_batched_chained,
     rope_qk_batched,
 };
-use crate::metal::batched_kernels::{self as bk};
 use crate::metal::batch::begin_engine_batch;
+use crate::metal::batched_kernels::{self as bk};
 use crate::metal::engine::GpuDecoderEngine;
 use crate::metal::kv_cache::GpuKvCache;
 use crate::metal::linear::{linear_cached_batched_in_buf, linear_cached_batched_in_cpu_out};
 use crate::metal::weights::GpuLayerWeightCache;
-use crate::model::attention::{
-    concat_kv_for_decoder, AttentionParams, AttentionScratch, GqaMask,
-};
+use crate::model::attention::{AttentionParams, AttentionScratch, GqaMask, concat_kv_for_decoder};
 use crate::model::kv_cache::LayerKvView;
 use crate::model::mask::DecoderAttnMask;
 use crate::safetensors::Error;
@@ -71,7 +69,7 @@ fn fused_input_qkv_heads(
             &engine.f32_bf16_linear_pipeline,
             &engine.f32_q4_linear_pipeline,
             &engine.f32_nvfp4_linear_pipeline,
-        &engine.f32_q8_linear_pipeline,
+            &engine.f32_q8_linear_pipeline,
             &buf_normed,
             v_proj,
             seq_len,
@@ -201,14 +199,7 @@ fn encode_input_qkv_gpu_bufs(
         head_dim,
         eps,
     )?;
-    let buf_v = bk::rms_norm_rows_no_scale_gpu_buf(
-        batch,
-        kernels,
-        &buf_v,
-        kv_rows,
-        head_dim,
-        eps,
-    )?;
+    let buf_v = bk::rms_norm_rows_no_scale_gpu_buf(batch, kernels, &buf_v, kv_rows, head_dim, eps)?;
     Ok((buf_q, buf_k, buf_v))
 }
 
@@ -286,14 +277,7 @@ pub(crate) fn encode_fused_gpu_kv_attention_buf(
         mask,
     )?;
     linear_cached_batched_in_buf(
-        batch,
-        f32_bf16,
-        f32_q4,
-        f32_nvfp4,
-        f32_q8,
-        &buf_attn,
-        o_proj,
-        seq_len,
+        batch, f32_bf16, f32_q4, f32_nvfp4, f32_q8, &buf_attn, o_proj, seq_len,
     )
 }
 
@@ -382,9 +366,7 @@ pub fn forward_decoder_attention(
     let rope_kind = rope_kind_for_layer(cfg, layer).ok_or(Error::Format("rope kind"))?;
     compute_rope_freqs(&mut scratch.rope_freqs, positions, rope_kind);
 
-    let use_gpu_kv = gpu_kv
-        .map(|g| g.kv_len == kv.kv_len)
-        .unwrap_or(false);
+    let use_gpu_kv = gpu_kv.map(|g| g.kv_len == kv.kv_len).unwrap_or(false);
 
     let default_mask;
     let gqa_mask = match mask {

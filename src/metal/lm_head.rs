@@ -1,6 +1,6 @@
 //! Tied lm_head on GPU (q8 embed weights from `.dgq` blob).
 
-use crate::metal::batch::{set_bytes, GpuBatch};
+use crate::metal::batch::{GpuBatch, set_bytes};
 use crate::metal::device::ComputePipeline;
 use crate::metal::dgq_gpu::Q8LinearGpu;
 use crate::metal::linear::f32_q8_linear_gpu_bufs;
@@ -88,12 +88,7 @@ pub fn lm_head_tied_q8_gpu_buf(
             hidden_dim,
             chunk,
         )?;
-        let params = [
-            seq_len as u32,
-            chunk as u32,
-            v0 as u32,
-            vocab_size as u32,
-        ];
+        let params = [seq_len as u32, chunk as u32, v0 as u32, vocab_size as u32];
         let tg_w = 16usize;
         let tg_h = 16usize;
         let grid = objc2_metal::MTLSize {
@@ -106,13 +101,18 @@ pub fn lm_head_tied_q8_gpu_buf(
             height: tg_h,
             depth: 1,
         };
-        batch.dispatch_with_grid(&sampler_kernels.scatter_vocab_chunk.pipeline, grid, tg, |enc| {
-            unsafe {
-                enc.setBuffer_offset_atIndex(Some(&buf_c), 0, 0);
-                enc.setBuffer_offset_atIndex(Some(buf_logits), 0, 1);
-            }
-            set_bytes(enc, &params, 2);
-        });
+        batch.dispatch_with_grid(
+            &sampler_kernels.scatter_vocab_chunk.pipeline,
+            grid,
+            tg,
+            |enc| {
+                unsafe {
+                    enc.setBuffer_offset_atIndex(Some(&buf_c), 0, 0);
+                    enc.setBuffer_offset_atIndex(Some(buf_logits), 0, 1);
+                }
+                set_bytes(enc, &params, 2);
+            },
+        );
     }
     Ok(())
 }
@@ -135,10 +135,10 @@ mod tests {
     use crate::metal::batch::GpuBatch;
     use crate::metal::buffer::{BufferPool, BufferPool as BP};
     use crate::metal::device::MetalContext;
-    use crate::metal::dgq_gpu::{load_q8_linear, DgqGpuBlob};
+    use crate::metal::dgq_gpu::{DgqGpuBlob, load_q8_linear};
+    use crate::metal::kernels::GpuKernels;
     use crate::metal::sampler::GpuLogitsBuf;
     use crate::metal::sampler_kernels::GpuSamplerKernels;
-    use crate::metal::kernels::GpuKernels;
     use std::sync::Arc;
 
     #[test]
@@ -151,8 +151,12 @@ mod tests {
         let store = DgqStore::open(dgq_dir).expect("open dgq");
         let ctx = MetalContext::new().expect("metal");
         let blob = DgqGpuBlob::from_store(&store, &ctx.device).expect("blob");
-        let embed = load_q8_linear(&store, Arc::clone(&blob), "model.decoder.embed_tokens.weight")
-            .expect("embed");
+        let embed = load_q8_linear(
+            &store,
+            Arc::clone(&blob),
+            "model.decoder.embed_tokens.weight",
+        )
+        .expect("embed");
         let seq_len = 2usize;
         let hidden = embed.in_dim;
         let vocab = embed.out_dim;
@@ -168,7 +172,8 @@ mod tests {
         let kernels = GpuKernels::new(&ctx).expect("kernels");
 
         let mut cpu_logits = vec![0.0f32; seq_len * vocab];
-        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None).expect("batch");
+        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None)
+            .expect("batch");
         lm_head_tied_q8_gpu(
             &mut batch,
             &q8_pipeline,
@@ -186,7 +191,8 @@ mod tests {
         logits_buf
             .ensure(&ctx.device, &mut pool, seq_len * vocab)
             .expect("ensure");
-        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None).expect("batch");
+        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None)
+            .expect("batch");
         lm_head_tied_q8_gpu_buf(
             &mut batch,
             &q8_pipeline,

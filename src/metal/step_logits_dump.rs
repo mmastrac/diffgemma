@@ -1,8 +1,8 @@
 //! Step-1 logit row dumps for MLX parity (post-softcap, pre/post temperature).
 
 use crate::metal::step_kernel::{
-    run_step_forward, run_step_layer_hidden_probe, scheduled_temperature, LayerHiddenProbeResult,
-    StepFinishMode, StepForwardOutput, StepSmokeConfig, CANVAS, HID, VOCAB,
+    CANVAS, HID, LayerHiddenProbeResult, StepFinishMode, StepForwardOutput, StepSmokeConfig, VOCAB,
+    run_step_forward, run_step_layer_hidden_probe, scheduled_temperature,
 };
 use crate::safetensors::Error;
 use crate::sample::{self, SamplerConfig};
@@ -84,8 +84,7 @@ fn top_k_tempered(row: &[f32], temperature: f32, k: usize) -> Vec<TopKEntry> {
         .map(|(i, &raw)| (i as u32, raw, raw / t))
         .collect();
     scored.sort_by(|a, b| {
-        b.2
-            .partial_cmp(&a.2)
+        b.2.partial_cmp(&a.2)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.0.cmp(&b.0))
     });
@@ -188,11 +187,11 @@ pub fn run_step_bf16_oracle_logits_dump(
     positions: &[usize],
     top_k: usize,
 ) -> Result<StepLogitsDump, Error> {
-    use crate::model::decoder::{forward, DecoderForwardInput, DecoderScratch};
-    use crate::model::encoder::{prefill, EncoderPrefillInput, EncoderScratch};
-    use crate::model::mask::DecoderAttnMask;
-    use crate::model::Model;
     use crate::metal::step_kernel::init_canvas_state;
+    use crate::model::Model;
+    use crate::model::decoder::{DecoderForwardInput, DecoderScratch, forward};
+    use crate::model::encoder::{EncoderPrefillInput, EncoderScratch, prefill};
+    use crate::model::mask::DecoderAttnMask;
 
     let model = Model::open(bf16_dir)?;
     if model.weights.is_quantized() {
@@ -204,7 +203,10 @@ pub fn run_step_bf16_oracle_logits_dump(
         .prefill_token_ids
         .as_ref()
         .ok_or_else(|| Error::Format("bf16 oracle dump requires prefill token ids"))?;
-    let layers = cfg.layers.min(model.config.text_config.num_hidden_layers).max(1);
+    let layers = cfg
+        .layers
+        .min(model.config.text_config.num_hidden_layers)
+        .max(1);
     let kv_len = prompt.len();
     let mut enc_scratch = EncoderScratch::new(kv_len.max(CANVAS), &model.config);
     let prefill_out = prefill(
@@ -257,18 +259,16 @@ pub fn run_step_bf16_oracle_logits_dump_gpu_kv(
     positions: &[usize],
     top_k: usize,
 ) -> Result<StepLogitsDump, Error> {
-    use crate::model::decoder::{forward, DecoderForwardInput, DecoderScratch};
-    use crate::model::mask::DecoderAttnMask;
-    use crate::model::Model;
-    use crate::metal::step_kernel::{
-        build_layout, build_offsets_from_store, init_canvas_state,
-    };
-    use crate::metal::step_kv::{
-        prefill_monolithic_kv_with_cache, read_monolithic_kv_prefix_to_cpu_cache,
-        MonolithicEncoderCache, kv_cache_total_bytes,
-    };
     use crate::dgq::DgqStore;
     use crate::metal::device::MetalContext;
+    use crate::metal::step_kernel::{build_layout, build_offsets_from_store, init_canvas_state};
+    use crate::metal::step_kv::{
+        MonolithicEncoderCache, kv_cache_total_bytes, prefill_monolithic_kv_with_cache,
+        read_monolithic_kv_prefix_to_cpu_cache,
+    };
+    use crate::model::Model;
+    use crate::model::decoder::{DecoderForwardInput, DecoderScratch, forward};
+    use crate::model::mask::DecoderAttnMask;
     use objc2_metal::{MTLDevice, MTLResourceOptions};
 
     let model = Model::open(bf16_dir)?;
@@ -281,7 +281,10 @@ pub fn run_step_bf16_oracle_logits_dump_gpu_kv(
         .prefill_token_ids
         .as_ref()
         .ok_or_else(|| Error::Format("bf16 gpu-kv oracle requires prefill token ids"))?;
-    let layers = cfg.layers.min(model.config.text_config.num_hidden_layers).max(1);
+    let layers = cfg
+        .layers
+        .min(model.config.text_config.num_hidden_layers)
+        .max(1);
     let max_seq = cfg.max_seq.max(prompt.len()).max(CANVAS);
     let dgq_store = DgqStore::open(dgq_dir)?;
     let layout = build_layout(&build_offsets_from_store(&dgq_store), max_seq);
@@ -291,8 +294,7 @@ pub fn run_step_bf16_oracle_logits_dump_gpu_kv(
         .device
         .newBufferWithLength_options(kv_bytes, MTLResourceOptions::StorageModeShared)
         .ok_or(Error::Format("gpu-kv oracle buffer alloc failed"))?;
-    let mut enc_cache =
-        MonolithicEncoderCache::open_opt(dgq_dir, CANVAS, max_seq, None)?;
+    let mut enc_cache = MonolithicEncoderCache::open_opt(dgq_dir, CANVAS, max_seq, None)?;
     let (kv_len, _) = prefill_monolithic_kv_with_cache(
         &mut enc_cache,
         prompt,
@@ -301,12 +303,8 @@ pub fn run_step_bf16_oracle_logits_dump_gpu_kv(
         max_seq,
         layers,
     )?;
-    let kv_cache = read_monolithic_kv_prefix_to_cpu_cache(
-        &gpu_buf,
-        &layout,
-        &model.config,
-        kv_len,
-    )?;
+    let kv_cache =
+        read_monolithic_kv_prefix_to_cpu_cache(&gpu_buf, &layout, &model.config, kv_len)?;
     let canvas = init_canvas_state(cfg.seed, VOCAB);
     let token_ids: Vec<u32> = canvas.ids.to_vec();
     let mask = DecoderAttnMask::all_valid(CANVAS, kv_len);

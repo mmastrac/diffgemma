@@ -1,10 +1,10 @@
 //! Stacked-segment Q4 GEMM: one input tile load, multiple weight/output segments (QKV, gate+up).
 
+use super::QuantFormat;
 use super::bf16;
 use super::gemm_common;
 use super::gpu_common;
 use super::test_util::ElemFormat;
-use super::QuantFormat;
 use crate::dgq::block::{q4_gemm_cpu, quantize_row_q4};
 use crate::dgq::layout::{q4_matrix_bytes, q4_row_bytes};
 use crate::safetensors::Error;
@@ -170,7 +170,11 @@ fn quantize_f32_matrix_q4(rows: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
     let row_bytes = q4_row_bytes(in_dim);
     for row in 0..out_dim {
         let off = row * in_dim;
-        quantize_row_q4(&rows[off..off + in_dim], in_dim, &mut dst[row * row_bytes..]);
+        quantize_row_q4(
+            &rows[off..off + in_dim],
+            in_dim,
+            &mut dst[row * row_bytes..],
+        );
     }
     dst
 }
@@ -362,8 +366,9 @@ pub fn stacked_pipeline_for(
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
 
-    static CACHE: OnceLock<Mutex<HashMap<StackedPipelineKey, std::sync::Arc<crate::metal::device::ComputePipeline>>>> =
-        OnceLock::new();
+    static CACHE: OnceLock<
+        Mutex<HashMap<StackedPipelineKey, std::sync::Arc<crate::metal::device::ComputePipeline>>>,
+    > = OnceLock::new();
     let stacked = StackedSegFc::from_segments(segs)?;
     let key = StackedPipelineKey::new(n, k, format, stacked);
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -409,7 +414,10 @@ pub fn bind_gpu_buffers(
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
-pub fn gpu_q4(f: &StackedFixture, _variant: super::variant::KernelVariant) -> Result<Vec<f32>, Error> {
+pub fn gpu_q4(
+    f: &StackedFixture,
+    _variant: super::variant::KernelVariant,
+) -> Result<Vec<f32>, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
 
@@ -769,7 +777,9 @@ mod tests {
         let offsets = build_offsets_from_store(&store);
         let layer = 0usize;
         let gate_off = *offsets
-            .get(&format!("model.decoder.layers.{layer}.mlp.gate_proj.weight"))
+            .get(&format!(
+                "model.decoder.layers.{layer}.mlp.gate_proj.weight"
+            ))
             .expect("gate");
         let up_off = *offsets
             .get(&format!("model.decoder.layers.{layer}.mlp.up_proj.weight"))
@@ -807,8 +817,12 @@ mod tests {
         let mut pool = BufferPool::new();
         let gpu_blob = DgqGpuBlob::from_store(&store, &ctx.device).expect("blob");
         let buf_x = pool.allocate(&ctx.device, m * k * 2).expect("x");
-        let buf_y_stacked = pool.allocate(&ctx.device, plane_bytes * 2).expect("y stacked");
-        let buf_y_split = pool.allocate(&ctx.device, plane_bytes * 2).expect("y split");
+        let buf_y_stacked = pool
+            .allocate(&ctx.device, plane_bytes * 2)
+            .expect("y stacked");
+        let buf_y_split = pool
+            .allocate(&ctx.device, plane_bytes * 2)
+            .expect("y split");
         BufferPool::write_bf16(&buf_x, &bf16::f32_slice_to_bf16_bits(&x));
 
         let n_total = (n * 2) as u32;
@@ -877,13 +891,19 @@ mod tests {
         let offsets = build_offsets_from_store(&store);
         let layer = 0usize;
         let q_off = *offsets
-            .get(&format!("model.decoder.layers.{layer}.self_attn.q_proj.weight"))
+            .get(&format!(
+                "model.decoder.layers.{layer}.self_attn.q_proj.weight"
+            ))
             .expect("q");
         let k_off = *offsets
-            .get(&format!("model.decoder.layers.{layer}.self_attn.k_proj.weight"))
+            .get(&format!(
+                "model.decoder.layers.{layer}.self_attn.k_proj.weight"
+            ))
             .expect("k");
         let v_off = *offsets
-            .get(&format!("model.decoder.layers.{layer}.self_attn.v_proj.weight"))
+            .get(&format!(
+                "model.decoder.layers.{layer}.self_attn.v_proj.weight"
+            ))
             .expect("v");
 
         let m = 4usize;

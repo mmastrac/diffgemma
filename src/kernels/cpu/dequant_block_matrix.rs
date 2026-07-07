@@ -1,7 +1,7 @@
 //! CPU oracle for block matrix dequant (`dequant_block_matrix`).
 
 use crate::dgq::block::q4_weight_at;
-use crate::dgq::layout::{nvfp4_matrix_bytes, q4_matrix_bytes, NVFP4_HEADER_BYTES};
+use crate::dgq::layout::{NVFP4_HEADER_BYTES, nvfp4_matrix_bytes, q4_matrix_bytes};
 use crate::dgq::nvfp4::nvfp4_weight_at;
 use crate::kernels::sub::QuantFormat;
 

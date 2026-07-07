@@ -95,11 +95,27 @@ impl std::fmt::Display for Error {
             Self::Json(e) => write!(f, "json error: {e}"),
             Self::Format(msg) => write!(f, "format error: {msg}"),
             Self::NotFound(name) => write!(f, "tensor not found: {name}"),
-            Self::DType { name, expected, got } => {
-                write!(f, "dtype mismatch for {name}: expected {}, got {}", expected.as_str(), got.as_str())
+            Self::DType {
+                name,
+                expected,
+                got,
+            } => {
+                write!(
+                    f,
+                    "dtype mismatch for {name}: expected {}, got {}",
+                    expected.as_str(),
+                    got.as_str()
+                )
             }
-            Self::ShapeMismatch { name, expected, got } => {
-                write!(f, "shape mismatch for {name}: expected {expected:?}, got {got:?}")
+            Self::ShapeMismatch {
+                name,
+                expected,
+                got,
+            } => {
+                write!(
+                    f,
+                    "shape mismatch for {name}: expected {expected:?}, got {got:?}"
+                )
             }
         }
     }

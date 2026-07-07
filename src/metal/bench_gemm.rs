@@ -86,7 +86,9 @@ pub fn bench_gemm_block_q4(shapes: &[GemmShape], iters: usize) -> Result<Vec<Gem
     use crate::kernels::sub::gemm_common;
     use crate::kernels::sub::gemm_q4;
     use crate::metal::device::MetalContext;
-    use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+    use objc2_metal::{
+        MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+    };
 
     let ctx = MetalContext::new()?;
     let warmup = 3usize;
@@ -121,13 +123,8 @@ pub fn bench_gemm_block_q4(shapes: &[GemmShape], iters: usize) -> Result<Vec<Gem
         let (grid, tg) = gemm_common::dispatch_shape(m, n);
 
         let dispatch = |count: usize| -> Result<(), Error> {
-            let cmd = ctx
-                .queue
-                .commandBuffer()
-                .ok_or(Error::Format("cmd"))?;
-            let enc = cmd
-                .computeCommandEncoder()
-                .ok_or(Error::Format("enc"))?;
+            let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
+            let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
             for _ in 0..count {
                 enc.setComputePipelineState(&pipeline.pipeline);
                 gemm_q4::bind_gpu_buffers(&enc, &buf_x, &buf_y, &buf_w, 0, m as u32);
@@ -156,7 +153,6 @@ pub fn bench_gemm_block_q4(shapes: &[GemmShape], iters: usize) -> Result<Vec<Gem
     Ok(rows)
 }
 
-
 /// Tunable GEMM (task #19): sweeps TUNE_BM/TUNE_BN configs via
 /// #define prepend; per-lane fragment loads (no simdgroup_load from tgmem).
 /// Each config is correctness-checked against gemm_block (expected BIT-exact:
@@ -164,7 +160,10 @@ pub fn bench_gemm_block_q4(shapes: &[GemmShape], iters: usize) -> Result<Vec<Gem
 pub fn bench_gemm_tunable(shapes: &[GemmShape], iters: usize) -> Result<Vec<GemmBenchRow>, Error> {
     use crate::kernels::sub::gemm_q4;
     use crate::metal::device::MetalContext;
-    use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize};
+    use objc2_metal::{
+        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+        MTLSize,
+    };
 
     const SHADER_TUNE: &str = shader_include::include_metal!("kernels/gemm_tunable.metal");
     const CONFIGS: &[(usize, usize)] = &[(32, 32), (64, 32), (32, 64), (64, 64), (32, 128)];
@@ -179,7 +178,9 @@ pub fn bench_gemm_tunable(shapes: &[GemmShape], iters: usize) -> Result<Vec<Gemm
             .map(|i| ((i as f32) * 0.0007).cos() * 0.02)
             .collect();
         let fixture = gemm_q4::Fixture {
-            x: (0..m * k).map(|i| ((i as f32) * 0.013).sin() * 0.2).collect(),
+            x: (0..m * k)
+                .map(|i| ((i as f32) * 0.013).sin() * 0.2)
+                .collect(),
             w_f32,
             m,
             n,
@@ -226,8 +227,16 @@ pub fn bench_gemm_tunable(shapes: &[GemmShape], iters: usize) -> Result<Vec<Gemm
                 crate::kernels::sub::QuantFormat::Q4Affine as u32,
                 false,
             )?;
-            let grid = MTLSize { width: n.div_ceil(bn), height: m.div_ceil(bm), depth: 1 };
-            let tg = MTLSize { width: 128, height: 1, depth: 1 };
+            let grid = MTLSize {
+                width: n.div_ceil(bn),
+                height: m.div_ceil(bm),
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            };
             let dispatch = |count: usize| -> Result<(), Error> {
                 let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
                 let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
@@ -286,7 +295,8 @@ pub fn bench_gemm_tunable(shapes: &[GemmShape], iters: usize) -> Result<Vec<Gemm
                 .ok_or(Error::Format("bench tunable wraw"))?;
             BufferPool::write_bf16(&buf_wr, &w_bits);
             {
-                let ref_pipe = crate::kernels::sub::gemm_bf16::pipeline_for(&ctx, n as u32, k as u32)?;
+                let ref_pipe =
+                    crate::kernels::sub::gemm_bf16::pipeline_for(&ctx, n as u32, k as u32)?;
                 let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
                 let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
                 enc.setComputePipelineState(&ref_pipe.pipeline);
@@ -307,8 +317,16 @@ pub fn bench_gemm_tunable(shapes: &[GemmShape], iters: usize) -> Result<Vec<Gemm
                 crate::kernels::sub::QuantFormat::Raw as u32,
                 false,
             )?;
-            let grid = MTLSize { width: n.div_ceil(64), height: m.div_ceil(64), depth: 1 };
-            let tg = MTLSize { width: 128, height: 1, depth: 1 };
+            let grid = MTLSize {
+                width: n.div_ceil(64),
+                height: m.div_ceil(64),
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            };
             let dispatch = |count: usize| -> Result<(), Error> {
                 let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
                 let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
@@ -364,7 +382,9 @@ pub fn bench_gemm_bf16(shapes: &[GemmShape], iters: usize) -> Result<Vec<GemmBen
     use crate::kernels::sub::gemm_common;
     use crate::kernels::sub::gemm_q8;
     use crate::metal::device::MetalContext;
-    use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+    use objc2_metal::{
+        MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+    };
 
     let ctx = MetalContext::new()?;
     let warmup = 3usize;
@@ -500,7 +520,10 @@ fn gflops(m: usize, k: usize, n: usize, iters: usize, secs: f64) -> f64 {
 }
 
 /// Run `bench/mpsgraph_gemm.swift` (MetalPerformanceShaders matmul oracle).
-pub fn bench_mpsgraph_oracle(shapes: &[GemmShape], iters: usize) -> Result<Vec<GemmBenchRow>, Error> {
+pub fn bench_mpsgraph_oracle(
+    shapes: &[GemmShape],
+    iters: usize,
+) -> Result<Vec<GemmBenchRow>, Error> {
     let script = Path::new("bench/mpsgraph_gemm.swift");
     if !script.is_file() {
         return Err(Error::Format(
@@ -561,8 +584,8 @@ pub fn bench_gemm_tunable_sparse(iters: usize) -> Result<Vec<GemmBenchRow>, Erro
     use crate::metal::device::MetalContext;
     use crate::metal::{BlockGroupedJob, RouteScratch};
     use objc2_metal::{
-        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-        MTLComputeCommandEncoder, MTLSize,
+        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+        MTLSize,
     };
 
     let ctx = MetalContext::new()?;
@@ -610,7 +633,10 @@ pub fn bench_gemm_tunable_sparse(iters: usize) -> Result<Vec<GemmBenchRow>, Erro
             })
             .collect();
         let buf_jobs = pool
-            .allocate(&ctx.device, jobs.len() * std::mem::size_of::<BlockGroupedJob>())
+            .allocate(
+                &ctx.device,
+                jobs.len() * std::mem::size_of::<BlockGroupedJob>(),
+            )
             .ok_or(Error::Format("sparse bench jobs"))?;
         BufferPool::write_bytes(&buf_jobs, unsafe {
             std::slice::from_raw_parts(
@@ -623,7 +649,9 @@ pub fn bench_gemm_tunable_sparse(iters: usize) -> Result<Vec<GemmBenchRow>, Erro
             let slots = N_EXPERTS * rpe;
             let shape = GemmShape { m: slots, k, n };
 
-            let a: Vec<f32> = (0..slots * k).map(|i| ((i as f32) * 0.013).sin() * 0.2).collect();
+            let a: Vec<f32> = (0..slots * k)
+                .map(|i| ((i as f32) * 0.013).sin() * 0.2)
+                .collect();
             let buf_a = pool
                 .allocate(&ctx.device, a.len() * 4)
                 .ok_or(Error::Format("sparse bench a"))?;
@@ -692,11 +720,21 @@ pub fn bench_gemm_tunable_sparse(iters: usize) -> Result<Vec<GemmBenchRow>, Erro
                 let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
                 enc.setComputePipelineState(&pipe.pipeline);
                 crate::kernels::sub::gemm_block_grouped::bind_gpu_buffers(
-                    &enc, &buf_a, &buf_w, &buf_ref, &buf_jobs, &buf_rs, &buf_route,
+                    &enc,
+                    &buf_a,
+                    &buf_w,
+                    &buf_ref,
+                    &buf_jobs,
+                    &buf_rs,
+                    &buf_route,
                     N_EXPERTS as u32,
                 );
                 enc.dispatchThreadgroups_threadsPerThreadgroup(
-                    MTLSize { width: n_tiles, height: blocks as usize, depth: 1 },
+                    MTLSize {
+                        width: n_tiles,
+                        height: blocks as usize,
+                        depth: 1,
+                    },
                     MTLSize {
                         width: crate::kernels::sub::gemm_common::THREADS_PER_TG,
                         height: 1,
@@ -740,7 +778,13 @@ pub fn bench_gemm_tunable_sparse(iters: usize) -> Result<Vec<GemmBenchRow>, Erro
                     for _ in 0..count {
                         enc.setComputePipelineState(&pipe.pipeline);
                         crate::kernels::sub::gemm_block_grouped::bind_gpu_buffers(
-                            &enc, &buf_a, &buf_w, &buf_c, &buf_jobs, &buf_rs, &buf_route,
+                            &enc,
+                            &buf_a,
+                            &buf_w,
+                            &buf_c,
+                            &buf_jobs,
+                            &buf_rs,
+                            &buf_route,
                             N_EXPERTS as u32,
                         );
                         enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);

@@ -17,11 +17,7 @@ fn parse_eos_token_ids(value: &serde_json::Value) -> Vec<u32> {
             .collect(),
         _ => Vec::new(),
     };
-    if ids.is_empty() {
-        vec![1]
-    } else {
-        ids
-    }
+    if ids.is_empty() { vec![1] } else { ids }
 }
 
 /// Generation stop-token ids, preferring `generation_config.json`'s
@@ -126,10 +122,7 @@ impl ModelConfig {
     pub fn eos_token_id_u32(&self) -> u32 {
         match &self.eos_token_id {
             serde_json::Value::Number(n) => n.as_u64().unwrap_or(1) as u32,
-            serde_json::Value::Array(a) => a
-                .first()
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1) as u32,
+            serde_json::Value::Array(a) => a.first().and_then(|v| v.as_u64()).unwrap_or(1) as u32,
             _ => 1,
         }
     }
@@ -206,14 +199,26 @@ impl ModelConfig {
         println!("  num_hidden_layers:  {}", t.num_hidden_layers);
         println!("  num_experts:        {}", t.num_experts);
         println!("  top_k_experts:      {}", t.top_k_experts);
-        println!("  attention heads:    {} Q / {} KV ({} global KV)", t.num_attention_heads, t.num_key_value_heads, t.num_global_key_value_heads);
-        println!("  head_dim:           {} (global {})", t.head_dim, t.global_head_dim);
+        println!(
+            "  attention heads:    {} Q / {} KV ({} global KV)",
+            t.num_attention_heads, t.num_key_value_heads, t.num_global_key_value_heads
+        );
+        println!(
+            "  head_dim:           {} (global {})",
+            t.head_dim, t.global_head_dim
+        );
         println!("  q_dim / kv_dim:     {} / {}", self.q_dim(), self.kv_dim());
         println!("  sliding_window:     {}", t.sliding_window);
         println!("  moe intermediate:   {}", t.moe_intermediate_size);
         println!("  shared intermediate:{}", t.intermediate_size);
-        println!("  vision layers:      {}", self.vision_config.num_hidden_layers);
-        println!("  vision soft tokens: {}", self.vision_soft_tokens_per_image);
+        println!(
+            "  vision layers:      {}",
+            self.vision_config.num_hidden_layers
+        );
+        println!(
+            "  vision soft tokens: {}",
+            self.vision_soft_tokens_per_image
+        );
         println!("\n  layer_types:");
         for (i, kind) in t.layer_types.iter().enumerate() {
             println!("    layer {i:2}: {kind}");

@@ -330,12 +330,14 @@ impl ChatStream {
         let ticker = if interactive {
             let shared_t = Arc::clone(&shared);
             let done_t = Arc::clone(&done);
-            Some(std::thread::spawn(move || loop {
-                if done_t.load(Ordering::Relaxed) {
-                    break;
+            Some(std::thread::spawn(move || {
+                loop {
+                    if done_t.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    shared_t.lock().unwrap().render.paint();
+                    std::thread::sleep(Duration::from_millis(100));
                 }
-                shared_t.lock().unwrap().render.paint();
-                std::thread::sleep(Duration::from_millis(100));
             }))
         } else {
             None

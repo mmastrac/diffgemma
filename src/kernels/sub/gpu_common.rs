@@ -10,7 +10,11 @@ use objc2_metal::{
 };
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
-pub fn set_bytes<T>(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, value: &T, index: usize) {
+pub fn set_bytes<T>(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    value: &T,
+    index: usize,
+) {
     unsafe {
         encoder.setBytes_length_atIndex(
             std::ptr::NonNull::from_ref(value).cast(),
@@ -35,8 +39,12 @@ pub fn dispatch_1d_ranged(
     const THREADS_PER_TG: usize = 256;
     const MAX_GROUPS: usize = 65535;
     const CHUNK: usize = MAX_GROUPS * THREADS_PER_TG;
-    let cmd = queue.commandBuffer().ok_or(Error::Format("command buffer"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("encoder"))?;
+    let cmd = queue
+        .commandBuffer()
+        .ok_or(Error::Format("command buffer"))?;
+    let enc = cmd
+        .computeCommandEncoder()
+        .ok_or(Error::Format("encoder"))?;
     enc.setComputePipelineState(pipeline);
     let mut base = 0usize;
     while base < count {
@@ -73,8 +81,12 @@ pub fn dispatch_rows(
     encode: impl FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>),
 ) -> Result<(), Error> {
     const THREADGROUP_WIDTH: usize = 256;
-    let cmd = queue.commandBuffer().ok_or(Error::Format("command buffer"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("encoder"))?;
+    let cmd = queue
+        .commandBuffer()
+        .ok_or(Error::Format("command buffer"))?;
+    let enc = cmd
+        .computeCommandEncoder()
+        .ok_or(Error::Format("encoder"))?;
     enc.setComputePipelineState(pipeline);
     encode(&enc);
     enc.dispatchThreadgroups_threadsPerThreadgroup(
@@ -97,10 +109,7 @@ pub fn dispatch_rows(
 
 /// `scatter_vocab_chunk` grid (matches lm_head).
 #[cfg(all(feature = "metal", target_os = "macos"))]
-pub fn scatter_vocab_grid(
-    seq_len: usize,
-    chunk_cols: usize,
-) -> (MTLSize, MTLSize) {
+pub fn scatter_vocab_grid(seq_len: usize, chunk_cols: usize) -> (MTLSize, MTLSize) {
     const TG_W: usize = 16;
     const TG_H: usize = 16;
     (
@@ -124,14 +133,26 @@ pub fn dispatch_1d(
     count: usize,
     encode: impl FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>),
 ) -> Result<(), Error> {
-    let cmd = queue.commandBuffer().ok_or(Error::Format("command buffer"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("encoder"))?;
+    let cmd = queue
+        .commandBuffer()
+        .ok_or(Error::Format("command buffer"))?;
+    let enc = cmd
+        .computeCommandEncoder()
+        .ok_or(Error::Format("encoder"))?;
     enc.setComputePipelineState(pipeline);
     encode(&enc);
     let tg = 256usize.min(count);
     enc.dispatchThreadgroups_threadsPerThreadgroup(
-        MTLSize { width: div_up(count, tg), height: 1, depth: 1 },
-        MTLSize { width: tg, height: 1, depth: 1 },
+        MTLSize {
+            width: div_up(count, tg),
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
     );
     enc.endEncoding();
     cmd.commit();
@@ -149,8 +170,12 @@ pub fn dispatch_grid(
     tg_width: usize,
     encode: impl FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>),
 ) -> Result<(), Error> {
-    let cmd = queue.commandBuffer().ok_or(Error::Format("command buffer"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("encoder"))?;
+    let cmd = queue
+        .commandBuffer()
+        .ok_or(Error::Format("command buffer"))?;
+    let enc = cmd
+        .computeCommandEncoder()
+        .ok_or(Error::Format("encoder"))?;
     enc.setComputePipelineState(pipeline);
     encode(&enc);
     enc.dispatchThreadgroups_threadsPerThreadgroup(

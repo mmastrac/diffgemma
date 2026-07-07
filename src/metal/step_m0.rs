@@ -2,16 +2,16 @@
 
 use crate::dgq::block::{dequant_row_q4, q4_weight_at};
 use crate::dgq::layout::GROUP_SIZE;
-use crate::metal::decoder::{forward as decoder_forward, load_weight_cache, GpuDecoderScratch};
 use crate::metal::GpuDecoderEngine;
+use crate::metal::decoder::{GpuDecoderScratch, forward as decoder_forward, load_weight_cache};
 use crate::metal::step_kernel::{
-    init_canvas_state, run_step_forward, run_step_probe, run_step_smoke, StepFinishMode,
-    StepForwardOutput, StepParams, StepSmokeConfig, CANVAS, HID, VOCAB,
+    CANVAS, HID, StepFinishMode, StepForwardOutput, StepParams, StepSmokeConfig, VOCAB,
+    init_canvas_state, run_step_forward, run_step_probe, run_step_smoke,
 };
 use crate::model::decoder::DecoderForwardInput;
 use crate::model::mask::DecoderAttnMask;
-use crate::sample::{initialize_canvas, Rng, SamplerConfig};
 use crate::safetensors::Error;
+use crate::sample::{Rng, SamplerConfig, initialize_canvas};
 use std::path::Path;
 
 pub const EMBED_SCALE: f32 = 53.065_996_645_694_66; // sqrt(2816)
@@ -92,11 +92,7 @@ pub(crate) fn dequant_q4_group_cpu(g: &[u8; 20]) -> [f32; 32] {
 }
 
 /// K-order decode via col-indexed path (mirrors `q4_at_col` in dequant.metal).
-pub(crate) fn q4_weight_at_k_order_group(
-    row: &[u8],
-    base_k: usize,
-    in_dim: usize,
-) -> [f32; 32] {
+pub(crate) fn q4_weight_at_k_order_group(row: &[u8], base_k: usize, in_dim: usize) -> [f32; 32] {
     let mut out = [0.0f32; GROUP_SIZE];
     for m in 0..GROUP_SIZE {
         let col = base_k + m;
@@ -161,7 +157,9 @@ fn verify_q4_k_order_positions() -> M0Check {
     check(
         "M0.1b VERIFY-K",
         max_err <= 1e-6,
-        format!("dequant_q4_group vs q4_weight_at K-order max_err={max_err:.2e} ({samples} samples)"),
+        format!(
+            "dequant_q4_group vs q4_weight_at K-order max_err={max_err:.2e} ({samples} samples)"
+        ),
     )
 }
 
@@ -217,7 +215,8 @@ fn verify_rng_init() -> M0Check {
             false,
             format!(
                 "rng_state mismatch after canvas init: gpu={} cpu={}",
-                state.rng_state, rng.state()
+                state.rng_state,
+                rng.state()
             ),
         );
     }
@@ -237,7 +236,11 @@ fn verify_rng_init() -> M0Check {
             );
         }
     }
-    check("M0.3 RNG init", true, "1000 LCG draws match after canvas init".to_string())
+    check(
+        "M0.3 RNG init",
+        true,
+        "1000 LCG draws match after canvas init".to_string(),
+    )
 }
 
 fn verify_temperature_schedule() -> M0Check {
@@ -306,7 +309,10 @@ fn verify_sampler_golden(model_dir: &Path) -> Result<M0Check, Error> {
             42,
             [100691, 146483, 261606, 21027, 27498, 186817, 242016, 50996],
         ),
-        (43, [22431, 59629, 27721, 31328, 26087, 205511, 190278, 83847]),
+        (
+            43,
+            [22431, 59629, 27721, 31328, 26087, 205511, 190278, 83847],
+        ),
         (
             44,
             [206314, 234920, 55981, 41628, 24676, 224205, 138541, 116698],
@@ -352,7 +358,10 @@ fn verify_sampler_golden(model_dir: &Path) -> Result<M0Check, Error> {
 }
 
 /// Run all M0 checks that do not require weights, plus optional integration checks.
-pub fn run_step_verify(model_dir: Option<&Path>, probe_layers: usize) -> Result<M0VerifyResult, Error> {
+pub fn run_step_verify(
+    model_dir: Option<&Path>,
+    probe_layers: usize,
+) -> Result<M0VerifyResult, Error> {
     let mut checks = vec![
         verify_q4_nibble_parity(),
         verify_q4_k_order_positions(),
@@ -425,7 +434,12 @@ pub(crate) fn engine_forward(
         kv_len,
     )?;
     let mut engine = GpuDecoderEngine::new()?;
-    scratch.ensure_gpu_kv(&engine.ctx.device, &model.config.text_config, kv_len, canvas_len)?;
+    scratch.ensure_gpu_kv(
+        &engine.ctx.device,
+        &model.config.text_config,
+        kv_len,
+        canvas_len,
+    )?;
     scratch.sync_gpu_kv_from_cpu(&kv_cache, canvas_len)?;
 
     let out = decoder_forward(
@@ -475,7 +489,10 @@ pub fn run_step_parity(
     }
 
     let model = crate::model::Model::open(model_dir)?;
-    let layers = cfg.layers.min(model.config.text_config.num_hidden_layers).max(1);
+    let layers = cfg
+        .layers
+        .min(model.config.text_config.num_hidden_layers)
+        .max(1);
     let (default_hidden_tol, default_logits_tol) = parity_limits(layers);
     let hidden_tol = if cfg.hidden_tol == PARITY_HIDDEN_MAX_ABS {
         default_hidden_tol
@@ -511,14 +528,22 @@ pub fn run_step_parity(
         // top-1 argmax agreement per token row — the generation-relevant check.
         let rows = mono.logits.len() / VOCAB;
         let argmax = |v: &[f32]| {
-            v.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &x)| {
-                if x > bv { (i, x) } else { (bi, bv) }
-            }).0
+            v.iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &x)| {
+                    if x > bv { (i, x) } else { (bi, bv) }
+                })
+                .0
         };
         let agree = (0..rows)
-            .filter(|&r| argmax(&mono.logits[r * VOCAB..(r + 1) * VOCAB]) == argmax(&eng_logits[r * VOCAB..(r + 1) * VOCAB]))
+            .filter(|&r| {
+                argmax(&mono.logits[r * VOCAB..(r + 1) * VOCAB])
+                    == argmax(&eng_logits[r * VOCAB..(r + 1) * VOCAB])
+            })
             .count();
-        eprintln!("  [parity-debug] hidden max|Δ|={hidden_max_abs:.3}; logits mean|Δ|={logits_mean_diff:.4}; top-1 argmax agree {agree}/{rows}");
+        eprintln!(
+            "  [parity-debug] hidden max|Δ|={hidden_max_abs:.3}; logits mean|Δ|={logits_mean_diff:.4}; top-1 argmax agree {agree}/{rows}"
+        );
     }
 
     let pass = hidden_max_abs <= hidden_tol && logits_mean_diff <= logits_tol;

@@ -57,7 +57,9 @@ fn sysctl_read<T: Default>(name: &std::ffi::CStr) -> Option<T> {
 }
 
 fn swap_used_bytes() -> u64 {
-    sysctl_read::<XswUsage>(c"vm.swapusage").map(|s| s.used).unwrap_or(0)
+    sysctl_read::<XswUsage>(c"vm.swapusage")
+        .map(|s| s.used)
+        .unwrap_or(0)
 }
 
 /// 1 = normal, 2 = warn, 4 = critical (0 if unreadable).
@@ -94,7 +96,11 @@ pub fn report_section(
     let swap_delta = after.swap_used as i64 - before.swap_used as i64;
     let alloc = device.currentAllocatedSize() as u64;
     let cap = device.recommendedMaxWorkingSetSize();
-    let frac = if cap > 0 { alloc as f64 / cap as f64 } else { 0.0 };
+    let frac = if cap > 0 {
+        alloc as f64 / cap as f64
+    } else {
+        0.0
+    };
     let pressure = after.pressure.max(before.pressure);
     let suspect = swap_delta > 0 || pressure > 1 || frac > 0.90;
     eprintln!(

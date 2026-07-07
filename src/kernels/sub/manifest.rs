@@ -277,9 +277,8 @@ pub fn spec_by_entry(entry: &str) -> Option<&'static KernelSpec> {
 }
 
 pub fn validate_shared(entry: &str, variant: KernelVariant) -> Result<(), Error> {
-    let spec = spec_by_entry(entry).ok_or_else(|| {
-        Error::NotFound(format!("manifest: unknown kernel entry {entry:?}"))
-    })?;
+    let spec = spec_by_entry(entry)
+        .ok_or_else(|| Error::NotFound(format!("manifest: unknown kernel entry {entry:?}")))?;
     if !spec.quant_formats.is_empty() {
         if !spec.quant_formats.contains(&variant.quant_format) {
             return Err(Error::NotFound(format!(
@@ -537,7 +536,8 @@ mod tests {
     }
 
     fn collect_metal_files_rec(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-        for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        for entry in
+            std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
         {
             let entry = entry.expect("dir entry");
             let path = entry.path();

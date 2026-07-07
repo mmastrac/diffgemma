@@ -5,8 +5,8 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSError, NSString};
 use objc2_metal::{
-    MTLCommandQueue, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDataType,
-    MTLDevice, MTLFunctionConstantValues, MTLLibrary,
+    MTLCommandQueue, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDataType, MTLDevice,
+    MTLFunctionConstantValues, MTLLibrary,
 };
 
 pub struct MetalContext {
@@ -26,7 +26,10 @@ impl MetalContext {
         Ok(Self { device, queue })
     }
 
-    pub fn compile_library(&self, source: &str) -> Result<Retained<ProtocolObject<dyn MTLLibrary>>, Error> {
+    pub fn compile_library(
+        &self,
+        source: &str,
+    ) -> Result<Retained<ProtocolObject<dyn MTLLibrary>>, Error> {
         let ns_source = NSString::from_str(source);
         self.device
             .newLibraryWithSource_options_error(&ns_source, None)

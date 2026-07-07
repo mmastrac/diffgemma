@@ -1,7 +1,5 @@
 use crate::config::TextConfig;
-use crate::kernels::cpu::{
-    gelu_pytorch_tanh, linear_bf16_slice, rms_norm_no_scale, rms_norm_rows,
-};
+use crate::kernels::cpu::{gelu_pytorch_tanh, linear_bf16_slice, rms_norm_no_scale, rms_norm_rows};
 use crate::model::layer_weights::DecoderLayerWeights;
 use crate::safetensors::Error;
 use crate::tensor::Bf16Slice;
@@ -249,15 +247,7 @@ fn expert_forward_one(
         gate_act[i] = gate[i] * up[i];
     }
     let down_off = expert * down_stride;
-    linear_bf16_slice(
-        out,
-        gate_act,
-        down,
-        down_off,
-        1,
-        moe_inter,
-        hidden,
-    );
+    linear_bf16_slice(out, gate_act, down, down_off, 1, moe_inter, hidden);
 }
 
 /// `pre_feedforward_layernorm_2(residual)` — expert input after routing.

@@ -1,7 +1,7 @@
 //! GELU (PyTorch tanh) — CPU oracle, GPU dispatch, tier-1 tests.
 
-use super::test_util::ElemFormat;
 use super::manifest;
+use super::test_util::ElemFormat;
 use super::variant::KernelVariant;
 use crate::kernels::cpu;
 use crate::safetensors::Error;
@@ -52,8 +52,10 @@ pub fn cpu_oracle(fix: &Fixture) -> Vec<f32> {
 pub fn gpu(fix: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
-    
-    use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize};
+
+    use objc2_metal::{
+        MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
+    };
 
     let ctx = MetalContext::new()?;
     let pipeline = pipeline_for(&ctx, variant)?;
@@ -69,15 +71,28 @@ pub fn gpu(fix: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
 
     BufferPool::write_f32(&buf, &fix.x);
 
-    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd buffer"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("encoder"))?;
+    let cmd = ctx
+        .queue
+        .commandBuffer()
+        .ok_or(Error::Format("cmd buffer"))?;
+    let enc = cmd
+        .computeCommandEncoder()
+        .ok_or(Error::Format("encoder"))?;
     enc.setComputePipelineState(&pipeline.pipeline);
     let len_u = len as u32;
     bind_gpu_in_place(&enc, &buf, &buf_dump, len_u);
     let tg = 256usize.min(len);
     enc.dispatchThreadgroups_threadsPerThreadgroup(
-        MTLSize { width: div_up(len, tg), height: 1, depth: 1 },
-        MTLSize { width: tg, height: 1, depth: 1 },
+        MTLSize {
+            width: div_up(len, tg),
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
     );
     enc.endEncoding();
     cmd.commit();

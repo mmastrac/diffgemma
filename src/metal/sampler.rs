@@ -1,14 +1,14 @@
 //! GPU entropy-bound sampler: logits stay on device; read back scalars + canvas only.
 
-use crate::metal::batch::{begin_engine_batch, set_bytes, GpuBatch};
+use crate::metal::batch::{GpuBatch, begin_engine_batch, set_bytes};
 use crate::metal::buffer::BufferPool;
 use crate::metal::engine::GpuDecoderEngine;
 use crate::metal::sampler_kernels::GpuSamplerKernels;
-use crate::sample::{
-    accept_canvas_from_entropies, denoise_steps_completed, renoise_canvas, Rng, SamplerConfig,
-    StableConfidentStopper,
-};
 use crate::safetensors::Error;
+use crate::sample::{
+    Rng, SamplerConfig, StableConfidentStopper, accept_canvas_from_entropies,
+    denoise_steps_completed, renoise_canvas,
+};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder, MTLDevice};
@@ -21,10 +21,7 @@ pub struct GpuLogitsBuf {
 
 impl GpuLogitsBuf {
     pub fn new() -> Self {
-        Self {
-            buf: None,
-            cap: 0,
-        }
+        Self { buf: None, cap: 0 }
     }
 
     pub fn ensure(
@@ -234,14 +231,13 @@ fn dispatch_sample_from_probs(
     });
 }
 
-
 #[cfg(all(test, feature = "metal", target_os = "macos"))]
 mod tests {
     use super::*;
     use crate::metal::batch::GpuBatch;
     use crate::metal::device::MetalContext;
     use crate::metal::sampler_kernels::GpuSamplerKernels;
-    use crate::sample::{argmax_canvas, sample_canvas, token_entropy, Rng};
+    use crate::sample::{Rng, argmax_canvas, sample_canvas, token_entropy};
 
     #[test]
     fn gpu_postprocess_matches_cpu() {
@@ -283,7 +279,8 @@ mod tests {
         let mut scratch = GpuSamplerScratch::new(canvas_len, vocab);
         scratch.sample_rand.copy_from_slice(&rand_vals);
 
-        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None).expect("batch");
+        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None)
+            .expect("batch");
         let logits_ref = logits_buf.as_buf().expect("buf");
         dispatch_logit_softcapping(&mut batch, &sk, logits_ref, total, 30.0);
         dispatch_scale_logits(&mut batch, &sk, logits_ref, total, temperature);

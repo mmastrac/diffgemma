@@ -221,7 +221,9 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
     let kvcache: Vec<f32> = f
         .kvcache
         .iter()
-        .map(|&v| crate::kernels::sub::f16::f16_bits_to_f32(crate::kernels::sub::f16::f32_to_f16_bits(v)))
+        .map(|&v| {
+            crate::kernels::sub::f16::f16_bits_to_f32(crate::kernels::sub::f16::f32_to_f16_bits(v))
+        })
         .collect();
     let mut out = vec![0.0f32; f.out_len()];
     attention::attention(
@@ -257,7 +259,10 @@ fn kv_fc(
     fmt: crate::kernels::sub::kv_quant::KvFormat,
 ) -> ([crate::kernels::sub::variant::FcUInt; 1], &'static str) {
     (
-        [crate::kernels::sub::variant::FcUInt { index: 4, value: fmt.code() }],
+        [crate::kernels::sub::variant::FcUInt {
+            index: 4,
+            value: fmt.code(),
+        }],
         fmt.label(),
     )
 }
@@ -310,7 +315,10 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         .allocate(&ctx.device, f.q.len() * 2)
         .ok_or(Error::Format("alloc"))?;
     let buf_kv = pool
-        .allocate(&ctx.device, (f.kvcache.len() + 8 * f.n_kv() * f.head_dim() * 2) * 2)
+        .allocate(
+            &ctx.device,
+            (f.kvcache.len() + 8 * f.n_kv() * f.head_dim() * 2) * 2,
+        )
         .ok_or(Error::Format("alloc"))?;
     let buf_out = pool
         .allocate(&ctx.device, f.out_len() * 2)
@@ -396,7 +404,6 @@ pub fn gpu(_: &Fixture, _: KernelVariant) -> Result<Vec<f32>, Error> {
     Err(Error::Format("Metal unavailable"))
 }
 
-
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub fn pipeline_mma2_for(
     ctx: &crate::metal::device::MetalContext,
@@ -415,9 +422,18 @@ pub fn gpu_mma2(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> 
     let ctx = MetalContext::new()?;
     let pipeline = pipeline_mma2_for(&ctx, variant)?;
     let mut pool = BufferPool::new();
-    let buf_q = pool.allocate(&ctx.device, f.q.len() * 2).ok_or(Error::Format("alloc"))?;
-    let buf_kv = pool.allocate(&ctx.device, (f.kvcache.len() + 8 * f.n_kv() * f.head_dim() * 2) * 2).ok_or(Error::Format("alloc"))?;
-    let buf_out = pool.allocate(&ctx.device, f.out_len() * 2).ok_or(Error::Format("alloc"))?;
+    let buf_q = pool
+        .allocate(&ctx.device, f.q.len() * 2)
+        .ok_or(Error::Format("alloc"))?;
+    let buf_kv = pool
+        .allocate(
+            &ctx.device,
+            (f.kvcache.len() + 8 * f.n_kv() * f.head_dim() * 2) * 2,
+        )
+        .ok_or(Error::Format("alloc"))?;
+    let buf_out = pool
+        .allocate(&ctx.device, f.out_len() * 2)
+        .ok_or(Error::Format("alloc"))?;
     let buf_layer = pool
         .allocate(&ctx.device, std::mem::size_of::<LayerOffsets>())
         .ok_or(Error::Format("alloc"))?;
@@ -466,8 +482,16 @@ pub fn gpu_mma2(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> 
     gpu_common::set_bytes(&enc, &params, 4);
     gpu_common::set_bytes(&enc, &dims, 5);
     enc.dispatchThreadgroups_threadsPerThreadgroup(
-        MTLSize { width: f.canvas.div_ceil(MMA_M_TILE), height: f.n_kv(), depth: 1 },
-        MTLSize { width: 64, height: 1, depth: 1 },
+        MTLSize {
+            width: f.canvas.div_ceil(MMA_M_TILE),
+            height: f.n_kv(),
+            depth: 1,
+        },
+        MTLSize {
+            width: 64,
+            height: 1,
+            depth: 1,
+        },
     );
     enc.endEncoding();
     cmd.commit();
@@ -505,9 +529,18 @@ pub fn gpu_mma_full(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Err
     let ctx = MetalContext::new()?;
     let pipeline = pipeline_mma_full_for(&ctx, variant)?;
     let mut pool = BufferPool::new();
-    let buf_q = pool.allocate(&ctx.device, f.q.len() * 2).ok_or(Error::Format("alloc"))?;
-    let buf_kv = pool.allocate(&ctx.device, (f.kvcache.len() + 8 * f.n_kv() * f.head_dim() * 2) * 2).ok_or(Error::Format("alloc"))?;
-    let buf_out = pool.allocate(&ctx.device, f.out_len() * 2).ok_or(Error::Format("alloc"))?;
+    let buf_q = pool
+        .allocate(&ctx.device, f.q.len() * 2)
+        .ok_or(Error::Format("alloc"))?;
+    let buf_kv = pool
+        .allocate(
+            &ctx.device,
+            (f.kvcache.len() + 8 * f.n_kv() * f.head_dim() * 2) * 2,
+        )
+        .ok_or(Error::Format("alloc"))?;
+    let buf_out = pool
+        .allocate(&ctx.device, f.out_len() * 2)
+        .ok_or(Error::Format("alloc"))?;
     let buf_layer = pool
         .allocate(&ctx.device, std::mem::size_of::<LayerOffsets>())
         .ok_or(Error::Format("alloc"))?;
@@ -571,7 +604,11 @@ pub fn gpu_mma_full(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Err
             height: f.n_kv(),
             depth: group,
         },
-        MTLSize { width: MMA_FULL_QG * 32, height: 1, depth: 1 },
+        MTLSize {
+            width: MMA_FULL_QG * 32,
+            height: 1,
+            depth: 1,
+        },
     );
     enc.endEncoding();
     cmd.commit();
@@ -613,9 +650,18 @@ pub fn bench_path(f: &Fixture, iters: usize, path: u8) -> Result<f64, Error> {
         _ => pipeline_for(&ctx, prod)?,
     };
     let mut pool = BufferPool::new();
-    let buf_q = pool.allocate(&ctx.device, f.q.len() * 2).ok_or(Error::Format("alloc"))?;
-    let buf_kv = pool.allocate(&ctx.device, (f.kvcache.len() + 8 * f.n_kv() * f.head_dim() * 2) * 2).ok_or(Error::Format("alloc"))?;
-    let buf_out = pool.allocate(&ctx.device, f.out_len() * 2).ok_or(Error::Format("alloc"))?;
+    let buf_q = pool
+        .allocate(&ctx.device, f.q.len() * 2)
+        .ok_or(Error::Format("alloc"))?;
+    let buf_kv = pool
+        .allocate(
+            &ctx.device,
+            (f.kvcache.len() + 8 * f.n_kv() * f.head_dim() * 2) * 2,
+        )
+        .ok_or(Error::Format("alloc"))?;
+    let buf_out = pool
+        .allocate(&ctx.device, f.out_len() * 2)
+        .ok_or(Error::Format("alloc"))?;
     let buf_layer = pool
         .allocate(&ctx.device, std::mem::size_of::<LayerOffsets>())
         .ok_or(Error::Format("alloc"))?;
@@ -651,8 +697,16 @@ pub fn bench_path(f: &Fixture, iters: usize, path: u8) -> Result<f64, Error> {
     let dims = AttnDims::new(f.canvas as u32, f.n_q_heads as u32);
     let (grid, tpg) = match path {
         2 => (
-            MTLSize { width: f.canvas.div_ceil(MMA_M_TILE), height: f.n_kv(), depth: 1 },
-            MTLSize { width: 64, height: 1, depth: 1 },
+            MTLSize {
+                width: f.canvas.div_ceil(MMA_M_TILE),
+                height: f.n_kv(),
+                depth: 1,
+            },
+            MTLSize {
+                width: 64,
+                height: 1,
+                depth: 1,
+            },
         ),
         3 => (
             MTLSize {
@@ -660,11 +714,23 @@ pub fn bench_path(f: &Fixture, iters: usize, path: u8) -> Result<f64, Error> {
                 height: f.n_kv(),
                 depth: f.n_q_heads / f.n_kv(),
             },
-            MTLSize { width: MMA_FULL_QG * 32, height: 1, depth: 1 },
+            MTLSize {
+                width: MMA_FULL_QG * 32,
+                height: 1,
+                depth: 1,
+            },
         ),
         _ => (
-            MTLSize { width: f.canvas, height: f.n_q_heads, depth: 1 },
-            MTLSize { width: THREADGROUP_WIDTH, height: 1, depth: 1 },
+            MTLSize {
+                width: f.canvas,
+                height: f.n_q_heads,
+                depth: 1,
+            },
+            MTLSize {
+                width: THREADGROUP_WIDTH,
+                height: 1,
+                depth: 1,
+            },
         ),
     };
 
@@ -761,10 +827,6 @@ mod tests {
     // ---- Matrix-unit (flash) paths: parity vs the same CPU oracle ----
     // (1-head attention_mma deleted 2026-07-02: superseded by mma2/mma_full.)
 
-
-
-
-
     // ---- Full-layer MMA path (register-O, QG-grouped K/V): parity vs oracle ----
 
     kernel_oracle_matrix! {
@@ -826,9 +888,10 @@ mod tests {
         use crate::kernels::sub::attention::{bench_path, model_bench_fixture};
         let iters = 50usize;
         for kv_len in [64u32, 512, 1024, 8192, 32768] {
-            for (name, hd, is_full) in
-                [("sliding hd256", 256usize, false), ("full hd512", 512usize, true)]
-            {
+            for (name, hd, is_full) in [
+                ("sliding hd256", 256usize, false),
+                ("full hd512", 512usize, true),
+            ] {
                 // Sliding layers are window-clamped (1024) in production —
                 // benching them unwindowed at long kv is meaningless.
                 if !is_full && kv_len > 1024 {

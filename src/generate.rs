@@ -3,14 +3,14 @@
 use crate::config::ModelConfig;
 use crate::model::decoder::{DecoderForwardInput, DecoderScratch};
 use crate::model::encoder::extend_prefill;
-use crate::model::encoder::{prefill, EncoderPrefillInput, EncoderScratch};
+use crate::model::encoder::{EncoderPrefillInput, EncoderScratch, prefill};
 use crate::model::kv_cache::KvCache;
 use crate::model::mask::DecoderAttnMask;
-use crate::sample::{
-    accept_canvas, apply_temperature, argmax_canvas, denoise_steps_completed, initialize_canvas,
-    renoise_canvas, sample_canvas, Rng, SamplerConfig, StableConfidentStopper,
-};
 use crate::safetensors::Error;
+use crate::sample::{
+    Rng, SamplerConfig, StableConfidentStopper, accept_canvas, apply_temperature, argmax_canvas,
+    denoise_steps_completed, initialize_canvas, renoise_canvas, sample_canvas,
+};
 use crate::weights::WeightStore;
 
 #[derive(Debug, Clone)]
@@ -65,16 +65,6 @@ pub struct GenerateOutput {
     pub denoise_trace: Option<crate::denoise_trace::DenoiseTrace>,
 }
 
-
-
-
-
-
-
-
-
-
-
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub fn generate_monolithic_gpu(
     model_dir: &std::path::Path,
@@ -83,7 +73,7 @@ pub fn generate_monolithic_gpu(
     max_seq: usize,
     prompt_label: &str,
 ) -> Result<GenerateOutput, Error> {
-    use crate::metal::{generate_monolithic, validate_step_model, StepGenerateConfig};
+    use crate::metal::{StepGenerateConfig, generate_monolithic, validate_step_model};
     let validated = validate_step_model(model_dir)?;
     let layers = gen_cfg
         .max_layers
@@ -107,12 +97,12 @@ pub fn generate_monolithic_gpu(
 mod gpu_determinism {
     use super::*;
     use crate::metal::{
-        decoder_forward, load_weight_cache, prefill_gpu, GpuDecoderEngine, GpuDecoderScratch,
+        GpuDecoderEngine, GpuDecoderScratch, decoder_forward, load_weight_cache, prefill_gpu,
     };
     use crate::model::decoder::DecoderForwardInput;
     use crate::model::encoder::{EncoderPrefillInput, EncoderScratch};
     use crate::model::mask::DecoderAttnMask;
-    use crate::sample::{argmax_canvas, initialize_canvas, Rng};
+    use crate::sample::{Rng, argmax_canvas, initialize_canvas};
     use crate::weights::WeightStore;
 
     const DGQ_HELLO_PROMPT: [u32; 1] = [9259];
@@ -212,7 +202,13 @@ mod gpu_determinism {
         a.iter()
             .zip(b.iter())
             .enumerate()
-            .find_map(|(i, (&x, &y))| if x.to_bits() != y.to_bits() { Some((i, x, y)) } else { None })
+            .find_map(|(i, (&x, &y))| {
+                if x.to_bits() != y.to_bits() {
+                    Some((i, x, y))
+                } else {
+                    None
+                }
+            })
     }
 
     /// Same KV + canvas: two decoder forwards back-to-back must match bit-for-bit.
@@ -227,13 +223,21 @@ mod gpu_determinism {
         let canvas = cfg.canvas_length;
         let max_kv = DGQ_HELLO_PROMPT.len() + 256;
 
-        let mut weights = load_weight_cache(&store, &cfg.text_config, canvas, max_kv).expect("cache");
+        let mut weights =
+            load_weight_cache(&store, &cfg.text_config, canvas, max_kv).expect("cache");
         let mut engine = GpuDecoderEngine::new().expect("engine");
         let mut enc = EncoderScratch::new(canvas.max(1), &cfg);
         let mut dec = GpuDecoderScratch::new(canvas, &cfg);
-        let (kv, canvas_tokens) =
-            prefill_and_canvas(&store, &cfg, &mut weights, &mut engine, &mut enc, &mut dec, max_kv)
-                .expect("prefill");
+        let (kv, canvas_tokens) = prefill_and_canvas(
+            &store,
+            &cfg,
+            &mut weights,
+            &mut engine,
+            &mut enc,
+            &mut dec,
+            max_kv,
+        )
+        .expect("prefill");
 
         let a = forward_logits_once(
             &store,
@@ -276,7 +280,8 @@ mod gpu_determinism {
         let canvas = cfg.canvas_length;
         let max_kv = DGQ_HELLO_PROMPT.len() + 256;
 
-        let mut weights = load_weight_cache(&store, &cfg.text_config, canvas, max_kv).expect("cache");
+        let mut weights =
+            load_weight_cache(&store, &cfg.text_config, canvas, max_kv).expect("cache");
         let mut engine_a = GpuDecoderEngine::new().expect("engine a");
         let mut enc = EncoderScratch::new(canvas.max(1), &cfg);
         let mut dec = GpuDecoderScratch::new(canvas, &cfg);
@@ -335,14 +340,22 @@ mod gpu_determinism {
         let canvas = cfg.canvas_length;
         let max_kv = DGQ_HELLO_PROMPT.len() + 256;
 
-        let mut weights = load_weight_cache(&store, &cfg.text_config, canvas, max_kv).expect("cache");
+        let mut weights =
+            load_weight_cache(&store, &cfg.text_config, canvas, max_kv).expect("cache");
 
         let mut engine = GpuDecoderEngine::new().expect("engine");
         let mut enc = EncoderScratch::new(canvas.max(1), &cfg);
         let mut dec = GpuDecoderScratch::new(canvas, &cfg);
-        let (kv, canvas_tokens) =
-            prefill_and_canvas(&store, &cfg, &mut weights, &mut engine, &mut enc, &mut dec, max_kv)
-                .expect("prefill a");
+        let (kv, canvas_tokens) = prefill_and_canvas(
+            &store,
+            &cfg,
+            &mut weights,
+            &mut engine,
+            &mut enc,
+            &mut dec,
+            max_kv,
+        )
+        .expect("prefill a");
         let a = forward_logits_once(
             &store,
             &cfg,
@@ -357,9 +370,16 @@ mod gpu_determinism {
 
         let mut enc = EncoderScratch::new(canvas.max(1), &cfg);
         let mut dec = GpuDecoderScratch::new(canvas, &cfg);
-        let (kv, canvas_tokens) =
-            prefill_and_canvas(&store, &cfg, &mut weights, &mut engine, &mut enc, &mut dec, max_kv)
-                .expect("prefill b");
+        let (kv, canvas_tokens) = prefill_and_canvas(
+            &store,
+            &cfg,
+            &mut weights,
+            &mut engine,
+            &mut enc,
+            &mut dec,
+            max_kv,
+        )
+        .expect("prefill b");
         let b = forward_logits_once(
             &store,
             &cfg,
@@ -443,7 +463,7 @@ mod gpu_determinism {
             let mut engine = GpuDecoderEngine::new().expect("engine");
             let mut enc = EncoderScratch::new(canvas.max(1), &cfg);
             let mut dec = GpuDecoderScratch::new(canvas, &cfg);
-                dec.use_gpu_sampler = false;
+            dec.use_gpu_sampler = false;
             let input = EncoderPrefillInput {
                 token_ids: &DGQ_HELLO_PROMPT,
                 position_offset: 0,
@@ -478,8 +498,7 @@ mod gpu_determinism {
             let argmax = argmax_canvas(&logits, canvas, vocab);
             eprintln!(
                 "{layers}-layer trial {trial}: nan={nan_n} pos1_argmax={} logit0={}",
-                argmax[1],
-                logits[0]
+                argmax[1], logits[0]
             );
             argmax_samples.insert(argmax[1]);
         }
@@ -505,7 +524,7 @@ mod gpu_determinism {
             let mut engine = GpuDecoderEngine::new().expect("engine");
             let mut enc = EncoderScratch::new(canvas.max(1), &cfg);
             let mut dec = GpuDecoderScratch::new(canvas, &cfg);
-                dec.use_gpu_sampler = false;
+            dec.use_gpu_sampler = false;
             let input = EncoderPrefillInput {
                 token_ids: &DGQ_HELLO_PROMPT,
                 position_offset: 0,
@@ -676,14 +695,22 @@ mod gpu_determinism {
         let vocab = cfg.text_config.vocab_size;
         let max_kv = DGQ_HELLO_PROMPT.len() + 256;
 
-        let mut weights = load_weight_cache(&store, &cfg.text_config, canvas, max_kv).expect("cache");
+        let mut weights =
+            load_weight_cache(&store, &cfg.text_config, canvas, max_kv).expect("cache");
         let mut engine = GpuDecoderEngine::new().expect("engine");
 
         let mut enc = EncoderScratch::new(canvas.max(1), &cfg);
         let mut dec = GpuDecoderScratch::new(canvas, &cfg);
-        let (kv, canvas_tokens) =
-            prefill_and_canvas(&store, &cfg, &mut weights, &mut engine, &mut enc, &mut dec, max_kv)
-                .expect("prefill baseline");
+        let (kv, canvas_tokens) = prefill_and_canvas(
+            &store,
+            &cfg,
+            &mut weights,
+            &mut engine,
+            &mut enc,
+            &mut dec,
+            max_kv,
+        )
+        .expect("prefill baseline");
         let baseline = forward_logits_once(
             &store,
             &cfg,
@@ -710,7 +737,10 @@ mod gpu_determinism {
                 max_kv,
             )
             .expect("prefill");
-            assert_eq!(canvas_t, canvas_tokens, "canvas init drift at trial {trial}");
+            assert_eq!(
+                canvas_t, canvas_tokens,
+                "canvas init drift at trial {trial}"
+            );
             let logits = forward_logits_once(
                 &store,
                 &cfg,

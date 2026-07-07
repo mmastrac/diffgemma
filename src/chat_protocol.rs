@@ -43,7 +43,10 @@ pub enum ChatEvent {
     /// `common` is a char boundary.
     Rewind { common: usize },
     /// A canvas block's tokens became final (immutable).
-    BlockCommit { block: usize, committed_tokens: usize },
+    BlockCommit {
+        block: usize,
+        committed_tokens: usize,
+    },
     /// The turn finished. `text` is the authoritative reply.
     Done {
         tokens: usize,
@@ -132,7 +135,9 @@ impl<D: TextDecoder> StreamDecoder<D> {
             self.block_idx = ev.block_idx;
             self.last_argmax.clear();
             self.streak.clear();
-            out.push(ChatEvent::BlockStart { block: ev.block_idx });
+            out.push(ChatEvent::BlockStart {
+                block: ev.block_idx,
+            });
         }
 
         // Per-position stable-streak update.
@@ -184,7 +189,9 @@ impl<D: TextDecoder> StreamDecoder<D> {
             self.streak.clear();
             let raw = self
                 .decoder
-                .decode(&crate::sample::strip_degenerate_token_ids(&self.committed_ids));
+                .decode(&crate::sample::strip_degenerate_token_ids(
+                    &self.committed_ids,
+                ));
             self.committed_text = crate::chat_template::sanitize_model_reply(&raw);
             out.push(ChatEvent::BlockCommit {
                 block: ev.block_idx,
@@ -245,12 +252,7 @@ mod tests {
         }
     }
 
-    fn step<'a>(
-        block: usize,
-        step: u32,
-        argmax: &'a [u32],
-        done: bool,
-    ) -> StepProgressEvent<'a> {
+    fn step<'a>(block: usize, step: u32, argmax: &'a [u32], done: bool) -> StepProgressEvent<'a> {
         StepProgressEvent {
             block_idx: block,
             step_in_block: step,
@@ -314,7 +316,10 @@ mod tests {
         let canvas = [b'H' as u32, b'i' as u32, 99];
         let e = d.on_step(&step(1, 5, &canvas, true));
         assert_eq!(d.committed_text(), "Hi");
-        assert!(e.iter().any(|ev| matches!(ev, ChatEvent::BlockCommit { .. })));
+        assert!(
+            e.iter()
+                .any(|ev| matches!(ev, ChatEvent::BlockCommit { .. }))
+        );
         // Ended: a further step yields nothing.
         assert!(d.on_step(&step(1, 6, &canvas, true)).is_empty());
     }
@@ -334,7 +339,10 @@ mod tests {
         all.extend(d.on_step(&step(1, 5, &cot, false)));
         let last = d.on_step(&step(1, 6, &cot, false));
         all.extend(last.clone());
-        assert!(all.iter().any(|ev| matches!(ev, ChatEvent::Rewind { common: 1 })));
+        assert!(
+            all.iter()
+                .any(|ev| matches!(ev, ChatEvent::Rewind { common: 1 }))
+        );
         assert_eq!(texts(&last), vec!["Cot"]);
     }
 }

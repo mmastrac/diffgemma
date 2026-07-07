@@ -20,7 +20,10 @@
 /// f32 rounding).
 pub fn fwht_normalized(v: &mut [f32]) {
     let n = v.len();
-    debug_assert!(n.is_power_of_two() && n > 0, "FWHT length must be a power of two");
+    debug_assert!(
+        n.is_power_of_two() && n > 0,
+        "FWHT length must be a power of two"
+    );
     // Unnormalized butterfly.
     let mut h = 1usize;
     while h < n {
@@ -62,7 +65,11 @@ pub fn fwht_rows(data: &mut [f32], rows: usize, n: usize) {
 /// R = I ⊗ H_blk — orthogonal, fast, and it spreads outlier channels within
 /// each block (across-block mixing is lost, so smaller blocks help less).
 pub fn block_fwht(v: &mut [f32], blk: usize) {
-    debug_assert_eq!(v.len() % blk, 0, "block_fwht: len must be a multiple of blk");
+    debug_assert_eq!(
+        v.len() % blk,
+        0,
+        "block_fwht: len must be a multiple of blk"
+    );
     let n = v.len();
     let mut off = 0usize;
     while off < n {
@@ -137,7 +144,10 @@ mod tests {
         fwht_normalized(&mut v);
         let expect = 10.0 / (n as f32).sqrt();
         for x in &v {
-            assert!((x.abs() - expect).abs() < 1e-4, "spike not spread: {x} vs ±{expect}");
+            assert!(
+                (x.abs() - expect).abs() < 1e-4,
+                "spike not spread: {x} vs ±{expect}"
+            );
         }
     }
 }

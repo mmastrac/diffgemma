@@ -114,16 +114,12 @@ impl<'a> FastBf16Slice<'a> {
     pub unsafe fn get_u16_unchecked(&self, index: usize) -> u16 {
         debug_assert!(index < self.len);
         let off = index * 2;
-        unsafe {
-            u16::from_le_bytes([*self.ptr.add(off), *self.ptr.add(off + 1)])
-        }
+        unsafe { u16::from_le_bytes([*self.ptr.add(off), *self.ptr.add(off + 1)]) }
     }
 
     #[inline(always)]
     pub unsafe fn to_f32_unchecked(&self, index: usize) -> f32 {
-        unsafe {
-            f32::from_bits((self.get_u16_unchecked(index) as u32) << 16)
-        }
+        unsafe { f32::from_bits((self.get_u16_unchecked(index) as u32) << 16) }
     }
 }
 

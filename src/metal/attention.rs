@@ -185,7 +185,8 @@ impl GpuAttention {
             buf_pos = Some((pos_bytes, b));
         }
 
-        let gpu_params = GqaParams::for_attention(seq_len, total_kv, params, mask_kind, kv_cache_len);
+        let gpu_params =
+            GqaParams::for_attention(seq_len, total_kv, params, mask_kind, kv_cache_len);
 
         run_kernel(
             &self.ctx.queue,
@@ -240,7 +241,14 @@ impl GpuAttention {
         params: &AttentionParams,
         mask: GqaMask<'_>,
     ) -> Result<(), Error> {
-        self.apply_rope(q, freqs, seq_len, params.n_heads, params.head_dim, params.rotary_dim)?;
+        self.apply_rope(
+            q,
+            freqs,
+            seq_len,
+            params.n_heads,
+            params.head_dim,
+            params.rotary_dim,
+        )?;
         self.apply_rope(
             k,
             freqs,

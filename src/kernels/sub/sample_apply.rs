@@ -4,8 +4,10 @@ use super::bf16;
 use super::gpu_common;
 use super::test_util::ElemFormat;
 use super::variant::KernelVariant;
-use crate::kernels::cpu::sampler::{temp_at, tempered_row_stats, tempered_sample_row, TemperedRowStats};
-use crate::metal::{CanvasState, StepParams, CANVAS};
+use crate::kernels::cpu::sampler::{
+    TemperedRowStats, temp_at, tempered_row_stats, tempered_sample_row,
+};
+use crate::metal::{CANVAS, CanvasState, StepParams};
 use crate::safetensors::Error;
 
 pub const ENTRY: &str = "sample_apply";
@@ -64,7 +66,12 @@ pub fn tiny_fixture(_: ElemFormat) -> Fixture {
         plateau_prefix_mean_max: 0.05,
         eos_token_id: 1,
     };
-    let t = temp_at(step.saturating_sub(1), params.max_steps, params.t_min, params.t_max);
+    let t = temp_at(
+        step.saturating_sub(1),
+        params.max_steps,
+        params.t_min,
+        params.t_max,
+    );
     let mut rowstat = vec![0.0f32; rows * 2];
     for row in 0..rows {
         let lr = &logits[row * cols..(row + 1) * cols];
@@ -86,9 +93,7 @@ pub fn tiny_fixture(_: ElemFormat) -> Fixture {
 pub fn wide_fixture(_: ElemFormat) -> Fixture {
     let rows = 8usize;
     let cols = 512usize;
-    let logits: Vec<f32> = (0..rows * cols)
-        .map(|i| (i as f32 % 19.0) - 9.0)
-        .collect();
+    let logits: Vec<f32> = (0..rows * cols).map(|i| (i as f32 % 19.0) - 9.0).collect();
     let logits = bf16::bf16_slice_to_f32(&bf16::f32_slice_to_bf16_bits(&logits));
     let t = temp_at(1, 8, 0.25, 0.95);
     let mut rowstat = vec![0.0f32; rows * 2];
@@ -176,8 +181,7 @@ pub fn pipeline_for(
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLSize,
+    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
 };
 
 #[cfg(all(feature = "metal", target_os = "macos"))]

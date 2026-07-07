@@ -3,8 +3,8 @@
 use super::gpu_common;
 use super::sampler_ranged::{CANVAS_LEN, VOCAB};
 use super::test_util::ElemFormat;
-use crate::sample::argmax_canvas;
 use crate::safetensors::Error;
+use crate::sample::argmax_canvas;
 
 pub const ENTRY: &str = "argmax_rows";
 
@@ -119,7 +119,7 @@ pub fn gpu(_: &Fixture) -> Result<Vec<f32>, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::sub::test_util::{assert_oracle, ElemFormat};
+    use crate::kernels::sub::test_util::{ElemFormat, assert_oracle};
 
     fn run_matrix(fixture_fn: fn(ElemFormat) -> Fixture, max_tol: f32) {
         let fix = fixture_fn(ElemFormat::F32);

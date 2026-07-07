@@ -3,17 +3,15 @@
 
 use crate::config::{ModelConfig, TextConfig};
 use crate::dgq::DgqStore;
+use crate::kernels::sub::QuantFormat;
 use crate::metal::device::{ComputePipeline, MetalContext};
 use crate::metal::dgq_gpu::DgqGpuBlob;
 use crate::metal::moe::experts_forward_dgq_cpu;
-use crate::metal::step_quant::{
-    BlockGroupedJob, MoeExecutionStyle, StepBlockProfile,
-};
+use crate::metal::step_quant::{BlockGroupedJob, MoeExecutionStyle, StepBlockProfile};
 use crate::metal::weights::GpuDecoderWeightCache;
-use crate::kernels::sub::QuantFormat;
 use crate::model::moe::{MoeScratch, RouteResult};
-use crate::sample::{initialize_canvas, Rng, SamplerConfig};
 use crate::safetensors::Error;
+use crate::sample::{Rng, SamplerConfig, initialize_canvas};
 use crate::weights::WeightStore;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -64,19 +62,18 @@ pub const SC_SPARSE_MAXK: u32 = 8192;
 pub const MOE_ACT_PROBE_ACT_FLOATS: usize = (MOE_FF * 2) as usize;
 pub const MOE_ACT_PROBE_META_FLOATS: usize = 36; // tok,slot,e,w,x[8],row0[8], down_o[8], moe_out_tok_row[8]
 
-use crate::metal::arena_layout::{build_arena_layout, ArenaLayout, ArenaLayoutParams};
+use crate::metal::arena_layout::{ArenaLayout, ArenaLayoutParams, build_arena_layout};
 
 // All DGQ_* env flags live in crate::flags; re-exported here so existing
 // `step_kernel::<flag>()` call sites keep working.
 pub use crate::flags::{
-    attn_mma_enabled, attn_mma_full_enabled, attn_window_enabled, denoise_parity_log_enabled,
-    denoise_parity_log_positions, denoiser_argmax_enabled, final_entropy_log_enabled,
-    freeze_enabled, fused_algebra_enabled, fused_gate_up_enabled, fused_qkv_enabled,
-    gemm_tunable_enabled, logits_finite_check_enabled, logits_finite_sample_count,
-    moe_block_sparse_enabled, moe_fuse_gather_enabled, moe_tile_adapt_enabled,
-    partial_lm_head_enabled, prefill_batch_enabled, router_gemm_enabled, sc_sparse_enabled,
-    should_fast_prefill,
-    step_text_log_enabled, trace_entropy_enabled, FAST_PREFILL_MIN_TOKENS,
+    FAST_PREFILL_MIN_TOKENS, attn_mma_enabled, attn_mma_full_enabled, attn_window_enabled,
+    denoise_parity_log_enabled, denoise_parity_log_positions, denoiser_argmax_enabled,
+    final_entropy_log_enabled, freeze_enabled, fused_algebra_enabled, fused_gate_up_enabled,
+    fused_qkv_enabled, gemm_tunable_enabled, logits_finite_check_enabled,
+    logits_finite_sample_count, moe_block_sparse_enabled, moe_fuse_gather_enabled,
+    moe_tile_adapt_enabled, partial_lm_head_enabled, prefill_batch_enabled, router_gemm_enabled,
+    sc_sparse_enabled, should_fast_prefill, step_text_log_enabled, trace_entropy_enabled,
 };
 
 pub const MAX_ATTN_Q_COLS: usize = 8192;
@@ -194,23 +191,6 @@ pub struct CanvasState {
     pub prev_accept_sig: u32,
     pub frozen: [u32; FROZEN_WORDS],
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 const STACKED_SEG_MAX: usize = 3;
 
@@ -498,7 +478,11 @@ pub fn build_layout(offsets: &HashMap<String, u64>, max_seq: usize) -> ModelLayo
     // DGQ_KV_Q8 override) — every sizing/pack/kernel site derives it the same
     // way so the layout stays coherent.
     let kv_fmt = crate::flags::kv_format(max_seq);
-    let g = |n: &str| *offsets.get(n).unwrap_or_else(|| panic!("missing tensor {n}"));
+    let g = |n: &str| {
+        *offsets
+            .get(n)
+            .unwrap_or_else(|| panic!("missing tensor {n}"))
+    };
     let opt = |n: &str| offsets.get(n).copied().unwrap_or(0);
     let mut layers = [LayerOffsets::default(); N_LAYERS];
     let mut kv_off = 0u64;
@@ -564,7 +548,10 @@ fn div_up(v: usize, g: usize) -> usize {
 pub(crate) fn qkv_stacked_segments(
     l: &LayerOffsets,
     arena: &ArenaLayout,
-) -> (Vec<crate::kernels::sub::gemm_block_stacked::GemmStackedSeg>, u32) {
+) -> (
+    Vec<crate::kernels::sub::gemm_block_stacked::GemmStackedSeg>,
+    u32,
+) {
     use crate::kernels::sub::gemm_block_stacked::GemmStackedSeg;
     let full = l.is_full != 0;
     let q_n = if full { 8192u32 } else { 4096 };
@@ -605,7 +592,10 @@ pub(crate) fn qkv_stacked_segments(
 pub(crate) fn gate_up_stacked_segments(
     l: &LayerOffsets,
     arena: &ArenaLayout,
-) -> ([crate::kernels::sub::gemm_block_stacked::GemmStackedSeg; 2], u32) {
+) -> (
+    [crate::kernels::sub::gemm_block_stacked::GemmStackedSeg; 2],
+    u32,
+) {
     use crate::kernels::sub::gemm_block_stacked::GemmStackedSeg;
     let n2 = DENSE_FF * 2;
     (
@@ -664,8 +654,6 @@ fn gemm_scratch_bytes() -> (usize, usize) {
 fn sc_probs_buffer_bytes() -> usize {
     CANVAS * crate::model::embed::LM_HEAD_CHUNK * 2
 }
-
-
 
 fn logits_finite_sample_bytes() -> u64 {
     (logits_finite_sample_count().min(CANVAS * VOCAB) * 2) as u64
@@ -880,9 +868,7 @@ impl StepPipelines {
             shader_include::include_metal!("kernels/gemm_bf16_rowk_acc_f32.metal");
         let mut gemm_q8_rowk_acc_f32 = HashMap::new();
         {
-            for &(n, k) in &[
-                (HID as u32, crate::model::embed::LM_HEAD_CHUNK as u32),
-            ] {
+            for &(n, k) in &[(HID as u32, crate::model::embed::LM_HEAD_CHUNK as u32)] {
                 gemm_q8_rowk_acc_f32.insert(
                     (n, k),
                     ctx.compile_gemm_subkernel(
@@ -908,8 +894,8 @@ impl StepPipelines {
                         n,
                         k,
                         false,
-                        crate::kernels::sub::QuantFormat::Raw as u32,  // bf16 embed -> Raw branch
-                        true, // sc_probs is fp16
+                        crate::kernels::sub::QuantFormat::Raw as u32, // bf16 embed -> Raw branch
+                        true,                                         // sc_probs is fp16
                     )?,
                 );
             }
@@ -1060,14 +1046,24 @@ impl StepPipelines {
                         gemm_tunable_sparse_wide.insert(
                             (n, k, false, fmt as u32),
                             crate::kernels::sub::gemm_tunable::pipeline_for_sparse_bm(
-                                ctx, n, k, false, fmt, sparse_wide_bm as usize,
+                                ctx,
+                                n,
+                                k,
+                                false,
+                                fmt,
+                                sparse_wide_bm as usize,
                             )?,
                         );
                         if moe_fuse_gather_enabled() && (n, k) == (MOE_FF * 2, HID as u32) {
                             gemm_tunable_sparse_wide.insert(
                                 (n, k, true, fmt as u32),
                                 crate::kernels::sub::gemm_tunable::pipeline_for_sparse_bm(
-                                    ctx, n, k, true, fmt, sparse_wide_bm as usize,
+                                    ctx,
+                                    n,
+                                    k,
+                                    true,
+                                    fmt,
+                                    sparse_wide_bm as usize,
                                 )?,
                             );
                         }
@@ -1141,10 +1137,7 @@ impl StepPipelines {
                 ctx, prod,
             )?,
             moe_grouped: crate::kernels::sub::moe_grouped::pipeline_for(ctx, prod)?,
-            moe_grouped_nvfp4: crate::kernels::sub::moe_grouped_nvfp4::pipeline_for(
-                ctx,
-                prod,
-            )?,
+            moe_grouped_nvfp4: crate::kernels::sub::moe_grouped_nvfp4::pipeline_for(ctx, prod)?,
             moe_grouped_dump: crate::kernels::sub::moe_grouped::pipeline_for(ctx, dump)?,
             embed_gather: crate::kernels::sub::embed_gather::pipeline_for(ctx, prod)?,
             embed_gather_bf16: ctx.compile_subkernel(
@@ -1235,7 +1228,8 @@ impl StepPipelines {
         k: u32,
         gather: bool,
     ) -> Option<&ComputePipeline> {
-        self.gemm_tunable_sparse_wide.get(&(n, k, gather, format as u32))
+        self.gemm_tunable_sparse_wide
+            .get(&(n, k, gather, format as u32))
     }
 
     fn q8_logits(&self, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
@@ -1549,7 +1543,8 @@ impl StepEnc<'_> {
     }
 
     fn sink_dispatch(&mut self, grid: MTLSize, tg: MTLSize) {
-        self.enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        self.enc
+            .dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
     }
 
     /// Buffer-scope memory barrier on the live encoder.
@@ -1559,11 +1554,12 @@ impl StepEnc<'_> {
 
     fn sink_dispatch_indirect(&mut self, indirect_offset: usize, _n: u32, tg: MTLSize) {
         unsafe {
-            self.enc.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
-                &self.bufs.moe_grouped_indirect,
-                indirect_offset,
-                tg,
-            );
+            self.enc
+                .dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+                    &self.bufs.moe_grouped_indirect,
+                    indirect_offset,
+                    tg,
+                );
         }
     }
 
@@ -1857,20 +1853,13 @@ impl StepEnc<'_> {
         self.dispatch_1d(&self.ps.memzero, count, 256);
     }
 
-    fn rmsnorm(
-        &mut self,
-        x_off: u64,
-        y_off: u64,
-        w_off: u64,
-        dim: u32,
-        rows: usize,
-    ) {
+    fn rmsnorm(&mut self, x_off: u64, y_off: u64, w_off: u64, dim: u32, rows: usize) {
         self.sink_set_pipeline(&self.ps.rmsnorm);
-            self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
-            self.sink_set_buffer(&self.bufs.arena, y_off as usize, 1);
-            self.bind_blob(2);
-            self.sink_set_bytes( &w_off, 3);
-            self.sink_set_bytes( &dim, 4);
+        self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
+        self.sink_set_buffer(&self.bufs.arena, y_off as usize, 1);
+        self.bind_blob(2);
+        self.sink_set_bytes(&w_off, 3);
+        self.sink_set_bytes(&dim, 4);
         let grid = MTLSize {
             width: rows,
             height: 1,
@@ -1884,20 +1873,13 @@ impl StepEnc<'_> {
         self.sink_dispatch(grid, tg);
     }
 
-    fn rmsnorm_f32(
-        &mut self,
-        x_off: u64,
-        y_off: u64,
-        w_off: u64,
-        dim: u32,
-        rows: usize,
-    ) {
+    fn rmsnorm_f32(&mut self, x_off: u64, y_off: u64, w_off: u64, dim: u32, rows: usize) {
         self.sink_set_pipeline(&self.ps.rmsnorm_f32);
-            self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
-            self.sink_set_buffer(&self.bufs.arena, y_off as usize, 1);
-            self.bind_blob(2);
-            self.sink_set_bytes( &w_off, 3);
-            self.sink_set_bytes( &dim, 4);
+        self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
+        self.sink_set_buffer(&self.bufs.arena, y_off as usize, 1);
+        self.bind_blob(2);
+        self.sink_set_bytes(&w_off, 3);
+        self.sink_set_bytes(&dim, 4);
         let grid = MTLSize {
             width: rows,
             height: 1,
@@ -1939,11 +1921,11 @@ impl StepEnc<'_> {
             ),
         };
         self.sink_set_pipeline(ps);
-            self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
-            self.sink_set_buffer(&self.bufs.arena, y_off as usize, 1);
-            self.bind_blob(2);
-            self.sink_set_bytes( &w_off, 3);
-            self.sink_set_bytes( &m, 4);
+        self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
+        self.sink_set_buffer(&self.bufs.arena, y_off as usize, 1);
+        self.bind_blob(2);
+        self.sink_set_bytes(&w_off, 3);
+        self.sink_set_bytes(&m, 4);
         let tg = MTLSize {
             width: GEMM_THREADS_PER_TG,
             height: 1,
@@ -2072,8 +2054,8 @@ impl StepEnc<'_> {
         self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
         self.sink_set_buffer(&self.bufs.logits, logits_byte_off, 1);
         self.bind_blob(2);
-        self.sink_set_bytes( &w_off, 3);
-        self.sink_set_bytes( &m, 4);
+        self.sink_set_bytes(&w_off, 3);
+        self.sink_set_bytes(&m, 4);
         let tg = MTLSize {
             width: GEMM_THREADS_PER_TG,
             height: 1,
@@ -2250,8 +2232,7 @@ impl StepEnc<'_> {
         let params = [CANVAS as u32, VOCAB as u32, v0, chunk];
         self.sink_set_bytes(&params, 3);
         self.bind_debug_status(4);
-        let (grid, tg) =
-            crate::kernels::sub::sc_prob_cols::dispatch_shape(CANVAS, chunk as usize);
+        let (grid, tg) = crate::kernels::sub::sc_prob_cols::dispatch_shape(CANVAS, chunk as usize);
         self.sink_dispatch(grid, tg);
     }
 
@@ -2330,8 +2311,16 @@ impl StepEnc<'_> {
         let p1 = [CANVAS as u32, VOCAB as u32, maxk, 0u32];
         self.sink_set_bytes(&p1, 5);
         self.sink_dispatch(
-            MTLSize { width: CANVAS, height: 1, depth: 1 },
-            MTLSize { width: 256, height: 1, depth: 1 },
+            MTLSize {
+                width: CANVAS,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
         );
         self.sink_memory_barrier();
 
@@ -2346,14 +2335,27 @@ impl StepEnc<'_> {
         let p2 = [CANVAS as u32, HID as u32, maxk, 0u32];
         self.sink_set_bytes(&p2, 6);
         self.sink_dispatch(
-            MTLSize { width: CANVAS, height: 1, depth: 1 },
-            MTLSize { width: 256, height: 1, depth: 1 },
+            MTLSize {
+                width: CANVAS,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
         );
         self.sink_memory_barrier();
 
         // Finalize: f32 accumulator → bf16 soft slot (÷ SC_PROB_GEMM_SCALE, × √HID).
         let scale = (HID as f32).sqrt() / SC_PROB_GEMM_SCALE;
-        self.f32_to_half_scale(&self.bufs.gemm_b, self.arena().soft_off(), CANVAS * HID, scale);
+        self.f32_to_half_scale(
+            &self.bufs.gemm_b,
+            self.arena().soft_off(),
+            CANVAS * HID,
+            scale,
+        );
         Ok(())
     }
 
@@ -2364,21 +2366,21 @@ impl StepEnc<'_> {
     }
 
     fn residual(&mut self, a_off: u64, b_off: u64, y_off: u64, scal_off: u64, elems: usize) {
-            self.sink_set_buffer(&self.bufs.arena, a_off as usize, 0);
-            self.sink_set_buffer(&self.bufs.arena, b_off as usize, 1);
-            self.sink_set_buffer(&self.bufs.arena, y_off as usize, 2);
-            self.bind_blob(3);
-            self.sink_set_bytes( &scal_off, 4);
+        self.sink_set_buffer(&self.bufs.arena, a_off as usize, 0);
+        self.sink_set_buffer(&self.bufs.arena, b_off as usize, 1);
+        self.sink_set_buffer(&self.bufs.arena, y_off as usize, 2);
+        self.bind_blob(3);
+        self.sink_set_bytes(&scal_off, 4);
         self.dispatch_1d(&self.ps.residual, elems, 256);
     }
 
     fn glu(&mut self, gate_off: u64, up_off: u64, y_off: u64, elems: usize) {
         self.sink_set_pipeline(&self.ps.glu);
         let dims = [elems as u32, 0u32];
-            self.sink_set_buffer(&self.bufs.arena, gate_off as usize, 0);
-            self.sink_set_buffer(&self.bufs.arena, up_off as usize, 1);
-            self.sink_set_buffer(&self.bufs.arena, y_off as usize, 2);
-            self.sink_set_bytes(&dims, 3);
+        self.sink_set_buffer(&self.bufs.arena, gate_off as usize, 0);
+        self.sink_set_buffer(&self.bufs.arena, up_off as usize, 1);
+        self.sink_set_buffer(&self.bufs.arena, y_off as usize, 2);
+        self.sink_set_bytes(&dims, 3);
         self.dispatch_1d(&self.ps.glu, elems, 256);
     }
 
@@ -2401,7 +2403,11 @@ impl StepEnc<'_> {
         self.encode_layer_o_proj_tail(layer, layout)
     }
 
-    fn encode_layer_o_proj_gemm(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
+    fn encode_layer_o_proj_gemm(
+        &mut self,
+        layer: usize,
+        layout: &ModelLayout,
+    ) -> Result<(), Error> {
         let fm = self.forward_m;
         let l = &layout.layers[layer];
         let o_k = if l.is_full != 0 { 8192 } else { 4096 };
@@ -2415,18 +2421,40 @@ impl StepEnc<'_> {
         )
     }
 
-    fn encode_layer_o_proj_tail(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
+    fn encode_layer_o_proj_tail(
+        &mut self,
+        layer: usize,
+        layout: &ModelLayout,
+    ) -> Result<(), Error> {
         let fm = self.forward_m;
         let l = &layout.layers[layer];
-        self.rmsnorm(self.arena().tmp_off(), self.arena().tmp_off(), l.post_attn_ln, HID as u32, fm);
-        self.residual(self.arena().hidden_off(), self.arena().tmp_off(), self.arena().stream_off(), 0, fm * HID);
+        self.rmsnorm(
+            self.arena().tmp_off(),
+            self.arena().tmp_off(),
+            l.post_attn_ln,
+            HID as u32,
+            fm,
+        );
+        self.residual(
+            self.arena().hidden_off(),
+            self.arena().tmp_off(),
+            self.arena().stream_off(),
+            0,
+            fm * HID,
+        );
         Ok(())
     }
 
     fn encode_layer_dense_ffn(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
         let fm = self.forward_m;
         let l = &layout.layers[layer];
-        self.rmsnorm(self.arena().stream_off(), self.arena().tmp_off(), l.pre_ff_ln, HID as u32, fm);
+        self.rmsnorm(
+            self.arena().stream_off(),
+            self.arena().tmp_off(),
+            l.pre_ff_ln,
+            HID as u32,
+            fm,
+        );
         self.encode_layer_dense_gate_up(layer, layout)?;
         self.glu(
             self.arena().ffg_off(),
@@ -2458,7 +2486,11 @@ impl StepEnc<'_> {
         )
     }
 
-    fn encode_layer_dense_gate_up(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
+    fn encode_layer_dense_gate_up(
+        &mut self,
+        layer: usize,
+        layout: &ModelLayout,
+    ) -> Result<(), Error> {
         let fm = self.forward_m;
         let l = &layout.layers[layer];
         if fused_gate_up_enabled() && self.attn_ffn_bf16 {
@@ -2545,8 +2577,16 @@ impl StepEnc<'_> {
             self.bind_route(3);
             self.sink_set_bytes(&router_dims, 4);
             self.bind_debug_status(5);
-            let grid = MTLSize { width: fm.div_ceil(64), height: 1, depth: 1 };
-            let tg = MTLSize { width: 64, height: 1, depth: 1 };
+            let grid = MTLSize {
+                width: fm.div_ceil(64),
+                height: 1,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: 64,
+                height: 1,
+                depth: 1,
+            };
             self.sink_dispatch(grid, tg);
         } else {
             self.sink_set_pipeline(&self.ps.router);
@@ -2592,7 +2632,13 @@ impl StepEnc<'_> {
         }
 
         let l = &layout.layers[layer];
-        self.rmsnorm(self.arena().stream_off(), self.arena().moein_off(), l.pre_ff_ln_2, HID as u32, fm);
+        self.rmsnorm(
+            self.arena().stream_off(),
+            self.arena().moein_off(),
+            l.pre_ff_ln_2,
+            HID as u32,
+            fm,
+        );
         self.memzero_bytes(self.arena().moeout_off(), (fm * HID * 4) as u64);
         Ok(())
     }
@@ -2608,9 +2654,7 @@ impl StepEnc<'_> {
             return 32;
         }
         let fmt = self.block_profile.format;
-        if !moe_block_sparse_enabled()
-            || !matches!(fmt, QuantFormat::Q4Affine | QuantFormat::Q6)
-        {
+        if !moe_block_sparse_enabled() || !matches!(fmt, QuantFormat::Q4Affine | QuantFormat::Q6) {
             return 32;
         }
         // Wide pipelines are compiled for exactly the shapes/gather variants
@@ -2619,7 +2663,10 @@ impl StepEnc<'_> {
             .ps
             .sparse_tunable_wide_fmt(fmt, MOE_FF * 2, HID as u32, false)
             .is_some()
-            && self.ps.sparse_tunable_wide_fmt(fmt, HID as u32, MOE_FF, false).is_some();
+            && self
+                .ps
+                .sparse_tunable_wide_fmt(fmt, HID as u32, MOE_FF, false)
+                .is_some();
         if wide_ok {
             if crate::flags::progress_enabled() {
                 static ONCE: std::sync::Once = std::sync::Once::new();
@@ -2657,7 +2704,10 @@ impl StepEnc<'_> {
                 self.block_profile.format,
                 QuantFormat::Q4Affine | QuantFormat::Q6
             )
-            && self.ps.sparse_tunable_fmt(self.block_profile.format, n, k, gather).is_some();
+            && self
+                .ps
+                .sparse_tunable_fmt(self.block_profile.format, n, k, gather)
+                .is_some();
         // Wide-block weight-stationary prefill: the block list for this
         // forward was built at moe_block_m() rows (bucket_fill phase 1), so
         // the consuming pipeline's TUNE_BM must match — never fall back to a
@@ -2674,9 +2724,11 @@ impl StepEnc<'_> {
         // missing we'd read a stale A buffer, so fail loud rather than silently.
         let gather_ps = if gather {
             if tunable && wide {
-                self.ps.sparse_tunable_wide_fmt(self.block_profile.format, n, k, true)
+                self.ps
+                    .sparse_tunable_wide_fmt(self.block_profile.format, n, k, true)
             } else if tunable {
-                self.ps.sparse_tunable_fmt(self.block_profile.format, n, k, true)
+                self.ps
+                    .sparse_tunable_fmt(self.block_profile.format, n, k, true)
             } else {
                 self.ps.block_sparse_gather(n, k, adaptive)
             }
@@ -2700,7 +2752,8 @@ impl StepEnc<'_> {
                 .sparse_tunable_fmt(self.block_profile.format, n, k, false)
                 .ok_or(Error::Format("missing tunable sparse pipeline"))?
         } else if block_sparse {
-            self.ps.block_sparse(self.block_profile.format, n, k, adaptive)?
+            self.ps
+                .block_sparse(self.block_profile.format, n, k, adaptive)?
         } else {
             self.ps.block_grouped(self.block_profile.format, n, k)?
         };
@@ -2711,13 +2764,13 @@ impl StepEnc<'_> {
         } else {
             &self.bufs.gemm_b
         };
-            self.sink_set_buffer(a_buf, buf_a_off, 0);
-            // Expert weights: region-2 buffer on split blobs (job offsets are
-            // rebased to match in layer_moe_block_jobs_impl).
-            self.bind_blob_experts(1);
-            self.sink_set_buffer(&self.bufs.gemm_b, buf_c_off, 2);
-            self.sink_set_bytes(jobs, 3);
-            self.sink_set_buffer(&self.bufs.route, row_start_off, 4);
+        self.sink_set_buffer(a_buf, buf_a_off, 0);
+        // Expert weights: region-2 buffer on split blobs (job offsets are
+        // rebased to match in layer_moe_block_jobs_impl).
+        self.bind_blob_experts(1);
+        self.sink_set_buffer(&self.bufs.gemm_b, buf_c_off, 2);
+        self.sink_set_bytes(jobs, 3);
+        self.sink_set_buffer(&self.bufs.route, row_start_off, 4);
         let num_jobs = N_EXPERTS as u32;
         self.sink_set_bytes(&num_jobs, 5);
         self.bind_route(6);
@@ -2772,11 +2825,7 @@ impl StepEnc<'_> {
             gather_count,
             256,
             |this, base, _chunk| {
-                this.sink_set_buffer(
-                    &this.bufs.arena,
-                    this.arena().moein_off() as usize,
-                    0,
-                );
+                this.sink_set_buffer(&this.bufs.arena, this.arena().moein_off() as usize, 0);
                 this.sink_set_buffer(&this.bufs.route, token_list_off, 1);
                 this.sink_set_buffer(&this.bufs.gemm_b, moe_w_byte_off_a(), 2);
                 this.sink_set_buffer(&this.bufs.dummy_dump, 0, 5);
@@ -2803,15 +2852,20 @@ impl StepEnc<'_> {
         // the static plane-offset capacity.
         let slots = (self.forward_m * TOP_K) as u32;
         let gather_count = slots as usize * HID;
-        self.dispatch_1d_ranged(&self.ps.gather_rows, gather_count, 256, |this, base, _chunk| {
-            this.sink_set_buffer(&this.bufs.gemm_a, 0, 0);
-            this.sink_set_buffer(&this.bufs.route, token_list_off, 1);
-            this.sink_set_buffer(&this.bufs.gemm_b, moe_w_byte_off_a(), 2);
-            this.sink_set_buffer(&this.bufs.dummy_dump, 0, 5);
-            this.sink_set_bytes(&gather_dims, 3);
-            this.sink_set_bytes(&slots, 4);
-            this.sink_set_bytes(&base, 6);
-        });
+        self.dispatch_1d_ranged(
+            &self.ps.gather_rows,
+            gather_count,
+            256,
+            |this, base, _chunk| {
+                this.sink_set_buffer(&this.bufs.gemm_a, 0, 0);
+                this.sink_set_buffer(&this.bufs.route, token_list_off, 1);
+                this.sink_set_buffer(&this.bufs.gemm_b, moe_w_byte_off_a(), 2);
+                this.sink_set_buffer(&this.bufs.dummy_dump, 0, 5);
+                this.sink_set_bytes(&gather_dims, 3);
+                this.sink_set_bytes(&slots, 4);
+                this.sink_set_bytes(&base, 6);
+            },
+        );
         Ok(())
     }
 
@@ -2854,11 +2908,7 @@ impl StepEnc<'_> {
         Ok(())
     }
 
-    fn encode_moe_batched_down(
-        &mut self,
-        layer: usize,
-        layout: &ModelLayout,
-    ) -> Result<(), Error> {
+    fn encode_moe_batched_down(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
         let l = &layout.layers[layer];
         let (_, down_jobs) = layer_moe_block_jobs_impl(
             l,
@@ -2904,11 +2954,7 @@ impl StepEnc<'_> {
         Ok(())
     }
 
-    fn encode_layer_moe_scalar(
-        &mut self,
-        layer: usize,
-        layout: &ModelLayout,
-    ) -> Result<(), Error> {
+    fn encode_layer_moe_scalar(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
         let fm = self.forward_m;
         let layer_off = layer_byte_offset(layer);
         self.sink_set_pipeline(self.ps.moe_scalar(self.block_profile.format));
@@ -2952,19 +2998,51 @@ impl StepEnc<'_> {
         }
     }
 
-    fn encode_layer_moe_post_norm(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
+    fn encode_layer_moe_post_norm(
+        &mut self,
+        layer: usize,
+        layout: &ModelLayout,
+    ) -> Result<(), Error> {
         let fm = self.forward_m;
         let l = &layout.layers[layer];
-        self.rmsnorm_f32(self.arena().moeout_off(), self.arena().moein_off(), l.post_ff_ln_2, HID as u32, fm);
+        self.rmsnorm_f32(
+            self.arena().moeout_off(),
+            self.arena().moein_off(),
+            l.post_ff_ln_2,
+            HID as u32,
+            fm,
+        );
         Ok(())
     }
 
-    fn encode_layer_moe_post_combine(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
+    fn encode_layer_moe_post_combine(
+        &mut self,
+        layer: usize,
+        layout: &ModelLayout,
+    ) -> Result<(), Error> {
         let fm = self.forward_m;
         let l = &layout.layers[layer];
-        self.residual(self.arena().dense_off(), self.arena().moein_off(), self.arena().tmp_off(), 0, fm * HID);
-        self.rmsnorm(self.arena().tmp_off(), self.arena().tmp_off(), l.post_ff_ln, HID as u32, fm);
-        self.residual(self.arena().stream_off(), self.arena().tmp_off(), self.arena().hidden_off(), l.layer_scalar, fm * HID);
+        self.residual(
+            self.arena().dense_off(),
+            self.arena().moein_off(),
+            self.arena().tmp_off(),
+            0,
+            fm * HID,
+        );
+        self.rmsnorm(
+            self.arena().tmp_off(),
+            self.arena().tmp_off(),
+            l.post_ff_ln,
+            HID as u32,
+            fm,
+        );
+        self.residual(
+            self.arena().stream_off(),
+            self.arena().tmp_off(),
+            self.arena().hidden_off(),
+            l.layer_scalar,
+            fm * HID,
+        );
         Ok(())
     }
 
@@ -2991,7 +3069,13 @@ impl StepEnc<'_> {
         expert_id: u32,
     ) {
         let l = &layout.layers[layer];
-        self.rmsnorm(self.arena().stream_off(), self.arena().moein_off(), l.pre_ff_ln_2, HID as u32, CANVAS);
+        self.rmsnorm(
+            self.arena().stream_off(),
+            self.arena().moein_off(),
+            l.pre_ff_ln_2,
+            HID as u32,
+            CANVAS,
+        );
         self.memzero_bytes(self.arena().moeout_off(), (CANVAS * HID * 4) as u64);
         write_single_expert_route(&self.bufs.route, position, expert_id);
     }
@@ -3042,11 +3126,7 @@ impl StepEnc<'_> {
     }
 
     /// Input layernorm + fused Q‖K(‖V) projections (stops before qk_rope_kv).
-    fn encode_layer_qkv_gemm(
-        &mut self,
-        layer: usize,
-        layout: &ModelLayout,
-    ) -> Result<(), Error> {
+    fn encode_layer_qkv_gemm(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
         let fm = self.forward_m;
         let l = &layout.layers[layer];
         self.rmsnorm(
@@ -3211,9 +3291,21 @@ impl StepEnc<'_> {
         // widths (n_kv*hd); Q at n_q*hd.
         let q_row = CANVAS * self.sub_c * STEP_NQ_HEADS * l.head_dim as usize * 2;
         let kv_row = CANVAS * self.sub_c * (l.n_kv_heads * l.head_dim) as usize * 2;
-        self.sink_set_buffer(&self.bufs.arena, self.arena().attnq_off() as usize + q_row, 0);
-        self.sink_set_buffer(&self.bufs.arena, self.arena().attnk_off() as usize + kv_row, 1);
-        self.sink_set_buffer(&self.bufs.arena, self.arena().attnv_off() as usize + kv_row, 2);
+        self.sink_set_buffer(
+            &self.bufs.arena,
+            self.arena().attnq_off() as usize + q_row,
+            0,
+        );
+        self.sink_set_buffer(
+            &self.bufs.arena,
+            self.arena().attnk_off() as usize + kv_row,
+            1,
+        );
+        self.sink_set_buffer(
+            &self.bufs.arena,
+            self.arena().attnv_off() as usize + kv_row,
+            2,
+        );
         self.bind_kvcache(3);
         self.bind_blob(4);
         self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 5);
@@ -3271,9 +3363,17 @@ impl StepEnc<'_> {
         // Per-sub-chunk row offsets into the batched Q/O planes (sub_c = 0
         // outside a super-chunk).
         let qo_row = CANVAS * self.sub_c * STEP_NQ_HEADS * l.head_dim as usize * 2;
-        self.sink_set_buffer(&self.bufs.arena, self.arena().attnq_off() as usize + qo_row, 0);
+        self.sink_set_buffer(
+            &self.bufs.arena,
+            self.arena().attnq_off() as usize + qo_row,
+            0,
+        );
         self.bind_kvcache(1);
-        self.sink_set_buffer(&self.bufs.arena, self.arena().attno_off() as usize + qo_row, 2);
+        self.sink_set_buffer(
+            &self.bufs.arena,
+            self.arena().attno_off() as usize + qo_row,
+            2,
+        );
         self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 3);
         self.bind_params(4);
         // Sliding layers (is_full==0) attend a bounded window (Gemma-4
@@ -3353,7 +3453,11 @@ impl StepEnc<'_> {
             };
             for b in 0..blocks {
                 let t_begin = b * block;
-                let t_end = if blocks == 1 { t_total } else { ((b + 1) * block).min(t_total) };
+                let t_end = if blocks == 1 {
+                    t_total
+                } else {
+                    ((b + 1) * block).min(t_total)
+                };
                 let blk = [
                     t_begin as u32,
                     t_end as u32,
@@ -3395,43 +3499,48 @@ impl StepEnc<'_> {
             }
             StepStage::ScSoftembed => self.encode_sc_softembed(layout),
             StepStage::ScPreNorm => {
-                self.rmsnorm(self.arena().soft_off(), self.arena().tmp_off(), layout.sc_pre_norm, HID as u32, CANVAS);
+                self.rmsnorm(
+                    self.arena().soft_off(),
+                    self.arena().tmp_off(),
+                    layout.sc_pre_norm,
+                    HID as u32,
+                    CANVAS,
+                );
                 Ok(())
             }
-            StepStage::ScGateGemm => {
-                self.gemm_q8(
-                    self.arena().tmp_off(),
-                    self.arena().ffg_off(),
-                    layout.sc_gate,
-                    CANVAS as u32,
-                    DENSE_FF,
-                    HID as u32,
-                )
-            }
-            StepStage::ScUpGemm => {
-                self.gemm_q8(
-                    self.arena().tmp_off(),
-                    self.arena().ffu_off(),
-                    layout.sc_up,
-                    CANVAS as u32,
-                    DENSE_FF,
-                    HID as u32,
-                )
-            }
+            StepStage::ScGateGemm => self.gemm_q8(
+                self.arena().tmp_off(),
+                self.arena().ffg_off(),
+                layout.sc_gate,
+                CANVAS as u32,
+                DENSE_FF,
+                HID as u32,
+            ),
+            StepStage::ScUpGemm => self.gemm_q8(
+                self.arena().tmp_off(),
+                self.arena().ffu_off(),
+                layout.sc_up,
+                CANVAS as u32,
+                DENSE_FF,
+                HID as u32,
+            ),
             StepStage::ScGlu => {
-                self.glu(self.arena().ffg_off(), self.arena().ffu_off(), self.arena().ffg_off(), CANVAS * DENSE_FF as usize);
+                self.glu(
+                    self.arena().ffg_off(),
+                    self.arena().ffu_off(),
+                    self.arena().ffg_off(),
+                    CANVAS * DENSE_FF as usize,
+                );
                 Ok(())
             }
-            StepStage::ScDownGemm => {
-                self.gemm_q8(
-                    self.arena().ffg_off(),
-                    self.arena().dense_off(),
-                    layout.sc_down,
-                    CANVAS as u32,
-                    HID as u32,
-                    DENSE_FF,
-                )
-            }
+            StepStage::ScDownGemm => self.gemm_q8(
+                self.arena().ffg_off(),
+                self.arena().dense_off(),
+                layout.sc_down,
+                CANVAS as u32,
+                HID as u32,
+                DENSE_FF,
+            ),
             StepStage::EmbedGather => {
                 self.dispatch_embed_gather(layout.embed);
                 Ok(())
@@ -3447,7 +3556,13 @@ impl StepEnc<'_> {
                 Ok(())
             }
             StepStage::RmsNormHidden => {
-                self.rmsnorm(self.arena().hidden_off(), self.arena().hidden_off(), 0, HID as u32, self.forward_m);
+                self.rmsnorm(
+                    self.arena().hidden_off(),
+                    self.arena().hidden_off(),
+                    0,
+                    HID as u32,
+                    self.forward_m,
+                );
                 Ok(())
             }
             StepStage::LayerInputNormQkv => self.encode_layer_qkv_gemm(layer, layout),
@@ -3472,7 +3587,13 @@ impl StepEnc<'_> {
             StepStage::LayerMoePostNorm => self.encode_layer_moe_post_norm(layer, layout),
             StepStage::LayerMoePostCombine => self.encode_layer_moe_post_combine(layer, layout),
             StepStage::FinalNorm => {
-                self.rmsnorm(self.arena().hidden_off(), self.arena().tmp_off(), layout.final_norm, HID as u32, CANVAS);
+                self.rmsnorm(
+                    self.arena().hidden_off(),
+                    self.arena().tmp_off(),
+                    layout.final_norm,
+                    HID as u32,
+                    CANVAS,
+                );
                 Ok(())
             }
             StepStage::LmHeadGemm => {
@@ -3598,8 +3719,18 @@ impl StepEnc<'_> {
     fn encode_prefill_chunk(&mut self, layout: &ModelLayout, layers: usize) -> Result<(), Error> {
         use step_schedule::StepStage;
         self.prefill_causal = true;
-        self.exec_stage(StepStage::EmbedGather, 0, layout, StepFinishMode::ForwardOnly)?;
-        self.exec_stage(StepStage::RmsNormHidden, 0, layout, StepFinishMode::ForwardOnly)?;
+        self.exec_stage(
+            StepStage::EmbedGather,
+            0,
+            layout,
+            StepFinishMode::ForwardOnly,
+        )?;
+        self.exec_stage(
+            StepStage::RmsNormHidden,
+            0,
+            layout,
+            StepFinishMode::ForwardOnly,
+        )?;
         let per_layer = step_schedule::per_layer_stages(&self.block_profile);
         for layer in 0..layers {
             for &stage in &per_layer {
@@ -3627,8 +3758,18 @@ impl StepEnc<'_> {
         use step_schedule::StepStage;
         self.prefill_causal = true;
         self.forward_m = n_subs * CANVAS;
-        self.exec_stage(StepStage::EmbedGather, 0, layout, StepFinishMode::ForwardOnly)?;
-        self.exec_stage(StepStage::RmsNormHidden, 0, layout, StepFinishMode::ForwardOnly)?;
+        self.exec_stage(
+            StepStage::EmbedGather,
+            0,
+            layout,
+            StepFinishMode::ForwardOnly,
+        )?;
+        self.exec_stage(
+            StepStage::RmsNormHidden,
+            0,
+            layout,
+            StepFinishMode::ForwardOnly,
+        )?;
         let per_layer = step_schedule::per_layer_stages(&self.block_profile);
         for layer in 0..layers {
             for &stage in &per_layer {
@@ -3697,7 +3838,13 @@ impl StepEnc<'_> {
             self.encode_sc_logit_rowstats();
             self.encode_sc_softembed(layout)?;
 
-            self.rmsnorm(self.arena().soft_off(), self.arena().tmp_off(), layout.sc_pre_norm, HID as u32, CANVAS);
+            self.rmsnorm(
+                self.arena().soft_off(),
+                self.arena().tmp_off(),
+                layout.sc_pre_norm,
+                HID as u32,
+                CANVAS,
+            );
             self.gemm_q8(
                 self.arena().tmp_off(),
                 self.arena().ffg_off(),
@@ -3714,7 +3861,12 @@ impl StepEnc<'_> {
                 DENSE_FF,
                 HID as u32,
             )?;
-            self.glu(self.arena().ffg_off(), self.arena().ffu_off(), self.arena().ffg_off(), CANVAS * DENSE_FF as usize);
+            self.glu(
+                self.arena().ffg_off(),
+                self.arena().ffu_off(),
+                self.arena().ffg_off(),
+                CANVAS * DENSE_FF as usize,
+            );
             self.gemm_q8(
                 self.arena().ffg_off(),
                 self.arena().dense_off(),
@@ -3734,15 +3886,17 @@ impl StepEnc<'_> {
             0,
             CANVAS * HID,
         );
-        self.rmsnorm(self.arena().hidden_off(), self.arena().hidden_off(), 0, HID as u32, CANVAS);
+        self.rmsnorm(
+            self.arena().hidden_off(),
+            self.arena().hidden_off(),
+            0,
+            HID as u32,
+            CANVAS,
+        );
         Ok(())
     }
 
-    fn encode_partial_lm_head(
-        &mut self,
-        layout: &ModelLayout,
-        m: u32,
-    ) -> Result<(), Error> {
+    fn encode_partial_lm_head(&mut self, layout: &ModelLayout, m: u32) -> Result<(), Error> {
         let token_list_off = std::mem::offset_of!(RouteScratch, token_list);
         let num_slots_off = std::mem::offset_of!(RouteScratch, num_slots);
         let compact_row = CANVAS as u32 - m;
@@ -3766,15 +3920,20 @@ impl StepEnc<'_> {
 
         let gather_dims = [0u32, HID as u32];
         let gather_count = (m as usize) * HID;
-        self.dispatch_1d_ranged(&self.ps.gather_rows_bf16, gather_count, 256, |this, base, _chunk| {
-            this.sink_set_buffer(&this.bufs.arena, this.arena().tmp_off() as usize, 0);
-            this.sink_set_buffer(&this.bufs.route, token_list_off, 1);
-            this.sink_set_buffer(&this.bufs.arena, this.arena().dense_off() as usize, 2);
-            this.sink_set_buffer(&this.bufs.dummy_dump, 0, 5);
-            this.sink_set_bytes(&gather_dims, 3);
-            this.sink_set_bytes(&m, 4);
-            this.sink_set_bytes(&base, 6);
-        });
+        self.dispatch_1d_ranged(
+            &self.ps.gather_rows_bf16,
+            gather_count,
+            256,
+            |this, base, _chunk| {
+                this.sink_set_buffer(&this.bufs.arena, this.arena().tmp_off() as usize, 0);
+                this.sink_set_buffer(&this.bufs.route, token_list_off, 1);
+                this.sink_set_buffer(&this.bufs.arena, this.arena().dense_off() as usize, 2);
+                this.sink_set_buffer(&this.bufs.dummy_dump, 0, 5);
+                this.sink_set_bytes(&gather_dims, 3);
+                this.sink_set_bytes(&m, 4);
+                this.sink_set_bytes(&base, 6);
+            },
+        );
 
         self.gemm_q8_logits(
             self.arena().dense_off(),
@@ -3810,7 +3969,13 @@ impl StepEnc<'_> {
         layout: &ModelLayout,
         mode: StepFinishMode,
     ) -> Result<(), Error> {
-        self.rmsnorm(self.arena().hidden_off(), self.arena().tmp_off(), layout.final_norm, HID as u32, CANVAS);
+        self.rmsnorm(
+            self.arena().hidden_off(),
+            self.arena().tmp_off(),
+            layout.final_norm,
+            HID as u32,
+            CANVAS,
+        );
         let m = self.partial_lm_m;
         if partial_lm_head_enabled() && m < CANVAS as u32 {
             self.encode_partial_lm_head(layout, m)?;
@@ -4025,11 +4190,7 @@ fn zero_buffer(buf: &ProtocolObject<dyn MTLBuffer>) {
 }
 
 /// Synthetic route: one token at `position` routed to `expert_id` with weight 1.0 (f16).
-fn write_single_expert_route(
-    buf: &ProtocolObject<dyn MTLBuffer>,
-    position: usize,
-    expert_id: u32,
-) {
+fn write_single_expert_route(buf: &ProtocolObject<dyn MTLBuffer>, position: usize, expert_id: u32) {
     assert!(position < CANVAS);
     assert!((expert_id as usize) < N_EXPERTS);
     zero_buffer(buf);
@@ -4059,17 +4220,13 @@ fn read_struct<T: Copy>(buf: &ProtocolObject<dyn MTLBuffer>) -> T {
 /// Debug: dump the raw bytes of a buffer to `path` (for KV-cache fast-vs-engine
 /// diffs). Bytes are bf16 in KV-cache layout; the diff tool reinterprets them.
 fn dump_buffer_raw(buf: &ProtocolObject<dyn MTLBuffer>, path: &str) {
-    let bytes = unsafe {
-        std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, buf.length())
-    };
+    let bytes =
+        unsafe { std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, buf.length()) };
     match std::fs::write(path, bytes) {
         Ok(()) => eprintln!("step-kernel: dumped {} bytes to {path}", bytes.len()),
         Err(e) => eprintln!("step-kernel: DGQ_DUMP_KV write failed: {e}"),
     }
 }
-
-
-
 
 /// Per-position entropy at end of a denoise block (`DGQ_LOG_FINAL_ENTROPY=1`).
 pub fn log_final_per_token_entropy(
@@ -4078,7 +4235,9 @@ pub fn log_final_per_token_entropy(
     stop_flag: u32,
     eos_token_id: u32,
 ) {
-    use crate::sample::{decode_early_stop_flag, is_active_token, EarlyStopKind, FILLER_TOKEN_ID, PAD_TOKEN_ID};
+    use crate::sample::{
+        EarlyStopKind, FILLER_TOKEN_ID, PAD_TOKEN_ID, decode_early_stop_flag, is_active_token,
+    };
     let stop_kind = match decode_early_stop_flag(stop_flag) {
         Some(EarlyStopKind::Confident) => "confident_stable",
         Some(EarlyStopKind::Plateau) => "plateau_stop",
@@ -4101,14 +4260,17 @@ pub fn log_final_per_token_entropy(
         } else {
             "active"
         };
-        eprintln!(
-            "  pos={pos:3} {tag:6} id={id:6} argmax={am:6} ent={ent:8.4} accept={acc}",
-        );
+        eprintln!("  pos={pos:3} {tag:6} id={id:6} argmax={am:6} ent={ent:8.4} accept={acc}",);
     }
     let mut high_ent_active = Vec::new();
     for pos in 0..CANVAS {
         if is_active_token(state.ids[pos]) && state.entropy[pos] > 0.1 {
-            high_ent_active.push((pos, state.entropy[pos], state.ids[pos], state.prev_argmax[pos]));
+            high_ent_active.push((
+                pos,
+                state.entropy[pos],
+                state.ids[pos],
+                state.prev_argmax[pos],
+            ));
         }
     }
     high_ent_active.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -4132,8 +4294,6 @@ pub fn log_final_per_token_entropy(
     }
 }
 
-
-
 /// HF linear schedule: temperature at start of denoise step `steps_done` (0 = first step).
 pub fn scheduled_temperature(steps_done: u32, params: &StepParams) -> f32 {
     let max = params.max_steps.max(1) as f32;
@@ -4155,8 +4315,7 @@ pub fn log_denoise_parity_step(
     params: &StepParams,
     logits: &ProtocolObject<dyn MTLBuffer>,
 ) {
-    let cpu_mask =
-        crate::sample::accept_mask_from_entropies(&state.entropy, params.entropy_bound);
+    let cpu_mask = crate::sample::accept_mask_from_entropies(&state.entropy, params.entropy_bound);
     let cpu_accept = cpu_mask.iter().filter(|&&m| m).count() as u32;
     let gpu_accept = state.accept.iter().filter(|&&a| a != 0).count();
     let temp = scheduled_temperature(state.step.saturating_sub(1), params);
@@ -4179,7 +4338,6 @@ pub fn log_denoise_parity_step(
         );
     }
 }
-
 
 fn count_non_finite_half(buf: &ProtocolObject<dyn MTLBuffer>, elems: usize) -> (usize, f32) {
     use crate::kernels::sub::bf16;
@@ -4236,7 +4394,10 @@ fn half_buffer_stats(
     (finite, max_abs)
 }
 
-fn arena_hidden_stats(arena: &ProtocolObject<dyn MTLBuffer>, layout: &ArenaLayout) -> (bool, f32, usize) {
+fn arena_hidden_stats(
+    arena: &ProtocolObject<dyn MTLBuffer>,
+    layout: &ArenaLayout,
+) -> (bool, f32, usize) {
     let sample = read_arena_buffer_f32(arena, layout.hidden_off() as usize, CANVAS * HID);
     let mut max_abs = 0.0f32;
     let mut finite = true;
@@ -4347,7 +4508,11 @@ impl StepRuntime {
             // Batched super-chunk: n_subs full-CANVAS causal sub-chunks as one
             // forward (needs kv headroom for the whole super-chunk). The tail
             // (< 2 full chunks) falls back to plain 256-chunks.
-            let n_subs = if batch { (remaining / CANVAS).min(PREFILL_SUBS) } else { 1 };
+            let n_subs = if batch {
+                (remaining / CANVAS).min(PREFILL_SUBS)
+            } else {
+                1
+            };
             if n_subs >= 2 && pos + n_subs * CANVAS + CANVAS <= self.max_seq {
                 let m = n_subs * CANVAS;
                 self.set_canvas_ids(&delta_token_ids[pos - offset..pos - offset + m])?;
@@ -4359,7 +4524,8 @@ impl StepRuntime {
             }
             let chunk_len = remaining.min(CANVAS);
             let mut ids = [0u32; CANVAS];
-            ids[..chunk_len].copy_from_slice(&delta_token_ids[pos - offset..pos - offset + chunk_len]);
+            ids[..chunk_len]
+                .copy_from_slice(&delta_token_ids[pos - offset..pos - offset + chunk_len]);
             self.set_canvas_ids(&ids)?;
             self.set_kv_len(pos as u32);
             self.dispatch_and_wait(|enc| enc.encode_prefill_chunk(&layout, layers))?;
@@ -4385,7 +4551,9 @@ impl StepRuntime {
         // CANVAS for denoise / plain prefill chunks; up to PREFILL_M for a
         // batched prefill super-chunk.
         if ids.len() != CANVAS && (ids.len() > PREFILL_M || ids.len() % CANVAS != 0) {
-            return Err(Error::Format("canvas ids length must be CANVAS..=PREFILL_M"));
+            return Err(Error::Format(
+                "canvas ids length must be CANVAS..=PREFILL_M",
+            ));
         }
         let mut state = self.read_canvas_state();
         for (i, &id) in ids.iter().enumerate() {
@@ -4459,8 +4627,7 @@ impl StepRuntime {
             return Ok(());
         }
         let sample = logits_finite_sample_count().min(CANVAS * VOCAB);
-        let (finite, max_abs) =
-            half_buffer_stats(&self.bufs.logits, 0, CANVAS * VOCAB, sample);
+        let (finite, max_abs) = half_buffer_stats(&self.bufs.logits, 0, CANVAS * VOCAB, sample);
         if !finite {
             eprintln!("non-finite logits (max_abs={max_abs:.4}, sample={sample})");
             return Err(Error::Format("non-finite logits"));
@@ -4515,7 +4682,11 @@ impl StepRuntime {
     pub fn fill_moe_out_dgq_cpu(&mut self, layer: usize) -> Result<(), Error> {
         let route: RouteScratch = read_struct(&self.bufs.route);
         let routes = routes_from_route_scratch(&route);
-        let moe_in = read_arena_buffer_f32(&self.bufs.arena, self.bufs.arena_map.moein_off() as usize, CANVAS * HID);
+        let moe_in = read_arena_buffer_f32(
+            &self.bufs.arena,
+            self.bufs.arena_map.moein_off() as usize,
+            CANVAS * HID,
+        );
         let mut moe_out = vec![0.0f32; CANVAS * HID];
         let mut scratch = MoeScratch::new(CANVAS, &self.text_config);
         experts_forward_dgq_cpu(
@@ -4627,13 +4798,23 @@ impl StepRuntime {
         };
 
         self.dispatch_and_wait(|enc| enc.encode_step_preamble(&layout, first_step))?;
-        probe(self, "preamble:soft", self.bufs.arena_map.soft_off(), CANVAS * HID);
+        probe(
+            self,
+            "preamble:soft",
+            self.bufs.arena_map.soft_off(),
+            CANVAS * HID,
+        );
 
         for layer in 0..layers {
             let a = &self.bufs.arena_map;
             let (hidden, attnq, attno, tmp, ffg, dense, moein) = (
-                a.hidden_off(), a.attnq_off(), a.attno_off(), a.tmp_off(),
-                a.ffg_off(), a.dense_off(), a.moein_off(),
+                a.hidden_off(),
+                a.attnq_off(),
+                a.attno_off(),
+                a.tmp_off(),
+                a.ffg_off(),
+                a.dense_off(),
+                a.moein_off(),
             );
             self.time_enc_stage(|e| e.encode_layer_qkv_gemm(layer, &layout))?;
             probe(self, "layer:qkv(Q)", attnq, CANVAS * 4096);
@@ -4645,14 +4826,40 @@ impl StepRuntime {
             self.time_enc_stage(|e| e.encode_layer_o_proj_tail(layer, &layout))?;
             probe(self, "layer:resid_pre_moe(hidden)", hidden, CANVAS * HID);
             let l = &layout.layers[layer];
-            self.time_enc_stage(|e| { e.rmsnorm(e.arena().stream_off(), e.arena().tmp_off(), l.pre_ff_ln, HID as u32, CANVAS); Ok(()) })?;
+            self.time_enc_stage(|e| {
+                e.rmsnorm(
+                    e.arena().stream_off(),
+                    e.arena().tmp_off(),
+                    l.pre_ff_ln,
+                    HID as u32,
+                    CANVAS,
+                );
+                Ok(())
+            })?;
             self.time_enc_stage(|e| e.encode_layer_dense_gate_up(layer, &layout))?;
             probe(self, "layer:gate_up", ffg, CANVAS * DENSE_FF as usize);
-            self.time_enc_stage(|e| { e.glu(e.arena().ffg_off(), e.arena().ffu_off(), e.arena().ffg_off(), CANVAS * DENSE_FF as usize); Ok(()) })?;
+            self.time_enc_stage(|e| {
+                e.glu(
+                    e.arena().ffg_off(),
+                    e.arena().ffu_off(),
+                    e.arena().ffg_off(),
+                    CANVAS * DENSE_FF as usize,
+                );
+                Ok(())
+            })?;
             probe(self, "layer:swiglu", ffg, CANVAS * DENSE_FF as usize);
             self.time_enc_stage(|e| e.encode_layer_dense_down(layer, &layout))?;
             probe(self, "layer:dense_down", dense, CANVAS * HID);
-            self.time_enc_stage(|e| { e.rmsnorm(e.arena().dense_off(), e.arena().dense_off(), l.post_ff_ln_1, HID as u32, CANVAS); Ok(()) })?;
+            self.time_enc_stage(|e| {
+                e.rmsnorm(
+                    e.arena().dense_off(),
+                    e.arena().dense_off(),
+                    l.post_ff_ln_1,
+                    HID as u32,
+                    CANVAS,
+                );
+                Ok(())
+            })?;
             self.time_enc_stage(|e| e.encode_layer_router_buckets(layer, &layout))?;
             // MoE
             self.time_enc_stage(|e| e.encode_moe_batched_gate_up(layer, &layout))?;
@@ -4664,14 +4871,27 @@ impl StepRuntime {
             self.time_enc_stage(|e| e.encode_layer_moe_post_combine(layer, &layout))?;
             probe(self, "layer:resid_post_moe(hidden)", hidden, CANVAS * HID);
             // Per-layer residual peak (the f16-overflow suspect).
-            let (_, hmx) = half_buffer_stats(&self.bufs.arena, hidden as usize, CANVAS * HID, SAMPLE);
+            let (_, hmx) =
+                half_buffer_stats(&self.bufs.arena, hidden as usize, CANVAS * HID, SAMPLE);
             eprintln!("  layer {layer:>2}: residual(hidden) max|x| = {hmx:.1}");
         }
 
-        eprintln!("=== bf16 activation ranges (max|x| across {layers} layers) — f16 max = 65504 ===");
+        eprintln!(
+            "=== bf16 activation ranges (max|x| across {layers} layers) — f16 max = 65504 ==="
+        );
         for (label, (mx, nf)) in &peak {
-            let flag = if *mx > 65504.0 { "  <-- OVERFLOWS f16" } else if *mx > 16384.0 { "  (tight)" } else { "" };
-            eprintln!("  {label:<28} {mx:>12.1}{}{}", if *nf { " [non-finite!]" } else { "" }, flag);
+            let flag = if *mx > 65504.0 {
+                "  <-- OVERFLOWS f16"
+            } else if *mx > 16384.0 {
+                "  (tight)"
+            } else {
+                ""
+            };
+            eprintln!(
+                "  {label:<28} {mx:>12.1}{}{}",
+                if *nf { " [non-finite!]" } else { "" },
+                flag
+            );
         }
         Ok(())
     }
@@ -4749,7 +4969,8 @@ impl StepRuntime {
         }
 
         for layer in 0..layers {
-            moe_prof.post += self.time_enc_stage(|e| e.encode_layer_moe_post_norm(layer, &layout))?;
+            moe_prof.post +=
+                self.time_enc_stage(|e| e.encode_layer_moe_post_norm(layer, &layout))?;
             moe_prof.post +=
                 self.time_enc_stage(|e| e.encode_layer_moe_post_combine(layer, &layout))?;
         }
@@ -4831,11 +5052,7 @@ fn shared_step_pipelines(
     Ok(leaked)
 }
 
-pub fn log_step_memory_budget(
-    blob_bytes: u64,
-    max_seq: usize,
-    layout: &ModelLayout,
-) {
+pub fn log_step_memory_budget(blob_bytes: u64, max_seq: usize, layout: &ModelLayout) {
     let kv = kv_cache_bytes(layout, max_seq);
     let logits = (CANVAS * VOCAB * 2) as u64;
     let sc_probs = sc_probs_buffer_bytes() as u64;
@@ -4845,39 +5062,33 @@ pub fn log_step_memory_budget(
     let gpu_static = kv + logits + sc_probs + arena + gemm_scratch;
     let total = blob_bytes + gpu_static;
     if crate::flags::progress_enabled() {
-    eprintln!("step-kernel memory budget:");
-    eprintln!(
-        "  blob:       {:.2} GiB",
-        blob_bytes as f64 / (1024.0_f64.powi(3))
-    );
-    eprintln!(
-        "  arena:      {:.2} MiB",
-        arena as f64 / (1024.0 * 1024.0)
-    );
-    eprintln!(
-        "  kv cache:   {:.2} MiB (max_seq={max_seq})",
-        kv as f64 / (1024.0 * 1024.0)
-    );
-    eprintln!(
-        "  logits:     {:.2} MiB",
-        logits as f64 / (1024.0 * 1024.0)
-    );
-    eprintln!(
-        "  sc_probs:   {:.2} MiB",
-        sc_probs as f64 / (1024.0 * 1024.0)
-    );
-    eprintln!(
-        "  gemm scratch:{:.2} MiB",
-        gemm_scratch as f64 / (1024.0 * 1024.0)
-    );
-    eprintln!(
-        "  gpu static: {:.2} GiB (excl. blob)",
-        gpu_static as f64 / (1024.0_f64.powi(3))
-    );
-    eprintln!(
-        "  total est:  {:.2} GiB",
-        total as f64 / (1024.0_f64.powi(3))
-    );
+        eprintln!("step-kernel memory budget:");
+        eprintln!(
+            "  blob:       {:.2} GiB",
+            blob_bytes as f64 / (1024.0_f64.powi(3))
+        );
+        eprintln!("  arena:      {:.2} MiB", arena as f64 / (1024.0 * 1024.0));
+        eprintln!(
+            "  kv cache:   {:.2} MiB (max_seq={max_seq})",
+            kv as f64 / (1024.0 * 1024.0)
+        );
+        eprintln!("  logits:     {:.2} MiB", logits as f64 / (1024.0 * 1024.0));
+        eprintln!(
+            "  sc_probs:   {:.2} MiB",
+            sc_probs as f64 / (1024.0 * 1024.0)
+        );
+        eprintln!(
+            "  gemm scratch:{:.2} MiB",
+            gemm_scratch as f64 / (1024.0 * 1024.0)
+        );
+        eprintln!(
+            "  gpu static: {:.2} GiB (excl. blob)",
+            gpu_static as f64 / (1024.0_f64.powi(3))
+        );
+        eprintln!(
+            "  total est:  {:.2} GiB",
+            total as f64 / (1024.0_f64.powi(3))
+        );
     }
 }
 
@@ -4958,11 +5169,7 @@ pub fn build_step_runtime(
     let logits_bytes = CANVAS * VOCAB * 2;
     let sc_probs_bytes = sc_probs_buffer_bytes();
 
-    log_step_memory_budget(
-        store.blob_bytes(),
-        cfg.max_seq,
-        &layout,
-    );
+    log_step_memory_budget(store.blob_bytes(), cfg.max_seq, &layout);
 
     let sampler = crate::sample::sampler_for_steps(cfg.steps.max(1), cfg.no_early_stop);
     let prefill_len = cfg
@@ -5106,7 +5313,9 @@ pub fn build_step_runtime(
     };
     if crate::flags::progress_enabled() {
         if rt.embed_bf16 && sc_sparse_enabled() {
-            eprintln!("step-kernel: sparse SC softembed (DGQ_SC_SPARSE=0 for the exact chunked path)");
+            eprintln!(
+                "step-kernel: sparse SC softembed (DGQ_SC_SPARSE=0 for the exact chunked path)"
+            );
         } else {
             eprintln!("step-kernel: chunked SC softembed");
         }
@@ -5162,7 +5371,13 @@ pub fn run_step_probe(model_dir: &Path, cfg: StepSmokeConfig) -> Result<StepProb
     }
 
     rt.dispatch_and_wait(|enc| {
-        enc.rmsnorm(enc.arena().hidden_off(), enc.arena().tmp_off(), layout.final_norm, HID as u32, CANVAS);
+        enc.rmsnorm(
+            enc.arena().hidden_off(),
+            enc.arena().tmp_off(),
+            layout.final_norm,
+            HID as u32,
+            CANVAS,
+        );
         enc.gemm_q8_logits(
             enc.arena().tmp_off(),
             layout.embed,
@@ -5200,11 +5415,7 @@ pub struct LayerHiddenProbeResult {
     pub checkpoints: Vec<LayerHiddenProbeCheckpoint>,
 }
 
-fn read_arena_hidden_row(
-    arena: &ProtocolObject<dyn MTLBuffer>,
-    base: u64,
-    row: usize,
-) -> Vec<f32> {
+fn read_arena_hidden_row(arena: &ProtocolObject<dyn MTLBuffer>, base: u64, row: usize) -> Vec<f32> {
     read_arena_row(arena, base, row, HID)
 }
 
@@ -5243,7 +5454,8 @@ pub fn run_step_layer_hidden_probe(
         Ok(())
     })?;
     {
-        let hidden = read_arena_hidden_row(&rt.bufs.arena, rt.bufs.arena_map.hidden_off(), position);
+        let hidden =
+            read_arena_hidden_row(&rt.bufs.arena, rt.bufs.arena_map.hidden_off(), position);
         let (hidden_l2, hidden_max_abs) = hidden_vec_stats(&hidden);
         checkpoints.push(LayerHiddenProbeCheckpoint {
             label: "after_preamble".into(),
@@ -5256,7 +5468,8 @@ pub fn run_step_layer_hidden_probe(
 
     for layer in 0..layers {
         rt.encode_full_layer(layer)?;
-        let hidden = read_arena_hidden_row(&rt.bufs.arena, rt.bufs.arena_map.hidden_off(), position);
+        let hidden =
+            read_arena_hidden_row(&rt.bufs.arena, rt.bufs.arena_map.hidden_off(), position);
         let (hidden_l2, hidden_max_abs) = hidden_vec_stats(&hidden);
         checkpoints.push(LayerHiddenProbeCheckpoint {
             label: format!("after_layer_{layer}"),
@@ -5268,7 +5481,13 @@ pub fn run_step_layer_hidden_probe(
     }
 
     rt.dispatch_and_wait(|enc| {
-        enc.rmsnorm(enc.arena().hidden_off(), enc.arena().tmp_off(), layout.final_norm, HID as u32, CANVAS);
+        enc.rmsnorm(
+            enc.arena().hidden_off(),
+            enc.arena().tmp_off(),
+            layout.final_norm,
+            HID as u32,
+            CANVAS,
+        );
         Ok(())
     })?;
     {
@@ -5315,10 +5534,12 @@ pub fn run_step_preamble_capture(
     let layout = rt.layout;
 
     rt.dispatch_and_wait(|enc| enc.encode_preamble_embed_only(&layout))?;
-    let embed_scaled = read_arena_hidden_row(&rt.bufs.arena, rt.bufs.arena_map.hidden_off(), position);
+    let embed_scaled =
+        read_arena_hidden_row(&rt.bufs.arena, rt.bufs.arena_map.hidden_off(), position);
 
     rt.dispatch_and_wait(|enc| enc.encode_step_preamble(&layout, 1))?;
-    let after_preamble = read_arena_hidden_row(&rt.bufs.arena, rt.bufs.arena_map.hidden_off(), position);
+    let after_preamble =
+        read_arena_hidden_row(&rt.bufs.arena, rt.bufs.arena_map.hidden_off(), position);
 
     let state = rt.read_canvas_state();
     Ok(PreambleCapture {
@@ -5343,7 +5564,11 @@ pub fn run_embed_row_gpu(
     rt.write_canvas_state(&state);
     let layout = rt.layout;
     rt.dispatch_and_wait(|enc| enc.encode_preamble_embed_only(&layout))?;
-    Ok(read_arena_hidden_row(&rt.bufs.arena, rt.bufs.arena_map.hidden_off(), 0))
+    Ok(read_arena_hidden_row(
+        &rt.bufs.arena,
+        rt.bufs.arena_map.hidden_off(),
+        0,
+    ))
 }
 
 /// Query heads in the monolithic step-kernel shader (`NQ_HEADS` in diffgemma_step.metal).
@@ -5479,9 +5704,15 @@ pub fn run_step_attn_layer_capture(
     let total_kv = kv_len as usize + CANVAS;
 
     let hidden_ln = read_arena_hidden_row(&rt.bufs.arena, rt.bufs.arena_map.tmp_off(), position);
-    let q_raw_proj = read_arena_row(&rt.bufs.arena, rt.bufs.arena_map.attnq_off(), position, q_width);
-    let q_norm_w = DgqStore::open(model_dir)?
-        .tensor_f32(&format!("model.decoder.layers.{layer}.self_attn.q_norm.weight"))?;
+    let q_raw_proj = read_arena_row(
+        &rt.bufs.arena,
+        rt.bufs.arena_map.attnq_off(),
+        position,
+        q_width,
+    );
+    let q_norm_w = DgqStore::open(model_dir)?.tensor_f32(&format!(
+        "model.decoder.layers.{layer}.self_attn.q_norm.weight"
+    ))?;
     let mut q_pre_rope = q_raw_proj.clone();
     for h in 0..n_heads {
         let off = h * hd;
@@ -5497,16 +5728,35 @@ pub fn run_step_attn_layer_capture(
         Ok(())
     })?;
 
-    let q_all = read_arena_buffer_f32(&rt.bufs.arena, rt.bufs.arena_map.attnq_off() as usize, CANVAS * q_width);
-    let q_post_rope = read_arena_row(&rt.bufs.arena, rt.bufs.arena_map.attnq_off(), position, q_width);
-    let attn_out = read_arena_row(&rt.bufs.arena, rt.bufs.arena_map.attno_off(), position, q_width);
+    let q_all = read_arena_buffer_f32(
+        &rt.bufs.arena,
+        rt.bufs.arena_map.attnq_off() as usize,
+        CANVAS * q_width,
+    );
+    let q_post_rope = read_arena_row(
+        &rt.bufs.arena,
+        rt.bufs.arena_map.attnq_off(),
+        position,
+        q_width,
+    );
+    let attn_out = read_arena_row(
+        &rt.bufs.arena,
+        rt.bufs.arena_map.attno_off(),
+        position,
+        q_width,
+    );
     let k_cache = read_layer_k_cache_f32(rt.kvcache(), &layout, layer, total_kv);
 
     let raw_scores = row_raw_scores(&q_all, &k_cache, position, total_kv, n_heads, nkv, hd);
     let attn_probs = softmax_attn_rows(&raw_scores, n_heads, total_kv);
 
     let canvas_abs = kv_len as usize + position;
-    let mut sample_pos = vec![0usize, kv_len.saturating_sub(1) as usize, kv_len as usize, canvas_abs];
+    let mut sample_pos = vec![
+        0usize,
+        kv_len.saturating_sub(1) as usize,
+        kv_len as usize,
+        canvas_abs,
+    ];
     for t in top_key_positions(&attn_probs, n_heads, total_kv, 8) {
         sample_pos.push(t);
     }
@@ -5562,9 +5812,7 @@ pub struct LayerMoeCapture {
 fn routes_from_route_scratch(route: &RouteScratch) -> Vec<RouteResult> {
     let mut routes = Vec::with_capacity(CANVAS);
     for tok in 0..CANVAS {
-        let indices = (0..TOP_K)
-            .map(|k| route.expert[tok][k] as usize)
-            .collect();
+        let indices = (0..TOP_K).map(|k| route.expert[tok][k] as usize).collect();
         let weights = (0..TOP_K)
             .map(|k| crate::kernels::sub::bf16::bf16_bits_to_f32(route.weight[tok][k]))
             .collect();
@@ -5573,11 +5821,7 @@ fn routes_from_route_scratch(route: &RouteScratch) -> Vec<RouteResult> {
     routes
 }
 
-fn write_f32_arena(
-    arena: &ProtocolObject<dyn MTLBuffer>,
-    base: u64,
-    data: &[f32],
-) {
+fn write_f32_arena(arena: &ProtocolObject<dyn MTLBuffer>, base: u64, data: &[f32]) {
     let byte_off = base as usize;
     unsafe {
         let ptr = arena.contents().as_ptr().add(byte_off) as *mut f32;
@@ -5587,11 +5831,7 @@ fn write_f32_arena(
     }
 }
 
-fn read_f32_arena(
-    arena: &ProtocolObject<dyn MTLBuffer>,
-    base: u64,
-    elems: usize,
-) -> Vec<f32> {
+fn read_f32_arena(arena: &ProtocolObject<dyn MTLBuffer>, base: u64, elems: usize) -> Vec<f32> {
     let byte_off = base as usize;
     unsafe {
         let ptr = arena.contents().as_ptr().add(byte_off) as *const f32;
@@ -5811,7 +6051,11 @@ pub struct MoeRouteCapture {
     pub moe_out_gpu_cpu_rel_l2: Option<f32>,
 }
 
-fn read_scratch_f32(buf: &ProtocolObject<dyn MTLBuffer>, byte_off: usize, elems: usize) -> Vec<f32> {
+fn read_scratch_f32(
+    buf: &ProtocolObject<dyn MTLBuffer>,
+    byte_off: usize,
+    elems: usize,
+) -> Vec<f32> {
     unsafe {
         let ptr = buf.contents().as_ptr().add(byte_off) as *const f32;
         (0..elems).map(|i| *ptr.add(i)).collect()
@@ -5825,8 +6069,8 @@ pub fn run_step_moe_batched_pin_capture(
     layer: usize,
 ) -> Result<crate::kernels::sub::moe_batched_pin::MoeBatchedPinDump, Error> {
     use crate::kernels::sub::moe_batched_pin::{
-        verify_batched_stages_cpu_with_verdict, MoeBatchedPinDump, MoeBatchedPinLayout,
-        MoeBatchedPinRoute,
+        MoeBatchedPinDump, MoeBatchedPinLayout, MoeBatchedPinRoute,
+        verify_batched_stages_cpu_with_verdict,
     };
 
     const SCHEMA: u32 = 3;
@@ -5845,7 +6089,11 @@ pub fn run_step_moe_batched_pin_capture(
     })?;
 
     let route: RouteScratch = read_struct(&rt.bufs.route);
-    let moe_in = read_arena_buffer_f32(&rt.bufs.arena, rt.bufs.arena_map.moein_off() as usize, CANVAS * HID);
+    let moe_in = read_arena_buffer_f32(
+        &rt.bufs.arena,
+        rt.bufs.arena_map.moein_off() as usize,
+        CANVAS * HID,
+    );
     let slots = route.num_slots as usize;
     let gu_elems = slots * (MOE_FF as usize) * 2;
     let act_elems = slots * MOE_FF as usize;
@@ -5888,18 +6136,19 @@ pub fn run_step_moe_batched_pin_capture(
         )
     };
     let layer_off = &layout.layers[layer];
-    let (stages, rel_l2, gate_up_diff, first_divergent_stage) = verify_batched_stages_cpu_with_verdict(
-        &moe_in,
-        &route,
-        blob,
-        layer_off,
-        format,
-        &gpu_gather,
-        &gpu_gate_up,
-        &gpu_swiglu,
-        &gpu_down,
-        &gpu_scatter,
-    );
+    let (stages, rel_l2, gate_up_diff, first_divergent_stage) =
+        verify_batched_stages_cpu_with_verdict(
+            &moe_in,
+            &route,
+            blob,
+            layer_off,
+            format,
+            &gpu_gather,
+            &gpu_gate_up,
+            &gpu_swiglu,
+            &gpu_down,
+            &gpu_scatter,
+        );
 
     Ok(MoeBatchedPinDump {
         schema_version: SCHEMA,
@@ -6032,8 +6281,7 @@ pub fn run_step_moe_layer_capture(
     rt.dispatch_and_wait(|enc| enc.encode_layer_router_buckets(layer, &layout))?;
 
     if let Some(path) = crate::flags::moe_route_ref_path() {
-        if let Some((experts, weights)) =
-            route_override_from_ref_json(Path::new(&path), position)?
+        if let Some((experts, weights)) = route_override_from_ref_json(Path::new(&path), position)?
         {
             let mut route: RouteScratch = read_struct(&rt.bufs.route);
             patch_route_position(&mut route, position, &experts, &weights);
@@ -6047,7 +6295,12 @@ pub fn run_step_moe_layer_capture(
     rt.dispatch_and_wait(|enc| enc.encode_layer_moe_grouped(layer, &layout))?;
     let (experts, expert_weights) = read_route_at_position(&rt.bufs.route, position);
 
-    let moe_out = read_f32_arena_row(&rt.bufs.arena, rt.bufs.arena_map.moeout_off(), position, HID);
+    let moe_out = read_f32_arena_row(
+        &rt.bufs.arena,
+        rt.bufs.arena_map.moeout_off(),
+        position,
+        HID,
+    );
 
     rt.dispatch_and_wait(|enc| enc.encode_layer_moe_post_norm(layer, &layout))?;
     let moe_out_ln = read_arena_hidden_row(&rt.bufs.arena, rt.bufs.arena_map.moein_off(), position);
@@ -6109,10 +6362,14 @@ pub fn run_step_moe_single_expert_capture(
     expert_id: u32,
 ) -> Result<SingleExpertMoeCapture, Error> {
     if position >= CANVAS {
-        return Err(Error::Format("single-expert moe capture position out of range"));
+        return Err(Error::Format(
+            "single-expert moe capture position out of range",
+        ));
     }
     if expert_id as usize >= N_EXPERTS {
-        return Err(Error::Format("single-expert moe capture expert_id out of range"));
+        return Err(Error::Format(
+            "single-expert moe capture expert_id out of range",
+        ));
     }
     let layer = layer.min(cfg.layers.saturating_sub(1));
     let (mut rt, _) = build_step_runtime(model_dir, cfg)?;
@@ -6139,8 +6396,17 @@ pub fn run_step_moe_single_expert_capture(
         enc.encode_layer_moe_grouped_act_probe(layer, &layout)?;
         Ok(())
     })?;
-    let gpu_out = read_f32_arena_row(&rt.bufs.arena, rt.bufs.arena_map.moeout_off(), position, HID);
-    let act_probe = read_f32_arena(&rt.bufs.arena, rt.bufs.arena_map.soft_off(), MOE_ACT_PROBE_FLOATS);
+    let gpu_out = read_f32_arena_row(
+        &rt.bufs.arena,
+        rt.bufs.arena_map.moeout_off(),
+        position,
+        HID,
+    );
+    let act_probe = read_f32_arena(
+        &rt.bufs.arena,
+        rt.bufs.arena_map.soft_off(),
+        MOE_ACT_PROBE_FLOATS,
+    );
     let moe_ff = MOE_FF as usize;
     let gpu_act_after_barrier = act_probe[..moe_ff].to_vec();
     let gpu_act_at_down_read = act_probe[moe_ff..moe_ff * 2].to_vec();
@@ -6511,7 +6777,10 @@ pub struct StepForwardOutput {
 }
 
 /// Forward-only monolithic pass: final norm hidden + softcapped logits.
-pub fn run_step_forward(model_dir: &Path, cfg: &StepSmokeConfig) -> Result<StepForwardOutput, Error> {
+pub fn run_step_forward(
+    model_dir: &Path,
+    cfg: &StepSmokeConfig,
+) -> Result<StepForwardOutput, Error> {
     let (mut rt, _) = build_step_runtime(model_dir, cfg)?;
     let layout = rt.layout;
     let layers = rt.layers;
@@ -6524,10 +6793,20 @@ pub fn run_step_forward(model_dir: &Path, cfg: &StepSmokeConfig) -> Result<StepF
     }
     // Snapshot final norm before lm_head; gemm_q8_logits clobbers self.arena().tmp_off() on GPU.
     rt.dispatch_and_wait(|enc| {
-        enc.rmsnorm(enc.arena().hidden_off(), enc.arena().tmp_off(), layout.final_norm, HID as u32, CANVAS);
+        enc.rmsnorm(
+            enc.arena().hidden_off(),
+            enc.arena().tmp_off(),
+            layout.final_norm,
+            HID as u32,
+            CANVAS,
+        );
         Ok(())
     })?;
-    let norm_hidden = read_arena_buffer_f32(&rt.bufs.arena, rt.bufs.arena_map.tmp_off() as usize, CANVAS * HID);
+    let norm_hidden = read_arena_buffer_f32(
+        &rt.bufs.arena,
+        rt.bufs.arena_map.tmp_off() as usize,
+        CANVAS * HID,
+    );
     rt.dispatch_and_wait(|enc| {
         enc.gemm_q8_logits(
             enc.arena().tmp_off(),
@@ -6560,7 +6839,7 @@ pub struct DenoiseStepStats {
 /// Chat-templated `-p Hello` prefill token ids (matches `generate-monolithic` default).
 #[cfg(test)]
 pub fn hello_chat_prefill_token_ids(model_dir: &Path) -> Result<Vec<u32>, Error> {
-    use crate::chat_template::{format_chat_token_ids, ChatFormatOptions, ChatTurn};
+    use crate::chat_template::{ChatFormatOptions, ChatTurn, format_chat_token_ids};
     use crate::tokenizer::Tokenizer;
     let tok = Tokenizer::load(&model_dir.join("tokenizer.json"))?;
     format_chat_token_ids(
@@ -6577,7 +6856,9 @@ pub fn run_denoise_steps(
     cfg: &StepSmokeConfig,
 ) -> Result<Vec<DenoiseStepStats>, Error> {
     if cfg.finish != StepFinishMode::Full {
-        return Err(Error::Format("run_denoise_steps requires StepFinishMode::Full"));
+        return Err(Error::Format(
+            "run_denoise_steps requires StepFinishMode::Full",
+        ));
     }
     use crate::sample::StableConfidentStopper;
     let steps = cfg.steps.max(1);
@@ -6627,7 +6908,11 @@ pub fn run_step_smoke(model_dir: &Path, cfg: StepSmokeConfig) -> Result<StepSmok
     let started = Instant::now();
     for step_i in 0..steps {
         rt.run_forward_once(finish)?;
-        eprintln!("step-smoke: completed denoise step {}/{}", step_i + 1, steps);
+        eprintln!(
+            "step-smoke: completed denoise step {}/{}",
+            step_i + 1,
+            steps
+        );
         if finish == StepFinishMode::Full {
             let st: CanvasState = read_struct(&rt.bufs.state);
             if st.stop_flag != 0 && !cfg.no_early_stop {
@@ -6694,7 +6979,9 @@ mod tests {
         const MIN_ACCEPT: u32 = 150;
         let dir = Path::new("/tmp/quantized-weights");
         if !crate::dgq::store::looks_like_dgq_dir(dir) {
-            eprintln!("skip monolith_one_step_accept_regression: no weights at /tmp/quantized-weights");
+            eprintln!(
+                "skip monolith_one_step_accept_regression: no weights at /tmp/quantized-weights"
+            );
             return;
         }
         let prefill = hello_chat_prefill_token_ids(dir).expect("hello prefill");
@@ -6742,7 +7029,9 @@ mod tests {
             return;
         }
         let layer = 2usize;
-        let text = crate::config::ModelConfig::load(dir).expect("cfg").text_config;
+        let text = crate::config::ModelConfig::load(dir)
+            .expect("cfg")
+            .text_config;
         let store = DgqStore::open(dir).expect("dgq");
         let ws = WeightStore::open(dir).expect("ws");
         let ctx = MetalContext::new().expect("metal");
@@ -6751,7 +7040,9 @@ mod tests {
         let offsets = build_offsets_from_store(&store);
         let layout = build_layout(&offsets, 512);
         let manifest_gu = offsets
-            .get(&format!("model.decoder.layers.{layer}.experts.gate_up_proj"))
+            .get(&format!(
+                "model.decoder.layers.{layer}.experts.gate_up_proj"
+            ))
             .copied()
             .expect("manifest gate_up");
         let manifest_dn = offsets
@@ -6773,7 +7064,10 @@ mod tests {
 
         let per_expert = q4_matrix_bytes(text.moe_intermediate_size * 2, text.hidden_size) as u64;
         let down_per = q4_matrix_bytes(text.hidden_size, text.moe_intermediate_size) as u64;
-        eprintln!("per_expert gate_up={per_expert} down={down_per} fused={}", per_expert + down_per);
+        eprintln!(
+            "per_expert gate_up={per_expert} down={down_per} fused={}",
+            per_expert + down_per
+        );
 
         for expert in [0usize, 18] {
             let cache_gu = cache.expert_gate_up_q4(layer, expert);
@@ -6788,8 +7082,9 @@ mod tests {
                     .as_ptr()
                     .add(kernel_gu as usize)
             };
-            let kernel_bytes =
-                unsafe { std::slice::from_raw_parts(blob_ptr as *const u8, cache_bytes.len().min(64)) };
+            let kernel_bytes = unsafe {
+                std::slice::from_raw_parts(blob_ptr as *const u8, cache_bytes.len().min(64))
+            };
             assert_eq!(
                 &kernel_bytes[..64],
                 &cache_bytes[..64],
@@ -6804,7 +7099,8 @@ mod tests {
             return;
         }
         let dump: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(dump_path).expect("read dump")).expect("json");
+            serde_json::from_str(&std::fs::read_to_string(dump_path).expect("read dump"))
+                .expect("json");
         let moe_in: Vec<f32> = dump["moe_in"]
             .as_array()
             .expect("moe_in")
@@ -6840,9 +7136,7 @@ mod tests {
             }
             (dot / (na.sqrt() * nb.sqrt())) as f32
         };
-        eprintln!(
-            "E18 act: cos(staged_gate_act,gpu_act)={cos_staged_gpu_act:.4} (expect ~0.015)"
-        );
+        eprintln!("E18 act: cos(staged_gate_act,gpu_act)={cos_staged_gpu_act:.4} (expect ~0.015)");
     }
 
     #[test]
@@ -6851,7 +7145,7 @@ mod tests {
         use crate::dgq::layout::q4_row_bytes;
         use crate::kernels::sub::q4_group_k_order;
         use crate::kernels::sub::variant::KernelVariant;
-        use crate::metal::batch::{set_bytes, GpuBatch};
+        use crate::metal::batch::{GpuBatch, set_bytes};
         use crate::metal::buffer::BufferPool;
         use crate::metal::device::MetalContext;
         use crate::metal::step_m0::{dequant_q4_group_cpu, q4_weight_at_k_order_group};
@@ -6917,7 +7211,9 @@ mod tests {
                 "CPU K-order mismatch k0={k0} max_err={max_err}"
             );
 
-            let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None).expect("batch");
+            let mut batch =
+                GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None)
+                    .expect("batch");
             let out_buf = batch.alloc_f32_out(64).expect("out");
             let enc = batch.encoder();
             let (wbuf, row_off) = gate_up.weight_buffer();
@@ -7024,7 +7320,9 @@ mod tests {
             }
             gb_max = gb_max.max(d);
         }
-        eprintln!("NONDET-SC gemm_b accumulator run1-vs-run2: max_abs={gb_max:.6} first(idx,row,col,a,b)={gb_first:?}");
+        eprintln!(
+            "NONDET-SC gemm_b accumulator run1-vs-run2: max_abs={gb_max:.6} first(idx,row,col,a,b)={gb_first:?}"
+        );
 
         let mut max_abs = 0.0f32;
         let mut ndiff = 0usize;
@@ -7099,13 +7397,9 @@ mod tests {
             (0..N_LAYERS)
                 .map(|layer| {
                     let l = &layout.layers[layer];
-                    let token_stride =
-                        (l.n_kv_heads as usize) * (l.head_dim as usize) * 2 * 2;
+                    let token_stride = (l.n_kv_heads as usize) * (l.head_dim as usize) * 2 * 2;
                     let base = l.kv_region as usize;
-                    unsafe {
-                        std::slice::from_raw_parts(ptr.add(base), n * token_stride)
-                            .to_vec()
-                    }
+                    unsafe { std::slice::from_raw_parts(ptr.add(base), n * token_stride).to_vec() }
                 })
                 .collect()
         };
@@ -7115,7 +7409,9 @@ mod tests {
         let full = read_kv_prefix(&rt, n);
 
         zero_buffer(&rt.bufs.kvcache);
-        let k1 = rt.prefill_chunks(&tokens[..offset]).expect("prefix prefill");
+        let k1 = rt
+            .prefill_chunks(&tokens[..offset])
+            .expect("prefix prefill");
         assert_eq!(k1, offset);
         let k2 = rt
             .prefill_chunks_from(offset, &tokens[offset..])
@@ -7127,8 +7423,7 @@ mod tests {
         for layer in 0..N_LAYERS {
             if full[layer] != split[layer] {
                 let l = &layout.layers[layer];
-                let token_stride =
-                    (l.n_kv_heads as usize) * (l.head_dim as usize) * 2 * 2;
+                let token_stride = (l.n_kv_heads as usize) * (l.head_dim as usize) * 2 * 2;
                 let first = full[layer]
                     .iter()
                     .zip(split[layer].iter())
@@ -7152,7 +7447,7 @@ mod tests {
         use crate::buffer::Buffer;
         use crate::dgq::block::q8_gemm_rowk_cpu;
         use crate::dgq::layout::q8_row_bytes;
-        use crate::model::embed::{soft_embeddings_from_logits_store, EMBED_TENSOR, LM_HEAD_CHUNK};
+        use crate::model::embed::{EMBED_TENSOR, LM_HEAD_CHUNK, soft_embeddings_from_logits_store};
         use crate::weights::WeightStore;
 
         let dir = [Path::new("/tmp/quantized-weights"), Path::new("model/q4")]
@@ -7237,8 +7532,11 @@ mod tests {
             Ok(())
         })
         .expect("gpu chunked");
-        let gpu_chunked =
-            read_arena_buffer_f32(&rt.bufs.arena, rt.bufs.arena_map.soft_off() as usize, CANVAS * HID);
+        let gpu_chunked = read_arena_buffer_f32(
+            &rt.bufs.arena,
+            rt.bufs.arena_map.soft_off() as usize,
+            CANVAS * HID,
+        );
 
         let mut max_gpu = 0.0f32;
         for (a, b) in cpu_chunked.iter().zip(gpu_chunked.iter()) {
@@ -7256,18 +7554,18 @@ mod tests {
         len: usize,
     ) -> Vec<u8> {
         unsafe {
-            std::slice::from_raw_parts(
-                buf.contents().as_ptr().add(byte_off) as *const u8,
-                len,
-            )
-            .to_vec()
+            std::slice::from_raw_parts(buf.contents().as_ptr().add(byte_off) as *const u8, len)
+                .to_vec()
         }
     }
 
     fn write_buffer_bytes(buf: &ProtocolObject<dyn MTLBuffer>, byte_off: usize, data: &[u8]) {
         unsafe {
-            std::slice::from_raw_parts_mut(buf.contents().as_ptr().add(byte_off) as *mut u8, data.len())
-                .copy_from_slice(data);
+            std::slice::from_raw_parts_mut(
+                buf.contents().as_ptr().add(byte_off) as *mut u8,
+                data.len(),
+            )
+            .copy_from_slice(data);
         }
     }
 
@@ -7310,7 +7608,9 @@ mod tests {
     fn step_smoke_runs_if_weights_present() {
         let dir = Path::new("/tmp/quantized-weights");
         if !crate::dgq::store::looks_like_dgq_dir(dir) {
-            eprintln!("skip step_smoke_runs_if_weights_present: no weights at /tmp/quantized-weights");
+            eprintln!(
+                "skip step_smoke_runs_if_weights_present: no weights at /tmp/quantized-weights"
+            );
             return;
         }
         let result = run_step_smoke(dir, StepSmokeConfig::default()).expect("step smoke");
@@ -7325,12 +7625,12 @@ mod tests {
 
     #[test]
     fn fused_gate_up_gemm_matches_split_in_full_arena() {
+        use crate::kernels::sub::QuantFormat;
         use crate::kernels::sub::gemm_block_stacked::pipeline_for;
         use crate::kernels::sub::gemm_q4;
-        use crate::kernels::sub::QuantFormat;
+        use crate::metal::DgqGpuBlob;
         use crate::metal::buffer::BufferPool;
         use crate::metal::device::MetalContext;
-        use crate::metal::DgqGpuBlob;
         use std::path::Path;
 
         fn read_plane(
@@ -7341,9 +7641,7 @@ mod tests {
             let ptr = arena.contents().as_ptr() as *const u16;
             let base = (byte_off / 2) as usize;
             (0..elems)
-                .map(|i| {
-                    crate::kernels::sub::bf16::bf16_bits_to_f32(unsafe { *ptr.add(base + i) })
-                })
+                .map(|i| crate::kernels::sub::bf16::bf16_bits_to_f32(unsafe { *ptr.add(base + i) }))
                 .collect()
         }
 
@@ -7386,14 +7684,8 @@ mod tests {
             std::ptr::copy_nonoverlapping(x_bits.as_ptr(), dst, x_bits.len());
         }
 
-        let pipeline = pipeline_for(
-            &ctx,
-            n_total,
-            k as u32,
-            QuantFormat::Q4Affine,
-            &segs,
-        )
-        .expect("pipe");
+        let pipeline =
+            pipeline_for(&ctx, n_total, k as u32, QuantFormat::Q4Affine, &segs).expect("pipe");
         let (grid, tg) = crate::kernels::sub::gemm_common::dispatch_shape(m, n_total as usize);
         let cmd = ctx.queue.commandBuffer().expect("cmd");
         let enc = cmd.computeCommandEncoder().expect("enc");
@@ -7413,15 +7705,17 @@ mod tests {
         let fused_gate = read_plane(&arena, arena_map.ffg_off());
         let fused_up = read_plane(&arena, arena_map.ffu_off());
 
-        let arena2 = pool.allocate(&ctx.device, arena_map.bytes() as usize).expect("arena2");
+        let arena2 = pool
+            .allocate(&ctx.device, arena_map.bytes() as usize)
+            .expect("arena2");
         unsafe {
-            let dst = arena2
-                .contents()
-                .as_ptr()
-                .add(arena_map.tmp_off() as usize) as *mut u16;
+            let dst = arena2.contents().as_ptr().add(arena_map.tmp_off() as usize) as *mut u16;
             std::ptr::copy_nonoverlapping(x_bits.as_ptr(), dst, x_bits.len());
         }
-        for (w_off, y_off) in [(l.mlp_gate, arena_map.ffg_off()), (l.mlp_up, arena_map.ffu_off())] {
+        for (w_off, y_off) in [
+            (l.mlp_gate, arena_map.ffg_off()),
+            (l.mlp_up, arena_map.ffu_off()),
+        ] {
             let pipeline1 = gemm_q4::pipeline_for(&ctx, DENSE_FF, k as u32).expect("split pipe");
             let cmd2 = ctx.queue.commandBuffer().expect("cmd");
             let enc2 = cmd2.computeCommandEncoder().expect("enc");
@@ -7469,12 +7763,7 @@ mod tests {
         let (mut rt, _) = build_step_runtime(dir, &cfg).expect("runtime");
         let eos = rt.read_params().eos_token_id;
         let sampler = crate::sample::sampler_for_steps(4, true);
-        let params = step_params_from_sampler(
-            &sampler,
-            rt.read_params().kv_len,
-            true,
-            eos,
-        );
+        let params = step_params_from_sampler(&sampler, rt.read_params().kv_len, true, eos);
         let mut rng = Rng::new(42);
         rt.reset_block(VOCAB, &mut rng, params);
         for _ in 0..4 {
@@ -7547,9 +7836,7 @@ mod tests {
 
         let max = row0_max_abs_diff(&off, &on);
         let baseline = row0_max_abs_diff(&off, &off2);
-        eprintln!(
-            "fusion row0 logits max_abs: fused={max:.4e} unfused_repeat={baseline:.4e}"
-        );
+        eprintln!("fusion row0 logits max_abs: fused={max:.4e} unfused_repeat={baseline:.4e}");
         assert!(baseline < 1e-5, "unfused not deterministic: {baseline}");
 
         let mut smoke = cfg.clone();

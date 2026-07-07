@@ -5,7 +5,9 @@ use super::f16;
 use super::gpu_common;
 use super::test_util::ElemFormat;
 use super::variant::KernelVariant;
-use crate::kernels::cpu::moe_router::{moe_router_rows, pack_route_rows, RouterDims as CpuRouterDims};
+use crate::kernels::cpu::moe_router::{
+    RouterDims as CpuRouterDims, moe_router_rows, pack_route_rows,
+};
 use crate::metal::{LayerOffsets, RouteScratch, TOP_K};
 use crate::safetensors::Error;
 
@@ -137,7 +139,9 @@ pub fn wide_fixture(_: ElemFormat) -> Fixture {
         stream: (0..canvas * hidden)
             .map(|i| (i as f32 * 0.03).sin() * 0.5)
             .collect(),
-        router_scale: (0..hidden).map(|i| 1.0 + (i as f32 * 0.001).sin() * 0.1).collect(),
+        router_scale: (0..hidden)
+            .map(|i| 1.0 + (i as f32 * 0.001).sin() * 0.1)
+            .collect(),
         router_proj: (0..n_experts * hidden)
             .map(|i| (i as f32 * 0.005).cos() * 0.04)
             .collect(),
@@ -222,15 +226,12 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     BufferPool::write_bf16(&buf_stream, &bf16::f32_slice_to_bf16_bits(&f.stream));
     BufferPool::write_bytes(&buf_blob, &blob);
     let layer = f.layer_offsets();
-    BufferPool::write_bytes(
-        &buf_layer,
-        unsafe {
-            std::slice::from_raw_parts(
-                &layer as *const LayerOffsets as *const u8,
-                std::mem::size_of::<LayerOffsets>(),
-            )
-        },
-    );
+    BufferPool::write_bytes(&buf_layer, unsafe {
+        std::slice::from_raw_parts(
+            &layer as *const LayerOffsets as *const u8,
+            std::mem::size_of::<LayerOffsets>(),
+        )
+    });
     let zero = RouteScratch {
         weight: [[0; TOP_K]; crate::metal::PREFILL_M],
         expert: [[0; TOP_K]; crate::metal::PREFILL_M],
@@ -246,15 +247,12 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         block_row0: [0; crate::metal::MOE_MAX_BLOCKS],
         num_blocks: 0,
     };
-    BufferPool::write_bytes(
-        &buf_route,
-        unsafe {
-            std::slice::from_raw_parts(
-                &zero as *const RouteScratch as *const u8,
-                std::mem::size_of::<RouteScratch>(),
-            )
-        },
-    );
+    BufferPool::write_bytes(&buf_route, unsafe {
+        std::slice::from_raw_parts(
+            &zero as *const RouteScratch as *const u8,
+            std::mem::size_of::<RouteScratch>(),
+        )
+    });
 
     let dims = f.dims();
     let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
@@ -283,9 +281,8 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     cmd.commit();
     cmd.waitUntilCompleted();
 
-    let route: RouteScratch = unsafe {
-        std::ptr::read(buf_route.contents().as_ptr() as *const RouteScratch)
-    };
+    let route: RouteScratch =
+        unsafe { std::ptr::read(buf_route.contents().as_ptr() as *const RouteScratch) };
     Ok(route_from_scratch(&route, f))
 }
 

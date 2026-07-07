@@ -1,7 +1,7 @@
 //! LRU cache for MoE expert bf16 weights on GPU (PyTorch layout, no transpose).
 
-use crate::metal::buffer::BufferPool;
 use crate::config::TextConfig;
+use crate::metal::buffer::BufferPool;
 use crate::tensor::Bf16Slice;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;

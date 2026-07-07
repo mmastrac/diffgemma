@@ -7,7 +7,7 @@ use super::test_util::ElemFormat;
 use super::variant::KernelVariant;
 use crate::dgq::block::quantize_row_q4;
 use crate::dgq::layout::{q4_matrix_bytes, q4_row_bytes};
-use crate::kernels::cpu::moe_grouped::{moe_grouped_q4, GroupedRoute, MoeGroupedDims};
+use crate::kernels::cpu::moe_grouped::{GroupedRoute, MoeGroupedDims, moe_grouped_q4};
 use crate::kernels::cpu::moe_router::moe_bucket_phases;
 use crate::metal::{LayerOffsets, RouteScratch, TOP_K};
 use crate::safetensors::Error;
@@ -66,7 +66,12 @@ impl Fixture {
     }
 
     fn gate_up_q4(&self) -> Vec<u8> {
-        quantize_stack(&self.gate_up_f32, self.n_experts, self.moe_ff * 2, self.hidden)
+        quantize_stack(
+            &self.gate_up_f32,
+            self.n_experts,
+            self.moe_ff * 2,
+            self.hidden,
+        )
     }
 
     fn down_q4(&self) -> Vec<u8> {
@@ -114,11 +119,7 @@ impl Fixture {
     }
 
     pub(crate) fn grouped_route(&self) -> GroupedRoute {
-        let bucket = moe_bucket_phases(
-            &self.expert_ids,
-            self.n_experts as u32,
-            self.top_k as u32,
-        );
+        let bucket = moe_bucket_phases(&self.expert_ids, self.n_experts as u32, self.top_k as u32);
         GroupedRoute {
             offset: bucket.offset,
             num_slots: bucket.num_slots,
@@ -277,8 +278,7 @@ pub fn pipeline_for(
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLSize,
+    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
 };
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -326,24 +326,18 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     BufferPool::write_f32(&buf_out, &vec![0.0f32; f.out_len()]);
     BufferPool::write_bytes(&buf_blob, &blob);
     let layer = f.layer_offsets();
-    BufferPool::write_bytes(
-        &buf_layer,
-        unsafe {
-            std::slice::from_raw_parts(
-                &layer as *const LayerOffsets as *const u8,
-                std::mem::size_of::<LayerOffsets>(),
-            )
-        },
-    );
-    BufferPool::write_bytes(
-        &buf_route,
-        unsafe {
-            std::slice::from_raw_parts(
-                &route as *const RouteScratch as *const u8,
-                std::mem::size_of::<RouteScratch>(),
-            )
-        },
-    );
+    BufferPool::write_bytes(&buf_layer, unsafe {
+        std::slice::from_raw_parts(
+            &layer as *const LayerOffsets as *const u8,
+            std::mem::size_of::<LayerOffsets>(),
+        )
+    });
+    BufferPool::write_bytes(&buf_route, unsafe {
+        std::slice::from_raw_parts(
+            &route as *const RouteScratch as *const u8,
+            std::mem::size_of::<RouteScratch>(),
+        )
+    });
 
     let dims = f.dims();
     let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
@@ -374,8 +368,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     cmd.commit();
     cmd.waitUntilCompleted();
 
-    let scatter_ps =
-        crate::kernels::sub::moe_scatter_weighted::pipeline_for(&ctx, variant)?;
+    let scatter_ps = crate::kernels::sub::moe_scatter_weighted::pipeline_for(&ctx, variant)?;
     // Production layout: one TG per (256-wide d-tile, token), 256 threads
     // (d = tgid.x * 256 + tid) — matches encode_moe_batched_scatter.
     gpu_common::dispatch_grid(

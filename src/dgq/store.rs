@@ -2,8 +2,8 @@
 
 use crate::dgq::dequant::dequant_to_f32;
 use crate::dgq::layout::{
-    blob_slice_range, dgq_version_supported, parse_quant_kind, DgqManifest, QuantKind,
-    MANIFEST_FILE,
+    DgqManifest, MANIFEST_FILE, QuantKind, blob_slice_range, dgq_version_supported,
+    parse_quant_kind,
 };
 use crate::safetensors::Error;
 use crate::tensor::TensorView;

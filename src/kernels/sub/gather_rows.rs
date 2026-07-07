@@ -101,8 +101,7 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
     for (bi, &tok) in f.indices.iter().enumerate() {
         let src_off = tok as usize * f.hidden;
         let dst_off = bi * f.hidden;
-        out[dst_off..dst_off + f.hidden]
-            .copy_from_slice(&f.src[src_off..src_off + f.hidden]);
+        out[dst_off..dst_off + f.hidden].copy_from_slice(&f.src[src_off..src_off + f.hidden]);
     }
     out
 }
@@ -157,17 +156,26 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let mut pool = BufferPool::new();
     let out_len = f.out_len();
     let grid = out_len;
-    let buf_src = pool.allocate(&ctx.device, f.src.len() * 4).ok_or(Error::Format("alloc"))?;
+    let buf_src = pool
+        .allocate(&ctx.device, f.src.len() * 4)
+        .ok_or(Error::Format("alloc"))?;
     let buf_idx = pool
         .allocate(&ctx.device, f.indices.len() * 4)
         .ok_or(Error::Format("alloc"))?;
-    let buf_dst = pool.allocate(&ctx.device, out_len * 4).ok_or(Error::Format("alloc"))?;
-    let dump_bytes = if variant.dump_stage > 0 { out_len * 4 } else { 4 };
-    let buf_d = pool.allocate(&ctx.device, dump_bytes).ok_or(Error::Format("alloc"))?;
-    BufferPool::write_f32(&buf_src, &f.src);
-    let idx_bytes = unsafe {
-        std::slice::from_raw_parts(f.indices.as_ptr().cast::<u8>(), f.indices.len() * 4)
+    let buf_dst = pool
+        .allocate(&ctx.device, out_len * 4)
+        .ok_or(Error::Format("alloc"))?;
+    let dump_bytes = if variant.dump_stage > 0 {
+        out_len * 4
+    } else {
+        4
     };
+    let buf_d = pool
+        .allocate(&ctx.device, dump_bytes)
+        .ok_or(Error::Format("alloc"))?;
+    BufferPool::write_f32(&buf_src, &f.src);
+    let idx_bytes =
+        unsafe { std::slice::from_raw_parts(f.indices.as_ptr().cast::<u8>(), f.indices.len() * 4) };
     BufferPool::write_bytes(&buf_idx, idx_bytes);
     gpu_common::dispatch_1d(&ctx.queue, &pipeline.pipeline, grid, |enc| {
         bind_gpu_buffers(

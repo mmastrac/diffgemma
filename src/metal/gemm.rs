@@ -363,7 +363,9 @@ mod tests {
         let m = 256usize;
         let k = 2816usize;
         let n = 2112usize;
-        let a: Vec<u16> = (0..m * k).map(|i| f32_to_bf16((i as f32 * 0.001).sin())).collect();
+        let a: Vec<u16> = (0..m * k)
+            .map(|i| f32_to_bf16((i as f32 * 0.001).sin()))
+            .collect();
         let b: Vec<u16> = (0..k * n)
             .map(|i| f32_to_bf16(((i as f32) * 0.0007).cos() * 0.01))
             .collect();

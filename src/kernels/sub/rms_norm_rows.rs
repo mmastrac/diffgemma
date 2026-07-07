@@ -4,8 +4,8 @@ use super::test_util::ElemFormat;
 use crate::kernels::cpu;
 use crate::safetensors::Error;
 
-pub use super::variant::KernelVariant;
 use super::manifest::{self};
+pub use super::variant::KernelVariant;
 
 pub const ENTRY: &str = "rms_norm_rows";
 
@@ -45,12 +45,8 @@ pub fn mlp_shape_fixture(_fmt: ElemFormat) -> Fixture {
     let seq_len = 3;
     let hidden = 64;
     let len = seq_len * hidden;
-    let x: Vec<f32> = (0..len)
-        .map(|i| ((i as f32) * 0.017).sin() * 0.5)
-        .collect();
-    let weight: Vec<f32> = (0..hidden)
-        .map(|i| 1.0 + (i as f32) * 0.001)
-        .collect();
+    let x: Vec<f32> = (0..len).map(|i| ((i as f32) * 0.017).sin() * 0.5).collect();
+    let weight: Vec<f32> = (0..hidden).map(|i| 1.0 + (i as f32) * 0.001).collect();
     Fixture {
         x,
         weight,
@@ -75,9 +71,7 @@ pub fn mlp_shape_fixture_no_scale(_fmt: ElemFormat) -> Fixture {
     let hidden = 64;
     let len = seq_len * hidden;
     Fixture {
-        x: (0..len)
-            .map(|i| ((i as f32) * 0.017).sin() * 0.5)
-            .collect(),
+        x: (0..len).map(|i| ((i as f32) * 0.017).sin() * 0.5).collect(),
         weight: vec![1.0; hidden],
         seq_len,
         hidden,
@@ -101,13 +95,7 @@ pub fn cpu(fix: &Fixture) -> Vec<f32> {
 
 pub fn cpu_no_scale(fix: &Fixture) -> Vec<f32> {
     let mut out = vec![0.0f32; fix.out_len()];
-    cpu::rms_norm_rows_no_scale(
-        &mut out,
-        &fix.x,
-        fix.seq_len,
-        fix.hidden,
-        fix.eps,
-    );
+    cpu::rms_norm_rows_no_scale(&mut out, &fix.x, fix.seq_len, fix.hidden, fix.eps);
     out
 }
 
@@ -130,10 +118,9 @@ pub fn gpu_no_scale(fix: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, E
 fn gpu_affine(fix: &Fixture, variant: KernelVariant, affine: bool) -> Result<Vec<f32>, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
-    
+
     use objc2_metal::{
-        MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-        MTLSize,
+        MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
     };
 
     let ctx = MetalContext::new()?;

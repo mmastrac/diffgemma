@@ -1,12 +1,12 @@
 //! Tiled grouped MoE GEMM: expert segments × 32×32 output tiles (simdgroup matmul).
 
+use super::QuantFormat;
+use super::bf16;
 use super::gemm_common;
 use super::gpu_common;
 use super::test_util::ElemFormat;
-use super::bf16;
-use super::QuantFormat;
 use crate::kernels::cpu::gemm_linear_grouped::gemm_linear_grouped_cpu;
-use crate::kernels::sub::gemm_linear_grouped::{grouped_fixture, Fixture};
+use crate::kernels::sub::gemm_linear_grouped::{Fixture, grouped_fixture};
 use crate::metal::{BlockGroupedJob, RouteScratch};
 use crate::safetensors::Error;
 
@@ -90,15 +90,7 @@ pub fn pipeline_for(
     k: u32,
     format: QuantFormat,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_gemm_subkernel(
-        SHADER,
-        ENTRY,
-        n,
-        k,
-        false,
-        format as u32,
-        false,
-    )
+    ctx.compile_gemm_subkernel(SHADER, ENTRY, n, k, false, format as u32, false)
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -170,7 +162,10 @@ pub fn gpu(f: &Fixture, _variant: super::KernelVariant) -> Result<Vec<f32>, Erro
         .allocate(&ctx.device, out_len * 4)
         .ok_or(Error::Format("alloc"))?;
     let buf_jobs = pool
-        .allocate(&ctx.device, jobs.len() * std::mem::size_of::<BlockGroupedJob>())
+        .allocate(
+            &ctx.device,
+            jobs.len() * std::mem::size_of::<BlockGroupedJob>(),
+        )
         .ok_or(Error::Format("alloc"))?;
     let buf_rs = pool
         .allocate(&ctx.device, f.row_starts.len() * 4)
@@ -182,33 +177,21 @@ pub fn gpu(f: &Fixture, _variant: super::KernelVariant) -> Result<Vec<f32>, Erro
 
     BufferPool::write_f32(&buf_a, &f.a);
     BufferPool::write_bytes(&buf_w, &w_blob);
-    BufferPool::write_bytes(
-        &buf_jobs,
-        unsafe {
-            std::slice::from_raw_parts(
-                jobs.as_ptr().cast::<u8>(),
-                jobs.len() * std::mem::size_of::<BlockGroupedJob>(),
-            )
-        },
-    );
-    BufferPool::write_bytes(
-        &buf_rs,
-        unsafe {
-            std::slice::from_raw_parts(
-                f.row_starts.as_ptr().cast::<u8>(),
-                f.row_starts.len() * 4,
-            )
-        },
-    );
-    BufferPool::write_bytes(
-        &buf_route,
-        unsafe {
-            std::slice::from_raw_parts(
-                &route as *const RouteScratch as *const u8,
-                std::mem::size_of::<RouteScratch>(),
-            )
-        },
-    );
+    BufferPool::write_bytes(&buf_jobs, unsafe {
+        std::slice::from_raw_parts(
+            jobs.as_ptr().cast::<u8>(),
+            jobs.len() * std::mem::size_of::<BlockGroupedJob>(),
+        )
+    });
+    BufferPool::write_bytes(&buf_rs, unsafe {
+        std::slice::from_raw_parts(f.row_starts.as_ptr().cast::<u8>(), f.row_starts.len() * 4)
+    });
+    BufferPool::write_bytes(&buf_route, unsafe {
+        std::slice::from_raw_parts(
+            &route as *const RouteScratch as *const u8,
+            std::mem::size_of::<RouteScratch>(),
+        )
+    });
     BufferPool::write_f32(&buf_c, &vec![0.0f32; out_len]);
 
     let (grid, tg) = dispatch_shape(f.n, num_jobs);
@@ -345,33 +328,21 @@ pub fn gpu_on_blob(
 
     BufferPool::write_f32(&buf_a, p.a);
     BufferPool::write_f32(&buf_c, &vec![0.0f32; out_len]);
-    BufferPool::write_bytes(
-        &buf_jobs,
-        unsafe {
-            std::slice::from_raw_parts(
-                p.jobs.as_ptr().cast::<u8>(),
-                p.jobs.len() * std::mem::size_of::<BlockGroupedJob>(),
-            )
-        },
-    );
-    BufferPool::write_bytes(
-        &buf_rs,
-        unsafe {
-            std::slice::from_raw_parts(
-                p.row_starts.as_ptr().cast::<u8>(),
-                p.row_starts.len() * 4,
-            )
-        },
-    );
-    BufferPool::write_bytes(
-        &buf_route,
-        unsafe {
-            std::slice::from_raw_parts(
-                &route as *const RouteScratch as *const u8,
-                std::mem::size_of::<RouteScratch>(),
-            )
-        },
-    );
+    BufferPool::write_bytes(&buf_jobs, unsafe {
+        std::slice::from_raw_parts(
+            p.jobs.as_ptr().cast::<u8>(),
+            p.jobs.len() * std::mem::size_of::<BlockGroupedJob>(),
+        )
+    });
+    BufferPool::write_bytes(&buf_rs, unsafe {
+        std::slice::from_raw_parts(p.row_starts.as_ptr().cast::<u8>(), p.row_starts.len() * 4)
+    });
+    BufferPool::write_bytes(&buf_route, unsafe {
+        std::slice::from_raw_parts(
+            &route as *const RouteScratch as *const u8,
+            std::mem::size_of::<RouteScratch>(),
+        )
+    });
 
     let (grid, tg) = dispatch_shape(p.n, num_jobs);
     let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;

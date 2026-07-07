@@ -29,7 +29,12 @@ pub struct AttnDims {
 
 impl AttnDims {
     pub fn new(canvas: u32, n_q_heads: u32) -> Self {
-        Self { canvas, n_q_heads, causal: 0, window: 0 }
+        Self {
+            canvas,
+            n_q_heads,
+            causal: 0,
+            window: 0,
+        }
     }
 }
 
@@ -83,9 +88,7 @@ pub fn tiny_fixture(_: ElemFormat) -> Fixture {
     let q_len = canvas * n_q_heads * hd;
     let kv_len_flat = canvas * n_kv * hd;
     Fixture {
-        q: (0..q_len)
-            .map(|i| (i as f32 * 0.13).sin() * 0.5)
-            .collect(),
+        q: (0..q_len).map(|i| (i as f32 * 0.13).sin() * 0.5).collect(),
         k: (0..kv_len_flat)
             .map(|i| (i as f32 * 0.17).cos() * 0.4)
             .collect(),
@@ -250,7 +253,9 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
     }
     // KV cache stores f16 (attention_device.metal kv_store).
     for v in kvcache.iter_mut() {
-        *v = crate::kernels::sub::f16::f16_bits_to_f32(crate::kernels::sub::f16::f32_to_f16_bits(*v));
+        *v = crate::kernels::sub::f16::f16_bits_to_f32(crate::kernels::sub::f16::f32_to_f16_bits(
+            *v,
+        ));
     }
     pack_out(&q, &k, &kvcache, f)
 }
@@ -273,7 +278,10 @@ pub fn pipeline_for_kv(
     variant: KernelVariant,
     fmt: crate::kernels::sub::kv_quant::KvFormat,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    let uints = [crate::kernels::sub::variant::FcUInt { index: 4, value: fmt.code() }];
+    let uints = [crate::kernels::sub::variant::FcUInt {
+        index: 4,
+        value: fmt.code(),
+    }];
     ctx.compile_subkernel_ex(SHADER, ENTRY, variant, fmt.label(), &[], &uints)
 }
 
@@ -320,7 +328,10 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     BufferPool::write_bf16(&buf_k, &bf16::f32_slice_to_bf16_bits(&f.k));
     BufferPool::write_bf16(&buf_v, &bf16::f32_slice_to_bf16_bits(&f.v));
     // KV cache stores f16 (attention_device.metal kv_store); q/k/v stay bf16 (arena).
-    BufferPool::write_bf16(&buf_kv, &crate::kernels::sub::f16::f32_slice_to_f16(&f.kvcache));
+    BufferPool::write_bf16(
+        &buf_kv,
+        &crate::kernels::sub::f16::f32_slice_to_f16(&f.kvcache),
+    );
     BufferPool::write_bytes(&buf_blob, &blob);
     let layer = layer_offsets(f);
     let layer_bytes = unsafe {

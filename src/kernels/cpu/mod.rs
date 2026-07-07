@@ -1,7 +1,7 @@
 use super::matmul;
-use crate::config::{LayerType, TextConfig};
 use crate::buffer::Buffer;
-use crate::fast_slice::{bf16_to_f32_into, FastBf16Slice};
+use crate::config::{LayerType, TextConfig};
+use crate::fast_slice::{FastBf16Slice, bf16_to_f32_into};
 use crate::tensor::Bf16Slice;
 
 pub mod activations;
@@ -41,7 +41,7 @@ pub fn rms_norm(out: &mut [f32], x: &[f32], weight: &[f32], eps: f32) {
         sum_sq += v * v;
     }
     let rms_inv = 1.0 / (sum_sq / hidden as f32 + eps).sqrt();
-    for i in 0.. hidden {
+    for i in 0..hidden {
         out[i] = x[i] * rms_inv * weight[i];
     }
 }
@@ -60,18 +60,17 @@ pub fn rms_norm_rows(
     assert_eq!(weight.len(), hidden);
     for s in 0..seq_len {
         let off = s * hidden;
-        rms_norm(&mut out[off..off + hidden], &x[off..off + hidden], weight, eps);
+        rms_norm(
+            &mut out[off..off + hidden],
+            &x[off..off + hidden],
+            weight,
+            eps,
+        );
     }
 }
 
 /// Per-row RMSNorm without learnable scale over `[seq_len, hidden]`.
-pub fn rms_norm_rows_no_scale(
-    out: &mut [f32],
-    x: &[f32],
-    seq_len: usize,
-    hidden: usize,
-    eps: f32,
-) {
+pub fn rms_norm_rows_no_scale(out: &mut [f32], x: &[f32], seq_len: usize, hidden: usize, eps: f32) {
     assert_eq!(out.len(), seq_len * hidden);
     assert_eq!(x.len(), seq_len * hidden);
     for s in 0..seq_len {
@@ -121,10 +120,7 @@ pub fn linear_bf16(
 ) {
     assert_eq!(w.len(), out_dim * in_dim);
     w_scratch.ensure_len(out_dim * in_dim);
-    bf16_to_f32_into(
-        FastBf16Slice::from_bf16(w),
-        w_scratch.as_fast_slice_mut(),
-    );
+    bf16_to_f32_into(FastBf16Slice::from_bf16(w), w_scratch.as_fast_slice_mut());
     linear(y, x, w_scratch.as_slice(), b, seq_len, in_dim, out_dim);
 }
 
@@ -198,10 +194,7 @@ pub fn softmax_rows(x: &mut [f32], rows: usize, cols: usize) {
 #[derive(Debug, Clone, Copy)]
 pub enum RopeKind {
     /// Sliding-window layers: rotate full `head_dim`, standard inverse frequencies.
-    Default {
-        head_dim: usize,
-        theta: f32,
-    },
+    Default { head_dim: usize, theta: f32 },
     /// Full-attention layers: proportional partial RoPE on `rotary_dim` of `full_head_dim`.
     Proportional {
         rotary_dim: usize,
@@ -248,7 +241,11 @@ pub fn apply_rope(vec: &mut [f32], freqs: &[f32], rotary_dim: usize) {
     for d in 0..half {
         let cos = freqs[2 * d];
         let sin = freqs[2 * d + 1];
-        let i1 = if proportional { half_head + d } else { d + half };
+        let i1 = if proportional {
+            half_head + d
+        } else {
+            d + half
+        };
         let x0 = vec[d];
         let x1 = vec[i1];
         vec[d] = x0 * cos - x1 * sin;
@@ -271,7 +268,11 @@ pub fn apply_rope_tensor(
         for h in 0..num_heads {
             let off = (s * num_heads + h) * head_dim;
             let foff = s * rotary_dim;
-            apply_rope(&mut x[off..off + head_dim], &freqs[foff..foff + rotary_dim], rotary_dim);
+            apply_rope(
+                &mut x[off..off + head_dim],
+                &freqs[foff..foff + rotary_dim],
+                rotary_dim,
+            );
         }
     }
 }
@@ -307,12 +308,7 @@ mod tests {
         let w = [1.0f32; 4];
         let mut out = [0.0f32; 4];
         rms_norm(&mut out, &x, &w, 1e-6);
-        let expected = [
-            0.365_148_35,
-            0.730_296_7,
-            1.095_445_,
-            1.460_593_4,
-        ];
+        let expected = [0.365_148_35, 0.730_296_7, 1.095_445_, 1.460_593_4];
         for (a, b) in out.iter().zip(expected) {
             assert!((a - b).abs() < 1e-5, "got {a}, expected {b}");
         }

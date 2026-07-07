@@ -23,11 +23,7 @@ impl LayerAttnParams {
     }
 
     pub fn theta(&self) -> f32 {
-        if self.is_full {
-            1.0e6
-        } else {
-            1.0e4
-        }
+        if self.is_full { 1.0e6 } else { 1.0e4 }
     }
 }
 
@@ -102,11 +98,7 @@ pub fn qk_rope_kv(
         for h in 0..(n_q_heads + 2 * nkv) {
             let is_q = h < n_q_heads;
             let is_k = !is_q && h < n_q_heads + nkv;
-            let hh = if is_q {
-                h
-            } else {
-                (h - n_q_heads) % nkv
-            };
+            let hh = if is_q { h } else { (h - n_q_heads) % nkv };
 
             let head = if is_q {
                 let off = (tok * n_q_heads + hh) * hd;
@@ -124,10 +116,7 @@ pub fn qk_rope_kv(
                 };
                 let mut tmp = src.to_vec();
                 rms_norm_head(&mut tmp, None, RMS_EPS);
-                let dst_off = kv_half_base
-                    + (pos as usize * nkv * hd * 2)
-                    + nkv * hd
-                    + hh * hd;
+                let dst_off = kv_half_base + (pos as usize * nkv * hd * 2) + nkv * hd + hh * hd;
                 kvcache[dst_off..dst_off + hd].copy_from_slice(&tmp);
                 continue;
             };

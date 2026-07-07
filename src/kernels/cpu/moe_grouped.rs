@@ -1,7 +1,7 @@
 //! CPU reference for grouped MoE expert forward (Q4 + NVFP4 dequant loops).
 
 use crate::dgq::block::q4_weight_at;
-use crate::dgq::layout::{q4_row_bytes, NVFP4_HEADER_BYTES};
+use crate::dgq::layout::{NVFP4_HEADER_BYTES, q4_row_bytes};
 use crate::dgq::nvfp4::nvfp4_weight_at;
 use crate::kernels::cpu::gelu_pytorch_tanh_f32;
 use crate::kernels::sub::bf16;

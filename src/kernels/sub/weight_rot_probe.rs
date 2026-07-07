@@ -21,7 +21,13 @@ use crate::kernels::sub::kv_quant::{affine_roundtrip_levels, rel_rms};
 /// Quantize every row of a row-major `[out, in]` weight group-32 along `in`,
 /// optionally block-Hadamard-rotating each row first (rows = W·Rᵀ). Returns
 /// the dequantized weight (same shape).
-fn quant_weight(w: &[f32], out_dim: usize, in_dim: usize, levels: f32, blk: Option<usize>) -> Vec<f32> {
+fn quant_weight(
+    w: &[f32],
+    out_dim: usize,
+    in_dim: usize,
+    levels: f32,
+    blk: Option<usize>,
+) -> Vec<f32> {
     let mut q = vec![0.0f32; w.len()];
     let mut row = vec![0.0f32; in_dim];
     for o in 0..out_dim {
@@ -89,7 +95,9 @@ fn out_err(w: &[f32], out_dim: usize, in_dim: usize, levels: f32, rot: Rot) -> f
     let trials = 4;
     for t in 0..trials {
         let x: Vec<f32> = (0..in_dim)
-            .map(|i| (((i * 2654435761).wrapping_add(t * 40503) as u32 >> 9) as f32 / 8_388_608.0 - 1.0))
+            .map(|i| {
+                (((i * 2654435761).wrapping_add(t * 40503) as u32 >> 9) as f32 / 8_388_608.0 - 1.0)
+            })
             .collect();
         let y_true = matvec(w, &x, out_dim, in_dim);
         let y_q = match rot {
@@ -136,7 +144,10 @@ mod tests {
             "model.decoder.layers.0.mlp.down_proj.weight",
             "model.decoder.layers.5.self_attn.q_proj.weight",
         ];
-        println!("\n{:<52} {:>6} {:>6}  q4:plain->rot   q6:plain->rot   blk", "tensor", "out", "in");
+        println!(
+            "\n{:<52} {:>6} {:>6}  q4:plain->rot   q6:plain->rot   blk",
+            "tensor", "out", "in"
+        );
         for name in names {
             let Some(entry) = store.get_entry(name) else {
                 println!("{name:<52}  (missing)");

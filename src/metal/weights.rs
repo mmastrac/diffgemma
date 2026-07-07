@@ -3,15 +3,14 @@
 use crate::buffer::Buffer;
 use crate::config::TextConfig;
 use crate::dgq::DgqStore;
-use crate::fast_slice::{bf16_to_f32_into, FastBf16Slice};
+use crate::fast_slice::{FastBf16Slice, bf16_to_f32_into};
 use crate::metal::dgq_gpu::{
-    load_block_expert_stack, load_block_linear,
-    load_q8_linear, load_raw_view, DgqGpuBlob,
-    Q4ExpertStackGpu, Q8LinearGpu,
+    DgqGpuBlob, Q4ExpertStackGpu, Q8LinearGpu, load_block_expert_stack, load_block_linear,
+    load_q8_linear, load_raw_view,
 };
-use crate::metal::self_conditioning::GpuSelfConditioningWeights;
 use crate::metal::expert_cache::{ExpertCacheStats, ExpertWeightCache};
 use crate::metal::linear::GpuLinearWeight;
+use crate::metal::self_conditioning::GpuSelfConditioningWeights;
 use crate::model::layer_weights::DecoderLayerWeights;
 use crate::safetensors::Error;
 use crate::tensor::Bf16Slice;
@@ -33,11 +32,7 @@ fn load_self_conditioning_dgq(
     blob: Arc<DgqGpuBlob>,
 ) -> Result<GpuSelfConditioningWeights, Error> {
     Ok(GpuSelfConditioningWeights {
-        pre_norm: raw_blob_bf16_to_f32(&load_raw_view(
-            dgq,
-            Arc::clone(&blob),
-            SC_PRE_NORM,
-        )?)?,
+        pre_norm: raw_blob_bf16_to_f32(&load_raw_view(dgq, Arc::clone(&blob), SC_PRE_NORM)?)?,
         gate_proj: load_q8_linear(dgq, Arc::clone(&blob), SC_GATE)?,
         up_proj: load_q8_linear(dgq, Arc::clone(&blob), SC_UP)?,
         down_proj: load_q8_linear(dgq, blob, SC_DOWN)?,
@@ -50,9 +45,7 @@ fn bf16_tensor_to_f32_buffer(slice: Bf16Slice<'_>) -> Buffer<f32> {
     out
 }
 
-fn raw_blob_bf16_to_f32(
-    view: &crate::metal::dgq_gpu::RawBlobView,
-) -> Result<Buffer<f32>, Error> {
+fn raw_blob_bf16_to_f32(view: &crate::metal::dgq_gpu::RawBlobView) -> Result<Buffer<f32>, Error> {
     let blob = &view.blob.buffer;
     let ptr = blob.contents().as_ptr() as *const u8;
     let src = unsafe {
@@ -115,7 +108,11 @@ fn load_attn_ffn_linear(
                 ));
             }
             let f32 = raw_blob_bf16_to_f32(&load_raw_view(store, blob, name)?)?;
-            Ok(GpuLinearWeight::Bf16(CachedLinear::from_f32(f32.as_slice(), out, inp)))
+            Ok(GpuLinearWeight::Bf16(CachedLinear::from_f32(
+                f32.as_slice(),
+                out,
+                inp,
+            )))
         }
         Some(crate::dgq::layout::QuantKind::Q8Row) => {
             Ok(GpuLinearWeight::q8(load_q8_linear(store, blob, name)?))
@@ -172,15 +169,9 @@ impl GpuLayerWeightCache {
             post_attn_norm: bf16_tensor_to_f32_buffer(weights.post_attention_layernorm.bf16()?),
             pre_ff_norm: bf16_tensor_to_f32_buffer(weights.pre_feedforward_layernorm.bf16()?),
             post_ff_norm: bf16_tensor_to_f32_buffer(weights.post_feedforward_layernorm.bf16()?),
-            post_ff_norm_1: bf16_tensor_to_f32_buffer(
-                weights.post_feedforward_layernorm_1.bf16()?,
-            ),
-            pre_ff_norm_2: bf16_tensor_to_f32_buffer(
-                weights.pre_feedforward_layernorm_2.bf16()?,
-            ),
-            post_ff_norm_2: bf16_tensor_to_f32_buffer(
-                weights.post_feedforward_layernorm_2.bf16()?,
-            ),
+            post_ff_norm_1: bf16_tensor_to_f32_buffer(weights.post_feedforward_layernorm_1.bf16()?),
+            pre_ff_norm_2: bf16_tensor_to_f32_buffer(weights.pre_feedforward_layernorm_2.bf16()?),
+            post_ff_norm_2: bf16_tensor_to_f32_buffer(weights.post_feedforward_layernorm_2.bf16()?),
             mlp_gate: GpuLinearWeight::bf16(weights.mlp_gate.bf16()?, inter, hidden),
             mlp_up: GpuLinearWeight::bf16(weights.mlp_up.bf16()?, inter, hidden),
             mlp_down: GpuLinearWeight::bf16(weights.mlp_down.bf16()?, hidden, inter),
@@ -207,20 +198,16 @@ impl GpuLayerWeightCache {
                 Arc::clone(&blob),
                 &keys.input_layernorm,
             )?)?,
-            q_norm: raw_blob_bf16_to_f32(&load_raw_view(
-                store,
-                Arc::clone(&blob),
-                &keys.q_norm,
-            )?)?,
-            k_norm: raw_blob_bf16_to_f32(&load_raw_view(
-                store,
-                Arc::clone(&blob),
-                &keys.k_norm,
-            )?)?,
+            q_norm: raw_blob_bf16_to_f32(&load_raw_view(store, Arc::clone(&blob), &keys.q_norm)?)?,
+            k_norm: raw_blob_bf16_to_f32(&load_raw_view(store, Arc::clone(&blob), &keys.k_norm)?)?,
             q_proj: load_attn_ffn_linear(store, Arc::clone(&blob), &keys.q_proj)?,
             k_proj: load_attn_ffn_linear(store, Arc::clone(&blob), &keys.k_proj)?,
             v_proj: match &shapes.v_proj {
-                Some(_) => Some(load_attn_ffn_linear(store, Arc::clone(&blob), &keys.v_proj)?),
+                Some(_) => Some(load_attn_ffn_linear(
+                    store,
+                    Arc::clone(&blob),
+                    &keys.v_proj,
+                )?),
                 None => None,
             },
             o_proj: load_attn_ffn_linear(store, Arc::clone(&blob), &keys.o_proj)?,
@@ -278,11 +265,7 @@ impl GpuLayerWeightCache {
                 Arc::clone(&blob),
                 &keys.experts_gate_up,
             )?),
-            experts_down: Some(load_block_expert_stack(
-                store,
-                blob,
-                &keys.experts_down,
-            )?),
+            experts_down: Some(load_block_expert_stack(store, blob, &keys.experts_down)?),
         })
     }
 
@@ -434,12 +417,8 @@ impl GpuDecoderWeightCache {
                 text,
             )?);
         }
-        let embed_q8 = load_q8_linear(
-            dgq,
-            Arc::clone(&blob),
-            "model.decoder.embed_tokens.weight",
-        )
-        .ok();
+        let embed_q8 =
+            load_q8_linear(dgq, Arc::clone(&blob), "model.decoder.embed_tokens.weight").ok();
         let self_conditioning = load_self_conditioning_dgq(dgq, Arc::clone(&blob))?;
         Ok(Self::Dgq(DgqResident {
             blob,
@@ -500,9 +479,9 @@ impl GpuDecoderWeightCache {
         pool: &mut crate::metal::buffer::BufferPool,
     ) {
         if let Self::Bf16(b) = self {
-            b.expert_cache.borrow_mut().prefetch_expert(
-                layer, gate_up, down, expert, device, pool,
-            );
+            b.expert_cache
+                .borrow_mut()
+                .prefetch_expert(layer, gate_up, down, expert, device, pool);
         }
     }
 
@@ -528,7 +507,11 @@ impl GpuDecoderWeightCache {
         }
     }
 
-    pub fn expert_gate_up_q4(&self, layer: usize, expert: usize) -> crate::metal::dgq_gpu::Q4LinearGpu {
+    pub fn expert_gate_up_q4(
+        &self,
+        layer: usize,
+        expert: usize,
+    ) -> crate::metal::dgq_gpu::Q4LinearGpu {
         match self {
             Self::Dgq(d) => d.layers[layer]
                 .experts_gate_up
@@ -539,7 +522,11 @@ impl GpuDecoderWeightCache {
         }
     }
 
-    pub fn expert_down_q4(&self, layer: usize, expert: usize) -> crate::metal::dgq_gpu::Q4LinearGpu {
+    pub fn expert_down_q4(
+        &self,
+        layer: usize,
+        expert: usize,
+    ) -> crate::metal::dgq_gpu::Q4LinearGpu {
         match self {
             Self::Dgq(d) => d.layers[layer]
                 .experts_down
@@ -611,8 +598,7 @@ impl GpuDecoderWeightCache {
             Self::Dgq(d) => LayerWeightRef::Dgq(&d.layers[layer]),
             Self::Bf16(b) => LayerWeightRef::Bf16(std::cell::Ref::map(b.layer.borrow(), |s| {
                 assert_eq!(
-                    s.loaded_layer,
-                    layer,
+                    s.loaded_layer, layer,
                     "ensure_layer({layer}) before layer_ref"
                 );
                 s.cache

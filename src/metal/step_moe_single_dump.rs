@@ -8,7 +8,7 @@ use crate::metal::moe::{
     experts_forward_dgq_cpu, load_expert_bf16_slices,
 };
 use crate::metal::step_kernel::{
-    run_step_moe_single_expert_capture, SingleExpertMoeCapture, StepSmokeConfig, CANVAS, HID,
+    CANVAS, HID, SingleExpertMoeCapture, StepSmokeConfig, run_step_moe_single_expert_capture,
 };
 use crate::metal::weights::GpuDecoderWeightCache;
 use crate::model::moe::{MoeScratch, RouteResult};
@@ -162,7 +162,8 @@ fn single_expert_staged_refs(
     let gate_up = cache.expert_gate_up_q4(layer, expert);
     let down = cache.expert_down_q4(layer, expert);
     let mut scratch = MoeScratch::new(1, &text);
-    let q4 = expert_forward_staged_dgq(moe_in_row, &gate_up, &down, moe_inter, hidden, &mut scratch);
+    let q4 =
+        expert_forward_staged_dgq(moe_in_row, &gate_up, &down, moe_inter, hidden, &mut scratch);
     let (gu_bf16, dn_bf16) = load_expert_bf16_slices(&store, layer, expert, moe_inter, hidden)?;
     let bf16 = expert_forward_staged_bf16(
         moe_in_row,
@@ -198,25 +199,20 @@ fn dump_from_capture(
     let gpu_readback_head: [f32; 8] = cap.gpu_out[..8].try_into().expect("gpu_out head");
     let cos_gpu_readback_vs_kernel_moe_out =
         cosine_f32(&gpu_readback_head, &cap.gpu_input.moe_out_tok_row_head);
-    let cos_kernel_moe_out_cpu =
-        cosine_f32(&cap.gpu_input.moe_out_tok_row_head, &cpu_out[..8]);
-    let cos_kernel_moe_out_mirror =
-        cosine_f32(&cap.gpu_input.moe_out_tok_row_head, &grouped_mirror_out[..8]);
+    let cos_kernel_moe_out_cpu = cosine_f32(&cap.gpu_input.moe_out_tok_row_head, &cpu_out[..8]);
+    let cos_kernel_moe_out_mirror = cosine_f32(
+        &cap.gpu_input.moe_out_tok_row_head,
+        &grouped_mirror_out[..8],
+    );
     eprintln!(
         "moe-single kernel input: tok={} slot={} expert={} weight={:.4} \
          cos(x_head,cpu_moe_in)={cos_gpu_x_head_cpu_moe_in:.4}",
-        cap.gpu_input.tok,
-        cap.gpu_input.slot,
-        cap.gpu_input.expert,
-        cap.gpu_input.weight,
+        cap.gpu_input.tok, cap.gpu_input.slot, cap.gpu_input.expert, cap.gpu_input.weight,
     );
     let mirror_head: [f32; 8] = grouped_mirror_out[..8].try_into().expect("mirror head");
     eprintln!(
         "moe-single moe_out row {}: kernel_readback={:?} cpu_readback={:?} mirror={:?}",
-        cap.gpu_input.tok,
-        cap.gpu_input.moe_out_tok_row_head,
-        gpu_readback_head,
-        mirror_head,
+        cap.gpu_input.tok, cap.gpu_input.moe_out_tok_row_head, gpu_readback_head, mirror_head,
     );
     eprintln!(
         "moe-single moe_out cos: readback_vs_kernel={cos_gpu_readback_vs_kernel_moe_out:.4} \

@@ -3,7 +3,7 @@
 use super::gpu_common;
 use super::test_util::ElemFormat;
 use super::variant::KernelVariant;
-use crate::metal::{RouteScratch, N_EXPERTS};
+use crate::metal::{N_EXPERTS, RouteScratch};
 use crate::safetensors::Error;
 
 pub const ENTRY: &str = "moe_bucket_count";
@@ -30,7 +30,9 @@ pub fn tiny_fixture(_: ElemFormat) -> Fixture {
 }
 
 pub fn production_fixture(_: ElemFormat) -> Fixture {
-    Fixture { n_experts: N_EXPERTS }
+    Fixture {
+        n_experts: N_EXPERTS,
+    }
 }
 
 pub fn cpu(f: &Fixture) -> Vec<f32> {
@@ -81,15 +83,12 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         block_row0: [0; crate::metal::MOE_MAX_BLOCKS],
         num_blocks: 0,
     };
-    BufferPool::write_bytes(
-        &buf_route,
-        unsafe {
-            std::slice::from_raw_parts(
-                &scratch as *const RouteScratch as *const u8,
-                std::mem::size_of::<RouteScratch>(),
-            )
-        },
-    );
+    BufferPool::write_bytes(&buf_route, unsafe {
+        std::slice::from_raw_parts(
+            &scratch as *const RouteScratch as *const u8,
+            std::mem::size_of::<RouteScratch>(),
+        )
+    });
 
     let n_experts = f.n_experts as u32;
     let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
@@ -116,7 +115,10 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     cmd.waitUntilCompleted();
 
     scratch = unsafe { std::ptr::read(buf_route.contents().as_ptr() as *const RouteScratch) };
-    Ok(scratch.count[..f.n_experts].iter().map(|&v| v as f32).collect())
+    Ok(scratch.count[..f.n_experts]
+        .iter()
+        .map(|&v| v as f32)
+        .collect())
 }
 
 #[cfg(not(all(feature = "metal", target_os = "macos")))]

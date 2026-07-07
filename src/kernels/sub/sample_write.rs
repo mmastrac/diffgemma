@@ -4,7 +4,7 @@ use super::gpu_common;
 use super::test_util::ElemFormat;
 use super::variant::KernelVariant;
 use crate::kernels::cpu::sampler::sample_write_cpu;
-use crate::metal::{CanvasState, CANVAS};
+use crate::metal::{CANVAS, CanvasState};
 use crate::safetensors::Error;
 
 pub const ENTRY: &str = "sample_write";
@@ -114,8 +114,7 @@ pub fn pipeline_for(
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLSize,
+    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
 };
 
 #[cfg(all(feature = "metal", target_os = "macos"))]

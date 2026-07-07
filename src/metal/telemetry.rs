@@ -1,7 +1,7 @@
 //! Per-forward and per-step counters for Q0 calibration (PLAN2).
 
-use crate::metal::expert_cache::expert_entry_bytes;
 use crate::config::TextConfig;
+use crate::metal::expert_cache::expert_entry_bytes;
 
 /// Counters accumulated during one GPU decoder forward.
 #[derive(Debug, Default, Clone)]
@@ -36,26 +36,16 @@ impl ForwardTelemetry {
         }
     }
 
-    pub fn record_expert_layer(
-        &mut self,
-        layer: usize,
-        unique_experts: usize,
-        text: &TextConfig,
-    ) {
+    pub fn record_expert_layer(&mut self, layer: usize, unique_experts: usize, text: &TextConfig) {
         if self.expert_unique_per_layer.len() <= layer {
             self.expert_unique_per_layer.resize(layer + 1, 0);
         }
         self.expert_unique_per_layer[layer] = unique_experts as u32;
-        self.expert_weight_bytes_touched +=
-            unique_experts as u64 * expert_entry_bytes(text);
+        self.expert_weight_bytes_touched += unique_experts as u64 * expert_entry_bytes(text);
     }
 
     /// Monolithic grouped MoE: per-layer unique counts + `.dgq` blob bytes/expert.
-    pub fn record_expert_layers_grouped(
-        &mut self,
-        counts: &[u32],
-        weight_bytes_per_expert: u64,
-    ) {
+    pub fn record_expert_layers_grouped(&mut self, counts: &[u32], weight_bytes_per_expert: u64) {
         self.expert_unique_per_layer = counts.to_vec();
         if weight_bytes_per_expert > 0 {
             let total_unique: u64 = counts.iter().map(|&u| u as u64).sum();
@@ -176,14 +166,9 @@ impl SessionTelemetry {
 
     pub fn print_summary(&self, label: &str) {
         println!("{label} ({} steps)", self.steps.len());
-        println!(
-            "  decoder: {:.1} ms/step (mean)",
-            self.mean_decoder_ms()
-        );
-        println!(
-            "  sampler: {:.1} ms/step (mean)",
-            self.mean_sampler_ms()
-        );
-        self.aggregate_forward().print_summary("  per-step forward (mean fields):");
+        println!("  decoder: {:.1} ms/step (mean)", self.mean_decoder_ms());
+        println!("  sampler: {:.1} ms/step (mean)", self.mean_sampler_ms());
+        self.aggregate_forward()
+            .print_summary("  per-step forward (mean fields):");
     }
 }
