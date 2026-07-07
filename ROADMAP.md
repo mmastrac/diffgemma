@@ -320,6 +320,7 @@ the sampler-struct growth ripple). The slack is the plan.
 | E7 | confidence-threshold sampler | parity feature, maybe faster stops | 1 d | gate neutral | worse convergence |
 | E8 | Hadamard-rotated q4 KV (§5.2) | **IN PROGRESS 2026-07-07**: 262k KV 5.3→~1.4 GiB, quality-neutral. Premise corrected — K rotates at RUNTIME after RoPE (can't fold), V rotates at runtime too (full layers alias V/no W_v), only W_o folds offline | ~3 d | rotated-q4 passes multi-seed gate + needle 33k/100k exact + DGQ_MEM_WATCH < 90% @ 262k | rotated-q4 fails gate (rotation doesn't recover q4 quality) |
 | E9 | Rotated experts (near-bf16 fidelity @ q4) (§5.4) | M1 gate/up (shared WHT + offline fold) recovers ~bf16 forward; M2 down_proj WHT only if needed | v2+ | full gate vs bf16-expert ref + census + sign-off | M1 no better than plain q4, or M2 WHT regresses short-context |
+| E10 | Precision-decay KV (recent f16, aged rotated-q4) | segmented full-layer KV: f16 recent window + q4 aged bulk, demoted+rotated as tokens age past the window; better quality/memory than uniform q4 | v2+ | needle 262k exact + DGQ_MEM_WATCH under budget + gate | on 36 GB marginal over q8-auto (which already fits 262k) — value is 18-24 GB / >262k / long-range quality |
 
 Every experiment observes the standing rules: bit-identical ships on
 identity evidence; anything else needs multi-seed gate + census + explicit
