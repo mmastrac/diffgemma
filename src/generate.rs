@@ -89,7 +89,7 @@ pub fn generate_monolithic_gpu(
         .max_layers
         .unwrap_or(validated.num_layers)
         .min(validated.num_layers);
-    let cfg = StepGenerateConfig::from_generate(
+    let mut cfg = StepGenerateConfig::from_generate(
         gen_cfg.seed,
         gen_cfg.max_new_tokens,
         max_seq,
@@ -97,6 +97,9 @@ pub fn generate_monolithic_gpu(
         gen_cfg.sampler.clone(),
         gen_cfg.no_early_stop,
     );
+    // E6 empty/degenerate-reply canvas re-roll (only when enabled). Detects an
+    // empty user-facing reply from the decoded+sanitized committed block.
+    cfg.degenerate_reply_check = crate::chat_template::empty_reply_check(model_dir, Vec::new());
     generate_monolithic(model_dir, prompt_token_ids, &cfg, prompt_label)
 }
 

@@ -56,6 +56,13 @@ pub struct StepGenerateConfig {
     /// block emits any of these. Empty preserves the fixed `max_new_tokens`
     /// budget behavior used by parity/golden paths.
     pub stop_token_ids: Vec<u32>,
+    /// E6 empty/degenerate-reply canvas re-roll (with `DGQ_EMPTY_REPLY_RETRY>0`).
+    /// Given the first block's committed argmax, returns true when it renders as
+    /// an empty user-facing reply (eos-first canvas OR `<|channel>thought`
+    /// ceremony) — checked against the real decoded+sanitized output, not a
+    /// token blocklist. `None` disables the re-roll. Built by
+    /// `chat_template::empty_reply_check`.
+    pub degenerate_reply_check: Option<std::sync::Arc<dyn Fn(&[u32]) -> bool + Send + Sync>>,
     /// Optional per-step progress callback (chat streaming / spinner).
     pub step_observer: Option<StepObserver>,
 }
@@ -70,6 +77,7 @@ impl std::fmt::Debug for StepGenerateConfig {
             .field("sampler", &self.sampler)
             .field("no_early_stop", &self.no_early_stop)
             .field("stop_token_ids", &self.stop_token_ids)
+            .field("degenerate_reply_check", &self.degenerate_reply_check.is_some())
             .field("step_observer", &self.step_observer.is_some())
             .finish()
     }
@@ -93,6 +101,7 @@ impl StepGenerateConfig {
             no_early_stop,
             initial_canvas_ids: None,
             stop_token_ids: Vec::new(),
+            degenerate_reply_check: None,
             step_observer: None,
         }
     }
@@ -429,15 +438,26 @@ pub fn generate_with_session(
         }
 
         let block_started = Instant::now();
-        let mut block_step_count = 0u32;
-        let mut accept_hist = Vec::new();
-        let mut min_entropy_hist = Vec::new();
-        let mut mean_entropy_hist = Vec::new();
-        let mut low_ent_hist = Vec::new();
-        let mut last_st;
-        let mut prev_step_argmax: Option<[u32; CANVAS]> = None;
-        let mut prefix_stable_streak = 0u32;
-        loop {
+        // E6: empty/degenerate-reply retry — first block only. If the committed
+        // canvas would trim to empty (position 0 is a stop/eos/control token),
+        // re-roll the canvas and re-denoise up to N times (DGQ_EMPTY_REPLY_RETRY).
+        let empty_retry_max = if block_idx == 1 {
+            crate::flags::empty_reply_retry()
+        } else {
+            0
+        };
+        let mut empty_retry_attempt = 0u32;
+        let (st, block_step_count, accept_hist, min_entropy_hist, mean_entropy_hist, low_ent_hist) =
+            'attempt: loop {
+                let mut block_step_count = 0u32;
+                let mut accept_hist = Vec::new();
+                let mut min_entropy_hist = Vec::new();
+                let mut mean_entropy_hist = Vec::new();
+                let mut low_ent_hist = Vec::new();
+                let mut last_st;
+                let mut prev_step_argmax: Option<[u32; CANVAS]> = None;
+                let mut prefix_stable_streak = 0u32;
+                loop {
             let step_started = Instant::now();
             rt.run_denoise_step()?;
             let check_logits = crate::metal::step_kernel::logits_finite_check_enabled();
@@ -608,6 +628,39 @@ pub fn generate_with_session(
             }
         }
         let st = last_st;
+        // Empty/degenerate-reply detection: does the committed argmax render as
+        // an empty user-facing reply (eos-first canvas OR `<|channel>thought`
+        // ceremony)? Checked against the real decoded+sanitized output (E6
+        // attractor). Re-roll the canvas from the advancing rng and retry.
+        let degenerate = cfg
+            .degenerate_reply_check
+            .as_ref()
+            .is_some_and(|check| check(&st.prev_argmax));
+        if empty_retry_attempt < empty_retry_max && degenerate {
+            empty_retry_attempt += 1;
+            if progress_enabled() {
+                eprintln!(
+                    "step-generate: block {block_idx} empty/degenerate reply; re-rolling canvas (attempt {empty_retry_attempt}/{empty_retry_max})"
+                );
+            }
+            let params = step_params_from_sampler(
+                &cfg.sampler,
+                rt.read_params().kv_len,
+                cfg.no_early_stop,
+                rt.read_params().eos_token_id,
+            );
+            rt.reset_block(VOCAB, &mut rng, params);
+            continue 'attempt;
+        }
+        break 'attempt (
+            st,
+            block_step_count,
+            accept_hist,
+            min_entropy_hist,
+            mean_entropy_hist,
+            low_ent_hist,
+        );
+        };
         let block_elapsed = block_started.elapsed();
         denoise_elapsed += block_elapsed;
         block_steps_eff.push(block_step_count);

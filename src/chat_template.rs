@@ -56,6 +56,47 @@ impl Default for ChatFormatOptions {
     }
 }
 
+/// Predicate for the E6 empty/degenerate-reply canvas re-roll: given a
+/// committed block's full-canvas argmax, returns true when it would render as
+/// an EMPTY user-facing reply. It checks the actual output STATE — take the
+/// answer region (up to the first stop/eos token), strip pad/filler, decode,
+/// and `sanitize_model_reply` — rather than blocklisting leading token ids.
+/// This catches both shapes of the attractor with one rule: the eos-first
+/// "empty" canvas AND the `<|channel>thought` ceremony (sanitize erases the
+/// thought-channel scaffold to nothing). Owns the tokenizer by move so it can
+/// live in `StepGenerateConfig` as a `Send + Sync` closure.
+pub fn empty_reply_predicate(
+    tok: Tokenizer,
+    stop_ids: Vec<u32>,
+    eos_token_id: u32,
+) -> impl Fn(&[u32]) -> bool + Send + Sync {
+    move |argmax: &[u32]| {
+        let end = argmax
+            .iter()
+            .position(|id| *id == eos_token_id || stop_ids.contains(id))
+            .unwrap_or(argmax.len());
+        let region = crate::sample::strip_degenerate_token_ids(&argmax[..end]);
+        sanitize_model_reply(&tok.decode(&region)).is_empty()
+    }
+}
+
+/// Build the E6 empty-reply predicate for `StepGenerateConfig`, or `None` when
+/// the retry is disabled (`DGQ_EMPTY_REPLY_RETRY=0`) or the tokenizer/config
+/// can't be loaded — so the re-roll only ever activates when enabled.
+pub fn empty_reply_check(
+    model_dir: &std::path::Path,
+    stop_ids: Vec<u32>,
+) -> Option<std::sync::Arc<dyn Fn(&[u32]) -> bool + Send + Sync>> {
+    if crate::flags::empty_reply_retry() == 0 {
+        return None;
+    }
+    let tok = Tokenizer::load(model_dir.join("tokenizer.json")).ok()?;
+    let eos = crate::config::ModelConfig::load(model_dir)
+        .ok()?
+        .eos_token_id_u32();
+    Some(std::sync::Arc::new(empty_reply_predicate(tok, stop_ids, eos)))
+}
+
 fn role_name(role: ChatRole) -> &'static str {
     match role {
         ChatRole::User => "user",

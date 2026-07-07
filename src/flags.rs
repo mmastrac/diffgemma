@@ -75,6 +75,27 @@ pub fn early_stop_mean_ent() -> f32 {
     })
 }
 
+/// Empty/degenerate-reply retry (E6). On the FIRST denoise block only, if the
+/// committed canvas is degenerate (position 0 is a stop/eos/control token → the
+/// reply would trim to empty or lead with ceremony), re-roll the initial canvas
+/// from the advancing seed stream and re-run the block, up to N times. The empty
+/// reply is an intrinsic (prompt, initial-canvas)→eos attractor shared with MLX
+/// (E6 2026-07-07: forward is MLX-faithful, token-suppression recovers ceremony
+/// junk, template is load-bearing) — a fresh canvas draw escapes it for ~most
+/// seeds. Retries stay deterministic per `--seed` (canvas derives from the same
+/// rng chain). DEFAULT 3 (user sign-off 2026-07-07; seed-123 gate answers
+/// 13→17, calibration seeds 7/42 unchanged 17/17 = pure no-op on good replies,
+/// suite 714/0). `DGQ_EMPTY_REPLY_RETRY=0` disables.
+pub fn empty_reply_retry() -> u32 {
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DGQ_EMPTY_REPLY_RETRY")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(3)
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Production perf toggles (all default ON, opt-out for A/B triage)
 // ---------------------------------------------------------------------------

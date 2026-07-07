@@ -3988,6 +3988,8 @@ fn run_chat_cmd(
         sampler,
         no_early_stop,
     );
+    step_cfg.degenerate_reply_check =
+        chat_template::empty_reply_check(model_dir, stop_token_ids.clone());
     step_cfg.stop_token_ids = stop_token_ids;
 
     if interactive {
@@ -4283,6 +4285,8 @@ fn run_smoketest_cmd(
     let sampler = sample::sampler_for_steps(steps, false);
     let mut step_cfg =
         StepGenerateConfig::from_generate(seed, 1024, SMOKE_MAX_SEQ, layers, sampler, false);
+    step_cfg.degenerate_reply_check =
+        chat_template::empty_reply_check(model_dir, stop_token_ids.clone());
     step_cfg.stop_token_ids = stop_token_ids;
 
     let mut session = match StepGenerateSession::open(model_dir, &step_cfg, None) {
@@ -4321,7 +4325,13 @@ fn run_smoketest_cmd(
                 out.token_ids.get(prompt_len..).unwrap_or(&[]),
             );
             let reply = chat_template::sanitize_model_reply(&tokenizer.decode(&new_ids));
-            Ok((out.denoise_steps_run, reply))
+            // Convergence gate = steps of the COMMITTED blocks (block_steps_eff),
+            // not total denoise work. Identical to denoise_steps_run unless the
+            // empty-reply retry (DGQ_EMPTY_REPLY_RETRY>0) re-rolled a degenerate
+            // first block — discarded re-roll steps are latency, not a convergence
+            // regression, so they must not count against the per-prompt budget.
+            let committed_steps: usize = out.block_steps_eff.iter().map(|&s| s as usize).sum();
+            Ok((committed_steps, reply))
         };
 
     // (No warm-up: cold-start is fixed at the root by the deterministic first-step
