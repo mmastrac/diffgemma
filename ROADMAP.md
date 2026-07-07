@@ -110,8 +110,13 @@ interleaved rounds per arm — NOT full-prefill wall-clock):
   issue-bound; unique DRAM traffic (~430 MB once) is milliseconds. The
   33k physics holds at 105k.
 - Updated guidance: q8 = the KV MEMORY lever (halves KV), and at 100k+ it's
-  additionally ~6% faster — win-win for very long contexts, opt-in.
+  additionally ~6% faster — win-win for very long contexts.
 - Retrieval at 105k under q8 run separately (untimed, correctness only).
+- **SHIPPED 2026-07-07: q8 auto-enables at long context** (`kv_q8(max_seq)`
+  scales with the captured working-set cap; `DGQ_KV_Q8=1/0` overrides). f16
+  @262k SWAPS (91% + 704 MB, pressure WARN via DGQ_MEM_WATCH); auto-q8 keeps
+  it at 82%. Threshold ~178k on 36 GB, lower on smaller Macs. Short prompts
+  stay f16 → gate 17/17 unchanged.
 
 ### 2.5 Attention issue-bound follow-up (timeboxed research, ≤ 1 day)
 Full-layer attention at 100k ≈ 3 s/step is instruction-issue-bound. The one
@@ -309,7 +314,7 @@ the sampler-struct growth ripple). The slack is the plan.
 | E1 | Weight-stationary expert GEMM | ~~33k prefill −20%~~ **DISPROVEN 2026-07-07**: BM=64 wash, BM=128 3.6x slower; expert GEMM at M=1024 is compute-bound (~6x margin over W bytes) | done | bit-identity held (KV byte-equal), gate 17/17 | hit: < 5% → machinery kept, default off |
 | E2 | Fast prefill for short prompts | turn time neutral, engine retired | 1 d | multi-seed ≥ 47/51 + census | adherence regression |
 | E3 | Canvas shrink at tail | MLX parity, small tail win | 1 d | multi-seed gate | quality regression |
-| E4 | q8 KV @ 100k | ~~q8 wins where DRAM-bound~~ **CLOSED 2026-07-07**: sign flips but only −6% denoise at 105k (still SLC-served/issue-bound, ~580 GB/s effective) | done | < 15% → no default change; q8 = memory lever, +6% bonus at 100k+ | hit: table closed |
+| E4 | q8 KV @ 100k | ~~q8 wins where DRAM-bound~~ **CLOSED 2026-07-07**: −6% at 105k (issue-bound); but f16 @262k SWAPS (91%) → **q8 now AUTO-enables at long ctx** so long sessions stay resident | done | q8 = memory lever; auto above ~178k (scales with cap); gate 17/17 (short prompts stay f16) | hit: table closed |
 | E5 | Fragment-tile attention | ≥ 1.5× at kv 32k | 1 d timebox | bench row, then full gate | < 1.5× on bench |
 | E6 | seed-123 artifact root-cause | stop-token trim on eos-first canvas | 2 d | aggregate > 47/51 | — (must diagnose even if fix deferred) |
 | E7 | confidence-threshold sampler | parity feature, maybe faster stops | 1 d | gate neutral | worse convergence |

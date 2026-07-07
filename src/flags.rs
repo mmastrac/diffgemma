@@ -207,28 +207,50 @@ pub fn kv_reuse_enabled() -> bool {
     on_unless_zero("DGQ_KV_REUSE")
 }
 
-/// q8 KV cache storage (`DGQ_KV_Q8=1` opts in; DEFAULT OFF). Group-32
-/// symmetric i8 + f16 scales (0.92% rel-RMS on real KV), halves KV memory.
-/// DISPROVEN AS A SPEED LEVER at short/mid kv 2026-07-06: at 33k tokens q8
-/// is prefill +9% / denoise +54% vs f16 even with vectorized group dequant —
-/// the f16 direct-load kernels are ISSUE-bound at SLC-served ~171 GB/s
-/// effective, not byte-starved, so halving bytes while adding a dequant
-/// staging pass (tgmem round-trip + 4 tg barriers/key-tile) loses. Same
-/// physics rules out rotated lower-bit KV (TurboQuant-class) as a speed
-/// lever here. E4 100k CELL SETTLED 2026-07-07 (kv=105k, 30L, interleaved
-/// 3-round profile-steps A/B): the sign flips but only to −6% denoise
-/// (pre_moe 4.14→3.87 s/step; full-layer sweep still runs ~580 GB/s
-/// effective = SLC-served, issue-bound even at 105k) — under the ≥15%
-/// adaptive-flip gate, so the default stays f16 at every length. Use q8
-/// when KV MEMORY binds (~262k ctx: f16 5.3 GiB -> q8 2.8; at 100k+ it is
-/// additionally ~6% faster). Quality: forced-q8 gate aggregate 45/51 =
-/// baseline (reshuffle-neutral); needle retrieval exact at 33k. The format
-/// is fixed per session at open; every KV writer/reader compiles a matching
-/// function-constant variant.
+/// GPU working-set cap (Metal `recommendedMaxWorkingSetSize`), captured once
+/// at MetalContext init so the pure `kv_q8` policy can scale to the device's
+/// RAM. 0 (unset, e.g. CPU-only tests) → the q8 auto-policy stays off.
+static GPU_WORKING_SET_BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Record the device working-set cap (idempotent; first writer wins).
+pub fn set_gpu_working_set_cap(bytes: u64) {
+    let _ = GPU_WORKING_SET_BYTES.set(bytes);
+}
+
+/// q8 KV cache storage. Group-32 symmetric i8 + f16 scales (0.92% rel-RMS on
+/// real KV), halves KV memory. **AUTO at long context since 2026-07-07**:
+/// enabled when the estimated f16 resident at `max_seq` would approach the
+/// GPU working-set cap, so very long sessions stay resident instead of
+/// swapping. `DGQ_KV_Q8=1` forces on, `=0` forces off (override the policy).
+///
+/// Why auto (measured): at kv=262k (model max), f16 KV puts resident at 91%
+/// of the ~27 GiB cap and the machine SWAPS (+704 MB, pressure WARN, caught
+/// by DGQ_MEM_WATCH); q8 lands at 82% and doesn't. Below the cap f16 is the
+/// default — it's issue-bound-faster (E4: q8 is +9%/+54% at 33k, −6% at
+/// 105k), so q8 only earns its keep once memory pressure would otherwise
+/// force swap. The switch scales with the cap, so smaller Macs flip earlier.
+/// Constants measured on this checkpoint 2026-07-07 (f16 session-open:
+/// 105k→21.63 GiB, 262k→24.61 GiB → resident ≈ 19.73 GiB + 19.0 KiB/token).
+///
+/// Not a SPEED lever below the cliff (issue-bound kernels; same physics rules
+/// out rotated lower-bit KV for speed). Quality: forced-q8 gate 45/51 =
+/// baseline; needle exact 33k/105k. Format is fixed per session at open;
+/// every KV writer/reader compiles a matching function-constant variant.
 pub fn kv_q8(max_seq: usize) -> bool {
-    let _ = max_seq;
-    static FORCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FORCE.get_or_init(|| on_if_one("DGQ_KV_Q8"))
+    // Explicit override (any set value): 1/true → on, else → off.
+    if let Ok(v) = std::env::var("DGQ_KV_Q8") {
+        return v == "1" || v.eq_ignore_ascii_case("true");
+    }
+    // Auto: enable when f16 resident would exceed a safe fraction of the cap.
+    let Some(&cap) = GPU_WORKING_SET_BYTES.get() else {
+        return false; // cap unknown (tests / CPU) → keep f16
+    };
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const F16_BASE_BYTES: f64 = 19.73 * GIB; // non-KV resident (weights+arena)
+    const F16_KV_BYTES_PER_TOKEN: f64 = 19.0 * 1024.0; // f16 KV linear growth
+    const SAFE_FRACTION: f64 = 0.85; // switch before the >90% swap regime
+    let f16_resident = F16_BASE_BYTES + F16_KV_BYTES_PER_TOKEN * max_seq as f64;
+    f16_resident > SAFE_FRACTION * cap as f64
 }
 
 /// KV block size for sequential-block full-attention (`DGQ_ATTN_KV_BLOCK=

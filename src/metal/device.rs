@@ -20,6 +20,9 @@ impl MetalContext {
         let queue = device
             .newCommandQueue()
             .ok_or(Error::Format("failed to create Metal command queue"))?;
+        // Record the working-set cap so the q8-KV auto policy (flags::kv_q8)
+        // can scale to this device's RAM.
+        crate::flags::set_gpu_working_set_cap(device.recommendedMaxWorkingSetSize());
         Ok(Self { device, queue })
     }
 

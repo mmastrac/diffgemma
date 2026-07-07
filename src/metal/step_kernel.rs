@@ -4894,6 +4894,12 @@ pub fn build_step_runtime(
     let store = DgqStore::open(model_dir)?;
     let offsets = build_offsets_from_store(&store);
     let layout = build_layout(&offsets, cfg.max_seq);
+    if crate::flags::progress_enabled() && crate::flags::kv_q8(cfg.max_seq) {
+        eprintln!(
+            "step-kernel: q8 KV cache (auto at long context, max_seq={}) — halves KV to stay under the GPU working-set cap",
+            cfg.max_seq
+        );
+    }
     let layers = cfg.layers.min(validated.num_layers).max(1);
 
     // Mixed-precision .dgq stores attention + dense-FFN as bf16 (Raw) — or q8 on
