@@ -145,7 +145,27 @@ tiles — the padding is real, it just isn't on the critical path):
   ms/layer W bytes incl. re-reads) — byte-cutting is a non-lever here; the
   prefill MoE lever, if any, is GEMM TF/s (fragment-tile class).
 
-## GEMM headroom investigation (2026-07-02) — OPEN, the next big lever
+## GEMM TF/s ceiling — SETTLED 2026-07-07 (bench: `bench-gemm --shapes sparse`)
+
+Measured at the PREFILL shapes (M=8192-slot MoE, M=1024 dense), M3 Pro:
+- **dense tunable 64x64 = 3.69-3.88 TF/s = AT the MPS matmul wall
+  (3.65-3.69)** — the 2026-07-02 "1.5-1.7x headroom" is CLOSED; the tunable
+  port captured it.
+- **sparse @ prefill route distribution (128 experts x 64 rows): 3.33-3.64
+  useful = 92-96% of its dense twin.** SHIPPED from the sweep: SPARSE_BN
+  64→128 (gate_up +5.6%, down +8% within-run; both N dims divide 128; same
+  block list; bit-identical — KV dump byte-equal, gate 17/17).
+- **sparse @ denoise distribution (x16 rows): 1.73-1.87 useful** — the old
+  "~2.3 TF/s useful wall" figure was THIS regime (per-TG fixed cost +
+  padding at tiny M_tile), i.e. the CLOSED tiny-M family, not a kernel
+  quality gap.
+- **MLX steel qmm: 3.96-4.15 at the same shapes** (f16 dense 4.29-4.45).
+  The remaining ~10-15% vs MLX is their software-pipelined loader/MMA;
+  porting it is a real GEMM project worth <= ~2-3% end-to-end prefill →
+  NON-LEVER at current ROI. GEMM TF/s is now a closed ledger; prefill
+  gains must come from non-GEMM stages or fewer FLOPs.
+
+## GEMM headroom investigation (2026-07-02) — CLOSED by the above (history)
 
 MPS/MLX prove ~1.5–1.7× GEMM headroom at our shapes (numbers above). Root
 cause hunted with a bench-only prototype (`gemm_block_sq`, wired into

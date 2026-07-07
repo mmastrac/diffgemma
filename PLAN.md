@@ -69,7 +69,7 @@ agent memory `long-context-100k`.
 
 | Item | Note |
 |---|---|
-| Long-context speed | remaining levers are TF/s-class only (fragment-tile GEMM/attention); byte/schedule levers all disproven: KV quant, blocked dispatch, weight-stationary expert GEMM (E1, 2026-07-07) |
+| Long-context speed | GEMM ledger CLOSED 2026-07-07: tunable = MPS wall, sparse 92-96% of dense at prefill distribution, SPARSE_BN=128 shipped (+6-8% kernel); MLX-qmm gap ~10-15% = pipelined-loader port worth ≤2-3% (non-lever). Remaining: attention fragment-tile (ROADMAP E5) only |
 | Seed-123 empty-reply artifact | short factual prompts, both prefill paths (engine 5 / fast 2 of 17 at that seed); trajectory-level, pre-existing |
 | Legacy GEMM retirement | `gemm_block*` legacy pipelines after a stable tunable cycle (KERNELS.md deprecation list; needs user nod) |
 | Mechanical kernel merges | embed_gather / gather_rows / f32_to_half families (KERNELS.md) |
