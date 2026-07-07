@@ -2746,6 +2746,20 @@ fn run_bench_gemm(shapes: &str, oracle: Option<&str>, iters: usize) -> ExitCode 
         bench_custom_kernel, bench_gemm_bf16, bench_gemm_block_q4, bench_mpsgraph_oracle,
         parse_shapes, print_bench_rows,
     };
+    // `--shapes sparse`: block-sparse MoE bench at the production route
+    // distributions (MxKxN comes from the model shapes; the spec is ignored).
+    if shapes == "sparse" {
+        return match metal::bench_gemm_tunable_sparse(iters) {
+            Ok(rows) => {
+                print_bench_rows(&rows);
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("error: {err}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let parsed = match parse_shapes(shapes) {
         Ok(s) => s,
         Err(err) => {

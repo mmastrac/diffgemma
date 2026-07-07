@@ -91,9 +91,13 @@ pub fn stacked_pipeline_for(
 }
 
 /// Sparse (block-sparse MoE) tile config: BM fixed at the 32-row block height
-/// baked into moe_bucket_fill; BN=64 like the plain kernels.
+/// baked into moe_bucket_fill. BN=128 since 2026-07-07 (`bench-gemm --shapes
+/// sparse`, within-run A/B at the prefill distribution r64: gate_up 3.33 →
+/// 3.52 TF/s, down 3.36 → 3.63; denoise r16 neutral-to-+2%). Both MoE N dims
+/// (1408, 2816) divide 128 exactly; same 32-row block list; bit-identical
+/// (N-tile width never touches the per-output K-chain).
 pub const SPARSE_BM: usize = 32;
-pub const SPARSE_BN: usize = 64;
+pub const SPARSE_BN: usize = 128;
 
 pub const ENTRY_SPARSE: &str = "gemm_tunable_sparse";
 
@@ -110,11 +114,29 @@ pub fn pipeline_for_sparse(
     pipeline_for_sparse_bm(ctx, n, k, gather, format, SPARSE_BM)
 }
 
-/// Wide-block variant (weight-stationary prefill, DGQ_MOE_PREFILL_BM): same
-/// kernel compiled at a taller TUNE_BM so one threadgroup owns all (or most)
-/// of an expert's rows — one dequantized weight stream per N-tile instead of
-/// one per 32-row block. Requires the block list to be built with the same
-/// block height (moe_bucket_fill phase 1, RouterDims.block_m).
+/// Tile-parameterized sparse variant. `bm` != 32 is the weight-stationary
+/// prefill experiment (DGQ_MOE_PREFILL_BM — requires the block list to be
+/// built at the same height via RouterDims.block_m; disproven as perf, kept
+/// opt-in). `bn` != 64 changes only the N-tile width (same 32-row block
+/// list; dispatch grid width must use the same bn).
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn pipeline_for_sparse_tile(
+    ctx: &crate::metal::device::MetalContext,
+    n: u32,
+    k: u32,
+    gather: bool,
+    format: QuantFormat,
+    bm: usize,
+    bn: usize,
+) -> Result<crate::metal::device::ComputePipeline, Error> {
+    let src = tuned_source(bm, bn);
+    if gather {
+        ctx.compile_gemm_subkernel_gather(&src, ENTRY_SPARSE, n, k, format as u32)
+    } else {
+        ctx.compile_gemm_subkernel(&src, ENTRY_SPARSE, n, k, false, format as u32, false)
+    }
+}
+
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub fn pipeline_for_sparse_bm(
     ctx: &crate::metal::device::MetalContext,
@@ -124,10 +146,8 @@ pub fn pipeline_for_sparse_bm(
     format: QuantFormat,
     bm: usize,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    let src = tuned_source(bm, SPARSE_BN);
-    if gather {
-        ctx.compile_gemm_subkernel_gather(&src, ENTRY_SPARSE, n, k, format as u32)
-    } else {
-        ctx.compile_gemm_subkernel(&src, ENTRY_SPARSE, n, k, false, format as u32, false)
-    }
+    // The wide-block (E1) variants pin BN=64: bm=64 x BN=128 would be 32
+    // accumulator fragments (64 f32/lane) — the known register-spill regime.
+    let bn = if bm == 32 { SPARSE_BN } else { 64 };
+    pipeline_for_sparse_tile(ctx, n, k, gather, format, bm, bn)
 }

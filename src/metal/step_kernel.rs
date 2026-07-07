@@ -1366,6 +1366,10 @@ struct MoeGroupedGridInfo {
     tpg: u32,
     /// N-tile width of the tunable sparse pipelines (indirect slots 4/5).
     tunable_n_tile: u32,
+    /// N-tile width of the wide-block (E1, block_m != 32) tunable sparse
+    /// pipelines — they pin BN=64. bucket_fill picks this for slots 4/5
+    /// when dims.block_m != 32.
+    tunable_wide_n_tile: u32,
 }
 
 // Slots 0/1: per-expert grouped (gate_up/down), height = num_active_experts.
@@ -1380,6 +1384,7 @@ fn moe_grouped_grid_info() -> MoeGroupedGridInfo {
         n_tile: crate::kernels::sub::gemm_common::n_tile() as u32,
         tpg: crate::kernels::sub::gemm_common::THREADS_PER_TG as u32,
         tunable_n_tile: crate::kernels::sub::gemm_tunable::SPARSE_BN as u32,
+        tunable_wide_n_tile: 64,
     }
 }
 

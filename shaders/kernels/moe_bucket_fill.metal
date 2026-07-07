@@ -85,8 +85,13 @@ kernel void moe_bucket_fill(
                 indirect[3].threadgroups_per_grid[0] = down_w;
                 indirect[3].threadgroups_per_grid[1] = blk;
                 indirect[3].threadgroups_per_grid[2] = 1u;
-                // Slots 4/5: tunable block-sparse (BN-wide N-tiles).
-                const uint tn = max(grid_info.tunable_n_tile, 1u);
+                // Slots 4/5: tunable block-sparse (BN-wide N-tiles). The
+                // wide-block (E1) pipelines are compiled at a different BN
+                // than the default 32-row ones — the width must match the
+                // pipeline the block list's height selects.
+                const uint tn_sel =
+                    (bm == 32u) ? grid_info.tunable_n_tile : grid_info.tunable_wide_n_tile;
+                const uint tn = max(tn_sel, 1u);
                 indirect[4].threadgroups_per_grid[0] = (grid_info.gate_n + tn - 1u) / tn;
                 indirect[4].threadgroups_per_grid[1] = blk;
                 indirect[4].threadgroups_per_grid[2] = 1u;

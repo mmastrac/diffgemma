@@ -118,6 +118,7 @@ struct MoeGroupedGridInfo {
     n_tile: u32,
     tpg: u32,
     tunable_n_tile: u32,
+    tunable_wide_n_tile: u32,
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -137,6 +138,7 @@ fn run_phases(
         n_tile: 128,
         tpg: 128,
         tunable_n_tile: 64,
+        tunable_wide_n_tile: 64,
     };
     for phase in 0u32..3 {
         enc.setComputePipelineState(&pipeline.pipeline);
