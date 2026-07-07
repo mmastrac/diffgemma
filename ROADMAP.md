@@ -72,7 +72,19 @@ tokens identical at 32/64/128); suite 708/708; spec gate 17/17.
   cap is kernel TF/s. Raising prefill MoE throughput now means raising the
   GEMM's TF/s (E5-class fragment work), not byte reduction.
 
-### 2.2 Retire the f32 engine prefill for short prompts — 1 day
+### 2.2 Retire the f32 engine prefill — DONE 2026-07-07: DISPROVEN, keep the engine
+Forced `DGQ_FAST_PREFILL=1` for ALL lengths, multi-seed gate {7,42,123}:
+**41/51 (16/15/10) vs engine baseline 47/51 (17/17/13)** — a 6-point
+regression, all in the EMPTY-REPLY / non-convergence class on short factual
+prompts (blue_plus_yellow, opposite_of_hot, one_plus_one … "answer BAD",
+blank output). Fast prefill's bf16-perturbed prompt KV aggravates the
+seed-123 empty-reply artifact and spreads it to seed 42. Fails the ≥47/51
+ship gate on quality alone (wall-clock moot). **VERDICT: keep the f32 engine
+for short prompts — the length heuristic is a QUALITY mitigation, not just
+wall-clock. Strong mechanistic clue for E6: the empty-reply artifact is
+prefill-KV-precision-sensitive (engine f32 forward = partial cure).**
+
+### 2.2b (superseded) Retire the f32 engine prefill for short prompts — 1 day
 Short prompts (≤256) still run the legacy f32 engine at session open
 (~0.85 s steady + one-time shader JIT; ~2 s cold). Post-no-freeze evidence
 says fast prefill is adherence-clean (17/17 forced at seeds 7/42); the
