@@ -6,6 +6,7 @@ Low-dependency Rust + Metal inference engine for
 
 Docs: **SPEC.md** = the implemented generation contract. **KERNELS.md** =
 kernel verdicts + precision policy. **STRATEGY.md** = how to work here.
+**ROADMAP.md** = the 4-week production plan + experiment playbooks.
 **src/flags.rs** = every env flag. History lives in git + agent memory,
 not here.
 
