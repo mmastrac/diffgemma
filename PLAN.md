@@ -56,16 +56,20 @@ f16 direct-load kernels are ISSUE-bound at SLC speed, not byte-starved,
 which rules out TurboQuant-class low-bit KV for speed by the same physics.
 Batched multi-chunk prefill SHIPPED
 (bit-identical, `DGQ_PREFILL_BATCH`): 4x256 causal sub-chunks as one M=1024
-forward — 33k prefill 165.7→142.4s (−14%); the MoE amortization is capped
-by the block-sparse GEMM re-reading expert weights per 32-row block, so the
-next prefill lever is a weight-stationary expert GEMM. See agent memory
-`long-context-100k`.
+forward — 33k prefill 165.7→142.4s (−14%). The weight-stationary expert
+GEMM (ROADMAP E1) was then built and DISPROVEN 2026-07-07
+(`DGQ_MOE_PREFILL_BM`, default off): taller expert blocks are bit-identical
+but a perf WASH at 64 and 3.6x slower at 128 (register spill) — the expert
+GEMM at M=1024 is COMPUTE-bound at the ~2.3 TF/s kernel wall (~6x margin
+over weight bytes even with per-block re-reads), so byte-cutting can't win;
+further prefill MoE gains need higher GEMM TF/s (fragment-tile class). See
+agent memory `long-context-100k`.
 
 ## Open items
 
 | Item | Note |
 |---|---|
-| Long-context speed | weight-stationary expert GEMM (batched prefill shipped −14%; KV quant + scheduling disproven) |
+| Long-context speed | remaining levers are TF/s-class only (fragment-tile GEMM/attention); byte/schedule levers all disproven: KV quant, blocked dispatch, weight-stationary expert GEMM (E1, 2026-07-07) |
 | Seed-123 empty-reply artifact | short factual prompts, both prefill paths (engine 5 / fast 2 of 17 at that seed); trajectory-level, pre-existing |
 | Legacy GEMM retirement | `gemm_block*` legacy pipelines after a stable tunable cycle (KERNELS.md deprecation list; needs user nod) |
 | Mechanical kernel merges | embed_gather / gather_rows / f32_to_half families (KERNELS.md) |

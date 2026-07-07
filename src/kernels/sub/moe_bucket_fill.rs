@@ -31,6 +31,7 @@ impl Fixture {
             n_experts: self.n_experts,
             top_k: self.top_k,
             router_hscale: 1.0,
+            block_m: 32,
         }
     }
 

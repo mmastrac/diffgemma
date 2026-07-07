@@ -34,6 +34,10 @@ struct RouterDims {
     uint n_experts;
     uint top_k;
     float router_hscale;
+    /// Block-sparse tile height for the block list built in bucket_fill
+    /// phase 1 (32, or the wide weight-stationary height during batched
+    /// prefill). Must match the consuming GEMM's TUNE_BM.
+    uint block_m;
 };
 
 #endif

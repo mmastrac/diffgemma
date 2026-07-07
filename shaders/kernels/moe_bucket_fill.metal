@@ -41,17 +41,21 @@ kernel void moe_bucket_fill(
             uint used = 0u;
             uint ai = 0u;
             uint blk = 0u;
+            // Block-sparse tile height: 32 in steady state; the wide
+            // weight-stationary height during batched prefill (must match
+            // the consuming GEMM's TUNE_BM).
+            const uint bm = (dims.block_m != 0u) ? dims.block_m : 32u;
             for (uint e = 0u; e < dims.n_experts; ++e) {
                 const uint c = R->count[e];
                 if (c > 0u) {
                     R->active_expert[ai] = e;
                     ai++;
                     used++;
-                    // Block-sparse: one <=32-row tile per chunk of this expert.
-                    const uint nb = (c + 31u) / 32u;
+                    // Block-sparse: one <=bm-row tile per chunk of this expert.
+                    const uint nb = (c + bm - 1u) / bm;
                     for (uint b = 0u; b < nb; ++b) {
                         R->block_expert[blk] = e;
-                        R->block_row0[blk] = s + b * 32u;
+                        R->block_row0[blk] = s + b * bm;
                         blk++;
                     }
                 }

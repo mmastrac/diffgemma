@@ -107,7 +107,24 @@ pub fn pipeline_for_sparse(
     gather: bool,
     format: QuantFormat,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    let src = tuned_source(SPARSE_BM, SPARSE_BN);
+    pipeline_for_sparse_bm(ctx, n, k, gather, format, SPARSE_BM)
+}
+
+/// Wide-block variant (weight-stationary prefill, DGQ_MOE_PREFILL_BM): same
+/// kernel compiled at a taller TUNE_BM so one threadgroup owns all (or most)
+/// of an expert's rows — one dequantized weight stream per N-tile instead of
+/// one per 32-row block. Requires the block list to be built with the same
+/// block height (moe_bucket_fill phase 1, RouterDims.block_m).
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn pipeline_for_sparse_bm(
+    ctx: &crate::metal::device::MetalContext,
+    n: u32,
+    k: u32,
+    gather: bool,
+    format: QuantFormat,
+    bm: usize,
+) -> Result<crate::metal::device::ComputePipeline, Error> {
+    let src = tuned_source(bm, SPARSE_BN);
     if gather {
         ctx.compile_gemm_subkernel_gather(&src, ENTRY_SPARSE, n, k, format as u32)
     } else {

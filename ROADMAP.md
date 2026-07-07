@@ -54,22 +54,23 @@ partial-forward; f32 hidden; f16 arena; ICB.
 
 ## 2. Week 1 — finish the perf story (kernel work, all gate-bounded)
 
-### 2.1 Weight-stationary expert GEMM (the capped MoE win) — 2-3 days
-The batched-prefill win (-14%) is capped because `gemm_tunable_sparse`
-re-reads expert weights per 32-row block: at M=1024 each expert averages ~64
-rows = 2+ blocks = 2+ weight streams. Restructure so one threadgroup (or one
-serial block chain) owns ALL of an expert's rows for the pass.
-- **Hypothesis**: prefill chunk MoE time ~-40%; total 33k prefill 142 → ~115 s.
-  Denoise untouched (M=256 keeps ~1 block/expert).
-- **Method**: extend the block-sparse tiling so blocks of the same expert are
-  CONSECUTIVE and a threadgroup loops `while (same expert)` re-using its
-  dequantized weight tile (the K-loop tile lives in registers/tgmem already;
-  the win is not re-streaming W per block).
-- **Gate**: bit-identical requirement (same per-row math) → trace equality on
-  needle_3k, suite, spec-seed gate. Bench: `--profile-steps` MoE bucket +
-  33k prefill A/B.
-- **Abort**: if the loop-carried variant loses occupancy and nets < 5%,
-  record disproof next to tiny-M and stop.
+### 2.1 Weight-stationary expert GEMM — DONE 2026-07-07: DISPROVEN
+Built (`DGQ_MOE_PREFILL_BM=64|128`, default 32/off, machinery kept): the
+batched-prefill block list is built at a taller block height and consumed by
+the same tunable sparse kernel compiled at that TUNE_BM, so one threadgroup
+owns all (most) of an expert's ~64 rows = one dequantized weight stream.
+Bit-identical PROVEN (6.5k needle: full 30-layer KV dump byte-equal and
+tokens identical at 32/64/128); suite 708/708; spec gate 17/17.
+- **Result**: BM=64 is a WASH (21.1s vs 21.1s 6.5k prefill, alternating warm
+  runs); BM=128 is 3.6x SLOWER (76s — TM=8 means 64 f32 accumulators/lane,
+  the known register-spill regime).
+- **Why (roofline, real dims)**: expert W per layer = 128 x 3.72 MB q4 =
+  476 MB → ~7.6 ms/layer at DRAM even WITH the 2.4x per-block re-reads; MoE
+  MMA at M=1024 ≈ 110 GFLOP/layer ÷ ~2.3 TF/s ≈ 48 ms/layer. The expert
+  GEMM is COMPUTE-bound by ~6x — cutting W bytes can't help. The premise
+  ("win capped by weight re-reads", eb0edba) was a wrong attribution; the
+  cap is kernel TF/s. Raising prefill MoE throughput now means raising the
+  GEMM's TF/s (E5-class fragment work), not byte reduction.
 
 ### 2.2 Retire the f32 engine prefill for short prompts — 1 day
 Short prompts (≤256) still run the legacy f32 engine at session open
@@ -250,7 +251,7 @@ the sampler-struct growth ripple). The slack is the plan.
 
 | # | Experiment | Hypothesis | Cost | Ship gate | Abort criterion |
 |---|---|---|---|---|---|
-| E1 | Weight-stationary expert GEMM | 33k prefill −20% | 2-3 d | bit-identical traces + gate | < 5% after occupancy tuning |
+| E1 | Weight-stationary expert GEMM | ~~33k prefill −20%~~ **DISPROVEN 2026-07-07**: BM=64 wash, BM=128 3.6x slower; expert GEMM at M=1024 is compute-bound (~6x margin over W bytes) | done | bit-identity held (KV byte-equal), gate 17/17 | hit: < 5% → machinery kept, default off |
 | E2 | Fast prefill for short prompts | turn time neutral, engine retired | 1 d | multi-seed ≥ 47/51 + census | adherence regression |
 | E3 | Canvas shrink at tail | MLX parity, small tail win | 1 d | multi-seed gate | quality regression |
 | E4 | q8 KV @ 100k | q8 wins where DRAM-bound | 0.5 d | ≥ 15% denoise win at 100k | loses again → close table |

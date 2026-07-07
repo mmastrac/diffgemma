@@ -74,7 +74,8 @@ pub use crate::flags::{
     freeze_enabled, fused_algebra_enabled, fused_gate_up_enabled, fused_qkv_enabled,
     gemm_tunable_enabled, logits_finite_check_enabled, logits_finite_sample_count,
     moe_block_sparse_enabled, moe_fuse_gather_enabled, moe_tile_adapt_enabled,
-    partial_lm_head_enabled, router_gemm_enabled, sc_sparse_enabled, should_fast_prefill,
+    partial_lm_head_enabled, prefill_batch_enabled, router_gemm_enabled, sc_sparse_enabled,
+    should_fast_prefill,
     step_text_log_enabled, trace_entropy_enabled, FAST_PREFILL_MIN_TOKENS,
 };
 
@@ -684,6 +685,12 @@ struct StepPipelines {
     /// Tunable block-sparse MoE pipelines (DGQ_GEMM_TUNABLE, q4/q6 experts),
     /// keyed (n, k, gather, format as u32).
     gemm_tunable_sparse: HashMap<(u32, u32, bool, u32), ComputePipeline>,
+    /// Wide-block (weight-stationary) tunable sparse pipelines for batched
+    /// prefill (DGQ_MOE_PREFILL_BM != 32); same keying. Empty when disabled.
+    gemm_tunable_sparse_wide: HashMap<(u32, u32, bool, u32), ComputePipeline>,
+    /// TUNE_BM the wide sparse pipelines were compiled with (the block
+    /// height moe_bucket_fill phase 1 must build during batched prefill).
+    sparse_wide_bm: u32,
     gemm_nvfp4: HashMap<(u32, u32), ComputePipeline>,
     gemm_q8: HashMap<(u32, u32), ComputePipeline>,
     gemm_bf16: HashMap<(u32, u32), ComputePipeline>,
@@ -756,6 +763,8 @@ impl StepPipelines {
         let mut gemm_tunable_raw = HashMap::new();
         let mut gemm_tunable_q8 = HashMap::new();
         let mut gemm_tunable_sparse = HashMap::new();
+        let mut gemm_tunable_sparse_wide = HashMap::new();
+        let sparse_wide_bm = crate::flags::moe_prefill_block_m();
         let mut gemm_nvfp4 = HashMap::new();
         let mut gemm_q8 = HashMap::new();
         let mut gemm_bf16 = HashMap::new();
@@ -1044,6 +1053,25 @@ impl StepPipelines {
                             )?,
                         );
                     }
+                    // Wide-block (weight-stationary) prefill variants: same
+                    // kernel at TUNE_BM=sparse_wide_bm; the batched-prefill
+                    // block list is built at this height.
+                    if sparse_wide_bm != 32 && prefill_batch_enabled() {
+                        gemm_tunable_sparse_wide.insert(
+                            (n, k, false, fmt as u32),
+                            crate::kernels::sub::gemm_tunable::pipeline_for_sparse_bm(
+                                ctx, n, k, false, fmt, sparse_wide_bm as usize,
+                            )?,
+                        );
+                        if moe_fuse_gather_enabled() && (n, k) == (MOE_FF * 2, HID as u32) {
+                            gemm_tunable_sparse_wide.insert(
+                                (n, k, true, fmt as u32),
+                                crate::kernels::sub::gemm_tunable::pipeline_for_sparse_bm(
+                                    ctx, n, k, true, fmt, sparse_wide_bm as usize,
+                                )?,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1066,6 +1094,8 @@ impl StepPipelines {
             gemm_tunable_raw,
             gemm_tunable_q8,
             gemm_tunable_sparse,
+            gemm_tunable_sparse_wide,
+            sparse_wide_bm,
             gemm_nvfp4,
             gemm_q8,
             gemm_bf16,
@@ -1193,6 +1223,19 @@ impl StepPipelines {
         gather: bool,
     ) -> Option<&ComputePipeline> {
         self.gemm_tunable_sparse.get(&(n, k, gather, format as u32))
+    }
+
+    /// Wide-block (weight-stationary prefill) tunable sparse pipeline if
+    /// built (DGQ_MOE_PREFILL_BM != 32). Only valid against a block list
+    /// built at `sparse_wide_bm`.
+    fn sparse_tunable_wide_fmt(
+        &self,
+        format: QuantFormat,
+        n: u32,
+        k: u32,
+        gather: bool,
+    ) -> Option<&ComputePipeline> {
+        self.gemm_tunable_sparse_wide.get(&(n, k, gather, format as u32))
     }
 
     fn q8_logits(&self, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
@@ -2465,6 +2508,7 @@ impl StepEnc<'_> {
             n_experts: N_EXPERTS as u32,
             top_k: TOP_K as u32,
             router_hscale: (HID as f32).powf(-0.5),
+            block_m: self.moe_block_m(),
         };
         if router_gemm_enabled() {
             // Router-as-GEMM: xn = rmsnorm_noscale(stream) * router_scale[d]
@@ -2548,6 +2592,45 @@ impl StepEnc<'_> {
         Ok(())
     }
 
+    /// Block height of the block-sparse expert GEMM for THIS forward. 32 in
+    /// steady state; the wide weight-stationary height during batched-prefill
+    /// super-chunks (forward_m > CANVAS) when the wide tunable pipelines were
+    /// built. moe_bucket_fill phase 1 builds the block list at this height,
+    /// so dispatch_block_linear_grouped MUST select the matching pipeline —
+    /// both read this one function.
+    fn moe_block_m(&self) -> u32 {
+        if self.forward_m <= CANVAS {
+            return 32;
+        }
+        let fmt = self.block_profile.format;
+        if !moe_block_sparse_enabled()
+            || !matches!(fmt, QuantFormat::Q4Affine | QuantFormat::Q6)
+        {
+            return 32;
+        }
+        // Wide pipelines are compiled for exactly the shapes/gather variants
+        // the narrow set has; one representative presence check suffices.
+        let wide_ok = self
+            .ps
+            .sparse_tunable_wide_fmt(fmt, MOE_FF * 2, HID as u32, false)
+            .is_some()
+            && self.ps.sparse_tunable_wide_fmt(fmt, HID as u32, MOE_FF, false).is_some();
+        if wide_ok {
+            if crate::flags::progress_enabled() {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    eprintln!(
+                        "step-kernel: weight-stationary expert GEMM (block_m={})",
+                        self.ps.sparse_wide_bm
+                    );
+                });
+            }
+            self.ps.sparse_wide_bm
+        } else {
+            32
+        }
+    }
+
     fn dispatch_block_linear_grouped(
         &mut self,
         a_on_gemm_a: bool,
@@ -2570,12 +2653,24 @@ impl StepEnc<'_> {
                 QuantFormat::Q4Affine | QuantFormat::Q6
             )
             && self.ps.sparse_tunable_fmt(self.block_profile.format, n, k, gather).is_some();
+        // Wide-block weight-stationary prefill: the block list for this
+        // forward was built at moe_block_m() rows (bucket_fill phase 1), so
+        // the consuming pipeline's TUNE_BM must match — never fall back to a
+        // 32-row kernel against a wide list.
+        let wide = self.moe_block_m() != 32;
+        if wide && !tunable {
+            return Err(Error::Format(
+                "MoE block list built wide (weight-stationary prefill) but tunable sparse unavailable",
+            ));
+        }
         // Fused-gather gate_up: A-load pulls bf16 `moein` rows via token_list
         // (buffer 7), so no separate gather pass / f32 staging buffer. The caller
         // skips the gather pass iff `gather`; if the pipeline for this shape is
         // missing we'd read a stale A buffer, so fail loud rather than silently.
         let gather_ps = if gather {
-            if tunable {
+            if tunable && wide {
+                self.ps.sparse_tunable_wide_fmt(self.block_profile.format, n, k, true)
+            } else if tunable {
                 self.ps.sparse_tunable_fmt(self.block_profile.format, n, k, true)
             } else {
                 self.ps.block_sparse_gather(n, k, adaptive)
@@ -2591,6 +2686,10 @@ impl StepEnc<'_> {
         let use_gather = gather_ps.is_some();
         let grouped_ps = if let Some(p) = gather_ps {
             p
+        } else if tunable && wide {
+            self.ps
+                .sparse_tunable_wide_fmt(self.block_profile.format, n, k, false)
+                .ok_or(Error::Format("missing wide tunable sparse pipeline"))?
         } else if tunable {
             self.ps
                 .sparse_tunable_fmt(self.block_profile.format, n, k, false)

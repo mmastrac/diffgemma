@@ -106,6 +106,31 @@ pub fn moe_fuse_gather_enabled() -> bool {
     moe_block_sparse_enabled() && on_unless_zero("DGQ_MOE_FUSE_GATHER")
 }
 
+/// Weight-stationary expert GEMM for batched-prefill super-chunks
+/// (`DGQ_MOE_PREFILL_BM=64|128` opts in; default 32 = OFF). BUILT +
+/// DISPROVEN 2026-07-07 (ROADMAP E1): taller blocks consolidate an expert's
+/// ~64 routed rows at M=1024 into one dequantized weight stream (bit-
+/// identical — 6.5k needle KV dump byte-equal at 32/64/128), but 64 is a
+/// WASH (21.1s vs 21.1s prefill) and 128 is 3.6x SLOWER (76s, register
+/// spill: TM=8 = 64 f32 accumulators/lane). Roofline says why: at M=1024
+/// the expert GEMM is COMPUTE-bound at the ~2.3 TF/s kernel wall (~48
+/// ms/layer MMA vs ~7.6 ms/layer weight bytes even with the 2.4x per-block
+/// re-reads) — cutting W bytes can't speed a compute-bound kernel. The
+/// eb0edba "capped by weight re-reads" attribution was wrong; the cap is
+/// kernel TF/s. Machinery kept for re-tests.
+pub fn moe_prefill_block_m() -> u32 {
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        match std::env::var("DGQ_MOE_PREFILL_BM")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+        {
+            Some(bm @ (64 | 128)) => bm,
+            _ => 32,
+        }
+    })
+}
+
 /// GQA matrix-unit attention on sliding layers (~3-4.5%/step). Non-bit-
 /// identical (f16 MMA vs f32 scalar) but quality-neutral (multi-seed + MLX
 /// bench). `DGQ_ATTN_MMA=0` restores the scalar kernel.

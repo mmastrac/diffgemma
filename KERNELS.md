@@ -135,6 +135,15 @@ tiles — the padding is real, it just isn't on the critical path):
   LATENT win: once the tunable GEMM port (task #19) makes per-TG cost
   compute-bound, the padding savings activate — carry the adaptive M-mapping
   into that port.
+- **Weight-stationary prefill blocks** (ROADMAP E1, 2026-07-07 —
+  `DGQ_MOE_PREFILL_BM=64|128` opt-in, default off): batched-prefill block
+  list built at a taller height, same tunable sparse kernel at that TUNE_BM,
+  one weight stream per expert instead of ~2.4. BIT-IDENTICAL (6.5k needle
+  KV dump byte-equal at 32/64/128) but DISPROVEN as perf: 64 = wash, 128 =
+  3.6x slower (TM=8 → 64 f32 acc/lane register spill). Roofline: at M=1024
+  the expert GEMM is COMPUTE-bound (~48 ms/layer MMA at 2.3 TF/s vs ~7.6
+  ms/layer W bytes incl. re-reads) — byte-cutting is a non-lever here; the
+  prefill MoE lever, if any, is GEMM TF/s (fragment-tile class).
 
 ## GEMM headroom investigation (2026-07-02) — OPEN, the next big lever
 

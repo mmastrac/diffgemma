@@ -22,6 +22,11 @@ pub struct RouterDims {
     pub n_experts: u32,
     pub top_k: u32,
     pub router_hscale: f32,
+    /// Block height for the block-sparse expert-GEMM tile list built in
+    /// `moe_bucket_fill` phase 1. MUST match the TUNE_BM of the sparse
+    /// pipeline that consumes the list (32 everywhere except batched-prefill
+    /// super-chunks — see `flags::moe_prefill_block_m`).
+    pub block_m: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +49,7 @@ impl Fixture {
             n_experts: self.n_experts as u32,
             top_k: self.top_k as u32,
             router_hscale: (self.hidden as f32).powf(-0.5),
+            block_m: 32,
         }
     }
 
