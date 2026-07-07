@@ -223,23 +223,38 @@ Version tagging, CHANGELOG from the commit narrative, binary size pass,
 gate — old q8-embed blobs still load, verify), final full-matrix run:
 suite + gate 3 seeds + census + needle {6.5k, 33k, 105k} + MLX head-to-head.
 
-### 5.2 TurboQuant / rotated-KV — research track, ship-optional (2 days)
-TurboQuant (arXiv 2504.19874): random rotation → near-uniform coordinates →
-scalar codebook; quality-neutral ~3.5 bits/channel, 2.5 marginal. Our
-measured physics says low-bit KV is a MEMORY lever only (issue-bound
-kernels), so this ships only if we want **262k contexts** (f16 KV 5.3 GiB →
-~1.4 GiB at 2.5-3.5 bit) or smaller Macs (18 GB) as a v1.x goal.
-**Key implementation insight for us**: an orthogonal rotation R can be
-FOLDED INTO WEIGHTS offline — replace (W_q, W_k) with (R·W_q, R·W_k) and
-(W_v, W_o) with (R·W_v, W_o·Rᵀ): QK dot products and the attention output
-are invariant, the runtime cost is ZERO, and the stored K/V coordinates
-become outlier-free — making plain group-q4 (or the q8 we already built)
-dramatically better-conditioned. Experiment: fold a Hadamard rotation at
-quantize time (per full-layer head), re-run the KV-quant error measurement
-(0.92% group-32 today → expect ~2× better at the same bits, enabling q4),
-then the 100k A/B. Zero kernel changes beyond the existing KV_Q8 lattice +
-a q4 variant. Gate as usual. **Do not do this for speed** — the disproof
-stands.
+### 5.2 TurboQuant / rotated-KV — IN PROGRESS (moved up from Week 4, 2026-07-07)
+TurboQuant (arXiv 2504.19874) / QuaRot: an orthogonal rotation → near-uniform
+coordinates → outlier-free low-bit quant. Our measured physics says low-bit
+KV is a MEMORY lever only (issue-bound kernels), so this targets **262k
+contexts** (f16 KV 5.3 GiB → ~1.4 GiB at q4) / smaller Macs. **Do not do
+this for speed** — the disproof stands (E4: q8@100k only −6%).
+
+**PREMISE CORRECTED 2026-07-07 (the old text below the line was wrong).**
+The earlier claim "fold R into (W_q,W_k) and (W_v,W_o) offline, zero runtime
+cost" is FALSE for K, and the V half needs rework too:
+- **K cannot fold offline.** RoPE sits between W_k and the KV store
+  (`qk_rope_kv.metal` applies RoPE, then writes K), and a Hadamard doesn't
+  commute with position-dependent RoPE. K needs a RUNTIME Walsh-Hadamard on
+  `head[]` AFTER RoPE, plus the same H on Q after its RoPE — `(Hq)·(Hk)=q·k`
+  keeps scores exact. Cheap: O(hd·log hd), hd=256/512 both pow2.
+- **The offline W_v fold is nearly worthless.** Full layers (5,11,17,23,29)
+  have NO separate `v_proj` — V aliases the raw k_proj output — and those
+  full layers store KV LINEARLY (sliding layers ring-cap at 2048), so they
+  hold ~2.1 of the 2.4 GB at 105k. The memory that matters is exactly the
+  layers with no W_v to fold.
+- **Winning design = uniform runtime rotation, only W_o folded offline.** In
+  `qk_rope_kv`, after RoPE apply H to q / k / v (v has no RoPE); store q4 K+V.
+  Attention reads rotated q (arena) + rotated q4 K/V — scores and output
+  `Σattn·(Hv)=H·o` come out right with NO rotation logic in the attention
+  kernels (they need only q4 dequant). Unrotate V via W_o offline: fold Hᵀ
+  into each q-head hd-block of W_o. Q rotation self-cancels in the QK dot.
+- **Milestones**: M1 q4-KV format end-to-end, no rotation (mechanical, mirror
+  the KV_Q8 lattice → KV_Q4; establishes the degraded baseline) → M2 runtime
+  Hadamard (q/k/v) + offline W_o Hᵀ fold, prove rotated-q4 recovers quality →
+  M3 non-expert bf16 weights → M4 rotated experts (§5.4, E9, v2+). Full
+  corrected math + code map: memory `turboquant-rotated-kv`. WHT helper
+  shipped (`src/kernels/sub/hadamard.rs`, 834cc1d). Gate as usual.
 
 ### 5.3 Vision (VLM) — decision, not implementation
 The checkpoint ships a vision tower (mlx_vlm serves images; our config.rs
@@ -249,7 +264,39 @@ encoder + image token splicing + mm masks — realistically 2+ weeks alone.
 headline.** If overruled, this displaces §4.1-4.3 and the month becomes
 perf-freeze + vision.
 
-### 5.4 Slack (2-3 days)
+### 5.4 Rotated experts (E9) — far-future / v2+, experts LAST
+The same Hadamard rotation applied to the MoE expert weights. Value is
+**near-bf16 fidelity within the mandatory 4-bit budget** (bf16 experts don't
+fit; the q6 experiment showed spending bits barely moves warts, so rotation
+attacks CONDITIONING — a different axis — not size). Only start after the
+KV rotation infra (E8) is proven bit-exact; build experts last; quality
+change → full multi-seed gate + wart census + sign-off.
+
+Two sub-cases, different cost — and the "gate/up is free" framing needs a
+correction (verified against the code 2026-07-07):
+- **gate/up.** Both read the pre_ff_ln_2-normed hidden (`moein`, one shared
+  buffer). The rotation folds into the WEIGHTS offline (W_gate·Rᵀ, W_up·Rᵀ),
+  but feeding the rotated input `R·moein` is NOT zero-cost: it needs either
+  (a) ONE runtime WHT on `moein` per token — cheap, shared across all 128
+  experts (moein is expert-branch-local; the router uses a *separate* norm
+  `router_scale`, so it's not a shared fold) — or (b) a global
+  residual-stream rotation (QuaRot computational invariance: rotate once at
+  embed, unrotate at lm_head) which makes it truly free but is a much bigger
+  change. So gate/up = "one cheap shared WHT," not "free." Covers 2/3 of
+  expert params; the whole bet until proven insufficient.
+- **down_proj.** `out = h·W_downᵀ`, `h = silu(gate)·up` — the nonlinearity
+  blocks any offline fold; needs a runtime WHT on `h` (moe_ff 704 → pad
+  1024) every denoise step. Contingent, hot-path.
+
+Milestones: M1 gate/up-only (shared WHT + offline weight fold, gated vs a
+bf16-expert reference — STOP here if it reaches near-bf16) → M2 down_proj
+WHT (only if M1 short; measure with `DGQ_MEM_WATCH` + `bench-step-kernel`
+A/B first, abort if it regresses the short-context, non-memory-bound case) →
+M3 optional sub-q4 gate/up for memory (separate gate). Headroom evidence
+(q6 = warts unchanged) shows expert-quant error isn't today's wart driver
+but does NOT prove rotated-q4 recovers bf16 or that q3 is safe.
+
+### 5.5 Slack (2-3 days)
 History says every week here surfaces one unplanned wall (this week it was
 the sampler-struct growth ripple). The slack is the plan.
 
@@ -266,7 +313,8 @@ the sampler-struct growth ripple). The slack is the plan.
 | E5 | Fragment-tile attention | ≥ 1.5× at kv 32k | 1 d timebox | bench row, then full gate | < 1.5× on bench |
 | E6 | seed-123 artifact root-cause | stop-token trim on eos-first canvas | 2 d | aggregate > 47/51 | — (must diagnose even if fix deferred) |
 | E7 | confidence-threshold sampler | parity feature, maybe faster stops | 1 d | gate neutral | worse convergence |
-| E8 | Hadamard-folded q4 KV | 262k memory @ ~1.4 GiB, quality-neutral | 2 d | KV relerr ≤ f16-era gate deltas + needle 33k/100k | relerr > q8-group-32 |
+| E8 | Hadamard-rotated q4 KV (§5.2) | **IN PROGRESS 2026-07-07**: 262k KV 5.3→~1.4 GiB, quality-neutral. Premise corrected — K rotates at RUNTIME after RoPE (can't fold), V rotates at runtime too (full layers alias V/no W_v), only W_o folds offline | ~3 d | rotated-q4 passes multi-seed gate + needle 33k/100k exact + DGQ_MEM_WATCH < 90% @ 262k | rotated-q4 fails gate (rotation doesn't recover q4 quality) |
+| E9 | Rotated experts (near-bf16 fidelity @ q4) (§5.4) | M1 gate/up (shared WHT + offline fold) recovers ~bf16 forward; M2 down_proj WHT only if needed | v2+ | full gate vs bf16-expert ref + census + sign-off | M1 no better than plain q4, or M2 WHT regresses short-context |
 
 Every experiment observes the standing rules: bit-identical ships on
 identity evidence; anything else needs multi-seed gate + census + explicit
