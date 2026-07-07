@@ -131,16 +131,16 @@ impl Fixture {
     pub(crate) fn route_scratch(&self) -> RouteScratch {
         let bucket = self.grouped_route();
         let mut route = RouteScratch {
-            weight: [[0; TOP_K]; crate::metal::CANVAS],
-            expert: [[0; TOP_K]; crate::metal::CANVAS],
+            weight: [[0; TOP_K]; crate::metal::PREFILL_M],
+            expert: [[0; TOP_K]; crate::metal::PREFILL_M],
             count: [0; crate::metal::N_EXPERTS],
             row_start: [0; crate::metal::N_EXPERTS + 1],
             num_slots: 0,
             num_active_experts: 0,
             active_expert: [0; crate::metal::N_EXPERTS],
-            token_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
-            slot_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
-            token_slot: [[0; crate::metal::TOP_K]; crate::metal::CANVAS],
+            token_list: [0; crate::metal::PREFILL_M * crate::metal::TOP_K],
+            slot_list: [0; crate::metal::PREFILL_M * crate::metal::TOP_K],
+            token_slot: [[0; crate::metal::TOP_K]; crate::metal::PREFILL_M],
             block_expert: [0; crate::metal::MOE_MAX_BLOCKS],
             block_row0: [0; crate::metal::MOE_MAX_BLOCKS],
             num_blocks: 0,

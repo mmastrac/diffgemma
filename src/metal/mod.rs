@@ -67,7 +67,7 @@ pub use step_kernel::{
     run_step_probe, run_step_smoke, run_embed_row_gpu, layer_moe_block_jobs, trace_entropy_enabled,
     bench_step_kernel_profile, bench_step_kernel_profile_steps, bench_step_kernel_encode_subprofile,
     EncodeSubProfileResult, LayerEncodeSubProfile, MoeEncodeSubProfile, StepFinishMode,
-    StepSmokeConfig, CANVAS, CanvasState, LayerOffsets, RouteScratch, StepParams,
+    StepSmokeConfig, CANVAS, PREFILL_M, PREFILL_SUBS, CanvasState, LayerOffsets, RouteScratch, StepParams,
     fill_token_slot, N_EXPERTS, TOP_K, HID, MOE_FF, FROZEN_WORDS, MOE_MAX_BLOCKS,
 };
 pub use step_preamble_dump::{

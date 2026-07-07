@@ -37,6 +37,13 @@ const STEP_SHADER: &str = shader_include::include_metal!("monolithic/diffgemma_s
 pub const HID: usize = 2816;
 pub const VOCAB: usize = 262144;
 pub const CANVAS: usize = 256;
+/// Batched prefill super-chunk: PREFILL_SUBS causal 256-token sub-chunks run
+/// as ONE forward (attention/rope per sub-chunk, everything else — QKV,
+/// o_proj, dense FFN, router, MoE — at M = PREFILL_M). Bit-identical to
+/// sequential chunks (all batched stages are row-independent); the win is MoE
+/// expert-weight streaming amortized over 4x the tokens + GEMM M-efficiency.
+pub const PREFILL_SUBS: usize = 4;
+pub const PREFILL_M: usize = CANVAS * PREFILL_SUBS;
 /// Up-scale applied to SC softembed probs before the fp16 GEMM tiles and divided
 /// back out of the final scale. Must match `SC_PROB_GEMM_SCALE` in
 /// `shaders/include/sc_prob_scale.metal`. Keeps near-uniform probs (~2^-18) out
@@ -76,7 +83,10 @@ pub const MAX_ATTN_KV_COLS: usize = 2048;
 
 pub fn step_arena_params() -> ArenaLayoutParams {
     ArenaLayoutParams {
-        canvas: CANVAS,
+        // Planes hold PREFILL_M rows so the batched prefill super-chunk (4x256
+        // causal sub-chunks in ONE forward) fits; denoise dispatches only ever
+        // touch rows [0..CANVAS) of each plane. Arena ~25.6 -> ~102 MiB.
+        canvas: PREFILL_M,
         hidden: HID,
         dense_ff: DENSE_FF as usize,
         max_attn_q_cols: MAX_ATTN_Q_COLS,
@@ -163,7 +173,8 @@ pub struct StepParams {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CanvasState {
-    pub ids: [u32; CANVAS],
+    /// 1024 = batched-prefill super-chunk M (denoise + sampler use [0..CANVAS)).
+    pub ids: [u32; PREFILL_M],
     pub prev_argmax: [u32; CANVAS],
     pub new_sample: [u32; CANVAS],
     pub entropy: [f32; CANVAS],
@@ -235,16 +246,16 @@ pub fn partial_lm_active_rows(state: &CanvasState) -> u32 {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RouteScratch {
-    pub weight: [[u16; TOP_K]; CANVAS],
-    pub expert: [[u32; TOP_K]; CANVAS],
+    pub weight: [[u16; TOP_K]; PREFILL_M],
+    pub expert: [[u32; TOP_K]; PREFILL_M],
     pub count: [u32; N_EXPERTS],
     pub row_start: [u32; N_EXPERTS + 1],
     pub num_slots: u32,
     pub num_active_experts: u32,
     pub active_expert: [u32; N_EXPERTS],
-    pub token_list: [u32; CANVAS * TOP_K],
-    pub slot_list: [u32; CANVAS * TOP_K],
-    pub token_slot: [[u32; TOP_K]; CANVAS],
+    pub token_list: [u32; PREFILL_M * TOP_K],
+    pub slot_list: [u32; PREFILL_M * TOP_K],
+    pub token_slot: [[u32; TOP_K]; PREFILL_M],
     /// Block-sparse MoE GEMM (DGQ_MOE_BLOCK_SPARSE): one entry per <=32-row tile.
     /// `block_expert[b]` = expert owning block b; `block_row0[b]` = its global row
     /// start into the gathered A / token_list. `num_blocks` = total. Built in
@@ -256,11 +267,12 @@ pub struct RouteScratch {
 
 /// Max block-sparse MoE tiles: sum_e ceil(count_e/32) <= n_active + num_slots/32
 /// <= 128 + 2048/32 = 192. Rounded up.
-pub const MOE_MAX_BLOCKS: usize = 256;
+// Bounded by n_active_experts + max_slots/32 = 128 + PREFILL_M*8/32.
+pub const MOE_MAX_BLOCKS: usize = N_EXPERTS + PREFILL_M * TOP_K / 32;
 
 /// Fill `token_slot[tok][kk]` from flat `token_list` / `slot_list` after bucketing.
 pub fn fill_token_slot(route: &mut RouteScratch) {
-    route.token_slot = [[0; TOP_K]; CANVAS];
+    route.token_slot = [[0; TOP_K]; PREFILL_M];
     let slots = route.num_slots as usize;
     for slot in 0..slots {
         let tok = route.token_list[slot] as usize;
@@ -637,6 +649,13 @@ fn gemm_scratch_bytes() -> (usize, usize) {
         max_nk = max_nk.max(_n as usize * k as usize);
     }
     let f32 = std::mem::size_of::<f32>();
+    // Batched prefill (M = PREFILL_M): gemm_a holds the moein f32 conversion
+    // (PREFILL_M x HID) and the swiglu activations (MOE_SLOTS x MOE_FF);
+    // gemm_b holds the gathered expert A (MOE_SLOTS x HID at offset 0) plus
+    // the gate_up activations (MOE_SLOTS x 2*MOE_FF at moe_w_byte_off_gu).
+    let moe_slots = PREFILL_M * TOP_K;
+    max_mk = max_mk.max(PREFILL_M * HID).max(moe_slots * MOE_FF as usize);
+    max_nk = max_nk.max(moe_slots * (HID + 2 * MOE_FF as usize));
     (max_mk * f32, max_nk * f32)
 }
 
@@ -1283,6 +1302,11 @@ pub(crate) struct StepBuffers {
     /// Online-softmax state (f32 m/l + unnormalized O per head x canvas row)
     /// persisted between sequential kv-block dispatches of attention_mma_full.
     attn_state: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// PREFILL_SUBS StepParams slots for the per-sub-chunk rope/attention
+    /// dispatches of a batched prefill super-chunk (kv_len differs per sub;
+    /// bufs.params is read at execution time so it can't vary within one
+    /// encoder).
+    params_sub: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// Scratch plane byte offsets (host-built, mirrored on GPU as b8).
     pub(crate) arena_map: ArenaLayout,
     /// GPU copy of `arena_map` (b8); bound when kernels need device-side plane table.
@@ -1337,6 +1361,17 @@ struct StepEnc<'a> {
     /// Prefill mode: attention is CAUSAL (scalar kernel only; mma variants have no
     /// causal mask) and the SC/sampler/lm_head stages are skipped (KV-only forward).
     prefill_causal: bool,
+    /// Rows in this forward: CANVAS for denoise / plain prefill chunks;
+    /// n_subs*CANVAS for a batched prefill super-chunk. Every row-independent
+    /// stage (embed, norms, QKV/o_proj/FFN GEMMs, router, MoE) dispatches at
+    /// this M; attention + rope/KV-write stay per-CANVAS-sub-chunk.
+    forward_m: usize,
+    /// Current sub-chunk (0..PREFILL_SUBS) for the per-sub attention/rope
+    /// dispatches of a super-chunk: arena rows offset by sub_c*CANVAS and
+    /// StepParams come from the params_sub slot (kv_len differs per sub).
+    sub_c: usize,
+    /// Bind params from bufs.params_sub[sub_c] instead of bufs.params.
+    use_params_sub: bool,
     /// Model sliding-window size (Gemma-4: 1024) for sliding-attention layers.
     sliding_window: u32,
 }
@@ -1348,7 +1383,7 @@ impl<'a> StepEnc<'a> {
     }
 }
 
-const MOE_SLOTS: u32 = (CANVAS * TOP_K) as u32;
+const MOE_SLOTS: u32 = (PREFILL_M * TOP_K) as u32;
 
 fn grouped_expert_blob_bytes_per_expert(format: crate::kernels::sub::QuantFormat) -> u64 {
     use crate::dgq::layout::{nvfp4_matrix_bytes, q4_matrix_bytes};
@@ -1496,7 +1531,26 @@ impl StepEnc<'_> {
     }
 
     fn bind_params(&mut self, idx: usize) {
-        self.sink_set_buffer(&self.bufs.params, 0, idx);
+        if self.use_params_sub {
+            self.sink_set_buffer(
+                &self.bufs.params_sub,
+                self.sub_c * std::mem::size_of::<StepParams>(),
+                idx,
+            );
+        } else {
+            self.sink_set_buffer(&self.bufs.params, 0, idx);
+        }
+    }
+
+    /// kv_len the NEXT rope/attention dispatch will see (per-sub slot during a
+    /// batched prefill super-chunk, else the shared params).
+    fn dispatch_kv_len(&self) -> u32 {
+        if self.use_params_sub {
+            let ptr = self.bufs.params_sub.contents().as_ptr() as *const StepParams;
+            unsafe { (*ptr.add(self.sub_c)).kv_len }
+        } else {
+            read_struct::<StepParams>(&self.bufs.params).kv_len
+        }
     }
 
     fn bind_kvcache(&mut self, idx: usize) {
@@ -2300,34 +2354,37 @@ impl StepEnc<'_> {
     }
 
     fn encode_layer_o_proj_gemm(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
+        let fm = self.forward_m;
         let l = &layout.layers[layer];
         let o_k = if l.is_full != 0 { 8192 } else { 4096 };
         self.gemm_q4(
             self.arena().attno_off(),
             self.arena().tmp_off(),
             l.o_proj,
-            CANVAS as u32,
+            fm as u32,
             HID as u32,
             o_k,
         )
     }
 
     fn encode_layer_o_proj_tail(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
+        let fm = self.forward_m;
         let l = &layout.layers[layer];
-        self.rmsnorm(self.arena().tmp_off(), self.arena().tmp_off(), l.post_attn_ln, HID as u32, CANVAS);
-        self.residual(self.arena().hidden_off(), self.arena().tmp_off(), self.arena().stream_off(), 0, CANVAS * HID);
+        self.rmsnorm(self.arena().tmp_off(), self.arena().tmp_off(), l.post_attn_ln, HID as u32, fm);
+        self.residual(self.arena().hidden_off(), self.arena().tmp_off(), self.arena().stream_off(), 0, fm * HID);
         Ok(())
     }
 
     fn encode_layer_dense_ffn(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
+        let fm = self.forward_m;
         let l = &layout.layers[layer];
-        self.rmsnorm(self.arena().stream_off(), self.arena().tmp_off(), l.pre_ff_ln, HID as u32, CANVAS);
+        self.rmsnorm(self.arena().stream_off(), self.arena().tmp_off(), l.pre_ff_ln, HID as u32, fm);
         self.encode_layer_dense_gate_up(layer, layout)?;
         self.glu(
             self.arena().ffg_off(),
             self.arena().ffu_off(),
             self.arena().ffg_off(),
-            CANVAS * DENSE_FF as usize,
+            fm * DENSE_FF as usize,
         );
         self.encode_layer_dense_down(layer, layout)?;
         self.rmsnorm(
@@ -2335,31 +2392,33 @@ impl StepEnc<'_> {
             self.arena().dense_off(),
             l.post_ff_ln_1,
             HID as u32,
-            CANVAS,
+            fm,
         );
         Ok(())
     }
 
     fn encode_layer_dense_down(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
+        let fm = self.forward_m;
         let l = &layout.layers[layer];
         self.gemm_q4(
             self.arena().ffg_off(),
             self.arena().dense_off(),
             l.mlp_down,
-            CANVAS as u32,
+            fm as u32,
             HID as u32,
             DENSE_FF,
         )
     }
 
     fn encode_layer_dense_gate_up(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
+        let fm = self.forward_m;
         let l = &layout.layers[layer];
         if fused_gate_up_enabled() && self.attn_ffn_bf16 {
             let (segs, n_total) = gate_up_stacked_segments(l, self.arena());
             self.gemm_bf16_stacked(
                 self.arena().tmp_off(),
                 &segs,
-                CANVAS as u32,
+                fm as u32,
                 HID as u32,
                 n_total,
             )?;
@@ -2368,7 +2427,7 @@ impl StepEnc<'_> {
             self.gemm_q4_stacked(
                 self.arena().tmp_off(),
                 &segs,
-                CANVAS as u32,
+                fm as u32,
                 HID as u32,
                 n_total,
             )?;
@@ -2377,7 +2436,7 @@ impl StepEnc<'_> {
                 self.arena().tmp_off(),
                 self.arena().ffg_off(),
                 l.mlp_gate,
-                CANVAS as u32,
+                fm as u32,
                 DENSE_FF,
                 HID as u32,
             )?;
@@ -2385,7 +2444,7 @@ impl StepEnc<'_> {
                 self.arena().tmp_off(),
                 self.arena().ffu_off(),
                 l.mlp_up,
-                CANVAS as u32,
+                fm as u32,
                 DENSE_FF,
                 HID as u32,
             )?;
@@ -2398,9 +2457,10 @@ impl StepEnc<'_> {
         layer: usize,
         layout: &ModelLayout,
     ) -> Result<(), Error> {
+        let fm = self.forward_m;
         let layer_off = layer_byte_offset(layer);
         let router_dims = crate::kernels::sub::moe_router::RouterDims {
-            canvas: CANVAS as u32,
+            canvas: fm as u32,
             hidden: HID as u32,
             n_experts: N_EXPERTS as u32,
             top_k: TOP_K as u32,
@@ -2419,13 +2479,13 @@ impl StepEnc<'_> {
                 self.arena().tmp_off(),
                 l.router_scale,
                 HID as u32,
-                CANVAS,
+                fm,
             );
             self.gemm_bf16(
                 self.arena().tmp_off(),
                 self.arena().ffg_off(),
                 l.router_proj,
-                CANVAS as u32,
+                fm as u32,
                 N_EXPERTS as u32,
                 HID as u32,
             )?;
@@ -2436,7 +2496,7 @@ impl StepEnc<'_> {
             self.bind_route(3);
             self.sink_set_bytes(&router_dims, 4);
             self.bind_debug_status(5);
-            let grid = MTLSize { width: CANVAS.div_ceil(64), height: 1, depth: 1 };
+            let grid = MTLSize { width: fm.div_ceil(64), height: 1, depth: 1 };
             let tg = MTLSize { width: 64, height: 1, depth: 1 };
             self.sink_dispatch(grid, tg);
         } else {
@@ -2448,7 +2508,7 @@ impl StepEnc<'_> {
             self.sink_set_bytes(&router_dims, 4);
             self.bind_debug_status(5);
             let grid = MTLSize {
-                width: CANVAS,
+                width: fm,
                 height: 1,
                 depth: 1,
             };
@@ -2478,13 +2538,13 @@ impl StepEnc<'_> {
             self.sink_set_buffer(&self.bufs.moe_grouped_indirect, 0, 6);
             let grid_info = moe_grouped_grid_info();
             self.sink_set_bytes(&grid_info, 7);
-            let count = if phase == 1 { 1 } else { CANVAS * TOP_K };
+            let count = if phase == 1 { 1 } else { fm * TOP_K };
             self.dispatch_1d(&self.ps.bucket_fill, count, 256);
         }
 
         let l = &layout.layers[layer];
-        self.rmsnorm(self.arena().stream_off(), self.arena().moein_off(), l.pre_ff_ln_2, HID as u32, CANVAS);
-        self.memzero_bytes(self.arena().moeout_off(), (CANVAS * HID * 4) as u64);
+        self.rmsnorm(self.arena().stream_off(), self.arena().moein_off(), l.pre_ff_ln_2, HID as u32, fm);
+        self.memzero_bytes(self.arena().moeout_off(), (fm * HID * 4) as u64);
         Ok(())
     }
 
@@ -2601,7 +2661,8 @@ impl StepEnc<'_> {
     fn encode_moe_batched_gather_bf16_to_f32(&mut self) -> Result<(), Error> {
         let token_list_off = std::mem::offset_of!(RouteScratch, token_list);
         let gather_dims = [0u32, HID as u32];
-        let gather_count = (MOE_SLOTS as usize) * HID;
+        let slots = (self.forward_m * TOP_K) as u32;
+        let gather_count = slots as usize * HID;
         self.dispatch_1d_ranged(
             &self.ps.gather_rows_bf16_to_f32,
             gather_count,
@@ -2616,7 +2677,7 @@ impl StepEnc<'_> {
                 this.sink_set_buffer(&this.bufs.gemm_b, moe_w_byte_off_a(), 2);
                 this.sink_set_buffer(&this.bufs.dummy_dump, 0, 5);
                 this.sink_set_bytes(&gather_dims, 3);
-                this.sink_set_bytes(&MOE_SLOTS, 4);
+                this.sink_set_bytes(&slots, 4);
                 this.sink_set_bytes(&base, 6);
             },
         );
@@ -2625,7 +2686,8 @@ impl StepEnc<'_> {
 
     #[allow(dead_code)]
     fn encode_moe_batched_half_to_f32(&mut self) -> Result<(), Error> {
-        self.half_to_f32_buf(self.arena().moein_off(), CANVAS * HID);
+        let fm = self.forward_m;
+        self.half_to_f32_buf(self.arena().moein_off(), fm * HID);
         Ok(())
     }
 
@@ -2633,14 +2695,17 @@ impl StepEnc<'_> {
     fn encode_moe_batched_gather_rows(&mut self) -> Result<(), Error> {
         let token_list_off = std::mem::offset_of!(RouteScratch, token_list);
         let gather_dims = [0u32, HID as u32];
-        let gather_count = (MOE_SLOTS as usize) * HID;
+        // Slot capacity for THIS forward (fm rows x TOP_K); MOE_SLOTS is only
+        // the static plane-offset capacity.
+        let slots = (self.forward_m * TOP_K) as u32;
+        let gather_count = slots as usize * HID;
         self.dispatch_1d_ranged(&self.ps.gather_rows, gather_count, 256, |this, base, _chunk| {
             this.sink_set_buffer(&this.bufs.gemm_a, 0, 0);
             this.sink_set_buffer(&this.bufs.route, token_list_off, 1);
             this.sink_set_buffer(&this.bufs.gemm_b, moe_w_byte_off_a(), 2);
             this.sink_set_buffer(&this.bufs.dummy_dump, 0, 5);
             this.sink_set_bytes(&gather_dims, 3);
-            this.sink_set_bytes(&MOE_SLOTS, 4);
+            this.sink_set_bytes(&slots, 4);
             this.sink_set_bytes(&base, 6);
         });
         Ok(())
@@ -2673,12 +2738,13 @@ impl StepEnc<'_> {
 
     fn encode_moe_batched_swiglu(&mut self) -> Result<(), Error> {
         let gu_off = moe_w_byte_off_gu();
-        let act_elems = (MOE_SLOTS as usize) * MOE_FF as usize;
+        let slots = (self.forward_m * TOP_K) as u32;
+        let act_elems = slots as usize * MOE_FF as usize;
         self.sink_set_pipeline(&self.ps.gelu_swiglu_gate_up);
         self.sink_set_buffer(&self.bufs.gemm_b, gu_off, 0);
         self.sink_set_buffer(&self.bufs.gemm_a, 0, 1);
         self.sink_set_buffer(&self.bufs.dummy_dump, 0, 3);
-        let swiglu_dims = [MOE_SLOTS, MOE_FF];
+        let swiglu_dims = [slots, MOE_FF];
         self.sink_set_bytes(&swiglu_dims, 2);
         self.dispatch_1d(&self.ps.gelu_swiglu_gate_up, act_elems, 256);
         Ok(())
@@ -2710,12 +2776,13 @@ impl StepEnc<'_> {
     }
 
     fn encode_moe_batched_scatter(&mut self) -> Result<(), Error> {
+        let fm = self.forward_m;
         self.sink_set_pipeline(&self.ps.moe_scatter_weighted);
         self.sink_set_buffer(&self.bufs.gemm_b, moe_w_byte_off_a(), 0);
         self.sink_set_buffer(&self.bufs.arena, self.arena().moeout_off() as usize, 1);
         self.bind_route(2);
         let hidden = HID as u32;
-        let canvas = CANVAS as u32;
+        let canvas = fm as u32;
         self.sink_set_bytes(&hidden, 3);
         self.sink_set_bytes(&canvas, 4);
         // One threadgroup per (token, 256-wide d-tile); 256 threads, one per d.
@@ -2738,6 +2805,7 @@ impl StepEnc<'_> {
         layer: usize,
         layout: &ModelLayout,
     ) -> Result<(), Error> {
+        let fm = self.forward_m;
         let layer_off = layer_byte_offset(layer);
         self.sink_set_pipeline(self.ps.moe_scalar(self.block_profile.format));
         self.sink_set_buffer(&self.bufs.arena, self.arena().moein_off() as usize, 0);
@@ -2746,7 +2814,7 @@ impl StepEnc<'_> {
         self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 3);
         self.bind_route(4);
         let grouped_dims = crate::kernels::sub::moe_grouped::GroupedDims {
-            canvas: CANVAS as u32,
+            canvas: fm as u32,
             hidden: HID as u32,
             moe_ff: MOE_FF,
             n_experts: N_EXPERTS as u32,
@@ -2756,7 +2824,7 @@ impl StepEnc<'_> {
             self.sink_set_buffer(&self.bufs.dummy_dump, 0, 6);
         }
         let grid = MTLSize {
-            width: CANVAS,
+            width: fm,
             height: N_EXPERTS,
             depth: 1,
         };
@@ -2781,16 +2849,18 @@ impl StepEnc<'_> {
     }
 
     fn encode_layer_moe_post_norm(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
+        let fm = self.forward_m;
         let l = &layout.layers[layer];
-        self.rmsnorm_f32(self.arena().moeout_off(), self.arena().moein_off(), l.post_ff_ln_2, HID as u32, CANVAS);
+        self.rmsnorm_f32(self.arena().moeout_off(), self.arena().moein_off(), l.post_ff_ln_2, HID as u32, fm);
         Ok(())
     }
 
     fn encode_layer_moe_post_combine(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
+        let fm = self.forward_m;
         let l = &layout.layers[layer];
-        self.residual(self.arena().dense_off(), self.arena().moein_off(), self.arena().tmp_off(), 0, CANVAS * HID);
-        self.rmsnorm(self.arena().tmp_off(), self.arena().tmp_off(), l.post_ff_ln, HID as u32, CANVAS);
-        self.residual(self.arena().stream_off(), self.arena().tmp_off(), self.arena().hidden_off(), l.layer_scalar, CANVAS * HID);
+        self.residual(self.arena().dense_off(), self.arena().moein_off(), self.arena().tmp_off(), 0, fm * HID);
+        self.rmsnorm(self.arena().tmp_off(), self.arena().tmp_off(), l.post_ff_ln, HID as u32, fm);
+        self.residual(self.arena().stream_off(), self.arena().tmp_off(), self.arena().hidden_off(), l.layer_scalar, fm * HID);
         Ok(())
     }
 
@@ -2873,20 +2943,21 @@ impl StepEnc<'_> {
         layer: usize,
         layout: &ModelLayout,
     ) -> Result<(), Error> {
+        let fm = self.forward_m;
         let l = &layout.layers[layer];
         self.rmsnorm(
             self.arena().hidden_off(),
             self.arena().tmp_off(),
             l.input_ln,
             HID as u32,
-            CANVAS,
+            fm,
         );
         if fused_qkv_enabled() && self.attn_ffn_bf16 {
             let (segs, n_total) = qkv_stacked_segments(l, self.arena());
             self.gemm_bf16_stacked(
                 self.arena().tmp_off(),
                 &segs,
-                CANVAS as u32,
+                fm as u32,
                 HID as u32,
                 n_total,
             )?;
@@ -2895,7 +2966,7 @@ impl StepEnc<'_> {
             self.gemm_q4_stacked(
                 self.arena().tmp_off(),
                 &segs,
-                CANVAS as u32,
+                fm as u32,
                 HID as u32,
                 n_total,
             )?;
@@ -2906,7 +2977,7 @@ impl StepEnc<'_> {
                 self.arena().tmp_off(),
                 self.arena().attnq_off(),
                 l.q_proj,
-                CANVAS as u32,
+                fm as u32,
                 q_n,
                 HID as u32,
             )?;
@@ -2914,7 +2985,7 @@ impl StepEnc<'_> {
                 self.arena().tmp_off(),
                 self.arena().attnk_off(),
                 l.k_proj,
-                CANVAS as u32,
+                fm as u32,
                 k_n,
                 HID as u32,
             )?;
@@ -2923,7 +2994,7 @@ impl StepEnc<'_> {
                     self.arena().tmp_off(),
                     self.arena().attnv_off(),
                     l.v_proj,
-                    CANVAS as u32,
+                    fm as u32,
                     k_n,
                     HID as u32,
                 )?;
@@ -3031,9 +3102,14 @@ impl StepEnc<'_> {
         let layer_off = layer_byte_offset(layer);
 
         self.sink_set_pipeline(&self.ps.qk_rope_kv);
-        self.sink_set_buffer(&self.bufs.arena, self.arena().attnq_off() as usize, 0);
-        self.sink_set_buffer(&self.bufs.arena, self.arena().attnk_off() as usize, 1);
-        self.sink_set_buffer(&self.bufs.arena, self.arena().attnv_off() as usize, 2);
+        // Per-sub-chunk row offsets into the batched Q/K/V planes (sub_c = 0
+        // outside a super-chunk). K/V planes are written at the layer's native
+        // widths (n_kv*hd); Q at n_q*hd.
+        let q_row = CANVAS * self.sub_c * STEP_NQ_HEADS * l.head_dim as usize * 2;
+        let kv_row = CANVAS * self.sub_c * (l.n_kv_heads * l.head_dim) as usize * 2;
+        self.sink_set_buffer(&self.bufs.arena, self.arena().attnq_off() as usize + q_row, 0);
+        self.sink_set_buffer(&self.bufs.arena, self.arena().attnk_off() as usize + kv_row, 1);
+        self.sink_set_buffer(&self.bufs.arena, self.arena().attnv_off() as usize + kv_row, 2);
         self.bind_kvcache(3);
         self.bind_blob(4);
         self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 5);
@@ -3088,9 +3164,12 @@ impl StepEnc<'_> {
         } else {
             self.sink_set_pipeline(&self.ps.attention);
         }
-        self.sink_set_buffer(&self.bufs.arena, self.arena().attnq_off() as usize, 0);
+        // Per-sub-chunk row offsets into the batched Q/O planes (sub_c = 0
+        // outside a super-chunk).
+        let qo_row = CANVAS * self.sub_c * STEP_NQ_HEADS * l.head_dim as usize * 2;
+        self.sink_set_buffer(&self.bufs.arena, self.arena().attnq_off() as usize + qo_row, 0);
         self.bind_kvcache(1);
-        self.sink_set_buffer(&self.bufs.arena, self.arena().attno_off() as usize, 2);
+        self.sink_set_buffer(&self.bufs.arena, self.arena().attno_off() as usize + qo_row, 2);
         self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 3);
         self.bind_params(4);
         // Sliding layers (is_full==0) attend a bounded window (Gemma-4
@@ -3161,7 +3240,7 @@ impl StepEnc<'_> {
             // the same <=block key window (SLC-served instead of
             // DRAM-thrashed; the 256-consumer redundancy made the kernel
             // DRAM-bound past ~8k keys).
-            let t_total = read_struct::<StepParams>(&self.bufs.params).kv_len as usize + CANVAS;
+            let t_total = self.dispatch_kv_len() as usize + CANVAS;
             let block = crate::flags::attn_kv_block();
             let blocks = if block > 0 && t_total > block {
                 t_total.div_ceil(block)
@@ -3264,7 +3343,7 @@ impl StepEnc<'_> {
                 Ok(())
             }
             StepStage::RmsNormHidden => {
-                self.rmsnorm(self.arena().hidden_off(), self.arena().hidden_off(), 0, HID as u32, CANVAS);
+                self.rmsnorm(self.arena().hidden_off(), self.arena().hidden_off(), 0, HID as u32, self.forward_m);
                 Ok(())
             }
             StepStage::LayerInputNormQkv => self.encode_layer_qkv_gemm(layer, layout),
@@ -3426,6 +3505,49 @@ impl StepEnc<'_> {
         Ok(())
     }
 
+    /// Batched prefill SUPER-chunk: n_subs causal 256-token sub-chunks as ONE
+    /// forward. Row-independent stages (embed, norms, QKV / o_proj / dense FFN
+    /// GEMMs, router, MoE) run once at M = n_subs*CANVAS — this is where the
+    /// win lives (MoE expert weights streamed once per super-chunk instead of
+    /// once per chunk). Rope/KV-write + attention keep their causal sequencing
+    /// per sub-chunk (kv_len differs per sub -> params_sub slots; arena rows
+    /// offset by sub_c*CANVAS). Bit-identical to sequential chunks: every
+    /// batched stage is row-independent, and the per-sub stages are dispatched
+    /// with exactly the same dims as a plain chunk.
+    fn encode_prefill_super(
+        &mut self,
+        layout: &ModelLayout,
+        layers: usize,
+        n_subs: usize,
+    ) -> Result<(), Error> {
+        use step_schedule::StepStage;
+        self.prefill_causal = true;
+        self.forward_m = n_subs * CANVAS;
+        self.exec_stage(StepStage::EmbedGather, 0, layout, StepFinishMode::ForwardOnly)?;
+        self.exec_stage(StepStage::RmsNormHidden, 0, layout, StepFinishMode::ForwardOnly)?;
+        let per_layer = step_schedule::per_layer_stages(&self.block_profile);
+        for layer in 0..layers {
+            for &stage in &per_layer {
+                match stage {
+                    StepStage::LayerQkRopeKv | StepStage::LayerAttention => {
+                        self.use_params_sub = true;
+                        for c in 0..n_subs {
+                            self.sub_c = c;
+                            self.exec_stage(stage, layer, layout, StepFinishMode::ForwardOnly)?;
+                        }
+                        self.sub_c = 0;
+                        self.use_params_sub = false;
+                    }
+                    _ => {
+                        self.exec_stage(stage, layer, layout, StepFinishMode::ForwardOnly)?;
+                    }
+                }
+            }
+        }
+        self.forward_m = CANVAS;
+        Ok(())
+    }
+
     /// Canvas token embed gather only (no no-scale RMSNorm).
     fn encode_layer_through_attention(
         &mut self,
@@ -3437,6 +3559,7 @@ impl StepEnc<'_> {
     }
 
     fn dispatch_embed_gather(&mut self, embed_off: u64) {
+        let fm = self.forward_m;
         use crate::dgq::embed_row::EMBED_SCALE;
 
         let ps = if self.embed_bf16 {
@@ -3449,13 +3572,13 @@ impl StepEnc<'_> {
         self.bind_state(1);
         self.sink_set_buffer(&self.bufs.arena, self.arena().hidden_off() as usize, 2);
         self.sink_set_bytes(&embed_off, 3);
-        let dims = [HID as u32, CANVAS as u32];
+        let dims = [HID as u32, fm as u32];
         self.sink_set_bytes(&dims, 4);
         self.sink_set_bytes(&EMBED_SCALE, 5);
         let vocab = VOCAB as u32;
         self.sink_set_bytes(&vocab, 6);
         self.bind_debug_status(7);
-        let (grid, tg) = crate::kernels::sub::embed_gather::dispatch_shape(HID, CANVAS);
+        let (grid, tg) = crate::kernels::sub::embed_gather::dispatch_shape(HID, fm);
         self.sink_dispatch(grid, tg);
     }
 
@@ -3712,8 +3835,8 @@ pub fn init_canvas_state(seed: u64, vocab: usize) -> CanvasState {
 
 pub fn init_canvas_state_from_rng(vocab: usize, rng: &mut Rng) -> CanvasState {
     let ids_vec = initialize_canvas(CANVAS, vocab, rng);
-    let mut ids = [0u32; CANVAS];
-    ids.copy_from_slice(&ids_vec);
+    let mut ids = [0u32; PREFILL_M];
+    ids[..CANVAS].copy_from_slice(&ids_vec);
     CanvasState {
         ids,
         prev_argmax: [u32::MAX; CANVAS],
@@ -4114,8 +4237,23 @@ impl StepRuntime {
         let layers = self.layers;
         let n = offset + delta_token_ids.len();
         let mut pos = offset;
+        let batch = crate::flags::prefill_batch_enabled();
         while pos < n {
-            let chunk_len = (n - pos).min(CANVAS);
+            let remaining = n - pos;
+            // Batched super-chunk: n_subs full-CANVAS causal sub-chunks as one
+            // forward (needs kv headroom for the whole super-chunk). The tail
+            // (< 2 full chunks) falls back to plain 256-chunks.
+            let n_subs = if batch { (remaining / CANVAS).min(PREFILL_SUBS) } else { 1 };
+            if n_subs >= 2 && pos + n_subs * CANVAS + CANVAS <= self.max_seq {
+                let m = n_subs * CANVAS;
+                self.set_canvas_ids(&delta_token_ids[pos - offset..pos - offset + m])?;
+                self.set_kv_len(pos as u32);
+                self.write_params_sub(pos as u32, n_subs);
+                self.dispatch_and_wait(|enc| enc.encode_prefill_super(&layout, layers, n_subs))?;
+                pos += m;
+                continue;
+            }
+            let chunk_len = remaining.min(CANVAS);
             let mut ids = [0u32; CANVAS];
             ids[..chunk_len].copy_from_slice(&delta_token_ids[pos - offset..pos - offset + chunk_len]);
             self.set_canvas_ids(&ids)?;
@@ -4140,8 +4278,10 @@ impl StepRuntime {
     }
 
     pub fn set_canvas_ids(&mut self, ids: &[u32]) -> Result<(), Error> {
-        if ids.len() != CANVAS {
-            return Err(Error::Format("canvas ids length must match CANVAS"));
+        // CANVAS for denoise / plain prefill chunks; up to PREFILL_M for a
+        // batched prefill super-chunk.
+        if ids.len() != CANVAS && (ids.len() > PREFILL_M || ids.len() % CANVAS != 0) {
+            return Err(Error::Format("canvas ids length must be CANVAS..=PREFILL_M"));
         }
         let mut state = self.read_canvas_state();
         for (i, &id) in ids.iter().enumerate() {
@@ -4149,6 +4289,17 @@ impl StepRuntime {
         }
         self.write_canvas_state(&state);
         Ok(())
+    }
+
+    /// Write the per-sub-chunk StepParams slots for a batched prefill
+    /// super-chunk: slot c = current params with kv_len = base + c*CANVAS.
+    fn write_params_sub(&mut self, base_kv_len: u32, n_subs: usize) {
+        let mut p = read_struct::<StepParams>(&self.bufs.params);
+        let ptr = self.bufs.params_sub.contents().as_ptr() as *mut StepParams;
+        for c in 0..n_subs {
+            p.kv_len = base_kv_len + (c * CANVAS) as u32;
+            unsafe { std::ptr::write(ptr.add(c), p) };
+        }
     }
 
     pub fn write_canvas_state(&mut self, state: &CanvasState) {
@@ -4244,6 +4395,9 @@ impl StepRuntime {
             attn_ffn_bf16: self.attn_ffn_bf16,
             embed_bf16: self.embed_bf16,
             prefill_causal: false,
+            forward_m: CANVAS,
+            sub_c: 0,
+            use_params_sub: false,
             sliding_window: self.text_config.sliding_window as u32,
         };
         f(&mut enc)?;
@@ -4762,6 +4916,10 @@ pub fn build_step_runtime(
         attn_state: alloc_buffer(
             &ctx.device,
             STEP_NQ_HEADS * CANVAS * (2 + 512) * std::mem::size_of::<f32>(),
+        )?,
+        params_sub: alloc_buffer(
+            &ctx.device,
+            PREFILL_SUBS * std::mem::size_of::<StepParams>(),
         )?,
         arena_map,
         arena_layout_buf: {
@@ -6359,7 +6517,7 @@ pub fn run_step_smoke(model_dir: &Path, cfg: StepSmokeConfig) -> Result<StepSmok
         mean_entropy: final_state.mean_entropy,
         min_entropy: ent_stats.min_entropy,
         low_entropy_positions: ent_stats.low_entropy_positions,
-        ids: final_state.ids,
+        ids: final_state.ids[..CANVAS].try_into().expect("canvas prefix"),
         logits_finite,
         max_abs_logit,
         elapsed,

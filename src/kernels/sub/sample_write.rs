@@ -74,7 +74,7 @@ pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
 }
 
 fn canvas_state_for_gpu(f: &Fixture) -> CanvasState {
-    let mut ids = [0u32; CANVAS];
+    let mut ids = [0u32; crate::metal::PREFILL_M];
     let mut accept = [0u32; CANVAS];
     let mut new_sample = [0u32; CANVAS];
     for i in 0..f.canvas_size {

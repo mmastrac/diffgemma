@@ -60,16 +60,16 @@ pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
 fn route_from_fixture(f: &Fixture) -> RouteScratch {
     let num_jobs = f.num_jobs();
     let mut route = RouteScratch {
-        weight: [[0; crate::metal::TOP_K]; crate::metal::CANVAS],
-        expert: [[0; crate::metal::TOP_K]; crate::metal::CANVAS],
+        weight: [[0; crate::metal::TOP_K]; crate::metal::PREFILL_M],
+        expert: [[0; crate::metal::TOP_K]; crate::metal::PREFILL_M],
         count: [0; crate::metal::N_EXPERTS],
         row_start: [0; crate::metal::N_EXPERTS + 1],
         num_slots: 0,
         num_active_experts: num_jobs as u32,
         active_expert: [0; crate::metal::N_EXPERTS],
-        token_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
-        slot_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
-        token_slot: [[0; crate::metal::TOP_K]; crate::metal::CANVAS],
+        token_list: [0; crate::metal::PREFILL_M * crate::metal::TOP_K],
+        slot_list: [0; crate::metal::PREFILL_M * crate::metal::TOP_K],
+        token_slot: [[0; crate::metal::TOP_K]; crate::metal::PREFILL_M],
         block_expert: [0; crate::metal::MOE_MAX_BLOCKS],
         block_row0: [0; crate::metal::MOE_MAX_BLOCKS],
         num_blocks: 0,
@@ -319,16 +319,16 @@ pub fn gpu_on_blob(
         .allocate(&ctx.device, p.row_starts.len() * 4)
         .ok_or(Error::Format("alloc"))?;
     let mut route = RouteScratch {
-        weight: [[0; crate::metal::TOP_K]; crate::metal::CANVAS],
-        expert: [[0; crate::metal::TOP_K]; crate::metal::CANVAS],
+        weight: [[0; crate::metal::TOP_K]; crate::metal::PREFILL_M],
+        expert: [[0; crate::metal::TOP_K]; crate::metal::PREFILL_M],
         count: [0; crate::metal::N_EXPERTS],
         row_start: [0; crate::metal::N_EXPERTS + 1],
         num_slots: 0,
         num_active_experts: num_jobs as u32,
         active_expert: [0; crate::metal::N_EXPERTS],
-        token_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
-        slot_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
-        token_slot: [[0; crate::metal::TOP_K]; crate::metal::CANVAS],
+        token_list: [0; crate::metal::PREFILL_M * crate::metal::TOP_K],
+        slot_list: [0; crate::metal::PREFILL_M * crate::metal::TOP_K],
+        token_slot: [[0; crate::metal::TOP_K]; crate::metal::PREFILL_M],
         block_expert: [0; crate::metal::MOE_MAX_BLOCKS],
         block_row0: [0; crate::metal::MOE_MAX_BLOCKS],
         num_blocks: 0,

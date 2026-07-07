@@ -140,7 +140,7 @@ pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
 fn blank_state(f: &Fixture) -> CanvasState {
     let mut entropy = [0.0f32; CANVAS];
     let mut prev = [0u32; CANVAS];
-    let mut ids = [0u32; CANVAS];
+    let mut ids = [0u32; crate::metal::PREFILL_M];
     for i in 0..f.canvas_size {
         entropy[i] = f.entropy[i];
         prev[i] = f.prev_argmax[i];

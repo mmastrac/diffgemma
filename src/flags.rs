@@ -221,6 +221,16 @@ pub fn attn_kv_block() -> usize {
     })
 }
 
+/// Batched prefill super-chunks (`DGQ_PREFILL_BATCH=0` restores plain
+/// 256-token chunks): up to PREFILL_SUBS causal sub-chunks run as ONE forward
+/// — MoE expert weights are streamed once per super-chunk instead of once per
+/// chunk (the dominant prefill GEMM cost), and the dense GEMMs run at M=1024.
+/// Bit-identical to sequential chunks (row-independent batched stages;
+/// attention/rope keep per-sub causal dims + per-sub params slots).
+pub fn prefill_batch_enabled() -> bool {
+    on_unless_zero("DGQ_PREFILL_BATCH")
+}
+
 /// MMA attention in the fast prefill (`DGQ_PREFILL_MMA=0` restores the scalar
 /// prefill attention). The MMA kernels honor the causal mask + sliding window;
 /// scalar prefill was kept from the freeze era when f16 prefill attention

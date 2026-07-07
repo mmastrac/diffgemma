@@ -145,7 +145,7 @@ fn canvas_state_for_gpu(f: &Fixture) -> CanvasState {
         u_cat[i] = u;
     }
     CanvasState {
-        ids: [0; CANVAS],
+        ids: [0; crate::metal::PREFILL_M],
         prev_argmax: [0; CANVAS],
         new_sample: [0; CANVAS],
         entropy: [0.0; CANVAS],

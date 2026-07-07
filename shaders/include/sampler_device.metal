@@ -21,7 +21,8 @@ struct StepParams {
 };
 
 struct CanvasState {
-    uint ids[256];
+    // 1024 = batched-prefill super-chunk M (denoise + sampler use [0..256)).
+    uint ids[1024];
     uint prev_argmax[256];
     uint new_sample[256];
     float entropy[256];

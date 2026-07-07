@@ -67,16 +67,16 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         .allocate(&ctx.device, std::mem::size_of::<RouteScratch>())
         .ok_or(Error::Format("alloc"))?;
     let mut scratch = RouteScratch {
-        weight: [[0; crate::metal::TOP_K]; crate::metal::CANVAS],
-        expert: [[0; crate::metal::TOP_K]; crate::metal::CANVAS],
+        weight: [[0; crate::metal::TOP_K]; crate::metal::PREFILL_M],
+        expert: [[0; crate::metal::TOP_K]; crate::metal::PREFILL_M],
         count: [1; N_EXPERTS],
         row_start: [0; N_EXPERTS + 1],
         num_slots: 99,
         num_active_experts: 0,
         active_expert: [0; crate::metal::N_EXPERTS],
-        token_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
-        slot_list: [0; crate::metal::CANVAS * crate::metal::TOP_K],
-        token_slot: [[0; crate::metal::TOP_K]; crate::metal::CANVAS],
+        token_list: [0; crate::metal::PREFILL_M * crate::metal::TOP_K],
+        slot_list: [0; crate::metal::PREFILL_M * crate::metal::TOP_K],
+        token_slot: [[0; crate::metal::TOP_K]; crate::metal::PREFILL_M],
         block_expert: [0; crate::metal::MOE_MAX_BLOCKS],
         block_row0: [0; crate::metal::MOE_MAX_BLOCKS],
         num_blocks: 0,

@@ -142,7 +142,7 @@ pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
 
 fn canvas_state_for_gpu(f: &Fixture) -> CanvasState {
     let mut prev = [u32::MAX; CANVAS];
-    let mut ids = [0u32; CANVAS];
+    let mut ids = [0u32; crate::metal::PREFILL_M];
     for (i, &v) in f.prev_argmax.iter().enumerate() {
         prev[i] = v;
     }

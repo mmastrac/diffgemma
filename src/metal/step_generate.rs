@@ -807,6 +807,8 @@ mod tests {
         assert_ne!(a, b);
         let mut r = Rng::new(99);
         let st = init_canvas_state_from_rng(VOCAB, &mut r);
-        assert_eq!(st.ids.len(), CANVAS);
+        // ids array is PREFILL_M-sized (batched prefill); the canvas uses [0..CANVAS).
+        assert_eq!(st.ids.len(), crate::metal::PREFILL_M);
+        assert!(st.ids[..CANVAS].iter().any(|&v| v != 0));
     }
 }
