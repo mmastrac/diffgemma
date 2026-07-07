@@ -12,6 +12,7 @@ pub mod gelu;
 pub mod gemm_common;
 pub mod hadamard;
 pub mod kv_quant;
+pub mod weight_rot_probe;
 pub mod gemm_linear_f32;
 pub mod gemm_block_grouped;
 pub mod gemm_block_sparse;

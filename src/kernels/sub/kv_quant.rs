@@ -123,6 +123,23 @@ pub fn q4_affine_roundtrip(src: &[f32], out: &mut [f32]) {
     }
 }
 
+/// Generic affine (asymmetric) group-32 round-trip at `levels` steps
+/// (q4 = 15, q6 = 63, q8 = 255) — for the weight-quant viability probe.
+pub fn affine_roundtrip_levels(src: &[f32], out: &mut [f32], levels: f32) {
+    let hd = src.len();
+    for g in 0..hd / KV_GROUP {
+        let grp = &src[g * KV_GROUP..(g + 1) * KV_GROUP];
+        let lo = grp.iter().cloned().fold(f32::INFINITY, f32::min);
+        let hi = grp.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let sf = f16_bits_to_f32(f32_to_f16_bits(((hi - lo) / levels).max(1e-8)));
+        let zf = f16_bits_to_f32(f32_to_f16_bits(lo));
+        for j in 0..KV_GROUP {
+            let q = ((grp[j] - zf) / sf).round_ties_even().clamp(0.0, levels);
+            out[g * KV_GROUP + j] = zf + q * sf;
+        }
+    }
+}
+
 fn rotated<F: Fn(&[f32], &mut [f32])>(src: &[f32], out: &mut [f32], q: F) {
     let mut r = src.to_vec();
     fwht_normalized(&mut r);

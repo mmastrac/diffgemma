@@ -54,6 +54,32 @@ pub fn fwht_rows(data: &mut [f32], rows: usize, n: usize) {
     }
 }
 
+/// Block-diagonal normalized WHT: apply `fwht_normalized` independently to each
+/// consecutive `blk`-sized sub-block of `v` (`v.len()` must be a multiple of
+/// `blk`, `blk` a power of two). This is the rotation for weight contraction
+/// dims that AREN'T powers of two (hidden 2816 = 256×11, FFN 2112 = 64×33):
+/// a full Hadamard needs a pow2 (or Paley-constructed) size, so we use
+/// R = I ⊗ H_blk — orthogonal, fast, and it spreads outlier channels within
+/// each block (across-block mixing is lost, so smaller blocks help less).
+pub fn block_fwht(v: &mut [f32], blk: usize) {
+    debug_assert_eq!(v.len() % blk, 0, "block_fwht: len must be a multiple of blk");
+    let n = v.len();
+    let mut off = 0usize;
+    while off < n {
+        fwht_normalized(&mut v[off..off + blk]);
+        off += blk;
+    }
+}
+
+/// Largest power-of-two divisor of `n` (the natural block size for a
+/// block-diagonal Hadamard over a non-pow2 contraction dim).
+pub fn largest_pow2_divisor(n: usize) -> usize {
+    if n == 0 {
+        return 1;
+    }
+    n & n.wrapping_neg()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

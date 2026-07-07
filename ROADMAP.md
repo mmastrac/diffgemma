@@ -301,6 +301,26 @@ M3 optional sub-q4 gate/up for memory (separate gate). Headroom evidence
 (q6 = warts unchanged) shows expert-quant error isn't today's wart driver
 but does NOT prove rotated-q4 recovers bf16 or that q3 is safe.
 
+**Prior-art specifics + build-order correction (2026-07-07).** "TurboQuant
+for weights" is NOT novel: TurboQuant (2504.19874) never quantizes weights
+(KV + nearest-neighbor only), and its stage-2 QJL-residual trick only buys
+*inner-product* unbiasedness — an attention concern, irrelevant to weights
+(we want MSE). The real weight-domain twins are **PolarQuant** (2603.29078:
+128-block L2-norm → Walsh–Hadamard → Lloyd–Max centroids fit to 𝒩(0,1),
+calibration-free) and **QAM-W** (2605.26339: Hadamard + 2D codebook +
+activation-aware scaling); lineage QuIP/QuIP#/QuaRot/SpinQuant. So E9 is a
+*port*, not research — benchmark to beat is PolarQuant/QuIP#, not "is it new."
+The one actionable result they surface: **PolarQuant measured Hadamard
+rotation = ~98% of the quality gain (PPL 6.90→6.40 at Q5); optimal Lloyd–Max
+centroids add only ~1%.** This matches our q6 finding (bits ≈ no wart
+movement) — the lever is CONDITIONING, not the codebook. So **M1 should prove
+the rotation with PLAIN absmax/uniform q4 first** and treat the good
+quantizer as a near-non-lever; only revisit optimal 𝒩(0,1)/Beta centroids
+for the M3 sub-q4 case, where the centroid share grows (TurboQuant's whole
+point is centroids dominate at low bit — 98% is a Q5 number, not a q4/q3
+one). PolarQuant's 128-elt intra-block matches our existing WHT helper block
+size; all of it is calibration-free (no new data pipeline).
+
 ### 5.5 Slack (2-3 days)
 History says every week here surfaces one unplanned wall (this week it was
 the sampler-struct growth ripple). The slack is the plan.
