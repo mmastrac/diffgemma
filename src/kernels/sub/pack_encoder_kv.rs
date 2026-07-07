@@ -15,14 +15,16 @@ pub fn pipeline_for(
     ctx.compile_subkernel(SHADER, ENTRY, variant)
 }
 
-/// q8-KV variant (function constant 4): grid depth = head_dim/32 groups.
+/// Quantized-KV variant (uint function constant 4 = KvFormat code): grid
+/// depth = head_dim/32 groups. `fmt` must be a quantized format (q8/q4).
 #[cfg(all(feature = "metal", target_os = "macos"))]
-pub fn pipeline_q8_for(
+pub fn pipeline_fmt_for(
     ctx: &crate::metal::device::MetalContext,
     variant: KernelVariant,
+    fmt: crate::kernels::sub::kv_quant::KvFormat,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    let bools = [crate::kernels::sub::variant::FcBool { index: 4, value: true }];
-    ctx.compile_subkernel_ex(SHADER, ENTRY, variant, "kvq8", &bools, &[])
+    let uints = [crate::kernels::sub::variant::FcUInt { index: 4, value: fmt.code() }];
+    ctx.compile_subkernel_ex(SHADER, ENTRY, variant, fmt.label(), &[], &uints)
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -61,15 +63,16 @@ pub fn dispatch_shape(
     token_count: usize,
     nkv: usize,
     hd: usize,
-    kv_q8: bool,
+    fmt: crate::kernels::sub::kv_quant::KvFormat,
 ) -> (objc2_metal::MTLSize, objc2_metal::MTLSize) {
+    use crate::kernels::sub::kv_quant::KvFormat;
     use objc2_metal::MTLSize;
     (
         MTLSize {
             width: token_count,
             height: nkv,
-            // q8: one thread per 32-group (quantizes K + V); f16: per element.
-            depth: if kv_q8 { hd / 32 } else { hd },
+            // quantized: one thread per 32-group (quantizes K + V); f16: per element.
+            depth: if fmt == KvFormat::F16 { hd } else { hd / 32 },
         },
         MTLSize {
             width: 1,

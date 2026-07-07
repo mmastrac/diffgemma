@@ -251,12 +251,14 @@ pub fn pipeline_for(
     ctx.compile_subkernel(SHADER, ENTRY, variant)
 }
 
-/// Compile with the session KV storage format (function constant 4).
+/// Compile with the session KV storage format (uint function constant 4).
 #[cfg(all(feature = "metal", target_os = "macos"))]
-fn kv_fc(kv_q8: bool) -> ([crate::kernels::sub::variant::FcBool; 1], &'static str) {
+fn kv_fc(
+    fmt: crate::kernels::sub::kv_quant::KvFormat,
+) -> ([crate::kernels::sub::variant::FcUInt; 1], &'static str) {
     (
-        [crate::kernels::sub::variant::FcBool { index: 4, value: kv_q8 }],
-        if kv_q8 { "kvq8" } else { "kvf16" },
+        [crate::kernels::sub::variant::FcUInt { index: 4, value: fmt.code() }],
+        fmt.label(),
     )
 }
 
@@ -264,30 +266,30 @@ fn kv_fc(kv_q8: bool) -> ([crate::kernels::sub::variant::FcBool; 1], &'static st
 pub fn pipeline_for_kv(
     ctx: &crate::metal::device::MetalContext,
     variant: KernelVariant,
-    kv_q8: bool,
+    fmt: crate::kernels::sub::kv_quant::KvFormat,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    let (bools, label) = kv_fc(kv_q8);
-    ctx.compile_subkernel_ex(SHADER, ENTRY, variant, label, &bools, &[])
+    let (uints, label) = kv_fc(fmt);
+    ctx.compile_subkernel_ex(SHADER, ENTRY, variant, label, &[], &uints)
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub fn pipeline_mma2_for_kv(
     ctx: &crate::metal::device::MetalContext,
     variant: KernelVariant,
-    kv_q8: bool,
+    fmt: crate::kernels::sub::kv_quant::KvFormat,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    let (bools, label) = kv_fc(kv_q8);
-    ctx.compile_subkernel_ex(SHADER_MMA2, ENTRY_MMA2, variant, label, &bools, &[])
+    let (uints, label) = kv_fc(fmt);
+    ctx.compile_subkernel_ex(SHADER_MMA2, ENTRY_MMA2, variant, label, &[], &uints)
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub fn pipeline_mma_full_for_kv(
     ctx: &crate::metal::device::MetalContext,
     variant: KernelVariant,
-    kv_q8: bool,
+    fmt: crate::kernels::sub::kv_quant::KvFormat,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    let (bools, label) = kv_fc(kv_q8);
-    ctx.compile_subkernel_ex(SHADER_MMA_FULL, ENTRY_MMA_FULL, variant, label, &bools, &[])
+    let (uints, label) = kv_fc(fmt);
+    ctx.compile_subkernel_ex(SHADER_MMA_FULL, ENTRY_MMA_FULL, variant, label, &[], &uints)
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]

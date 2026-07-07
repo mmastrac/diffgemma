@@ -53,7 +53,11 @@ impl GpuKernels {
             embed_gather: embed_gather::pipeline_for(ctx, prod)?,
             half_to_f32: half_to_f32::pipeline_for(ctx, prod)?,
             pack_encoder_kv: pack_encoder_kv::pipeline_for(ctx, prod)?,
-            pack_encoder_kv_q8: pack_encoder_kv::pipeline_q8_for(ctx, prod)?,
+            pack_encoder_kv_q8: pack_encoder_kv::pipeline_fmt_for(
+                ctx,
+                prod,
+                crate::kernels::sub::kv_quant::KvFormat::Q8,
+            )?,
             scatter_rows_weighted: scatter_rows_weighted::pipeline_for(ctx, prod)?,
         })
     }

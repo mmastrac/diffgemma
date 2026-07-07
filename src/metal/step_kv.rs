@@ -51,18 +51,16 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 use std::path::Path;
 
-/// Bytes of one (slot, head, K-or-V) row. q8: hd i8 + hd/32 f16 group scales;
-/// f16: hd halfs. MUST match attention_device.metal `kv_row_bytes`.
-pub fn kv_row_bytes(head_dim: u32, kv_q8: bool) -> u64 {
-    if kv_q8 {
-        head_dim as u64 + (head_dim as u64 / 32) * 2
-    } else {
-        head_dim as u64 * 2
-    }
+use crate::kernels::sub::kv_quant::KvFormat;
+
+/// Bytes of one (slot, head, K-or-V) row for the given format. MUST match
+/// attention_device.metal `kv_row_bytes` (delegates to `KvFormat::row_bytes`).
+pub fn kv_row_bytes(head_dim: u32, fmt: KvFormat) -> u64 {
+    fmt.row_bytes(head_dim)
 }
 
-pub fn kv_region_bytes(n_kv_heads: u32, head_dim: u32, slots: usize, kv_q8: bool) -> u64 {
-    (slots as u64) * (n_kv_heads as u64) * 2 * kv_row_bytes(head_dim, kv_q8)
+pub fn kv_region_bytes(n_kv_heads: u32, head_dim: u32, slots: usize, fmt: KvFormat) -> u64 {
+    (slots as u64) * (n_kv_heads as u64) * 2 * kv_row_bytes(head_dim, fmt)
 }
 
 /// Per-layer KV slots — MUST agree with `build_layout`'s region offsets: full
@@ -83,11 +81,11 @@ fn kv_slot(l: &crate::metal::step_kernel::LayerOffsets, pos: usize) -> usize {
 }
 
 pub fn kv_cache_total_bytes(layout: &ModelLayout, max_seq: usize) -> u64 {
-    let kv_q8 = crate::flags::kv_q8(max_seq);
+    let fmt = crate::flags::kv_format(max_seq);
     (0..N_LAYERS)
         .map(|i| {
             let l = &layout.layers[i];
-            kv_region_bytes(l.n_kv_heads, l.head_dim, layer_slots(l, max_seq), kv_q8)
+            kv_region_bytes(l.n_kv_heads, l.head_dim, layer_slots(l, max_seq), fmt)
         })
         .sum()
 }
@@ -112,8 +110,11 @@ pub fn pack_kv_cache_to_monolithic(
         }
         let nkv = l.n_kv_heads as usize;
         let hd = l.head_dim as usize;
-        let kv_q8 = crate::flags::kv_q8(max_seq);
-        let row_b = kv_row_bytes(l.head_dim, kv_q8) as usize;
+        let fmt = crate::flags::kv_format(max_seq);
+        if fmt == KvFormat::Q4 {
+            return Err(Error::Format("q4 KV pack not implemented"));
+        }
+        let row_b = kv_row_bytes(l.head_dim, fmt) as usize;
         let slot_stride_b = 2 * nkv * row_b;
         let byte_base = l.kv_region as usize;
         if byte_base + layer_slots(l, max_seq) * slot_stride_b > dst.len() {
@@ -124,7 +125,7 @@ pub fn pack_kv_cache_to_monolithic(
             let slot_b = byte_base + kv_slot(l, pos) * slot_stride_b;
             for hh in 0..nkv {
                 let ksrc = pos * per_token + hh * hd;
-                if kv_q8 {
+                if fmt == KvFormat::Q8 {
                     kv_q8_pack_row(&mut dst[slot_b + hh * row_b..], &kv_layer.keys[ksrc..ksrc + hd]);
                     kv_q8_pack_row(
                         &mut dst[slot_b + (nkv + hh) * row_b..],
@@ -304,15 +305,16 @@ fn pack_gpu_kv_prefix_to_monolithic(
     layers: usize,
     dst_pos: usize,
     src_pos: usize,
-    kv_q8: bool,
+    fmt: KvFormat,
 ) -> Result<(), Error> {
     use crate::kernels::sub::pack_encoder_kv;
     use crate::metal::batch::begin_engine_batch;
 
-    let pack_pipeline = if kv_q8 {
-        engine.kernels.pack_encoder_kv_q8.pipeline.clone()
-    } else {
+    let pack_pipeline = if fmt == KvFormat::F16 {
         engine.kernels.pack_encoder_kv.pipeline.clone()
+    } else {
+        // q8 (q4 not yet wired) — the quantized pack pipeline.
+        engine.kernels.pack_encoder_kv_q8.pipeline.clone()
     };
     let telemetry = engine.batch_telemetry();
     let batch = begin_engine_batch(
@@ -326,7 +328,7 @@ fn pack_gpu_kv_prefix_to_monolithic(
         let nkv = l.n_kv_heads as usize;
         let hd = l.head_dim as usize;
         let (k_buf, v_buf) = gpu_kv.layer_buffers(layer)?;
-        let (grid, tg) = pack_encoder_kv::dispatch_shape(token_count, nkv, hd, kv_q8);
+        let (grid, tg) = pack_encoder_kv::dispatch_shape(token_count, nkv, hd, fmt);
         batch.dispatch_with_grid(
             &pack_pipeline,
             grid,
@@ -513,7 +515,7 @@ pub fn prefill_monolithic_kv_with_cache_timed(
         layers,
         0,
         0,
-        crate::flags::kv_q8(max_seq),
+        crate::flags::kv_format(max_seq),
     )?;
     let kv_pack_ms = pack_started.elapsed().as_secs_f64() * 1000.0;
     let timing = MonolithicPrefillTiming {
@@ -701,7 +703,7 @@ pub fn extend_monolithic_kv_with_cache(
         layers,
         kv_len_before,
         kv_len_before,
-        crate::flags::kv_q8(max_seq),
+        crate::flags::kv_format(max_seq),
     )?;
     Ok(new_kv_len)
 }

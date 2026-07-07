@@ -9,8 +9,10 @@ using namespace metal;
 
 // Session-wide KV storage format: q8 (group-32) for long-context sessions,
 // f16 otherwise. Unset (oracle/test compiles) = f16.
-constant bool KV_Q8_FC [[function_constant(4)]];
-constant bool KV_Q8 = is_function_constant_defined(KV_Q8_FC) ? KV_Q8_FC : false;
+constant uint KV_FMT_FC [[function_constant(4)]];
+constant uint KV_FMT = is_function_constant_defined(KV_FMT_FC) ? KV_FMT_FC : 0u;
+constant bool KV_Q8 = (KV_FMT == 1u);
+constant bool KV_Q4 = (KV_FMT == 2u);
 
 /// Per-head Q/K RMSNorm + split-half RoPE + KV cache write (monolith step path).
 kernel void qk_rope_kv(
@@ -73,8 +75,8 @@ kernel void qk_rope_kv(
             // RoPE uses the ABSOLUTE pos; only the storage slot is ring-mapped.
             if (KV_Q8) {
                 device uchar *row = (device uchar *)kvcache + L->kv_region
-                    + (ulong)kv_slot_of(L, pos) * kv_slot_stride_bytes(nkv, hd, true)
-                    + hh * kv_row_bytes(hd, true);
+                    + (ulong)kv_slot_of(L, pos) * kv_slot_stride_bytes(nkv, hd, KV_FMT)
+                    + hh * kv_row_bytes(hd, KV_FMT);
                 kv_q8_store_row(row, head, hd);
             } else {
                 device ushort *dst = kvcache + L->kv_region / 2
@@ -100,8 +102,8 @@ kernel void qk_rope_kv(
                 head[i] = arena_load(src, i) * inv;
             }
             device uchar *row = (device uchar *)kvcache + L->kv_region
-                + (ulong)kv_slot_of(L, pos) * kv_slot_stride_bytes(nkv, hd, true)
-                + ((ulong)nkv + hh) * kv_row_bytes(hd, true);
+                + (ulong)kv_slot_of(L, pos) * kv_slot_stride_bytes(nkv, hd, KV_FMT)
+                + ((ulong)nkv + hh) * kv_row_bytes(hd, KV_FMT);
             kv_q8_store_row(row, head, hd);
         } else {
             device ushort *dst = kvcache + L->kv_region / 2

@@ -11,8 +11,10 @@ using namespace metal;
 // Unset (oracle/test compiles) = f16. Under q8 the grid's z axis is
 // head_dim/32 GROUPS (one thread quantizes a 32-group of K and of V);
 // under f16 it is head_dim elements.
-constant bool KV_Q8_FC [[function_constant(4)]];
-constant bool KV_Q8 = is_function_constant_defined(KV_Q8_FC) ? KV_Q8_FC : false;
+constant uint KV_FMT_FC [[function_constant(4)]];
+constant uint KV_FMT = is_function_constant_defined(KV_FMT_FC) ? KV_FMT_FC : 0u;
+constant bool KV_Q8 = (KV_FMT == 1u);
+constant bool KV_Q4 = (KV_FMT == 2u);
 
 /// Pack engine f32 K/V prefix into monolithic b4 layer region (matches CPU pack layout).
 kernel void pack_encoder_kv(
@@ -49,9 +51,9 @@ kernel void pack_encoder_kv(
         // gid.z = group index; quantize one 32-group of K and of V.
         const uint g = d;
         device uchar *slot_base = dst + kv_region_bytes
-            + ulong(slot) * kv_slot_stride_bytes(nkv, hd, true);
-        device uchar *krow = slot_base + hh * kv_row_bytes(hd, true);
-        device uchar *vrow = slot_base + ((ulong)nkv + hh) * kv_row_bytes(hd, true);
+            + ulong(slot) * kv_slot_stride_bytes(nkv, hd, KV_FMT);
+        device uchar *krow = slot_base + hh * kv_row_bytes(hd, KV_FMT);
+        device uchar *vrow = slot_base + ((ulong)nkv + hh) * kv_row_bytes(hd, KV_FMT);
         const uint src_base = (src_pos + pos) * per_token + hh * hd + g * KV_Q8_GROUP;
         float kg[KV_Q8_GROUP];
         float vg[KV_Q8_GROUP];

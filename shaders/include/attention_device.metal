@@ -53,14 +53,20 @@ inline void kv_store(device ushort *p, uint i, float v) {
 // [K rows x nkv][V rows x nkv].
 constant uint KV_Q8_GROUP = 32u;
 
-inline ulong kv_row_bytes(uint hd, bool q8) {
-    // q8: hd i8 payload + (hd/32) f16 scales; f16: hd halfs.
-    return q8 ? (ulong)hd + (ulong)(hd / KV_Q8_GROUP) * 2ul : (ulong)hd * 2ul;
+// KV storage format code (mirrors Rust KvFormat::code(); the KV_FMT function
+// constant): 0 = f16, 1 = q8 (group-32 i8+f16 scales), 2 = q4 (group-32
+// i4+f16 scales, reserved for the rotated-KV lever). Row bytes per format:
+inline ulong kv_row_bytes(uint hd, uint fmt) {
+    switch (fmt) {
+        case 1u: return (ulong)hd + (ulong)(hd / KV_Q8_GROUP) * 2ul;        // q8
+        case 2u: return (ulong)(hd / 2u) + (ulong)(hd / KV_Q8_GROUP) * 2ul; // q4
+        default: return (ulong)hd * 2ul;                                    // f16
+    }
 }
 
 /// Byte stride between consecutive KV slots (one position's K+V, all heads).
-inline ulong kv_slot_stride_bytes(uint nkv, uint hd, bool q8) {
-    return 2ul * (ulong)nkv * kv_row_bytes(hd, q8);
+inline ulong kv_slot_stride_bytes(uint nkv, uint hd, uint fmt) {
+    return 2ul * (ulong)nkv * kv_row_bytes(hd, fmt);
 }
 
 /// Dequantize one element of a q8 row (scalar fallback — the MMA kernels use

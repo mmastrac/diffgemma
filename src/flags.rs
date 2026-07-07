@@ -236,21 +236,30 @@ pub fn set_gpu_working_set_cap(bytes: u64) {
 /// out rotated lower-bit KV for speed). Quality: forced-q8 gate 45/51 =
 /// baseline; needle exact 33k/105k. Format is fixed per session at open;
 /// every KV writer/reader compiles a matching function-constant variant.
-pub fn kv_q8(max_seq: usize) -> bool {
-    // Explicit override (any set value): 1/true → on, else → off.
+pub fn kv_format(max_seq: usize) -> crate::kernels::sub::kv_quant::KvFormat {
+    use crate::kernels::sub::kv_quant::KvFormat;
+    // Explicit override (any set value): 1/true → q8, else → f16.
     if let Ok(v) = std::env::var("DGQ_KV_Q8") {
-        return v == "1" || v.eq_ignore_ascii_case("true");
+        return if v == "1" || v.eq_ignore_ascii_case("true") {
+            KvFormat::Q8
+        } else {
+            KvFormat::F16
+        };
     }
-    // Auto: enable when f16 resident would exceed a safe fraction of the cap.
+    // Auto: q8 when f16 resident would exceed a safe fraction of the cap.
     let Some(&cap) = GPU_WORKING_SET_BYTES.get() else {
-        return false; // cap unknown (tests / CPU) → keep f16
+        return KvFormat::F16; // cap unknown (tests / CPU) → keep f16
     };
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
     const F16_BASE_BYTES: f64 = 19.73 * GIB; // non-KV resident (weights+arena)
     const F16_KV_BYTES_PER_TOKEN: f64 = 19.0 * 1024.0; // f16 KV linear growth
     const SAFE_FRACTION: f64 = 0.85; // switch before the >90% swap regime
     let f16_resident = F16_BASE_BYTES + F16_KV_BYTES_PER_TOKEN * max_seq as f64;
-    f16_resident > SAFE_FRACTION * cap as f64
+    if f16_resident > SAFE_FRACTION * cap as f64 {
+        KvFormat::Q8
+    } else {
+        KvFormat::F16
+    }
 }
 
 /// KV block size for sequential-block full-attention (`DGQ_ATTN_KV_BLOCK=

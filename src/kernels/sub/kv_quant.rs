@@ -17,6 +17,60 @@ use crate::kernels::sub::hadamard::fwht_normalized;
 
 pub const KV_GROUP: usize = 32;
 
+/// KV-cache storage format — the code threaded through the Rust API and set
+/// as the `KV_FMT` uint function constant (index 4) the KV kernels specialize
+/// on. Always a code, never a bool: the format is multi-state (f16 / q8 / q4)
+/// and will grow. Group-32 for the quantized variants (mirrors the shipped
+/// q8 lattice). `code()` MUST match the Metal `KV_FMT` values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvFormat {
+    /// f16 halfs — the direct-simdgroup-load default.
+    F16,
+    /// group-32 symmetric i8 + f16 scales (`[hd i8][hd/32 f16]`).
+    Q8,
+    /// group-32 q4 (`[hd/2 i4][hd/32 f16]`) — reserved for the rotated-KV
+    /// memory lever (E8); not yet implemented in the kernels.
+    Q4,
+}
+
+impl KvFormat {
+    pub fn code(self) -> u32 {
+        match self {
+            KvFormat::F16 => 0,
+            KvFormat::Q8 => 1,
+            KvFormat::Q4 => 2,
+        }
+    }
+
+    pub fn from_code(c: u32) -> Self {
+        match c {
+            1 => KvFormat::Q8,
+            2 => KvFormat::Q4,
+            _ => KvFormat::F16,
+        }
+    }
+
+    /// Pipeline-cache label suffix.
+    pub fn label(self) -> &'static str {
+        match self {
+            KvFormat::F16 => "kvf16",
+            KvFormat::Q8 => "kvq8",
+            KvFormat::Q4 => "kvq4",
+        }
+    }
+
+    /// Bytes for one (slot, head, K-or-V) row of `hd` elements. MUST match the
+    /// Metal `kv_row_bytes(hd, fmt)`.
+    pub fn row_bytes(self, hd: u32) -> u64 {
+        let hd = hd as u64;
+        match self {
+            KvFormat::F16 => hd * 2,
+            KvFormat::Q8 => hd + (hd / KV_GROUP as u64) * 2,
+            KvFormat::Q4 => hd / 2 + (hd / KV_GROUP as u64) * 2,
+        }
+    }
+}
+
 /// q8 group-32 round-trip of one head vector (matches `step_kv::kv_q8_pack_row`
 /// + `kv_q8_read` numerics; reproduced here so this module is self-contained
 /// and testable without the Metal path).

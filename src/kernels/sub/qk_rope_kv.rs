@@ -271,17 +271,10 @@ pub fn pipeline_for(
 pub fn pipeline_for_kv(
     ctx: &crate::metal::device::MetalContext,
     variant: KernelVariant,
-    kv_q8: bool,
+    fmt: crate::kernels::sub::kv_quant::KvFormat,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    let bools = [crate::kernels::sub::variant::FcBool { index: 4, value: kv_q8 }];
-    ctx.compile_subkernel_ex(
-        SHADER,
-        ENTRY,
-        variant,
-        if kv_q8 { "kvq8" } else { "kvf16" },
-        &bools,
-        &[],
-    )
+    let uints = [crate::kernels::sub::variant::FcUInt { index: 4, value: fmt.code() }];
+    ctx.compile_subkernel_ex(SHADER, ENTRY, variant, fmt.label(), &[], &uints)
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]

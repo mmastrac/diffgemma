@@ -38,8 +38,10 @@ constant uint NCH_H = NCH / QG; // chunks per d-half (32)
 // Session-wide KV storage format: q8 (group-32) for long-context sessions,
 // f16 otherwise. Unset (oracle/test compiles) = f16. The q8 path stages
 // dequantized half tiles through tgmem (simdgroup_load can't read i8).
-constant bool KV_Q8_FC [[function_constant(4)]];
-constant bool KV_Q8 = is_function_constant_defined(KV_Q8_FC) ? KV_Q8_FC : false;
+constant uint KV_FMT_FC [[function_constant(4)]];
+constant uint KV_FMT = is_function_constant_defined(KV_FMT_FC) ? KV_FMT_FC : 0u;
+constant bool KV_Q8 = (KV_FMT == 1u);
+constant bool KV_Q4 = (KV_FMT == 2u);
 
 kernel void attention_mma_full(
     device const ushort *q [[buffer(0)]],
@@ -154,8 +156,8 @@ kernel void attention_mma_full(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     device const uchar *kvb = (device const uchar *)kvcache + L->kv_region;
-    const ulong q8_stride = kv_slot_stride_bytes(nkv, hd, true);
-    const ulong q8_row = kv_row_bytes(hd, true);
+    const ulong q8_stride = kv_slot_stride_bytes(nkv, hd, KV_FMT);
+    const ulong q8_row = kv_row_bytes(hd, KV_FMT);
 
     const uint t_stop = min(T_eff, blk.t_end);
     for (uint t0 = blk.t_begin; t0 < t_stop; t0 += 8u) {

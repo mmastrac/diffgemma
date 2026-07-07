@@ -10,8 +10,10 @@ using namespace metal;
 
 // Session-wide KV storage format: q8 (group-32) for long-context sessions,
 // f16 otherwise. Unset (oracle/test compiles) = f16.
-constant bool KV_Q8_FC [[function_constant(4)]];
-constant bool KV_Q8 = is_function_constant_defined(KV_Q8_FC) ? KV_Q8_FC : false;
+constant uint KV_FMT_FC [[function_constant(4)]];
+constant uint KV_FMT = is_function_constant_defined(KV_FMT_FC) ? KV_FMT_FC : 0u;
+constant bool KV_Q8 = (KV_FMT == 1u);
+constant bool KV_Q4 = (KV_FMT == 2u);
 
 /// Canvas queries attend all KV positions 0..kv_len+canvas-1 (no causal mask)
 /// when dims.causal==0 (denoise). When dims.causal!=0 (prefill), query at absolute
@@ -79,8 +81,8 @@ kernel void attention(
         acc[i] = 0.f;
     }
     device const uchar *base_b = (device const uchar *)kvcache + L->kv_region;
-    const ulong q8_stride = kv_slot_stride_bytes(nkv, hd, true);
-    const ulong q8_row = kv_row_bytes(hd, true);
+    const ulong q8_stride = kv_slot_stride_bytes(nkv, hd, KV_FMT);
+    const ulong q8_row = kv_row_bytes(hd, KV_FMT);
     for (uint t = t_lo; t < T; ++t) {
         const uint ts = kv_slot_of(L, t);
         device const ushort *kk = base + (ulong)ts * nkv * hd * 2u + kvh * hd;
