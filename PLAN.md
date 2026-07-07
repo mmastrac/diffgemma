@@ -53,14 +53,18 @@ gets SLC service (171 > 150 GB/s DRAM at 32k); default off. q8 KV was then also 
 DISPROVEN as a speed lever too: +9% prefill / +54% denoise at 33k — the
 f16 direct-load kernels are ISSUE-bound at SLC speed, not byte-starved,
 which rules out TurboQuant-class low-bit KV for speed by the same physics.
-The remaining long-context speed lever is batched multi-chunk prefill (the
-M=256 chunk-serial floor). See agent memory `long-context-100k`.
+Batched multi-chunk prefill SHIPPED
+(bit-identical, `DGQ_PREFILL_BATCH`): 4x256 causal sub-chunks as one M=1024
+forward — 33k prefill 165.7→142.4s (−14%); the MoE amortization is capped
+by the block-sparse GEMM re-reading expert weights per 32-row block, so the
+next prefill lever is a weight-stationary expert GEMM. See agent memory
+`long-context-100k`.
 
 ## Open items
 
 | Item | Note |
 |---|---|
-| Long-context speed | batched multi-chunk prefill (KV quant + scheduling levers disproven) |
+| Long-context speed | weight-stationary expert GEMM (batched prefill shipped −14%; KV quant + scheduling disproven) |
 | Seed-123 empty-reply artifact | short factual prompts, both prefill paths (engine 5 / fast 2 of 17 at that seed); trajectory-level, pre-existing |
 | Legacy GEMM retirement | `gemm_block*` legacy pipelines after a stable tunable cycle (KERNELS.md deprecation list; needs user nod) |
 | Mechanical kernel merges | embed_gather / gather_rows / f32_to_half families (KERNELS.md) |
