@@ -209,16 +209,22 @@ pub fn kv_reuse_enabled() -> bool {
 
 /// q8 KV cache storage (`DGQ_KV_Q8=1` opts in; DEFAULT OFF). Group-32
 /// symmetric i8 + f16 scales (0.92% rel-RMS on real KV), halves KV memory.
-/// DISPROVEN AS A SPEED LEVER 2026-07-06: at 33k tokens q8 is prefill +9% /
-/// denoise +54% vs f16 even with vectorized group dequant — the f16
-/// direct-load kernels are ISSUE-bound at SLC-served ~171 GB/s effective,
-/// not byte-starved, so halving bytes while adding a dequant staging pass
-/// (tgmem round-trip + 4 tg barriers/key-tile) loses. Same physics rules out
-/// rotated lower-bit KV (TurboQuant-class) as a speed lever here. Use ONLY
-/// when KV memory itself binds (e.g. ~262k ctx: f16 5.3 GiB -> q8 2.8).
-/// Quality: forced-q8 gate aggregate 45/51 = baseline (reshuffle-neutral);
-/// 33k needle retrieval exact. The format is fixed per session at open;
-/// every KV writer/reader compiles a matching function-constant variant.
+/// DISPROVEN AS A SPEED LEVER at short/mid kv 2026-07-06: at 33k tokens q8
+/// is prefill +9% / denoise +54% vs f16 even with vectorized group dequant —
+/// the f16 direct-load kernels are ISSUE-bound at SLC-served ~171 GB/s
+/// effective, not byte-starved, so halving bytes while adding a dequant
+/// staging pass (tgmem round-trip + 4 tg barriers/key-tile) loses. Same
+/// physics rules out rotated lower-bit KV (TurboQuant-class) as a speed
+/// lever here. E4 100k CELL SETTLED 2026-07-07 (kv=105k, 30L, interleaved
+/// 3-round profile-steps A/B): the sign flips but only to −6% denoise
+/// (pre_moe 4.14→3.87 s/step; full-layer sweep still runs ~580 GB/s
+/// effective = SLC-served, issue-bound even at 105k) — under the ≥15%
+/// adaptive-flip gate, so the default stays f16 at every length. Use q8
+/// when KV MEMORY binds (~262k ctx: f16 5.3 GiB -> q8 2.8; at 100k+ it is
+/// additionally ~6% faster). Quality: forced-q8 gate aggregate 45/51 =
+/// baseline (reshuffle-neutral); needle retrieval exact at 33k. The format
+/// is fixed per session at open; every KV writer/reader compiles a matching
+/// function-constant variant.
 pub fn kv_q8(max_seq: usize) -> bool {
     let _ = max_seq;
     static FORCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -384,6 +390,16 @@ pub fn sc_log_enabled() -> bool {
 /// experiments — measure BEFORE concluding (recorded feedback).
 pub fn trace_ranges_enabled() -> bool {
     std::env::var("DGQ_TRACE_RANGES").is_ok()
+}
+
+/// UMA memory-pressure watch (`DGQ_MEM_WATCH=1`): per-section (session-open
+/// / prefill / denoise / profile) report of Metal working-set occupancy,
+/// swap-used delta, and the kernel memory-pressure level; prints a LOUD
+/// "TIMINGS SUSPECT" line when swap grew, pressure is elevated, or GPU
+/// allocation exceeds 90% of recommendedMaxWorkingSetSize — wall-clock from
+/// such sections is unified-memory noise, not kernel cost.
+pub fn mem_watch_enabled() -> bool {
+    on_if_one("DGQ_MEM_WATCH")
 }
 
 /// Dump per-layer prefill KV to `<path>` (`DGQ_DUMP_KV=<path>`) — the probe

@@ -21,6 +21,7 @@ mod embed;
 mod lm_head;
 mod kv_cache;
 mod memory;
+mod memwatch;
 mod moe;
 mod dequant_matrix;
 mod pipeline_cache;

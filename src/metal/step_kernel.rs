@@ -6231,14 +6231,27 @@ pub fn bench_step_kernel_profile_steps(
         ));
     }
     let n_steps = n_steps.max(1);
+    let watch = crate::flags::mem_watch_enabled();
+    let mem_before = watch.then(crate::metal::memwatch::snapshot);
     let (mut rt, build) = build_step_runtime(model_dir, cfg)?;
+    if let Some(before) = mem_before {
+        crate::metal::memwatch::report_section("session-open", before, &rt.ctx.device);
+    }
     let finish = StepFinishMode::Full;
     let mut out = Vec::with_capacity(n_steps);
     for i in 0..n_steps {
         let st: CanvasState = read_struct(&rt.bufs.state);
+        let mem_before = watch.then(crate::metal::memwatch::snapshot);
         let mut prof = rt.profile_forward_once(finish)?;
         if i == 0 {
             prof.compile = build.compile;
+        }
+        if let Some(before) = mem_before {
+            crate::metal::memwatch::report_section(
+                &format!("profile-step {i}"),
+                before,
+                &rt.ctx.device,
+            );
         }
         out.push((st.step, prof));
     }

@@ -97,13 +97,21 @@ Matters at reply tails and tight `--max-new-tokens`: the finish stages
   deliberate divergence before v1 and matching MLX's `min_canvas_length`
   semantics. Low risk, bounded.
 
-### 2.4 q8-KV at 100k A/B (already built — one afternoon)
-The 33k verdict (issue-bound, q8 loses) may flip at 100k where the full-attn
-working set (~800 MB/layer f16) is far beyond SLC. The flag exists.
-- **Method**: needle_100k with `DGQ_KV_Q8=1` vs default; compare denoise
-  s/step and prefill. If q8 wins ≥ 15% at 100k, make the format
-  length-adaptive again (auto at ≥ 64k, say) with the gate evidence rerun.
-- This is cheap and settles the last open cell of the KV-quant table.
+### 2.4 q8-KV at 100k A/B — DONE 2026-07-07: table CLOSED, no default change
+Measured per the timing methodology (isolated `bench-step-kernel
+--layers 30 --kv-len 105000 --profile-steps 4`, full KV allocated, 3
+interleaved rounds per arm — NOT full-prefill wall-clock):
+- **The sign flips at 100k but only to −6%**: pre_moe (attention)
+  4.14 → 3.87 s/step, total 4.66 → 4.39 (every q8 step beat every f16 step
+  across all rounds). Under the ≥15% adaptive-flip gate → default stays f16
+  at every length; q8 remains opt-in.
+- **Why so small**: even at kv=105k the full-layer sweep reads ~430 MB/layer
+  in ~740 ms ≈ 580 GB/s effective — still SLC-served lockstep, still
+  issue-bound; unique DRAM traffic (~430 MB once) is milliseconds. The
+  33k physics holds at 105k.
+- Updated guidance: q8 = the KV MEMORY lever (halves KV), and at 100k+ it's
+  additionally ~6% faster — win-win for very long contexts, opt-in.
+- Retrieval at 105k under q8 run separately (untimed, correctness only).
 
 ### 2.5 Attention issue-bound follow-up (timeboxed research, ≤ 1 day)
 Full-layer attention at 100k ≈ 3 s/step is instruction-issue-bound. The one
@@ -254,7 +262,7 @@ the sampler-struct growth ripple). The slack is the plan.
 | E1 | Weight-stationary expert GEMM | ~~33k prefill −20%~~ **DISPROVEN 2026-07-07**: BM=64 wash, BM=128 3.6x slower; expert GEMM at M=1024 is compute-bound (~6x margin over W bytes) | done | bit-identity held (KV byte-equal), gate 17/17 | hit: < 5% → machinery kept, default off |
 | E2 | Fast prefill for short prompts | turn time neutral, engine retired | 1 d | multi-seed ≥ 47/51 + census | adherence regression |
 | E3 | Canvas shrink at tail | MLX parity, small tail win | 1 d | multi-seed gate | quality regression |
-| E4 | q8 KV @ 100k | q8 wins where DRAM-bound | 0.5 d | ≥ 15% denoise win at 100k | loses again → close table |
+| E4 | q8 KV @ 100k | ~~q8 wins where DRAM-bound~~ **CLOSED 2026-07-07**: sign flips but only −6% denoise at 105k (still SLC-served/issue-bound, ~580 GB/s effective) | done | < 15% → no default change; q8 = memory lever, +6% bonus at 100k+ | hit: table closed |
 | E5 | Fragment-tile attention | ≥ 1.5× at kv 32k | 1 d timebox | bench row, then full gate | < 1.5× on bench |
 | E6 | seed-123 artifact root-cause | stop-token trim on eos-first canvas | 2 d | aggregate > 47/51 | — (must diagnose even if fix deferred) |
 | E7 | confidence-threshold sampler | parity feature, maybe faster stops | 1 d | gate neutral | worse convergence |

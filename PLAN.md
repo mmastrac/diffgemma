@@ -51,9 +51,13 @@ KV 2.4 GiB)**. Flash-decode sequential blocking was built (bit-identical,
 `DGQ_ATTN_KV_BLOCK`) and DISPROVEN — the lockstep threadgroup sweep already
 gets SLC service (171 > 150 GB/s DRAM at 32k); default off. q8 KV was then also built
 (group-32, quality-neutral, halves KV memory, `DGQ_KV_Q8` opt-in) and
-DISPROVEN as a speed lever too: +9% prefill / +54% denoise at 33k — the
+DISPROVEN as a speed lever at ≤33k: +9% prefill / +54% denoise — the
 f16 direct-load kernels are ISSUE-bound at SLC speed, not byte-starved,
 which rules out TurboQuant-class low-bit KV for speed by the same physics.
+E4 (ROADMAP 2.4) settled the last cell 2026-07-07: at kv=105k the sign
+flips but only to −6% denoise (still SLC-served, ~580 GB/s effective) —
+under the 15% adaptive gate, so f16 stays the default at every length;
+q8 is the KV MEMORY lever (+6% bonus past 100k). q8 105k needle exact.
 Batched multi-chunk prefill SHIPPED
 (bit-identical, `DGQ_PREFILL_BATCH`): 4x256 causal sub-chunks as one M=1024
 forward — 33k prefill 165.7→142.4s (−14%). The weight-stationary expert
