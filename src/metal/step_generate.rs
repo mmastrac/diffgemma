@@ -444,6 +444,16 @@ pub fn generate_with_session(
         };
         let mut empty_retry_attempt = 0u32;
         let (st, block_step_count, accept_hist, min_entropy_hist, mean_entropy_hist, low_ent_hist) = 'attempt: loop {
+            // Shrink-on-retry (E3/E6): attempt 0 uses the full canvas (handles
+            // long answers); each degenerate retry narrows it (256→128→64),
+            // where the empty/ceremony attractor is far weaker (72%→3% by width).
+            let attempt_canvas = match empty_retry_attempt {
+                0 => CANVAS,
+                1 => 128,
+                _ => 64,
+            };
+            rt.set_active_canvas(attempt_canvas);
+            let active = rt.active_canvas();
             let mut block_step_count = 0u32;
             let mut accept_hist = Vec::new();
             let mut min_entropy_hist = Vec::new();
@@ -486,17 +496,21 @@ pub fn generate_with_session(
                         st.step >= 1
                     );
                 }
-                let stats = step_entropy_stats(&st.entropy, &st.accept);
+                // Slice canvas stats/argmax to the ACTIVE rows — stale rows
+                // [active..CANVAS) hold reset sentinels (u32::MAX / 0) that would
+                // skew stats and (on decode) corrupt the reply.
+                let stats = step_entropy_stats(&st.entropy[..active], &st.accept[..active]);
                 accept_hist.push(stats.accept_count);
                 min_entropy_hist.push(stats.min_entropy);
                 mean_entropy_hist.push(st.mean_entropy);
                 low_ent_hist.push(stats.low_entropy_positions);
                 let max_steps_reached = st.step >= max_steps as u32;
                 let params = rt.read_params();
-                let region_end = crate::sample::answer_region_end(&st.ids, params.eos_token_id);
+                let region_end =
+                    crate::sample::answer_region_end(&st.ids[..active], params.eos_token_id);
                 let (full_diff, prefix_diff, prefix_stable_streak) = match prev_step_argmax {
                     Some(prev) => {
-                        let full = crate::sample::count_argmax_diff(&st.prev_argmax, &prev, CANVAS);
+                        let full = crate::sample::count_argmax_diff(&st.prev_argmax, &prev, active);
                         let prefix =
                             crate::sample::count_argmax_diff(&st.prev_argmax, &prev, region_end);
                         let streak = if prefix == 0 {
@@ -631,7 +645,7 @@ pub fn generate_with_session(
             let degenerate = cfg
                 .degenerate_reply_check
                 .as_ref()
-                .is_some_and(|check| check(&st.prev_argmax));
+                .is_some_and(|check| check(&st.prev_argmax[..active]));
             if empty_retry_attempt < empty_retry_max && degenerate {
                 empty_retry_attempt += 1;
                 if progress_enabled() {
@@ -709,7 +723,12 @@ pub fn generate_with_session(
             );
         }
 
-        let argmax_tokens: Vec<u32> = st.prev_argmax.to_vec();
+        // The committed block is only the ACTIVE canvas rows (shrink-on-retry
+        // narrows a degenerate first block); rows [active..CANVAS) are stale
+        // sentinels. `rt.active_canvas()` after the loop is the successful
+        // attempt's width (no set_active_canvas ran after its break).
+        let committed_canvas = rt.active_canvas();
+        let argmax_tokens: Vec<u32> = st.prev_argmax[..committed_canvas].to_vec();
         let block_base = sequences.len();
         sequences.extend_from_slice(&argmax_tokens);
         blocks_committed += 1;

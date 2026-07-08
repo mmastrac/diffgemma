@@ -96,6 +96,21 @@ pub fn empty_reply_retry() -> u32 {
     })
 }
 
+/// TEST override for the denoise canvas width (E3/E6 shrink machinery). When
+/// set (`DGQ_FORCE_CANVAS=64|128|...`), every denoise step runs at this active
+/// canvas width instead of 256 — used to validate the `active_canvas` plumbing
+/// and measure the width→degeneracy curve on our engine. `None` = normal (256).
+/// Clamped to [1, CANVAS] at the use site. Diagnostic only; not a product flag.
+pub fn force_canvas() -> Option<u32> {
+    static V: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DGQ_FORCE_CANVAS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&w| w >= 1)
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Production perf toggles (all default ON, opt-out for A/B triage)
 // ---------------------------------------------------------------------------

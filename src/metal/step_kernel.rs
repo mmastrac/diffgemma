@@ -1408,6 +1408,12 @@ struct StepEnc<'a> {
     /// stage (embed, norms, QKV/o_proj/FFN GEMMs, router, MoE) dispatches at
     /// this M; attention + rope/KV-write stay per-CANVAS-sub-chunk.
     forward_m: usize,
+    /// Active canvas width for a DENOISE step (E3/E6 shrink-on-retry): the
+    /// number of canvas rows actually denoised, `CANVAS` (256) normally, less
+    /// on a narrowed retry. Drives the denoise-only width sites (attention
+    /// seq-len + grid, SC softembed, lm_head, sampler) and `forward_m`. Stays
+    /// `CANVAS` for prefill chunks/super-chunks (their sub width is 256).
+    active_canvas: usize,
     /// Current sub-chunk (0..PREFILL_SUBS) for the per-sub attention/rope
     /// dispatches of a super-chunk: arena rows offset by sub_c*CANVAS and
     /// StepParams come from the params_sub slot (kv_len differs per sub).
@@ -3311,7 +3317,7 @@ impl StepEnc<'_> {
         self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 5);
         self.bind_params(6);
         let attn_dims = crate::kernels::sub::qk_rope_kv::AttnDims {
-            canvas: CANVAS as u32,
+            canvas: self.active_canvas as u32,
             n_q_heads: STEP_NQ_HEADS as u32,
             causal: 0,
             window: 0, // KV write only; the window applies at attention read time
@@ -3319,7 +3325,7 @@ impl StepEnc<'_> {
         self.sink_set_bytes(&attn_dims, 7);
         self.bind_debug_status(8);
         let grid = MTLSize {
-            width: CANVAS,
+            width: self.active_canvas,
             height: qk_y,
             depth: 1,
         };
@@ -3388,7 +3394,7 @@ impl StepEnc<'_> {
             0
         };
         let attn_dims = crate::kernels::sub::qk_rope_kv::AttnDims {
-            canvas: CANVAS as u32,
+            canvas: self.active_canvas as u32,
             n_q_heads: STEP_NQ_HEADS as u32,
             causal: u32::from(self.prefill_causal),
             window,
@@ -3406,7 +3412,9 @@ impl StepEnc<'_> {
         // simdgroups sharing K/V; (group/QG) sub-groups along z.
         let grid = if use_mma2 {
             MTLSize {
-                width: CANVAS.div_ceil(crate::kernels::sub::attention::MMA_M_TILE),
+                width: self
+                    .active_canvas
+                    .div_ceil(crate::kernels::sub::attention::MMA_M_TILE),
                 height: l.n_kv_heads as usize,
                 depth: 1,
             }
@@ -3415,13 +3423,15 @@ impl StepEnc<'_> {
             // One tg per (query tile, kv head, Q head); the QG simdgroups
             // split head_dim, so depth is the full GQA group.
             MTLSize {
-                width: CANVAS.div_ceil(crate::kernels::sub::attention::MMA_M_TILE),
+                width: self
+                    .active_canvas
+                    .div_ceil(crate::kernels::sub::attention::MMA_M_TILE),
                 height: l.n_kv_heads as usize,
                 depth: group,
             }
         } else {
             MTLSize {
-                width: CANVAS,
+                width: self.active_canvas,
                 height: 16,
                 depth: 1,
             }
@@ -3444,7 +3454,7 @@ impl StepEnc<'_> {
             // the same <=block key window (SLC-served instead of
             // DRAM-thrashed; the 256-consumer redundancy made the kernel
             // DRAM-bound past ~8k keys).
-            let t_total = self.dispatch_kv_len() as usize + CANVAS;
+            let t_total = self.dispatch_kv_len() as usize + self.active_canvas;
             let block = crate::flags::attn_kv_block();
             let blocks = if block > 0 && t_total > block {
                 t_total.div_ceil(block)
@@ -3998,7 +4008,12 @@ impl StepEnc<'_> {
 
     fn encode_step_sampler(&mut self, _layout: &ModelLayout) -> Result<(), Error> {
         let cols = VOCAB as u32;
-        let canvas = CANVAS as u32;
+        // Active denoise width (E3/E6 shrink-on-retry): the sampler stats
+        // (mean-entropy, canvas-stable, accept-plateau) that drive early-stop
+        // must cover exactly the active rows — stale rows [active..CANVAS) would
+        // corrupt convergence. rowstats/apply run one threadgroup per row;
+        // commit/write loop over `canvas` internally.
+        let canvas = self.active_canvas as u32;
         let pad = crate::sample::PAD_TOKEN_ID;
         let filler = crate::sample::FILLER_TOKEN_ID;
 
@@ -4014,7 +4029,7 @@ impl StepEnc<'_> {
         self.sink_set_bytes(&eos, 7);
         self.bind_debug_status(8);
         let grid = MTLSize {
-            width: CANVAS,
+            width: self.active_canvas,
             height: 1,
             depth: 1,
         };
@@ -4056,7 +4071,7 @@ impl StepEnc<'_> {
         self.sink_set_bytes(&cols, 4);
         self.bind_debug_status(5);
         let grid = MTLSize {
-            width: CANVAS,
+            width: self.active_canvas,
             height: 1,
             depth: 1,
         };
@@ -4429,6 +4444,10 @@ pub struct StepRuntime {
     /// denoise block writes a CANVAS-wide canvas at [kv_len..kv_len+CANVAS], so
     /// kv_len + CANVAS must never exceed this — checked in `set_kv_len`.
     max_seq: usize,
+    /// Active canvas width for the NEXT denoise step (E3/E6 shrink-on-retry).
+    /// `CANVAS` (256) normally; the block loop narrows it (128/64) when re-
+    /// rolling a degenerate reply. Clamped to [1, CANVAS].
+    active_canvas: usize,
 }
 
 impl StepRuntime {
@@ -4579,6 +4598,22 @@ impl StepRuntime {
     }
 
     /// New denoise block: fresh random canvas, reset step/stop, patch sampler params.
+    /// Active denoise canvas width for subsequent steps (E3/E6 shrink-on-retry).
+    /// Clamped to [1, CANVAS]. A `DGQ_FORCE_CANVAS` override still wins at the
+    /// dispatch site. The block loop reads it back via `active_canvas()`.
+    pub fn set_active_canvas(&mut self, w: usize) {
+        self.active_canvas = w.clamp(1, CANVAS);
+    }
+
+    /// Effective active canvas width (the `DGQ_FORCE_CANVAS` test override, else
+    /// the value set by `set_active_canvas`). The CPU block loop slices canvas
+    /// stats/trim to this many rows.
+    pub fn active_canvas(&self) -> usize {
+        crate::flags::force_canvas()
+            .map(|w| (w as usize).clamp(1, CANVAS))
+            .unwrap_or(self.active_canvas)
+    }
+
     pub fn reset_block(&mut self, vocab: usize, rng: &mut Rng, params: StepParams) {
         let mut state = init_canvas_state_from_rng(vocab, rng);
         state.step = 0;
@@ -4667,6 +4702,7 @@ impl StepRuntime {
             embed_bf16: self.embed_bf16,
             prefill_causal: false,
             forward_m: CANVAS,
+            active_canvas: CANVAS,
             sub_c: 0,
             use_params_sub: false,
             sliding_window: self.text_config.sliding_window as u32,
@@ -5002,8 +5038,20 @@ impl StepRuntime {
         }
         let first_step = if st_before.step == 0 { 1u32 } else { 0u32 };
         let partial_lm_m = partial_lm_active_rows(&st_before);
+        // Denoise (Full) may run a narrowed canvas (E3/E6 shrink-on-retry);
+        // ForwardOnly (prefill/dump) always uses the full CANVAS sub width.
+        let active_canvas = if finish == StepFinishMode::Full {
+            crate::flags::force_canvas()
+                .map(|w| (w as usize).clamp(1, CANVAS))
+                .unwrap_or(self.active_canvas)
+                .clamp(1, CANVAS)
+        } else {
+            CANVAS
+        };
         self.dispatch_and_wait(|enc| {
             enc.partial_lm_m = partial_lm_m;
+            enc.active_canvas = active_canvas;
+            enc.forward_m = active_canvas;
             enc.interpret_step(&layout, layers, first_step, finish)
         })?;
         self.check_debug_status()
@@ -5310,6 +5358,7 @@ pub fn build_step_runtime(
         tensor_offsets: offsets,
         layers,
         max_seq: cfg.max_seq,
+        active_canvas: CANVAS,
     };
     if crate::flags::progress_enabled() {
         if rt.embed_bf16 && sc_sparse_enabled() {
