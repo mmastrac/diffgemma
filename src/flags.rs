@@ -298,6 +298,57 @@ pub fn kv_format(max_seq: usize) -> crate::kernels::sub::kv_quant::KvFormat {
     }
 }
 
+// Resident-memory model for the q4emb checkpoint (measured 2026-07-07; see
+// `kv_format`): resident ≈ 19.73 GiB weights+arena + KV linear in tokens.
+const CTX_BASE_BYTES: f64 = 19.73 * 1024.0 * 1024.0 * 1024.0;
+const CTX_F16_KV_PER_TOKEN: f64 = 19.0 * 1024.0;
+/// q8 KV (half) auto-enables once f16 resident exceeds this fraction of budget
+/// — matches the `kv_format` auto policy so the guard mirrors the engine.
+const CTX_Q8_AUTO_FRACTION: f64 = 0.85;
+/// Safe resident ceiling fraction of the budget: past this Metal swaps / the
+/// KV alloc fails.
+pub const CTX_SAFE_FRACTION: f64 = 0.90;
+
+/// Estimated GPU-resident bytes at `max_seq`, mirroring what the engine will
+/// actually allocate: q8 KV (≈half) auto-enables once the f16 resident would
+/// exceed `CTX_Q8_AUTO_FRACTION` of `budget_bytes` (the same policy as
+/// `kv_format`, but budget-driven so it works before the Metal device — and
+/// thus the runtime cap — exists). `DGQ_KV_Q8=0` forces f16.
+pub fn estimate_resident_bytes(max_seq: usize, budget_bytes: u64) -> u64 {
+    let f16 = CTX_BASE_BYTES + CTX_F16_KV_PER_TOKEN * max_seq as f64;
+    let force_f16 = matches!(std::env::var("DGQ_KV_Q8").as_deref(), Ok("0"));
+    let q8 = !force_f16 && budget_bytes > 0 && f16 > CTX_Q8_AUTO_FRACTION * budget_bytes as f64;
+    let per_tok = if q8 {
+        CTX_F16_KV_PER_TOKEN * 0.5
+    } else {
+        CTX_F16_KV_PER_TOKEN
+    };
+    (CTX_BASE_BYTES + per_tok * max_seq as f64) as u64
+}
+
+/// Guard for a user-requested context length: `Some((needed, ceiling))` bytes
+/// when the estimated resident at `max_seq` would exceed `CTX_SAFE_FRACTION` of
+/// `budget_bytes` (past which Metal swaps / the KV alloc fails). `None` = fits,
+/// or `budget_bytes == 0` (unknown). Caller supplies the budget (working-set
+/// cap or physical-RAM proxy) so this stays usable before the device exists.
+pub fn ctx_over_budget(max_seq: usize, budget_bytes: u64) -> Option<(u64, u64)> {
+    if budget_bytes == 0 {
+        return None;
+    }
+    let ceiling = (CTX_SAFE_FRACTION * budget_bytes as f64) as u64;
+    let needed = estimate_resident_bytes(max_seq, budget_bytes);
+    (needed > ceiling).then_some((needed, ceiling))
+}
+
+/// Largest `--ctx` (max_seq) whose estimate stays under the safe ceiling, for
+/// the "reduce to <= N" hint. At the ceiling ctx is large, so q8 KV is
+/// auto-selected — consistent with `estimate_resident_bytes` there. 0 when the
+/// budget can't even hold the base weights.
+pub fn max_feasible_ctx(budget_bytes: u64) -> usize {
+    let headroom = CTX_SAFE_FRACTION * budget_bytes as f64 - CTX_BASE_BYTES;
+    (headroom / (CTX_F16_KV_PER_TOKEN * 0.5)).max(0.0) as usize
+}
+
 /// KV block size for sequential-block full-attention (`DGQ_ATTN_KV_BLOCK=
 /// <keys>`; DEFAULT 0 = OFF). When on and kv_len+canvas exceeds the block,
 /// full-attention layers run as in-order dispatches over block-sized key
@@ -502,4 +553,35 @@ pub fn prefill_profile_enabled() -> bool {
 /// Extra step-parity diagnostics (argmax agreement) (`DGQ_PARITY_DEBUG=1`).
 pub fn parity_debug_enabled() -> bool {
     std::env::var_os("DGQ_PARITY_DEBUG").is_some()
+}
+
+#[cfg(test)]
+mod ctx_budget_tests {
+    use super::*;
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn unknown_budget_never_trips() {
+        assert!(ctx_over_budget(1_000_000, 0).is_none());
+    }
+
+    #[test]
+    fn small_ctx_fits_large_ctx_refused_on_36gib() {
+        let budget = 26 * GIB; // ~72% of a 36 GiB machine
+        assert!(ctx_over_budget(8_192, budget).is_none(), "8k must fit");
+        assert!(
+            ctx_over_budget(900_000, budget).is_some(),
+            "900k must be refused"
+        );
+    }
+
+    #[test]
+    fn max_feasible_is_a_real_boundary() {
+        let budget = 26 * GIB;
+        let n = max_feasible_ctx(budget);
+        assert!(n > 0);
+        // At the reported max it fits; just past it, it's refused.
+        assert!(ctx_over_budget(n.saturating_sub(1024), budget).is_none());
+        assert!(ctx_over_budget(n + 50_000, budget).is_some());
+    }
 }

@@ -24,7 +24,7 @@ mod kv_cache;
 mod linear;
 mod lm_head;
 mod memory;
-mod memwatch;
+pub mod memwatch;
 mod moe;
 mod pipeline_cache;
 mod probe;

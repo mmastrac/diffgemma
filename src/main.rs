@@ -3985,6 +3985,27 @@ fn run_chat_cmd(
     // the caller raises it above the default, becomes an optional hard ceiling.
     #[allow(non_snake_case)]
     let CHAT_MAX_SEQ: usize = ctx.unwrap_or(8192);
+    // Fail-fast --ctx budget guard: on Apple Silicon the GPU working-set cap is
+    // ~72% of physical RAM; a --ctx whose weights+KV would push resident past
+    // the safe ceiling swaps or fails to allocate. Refuse with an actionable
+    // hint instead of crashing mid-prefill.
+    {
+        let phys = crate::metal::memwatch::physical_ram_bytes();
+        let budget = (phys as f64 * 0.72) as u64;
+        if let Some((needed, ceiling)) = flags::ctx_over_budget(CHAT_MAX_SEQ, budget) {
+            let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+            eprintln!(
+                "error: --ctx {CHAT_MAX_SEQ} needs ~{:.1} GiB GPU-resident (weights + KV), over \
+                 the ~{:.1} GiB safe budget on this {:.0} GiB machine — it would swap or fail to \
+                 allocate. Reduce --ctx to <= {} (or free RAM).",
+                gib(needed),
+                gib(ceiling),
+                gib(phys),
+                flags::max_feasible_ctx(budget),
+            );
+            return ExitCode::FAILURE;
+        }
+    }
     let explicit_cap = if max_new_tokens > 256 {
         Some(max_new_tokens)
     } else {

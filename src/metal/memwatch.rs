@@ -62,6 +62,12 @@ fn swap_used_bytes() -> u64 {
         .unwrap_or(0)
 }
 
+/// Total physical RAM (`hw.memsize`), for the fail-fast `--ctx` budget guard
+/// before a Metal device exists. 0 if unavailable.
+pub fn physical_ram_bytes() -> u64 {
+    sysctl_read::<u64>(c"hw.memsize").unwrap_or(0)
+}
+
 /// 1 = normal, 2 = warn, 4 = critical (0 if unreadable).
 fn pressure_level() -> u32 {
     sysctl_read::<u32>(c"kern.memorystatus_vm_pressure_level").unwrap_or(0)
