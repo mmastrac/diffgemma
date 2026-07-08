@@ -243,6 +243,23 @@ pub fn kv_reuse_enabled() -> bool {
     on_unless_zero("DGQ_KV_REUSE")
 }
 
+/// `DGQ_KV_MMAP=1`: back the session KV cache with a `MAP_SHARED` temp-file mmap
+/// (wrapped no-copy as the Metal buffer) instead of anonymous device memory, so
+/// under memory pressure dirty KV pages evict to that file rather than to the
+/// anonymous compressor/swap — gentler at the very-long-context / co-tenant
+/// cliff. Opt-in experiment. Default OFF (anonymous StorageModeShared).
+pub fn kv_mmap() -> bool {
+    on_if_one("DGQ_KV_MMAP")
+}
+
+/// Directory for the `DGQ_KV_MMAP` backing file. Defaults to the system temp
+/// dir; override for a specific (e.g. faster/roomier) volume.
+pub fn kv_mmap_dir() -> std::path::PathBuf {
+    std::env::var_os("DGQ_KV_MMAP_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
 /// GPU working-set cap (Metal `recommendedMaxWorkingSetSize`), captured once
 /// at MetalContext init so the pure `kv_q8` policy can scale to the device's
 /// RAM. 0 (unset, e.g. CPU-only tests) → the q8 auto-policy stays off.

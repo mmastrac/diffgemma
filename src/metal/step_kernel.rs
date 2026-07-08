@@ -1322,6 +1322,11 @@ pub(crate) struct StepBuffers {
     params: Retained<ProtocolObject<dyn MTLBuffer>>,
     arena: Retained<ProtocolObject<dyn MTLBuffer>>,
     kvcache: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// Keepalive for `DGQ_KV_MMAP`: the file-backed mapping `kvcache` wraps
+    /// no-copy. Declared right after `kvcache` so it drops *after* it (the Metal
+    /// buffer must be released before the mapping is torn down). `None` = the
+    /// default anonymous `StorageModeShared` allocation.
+    _kv_mmap: Option<KvMmapBacking>,
     state: Retained<ProtocolObject<dyn MTLBuffer>>,
     logits: Retained<ProtocolObject<dyn MTLBuffer>>,
     sc_probs: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -4188,6 +4193,71 @@ fn alloc_buffer(
         .ok_or(Error::Format("Metal buffer alloc failed"))
 }
 
+/// Keepalive + auto-cleanup for a `DGQ_KV_MMAP` file-backed KV buffer. Holds the
+/// mapping the Metal buffer wraps no-copy; removes the backing file on drop.
+struct KvMmapBacking {
+    mmap: memmap2::MmapMut,
+    path: std::path::PathBuf,
+}
+
+impl Drop for KvMmapBacking {
+    fn drop(&mut self) {
+        // Best-effort: unlink the backing file. The mapping (`mmap`, dropped
+        // after this) stays valid through the unlink on macOS.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Allocate the session KV buffer. Default: anonymous `StorageModeShared`. With
+/// `DGQ_KV_MMAP`: a `MAP_SHARED` temp-file mapping wrapped no-copy as the Metal
+/// buffer (same mechanism as the read-only `.dgq` weight blob), so under memory
+/// pressure dirty KV pages evict to that file rather than to anonymous swap.
+fn alloc_kv_buffer(
+    device: &ProtocolObject<dyn MTLDevice>,
+    bytes: usize,
+) -> Result<
+    (
+        Retained<ProtocolObject<dyn MTLBuffer>>,
+        Option<KvMmapBacking>,
+    ),
+    Error,
+> {
+    if !crate::flags::kv_mmap() {
+        return Ok((alloc_buffer(device, bytes)?, None));
+    }
+    // `newBufferWithBytesNoCopy` requires a page-aligned pointer (mmap gives
+    // this) and length. Round up to the Apple-Silicon 16 KiB page.
+    const PAGE: usize = 16 * 1024;
+    let len = bytes.div_ceil(PAGE) * PAGE;
+    let path = crate::flags::kv_mmap_dir().join(format!("dgq-kv-{}.bin", std::process::id()));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)?;
+    file.set_len(len as u64)?;
+    let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file)? };
+    let ptr = std::ptr::NonNull::new(mmap.as_mut_ptr() as *mut std::ffi::c_void)
+        .ok_or(Error::Format("kv mmap null pointer"))?;
+    let buffer = unsafe {
+        device
+            .newBufferWithBytesNoCopy_length_options_deallocator(
+                ptr,
+                len,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            )
+            .ok_or(Error::Format("kv mmap buffer alloc failed"))?
+    };
+    eprintln!(
+        "kv cache: mmap-backed ({:.2} GiB) at {}",
+        len as f64 / 1_073_741_824.0,
+        path.display()
+    );
+    Ok((buffer, Some(KvMmapBacking { mmap, path })))
+}
+
 fn write_struct<T>(buf: &ProtocolObject<dyn MTLBuffer>, val: &T) {
     unsafe {
         std::ptr::copy_nonoverlapping(
@@ -5241,6 +5311,10 @@ pub fn build_step_runtime(
     )?;
 
     let arena_map = step_arena_layout();
+    // KV cache: optionally file-backed (DGQ_KV_MMAP) so dirty pages evict to a
+    // real file instead of anonymous swap. `kv_mmap_backing` must outlive
+    // `kvcache` — it is declared after it in `StepBuffers` so it drops later.
+    let (kvcache, kv_mmap_backing) = alloc_kv_buffer(&ctx.device, kv_bytes)?;
     let bufs = StepBuffers {
         blob: gpu_blob.buffer.clone(),
         blob_experts: {
@@ -5259,7 +5333,8 @@ pub fn build_step_runtime(
             b
         },
         arena: alloc_buffer(&ctx.device, arena_map.bytes() as usize)?,
-        kvcache: alloc_buffer(&ctx.device, kv_bytes)?,
+        kvcache,
+        _kv_mmap: kv_mmap_backing,
         state: {
             let b = alloc_buffer(&ctx.device, std::mem::size_of::<CanvasState>())?;
             write_struct(&b, &state);
