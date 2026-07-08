@@ -4082,11 +4082,16 @@ fn run_chat_cmd(
         let prompt_len = prompt.len();
         // KV arena is fixed at session open (CHAT_MAX_SEQ); the reply may use
         // the whole remaining context (no artificial cap), or the caller's
-        // explicit ceiling if one was given.
-        let budget = CHAT_MAX_SEQ.saturating_sub(prompt_len);
+        // explicit ceiling if one was given. Reserve one CANVAS block: each
+        // denoise block writes a CANVAS-wide canvas at [kv_len..kv_len+CANVAS],
+        // so kv_len + CANVAS must stay within max_seq — this keeps the
+        // `set_kv_len` overflow assert unreachable from a near-full context.
+        let budget = CHAT_MAX_SEQ.saturating_sub(prompt_len + metal::CANVAS);
         if budget == 0 {
             if !json {
-                println!("model> (prompt fills the {CHAT_MAX_SEQ}-token context; cannot generate)");
+                println!(
+                    "model> (prompt leaves no room for a reply within the {CHAT_MAX_SEQ}-token context; cannot generate)"
+                );
             }
             history.push(chat_template::ChatTurn::model(String::new()));
             *turn_idx = turn_idx.wrapping_add(1);
