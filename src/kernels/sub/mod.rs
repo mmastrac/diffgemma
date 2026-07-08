@@ -73,7 +73,6 @@ pub mod variant;
 pub mod vec_add_inplace;
 pub mod vec_fill_zero;
 pub mod vec_scale_inplace;
-pub mod weight_rot_probe;
 
 pub use manifest::SwigluSplitVariant;
 pub use variant::{KernelVariant, QuantFormat};

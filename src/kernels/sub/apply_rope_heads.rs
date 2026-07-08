@@ -267,27 +267,7 @@ mod tests {
         run_matrix(k_offset_fixture, 1e-5);
     }
 
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    #[test]
-    fn gpu_tiny() {
-        run_matrix(tiny_fixture, 1e-5);
-    }
-
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    #[test]
-    fn gpu_sliding_prefill() {
-        run_matrix(sliding_prefill_fixture, 1e-5);
-    }
-
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    #[test]
-    fn gpu_full_partial() {
-        run_matrix(full_partial_fixture, 1e-5);
-    }
-
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    #[test]
-    fn gpu_k_offset() {
-        run_matrix(k_offset_fixture, 1e-5);
-    }
+    // (GPU twins removed — `run_matrix` already exercises the GPU path under
+    // #[cfg(metal)] from the cpu_* tests above; the gpu_* copies were byte-
+    // identical duplicates.)
 }

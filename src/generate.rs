@@ -622,66 +622,6 @@ mod gpu_determinism {
         assert_eq!(unique.len(), 1, "3-layer drift: {unique:?}");
     }
 
-    #[test]
-    #[ignore = "3-layer stack drift survey; use dgq_drift_survey_three_layers"]
-    fn dgq_drift_survey() {
-        let Some(dgq_dir) = dgq_fixture_dir() else {
-            eprintln!("skip: /tmp/quantized-weights missing");
-            return;
-        };
-        let store = WeightStore::open(&dgq_dir).expect("open");
-        let cfg = crate::config::ModelConfig::load(&dgq_dir).expect("cfg");
-        let canvas = cfg.canvas_length;
-        let vocab = cfg.text_config.vocab_size;
-        let max_kv = DGQ_HELLO_PROMPT.len() + 256;
-
-        let mut argmax_samples = Vec::new();
-        for trial in 0..8 {
-            let mut weights =
-                load_weight_cache(&store, &cfg.text_config, canvas, max_kv).expect("cache");
-            let mut engine = GpuDecoderEngine::new().expect("engine");
-            let mut enc = EncoderScratch::new(canvas.max(1), &cfg);
-            let mut dec = GpuDecoderScratch::new(canvas, &cfg);
-            let (kv, canvas_tokens) = prefill_and_canvas(
-                &store,
-                &cfg,
-                &mut weights,
-                &mut engine,
-                &mut enc,
-                &mut dec,
-                max_kv,
-            )
-            .expect("prefill");
-            let logits = forward_logits_once(
-                &store,
-                &cfg,
-                &weights,
-                &mut engine,
-                &mut dec,
-                &canvas_tokens,
-                &kv,
-                DGQ_MAX_LAYERS,
-            )
-            .expect("forward");
-            let nan_n = logits.iter().filter(|v| v.is_nan()).count();
-            let argmax = argmax_canvas(&logits, canvas, vocab);
-            eprintln!(
-                "trial {trial}: nan={nan_n} canvas[0..3]={:?} pos1_argmax={} logit0={}",
-                &canvas_tokens[0..3],
-                argmax[1],
-                logits[0]
-            );
-            argmax_samples.push(argmax[1]);
-        }
-        let unique: std::collections::HashSet<_> = argmax_samples.iter().copied().collect();
-        eprintln!("unique pos1 argmax values in 8 trials: {}", unique.len());
-        assert_eq!(
-            unique.len(),
-            1,
-            "expected deterministic pos1 argmax, got {unique:?}"
-        );
-    }
-
     /// Full prefill + forward repeated in-process (reused engine pool).
     #[test]
     fn dgq_forward_logits_repeatable_with_reused_engine() {

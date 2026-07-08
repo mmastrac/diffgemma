@@ -500,46 +500,4 @@ mod tests {
     fn cpu_sliding_tight() {
         run_matrix(sliding_tight_fixture, 1e-4);
     }
-
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    #[test]
-    fn gpu_tiny() {
-        run_matrix(tiny_fixture, 1e-4);
-    }
-
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    #[test]
-    fn gpu_sliding_prefill() {
-        run_matrix(sliding_prefill_fixture, 1e-4);
-    }
-
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    #[test]
-    fn gpu_encoder_extend() {
-        run_matrix(encoder_extend_fixture, 1e-4);
-    }
-
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    #[test]
-    fn gpu_full_layer() {
-        run_matrix(full_layer_fixture, 1e-4);
-    }
-
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    #[test]
-    fn gpu_decoder_bitmap() {
-        run_matrix(decoder_bitmap_fixture, 1e-4);
-    }
-
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    #[test]
-    fn gpu_sparse_decoder_bitmap() {
-        run_matrix(sparse_decoder_bitmap_fixture, 1e-4);
-    }
-
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    #[test]
-    fn gpu_sliding_tight() {
-        run_matrix(sliding_tight_fixture, 1e-4);
-    }
 }
