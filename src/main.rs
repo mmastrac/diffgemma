@@ -3855,6 +3855,30 @@ fn run_tokenize(model_dir: &PathBuf, text: &str, raw_prompt: bool) -> ExitCode {
     }
 }
 
+/// Fail-fast context-budget check (panic-to-error, ROADMAP 3.2): `Err(msg)`
+/// when the weights + KV at `max_seq` would exceed the safe fraction of the GPU
+/// working-set (estimated from physical RAM, ~72% on Apple Silicon), which
+/// swaps or fails the KV allocation. Shared by `chat` (`--ctx`) and `ask`
+/// (max_seq sized from the prompt + `--max-new-tokens`). Returns `Ok` when the
+/// budget can't be determined (no device query) so it never blocks small runs.
+fn check_ctx_budget(max_seq: usize) -> Result<(), String> {
+    let phys = crate::metal::memwatch::physical_ram_bytes();
+    let budget = (phys as f64 * 0.72) as u64;
+    if let Some((needed, ceiling)) = flags::ctx_over_budget(max_seq, budget) {
+        let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+        return Err(format!(
+            "context {max_seq} needs ~{:.1} GiB GPU-resident (weights + KV), over the ~{:.1} GiB \
+             safe budget on this {:.0} GiB machine — it would swap or fail to allocate. Reduce the \
+             prompt / --max-new-tokens / --ctx to <= {} (or free RAM).",
+            gib(needed),
+            gib(ceiling),
+            gib(phys),
+            flags::max_feasible_ctx(budget),
+        ));
+    }
+    Ok(())
+}
+
 fn build_prompt_tokens(
     model_dir: &std::path::Path,
     prompt_text: Option<&str>,
@@ -3985,26 +4009,11 @@ fn run_chat_cmd(
     // the caller raises it above the default, becomes an optional hard ceiling.
     #[allow(non_snake_case)]
     let CHAT_MAX_SEQ: usize = ctx.unwrap_or(8192);
-    // Fail-fast --ctx budget guard: on Apple Silicon the GPU working-set cap is
-    // ~72% of physical RAM; a --ctx whose weights+KV would push resident past
-    // the safe ceiling swaps or fails to allocate. Refuse with an actionable
-    // hint instead of crashing mid-prefill.
-    {
-        let phys = crate::metal::memwatch::physical_ram_bytes();
-        let budget = (phys as f64 * 0.72) as u64;
-        if let Some((needed, ceiling)) = flags::ctx_over_budget(CHAT_MAX_SEQ, budget) {
-            let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
-            eprintln!(
-                "error: --ctx {CHAT_MAX_SEQ} needs ~{:.1} GiB GPU-resident (weights + KV), over \
-                 the ~{:.1} GiB safe budget on this {:.0} GiB machine — it would swap or fail to \
-                 allocate. Reduce --ctx to <= {} (or free RAM).",
-                gib(needed),
-                gib(ceiling),
-                gib(phys),
-                flags::max_feasible_ctx(budget),
-            );
-            return ExitCode::FAILURE;
-        }
+    // Fail-fast --ctx budget guard: refuse a context whose weights+KV would
+    // swap / fail to allocate, before loading the model (see check_ctx_budget).
+    if let Err(msg) = check_ctx_budget(CHAT_MAX_SEQ) {
+        eprintln!("error: {msg}");
+        return ExitCode::FAILURE;
     }
     let explicit_cap = if max_new_tokens > 256 {
         Some(max_new_tokens)
@@ -4677,6 +4686,12 @@ fn run_generate_monolithic_cmd(
     // KV region for prompts >256 tokens (kv_len+256 > max_seq), corrupting attention
     // into word-salad. See run_chat_cmd's roomy CHAT_MAX_SEQ for the same reasoning.
     let max_seq = (prompt_len + max_new_tokens + metal::CANVAS).max(512);
+    // A large prompt / --max-new-tokens sizes max_seq up; refuse configs whose
+    // KV cache would swap or fail to allocate, before loading 19 GiB of weights.
+    if let Err(msg) = check_ctx_budget(max_seq) {
+        eprintln!("error: {msg}");
+        return ExitCode::FAILURE;
+    }
 
     let layers = match resolve_model_layers(model_dir, max_layers) {
         Ok(n) => n,
