@@ -21,7 +21,7 @@ pub fn tuned_source(bm: usize, bn: usize) -> String {
     format!("#define TUNE_BM {bm}\n#define TUNE_BN {bn}\n{SHADER}")
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_for(
     ctx: &crate::metal::device::MetalContext,
     n: u32,
@@ -40,7 +40,7 @@ pub fn pipeline_for(
 }
 
 /// Logits variant: forces bf16 output (FC29) — lm_head.
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_for_logits(
     ctx: &crate::metal::device::MetalContext,
     n: u32,
@@ -55,7 +55,7 @@ pub const ENTRY_STACKED: &str = "gemm_tunable_stacked";
 /// Stacked variant (segment table FC12-27, same contract as
 /// gemm_block_stacked): qkv + dense gate/up fused dispatches. Cached per
 /// (n, k, format, segment table) like the legacy stacked pipeline.
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn stacked_pipeline_for(
     ctx: &crate::metal::device::MetalContext,
     n: u32,
@@ -104,7 +104,7 @@ pub const ENTRY_SPARSE: &str = "gemm_tunable_sparse";
 
 /// Block-sparse variant (q4/q6 experts); `gather` sets GATHER_A (FC28) for
 /// the fused-gather gate_up A-load.
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_for_sparse(
     ctx: &crate::metal::device::MetalContext,
     n: u32,
@@ -120,7 +120,7 @@ pub fn pipeline_for_sparse(
 /// built at the same height via RouterDims.block_m; disproven as perf, kept
 /// opt-in). `bn` != 64 changes only the N-tile width (same 32-row block
 /// list; dispatch grid width must use the same bn).
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_for_sparse_tile(
     ctx: &crate::metal::device::MetalContext,
     n: u32,
@@ -138,7 +138,7 @@ pub fn pipeline_for_sparse_tile(
     }
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_for_sparse_bm(
     ctx: &crate::metal::device::MetalContext,
     n: u32,

@@ -34,7 +34,7 @@ pub fn cpu_reference(
     out
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_for(
     ctx: &crate::metal::device::MetalContext,
     variant: KernelVariant,
@@ -42,12 +42,12 @@ pub fn pipeline_for(
     ctx.compile_subkernel(SHADER, ENTRY, variant)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use objc2::runtime::ProtocolObject;
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder};
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn bind_gpu_buffers(
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     arena: &ProtocolObject<dyn MTLBuffer>,
@@ -67,7 +67,7 @@ pub fn bind_gpu_buffers(
     gpu_common::set_bytes(enc, dims, 4);
 }
 
-#[cfg(all(test, feature = "metal", target_os = "macos"))]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
     use crate::metal::batch::GpuBatch;

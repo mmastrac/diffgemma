@@ -82,7 +82,7 @@ agent memory `long-context-100k`.
 ## Command reference
 
 `WEIGHTS=model/diffusiongemma-q4emb`; binary at `target/release/diffgemma-mps`
-(build: `cargo build --release --features metal,blas`).
+(build: `cargo build --release`).
 
 ```bash
 # Generate / chat
@@ -91,7 +91,7 @@ diffgemma-mps chat -m $WEIGHTS
 # Gate / bench / tests
 diffgemma-mps smoketest -m $WEIGHTS            # 17/17 required before commit
 diffgemma-mps bench-step-kernel -m $WEIGHTS --profile-steps 8
-cargo test --release --features metal,blas
+cargo test --release
 # Requantize from HF safetensors
 diffgemma-mps quantize -m model/transformer -o model/diffusiongemma-q4emb --profile q4
 # MLX reference comparison (SERIALIZE with our runs — never in parallel)

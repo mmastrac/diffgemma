@@ -186,7 +186,7 @@ fn bytes_to_state(bytes: &[u8]) -> CanvasState {
     unsafe { std::ptr::read(bytes.as_ptr() as *const CanvasState) }
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_for(
     ctx: &crate::metal::device::MetalContext,
     variant: KernelVariant,
@@ -194,13 +194,13 @@ pub fn pipeline_for(
     ctx.compile_subkernel(SHADER, ENTRY, variant)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
     MTLSize,
 };
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
@@ -255,11 +255,6 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     }
     let state_out = bytes_to_state(&out_buf);
     Ok(pack_out(&state_out, f.canvas_size))
-}
-
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-pub fn gpu(_: &Fixture, _: KernelVariant) -> Result<Vec<f32>, Error> {
-    Err(Error::Format("Metal unavailable"))
 }
 
 #[cfg(test)]

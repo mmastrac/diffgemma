@@ -1014,7 +1014,7 @@ pub fn forward_decoder_cpu(
     )
 }
 
-#[cfg(all(test, feature = "metal", target_os = "macos"))]
+#[cfg(all(test, target_os = "macos"))]
 mod determinism_tests {
     use super::*;
     use crate::config::ModelConfig;

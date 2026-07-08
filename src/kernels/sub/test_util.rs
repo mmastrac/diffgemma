@@ -82,7 +82,7 @@ macro_rules! kernel_oracle_matrix {
                         assert_oracle(&out, &oracle, $max_tol, $min_cos);
                     }
 
-                    #[cfg(all(feature = "metal", target_os = "macos"))]
+                    #[cfg(target_os = "macos")]
                     #[test]
                     fn gpu_matches_cpu() {
                         let fix = $fixture_fn(ElemFormat::$fmt);
@@ -92,7 +92,7 @@ macro_rules! kernel_oracle_matrix {
                         assert_oracle(&gpu, &cpu, $max_tol, $min_cos);
                     }
 
-                    #[cfg(all(feature = "metal", target_os = "macos"))]
+                    #[cfg(target_os = "macos")]
                     #[test]
                     fn gpu_assert_variant_matches_cpu() {
                         let fix = $fixture_fn(ElemFormat::$fmt);

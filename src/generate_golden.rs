@@ -347,9 +347,9 @@ mod tests {
                 prefill_elapsed: std::time::Duration::ZERO,
                 denoise_elapsed: std::time::Duration::ZERO,
                 extend_elapsed: std::time::Duration::ZERO,
-                #[cfg(all(feature = "metal", target_os = "macos"))]
+                #[cfg(target_os = "macos")]
                 session_telemetry: crate::metal::SessionTelemetry::default(),
-                #[cfg(all(feature = "metal", target_os = "macos"))]
+                #[cfg(target_os = "macos")]
                 denoise_trace: None,
             }
         }

@@ -97,7 +97,7 @@ pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
     cpu(f)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_for(
     ctx: &crate::metal::device::MetalContext,
     variant: KernelVariant,
@@ -105,7 +105,7 @@ pub fn pipeline_for(
     ctx.compile_subkernel(SHADER, ENTRY, variant)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
     MTLSize,
@@ -121,7 +121,7 @@ struct MoeGroupedGridInfo {
     tunable_wide_n_tile: u32,
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn run_phases(
     enc: &objc2::runtime::ProtocolObject<dyn MTLComputeCommandEncoder>,
     pipeline: &crate::metal::device::ComputePipeline,
@@ -171,7 +171,7 @@ fn run_phases(
     }
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
@@ -223,11 +223,6 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     out.extend(out_scratch.token_list[..slots].iter().map(|&v| v as f32));
     out.extend(out_scratch.slot_list[..slots].iter().map(|&v| v as f32));
     Ok(out)
-}
-
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-pub fn gpu(_: &Fixture, _: KernelVariant) -> Result<Vec<f32>, Error> {
-    Err(Error::Format("Metal unavailable"))
 }
 
 #[cfg(test)]

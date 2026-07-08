@@ -59,13 +59,13 @@ pub struct GenerateOutput {
     pub prefill_elapsed: std::time::Duration,
     pub denoise_elapsed: std::time::Duration,
     pub extend_elapsed: std::time::Duration,
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     pub session_telemetry: crate::metal::SessionTelemetry,
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     pub denoise_trace: Option<crate::denoise_trace::DenoiseTrace>,
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn generate_monolithic_gpu(
     model_dir: &std::path::Path,
     prompt_token_ids: &[u32],
@@ -93,7 +93,7 @@ pub fn generate_monolithic_gpu(
     generate_monolithic(model_dir, prompt_token_ids, &cfg, prompt_label)
 }
 
-#[cfg(all(test, feature = "metal", target_os = "macos"))]
+#[cfg(all(test, target_os = "macos"))]
 mod gpu_determinism {
     use super::*;
     use crate::metal::{

@@ -115,7 +115,7 @@ pub fn route_gpu_in_batch(
     Ok(())
 }
 
-#[cfg(all(test, feature = "metal", target_os = "macos"))]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
     use crate::metal::batch::GpuBatch;

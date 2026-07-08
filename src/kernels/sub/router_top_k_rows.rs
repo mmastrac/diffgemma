@@ -83,7 +83,7 @@ pub fn cpu_oracle(fix: &Fixture) -> RouteOut {
     cpu(fix)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu(fix: &Fixture, variant: KernelVariant) -> Result<RouteOut, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
@@ -154,12 +154,7 @@ pub fn gpu(fix: &Fixture, variant: KernelVariant) -> Result<RouteOut, Error> {
     Ok(RouteOut { indices, weights })
 }
 
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-pub fn gpu(_fix: &Fixture, _variant: KernelVariant) -> Result<RouteOut, Error> {
-    Err(Error::Format("Metal unavailable"))
-}
-
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_for(
     ctx: &crate::metal::device::MetalContext,
     variant: KernelVariant,
@@ -167,12 +162,12 @@ pub fn pipeline_for(
     ctx.compile_subkernel(SHADER, ENTRY, variant)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use objc2::runtime::ProtocolObject;
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder};
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn bind_gpu_buffers(
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     probs: &ProtocolObject<dyn MTLBuffer>,
@@ -192,7 +187,7 @@ pub fn bind_gpu_buffers(
     set_bytes(enc, params, 4);
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn set_bytes<T>(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, value: &T, index: usize) {
     unsafe {
         encoder.setBytes_length_atIndex(
@@ -229,7 +224,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     #[test]
     fn gpu_matches_cpu_tiny() {
         let fix = tiny_fixture(ElemFormat::F32);
@@ -238,7 +233,7 @@ mod tests {
         assert_route_eq(&cpu, &gpu);
     }
 
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     #[test]
     fn gpu_matches_cpu_moe() {
         let fix = moe_fixture(ElemFormat::F32);

@@ -38,7 +38,7 @@ pub fn dispatch_dequant_block_matrix(
     encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
 }
 
-#[cfg(all(test, feature = "metal", target_os = "macos"))]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
     use crate::dgq::DgqStore;

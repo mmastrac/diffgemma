@@ -7,9 +7,9 @@ use crate::metal::expert_cache::{
 };
 use crate::metal::weights::GpuDecoderWeightCache;
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use objc2::runtime::ProtocolObject;
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use objc2_metal::MTLDevice;
 
 #[derive(Debug, Clone, Copy)]
@@ -190,7 +190,7 @@ pub fn estimate_session_resident_bytes(
 }
 
 /// Metal-reported working set limit (unified memory on Apple Silicon).
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu_working_set_cap_bytes(device: &ProtocolObject<dyn MTLDevice>) -> u64 {
     let recommended = device.recommendedMaxWorkingSetSize();
     if recommended > 0 {
@@ -200,13 +200,8 @@ pub fn gpu_working_set_cap_bytes(device: &ProtocolObject<dyn MTLDevice>) -> u64 
     16_u64 * 1024 * 1024 * 1024
 }
 
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-pub fn gpu_working_set_cap_bytes() -> u64 {
-    16_u64 * 1024 * 1024 * 1024
-}
-
 /// LRU budget for transposed MoE experts: 80% of working set minus estimated forward resident.
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn expert_cache_budget_bytes(
     device: &ProtocolObject<dyn MTLDevice>,
     text: &TextConfig,
@@ -220,7 +215,7 @@ pub fn expert_cache_budget_bytes(
     cap.saturating_sub(forward).min(expert_cap).max(entry)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn log_gpu_memory_plan(
     device: &ProtocolObject<dyn MTLDevice>,
     text: &TextConfig,

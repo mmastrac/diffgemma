@@ -1,8 +1,18 @@
+// diffgemma-mps is an Apple-Silicon Metal inference engine. Metal is the only
+// backend — there is no CPU forward/generate path — so the whole program is
+// macOS-only. Fail fast on other targets with one clear message rather than a
+// wall of "cannot find `metal`" errors from the GPU-referencing kernel code.
+#[cfg(not(target_os = "macos"))]
+compile_error!(
+    "diffgemma-mps requires macOS on Apple Silicon: Metal is the only backend \
+     and there is no CPU inference path."
+);
+
 mod buffer;
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 mod chat_protocol;
 mod chat_template;
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 mod chat_ui;
 mod config;
 mod denoise_trace;
@@ -13,7 +23,7 @@ mod generate;
 mod generate_golden;
 #[allow(dead_code)]
 mod kernels;
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 mod metal;
 mod model;
 mod pack;
@@ -847,7 +857,7 @@ fn attach_step_prefill(
     Ok(())
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn run_step_probe_cmd(
     model_dir: &std::path::Path,
     layers: usize,
@@ -895,21 +905,7 @@ fn run_step_probe_cmd(
     }
 }
 
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-fn run_step_probe_cmd(
-    _model_dir: &std::path::Path,
-    _layers: usize,
-    _kv_len: u32,
-    _seed: u64,
-    _max_seq: usize,
-    _prompt: Option<&str>,
-    _raw_prompt: bool,
-) -> ExitCode {
-    eprintln!("error: step-probe requires --features metal on macOS");
-    ExitCode::FAILURE
-}
-
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn run_step_logits_dump_cmd(
     model_dir: &std::path::Path,
     prompt: Option<String>,
@@ -971,7 +967,7 @@ fn run_step_logits_dump_cmd(
     }
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn run_step_bf16_oracle_logits_dump_cmd(
     dgq_dir: &std::path::Path,
     bf16_dir: &std::path::Path,
@@ -1053,43 +1049,7 @@ fn run_step_bf16_oracle_logits_dump_cmd(
     }
 }
 
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-fn run_step_bf16_oracle_logits_dump_cmd(
-    _dgq_dir: &std::path::Path,
-    _bf16_dir: &std::path::Path,
-    _prompt: Option<String>,
-    _layers: usize,
-    _steps: usize,
-    _seed: u64,
-    _max_seq: usize,
-    _raw_prompt: bool,
-    _output: &std::path::Path,
-    _positions: &str,
-    _top_k: usize,
-    _gpu_kv: bool,
-) -> ExitCode {
-    eprintln!("error: step-bf16-logits-dump requires --features metal on macOS");
-    ExitCode::FAILURE
-}
-
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-fn run_step_logits_dump_cmd(
-    _model_dir: &std::path::Path,
-    _prompt: Option<String>,
-    _layers: usize,
-    _steps: usize,
-    _seed: u64,
-    _max_seq: usize,
-    _raw_prompt: bool,
-    _output: &std::path::Path,
-    _positions: &str,
-    _top_k: usize,
-) -> ExitCode {
-    eprintln!("error: step-logits-dump requires --features metal on macOS");
-    ExitCode::FAILURE
-}
-
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn run_step_layer_probe_cmd(
     model_dir: &std::path::Path,
     prompt: Option<String>,
@@ -1142,22 +1102,7 @@ fn run_step_layer_probe_cmd(
     }
 }
 
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-fn run_step_layer_probe_cmd(
-    _model_dir: &std::path::Path,
-    _prompt: Option<String>,
-    _layers: usize,
-    _seed: u64,
-    _max_seq: usize,
-    _raw_prompt: bool,
-    _output: &std::path::Path,
-    _position: usize,
-) -> ExitCode {
-    eprintln!("error: step-layer-probe requires --features metal on macOS");
-    ExitCode::FAILURE
-}
-
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn run_step_attn_dump_cmd(
     model_dir: &std::path::Path,
     prompt: Option<String>,
@@ -1212,7 +1157,7 @@ fn run_step_attn_dump_cmd(
     }
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn run_step_moe_dump_cmd(
     model_dir: &std::path::Path,
     prompt: Option<String>,
@@ -1268,7 +1213,7 @@ fn run_step_moe_dump_cmd(
     }
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn run_step_moe_route_dump_cmd(
     model_dir: &std::path::Path,
     prompt: Option<String>,
@@ -1344,7 +1289,7 @@ fn run_step_moe_route_dump_cmd(
     }
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn run_step_moe_batched_pin_dump_cmd(
     model_dir: &std::path::Path,
     prompt: Option<String>,
@@ -1416,7 +1361,7 @@ fn run_step_moe_batched_pin_dump_cmd(
     }
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn run_step_moe_single_dump_cmd(
     model_dir: &std::path::Path,
     prompt: Option<String>,
@@ -1491,7 +1436,7 @@ fn run_step_moe_single_dump_cmd(
     }
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn run_step_preamble_dump_cmd(
     model_dir: &std::path::Path,
     prompt: Option<String>,
@@ -1569,7 +1514,7 @@ fn run_embed_row_dump_cmd(
         }
     };
 
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     let gpu_scaled = if gpu {
         use metal::{StepFinishMode, StepSmokeConfig, run_embed_row_gpu};
         let mut cfg = StepSmokeConfig {
@@ -1598,14 +1543,6 @@ fn run_embed_row_dump_cmd(
         None
     };
 
-    #[cfg(not(all(feature = "metal", target_os = "macos")))]
-    let gpu_scaled: Option<Vec<f32>> = if gpu {
-        eprintln!("error: --embed-gpu requires --features metal on macOS");
-        return ExitCode::FAILURE;
-    } else {
-        None
-    };
-
     match run_embed_row_dump(model_dir, token, hidden, bf16_ref_dir, gpu_scaled) {
         Ok(dump) => {
             if let Err(err) = write_embed_row_dump(output, &dump) {
@@ -1628,38 +1565,7 @@ fn run_embed_row_dump_cmd(
     }
 }
 
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-fn run_step_preamble_dump_cmd(
-    _model_dir: &std::path::Path,
-    _prompt: Option<String>,
-    _layers: usize,
-    _seed: u64,
-    _max_seq: usize,
-    _raw_prompt: bool,
-    _output: &std::path::Path,
-    _position: usize,
-) -> ExitCode {
-    eprintln!("error: step-preamble-dump requires --features metal on macOS");
-    ExitCode::FAILURE
-}
-
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-fn run_step_attn_dump_cmd(
-    _model_dir: &std::path::Path,
-    _prompt: Option<String>,
-    _layers: usize,
-    _seed: u64,
-    _max_seq: usize,
-    _raw_prompt: bool,
-    _output: &std::path::Path,
-    _layer: usize,
-    _position: usize,
-) -> ExitCode {
-    eprintln!("error: step-attn-dump requires --features metal on macOS");
-    ExitCode::FAILURE
-}
-
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn run_step_kv_check_cmd(
     model_dir: &std::path::Path,
     kv_len: usize,
@@ -1704,7 +1610,7 @@ fn run_step_kv_check_cmd(
     }
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn run_step_kv_bf16_cross_cmd(
     dgq_dir: &std::path::Path,
     bf16_dir: &std::path::Path,
@@ -1774,22 +1680,7 @@ fn run_step_kv_bf16_cross_cmd(
     }
 }
 
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-fn run_step_kv_bf16_cross_cmd(
-    _dgq_dir: &std::path::Path,
-    _bf16_dir: &std::path::Path,
-    _prompt: Option<String>,
-    _prompt_len: usize,
-    _layers: usize,
-    _seed: u64,
-    _max_seq: usize,
-    _raw_prompt: bool,
-) -> ExitCode {
-    eprintln!("error: step-kv-bf16-cross requires --features metal on macOS");
-    ExitCode::FAILURE
-}
-
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn run_step_kv_parity_cmd(
     model_dir: &std::path::Path,
     prompt: Option<String>,
@@ -1866,7 +1757,7 @@ fn run_step_kv_parity_cmd(
     }
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn run_step_attn_probe_cmd(
     model_dir: &std::path::Path,
     prompt: Option<String>,
@@ -1961,33 +1852,7 @@ fn run_step_attn_probe_cmd(
     }
 }
 
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-fn run_step_kv_parity_cmd(
-    _model_dir: &std::path::Path,
-    _prompt: Option<String>,
-    _prompt_len: usize,
-    _layers: usize,
-    _seed: u64,
-    _max_seq: usize,
-    _raw_prompt: bool,
-) -> ExitCode {
-    eprintln!("error: step-kv-parity requires --features metal on macOS");
-    ExitCode::FAILURE
-}
-
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-fn run_step_kv_check_cmd(
-    _model_dir: &std::path::Path,
-    _kv_len: usize,
-    _layers: usize,
-    _seed: u64,
-    _max_seq: usize,
-) -> ExitCode {
-    eprintln!("error: step-kv-check requires --features metal on macOS");
-    ExitCode::FAILURE
-}
-
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn run_step_verify_cmd(model_dir: &std::path::Path, layers: usize) -> ExitCode {
     use metal::run_step_verify;
 
@@ -2018,13 +1883,7 @@ fn run_step_verify_cmd(model_dir: &std::path::Path, layers: usize) -> ExitCode {
     }
 }
 
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-fn run_step_verify_cmd(_model_dir: &std::path::Path, _layers: usize) -> ExitCode {
-    eprintln!("error: step-verify requires --features metal on macOS");
-    ExitCode::FAILURE
-}
-
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn run_step_ci_cmd(model_dir: &std::path::Path, layers: usize) -> ExitCode {
     use metal::validate_step_model;
 
@@ -2082,7 +1941,7 @@ fn run_step_ci_cmd(model_dir: &std::path::Path, layers: usize) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn run_chat_quality_gate(model_dir: &std::path::Path, layers: usize) -> ExitCode {
     use generate_golden::{ChatQualityFixture, check_chat_quality};
 
@@ -2152,18 +2011,7 @@ fn run_chat_quality_gate(model_dir: &std::path::Path, layers: usize) -> ExitCode
     }
 }
 
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-fn run_chat_quality_gate(_model_dir: &std::path::Path, _layers: usize) -> ExitCode {
-    ExitCode::SUCCESS
-}
-
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-fn run_step_ci_cmd(_model_dir: &std::path::Path, _layers: usize) -> ExitCode {
-    eprintln!("error: step-ci requires --features metal on macOS");
-    ExitCode::FAILURE
-}
-
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn run_step_parity_cmd(
     model_dir: &std::path::Path,
     layers: usize,
@@ -2221,19 +2069,7 @@ fn run_step_parity_cmd(
     }
 }
 
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-fn run_step_parity_cmd(
-    _model_dir: &std::path::Path,
-    _layers: usize,
-    _kv_len: u32,
-    _seed: u64,
-    _max_seq: usize,
-) -> ExitCode {
-    eprintln!("error: step-parity requires --features metal on macOS");
-    ExitCode::FAILURE
-}
-
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn print_encode_subprofile(p: &metal::EncodeSubProfileResult) {
     use metal::{LayerEncodeSubProfile, MoeEncodeSubProfile};
     let layers = p.layers.max(1) as u32;
@@ -2314,7 +2150,7 @@ fn print_encode_subprofile(p: &metal::EncodeSubProfileResult) {
     println!("  grand_total:   {:.2?}", grand);
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn run_bench_step_kernel_cmd(
     model_dir: &std::path::Path,
     layers: usize,
@@ -2471,24 +2307,7 @@ fn run_bench_step_kernel_cmd(
     }
 }
 
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-fn run_bench_step_kernel_cmd(
-    _model_dir: &std::path::Path,
-    _layers: usize,
-    _kv_len: u32,
-    _seed: u64,
-    _max_seq: usize,
-    _iters: usize,
-    _forward_only: bool,
-    _profile: bool,
-    _profile_steps: usize,
-    _layer_profile: bool,
-) -> ExitCode {
-    eprintln!("error: bench-step-kernel requires --features metal on macOS");
-    ExitCode::FAILURE
-}
-
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn run_bench_gemm_fusion_cmd(
     model_dir: &std::path::Path,
     layers: usize,
@@ -2577,20 +2396,7 @@ fn run_bench_gemm_fusion_cmd(
     }
 }
 
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-fn run_bench_gemm_fusion_cmd(
-    _model_dir: &std::path::Path,
-    _layers: usize,
-    _kv_len: u32,
-    _seed: u64,
-    _max_seq: usize,
-    _iters: usize,
-) -> ExitCode {
-    eprintln!("error: bench-gemm-fusion requires --features metal on macOS");
-    ExitCode::FAILURE
-}
-
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn run_step_smoke_cmd(
     model_dir: &std::path::Path,
     layers: usize,
@@ -2649,22 +2455,6 @@ fn run_step_smoke_cmd(
             ExitCode::FAILURE
         }
     }
-}
-
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-fn run_step_smoke_cmd(
-    _model_dir: &std::path::Path,
-    _layers: usize,
-    _steps: usize,
-    _kv_len: u32,
-    _seed: u64,
-    _max_seq: usize,
-    _forward_only: bool,
-    _prompt: Option<&str>,
-    _raw_prompt: bool,
-) -> ExitCode {
-    eprintln!("error: step-smoke requires --features metal on macOS");
-    ExitCode::FAILURE
 }
 
 fn run_quantize(source_dir: &std::path::Path, output: &std::path::Path, profile: &str) -> ExitCode {
@@ -2726,7 +2516,7 @@ fn run_quantize(source_dir: &std::path::Path, output: &std::path::Path, profile:
     }
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn run_probe_device() -> ExitCode {
     use metal::{print_probe_result, probe_device};
     match probe_device() {
@@ -2741,13 +2531,7 @@ fn run_probe_device() -> ExitCode {
     }
 }
 
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-fn run_probe_device() -> ExitCode {
-    eprintln!("error: probe-device requires --features metal on macOS");
-    ExitCode::FAILURE
-}
-
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn run_bench_gemm(shapes: &str, oracle: Option<&str>, iters: usize) -> ExitCode {
     use metal::{
         bench_custom_kernel, bench_gemm_bf16, bench_gemm_block_q4, bench_mpsgraph_oracle,
@@ -2803,12 +2587,6 @@ fn run_bench_gemm(shapes: &str, oracle: Option<&str>, iters: usize) -> ExitCode 
     }
     print_bench_rows(&rows);
     ExitCode::SUCCESS
-}
-
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-fn run_bench_gemm(_shapes: &str, _oracle: Option<&str>, _iters: usize) -> ExitCode {
-    eprintln!("error: bench-gemm requires --features metal on macOS");
-    ExitCode::FAILURE
 }
 
 fn run_convert_model(source_dir: &std::path::Path, output_dir: &std::path::Path) -> ExitCode {
@@ -3579,7 +3357,7 @@ fn parse_cli() -> Cli {
                 "usage: diffgemma-mps [-p PROMPT] [--raw] [summary|config|weights <name>|quantize|convert-model|step-smoke|step-probe|step-kv-check|step-kv-parity|step-verify|step-ci|step-parity|bench-step-kernel|bench-step|bench-prefill|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-monolithic|generate-monolithic-parity|generate-parity|chat|tokenize <text>|gemm|attention]"
             );
             eprintln!(
-                "  default (no command): generate-monolithic on .dgq, else generate-gpu (bf16) with --features metal"
+                "  default (no command): generate-monolithic on .dgq, else generate-gpu (bf16)"
             );
             eprintln!(
                 "  prompts: chat template applied by default; use --raw for bare BPE (-p \"Hello\" -> [9259])"
@@ -3593,11 +3371,9 @@ fn parse_cli() -> Cli {
             eprintln!(
                 "  options: ... --golden NAME --write-golden NAME --compare-cpu --no-early-stop --assert --debug-deep"
             );
-            eprintln!("  gemm options: --size N (default 512, requires --features metal)");
-            eprintln!("  attention: layer 0 GQA parity (requires --features metal)");
-            eprintln!(
-                "  decoder-gpu: full decoder CPU vs GPU parity at seq=256 (requires --features metal)"
-            );
+            eprintln!("  gemm options: --size N (default 512)");
+            eprintln!("  attention: layer 0 GQA parity");
+            eprintln!("  decoder-gpu: full decoder CPU vs GPU parity at seq=256");
             std::process::exit(2);
         }
     };
@@ -3609,7 +3385,7 @@ fn parse_cli() -> Cli {
     }
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn default_generate_command(
     model_dir: &std::path::Path,
     prompt: Option<String>,
@@ -3623,32 +3399,6 @@ fn default_generate_command(
     let _ = model_dir;
     // The non-monolithic generate surface is retired; `ask`/`generate` always
     // run the monolithic step path.
-    Command::GenerateMonolithic {
-        prompt,
-        seed,
-        steps,
-        prompt_len,
-        max_new_tokens,
-        max_layers,
-        no_early_stop,
-        kernel_assert: false,
-        kernel_debug_deep: false,
-        write_golden: None,
-        write_trace: None,
-    }
-}
-
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-fn default_generate_command(
-    _model_dir: &std::path::Path,
-    prompt: Option<String>,
-    seed: u64,
-    steps: usize,
-    prompt_len: usize,
-    max_new_tokens: usize,
-    max_layers: Option<usize>,
-    no_early_stop: bool,
-) -> Command {
     Command::GenerateMonolithic {
         prompt,
         seed,
@@ -3747,7 +3497,7 @@ fn gib(bytes: u64) -> f64 {
 }
 
 fn run_gemm(size: usize) -> ExitCode {
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     {
         use metal::{Bf16Gemm, bf16_matmul_cpu, f32_to_bf16};
 
@@ -3808,12 +3558,6 @@ fn run_gemm(size: usize) -> ExitCode {
             eprintln!("error: max_abs_diff {max_abs} exceeds tolerance {TOL}");
             ExitCode::FAILURE
         }
-    }
-    #[cfg(not(all(feature = "metal", target_os = "macos")))]
-    {
-        let _ = size;
-        eprintln!("error: gemm requires --features metal on macOS");
-        ExitCode::FAILURE
     }
 }
 
@@ -3929,7 +3673,7 @@ fn build_chat_prompt_tokens(
     }
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn run_chat_cmd(
     model_dir: &std::path::Path,
@@ -4202,7 +3946,7 @@ fn run_chat_cmd(
 }
 
 /// Smoketest prompt spec (`fixtures/smoketest/prompts.json`).
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 #[derive(serde::Deserialize)]
 struct SmoketestSpec {
     #[serde(default)]
@@ -4218,7 +3962,7 @@ struct SmoketestSpec {
 }
 
 /// Free-form prompt that must converge within `max_steps` denoise steps.
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 #[derive(serde::Deserialize)]
 struct SmokeConvergence {
     id: String,
@@ -4227,7 +3971,7 @@ struct SmokeConvergence {
 }
 
 /// Prompt with exactly one correct answer; gated on both answer + convergence.
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 #[derive(serde::Deserialize)]
 struct SmokeAdherence {
     id: String,
@@ -4240,7 +3984,7 @@ struct SmokeAdherence {
 }
 
 /// Lowercase, alphanumeric-only, single-spaced — for word-boundary matching.
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn smoke_normalize(s: &str) -> String {
     let mut out = String::new();
     let mut prev_space = true;
@@ -4259,7 +4003,7 @@ fn smoke_normalize(s: &str) -> String {
 }
 
 /// Does `reply` contain `answer` (or an accepted alternate) as a whole word run?
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn smoke_answer_matches(reply: &str, answer: &str, accept: &[String]) -> bool {
     let r = format!(" {} ", smoke_normalize(reply));
     std::iter::once(answer)
@@ -4273,7 +4017,7 @@ fn smoke_answer_matches(reply: &str, answer: &str, accept: &[String]) -> bool {
 /// Convergence + adherence gate over a prompt set. Reuses the chat session path
 /// so each prompt is a fresh single-turn generation; reports actual vs threshold
 /// denoise steps (ratchet thresholds down in the JSON as the engine improves).
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn run_smoketest_cmd(
     model_dir: &std::path::Path,
     prompts_path: Option<&std::path::Path>,
@@ -4493,36 +4237,6 @@ fn run_smoketest_cmd(
     }
 }
 
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-fn run_chat_cmd(
-    _model_dir: &std::path::Path,
-    _initial_prompt: Option<String>,
-    _seed: u64,
-    _steps: usize,
-    _max_new_tokens: usize,
-    _max_layers: Option<usize>,
-    _no_early_stop: bool,
-    _raw_prompt: bool,
-) -> ExitCode {
-    eprintln!("error: chat requires --features metal on macOS");
-    ExitCode::FAILURE
-}
-
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-fn run_smoketest_cmd(
-    _model_dir: &std::path::Path,
-    _prompts_path: Option<&std::path::Path>,
-    _seed: u64,
-    _steps: usize,
-    _max_layers: Option<usize>,
-    _raw_prompt: bool,
-    _filter: Option<&str>,
-    _repeat: usize,
-) -> ExitCode {
-    eprintln!("error: smoketest requires --features metal on macOS");
-    ExitCode::FAILURE
-}
-
 fn print_generate_elapsed(label: &str, elapsed: std::time::Duration) {
     let secs = elapsed.as_secs_f64();
     println!("  {label} elapsed: {secs:.2}s ({elapsed:.2?})");
@@ -4573,7 +4287,7 @@ fn print_generate_output(
         println!("  throughput: {tok_s:.2} tok/s (denoise only, excludes prefill/extend)");
     }
 
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     if !out.session_telemetry.steps.is_empty() {
         out.session_telemetry.print_summary("  session telemetry:");
         if out.denoise_steps_run > 0 {
@@ -4638,7 +4352,7 @@ fn print_generate_output(
     }
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn run_generate_monolithic_cmd(
     model_dir: &std::path::Path,
     prompt_text: Option<String>,
@@ -4773,7 +4487,7 @@ fn run_generate_monolithic_cmd(
     }
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn run_generate_monolithic_parity_cmd(
     model_dir: &std::path::Path,
     prompt_text: Option<String>,
@@ -4905,44 +4619,6 @@ fn run_generate_monolithic_parity_cmd(
     }
 }
 
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-fn run_generate_monolithic_parity_cmd(
-    _model_dir: &std::path::Path,
-    _prompt_text: Option<String>,
-    _seed: u64,
-    _steps: usize,
-    _prompt_len: usize,
-    _max_new_tokens: usize,
-    _max_layers: Option<usize>,
-    _no_early_stop: bool,
-    _golden_name: Option<String>,
-    _write_golden: Option<String>,
-    _raw_prompt: bool,
-) -> ExitCode {
-    eprintln!("error: generate-monolithic-parity requires --features metal on macOS");
-    ExitCode::FAILURE
-}
-
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-fn run_generate_monolithic_cmd(
-    _model_dir: &std::path::Path,
-    _prompt_text: Option<String>,
-    _seed: u64,
-    _steps: usize,
-    _prompt_len: usize,
-    _max_new_tokens: usize,
-    _max_layers: Option<usize>,
-    _no_early_stop: bool,
-    _kernel_assert: bool,
-    _kernel_debug_deep: bool,
-    _write_golden: Option<String>,
-    _write_trace: Option<PathBuf>,
-    _raw_prompt: bool,
-) -> ExitCode {
-    eprintln!("error: generate-monolithic requires --features metal on macOS");
-    ExitCode::FAILURE
-}
-
 fn write_generate_golden(
     name: &str,
     prompt: &str,
@@ -4970,7 +4646,7 @@ fn write_generate_golden(
 }
 
 fn run_attention_parity(m: &model::Model) -> ExitCode {
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     {
         use metal::GpuAttention;
         use model::attention::{AttentionParams, forward_to_attn_out, prepare_qkv_pre_rope};
@@ -5105,12 +4781,6 @@ fn run_attention_parity(m: &model::Model) -> ExitCode {
             eprintln!("error: max_abs_diff {max_abs} exceeds tolerance {TOL}");
             ExitCode::FAILURE
         }
-    }
-    #[cfg(not(all(feature = "metal", target_os = "macos")))]
-    {
-        let _ = m;
-        eprintln!("error: attention requires --features metal on macOS");
-        ExitCode::FAILURE
     }
 }
 

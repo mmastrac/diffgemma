@@ -7,7 +7,7 @@ pub const ENTRY: &str = "gather_rows_bf16";
 
 const SHADER: &str = shader_include::include_metal!("kernels/gather_rows_bf16.metal");
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_for(
     ctx: &crate::metal::device::MetalContext,
     variant: KernelVariant,

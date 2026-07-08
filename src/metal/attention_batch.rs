@@ -435,7 +435,7 @@ fn encode_gqa(
     engine_gqa_common::dispatch_head_query_2d(batch.encoder(), n_heads, seq_len);
 }
 
-#[cfg(all(test, feature = "metal", target_os = "macos"))]
+#[cfg(all(test, target_os = "macos"))]
 mod prefill_attn_tests {
     use super::*;
     use crate::config::ModelConfig;

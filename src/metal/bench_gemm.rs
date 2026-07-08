@@ -579,7 +579,7 @@ pub fn print_bench_rows(rows: &[GemmBenchRow]) {
 /// `gemm_block_sparse` reference (bitwise-compared) and reports USEFUL
 /// TF/s (routed rows only — padding excluded, matching the KERNELS.md
 /// methodology).
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn bench_gemm_tunable_sparse(iters: usize) -> Result<Vec<GemmBenchRow>, Error> {
     use crate::metal::device::MetalContext;
     use crate::metal::{BlockGroupedJob, RouteScratch};

@@ -598,7 +598,7 @@ pub fn experts_forward_dgq_cpu(
     Ok(())
 }
 
-#[cfg(all(test, feature = "metal", target_os = "macos"))]
+#[cfg(all(test, target_os = "macos"))]
 mod dgq_expert_tests {
     use super::*;
     use crate::config::ModelConfig;

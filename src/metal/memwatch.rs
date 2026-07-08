@@ -15,7 +15,7 @@
 //! perf-timing methodology note: full-run wall-clock is questionable when
 //! the machine isn't idle).
 
-#![cfg(all(feature = "metal", target_os = "macos"))]
+#![cfg(target_os = "macos")]
 
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLDevice;

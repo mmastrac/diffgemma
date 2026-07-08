@@ -83,7 +83,7 @@ fn route_from_fixture(f: &Fixture) -> RouteScratch {
     route
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_for(
     ctx: &crate::metal::device::MetalContext,
     n: u32,
@@ -93,15 +93,15 @@ pub fn pipeline_for(
     ctx.compile_gemm_subkernel(SHADER, ENTRY, n, k, false, format as u32, false)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use objc2::runtime::ProtocolObject;
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
     MTLSize,
 };
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn bind_gpu_buffers(
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     a: &ProtocolObject<dyn MTLBuffer>,
@@ -123,7 +123,7 @@ pub fn bind_gpu_buffers(
     gpu_common::set_bytes(enc, &num_jobs, 5);
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn dispatch_shape(n: usize, num_active: usize) -> (MTLSize, MTLSize) {
     (
         MTLSize {
@@ -139,7 +139,7 @@ pub fn dispatch_shape(n: usize, num_active: usize) -> (MTLSize, MTLSize) {
     )
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu(f: &Fixture, _variant: super::KernelVariant) -> Result<Vec<f32>, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
@@ -218,12 +218,7 @@ pub fn gpu(f: &Fixture, _variant: super::KernelVariant) -> Result<Vec<f32>, Erro
     Ok(out)
 }
 
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-pub fn gpu(_: &Fixture, _: super::KernelVariant) -> Result<Vec<f32>, Error> {
-    Err(Error::Format("Metal unavailable"))
-}
-
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu_q4(f: &Fixture, variant: super::KernelVariant) -> Result<Vec<f32>, Error> {
     gpu(
         f,
@@ -234,7 +229,7 @@ pub fn gpu_q4(f: &Fixture, variant: super::KernelVariant) -> Result<Vec<f32>, Er
     )
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu_nvfp4(f: &Fixture, variant: super::KernelVariant) -> Result<Vec<f32>, Error> {
     gpu(
         f,
@@ -246,7 +241,7 @@ pub fn gpu_nvfp4(f: &Fixture, variant: super::KernelVariant) -> Result<Vec<f32>,
 }
 
 /// Grouped tiled GEMM against a shared `.dgq` blob (absolute `w_byte_off` in jobs).
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub struct BlobGroupedParams<'a> {
     pub blob: &'a ProtocolObject<dyn MTLBuffer>,
     pub a: &'a [f32],
@@ -257,7 +252,7 @@ pub struct BlobGroupedParams<'a> {
     pub format: QuantFormat,
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 impl BlobGroupedParams<'_> {
     pub fn total_m(&self) -> usize {
         *self.row_starts.last().unwrap_or(&0) as usize
@@ -272,7 +267,7 @@ impl BlobGroupedParams<'_> {
     }
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu_on_blob(
     p: &BlobGroupedParams<'_>,
     _variant: super::KernelVariant,

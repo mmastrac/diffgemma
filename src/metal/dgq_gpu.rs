@@ -493,7 +493,7 @@ pub fn load_raw_view(
     })
 }
 
-#[cfg(all(test, feature = "metal", target_os = "macos"))]
+#[cfg(all(test, target_os = "macos"))]
 mod q4_gpu_tests {
     use super::*;
     use crate::metal::batch::GpuBatch;

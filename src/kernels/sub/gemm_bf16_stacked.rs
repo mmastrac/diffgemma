@@ -6,7 +6,7 @@
 use super::gemm_block_stacked::GemmStackedSeg;
 use crate::safetensors::Error;
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn stacked_pipeline_for(
     ctx: &crate::metal::device::MetalContext,
     n: u32,

@@ -10,7 +10,7 @@ pub const ENTRY: &str = "gemm_block_sparse";
 
 const SHADER: &str = shader_include::include_metal!("kernels/gemm_block_sparse.metal");
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_for(
     ctx: &crate::metal::device::MetalContext,
     n: u32,
@@ -23,7 +23,7 @@ pub fn pipeline_for(
 /// Fused-gather variant (GATHER_A): A-load gathers bf16 `moein` rows via
 /// `route->token_list` (buffer 7) instead of a pre-gathered f32 buffer. Used for
 /// MoE gate_up to skip the separate gather pass.
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_for_gather(
     ctx: &crate::metal::device::MetalContext,
     n: u32,
@@ -35,7 +35,7 @@ pub fn pipeline_for_gather(
 
 /// Adaptive-M variant (FC32, DGQ_MOE_TILE_ADAPT): each block runs the smallest
 /// simdgroup M-mapping (8/16/32 rows) covering its actual row count.
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_for_adaptive(
     ctx: &crate::metal::device::MetalContext,
     n: u32,
@@ -46,7 +46,7 @@ pub fn pipeline_for_adaptive(
 }
 
 /// Adaptive-M + fused-gather (GATHER_A) variant for MoE gate_up.
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_for_gather_adaptive(
     ctx: &crate::metal::device::MetalContext,
     n: u32,
@@ -56,7 +56,7 @@ pub fn pipeline_for_gather_adaptive(
     ctx.compile_gemm_subkernel_gather_adaptive(SHADER, ENTRY, n, k, format as u32)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
 };
@@ -64,7 +64,7 @@ use objc2_metal::{
 /// Run the block-sparse kernel on a grouped fixture with CPU-built blocks
 /// (bucket_fill's legacy emission). `adaptive` selects the GEMM_M_ADAPT
 /// pipeline (runtime per-block M-mapping); same single dispatch either way.
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu_sparse(
     f: &crate::kernels::sub::gemm_linear_grouped::Fixture,
     adaptive: bool,
@@ -191,7 +191,7 @@ pub fn gpu_sparse(
 }
 
 #[cfg(test)]
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 mod tests {
     use super::*;
     use crate::kernels::sub::gemm_linear_grouped::grouped_fixture;

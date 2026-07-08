@@ -74,7 +74,7 @@ impl GqaParams {
     }
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn set_params(
     encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
     params: &GqaParams,
@@ -91,7 +91,7 @@ pub fn set_params(
 }
 
 /// One thread per (head, query) — grid can exceed any fixed threadgroup width.
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn dispatch_head_query_2d(
     encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
     n_heads: usize,

@@ -1,15 +1,15 @@
 //! Shared Metal helpers for tier-1 subkernel GPU tests.
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use crate::safetensors::Error;
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use objc2::runtime::ProtocolObject;
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
 };
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn set_bytes<T>(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     value: &T,
@@ -29,7 +29,7 @@ pub fn div_up(value: usize, group: usize) -> usize {
 }
 
 /// Matches [`crate::metal::batch::GpuBatch::dispatch_1d_ranged`] chunking.
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn dispatch_1d_ranged(
     queue: &ProtocolObject<dyn MTLCommandQueue>,
     pipeline: &ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
@@ -73,7 +73,7 @@ pub fn dispatch_1d_ranged(
 }
 
 /// Row kernels: one threadgroup (width 256) per row.
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn dispatch_rows(
     queue: &ProtocolObject<dyn MTLCommandQueue>,
     pipeline: &ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
@@ -108,7 +108,7 @@ pub fn dispatch_rows(
 }
 
 /// `scatter_vocab_chunk` grid (matches lm_head).
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn scatter_vocab_grid(seq_len: usize, chunk_cols: usize) -> (MTLSize, MTLSize) {
     const TG_W: usize = 16;
     const TG_H: usize = 16;
@@ -126,7 +126,7 @@ pub fn scatter_vocab_grid(seq_len: usize, chunk_cols: usize) -> (MTLSize, MTLSiz
     )
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn dispatch_1d(
     queue: &ProtocolObject<dyn MTLCommandQueue>,
     pipeline: &ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
@@ -161,7 +161,7 @@ pub fn dispatch_1d(
 }
 
 /// 2D grid with fixed threadgroup width (e.g. MoE scatter: one TG per `(d, tok)`).
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn dispatch_grid(
     queue: &ProtocolObject<dyn MTLCommandQueue>,
     pipeline: &ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,

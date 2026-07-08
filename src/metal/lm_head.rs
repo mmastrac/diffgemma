@@ -128,7 +128,7 @@ pub fn zero_logits_buf(
     Ok(())
 }
 
-#[cfg(all(test, feature = "metal", target_os = "macos"))]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
     use crate::dgq::store::DgqStore;

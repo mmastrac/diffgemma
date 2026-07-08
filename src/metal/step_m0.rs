@@ -577,7 +577,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "metal", target_os = "macos"))]
+#[cfg(all(test, target_os = "macos"))]
 mod parity_debug {
     use super::*;
     use std::path::Path;

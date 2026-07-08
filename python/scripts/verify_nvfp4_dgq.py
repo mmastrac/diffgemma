@@ -27,7 +27,7 @@ def main() -> int:
 
     print(f"MLX nvfp4: shape={tuple(w.shape)} scales={scales[0].tolist()[:4]}...")
     print(f"  max abs err vs bf16 input: {float(mx.max(mx.abs(w_hat - w))):.6f}")
-    print("ok (compare with `cargo test --features metal dgq::nvfp4::tests::nvfp4_matches_mlx_linspace_row`)")
+    print("ok (compare with `cargo test dgq::nvfp4::tests::nvfp4_matches_mlx_linspace_row`)")
     return 0
 
 

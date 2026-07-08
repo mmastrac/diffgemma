@@ -96,7 +96,7 @@ pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
     cpu(f)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_for(
     ctx: &crate::metal::device::MetalContext,
     format: QuantFormat,
@@ -109,15 +109,15 @@ pub fn pipeline_for(
     ctx.compile_subkernel(SHADER, ENTRY, v)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use objc2::runtime::ProtocolObject;
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
     MTLSize,
 };
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn bind_gpu_buffers(
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     w: &ProtocolObject<dyn MTLBuffer>,
@@ -134,7 +134,7 @@ pub fn bind_gpu_buffers(
     gpu_common::set_bytes(enc, &dims, 2);
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn dispatch_shape(n: usize, k: usize) -> (MTLSize, MTLSize) {
     let tg = MTLSize {
         width: THREADGROUP,
@@ -149,7 +149,7 @@ pub fn dispatch_shape(n: usize, k: usize) -> (MTLSize, MTLSize) {
     (grid, tg)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
@@ -190,12 +190,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     Ok(out)
 }
 
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-pub fn gpu(_: &Fixture, _: KernelVariant) -> Result<Vec<f32>, Error> {
-    Err(Error::Format("Metal unavailable"))
-}
-
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu_q4(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     gpu(
         f,
@@ -206,7 +201,7 @@ pub fn gpu_q4(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     )
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu_nvfp4(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     gpu(
         f,

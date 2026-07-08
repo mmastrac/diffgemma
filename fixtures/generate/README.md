@@ -39,24 +39,24 @@ Forward-only regression limits vs engine (`step-parity`). Use `DGQ_MPS_Q4=0` for
 Refresh after intentional monolithic/kernel changes:
 
 ```bash
-DGQ_MPS_Q4=0 cargo run --release --features metal -- -m /tmp/quantized-weights step-parity --layers 3 --seed 42
+DGQ_MPS_Q4=0 cargo run --release -- -m /tmp/quantized-weights step-parity --layers 3 --seed 42
 
 # CI regression (config validate + step-verify + generate-monolithic-parity)
-DGQ_MPS_Q4=0 cargo run --release --features metal -- -m /tmp/quantized-weights step-ci --layers 3
+DGQ_MPS_Q4=0 cargo run --release -- -m /tmp/quantized-weights step-ci --layers 3
 
 # Golden parity only
-DGQ_MPS_Q4=0 cargo run --release --features metal -- -m /tmp/quantized-weights generate-monolithic-parity -p hello --raw --layers 3 --steps 4 --seed 42 --no-early-stop
+DGQ_MPS_Q4=0 cargo run --release -- -m /tmp/quantized-weights generate-monolithic-parity -p hello --raw --layers 3 --steps 4 --seed 42 --no-early-stop
 ```
 
 
 ```bash
 # bf16
-cargo run --release --features metal -- generate-gpu -p "Hello" --seed 42 --steps 1 --write-golden hello_steps1_full
+cargo run --release -- generate-gpu -p "Hello" --seed 42 --steps 1 --write-golden hello_steps1_full
 
 # .dgq (quantize first if needed)
-cargo run --release --features metal -- quantize -o /tmp/quantized-weights
-cargo run --release --features metal -- -m /tmp/quantized-weights generate-gpu -p "Hello" --seed 42 --steps 1 --layers 3 --write-golden dgq_hello_steps1_layers3
-cargo run --release --features metal -- -m /tmp/quantized-weights generate-parity -p "Hello" --raw --seed 42 --steps 1 --layers 3
+cargo run --release -- quantize -o /tmp/quantized-weights
+cargo run --release -- -m /tmp/quantized-weights generate-gpu -p "Hello" --seed 42 --steps 1 --layers 3 --write-golden dgq_hello_steps1_layers3
+cargo run --release -- -m /tmp/quantized-weights generate-parity -p "Hello" --raw --seed 42 --steps 1 --layers 3
 ```
 
 Use `--compare-cpu` on `generate-parity` for full CPU vs GPU on the same weights (slow).
@@ -72,7 +72,7 @@ Compact per-step telemetry for localizing sampler vs forward divergence. Schema:
 **Rust dump:**
 
 ```bash
-cargo run --release --features metal -- -m /tmp/quantized-weights generate-monolithic \
+cargo run --release -- -m /tmp/quantized-weights generate-monolithic \
   -p Hello --seed 42 --layers 3 --steps 4 --no-early-stop \
   --write-trace fixtures/generate/denoise_trace_hello_layers3_steps4_seed42.json
 ```
@@ -81,7 +81,7 @@ cargo run --release --features metal -- -m /tmp/quantized-weights generate-monol
 
 ```bash
 # 1) Rust trace first
-cargo run --release --features metal -- -m /tmp/quantized-weights generate-monolithic \
+cargo run --release -- -m /tmp/quantized-weights generate-monolithic \
   -p 'How can I get from Calgary to Namibia?' --seed 42 --layers 30 --steps 12 --no-early-stop \
   --write-trace /tmp/calgary_mono_trace.json
 

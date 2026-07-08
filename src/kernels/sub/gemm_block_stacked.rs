@@ -344,7 +344,7 @@ pub fn cpu_oracle(f: &StackedFixture) -> Vec<f32> {
     cpu(f)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_for(
     ctx: &crate::metal::device::MetalContext,
     n: u32,
@@ -355,7 +355,7 @@ pub fn pipeline_for(
     Ok((*stacked_pipeline_for(ctx, n, k, format, segs)?).clone())
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn stacked_pipeline_for(
     ctx: &crate::metal::device::MetalContext,
     n: u32,
@@ -390,14 +390,14 @@ pub fn stacked_pipeline_for(
     Ok(pipe)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use objc2::runtime::ProtocolObject;
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
 };
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn bind_gpu_buffers(
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     x: &ProtocolObject<dyn MTLBuffer>,
@@ -413,7 +413,7 @@ pub fn bind_gpu_buffers(
     gpu_common::set_bytes(enc, &m, 3);
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu_q4(
     f: &StackedFixture,
     _variant: super::variant::KernelVariant,
@@ -453,11 +453,6 @@ pub fn gpu_q4(
         .collect())
 }
 
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-pub fn gpu_q4(_: &StackedFixture, _: super::variant::KernelVariant) -> Result<Vec<f32>, Error> {
-    Err(Error::Format("Metal unavailable"))
-}
-
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
     a.iter()
         .zip(b.iter())
@@ -465,7 +460,7 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
         .fold(0.0f32, f32::max)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu_q4_split(f: &StackedFixture) -> Result<Vec<f32>, Error> {
     use super::gemm_q4;
     use crate::metal::buffer::BufferPool;
@@ -720,7 +715,7 @@ mod tests {
         min_cos = 0.999,
     }
 
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     #[test]
     fn stacked_gpu_matches_split_gate_up_canvas() {
         use crate::kernels::sub::gemm_q4;
@@ -732,7 +727,7 @@ mod tests {
         assert!(max < 0.05, "canvas stacked vs split max_abs={max}");
     }
 
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     #[test]
     fn stacked_gpu_matches_split_gate_up_tiny() {
         use crate::kernels::sub::gemm_q4;
@@ -744,7 +739,7 @@ mod tests {
         assert!(max < 0.05, "stacked vs split max_abs={max}");
     }
 
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     #[test]
     fn stacked_gpu_matches_split_qkv_sliding_prod() {
         use crate::kernels::sub::gemm_q4;
@@ -756,7 +751,7 @@ mod tests {
         assert!(max < 0.05, "stacked vs split max_abs={max}");
     }
 
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     #[test]
     fn stacked_gpu_matches_split_on_dgq_gate_up() {
         use crate::kernels::sub::gemm_q4;
@@ -870,7 +865,7 @@ mod tests {
         assert!(max < 0.05, "dgq gate_up stacked vs split max_abs={max}");
     }
 
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     #[test]
     fn stacked_gpu_matches_split_on_dgq_qkv_sliding() {
         use crate::kernels::sub::gemm_q4;

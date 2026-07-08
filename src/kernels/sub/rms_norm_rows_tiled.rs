@@ -107,7 +107,7 @@ pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
     cpu(f)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn dispatch_shape(rows: usize) -> (objc2_metal::MTLSize, objc2_metal::MTLSize) {
     use objc2_metal::MTLSize;
     (
@@ -124,7 +124,7 @@ pub fn dispatch_shape(rows: usize) -> (objc2_metal::MTLSize, objc2_metal::MTLSiz
     )
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_for(
     ctx: &crate::metal::device::MetalContext,
     tiled: TiledVariant,
@@ -143,14 +143,14 @@ pub fn pipeline_for(
     )
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use objc2::runtime::ProtocolObject;
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
 };
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn bind_gpu_buffers(
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     x: &ProtocolObject<dyn MTLBuffer>,
@@ -170,17 +170,17 @@ pub fn bind_gpu_buffers(
     gpu_common::set_bytes(enc, &dim, 4);
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu_half(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     gpu_tiled(f, variant, TiledVariant::HALF_IN)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu_f32_in(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     gpu_tiled(f, variant, TiledVariant::F32_IN)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn gpu_tiled(f: &Fixture, variant: KernelVariant, tiled: TiledVariant) -> Result<Vec<f32>, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
@@ -237,16 +237,6 @@ fn gpu_tiled(f: &Fixture, variant: KernelVariant, tiled: TiledVariant) -> Result
     Ok((0..len)
         .map(|i| bf16::bf16_bits_to_f32(unsafe { *ptr.add(i) }))
         .collect())
-}
-
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-pub fn gpu_half(_: &Fixture, _: KernelVariant) -> Result<Vec<f32>, Error> {
-    Err(Error::Format("Metal unavailable"))
-}
-
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-pub fn gpu_f32_in(_: &Fixture, _: KernelVariant) -> Result<Vec<f32>, Error> {
-    Err(Error::Format("Metal unavailable"))
 }
 
 #[cfg(test)]

@@ -7,7 +7,7 @@ pub const ENTRY: &str = "pack_encoder_kv";
 
 const SHADER: &str = shader_include::include_metal!("kernels/pack_encoder_kv.metal");
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_for(
     ctx: &crate::metal::device::MetalContext,
     variant: KernelVariant,
@@ -17,7 +17,7 @@ pub fn pipeline_for(
 
 /// Quantized-KV variant (uint function constant 4 = KvFormat code): grid
 /// depth = head_dim/32 groups. `fmt` must be a quantized format (q8/q4).
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_fmt_for(
     ctx: &crate::metal::device::MetalContext,
     variant: KernelVariant,
@@ -30,12 +30,12 @@ pub fn pipeline_fmt_for(
     ctx.compile_subkernel_ex(SHADER, ENTRY, variant, fmt.label(), &[], &uints)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use objc2::runtime::ProtocolObject;
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder};
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn bind_gpu_buffers(
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     keys: &ProtocolObject<dyn MTLBuffer>,
@@ -61,7 +61,7 @@ pub fn bind_gpu_buffers(
     super::gpu_common::set_bytes(enc, &kv_ring_mask, 6);
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn dispatch_shape(
     token_count: usize,
     nkv: usize,

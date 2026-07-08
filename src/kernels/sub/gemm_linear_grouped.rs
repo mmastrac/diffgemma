@@ -183,7 +183,7 @@ pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
     cpu(f)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_for(
     ctx: &crate::metal::device::MetalContext,
     format: QuantFormat,
@@ -196,15 +196,15 @@ pub fn pipeline_for(
     ctx.compile_subkernel(SHADER, ENTRY, v)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use objc2::runtime::ProtocolObject;
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
     MTLSize,
 };
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn bind_gpu_buffers(
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     a: &ProtocolObject<dyn MTLBuffer>,
@@ -227,7 +227,7 @@ pub fn bind_gpu_buffers(
     gpu_common::set_bytes(enc, &dims, 5);
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
@@ -306,7 +306,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     Ok(out)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu_on_blob(
     p: &crate::kernels::sub::gemm_block_grouped::BlobGroupedParams<'_>,
     _variant: KernelVariant,
@@ -383,7 +383,7 @@ pub fn gpu_on_blob(
     Ok(out)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu_on_blob_block(
     p: &crate::kernels::sub::gemm_block_grouped::BlobGroupedParams<'_>,
     variant: KernelVariant,
@@ -391,7 +391,7 @@ pub fn gpu_on_blob_block(
     crate::kernels::sub::gemm_block_grouped::gpu_on_blob(p, variant)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu_q4(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     gpu(
         f,
@@ -402,7 +402,7 @@ pub fn gpu_q4(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     )
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu_nvfp4(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     gpu(
         f,
@@ -490,7 +490,7 @@ mod tests {
         min_cos = 0.9999,
     }
 
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     #[test]
     fn gpu_tiled_grouped_matches_linear_grouped_nvfp4() {
         use crate::kernels::sub::gemm_block_grouped;

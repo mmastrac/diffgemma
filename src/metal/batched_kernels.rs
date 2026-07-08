@@ -316,7 +316,7 @@ mod tests {
     use crate::metal::device::MetalContext;
     use crate::metal::kernels::GpuKernels;
 
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     #[test]
     fn gpu_gelu_large_input() {
         let mut cpu = vec![10.229641f32];
@@ -335,7 +335,7 @@ mod tests {
         assert!((cpu[0] - gpu[0]).abs() < 1e-4);
     }
 
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     #[test]
     fn gpu_gelu_matches_cpu() {
         let mut cpu = vec![-2.0f32, -1.0, 0.0, 0.5, 1.5, 3.0];
@@ -357,7 +357,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     #[test]
     fn gpu_gelu_matches_cpu_mlp_shape() {
         let len = 16 * 2112;

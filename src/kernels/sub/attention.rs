@@ -245,7 +245,7 @@ pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
     cpu(f)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_for(
     ctx: &crate::metal::device::MetalContext,
     variant: KernelVariant,
@@ -254,7 +254,7 @@ pub fn pipeline_for(
 }
 
 /// Compile with the session KV storage format (uint function constant 4).
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn kv_fc(
     fmt: crate::kernels::sub::kv_quant::KvFormat,
 ) -> ([crate::kernels::sub::variant::FcUInt; 1], &'static str) {
@@ -267,7 +267,7 @@ fn kv_fc(
     )
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_for_kv(
     ctx: &crate::metal::device::MetalContext,
     variant: KernelVariant,
@@ -277,7 +277,7 @@ pub fn pipeline_for_kv(
     ctx.compile_subkernel_ex(SHADER, ENTRY, variant, label, &[], &uints)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_mma2_for_kv(
     ctx: &crate::metal::device::MetalContext,
     variant: KernelVariant,
@@ -287,7 +287,7 @@ pub fn pipeline_mma2_for_kv(
     ctx.compile_subkernel_ex(SHADER_MMA2, ENTRY_MMA2, variant, label, &[], &uints)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_mma_full_for_kv(
     ctx: &crate::metal::device::MetalContext,
     variant: KernelVariant,
@@ -297,13 +297,13 @@ pub fn pipeline_mma_full_for_kv(
     ctx.compile_subkernel_ex(SHADER_MMA_FULL, ENTRY_MMA_FULL, variant, label, &[], &uints)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
     MTLSize,
 };
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
@@ -399,12 +399,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     Ok(out)
 }
 
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-pub fn gpu(_: &Fixture, _: KernelVariant) -> Result<Vec<f32>, Error> {
-    Err(Error::Format("Metal unavailable"))
-}
-
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_mma2_for(
     ctx: &crate::metal::device::MetalContext,
     variant: KernelVariant,
@@ -414,7 +409,7 @@ pub fn pipeline_mma2_for(
 
 /// GQA-grouped MMA attention path. One threadgroup per (MMA_M_TILE-row tile, KV
 /// head), 64 lanes = 2 simdgroups (one per Q head in the group). hd <= 256 only.
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu_mma2(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
@@ -505,12 +500,7 @@ pub fn gpu_mma2(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> 
     Ok(out)
 }
 
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-pub fn gpu_mma2(_: &Fixture, _: KernelVariant) -> Result<Vec<f32>, Error> {
-    Err(Error::Format("Metal unavailable"))
-}
-
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_mma_full_for(
     ctx: &crate::metal::device::MetalContext,
     variant: KernelVariant,
@@ -521,7 +511,7 @@ pub fn pipeline_mma_full_for(
 /// Full-layer MMA attention path (hd=512). One threadgroup per (MT-row tile, KV
 /// head, QG-head sub-group); QG simdgroups (32 lanes each) share K/V staging,
 /// O accumulator is register-resident. Identical buffer layout to `gpu_mma`.
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu_mma_full(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
@@ -622,11 +612,6 @@ pub fn gpu_mma_full(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Err
     Ok(out)
 }
 
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-pub fn gpu_mma_full(_: &Fixture, _: KernelVariant) -> Result<Vec<f32>, Error> {
-    Err(Error::Format("Metal unavailable"))
-}
-
 /// Model-shaped attention fixture (canvas=256, 16 Q / 8 KV heads) for benching.
 pub fn model_bench_fixture(hd: usize, kv_len: u32, is_full: bool) -> Fixture {
     model_attn_fixture(256, 16, 8, hd, kv_len, is_full)
@@ -636,7 +621,7 @@ pub fn model_bench_fixture(hd: usize, kv_len: u32, is_full: bool) -> Fixture {
 /// buffer; returns mean ms/dispatch (GPU wall, compile + alloc excluded).
 /// path: 0 = scalar `attention`, 1 = `attention_mma` (1 head/tg), 2 = `attention_mma2`
 /// (2 heads/tg, GQA-shared K/V).
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn bench_path(f: &Fixture, iters: usize, path: u8) -> Result<f64, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
@@ -880,8 +865,8 @@ mod tests {
     }
 
     /// Microbench: scalar vs matrix-unit attention at model shape. Ignored (timing).
-    /// Run: `cargo test --features metal --bin diffgemma-mps attn_mma_bench -- --ignored --nocapture`
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    /// Run: `cargo test --bin diffgemma-mps attn_mma_bench -- --ignored --nocapture`
+    #[cfg(target_os = "macos")]
     #[test]
     #[ignore]
     fn attn_mma_bench() {

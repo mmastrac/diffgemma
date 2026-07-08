@@ -100,7 +100,7 @@ fn shader_and_entry(op: RangedOp) -> (&'static str, &'static str) {
     }
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu(f: &Fixture) -> Result<Vec<f32>, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
@@ -165,19 +165,9 @@ pub fn gpu(f: &Fixture) -> Result<Vec<f32>, Error> {
     Ok(out)
 }
 
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-pub fn gpu(_: &Fixture) -> Result<Vec<f32>, Error> {
-    Err(Error::Format("Metal unavailable"))
-}
-
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu_variant(f: &Fixture, _: super::variant::KernelVariant) -> Result<Vec<f32>, Error> {
     gpu(f)
-}
-
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-pub fn gpu_variant(_: &Fixture, _: super::variant::KernelVariant) -> Result<Vec<f32>, Error> {
-    Err(Error::Format("Metal unavailable"))
 }
 
 #[cfg(test)]
@@ -221,7 +211,7 @@ mod tests {
         min_cos = 1.0,
     }
 
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     mod canvas_vocab {
         use super::*;
         use crate::kernels::sub::test_util::assert_oracle;

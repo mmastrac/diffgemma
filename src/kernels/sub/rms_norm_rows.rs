@@ -104,17 +104,17 @@ pub fn cpu_oracle(fix: &Fixture) -> Vec<f32> {
     cpu(fix)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu(fix: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     gpu_affine(fix, variant, true)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu_no_scale(fix: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     gpu_affine(fix, variant, false)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn gpu_affine(fix: &Fixture, variant: KernelVariant, affine: bool) -> Result<Vec<f32>, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
@@ -193,16 +193,11 @@ fn gpu_affine(fix: &Fixture, variant: KernelVariant, affine: bool) -> Result<Vec
     Ok(out)
 }
 
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-pub fn gpu(_fix: &Fixture, _variant: KernelVariant) -> Result<Vec<f32>, Error> {
-    Err(Error::Format("Metal unavailable"))
-}
-
 pub fn shader_source() -> &'static str {
     SHADER
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_for(
     ctx: &crate::metal::device::MetalContext,
     affine: bool,
@@ -221,12 +216,12 @@ pub fn pipeline_for(
     )
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use objc2::runtime::ProtocolObject;
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder};
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn bind_gpu_buffers(
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     buf_x: &ProtocolObject<dyn MTLBuffer>,
@@ -246,7 +241,7 @@ pub fn bind_gpu_buffers(
     set_bytes(enc, &eps, 4);
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn set_bytes<T>(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, value: &T, index: usize) {
     unsafe {
         encoder.setBytes_length_atIndex(
@@ -257,7 +252,7 @@ fn set_bytes<T>(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, value: &
     }
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn div_up(value: usize, group: usize) -> usize {
     (value + group - 1) / group
 }

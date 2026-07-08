@@ -331,7 +331,7 @@ pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
     cpu(f)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_for(
     ctx: &crate::metal::device::MetalContext,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
@@ -341,7 +341,7 @@ pub fn pipeline_for(
         .ok_or(Error::Format("Metal pipeline missing"))
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu(f: &Fixture) -> Result<Vec<f32>, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
@@ -443,11 +443,6 @@ pub fn gpu(f: &Fixture) -> Result<Vec<f32>, Error> {
     Ok(out)
 }
 
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-pub fn gpu(_: &Fixture) -> Result<Vec<f32>, Error> {
-    Err(Error::Format("Metal unavailable"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,7 +454,7 @@ mod tests {
         assert!(cpu.iter().all(|v| v.is_finite()));
         assert_eq!(cpu.len(), fixture_len(&fix));
 
-        #[cfg(all(feature = "metal", target_os = "macos"))]
+        #[cfg(target_os = "macos")]
         {
             let gpu = gpu(&fix).expect("gpu");
             assert_oracle(&gpu, &cpu, max_tol, 0.9999);

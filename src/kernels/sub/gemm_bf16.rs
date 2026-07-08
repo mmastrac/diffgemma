@@ -10,7 +10,7 @@ pub const ENTRY: &str = "gemm_block";
 const SHADER: &str = shader_include::include_metal!("kernels/gemm_block.metal");
 const RAW: u32 = super::QuantFormat::Raw as u32;
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_for(
     ctx: &crate::metal::device::MetalContext,
     n: u32,
@@ -21,22 +21,13 @@ pub fn pipeline_for(
 
 /// lm_head logits pipeline: forces bf16 output (FC29) so logits keep bf16's range
 /// even when K_ACT_F16 (f16 activations) is on for the input.
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_for_logits(
     ctx: &crate::metal::device::MetalContext,
     n: u32,
     k: u32,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
     ctx.compile_gemm_subkernel_out_bf16(SHADER, ENTRY, n, k, RAW)
-}
-
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-pub fn pipeline_for(
-    _ctx: &crate::metal::device::MetalContext,
-    _n: u32,
-    _k: u32,
-) -> Result<crate::metal::device::ComputePipeline, Error> {
-    Err(Error::Format("Metal unavailable"))
 }
 
 #[cfg(test)]
@@ -106,7 +97,7 @@ pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
     cpu(f)
 }
 
-#[cfg(all(test, feature = "metal", target_os = "macos"))]
+#[cfg(all(test, target_os = "macos"))]
 pub fn gpu(f: &Fixture, _variant: super::KernelVariant) -> Result<Vec<f32>, Error> {
     use crate::kernels::sub::gemm_common;
     use crate::kernels::sub::gemm_q8;
@@ -145,7 +136,7 @@ pub fn gpu(f: &Fixture, _variant: super::KernelVariant) -> Result<Vec<f32>, Erro
         .collect())
 }
 
-#[cfg(all(test, not(all(feature = "metal", target_os = "macos"))))]
+#[cfg(all(test, not(target_os = "macos")))]
 pub fn gpu(_: &Fixture, _: super::KernelVariant) -> Result<Vec<f32>, Error> {
     Err(Error::Format("Metal unavailable"))
 }

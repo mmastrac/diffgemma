@@ -331,7 +331,7 @@ mod tests {
         assert_eq!(bf16_to_f32(f32_to_bf16(0.0)), 0.0);
     }
 
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     #[test]
     fn gpu_f32_bf16_linear_matches_cpu_decoder_mlp_shape() {
         let m = 256usize;
@@ -357,7 +357,7 @@ mod tests {
         assert!(max_diff < 1e-3, "max_diff={max_diff}");
     }
 
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     #[test]
     fn gpu_gemm_matches_cpu_decoder_mlp_shape() {
         let m = 256usize;

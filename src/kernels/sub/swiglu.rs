@@ -157,7 +157,7 @@ pub fn cpu_oracle_interleaved(f: &InterleavedFixture) -> Vec<f32> {
     gate
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_for(
     ctx: &crate::metal::device::MetalContext,
     split: SwigluSplitVariant,
@@ -177,7 +177,7 @@ pub fn pipeline_for(
     )
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn pipeline_for_moe(
     ctx: &crate::metal::device::MetalContext,
     variant: KernelVariant,
@@ -186,12 +186,12 @@ pub fn pipeline_for_moe(
     ctx.compile_subkernel(MOE_SHADER, MOE_ENTRY, variant)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use objc2::runtime::ProtocolObject;
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder};
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn bind_split_in_place_f32(
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     gate: &ProtocolObject<dyn MTLBuffer>,
@@ -209,7 +209,7 @@ pub fn bind_split_in_place_f32(
     gpu_common::set_bytes(enc, &dims, 3);
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn bind_split_half(
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     gate: &ProtocolObject<dyn MTLBuffer>,
@@ -228,7 +228,7 @@ pub fn bind_split_half(
     gpu_common::set_bytes(enc, &dims, 3);
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn bind_moe_gate_up(
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     gate_up: &ProtocolObject<dyn MTLBuffer>,
@@ -244,7 +244,7 @@ pub fn bind_moe_gate_up(
     gpu_common::set_bytes(enc, dims, 2);
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn gpu_split(
     f: &SplitFixture,
     variant: KernelVariant,
@@ -295,12 +295,12 @@ fn gpu_split(
     Ok(out)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu_split_mul(f: &SplitFixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     gpu_split(f, variant, SwigluSplitVariant::DECODER_MUL)
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu_half_glu(f: &HalfFixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
@@ -333,7 +333,7 @@ pub fn gpu_half_glu(f: &HalfFixture, variant: KernelVariant) -> Result<Vec<f32>,
         .collect())
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn gpu_interleaved(f: &InterleavedFixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
@@ -385,22 +385,7 @@ pub fn gpu_interleaved(f: &InterleavedFixture, variant: KernelVariant) -> Result
     Ok(out)
 }
 
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-pub fn gpu_split_mul(_: &SplitFixture, _: KernelVariant) -> Result<Vec<f32>, Error> {
-    Err(Error::Format("Metal unavailable"))
-}
-
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-pub fn gpu_half_glu(_: &HalfFixture, _: KernelVariant) -> Result<Vec<f32>, Error> {
-    Err(Error::Format("Metal unavailable"))
-}
-
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
-pub fn gpu_interleaved(_: &InterleavedFixture, _: KernelVariant) -> Result<Vec<f32>, Error> {
-    Err(Error::Format("Metal unavailable"))
-}
-
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn div_up(value: usize, group: usize) -> usize {
     (value + group - 1) / group
 }

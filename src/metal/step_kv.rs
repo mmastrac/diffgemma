@@ -1336,7 +1336,7 @@ pub fn run_encoder_moe_kv_parity(
     Ok((max_diff, layer, pos))
 }
 
-#[cfg(all(test, feature = "metal", target_os = "macos"))]
+#[cfg(all(test, target_os = "macos"))]
 mod encoder_moe_kv_tests {
     use super::*;
     use crate::chat_template::{ChatFormatOptions, ChatTurn, format_chat_token_ids};
