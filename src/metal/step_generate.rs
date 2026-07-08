@@ -255,6 +255,20 @@ impl StepGenerateSession {
         self.rt.set_kv_len(0);
         self.kv_valid_tokens.clear();
     }
+
+    /// Make the session's KV safe to reuse for `prompt`. Cross-turn reuse assumes
+    /// the cached causal KV is a *prefix* of the next prompt (append-only chat).
+    /// A stateless server sees independent prompts that may diverge from — or be
+    /// shorter than — the cached sequence; reusing that KV would answer from the
+    /// wrong context. So: keep the KV only when the cached tokens are a genuine
+    /// prefix of `prompt` (an extension → reuse prefills just the delta);
+    /// otherwise drop it and re-prefill from scratch.
+    pub fn reset_kv_unless_extends(&mut self, prompt: &[u32]) {
+        let kept = longest_common_prefix(&self.kv_valid_tokens, prompt);
+        if kept < self.kv_valid_tokens.len() {
+            self.reset_kv();
+        }
+    }
 }
 
 /// Monolithic generate: prefill prompt → denoise blocks → extend KV (matches `generate_inner` structure).

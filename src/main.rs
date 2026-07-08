@@ -29,6 +29,8 @@ mod model;
 mod pack;
 mod safetensors;
 mod sample;
+#[cfg(target_os = "macos")]
+mod server;
 mod tensor;
 mod tokenizer;
 mod weights;
@@ -284,6 +286,15 @@ enum Command {
         json: bool,
         /// Context window (max_seq) override; None = default 8192.
         ctx: Option<usize>,
+    },
+    /// OpenAI-compatible HTTP server (`serve`). Single-GPU-queue chat completions.
+    Serve {
+        addr: String,
+        seed: u64,
+        steps: usize,
+        max_layers: Option<usize>,
+        /// Context window (max_seq); default 8192.
+        ctx: usize,
     },
     Smoketest {
         prompts_path: Option<PathBuf>,
@@ -709,6 +720,19 @@ fn main() -> ExitCode {
             json,
             ctx,
         ),
+        Command::Serve {
+            addr,
+            seed,
+            steps,
+            max_layers,
+            ctx,
+        } => match server::run_serve(&cli.model_dir, &addr, ctx, seed, steps, max_layers) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(msg) => {
+                eprintln!("error: {msg}");
+                ExitCode::FAILURE
+            }
+        },
         Command::Smoketest {
             prompts_path,
             seed,
@@ -776,6 +800,7 @@ fn run_command(
         Command::Layer0 => run_layer0_forward(m),
         Command::Attention => run_attention_parity(m),
         Command::Chat { .. } => ExitCode::FAILURE,
+        Command::Serve { .. } => ExitCode::FAILURE,
         Command::Smoketest { .. } => ExitCode::FAILURE,
         Command::Tokenize(_) => ExitCode::FAILURE,
         Command::Gemm { .. } => ExitCode::FAILURE,
@@ -2646,6 +2671,7 @@ fn parse_cli() -> Cli {
     let mut seed = 42u64;
     let mut seed_explicit = false;
     let mut chat_ctx: Option<usize> = None;
+    let mut serve_addr: String = "127.0.0.1:8080".to_string();
     let mut steps_override: Option<usize> = None;
     let mut prompt_len = 8usize;
     let mut max_new_tokens = 256usize;
@@ -2769,6 +2795,11 @@ fn parse_cli() -> Cli {
             "--events" => {
                 if let Some(v) = args.next() {
                     chat_events_path = Some(PathBuf::from(v));
+                }
+            }
+            "--addr" => {
+                if let Some(v) = args.next() {
+                    serve_addr = v;
                 }
             }
             "--assert" => kernel_assert = true,
@@ -3020,6 +3051,13 @@ fn parse_cli() -> Cli {
             events_path: chat_events_path.clone(),
             json: chat_json,
             ctx: chat_ctx,
+        },
+        Some("serve") => Command::Serve {
+            addr: serve_addr.clone(),
+            seed,
+            steps: steps_production,
+            max_layers: parity_layers,
+            ctx: chat_ctx.unwrap_or(8192),
         },
         Some("smoketest") => Command::Smoketest {
             prompts_path: positional.get(1).map(PathBuf::from),
@@ -3354,7 +3392,7 @@ fn parse_cli() -> Cli {
         Some(cmd) => {
             eprintln!("unknown command: {cmd}");
             eprintln!(
-                "usage: diffgemma-mps [-p PROMPT] [--raw] [summary|config|weights <name>|quantize|convert-model|step-smoke|step-probe|step-kv-check|step-kv-parity|step-verify|step-ci|step-parity|bench-step-kernel|bench-step|bench-prefill|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-monolithic|generate-monolithic-parity|generate-parity|chat|tokenize <text>|gemm|attention]"
+                "usage: diffgemma-mps [-p PROMPT] [--raw] [summary|config|weights <name>|quantize|convert-model|step-smoke|step-probe|step-kv-check|step-kv-parity|step-verify|step-ci|step-parity|bench-step-kernel|bench-step|bench-prefill|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-monolithic|generate-monolithic-parity|generate-parity|chat|serve|tokenize <text>|gemm|attention]"
             );
             eprintln!(
                 "  default (no command): generate-monolithic on .dgq, else generate-gpu (bf16)"
