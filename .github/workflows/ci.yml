@@ -4,28 +4,67 @@ on:
   push:
   pull_request:
 
+env:
+  CARGO_TERM_COLOR: always
+
+# This is an Apple-Silicon Metal inference engine. The default (non-metal) build
+# does not compile (the CPU-only path is unmaintained), so CI runs on macOS with
+# the `metal` feature. GitHub-hosted `macos-14` runners are Apple Silicon and
+# expose Metal, so the fixture-based kernel/GPU tests run there. Tests that need
+# the quantized model (smoketest gate, needle) skip gracefully — they belong on a
+# self-hosted runner with the weights (see the nightly scaffold at the bottom).
+
 jobs:
-  test:
+  fmt:
+    # `cargo fmt --check` only parses/formats — no compile, no Metal — so it runs
+    # cheaply on Linux.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
 
-  macos-metal:
-    runs-on: macos-latest
+  build-test:
+    # The real gate: build + the full fixture-based unit/oracle suite on Metal.
+    # MUST be single-threaded — parallel GPU tests SIGSEGV (concurrent Metal
+    # command buffers on the shared device). Model-gated tests skip (no weights).
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --features metal
-      - name: step-ci (skips if no .dgq weights)
-        run: cargo run --release --features metal -- -m /tmp/quantized-weights step-ci --layers 3
-      - name: generate-monolithic-parity (requires local weights)
-        run: |
-          if [ -f /tmp/quantized-weights/model.dgq.json ]; then
-            cargo run --release --features metal -- \
-              -m /tmp/quantized-weights generate-monolithic-parity \
-              -p hello --raw --layers 3 --steps 4 --seed 42 --no-early-stop
-          else
-            echo "skip generate-monolithic-parity (no weights at /tmp/quantized-weights)"
-          fi
+      - name: Build
+        run: cargo build --release --features metal,blas
+      - name: Test (single-threaded — parallel GPU tests crash)
+        run: cargo test --release --features metal,blas -- --test-threads=1
+
+  clippy:
+    # Non-blocking: ~400 pre-existing warnings. Surfaces new lints in the log
+    # without gating; flip to `-D warnings` after a cleanup pass. Needs Metal to
+    # compile (non-metal build is broken), so it runs on macOS.
+    runs-on: macos-14
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --release --features metal,blas
+
+# ---------------------------------------------------------------------------
+# NIGHTLY / model-gated tiers (require the quantized weights + a self-hosted
+# Apple-Silicon runner labeled `[self-hosted, macos, dgq-weights]` with the
+# model at $DGQ_MODEL). Not enabled here — uncomment + point at your runner:
+#
+#   nightly:
+#     runs-on: [self-hosted, macos, dgq-weights]
+#     steps:
+#       - uses: actions/checkout@v4
+#       - uses: dtolnay/rust-toolchain@stable
+#       - run: cargo build --release --features metal,blas
+#       - name: Spec-seed smoketest gate (17/17)
+#         run: ./target/release/diffgemma-mps smoketest -m "$DGQ_MODEL"
+#       - name: Needle retrieval (short)
+#         run: ./target/release/diffgemma-mps ask -m "$DGQ_MODEL" -p "..." # needle probe
+# ---------------------------------------------------------------------------
