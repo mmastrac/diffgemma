@@ -217,6 +217,28 @@ pub struct KvCheckpoint {
     tokens: usize,
 }
 
+/// A saved conversation's KV: the raw KV-cache bytes plus the causal token log
+/// they correspond to. Produced by [`StepGenerateSession::snapshot_kv`] and
+/// loaded by [`StepGenerateSession::restore_kv`]. The conversation manager keeps
+/// these in an LRU pool (RAM in v1; SSD in v2) to swap conversations through the
+/// single hot GPU buffer. `kv_bytes.len()` is the pool cost.
+pub struct KvSnapshot {
+    kv_bytes: Vec<u8>,
+    tokens: Vec<u32>,
+}
+
+impl KvSnapshot {
+    /// Bytes this snapshot occupies in the pool (the KV buffer copy).
+    pub fn byte_len(&self) -> usize {
+        self.kv_bytes.len()
+    }
+
+    /// The causal token log this snapshot represents.
+    pub fn tokens(&self) -> &[u32] {
+        &self.tokens
+    }
+}
+
 /// Reusable monolithic runtime across prompts (M4.3).
 pub struct StepGenerateSession {
     rt: StepRuntime,
@@ -291,6 +313,48 @@ impl StepGenerateSession {
         self.rt
             .set_kv_len(cp.kv_len.min(self.kv_valid_tokens.len() as u32));
         self.kv_valid_tokens.truncate(tokens);
+    }
+
+    /// Causally prefill `tokens` onto the end of the current KV (no denoise),
+    /// extending `kv_valid_tokens`. Used by the conversation manager to finalize
+    /// a turn: after `rollback_to` a checkpoint, extend with only the sanitized
+    /// answer so the persisted KV is the thought-free canonical continuation.
+    /// (Also puts the final answer block — normally bidirectional and excluded —
+    /// into the reusable causal KV immediately.) `tokens` should be short (an
+    /// answer), well within the causal-prefill window.
+    pub fn extend_kv(&mut self, tokens: &[u32]) -> Result<(), Error> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        let offset = self.kv_valid_tokens.len();
+        self.rt.prefill_chunks_from(offset, tokens)?;
+        self.kv_valid_tokens.extend_from_slice(tokens);
+        Ok(())
+    }
+
+    /// Full snapshot of the session's KV state (buffer bytes + causal token log),
+    /// for saving a conversation out of the single hot buffer. Restore with
+    /// [`restore_kv`](Self::restore_kv). See [`KvSnapshot`].
+    pub fn snapshot_kv(&self) -> KvSnapshot {
+        KvSnapshot {
+            kv_bytes: self.rt.snapshot_kv(),
+            tokens: self.kv_valid_tokens.clone(),
+        }
+    }
+
+    /// Load a conversation's KV back into the hot buffer, replacing whatever was
+    /// resident. After this the session continues that conversation as if it had
+    /// never been swapped out.
+    pub fn restore_kv(&mut self, snap: &KvSnapshot) {
+        self.rt.restore_kv(&snap.kv_bytes);
+        self.rt.set_kv_len(snap.tokens.len() as u32);
+        self.kv_valid_tokens = snap.tokens.clone();
+    }
+
+    /// The causal token sequence currently resident in KV (== `kv_len`). Lets the
+    /// conversation manager route by longest-common-prefix without re-tokenizing.
+    pub fn kv_valid_tokens(&self) -> &[u32] {
+        &self.kv_valid_tokens
     }
 
     /// Make the session's KV safe to reuse for `prompt`. Cross-turn reuse assumes

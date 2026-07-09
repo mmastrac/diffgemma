@@ -4562,6 +4562,28 @@ impl StepRuntime {
         self.write_params(params);
     }
 
+    /// Raw byte copy of the entire KV-cache buffer, for saving a conversation's
+    /// KV out of the single hot buffer (multi-conversation swap). v1 copies the
+    /// whole `max_seq` allocation; gathering only the valid `[0, kv_len)` prefix
+    /// per layer is a later size optimization. Pair with the session's
+    /// `kv_valid_tokens` to restore a consistent state via [`restore_kv`].
+    pub fn snapshot_kv(&self) -> Vec<u8> {
+        let buf = &self.bufs.kvcache;
+        let len = buf.length();
+        let src = unsafe { std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, len) };
+        src.to_vec()
+    }
+
+    /// Restore KV-cache bytes captured by [`snapshot_kv`] into the hot buffer.
+    /// The caller must also set `kv_len` (via `set_kv_len`) to match the snapshot.
+    pub fn restore_kv(&mut self, bytes: &[u8]) {
+        let buf = &self.bufs.kvcache;
+        let len = buf.length().min(bytes.len());
+        let dst =
+            unsafe { std::slice::from_raw_parts_mut(buf.contents().as_ptr() as *mut u8, len) };
+        dst[..len].copy_from_slice(&bytes[..len]);
+    }
+
     /// Fast prefill on the monolithic kernels: process the prompt in CANVAS-sized
     /// chunks, each a KV-only CAUSAL forward writing K/V into the b4 cache at
     /// [chunk_start, chunk_start+chunk_len). The last chunk is padded to CANVAS;
