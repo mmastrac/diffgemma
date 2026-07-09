@@ -1238,3 +1238,130 @@ mod tests {
         })
     }
 }
+
+// ===========================================================================
+// Model-gated tool-call smoke tests. These drive the server's *exact* tool path
+// in-process — canonical render → encode-with-specials → generate → parse — so a
+// regression in any of those (or the model's tool-call quality) fails the gate.
+// They skip when the quantized weights aren't present, and run single-threaded
+// (shared GPU). Assertions are type-level (robust to seed/version drift), which
+// is what the degradation experiment showed is the stable invariant.
+// ===========================================================================
+#[cfg(all(test, target_os = "macos"))]
+mod tool_smoke {
+    use crate::metal::{StepGenerateConfig, StepGenerateSession, generate_with_session};
+    use crate::tools::ParsedToolCall;
+    use serde_json::{Value, json};
+    use std::path::{Path, PathBuf};
+
+    fn model_dir() -> Option<PathBuf> {
+        for p in ["model/diffusiongemma-q4emb", "/tmp/quantized-weights"] {
+            let d = PathBuf::from(p);
+            if d.join("model.dgq.json").exists() {
+                return Some(d);
+            }
+        }
+        None
+    }
+
+    /// One tool turn, driven exactly like the server worker: render the messages
+    /// + tools in the model's canonical format, tokenize the specials, generate
+    /// (stop at eos), then parse the calls back. Returns (raw reply, calls).
+    fn tool_turn(dir: &Path, messages: &[Value], tools: &[Value]) -> (String, Vec<ParsedToolCall>) {
+        let tok = crate::tokenizer::Tokenizer::load(dir.join("tokenizer.json")).unwrap();
+        let layers = crate::resolve_model_layers(dir, None).unwrap();
+        let stop = crate::config::load_generation_stop_tokens(dir);
+        let sampler = crate::sample::sampler_for_steps(24, false);
+        const MAX_SEQ: usize = 2048;
+        let mut cfg = StepGenerateConfig::from_generate(7, 512, MAX_SEQ, layers, sampler, false);
+        cfg.stop_token_ids = stop.clone();
+        cfg.degenerate_reply_check = crate::chat_template::empty_reply_check(dir, stop);
+        let (mut session, _) = StepGenerateSession::open(dir, &cfg, None).unwrap();
+
+        let prompt_str = crate::tools::render_conversation(messages, tools, true, false);
+        let prompt = tok.encode_with_specials(&prompt_str);
+        cfg.max_new_tokens = 512.min(MAX_SEQ.saturating_sub(prompt.len()).max(1));
+        let out = generate_with_session(&mut session, &prompt, &cfg, "tool-smoke").unwrap();
+        let new_ids = crate::sample::strip_degenerate_token_ids(
+            out.token_ids.get(prompt.len()..).unwrap_or(&[]),
+        );
+        let text = tok.decode(&new_ids);
+        let calls = crate::tools::parse_tool_calls(&text);
+        (text, calls)
+    }
+
+    fn list_dir_tool() -> Value {
+        json!({"type":"function","function":{
+            "name":"list_dir",
+            "description":"Lists all files and subdirectories in a specified directory path",
+            "parameters":{"type":"object","properties":{
+                "path":{"type":"string","description":"The absolute path to the directory to list (e.g., /tmp)"}},
+                "required":["path"]}}})
+    }
+
+    fn search_tool() -> Value {
+        json!({"type":"function","function":{
+            "name":"search",
+            "description":"Search the web",
+            "parameters":{"type":"object","properties":{
+                "query":{"type":"string","description":"the query"},
+                "count":{"type":"integer","description":"number of results"},
+                "safe":{"type":"boolean","description":"safe search"},
+                "sort":{"type":"string","description":"sort order","enum":["relevance","date"]}},
+                "required":["query"]}}})
+    }
+
+    #[test]
+    fn tool_smoke_emits_a_well_formed_call() {
+        let Some(dir) = model_dir() else {
+            eprintln!("skip tool_smoke_emits_a_well_formed_call: quantized model not present");
+            return;
+        };
+        let msgs = [json!({"role":"user","content":"List the files in /tmp using the tool."})];
+        let (text, calls) = tool_turn(&dir, &msgs, &[list_dir_tool()]);
+        assert!(
+            !calls.is_empty(),
+            "expected a tool call, got reply: {text:?}"
+        );
+        assert_eq!(calls[0].name, "list_dir", "reply: {text:?}");
+        let path = calls[0].arguments.get("path").and_then(Value::as_str);
+        assert!(
+            path.is_some_and(|p| p.contains("tmp")),
+            "path arg should reference /tmp, got {:?} (reply: {text:?})",
+            calls[0].arguments
+        );
+    }
+
+    #[test]
+    fn tool_smoke_argument_types_match_schema() {
+        let Some(dir) = model_dir() else {
+            eprintln!("skip tool_smoke_argument_types_match_schema: quantized model not present");
+            return;
+        };
+        let msgs = [json!({"role":"user","content":
+            "Search for \"rust async\" with 5 results, safe search on, sorted by date. Use the tool."})];
+        let (text, calls) = tool_turn(&dir, &msgs, &[search_tool()]);
+        assert!(
+            !calls.is_empty(),
+            "expected a tool call, got reply: {text:?}"
+        );
+        let a = &calls[0].arguments;
+        assert_eq!(calls[0].name, "search", "reply: {text:?}");
+        // The stable invariant (per the degradation experiment): the model emits
+        // schema-typed args — integer/boolean/valid-enum, not stringified.
+        assert!(
+            a.get("count").is_some_and(Value::is_number),
+            "count should parse as a number, got {a:?} (reply: {text:?})"
+        );
+        assert!(
+            a.get("safe").is_some_and(Value::is_boolean),
+            "safe should parse as a bool, got {a:?} (reply: {text:?})"
+        );
+        if let Some(sort) = a.get("sort").and_then(Value::as_str) {
+            assert!(
+                ["relevance", "date"].contains(&sort),
+                "sort should be a declared enum member, got {sort:?} (reply: {text:?})"
+            );
+        }
+    }
+}
