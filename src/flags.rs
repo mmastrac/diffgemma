@@ -243,6 +243,22 @@ pub fn kv_reuse_enabled() -> bool {
     on_unless_zero("DGQ_KV_REUSE")
 }
 
+/// Byte budget for the server's multi-conversation KV snapshot pool
+/// (`DGQ_CONV_CACHE_GB`, gibibytes → bytes). The manager keeps recent
+/// conversations' KV resident so interleaved clients don't re-prefill on every
+/// switch; over budget, least-recently-used snapshots are dropped (→ re-prefill
+/// from their token log). Default 0 = minimal (effectively single hot
+/// conversation, the prior server behavior). Each snapshot currently costs a
+/// full `max_seq` KV buffer, so size this against free RAM.
+pub fn conv_cache_bytes() -> usize {
+    std::env::var("DGQ_CONV_CACHE_GB")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|g| *g > 0.0)
+        .map(|g| (g * 1024.0 * 1024.0 * 1024.0) as usize)
+        .unwrap_or(0)
+}
+
 /// `DGQ_KV_MMAP=1`: back the session KV cache with a `MAP_SHARED` temp-file mmap
 /// (wrapped no-copy as the Metal buffer) instead of anonymous device memory, so
 /// under memory pressure dirty KV pages evict to that file rather than to the

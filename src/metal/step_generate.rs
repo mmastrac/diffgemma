@@ -237,6 +237,17 @@ impl KvSnapshot {
     pub fn tokens(&self) -> &[u32] {
         &self.tokens
     }
+
+    /// Test-only: a snapshot with a recorded byte cost but no real KV, so the
+    /// conversation manager's routing/LRU/accounting can be exercised without a
+    /// GPU session.
+    #[cfg(test)]
+    pub fn for_test(byte_len: usize) -> Self {
+        Self {
+            kv_bytes: vec![0u8; byte_len],
+            tokens: Vec::new(),
+        }
+    }
 }
 
 /// Reusable monolithic runtime across prompts (M4.3).
@@ -313,6 +324,17 @@ impl StepGenerateSession {
         self.rt
             .set_kv_len(cp.kv_len.min(self.kv_valid_tokens.len() as u32));
         self.kv_valid_tokens.truncate(tokens);
+    }
+
+    /// Truncate the resident KV to its first `n_tokens` causal positions (the
+    /// physical bytes past `n_tokens` are left stale but never read; the next
+    /// `extend_kv`/prefill overwrites them). The raw-length twin of
+    /// `rollback_to`, used by the conversation manager's turn finalize: roll back
+    /// to the reuse point, then `extend_kv` the canonical (thought-free) tail.
+    pub fn truncate_kv_to(&mut self, n_tokens: usize) {
+        let n = n_tokens.min(self.kv_valid_tokens.len());
+        self.rt.set_kv_len(n as u32);
+        self.kv_valid_tokens.truncate(n);
     }
 
     /// Causally prefill `tokens` onto the end of the current KV (no denoise),

@@ -498,7 +498,7 @@ impl Worker {
     /// on this thread), signal readiness, then drain the job queue one at a time.
     fn run(self, ready: mpsc::Sender<Result<(), String>>, jobs: mpsc::Receiver<Job>) {
         let open_started = std::time::Instant::now();
-        let mut session =
+        let session =
             match crate::metal::StepGenerateSession::open(&self.model_dir, &self.base_cfg, None) {
                 Ok((s, _compile)) => s,
                 Err(err) => {
@@ -506,20 +506,23 @@ impl Worker {
                     return;
                 }
             };
+        let cache_bytes = crate::flags::conv_cache_bytes();
+        let mut manager = crate::conversation::ConversationManager::new(session, cache_bytes);
         eprintln!(
-            "serve: model ready ({:.1}s, ctx={})",
+            "serve: model ready ({:.1}s, ctx={}, conv-cache={:.1} GiB)",
             open_started.elapsed().as_secs_f64(),
-            self.max_seq
+            self.max_seq,
+            cache_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
         );
         if ready.send(Ok(())).is_err() {
             return;
         }
         for job in jobs {
-            self.handle(&mut session, job);
+            self.handle(&mut manager, job);
         }
     }
 
-    fn handle(&self, session: &mut crate::metal::StepGenerateSession, job: Job) {
+    fn handle(&self, manager: &mut crate::conversation::ConversationManager, job: Job) {
         let history: Vec<crate::chat_template::ChatTurn> = job
             .turns
             .iter()
@@ -582,20 +585,49 @@ impl Worker {
             }));
         }
 
-        // Independent requests: keep the cached KV only when this prompt extends
-        // it (a continuing conversation), else drop it so we don't answer from a
-        // previous request's context.
-        session.reset_kv_unless_extends(&prompt);
+        // Route this prompt to its conversation (longest-prefix match), loading
+        // that conversation's KV into the hot buffer. `generate_with_session`
+        // then reuses the conversation's prefix and prefills only the new-turn
+        // delta (or re-prefills whole for a new/evicted conversation).
+        let conv_id = manager.activate(&prompt);
 
-        let out = crate::metal::generate_with_session(session, &prompt, &cfg, "serve");
+        let out =
+            crate::metal::generate_with_session(manager.session_mut(), &prompt, &cfg, "serve");
         cfg.step_observer = None;
         match out {
             Ok(out) => {
-                let m = mapper.lock().unwrap();
+                let content = mapper.lock().unwrap().content().to_string();
+                let reasoning = mapper.lock().unwrap().reasoning().to_string();
                 let completion_tokens = out.token_ids.len().saturating_sub(prompt_len);
+
+                // Finalize the turn to the canonical completed-turns log (sanitized
+                // answer, no `thought` channel, no generation-prompt scaffold) so
+                // the conversation's snapshot is a clean prefix of the next turn's
+                // prompt — reasoning never persists, and reuse survives a swap.
+                let mut completed = history.clone();
+                completed.push(crate::chat_template::ChatTurn::model(content.clone()));
+                let finalize_opts = crate::chat_template::ChatFormatOptions {
+                    add_generation_prompt: false,
+                    enable_thinking: false,
+                };
+                match crate::chat_template::format_chat_token_ids(
+                    &self.tokenizer,
+                    &completed,
+                    &finalize_opts,
+                ) {
+                    Ok(canonical) => {
+                        if let Err(err) = manager.finalize(conv_id, &canonical) {
+                            // A failed finalize only costs reuse (next turn
+                            // re-prefills); the reply is already correct.
+                            eprintln!("serve: conversation finalize failed: {err}");
+                        }
+                    }
+                    Err(err) => eprintln!("serve: canonical prompt build failed: {err}"),
+                }
+
                 let _ = job.resp.send(ServerEvent::Done {
-                    content: m.content().to_string(),
-                    reasoning: m.reasoning().to_string(),
+                    content,
+                    reasoning,
                     prompt_tokens: prompt_len,
                     completion_tokens,
                     stopped: out.stopped_on_eot,

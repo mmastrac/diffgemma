@@ -15,6 +15,8 @@ mod chat_template;
 #[cfg(target_os = "macos")]
 mod chat_ui;
 mod config;
+#[cfg(target_os = "macos")]
+mod conversation;
 mod denoise_trace;
 mod dgq;
 mod fast_slice;
