@@ -229,6 +229,13 @@ impl ConversationManager {
     /// (once `current` has moved on, so `id` can itself be spilled if needed).
     fn stash(&mut self, id: u64) {
         self.free_residence(id);
+        // With no snapshot pool at all, rebalance would drop the snapshot
+        // immediately — skip the full-KV gather (a conversation switch then
+        // costs only the target's re-prefill, not a wasted copy-out too).
+        if self.ram_budget == 0 && self.disk_budget == 0 {
+            self.touch(id);
+            return;
+        }
         let snap = self.session.snapshot_kv();
         self.ram_used += snap.byte_len();
         if let Some(c) = self.convs.get_mut(&id) {

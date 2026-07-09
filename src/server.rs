@@ -617,14 +617,10 @@ impl Worker {
                         .map_err(|err| eprintln!("serve: canonical prompt build failed: {err}"))
                         .ok()
                 };
-                if let Some(canonical) = canonical {
-                    if let Err(err) = manager.finalize(conv_id, &canonical) {
-                        // A failed finalize only costs reuse (next turn re-prefills);
-                        // the reply is already correct.
-                        eprintln!("serve: conversation finalize failed: {err}");
-                    }
-                }
-
+                // Unblock the client BEFORE the finalize KV rebuild: finalize is
+                // ~a prefill-chunk of GPU work the reply doesn't depend on, and
+                // stalling the finish chunk on it made serve feel slower than
+                // chat. The single worker still finishes it before the next job.
                 let _ = job.resp.send(ServerEvent::Done {
                     content,
                     reasoning,
@@ -633,6 +629,14 @@ impl Worker {
                     completion_tokens,
                     stopped: out.stopped_on_eot,
                 });
+
+                if let Some(canonical) = canonical {
+                    if let Err(err) = manager.finalize(conv_id, &canonical) {
+                        // A failed finalize only costs reuse (next turn re-prefills);
+                        // the reply is already correct.
+                        eprintln!("serve: conversation finalize failed: {err}");
+                    }
+                }
             }
             Err(err) => {
                 let _ = job.resp.send(ServerEvent::Error(format!("{err}")));
@@ -699,10 +703,11 @@ impl Worker {
         // already compacted in the conversation's canonical log, so the
         // longest-prefix match holds whether or not this turn's NEW tool
         // responses (still verbose here) have been summarized yet.
+        let routing_messages = substitute(store, &job.messages);
         let routing_prompt =
             self.tokenizer
                 .encode_with_specials(&crate::tools::render_conversation(
-                    &substitute(store, &job.messages),
+                    &routing_messages,
                     &tools_aug,
                     true,
                     thinking,
@@ -712,6 +717,7 @@ impl Worker {
         // Summarize passes for new over-threshold responses, in message order
         // (each sees prior substitutions). Failures degrade to a mechanical
         // head+tail digest — compaction never blocks the reply.
+        let mut summarized_any = false;
         for cand in tc::find_compactable(&job.messages, cc.threshold, &count) {
             if store.get(cand.hash).is_some() {
                 continue;
@@ -754,10 +760,11 @@ impl Worker {
             };
             let summary = summary.unwrap_or_else(|| tc::mechanical_summary(&cand.text, 1024));
             eprintln!(
-                "serve: tool-compact: summarized {} tokens as {} ({:.1}s)",
+                "serve: tool-compact: summarized {} tokens as {} ({:.1}s):\n  | {}",
                 count(&cand.text),
                 tc::output_id(cand.hash),
                 started.elapsed().as_secs_f64(),
+                summary.replace('\n', "\n  | "),
             );
             if let Err(err) = store.put(cand.hash, &cand.text, summary) {
                 // No store entry → the resolver misses → verbose passthrough.
@@ -766,19 +773,23 @@ impl Worker {
                     tc::output_id(cand.hash)
                 );
             }
+            summarized_any = true;
         }
 
         // Main generation over the fully substituted prompt, with a bounded
-        // server-side expand_summary loop.
-        let messages_sub = substitute(store, &job.messages);
-        let prompt = self
-            .tokenizer
-            .encode_with_specials(&crate::tools::render_conversation(
-                &messages_sub,
-                &tools_aug,
-                true,
-                thinking,
-            ));
+        // server-side expand_summary loop. When no summarize pass ran, the
+        // routing render IS the main prompt — skip the duplicate render+encode.
+        let (messages_sub, prompt) = if summarized_any {
+            let msgs = substitute(store, &job.messages);
+            let p = self
+                .tokenizer
+                .encode_with_specials(&crate::tools::render_conversation(
+                    &msgs, &tools_aug, true, thinking,
+                ));
+            (msgs, p)
+        } else {
+            (routing_messages, routing_prompt)
+        };
         let prompt_len = prompt.len();
         let budget = self.max_seq.saturating_sub(prompt_len + canvas);
         if budget == 0 {
@@ -925,10 +936,9 @@ impl Worker {
             .encode_with_specials(&crate::tools::render_conversation(
                 &completed, &tools_aug, false, thinking,
             ));
-        if let Err(err) = manager.finalize(conv_id, &canonical) {
-            eprintln!("serve: conversation finalize failed: {err}");
-        }
 
+        // Unblock the client before the finalize KV rebuild (same reasoning as
+        // the plain path — the reply doesn't depend on it).
         let _ = job.resp.send(ServerEvent::Done {
             content,
             reasoning,
@@ -937,6 +947,10 @@ impl Worker {
             completion_tokens,
             stopped,
         });
+
+        if let Err(err) = manager.finalize(conv_id, &canonical) {
+            eprintln!("serve: conversation finalize failed: {err}");
+        }
     }
 }
 
@@ -1179,7 +1193,10 @@ fn handle_chat(
         // anyway, so reasoning_content stays empty. Clients opt in per request;
         // the reasoning_content plumbing is fully wired for when it fires.
         enable_thinking: req.enable_thinking.unwrap_or(false),
-        emit_drafts: req.x_diffusion_drafts.unwrap_or(true),
+        // Draft deltas only exist for streaming responses; a non-streaming
+        // request would decode the full canvas every step just to have
+        // respond_json discard the events.
+        emit_drafts: req.x_diffusion_drafts.unwrap_or(true) && req.stream,
         resp: resp_tx,
     };
     let streaming = job.stream;
