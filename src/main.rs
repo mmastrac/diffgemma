@@ -35,6 +35,7 @@ mod sample;
 mod server;
 mod tensor;
 mod tokenizer;
+mod tools;
 mod weights;
 
 use std::env;

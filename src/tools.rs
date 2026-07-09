@@ -1,0 +1,388 @@
+//! Tool-use (function calling) formatting + parsing for diffusiongemma.
+//!
+//! The model was trained with a custom tool grammar (its `chat_template.jinja`,
+//! reproduced by `python/scripts/tool_format_oracle.py`), NOT plain JSON. This
+//! module mirrors that grammar exactly so tool definitions we inject match what
+//! the model saw in training, and parses the calls it emits back into the OpenAI
+//! `tool_calls` shape. Pure (no GPU) and unit-tested byte-for-byte against the
+//! jinja oracle.
+//!
+//! Grammar (see the oracle):
+//! - **definition**: `<|tool>declaration:NAME{description:<|"|>…<|"|>,parameters:{
+//!   properties:{KEY:{description:<|"|>…<|"|>,…,type:<|"|>TYPE<|"|>},…},
+//!   required:[<|"|>k<|"|>,…],type:<|"|>OBJECT<|"|>}}<tool|>` — property keys
+//!   sorted, string values/descriptions/types wrapped in the `<|"|>` quote token,
+//!   types upper-cased, `type` always last within a property.
+//! - **call** (model output): `<|tool_call>call:NAME{key:value,…}<tool_call|>`,
+//!   one wrapper per call, bare keys, `<|"|>`-quoted string values.
+
+use serde_json::{Map, Value};
+
+/// The `<|"|>` string-quote special token (id 52) used throughout the grammar.
+const Q: &str = "<|\"|>";
+
+// ===========================================================================
+// Definitions: OpenAI `tools` → the model's `<|tool>declaration:…<tool|>` grammar
+// ===========================================================================
+
+/// Format OpenAI `tools` into the concatenated `<|tool>…<tool|>` declaration
+/// blocks the model expects in the system turn. Returns "" for no tools.
+pub fn format_tool_declarations(tools: &[Value]) -> String {
+    tools
+        .iter()
+        .map(|t| format!("<|tool>{}<tool|>", format_declaration(t)))
+        .collect()
+}
+
+fn format_declaration(tool: &Value) -> String {
+    let f = tool.get("function").unwrap_or(tool);
+    let name = f.get("name").and_then(Value::as_str).unwrap_or("");
+    let desc = f.get("description").and_then(Value::as_str).unwrap_or("");
+    let mut s = format!("declaration:{name}{{description:{Q}{desc}{Q}");
+    if let Some(params) = f.get("parameters").filter(|p| p.is_object()) {
+        let mut fields: Vec<String> = Vec::new();
+        if let Some(props) = params.get("properties").and_then(Value::as_object) {
+            fields.push(format!("properties:{{{}}}", format_parameters(props)));
+        }
+        let req = required_list(params);
+        if !req.is_empty() {
+            fields.push(format!("required:[{req}]"));
+        }
+        if let Some(ty) = params.get("type").and_then(Value::as_str) {
+            fields.push(format!("type:{Q}{}{Q}", ty.to_uppercase()));
+        }
+        s.push_str(",parameters:{");
+        s.push_str(&fields.join(","));
+        s.push('}');
+    }
+    s.push('}');
+    s
+}
+
+/// `key:{body},key:{body}` for properties, keys in sorted order (jinja `dictsort`).
+fn format_parameters(props: &Map<String, Value>) -> String {
+    let mut keys: Vec<&String> = props.keys().collect();
+    keys.sort();
+    keys.iter()
+        .map(|k| format!("{k}:{{{}}}", format_property_body(&props[*k])))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// One property's inner fields: `description`, then type-specific (`enum`/`items`),
+/// then `nullable`, then object `properties`/`required`, and `type` always last.
+fn format_property_body(v: &Value) -> String {
+    let ty = v
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_uppercase();
+    let mut fields: Vec<String> = Vec::new();
+    if let Some(d) = v.get("description").and_then(Value::as_str) {
+        fields.push(format!("description:{Q}{d}{Q}"));
+    }
+    if ty == "STRING" {
+        if let Some(en) = v.get("enum").filter(|e| e.is_array()) {
+            fields.push(format!("enum:{}", format_argument(en, true)));
+        }
+    } else if ty == "ARRAY" {
+        if let Some(items) = v.get("items").filter(|i| i.is_object()) {
+            fields.push(format!("items:{{{}}}", format_items_body(items)));
+        }
+    }
+    if v.get("nullable").and_then(Value::as_bool) == Some(true) {
+        fields.push("nullable:true".into());
+    }
+    if ty == "OBJECT" {
+        if let Some(props) = v.get("properties").and_then(Value::as_object) {
+            fields.push(format!("properties:{{{}}}", format_parameters(props)));
+            let req = required_list(v);
+            if !req.is_empty() {
+                fields.push(format!("required:[{req}]"));
+            }
+        }
+    }
+    fields.push(format!("type:{Q}{ty}{Q}"));
+    fields.join(",")
+}
+
+/// Array `items` body: `type`, `properties`, `required` handled specially, keys sorted.
+fn format_items_body(items: &Value) -> String {
+    let m = items.as_object().unwrap();
+    let mut keys: Vec<&String> = m.keys().collect();
+    keys.sort();
+    let mut parts = Vec::new();
+    for k in keys {
+        let v = &m[k];
+        if v.is_null() {
+            continue;
+        }
+        let part = match k.as_str() {
+            "type" => match v.as_str() {
+                Some(s) => format!("type:{Q}{}{Q}", s.to_uppercase()),
+                None => continue,
+            },
+            "properties" => match v.as_object() {
+                Some(p) => format!("properties:{{{}}}", format_parameters(p)),
+                None => continue,
+            },
+            "required" => format!("required:[{}]", required_list(items)),
+            _ => format!("{k}:{}", format_argument(v, true)),
+        };
+        parts.push(part);
+    }
+    parts.join(",")
+}
+
+/// `<|"|>a<|"|>,<|"|>b<|"|>` from an object's `required` list.
+fn required_list(obj: &Value) -> String {
+    obj.get("required")
+        .and_then(Value::as_array)
+        .map(|r| {
+            r.iter()
+                .filter_map(Value::as_str)
+                .map(|s| format!("{Q}{s}{Q}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default()
+}
+
+/// jinja `format_argument`: strings quoted with `<|"|>`, maps/arrays recursive,
+/// bools bare. `escape_keys` quotes object keys (definitions) vs not (call args).
+fn format_argument(v: &Value, escape_keys: bool) -> String {
+    match v {
+        Value::String(s) => format!("{Q}{s}{Q}"),
+        Value::Bool(b) => if *b { "true" } else { "false" }.into(),
+        Value::Number(n) => n.to_string(),
+        Value::Null => String::new(),
+        Value::Array(a) => format!(
+            "[{}]",
+            a.iter()
+                .map(|x| format_argument(x, escape_keys))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Value::Object(m) => {
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            let body = keys
+                .iter()
+                .map(|k| {
+                    let key = if escape_keys {
+                        format!("{Q}{k}{Q}")
+                    } else {
+                        (*k).clone()
+                    };
+                    format!("{key}:{}", format_argument(&m[*k], escape_keys))
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{body}}}")
+        }
+    }
+}
+
+// ===========================================================================
+// Calls: the model's `<|tool_call>call:NAME{…}<tool_call|>` output → OpenAI shape
+// ===========================================================================
+
+/// A tool call parsed from model output.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedToolCall {
+    pub name: String,
+    /// Arguments as a JSON object (serialized to a string for the OpenAI field).
+    pub arguments: Value,
+}
+
+/// Parse every `call:NAME{ARGS}` in model output into structured tool calls,
+/// tolerant of the exact wrapper tokens around/between them.
+pub fn parse_tool_calls(text: &str) -> Vec<ParsedToolCall> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(pos) = rest.find("call:") {
+        let after = &rest[pos + "call:".len()..];
+        let Some(brace) = after.find('{') else { break };
+        let name = after[..brace].trim().to_string();
+        let Some((inner, consumed)) = read_braced(&after[brace..]) else {
+            break;
+        };
+        out.push(ParsedToolCall {
+            name,
+            arguments: parse_object(inner),
+        });
+        rest = &after[brace + consumed..];
+    }
+    out
+}
+
+/// Given a string starting with '{', return (inner content, bytes consumed incl.
+/// both braces), respecting nested braces. `None` if unbalanced.
+fn read_braced(s: &str) -> Option<(&str, usize)> {
+    let b = s.as_bytes();
+    if b.first() != Some(&b'{') {
+        return None;
+    }
+    let mut depth = 0i32;
+    for (i, &c) in b.iter().enumerate() {
+        match c {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((&s[1..i], i + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Parse a `key:value,key:value` body (bare keys, `<|"|>`-quoted strings) into a
+/// JSON object.
+fn parse_object(inner: &str) -> Value {
+    let mut map = Map::new();
+    for field in split_top_level(inner) {
+        let Some(colon) = field.find(':') else {
+            continue;
+        };
+        let key = field[..colon].trim().trim_matches('"').to_string();
+        if key.is_empty() {
+            continue;
+        }
+        map.insert(key, parse_value(field[colon + 1..].trim()));
+    }
+    Value::Object(map)
+}
+
+fn parse_value(s: &str) -> Value {
+    let s = s.trim();
+    if let Some(inner) = s.strip_prefix(Q).and_then(|x| x.strip_suffix(Q)) {
+        return Value::String(inner.to_string());
+    }
+    if let Some(inner) = s.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
+        return Value::String(inner.to_string());
+    }
+    if s.starts_with('{') {
+        if let Some((body, _)) = read_braced(s) {
+            return parse_object(body);
+        }
+    }
+    if let Some(body) = s.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
+        return Value::Array(split_top_level(body).into_iter().map(parse_value).collect());
+    }
+    match s {
+        "true" => return Value::Bool(true),
+        "false" => return Value::Bool(false),
+        _ => {}
+    }
+    if let Ok(n) = serde_json::from_str::<serde_json::Number>(s) {
+        return Value::Number(n);
+    }
+    Value::String(s.to_string())
+}
+
+/// Split on top-level commas, respecting `{}`/`[]` nesting and `<|"|>` strings.
+fn split_top_level(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut depth, mut start) = (0i32, 0usize);
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Skip over a `<|"|>…<|"|>` quoted run so commas inside don't split.
+        if s[i..].starts_with(Q) {
+            if let Some(end) = s[i + Q.len()..].find(Q) {
+                i += Q.len() + end + Q.len();
+                continue;
+            }
+        }
+        match bytes[i] {
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth -= 1,
+            b',' if depth == 0 => {
+                parts.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if start < s.len() || !s.is_empty() && start == s.len() {
+        let tail = s[start..].trim();
+        if !tail.is_empty() {
+            parts.push(tail);
+        }
+    }
+    parts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // Oracle strings from python/scripts/tool_format_oracle.py (the reference jinja).
+
+    #[test]
+    fn declaration_matches_jinja_oracle_simple() {
+        let tools = [json!({"type":"function","function":{
+            "name":"list_dir",
+            "description":"Lists all files and subdirectories in a specified directory path",
+            "parameters":{"type":"object","properties":{
+                "path":{"type":"string","description":"The absolute path to the directory to list (e.g., /tmp)"}},
+                "required":["path"]}}})];
+        let expected = "<|tool>declaration:list_dir{description:<|\"|>Lists all files and subdirectories in a specified directory path<|\"|>,parameters:{properties:{path:{description:<|\"|>The absolute path to the directory to list (e.g., /tmp)<|\"|>,type:<|\"|>STRING<|\"|>}},required:[<|\"|>path<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|>";
+        assert_eq!(format_tool_declarations(&tools), expected);
+    }
+
+    #[test]
+    fn declaration_matches_jinja_oracle_rich() {
+        let tools = [json!({"type":"function","function":{
+            "name":"search",
+            "description":"Search the web",
+            "parameters":{"type":"object","properties":{
+                "query":{"type":"string","description":"the query"},
+                "count":{"type":"integer","description":"how many"},
+                "safe":{"type":"boolean","description":"safe search"},
+                "sort":{"type":"string","description":"sort order","enum":["relevance","date"]},
+                "tags":{"type":"array","description":"tags","items":{"type":"string"}}},
+                "required":["query"]}}})];
+        let expected = "<|tool>declaration:search{description:<|\"|>Search the web<|\"|>,parameters:{properties:{count:{description:<|\"|>how many<|\"|>,type:<|\"|>INTEGER<|\"|>},query:{description:<|\"|>the query<|\"|>,type:<|\"|>STRING<|\"|>},safe:{description:<|\"|>safe search<|\"|>,type:<|\"|>BOOLEAN<|\"|>},sort:{description:<|\"|>sort order<|\"|>,enum:[<|\"|>relevance<|\"|>,<|\"|>date<|\"|>],type:<|\"|>STRING<|\"|>},tags:{description:<|\"|>tags<|\"|>,items:{type:<|\"|>STRING<|\"|>},type:<|\"|>ARRAY<|\"|>}},required:[<|\"|>query<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|>";
+        assert_eq!(format_tool_declarations(&tools), expected);
+    }
+
+    #[test]
+    fn parse_single_call() {
+        let calls =
+            parse_tool_calls("<|tool_call>call:list_dir{path:<|\"|>/tmp<|\"|>}<tool_call|>");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "list_dir");
+        assert_eq!(calls[0].arguments, json!({"path":"/tmp"}));
+    }
+
+    #[test]
+    fn parse_multiple_calls() {
+        let calls = parse_tool_calls(
+            "<|tool_call>call:list_dir{path:<|\"|>/tmp<|\"|>}<tool_call>call:list_dir{path:<|\"|>/home<|\"|>}<tool_call|>",
+        );
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].arguments, json!({"path":"/tmp"}));
+        assert_eq!(calls[1].arguments, json!({"path":"/home"}));
+    }
+
+    #[test]
+    fn parse_typed_args() {
+        let calls = parse_tool_calls("call:search{query:<|\"|>rust<|\"|>,count:5,safe:true}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].arguments,
+            json!({"query":"rust","count":5,"safe":true})
+        );
+    }
+
+    #[test]
+    fn parse_none_when_no_calls() {
+        assert!(parse_tool_calls("just a normal answer, no tools here").is_empty());
+    }
+}
