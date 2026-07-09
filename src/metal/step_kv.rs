@@ -89,6 +89,57 @@ pub fn kv_cache_total_bytes(layout: &ModelLayout, max_seq: usize) -> u64 {
         .sum()
 }
 
+/// Gather the live `[0, kv_len)` KV of every layer into a compact blob (per-layer
+/// regions concatenated, no capacity tail) — for saving a conversation out of the
+/// hot buffer. Full layers contribute `kv_len` slots; sliding (ring) layers cap
+/// at their window (`kv_slot` is the stateless `pos & mask`, so the live ring is
+/// exactly the first `min(kv_len, window)` physical slots). Inverse:
+/// [`scatter_kv_prefix`], which must be called with the same `max_seq`/`kv_len`.
+pub fn gather_kv_prefix(
+    buf: &ProtocolObject<dyn MTLBuffer>,
+    layout: &ModelLayout,
+    max_seq: usize,
+    kv_len: usize,
+) -> Vec<u8> {
+    let fmt = crate::flags::kv_format(max_seq);
+    let src =
+        unsafe { std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, buf.length()) };
+    let mut out = Vec::new();
+    for i in 0..N_LAYERS {
+        let l = &layout.layers[i];
+        let slots = kv_len.min(layer_slots(l, max_seq));
+        let bytes = kv_region_bytes(l.n_kv_heads, l.head_dim, slots, fmt) as usize;
+        let base = l.kv_region as usize;
+        out.extend_from_slice(&src[base..base + bytes]);
+    }
+    out
+}
+
+/// Restore a blob from [`gather_kv_prefix`] into the KV buffer. Writes only each
+/// layer's live prefix; slots past it are left as-is (never read before the next
+/// prefill overwrites them — the same invariant a fresh prefill leaves). `max_seq`
+/// and `kv_len` MUST match the gather, as they set each layer's slice length.
+pub fn scatter_kv_prefix(
+    buf: &ProtocolObject<dyn MTLBuffer>,
+    layout: &ModelLayout,
+    max_seq: usize,
+    kv_len: usize,
+    blob: &[u8],
+) {
+    let fmt = crate::flags::kv_format(max_seq);
+    let dst =
+        unsafe { std::slice::from_raw_parts_mut(buf.contents().as_ptr() as *mut u8, buf.length()) };
+    let mut off = 0;
+    for i in 0..N_LAYERS {
+        let l = &layout.layers[i];
+        let slots = kv_len.min(layer_slots(l, max_seq));
+        let bytes = kv_region_bytes(l.n_kv_heads, l.head_dim, slots, fmt) as usize;
+        let base = l.kv_region as usize;
+        dst[base..base + bytes].copy_from_slice(&blob[off..off + bytes]);
+        off += bytes;
+    }
+}
+
 /// Pack CPU post-RoPE encoder KV into monolithic b4 layout (bf16, K then V per token).
 pub fn pack_kv_cache_to_monolithic(
     dst: &mut [u8],

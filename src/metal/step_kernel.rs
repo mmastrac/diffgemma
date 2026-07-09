@@ -4562,26 +4562,31 @@ impl StepRuntime {
         self.write_params(params);
     }
 
-    /// Raw byte copy of the entire KV-cache buffer, for saving a conversation's
-    /// KV out of the single hot buffer (multi-conversation swap). v1 copies the
-    /// whole `max_seq` allocation; gathering only the valid `[0, kv_len)` prefix
-    /// per layer is a later size optimization. Pair with the session's
-    /// `kv_valid_tokens` to restore a consistent state via [`restore_kv`].
-    pub fn snapshot_kv(&self) -> Vec<u8> {
-        let buf = &self.bufs.kvcache;
-        let len = buf.length();
-        let src = unsafe { std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, len) };
-        src.to_vec()
+    /// Compact byte snapshot of the live `[0, kv_len)` KV, for saving a
+    /// conversation out of the single hot buffer (multi-conversation swap).
+    /// Gathers only each layer's valid prefix (see `gather_kv_prefix`), so the
+    /// blob is proportional to the conversation length, not the `max_seq`
+    /// capacity. Pair with the session's `kv_valid_tokens` and [`restore_kv`].
+    pub fn snapshot_kv(&self, kv_len: usize) -> Vec<u8> {
+        crate::metal::step_kv::gather_kv_prefix(
+            &self.bufs.kvcache,
+            &self.layout,
+            self.max_seq,
+            kv_len,
+        )
     }
 
-    /// Restore KV-cache bytes captured by [`snapshot_kv`] into the hot buffer.
-    /// The caller must also set `kv_len` (via `set_kv_len`) to match the snapshot.
-    pub fn restore_kv(&mut self, bytes: &[u8]) {
-        let buf = &self.bufs.kvcache;
-        let len = buf.length().min(bytes.len());
-        let dst =
-            unsafe { std::slice::from_raw_parts_mut(buf.contents().as_ptr() as *mut u8, len) };
-        dst[..len].copy_from_slice(&bytes[..len]);
+    /// Restore a compact snapshot from [`snapshot_kv`] into the hot buffer. The
+    /// caller must also set `kv_len` (via `set_kv_len`) to match, and pass the
+    /// same `kv_len` here so each layer's slice length is reconstructed.
+    pub fn restore_kv(&mut self, kv_len: usize, bytes: &[u8]) {
+        crate::metal::step_kv::scatter_kv_prefix(
+            &self.bufs.kvcache,
+            &self.layout,
+            self.max_seq,
+            kv_len,
+            bytes,
+        );
     }
 
     /// Fast prefill on the monolithic kernels: process the prompt in CANVAS-sized

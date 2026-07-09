@@ -359,7 +359,7 @@ impl StepGenerateSession {
     /// [`restore_kv`](Self::restore_kv). See [`KvSnapshot`].
     pub fn snapshot_kv(&self) -> KvSnapshot {
         KvSnapshot {
-            kv_bytes: self.rt.snapshot_kv(),
+            kv_bytes: self.rt.snapshot_kv(self.kv_valid_tokens.len()),
             tokens: self.kv_valid_tokens.clone(),
         }
     }
@@ -368,7 +368,7 @@ impl StepGenerateSession {
     /// resident. After this the session continues that conversation as if it had
     /// never been swapped out.
     pub fn restore_kv(&mut self, snap: &KvSnapshot) {
-        self.rt.restore_kv(&snap.kv_bytes);
+        self.rt.restore_kv(snap.tokens.len(), &snap.kv_bytes);
         self.rt.set_kv_len(snap.tokens.len() as u32);
         self.kv_valid_tokens = snap.tokens.clone();
     }
