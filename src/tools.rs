@@ -335,6 +335,12 @@ fn format_tool_call(tc: &Value) -> String {
     format!("<|tool_call>call:{name}{{{body}}}<tool_call|>")
 }
 
+/// Render one tool response in the canonical grammar (server-side tool
+/// execution, e.g. the compactor's `expand_summary`, extends KV with this).
+pub(crate) fn render_tool_response(name: &str, msg: &Value) -> String {
+    format_tool_response(name.to_string(), msg)
+}
+
 /// `<|tool_response>response:NAME{…}<tool_response|>`. String content wraps in a
 /// `value:` key; object content is rendered field-by-field (bare keys).
 fn format_tool_response(name: String, msg: &Value) -> String {

@@ -35,6 +35,7 @@ mod sample;
 mod server;
 mod tensor;
 mod tokenizer;
+mod toolcompact;
 mod tools;
 mod weights;
 
@@ -301,6 +302,8 @@ enum Command {
         max_layers: Option<usize>,
         /// Context window (max_seq); default 8192.
         ctx: usize,
+        /// Tool-output compaction (KV rewinder). Also `DGQ_TOOL_COMPACT=1`.
+        tool_compact: bool,
     },
     Smoketest {
         prompts_path: Option<PathBuf>,
@@ -734,7 +737,16 @@ fn main() -> ExitCode {
             steps,
             max_layers,
             ctx,
-        } => match server::run_serve(&cli.model_dir, &addr, ctx, seed, steps, max_layers) {
+            tool_compact,
+        } => match server::run_serve(
+            &cli.model_dir,
+            &addr,
+            ctx,
+            seed,
+            steps,
+            max_layers,
+            tool_compact,
+        ) {
             Ok(()) => ExitCode::SUCCESS,
             Err(msg) => {
                 eprintln!("error: {msg}");
@@ -2681,6 +2693,7 @@ fn parse_cli() -> Cli {
     let mut seed_explicit = false;
     let mut chat_ctx: Option<usize> = None;
     let mut serve_addr: String = "127.0.0.1:8080".to_string();
+    let mut serve_tool_compact = false;
     let mut steps_override: Option<usize> = None;
     let mut prompt_len = 8usize;
     let mut max_new_tokens = 256usize;
@@ -2813,6 +2826,7 @@ fn parse_cli() -> Cli {
                     serve_addr = v;
                 }
             }
+            "--tool-compact" => serve_tool_compact = true,
             "--assert" => kernel_assert = true,
             "--debug-deep" => kernel_debug_deep = true,
             "--gpu-kv" => step_gpu_kv = true,
@@ -3080,6 +3094,7 @@ fn parse_cli() -> Cli {
             steps: steps_production,
             max_layers: parity_layers,
             ctx: chat_ctx.unwrap_or(8192),
+            tool_compact: serve_tool_compact,
         },
         Some("smoketest") => Command::Smoketest {
             prompts_path: positional.get(1).map(PathBuf::from),

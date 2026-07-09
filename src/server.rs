@@ -460,6 +460,17 @@ struct Worker {
     steps: usize,
     no_early_stop: bool,
     base_cfg: crate::metal::StepGenerateConfig,
+    tool_compact: Option<ToolCompactCfg>,
+}
+
+/// Tool-output compaction settings (`--tool-compact` / `DGQ_TOOL_COMPACT=1`).
+struct ToolCompactCfg {
+    /// Tool responses over this many tokens get summarized + substituted.
+    threshold: usize,
+    /// Max server-side `expand_summary` round-trips per request.
+    max_expand_rounds: usize,
+    /// Token budget for one summarize pass's reply.
+    summarize_max_new: usize,
 }
 
 impl Worker {
@@ -480,6 +491,13 @@ impl Worker {
         let disk_dir = crate::flags::conv_cache_dir();
         let mut manager =
             crate::conversation::ConversationManager::new(session, ram_bytes, disk_bytes, disk_dir);
+        let mut tool_store = self.tool_compact.as_ref().map(|cc| {
+            eprintln!(
+                "serve: tool-compact ON (threshold {} tokens, {} expand rounds)",
+                cc.threshold, cc.max_expand_rounds
+            );
+            crate::toolcompact::ToolOutputStore::new(crate::flags::tool_compact_dir())
+        });
         let gib = |b: usize| b as f64 / (1024.0 * 1024.0 * 1024.0);
         eprintln!(
             "serve: model ready ({:.1}s, ctx={}, conv-cache={:.1} GiB RAM + {:.1} GiB SSD)",
@@ -492,12 +510,20 @@ impl Worker {
             return;
         }
         for job in jobs {
-            self.handle(&mut manager, job);
+            self.handle(&mut manager, tool_store.as_mut(), job);
         }
     }
 
-    fn handle(&self, manager: &mut crate::conversation::ConversationManager, job: Job) {
+    fn handle(
+        &self,
+        manager: &mut crate::conversation::ConversationManager,
+        store: Option<&mut crate::toolcompact::ToolOutputStore>,
+        job: Job,
+    ) {
         let tool_mode = needs_tool_rendering(&job.messages, &job.tools);
+        if tool_mode && let (Some(cc), Some(store)) = (&self.tool_compact, store) {
+            return self.handle_tool_compact(manager, store, cc, job);
+        }
         let thinking = job.enable_thinking;
         // Plain turns for the non-tool prompt/finalize path (gate-validated).
         let history = build_turns(&job.messages);
@@ -532,32 +558,9 @@ impl Worker {
             return;
         }
 
-        let mut cfg = self.base_cfg.clone();
-        cfg.sampler = crate::sample::sampler_for_steps(self.steps, self.no_early_stop);
-        cfg.max_new_tokens = job.max_tokens.map_or(budget, |c| c.min(budget));
-        cfg.seed = job.seed.unwrap_or(self.base_cfg.seed);
-        cfg.stop_token_ids = self.stop_token_ids.clone();
-        cfg.degenerate_reply_check =
-            crate::chat_template::empty_reply_check(&self.model_dir, self.stop_token_ids.clone());
-
-        let mapper = Arc::new(Mutex::new(DiffusionStreamMapper::new(
-            Arc::clone(&self.tokenizer),
-            self.stop_token_ids.clone(),
-            self.channel_open,
-            self.channel_close,
-            job.enable_thinking,
-            job.emit_drafts,
-        )));
-        {
-            let mapper = Arc::clone(&mapper);
-            let resp = job.resp.clone();
-            cfg.step_observer = Some(Arc::new(move |ev: &crate::metal::StepProgressEvent<'_>| {
-                let deltas = mapper.lock().unwrap().on_step(ev);
-                for d in deltas {
-                    let _ = resp.send(ServerEvent::Delta(d));
-                }
-            }));
-        }
+        let mut cfg = self.per_request_cfg(&job, budget);
+        let mapper = self.make_mapper(&job);
+        attach_stream_observer(&mut cfg, &mapper, &job.resp);
 
         // Route this prompt to its conversation (longest-prefix match), loading
         // that conversation's KV into the hot buffer. `generate_with_session`
@@ -636,6 +639,392 @@ impl Worker {
             }
         }
     }
+
+    /// Per-request generation config shared by every serve path.
+    fn per_request_cfg(&self, job: &Job, budget: usize) -> crate::metal::StepGenerateConfig {
+        let mut cfg = self.base_cfg.clone();
+        cfg.sampler = crate::sample::sampler_for_steps(self.steps, self.no_early_stop);
+        cfg.max_new_tokens = job.max_tokens.map_or(budget, |c| c.min(budget));
+        cfg.seed = job.seed.unwrap_or(self.base_cfg.seed);
+        cfg.stop_token_ids = self.stop_token_ids.clone();
+        cfg.degenerate_reply_check =
+            crate::chat_template::empty_reply_check(&self.model_dir, self.stop_token_ids.clone());
+        cfg
+    }
+
+    fn make_mapper(&self, job: &Job) -> ServeMapper {
+        Arc::new(Mutex::new(DiffusionStreamMapper::new(
+            Arc::clone(&self.tokenizer),
+            self.stop_token_ids.clone(),
+            self.channel_open,
+            self.channel_close,
+            job.enable_thinking,
+            job.emit_drafts,
+        )))
+    }
+
+    /// Tool-mode request with compaction on (the KV rewinder). Over-threshold
+    /// tool responses are summarized by the model (checkpoint → summarize pass
+    /// → rollback) and replaced in every render by `{summary, full_output_id}`;
+    /// the model can retrieve slices of the stored full output via the built-in
+    /// `expand_summary` tool, executed server-side in a bounded in-turn loop.
+    /// Excerpts are turn-scoped: finalize rebuilds the canonical compacted log,
+    /// evicting them from KV.
+    fn handle_tool_compact(
+        &self,
+        manager: &mut crate::conversation::ConversationManager,
+        store: &mut crate::toolcompact::ToolOutputStore,
+        cc: &ToolCompactCfg,
+        job: Job,
+    ) {
+        use crate::toolcompact as tc;
+        let thinking = job.enable_thinking;
+        let canvas = crate::metal::CANVAS;
+
+        // The retrieval tool is appended (last) on EVERY render — prompt,
+        // summarize passes, and canonical — so the system-turn prefix stays
+        // stable for KV reuse.
+        let mut tools_aug = job.tools.clone();
+        tools_aug.push(tc::expand_summary_tool());
+
+        let count = |s: &str| self.tokenizer.encode(s, false).len();
+        let substitute =
+            |store: &tc::ToolOutputStore, msgs: &[serde_json::Value]| -> Vec<serde_json::Value> {
+                tc::compact_messages(msgs, cc.threshold, &count, &|h| {
+                    store.get(h).map(|o| (o.id.clone(), o.summary.clone()))
+                })
+            };
+
+        // Route with the current-store substitution: completed turns are
+        // already compacted in the conversation's canonical log, so the
+        // longest-prefix match holds whether or not this turn's NEW tool
+        // responses (still verbose here) have been summarized yet.
+        let routing_prompt =
+            self.tokenizer
+                .encode_with_specials(&crate::tools::render_conversation(
+                    &substitute(store, &job.messages),
+                    &tools_aug,
+                    true,
+                    thinking,
+                ));
+        let conv_id = manager.activate(&routing_prompt);
+
+        // Summarize passes for new over-threshold responses, in message order
+        // (each sees prior substitutions). Failures degrade to a mechanical
+        // head+tail digest — compaction never blocks the reply.
+        for cand in tc::find_compactable(&job.messages, cc.threshold, &count) {
+            if store.get(cand.hash).is_some() {
+                continue;
+            }
+            let started = std::time::Instant::now();
+            let mut ctx = substitute(store, &job.messages[..=cand.idx]);
+            ctx.push(serde_json::json!({
+                "role": "user", "content": tc::summarize_instruction(),
+            }));
+            let too_big = |ctx: &[serde_json::Value]| {
+                let p = self
+                    .tokenizer
+                    .encode_with_specials(&crate::tools::render_conversation(
+                        ctx, &tools_aug, true, false,
+                    ));
+                p.len() + canvas + 64 > self.max_seq
+            };
+            if too_big(&ctx) {
+                // The verbose response alone blows the context: summarize a
+                // head+tail slice instead (the stored full output keeps every
+                // byte and stays reachable via expand_summary).
+                ctx[cand.idx]["content"] =
+                    serde_json::Value::String(tc::mechanical_summary(&cand.text, cc.threshold * 8));
+            }
+            let summary = if too_big(&ctx) {
+                None
+            } else {
+                run_summarize_pass(
+                    manager.session_mut(),
+                    &self.tokenizer,
+                    &self.base_cfg,
+                    self.steps,
+                    &self.stop_token_ids,
+                    &self.model_dir,
+                    self.max_seq,
+                    cc.summarize_max_new,
+                    &ctx,
+                    &tools_aug,
+                )
+            };
+            let summary = summary.unwrap_or_else(|| tc::mechanical_summary(&cand.text, 1024));
+            eprintln!(
+                "serve: tool-compact: summarized {} tokens as {} ({:.1}s)",
+                count(&cand.text),
+                tc::output_id(cand.hash),
+                started.elapsed().as_secs_f64(),
+            );
+            if let Err(err) = store.put(cand.hash, &cand.text, summary) {
+                // No store entry → the resolver misses → verbose passthrough.
+                eprintln!(
+                    "serve: tool-compact: store write failed for {}: {err}",
+                    tc::output_id(cand.hash)
+                );
+            }
+        }
+
+        // Main generation over the fully substituted prompt, with a bounded
+        // server-side expand_summary loop.
+        let messages_sub = substitute(store, &job.messages);
+        let prompt = self
+            .tokenizer
+            .encode_with_specials(&crate::tools::render_conversation(
+                &messages_sub,
+                &tools_aug,
+                true,
+                thinking,
+            ));
+        let prompt_len = prompt.len();
+        let budget = self.max_seq.saturating_sub(prompt_len + canvas);
+        if budget == 0 {
+            let _ = job.resp.send(ServerEvent::Error(format!(
+                "prompt ({prompt_len} tokens) leaves no room for a reply within the {}-token context",
+                self.max_seq
+            )));
+            return;
+        }
+
+        let mut content_pieces: Vec<String> = Vec::new();
+        let mut reasoning = String::new();
+        let mut completion_tokens = 0usize;
+        let mut tool_calls_out: Vec<serde_json::Value> = Vec::new();
+        let mut stopped = false;
+        let mut round_prompt = prompt;
+
+        for round in 0..=cc.max_expand_rounds {
+            let remaining = job.max_tokens.map(|m| m.saturating_sub(completion_tokens));
+            let room = self.max_seq.saturating_sub(round_prompt.len() + canvas);
+            // Cap CUMULATIVE completion at the main prompt's budget so the
+            // canonical log (prompt + all rounds' content) stays finalizable
+            // within the context.
+            let cum_room = budget.saturating_sub(completion_tokens);
+            if remaining == Some(0) || room == 0 || cum_room == 0 {
+                break;
+            }
+            let mut cfg = self.per_request_cfg(&job, room);
+            cfg.max_new_tokens = cfg.max_new_tokens.min(cum_room);
+            if let Some(r) = remaining {
+                cfg.max_new_tokens = cfg.max_new_tokens.min(r);
+            }
+            // Fresh mapper per round: block indices restart at 1 on every
+            // generation, and a prior round's stop token must not eat this
+            // round's text.
+            let mapper = self.make_mapper(&job);
+            attach_stream_observer(&mut cfg, &mapper, &job.resp);
+
+            let out = crate::metal::generate_with_session(
+                manager.session_mut(),
+                &round_prompt,
+                &cfg,
+                "serve",
+            );
+            let out = match out {
+                Ok(o) => o,
+                Err(err) => {
+                    let _ = job.resp.send(ServerEvent::Error(format!("{err}")));
+                    return;
+                }
+            };
+            let raw = mapper.lock().unwrap().content().to_string();
+            reasoning.push_str(mapper.lock().unwrap().reasoning());
+            completion_tokens += out.token_ids.len().saturating_sub(round_prompt.len());
+            stopped = out.stopped_on_eot;
+
+            let calls = crate::tools::parse_tool_calls(&raw);
+            let piece = crate::tools::content_before_tool_calls(&raw);
+            if !piece.is_empty() {
+                content_pieces.push(piece);
+            }
+            let (expand_calls, user_calls): (Vec<_>, Vec<_>) = calls
+                .into_iter()
+                .partition(|c| c.name == tc::EXPAND_TOOL_NAME);
+
+            // Only a pure expand round continues the turn; anything else (user
+            // tool calls, a plain answer) finishes it. expand_summary never
+            // reaches the client.
+            if !user_calls.is_empty() || expand_calls.is_empty() {
+                if !expand_calls.is_empty() {
+                    eprintln!(
+                        "serve: tool-compact: dropped {} expand_summary call(s) mixed with user tool calls",
+                        expand_calls.len()
+                    );
+                }
+                tool_calls_out = crate::tools::to_openai_tool_calls(&user_calls);
+                break;
+            }
+            if round == cc.max_expand_rounds {
+                eprintln!(
+                    "serve: tool-compact: expand round cap reached; {} call(s) unanswered",
+                    expand_calls.len()
+                );
+                break;
+            }
+
+            // Serve the expand calls locally and continue the turn: extend KV
+            // with the model's own emitted tokens + the canonical tool
+            // responses (its actual ids — no decode/re-encode drift), then
+            // re-enter generation with prompt == kv_valid_tokens (total reuse,
+            // fresh block).
+            let mut resp_text = String::new();
+            for call in &expand_calls {
+                let id = call
+                    .arguments
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let excerpt = match store.read_full(id) {
+                    Some(full) => tc::dispatch_expand(&call.arguments, &full),
+                    None => tc::expand_error(&format!("unknown id {id:?}")),
+                };
+                let excerpt = cap_tokens(&self.tokenizer, &excerpt, cc.threshold / 2);
+                eprintln!(
+                    "serve: tool-compact: expand_summary({id}) round {} -> {} chars",
+                    round + 1,
+                    excerpt.len()
+                );
+                resp_text.push_str(&crate::tools::render_tool_response(
+                    tc::EXPAND_TOOL_NAME,
+                    &serde_json::json!({ "content": excerpt }),
+                ));
+            }
+            let mut ext = out.token_ids.clone();
+            ext.extend(self.tokenizer.encode_with_specials(&resp_text));
+            if ext.len() + canvas >= self.max_seq {
+                eprintln!(
+                    "serve: tool-compact: expand response would overflow the context; finishing turn"
+                );
+                break;
+            }
+            let session = manager.session_mut();
+            let reuse = lcp(session.kv_valid_tokens(), &ext);
+            session.truncate_kv_to(reuse);
+            if let Err(err) = session.extend_kv(&ext[reuse..]) {
+                eprintln!("serve: tool-compact: expand KV extend failed: {err}");
+                break;
+            }
+            round_prompt = ext;
+        }
+
+        // Finalize with the substituted canonical log. The LCP truncation
+        // evicts every ephemeral expand excerpt from KV (they diverge from the
+        // canonical at the assistant-turn boundary).
+        let content = content_pieces.join("\n\n").trim().to_string();
+        let mut completed = messages_sub;
+        let mut assistant = serde_json::json!({"role": "assistant", "content": content});
+        if !tool_calls_out.is_empty() {
+            assistant["tool_calls"] = serde_json::Value::Array(tool_calls_out.clone());
+        }
+        completed.push(assistant);
+        let canonical = self
+            .tokenizer
+            .encode_with_specials(&crate::tools::render_conversation(
+                &completed, &tools_aug, false, thinking,
+            ));
+        if let Err(err) = manager.finalize(conv_id, &canonical) {
+            eprintln!("serve: conversation finalize failed: {err}");
+        }
+
+        let _ = job.resp.send(ServerEvent::Done {
+            content,
+            reasoning,
+            tool_calls: tool_calls_out,
+            prompt_tokens: prompt_len,
+            completion_tokens,
+            stopped,
+        });
+    }
+}
+
+type ServeMapper = Arc<Mutex<DiffusionStreamMapper<Arc<crate::tokenizer::Tokenizer>>>>;
+
+fn attach_stream_observer(
+    cfg: &mut crate::metal::StepGenerateConfig,
+    mapper: &ServeMapper,
+    resp: &mpsc::Sender<ServerEvent>,
+) {
+    let mapper = Arc::clone(mapper);
+    let resp = resp.clone();
+    cfg.step_observer = Some(Arc::new(move |ev: &crate::metal::StepProgressEvent<'_>| {
+        let deltas = mapper.lock().unwrap().on_step(ev);
+        for d in deltas {
+            let _ = resp.send(ServerEvent::Delta(d));
+        }
+    }));
+}
+
+/// One checkpoint-bracketed summarize generation: render `messages_ctx`
+/// (conversation up to and including the verbose tool response + the summarize
+/// instruction), generate a bounded reply with NO step observer, extract the
+/// `<summarize>…</summarize>` span, and roll the KV back so nothing of the
+/// pass persists. Returns None when the prompt doesn't fit, generation fails,
+/// or the model produced no usable tags (caller falls back mechanically).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_summarize_pass(
+    session: &mut crate::metal::StepGenerateSession,
+    tokenizer: &crate::tokenizer::Tokenizer,
+    base_cfg: &crate::metal::StepGenerateConfig,
+    steps: usize,
+    stop_token_ids: &[u32],
+    model_dir: &std::path::Path,
+    max_seq: usize,
+    summarize_max_new: usize,
+    messages_ctx: &[serde_json::Value],
+    tools: &[serde_json::Value],
+) -> Option<String> {
+    let s = crate::tools::render_conversation(messages_ctx, tools, true, false);
+    let prompt = tokenizer.encode_with_specials(&s);
+    let room = max_seq.saturating_sub(prompt.len() + crate::metal::CANVAS);
+    if room < 64 {
+        return None;
+    }
+    let mut cfg = base_cfg.clone();
+    cfg.sampler = crate::sample::sampler_for_steps(steps, false);
+    cfg.max_new_tokens = summarize_max_new.min(room);
+    cfg.stop_token_ids = stop_token_ids.to_vec();
+    cfg.degenerate_reply_check =
+        crate::chat_template::empty_reply_check(model_dir, stop_token_ids.to_vec());
+    cfg.step_observer = None;
+
+    let cp = session.checkpoint();
+    let result = crate::metal::generate_with_session(session, &prompt, &cfg, "tool-compact");
+    // Always rewind — the verbose response, the instruction, and the summary
+    // itself must never persist in the conversation's KV.
+    session.rollback_to(&cp);
+    let out = match result {
+        Ok(o) => o,
+        Err(err) => {
+            eprintln!("serve: tool-compact: summarize pass failed: {err}");
+            return None;
+        }
+    };
+    let generated = &out.token_ids[prompt.len().min(out.token_ids.len())..];
+    let text = crate::chat_template::sanitize_model_reply(
+        &tokenizer.decode(&crate::sample::strip_degenerate_token_ids(generated)),
+    );
+    crate::toolcompact::extract_summary(&text)
+}
+
+/// Longest common prefix (in tokens).
+fn lcp(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+/// Cap an expand excerpt to a token budget so retrieval can't blow the
+/// context the compactor just reclaimed.
+fn cap_tokens(tokenizer: &crate::tokenizer::Tokenizer, text: &str, max_tokens: usize) -> String {
+    let max_tokens = max_tokens.max(16);
+    let ids = tokenizer.encode(text, false);
+    if ids.len() <= max_tokens {
+        return text.to_string();
+    }
+    let mut s = tokenizer.decode(&ids[..max_tokens]);
+    s.push_str("\n[excerpt truncated]");
+    s
 }
 
 // ===========================================================================
@@ -1046,6 +1435,7 @@ pub fn run_serve(
     seed: u64,
     steps: usize,
     max_layers: Option<usize>,
+    tool_compact: bool,
 ) -> Result<(), String> {
     use crate::metal::StepGenerateConfig;
 
@@ -1082,6 +1472,7 @@ pub fn run_serve(
     // signals readiness before we start accepting connections.
     let (job_tx, job_rx) = mpsc::channel::<Job>();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+    let tool_compact = tool_compact || crate::flags::tool_compact_enabled();
     let worker = Worker {
         model_dir: model_dir.to_path_buf(),
         tokenizer,
@@ -1092,6 +1483,11 @@ pub fn run_serve(
         steps,
         no_early_stop: false,
         base_cfg,
+        tool_compact: tool_compact.then(|| ToolCompactCfg {
+            threshold: crate::flags::tool_compact_threshold(),
+            max_expand_rounds: 4,
+            summarize_max_new: 512,
+        }),
     };
     eprintln!("serve: loading model…");
     let worker_handle = std::thread::spawn(move || worker.run(ready_tx, job_rx));
@@ -1363,5 +1759,315 @@ mod tool_smoke {
                 "sort should be a declared enum member, got {sort:?} (reply: {text:?})"
             );
         }
+    }
+}
+
+// ===========================================================================
+// Model-gated compaction smoke tests (the KV rewinder). These drive the
+// summarize-pass rewind, the substituted-prompt reuse, the expand re-entry,
+// and the finalize eviction against the real model — the invariants the pure
+// unit tests can't reach. Skip when the weights aren't present; run
+// single-threaded (shared GPU). Assertions are structural (KV lengths, token
+// logs), never on summary wording (seed-robust).
+// ===========================================================================
+#[cfg(all(test, target_os = "macos"))]
+mod tool_compact_smoke {
+    use crate::metal::{StepGenerateConfig, StepGenerateSession, generate_with_session};
+    use crate::toolcompact as tc;
+    use serde_json::{Value, json};
+    use std::path::{Path, PathBuf};
+
+    // The verbose fixture renders ~1800 tokens; 4096 leaves room for the
+    // summarize prompt + a canvas block at every step.
+    const MAX_SEQ: usize = 4096;
+    const THRESHOLD: usize = 64;
+
+    fn model_dir() -> Option<PathBuf> {
+        for p in ["model/diffusiongemma-q4emb", "/tmp/quantized-weights"] {
+            let d = PathBuf::from(p);
+            if d.join("model.dgq.json").exists() {
+                return Some(d);
+            }
+        }
+        None
+    }
+
+    fn open(
+        dir: &Path,
+    ) -> (
+        crate::tokenizer::Tokenizer,
+        StepGenerateConfig,
+        StepGenerateSession,
+    ) {
+        let tok = crate::tokenizer::Tokenizer::load(dir.join("tokenizer.json")).unwrap();
+        let layers = crate::resolve_model_layers(dir, None).unwrap();
+        let stop = crate::config::load_generation_stop_tokens(dir);
+        let sampler = crate::sample::sampler_for_steps(24, false);
+        let mut cfg = StepGenerateConfig::from_generate(7, 512, MAX_SEQ, layers, sampler, false);
+        cfg.stop_token_ids = stop.clone();
+        cfg.degenerate_reply_check = crate::chat_template::empty_reply_check(dir, stop);
+        let (session, _) = StepGenerateSession::open(dir, &cfg, None).unwrap();
+        (tok, cfg, session)
+    }
+
+    fn read_file_tool() -> Value {
+        json!({"type":"function","function":{
+            "name":"read_file",
+            "description":"Read a file from disk",
+            "parameters":{"type":"object","properties":{
+                "path":{"type":"string","description":"absolute path"}},
+                "required":["path"]}}})
+    }
+
+    /// A fake verbose tool output, comfortably over THRESHOLD tokens.
+    fn big_output() -> String {
+        let mut s = String::from("directory listing of /data:\n");
+        for i in 1..=60 {
+            s.push_str(&format!(
+                "file_{i:03}.txt  {}00 bytes  2026-07-0{}\n",
+                i,
+                i % 9 + 1
+            ));
+        }
+        s.push_str("secret_marker=zebra42\n");
+        s
+    }
+
+    fn base_messages(output: &str) -> Vec<Value> {
+        vec![
+            json!({"role":"user","content":"Read /data and tell me what's inside."}),
+            json!({"role":"assistant","content":"","tool_calls":[
+                {"id":"call_0","type":"function",
+                 "function":{"name":"read_file","arguments":"{\"path\":\"/data\"}"}}]}),
+            json!({"role":"tool","tool_call_id":"call_0","content":output}),
+        ]
+    }
+
+    /// The full M1 loop: route → summarize pass (checkpoint/rollback) →
+    /// substituted main generation → finalize. Asserts the KV-state invariants
+    /// at each step.
+    #[test]
+    fn tool_compact_rewind_smoke() {
+        let Some(dir) = model_dir() else {
+            eprintln!("skip tool_compact_rewind_smoke: quantized model not present");
+            return;
+        };
+        let (tok, cfg, session) = open(&dir);
+        let conv_dir =
+            std::env::temp_dir().join(format!("dgq-compact-smoke-{}", std::process::id()));
+        let mut manager = crate::conversation::ConversationManager::new(session, 0, 0, conv_dir);
+
+        let output = big_output();
+        let messages = base_messages(&output);
+        let mut tools = vec![read_file_tool()];
+        tools.push(tc::expand_summary_tool());
+        let count = |s: &str| tok.encode(s, false).len();
+        assert!(
+            count(&output) > THRESHOLD,
+            "fixture must exceed the threshold"
+        );
+
+        // Route + prefill the (still verbose) routing prompt, as the server does.
+        let routing = tok.encode_with_specials(&crate::tools::render_conversation(
+            &messages, &tools, true, false,
+        ));
+        let conv_id = manager.activate(&routing);
+        manager.session_mut().extend_kv(&routing).unwrap();
+        let before = manager.session_mut().kv_valid_tokens().to_vec();
+        assert!(!before.is_empty());
+
+        // Summarize pass: generates, then must roll the KV back exactly.
+        let mut ctx = messages.clone();
+        ctx.push(json!({"role":"user","content": tc::summarize_instruction()}));
+        let stop = crate::config::load_generation_stop_tokens(&dir);
+        let summary_opt = super::run_summarize_pass(
+            manager.session_mut(),
+            &tok,
+            &cfg,
+            24,
+            &stop,
+            &dir,
+            MAX_SEQ,
+            256,
+            &ctx,
+            &tools,
+        );
+        assert_eq!(
+            manager.session_mut().kv_valid_tokens(),
+            &before[..],
+            "summarize pass must leave the KV exactly as it found it"
+        );
+        // Extracted or mechanical — either way compaction proceeds.
+        let summary = summary_opt.unwrap_or_else(|| tc::mechanical_summary(&output, 1024));
+        assert!(!summary.is_empty());
+
+        // Substituted main generation (delta-prefills from the divergence point).
+        let hash = tc::fnv1a64(&output);
+        let resolve = |h: u64| (h == hash).then(|| ("tr_smoke".to_string(), summary.clone()));
+        let messages_sub = tc::compact_messages(&messages, THRESHOLD, &count, &resolve);
+        assert_ne!(messages_sub[2]["content"], messages[2]["content"]);
+        let prompt = tok.encode_with_specials(&crate::tools::render_conversation(
+            &messages_sub,
+            &tools,
+            true,
+            false,
+        ));
+        let mut cfg_main = cfg.clone();
+        cfg_main.max_new_tokens =
+            256.min(MAX_SEQ.saturating_sub(prompt.len() + crate::metal::CANVAS));
+        let out = generate_with_session(manager.session_mut(), &prompt, &cfg_main, "compact-smoke")
+            .expect("substituted generation must succeed");
+        let reply = tok.decode(&crate::sample::strip_degenerate_token_ids(
+            out.token_ids.get(prompt.len()..).unwrap_or(&[]),
+        ));
+        let content = crate::tools::content_before_tool_calls(
+            &crate::chat_template::sanitize_model_reply(&reply),
+        );
+
+        // Finalize with the substituted canonical: the resident KV becomes
+        // exactly the compacted completed-turns log (verbose text evicted).
+        let mut completed = messages_sub.clone();
+        completed.push(json!({"role":"assistant","content": content}));
+        let canonical = tok.encode_with_specials(&crate::tools::render_conversation(
+            &completed, &tools, false, false,
+        ));
+        manager.finalize(conv_id, &canonical).unwrap();
+        assert_eq!(manager.session_mut().kv_valid_tokens(), &canonical[..]);
+        // The canonical log must not contain the verbose response (it holds the
+        // substituted summary object instead) — the whole point of compaction.
+        let canonical_text = tok.decode(&canonical);
+        assert!(
+            !canonical_text.contains("file_042.txt"),
+            "verbose output leaked into canonical KV"
+        );
+        assert!(
+            canonical_text.contains("tr_smoke"),
+            "substituted id missing from canonical KV"
+        );
+    }
+
+    /// The M2 machinery: after a generation, extend the KV with the model's own
+    /// tokens + a server-rendered expand_summary response, re-enter generation
+    /// with prompt == kv_valid_tokens (fresh block), and verify finalize evicts
+    /// the excerpt.
+    #[test]
+    fn tool_compact_expand_reentry_smoke() {
+        let Some(dir) = model_dir() else {
+            eprintln!("skip tool_compact_expand_reentry_smoke: quantized model not present");
+            return;
+        };
+        let (tok, cfg, mut session) = open(&dir);
+
+        let output = big_output();
+        let messages = base_messages(&output);
+        let mut tools = vec![read_file_tool()];
+        tools.push(tc::expand_summary_tool());
+        let count = |s: &str| tok.encode(s, false).len();
+        let hash = tc::fnv1a64(&output);
+        let resolve = |h: u64| {
+            (h == hash).then(|| ("tr_smoke".to_string(), "a directory listing".to_string()))
+        };
+        let messages_sub = tc::compact_messages(&messages, THRESHOLD, &count, &resolve);
+
+        let prompt = tok.encode_with_specials(&crate::tools::render_conversation(
+            &messages_sub,
+            &tools,
+            true,
+            false,
+        ));
+        let mut cfg_r0 = cfg.clone();
+        cfg_r0.max_new_tokens = 256;
+        let out = generate_with_session(&mut session, &prompt, &cfg_r0, "expand-smoke").unwrap();
+
+        // Hand-build the expand round exactly as handle_tool_compact does:
+        // model's own token ids + the canonical rendered tool response.
+        let excerpt =
+            tc::dispatch_expand(&json!({"mode":"grep","pattern":"secret_marker"}), &output);
+        assert!(excerpt.contains("zebra42"));
+        let resp_text =
+            crate::tools::render_tool_response(tc::EXPAND_TOOL_NAME, &json!({"content": excerpt}));
+        let mut ext = out.token_ids.clone();
+        ext.extend(tok.encode_with_specials(&resp_text));
+        assert!(ext.len() + crate::metal::CANVAS < MAX_SEQ);
+        let reuse = ext
+            .iter()
+            .zip(session.kv_valid_tokens())
+            .take_while(|(a, b)| a == b)
+            .count();
+        session.truncate_kv_to(reuse);
+        session.extend_kv(&ext[reuse..]).unwrap();
+        assert_eq!(session.kv_valid_tokens(), &ext[..]);
+
+        // Re-entry: prompt == kv_valid_tokens → no prefill, fresh block denoise.
+        let round_prompt = session.kv_valid_tokens().to_vec();
+        let mut cfg_r1 = cfg.clone();
+        cfg_r1.max_new_tokens =
+            256.min(MAX_SEQ.saturating_sub(round_prompt.len() + crate::metal::CANVAS));
+        let out2 = generate_with_session(&mut session, &round_prompt, &cfg_r1, "expand-smoke")
+            .expect("re-entry after expand extension must succeed");
+        assert!(
+            out2.token_ids.len() > round_prompt.len(),
+            "re-entry must denoise new tokens"
+        );
+
+        // Finalize-equivalent: rebuild the canonical (no expand round in it) and
+        // verify the excerpt tokens are gone from the causal KV.
+        let mut completed = messages_sub.clone();
+        completed.push(json!({"role":"assistant","content":"done"}));
+        let canonical = tok.encode_with_specials(&crate::tools::render_conversation(
+            &completed, &tools, false, false,
+        ));
+        let reuse = canonical
+            .iter()
+            .zip(session.kv_valid_tokens())
+            .take_while(|(a, b)| a == b)
+            .count();
+        session.truncate_kv_to(reuse);
+        session.extend_kv(&canonical[reuse..]).unwrap();
+        assert_eq!(session.kv_valid_tokens(), &canonical[..]);
+        assert!(
+            !tok.decode(session.kv_valid_tokens()).contains("zebra42"),
+            "expand excerpt must be evicted from the canonical KV"
+        );
+    }
+
+    /// Regression for the KV-overflow panic hit in production (2026-07-09): a
+    /// 13-block reply overshot the token budget by up to a block, and finalize's
+    /// extend of the ~context-full canonical tripped the `set_kv_len` assert.
+    /// Now: `extend_kv` past capacity is a typed error, and `finalize` trims its
+    /// extend to the longest fitting prefix (full canonical kept for routing).
+    #[test]
+    fn tool_compact_overlong_finalize_is_trimmed_not_panic() {
+        let Some(dir) = model_dir() else {
+            eprintln!(
+                "skip tool_compact_overlong_finalize_is_trimmed_not_panic: quantized model not present"
+            );
+            return;
+        };
+        let (tok, _cfg, mut session) = open(&dir);
+        let capacity = session.extend_capacity();
+        assert_eq!(capacity, MAX_SEQ - crate::metal::CANVAS);
+
+        // Raw extend past capacity: typed error, no partial write, no panic.
+        let overlong: Vec<u32> = tok
+            .encode(&"inventory line item alpha beta ".repeat(900), false)
+            .into_iter()
+            .take(capacity + 100)
+            .collect();
+        assert!(overlong.len() > capacity, "fixture must exceed capacity");
+        assert!(session.extend_kv(&overlong).is_err());
+        assert_eq!(session.kv_valid_tokens().len(), 0);
+
+        // Finalize with the same overlong canonical: Ok, KV holds the longest
+        // fitting prefix, routing log keeps the full canonical.
+        let conv_dir =
+            std::env::temp_dir().join(format!("dgq-compact-smoke-fin-{}", std::process::id()));
+        let mut manager = crate::conversation::ConversationManager::new(session, 0, 0, conv_dir);
+        let conv_id = manager.activate(&overlong);
+        manager.finalize(conv_id, &overlong).unwrap();
+        assert_eq!(
+            manager.session_mut().kv_valid_tokens(),
+            &overlong[..capacity]
+        );
     }
 }

@@ -284,6 +284,39 @@ pub fn conv_cache_dir() -> std::path::PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join(format!("dgq-conv-{}", std::process::id())))
 }
 
+/// `DGQ_TOOL_COMPACT=1`: enable the serve tool-output compactor (KV rewinder).
+/// Over-threshold tool responses are summarized by the model (checkpoint →
+/// summarize pass → rollback), replaced in context by `{summary,
+/// full_output_id}`, and the full output is stored on disk for on-demand
+/// retrieval via the built-in `expand_summary` tool. Opt-IN and default OFF:
+/// quality-affecting (the model sees summaries instead of raw outputs) and not
+/// yet gate-signed-off. Equivalent to `serve --tool-compact`.
+pub fn tool_compact_enabled() -> bool {
+    on_if_one("DGQ_TOOL_COMPACT")
+}
+
+/// Token threshold above which a tool response is compacted
+/// (`DGQ_TOOL_COMPACT_THRESHOLD`, tokens). Under-threshold responses pass
+/// through verbatim — no summarize generation, full fidelity. Default 384
+/// (~1.5 canvas blocks: below that the summary + scaffold saves little).
+pub fn tool_compact_threshold() -> usize {
+    std::env::var("DGQ_TOOL_COMPACT_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&t| t > 0)
+        .unwrap_or(384)
+}
+
+/// Directory for full tool outputs stored by the compactor
+/// (`DGQ_TOOL_COMPACT_DIR`). Defaults to a per-process subdir of the system
+/// temp dir; files are removed on server exit (plus a startup sweep for
+/// hard-killed runs, mirroring the conversation blob store).
+pub fn tool_compact_dir() -> std::path::PathBuf {
+    std::env::var_os("DGQ_TOOL_COMPACT_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("dgq-toolout-{}", std::process::id())))
+}
+
 /// `DGQ_KV_MMAP=1`: back the session KV cache with a `MAP_SHARED` temp-file mmap
 /// (wrapped no-copy as the Metal buffer) instead of anonymous device memory, so
 /// under memory pressure dirty KV pages evict to that file rather than to the
