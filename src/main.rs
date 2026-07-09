@@ -68,6 +68,9 @@ enum Command {
         kernel_debug_deep: bool,
         write_golden: Option<String>,
         write_trace: Option<PathBuf>,
+        /// `--verbose`: show the full generation telemetry. Default prints only
+        /// the clean reply (one-shot chat).
+        verbose: bool,
     },
     GenerateMonolithicParity {
         prompt: Option<String>,
@@ -660,6 +663,7 @@ fn main() -> ExitCode {
             kernel_debug_deep,
             write_golden,
             write_trace,
+            verbose,
         } => run_generate_monolithic_cmd(
             &cli.model_dir,
             prompt,
@@ -674,6 +678,7 @@ fn main() -> ExitCode {
             write_golden,
             write_trace,
             cli.raw_prompt,
+            verbose,
         ),
         Command::GenerateMonolithicParity {
             prompt,
@@ -2001,6 +2006,7 @@ fn run_chat_quality_gate(model_dir: &std::path::Path, layers: usize) -> ExitCode
         max_layers: Some(max_layers),
         no_early_stop: false,
         deterministic: true,
+        full_message_stop: false,
         trace_prompt: None,
     };
 
@@ -2678,6 +2684,7 @@ fn parse_cli() -> Cli {
     let mut steps_override: Option<usize> = None;
     let mut prompt_len = 8usize;
     let mut max_new_tokens = 256usize;
+    let mut max_new_tokens_explicit = false;
     let mut gemm_size = 512usize;
     let mut prompt: Option<String> = None;
     let mut bench_seq = 16usize;
@@ -2780,6 +2787,7 @@ fn parse_cli() -> Cli {
                         eprintln!("invalid --max-new-tokens");
                         std::process::exit(2);
                     });
+                    max_new_tokens_explicit = true;
                 }
             }
             "--compare-cpu" => compare_cpu = true,
@@ -2999,7 +3007,11 @@ fn parse_cli() -> Cli {
             seed,
             steps_production,
             prompt_len,
-            max_new_tokens,
+            if max_new_tokens_explicit {
+                max_new_tokens
+            } else {
+                2048
+            },
             parity_layers,
             no_early_stop,
         ),
@@ -3023,13 +3035,20 @@ fn parse_cli() -> Cli {
                 seed,
                 steps: steps_production,
                 prompt_len,
-                max_new_tokens,
+                // Behave like a single-turn chat: allow a full multi-block reply
+                // unless the caller pinned a smaller budget with --max-new-tokens.
+                max_new_tokens: if max_new_tokens_explicit {
+                    max_new_tokens
+                } else {
+                    2048
+                },
                 max_layers: parity_layers,
                 no_early_stop,
                 kernel_assert,
                 kernel_debug_deep,
                 write_golden,
                 write_trace,
+                verbose: chat_verbose,
             }
         }
         Some("generate-monolithic-parity") => Command::GenerateMonolithicParity {
@@ -3452,6 +3471,7 @@ fn default_generate_command(
         kernel_debug_deep: false,
         write_golden: None,
         write_trace: None,
+        verbose: false,
     }
 }
 
@@ -4283,6 +4303,28 @@ fn print_generate_elapsed(label: &str, elapsed: std::time::Duration) {
     println!("  {label} elapsed: {secs:.2}s ({elapsed:.2?})");
 }
 
+/// Print just the clean reply (the one-shot-chat default for `ask`): decode the
+/// generated tokens, strip pad/filler, sanitize chat scaffolding (thought/turn
+/// markers — tool-call markers are kept), and print the FULL reply untruncated.
+fn print_generate_reply(
+    out: &generate::GenerateOutput,
+    prompt_len: usize,
+    model_dir: &std::path::Path,
+) {
+    let Ok(tokenizer) = tokenizer::Tokenizer::load(model_dir.join("tokenizer.json")) else {
+        eprintln!("error: could not load tokenizer to decode reply");
+        return;
+    };
+    let generated = out.token_ids.get(prompt_len..).unwrap_or(&[]);
+    let display_ids = sample::strip_degenerate_token_ids(generated);
+    let reply = chat_template::sanitize_model_reply(&tokenizer.decode(&display_ids));
+    if reply.is_empty() {
+        println!("(empty response)");
+    } else {
+        println!("{reply}");
+    }
+}
+
 fn print_generate_output(
     label: &str,
     out: &generate::GenerateOutput,
@@ -4408,6 +4450,7 @@ fn run_generate_monolithic_cmd(
     write_golden: Option<String>,
     write_trace: Option<PathBuf>,
     raw_prompt: bool,
+    verbose: bool,
 ) -> ExitCode {
     if !dgq::store::looks_like_dgq_dir(model_dir) {
         eprintln!(
@@ -4468,19 +4511,24 @@ fn run_generate_monolithic_cmd(
         max_layers: Some(layers),
         no_early_stop,
         deterministic: false,
+        // `ask` is a single-turn chat: stop at eos (multi-block-until-done), with
+        // max_new_tokens as the cap.
+        full_message_stop: true,
         trace_prompt: None,
     };
 
-    let stop_note = if no_early_stop { ", no_early_stop" } else { "" };
-    let assert_note = if kernel_assert { ", assert" } else { "" };
-    let deep_note = if kernel_debug_deep {
-        ", debug-deep"
-    } else {
-        ""
-    };
-    eprintln!(
-        "running generate-monolithic (prompt_len={prompt_len}, steps={steps}, layers={layers}, max_new_tokens={max_new_tokens}, seed={seed}{stop_note}{assert_note}{deep_note})..."
-    );
+    if verbose {
+        let stop_note = if no_early_stop { ", no_early_stop" } else { "" };
+        let assert_note = if kernel_assert { ", assert" } else { "" };
+        let deep_note = if kernel_debug_deep {
+            ", debug-deep"
+        } else {
+            ""
+        };
+        eprintln!(
+            "running generate-monolithic (prompt_len={prompt_len}, steps={steps}, layers={layers}, max_new_tokens={max_new_tokens}, seed={seed}{stop_note}{assert_note}{deep_note})..."
+        );
+    }
     let started = std::time::Instant::now();
 
     let prompt_label = prompt_text.clone().unwrap_or_default();
@@ -4512,13 +4560,17 @@ fn run_generate_monolithic_cmd(
                     return ExitCode::FAILURE;
                 }
             }
-            print_generate_output(
-                "generate-monolithic",
-                &out,
-                prompt_len,
-                started.elapsed(),
-                model_dir,
-            );
+            if verbose {
+                print_generate_output(
+                    "generate-monolithic",
+                    &out,
+                    prompt_len,
+                    started.elapsed(),
+                    model_dir,
+                );
+            } else {
+                print_generate_reply(&out, prompt_len, model_dir);
+            }
             ExitCode::SUCCESS
         }
         Err(err) => {
@@ -4588,6 +4640,7 @@ fn run_generate_monolithic_parity_cmd(
         max_layers,
         no_early_stop,
         deterministic: true,
+        full_message_stop: false,
         trace_prompt: None,
     };
 

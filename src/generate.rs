@@ -24,6 +24,11 @@ pub struct GenerateConfig {
     pub no_early_stop: bool,
     /// Parity / golden tests: native Q4 kernels + CPU sampler (deterministic, slower).
     pub deterministic: bool,
+    /// Stop the whole reply as soon as a committed block emits a generation stop
+    /// token (chat-like, multi-block-until-eos). Off = fixed `max_new_tokens`
+    /// length (parity/golden). When on, the model's stop tokens are loaded from
+    /// the model dir and `max_new_tokens` becomes a cap.
+    pub full_message_stop: bool,
     /// Optional label stored in denoise trace JSON.
     pub trace_prompt: Option<String>,
 }
@@ -37,6 +42,7 @@ impl Default for GenerateConfig {
             max_layers: None,
             no_early_stop: false,
             deterministic: false,
+            full_message_stop: false,
             trace_prompt: None,
         }
     }
@@ -87,9 +93,18 @@ pub fn generate_monolithic_gpu(
         gen_cfg.sampler.clone(),
         gen_cfg.no_early_stop,
     );
+    // Chat-like full-message stop: end the reply when a committed block emits a
+    // generation stop token, so a multi-block reply terminates at eos instead of
+    // running the whole `max_new_tokens` budget. Off → fixed length (parity).
+    let stops = if gen_cfg.full_message_stop {
+        crate::config::load_generation_stop_tokens(model_dir)
+    } else {
+        Vec::new()
+    };
+    cfg.stop_token_ids = stops.clone();
     // E6 empty/degenerate-reply canvas re-roll (only when enabled). Detects an
     // empty user-facing reply from the decoded+sanitized committed block.
-    cfg.degenerate_reply_check = crate::chat_template::empty_reply_check(model_dir, Vec::new());
+    cfg.degenerate_reply_check = crate::chat_template::empty_reply_check(model_dir, stops);
     generate_monolithic(model_dir, prompt_token_ids, &cfg, prompt_label)
 }
 
@@ -125,6 +140,7 @@ mod gpu_determinism {
             max_layers: Some(DGQ_MAX_LAYERS),
             no_early_stop: false,
             deterministic: true,
+            full_message_stop: false,
             trace_prompt: None,
         }
     }
