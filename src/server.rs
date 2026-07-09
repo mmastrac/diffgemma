@@ -48,47 +48,16 @@ const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 // Wire protocol (request in, chunks out).
 // ===========================================================================
 
-/// Message `content` may be a plain string or an array of typed parts
-/// (OpenAI multimodal shape); we flatten text parts and ignore the rest.
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum MsgContent {
-    Text(String),
-    Parts(Vec<ContentPart>),
-}
-
-#[derive(Deserialize)]
-struct ContentPart {
-    #[serde(default)]
-    text: String,
-}
-
-impl MsgContent {
-    fn into_text(self) -> String {
-        match self {
-            MsgContent::Text(s) => s,
-            MsgContent::Parts(parts) => {
-                let mut out = String::new();
-                for p in parts {
-                    out.push_str(&p.text);
-                }
-                out
-            }
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct RequestMessage {
-    role: String,
-    #[serde(default)]
-    content: Option<MsgContent>,
-}
-
 #[derive(Deserialize)]
 struct ChatRequest {
+    /// Raw OpenAI messages, kept as JSON so the tool-aware renderer sees
+    /// `tool_calls` / `tool` roles / content-parts verbatim. `content` (string or
+    /// parts array) is flattened by `tools::message_text` for the plain path.
     #[serde(default)]
-    messages: Vec<RequestMessage>,
+    messages: Vec<serde_json::Value>,
+    /// OpenAI `tools` (function definitions). Present → tool-aware prompt.
+    #[serde(default)]
+    tools: Vec<serde_json::Value>,
     #[serde(default)]
     stream: bool,
     #[serde(default)]
@@ -371,6 +340,8 @@ struct DeltaBody {
     reasoning_content: Option<String>,
     #[serde(rename = "x-diffusion-draft", skip_serializing_if = "Option::is_none")]
     draft: Option<DraftBody>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Serialize)]
@@ -404,6 +375,7 @@ fn empty_delta() -> DeltaBody {
         content: None,
         reasoning_content: None,
         draft: None,
+        tool_calls: None,
     }
 }
 
@@ -440,15 +412,11 @@ impl WireDelta {
 // Worker job protocol (HTTP thread <-> GPU worker thread).
 // ===========================================================================
 
-/// A parsed chat turn (role + text), independent of the wire types so the job is
-/// `Send`.
-struct Turn {
-    role: crate::chat_template::ChatRole,
-    content: String,
-}
-
+/// A unit of work handed to the GPU worker (all fields `Send`).
 struct Job {
-    turns: Vec<Turn>,
+    /// Raw OpenAI messages (JSON) and `tools`, rendered on the worker thread.
+    messages: Vec<serde_json::Value>,
+    tools: Vec<serde_json::Value>,
     stream: bool,
     max_tokens: Option<usize>,
     seed: Option<u64>,
@@ -463,6 +431,7 @@ enum ServerEvent {
     Done {
         content: String,
         reasoning: String,
+        tool_calls: Vec<serde_json::Value>,
         prompt_tokens: usize,
         completion_tokens: usize,
         stopped: bool,
@@ -528,27 +497,27 @@ impl Worker {
     }
 
     fn handle(&self, manager: &mut crate::conversation::ConversationManager, job: Job) {
-        let history: Vec<crate::chat_template::ChatTurn> = job
-            .turns
-            .iter()
-            .map(|t| crate::chat_template::ChatTurn {
-                role: t.role,
-                content: t.content.clone(),
-            })
-            .collect();
+        let tool_mode = needs_tool_rendering(&job.messages, &job.tools);
+        let thinking = job.enable_thinking;
+        // Plain turns for the non-tool prompt/finalize path (gate-validated).
+        let history = build_turns(&job.messages);
 
-        let opts = crate::chat_template::ChatFormatOptions {
-            add_generation_prompt: true,
-            enable_thinking: job.enable_thinking,
-        };
-        let prompt =
+        let prompt = if tool_mode {
+            let s = crate::tools::render_conversation(&job.messages, &job.tools, true, thinking);
+            self.tokenizer.encode_with_specials(&s)
+        } else {
+            let opts = crate::chat_template::ChatFormatOptions {
+                add_generation_prompt: true,
+                enable_thinking: thinking,
+            };
             match crate::chat_template::format_chat_token_ids(&self.tokenizer, &history, &opts) {
                 Ok(p) => p,
                 Err(err) => {
                     let _ = job.resp.send(ServerEvent::Error(format!("prompt: {err}")));
                     return;
                 }
-            };
+            }
+        };
         let prompt_len = prompt.len();
 
         // Reserve one CANVAS block so the KV never overflows max_seq.
@@ -601,38 +570,62 @@ impl Worker {
         cfg.step_observer = None;
         match out {
             Ok(out) => {
-                let content = mapper.lock().unwrap().content().to_string();
+                let raw = mapper.lock().unwrap().content().to_string();
                 let reasoning = mapper.lock().unwrap().reasoning().to_string();
                 let completion_tokens = out.token_ids.len().saturating_sub(prompt_len);
 
-                // Finalize the turn to the canonical completed-turns log (sanitized
-                // answer, no `thought` channel, no generation-prompt scaffold) so
-                // the conversation's snapshot is a clean prefix of the next turn's
-                // prompt — reasoning never persists, and reuse survives a swap.
-                let mut completed = history.clone();
-                completed.push(crate::chat_template::ChatTurn::model(content.clone()));
-                let finalize_opts = crate::chat_template::ChatFormatOptions {
-                    add_generation_prompt: false,
-                    enable_thinking: false,
+                // In tool mode the committed text may contain `<|tool_call>…` spans:
+                // parse them out; `content` becomes the preamble before the first
+                // call. A tool_call does NOT end the turn, so the model may emit
+                // several calls + interleaved text — we capture all calls.
+                let (content, tool_calls) = if tool_mode {
+                    let calls = crate::tools::parse_tool_calls(&raw);
+                    (
+                        crate::tools::content_before_tool_calls(&raw),
+                        crate::tools::to_openai_tool_calls(&calls),
+                    )
+                } else {
+                    (raw, Vec::new())
                 };
-                match crate::chat_template::format_chat_token_ids(
-                    &self.tokenizer,
-                    &completed,
-                    &finalize_opts,
-                ) {
-                    Ok(canonical) => {
-                        if let Err(err) = manager.finalize(conv_id, &canonical) {
-                            // A failed finalize only costs reuse (next turn
-                            // re-prefills); the reply is already correct.
-                            eprintln!("serve: conversation finalize failed: {err}");
-                        }
+
+                // Finalize to the canonical completed-turns log so the snapshot is a
+                // clean prefix of the next turn's prompt (reasoning never persists;
+                // reuse survives a swap). Tool turns re-derive the assistant message
+                // WITH its tool_calls via the tool-aware renderer.
+                let canonical = if tool_mode {
+                    let mut completed = job.messages.clone();
+                    let mut assistant =
+                        serde_json::json!({"role": "assistant", "content": content});
+                    if !tool_calls.is_empty() {
+                        assistant["tool_calls"] = serde_json::Value::Array(tool_calls.clone());
                     }
-                    Err(err) => eprintln!("serve: canonical prompt build failed: {err}"),
+                    completed.push(assistant);
+                    let s =
+                        crate::tools::render_conversation(&completed, &job.tools, false, thinking);
+                    Some(self.tokenizer.encode_with_specials(&s))
+                } else {
+                    let mut completed = history.clone();
+                    completed.push(crate::chat_template::ChatTurn::model(content.clone()));
+                    let opts = crate::chat_template::ChatFormatOptions {
+                        add_generation_prompt: false,
+                        enable_thinking: false,
+                    };
+                    crate::chat_template::format_chat_token_ids(&self.tokenizer, &completed, &opts)
+                        .map_err(|err| eprintln!("serve: canonical prompt build failed: {err}"))
+                        .ok()
+                };
+                if let Some(canonical) = canonical {
+                    if let Err(err) = manager.finalize(conv_id, &canonical) {
+                        // A failed finalize only costs reuse (next turn re-prefills);
+                        // the reply is already correct.
+                        eprintln!("serve: conversation finalize failed: {err}");
+                    }
                 }
 
                 let _ = job.resp.send(ServerEvent::Done {
                     content,
                     reasoning,
+                    tool_calls,
                     prompt_tokens: prompt_len,
                     completion_tokens,
                     stopped: out.stopped_on_eot,
@@ -775,8 +768,7 @@ fn handle_chat(
         }
     };
 
-    let turns = build_turns(req.messages);
-    if turns.is_empty() {
+    if req.messages.is_empty() {
         write_json(
             stream,
             "400 Bad Request",
@@ -787,7 +779,8 @@ fn handle_chat(
 
     let (resp_tx, resp_rx) = mpsc::channel();
     let job = Job {
-        turns,
+        messages: req.messages,
+        tools: req.tools,
         stream: req.stream,
         max_tokens: req.max_tokens,
         seed: req.seed,
@@ -817,21 +810,35 @@ fn handle_chat(
     }
 }
 
-fn build_turns(messages: Vec<RequestMessage>) -> Vec<Turn> {
+/// Build plain `ChatTurn`s from raw messages for the non-tool prompt path
+/// (`format_chat_template` — the gate-validated encoding). system→user,
+/// assistant→model; content flattened via `tools::message_text`.
+fn build_turns(messages: &[serde_json::Value]) -> Vec<crate::chat_template::ChatTurn> {
     messages
-        .into_iter()
+        .iter()
         .filter_map(|m| {
-            let role = match m.role.as_str() {
-                "user" | "system" => crate::chat_template::ChatRole::User,
-                "assistant" | "model" => crate::chat_template::ChatRole::Model,
+            let role = match m.get("role").and_then(|r| r.as_str()) {
+                Some("user") | Some("system") | Some("developer") => {
+                    crate::chat_template::ChatRole::User
+                }
+                Some("assistant") | Some("model") => crate::chat_template::ChatRole::Model,
                 _ => return None,
             };
-            Some(Turn {
+            Some(crate::chat_template::ChatTurn {
                 role,
-                content: m.content.map(|c| c.into_text()).unwrap_or_default(),
+                content: crate::tools::message_text(m),
             })
         })
         .collect()
+}
+
+/// True when a request needs the tool-aware renderer: `tools` present, or any
+/// message is a `tool` result or carries `tool_calls`.
+fn needs_tool_rendering(messages: &[serde_json::Value], tools: &[serde_json::Value]) -> bool {
+    !tools.is_empty()
+        || messages.iter().any(|m| {
+            m.get("role").and_then(|r| r.as_str()) == Some("tool") || m.get("tool_calls").is_some()
+        })
 }
 
 /// Stream Server-Sent Events: one `chat.completion.chunk` per delta, ending with
@@ -881,8 +888,28 @@ fn stream_sse(stream: &mut TcpStream, rx: mpsc::Receiver<ServerEvent>, model_nam
                     return; // client hung up
                 }
             }
-            ServerEvent::Done { stopped, .. } => {
-                if !stopped {
+            ServerEvent::Done {
+                stopped,
+                tool_calls,
+                ..
+            } => {
+                if !tool_calls.is_empty() {
+                    finish = "tool_calls";
+                    let _ = send_chunk(
+                        stream,
+                        &id,
+                        created,
+                        &model,
+                        ChunkChoice {
+                            index: 0,
+                            delta: DeltaBody {
+                                tool_calls: Some(tool_calls),
+                                ..empty_delta()
+                            },
+                            finish_reason: None,
+                        },
+                    );
+                } else if !stopped {
                     finish = "length";
                 }
                 break;
@@ -944,17 +971,34 @@ fn respond_json(stream: &mut TcpStream, rx: mpsc::Receiver<ServerEvent>, model_n
             ServerEvent::Done {
                 content,
                 reasoning,
+                tool_calls,
                 prompt_tokens,
                 completion_tokens,
                 stopped,
             } => {
+                let has_calls = !tool_calls.is_empty();
                 let mut message = serde_json::json!({
                     "role": "assistant",
-                    "content": content,
+                    // OpenAI convention: content is null when only tool_calls.
+                    "content": if has_calls && content.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::Value::String(content)
+                    },
                 });
                 if !reasoning.is_empty() {
                     message["reasoning_content"] = serde_json::Value::String(reasoning);
                 }
+                if has_calls {
+                    message["tool_calls"] = serde_json::Value::Array(tool_calls);
+                }
+                let finish_reason = if has_calls {
+                    "tool_calls"
+                } else if stopped {
+                    "stop"
+                } else {
+                    "length"
+                };
                 let value = serde_json::json!({
                     "id": format!("chatcmpl-{}", next_id()),
                     "object": "chat.completion",
@@ -963,7 +1007,7 @@ fn respond_json(stream: &mut TcpStream, rx: mpsc::Receiver<ServerEvent>, model_n
                     "choices": [{
                         "index": 0,
                         "message": message,
-                        "finish_reason": if stopped { "stop" } else { "length" },
+                        "finish_reason": finish_reason,
                     }],
                     "usage": {
                         "prompt_tokens": prompt_tokens,

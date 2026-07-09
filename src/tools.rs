@@ -251,7 +251,10 @@ pub fn render_conversation(
         };
         out.push_str(&format!("<|turn>{render_role}\n"));
 
-        let tool_calls = m.get("tool_calls").and_then(Value::as_array);
+        let tool_calls = m
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .filter(|c| !c.is_empty());
         if let Some(calls) = tool_calls {
             for tc in calls {
                 out.push_str(&format_tool_call(tc));
@@ -381,8 +384,33 @@ fn tool_name_for(msg: &Value, calls: Option<&Vec<Value>>) -> String {
         .to_string()
 }
 
+/// The user-facing content of a tool-call response: the preamble before the
+/// first `<|tool_call>` (the between-call / trailing text is dropped — clients
+/// treat `content` as the preamble when `tool_calls` are present).
+pub fn content_before_tool_calls(text: &str) -> String {
+    match text.find("<|tool_call>") {
+        Some(i) => text[..i].trim().to_string(),
+        None => text.trim().to_string(),
+    }
+}
+
+/// Parsed calls → OpenAI `tool_calls` array (`arguments` serialized as a string).
+pub fn to_openai_tool_calls(calls: &[ParsedToolCall]) -> Vec<Value> {
+    calls
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            serde_json::json!({
+                "id": format!("call_{i}"),
+                "type": "function",
+                "function": {"name": c.name, "arguments": c.arguments.to_string()},
+            })
+        })
+        .collect()
+}
+
 /// Flatten a message's `content` (string or content-parts array) to text.
-fn message_text(m: &Value) -> String {
+pub fn message_text(m: &Value) -> String {
     match m.get("content") {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Array(parts)) => parts

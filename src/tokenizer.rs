@@ -113,6 +113,46 @@ impl Tokenizer {
         out.extend(self.encode(text, false));
     }
 
+    /// Encode `text` that may contain special-token *literals* (e.g. `<|turn>`,
+    /// `<|tool_call>`, `<|"|>`) as their ids, BPE-encoding the runs between. Used
+    /// to tokenize prompt strings built by the tool-aware renderer, which emits
+    /// special tokens inline as text. Longest special match wins at each position.
+    pub fn encode_with_specials(&self, text: &str) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut text_start = 0;
+        let mut i = 0;
+        while i < text.len() {
+            if let Some((lit_len, id)) = self.match_special_at(&text[i..]) {
+                if text_start < i {
+                    self.encode_append(&mut out, &text[text_start..i]);
+                }
+                out.push(id);
+                i += lit_len;
+                text_start = i;
+            } else {
+                // Advance one char (keeps `i` on a UTF-8 boundary).
+                i += text[i..].chars().next().map_or(1, char::len_utf8);
+            }
+        }
+        if text_start < text.len() {
+            self.encode_append(&mut out, &text[text_start..]);
+        }
+        out
+    }
+
+    /// Longest special-token literal that `s` starts with → (byte length, id).
+    fn match_special_at(&self, s: &str) -> Option<(usize, u32)> {
+        // Special tokens begin with '<'; cheap reject otherwise.
+        if !s.starts_with('<') {
+            return None;
+        }
+        self.special_tokens
+            .iter()
+            .filter(|(lit, _)| s.starts_with(lit.as_str()))
+            .max_by_key(|(lit, _)| lit.len())
+            .map(|(lit, id)| (lit.len(), *id))
+    }
+
     pub fn id_to_token(&self, id: u32) -> Option<&str> {
         self.id_to_token
             .get(id as usize)
