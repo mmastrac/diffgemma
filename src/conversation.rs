@@ -317,10 +317,17 @@ impl ConversationManager {
     /// generation-prompt scaffold) by rolling back to the shared prefix and
     /// re-deriving the tail. That log is a clean prefix of the next turn's prompt,
     /// so the snapshot stays reusable across the swap and reasoning never persists.
+    ///
+    /// A near-context-full turn can produce a canonical log longer than the KV
+    /// can hold with canvas headroom (the last block may overshoot the token
+    /// budget by up to a block): the KV keeps the longest fitting *prefix* —
+    /// still a valid reuse prefix of the next prompt — while the routing log
+    /// keeps the full canonical.
     pub fn finalize(&mut self, id: u64, canonical_tokens: &[u32]) -> Result<(), Error> {
-        let reuse = common_prefix_len(self.session.kv_valid_tokens(), canonical_tokens);
+        let fit = canonical_tokens.len().min(self.session.extend_capacity());
+        let reuse = common_prefix_len(self.session.kv_valid_tokens(), canonical_tokens).min(fit);
         self.session.truncate_kv_to(reuse);
-        self.session.extend_kv(&canonical_tokens[reuse..])?;
+        self.session.extend_kv(&canonical_tokens[reuse..fit])?;
         if let Some(c) = self.convs.get_mut(&id) {
             c.tokens = canonical_tokens.to_vec();
             c.last_used = self.tick;

@@ -348,18 +348,33 @@ impl StepGenerateSession {
         self.kv_valid_tokens.truncate(n);
     }
 
+    /// The most causal tokens the KV can hold while leaving room for one canvas
+    /// block (every denoise writes at `[kv_len, kv_len+CANVAS)`, and `set_kv_len`
+    /// asserts that headroom). Callers that extend the KV with variable-length
+    /// content (turn finalize, tool-response extensions) must stay within this.
+    pub fn extend_capacity(&self) -> usize {
+        self.rt.max_seq().saturating_sub(crate::metal::CANVAS)
+    }
+
     /// Causally prefill `tokens` onto the end of the current KV (no denoise),
     /// extending `kv_valid_tokens`. Used by the conversation manager to finalize
     /// a turn: after `rollback_to` a checkpoint, extend with only the sanitized
     /// answer so the persisted KV is the thought-free canonical continuation.
     /// (Also puts the final answer block — normally bidirectional and excluded —
-    /// into the reusable causal KV immediately.) `tokens` should be short (an
-    /// answer), well within the causal-prefill window.
+    /// into the reusable causal KV immediately.) Total: an extension past
+    /// [`extend_capacity`](Self::extend_capacity) returns a typed error (no
+    /// partial write) instead of tripping the `set_kv_len` overflow assert —
+    /// reachable from user input via a near-context-full turn finalize.
     pub fn extend_kv(&mut self, tokens: &[u32]) -> Result<(), Error> {
         if tokens.is_empty() {
             return Ok(());
         }
         let offset = self.kv_valid_tokens.len();
+        if offset + tokens.len() > self.extend_capacity() {
+            return Err(Error::Format(
+                "KV extend exceeds capacity (tokens + CANVAS headroom > max_seq)",
+            ));
+        }
         self.rt.prefill_chunks_from(offset, tokens)?;
         self.kv_valid_tokens.extend_from_slice(tokens);
         Ok(())

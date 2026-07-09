@@ -4521,6 +4521,11 @@ pub struct StepRuntime {
 }
 
 impl StepRuntime {
+    /// KV-cache capacity (positions per layer) the buffers were sized for.
+    pub fn max_seq(&self) -> usize {
+        self.max_seq
+    }
+
     pub fn layout(&self) -> &ModelLayout {
         &self.layout
     }
