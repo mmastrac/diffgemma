@@ -184,6 +184,230 @@ fn format_argument(v: &Value, escape_keys: bool) -> String {
 }
 
 // ===========================================================================
+// Conversation rendering: OpenAI messages+tools → the model's prompt string.
+//
+// Mirrors the reference chat_template.jinja for the tool-use path (verified
+// byte-for-byte against the oracle). Produces a STRING with special-token
+// literals; the caller tokenizes it (the specials encode to their ids).
+// ===========================================================================
+
+/// Render a full conversation (with optional `tools`) to the model's prompt
+/// string. Handles the system/tools block, user/assistant turns, assistant
+/// `tool_calls`, and `tool`-role responses (forward-scanned onto the preceding
+/// assistant turn). `add_generation_prompt` appends the `<|turn>model` scaffold
+/// unless the last thing emitted was a tool call/response (model continues
+/// in-turn). Thinking off seeds the empty thought channel, matching the default.
+pub fn render_conversation(
+    messages: &[Value],
+    tools: &[Value],
+    add_generation_prompt: bool,
+    enable_thinking: bool,
+) -> String {
+    let role = |m: &Value| {
+        m.get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let mut out = String::from("<bos>");
+    let mut prev = PrevType::Other;
+
+    let first_is_system = messages
+        .first()
+        .map(|m| matches!(role(m).as_str(), "system" | "developer"))
+        .unwrap_or(false);
+
+    if enable_thinking || !tools.is_empty() || first_is_system {
+        out.push_str("<|turn>system\n");
+        if enable_thinking {
+            out.push_str("<|think|>\n");
+        }
+        if first_is_system {
+            out.push_str(message_text(&messages[0]).trim());
+        }
+        for tool in tools {
+            out.push_str(&format!("<|tool>{}<tool|>", format_declaration(tool)));
+        }
+        out.push_str("<turn|>\n");
+    }
+
+    let start = if first_is_system { 1 } else { 0 };
+    let mut i = start;
+    while i < messages.len() {
+        let m = &messages[i];
+        let r = role(m);
+        if r == "tool" {
+            // A tool message not consumed by a preceding assistant turn: emit its
+            // response standalone (rare; e.g. a leading tool result).
+            out.push_str(&format_tool_response(tool_name_for(m, None), m));
+            prev = PrevType::ToolResponse;
+            i += 1;
+            continue;
+        }
+        let render_role = if r == "assistant" {
+            "model"
+        } else {
+            r.as_str()
+        };
+        out.push_str(&format!("<|turn>{render_role}\n"));
+
+        let tool_calls = m.get("tool_calls").and_then(Value::as_array);
+        if let Some(calls) = tool_calls {
+            for tc in calls {
+                out.push_str(&format_tool_call(tc));
+            }
+            prev = PrevType::ToolCall;
+        }
+
+        // Forward-scan consecutive `tool` messages as responses on this turn.
+        let mut responses_emitted = false;
+        if tool_calls.is_some() {
+            let mut k = i + 1;
+            while k < messages.len() && role(&messages[k]) == "tool" {
+                let name = tool_name_for(&messages[k], tool_calls);
+                out.push_str(&format_tool_response(name, &messages[k]));
+                responses_emitted = true;
+                prev = PrevType::ToolResponse;
+                k += 1;
+            }
+            i = k - 1; // consumed the tool messages
+        }
+
+        let content = if render_role == "model" {
+            strip_thinking(&message_text(m))
+        } else {
+            message_text(m).trim().to_string()
+        };
+        out.push_str(&content);
+        let has_content = !content.trim().is_empty();
+
+        if prev == PrevType::ToolCall && !responses_emitted {
+            out.push_str("<|tool_response>");
+        } else if !(responses_emitted && !has_content) {
+            out.push_str("<turn|>\n");
+            prev = PrevType::Other;
+        }
+        i += 1;
+    }
+
+    if add_generation_prompt && !matches!(prev, PrevType::ToolCall | PrevType::ToolResponse) {
+        out.push_str("<|turn>model\n");
+        if !enable_thinking {
+            out.push_str("<|channel>thought\n<channel|>");
+        }
+    }
+    out
+}
+
+#[derive(PartialEq)]
+enum PrevType {
+    Other,
+    ToolCall,
+    ToolResponse,
+}
+
+/// `<|tool_call>call:NAME{key:value,…}<tool_call|>` for an OpenAI tool_call
+/// (arguments may be a JSON object or a JSON string), keys sorted, bare keys.
+fn format_tool_call(tc: &Value) -> String {
+    let f = tc.get("function").unwrap_or(tc);
+    let name = f.get("name").and_then(Value::as_str).unwrap_or("");
+    let args = f.get("arguments");
+    let obj = match args {
+        Some(Value::Object(m)) => Some(m.clone()),
+        Some(Value::String(s)) => serde_json::from_str::<Value>(s)
+            .ok()
+            .and_then(|v| v.as_object().cloned()),
+        _ => None,
+    };
+    let body = obj
+        .map(|m| {
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            keys.iter()
+                .map(|k| format!("{k}:{}", format_argument(&m[*k], false)))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    format!("<|tool_call>call:{name}{{{body}}}<tool_call|>")
+}
+
+/// `<|tool_response>response:NAME{…}<tool_response|>`. String content wraps in a
+/// `value:` key; object content is rendered field-by-field (bare keys).
+fn format_tool_response(name: String, msg: &Value) -> String {
+    let content = msg.get("content").cloned().unwrap_or(Value::Null);
+    let body = match &content {
+        Value::Object(m) => {
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            keys.iter()
+                .map(|k| format!("{k}:{}", format_argument(&m[*k], false)))
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+        other => {
+            let s = other
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| match other {
+                    Value::Null => String::new(),
+                    _ => other.to_string(),
+                });
+            format!("value:{}", format_argument(&Value::String(s), false))
+        }
+    };
+    format!("<|tool_response>response:{name}{{{body}}}<tool_response|>")
+}
+
+/// Resolve a `tool` message's function name via its `tool_call_id` against the
+/// preceding assistant `tool_calls`, else its `name`, else "unknown".
+fn tool_name_for(msg: &Value, calls: Option<&Vec<Value>>) -> String {
+    if let (Some(id), Some(calls)) = (msg.get("tool_call_id").and_then(Value::as_str), calls) {
+        for tc in calls {
+            if tc.get("id").and_then(Value::as_str) == Some(id) {
+                if let Some(n) = tc
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+                {
+                    return n.to_string();
+                }
+            }
+        }
+    }
+    msg.get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+/// Flatten a message's `content` (string or content-parts array) to text.
+fn message_text(m: &Value) -> String {
+    match m.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+/// Remove `<|channel>…<channel|>` thought spans (jinja `strip_thinking`).
+fn strip_thinking(text: &str) -> String {
+    let mut result = String::new();
+    for part in text.split("<channel|>") {
+        match part.split_once("<|channel>") {
+            Some((before, _)) => result.push_str(before),
+            None => result.push_str(part),
+        }
+    }
+    result.trim().to_string()
+}
+
+// ===========================================================================
 // Calls: the model's `<|tool_call>call:NAME{…}<tool_call|>` output → OpenAI shape
 // ===========================================================================
 
@@ -384,5 +608,51 @@ mod tests {
     #[test]
     fn parse_none_when_no_calls() {
         assert!(parse_tool_calls("just a normal answer, no tools here").is_empty());
+    }
+
+    fn list_dir_tool() -> Value {
+        json!({"type":"function","function":{
+            "name":"list_dir",
+            "description":"Lists all files and subdirectories in a specified directory path",
+            "parameters":{"type":"object","properties":{
+                "path":{"type":"string","description":"The absolute path to the directory to list (e.g., /tmp)"}},
+                "required":["path"]}}})
+    }
+
+    #[test]
+    fn render_tools_plus_user_matches_oracle() {
+        let msgs = [json!({"role":"user","content":"List files in /tmp"})];
+        let expected = "<bos><|turn>system\n<|tool>declaration:list_dir{description:<|\"|>Lists all files and subdirectories in a specified directory path<|\"|>,parameters:{properties:{path:{description:<|\"|>The absolute path to the directory to list (e.g., /tmp)<|\"|>,type:<|\"|>STRING<|\"|>}},required:[<|\"|>path<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nList files in /tmp<turn|>\n<|turn>model\n<|channel>thought\n<channel|>";
+        assert_eq!(
+            render_conversation(&msgs, &[list_dir_tool()], true, false),
+            expected
+        );
+    }
+
+    #[test]
+    fn render_tool_call_and_response_matches_oracle() {
+        let msgs = [
+            json!({"role":"user","content":"List files in /tmp"}),
+            json!({"role":"assistant","tool_calls":[{"id":"c1","function":{"name":"list_dir","arguments":{"path":"/tmp"}}}]}),
+            json!({"role":"tool","tool_call_id":"c1","content":"a.txt\nb.txt"}),
+        ];
+        let expected = "<bos><|turn>system\n<|tool>declaration:list_dir{description:<|\"|>Lists all files and subdirectories in a specified directory path<|\"|>,parameters:{properties:{path:{description:<|\"|>The absolute path to the directory to list (e.g., /tmp)<|\"|>,type:<|\"|>STRING<|\"|>}},required:[<|\"|>path<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nList files in /tmp<turn|>\n<|turn>model\n<|tool_call>call:list_dir{path:<|\"|>/tmp<|\"|>}<tool_call|><|tool_response>response:list_dir{value:<|\"|>a.txt\nb.txt<|\"|>}<tool_response|>";
+        assert_eq!(
+            render_conversation(&msgs, &[list_dir_tool()], true, false),
+            expected
+        );
+    }
+
+    #[test]
+    fn render_system_plus_tools_matches_oracle() {
+        let msgs = [
+            json!({"role":"system","content":"You are helpful."}),
+            json!({"role":"user","content":"hi"}),
+        ];
+        let expected = "<bos><|turn>system\nYou are helpful.<|tool>declaration:list_dir{description:<|\"|>Lists all files and subdirectories in a specified directory path<|\"|>,parameters:{properties:{path:{description:<|\"|>The absolute path to the directory to list (e.g., /tmp)<|\"|>,type:<|\"|>STRING<|\"|>}},required:[<|\"|>path<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nhi<turn|>\n<|turn>model\n<|channel>thought\n<channel|>";
+        assert_eq!(
+            render_conversation(&msgs, &[list_dir_tool()], true, false),
+            expected
+        );
     }
 }
