@@ -208,6 +208,15 @@ fn longest_common_prefix(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
+/// A saved KV position captured by [`StepGenerateSession::checkpoint`] and
+/// restored by [`StepGenerateSession::rollback_to`]. Plain values (no borrow of
+/// the session), so a conversation manager can hold one across turns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvCheckpoint {
+    kv_len: u32,
+    tokens: usize,
+}
+
 /// Reusable monolithic runtime across prompts (M4.3).
 pub struct StepGenerateSession {
     rt: StepRuntime,
@@ -254,6 +263,34 @@ impl StepGenerateSession {
     pub fn reset_kv(&mut self) {
         self.rt.set_kv_len(0);
         self.kv_valid_tokens.clear();
+    }
+
+    /// A saved KV position (`checkpoint`) that `rollback_to` can return to. It
+    /// pins both the runtime `kv_len` and the length of the causal token log so
+    /// the two stay consistent. Values only — safe to hold across turns.
+    ///
+    /// Rollback is O(1): the physical KV past `kv_len` is left stale but is never
+    /// read (attention reads `[0, kv_len)`) and is overwritten by the next
+    /// prefill. This is the low-level control the conversation manager uses to
+    /// keep ephemeral content — e.g. a turn's `thought`-channel reasoning — OUT
+    /// of the persisted context: checkpoint after the user message, generate,
+    /// roll back, then extend with only the sanitized answer.
+    pub fn checkpoint(&self) -> KvCheckpoint {
+        KvCheckpoint {
+            kv_len: self.rt.read_params().kv_len,
+            tokens: self.kv_valid_tokens.len(),
+        }
+    }
+
+    /// Return the session's KV to a previously captured `checkpoint`, discarding
+    /// everything causally appended since (see [`checkpoint`](Self::checkpoint)).
+    /// The checkpoint must not be ahead of the current KV — a stale checkpoint
+    /// from a longer past state is ignored (clamped) rather than trusted.
+    pub fn rollback_to(&mut self, cp: &KvCheckpoint) {
+        let tokens = cp.tokens.min(self.kv_valid_tokens.len());
+        self.rt
+            .set_kv_len(cp.kv_len.min(self.kv_valid_tokens.len() as u32));
+        self.kv_valid_tokens.truncate(tokens);
     }
 
     /// Make the session's KV safe to reuse for `prompt`. Cross-turn reuse assumes
