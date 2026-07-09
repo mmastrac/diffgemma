@@ -171,11 +171,13 @@ fn log_denoise_step_progress(
         extra.push_str(&format!(" ans_len={re}"));
     }
     if let Some(text) = answer_text {
+        // Show the TAIL of the converging text: the head is stable after the
+        // first steps, the interesting churn is at the end of the canvas.
+        const SHOW: usize = 120;
         let one_line = text.replace(['\n', '\r'], "\\n");
-        let shown = if one_line.len() > 72 {
-            format!("{}...", &one_line[..72])
-        } else {
-            one_line
+        let shown = match one_line.char_indices().nth_back(SHOW) {
+            Some((i, _)) => format!("…{}", &one_line[i..]),
+            None => one_line,
         };
         extra.push_str(&format!(" text={shown:?}"));
     }

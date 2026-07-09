@@ -566,9 +566,13 @@ pub fn final_entropy_log_enabled() -> bool {
     }
 }
 
-/// Decode answer-prefix argmax each denoise step (`DGQ_LOG_STEP_TEXT=1`).
+/// Decode the answer-region argmax each denoise step and show it in the step
+/// progress line (`text="…"`, tail-truncated). Log-only — the generation is
+/// bit-identical either way; cost is one ≤canvas decode per step (µs against
+/// a ~1s step). DEFAULT ON since 2026-07-09 (user request: the step log should
+/// show WHAT is converging, not just counts). `DGQ_LOG_STEP_TEXT=0` disables.
 pub fn step_text_log_enabled() -> bool {
-    on_if_one("DGQ_LOG_STEP_TEXT")
+    on_unless_zero("DGQ_LOG_STEP_TEXT")
 }
 
 /// GPU-vs-CPU accept-mask parity log per step (`DGQ_LOG_DENOISE=1`).
