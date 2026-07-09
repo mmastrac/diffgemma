@@ -455,13 +455,16 @@ pub fn parse_tool_calls(text: &str) -> Vec<ParsedToolCall> {
     while let Some(pos) = rest.find("call:") {
         let after = &rest[pos + "call:".len()..];
         let Some(brace) = after.find('{') else { break };
-        let name = after[..brace].trim().to_string();
+        // A malformed/unbalanced call must not drop the calls that follow it:
+        // skip past this `call:` and keep scanning.
         let Some((inner, consumed)) = read_braced(&after[brace..]) else {
-            break;
+            rest = after;
+            continue;
         };
+        let name = after[..brace].trim().to_string();
         out.push(ParsedToolCall {
             name,
-            arguments: parse_object(inner),
+            arguments: parse_object(inner, 0),
         });
         rest = &after[brace + consumed..];
     }
@@ -491,9 +494,13 @@ fn read_braced(s: &str) -> Option<(&str, usize)> {
     None
 }
 
+/// Cap on argument nesting depth — past it, a value is kept as a raw string
+/// rather than recursed into (guards against runaway `{{{…}}}` output).
+const MAX_ARG_DEPTH: u32 = 32;
+
 /// Parse a `key:value,key:value` body (bare keys, `<|"|>`-quoted strings) into a
 /// JSON object.
-fn parse_object(inner: &str) -> Value {
+fn parse_object(inner: &str, depth: u32) -> Value {
     let mut map = Map::new();
     for field in split_top_level(inner) {
         let Some(colon) = field.find(':') else {
@@ -503,12 +510,12 @@ fn parse_object(inner: &str) -> Value {
         if key.is_empty() {
             continue;
         }
-        map.insert(key, parse_value(field[colon + 1..].trim()));
+        map.insert(key, parse_value(field[colon + 1..].trim(), depth));
     }
     Value::Object(map)
 }
 
-fn parse_value(s: &str) -> Value {
+fn parse_value(s: &str, depth: u32) -> Value {
     let s = s.trim();
     if let Some(inner) = s.strip_prefix(Q).and_then(|x| x.strip_suffix(Q)) {
         return Value::String(inner.to_string());
@@ -516,13 +523,20 @@ fn parse_value(s: &str) -> Value {
     if let Some(inner) = s.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
         return Value::String(inner.to_string());
     }
-    if s.starts_with('{') {
-        if let Some((body, _)) = read_braced(s) {
-            return parse_object(body);
+    if depth < MAX_ARG_DEPTH {
+        if s.starts_with('{') {
+            if let Some((body, _)) = read_braced(s) {
+                return parse_object(body, depth + 1);
+            }
         }
-    }
-    if let Some(body) = s.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
-        return Value::Array(split_top_level(body).into_iter().map(parse_value).collect());
+        if let Some(body) = s.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
+            return Value::Array(
+                split_top_level(body)
+                    .into_iter()
+                    .map(|v| parse_value(v, depth + 1))
+                    .collect(),
+            );
+        }
     }
     match s {
         "true" => return Value::Bool(true),
@@ -535,17 +549,32 @@ fn parse_value(s: &str) -> Value {
     Value::String(s.to_string())
 }
 
+/// Byte-substring search (needle in haystack) → start index.
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
 /// Split on top-level commas, respecting `{}`/`[]` nesting and `<|"|>` strings.
+///
+/// Byte-safe: scans `s.as_bytes()` and only ever slices `s` at ASCII delimiter
+/// positions (commas/brackets), which are always char boundaries — so multi-byte
+/// UTF-8 anywhere in the input can never split mid-character (the previous
+/// `s[i..]` scan panicked on e.g. a bare `naïve`).
 fn split_top_level(s: &str) -> Vec<&str> {
+    let qb = Q.as_bytes();
+    let bytes = s.as_bytes();
     let mut parts = Vec::new();
     let (mut depth, mut start) = (0i32, 0usize);
-    let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        // Skip over a `<|"|>…<|"|>` quoted run so commas inside don't split.
-        if s[i..].starts_with(Q) {
-            if let Some(end) = s[i + Q.len()..].find(Q) {
-                i += Q.len() + end + Q.len();
+        // Skip a whole `<|"|>…<|"|>` quoted run so delimiters inside don't count.
+        if bytes[i..].starts_with(qb) {
+            let after = i + qb.len();
+            if let Some(rel) = find_bytes(&bytes[after..], qb) {
+                i = after + rel + qb.len();
                 continue;
             }
         }
@@ -636,6 +665,76 @@ mod tests {
     #[test]
     fn parse_none_when_no_calls() {
         assert!(parse_tool_calls("just a normal answer, no tools here").is_empty());
+    }
+
+    #[test]
+    fn parse_never_panics_on_adversarial_input() {
+        let cases = [
+            // Multi-byte UTF-8 inside a call (high-temp model can emit these).
+            "call:list_dir{path:<|\"|>/tmp/café/naïve/日本<|\"|>}",
+            "<|tool_call>call:πcalc{x:<|\"|>±∞<|\"|>}<tool_call|>",
+            // Multi-byte OUTSIDE a quoted run (bare key/value) — the hard case.
+            "call:x{a:naïve,b:1}",
+            "call:f{café:1}",
+            "call:g{x:日本語}",
+            // Deeply nested braces (runaway generation).
+            &format!("call:x{{a:{}{}", "{".repeat(5000), "}".repeat(5000)),
+            // Unbalanced / truncated.
+            "call:list_dir{path:<|\"|>/tmp",
+            "call:a{b:{c:{d:",
+            "<|tool_call>call:",
+            "call:{}}}}}",
+            // Garbage bytes near markers.
+            "call:\u{feff}\u{200b}{k\u{0}:v}",
+        ];
+        for c in cases {
+            let _ = parse_tool_calls(c); // must return, not panic
+        }
+    }
+
+    #[test]
+    fn parse_total_under_random_fuzz() {
+        // Deterministic LCG (no deps) → strings assembled from tool-call
+        // fragments, delimiters, and multi-byte chars. `parse_tool_calls` must
+        // return on every one (a panic here = a server crash on model output).
+        let frags = [
+            "call:",
+            "<|tool_call>",
+            "<tool_call|>",
+            "{",
+            "}",
+            "[",
+            "]",
+            ",",
+            ":",
+            "<|\"|>",
+            "path",
+            "/tmp",
+            "naïve",
+            "日本",
+            "±∞",
+            "true",
+            "42",
+            " ",
+            "\n",
+            "x",
+        ];
+        let mut state: u64 = 0x9e3779b97f4a7c15;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+        for _ in 0..20_000 {
+            let n = next() % 40;
+            let mut s = String::new();
+            for _ in 0..n {
+                s.push_str(frags[next() % frags.len()]);
+            }
+            let _ = parse_tool_calls(&s);
+            let _ = content_before_tool_calls(&s);
+        }
     }
 
     fn list_dir_tool() -> Value {
