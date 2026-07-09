@@ -238,6 +238,17 @@ impl KvSnapshot {
         &self.tokens
     }
 
+    /// The raw KV bytes (for spilling to the SSD tier). The token log is stored
+    /// separately by the manager, so only these bytes need to hit disk.
+    pub fn kv_bytes(&self) -> &[u8] {
+        &self.kv_bytes
+    }
+
+    /// Reconstruct a snapshot from SSD bytes + the conversation's token log.
+    pub fn from_parts(kv_bytes: Vec<u8>, tokens: Vec<u32>) -> Self {
+        Self { kv_bytes, tokens }
+    }
+
     /// Test-only: a snapshot with a recorded byte cost but no real KV, so the
     /// conversation manager's routing/LRU/accounting can be exercised without a
     /// GPU session.

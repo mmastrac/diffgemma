@@ -259,6 +259,31 @@ pub fn conv_cache_bytes() -> usize {
         .unwrap_or(0)
 }
 
+/// Disk byte budget for the server's SSD conversation-snapshot tier
+/// (`DGQ_CONV_DISK_GB`, gibibytes → bytes). When the RAM pool
+/// ([`conv_cache_bytes`]) overflows, least-recently-used snapshots spill to this
+/// tier (a compact blob per conversation on SSD) instead of being dropped;
+/// restoring one streams it back — far cheaper than re-prefilling a long
+/// conversation. Over the disk budget, LRU blobs are dropped (→ re-prefill from
+/// the token log). Default 0 = no disk tier (RAM overflow re-prefills directly).
+pub fn conv_disk_bytes() -> usize {
+    std::env::var("DGQ_CONV_DISK_GB")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|g| *g > 0.0)
+        .map(|g| (g * 1024.0 * 1024.0 * 1024.0) as usize)
+        .unwrap_or(0)
+}
+
+/// Directory for the SSD conversation-snapshot tier (`DGQ_CONV_CACHE_DIR`).
+/// Defaults to a per-process subdir of the system temp dir; blobs are removed on
+/// eviction and when the server exits.
+pub fn conv_cache_dir() -> std::path::PathBuf {
+    std::env::var_os("DGQ_CONV_CACHE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("dgq-conv-{}", std::process::id())))
+}
+
 /// `DGQ_KV_MMAP=1`: back the session KV cache with a `MAP_SHARED` temp-file mmap
 /// (wrapped no-copy as the Metal buffer) instead of anonymous device memory, so
 /// under memory pressure dirty KV pages evict to that file rather than to the

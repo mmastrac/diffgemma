@@ -506,13 +506,18 @@ impl Worker {
                     return;
                 }
             };
-        let cache_bytes = crate::flags::conv_cache_bytes();
-        let mut manager = crate::conversation::ConversationManager::new(session, cache_bytes);
+        let ram_bytes = crate::flags::conv_cache_bytes();
+        let disk_bytes = crate::flags::conv_disk_bytes();
+        let disk_dir = crate::flags::conv_cache_dir();
+        let mut manager =
+            crate::conversation::ConversationManager::new(session, ram_bytes, disk_bytes, disk_dir);
+        let gib = |b: usize| b as f64 / (1024.0 * 1024.0 * 1024.0);
         eprintln!(
-            "serve: model ready ({:.1}s, ctx={}, conv-cache={:.1} GiB)",
+            "serve: model ready ({:.1}s, ctx={}, conv-cache={:.1} GiB RAM + {:.1} GiB SSD)",
             open_started.elapsed().as_secs_f64(),
             self.max_seq,
-            cache_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            gib(ram_bytes),
+            gib(disk_bytes),
         );
         if ready.send(Ok(())).is_err() {
             return;
