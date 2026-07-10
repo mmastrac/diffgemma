@@ -96,6 +96,22 @@ pub fn empty_reply_retry() -> u32 {
     })
 }
 
+/// Whitespace-collapse STOPGAP (`DGQ_WS_BLOCK_STOP=1` enables). Very long
+/// replies can degenerate into a newline attractor (observed 2026-07-09 at
+/// ~7k reply tokens / 100k ctx: every block commits 256 newlines, entropy
+/// never converges, every block burns max_steps ~57s, and no stop token ever
+/// comes — the turn would crawl to the context wall). When enabled, a
+/// committed block whose text is PURE whitespace (or all pad/filler) is
+/// dropped and the turn ends. Default OFF while the attractor is treated as
+/// an UNFIXED BUG (suspects: fast-block-extend perturbation accumulation over
+/// ~30 extends, q8-KV-auto at long ctx, sliding-ring interaction) — a
+/// default-on stopper would truncate exactly the evidence needed to
+/// root-cause it. Flip to default ON (with gate + sign-off) only if the
+/// attractor turns out intrinsic.
+pub fn ws_block_stop_enabled() -> bool {
+    on_if_one("DGQ_WS_BLOCK_STOP")
+}
+
 /// TEST override for the denoise canvas width (E3/E6 shrink machinery). When
 /// set (`DGQ_FORCE_CANVAS=64|128|...`), every denoise step runs at this active
 /// canvas width instead of 256 — used to validate the `active_canvas` plumbing

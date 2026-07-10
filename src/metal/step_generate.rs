@@ -450,13 +450,17 @@ pub fn generate_with_session(
     let shared_blob = session.rt.shared_dgq_blob();
     let rt = &mut session.rt;
 
-    if step_text_log_enabled() && session.step_text_tokenizer.is_none() {
+    // The step-text log AND the whitespace-collapse guard both need to decode
+    // canvas tokens; load the tokenizer lazily once per session for either.
+    if (step_text_log_enabled() || crate::flags::ws_block_stop_enabled())
+        && session.step_text_tokenizer.is_none()
+    {
         let tok_path = session.model_dir.join("tokenizer.json");
         match Tokenizer::load(&tok_path) {
             Ok(tok) => session.step_text_tokenizer = Some(tok),
             Err(err) => {
                 eprintln!(
-                    "step-generate: DGQ_LOG_STEP_TEXT=1 but failed to load {}: {err}",
+                    "step-generate: step-text/ws-guard tokenizer load failed for {}: {err}",
                     tok_path.display()
                 );
             }
@@ -738,15 +742,21 @@ pub fn generate_with_session(
                 }
                 let (prefix_mean_log, region_end_log, answer_text_log) = if step_text_log_enabled()
                 {
+                    // Slice to the ACTIVE canvas: the readback buffers are
+                    // PREFILL_M-sized, and rows [active..] hold stale data
+                    // (was: ans_len=1024 + stale positions polluting
+                    // prefix_mean/text on every step line).
+                    let ids = &st.ids[..active.min(st.ids.len())];
+                    let entropy = &st.entropy[..active.min(st.entropy.len())];
                     let pm = crate::sample::mean_entropy_answer_prefix(
-                        &st.entropy,
-                        &st.ids,
+                        entropy,
+                        ids,
                         params.eos_token_id,
                     );
                     let (re, text) = step_answer_text(
                         session.step_text_tokenizer.as_ref(),
                         &st.prev_argmax,
-                        &st.ids,
+                        ids,
                         params.eos_token_id,
                     );
                     (Some(pm), Some(re), text)
@@ -912,6 +922,30 @@ pub fn generate_with_session(
                     eprintln!(
                         "step-generate: block {block_idx} hit stop token {} at offset {rel}; ending turn ({} new tokens)",
                         argmax_tokens[rel],
+                        sequences.len() - prompt_token_ids.len()
+                    );
+                }
+                break;
+            }
+        }
+
+        // Whitespace-collapse STOPGAP (opt-in, see flags::ws_block_stop_enabled:
+        // the attractor is being treated as an unfixed bug and a default-on
+        // stopper would hide the evidence): a committed block whose text is
+        // pure whitespace / all pad-filler ends the turn instead of crawling
+        // toward the context wall at max_steps per block.
+        if crate::flags::ws_block_stop_enabled() {
+            let cleaned = crate::sample::strip_degenerate_token_ids(&argmax_tokens);
+            let all_ws = cleaned.is_empty()
+                || session
+                    .step_text_tokenizer
+                    .as_ref()
+                    .is_some_and(|tok| tok.decode(&cleaned).trim().is_empty());
+            if all_ws {
+                sequences.truncate(block_base);
+                if progress_enabled() {
+                    eprintln!(
+                        "step-generate: block {block_idx} committed pure whitespace; ending turn (DGQ_WS_BLOCK_STOP, {} new tokens kept)",
                         sequences.len() - prompt_token_ids.len()
                     );
                 }
