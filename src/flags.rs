@@ -523,14 +523,34 @@ pub fn prefill_resident_enabled() -> bool {
 /// short-answer prompts); long prompts take the ~10x-faster quantized path.
 pub const FAST_PREFILL_MIN_TOKENS: usize = 256;
 
+/// Max prompt length (tokens) the fast quantized prefill is trusted for
+/// (`DGQ_FAST_PREFILL_MAX`; 0 = no cap). DEFAULT 2048 pending the fp16-stream
+/// fix (task #64, 2026-07-10): the fast prefill's bf16 activation stream
+/// accumulates error with length — grounded/correct answers through ~2.2k
+/// tokens, degraded at ~4.2k, total hallucination at 6.6k (engine f32 prefill
+/// correct at every probed length, MLX fp16 correct at 6.6k). Discrete bugs
+/// were fixed first (pad-row ring clobber, 3285ebe) and every kernel family
+/// was A/B-exonerated (scalar/MMA both degrade; GEMM/MoE/rope byte-identical
+/// swaps) — the remaining delta to the correct engine is activation
+/// precision. Above the cap prompts take the slow-but-correct f32 engine.
+pub fn fast_prefill_max_tokens() -> usize {
+    std::env::var("DGQ_FAST_PREFILL_MAX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(2048)
+}
+
 /// Fast monolithic prefill (quantized + causal) vs the f32 engine for a
 /// `prompt_len`-token prompt. `DGQ_FAST_PREFILL=1|0` forces on/off for all
-/// lengths; unset uses the length heuristic.
+/// lengths; unset uses the length band (see [`fast_prefill_max_tokens`]).
 pub fn should_fast_prefill(prompt_len: usize) -> bool {
     match std::env::var("DGQ_FAST_PREFILL").as_deref() {
         Ok("1") | Ok("true") => true,
         Ok("0") | Ok("false") => false,
-        _ => prompt_len > FAST_PREFILL_MIN_TOKENS,
+        _ => {
+            let max = fast_prefill_max_tokens();
+            prompt_len > FAST_PREFILL_MIN_TOKENS && (max == 0 || prompt_len <= max)
+        }
     }
 }
 

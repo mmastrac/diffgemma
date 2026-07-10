@@ -489,14 +489,44 @@ pub fn generate_with_session(
             Duration::ZERO,
         )
     } else if reuse > 0 {
-        // Keep KV[0..reuse] (causally valid), fast-prefill the delta [reuse..]
-        // at that offset. The delta chunks attend causally to the reused KV, so
-        // this resumes the prefill without the engine's ~1.3s fixed sync cost.
-        let kv_len = rt.prefill_chunks_from(reuse, &prompt_token_ids[reuse..])?;
+        // Keep KV[0..reuse] (causally valid), prefill the delta [reuse..] at
+        // that offset. Short deltas take the fast quantized resume; a delta
+        // past the fast-prefill trust cap (task #64: the bf16 stream
+        // accumulates error with length) extends via the f32 engine in
+        // canvas-sized blocks instead — slower, correct.
+        let delta = &prompt_token_ids[reuse..];
+        let max = crate::flags::fast_prefill_max_tokens();
+        let kv_len = if max == 0 || delta.len() <= max {
+            rt.prefill_chunks_from(reuse, delta)?
+        } else {
+            if session.encoder.is_none() {
+                session.encoder = Some(MonolithicEncoderCache::open_opt(
+                    model_dir,
+                    canvas_len,
+                    cfg.max_seq,
+                    Some(std::sync::Arc::clone(&shared_blob)),
+                )?);
+            }
+            let encoder = session.encoder.as_mut().expect("encoder cache");
+            let mut off = reuse;
+            for chunk in delta.chunks(canvas_len) {
+                off = extend_monolithic_kv_with_cache(
+                    encoder,
+                    rt.kvcache(),
+                    rt.layout(),
+                    off,
+                    chunk,
+                    cfg.max_seq,
+                    layers,
+                )?;
+            }
+            rt.set_kv_len(off as u32);
+            off
+        };
         let prefill_elapsed = prefill_started.elapsed();
         if progress_enabled() {
             eprintln!(
-                "step-generate: cross-turn KV reuse: kept {reuse}/{n_prompt}, fast-prefilled {} delta tokens ({prefill_elapsed:.2?})",
+                "step-generate: cross-turn KV reuse: kept {reuse}/{n_prompt}, prefilled {} delta tokens ({prefill_elapsed:.2?})",
                 n_prompt - reuse
             );
         }
