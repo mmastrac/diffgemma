@@ -3834,12 +3834,16 @@ impl StepEnc<'_> {
             layout,
             StepFinishMode::ForwardOnly,
         )?;
-        self.exec_stage(
-            StepStage::RmsNormHidden,
-            0,
-            layout,
-            StepFinishMode::ForwardOnly,
-        )?;
+        // NO RmsNormHidden here (task #64/#68 ROOT CAUSE, fixed 2026-07-10):
+        // normalizing the embedded hidden is the DENOISE preamble's convention
+        // (canvas stream, parity-validated); the reference ENCODER pass feeds
+        // embed*sqrt(H) straight into layer 0. The norm is per-row
+        // scale-invariant through input_layernorm — layer-0 K/V matched the
+        // engine exactly (rel 0.0025), which hid it — but the RESIDUAL stream
+        // carried a per-token rescale the model never saw in training:
+        // L1 KV diverged 33% from the engine at every length, flipping MoE
+        // routes systematically; short prompts tolerated the warped
+        // trajectory, long ones collapsed into fluent hallucination.
         let per_layer = step_schedule::per_layer_stages(&self.block_profile);
         for layer in 0..layers {
             for &stage in &per_layer {
@@ -3873,12 +3877,16 @@ impl StepEnc<'_> {
             layout,
             StepFinishMode::ForwardOnly,
         )?;
-        self.exec_stage(
-            StepStage::RmsNormHidden,
-            0,
-            layout,
-            StepFinishMode::ForwardOnly,
-        )?;
+        // NO RmsNormHidden here (task #64/#68 ROOT CAUSE, fixed 2026-07-10):
+        // normalizing the embedded hidden is the DENOISE preamble's convention
+        // (canvas stream, parity-validated); the reference ENCODER pass feeds
+        // embed*sqrt(H) straight into layer 0. The norm is per-row
+        // scale-invariant through input_layernorm — layer-0 K/V matched the
+        // engine exactly (rel 0.0025), which hid it — but the RESIDUAL stream
+        // carried a per-token rescale the model never saw in training:
+        // L1 KV diverged 33% from the engine at every length, flipping MoE
+        // routes systematically; short prompts tolerated the warped
+        // trajectory, long ones collapsed into fluent hallucination.
         let per_layer = step_schedule::per_layer_stages(&self.block_profile);
         for layer in 0..layers {
             for &stage in &per_layer {

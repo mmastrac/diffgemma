@@ -199,7 +199,9 @@ pub fn substituted_content(id: &str, summary: &str) -> Value {
     json!({
         "summary": summary,
         "full_output_id": id,
-        "note": "full output available via expand_summary",
+        "note": "This is a summary only. If you need details beyond it, call \
+                 expand_summary with this full_output_id and a mode (head, tail, \
+                 lines, or grep) to retrieve excerpts from the full output.",
     })
 }
 
@@ -231,8 +233,8 @@ pub fn compact_messages(
 pub fn summarize_instruction() -> String {
     "Summarize the critical information from this tool response, delimited \
      with XML <summarize></summarize> tags. The tool response will be replaced \
-     with your summary, so make it short and compact to conserve context \
-     space. A follow-up tool call (expand_summary) will be available to search \
+     with your summary, so if you can extract all relevant content you'll need from it, do so. \
+     A follow-up tool call (expand_summary) will be available to search \
      the full, unsummarized tool output if needed."
         .to_string()
 }

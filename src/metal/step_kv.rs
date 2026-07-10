@@ -1871,6 +1871,196 @@ mod engine_extend_bench_tests {
         assert_eq!(off, 2488 + CANVAS);
     }
 
+    /// E15: fast-vs-engine per-layer per-position-band KV divergence at 4.2k.
+    /// The DGQ_KV_NOISE anchor (engine + 1% noise on every KV value answers
+    /// the 4.2k doc probe correctly) makes the criterion hard: rel-RMS > ~3%
+    /// in some (layer, band) = the bug's first expression; below = ignorable.
+    /// Fixture path via DGQ_E15_PROMPT (defaults to the session scratchpad
+    /// probe_4k.txt).
+    #[test]
+    #[ignore = "model-gated: cargo test --release e15_layer_kv_bisect -- --ignored --nocapture"]
+    fn e15_layer_kv_bisect() {
+        use crate::metal::step_kernel::{StepFinishMode, StepSmokeConfig, build_step_runtime};
+        use crate::tokenizer::Tokenizer;
+        let Some(dir) = model_dir() else { return };
+        let prompt_path = std::env::var("DGQ_E15_PROMPT").unwrap_or_else(|_| {
+            "/private/tmp/claude-501/-Users-matt-Documents-github-diffgemma-mps/2f485cb9-ac37-41aa-bfea-e7eb74c44b4d/scratchpad/probe_4k.txt".into()
+        });
+        let text = std::fs::read_to_string(&prompt_path).expect("probe fixture");
+        let tok = Tokenizer::load(&dir.join("tokenizer.json")).expect("tokenizer");
+        let ids = tok.encode(&text, false);
+        let n = ids.len();
+        eprintln!("e15: {n} tokens from {prompt_path}");
+        let max_seq = 8192usize;
+
+        // FAST path: step runtime + prefill_chunks (the production fast prefill).
+        let cfg = StepSmokeConfig {
+            layers: N_LAYERS,
+            steps: 1,
+            kv_len: 0,
+            seed: 7,
+            max_seq,
+            finish: StepFinishMode::ForwardOnly,
+            prefill_token_ids: None,
+            no_early_stop: true,
+        };
+        let (mut rt, _) = build_step_runtime(&dir, &cfg).expect("runtime");
+        let kv_fast = rt.prefill_chunks(&ids).expect("fast prefill");
+        assert_eq!(kv_fast, n);
+
+        // ENGINE path: shares the dgq blob; separate KV buffer, same layout.
+        let layout = *rt.layout();
+        let ctx = MetalContext::new().expect("metal");
+        let kv_bytes = kv_cache_total_bytes(&layout, max_seq) as usize;
+        let eng_buf = ctx
+            .device
+            .newBufferWithLength_options(kv_bytes, MTLResourceOptions::StorageModeShared)
+            .expect("engine kv buf");
+        let mut cache =
+            MonolithicEncoderCache::open_opt(&dir, CANVAS, max_seq, Some(rt.shared_dgq_blob()))
+                .expect("encoder cache");
+        let (kv_eng, _) = prefill_monolithic_kv_with_cache(
+            &mut cache, &ids, &eng_buf, &layout, max_seq, N_LAYERS,
+        )
+        .expect("engine prefill");
+        assert_eq!(kv_eng, n);
+
+        // Per-(layer, band) rel-RMS over LIVE slots. Bands of 512 positions.
+        const BAND: usize = 512;
+        eprintln!("e15: rel-RMS fast-vs-engine per (layer, position band); * = >3%");
+        let mut worst: (f32, usize, usize) = (0.0, 0, 0);
+        for layer in 0..N_LAYERS {
+            let l = &layout.layers[layer];
+            let nkv = l.n_kv_heads as usize;
+            let hd = l.head_dim as usize;
+            let token_stride = nkv * hd * 2;
+            let slot_base = l.kv_region as usize / 2;
+            let live_from = if l.kv_ring_mask != 0 {
+                n.saturating_sub(layer_slots(l, max_seq))
+            } else {
+                0
+            };
+            let mut row = format!("L{layer:02}{} ", if l.is_full != 0 { "F" } else { " " });
+            let mut band_start = live_from - live_from % BAND;
+            while band_start < n {
+                let b0 = band_start.max(live_from);
+                let band_end = (band_start + BAND).min(n);
+                let mut num = 0f64;
+                let mut den = 0f64;
+                for pos in b0..band_end {
+                    let slot = kv_slot(l, pos);
+                    for i in 0..token_stride {
+                        let byte = (slot_base + slot * token_stride + i) * 2;
+                        let va = f16_bits_to_f32(read_half_at(rt.kvcache(), byte)) as f64;
+                        let vb = f16_bits_to_f32(read_half_at(&eng_buf, byte)) as f64;
+                        num += (va - vb) * (va - vb);
+                        den += vb * vb;
+                    }
+                }
+                let rel = if den > 0.0 {
+                    (num / den).sqrt() as f32
+                } else {
+                    0.0
+                };
+                if rel > worst.0 {
+                    worst = (rel, layer, b0);
+                }
+                row.push_str(&format!(
+                    "{}{:5.3} ",
+                    if rel > 0.03 { "*" } else { " " },
+                    rel
+                ));
+                band_start = band_end;
+            }
+            eprintln!("{row}");
+        }
+        eprintln!(
+            "e15: worst rel-RMS {:.4} at L{} band starting {}",
+            worst.0, worst.1, worst.2
+        );
+    }
+
+    /// E15 causality check (chaos-immune): fast-prefill of tokens[..k] must
+    /// leave BYTE-IDENTICAL full-layer KV for positions [0, k) as a fast
+    /// prefill of the whole prompt — each position's KV is fixed by its causal
+    /// context. Any difference = later tokens corrupting earlier state (a
+    /// write-range/aliasing bug), with no routing-chaos excuse (same path,
+    /// same kernels, bit comparison). Full layers only (linear storage; the
+    /// sliding rings hold different position windows in the two runs).
+    #[test]
+    #[ignore = "model-gated: cargo test --release e15_causality_check -- --ignored --nocapture"]
+    fn e15_causality_check() {
+        use crate::metal::step_kernel::{StepFinishMode, StepSmokeConfig, build_step_runtime};
+        use crate::tokenizer::Tokenizer;
+        let Some(dir) = model_dir() else { return };
+        let prompt_path = std::env::var("DGQ_E15_PROMPT").unwrap_or_else(|_| {
+            "/private/tmp/claude-501/-Users-matt-Documents-github-diffgemma-mps/2f485cb9-ac37-41aa-bfea-e7eb74c44b4d/scratchpad/probe_4k.txt".into()
+        });
+        let text = std::fs::read_to_string(&prompt_path).expect("probe fixture");
+        let tok = Tokenizer::load(&dir.join("tokenizer.json")).expect("tokenizer");
+        let ids = tok.encode(&text, false);
+        let n = ids.len();
+        let k = 2048usize.min(n / 2 * 2);
+        let max_seq = 8192usize;
+        eprintln!("e15-causality: prefix {k} of {n} tokens");
+        let cfg = StepSmokeConfig {
+            layers: N_LAYERS,
+            steps: 1,
+            kv_len: 0,
+            seed: 7,
+            max_seq,
+            finish: StepFinishMode::ForwardOnly,
+            prefill_token_ids: None,
+            no_early_stop: true,
+        };
+        let (mut rt, _) = build_step_runtime(&dir, &cfg).expect("runtime");
+
+        // Run 1: prefix only. Snapshot full-layer KV for [0, k).
+        let got = rt.prefill_chunks(&ids[..k]).expect("prefix prefill");
+        assert_eq!(got, k);
+        let layout = *rt.layout();
+        let mut snap: Vec<(usize, Vec<u16>)> = Vec::new();
+        for layer in 0..N_LAYERS {
+            let l = &layout.layers[layer];
+            if l.is_full == 0 {
+                continue;
+            }
+            let token_stride = (l.n_kv_heads * l.head_dim) as usize * 2;
+            let slot_base = l.kv_region as usize / 2;
+            let mut vals = vec![0u16; k * token_stride];
+            for (i, v) in vals.iter_mut().enumerate() {
+                *v = read_half_at(rt.kvcache(), (slot_base + i) * 2);
+            }
+            snap.push((layer, vals));
+        }
+
+        // Run 2: full prompt on the same runtime (prefill_chunks rewrites from 0).
+        rt.set_kv_len(0);
+        let got = rt.prefill_chunks(&ids).expect("full prefill");
+        assert_eq!(got, n);
+
+        for (layer, vals) in &snap {
+            let l = &layout.layers[*layer];
+            let token_stride = (l.n_kv_heads * l.head_dim) as usize * 2;
+            let slot_base = l.kv_region as usize / 2;
+            let mut bad = 0usize;
+            let mut first: Option<usize> = None;
+            for (i, v) in vals.iter().enumerate() {
+                let now = read_half_at(rt.kvcache(), (slot_base + i) * 2);
+                if now != *v {
+                    bad += 1;
+                    if first.is_none() {
+                        first = Some(i / token_stride);
+                    }
+                }
+            }
+            eprintln!(
+                "e15-causality: L{layer:02}F prefix [0,{k}) mismatched u16s: {bad}/{} first_pos={first:?}",
+                vals.len()
+            );
+        }
+    }
+
     /// One resident engine prefill of 1024 synthetic tokens with the per-layer
     /// phase profile on — splits waitA (attention+dense GEMMs+router GPU) from
     /// waitB (MoE GPU) to locate the ms/tok. Diagnostic only.
