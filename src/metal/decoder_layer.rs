@@ -655,11 +655,16 @@ impl PrefillResidentBufs {
     }
 }
 
-/// GPU-resident causal prefill layer: identical kernels and dispatch order to
-/// `forward_encoder_prefill` + `forward_layer_ff_dgq_gpu` (bit-identical KV and
-/// hidden), but the hidden state never leaves the GPU. Two syncs per layer —
-/// the router flush (~32 KB) and the MoE/combine batch end (no readback) —
-/// instead of four syncs with ~3.5 MiB of hidden-state round-trips.
+/// GPU-resident causal prefill/extend layer: identical kernels and dispatch
+/// order to `forward_encoder_prefill`/`forward_encoder_extend` +
+/// `forward_layer_ff_dgq_gpu` (bit-identical KV and hidden), but the hidden
+/// state never leaves the GPU. Two syncs per layer — the router flush
+/// (~32 KB) and the MoE/combine batch end (no readback) — instead of four
+/// syncs with ~3.5 MiB of hidden-state round-trips.
+///
+/// `kv_cache_len == 0` is a fresh causal prefill (CausalSliding mask);
+/// `kv_cache_len > 0` extends an existing prefix (EncoderExtend mask —
+/// `gpu_kv.kv_len` must equal it, and `positions` start there).
 ///
 /// Input hidden is `bufs.hidden[in_idx]`; output is written to
 /// `bufs.hidden[1 - in_idx]`. `.dgq` + GPU-MoE only (the production configuration).
@@ -673,6 +678,7 @@ pub fn forward_encoder_prefill_resident(
     layer: usize,
     seq_len: usize,
     positions: &[i64],
+    kv_cache_len: usize,
     // Tiny reusable scratch (the full GpuDecoderLayerScratch allocates CPU
     // attention/MoE buffers this GPU-resident path never touches).
     rope_freqs: &mut Vec<f32>,
@@ -694,11 +700,19 @@ pub fn forward_encoder_prefill_resident(
     let top_k = cfg.top_k_experts;
     let params = AttentionParams::for_layer(cfg, layer)?;
 
-    assert_eq!(gpu_kv.kv_len, 0);
+    assert_eq!(gpu_kv.kv_len, kv_cache_len);
     let rope_kind = rope_kind_for_layer(cfg, layer).ok_or(Error::Format("rope kind"))?;
     rope_freqs.clear();
     rope_freqs.resize(seq_len * params.rotary_dim, 0.0);
     compute_rope_freqs(rope_freqs, positions, rope_kind);
+    let mask = if kv_cache_len == 0 {
+        GqaMask::CausalSliding
+    } else {
+        GqaMask::EncoderExtend {
+            kv_cache_len,
+            positions,
+        }
+    };
 
     let k_canvas_off = gpu_kv.canvas_k_elem_offset(layer)?;
     let kv_suffix_elems = seq_len * params.n_kv_heads * params.head_dim;
@@ -736,8 +750,8 @@ pub fn forward_encoder_prefill_resident(
         k_canvas_off,
         kv_suffix_byte_off,
         kv_suffix_elems,
-        seq_len,
-        GqaMask::CausalSliding,
+        kv_cache_len + seq_len,
+        mask,
         &cached.o_proj,
     )?;
     let t_attn_encoded = std::time::Instant::now();

@@ -109,6 +109,7 @@ pub fn prefill_gpu(
                     layer,
                     seq_len,
                     &positions,
+                    0,
                     &mut rope_freqs,
                     &mut token_indices,
                     engine,
@@ -279,6 +280,48 @@ pub fn extend_prefill_gpu(
     let n_layers = max_layers
         .unwrap_or(text.num_hidden_layers)
         .min(text.num_hidden_layers);
+
+    // GPU-resident extend (default): same kernels/order as the classic path
+    // below (bit-identical KV), hidden stays on GPU — 2 syncs/layer instead of
+    // 4 with multi-MiB host round-trips. Mirrors `prefill_gpu`'s resident
+    // branch with the EncoderExtend mask. `DGQ_PREFILL_RESIDENT=0` opts out.
+    let resident =
+        weights.is_dgq() && engine.encoder_gpu_moe() && crate::flags::prefill_resident_enabled();
+    if resident {
+        let bufs = crate::metal::decoder_layer::PrefillResidentBufs::new(engine, seq_len, hidden)?;
+        bufs.upload_hidden(0, &enc_scratch.hidden_a[..seq_len * hidden])?;
+        let mut rope_freqs: Vec<f32> = Vec::new();
+        let mut token_indices: Vec<u32> = Vec::new();
+        let mut in_idx = 0usize;
+        for layer in 0..n_layers {
+            weights.ensure_layer(store, text, layer, &engine.ctx.device, &mut engine.pool)?;
+            let layer_cache = weights.layer_ref(layer);
+            crate::metal::decoder_layer::forward_encoder_prefill_resident(
+                &bufs,
+                in_idx,
+                &layer_cache,
+                weights,
+                text,
+                layer,
+                seq_len,
+                &positions,
+                kv_len_before,
+                &mut rope_freqs,
+                &mut token_indices,
+                engine,
+                &gpu_kv,
+            )?;
+            in_idx = 1 - in_idx;
+        }
+        // No pool trim here (unlike prefill): extends run in chunk loops —
+        // keep the pool warm across chunks.
+        bufs.release(engine);
+        gpu_kv.advance_kv_len(seq_len)?;
+        dec_scratch.gpu_kv = Some(gpu_kv);
+        kv_cache.advance_kv_len(seq_len);
+        return Ok(());
+    }
+
     let mut use_a_input = true;
     for layer in 0..n_layers {
         let layer_weights = if weights.is_dgq() {

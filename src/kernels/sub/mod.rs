@@ -69,6 +69,7 @@ pub mod softcap_half;
 pub mod softmax_rows;
 pub mod swiglu;
 pub mod test_util;
+pub mod unpack_encoder_kv;
 pub mod variant;
 pub mod vec_add_inplace;
 pub mod vec_fill_zero;

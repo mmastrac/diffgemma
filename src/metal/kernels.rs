@@ -21,6 +21,9 @@ pub struct GpuKernels {
     pub(crate) pack_encoder_kv: ComputePipeline,
     /// q8-KV variant (long-context sessions; grid depth = head_dim/32 groups).
     pub(crate) pack_encoder_kv_q8: ComputePipeline,
+    pub(crate) unpack_encoder_kv: ComputePipeline,
+    /// q8-KV variant (grid depth = head_dim elements, same as f16).
+    pub(crate) unpack_encoder_kv_q8: ComputePipeline,
     pub(crate) scatter_rows_weighted: ComputePipeline,
 }
 
@@ -29,7 +32,8 @@ impl GpuKernels {
         use crate::kernels::sub::{
             embed_gather, gather_prob_cols, gather_rows, gelu, half_to_f32, pack_encoder_kv,
             rms_norm_rows, router_scale_rows, router_top_k_rows, scatter_rows_weighted,
-            softmax_rows, swiglu, vec_add_inplace, vec_fill_zero, vec_scale_inplace,
+            softmax_rows, swiglu, unpack_encoder_kv, vec_add_inplace, vec_fill_zero,
+            vec_scale_inplace,
         };
         let prod = KernelVariant::PRODUCTION;
         Ok(Self {
@@ -54,6 +58,12 @@ impl GpuKernels {
             half_to_f32: half_to_f32::pipeline_for(ctx, prod)?,
             pack_encoder_kv: pack_encoder_kv::pipeline_for(ctx, prod)?,
             pack_encoder_kv_q8: pack_encoder_kv::pipeline_fmt_for(
+                ctx,
+                prod,
+                crate::kernels::sub::kv_quant::KvFormat::Q8,
+            )?,
+            unpack_encoder_kv: unpack_encoder_kv::pipeline_for(ctx, prod)?,
+            unpack_encoder_kv_q8: unpack_encoder_kv::pipeline_fmt_for(
                 ctx,
                 prod,
                 crate::kernels::sub::kv_quant::KvFormat::Q8,

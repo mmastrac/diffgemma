@@ -9,8 +9,8 @@ use crate::metal::step_kernel::{
     trace_entropy_enabled,
 };
 use crate::metal::step_kv::{
-    MonolithicEncoderCache, MonolithicPrefillTiming, extend_monolithic_kv_with_cache,
-    prefill_monolithic_kv_with_cache,
+    MonolithicEncoderCache, MonolithicPrefillTiming, extend_monolithic_kv_chunked,
+    extend_monolithic_kv_with_cache, prefill_monolithic_kv_with_cache,
 };
 use crate::metal::{ForwardTelemetry, SessionTelemetry, StepPhaseTelemetry};
 use crate::safetensors::Error;
@@ -508,18 +508,15 @@ pub fn generate_with_session(
                 )?);
             }
             let encoder = session.encoder.as_mut().expect("encoder cache");
-            let mut off = reuse;
-            for chunk in delta.chunks(canvas_len) {
-                off = extend_monolithic_kv_with_cache(
-                    encoder,
-                    rt.kvcache(),
-                    rt.layout(),
-                    off,
-                    chunk,
-                    cfg.max_seq,
-                    layers,
-                )?;
-            }
+            let off = extend_monolithic_kv_chunked(
+                encoder,
+                rt.kvcache(),
+                rt.layout(),
+                reuse,
+                delta,
+                cfg.max_seq,
+                layers,
+            )?;
             rt.set_kv_len(off as u32);
             off
         };

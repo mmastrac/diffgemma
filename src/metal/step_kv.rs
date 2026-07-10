@@ -620,10 +620,27 @@ pub fn read_layer_k_cache_f32(
     keys
 }
 
-/// Load monolithic b4 prefix `[0, kv_len)` into engine `GpuKvCache` (for extend after prefill).
+/// Load monolithic b4 prefix `[0, kv_len)` into engine `GpuKvCache` (for extend
+/// after prefill). GPU kernel (inverse of `pack_encoder_kv`), one batch for all
+/// layers.
+///
+/// Ring-aware: sliding layers hold only the last `min(kv_len, ring)` positions
+/// (`slot = pos & mask`), so only that live range is hydrated — into the SAME
+/// absolute engine indices (the extend attention mask uses `pos_k = ki`, buffer
+/// index == position). Engine positions below the live range are left as-is:
+/// their K scores are sliding-window-masked (score overwritten, so even NaN K
+/// is harmless) and their V rows are multiplied by an exactly-0.0 softmax
+/// weight — safe because GpuKvCache buffers are zero-filled at allocation and
+/// only ever written by forwards/hydrates (always finite; 0.0 * finite = 0.0).
+///
+/// (The pre-3285ebe-era CPU predecessor of this function read monolithic slots
+/// LINEARLY — wrong past the ring wrap — and cost O(kv_len) scalar f16
+/// conversions per call, O(n²) over a chunked delta.)
 fn hydrate_gpu_kv_from_monolithic(
+    engine: &mut GpuDecoderEngine,
     kv_buf: &ProtocolObject<dyn MTLBuffer>,
     layout: &ModelLayout,
+    max_seq: usize,
     kv_len: usize,
     gpu_kv: &mut crate::metal::GpuKvCache,
     layers: usize,
@@ -632,32 +649,55 @@ fn hydrate_gpu_kv_from_monolithic(
         gpu_kv.reset_len();
         return Ok(());
     }
-    use crate::metal::buffer::BufferPool;
+    use crate::kernels::sub::unpack_encoder_kv;
+    use crate::metal::batch::begin_engine_batch;
+
+    let fmt = crate::flags::kv_format(max_seq);
+    let pipeline = if fmt == KvFormat::F16 {
+        engine.kernels.unpack_encoder_kv.pipeline.clone()
+    } else {
+        // q8 (q4 not yet wired) — the quantized unpack pipeline.
+        engine.kernels.unpack_encoder_kv_q8.pipeline.clone()
+    };
+    let telemetry = engine.batch_telemetry();
+    let batch = begin_engine_batch(
+        &engine.ctx.queue,
+        &mut engine.pool,
+        &engine.ctx.device,
+        telemetry,
+    )?;
     for layer in 0..layers {
         let l = &layout.layers[layer];
         let nkv = l.n_kv_heads as usize;
         let hd = l.head_dim as usize;
-        let per_token = nkv * hd;
-        let token_stride = nkv * hd * 2;
-        let byte_base = l.kv_region as usize;
-        let mut keys = vec![0f32; kv_len * per_token];
-        let mut values = vec![0f32; kv_len * per_token];
-        for pos in 0..kv_len {
-            let slot_base = byte_base / 2 + pos * token_stride;
-            for hh in 0..nkv {
-                for d in 0..hd {
-                    let dst_i = pos * per_token + hh * hd + d;
-                    let k_byte = (slot_base + hh * hd + d) * 2;
-                    let v_byte = (slot_base + nkv * hd + hh * hd + d) * 2;
-                    keys[dst_i] = f16_bits_to_f32(read_half_at(kv_buf, k_byte));
-                    values[dst_i] = f16_bits_to_f32(read_half_at(kv_buf, v_byte));
-                }
-            }
+        let live_from = if l.kv_ring_mask != 0 {
+            kv_len.saturating_sub(layer_slots(l, max_seq))
+        } else {
+            0
+        };
+        let count = kv_len - live_from;
+        if count == 0 {
+            continue;
         }
         let (k_buf, v_buf) = gpu_kv.layer_buffers(layer)?;
-        BufferPool::write_f32(&k_buf, &keys);
-        BufferPool::write_f32(&v_buf, &values);
+        let (grid, tg) = unpack_encoder_kv::dispatch_shape(count, nkv, hd);
+        batch.dispatch_with_grid(&pipeline, grid, tg, |enc| {
+            unpack_encoder_kv::bind_gpu_buffers(
+                enc,
+                kv_buf,
+                &k_buf,
+                &v_buf,
+                count as u32,
+                live_from as u32,
+                nkv as u32,
+                hd as u32,
+                l.kv_region,
+                live_from as u32,
+                l.kv_ring_mask,
+            );
+        });
     }
+    batch.end()?;
     gpu_kv.kv_len = kv_len;
     Ok(())
 }
@@ -678,6 +718,7 @@ pub fn extend_monolithic_kv_with_cache(
     if kv_len_before + new_token_ids.len() > max_seq {
         return Err(Error::Format("monolithic kv extend exceeds max_seq"));
     }
+    let total_started = std::time::Instant::now();
     let text = &cache.model.config.text_config;
     let canvas = CANVAS;
     let layers = max_layers.min(text.num_hidden_layers);
@@ -693,12 +734,23 @@ pub fn extend_monolithic_kv_with_cache(
         .gpu_kv
         .take()
         .ok_or(Error::Format("gpu kv cache missing"))?;
-    hydrate_gpu_kv_from_monolithic(kv_buf, layout, kv_len_before, &mut gpu_kv, layers)?;
+    let hydrate_started = std::time::Instant::now();
+    hydrate_gpu_kv_from_monolithic(
+        &mut cache.engine,
+        kv_buf,
+        layout,
+        max_seq,
+        kv_len_before,
+        &mut gpu_kv,
+        layers,
+    )?;
+    let hydrate_ms = hydrate_started.elapsed().as_secs_f64() * 1000.0;
     cache.dec_scratch.gpu_kv = Some(gpu_kv);
 
     let mut cpu_kv = KvCache::empty(text)?;
     cpu_kv.kv_len = kv_len_before;
 
+    let forward_started = std::time::Instant::now();
     extend_prefill_gpu(
         &cache.model.weights,
         &cache.model.config,
@@ -710,6 +762,7 @@ pub fn extend_monolithic_kv_with_cache(
         &mut cache.engine,
         Some(layers),
     )?;
+    let forward_ms = forward_started.elapsed().as_secs_f64() * 1000.0;
 
     let gpu_kv = cache
         .dec_scratch
@@ -723,6 +776,7 @@ pub fn extend_monolithic_kv_with_cache(
         return Err(Error::Format("monolithic kv buffer too small"));
     }
 
+    let pack_started = std::time::Instant::now();
     pack_gpu_kv_prefix_to_monolithic(
         &mut cache.engine,
         gpu_kv,
@@ -734,7 +788,121 @@ pub fn extend_monolithic_kv_with_cache(
         kv_len_before,
         crate::flags::kv_format(max_seq),
     )?;
+    if progress_enabled() {
+        eprintln!(
+            "monolithic-extend: +{append_len} tok at kv={kv_len_before}: hydrate={hydrate_ms:.1}ms forward={forward_ms:.1}ms pack={:.1}ms total={:.1}ms",
+            pack_started.elapsed().as_secs_f64() * 1000.0,
+            total_started.elapsed().as_secs_f64() * 1000.0,
+        );
+    }
     Ok(new_kv_len)
+}
+
+/// Multi-chunk engine extend: hydrate the engine KV from monolithic b4 ONCE,
+/// then forward + pack `new_token_ids` in `CANVAS`-sized chunks. Byte-identical
+/// KV to chaining [`extend_monolithic_kv_with_cache`] per chunk (same kernels,
+/// same chunking, same f16 pack/unpack roundtrips at chunk boundaries) minus
+/// that path's per-chunk re-hydration — which is O(prefix) per chunk, O(n²)
+/// over a long delta. This is the production path for cross-turn deltas past
+/// the fast-prefill trust cap (task #64).
+pub fn extend_monolithic_kv_chunked(
+    cache: &mut MonolithicEncoderCache,
+    kv_buf: &ProtocolObject<dyn MTLBuffer>,
+    layout: &ModelLayout,
+    kv_len_before: usize,
+    new_token_ids: &[u32],
+    max_seq: usize,
+    max_layers: usize,
+) -> Result<usize, Error> {
+    if new_token_ids.is_empty() {
+        return Ok(kv_len_before);
+    }
+    if kv_len_before + new_token_ids.len() > max_seq {
+        return Err(Error::Format("monolithic kv extend exceeds max_seq"));
+    }
+    let total_started = std::time::Instant::now();
+    let text = &cache.model.config.text_config;
+    let canvas = CANVAS;
+    let layers = max_layers.min(text.num_hidden_layers);
+    let fmt = crate::flags::kv_format(max_seq);
+    let need = kv_cache_total_bytes(layout, max_seq) as usize;
+    if kv_buf.length() < need {
+        return Err(Error::Format("monolithic kv buffer too small"));
+    }
+
+    let encoder_kv_cap = (kv_len_before + new_token_ids.len()).min(max_seq);
+    cache
+        .dec_scratch
+        .ensure_gpu_kv(&cache.engine.ctx.device, text, encoder_kv_cap, canvas)?;
+    let mut gpu_kv = cache
+        .dec_scratch
+        .gpu_kv
+        .take()
+        .ok_or(Error::Format("gpu kv cache missing"))?;
+    let hydrate_started = std::time::Instant::now();
+    hydrate_gpu_kv_from_monolithic(
+        &mut cache.engine,
+        kv_buf,
+        layout,
+        max_seq,
+        kv_len_before,
+        &mut gpu_kv,
+        layers,
+    )?;
+    let hydrate_ms = hydrate_started.elapsed().as_secs_f64() * 1000.0;
+    cache.dec_scratch.gpu_kv = Some(gpu_kv);
+
+    let mut cpu_kv = KvCache::empty(text)?;
+    cpu_kv.kv_len = kv_len_before;
+    // Scratch sized once for the largest chunk (forwards slice to chunk len).
+    let mut enc_scratch = EncoderScratch::new(canvas.min(new_token_ids.len()), &cache.model.config);
+
+    let mut off = kv_len_before;
+    let mut forward_ms = 0f64;
+    let mut pack_ms = 0f64;
+    for chunk in new_token_ids.chunks(canvas) {
+        let forward_started = std::time::Instant::now();
+        extend_prefill_gpu(
+            &cache.model.weights,
+            &cache.model.config,
+            &mut cpu_kv,
+            chunk,
+            &mut enc_scratch,
+            &mut cache.dec_scratch,
+            &mut cache.weights,
+            &mut cache.engine,
+            Some(layers),
+        )?;
+        forward_ms += forward_started.elapsed().as_secs_f64() * 1000.0;
+
+        let gpu_kv = cache
+            .dec_scratch
+            .gpu_kv
+            .as_ref()
+            .ok_or(Error::Format("gpu kv missing after extend"))?;
+        let pack_started = std::time::Instant::now();
+        pack_gpu_kv_prefix_to_monolithic(
+            &mut cache.engine,
+            gpu_kv,
+            kv_buf,
+            layout,
+            chunk.len(),
+            layers,
+            off,
+            off,
+            fmt,
+        )?;
+        pack_ms += pack_started.elapsed().as_secs_f64() * 1000.0;
+        off += chunk.len();
+    }
+    if progress_enabled() {
+        eprintln!(
+            "monolithic-extend-chunked: +{} tok at kv={kv_len_before}: hydrate={hydrate_ms:.1}ms forward={forward_ms:.1}ms pack={pack_ms:.1}ms total={:.1}ms",
+            new_token_ids.len(),
+            total_started.elapsed().as_secs_f64() * 1000.0,
+        );
+    }
+    Ok(off)
 }
 
 /// GPU encoder extend → read back new suffix K/V → append into monolithic b4 (M1.3).
@@ -1385,6 +1553,172 @@ pub fn run_encoder_moe_kv_parity(
     let (max_diff, layer, pos) =
         monolithic_kv_prefix_max_diff(&cpu_buf, &gpu_buf, &layout, cpu_kv_len, layers);
     Ok((max_diff, layer, pos))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod engine_extend_bench_tests {
+    use super::*;
+    use crate::metal::device::MetalContext;
+
+    fn model_dir() -> Option<std::path::PathBuf> {
+        let dir = std::path::Path::new("model/diffusiongemma-q4emb");
+        if dir.join("model.dgq.json").exists() {
+            Some(dir.to_path_buf())
+        } else {
+            eprintln!("skip: model/diffusiongemma-q4emb missing");
+            None
+        }
+    }
+
+    fn synth_ids(n: usize) -> Vec<u32> {
+        (0..n).map(|i| ((i * 131 + 7) % VOCAB) as u32).collect()
+    }
+
+    /// Ring-aware max |Δ| between two monolithic KV buffers over each layer's
+    /// LIVE slots (full layers: all of [0, kv_len); sliding: the last
+    /// min(kv_len, ring) positions). `monolithic_kv_prefix_max_diff` reads
+    /// positions linearly and is only valid below the ring wrap.
+    fn live_kv_max_diff(
+        a: &ProtocolObject<dyn MTLBuffer>,
+        b: &ProtocolObject<dyn MTLBuffer>,
+        layout: &ModelLayout,
+        max_seq: usize,
+        kv_len: usize,
+        layers: usize,
+    ) -> (f32, usize, usize) {
+        let mut max_diff = 0.0f32;
+        let mut max_layer = 0usize;
+        let mut max_pos = 0usize;
+        for layer in 0..layers.min(N_LAYERS) {
+            let l = &layout.layers[layer];
+            let nkv = l.n_kv_heads as usize;
+            let hd = l.head_dim as usize;
+            let token_stride = nkv * hd * 2;
+            let slot_base = l.kv_region as usize / 2;
+            let live_from = if l.kv_ring_mask != 0 {
+                kv_len.saturating_sub(layer_slots(l, max_seq))
+            } else {
+                0
+            };
+            for pos in live_from..kv_len {
+                let slot = kv_slot(l, pos);
+                for hidx in 0..token_stride {
+                    let byte = (slot_base + slot * token_stride + hidx) * 2;
+                    let va = f16_bits_to_f32(read_half_at(a, byte));
+                    let vb = f16_bits_to_f32(read_half_at(b, byte));
+                    let d = (va - vb).abs();
+                    if d > max_diff {
+                        max_diff = d;
+                        max_layer = layer;
+                        max_pos = pos;
+                    }
+                }
+            }
+        }
+        (max_diff, max_layer, max_pos)
+    }
+
+    /// E12 baseline: extend-vs-full-prefill KV parity below (1500) and above
+    /// (3000) the sliding ring wrap (2048), plus hydrate/forward/pack timing
+    /// per 256-token extend (printed by the monolithic-extend instrumentation).
+    #[test]
+    #[ignore = "model-gated bench: cargo test --release engine_extend_baseline -- --ignored --nocapture"]
+    fn engine_extend_baseline() {
+        let Some(dir) = model_dir() else { return };
+        let max_seq = 4096usize;
+        let layers = N_LAYERS;
+        let store = DgqStore::open(&dir).expect("dgq");
+        let layout = build_layout(&build_offsets_from_store(&store), max_seq);
+        let ctx = MetalContext::new().expect("metal");
+        let kv_bytes = kv_cache_total_bytes(&layout, max_seq) as usize;
+        let alloc = || {
+            ctx.device
+                .newBufferWithLength_options(kv_bytes, MTLResourceOptions::StorageModeShared)
+                .expect("kv buf")
+        };
+        let mut cache = MonolithicEncoderCache::open(&dir, CANVAS, max_seq).expect("cache");
+
+        for &(total, label) in &[(1500usize, "below-ring"), (3000usize, "above-ring")] {
+            let ids = synth_ids(total);
+            let split = total - 2 * CANVAS;
+            let buf_full = alloc();
+            let buf_ext = alloc();
+
+            let t = std::time::Instant::now();
+            let (kv_full, _) = prefill_monolithic_kv_with_cache(
+                &mut cache, &ids, &buf_full, &layout, max_seq, layers,
+            )
+            .expect("full prefill");
+            let full_s = t.elapsed().as_secs_f64();
+
+            let (kv_pre, _) = prefill_monolithic_kv_with_cache(
+                &mut cache,
+                &ids[..split],
+                &buf_ext,
+                &layout,
+                max_seq,
+                layers,
+            )
+            .expect("split prefill");
+            assert_eq!(kv_pre, split);
+            let t = std::time::Instant::now();
+            let mut off = split;
+            for chunk in ids[split..].chunks(CANVAS) {
+                off = extend_monolithic_kv_with_cache(
+                    &mut cache, &buf_ext, &layout, off, chunk, max_seq, layers,
+                )
+                .expect("extend");
+            }
+            let ext_s = t.elapsed().as_secs_f64();
+            assert_eq!(off, total);
+            assert_eq!(kv_full, total);
+
+            // Chunked (hydrate-once) extend — must be byte-identical to the
+            // per-chunk path (same kernels + chunk boundaries).
+            let buf_chunked = alloc();
+            let (kv_pre2, _) = prefill_monolithic_kv_with_cache(
+                &mut cache,
+                &ids[..split],
+                &buf_chunked,
+                &layout,
+                max_seq,
+                layers,
+            )
+            .expect("split prefill 2");
+            assert_eq!(kv_pre2, split);
+            let t = std::time::Instant::now();
+            let off2 = extend_monolithic_kv_chunked(
+                &mut cache,
+                &buf_chunked,
+                &layout,
+                split,
+                &ids[split..],
+                max_seq,
+                layers,
+            )
+            .expect("chunked extend");
+            let chunked_s = t.elapsed().as_secs_f64();
+            assert_eq!(off2, total);
+
+            let (diff, dl, dp) =
+                live_kv_max_diff(&buf_full, &buf_ext, &layout, max_seq, total, layers);
+            let (cdiff, cdl, cdp) =
+                live_kv_max_diff(&buf_ext, &buf_chunked, &layout, max_seq, total, layers);
+            eprintln!(
+                "[{label}] total={total} full_prefill={full_s:.2}s ({:.1} ms/tok) extend(2x256 @{split})={ext_s:.2}s ({:.1} ms/tok) chunked={chunked_s:.2}s live_max_diff={diff:.6} @L{dl} pos{dp} chunked_vs_perchunk={cdiff:.6} @L{cdl} pos{cdp}",
+                full_s * 1000.0 / total as f64,
+                ext_s * 1000.0 / (2.0 * CANVAS as f64),
+            );
+            assert_eq!(
+                cdiff, 0.0,
+                "[{label}] chunked extend != per-chunk extend: {cdiff} @ L{cdl} pos {cdp}"
+            );
+            assert!(
+                diff < 0.02,
+                "[{label}] extend diverges from full prefill: {diff} @ L{dl} pos {dp}"
+            );
+        }
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
