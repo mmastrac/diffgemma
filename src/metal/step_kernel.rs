@@ -4645,6 +4645,47 @@ impl StepRuntime {
         let n = offset + delta_token_ids.len();
         let mut pos = offset;
         let batch = crate::flags::prefill_batch_enabled();
+        // E11 M0 range trace (DGQ_TRACE_RANGES=1): after each chunk forward the
+        // arena planes hold the LAST layer's stage outputs — sample max|x| and
+        // non-finites per plane across all chunks, so position-dependence is
+        // covered. Answers "do prefill activations fit fp16 (max 65504)?".
+        type RangePeaks = std::collections::BTreeMap<&'static str, (f32, bool, Option<usize>)>;
+        let mut range_peaks: Option<RangePeaks> =
+            crate::flags::trace_ranges_enabled().then(RangePeaks::new);
+        let mut probe_planes = |this: &Self, m_rows: usize, peaks: &mut RangePeaks| {
+            let a = &this.bufs.arena_map;
+            for (label, off, per_row) in [
+                ("hidden", a.hidden_off(), HID),
+                ("attnq(Q)", a.attnq_off(), 4096),
+                ("attn_out", a.attno_off(), 4096),
+                ("tmp(o_proj)", a.tmp_off(), HID),
+                ("ffg(gate_up)", a.ffg_off(), DENSE_FF as usize),
+                ("dense", a.dense_off(), HID),
+                ("moein", a.moein_off(), HID),
+            ] {
+                // half_buffer_stats returns (finite, max_abs) — bool true = healthy.
+                let (finite, mx) =
+                    half_buffer_stats(&this.bufs.arena, off as usize, m_rows * per_row, 8192);
+                let e = peaks.entry(label).or_insert((0.0, false, None));
+                e.0 = e.0.max(mx);
+                e.1 |= !finite;
+                if !finite && e.2.is_none() {
+                    // Locate the first offending ROW (full scan, diagnostic-only):
+                    // rows >= the chunk's real token count are inert zero-pad rows
+                    // whose all-masked softmax yields NaN by construction.
+                    let ptr = unsafe {
+                        this.bufs.arena.contents().as_ptr().add(off as usize) as *const u16
+                    };
+                    for i in 0..m_rows * per_row {
+                        let v = crate::kernels::sub::bf16::bf16_bits_to_f32(unsafe { *ptr.add(i) });
+                        if !v.is_finite() {
+                            e.2 = Some(i / per_row);
+                            break;
+                        }
+                    }
+                }
+            }
+        };
         // Suppress KV writes for the zero-PADDED tail rows (positions >= n):
         // on sliding layers a pad position wraps onto (pos & ring_mask) and
         // would clobber the oldest live window slots (task #64).
@@ -4665,6 +4706,9 @@ impl StepRuntime {
                 self.set_kv_len(pos as u32);
                 self.write_params_sub(pos as u32, n_subs);
                 self.dispatch_and_wait(|enc| enc.encode_prefill_super(&layout, layers, n_subs))?;
+                if let Some(peaks) = range_peaks.as_mut() {
+                    probe_planes(self, m, peaks);
+                }
                 pos += m;
                 continue;
             }
@@ -4675,7 +4719,17 @@ impl StepRuntime {
             self.set_canvas_ids(&ids)?;
             self.set_kv_len(pos as u32);
             self.dispatch_and_wait(|enc| enc.encode_prefill_chunk(&layout, layers))?;
+            if let Some(peaks) = range_peaks.as_mut() {
+                probe_planes(self, CANVAS, peaks);
+            }
             pos += chunk_len;
+        }
+        if let Some(peaks) = range_peaks {
+            for (label, (mx, nf, nf_row)) in &peaks {
+                eprintln!(
+                    "prefill-trace: plane={label} max_abs={mx:.1} non_finite={nf} first_nf_row={nf_row:?} (last-layer stage outputs, all chunks, offset={offset} n={n})"
+                );
+            }
         }
         self.set_kv_write_end(u32::MAX);
         self.set_kv_len(n as u32);
@@ -4955,10 +5009,11 @@ impl StepRuntime {
         // (label) -> (max_abs across layers, any_non_finite)
         let mut peak: BTreeMap<&'static str, (f32, bool)> = BTreeMap::new();
         let mut probe = |this: &Self, label: &'static str, off: u64, elems: usize| {
-            let (nf, mx) = half_buffer_stats(&this.bufs.arena, off as usize, elems, SAMPLE);
+            // half_buffer_stats returns (finite, max_abs) — bool true = healthy.
+            let (finite, mx) = half_buffer_stats(&this.bufs.arena, off as usize, elems, SAMPLE);
             let e = peak.entry(label).or_insert((0.0, false));
             e.0 = e.0.max(mx);
-            e.1 |= nf;
+            e.1 |= !finite;
         };
 
         self.dispatch_and_wait(|enc| enc.encode_step_preamble(&layout, first_step))?;
