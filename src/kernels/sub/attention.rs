@@ -356,6 +356,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         accept_plateau_threshold: 0,
         plateau_prefix_mean_max: f32::MAX,
         eos_token_id: 1,
+        kv_write_end: u32::MAX,
     };
     let dims = AttnDims {
         canvas: f.canvas as u32,
@@ -462,6 +463,7 @@ pub fn gpu_mma2(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> 
         accept_plateau_threshold: 0,
         plateau_prefix_mean_max: f32::MAX,
         eos_token_id: 1,
+        kv_write_end: u32::MAX,
     };
     let dims = AttnDims::new(f.canvas as u32, f.n_q_heads as u32);
 
@@ -564,6 +566,7 @@ pub fn gpu_mma_full(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Err
         accept_plateau_threshold: 0,
         plateau_prefix_mean_max: f32::MAX,
         eos_token_id: 1,
+        kv_write_end: u32::MAX,
     };
     let dims = AttnDims::new(f.canvas as u32, f.n_q_heads as u32);
     let group = f.n_q_heads / f.n_kv();
@@ -678,6 +681,7 @@ pub fn bench_path(f: &Fixture, iters: usize, path: u8) -> Result<f64, Error> {
         accept_plateau_threshold: 0,
         plateau_prefix_mean_max: f32::MAX,
         eos_token_id: 1,
+        kv_write_end: u32::MAX,
     };
     let dims = AttnDims::new(f.canvas as u32, f.n_q_heads as u32);
     let (grid, tpg) = match path {

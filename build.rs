@@ -1,4 +1,38 @@
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::path::Path;
+
+/// Hash every shader source under `shaders/` (sorted walk) so:
+/// 1. cargo rebuilds when ANY shader changes (the include_metal! proc macro
+///    does not register file dependencies, so shader edits were otherwise
+///    invisible to incremental builds), and
+/// 2. the Metal pipeline cache can key on the WHOLE shader tree instead of a
+///    hand-maintained include_str! list (33 of 93 files were missing from
+///    that list — stale metallibs were served after kernel edits).
+fn hash_shader_tree(dir: &Path, h: &mut DefaultHasher) {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
+        .map(|e| e.expect("dir entry").path())
+        .collect();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            hash_shader_tree(&path, h);
+        } else if path.extension().is_some_and(|e| e == "metal") {
+            path.to_string_lossy().hash(h);
+            std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+                .hash(h);
+        }
+    }
+}
+
 fn main() {
+    println!("cargo:rerun-if-changed=shaders");
+    let mut h = DefaultHasher::new();
+    hash_shader_tree(Path::new("shaders"), &mut h);
+    println!("cargo:rustc-env=DGQ_SHADER_TREE_HASH={:016x}", h.finish());
+
     if std::env::var("CARGO_FEATURE_BLAS").is_ok() {
         let target = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
         if target == "macos" {

@@ -59,6 +59,7 @@ pub fn tiny_fixture(_: ElemFormat) -> Fixture {
             accept_plateau_threshold: 2,
             plateau_prefix_mean_max: 0.05,
             eos_token_id: 1,
+            kv_write_end: u32::MAX,
         },
         pad_token: PAD_TOKEN_ID,
         filler_token: FILLER_TOKEN_ID,

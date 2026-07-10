@@ -354,6 +354,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         accept_plateau_threshold: 0,
         plateau_prefix_mean_max: f32::MAX,
         eos_token_id: 1,
+        kv_write_end: u32::MAX,
     };
     let dims = AttnDims {
         canvas: f.canvas as u32,

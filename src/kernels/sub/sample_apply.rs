@@ -65,6 +65,7 @@ pub fn tiny_fixture(_: ElemFormat) -> Fixture {
         accept_plateau_threshold: 2,
         plateau_prefix_mean_max: 0.05,
         eos_token_id: 1,
+        kv_write_end: u32::MAX,
     };
     let t = temp_at(
         step.saturating_sub(1),
@@ -122,6 +123,7 @@ pub fn wide_fixture(_: ElemFormat) -> Fixture {
             accept_plateau_threshold: 2,
             plateau_prefix_mean_max: 0.05,
             eos_token_id: 1,
+            kv_write_end: u32::MAX,
         },
     }
 }

@@ -18,6 +18,10 @@ struct StepParams {
     uint accept_plateau_threshold;
     float plateau_prefix_mean_max;
     uint eos_token_id;
+    // First position qk_rope_kv must NOT write to the KV cache (prefill sets
+    // the prompt end so padded tail rows never clobber live ring slots;
+    // 0xFFFFFFFF = no suppression). See StepParams in step_kernel.rs.
+    uint kv_write_end;
 };
 
 struct CanvasState {

@@ -21,70 +21,11 @@ fn shader_bundle_token() -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
-    for src in [
-        include_str!("../../shaders/include/common.metal"),
-        include_str!("../../shaders/include/dequant.metal"),
-        include_str!("../../shaders/include/activations.metal"),
-        include_str!("../../shaders/gemm.metal"),
-        include_str!("../../shaders/include/fc_axes.metal"),
-        include_str!("../../shaders/include/gemm_fc.metal"),
-        include_str!("../../shaders/include/gemm_block_tile.metal"),
-        include_str!("../../shaders/include/qgemm_grouped.metal"),
-        include_str!("../../shaders/kernels/dequant_block_matrix.metal"),
-        include_str!("../../shaders/kernels/gemm_block.metal"),
-        include_str!("../../shaders/kernels/gemm_block_stacked.metal"),
-        include_str!("../../shaders/kernels/gemm_block_grouped.metal"),
-        include_str!("../../shaders/include/gemm_stacked.metal"),
-        include_str!("../../shaders/include/gemm_stacked_fc.metal"),
-        include_str!("../../shaders/kernels/gemm_linear_f32.metal"),
-        include_str!("../../shaders/kernels/gemm_linear_grouped.metal"),
-        include_str!("../../shaders/kernels/gemm_q8_linear_f32.metal"),
-        include_str!("../../shaders/kernels/gemm_q8_linear_kxn_f32.metal"),
-        include_str!("../../shaders/kernels/gemm_q8_rowk.metal"),
-        include_str!("../../shaders/kernels/f32_to_half_scale.metal"),
-        include_str!("../../shaders/kernels/embed_gather.metal"),
-        include_str!("../../shaders/kernels/gather_prob_cols.metal"),
-        include_str!("../../shaders/kernels/gather_rows.metal"),
-        include_str!("../../shaders/kernels/gelu.metal"),
-        include_str!("../../shaders/kernels/swiglu.metal"),
-        include_str!("../../shaders/kernels/swiglu_moe_gate_up.metal"),
-        include_str!("../../shaders/kernels/half_scale.metal"),
-        include_str!("../../shaders/kernels/half_to_f32.metal"),
-        include_str!("../../shaders/kernels/pack_encoder_kv.metal"),
-        include_str!("../../shaders/kernels/logit_rowstats.metal"),
-        include_str!("../../shaders/kernels/sc_prob_cols.metal"),
-        include_str!("../../shaders/kernels/sc_probs.metal"),
-        include_str!("../../shaders/kernels/memzero_bytes.metal"),
-        include_str!("../../shaders/kernels/residual_half.metal"),
-        include_str!("../../shaders/kernels/rms_norm_rows.metal"),
-        include_str!("../../shaders/kernels/rms_norm_rows_tiled.metal"),
-        include_str!("../../shaders/kernels/router_scale_rows.metal"),
-        include_str!("../../shaders/kernels/router_top_k_rows.metal"),
-        include_str!("../../shaders/kernels/softcap_half.metal"),
-        include_str!("../../shaders/kernels/softmax_rows.metal"),
-        include_str!("../../shaders/kernels/vec_add_inplace.metal"),
-        include_str!("../../shaders/kernels/vec_fill_zero.metal"),
-        include_str!("../../shaders/kernels/vec_scale_inplace.metal"),
-        include_str!("../../shaders/kernels/scatter_rows_weighted.metal"),
-        include_str!("../../shaders/include/gqa_device.metal"),
-        include_str!("../../shaders/kernels/apply_rope_heads.metal"),
-        include_str!("../../shaders/kernels/argmax_rows.metal"),
-        include_str!("../../shaders/kernels/copy_f32.metal"),
-        include_str!("../../shaders/kernels/gqa_attention.metal"),
-        include_str!("../../shaders/kernels/attention_mma_full.metal"),
-        include_str!("../../shaders/kernels/logit_softcapping.metal"),
-        include_str!("../../shaders/kernels/row_entropy.metal"),
-        include_str!("../../shaders/kernels/sample_from_probs_rows.metal"),
-        include_str!("../../shaders/kernels/scale_logits.metal"),
-        include_str!("../../shaders/kernels/scatter_vocab_chunk.metal"),
-        include_str!("../../shaders/kernels/compact_active_rows.metal"),
-        include_str!("../../shaders/kernels/gather_rows_bf16.metal"),
-        include_str!("../../shaders/kernels/gather_rows_bf16_to_f32.metal"),
-        include_str!("../../shaders/kernels/scatter_logits_rows.metal"),
-        include_str!("../../shaders/monolithic/diffgemma_step.metal"),
-    ] {
-        src.hash(&mut h);
-    }
+    // Whole-shader-tree hash from build.rs (walks shaders/**.metal). Replaces
+    // a hand-maintained include_str! list that had drifted to cover only 60 of
+    // 93 files — edits to unlisted kernels (qk_rope_kv, attention_device,
+    // gemm_tunable, sample_commit, ...) were served STALE from the archive.
+    env!("DGQ_SHADER_TREE_HASH").hash(&mut h);
     CACHE_BUNDLE_TAG.hash(&mut h);
     h.finish()
 }

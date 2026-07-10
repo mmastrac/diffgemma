@@ -79,6 +79,7 @@ struct StepParams {
     uint accept_plateau_threshold;
     float plateau_prefix_mean_max;
     uint eos_token_id;
+    uint kv_write_end;  // first pos NOT written to KV (pad-row ring guard)
 };
 struct CanvasState {
     uint ids[256]; uint prev_argmax[256]; uint new_sample[256];

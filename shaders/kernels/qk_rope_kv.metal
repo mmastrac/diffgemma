@@ -41,6 +41,10 @@ kernel void qk_rope_kv(
         return;
     }
     const uint pos = P.kv_len + tok;
+    // Prefill pads the tail chunk with zero rows; their positions are >=
+    // kv_write_end and must never reach the cache (a pad position wraps onto
+    // a LIVE sliding-ring slot and clobbers the oldest window content).
+    const bool kv_write = pos < P.kv_write_end;
     const bool full = L->is_full != 0u;
     const uint rot = full ? (hd / 4u) : hd;
     const float theta = full ? 1.0e6f : 1.0e4f;
@@ -73,7 +77,8 @@ kernel void qk_rope_kv(
         }
         if (isK) {
             // RoPE uses the ABSOLUTE pos; only the storage slot is ring-mapped.
-            if (KV_Q8) {
+            if (!kv_write) {
+            } else if (KV_Q8) {
                 device uchar *row = (device uchar *)kvcache + L->kv_region
                     + (ulong)kv_slot_of(L, pos) * kv_slot_stride_bytes(nkv, hd, KV_FMT)
                     + hh * kv_row_bytes(hd, KV_FMT);
@@ -96,7 +101,8 @@ kernel void qk_rope_kv(
             }
         }
     } else {
-        if (KV_Q8) {
+        if (!kv_write) {
+        } else if (KV_Q8) {
             float head[512];
             for (uint i = 0u; i < hd; ++i) {
                 head[i] = arena_load(src, i) * inv;

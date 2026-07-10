@@ -166,6 +166,16 @@ pub struct StepParams {
     pub accept_plateau_threshold: u32,
     pub plateau_prefix_mean_max: f32,
     pub eos_token_id: u32,
+    /// First position qk_rope_kv must NOT write to the KV cache. Prefill sets
+    /// this to the prompt end so the zero-PADDED tail-chunk rows don't store
+    /// pad K/V: on linear (full-attention) regions pad writes land past
+    /// kv_len and are causally masked — harmless — but on the sliding RING
+    /// they wrap onto (pad_pos & ring_mask) and CLOBBER the oldest live
+    /// window positions. That clobber (prompts > ring size, i.e. >2k tokens)
+    /// destroyed the window start on all 25 sliding layers and broke
+    /// long-prompt comprehension entirely (task #64). u32::MAX = no
+    /// suppression (denoise canvas writes must always land).
+    pub kv_write_end: u32,
 }
 
 #[repr(C)]
@@ -4181,6 +4191,7 @@ pub fn step_params_from_sampler(
         accept_plateau_threshold: plateau_thresh,
         plateau_prefix_mean_max: plateau_mean,
         eos_token_id,
+        kv_write_end: u32::MAX,
     }
 }
 
@@ -4567,6 +4578,16 @@ impl StepRuntime {
         self.write_params(params);
     }
 
+    /// Set the first position `qk_rope_kv` must NOT write to the KV cache
+    /// (see `StepParams::kv_write_end`). Prefill brackets its chunk loop with
+    /// this (prompt end during, `u32::MAX` after) so padded tail rows never
+    /// clobber live ring slots while denoise canvas writes stay unaffected.
+    pub fn set_kv_write_end(&mut self, end: u32) {
+        let mut params = self.read_params();
+        params.kv_write_end = end;
+        self.write_params(params);
+    }
+
     /// Compact byte snapshot of the live `[0, kv_len)` KV, for saving a
     /// conversation out of the single hot buffer (multi-conversation swap).
     /// Gathers only each layer's valid prefix (see `gather_kv_prefix`), so the
@@ -4624,6 +4645,10 @@ impl StepRuntime {
         let n = offset + delta_token_ids.len();
         let mut pos = offset;
         let batch = crate::flags::prefill_batch_enabled();
+        // Suppress KV writes for the zero-PADDED tail rows (positions >= n):
+        // on sliding layers a pad position wraps onto (pos & ring_mask) and
+        // would clobber the oldest live window slots (task #64).
+        self.set_kv_write_end(n as u32);
         while pos < n {
             let remaining = n - pos;
             // Batched super-chunk: n_subs full-CANVAS causal sub-chunks as one
@@ -4652,6 +4677,7 @@ impl StepRuntime {
             self.dispatch_and_wait(|enc| enc.encode_prefill_chunk(&layout, layers))?;
             pos += chunk_len;
         }
+        self.set_kv_write_end(u32::MAX);
         self.set_kv_len(n as u32);
         // The prefill dirtied scratch (arena hidden/dense, MoE routing buffers,
         // logits); re-zero to the same clean state the (self-contained) engine
