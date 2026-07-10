@@ -115,6 +115,7 @@ previously-unlisted files.
 | Seed-123 empty-reply artifact | short factual prompts, both prefill paths (engine 5 / fast 2 of 17 at that seed); trajectory-level, pre-existing |
 | Legacy GEMM retirement | `gemm_block*` legacy pipelines after a stable tunable cycle (KERNELS.md deprecation list; needs user nod) |
 | Mechanical kernel merges | embed_gather / gather_rows / f32_to_half families (KERNELS.md) |
+| **"Un-RoPE" the KV for TurboQuant (E8 revisit)** | Idea (2026-07-10): E8's blocker was that RoPE sits between W_k and the stored K, so the Hadamard rotation can't fold offline into W_k. If we store K PRE-RoPE (or rotate stored K back by its position) and apply RoPE at attention-read time instead, the K-side rotation folds offline like V's — unlocking rotated low-bit KV without the runtime-rotation cost. Trade: RoPE moves into the attention read path (per-key trig per read vs once per write — the engine already reads-time-RoPEs Q, and cos/sin can come precomputed per position). Worth an experiment: quant-error stats on pre-RoPE vs post-RoPE K (pre-RoPE may also quantize better — RoPE mixes dims and can widen per-group ranges), then a read-time-RoPE attention prototype. Same idea may apply to other rotation-blocked weights |
 
 ## Command reference
 
