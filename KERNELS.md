@@ -33,11 +33,17 @@ kernel exist / merge / change dtype"; re-audit when a family gains members.
 
 - **Weights**: bf16 lossless (attention / dense FFN / embed), q4 group-32
   experts (memory constraint), q8 SC-MLP. No changes.
-- **Activation planes**: bf16 (`arena_load/store`). The global-f16 flip
-  (K_ACT_F16), the f32 residual stream (DGQ_HIDDEN_F32), and finer expert
-  formats were each built, measured, DISPROVEN, and their machinery DELETED
-  in the 2026-07-05 flag cleanup: none improves quality; each just re-rolls
-  borderline-prompt trajectories. Do not re-litigate without new evidence.
+- **Activation planes**: bf16 (`arena_load/store`) — **verdict SCOPE
+  CORRECTED 2026-07-10**: valid for DENOISE and for prefill ≤~2k tokens
+  ONLY. The 2026-07-05 disproofs of K_ACT_F16 / DGQ_HIDDEN_F32 were
+  short-context claims; at long prefill the bf16 stream's 2⁻⁸ per-op step
+  compounds across (position × layer) through the causal K/V recurrence and
+  destroys document comprehension (exact ≤2.2k, degraded 4.2k, fluent
+  hallucination 6.6k; engine-f32 exact everywhere; MLX-fp16 exact at 6.6k).
+  Every discrete kernel was A/B-exonerated first. New evidence = the
+  re-litigation bar is met: ROADMAP E11 rebuilds the arena-dtype FC as
+  fp16 for PREFILL pipelines only (denoise stays bf16). Until it lands,
+  `DGQ_FAST_PREFILL_MAX=2048` routes longer prompts/deltas to the engine.
 - **f16 where values are bounded [0,1]**: `sc_probs` (fp16 + GEMM prob scale),
   attention P tiles (half). Already done; nothing else qualifies.
 - **Always-bf16 buffers** (range or cross-path layout): logits (`FC29` forced),
@@ -229,6 +235,27 @@ like ours; keep our dequant math + bf16 I/O rounding) — verify per element.
   `sample_commit.metal` (GPU: all-pad/filler argmax suppresses confident/
   plateau stops; inert on normal prompts — gate 17/17 verified after).
 
+## Ring-write hazard + shader staleness (postmortems, 2026-07-10)
+
+- **Any kernel that writes KV by absolute position must respect
+  `StepParams.kv_write_end`.** The fast prefill's zero-padded tail chunk
+  wrote pad K/V; pad positions wrap onto `pos & kv_ring_mask` and CLOBBER
+  the oldest LIVE window slots on sliding layers (the "padding is causally
+  masked / overwritten" reasoning only holds for linear full-attention
+  regions). 186 slots corrupted at a 4.4k prompt; inert below ring size —
+  invisible to every short-context gate. Fixed in `qk_rope_kv` (3285ebe);
+  the rule generalizes: past-the-end ≠ dead on a ring.
+- **Shader-edit staleness (two independent holes, both fixed 3285ebe).**
+  (1) `include_metal!` registers no cargo file dependencies → shader edits
+  did not trigger rebuilds; (2) the pipeline `MTLBinaryArchive` cache keyed
+  on a hand-listed 60/93 subset of shader files → edits to unlisted kernels
+  (qk_rope_kv, attention_device, gemm_tunable, sample_commit, …) were served
+  STALE from `~/.cache` metallibs. Both now keyed on a build.rs whole-tree
+  hash (`DGQ_SHADER_TREE_HASH`, `cargo:rerun-if-changed=shaders`).
+  **Trust rule:** a "byte-identical" kernel-edit A/B is only evidence if the
+  build postdates 3285ebe (or the pipeline demonstrably recompiled);
+  historical identical-output A/Bs on previously-unlisted files are suspect.
+
 ## Notes
 
 - The old `gemm_q8` 32-tile migration flagged in earlier notes is DONE
@@ -236,3 +263,6 @@ like ours; keep our dequant math + bf16 I/O rounding) — verify per element.
   corrected.
 - Every non-bit-identical change must be judged by MULTI-SEED gate aggregate +
   wart census, not a single-seed smoketest (see prompts.json seed comment).
+- Long-context claims must be judged by real-document Q&A ladders, not
+  needle probes: needles ride a few sharp attention edges and stayed EXACT
+  while 6.6k comprehension was fully hallucinated (ROADMAP E13).

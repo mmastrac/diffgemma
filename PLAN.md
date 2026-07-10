@@ -69,15 +69,52 @@ over weight bytes even with per-block re-reads), so byte-cutting can't win;
 further prefill MoE gains need higher GEMM TF/s (fragment-tile class). See
 agent memory `long-context-100k`.
 
+## Long-prompt correctness (2026-07-10 — fixed by cap; fp16 stream is the real fix)
+
+Field incident: long agentic turns at 100k ctx collapsed into newline soup.
+Root-caused (task #64) to the FAST QUANTIZED PREFILL, two stacked defects:
+
+1. **Pad-row ring clobber (FIXED, 3285ebe).** The zero-padded tail chunk
+   wrote pad K/V; pad positions wrap onto `pos & ring_mask` and clobber the
+   OLDEST LIVE window slots on all 25 sliding layers (186 slots at a 4.4k
+   prompt). Inert below ring size (2048) — why every short-context gate was
+   green. Fix: `StepParams.kv_write_end` suppresses cache stores past the
+   prompt end. KV-verified (layer-0 fast-vs-engine: 186 broken slots → 0).
+   The old "padding is provably overwritten" claim was true only for linear
+   full-attention regions.
+2. **bf16 activation-stream accumulation (CAPPED, e8de7d1; fix = E11).**
+   With (1) fixed and every kernel family A/B-exonerated (GEMM/MoE/rope
+   swaps byte-identical; scalar and MMA attention both degrade), the
+   remaining delta vs the correct f32 engine is activation precision. Fast
+   prefill answers real-document questions exactly to ~2.2k tokens, degrades
+   at ~4.2k, hallucinates fluently at 6.6k; the engine is exact at every
+   probed length and MLX (fp16 stream) is exact at 6.6k. Default now:
+   `DGQ_FAST_PREFILL_MAX=2048` — prompts AND cross-turn deltas above it take
+   the f32 engine (deltas via canvas-block engine extends at the reuse
+   offset). Serve stays fast in steady state (reuse + tool-output compactor
+   keep deltas small); cold long-document prefill is slow until E11/E12.
+
+**Validation lesson (institutionalize as E13):** needle probes stayed EXACT
+through all of this — literal retrieval survives on a few sharp attention
+edges while grounded comprehension (many medium-weight edges) dies. Long-ctx
+claims must be gated on real-document Q&A ladders, not needles.
+
+Also fixed en route: shader edits were invisible to cargo (`include_metal!`
+registers no deps) and the pipeline cache hashed only 60/93 shader files —
+stale metallibs served after kernel edits. Both now keyed on a build.rs
+whole-tree hash. Distrust pre-3285ebe "byte-identical" kernel A/Bs on
+previously-unlisted files.
+
 ## Open items
 
 | Item | Note |
 |---|---|
+| **fp16 prefill stream (E11)** | Lift the 2048 fast-prefill cap by flipping prefill activation planes bf16→fp16 (task #65; playbook in ROADMAP §6) |
+| **Engine prefill throughput (E12)** | ~40 ms/token today; 3-4× (tunable-GEMM f32 port + chunk batching + sync trim) makes the >2k fallback livable at 100k while E11 cooks |
 | Long-context speed | GEMM ledger CLOSED 2026-07-07: tunable = MPS wall, sparse 92-96% of dense at prefill distribution, SPARSE_BN=128 shipped (+6-8% kernel); MLX-qmm gap ~10-15% = pipelined-loader port worth ≤2-3% (non-lever). Remaining: attention fragment-tile (ROADMAP E5) only |
 | Seed-123 empty-reply artifact | short factual prompts, both prefill paths (engine 5 / fast 2 of 17 at that seed); trajectory-level, pre-existing |
 | Legacy GEMM retirement | `gemm_block*` legacy pipelines after a stable tunable cycle (KERNELS.md deprecation list; needs user nod) |
 | Mechanical kernel merges | embed_gather / gather_rows / f32_to_half families (KERNELS.md) |
-| Inert padding-KV write | fast prefill writes garbage KV at [n..256), provably overwritten (SPEC.md §3) |
 
 ## Command reference
 

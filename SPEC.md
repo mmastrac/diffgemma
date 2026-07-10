@@ -82,25 +82,39 @@ Settled against the reference implementations and the CPU oracle — do NOT
 
 ## 3. Prefill path selection
 
-`should_fast_prefill(prompt_len)` (src/flags.rs): prompts ≤ 256 tokens use the
-**f32 engine** prefill; longer prompts use the **fast quantized (bf16
-activation) prefill** (~10× faster where it matters). `DGQ_FAST_PREFILL=1|0`
-forces either for all lengths.
+`should_fast_prefill(prompt_len)` (src/flags.rs) selects a **band** since
+2026-07-10 (e8de7d1): prompts ≤ 256 tokens use the **f32 engine** prefill;
+256 < len ≤ `DGQ_FAST_PREFILL_MAX` (default **2048**) use the **fast
+quantized (bf16 activation) prefill** (~10× faster); prompts ABOVE the cap
+return to the slow-but-correct f32 engine. Cross-turn delta reuse follows the
+same rule on the DELTA length: short deltas fast-resume at the reuse offset,
+long deltas extend via the engine in canvas-sized blocks. `DGQ_FAST_PREFILL=1|0`
+still forces either path for all lengths; `DGQ_FAST_PREFILL_MAX=0` uncaps.
 
-History of the heuristic (see memory/KERNELS.md for the full data): fast
+Why the cap (task #64, 2026-07-10): the fast prefill's bf16 activation
+stream accumulates error across (position × layer) through the causal K/V
+recurrence — real-document Q&A is exact to ~2.2k prompt tokens, degraded at
+~4.2k, fluently hallucinated at 6.6k, while the engine is exact at every
+probed length and MLX (fp16 stream) is exact at 6.6k. All discrete kernels
+were A/B-exonerated. Needle probes DO NOT catch this class (retrieval rides
+a few sharp attention edges and stayed exact throughout) — long-context
+validation must use document-comprehension ladders (ROADMAP E13). The cap
+lifts when the fp16 prefill stream lands (ROADMAP E11).
+
+History of the short-prompt floor (see KERNELS.md for the full data): fast
 prefill's bf16 activations perturb outlier KV channels enough to flip MoE
-expert routing on borderline tokens (a discrete cliff — no precision lever
-fixes it; f16 just shuffles which prompts flip). Under the legacy freezing
-sampler this produced LOUD degenerate outputs (empty / thought-mode) on 2/16
-short prompts. **Since the no-freeze sampler (2026-07-05) the degenerate class
-is gone** — forced fast prefill scores 17/17 adherence at seeds 7/42 — the
-perturbation now costs extra denoise steps instead (e.g. capital_france 10 vs
-3). The heuristic is kept purely on wall-clock: engine prefill of a short
-prompt (~0.85 s) is cheaper than the extra steps fast prefill induces.
+expert routing on borderline tokens. Under the legacy freezing sampler this
+produced LOUD degenerate outputs on 2/16 short prompts. **Since the no-freeze
+sampler (2026-07-05) the degenerate class is gone** — the perturbation costs
+extra denoise steps instead — so the ≤256 floor is kept purely on wall-clock.
 
-Known inert bug: fast prefill pads its last chunk to CANVAS and writes garbage
-KV at [n..256); provably overwritten by the first denoise step before any
-read. Documented, not load-bearing.
+Pad-row contract (3285ebe): the fast prefill pads its last chunk to CANVAS,
+but pad rows MUST NOT write KV — `StepParams.kv_write_end` (set to the
+prompt end during prefill, `u32::MAX` otherwise) suppresses their cache
+stores in `qk_rope_kv`. The previous "garbage KV at [n..256) is provably
+overwritten" claim was WRONG on sliding layers: pad positions wrap onto
+`pos & kv_ring_mask` and clobber the oldest live window slots (186 slots at
+a 4.4k prompt, silently corrupting every sliding layer's window start).
 
 ## 4. Denoise step (one forward = one canvas refinement)
 

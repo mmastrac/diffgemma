@@ -353,10 +353,84 @@ the sampler-struct growth ripple). The slack is the plan.
 | E8 | Hadamard-rotated q4 KV (§5.2) | **IN PROGRESS 2026-07-07**: 262k KV 5.3→~1.4 GiB, quality-neutral. Premise corrected — K rotates at RUNTIME after RoPE (can't fold), V rotates at runtime too (full layers alias V/no W_v), only W_o folds offline | ~3 d | rotated-q4 passes multi-seed gate + needle 33k/100k exact + DGQ_MEM_WATCH < 90% @ 262k | rotated-q4 fails gate (rotation doesn't recover q4 quality) |
 | E9 | Rotated experts (near-bf16 fidelity @ q4) (§5.4) | M1 gate/up (shared WHT + offline fold) recovers ~bf16 forward; M2 down_proj WHT only if needed | v2+ | full gate vs bf16-expert ref + census + sign-off | M1 no better than plain q4, or M2 WHT regresses short-context |
 | E10 | Precision-decay KV (recent f16, aged rotated-q4) | segmented full-layer KV: f16 recent window + q4 aged bulk, demoted+rotated as tokens age past the window; better quality/memory than uniform q4 | v2+ | needle 262k exact + DGQ_MEM_WATCH under budget + gate | on 36 GB marginal over q8-auto (which already fits 262k) — value is 18-24 GB / >262k / long-range quality |
+| E11 | **fp16 prefill activation stream** (§6.1) | bf16's 2⁻⁸ per-op rel step is above the long-prefill stability threshold; fp16's 2⁻¹¹ is below it (MLX = existence proof; engine-f32 = upper bound). Lifts the `DGQ_FAST_PREFILL_MAX=2048` cap | ~2-3 d | doc-probe ladder (1k/2.2k/4.2k/6.6k/13k) EXACT through fast+fp16; layer-5 KV rel vs engine drops ~8×; needle 33k/105k exact; gate+census neutral at short ctx; suite green | fp16 range overflow on residual outlier channels AND the plane-scaled/f32-trunk fallbacks also fail the ladder |
+| E12 | Engine prefill throughput ≥3× (§6.2) | engine is ~40 ms/token from f32 legacy GEMMs + chunk-serial + per-call sync, not physics; tunable-f32 port + M=1024 batching + P2-style sync trim reach ≤13 ms/token (100k: 65→~20 min) | ~2 d | engine output BYTE-IDENTICAL to current engine (pure perf); timing on the 6.6k/33k probes | <2× after the three levers → engine stays bridge-only |
+| E13 | Comprehension probes in the gate (§6.3) | needle probes are blind to comprehension loss (stayed EXACT while 6.6k answers were hallucinated); a real-doc Q&A ladder catches the whole class | ~0.5 d | model-gated long-ctx tier in smoketest (planted-fact real-doc Q at 2k/4.2k/6.6k + classic needle); wired into nightly CI tier | n/a (pure validation) |
 
 Every experiment observes the standing rules: bit-identical ships on
 identity evidence; anything else needs multi-seed gate + census + explicit
 sign-off; serialize all model-loading runs; check the disproof ledger first.
+
+### 6.1 E11 playbook — fp16 prefill activation stream (task #65)
+
+**Failure mechanism (measured 2026-07-10).** The causal chunk forward
+re-ingests every prior position's already-noisy K/V at each of 30 layers, so
+per-op activation noise compounds across (position × layer). Attention-logit
+noise from a bf16 Q row against f16 K is ≈ |q||k|·2⁻⁸ ≈ 0.1–0.3 nats — small
+enough that sharp single-edge heads (needle retrieval) survive, large enough
+that the many medium-weight edges carrying document comprehension decohere as
+the window fills. Empirical quality-vs-length: exact ≤2.2k, degraded 4.2k,
+fluent hallucination 6.6k. All discrete candidates were eliminated first: pad
+ring clobber fixed (3285ebe, layer-0 KV now engine-clean), GEMM/MoE/rope
+swaps byte-identical, scalar vs MMA attention both degrade (scalar less),
+batching bit-identical, q8 off, rope precise-trig A/B byte-identical.
+
+**M0 — ranges before conclusions** (check-ranges rule): `DGQ_TRACE_RANGES`
+over a real 6.6k prefill; per-plane max|x| for hidden / q / k / v / attn-out
+/ dense / gate-up. fp16 range 65504; Gemma-class residual OUTLIER CHANNELS
+can reach 1e3–1e4 — if within range with ≥8× headroom, direct flip is safe;
+else per-plane scaled-fp16 (store x·2⁻ˢ, fold 2ˢ into the consumer) for the
+offending planes only, or the M2b trunk fallback.
+
+**M1 — arena dtype function-constant, prefill-scoped.** Rebuild the deleted
+K_ACT_F16 infra as `K_ARENA_F16`: `arena_load/arena_store` already funnel
+every plane access, so the kernel-side change is one macro pair + FC plumb.
+Compile SECOND variants only for pipelines dispatched under
+`prefill_causal` (embed_gather, rms_norm, qk_rope_kv, attention*, GEMM/MoE
+stages, residual) — denoise keeps bf16 (gate-validated; do not re-litigate).
+Same bytes/bandwidth as bf16 → perf-neutral expectation; pipeline count grows
+only for the prefill stage set.
+
+**M2 fallbacks, in order.** (a) scaled-fp16 for outlier planes (M0 data);
+(b) f32 residual TRUNK only (hidden plane f32, branches stay bf16 — halves
+the FC surface; the accumulator lives in the trunk, and old DGQ_HIDDEN_F32
+evidence showed branch storage dominates self-noise at SHORT ctx, so this
+may under-deliver at long ctx — test only if fp16 fails); (c) stochastic
+rounding on prefill arena stores (unbiased noise accumulates as √N instead
+of N — cheap FC, marginal alone, useful as a 100k+ topper).
+
+**Prior-disproof note.** K_ACT_F16 and DGQ_HIDDEN_F32 were built, measured,
+DISPROVEN and deleted 2026-07-05 — for SHORT-context quality/speed claims.
+This is a different claim (long-context comprehension stability) with new
+evidence (engine-vs-fast behavioral split + MLX fp16 correctness at 6.6k),
+which is exactly the re-litigation bar the disproof ledger sets.
+
+**Ship sequence.** M0 ranges → M1 build → ladder+gate → raise
+`DGQ_FAST_PREFILL_MAX` default (2048 → 32k probe → uncapped) → keep the cap
+flag for A/B triage.
+
+### 6.2 E12 playbook — engine prefill throughput (the correctness bridge)
+
+Engine prefill ≈ 10 s/256-token chunk (~40 ms/token; 6.6k ≈ 4.5 min, 100k ≈
+65 min). It was deliberately left unoptimized when fast prefill shipped. The
+three levers, all bit-identity-preserving (pure perf, byte-equal output
+gate): (1) **tunable-GEMM f32 variants** — the fragment kernels are
+dtype-templated at the loader level; the engine's legacy f32 GEMMs are the
+bulk of the 40 ms; (2) **chunk batching** — mirror the fast path's M=1024
+super-chunk for the row-independent stages (embed/norm/GEMM/MoE), keeping
+per-chunk causal attention; (3) **sync/readback trim** — the engine still
+pays a ~1.3 s fixed sync per call plus per-stage readbacks the P2 arc
+removed from the step path. Target ≥3×; even 2× makes >2k-token engine
+fallbacks routine while E11 cooks.
+
+### 6.3 E13 — long-context validation that can actually fail
+
+Add a model-gated `longctx` smoketest tier: a real technical document
+(fixtures: KERNELS/SPEC excerpts) with a planted fact, questioned at 2k /
+4.2k / 6.6k prompt tokens, judged on the FACT (substring), plus the classic
+synthetic needle as the retrieval control. The pair separates the two
+capabilities the incident conflated: needle-EXACT + doc-WRONG is precisely
+the fast-prefill failure signature and must page, not pass.
 
 ---
 
