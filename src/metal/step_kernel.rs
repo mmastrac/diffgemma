@@ -478,6 +478,11 @@ pub fn layer_kv_slots(is_full: bool, max_seq: usize) -> usize {
         // the softmax masks the tail keys but the reads must stay in-buffer
         // (layer 29 — the last region — is a full layer).
         (max_seq + 8).next_multiple_of(8)
+    } else if std::env::var("DGQ_KV_RING_UNCAPPED").is_ok() {
+        // DIAGNOSTIC (task #64 follow-up): linear sliding storage — no ring
+        // wrap ever. Isolates ring-READ defects from everything else at the
+        // cost of full-length sliding KV (fine to ~8k).
+        max_seq.next_power_of_two()
     } else {
         max_seq.next_power_of_two().min(2048)
     }
@@ -4456,6 +4461,34 @@ fn check_logits_finite(logits: &ProtocolObject<dyn MTLBuffer>) -> (bool, f32) {
     half_buffer_stats(logits, 0, CANVAS * VOCAB, CANVAS * VOCAB)
 }
 
+/// f16 twin of `half_buffer_stats` (planes written by the K_ARENA_F16 set).
+fn f16_buffer_stats(
+    buf: &ProtocolObject<dyn MTLBuffer>,
+    byte_off: usize,
+    elems: usize,
+    sample: usize,
+) -> (bool, f32) {
+    use crate::kernels::sub::f16::f16_bits_to_f32;
+    let ptr = unsafe { buf.contents().as_ptr().add(byte_off) as *const u16 };
+    let mut max_abs = 0.0f32;
+    let mut finite = true;
+    let n = sample.min(elems);
+    let stride = (elems / n.max(1)).max(1);
+    let mut i = 0usize;
+    while i < elems {
+        let v = f16_bits_to_f32(unsafe { *ptr.add(i) });
+        if !v.is_finite() {
+            finite = false;
+        }
+        max_abs = max_abs.max(v.abs());
+        i += stride;
+        if i / stride >= n {
+            break;
+        }
+    }
+    (finite, max_abs)
+}
+
 fn half_buffer_stats(
     buf: &ProtocolObject<dyn MTLBuffer>,
     byte_off: usize,
@@ -4510,6 +4543,13 @@ fn arena_hidden_stats(
 pub struct StepRuntime {
     ctx: MetalContext,
     pipelines: &'static StepPipelines,
+    /// fp16-arena pipeline set (E11, DGQ_PREFILL_F16): identical kernels
+    /// compiled with K_ARENA_F16 — the fast prefill dispatches through these
+    /// while denoise keeps the gate-validated bf16 set. None when off.
+    pipelines_prefill_f16: Option<&'static StepPipelines>,
+    /// While true, dispatch_and_wait encodes against the fp16 set (bracketed
+    /// around prefill_chunks_from's chunk loop).
+    arena_f16_mode: bool,
     bufs: StepBuffers,
     gpu_blob: std::sync::Arc<DgqGpuBlob>,
     weight_cache: GpuDecoderWeightCache,
@@ -4664,8 +4704,11 @@ impl StepRuntime {
                 ("moein", a.moein_off(), HID),
             ] {
                 // half_buffer_stats returns (finite, max_abs) — bool true = healthy.
-                let (finite, mx) =
-                    half_buffer_stats(&this.bufs.arena, off as usize, m_rows * per_row, 8192);
+                let (finite, mx) = if this.arena_f16_mode {
+                    f16_buffer_stats(&this.bufs.arena, off as usize, m_rows * per_row, 8192)
+                } else {
+                    half_buffer_stats(&this.bufs.arena, off as usize, m_rows * per_row, 8192)
+                };
                 let e = peaks.entry(label).or_insert((0.0, false, None));
                 e.0 = e.0.max(mx);
                 e.1 |= !finite;
@@ -4690,6 +4733,7 @@ impl StepRuntime {
         // on sliding layers a pad position wraps onto (pos & ring_mask) and
         // would clobber the oldest live window slots (task #64).
         self.set_kv_write_end(n as u32);
+        self.arena_f16_mode = self.pipelines_prefill_f16.is_some();
         while pos < n {
             let remaining = n - pos;
             // Batched super-chunk: n_subs full-CANVAS causal sub-chunks as one
@@ -4731,6 +4775,7 @@ impl StepRuntime {
                 );
             }
         }
+        self.arena_f16_mode = false;
         self.set_kv_write_end(u32::MAX);
         self.set_kv_len(n as u32);
         // The prefill dirtied scratch (arena hidden/dense, MoE routing buffers,
@@ -4869,12 +4914,24 @@ impl StepRuntime {
             .queue
             .commandBuffer()
             .ok_or(Error::Format("command buffer alloc failed"))?;
+        let ps: &StepPipelines = if self.arena_f16_mode {
+            self.pipelines_prefill_f16.unwrap_or(self.pipelines)
+        } else {
+            self.pipelines
+        };
+        // Some pipelines (tunable STACKED — segment layout only known at
+        // dispatch) compile LAZILY inside the encode closure via
+        // runtime_step_variant(); scope the arena-f16 compile mode to this
+        // dispatch so those lazy compiles (and their cache keys) inherit the
+        // active set's arena dtype.
+        let saved_af16 = crate::kernels::sub::variant::arena_f16_compile_enabled();
+        crate::kernels::sub::variant::set_arena_f16_compile(saved_af16 || self.arena_f16_mode);
         let mut enc = StepEnc {
             enc: cmd
                 .computeCommandEncoder()
                 .ok_or(Error::Format("compute encoder alloc failed"))?,
             ctx: &self.ctx,
-            ps: &self.pipelines,
+            ps,
             bufs: &self.bufs,
             block_profile: self.block_profile,
             tensor_offsets: &self.tensor_offsets,
@@ -4889,10 +4946,21 @@ impl StepRuntime {
             use_params_sub: false,
             sliding_window: self.text_config.sliding_window as u32,
         };
-        f(&mut enc)?;
+        let encode_result = f(&mut enc);
+        crate::kernels::sub::variant::set_arena_f16_compile(saved_af16);
+        encode_result?;
         enc.enc.endEncoding();
         cmd.commit();
         cmd.waitUntilCompleted();
+        if let Some(err) = unsafe { cmd.error() } {
+            return Err(Error::Format(
+                format!(
+                    "step dispatch command buffer failed: {}",
+                    err.localizedDescription()
+                )
+                .leak(),
+            ));
+        }
         Ok(())
     }
 
@@ -5010,10 +5078,23 @@ impl StepRuntime {
         let mut peak: BTreeMap<&'static str, (f32, bool)> = BTreeMap::new();
         let mut probe = |this: &Self, label: &'static str, off: u64, elems: usize| {
             // half_buffer_stats returns (finite, max_abs) — bool true = healthy.
-            let (finite, mx) = half_buffer_stats(&this.bufs.arena, off as usize, elems, SAMPLE);
+            let f16 = this.arena_f16_mode || std::env::var("DGQ_ARENA_F16_ALL").is_ok();
+            let (finite, mx) = if f16 {
+                f16_buffer_stats(&this.bufs.arena, off as usize, elems, SAMPLE)
+            } else {
+                half_buffer_stats(&this.bufs.arena, off as usize, elems, SAMPLE)
+            };
             let e = peak.entry(label).or_insert((0.0, false));
             e.0 = e.0.max(mx);
             e.1 |= !finite;
+            if mx == 0.0 || !finite {
+                let ptr =
+                    unsafe { this.bufs.arena.contents().as_ptr().add(off as usize) as *const u16 };
+                let bits: Vec<String> = (0..8)
+                    .map(|i| format!("{:04x}", unsafe { *ptr.add(i) }))
+                    .collect();
+                eprintln!("    {label}: first bits [{}]", bits.join(" "));
+            }
         };
 
         self.dispatch_and_wait(|enc| enc.encode_step_preamble(&layout, first_step))?;
@@ -5021,6 +5102,18 @@ impl StepRuntime {
             self,
             "preamble:soft",
             self.bufs.arena_map.soft_off(),
+            CANVAS * HID,
+        );
+        probe(
+            self,
+            "preamble:dense(sc_mlp)",
+            self.bufs.arena_map.dense_off(),
+            CANVAS * HID,
+        );
+        probe(
+            self,
+            "preamble:hidden(embed+sc)",
+            self.bufs.arena_map.hidden_off(),
             CANVAS * HID,
         );
 
@@ -5252,12 +5345,13 @@ fn step_pipeline_key(
     variant: crate::kernels::sub::variant::KernelVariant,
     fmt: crate::kernels::sub::kv_quant::KvFormat,
 ) -> StepPipelineKey {
-    // KV format code occupies bits 3-4 (0=f16, 1=q8, 2=q4).
+    // KV format code occupies bits 3-4 (0=f16, 1=q8, 2=q4); bit 5 = fp16 arena.
     StepPipelineKey(
         u8::from(variant.shape_assert)
             | (u8::from(variant.debug_fast) << 1)
             | (u8::from(variant.debug_deep) << 2)
-            | ((fmt.code() as u8) << 3),
+            | ((fmt.code() as u8) << 3)
+            | (u8::from(variant.arena_f16) << 5),
     )
 }
 
@@ -5391,7 +5485,23 @@ pub fn build_step_runtime(
     let ctx = MetalContext::new()?;
     let compile_started = Instant::now();
     let kv_fmt = crate::flags::kv_format(cfg.max_seq);
+    // TEMP diagnostic (E11 bring-up): DGQ_ARENA_F16_ALL=1 builds the MAIN set
+    // fp16 too — bisects kernel-level breakage from mode-switch wiring.
+    let f16_all = std::env::var("DGQ_ARENA_F16_ALL").is_ok();
+    if f16_all {
+        crate::kernels::sub::variant::set_arena_f16_compile(true);
+    }
     let pipelines = shared_step_pipelines(&ctx, kv_fmt)?;
+    // f16_all: LEAVE the compile-mode atomic on — lazy dispatch-time compiles
+    // (stacked GEMM) must also build f16 for the whole session.
+    let pipelines_prefill_f16 = if crate::flags::prefill_f16_enabled() {
+        crate::kernels::sub::variant::set_arena_f16_compile(true);
+        let out = shared_step_pipelines(&ctx, kv_fmt);
+        crate::kernels::sub::variant::set_arena_f16_compile(false);
+        Some(out?)
+    } else {
+        None
+    };
     let compile = compile_started.elapsed();
 
     let gpu_blob = DgqGpuBlob::from_store(&store, &ctx.device)?;
@@ -5534,6 +5644,8 @@ pub fn build_step_runtime(
     let mut rt = StepRuntime {
         ctx,
         pipelines,
+        pipelines_prefill_f16,
+        arena_f16_mode: false,
         bufs,
         gpu_blob,
         weight_cache,
@@ -6737,8 +6849,12 @@ pub fn bench_step_kernel_encode_subprofile(
     rt.run_forward_once(cfg.finish)?;
     if crate::flags::trace_ranges_enabled() {
         // Warm to a steady-state (denoised) step, then trace one step's ranges.
+        // Under DGQ_PREFILL_F16 the traced step runs on the fp16 pipeline set
+        // (per-stage localization for the E11 arena dtype flip).
+        rt.arena_f16_mode = rt.pipelines_prefill_f16.is_some();
         rt.run_forward_once(cfg.finish)?;
         rt.trace_step_ranges()?;
+        rt.arena_f16_mode = false;
     }
     let mut prof = rt.profile_encode_subprofile()?;
     prof.compile = build.compile;

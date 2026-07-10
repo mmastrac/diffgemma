@@ -116,7 +116,7 @@ kernel void moe_grouped(
                 }
             }
         }
-        act[r] = f32_round_bf16(gelu_tanh(g) * u);
+        act[r] = arena_round_f32(gelu_tanh(g) * u);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (probe && ltid == 0u) {
@@ -146,9 +146,9 @@ kernel void moe_grouped(
                 }
             }
         }
-        float o_round = f32_round_bf16(o);
+        float o_round = arena_round_f32(o);
         if (probe) {
-            float contrib = f32_round_bf16(w * o_round);
+            float contrib = arena_round_f32(w * o_round);
             if (ltid == 0u && d < 8u) {
                 const uint meta = dims.moe_ff * 2u;
                 dump[meta + 20u + d] = contrib;

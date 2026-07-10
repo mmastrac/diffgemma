@@ -5,6 +5,7 @@ using namespace metal;
 #include "debug_status.metal"
 #include "common.metal"
 #include "activations.metal"
+#include "arena.metal"
 
 /// MoE gate_up `[batch, 2*moe_inter]` → gelu(gate)*up. Layout is fixed by .dgq manifest.
 kernel void swiglu_moe_gate_up(
@@ -32,5 +33,5 @@ kernel void swiglu_moe_gate_up(
     if (K_DUMP_STAGE >= 1u) {
         dump[gid] = u;
     }
-    out[gid] = f32_round_bf16(g * u);
+    out[gid] = arena_round_f32(g * u);
 }

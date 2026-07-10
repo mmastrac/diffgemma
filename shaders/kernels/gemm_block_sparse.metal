@@ -6,6 +6,7 @@ using namespace metal;
 #include "gemm_fc.metal"
 #include "gemm_block_tile.metal"
 #include "dequant.metal"
+#include "arena.metal"
 #include "qgemm_grouped.metal"
 #include "moe_router_device.metal"
 
@@ -173,7 +174,7 @@ kernel void gemm_block_sparse(
         const uint mm = i / GEMM_N_TILE;
         const uint nn = i % GEMM_N_TILE;
         if (mm < M_tile && n0 + nn < N) {
-            c[(ulong)(row0 + mm) * N + n0 + nn] = f32_round_bf16(ty[mm][nn]);
+            c[(ulong)(row0 + mm) * N + n0 + nn] = arena_round_f32(ty[mm][nn]);
         }
     }
 }

@@ -533,6 +533,14 @@ pub const FAST_PREFILL_MIN_TOKENS: usize = 256;
 /// was A/B-exonerated (scalar/MMA both degrade; GEMM/MoE/rope byte-identical
 /// swaps) — the remaining delta to the correct engine is activation
 /// precision. Above the cap prompts take the slow-but-correct f32 engine.
+/// E11: fast prefill runs on fp16 activation-arena pipelines (K_ARENA_F16)
+/// instead of bf16 — 2^-11 relative rounding vs 2^-8, targeting the
+/// length-accumulating comprehension loss (task #64/#65). Denoise keeps the
+/// gate-validated bf16 set. Opt-in until the doc-probe ladder + gate sign off.
+pub fn prefill_f16_enabled() -> bool {
+    on_if_one("DGQ_PREFILL_F16")
+}
+
 pub fn fast_prefill_max_tokens() -> usize {
     std::env::var("DGQ_FAST_PREFILL_MAX")
         .ok()

@@ -51,7 +51,7 @@ kernel void moe_scatter_weighted(
     float sum = 0.f;
     for (uint i = 0u; i < MOE_MAX_TOP_K; ++i) {
         const float v = expert_out[(ulong)t_slot[i] * hidden + d];
-        sum += f32_round_bf16(t_w[i] * f32_round_bf16(v));
+        sum += arena_round_f32(t_w[i] * arena_round_f32(v));
     }
     moe_out[(ulong)tok * hidden + d] = sum;
 }

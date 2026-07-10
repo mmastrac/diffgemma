@@ -4,6 +4,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static RUNTIME_ASSERT: AtomicBool = AtomicBool::new(false);
 static RUNTIME_DEBUG_DEEP: AtomicBool = AtomicBool::new(false);
+static ARENA_F16_COMPILE: AtomicBool = AtomicBool::new(false);
+
+/// Compile-mode switch: while true, `runtime_step_variant()` yields variants
+/// with `arena_f16` set, so a whole pipeline set (incl. the internal-variant
+/// GEMM compile paths) builds against fp16 activation-arena slots (FC9).
+/// Bracket the build of the E11 prefill pipeline set with this.
+pub fn set_arena_f16_compile(enabled: bool) {
+    ARENA_F16_COMPILE.store(enabled, Ordering::Relaxed);
+}
+
+pub fn arena_f16_compile_enabled() -> bool {
+    ARENA_F16_COMPILE.load(Ordering::Relaxed)
+}
 
 /// Enable GPU fast/shape asserts for step pipelines (`--assert` on generate-monolithic).
 pub fn set_runtime_assert_enabled(enabled: bool) {
@@ -38,15 +51,13 @@ pub fn set_runtime_kernel_debug(assert: bool, deep: bool) {
 pub fn runtime_step_variant() -> KernelVariant {
     let assert = runtime_assert_enabled();
     let deep = runtime_debug_deep_enabled();
-    if !assert && !deep {
-        return KernelVariant::PRODUCTION;
-    }
     KernelVariant {
         shape_assert: assert,
         debug_fast: assert,
         debug_deep: deep,
         dump_stage: 0,
         quant_format: QuantFormat::INERT,
+        arena_f16: arena_f16_compile_enabled(),
     }
 }
 
@@ -89,6 +100,8 @@ pub struct KernelVariant {
     pub dump_stage: u32,
     /// Quant format selector (FC3). Inert on elementwise bodies (must be Q4Affine).
     pub quant_format: QuantFormat,
+    /// Activation-arena slots are fp16 instead of bf16 (FC9; E11 prefill stream).
+    pub arena_f16: bool,
 }
 
 impl KernelVariant {
@@ -98,6 +111,7 @@ impl KernelVariant {
         debug_deep: false,
         dump_stage: 0,
         quant_format: QuantFormat::INERT,
+        arena_f16: false,
     };
 
     pub const TEST_ASSERT: Self = Self {
@@ -106,6 +120,7 @@ impl KernelVariant {
         debug_deep: false,
         dump_stage: 0,
         quant_format: QuantFormat::INERT,
+        arena_f16: false,
     };
 
     pub const TEST_DUMP: Self = Self {
@@ -114,16 +129,18 @@ impl KernelVariant {
         debug_deep: false,
         dump_stage: 1,
         quant_format: QuantFormat::INERT,
+        arena_f16: false,
     };
 
     pub fn cache_label(&self, entry: &str) -> String {
         format!(
-            "{entry}_sa{}_df{}_dd{}_d{}_qf{}",
+            "{entry}_sa{}_df{}_dd{}_d{}_qf{}_af{}",
             u8::from(self.shape_assert),
             u8::from(self.debug_fast),
             u8::from(self.debug_deep),
             self.dump_stage,
             self.quant_format as u32,
+            u8::from(self.arena_f16),
         )
     }
 

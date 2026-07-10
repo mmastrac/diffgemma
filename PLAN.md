@@ -109,8 +109,8 @@ previously-unlisted files.
 
 | Item | Note |
 |---|---|
-| **fp16 prefill stream (E11)** | Lift the 2048 fast-prefill cap by flipping prefill activation planes bf16→fp16 (task #65; playbook in ROADMAP §6) |
-| **Engine prefill throughput (E12)** | ~40 ms/token today; 3-4× (tunable-GEMM f32 port + chunk batching + sync trim) makes the >2k fallback livable at 100k while E11 cooks |
+| **Rolling window KV (E14)** | THE cap-lifter after the 2026-07-10 disproofs: E11 fp16-arena BUILT (opt-in `DGQ_PREFILL_F16`) but 4.2k probe still hallucinates; ring-uncap disproven too → failure is chunk-boundary f16 KV rounding compounding ~p/256 hops (engine/MLX correct = unchunked). Fix = f32 side window K/V (~1.3 GB constant) for sliding layers during fast prefill (ROADMAP §6.4) |
+| **Engine prefill (E12)** | PARTIAL 2026-07-10: ring-correct GPU hydrate (was O(n²) CPU + wrong past wrap), hydrate-once chunked extend, resident extend (wash — kernel-bound), bit-identical gqa clamp (−19%). Engine ≈55-78 ms/tok, kernel-bound (scalar 3-pass GQA ~70%, f32 MoE); further surgery poor ROI vs E14; linear-f32 engine KV = memory wall past ~10k |
 | Long-context speed | GEMM ledger CLOSED 2026-07-07: tunable = MPS wall, sparse 92-96% of dense at prefill distribution, SPARSE_BN=128 shipped (+6-8% kernel); MLX-qmm gap ~10-15% = pipelined-loader port worth ≤2-3% (non-lever). Remaining: attention fragment-tile (ROADMAP E5) only |
 | Seed-123 empty-reply artifact | short factual prompts, both prefill paths (engine 5 / fast 2 of 17 at that seed); trajectory-level, pre-existing |
 | Legacy GEMM retirement | `gemm_block*` legacy pipelines after a stable tunable cycle (KERNELS.md deprecation list; needs user nod) |

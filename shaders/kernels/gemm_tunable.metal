@@ -54,7 +54,7 @@ inline void tunable_load_a(
         half4 h;
         if (m0 + mm < M) {
             const ushort4 u = *(device const ushort4 *)(x + (ulong)(m0 + mm) * K + k0 + kk);
-            h = half4(as_type<float4>(uint4(u) << 16u));
+            h = K_ARENA_F16 ? as_type<half4>(u) : half4(as_type<float4>(uint4(u) << 16u));
         } else {
             h = half4(0);
         }
@@ -444,7 +444,8 @@ kernel void gemm_tunable_sparse(
                     const uint tok = route->token_list[row0 + mm];
                     const ushort4 u =
                         *(device const ushort4 *)(moein + (ulong)tok * K + k0 + kk);
-                    h = half4(as_type<float4>(uint4(u) << 16u));
+                    h = K_ARENA_F16 ? as_type<half4>(u)
+                                    : half4(as_type<float4>(uint4(u) << 16u));
                 } else {
                     const float4 f =
                         *(device const float4 *)(a + (ulong)(row0 + mm) * K + k0 + kk);
@@ -525,10 +526,10 @@ kernel void gemm_tunable_sparse(
             const thread float2 &ec = reinterpret_cast<thread float2 &>(C[i][j].thread_elements());
             const uint col = n0 + sc + 8u * j + fn;
             if (col < N) {
-                c[(ulong)(row0 + mm) * N + col] = f32_round_bf16(ec[0]);
+                c[(ulong)(row0 + mm) * N + col] = arena_round_f32(ec[0]);
             }
             if (col + 1u < N) {
-                c[(ulong)(row0 + mm) * N + col + 1u] = f32_round_bf16(ec[1]);
+                c[(ulong)(row0 + mm) * N + col + 1u] = arena_round_f32(ec[1]);
             }
         }
     }

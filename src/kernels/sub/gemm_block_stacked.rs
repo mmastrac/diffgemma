@@ -84,6 +84,8 @@ pub(crate) struct StackedPipelineKey {
     k: u32,
     format: u32,
     stacked: StackedSegFc,
+    /// fp16 activation arena (FC9) — the compiled body differs (E11).
+    arena_f16: bool,
 }
 
 impl StackedPipelineKey {
@@ -92,6 +94,7 @@ impl StackedPipelineKey {
             n,
             k,
             format: format as u32,
+            arena_f16: crate::kernels::sub::variant::arena_f16_compile_enabled(),
             stacked,
         }
     }

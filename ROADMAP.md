@@ -353,15 +353,37 @@ the sampler-struct growth ripple). The slack is the plan.
 | E8 | Hadamard-rotated q4 KV (§5.2) | **IN PROGRESS 2026-07-07**: 262k KV 5.3→~1.4 GiB, quality-neutral. Premise corrected — K rotates at RUNTIME after RoPE (can't fold), V rotates at runtime too (full layers alias V/no W_v), only W_o folds offline | ~3 d | rotated-q4 passes multi-seed gate + needle 33k/100k exact + DGQ_MEM_WATCH < 90% @ 262k | rotated-q4 fails gate (rotation doesn't recover q4 quality) |
 | E9 | Rotated experts (near-bf16 fidelity @ q4) (§5.4) | M1 gate/up (shared WHT + offline fold) recovers ~bf16 forward; M2 down_proj WHT only if needed | v2+ | full gate vs bf16-expert ref + census + sign-off | M1 no better than plain q4, or M2 WHT regresses short-context |
 | E10 | Precision-decay KV (recent f16, aged rotated-q4) | segmented full-layer KV: f16 recent window + q4 aged bulk, demoted+rotated as tokens age past the window; better quality/memory than uniform q4 | v2+ | needle 262k exact + DGQ_MEM_WATCH under budget + gate | on 36 GB marginal over q8-auto (which already fits 262k) — value is 18-24 GB / >262k / long-range quality |
-| E11 | **fp16 prefill activation stream** (§6.1) | bf16's 2⁻⁸ per-op rel step is above the long-prefill stability threshold; fp16's 2⁻¹¹ is below it (MLX = existence proof; engine-f32 = upper bound). Lifts the `DGQ_FAST_PREFILL_MAX=2048` cap | ~2-3 d | doc-probe ladder (1k/2.2k/4.2k/6.6k/13k) EXACT through fast+fp16; layer-5 KV rel vs engine drops ~8×; needle 33k/105k exact; gate+census neutral at short ctx; suite green | fp16 range overflow on residual outlier channels AND the plane-scaled/f32-trunk fallbacks also fail the ladder |
-| E12 | Engine prefill throughput ≥3× (§6.2) | engine is ~40 ms/token from f32 legacy GEMMs + chunk-serial + per-call sync, not physics; tunable-f32 port + M=1024 batching + P2-style sync trim reach ≤13 ms/token (100k: 65→~20 min) | ~2 d | engine output BYTE-IDENTICAL to current engine (pure perf); timing on the 6.6k/33k probes | <2× after the three levers → engine stays bridge-only |
+| E11 | ~~fp16 prefill activation stream~~ **BUILT + DISPROVEN 2026-07-10** (§6.1): K_ARENA_F16 machinery shipped opt-in (`DGQ_PREFILL_F16`; `DGQ_ARENA_F16_ALL` diagnostic; M0 ranges all ≤129, ~500× headroom; all-f16 session generates correctly) but the 4.2k doc probe STILL hallucinates — stream dtype is NOT the driver. Ring-uncap (`DGQ_KV_RING_UNCAPPED`) also disproven. Failure is STRUCTURAL: chunk-boundary f16 KV rounding compounds ~p/256 causal hops (8 hops exact / 17 degraded / 26 gone); engine-f32 and MLX are correct because they prefill full-M UNCHUNKED | done (disproof) | — | hit: see E14 |
+| E12 | Engine prefill (§6.2) — **PARTIAL 2026-07-10** (7c621b7, b55128b): GPU ring-correct hydrate (13-32 ms, was O(n²) CPU + wrong past the ring wrap), hydrate-once chunked extend, resident extend (perf WASH — engine is KERNEL-bound, not sync-bound), bit-identical gqa masked-key clamp (−19% full prefill). Engine ≈55-78 ms/tok; remaining levers (attention rewrite = quality-gated, GEMM/MoE f32 ports) are days for 2-4× — POOR ROI vs E14; engine KV (linear f32) is also a memory wall past ~10k | done (bridge) | hydrate ring-exactness gate + finite-KV gate + fingerprint bit-identity | further engine surgery deprioritized for E14 |
+| E14 | **Rolling high-precision window KV for chunked prefill** (§6.4) | kills the chunk-boundary compounding where comprehension lives: sliding layers read the last window+chunk (~1280 pos) of K/V from an f32 (or unrounded) side buffer during prefill — ~1.3 GB CONSTANT in kv_len; full layers keep f16 (retrieval provably survives it: needles exact at 105k) | ~2-3 d | doc-probe ladder (1k/2.2k/4.2k/6.6k/13k) grounded through the fast path; then raise `DGQ_FAST_PREFILL_MAX`; gate+census neutral short-ctx | ladder still fails → the compounding theory is wrong too; next differential = full-M unchunked prefill |
 | E13 | Comprehension probes in the gate (§6.3) | needle probes are blind to comprehension loss (stayed EXACT while 6.6k answers were hallucinated); a real-doc Q&A ladder catches the whole class | ~0.5 d | model-gated long-ctx tier in smoketest (planted-fact real-doc Q at 2k/4.2k/6.6k + classic needle); wired into nightly CI tier | n/a (pure validation) |
 
 Every experiment observes the standing rules: bit-identical ships on
 identity evidence; anything else needs multi-seed gate + census + explicit
 sign-off; serialize all model-loading runs; check the disproof ledger first.
 
-### 6.1 E11 playbook — fp16 prefill activation stream (task #65)
+### 6.4 E14 playbook — rolling window KV (the surviving hypothesis)
+
+The 2026-07-10 differential: every CHUNKED configuration fails the 4.2k doc
+probe identically (bf16 arena, fp16 arena, ring capped/uncapped, every
+kernel A/B) while both UNCHUNKED implementations (our f32 engine full-M,
+MLX fp16 full-M) answer correctly. The only mechanism left standing:
+each 256-token chunk reads the whole prefix's K/V through the f16
+monolithic cache, so position p's context signal passes through ~p/256
+compounding rounding hops (~8 at 2.2k = exact, ~17 at 4.2k = degraded,
+~26 at 6.6k = hallucination — matches the smooth position-wise layer-5 KV
+drift measured earlier; batched super-chunks don't help, attention/KV stay
+256-granular inside them; fp16 arena can't help, K/V were already f16).
+
+Design: during fast prefill only, sliding layers keep a SIDE f32 K/V ring
+of window+chunk (~1280) positions; qk_rope_kv writes both (f32 side +
+f16 monolithic), prefill attention reads the f32 side for sliding layers.
+Memory ~1.3 GB constant in kv_len. Full layers stay on f16 monolithic
+(their long-range edges provably survive f16 — needle exact at 105k; and
+an f32 full-layer store would be O(kv) memory again). Denoise unchanged.
+Validation = the E13 doc-probe ladder, then raise the cap.
+
+### 6.1 E11 playbook — fp16 prefill activation stream (task #65) — DISPROVEN, machinery kept
 
 **Failure mechanism (measured 2026-07-10).** The causal chunk forward
 re-ingests every prior position's already-noisy K/V at each of 30 layers, so

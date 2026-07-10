@@ -5,8 +5,10 @@
 //   3  K_QUANT_FORMAT   uint   0=q4_affine 1=q8 2=mxfp4 3=nvfp4
 //   7  K_DEBUG_FAST     bool   shape/dim/index bounds (cheap; P3.7)
 //   8  K_DEBUG_DEEP     bool   NaN/Inf scans (expensive; P3.7)
+//   9  K_ARENA_F16      bool   activation-arena slots are fp16 instead of bf16
+//                              (E11 fp16 prefill stream; unset/false = bf16)
 //
-// Per-kernel semantic axes (4+): declared in that kernel's entry file only.
+// Per-kernel semantic axes (4+ except 7-9): declared in that kernel's entry file only.
 
 #ifndef DGQ_FC_AXES_METAL
 #define DGQ_FC_AXES_METAL
@@ -16,6 +18,7 @@ constant uint K_DUMP_STAGE [[function_constant(2)]];
 constant uint K_QUANT_FORMAT [[function_constant(3)]];
 constant bool K_DEBUG_FAST [[function_constant(7)]];
 constant bool K_DEBUG_DEEP [[function_constant(8)]];
+#include "arena_fc.metal"
 
 constant uint QUANT_Q4_AFFINE = 0u;
 constant uint QUANT_Q8 = 1u;
