@@ -5601,6 +5601,16 @@ pub fn run_step_layer_hidden_probe(
         return Err(Error::Format("layer probe position out of range"));
     }
     let (mut rt, _) = build_step_runtime(model_dir, cfg)?;
+    // build_step_runtime seeds the canvas BEFORE the fast prefill runs, and the
+    // prefill chunks stream the prompt through the same ids plane — at >256
+    // prompt tokens the probe would otherwise measure a canvas of prefill
+    // leftovers (last chunk's tokens + zero padding) instead of the seeded
+    // canvas. Re-seed in PRODUCTION order (prefill → reset_block → denoise);
+    // a fresh Rng reproduces the exact build-time draw, so short/engine-prefill
+    // probes are unchanged (idempotent).
+    let params = rt.read_params();
+    let mut rng = Rng::new(cfg.seed);
+    rt.reset_block(VOCAB, &mut rng, params);
     let layout = rt.layout;
     let layers = rt.layers;
     let mut checkpoints = Vec::new();
