@@ -705,6 +705,12 @@ struct StepPipelines {
     /// f32→bf16 convert with scale, for chunked SC softembed accumulator → half arena.
     f32_to_half_scale: ComputePipeline,
     qk_rope_kv: ComputePipeline,
+    /// E14 prefill variants (FC30, DGQ_PREFILL_KV_F32): rope also writes the
+    /// f32 side ring; mma2 reads K/V from it (all-float MMA). None = flag off.
+    qk_rope_kv_side: Option<ComputePipeline>,
+    attention_mma2_side: Option<ComputePipeline>,
+    attention_mma_full_side: Option<ComputePipeline>,
+    kv_f32_side_hydrate: Option<ComputePipeline>,
     attention: ComputePipeline,
     /// GQA-grouped MMA attention for sliding layers (`DGQ_ATTN_MMA`); scalar `attention` is the fallback/oracle.
     attention_mma2: ComputePipeline,
@@ -1117,6 +1123,32 @@ impl StepPipelines {
             gemm_bf16_rowk_acc_f32,
             f32_to_half_scale,
             qk_rope_kv: crate::kernels::sub::qk_rope_kv::pipeline_for_kv(ctx, prod, fmt)?,
+            qk_rope_kv_side: if crate::flags::prefill_kv_f32_enabled() {
+                Some(crate::kernels::sub::qk_rope_kv::pipeline_for_kv_side(
+                    ctx, prod, fmt,
+                )?)
+            } else {
+                None
+            },
+            attention_mma2_side: if crate::flags::prefill_kv_f32_enabled() {
+                Some(crate::kernels::sub::attention::pipeline_mma2_for_kv_side(
+                    ctx, prod, fmt,
+                )?)
+            } else {
+                None
+            },
+            attention_mma_full_side: if crate::flags::prefill_kv_f32_enabled() {
+                Some(crate::kernels::sub::attention::pipeline_mma_full_for_kv_side(ctx, prod, fmt)?)
+            } else {
+                None
+            },
+            kv_f32_side_hydrate: if crate::flags::prefill_kv_f32_enabled() {
+                Some(crate::kernels::sub::kv_f32_side_hydrate::pipeline_for_kv(
+                    ctx, prod, fmt,
+                )?)
+            } else {
+                None
+            },
             attention: crate::kernels::sub::attention::pipeline_for_kv(ctx, prod, fmt)?,
             attention_mma2: crate::kernels::sub::attention::pipeline_mma2_for_kv(ctx, prod, fmt)?,
             attention_mma_full: crate::kernels::sub::attention::pipeline_mma_full_for_kv(
@@ -1359,6 +1391,14 @@ pub(crate) struct StepBuffers {
     /// Online-softmax state (f32 m/l + unnormalized O per head x canvas row)
     /// persisted between sequential kv-block dispatches of attention_mma_full.
     attn_state: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// E14 (DGQ_PREFILL_KV_F32): f32 side K/V ring for the sliding layers —
+    /// written by the prefill rope, read by the prefill attention, so chunk
+    /// boundaries never round K/V to f16. Same slot = pos & ring_mask
+    /// addressing as the f16 ring; per-layer byte offsets in
+    /// `kv_f32_side_offs` (u64::MAX for full layers). None when the flag is
+    /// off.
+    kv_f32_side: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    kv_f32_side_offs: [u64; N_LAYERS],
     /// PREFILL_SUBS StepParams slots for the per-sub-chunk rope/attention
     /// dispatches of a batched prefill super-chunk (kv_len differs per sub;
     /// bufs.params is read at execution time so it can't vary within one
@@ -3311,7 +3351,19 @@ impl StepEnc<'_> {
         let qk_y = (16 + 2 * l.n_kv_heads) as usize;
         let layer_off = layer_byte_offset(layer);
 
-        self.sink_set_pipeline(&self.ps.qk_rope_kv);
+        // E14: prefill writes sliding K/V to the f32 side ring too.
+        let side = if self.prefill_causal {
+            self.bufs
+                .kv_f32_side
+                .as_ref()
+                .zip(self.ps.qk_rope_kv_side.as_ref())
+        } else {
+            None
+        };
+        match &side {
+            Some((_, pipe)) => self.sink_set_pipeline(pipe),
+            None => self.sink_set_pipeline(&self.ps.qk_rope_kv),
+        }
         // Per-sub-chunk row offsets into the batched Q/K/V planes (sub_c = 0
         // outside a super-chunk). K/V planes are written at the layer's native
         // widths (n_kv*hd); Q at n_q*hd.
@@ -3344,6 +3396,13 @@ impl StepEnc<'_> {
         };
         self.sink_set_bytes(&attn_dims, 7);
         self.bind_debug_status(8);
+        if let Some((sbuf, _)) = side {
+            // Full layers never dereference the side pointer (kernel guards on
+            // !full) — bind offset 0 for them.
+            let off = self.bufs.kv_f32_side_offs[layer];
+            let off = if off == u64::MAX { 0 } else { off as usize };
+            self.sink_set_buffer(sbuf, off, 9);
+        }
         let grid = MTLSize {
             width: self.active_canvas,
             height: qk_y,
@@ -3379,7 +3438,23 @@ impl StepEnc<'_> {
         let mma_ok = !self.prefill_causal || crate::flags::prefill_mma_enabled();
         let use_mma2 = mma_ok && attn_mma_enabled() && l.is_full == 0;
         let use_mma_full = mma_ok && attn_mma_full_enabled() && l.is_full == 1;
-        if use_mma2 {
+        // E14: prefill attention reads K/V from the f32 side cache.
+        let side = if self.prefill_causal && use_mma2 {
+            self.bufs
+                .kv_f32_side
+                .as_ref()
+                .zip(self.ps.attention_mma2_side.as_ref())
+        } else if self.prefill_causal && use_mma_full {
+            self.bufs
+                .kv_f32_side
+                .as_ref()
+                .zip(self.ps.attention_mma_full_side.as_ref())
+        } else {
+            None
+        };
+        if let Some((_, pipe)) = &side {
+            self.sink_set_pipeline(pipe);
+        } else if use_mma2 {
             self.sink_set_pipeline(&self.ps.attention_mma2);
         } else if use_mma_full {
             self.sink_set_pipeline(&self.ps.attention_mma_full);
@@ -3421,6 +3496,10 @@ impl StepEnc<'_> {
         };
         self.sink_set_bytes(&attn_dims, 5);
         self.bind_debug_status(6);
+        if let Some((sbuf, _)) = side {
+            let idx = if use_mma_full { 9 } else { 7 };
+            self.sink_set_buffer(sbuf, self.bufs.kv_f32_side_offs[layer] as usize, idx);
+        }
         // Full-attention kernel takes a kv-block range + state scratch
         // (buffers 7/8); the range is (re)set per dispatch below.
         if use_mma_full {
@@ -4565,6 +4644,11 @@ pub struct StepRuntime {
     /// denoise block writes a CANVAS-wide canvas at [kv_len..kv_len+CANVAS], so
     /// kv_len + CANVAS must never exceed this — checked in `set_kv_len`.
     max_seq: usize,
+    /// E14: KV position the f32 side ring is valid up to. A fast prefill
+    /// resuming at a different offset re-hydrates the window from the
+    /// monolithic cache first (rollback / restore / conversation swap all
+    /// invalidate silently — the mismatch check heals every case).
+    kv_f32_side_valid: usize,
     /// Active canvas width for the NEXT denoise step (E3/E6 shrink-on-retry).
     /// `CANVAS` (256) normally; the block loop narrows it (128/64) when re-
     /// rolling a degenerate reply. Clamped to [1, CANVAS].
@@ -4667,6 +4751,56 @@ impl StepRuntime {
         self.prefill_chunks_from(0, prompt_token_ids)
     }
 
+    /// E14: refill each sliding layer's f32 side ring from the monolithic
+    /// cache for the last `min(upto, ring)` positions below `upto` (f16→f32
+    /// widening — bakes in the one rounding those values already carry, no
+    /// further compounding). One dispatch for all layers, ~ms.
+    fn hydrate_kv_f32_side(&mut self, upto: usize) -> Result<(), Error> {
+        let layout = self.layout;
+        let layers = self.layers;
+        self.dispatch_and_wait(|enc| {
+            let pipe = enc
+                .ps
+                .kv_f32_side_hydrate
+                .clone()
+                .ok_or(Error::Format("kv_f32_side_hydrate pipeline missing"))?;
+            let sbuf = enc
+                .bufs
+                .kv_f32_side
+                .clone()
+                .ok_or(Error::Format("kv_f32_side buffer missing"))?;
+            for layer in 0..layers {
+                let l = &layout.layers[layer];
+                let slots = if l.kv_ring_mask != 0 {
+                    (l.kv_ring_mask as usize) + 1
+                } else {
+                    upto // full layers are linear: hydrate everything
+                };
+                let count = upto.min(slots);
+                let pos0 = upto - count;
+                enc.sink_set_pipeline(&pipe);
+                enc.bind_kvcache(0);
+                enc.sink_set_buffer(&sbuf, enc.bufs.kv_f32_side_offs[layer] as usize, 1);
+                let shape = [count as u32, pos0 as u32, l.n_kv_heads, l.head_dim];
+                enc.sink_set_bytes(&shape, 2);
+                enc.sink_set_bytes(&(l.kv_region as u64), 3);
+                enc.sink_set_bytes(&l.kv_ring_mask, 4);
+                let grid = MTLSize {
+                    width: count,
+                    height: l.n_kv_heads as usize,
+                    depth: l.head_dim as usize,
+                };
+                let tg = MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                };
+                enc.sink_dispatch(grid, tg);
+            }
+            Ok(())
+        })
+    }
+
     /// Fast (quantized, causal) prefill of `delta_token_ids` starting at KV
     /// position `offset`. The delta chunks attend causally to the KV already
     /// present at [0..offset] (e.g. the reused cross-turn prefix), so this
@@ -4733,6 +4867,12 @@ impl StepRuntime {
         // on sliding layers a pad position wraps onto (pos & ring_mask) and
         // would clobber the oldest live window slots (task #64).
         self.set_kv_write_end(n as u32);
+        // E14: the prefill attention reads sliding K/V from the f32 side ring;
+        // make its window current for a resume at `offset` (fresh prefill at
+        // 0 needs nothing — every read position gets written first).
+        if self.bufs.kv_f32_side.is_some() && offset > 0 && self.kv_f32_side_valid != offset {
+            self.hydrate_kv_f32_side(offset)?;
+        }
         self.arena_f16_mode = self.pipelines_prefill_f16.is_some();
         while pos < n {
             let remaining = n - pos;
@@ -4776,6 +4916,9 @@ impl StepRuntime {
             }
         }
         self.arena_f16_mode = false;
+        if self.bufs.kv_f32_side.is_some() {
+            self.kv_f32_side_valid = n;
+        }
         self.set_kv_write_end(u32::MAX);
         self.set_kv_len(n as u32);
         // The prefill dirtied scratch (arena hidden/dense, MoE routing buffers,
@@ -5538,7 +5681,31 @@ pub fn build_step_runtime(
     // real file instead of anonymous swap. `kv_mmap_backing` must outlive
     // `kvcache` — it is declared after it in `StepBuffers` so it drops later.
     let (kvcache, kv_mmap_backing) = alloc_kv_buffer(&ctx.device, kv_bytes)?;
+    // E14 f32 side K/V ring for sliding layers (DGQ_PREFILL_KV_F32).
+    let mut kv_f32_side_offs = [u64::MAX; N_LAYERS];
+    let kv_f32_side = if crate::flags::prefill_kv_f32_enabled() {
+        let mut off = 0u64;
+        for i in 0..N_LAYERS {
+            let l = &layout.layers[i];
+            kv_f32_side_offs[i] = off;
+            off += (layer_kv_slots(l.is_full != 0, cfg.max_seq)
+                * (l.n_kv_heads * l.head_dim) as usize
+                * 2
+                * 4) as u64;
+        }
+        if crate::flags::progress_enabled() {
+            eprintln!(
+                "step-kernel: f32 side KV ring {:.0} MiB (DGQ_PREFILL_KV_F32)",
+                off as f64 / (1024.0 * 1024.0)
+            );
+        }
+        Some(alloc_buffer(&ctx.device, off as usize)?)
+    } else {
+        None
+    };
     let bufs = StepBuffers {
+        kv_f32_side,
+        kv_f32_side_offs,
         blob: gpu_blob.buffer.clone(),
         blob_experts: {
             let (b, _) = gpu_blob.expert_region();
@@ -5646,6 +5813,7 @@ pub fn build_step_runtime(
         pipelines,
         pipelines_prefill_f16,
         arena_f16_mode: false,
+        kv_f32_side_valid: 0,
         bufs,
         gpu_blob,
         weight_cache,

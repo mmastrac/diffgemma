@@ -109,7 +109,7 @@ previously-unlisted files.
 
 | Item | Note |
 |---|---|
-| **Rolling window KV (E14)** | THE cap-lifter after the 2026-07-10 disproofs: E11 fp16-arena BUILT (opt-in `DGQ_PREFILL_F16`) but 4.2k probe still hallucinates; ring-uncap disproven too → failure is chunk-boundary f16 KV rounding compounding ~p/256 hops (engine/MLX correct = unchunked). Fix = f32 side window K/V (~1.3 GB constant) for sliding layers during fast prefill (ROADMAP §6.4) |
+| **Fast-prefill defect hunt (E15)** | The 2026-07-10 disproof cascade (fp16 arena, ring uncap, f32 side KV on all 30 layers, all combos) + the DECISIVE anchor: engine KV + 1% random noise on 255M values answers 4.2k correctly (`DGQ_KV_NOISE`) → fast prefill has a REAL bug, not precision drift. Onset 2.2k–3.2k. Next: layer-KV bisect with the >3%-is-real criterion (ROADMAP E15). Cap stays 2048 |
 | **Engine prefill (E12)** | PARTIAL 2026-07-10: ring-correct GPU hydrate (was O(n²) CPU + wrong past wrap), hydrate-once chunked extend, resident extend (wash — kernel-bound), bit-identical gqa clamp (−19%). Engine ≈55-78 ms/tok, kernel-bound (scalar 3-pass GQA ~70%, f32 MoE); further surgery poor ROI vs E14; linear-f32 engine KV = memory wall past ~10k |
 | Long-context speed | GEMM ledger CLOSED 2026-07-07: tunable = MPS wall, sparse 92-96% of dense at prefill distribution, SPARSE_BN=128 shipped (+6-8% kernel); MLX-qmm gap ~10-15% = pipelined-loader port worth ≤2-3% (non-lever). Remaining: attention fragment-tile (ROADMAP E5) only |
 | Seed-123 empty-reply artifact | short factual prompts, both prefill paths (engine 5 / fast 2 of 17 at that seed); trajectory-level, pre-existing |

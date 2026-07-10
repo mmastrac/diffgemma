@@ -287,6 +287,47 @@ pub fn pipeline_mma2_for_kv(
     ctx.compile_subkernel_ex(SHADER_MMA2, ENTRY_MMA2, variant, label, &[], &uints)
 }
 
+/// E14 prefill variant (FC30): sliding K/V read from the f32 side ring,
+/// all-float MMA. See attention_mma2.metal.
+#[cfg(target_os = "macos")]
+pub fn pipeline_mma2_for_kv_side(
+    ctx: &crate::metal::device::MetalContext,
+    variant: KernelVariant,
+    fmt: crate::kernels::sub::kv_quant::KvFormat,
+) -> Result<crate::metal::device::ComputePipeline, Error> {
+    let (uints, label) = kv_fc(fmt);
+    let label = format!("{label}_side");
+    let bools = [crate::kernels::sub::variant::FcBool {
+        index: 30,
+        value: true,
+    }];
+    ctx.compile_subkernel_ex(SHADER_MMA2, ENTRY_MMA2, variant, &label, &bools, &uints)
+}
+
+/// E14 prefill variant (FC30) for FULL layers: linear f32 side K/V,
+/// all-float MMA. See attention_mma_full.metal.
+#[cfg(target_os = "macos")]
+pub fn pipeline_mma_full_for_kv_side(
+    ctx: &crate::metal::device::MetalContext,
+    variant: KernelVariant,
+    fmt: crate::kernels::sub::kv_quant::KvFormat,
+) -> Result<crate::metal::device::ComputePipeline, Error> {
+    let (uints, label) = kv_fc(fmt);
+    let label = format!("{label}_side");
+    let bools = [crate::kernels::sub::variant::FcBool {
+        index: 30,
+        value: true,
+    }];
+    ctx.compile_subkernel_ex(
+        SHADER_MMA_FULL,
+        ENTRY_MMA_FULL,
+        variant,
+        &label,
+        &bools,
+        &uints,
+    )
+}
+
 #[cfg(target_os = "macos")]
 pub fn pipeline_mma_full_for_kv(
     ctx: &crate::metal::device::MetalContext,

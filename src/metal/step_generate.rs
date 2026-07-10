@@ -422,6 +422,48 @@ impl StepGenerateSession {
     }
 }
 
+/// DIAGNOSTIC (task #67): multiply every live f16 KV value by (1 + eps*u),
+/// u uniform in [-1, 1] — models the fast path's per-value computation noise
+/// on top of a KNOWN-GOOD engine prefill. f16 sessions only (q8 skipped).
+fn perturb_live_kv_f16(
+    rt: &mut crate::metal::step_kernel::StepRuntime,
+    kv_len: usize,
+    eps: f32,
+    seed: u64,
+) {
+    use crate::kernels::sub::f16::{f16_bits_to_f32, f32_to_f16_bits};
+    use objc2_metal::MTLBuffer as _;
+    if crate::flags::kv_format(rt.max_seq()) != crate::kernels::sub::kv_quant::KvFormat::F16 {
+        eprintln!("DGQ_KV_NOISE: q8 session — skipped");
+        return;
+    }
+    let layout = *rt.layout();
+    let buf = rt.kvcache();
+    let mut rng = Rng::new(seed ^ 0x5eed);
+    let mut n = 0u64;
+    for layer in 0..crate::metal::step_kernel::N_LAYERS {
+        let l = &layout.layers[layer];
+        let nkv = l.n_kv_heads as usize;
+        let hd = l.head_dim as usize;
+        let token_stride = nkv * hd * 2;
+        let slots = if l.kv_ring_mask != 0 {
+            kv_len.min(l.kv_ring_mask as usize + 1)
+        } else {
+            kv_len
+        };
+        let base = l.kv_region as usize / 2;
+        let ptr = unsafe { (buf.contents().as_ptr() as *mut u16).add(base) };
+        for i in 0..slots * token_stride {
+            let p = unsafe { ptr.add(i) };
+            let v = f16_bits_to_f32(unsafe { *p });
+            let u = rng.next_f32() * 2.0 - 1.0;
+            unsafe { *p = f32_to_f16_bits(v * (1.0 + eps * u)) };
+            n += 1;
+        }
+    }
+    eprintln!("DGQ_KV_NOISE: perturbed {n} f16 KV values by rel eps {eps}");
+}
+
 /// Monolithic generate: prefill prompt → denoise blocks → extend KV (matches `generate_inner` structure).
 pub fn generate_monolithic(
     model_dir: &Path,
@@ -566,6 +608,16 @@ pub fn generate_with_session(
         let prefill_elapsed = prefill_started.elapsed();
         (kv_len, prefill_timing, prefill_elapsed)
     };
+    // DIAGNOSTIC (task #67 sensitivity probe): DGQ_KV_NOISE=<rel eps>
+    // perturbs every live f16 KV value after prefill (whichever path ran) by
+    // a random relative factor — separates "the model is knife-edge
+    // sensitive to KV noise at this length" from "the fast path has a real
+    // defect".
+    if let Ok(eps) = std::env::var("DGQ_KV_NOISE") {
+        if let Ok(eps) = eps.parse::<f32>() {
+            perturb_live_kv_f16(rt, kv_len, eps, cfg.seed);
+        }
+    }
     // Canvas denoise writes at [kv_len..kv_len+CANVAS]; ensure the runtime's
     // kv_len is exactly the prompt length (the reuse/extend paths update KV but
     // not params; a full-reuse KV may also hold stale tokens past the prompt).

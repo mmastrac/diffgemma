@@ -14,6 +14,17 @@ constant uint KV_FMT = is_function_constant_defined(KV_FMT_FC) ? KV_FMT_FC : 0u;
 constant bool KV_Q8 = (KV_FMT == 1u);
 constant bool KV_Q4 = (KV_FMT == 2u);
 
+// E14: during fast prefill, every layer ALSO writes post-RoPE K / normed V
+// into an f32 side cache (buffer 9, bound at the layer's side offset; same
+// kv_slot_of addressing — ring for sliding layers, linear for full). The
+// prefill attention reads the side instead of the f16 cache, so
+// chunk-boundary rounding never compounds. Denoise is untouched (the variant
+// is dispatched only for prefill; the f16/q8 monolithic write above stays
+// authoritative for denoise).
+constant bool KV_F32_SIDE_FC [[function_constant(30)]];
+constant bool KV_F32_SIDE =
+    is_function_constant_defined(KV_F32_SIDE_FC) && KV_F32_SIDE_FC;
+
 /// Per-head Q/K RMSNorm + split-half RoPE + KV cache write (monolith step path).
 kernel void qk_rope_kv(
     device ushort *q [[buffer(0)]],
@@ -25,6 +36,7 @@ kernel void qk_rope_kv(
     constant StepParams &P [[buffer(6)]],
     constant AttnDims &dims [[buffer(7)]],
     device DebugStatus *dbg [[buffer(8)]],
+    device float *kv_f32_side [[buffer(9), function_constant(KV_F32_SIDE_FC)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     if (K_SHAPE_ASSERT && (dims.canvas == 0u || dims.n_q_heads == 0u)) {
@@ -90,6 +102,13 @@ kernel void qk_rope_kv(
                     kv_store(dst, i, head[i]);  // KV cache is f16 (see kv_store)
                 }
             }
+            if (KV_F32_SIDE && kv_write) {
+                device float *sd = kv_f32_side
+                    + (ulong)kv_slot_of(L, pos) * nkv * hd * 2u + hh * hd;
+                for (uint i = 0u; i < hd; ++i) {
+                    sd[i] = head[i];
+                }
+            }
             if (L->v_proj != 0ul) {
                 for (uint i = 0u; i < hd; ++i) {
                     arena_store(src, i, head[i]);
@@ -116,6 +135,14 @@ kernel void qk_rope_kv(
                 + (ulong)kv_slot_of(L, pos) * nkv * hd * 2u + (ulong)nkv * hd + hh * hd;
             for (uint i = 0u; i < hd; ++i) {
                 kv_store(dst, i, arena_load(src, i) * inv);  // KV cache is f16
+            }
+        }
+        if (KV_F32_SIDE && kv_write) {
+            device float *sd = kv_f32_side
+                + (ulong)kv_slot_of(L, pos) * nkv * hd * 2u
+                + (ulong)nkv * hd + hh * hd;
+            for (uint i = 0u; i < hd; ++i) {
+                sd[i] = arena_load(src, i) * inv;
             }
         }
     }

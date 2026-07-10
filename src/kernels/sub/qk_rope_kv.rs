@@ -285,6 +285,26 @@ pub fn pipeline_for_kv(
     ctx.compile_subkernel_ex(SHADER, ENTRY, variant, fmt.label(), &[], &uints)
 }
 
+/// E14 prefill variant (FC30): sliding layers also write post-RoPE K /
+/// normed V into the f32 side ring (buffer 9).
+#[cfg(target_os = "macos")]
+pub fn pipeline_for_kv_side(
+    ctx: &crate::metal::device::MetalContext,
+    variant: KernelVariant,
+    fmt: crate::kernels::sub::kv_quant::KvFormat,
+) -> Result<crate::metal::device::ComputePipeline, Error> {
+    let uints = [crate::kernels::sub::variant::FcUInt {
+        index: 4,
+        value: fmt.code(),
+    }];
+    let bools = [crate::kernels::sub::variant::FcBool {
+        index: 30,
+        value: true,
+    }];
+    let label = format!("{}_side", fmt.label());
+    ctx.compile_subkernel_ex(SHADER, ENTRY, variant, &label, &bools, &uints)
+}
+
 #[cfg(target_os = "macos")]
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,

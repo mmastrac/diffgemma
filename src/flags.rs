@@ -541,6 +541,18 @@ pub fn prefill_f16_enabled() -> bool {
     on_if_one("DGQ_PREFILL_F16")
 }
 
+/// E14: during fast prefill, sliding layers write/read K/V through an f32
+/// side ring (window-sized, ~840 MB constant) instead of reading the f16
+/// monolithic cache — kills the chunk-boundary rounding that compounds
+/// ~p/256 hops through the causal chain and destroys long-prompt
+/// comprehension (task #64/#67; fp16-arena and ring-uncap disproofs
+/// isolated the mechanism). Full layers and denoise are untouched.
+/// Requires the MMA prefill attention (default); the scalar fallback has no
+/// side variant and simply keeps the old behavior.
+pub fn prefill_kv_f32_enabled() -> bool {
+    on_if_one("DGQ_PREFILL_KV_F32")
+}
+
 pub fn fast_prefill_max_tokens() -> usize {
     std::env::var("DGQ_FAST_PREFILL_MAX")
         .ok()

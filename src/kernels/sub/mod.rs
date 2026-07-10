@@ -35,6 +35,7 @@ pub mod gqa_attention;
 pub mod hadamard;
 pub mod half_scale;
 pub mod half_to_f32;
+pub mod kv_f32_side_hydrate;
 pub mod kv_quant;
 pub mod logit_rowstats;
 pub mod manifest;
