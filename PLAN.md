@@ -69,7 +69,20 @@ over weight bytes even with per-block re-reads), so byte-cutting can't win;
 further prefill MoE gains need higher GEMM TF/s (fragment-tile class). See
 agent memory `long-context-100k`.
 
-## Long-prompt correctness (2026-07-10 — fixed by cap; fp16 stream is the real fix)
+## Long-prompt correctness (2026-07-10 — ROOT CAUSE FIXED: spurious encoder RmsNormHidden; cap raise pending gate)
+
+**FINAL RESOLUTION (later on 2026-07-10, supersedes item 2 below):** the
+"bf16 accumulation" theory was wrong. The fast prefill applied the DENOISE
+preamble's no-scale RMSNorm to the embedded hidden; the reference encoder
+has no such norm. Scale-invariance through input_layernorm kept layer-0
+K/V engine-exact (which hid it), while the residual stream carried a
+per-token rescale → systematic MoE route flips at every length → collapse
+past ~2.5k. Fixed by removing `RmsNormHidden` from the two prefill
+encoders (denoise keeps it — parity-validated there). Doc-QA grounded at
+3.2k/4.2k/6.6k on the plain fast path; 5.9k tokens prefill in 17 s. En
+route, DISPROVEN with machinery kept opt-in: fp16 arena (E11), f32 side
+KV (E14), ring uncap; plus the `DGQ_KV_NOISE` sensitivity anchor (engine
++1% KV noise stays correct). Historical account below.
 
 Field incident: long agentic turns at 100k ctx collapsed into newline soup.
 Root-caused (task #64) to the FAST QUANTIZED PREFILL, two stacked defects:
