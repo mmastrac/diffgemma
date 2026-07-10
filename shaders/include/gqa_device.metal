@@ -66,6 +66,38 @@ inline bool gqa_masked(
     return masked;
 }
 
+/// Conservative [lo, hi) bounds on possibly-unmasked key indices for query
+/// `qi`. Keys outside contribute EXACTLY nothing to the softmax: their weight
+/// is exp(mask_neg - max) which underflows to +0.0 (mask_neg = -1e30), and the
+/// running max is never set by a masked key (the causal self-key is always in
+/// range) — so skipping them is bit-identical to scanning [0, total_kv).
+///
+/// CausalSliding (prefill): pos == index, exact causal + window range.
+/// EncoderExtend (chunked extend): prefix keys sit at pos == ki; those below
+/// the query's window start are masked for this query (query positions are
+/// all >= any prefix pos). Suffix keys (<= one canvas chunk) keep the per-key
+/// mask. DecoderBitmap: no clamp (arbitrary mask).
+inline uint2 gqa_ki_bounds(
+    constant GqaParams &p,
+    uint qi,
+    device const long *positions
+) {
+    if (p.mask_kind == MASK_CAUSAL_SLIDING) {
+        uint hi = min(qi + 1u, p.total_kv);
+        uint lo = 0u;
+        if (p.sliding_window > 0u && qi + 1u > p.sliding_window) {
+            lo = qi + 1u - p.sliding_window;
+        }
+        return uint2(lo, hi);
+    }
+    if (p.mask_kind == MASK_ENCODER_EXTEND && p.sliding_window > 0u) {
+        long start = positions[qi] - (long)p.sliding_window + 1;
+        uint lo = (start > 0) ? min((uint)start, p.kv_cache_len) : 0u;
+        return uint2(lo, p.total_kv);
+    }
+    return uint2(0u, p.total_kv);
+}
+
 inline float gqa_score(
     constant GqaParams &p,
     device const float *q,

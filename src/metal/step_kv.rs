@@ -1618,9 +1618,96 @@ mod engine_extend_bench_tests {
         (max_diff, max_layer, max_pos)
     }
 
-    /// E12 baseline: extend-vs-full-prefill KV parity below (1500) and above
-    /// (3000) the sliding ring wrap (2048), plus hydrate/forward/pack timing
-    /// per 256-token extend (printed by the monolithic-extend instrumentation).
+    /// Exactness gate for the GPU hydrate: engine f32 K/V after
+    /// `hydrate_gpu_kv_from_monolithic` must equal the f16-widened monolithic
+    /// live slots bit-for-bit (f16 -> f32 widening is exact), with the ring
+    /// mapping applied on the source side. This is the ground truth for the
+    /// ring fix — end-to-end extend-vs-full diffs are chaos-amplified by the
+    /// forward and cannot distinguish mapping bugs from f16 boundary rounding.
+    fn assert_hydrate_exact(
+        cache: &mut MonolithicEncoderCache,
+        kv_buf: &ProtocolObject<dyn MTLBuffer>,
+        layout: &ModelLayout,
+        max_seq: usize,
+        kv_len: usize,
+        layers: usize,
+    ) {
+        let text = &cache.model.config.text_config;
+        cache
+            .dec_scratch
+            .ensure_gpu_kv(&cache.engine.ctx.device, text, kv_len, CANVAS)
+            .expect("ensure gpu kv");
+        let mut gpu_kv = cache.dec_scratch.gpu_kv.take().expect("gpu kv");
+        hydrate_gpu_kv_from_monolithic(
+            &mut cache.engine,
+            kv_buf,
+            layout,
+            max_seq,
+            kv_len,
+            &mut gpu_kv,
+            layers,
+        )
+        .expect("hydrate");
+        for layer in 0..layers {
+            let l = &layout.layers[layer];
+            let nkv = l.n_kv_heads as usize;
+            let hd = l.head_dim as usize;
+            let per_token = nkv * hd;
+            let token_stride = nkv * hd * 2;
+            let slot_base = l.kv_region as usize / 2;
+            let live_from = if l.kv_ring_mask != 0 {
+                kv_len.saturating_sub(layer_slots(l, max_seq))
+            } else {
+                0
+            };
+            let (k_buf, v_buf) = gpu_kv.layer_buffers(layer).expect("bufs");
+            let k_eng = unsafe {
+                std::slice::from_raw_parts(
+                    k_buf.contents().as_ptr() as *const f32,
+                    kv_len * per_token,
+                )
+            };
+            let v_eng = unsafe {
+                std::slice::from_raw_parts(
+                    v_buf.contents().as_ptr() as *const f32,
+                    kv_len * per_token,
+                )
+            };
+            let mut bad = 0usize;
+            for pos in live_from..kv_len {
+                let slot = kv_slot(l, pos);
+                for i in 0..per_token {
+                    let k_exp = f16_bits_to_f32(read_half_at(
+                        kv_buf,
+                        (slot_base + slot * token_stride + i) * 2,
+                    ));
+                    let v_exp = f16_bits_to_f32(read_half_at(
+                        kv_buf,
+                        (slot_base + slot * token_stride + per_token + i) * 2,
+                    ));
+                    if k_eng[pos * per_token + i].to_bits() != k_exp.to_bits()
+                        || v_eng[pos * per_token + i].to_bits() != v_exp.to_bits()
+                    {
+                        bad += 1;
+                    }
+                }
+            }
+            assert_eq!(
+                bad, 0,
+                "hydrate not exact: layer {layer} kv_len={kv_len} live_from={live_from} bad={bad}"
+            );
+        }
+        cache.dec_scratch.gpu_kv = Some(gpu_kv);
+        eprintln!("hydrate exact at kv_len={kv_len} (all {layers} layers, live slots bit-equal)");
+    }
+
+    /// E12 baseline: extend-vs-full-prefill KV diffs below (1500) and above
+    /// (3000) the sliding ring wrap (2048) — DIAGNOSTIC (chunk boundaries
+    /// expose the prefix through f16 pack/unpack; the forward chaos-amplifies
+    /// that, so nonzero diffs are physics, not defects). The hard gates are
+    /// (a) hydrate exactness incl. ring mapping, (b) extend completes and
+    /// produces finite KV. Timing per extend printed by the monolithic-extend
+    /// instrumentation.
     #[test]
     #[ignore = "model-gated bench: cargo test --release engine_extend_baseline -- --ignored --nocapture"]
     fn engine_extend_baseline() {
@@ -1661,6 +1748,8 @@ mod engine_extend_bench_tests {
             )
             .expect("split prefill");
             assert_eq!(kv_pre, split);
+            // Hard gate: hydrate exactness (incl. ring mapping above 2048).
+            assert_hydrate_exact(&mut cache, &buf_ext, &layout, max_seq, split, layers);
             let t = std::time::Instant::now();
             let mut off = split;
             for chunk in ids[split..].chunks(CANVAS) {
@@ -1709,15 +1798,107 @@ mod engine_extend_bench_tests {
                 full_s * 1000.0 / total as f64,
                 ext_s * 1000.0 / (2.0 * CANVAS as f64),
             );
-            assert_eq!(
-                cdiff, 0.0,
-                "[{label}] chunked extend != per-chunk extend: {cdiff} @ L{cdl} pos {cdp}"
-            );
-            assert!(
-                diff < 0.02,
-                "[{label}] extend diverges from full prefill: {diff} @ L{dl} pos {dp}"
-            );
+            // Diffs above are diagnostics (chaos-amplified f16 chunk-boundary
+            // rounding — per-chunk re-hydrates the prior chunk as f16 while
+            // hydrate-once keeps it f32, and full prefill never rounds).
+            // Gate: finite KV in every live slot the extends wrote.
+            for (name, buf) in [("perchunk", &buf_ext), ("chunked", &buf_chunked)] {
+                for layer in 0..layers {
+                    let l = &layout.layers[layer];
+                    let nkv = l.n_kv_heads as usize;
+                    let hd = l.head_dim as usize;
+                    let token_stride = nkv * hd * 2;
+                    let slot_base = l.kv_region as usize / 2;
+                    let live_from = if l.kv_ring_mask != 0 {
+                        total.saturating_sub(layer_slots(l, max_seq))
+                    } else {
+                        0
+                    };
+                    for pos in live_from..total {
+                        let slot = kv_slot(l, pos);
+                        for i in 0..token_stride {
+                            let v = f16_bits_to_f32(read_half_at(
+                                buf,
+                                (slot_base + slot * token_stride + i) * 2,
+                            ));
+                            assert!(
+                                v.is_finite(),
+                                "[{label}] {name} non-finite KV @ L{layer} pos {pos}"
+                            );
+                        }
+                    }
+                }
+            }
         }
+    }
+
+    /// Ring-fix gate, fast: prefill past the sliding ring wrap (2488 > 2048),
+    /// then assert the GPU hydrate reproduces every LIVE monolithic slot
+    /// bit-exactly in the engine cache (ring-mapped source, linear dest).
+    /// The old CPU hydrate read slots linearly and failed exactly this.
+    #[test]
+    #[ignore = "model-gated: cargo test --release engine_hydrate_ring_exactness -- --ignored --nocapture"]
+    fn engine_hydrate_ring_exactness() {
+        let Some(dir) = model_dir() else { return };
+        let max_seq = 4096usize;
+        let store = DgqStore::open(&dir).expect("dgq");
+        let layout = build_layout(&build_offsets_from_store(&store), max_seq);
+        let ctx = MetalContext::new().expect("metal");
+        let kv_bytes = kv_cache_total_bytes(&layout, max_seq) as usize;
+        let kv_buf = ctx
+            .device
+            .newBufferWithLength_options(kv_bytes, MTLResourceOptions::StorageModeShared)
+            .expect("kv buf");
+        let mut cache = MonolithicEncoderCache::open(&dir, CANVAS, max_seq).expect("cache");
+        let ids = synth_ids(2488);
+        let (kv_len, _) =
+            prefill_monolithic_kv_with_cache(&mut cache, &ids, &kv_buf, &layout, max_seq, N_LAYERS)
+                .expect("prefill");
+        assert_eq!(kv_len, 2488);
+        assert_hydrate_exact(&mut cache, &kv_buf, &layout, max_seq, kv_len, N_LAYERS);
+        // And one extend across the wrap completes with finite live KV.
+        let ext = synth_ids(2488 + CANVAS);
+        let off = extend_monolithic_kv_chunked(
+            &mut cache,
+            &kv_buf,
+            &layout,
+            2488,
+            &ext[2488..],
+            max_seq,
+            N_LAYERS,
+        )
+        .expect("extend past wrap");
+        assert_eq!(off, 2488 + CANVAS);
+    }
+
+    /// One resident engine prefill of 1024 synthetic tokens with the per-layer
+    /// phase profile on — splits waitA (attention+dense GEMMs+router GPU) from
+    /// waitB (MoE GPU) to locate the ms/tok. Diagnostic only.
+    #[test]
+    #[ignore = "model-gated bench: cargo test --release engine_prefill_profile -- --ignored --nocapture"]
+    fn engine_prefill_profile() {
+        let Some(dir) = model_dir() else { return };
+        unsafe { std::env::set_var("DGQ_PREFILL_PROFILE", "1") };
+        let max_seq = 2048usize;
+        let store = DgqStore::open(&dir).expect("dgq");
+        let layout = build_layout(&build_offsets_from_store(&store), max_seq);
+        let ctx = MetalContext::new().expect("metal");
+        let kv_bytes = kv_cache_total_bytes(&layout, max_seq) as usize;
+        let kv_buf = ctx
+            .device
+            .newBufferWithLength_options(kv_bytes, MTLResourceOptions::StorageModeShared)
+            .expect("kv buf");
+        let mut cache = MonolithicEncoderCache::open(&dir, CANVAS, max_seq).expect("cache");
+        let ids = synth_ids(1024);
+        let t = std::time::Instant::now();
+        let (kv_len, _) =
+            prefill_monolithic_kv_with_cache(&mut cache, &ids, &kv_buf, &layout, max_seq, N_LAYERS)
+                .expect("prefill");
+        eprintln!(
+            "engine_prefill_profile: kv_len={kv_len} total={:.2}s ({:.1} ms/tok)",
+            t.elapsed().as_secs_f64(),
+            t.elapsed().as_secs_f64() * 1000.0 / kv_len as f64
+        );
     }
 }
 

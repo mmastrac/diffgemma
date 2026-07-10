@@ -24,14 +24,19 @@ kernel void gqa_attention(
     uint kv_h = h / p.n_groups;
     uint o_off = (qi * p.n_heads + h) * hd;
 
+    // Skip keys that are masked for this query on every pass — bit-identical
+    // (see gqa_ki_bounds) and the difference between O(kv_len) and O(window)
+    // work per query on sliding layers.
+    const uint2 kb = gqa_ki_bounds(p, qi, positions);
+
     float max_val = -1e30f;
-    for (uint ki = 0; ki < p.total_kv; ki++) {
+    for (uint ki = kb.x; ki < kb.y; ki++) {
         float dot = gqa_score(p, q, k, qi, ki, h, decoder_mask, positions);
         max_val = max(max_val, dot);
     }
 
     float sum = 0.0f;
-    for (uint ki = 0; ki < p.total_kv; ki++) {
+    for (uint ki = kb.x; ki < kb.y; ki++) {
         float dot = gqa_score(p, q, k, qi, ki, h, decoder_mask, positions);
         sum += exp(dot - max_val);
     }
@@ -40,7 +45,7 @@ kernel void gqa_attention(
     for (uint d = 0; d < hd; d++) {
         out[o_off + d] = 0.0f;
     }
-    for (uint ki = 0; ki < p.total_kv; ki++) {
+    for (uint ki = kb.x; ki < kb.y; ki++) {
         float dot = gqa_score(p, q, k, qi, ki, h, decoder_mask, positions);
         float w = exp(dot - max_val) * inv_sum;
         uint v_off = ki * kv_dim + kv_h * hd;
