@@ -407,6 +407,20 @@ impl StepGenerateSession {
         &self.kv_valid_tokens
     }
 
+    /// Direct KV buffer + layout access for oracle-style tests that MUTATE
+    /// stored KV between prefill and denoise (E16 fusion replay: rewrite aged
+    /// full-layer rows, then re-enter generation on the doctored cache).
+    /// Diagnostic only — production code goes through the runtime.
+    pub(crate) fn kv_buffer_for_test(
+        &self,
+    ) -> &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer> {
+        self.rt.kvcache()
+    }
+
+    pub(crate) fn layout_for_test(&self) -> &crate::metal::step_kernel::ModelLayout {
+        self.rt.layout()
+    }
+
     /// Make the session's KV safe to reuse for `prompt`. Cross-turn reuse assumes
     /// the cached causal KV is a *prefix* of the next prompt (append-only chat).
     /// A stateless server sees independent prompts that may diverge from — or be

@@ -2213,6 +2213,341 @@ mod engine_extend_bench_tests {
         }
     }
 
+    /// E16-M0b (token fusion): how MERGEABLE are neighboring full-layer KV
+    /// rows? Token fusion (CaM/KVMerger/Compressive-Transformer class) would
+    /// coalesce aged rows of the 5 FULL layers (the only long-range memory =
+    /// all the KV bytes and the O(kv_len) step cost). Merging by averaging is
+    /// promising iff neighbors are correlated — and structurally they should
+    /// be: proportional RoPE ropes only rot=hd/4 dims, so 75% of every
+    /// full-layer K row is position-independent. Measures adjacent-row and
+    /// block-of-4 cosine (K whole / K roped-dims / K unroped-dims / V), by
+    /// age band, plus the constant-row-norm check (scalar k_norm → rows on a
+    /// sphere). Full layers store linearly (slot == pos at any length), so a
+    /// longer prompt is fine here.
+    #[test]
+    #[ignore = "model-gated: cargo test --release e16_fusion_mergeability_stats -- --ignored --nocapture"]
+    fn e16_fusion_mergeability_stats() {
+        use crate::metal::step_kernel::{StepFinishMode, StepSmokeConfig, build_step_runtime};
+        use crate::tokenizer::Tokenizer;
+        let Some(dir) = model_dir() else { return };
+        let text = std::fs::read_to_string("fixtures/smoketest/longdoc.md").expect("probe fixture");
+        let tok = Tokenizer::load(&dir.join("tokenizer.json")).expect("tokenizer");
+        let mut ids = tok.encode(&text, false);
+        let max_seq = 8192usize;
+        ids.truncate(max_seq - CANVAS - 36);
+        let n = ids.len();
+        let cfg = StepSmokeConfig {
+            layers: N_LAYERS,
+            steps: 1,
+            kv_len: 0,
+            seed: 7,
+            max_seq,
+            finish: StepFinishMode::ForwardOnly,
+            prefill_token_ids: None,
+            no_early_stop: true,
+        };
+        let (mut rt, _) = build_step_runtime(&dir, &cfg).expect("runtime");
+        let kv = rt.prefill_chunks(&ids).expect("fast prefill");
+        assert_eq!(kv, n);
+        let layout = *rt.layout();
+
+        fn cos(a: &[f32], b: &[f32]) -> f64 {
+            let (mut d, mut na, mut nb) = (0f64, 0f64, 0f64);
+            for (&x, &y) in a.iter().zip(b) {
+                d += (x as f64) * (y as f64);
+                na += (x as f64) * (x as f64);
+                nb += (y as f64) * (y as f64);
+            }
+            if na == 0.0 || nb == 0.0 {
+                0.0
+            } else {
+                d / (na * nb).sqrt()
+            }
+        }
+
+        eprintln!("e16-m0b: full-layer KV mergeability ({n} tokens; aged = all but last 2048)");
+        for layer in 0..N_LAYERS {
+            let l = &layout.layers[layer];
+            if l.is_full == 0 {
+                continue;
+            }
+            let nkv = l.n_kv_heads as usize;
+            let hd = l.head_dim as usize;
+            let rot = hd / 4;
+            let half_head = hd / 2;
+            // roped dims = {0..rot/2} ∪ {half_head..half_head+rot/2}
+            let roped: Vec<usize> = (0..rot / 2).chain(half_head..half_head + rot / 2).collect();
+            let unroped: Vec<usize> = (0..hd).filter(|d| !roped.contains(d)).collect();
+            let token_stride = nkv * hd * 2;
+            let slot_base = l.kv_region as usize / 2;
+            // read all K and V rows for this layer: [pos][head][hd]
+            let read_row = |pos: usize, hh: usize, is_v: bool| -> Vec<f32> {
+                let base = slot_base + pos * token_stride + if is_v { nkv * hd } else { 0 };
+                (0..hd)
+                    .map(|d| f16_bits_to_f32(read_half_at(rt.kvcache(), (base + hh * hd + d) * 2)))
+                    .collect()
+            };
+            let sub =
+                |v: &[f32], idx: &[usize]| -> Vec<f32> { idx.iter().map(|&i| v[i]).collect() };
+            let bands: [(usize, usize, &str); 2] = [
+                (0, n.saturating_sub(2048), "aged  "),
+                (n.saturating_sub(2048), n, "recent"),
+            ];
+            for (b0, b1, label) in bands {
+                if b1 - b0 < 8 {
+                    continue;
+                }
+                let (mut ck, mut ckr, mut cku, mut cv, mut c4k, mut c4v) =
+                    (0f64, 0f64, 0f64, 0f64, 0f64, 0f64);
+                let (mut n_adj, mut n_blk) = (0usize, 0usize);
+                let mut norm_sum = 0f64;
+                let mut norm_sq = 0f64;
+                let mut n_norm = 0usize;
+                // sample every head, stride positions by 4 to bound CPU time
+                for hh in 0..nkv {
+                    let mut pos = b0;
+                    while pos + 4 < b1 {
+                        let k: Vec<Vec<f32>> =
+                            (0..4).map(|i| read_row(pos + i, hh, false)).collect();
+                        let v: Vec<Vec<f32>> =
+                            (0..4).map(|i| read_row(pos + i, hh, true)).collect();
+                        ck += cos(&k[0], &k[1]);
+                        ckr += cos(&sub(&k[0], &roped), &sub(&k[1], &roped));
+                        cku += cos(&sub(&k[0], &unroped), &sub(&k[1], &unroped));
+                        cv += cos(&v[0], &v[1]);
+                        n_adj += 1;
+                        // mean pairwise cos within the block of 4
+                        let (mut sk, mut sv, mut np) = (0f64, 0f64, 0usize);
+                        for i in 0..4 {
+                            for j in i + 1..4 {
+                                sk += cos(&k[i], &k[j]);
+                                sv += cos(&v[i], &v[j]);
+                                np += 1;
+                            }
+                        }
+                        c4k += sk / np as f64;
+                        c4v += sv / np as f64;
+                        n_blk += 1;
+                        let nn = k[0]
+                            .iter()
+                            .map(|&x| (x as f64) * (x as f64))
+                            .sum::<f64>()
+                            .sqrt();
+                        norm_sum += nn;
+                        norm_sq += nn * nn;
+                        n_norm += 1;
+                        pos += 16;
+                    }
+                }
+                let m = |s: f64, c: usize| s / c.max(1) as f64;
+                let nm = norm_sum / n_norm.max(1) as f64;
+                let nsd = (norm_sq / n_norm.max(1) as f64 - nm * nm).max(0.0).sqrt();
+                eprintln!(
+                    "  L{layer:02} {label} adjK {:+.3} (roped {:+.3} unroped {:+.3}) adjV {:+.3} | blk4 K {:+.3} V {:+.3} | ‖K‖ {nm:.2}±{nsd:.2}",
+                    m(ck, n_adj),
+                    m(ckr, n_adj),
+                    m(cku, n_adj),
+                    m(cv, n_adj),
+                    m(c4k, n_blk),
+                    m(c4v, n_blk)
+                );
+            }
+        }
+    }
+
+    /// E16-M0c (token fusion ORACLE): quality frontier of count-weighted KV
+    /// fusion with ZERO kernel changes. Trick: prefill normally, then rewrite
+    /// each aged full-layer block of r rows as r DUPLICATES of its mean-K /
+    /// mean-V — duplicated keys contribute r·exp(q·k̄) to the softmax, which
+    /// is EXACTLY the count-weighted merged-attention semantics a real fused
+    /// kernel would implement (and duplicated V̄ gives the right weighted
+    /// average). Then re-enter generation on the doctored cache (restore →
+    /// mutate → generate re-entry skips prefill since kv_valid == prompt) and
+    /// judge the doc_13k ladder question. Faithful to a real M1 including the
+    /// merged-RoPE-position effect (we merge stored post-RoPE rows). Sliding
+    /// layers untouched (they never see aged tokens anyway).
+    #[test]
+    #[ignore = "model-gated: cargo test --release e16_fusion_oracle_replay -- --ignored --nocapture"]
+    fn e16_fusion_oracle_replay() {
+        use crate::chat_template;
+        use crate::config;
+        use crate::kernels::sub::f16::f32_to_f16_bits;
+        use crate::metal::step_generate::{
+            StepGenerateConfig, StepGenerateSession, generate_with_session,
+        };
+        use crate::sample;
+        use crate::tokenizer::Tokenizer;
+        let Some(dir) = model_dir() else { return };
+        let tok = Tokenizer::load(&dir.join("tokenizer.json")).expect("tokenizer");
+        let text = std::fs::read_to_string("fixtures/smoketest/longdoc.md").expect("probe fixture");
+        let doc_ids = tok.encode(&text, false);
+        let excerpt = tok.decode(&doc_ids[..13300]);
+        // Facts at doc depths ~979 ("1085") and ~7716 ("20.25") — DEEP inside
+        // the fused aged region at every grid W (recent window = last 1-2k).
+        // (First run of this oracle asked about facts at ~12.7-13.0k, which sit
+        // INSIDE the protected recent window — all cells passed identically and
+        // proved only that the harness works. Aim questions at fused depths.)
+        let question = "(a) How many seconds did the 105k-token needle prefill take, and (b) \
+                        what is the Metal single-buffer allocation cap in GiB?";
+        let prompt_text =
+            format!("{excerpt}\n\n[end of document]\nAnswer from the document above: {question}");
+        let turns = [chat_template::ChatTurn::user(&prompt_text)];
+        let prompt = chat_template::format_chat_token_ids(
+            &tok,
+            &turns,
+            &chat_template::ChatFormatOptions::default(),
+        )
+        .expect("chat prompt");
+        let n = prompt.len();
+        let max_seq = 16384usize;
+        let sampler = sample::sampler_for_steps(48, false);
+        let mut cfg = StepGenerateConfig::from_generate(7, 512, max_seq, N_LAYERS, sampler, false);
+        cfg.stop_token_ids = config::load_generation_stop_tokens(&dir);
+        let (mut session, _) = StepGenerateSession::open(&dir, &cfg, None).expect("session");
+        session.extend_kv(&prompt).expect("prefill");
+        let snap = session.snapshot_kv();
+        let layout = *session.layout_for_test();
+        eprintln!("e16-oracle: prompt {n} tokens; facts at ~979 / ~7716, aged region = [0, n-W)");
+
+        // Word-run match with digit<->letter splits (mirror of smoke_normalize).
+        fn normalize(s: &str) -> String {
+            let mut out = String::new();
+            let mut prev = 0u8; // 0 space, 1 digit, 2 letter
+            for c in s.chars() {
+                if c.is_alphanumeric() {
+                    let cur = if c.is_ascii_digit() { 1 } else { 2 };
+                    if prev != 0 && prev != cur {
+                        out.push(' ');
+                    }
+                    for lc in c.to_lowercase() {
+                        out.push(lc);
+                    }
+                    prev = cur;
+                } else if prev != 0 {
+                    out.push(' ');
+                    prev = 0;
+                }
+            }
+            out.trim().to_string()
+        }
+        let matches = |reply: &str, k: &str| {
+            format!(" {} ", normalize(reply)).contains(&format!(" {} ", normalize(k)))
+        };
+
+        fn write_half_at(
+            buf: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+            byte_off: usize,
+            bits: u16,
+        ) {
+            use objc2_metal::MTLBuffer as _;
+            unsafe {
+                *(buf.contents().as_ptr() as *mut u8)
+                    .add(byte_off)
+                    .cast::<u16>() = bits;
+            }
+        }
+
+        // Count-weighted fusion via duplication: aged region = [0, n-w); each
+        // block of r rows -> r copies of the block mean (K and V). `renorm`
+        // projects the merged K back onto the layer's K sphere (merged rows
+        // land inside it at cos<1, deflating their logits).
+        let fuse = |session: &StepGenerateSession, w: usize, r: usize, renorm: bool| {
+            let buf = session.kv_buffer_for_test();
+            let aged_end = n.saturating_sub(w);
+            for layer in 0..N_LAYERS {
+                let l = &layout.layers[layer];
+                if l.is_full == 0 {
+                    continue;
+                }
+                let nkv = l.n_kv_heads as usize;
+                let hd = l.head_dim as usize;
+                let token_stride = nkv * hd * 2;
+                let half_base = l.kv_region as usize / 2;
+                let mut b0 = 0usize;
+                while b0 < aged_end {
+                    let b1 = (b0 + r).min(aged_end);
+                    if b1 - b0 >= 2 {
+                        for hh in 0..nkv {
+                            for is_v in [false, true] {
+                                let off = if is_v { nkv * hd } else { 0 };
+                                let mut mean = vec![0f64; hd];
+                                let mut norm_sum = 0f64;
+                                for pos in b0..b1 {
+                                    let base = half_base + pos * token_stride + off + hh * hd;
+                                    let mut sq = 0f64;
+                                    for (d, m) in mean.iter_mut().enumerate() {
+                                        let v = f16_bits_to_f32(read_half_at(buf, (base + d) * 2))
+                                            as f64;
+                                        *m += v;
+                                        sq += v * v;
+                                    }
+                                    norm_sum += sq.sqrt();
+                                }
+                                let cnt = (b1 - b0) as f64;
+                                for m in mean.iter_mut() {
+                                    *m /= cnt;
+                                }
+                                if renorm && !is_v {
+                                    let target = norm_sum / cnt;
+                                    let cur = mean.iter().map(|&x| x * x).sum::<f64>().sqrt();
+                                    if cur > 1e-12 {
+                                        let s = target / cur;
+                                        for m in mean.iter_mut() {
+                                            *m *= s;
+                                        }
+                                    }
+                                }
+                                for pos in b0..b1 {
+                                    let base = half_base + pos * token_stride + off + hh * hd;
+                                    for (d, &m) in mean.iter().enumerate() {
+                                        write_half_at(
+                                            buf,
+                                            (base + d) * 2,
+                                            f32_to_f16_bits(m as f32),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    b0 = b1;
+                }
+            }
+        };
+
+        // (window, ratio, renorm). r=1 = untouched control (validates harness).
+        let cells: [(usize, usize, bool); 6] = [
+            (2048, 1, false),
+            (2048, 2, false),
+            (2048, 4, false),
+            (2048, 4, true),
+            (2048, 8, false),
+            (1024, 4, false),
+        ];
+        for (w, r, renorm) in cells {
+            session.restore_kv(&snap);
+            if r > 1 {
+                fuse(&session, w, r, renorm);
+            }
+            let out =
+                generate_with_session(&mut session, &prompt, &cfg, "e16-oracle").expect("gen");
+            let new_ids = sample::strip_degenerate_token_ids(out.token_ids.get(n..).unwrap_or(&[]));
+            let reply = chat_template::sanitize_model_reply(&tok.decode(&new_ids));
+            let r1 = matches(&reply, "1085");
+            let r2 = matches(&reply, "20.25");
+            let prev = reply
+                .chars()
+                .take(90)
+                .collect::<String>()
+                .replace('\n', " ");
+            eprintln!(
+                "e16-oracle W={w:<5} r={r} renorm={renorm:<5} 1085:{} 20.25:{} | {prev}",
+                if r1 { "PASS" } else { "FAIL" },
+                if r2 { "PASS" } else { "FAIL" },
+            );
+        }
+    }
+
     /// One resident engine prefill of 1024 synthetic tokens with the per-layer
     /// phase profile on — splits waitA (attention+dense GEMMs+router GPU) from
     /// waitB (MoE GPU) to locate the ms/tok. Diagnostic only.
