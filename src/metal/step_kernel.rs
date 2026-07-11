@@ -1,5 +1,17 @@
-//! Monolithic diffgemma denoise-step kernel (parallel smoke path).
-//! See `shaders/monolithic/diffgemma_step.metal` and dispatch schedule at file bottom.
+//! Monolithic diffgemma denoise-step kernel (the production per-step engine).
+//!
+//! Per-step dispatch outline (pipelines specialized by `IS_FULL_LAYER` +
+//! `GEMM_N`/`GEMM_K` function constants; shared device math lives in
+//! `shaders/include/`, entry kernels in `shaders/kernels/`):
+//!   SC preamble: logit_rowstats → sc softembed (sparse/chunked) → embed_gather
+//!     → residual → rmsnorm.
+//!   per layer: rmsnorm → QKV gemm → qk_rope_kv → attention (mma2/mma_full)
+//!     → o_proj gemm → residual → rmsnorm → MLP gate/up/glu/down gemm
+//!     → moe_router + bucket_count/fill → moe_grouped/block_sparse experts
+//!     → moe_scatter_weighted → residual.
+//!   finish: final rmsnorm → lm_head gemm → softcap → sample_rowstats
+//!     → sample_commit → sample_apply → sample_write.
+//! The buffer/struct ABI is authoritative in Rust (`abi.rs`, `arena_layout.rs`).
 
 use crate::config::{ModelConfig, TextConfig};
 use crate::dgq::DgqStore;
@@ -29,8 +41,6 @@ mod step_schedule;
 
 #[path = "arena_liveness.rs"]
 pub(crate) mod arena_liveness;
-
-const STEP_SHADER: &str = shader_include::include_metal!("monolithic/diffgemma_step.metal");
 
 pub const HID: usize = 2816;
 pub const VOCAB: usize = 262144;
@@ -678,7 +688,6 @@ struct StepPipelines {
     memzero: ComputePipeline,
     rmsnorm: ComputePipeline,
     rmsnorm_f32: ComputePipeline,
-    half_to_f32: ComputePipeline,
     gemm_q4: HashMap<(u32, u32), ComputePipeline>,
     /// Tunable Raw pipelines (DGQ_GEMM_TUNABLE), keyed (n,k);
     /// VOCAB shape uses the logits (K_OUT_BF16) variant.
@@ -734,7 +743,6 @@ struct StepPipelines {
     /// Fused-gather gate_up variant, keyed by (n,k,adaptive); built only when
     /// DGQ_MOE_FUSE_GATHER is on. Q4 only (the production MoE format).
     block_sparse_gather: HashMap<(u32, u32, bool), ComputePipeline>,
-    gather_rows: ComputePipeline,
     gather_rows_bf16_to_f32: ComputePipeline,
     gelu_swiglu_gate_up: ComputePipeline,
     moe_scatter_weighted: ComputePipeline,
@@ -1106,7 +1114,6 @@ impl StepPipelines {
                 crate::kernels::sub::rms_norm_rows_tiled::TiledVariant::F32_IN,
                 prod,
             )?,
-            half_to_f32: crate::kernels::sub::half_to_f32::pipeline_for(ctx, prod)?,
             gemm_q4,
             gemm_tunable_raw,
             gemm_tunable_q8,
@@ -1175,7 +1182,6 @@ impl StepPipelines {
             q6_block_grouped,
             nvfp4_block_sparse,
             block_sparse_gather,
-            gather_rows: crate::kernels::sub::gather_rows::pipeline_for(ctx, prod)?,
             gather_rows_bf16_to_f32: crate::kernels::sub::gather_rows_bf16_to_f32::pipeline_for(
                 ctx, prod,
             )?,
@@ -1740,34 +1746,6 @@ impl StepEnc<'_> {
             this.sink_set_buffer(&this.bufs.dummy_dump, 0, 3);
             this.bind_debug_status(4);
         });
-    }
-
-    fn dispatch_convert_1d(
-        &mut self,
-        ps: &ComputePipeline,
-        src: &ProtocolObject<dyn MTLBuffer>,
-        src_off: usize,
-        dst: &ProtocolObject<dyn MTLBuffer>,
-        dst_off: usize,
-        len: usize,
-    ) {
-        self.dispatch_1d_ranged(ps, len, 256, |this, base, chunk| {
-            this.sink_set_buffer(src, src_off, 0);
-            this.sink_set_buffer(dst, dst_off, 1);
-            this.sink_set_bytes(&base, 2);
-            this.sink_set_bytes(&chunk, 3);
-        });
-    }
-
-    fn half_to_f32_buf(&mut self, arena_off: u64, len: usize) {
-        self.dispatch_convert_1d(
-            &self.ps.half_to_f32,
-            &self.bufs.arena,
-            arena_off as usize,
-            &self.bufs.gemm_a,
-            0,
-            len,
-        );
     }
 
     fn gemm_q4(
@@ -2892,38 +2870,6 @@ impl StepEnc<'_> {
             256,
             |this, base, _chunk| {
                 this.sink_set_buffer(&this.bufs.arena, this.arena().moein_off() as usize, 0);
-                this.sink_set_buffer(&this.bufs.route, token_list_off, 1);
-                this.sink_set_buffer(&this.bufs.gemm_b, moe_w_byte_off_a(), 2);
-                this.sink_set_buffer(&this.bufs.dummy_dump, 0, 5);
-                this.sink_set_bytes(&gather_dims, 3);
-                this.sink_set_bytes(&slots, 4);
-                this.sink_set_bytes(&base, 6);
-            },
-        );
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    fn encode_moe_batched_half_to_f32(&mut self) -> Result<(), Error> {
-        let fm = self.forward_m;
-        self.half_to_f32_buf(self.arena().moein_off(), fm * HID);
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    fn encode_moe_batched_gather_rows(&mut self) -> Result<(), Error> {
-        let token_list_off = std::mem::offset_of!(RouteScratch, token_list);
-        let gather_dims = [0u32, HID as u32];
-        // Slot capacity for THIS forward (fm rows x TOP_K); MOE_SLOTS is only
-        // the static plane-offset capacity.
-        let slots = (self.forward_m * TOP_K) as u32;
-        let gather_count = slots as usize * HID;
-        self.dispatch_1d_ranged(
-            &self.ps.gather_rows,
-            gather_count,
-            256,
-            |this, base, _chunk| {
-                this.sink_set_buffer(&this.bufs.gemm_a, 0, 0);
                 this.sink_set_buffer(&this.bufs.route, token_list_off, 1);
                 this.sink_set_buffer(&this.bufs.gemm_b, moe_w_byte_off_a(), 2);
                 this.sink_set_buffer(&this.bufs.dummy_dump, 0, 5);
@@ -5520,7 +5466,6 @@ fn shared_step_pipelines(
         return Ok(pipelines);
     }
 
-    ctx.compile_library(STEP_SHADER)?;
     let pipelines = StepPipelines::new(ctx, variant, fmt)?;
     let leaked: &'static StepPipelines = Box::leak(Box::new(pipelines));
     guard.insert(key, leaked);
@@ -6106,7 +6051,7 @@ pub fn run_embed_row_gpu(
     ))
 }
 
-/// Query heads in the monolithic step-kernel shader (`NQ_HEADS` in diffgemma_step.metal).
+/// Query heads in the monolithic step-kernel shader (`NQ_HEADS`).
 pub const STEP_NQ_HEADS: usize = 16;
 
 #[derive(Debug, Clone)]
