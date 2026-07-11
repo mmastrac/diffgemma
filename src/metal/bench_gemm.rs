@@ -669,9 +669,6 @@ pub fn bench_gemm_tunable_sparse(iters: usize) -> Result<Vec<GemmBenchRow>, Erro
             let buf_c = pool
                 .allocate(&ctx.device, slots * n * 4)
                 .ok_or(Error::Format("sparse bench c"))?;
-            let buf_ref = pool
-                .allocate(&ctx.device, slots * n * 4)
-                .ok_or(Error::Format("sparse bench ref"))?;
             let buf_route = pool
                 .allocate(&ctx.device, std::mem::size_of::<RouteScratch>())
                 .ok_or(Error::Format("sparse bench route"))?;
@@ -702,49 +699,6 @@ pub fn bench_gemm_tunable_sparse(iters: usize) -> Result<Vec<GemmBenchRow>, Erro
                 });
                 blk as u32
             };
-
-            // Legacy reference (production-proven kernel), blocks at 32.
-            {
-                let blocks = write_route(32);
-                let pipe = crate::kernels::sub::gemm_block_sparse::pipeline_for(
-                    &ctx,
-                    n as u32,
-                    k as u32,
-                    crate::kernels::sub::QuantFormat::Q4Affine,
-                )?;
-                let n_tiles = crate::kernels::sub::gemm_common::div_up(
-                    n,
-                    crate::kernels::sub::gemm_common::n_tile(),
-                );
-                let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-                let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
-                enc.setComputePipelineState(&pipe.pipeline);
-                crate::kernels::sub::gemm_block_grouped::bind_gpu_buffers(
-                    &enc,
-                    &buf_a,
-                    &buf_w,
-                    &buf_ref,
-                    &buf_jobs,
-                    &buf_rs,
-                    &buf_route,
-                    N_EXPERTS as u32,
-                );
-                enc.dispatchThreadgroups_threadsPerThreadgroup(
-                    MTLSize {
-                        width: n_tiles,
-                        height: blocks as usize,
-                        depth: 1,
-                    },
-                    MTLSize {
-                        width: crate::kernels::sub::gemm_common::THREADS_PER_TG,
-                        height: 1,
-                        depth: 1,
-                    },
-                );
-                enc.endEncoding();
-                cmd.commit();
-                cmd.waitUntilCompleted();
-            }
 
             for (bm, bn) in [(32usize, 64usize), (32, 128), (64, 64)] {
                 // Wider-than-32 blocks only pay off when an expert spans
@@ -795,34 +749,18 @@ pub fn bench_gemm_tunable_sparse(iters: usize) -> Result<Vec<GemmBenchRow>, Erro
                     Ok(())
                 };
                 dispatch(1)?;
-                let mut mismatches = 0usize;
-                {
-                    let rp = buf_ref.contents().as_ptr() as *const u32;
-                    let cp = buf_c.contents().as_ptr() as *const u32;
-                    for i in 0..(slots * n) {
-                        if unsafe { *rp.add(i) != *cp.add(i) } {
-                            mismatches += 1;
-                        }
-                    }
-                }
                 dispatch(warmup)?;
                 let started = Instant::now();
                 dispatch(iters)?;
                 let rate = gflops(slots, k, n, iters, started.elapsed().as_secs_f64());
-                let bits = if mismatches == 0 {
-                    "BITEXACT".to_string()
-                } else {
-                    format!("MISMATCH x{mismatches}")
-                };
                 rows.push(GemmBenchRow {
                     shape,
-                    label: format!("sparse_{tag}_r{rpe}_{bm}x{bn}/x{iters} [{bits}]"),
+                    label: format!("sparse_{tag}_r{rpe}_{bm}x{bn}/x{iters}"),
                     gflops: rate,
                 });
             }
             pool.release(slots * k * 4, buf_a);
             pool.release(slots * n * 4, buf_c);
-            pool.release(slots * n * 4, buf_ref);
         }
         pool.release(N_EXPERTS * expert_b, buf_w);
     }

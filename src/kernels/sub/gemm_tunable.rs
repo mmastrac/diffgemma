@@ -500,30 +500,9 @@ mod sparse_nvfp4_tests {
     /// Same ragged M-tile boundary coverage as the block_sparse suite.
     const COUNTS: &[usize] = &[1, 6, 8, 9, 16, 17, 31, 33, 40, 0, 100];
 
-    /// Port oracle: `gemm_tunable_sparse` at nvfp4 must be BIT-EXACT vs the
-    /// production-proven `gemm_block_sparse` (same per-output K-accumulation
-    /// chain + `half(e2m1*scale)` dequant + `arena_round_f32` store). Guards the
-    /// nvfp4 branch added when the block_sparse family was retired. NOTE: this
-    /// cross-check depends on gemm_block_sparse; when that kernel is deleted the
-    /// durable oracle below (vs CPU) remains.
-    #[test]
-    fn sparse_nvfp4_bitexact_vs_block_sparse() {
-        let f = grouped_fixture(QuantFormat::NvFp4, 64, 192, COUNTS);
-        let legacy = crate::kernels::sub::gemm_block_sparse::gpu_sparse(&f, false)
-            .expect("legacy block_sparse");
-        let tuned = gpu_sparse_tunable(&f).expect("tunable sparse");
-        assert_eq!(legacy.len(), tuned.len());
-        for (i, (a, b)) in legacy.iter().zip(tuned.iter()).enumerate() {
-            assert_eq!(
-                a.to_bits(),
-                b.to_bits(),
-                "nvfp4 output {i} differs: block_sparse {a} tunable {b}"
-            );
-        }
-    }
-
-    /// Durable independent oracle (survives block_sparse retirement): tunable
-    /// nvfp4 output tracks the grouped CPU reference within quant tolerance.
+    /// Independent oracle: tunable nvfp4 block-sparse output tracks the grouped
+    /// CPU reference within quant tolerance. (The block_sparse bit-exact
+    /// cross-check retired with that kernel.)
     #[test]
     fn sparse_nvfp4_matches_cpu_oracle() {
         let f = grouped_fixture(QuantFormat::NvFp4, 64, 192, COUNTS);

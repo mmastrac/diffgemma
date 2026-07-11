@@ -16,7 +16,6 @@ pub mod gelu;
 pub mod gemm_bf16;
 pub mod gemm_bf16_stacked;
 pub mod gemm_block_grouped;
-pub mod gemm_block_sparse;
 pub mod gemm_block_stacked;
 pub mod gemm_common;
 pub mod gemm_linear_f32;
