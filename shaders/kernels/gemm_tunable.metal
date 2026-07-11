@@ -119,7 +119,14 @@ kernel void gemm_tunable(
 
     const bool is_raw = (K_QUANT_FORMAT == QUANT_RAW);
     const bool is_q8 = (K_QUANT_FORMAT == QUANT_Q8);
-    const ulong rowB = is_raw ? (ulong)K * 2ul : (is_q8 ? q8_row_bytes(K) : q4_row_bytes(K));
+    const bool is_nvfp4 = (K_QUANT_FORMAT == QUANT_NVFP4);
+    const ulong rowB = is_raw
+        ? (ulong)K * 2ul
+        : (is_q8 ? q8_row_bytes(K) : (is_nvfp4 ? nvfp4_row_bytes(K) : q4_row_bytes(K)));
+    // nvfp4: 4-byte f32 global scale header at w_off, body at w_off+4.
+    const ulong body = is_nvfp4 ? w_off + 4ul : w_off;
+    const float nvfp4_gscale =
+        is_nvfp4 ? as_type<float>(*(device const uint *)(blob + w_off)) : 0.0f;
 
     // Steel lane->element coordinates within an 8x8 fragment: this lane owns
     // elements (fm, fn) and (fm, fn+1).
@@ -167,6 +174,13 @@ kernel void gemm_tunable(
                             *((device const char *)(rb + 2u + k0 + w_q + j));
                         Ws[w_r][w_q + j] = half(float(qv) * sq8);
                     }
+                } else if (is_nvfp4) {
+                    // 16-wide nvfp4 groups; range helper decodes by ABSOLUTE
+                    // column (k0 + w_q + i). Bit-identical half(e2m1*scale) to
+                    // gemm_block's dense nvfp4 path.
+                    dequant_nvfp4_tile_half_fused_tg_range(
+                        blob + body + (ulong)gn * rowB, K, k0,
+                        &Ws[w_r][w_q], nvfp4_gscale, k0 + w_q, w_cols);
                 } else {
                     // Vectorized q4 decode: 8 nibbles per assembled u32; same
                     // per-element s*q+mn half math as the scalar helper.
@@ -253,7 +267,10 @@ kernel void gemm_tunable_stacked(
     const uint ltid = lid.x;
 
     const bool is_raw = (K_QUANT_FORMAT == QUANT_RAW);
-    const ulong rowB = is_raw ? (ulong)K * 2ul : q4_row_bytes(K);
+    const bool is_nvfp4 = (K_QUANT_FORMAT == QUANT_NVFP4);
+    const ulong rowB = is_raw
+        ? (ulong)K * 2ul
+        : (is_nvfp4 ? nvfp4_row_bytes(K) : q4_row_bytes(K));
 
     const uint qid = lane / 4u;
     const uint fm = (qid & 4u) + ((lane / 2u) % 4u);
@@ -277,6 +294,11 @@ kernel void gemm_tunable_stacked(
     const uint w_seg = stacked_fc_seg_index(gn);
     const uint w_local_n = stacked_fc_local_n(gn, w_seg);
     const ulong w_base = stacked_fc_w_off(w_seg);
+    // nvfp4: each segment matrix carries a 4-byte f32 global scale header at
+    // its w_base; the row body starts at w_base+4.
+    const float w_gscale =
+        is_nvfp4 ? as_type<float>(*(device const uint *)(blob + w_base)) : 0.0f;
+    const ulong w_body = is_nvfp4 ? w_base + 4ul : w_base;
 
     for (uint k0 = 0u; k0 < K; k0 += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -291,6 +313,10 @@ kernel void gemm_tunable_stacked(
                         *(threadgroup half4 *)(&Ws[w_r][w_q + j]) =
                             half4(as_type<float4>(uint4(u) << 16u));
                     }
+                } else if (is_nvfp4) {
+                    dequant_nvfp4_tile_half_fused_tg_range(
+                        blob + w_body + (ulong)w_local_n * rowB, K, k0,
+                        &Ws[w_r][w_q], w_gscale, k0 + w_q, w_cols);
                 } else {
                     device const uchar *g =
                         blob + w_base + (ulong)w_local_n * rowB + (ulong)(k0 / 32u) * 20ul;

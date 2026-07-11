@@ -278,6 +278,219 @@ pub(crate) fn gpu_sparse_tunable(
     Ok(out)
 }
 
+/// Run the dense `gemm_tunable` kernel on a legacy nvfp4 dense fixture
+/// (x bf16, single weight matrix at w_off=0). Self-contained; used by the
+/// dense nvfp4 port oracle. Returns bf16-decoded outputs.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn gpu_dense_tunable_nvfp4(
+    f: &crate::kernels::sub::gemm_nvfp4::Fixture,
+) -> Result<Vec<f32>, Error> {
+    use crate::kernels::sub::bf16;
+    use crate::metal::buffer::BufferPool;
+    use crate::metal::device::MetalContext;
+    use objc2_metal::{
+        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+        MTLSize,
+    };
+
+    let ctx = MetalContext::new()?;
+    let mut pool = BufferPool::new();
+    let w_nvfp4 = f.w_nvfp4();
+    let buf_x = pool
+        .allocate(&ctx.device, f.m * f.k * 2)
+        .ok_or(Error::Format("alloc x"))?;
+    let buf_y = pool
+        .allocate(&ctx.device, f.m * f.n * 2)
+        .ok_or(Error::Format("alloc y"))?;
+    let buf_w = pool
+        .allocate(&ctx.device, w_nvfp4.len())
+        .ok_or(Error::Format("alloc w"))?;
+    BufferPool::write_bf16(&buf_x, &bf16::f32_slice_to_bf16_bits(&f.x));
+    BufferPool::write_bytes(&buf_w, &w_nvfp4);
+    let pipe = pipeline_for(&ctx, f.n as u32, f.k as u32, QuantFormat::NvFp4)?;
+    let grid = MTLSize {
+        width: f.n.div_ceil(TUNE_BN),
+        height: f.m.div_ceil(TUNE_BM),
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: 128,
+        height: 1,
+        depth: 1,
+    };
+    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+    enc.setComputePipelineState(&pipe.pipeline);
+    crate::kernels::sub::gemm_nvfp4::bind_gpu_buffers(&enc, &buf_x, &buf_y, &buf_w, 0, f.m as u32);
+    enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    enc.endEncoding();
+    cmd.commit();
+    cmd.waitUntilCompleted();
+    let ptr = buf_y.contents().as_ptr() as *const u16;
+    Ok((0..f.out_len())
+        .map(|i| bf16::bf16_bits_to_f32(unsafe { *ptr.add(i) }))
+        .collect())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod stacked_nvfp4_tests {
+    use super::*;
+    use crate::dgq::layout::nvfp4_matrix_bytes;
+    use crate::dgq::nvfp4::quantize_f32_matrix_nvfp4;
+    use crate::kernels::sub::bf16;
+    use crate::kernels::sub::gemm_block_stacked::{self, GemmStackedSeg};
+    use crate::kernels::sub::test_util::ElemFormat;
+    use crate::metal::buffer::BufferPool;
+    use crate::metal::device::MetalContext;
+    use objc2_metal::{
+        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+        MTLSize,
+    };
+
+    /// Re-quantize a stacked fixture's segments as nvfp4 (4-byte f32 gscale
+    /// header + body per segment matrix); returns (blob, gpu segments).
+    fn nvfp4_stacked(
+        f: &gemm_block_stacked::StackedFixture,
+    ) -> (Vec<u8>, Vec<GemmStackedSeg>) {
+        let mut blob = Vec::new();
+        let mut segs = Vec::new();
+        let mut w_off = 0u64;
+        for s in &f.segments {
+            let mut dst = vec![0u8; nvfp4_matrix_bytes(s.n, f.k)];
+            quantize_f32_matrix_nvfp4(&s.w_f32, s.n, f.k, &mut dst);
+            segs.push(GemmStackedSeg {
+                n_cols: s.n as u32,
+                y_col0: s.y_col0 as u32,
+                y_row_cols: s.y_row_cols as u32,
+                _pad: 0,
+                w_off,
+                y_byte_off: s.y_byte_off as u64,
+            });
+            w_off += nvfp4_matrix_bytes(s.n, f.k) as u64;
+            blob.extend_from_slice(&dst);
+        }
+        (blob, segs)
+    }
+
+    /// Port oracle: `gemm_tunable_stacked` at nvfp4 must be BIT-EXACT vs the
+    /// legacy `gemm_block_stacked` nvfp4 path (per-segment gscale header +
+    /// range decode). Covers the qkv (3-seg) and gate/up (2-seg) layouts.
+    #[test]
+    fn stacked_nvfp4_bitexact_vs_gemm_block_stacked() {
+        for fixture_fn in [
+            gemm_block_stacked::gate_up_tiny_fixture as fn(_) -> _,
+            gemm_block_stacked::qkv_tiny_fixture,
+        ] {
+            let f = fixture_fn(ElemFormat::F32);
+            let n_total = f.n_total() as u32;
+            let (blob, segs) = nvfp4_stacked(&f);
+
+            let ctx = MetalContext::new().expect("metal ctx");
+            let mut pool = BufferPool::new();
+            let buf_x = pool.allocate(&ctx.device, f.m * f.k * 2).expect("x");
+            let buf_w = pool.allocate(&ctx.device, blob.len()).expect("w");
+            let buf_leg = pool.allocate(&ctx.device, f.y_bytes()).expect("y_leg");
+            let buf_tun = pool.allocate(&ctx.device, f.y_bytes()).expect("y_tun");
+            BufferPool::write_bf16(&buf_x, &bf16::f32_slice_to_bf16_bits(&f.x));
+            BufferPool::write_bytes(&buf_w, &blob);
+
+            // Legacy gemm_block_stacked (n_tile grid).
+            {
+                let pipe = gemm_block_stacked::pipeline_for(
+                    &ctx,
+                    n_total,
+                    f.k as u32,
+                    QuantFormat::NvFp4,
+                    &segs,
+                )
+                .expect("legacy stacked pipeline");
+                let (grid, tg) =
+                    crate::kernels::sub::gemm_common::dispatch_shape(f.m, f.n_total());
+                let cmd = ctx.queue.commandBuffer().expect("cmd");
+                let enc = cmd.computeCommandEncoder().expect("enc");
+                enc.setComputePipelineState(&pipe.pipeline);
+                gemm_block_stacked::bind_gpu_buffers(&enc, &buf_x, &buf_leg, &buf_w, f.m as u32);
+                enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+                enc.endEncoding();
+                cmd.commit();
+                cmd.waitUntilCompleted();
+            }
+            // Tunable gemm_tunable_stacked (TUNE_BM/BN grid, same buffers).
+            {
+                let pipe = stacked_pipeline_for(&ctx, n_total, f.k as u32, QuantFormat::NvFp4, &segs)
+                    .expect("tunable stacked pipeline");
+                let grid = MTLSize {
+                    width: (n_total as usize).div_ceil(TUNE_BN),
+                    height: f.m.div_ceil(TUNE_BM),
+                    depth: 1,
+                };
+                let tg = MTLSize {
+                    width: 128,
+                    height: 1,
+                    depth: 1,
+                };
+                let cmd = ctx.queue.commandBuffer().expect("cmd");
+                let enc = cmd.computeCommandEncoder().expect("enc");
+                enc.setComputePipelineState(&pipe.pipeline);
+                gemm_block_stacked::bind_gpu_buffers(&enc, &buf_x, &buf_tun, &buf_w, f.m as u32);
+                enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+                enc.endEncoding();
+                cmd.commit();
+                cmd.waitUntilCompleted();
+            }
+
+            let lp = buf_leg.contents().as_ptr() as *const u16;
+            let tp = buf_tun.contents().as_ptr() as *const u16;
+            for i in 0..(f.y_bytes() / 2) {
+                let a = unsafe { *lp.add(i) };
+                let b = unsafe { *tp.add(i) };
+                assert_eq!(a, b, "nvfp4 stacked output {i} differs: legacy {a:#06x} tunable {b:#06x}");
+            }
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod dense_nvfp4_tests {
+    use super::*;
+    use crate::kernels::sub::gemm_nvfp4;
+    use crate::kernels::sub::test_util::{ElemFormat, assert_oracle};
+    use crate::kernels::sub::variant::KernelVariant;
+
+    /// Port oracle: dense `gemm_tunable` at nvfp4 must be BIT-EXACT vs the
+    /// legacy `gemm_block` nvfp4 dense kernel. Guards the is_nvfp4 branch added
+    /// to the dense W-load when gemm_block was retired.
+    #[test]
+    fn dense_nvfp4_bitexact_vs_gemm_block() {
+        for fixture_fn in [
+            gemm_nvfp4::tile_fixture as fn(_) -> _,
+            gemm_nvfp4::gscale_fixture,
+        ] {
+            let f = fixture_fn(ElemFormat::F32);
+            let legacy = gemm_nvfp4::gpu(&f, KernelVariant::PRODUCTION).expect("legacy gemm_block");
+            let tuned = gpu_dense_tunable_nvfp4(&f).expect("tunable dense");
+            assert_eq!(legacy.len(), tuned.len());
+            for (i, (a, b)) in legacy.iter().zip(tuned.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "nvfp4 dense output {i} differs: gemm_block {a} tunable {b}"
+                );
+            }
+        }
+    }
+
+    /// Durable oracle (survives gemm_block retirement): dense tunable nvfp4
+    /// tracks the CPU reference within quant tolerance.
+    #[test]
+    fn dense_nvfp4_matches_cpu_oracle() {
+        let f = gemm_nvfp4::tile_fixture(ElemFormat::F32);
+        let tuned = gpu_dense_tunable_nvfp4(&f).expect("tunable dense");
+        let oracle = gemm_nvfp4::cpu(&f);
+        assert_oracle(&tuned, &oracle, 0.08, 0.999);
+    }
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod sparse_nvfp4_tests {
     use super::*;
