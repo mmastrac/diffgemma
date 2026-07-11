@@ -1053,6 +1053,7 @@ impl StepPipelines {
                 for fmt in [
                     crate::kernels::sub::QuantFormat::Q4Affine,
                     crate::kernels::sub::QuantFormat::Q6,
+                    crate::kernels::sub::QuantFormat::NvFp4,
                 ] {
                     gemm_tunable_sparse.insert(
                         (n, k, false, fmt as u32),
@@ -2748,7 +2749,7 @@ impl StepEnc<'_> {
         let tunable = block_sparse
             && matches!(
                 self.block_profile.format,
-                QuantFormat::Q4Affine | QuantFormat::Q6
+                QuantFormat::Q4Affine | QuantFormat::Q6 | QuantFormat::NvFp4
             )
             && self
                 .ps
