@@ -66,6 +66,9 @@ jobs:
 #       - run: cargo build --release
 #       - name: Spec-seed smoketest gate (17/17)
 #         run: ./target/release/diffgemma-mps smoketest -m "$DGQ_MODEL"
+#       - name: Longctx doc-QA ladder (E13 — comprehension, not needles;
+#         # catches the task #64 class: fast-prefill grounding collapse at length)
+#         run: ./target/release/diffgemma-mps smoketest -m "$DGQ_MODEL" --longctx
 #       - name: Needle retrieval (short)
 #         run: ./target/release/diffgemma-mps ask -m "$DGQ_MODEL" -p "..." # needle probe
 # ---------------------------------------------------------------------------

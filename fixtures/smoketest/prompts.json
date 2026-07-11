@@ -108,5 +108,40 @@
       "prompt": "Summarize the water cycle in two sentences.",
       "max_steps": 13
     }
+  ],
+  "_comment_longctx": "E13 doc-QA ladder (`smoketest --longctx` only; excluded from the default gate). longdoc.md is a FROZEN snapshot of the repo docs (2026-07-10) — never regenerate it from the live docs; the require keywords are pinned to this snapshot. Each rung asks about facts whose only in-window occurrence sits near the truncation edge, so a grounded answer proves comprehension at that depth. Needle probes provably miss this failure class (task #64).",
+  "longctx": [
+    {
+      "id": "doc_3k",
+      "doc": "longdoc.md",
+      "doc_tokens": 3300,
+      "question": "(a) Which StepParams field suppresses pad-row KV cache stores during prefill, and (b) what SPARSE_BN value shipped as the default?",
+      "require": ["kv_write_end", "128"],
+      "max_steps": 60
+    },
+    {
+      "id": "doc_8k",
+      "doc": "longdoc.md",
+      "doc_tokens": 8192,
+      "question": "(a) How many seconds did the 105k-token needle prefill take, and (b) what is the Metal single-buffer allocation cap in GiB?",
+      "require": ["1085", "20.25"],
+      "max_steps": 60
+    },
+    {
+      "id": "doc_13k",
+      "doc": "longdoc.md",
+      "doc_tokens": 13300,
+      "question": "(a) What TF/s figure did the 64x64x32 partial-win GEMM tile reach at the MoE shape 2048x704x2816, and (b) what is the name of the bench-only prototype kernel used in the GEMM headroom hunt?",
+      "require": ["3.07", "gemm_block_sq"],
+      "max_steps": 60
+    },
+    {
+      "id": "doc_20k",
+      "doc": "longdoc.md",
+      "doc_tokens": 20600,
+      "question": "(a) What per-step time (in seconds) does the engine achieve on M3 Pro according to the opening status summary, and (b) which model component does the roadmap recommend deferring to v2?",
+      "require": ["0.93", "vision"],
+      "max_steps": 60
+    }
   ]
 }

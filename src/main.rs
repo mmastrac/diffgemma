@@ -316,6 +316,8 @@ enum Command {
         /// Repeat the whole (filtered) prompt sequence N times in ONE session
         /// (no re-warmup) — surfaces reset_kv session-state carryover.
         repeat: usize,
+        /// Run ONLY the long-context doc-QA tier (bigger session; E13).
+        longctx: bool,
     },
 }
 
@@ -760,6 +762,7 @@ fn main() -> ExitCode {
             max_layers,
             filter,
             repeat,
+            longctx,
         } => run_smoketest_cmd(
             &cli.model_dir,
             prompts_path.as_deref(),
@@ -769,6 +772,7 @@ fn main() -> ExitCode {
             cli.raw_prompt,
             filter.as_deref(),
             repeat,
+            longctx,
         ),
         Command::Quantize { output, profile } => run_quantize(&cli.model_dir, &output, &profile),
         Command::Tokenize(text) => run_tokenize(&cli.model_dir, &text, cli.raw_prompt),
@@ -2711,6 +2715,7 @@ fn parse_cli() -> Cli {
     let mut golden_name: Option<String> = None;
     let mut smoke_filter: Option<String> = None;
     let mut smoke_repeat: usize = 1;
+    let mut smoke_longctx = false;
     let mut compare_cpu = false;
     let mut write_golden: Option<String> = None;
     let mut write_trace: Option<PathBuf> = None;
@@ -2859,6 +2864,7 @@ fn parse_cli() -> Cli {
                     });
                 }
             }
+            "--longctx" => smoke_longctx = true,
             "--size" => {
                 if let Some(v) = args.next() {
                     gemm_size = v.parse().unwrap_or_else(|_| {
@@ -3103,6 +3109,7 @@ fn parse_cli() -> Cli {
             max_layers: parity_layers,
             filter: smoke_filter.clone(),
             repeat: smoke_repeat.max(1),
+            longctx: smoke_longctx,
         },
         Some("tokenize") => {
             let text = positional.get(1).cloned().unwrap_or_else(|| {
@@ -4029,6 +4036,13 @@ struct SmoketestSpec {
     convergence: Vec<SmokeConvergence>,
     #[serde(default)]
     adherence: Vec<SmokeAdherence>,
+    /// Long-context doc-QA ladder (E13; `smoketest --longctx` only). Judges
+    /// grounded COMPREHENSION of a real document at increasing prompt lengths
+    /// — the failure class needle probes provably miss (task #64: retrieval
+    /// rides a few sharp attention edges and stayed EXACT while grounded
+    /// answers collapsed into fluent hallucination).
+    #[serde(default)]
+    longctx: Vec<SmokeLongCtx>,
     /// Gate baseline seed. Trajectory-reshuffling accepted changes re-baseline
     /// the gate here (single-seed pass/fail is arbitrary for such changes; the
     /// multi-seed aggregate is the real quality metric — see working notes).
@@ -4046,6 +4060,24 @@ struct SmokeConvergence {
     max_steps: usize,
 }
 
+/// Long-context doc-QA probe: a fixture document truncated to `doc_tokens`
+/// prompt tokens + a question about facts planted near the truncation edge
+/// (in-window-unique, so a grounded answer proves the model READ that depth).
+#[cfg(target_os = "macos")]
+#[derive(serde::Deserialize)]
+struct SmokeLongCtx {
+    id: String,
+    /// Fixture document path, relative to the spec file's directory. Frozen
+    /// snapshot — do NOT regenerate from the live repo docs (answers drift).
+    doc: String,
+    /// Truncate the document to this many tokens before the question.
+    doc_tokens: usize,
+    question: String,
+    /// EVERY entry must appear in the reply (normalized word-run match).
+    require: Vec<String>,
+    max_steps: usize,
+}
+
 /// Prompt with exactly one correct answer; gated on both answer + convergence.
 #[cfg(target_os = "macos")]
 #[derive(serde::Deserialize)]
@@ -4060,19 +4092,37 @@ struct SmokeAdherence {
 }
 
 /// Lowercase, alphanumeric-only, single-spaced — for word-boundary matching.
+/// Digit<->letter transitions also split ("1085s" -> "1085 s"), so a numeric
+/// pattern matches a reply with a unit suffix. Both sides of a match are
+/// normalized identically, so patterns like "h2o" keep matching ("h 2 o" on
+/// both sides).
 #[cfg(target_os = "macos")]
 fn smoke_normalize(s: &str) -> String {
+    #[derive(PartialEq, Clone, Copy)]
+    enum Class {
+        Space,
+        Digit,
+        Letter,
+    }
     let mut out = String::new();
-    let mut prev_space = true;
+    let mut prev = Class::Space;
     for c in s.chars() {
         if c.is_alphanumeric() {
+            let cur = if c.is_ascii_digit() {
+                Class::Digit
+            } else {
+                Class::Letter
+            };
+            if prev != Class::Space && prev != cur {
+                out.push(' ');
+            }
             for lc in c.to_lowercase() {
                 out.push(lc);
             }
-            prev_space = false;
-        } else if !prev_space {
+            prev = cur;
+        } else if prev != Class::Space {
             out.push(' ');
-            prev_space = true;
+            prev = Class::Space;
         }
     }
     out.trim().to_string()
@@ -4103,6 +4153,7 @@ fn run_smoketest_cmd(
     raw_prompt: bool,
     filter: Option<&str>,
     repeat: usize,
+    longctx: bool,
 ) -> ExitCode {
     use metal::{StepGenerateConfig, StepGenerateSession, generate_with_session};
 
@@ -4134,12 +4185,22 @@ fn run_smoketest_cmd(
             .retain(|p| p.id.to_ascii_lowercase().contains(&pat));
         spec.convergence
             .retain(|p| p.id.to_ascii_lowercase().contains(&pat));
-        let kept = spec.adherence.len() + spec.convergence.len();
+        spec.longctx
+            .retain(|p| p.id.to_ascii_lowercase().contains(&pat));
+        let kept = if longctx {
+            spec.longctx.len()
+        } else {
+            spec.adherence.len() + spec.convergence.len()
+        };
         if kept == 0 {
             eprintln!("smoketest: no prompts match filter {pat:?}");
             return ExitCode::FAILURE;
         }
         eprintln!("smoketest: filter {pat:?} -> {kept} prompt(s)");
+    }
+    if longctx && spec.longctx.is_empty() {
+        eprintln!("smoketest: --longctx but the spec has no longctx probes");
+        return ExitCode::FAILURE;
     }
 
     // Gate baseline seed: the spec pins it (re-baselined with accepted
@@ -4164,10 +4225,17 @@ fn run_smoketest_cmd(
 
     const SMOKE_MAX_SEQ: usize = 2048;
     const SMOKE_GEN_CAP: usize = 512; // ~2 canvas blocks; bounds gate time + KV
+    // Longctx tier needs headroom for the deepest ladder rung (~20.6k doc).
+    const LONGCTX_MAX_SEQ: usize = 24576;
+    let smoke_max_seq = if longctx {
+        LONGCTX_MAX_SEQ
+    } else {
+        SMOKE_MAX_SEQ
+    };
     let stop_token_ids = config::load_generation_stop_tokens(model_dir);
     let sampler = sample::sampler_for_steps(steps, false);
     let mut step_cfg =
-        StepGenerateConfig::from_generate(seed, 1024, SMOKE_MAX_SEQ, layers, sampler, false);
+        StepGenerateConfig::from_generate(seed, 1024, smoke_max_seq, layers, sampler, false);
     step_cfg.degenerate_reply_check =
         chat_template::empty_reply_check(model_dir, stop_token_ids.clone());
     step_cfg.stop_token_ids = stop_token_ids;
@@ -4202,7 +4270,7 @@ fn run_smoketest_cmd(
         let prompt_len = prompt.len();
         // Bound generation (and thus time + KV) — a gate doesn't need essays.
         step_cfg.max_new_tokens =
-            SMOKE_GEN_CAP.min(SMOKE_MAX_SEQ.saturating_sub(prompt_len).max(1));
+            SMOKE_GEN_CAP.min(smoke_max_seq.saturating_sub(prompt_len).max(1));
         let out = generate_with_session(&mut session, &prompt, &step_cfg, "smoketest")?;
         let new_ids =
             sample::strip_degenerate_token_ids(out.token_ids.get(prompt_len..).unwrap_or(&[]));
@@ -4228,12 +4296,82 @@ fn run_smoketest_cmd(
         model_dir.display()
     );
 
+    // Longctx doc token ids, cached per fixture path (each rung re-truncates).
+    let mut doc_ids_cache: std::collections::HashMap<String, Vec<u32>> = Default::default();
+    let spec_dir = path.parent().unwrap_or(std::path::Path::new("."));
+
     for iter in 0..repeat {
         if repeat > 1 {
             println!(
                 "\n===== iteration {}/{repeat} (same session, no re-warmup) =====",
                 iter + 1
             );
+        }
+        // `--longctx` runs ONLY the doc-QA ladder (its session budget differs);
+        // the default gate runs only adherence+convergence and stays fast.
+        if longctx {
+            println!("\n[longctx doc-QA]");
+            for p in &spec.longctx {
+                total += 1;
+                if !doc_ids_cache.contains_key(&p.doc) {
+                    let doc_path = spec_dir.join(&p.doc);
+                    match std::fs::read_to_string(&doc_path) {
+                        Ok(text) => {
+                            doc_ids_cache.insert(p.doc.clone(), tokenizer.encode(&text, false));
+                        }
+                        Err(err) => {
+                            println!("  {:<22} ERROR  read {}: {err}", p.id, doc_path.display());
+                            failures.push(p.id.clone());
+                            continue;
+                        }
+                    }
+                }
+                let ids = &doc_ids_cache[&p.doc];
+                let n = p.doc_tokens.min(ids.len());
+                let excerpt = tokenizer.decode(&ids[..n]);
+                let prompt_text = format!(
+                    "{excerpt}\n\n[end of document]\nAnswer from the document above: {q}",
+                    q = p.question
+                );
+                let (st, reply) = match run_one(&prompt_text) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        println!("  {:<22} ERROR  {err}", p.id);
+                        failures.push(p.id.clone());
+                        continue;
+                    }
+                };
+                let missing: Vec<&str> = p
+                    .require
+                    .iter()
+                    .filter(|k| !smoke_answer_matches(&reply, k, &[]))
+                    .map(String::as_str)
+                    .collect();
+                let conv_ok = st <= p.max_steps;
+                let ok = missing.is_empty() && conv_ok;
+                if ok {
+                    passed += 1;
+                } else {
+                    failures.push(p.id.clone());
+                }
+                let mark = if ok { "PASS" } else { "FAIL" };
+                let af = if missing.is_empty() {
+                    "ok".to_string()
+                } else {
+                    format!("MISSING {missing:?}")
+                };
+                let max = p.max_steps;
+                let prev = reply
+                    .chars()
+                    .take(72)
+                    .collect::<String>()
+                    .replace('\n', " ");
+                println!(
+                    "  {id:<22} {mark:<4} doc {n:>5}tok steps {st:>3}/{max:<3} {af}  | {prev}",
+                    id = p.id
+                );
+            }
+            continue;
         }
         if !spec.adherence.is_empty() {
             println!("\n[adherence]");
