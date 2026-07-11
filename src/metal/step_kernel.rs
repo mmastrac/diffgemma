@@ -80,7 +80,7 @@ pub use crate::flags::{
     FAST_PREFILL_MIN_TOKENS, attn_mma_enabled, attn_mma_full_enabled, attn_window_enabled,
     denoise_parity_log_enabled, denoise_parity_log_positions, denoiser_argmax_enabled,
     final_entropy_log_enabled, freeze_enabled, fused_algebra_enabled, fused_gate_up_enabled,
-    fused_qkv_enabled, gemm_tunable_enabled, logits_finite_check_enabled,
+    fused_qkv_enabled, logits_finite_check_enabled,
     logits_finite_sample_count, moe_fuse_gather_enabled, partial_lm_head_enabled,
     prefill_batch_enabled, router_gemm_enabled,
     sc_sparse_enabled, should_fast_prefill, step_text_log_enabled, trace_entropy_enabled,
@@ -688,12 +688,15 @@ struct StepPipelines {
     memzero: ComputePipeline,
     rmsnorm: ComputePipeline,
     rmsnorm_f32: ComputePipeline,
-    gemm_q4: HashMap<(u32, u32), ComputePipeline>,
-    /// Tunable Raw pipelines (DGQ_GEMM_TUNABLE), keyed (n,k);
-    /// VOCAB shape uses the logits (K_OUT_BF16) variant.
+    /// Tunable Raw (bf16-weight) dense pipelines, keyed (n,k); VOCAB shape uses
+    /// the logits (K_OUT_BF16) variant. Sole dense path for the bf16 profile.
     gemm_tunable_raw: HashMap<(u32, u32), ComputePipeline>,
-    /// Tunable q8 pipelines (DGQ_GEMM_TUNABLE), keyed (n,k); VOCAB = logits.
+    /// Tunable q8 dense pipelines, keyed (n,k); VOCAB = logits variant.
     gemm_tunable_q8: HashMap<(u32, u32), ComputePipeline>,
+    /// Tunable q4 / nvfp4 dense pipelines (attention/dense-FFN weights on a
+    /// block-quantized checkpoint), keyed (n,k).
+    gemm_tunable_q4: HashMap<(u32, u32), ComputePipeline>,
+    gemm_tunable_nvfp4: HashMap<(u32, u32), ComputePipeline>,
     /// Tunable block-sparse MoE pipelines (DGQ_GEMM_TUNABLE, q4/q6 experts),
     /// keyed (n, k, gather, format as u32).
     gemm_tunable_sparse: HashMap<(u32, u32, bool, u32), ComputePipeline>,
@@ -703,10 +706,6 @@ struct StepPipelines {
     /// TUNE_BM the wide sparse pipelines were compiled with (the block
     /// height moe_bucket_fill phase 1 must build during batched prefill).
     sparse_wide_bm: u32,
-    gemm_nvfp4: HashMap<(u32, u32), ComputePipeline>,
-    gemm_q8: HashMap<(u32, u32), ComputePipeline>,
-    gemm_bf16: HashMap<(u32, u32), ComputePipeline>,
-    gemm_q8_logits: HashMap<(u32, u32), ComputePipeline>,
     gemm_q8_rowk: HashMap<(u32, u32), ComputePipeline>,
     gemm_q8_rowk_xfp16: HashMap<(u32, u32), ComputePipeline>,
     /// f32-accumulate variant of `gemm_q8_rowk` for chunked SC softembed (avoids per-chunk bf16 round).
@@ -765,16 +764,13 @@ impl StepPipelines {
         variant: crate::kernels::sub::variant::KernelVariant,
         fmt: crate::kernels::sub::kv_quant::KvFormat,
     ) -> Result<Self, Error> {
-        let mut gemm_q4 = HashMap::new();
         let mut gemm_tunable_raw = HashMap::new();
         let mut gemm_tunable_q8 = HashMap::new();
+        let mut gemm_tunable_q4 = HashMap::new();
+        let mut gemm_tunable_nvfp4 = HashMap::new();
         let mut gemm_tunable_sparse = HashMap::new();
         let mut gemm_tunable_sparse_wide = HashMap::new();
         let sparse_wide_bm = crate::flags::moe_prefill_block_m();
-        let mut gemm_nvfp4 = HashMap::new();
-        let mut gemm_q8 = HashMap::new();
-        let mut gemm_bf16 = HashMap::new();
-        let mut gemm_q8_logits = HashMap::new();
         let mut gemm_q8_rowk = HashMap::new();
         let mut gemm_q8_rowk_xfp16 = HashMap::new();
         for &(n, k) in &[
@@ -790,41 +786,44 @@ impl StepPipelines {
             // Router logits GEMM (DGQ_ROUTER_GEMM): [256, HID] @ router_proj^T[128, HID].
             (N_EXPERTS as u32, HID as u32),
         ] {
-            gemm_q4.insert(
-                (n, k),
-                crate::kernels::sub::gemm_q4::pipeline_for(ctx, n, k)?,
-            );
-            gemm_nvfp4.insert(
-                (n, k),
-                crate::kernels::sub::gemm_nvfp4::pipeline_for(ctx, n, k)?,
-            );
-            // bf16-weight GEMM for the mixed-precision attention/dense-FFN path.
-            // lm_head logits (n=VOCAB) forces bf16 output (range); others follow
-            // K_ACT_F16 for their activation output.
-            let bf16_ps = if n == VOCAB as u32 {
-                crate::kernels::sub::gemm_bf16::pipeline_for_logits(ctx, n, k)?
+            // Raw (bf16-weight) dense: lm_head logits (n=VOCAB) forces bf16
+            // output (range); others follow K_ACT_F16 for their activation out.
+            let raw = if n == VOCAB as u32 {
+                crate::kernels::sub::gemm_tunable::pipeline_for_logits(
+                    ctx,
+                    n,
+                    k,
+                    crate::kernels::sub::QuantFormat::Raw,
+                )?
             } else {
-                crate::kernels::sub::gemm_bf16::pipeline_for(ctx, n, k)?
+                crate::kernels::sub::gemm_tunable::pipeline_for(
+                    ctx,
+                    n,
+                    k,
+                    crate::kernels::sub::QuantFormat::Raw,
+                )?
             };
-            gemm_bf16.insert((n, k), bf16_ps);
-            if gemm_tunable_enabled() {
-                let t = if n == VOCAB as u32 {
-                    crate::kernels::sub::gemm_tunable::pipeline_for_logits(
-                        ctx,
-                        n,
-                        k,
-                        crate::kernels::sub::QuantFormat::Raw,
-                    )?
-                } else {
-                    crate::kernels::sub::gemm_tunable::pipeline_for(
-                        ctx,
-                        n,
-                        k,
-                        crate::kernels::sub::QuantFormat::Raw,
-                    )?
-                };
-                gemm_tunable_raw.insert((n, k), t);
-            }
+            gemm_tunable_raw.insert((n, k), raw);
+            // q4 / nvfp4 dense (block-quant attention/dense-FFN checkpoints).
+            // Never lm_head (that path is bf16 or q8), so no logits variant.
+            gemm_tunable_q4.insert(
+                (n, k),
+                crate::kernels::sub::gemm_tunable::pipeline_for(
+                    ctx,
+                    n,
+                    k,
+                    crate::kernels::sub::QuantFormat::Q4Affine,
+                )?,
+            );
+            gemm_tunable_nvfp4.insert(
+                (n, k),
+                crate::kernels::sub::gemm_tunable::pipeline_for(
+                    ctx,
+                    n,
+                    k,
+                    crate::kernels::sub::QuantFormat::NvFp4,
+                )?,
+            );
         }
         for &(n, k) in &[
             (DENSE_FF, HID as u32),
@@ -838,34 +837,24 @@ impl StepPipelines {
             (2816, 4096),
             (2816, 8192),
         ] {
-            gemm_q8.insert(
-                (n, k),
-                crate::kernels::sub::gemm_q8::pipeline_for(ctx, n, k)?,
-            );
-            if (n, k) == (VOCAB as u32, HID as u32) {
-                gemm_q8_logits.insert(
-                    (n, k),
-                    crate::kernels::sub::gemm_q8::pipeline_for_logits(ctx, n, k)?,
-                );
-            }
-            if gemm_tunable_enabled() {
-                let t = if (n, k) == (VOCAB as u32, HID as u32) {
-                    crate::kernels::sub::gemm_tunable::pipeline_for_logits(
-                        ctx,
-                        n,
-                        k,
-                        crate::kernels::sub::QuantFormat::Q8,
-                    )?
-                } else {
-                    crate::kernels::sub::gemm_tunable::pipeline_for(
-                        ctx,
-                        n,
-                        k,
-                        crate::kernels::sub::QuantFormat::Q8,
-                    )?
-                };
-                gemm_tunable_q8.insert((n, k), t);
-            }
+            // q8 dense: lm_head logits (VOCAB) forces bf16 output; others follow
+            // the arena activation dtype.
+            let q8 = if (n, k) == (VOCAB as u32, HID as u32) {
+                crate::kernels::sub::gemm_tunable::pipeline_for_logits(
+                    ctx,
+                    n,
+                    k,
+                    crate::kernels::sub::QuantFormat::Q8,
+                )?
+            } else {
+                crate::kernels::sub::gemm_tunable::pipeline_for(
+                    ctx,
+                    n,
+                    k,
+                    crate::kernels::sub::QuantFormat::Q8,
+                )?
+            };
+            gemm_tunable_q8.insert((n, k), q8);
         }
         for &(n, k) in &[
             (HID as u32, VOCAB as u32),
@@ -986,16 +975,13 @@ impl StepPipelines {
                 crate::kernels::sub::rms_norm_rows_tiled::TiledVariant::F32_IN,
                 prod,
             )?,
-            gemm_q4,
             gemm_tunable_raw,
             gemm_tunable_q8,
+            gemm_tunable_q4,
+            gemm_tunable_nvfp4,
             gemm_tunable_sparse,
             gemm_tunable_sparse_wide,
             sparse_wide_bm,
-            gemm_nvfp4,
-            gemm_q8,
-            gemm_bf16,
-            gemm_q8_logits,
             gemm_q8_rowk,
             gemm_q8_rowk_xfp16,
             gemm_q8_rowk_acc_f32,
@@ -1093,38 +1079,32 @@ impl StepPipelines {
         })
     }
 
-    fn q4(&self, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
-        self.gemm_q4
+    /// Tunable Raw (bf16-weight) dense pipeline; VOCAB shape = logits variant.
+    fn dense_raw(&self, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
+        self.gemm_tunable_raw
             .get(&(n, k))
-            .ok_or(Error::Format("missing q4 pipeline"))
+            .ok_or(Error::Format("missing tunable raw pipeline"))
     }
 
-    fn nvfp4(&self, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
-        self.gemm_nvfp4
+    /// Tunable q8 dense pipeline; VOCAB shape = logits variant.
+    fn dense_q8(&self, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
+        self.gemm_tunable_q8
             .get(&(n, k))
-            .ok_or(Error::Format("missing nvfp4 pipeline"))
+            .ok_or(Error::Format("missing tunable q8 pipeline"))
     }
 
-    fn q8(&self, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
-        self.gemm_q8
+    /// Tunable q4 dense pipeline (block-quant attention/dense-FFN checkpoint).
+    fn dense_q4(&self, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
+        self.gemm_tunable_q4
             .get(&(n, k))
-            .ok_or(Error::Format("missing q8 pipeline"))
+            .ok_or(Error::Format("missing tunable q4 dense pipeline"))
     }
 
-    fn bf16(&self, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
-        self.gemm_bf16
+    /// Tunable nvfp4 dense pipeline.
+    fn dense_nvfp4(&self, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
+        self.gemm_tunable_nvfp4
             .get(&(n, k))
-            .ok_or(Error::Format("missing bf16 pipeline"))
-    }
-
-    /// Tunable Raw pipeline if built for this shape (DGQ_GEMM_TUNABLE).
-    fn bf16_tunable(&self, n: u32, k: u32) -> Option<&ComputePipeline> {
-        self.gemm_tunable_raw.get(&(n, k))
-    }
-
-    /// Tunable q8 pipeline if built for this shape (DGQ_GEMM_TUNABLE).
-    fn q8_tunable(&self, n: u32, k: u32) -> Option<&ComputePipeline> {
-        self.gemm_tunable_q8.get(&(n, k))
+            .ok_or(Error::Format("missing tunable nvfp4 dense pipeline"))
     }
 
     /// Tunable block-sparse pipeline (q4/q6 experts) if built (DGQ_GEMM_TUNABLE).
@@ -1152,12 +1132,6 @@ impl StepPipelines {
             .get(&(n, k, gather, format as u32))
     }
 
-    fn q8_logits(&self, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
-        self.gemm_q8_logits
-            .get(&(n, k))
-            .ok_or(Error::Format("missing q8 logits pipeline"))
-    }
-
     fn q8_rowk_xfp16(&self, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
         self.gemm_q8_rowk_xfp16
             .get(&(n, k))
@@ -1172,8 +1146,8 @@ impl StepPipelines {
 
     fn block_gemm(&self, format: QuantFormat, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
         match format {
-            QuantFormat::NvFp4 => self.nvfp4(n, k),
-            _ => self.q4(n, k),
+            QuantFormat::NvFp4 => self.dense_nvfp4(n, k),
+            _ => self.dense_q4(n, k),
         }
     }
 
@@ -1594,8 +1568,8 @@ impl StepEnc<'_> {
         self.sink_set_bytes(&w_off, 3);
         self.sink_set_bytes(&m, 4);
         let grid = MTLSize {
-            width: div_up(n as usize, crate::kernels::sub::gemm_common::n_tile()),
-            height: div_up(m as usize, crate::kernels::sub::gemm_common::M_TILE),
+            width: div_up(n as usize, crate::kernels::sub::gemm_tunable::TUNE_BN),
+            height: div_up(m as usize, crate::kernels::sub::gemm_tunable::TUNE_BM),
             depth: 1,
         };
         let tg = MTLSize {
@@ -1616,7 +1590,7 @@ impl StepEnc<'_> {
         n_total: u32,
     ) -> Result<(), Error> {
         debug_assert!(segs.len() <= STACKED_SEG_MAX, "too many stacked segments");
-        let ps = crate::kernels::sub::gemm_block_stacked::stacked_pipeline_for(
+        let ps = crate::kernels::sub::gemm_tunable::stacked_pipeline_for(
             self.ctx,
             n_total,
             k,
@@ -1629,8 +1603,8 @@ impl StepEnc<'_> {
         self.bind_blob(2);
         self.sink_set_bytes(&m, 3);
         let grid = MTLSize {
-            width: div_up(n_total as usize, crate::kernels::sub::gemm_common::n_tile()),
-            height: div_up(m as usize, crate::kernels::sub::gemm_common::M_TILE),
+            width: div_up(n_total as usize, crate::kernels::sub::gemm_tunable::TUNE_BN),
+            height: div_up(m as usize, crate::kernels::sub::gemm_tunable::TUNE_BM),
             depth: 1,
         };
         let tg = MTLSize {
@@ -1653,32 +1627,17 @@ impl StepEnc<'_> {
         n_total: u32,
     ) -> Result<(), Error> {
         debug_assert!(segs.len() <= STACKED_SEG_MAX, "too many stacked segments");
-        let (ps, grid) = if gemm_tunable_enabled() {
-            (
-                crate::kernels::sub::gemm_tunable::stacked_pipeline_for(
-                    self.ctx,
-                    n_total,
-                    k,
-                    crate::kernels::sub::QuantFormat::Raw,
-                    segs,
-                )?,
-                MTLSize {
-                    width: div_up(n_total as usize, crate::kernels::sub::gemm_tunable::TUNE_BN),
-                    height: div_up(m as usize, crate::kernels::sub::gemm_tunable::TUNE_BM),
-                    depth: 1,
-                },
-            )
-        } else {
-            (
-                crate::kernels::sub::gemm_bf16_stacked::stacked_pipeline_for(
-                    self.ctx, n_total, k, segs,
-                )?,
-                MTLSize {
-                    width: div_up(n_total as usize, crate::kernels::sub::gemm_common::n_tile()),
-                    height: div_up(m as usize, crate::kernels::sub::gemm_common::M_TILE),
-                    depth: 1,
-                },
-            )
+        let ps = crate::kernels::sub::gemm_tunable::stacked_pipeline_for(
+            self.ctx,
+            n_total,
+            k,
+            crate::kernels::sub::QuantFormat::Raw,
+            segs,
+        )?;
+        let grid = MTLSize {
+            width: div_up(n_total as usize, crate::kernels::sub::gemm_tunable::TUNE_BN),
+            height: div_up(m as usize, crate::kernels::sub::gemm_tunable::TUNE_BM),
+            depth: 1,
         };
         self.sink_set_pipeline(ps.as_ref());
         self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
@@ -1766,23 +1725,11 @@ impl StepEnc<'_> {
         n: u32,
         k: u32,
     ) -> Result<(), Error> {
-        let (ps, grid) = match self.ps.q8_tunable(n, k) {
-            Some(t) => (
-                t,
-                MTLSize {
-                    width: div_up(n as usize, crate::kernels::sub::gemm_tunable::TUNE_BN),
-                    height: div_up(m as usize, crate::kernels::sub::gemm_tunable::TUNE_BM),
-                    depth: 1,
-                },
-            ),
-            None => (
-                self.ps.q8(n, k)?,
-                MTLSize {
-                    width: div_up(n as usize, crate::kernels::sub::gemm_common::n_tile()),
-                    height: div_up(m as usize, crate::kernels::sub::gemm_common::M_TILE),
-                    depth: 1,
-                },
-            ),
+        let ps = self.ps.dense_q8(n, k)?;
+        let grid = MTLSize {
+            width: div_up(n as usize, crate::kernels::sub::gemm_tunable::TUNE_BN),
+            height: div_up(m as usize, crate::kernels::sub::gemm_tunable::TUNE_BM),
+            depth: 1,
         };
         self.sink_set_pipeline(ps);
         self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
@@ -1810,23 +1757,11 @@ impl StepEnc<'_> {
         n: u32,
         k: u32,
     ) -> Result<(), Error> {
-        let (ps, grid) = match self.ps.bf16_tunable(n, k) {
-            Some(t) => (
-                t,
-                MTLSize {
-                    width: div_up(n as usize, crate::kernels::sub::gemm_tunable::TUNE_BN),
-                    height: div_up(m as usize, crate::kernels::sub::gemm_tunable::TUNE_BM),
-                    depth: 1,
-                },
-            ),
-            None => (
-                self.ps.bf16(n, k)?,
-                MTLSize {
-                    width: div_up(n as usize, crate::kernels::sub::gemm_common::n_tile()),
-                    height: div_up(m as usize, crate::kernels::sub::gemm_common::M_TILE),
-                    depth: 1,
-                },
-            ),
+        let ps = self.ps.dense_raw(n, k)?;
+        let grid = MTLSize {
+            width: div_up(n as usize, crate::kernels::sub::gemm_tunable::TUNE_BN),
+            height: div_up(m as usize, crate::kernels::sub::gemm_tunable::TUNE_BM),
+            depth: 1,
         };
         self.sink_set_pipeline(ps);
         self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
@@ -1854,23 +1789,11 @@ impl StepEnc<'_> {
         k: u32,
         logits_byte_off: usize,
     ) -> Result<(), Error> {
-        let (ps, grid) = match self.ps.bf16_tunable(n, k) {
-            Some(t) => (
-                t,
-                MTLSize {
-                    width: div_up(n as usize, crate::kernels::sub::gemm_tunable::TUNE_BN),
-                    height: div_up(m as usize, crate::kernels::sub::gemm_tunable::TUNE_BM),
-                    depth: 1,
-                },
-            ),
-            None => (
-                self.ps.bf16(n, k)?,
-                MTLSize {
-                    width: div_up(n as usize, crate::kernels::sub::gemm_common::n_tile()),
-                    height: div_up(m as usize, crate::kernels::sub::gemm_common::M_TILE),
-                    depth: 1,
-                },
-            ),
+        let ps = self.ps.dense_raw(n, k)?;
+        let grid = MTLSize {
+            width: div_up(n as usize, crate::kernels::sub::gemm_tunable::TUNE_BN),
+            height: div_up(m as usize, crate::kernels::sub::gemm_tunable::TUNE_BM),
+            depth: 1,
         };
         self.sink_set_pipeline(ps);
         self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
@@ -1896,23 +1819,11 @@ impl StepEnc<'_> {
         k: u32,
         logits_byte_off: usize,
     ) -> Result<(), Error> {
-        let (ps, grid) = match self.ps.q8_tunable(n, k) {
-            Some(t) => (
-                t,
-                MTLSize {
-                    width: div_up(n as usize, crate::kernels::sub::gemm_tunable::TUNE_BN),
-                    height: div_up(m as usize, crate::kernels::sub::gemm_tunable::TUNE_BM),
-                    depth: 1,
-                },
-            ),
-            None => (
-                self.ps.q8_logits(n, k)?,
-                MTLSize {
-                    width: div_up(n as usize, crate::kernels::sub::gemm_common::n_tile()),
-                    height: div_up(m as usize, crate::kernels::sub::gemm_common::M_TILE),
-                    depth: 1,
-                },
-            ),
+        let ps = self.ps.dense_q8(n, k)?;
+        let grid = MTLSize {
+            width: div_up(n as usize, crate::kernels::sub::gemm_tunable::TUNE_BN),
+            height: div_up(m as usize, crate::kernels::sub::gemm_tunable::TUNE_BM),
+            depth: 1,
         };
         self.sink_set_pipeline(ps);
         self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
