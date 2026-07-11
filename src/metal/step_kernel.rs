@@ -81,8 +81,8 @@ pub use crate::flags::{
     denoise_parity_log_enabled, denoise_parity_log_positions, denoiser_argmax_enabled,
     final_entropy_log_enabled, freeze_enabled, fused_algebra_enabled, fused_gate_up_enabled,
     fused_qkv_enabled, gemm_tunable_enabled, logits_finite_check_enabled,
-    logits_finite_sample_count, moe_block_sparse_enabled, moe_fuse_gather_enabled,
-    moe_tile_adapt_enabled, partial_lm_head_enabled, prefill_batch_enabled, router_gemm_enabled,
+    logits_finite_sample_count, moe_fuse_gather_enabled, partial_lm_head_enabled,
+    prefill_batch_enabled, router_gemm_enabled,
     sc_sparse_enabled, should_fast_prefill, step_text_log_enabled, trace_entropy_enabled,
 };
 
@@ -732,17 +732,6 @@ struct StepPipelines {
     router_topk: ComputePipeline,
     bucket_count: ComputePipeline,
     bucket_fill: ComputePipeline,
-    q4_block_grouped: HashMap<(u32, u32), ComputePipeline>,
-    nvfp4_block_grouped: HashMap<(u32, u32), ComputePipeline>,
-    /// Block-sparse MoE GEMMs, keyed by (n, k, adaptive). adaptive = the
-    /// GEMM_M_ADAPT pipeline (DGQ_MOE_TILE_ADAPT runtime per-block M-mapping).
-    q4_block_sparse: HashMap<(u32, u32, bool), ComputePipeline>,
-    q6_block_sparse: HashMap<(u32, u32, bool), ComputePipeline>,
-    q6_block_grouped: HashMap<(u32, u32), ComputePipeline>,
-    nvfp4_block_sparse: HashMap<(u32, u32, bool), ComputePipeline>,
-    /// Fused-gather gate_up variant, keyed by (n,k,adaptive); built only when
-    /// DGQ_MOE_FUSE_GATHER is on. Q4 only (the production MoE format).
-    block_sparse_gather: HashMap<(u32, u32, bool), ComputePipeline>,
     gather_rows_bf16_to_f32: ComputePipeline,
     gelu_swiglu_gate_up: ComputePipeline,
     moe_scatter_weighted: ComputePipeline,
@@ -934,169 +923,51 @@ impl StepPipelines {
             "f32_to_half_scale",
             variant,
         )?;
-        let mut q4_block_grouped = HashMap::new();
-        let mut nvfp4_block_grouped = HashMap::new();
-        let mut q4_block_sparse = HashMap::new();
-        let mut q6_block_sparse = HashMap::new();
-        let mut q6_block_grouped = HashMap::new();
-        let mut nvfp4_block_sparse = HashMap::new();
-        let mut block_sparse_gather = HashMap::new();
-        if moe_fuse_gather_enabled() {
-            // Only gate_up gathers (down's A is the swiglu output, not gathered).
-            let (n, k) = (MOE_FF * 2, HID as u32);
-            block_sparse_gather.insert(
-                (n, k, false),
-                crate::kernels::sub::gemm_block_sparse::pipeline_for_gather(
-                    ctx,
-                    n,
-                    k,
-                    crate::kernels::sub::QuantFormat::Q4Affine,
-                )?,
-            );
-            if moe_tile_adapt_enabled() {
-                block_sparse_gather.insert(
-                    (n, k, true),
-                    crate::kernels::sub::gemm_block_sparse::pipeline_for_gather_adaptive(
-                        ctx,
-                        n,
-                        k,
-                        crate::kernels::sub::QuantFormat::Q4Affine,
-                    )?,
-                );
-            }
-        }
+        // Block-sparse MoE experts: tunable is the sole path (q4/q6/nvfp4).
+        // gate_up gathers bf16 moein rows (fused gather); down's A is the
+        // swiglu output. Wide variants = weight-stationary prefill height
+        // (TUNE_BM=sparse_wide_bm; the batched-prefill block list is built at
+        // this height).
         for &(n, k) in &[(MOE_FF * 2, HID as u32), (HID as u32, MOE_FF)] {
-            q4_block_grouped.insert(
-                (n, k),
-                crate::kernels::sub::gemm_block_grouped::pipeline_for(
-                    ctx,
-                    n,
-                    k,
-                    crate::kernels::sub::QuantFormat::Q4Affine,
-                )?,
-            );
-            nvfp4_block_grouped.insert(
-                (n, k),
-                crate::kernels::sub::gemm_block_grouped::pipeline_for(
-                    ctx,
-                    n,
-                    k,
-                    crate::kernels::sub::QuantFormat::NvFp4,
-                )?,
-            );
-            q4_block_sparse.insert(
-                (n, k, false),
-                crate::kernels::sub::gemm_block_sparse::pipeline_for(
-                    ctx,
-                    n,
-                    k,
-                    crate::kernels::sub::QuantFormat::Q4Affine,
-                )?,
-            );
-            nvfp4_block_sparse.insert(
-                (n, k, false),
-                crate::kernels::sub::gemm_block_sparse::pipeline_for(
-                    ctx,
-                    n,
-                    k,
-                    crate::kernels::sub::QuantFormat::NvFp4,
-                )?,
-            );
-            q6_block_sparse.insert(
-                (n, k, false),
-                crate::kernels::sub::gemm_block_sparse::pipeline_for(
-                    ctx,
-                    n,
-                    k,
-                    crate::kernels::sub::QuantFormat::Q6,
-                )?,
-            );
-            q6_block_grouped.insert(
-                (n, k),
-                crate::kernels::sub::gemm_block_grouped::pipeline_for(
-                    ctx,
-                    n,
-                    k,
-                    crate::kernels::sub::QuantFormat::Q6,
-                )?,
-            );
-            if moe_tile_adapt_enabled() {
-                q6_block_sparse.insert(
-                    (n, k, true),
-                    crate::kernels::sub::gemm_block_sparse::pipeline_for_adaptive(
-                        ctx,
-                        n,
-                        k,
-                        crate::kernels::sub::QuantFormat::Q6,
-                    )?,
+            for fmt in [
+                crate::kernels::sub::QuantFormat::Q4Affine,
+                crate::kernels::sub::QuantFormat::Q6,
+                crate::kernels::sub::QuantFormat::NvFp4,
+            ] {
+                gemm_tunable_sparse.insert(
+                    (n, k, false, fmt as u32),
+                    crate::kernels::sub::gemm_tunable::pipeline_for_sparse(ctx, n, k, false, fmt)?,
                 );
-                q4_block_sparse.insert(
-                    (n, k, true),
-                    crate::kernels::sub::gemm_block_sparse::pipeline_for_adaptive(
-                        ctx,
-                        n,
-                        k,
-                        crate::kernels::sub::QuantFormat::Q4Affine,
-                    )?,
-                );
-                nvfp4_block_sparse.insert(
-                    (n, k, true),
-                    crate::kernels::sub::gemm_block_sparse::pipeline_for_adaptive(
-                        ctx,
-                        n,
-                        k,
-                        crate::kernels::sub::QuantFormat::NvFp4,
-                    )?,
-                );
-            }
-            if gemm_tunable_enabled() {
-                for fmt in [
-                    crate::kernels::sub::QuantFormat::Q4Affine,
-                    crate::kernels::sub::QuantFormat::Q6,
-                    crate::kernels::sub::QuantFormat::NvFp4,
-                ] {
+                if moe_fuse_gather_enabled() && (n, k) == (MOE_FF * 2, HID as u32) {
                     gemm_tunable_sparse.insert(
+                        (n, k, true, fmt as u32),
+                        crate::kernels::sub::gemm_tunable::pipeline_for_sparse(ctx, n, k, true, fmt)?,
+                    );
+                }
+                if sparse_wide_bm != 32 && prefill_batch_enabled() {
+                    gemm_tunable_sparse_wide.insert(
                         (n, k, false, fmt as u32),
-                        crate::kernels::sub::gemm_tunable::pipeline_for_sparse(
-                            ctx, n, k, false, fmt,
+                        crate::kernels::sub::gemm_tunable::pipeline_for_sparse_bm(
+                            ctx,
+                            n,
+                            k,
+                            false,
+                            fmt,
+                            sparse_wide_bm as usize,
                         )?,
                     );
                     if moe_fuse_gather_enabled() && (n, k) == (MOE_FF * 2, HID as u32) {
-                        gemm_tunable_sparse.insert(
-                            (n, k, true, fmt as u32),
-                            crate::kernels::sub::gemm_tunable::pipeline_for_sparse(
-                                ctx, n, k, true, fmt,
-                            )?,
-                        );
-                    }
-                    // Wide-block (weight-stationary) prefill variants: same
-                    // kernel at TUNE_BM=sparse_wide_bm; the batched-prefill
-                    // block list is built at this height.
-                    if sparse_wide_bm != 32 && prefill_batch_enabled() {
                         gemm_tunable_sparse_wide.insert(
-                            (n, k, false, fmt as u32),
+                            (n, k, true, fmt as u32),
                             crate::kernels::sub::gemm_tunable::pipeline_for_sparse_bm(
                                 ctx,
                                 n,
                                 k,
-                                false,
+                                true,
                                 fmt,
                                 sparse_wide_bm as usize,
                             )?,
                         );
-                        if moe_fuse_gather_enabled() && (n, k) == (MOE_FF * 2, HID as u32) {
-                            gemm_tunable_sparse_wide.insert(
-                                (n, k, true, fmt as u32),
-                                crate::kernels::sub::gemm_tunable::pipeline_for_sparse_bm(
-                                    ctx,
-                                    n,
-                                    k,
-                                    true,
-                                    fmt,
-                                    sparse_wide_bm as usize,
-                                )?,
-                            );
-                        }
                     }
                 }
             }
@@ -1176,13 +1047,6 @@ impl StepPipelines {
             )?,
             bucket_count: crate::kernels::sub::moe_bucket_count::pipeline_for(ctx, prod)?,
             bucket_fill: crate::kernels::sub::moe_bucket_fill::pipeline_for(ctx, prod)?,
-            q4_block_grouped,
-            nvfp4_block_grouped,
-            q4_block_sparse,
-            q6_block_sparse,
-            q6_block_grouped,
-            nvfp4_block_sparse,
-            block_sparse_gather,
             gather_rows_bf16_to_f32: crate::kernels::sub::gather_rows::pipeline_for_fmt(
                 ctx, prod, false, true,
             )?,
@@ -1311,53 +1175,6 @@ impl StepPipelines {
             QuantFormat::NvFp4 => self.nvfp4(n, k),
             _ => self.q4(n, k),
         }
-    }
-
-    fn block_grouped(
-        &self,
-        format: QuantFormat,
-        n: u32,
-        k: u32,
-    ) -> Result<&ComputePipeline, Error> {
-        let map = match format {
-            QuantFormat::Q4Affine => &self.q4_block_grouped,
-            QuantFormat::Q6 => &self.q6_block_grouped,
-            QuantFormat::NvFp4 => &self.nvfp4_block_grouped,
-            _ => {
-                return Err(Error::Format(
-                    "batched MoE tiled grouped GEMM unsupported for this block format",
-                ));
-            }
-        };
-        map.get(&(n, k))
-            .ok_or(Error::Format("missing block_grouped pipeline"))
-    }
-
-    /// Block-sparse pipeline; `adaptive` = GEMM_M_ADAPT (DGQ_MOE_TILE_ADAPT).
-    fn block_sparse(
-        &self,
-        format: QuantFormat,
-        n: u32,
-        k: u32,
-        adaptive: bool,
-    ) -> Result<&ComputePipeline, Error> {
-        let map = match format {
-            QuantFormat::Q4Affine => &self.q4_block_sparse,
-            QuantFormat::Q6 => &self.q6_block_sparse,
-            QuantFormat::NvFp4 => &self.nvfp4_block_sparse,
-            _ => {
-                return Err(Error::Format(
-                    "block-sparse MoE GEMM unsupported for this block format",
-                ));
-            }
-        };
-        map.get(&(n, k, adaptive))
-            .ok_or(Error::Format("missing block_sparse pipeline"))
-    }
-
-    /// Fused-gather gate_up pipeline if built (DGQ_MOE_FUSE_GATHER), else None.
-    fn block_sparse_gather(&self, n: u32, k: u32, adaptive: bool) -> Option<&ComputePipeline> {
-        self.block_sparse_gather.get(&(n, k, adaptive))
     }
 
     fn moe_scalar(&self, format: QuantFormat) -> &ComputePipeline {
@@ -2701,11 +2518,9 @@ impl StepEnc<'_> {
             return 32;
         }
         let fmt = self.block_profile.format;
-        if !moe_block_sparse_enabled() || !matches!(fmt, QuantFormat::Q4Affine | QuantFormat::Q6) {
-            return 32;
-        }
         // Wide pipelines are compiled for exactly the shapes/gather variants
-        // the narrow set has; one representative presence check suffices.
+        // the narrow set has; one representative presence check suffices (and
+        // is only built for the block-expert formats q4/q6/nvfp4).
         let wide_ok = self
             .ps
             .sparse_tunable_wide_fmt(fmt, MOE_FF * 2, HID as u32, false)
@@ -2742,42 +2557,22 @@ impl StepEnc<'_> {
         indirect_slot: usize,
         gather: bool,
     ) -> Result<(), Error> {
-        let block_sparse = moe_block_sparse_enabled();
-        let adaptive = block_sparse && moe_tile_adapt_enabled();
-        // Tunable block-sparse (q4 experts): fragment kernel with built-in
-        // adaptive-M; indirect slots 4/5 (BN-wide N-tiles).
-        let tunable = block_sparse
-            && matches!(
-                self.block_profile.format,
-                QuantFormat::Q4Affine | QuantFormat::Q6 | QuantFormat::NvFp4
-            )
-            && self
-                .ps
-                .sparse_tunable_fmt(self.block_profile.format, n, k, gather)
-                .is_some();
-        // Wide-block weight-stationary prefill: the block list for this
-        // forward was built at moe_block_m() rows (bucket_fill phase 1), so
-        // the consuming pipeline's TUNE_BM must match — never fall back to a
-        // 32-row kernel against a wide list.
+        // Tunable block-sparse is the sole expert-GEMM path (q4/q6/nvfp4);
+        // indirect slots 4/5 (BN-wide N-tiles). Wide = the weight-stationary
+        // prefill block height (moe_block_m()); the block list for this forward
+        // was built at that height (bucket_fill phase 1), so the consuming
+        // pipeline's TUNE_BM must match.
+        let fmt = self.block_profile.format;
         let wide = self.moe_block_m() != 32;
-        if wide && !tunable {
-            return Err(Error::Format(
-                "MoE block list built wide (weight-stationary prefill) but tunable sparse unavailable",
-            ));
-        }
         // Fused-gather gate_up: A-load pulls bf16 `moein` rows via token_list
         // (buffer 7), so no separate gather pass / f32 staging buffer. The caller
         // skips the gather pass iff `gather`; if the pipeline for this shape is
         // missing we'd read a stale A buffer, so fail loud rather than silently.
         let gather_ps = if gather {
-            if tunable && wide {
-                self.ps
-                    .sparse_tunable_wide_fmt(self.block_profile.format, n, k, true)
-            } else if tunable {
-                self.ps
-                    .sparse_tunable_fmt(self.block_profile.format, n, k, true)
+            if wide {
+                self.ps.sparse_tunable_wide_fmt(fmt, n, k, true)
             } else {
-                self.ps.block_sparse_gather(n, k, adaptive)
+                self.ps.sparse_tunable_fmt(fmt, n, k, true)
             }
         } else {
             None
@@ -2790,19 +2585,14 @@ impl StepEnc<'_> {
         let use_gather = gather_ps.is_some();
         let grouped_ps = if let Some(p) = gather_ps {
             p
-        } else if tunable && wide {
+        } else if wide {
             self.ps
-                .sparse_tunable_wide_fmt(self.block_profile.format, n, k, false)
+                .sparse_tunable_wide_fmt(fmt, n, k, false)
                 .ok_or(Error::Format("missing wide tunable sparse pipeline"))?
-        } else if tunable {
-            self.ps
-                .sparse_tunable_fmt(self.block_profile.format, n, k, false)
-                .ok_or(Error::Format("missing tunable sparse pipeline"))?
-        } else if block_sparse {
-            self.ps
-                .block_sparse(self.block_profile.format, n, k, adaptive)?
         } else {
-            self.ps.block_grouped(self.block_profile.format, n, k)?
+            self.ps
+                .sparse_tunable_fmt(fmt, n, k, false)
+                .ok_or(Error::Format("missing tunable sparse pipeline"))?
         };
         let row_start_off = std::mem::offset_of!(RouteScratch, row_start);
         self.sink_set_pipeline(grouped_ps);
@@ -2829,14 +2619,8 @@ impl StepEnc<'_> {
             height: 1,
             depth: 1,
         };
-        // Indirect slots: tunable sparse 4/5; legacy block-sparse 2/3; grouped 0/1.
-        let slot = if tunable {
-            indirect_slot + 4
-        } else if block_sparse {
-            indirect_slot + 2
-        } else {
-            indirect_slot
-        };
+        // Indirect slots: tunable sparse uses 4/5.
+        let slot = indirect_slot + 4;
         let indirect_offset = slot * 3 * std::mem::size_of::<u32>();
         self.sink_dispatch_indirect(indirect_offset, n, tg);
         Ok(())
