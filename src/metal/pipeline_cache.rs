@@ -31,17 +31,12 @@ fn shader_bundle_token() -> u64 {
 }
 
 fn cache_enabled() -> bool {
-    match std::env::var("DGQ_METAL_PIPELINE_CACHE") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
-    }
+    crate::flags::metal_pipeline_cache_enabled()
 }
 
 fn cache_root_dir() -> PathBuf {
-    if let Ok(v) = std::env::var("DGQ_METAL_PIPELINE_CACHE") {
-        if !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false") {
-            return PathBuf::from(v);
-        }
+    if let Some(dir) = crate::flags::metal_pipeline_cache_dir_override() {
+        return dir;
     }
     std::env::var("XDG_CACHE_HOME")
         .map(PathBuf::from)

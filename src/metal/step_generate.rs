@@ -627,10 +627,8 @@ pub fn generate_with_session(
     // a random relative factor — separates "the model is knife-edge
     // sensitive to KV noise at this length" from "the fast path has a real
     // defect".
-    if let Ok(eps) = std::env::var("DGQ_KV_NOISE") {
-        if let Ok(eps) = eps.parse::<f32>() {
-            perturb_live_kv_f16(rt, kv_len, eps, cfg.seed);
-        }
+    if let Some(eps) = crate::flags::kv_noise() {
+        perturb_live_kv_f16(rt, kv_len, eps, cfg.seed);
     }
     // Canvas denoise writes at [kv_len..kv_len+CANVAS]; ensure the runtime's
     // kv_len is exactly the prompt length (the reuse/extend paths update KV but

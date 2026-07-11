@@ -478,7 +478,7 @@ pub fn layer_kv_slots(is_full: bool, max_seq: usize) -> usize {
         // the softmax masks the tail keys but the reads must stay in-buffer
         // (layer 29 — the last region — is a full layer).
         (max_seq + 8).next_multiple_of(8)
-    } else if std::env::var("DGQ_KV_RING_UNCAPPED").is_ok() {
+    } else if crate::flags::kv_ring_uncapped_enabled() {
         // DIAGNOSTIC (task #64 follow-up): linear sliding storage — no ring
         // wrap ever. Isolates ring-READ defects from everything else at the
         // cost of full-length sliding KV (fine to ~8k).
@@ -5229,7 +5229,7 @@ impl StepRuntime {
         let mut peak: BTreeMap<&'static str, (f32, bool)> = BTreeMap::new();
         let mut probe = |this: &Self, label: &'static str, off: u64, elems: usize| {
             // half_buffer_stats returns (finite, max_abs) — bool true = healthy.
-            let f16 = this.arena_f16_mode || std::env::var("DGQ_ARENA_F16_ALL").is_ok();
+            let f16 = this.arena_f16_mode || crate::flags::arena_f16_all_enabled();
             let (finite, mx) = if f16 {
                 f16_buffer_stats(&this.bufs.arena, off as usize, elems, SAMPLE)
             } else {
@@ -5638,7 +5638,7 @@ pub fn build_step_runtime(
     let kv_fmt = crate::flags::kv_format(cfg.max_seq);
     // TEMP diagnostic (E11 bring-up): DGQ_ARENA_F16_ALL=1 builds the MAIN set
     // fp16 too — bisects kernel-level breakage from mode-switch wiring.
-    let f16_all = std::env::var("DGQ_ARENA_F16_ALL").is_ok();
+    let f16_all = crate::flags::arena_f16_all_enabled();
     if f16_all {
         crate::kernels::sub::variant::set_arena_f16_compile(true);
     }

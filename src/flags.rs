@@ -22,10 +22,11 @@
 //! - Sampler-semantics toggles carry their sign-off history in the doc.
 //! - Debug/probe flags default OFF and are opt-IN (`=1` or a path enables).
 //!
-//! Deliberate exceptions still live outside this module: `DGQ_METAL_PIPELINE_CACHE`
-//! (pipeline_cache.rs, dual bool/path semantics coupled to its directory
-//! layout) and a handful of test-only probe knobs (`DGQ_E15_PROMPT`,
-//! `DGQ_ARENA_F16_ALL`, `DGQ_KV_RING_UNCAPPED`, …).
+//! Deliberate exceptions still read env directly: test-only probe-prompt knobs
+//! that are passed from the command line into `#[ignore]`d diagnostics
+//! (`DGQ_E15_PROMPT`, `DGQ_E8_PROMPT`, `DGQ_E16_CARRIER` in step_kv.rs — a
+//! crafted Config can't inject those), and the system-env fallbacks
+//! `XDG_CACHE_HOME`/`HOME` (pipeline_cache.rs) / `COLUMNS` (chat_ui.rs).
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -250,6 +251,19 @@ pub struct DebugFlags {
     pub engine_layer_dump_pos: usize,
     pub prefill_profile: bool,
     pub parity_debug: bool,
+    /// `DGQ_KV_NOISE=<rel eps>`: perturb every live f16 KV value after prefill
+    /// (task #67 sensitivity probe). None = off.
+    pub kv_noise: Option<f32>,
+    /// `DGQ_KV_RING_UNCAPPED`: linear (no-wrap) sliding KV storage (task #64
+    /// ring-read isolation). Any set value enables.
+    pub kv_ring_uncapped: bool,
+    /// `DGQ_ARENA_F16_ALL`: build the MAIN activation set fp16 too (E11 bring-up
+    /// bisect). Any set value enables.
+    pub arena_f16_all: bool,
+    /// `DGQ_METAL_PIPELINE_CACHE` raw override (unset = None): `0`/`false`
+    /// disables the on-disk pipeline cache; any other non-empty value is used as
+    /// the cache root dir. Consumed by pipeline_cache.rs via the accessors.
+    pub metal_pipeline_cache: Option<String>,
 }
 
 impl Default for DebugFlags {
@@ -275,6 +289,10 @@ impl Default for DebugFlags {
             engine_layer_dump_pos: 129,
             prefill_profile: false,
             parity_debug: false,
+            kv_noise: None,
+            kv_ring_uncapped: false,
+            arena_f16_all: false,
+            metal_pipeline_cache: None,
         }
     }
 }
@@ -420,6 +438,12 @@ impl Config {
                 engine_layer_dump_pos: parse_usize("DGQ_ENGINE_LAYER_POS", 129),
                 prefill_profile: std::env::var("DGQ_PREFILL_PROFILE").is_ok(),
                 parity_debug: std::env::var_os("DGQ_PARITY_DEBUG").is_some(),
+                kv_noise: std::env::var("DGQ_KV_NOISE")
+                    .ok()
+                    .and_then(|v| v.parse::<f32>().ok()),
+                kv_ring_uncapped: std::env::var("DGQ_KV_RING_UNCAPPED").is_ok(),
+                arena_f16_all: std::env::var("DGQ_ARENA_F16_ALL").is_ok(),
+                metal_pipeline_cache: std::env::var("DGQ_METAL_PIPELINE_CACHE").ok(),
             },
         }
     }
@@ -1007,6 +1031,42 @@ pub fn parity_debug_enabled() -> bool {
     config().debug.parity_debug
 }
 
+/// KV-noise sensitivity probe rel-eps (`DGQ_KV_NOISE=<f32>`; None = off).
+pub fn kv_noise() -> Option<f32> {
+    config().debug.kv_noise
+}
+
+/// Linear (no-wrap) sliding KV storage (`DGQ_KV_RING_UNCAPPED`).
+pub fn kv_ring_uncapped_enabled() -> bool {
+    config().debug.kv_ring_uncapped
+}
+
+/// Build the MAIN activation set fp16 too (`DGQ_ARENA_F16_ALL`).
+pub fn arena_f16_all_enabled() -> bool {
+    config().debug.arena_f16_all
+}
+
+/// On-disk Metal pipeline cache enabled (`DGQ_METAL_PIPELINE_CACHE`; `0`/`false`
+/// disables, unset or any other value enables).
+pub fn metal_pipeline_cache_enabled() -> bool {
+    match config().debug.metal_pipeline_cache.as_deref() {
+        Some(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        None => true,
+    }
+}
+
+/// Explicit Metal pipeline-cache root dir from `DGQ_METAL_PIPELINE_CACHE` when
+/// it names a (non-empty, non-off) path; `None` falls back to the XDG/HOME
+/// default (kept in pipeline_cache.rs — those are system env, not DGQ config).
+pub fn metal_pipeline_cache_dir_override() -> Option<PathBuf> {
+    config()
+        .debug
+        .metal_pipeline_cache
+        .as_deref()
+        .filter(|v| !v.is_empty() && *v != "0" && !v.eq_ignore_ascii_case("false"))
+        .map(PathBuf::from)
+}
+
 #[cfg(test)]
 mod ctx_budget_tests {
     use super::*;
@@ -1101,6 +1161,30 @@ mod config_tests {
         };
         // Both consumers honor the SAME override: q8 halves per-token KV.
         assert!(q8_bytes < f16_bytes, "q8 override must shrink the estimate");
+    }
+
+    #[test]
+    fn metal_pipeline_cache_dual_semantics() {
+        {
+            let _g = install_for_test(Config::default());
+            assert!(metal_pipeline_cache_enabled(), "unset → enabled");
+            assert!(metal_pipeline_cache_dir_override().is_none());
+        }
+        for off in ["0", "false", "FALSE"] {
+            let mut c = Config::default();
+            c.debug.metal_pipeline_cache = Some(off.to_string());
+            let _g = install_for_test(c);
+            assert!(!metal_pipeline_cache_enabled(), "{off} disables");
+            assert!(metal_pipeline_cache_dir_override().is_none());
+        }
+        let mut c = Config::default();
+        c.debug.metal_pipeline_cache = Some("/tmp/pc".to_string());
+        let _g = install_for_test(c);
+        assert!(metal_pipeline_cache_enabled(), "a path enables");
+        assert_eq!(
+            metal_pipeline_cache_dir_override(),
+            Some(PathBuf::from("/tmp/pc"))
+        );
     }
 
     #[test]
