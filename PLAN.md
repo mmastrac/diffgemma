@@ -28,8 +28,12 @@ The engine is in ship shape:
   2.9 vs 3.7s; sky ~410tok 22.0 vs 27.6s (18.6 tok/s); transformer ~840tok
   50.2 vs 59.2s (16.7 tok/s).
 - **Quality**: MLX-exact sampler semantics default (no-freeze + argmax commit,
-  signed off 2026-07-05). Wart census 0/10 (was 4/10). Smoketest 17/17 at the
-  spec seed. Fast-prefill degenerate class fixed as a side effect.
+  signed off 2026-07-05). Smoketest 17/17 at the spec seed. Wart census
+  (10-seed greentext) re-baselined 2026-07-10: **6/10 minor tail warts with
+  early-stop 0.05 / 2/10 intrinsic floor with it off** — the 07-05 "0/10"
+  went stale via an early-stop × trajectory-reshuffle interaction. SIGNED
+  OFF 2026-07-10: keep 0.05 (perf; warts confined to flat/creative canvases
+  — factual/doc-QA unaffected); the tail-commit fix is E7, not thresholds. Fast-prefill degenerate class fixed as a side effect.
 - **Correctness**: full test suite green (704). Step-parity oracle valid.
   Quantization exonerated as a quality lever (q6 experiment).
 - **Model**: `model/diffusiongemma-q4emb` (bf16 attn/dense/embed, q8 SC, q4
