@@ -86,7 +86,6 @@ impl Default for SamplerFlags {
 /// Production perf toggles (all default ON, opt-out for A/B triage).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PerfFlags {
-    pub gemm_tunable: bool,
     /// `DGQ_MOE_FUSE_GATHER`: fused gate_up A-gather in the tunable expert GEMM.
     pub moe_fuse_gather: bool,
     /// `DGQ_MOE_PREFILL_BM`: 64|128 opt-in, else 32 (OFF).
@@ -110,7 +109,6 @@ pub struct PerfFlags {
 impl Default for PerfFlags {
     fn default() -> Self {
         Self {
-            gemm_tunable: true,
             moe_fuse_gather: true,
             moe_prefill_block_m: 32,
             attn_mma: true,
@@ -336,7 +334,6 @@ impl Config {
                     .filter(|&w| w >= 1),
             },
             perf: PerfFlags {
-                gemm_tunable: env_on_unless_zero("DGQ_GEMM_TUNABLE"),
                 moe_fuse_gather: env_on_unless_zero("DGQ_MOE_FUSE_GATHER"),
                 moe_prefill_block_m: match std::env::var("DGQ_MOE_PREFILL_BM")
                     .ok()
@@ -585,13 +582,6 @@ pub fn force_canvas() -> Option<u32> {
 // ===========================================================================
 // Production perf toggles (all default ON, opt-out for A/B triage)
 // ===========================================================================
-
-/// Tunable GEMM (fragment-level 64x64 kernels for Raw/q8/stacked/sparse-MoE).
-/// BIT-EXACT vs the legacy kernels; step 1.22 -> 0.97s. `DGQ_GEMM_TUNABLE=0`
-/// falls back to the legacy block GEMMs.
-pub fn gemm_tunable_enabled() -> bool {
-    config().perf.gemm_tunable
-}
 
 /// Fuse the MoE gather into the gate_up tunable expert GEMM (bit-identical,
 /// ~28ms/step). `DGQ_MOE_FUSE_GATHER=0` opts out.
@@ -1088,7 +1078,7 @@ mod config_tests {
         assert_eq!(c.sampler.early_stop_mean_ent, 0.05);
         assert_eq!(c.sampler.empty_reply_retry, 3);
         // Perf toggles ship ON.
-        assert!(c.perf.gemm_tunable && c.perf.attn_mma && c.perf.fused_algebra);
+        assert!(c.perf.attn_mma && c.perf.fused_algebra);
         assert_eq!(c.perf.moe_prefill_block_m, 32);
         // Prefill uncapped, KV reuse on, tool-compact off.
         assert_eq!(c.prefill.fast_prefill_max, 0);
