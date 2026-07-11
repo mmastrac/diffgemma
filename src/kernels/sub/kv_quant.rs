@@ -140,6 +140,39 @@ pub fn affine_roundtrip_levels(src: &[f32], out: &mut [f32], levels: f32) {
     }
 }
 
+/// Single-scale symmetric q8 over the WHOLE row (one f16 scale, no groups) —
+/// models dropping group scales entirely once rotation Gaussianizes the row
+/// (post-rotation coordinates share one distribution, so per-group adaptivity
+/// buys nothing; scale storage drops from hd/32 f16s to one).
+pub fn q8_row_roundtrip(src: &[f32], out: &mut [f32]) {
+    let mx = src.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+    let sf = f16_bits_to_f32(f32_to_f16_bits((mx / 127.0).max(1e-8)));
+    for (o, &s) in out.iter_mut().zip(src) {
+        *o = (s / sf).round_ties_even().clamp(-127.0, 127.0) * sf;
+    }
+}
+
+/// Single-scale affine q4 over the whole row (one f16 scale + zero).
+pub fn q4_affine_row_roundtrip(src: &[f32], out: &mut [f32]) {
+    let lo = src.iter().cloned().fold(f32::INFINITY, f32::min);
+    let hi = src.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let sf = f16_bits_to_f32(f32_to_f16_bits(((hi - lo) / 15.0).max(1e-8)));
+    let zf = f16_bits_to_f32(f32_to_f16_bits(lo));
+    for (o, &s) in out.iter_mut().zip(src) {
+        *o = zf + ((s - zf) / sf).round_ties_even().clamp(0.0, 15.0) * sf;
+    }
+}
+
+/// Rotated row-scale q8: H, one-scale q8, H (self-inverse).
+pub fn q8_row_rotated_roundtrip(src: &[f32], out: &mut [f32]) {
+    rotated(src, out, q8_row_roundtrip);
+}
+
+/// Rotated row-scale affine q4.
+pub fn q4_affine_row_rotated_roundtrip(src: &[f32], out: &mut [f32]) {
+    rotated(src, out, q4_affine_row_roundtrip);
+}
+
 fn rotated<F: Fn(&[f32], &mut [f32])>(src: &[f32], out: &mut [f32], q: F) {
     let mut r = src.to_vec();
     fwht_normalized(&mut r);

@@ -2075,8 +2075,9 @@ mod engine_extend_bench_tests {
     #[ignore = "model-gated: cargo test --release e8_prerope_k_quant_stats -- --ignored --nocapture"]
     fn e8_prerope_k_quant_stats() {
         use crate::kernels::sub::kv_quant::{
-            q4_affine_rotated_roundtrip, q4_affine_roundtrip, q4_rotated_roundtrip, q4_roundtrip,
-            q8_roundtrip,
+            q4_affine_rotated_roundtrip, q4_affine_roundtrip, q4_affine_row_rotated_roundtrip,
+            q4_affine_row_roundtrip, q4_rotated_roundtrip, q4_roundtrip, q8_roundtrip,
+            q8_row_rotated_roundtrip, q8_row_roundtrip,
         };
         use crate::metal::step_kernel::{StepFinishMode, StepSmokeConfig, build_step_runtime};
         use crate::tokenizer::Tokenizer;
@@ -2134,21 +2135,35 @@ mod engine_extend_bench_tests {
             }
         }
 
-        let names = ["q8", "q4_sym", "q4_affine", "q4_sym_rot", "q4_affine_rot"];
-        let fns: [fn(&[f32], &mut [f32]); 5] = [
+        let names = [
+            "q8",
+            "q4_sym",
+            "q4_affine",
+            "q4_sym_rot",
+            "q4_affine_rot",
+            "q8_row",
+            "q8_row_rot",
+            "q4_aff_row",
+            "q4_aff_row_rot",
+        ];
+        let fns: [fn(&[f32], &mut [f32]); 9] = [
             q8_roundtrip,
             q4_roundtrip,
             q4_affine_roundtrip,
             q4_rotated_roundtrip,
             q4_affine_rotated_roundtrip,
+            q8_row_roundtrip,
+            q8_row_rotated_roundtrip,
+            q4_affine_row_roundtrip,
+            q4_affine_row_rotated_roundtrip,
         ];
 
         eprintln!(
             "e8-m0: K quant rel-RMS, post- vs pre-RoPE ({n} tokens, aggregate per layer class)"
         );
         for full_class in [false, true] {
-            let mut num = [[0f64; 2]; 5];
-            let mut den = [[0f64; 2]; 5];
+            let mut num = [[0f64; 2]; 9];
+            let mut den = [[0f64; 2]; 9];
             for layer in 0..N_LAYERS {
                 let l = &layout.layers[layer];
                 if (l.is_full != 0) != full_class {
