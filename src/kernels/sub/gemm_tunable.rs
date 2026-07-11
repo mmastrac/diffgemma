@@ -152,3 +152,170 @@ pub fn pipeline_for_sparse_bm(
     let bn = if bm == 32 { SPARSE_BN } else { 64 };
     pipeline_for_sparse_tile(ctx, n, k, gather, format, bm, bn)
 }
+
+/// Run `gemm_tunable_sparse` on a grouped MoE fixture with CPU-built 32-row
+/// blocks (bucket_fill phase-1 mirror), non-gather (A from the f32 buffer).
+/// Self-contained (no dependency on the legacy gemm_block_sparse harness) so it
+/// survives that kernel's retirement. Used by the nvfp4 port oracle.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn gpu_sparse_tunable(
+    f: &crate::kernels::sub::gemm_linear_grouped::Fixture,
+) -> Result<Vec<f32>, Error> {
+    use crate::metal::buffer::BufferPool;
+    use crate::metal::device::MetalContext;
+    use crate::metal::{BlockGroupedJob, RouteScratch};
+    use objc2_metal::{
+        MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
+    };
+
+    let ctx = MetalContext::new()?;
+    let mut pool = BufferPool::new();
+    let jobs = f.jobs();
+    let w_blob = f.w_blob();
+    let out_len = f.out_len();
+    let num_jobs = f.num_jobs();
+
+    let mut route: Box<RouteScratch> = unsafe { Box::new(std::mem::zeroed()) };
+    for (i, &rs) in f.row_starts.iter().enumerate().take(num_jobs + 1) {
+        route.row_start[i] = rs;
+    }
+    route.num_active_experts = num_jobs as u32;
+    for e in 0..num_jobs {
+        route.active_expert[e] = e as u32;
+    }
+    // 32-row block emission (SPARSE_BM), identical to bucket_fill phase 1.
+    let mut blk = 0usize;
+    for e in 0..num_jobs {
+        let base = f.row_starts[e];
+        let count = f.row_starts[e + 1] - f.row_starts[e];
+        for b in 0..(count as usize).div_ceil(SPARSE_BM) {
+            route.block_expert[blk] = e as u32;
+            route.block_row0[blk] = base + (b * SPARSE_BM) as u32;
+            blk += 1;
+        }
+    }
+    route.num_blocks = blk as u32;
+
+    let buf_a = pool
+        .allocate(&ctx.device, f.a.len() * 4)
+        .ok_or(Error::Format("alloc a"))?;
+    let buf_w = pool
+        .allocate(&ctx.device, w_blob.len())
+        .ok_or(Error::Format("alloc w"))?;
+    let buf_c = pool
+        .allocate(&ctx.device, out_len * 4)
+        .ok_or(Error::Format("alloc c"))?;
+    let buf_jobs = pool
+        .allocate(
+            &ctx.device,
+            jobs.len() * std::mem::size_of::<BlockGroupedJob>(),
+        )
+        .ok_or(Error::Format("alloc jobs"))?;
+    let buf_rs = pool
+        .allocate(&ctx.device, f.row_starts.len() * 4)
+        .ok_or(Error::Format("alloc rs"))?;
+    let buf_route = pool
+        .allocate(&ctx.device, std::mem::size_of::<RouteScratch>())
+        .ok_or(Error::Format("alloc route"))?;
+    BufferPool::write_f32(&buf_a, &f.a);
+    BufferPool::write_bytes(&buf_w, &w_blob);
+    BufferPool::write_bytes(&buf_jobs, unsafe {
+        std::slice::from_raw_parts(
+            jobs.as_ptr().cast::<u8>(),
+            jobs.len() * std::mem::size_of::<BlockGroupedJob>(),
+        )
+    });
+    BufferPool::write_bytes(&buf_rs, unsafe {
+        std::slice::from_raw_parts(f.row_starts.as_ptr().cast::<u8>(), f.row_starts.len() * 4)
+    });
+    BufferPool::write_bytes(&buf_route, unsafe {
+        std::slice::from_raw_parts(
+            route.as_ref() as *const RouteScratch as *const u8,
+            std::mem::size_of::<RouteScratch>(),
+        )
+    });
+    BufferPool::write_f32(&buf_c, &vec![0.0f32; out_len]);
+
+    let pipe = pipeline_for_sparse_tile(
+        &ctx,
+        f.n as u32,
+        f.k as u32,
+        false,
+        f.format,
+        SPARSE_BM,
+        SPARSE_BN,
+    )?;
+    let grid = MTLSize {
+        width: f.n.div_ceil(SPARSE_BN),
+        height: route.num_blocks as usize,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: crate::kernels::sub::gemm_common::THREADS_PER_TG,
+        height: 1,
+        depth: 1,
+    };
+    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+    enc.setComputePipelineState(&pipe.pipeline);
+    crate::kernels::sub::gemm_block_grouped::bind_gpu_buffers(
+        &enc,
+        &buf_a,
+        &buf_w,
+        &buf_c,
+        &buf_jobs,
+        &buf_rs,
+        &buf_route,
+        num_jobs as u32,
+    );
+    enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    enc.endEncoding();
+    cmd.commit();
+    cmd.waitUntilCompleted();
+
+    let mut out = vec![0.0f32; out_len];
+    BufferPool::read_f32(&buf_c, &mut out);
+    Ok(out)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod sparse_nvfp4_tests {
+    use super::*;
+    use crate::kernels::sub::gemm_linear_grouped::grouped_fixture;
+    use crate::kernels::sub::test_util::assert_oracle;
+
+    /// Same ragged M-tile boundary coverage as the block_sparse suite.
+    const COUNTS: &[usize] = &[1, 6, 8, 9, 16, 17, 31, 33, 40, 0, 100];
+
+    /// Port oracle: `gemm_tunable_sparse` at nvfp4 must be BIT-EXACT vs the
+    /// production-proven `gemm_block_sparse` (same per-output K-accumulation
+    /// chain + `half(e2m1*scale)` dequant + `arena_round_f32` store). Guards the
+    /// nvfp4 branch added when the block_sparse family was retired. NOTE: this
+    /// cross-check depends on gemm_block_sparse; when that kernel is deleted the
+    /// durable oracle below (vs CPU) remains.
+    #[test]
+    fn sparse_nvfp4_bitexact_vs_block_sparse() {
+        let f = grouped_fixture(QuantFormat::NvFp4, 64, 192, COUNTS);
+        let legacy = crate::kernels::sub::gemm_block_sparse::gpu_sparse(&f, false)
+            .expect("legacy block_sparse");
+        let tuned = gpu_sparse_tunable(&f).expect("tunable sparse");
+        assert_eq!(legacy.len(), tuned.len());
+        for (i, (a, b)) in legacy.iter().zip(tuned.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "nvfp4 output {i} differs: block_sparse {a} tunable {b}"
+            );
+        }
+    }
+
+    /// Durable independent oracle (survives block_sparse retirement): tunable
+    /// nvfp4 output tracks the grouped CPU reference within quant tolerance.
+    #[test]
+    fn sparse_nvfp4_matches_cpu_oracle() {
+        let f = grouped_fixture(QuantFormat::NvFp4, 64, 192, COUNTS);
+        let tuned = gpu_sparse_tunable(&f).expect("tunable sparse");
+        let oracle = crate::kernels::sub::gemm_block_grouped::cpu(&f);
+        assert_oracle(&tuned, &oracle, 0.05, 0.999);
+    }
+}

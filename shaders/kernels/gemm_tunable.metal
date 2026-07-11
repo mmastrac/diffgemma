@@ -403,9 +403,17 @@ kernel void gemm_tunable_sparse(
     if (n0 >= N) {
         return;
     }
+    const bool is_nvfp4 = (K_QUANT_FORMAT == QUANT_NVFP4);
     const bool is_q6 = (K_QUANT_FORMAT == QUANT_Q6);
     const ulong w_off = jobs[e].w_byte_off;
-    const ulong rowB = is_q6 ? q6_row_bytes(K) : q4_row_bytes(K);
+    // nvfp4 rows carry a 4-byte f32 global scale header at w_off; the row body
+    // (packed codes + per-group fp8 scales) starts at w_off+4. q4/q6 have no
+    // header (body == w_off). Same layout resolve as gemm_block_sparse.
+    const ulong body = is_nvfp4 ? w_off + 4ul : w_off;
+    const float nvfp4_gscale =
+        is_nvfp4 ? as_type<float>(*(device const uint *)(blob + w_off)) : 0.0f;
+    const ulong rowB =
+        is_nvfp4 ? nvfp4_row_bytes(K) : (is_q6 ? q6_row_bytes(K) : q4_row_bytes(K));
     const uint ltid = lid.x;
 
     const uint qid = lane / 4u;
@@ -456,17 +464,26 @@ kernel void gemm_tunable_sparse(
             }
             *(threadgroup half4 *)(&Xs[mm][kk]) = h;
         }
-        // W tile: expert q4/q6 rows.
+        // W tile: expert q4/q6/nvfp4 rows.
         {
             const uint gn = n0 + w_r;
             if (gn < N) {
-                if (is_q6) {
+                if (is_nvfp4) {
+                    // nvfp4 groups are 16-wide (vs 32 for q4/q6); the range
+                    // helper decodes by ABSOLUTE column (k0 + w_q + i), so it
+                    // resolves the per-column 16-group + fp8 scale itself.
+                    // Same half(e2m1*scale) math as gemm_block_sparse's
+                    // full-tile decode -> bit-identical.
+                    dequant_nvfp4_tile_half_fused_tg_range(
+                        blob + body + (ulong)gn * rowB, K, k0,
+                        &Ws[w_r][w_q], nvfp4_gscale, k0 + w_q, w_cols);
+                } else if (is_q6) {
                     dequant_q6_group_half_tg_range(
-                        blob + w_off + (ulong)gn * rowB + (ulong)(k0 / 32u) * 28ul,
+                        blob + body + (ulong)gn * rowB + (ulong)(k0 / 32u) * 28ul,
                         &Ws[w_r][w_q], w_q, w_cols);
                 } else {
                     device const uchar *g =
-                        blob + w_off + (ulong)gn * rowB + (ulong)(k0 / 32u) * 20ul;
+                        blob + body + (ulong)gn * rowB + (ulong)(k0 / 32u) * 20ul;
                     const half s = half(bf16_bytes(g));
                     const half mn = half(bf16_bytes(g + 2));
                     for (uint j8 = 0u; j8 < w_cols; j8 += 8u) {
