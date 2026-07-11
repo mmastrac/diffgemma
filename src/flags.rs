@@ -1,13 +1,16 @@
 //! Central runtime configuration.
 //!
 //! Every `DGQ_*` env flag is parsed EXACTLY ONCE into a [`Config`] value; all
-//! runtime accessors read that value through the process-global [`config`].
-//! This replaces the old scatter of per-call `std::env::var` reads:
+//! runtime accessors read it through [`config`]. This replaces the old scatter
+//! of per-call `std::env::var` reads:
 //!
-//! - **Production** lazily loads [`Config::from_env`] on first access.
+//! - **Production** reads a shared, read-only base lazily loaded from
+//!   [`Config::from_env`] once (`base`).
 //! - **Tests** craft an explicit [`Config`] and install it for their scope via
-//!   [`install_for_test`] (an RAII guard restores the prior config on drop) —
-//!   no `set_var`/`remove_var` (which is `unsafe` and racy under edition 2024).
+//!   [`install_for_test`] — a THREAD-LOCAL override (RAII guard restores the
+//!   prior value on drop). Thread-local so a stray override can never leak into
+//!   another test (libtest runs each on its own thread) or another reader. No
+//!   `set_var`/`remove_var` (`unsafe` and racy under edition 2024).
 //!
 //! The public accessor functions (`freeze_enabled()`, `kv_format()`, …) keep
 //! their signatures and are thin typed views into [`config`], so call sites are
@@ -24,8 +27,9 @@
 //! layout) and a handful of test-only probe knobs (`DGQ_E15_PROMPT`,
 //! `DGQ_ARENA_F16_ALL`, `DGQ_KV_RING_UNCAPPED`, …).
 
+use std::cell::RefCell;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
 
 /// `=0`/`false` disables; anything else (or unset) leaves it ON.
 fn env_on_unless_zero(name: &str) -> bool {
@@ -157,11 +161,11 @@ impl Default for PrefillFlags {
 /// KV-cache configuration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KvFlags {
-    /// Raw `DGQ_KV_Q8` override string (unset = None). Deliberately kept raw:
-    /// `kv_format` and `estimate_resident_bytes` have historically applied it
-    /// with slightly different rules (only `"0"` forces f16 in the estimate),
-    /// preserved here byte-for-byte.
-    pub q8_override: Option<String>,
+    /// `DGQ_KV_Q8` override: `Some(true)` forces q8, `Some(false)` forces f16,
+    /// `None` = the auto policy. Unified 2026-07-11: `kv_format` and
+    /// `estimate_resident_bytes` previously disagreed on non-`1`/`0` values;
+    /// both now honor this bool identically (nobody relied on the divergence).
+    pub q8_override: Option<bool>,
     /// `DGQ_KV_REUSE`: cross-turn KV reuse. Default ON.
     pub reuse: bool,
     /// `DGQ_KV_MMAP`: file-backed KV buffer. Default OFF.
@@ -355,7 +359,11 @@ impl Config {
                 },
             },
             kv: KvFlags {
-                q8_override: std::env::var("DGQ_KV_Q8").ok(),
+                q8_override: match std::env::var("DGQ_KV_Q8") {
+                    Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => Some(true),
+                    Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") => Some(false),
+                    _ => None, // unset or unrecognized → auto policy
+                },
                 reuse: env_on_unless_zero("DGQ_KV_REUSE"),
                 mmap: env_on_if_one("DGQ_KV_MMAP"),
                 mmap_dir: std::env::var_os("DGQ_KV_MMAP_DIR")
@@ -431,24 +439,39 @@ fn gib_bytes(name: &str) -> usize {
 // Process-global config + test override
 // ===========================================================================
 
-fn slot() -> &'static RwLock<Arc<Config>> {
-    static GLOBAL: OnceLock<RwLock<Arc<Config>>> = OnceLock::new();
-    GLOBAL.get_or_init(|| RwLock::new(Arc::new(Config::from_env())))
+/// The shared, read-only base config — loaded from env exactly once. Every
+/// thread sees the same base; a test override or [`set_quiet`] diverges only
+/// the CURRENT THREAD (see `OVERRIDE`), so a stray override can never leak
+/// across threads (libtest runs each test on its own thread) or corrupt other
+/// readers. There is no process-global mutable config.
+fn base() -> Arc<Config> {
+    static BASE: OnceLock<Arc<Config>> = OnceLock::new();
+    BASE.get_or_init(|| Arc::new(Config::from_env())).clone()
 }
 
-/// The process-global config. Lazily loaded from env on first access; a test
-/// override ([`install_for_test`]) or [`set_quiet`] swaps it atomically.
+thread_local! {
+    /// Per-thread override of [`base`]. `None` = use the base. Installed by
+    /// [`install_for_test`] (RAII) and [`set_quiet`]. Because it is
+    /// thread-local, work that a `config()` reader spawns onto ANOTHER thread
+    /// sees the base, not the override — every current caller reads on the same
+    /// thread it configured (Metal dispatch is synchronous), so this is safe.
+    static OVERRIDE: RefCell<Option<Arc<Config>>> = const { RefCell::new(None) };
+}
+
+/// The effective config on THIS thread: the thread-local override if one is
+/// installed, else the shared env-loaded base.
 pub fn config() -> Arc<Config> {
-    slot().read().expect("config lock poisoned").clone()
+    OVERRIDE.with(|o| o.borrow().clone()).unwrap_or_else(base)
 }
 
-/// Runtime quiet toggle — replaces the old `set_var("DGQ_QUIET", "1")` calls.
-/// Clones the current config, flips `debug.quiet`, and installs it.
+/// Runtime quiet toggle (this thread) — replaces the old `set_var("DGQ_QUIET")`.
+/// Installs a thread-local override cloned from the current config with
+/// `debug.quiet` flipped. The command handlers that call this run their
+/// generation on the same thread, so the toggle is seen.
 pub fn set_quiet(quiet: bool) {
-    let mut w = slot().write().expect("config lock poisoned");
-    let mut cfg = (**w).clone();
+    let mut cfg = (*config()).clone();
     cfg.debug.quiet = quiet;
-    *w = Arc::new(cfg);
+    OVERRIDE.with(|o| *o.borrow_mut() = Some(Arc::new(cfg)));
 }
 
 /// Whether the user explicitly set `DGQ_QUIET` in the environment (so a caller
@@ -457,28 +480,27 @@ pub fn quiet_set_by_user() -> bool {
     config().debug.quiet_from_env
 }
 
-/// Install `cfg` as the global config for the current scope; the returned guard
-/// restores the previous config on drop. TEST ONLY. The suite runs
-/// single-threaded (`--test-threads=1`), so scopes never overlap.
+/// Install `cfg` as the config for the CURRENT THREAD's scope; the returned
+/// guard restores the prior thread-local override on drop. TEST ONLY.
 #[cfg(test)]
 #[must_use = "the override is reverted when the guard drops"]
 pub fn install_for_test(cfg: Config) -> TestGuard {
-    let mut w = slot().write().expect("config lock poisoned");
-    let prev = w.clone();
-    *w = Arc::new(cfg);
+    let prev = OVERRIDE.with(|o| o.borrow_mut().replace(Arc::new(cfg)));
     TestGuard { prev }
 }
 
-/// RAII guard from [`install_for_test`]: restores the prior config on drop.
+/// RAII guard from [`install_for_test`]: restores the prior thread-local
+/// override (possibly `None`) on drop.
 #[cfg(test)]
 pub struct TestGuard {
-    prev: Arc<Config>,
+    prev: Option<Arc<Config>>,
 }
 
 #[cfg(test)]
 impl Drop for TestGuard {
     fn drop(&mut self) {
-        *slot().write().expect("config lock poisoned") = self.prev.clone();
+        let prev = self.prev.take();
+        OVERRIDE.with(|o| *o.borrow_mut() = prev);
     }
 }
 
@@ -726,9 +748,9 @@ pub fn set_gpu_working_set_cap(bytes: u64) {
 /// writer/reader compiles a matching function-constant variant.
 pub fn kv_format(max_seq: usize) -> crate::kernels::sub::kv_quant::KvFormat {
     use crate::kernels::sub::kv_quant::KvFormat;
-    // Explicit override (any set value): 1/true → q8, else → f16.
-    if let Some(v) = config().kv.q8_override.as_deref() {
-        return if v == "1" || v.eq_ignore_ascii_case("true") {
+    // Explicit override wins.
+    if let Some(force_q8) = config().kv.q8_override {
+        return if force_q8 {
             KvFormat::Q8
         } else {
             KvFormat::F16
@@ -763,13 +785,14 @@ pub const CTX_SAFE_FRACTION: f64 = 0.90;
 
 /// Estimated GPU-resident bytes at `max_seq`, mirroring what the engine will
 /// actually allocate: q8 KV (≈half) auto-enables once the f16 resident would
-/// exceed `CTX_Q8_AUTO_FRACTION` of `budget_bytes`. `DGQ_KV_Q8=0` forces f16.
-/// (Preserves the historical quirk: only the literal `"0"` forces f16 here,
-/// unlike `kv_format` which treats any non-`1`/`true` value as f16.)
+/// exceed `CTX_Q8_AUTO_FRACTION` of `budget_bytes`. `DGQ_KV_Q8` forces the
+/// format either way — the SAME rule as `kv_format`.
 pub fn estimate_resident_bytes(max_seq: usize, budget_bytes: u64) -> u64 {
     let f16 = CTX_BASE_BYTES + CTX_F16_KV_PER_TOKEN * max_seq as f64;
-    let force_f16 = config().kv.q8_override.as_deref() == Some("0");
-    let q8 = !force_f16 && budget_bytes > 0 && f16 > CTX_Q8_AUTO_FRACTION * budget_bytes as f64;
+    let q8 = match config().kv.q8_override {
+        Some(force_q8) => force_q8,
+        None => budget_bytes > 0 && f16 > CTX_Q8_AUTO_FRACTION * budget_bytes as f64,
+    };
     let per_tok = if q8 {
         CTX_F16_KV_PER_TOKEN * 0.5
     } else {
@@ -1056,6 +1079,40 @@ mod config_tests {
         assert!(!progress_enabled());
         set_quiet(false);
         assert!(progress_enabled());
+    }
+
+    #[test]
+    fn kv_q8_override_is_consistent_across_consumers() {
+        use crate::kernels::sub::kv_quant::KvFormat;
+        let budget = 26 * 1024 * 1024 * 1024u64;
+        let q8_bytes = {
+            let mut cfg = Config::default();
+            cfg.kv.q8_override = Some(true);
+            let _g = install_for_test(cfg);
+            assert!(matches!(kv_format(8192), KvFormat::Q8), "force-on → q8");
+            estimate_resident_bytes(100_000, budget)
+        };
+        let f16_bytes = {
+            let mut cfg = Config::default();
+            cfg.kv.q8_override = Some(false);
+            let _g = install_for_test(cfg);
+            assert!(matches!(kv_format(8192), KvFormat::F16), "force-off → f16");
+            estimate_resident_bytes(100_000, budget)
+        };
+        // Both consumers honor the SAME override: q8 halves per-token KV.
+        assert!(q8_bytes < f16_bytes, "q8 override must shrink the estimate");
+    }
+
+    #[test]
+    fn override_is_thread_local() {
+        // An override installed here must NOT be visible on another thread
+        // (which sees the shared base) — the isolation the design guarantees.
+        let mut cfg = Config::default();
+        cfg.sampler.freeze = true;
+        let _g = install_for_test(cfg);
+        assert!(freeze_enabled(), "override visible on this thread");
+        let base_freeze = std::thread::spawn(freeze_enabled).join().unwrap();
+        assert!(!base_freeze, "other thread sees the base, not the override");
     }
 
     #[test]
