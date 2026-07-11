@@ -82,24 +82,27 @@ Settled against the reference implementations and the CPU oracle — do NOT
 
 ## 3. Prefill path selection
 
-`should_fast_prefill(prompt_len)` (src/flags.rs) selects a **band** since
-2026-07-10 (e8de7d1): prompts ≤ 256 tokens use the **f32 engine** prefill;
-256 < len ≤ `DGQ_FAST_PREFILL_MAX` (default **2048**) use the **fast
-quantized (bf16 activation) prefill** (~10× faster); prompts ABOVE the cap
-return to the slow-but-correct f32 engine. Cross-turn delta reuse follows the
-same rule on the DELTA length: short deltas fast-resume at the reuse offset,
-long deltas extend via the engine in canvas-sized blocks. `DGQ_FAST_PREFILL=1|0`
-still forces either path for all lengths; `DGQ_FAST_PREFILL_MAX=0` uncaps.
+`should_fast_prefill(prompt_len)` (src/flags.rs): prompts ≤ 256 tokens use
+the **f32 engine** prefill; longer prompts use the **fast quantized (bf16
+activation) prefill** (~20× faster, ~3 ms/token). `DGQ_FAST_PREFILL_MAX`
+(default **0** = uncapped) can reinstate an upper band above which prompts
+return to the engine. Cross-turn delta reuse follows the same rule on the
+DELTA length: short deltas fast-resume at the reuse offset, long deltas
+extend via the engine in canvas-sized blocks. `DGQ_FAST_PREFILL=1|0` still
+forces either path for all lengths.
 
-Why the cap (task #64, 2026-07-10): the fast prefill's bf16 activation
-stream accumulates error across (position × layer) through the causal K/V
-recurrence — real-document Q&A is exact to ~2.2k prompt tokens, degraded at
-~4.2k, fluently hallucinated at 6.6k, while the engine is exact at every
-probed length and MLX (fp16 stream) is exact at 6.6k. All discrete kernels
-were A/B-exonerated. Needle probes DO NOT catch this class (retrieval rides
-a few sharp attention edges and stayed exact throughout) — long-context
-validation must use document-comprehension ladders (ROADMAP E13). The cap
-lifts when the fp16 prefill stream lands (ROADMAP E11).
+Cap history (task #64/#68): from 2026-07-09..10 the default cap was 2048 as
+a mitigation for a length-dependent comprehension collapse (grounded to
+~2.2k, hallucinating at 6.6k). The root cause (fixed 2b0d12b, 2026-07-10)
+was a spurious `RmsNormHidden` on the encoder pass — the DENOISE preamble's
+no-scale norm applied to the prefill hidden. Scale-invariance through
+`input_layernorm` kept layer-0 K/V engine-exact (hiding it) while the
+residual stream carried a per-token rescale that systematically flipped MoE
+routes (L1 KV 33% off at every length; 0.013 post-fix). Post-fix the fast
+path is doc-QA-grounded at 3.2k/4.2k/6.6k/13k and the cap default is 0.
+Validation lesson: needle probes DO NOT catch this class (retrieval rides a
+few sharp attention edges and stayed exact throughout) — long-context
+validation must use document-comprehension ladders (ROADMAP E13).
 
 History of the short-prompt floor (see KERNELS.md for the full data): fast
 prefill's bf16 activations perturb outlier KV channels enough to flip MoE

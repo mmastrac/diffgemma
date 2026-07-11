@@ -523,20 +523,11 @@ pub fn prefill_resident_enabled() -> bool {
 /// short-answer prompts); long prompts take the ~10x-faster quantized path.
 pub const FAST_PREFILL_MIN_TOKENS: usize = 256;
 
-/// Max prompt length (tokens) the fast quantized prefill is trusted for
-/// (`DGQ_FAST_PREFILL_MAX`; 0 = no cap). DEFAULT 2048 pending the fp16-stream
-/// fix (task #64, 2026-07-10): the fast prefill's bf16 activation stream
-/// accumulates error with length — grounded/correct answers through ~2.2k
-/// tokens, degraded at ~4.2k, total hallucination at 6.6k (engine f32 prefill
-/// correct at every probed length, MLX fp16 correct at 6.6k). Discrete bugs
-/// were fixed first (pad-row ring clobber, 3285ebe) and every kernel family
-/// was A/B-exonerated (scalar/MMA both degrade; GEMM/MoE/rope byte-identical
-/// swaps) — the remaining delta to the correct engine is activation
-/// precision. Above the cap prompts take the slow-but-correct f32 engine.
-/// E11: fast prefill runs on fp16 activation-arena pipelines (K_ARENA_F16)
-/// instead of bf16 — 2^-11 relative rounding vs 2^-8, targeting the
-/// length-accumulating comprehension loss (task #64/#65). Denoise keeps the
-/// gate-validated bf16 set. Opt-in until the doc-probe ladder + gate sign off.
+/// E11 (DISPROVEN as the long-prompt fix; kept as a diagnostic): fast prefill
+/// runs on fp16 activation-arena pipelines (K_ARENA_F16) instead of bf16 —
+/// 2^-11 relative rounding vs 2^-8. Built while hunting task #64; the real
+/// cause was the spurious encoder RmsNormHidden (fixed 2b0d12b), not stream
+/// precision. Denoise keeps the gate-validated bf16 set. Opt-in.
 pub fn prefill_f16_enabled() -> bool {
     on_if_one("DGQ_PREFILL_F16")
 }
@@ -553,11 +544,20 @@ pub fn prefill_kv_f32_enabled() -> bool {
     on_if_one("DGQ_PREFILL_KV_F32")
 }
 
+/// Max prompt length (tokens) the fast quantized prefill handles
+/// (`DGQ_FAST_PREFILL_MAX`; 0 = no cap; prompts above a non-zero cap take the
+/// f32 engine). DEFAULT 0 (uncapped) since the task #64/#68 root-cause fix
+/// (2b0d12b, 2026-07-10): the length-dependent comprehension collapse was a
+/// spurious encoder-pass RmsNormHidden (the denoise preamble's norm) warping
+/// the residual stream into systematic MoE route flips — not accumulating
+/// precision error. Post-fix the fast path is doc-QA-grounded at every probed
+/// length (3.2k/4.2k/6.6k/13k) and gate-clean at seeds {7,42,123}; the cap
+/// era (default 2048, 2026-07-09..10) was the mitigation while the bug lived.
 pub fn fast_prefill_max_tokens() -> usize {
     std::env::var("DGQ_FAST_PREFILL_MAX")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(2048)
+        .unwrap_or(0)
 }
 
 /// Fast monolithic prefill (quantized + causal) vs the f32 engine for a
