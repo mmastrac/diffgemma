@@ -3809,10 +3809,8 @@ fn run_chat_cmd(
     // Quiet by default: chat is a UI, not a log. `--verbose` restores the
     // step/prefill/session logs; `--json` routes the event stream to stdout so
     // no human chrome may pollute it.
-    if !verbose && std::env::var_os("DGQ_QUIET").is_none() {
-        unsafe {
-            std::env::set_var("DGQ_QUIET", "1");
-        }
+    if !verbose && !flags::quiet_set_by_user() {
+        flags::set_quiet(true);
     }
     // `--json`: JSONL to stdout, all human output suppressed. Otherwise the
     // spinner/streaming renderer runs on an interactive tty (not under
@@ -4250,8 +4248,8 @@ fn run_smoketest_cmd(
     };
 
     // Per-step denoise progress would drown the gate report.
-    if std::env::var_os("DGQ_QUIET").is_none() {
-        unsafe { std::env::set_var("DGQ_QUIET", "1") };
+    if !flags::quiet_set_by_user() {
+        flags::set_quiet(true);
     }
 
     const SMOKE_MAX_SEQ: usize = 2048;

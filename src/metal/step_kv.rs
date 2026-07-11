@@ -2904,7 +2904,9 @@ mod engine_extend_bench_tests {
     #[ignore = "model-gated bench: cargo test --release engine_prefill_profile -- --ignored --nocapture"]
     fn engine_prefill_profile() {
         let Some(dir) = model_dir() else { return };
-        unsafe { std::env::set_var("DGQ_PREFILL_PROFILE", "1") };
+        let mut cfg = crate::flags::Config::default();
+        cfg.debug.prefill_profile = true;
+        let _g = crate::flags::install_for_test(cfg);
         let max_seq = 2048usize;
         let store = DgqStore::open(&dir).expect("dgq");
         let layout = build_layout(&build_offsets_from_store(&store), max_seq);

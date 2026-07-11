@@ -8060,13 +8060,9 @@ mod tests {
         }
 
         fn forward_row0_logits(dir: &Path, cfg: &StepSmokeConfig, fused: bool) -> Vec<f32> {
-            unsafe {
-                if fused {
-                    std::env::remove_var("DGQ_FUSED_ALGEBRA");
-                } else {
-                    std::env::set_var("DGQ_FUSED_ALGEBRA", "0");
-                }
-            }
+            let mut fcfg = crate::flags::Config::default();
+            fcfg.perf.fused_algebra = fused;
+            let _g = crate::flags::install_for_test(fcfg);
             let mut cfg = cfg.clone();
             cfg.finish = StepFinishMode::ForwardOnly;
             let (mut rt, _) = build_step_runtime(dir, &cfg).expect("runtime");
@@ -8105,9 +8101,6 @@ mod tests {
         let off = forward_row0_logits(dir, &cfg, false);
         let on = forward_row0_logits(dir, &cfg, true);
         let off2 = forward_row0_logits(dir, &cfg, false);
-        unsafe {
-            std::env::remove_var("DGQ_FUSED_ALGEBRA");
-        }
 
         let max = row0_max_abs_diff(&off, &on);
         let baseline = row0_max_abs_diff(&off, &off2);
@@ -8118,20 +8111,28 @@ mod tests {
         smoke.finish = StepFinishMode::Full;
         smoke.steps = 1;
         smoke.prefill_token_ids = Some(vec![23391u32]);
-        unsafe {
-            std::env::set_var("DGQ_FUSED_ALGEBRA", "0");
-        }
-        let (mut rt_off, _) = build_step_runtime(dir, &smoke).expect("rt off");
-        rt_off.run_forward_once(StepFinishMode::Full).expect("step");
-        let st_off = rt_off.read_canvas_state();
-        let logits_off = read_half_buffer_f32(&rt_off.bufs.logits, 0, VOCAB);
-        unsafe {
-            std::env::remove_var("DGQ_FUSED_ALGEBRA");
-        }
-        let (mut rt_on, _) = build_step_runtime(dir, &smoke).expect("rt on");
-        rt_on.run_forward_once(StepFinishMode::Full).expect("step");
-        let st_on = rt_on.read_canvas_state();
-        let logits_on = read_half_buffer_f32(&rt_on.bufs.logits, 0, VOCAB);
+        let (st_off, logits_off) = {
+            let mut c = crate::flags::Config::default();
+            c.perf.fused_algebra = false;
+            let _g = crate::flags::install_for_test(c);
+            let (mut rt_off, _) = build_step_runtime(dir, &smoke).expect("rt off");
+            rt_off.run_forward_once(StepFinishMode::Full).expect("step");
+            (
+                rt_off.read_canvas_state(),
+                read_half_buffer_f32(&rt_off.bufs.logits, 0, VOCAB),
+            )
+        };
+        let (st_on, logits_on) = {
+            let mut c = crate::flags::Config::default();
+            c.perf.fused_algebra = true;
+            let _g = crate::flags::install_for_test(c);
+            let (mut rt_on, _) = build_step_runtime(dir, &smoke).expect("rt on");
+            rt_on.run_forward_once(StepFinishMode::Full).expect("step");
+            (
+                rt_on.read_canvas_state(),
+                read_half_buffer_f32(&rt_on.bufs.logits, 0, VOCAB),
+            )
+        };
         let full_row0 = row0_max_abs_diff(&logits_off, &logits_on);
         eprintln!(
             "full-step ids[:4] off={:?} on={:?} row0_logits_max_abs={full_row0:.4e}",

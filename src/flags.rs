@@ -1,18 +1,34 @@
-//! Central registry of every `DGQ_*` environment flag.
+//! Central runtime configuration.
 //!
-//! All runtime env-flag accessors live in this module — grep here first.
-//! Conventions:
-//! - Production toggles default ON and are opt-OUT (`=0` disables); each one
-//!   names a shipped, evidence-backed default. They exist for A/B triage.
+//! Every `DGQ_*` env flag is parsed EXACTLY ONCE into a [`Config`] value; all
+//! runtime accessors read that value through the process-global [`config`].
+//! This replaces the old scatter of per-call `std::env::var` reads:
+//!
+//! - **Production** lazily loads [`Config::from_env`] on first access.
+//! - **Tests** craft an explicit [`Config`] and install it for their scope via
+//!   [`install_for_test`] (an RAII guard restores the prior config on drop) —
+//!   no `set_var`/`remove_var` (which is `unsafe` and racy under edition 2024).
+//!
+//! The public accessor functions (`freeze_enabled()`, `kv_format()`, …) keep
+//! their signatures and are thin typed views into [`config`], so call sites are
+//! unchanged and the change is provably byte-identical (the golden pack).
+//!
+//! Conventions preserved from the env era:
+//! - Production toggles default ON and are opt-OUT (`=0` disables); each names a
+//!   shipped, evidence-backed default. They exist for A/B triage.
 //! - Sampler-semantics toggles carry their sign-off history in the doc.
 //! - Debug/probe flags default OFF and are opt-IN (`=1` or a path enables).
 //!
-//! One deliberate exception lives outside this module:
-//! `DGQ_METAL_PIPELINE_CACHE` (pipeline_cache.rs) — dual bool/path semantics
-//! coupled to that module's directory layout.
+//! Deliberate exceptions still live outside this module: `DGQ_METAL_PIPELINE_CACHE`
+//! (pipeline_cache.rs, dual bool/path semantics coupled to its directory
+//! layout) and a handful of test-only probe knobs (`DGQ_E15_PROMPT`,
+//! `DGQ_ARENA_F16_ALL`, `DGQ_KV_RING_UNCAPPED`, …).
+
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock, RwLock};
 
 /// `=0`/`false` disables; anything else (or unset) leaves it ON.
-fn on_unless_zero(name: &str) -> bool {
+fn env_on_unless_zero(name: &str) -> bool {
     match std::env::var(name) {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
         Err(_) => true,
@@ -20,17 +36,455 @@ fn on_unless_zero(name: &str) -> bool {
 }
 
 /// `=1`/`true` enables; anything else (or unset) leaves it OFF.
-fn on_if_one(name: &str) -> bool {
+fn env_on_if_one(name: &str) -> bool {
     match std::env::var(name) {
         Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
         Err(_) => false,
     }
 }
 
-// ---------------------------------------------------------------------------
-// Sampler semantics (quality-affecting; changes need multi-seed gate + census
-// + user sign-off — see the quality-ratchet rule)
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// Config data model
+// ===========================================================================
+
+/// Sampler-semantics toggles (quality-affecting; changes need the multi-seed
+/// gate + census + sign-off — see the quality-ratchet rule).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SamplerFlags {
+    /// `DGQ_FREEZE`: hard-freeze accepted canvas rows (legacy). Default OFF.
+    pub freeze: bool,
+    /// `DGQ_DENOISER_ARGMAX`: commit row argmax vs tempered sample. Default ON.
+    pub denoiser_argmax: bool,
+    /// `DGQ_EARLY_STOP_MEAN_ENT` (nats; 0 disables). Default 0.05.
+    pub early_stop_mean_ent: f32,
+    /// `DGQ_EMPTY_REPLY_RETRY`: E6 degenerate-first-block re-roll count. Default 3.
+    pub empty_reply_retry: u32,
+    /// `DGQ_WS_BLOCK_STOP`: drop pure-whitespace committed blocks. Default OFF.
+    pub ws_block_stop: bool,
+    /// `DGQ_FORCE_CANVAS`: force the active canvas width (diagnostic). None = 256.
+    pub force_canvas: Option<u32>,
+}
+
+impl Default for SamplerFlags {
+    fn default() -> Self {
+        Self {
+            freeze: false,
+            denoiser_argmax: true,
+            early_stop_mean_ent: 0.05,
+            empty_reply_retry: 3,
+            ws_block_stop: false,
+            force_canvas: None,
+        }
+    }
+}
+
+/// Production perf toggles (all default ON, opt-out for A/B triage).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PerfFlags {
+    pub gemm_tunable: bool,
+    pub moe_block_sparse: bool,
+    /// Raw `DGQ_MOE_TILE_ADAPT` (effective value also requires `moe_block_sparse`).
+    pub moe_tile_adapt: bool,
+    /// Raw `DGQ_MOE_FUSE_GATHER` (effective value also requires `moe_block_sparse`).
+    pub moe_fuse_gather: bool,
+    /// `DGQ_MOE_PREFILL_BM`: 64|128 opt-in, else 32 (OFF).
+    pub moe_prefill_block_m: u32,
+    pub attn_mma: bool,
+    pub attn_mma_full: bool,
+    pub router_gemm: bool,
+    pub sc_sparse: bool,
+    pub attn_window: bool,
+    pub fused_algebra: bool,
+    pub partial_lm_head: bool,
+    pub encoder_gpu_moe: bool,
+    pub prefill_batch: bool,
+    pub prefill_mma: bool,
+    pub fast_block_extend: bool,
+    pub prefill_resident: bool,
+    /// `DGQ_ATTN_KV_BLOCK`: block size for sequential full-attention. Default 0 (OFF).
+    pub attn_kv_block: usize,
+}
+
+impl Default for PerfFlags {
+    fn default() -> Self {
+        Self {
+            gemm_tunable: true,
+            moe_block_sparse: true,
+            moe_tile_adapt: true,
+            moe_fuse_gather: true,
+            moe_prefill_block_m: 32,
+            attn_mma: true,
+            attn_mma_full: true,
+            router_gemm: true,
+            sc_sparse: true,
+            attn_window: true,
+            fused_algebra: true,
+            partial_lm_head: true,
+            encoder_gpu_moe: true,
+            prefill_batch: true,
+            prefill_mma: true,
+            fast_block_extend: true,
+            prefill_resident: true,
+            attn_kv_block: 0,
+        }
+    }
+}
+
+/// Prefill-path selection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrefillFlags {
+    /// `DGQ_PREFILL_F16`: fp16 activation arena in fast prefill. Default OFF.
+    pub f16: bool,
+    /// `DGQ_PREFILL_KV_F32`: E14 f32 side ring for sliding KV. Default OFF.
+    pub kv_f32: bool,
+    /// `DGQ_FAST_PREFILL_MAX`: max prompt tokens the fast path handles (0 = uncapped).
+    pub fast_prefill_max: usize,
+    /// `DGQ_FAST_PREFILL`: force fast prefill on/off for all lengths; None = length band.
+    pub fast_prefill_force: Option<bool>,
+}
+
+impl Default for PrefillFlags {
+    fn default() -> Self {
+        Self {
+            f16: false,
+            kv_f32: false,
+            fast_prefill_max: 0,
+            fast_prefill_force: None,
+        }
+    }
+}
+
+/// KV-cache configuration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KvFlags {
+    /// Raw `DGQ_KV_Q8` override string (unset = None). Deliberately kept raw:
+    /// `kv_format` and `estimate_resident_bytes` have historically applied it
+    /// with slightly different rules (only `"0"` forces f16 in the estimate),
+    /// preserved here byte-for-byte.
+    pub q8_override: Option<String>,
+    /// `DGQ_KV_REUSE`: cross-turn KV reuse. Default ON.
+    pub reuse: bool,
+    /// `DGQ_KV_MMAP`: file-backed KV buffer. Default OFF.
+    pub mmap: bool,
+    /// `DGQ_KV_MMAP_DIR`: backing-file dir (default system temp).
+    pub mmap_dir: PathBuf,
+}
+
+impl Default for KvFlags {
+    fn default() -> Self {
+        Self {
+            q8_override: None,
+            reuse: true,
+            mmap: false,
+            mmap_dir: std::env::temp_dir(),
+        }
+    }
+}
+
+/// Server (serve) configuration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerFlags {
+    /// `DGQ_CONV_CACHE_GB` → bytes for the RAM conversation-snapshot pool.
+    pub conv_cache_bytes: usize,
+    /// `DGQ_CONV_DISK_GB` → bytes for the SSD conversation-snapshot tier.
+    pub conv_disk_bytes: usize,
+    /// `DGQ_CONV_CACHE_DIR`: SSD tier dir (default per-process temp subdir).
+    pub conv_cache_dir: PathBuf,
+    /// `DGQ_TOOL_COMPACT`: enable the tool-output compactor. Default OFF.
+    pub tool_compact: bool,
+    /// `DGQ_TOOL_COMPACT_THRESHOLD`: tokens above which a tool response compacts.
+    pub tool_compact_threshold: usize,
+    /// `DGQ_TOOL_COMPACT_DIR`: full-output store dir (default per-process temp subdir).
+    pub tool_compact_dir: PathBuf,
+}
+
+impl Default for ServerFlags {
+    fn default() -> Self {
+        Self {
+            conv_cache_bytes: 0,
+            conv_disk_bytes: 0,
+            conv_cache_dir: default_conv_cache_dir(),
+            tool_compact: false,
+            tool_compact_threshold: 384,
+            tool_compact_dir: default_tool_compact_dir(),
+        }
+    }
+}
+
+fn default_conv_cache_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("dgq-conv-{}", std::process::id()))
+}
+
+fn default_tool_compact_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("dgq-toolout-{}", std::process::id()))
+}
+
+/// Debug / probe flags (all opt-in) plus the runtime `quiet` toggle.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DebugFlags {
+    /// `DGQ_QUIET`: suppress progress logs. Runtime-settable via [`set_quiet`].
+    pub quiet: bool,
+    /// Whether `DGQ_QUIET` was present in the env at load (so a runtime
+    /// auto-quiet doesn't clobber an explicit user setting).
+    pub quiet_from_env: bool,
+    pub logits_finite_check: bool,
+    pub logits_finite_samples: usize,
+    pub trace_entropy: bool,
+    pub trace_entropy_full: bool,
+    pub final_entropy_log: bool,
+    /// `DGQ_LOG_STEP_TEXT`: per-step decoded answer text. Default ON.
+    pub step_text_log: bool,
+    pub denoise_parity_log: bool,
+    pub denoise_parity_positions: usize,
+    pub log_early_stop: bool,
+    pub sc_log: bool,
+    pub trace_ranges: bool,
+    pub mem_watch: bool,
+    pub dump_kv_path: Option<String>,
+    pub moe_route_ref_path: Option<String>,
+    pub engine_layer_dump_path: Option<String>,
+    pub engine_layer_dump_pos: usize,
+    pub prefill_profile: bool,
+    pub parity_debug: bool,
+}
+
+impl Default for DebugFlags {
+    fn default() -> Self {
+        Self {
+            quiet: false,
+            quiet_from_env: false,
+            logits_finite_check: false,
+            logits_finite_samples: 4096,
+            trace_entropy: false,
+            trace_entropy_full: false,
+            final_entropy_log: false,
+            step_text_log: true,
+            denoise_parity_log: false,
+            denoise_parity_positions: 8,
+            log_early_stop: false,
+            sc_log: false,
+            trace_ranges: false,
+            mem_watch: false,
+            dump_kv_path: None,
+            moe_route_ref_path: None,
+            engine_layer_dump_path: None,
+            engine_layer_dump_pos: 129,
+            prefill_profile: false,
+            parity_debug: false,
+        }
+    }
+}
+
+/// The full runtime configuration. `Default` = the env-independent documented
+/// defaults (what tests build on); [`from_env`](Config::from_env) overlays the
+/// `DGQ_*` env vars onto those.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Config {
+    pub sampler: SamplerFlags,
+    pub perf: PerfFlags,
+    pub prefill: PrefillFlags,
+    pub kv: KvFlags,
+    pub server: ServerFlags,
+    pub debug: DebugFlags,
+}
+
+impl Config {
+    /// Parse every `DGQ_*` env flag once. The single source of env truth.
+    pub fn from_env() -> Self {
+        let parse_usize = |name: &str, default: usize| -> usize {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(default)
+        };
+        let quiet_from_env = std::env::var_os("DGQ_QUIET").is_some();
+
+        Config {
+            sampler: SamplerFlags {
+                freeze: env_on_if_one("DGQ_FREEZE"),
+                denoiser_argmax: env_on_unless_zero("DGQ_DENOISER_ARGMAX"),
+                early_stop_mean_ent: std::env::var("DGQ_EARLY_STOP_MEAN_ENT")
+                    .ok()
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .filter(|&x| x >= 0.0)
+                    .unwrap_or(0.05),
+                empty_reply_retry: std::env::var("DGQ_EMPTY_REPLY_RETRY")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(3),
+                ws_block_stop: env_on_if_one("DGQ_WS_BLOCK_STOP"),
+                force_canvas: std::env::var("DGQ_FORCE_CANVAS")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .filter(|&w| w >= 1),
+            },
+            perf: PerfFlags {
+                gemm_tunable: env_on_unless_zero("DGQ_GEMM_TUNABLE"),
+                moe_block_sparse: env_on_unless_zero("DGQ_MOE_BLOCK_SPARSE"),
+                moe_tile_adapt: env_on_unless_zero("DGQ_MOE_TILE_ADAPT"),
+                moe_fuse_gather: env_on_unless_zero("DGQ_MOE_FUSE_GATHER"),
+                moe_prefill_block_m: match std::env::var("DGQ_MOE_PREFILL_BM")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+                {
+                    Some(bm @ (64 | 128)) => bm,
+                    _ => 32,
+                },
+                attn_mma: env_on_unless_zero("DGQ_ATTN_MMA"),
+                attn_mma_full: env_on_unless_zero("DGQ_ATTN_MMA_FULL"),
+                router_gemm: env_on_unless_zero("DGQ_ROUTER_GEMM"),
+                sc_sparse: env_on_unless_zero("DGQ_SC_SPARSE"),
+                attn_window: env_on_unless_zero("DGQ_ATTN_WINDOW"),
+                fused_algebra: env_on_unless_zero("DGQ_FUSED_ALGEBRA"),
+                partial_lm_head: env_on_unless_zero("DGQ_PARTIAL_LM_HEAD"),
+                encoder_gpu_moe: env_on_unless_zero("DGQ_ENCODER_GPU_MOE"),
+                prefill_batch: env_on_unless_zero("DGQ_PREFILL_BATCH"),
+                prefill_mma: env_on_unless_zero("DGQ_PREFILL_MMA"),
+                fast_block_extend: env_on_unless_zero("DGQ_FAST_BLOCK_EXTEND"),
+                prefill_resident: env_on_unless_zero("DGQ_PREFILL_RESIDENT"),
+                attn_kv_block: parse_usize("DGQ_ATTN_KV_BLOCK", 0),
+            },
+            prefill: PrefillFlags {
+                f16: env_on_if_one("DGQ_PREFILL_F16"),
+                kv_f32: env_on_if_one("DGQ_PREFILL_KV_F32"),
+                fast_prefill_max: parse_usize("DGQ_FAST_PREFILL_MAX", 0),
+                fast_prefill_force: match std::env::var("DGQ_FAST_PREFILL").as_deref() {
+                    Ok("1") | Ok("true") => Some(true),
+                    Ok("0") | Ok("false") => Some(false),
+                    _ => None,
+                },
+            },
+            kv: KvFlags {
+                q8_override: std::env::var("DGQ_KV_Q8").ok(),
+                reuse: env_on_unless_zero("DGQ_KV_REUSE"),
+                mmap: env_on_if_one("DGQ_KV_MMAP"),
+                mmap_dir: std::env::var_os("DGQ_KV_MMAP_DIR")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(std::env::temp_dir),
+            },
+            server: ServerFlags {
+                conv_cache_bytes: gib_bytes("DGQ_CONV_CACHE_GB"),
+                conv_disk_bytes: gib_bytes("DGQ_CONV_DISK_GB"),
+                conv_cache_dir: std::env::var_os("DGQ_CONV_CACHE_DIR")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(default_conv_cache_dir),
+                tool_compact: env_on_if_one("DGQ_TOOL_COMPACT"),
+                tool_compact_threshold: std::env::var("DGQ_TOOL_COMPACT_THRESHOLD")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|&t| t > 0)
+                    .unwrap_or(384),
+                tool_compact_dir: std::env::var_os("DGQ_TOOL_COMPACT_DIR")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(default_tool_compact_dir),
+            },
+            debug: DebugFlags {
+                quiet: matches!(std::env::var("DGQ_QUIET").as_deref(), Ok("1"))
+                    || std::env::var("DGQ_QUIET")
+                        .map(|v| v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false),
+                quiet_from_env,
+                logits_finite_check: env_on_if_one("DGQ_CHECK_LOGITS"),
+                logits_finite_samples: parse_usize("DGQ_CHECK_LOGITS_SAMPLES", 4096),
+                trace_entropy: std::env::var("DGQ_TRACE_ENTROPY")
+                    .map(|v| {
+                        v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("full")
+                    })
+                    .unwrap_or(false),
+                trace_entropy_full: std::env::var("DGQ_TRACE_ENTROPY")
+                    .map(|v| v.eq_ignore_ascii_case("full"))
+                    .unwrap_or(false),
+                final_entropy_log: std::env::var("DGQ_LOG_FINAL_ENTROPY")
+                    .map(|v| {
+                        v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("full")
+                    })
+                    .unwrap_or(false),
+                step_text_log: env_on_unless_zero("DGQ_LOG_STEP_TEXT"),
+                denoise_parity_log: env_on_if_one("DGQ_LOG_DENOISE"),
+                denoise_parity_positions: parse_usize("DGQ_LOG_DENOISE_POS", 8),
+                log_early_stop: env_on_if_one("DGQ_LOG_EARLY_STOP"),
+                sc_log: std::env::var("DGQ_LOG_SC").ok().as_deref() == Some("1"),
+                trace_ranges: std::env::var("DGQ_TRACE_RANGES").is_ok(),
+                mem_watch: env_on_if_one("DGQ_MEM_WATCH"),
+                dump_kv_path: std::env::var("DGQ_DUMP_KV").ok(),
+                moe_route_ref_path: std::env::var("DGQ_MOE_ROUTE_REF").ok(),
+                engine_layer_dump_path: std::env::var("DGQ_ENGINE_LAYER_DUMP").ok(),
+                engine_layer_dump_pos: parse_usize("DGQ_ENGINE_LAYER_POS", 129),
+                prefill_profile: std::env::var("DGQ_PREFILL_PROFILE").is_ok(),
+                parity_debug: std::env::var_os("DGQ_PARITY_DEBUG").is_some(),
+            },
+        }
+    }
+}
+
+/// `DGQ_*_GB` gibibytes → bytes (0 / absent / non-positive → 0).
+fn gib_bytes(name: &str) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|g| *g > 0.0)
+        .map(|g| (g * 1024.0 * 1024.0 * 1024.0) as usize)
+        .unwrap_or(0)
+}
+
+// ===========================================================================
+// Process-global config + test override
+// ===========================================================================
+
+fn slot() -> &'static RwLock<Arc<Config>> {
+    static GLOBAL: OnceLock<RwLock<Arc<Config>>> = OnceLock::new();
+    GLOBAL.get_or_init(|| RwLock::new(Arc::new(Config::from_env())))
+}
+
+/// The process-global config. Lazily loaded from env on first access; a test
+/// override ([`install_for_test`]) or [`set_quiet`] swaps it atomically.
+pub fn config() -> Arc<Config> {
+    slot().read().expect("config lock poisoned").clone()
+}
+
+/// Runtime quiet toggle — replaces the old `set_var("DGQ_QUIET", "1")` calls.
+/// Clones the current config, flips `debug.quiet`, and installs it.
+pub fn set_quiet(quiet: bool) {
+    let mut w = slot().write().expect("config lock poisoned");
+    let mut cfg = (**w).clone();
+    cfg.debug.quiet = quiet;
+    *w = Arc::new(cfg);
+}
+
+/// Whether the user explicitly set `DGQ_QUIET` in the environment (so a caller
+/// can auto-enable quiet without clobbering an explicit choice).
+pub fn quiet_set_by_user() -> bool {
+    config().debug.quiet_from_env
+}
+
+/// Install `cfg` as the global config for the current scope; the returned guard
+/// restores the previous config on drop. TEST ONLY. The suite runs
+/// single-threaded (`--test-threads=1`), so scopes never overlap.
+#[cfg(test)]
+#[must_use = "the override is reverted when the guard drops"]
+pub fn install_for_test(cfg: Config) -> TestGuard {
+    let mut w = slot().write().expect("config lock poisoned");
+    let prev = w.clone();
+    *w = Arc::new(cfg);
+    TestGuard { prev }
+}
+
+/// RAII guard from [`install_for_test`]: restores the prior config on drop.
+#[cfg(test)]
+pub struct TestGuard {
+    prev: Arc<Config>,
+}
+
+#[cfg(test)]
+impl Drop for TestGuard {
+    fn drop(&mut self) {
+        *slot().write().expect("config lock poisoned") = self.prev.clone();
+    }
+}
+
+// ===========================================================================
+// Sampler semantics
+// ===========================================================================
 
 /// Hard-freeze of accepted canvas rows (`DGQ_FREEZE=1` re-enables the legacy
 /// behavior). Default OFF since 2026-07-05 (user sign-off): the freeze was
@@ -41,8 +495,7 @@ fn on_if_one(name: &str) -> bool {
 /// commit is the true full-canvas last-step argmax. ON additionally feeds the
 /// partial-lm_head row skip (dormant at default).
 pub fn freeze_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| on_if_one("DGQ_FREEZE"))
+    config().sampler.freeze
 }
 
 /// Commit the row argmax instead of the tempered categorical sample
@@ -52,149 +505,98 @@ pub fn freeze_enabled() -> bool {
 /// soft-embed, never the committed token. With no-freeze this is the
 /// MLX-exact config (gate 16,16,11; census 0/10 warty).
 pub fn denoiser_argmax_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| on_unless_zero("DGQ_DENOISER_ARGMAX"))
+    config().sampler.denoiser_argmax
 }
 
 /// Entropy-only early stop (`DGQ_EARLY_STOP_MEAN_ENT=<nats>`; 0 disables).
 /// A denoise block stops as soon as the full-canvas mean entropy falls below
 /// this (after `min_early_stop_steps`), WITHOUT waiting for full argmax
-/// stability. Our forward converges the answer text long before the argmax
-/// fully locks (the last ~10 steps only micro-flip near-tie positions and
-/// shrink entropy from ~0.1 to ~0.0001), so 0.05 cuts ~25-35% of steps on
-/// long replies. DEFAULT ON at 0.05 (user sign-off 2026-07-06; evidence:
-/// probe answers byte-identical, multi-seed gate + wart census neutral).
+/// stability. DEFAULT ON at 0.05 (user sign-off 2026-07-06; probe answers
+/// byte-identical, multi-seed gate + wart census neutral).
 pub fn early_stop_mean_ent() -> f32 {
-    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("DGQ_EARLY_STOP_MEAN_ENT")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .filter(|&x| x >= 0.0)
-            .unwrap_or(0.05)
-    })
+    config().sampler.early_stop_mean_ent
 }
 
 /// Empty/degenerate-reply retry (E6). On the FIRST denoise block only, if the
-/// committed canvas is degenerate (position 0 is a stop/eos/control token → the
-/// reply would trim to empty or lead with ceremony), re-roll the initial canvas
-/// from the advancing seed stream and re-run the block, up to N times. The empty
-/// reply is an intrinsic (prompt, initial-canvas)→eos attractor shared with MLX
-/// (E6 2026-07-07: forward is MLX-faithful, token-suppression recovers ceremony
-/// junk, template is load-bearing) — a fresh canvas draw escapes it for ~most
-/// seeds. Retries stay deterministic per `--seed` (canvas derives from the same
-/// rng chain). DEFAULT 3 (user sign-off 2026-07-07; seed-123 gate answers
-/// 13→17, calibration seeds 7/42 unchanged 17/17 = pure no-op on good replies,
-/// suite 714/0). `DGQ_EMPTY_REPLY_RETRY=0` disables.
+/// committed canvas is degenerate, re-roll the initial canvas from the
+/// advancing seed stream and re-run, up to N times. DEFAULT 3 (user sign-off
+/// 2026-07-07; seed-123 gate answers 13→17, seeds 7/42 unchanged 17/17).
+/// `DGQ_EMPTY_REPLY_RETRY=0` disables.
 pub fn empty_reply_retry() -> u32 {
-    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("DGQ_EMPTY_REPLY_RETRY")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(3)
-    })
+    config().sampler.empty_reply_retry
 }
 
-/// Whitespace-collapse STOPGAP (`DGQ_WS_BLOCK_STOP=1` enables). Very long
-/// replies can degenerate into a newline attractor (observed 2026-07-09 at
-/// ~7k reply tokens / 100k ctx: every block commits 256 newlines, entropy
-/// never converges, every block burns max_steps ~57s, and no stop token ever
-/// comes — the turn would crawl to the context wall). When enabled, a
-/// committed block whose text is PURE whitespace (or all pad/filler) is
-/// dropped and the turn ends. Default OFF while the attractor is treated as
-/// an UNFIXED BUG (suspects: fast-block-extend perturbation accumulation over
-/// ~30 extends, q8-KV-auto at long ctx, sliding-ring interaction) — a
-/// default-on stopper would truncate exactly the evidence needed to
-/// root-cause it. Flip to default ON (with gate + sign-off) only if the
-/// attractor turns out intrinsic.
+/// Whitespace-collapse STOPGAP (`DGQ_WS_BLOCK_STOP=1` enables). A committed
+/// block whose text is PURE whitespace (or all pad/filler) is dropped and the
+/// turn ends. Default OFF while the newline-attractor is treated as an UNFIXED
+/// BUG — a default-on stopper would truncate the evidence needed to root-cause
+/// it. Flip to default ON (with gate + sign-off) only if intrinsic.
 pub fn ws_block_stop_enabled() -> bool {
-    on_if_one("DGQ_WS_BLOCK_STOP")
+    config().sampler.ws_block_stop
 }
 
 /// TEST override for the denoise canvas width (E3/E6 shrink machinery). When
 /// set (`DGQ_FORCE_CANVAS=64|128|...`), every denoise step runs at this active
-/// canvas width instead of 256 — used to validate the `active_canvas` plumbing
-/// and measure the width→degeneracy curve on our engine. `None` = normal (256).
-/// Clamped to [1, CANVAS] at the use site. Diagnostic only; not a product flag.
+/// canvas width instead of 256. `None` = normal (256). Clamped to [1, CANVAS]
+/// at the use site. Diagnostic only; not a product flag.
 pub fn force_canvas() -> Option<u32> {
-    static V: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("DGQ_FORCE_CANVAS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|&w| w >= 1)
-    })
+    config().sampler.force_canvas
 }
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // Production perf toggles (all default ON, opt-out for A/B triage)
-// ---------------------------------------------------------------------------
+// ===========================================================================
 
 /// Tunable GEMM (fragment-level 64x64 kernels for Raw/q8/stacked/sparse-MoE).
 /// BIT-EXACT vs the legacy kernels; step 1.22 -> 0.97s. `DGQ_GEMM_TUNABLE=0`
 /// falls back to the legacy block GEMMs.
 pub fn gemm_tunable_enabled() -> bool {
-    on_unless_zero("DGQ_GEMM_TUNABLE")
+    config().perf.gemm_tunable
 }
 
 /// Block-sparse (megablocks-style) MoE expert GEMM: ragged M pre-tiled into
 /// <=32-row blocks, one block per threadgroup. Bit-identical, ~6%/step.
 /// `DGQ_MOE_BLOCK_SPARSE=0` falls back to the grouped path.
 pub fn moe_block_sparse_enabled() -> bool {
-    on_unless_zero("DGQ_MOE_BLOCK_SPARSE")
+    config().perf.moe_block_sparse
 }
 
 /// Adaptive M-tile for block-sparse MoE (BIT-IDENTICAL; perf wash today,
 /// latent win if the kernels go compute-bound — default ON per user
 /// 2026-07-02). Requires block-sparse. `DGQ_MOE_TILE_ADAPT=0` opts out.
 pub fn moe_tile_adapt_enabled() -> bool {
-    moe_block_sparse_enabled() && on_unless_zero("DGQ_MOE_TILE_ADAPT")
+    let c = config();
+    c.perf.moe_block_sparse && c.perf.moe_tile_adapt
 }
 
 /// Fuse the MoE gather into the gate_up block-sparse GEMM (bit-identical,
 /// ~28ms/step). Requires block-sparse. `DGQ_MOE_FUSE_GATHER=0` opts out.
 pub fn moe_fuse_gather_enabled() -> bool {
-    moe_block_sparse_enabled() && on_unless_zero("DGQ_MOE_FUSE_GATHER")
+    let c = config();
+    c.perf.moe_block_sparse && c.perf.moe_fuse_gather
 }
 
 /// Weight-stationary expert GEMM for batched-prefill super-chunks
-/// (`DGQ_MOE_PREFILL_BM=64|128` opts in; default 32 = OFF). BUILT +
-/// DISPROVEN 2026-07-07 (ROADMAP E1): taller blocks consolidate an expert's
-/// ~64 routed rows at M=1024 into one dequantized weight stream (bit-
-/// identical — 6.5k needle KV dump byte-equal at 32/64/128), but 64 is a
-/// WASH (21.1s vs 21.1s prefill) and 128 is 3.6x SLOWER (76s, register
-/// spill: TM=8 = 64 f32 accumulators/lane). Roofline says why: at M=1024
-/// the expert GEMM is COMPUTE-bound at the ~2.3 TF/s kernel wall (~48
-/// ms/layer MMA vs ~7.6 ms/layer weight bytes even with the 2.4x per-block
-/// re-reads) — cutting W bytes can't speed a compute-bound kernel. The
-/// eb0edba "capped by weight re-reads" attribution was wrong; the cap is
-/// kernel TF/s. Machinery kept for re-tests.
+/// (`DGQ_MOE_PREFILL_BM=64|128` opts in; default 32 = OFF). BUILT + DISPROVEN
+/// 2026-07-07 (ROADMAP E1): at M=1024 the expert GEMM is COMPUTE-bound at the
+/// ~2.3 TF/s kernel wall, so cutting weight bytes can't speed it (64 = wash,
+/// 128 = 3.6x slower via register spill). Machinery kept for re-tests.
 pub fn moe_prefill_block_m() -> u32 {
-    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        match std::env::var("DGQ_MOE_PREFILL_BM")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-        {
-            Some(bm @ (64 | 128)) => bm,
-            _ => 32,
-        }
-    })
+    config().perf.moe_prefill_block_m
 }
 
 /// GQA matrix-unit attention on sliding layers (~3-4.5%/step). Non-bit-
 /// identical (f16 MMA vs f32 scalar) but quality-neutral (multi-seed + MLX
 /// bench). `DGQ_ATTN_MMA=0` restores the scalar kernel.
 pub fn attn_mma_enabled() -> bool {
-    on_unless_zero("DGQ_ATTN_MMA")
+    config().perf.attn_mma
 }
 
 /// Matrix-unit attention on FULL layers (hd=512; attention -29% at kv=512).
 /// Non-bit-identical but quality-neutral (sign-off 2026-06-28).
 /// `DGQ_ATTN_MMA_FULL=0` restores the scalar kernel.
 pub fn attn_mma_full_enabled() -> bool {
-    on_unless_zero("DGQ_ATTN_MMA_FULL")
+    config().perf.attn_mma_full
 }
 
 /// Router-as-GEMM (~30ms/step). Non-bit-identical (near-tie expert flips =
@@ -202,8 +604,7 @@ pub fn attn_mma_full_enabled() -> bool {
 /// and the gate was re-baselined with it. `DGQ_ROUTER_GEMM=0` restores the
 /// serial router kernel.
 pub fn router_gemm_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| on_unless_zero("DGQ_ROUTER_GEMM"))
+    config().perf.router_gemm
 }
 
 /// Sparse SC softembed (top-survivors gather instead of the full vocab GEMM).
@@ -211,20 +612,20 @@ pub fn router_gemm_enabled() -> bool {
 /// output-level equivalent to MLX-4bit. Needs bf16 embed (gated at call
 /// site). `DGQ_SC_SPARSE=0` uses the exact chunked path.
 pub fn sc_sparse_enabled() -> bool {
-    on_unless_zero("DGQ_SC_SPARSE")
+    config().perf.sc_sparse
 }
 
 /// Sliding-window masking on sliding-attention layers (matches MLX
 /// `_make_decoder_masks`; bit-identical within the window, more correct AND
 /// O(window) beyond it). `DGQ_ATTN_WINDOW=0` restores unwindowed for A/B.
 pub fn attn_window_enabled() -> bool {
-    on_unless_zero("DGQ_ATTN_WINDOW")
+    config().perf.attn_window
 }
 
 /// Algebraic fusion: QKV and dense gate+up as one stacked GEMM (bit-identical,
 /// ~1.3%/step). `DGQ_FUSED_ALGEBRA=0` disables both for A/B.
 pub fn fused_algebra_enabled() -> bool {
-    on_unless_zero("DGQ_FUSED_ALGEBRA")
+    config().perf.fused_algebra
 }
 
 pub fn fused_qkv_enabled() -> bool {
@@ -239,150 +640,94 @@ pub fn fused_gate_up_enabled() -> bool {
 /// meaningful under `DGQ_FREEZE=1` (no rows freeze at default semantics).
 /// `DGQ_PARTIAL_LM_HEAD=0` opts out.
 pub fn partial_lm_head_enabled() -> bool {
-    on_unless_zero("DGQ_PARTIAL_LM_HEAD")
+    config().perf.partial_lm_head
 }
 
 /// Engine (f32) prefill runs MoE expert GEMMs on GPU (`=0` = CPU mirror, the
 /// exact `.dgq` oracle — the triage lever for engine-prefill drift).
 pub fn encoder_gpu_moe_enabled() -> bool {
-    on_unless_zero("DGQ_ENCODER_GPU_MOE")
+    config().perf.encoder_gpu_moe
 }
 
 /// Cross-turn KV reuse in chat (`DGQ_KV_REUSE=0` disables): keep the causal KV
 /// for the longest common prefix of the prior sequence and the new prompt, and
-/// prefill only the delta at that offset. Big multi-turn win (turn N no longer
-/// re-prefills the whole conversation history). NOT byte-identical to a full
-/// re-prefill (the reused prefix and the engine-prefilled delta can differ in
-/// precision from a single fast prefill of the whole prompt) but quality-
-/// equivalent — same class as the fast-vs-engine prefill approximation.
+/// prefill only the delta at that offset. NOT byte-identical to a full
+/// re-prefill but quality-equivalent (same class as fast-vs-engine prefill).
 pub fn kv_reuse_enabled() -> bool {
-    on_unless_zero("DGQ_KV_REUSE")
+    config().kv.reuse
 }
 
 /// Byte budget for the server's multi-conversation KV snapshot pool
-/// (`DGQ_CONV_CACHE_GB`, gibibytes → bytes). The manager keeps recent
-/// conversations' KV resident so interleaved clients don't re-prefill on every
-/// switch; over budget, least-recently-used snapshots are dropped (→ re-prefill
-/// from their token log). Default 0 = minimal (effectively single hot
-/// conversation, the prior server behavior). Each snapshot currently costs a
-/// full `max_seq` KV buffer, so size this against free RAM.
+/// (`DGQ_CONV_CACHE_GB`). Default 0 = minimal (single hot conversation).
 pub fn conv_cache_bytes() -> usize {
-    std::env::var("DGQ_CONV_CACHE_GB")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|g| *g > 0.0)
-        .map(|g| (g * 1024.0 * 1024.0 * 1024.0) as usize)
-        .unwrap_or(0)
+    config().server.conv_cache_bytes
 }
 
 /// Disk byte budget for the server's SSD conversation-snapshot tier
-/// (`DGQ_CONV_DISK_GB`, gibibytes → bytes). When the RAM pool
-/// ([`conv_cache_bytes`]) overflows, least-recently-used snapshots spill to this
-/// tier (a compact blob per conversation on SSD) instead of being dropped;
-/// restoring one streams it back — far cheaper than re-prefilling a long
-/// conversation. Over the disk budget, LRU blobs are dropped (→ re-prefill from
-/// the token log). Default 0 = no disk tier (RAM overflow re-prefills directly).
+/// (`DGQ_CONV_DISK_GB`). Default 0 = no disk tier.
 pub fn conv_disk_bytes() -> usize {
-    std::env::var("DGQ_CONV_DISK_GB")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|g| *g > 0.0)
-        .map(|g| (g * 1024.0 * 1024.0 * 1024.0) as usize)
-        .unwrap_or(0)
+    config().server.conv_disk_bytes
 }
 
 /// Directory for the SSD conversation-snapshot tier (`DGQ_CONV_CACHE_DIR`).
-/// Defaults to a per-process subdir of the system temp dir; blobs are removed on
-/// eviction and when the server exits.
-pub fn conv_cache_dir() -> std::path::PathBuf {
-    std::env::var_os("DGQ_CONV_CACHE_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("dgq-conv-{}", std::process::id())))
+pub fn conv_cache_dir() -> PathBuf {
+    config().server.conv_cache_dir.clone()
 }
 
 /// `DGQ_TOOL_COMPACT=1`: enable the serve tool-output compactor (KV rewinder).
-/// Over-threshold tool responses are summarized by the model (checkpoint →
-/// summarize pass → rollback), replaced in context by `{summary,
-/// full_output_id}`, and the full output is stored on disk for on-demand
-/// retrieval via the built-in `expand_summary` tool. Opt-IN and default OFF:
-/// quality-affecting (the model sees summaries instead of raw outputs) and not
-/// yet gate-signed-off. Equivalent to `serve --tool-compact`.
+/// Opt-IN and default OFF (quality-affecting, not yet gate-signed-off).
+/// Equivalent to `serve --tool-compact`.
 pub fn tool_compact_enabled() -> bool {
-    on_if_one("DGQ_TOOL_COMPACT")
+    config().server.tool_compact
 }
 
 /// Token threshold above which a tool response is compacted
-/// (`DGQ_TOOL_COMPACT_THRESHOLD`, tokens). Under-threshold responses pass
-/// through verbatim — no summarize generation, full fidelity. Default 384
-/// (~1.5 canvas blocks: below that the summary + scaffold saves little).
+/// (`DGQ_TOOL_COMPACT_THRESHOLD`). Default 384.
 pub fn tool_compact_threshold() -> usize {
-    std::env::var("DGQ_TOOL_COMPACT_THRESHOLD")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&t| t > 0)
-        .unwrap_or(384)
+    config().server.tool_compact_threshold
 }
 
 /// Directory for full tool outputs stored by the compactor
-/// (`DGQ_TOOL_COMPACT_DIR`). Defaults to a per-process subdir of the system
-/// temp dir; files are removed on server exit (plus a startup sweep for
-/// hard-killed runs, mirroring the conversation blob store).
-pub fn tool_compact_dir() -> std::path::PathBuf {
-    std::env::var_os("DGQ_TOOL_COMPACT_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("dgq-toolout-{}", std::process::id())))
+/// (`DGQ_TOOL_COMPACT_DIR`).
+pub fn tool_compact_dir() -> PathBuf {
+    config().server.tool_compact_dir.clone()
 }
 
 /// `DGQ_KV_MMAP=1`: back the session KV cache with a `MAP_SHARED` temp-file mmap
-/// (wrapped no-copy as the Metal buffer) instead of anonymous device memory, so
-/// under memory pressure dirty KV pages evict to that file rather than to the
-/// anonymous compressor/swap — gentler at the very-long-context / co-tenant
-/// cliff. Opt-in experiment. Default OFF (anonymous StorageModeShared).
+/// (wrapped no-copy as the Metal buffer). Opt-in experiment. Default OFF.
 pub fn kv_mmap() -> bool {
-    on_if_one("DGQ_KV_MMAP")
+    config().kv.mmap
 }
 
-/// Directory for the `DGQ_KV_MMAP` backing file. Defaults to the system temp
-/// dir; override for a specific (e.g. faster/roomier) volume.
-pub fn kv_mmap_dir() -> std::path::PathBuf {
-    std::env::var_os("DGQ_KV_MMAP_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
+/// Directory for the `DGQ_KV_MMAP` backing file. Defaults to the system temp dir.
+pub fn kv_mmap_dir() -> PathBuf {
+    config().kv.mmap_dir.clone()
 }
+
+// ===========================================================================
+// GPU working-set cap (a device fact, not env config)
+// ===========================================================================
 
 /// GPU working-set cap (Metal `recommendedMaxWorkingSetSize`), captured once
 /// at MetalContext init so the pure `kv_q8` policy can scale to the device's
 /// RAM. 0 (unset, e.g. CPU-only tests) → the q8 auto-policy stays off.
-static GPU_WORKING_SET_BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static GPU_WORKING_SET_BYTES: OnceLock<u64> = OnceLock::new();
 
 /// Record the device working-set cap (idempotent; first writer wins).
 pub fn set_gpu_working_set_cap(bytes: u64) {
     let _ = GPU_WORKING_SET_BYTES.set(bytes);
 }
 
-/// q8 KV cache storage. Group-32 symmetric i8 + f16 scales (0.92% rel-RMS on
-/// real KV), halves KV memory. **AUTO at long context since 2026-07-07**:
-/// enabled when the estimated f16 resident at `max_seq` would approach the
-/// GPU working-set cap, so very long sessions stay resident instead of
-/// swapping. `DGQ_KV_Q8=1` forces on, `=0` forces off (override the policy).
-///
-/// Why auto (measured): at kv=262k (model max), f16 KV puts resident at 91%
-/// of the ~27 GiB cap and the machine SWAPS (+704 MB, pressure WARN, caught
-/// by DGQ_MEM_WATCH); q8 lands at 82% and doesn't. Below the cap f16 is the
-/// default — it's issue-bound-faster (E4: q8 is +9%/+54% at 33k, −6% at
-/// 105k), so q8 only earns its keep once memory pressure would otherwise
-/// force swap. The switch scales with the cap, so smaller Macs flip earlier.
-/// Constants measured on this checkpoint 2026-07-07 (f16 session-open:
-/// 105k→21.63 GiB, 262k→24.61 GiB → resident ≈ 19.73 GiB + 19.0 KiB/token).
-///
-/// Not a SPEED lever below the cliff (issue-bound kernels; same physics rules
-/// out rotated lower-bit KV for speed). Quality: forced-q8 gate 45/51 =
-/// baseline; needle exact 33k/105k. Format is fixed per session at open;
-/// every KV writer/reader compiles a matching function-constant variant.
+/// q8 KV cache storage. Group-32 symmetric i8 + f16 scales (0.92% rel-RMS),
+/// halves KV memory. **AUTO at long context since 2026-07-07**: enabled when
+/// the estimated f16 resident at `max_seq` would approach the GPU working-set
+/// cap, so very long sessions stay resident instead of swapping. `DGQ_KV_Q8=1`
+/// forces on, `=0` forces off. Format is fixed per session at open; every KV
+/// writer/reader compiles a matching function-constant variant.
 pub fn kv_format(max_seq: usize) -> crate::kernels::sub::kv_quant::KvFormat {
     use crate::kernels::sub::kv_quant::KvFormat;
     // Explicit override (any set value): 1/true → q8, else → f16.
-    if let Ok(v) = std::env::var("DGQ_KV_Q8") {
+    if let Some(v) = config().kv.q8_override.as_deref() {
         return if v == "1" || v.eq_ignore_ascii_case("true") {
             KvFormat::Q8
         } else {
@@ -418,12 +763,12 @@ pub const CTX_SAFE_FRACTION: f64 = 0.90;
 
 /// Estimated GPU-resident bytes at `max_seq`, mirroring what the engine will
 /// actually allocate: q8 KV (≈half) auto-enables once the f16 resident would
-/// exceed `CTX_Q8_AUTO_FRACTION` of `budget_bytes` (the same policy as
-/// `kv_format`, but budget-driven so it works before the Metal device — and
-/// thus the runtime cap — exists). `DGQ_KV_Q8=0` forces f16.
+/// exceed `CTX_Q8_AUTO_FRACTION` of `budget_bytes`. `DGQ_KV_Q8=0` forces f16.
+/// (Preserves the historical quirk: only the literal `"0"` forces f16 here,
+/// unlike `kv_format` which treats any non-`1`/`true` value as f16.)
 pub fn estimate_resident_bytes(max_seq: usize, budget_bytes: u64) -> u64 {
     let f16 = CTX_BASE_BYTES + CTX_F16_KV_PER_TOKEN * max_seq as f64;
-    let force_f16 = matches!(std::env::var("DGQ_KV_Q8").as_deref(), Ok("0"));
+    let force_f16 = config().kv.q8_override.as_deref() == Some("0");
     let q8 = !force_f16 && budget_bytes > 0 && f16 > CTX_Q8_AUTO_FRACTION * budget_bytes as f64;
     let per_tok = if q8 {
         CTX_F16_KV_PER_TOKEN * 0.5
@@ -435,9 +780,7 @@ pub fn estimate_resident_bytes(max_seq: usize, budget_bytes: u64) -> u64 {
 
 /// Guard for a user-requested context length: `Some((needed, ceiling))` bytes
 /// when the estimated resident at `max_seq` would exceed `CTX_SAFE_FRACTION` of
-/// `budget_bytes` (past which Metal swaps / the KV alloc fails). `None` = fits,
-/// or `budget_bytes == 0` (unknown). Caller supplies the budget (working-set
-/// cap or physical-RAM proxy) so this stays usable before the device exists.
+/// `budget_bytes`. `None` = fits, or `budget_bytes == 0` (unknown).
 pub fn ctx_over_budget(max_seq: usize, budget_bytes: u64) -> Option<(u64, u64)> {
     if budget_bytes == 0 {
         return None;
@@ -449,261 +792,196 @@ pub fn ctx_over_budget(max_seq: usize, budget_bytes: u64) -> Option<(u64, u64)> 
 
 /// Largest `--ctx` (max_seq) whose estimate stays under the safe ceiling, for
 /// the "reduce to <= N" hint. At the ceiling ctx is large, so q8 KV is
-/// auto-selected — consistent with `estimate_resident_bytes` there. 0 when the
-/// budget can't even hold the base weights.
+/// auto-selected. 0 when the budget can't even hold the base weights.
 pub fn max_feasible_ctx(budget_bytes: u64) -> usize {
     let headroom = CTX_SAFE_FRACTION * budget_bytes as f64 - CTX_BASE_BYTES;
     (headroom / (CTX_F16_KV_PER_TOKEN * 0.5)).max(0.0) as usize
 }
 
-/// KV block size for sequential-block full-attention (`DGQ_ATTN_KV_BLOCK=
-/// <keys>`; DEFAULT 0 = OFF). When on and kv_len+canvas exceeds the block,
-/// full-attention layers run as in-order dispatches over block-sized key
-/// ranges with f32 online-softmax state persisted in `attn_state` —
-/// BIT-IDENTICAL to the monolithic pass (verified: 6.5k traces byte-equal).
-/// DISPROVEN AS A PERF LEVER 2026-07-06: the hoped-for SLC-locality win does
-/// not exist — threadgroups already sweep keys in near-lockstep, so the SLC
-/// already serves the shared stream (measured effective bandwidth 171 GB/s >
-/// DRAM's ~150 at kv 32k). Blocking only adds state round-trips: 33k prefill
-/// 165.7 -> 177.7 s, denoise unchanged. Kept as scaffolding (the state
-/// machinery is the base for a future parallel-split or quantized-KV pass).
+/// KV block size for sequential-block full-attention (`DGQ_ATTN_KV_BLOCK`;
+/// DEFAULT 0 = OFF). BIT-IDENTICAL to the monolithic pass but DISPROVEN AS A
+/// PERF LEVER 2026-07-06 (the SLC already serves the shared key stream in
+/// near-lockstep). Kept as scaffolding for a future parallel-split/quantized-KV pass.
 pub fn attn_kv_block() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("DGQ_ATTN_KV_BLOCK")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0)
-    })
+    config().perf.attn_kv_block
 }
 
-/// Batched prefill super-chunks (`DGQ_PREFILL_BATCH=0` restores plain
-/// 256-token chunks): up to PREFILL_SUBS causal sub-chunks run as ONE forward
-/// — MoE expert weights are streamed once per super-chunk instead of once per
-/// chunk (the dominant prefill GEMM cost), and the dense GEMMs run at M=1024.
-/// Bit-identical to sequential chunks (row-independent batched stages;
-/// attention/rope keep per-sub causal dims + per-sub params slots).
+/// Batched prefill super-chunks (`DGQ_PREFILL_BATCH=0` restores plain 256-token
+/// chunks): up to PREFILL_SUBS causal sub-chunks run as ONE forward. Bit-
+/// identical to sequential chunks.
 pub fn prefill_batch_enabled() -> bool {
-    on_unless_zero("DGQ_PREFILL_BATCH")
+    config().perf.prefill_batch
 }
 
 /// MMA attention in the fast prefill (`DGQ_PREFILL_MMA=0` restores the scalar
-/// prefill attention). The MMA kernels honor the causal mask + sliding window;
-/// scalar prefill was kept from the freeze era when f16 prefill attention
-/// scored 11/16 vs 14/16 — re-validated after no-freeze (which fixed the
-/// fast-prefill degeneration class): gate-neutral, and scalar prefill is
-/// O(kv_len) serial per query = unusable at long context (6.5k prompt: 98.6s).
+/// prefill attention). Scalar prefill is O(kv_len) serial per query = unusable
+/// at long context.
 pub fn prefill_mma_enabled() -> bool {
-    on_unless_zero("DGQ_PREFILL_MMA")
+    config().perf.prefill_mma
 }
 
 /// Fast (quantized) between-block KV extend (`DGQ_FAST_BLOCK_EXTEND=0` restores
 /// the f32 engine extend). After a canvas block commits, its 256 tokens are
-/// causally extended into KV via `prefill_chunks_from` (~0.85s) instead of the
-/// engine (~10s/block — the dominant cost of multi-block replies; a 4-block
-/// reply paid ~30s in extends). Same quality class as the fast-vs-engine
-/// prefill approximation and cross-turn reuse; gate-validated on flip.
+/// causally extended via `prefill_chunks_from` (~0.85s) instead of the engine
+/// (~10s/block). Same quality class as fast-vs-engine prefill.
 pub fn fast_block_extend_enabled() -> bool {
-    on_unless_zero("DGQ_FAST_BLOCK_EXTEND")
+    config().perf.fast_block_extend
 }
 
 /// Buffer-resident engine prefill (merged batches, no CPU round-trips).
 /// `DGQ_PREFILL_RESIDENT=0` restores the legacy per-batch readback path.
 pub fn prefill_resident_enabled() -> bool {
-    on_unless_zero("DGQ_PREFILL_RESIDENT")
+    config().perf.prefill_resident
 }
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // Prefill path selection
-// ---------------------------------------------------------------------------
+// ===========================================================================
 
 /// Min prompt length (tokens) for the fast quantized prefill under the
-/// heuristic default. Short prompts stay on the accurate f32 engine (prefill
-/// is cheap there, and bf16 prompt KV can flip MoE routing on borderline
-/// short-answer prompts); long prompts take the ~10x-faster quantized path.
+/// heuristic default. Short prompts stay on the accurate f32 engine.
 pub const FAST_PREFILL_MIN_TOKENS: usize = 256;
 
 /// E11 (DISPROVEN as the long-prompt fix; kept as a diagnostic): fast prefill
-/// runs on fp16 activation-arena pipelines (K_ARENA_F16) instead of bf16 —
-/// 2^-11 relative rounding vs 2^-8. Built while hunting task #64; the real
-/// cause was the spurious encoder RmsNormHidden (fixed 2b0d12b), not stream
-/// precision. Denoise keeps the gate-validated bf16 set. Opt-in.
+/// runs on fp16 activation-arena pipelines instead of bf16. The real cause of
+/// task #64 was the spurious encoder RmsNormHidden (fixed 2b0d12b). Opt-in.
 pub fn prefill_f16_enabled() -> bool {
-    on_if_one("DGQ_PREFILL_F16")
+    config().prefill.f16
 }
 
-/// E14: during fast prefill, sliding layers write/read K/V through an f32
-/// side ring (window-sized, ~840 MB constant) instead of reading the f16
-/// monolithic cache — kills the chunk-boundary rounding that compounds
-/// ~p/256 hops through the causal chain and destroys long-prompt
-/// comprehension (task #64/#67; fp16-arena and ring-uncap disproofs
-/// isolated the mechanism). Full layers and denoise are untouched.
-/// Requires the MMA prefill attention (default); the scalar fallback has no
-/// side variant and simply keeps the old behavior.
+/// E14: during fast prefill, sliding layers write/read K/V through an f32 side
+/// ring (window-sized) instead of the f16 monolithic cache — kills the
+/// chunk-boundary rounding that compounds through the causal chain and
+/// destroyed long-prompt comprehension (task #64/#67). Requires the MMA
+/// prefill attention (default).
 pub fn prefill_kv_f32_enabled() -> bool {
-    on_if_one("DGQ_PREFILL_KV_F32")
+    config().prefill.kv_f32
 }
 
 /// Max prompt length (tokens) the fast quantized prefill handles
-/// (`DGQ_FAST_PREFILL_MAX`; 0 = no cap; prompts above a non-zero cap take the
-/// f32 engine). DEFAULT 0 (uncapped) since the task #64/#68 root-cause fix
-/// (2b0d12b, 2026-07-10): the length-dependent comprehension collapse was a
-/// spurious encoder-pass RmsNormHidden (the denoise preamble's norm) warping
-/// the residual stream into systematic MoE route flips — not accumulating
-/// precision error. Post-fix the fast path is doc-QA-grounded at every probed
-/// length (3.2k/4.2k/6.6k/13k) and gate-clean at seeds {7,42,123}; the cap
-/// era (default 2048, 2026-07-09..10) was the mitigation while the bug lived.
+/// (`DGQ_FAST_PREFILL_MAX`; 0 = no cap). DEFAULT 0 (uncapped) since the task
+/// #64/#68 root-cause fix (2b0d12b, 2026-07-10): the length-dependent
+/// comprehension collapse was a spurious encoder-pass RmsNormHidden, not
+/// accumulating precision error.
 pub fn fast_prefill_max_tokens() -> usize {
-    std::env::var("DGQ_FAST_PREFILL_MAX")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0)
+    config().prefill.fast_prefill_max
 }
 
 /// Fast monolithic prefill (quantized + causal) vs the f32 engine for a
 /// `prompt_len`-token prompt. `DGQ_FAST_PREFILL=1|0` forces on/off for all
 /// lengths; unset uses the length band (see [`fast_prefill_max_tokens`]).
 pub fn should_fast_prefill(prompt_len: usize) -> bool {
-    match std::env::var("DGQ_FAST_PREFILL").as_deref() {
-        Ok("1") | Ok("true") => true,
-        Ok("0") | Ok("false") => false,
-        _ => {
+    match config().prefill.fast_prefill_force {
+        Some(v) => v,
+        None => {
             let max = fast_prefill_max_tokens();
             prompt_len > FAST_PREFILL_MIN_TOKENS && (max == 0 || prompt_len <= max)
         }
     }
 }
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // Debug / probe flags (all opt-in)
-// ---------------------------------------------------------------------------
+// ===========================================================================
 
 /// Suppress step-generate/prefill progress logs (`DGQ_QUIET=1`).
 pub fn progress_enabled() -> bool {
-    match std::env::var("DGQ_QUIET") {
-        Ok(v) => v != "1" && !v.eq_ignore_ascii_case("true"),
-        Err(_) => true,
-    }
+    !config().debug.quiet
 }
 
 /// Opt-in logits NaN guard on the generate hot path (`DGQ_CHECK_LOGITS=1`).
 pub fn logits_finite_check_enabled() -> bool {
-    on_if_one("DGQ_CHECK_LOGITS")
+    config().debug.logits_finite_check
 }
 
 /// Sample count for the logits NaN guard (`DGQ_CHECK_LOGITS_SAMPLES`).
 pub fn logits_finite_sample_count() -> usize {
-    match std::env::var("DGQ_CHECK_LOGITS_SAMPLES") {
-        Ok(v) => v.parse().unwrap_or(4096),
-        Err(_) => 4096,
-    }
+    config().debug.logits_finite_samples
 }
 
 /// Per-step entropy traces in generate output (`DGQ_TRACE_ENTROPY=1|full`).
 pub fn trace_entropy_enabled() -> bool {
-    match std::env::var("DGQ_TRACE_ENTROPY") {
-        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("full"),
-        Err(_) => false,
-    }
+    config().debug.trace_entropy
 }
 
 /// Full-canvas (vs 16-prefix) entropy trace payloads (`DGQ_TRACE_ENTROPY=full`).
 pub fn trace_entropy_full() -> bool {
-    std::env::var("DGQ_TRACE_ENTROPY")
-        .map(|v| v.eq_ignore_ascii_case("full"))
-        .unwrap_or(false)
+    config().debug.trace_entropy_full
 }
 
 /// Per-position entropy at end of a denoise block (`DGQ_LOG_FINAL_ENTROPY=1`).
 pub fn final_entropy_log_enabled() -> bool {
-    match std::env::var("DGQ_LOG_FINAL_ENTROPY") {
-        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("full"),
-        Err(_) => false,
-    }
+    config().debug.final_entropy_log
 }
 
 /// Decode the answer-region argmax each denoise step and show it in the step
-/// progress line (`text="…"`, tail-truncated). Log-only — the generation is
-/// bit-identical either way; cost is one ≤canvas decode per step (µs against
-/// a ~1s step). DEFAULT ON since 2026-07-09 (user request: the step log should
-/// show WHAT is converging, not just counts). `DGQ_LOG_STEP_TEXT=0` disables.
+/// progress line. Log-only — generation is bit-identical either way. DEFAULT ON
+/// since 2026-07-09. `DGQ_LOG_STEP_TEXT=0` disables.
 pub fn step_text_log_enabled() -> bool {
-    on_unless_zero("DGQ_LOG_STEP_TEXT")
+    config().debug.step_text_log
 }
 
 /// GPU-vs-CPU accept-mask parity log per step (`DGQ_LOG_DENOISE=1`).
 pub fn denoise_parity_log_enabled() -> bool {
-    on_if_one("DGQ_LOG_DENOISE")
+    config().debug.denoise_parity_log
 }
 
 /// Positions printed by the denoise parity log (`DGQ_LOG_DENOISE_POS`).
 pub fn denoise_parity_log_positions() -> usize {
-    match std::env::var("DGQ_LOG_DENOISE_POS") {
-        Ok(v) => v.parse().unwrap_or(8),
-        Err(_) => 8,
-    }
+    config().debug.denoise_parity_positions
 }
 
 /// Early-stop decision log + GPU/CPU mismatch check (`DGQ_LOG_EARLY_STOP=1`).
 pub fn log_early_stop_enabled() -> bool {
-    on_if_one("DGQ_LOG_EARLY_STOP")
+    config().debug.log_early_stop
 }
 
 /// SC soft-embed stage logging (`DGQ_LOG_SC=1`).
 pub fn sc_log_enabled() -> bool {
-    std::env::var("DGQ_LOG_SC").ok().as_deref() == Some("1")
+    config().debug.sc_log
 }
 
-/// Per-stage bf16 activation-range trace (`DGQ_TRACE_RANGES=1`): answers
-/// "does any activation exceed f16's 65504 range?" before precision
-/// experiments — measure BEFORE concluding (recorded feedback).
+/// Per-stage bf16 activation-range trace (`DGQ_TRACE_RANGES=1`): answers "does
+/// any activation exceed f16's 65504 range?" before precision experiments.
 pub fn trace_ranges_enabled() -> bool {
-    std::env::var("DGQ_TRACE_RANGES").is_ok()
+    config().debug.trace_ranges
 }
 
-/// UMA memory-pressure watch (`DGQ_MEM_WATCH=1`): per-section (session-open
-/// / prefill / denoise / profile) report of Metal working-set occupancy,
-/// swap-used delta, and the kernel memory-pressure level; prints a LOUD
-/// "TIMINGS SUSPECT" line when swap grew, pressure is elevated, or GPU
-/// allocation exceeds 90% of recommendedMaxWorkingSetSize — wall-clock from
-/// such sections is unified-memory noise, not kernel cost.
+/// UMA memory-pressure watch (`DGQ_MEM_WATCH=1`): per-section working-set /
+/// swap-delta / pressure report; prints a LOUD "TIMINGS SUSPECT" when swap grew
+/// or allocation exceeds 90% of the working-set cap.
 pub fn mem_watch_enabled() -> bool {
-    on_if_one("DGQ_MEM_WATCH")
+    config().debug.mem_watch
 }
 
-/// Dump per-layer prefill KV to `<path>` (`DGQ_DUMP_KV=<path>`) — the probe
-/// that pinned the fast-prefill routing-flip mechanism.
+/// Dump per-layer prefill KV to `<path>` (`DGQ_DUMP_KV=<path>`).
 pub fn dump_kv_path() -> Option<String> {
-    std::env::var("DGQ_DUMP_KV").ok()
+    config().debug.dump_kv_path.clone()
 }
 
-/// Dump MoE routes to `<path>` (`DGQ_MOE_ROUTE_REF=<path>`) for the
-/// GPU-vs-CPU route comparison tooling.
+/// Dump MoE routes to `<path>` (`DGQ_MOE_ROUTE_REF=<path>`).
 pub fn moe_route_ref_path() -> Option<String> {
-    std::env::var("DGQ_MOE_ROUTE_REF").ok()
+    config().debug.moe_route_ref_path.clone()
 }
 
 /// Engine per-layer hidden dump (`DGQ_ENGINE_LAYER_DUMP=<json path>`).
 pub fn engine_layer_dump_path() -> Option<String> {
-    std::env::var("DGQ_ENGINE_LAYER_DUMP").ok()
+    config().debug.engine_layer_dump_path.clone()
 }
 
 /// Canvas row probed by the engine layer dump (`DGQ_ENGINE_LAYER_POS`).
 pub fn engine_layer_dump_pos() -> usize {
-    std::env::var("DGQ_ENGINE_LAYER_POS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(129)
+    config().debug.engine_layer_dump_pos
 }
 
 /// Per-layer engine prefill phase timings (`DGQ_PREFILL_PROFILE=1`).
 pub fn prefill_profile_enabled() -> bool {
-    std::env::var("DGQ_PREFILL_PROFILE").is_ok()
+    config().debug.prefill_profile
 }
 
 /// Extra step-parity diagnostics (argmax agreement) (`DGQ_PARITY_DEBUG=1`).
 pub fn parity_debug_enabled() -> bool {
-    std::env::var_os("DGQ_PARITY_DEBUG").is_some()
+    config().debug.parity_debug
 }
 
 #[cfg(test)]
@@ -734,5 +1012,70 @@ mod ctx_budget_tests {
         // At the reported max it fits; just past it, it's refused.
         assert!(ctx_over_budget(n.saturating_sub(1024), budget).is_none());
         assert!(ctx_over_budget(n + 50_000, budget).is_some());
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn default_matches_documented_shipped_defaults() {
+        let c = Config::default();
+        // Sampler sign-offs.
+        assert!(!c.sampler.freeze);
+        assert!(c.sampler.denoiser_argmax);
+        assert_eq!(c.sampler.early_stop_mean_ent, 0.05);
+        assert_eq!(c.sampler.empty_reply_retry, 3);
+        // Perf toggles ship ON.
+        assert!(c.perf.gemm_tunable && c.perf.attn_mma && c.perf.fused_algebra);
+        assert_eq!(c.perf.moe_prefill_block_m, 32);
+        // Prefill uncapped, KV reuse on, tool-compact off.
+        assert_eq!(c.prefill.fast_prefill_max, 0);
+        assert!(c.kv.reuse);
+        assert!(!c.server.tool_compact);
+        assert_eq!(c.server.tool_compact_threshold, 384);
+    }
+
+    #[test]
+    fn install_for_test_overrides_and_restores() {
+        let before = freeze_enabled();
+        {
+            let mut cfg = Config::default();
+            cfg.sampler.freeze = !before;
+            let _g = install_for_test(cfg);
+            assert_eq!(freeze_enabled(), !before, "override takes effect");
+        }
+        assert_eq!(freeze_enabled(), before, "prior config restored on drop");
+    }
+
+    #[test]
+    fn set_quiet_flips_progress() {
+        let _g = install_for_test(Config::default());
+        set_quiet(true);
+        assert!(!progress_enabled());
+        set_quiet(false);
+        assert!(progress_enabled());
+    }
+
+    #[test]
+    fn should_fast_prefill_respects_force_and_band() {
+        let mut cfg = Config::default();
+        cfg.prefill.fast_prefill_force = Some(false);
+        {
+            let _g = install_for_test(cfg.clone());
+            assert!(!should_fast_prefill(10_000), "force-off wins at any length");
+        }
+        cfg.prefill.fast_prefill_force = None;
+        cfg.prefill.fast_prefill_max = 0;
+        let _g = install_for_test(cfg);
+        assert!(
+            !should_fast_prefill(FAST_PREFILL_MIN_TOKENS),
+            "at floor = engine"
+        );
+        assert!(
+            should_fast_prefill(FAST_PREFILL_MIN_TOKENS + 1),
+            "above floor = fast"
+        );
     }
 }
