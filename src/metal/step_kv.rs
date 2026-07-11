@@ -2061,6 +2061,143 @@ mod engine_extend_bench_tests {
         }
     }
 
+    /// E8-M0 (task #71, the "un-RoPE the KV" idea): does PRE-RoPE K quantize
+    /// better than the POST-RoPE K we store today? RoPE mixes dim pairs with
+    /// position-dependent angles and can widen per-group ranges; if pre-RoPE K
+    /// brings affine-q4 error toward q8-class, storing K pre-RoPE (RoPE at
+    /// attention-read time) both restores the offline Hadamard fold AND
+    /// improves plain quantization. Method: fast-prefill a real prompt at
+    /// max_seq=2048 (slot == pos on every layer: sliding rings are 2048 slots,
+    /// no wrap), read the stored post-RoPE f16 K rows, invert RoPE exactly on
+    /// CPU (orthogonal rotation; the f16 storage noise ~1e-3 is far below the
+    /// 1-8% quant errors under study), and compare kv_quant round-trips.
+    #[test]
+    #[ignore = "model-gated: cargo test --release e8_prerope_k_quant_stats -- --ignored --nocapture"]
+    fn e8_prerope_k_quant_stats() {
+        use crate::kernels::sub::kv_quant::{
+            q4_affine_rotated_roundtrip, q4_affine_roundtrip, q4_rotated_roundtrip, q4_roundtrip,
+            q8_roundtrip,
+        };
+        use crate::metal::step_kernel::{StepFinishMode, StepSmokeConfig, build_step_runtime};
+        use crate::tokenizer::Tokenizer;
+        let Some(dir) = model_dir() else { return };
+        let prompt_path = std::env::var("DGQ_E8_PROMPT")
+            .unwrap_or_else(|_| "fixtures/smoketest/longdoc.md".into());
+        let text = std::fs::read_to_string(&prompt_path).expect("probe fixture");
+        let tok = Tokenizer::load(&dir.join("tokenizer.json")).expect("tokenizer");
+        let mut ids = tok.encode(&text, false);
+        // Keep slot == pos (sliding ring = 2048 slots at this max_seq) AND
+        // leave the CANVAS block the prefill reserves (kv_len + 256 <= max_seq).
+        ids.truncate(1750);
+        let n = ids.len();
+        let max_seq = 2048usize;
+        let cfg = StepSmokeConfig {
+            layers: N_LAYERS,
+            steps: 1,
+            kv_len: 0,
+            seed: 7,
+            max_seq,
+            finish: StepFinishMode::ForwardOnly,
+            prefill_token_ids: None,
+            no_early_stop: true,
+        };
+        let (mut rt, _) = build_step_runtime(&dir, &cfg).expect("runtime");
+        let kv = rt.prefill_chunks(&ids).expect("fast prefill");
+        assert_eq!(kv, n);
+        let layout = *rt.layout();
+
+        // Exact inverses of qk_rope_kv.metal's two rotations (transpose = -sin).
+        fn un_rope(head: &mut [f32], full: bool, pos: usize) {
+            let hd = head.len();
+            if full {
+                // apply_proportional_rope_f32: rot = hd/4, theta 1e6.
+                let half_head = hd / 2;
+                for d in 0..hd / 8 {
+                    let inv_freq = 1.0e6f32.powf(-2.0 * d as f32 / hd as f32);
+                    let (s, c) = (pos as f32 * inv_freq).sin_cos();
+                    let x0 = head[d];
+                    let x1 = head[half_head + d];
+                    head[d] = x0 * c + x1 * s;
+                    head[half_head + d] = -x0 * s + x1 * c;
+                }
+            } else {
+                // apply_split_half_rope_f32: rot = hd, theta 1e4.
+                let half_rot = hd / 2;
+                for d in 0..half_rot {
+                    let inv_freq = 1.0e4f32.powf(-2.0 * d as f32 / hd as f32);
+                    let (s, c) = (pos as f32 * inv_freq).sin_cos();
+                    let x0 = head[d];
+                    let x1 = head[d + half_rot];
+                    head[d] = x0 * c + x1 * s;
+                    head[d + half_rot] = -x0 * s + x1 * c;
+                }
+            }
+        }
+
+        let names = ["q8", "q4_sym", "q4_affine", "q4_sym_rot", "q4_affine_rot"];
+        let fns: [fn(&[f32], &mut [f32]); 5] = [
+            q8_roundtrip,
+            q4_roundtrip,
+            q4_affine_roundtrip,
+            q4_rotated_roundtrip,
+            q4_affine_rotated_roundtrip,
+        ];
+
+        eprintln!(
+            "e8-m0: K quant rel-RMS, post- vs pre-RoPE ({n} tokens, aggregate per layer class)"
+        );
+        for full_class in [false, true] {
+            let mut num = [[0f64; 2]; 5];
+            let mut den = [[0f64; 2]; 5];
+            for layer in 0..N_LAYERS {
+                let l = &layout.layers[layer];
+                if (l.is_full != 0) != full_class {
+                    continue;
+                }
+                let nkv = l.n_kv_heads as usize;
+                let hd = l.head_dim as usize;
+                let token_stride = nkv * hd * 2;
+                let slot_base = l.kv_region as usize / 2;
+                let mut out = vec![0f32; hd];
+                for pos in 0..n {
+                    for hh in 0..nkv {
+                        let mut post = vec![0f32; hd];
+                        for (d, p) in post.iter_mut().enumerate() {
+                            let byte = (slot_base + pos * token_stride + hh * hd + d) * 2;
+                            *p = f16_bits_to_f32(read_half_at(rt.kvcache(), byte));
+                        }
+                        let mut pre = post.clone();
+                        un_rope(&mut pre, full_class, pos);
+                        for (v, f) in fns.iter().enumerate() {
+                            for (side, src) in [&post, &pre].into_iter().enumerate() {
+                                f(src, &mut out);
+                                for d in 0..hd {
+                                    let e = (src[d] - out[d]) as f64;
+                                    num[v][side] += e * e;
+                                    den[v][side] += (src[d] as f64) * (src[d] as f64);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let label = if full_class {
+                "full  (hd 512, rot 128, theta 1e6, 5 layers, linear KV)"
+            } else {
+                "sliding (hd 256, rot 256, theta 1e4, 25 layers, ring KV)"
+            };
+            eprintln!("  [{label}]");
+            for (v, name) in names.iter().enumerate() {
+                let post = (num[v][0] / den[v][0]).sqrt();
+                let pre = (num[v][1] / den[v][1]).sqrt();
+                eprintln!(
+                    "    {name:<14} post {post:.4}  pre {pre:.4}  post/pre {:.2}x",
+                    post / pre
+                );
+            }
+        }
+    }
+
     /// One resident engine prefill of 1024 synthetic tokens with the per-layer
     /// phase profile on — splits waitA (attention+dense GEMMs+router GPU) from
     /// waitB (MoE GPU) to locate the ms/tok. Diagnostic only.
