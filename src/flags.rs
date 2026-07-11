@@ -87,10 +87,7 @@ impl Default for SamplerFlags {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PerfFlags {
     pub gemm_tunable: bool,
-    pub moe_block_sparse: bool,
-    /// Raw `DGQ_MOE_TILE_ADAPT` (effective value also requires `moe_block_sparse`).
-    pub moe_tile_adapt: bool,
-    /// Raw `DGQ_MOE_FUSE_GATHER` (effective value also requires `moe_block_sparse`).
+    /// `DGQ_MOE_FUSE_GATHER`: fused gate_up A-gather in the tunable expert GEMM.
     pub moe_fuse_gather: bool,
     /// `DGQ_MOE_PREFILL_BM`: 64|128 opt-in, else 32 (OFF).
     pub moe_prefill_block_m: u32,
@@ -114,8 +111,6 @@ impl Default for PerfFlags {
     fn default() -> Self {
         Self {
             gemm_tunable: true,
-            moe_block_sparse: true,
-            moe_tile_adapt: true,
             moe_fuse_gather: true,
             moe_prefill_block_m: 32,
             attn_mma: true,
@@ -342,8 +337,6 @@ impl Config {
             },
             perf: PerfFlags {
                 gemm_tunable: env_on_unless_zero("DGQ_GEMM_TUNABLE"),
-                moe_block_sparse: env_on_unless_zero("DGQ_MOE_BLOCK_SPARSE"),
-                moe_tile_adapt: env_on_unless_zero("DGQ_MOE_TILE_ADAPT"),
                 moe_fuse_gather: env_on_unless_zero("DGQ_MOE_FUSE_GATHER"),
                 moe_prefill_block_m: match std::env::var("DGQ_MOE_PREFILL_BM")
                     .ok()
@@ -600,26 +593,10 @@ pub fn gemm_tunable_enabled() -> bool {
     config().perf.gemm_tunable
 }
 
-/// Block-sparse (megablocks-style) MoE expert GEMM: ragged M pre-tiled into
-/// <=32-row blocks, one block per threadgroup. Bit-identical, ~6%/step.
-/// `DGQ_MOE_BLOCK_SPARSE=0` falls back to the grouped path.
-pub fn moe_block_sparse_enabled() -> bool {
-    config().perf.moe_block_sparse
-}
-
-/// Adaptive M-tile for block-sparse MoE (BIT-IDENTICAL; perf wash today,
-/// latent win if the kernels go compute-bound — default ON per user
-/// 2026-07-02). Requires block-sparse. `DGQ_MOE_TILE_ADAPT=0` opts out.
-pub fn moe_tile_adapt_enabled() -> bool {
-    let c = config();
-    c.perf.moe_block_sparse && c.perf.moe_tile_adapt
-}
-
-/// Fuse the MoE gather into the gate_up block-sparse GEMM (bit-identical,
-/// ~28ms/step). Requires block-sparse. `DGQ_MOE_FUSE_GATHER=0` opts out.
+/// Fuse the MoE gather into the gate_up tunable expert GEMM (bit-identical,
+/// ~28ms/step). `DGQ_MOE_FUSE_GATHER=0` opts out.
 pub fn moe_fuse_gather_enabled() -> bool {
-    let c = config();
-    c.perf.moe_block_sparse && c.perf.moe_fuse_gather
+    config().perf.moe_fuse_gather
 }
 
 /// Weight-stationary expert GEMM for batched-prefill super-chunks
