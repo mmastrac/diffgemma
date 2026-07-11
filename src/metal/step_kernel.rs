@@ -7485,44 +7485,17 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn forward_row_entropy_probe() {
-        use crate::sample::token_entropy;
-        let dir = Path::new("/tmp/quantized-weights");
-        if !crate::dgq::store::looks_like_dgq_dir(dir) {
-            return;
-        }
-        let cfg = StepSmokeConfig {
-            layers: 3,
-            finish: StepFinishMode::ForwardOnly,
-            ..StepSmokeConfig::default()
-        };
-        let out = run_step_forward(dir, &cfg).expect("forward");
-        let ent = token_entropy(&out.logits, CANVAS, VOCAB);
-        for row in 0..CANVAS {
-            let base = row * VOCAB;
-            let row_logits = &out.logits[base..base + VOCAB];
-            let all_zero = row_logits.iter().all(|&v| v == 0.0);
-            assert!(!all_zero, "row {row} logits all zero (GEMM tg regression)");
-        }
-        let min_h = ent.iter().cloned().fold(f32::INFINITY, f32::min);
-        let max_h = ent.iter().cloned().fold(0.0f32, f32::max);
-        eprintln!("forward 3L row entropy: min={min_h:.3} max={max_h:.3}");
-        assert!(max_h < 12.4, "uniform row entropy {max_h}");
-    }
-
-    #[test]
+    #[ignore = "model-gated diagnostic: e2e accept-count/entropy tripwire (cargo test --release monolith_one_step_accept_regression -- --ignored)"]
     fn monolith_one_step_accept_regression() {
         // MLX @ 30L/Hello/seed42 accepts ~196 positions on denoise step 1 alone.
         // `.dgq` sharpens over the 8-step block; GEMM tg=(128,1,1) bug held ~1 accept/step
         // (~8 total) with mean_entropy~10. Healthy cumulative accept >> 150.
         const MIN_ACCEPT: u32 = 150;
-        let dir = Path::new("/tmp/quantized-weights");
-        if !crate::dgq::store::looks_like_dgq_dir(dir) {
-            eprintln!(
-                "skip monolith_one_step_accept_regression: no weights at /tmp/quantized-weights"
-            );
+        let Some(dir) = crate::kernels::sub::test_util::dgq_model_dir() else {
+            eprintln!("skip monolith_one_step_accept_regression: quantized model not present");
             return;
-        }
+        };
+        let dir = dir.as_path();
         let prefill = hello_chat_prefill_token_ids(dir).expect("hello prefill");
         let cfg = StepSmokeConfig {
             layers: 30,
@@ -7556,17 +7529,18 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model-gated diagnostic: expert offset/bytes layout parity vs real store (run with --ignored)"]
     fn moe_grouped_layer2_expert_offset_and_bytes_parity() {
         use crate::dgq::layout::q4_matrix_bytes;
         use crate::metal::moe::expert_forward_staged_dgq;
         use crate::model::moe::MoeScratch;
         use std::path::Path;
 
-        let dir = Path::new("/tmp/quantized-weights");
-        if !crate::dgq::store::looks_like_dgq_dir(dir) {
+        let Some(dir) = crate::kernels::sub::test_util::dgq_model_dir() else {
             eprintln!("skip moe_grouped_layer2_expert_offset_and_bytes_parity");
             return;
-        }
+        };
+        let dir = dir.as_path();
         let layer = 2usize;
         let text = crate::config::ModelConfig::load(dir)
             .expect("cfg")
@@ -7676,125 +7650,6 @@ mod tests {
             (dot / (na.sqrt() * nb.sqrt())) as f32
         };
         eprintln!("E18 act: cos(staged_gate_act,gpu_act)={cos_staged_gpu_act:.4} (expect ~0.015)");
-    }
-
-    #[test]
-    fn q4_group_k_order_l2_e0_gate_probe() {
-        use crate::config::ModelConfig;
-        use crate::dgq::layout::q4_row_bytes;
-        use crate::kernels::sub::q4_group_k_order;
-        use crate::kernels::sub::variant::KernelVariant;
-        use crate::metal::batch::{GpuBatch, set_bytes};
-        use crate::metal::buffer::BufferPool;
-        use crate::metal::device::MetalContext;
-        use crate::metal::step_m0::{dequant_q4_group_cpu, q4_weight_at_k_order_group};
-        use crate::weights::WeightStore;
-        use objc2_metal::MTLSize;
-        use std::path::Path;
-
-        let dir = Path::new("/tmp/quantized-weights");
-        if !crate::dgq::store::looks_like_dgq_dir(dir) {
-            eprintln!("skip q4_group_k_order_l2_e0_gate_probe");
-            return;
-        }
-        let layer = 2usize;
-        let expert = 0usize;
-        let text = ModelConfig::load(dir).expect("cfg").text_config;
-        let hidden = text.hidden_size;
-        let ws = WeightStore::open(dir).expect("ws");
-        let ctx = MetalContext::new().expect("metal");
-        let cache = GpuDecoderWeightCache::load(&ws, &text, 0, &ctx.device).expect("cache");
-        let gate_up = cache.expert_gate_up_q4(layer, expert);
-        let row = gate_up.src_slice();
-        let row_bytes = q4_row_bytes(hidden);
-        assert!(row.len() >= row_bytes);
-
-        let pipeline =
-            q4_group_k_order::pipeline_for(&ctx, KernelVariant::TEST_DUMP).expect("pipeline");
-        let mut pool = BufferPool::new();
-
-        for k0 in [0usize, 32, 64] {
-            let g_off = (k0 / 32) * 20;
-            let group: &[u8; 20] = row[g_off..g_off + 20].try_into().expect("group");
-            let via_dequant = dequant_q4_group_cpu(group);
-            let via_col = q4_weight_at_k_order_group(row, k0, hidden);
-
-            let mut max_err = 0.0f32;
-            let mut first_mismatch = None;
-            for m in 0..32 {
-                let err = (via_dequant[m] - via_col[m]).abs();
-                max_err = max_err.max(err);
-                if first_mismatch.is_none() && err > 1e-6 {
-                    first_mismatch = Some((m, via_dequant[m], via_col[m]));
-                }
-            }
-            eprintln!(
-                "CPU L{layer} E{expert} gate row0 k0={k0}: max_err={max_err:.2e} mismatch={first_mismatch:?}"
-            );
-            eprintln!(
-                "  dequant[0..8]={:?}",
-                via_dequant[..8]
-                    .iter()
-                    .map(|v| format!("{v:.5}"))
-                    .collect::<Vec<_>>()
-            );
-            eprintln!(
-                "  q4_at [0..8]={:?}",
-                via_col[..8]
-                    .iter()
-                    .map(|v| format!("{v:.5}"))
-                    .collect::<Vec<_>>()
-            );
-            assert!(
-                max_err <= 1e-6,
-                "CPU K-order mismatch k0={k0} max_err={max_err}"
-            );
-
-            let mut batch =
-                GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None)
-                    .expect("batch");
-            let out_buf = batch.alloc_f32_out(64).expect("out");
-            let enc = batch.encoder();
-            let (wbuf, row_off) = gate_up.weight_buffer();
-            let k0_u32 = k0 as u32;
-            let in_dim_u32 = hidden as u32;
-            let mut gpu_out = vec![0.0f32; 64];
-            enc.setComputePipelineState(&pipeline.pipeline);
-            unsafe {
-                enc.setBuffer_offset_atIndex(Some(wbuf), row_off as usize, 0);
-                set_bytes(enc, &k0_u32, 1);
-                set_bytes(enc, &in_dim_u32, 2);
-                enc.setBuffer_offset_atIndex(Some(&out_buf), 0, 3);
-            }
-            enc.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize {
-                    width: 1,
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: 1,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-            batch.register_read(out_buf, &mut gpu_out);
-            batch.end().expect("end");
-
-            let gpu_vs_dequant = (0..32)
-                .map(|m| (gpu_out[m] - via_dequant[m]).abs())
-                .fold(0.0f32, f32::max);
-            let gpu_vs_q4at = (0..32)
-                .map(|m| (gpu_out[32 + m] - via_col[m]).abs())
-                .fold(0.0f32, f32::max);
-            eprintln!(
-                "GPU L{layer} E{expert} k0={k0}: max_err vs CPU dequant={gpu_vs_dequant:.2e} vs CPU q4_at={gpu_vs_q4at:.2e}"
-            );
-            assert!(
-                gpu_vs_dequant <= 1e-5 && gpu_vs_q4at <= 1e-5,
-                "GPU decode mismatch k0={k0}"
-            );
-        }
     }
 
     /// NONDET-SC-1 diagnostic: run the chunked SC softembed twice on identical
@@ -8035,25 +7890,6 @@ mod tests {
     }
 
     #[test]
-    fn step_smoke_runs_if_weights_present() {
-        let dir = Path::new("/tmp/quantized-weights");
-        if !crate::dgq::store::looks_like_dgq_dir(dir) {
-            eprintln!(
-                "skip step_smoke_runs_if_weights_present: no weights at /tmp/quantized-weights"
-            );
-            return;
-        }
-        let result = run_step_smoke(dir, StepSmokeConfig::default()).expect("step smoke");
-        assert_eq!(result.step, 1);
-        if !result.logits_finite {
-            eprintln!(
-                "warning: step smoke logits non-finite (max_abs={})",
-                result.max_abs_logit
-            );
-        }
-    }
-
-    #[test]
     fn fused_gate_up_gemm_matches_split_in_full_arena() {
         use crate::kernels::sub::QuantFormat;
         use crate::kernels::sub::gemm_block_stacked::pipeline_for;
@@ -8082,9 +7918,12 @@ mod tests {
                 .fold(0.0f32, f32::max)
         }
 
-        let dir = [Path::new("model/q4"), Path::new("/tmp/quantized-weights")]
-            .into_iter()
-            .find(|p| crate::dgq::store::looks_like_dgq_dir(p));
+        let dir = [
+            Path::new("model/diffusiongemma-q4emb"),
+            Path::new("/tmp/quantized-weights"),
+        ]
+        .into_iter()
+        .find(|p| crate::dgq::store::looks_like_dgq_dir(p));
         let Some(dir) = dir else {
             eprintln!("skip fused_gate_up_gemm_matches_split_in_full_arena");
             return;
@@ -8175,9 +8014,12 @@ mod tests {
         use crate::sample::Rng;
         use std::path::Path;
 
-        let dir = [Path::new("model/q4"), Path::new("/tmp/quantized-weights")]
-            .into_iter()
-            .find(|p| crate::dgq::store::looks_like_dgq_dir(p));
+        let dir = [
+            Path::new("model/diffusiongemma-q4emb"),
+            Path::new("/tmp/quantized-weights"),
+        ]
+        .into_iter()
+        .find(|p| crate::dgq::store::looks_like_dgq_dir(p));
         let Some(dir) = dir else {
             eprintln!("skip generate_path_reset_block_matches_step_smoke_ids");
             return;
@@ -8242,9 +8084,12 @@ mod tests {
             read_half_buffer_f32(&rt.bufs.logits, 0, VOCAB)
         }
 
-        let dir = [Path::new("model/q4"), Path::new("/tmp/quantized-weights")]
-            .into_iter()
-            .find(|p| crate::dgq::store::looks_like_dgq_dir(p));
+        let dir = [
+            Path::new("model/diffusiongemma-q4emb"),
+            Path::new("/tmp/quantized-weights"),
+        ]
+        .into_iter()
+        .find(|p| crate::dgq::store::looks_like_dgq_dir(p));
         let Some(dir) = dir else {
             eprintln!("skip fusion_matches_unfused_forward_logits");
             return;

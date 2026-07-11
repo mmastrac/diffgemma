@@ -1677,24 +1677,45 @@ mod tool_smoke {
         None
     }
 
-    /// One tool turn, driven exactly like the server worker: render the messages
-    /// + tools in the model's canonical format, tokenize the specials, generate
-    /// (stop at eos), then parse the calls back. Returns (raw reply, calls).
-    fn tool_turn(dir: &Path, messages: &[Value], tools: &[Value]) -> (String, Vec<ParsedToolCall>) {
+    const MAX_SEQ: usize = 2048;
+
+    /// One session shared by every scenario in this module: the model load
+    /// dominated these tests as separate #[test] fns, so they now run as
+    /// phases of a single test against one session.
+    fn open_rig(
+        dir: &Path,
+    ) -> (
+        crate::tokenizer::Tokenizer,
+        StepGenerateConfig,
+        StepGenerateSession,
+    ) {
         let tok = crate::tokenizer::Tokenizer::load(dir.join("tokenizer.json")).unwrap();
         let layers = crate::resolve_model_layers(dir, None).unwrap();
         let stop = crate::config::load_generation_stop_tokens(dir);
         let sampler = crate::sample::sampler_for_steps(24, false);
-        const MAX_SEQ: usize = 2048;
         let mut cfg = StepGenerateConfig::from_generate(7, 512, MAX_SEQ, layers, sampler, false);
         cfg.stop_token_ids = stop.clone();
         cfg.degenerate_reply_check = crate::chat_template::empty_reply_check(dir, stop);
-        let (mut session, _) = StepGenerateSession::open(dir, &cfg, None).unwrap();
+        let (session, _) = StepGenerateSession::open(dir, &cfg, None).unwrap();
+        (tok, cfg, session)
+    }
 
+    /// One tool turn, driven exactly like the server worker: render the messages
+    /// + tools in the model's canonical format, tokenize the specials, generate
+    /// (stop at eos), then parse the calls back. Returns (raw reply, calls).
+    /// `generate_with_session` resets the KV when the prompt doesn't extend it.
+    fn tool_turn(
+        tok: &crate::tokenizer::Tokenizer,
+        cfg: &StepGenerateConfig,
+        session: &mut StepGenerateSession,
+        messages: &[Value],
+        tools: &[Value],
+    ) -> (String, Vec<ParsedToolCall>) {
         let prompt_str = crate::tools::render_conversation(messages, tools, true, false);
         let prompt = tok.encode_with_specials(&prompt_str);
+        let mut cfg = cfg.clone();
         cfg.max_new_tokens = 512.min(MAX_SEQ.saturating_sub(prompt.len()).max(1));
-        let out = generate_with_session(&mut session, &prompt, &cfg, "tool-smoke").unwrap();
+        let out = generate_with_session(session, &prompt, &cfg, "tool-smoke").unwrap();
         let new_ids = crate::sample::strip_degenerate_token_ids(
             out.token_ids.get(prompt.len()..).unwrap_or(&[]),
         );
@@ -1724,14 +1745,19 @@ mod tool_smoke {
                 "required":["query"]}}})
     }
 
+    /// Both tool-grammar scenarios as phases of one test (single model load):
+    /// a well-formed call with a string arg, then schema-typed argument kinds.
     #[test]
-    fn tool_smoke_emits_a_well_formed_call() {
+    fn tool_smoke_call_shape_and_argument_types() {
         let Some(dir) = model_dir() else {
-            eprintln!("skip tool_smoke_emits_a_well_formed_call: quantized model not present");
+            eprintln!("skip tool_smoke_call_shape_and_argument_types: quantized model not present");
             return;
         };
+        let (tok, cfg, mut session) = open_rig(&dir);
+
+        // --- Phase 1: a well-formed call with the expected name + path arg.
         let msgs = [json!({"role":"user","content":"List the files in /tmp using the tool."})];
-        let (text, calls) = tool_turn(&dir, &msgs, &[list_dir_tool()]);
+        let (text, calls) = tool_turn(&tok, &cfg, &mut session, &msgs, &[list_dir_tool()]);
         assert!(
             !calls.is_empty(),
             "expected a tool call, got reply: {text:?}"
@@ -1743,17 +1769,11 @@ mod tool_smoke {
             "path arg should reference /tmp, got {:?} (reply: {text:?})",
             calls[0].arguments
         );
-    }
 
-    #[test]
-    fn tool_smoke_argument_types_match_schema() {
-        let Some(dir) = model_dir() else {
-            eprintln!("skip tool_smoke_argument_types_match_schema: quantized model not present");
-            return;
-        };
+        // --- Phase 2: schema-typed arguments (integer/boolean/enum, not strings).
         let msgs = [json!({"role":"user","content":
             "Search for \"rust async\" with 5 results, safe search on, sorted by date. Use the tool."})];
-        let (text, calls) = tool_turn(&dir, &msgs, &[search_tool()]);
+        let (text, calls) = tool_turn(&tok, &cfg, &mut session, &msgs, &[search_tool()]);
         assert!(
             !calls.is_empty(),
             "expected a tool call, got reply: {text:?}"
@@ -1860,16 +1880,119 @@ mod tool_compact_smoke {
         ]
     }
 
-    /// The full M1 loop: route → summarize pass (checkpoint/rollback) →
-    /// substituted main generation → finalize. Asserts the KV-state invariants
-    /// at each step.
+    /// All three compaction smokes as phases of ONE test: the three separate
+    /// model loads dominated the entire default suite, and every phase after A
+    /// starts from a state the manager/session APIs guarantee (activate() of a
+    /// new conversation resets the KV). Phases:
+    ///   A) raw extend past capacity = typed error, no partial write;
+    ///   B) M2 expand re-entry + finalize eviction (raw session);
+    ///   C) M1 summarize-rewind + substituted finalize (via the manager);
+    ///   D) overlong finalize trims to capacity instead of panicking.
     #[test]
-    fn tool_compact_rewind_smoke() {
+    fn tool_compact_m1_m2_and_overlong_smoke() {
         let Some(dir) = model_dir() else {
-            eprintln!("skip tool_compact_rewind_smoke: quantized model not present");
+            eprintln!("skip tool_compact_m1_m2_and_overlong_smoke: quantized model not present");
             return;
         };
-        let (tok, cfg, session) = open(&dir);
+        let (tok, cfg, mut session) = open(&dir);
+
+        // --- Phase A: raw extend past capacity (fresh session → no partial write).
+        let capacity = session.extend_capacity();
+        assert_eq!(capacity, MAX_SEQ - crate::metal::CANVAS);
+
+        // Raw extend past capacity: typed error, no partial write, no panic.
+        let overlong: Vec<u32> = tok
+            .encode(&"inventory line item alpha beta ".repeat(900), false)
+            .into_iter()
+            .take(capacity + 100)
+            .collect();
+        assert!(overlong.len() > capacity, "fixture must exceed capacity");
+        assert!(session.extend_kv(&overlong).is_err());
+        assert_eq!(session.kv_valid_tokens().len(), 0);
+
+        // Finalize with the same overlong canonical: Ok, KV holds the longest
+        // fitting prefix, routing log keeps the full canonical.
+
+        // --- Phase B: M2 expand re-entry + eviction, on the raw session.
+        {
+            let output = big_output();
+            let messages = base_messages(&output);
+            let mut tools = vec![read_file_tool()];
+            tools.push(tc::expand_summary_tool());
+            let count = |s: &str| tok.encode(s, false).len();
+            let hash = tc::fnv1a64(&output);
+            let resolve = |h: u64| {
+                (h == hash).then(|| ("tr_smoke".to_string(), "a directory listing".to_string()))
+            };
+            let messages_sub = tc::compact_messages(&messages, THRESHOLD, &count, &resolve);
+
+            let prompt = tok.encode_with_specials(&crate::tools::render_conversation(
+                &messages_sub,
+                &tools,
+                true,
+                false,
+            ));
+            let mut cfg_r0 = cfg.clone();
+            cfg_r0.max_new_tokens = 256;
+            let out =
+                generate_with_session(&mut session, &prompt, &cfg_r0, "expand-smoke").unwrap();
+
+            // Hand-build the expand round exactly as handle_tool_compact does:
+            // model's own token ids + the canonical rendered tool response.
+            let excerpt =
+                tc::dispatch_expand(&json!({"mode":"grep","pattern":"secret_marker"}), &output);
+            assert!(excerpt.contains("zebra42"));
+            let resp_text = crate::tools::render_tool_response(
+                tc::EXPAND_TOOL_NAME,
+                &json!({"content": excerpt}),
+            );
+            let mut ext = out.token_ids.clone();
+            ext.extend(tok.encode_with_specials(&resp_text));
+            assert!(ext.len() + crate::metal::CANVAS < MAX_SEQ);
+            let reuse = ext
+                .iter()
+                .zip(session.kv_valid_tokens())
+                .take_while(|(a, b)| a == b)
+                .count();
+            session.truncate_kv_to(reuse);
+            session.extend_kv(&ext[reuse..]).unwrap();
+            assert_eq!(session.kv_valid_tokens(), &ext[..]);
+
+            // Re-entry: prompt == kv_valid_tokens → no prefill, fresh block denoise.
+            let round_prompt = session.kv_valid_tokens().to_vec();
+            let mut cfg_r1 = cfg.clone();
+            cfg_r1.max_new_tokens =
+                256.min(MAX_SEQ.saturating_sub(round_prompt.len() + crate::metal::CANVAS));
+            let out2 = generate_with_session(&mut session, &round_prompt, &cfg_r1, "expand-smoke")
+                .expect("re-entry after expand extension must succeed");
+            assert!(
+                out2.token_ids.len() > round_prompt.len(),
+                "re-entry must denoise new tokens"
+            );
+
+            // Finalize-equivalent: rebuild the canonical (no expand round in it) and
+            // verify the excerpt tokens are gone from the causal KV.
+            let mut completed = messages_sub.clone();
+            completed.push(json!({"role":"assistant","content":"done"}));
+            let canonical = tok.encode_with_specials(&crate::tools::render_conversation(
+                &completed, &tools, false, false,
+            ));
+            let reuse = canonical
+                .iter()
+                .zip(session.kv_valid_tokens())
+                .take_while(|(a, b)| a == b)
+                .count();
+            session.truncate_kv_to(reuse);
+            session.extend_kv(&canonical[reuse..]).unwrap();
+            assert_eq!(session.kv_valid_tokens(), &canonical[..]);
+            assert!(
+                !tok.decode(session.kv_valid_tokens()).contains("zebra42"),
+                "expand excerpt must be evicted from the canonical KV"
+            );
+        }
+
+        // --- Phase C: M1 summarize-rewind + substituted finalize (manager owns
+        // the session from here; activate() resets the KV for the new conv).
         let conv_dir =
             std::env::temp_dir().join(format!("dgq-compact-smoke-{}", std::process::id()));
         let mut manager = crate::conversation::ConversationManager::new(session, 0, 0, conv_dir);
@@ -1961,125 +2084,8 @@ mod tool_compact_smoke {
             canonical_text.contains("tr_smoke"),
             "substituted id missing from canonical KV"
         );
-    }
 
-    /// The M2 machinery: after a generation, extend the KV with the model's own
-    /// tokens + a server-rendered expand_summary response, re-enter generation
-    /// with prompt == kv_valid_tokens (fresh block), and verify finalize evicts
-    /// the excerpt.
-    #[test]
-    fn tool_compact_expand_reentry_smoke() {
-        let Some(dir) = model_dir() else {
-            eprintln!("skip tool_compact_expand_reentry_smoke: quantized model not present");
-            return;
-        };
-        let (tok, cfg, mut session) = open(&dir);
-
-        let output = big_output();
-        let messages = base_messages(&output);
-        let mut tools = vec![read_file_tool()];
-        tools.push(tc::expand_summary_tool());
-        let count = |s: &str| tok.encode(s, false).len();
-        let hash = tc::fnv1a64(&output);
-        let resolve = |h: u64| {
-            (h == hash).then(|| ("tr_smoke".to_string(), "a directory listing".to_string()))
-        };
-        let messages_sub = tc::compact_messages(&messages, THRESHOLD, &count, &resolve);
-
-        let prompt = tok.encode_with_specials(&crate::tools::render_conversation(
-            &messages_sub,
-            &tools,
-            true,
-            false,
-        ));
-        let mut cfg_r0 = cfg.clone();
-        cfg_r0.max_new_tokens = 256;
-        let out = generate_with_session(&mut session, &prompt, &cfg_r0, "expand-smoke").unwrap();
-
-        // Hand-build the expand round exactly as handle_tool_compact does:
-        // model's own token ids + the canonical rendered tool response.
-        let excerpt =
-            tc::dispatch_expand(&json!({"mode":"grep","pattern":"secret_marker"}), &output);
-        assert!(excerpt.contains("zebra42"));
-        let resp_text =
-            crate::tools::render_tool_response(tc::EXPAND_TOOL_NAME, &json!({"content": excerpt}));
-        let mut ext = out.token_ids.clone();
-        ext.extend(tok.encode_with_specials(&resp_text));
-        assert!(ext.len() + crate::metal::CANVAS < MAX_SEQ);
-        let reuse = ext
-            .iter()
-            .zip(session.kv_valid_tokens())
-            .take_while(|(a, b)| a == b)
-            .count();
-        session.truncate_kv_to(reuse);
-        session.extend_kv(&ext[reuse..]).unwrap();
-        assert_eq!(session.kv_valid_tokens(), &ext[..]);
-
-        // Re-entry: prompt == kv_valid_tokens → no prefill, fresh block denoise.
-        let round_prompt = session.kv_valid_tokens().to_vec();
-        let mut cfg_r1 = cfg.clone();
-        cfg_r1.max_new_tokens =
-            256.min(MAX_SEQ.saturating_sub(round_prompt.len() + crate::metal::CANVAS));
-        let out2 = generate_with_session(&mut session, &round_prompt, &cfg_r1, "expand-smoke")
-            .expect("re-entry after expand extension must succeed");
-        assert!(
-            out2.token_ids.len() > round_prompt.len(),
-            "re-entry must denoise new tokens"
-        );
-
-        // Finalize-equivalent: rebuild the canonical (no expand round in it) and
-        // verify the excerpt tokens are gone from the causal KV.
-        let mut completed = messages_sub.clone();
-        completed.push(json!({"role":"assistant","content":"done"}));
-        let canonical = tok.encode_with_specials(&crate::tools::render_conversation(
-            &completed, &tools, false, false,
-        ));
-        let reuse = canonical
-            .iter()
-            .zip(session.kv_valid_tokens())
-            .take_while(|(a, b)| a == b)
-            .count();
-        session.truncate_kv_to(reuse);
-        session.extend_kv(&canonical[reuse..]).unwrap();
-        assert_eq!(session.kv_valid_tokens(), &canonical[..]);
-        assert!(
-            !tok.decode(session.kv_valid_tokens()).contains("zebra42"),
-            "expand excerpt must be evicted from the canonical KV"
-        );
-    }
-
-    /// Regression for the KV-overflow panic hit in production (2026-07-09): a
-    /// 13-block reply overshot the token budget by up to a block, and finalize's
-    /// extend of the ~context-full canonical tripped the `set_kv_len` assert.
-    /// Now: `extend_kv` past capacity is a typed error, and `finalize` trims its
-    /// extend to the longest fitting prefix (full canonical kept for routing).
-    #[test]
-    fn tool_compact_overlong_finalize_is_trimmed_not_panic() {
-        let Some(dir) = model_dir() else {
-            eprintln!(
-                "skip tool_compact_overlong_finalize_is_trimmed_not_panic: quantized model not present"
-            );
-            return;
-        };
-        let (tok, _cfg, mut session) = open(&dir);
-        let capacity = session.extend_capacity();
-        assert_eq!(capacity, MAX_SEQ - crate::metal::CANVAS);
-
-        // Raw extend past capacity: typed error, no partial write, no panic.
-        let overlong: Vec<u32> = tok
-            .encode(&"inventory line item alpha beta ".repeat(900), false)
-            .into_iter()
-            .take(capacity + 100)
-            .collect();
-        assert!(overlong.len() > capacity, "fixture must exceed capacity");
-        assert!(session.extend_kv(&overlong).is_err());
-        assert_eq!(session.kv_valid_tokens().len(), 0);
-
-        // Finalize with the same overlong canonical: Ok, KV holds the longest
-        // fitting prefix, routing log keeps the full canonical.
-        let conv_dir =
-            std::env::temp_dir().join(format!("dgq-compact-smoke-fin-{}", std::process::id()));
-        let mut manager = crate::conversation::ConversationManager::new(session, 0, 0, conv_dir);
+        // --- Phase D: overlong finalize trims to the longest fitting prefix.
         let conv_id = manager.activate(&overlong);
         manager.finalize(conv_id, &overlong).unwrap();
         assert_eq!(

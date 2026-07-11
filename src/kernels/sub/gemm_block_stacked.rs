@@ -763,7 +763,7 @@ mod tests {
         use objc2::runtime::ProtocolObject;
         use std::path::Path;
 
-        let dir = ["model/q4", "/tmp/quantized-weights"]
+        let dir = ["model/diffusiongemma-q4emb", "/tmp/quantized-weights"]
             .into_iter()
             .map(Path::new)
             .find(|p| crate::dgq::store::looks_like_dgq_dir(p));
@@ -877,7 +877,7 @@ mod tests {
         use objc2::runtime::ProtocolObject;
         use std::path::Path;
 
-        let dir = ["model/q4", "/tmp/quantized-weights"]
+        let dir = ["model/diffusiongemma-q4emb", "/tmp/quantized-weights"]
             .into_iter()
             .map(Path::new)
             .find(|p| crate::dgq::store::looks_like_dgq_dir(p));

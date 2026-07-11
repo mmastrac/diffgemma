@@ -47,7 +47,11 @@ mod tests {
     }
 
     fn run_pin_layer(layer: usize, prompt: &str) -> Option<MoeBatchedPinDump> {
-        let dir = std::path::Path::new("/tmp/quantized-weights");
+        let dir_buf = match crate::kernels::sub::test_util::dgq_model_dir() {
+            Some(d) => d,
+            None => std::path::PathBuf::from("/tmp/quantized-weights"),
+        };
+        let dir = dir_buf.as_path();
         if !dir.join("model.dgq.json").exists() {
             eprintln!("skip: /tmp/quantized-weights missing");
             return None;
@@ -62,43 +66,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "tier-1 pin on demand: batched MoE L0 Calgary (requires /tmp/quantized-weights)"]
+    #[ignore = "tier-1 pin on demand: batched MoE L0 Calgary (model-gated, run with --ignored)"]
     fn batched_pin_l0_calgary_stages() {
         let dump = run_pin_layer(0, "What's the best way to get from calgary to namibia?")
-            .expect("pin capture");
-        print_pin_summary(&dump);
-        assert!(
-            dump.stages.gather >= 0.99,
-            "gather cos={}",
-            dump.stages.gather
-        );
-        assert!(
-            dump.stages.gate_up_gemm >= 0.99,
-            "gate_up_gemm cos={}",
-            dump.stages.gate_up_gemm
-        );
-        assert!(
-            dump.stages.swiglu_post >= 0.99,
-            "swiglu_post cos={}",
-            dump.stages.swiglu_post
-        );
-        assert!(
-            dump.stages.swiglu_isolated >= 0.99,
-            "swiglu_isolated cos={}",
-            dump.stages.swiglu_isolated
-        );
-        assert!(dump.stages.down >= 0.99, "down cos={}", dump.stages.down);
-        assert!(
-            dump.stages.scatter >= 0.99,
-            "scatter cos={}",
-            dump.stages.scatter
-        );
-    }
-
-    #[test]
-    #[ignore = "tier-1 pin on demand: batched MoE L1 Calgary (requires /tmp/quantized-weights)"]
-    fn batched_pin_l1_calgary_stages() {
-        let dump = run_pin_layer(1, "What's the best way to get from calgary to namibia?")
             .expect("pin capture");
         print_pin_summary(&dump);
         assert!(

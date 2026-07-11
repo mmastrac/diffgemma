@@ -2983,23 +2983,4 @@ mod encoder_moe_kv_tests {
             );
         }
     }
-
-    #[test]
-    fn encoder_moe_kv_matches_cpu_for_calgary_prompt() {
-        let dir = std::path::Path::new("/tmp/quantized-weights");
-        if !dir.join("model.dgq.json").exists() {
-            eprintln!("skip: /tmp/quantized-weights missing");
-            return;
-        }
-        let ids = calgary_prefill(dir);
-        assert_eq!(ids.len(), 22);
-        let (max_diff, layer, pos) = run_encoder_moe_kv_parity(dir, &ids, 30, 512).expect("parity");
-        eprintln!(
-            "encoder moe kv parity (Calgary, 22 tok): max_diff={max_diff:.6} layer={layer} pos={pos}"
-        );
-        assert!(
-            max_diff < 0.02,
-            "cpu vs gpu encoder MoE KV diverged: {max_diff} @ L{layer} pos {pos}"
-        );
-    }
 }

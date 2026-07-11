@@ -8,6 +8,18 @@ pub enum ElemFormat {
     F32,
 }
 
+/// Quantized-model directory for real-weight tests: the in-repo model first,
+/// then the legacy /tmp path. Tests gated on this skip gracefully when absent.
+pub fn dgq_model_dir() -> Option<std::path::PathBuf> {
+    for p in ["model/diffusiongemma-q4emb", "/tmp/quantized-weights"] {
+        let d = std::path::PathBuf::from(p);
+        if d.join("model.dgq.json").exists() {
+            return Some(d);
+        }
+    }
+    None
+}
+
 pub fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
     a.iter()
@@ -66,19 +78,15 @@ macro_rules! kernel_oracle_matrix {
                 mod $fmt {
                     use $crate::kernels::sub::test_util::{assert_oracle, ElemFormat};
 
-                    #[test]
-                    fn cpu_smoke() {
-                        let fix = $fixture_fn(ElemFormat::$fmt);
-                        let out = $cpu_fn(&fix);
-                        assert!(out.iter().all(|v| v.is_finite()));
-                        assert_eq!(out.len(), $out_len(&fix));
-                    }
-
+                    // (cpu_smoke was deleted: strictly dominated by
+                    // cpu_matches_oracle, which runs the same CPU fn and asserts
+                    // finiteness inside assert_oracle.)
                     #[test]
                     fn cpu_matches_oracle() {
                         let fix = $fixture_fn(ElemFormat::$fmt);
                         let out = $cpu_fn(&fix);
                         let oracle = $oracle_fn(&fix);
+                        assert_eq!(out.len(), $out_len(&fix));
                         assert_oracle(&out, &oracle, $max_tol, $min_cos);
                     }
 

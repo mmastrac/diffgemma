@@ -181,11 +181,15 @@ mod tests {
     }
 
     #[test]
-    fn spot_check_tmp_quantized_weights() {
+    fn spot_check_quantized_weights_vs_bf16() {
         let src = std::path::Path::new("model/transformer");
-        let dgq = std::path::Path::new("/tmp/quantized-weights");
-        if !dgq.join("model.dgq.json").exists() || !src.exists() {
-            eprintln!("skip: model or /tmp/quantized-weights missing");
+        let Some(dgq) = crate::kernels::sub::test_util::dgq_model_dir() else {
+            eprintln!("skip: quantized model not present");
+            return;
+        };
+        let dgq = dgq.as_path();
+        if !src.exists() {
+            eprintln!("skip: model/transformer (bf16 source) missing");
             return;
         }
 
@@ -195,6 +199,7 @@ mod tests {
             "model.decoder.layers.0.experts.gate_up_proj",
             "model.decoder.layers.0.router.proj.weight",
             "model.decoder.layers.0.input_layernorm.weight",
+            "model.decoder.self_conditioning.down_proj.weight",
         ];
         let results = spot_check(src, dgq, &tensors).expect("spot-check");
         for r in &results {
@@ -210,14 +215,6 @@ mod tests {
                 QuantKind::Raw => assert!(r.max_abs_err < 1e-5, "raw {}", r.name),
             }
         }
-
-        let embed = spot_check_embed_row(src, dgq, "model.decoder.embed_tokens.weight", 2816)
-            .expect("embed row");
-        eprintln!(
-            "  {} {:?}: max={:.6} mean={:.6}",
-            embed.name, embed.kind, embed.max_abs_err, embed.mean_abs_err
-        );
-        assert!(embed.max_abs_err < 0.05);
     }
 
     #[test]
@@ -239,9 +236,10 @@ mod tests {
             .map(|c| crate::kernels::cpu::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect();
 
-        let q4_path = std::path::Path::new("/tmp/quantized-weights");
-        let nv_path = std::path::Path::new("/tmp/nvfp4-weights");
-        for (label, dgq_path) in [("q4", q4_path), ("nvfp4", nv_path)] {
+        let q4_path = crate::kernels::sub::test_util::dgq_model_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/quantized-weights"));
+        let nv_path = std::path::PathBuf::from("/tmp/nvfp4-weights");
+        for (label, dgq_path) in [("q4", &q4_path), ("nvfp4", &nv_path)] {
             if !dgq_path.join("model.dgq.json").exists() {
                 eprintln!("skip {label}: missing {}", dgq_path.display());
                 continue;

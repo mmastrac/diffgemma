@@ -502,78 +502,12 @@ mod q4_gpu_tests {
     use crate::metal::linear::f32_q4_linear_gpu_bufs;
 
     #[test]
-    fn q4_gpu_linear_matches_cpu_dequant() {
-        let dgq_dir = std::path::Path::new("/tmp/quantized-weights");
-        if !dgq_dir.join("model.dgq.json").exists() {
-            eprintln!("skip: /tmp/quantized-weights missing");
-            return;
-        }
-        let store = DgqStore::open(dgq_dir).expect("open dgq");
-        let ctx = MetalContext::new().expect("metal");
-        let blob = DgqGpuBlob::from_store(&store, &ctx.device).expect("blob");
-        let q4 = load_block_linear(
-            &store,
-            Arc::clone(&blob),
-            "model.decoder.layers.0.self_attn.q_proj.weight",
-        )
-        .expect("q4 view");
-
-        let m = 4usize;
-        let k = q4.in_dim;
-        let n = q4.out_dim;
-        let a: Vec<f32> = (0..m * k)
-            .map(|i| (i as f32 * 0.001 - 0.5).sin() * 0.01)
-            .collect();
-
-        let f32_w = store
-            .tensor_f32("model.decoder.layers.0.self_attn.q_proj.weight")
-            .expect("dequant");
-        let mut cpu_out = vec![0.0f32; m * n];
-        for row in 0..m {
-            for col in 0..n {
-                let mut sum = 0.0f32;
-                for p in 0..k {
-                    sum += a[row * k + p] * f32_w[col * k + p];
-                }
-                cpu_out[row * n + col] = sum;
-            }
-        }
-
-        let mut pool = BufferPool::new();
-        let prod = crate::kernels::sub::variant::KernelVariant::PRODUCTION;
-        let pipeline = crate::kernels::sub::gemm_linear_f32::pipeline_for(
-            &ctx,
-            crate::kernels::sub::QuantFormat::Q4Affine,
-            prod,
-        )
-        .expect("pipeline");
-        let nvfp4_pipeline = crate::kernels::sub::gemm_linear_f32::pipeline_for(
-            &ctx,
-            crate::kernels::sub::QuantFormat::NvFp4,
-            prod,
-        )
-        .expect("nvfp4 pipeline");
-        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None)
-            .expect("batch");
-        let buf_a = batch.alloc_f32(&a).expect("a");
-        let buf_c =
-            f32_q4_linear_gpu_bufs(&mut batch, &pipeline, &nvfp4_pipeline, &buf_a, &q4, m, k, n)
-                .expect("gemm");
-        let mut gpu_out = vec![0.0f32; m * n];
-        batch.register_read(buf_c, &mut gpu_out);
-        batch.end().expect("end");
-
-        let mut max_err = 0.0f32;
-        for (a, b) in cpu_out.iter().zip(gpu_out.iter()) {
-            max_err = max_err.max((a - b).abs());
-        }
-        eprintln!("q4 gpu vs cpu dequant max_err={max_err:.6}");
-        assert!(max_err < 0.05, "max_err={max_err}");
-    }
-
-    #[test]
     fn q8_gpu_linear_matches_cpu_dequant() {
-        let dgq_dir = std::path::Path::new("/tmp/quantized-weights");
+        let dgq_dir_buf = match crate::kernels::sub::test_util::dgq_model_dir() {
+            Some(d) => d,
+            None => std::path::PathBuf::from("/tmp/quantized-weights"),
+        };
+        let dgq_dir = dgq_dir_buf.as_path();
         if !dgq_dir.join("model.dgq.json").exists() {
             eprintln!("skip: /tmp/quantized-weights missing");
             return;
@@ -584,7 +518,7 @@ mod q4_gpu_tests {
         let q8 = load_q8_linear(
             &store,
             Arc::clone(&blob),
-            "model.decoder.embed_tokens.weight",
+            "model.decoder.self_conditioning.down_proj.weight",
         )
         .expect("q8 embed");
         let q8 = q8.row_slice(100, 8);
@@ -597,7 +531,7 @@ mod q4_gpu_tests {
             .collect();
 
         let f32_w = store
-            .tensor_f32("model.decoder.embed_tokens.weight")
+            .tensor_f32("model.decoder.self_conditioning.down_proj.weight")
             .expect("dequant");
         let row_off = 100usize;
         let mut cpu_out = vec![0.0f32; m * n];

@@ -629,7 +629,11 @@ mod dgq_expert_tests {
 
     #[test]
     fn dgq_expert_q4_matches_bf16_oracle_and_grouped_mirror() {
-        let dgq_dir = std::path::Path::new("/tmp/quantized-weights");
+        let dgq_dir_buf = match crate::kernels::sub::test_util::dgq_model_dir() {
+            Some(d) => d,
+            None => std::path::PathBuf::from("/tmp/quantized-weights"),
+        };
+        let dgq_dir = dgq_dir_buf.as_path();
         if !dgq_dir.join("model.dgq.json").exists() {
             eprintln!("skip: /tmp/quantized-weights missing");
             return;
