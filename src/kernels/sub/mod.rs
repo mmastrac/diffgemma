@@ -12,8 +12,6 @@ pub mod f16;
 pub mod fp8_e4m3_table;
 pub mod gather_prob_cols;
 pub mod gather_rows;
-pub mod gather_rows_bf16;
-pub mod gather_rows_bf16_to_f32;
 pub mod gelu;
 pub mod gemm_bf16;
 pub mod gemm_bf16_stacked;

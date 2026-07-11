@@ -1182,8 +1182,8 @@ impl StepPipelines {
             q6_block_grouped,
             nvfp4_block_sparse,
             block_sparse_gather,
-            gather_rows_bf16_to_f32: crate::kernels::sub::gather_rows_bf16_to_f32::pipeline_for(
-                ctx, prod,
+            gather_rows_bf16_to_f32: crate::kernels::sub::gather_rows::pipeline_for_fmt(
+                ctx, prod, false, true,
             )?,
             gelu_swiglu_gate_up: crate::kernels::sub::swiglu::pipeline_for_moe(ctx, prod)?,
             moe_scatter_weighted: crate::kernels::sub::moe_scatter_weighted::pipeline_for(
@@ -1210,7 +1210,9 @@ impl StepPipelines {
                 shader_include::include_metal!("kernels/compact_active_rows.metal"),
                 "compact_active_rows",
             )?,
-            gather_rows_bf16: crate::kernels::sub::gather_rows_bf16::pipeline_for(ctx, prod)?,
+            gather_rows_bf16: crate::kernels::sub::gather_rows::pipeline_for_fmt(
+                ctx, prod, false, false,
+            )?,
             scatter_logits_rows: ctx.compile_kernel(
                 shader_include::include_metal!("kernels/scatter_logits_rows.metal"),
                 "scatter_logits_rows",

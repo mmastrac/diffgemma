@@ -110,12 +110,46 @@ pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
     cpu(f)
 }
 
+/// Format-specialized pipeline. `src_f32`/`dst_f32` pick f32 (4-byte) vs
+/// activation-arena (2-byte bf16/fp16) for the source and destination buffers
+/// (function constants 4/5). The three legacy entry points map to:
+///   (true,  true)  — the old `gather_rows`             (f32 -> f32)
+///   (false, false) — the old `gather_rows_bf16`        (arena -> arena)
+///   (false, true)  — the old `gather_rows_bf16_to_f32` (arena -> f32)
+#[cfg(target_os = "macos")]
+pub fn pipeline_for_fmt(
+    ctx: &crate::metal::device::MetalContext,
+    variant: KernelVariant,
+    src_f32: bool,
+    dst_f32: bool,
+) -> Result<crate::metal::device::ComputePipeline, Error> {
+    use crate::kernels::sub::variant::FcBool;
+    let bools = [
+        FcBool {
+            index: 4,
+            value: src_f32,
+        },
+        FcBool {
+            index: 5,
+            value: dst_f32,
+        },
+    ];
+    let label = match (src_f32, dst_f32) {
+        (true, true) => "f32",
+        (false, true) => "arena2f32",
+        (false, false) => "arena",
+        (true, false) => "f322arena",
+    };
+    ctx.compile_subkernel_ex(SHADER, ENTRY, variant, label, &bools, &[])
+}
+
+/// f32 -> f32 gather (the oracle/batched-prefill default).
 #[cfg(target_os = "macos")]
 pub fn pipeline_for(
     ctx: &crate::metal::device::MetalContext,
     variant: KernelVariant,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_subkernel(SHADER, ENTRY, variant)
+    pipeline_for_fmt(ctx, variant, true, true)
 }
 
 #[cfg(target_os = "macos")]
@@ -194,10 +228,103 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     Ok(out)
 }
 
+/// Run the merged kernel for a given (src_f32, dst_f32) specialization on a
+/// fixture whose values are bf16-exact, returning the gathered output widened
+/// to f32. Used by the format-agreement test to cover the arena specializations
+/// (the old gather_rows_bf16 / gather_rows_bf16_to_f32) the f32 oracle can't.
+#[cfg(all(test, target_os = "macos"))]
+fn run_fmt(f: &Fixture, src_f32: bool, dst_f32: bool) -> Vec<f32> {
+    use crate::metal::buffer::BufferPool;
+    use crate::metal::device::MetalContext;
+
+    let ctx = MetalContext::new().expect("metal");
+    let pipeline =
+        pipeline_for_fmt(&ctx, KernelVariant::PRODUCTION, src_f32, dst_f32).expect("pipe");
+    let mut pool = BufferPool::new();
+    let out_len = f.out_len();
+
+    // bf16 bits = high 16 of the f32 (exact for bf16-representable values).
+    let src_bytes: Vec<u8> = if src_f32 {
+        f.src
+            .iter()
+            .flat_map(|v| v.to_bits().to_le_bytes())
+            .collect()
+    } else {
+        f.src
+            .iter()
+            .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+            .collect()
+    };
+    let buf_src = pool
+        .allocate(&ctx.device, src_bytes.len())
+        .expect("src alloc");
+    BufferPool::write_bytes(&buf_src, &src_bytes);
+
+    let idx_bytes =
+        unsafe { std::slice::from_raw_parts(f.indices.as_ptr().cast::<u8>(), f.indices.len() * 4) };
+    let buf_idx = pool.allocate(&ctx.device, idx_bytes.len()).expect("idx");
+    BufferPool::write_bytes(&buf_idx, idx_bytes);
+
+    let dst_elem = if dst_f32 { 4 } else { 2 };
+    let buf_dst = pool
+        .allocate(&ctx.device, out_len * dst_elem)
+        .expect("dst alloc");
+    let buf_dump = pool.allocate(&ctx.device, 4).expect("dump");
+
+    gpu_common::dispatch_1d(&ctx.queue, &pipeline.pipeline, out_len, |enc| {
+        bind_gpu_buffers(
+            enc,
+            &buf_src,
+            &buf_idx,
+            &buf_dst,
+            &buf_dump,
+            f.hidden as u32,
+            f.batch_size() as u32,
+            0,
+        );
+    })
+    .expect("dispatch");
+
+    if dst_f32 {
+        let mut out = vec![0.0f32; out_len];
+        BufferPool::read_f32(&buf_dst, &mut out);
+        out
+    } else {
+        let ptr = buf_dst.contents().as_ptr() as *const u16;
+        (0..out_len)
+            .map(|i| f32::from_bits((unsafe { *ptr.add(i) } as u32) << 16))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::kernel_oracle_matrix;
+
+    /// All three production specializations of the merged kernel — f32->f32,
+    /// arena->arena (the ex-`gather_rows_bf16`, previously untested), and
+    /// arena->f32 (ex-`gather_rows_bf16_to_f32`) — must agree bit-for-bit with
+    /// the CPU gather on bf16-exact input.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn format_specializations_agree() {
+        let f = tiny_fixture(ElemFormat::F32);
+        let expect = cpu(&f);
+        for (sf, df, label) in [
+            (true, true, "f32->f32"),
+            (false, false, "arena->arena"),
+            (false, true, "arena->f32"),
+        ] {
+            let got = run_fmt(&f, sf, df);
+            for (i, (a, e)) in got.iter().zip(&expect).enumerate() {
+                assert!(
+                    a.to_bits() == e.to_bits(),
+                    "{label}: mismatch at {i}: got {a} want {e}"
+                );
+            }
+        }
+    }
 
     kernel_oracle_matrix! {
         mod tiny,
