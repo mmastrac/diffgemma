@@ -906,11 +906,9 @@ impl StepPipelines {
                 );
             }
         }
-        let f32_to_half_scale = ctx.compile_subkernel(
-            shader_include::include_metal!("kernels/f32_to_half_scale.metal"),
-            "f32_to_half_scale",
-            variant,
-        )?;
+        // f32 -> arena bf16 with scale (convert_scale src_f32=true, dst_f32=false).
+        let f32_to_half_scale =
+            crate::kernels::sub::convert_scale::pipeline_for_fmt(ctx, variant, true, false)?;
         // Block-sparse MoE experts: tunable is the sole path (q4/q6/nvfp4).
         // gate_up gathers bf16 moein rows (fused gather); down's A is the
         // swiglu output. Wide variants = weight-stationary prefill height
@@ -1046,7 +1044,8 @@ impl StepPipelines {
             embed_gather_bf16: crate::kernels::sub::embed_gather::pipeline_for_fmt(ctx, prod, true)?,
             logit_rowstats: crate::kernels::sub::logit_rowstats::pipeline_for(ctx, prod)?,
             sc_prob_cols: crate::kernels::sub::sc_prob_cols::pipeline_for(ctx, prod)?,
-            half_scale: crate::kernels::sub::half_scale::pipeline_for(ctx, prod)?,
+            // arena bf16 in-place scale (convert_scale src_f32=false, dst_f32=false).
+            half_scale: crate::kernels::sub::convert_scale::pipeline_for_fmt(ctx, prod, false, false)?,
             softcap: crate::kernels::sub::softcap_half::pipeline_for(ctx, prod)?,
             sample_rowstats: crate::kernels::sub::sample_rowstats::pipeline_for(ctx, prod)?,
             sample_commit: crate::kernels::sub::sample_commit::pipeline_for(ctx, prod)?,
@@ -1944,35 +1943,44 @@ impl StepEnc<'_> {
         len: usize,
         scale: f32,
     ) {
+        // convert_scale (src_f32=true, dst_f32=false): src @0, arena dst @1.
+        // Arena is bound at `y_off`, so both base offsets are 0 (the binding
+        // offset already places the slot; passing `y_off` again would double it).
         self.sink_set_pipeline(&self.ps.f32_to_half_scale);
         self.sink_set_buffer(src_buf, 0, 0);
-        // Arena is already bound at `y_off`; the shader adds `base` on top of the
-        // binding offset, so `base` must be 0 (passing `y_off` here double-applies
-        // the offset and leaves the real slot at zero).
         self.sink_set_buffer(&self.bufs.arena, y_off as usize, 1);
-        self.sink_set_bytes(&0u32, 2);
-        self.sink_set_bytes(&(len as u32), 3);
-        self.sink_set_bytes(&scale, 4);
-        self.sink_set_buffer(&self.bufs.dummy_dump, 0, 5);
+        self.sink_set_bytes(&0u32, 2); // src_base
+        self.sink_set_bytes(&0u32, 3); // dst_base
+        self.sink_set_bytes(&(len as u32), 4);
+        self.sink_set_bytes(&scale, 5);
+        self.sink_set_buffer(&self.bufs.dummy_dump, 0, 6);
         self.dispatch_1d(&self.ps.f32_to_half_scale, len, 256);
     }
 
     fn scale_half_arena(&mut self, y_off: u64, elems: usize, scale: f32) {
+        // convert_scale (arena->arena, in-place): same buffer @0 and @1.
         self.sink_set_pipeline(&self.ps.half_scale);
         self.sink_set_buffer(&self.bufs.arena, y_off as usize, 0);
-        self.sink_set_bytes(&(elems as u32), 1);
-        self.sink_set_bytes(&scale, 2);
+        self.sink_set_buffer(&self.bufs.arena, y_off as usize, 1);
+        self.sink_set_bytes(&0u32, 2); // src_base
+        self.sink_set_bytes(&0u32, 3); // dst_base
+        self.sink_set_bytes(&(elems as u32), 4);
+        self.sink_set_bytes(&scale, 5);
+        self.sink_set_buffer(&self.bufs.dummy_dump, 0, 6);
         self.dispatch_1d(&self.ps.half_scale, elems, 256);
     }
 
     fn scale_half_logits(&mut self, elems: usize, scale: f32) {
-        // Same kernel as scale_half_arena (half_scale); only the bound buffer differs
-        // (logits vs arena). Both are byte-identical in-place bf16 scales.
+        // Same convert_scale kernel as scale_half_arena; only the bound buffer
+        // differs (logits vs arena). In-place bf16 scale, same buffer @0 and @1.
         self.sink_set_pipeline(&self.ps.half_scale);
         self.bind_logits(0);
-        self.sink_set_bytes(&(elems as u32), 1);
-        self.sink_set_bytes(&scale, 2);
-        self.sink_set_buffer(&self.bufs.dummy_dump, 0, 3);
+        self.bind_logits(1);
+        self.sink_set_bytes(&0u32, 2); // src_base
+        self.sink_set_bytes(&0u32, 3); // dst_base
+        self.sink_set_bytes(&(elems as u32), 4);
+        self.sink_set_bytes(&scale, 5);
+        self.sink_set_buffer(&self.bufs.dummy_dump, 0, 6);
         self.dispatch_1d(&self.ps.half_scale, elems, 256);
     }
 

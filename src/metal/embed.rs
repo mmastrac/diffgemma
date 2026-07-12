@@ -383,7 +383,7 @@ pub fn embed_token_ids_q8_gpu(
         return Err(Error::Format("embed_token_ids_q8_gpu shape mismatch"));
     }
     use crate::dgq::embed_row::EMBED_SCALE;
-    use crate::kernels::sub::{embed_gather, half_to_f32};
+    use crate::kernels::sub::{convert_scale, embed_gather};
 
     let embed_pipeline = engine.kernels.embed_gather.pipeline.clone();
     let half_pipeline = engine.kernels.half_to_f32.pipeline.clone();
@@ -424,7 +424,10 @@ pub fn embed_token_ids_q8_gpu(
     let base = 0u32;
     let len_u32 = len as u32;
     batch.dispatch_1d(&half_pipeline, len, |enc| {
-        half_to_f32::bind_gpu_buffers(enc, &buf_half, &buf_f32, &dump, base, len_u32);
+        // arena bf16 -> f32, no scale (src/dst both at `base`).
+        convert_scale::bind_gpu_buffers(
+            enc, &buf_half, 0, &buf_f32, 0, base, base, len_u32, 1.0, &dump,
+        );
     });
 
     batch.register_read(buf_f32, &mut out[..len]);

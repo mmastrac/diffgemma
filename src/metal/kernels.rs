@@ -30,7 +30,7 @@ pub struct GpuKernels {
 impl GpuKernels {
     pub fn new(ctx: &MetalContext) -> Result<Self, Error> {
         use crate::kernels::sub::{
-            embed_gather, gather_prob_cols, gather_rows, gelu, half_to_f32, pack_encoder_kv,
+            convert_scale, embed_gather, gather_prob_cols, gather_rows, gelu, pack_encoder_kv,
             rms_norm_rows, router_scale_rows, router_top_k_rows, scatter_rows_weighted,
             softmax_rows, swiglu, unpack_encoder_kv, vec_add_inplace, vec_fill_zero,
             vec_scale_inplace,
@@ -55,7 +55,8 @@ impl GpuKernels {
             rms_norm_no_scale: rms_norm_rows::pipeline_for(ctx, false, prod)?,
             rms_norm: rms_norm_rows::pipeline_for(ctx, true, prod)?,
             embed_gather: embed_gather::pipeline_for(ctx, prod)?,
-            half_to_f32: half_to_f32::pipeline_for(ctx, prod)?,
+            // arena bf16 -> f32 (convert_scale src_f32=false, dst_f32=true).
+            half_to_f32: convert_scale::pipeline_for_fmt(ctx, prod, false, true)?,
             pack_encoder_kv: pack_encoder_kv::pipeline_for(ctx, prod)?,
             pack_encoder_kv_q8: pack_encoder_kv::pipeline_fmt_for(
                 ctx,
