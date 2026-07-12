@@ -86,6 +86,7 @@ impl MetalContext {
             x_fp16,
             false,
             false,
+            false,
         )
     }
 
@@ -111,6 +112,7 @@ impl MetalContext {
             false,
             false,
             true,
+            false,
         )
     }
 
@@ -136,6 +138,35 @@ impl MetalContext {
             false,
             true,
             false,
+            false,
+        )
+    }
+
+    /// As `compile_gemm_subkernel` but sets K_ROWK_OUT_ARENA (FC30) — the
+    /// arena-overwrite output mode of `gemm_rowk` (SC softembed); accumulate
+    /// (f32, tied-embed lm_head) is the FC30-unset default.
+    pub fn compile_gemm_subkernel_rowk_arena(
+        &self,
+        source: &str,
+        entry: &str,
+        gemm_n: u32,
+        gemm_k: u32,
+        quant_format: u32,
+        x_fp16: bool,
+    ) -> Result<ComputePipeline, Error> {
+        let library = self.compile_library(source)?;
+        Self::compile_gemm_subkernel_on_device(
+            &self.device,
+            &library,
+            entry,
+            gemm_n,
+            gemm_k,
+            false,
+            quant_format,
+            x_fp16,
+            false,
+            false,
+            true,
         )
     }
 
@@ -319,6 +350,7 @@ impl MetalContext {
         x_fp16: bool,
         gather_a: bool,
         out_bf16: bool,
+        out_arena: bool,
     ) -> Result<ComputePipeline, Error> {
         let variant = crate::kernels::sub::variant::runtime_step_variant();
         let fc = MTLFunctionConstantValues::new();
@@ -398,19 +430,27 @@ impl MetalContext {
                     29,
                 );
             }
+            if out_arena {
+                fc.setConstantValue_type_atIndex(
+                    std::ptr::NonNull::from_ref(&out_arena).cast(),
+                    MTLDataType::Bool,
+                    30,
+                );
+            }
         }
         let name = NSString::from_str(entry);
         let function = library
             .newFunctionWithName_constantValues_error(&name, &fc)
             .map_err(|e| shader_compile_error(e))?;
         let label = format!(
-            "{entry}_qf{quant_format}_n{gemm_n}_k{gemm_k}_nt{gemm_n_tile}_xfp16{}_sa{}_df{}_dd{}_g{}_o{}_af{}",
+            "{entry}_qf{quant_format}_n{gemm_n}_k{gemm_k}_nt{gemm_n_tile}_xfp16{}_sa{}_df{}_dd{}_g{}_o{}_oa{}_af{}",
             u8::from(x_fp16),
             u8::from(shape_assert),
             u8::from(debug_fast),
             u8::from(debug_deep),
             u8::from(gather_a),
             u8::from(out_bf16),
+            u8::from(out_arena),
             u8::from(arena_f16),
         );
         let cache = PipelineArchiveCache::shared(device)?;

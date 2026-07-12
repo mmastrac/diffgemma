@@ -362,8 +362,8 @@ quant_formats = [0, 3]
 [[kernel.variants]]
 
 [[kernel]]
-name = "gemm_q8_rowk"
-entry = "gemm_q8_rowk"
+name = "gemm_rowk"
+entry = "gemm_rowk"
 quant_formats = [1]
 
 [kernel.fc]

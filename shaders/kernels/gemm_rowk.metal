@@ -7,13 +7,21 @@ using namespace metal;
 #include "dequant.metal"
 #include "arena.metal"
 
+/// Row-K GEMM: y[M,N] = x[M,K] @ W[K,N], weight rows indexed by K (vocab /
+/// SC softembed). Generic over BOTH axes tunable-style:
+///   K_QUANT_FORMAT (FC3)  = weight format: QUANT_Q8 (dequant) or QUANT_RAW (bf16).
+///   K_X_FP16       (FC10) = activation input dtype: fp16 vs bf16 arena.
+///   K_ROWK_OUT_ARENA (FC30) = output/fusion mode:
+///       false → y is `float[M,N]`, ACCUMULATE (`y += ...`), tied-embed lm_head.
+///       true  → y is arena `ushort[M,N]`, OVERWRITE (`arena_store`), SC softembed.
 constant bool K_X_FP16 [[function_constant(10)]];
+constant bool K_ROWK_OUT_ARENA_DEF [[function_constant(30)]];
+constant bool K_ROWK_OUT_ARENA =
+    is_function_constant_defined(K_ROWK_OUT_ARENA_DEF) ? K_ROWK_OUT_ARENA_DEF : false;
 
-/// y[M,N] (f32) += x[M,K] @ W[K,N]; weight rows indexed by K (vocab / SC softembed),
-/// stored bf16 (Raw embed). bf16-embed variant of `gemm_q8_rowk_acc_f32`.
-kernel void gemm_bf16_rowk_acc_f32(
+kernel void gemm_rowk(
     device const ushort *x [[buffer(0)]],
-    device float *y [[buffer(1)]],
+    device uchar *y [[buffer(1)]],
     device const uchar *blob [[buffer(2)]],
     constant ulong &w_off [[buffer(3)]],
     constant uint &M [[buffer(4)]],
@@ -70,7 +78,13 @@ kernel void gemm_bf16_rowk_acc_f32(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint i = ltid; i < 32 * 32; i += 128) {
         uint mm = i / 32, nn = i % 32;
-        if (m0 + mm < M && n0 + nn < N)
-            y[(ulong)(m0 + mm) * N + n0 + nn] += ty[mm][nn];
+        if (m0 + mm < M && n0 + nn < N) {
+            const ulong idx = (ulong)(m0 + mm) * N + n0 + nn;
+            if (K_ROWK_OUT_ARENA) {
+                arena_store((device ushort *)y, idx, ty[mm][nn]);
+            } else {
+                ((device float *)y)[idx] += ty[mm][nn];
+            }
+        }
     }
 }

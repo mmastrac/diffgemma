@@ -871,8 +871,7 @@ impl StepPipelines {
         }
         // Unified rowk f32-accumulate SC-softembed GEMM (one shader; weight format
         // = K_QUANT_FORMAT: Raw bf16 embed or Q8 embed). x is fp16 sc_probs.
-        const ROWK_ACC_SHADER: &str =
-            shader_include::include_metal!("kernels/gemm_bf16_rowk_acc_f32.metal");
+        const ROWK_ACC_SHADER: &str = shader_include::include_metal!("kernels/gemm_rowk.metal");
         let mut gemm_q8_rowk_acc_f32 = HashMap::new();
         {
             for &(n, k) in &[(HID as u32, crate::model::embed::LM_HEAD_CHUNK as u32)] {
@@ -880,7 +879,7 @@ impl StepPipelines {
                     (n, k),
                     ctx.compile_gemm_subkernel(
                         ROWK_ACC_SHADER,
-                        "gemm_bf16_rowk_acc_f32",
+                        "gemm_rowk",
                         n,
                         k,
                         false,
@@ -897,7 +896,7 @@ impl StepPipelines {
                     (n, k),
                     ctx.compile_gemm_subkernel(
                         ROWK_ACC_SHADER,
-                        "gemm_bf16_rowk_acc_f32",
+                        "gemm_rowk",
                         n,
                         k,
                         false,

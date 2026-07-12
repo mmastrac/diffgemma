@@ -1,4 +1,6 @@
-//! Tiled Q8 GEMM: `y[M,N] = x[M,K] @ W[K,N]` with K-indexed rows (monolith `k_gemm_q8_rowk`).
+//! Q8 row-K GEMM oracle + production wiring: `y[M,N] = x[M,K] @ W[K,N]` with
+//! K-indexed rows. Runs the generic `gemm_rowk` kernel (format + output-mode FC)
+//! in its arena-overwrite / q8 configuration (SC softembed path).
 
 use super::bf16;
 use super::f16;
@@ -8,9 +10,9 @@ use crate::dgq::block::{q8_gemm_rowk_cpu, quantize_row_q8};
 use crate::dgq::layout::q8_row_bytes;
 use crate::safetensors::Error;
 
-pub const ENTRY: &str = "gemm_q8_rowk";
+pub const ENTRY: &str = "gemm_rowk";
 
-const SHADER: &str = shader_include::include_metal!("kernels/gemm_q8_rowk.metal");
+const SHADER: &str = shader_include::include_metal!("kernels/gemm_rowk.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {
@@ -91,15 +93,7 @@ pub fn pipeline_for(
     n: u32,
     k: u32,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_gemm_subkernel(
-        SHADER,
-        ENTRY,
-        n,
-        k,
-        false,
-        super::QuantFormat::Q8 as u32,
-        false,
-    )
+    ctx.compile_gemm_subkernel_rowk_arena(SHADER, ENTRY, n, k, super::QuantFormat::Q8 as u32, false)
 }
 
 #[cfg(target_os = "macos")]
@@ -108,15 +102,7 @@ pub fn pipeline_for_fp16_input(
     n: u32,
     k: u32,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_gemm_subkernel(
-        SHADER,
-        ENTRY,
-        n,
-        k,
-        false,
-        super::QuantFormat::Q8 as u32,
-        true,
-    )
+    ctx.compile_gemm_subkernel_rowk_arena(SHADER, ENTRY, n, k, super::QuantFormat::Q8 as u32, true)
 }
 
 #[cfg(target_os = "macos")]
