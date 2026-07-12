@@ -425,3 +425,15 @@ mod tests {
 
 pub mod cpu;
 pub mod nvfp4;
+
+/// Manifest registration; collected in common/manifest.rs::MANIFEST.
+pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
+    name: "moe_grouped",
+    entry: "moe_grouped",
+    quant_formats: &[
+        crate::shaders::variant::QuantFormat::Q4Affine,
+        crate::shaders::variant::QuantFormat::NvFp4,
+    ],
+    fc: &[],
+    variants: crate::shaders::manifest::KernelVariants::Elementwise,
+};

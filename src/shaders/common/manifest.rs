@@ -1,15 +1,24 @@
 //! Kernel FC axis manifest — validity contract for pipeline specialization.
 //!
-//! `build/manifest.toml` is the human-readable spec; this module is the
-//! enforcement layer. Invalid tuples cannot be compiled; tier-1 tests enumerate
-//! every valid variant row.
+//! Each registered kernel declares its own `SPEC` const in its kernel
+//! directory (colocated with the Metal source); `MANIFEST` below collects
+//! them. This module is the enforcement layer: invalid tuples cannot be
+//! compiled, and tier-1 tests enumerate every valid variant row.
+//!
+//! The human-readable TOML form is GENERATED from these specs at runtime
+//! (`render_toml()`, `diffgemma-mps manifest`) — there is no checked-in
+//! manifest file to drift. FC 1–3 are reserved globally
+//! (src/shaders/include/fc_axes.metal); `fc` lists each kernel's LOCAL
+//! axes (index ≥ 4). Axes of non-registered kernels (the tunable GEMM
+//! family's FC9–11/28–30, convert_scale's FC4/5, …) are documented in
+//! KERNELS.md.
 
 use super::variant::{ElemDtype, FcBool, FcUInt, KernelVariant, QuantFormat};
 use crate::safetensors::Error;
 
-/// Parsed manifest (static mirror of `build/manifest.toml`).
+/// Collected kernel specs (each lives beside its kernel).
 pub struct Manifest {
-    pub kernels: &'static [KernelSpec],
+    pub kernels: &'static [&'static KernelSpec],
 }
 
 pub struct KernelSpec {
@@ -17,6 +26,8 @@ pub struct KernelSpec {
     pub entry: &'static str,
     /// Valid FC3 values. Empty means inert-only (must be `QuantFormat::Q4Affine`).
     pub quant_formats: &'static [QuantFormat],
+    /// Local function-constant axes: (index ≥ 4, name). FC1–3 are implied.
+    pub fc: &'static [(u32, &'static str)],
     pub variants: KernelVariants,
 }
 
@@ -56,188 +67,100 @@ pub struct SwigluSplitVariant {
 
 pub static MANIFEST: Manifest = Manifest {
     kernels: &[
-        KernelSpec {
-            name: "rms_norm_rows",
-            entry: "rms_norm_rows",
-            quant_formats: &[QuantFormat::Q4Affine],
-            variants: KernelVariants::RmsNormRows {
-                rows: &[
-                    RmsNormRowsVariant { affine: false },
-                    RmsNormRowsVariant { affine: true },
-                ],
-            },
-        },
-        KernelSpec {
-            name: "rms_norm_rows_tiled",
-            entry: "rms_norm_rows_tiled",
-            quant_formats: &[QuantFormat::Q4Affine],
-            variants: KernelVariants::RmsNormRowsTiled {
-                rows: &[
-                    RmsNormRowsTiledVariant {
-                        in_dtype: ElemDtype::F32,
-                    },
-                    RmsNormRowsTiledVariant {
-                        in_dtype: ElemDtype::Half,
-                    },
-                ],
-            },
-        },
-        KernelSpec {
-            name: "swiglu",
-            entry: "swiglu",
-            quant_formats: &[QuantFormat::Q4Affine],
-            variants: KernelVariants::SwigluSplit {
-                rows: &[
-                    SwigluSplitVariant {
-                        io_dtype: ElemDtype::F32,
-                        gelu_gate: false,
-                        in_place: true,
-                    },
-                    SwigluSplitVariant {
-                        io_dtype: ElemDtype::Half,
-                        gelu_gate: true,
-                        in_place: false,
-                    },
-                ],
-            },
-        },
-        KernelSpec {
-            name: "swiglu_moe_gate_up",
-            entry: "swiglu_moe_gate_up",
-            quant_formats: &[QuantFormat::Q4Affine],
-            variants: KernelVariants::SwigluMoeGateUp,
-        },
-        KernelSpec {
-            name: "gelu",
-            entry: "gelu",
-            quant_formats: &[QuantFormat::Q4Affine],
-            variants: KernelVariants::Gelu,
-        },
-        KernelSpec {
-            name: "embed_gather",
-            entry: "embed_gather",
-            quant_formats: &[QuantFormat::Q8],
-            variants: KernelVariants::Elementwise,
-        },
-        KernelSpec {
-            name: "logit_rowstats",
-            entry: "logit_rowstats",
-            quant_formats: &[QuantFormat::Q4Affine],
-            variants: KernelVariants::Elementwise,
-        },
-        KernelSpec {
-            name: "sc_prob_cols",
-            entry: "sc_prob_cols",
-            quant_formats: &[QuantFormat::Q4Affine],
-            variants: KernelVariants::Elementwise,
-        },
-        KernelSpec {
-            name: "sample_rowstats",
-            entry: "sample_rowstats",
-            quant_formats: &[QuantFormat::Q4Affine],
-            variants: KernelVariants::Elementwise,
-        },
-        KernelSpec {
-            name: "sample_commit",
-            entry: "sample_commit",
-            quant_formats: &[QuantFormat::Q4Affine],
-            variants: KernelVariants::Elementwise,
-        },
-        KernelSpec {
-            name: "sample_apply",
-            entry: "sample_apply",
-            quant_formats: &[QuantFormat::Q4Affine],
-            variants: KernelVariants::Elementwise,
-        },
-        KernelSpec {
-            name: "sample_write",
-            entry: "sample_write",
-            quant_formats: &[QuantFormat::Q4Affine],
-            variants: KernelVariants::Elementwise,
-        },
-        KernelSpec {
-            name: "qk_rope_kv",
-            entry: "qk_rope_kv",
-            quant_formats: &[QuantFormat::Q4Affine],
-            variants: KernelVariants::Elementwise,
-        },
-        KernelSpec {
-            name: "attention",
-            entry: "attention",
-            quant_formats: &[QuantFormat::Q4Affine],
-            variants: KernelVariants::Elementwise,
-        },
-        KernelSpec {
-            name: "moe_router",
-            entry: "moe_router",
-            quant_formats: &[QuantFormat::Q4Affine],
-            variants: KernelVariants::Elementwise,
-        },
-        KernelSpec {
-            name: "moe_bucket_count",
-            entry: "moe_bucket_count",
-            quant_formats: &[QuantFormat::Q4Affine],
-            variants: KernelVariants::Elementwise,
-        },
-        KernelSpec {
-            name: "moe_bucket_fill",
-            entry: "moe_bucket_fill",
-            quant_formats: &[QuantFormat::Q4Affine],
-            variants: KernelVariants::Elementwise,
-        },
-        KernelSpec {
-            name: "moe_grouped",
-            entry: "moe_grouped",
-            quant_formats: &[QuantFormat::Q4Affine, QuantFormat::NvFp4],
-            variants: KernelVariants::Elementwise,
-        },
-        KernelSpec {
-            name: "moe_scatter_weighted",
-            entry: "moe_scatter_weighted",
-            quant_formats: &[QuantFormat::Q4Affine],
-            variants: KernelVariants::Elementwise,
-        },
-        KernelSpec {
-            name: "gemm_linear_grouped",
-            entry: "gemm_linear_grouped",
-            quant_formats: &[QuantFormat::Q4Affine, QuantFormat::NvFp4],
-            variants: KernelVariants::Elementwise,
-        },
-        KernelSpec {
-            name: "gemm_block_grouped",
-            entry: "gemm_block_grouped",
-            quant_formats: &[QuantFormat::Q4Affine, QuantFormat::NvFp4],
-            variants: KernelVariants::GemmBlock,
-        },
-        KernelSpec {
-            name: "gemm_linear_f32",
-            entry: "gemm_linear_f32",
-            quant_formats: &[QuantFormat::Q4Affine, QuantFormat::NvFp4],
-            variants: KernelVariants::Elementwise,
-        },
-        KernelSpec {
-            name: "gemm_q8_linear_f32",
-            entry: "gemm_q8_linear_f32",
-            quant_formats: &[QuantFormat::Q4Affine],
-            variants: KernelVariants::Elementwise,
-        },
-        KernelSpec {
-            name: "gemm_block",
-            entry: "gemm_block",
-            quant_formats: &[QuantFormat::Q4Affine, QuantFormat::Q8, QuantFormat::NvFp4],
-            variants: KernelVariants::GemmBlock,
-        },
-        KernelSpec {
-            name: "gemm_rowk",
-            entry: "gemm_rowk",
-            quant_formats: &[QuantFormat::Q8],
-            variants: KernelVariants::GemmRowk,
-        },
+        &crate::shaders::rms_norm_rows::SPEC,
+        &crate::shaders::rms_norm_rows_tiled::SPEC,
+        &crate::shaders::swiglu::SPEC,
+        &crate::shaders::swiglu::SPEC_MOE_GATE_UP,
+        &crate::shaders::gelu::SPEC,
+        &crate::shaders::embed_gather::SPEC,
+        &crate::shaders::logit_rowstats::SPEC,
+        &crate::shaders::sc_prob_cols::SPEC,
+        &crate::shaders::sample_rowstats::SPEC,
+        &crate::shaders::sample_commit::SPEC,
+        &crate::shaders::sample_apply::SPEC,
+        &crate::shaders::sample_write::SPEC,
+        &crate::shaders::qk_rope_kv::SPEC,
+        &crate::shaders::attention::SPEC,
+        &crate::shaders::moe_router::SPEC,
+        &crate::shaders::moe_bucket_count::SPEC,
+        &crate::shaders::moe_bucket_fill::SPEC,
+        &crate::shaders::moe_grouped::SPEC,
+        &crate::shaders::moe_scatter_weighted::SPEC,
+        &crate::shaders::gemm_linear_grouped::SPEC,
+        &crate::shaders::gemm_block_grouped::SPEC,
+        &crate::shaders::gemm_linear_f32::SPEC,
+        &crate::shaders::gemm_q8_linear_f32::SPEC,
+        &crate::shaders::oracle::gemm::gemm_block::SPEC,
+        &crate::shaders::gemm_block_stacked::SPEC,
+        &crate::shaders::gemm_rowk::SPEC,
     ],
 };
 
 pub fn spec_by_entry(entry: &str) -> Option<&'static KernelSpec> {
-    MANIFEST.kernels.iter().find(|k| k.entry == entry)
+    MANIFEST.kernels.iter().copied().find(|k| k.entry == entry)
+}
+
+/// Render the collected specs as the human-readable TOML manifest.
+/// (`diffgemma-mps manifest` — generated on demand, never checked in.)
+pub fn render_toml() -> String {
+    let mut out = String::new();
+    out.push_str(
+        "# Kernel function-constant manifest (GENERATED: diffgemma-mps manifest).\n\
+         #\n\
+         # FC 1\u{2013}3 are reserved globally (see src/shaders/include/fc_axes.metal).\n\
+         # FC 4+ are per-kernel; each kernel lists its full index map under [kernel.fc].\n\
+         # Pipeline construction in Rust MUST only build tuples listed under [[kernel.variants]].\n\
+         # Tier-1 tests MUST cover every [[kernel.variants]] row (see manifest.rs tests).\n",
+    );
+    for k in MANIFEST.kernels {
+        out.push_str(&format!(
+            "\n[[kernel]]\nname = \"{}\"\nentry = \"{}\"\n",
+            k.name, k.entry
+        ));
+        let formats: Vec<String> = k
+            .quant_formats
+            .iter()
+            .map(|f| (*f as u32).to_string())
+            .collect();
+        out.push_str(&format!("quant_formats = [{}]\n", formats.join(", ")));
+        out.push_str(
+            "\n[kernel.fc]\n1 = \"K_SHAPE_ASSERT\"\n2 = \"K_DUMP_STAGE\"\n3 = \"K_QUANT_FORMAT\"\n",
+        );
+        for (idx, name) in k.fc {
+            out.push_str(&format!("{idx} = \"{name}\"\n"));
+        }
+        match k.variants {
+            KernelVariants::RmsNormRows { rows } => {
+                for r in rows {
+                    out.push_str(&format!("\n[[kernel.variants]]\naffine = {}\n", r.affine));
+                }
+            }
+            KernelVariants::RmsNormRowsTiled { rows } => {
+                for r in rows {
+                    out.push_str(&format!(
+                        "\n[[kernel.variants]]\nin_dtype = {}\n",
+                        r.in_dtype as u32
+                    ));
+                }
+            }
+            KernelVariants::SwigluSplit { rows } => {
+                for r in rows {
+                    out.push_str(&format!(
+                        "\n[[kernel.variants]]\nio_dtype = {}\ngelu_gate = {}\nin_place = {}\n",
+                        r.io_dtype as u32, r.gelu_gate, r.in_place
+                    ));
+                }
+            }
+            KernelVariants::SwigluMoeGateUp
+            | KernelVariants::Gelu
+            | KernelVariants::GemmBlock
+            | KernelVariants::GemmRowk
+            | KernelVariants::Elementwise => {
+                out.push_str("\n[[kernel.variants]]\n");
+            }
+        }
+    }
+    out
 }
 
 pub fn validate_shared(entry: &str, variant: KernelVariant) -> Result<(), Error> {
@@ -407,13 +330,11 @@ mod tests {
     }
 
     #[test]
-    fn rms_norm_rows_fc_map_no_collisions() {
-        assert_no_fc_collisions("rms_norm_rows", &[4]).unwrap();
-    }
-
-    #[test]
-    fn swiglu_fc_map_no_collisions() {
-        assert_no_fc_collisions("swiglu", &[4, 5, 6]).unwrap();
+    fn all_fc_maps_collision_free() {
+        for k in MANIFEST.kernels {
+            let indices: Vec<u32> = k.fc.iter().map(|(idx, _)| *idx).collect();
+            assert_no_fc_collisions(k.entry, &indices).unwrap();
+        }
     }
 
     #[test]
@@ -433,23 +354,21 @@ mod tests {
     }
 
     #[test]
-    fn toml_file_present() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("build/manifest.toml");
-        assert!(path.exists(), "build/manifest.toml missing");
-        let text = std::fs::read_to_string(path).expect("read manifest");
-        assert!(text.contains("K_QUANT_FORMAT"));
-        assert!(text.contains("rms_norm_rows"));
-        assert!(!text.contains("K_INTERLEAVED"));
-    }
-
-    #[test]
-    fn gemm_block_fc_map_no_collisions() {
-        assert_no_fc_collisions("gemm_block", &[4, 5, 6]).unwrap();
-    }
-
-    #[test]
-    fn gemm_block_grouped_fc_map_no_collisions() {
-        assert_no_fc_collisions("gemm_block_grouped", &[4, 5, 6]).unwrap();
+    fn rendered_toml_covers_every_spec() {
+        let toml = render_toml();
+        assert_eq!(
+            toml.matches("[[kernel]]").count(),
+            MANIFEST.kernels.len(),
+            "one [[kernel]] block per spec"
+        );
+        assert!(toml.contains("K_QUANT_FORMAT"));
+        assert!(toml.contains("name = \"rms_norm_rows\""));
+        assert!(toml.contains("4 = \"K_AFFINE\""));
+        // Two enumerated swiglu variant rows survive the round trip.
+        assert!(toml.contains("io_dtype = 0"));
+        assert!(toml.contains("io_dtype = 1"));
+        // The old hand-maintained file's drift cases stay dead.
+        assert!(!toml.contains("sc_softembed"));
     }
 
     #[test]

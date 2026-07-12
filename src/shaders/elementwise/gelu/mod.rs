@@ -178,3 +178,12 @@ mod tests {
         min_cos = 0.9999,
     }
 }
+
+/// Manifest registration; collected in common/manifest.rs::MANIFEST.
+pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
+    name: "gelu",
+    entry: "gelu",
+    quant_formats: &[crate::shaders::variant::QuantFormat::Q4Affine],
+    fc: &[],
+    variants: crate::shaders::manifest::KernelVariants::Gelu,
+};

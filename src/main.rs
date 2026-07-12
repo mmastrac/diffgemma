@@ -321,6 +321,8 @@ enum Command {
         longctx: bool,
     },
     /// Golden byte-identity pack — the Tier-1 refactor gate (task #73).
+    /// Print the generated kernel FC-axis manifest (TOML) to stdout.
+    Manifest,
     Golden {
         /// Pack spec (default `fixtures/golden/golden.json`).
         pack_path: Option<PathBuf>,
@@ -784,6 +786,10 @@ fn main() -> ExitCode {
             repeat,
             longctx,
         ),
+        Command::Manifest => {
+            print!("{}", crate::shaders::manifest::render_toml());
+            ExitCode::SUCCESS
+        }
         #[cfg(target_os = "macos")]
         Command::Golden {
             pack_path,
@@ -850,6 +856,10 @@ fn run_command(
         Command::Serve { .. } => ExitCode::FAILURE,
         Command::Smoketest { .. } => ExitCode::FAILURE,
         Command::Golden { .. } => ExitCode::FAILURE,
+        Command::Manifest => {
+            print!("{}", crate::shaders::manifest::render_toml());
+            ExitCode::SUCCESS
+        }
         Command::Tokenize(_) => ExitCode::FAILURE,
         Command::Gemm { .. } => ExitCode::FAILURE,
         Command::ProbeDevice { .. } => ExitCode::FAILURE,
@@ -3137,6 +3147,7 @@ fn parse_cli() -> Cli {
             repeat: smoke_repeat.max(1),
             longctx: smoke_longctx,
         },
+        Some("manifest") => Command::Manifest,
         Some("golden") => Command::Golden {
             pack_path: positional.get(1).map(PathBuf::from),
             bless: golden_bless,

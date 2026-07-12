@@ -331,3 +331,17 @@ mod tests {
 }
 
 pub mod tiled;
+
+/// Manifest registration; collected in common/manifest.rs::MANIFEST.
+pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
+    name: "rms_norm_rows",
+    entry: "rms_norm_rows",
+    quant_formats: &[crate::shaders::variant::QuantFormat::Q4Affine],
+    fc: &[(4, "K_AFFINE")],
+    variants: crate::shaders::manifest::KernelVariants::RmsNormRows {
+        rows: &[
+            crate::shaders::manifest::RmsNormRowsVariant { affine: false },
+            crate::shaders::manifest::RmsNormRowsVariant { affine: true },
+        ],
+    },
+};

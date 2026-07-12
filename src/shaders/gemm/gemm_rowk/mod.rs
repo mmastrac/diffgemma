@@ -219,3 +219,17 @@ mod tests {
         min_cos = 0.999,
     }
 }
+
+/// Manifest registration; collected in common/manifest.rs::MANIFEST.
+pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
+    name: "gemm_rowk",
+    entry: "gemm_rowk",
+    quant_formats: &[crate::shaders::variant::QuantFormat::Q8],
+    fc: &[
+        (4, "IS_FULL_LAYER"),
+        (5, "GEMM_N"),
+        (6, "GEMM_K"),
+        (30, "K_ROWK_OUT_ARENA"),
+    ],
+    variants: crate::shaders::manifest::KernelVariants::GemmRowk,
+};

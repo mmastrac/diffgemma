@@ -194,3 +194,12 @@ mod tests {
 }
 
 pub mod kxn;
+
+/// Manifest registration; collected in common/manifest.rs::MANIFEST.
+pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
+    name: "gemm_q8_linear_f32",
+    entry: "gemm_q8_linear_f32",
+    quant_formats: &[crate::shaders::variant::QuantFormat::Q4Affine],
+    fc: &[],
+    variants: crate::shaders::manifest::KernelVariants::Elementwise,
+};
