@@ -7,10 +7,6 @@ use crate::dgq::block::{q8_gemm_rowk_cpu, quantize_row_q8};
 use crate::dgq::layout::q8_row_bytes;
 use crate::safetensors::Error;
 
-pub const ENTRY: &str = "gemm_q8_linear_kxn_f32";
-
-const SHADER: &str = shader_include::include_metal!("kernels/gemm_q8_linear_kxn_f32.metal");
-
 const THREADGROUP: usize = 16;
 
 #[derive(Debug, Clone)]
@@ -71,12 +67,14 @@ pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
     cpu(f)
 }
 
+/// The KxN weight-order specialization of the merged `gemm_q8_linear_f32`
+/// kernel (K_W_KXN / FC4 = true). This module keeps the KxN CPU oracle + tests.
 #[cfg(target_os = "macos")]
 pub fn pipeline_for(
     ctx: &crate::metal::device::MetalContext,
     variant: KernelVariant,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_subkernel(SHADER, ENTRY, variant)
+    crate::kernels::sub::gemm_q8_linear_f32::pipeline_for_kxn(ctx, variant, true)
 }
 
 #[cfg(target_os = "macos")]

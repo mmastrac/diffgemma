@@ -75,7 +75,24 @@ pub fn pipeline_for(
     ctx: &crate::metal::device::MetalContext,
     variant: KernelVariant,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_subkernel(SHADER, ENTRY, variant)
+    pipeline_for_kxn(ctx, variant, false)
+}
+
+/// Weight K-order axis (K_W_KXN / FC4): false = W[N,K]^T, true = W[K,N].
+/// One kernel; the kxn variant serves the embed / SC-softembed layout.
+#[cfg(target_os = "macos")]
+pub fn pipeline_for_kxn(
+    ctx: &crate::metal::device::MetalContext,
+    variant: KernelVariant,
+    kxn: bool,
+) -> Result<crate::metal::device::ComputePipeline, Error> {
+    use crate::kernels::sub::variant::FcBool;
+    let bools = [FcBool {
+        index: 4,
+        value: kxn,
+    }];
+    let label = if kxn { "kxn" } else { "nxk" };
+    ctx.compile_subkernel_ex(SHADER, ENTRY, variant, label, &bools, &[])
 }
 
 #[cfg(target_os = "macos")]

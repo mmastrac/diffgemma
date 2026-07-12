@@ -222,12 +222,6 @@ pub static MANIFEST: Manifest = Manifest {
             variants: KernelVariants::Elementwise,
         },
         KernelSpec {
-            name: "gemm_q8_linear_kxn_f32",
-            entry: "gemm_q8_linear_kxn_f32",
-            quant_formats: &[QuantFormat::Q4Affine],
-            variants: KernelVariants::Elementwise,
-        },
-        KernelSpec {
             name: "gemm_block",
             entry: "gemm_block",
             quant_formats: &[QuantFormat::Q4Affine, QuantFormat::Q8, QuantFormat::NvFp4],
