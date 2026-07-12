@@ -64,43 +64,6 @@ pub(crate) fn run_quantize(
         }
     }
 }
-pub(crate) fn run_convert_model(
-    source_dir: &std::path::Path,
-    output_dir: &std::path::Path,
-) -> ExitCode {
-    use pack::{ConvertOptions, convert_model};
-    eprintln!(
-        "convert-model: {} -> {}",
-        source_dir.display(),
-        output_dir.display()
-    );
-    match convert_model(ConvertOptions {
-        source_dir: source_dir.to_path_buf(),
-        output_dir: output_dir.to_path_buf(),
-    }) {
-        Ok(summary) => {
-            println!("convert-model ok");
-            println!("  tensors:           {}", summary.tensor_count);
-            println!(
-                "  blob size:         {:.2} GiB",
-                summary.blob_bytes as f64 / (1024.0_f64.powi(3))
-            );
-            println!("  gemm transposed:   {}", summary.transposed_gemm);
-            println!("  expert transposed: {}", summary.transposed_experts);
-            println!("  raw copied:        {}", summary.raw_copied);
-            println!(
-                "  manifest:          {}/{}",
-                output_dir.display(),
-                pack::layout::MANIFEST_FILE
-            );
-            ExitCode::SUCCESS
-        }
-        Err(err) => {
-            eprintln!("error: {err}");
-            ExitCode::FAILURE
-        }
-    }
-}
 pub(crate) fn run_tokenize(model_dir: &PathBuf, text: &str, raw_prompt: bool) -> ExitCode {
     let path = model_dir.join("tokenizer.json");
     match tokenizer::Tokenizer::load(&path) {

@@ -7,7 +7,7 @@ pub(crate) use crate::cli::{Cli, Command};
 // submodule can `use super::*` and keep the crate-root call style it grew up with.
 pub(crate) use crate::{
     chat_template, chat_ui, config, dgq, flags, generate, generate_golden, golden, metal, model,
-    pack, safetensors, sample, server, tokenizer, tools, weights,
+    safetensors, sample, server, tokenizer, tools, weights,
 };
 pub(crate) use std::path::PathBuf;
 pub(crate) use std::process::ExitCode;
@@ -34,7 +34,6 @@ pub(crate) use step_gate::*;
 
 pub(crate) fn dispatch(cli: Cli) -> ExitCode {
     match cli.command {
-        Command::ConvertModel { output_dir } => run_convert_model(&cli.model_dir, &output_dir),
         Command::StepSmoke {
             layers,
             steps,
@@ -561,7 +560,6 @@ pub(crate) fn run_command(
         Command::Tokenize(_) => ExitCode::FAILURE,
         Command::Gemm { .. } => ExitCode::FAILURE,
         Command::ProbeDevice { .. } => ExitCode::FAILURE,
-        Command::ConvertModel { .. } => ExitCode::FAILURE,
         Command::Quantize { .. } => ExitCode::FAILURE,
         Command::BenchGemm { .. } => ExitCode::FAILURE,
         Command::StepSmoke { .. } => ExitCode::FAILURE,

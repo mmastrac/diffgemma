@@ -32,12 +32,6 @@ impl Model {
                     open_started.elapsed()
                 );
             }
-        } else if weights.is_packed() {
-            eprintln!(
-                "loaded iris.pack weights from {} ({:.2?})",
-                model_dir.display(),
-                open_started.elapsed()
-            );
         }
         Ok(Self {
             config: ModelConfig::load(model_dir)?,

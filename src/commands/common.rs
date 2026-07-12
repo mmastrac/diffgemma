@@ -133,8 +133,6 @@ pub(crate) fn print_summary(store: &weights::WeightStore) {
     println!("  model dir:          {}", store.model_dir().display());
     if store.is_quantized() {
         println!("  format:             .dgq (quantized, mmap)");
-    } else if store.is_packed() {
-        println!("  format:             iris.pack (pre-transposed)");
     }
     println!("  shards:             {}", s.shard_count);
     println!("  tensors (index):    {}", s.tensor_count_index);
@@ -175,9 +173,6 @@ pub(crate) fn print_summary(store: &weights::WeightStore) {
                     gib(shard.file_size() as u64),
                 );
             }
-        }
-        weights::WeightStore::Packed(_) => {
-            println!("    iris.pack.bin  (single mmap blob)");
         }
         weights::WeightStore::Dgq(_) => {
             println!("    model.dgq.bin  (quantized mmap blob)");

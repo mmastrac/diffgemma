@@ -27,7 +27,6 @@ mod golden;
 #[cfg(target_os = "macos")]
 mod metal;
 mod model;
-mod pack;
 mod safetensors;
 mod sample;
 #[cfg(target_os = "macos")]

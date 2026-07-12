@@ -65,9 +65,6 @@ pub(crate) enum Command {
         output: PathBuf,
         profile: String,
     },
-    ConvertModel {
-        output_dir: PathBuf,
-    },
     StepSmoke {
         layers: usize,
         steps: usize,
@@ -706,13 +703,6 @@ pub(crate) fn parse_cli() -> Cli {
                 profile: quant_profile,
             }
         }
-        Some("convert-model") => {
-            let out = output_dir.unwrap_or_else(|| {
-                eprintln!("usage: diffgemma-mps convert-model -o OUTPUT_DIR [-m SOURCE_MODEL]");
-                std::process::exit(2);
-            });
-            Command::ConvertModel { output_dir: out }
-        }
         Some("step-smoke") => Command::StepSmoke {
             layers: bench_layers.max(1).min(30),
             steps: steps_parity.max(1),
@@ -1006,7 +996,7 @@ pub(crate) fn parse_cli() -> Cli {
         Some(cmd) => {
             eprintln!("unknown command: {cmd}");
             eprintln!(
-                "usage: diffgemma-mps [-p PROMPT] [--raw] [summary|config|weights <name>|quantize|convert-model|step-smoke|step-probe|step-kv-check|step-kv-parity|step-verify|step-ci|step-parity|bench-step-kernel|bench-step|bench-prefill|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-monolithic|generate-monolithic-parity|generate-parity|chat|serve|tokenize <text>|gemm|attention]"
+                "usage: diffgemma-mps [-p PROMPT] [--raw] [summary|config|weights <name>|quantize|step-smoke|step-probe|step-kv-check|step-kv-parity|step-verify|step-ci|step-parity|bench-step-kernel|bench-step|bench-prefill|probe-device|layer0|decoder|decoder-gpu|prefill|generate|generate-gpu|generate-monolithic|generate-monolithic-parity|generate-parity|chat|serve|tokenize <text>|gemm|attention]"
             );
             eprintln!(
                 "  default (no command): generate-monolithic on .dgq, else generate-gpu (bf16)"

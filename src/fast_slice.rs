@@ -41,10 +41,6 @@ impl<'a, T> FastSlice<'a, T> {
 }
 
 impl<'a, T> FastSliceMut<'a, T> {
-    pub fn from_slice_mut(slice: &'a mut [T]) -> Self {
-        unsafe { Self::from_ptr(slice.as_mut_ptr(), slice.len()) }
-    }
-
     /// # Safety
     /// `ptr` must be valid for `len` writes for `'a`.
     pub unsafe fn from_ptr(ptr: *mut T, len: usize) -> Self {
@@ -100,16 +96,6 @@ impl<'a> FastBf16Slice<'a> {
         self.len
     }
 
-    /// View into `[elem_off .. elem_off + elem_len)` bf16 elements.
-    pub unsafe fn slice_unchecked(&self, elem_off: usize, elem_len: usize) -> Self {
-        debug_assert!(elem_off.saturating_add(elem_len) <= self.len);
-        Self {
-            ptr: unsafe { self.ptr.add(elem_off * 2) },
-            len: elem_len,
-            _marker: PhantomData,
-        }
-    }
-
     #[inline(always)]
     pub unsafe fn get_u16_unchecked(&self, index: usize) -> u16 {
         debug_assert!(index < self.len);
@@ -120,23 +106,6 @@ impl<'a> FastBf16Slice<'a> {
     #[inline(always)]
     pub unsafe fn to_f32_unchecked(&self, index: usize) -> f32 {
         unsafe { f32::from_bits((self.get_u16_unchecked(index) as u32) << 16) }
-    }
-}
-
-/// Pack PyTorch linear weights `[out, in]` into `[in, out]` for `bf16_gemm`.
-pub fn transpose_bf16_weight_into(
-    src: FastBf16Slice<'_>,
-    mut dst: FastSliceMut<'_, u16>,
-    out_dim: usize,
-    in_dim: usize,
-) {
-    assert_eq!(src.len(), out_dim * in_dim);
-    assert_eq!(dst.len(), in_dim * out_dim);
-    for o in 0..out_dim {
-        for i in 0..in_dim {
-            let v = unsafe { src.get_u16_unchecked(o * in_dim + i) };
-            unsafe { dst.write_unchecked(i * out_dim + o, v) };
-        }
     }
 }
 

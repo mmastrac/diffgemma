@@ -1,6 +1,5 @@
 use crate::dgq::DgqStore;
 use crate::dgq::store::looks_like_dgq_dir;
-use crate::pack::PackedStore;
 use crate::safetensors::{Error, SafetensorsFile, TensorInfo};
 use crate::tensor::TensorView;
 use serde::Deserialize;
@@ -72,10 +71,6 @@ impl SafetensorStore {
         Ok(TensorView::from_info(&info.name, info, data))
     }
 
-    pub fn is_packed(&self) -> bool {
-        false
-    }
-
     pub fn summarize(&self) -> Summary {
         let mut dtypes = BTreeMap::new();
         let mut prefix_counts: BTreeMap<String, usize> = BTreeMap::new();
@@ -112,10 +107,9 @@ impl SafetensorStore {
     }
 }
 
-/// Inference weights: safetensors, `.dgq` quantized, or pre-packed `iris.pack`.
+/// Inference weights: safetensors or `.dgq` quantized.
 pub enum WeightStore {
     Safetensors(SafetensorStore),
-    Packed(PackedStore),
     Dgq(DgqStore),
 }
 
@@ -124,8 +118,6 @@ impl WeightStore {
         let model_dir = model_dir.as_ref();
         if looks_like_dgq_dir(model_dir) {
             Ok(Self::Dgq(DgqStore::open(model_dir)?))
-        } else if model_dir.join(crate::pack::layout::MANIFEST_FILE).exists() {
-            Ok(Self::Packed(PackedStore::open(model_dir)?))
         } else {
             Ok(Self::Safetensors(SafetensorStore::open(model_dir)?))
         }
@@ -134,16 +126,7 @@ impl WeightStore {
     pub fn model_dir(&self) -> &Path {
         match self {
             Self::Safetensors(s) => &s.model_dir,
-            Self::Packed(s) => &s.model_dir,
             Self::Dgq(s) => &s.model_dir,
-        }
-    }
-
-    pub fn is_packed(&self) -> bool {
-        match self {
-            Self::Safetensors(s) => s.is_packed(),
-            Self::Packed(s) => s.is_packed(),
-            Self::Dgq(_) => false,
         }
     }
 
@@ -154,7 +137,6 @@ impl WeightStore {
     pub fn tensor(&self, name: &str) -> Result<TensorView<'_>, Error> {
         match self {
             Self::Safetensors(s) => s.tensor(name),
-            Self::Packed(s) => s.tensor(name),
             Self::Dgq(s) => s.tensor(name),
         }
     }
@@ -162,7 +144,6 @@ impl WeightStore {
     pub fn summarize(&self) -> Summary {
         match self {
             Self::Safetensors(s) => s.summarize(),
-            Self::Packed(s) => s.summarize(),
             Self::Dgq(s) => s.summarize(),
         }
     }
@@ -170,7 +151,7 @@ impl WeightStore {
     pub fn safetensor_metadata(&self) -> Option<&BTreeMap<String, serde_json::Value>> {
         match self {
             Self::Safetensors(s) => Some(&s.metadata),
-            Self::Packed(_) | Self::Dgq(_) => None,
+            Self::Dgq(_) => None,
         }
     }
 }
