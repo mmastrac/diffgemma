@@ -10,7 +10,7 @@ use crate::shaders::test_util::ElemFormat;
 
 pub const ENTRY: &str = "gemm_rowk";
 
-pub const SHADER: &str = shader_include::include_metal!("gemm/gemm_rowk/gemm_rowk.metal");
+pub const SHADER: &str = include_str!("gemm_rowk.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

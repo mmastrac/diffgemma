@@ -9,8 +9,7 @@ use crate::shaders::variant::KernelVariant;
 
 pub const ENTRY: &str = "moe_scatter_weighted";
 
-const SHADER: &str =
-    shader_include::include_metal!("moe/moe_scatter_weighted/moe_scatter_weighted.metal");
+pub const SHADER: &str = include_str!("moe_scatter_weighted.metal");
 
 #[derive(Clone)]
 pub struct Fixture {

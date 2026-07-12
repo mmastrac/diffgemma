@@ -13,7 +13,7 @@ use crate::shaders::variant::KernelVariant;
 pub const ENTRY: &str = "moe_router";
 pub const THREADGROUP_WIDTH: usize = 128;
 
-const SHADER: &str = shader_include::include_metal!("moe/moe_router/moe_router.metal");
+pub const SHADER: &str = include_str!("moe_router.metal");
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -320,5 +320,4 @@ pub mod cpu;
 /// Subkernel: fused top-k over router probs (colocated `moe_router_topk.metal`,
 /// dispatched from step_kernel.rs).
 pub const TOPK_ENTRY: &str = "moe_router_topk";
-pub const TOPK_SHADER: &str =
-    shader_include::include_metal!("moe/moe_router/moe_router_topk.metal");
+pub const TOPK_SHADER: &str = include_str!("moe_router_topk.metal");

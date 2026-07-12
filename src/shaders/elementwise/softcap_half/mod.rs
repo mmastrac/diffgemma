@@ -8,7 +8,7 @@ use crate::shaders::{bf16, f16};
 
 pub const ENTRY: &str = "softcap_half";
 
-const SHADER: &str = shader_include::include_metal!("elementwise/softcap_half/softcap_half.metal");
+pub const SHADER: &str = include_str!("softcap_half.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

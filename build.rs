@@ -2,13 +2,12 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 
-/// Hash every shader source under `src/shaders/` (sorted walk) so:
-/// 1. cargo rebuilds when ANY shader changes (the include_metal! proc macro
-///    does not register file dependencies, so shader edits were otherwise
-///    invisible to incremental builds), and
-/// 2. the Metal pipeline cache can key on the WHOLE shader tree instead of a
-///    hand-maintained include_str! list (33 of 93 files were missing from
-///    that list — stale metallibs were served after kernel edits).
+/// Hash every shader source under `src/shaders/` (sorted walk): the Metal
+/// pipeline cache keys on the WHOLE shader tree (DGQ_SHADER_TREE_HASH), so a
+/// stale metallib can never be served after a kernel edit. (Shader sources
+/// are embedded via file-relative include_str!, which already registers each
+/// .metal as a cargo dependency — but the build script itself must re-run to
+/// recompute the hash env var, hence the rerun-if-changed lines below.)
 ///
 /// rerun-if-changed is emitted per DIRECTORY + per .metal FILE (not the tree
 /// root) so .rs edits under src/shaders/ do not re-run the build script;

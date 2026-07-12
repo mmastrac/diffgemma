@@ -7,8 +7,7 @@ use crate::shaders::variant::KernelVariant;
 
 pub const ENTRY: &str = "router_scale_rows";
 
-const SHADER: &str =
-    shader_include::include_metal!("moe/router_scale_rows/router_scale_rows.metal");
+pub const SHADER: &str = include_str!("router_scale_rows.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

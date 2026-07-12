@@ -7,8 +7,7 @@ use crate::shaders::variant::KernelVariant;
 
 pub const ENTRY: &str = "router_top_k_rows";
 
-const SHADER: &str =
-    shader_include::include_metal!("moe/router_top_k_rows/router_top_k_rows.metal");
+pub const SHADER: &str = include_str!("router_top_k_rows.metal");
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RouteOut {

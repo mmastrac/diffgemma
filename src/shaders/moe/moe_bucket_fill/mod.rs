@@ -10,7 +10,7 @@ use crate::shaders::variant::KernelVariant;
 
 pub const ENTRY: &str = "moe_bucket_fill";
 
-const SHADER: &str = shader_include::include_metal!("moe/moe_bucket_fill/moe_bucket_fill.metal");
+pub const SHADER: &str = include_str!("moe_bucket_fill.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

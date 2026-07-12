@@ -10,7 +10,7 @@ use crate::shaders::variant::KernelVariant;
 pub const ENTRY: &str = "sample_write";
 pub const THREADGROUP_WIDTH: usize = 256;
 
-const SHADER: &str = shader_include::include_metal!("sample/sample_write/sample_write.metal");
+pub const SHADER: &str = include_str!("sample_write.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

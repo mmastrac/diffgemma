@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
-const CACHE_BUNDLE_TAG: &str = "diffgemma-mps-v8-stacked-seg-fc";
+const CACHE_BUNDLE_TAG: &str = "diffgemma-mps-v9-runtime-include";
 
 fn shader_bundle_token() -> u64 {
     use std::collections::hash_map::DefaultHasher;

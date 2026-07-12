@@ -14,7 +14,7 @@ use crate::shaders::variant::KernelVariant;
 pub const ENTRY: &str = "moe_grouped";
 pub const THREADGROUP_WIDTH: usize = 128;
 
-const SHADER: &str = shader_include::include_metal!("moe/moe_grouped/moe_grouped.metal");
+pub const SHADER: &str = include_str!("moe_grouped.metal");
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]

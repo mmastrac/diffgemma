@@ -8,8 +8,7 @@ use crate::shaders::variant::KernelVariant;
 
 pub const ENTRY: &str = "convert_scale";
 
-pub const SHADER: &str =
-    shader_include::include_metal!("elementwise/convert_scale/convert_scale.metal");
+pub const SHADER: &str = include_str!("convert_scale.metal");
 
 /// Compile the convert/scale kernel specialized for (src_f32, dst_f32).
 #[cfg(target_os = "macos")]

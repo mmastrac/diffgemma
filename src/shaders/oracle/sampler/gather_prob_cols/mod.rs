@@ -8,8 +8,7 @@ use crate::shaders::variant::KernelVariant;
 pub const ENTRY: &str = "gather_prob_cols";
 pub const TILE: usize = 16;
 
-const SHADER: &str =
-    shader_include::include_metal!("oracle/sampler/gather_prob_cols/gather_prob_cols.metal");
+pub const SHADER: &str = include_str!("gather_prob_cols.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

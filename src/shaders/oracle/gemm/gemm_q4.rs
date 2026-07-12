@@ -12,7 +12,7 @@ use crate::shaders::test_util::ElemFormat;
 
 pub const ENTRY: &str = "gemm_block";
 
-const SHADER: &str = shader_include::include_metal!("oracle/gemm/gemm_block/gemm_block.metal");
+pub const SHADER: &str = include_str!("gemm_block/gemm_block.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

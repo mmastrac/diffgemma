@@ -9,8 +9,7 @@ pub use crate::shaders::variant::KernelVariant;
 
 pub const ENTRY: &str = "rms_norm_rows";
 
-const SHADER: &str =
-    shader_include::include_metal!("elementwise/rms_norm_rows/rms_norm_rows.metal");
+pub const SHADER: &str = include_str!("rms_norm_rows.metal");
 
 /// Synthetic tier-1 fixture (blob-free).
 #[derive(Debug, Clone)]

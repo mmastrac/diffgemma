@@ -13,8 +13,7 @@ use crate::shaders::variant::KernelVariant;
 
 pub const ENTRY: &str = "gemm_linear_grouped";
 
-const SHADER: &str =
-    shader_include::include_metal!("gemm/gemm_linear_grouped/gemm_linear_grouped.metal");
+pub const SHADER: &str = include_str!("gemm_linear_grouped.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

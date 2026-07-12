@@ -7,8 +7,7 @@ use crate::shaders::test_util::ElemFormat;
 
 pub const ENTRY: &str = "scatter_vocab_chunk";
 
-pub const SHADER: &str =
-    shader_include::include_metal!("oracle/sampler/scatter_vocab_chunk/scatter_vocab_chunk.metal");
+pub const SHADER: &str = include_str!("scatter_vocab_chunk.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

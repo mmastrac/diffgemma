@@ -11,7 +11,7 @@ use crate::shaders::variant::KernelVariant;
 
 pub const ENTRY: &str = "embed_gather";
 
-const SHADER: &str = shader_include::include_metal!("embed/embed_gather/embed_gather.metal");
+pub const SHADER: &str = include_str!("embed_gather.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

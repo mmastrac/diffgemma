@@ -16,8 +16,7 @@ use crate::shaders::test_util::ElemFormat;
 
 pub const ENTRY: &str = "gemm_block_stacked";
 
-const SHADER: &str =
-    shader_include::include_metal!("oracle/gemm/gemm_block_stacked/gemm_block_stacked.metal");
+pub const SHADER: &str = include_str!("gemm_block_stacked.metal");
 
 /// Must match `shaders/include/gemm_stacked.metal`.
 #[repr(C)]

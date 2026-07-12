@@ -7,8 +7,7 @@ use crate::shaders::variant::KernelVariant;
 
 pub const ENTRY: &str = "memzero_bytes";
 
-const SHADER: &str =
-    shader_include::include_metal!("elementwise/memzero_bytes/memzero_bytes.metal");
+pub const SHADER: &str = include_str!("memzero_bytes.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

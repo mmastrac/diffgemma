@@ -7,8 +7,7 @@ use crate::shaders::variant::KernelVariant;
 
 pub const ENTRY: &str = "kv_f32_side_hydrate";
 
-const SHADER: &str =
-    shader_include::include_metal!("kv/kv_f32_side_hydrate/kv_f32_side_hydrate.metal");
+pub const SHADER: &str = include_str!("kv_f32_side_hydrate.metal");
 
 #[cfg(target_os = "macos")]
 pub fn pipeline_for_kv(

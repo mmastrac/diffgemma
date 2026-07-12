@@ -17,8 +17,7 @@ use crate::shaders::test_util::ElemFormat;
 
 pub const ENTRY: &str = "gemm_block_grouped";
 
-const SHADER: &str =
-    shader_include::include_metal!("oracle/gemm/gemm_block_grouped/gemm_block_grouped.metal");
+pub const SHADER: &str = include_str!("gemm_block_grouped.metal");
 
 pub fn fixture_len(f: &Fixture) -> usize {
     f.out_len()

@@ -30,7 +30,8 @@ impl MetalContext {
         &self,
         source: &str,
     ) -> Result<Retained<ProtocolObject<dyn MTLLibrary>>, Error> {
-        let ns_source = NSString::from_str(source);
+        // Quoted #include expansion happens here (src/shaders/common/expand.rs).
+        let ns_source = NSString::from_str(&crate::shaders::expand::expand(source));
         self.device
             .newLibraryWithSource_options_error(&ns_source, None)
             .map_err(|e| shader_compile_error(e))
@@ -511,7 +512,8 @@ impl MetalContext {
         extra_uints: &[crate::shaders::variant::FcUInt],
     ) -> Result<ComputePipeline, Error> {
         let library = {
-            let ns_source = NSString::from_str(source);
+            // Quoted #include expansion happens here (src/shaders/common/expand.rs).
+            let ns_source = NSString::from_str(&crate::shaders::expand::expand(source));
             device
                 .newLibraryWithSource_options_error(&ns_source, None)
                 .map_err(|e| shader_compile_error(e))?

@@ -13,7 +13,7 @@ use crate::shaders::variant::KernelVariant;
 
 pub const ENTRY: &str = "moe_grouped";
 
-const SHADER: &str = shader_include::include_metal!("moe/moe_grouped/moe_grouped.metal");
+pub const SHADER: &str = include_str!("moe_grouped.metal");
 
 impl Fixture {
     fn gate_up_nvfp4(&self) -> Vec<u8> {

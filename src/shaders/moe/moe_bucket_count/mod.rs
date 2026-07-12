@@ -8,7 +8,7 @@ use crate::shaders::variant::KernelVariant;
 
 pub const ENTRY: &str = "moe_bucket_count";
 
-const SHADER: &str = shader_include::include_metal!("moe/moe_bucket_count/moe_bucket_count.metal");
+pub const SHADER: &str = include_str!("moe_bucket_count.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

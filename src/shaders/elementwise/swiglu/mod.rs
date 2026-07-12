@@ -11,10 +11,9 @@ use crate::shaders::variant::KernelVariant;
 pub const ENTRY: &str = "swiglu";
 pub const MOE_ENTRY: &str = "swiglu_moe_gate_up";
 
-const SHADER: &str = shader_include::include_metal!("elementwise/swiglu/swiglu.metal");
+pub const SHADER: &str = include_str!("swiglu.metal");
 
-const MOE_SHADER: &str =
-    shader_include::include_metal!("elementwise/swiglu/swiglu_moe_gate_up.metal");
+pub const MOE_SHADER: &str = include_str!("swiglu_moe_gate_up.metal");
 
 // --- split f32 in-place (decoder swiglu_mul) ---
 

@@ -29,6 +29,8 @@ pub mod sc;
 #[allow(unused_imports)]
 pub use attn::{apply_rope_heads, attention, engine_gqa_common, gqa_attention, qk_rope_kv};
 #[allow(unused_imports)]
+pub use common::expand;
+#[allow(unused_imports)]
 pub use common::{bf16, dbg_kernel, f16, gpu_common, manifest, test_util, variant};
 #[allow(unused_imports)]
 pub use elementwise::rms_norm_rows::tiled as rms_norm_rows_tiled;

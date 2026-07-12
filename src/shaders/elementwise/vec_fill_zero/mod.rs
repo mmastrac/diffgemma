@@ -7,8 +7,7 @@ use crate::shaders::variant::KernelVariant;
 
 pub const ENTRY: &str = "vec_fill_zero";
 
-const SHADER: &str =
-    shader_include::include_metal!("elementwise/vec_fill_zero/vec_fill_zero.metal");
+pub const SHADER: &str = include_str!("vec_fill_zero.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

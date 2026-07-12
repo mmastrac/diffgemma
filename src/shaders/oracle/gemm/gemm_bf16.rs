@@ -10,7 +10,7 @@ use crate::safetensors::Error;
 
 pub const ENTRY: &str = "gemm_block";
 
-const SHADER: &str = shader_include::include_metal!("oracle/gemm/gemm_block/gemm_block.metal");
+pub const SHADER: &str = include_str!("gemm_block/gemm_block.metal");
 const RAW: u32 = crate::shaders::QuantFormat::Raw as u32;
 
 #[cfg(target_os = "macos")]

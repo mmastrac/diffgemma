@@ -10,7 +10,7 @@ use crate::shaders::variant::KernelVariant;
 
 pub const ENTRY: &str = "qk_rope_kv";
 
-const SHADER: &str = shader_include::include_metal!("attn/qk_rope_kv/qk_rope_kv.metal");
+pub const SHADER: &str = include_str!("qk_rope_kv.metal");
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]

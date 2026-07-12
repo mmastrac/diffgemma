@@ -7,7 +7,7 @@ use crate::shaders::variant::KernelVariant;
 
 pub const ENTRY: &str = "gather_rows";
 
-const SHADER: &str = shader_include::include_metal!("elementwise/gather_rows/gather_rows.metal");
+pub const SHADER: &str = include_str!("gather_rows.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

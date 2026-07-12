@@ -9,8 +9,7 @@ use crate::shaders::variant::KernelVariant;
 
 pub const ENTRY: &str = "gemm_q8_linear_f32";
 
-const SHADER: &str =
-    shader_include::include_metal!("gemm/gemm_q8_linear_f32/gemm_q8_linear_f32.metal");
+pub const SHADER: &str = include_str!("gemm_q8_linear_f32.metal");
 
 const THREADGROUP: usize = 16;
 

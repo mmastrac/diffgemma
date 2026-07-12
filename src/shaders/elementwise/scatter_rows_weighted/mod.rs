@@ -9,8 +9,7 @@ use crate::shaders::variant::KernelVariant;
 
 pub const ENTRY: &str = "scatter_rows_weighted";
 
-const SHADER: &str =
-    shader_include::include_metal!("elementwise/scatter_rows_weighted/scatter_rows_weighted.metal");
+pub const SHADER: &str = include_str!("scatter_rows_weighted.metal");
 
 /// CPU reference: same accumulation order as the kernel (k ascending per token).
 pub fn cpu_reference(

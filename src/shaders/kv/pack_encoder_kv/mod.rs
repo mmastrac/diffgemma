@@ -5,7 +5,7 @@ use crate::shaders::variant::KernelVariant;
 
 pub const ENTRY: &str = "pack_encoder_kv";
 
-const SHADER: &str = shader_include::include_metal!("kv/pack_encoder_kv/pack_encoder_kv.metal");
+pub const SHADER: &str = include_str!("pack_encoder_kv.metal");
 
 #[cfg(target_os = "macos")]
 pub fn pipeline_for(

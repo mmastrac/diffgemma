@@ -8,8 +8,7 @@ use crate::shaders::variant::KernelVariant;
 
 pub const ENTRY: &str = "residual_half";
 
-const SHADER: &str =
-    shader_include::include_metal!("elementwise/residual_half/residual_half.metal");
+pub const SHADER: &str = include_str!("residual_half.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

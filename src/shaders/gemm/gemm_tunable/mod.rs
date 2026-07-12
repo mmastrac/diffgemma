@@ -11,7 +11,7 @@ use crate::shaders::QuantFormat;
 
 pub const ENTRY: &str = "gemm_tunable";
 
-pub const SHADER: &str = shader_include::include_metal!("gemm/gemm_tunable/gemm_tunable.metal");
+pub const SHADER: &str = include_str!("gemm_tunable.metal");
 
 /// Production tile config: 64x64 won every swept production shape.
 pub const TUNE_BM: usize = 64;

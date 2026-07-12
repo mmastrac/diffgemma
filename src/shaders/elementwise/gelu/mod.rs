@@ -8,7 +8,7 @@ use crate::shaders::variant::KernelVariant;
 
 pub const ENTRY: &str = "gelu";
 
-const SHADER: &str = shader_include::include_metal!("elementwise/gelu/gelu.metal");
+pub const SHADER: &str = include_str!("gelu.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

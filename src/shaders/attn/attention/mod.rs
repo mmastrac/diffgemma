@@ -12,22 +12,21 @@ use crate::shaders::variant::KernelVariant;
 pub const ENTRY: &str = "attention";
 pub const THREADGROUP_WIDTH: usize = 64;
 
-const SHADER: &str = shader_include::include_metal!("attn/attention/attention.metal");
+pub const SHADER: &str = include_str!("attention.metal");
 
 pub const MMA_M_TILE: usize = 8;
 
 /// GQA-grouped MMA attention (2 Q heads / threadgroup, shared K/V staging).
 /// Group size 2, hd <= 256 only (sliding layers). `attention` stays the oracle.
 pub const ENTRY_MMA2: &str = "attention_mma2";
-const SHADER_MMA2: &str = shader_include::include_metal!("attn/attention/attention_mma2.metal");
+pub const SHADER_MMA2: &str = include_str!("attention_mma2.metal");
 
 /// MMA attention for full/global layers (hd=512): register-resident O + QG-grouped
 /// K/V sharing. `attention` stays the oracle. QG simdgroups per threadgroup, 32
 /// lanes each; (group/QG) sub-groups along grid.z.
 pub const ENTRY_MMA_FULL: &str = "attention_mma_full";
 pub const MMA_FULL_QG: usize = 2;
-const SHADER_MMA_FULL: &str =
-    shader_include::include_metal!("attn/attention/attention_mma_full.metal");
+pub const SHADER_MMA_FULL: &str = include_str!("attention_mma_full.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

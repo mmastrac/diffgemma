@@ -28,7 +28,6 @@ dependencies = [
  "objc2-metal",
  "serde",
  "serde_json",
- "shader-include",
 ]
 
 [[package]]
@@ -154,15 +153,6 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
-]
-
-[[package]]
-name = "shader-include"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]

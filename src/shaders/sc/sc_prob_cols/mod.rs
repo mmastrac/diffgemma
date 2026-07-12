@@ -13,7 +13,7 @@ const TILE: usize = 16;
 /// shaders/include/sc_prob_scale.metal and src/metal/step_kernel.rs.
 const SC_PROB_GEMM_SCALE: f32 = 4096.0;
 
-const SHADER: &str = shader_include::include_metal!("sc/sc_prob_cols/sc_prob_cols.metal");
+pub const SHADER: &str = include_str!("sc_prob_cols.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {
