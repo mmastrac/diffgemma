@@ -123,13 +123,17 @@ fn dispatch_copy_f32(
     dst: &ProtocolObject<dyn MTLBuffer>,
     len: usize,
 ) {
+    // convert_scale (f32->f32, scale=1): src/dst @ base, len=chunk. dump
+    // (buffer 6) stays unbound — K_DUMP_STAGE=0 dead-codes the access.
     batch.dispatch_1d_ranged(&sk.copy_f32.pipeline, len, |enc, base, chunk| {
-        let range = [base, chunk];
         unsafe {
             enc.setBuffer_offset_atIndex(Some(src), 0, 0);
             enc.setBuffer_offset_atIndex(Some(dst), 0, 1);
         }
-        set_bytes(enc, &range, 2);
+        set_bytes(enc, &base, 2);
+        set_bytes(enc, &base, 3);
+        set_bytes(enc, &chunk, 4);
+        set_bytes(enc, &1.0f32, 5);
     });
 }
 

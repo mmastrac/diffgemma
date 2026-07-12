@@ -5,7 +5,6 @@ use crate::kernels::sub::softmax_rows;
 use crate::metal::device::{ComputePipeline, MetalContext};
 use crate::safetensors::Error;
 
-const COPY_F32_SHADER: &str = shader_include::include_metal!("kernels/copy_f32.metal");
 const LOGIT_SOFTCAPPING_SHADER: &str =
     shader_include::include_metal!("oracle/logit_softcapping.metal");
 const SCALE_LOGITS_SHADER: &str = shader_include::include_metal!("oracle/scale_logits.metal");
@@ -30,7 +29,13 @@ pub struct GpuSamplerKernels {
 impl GpuSamplerKernels {
     pub fn new(ctx: &MetalContext) -> Result<Self, Error> {
         Ok(Self {
-            copy_f32: ctx.compile_kernel(COPY_F32_SHADER, "copy_f32")?,
+            // f32 -> f32 copy = convert_scale (src_f32=true, dst_f32=true, scale=1).
+            copy_f32: crate::kernels::sub::convert_scale::pipeline_for_fmt(
+                ctx,
+                KernelVariant::PRODUCTION,
+                true,
+                true,
+            )?,
             logit_softcapping: ctx.compile_kernel(LOGIT_SOFTCAPPING_SHADER, "logit_softcapping")?,
             scale_logits: ctx.compile_kernel(SCALE_LOGITS_SHADER, "scale_logits")?,
             scatter_vocab_chunk: ctx

@@ -1,15 +1,15 @@
-//! Ranged elementwise sampler kernels: copy_f32, logit_softcapping, scale_logits.
+//! Ranged elementwise sampler oracles: logit_softcapping, scale_logits.
+//! (copy_f32 merged into the generic `convert_scale` kernel; its oracle lives
+//! there.)
 
 use super::gpu_common;
 use super::test_util::ElemFormat;
 use crate::model::embed::logit_softcapping;
 use crate::safetensors::Error;
 
-pub const COPY_ENTRY: &str = "copy_f32";
 pub const SOFTCAP_ENTRY: &str = "logit_softcapping";
 pub const SCALE_ENTRY: &str = "scale_logits";
 
-const COPY_SHADER: &str = shader_include::include_metal!("kernels/copy_f32.metal");
 const SOFTCAP_SHADER: &str = shader_include::include_metal!("oracle/logit_softcapping.metal");
 const SCALE_SHADER: &str = shader_include::include_metal!("oracle/scale_logits.metal");
 
@@ -20,7 +20,6 @@ pub const CANVAS_VOCAB_LEN: usize = CANVAS_LEN * VOCAB;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RangedOp {
-    Copy,
     Softcap,
     Scale,
 }
@@ -67,18 +66,8 @@ pub fn tiny_scale_fixture(_: ElemFormat) -> Fixture {
     }
 }
 
-pub fn tiny_copy_fixture(_: ElemFormat) -> Fixture {
-    Fixture {
-        src: vec![0.25, -1.5, 2.0, 7.0, -3.0],
-        cap: 30.0,
-        inv_t: 1.0,
-        op: RangedOp::Copy,
-    }
-}
-
 pub fn cpu(f: &Fixture) -> Vec<f32> {
     match f.op {
-        RangedOp::Copy => f.src.clone(),
         RangedOp::Softcap => {
             let mut out = f.src.clone();
             logit_softcapping(&mut out, f.cap);
@@ -94,7 +83,6 @@ pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
 
 fn shader_and_entry(op: RangedOp) -> (&'static str, &'static str) {
     match op {
-        RangedOp::Copy => (COPY_SHADER, COPY_ENTRY),
         RangedOp::Softcap => (SOFTCAP_SHADER, SOFTCAP_ENTRY),
         RangedOp::Scale => (SCALE_SHADER, SCALE_ENTRY),
     }
@@ -118,26 +106,9 @@ pub fn gpu(f: &Fixture) -> Result<Vec<f32>, Error> {
         .ok_or(Error::Format("alloc"))?;
     BufferPool::write_f32(&buf, &f.src);
 
-    let buf_dst = if f.op == RangedOp::Copy {
-        let b = pool
-            .allocate(&ctx.device, bytes)
-            .ok_or(Error::Format("alloc"))?;
-        Some(b)
-    } else {
-        None
-    };
-
     gpu_common::dispatch_1d_ranged(&ctx.queue, &pipeline.pipeline, len, |enc, base, chunk| {
         let range = [base, chunk];
         match f.op {
-            RangedOp::Copy => {
-                let dst = buf_dst.as_ref().expect("dst");
-                unsafe {
-                    enc.setBuffer_offset_atIndex(Some(&buf), 0, 0);
-                    enc.setBuffer_offset_atIndex(Some(dst), 0, 1);
-                }
-                gpu_common::set_bytes(enc, &range, 2);
-            }
             RangedOp::Softcap => {
                 unsafe {
                     enc.setBuffer_offset_atIndex(Some(&buf), 0, 0);
@@ -156,12 +127,7 @@ pub fn gpu(f: &Fixture) -> Result<Vec<f32>, Error> {
     })?;
 
     let mut out = vec![0.0f32; len];
-    let read_buf = if f.op == RangedOp::Copy {
-        buf_dst.as_ref().expect("dst")
-    } else {
-        &buf
-    };
-    BufferPool::read_f32(read_buf, &mut out);
+    BufferPool::read_f32(&buf, &mut out);
     Ok(out)
 }
 
@@ -199,18 +165,6 @@ mod tests {
         min_cos = 0.9999,
     }
 
-    kernel_oracle_matrix! {
-        mod tiny_copy,
-        cpu = crate::kernels::sub::sampler_ranged::cpu,
-        cpu_oracle = crate::kernels::sub::sampler_ranged::cpu_oracle,
-        gpu = crate::kernels::sub::sampler_ranged::gpu_variant,
-        fixture = crate::kernels::sub::sampler_ranged::tiny_copy_fixture,
-        out_len = crate::kernels::sub::sampler_ranged::fixture_len,
-        formats: [F32],
-        max_tol = 0.0,
-        min_cos = 1.0,
-    }
-
     #[cfg(target_os = "macos")]
     mod canvas_vocab {
         use super::*;
@@ -236,11 +190,6 @@ mod tests {
         #[test]
         fn gpu_scale_matches_cpu() {
             run(RangedOp::Scale, 0.000013);
-        }
-
-        #[test]
-        fn gpu_copy_matches_cpu() {
-            run(RangedOp::Copy, 0.000017);
         }
     }
 }
