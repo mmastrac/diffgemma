@@ -1,8 +1,52 @@
-# Kernel audit (2026-07-02)
+# Kernel audit (2026-07-02, surface reduction completed 2026-07-11)
 
-Full pass over the 72 Metal kernels: aggregation, genericization, perf, and
+Full pass over the Metal kernels: aggregation, genericization, perf, and
 per-step precision. Verdicts below are the source of truth for "should this
 kernel exist / merge / change dtype"; re-audit when a family gains members.
+
+## 2026-07-11 — kernel-surface reduction COMPLETE (task #74/#76)
+
+`shaders/kernels/` went **66 → 47**. Every step golden 8/8 + full suite green.
+The current state (supersedes the older "Consolidation verdicts" /
+"Deprecation candidates" below where they conflict):
+
+- **Tunable GEMM is the SOLE production GEMM path** — dense, stacked, and
+  block-sparse MoE, across every weight format (raw/q8/q4/q6/nvfp4). nvfp4 was
+  ported into `gemm_tunable_{dense,stacked,sparse}` (bit-exact oracles), then
+  the whole legacy `gemm_block*` family was retired from production.
+- **All 3 GEMM flags DELETED**: `DGQ_GEMM_TUNABLE`, `DGQ_MOE_BLOCK_SPARSE`,
+  `DGQ_MOE_TILE_ADAPT` (with the adaptive-M machinery: `GEMM_M_ADAPT` FC,
+  `gemm_block_tile` adaptive helpers, the device.rs adaptive compile wrappers).
+- **`gemm_block_sparse` DELETED**; `gemm_block` / `gemm_block_stacked` /
+  `gemm_block_grouped` **relocated to `shaders/oracle/`** — they now exist ONLY
+  as bit-exact validation oracles (their Rust modules also still export the
+  CPU oracles + `Fixture`/`BlobGroupedParams`/`GemmStackedSeg` types that
+  production `gemm_tunable` depends on). See `shaders/oracle/README.md`.
+- **Dead oracle kernels deleted** (dispatched only from their own `#[cfg(test)]`):
+  `fp8_e4m3_table`, `nvfp4_tile_k_order`, `q4_group_k_order`,
+  `dequant_block_matrix`, `sc_probs` GPU (its CPU oracle kept for `sc_prob_cols`).
+- **Oracle sampler/LM-head kernels relocated to `shaders/oracle/`** (driven only
+  by `GpuDecoderEngine::forward`): argmax_rows, logit_softcapping, scale_logits,
+  scatter_vocab_chunk, row_entropy, sample_from_probs_rows, gather_prob_cols,
+  softmax_rows. (`copy_f32` stayed production — see below.)
+- **Genericization merges** (kernel = op + tiling; format, fusion/output-mode,
+  and even divergent signatures are generic FC axes):
+  - `gemm_q8_rowk` + `gemm_bf16_rowk_acc_f32` → **`gemm_rowk`** (format via
+    `K_QUANT_FORMAT`; output/fusion mode via `K_ROWK_OUT_ARENA` FC30:
+    f32-accumulate lm_head vs arena-overwrite SC).
+  - `embed_gather_bf16` → `embed_gather` (`K_EMBED_BF16` FC4).
+  - `gemm_q8_linear_kxn_f32` → `gemm_q8_linear_f32` (`K_W_KXN` FC4).
+  - `gather_rows` triad → one `gather_rows` (`K_SRC_F32`/`K_DST_F32` FC4/5).
+  - **converter family** `half_to_f32` + `half_scale` + `copy_f32` +
+    `f32_to_half_scale` → **`convert_scale`** (`K_SRC_F32`/`K_DST_F32` FC4/5;
+    scale + separate src/dst offsets as runtime params; in-place = same buffer
+    twice). Normalized four "incompatible" signatures into one superset.
+- Also: the discarded `shaders/monolithic/diffgemma_step.metal` was deleted.
+
+**Still genuinely NOT merges** (different ops, not twins): the attention perf
+tiers (`attention` / `attention_mma2` / `attention_mma_full`, runtime-selected
+by sequence length) and `rms_norm_rows` vs `rms_norm_rows_tiled` (different
+dtype + tiling + weight source).
 
 ## Hot-path budget (steady denoise step ≈ 0.97 s since tunable GEMM, kv=25)
 
@@ -44,7 +88,7 @@ kernel exist / merge / change dtype"; re-audit when a family gains members.
   re-litigation bar is met: ROADMAP E11 rebuilds the arena-dtype FC as
   fp16 for PREFILL pipelines only (denoise stays bf16). Until it lands,
   `DGQ_FAST_PREFILL_MAX=2048` routes longer prompts/deltas to the engine.
-- **f16 where values are bounded [0,1]**: `sc_probs` (fp16 + GEMM prob scale),
+- **f16 where values are bounded [0,1]**: `sc_prob_cols` (fp16 + GEMM prob scale),
   attention P tiles (half). Already done; nothing else qualifies.
 - **Always-bf16 buffers** (range or cross-path layout): logits (`FC29` forced),
   RouteScratch weights.
@@ -69,13 +113,10 @@ kernel exist / merge / change dtype"; re-audit when a family gains members.
 Done already (no action): `gemm_bf16`→`gemm_block` (QUANT_RAW), moe grouped
 q4/nvfp4 (QUANT_FORMAT), sc_softembed bf16 variant.
 
-**Merge (mechanical, bit-identical, low priority)**
-- `embed_gather` + `embed_gather_bf16` → one shader, quant FC (q8/raw) —
-  halves the pipeline variants (the hf32 variants are gone as of 2026-07-05).
-- `gather_rows` / `gather_rows_bf16` / `gather_rows_bf16_to_f32` → one shader,
-  in/out dtype FCs.
-- `f32_to_half` + `f32_to_half_scale` → scale FC (plain variant currently has
-  no production dispatch).
+**Merge candidates — ALL DONE 2026-07-11** (see the status banner up top):
+`embed_gather`, the `gather_rows` triad, and the whole converter family
+(`half_to_f32`/`half_scale`/`copy_f32`/`f32_to_half_scale` → `convert_scale`)
+are merged. Plus the GEMM twins `gemm_rowk` and `gemm_q8_linear` (kxn).
 
 **Keep separate (justified)**
 - Attention family (scalar oracle / mma2 sliding / mma_full full): different
@@ -94,16 +135,12 @@ q4/nvfp4 (QUANT_FORMAT), sc_softembed bf16 variant.
 - `scatter_vocab_chunk`: the ENGINE-validation lm_head (lm_head.rs via
   sampler_kernels) dispatches it — engine-validation-only, not a placeholder.
 
-**Deprecation candidates (need a stable tunable cycle first — do NOT delete yet)**
-- Legacy `gemm_block` / `gemm_block_stacked` / `gemm_block_sparse`: still the
-  DGQ_GEMM_TUNABLE=0 fallback, the non-bf16-checkpoint stacked-q4 path, the
-  nvfp4 expert path, AND the bit-exactness ORACLE the tunable bench rows
-  verify against. Revisit after a few stable weeks.
-- Legacy adaptive-M machinery (`DGQ_MOE_TILE_ADAPT` + m16/m8 helpers in
-  gemm_block_tile + classed pipelines): superseded by gemm_tunable_sparse at
-  default (only live at DGQ_GEMM_TUNABLE=0). User signed it default-on
-  2026-07-02; removal needs their nod.
-- `gemm_block_grouped` (pre-sparse MoE): DGQ_MOE_BLOCK_SPARSE=0 fallback only.
+**Deprecation candidates — RETIRED 2026-07-11** (see status banner up top):
+tunable now covers every format so the whole legacy `gemm_block*` family left
+production. `gemm_block_sparse` + adaptive-M deleted; `gemm_block` /
+`gemm_block_stacked` / `gemm_block_grouped` relocated to `shaders/oracle/` as
+validation oracles; all 3 flags (`DGQ_GEMM_TUNABLE` / `DGQ_MOE_BLOCK_SPARSE` /
+`DGQ_MOE_TILE_ADAPT`) deleted.
 
 **Graveyard (disproven machinery DELETED in the 2026-07-05 flag cleanup):**
 DGQ_HIDDEN_F32 (f32 hidden planes + hf32 kernel variants), K_ACT_F16 (f16
