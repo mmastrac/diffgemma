@@ -576,7 +576,7 @@ pub fn print_bench_rows(rows: &[GemmBenchRow]) {
 /// built exactly like moe_bucket_fill phase 1. Times the production
 /// `gemm_tunable_sparse` pipelines (BM 32 and 64) against the legacy
 /// `gemm_block_sparse` reference (bitwise-compared) and reports USEFUL
-/// TF/s (routed rows only — padding excluded, matching the KERNELS.md
+/// TF/s (routed rows only — padding excluded, matching the
 /// methodology).
 #[cfg(target_os = "macos")]
 pub fn bench_gemm_tunable_sparse(iters: usize) -> Result<Vec<GemmBenchRow>, Error> {

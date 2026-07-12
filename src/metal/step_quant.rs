@@ -1,4 +1,4 @@
-//! Step-kernel quantization profile: one algorithm, format selects kernels (STRATEGY.md §4).
+//! Step-kernel quantization profile: one algorithm, format selects kernels (AGENTS.md §4).
 
 use crate::dgq::layout::QuantProfile;
 use crate::shaders::QuantFormat;

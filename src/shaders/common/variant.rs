@@ -1,4 +1,4 @@
-//! Compile-time subkernel variant tuple (STRATEGY.md §4).
+//! Compile-time subkernel variant tuple (AGENTS.md §4).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

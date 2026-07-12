@@ -1,0 +1,310 @@
+# diffgemma-mps — how to work on this codebase
+
+Read this before writing kernels, tests, or chasing bugs. It is **how to work
+here without repeating the mistakes that have already cost days.**
+
+The project: a Rust + Metal inference engine for DiffusionGemma (Gemma-4
+26B-A4B MoE, discrete block diffusion) on Apple Silicon.
+
+Doc map — three documents, each with one job:
+- **ARCHITECTURE.md** — the design and the implemented generation contract,
+  including the *Negative Knowledge* section (disproven approaches and the
+  physics that blocked them).
+- **PLAN.md** — open work only.
+- **AGENTS.md** (this file) — working discipline.
+- Everything else lives in **git history** (thorough commit messages are the
+  changelog) and the agent memory. Do NOT add changelog-style banners,
+  dated status sections, or "history of this fix" narratives to code or
+  docs — describe the present; commit messages record the past.
+
+Authoritative numeric behavior: the CPU reference (per-kernel `cpu.rs`
+oracles under `src/shaders/`, shared ops in `src/shaders/cpu/`, plus
+`sample.rs`) and the weight manifest (`model.dgq.json`).
+
+---
+
+## 1. The one thing to internalize
+
+**Every serious bug in this project has lived in a fused or accelerated GPU
+path that a slower reference path got right.** MPS-Q4 producing uniform
+logits, the SC GEMM transpose, the softmax grid collapse, the MoE
+route-garbage from a last-expert `n_tok` bug, the fast-prefill encoder
+running a denoise-only norm — all the same shape: the optimized path computes
+a different function than the reference, parity is green because the
+optimized path has no golden, and the symptom only appears downstream
+(layer 2+, entropy collapse, pad output, >2.5k-token collapse) far from the
+cause.
+
+The corollary that governs everything below: **an untested path is where the
+next bug is.** Speed without a per-path correctness gate is how bugs ship.
+So the strategy is not "go fast"; it is "make divergence impossible to
+introduce silently, then go fast."
+
+---
+
+## 2. Diagnostic discipline (how to chase a bug)
+
+When output is wrong, follow this order. Do not skip to optimization or to
+rewriting a kernel you can't explain.
+
+1. **Localize before you theorize.** Find the *smallest* unit that diverges
+   from the reference. A 30-layer entropy collapse is not a bug location;
+   it's a symptom. Bisect: which layer, which kernel, which stage within the
+   kernel. The MoE hunt took ten turns because we theorized about kernel math
+   for several rounds before dumping the one value (`x`/`tok` as the kernel
+   actually read it) that localized it in one read.
+
+2. **Same input, same weights, two paths.** The fastest localization is
+   always: run the suspect GPU path and the CPU reference on *byte-identical*
+   input and weights, compare cosine. cos > 0.999 = that stage is fine.
+   cos ~0.5 = correlated-but-wrong (often a swap, a scale, or partial
+   corruption). cos ~0 = orthogonal, reading the wrong data entirely. The
+   cosine *magnitude* is a diagnostic, not just pass/fail — read it.
+
+3. **Dump the actual bytes/values the kernel reads, not what you think it
+   reads.** Repeatedly, the bug was "kernel reads a different thing than the
+   reference" — wrong row, wrong tensor, wrong activation. A CPU
+   transliteration of the *source* can match the reference while the *GPU
+   execution* diverges, because the transliteration can't reproduce
+   threadgroup semantics, arena bindings, or route resolution. When in doubt,
+   write the kernel's actual inputs to a scratch buffer and read them back.
+
+4. **Impossible numbers mean wrong N or wrong normalization.** Entropy >
+   ln(N), Z=0, cos > 1, values at ~1e38 — these are never "the model is just
+   bad." They are indexing, normalization, or precision-overflow bugs with a
+   specific cause. Chase them as such.
+
+5. **Two paths failing differently is a gift, not noise.** When the engine
+   and monolithic paths diverge on the same input, the *difference* localizes
+   the bug to the path-specific code. One exploding (inf), one inert (zero)
+   meant two different bugs in the same conceptual spot — and finding one
+   explained the other.
+
+6. **Don't let a workaround end the investigation.** Swapping a broken fused
+   kernel for a slow reference path unblocks convergence but leaves the
+   latent bug in every *other* kernel that shares the flawed pattern.
+   Root-cause it, then decide whether to fix or replace.
+
+7. **A contradiction is a second bug, not an anomaly.** "act went 0.015 → 1.0
+   but gpu_out is bit-identical" cannot happen in a correct pipeline. When a
+   fix changes an intermediate but not the output, you are measuring two
+   different code paths (probe vs production) or reading a stale buffer.
+   Resolve contradictions; do not note-and-move-on.
+
+8. **Reproduce a gap across inputs before attributing it to a bug.** A
+   difference measured on one prompt/seed can be *chaos*, not a defect: in a
+   sensitive iterative system (the denoise loop), a sub-1e-4 per-step
+   difference can flip an entropy-boundary accept decision and cascade into a
+   different — but equally valid — trajectory. Before chasing a single-input
+   delta, check that it's *systematic* (same direction across prompts/seeds)
+   and that per-unit parity is actually broken. Otherwise you'll "fix" noise.
+
+9. **Localize the gap to the right axis, then change one thing.** A quality
+   gap can live in any of {sampler, forward precision, a specific quantized
+   tensor}. Bisect to the axis before rebuilding; each step changes exactly
+   one variable. A "rebuild with everything different" tells you nothing.
+
+10. **Measure value/type ranges before calling a precision experiment
+    failed** (`DGQ_TRACE_RANGES`, value-cos) — and check the Negative
+    Knowledge section + agent memory for the lever family BEFORE planning
+    perf work; task descriptions carry stale premises.
+
+---
+
+## 3. Measure before optimizing — always
+
+- **Get a clean measurement first.** Compile out probes/readbacks before
+  timing anything. A readback is a GPU pipeline stall; instrumentation can
+  dominate a step.
+- **Attribute the time before reducing it.** Per-dispatch timing on one clean
+  step. Do not guess which stage dominates; the guesses have been wrong.
+- **Know the regime** (see ARCHITECTURE.md): denoise GEMMs are compute-bound
+  at the MPS wall; attention is instruction-issue-bound at SLC service rates;
+  the expert GEMM at prefill M=1024 is compute-bound with ~6× margin over
+  weight bytes. Byte-cutting levers do not pay on issue/compute-bound
+  kernels — check Negative Knowledge before reaching for one.
+- **Sequence optimizations to the bottleneck.** At multi-second steps the win
+  is "stop doing the slow/temporary thing" (remove probes, use the fused
+  kernel, re-enable the fast path). Don't reach for architecture when the
+  cost is a left-on debug path.
+- **Timing methodology**: separate retrieval from perf runs; perf A/Bs are
+  isolated benches on representative subsets, within-process adjacent
+  (`bench-step-kernel`, `bench-gemm`), never full-wall-clock comparisons of
+  mixed work.
+
+---
+
+## 4. Kernel organization: one body, compile-time specialization
+
+Kernel code lives in **`src/shaders/<group>/<kernel>/`** — the Rust wrapper
+(`mod.rs`), the Metal source (`<kernel>.metal`), the CPU oracle (`cpu.rs`),
+and the manifest registration (`SPEC`) are colocated. Only `src/shaders/`
+knows `.metal` paths; `src/metal/` (the runtime) consumes pipelines via
+`shaders::<kernel>::pipeline_for*` / `{SHADER, ENTRY}`.
+
+- **One source body per logical kernel.** A kernel = the operation + its
+  tiling. Variant axes — weight format (q4/q8/nvfp4/raw), fusion/output mode,
+  dtype, dump depth, even divergent buffer signatures — are **function
+  constants** selected at pipeline-compile time. A "variant" is a tuple of
+  constant values, not a file. Never fork `k_foo` into `k_foo_fp8`,
+  `k_foo_debug`.
+- **Intermediate dumps are a compile-time mode of the production kernel**
+  (`K_DUMP_STAGE`), not a separate probe kernel. Fold hunt-time probes back
+  behind the dump flag once a bug is found.
+- FC 1–3 are global (shape-assert, dump, quant-format); local axes are
+  registered in each kernel's `SPEC` (see `diffgemma-mps manifest`).
+- Quoted `#include "x.metal"` resolves from `src/shaders/include/` at
+  runtime (`common/expand.rs`); the pipeline binary archive keys on the
+  whole-tree hash, so shader edits can never be served stale — but if golden
+  regresses right after a `.metal` edit, **rebuild clean before diagnosing**
+  (a mid-sequence binary can still be stale).
+
+---
+
+## 5. Testing: three tiers, push assertions down
+
+**Tier 1 — per-kernel unit tests.** Synthetic, blob-free, milliseconds. One
+test per kernel against its CPU oracle on a tiny hand-built fixture — never
+the 19 GiB blob. Fixtures must exceed the worst tile (e.g. grouped
+`rows_per_expert ≥ 33`). Every kernel has a permanent CPU twin; the twin is
+the oracle forever.
+
+**Tier 2 — staged comparison.** Real weights, reduced stages, dump depth on.
+Catches integration bugs between correct kernels.
+
+**Tier 3 — end-to-end goldens.** `golden` (byte-identity, 8-case path
+matrix), `smoketest` (17/17 gate), full suite. Regression gates, **not**
+debugging tools.
+
+**Transitivity is the speed win**: pin both engines to the same CPU oracle in
+Tier 1 and engine-vs-engine agreement is automatic.
+
+**Recurring failure class**: stale test dispatch grids after kernel grid
+rewrites — a cos≈0.34 oracle failure usually means the HARNESS dispatches an
+old shape, not that the kernel math broke. Check the harness grid first.
+
+**Suite mechanics**: `cargo test --release -- --test-threads=1` (parallel
+GPU tests SIGSEGV). Model-gated tests key off `test_util::dgq_model_dir()`.
+
+---
+
+## 6. Non-negotiable invariants
+
+- **Finite:** no NaN/Inf in logits, activations, attention output, SC signal.
+- **Softmax rows sum to 1.0** over their actual support.
+- **Entropy ≤ ln(N)**; SC signal finite and non-zero on step ≥ 2.
+- **Determinism:** same seed → same tokens on the deterministic path.
+- **Not all-pad/all-filler** on a converged block before early-stop fires.
+- **Offsets in `ulong`** for all blob addressing (blob > uint32).
+- **Quant K-order:** sequential decode == indexed decode in K-order, not just
+  as a set.
+- **Tile-bound dimensions:** for every kernel, each compile-time tile must be
+  either grid-tiled, striped in-kernel, or ranged-dispatched if a
+  data-dependent dimension can exceed it; Tier-1 fixtures must exceed the
+  worst tile. Audit mechanically: grep fixed-size arrays, check each index's
+  runtime bound.
+- **Ring KV writes respect `StepParams.kv_write_end`.** Past-the-end ≠ dead
+  on a ring: pad/garbage rows wrap onto `pos & ring_mask` and clobber the
+  oldest live window slots. Any kernel writing KV by absolute position must
+  honor it.
+- **Producer/consumer dtype mismatch is the real precision hazard**, not the
+  choice of dtype. When changing a plane's dtype, convert every writer and
+  reader together and audit the toggleable loaders.
+
+---
+
+## 7. Authority & sources of truth
+
+- **Numeric behavior:** the CPU reference is the oracle. When GPU and CPU
+  disagree, the CPU is right and the GPU path is the suspect.
+- **Weight layout:** the `model.dgq.json` manifest is authoritative for
+  shapes, offsets, orientation. When a kernel's addressing assumption is in
+  question, the manifest decides — not memory, not the comment.
+- **Model semantics:** ARCHITECTURE.md Part II (forward-pass details: RoPE
+  split-half pairing, proportional-RoPE full-head-dim denominator,
+  temperature count-down, prefix-sum accept rule, QK-norm folding the
+  attention scale, V aliased from raw k_proj on full layers). These are
+  checkpoint-specific and several are counterintuitive — do not "correct"
+  them from general Gemma knowledge without checking the reference.
+- **Kernel FC registration:** each kernel's `SPEC` const;
+  `diffgemma-mps manifest` renders the full TOML view.
+- **Env flags:** `src/flags.rs` is the single registry — check it before
+  inventing any `DGQ_` flag. Flags are parsed once into `Config`; tests use
+  `install_for_test(cfg)`.
+- **Do not trust comments over code/manifest.** A stale comment has already
+  misled. Verify against the authoritative source.
+
+---
+
+## 8. Ship gates & operational rules
+
+- **Quality never ratchets without human sign-off.** Bit-identical changes
+  ship on identity evidence (`golden` 8/8 + suite). Anything
+  trajectory-affecting needs the multi-seed smoketest aggregate ({7,42,123})
+  + wart census + explicit user approval. Single-seed results are arbitrary
+  for trajectory-reshuffling changes.
+- **`golden` is the Tier-1 refactor gate**: run before/after every refactor;
+  `--bless` only after Tier-2/3 sign-off.
+- **Long-context claims are judged on real-document Q&A ladders
+  (`smoketest --longctx`), never needle probes alone** — needles ride a few
+  sharp attention edges and stay exact while document comprehension is fully
+  hallucinated.
+- **NEVER run two model-loading processes in parallel** (ours ~19 GiB + MLX
+  ~15 GiB = machine crash). `pgrep -f "diffgemma-mps -m"` before any GPU run;
+  serialize every bench.
+- **Wart census** (10-seed greentext) is the sensitive sampler probe.
+- **State assumptions as checks, not beliefs.** "The stride is K+2" → assert
+  it against the manifest and a byte dump.
+- **One bisecting measurement beats three rounds of theory.**
+- **Every bug fixed gets a regression test at the lowest tier that would have
+  caught it.**
+- **No path ships without a golden.** New kernel variant / code path → a
+  matrix row before it's "done."
+- **Don't optimize against a dirty baseline.**
+- **Write thorough commit messages** — they are the project changelog and
+  the disproof ledger's primary record. Keep PLAN.md forward-only and
+  ARCHITECTURE.md present-tense; move anything historical into the commit
+  that changed it.
+- `cargo fmt` is safe to run freely (repo is rustfmt-normalized; big
+  reformats go in their own blame-ignored commit).
+
+---
+
+## 9. Command reference
+
+`WEIGHTS=model/diffusiongemma-q4emb`; binary at `target/release/diffgemma-mps`
+(build: `cargo build --release`).
+
+```bash
+# Generate / chat / serve
+diffgemma-mps ask  -m $WEIGHTS -p "Hello" --seed 42
+diffgemma-mps chat -m $WEIGHTS                  # --ctx N for long context
+diffgemma-mps serve -m $WEIGHTS --ctx 8192      # OpenAI-compatible HTTP
+
+# Gates (run before commit)
+diffgemma-mps smoketest -m $WEIGHTS             # 17/17 required
+diffgemma-mps smoketest -m $WEIGHTS --longctx   # doc-QA ladder
+diffgemma-mps golden -m $WEIGHTS                # byte-identity 8/8
+cargo test --release -- --test-threads=1
+
+# Bench / diagnostics
+diffgemma-mps bench-step-kernel -m $WEIGHTS --profile-steps 8
+diffgemma-mps bench-gemm --shapes 256x2816x2816 --oracle mps --iters 10
+diffgemma-mps step-probe -m $WEIGHTS --layers 3 --kv-len 64 --seed 42
+diffgemma-mps step-parity -m $WEIGHTS           # engine-vs-monolith oracle
+diffgemma-mps probe-device; diffgemma-mps summary; diffgemma-mps config
+diffgemma-mps manifest                          # kernel FC-axis TOML
+
+# Requantize from HF safetensors
+diffgemma-mps quantize -m model/transformer -o model/diffusiongemma-q4emb --profile q4
+
+# MLX reference comparison (SERIALIZE with our runs — never in parallel)
+python/.venv/bin/python python/scripts/mlx_generate.py -p "..." -o /tmp/mlx.json
+```
+
+MLX parity tooling (`python/scripts/`): `mlx_generate.py`,
+`compare_generation.py`, layer-cos + denoise-trace dump/compare pairs.
+ALWAYS prompt-match layer-cos comparisons.
+
+Debug/probe env flags (`DGQ_TRACE_*`, `DGQ_LOG_*`, `DGQ_MEM_WATCH`, …) are
+documented in `src/flags.rs`.

@@ -472,7 +472,7 @@ impl MetalContext {
         Ok(pipelines)
     }
 
-    /// Specialize an isolated subkernel (function constants 1–3 per STRATEGY.md §4).
+    /// Specialize an isolated subkernel (function constants 1–3 per AGENTS.md §4).
     pub fn compile_subkernel(
         &self,
         source: &str,

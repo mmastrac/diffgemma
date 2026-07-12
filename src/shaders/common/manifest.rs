@@ -11,7 +11,7 @@
 //! (src/shaders/include/fc_axes.metal); `fc` lists each kernel's LOCAL
 //! axes (index ≥ 4). Axes of non-registered kernels (the tunable GEMM
 //! family's FC9–11/28–30, convert_scale's FC4/5, …) are documented in
-//! KERNELS.md.
+//! ARCHITECTURE.md.
 
 use super::variant::{ElemDtype, FcBool, FcUInt, KernelVariant, QuantFormat};
 use crate::safetensors::Error;
