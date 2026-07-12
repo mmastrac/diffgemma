@@ -11,9 +11,9 @@ use objc2_metal::{
     MTLBinaryArchive, MTLBinaryArchiveDescriptor, MTLComputePipelineDescriptor,
     MTLComputePipelineState, MTLDevice, MTLFunction, MTLPipelineOption,
 };
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 const CACHE_BUNDLE_TAG: &str = "diffgemma-mps-v9-runtime-include";
 
@@ -59,13 +59,29 @@ fn sanitize_device_name(name: &str) -> String {
 }
 
 pub struct PipelineArchiveCache {
-    archive: Retained<ProtocolObject<dyn MTLBinaryArchive>>,
+    /// All access to the non-thread-safe `MTLBinaryArchive` — the pipeline-lookup
+    /// read during compilation, `addComputePipelineFunctions`, and `serialize` —
+    /// goes through this Mutex, so the archive is never touched from two threads
+    /// at once. The compiled-pipeline map lives here too so a repeat request
+    /// returns a clone without re-entering the archive at all.
+    inner: Mutex<ArchiveInner>,
     cache_file: PathBuf,
-    dirty: AtomicBool,
     persist: bool,
 }
 
-// Metal pipeline objects are used from the main inference thread only.
+struct ArchiveInner {
+    archive: Retained<ProtocolObject<dyn MTLBinaryArchive>>,
+    /// Compiled pipelines keyed by the caller's label. The label encodes the
+    /// entry point plus the full function-constant config (see
+    /// `device.rs::compile_*`), so it uniquely identifies a pipeline — making
+    /// this an exact-match dedup, not a lossy hash.
+    compiled: HashMap<String, Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+    dirty: bool,
+}
+
+// SAFETY: the only non-`Send`/`Sync` members are Metal objects reached through
+// `inner`'s Mutex. The archive is never used unsynchronized (see the field doc),
+// and `MTLComputePipelineState` is immutable and safe to share once created.
 unsafe impl Send for PipelineArchiveCache {}
 unsafe impl Sync for PipelineArchiveCache {}
 
@@ -128,9 +144,12 @@ impl PipelineArchiveCache {
         }
 
         Ok(Self {
-            archive,
+            inner: Mutex::new(ArchiveInner {
+                archive,
+                compiled: HashMap::new(),
+                dirty: false,
+            }),
             cache_file,
-            dirty: AtomicBool::new(false),
             persist: true,
         })
     }
@@ -141,9 +160,12 @@ impl PipelineArchiveCache {
             .newBinaryArchiveWithDescriptor_error(&desc)
             .map_err(|_| Error::Format("MTLBinaryArchive create failed"))?;
         Ok(Self {
-            archive,
+            inner: Mutex::new(ArchiveInner {
+                archive,
+                compiled: HashMap::new(),
+                dirty: false,
+            }),
             cache_file: PathBuf::new(),
-            dirty: AtomicBool::new(false),
             persist: false,
         })
     }
@@ -154,11 +176,19 @@ impl PipelineArchiveCache {
         function: &ProtocolObject<dyn MTLFunction>,
         label: &str,
     ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, Error> {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+
+        // Fast path: already compiled this exact pipeline — hand back a clone
+        // (a cheap retain) without re-entering the archive.
+        if let Some(pipeline) = inner.compiled.get(label) {
+            return Ok(pipeline.clone());
+        }
+
         let desc = MTLComputePipelineDescriptor::new();
         desc.setComputeFunction(Some(function));
         desc.setLabel(Some(&NSString::from_str(label)));
         desc.setSupportIndirectCommandBuffers(true);
-        let archives = NSArray::from_slice(&[&*self.archive]);
+        let archives = NSArray::from_slice(&[&*inner.archive]);
         desc.setBinaryArchives(Some(&archives));
 
         let pipeline = device
@@ -170,27 +200,43 @@ impl PipelineArchiveCache {
             .map_err(|_| Error::Format("Metal pipeline compile failed"))?;
 
         if self.persist
-            && self
+            && inner
                 .archive
                 .addComputePipelineFunctionsWithDescriptor_error(&desc)
                 .is_ok()
         {
-            self.dirty.store(true, Ordering::Relaxed);
+            inner.dirty = true;
         }
 
+        inner.compiled.insert(label.to_string(), pipeline.clone());
         Ok(pipeline)
     }
 
     pub fn flush_if_dirty(&self) {
-        if !self.persist || !self.dirty.swap(false, Ordering::Relaxed) {
+        if !self.persist {
             return;
         }
-        let Some(url) = NSURL::from_file_path(&self.cache_file) else {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if !std::mem::replace(&mut inner.dirty, false) {
+            return;
+        }
+        // Serialize to a pid-tagged temp then atomically rename, so a crash or a
+        // second process writing the same cache file can never leave a
+        // half-written (corrupt) archive that would fail to reopen.
+        let tmp = self
+            .cache_file
+            .with_extension(format!("tmp-{}", std::process::id()));
+        let Some(url) = NSURL::from_file_path(&tmp) else {
             return;
         };
         let save_started = std::time::Instant::now();
-        match self.archive.serializeToURL_error(&url) {
+        match inner.archive.serializeToURL_error(&url) {
             Ok(()) => {
+                if let Err(e) = std::fs::rename(&tmp, &self.cache_file) {
+                    let _ = std::fs::remove_file(&tmp);
+                    eprintln!("warning: metal pipeline cache rename failed: {e}");
+                    return;
+                }
                 if crate::flags::progress_enabled() {
                     eprintln!(
                         "metal pipeline cache: saved {} ({:.2?})",
@@ -199,10 +245,57 @@ impl PipelineArchiveCache {
                     );
                 }
             }
-            Err(e) => eprintln!(
-                "warning: metal pipeline cache serialize failed: {}",
-                e.localizedDescription()
-            ),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                eprintln!(
+                    "warning: metal pipeline cache serialize failed: {}",
+                    e.localizedDescription()
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::device::MetalContext;
+
+    const SRC: &str = "\
+#include <metal_stdlib>
+using namespace metal;
+kernel void pc_k0(device float* o [[buffer(0)]], uint i [[thread_position_in_grid]]) { o[i] = 0.0f; }
+kernel void pc_k1(device float* o [[buffer(0)]], uint i [[thread_position_in_grid]]) { o[i] = 1.0f; }
+kernel void pc_k2(device float* o [[buffer(0)]], uint i [[thread_position_in_grid]]) { o[i] = 2.0f; }
+kernel void pc_k3(device float* o [[buffer(0)]], uint i [[thread_position_in_grid]]) { o[i] = 3.0f; }
+";
+
+    /// Hammer the process-global pipeline archive from many threads at once.
+    /// Same entry across threads exercises the dedup fast path; different entries
+    /// race concurrent `addComputePipelineFunctions`. Pre-Mutex this raced the
+    /// non-thread-safe `MTLBinaryArchive` and SIGSEGV'd — the reason the test
+    /// suite ran `--test-threads=1`. Manages its own threads, so it still
+    /// exercises concurrency under the serial test harness.
+    #[test]
+    fn concurrent_compile_is_race_free() {
+        if MetalContext::new().is_err() {
+            eprintln!("skip: no Metal device");
+            return;
+        }
+        let entries = ["pc_k0", "pc_k1", "pc_k2", "pc_k3"];
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    let ctx = MetalContext::new().expect("device");
+                    for _ in 0..4 {
+                        for e in entries {
+                            ctx.compile_kernel(SRC, e).expect("pipeline compile");
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("worker panicked — pipeline cache race?");
         }
     }
 }
