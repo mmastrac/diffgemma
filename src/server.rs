@@ -168,6 +168,7 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
         &self.emitted_reasoning
     }
 
+    #[allow(dead_code)]
     pub fn ended(&self) -> bool {
         self.ended
     }
@@ -1462,10 +1463,11 @@ pub fn run_serve(
             model_dir.display()
         ));
     }
-    let layers = crate::resolve_model_layers(model_dir, max_layers).map_err(|e| e.to_string())?;
+    let layers =
+        crate::commands::resolve_model_layers(model_dir, max_layers).map_err(|e| e.to_string())?;
 
     // Fail-fast context budget guard before loading weights (mirrors chat/ask).
-    crate::check_ctx_budget(ctx)?;
+    crate::commands::check_ctx_budget(ctx)?;
 
     let stop_token_ids = crate::config::load_generation_stop_tokens(model_dir);
     let sampler = crate::sample::sampler_for_steps(steps, false);
@@ -1690,7 +1692,7 @@ mod tool_smoke {
         StepGenerateSession,
     ) {
         let tok = crate::tokenizer::Tokenizer::load(dir.join("tokenizer.json")).unwrap();
-        let layers = crate::resolve_model_layers(dir, None).unwrap();
+        let layers = crate::commands::resolve_model_layers(dir, None).unwrap();
         let stop = crate::config::load_generation_stop_tokens(dir);
         let sampler = crate::sample::sampler_for_steps(24, false);
         let mut cfg = StepGenerateConfig::from_generate(7, 512, MAX_SEQ, layers, sampler, false);
@@ -1837,7 +1839,7 @@ mod tool_compact_smoke {
         StepGenerateSession,
     ) {
         let tok = crate::tokenizer::Tokenizer::load(dir.join("tokenizer.json")).unwrap();
-        let layers = crate::resolve_model_layers(dir, None).unwrap();
+        let layers = crate::commands::resolve_model_layers(dir, None).unwrap();
         let stop = crate::config::load_generation_stop_tokens(dir);
         let sampler = crate::sample::sampler_for_steps(24, false);
         let mut cfg = StepGenerateConfig::from_generate(7, 512, MAX_SEQ, layers, sampler, false);
