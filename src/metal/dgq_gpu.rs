@@ -725,59 +725,6 @@ mod q4_gpu_tests {
         assert!(max_err < 0.08, "max_err={max_err}");
     }
 
-    #[test]
-    fn nvfp4_gpu_dequant_matrix_matches_cpu() {
-        use crate::metal::dequant_matrix::dispatch_dequant_block_matrix;
-        let dgq_dir = std::path::Path::new("/tmp/nvfp4-weights");
-        if !dgq_dir.join("model.dgq.json").exists() {
-            eprintln!("skip: /tmp/nvfp4-weights missing");
-            return;
-        }
-        let store = DgqStore::open(dgq_dir).expect("open dgq");
-        let ctx = MetalContext::new().expect("metal");
-        let blob = DgqGpuBlob::from_store(&store, &ctx.device).expect("blob");
-        let q4 = load_block_linear(
-            &store,
-            Arc::clone(&blob),
-            "model.decoder.layers.0.self_attn.q_proj.weight",
-        )
-        .expect("nvfp4 view");
-        let cpu = store
-            .tensor_f32("model.decoder.layers.0.self_attn.q_proj.weight")
-            .expect("cpu dequant");
-
-        let prod = crate::kernels::sub::variant::KernelVariant::PRODUCTION;
-        let pipeline = crate::kernels::sub::dequant_block_matrix::pipeline_for(
-            &ctx,
-            crate::kernels::sub::QuantFormat::NvFp4,
-            prod,
-        )
-        .expect("pipeline");
-        let mut pool = BufferPool::new();
-        let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None)
-            .expect("batch");
-        let buf_out = batch.alloc_f32_out(cpu.len()).expect("out");
-        dispatch_dequant_block_matrix(batch.encoder(), &pipeline, &q4, &buf_out);
-        let mut gpu = vec![0.0f32; cpu.len()];
-        batch.register_read(buf_out, &mut gpu);
-        batch.end().expect("end");
-
-        let mut max_err = 0.0f32;
-        let mut worst = (0usize, 0usize, 0.0f32, 0.0f32);
-        for (i, (a, b)) in cpu.iter().zip(gpu.iter()).enumerate() {
-            let err = (a - b).abs();
-            if err > max_err {
-                max_err = err;
-                worst = (i / q4.in_dim, i % q4.in_dim, *a, *b);
-            }
-        }
-        eprintln!(
-            "nvfp4 gpu dequant matrix max_err={max_err:.6} worst=({},{}) cpu={:.6} gpu={:.6}",
-            worst.0, worst.1, worst.2, worst.3
-        );
-        assert!(max_err < 0.01, "max_err={max_err}");
-    }
-
     fn grouped_stats(cpu: &[f32], gpu: &[f32]) -> (f32, f64) {
         assert_eq!(cpu.len(), gpu.len());
         let mut max_err = 0.0f32;

@@ -132,12 +132,6 @@ pub static MANIFEST: Manifest = Manifest {
             variants: KernelVariants::Elementwise,
         },
         KernelSpec {
-            name: "sc_probs",
-            entry: "sc_probs",
-            quant_formats: &[QuantFormat::Q4Affine],
-            variants: KernelVariants::Elementwise,
-        },
-        KernelSpec {
             name: "sample_rowstats",
             entry: "sample_rowstats",
             quant_formats: &[QuantFormat::Q4Affine],
@@ -201,30 +195,6 @@ pub static MANIFEST: Manifest = Manifest {
             name: "moe_scatter_weighted",
             entry: "moe_scatter_weighted",
             quant_formats: &[QuantFormat::Q4Affine],
-            variants: KernelVariants::Elementwise,
-        },
-        KernelSpec {
-            name: "q4_group_k_order",
-            entry: "q4_group_k_order",
-            quant_formats: &[QuantFormat::Q4Affine],
-            variants: KernelVariants::Elementwise,
-        },
-        KernelSpec {
-            name: "fp8_e4m3_table",
-            entry: "fp8_e4m3_table",
-            quant_formats: &[QuantFormat::Q4Affine],
-            variants: KernelVariants::Elementwise,
-        },
-        KernelSpec {
-            name: "nvfp4_tile_k_order",
-            entry: "nvfp4_tile_k_order",
-            quant_formats: &[QuantFormat::Q4Affine],
-            variants: KernelVariants::Elementwise,
-        },
-        KernelSpec {
-            name: "dequant_block_matrix",
-            entry: "dequant_block_matrix",
-            quant_formats: &[QuantFormat::Q4Affine, QuantFormat::NvFp4],
             variants: KernelVariants::Elementwise,
         },
         KernelSpec {

@@ -137,18 +137,6 @@ quant_formats = [0]
 [[kernel.variants]]
 
 [[kernel]]
-name = "sc_probs"
-entry = "sc_probs"
-quant_formats = [0]
-
-[kernel.fc]
-1 = "K_SHAPE_ASSERT"
-2 = "K_DUMP_STAGE"
-3 = "K_QUANT_FORMAT"
-
-[[kernel.variants]]
-
-[[kernel]]
 name = "sample_rowstats"
 entry = "sample_rowstats"
 quant_formats = [0]
@@ -272,54 +260,6 @@ quant_formats = [0, 3]
 name = "moe_scatter_weighted"
 entry = "moe_scatter_weighted"
 quant_formats = [0]
-
-[kernel.fc]
-1 = "K_SHAPE_ASSERT"
-2 = "K_DUMP_STAGE"
-3 = "K_QUANT_FORMAT"
-
-[[kernel.variants]]
-
-[[kernel]]
-name = "q4_group_k_order"
-entry = "q4_group_k_order"
-quant_formats = [0]
-
-[kernel.fc]
-1 = "K_SHAPE_ASSERT"
-2 = "K_DUMP_STAGE"
-3 = "K_QUANT_FORMAT"
-
-[[kernel.variants]]
-
-[[kernel]]
-name = "fp8_e4m3_table"
-entry = "fp8_e4m3_table"
-quant_formats = [0]
-
-[kernel.fc]
-1 = "K_SHAPE_ASSERT"
-2 = "K_DUMP_STAGE"
-3 = "K_QUANT_FORMAT"
-
-[[kernel.variants]]
-
-[[kernel]]
-name = "nvfp4_tile_k_order"
-entry = "nvfp4_tile_k_order"
-quant_formats = [0]
-
-[kernel.fc]
-1 = "K_SHAPE_ASSERT"
-2 = "K_DUMP_STAGE"
-3 = "K_QUANT_FORMAT"
-
-[[kernel.variants]]
-
-[[kernel]]
-name = "dequant_block_matrix"
-entry = "dequant_block_matrix"
-quant_formats = [0, 3]
 
 [kernel.fc]
 1 = "K_SHAPE_ASSERT"

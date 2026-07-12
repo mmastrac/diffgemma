@@ -11,7 +11,6 @@ pub(crate) mod debug_status;
 mod decoder;
 mod decoder_attention;
 mod decoder_layer;
-mod dequant_matrix;
 pub(crate) mod device;
 mod dgq_gpu;
 mod embed;
