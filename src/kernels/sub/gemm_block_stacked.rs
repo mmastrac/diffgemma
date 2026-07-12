@@ -1,4 +1,9 @@
 //! Stacked-segment Q4 GEMM: one input tile load, multiple weight/output segments (QKV, gate+up).
+//!
+//! The GPU kernel (`shaders/oracle/gemm_block_stacked.metal`) is a validation
+//! ORACLE — production stacked GEMM runs `gemm_tunable`. The segment types/helpers
+//! here (`GemmStackedSeg`, `StackedSegFc`, `StackedPipelineKey`) are PRODUCTION:
+//! `gemm_tunable::stacked_pipeline_for` builds on them.
 
 use super::QuantFormat;
 use super::bf16;
@@ -11,7 +16,7 @@ use crate::safetensors::Error;
 
 pub const ENTRY: &str = "gemm_block_stacked";
 
-const SHADER: &str = shader_include::include_metal!("kernels/gemm_block_stacked.metal");
+const SHADER: &str = shader_include::include_metal!("oracle/gemm_block_stacked.metal");
 
 /// Must match `shaders/include/gemm_stacked.metal`.
 #[repr(C)]

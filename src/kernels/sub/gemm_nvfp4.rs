@@ -1,3 +1,6 @@
+//! ORACLE (not production): validation twin of `gemm_tunable` dense nvfp4.
+//! Kernel source lives in `shaders/oracle/gemm_block.metal`; see that README.
+//!
 //! Tiled NVFP4 GEMM: `y[M,N] = x[M,K] @ Wnvfp4[N,K]^T` (monolith `k_gemm_nvfp4` body).
 
 use super::bf16;
@@ -10,7 +13,7 @@ use crate::safetensors::Error;
 
 pub const ENTRY: &str = "gemm_block";
 
-const SHADER: &str = shader_include::include_metal!("kernels/gemm_block.metal");
+const SHADER: &str = shader_include::include_metal!("oracle/gemm_block.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

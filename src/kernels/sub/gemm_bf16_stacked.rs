@@ -1,3 +1,6 @@
+//! ORACLE (not production): validation twin of `gemm_tunable` stacked raw.
+//! Kernel source lives in `shaders/oracle/gemm_block_stacked.metal`.
+//!
 //! bf16 stacked GEMM (fused QKV / gate+up on the bf16 default path). Now a thin
 //! delegate over `gemm_block_stacked` with `QuantFormat::Raw` (bf16 [N,K] rows
 //! read with no dequant) — the bf16 analog, mirroring how `gemm_bf16` folded

@@ -1,4 +1,9 @@
 //! Tiled grouped MoE GEMM: expert segments × 32×32 output tiles (simdgroup matmul).
+//!
+//! The GPU kernel (`shaders/oracle/gemm_block_grouped.metal`) is a validation
+//! ORACLE — production MoE experts run `gemm_tunable_sparse`. The CPU oracle
+//! (`cpu`), buffer binder (`bind_gpu_buffers`), and types (`Fixture`,
+//! `BlobGroupedParams`) here are PRODUCTION/shared test infrastructure.
 
 use super::QuantFormat;
 use super::bf16;
@@ -12,7 +17,7 @@ use crate::safetensors::Error;
 
 pub const ENTRY: &str = "gemm_block_grouped";
 
-const SHADER: &str = shader_include::include_metal!("kernels/gemm_block_grouped.metal");
+const SHADER: &str = shader_include::include_metal!("oracle/gemm_block_grouped.metal");
 
 pub fn fixture_len(f: &Fixture) -> usize {
     f.out_len()

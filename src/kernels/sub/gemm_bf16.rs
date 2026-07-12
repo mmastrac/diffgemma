@@ -1,3 +1,6 @@
+//! ORACLE (not production): validation twin of `gemm_tunable` dense raw (bf16).
+//! Kernel source lives in `shaders/oracle/gemm_block.metal`; see that README.
+//!
 //! Tiled bf16-weight GEMM: `y[M,N] = x[M,K] @ W[N,K]^T` with bf16 weights (no
 //! quantization). CONSOLIDATED into `gemm_block` (the unified plain GEMM) via the
 //! `Raw` weight format — same tiling as q4/nvfp4, just a direct bf16→half weight
@@ -7,7 +10,7 @@ use crate::safetensors::Error;
 
 pub const ENTRY: &str = "gemm_block";
 
-const SHADER: &str = shader_include::include_metal!("kernels/gemm_block.metal");
+const SHADER: &str = shader_include::include_metal!("oracle/gemm_block.metal");
 const RAW: u32 = super::QuantFormat::Raw as u32;
 
 #[cfg(target_os = "macos")]
