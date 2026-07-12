@@ -8,7 +8,7 @@ use crate::sample::token_entropy;
 
 pub const ENTRY: &str = "row_entropy";
 
-const SHADER: &str = shader_include::include_metal!("kernels/row_entropy.metal");
+const SHADER: &str = shader_include::include_metal!("oracle/row_entropy.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

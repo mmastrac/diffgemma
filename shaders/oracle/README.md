@@ -16,6 +16,18 @@ K-accumulation chain, dequant, or rounding.
 | `gemm_block_stacked.metal` | fused QKV / gate+up | `gemm_block_stacked` `gemm_bf16_stacked` |
 | `gemm_block_grouped.metal` | grouped MoE experts | `gemm_block_grouped` |
 
+## Sampler / LM-head oracles
+
+The decoder-engine (`GpuDecoderEngine::forward`) sampling + LM-head kernels are
+also validation-only — production sampling runs the step-kernel sampler
+(`sample_rowstats`/`sample_apply`/`sample_commit`/`sc_prob_cols`/…). These live
+here too: `argmax_rows`, `logit_softcapping`, `scale_logits`, `scatter_vocab_chunk`,
+`row_entropy`, `sample_from_probs_rows`, `gather_prob_cols`, `softmax_rows`.
+(`copy_f32` stays in `kernels/` — it is also dispatched in the default ≤256-token
+engine prefill path, so it is production.)
+
+## GEMM oracles
+
 `gemm_block_stacked` / `gemm_block_grouped` (Rust) also export **production**
 types/helpers/CPU-oracles (`GemmStackedSeg`, `StackedSegFc`, `Fixture`,
 `BlobGroupedParams`, `bind_gpu_buffers`, `cpu`) that `gemm_tunable` and its tests

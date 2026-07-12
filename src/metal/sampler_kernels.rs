@@ -7,14 +7,14 @@ use crate::safetensors::Error;
 
 const COPY_F32_SHADER: &str = shader_include::include_metal!("kernels/copy_f32.metal");
 const LOGIT_SOFTCAPPING_SHADER: &str =
-    shader_include::include_metal!("kernels/logit_softcapping.metal");
-const SCALE_LOGITS_SHADER: &str = shader_include::include_metal!("kernels/scale_logits.metal");
+    shader_include::include_metal!("oracle/logit_softcapping.metal");
+const SCALE_LOGITS_SHADER: &str = shader_include::include_metal!("oracle/scale_logits.metal");
 const SCATTER_VOCAB_CHUNK_SHADER: &str =
-    shader_include::include_metal!("kernels/scatter_vocab_chunk.metal");
-const ARGMAX_ROWS_SHADER: &str = shader_include::include_metal!("kernels/argmax_rows.metal");
-const ROW_ENTROPY_SHADER: &str = shader_include::include_metal!("kernels/row_entropy.metal");
+    shader_include::include_metal!("oracle/scatter_vocab_chunk.metal");
+const ARGMAX_ROWS_SHADER: &str = shader_include::include_metal!("oracle/argmax_rows.metal");
+const ROW_ENTROPY_SHADER: &str = shader_include::include_metal!("oracle/row_entropy.metal");
 const SAMPLE_FROM_PROBS_SHADER: &str =
-    shader_include::include_metal!("kernels/sample_from_probs_rows.metal");
+    shader_include::include_metal!("oracle/sample_from_probs_rows.metal");
 
 pub struct GpuSamplerKernels {
     pub copy_f32: ComputePipeline,

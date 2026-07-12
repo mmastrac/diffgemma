@@ -10,7 +10,7 @@ use crate::safetensors::Error;
 pub const ENTRY: &str = "softmax_rows";
 pub const THREADGROUP_WIDTH: usize = 256;
 
-const SHADER: &str = shader_include::include_metal!("kernels/softmax_rows.metal");
+const SHADER: &str = shader_include::include_metal!("oracle/softmax_rows.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

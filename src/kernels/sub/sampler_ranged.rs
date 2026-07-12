@@ -10,8 +10,8 @@ pub const SOFTCAP_ENTRY: &str = "logit_softcapping";
 pub const SCALE_ENTRY: &str = "scale_logits";
 
 const COPY_SHADER: &str = shader_include::include_metal!("kernels/copy_f32.metal");
-const SOFTCAP_SHADER: &str = shader_include::include_metal!("kernels/logit_softcapping.metal");
-const SCALE_SHADER: &str = shader_include::include_metal!("kernels/scale_logits.metal");
+const SOFTCAP_SHADER: &str = shader_include::include_metal!("oracle/logit_softcapping.metal");
+const SCALE_SHADER: &str = shader_include::include_metal!("oracle/scale_logits.metal");
 
 /// Production canvas × vocab flat length (forces multi-chunk ranged dispatch).
 pub const CANVAS_LEN: usize = 256;

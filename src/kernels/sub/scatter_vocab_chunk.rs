@@ -7,7 +7,7 @@ use crate::safetensors::Error;
 
 pub const ENTRY: &str = "scatter_vocab_chunk";
 
-const SHADER: &str = shader_include::include_metal!("kernels/scatter_vocab_chunk.metal");
+const SHADER: &str = shader_include::include_metal!("oracle/scatter_vocab_chunk.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

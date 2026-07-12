@@ -8,7 +8,7 @@ use crate::sample::argmax_canvas;
 
 pub const ENTRY: &str = "argmax_rows";
 
-const SHADER: &str = shader_include::include_metal!("kernels/argmax_rows.metal");
+const SHADER: &str = shader_include::include_metal!("oracle/argmax_rows.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {
