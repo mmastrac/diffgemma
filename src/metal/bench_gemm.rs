@@ -165,8 +165,7 @@ pub fn bench_gemm_tunable(shapes: &[GemmShape], iters: usize) -> Result<Vec<Gemm
         MTLSize,
     };
 
-    const SHADER_TUNE: &str =
-        shader_include::include_metal!("gemm/gemm_tunable/gemm_tunable.metal");
+    const SHADER_TUNE: &str = crate::shaders::gemm_tunable::SHADER;
     const CONFIGS: &[(usize, usize)] = &[(32, 32), (64, 32), (32, 64), (64, 64), (32, 128)];
     let ctx = MetalContext::new()?;
     let warmup = 3usize;

@@ -7,7 +7,8 @@ use crate::shaders::test_util::ElemFormat;
 
 pub const ENTRY: &str = "apply_rope_heads";
 
-const SHADER: &str = shader_include::include_metal!("attn/apply_rope_heads/apply_rope_heads.metal");
+pub const SHADER: &str =
+    shader_include::include_metal!("attn/apply_rope_heads/apply_rope_heads.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

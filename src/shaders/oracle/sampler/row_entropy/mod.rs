@@ -8,7 +8,8 @@ use crate::shaders::test_util::ElemFormat;
 
 pub const ENTRY: &str = "row_entropy";
 
-const SHADER: &str = shader_include::include_metal!("oracle/sampler/row_entropy/row_entropy.metal");
+pub const SHADER: &str =
+    shader_include::include_metal!("oracle/sampler/row_entropy/row_entropy.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

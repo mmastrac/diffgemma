@@ -9,11 +9,10 @@ use objc2_metal::{
     MTLComputePipelineState,
 };
 
-const ROPE_SHADER: &str =
-    shader_include::include_metal!("attn/apply_rope_heads/apply_rope_heads.metal");
-const GQA_SHADER: &str = shader_include::include_metal!("attn/gqa_attention/gqa_attention.metal");
-const ROPE_ENTRY: &str = "apply_rope_heads";
-const GQA_ENTRY: &str = "gqa_attention";
+const ROPE_SHADER: &str = crate::shaders::apply_rope_heads::SHADER;
+const GQA_SHADER: &str = crate::shaders::gqa_attention::SHADER;
+const ROPE_ENTRY: &str = crate::shaders::apply_rope_heads::ENTRY;
+const GQA_ENTRY: &str = crate::shaders::gqa_attention::ENTRY;
 
 pub struct GpuAttentionKernels {
     pub rope_pipeline: ComputePipeline,

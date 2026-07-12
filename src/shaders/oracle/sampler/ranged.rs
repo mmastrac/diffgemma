@@ -10,10 +10,8 @@ use crate::shaders::test_util::ElemFormat;
 pub const SOFTCAP_ENTRY: &str = "logit_softcapping";
 pub const SCALE_ENTRY: &str = "scale_logits";
 
-const SOFTCAP_SHADER: &str =
-    shader_include::include_metal!("oracle/sampler/logit_softcapping/logit_softcapping.metal");
-const SCALE_SHADER: &str =
-    shader_include::include_metal!("oracle/sampler/scale_logits/scale_logits.metal");
+const SOFTCAP_SHADER: &str = super::logit_softcapping::SHADER;
+const SCALE_SHADER: &str = super::scale_logits::SHADER;
 
 /// Production canvas × vocab flat length (forces multi-chunk ranged dispatch).
 pub const CANVAS_LEN: usize = 256;

@@ -8,7 +8,7 @@ use objc2_metal::{
     MTLComputePipelineState, MTLSize,
 };
 
-const GEMM_SHADER: &str = include_str!("../shaders/gemm/gemm.metal");
+const GEMM_SHADER: &str = crate::shaders::gemm::ENGINE_LINEAR_SHADER;
 const GEMM_ENTRY: &str = "bf16_gemm";
 const F32_BF16_LINEAR_ENTRY: &str = "f32_bf16_linear";
 const THREADGROUP: usize = 16;

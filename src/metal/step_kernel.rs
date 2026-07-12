@@ -864,8 +864,7 @@ impl StepPipelines {
         }
         // Unified rowk f32-accumulate SC-softembed GEMM (one shader; weight format
         // = K_QUANT_FORMAT: Raw bf16 embed or Q8 embed). x is fp16 sc_probs.
-        const ROWK_ACC_SHADER: &str =
-            shader_include::include_metal!("gemm/gemm_rowk/gemm_rowk.metal");
+        const ROWK_ACC_SHADER: &str = crate::shaders::gemm_rowk::SHADER;
         let mut gemm_q8_rowk_acc_f32 = HashMap::new();
         {
             for &(n, k) in &[(HID as u32, crate::model::embed::LM_HEAD_CHUNK as u32)] {
@@ -1020,8 +1019,8 @@ impl StepPipelines {
             )?,
             router: crate::shaders::moe_router::pipeline_for(ctx, prod)?,
             router_topk: ctx.compile_subkernel(
-                shader_include::include_metal!("moe/moe_router/moe_router_topk.metal"),
-                "moe_router_topk",
+                crate::shaders::moe_router::TOPK_SHADER,
+                crate::shaders::moe_router::TOPK_ENTRY,
                 prod,
             )?,
             bucket_count: crate::shaders::moe_bucket_count::pipeline_for(ctx, prod)?,
@@ -1046,27 +1045,23 @@ impl StepPipelines {
             sample_apply: crate::shaders::sample_apply::pipeline_for(ctx, prod)?,
             sample_write: crate::shaders::sample_write::pipeline_for(ctx, prod)?,
             compact_active_rows: ctx.compile_kernel(
-                shader_include::include_metal!(
-                    "sample/compact_active_rows/compact_active_rows.metal"
-                ),
-                "compact_active_rows",
+                crate::shaders::compact_active_rows::SHADER,
+                crate::shaders::compact_active_rows::ENTRY,
             )?,
             gather_rows_bf16: crate::shaders::gather_rows::pipeline_for_fmt(
                 ctx, prod, false, false,
             )?,
             scatter_logits_rows: ctx.compile_kernel(
-                shader_include::include_metal!(
-                    "sample/scatter_logits_rows/scatter_logits_rows.metal"
-                ),
-                "scatter_logits_rows",
+                crate::shaders::scatter_logits_rows::SHADER,
+                crate::shaders::scatter_logits_rows::ENTRY,
             )?,
             sc_sparse_select: ctx.compile_kernel(
-                shader_include::include_metal!("sc/sc_sparse_select/sc_sparse_select.metal"),
-                "sc_sparse_select",
+                crate::shaders::sc_sparse_select::SHADER,
+                crate::shaders::sc_sparse_select::ENTRY,
             )?,
             sc_sparse_gather: ctx.compile_kernel(
-                shader_include::include_metal!("sc/sc_sparse_gather/sc_sparse_gather.metal"),
-                "sc_sparse_gather",
+                crate::shaders::sc_sparse_gather::SHADER,
+                crate::shaders::sc_sparse_gather::ENTRY,
             )?,
         })
     }

@@ -5,19 +5,14 @@ use crate::safetensors::Error;
 use crate::shaders::KernelVariant;
 use crate::shaders::softmax_rows;
 
-const LOGIT_SOFTCAPPING_SHADER: &str =
-    shader_include::include_metal!("oracle/sampler/logit_softcapping/logit_softcapping.metal");
-const SCALE_LOGITS_SHADER: &str =
-    shader_include::include_metal!("oracle/sampler/scale_logits/scale_logits.metal");
+const LOGIT_SOFTCAPPING_SHADER: &str = crate::shaders::oracle::sampler::logit_softcapping::SHADER;
+const SCALE_LOGITS_SHADER: &str = crate::shaders::oracle::sampler::scale_logits::SHADER;
 const SCATTER_VOCAB_CHUNK_SHADER: &str =
-    shader_include::include_metal!("oracle/sampler/scatter_vocab_chunk/scatter_vocab_chunk.metal");
-const ARGMAX_ROWS_SHADER: &str =
-    shader_include::include_metal!("oracle/sampler/argmax_rows/argmax_rows.metal");
-const ROW_ENTROPY_SHADER: &str =
-    shader_include::include_metal!("oracle/sampler/row_entropy/row_entropy.metal");
-const SAMPLE_FROM_PROBS_SHADER: &str = shader_include::include_metal!(
-    "oracle/sampler/sample_from_probs_rows/sample_from_probs_rows.metal"
-);
+    crate::shaders::oracle::sampler::scatter_vocab_chunk::SHADER;
+const ARGMAX_ROWS_SHADER: &str = crate::shaders::oracle::sampler::argmax_rows::SHADER;
+const ROW_ENTROPY_SHADER: &str = crate::shaders::oracle::sampler::row_entropy::SHADER;
+const SAMPLE_FROM_PROBS_SHADER: &str =
+    crate::shaders::oracle::sampler::sample_from_probs_rows::SHADER;
 
 pub struct GpuSamplerKernels {
     pub copy_f32: ComputePipeline,

@@ -316,3 +316,9 @@ mod tests {
 }
 
 pub mod cpu;
+
+/// Subkernel: fused top-k over router probs (colocated `moe_router_topk.metal`,
+/// dispatched from step_kernel.rs).
+pub const TOPK_ENTRY: &str = "moe_router_topk";
+pub const TOPK_SHADER: &str =
+    shader_include::include_metal!("moe/moe_router/moe_router_topk.metal");

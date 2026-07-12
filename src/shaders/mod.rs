@@ -70,11 +70,15 @@ pub use oracle::sampler::{
     argmax_rows, gather_prob_cols, row_entropy, scatter_vocab_chunk, softmax_rows,
 };
 #[allow(unused_imports)]
+pub use sample::{compact_active_rows, scatter_logits_rows};
+#[allow(unused_imports)]
 pub use sample::{logit_rowstats, sample_apply, sample_commit, sample_rowstats, sample_write};
 #[allow(unused_imports)]
 pub use sc::sc_prob_cols;
 #[allow(unused_imports)]
 pub use sc::sc_prob_cols::cpu as sc_probs;
+#[allow(unused_imports)]
+pub use sc::{sc_sparse_gather, sc_sparse_select};
 
 #[allow(unused_imports)]
 pub use manifest::SwigluSplitVariant;

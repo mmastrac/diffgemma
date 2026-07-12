@@ -10,7 +10,7 @@ use crate::shaders::test_util::ElemFormat;
 
 pub const ENTRY: &str = "gqa_attention";
 
-const SHADER: &str = shader_include::include_metal!("attn/gqa_attention/gqa_attention.metal");
+pub const SHADER: &str = shader_include::include_metal!("attn/gqa_attention/gqa_attention.metal");
 
 #[derive(Debug, Clone)]
 pub enum MaskMode {

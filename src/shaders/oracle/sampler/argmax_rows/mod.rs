@@ -8,7 +8,8 @@ use crate::shaders::test_util::ElemFormat;
 
 pub const ENTRY: &str = "argmax_rows";
 
-const SHADER: &str = shader_include::include_metal!("oracle/sampler/argmax_rows/argmax_rows.metal");
+pub const SHADER: &str =
+    shader_include::include_metal!("oracle/sampler/argmax_rows/argmax_rows.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {

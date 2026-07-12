@@ -7,3 +7,8 @@ pub mod gemm_linear_grouped;
 pub mod gemm_q8_linear_f32;
 pub mod gemm_rowk;
 pub mod gemm_tunable;
+
+/// Engine simple-linear entry points (`bf16_gemm` / `f32_bf16_linear` /
+/// `f32_f32_linear` in `gemm.metal`) — compiled by src/metal/{engine,gemm}.rs.
+/// System includes only, so no include_metal! expansion is needed.
+pub const ENGINE_LINEAR_SHADER: &str = include_str!("gemm.metal");

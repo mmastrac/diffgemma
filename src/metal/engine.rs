@@ -9,7 +9,7 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-const GEMM_SHADER: &str = include_str!("../shaders/gemm/gemm.metal");
+const GEMM_SHADER: &str = crate::shaders::gemm::ENGINE_LINEAR_SHADER;
 const F32_BF16_LINEAR_ENTRY: &str = "f32_bf16_linear";
 const F32_F32_LINEAR_ENTRY: &str = "f32_f32_linear";
 
