@@ -9,6 +9,72 @@ use objc2_metal::{
     MTLFunctionConstantValues, MTLLibrary,
 };
 
+/// Caller-chosen function-constant axes for a GEMM subkernel compile. The rest
+/// (shape_assert / debug_fast / debug_deep / arena_f16 / n_tile) come from the
+/// runtime [`KernelVariant`]. Named fields replace what was a trailing run of
+/// four positional bools on `compile_gemm_subkernel_on_device`.
+#[derive(Clone, Copy)]
+pub(crate) struct GemmCompileConfig {
+    pub gemm_n: u32,
+    pub gemm_k: u32,
+    pub is_full_layer: bool,
+    pub quant_format: u32,
+    /// FC10: f16 activation (A) input.
+    pub x_fp16: bool,
+    /// FC28 GATHER_A: fused-MoE gate_up gathers bf16 `moein` rows in the A-load.
+    pub gather_a: bool,
+    /// FC29: force bf16 output (lm_head logits — f16 acts, bf16-range logits).
+    pub out_bf16: bool,
+    /// FC30 K_ROWK_OUT_ARENA: arena-overwrite output mode of `gemm_rowk`.
+    pub out_arena: bool,
+}
+
+impl GemmCompileConfig {
+    /// Default raw path (no gather / bf16-out / arena override).
+    pub fn raw(
+        gemm_n: u32,
+        gemm_k: u32,
+        is_full_layer: bool,
+        quant_format: u32,
+        x_fp16: bool,
+    ) -> Self {
+        Self {
+            gemm_n,
+            gemm_k,
+            is_full_layer,
+            quant_format,
+            x_fp16,
+            gather_a: false,
+            out_bf16: false,
+            out_arena: false,
+        }
+    }
+
+    /// FC29 bf16 output (lm_head logits).
+    pub fn out_bf16(gemm_n: u32, gemm_k: u32, quant_format: u32) -> Self {
+        Self {
+            out_bf16: true,
+            ..Self::raw(gemm_n, gemm_k, false, quant_format, false)
+        }
+    }
+
+    /// FC28 GATHER_A (fused-MoE gate_up).
+    pub fn gather(gemm_n: u32, gemm_k: u32, quant_format: u32) -> Self {
+        Self {
+            gather_a: true,
+            ..Self::raw(gemm_n, gemm_k, false, quant_format, false)
+        }
+    }
+
+    /// FC30 arena-overwrite output (`gemm_rowk` SC softembed).
+    pub fn rowk_arena(gemm_n: u32, gemm_k: u32, quant_format: u32, x_fp16: bool) -> Self {
+        Self {
+            out_arena: true,
+            ..Self::raw(gemm_n, gemm_k, false, quant_format, x_fp16)
+        }
+    }
+}
+
 pub struct MetalContext {
     pub device: Retained<ProtocolObject<dyn MTLDevice>>,
     pub queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
@@ -80,14 +146,7 @@ impl MetalContext {
             &self.device,
             &library,
             entry,
-            gemm_n,
-            gemm_k,
-            is_full_layer,
-            quant_format,
-            x_fp16,
-            false,
-            false,
-            false,
+            &GemmCompileConfig::raw(gemm_n, gemm_k, is_full_layer, quant_format, x_fp16),
         )
     }
 
@@ -106,14 +165,7 @@ impl MetalContext {
             &self.device,
             &library,
             entry,
-            gemm_n,
-            gemm_k,
-            false,
-            quant_format,
-            false,
-            false,
-            true,
-            false,
+            &GemmCompileConfig::out_bf16(gemm_n, gemm_k, quant_format),
         )
     }
 
@@ -132,14 +184,7 @@ impl MetalContext {
             &self.device,
             &library,
             entry,
-            gemm_n,
-            gemm_k,
-            false,
-            quant_format,
-            false,
-            true,
-            false,
-            false,
+            &GemmCompileConfig::gather(gemm_n, gemm_k, quant_format),
         )
     }
 
@@ -160,14 +205,7 @@ impl MetalContext {
             &self.device,
             &library,
             entry,
-            gemm_n,
-            gemm_k,
-            false,
-            quant_format,
-            x_fp16,
-            false,
-            false,
-            true,
+            &GemmCompileConfig::rowk_arena(gemm_n, gemm_k, quant_format, x_fp16),
         )
     }
 
@@ -344,15 +382,18 @@ impl MetalContext {
         device: &ProtocolObject<dyn MTLDevice>,
         library: &ProtocolObject<dyn MTLLibrary>,
         entry: &str,
-        gemm_n: u32,
-        gemm_k: u32,
-        is_full_layer: bool,
-        quant_format: u32,
-        x_fp16: bool,
-        gather_a: bool,
-        out_bf16: bool,
-        out_arena: bool,
+        cfg: &GemmCompileConfig,
     ) -> Result<ComputePipeline, Error> {
+        let GemmCompileConfig {
+            gemm_n,
+            gemm_k,
+            is_full_layer,
+            quant_format,
+            x_fp16,
+            gather_a,
+            out_bf16,
+            out_arena,
+        } = *cfg;
         let variant = crate::shaders::variant::runtime_step_variant();
         let fc = MTLFunctionConstantValues::new();
         let shape_assert = variant.shape_assert;
