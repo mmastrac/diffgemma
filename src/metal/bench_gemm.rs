@@ -107,8 +107,9 @@ pub fn bench_gemm_block_q4(shapes: &[GemmShape], iters: usize) -> Result<Vec<Gem
             m,
             n,
             k,
+            global_scale: 1.0,
         };
-        let w_q4 = fixture.w_q4();
+        let w_q4 = gemm_q4::w_q4(&fixture);
         let buf_x = pool
             .allocate(&ctx.device, m * k * 2)
             .ok_or(Error::Format("bench gemm_block x"))?;
@@ -185,8 +186,9 @@ pub fn bench_gemm_tunable(shapes: &[GemmShape], iters: usize) -> Result<Vec<Gemm
             m,
             n,
             k,
+            global_scale: 1.0,
         };
-        let w_q4 = fixture.w_q4();
+        let w_q4 = gemm_q4::w_q4(&fixture);
         let buf_x = pool
             .allocate(&ctx.device, m * k * 2)
             .ok_or(Error::Format("bench tunable x"))?;

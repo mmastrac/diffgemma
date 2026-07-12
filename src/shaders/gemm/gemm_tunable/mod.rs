@@ -289,7 +289,7 @@ pub(crate) fn gpu_dense_tunable_nvfp4(
 
     let ctx = MetalContext::new()?;
     let mut pool = BufferPool::new();
-    let w_nvfp4 = f.w_nvfp4();
+    let w_nvfp4 = crate::shaders::gemm_nvfp4::w_nvfp4(f);
     let buf_x = pool
         .allocate(&ctx.device, f.m * f.k * 2)
         .ok_or(Error::Format("alloc x"))?;
