@@ -394,6 +394,7 @@ pub fn gqa_attention(
 }
 
 /// Incremental encoder prefill: causal attention over cached KV + new tokens; appends K/V.
+#[allow(dead_code)]
 pub fn forward_encoder_extend(
     out: &mut [f32],
     hidden: &[f32],

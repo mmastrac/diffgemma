@@ -188,6 +188,7 @@ impl GpuDecoderScratch {
     }
 }
 
+#[allow(dead_code)]
 pub struct BenchConfig {
     pub max_layers: usize,
 }

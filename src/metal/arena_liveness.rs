@@ -12,6 +12,7 @@ use crate::metal::step_quant::StepBlockProfile;
 #[repr(u8)]
 pub enum ArenaPlane {
     Hidden = 0,
+    #[allow(dead_code)]
     Resid,
     AttnQ,
     AttnK,
@@ -81,7 +82,6 @@ impl std::error::Error for ArenaLivenessError {}
 
 #[derive(Clone, Copy)]
 struct LivenessCtx<'a> {
-    first_step: u32,
     layer: usize,
     layer_info: Option<&'a LayerOffsets>,
     finish: StepFinishMode,
@@ -166,7 +166,7 @@ fn apply_stage_aliases(stage: StepStage, ctx: LivenessCtx<'_>, live: &mut ArenaL
     }
 }
 
-pub fn stage_arena_access(stage: StepStage, ctx: LivenessCtx<'_>) -> StageArenaAccess {
+fn stage_arena_access(stage: StepStage, ctx: LivenessCtx<'_>) -> StageArenaAccess {
     use StepStage::*;
     match stage {
         ScLogitRowstats => StageArenaAccess {
@@ -340,7 +340,6 @@ pub fn check_step_arena_liveness(
 
     for stage in build_preamble(first_step) {
         let ctx = LivenessCtx {
-            first_step,
             layer: 0,
             layer_info: None,
             finish,
@@ -354,7 +353,6 @@ pub fn check_step_arena_liveness(
         let layer_info = &layout.layers[layer];
         for &stage in &schedule.per_layer {
             let ctx = LivenessCtx {
-                first_step,
                 layer,
                 layer_info: Some(layer_info),
                 finish,
@@ -374,7 +372,6 @@ pub fn check_step_arena_liveness(
         ) {
             if !sampler_checked && finish == StepFinishMode::Full {
                 let ctx = LivenessCtx {
-                    first_step,
                     layer: 0,
                     layer_info: None,
                     finish,
@@ -386,7 +383,6 @@ pub fn check_step_arena_liveness(
             continue;
         }
         let ctx = LivenessCtx {
-            first_step,
             layer: 0,
             layer_info: None,
             finish,
@@ -483,7 +479,6 @@ mod tests {
     fn uninitialized_read_is_caught() {
         let mut live = ArenaLiveness::new();
         let ctx = LivenessCtx {
-            first_step: 1,
             layer: 0,
             layer_info: None,
             finish: StepFinishMode::Full,

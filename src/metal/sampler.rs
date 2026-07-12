@@ -1,14 +1,14 @@
 //! GPU entropy-bound sampler: logits stay on device; read back scalars + canvas only.
+//!
+//! ORACLE-ONLY: the decode-engine sampler (validation path). The dispatch
+//! helpers here are exercised by parity tests, not the production step path
+//! (which samples via `shaders::sample::*` + `step_kernel`).
+#![allow(dead_code)]
 
-use crate::metal::batch::{GpuBatch, begin_engine_batch, set_bytes};
+use crate::metal::batch::{GpuBatch, set_bytes};
 use crate::metal::buffer::BufferPool;
-use crate::metal::engine::GpuDecoderEngine;
 use crate::metal::sampler_kernels::GpuSamplerKernels;
 use crate::safetensors::Error;
-use crate::sample::{
-    Rng, SamplerConfig, StableConfidentStopper, accept_canvas_from_entropies,
-    denoise_steps_completed, renoise_canvas,
-};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder, MTLDevice};

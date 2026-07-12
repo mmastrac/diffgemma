@@ -1,19 +1,10 @@
 //! End-to-end block diffusion generation (CPU decoder; optional Metal GPU decoder).
 
-use crate::config::ModelConfig;
-use crate::model::decoder::{DecoderForwardInput, DecoderScratch};
-use crate::model::encoder::extend_prefill;
-use crate::model::encoder::{EncoderPrefillInput, EncoderScratch, prefill};
-use crate::model::kv_cache::KvCache;
-use crate::model::mask::DecoderAttnMask;
 use crate::safetensors::Error;
-use crate::sample::{
-    Rng, SamplerConfig, StableConfidentStopper, accept_canvas, apply_temperature, argmax_canvas,
-    denoise_steps_completed, initialize_canvas, renoise_canvas, sample_canvas,
-};
-use crate::weights::WeightStore;
+use crate::sample::SamplerConfig;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // some fields are consumed only by parity/golden test paths
 pub struct GenerateConfig {
     pub sampler: SamplerConfig,
     pub max_new_tokens: usize,

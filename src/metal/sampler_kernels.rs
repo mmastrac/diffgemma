@@ -1,4 +1,7 @@
 //! GPU sampler kernels (logit post-process, entropy, argmax, categorical sample).
+//!
+//! ORACLE-ONLY: the decode-engine sampler pipeline handles (validation path).
+#![allow(dead_code)]
 
 use crate::metal::device::{ComputePipeline, MetalContext};
 use crate::safetensors::Error;

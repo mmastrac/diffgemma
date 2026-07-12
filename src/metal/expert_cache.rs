@@ -21,6 +21,7 @@ pub const BUFFER_POOL_FUDGE_BYTES: u64 = 64 * 1024 * 1024;
 pub const BUFFER_POOL_LARGE_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Default)]
+#[allow(dead_code)] // stats surface read by diagnostics/tests
 pub struct ExpertCacheStats {
     pub budget_bytes: u64,
     pub used_bytes: u64,
@@ -191,6 +192,7 @@ impl ExpertLruCache {
         self.touch(layer, expert);
     }
 
+    #[allow(dead_code)]
     fn resident_bytes(&self) -> u64 {
         self.used_bytes
     }
@@ -211,6 +213,7 @@ impl ExpertWeightCache {
         self.inner.stats()
     }
 
+    #[allow(dead_code)]
     pub fn resident_bytes(&self) -> u64 {
         self.inner.resident_bytes()
     }

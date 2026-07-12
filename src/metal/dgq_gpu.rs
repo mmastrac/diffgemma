@@ -227,6 +227,7 @@ impl Q4LinearGpu {
     }
 
     /// (MTLBuffer, rebased offset) for GPU binds — region-aware.
+    #[allow(dead_code)]
     pub fn mtl_buffer_and_offset(&self) -> (&ProtocolObject<dyn MTLBuffer>, u64) {
         self.blob.buffer_for(self.byte_offset)
     }

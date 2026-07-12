@@ -1,5 +1,5 @@
 //! ORACLE (not production): validation twin of `gemm_tunable` dense nvfp4.
-//! Kernel source lives in `shaders/oracle/gemm_block.metal`; see that README.
+//! Kernel source lives in `oracle/gemm/gemm_block/gemm_block.metal`; see that README.
 //!
 //! Tiled NVFP4 GEMM: `y[M,N] = x[M,K] @ Wnvfp4[N,K]^T` (monolith `k_gemm_nvfp4` body).
 

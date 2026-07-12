@@ -1,5 +1,5 @@
 // Canonical per-kernel IDs for debug status reporting (P3.7).
-// Keep in sync with src/kernels/sub/dbg_kernel.rs.
+// Keep in sync with src/shaders/common/dbg_kernel.rs.
 
 #ifndef DGQ_KERNELS_METAL
 #define DGQ_KERNELS_METAL

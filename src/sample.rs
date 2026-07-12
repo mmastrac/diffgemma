@@ -1,6 +1,11 @@
 //! Entropy-bound block diffusion sampler (CPU).
 //!
 //! Matches HuggingFace `EntropyBoundSampler` and `LinearTemperatureScheduleLogitsProcessor`.
+//!
+//! CPU reference/policy module: the config + temperature-schedule types are
+//! live in production, while the CPU denoise-loop reference (accept/renoise/
+//! sample_canvas, `StableConfidentStopper`) is exercised only by parity tests.
+#![allow(dead_code)]
 
 use crate::shaders::cpu::softmax_rows;
 

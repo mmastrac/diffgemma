@@ -121,6 +121,7 @@ impl<D: TextDecoder> StreamDecoder<D> {
     }
 
     /// The immutable committed reply text so far.
+    #[allow(dead_code)]
     pub fn committed_text(&self) -> &str {
         &self.committed_text
     }

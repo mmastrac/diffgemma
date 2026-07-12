@@ -27,6 +27,7 @@ const Q: &str = "<|\"|>";
 
 /// Format OpenAI `tools` into the concatenated `<|tool>…<tool|>` declaration
 /// blocks the model expects in the system turn. Returns "" for no tools.
+#[allow(dead_code)]
 pub fn format_tool_declarations(tools: &[Value]) -> String {
     tools
         .iter()

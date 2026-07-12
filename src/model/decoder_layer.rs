@@ -376,6 +376,7 @@ pub fn forward_encoder(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn forward_encoder_extend(
     out: &mut [f32],
     hidden_states: &[f32],

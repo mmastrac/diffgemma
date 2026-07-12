@@ -45,6 +45,7 @@ impl LayerKv {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn append_kv(
         &mut self,
         keys: &[f32],
@@ -130,6 +131,7 @@ impl KvCache {
         self.kv_len += append_len;
     }
 
+    #[allow(dead_code)]
     pub fn describe_layer(&self, layer: usize) -> String {
         if let Some(kv) = self.layer(layer) {
             format!(

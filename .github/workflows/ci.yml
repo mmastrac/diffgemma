@@ -35,8 +35,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build
+      - name: Build (rustc-warning-clean gate)
         run: cargo build --release
+        env:
+          # The release build is warning-zero (2026-07-12 cleanup); keep it that
+          # way. Step-scoped so the test compile below (which still carries
+          # test-only dead_code) is not gated here.
+          RUSTFLAGS: "-D warnings"
       - name: Test (single-threaded — parallel GPU tests crash)
         run: cargo test --release -- --test-threads=1
 

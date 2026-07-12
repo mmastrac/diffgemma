@@ -145,6 +145,7 @@ pub fn infer_monolithic_fixture_name(
     })
 }
 
+#[allow(dead_code)]
 pub fn infer_fixture_name(
     prompt_text: Option<&str>,
     steps: usize,

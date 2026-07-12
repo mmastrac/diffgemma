@@ -269,6 +269,7 @@ impl GpuLayerWeightCache {
         })
     }
 
+    #[allow(dead_code)]
     pub fn resident_bytes(&self) -> u64 {
         let mut bytes = (self.input_layernorm.len()
             + self.q_norm.len()
@@ -627,6 +628,7 @@ impl GpuDecoderWeightCache {
         }
     }
 
+    #[allow(dead_code)]
     pub fn resident_bytes(&self) -> u64 {
         match self {
             Self::Dgq(d) => d.blob.len as u64 + d.final_norm.len() as u64 * 4,

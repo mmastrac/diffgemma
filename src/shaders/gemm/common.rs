@@ -3,9 +3,7 @@
 pub const THREADS_PER_TG: usize = 128;
 pub const M_TILE: usize = 32;
 
-pub fn div_up(value: usize, group: usize) -> usize {
-    (value + group - 1) / group
-}
+pub use crate::shaders::gpu_common::div_up;
 
 /// N-axis tile width for the block GEMM family.
 pub fn n_tile() -> usize {

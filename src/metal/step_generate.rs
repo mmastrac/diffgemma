@@ -411,12 +411,14 @@ impl StepGenerateSession {
     /// stored KV between prefill and denoise (E16 fusion replay: rewrite aged
     /// full-layer rows, then re-enter generation on the doctored cache).
     /// Diagnostic only — production code goes through the runtime.
+    #[allow(dead_code)]
     pub(crate) fn kv_buffer_for_test(
         &self,
     ) -> &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer> {
         self.rt.kvcache()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn layout_for_test(&self) -> &crate::metal::step_kernel::ModelLayout {
         self.rt.layout()
     }
@@ -428,6 +430,7 @@ impl StepGenerateSession {
     /// wrong context. So: keep the KV only when the cached tokens are a genuine
     /// prefix of `prompt` (an extension → reuse prefills just the delta);
     /// otherwise drop it and re-prefill from scratch.
+    #[allow(dead_code)]
     pub fn reset_kv_unless_extends(&mut self, prompt: &[u32]) {
         let kept = longest_common_prefix(&self.kv_valid_tokens, prompt);
         if kept < self.kv_valid_tokens.len() {
@@ -721,7 +724,7 @@ pub fn generate_with_session(
             let mut low_ent_hist = Vec::new();
             let mut last_st;
             let mut prev_step_argmax: Option<[u32; CANVAS]> = None;
-            let mut prefix_stable_streak = 0u32;
+            let prefix_stable_streak = 0u32;
             loop {
                 let step_started = Instant::now();
                 rt.run_denoise_step()?;

@@ -1,5 +1,5 @@
 //! ORACLE (not production): validation twin of `gemm_tunable` dense raw (bf16).
-//! Kernel source lives in `shaders/oracle/gemm_block.metal`; see that README.
+//! Kernel source lives in `oracle/gemm/gemm_block/gemm_block.metal`; see that README.
 //!
 //! Tiled bf16-weight GEMM: `y[M,N] = x[M,K] @ W[N,K]^T` with bf16 weights (no
 //! quantization). CONSOLIDATED into `gemm_block` (the unified plain GEMM) via the

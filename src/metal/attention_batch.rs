@@ -80,6 +80,7 @@ pub fn rope_qk_batched(
 
 /// RoPE canvas K in-place at `k_canvas_elem_offset` within `k_buf`, RoPE Q in pool buffer, then GQA.
 /// `k_buf`/`v_buf` must already hold encoder prefix; canvas V written at the same suffix offset.
+#[allow(dead_code)]
 pub fn decoder_gqa_gpu_kv_batched(
     batch: &mut GpuBatch<'_>,
     kernels: &GpuAttentionKernels,

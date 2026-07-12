@@ -55,6 +55,7 @@ impl BufferPool {
         }
     }
 
+    #[allow(dead_code)]
     pub fn write_f32_at_offset(
         buffer: &ProtocolObject<dyn MTLBuffer>,
         byte_offset: usize,

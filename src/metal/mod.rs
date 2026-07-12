@@ -47,16 +47,19 @@ mod step_quant;
 mod telemetry;
 mod weights;
 
+// Re-exports consumed only by in-crate tests. Test-gated so the non-test build
+// stays warning-clean under `-D warnings` (the binary never uses these paths).
+#[cfg(test)]
 pub use dgq_gpu::DgqGpuBlob;
-pub use memory::{estimate_decoder_forward, estimate_paged_layer_bytes};
+#[cfg(test)]
+pub use step_kernel::build_offsets_from_store;
 
 pub use attention::GpuAttention;
 pub use bench_gemm::{
     bench_custom_kernel, bench_gemm_bf16, bench_gemm_block_q4, bench_gemm_tunable,
     bench_gemm_tunable_sparse, bench_mpsgraph_oracle, parse_shapes, print_bench_rows,
 };
-pub use decoder::{BenchConfig, GpuDecoderScratch, forward as decoder_forward, load_weight_cache};
-pub use encoder_extend::prefill_gpu;
+pub use decoder::GpuDecoderScratch;
 pub use engine::GpuDecoderEngine;
 pub use gemm::{Bf16Gemm, bf16_matmul_cpu, f32_to_bf16};
 pub use kv_cache::GpuKvCache;
@@ -64,20 +67,19 @@ pub use probe::{print_probe_result, probe_device};
 pub use step_attn_dump::{run_step_attn_layer_dump, write_step_attn_layer_dump};
 pub use step_config::{log_validated_step_model, validate_step_model};
 pub use step_generate::{
-    KvCheckpoint, KvSnapshot, StepGenerateConfig, StepGenerateSession, StepObserver,
-    StepProgressEvent, generate_monolithic, generate_with_session,
+    KvSnapshot, StepGenerateConfig, StepGenerateSession, StepObserver, StepProgressEvent,
+    generate_monolithic, generate_with_session,
 };
 pub use step_kernel::{
     CANVAS, CanvasState, EncodeSubProfileResult, FROZEN_WORDS, HID, LayerEncodeSubProfile,
-    LayerOffsets, MOE_FF, MOE_MAX_BLOCKS, MoeEncodeSubProfile, N_EXPERTS, PREFILL_M, PREFILL_SUBS,
-    RouteScratch, StepFinishMode, StepParams, StepSmokeConfig, TOP_K, bench_fused_gemm_dispatches,
+    LayerOffsets, MOE_FF, MOE_MAX_BLOCKS, MoeEncodeSubProfile, N_EXPERTS, PREFILL_M, RouteScratch,
+    StepFinishMode, StepParams, StepSmokeConfig, TOP_K, bench_fused_gemm_dispatches,
     bench_step_kernel, bench_step_kernel_encode_subprofile, bench_step_kernel_profile,
-    bench_step_kernel_profile_steps, build_offsets_from_store, build_step_runtime, fill_token_slot,
-    layer_moe_block_jobs, run_embed_row_gpu, run_step_probe, run_step_smoke, trace_entropy_enabled,
+    bench_step_kernel_profile_steps, fill_token_slot, layer_moe_block_jobs, run_embed_row_gpu,
+    run_step_probe, run_step_smoke,
 };
 pub use step_kv::{
-    MonolithicEncoderCache, prefill_monolithic_kv_with_cache, run_step_attn_probe,
-    run_step_kv_audit, run_step_kv_bf16_cross_parity, run_step_kv_parity,
+    run_step_attn_probe, run_step_kv_audit, run_step_kv_bf16_cross_parity, run_step_kv_parity,
 };
 pub use step_logits_dump::{
     parse_positions, run_step_bf16_oracle_logits_dump, run_step_bf16_oracle_logits_dump_gpu_kv,
@@ -99,4 +101,3 @@ pub use step_moe_single_dump::{
 pub use step_preamble_dump::{run_step_preamble_dump, write_step_preamble_dump};
 pub use step_quant::BlockGroupedJob;
 pub use telemetry::{ForwardTelemetry, SessionTelemetry, StepPhaseTelemetry};
-pub use weights::GpuDecoderWeightCache;

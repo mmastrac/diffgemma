@@ -1,10 +1,9 @@
 //! CPU reference for monolithic sampler kernels (tempered rowstats, commit, apply, write).
 
-use crate::sample::{
-    ARGMAX_HIST_MAX, accept_mask_from_entropies, accept_mask_sig, diffusion_append_argmax_hist,
-    diffusion_argmax_canvas_stable,
-};
 use crate::sample::{STOP_FLAG_CONFIDENT, STOP_FLAG_MAX_STEPS, STOP_FLAG_PLATEAU};
+use crate::sample::{
+    accept_mask_sig, diffusion_append_argmax_hist, diffusion_argmax_canvas_stable,
+};
 
 /// Temperature after `steps_done` denoise iterations (matches `temp_at` in Metal).
 pub fn temp_at(steps_done: u32, max_steps: u32, t_min: f32, t_max: f32) -> f32 {
@@ -223,7 +222,7 @@ pub fn sample_write_cpu(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sample::{FILLER_TOKEN_ID, PAD_TOKEN_ID};
+    use crate::sample::{ARGMAX_HIST_MAX, FILLER_TOKEN_ID, PAD_TOKEN_ID};
 
     #[test]
     fn temp_at_matches_sample_rs() {

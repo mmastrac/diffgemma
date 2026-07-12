@@ -21,7 +21,6 @@ dependencies = [
 name = "diffgemma-mps"
 version = "0.1.0"
 dependencies = [
- "block2",
  "memmap2",
  "objc2",
  "objc2-foundation",

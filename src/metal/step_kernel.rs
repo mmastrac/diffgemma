@@ -77,12 +77,12 @@ use crate::metal::arena_layout::{ArenaLayout, ArenaLayoutParams, build_arena_lay
 // All DGQ_* env flags live in crate::flags; re-exported here so existing
 // `step_kernel::<flag>()` call sites keep working.
 pub use crate::flags::{
-    FAST_PREFILL_MIN_TOKENS, attn_mma_enabled, attn_mma_full_enabled, attn_window_enabled,
-    denoise_parity_log_enabled, denoise_parity_log_positions, denoiser_argmax_enabled,
-    final_entropy_log_enabled, freeze_enabled, fused_algebra_enabled, fused_gate_up_enabled,
-    fused_qkv_enabled, logits_finite_check_enabled, logits_finite_sample_count,
-    moe_fuse_gather_enabled, partial_lm_head_enabled, prefill_batch_enabled, router_gemm_enabled,
-    sc_sparse_enabled, should_fast_prefill, step_text_log_enabled, trace_entropy_enabled,
+    attn_mma_enabled, attn_mma_full_enabled, attn_window_enabled, denoise_parity_log_enabled,
+    denoise_parity_log_positions, denoiser_argmax_enabled, final_entropy_log_enabled,
+    freeze_enabled, fused_gate_up_enabled, fused_qkv_enabled, logits_finite_check_enabled,
+    logits_finite_sample_count, moe_fuse_gather_enabled, partial_lm_head_enabled,
+    prefill_batch_enabled, router_gemm_enabled, sc_sparse_enabled, should_fast_prefill,
+    step_text_log_enabled, trace_entropy_enabled,
 };
 
 pub const MAX_ATTN_Q_COLS: usize = 8192;
@@ -699,7 +699,9 @@ struct StepPipelines {
     /// TUNE_BM the wide sparse pipelines were compiled with (the block
     /// height moe_bucket_fill phase 1 must build during batched prefill).
     sparse_wide_bm: u32,
+    #[allow(dead_code)]
     gemm_q8_rowk: HashMap<(u32, u32), ComputePipeline>,
+    #[allow(dead_code)]
     gemm_q8_rowk_xfp16: HashMap<(u32, u32), ComputePipeline>,
     /// f32-accumulate variant of `gemm_q8_rowk` for chunked SC softembed (avoids per-chunk bf16 round).
     gemm_q8_rowk_acc_f32: HashMap<(u32, u32), ComputePipeline>,
@@ -1119,12 +1121,14 @@ impl StepPipelines {
             .get(&(n, k, gather, format as u32))
     }
 
+    #[allow(dead_code)]
     fn q8_rowk_xfp16(&self, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
         self.gemm_q8_rowk_xfp16
             .get(&(n, k))
             .ok_or(Error::Format("missing q8 rowk fp16-input pipeline"))
     }
 
+    #[allow(dead_code)]
     fn q8_rowk(&self, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
         self.gemm_q8_rowk
             .get(&(n, k))
@@ -1828,6 +1832,7 @@ impl StepEnc<'_> {
     }
 
     /// probs [M,K] half buffer → arena y_off [M,N] via q8 weights indexed by K.
+    #[allow(dead_code)]
     fn gemm_q8_rowk_half(
         &mut self,
         x_buf: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
@@ -1950,6 +1955,7 @@ impl StepEnc<'_> {
         self.dispatch_1d(&self.ps.f32_to_half_scale, len, 256);
     }
 
+    #[allow(dead_code)]
     fn scale_half_arena(&mut self, y_off: u64, elems: usize, scale: f32) {
         // convert_scale (arena->arena, in-place): same buffer @0 and @1.
         self.sink_set_pipeline(&self.ps.half_scale);
@@ -2660,7 +2666,11 @@ impl StepEnc<'_> {
         Ok(())
     }
 
-    fn encode_layer_moe_scalar(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
+    fn encode_layer_moe_scalar(
+        &mut self,
+        layer: usize,
+        _layout: &ModelLayout,
+    ) -> Result<(), Error> {
         let fm = self.forward_m;
         let layer_off = layer_byte_offset(layer);
         self.sink_set_pipeline(self.ps.moe_scalar(self.block_profile.format));
@@ -3939,6 +3949,7 @@ fn alloc_buffer(
 /// Keepalive + auto-cleanup for a `DGQ_KV_MMAP` file-backed KV buffer. Holds the
 /// mapping the Metal buffer wraps no-copy; removes the backing file on drop.
 struct KvMmapBacking {
+    #[allow(dead_code)]
     mmap: memmap2::MmapMut,
     path: std::path::PathBuf,
 }
@@ -4061,7 +4072,7 @@ pub fn log_final_per_token_entropy(
     label: &str,
     state: &CanvasState,
     stop_flag: u32,
-    eos_token_id: u32,
+    _eos_token_id: u32,
 ) {
     use crate::sample::{
         EarlyStopKind, FILLER_TOKEN_ID, PAD_TOKEN_ID, decode_early_stop_flag, is_active_token,
@@ -4474,7 +4485,7 @@ impl StepRuntime {
         type RangePeaks = std::collections::BTreeMap<&'static str, (f32, bool, Option<usize>)>;
         let mut range_peaks: Option<RangePeaks> =
             crate::flags::trace_ranges_enabled().then(RangePeaks::new);
-        let mut probe_planes = |this: &Self, m_rows: usize, peaks: &mut RangePeaks| {
+        let probe_planes = |this: &Self, m_rows: usize, peaks: &mut RangePeaks| {
             let a = &this.bufs.arena_map;
             for (label, off, per_row) in [
                 ("hidden", a.hidden_off(), HID),
@@ -4743,7 +4754,7 @@ impl StepRuntime {
         enc.enc.endEncoding();
         cmd.commit();
         cmd.waitUntilCompleted();
-        if let Some(err) = unsafe { cmd.error() } {
+        if let Some(err) = cmd.error() {
             return Err(Error::Format(
                 format!(
                     "step dispatch command buffer failed: {}",
@@ -6734,6 +6745,7 @@ pub struct FusedGemmDispatchBenchResult {
     pub gate_up_batched_split: std::time::Duration,
     pub qkv_stacked_dispatches_per_pass: usize,
     pub qkv_split_dispatches_per_pass: usize,
+    #[allow(dead_code)]
     pub gate_up_dispatches_per_pass: usize,
 }
 
@@ -6856,7 +6868,6 @@ pub fn bench_fused_gemm_dispatches(
     cfg: StepSmokeConfig,
     iters: usize,
 ) -> Result<FusedGemmDispatchBenchResult, Error> {
-    use std::time::Instant;
     let iters = iters.max(1);
     let (mut rt, build) = build_step_runtime(model_dir, &cfg)?;
     let layout = rt.layout;
@@ -7699,7 +7710,7 @@ mod tests {
         }
 
         fn forward_row0_logits(dir: &Path, cfg: &StepSmokeConfig, fused: bool) -> Vec<f32> {
-            let mut fcfg = crate::flags::Config::default();
+            let mut fcfg = crate::flags::RuntimeConfig::default();
             fcfg.perf.fused_algebra = fused;
             let _g = crate::flags::install_for_test(fcfg);
             let mut cfg = cfg.clone();
@@ -7751,7 +7762,7 @@ mod tests {
         smoke.steps = 1;
         smoke.prefill_token_ids = Some(vec![23391u32]);
         let (st_off, logits_off) = {
-            let mut c = crate::flags::Config::default();
+            let mut c = crate::flags::RuntimeConfig::default();
             c.perf.fused_algebra = false;
             let _g = crate::flags::install_for_test(c);
             let (mut rt_off, _) = build_step_runtime(dir, &smoke).expect("rt off");
@@ -7762,7 +7773,7 @@ mod tests {
             )
         };
         let (st_on, logits_on) = {
-            let mut c = crate::flags::Config::default();
+            let mut c = crate::flags::RuntimeConfig::default();
             c.perf.fused_algebra = true;
             let _g = crate::flags::install_for_test(c);
             let (mut rt_on, _) = build_step_runtime(dir, &smoke).expect("rt on");

@@ -253,9 +253,7 @@ fn set_bytes<T>(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, value: &
 }
 
 #[cfg(target_os = "macos")]
-fn div_up(value: usize, group: usize) -> usize {
-    (value + group - 1) / group
-}
+use crate::shaders::gpu_common::div_up;
 
 #[cfg(test)]
 mod tests {

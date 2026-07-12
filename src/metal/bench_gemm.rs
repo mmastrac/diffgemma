@@ -583,8 +583,7 @@ pub fn bench_gemm_tunable_sparse(iters: usize) -> Result<Vec<GemmBenchRow>, Erro
     use crate::metal::device::MetalContext;
     use crate::metal::{BlockGroupedJob, RouteScratch};
     use objc2_metal::{
-        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-        MTLSize,
+        MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
     };
 
     let ctx = MetalContext::new()?;

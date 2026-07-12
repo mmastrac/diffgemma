@@ -3,9 +3,8 @@
 use crate::config::TextConfig;
 use crate::metal::expert_cache::{
     BUFFER_POOL_FUDGE_BYTES, BUFFER_POOL_LARGE_BYTES, EXPERT_MAX_FRACTION_OF_RESIDENT_CAP,
-    ExpertCacheStats, GPU_RESIDENT_FRACTION, expert_entry_bytes,
+    GPU_RESIDENT_FRACTION, expert_entry_bytes,
 };
-use crate::metal::weights::GpuDecoderWeightCache;
 
 #[cfg(target_os = "macos")]
 use objc2::runtime::ProtocolObject;
@@ -30,6 +29,7 @@ impl MemoryEstimate {
             + self.logits_bytes
     }
 
+    #[allow(dead_code)]
     pub fn print_summary(&self, label: &str) {
         println!("{label} memory estimate (resident, approximate):");
         println!(

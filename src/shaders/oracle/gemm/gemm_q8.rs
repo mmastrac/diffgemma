@@ -1,5 +1,5 @@
 //! ORACLE (not production): validation twin of `gemm_tunable` dense q8. Kernel
-//! source lives in `shaders/oracle/gemm_block.metal`; see that dir's README.
+//! source lives in `oracle/gemm/gemm_block/gemm_block.metal`; see that dir's README.
 //!
 //! Tiled Q8 GEMM: `y[M,N] = x[M,K] @ Wq8[N,K]^T` (monolith `k_gemm_q8` body).
 

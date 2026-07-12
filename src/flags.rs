@@ -1,12 +1,12 @@
 //! Central runtime configuration.
 //!
-//! Every `DGQ_*` env flag is parsed EXACTLY ONCE into a [`Config`] value; all
+//! Every `DGQ_*` env flag is parsed EXACTLY ONCE into a [`RuntimeConfig`] value; all
 //! runtime accessors read it through [`config`]. This replaces the old scatter
 //! of per-call `std::env::var` reads:
 //!
 //! - **Production** reads a shared, read-only base lazily loaded from
-//!   [`Config::from_env`] once (`base`).
-//! - **Tests** craft an explicit [`Config`] and install it for their scope via
+//!   [`RuntimeConfig::from_env`] once (`base`).
+//! - **Tests** craft an explicit [`RuntimeConfig`] and install it for their scope via
 //!   [`install_for_test`] — a THREAD-LOCAL override (RAII guard restores the
 //!   prior value on drop). Thread-local so a stray override can never leak into
 //!   another test (libtest runs each on its own thread) or another reader. No
@@ -25,7 +25,7 @@
 //! Deliberate exceptions still read env directly: test-only probe-prompt knobs
 //! that are passed from the command line into `#[ignore]`d diagnostics
 //! (`DGQ_E15_PROMPT`, `DGQ_E8_PROMPT`, `DGQ_E16_CARRIER` in step_kv.rs — a
-//! crafted Config can't inject those), and the system-env fallbacks
+//! crafted RuntimeConfig can't inject those), and the system-env fallbacks
 //! `XDG_CACHE_HOME`/`HOME` (pipeline_cache.rs) / `COLUMNS` (chat_ui.rs).
 
 use std::cell::RefCell;
@@ -49,7 +49,7 @@ fn env_on_if_one(name: &str) -> bool {
 }
 
 // ===========================================================================
-// Config data model
+// RuntimeConfig data model
 // ===========================================================================
 
 /// Sampler-semantics toggles (quality-affecting; changes need the multi-seed
@@ -291,10 +291,10 @@ impl Default for DebugFlags {
 }
 
 /// The full runtime configuration. `Default` = the env-independent documented
-/// defaults (what tests build on); [`from_env`](Config::from_env) overlays the
+/// defaults (what tests build on); [`from_env`](RuntimeConfig::from_env) overlays the
 /// `DGQ_*` env vars onto those.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct Config {
+pub struct RuntimeConfig {
     pub sampler: SamplerFlags,
     pub perf: PerfFlags,
     pub prefill: PrefillFlags,
@@ -303,7 +303,7 @@ pub struct Config {
     pub debug: DebugFlags,
 }
 
-impl Config {
+impl RuntimeConfig {
     /// Parse every `DGQ_*` env flag once. The single source of env truth.
     pub fn from_env() -> Self {
         let parse_usize = |name: &str, default: usize| -> usize {
@@ -314,7 +314,7 @@ impl Config {
         };
         let quiet_from_env = std::env::var_os("DGQ_QUIET").is_some();
 
-        Config {
+        RuntimeConfig {
             sampler: SamplerFlags {
                 freeze: env_on_if_one("DGQ_FREEZE"),
                 denoiser_argmax: env_on_unless_zero("DGQ_DENOISER_ARGMAX"),
@@ -458,9 +458,10 @@ fn gib_bytes(name: &str) -> usize {
 /// the CURRENT THREAD (see `OVERRIDE`), so a stray override can never leak
 /// across threads (libtest runs each test on its own thread) or corrupt other
 /// readers. There is no process-global mutable config.
-fn base() -> Arc<Config> {
-    static BASE: OnceLock<Arc<Config>> = OnceLock::new();
-    BASE.get_or_init(|| Arc::new(Config::from_env())).clone()
+fn base() -> Arc<RuntimeConfig> {
+    static BASE: OnceLock<Arc<RuntimeConfig>> = OnceLock::new();
+    BASE.get_or_init(|| Arc::new(RuntimeConfig::from_env()))
+        .clone()
 }
 
 thread_local! {
@@ -469,12 +470,12 @@ thread_local! {
     /// thread-local, work that a `config()` reader spawns onto ANOTHER thread
     /// sees the base, not the override — every current caller reads on the same
     /// thread it configured (Metal dispatch is synchronous), so this is safe.
-    static OVERRIDE: RefCell<Option<Arc<Config>>> = const { RefCell::new(None) };
+    static OVERRIDE: RefCell<Option<Arc<RuntimeConfig>>> = const { RefCell::new(None) };
 }
 
 /// The effective config on THIS thread: the thread-local override if one is
 /// installed, else the shared env-loaded base.
-pub fn config() -> Arc<Config> {
+pub fn config() -> Arc<RuntimeConfig> {
     OVERRIDE.with(|o| o.borrow().clone()).unwrap_or_else(base)
 }
 
@@ -498,7 +499,7 @@ pub fn quiet_set_by_user() -> bool {
 /// guard restores the prior thread-local override on drop. TEST ONLY.
 #[cfg(test)]
 #[must_use = "the override is reverted when the guard drops"]
-pub fn install_for_test(cfg: Config) -> TestGuard {
+pub fn install_for_test(cfg: RuntimeConfig) -> TestGuard {
     let prev = OVERRIDE.with(|o| o.borrow_mut().replace(Arc::new(cfg)));
     TestGuard { prev }
 }
@@ -507,7 +508,7 @@ pub fn install_for_test(cfg: Config) -> TestGuard {
 /// override (possibly `None`) on drop.
 #[cfg(test)]
 pub struct TestGuard {
-    prev: Option<Arc<Config>>,
+    prev: Option<Arc<RuntimeConfig>>,
 }
 
 #[cfg(test)]
@@ -1071,7 +1072,7 @@ mod config_tests {
 
     #[test]
     fn default_matches_documented_shipped_defaults() {
-        let c = Config::default();
+        let c = RuntimeConfig::default();
         // Sampler sign-offs.
         assert!(!c.sampler.freeze);
         assert!(c.sampler.denoiser_argmax);
@@ -1091,7 +1092,7 @@ mod config_tests {
     fn install_for_test_overrides_and_restores() {
         let before = freeze_enabled();
         {
-            let mut cfg = Config::default();
+            let mut cfg = RuntimeConfig::default();
             cfg.sampler.freeze = !before;
             let _g = install_for_test(cfg);
             assert_eq!(freeze_enabled(), !before, "override takes effect");
@@ -1101,7 +1102,7 @@ mod config_tests {
 
     #[test]
     fn set_quiet_flips_progress() {
-        let _g = install_for_test(Config::default());
+        let _g = install_for_test(RuntimeConfig::default());
         set_quiet(true);
         assert!(!progress_enabled());
         set_quiet(false);
@@ -1113,14 +1114,14 @@ mod config_tests {
         use crate::shaders::kv_quant::KvFormat;
         let budget = 26 * 1024 * 1024 * 1024u64;
         let q8_bytes = {
-            let mut cfg = Config::default();
+            let mut cfg = RuntimeConfig::default();
             cfg.kv.q8_override = Some(true);
             let _g = install_for_test(cfg);
             assert!(matches!(kv_format(8192), KvFormat::Q8), "force-on → q8");
             estimate_resident_bytes(100_000, budget)
         };
         let f16_bytes = {
-            let mut cfg = Config::default();
+            let mut cfg = RuntimeConfig::default();
             cfg.kv.q8_override = Some(false);
             let _g = install_for_test(cfg);
             assert!(matches!(kv_format(8192), KvFormat::F16), "force-off → f16");
@@ -1133,18 +1134,18 @@ mod config_tests {
     #[test]
     fn metal_pipeline_cache_dual_semantics() {
         {
-            let _g = install_for_test(Config::default());
+            let _g = install_for_test(RuntimeConfig::default());
             assert!(metal_pipeline_cache_enabled(), "unset → enabled");
             assert!(metal_pipeline_cache_dir_override().is_none());
         }
         for off in ["0", "false", "FALSE"] {
-            let mut c = Config::default();
+            let mut c = RuntimeConfig::default();
             c.debug.metal_pipeline_cache = Some(off.to_string());
             let _g = install_for_test(c);
             assert!(!metal_pipeline_cache_enabled(), "{off} disables");
             assert!(metal_pipeline_cache_dir_override().is_none());
         }
-        let mut c = Config::default();
+        let mut c = RuntimeConfig::default();
         c.debug.metal_pipeline_cache = Some("/tmp/pc".to_string());
         let _g = install_for_test(c);
         assert!(metal_pipeline_cache_enabled(), "a path enables");
@@ -1158,7 +1159,7 @@ mod config_tests {
     fn override_is_thread_local() {
         // An override installed here must NOT be visible on another thread
         // (which sees the shared base) — the isolation the design guarantees.
-        let mut cfg = Config::default();
+        let mut cfg = RuntimeConfig::default();
         cfg.sampler.freeze = true;
         let _g = install_for_test(cfg);
         assert!(freeze_enabled(), "override visible on this thread");
@@ -1168,7 +1169,7 @@ mod config_tests {
 
     #[test]
     fn should_fast_prefill_respects_force_and_band() {
-        let mut cfg = Config::default();
+        let mut cfg = RuntimeConfig::default();
         cfg.prefill.fast_prefill_force = Some(false);
         {
             let _g = install_for_test(cfg.clone());

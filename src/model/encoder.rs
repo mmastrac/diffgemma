@@ -19,6 +19,7 @@ pub struct EncoderPrefillInput<'a> {
 
 pub struct EncoderPrefillOutput {
     pub kv_cache: KvCache,
+    #[allow(dead_code)]
     pub hidden_states: Vec<f32>,
 }
 
@@ -135,6 +136,7 @@ pub fn prefill(
 }
 
 /// Extend encoder KV cache with new prompt/canvas tokens (incremental prefill).
+#[allow(dead_code)]
 pub fn extend_prefill(
     store: &WeightStore,
     cfg: &ModelConfig,

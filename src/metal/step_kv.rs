@@ -216,6 +216,7 @@ fn kv_q8_pack_row(row: &mut [u8], src: &[f32]) {
 }
 
 /// Dequantize one element of a q8 row (inverse of `kv_q8_pack_row`).
+#[allow(dead_code)]
 fn kv_q8_read(row: &[u8], d: usize, hd: usize) -> f32 {
     let s = f16_bits_to_f32(u16::from_le_bytes([
         row[hd + (d / 32) * 2],
@@ -2904,7 +2905,7 @@ mod engine_extend_bench_tests {
     #[ignore = "model-gated bench: cargo test --release engine_prefill_profile -- --ignored --nocapture"]
     fn engine_prefill_profile() {
         let Some(dir) = model_dir() else { return };
-        let mut cfg = crate::flags::Config::default();
+        let mut cfg = crate::flags::RuntimeConfig::default();
         cfg.debug.prefill_profile = true;
         let _g = crate::flags::install_for_test(cfg);
         let max_seq = 2048usize;

@@ -25,6 +25,19 @@ green, census signed off).
 | **CI completion** | Nightly model-gated tiers are scaffolded; wire fully (smoketest + golden + longctx + perf floors), weekly multi-seed aggregate + census |
 | **Broader eval** | The 17-prompt gate is sensitive but narrow; add a ~100-prompt adherence set, weekly, non-blocking |
 
+## Code-health refactor backlog (2026-07-12 audit; execute in order)
+
+1. Warning zero + CI deny-warnings gate: `cargo fix` the mechanical ~48, triage the 57 dead_code (delete stale bench scaffolding / `#[allow]` kept diagnostics).
+2. Dead-residue basket: dead encoder imports in generate.rs, `block2` dep (0 refs), `div_up` ×5 → `gpu_common`, 7 stale pre-refactor path comments, main.rs duplicated FAILURE dispatch arms, `flags::Config` → `RuntimeConfig`. Flag removal RESOLVED: no genuinely-dead `DGQ_*` flags exist (the disproven ones are still wired A/B toggles, kept per the ledger). NOTE: items 1-2's non-test dead-code pruning over-cut test-only re-exports (`metal::DgqGpuBlob`, `metal::build_offsets_from_store`, `sample::ARGMAX_HIST_MAX`, `LivenessCtx.first_step`) — restored test-gated so `cargo check --tests` is clean again while the non-test build stays warning-zero.
+3. Extract inline tests to sibling files: step_kv.rs (~1.5k, 50% test), step_generate.rs (~0.9k, 78% test), server.rs (~0.6k), step_kernel.rs (~0.8k).
+4. Split step_kernel.rs along impl seams: step_types / step_pipelines (50-field struct) / step_dispatch (StepEnc) / step_runtime; move the ~2.6k trailing bench/capture fns + step_kv's ~1k `run_step_*` audits into diagnostic modules.
+5. ~~Split main.rs (5.4k)~~ **SPLIT DONE (split-only)**: `cli.rs` (Cli/Command + parse_cli) + `commands/{mod,common,step_debug,step_gate,bench,gen_cmd,chat,smoketest,golden_cmd,model_ops}.rs`; main.rs now 50 lines. Every top-level item moved verbatim (no deletions, no MoE collapse). **Prune deferred**: the "cold" dump subcommands each pair with a `python/scripts/{dump,compare}_*.py` oracle (manual layer/attn/MoE/embed parity-debug harness) — not dead, so retiring them + collapsing the 4 `step_moe_*_dump` is its own sign-off decision, not a mechanical refactor.
+6. `GemmCompileConfig` struct in device.rs (collapse the 4 preset wrappers + 4-bool threading; the KernelVariant pattern already in-file).
+7. `crate::Error`: move `safetensors::Error` (de-facto crate error across 124 files) to src/error.rs + add Gpu/Runtime variants (kill the `Format(&str)` catch-all).
+8. `metal/oracle/` quarantine: nest the decode-oracle family (decoder, decoder_attention, lm_head, sampler, attention-scalar, self_conditioning, kv_cache; fold kernels.rs + sampler_kernels.rs into engine.rs) — mirrors shaders/oracle.
+9. Judgment-call items (need sign-off): parametrize the 4 near-copy oracle GEMM fixtures (824→~250 lines); finish the 8 renaming aliases (148 sites; KEEP pass-through flat aliases); dedup the two CPU MoE routers + RoPE/rms twins (parity-gated, exact tie-break); retire `pack/` (confirm no iris.pack deployments); delete or keep model/decoder.rs full-stack CPU forward (test-only).
+10. `serve/` cluster split (server.rs → worker/wire/sse/mapper + conversation + toolcompact; check `lcp()` duplication) — last, it's the serve hot path.
+
 ## v2 parking lot
 
 - **Vision tower** (SigLIP encoder + image splicing; ~2+ weeks; v2 headline)

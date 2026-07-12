@@ -86,6 +86,7 @@ impl GpuKvCache {
     }
 
     /// Upload pre-RoPE canvas K and raw V into the suffix of the GPU KV buffers.
+    #[allow(dead_code)]
     pub fn write_canvas_kv_pre_rope(
         &self,
         layer: usize,
