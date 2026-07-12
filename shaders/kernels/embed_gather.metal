@@ -6,7 +6,13 @@ using namespace metal;
 #include "arena.metal"
 #include "dequant.metal"
 
-/// Gather Q8 embed rows by token id: out[tok,d] = dequant(embed[id], d) * embed_scale.
+/// Gather embed rows by token id: out[tok,d] = decode(embed[id], d) * embed_scale.
+/// Format-generic (dedicated FC axis, not FC3 — K_ELEMENTWISE_GUARD keeps FC3
+/// inert): K_EMBED_BF16 false = q8 per-row dequant (default), true = Raw bf16.
+constant bool K_EMBED_BF16_DEF [[function_constant(4)]];
+constant bool K_EMBED_BF16 =
+    is_function_constant_defined(K_EMBED_BF16_DEF) ? K_EMBED_BF16_DEF : false;
+
 kernel void embed_gather(
     device const uchar *blob [[buffer(0)]],
     device const uint *ids [[buffer(1)]],
@@ -35,8 +41,16 @@ kernel void embed_gather(
     if (d == 0u) {
         dgq_assert_token_id(dbg, DbgKernelEmbedGather, id, vocab);
     }
-    device const uchar *row = blob + w_off + (ulong)id * q8_row_bytes(hidden);
-    float v = q8_at(row, d, bf16_bytes(row)) * embed_scale;
+    float v;
+    if (K_EMBED_BF16) {
+        // Raw bf16 [vocab, hidden] embed table, no dequant.
+        device const ushort *row = (device const ushort *)(blob + w_off) + (ulong)id * hidden;
+        v = bf16_to_f32(row[d]) * embed_scale;
+    } else {
+        // Q8 per-row: [bf16 scale][int8 codes].
+        device const uchar *row = blob + w_off + (ulong)id * q8_row_bytes(hidden);
+        v = q8_at(row, d, bf16_bytes(row)) * embed_scale;
+    }
     if (dgq_debug_deep_enabled() && d == 0u) {
         dgq_assert_finite_f32(dbg, DbgKernelEmbedGather, v, tok);
     }

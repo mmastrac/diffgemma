@@ -123,7 +123,25 @@ pub fn pipeline_for(
     ctx: &crate::metal::device::MetalContext,
     variant: KernelVariant,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_subkernel(SHADER, ENTRY, variant)
+    pipeline_for_fmt(ctx, variant, false)
+}
+
+/// Format-generic embed gather: `bf16` picks the Raw bf16 embed table
+/// (K_EMBED_BF16 / FC4); false = q8 per-row dequant (default). FC3 stays inert
+/// so K_ELEMENTWISE_GUARD passes for both.
+#[cfg(target_os = "macos")]
+pub fn pipeline_for_fmt(
+    ctx: &crate::metal::device::MetalContext,
+    variant: KernelVariant,
+    bf16: bool,
+) -> Result<crate::metal::device::ComputePipeline, Error> {
+    use crate::kernels::sub::variant::FcBool;
+    let bools = [FcBool {
+        index: 4,
+        value: bf16,
+    }];
+    let label = if bf16 { "bf16" } else { "q8" };
+    ctx.compile_subkernel_ex(SHADER, ENTRY, variant, label, &bools, &[])
 }
 
 #[cfg(target_os = "macos")]

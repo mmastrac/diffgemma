@@ -1043,11 +1043,7 @@ impl StepPipelines {
             moe_grouped_nvfp4: crate::kernels::sub::moe_grouped_nvfp4::pipeline_for(ctx, prod)?,
             moe_grouped_dump: crate::kernels::sub::moe_grouped::pipeline_for(ctx, dump)?,
             embed_gather: crate::kernels::sub::embed_gather::pipeline_for(ctx, prod)?,
-            embed_gather_bf16: ctx.compile_subkernel(
-                shader_include::include_metal!("kernels/embed_gather_bf16.metal"),
-                "embed_gather_bf16",
-                prod,
-            )?,
+            embed_gather_bf16: crate::kernels::sub::embed_gather::pipeline_for_fmt(ctx, prod, true)?,
             logit_rowstats: crate::kernels::sub::logit_rowstats::pipeline_for(ctx, prod)?,
             sc_prob_cols: crate::kernels::sub::sc_prob_cols::pipeline_for(ctx, prod)?,
             half_scale: crate::kernels::sub::half_scale::pipeline_for(ctx, prod)?,
