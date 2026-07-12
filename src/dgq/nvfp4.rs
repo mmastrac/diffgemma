@@ -7,8 +7,8 @@ use crate::dgq::layout::{
     NVFP4_GROUP_SIZE, NVFP4_HEADER_BYTES, nvfp4_data_row_bytes, nvfp4_matrix_bytes,
     nvfp4_row_bytes, nvfp4_scales_row_bytes,
 };
-use crate::kernels::cpu::bf16_to_f32;
 use crate::safetensors::Error;
+use crate::shaders::cpu::bf16_to_f32;
 
 #[cfg(test)]
 fn f32_to_bf16_bits(v: f32) -> u16 {

@@ -1,5 +1,4 @@
 use crate::config::ModelConfig;
-use crate::kernels::cpu::rms_norm_rows;
 use crate::model::decoder_layer::{
     DecoderLayerScratch, forward_encoder as layer_forward_encoder,
     forward_encoder_extend as layer_forward_encoder_extend,
@@ -9,6 +8,7 @@ use crate::model::kv_cache::KvCache;
 use crate::model::kv_cache::LayerKvView;
 use crate::model::layer_weights::DecoderLayerWeights;
 use crate::safetensors::Error;
+use crate::shaders::cpu::rms_norm_rows;
 use crate::weights::WeightStore;
 
 pub struct EncoderPrefillInput<'a> {

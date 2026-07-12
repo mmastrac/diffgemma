@@ -1,6 +1,5 @@
 use crate::buffer::Buffer;
 use crate::config::ModelConfig;
-use crate::kernels::cpu::rms_norm_rows;
 use crate::model::decoder_layer::{DecoderLayerScratch, forward_decoder as layer_forward};
 use crate::model::embed::{embed_tokens_from_store, lm_head_tied_from_store, logit_softcapping};
 use crate::model::kv_cache::{KvCache, LayerKvView};
@@ -8,6 +7,7 @@ use crate::model::layer_weights::DecoderLayerWeights;
 use crate::model::mask::DecoderAttnMask;
 use crate::model::self_conditioning::{SelfConditioningScratch, apply_from_store};
 use crate::safetensors::Error;
+use crate::shaders::cpu::rms_norm_rows;
 use crate::weights::WeightStore;
 
 pub struct DecoderForwardInput<'a> {

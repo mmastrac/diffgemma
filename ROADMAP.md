@@ -271,7 +271,7 @@ cost" is FALSE for K, and the V half needs rework too:
   Hadamard (q/k/v) + offline W_o Hᵀ fold, prove rotated-q4 recovers quality →
   M3 non-expert bf16 weights → M4 rotated experts (§5.4, E9, v2+). Full
   corrected math + code map: memory `turboquant-rotated-kv`. WHT helper
-  shipped (`src/kernels/sub/hadamard.rs`, 834cc1d). Gate as usual.
+  shipped (`src/shaders/kv/hadamard.rs`, 834cc1d). Gate as usual.
 
 ### 5.3 Vision (VLM) — decision, not implementation
 The checkpoint ships a vision tower (mlx_vlm serves images; our config.rs

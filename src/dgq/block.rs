@@ -4,8 +4,8 @@ use crate::dgq::layout::{
     GROUP_SIZE, q4_matrix_bytes, q4_row_bytes, q6_matrix_bytes, q6_row_bytes, q8_matrix_bytes,
     q8_row_bytes,
 };
-use crate::kernels::cpu::bf16_to_f32;
 use crate::safetensors::Error;
+use crate::shaders::cpu::bf16_to_f32;
 
 fn f32_to_bf16_bits(v: f32) -> u16 {
     (v.to_bits() >> 16) as u16

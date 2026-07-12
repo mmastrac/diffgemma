@@ -1,7 +1,7 @@
 use crate::config::TextConfig;
-use crate::kernels::cpu::{gelu_pytorch_tanh, linear_bf16_slice, rms_norm_no_scale, rms_norm_rows};
 use crate::model::layer_weights::DecoderLayerWeights;
 use crate::safetensors::Error;
+use crate::shaders::cpu::{gelu_pytorch_tanh, linear_bf16_slice, rms_norm_no_scale, rms_norm_rows};
 use crate::tensor::Bf16Slice;
 
 pub struct RouteResult {
@@ -74,7 +74,7 @@ pub fn route(
         }
     }
 
-    crate::kernels::cpu::linear(
+    crate::shaders::cpu::linear(
         &mut scratch.router_logits,
         &scratch.router_input,
         &scratch.router_proj_w,
@@ -125,7 +125,7 @@ pub fn route_with_cached_weights(
         }
     }
 
-    crate::kernels::cpu::linear(
+    crate::shaders::cpu::linear(
         &mut scratch.router_logits,
         &scratch.router_input,
         router_proj,

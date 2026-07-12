@@ -1,11 +1,11 @@
 //! Tier-1 pin: per-stage GPU vs CPU oracle inside batched MoE (gather → GEMM×2 → swiglu → scatter).
 
-use crate::kernels::sub::moe_batched_pin::MoeBatchedPinDump;
 use crate::metal::step_kernel::{StepSmokeConfig, run_step_moe_batched_pin_capture};
 use crate::safetensors::Error;
+use crate::shaders::moe_batched_pin::MoeBatchedPinDump;
 use std::path::Path;
 
-pub use crate::kernels::sub::moe_batched_pin::print_pin_summary;
+pub use crate::shaders::moe_batched_pin::print_pin_summary;
 
 pub fn run_step_moe_batched_pin_dump(
     model_dir: &Path,
@@ -47,7 +47,7 @@ mod tests {
     }
 
     fn run_pin_layer(layer: usize, prompt: &str) -> Option<MoeBatchedPinDump> {
-        let dir_buf = match crate::kernels::sub::test_util::dgq_model_dir() {
+        let dir_buf = match crate::shaders::test_util::dgq_model_dir() {
             Some(d) => d,
             None => std::path::PathBuf::from("/tmp/quantized-weights"),
         };

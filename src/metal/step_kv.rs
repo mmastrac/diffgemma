@@ -27,7 +27,6 @@
 use crate::config::ModelConfig;
 use crate::dgq::DgqStore;
 use crate::flags::progress_enabled;
-use crate::kernels::sub::f16::{f16_bits_to_f32, f32_to_f16_bits};
 use crate::metal::GpuDecoderScratch;
 use crate::metal::decoder::load_weight_cache_opt;
 use crate::metal::device::MetalContext;
@@ -44,13 +43,14 @@ use crate::model::encoder::{EncoderPrefillInput, EncoderScratch};
 use crate::model::kv_cache::KvCache;
 use crate::safetensors::Error;
 use crate::sample::{Rng, SamplerConfig, step_entropy_stats};
+use crate::shaders::f16::{f16_bits_to_f32, f32_to_f16_bits};
 use crate::weights::WeightStore;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 use std::path::Path;
 
-use crate::kernels::sub::kv_quant::KvFormat;
+use crate::shaders::kv_quant::KvFormat;
 
 /// Bytes of one (slot, head, K-or-V) row for the given format. MUST match
 /// attention_device.metal `kv_row_bytes` (delegates to `KvFormat::row_bytes`).
@@ -362,8 +362,8 @@ fn pack_gpu_kv_prefix_to_monolithic(
     src_pos: usize,
     fmt: KvFormat,
 ) -> Result<(), Error> {
-    use crate::kernels::sub::pack_encoder_kv;
     use crate::metal::batch::begin_engine_batch;
+    use crate::shaders::pack_encoder_kv;
 
     let pack_pipeline = if fmt == KvFormat::F16 {
         engine.kernels.pack_encoder_kv.pipeline.clone()
@@ -649,8 +649,8 @@ fn hydrate_gpu_kv_from_monolithic(
         gpu_kv.reset_len();
         return Ok(());
     }
-    use crate::kernels::sub::unpack_encoder_kv;
     use crate::metal::batch::begin_engine_batch;
+    use crate::shaders::unpack_encoder_kv;
 
     let fmt = crate::flags::kv_format(max_seq);
     let pipeline = if fmt == KvFormat::F16 {
@@ -1266,12 +1266,12 @@ pub fn run_step_attn_probe(
     seed: u64,
     max_seq: usize,
 ) -> Result<StepAttnProbeResult, Error> {
-    use crate::kernels::cpu::rms_norm;
     use crate::model::attention::{
         AttentionParams, attn_score_stats_decoder, qk_norm_weight_stats,
     };
     use crate::model::mask::DecoderAttnMask;
     use crate::sample::Rng;
+    use crate::shaders::cpu::rms_norm;
 
     if token_ids.is_empty() {
         return Err(Error::Format("step-attn-probe requires prompt tokens"));
@@ -2074,12 +2074,12 @@ mod engine_extend_bench_tests {
     #[test]
     #[ignore = "model-gated: cargo test --release e8_prerope_k_quant_stats -- --ignored --nocapture"]
     fn e8_prerope_k_quant_stats() {
-        use crate::kernels::sub::kv_quant::{
+        use crate::metal::step_kernel::{StepFinishMode, StepSmokeConfig, build_step_runtime};
+        use crate::shaders::kv_quant::{
             q4_affine_rotated_roundtrip, q4_affine_roundtrip, q4_affine_row_rotated_roundtrip,
             q4_affine_row_roundtrip, q4_rotated_roundtrip, q4_roundtrip, q8_roundtrip,
             q8_row_rotated_roundtrip, q8_row_roundtrip,
         };
-        use crate::metal::step_kernel::{StepFinishMode, StepSmokeConfig, build_step_runtime};
         use crate::tokenizer::Tokenizer;
         let Some(dir) = model_dir() else { return };
         let prompt_path = std::env::var("DGQ_E8_PROMPT")
@@ -2386,11 +2386,11 @@ mod engine_extend_bench_tests {
     fn e16_fusion_oracle_replay() {
         use crate::chat_template;
         use crate::config;
-        use crate::kernels::sub::f16::f32_to_f16_bits;
         use crate::metal::step_generate::{
             StepGenerateConfig, StepGenerateSession, generate_with_session,
         };
         use crate::sample;
+        use crate::shaders::f16::f32_to_f16_bits;
         use crate::tokenizer::Tokenizer;
         let Some(dir) = model_dir() else { return };
         let tok = Tokenizer::load(&dir.join("tokenizer.json")).expect("tokenizer");
@@ -2622,11 +2622,11 @@ mod engine_extend_bench_tests {
     fn e16_fusion_multineedle_oracle() {
         use crate::chat_template;
         use crate::config;
-        use crate::kernels::sub::f16::f32_to_f16_bits;
         use crate::metal::step_generate::{
             StepGenerateConfig, StepGenerateSession, generate_with_session,
         };
         use crate::sample;
+        use crate::shaders::f16::f32_to_f16_bits;
         use crate::tokenizer::Tokenizer;
         let Some(dir) = model_dir() else { return };
         let tok = Tokenizer::load(&dir.join("tokenizer.json")).expect("tokenizer");

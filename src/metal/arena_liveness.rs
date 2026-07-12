@@ -398,14 +398,14 @@ pub fn check_step_arena_liveness(
 }
 
 pub fn runtime_arena_liveness_enabled() -> bool {
-    crate::kernels::sub::variant::runtime_assert_enabled()
+    crate::shaders::variant::runtime_assert_enabled()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::sub::QuantFormat;
     use crate::metal::step_quant::StepBlockProfile;
+    use crate::shaders::QuantFormat;
 
     fn test_layout() -> ModelLayout {
         let mut layers = [LayerOffsets {

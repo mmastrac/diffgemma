@@ -1,7 +1,7 @@
 //! Expand `#include "name.metal"` in shader sources at compile time (Rust concat path).
 //!
 //! Emits `#line N "path.metal"` so Metal compile errors map back to the original file.
-//! Native Metal builds resolve the same includes via `-I shaders/include`.
+//! Native Metal builds resolve the same includes via `-I src/shaders/include`.
 
 use proc_macro::TokenStream;
 use quote::quote;
@@ -12,18 +12,18 @@ fn shaders_root() -> Result<PathBuf, String> {
     let manifest = PathBuf::from(
         std::env::var("CARGO_MANIFEST_DIR").map_err(|e| e.to_string())?,
     );
-    let direct = manifest.join("shaders");
+    let direct = manifest.join("src/shaders");
     if direct.is_dir() {
         return Ok(direct);
     }
     if let Some(parent) = manifest.parent() {
-        let nested = parent.join("shaders");
+        let nested = parent.join("src/shaders");
         if nested.is_dir() {
             return Ok(nested);
         }
     }
     Err(format!(
-        "shader-include: shaders/ not found under {} (set CARGO_MANIFEST_DIR?)",
+        "shader-include: src/shaders/ not found under {} (set CARGO_MANIFEST_DIR?)",
         manifest.display()
     ))
 }
@@ -97,7 +97,7 @@ pub fn include_metal(input: TokenStream) -> TokenStream {
     if Path::new(&rel).is_absolute() || rel.contains("..") {
         return syn::Error::new(
             path_lit.span(),
-            format!("shader-include: path must be relative under shaders/: {rel:?}"),
+            format!("shader-include: path must be relative under src/shaders/: {rel:?}"),
         )
         .to_compile_error()
         .into();
@@ -129,7 +129,7 @@ mod tests {
     #[test]
     fn expand_moe_grouped() {
         let root = shaders_root().expect("root");
-        let s = read_entry(&root, "kernels/moe_grouped.metal").expect("expand");
+        let s = read_entry(&root, "moe/moe_grouped/moe_grouped.metal").expect("expand");
         assert!(s.contains("kernel void moe_grouped"));
         assert!(s.len() > 8000);
     }
@@ -137,9 +137,9 @@ mod tests {
     #[test]
     fn emits_line_directives() {
         let root = shaders_root().expect("root");
-        let s = read_entry(&root, "kernels/gelu.metal").expect("expand");
+        let s = read_entry(&root, "elementwise/gelu/gelu.metal").expect("expand");
         assert!(
-            s.contains("#line 1 \"kernels/gelu.metal\""),
+            s.contains("#line 1 \"elementwise/gelu/gelu.metal\""),
             "entry #line missing"
         );
         assert!(
@@ -152,7 +152,7 @@ mod tests {
         );
         // After fc_axes include, gelu.metal resumes at line 5 (#include on line 4).
         assert!(
-            s.contains("#line 5 \"kernels/gelu.metal\""),
+            s.contains("#line 5 \"elementwise/gelu/gelu.metal\""),
             "resume #line missing: {}",
             &s[..s.len().min(800)]
         );

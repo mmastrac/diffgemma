@@ -1,6 +1,5 @@
 //! Soft embeddings and related GPU embed ops (`.dgq` q8 table).
 
-use crate::kernels::sub::{gather_prob_cols, softmax_rows, vec_fill_zero, vec_scale_inplace};
 use crate::metal::batch::{GpuBatch, begin_engine_batch};
 use crate::metal::batched_kernels as bk;
 use crate::metal::dgq_gpu::Q8LinearGpu;
@@ -9,6 +8,7 @@ use crate::metal::kernels::GpuKernels;
 use crate::metal::linear::f32_q8_linear_kxn_gpu_bufs;
 use crate::model::embed::LM_HEAD_CHUNK;
 use crate::safetensors::Error;
+use crate::shaders::{gather_prob_cols, softmax_rows, vec_fill_zero, vec_scale_inplace};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLBuffer;
@@ -383,7 +383,7 @@ pub fn embed_token_ids_q8_gpu(
         return Err(Error::Format("embed_token_ids_q8_gpu shape mismatch"));
     }
     use crate::dgq::embed_row::EMBED_SCALE;
-    use crate::kernels::sub::{convert_scale, embed_gather};
+    use crate::shaders::{convert_scale, embed_gather};
 
     let embed_pipeline = engine.kernels.embed_gather.pipeline.clone();
     let half_pipeline = engine.kernels.half_to_f32.pipeline.clone();

@@ -2,7 +2,7 @@
 //!
 //! Matches HuggingFace `EntropyBoundSampler` and `LinearTemperatureScheduleLogitsProcessor`.
 
-use crate::kernels::cpu::softmax_rows;
+use crate::shaders::cpu::softmax_rows;
 
 /// `<pad>` token id (Gemma tokenizer).
 pub const PAD_TOKEN_ID: u32 = 0;

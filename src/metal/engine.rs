@@ -9,7 +9,7 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-const GEMM_SHADER: &str = include_str!("../../shaders/gemm.metal");
+const GEMM_SHADER: &str = include_str!("../shaders/gemm/gemm.metal");
 const F32_BF16_LINEAR_ENTRY: &str = "f32_bf16_linear";
 const F32_F32_LINEAR_ENTRY: &str = "f32_f32_linear";
 
@@ -42,44 +42,40 @@ impl GpuDecoderEngine {
         let pool = BufferPool::new();
         let f32_bf16_linear_pipeline = ctx.compile_kernel(GEMM_SHADER, F32_BF16_LINEAR_ENTRY)?;
         let f32_f32_linear_pipeline = ctx.compile_kernel(GEMM_SHADER, F32_F32_LINEAR_ENTRY)?;
-        let prod = crate::kernels::sub::variant::KernelVariant::PRODUCTION;
-        let f32_q4_linear_pipeline = crate::kernels::sub::gemm_linear_f32::pipeline_for(
+        let prod = crate::shaders::variant::KernelVariant::PRODUCTION;
+        let f32_q4_linear_pipeline = crate::shaders::gemm_linear_f32::pipeline_for(
             &ctx,
-            crate::kernels::sub::QuantFormat::Q4Affine,
+            crate::shaders::QuantFormat::Q4Affine,
             prod,
         )?;
-        let f32_nvfp4_linear_pipeline = crate::kernels::sub::gemm_linear_f32::pipeline_for(
+        let f32_nvfp4_linear_pipeline = crate::shaders::gemm_linear_f32::pipeline_for(
             &ctx,
-            crate::kernels::sub::QuantFormat::NvFp4,
+            crate::shaders::QuantFormat::NvFp4,
             prod,
         )?;
-        let f32_q4_linear_grouped_pipeline =
-            crate::kernels::sub::gemm_linear_grouped::pipeline_for(
-                &ctx,
-                crate::kernels::sub::QuantFormat::Q4Affine,
-                prod,
-            )?;
-        let f32_nvfp4_linear_grouped_pipeline =
-            crate::kernels::sub::gemm_linear_grouped::pipeline_for(
-                &ctx,
-                crate::kernels::sub::QuantFormat::NvFp4,
-                prod,
-            )?;
-        let f32_q6_linear_pipeline = crate::kernels::sub::gemm_linear_f32::pipeline_for(
+        let f32_q4_linear_grouped_pipeline = crate::shaders::gemm_linear_grouped::pipeline_for(
             &ctx,
-            crate::kernels::sub::QuantFormat::Q6,
+            crate::shaders::QuantFormat::Q4Affine,
             prod,
         )?;
-        let f32_q6_linear_grouped_pipeline =
-            crate::kernels::sub::gemm_linear_grouped::pipeline_for(
-                &ctx,
-                crate::kernels::sub::QuantFormat::Q6,
-                prod,
-            )?;
-        let f32_q8_linear_pipeline =
-            crate::kernels::sub::gemm_q8_linear_f32::pipeline_for(&ctx, prod)?;
+        let f32_nvfp4_linear_grouped_pipeline = crate::shaders::gemm_linear_grouped::pipeline_for(
+            &ctx,
+            crate::shaders::QuantFormat::NvFp4,
+            prod,
+        )?;
+        let f32_q6_linear_pipeline = crate::shaders::gemm_linear_f32::pipeline_for(
+            &ctx,
+            crate::shaders::QuantFormat::Q6,
+            prod,
+        )?;
+        let f32_q6_linear_grouped_pipeline = crate::shaders::gemm_linear_grouped::pipeline_for(
+            &ctx,
+            crate::shaders::QuantFormat::Q6,
+            prod,
+        )?;
+        let f32_q8_linear_pipeline = crate::shaders::gemm_q8_linear_f32::pipeline_for(&ctx, prod)?;
         let f32_q8_linear_kxn_pipeline =
-            crate::kernels::sub::gemm_q8_linear_kxn_f32::pipeline_for(&ctx, prod)?;
+            crate::shaders::gemm_q8_linear_kxn_f32::pipeline_for(&ctx, prod)?;
         let encoder_gpu_moe = Cell::new(encoder_gpu_moe_from_env());
         let kernels = GpuKernels::new(&ctx)?;
         let attention = GpuAttentionKernels::new(&ctx)?;

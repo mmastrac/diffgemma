@@ -2,14 +2,19 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 
-/// Hash every shader source under `shaders/` (sorted walk) so:
+/// Hash every shader source under `src/shaders/` (sorted walk) so:
 /// 1. cargo rebuilds when ANY shader changes (the include_metal! proc macro
 ///    does not register file dependencies, so shader edits were otherwise
 ///    invisible to incremental builds), and
 /// 2. the Metal pipeline cache can key on the WHOLE shader tree instead of a
 ///    hand-maintained include_str! list (33 of 93 files were missing from
 ///    that list — stale metallibs were served after kernel edits).
+///
+/// rerun-if-changed is emitted per DIRECTORY + per .metal FILE (not the tree
+/// root) so .rs edits under src/shaders/ do not re-run the build script;
+/// directory entries catch .metal file adds/removes.
 fn hash_shader_tree(dir: &Path, h: &mut DefaultHasher) {
+    println!("cargo:rerun-if-changed={}", dir.display());
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
         .map(|e| e.expect("dir entry").path())
@@ -19,6 +24,7 @@ fn hash_shader_tree(dir: &Path, h: &mut DefaultHasher) {
         if path.is_dir() {
             hash_shader_tree(&path, h);
         } else if path.extension().is_some_and(|e| e == "metal") {
+            println!("cargo:rerun-if-changed={}", path.display());
             path.to_string_lossy().hash(h);
             std::fs::read(&path)
                 .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
@@ -28,9 +34,8 @@ fn hash_shader_tree(dir: &Path, h: &mut DefaultHasher) {
 }
 
 fn main() {
-    println!("cargo:rerun-if-changed=shaders");
     let mut h = DefaultHasher::new();
-    hash_shader_tree(Path::new("shaders"), &mut h);
+    hash_shader_tree(Path::new("src/shaders"), &mut h);
     println!("cargo:rustc-env=DGQ_SHADER_TREE_HASH={:016x}", h.finish());
 
     if std::env::var("CARGO_FEATURE_BLAS").is_ok() {

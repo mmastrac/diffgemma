@@ -445,9 +445,9 @@ fn perturb_live_kv_f16(
     eps: f32,
     seed: u64,
 ) {
-    use crate::kernels::sub::f16::{f16_bits_to_f32, f32_to_f16_bits};
+    use crate::shaders::f16::{f16_bits_to_f32, f32_to_f16_bits};
     use objc2_metal::MTLBuffer as _;
-    if crate::flags::kv_format(rt.max_seq()) != crate::kernels::sub::kv_quant::KvFormat::F16 {
+    if crate::flags::kv_format(rt.max_seq()) != crate::shaders::kv_quant::KvFormat::F16 {
         eprintln!("DGQ_KV_NOISE: q8 session — skipped");
         return;
     }

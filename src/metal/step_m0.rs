@@ -88,7 +88,7 @@ fn check(id: &'static str, pass: bool, detail: impl Into<String>) -> M0Check {
 
 /// CPU mirror of `dequant_q4_group` in `include/dequant.metal` (VERIFY-N).
 pub(crate) fn dequant_q4_group_cpu(g: &[u8; 20]) -> [f32; 32] {
-    crate::kernels::cpu::dequant::dequant_q4_group(g)
+    crate::shaders::cpu::dequant::dequant_q4_group(g)
 }
 
 /// K-order decode via col-indexed path (mirrors `q4_at_col` in dequant.metal).

@@ -138,8 +138,8 @@ pub fn build_preamble(first_step: u32) -> Vec<StepStage> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::sub::QuantFormat;
     use crate::metal::step_quant::StepBlockProfile;
+    use crate::shaders::QuantFormat;
 
     #[test]
     fn batched_moe_schedule_has_five_moe_stages() {

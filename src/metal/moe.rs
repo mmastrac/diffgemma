@@ -3,7 +3,6 @@ use crate::dgq::DgqStore;
 use crate::dgq::block::{q4_gemm_cpu, q4_weight_at};
 use crate::dgq::layout::NVFP4_HEADER_BYTES;
 use crate::dgq::nvfp4::nvfp4_gemm_cpu;
-use crate::kernels::cpu::{gelu_pytorch_tanh, gelu_pytorch_tanh_f32, linear};
 use crate::metal::batch::GpuBatch;
 use crate::metal::batched_kernels::{self as bk};
 use crate::metal::device::ComputePipeline;
@@ -15,6 +14,7 @@ use crate::metal::weights::GpuDecoderWeightCache;
 use crate::model::layer_weights::DecoderLayerWeights;
 use crate::model::moe::{MoeScratch, RouteResult};
 use crate::safetensors::Error;
+use crate::shaders::cpu::{gelu_pytorch_tanh, gelu_pytorch_tanh_f32, linear};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLBuffer;
@@ -629,7 +629,7 @@ mod dgq_expert_tests {
 
     #[test]
     fn dgq_expert_q4_matches_bf16_oracle_and_grouped_mirror() {
-        let dgq_dir_buf = match crate::kernels::sub::test_util::dgq_model_dir() {
+        let dgq_dir_buf = match crate::shaders::test_util::dgq_model_dir() {
             Some(d) => d,
             None => std::path::PathBuf::from("/tmp/quantized-weights"),
         };

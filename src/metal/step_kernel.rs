@@ -15,7 +15,6 @@
 
 use crate::config::{ModelConfig, TextConfig};
 use crate::dgq::DgqStore;
-use crate::kernels::sub::QuantFormat;
 use crate::metal::device::{ComputePipeline, MetalContext};
 use crate::metal::dgq_gpu::DgqGpuBlob;
 use crate::metal::moe::experts_forward_dgq_cpu;
@@ -24,6 +23,7 @@ use crate::metal::weights::GpuDecoderWeightCache;
 use crate::model::moe::{MoeScratch, RouteResult};
 use crate::safetensors::Error;
 use crate::sample::{Rng, SamplerConfig, initialize_canvas};
+use crate::shaders::QuantFormat;
 use crate::weights::WeightStore;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -80,9 +80,8 @@ pub use crate::flags::{
     FAST_PREFILL_MIN_TOKENS, attn_mma_enabled, attn_mma_full_enabled, attn_window_enabled,
     denoise_parity_log_enabled, denoise_parity_log_positions, denoiser_argmax_enabled,
     final_entropy_log_enabled, freeze_enabled, fused_algebra_enabled, fused_gate_up_enabled,
-    fused_qkv_enabled, logits_finite_check_enabled,
-    logits_finite_sample_count, moe_fuse_gather_enabled, partial_lm_head_enabled,
-    prefill_batch_enabled, router_gemm_enabled,
+    fused_qkv_enabled, logits_finite_check_enabled, logits_finite_sample_count,
+    moe_fuse_gather_enabled, partial_lm_head_enabled, prefill_batch_enabled, router_gemm_enabled,
     sc_sparse_enabled, should_fast_prefill, step_text_log_enabled, trace_entropy_enabled,
 };
 
@@ -573,11 +572,8 @@ fn div_up(v: usize, g: usize) -> usize {
 pub(crate) fn qkv_stacked_segments(
     l: &LayerOffsets,
     arena: &ArenaLayout,
-) -> (
-    Vec<crate::kernels::sub::gemm_block_stacked::GemmStackedSeg>,
-    u32,
-) {
-    use crate::kernels::sub::gemm_block_stacked::GemmStackedSeg;
+) -> (Vec<crate::shaders::gemm_block_stacked::GemmStackedSeg>, u32) {
+    use crate::shaders::gemm_block_stacked::GemmStackedSeg;
     let full = l.is_full != 0;
     let q_n = if full { 8192u32 } else { 4096 };
     let k_n = if full { 1024 } else { 2048 };
@@ -617,11 +613,8 @@ pub(crate) fn qkv_stacked_segments(
 pub(crate) fn gate_up_stacked_segments(
     l: &LayerOffsets,
     arena: &ArenaLayout,
-) -> (
-    [crate::kernels::sub::gemm_block_stacked::GemmStackedSeg; 2],
-    u32,
-) {
-    use crate::kernels::sub::gemm_block_stacked::GemmStackedSeg;
+) -> ([crate::shaders::gemm_block_stacked::GemmStackedSeg; 2], u32) {
+    use crate::shaders::gemm_block_stacked::GemmStackedSeg;
     let n2 = DENSE_FF * 2;
     (
         [
@@ -761,8 +754,8 @@ struct StepPipelines {
 impl StepPipelines {
     fn new(
         ctx: &MetalContext,
-        variant: crate::kernels::sub::variant::KernelVariant,
-        fmt: crate::kernels::sub::kv_quant::KvFormat,
+        variant: crate::shaders::variant::KernelVariant,
+        fmt: crate::shaders::kv_quant::KvFormat,
     ) -> Result<Self, Error> {
         let mut gemm_tunable_raw = HashMap::new();
         let mut gemm_tunable_q8 = HashMap::new();
@@ -789,18 +782,18 @@ impl StepPipelines {
             // Raw (bf16-weight) dense: lm_head logits (n=VOCAB) forces bf16
             // output (range); others follow K_ACT_F16 for their activation out.
             let raw = if n == VOCAB as u32 {
-                crate::kernels::sub::gemm_tunable::pipeline_for_logits(
+                crate::shaders::gemm_tunable::pipeline_for_logits(
                     ctx,
                     n,
                     k,
-                    crate::kernels::sub::QuantFormat::Raw,
+                    crate::shaders::QuantFormat::Raw,
                 )?
             } else {
-                crate::kernels::sub::gemm_tunable::pipeline_for(
+                crate::shaders::gemm_tunable::pipeline_for(
                     ctx,
                     n,
                     k,
-                    crate::kernels::sub::QuantFormat::Raw,
+                    crate::shaders::QuantFormat::Raw,
                 )?
             };
             gemm_tunable_raw.insert((n, k), raw);
@@ -808,20 +801,20 @@ impl StepPipelines {
             // Never lm_head (that path is bf16 or q8), so no logits variant.
             gemm_tunable_q4.insert(
                 (n, k),
-                crate::kernels::sub::gemm_tunable::pipeline_for(
+                crate::shaders::gemm_tunable::pipeline_for(
                     ctx,
                     n,
                     k,
-                    crate::kernels::sub::QuantFormat::Q4Affine,
+                    crate::shaders::QuantFormat::Q4Affine,
                 )?,
             );
             gemm_tunable_nvfp4.insert(
                 (n, k),
-                crate::kernels::sub::gemm_tunable::pipeline_for(
+                crate::shaders::gemm_tunable::pipeline_for(
                     ctx,
                     n,
                     k,
-                    crate::kernels::sub::QuantFormat::NvFp4,
+                    crate::shaders::QuantFormat::NvFp4,
                 )?,
             );
         }
@@ -840,18 +833,18 @@ impl StepPipelines {
             // q8 dense: lm_head logits (VOCAB) forces bf16 output; others follow
             // the arena activation dtype.
             let q8 = if (n, k) == (VOCAB as u32, HID as u32) {
-                crate::kernels::sub::gemm_tunable::pipeline_for_logits(
+                crate::shaders::gemm_tunable::pipeline_for_logits(
                     ctx,
                     n,
                     k,
-                    crate::kernels::sub::QuantFormat::Q8,
+                    crate::shaders::QuantFormat::Q8,
                 )?
             } else {
-                crate::kernels::sub::gemm_tunable::pipeline_for(
+                crate::shaders::gemm_tunable::pipeline_for(
                     ctx,
                     n,
                     k,
-                    crate::kernels::sub::QuantFormat::Q8,
+                    crate::shaders::QuantFormat::Q8,
                 )?
             };
             gemm_tunable_q8.insert((n, k), q8);
@@ -862,16 +855,17 @@ impl StepPipelines {
         ] {
             gemm_q8_rowk.insert(
                 (n, k),
-                crate::kernels::sub::gemm_q8_rowk::pipeline_for(ctx, n, k)?,
+                crate::shaders::gemm_q8_rowk::pipeline_for(ctx, n, k)?,
             );
             gemm_q8_rowk_xfp16.insert(
                 (n, k),
-                crate::kernels::sub::gemm_q8_rowk::pipeline_for_fp16_input(ctx, n, k)?,
+                crate::shaders::gemm_q8_rowk::pipeline_for_fp16_input(ctx, n, k)?,
             );
         }
         // Unified rowk f32-accumulate SC-softembed GEMM (one shader; weight format
         // = K_QUANT_FORMAT: Raw bf16 embed or Q8 embed). x is fp16 sc_probs.
-        const ROWK_ACC_SHADER: &str = shader_include::include_metal!("kernels/gemm_rowk.metal");
+        const ROWK_ACC_SHADER: &str =
+            shader_include::include_metal!("gemm/gemm_rowk/gemm_rowk.metal");
         let mut gemm_q8_rowk_acc_f32 = HashMap::new();
         {
             for &(n, k) in &[(HID as u32, crate::model::embed::LM_HEAD_CHUNK as u32)] {
@@ -883,7 +877,7 @@ impl StepPipelines {
                         n,
                         k,
                         false,
-                        crate::kernels::sub::QuantFormat::Q8 as u32,
+                        crate::shaders::QuantFormat::Q8 as u32,
                         true, // sc_probs is fp16
                     )?,
                 );
@@ -900,15 +894,15 @@ impl StepPipelines {
                         n,
                         k,
                         false,
-                        crate::kernels::sub::QuantFormat::Raw as u32, // bf16 embed -> Raw branch
-                        true,                                         // sc_probs is fp16
+                        crate::shaders::QuantFormat::Raw as u32, // bf16 embed -> Raw branch
+                        true,                                    // sc_probs is fp16
                     )?,
                 );
             }
         }
         // f32 -> arena bf16 with scale (convert_scale src_f32=true, dst_f32=false).
         let f32_to_half_scale =
-            crate::kernels::sub::convert_scale::pipeline_for_fmt(ctx, variant, true, false)?;
+            crate::shaders::convert_scale::pipeline_for_fmt(ctx, variant, true, false)?;
         // Block-sparse MoE experts: tunable is the sole path (q4/q6/nvfp4).
         // gate_up gathers bf16 moein rows (fused gather); down's A is the
         // swiglu output. Wide variants = weight-stationary prefill height
@@ -916,24 +910,24 @@ impl StepPipelines {
         // this height).
         for &(n, k) in &[(MOE_FF * 2, HID as u32), (HID as u32, MOE_FF)] {
             for fmt in [
-                crate::kernels::sub::QuantFormat::Q4Affine,
-                crate::kernels::sub::QuantFormat::Q6,
-                crate::kernels::sub::QuantFormat::NvFp4,
+                crate::shaders::QuantFormat::Q4Affine,
+                crate::shaders::QuantFormat::Q6,
+                crate::shaders::QuantFormat::NvFp4,
             ] {
                 gemm_tunable_sparse.insert(
                     (n, k, false, fmt as u32),
-                    crate::kernels::sub::gemm_tunable::pipeline_for_sparse(ctx, n, k, false, fmt)?,
+                    crate::shaders::gemm_tunable::pipeline_for_sparse(ctx, n, k, false, fmt)?,
                 );
                 if moe_fuse_gather_enabled() && (n, k) == (MOE_FF * 2, HID as u32) {
                     gemm_tunable_sparse.insert(
                         (n, k, true, fmt as u32),
-                        crate::kernels::sub::gemm_tunable::pipeline_for_sparse(ctx, n, k, true, fmt)?,
+                        crate::shaders::gemm_tunable::pipeline_for_sparse(ctx, n, k, true, fmt)?,
                     );
                 }
                 if sparse_wide_bm != 32 && prefill_batch_enabled() {
                     gemm_tunable_sparse_wide.insert(
                         (n, k, false, fmt as u32),
-                        crate::kernels::sub::gemm_tunable::pipeline_for_sparse_bm(
+                        crate::shaders::gemm_tunable::pipeline_for_sparse_bm(
                             ctx,
                             n,
                             k,
@@ -945,7 +939,7 @@ impl StepPipelines {
                     if moe_fuse_gather_enabled() && (n, k) == (MOE_FF * 2, HID as u32) {
                         gemm_tunable_sparse_wide.insert(
                             (n, k, true, fmt as u32),
-                            crate::kernels::sub::gemm_tunable::pipeline_for_sparse_bm(
+                            crate::shaders::gemm_tunable::pipeline_for_sparse_bm(
                                 ctx,
                                 n,
                                 k,
@@ -959,17 +953,17 @@ impl StepPipelines {
             }
         }
         let prod = variant;
-        let dump = crate::kernels::sub::variant::KernelVariant::TEST_DUMP;
+        let dump = crate::shaders::variant::KernelVariant::TEST_DUMP;
         Ok(Self {
-            memzero: crate::kernels::sub::memzero_bytes::pipeline_for(ctx, prod)?,
-            rmsnorm: crate::kernels::sub::rms_norm_rows_tiled::pipeline_for(
+            memzero: crate::shaders::memzero_bytes::pipeline_for(ctx, prod)?,
+            rmsnorm: crate::shaders::rms_norm_rows_tiled::pipeline_for(
                 ctx,
-                crate::kernels::sub::rms_norm_rows_tiled::TiledVariant::HALF_IN,
+                crate::shaders::rms_norm_rows_tiled::TiledVariant::HALF_IN,
                 prod,
             )?,
-            rmsnorm_f32: crate::kernels::sub::rms_norm_rows_tiled::pipeline_for(
+            rmsnorm_f32: crate::shaders::rms_norm_rows_tiled::pipeline_for(
                 ctx,
-                crate::kernels::sub::rms_norm_rows_tiled::TiledVariant::F32_IN,
+                crate::shaders::rms_norm_rows_tiled::TiledVariant::F32_IN,
                 prod,
             )?,
             gemm_tunable_raw,
@@ -984,90 +978,94 @@ impl StepPipelines {
             gemm_q8_rowk_acc_f32,
             gemm_bf16_rowk_acc_f32,
             f32_to_half_scale,
-            qk_rope_kv: crate::kernels::sub::qk_rope_kv::pipeline_for_kv(ctx, prod, fmt)?,
+            qk_rope_kv: crate::shaders::qk_rope_kv::pipeline_for_kv(ctx, prod, fmt)?,
             qk_rope_kv_side: if crate::flags::prefill_kv_f32_enabled() {
-                Some(crate::kernels::sub::qk_rope_kv::pipeline_for_kv_side(
+                Some(crate::shaders::qk_rope_kv::pipeline_for_kv_side(
                     ctx, prod, fmt,
                 )?)
             } else {
                 None
             },
             attention_mma2_side: if crate::flags::prefill_kv_f32_enabled() {
-                Some(crate::kernels::sub::attention::pipeline_mma2_for_kv_side(
+                Some(crate::shaders::attention::pipeline_mma2_for_kv_side(
                     ctx, prod, fmt,
                 )?)
             } else {
                 None
             },
             attention_mma_full_side: if crate::flags::prefill_kv_f32_enabled() {
-                Some(crate::kernels::sub::attention::pipeline_mma_full_for_kv_side(ctx, prod, fmt)?)
-            } else {
-                None
-            },
-            kv_f32_side_hydrate: if crate::flags::prefill_kv_f32_enabled() {
-                Some(crate::kernels::sub::kv_f32_side_hydrate::pipeline_for_kv(
+                Some(crate::shaders::attention::pipeline_mma_full_for_kv_side(
                     ctx, prod, fmt,
                 )?)
             } else {
                 None
             },
-            attention: crate::kernels::sub::attention::pipeline_for_kv(ctx, prod, fmt)?,
-            attention_mma2: crate::kernels::sub::attention::pipeline_mma2_for_kv(ctx, prod, fmt)?,
-            attention_mma_full: crate::kernels::sub::attention::pipeline_mma_full_for_kv(
+            kv_f32_side_hydrate: if crate::flags::prefill_kv_f32_enabled() {
+                Some(crate::shaders::kv_f32_side_hydrate::pipeline_for_kv(
+                    ctx, prod, fmt,
+                )?)
+            } else {
+                None
+            },
+            attention: crate::shaders::attention::pipeline_for_kv(ctx, prod, fmt)?,
+            attention_mma2: crate::shaders::attention::pipeline_mma2_for_kv(ctx, prod, fmt)?,
+            attention_mma_full: crate::shaders::attention::pipeline_mma_full_for_kv(
                 ctx, prod, fmt,
             )?,
-            residual: crate::kernels::sub::residual_half::pipeline_for(ctx, prod)?,
-            glu: crate::kernels::sub::swiglu::pipeline_for(
+            residual: crate::shaders::residual_half::pipeline_for(ctx, prod)?,
+            glu: crate::shaders::swiglu::pipeline_for(
                 ctx,
-                crate::kernels::sub::SwigluSplitVariant::MONOLITH_GLU,
+                crate::shaders::SwigluSplitVariant::MONOLITH_GLU,
                 prod,
             )?,
-            router: crate::kernels::sub::moe_router::pipeline_for(ctx, prod)?,
+            router: crate::shaders::moe_router::pipeline_for(ctx, prod)?,
             router_topk: ctx.compile_subkernel(
-                shader_include::include_metal!("kernels/moe_router_topk.metal"),
+                shader_include::include_metal!("moe/moe_router/moe_router_topk.metal"),
                 "moe_router_topk",
                 prod,
             )?,
-            bucket_count: crate::kernels::sub::moe_bucket_count::pipeline_for(ctx, prod)?,
-            bucket_fill: crate::kernels::sub::moe_bucket_fill::pipeline_for(ctx, prod)?,
-            gather_rows_bf16_to_f32: crate::kernels::sub::gather_rows::pipeline_for_fmt(
+            bucket_count: crate::shaders::moe_bucket_count::pipeline_for(ctx, prod)?,
+            bucket_fill: crate::shaders::moe_bucket_fill::pipeline_for(ctx, prod)?,
+            gather_rows_bf16_to_f32: crate::shaders::gather_rows::pipeline_for_fmt(
                 ctx, prod, false, true,
             )?,
-            gelu_swiglu_gate_up: crate::kernels::sub::swiglu::pipeline_for_moe(ctx, prod)?,
-            moe_scatter_weighted: crate::kernels::sub::moe_scatter_weighted::pipeline_for(
-                ctx, prod,
-            )?,
-            moe_grouped: crate::kernels::sub::moe_grouped::pipeline_for(ctx, prod)?,
-            moe_grouped_nvfp4: crate::kernels::sub::moe_grouped_nvfp4::pipeline_for(ctx, prod)?,
-            moe_grouped_dump: crate::kernels::sub::moe_grouped::pipeline_for(ctx, dump)?,
-            embed_gather: crate::kernels::sub::embed_gather::pipeline_for(ctx, prod)?,
-            embed_gather_bf16: crate::kernels::sub::embed_gather::pipeline_for_fmt(ctx, prod, true)?,
-            logit_rowstats: crate::kernels::sub::logit_rowstats::pipeline_for(ctx, prod)?,
-            sc_prob_cols: crate::kernels::sub::sc_prob_cols::pipeline_for(ctx, prod)?,
+            gelu_swiglu_gate_up: crate::shaders::swiglu::pipeline_for_moe(ctx, prod)?,
+            moe_scatter_weighted: crate::shaders::moe_scatter_weighted::pipeline_for(ctx, prod)?,
+            moe_grouped: crate::shaders::moe_grouped::pipeline_for(ctx, prod)?,
+            moe_grouped_nvfp4: crate::shaders::moe_grouped_nvfp4::pipeline_for(ctx, prod)?,
+            moe_grouped_dump: crate::shaders::moe_grouped::pipeline_for(ctx, dump)?,
+            embed_gather: crate::shaders::embed_gather::pipeline_for(ctx, prod)?,
+            embed_gather_bf16: crate::shaders::embed_gather::pipeline_for_fmt(ctx, prod, true)?,
+            logit_rowstats: crate::shaders::logit_rowstats::pipeline_for(ctx, prod)?,
+            sc_prob_cols: crate::shaders::sc_prob_cols::pipeline_for(ctx, prod)?,
             // arena bf16 in-place scale (convert_scale src_f32=false, dst_f32=false).
-            half_scale: crate::kernels::sub::convert_scale::pipeline_for_fmt(ctx, prod, false, false)?,
-            softcap: crate::kernels::sub::softcap_half::pipeline_for(ctx, prod)?,
-            sample_rowstats: crate::kernels::sub::sample_rowstats::pipeline_for(ctx, prod)?,
-            sample_commit: crate::kernels::sub::sample_commit::pipeline_for(ctx, prod)?,
-            sample_apply: crate::kernels::sub::sample_apply::pipeline_for(ctx, prod)?,
-            sample_write: crate::kernels::sub::sample_write::pipeline_for(ctx, prod)?,
+            half_scale: crate::shaders::convert_scale::pipeline_for_fmt(ctx, prod, false, false)?,
+            softcap: crate::shaders::softcap_half::pipeline_for(ctx, prod)?,
+            sample_rowstats: crate::shaders::sample_rowstats::pipeline_for(ctx, prod)?,
+            sample_commit: crate::shaders::sample_commit::pipeline_for(ctx, prod)?,
+            sample_apply: crate::shaders::sample_apply::pipeline_for(ctx, prod)?,
+            sample_write: crate::shaders::sample_write::pipeline_for(ctx, prod)?,
             compact_active_rows: ctx.compile_kernel(
-                shader_include::include_metal!("kernels/compact_active_rows.metal"),
+                shader_include::include_metal!(
+                    "sample/compact_active_rows/compact_active_rows.metal"
+                ),
                 "compact_active_rows",
             )?,
-            gather_rows_bf16: crate::kernels::sub::gather_rows::pipeline_for_fmt(
+            gather_rows_bf16: crate::shaders::gather_rows::pipeline_for_fmt(
                 ctx, prod, false, false,
             )?,
             scatter_logits_rows: ctx.compile_kernel(
-                shader_include::include_metal!("kernels/scatter_logits_rows.metal"),
+                shader_include::include_metal!(
+                    "sample/scatter_logits_rows/scatter_logits_rows.metal"
+                ),
                 "scatter_logits_rows",
             )?,
             sc_sparse_select: ctx.compile_kernel(
-                shader_include::include_metal!("kernels/sc_sparse_select.metal"),
+                shader_include::include_metal!("sc/sc_sparse_select/sc_sparse_select.metal"),
                 "sc_sparse_select",
             )?,
             sc_sparse_gather: ctx.compile_kernel(
-                shader_include::include_metal!("kernels/sc_sparse_gather.metal"),
+                shader_include::include_metal!("sc/sc_sparse_gather/sc_sparse_gather.metal"),
                 "sc_sparse_gather",
             )?,
         })
@@ -1229,9 +1227,9 @@ fn moe_grouped_grid_info() -> MoeGroupedGridInfo {
     MoeGroupedGridInfo {
         gate_n: MOE_FF * 2,
         hid: HID as u32,
-        n_tile: crate::kernels::sub::gemm_common::n_tile() as u32,
-        tpg: crate::kernels::sub::gemm_common::THREADS_PER_TG as u32,
-        tunable_n_tile: crate::kernels::sub::gemm_tunable::SPARSE_BN as u32,
+        n_tile: crate::shaders::gemm_common::n_tile() as u32,
+        tpg: crate::shaders::gemm_common::THREADS_PER_TG as u32,
+        tunable_n_tile: crate::shaders::gemm_tunable::SPARSE_BN as u32,
         tunable_wide_n_tile: 64,
     }
 }
@@ -1287,12 +1285,12 @@ impl<'a> StepEnc<'a> {
 
 const MOE_SLOTS: u32 = (PREFILL_M * TOP_K) as u32;
 
-fn grouped_expert_blob_bytes_per_expert(format: crate::kernels::sub::QuantFormat) -> u64 {
+fn grouped_expert_blob_bytes_per_expert(format: crate::shaders::QuantFormat) -> u64 {
     use crate::dgq::layout::{nvfp4_matrix_bytes, q4_matrix_bytes};
     let hidden = HID;
     let moe_ff = MOE_FF as usize;
     match format {
-        crate::kernels::sub::QuantFormat::NvFp4 => {
+        crate::shaders::QuantFormat::NvFp4 => {
             (nvfp4_matrix_bytes(moe_ff * 2, hidden) + nvfp4_matrix_bytes(hidden, moe_ff)) as u64
         }
         _ => (q4_matrix_bytes(moe_ff * 2, hidden) + q4_matrix_bytes(hidden, moe_ff)) as u64,
@@ -1562,8 +1560,8 @@ impl StepEnc<'_> {
         self.sink_set_bytes(&w_off, 3);
         self.sink_set_bytes(&m, 4);
         let grid = MTLSize {
-            width: div_up(n as usize, crate::kernels::sub::gemm_tunable::TUNE_BN),
-            height: div_up(m as usize, crate::kernels::sub::gemm_tunable::TUNE_BM),
+            width: div_up(n as usize, crate::shaders::gemm_tunable::TUNE_BN),
+            height: div_up(m as usize, crate::shaders::gemm_tunable::TUNE_BM),
             depth: 1,
         };
         let tg = MTLSize {
@@ -1578,13 +1576,13 @@ impl StepEnc<'_> {
     fn gemm_q4_stacked(
         &mut self,
         x_off: u64,
-        segs: &[crate::kernels::sub::gemm_block_stacked::GemmStackedSeg],
+        segs: &[crate::shaders::gemm_block_stacked::GemmStackedSeg],
         m: u32,
         k: u32,
         n_total: u32,
     ) -> Result<(), Error> {
         debug_assert!(segs.len() <= STACKED_SEG_MAX, "too many stacked segments");
-        let ps = crate::kernels::sub::gemm_tunable::stacked_pipeline_for(
+        let ps = crate::shaders::gemm_tunable::stacked_pipeline_for(
             self.ctx,
             n_total,
             k,
@@ -1597,8 +1595,8 @@ impl StepEnc<'_> {
         self.bind_blob(2);
         self.sink_set_bytes(&m, 3);
         let grid = MTLSize {
-            width: div_up(n_total as usize, crate::kernels::sub::gemm_tunable::TUNE_BN),
-            height: div_up(m as usize, crate::kernels::sub::gemm_tunable::TUNE_BM),
+            width: div_up(n_total as usize, crate::shaders::gemm_tunable::TUNE_BN),
+            height: div_up(m as usize, crate::shaders::gemm_tunable::TUNE_BM),
             depth: 1,
         };
         let tg = MTLSize {
@@ -1615,22 +1613,22 @@ impl StepEnc<'_> {
     fn gemm_bf16_stacked(
         &mut self,
         x_off: u64,
-        segs: &[crate::kernels::sub::gemm_block_stacked::GemmStackedSeg],
+        segs: &[crate::shaders::gemm_block_stacked::GemmStackedSeg],
         m: u32,
         k: u32,
         n_total: u32,
     ) -> Result<(), Error> {
         debug_assert!(segs.len() <= STACKED_SEG_MAX, "too many stacked segments");
-        let ps = crate::kernels::sub::gemm_tunable::stacked_pipeline_for(
+        let ps = crate::shaders::gemm_tunable::stacked_pipeline_for(
             self.ctx,
             n_total,
             k,
-            crate::kernels::sub::QuantFormat::Raw,
+            crate::shaders::QuantFormat::Raw,
             segs,
         )?;
         let grid = MTLSize {
-            width: div_up(n_total as usize, crate::kernels::sub::gemm_tunable::TUNE_BN),
-            height: div_up(m as usize, crate::kernels::sub::gemm_tunable::TUNE_BM),
+            width: div_up(n_total as usize, crate::shaders::gemm_tunable::TUNE_BN),
+            height: div_up(m as usize, crate::shaders::gemm_tunable::TUNE_BM),
             depth: 1,
         };
         self.sink_set_pipeline(ps.as_ref());
@@ -1721,8 +1719,8 @@ impl StepEnc<'_> {
     ) -> Result<(), Error> {
         let ps = self.ps.dense_q8(n, k)?;
         let grid = MTLSize {
-            width: div_up(n as usize, crate::kernels::sub::gemm_tunable::TUNE_BN),
-            height: div_up(m as usize, crate::kernels::sub::gemm_tunable::TUNE_BM),
+            width: div_up(n as usize, crate::shaders::gemm_tunable::TUNE_BN),
+            height: div_up(m as usize, crate::shaders::gemm_tunable::TUNE_BM),
             depth: 1,
         };
         self.sink_set_pipeline(ps);
@@ -1753,8 +1751,8 @@ impl StepEnc<'_> {
     ) -> Result<(), Error> {
         let ps = self.ps.dense_raw(n, k)?;
         let grid = MTLSize {
-            width: div_up(n as usize, crate::kernels::sub::gemm_tunable::TUNE_BN),
-            height: div_up(m as usize, crate::kernels::sub::gemm_tunable::TUNE_BM),
+            width: div_up(n as usize, crate::shaders::gemm_tunable::TUNE_BN),
+            height: div_up(m as usize, crate::shaders::gemm_tunable::TUNE_BM),
             depth: 1,
         };
         self.sink_set_pipeline(ps);
@@ -1785,8 +1783,8 @@ impl StepEnc<'_> {
     ) -> Result<(), Error> {
         let ps = self.ps.dense_raw(n, k)?;
         let grid = MTLSize {
-            width: div_up(n as usize, crate::kernels::sub::gemm_tunable::TUNE_BN),
-            height: div_up(m as usize, crate::kernels::sub::gemm_tunable::TUNE_BM),
+            width: div_up(n as usize, crate::shaders::gemm_tunable::TUNE_BN),
+            height: div_up(m as usize, crate::shaders::gemm_tunable::TUNE_BM),
             depth: 1,
         };
         self.sink_set_pipeline(ps);
@@ -1815,8 +1813,8 @@ impl StepEnc<'_> {
     ) -> Result<(), Error> {
         let ps = self.ps.dense_q8(n, k)?;
         let grid = MTLSize {
-            width: div_up(n as usize, crate::kernels::sub::gemm_tunable::TUNE_BN),
-            height: div_up(m as usize, crate::kernels::sub::gemm_tunable::TUNE_BM),
+            width: div_up(n as usize, crate::shaders::gemm_tunable::TUNE_BN),
+            height: div_up(m as usize, crate::shaders::gemm_tunable::TUNE_BM),
             depth: 1,
         };
         self.sink_set_pipeline(ps);
@@ -1855,7 +1853,7 @@ impl StepEnc<'_> {
         self.sink_set_bytes(&m, 4);
         let grid = MTLSize {
             width: div_up(n as usize, 32),
-            height: div_up(m as usize, crate::kernels::sub::gemm_common::M_TILE),
+            height: div_up(m as usize, crate::shaders::gemm_common::M_TILE),
             depth: 1,
         };
         let tg = MTLSize {
@@ -1889,7 +1887,7 @@ impl StepEnc<'_> {
         self.sink_set_bytes(&m, 4);
         let grid = MTLSize {
             width: div_up(n as usize, 32),
-            height: div_up(m as usize, crate::kernels::sub::gemm_common::M_TILE),
+            height: div_up(m as usize, crate::shaders::gemm_common::M_TILE),
             depth: 1,
         };
         let tg = MTLSize {
@@ -1923,7 +1921,7 @@ impl StepEnc<'_> {
         self.sink_set_bytes(&m, 4);
         let grid = MTLSize {
             width: div_up(n as usize, 32),
-            height: div_up(m as usize, crate::kernels::sub::gemm_common::M_TILE),
+            height: div_up(m as usize, crate::shaders::gemm_common::M_TILE),
             depth: 1,
         };
         let tg = MTLSize {
@@ -1991,7 +1989,7 @@ impl StepEnc<'_> {
         let dims = [CANVAS as u32, VOCAB as u32];
         self.sink_set_bytes(&dims, 2);
         self.bind_debug_status(3);
-        let (grid, tg) = crate::kernels::sub::logit_rowstats::dispatch_shape(CANVAS);
+        let (grid, tg) = crate::shaders::logit_rowstats::dispatch_shape(CANVAS);
         self.sink_dispatch(grid, tg);
     }
 
@@ -2010,7 +2008,7 @@ impl StepEnc<'_> {
         let params = [CANVAS as u32, VOCAB as u32, v0, chunk];
         self.sink_set_bytes(&params, 3);
         self.bind_debug_status(4);
-        let (grid, tg) = crate::kernels::sub::sc_prob_cols::dispatch_shape(CANVAS, chunk as usize);
+        let (grid, tg) = crate::shaders::sc_prob_cols::dispatch_shape(CANVAS, chunk as usize);
         self.sink_dispatch(grid, tg);
     }
 
@@ -2317,7 +2315,7 @@ impl StepEnc<'_> {
     ) -> Result<(), Error> {
         let fm = self.forward_m;
         let layer_off = layer_byte_offset(layer);
-        let router_dims = crate::kernels::sub::moe_router::RouterDims {
+        let router_dims = crate::shaders::moe_router::RouterDims {
             canvas: fm as u32,
             hidden: HID as u32,
             n_experts: N_EXPERTS as u32,
@@ -2529,7 +2527,7 @@ impl StepEnc<'_> {
             self.sink_set_buffer(&self.bufs.arena, self.arena().moein_off() as usize, 7);
         }
         let tg = MTLSize {
-            width: crate::kernels::sub::gemm_common::THREADS_PER_TG,
+            width: crate::shaders::gemm_common::THREADS_PER_TG,
             height: 1,
             depth: 1,
         };
@@ -2676,7 +2674,7 @@ impl StepEnc<'_> {
         self.bind_blob(2);
         self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 3);
         self.bind_route(4);
-        let grouped_dims = crate::kernels::sub::moe_grouped::GroupedDims {
+        let grouped_dims = crate::shaders::moe_grouped::GroupedDims {
             canvas: fm as u32,
             hidden: HID as u32,
             moe_ff: MOE_FF,
@@ -2817,7 +2815,7 @@ impl StepEnc<'_> {
         self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 3);
         self.bind_route(4);
         self.sink_set_buffer(&self.bufs.arena, self.arena().soft_off() as usize, 6);
-        let grouped_dims = crate::kernels::sub::moe_grouped::GroupedDims {
+        let grouped_dims = crate::shaders::moe_grouped::GroupedDims {
             canvas: CANVAS as u32,
             hidden: HID as u32,
             moe_ff: MOE_FF,
@@ -3035,7 +3033,7 @@ impl StepEnc<'_> {
         self.bind_blob(4);
         self.sink_set_buffer(&self.bufs.layout, layer_off as usize, 5);
         self.bind_params(6);
-        let attn_dims = crate::kernels::sub::qk_rope_kv::AttnDims {
+        let attn_dims = crate::shaders::qk_rope_kv::AttnDims {
             canvas: self.active_canvas as u32,
             n_q_heads: STEP_NQ_HEADS as u32,
             causal: 0,
@@ -3135,7 +3133,7 @@ impl StepEnc<'_> {
         } else {
             0
         };
-        let attn_dims = crate::kernels::sub::qk_rope_kv::AttnDims {
+        let attn_dims = crate::shaders::qk_rope_kv::AttnDims {
             canvas: self.active_canvas as u32,
             n_q_heads: STEP_NQ_HEADS as u32,
             causal: u32::from(self.prefill_causal),
@@ -3160,7 +3158,7 @@ impl StepEnc<'_> {
             MTLSize {
                 width: self
                     .active_canvas
-                    .div_ceil(crate::kernels::sub::attention::MMA_M_TILE),
+                    .div_ceil(crate::shaders::attention::MMA_M_TILE),
                 height: l.n_kv_heads as usize,
                 depth: 1,
             }
@@ -3171,7 +3169,7 @@ impl StepEnc<'_> {
             MTLSize {
                 width: self
                     .active_canvas
-                    .div_ceil(crate::kernels::sub::attention::MMA_M_TILE),
+                    .div_ceil(crate::shaders::attention::MMA_M_TILE),
                 height: l.n_kv_heads as usize,
                 depth: group,
             }
@@ -3185,7 +3183,7 @@ impl StepEnc<'_> {
         // mma_full uses QG*32 lanes; scalar/mma2 use 64.
         let tg = MTLSize {
             width: if use_mma_full {
-                crate::kernels::sub::attention::MMA_FULL_QG * 32
+                crate::shaders::attention::MMA_FULL_QG * 32
             } else {
                 64
             },
@@ -3587,7 +3585,7 @@ impl StepEnc<'_> {
         let vocab = VOCAB as u32;
         self.sink_set_bytes(&vocab, 6);
         self.bind_debug_status(7);
-        let (grid, tg) = crate::kernels::sub::embed_gather::dispatch_shape(HID, fm);
+        let (grid, tg) = crate::shaders::embed_gather::dispatch_shape(HID, fm);
         self.sink_dispatch(grid, tg);
     }
 
@@ -4137,7 +4135,7 @@ pub fn scheduled_temperature(steps_done: u32, params: &StepParams) -> f32 {
 }
 
 fn read_logit_f32(logits: &ProtocolObject<dyn MTLBuffer>, row: usize, col: u32) -> f32 {
-    use crate::kernels::sub::bf16;
+    use crate::shaders::bf16;
     let byte_off = (row * VOCAB + col as usize) * 2;
     let ptr = unsafe { logits.contents().as_ptr().add(byte_off) as *const u16 };
     bf16::bf16_bits_to_f32(unsafe { *ptr })
@@ -4175,7 +4173,7 @@ pub fn log_denoise_parity_step(
 }
 
 fn count_non_finite_half(buf: &ProtocolObject<dyn MTLBuffer>, elems: usize) -> (usize, f32) {
-    use crate::kernels::sub::bf16;
+    use crate::shaders::bf16;
     let ptr = buf.contents().as_ptr() as *const u16;
     let mut bad = 0usize;
     let mut max_abs = 0.0f32;
@@ -4202,7 +4200,7 @@ fn f16_buffer_stats(
     elems: usize,
     sample: usize,
 ) -> (bool, f32) {
-    use crate::kernels::sub::f16::f16_bits_to_f32;
+    use crate::shaders::f16::f16_bits_to_f32;
     let ptr = unsafe { buf.contents().as_ptr().add(byte_off) as *const u16 };
     let mut max_abs = 0.0f32;
     let mut finite = true;
@@ -4229,7 +4227,7 @@ fn half_buffer_stats(
     elems: usize,
     sample: usize,
 ) -> (bool, f32) {
-    use crate::kernels::sub::bf16;
+    use crate::shaders::bf16;
     let ptr = unsafe { buf.contents().as_ptr().add(byte_off) as *const u16 };
     let mut max_abs = 0.0f32;
     let mut finite = true;
@@ -4509,7 +4507,7 @@ impl StepRuntime {
                         this.bufs.arena.contents().as_ptr().add(off as usize) as *const u16
                     };
                     for i in 0..m_rows * per_row {
-                        let v = crate::kernels::sub::bf16::bf16_bits_to_f32(unsafe { *ptr.add(i) });
+                        let v = crate::shaders::bf16::bf16_bits_to_f32(unsafe { *ptr.add(i) });
                         if !v.is_finite() {
                             e.2 = Some(i / per_row);
                             break;
@@ -4722,8 +4720,8 @@ impl StepRuntime {
         // runtime_step_variant(); scope the arena-f16 compile mode to this
         // dispatch so those lazy compiles (and their cache keys) inherit the
         // active set's arena dtype.
-        let saved_af16 = crate::kernels::sub::variant::arena_f16_compile_enabled();
-        crate::kernels::sub::variant::set_arena_f16_compile(saved_af16 || self.arena_f16_mode);
+        let saved_af16 = crate::shaders::variant::arena_f16_compile_enabled();
+        crate::shaders::variant::set_arena_f16_compile(saved_af16 || self.arena_f16_mode);
         let mut enc = StepEnc {
             enc: cmd
                 .computeCommandEncoder()
@@ -4745,7 +4743,7 @@ impl StepRuntime {
             sliding_window: self.text_config.sliding_window as u32,
         };
         let encode_result = f(&mut enc);
-        crate::kernels::sub::variant::set_arena_f16_compile(saved_af16);
+        crate::shaders::variant::set_arena_f16_compile(saved_af16);
         encode_result?;
         enc.enc.endEncoding();
         cmd.commit();
@@ -5140,8 +5138,8 @@ static STEP_PIPELINES_CACHE: std::sync::OnceLock<
 struct StepPipelineKey(u8);
 
 fn step_pipeline_key(
-    variant: crate::kernels::sub::variant::KernelVariant,
-    fmt: crate::kernels::sub::kv_quant::KvFormat,
+    variant: crate::shaders::variant::KernelVariant,
+    fmt: crate::shaders::kv_quant::KvFormat,
 ) -> StepPipelineKey {
     // KV format code occupies bits 3-4 (0=f16, 1=q8, 2=q4); bit 5 = fp16 arena.
     StepPipelineKey(
@@ -5155,9 +5153,9 @@ fn step_pipeline_key(
 
 fn shared_step_pipelines(
     ctx: &MetalContext,
-    fmt: crate::kernels::sub::kv_quant::KvFormat,
+    fmt: crate::shaders::kv_quant::KvFormat,
 ) -> Result<&'static StepPipelines, Error> {
-    let variant = crate::kernels::sub::variant::runtime_step_variant();
+    let variant = crate::shaders::variant::runtime_step_variant();
     let key = step_pipeline_key(variant, fmt);
     let cache = STEP_PIPELINES_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let mut guard = cache
@@ -5233,7 +5231,7 @@ pub fn build_step_runtime(
     let layout = build_layout(&offsets, cfg.max_seq);
     if crate::flags::progress_enabled() {
         let fmt = crate::flags::kv_format(cfg.max_seq);
-        if fmt != crate::kernels::sub::kv_quant::KvFormat::F16 {
+        if fmt != crate::shaders::kv_quant::KvFormat::F16 {
             eprintln!(
                 "step-kernel: {} KV cache (auto at long context, max_seq={}) — shrinks KV to stay under the GPU working-set cap",
                 fmt.label(),
@@ -5286,15 +5284,15 @@ pub fn build_step_runtime(
     // fp16 too — bisects kernel-level breakage from mode-switch wiring.
     let f16_all = crate::flags::arena_f16_all_enabled();
     if f16_all {
-        crate::kernels::sub::variant::set_arena_f16_compile(true);
+        crate::shaders::variant::set_arena_f16_compile(true);
     }
     let pipelines = shared_step_pipelines(&ctx, kv_fmt)?;
     // f16_all: LEAVE the compile-mode atomic on — lazy dispatch-time compiles
     // (stacked GEMM) must also build f16 for the whole session.
     let pipelines_prefill_f16 = if crate::flags::prefill_f16_enabled() {
-        crate::kernels::sub::variant::set_arena_f16_compile(true);
+        crate::shaders::variant::set_arena_f16_compile(true);
         let out = shared_step_pipelines(&ctx, kv_fmt);
-        crate::kernels::sub::variant::set_arena_f16_compile(false);
+        crate::shaders::variant::set_arena_f16_compile(false);
         Some(out?)
     } else {
         None
@@ -5392,7 +5390,7 @@ pub fn build_step_runtime(
             b
         },
         dummy_dump: alloc_buffer(&ctx.device, 4)?,
-        debug_status: if crate::kernels::sub::variant::runtime_kernel_debug_enabled() {
+        debug_status: if crate::shaders::variant::runtime_kernel_debug_enabled() {
             Some(alloc_buffer(
                 &ctx.device,
                 crate::metal::debug_status::DEBUG_STATUS_BYTES,
@@ -5897,10 +5895,10 @@ pub fn run_step_attn_layer_capture(
     let mut q_pre_rope = q_raw_proj.clone();
     for h in 0..n_heads {
         let off = h * hd;
-        crate::kernels::cpu::attention::rms_norm_head(
+        crate::shaders::cpu::attention::rms_norm_head(
             &mut q_pre_rope[off..off + hd],
             Some(&q_norm_w),
-            crate::kernels::cpu::attention::RMS_EPS,
+            crate::shaders::cpu::attention::RMS_EPS,
         );
     }
 
@@ -5995,7 +5993,7 @@ fn routes_from_route_scratch(route: &RouteScratch) -> Vec<RouteResult> {
     for tok in 0..CANVAS {
         let indices = (0..TOP_K).map(|k| route.expert[tok][k] as usize).collect();
         let weights = (0..TOP_K)
-            .map(|k| crate::kernels::sub::bf16::bf16_bits_to_f32(route.weight[tok][k]))
+            .map(|k| crate::shaders::bf16::bf16_bits_to_f32(route.weight[tok][k]))
             .collect();
         routes.push(RouteResult { indices, weights });
     }
@@ -6033,7 +6031,7 @@ fn read_f32_arena_row(
 
 fn rebucket_route_scratch(route: &mut RouteScratch) {
     let experts: Vec<Vec<u32>> = route.expert.iter().map(|row| row.to_vec()).collect();
-    let state = crate::kernels::cpu::moe_router::moe_bucket_phases(
+    let state = crate::shaders::cpu::moe_router::moe_bucket_phases(
         &experts,
         N_EXPERTS as u32,
         TOP_K as u32,
@@ -6080,7 +6078,7 @@ fn patch_route_position(
 }
 
 fn f32_to_f16_bits(v: f32) -> u16 {
-    crate::kernels::sub::f16::f32_to_f16_bits(v)
+    crate::shaders::f16::f32_to_f16_bits(v)
 }
 
 fn route_override_from_ref_json(
@@ -6248,8 +6246,8 @@ pub fn run_step_moe_batched_pin_capture(
     model_dir: &Path,
     cfg: &StepSmokeConfig,
     layer: usize,
-) -> Result<crate::kernels::sub::moe_batched_pin::MoeBatchedPinDump, Error> {
-    use crate::kernels::sub::moe_batched_pin::{
+) -> Result<crate::shaders::moe_batched_pin::MoeBatchedPinDump, Error> {
+    use crate::shaders::moe_batched_pin::{
         MoeBatchedPinDump, MoeBatchedPinLayout, MoeBatchedPinRoute,
         verify_batched_stages_cpu_with_verdict,
     };
@@ -6448,7 +6446,7 @@ pub fn run_step_moe_layer_capture(
     let p = format!("model.decoder.layers.{layer}.router");
     let router_scale = store.tensor_f32(&format!("{p}.scale"))?;
     let router_proj = store.tensor_f32(&format!("{p}.proj.weight"))?;
-    let router_logits = crate::kernels::cpu::moe_router::router_logits_row(
+    let router_logits = crate::shaders::cpu::moe_router::router_logits_row(
         &post_attn,
         &router_scale,
         &router_proj,
@@ -6934,7 +6932,7 @@ pub fn read_arena_buffer_f32(
     byte_off: usize,
     elems: usize,
 ) -> Vec<f32> {
-    use crate::kernels::sub::bf16;
+    use crate::shaders::bf16;
     let ptr = unsafe { buf.contents().as_ptr().add(byte_off) as *const u16 };
     (0..elems)
         .map(|i| unsafe { bf16::bf16_bits_to_f32(*ptr.add(i)) })
@@ -6947,7 +6945,7 @@ pub fn read_half_buffer_f32(
     byte_off: usize,
     elems: usize,
 ) -> Vec<f32> {
-    use crate::kernels::sub::bf16;
+    use crate::shaders::bf16;
     let ptr = unsafe { buf.contents().as_ptr().add(byte_off) as *const u16 };
     (0..elems)
         .map(|i| unsafe { bf16::bf16_bits_to_f32(*ptr.add(i)) })
@@ -7137,7 +7135,7 @@ mod tests {
         // `.dgq` sharpens over the 8-step block; GEMM tg=(128,1,1) bug held ~1 accept/step
         // (~8 total) with mean_entropy~10. Healthy cumulative accept >> 150.
         const MIN_ACCEPT: u32 = 150;
-        let Some(dir) = crate::kernels::sub::test_util::dgq_model_dir() else {
+        let Some(dir) = crate::shaders::test_util::dgq_model_dir() else {
             eprintln!("skip monolith_one_step_accept_regression: quantized model not present");
             return;
         };
@@ -7182,7 +7180,7 @@ mod tests {
         use crate::model::moe::MoeScratch;
         use std::path::Path;
 
-        let Some(dir) = crate::kernels::sub::test_util::dgq_model_dir() else {
+        let Some(dir) = crate::shaders::test_util::dgq_model_dir() else {
             eprintln!("skip moe_grouped_layer2_expert_offset_and_bytes_parity");
             return;
         };
@@ -7537,12 +7535,12 @@ mod tests {
 
     #[test]
     fn fused_gate_up_gemm_matches_split_in_full_arena() {
-        use crate::kernels::sub::QuantFormat;
-        use crate::kernels::sub::gemm_block_stacked::pipeline_for;
-        use crate::kernels::sub::gemm_q4;
         use crate::metal::DgqGpuBlob;
         use crate::metal::buffer::BufferPool;
         use crate::metal::device::MetalContext;
+        use crate::shaders::QuantFormat;
+        use crate::shaders::gemm_block_stacked::pipeline_for;
+        use crate::shaders::gemm_q4;
         use std::path::Path;
 
         fn read_plane(
@@ -7553,7 +7551,7 @@ mod tests {
             let ptr = arena.contents().as_ptr() as *const u16;
             let base = (byte_off / 2) as usize;
             (0..elems)
-                .map(|i| crate::kernels::sub::bf16::bf16_bits_to_f32(unsafe { *ptr.add(base + i) }))
+                .map(|i| crate::shaders::bf16::bf16_bits_to_f32(unsafe { *ptr.add(base + i) }))
                 .collect()
         }
 
@@ -7593,7 +7591,7 @@ mod tests {
         let x: Vec<f32> = (0..m * k)
             .map(|i| ((i as f32 + 11.0) * 0.0006).sin() * 0.14)
             .collect();
-        let x_bits = crate::kernels::sub::bf16::f32_slice_to_bf16_bits(&x);
+        let x_bits = crate::shaders::bf16::f32_slice_to_bf16_bits(&x);
         unsafe {
             let dst = arena.contents().as_ptr().add(arena_map.tmp_off() as usize) as *mut u16;
             std::ptr::copy_nonoverlapping(x_bits.as_ptr(), dst, x_bits.len());
@@ -7601,7 +7599,7 @@ mod tests {
 
         let pipeline =
             pipeline_for(&ctx, n_total, k as u32, QuantFormat::Q4Affine, &segs).expect("pipe");
-        let (grid, tg) = crate::kernels::sub::gemm_common::dispatch_shape(m, n_total as usize);
+        let (grid, tg) = crate::shaders::gemm_common::dispatch_shape(m, n_total as usize);
         let cmd = ctx.queue.commandBuffer().expect("cmd");
         let enc = cmd.computeCommandEncoder().expect("enc");
         enc.setComputePipelineState(&pipeline.pipeline);
@@ -7611,7 +7609,7 @@ mod tests {
             enc.setBuffer_offset_atIndex(Some(&arena), 0, 1);
             enc.setBuffer_offset_atIndex(Some(&gpu_blob.buffer), 0, 2);
         }
-        crate::kernels::sub::gpu_common::set_bytes(&enc, &m_u32, 3);
+        crate::shaders::gpu_common::set_bytes(&enc, &m_u32, 3);
         enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
         enc.endEncoding();
         cmd.commit();
@@ -7640,9 +7638,9 @@ mod tests {
                 enc2.setBuffer_offset_atIndex(Some(&arena2), y_off as usize, 1);
                 enc2.setBuffer_offset_atIndex(Some(&gpu_blob.buffer), 0, 2);
             }
-            crate::kernels::sub::gpu_common::set_bytes(&enc2, &w_off, 3);
-            crate::kernels::sub::gpu_common::set_bytes(&enc2, &m_u32, 4);
-            let (g2, t2) = crate::kernels::sub::gemm_common::dispatch_shape(m, DENSE_FF as usize);
+            crate::shaders::gpu_common::set_bytes(&enc2, &w_off, 3);
+            crate::shaders::gpu_common::set_bytes(&enc2, &m_u32, 4);
+            let (g2, t2) = crate::shaders::gemm_common::dispatch_shape(m, DENSE_FF as usize);
             enc2.dispatchThreadgroups_threadsPerThreadgroup(g2, t2);
             enc2.endEncoding();
             cmd2.commit();

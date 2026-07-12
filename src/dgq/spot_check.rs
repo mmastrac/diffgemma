@@ -2,8 +2,8 @@
 
 use crate::dgq::DgqStore;
 use crate::dgq::layout::QuantKind;
-use crate::kernels::cpu::bf16_to_f32;
 use crate::safetensors::Error;
+use crate::shaders::cpu::bf16_to_f32;
 use crate::weights::SafetensorStore;
 
 pub struct SpotCheckResult {
@@ -183,7 +183,7 @@ mod tests {
     #[test]
     fn spot_check_quantized_weights_vs_bf16() {
         let src = std::path::Path::new("model/transformer");
-        let Some(dgq) = crate::kernels::sub::test_util::dgq_model_dir() else {
+        let Some(dgq) = crate::shaders::test_util::dgq_model_dir() else {
             eprintln!("skip: quantized model not present");
             return;
         };
@@ -233,10 +233,10 @@ mod tests {
         let bf16 = t.bf16().expect("bf16").as_bytes();
         let orig: Vec<f32> = bf16
             .chunks_exact(2)
-            .map(|c| crate::kernels::cpu::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .map(|c| crate::shaders::cpu::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect();
 
-        let q4_path = crate::kernels::sub::test_util::dgq_model_dir()
+        let q4_path = crate::shaders::test_util::dgq_model_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("/tmp/quantized-weights"));
         let nv_path = std::path::PathBuf::from("/tmp/nvfp4-weights");
         for (label, dgq_path) in [("q4", &q4_path), ("nvfp4", &nv_path)] {

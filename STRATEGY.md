@@ -2,7 +2,7 @@
 
 Read this before writing kernels, tests, or chasing bugs. It is not a task list (that's `PLAN.md`) or the behavior contract (that's `SPEC.md`). It is **how to work on this codebase without repeating the mistakes that have already cost days.**
 
-The project: a Rust + Metal inference engine for DiffusionGemma (Gemma-4 26B-A4B MoE, discrete block diffusion) on Apple Silicon. Model semantics: `ARCHITECTURE.md` (concept) + `SPEC.md` (implemented contract); authoritative numeric behavior is in the CPU reference (`src/kernels/cpu/`, `sample.rs`) and the manifest (`model.dgq.json`).
+The project: a Rust + Metal inference engine for DiffusionGemma (Gemma-4 26B-A4B MoE, discrete block diffusion) on Apple Silicon. Model semantics: `ARCHITECTURE.md` (concept) + `SPEC.md` (implemented contract); authoritative numeric behavior is in the CPU reference (per-kernel `cpu.rs` oracles under `src/shaders/`, shared ops in `src/shaders/cpu/`, plus `sample.rs`) and the manifest (`model.dgq.json`).
 
 ---
 

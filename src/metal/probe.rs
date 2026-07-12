@@ -10,7 +10,7 @@ use objc2_metal::{
     MTLComputePipelineState, MTLDevice, MTLSize,
 };
 
-const PROBE_SHADER: &str = include_str!("../../shaders/probe.metal");
+const PROBE_SHADER: &str = include_str!("../shaders/oracle/probe/probe.metal");
 const MEMCPY_ENTRY: &str = "memcpy_f32";
 
 pub struct DeviceProbeResult {

@@ -3,9 +3,9 @@
 use crate::dgq::block::dequant_row_q8;
 use crate::dgq::layout::q8_row_bytes;
 use crate::dgq::store::DgqStore;
-use crate::kernels::cpu::bf16_to_f32;
 use crate::model::embed::EMBED_TENSOR;
 use crate::safetensors::Error;
+use crate::shaders::cpu::bf16_to_f32;
 use serde::Serialize;
 use std::path::Path;
 

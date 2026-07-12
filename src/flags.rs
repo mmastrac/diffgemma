@@ -737,8 +737,8 @@ pub fn set_gpu_working_set_cap(bytes: u64) {
 /// cap, so very long sessions stay resident instead of swapping. `DGQ_KV_Q8=1`
 /// forces on, `=0` forces off. Format is fixed per session at open; every KV
 /// writer/reader compiles a matching function-constant variant.
-pub fn kv_format(max_seq: usize) -> crate::kernels::sub::kv_quant::KvFormat {
-    use crate::kernels::sub::kv_quant::KvFormat;
+pub fn kv_format(max_seq: usize) -> crate::shaders::kv_quant::KvFormat {
+    use crate::shaders::kv_quant::KvFormat;
     // Explicit override wins.
     if let Some(force_q8) = config().kv.q8_override {
         return if force_q8 {
@@ -1110,7 +1110,7 @@ mod config_tests {
 
     #[test]
     fn kv_q8_override_is_consistent_across_consumers() {
-        use crate::kernels::sub::kv_quant::KvFormat;
+        use crate::shaders::kv_quant::KvFormat;
         let budget = 26 * 1024 * 1024 * 1024u64;
         let q8_bytes = {
             let mut cfg = Config::default();

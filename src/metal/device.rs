@@ -1,6 +1,6 @@
-use crate::kernels::sub::variant::KernelVariant;
 use crate::metal::pipeline_cache::PipelineArchiveCache;
 use crate::safetensors::Error;
+use crate::shaders::variant::KernelVariant;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSError, NSString};
@@ -178,7 +178,7 @@ impl MetalContext {
         gemm_n: u32,
         gemm_k: u32,
         quant_format: u32,
-        stacked: &crate::kernels::sub::gemm_block_stacked::StackedSegFc,
+        stacked: &crate::shaders::gemm_block_stacked::StackedSegFc,
     ) -> Result<ComputePipeline, Error> {
         let library = self.compile_library(source)?;
         Self::compile_gemm_stacked_subkernel_on_device(
@@ -199,16 +199,16 @@ impl MetalContext {
         gemm_n: u32,
         gemm_k: u32,
         quant_format: u32,
-        stacked: &crate::kernels::sub::gemm_block_stacked::StackedSegFc,
+        stacked: &crate::shaders::gemm_block_stacked::StackedSegFc,
     ) -> Result<ComputePipeline, Error> {
-        let variant = crate::kernels::sub::variant::runtime_step_variant();
+        let variant = crate::shaders::variant::runtime_step_variant();
         let fc = MTLFunctionConstantValues::new();
         let shape_assert = variant.shape_assert;
         let dump_stage = 0u32;
         let debug_fast = variant.debug_fast;
         let debug_deep = variant.debug_deep;
         let arena_f16 = variant.arena_f16;
-        let gemm_n_tile = crate::kernels::sub::gemm_common::n_tile() as u32;
+        let gemm_n_tile = crate::shaders::gemm_common::n_tile() as u32;
         let is_full_layer = false;
         let x_fp16 = false;
         unsafe {
@@ -352,14 +352,14 @@ impl MetalContext {
         out_bf16: bool,
         out_arena: bool,
     ) -> Result<ComputePipeline, Error> {
-        let variant = crate::kernels::sub::variant::runtime_step_variant();
+        let variant = crate::shaders::variant::runtime_step_variant();
         let fc = MTLFunctionConstantValues::new();
         let shape_assert = variant.shape_assert;
         let dump_stage = 0u32;
         let debug_fast = variant.debug_fast;
         let debug_deep = variant.debug_deep;
         let arena_f16 = variant.arena_f16;
-        let gemm_n_tile = crate::kernels::sub::gemm_common::n_tile() as u32;
+        let gemm_n_tile = crate::shaders::gemm_common::n_tile() as u32;
         unsafe {
             fc.setConstantValue_type_atIndex(
                 std::ptr::NonNull::from_ref(&shape_assert).cast(),
@@ -487,8 +487,8 @@ impl MetalContext {
         entry: &str,
         variant: KernelVariant,
         extra_label: &str,
-        extra_bools: &[crate::kernels::sub::variant::FcBool],
-        extra_uints: &[crate::kernels::sub::variant::FcUInt],
+        extra_bools: &[crate::shaders::variant::FcBool],
+        extra_uints: &[crate::shaders::variant::FcUInt],
     ) -> Result<ComputePipeline, Error> {
         Self::compile_subkernel_on_device(
             &self.device,
@@ -507,8 +507,8 @@ impl MetalContext {
         entry: &str,
         variant: KernelVariant,
         extra_label: &str,
-        extra_bools: &[crate::kernels::sub::variant::FcBool],
-        extra_uints: &[crate::kernels::sub::variant::FcUInt],
+        extra_bools: &[crate::shaders::variant::FcBool],
+        extra_uints: &[crate::shaders::variant::FcUInt],
     ) -> Result<ComputePipeline, Error> {
         let library = {
             let ns_source = NSString::from_str(source);

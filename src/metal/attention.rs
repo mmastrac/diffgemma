@@ -1,16 +1,17 @@
-use crate::kernels::sub::engine_gqa_common::{self, GqaParams};
 use crate::metal::buffer::BufferPool;
 use crate::metal::device::{ComputePipeline, MetalContext};
 use crate::model::attention::{AttentionParams, GqaMask};
 use crate::safetensors::Error;
+use crate::shaders::engine_gqa_common::{self, GqaParams};
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
     MTLComputePipelineState,
 };
 
-const ROPE_SHADER: &str = shader_include::include_metal!("kernels/apply_rope_heads.metal");
-const GQA_SHADER: &str = shader_include::include_metal!("kernels/gqa_attention.metal");
+const ROPE_SHADER: &str =
+    shader_include::include_metal!("attn/apply_rope_heads/apply_rope_heads.metal");
+const GQA_SHADER: &str = shader_include::include_metal!("attn/gqa_attention/gqa_attention.metal");
 const ROPE_ENTRY: &str = "apply_rope_heads";
 const GQA_ENTRY: &str = "gqa_attention";
 

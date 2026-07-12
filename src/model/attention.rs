@@ -1,12 +1,12 @@
 use crate::config::{LayerType, TextConfig};
-use crate::kernels::cpu::{
-    apply_rope_tensor, compute_rope_freqs, linear, rms_norm, rms_norm_no_scale, rms_norm_rows,
-    rope_kind_for_layer, softmax_rows,
-};
 use crate::model::kv_cache::{LayerKv, LayerKvView};
 use crate::model::layer_weights::DecoderLayerWeights;
 use crate::model::mask::DecoderAttnMask;
 use crate::safetensors::Error;
+use crate::shaders::cpu::{
+    apply_rope_tensor, compute_rope_freqs, linear, rms_norm, rms_norm_no_scale, rms_norm_rows,
+    rope_kind_for_layer, softmax_rows,
+};
 
 pub const MASK_NEG: f32 = -1e9;
 

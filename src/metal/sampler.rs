@@ -200,7 +200,7 @@ fn dispatch_softmax_rows(
     let (grid, tg) = row_grid(canvas_len);
     let buf_dump = batch.alloc_f32_out(4)?;
     batch.dispatch_with_grid(&sk.softmax_rows.pipeline, grid, tg, |enc| {
-        crate::kernels::sub::softmax_rows::bind_gpu_in_place(enc, probs, &buf_dump, &dims);
+        crate::shaders::softmax_rows::bind_gpu_in_place(enc, probs, &buf_dump, &dims);
     });
     Ok(())
 }

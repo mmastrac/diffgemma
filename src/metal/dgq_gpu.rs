@@ -503,7 +503,7 @@ mod q4_gpu_tests {
 
     #[test]
     fn q8_gpu_linear_matches_cpu_dequant() {
-        let dgq_dir_buf = match crate::kernels::sub::test_util::dgq_model_dir() {
+        let dgq_dir_buf = match crate::shaders::test_util::dgq_model_dir() {
             Some(d) => d,
             None => std::path::PathBuf::from("/tmp/quantized-weights"),
         };
@@ -546,9 +546,9 @@ mod q4_gpu_tests {
         }
 
         let mut pool = BufferPool::new();
-        let prod = crate::kernels::sub::variant::KernelVariant::PRODUCTION;
+        let prod = crate::shaders::variant::KernelVariant::PRODUCTION;
         let pipeline =
-            crate::kernels::sub::gemm_q8_linear_f32::pipeline_for(&ctx, prod).expect("pipeline");
+            crate::shaders::gemm_q8_linear_f32::pipeline_for(&ctx, prod).expect("pipeline");
         let mut batch = GpuBatch::begin_with_telemetry(&ctx.queue, &mut pool, &ctx.device, None)
             .expect("batch");
         let buf_a = batch.alloc_f32(&a).expect("a");
@@ -608,16 +608,16 @@ mod q4_gpu_tests {
         }
 
         let mut pool = BufferPool::new();
-        let prod = crate::kernels::sub::variant::KernelVariant::PRODUCTION;
-        let q4_pipeline = crate::kernels::sub::gemm_linear_f32::pipeline_for(
+        let prod = crate::shaders::variant::KernelVariant::PRODUCTION;
+        let q4_pipeline = crate::shaders::gemm_linear_f32::pipeline_for(
             &ctx,
-            crate::kernels::sub::QuantFormat::Q4Affine,
+            crate::shaders::QuantFormat::Q4Affine,
             prod,
         )
         .expect("pipeline");
-        let nvfp4_pipeline = crate::kernels::sub::gemm_linear_f32::pipeline_for(
+        let nvfp4_pipeline = crate::shaders::gemm_linear_f32::pipeline_for(
             &ctx,
-            crate::kernels::sub::QuantFormat::NvFp4,
+            crate::shaders::QuantFormat::NvFp4,
             prod,
         )
         .expect("nvfp4 pipeline");
@@ -680,16 +680,16 @@ mod q4_gpu_tests {
             }
         }
 
-        let prod = crate::kernels::sub::variant::KernelVariant::PRODUCTION;
-        let q4_pipeline = crate::kernels::sub::gemm_linear_f32::pipeline_for(
+        let prod = crate::shaders::variant::KernelVariant::PRODUCTION;
+        let q4_pipeline = crate::shaders::gemm_linear_f32::pipeline_for(
             &ctx,
-            crate::kernels::sub::QuantFormat::Q4Affine,
+            crate::shaders::QuantFormat::Q4Affine,
             prod,
         )
         .expect("pipeline");
-        let nvfp4_pipeline = crate::kernels::sub::gemm_linear_f32::pipeline_for(
+        let nvfp4_pipeline = crate::shaders::gemm_linear_f32::pipeline_for(
             &ctx,
-            crate::kernels::sub::QuantFormat::NvFp4,
+            crate::shaders::QuantFormat::NvFp4,
             prod,
         )
         .expect("nvfp4 pipeline");
@@ -880,11 +880,11 @@ mod q4_gpu_tests {
     /// Real nvfp4 MoE gate/up and down grouped GEMM vs CPU oracle (includes >4 GiB expert offsets).
     #[test]
     fn nvfp4_block_grouped_real_moe_weights_match_cpu() {
-        use crate::kernels::cpu::gemm_linear_grouped::gemm_linear_grouped_cpu;
-        use crate::kernels::sub::QuantFormat;
-        use crate::kernels::sub::gemm_block_grouped::{BlobGroupedParams, gpu_on_blob};
         use crate::metal::BlockGroupedJob;
         use crate::metal::step_kernel::{HID, MOE_FF, build_layout, build_offsets_from_store};
+        use crate::shaders::QuantFormat;
+        use crate::shaders::cpu::gemm_linear_grouped::gemm_linear_grouped_cpu;
+        use crate::shaders::gemm_block_grouped::{BlobGroupedParams, gpu_on_blob};
 
         let dgq_dir = std::path::Path::new("/tmp/nvfp4-weights");
         if !dgq_dir.join("model.dgq.json").exists() {
@@ -908,7 +908,7 @@ mod q4_gpu_tests {
         let blob_bytes = unsafe {
             std::slice::from_raw_parts(blob.buffer.contents().as_ptr().cast::<u8>(), blob.len)
         };
-        let variant = crate::kernels::sub::variant::KernelVariant::PRODUCTION;
+        let variant = crate::shaders::variant::KernelVariant::PRODUCTION;
 
         struct Case {
             label: &'static str,

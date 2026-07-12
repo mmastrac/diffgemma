@@ -4,6 +4,24 @@ Full pass over the Metal kernels: aggregation, genericization, perf, and
 per-step precision. Verdicts below are the source of truth for "should this
 kernel exist / merge / change dtype"; re-audit when a family gains members.
 
+## 2026-07-12 — UNIFIED KERNEL TREE (task #77)
+
+All kernel code now lives in one tree: **`src/shaders/<group>/<kernel>/`**
+colocating the Rust wrapper (`mod.rs`), the Metal source (`<kernel>.metal`),
+and the CPU oracle (`cpu.rs`) per kernel — room for future CUDA equivalents
+beside them. Groups: `gemm` `attn` `kv` `moe` `sample` `sc` `embed`
+`elementwise`, plus `include/` (shared .metal headers — ALL `#include`
+resolve here), `common/` (shared Rust helpers), `cpu/` (shared CPU ops +
+aliases to the per-kernel oracles), `oracle/` (validation-only kernels,
+grouped). Subkernels nest where natural (`attention_mma2/_full` under
+`attn/attention/`, `moe_router_topk` under `moe/moe_router/`,
+`rms_norm_rows_tiled` as `rms_norm_rows/tiled.rs`, kxn as
+`gemm_q8_linear_f32/kxn.rs`). `src/shaders/mod.rs` re-exports every kernel
+flat as `shaders::<name>` (the historical `kernels::sub::` namespace), so
+dispatch call sites are group-agnostic. Old `shaders/` + `src/kernels/` are
+gone; `build.rs` hashes `src/shaders/` (per-file rerun-if-changed) and
+`shader-include` roots there. Paths in older sections below are historical.
+
 ## 2026-07-11 — kernel-surface reduction COMPLETE (task #74/#76)
 
 `shaders/kernels/` went **66 → 47**. Every step golden 8/8 + full suite green.

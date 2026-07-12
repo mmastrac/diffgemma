@@ -1,5 +1,4 @@
 use crate::config::TextConfig;
-use crate::kernels::cpu::{gelu_pytorch_tanh, linear, rms_norm_rows};
 use crate::model::attention::{
     AttentionScratch, forward as attention_forward, forward_decoder as attention_forward_decoder,
     forward_encoder as attention_forward_encoder,
@@ -10,6 +9,7 @@ use crate::model::layer_weights::DecoderLayerWeights;
 use crate::model::mask::DecoderAttnMask;
 use crate::model::moe::{MoeScratch, experts_forward, prepare_expert_input, route};
 use crate::safetensors::Error;
+use crate::shaders::cpu::{gelu_pytorch_tanh, linear, rms_norm_rows};
 
 pub struct DecoderLayerScratch {
     pub attn: AttentionScratch,

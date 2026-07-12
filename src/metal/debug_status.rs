@@ -1,7 +1,7 @@
 //! GPU debug-status buffer readback (P3.7). Used with `--assert` on generate-monolithic.
 
-use crate::kernels::sub::dbg_kernel::{DbgErrorCode, DbgKernelId};
 use crate::safetensors::Error;
+use crate::shaders::dbg_kernel::{DbgErrorCode, DbgKernelId};
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLBuffer;
 

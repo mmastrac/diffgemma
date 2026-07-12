@@ -24,8 +24,6 @@ mod flags;
 mod generate;
 mod generate_golden;
 mod golden;
-#[allow(dead_code)]
-mod kernels;
 #[cfg(target_os = "macos")]
 mod metal;
 mod model;
@@ -34,6 +32,8 @@ mod safetensors;
 mod sample;
 #[cfg(target_os = "macos")]
 mod server;
+#[allow(dead_code)]
+mod shaders;
 mod tensor;
 mod tokenizer;
 mod toolcompact;
@@ -4957,7 +4957,7 @@ fn run_generate_monolithic_cmd(
         return ExitCode::FAILURE;
     }
 
-    crate::kernels::sub::variant::set_runtime_kernel_debug(kernel_assert, kernel_debug_deep);
+    crate::shaders::variant::set_runtime_kernel_debug(kernel_assert, kernel_debug_deep);
 
     let vocab = match crate::config::ModelConfig::load(model_dir) {
         Ok(c) => c.text_config.vocab_size,

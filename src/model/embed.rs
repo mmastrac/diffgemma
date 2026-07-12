@@ -2,8 +2,8 @@ use crate::buffer::Buffer;
 use crate::dgq::block::dequant_row_q8;
 use crate::dgq::layout::q8_row_bytes;
 use crate::fast_slice::FastBf16Slice;
-use crate::kernels::matmul;
 use crate::safetensors::Error;
+use crate::shaders::cpu::matmul;
 use crate::tensor::{Bf16Slice, TensorView};
 use crate::weights::WeightStore;
 

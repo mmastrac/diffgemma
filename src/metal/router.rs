@@ -99,7 +99,7 @@ pub fn route_gpu_in_batch(
     let params = [seq_len as u32, experts as u32, top_k as u32];
     let buf_dump = batch.alloc_f32_out(1)?;
     batch.dispatch_1d(&kernels.router_top_k.pipeline, seq_len, |enc| {
-        crate::kernels::sub::router_top_k_rows::bind_gpu_buffers(
+        crate::shaders::router_top_k_rows::bind_gpu_buffers(
             &enc,
             &buf_logits,
             &buf_scale,

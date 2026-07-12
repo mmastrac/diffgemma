@@ -686,11 +686,11 @@ pub fn forward_encoder_prefill_resident(
     engine: &mut GpuDecoderEngine,
     gpu_kv: &GpuKvCache,
 ) -> Result<(), Error> {
-    use crate::kernels::cpu::{compute_rope_freqs, rope_kind_for_layer};
     use crate::metal::attention_batch::dispatch_copy_f32_to_buf;
     use crate::metal::decoder_attention::encode_fused_gpu_kv_attention_buf;
     use crate::metal::moe::{build_scatter_lists, experts_forward_gpu_grouped_in_batch_buf};
     use crate::model::attention::GqaMask;
+    use crate::shaders::cpu::{compute_rope_freqs, rope_kind_for_layer};
 
     let layer_entry = std::time::Instant::now();
     let hidden_size = cfg.hidden_size;

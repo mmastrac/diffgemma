@@ -1,7 +1,7 @@
 # Kernel function-constant manifest.
 #
-# FC 1–3 are reserved globally (see shaders/include/fc_axes.metal).
-# Shared device math lives in shaders/include/ (dequant, activations, common).
+# FC 1–3 are reserved globally (see src/shaders/include/fc_axes.metal).
+# Shared device math lives in src/shaders/include/ (dequant, activations, common).
 # FC 4+ are per-kernel; each kernel lists its full index map under [kernel.fc].
 # Pipeline construction in Rust MUST only build tuples listed under [[kernel.variants]].
 # Tier-1 tests MUST cover every [[kernel.variants]] row (see manifest.rs tests).

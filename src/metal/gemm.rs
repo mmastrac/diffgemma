@@ -1,14 +1,14 @@
-use crate::kernels::cpu::bf16_to_f32;
 use crate::metal::buffer::BufferPool;
 use crate::metal::device::{ComputePipeline, MetalContext};
 use crate::safetensors::Error;
+use crate::shaders::cpu::bf16_to_f32;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
     MTLComputePipelineState, MTLSize,
 };
 
-const GEMM_SHADER: &str = include_str!("../../shaders/gemm.metal");
+const GEMM_SHADER: &str = include_str!("../shaders/gemm/gemm.metal");
 const GEMM_ENTRY: &str = "bf16_gemm";
 const F32_BF16_LINEAR_ENTRY: &str = "f32_bf16_linear";
 const THREADGROUP: usize = 16;

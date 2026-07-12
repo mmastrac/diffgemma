@@ -1,9 +1,9 @@
 //! GEMM throughput bench: full-call vs resident compute vs MPSGraph oracle.
 
-use crate::kernels::sub::bf16;
 use crate::metal::buffer::BufferPool;
 use crate::metal::gemm::Bf16Gemm;
 use crate::safetensors::Error;
+use crate::shaders::bf16;
 use std::path::Path;
 use std::process::Command;
 use std::time::Instant;
@@ -83,9 +83,9 @@ pub fn bench_custom_kernel(shapes: &[GemmShape], iters: usize) -> Result<Vec<Gem
 
 /// Fused Q4 `gemm_block` (step-kernel dense path): bf16 activations, on-the-fly dequant.
 pub fn bench_gemm_block_q4(shapes: &[GemmShape], iters: usize) -> Result<Vec<GemmBenchRow>, Error> {
-    use crate::kernels::sub::gemm_common;
-    use crate::kernels::sub::gemm_q4;
     use crate::metal::device::MetalContext;
+    use crate::shaders::gemm_common;
+    use crate::shaders::gemm_q4;
     use objc2_metal::{
         MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
     };
@@ -158,14 +158,15 @@ pub fn bench_gemm_block_q4(shapes: &[GemmShape], iters: usize) -> Result<Vec<Gem
 /// Each config is correctness-checked against gemm_block (expected BIT-exact:
 /// same K-chain, dequant, and bf16 rounding).
 pub fn bench_gemm_tunable(shapes: &[GemmShape], iters: usize) -> Result<Vec<GemmBenchRow>, Error> {
-    use crate::kernels::sub::gemm_q4;
     use crate::metal::device::MetalContext;
+    use crate::shaders::gemm_q4;
     use objc2_metal::{
         MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
         MTLSize,
     };
 
-    const SHADER_TUNE: &str = shader_include::include_metal!("kernels/gemm_tunable.metal");
+    const SHADER_TUNE: &str =
+        shader_include::include_metal!("gemm/gemm_tunable/gemm_tunable.metal");
     const CONFIGS: &[(usize, usize)] = &[(32, 32), (64, 32), (32, 64), (64, 64), (32, 128)];
     let ctx = MetalContext::new()?;
     let warmup = 3usize;
@@ -209,7 +210,7 @@ pub fn bench_gemm_tunable(shapes: &[GemmShape], iters: usize) -> Result<Vec<Gemm
             let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
             enc.setComputePipelineState(&ref_pipe.pipeline);
             gemm_q4::bind_gpu_buffers(&enc, &buf_x, &buf_ref, &buf_w, 0, m as u32);
-            let (rgrid, rtg) = crate::kernels::sub::gemm_common::dispatch_shape(m, n);
+            let (rgrid, rtg) = crate::shaders::gemm_common::dispatch_shape(m, n);
             enc.dispatchThreadgroups_threadsPerThreadgroup(rgrid, rtg);
             enc.endEncoding();
             cmd.commit();
@@ -224,7 +225,7 @@ pub fn bench_gemm_tunable(shapes: &[GemmShape], iters: usize) -> Result<Vec<Gemm
                 n as u32,
                 k as u32,
                 false,
-                crate::kernels::sub::QuantFormat::Q4Affine as u32,
+                crate::shaders::QuantFormat::Q4Affine as u32,
                 false,
             )?;
             let grid = MTLSize {
@@ -295,13 +296,12 @@ pub fn bench_gemm_tunable(shapes: &[GemmShape], iters: usize) -> Result<Vec<Gemm
                 .ok_or(Error::Format("bench tunable wraw"))?;
             BufferPool::write_bf16(&buf_wr, &w_bits);
             {
-                let ref_pipe =
-                    crate::kernels::sub::gemm_bf16::pipeline_for(&ctx, n as u32, k as u32)?;
+                let ref_pipe = crate::shaders::gemm_bf16::pipeline_for(&ctx, n as u32, k as u32)?;
                 let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
                 let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
                 enc.setComputePipelineState(&ref_pipe.pipeline);
                 gemm_q4::bind_gpu_buffers(&enc, &buf_x, &buf_ref, &buf_wr, 0, m as u32);
-                let (rgrid, rtg) = crate::kernels::sub::gemm_common::dispatch_shape(m, n);
+                let (rgrid, rtg) = crate::shaders::gemm_common::dispatch_shape(m, n);
                 enc.dispatchThreadgroups_threadsPerThreadgroup(rgrid, rtg);
                 enc.endEncoding();
                 cmd.commit();
@@ -314,7 +314,7 @@ pub fn bench_gemm_tunable(shapes: &[GemmShape], iters: usize) -> Result<Vec<Gemm
                 n as u32,
                 k as u32,
                 false,
-                crate::kernels::sub::QuantFormat::Raw as u32,
+                crate::shaders::QuantFormat::Raw as u32,
                 false,
             )?;
             let grid = MTLSize {
@@ -378,10 +378,10 @@ pub fn bench_gemm_tunable(shapes: &[GemmShape], iters: usize) -> Result<Vec<Gemm
 /// Tiled bf16-weight `gemm_bf16` (step-kernel mixed-precision attention/FFN path):
 /// bf16 activations, bf16 weights read straight into the half tile (no dequant).
 pub fn bench_gemm_bf16(shapes: &[GemmShape], iters: usize) -> Result<Vec<GemmBenchRow>, Error> {
-    use crate::kernels::sub::gemm_bf16;
-    use crate::kernels::sub::gemm_common;
-    use crate::kernels::sub::gemm_q8;
     use crate::metal::device::MetalContext;
+    use crate::shaders::gemm_bf16;
+    use crate::shaders::gemm_common;
+    use crate::shaders::gemm_q8;
     use objc2_metal::{
         MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
     };
@@ -707,12 +707,12 @@ pub fn bench_gemm_tunable_sparse(iters: usize) -> Result<Vec<GemmBenchRow>, Erro
                     continue;
                 }
                 let blocks = write_route(bm);
-                let pipe = crate::kernels::sub::gemm_tunable::pipeline_for_sparse_tile(
+                let pipe = crate::shaders::gemm_tunable::pipeline_for_sparse_tile(
                     &ctx,
                     n as u32,
                     k as u32,
                     false,
-                    crate::kernels::sub::QuantFormat::Q4Affine,
+                    crate::shaders::QuantFormat::Q4Affine,
                     bm,
                     bn,
                 )?;
@@ -722,7 +722,7 @@ pub fn bench_gemm_tunable_sparse(iters: usize) -> Result<Vec<GemmBenchRow>, Erro
                     depth: 1,
                 };
                 let tg = MTLSize {
-                    width: crate::kernels::sub::gemm_common::THREADS_PER_TG,
+                    width: crate::shaders::gemm_common::THREADS_PER_TG,
                     height: 1,
                     depth: 1,
                 };
@@ -731,7 +731,7 @@ pub fn bench_gemm_tunable_sparse(iters: usize) -> Result<Vec<GemmBenchRow>, Erro
                     let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
                     for _ in 0..count {
                         enc.setComputePipelineState(&pipe.pipeline);
-                        crate::kernels::sub::gemm_block_grouped::bind_gpu_buffers(
+                        crate::shaders::gemm_block_grouped::bind_gpu_buffers(
                             &enc,
                             &buf_a,
                             &buf_w,

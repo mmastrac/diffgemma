@@ -1,10 +1,10 @@
 //! Attention kernels batched through `GpuBatch` (shared engine pool/queue).
 
-use crate::kernels::sub::engine_gqa_common::{self, GqaParams};
 use crate::metal::batch::{GpuBatch, set_bytes};
 use crate::metal::device::ComputePipeline;
 use crate::model::attention::{AttentionParams, GqaMask, MASK_NEG};
 use crate::safetensors::Error;
+use crate::shaders::engine_gqa_common::{self, GqaParams};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder, MTLComputePipelineState};
@@ -443,13 +443,13 @@ fn encode_gqa(
 mod prefill_attn_tests {
     use super::*;
     use crate::config::ModelConfig;
-    use crate::kernels::cpu::{apply_rope_tensor, compute_rope_freqs, rope_kind_for_layer};
     use crate::metal::attention::GpuAttentionKernels;
     use crate::metal::batch::GpuBatch;
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
     use crate::metal::kv_cache::GpuKvCache;
     use crate::model::attention::gqa_attention;
+    use crate::shaders::cpu::{apply_rope_tensor, compute_rope_freqs, rope_kind_for_layer};
 
     fn dgq_fixture_dir() -> Option<std::path::PathBuf> {
         for dir in ["/tmp/nvfp4-weights", "/tmp/quantized-weights"] {

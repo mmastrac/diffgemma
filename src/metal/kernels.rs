@@ -1,6 +1,6 @@
-use crate::kernels::sub::variant::KernelVariant;
 use crate::metal::device::{ComputePipeline, MetalContext};
 use crate::safetensors::Error;
+use crate::shaders::variant::KernelVariant;
 
 pub struct GpuKernels {
     pub(crate) rms_norm: ComputePipeline,
@@ -29,7 +29,7 @@ pub struct GpuKernels {
 
 impl GpuKernels {
     pub fn new(ctx: &MetalContext) -> Result<Self, Error> {
-        use crate::kernels::sub::{
+        use crate::shaders::{
             convert_scale, embed_gather, gather_prob_cols, gather_rows, gelu, pack_encoder_kv,
             rms_norm_rows, router_scale_rows, router_top_k_rows, scatter_rows_weighted,
             softmax_rows, swiglu, unpack_encoder_kv, vec_add_inplace, vec_fill_zero,
@@ -44,7 +44,7 @@ impl GpuKernels {
             gelu: gelu::pipeline_for(ctx, prod)?,
             swiglu_mul: swiglu::pipeline_for(
                 ctx,
-                crate::kernels::sub::SwigluSplitVariant::DECODER_MUL,
+                crate::shaders::SwigluSplitVariant::DECODER_MUL,
                 prod,
             )?,
             gelu_swiglu_gate_up: swiglu::pipeline_for_moe(ctx, prod)?,
@@ -61,13 +61,13 @@ impl GpuKernels {
             pack_encoder_kv_q8: pack_encoder_kv::pipeline_fmt_for(
                 ctx,
                 prod,
-                crate::kernels::sub::kv_quant::KvFormat::Q8,
+                crate::shaders::kv_quant::KvFormat::Q8,
             )?,
             unpack_encoder_kv: unpack_encoder_kv::pipeline_for(ctx, prod)?,
             unpack_encoder_kv_q8: unpack_encoder_kv::pipeline_fmt_for(
                 ctx,
                 prod,
-                crate::kernels::sub::kv_quant::KvFormat::Q8,
+                crate::shaders::kv_quant::KvFormat::Q8,
             )?,
             scatter_rows_weighted: scatter_rows_weighted::pipeline_for(ctx, prod)?,
         })

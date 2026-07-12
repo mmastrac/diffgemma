@@ -1,11 +1,11 @@
 //! Elementwise kernels encoded into a shared `GpuBatch`.
 
-use crate::kernels::sub::{
-    gather_rows, gelu, rms_norm_rows, router_scale_rows, swiglu, vec_add_inplace,
-};
 use crate::metal::batch::GpuBatch;
 use crate::metal::kernels::GpuKernels;
 use crate::safetensors::Error;
+use crate::shaders::{
+    gather_rows, gelu, rms_norm_rows, router_scale_rows, swiglu, vec_add_inplace,
+};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLComputePipelineState};
@@ -266,7 +266,7 @@ pub fn scatter_rows_weighted_gpu(
         &kernels.scatter_rows_weighted.pipeline,
         seq_len * hidden,
         |enc| {
-            crate::kernels::sub::scatter_rows_weighted::bind_gpu_buffers(
+            crate::shaders::scatter_rows_weighted::bind_gpu_buffers(
                 &enc, arena_buf, &buf_rows, &buf_w, &buf_out, &buf_dump, &dims,
             );
         },
@@ -285,9 +285,7 @@ pub fn vec_scale_gpu_buf(
     let len_u = len as u32;
     let buf_dump = batch.alloc_f32_out(1)?;
     batch.dispatch_1d(&kernels.vec_scale.pipeline, len, |enc| {
-        crate::kernels::sub::vec_scale_inplace::bind_gpu_buffers(
-            &enc, buf, &buf_dump, scale, len_u,
-        );
+        crate::shaders::vec_scale_inplace::bind_gpu_buffers(&enc, buf, &buf_dump, scale, len_u);
     });
     Ok(())
 }
@@ -311,10 +309,10 @@ pub fn vec_add_gpu_bufs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::cpu::gelu_pytorch_tanh;
     use crate::metal::batch::GpuBatch;
     use crate::metal::device::MetalContext;
     use crate::metal::kernels::GpuKernels;
+    use crate::shaders::cpu::gelu_pytorch_tanh;
 
     #[cfg(target_os = "macos")]
     #[test]

@@ -1,7 +1,7 @@
 //! Step-kernel quantization profile: one algorithm, format selects kernels (STRATEGY.md §4).
 
 use crate::dgq::layout::QuantProfile;
-use crate::kernels::sub::QuantFormat;
+use crate::shaders::QuantFormat;
 
 /// Block-quantized weight format active for this step runtime (dense + MoE experts).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
