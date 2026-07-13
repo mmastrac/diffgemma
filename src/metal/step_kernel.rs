@@ -3105,7 +3105,7 @@ impl StepEnc<'_> {
         // Q/O sub-chunk row offset into the batched prefill planes.
         let qo_row = CANVAS * self.sub_c * STEP_NQ_HEADS * hd * 2;
 
-        let dims = crate::shaders::attention_gemm::AttnGemmDims {
+        let mut dims = crate::shaders::attention_gemm::AttnGemmDims {
             m: m as u32,
             n: t_total as u32,
             k: hd as u32,
@@ -3119,12 +3119,7 @@ impl StepEnc<'_> {
             group: group as u32,
             nkv: nkv as u32,
             s_head_stride: (m * np) as u32,
-        };
-        let dims_pv = crate::shaders::attention_gemm::AttnGemmDims {
-            n: hd as u32,
-            k: t_total as u32,
-            a_row_stride: np as u32,
-            ..dims
+            head_base: 0,
         };
 
         let tg128 = MTLSize {
@@ -3132,65 +3127,80 @@ impl StepEnc<'_> {
             height: 1,
             depth: 1,
         };
-        let heads = STEP_NQ_HEADS;
-        let grid_qk = MTLSize {
-            width: t_total.div_ceil(BN),
-            height: m.div_ceil(BM),
-            depth: heads,
-        };
-        let grid_sm = MTLSize {
-            width: m,
-            height: heads,
-            depth: 1,
-        };
         let tg_sm = MTLSize {
             width: SOFTMAX_TPG,
             height: 1,
             depth: 1,
         };
-        let grid_pv = MTLSize {
-            width: hd.div_ceil(BN),
-            height: m.div_ceil(BM),
-            depth: heads,
-        };
+        // E17a: process Q heads in batches of HC so the S/P scratch holds only
+        // HC heads. Data offsets use the global head (head_base + tgid.z); the
+        // scratch is indexed by the batch-local tgid.z.
+        let hc = crate::flags::gemm_attn_head_chunk().min(STEP_NQ_HEADS);
+        let mut h0 = 0usize;
+        while h0 < STEP_NQ_HEADS {
+            let hb = (STEP_NQ_HEADS - h0).min(hc);
+            dims.head_base = h0 as u32;
+            let dims_pv = crate::shaders::attention_gemm::AttnGemmDims {
+                n: hd as u32,
+                k: t_total as u32,
+                a_row_stride: np as u32,
+                ..dims
+            };
+            let grid_qk = MTLSize {
+                width: t_total.div_ceil(BN),
+                height: m.div_ceil(BM),
+                depth: hb,
+            };
+            let grid_sm = MTLSize {
+                width: m,
+                height: hb,
+                depth: 1,
+            };
+            let grid_pv = MTLSize {
+                width: hd.div_ceil(BN),
+                height: m.div_ceil(BM),
+                depth: hb,
+            };
 
-        // QK: S = Q.K^T (all heads). Q at the sub-chunk offset; K at this
-        // layer's kv_region (kv16 base = kvcache + kv_region bytes).
-        self.sink_set_pipeline(&self.ps.attn_gemm.as_ref().unwrap()[0]);
-        self.sink_set_buffer(
-            &self.bufs.arena,
-            self.arena().attnq_off() as usize + qo_row,
-            0,
-        );
-        self.sink_set_buffer(&self.bufs.kvcache, l.kv_region as usize, 1);
-        self.sink_set_buffer(self.bufs.attn_gemm_s.as_ref().unwrap(), 0, 2);
-        self.sink_set_bytes(&dims, 3);
-        self.sink_dispatch(grid_qk, tg128);
-        self.sink_memory_barrier();
+            // QK: S = Q.K^T. Q at the sub-chunk offset; K at this layer's
+            // kv_region (kv16 base = kvcache + kv_region bytes).
+            self.sink_set_pipeline(&self.ps.attn_gemm.as_ref().unwrap()[0]);
+            self.sink_set_buffer(
+                &self.bufs.arena,
+                self.arena().attnq_off() as usize + qo_row,
+                0,
+            );
+            self.sink_set_buffer(&self.bufs.kvcache, l.kv_region as usize, 1);
+            self.sink_set_buffer(self.bufs.attn_gemm_s.as_ref().unwrap(), 0, 2);
+            self.sink_set_bytes(&dims, 3);
+            self.sink_dispatch(grid_qk, tg128);
+            self.sink_memory_barrier();
 
-        // Softmax: P = exp(S - rowmax), masked; denom -> lrow (all heads).
-        self.sink_set_pipeline(&self.ps.attn_gemm.as_ref().unwrap()[1]);
-        self.sink_set_buffer(self.bufs.attn_gemm_s.as_ref().unwrap(), 0, 0);
-        self.sink_set_buffer(self.bufs.attn_gemm_p.as_ref().unwrap(), 0, 1);
-        self.sink_set_buffer(self.bufs.attn_gemm_lrow.as_ref().unwrap(), 0, 2);
-        self.sink_set_bytes(&dims, 3);
-        self.sink_dispatch(grid_sm, tg_sm);
-        self.sink_memory_barrier();
+            // Softmax: P = exp(S - rowmax), masked; denom -> lrow.
+            self.sink_set_pipeline(&self.ps.attn_gemm.as_ref().unwrap()[1]);
+            self.sink_set_buffer(self.bufs.attn_gemm_s.as_ref().unwrap(), 0, 0);
+            self.sink_set_buffer(self.bufs.attn_gemm_p.as_ref().unwrap(), 0, 1);
+            self.sink_set_buffer(self.bufs.attn_gemm_lrow.as_ref().unwrap(), 0, 2);
+            self.sink_set_bytes(&dims, 3);
+            self.sink_dispatch(grid_sm, tg_sm);
+            self.sink_memory_barrier();
 
-        // PV: O = (P.V) / L. V at kv_region (kernel adds (nkv+kvh)*hd); O at the
-        // sub-chunk offset in the attno plane.
-        self.sink_set_pipeline(&self.ps.attn_gemm.as_ref().unwrap()[2]);
-        self.sink_set_buffer(self.bufs.attn_gemm_p.as_ref().unwrap(), 0, 0);
-        self.sink_set_buffer(&self.bufs.kvcache, l.kv_region as usize, 1);
-        self.sink_set_buffer(
-            &self.bufs.arena,
-            self.arena().attno_off() as usize + qo_row,
-            2,
-        );
-        self.sink_set_buffer(self.bufs.attn_gemm_lrow.as_ref().unwrap(), 0, 3);
-        self.sink_set_bytes(&dims_pv, 4);
-        self.sink_dispatch(grid_pv, tg128);
-        self.sink_memory_barrier();
+            // PV: O = (P.V) / L. V at kv_region (kernel adds (nkv+kvh)*hd); O at
+            // the sub-chunk offset in the attno plane.
+            self.sink_set_pipeline(&self.ps.attn_gemm.as_ref().unwrap()[2]);
+            self.sink_set_buffer(self.bufs.attn_gemm_p.as_ref().unwrap(), 0, 0);
+            self.sink_set_buffer(&self.bufs.kvcache, l.kv_region as usize, 1);
+            self.sink_set_buffer(
+                &self.bufs.arena,
+                self.arena().attno_off() as usize + qo_row,
+                2,
+            );
+            self.sink_set_buffer(self.bufs.attn_gemm_lrow.as_ref().unwrap(), 0, 3);
+            self.sink_set_bytes(&dims_pv, 4);
+            self.sink_dispatch(grid_pv, tg128);
+            self.sink_memory_barrier();
+            h0 += hb;
+        }
         Ok(())
     }
 
@@ -5544,28 +5554,31 @@ pub fn build_step_runtime(
             &ctx.device,
             STEP_NQ_HEADS * CANVAS * (2 + 512) * std::mem::size_of::<f32>(),
         )?,
-        // E17 GEMM-attention prefill scratch (opt-in). Sized to the largest
-        // per-sub score matrix: [n_q_heads][CANVAS][n_pad(max_seq)]. Only
-        // allocated when DGQ_GEMM_ATTN is set (2-3 GiB at long ctx).
+        // E17 GEMM-attention prefill scratch (opt-in). Head-chunked (E17a): the
+        // score matrix S/P holds only HC heads at a time —
+        // [HC][CANVAS][n_pad(max_seq)]. Only allocated when DGQ_GEMM_ATTN is set.
         attn_gemm_s: if crate::flags::gemm_attn_enabled() {
             let np = crate::shaders::attention_gemm::n_pad(cfg.max_seq);
+            let hc = crate::flags::gemm_attn_head_chunk().min(STEP_NQ_HEADS);
             Some(alloc_buffer(
                 &ctx.device,
-                STEP_NQ_HEADS * CANVAS * np * std::mem::size_of::<f32>(),
+                hc * CANVAS * np * std::mem::size_of::<f32>(),
             )?)
         } else {
             None
         },
         attn_gemm_p: if crate::flags::gemm_attn_enabled() {
             let np = crate::shaders::attention_gemm::n_pad(cfg.max_seq);
-            Some(alloc_buffer(&ctx.device, STEP_NQ_HEADS * CANVAS * np * 2)?)
+            let hc = crate::flags::gemm_attn_head_chunk().min(STEP_NQ_HEADS);
+            Some(alloc_buffer(&ctx.device, hc * CANVAS * np * 2)?)
         } else {
             None
         },
         attn_gemm_lrow: if crate::flags::gemm_attn_enabled() {
+            let hc = crate::flags::gemm_attn_head_chunk().min(STEP_NQ_HEADS);
             Some(alloc_buffer(
                 &ctx.device,
-                STEP_NQ_HEADS * CANVAS * std::mem::size_of::<f32>(),
+                hc * CANVAS * std::mem::size_of::<f32>(),
             )?)
         } else {
             None

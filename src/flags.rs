@@ -109,6 +109,9 @@ pub struct PerfFlags {
     /// ~1.78x on the attention kernel; not bit-identical (full quality gate).
     /// Default OFF.
     pub gemm_attn: bool,
+    /// `DGQ_GEMM_ATTN_HC` (E17a): Q heads processed per E17 dispatch batch.
+    /// Bounds the S/P scratch to [HC][CANVAS][n_pad(max_seq)]. Default 4.
+    pub gemm_attn_head_chunk: usize,
 }
 
 impl Default for PerfFlags {
@@ -130,6 +133,7 @@ impl Default for PerfFlags {
             prefill_resident: true,
             attn_kv_block: 0,
             gemm_attn: false,
+            gemm_attn_head_chunk: 4,
         }
     }
 }
@@ -362,6 +366,7 @@ impl RuntimeConfig {
                 prefill_resident: env_on_unless_zero("DGQ_PREFILL_RESIDENT"),
                 attn_kv_block: parse_usize("DGQ_ATTN_KV_BLOCK", 0),
                 gemm_attn: env_on_if_one("DGQ_GEMM_ATTN"),
+                gemm_attn_head_chunk: parse_usize("DGQ_GEMM_ATTN_HC", 4).max(1),
             },
             prefill: PrefillFlags {
                 f16: env_on_if_one("DGQ_PREFILL_F16"),
@@ -625,6 +630,12 @@ pub fn attn_mma_full_enabled() -> bool {
 /// attention kernel; not bit-identical (full quality gate). `DGQ_GEMM_ATTN=1`.
 pub fn gemm_attn_enabled() -> bool {
     config().perf.gemm_attn
+}
+
+/// E17a: Q heads processed per E17 dispatch batch (`DGQ_GEMM_ATTN_HC`, default
+/// 4). Bounds the S/P prefill scratch; clamped to n_q_heads at dispatch.
+pub fn gemm_attn_head_chunk() -> usize {
+    config().perf.gemm_attn_head_chunk
 }
 
 /// Router-as-GEMM (~30ms/step). Non-bit-identical (near-tie expert flips =

@@ -56,6 +56,9 @@ struct AttnGemmDims {
     uint group;         // GQA group (n_q_heads / nkv): kvh = qh / group
     uint nkv;           // KV heads: V base = (nkv + kvh) * hd
     uint s_head_stride; // elems between heads in the S/P planes (m * s_row_stride)
+    uint head_base;     // E17a head-chunk: global Q head = head_base + tgid.z;
+                        // the S/P/lrow scratch is indexed by the LOCAL tgid.z,
+                        // so it holds only this batch's HC heads.
 };
 
 // One BK-wide MMA phase: per-lane fragment loads + TMxTN accumulate. Identical
@@ -108,11 +111,11 @@ kernel void attn_gemm_qk(
     threadgroup half Xs[BM][PAD];
     threadgroup half Ws[BN][PAD];
 
-    const uint qh = tgid.z;
+    const uint qh = d.head_base + tgid.z;     // global data head
     const uint kvh = qh / d.group;
     q += (ulong)qh * d.hd;                    // this head's Q base
     kcache += (ulong)kvh * d.hd;              // this kvh's K base
-    s += (ulong)qh * d.s_head_stride;         // this head's S slice
+    s += (ulong)tgid.z * d.s_head_stride;     // this batch-local S slice
 
     const uint m0 = tgid.y * BM;
     const uint n0 = tgid.x * BN;
@@ -288,12 +291,12 @@ kernel void attn_gemm_pv(
     threadgroup half Xs[BM][PAD];
     threadgroup half Ws[BN][PAD];
 
-    const uint qh = tgid.z;
+    const uint qh = d.head_base + tgid.z;           // global data head
     const uint kvh = qh / d.group;
-    p += (ulong)qh * d.s_head_stride;               // this head's P slice
+    p += (ulong)tgid.z * d.s_head_stride;           // this batch-local P slice
     vcache += (ulong)(d.nkv + kvh) * d.hd;          // this kvh's V base
     out += (ulong)qh * d.hd;                        // this head's O base
-    lrow += (ulong)qh * d.m;
+    lrow += (ulong)tgid.z * d.m;                    // this batch-local lrow slice
 
     const uint m0 = tgid.y * BM;
     const uint n0 = tgid.x * BN;
