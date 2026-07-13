@@ -53,46 +53,20 @@ pub fn route(
     seq_len: usize,
     scratch: &mut MoeScratch,
 ) -> Result<Vec<RouteResult>, Error> {
-    let hidden = cfg.hidden_size;
-    let experts = cfg.num_experts;
-    let top_k = cfg.top_k_experts;
-    let eps = cfg.rms_norm_eps as f32;
-    let root = (hidden as f32).powf(-0.5);
-
-    assert_eq!(residual.len(), seq_len * hidden);
+    assert_eq!(residual.len(), seq_len * cfg.hidden_size);
     scratch.load_router_weights(weights)?;
-
-    for s in 0..seq_len {
-        let off = s * hidden;
-        rms_norm_no_scale(
-            &mut scratch.router_input[off..off + hidden],
-            &residual[off..off + hidden],
-            eps,
-        );
-        for i in 0..hidden {
-            scratch.router_input[off + i] *= scratch.router_scale[i] * root;
-        }
-    }
-
-    crate::shaders::cpu::linear(
-        &mut scratch.router_logits,
-        &scratch.router_input,
+    // Disjoint field borrows: the just-loaded weights and the scratch buffers are
+    // distinct fields, so the shared core can take both from one `scratch`.
+    Ok(route_core(
+        residual,
         &scratch.router_proj_w,
-        None,
+        &scratch.router_scale,
+        &scratch.per_expert_scale,
+        &mut scratch.router_input,
+        &mut scratch.router_logits,
+        cfg,
         seq_len,
-        hidden,
-        experts,
-    );
-    let mut routes = Vec::with_capacity(seq_len);
-    for s in 0..seq_len {
-        let row = &scratch.router_logits[s * experts..(s + 1) * experts];
-        routes.push(top_k_route_from_raw_logits(
-            row,
-            top_k,
-            &scratch.per_expert_scale,
-        ));
-    }
-    Ok(routes)
+    ))
 }
 
 /// Router using pre-cached f32 weights (no per-forward dequant).
@@ -105,41 +79,68 @@ pub fn route_with_cached_weights(
     seq_len: usize,
     scratch: &mut MoeScratch,
 ) -> Result<Vec<RouteResult>, Error> {
+    assert_eq!(residual.len(), seq_len * cfg.hidden_size);
+    Ok(route_core(
+        residual,
+        router_proj,
+        router_scale,
+        per_expert_scale,
+        &mut scratch.router_input,
+        &mut scratch.router_logits,
+        cfg,
+        seq_len,
+    ))
+}
+
+/// Shared router body: `RMSNorm(residual) * router_scale * hidden^-0.5` -> linear
+/// projection -> per-row top-k softmax. The exact tie-break (score desc, index
+/// asc) lives in [`top_k_route_from_raw_logits`]. Weights and scratch buffers are
+/// passed as disjoint slices so the dequant-on-load and pre-cached entry points
+/// share one implementation.
+#[allow(clippy::too_many_arguments)]
+fn route_core(
+    residual: &[f32],
+    router_proj: &[f32],
+    router_scale: &[f32],
+    per_expert_scale: &[f32],
+    router_input: &mut [f32],
+    router_logits: &mut [f32],
+    cfg: &TextConfig,
+    seq_len: usize,
+) -> Vec<RouteResult> {
     let hidden = cfg.hidden_size;
     let experts = cfg.num_experts;
     let top_k = cfg.top_k_experts;
     let eps = cfg.rms_norm_eps as f32;
     let root = (hidden as f32).powf(-0.5);
 
-    assert_eq!(residual.len(), seq_len * hidden);
-
     for s in 0..seq_len {
         let off = s * hidden;
         rms_norm_no_scale(
-            &mut scratch.router_input[off..off + hidden],
+            &mut router_input[off..off + hidden],
             &residual[off..off + hidden],
             eps,
         );
         for i in 0..hidden {
-            scratch.router_input[off + i] *= router_scale[i] * root;
+            router_input[off + i] *= router_scale[i] * root;
         }
     }
 
     crate::shaders::cpu::linear(
-        &mut scratch.router_logits,
-        &scratch.router_input,
+        router_logits,
+        router_input,
         router_proj,
         None,
         seq_len,
         hidden,
         experts,
     );
-    let mut routes = Vec::with_capacity(seq_len);
-    for s in 0..seq_len {
-        let row = &scratch.router_logits[s * experts..(s + 1) * experts];
-        routes.push(top_k_route_from_raw_logits(row, top_k, per_expert_scale));
-    }
-    Ok(routes)
+    (0..seq_len)
+        .map(|s| {
+            let row = &router_logits[s * experts..(s + 1) * experts];
+            top_k_route_from_raw_logits(row, top_k, per_expert_scale)
+        })
+        .collect()
 }
 
 /// MLX/Gemma4: argpartition top-k on raw logits, softmax only over selected experts.

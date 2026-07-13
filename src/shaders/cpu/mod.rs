@@ -34,18 +34,13 @@ pub fn rms_norm_no_scale(out: &mut [f32], x: &[f32], eps: f32) {
     }
 }
 
-/// Gemma RMSNorm: `out = x / rms(x) * weight`, `rms = sqrt(mean(x^2) + eps)`.
+/// Gemma RMSNorm: `out = x / rms(x) * weight`, `rms = sqrt(mean(x^2) + eps)` —
+/// the unscaled normalize (shared with `rms_norm_no_scale`) then per-lane weight.
 pub fn rms_norm(out: &mut [f32], x: &[f32], weight: &[f32], eps: f32) {
-    assert_eq!(out.len(), x.len());
     assert_eq!(weight.len(), x.len());
-    let hidden = x.len();
-    let mut sum_sq = 0.0f32;
-    for &v in x {
-        sum_sq += v * v;
-    }
-    let rms_inv = 1.0 / (sum_sq / hidden as f32 + eps).sqrt();
-    for i in 0..hidden {
-        out[i] = x[i] * rms_inv * weight[i];
+    rms_norm_no_scale(out, x, eps);
+    for i in 0..out.len() {
+        out[i] *= weight[i];
     }
 }
 
