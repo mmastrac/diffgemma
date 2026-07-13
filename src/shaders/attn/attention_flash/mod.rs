@@ -132,32 +132,20 @@ pub struct FlashDims {
 pub fn pipeline_flash(
     ctx: &crate::metal::device::MetalContext,
     variant: crate::shaders::variant::KernelVariant,
-    side: bool,
     bq: usize,
     bk: usize,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    use crate::shaders::variant::FcBool;
-    let bools: &[FcBool] = if side {
-        &[FcBool {
-            index: 30,
-            value: true,
-        }]
-    } else {
-        &[]
-    };
     let src = tuned_source(bq, bk);
-    let label = if side { "flash_side" } else { "flash" };
-    ctx.compile_subkernel_ex(&src, ENTRY, variant, label, bools, &[])
+    ctx.compile_subkernel_ex(&src, ENTRY, variant, "flash", &[], &[])
 }
 
 /// GPU oracle: run the fused flash kernel over an `attention::Fixture`, return
-/// bf16-rounded O — same target as `attention_gemm::gpu` / `cpu_causal`. Full
-/// layers (hd=512) and sliding (hd=256); hd must be a multiple of NSG*8=64.
+/// bf16-rounded O — same target as `attention_gemm::gpu` / `cpu_causal`. f16 KV
+/// only. Full layers (hd=512) and sliding (hd=256); hd a multiple of NSG*8=64.
 #[cfg(target_os = "macos")]
 pub fn gpu_flash(
     f: &crate::shaders::attention::Fixture,
     causal: bool,
-    side: bool,
 ) -> Result<Vec<f32>, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
@@ -179,7 +167,7 @@ pub fn gpu_flash(
     let kstride = nkv * hd * 2;
 
     let ctx = MetalContext::new()?;
-    let pipe = pipeline_flash(&ctx, KernelVariant::PRODUCTION, side, BQ, BK)?;
+    let pipe = pipeline_flash(&ctx, KernelVariant::PRODUCTION, BQ, BK)?;
     let mut pool = BufferPool::new();
 
     let buf_q = pool
@@ -189,21 +177,14 @@ pub fn gpu_flash(
     let buf_out = pool
         .allocate(&ctx.device, canvas * n_q_heads * hd * 2)
         .ok_or(Error::Gpu("alloc out"))?;
+    // +BK pad rows: device tile-loads read up to key kt+BK-1 past T.
     let buf_kv = pool
-        .allocate(&ctx.device, (f.kvcache.len() + 8 * kstride) * 2)
+        .allocate(&ctx.device, (f.kvcache.len() + BK * kstride) * 2)
         .ok_or(Error::Gpu("alloc kv"))?;
     {
         let mut bits = crate::shaders::f16::f32_slice_to_f16(&f.kvcache);
-        bits.resize(bits.len() + 8 * kstride, 0);
+        bits.resize(bits.len() + BK * kstride, 0);
         BufferPool::write_bf16(&buf_kv, &bits);
-    }
-    let buf_kvf = pool
-        .allocate(&ctx.device, (f.kvcache.len() + 8 * kstride) * 4)
-        .ok_or(Error::Gpu("alloc kvf"))?;
-    {
-        let mut fs = f.kvcache.clone();
-        fs.resize(fs.len() + 8 * kstride, 0.0);
-        BufferPool::write_f32(&buf_kvf, &fs);
     }
 
     let mut dims = FlashDims {
@@ -238,9 +219,6 @@ pub fn gpu_flash(
         enc.setBuffer_offset_atIndex(Some(&buf_q), 0, 0);
         enc.setBuffer_offset_atIndex(Some(&buf_kv), 0, 1);
         enc.setBuffer_offset_atIndex(Some(&buf_out), 0, 2);
-        if side {
-            enc.setBuffer_offset_atIndex(Some(&buf_kvf), 0, 9);
-        }
     }
     gpu_common::set_bytes(&enc, &dims, 3);
     enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
@@ -280,7 +258,7 @@ pub fn bench_flash(f: &crate::shaders::attention::Fixture, iters: usize) -> Resu
     let kstride = nkv * hd * 2;
 
     let ctx = MetalContext::new()?;
-    let pipe = pipeline_flash(&ctx, KernelVariant::PRODUCTION, false, BQ, BK)?;
+    let pipe = pipeline_flash(&ctx, KernelVariant::PRODUCTION, BQ, BK)?;
     let mut pool = BufferPool::new();
     let buf_q = pool
         .allocate(&ctx.device, canvas * n_q_heads * hd * 2)
@@ -290,11 +268,11 @@ pub fn bench_flash(f: &crate::shaders::attention::Fixture, iters: usize) -> Resu
         .allocate(&ctx.device, canvas * n_q_heads * hd * 2)
         .ok_or(Error::Gpu("alloc out"))?;
     let buf_kv = pool
-        .allocate(&ctx.device, (f.kvcache.len() + 8 * kstride) * 2)
+        .allocate(&ctx.device, (f.kvcache.len() + BK * kstride) * 2)
         .ok_or(Error::Gpu("alloc kv"))?;
     {
         let mut bits = crate::shaders::f16::f32_slice_to_f16(&f.kvcache);
-        bits.resize(bits.len() + 8 * kstride, 0);
+        bits.resize(bits.len() + BK * kstride, 0);
         BufferPool::write_bf16(&buf_kv, &bits);
     }
     let mut dims = FlashDims {
