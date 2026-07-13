@@ -112,7 +112,12 @@ pub struct PerfFlags {
     /// 2026-07-13. Prefill-only; denoise keeps attention_mma_full. `=0` restores it.
     pub gemm_attn: bool,
     /// `DGQ_GEMM_ATTN_HC` (E17a): Q heads processed per E17 dispatch batch.
-    /// Bounds the S/P scratch to [HC][CANVAS][n_pad(max_seq)]. Default 4.
+    /// Bounds the S/P scratch to [HC][CANVAS][n_pad(max_seq)]. Default 16 (all
+    /// heads): the holistic prefill BO (task #88) found HC=16 the proxy optimum
+    /// at every kv (−0.3/1.5/3.1/3.6% at 2k/8k/30k/100k vs HC=4), and HC is
+    /// numerically invariant (per-head disjoint scratch), so this is a bit-
+    /// identical perf ship. Scratch ~1.6 GiB @100k on 36 GB; drop to 4 for very
+    /// long contexts if memory-pressured.
     pub gemm_attn_head_chunk: usize,
     /// E17 tunable tile geometry (task #87 sweep). QK GEMM tile qk_bm x qk_bn,
     /// PV GEMM tile pv_bm x pv_bn, softmax threads/row. Defaults reproduce the
@@ -157,7 +162,7 @@ impl Default for PerfFlags {
             prefill_resident: true,
             attn_kv_block: 0,
             gemm_attn: true,
-            gemm_attn_head_chunk: 4,
+            gemm_attn_head_chunk: 16,
             gemm_attn_qk_bm: 64,
             gemm_attn_qk_bn: 64,
             gemm_attn_pv_bm: 64,
@@ -401,7 +406,7 @@ impl RuntimeConfig {
                 prefill_resident: env_on_unless_zero("DGQ_PREFILL_RESIDENT"),
                 attn_kv_block: parse_usize("DGQ_ATTN_KV_BLOCK", 0),
                 gemm_attn: env_on_unless_zero("DGQ_GEMM_ATTN"),
-                gemm_attn_head_chunk: parse_usize("DGQ_GEMM_ATTN_HC", 4).max(1),
+                gemm_attn_head_chunk: parse_usize("DGQ_GEMM_ATTN_HC", 16).max(1),
                 gemm_attn_qk_bm: parse_usize("DGQ_GEMM_ATTN_QK_BM", 64).max(16),
                 gemm_attn_qk_bn: parse_usize("DGQ_GEMM_ATTN_QK_BN", 64).max(16),
                 gemm_attn_pv_bm: parse_usize("DGQ_GEMM_ATTN_PV_BM", 64).max(16),
