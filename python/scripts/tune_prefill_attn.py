@@ -60,6 +60,12 @@ def run_bench(binary: Path, kv_len: int, iters: int, side: bool, cfg: dict,
         "DGQ_GEMM_ATTN_HC": str(cfg["hc"]),
         "DGQ_GEMM_ATTN_SM_TPG": str(cfg["sm_tpg"]),
     })
+    if proxy:  # holistic: also the dense-GEMM + MoE-sparse tiles (task #88)
+        env.update({
+            "DGQ_GEMM_TUNE_BM": str(cfg["gemm_bm"]),
+            "DGQ_GEMM_TUNE_BN": str(cfg["gemm_bn"]),
+            "DGQ_MOE_SPARSE_BN": str(cfg["moe_bn"]),
+        })
     if proxy:  # holistic: one real super-chunk at kv=proxy, needs the model
         args = [str(binary), "-m", model, "bench-prefill-super",
                 "--kv-len", str(kv_len), "--iters", str(iters)]
@@ -114,6 +120,10 @@ def main() -> int:
             "hc": trial.suggest_categorical("hc", HC_CHOICES),
             "sm_tpg": trial.suggest_categorical("sm_tpg", TPG_CHOICES),
         }
+        if args.proxy:  # co-optimize the dominant dense-GEMM + MoE tiles too
+            cfg["gemm_bm"] = trial.suggest_categorical("gemm_bm", BM_CHOICES)
+            cfg["gemm_bn"] = trial.suggest_categorical("gemm_bn", BN_CHOICES)
+            cfg["moe_bn"] = trial.suggest_categorical("moe_bn", BN_CHOICES)
         model = str(Path(args.model).resolve()) if args.proxy else None
         res = run_bench(binary, args.kv_len, args.iters, args.side, cfg,
                         "proxy" if args.proxy else None, model)
