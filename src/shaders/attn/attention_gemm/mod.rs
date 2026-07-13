@@ -26,6 +26,54 @@ pub const BM: usize = 64;
 pub const BN: usize = 64;
 pub const SOFTMAX_TPG: usize = 256;
 
+/// Tunable config for a prefill-attention sweep (task #87). The two GEMMs have
+/// different shapes (QK: M=canvas,K=hd,N=T; PV: M=canvas,K=T,N=hd), so their
+/// tiles tune independently — compiled by prepending `#define AG_*`.
+#[derive(Clone, Copy, Debug)]
+pub struct TuneCfg {
+    pub hc: usize,
+    pub qk_bm: usize,
+    pub qk_bn: usize,
+    pub pv_bm: usize,
+    pub pv_bn: usize,
+    pub sm_tpg: usize,
+}
+
+impl Default for TuneCfg {
+    fn default() -> Self {
+        Self {
+            hc: 4,
+            qk_bm: 64,
+            qk_bn: 64,
+            pv_bm: 64,
+            pv_bn: 64,
+            sm_tpg: 256,
+        }
+    }
+}
+
+impl TuneCfg {
+    /// Compile-time validity: BN divides 128 (loader thread split) and is a
+    /// multiple of 16; BM a multiple of 16; SM_TPG a power of two in [32,1024].
+    pub fn valid(&self) -> bool {
+        let ok_bn = |bn: usize| bn % 16 == 0 && 128 % bn == 0;
+        let ok_bm = |bm: usize| bm % 16 == 0 && bm > 0 && bm <= 128;
+        ok_bn(self.qk_bn)
+            && ok_bn(self.pv_bn)
+            && ok_bm(self.qk_bm)
+            && ok_bm(self.pv_bm)
+            && self.sm_tpg.is_power_of_two()
+            && (32..=1024).contains(&self.sm_tpg)
+            && (1..=16).contains(&self.hc)
+    }
+}
+
+/// Prepend the tile #defines to specialize the kernels for a sweep. Un-prepended
+/// (production) source keeps the shipped 64x64/256 defaults, so golden is safe.
+pub fn tuned_source(bm: usize, bn: usize, sm_tpg: usize) -> String {
+    format!("#define AG_BM {bm}\n#define AG_BN {bn}\n#define AG_SM_TPG {sm_tpg}\n{SHADER}")
+}
+
 /// Host mirror of the shader `AttnGemmDims`. All buffer base offsets (per head,
 /// per KV head) are applied host-side via buffer offset args; this struct
 /// carries shapes, row strides, and the softmax mask parameters.
@@ -505,6 +553,199 @@ pub fn bench_gpu(
                 }
                 gpu_common::set_bytes(&enc, &dims_pv, 4);
                 enc.dispatchThreadgroups_threadsPerThreadgroup(grid_pv, tg128);
+                enc.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers);
+                h0 += hb;
+            }
+        }
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+        if round > 0 {
+            best = best.min(t.elapsed().as_secs_f64() * 1e3 / iters as f64);
+        }
+    }
+    Ok(best)
+}
+
+/// Sweep bench (task #87): compile the E17 kernels for a `TuneCfg` (QK/softmax
+/// with the QK tile, PV with the PV tile) and time the full head-chunked prefill
+/// sequence at model shape. Returns mean ms/layer (min over warmed rounds), or
+/// Err if the config fails to compile (bad tile / register spill). `side` = the
+/// f32 side-KV variant.
+#[cfg(target_os = "macos")]
+pub fn bench_tuned(
+    f: &crate::shaders::attention::Fixture,
+    iters: usize,
+    cfg: TuneCfg,
+    side: bool,
+) -> Result<f64, Error> {
+    use crate::metal::buffer::BufferPool;
+    use crate::metal::device::MetalContext;
+    use crate::shaders::bf16;
+    use crate::shaders::gpu_common;
+    use crate::shaders::variant::{FcBool, KernelVariant};
+    use objc2_metal::{
+        MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
+    };
+    use std::time::Instant;
+
+    let canvas = f.canvas;
+    let n_q_heads = f.n_q_heads;
+    let nkv = f.n_kv();
+    let hd = f.head_dim();
+    let group = n_q_heads / nkv;
+    let t_total = f.kv_len as usize + canvas;
+    let np = n_pad(t_total);
+    let kstride = nkv * hd * 2;
+    let hc = cfg.hc.clamp(1, n_q_heads);
+
+    let ctx = MetalContext::new()?;
+    let prod = KernelVariant::PRODUCTION;
+    let side_fc: &[FcBool] = if side {
+        &[FcBool {
+            index: 30,
+            value: true,
+        }]
+    } else {
+        &[]
+    };
+    let src_qk = tuned_source(cfg.qk_bm, cfg.qk_bn, cfg.sm_tpg);
+    let src_pv = tuned_source(cfg.pv_bm, cfg.pv_bn, cfg.sm_tpg);
+    let pipe_qk = ctx.compile_subkernel_ex(&src_qk, ENTRY_QK, prod, "tune", side_fc, &[])?;
+    let pipe_sm = ctx.compile_subkernel_ex(&src_qk, ENTRY_SOFTMAX, prod, "tune", side_fc, &[])?;
+    let pipe_pv = ctx.compile_subkernel_ex(&src_pv, ENTRY_PV, prod, "tune", side_fc, &[])?;
+
+    let mut pool = BufferPool::new();
+    let buf_q = pool
+        .allocate(&ctx.device, canvas * n_q_heads * hd * 2)
+        .ok_or(Error::Gpu("alloc q"))?;
+    BufferPool::write_bf16(&buf_q, &bf16::f32_slice_to_bf16_bits(&f.q));
+    let buf_out = pool
+        .allocate(&ctx.device, canvas * n_q_heads * hd * 2)
+        .ok_or(Error::Gpu("alloc out"))?;
+    let buf_kv = pool
+        .allocate(&ctx.device, (f.kvcache.len() + 8 * kstride) * 2)
+        .ok_or(Error::Gpu("alloc kv"))?;
+    {
+        let mut bits = crate::shaders::f16::f32_slice_to_f16(&f.kvcache);
+        bits.resize(bits.len() + 8 * kstride, 0);
+        BufferPool::write_bf16(&buf_kv, &bits);
+    }
+    let buf_kvf = pool
+        .allocate(&ctx.device, (f.kvcache.len() + 8 * kstride) * 4)
+        .ok_or(Error::Gpu("alloc kvf"))?;
+    {
+        let mut fs = f.kvcache.clone();
+        fs.resize(fs.len() + 8 * kstride, 0.0);
+        BufferPool::write_f32(&buf_kvf, &fs);
+    }
+    let p_elem = if side { 4 } else { 2 };
+    let buf_s = pool
+        .allocate(&ctx.device, hc * canvas * np * 4)
+        .ok_or(Error::Gpu("alloc s"))?;
+    let buf_p = pool
+        .allocate(&ctx.device, hc * canvas * np * p_elem)
+        .ok_or(Error::Gpu("alloc p"))?;
+    let buf_lrow = pool
+        .allocate(&ctx.device, hc * canvas * 4)
+        .ok_or(Error::Gpu("alloc lrow"))?;
+
+    let mut dims = AttnGemmDims {
+        m: canvas as u32,
+        n: t_total as u32,
+        k: hd as u32,
+        a_row_stride: (n_q_heads * hd) as u32,
+        b_row_stride: kstride as u32,
+        s_row_stride: np as u32,
+        out_row_stride: (n_q_heads * hd) as u32,
+        causal: 1,
+        kv_len: f.kv_len,
+        hd: hd as u32,
+        group: group as u32,
+        nkv: nkv as u32,
+        s_head_stride: (canvas * np) as u32,
+        head_base: 0,
+    };
+    let tg_qk = MTLSize {
+        width: 128,
+        height: 1,
+        depth: 1,
+    };
+    let tg_pv = MTLSize {
+        width: 128,
+        height: 1,
+        depth: 1,
+    };
+    let tg_sm = MTLSize {
+        width: cfg.sm_tpg,
+        height: 1,
+        depth: 1,
+    };
+
+    let mut best = f64::INFINITY;
+    for round in 0..6 {
+        let t = Instant::now();
+        let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+        let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
+        for _ in 0..iters {
+            let mut h0 = 0usize;
+            while h0 < n_q_heads {
+                let hb = (n_q_heads - h0).min(hc);
+                dims.head_base = h0 as u32;
+                let dims_pv = AttnGemmDims {
+                    n: hd as u32,
+                    k: t_total as u32,
+                    a_row_stride: np as u32,
+                    ..dims
+                };
+                let grid_qk = MTLSize {
+                    width: t_total.div_ceil(cfg.qk_bn),
+                    height: canvas.div_ceil(cfg.qk_bm),
+                    depth: hb,
+                };
+                let grid_sm = MTLSize {
+                    width: canvas,
+                    height: hb,
+                    depth: 1,
+                };
+                let grid_pv = MTLSize {
+                    width: hd.div_ceil(cfg.pv_bn),
+                    height: canvas.div_ceil(cfg.pv_bm),
+                    depth: hb,
+                };
+                enc.setComputePipelineState(&pipe_qk.pipeline);
+                unsafe {
+                    enc.setBuffer_offset_atIndex(Some(&buf_q), 0, 0);
+                    enc.setBuffer_offset_atIndex(Some(&buf_kv), 0, 1);
+                    enc.setBuffer_offset_atIndex(Some(&buf_s), 0, 2);
+                    if side {
+                        enc.setBuffer_offset_atIndex(Some(&buf_kvf), 0, 9);
+                    }
+                }
+                gpu_common::set_bytes(&enc, &dims, 3);
+                enc.dispatchThreadgroups_threadsPerThreadgroup(grid_qk, tg_qk);
+                enc.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers);
+                enc.setComputePipelineState(&pipe_sm.pipeline);
+                unsafe {
+                    enc.setBuffer_offset_atIndex(Some(&buf_s), 0, 0);
+                    enc.setBuffer_offset_atIndex(Some(&buf_p), 0, 1);
+                    enc.setBuffer_offset_atIndex(Some(&buf_lrow), 0, 2);
+                }
+                gpu_common::set_bytes(&enc, &dims, 3);
+                enc.dispatchThreadgroups_threadsPerThreadgroup(grid_sm, tg_sm);
+                enc.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers);
+                enc.setComputePipelineState(&pipe_pv.pipeline);
+                unsafe {
+                    enc.setBuffer_offset_atIndex(Some(&buf_p), 0, 0);
+                    enc.setBuffer_offset_atIndex(Some(&buf_kv), 0, 1);
+                    enc.setBuffer_offset_atIndex(Some(&buf_out), 0, 2);
+                    enc.setBuffer_offset_atIndex(Some(&buf_lrow), 0, 3);
+                    if side {
+                        enc.setBuffer_offset_atIndex(Some(&buf_kvf), 0, 9);
+                    }
+                }
+                gpu_common::set_bytes(&enc, &dims_pv, 4);
+                enc.dispatchThreadgroups_threadsPerThreadgroup(grid_pv, tg_pv);
                 enc.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers);
                 h0 += hb;
             }

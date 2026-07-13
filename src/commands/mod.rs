@@ -509,6 +509,17 @@ pub(crate) fn dispatch(cli: Cli) -> ExitCode {
             oracle,
             iters,
         } => run_bench_gemm(&shapes, oracle.as_deref(), iters),
+        Command::BenchPrefillAttn {
+            kv_len,
+            qk_bm,
+            qk_bn,
+            pv_bm,
+            pv_bn,
+            hc,
+            sm_tpg,
+            side,
+            iters,
+        } => run_bench_prefill_attn(kv_len, qk_bm, qk_bn, pv_bm, pv_bn, hc, sm_tpg, side, iters),
         command => {
             eprintln!("loading from {}", cli.model_dir.display());
             match model::Model::open(&cli.model_dir) {
@@ -562,6 +573,7 @@ pub(crate) fn run_command(
         Command::ProbeDevice { .. } => ExitCode::FAILURE,
         Command::Quantize { .. } => ExitCode::FAILURE,
         Command::BenchGemm { .. } => ExitCode::FAILURE,
+        Command::BenchPrefillAttn { .. } => ExitCode::FAILURE,
         Command::StepSmoke { .. } => ExitCode::FAILURE,
         Command::StepProbe { .. } => ExitCode::FAILURE,
         Command::StepKvCheck { .. } => ExitCode::FAILURE,

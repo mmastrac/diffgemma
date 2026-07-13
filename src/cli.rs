@@ -61,6 +61,19 @@ pub(crate) enum Command {
         oracle: Option<String>,
         iters: usize,
     },
+    /// Tunable E17 prefill-attention bench for sweeps (task #87): compiles the
+    /// kernels for a tile/HC/TPG config and prints RESULT {json: ms, tf_s}.
+    BenchPrefillAttn {
+        kv_len: u32,
+        qk_bm: usize,
+        qk_bn: usize,
+        pv_bm: usize,
+        pv_bn: usize,
+        hc: usize,
+        sm_tpg: usize,
+        side: bool,
+        iters: usize,
+    },
     Quantize {
         output: PathBuf,
         profile: String,
@@ -328,6 +341,14 @@ pub(crate) fn parse_cli() -> Cli {
     let mut output_dir: Option<PathBuf> = None;
     let mut quant_profile = String::from("q4");
     let mut bench_gemm_shapes = String::from("256x2816x2816,33x2816x1408");
+    // Tunable prefill-attention sweep (bench-prefill-attn).
+    let mut ag_qk_bm = 64usize;
+    let mut ag_qk_bn = 64usize;
+    let mut ag_pv_bm = 64usize;
+    let mut ag_pv_bn = 64usize;
+    let mut ag_hc = 4usize;
+    let mut ag_sm_tpg = 256usize;
+    let mut ag_side = false;
     let mut bench_gemm_oracle: Option<String> = None;
     let mut step_kv_len = 0u32;
     let mut step_max_seq = 512usize;
@@ -495,6 +516,37 @@ pub(crate) fn parse_cli() -> Cli {
                     bench_gemm_oracle = Some(v);
                 }
             }
+            "--qk-bm" => {
+                if let Some(v) = args.next() {
+                    ag_qk_bm = v.parse().unwrap_or(64);
+                }
+            }
+            "--qk-bn" => {
+                if let Some(v) = args.next() {
+                    ag_qk_bn = v.parse().unwrap_or(64);
+                }
+            }
+            "--pv-bm" => {
+                if let Some(v) = args.next() {
+                    ag_pv_bm = v.parse().unwrap_or(64);
+                }
+            }
+            "--pv-bn" => {
+                if let Some(v) = args.next() {
+                    ag_pv_bn = v.parse().unwrap_or(64);
+                }
+            }
+            "--hc" => {
+                if let Some(v) = args.next() {
+                    ag_hc = v.parse().unwrap_or(4);
+                }
+            }
+            "--sm-tpg" => {
+                if let Some(v) = args.next() {
+                    ag_sm_tpg = v.parse().unwrap_or(256);
+                }
+            }
+            "--side" => ag_side = true,
             "--forward-only" => step_forward_only = true,
             "--step-profile" => step_profile = true,
             "--layer-profile" => step_layer_profile = true,
@@ -691,6 +743,17 @@ pub(crate) fn parse_cli() -> Cli {
         Some("bench-gemm") => Command::BenchGemm {
             shapes: bench_gemm_shapes,
             oracle: bench_gemm_oracle,
+            iters: bench_iters.max(1),
+        },
+        Some("bench-prefill-attn") => Command::BenchPrefillAttn {
+            kv_len: if step_kv_len > 0 { step_kv_len } else { 30000 },
+            qk_bm: ag_qk_bm,
+            qk_bn: ag_qk_bn,
+            pv_bm: ag_pv_bm,
+            pv_bn: ag_pv_bn,
+            hc: ag_hc,
+            sm_tpg: ag_sm_tpg,
+            side: ag_side,
             iters: bench_iters.max(1),
         },
         Some("quantize") => {

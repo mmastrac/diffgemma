@@ -461,3 +461,62 @@ pub(crate) fn run_gemm(size: usize) -> ExitCode {
         }
     }
 }
+
+/// Tunable E17 prefill-attention bench (task #87). Compiles the kernels for a
+/// tile/HC/TPG config and times the full head-chunked prefill sequence at model
+/// shape (canvas=256, 16 Q / 2 KV, hd=512). Prints a human line + a machine
+/// `RESULT {json}` line (ms/layer, TF/s) for the Optuna sweep driver. Needs no
+/// model weights — a synthetic fixture drives the kernels.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_bench_prefill_attn(
+    kv_len: u32,
+    qk_bm: usize,
+    qk_bn: usize,
+    pv_bm: usize,
+    pv_bn: usize,
+    hc: usize,
+    sm_tpg: usize,
+    side: bool,
+    iters: usize,
+) -> ExitCode {
+    use crate::shaders::attention_gemm::{TuneCfg, bench_tuned, model_full_fixture};
+    let cfg = TuneCfg {
+        hc,
+        qk_bm,
+        qk_bn,
+        pv_bm,
+        pv_bn,
+        sm_tpg,
+    };
+    if !cfg.valid() {
+        // Machine-parseable failure so the sweep driver can prune invalid points.
+        println!("RESULT {{\"ok\": false, \"reason\": \"invalid config\", \"cfg\": {cfg:?}}}");
+        return ExitCode::FAILURE;
+    }
+    let f = model_full_fixture(kv_len);
+    let (canvas, n_q_heads, hd) = (256usize, 16usize, 512usize);
+    let t_total = kv_len as usize + canvas;
+    // QK (2*M*T*hd) + PV (2*M*T*hd) MAC pairs per head, x heads.
+    let flops = (n_q_heads as f64) * 4.0 * (canvas as f64) * (t_total as f64) * (hd as f64);
+    match bench_tuned(&f, iters, cfg, side) {
+        Ok(ms) => {
+            let tf_s = flops / (ms / 1e3) / 1e12;
+            println!(
+                "prefill-attn kv={kv_len} qk={qk_bm}x{qk_bn} pv={pv_bm}x{pv_bn} hc={hc} \
+                 tpg={sm_tpg} side={side}: {ms:.3} ms/layer, {tf_s:.2} TF/s"
+            );
+            println!(
+                "RESULT {{\"ok\": true, \"ms\": {ms:.4}, \"tf_s\": {tf_s:.4}, \"kv_len\": {kv_len}, \
+                 \"qk_bm\": {qk_bm}, \"qk_bn\": {qk_bn}, \"pv_bm\": {pv_bm}, \"pv_bn\": {pv_bn}, \
+                 \"hc\": {hc}, \"sm_tpg\": {sm_tpg}, \"side\": {side}}}"
+            );
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            // Compile/dispatch failure (e.g. register spill) — prune, don't crash.
+            println!("RESULT {{\"ok\": false, \"reason\": \"{err}\", \"cfg\": {cfg:?}}}");
+            ExitCode::FAILURE
+        }
+    }
+}

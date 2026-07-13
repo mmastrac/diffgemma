@@ -30,18 +30,33 @@ using namespace metal;
 //       to Ws[d][t] from native V[t][d] (so <P_i, V[:,d]> = O[i][d]).
 // This is prefill-only; denoise keeps attention_mma_full. Not bit-identical.
 
-constant uint BM = 64u;
-constant uint BN = 64u;
+// Tile geometry is tunable: prepend `#define AG_BM/AG_BN/AG_SM_TPG` (via
+// attention_gemm::tuned_source) to sweep. Defaults reproduce the shipped 64x64
+// / 256-thread kernel exactly, so the production (un-prepended) compile — and
+// golden — is unchanged. BN must divide 128 (loader thread split) and be a
+// multiple of 16; BM a multiple of 16 (register budget caps ~64).
+#ifndef AG_BM
+#define AG_BM 64
+#endif
+#ifndef AG_BN
+#define AG_BN 64
+#endif
+#ifndef AG_SM_TPG
+#define AG_SM_TPG 256
+#endif
+
+constant uint BM = AG_BM;
+constant uint BN = AG_BN;
 constant uint BK = 32u;
 constant uint PAD = 40u;         // BK + 8 halfs: bank-conflict pad
-constant uint TM = BM / 16u;     // 4 fragments per simdgroup along M
-constant uint TN = BN / 16u;     // 4 fragments per simdgroup along N
+constant uint TM = BM / 16u;     // fragments per simdgroup along M
+constant uint TN = BN / 16u;     // fragments per simdgroup along N
 
-// Shared 64x64 NT fragment tiler (frag_mma_ktile + frag_lane_coords), the same
-// MMA core gemm_tunable uses — only our tile loaders (strided arena Q, f16 KV
-// cache native/transposed) differ.
-#define FRAG_BM 64
-#define FRAG_BN 64
+// Shared NT fragment tiler (frag_mma_ktile + frag_lane_coords), the same MMA
+// core gemm_tunable uses — only our tile loaders (strided arena Q, f16 KV cache
+// native/transposed) differ.
+#define FRAG_BM AG_BM
+#define FRAG_BN AG_BN
 #include "gemm_frag_tile.metal"
 
 // E17b: read Q/K/V from the f32 side ring (buffer 9) and run the MMA all-float,
@@ -215,7 +230,7 @@ kernel void attn_gemm_qk(
 // by L at store). Masked columns (t >= t_total or, causal, t > kv_len+row) are
 // written 0 so the PV contraction skips them; S for those columns is never
 // read (so the QK pad past T need not be initialized).
-constant uint SM_TPG = 256u;
+constant uint SM_TPG = AG_SM_TPG;
 kernel void attn_gemm_softmax(
     device const float *s [[buffer(0)]],  // [n_q_heads][m][s_row_stride] scores
     device half *p [[buffer(1)]],         // [n_q_heads][m][s_row_stride] probs
