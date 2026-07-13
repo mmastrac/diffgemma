@@ -730,6 +730,10 @@ struct StepPipelines {
     /// E17 GEMM-attention for full-layer PREFILL (`DGQ_GEMM_ATTN`): [qk, softmax, pv].
     /// None unless the flag is set. Prefill-only; denoise keeps attention_mma_full.
     attn_gemm: Option<[ComputePipeline; 3]>,
+    /// E17b f32-side-KV variant (FC30): reads the f32 side ring, all-float MMA.
+    /// None unless DGQ_GEMM_ATTN && DGQ_PREFILL_KV_F32. Preferred over `attn_gemm`
+    /// when present (matches attention_mma_full_side precision).
+    attn_gemm_side: Option<[ComputePipeline; 3]>,
     residual: ComputePipeline,
     glu: ComputePipeline,
     router: ComputePipeline,
@@ -1023,6 +1027,13 @@ impl StepPipelines {
             )?,
             attn_gemm: if crate::flags::gemm_attn_enabled() {
                 Some(crate::shaders::attention_gemm::pipelines(ctx, prod)?)
+            } else {
+                None
+            },
+            attn_gemm_side: if crate::flags::gemm_attn_enabled()
+                && crate::flags::prefill_kv_f32_enabled()
+            {
+                Some(crate::shaders::attention_gemm::pipelines_side(ctx, prod)?)
             } else {
                 None
             },
@@ -3136,6 +3147,15 @@ impl StepEnc<'_> {
         // HC heads. Data offsets use the global head (head_base + tgid.z); the
         // scratch is indexed by the batch-local tgid.z.
         let hc = crate::flags::gemm_attn_head_chunk().min(STEP_NQ_HEADS);
+        // E17b: prefer the f32-side-KV variant (reads the f32 side ring at
+        // buffer 9) when compiled — matches attention_mma_full_side precision.
+        let side = self.ps.attn_gemm_side.is_some();
+        let side_off = self.bufs.kv_f32_side_offs[layer] as usize;
+        let pipes = if side {
+            self.ps.attn_gemm_side.as_ref().unwrap().clone()
+        } else {
+            self.ps.attn_gemm.as_ref().unwrap().clone()
+        };
         let mut h0 = 0usize;
         while h0 < STEP_NQ_HEADS {
             let hb = (STEP_NQ_HEADS - h0).min(hc);
@@ -3162,9 +3182,9 @@ impl StepEnc<'_> {
                 depth: hb,
             };
 
-            // QK: S = Q.K^T. Q at the sub-chunk offset; K at this layer's
-            // kv_region (kv16 base = kvcache + kv_region bytes).
-            self.sink_set_pipeline(&self.ps.attn_gemm.as_ref().unwrap()[0]);
+            // QK: S = Q.K^T. Q at the sub-chunk offset; K from the f16 main cache
+            // (buffer 1 @ kv_region) or the f32 side ring (buffer 9 @ side_off).
+            self.sink_set_pipeline(&pipes[0]);
             self.sink_set_buffer(
                 &self.bufs.arena,
                 self.arena().attnq_off() as usize + qo_row,
@@ -3172,12 +3192,15 @@ impl StepEnc<'_> {
             );
             self.sink_set_buffer(&self.bufs.kvcache, l.kv_region as usize, 1);
             self.sink_set_buffer(self.bufs.attn_gemm_s.as_ref().unwrap(), 0, 2);
+            if side {
+                self.sink_set_buffer(self.bufs.kv_f32_side.as_ref().unwrap(), side_off, 9);
+            }
             self.sink_set_bytes(&dims, 3);
             self.sink_dispatch(grid_qk, tg128);
             self.sink_memory_barrier();
 
             // Softmax: P = exp(S - rowmax), masked; denom -> lrow.
-            self.sink_set_pipeline(&self.ps.attn_gemm.as_ref().unwrap()[1]);
+            self.sink_set_pipeline(&pipes[1]);
             self.sink_set_buffer(self.bufs.attn_gemm_s.as_ref().unwrap(), 0, 0);
             self.sink_set_buffer(self.bufs.attn_gemm_p.as_ref().unwrap(), 0, 1);
             self.sink_set_buffer(self.bufs.attn_gemm_lrow.as_ref().unwrap(), 0, 2);
@@ -3185,9 +3208,9 @@ impl StepEnc<'_> {
             self.sink_dispatch(grid_sm, tg_sm);
             self.sink_memory_barrier();
 
-            // PV: O = (P.V) / L. V at kv_region (kernel adds (nkv+kvh)*hd); O at
-            // the sub-chunk offset in the attno plane.
-            self.sink_set_pipeline(&self.ps.attn_gemm.as_ref().unwrap()[2]);
+            // PV: O = (P.V) / L. V from the f16 cache (buffer 1) or f32 side ring
+            // (buffer 9); O at the sub-chunk offset in the attno plane.
+            self.sink_set_pipeline(&pipes[2]);
             self.sink_set_buffer(self.bufs.attn_gemm_p.as_ref().unwrap(), 0, 0);
             self.sink_set_buffer(&self.bufs.kvcache, l.kv_region as usize, 1);
             self.sink_set_buffer(
@@ -3196,6 +3219,9 @@ impl StepEnc<'_> {
                 2,
             );
             self.sink_set_buffer(self.bufs.attn_gemm_lrow.as_ref().unwrap(), 0, 3);
+            if side {
+                self.sink_set_buffer(self.bufs.kv_f32_side.as_ref().unwrap(), side_off, 9);
+            }
             self.sink_set_bytes(&dims_pv, 4);
             self.sink_dispatch(grid_pv, tg128);
             self.sink_memory_barrier();
@@ -5570,7 +5596,8 @@ pub fn build_step_runtime(
         attn_gemm_p: if crate::flags::gemm_attn_enabled() {
             let np = crate::shaders::attention_gemm::n_pad(cfg.max_seq);
             let hc = crate::flags::gemm_attn_head_chunk().min(STEP_NQ_HEADS);
-            Some(alloc_buffer(&ctx.device, hc * CANVAS * np * 2)?)
+            // f32-side path stores f32 probs; size for f32 (4B) so either path fits.
+            Some(alloc_buffer(&ctx.device, hc * CANVAS * np * 4)?)
         } else {
             None
         },

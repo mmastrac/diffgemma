@@ -69,4 +69,41 @@ inline void frag_mma_ktile(
     }
 }
 
+// All-f32 variant (E17b): identical NT tiling with float threadgroup staging and
+// simdgroup_float8x8 A/B fragments (2 f32 elements/lane). Used by the E17
+// f32-side-KV attention path — Q/K/V come from the f32 side ring, so the MMA
+// runs in f32 to match attention_mma_full_side's precision. C stays f32.
+inline void frag_mma_ktile_f32(
+    threadgroup float Xs[FRAG_BM][FRAG_PAD],
+    threadgroup float Ws[FRAG_BN][FRAG_PAD],
+    thread simdgroup_float8x8 (&C)[FRAG_TM][FRAG_TN],
+    uint sr,
+    uint sc,
+    uint fm,
+    uint fn
+) {
+    for (uint kk = 0u; kk < FRAG_BK; kk += 8u) {
+        simdgroup_barrier(mem_flags::mem_none);
+        simdgroup_float8x8 A[FRAG_TM];
+        for (uint i = 0u; i < FRAG_TM; ++i) {
+            thread float2 &ea = reinterpret_cast<thread float2 &>(A[i].thread_elements());
+            ea[0] = Xs[sr + 8u * i + fm][kk + fn];
+            ea[1] = Xs[sr + 8u * i + fm][kk + fn + 1u];
+        }
+        simdgroup_barrier(mem_flags::mem_none);
+        simdgroup_float8x8 B[FRAG_TN];
+        for (uint j = 0u; j < FRAG_TN; ++j) {
+            thread float2 &eb = reinterpret_cast<thread float2 &>(B[j].thread_elements());
+            eb[0] = Ws[sc + 8u * j + fn][kk + fm];
+            eb[1] = Ws[sc + 8u * j + fn + 1u][kk + fm];
+        }
+        simdgroup_barrier(mem_flags::mem_none);
+        for (uint i = 0u; i < FRAG_TM; ++i) {
+            for (uint j = 0u; j < FRAG_TN; ++j) {
+                simdgroup_multiply_accumulate(C[i][j], A[i], B[j], C[i][j]);
+            }
+        }
+    }
+}
+
 #endif

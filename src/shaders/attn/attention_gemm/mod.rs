@@ -67,13 +67,35 @@ pub fn pipelines(
     ])
 }
 
+/// E17b: f32-side-KV variant (FC30) — Q/K/V from the f32 side ring, all-float
+/// MMA, f32 probs. Matches attention_mma_full_side precision.
+#[cfg(target_os = "macos")]
+pub fn pipelines_side(
+    ctx: &crate::metal::device::MetalContext,
+    variant: crate::shaders::variant::KernelVariant,
+) -> Result<[crate::metal::device::ComputePipeline; 3], Error> {
+    let bools = [crate::shaders::variant::FcBool {
+        index: 30,
+        value: true,
+    }];
+    Ok([
+        ctx.compile_subkernel_ex(SHADER, ENTRY_QK, variant, "side", &bools, &[])?,
+        ctx.compile_subkernel_ex(SHADER, ENTRY_SOFTMAX, variant, "side", &bools, &[])?,
+        ctx.compile_subkernel_ex(SHADER, ENTRY_PV, variant, "side", &bools, &[])?,
+    ])
+}
+
 // --------------------------------------------------------------------------
 // GPU oracle: run the 3-kernel decomposition over an `attention::Fixture` and
 // return bf16-rounded outputs, to cross-check against the CPU attention oracle
 // (same target as `attention::gpu_mma_full`). Full layers (hd=512) only.
 // --------------------------------------------------------------------------
 #[cfg(target_os = "macos")]
-pub fn gpu(f: &crate::shaders::attention::Fixture, causal: bool) -> Result<Vec<f32>, Error> {
+pub fn gpu(
+    f: &crate::shaders::attention::Fixture,
+    causal: bool,
+    side: bool,
+) -> Result<Vec<f32>, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
     use crate::shaders::bf16;
@@ -95,7 +117,11 @@ pub fn gpu(f: &crate::shaders::attention::Fixture, causal: bool) -> Result<Vec<f
     let kstride = nkv * hd * 2; // elements between per-token KV rows (K then V)
 
     let ctx = MetalContext::new()?;
-    let [pipe_qk, pipe_sm, pipe_pv] = pipelines(&ctx, KernelVariant::PRODUCTION)?;
+    let [pipe_qk, pipe_sm, pipe_pv] = if side {
+        pipelines_side(&ctx, KernelVariant::PRODUCTION)?
+    } else {
+        pipelines(&ctx, KernelVariant::PRODUCTION)?
+    };
     let mut pool = BufferPool::new();
 
     // Q / out: [canvas][n_q_heads][hd] bf16 (arena default).
@@ -106,7 +132,7 @@ pub fn gpu(f: &crate::shaders::attention::Fixture, causal: bool) -> Result<Vec<f
     let buf_out = pool
         .allocate(&ctx.device, canvas * n_q_heads * hd * 2)
         .ok_or(Error::Gpu("alloc out"))?;
-    // KV: f16, +8 pad key rows (direct-load tiles read whole 8-key spans).
+    // KV: f16 main cache (f16 path). +8 pad key rows (direct-load whole 8-key tiles).
     let buf_kv = pool
         .allocate(&ctx.device, (f.kvcache.len() + 8 * kstride) * 2)
         .ok_or(Error::Gpu("alloc kv"))?;
@@ -115,13 +141,24 @@ pub fn gpu(f: &crate::shaders::attention::Fixture, causal: bool) -> Result<Vec<f
         bits.resize(bits.len() + 8 * kstride, 0);
         BufferPool::write_bf16(&buf_kv, &bits);
     }
-    // Scratch: S (f32), P (half), lrow (f32) — HC head slices (head-chunked).
+    // f32 side ring (f32 path): the fixture kvcache is already [t][nkv*hd*2] f32
+    // in the ring layout. +8 pad rows.
+    let buf_kvf = pool
+        .allocate(&ctx.device, (f.kvcache.len() + 8 * kstride) * 4)
+        .ok_or(Error::Gpu("alloc kvf"))?;
+    {
+        let mut fs = f.kvcache.clone();
+        fs.resize(fs.len() + 8 * kstride, 0.0);
+        BufferPool::write_f32(&buf_kvf, &fs);
+    }
+    // Scratch: S (f32), P (half or f32 in the side path), lrow (f32) — HC slices.
     let hc = 4.min(n_q_heads);
+    let p_elem = if side { 4 } else { 2 };
     let buf_s = pool
         .allocate(&ctx.device, hc * canvas * np * 4)
         .ok_or(Error::Gpu("alloc s"))?;
     let buf_p = pool
-        .allocate(&ctx.device, hc * canvas * np * 2)
+        .allocate(&ctx.device, hc * canvas * np * p_elem)
         .ok_or(Error::Gpu("alloc p"))?;
     let buf_lrow = pool
         .allocate(&ctx.device, hc * canvas * 4)
@@ -187,6 +224,9 @@ pub fn gpu(f: &crate::shaders::attention::Fixture, causal: bool) -> Result<Vec<f
             enc.setBuffer_offset_atIndex(Some(&buf_q), 0, 0);
             enc.setBuffer_offset_atIndex(Some(&buf_kv), 0, 1);
             enc.setBuffer_offset_atIndex(Some(&buf_s), 0, 2);
+            if side {
+                enc.setBuffer_offset_atIndex(Some(&buf_kvf), 0, 9);
+            }
         }
         gpu_common::set_bytes(&enc, &dims, 3);
         enc.dispatchThreadgroups_threadsPerThreadgroup(grid_qk, tg128);
@@ -208,6 +248,9 @@ pub fn gpu(f: &crate::shaders::attention::Fixture, causal: bool) -> Result<Vec<f
             enc.setBuffer_offset_atIndex(Some(&buf_kv), 0, 1);
             enc.setBuffer_offset_atIndex(Some(&buf_out), 0, 2);
             enc.setBuffer_offset_atIndex(Some(&buf_lrow), 0, 3);
+            if side {
+                enc.setBuffer_offset_atIndex(Some(&buf_kvf), 0, 9);
+            }
         }
         gpu_common::set_bytes(&enc, &dims_pv, 4);
         enc.dispatchThreadgroups_threadsPerThreadgroup(grid_pv, tg128);
@@ -233,7 +276,7 @@ pub fn gpu(f: &crate::shaders::attention::Fixture, causal: bool) -> Result<Vec<f
 /// tolerance matches the all-valid oracle. Prefill-only — the production
 /// non-causal path is covered by the `attention::cpu` oracle.
 #[cfg(all(test, target_os = "macos"))]
-pub fn cpu_causal(f: &crate::shaders::attention::Fixture) -> Vec<f32> {
+pub fn cpu_causal(f: &crate::shaders::attention::Fixture, round_kv_f16: bool) -> Vec<f32> {
     use crate::shaders::bf16;
     use crate::shaders::f16;
     let hd = f.head_dim();
@@ -243,11 +286,15 @@ pub fn cpu_causal(f: &crate::shaders::attention::Fixture) -> Vec<f32> {
     let kv_len = f.kv_len as usize;
     let group = n_q_heads / nkv;
     let q = bf16::bf16_slice_to_f32(&bf16::f32_slice_to_bf16_bits(&f.q));
-    let kv: Vec<f32> = f
-        .kvcache
-        .iter()
-        .map(|&v| f16::f16_bits_to_f32(f16::f32_to_f16_bits(v)))
-        .collect();
+    // f16 path rounds KV to f16 (main cache); f32-side path keeps raw f32.
+    let kv: Vec<f32> = if round_kv_f16 {
+        f.kvcache
+            .iter()
+            .map(|&v| f16::f16_bits_to_f32(f16::f32_to_f16_bits(v)))
+            .collect()
+    } else {
+        f.kvcache.clone()
+    };
     let mut out = vec![0.0f32; f.out_len()];
     for tok in 0..canvas {
         for qh in 0..n_q_heads {
@@ -484,7 +531,7 @@ mod tests {
     fn attn_gemm_full_grp8_vs_cpu() {
         use crate::shaders::test_util::{ElemFormat, assert_oracle};
         let f = crate::shaders::attention::full_grp8_hd512_fixture(ElemFormat::F32);
-        let got = gpu(&f, false).expect("gpu attn_gemm");
+        let got = gpu(&f, false, false).expect("gpu attn_gemm");
         let oracle = crate::shaders::attention::cpu(&f);
         assert_oracle(&got, &oracle, 2e-2, 0.9999);
     }
@@ -494,21 +541,33 @@ mod tests {
     fn attn_gemm_full_grp2_vs_cpu() {
         use crate::shaders::test_util::{ElemFormat, assert_oracle};
         let f = crate::shaders::attention::full_hd512_fixture(ElemFormat::F32);
-        let got = gpu(&f, false).expect("gpu attn_gemm");
+        let got = gpu(&f, false, false).expect("gpu attn_gemm");
         let oracle = crate::shaders::attention::cpu(&f);
         assert_oracle(&got, &oracle, 2e-2, 0.9999);
     }
 
-    /// Causal prefill mask vs the causal CPU reference. Full-layer shape,
-    /// GQA group 8; kv_len=28, canvas=16 exercises per-row cutoffs across
-    /// ragged 64-key N-tiles.
+    /// Causal prefill mask vs the causal CPU reference (f16 KV). Full-layer
+    /// shape, GQA group 8; kv_len=28, canvas=16 exercises per-row cutoffs
+    /// across ragged 64-key N-tiles.
     #[cfg(target_os = "macos")]
     #[test]
     fn attn_gemm_full_grp8_causal_vs_cpu() {
         use crate::shaders::test_util::{ElemFormat, assert_oracle};
         let f = crate::shaders::attention::full_grp8_hd512_fixture(ElemFormat::F32);
-        let got = gpu(&f, true).expect("gpu attn_gemm causal");
-        let oracle = cpu_causal(&f);
+        let got = gpu(&f, true, false).expect("gpu attn_gemm causal");
+        let oracle = cpu_causal(&f, true);
+        assert_oracle(&got, &oracle, 2e-2, 0.9999);
+    }
+
+    /// E17b f32-side-KV path (FC30): all-float MMA reading the f32 side ring;
+    /// vs the causal CPU reference with RAW f32 KV (no f16 rounding).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn attn_gemm_full_grp8_causal_side_vs_cpu() {
+        use crate::shaders::test_util::{ElemFormat, assert_oracle};
+        let f = crate::shaders::attention::full_grp8_hd512_fixture(ElemFormat::F32);
+        let got = gpu(&f, true, true).expect("gpu attn_gemm causal side");
+        let oracle = cpu_causal(&f, false);
         assert_oracle(&got, &oracle, 2e-2, 0.9999);
     }
 
