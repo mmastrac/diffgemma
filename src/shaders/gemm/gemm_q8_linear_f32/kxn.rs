@@ -164,11 +164,11 @@ mod tests {
 
     kernel_oracle_matrix! {
         mod tiny,
-        cpu = crate::shaders::gemm_q8_linear_kxn_f32::cpu,
-        cpu_oracle = crate::shaders::gemm_q8_linear_kxn_f32::cpu_oracle,
-        gpu = crate::shaders::gemm_q8_linear_kxn_f32::gpu,
-        fixture = crate::shaders::gemm_q8_linear_kxn_f32::tiny_fixture,
-        out_len = crate::shaders::gemm_q8_linear_kxn_f32::fixture_len,
+        cpu = crate::shaders::gemm_q8_linear_f32::kxn::cpu,
+        cpu_oracle = crate::shaders::gemm_q8_linear_f32::kxn::cpu_oracle,
+        gpu = crate::shaders::gemm_q8_linear_f32::kxn::gpu,
+        fixture = crate::shaders::gemm_q8_linear_f32::kxn::tiny_fixture,
+        out_len = crate::shaders::gemm_q8_linear_f32::kxn::fixture_len,
         formats: [F32],
         max_tol = 1e-4,
         min_cos = 0.9999,

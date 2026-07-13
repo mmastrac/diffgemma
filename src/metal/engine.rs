@@ -75,7 +75,7 @@ impl GpuDecoderEngine {
         )?;
         let f32_q8_linear_pipeline = crate::shaders::gemm_q8_linear_f32::pipeline_for(&ctx, prod)?;
         let f32_q8_linear_kxn_pipeline =
-            crate::shaders::gemm_q8_linear_kxn_f32::pipeline_for(&ctx, prod)?;
+            crate::shaders::gemm_q8_linear_f32::kxn::pipeline_for(&ctx, prod)?;
         let encoder_gpu_moe = Cell::new(encoder_gpu_moe_from_env());
         let kernels = GpuKernels::new(&ctx)?;
         let attention = GpuAttentionKernels::new(&ctx)?;

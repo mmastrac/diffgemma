@@ -863,13 +863,10 @@ impl StepPipelines {
             (HID as u32, VOCAB as u32),
             (HID as u32, crate::model::embed::LM_HEAD_CHUNK as u32),
         ] {
-            gemm_q8_rowk.insert(
-                (n, k),
-                crate::shaders::gemm_q8_rowk::pipeline_for(ctx, n, k)?,
-            );
+            gemm_q8_rowk.insert((n, k), crate::shaders::gemm_rowk::pipeline_for(ctx, n, k)?);
             gemm_q8_rowk_xfp16.insert(
                 (n, k),
-                crate::shaders::gemm_q8_rowk::pipeline_for_fp16_input(ctx, n, k)?,
+                crate::shaders::gemm_rowk::pipeline_for_fp16_input(ctx, n, k)?,
             );
         }
         // Unified rowk f32-accumulate SC-softembed GEMM (one shader; weight format

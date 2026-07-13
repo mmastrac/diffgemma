@@ -197,11 +197,11 @@ mod tests {
 
     kernel_oracle_matrix! {
         mod tiny,
-        cpu = crate::shaders::gemm_q8_rowk::cpu,
-        cpu_oracle = crate::shaders::gemm_q8_rowk::cpu_oracle,
-        gpu = crate::shaders::gemm_q8_rowk::gpu,
-        fixture = crate::shaders::gemm_q8_rowk::tiny_fixture,
-        out_len = crate::shaders::gemm_q8_rowk::fixture_len,
+        cpu = crate::shaders::gemm_rowk::cpu,
+        cpu_oracle = crate::shaders::gemm_rowk::cpu_oracle,
+        gpu = crate::shaders::gemm_rowk::gpu,
+        fixture = crate::shaders::gemm_rowk::tiny_fixture,
+        out_len = crate::shaders::gemm_rowk::fixture_len,
         formats: [F32],
         max_tol = 0.05,
         min_cos = 0.999,
@@ -209,11 +209,11 @@ mod tests {
 
     kernel_oracle_matrix! {
         mod tile,
-        cpu = crate::shaders::gemm_q8_rowk::cpu,
-        cpu_oracle = crate::shaders::gemm_q8_rowk::cpu_oracle,
-        gpu = crate::shaders::gemm_q8_rowk::gpu,
-        fixture = crate::shaders::gemm_q8_rowk::tile_fixture,
-        out_len = crate::shaders::gemm_q8_rowk::fixture_len,
+        cpu = crate::shaders::gemm_rowk::cpu,
+        cpu_oracle = crate::shaders::gemm_rowk::cpu_oracle,
+        gpu = crate::shaders::gemm_rowk::gpu,
+        fixture = crate::shaders::gemm_rowk::tile_fixture,
+        out_len = crate::shaders::gemm_rowk::fixture_len,
         formats: [F32],
         max_tol = 0.05,
         min_cos = 0.999,
