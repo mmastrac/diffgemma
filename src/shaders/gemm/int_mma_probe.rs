@@ -14,30 +14,32 @@ pub const SRC: &str = r#"
 #include <metal_simdgroup_matrix>
 using namespace metal;
 
-// 8-way ILP: 8 INDEPENDENT accumulator chains hide instruction latency so the
-// loop measures peak THROUGHPUT, not the (serial) latency of one dependency
-// chain. MAC counts below multiply by ILP=8.
+// ILP hides instruction latency so the loop measures peak THROUGHPUT not the
+// (serial) latency of one dependency chain. MMA uses a SMALLER ILP: each
+// simdgroup_matrix consumes scarce matrix registers, and ILP=8 (16 matrices)
+// spills → a false-slow reading. MAC counts below multiply by the matching ILP.
 #define ILP 8
+#define MMA_ILP 4
 
 // Half tensor-MMA: 8x8x8 = 512 MAC / instruction / simdgroup.
 kernel void bench_mma(device float *out [[buffer(0)]],
                       constant uint &iters [[buffer(1)]],
                       uint gid [[thread_position_in_grid]],
                       uint lane [[thread_index_in_simdgroup]]) {
-    simdgroup_half8x8 A[ILP];
+    simdgroup_half8x8 A[MMA_ILP];
     simdgroup_half8x8 B = simdgroup_half8x8(1.0009765625h);
-    simdgroup_float8x8 C[ILP];
-    for (uint j = 0u; j < ILP; ++j) {
+    simdgroup_float8x8 C[MMA_ILP];
+    for (uint j = 0u; j < MMA_ILP; ++j) {
         A[j] = simdgroup_half8x8(half(lane + j) * 1e-3h + 1.0h);
         C[j] = simdgroup_float8x8(0.0f);
     }
     for (uint i = 0u; i < iters; ++i) {
-        for (uint j = 0u; j < ILP; ++j) {
+        for (uint j = 0u; j < MMA_ILP; ++j) {
             simdgroup_multiply_accumulate(C[j], A[j], B, C[j]);
         }
     }
     float s = 0.0f;
-    for (uint j = 0u; j < ILP; ++j) {
+    for (uint j = 0u; j < MMA_ILP; ++j) {
         thread float2 &e = reinterpret_cast<thread float2 &>(C[j].thread_elements());
         s += e[0] + e[1];
     }
@@ -109,7 +111,8 @@ pub fn run() -> Result<(f64, f64, f64), crate::Error> {
 
     let bench = |entry: &str, macs_per_iter_per_unit: f64, units: f64| -> Result<f64, crate::Error> {
         let pipe = ctx.compile_subkernel(SRC, entry, KernelVariant::PRODUCTION)?;
-        let grid = MTLSize { width: threads as usize, height: 1, depth: 1 };
+        // dispatchThreadgroups takes the THREADGROUP count, not thread count.
+        let grid = MTLSize { width: tgs as usize, height: 1, depth: 1 };
         let tgd = MTLSize { width: tg as usize, height: 1, depth: 1 };
         let mut best = f64::INFINITY;
         for round in 0..5 {
@@ -131,15 +134,20 @@ pub fn run() -> Result<(f64, f64, f64), crate::Error> {
         }
         // total MACs = macs_per_iter_per_unit * iters * units
         let macs = macs_per_iter_per_unit * iters as f64 * units;
+        eprintln!(
+            "    [{entry}] {:.4}s/dispatch, {:.3e} MAC -> {:.1} GMAC/s",
+            best,
+            macs,
+            macs / best / 1e9
+        );
         Ok(macs / best / 1e9) // GMAC/s
     };
 
     // ILP=8 independent chains. MMA: 512 MAC/iter/chain per SIMDGROUP; int8/fma:
     // 4 / 1 MAC/iter/chain per LANE(thread).
-    let ilp = 8.0;
-    let mma = bench("bench_mma", 512.0 * ilp, simdgroups as f64)?;
-    let int8 = bench("bench_int8", 4.0 * ilp, threads as f64)?;
-    let fma = bench("bench_fma", 1.0 * ilp, threads as f64)?;
+    let mma = bench("bench_mma", 512.0 * 4.0, simdgroups as f64)?; // MMA_ILP=4
+    let int8 = bench("bench_int8", 4.0 * 8.0, threads as f64)?; // ILP=8
+    let fma = bench("bench_fma", 1.0 * 8.0, threads as f64)?; // ILP=8
     Ok((mma, int8, fma))
 }
 
