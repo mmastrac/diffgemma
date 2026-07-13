@@ -27,7 +27,9 @@ pub mod sample;
 pub mod sc;
 
 #[allow(unused_imports)]
-pub use attn::{apply_rope_heads, attention, engine_gqa_common, gqa_attention, qk_rope_kv};
+pub use attn::{
+    apply_rope_heads, attention, attention_gemm, engine_gqa_common, gqa_attention, qk_rope_kv,
+};
 #[allow(unused_imports)]
 pub use common::expand;
 #[allow(unused_imports)]

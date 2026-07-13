@@ -1,0 +1,23 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "web-8051",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": ["-lc", "cd /Users/matt/Documents/github/i8051 && exec cargo run -p i8051-web -- serve crates/i8051-disassembler/samples/lk201-8051.dsl --listen 127.0.0.1:8055"],
+      "port": 8055
+    },
+    {
+      "name": "web-6805",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": ["-lc", "cd /Users/matt/Documents/github/i8051 && exec cargo run -p i8051-web -- serve crates/i8051-disassembler/samples/lk201-6805.dsl --listen 127.0.0.1:8052"],
+      "port": 8052
+    },
+    {
+      "name": "web-6502",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": ["-lc", "cd /Users/matt/Documents/github/i8051 && exec cargo run -p i8051-web -- serve crates/i8051-disassembler/samples/6502_functional_test.dsl --listen 127.0.0.1:8053"],
+      "port": 8053
+    }
+  ]
+}
