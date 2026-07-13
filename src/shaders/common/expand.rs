@@ -43,6 +43,10 @@ static INCLUDES: &[(&str, &str)] = &[
     ),
     ("gemm_fc.metal", include_str!("../include/gemm_fc.metal")),
     (
+        "gemm_frag_tile.metal",
+        include_str!("../include/gemm_frag_tile.metal"),
+    ),
+    (
         "gemm_stacked.metal",
         include_str!("../include/gemm_stacked.metal"),
     ),

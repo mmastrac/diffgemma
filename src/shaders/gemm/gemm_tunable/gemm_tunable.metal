@@ -38,6 +38,12 @@ constant uint PAD = 40u; // BK + 8 halfs: bank-conflict pad
 constant uint TM = BM / 16u; // 8x8 fragments per simdgroup along M
 constant uint TN = BN / 16u; // 8x8 fragments per simdgroup along N
 
+// Shared NT fragment tiler (frag_mma_ktile + frag_lane_coords) — the same MMA
+// core attention_gemm (E17) reuses; only the tile loaders differ per op.
+#define FRAG_BM TUNE_BM
+#define FRAG_BN TUNE_BN
+#include "gemm_frag_tile.metal"
+
 /// A-tile loader: vectorized 4-wide bf16(or f16)->half loads, per-4 row guard.
 inline void tunable_load_a(
     device const ushort *x,
@@ -59,42 +65,6 @@ inline void tunable_load_a(
             h = half4(0);
         }
         *(threadgroup half4 *)(&Xs[mm][kk]) = h;
-    }
-}
-
-/// One BK-wide MMA phase: per-lane fragment loads + TMxTN accumulate.
-inline void tunable_mma_ktile(
-    threadgroup half Xs[TUNE_BM][40],
-    threadgroup half Ws[TUNE_BN][40],
-    thread simdgroup_float8x8 (&C)[TM][TN],
-    uint sr,
-    uint sc,
-    uint fm,
-    uint fn
-) {
-    for (uint kk = 0u; kk < BK; kk += 8u) {
-        simdgroup_barrier(mem_flags::mem_none);
-        // A fragments: element (fm, fn) of frag i = Xs[sr + 8i + fm][kk + fn].
-        simdgroup_half8x8 A[TM];
-        for (uint i = 0u; i < TM; ++i) {
-            thread half2 &ea = reinterpret_cast<thread half2 &>(A[i].thread_elements());
-            ea[0] = Xs[sr + 8u * i + fm][kk + fn];
-            ea[1] = Xs[sr + 8u * i + fm][kk + fn + 1u];
-        }
-        simdgroup_barrier(mem_flags::mem_none);
-        // B fragments: element (k=fm, n=fn) of frag j = Ws[sc + 8j + fn][kk + fm].
-        simdgroup_half8x8 B[TN];
-        for (uint j = 0u; j < TN; ++j) {
-            thread half2 &eb = reinterpret_cast<thread half2 &>(B[j].thread_elements());
-            eb[0] = Ws[sc + 8u * j + fn][kk + fm];
-            eb[1] = Ws[sc + 8u * j + fn + 1u][kk + fm];
-        }
-        simdgroup_barrier(mem_flags::mem_none);
-        for (uint i = 0u; i < TM; ++i) {
-            for (uint j = 0u; j < TN; ++j) {
-                simdgroup_multiply_accumulate(C[i][j], A[i], B[j], C[i][j]);
-            }
-        }
     }
 }
 
@@ -130,9 +100,8 @@ kernel void gemm_tunable(
 
     // Steel lane->element coordinates within an 8x8 fragment: this lane owns
     // elements (fm, fn) and (fm, fn+1).
-    const uint qid = lane / 4u;
-    const uint fm = (qid & 4u) + ((lane / 2u) % 4u);
-    const uint fn = (qid & 2u) * 2u + (lane % 2u) * 2u;
+    uint fm, fn;
+    frag_lane_coords(lane, fm, fn);
 
     simdgroup_float8x8 C[TM][TN];
     for (uint i = 0u; i < TM; ++i) {
@@ -211,7 +180,7 @@ kernel void gemm_tunable(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        tunable_mma_ktile(Xs, Ws, C, sr, sc, fm, fn);
+        frag_mma_ktile(Xs, Ws, C, sr, sc, fm, fn);
     }
 
     // Per-lane direct store: lane owns C elements (fm, fn) and (fm, fn+1).
@@ -272,9 +241,8 @@ kernel void gemm_tunable_stacked(
         ? (ulong)K * 2ul
         : (is_nvfp4 ? nvfp4_row_bytes(K) : q4_row_bytes(K));
 
-    const uint qid = lane / 4u;
-    const uint fm = (qid & 4u) + ((lane / 2u) % 4u);
-    const uint fn = (qid & 2u) * 2u + (lane % 2u) * 2u;
+    uint fm, fn;
+    frag_lane_coords(lane, fm, fn);
 
     simdgroup_float8x8 C[TM][TN];
     for (uint i = 0u; i < TM; ++i) {
@@ -344,7 +312,7 @@ kernel void gemm_tunable_stacked(
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        tunable_mma_ktile(Xs, Ws, C, sr, sc, fm, fn);
+        frag_mma_ktile(Xs, Ws, C, sr, sc, fm, fn);
     }
 
     // Per-lane store with per-element segment resolve (cols may straddle a
@@ -442,9 +410,8 @@ kernel void gemm_tunable_sparse(
         is_nvfp4 ? nvfp4_row_bytes(K) : (is_q6 ? q6_row_bytes(K) : q4_row_bytes(K));
     const uint ltid = lid.x;
 
-    const uint qid = lane / 4u;
-    const uint fm = (qid & 4u) + ((lane / 2u) % 4u);
-    const uint fn = (qid & 2u) * 2u + (lane % 2u) * 2u;
+    uint fm, fn;
+    frag_lane_coords(lane, fm, fn);
 
     simdgroup_float8x8 C[TM][TN];
     for (uint i = 0u; i < TM; ++i) {
@@ -535,28 +502,7 @@ kernel void gemm_tunable_sparse(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint kk = 0u; kk < BK; kk += 8u) {
-            simdgroup_barrier(mem_flags::mem_none);
-            simdgroup_half8x8 A[TM];
-            for (uint i = 0u; i < TM; ++i) {
-                thread half2 &ea = reinterpret_cast<thread half2 &>(A[i].thread_elements());
-                ea[0] = Xs[sr + 8u * i + fm][kk + fn];
-                ea[1] = Xs[sr + 8u * i + fm][kk + fn + 1u];
-            }
-            simdgroup_barrier(mem_flags::mem_none);
-            simdgroup_half8x8 B[TN];
-            for (uint j = 0u; j < TN; ++j) {
-                thread half2 &eb = reinterpret_cast<thread half2 &>(B[j].thread_elements());
-                eb[0] = Ws[sc + 8u * j + fn][kk + fm];
-                eb[1] = Ws[sc + 8u * j + fn + 1u][kk + fm];
-            }
-            simdgroup_barrier(mem_flags::mem_none);
-            for (uint i = 0u; i < TM; ++i) {
-                for (uint j = 0u; j < TN; ++j) {
-                    simdgroup_multiply_accumulate(C[i][j], A[i], B[j], C[i][j]);
-                }
-            }
-        }
+        frag_mma_ktile(Xs, Ws, C, sr, sc, fm, fn);
     }
 
     // Store: f32 slot rows, bf16-rounded values (matches gemm_block_sparse).

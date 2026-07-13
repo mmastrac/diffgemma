@@ -37,6 +37,13 @@ constant uint PAD = 40u;         // BK + 8 halfs: bank-conflict pad
 constant uint TM = BM / 16u;     // 4 fragments per simdgroup along M
 constant uint TN = BN / 16u;     // 4 fragments per simdgroup along N
 
+// Shared 64x64 NT fragment tiler (frag_mma_ktile + frag_lane_coords), the same
+// MMA core gemm_tunable uses — only our tile loaders (strided arena Q, f16 KV
+// cache native/transposed) differ.
+#define FRAG_BM 64
+#define FRAG_BN 64
+#include "gemm_frag_tile.metal"
+
 // Passed from the host per (layer, sub-chunk) dispatch. The Q head is the grid
 // z index (tgid.z); this struct carries shapes, row strides, the per-head base
 // strides, and the softmax mask parameters. All 16 Q heads run in one dispatch
@@ -60,41 +67,6 @@ struct AttnGemmDims {
                         // the S/P/lrow scratch is indexed by the LOCAL tgid.z,
                         // so it holds only this batch's HC heads.
 };
-
-// One BK-wide MMA phase: per-lane fragment loads + TMxTN accumulate. Identical
-// contract to gemm_tunable's tunable_mma_ktile (NT: C += A . B^T-staged).
-inline void ag_mma_ktile(
-    threadgroup half Xs[BM][PAD],
-    threadgroup half Ws[BN][PAD],
-    thread simdgroup_float8x8 (&C)[TM][TN],
-    uint sr,
-    uint sc,
-    uint fm,
-    uint fn
-) {
-    for (uint kk = 0u; kk < BK; kk += 8u) {
-        simdgroup_barrier(mem_flags::mem_none);
-        simdgroup_half8x8 A[TM];
-        for (uint i = 0u; i < TM; ++i) {
-            thread half2 &ea = reinterpret_cast<thread half2 &>(A[i].thread_elements());
-            ea[0] = Xs[sr + 8u * i + fm][kk + fn];
-            ea[1] = Xs[sr + 8u * i + fm][kk + fn + 1u];
-        }
-        simdgroup_barrier(mem_flags::mem_none);
-        simdgroup_half8x8 B[TN];
-        for (uint j = 0u; j < TN; ++j) {
-            thread half2 &eb = reinterpret_cast<thread half2 &>(B[j].thread_elements());
-            eb[0] = Ws[sc + 8u * j + fn][kk + fm];
-            eb[1] = Ws[sc + 8u * j + fn + 1u][kk + fm];
-        }
-        simdgroup_barrier(mem_flags::mem_none);
-        for (uint i = 0u; i < TM; ++i) {
-            for (uint j = 0u; j < TN; ++j) {
-                simdgroup_multiply_accumulate(C[i][j], A[i], B[j], C[i][j]);
-            }
-        }
-    }
-}
 
 // ---- QK: S[i,t] = <Q_i, K_t>. A = Q (arena, strided), B = K native. --------
 kernel void attn_gemm_qk(
@@ -121,9 +93,8 @@ kernel void attn_gemm_qk(
     const uint n0 = tgid.x * BN;
     const uint ltid = lid.x;
 
-    const uint qid = lane / 4u;
-    const uint fm = (qid & 4u) + ((lane / 2u) % 4u);
-    const uint fn = (qid & 2u) * 2u + (lane % 2u) * 2u;
+    uint fm, fn;
+    frag_lane_coords(lane, fm, fn);
 
     simdgroup_float8x8 C[TM][TN];
     for (uint i = 0u; i < TM; ++i) {
@@ -174,7 +145,7 @@ kernel void attn_gemm_qk(
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        ag_mma_ktile(Xs, Ws, C, sr, sc, fm, fn);
+        frag_mma_ktile(Xs, Ws, C, sr, sc, fm, fn);
     }
 
     for (uint i = 0u; i < TM; ++i) {
@@ -302,9 +273,8 @@ kernel void attn_gemm_pv(
     const uint n0 = tgid.x * BN;
     const uint ltid = lid.x;
 
-    const uint qid = lane / 4u;
-    const uint fm = (qid & 4u) + ((lane / 2u) % 4u);
-    const uint fn = (qid & 2u) * 2u + (lane % 2u) * 2u;
+    uint fm, fn;
+    frag_lane_coords(lane, fm, fn);
 
     simdgroup_float8x8 C[TM][TN];
     for (uint i = 0u; i < TM; ++i) {
@@ -346,7 +316,7 @@ kernel void attn_gemm_pv(
             Ws[d_local][t_local] = val;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        ag_mma_ktile(Xs, Ws, C, sr, sc, fm, fn);
+        frag_mma_ktile(Xs, Ws, C, sr, sc, fm, fn);
     }
 
     for (uint i = 0u; i < TM; ++i) {
