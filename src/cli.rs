@@ -80,6 +80,7 @@ pub(crate) enum Command {
     BenchPrefillSuper {
         kv_len: u32,
         iters: usize,
+        stages: bool,
     },
     Quantize {
         output: PathBuf,
@@ -356,6 +357,7 @@ pub(crate) fn parse_cli() -> Cli {
     let mut ag_hc = 4usize;
     let mut ag_sm_tpg = 256usize;
     let mut ag_side = false;
+    let mut bench_stages = false;
     let mut bench_gemm_oracle: Option<String> = None;
     let mut step_kv_len = 0u32;
     let mut step_max_seq = 512usize;
@@ -554,6 +556,7 @@ pub(crate) fn parse_cli() -> Cli {
                 }
             }
             "--side" => ag_side = true,
+            "--stages" => bench_stages = true,
             "--forward-only" => step_forward_only = true,
             "--step-profile" => step_profile = true,
             "--layer-profile" => step_layer_profile = true,
@@ -766,6 +769,7 @@ pub(crate) fn parse_cli() -> Cli {
         Some("bench-prefill-super") => Command::BenchPrefillSuper {
             kv_len: if step_kv_len > 0 { step_kv_len } else { 15000 },
             iters: bench_iters.max(1),
+            stages: bench_stages,
         },
         Some("quantize") => {
             let out = output_dir.unwrap_or_else(|| {

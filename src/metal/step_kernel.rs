@@ -3731,6 +3731,13 @@ impl StepEnc<'_> {
         let per_layer = step_schedule::per_layer_stages(&self.block_profile);
         for layer in 0..layers {
             for &stage in &per_layer {
+                // Diagnostic ablation (bench_prefill_super_stages): skip a stage
+                // group to measure its cost as the timing delta. Timing is
+                // data-independent, so skipped stages just feed stale arena data
+                // downstream. Empty in production (no-op).
+                if prefill_bench_skipped(stage) {
+                    continue;
+                }
                 match stage {
                     StepStage::LayerQkRopeKv | StepStage::LayerAttention => {
                         self.use_params_sub = true;
@@ -5326,6 +5333,51 @@ impl StepRuntime {
         Ok(best)
     }
 
+    /// Floor decomposition (diagnostic): time the full super-chunk, then re-time
+    /// with each stage-GROUP ablated — the delta is that group's cost. Reuses the
+    /// real weights/shapes at M=1024; timing is data-independent so ablated
+    /// stages just feed stale arena data downstream (no correctness needed).
+    /// Returns (full, [(label, group_ms)]).
+    pub(crate) fn bench_prefill_super_stages(
+        &mut self,
+        kv_len: u32,
+        iters: usize,
+    ) -> Result<(f64, Vec<(&'static str, f64)>), Error> {
+        use step_schedule::StepStage;
+        use step_schedule::StepStage::*;
+        let groups: &[(&str, &[StepStage])] = &[
+            ("attention", &[LayerQkRopeKv, LayerAttention]),
+            ("qkv_proj+inorm", &[LayerInputNormQkv]),
+            ("o_proj", &[LayerOProjPostAttn]),
+            ("router", &[LayerRouter]),
+            (
+                "moe_experts",
+                &[
+                    MoeBatchedGather,
+                    MoeBatchedGateUp,
+                    MoeBatchedSwiglu,
+                    MoeBatchedDown,
+                    MoeBatchedScatter,
+                    MoeGroupedScalar,
+                ],
+            ),
+            (
+                "moe_norm+combine+dense",
+                &[LayerDenseFfn, LayerMoePostNorm, LayerMoePostCombine],
+            ),
+            ("embed", &[EmbedGather]),
+        ];
+        let full = self.bench_prefill_super(kv_len, iters)?.as_secs_f64() * 1e3;
+        let mut out = Vec::new();
+        for (label, stages) in groups {
+            set_prefill_bench_skip(stages);
+            let ablated = self.bench_prefill_super(kv_len, iters)?.as_secs_f64() * 1e3;
+            set_prefill_bench_skip(&[]);
+            out.push((*label, (full - ablated).max(0.0)));
+        }
+        Ok((full, out))
+    }
+
     fn run_forward_once(&mut self, finish: StepFinishMode) -> Result<(), Error> {
         if let Some(ref dbg) = self.bufs.debug_status {
             crate::metal::debug_status::zero_buffer(dbg);
@@ -5367,6 +5419,23 @@ impl StepRuntime {
 static STEP_PIPELINES_CACHE: std::sync::OnceLock<
     std::sync::Mutex<HashMap<StepPipelineKey, &'static StepPipelines>>,
 > = std::sync::OnceLock::new();
+
+/// Diagnostic stage-ablation skip set (bench_prefill_super_stages only). Empty
+/// in production → `prefill_bench_skipped` is a fast empty-slice check.
+static PREFILL_BENCH_SKIP: std::sync::OnceLock<std::sync::Mutex<Vec<step_schedule::StepStage>>> =
+    std::sync::OnceLock::new();
+
+fn set_prefill_bench_skip(stages: &[step_schedule::StepStage]) {
+    let m = PREFILL_BENCH_SKIP.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    *m.lock().unwrap() = stages.to_vec();
+}
+
+fn prefill_bench_skipped(stage: step_schedule::StepStage) -> bool {
+    match PREFILL_BENCH_SKIP.get() {
+        Some(m) => m.lock().unwrap().contains(&stage),
+        None => false,
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct StepPipelineKey(u8);

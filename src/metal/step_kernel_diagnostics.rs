@@ -1199,6 +1199,17 @@ pub fn bench_step_kernel_prefill_super(
     rt.bench_prefill_super(kv_len, iters)
 }
 
+/// Floor decomposition: full super-chunk time + per-stage-group cost (ablation).
+pub fn bench_step_kernel_prefill_super_stages(
+    model_dir: &Path,
+    cfg: StepSmokeConfig,
+    kv_len: u32,
+    iters: usize,
+) -> Result<(f64, Vec<(&'static str, f64)>), Error> {
+    let (mut rt, _build) = build_step_runtime(model_dir, &cfg)?;
+    rt.bench_prefill_super_stages(kv_len, iters)
+}
+
 /// Profile the first `n_steps` denoise forwards (canvas `st.step` 0..n_steps-1).
 /// Step 0 has no SC preamble; step >= 1 includes self-conditioning.
 pub fn bench_step_kernel_profile_steps(

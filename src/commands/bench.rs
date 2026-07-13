@@ -531,8 +531,9 @@ pub(crate) fn run_bench_prefill_super_cmd(
     model_dir: &std::path::Path,
     kv_len: u32,
     iters: usize,
+    stages: bool,
 ) -> ExitCode {
-    use metal::bench_step_kernel_prefill_super;
+    use metal::{bench_step_kernel_prefill_super, bench_step_kernel_prefill_super_stages};
     if !dgq::store::looks_like_dgq_dir(model_dir) {
         eprintln!("error: bench-prefill-super requires a .dgq directory");
         return ExitCode::FAILURE;
@@ -542,6 +543,33 @@ pub(crate) fn run_bench_prefill_super_cmd(
     let cfg = step_kernel_config(30, kv_len, 42, max_seq, true);
     let (qk_bm, qk_bn, pv_bm, pv_bn, sm_tpg) = flags::gemm_attn_tile();
     let hc = flags::gemm_attn_head_chunk();
+    if stages {
+        // Floor decomposition: full super-chunk + per-stage-group cost (ablation).
+        match bench_step_kernel_prefill_super_stages(model_dir, cfg, kv_len, iters.max(1)) {
+            Ok((full, groups)) => {
+                eprintln!("prefill-super kv={kv_len} FLOOR DECOMPOSITION (hc={hc}):");
+                let sum: f64 = groups.iter().map(|(_, ms)| ms).sum();
+                for (label, ms) in &groups {
+                    eprintln!("  {label:<24} {ms:8.3} ms  ({:5.1}%)", 100.0 * ms / full);
+                }
+                eprintln!("  {:<24} {full:8.3} ms  (sum of groups {sum:.1})", "TOTAL");
+                let items: Vec<String> = groups
+                    .iter()
+                    .map(|(l, ms)| format!("\"{l}\": {ms:.4}"))
+                    .collect();
+                println!(
+                    "RESULT {{\"ok\": true, \"ms\": {full:.4}, \"kv_len\": {kv_len}, \
+                     \"stages\": {{{}}}}}",
+                    items.join(", ")
+                );
+                return ExitCode::SUCCESS;
+            }
+            Err(err) => {
+                println!("RESULT {{\"ok\": false, \"reason\": \"{err}\"}}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     match bench_step_kernel_prefill_super(model_dir, cfg, kv_len, iters.max(1)) {
         Ok(d) => {
             let ms = d.as_secs_f64() * 1e3;
