@@ -39,22 +39,41 @@ HC_CHOICES = [1, 2, 4, 8, 16]
 TPG_CHOICES = [64, 128, 256, 512, 1024]
 
 
-def run_bench(binary: Path, kv_len: int, iters: int, side: bool, cfg: dict) -> dict:
-    """Invoke bench-prefill-attn for one config; return the parsed RESULT dict."""
-    args = [
-        str(binary), "bench-prefill-attn",
-        "--kv-len", str(kv_len),
-        "--iters", str(iters),
-        "--qk-bm", str(cfg["qk_bm"]),
-        "--qk-bn", str(cfg["qk_bn"]),
-        "--pv-bm", str(cfg["pv_bm"]),
-        "--pv-bn", str(cfg["pv_bn"]),
-        "--hc", str(cfg["hc"]),
-        "--sm-tpg", str(cfg["sm_tpg"]),
-    ]
-    if side:
-        args.append("--side")
-    proc = subprocess.run(args, capture_output=True, text=True, timeout=600)
+def run_bench(binary: Path, kv_len: int, iters: int, side: bool, cfg: dict,
+              proxy: str | None, model: str | None) -> dict:
+    """Invoke the bench for one config; return the parsed RESULT dict.
+
+    Two objectives:
+      isolated (default): `bench-prefill-attn` — the attention kernel alone
+        (fast, but over-weights attention — does NOT track real prefill).
+      proxy (--proxy, needs --model): `bench-prefill-super` — one real M=1024
+        super-chunk (all stages, real weights), the FAITHFUL holistic objective.
+    Tile config is passed via env (the production pipelines read the flags).
+    """
+    import os
+    env = dict(os.environ)
+    env.update({
+        "DGQ_GEMM_ATTN_QK_BM": str(cfg["qk_bm"]),
+        "DGQ_GEMM_ATTN_QK_BN": str(cfg["qk_bn"]),
+        "DGQ_GEMM_ATTN_PV_BM": str(cfg["pv_bm"]),
+        "DGQ_GEMM_ATTN_PV_BN": str(cfg["pv_bn"]),
+        "DGQ_GEMM_ATTN_HC": str(cfg["hc"]),
+        "DGQ_GEMM_ATTN_SM_TPG": str(cfg["sm_tpg"]),
+    })
+    if proxy:  # holistic: one real super-chunk at kv=proxy, needs the model
+        args = [str(binary), "-m", model, "bench-prefill-super",
+                "--kv-len", str(kv_len), "--iters", str(iters)]
+    else:  # isolated attention kernel (no weights needed)
+        args = [
+            str(binary), "bench-prefill-attn",
+            "--kv-len", str(kv_len), "--iters", str(iters),
+            "--qk-bm", str(cfg["qk_bm"]), "--qk-bn", str(cfg["qk_bn"]),
+            "--pv-bm", str(cfg["pv_bm"]), "--pv-bn", str(cfg["pv_bn"]),
+            "--hc", str(cfg["hc"]), "--sm-tpg", str(cfg["sm_tpg"]),
+        ]
+        if side:
+            args.append("--side")
+    proc = subprocess.run(args, capture_output=True, text=True, timeout=1200, env=env)
     for line in proc.stdout.splitlines():
         if line.startswith("RESULT "):
             return json.loads(line[len("RESULT "):])
@@ -69,6 +88,11 @@ def main() -> int:
     p.add_argument("--side", action="store_true",
                    help="tune the f32-side-KV path (production default); else f16")
     p.add_argument("--binary", default="../target/release/diffgemma-mps")
+    p.add_argument("--proxy", action="store_true",
+                   help="objective = real M=1024 super-chunk (bench-prefill-super, FAITHFUL); "
+                        "else the isolated attention kernel (fast but not real-prefill-tracking)")
+    p.add_argument("--model", default="../model/diffusiongemma-q4emb",
+                   help="model dir for --proxy")
     p.add_argument("--storage", default=None, help="e.g. sqlite:///tune.db to persist/resume")
     p.add_argument("--study-name", default=None)
     p.add_argument("--seed", type=int, default=0)
@@ -90,7 +114,9 @@ def main() -> int:
             "hc": trial.suggest_categorical("hc", HC_CHOICES),
             "sm_tpg": trial.suggest_categorical("sm_tpg", TPG_CHOICES),
         }
-        res = run_bench(binary, args.kv_len, args.iters, args.side, cfg)
+        model = str(Path(args.model).resolve()) if args.proxy else None
+        res = run_bench(binary, args.kv_len, args.iters, args.side, cfg,
+                        "proxy" if args.proxy else None, model)
         if not res.get("ok"):
             trial.set_user_attr("failed", res.get("reason", "?"))
             return PENALTY
@@ -109,7 +135,7 @@ def main() -> int:
     )
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-    path = "f32-side" if args.side else "f16"
+    path = "PROXY:super-chunk" if args.proxy else ("f32-side" if args.side else "f16")
     print(f"tuning prefill-attn ({path}, kv={args.kv_len}, {args.trials} trials, "
           f"iters={args.iters})...", flush=True)
 
