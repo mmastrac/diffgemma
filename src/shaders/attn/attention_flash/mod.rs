@@ -105,10 +105,11 @@ pub const ENTRY: &str = "attn_flash";
 pub const BQ: usize = 16;
 pub const BK: usize = 64;
 
-/// Prepend the tile #defines to specialize the kernel for a sweep. Un-prepended
-/// (default) source reproduces the shipped 16/64 kernel.
-pub fn tuned_source(bq: usize, bk: usize) -> String {
-    format!("#define FL_BQ {bq}\n#define FL_BK {bk}\n{SHADER}")
+/// Prepend the tile #defines to specialize the kernel. Un-prepended (default)
+/// source reproduces the shipped 16/64/hd512 kernel. `hd` must equal the
+/// dispatch head_dim (sizes the resident Q stage + O accumulator).
+pub fn tuned_source(bq: usize, bk: usize, hd: usize) -> String {
+    format!("#define FL_BQ {bq}\n#define FL_BK {bk}\n#define FL_HD {hd}\n{SHADER}")
 }
 
 /// Host mirror of the shader `FlashDims`.
@@ -134,8 +135,9 @@ pub fn pipeline_flash(
     variant: crate::shaders::variant::KernelVariant,
     bq: usize,
     bk: usize,
+    hd: usize,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    let src = tuned_source(bq, bk);
+    let src = tuned_source(bq, bk, hd);
     ctx.compile_subkernel_ex(&src, ENTRY, variant, "flash", &[], &[])
 }
 
@@ -167,7 +169,7 @@ pub fn gpu_flash(
     let kstride = nkv * hd * 2;
 
     let ctx = MetalContext::new()?;
-    let pipe = pipeline_flash(&ctx, KernelVariant::PRODUCTION, BQ, BK)?;
+    let pipe = pipeline_flash(&ctx, KernelVariant::PRODUCTION, BQ, BK, hd)?;
     let mut pool = BufferPool::new();
 
     let buf_q = pool
@@ -238,7 +240,11 @@ pub fn gpu_flash(
 /// min-of-warmed-rounds ms/layer. Mirrors `attention_gemm::bench_gpu` so the two
 /// are directly comparable.
 #[cfg(target_os = "macos")]
-pub fn bench_flash(f: &crate::shaders::attention::Fixture, iters: usize) -> Result<f64, Error> {
+pub fn bench_flash(
+    f: &crate::shaders::attention::Fixture,
+    iters: usize,
+    bq: usize,
+) -> Result<f64, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
     use crate::shaders::bf16;
@@ -258,7 +264,7 @@ pub fn bench_flash(f: &crate::shaders::attention::Fixture, iters: usize) -> Resu
     let kstride = nkv * hd * 2;
 
     let ctx = MetalContext::new()?;
-    let pipe = pipeline_flash(&ctx, KernelVariant::PRODUCTION, BQ, BK)?;
+    let pipe = pipeline_flash(&ctx, KernelVariant::PRODUCTION, bq, BK, hd)?;
     let mut pool = BufferPool::new();
     let buf_q = pool
         .allocate(&ctx.device, canvas * n_q_heads * hd * 2)
@@ -294,7 +300,7 @@ pub fn bench_flash(f: &crate::shaders::attention::Fixture, iters: usize) -> Resu
         depth: 1,
     };
     let grid = MTLSize {
-        width: canvas.div_ceil(BQ),
+        width: canvas.div_ceil(bq),
         height: 1,
         depth: n_q_heads,
     };

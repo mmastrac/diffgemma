@@ -35,6 +35,11 @@ using namespace metal;
 #ifndef FL_BK
 #define FL_BK 64
 #endif
+// Compile-time head_dim (must equal d.hd at dispatch): sizes the resident Q
+// stage and O accumulator. Lower hd relaxes the O register budget → larger BQ.
+#ifndef FL_HD
+#define FL_HD 512
+#endif
 
 constant uint BQ = FL_BQ;          // query rows per threadgroup
 constant uint BK = FL_BK;          // keys streamed per block
@@ -78,7 +83,7 @@ kernel void attn_flash(
     const uint tid = lid.x;
     const uint bstride = d.b_row_stride;
 
-    threadgroup half Qs[FL_BQ * (512u + 8u)];   // Q staged once
+    threadgroup half Qs[FL_BQ * (FL_HD + 8u)];   // Q staged once
     threadgroup float Sf[FL_BQ * FL_BK];        // scores plane
     threadgroup half Ph[FL_BQ * FL_BK];         // probs (half) for PV
     threadgroup float rm[FL_BQ];                // running row max
@@ -101,7 +106,7 @@ kernel void attn_flash(
         rm[r] = -INFINITY;
         rl[r] = 0.f;
     }
-    simdgroup_float8x8 O[FL_BQ / 8u][(512u / 8u) / 8u];   // [TM][TN]
+    simdgroup_float8x8 O[FL_BQ / 8u][(FL_HD / 8u) / 8u];   // [TM][TN]
     for (uint i = 0u; i < TM; ++i) {
         for (uint j = 0u; j < TN; ++j) {
             O[i][j] = simdgroup_float8x8(0.f);

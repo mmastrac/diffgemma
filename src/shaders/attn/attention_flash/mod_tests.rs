@@ -95,7 +95,7 @@ fn flash_bench() {
         let f = model_full_fixture(kv_len);
         let mma_full = crate::shaders::attention::bench_path(&f, iters, 3).unwrap();
         let e17 = bench_gpu(&f, iters, 16).unwrap();
-        let flash = bench_flash(&f, iters).unwrap();
+        let flash = bench_flash(&f, iters, 16).unwrap();
         println!(
             "  {:>6}  {:>8.3}  {:>9.3}  {:>9.3}   {:>5.2}x",
             kv_len,
@@ -103,6 +103,33 @@ fn flash_bench() {
             e17,
             flash,
             e17 / flash
+        );
+    }
+}
+
+/// Confirmation (user's hypothesis): at hd=256 the O register cap relaxes, so
+/// flash can run larger BQ (16/32/64) → bigger MMA tiles. Compares flash at each
+/// BQ vs E17 at the SAME hd=256 full-attn shape. Ignored (timing).
+/// NOTE: hd=256 = the sliding layers, which in production are window-bounded
+/// (1024) — a win here is on a non-bottleneck. This just tests the tile physics.
+/// Run: `cargo test --release flash_bench_hd256 -- --ignored --nocapture`
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore]
+fn flash_bench_hd256() {
+    use crate::shaders::attn::attention_flash::bench_flash;
+    use crate::shaders::attn::attention_gemm::bench_gpu;
+    use crate::shaders::attention::model_bench_fixture;
+    let iters = 10usize;
+    println!("  kv       e17(hd256)  flash-bq16  flash-bq32   best/e17");
+    for kv_len in [8192u32, 30000, 60000] {
+        let f = model_bench_fixture(256, kv_len, true);
+        let e17 = bench_gpu(&f, iters, 16).unwrap();
+        let b16 = bench_flash(&f, iters, 16).unwrap();
+        let b32 = bench_flash(&f, iters, 32).unwrap();
+        println!(
+            "  {:>6}  {:>9.3}  {:>9.3}  {:>9.3}   {:>5.2}x",
+            kv_len, e17, b16, b32, e17 / b16.min(b32)
         );
     }
 }
