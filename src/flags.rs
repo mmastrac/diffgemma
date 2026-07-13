@@ -129,6 +129,13 @@ pub struct PerfFlags {
     pub gemm_tune_bm: usize,
     pub gemm_tune_bn: usize,
     pub moe_sparse_bn: usize,
+    /// `DGQ_FLASH_PREFILL` (E18): fused flash prefill attention (online softmax,
+    /// register-resident O, no device S/P traffic) instead of the E17 GEMM
+    /// decomposition. Prefill-only, full-attention layers. Default OFF (opt-in,
+    /// pending sign-off). `bq`/`bk` = query-row tile / key-block streamed.
+    pub flash_prefill: bool,
+    pub flash_prefill_bq: usize,
+    pub flash_prefill_bk: usize,
 }
 
 impl Default for PerfFlags {
@@ -159,6 +166,9 @@ impl Default for PerfFlags {
             gemm_tune_bm: 64,
             gemm_tune_bn: 64,
             moe_sparse_bn: 128,
+            flash_prefill: false,
+            flash_prefill_bq: 16,
+            flash_prefill_bk: 64,
         }
     }
 }
@@ -400,6 +410,9 @@ impl RuntimeConfig {
                 gemm_tune_bm: parse_usize("DGQ_GEMM_TUNE_BM", 64).max(16),
                 gemm_tune_bn: parse_usize("DGQ_GEMM_TUNE_BN", 64).max(16),
                 moe_sparse_bn: parse_usize("DGQ_MOE_SPARSE_BN", 128).max(16),
+                flash_prefill: env_on_if_one("DGQ_FLASH_PREFILL"),
+                flash_prefill_bq: parse_usize("DGQ_FLASH_PREFILL_BQ", 16).max(8),
+                flash_prefill_bk: parse_usize("DGQ_FLASH_PREFILL_BK", 64).max(16),
             },
             prefill: PrefillFlags {
                 f16: env_on_if_one("DGQ_PREFILL_F16"),
@@ -681,6 +694,13 @@ pub fn gemm_tune_tile() -> (usize, usize) {
 /// stays 32, baked into moe_bucket_fill).
 pub fn moe_sparse_bn() -> usize {
     config().perf.moe_sparse_bn
+}
+
+/// E18 fused flash prefill. `.0` = enabled, `.1` = BQ (query-row tile), `.2` =
+/// BK (streamed key block). Default off / 16 / 64.
+pub fn flash_prefill() -> (bool, usize, usize) {
+    let p = &config().perf;
+    (p.flash_prefill, p.flash_prefill_bq, p.flash_prefill_bk)
 }
 
 /// E17 tunable tile config (task #87). Defaults reproduce the shipped
