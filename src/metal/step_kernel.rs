@@ -5361,9 +5361,10 @@ impl StepRuntime {
                     MoeGroupedScalar,
                 ],
             ),
+            ("dense_ffn", &[LayerDenseFfn]),
             (
-                "moe_norm+combine+dense",
-                &[LayerDenseFfn, LayerMoePostNorm, LayerMoePostCombine],
+                "moe_postnorm+combine",
+                &[LayerMoePostNorm, LayerMoePostCombine],
             ),
             ("embed", &[EmbedGather]),
         ];
