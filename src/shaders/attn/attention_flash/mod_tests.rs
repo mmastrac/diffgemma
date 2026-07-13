@@ -53,3 +53,37 @@ fn flash_blocked_matches_cpu_causal_grp8_f16() {
 fn flash_blocked_matches_cpu_causal_sliding_hd256_f16() {
     assert_flash_matches(&sliding_hd256_fixture(ElemFormat::F32), true);
 }
+
+// ---- GPU oracle: the fused flash kernel vs the causal CPU reference. ----
+#[cfg(target_os = "macos")]
+#[test]
+fn flash_gpu_full_grp8_causal_vs_cpu() {
+    use crate::shaders::attn::attention_flash::gpu_flash;
+    use crate::shaders::test_util::assert_oracle;
+    let f = full_grp8_hd512_fixture(ElemFormat::F32);
+    let got = gpu_flash(&f, true, false).expect("gpu flash causal");
+    let oracle = cpu_causal(&f, true);
+    assert_oracle(&got, &oracle, 2e-2, 0.9999);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn flash_gpu_full_grp2_causal_vs_cpu() {
+    use crate::shaders::attn::attention_flash::gpu_flash;
+    use crate::shaders::test_util::assert_oracle;
+    let f = full_hd512_fixture(ElemFormat::F32);
+    let got = gpu_flash(&f, true, false).expect("gpu flash causal");
+    let oracle = cpu_causal(&f, true);
+    assert_oracle(&got, &oracle, 2e-2, 0.9999);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn flash_gpu_full_grp8_causal_side_vs_cpu() {
+    use crate::shaders::attn::attention_flash::gpu_flash;
+    use crate::shaders::test_util::assert_oracle;
+    let f = full_grp8_hd512_fixture(ElemFormat::F32);
+    let got = gpu_flash(&f, true, true).expect("gpu flash causal side");
+    let oracle = cpu_causal(&f, false);
+    assert_oracle(&got, &oracle, 2e-2, 0.9999);
+}
