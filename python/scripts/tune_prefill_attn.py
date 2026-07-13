@@ -145,6 +145,16 @@ def main() -> int:
     )
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
+    # Pin the shipped default as trial 0 so best-vs-default is measured
+    # apples-to-apples within THIS run (not vs a separately-benched baseline).
+    default_cfg = {"qk_bm": 64, "qk_bn": 64, "pv_bm": 64, "pv_bn": 64,
+                   "hc": 4, "sm_tpg": 256}
+    if args.proxy:
+        default_cfg.update({"gemm_bm": 64, "gemm_bn": 64, "moe_bn": 128})
+    if not (args.storage and any(
+            t.params == default_cfg for t in study.get_trials(deepcopy=False))):
+        study.enqueue_trial(default_cfg)
+
     path = "PROXY:super-chunk" if args.proxy else ("f32-side" if args.side else "f16")
     print(f"tuning prefill-attn ({path}, kv={args.kv_len}, {args.trials} trials, "
           f"iters={args.iters})...", flush=True)
