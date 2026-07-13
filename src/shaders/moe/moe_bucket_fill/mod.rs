@@ -181,14 +181,14 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let mut pool = BufferPool::new();
     let buf_route = pool
         .allocate(&ctx.device, std::mem::size_of::<RouteScratch>())
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_expert_unique = pool
         .allocate(&ctx.device, std::mem::size_of::<u32>())
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     // 6 grids × 3 u32 (grouped 0/1, block-sparse 2/3, tunable sparse 4/5).
     let buf_indirect = pool
         .allocate(&ctx.device, 6 * 3 * std::mem::size_of::<u32>())
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let scratch = scratch_from_fixture(f);
     BufferPool::write_bytes(&buf_route, unsafe {
         std::slice::from_raw_parts(
@@ -197,8 +197,8 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         )
     });
 
-    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+    let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
     run_phases(
         &enc,
         &pipeline,

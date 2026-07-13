@@ -103,7 +103,7 @@ pub fn gpu(f: &Fixture) -> Result<Vec<f32>, Error> {
 
     let buf = pool
         .allocate(&ctx.device, bytes)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     BufferPool::write_f32(&buf, &f.src);
 
     gpu_common::dispatch_1d_ranged(&ctx.queue, &pipeline.pipeline, len, |enc, base, chunk| {

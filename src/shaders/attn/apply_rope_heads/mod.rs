@@ -169,7 +169,7 @@ pub fn pipeline_for(
     let mut pipelines = ctx.compile_kernels(SHADER, &[ENTRY])?;
     pipelines
         .pop()
-        .ok_or(Error::Format("Metal pipeline missing"))
+        .ok_or(Error::Runtime("Metal pipeline missing"))
 }
 
 #[cfg(target_os = "macos")]
@@ -188,10 +188,10 @@ pub fn gpu(f: &Fixture) -> Result<Vec<f32>, Error> {
     let f_bytes = f.freqs.len() * 4;
     let buf_x = pool
         .allocate(&ctx.device, x_bytes)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_f = pool
         .allocate(&ctx.device, f_bytes)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
 
     BufferPool::write_f32(&buf_x, &f.x);
     BufferPool::write_f32(&buf_f, &f.freqs);
@@ -204,8 +204,8 @@ pub fn gpu(f: &Fixture) -> Result<Vec<f32>, Error> {
         f.elem_offset,
     );
 
-    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+    let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
     enc.setComputePipelineState(&pipeline.pipeline);
     unsafe {
         enc.setBuffer_offset_atIndex(Some(&buf_x), 0, 0);

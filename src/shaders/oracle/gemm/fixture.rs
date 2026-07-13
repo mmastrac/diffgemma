@@ -110,18 +110,18 @@ pub fn run_gpu(
     let mut pool = BufferPool::new();
     let buf_x = pool
         .allocate(&ctx.device, f.m * f.k * 2)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_y = pool
         .allocate(&ctx.device, f.m * f.n * 2)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_w = pool
         .allocate(&ctx.device, w_bytes.len())
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     BufferPool::write_bf16(&buf_x, &bf16::f32_slice_to_bf16_bits(&f.x));
     BufferPool::write_bytes(&buf_w, w_bytes);
     let (grid, tg) = gemm_common::dispatch_shape(f.m, f.n);
-    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+    let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
     enc.setComputePipelineState(&pipeline.pipeline);
     bind_gpu_buffers(&enc, &buf_x, &buf_y, &buf_w, 0, f.m as u32);
     enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);

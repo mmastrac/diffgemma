@@ -45,7 +45,7 @@ impl DgqGpuBlob {
         let mmap = unsafe { Mmap::map(&file)? };
         let len = mmap.len();
         let ptr =
-            NonNull::new(mmap.as_ptr() as *mut c_void).ok_or(Error::Format("dgq mmap null"))?;
+            NonNull::new(mmap.as_ptr() as *mut c_void).ok_or(Error::Runtime("dgq mmap null"))?;
         let max_buf = device.maxBufferLength();
         if len <= max_buf {
             let buffer = unsafe {
@@ -56,7 +56,7 @@ impl DgqGpuBlob {
                         MTLResourceOptions::StorageModeShared,
                         None,
                     )
-                    .ok_or(Error::Format("dgq gpu blob alloc failed"))?
+                    .ok_or(Error::Gpu("dgq gpu blob alloc failed"))?
             };
             return Ok(Arc::new(Self {
                 _file: file,
@@ -74,7 +74,7 @@ impl DgqGpuBlob {
             "dgq blob exceeds device max buffer length and manifest has no expert_split — re-convert with the experts-last converter",
         ))? as usize;
         if split % 16384 != 0 || split == 0 || split >= len {
-            return Err(Error::Format("dgq expert_split invalid"));
+            return Err(Error::Runtime("dgq expert_split invalid"));
         }
         if split > max_buf || (len - split) > max_buf {
             return Err(Error::Format(
@@ -96,10 +96,10 @@ impl DgqGpuBlob {
                     MTLResourceOptions::StorageModeShared,
                     None,
                 )
-                .ok_or(Error::Format("dgq gpu blob region1 alloc failed"))?
+                .ok_or(Error::Gpu("dgq gpu blob region1 alloc failed"))?
         };
         let ptr2 = NonNull::new(unsafe { (mmap.as_ptr() as *mut u8).add(split) } as *mut c_void)
-            .ok_or(Error::Format("dgq mmap region2 null"))?;
+            .ok_or(Error::Runtime("dgq mmap region2 null"))?;
         let buffer_experts = unsafe {
             device
                 .newBufferWithBytesNoCopy_length_options_deallocator(
@@ -108,7 +108,7 @@ impl DgqGpuBlob {
                     MTLResourceOptions::StorageModeShared,
                     None,
                 )
-                .ok_or(Error::Format("dgq gpu blob region2 alloc failed"))?
+                .ok_or(Error::Gpu("dgq gpu blob region2 alloc failed"))?
         };
         Ok(Arc::new(Self {
             _file: file,
@@ -435,7 +435,7 @@ pub fn load_block_linear(
         return Err(Error::Format("expected q4_block or nvfp4_block linear"));
     }
     if entry.meta.shape.len() != 2 {
-        return Err(Error::Format("block linear expects rank 2"));
+        return Err(Error::Runtime("block linear expects rank 2"));
     }
     let out = entry.meta.shape[0] as usize;
     let inp = entry.meta.shape[1] as usize;
@@ -463,7 +463,7 @@ pub fn load_block_expert_stack(
         ));
     }
     if entry.meta.shape.len() != 3 {
-        return Err(Error::Format("block expert expects rank 3"));
+        return Err(Error::Runtime("block expert expects rank 3"));
     }
     Ok(Q4ExpertStackGpu {
         kind,

@@ -109,7 +109,7 @@ fn role_name(role: ChatRole) -> &'static str {
 fn push_special(out: &mut Vec<u32>, tok: &Tokenizer, token: &str) -> Result<(), Error> {
     let id = tok
         .special_token_id(token)
-        .ok_or(Error::Format("missing chat special token"))?;
+        .ok_or(Error::Runtime("missing chat special token"))?;
     out.push(id);
     Ok(())
 }

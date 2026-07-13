@@ -211,13 +211,13 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let mut pool = BufferPool::new();
     let buf_state = pool
         .allocate(&ctx.device, std::mem::size_of::<CanvasState>())
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let state = blank_state(f);
     BufferPool::write_bytes(&buf_state, &state_to_bytes(&state));
 
     let canvas = f.canvas_size as u32;
-    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+    let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
     enc.setComputePipelineState(&pipeline.pipeline);
     unsafe {
         enc.setBuffer_offset_atIndex(Some(&buf_state), 0, 0);

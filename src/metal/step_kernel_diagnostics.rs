@@ -116,7 +116,7 @@ pub fn run_step_layer_hidden_probe(
     position: usize,
 ) -> Result<LayerHiddenProbeResult, Error> {
     if position >= CANVAS {
-        return Err(Error::Format("layer probe position out of range"));
+        return Err(Error::Runtime("layer probe position out of range"));
     }
     let (mut rt, _) = build_step_runtime(model_dir, cfg)?;
     // build_step_runtime seeds the canvas BEFORE the fast prefill runs, and the
@@ -212,7 +212,7 @@ pub fn run_step_preamble_capture(
     position: usize,
 ) -> Result<PreambleCapture, Error> {
     if position >= CANVAS {
-        return Err(Error::Format("preamble capture position out of range"));
+        return Err(Error::Runtime("preamble capture position out of range"));
     }
     let (mut rt, _) = build_step_runtime(model_dir, cfg)?;
     let layout = rt.layout;
@@ -358,7 +358,7 @@ pub fn run_step_attn_layer_capture(
     use crate::metal::step_kv::read_layer_k_cache_f32;
 
     if position >= CANVAS {
-        return Err(Error::Format("attn capture position out of range"));
+        return Err(Error::Runtime("attn capture position out of range"));
     }
     let layer = layer.min(cfg.layers.saturating_sub(1));
     let (mut rt, _) = build_step_runtime(model_dir, cfg)?;
@@ -598,14 +598,14 @@ fn route_override_from_ref_json(
     let experts: Vec<u32> = doc
         .get("experts")
         .and_then(|v| v.as_array())
-        .ok_or_else(|| Error::Format("route ref missing experts"))?
+        .ok_or_else(|| Error::Runtime("route ref missing experts"))?
         .iter()
         .map(|v| v.as_u64().unwrap_or(0) as u32)
         .collect();
     let weights: Vec<u16> = doc
         .get("expert_weights")
         .and_then(|v| v.as_array())
-        .ok_or_else(|| Error::Format("route ref missing expert_weights"))?
+        .ok_or_else(|| Error::Runtime("route ref missing expert_weights"))?
         .iter()
         .map(|v| {
             if let Some(n) = v.as_u64() {
@@ -616,7 +616,7 @@ fn route_override_from_ref_json(
         })
         .collect();
     if experts.len() != TOP_K || weights.len() != TOP_K {
-        return Err(Error::Format("route ref experts/weights must be top_k"));
+        return Err(Error::Runtime("route ref experts/weights must be top_k"));
     }
     Ok(Some((experts, weights)))
 }
@@ -926,7 +926,7 @@ pub fn run_step_moe_layer_capture(
     position: usize,
 ) -> Result<LayerMoeCapture, Error> {
     if position >= CANVAS {
-        return Err(Error::Format("moe capture position out of range"));
+        return Err(Error::Runtime("moe capture position out of range"));
     }
     let layer = layer.min(cfg.layers.saturating_sub(1));
     let (mut rt, _) = build_step_runtime(model_dir, cfg)?;

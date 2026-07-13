@@ -167,19 +167,19 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let rowstat = f.rowstat();
     let buf_l = pool
         .allocate(&ctx.device, f.logits.len() * 2)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_rs = pool
         .allocate(&ctx.device, rowstat.len() * 4)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_o = pool
         .allocate(&ctx.device, f.out_len() * 2)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     BufferPool::write_bf16(&buf_l, &bf16::f32_slice_to_bf16_bits(&f.logits));
     BufferPool::write_f32(&buf_rs, &rowstat);
     let params = [f.rows as u32, f.vocab as u32, f.v0 as u32, f.chunk as u32];
     let (grid, tg) = dispatch_shape(f.rows, f.chunk);
-    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+    let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
     enc.setComputePipelineState(&pipeline.pipeline);
     bind_gpu_buffers(&enc, &buf_l, &buf_rs, &buf_o, &params);
     enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);

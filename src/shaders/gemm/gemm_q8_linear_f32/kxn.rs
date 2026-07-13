@@ -130,20 +130,20 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let w_q8 = f.w_q8();
     let buf_a = pool
         .allocate(&ctx.device, f.x.len() * 4)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_w = pool
         .allocate(&ctx.device, w_q8.len())
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_c = pool
         .allocate(&ctx.device, f.out_len() * 4)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     BufferPool::write_f32(&buf_a, &f.x);
     BufferPool::write_bytes(&buf_w, &w_q8);
     BufferPool::write_f32(&buf_c, &vec![0.0f32; f.out_len()]);
 
     let (grid, tg) = dispatch_shape(f.m, f.n);
-    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+    let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
     enc.setComputePipelineState(&pipeline.pipeline);
     bind_gpu_buffers(
         &enc, &buf_a, &buf_w, &buf_c, f.m as u32, f.n as u32, f.k as u32,

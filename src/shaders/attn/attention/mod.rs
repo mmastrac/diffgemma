@@ -352,19 +352,19 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let mut pool = BufferPool::new();
     let buf_q = pool
         .allocate(&ctx.device, f.q.len() * 2)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_kv = pool
         .allocate(
             &ctx.device,
             (f.kvcache.len() + 8 * f.n_kv() * f.head_dim() * 2) * 2,
         )
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_out = pool
         .allocate(&ctx.device, f.out_len() * 2)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_layer = pool
         .allocate(&ctx.device, std::mem::size_of::<LayerOffsets>())
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
 
     BufferPool::write_bf16(&buf_q, &bf16::f32_slice_to_bf16_bits(&f.q));
     {
@@ -404,8 +404,8 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         window: 0,
     };
 
-    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+    let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
     enc.setComputePipelineState(&pipeline.pipeline);
     unsafe {
         enc.setBuffer_offset_atIndex(Some(&buf_q), 0, 0);
@@ -459,19 +459,19 @@ pub fn gpu_mma2(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> 
     let mut pool = BufferPool::new();
     let buf_q = pool
         .allocate(&ctx.device, f.q.len() * 2)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_kv = pool
         .allocate(
             &ctx.device,
             (f.kvcache.len() + 8 * f.n_kv() * f.head_dim() * 2) * 2,
         )
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_out = pool
         .allocate(&ctx.device, f.out_len() * 2)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_layer = pool
         .allocate(&ctx.device, std::mem::size_of::<LayerOffsets>())
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
 
     BufferPool::write_bf16(&buf_q, &bf16::f32_slice_to_bf16_bits(&f.q));
     {
@@ -506,8 +506,8 @@ pub fn gpu_mma2(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> 
     };
     let dims = AttnDims::new(f.canvas as u32, f.n_q_heads as u32);
 
-    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+    let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
     enc.setComputePipelineState(&pipeline.pipeline);
     unsafe {
         enc.setBuffer_offset_atIndex(Some(&buf_q), 0, 0);
@@ -562,19 +562,19 @@ pub fn gpu_mma_full(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Err
     let mut pool = BufferPool::new();
     let buf_q = pool
         .allocate(&ctx.device, f.q.len() * 2)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_kv = pool
         .allocate(
             &ctx.device,
             (f.kvcache.len() + 8 * f.n_kv() * f.head_dim() * 2) * 2,
         )
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_out = pool
         .allocate(&ctx.device, f.out_len() * 2)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_layer = pool
         .allocate(&ctx.device, std::mem::size_of::<LayerOffsets>())
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
 
     BufferPool::write_bf16(&buf_q, &bf16::f32_slice_to_bf16_bits(&f.q));
     {
@@ -612,11 +612,11 @@ pub fn gpu_mma_full(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Err
     // kv-block state scratch (single-block dispatch here: first+last).
     let buf_state = pool
         .allocate(&ctx.device, f.n_q_heads * f.canvas * (2 + 512) * 4)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let blk = [0u32, f.kv_len + f.canvas as u32, 1, 1];
 
-    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+    let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
     enc.setComputePipelineState(&pipeline.pipeline);
     unsafe {
         enc.setBuffer_offset_atIndex(Some(&buf_q), 0, 0);
@@ -679,19 +679,19 @@ pub fn bench_path(f: &Fixture, iters: usize, path: u8) -> Result<f64, Error> {
     let mut pool = BufferPool::new();
     let buf_q = pool
         .allocate(&ctx.device, f.q.len() * 2)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_kv = pool
         .allocate(
             &ctx.device,
             (f.kvcache.len() + 8 * f.n_kv() * f.head_dim() * 2) * 2,
         )
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_out = pool
         .allocate(&ctx.device, f.out_len() * 2)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_layer = pool
         .allocate(&ctx.device, std::mem::size_of::<LayerOffsets>())
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     BufferPool::write_bf16(&buf_q, &bf16::f32_slice_to_bf16_bits(&f.q));
     {
         // f16 KV + 8 zero pad rows (direct-load kernels read whole 8-key tiles;
@@ -765,7 +765,7 @@ pub fn bench_path(f: &Fixture, iters: usize, path: u8) -> Result<f64, Error> {
     // kv-block state scratch for the mma_full path (single-block: first+last).
     let buf_state = pool
         .allocate(&ctx.device, f.n_q_heads * f.canvas * (2 + 512) * 4)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let blk = [0u32, f.kv_len + f.canvas as u32, 1, 1];
 
     // 1 warm-up + several timed rounds (each one command buffer with `iters`
@@ -773,8 +773,8 @@ pub fn bench_path(f: &Fixture, iters: usize, path: u8) -> Result<f64, Error> {
     let mut best = f64::INFINITY;
     for round in 0..6 {
         let t = Instant::now();
-        let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-        let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+        let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+        let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
         enc.setComputePipelineState(&pipeline.pipeline);
         unsafe {
             enc.setBuffer_offset_atIndex(Some(&buf_q), 0, 0);

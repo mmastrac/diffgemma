@@ -256,7 +256,7 @@ pub fn decoder_gqa_gpu_kv_batched_chained_qbuf(
         mask,
         Some(buf_q),
     )?
-    .ok_or(Error::Format("gqa gpu kv missing output buffer"))
+    .ok_or(Error::Gpu("gqa gpu kv missing output buffer"))
 }
 
 pub fn gqa_batched_chained(
@@ -283,7 +283,7 @@ pub fn gqa_batched_chained(
         mask,
         None,
     )?
-    .ok_or(Error::Format("gqa missing output buffer"))
+    .ok_or(Error::Runtime("gqa missing output buffer"))
 }
 
 fn gqa_batched_inner(
@@ -319,7 +319,7 @@ fn gqa_batched_inner(
             return Err(Error::Format("gqa attention shape mismatch"));
         }
     } else if kv_gpu.is_none() {
-        return Err(Error::Format("gqa gpu kv buffers missing"));
+        return Err(Error::Gpu("gqa gpu kv buffers missing"));
     }
 
     let (mask_kind, kv_cache_len, positions, decoder_mask) = match mask {

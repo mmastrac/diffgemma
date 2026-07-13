@@ -36,7 +36,7 @@ impl LayerKv {
     pub fn set_kv(&mut self, keys: &[f32], values: &[f32], seq_len: usize) -> Result<(), Error> {
         let dim = self.per_token_dim();
         if keys.len() != seq_len * dim || values.len() != seq_len * dim {
-            return Err(Error::Format("kv buffer length mismatch"));
+            return Err(Error::Runtime("kv buffer length mismatch"));
         }
         self.keys.resize(seq_len * dim, 0.0);
         self.values.resize(seq_len * dim, 0.0);
@@ -54,7 +54,7 @@ impl LayerKv {
     ) -> Result<(), Error> {
         let dim = self.per_token_dim();
         if keys.len() != append_len * dim || values.len() != append_len * dim {
-            return Err(Error::Format("kv append length mismatch"));
+            return Err(Error::Runtime("kv append length mismatch"));
         }
         self.keys.extend_from_slice(keys);
         self.values.extend_from_slice(values);
@@ -117,7 +117,7 @@ impl KvCache {
         for (layer, kv) in self.layers.iter().enumerate() {
             let params = AttentionParams::for_layer(cfg, layer)?;
             if kv.kv_len() != self.kv_len {
-                return Err(Error::Format("kv cache seq length mismatch"));
+                return Err(Error::Runtime("kv cache seq length mismatch"));
             }
             if kv.n_kv_heads != params.n_kv_heads || kv.head_dim != params.head_dim {
                 return Err(Error::Format("kv cache head dims mismatch"));

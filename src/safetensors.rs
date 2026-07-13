@@ -74,7 +74,14 @@ pub struct SafetensorsFile {
 pub enum Error {
     Io(std::io::Error),
     Json(serde_json::Error),
+    /// Model-file parse / layout / dtype problems (safetensors, `.dgq`).
     Format(&'static str),
+    /// GPU / Metal failure: buffer allocation, encoder / command-buffer
+    /// creation, pipeline compile, dispatch.
+    Gpu(&'static str),
+    /// Runtime / logic error: invalid argument, budget or limit exceeded,
+    /// unsupported configuration, missing state.
+    Runtime(&'static str),
     NotFound(String),
     DType {
         name: String,
@@ -94,6 +101,8 @@ impl std::fmt::Display for Error {
             Self::Io(e) => write!(f, "io error: {e}"),
             Self::Json(e) => write!(f, "json error: {e}"),
             Self::Format(msg) => write!(f, "format error: {msg}"),
+            Self::Gpu(msg) => write!(f, "gpu error: {msg}"),
+            Self::Runtime(msg) => write!(f, "runtime error: {msg}"),
             Self::NotFound(name) => write!(f, "tensor not found: {name}"),
             Self::DType {
                 name,

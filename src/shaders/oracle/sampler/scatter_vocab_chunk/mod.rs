@@ -105,10 +105,10 @@ pub fn gpu(f: &Fixture) -> Result<Vec<f32>, Error> {
     let logits_bytes = f.logits.len() * 4;
     let buf_chunk = pool
         .allocate(&ctx.device, chunk_bytes)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_logits = pool
         .allocate(&ctx.device, logits_bytes)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     BufferPool::write_f32(&buf_chunk, &f.chunk);
     BufferPool::write_f32(&buf_logits, &f.logits);
 
@@ -120,8 +120,8 @@ pub fn gpu(f: &Fixture) -> Result<Vec<f32>, Error> {
     ];
     let (grid, tg) = gpu_common::scatter_vocab_grid(f.seq_len, f.chunk_cols);
 
-    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+    let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
     enc.setComputePipelineState(&pipeline.pipeline);
     unsafe {
         enc.setBuffer_offset_atIndex(Some(&buf_chunk), 0, 0);

@@ -153,13 +153,13 @@ pub fn gpu(f: &Fixture, _variant: crate::shaders::KernelVariant) -> Result<Vec<f
     let w_q8 = f.w_q8();
     let buf_x = pool
         .allocate(&ctx.device, f.m * f.k * 2)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_y = pool
         .allocate(&ctx.device, f.m * f.n * 2)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_w = pool
         .allocate(&ctx.device, w_q8.len())
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     BufferPool::write_bf16(&buf_x, &bf16::f32_slice_to_bf16_bits(&f.x));
     BufferPool::write_bytes(&buf_w, &w_q8);
     // gemm_q8_rowk is hardcoded to 32x32 tiles (tgid.{x,y} * 32) — production
@@ -176,8 +176,8 @@ pub fn gpu(f: &Fixture, _variant: crate::shaders::KernelVariant) -> Result<Vec<f
         height: 1,
         depth: 1,
     };
-    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+    let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
     enc.setComputePipelineState(&pipeline.pipeline);
     bind_gpu_buffers(&enc, &buf_x, &buf_y, &buf_w, 0, f.m as u32);
     enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);

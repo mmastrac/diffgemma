@@ -35,7 +35,7 @@ impl AttentionParams {
         let layer_type = cfg
             .layer_types
             .get(layer)
-            .ok_or(Error::Format("invalid layer index"))?;
+            .ok_or(Error::Runtime("invalid layer index"))?;
         let (n_kv_heads, head_dim) = match layer_type {
             LayerType::SlidingAttention => (cfg.num_key_value_heads, cfg.head_dim),
             LayerType::FullAttention => (cfg.num_global_key_value_heads, cfg.global_head_dim),

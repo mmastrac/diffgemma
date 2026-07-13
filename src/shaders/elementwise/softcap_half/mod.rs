@@ -88,7 +88,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let mut pool = BufferPool::new();
     let buf = pool
         .allocate(&ctx.device, f.logits.len() * 2)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let dump_bytes = if variant.dump_stage > 0 {
         f.len as usize * 4
     } else {
@@ -96,7 +96,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     };
     let buf_d = pool
         .allocate(&ctx.device, dump_bytes)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     BufferPool::write_bf16(&buf, &bf16::f32_slice_to_bf16_bits(&f.logits));
     gpu_common::dispatch_1d(&ctx.queue, &pipeline.pipeline, f.len as usize, |enc| {
         bind_gpu_buffers(enc, &buf, &buf_d, f.base, f.len);

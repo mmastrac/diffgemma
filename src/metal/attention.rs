@@ -23,8 +23,8 @@ impl GpuAttentionKernels {
     pub fn new(ctx: &MetalContext) -> Result<Self, Error> {
         let mut rope = ctx.compile_kernels(ROPE_SHADER, &[ROPE_ENTRY])?;
         let mut attn = ctx.compile_kernels(GQA_SHADER, &[GQA_ENTRY])?;
-        let attn_pipeline = attn.pop().ok_or(Error::Format("Metal pipeline missing"))?;
-        let rope_pipeline = rope.pop().ok_or(Error::Format("Metal pipeline missing"))?;
+        let attn_pipeline = attn.pop().ok_or(Error::Runtime("Metal pipeline missing"))?;
+        let rope_pipeline = rope.pop().ok_or(Error::Runtime("Metal pipeline missing"))?;
         Ok(Self {
             rope_pipeline,
             attn_pipeline,
@@ -67,11 +67,11 @@ impl GpuAttention {
         let buf_x = self
             .pool
             .allocate(&self.ctx.device, x_bytes)
-            .ok_or(Error::Format("Metal buffer alloc failed"))?;
+            .ok_or(Error::Gpu("Metal buffer alloc failed"))?;
         let buf_f = self
             .pool
             .allocate(&self.ctx.device, f_bytes)
-            .ok_or(Error::Format("Metal buffer alloc failed"))?;
+            .ok_or(Error::Gpu("Metal buffer alloc failed"))?;
 
         BufferPool::write_f32(&buf_x, x);
         BufferPool::write_f32(&buf_f, freqs);
@@ -143,19 +143,19 @@ impl GpuAttention {
         let buf_q = self
             .pool
             .allocate(&self.ctx.device, q_bytes)
-            .ok_or(Error::Format("Metal buffer alloc failed"))?;
+            .ok_or(Error::Gpu("Metal buffer alloc failed"))?;
         let buf_k = self
             .pool
             .allocate(&self.ctx.device, k_bytes)
-            .ok_or(Error::Format("Metal buffer alloc failed"))?;
+            .ok_or(Error::Gpu("Metal buffer alloc failed"))?;
         let buf_v = self
             .pool
             .allocate(&self.ctx.device, v_bytes)
-            .ok_or(Error::Format("Metal buffer alloc failed"))?;
+            .ok_or(Error::Gpu("Metal buffer alloc failed"))?;
         let buf_o = self
             .pool
             .allocate(&self.ctx.device, o_bytes)
-            .ok_or(Error::Format("Metal buffer alloc failed"))?;
+            .ok_or(Error::Gpu("Metal buffer alloc failed"))?;
 
         BufferPool::write_f32(&buf_q, q);
         BufferPool::write_f32(&buf_k, k);
@@ -169,7 +169,7 @@ impl GpuAttention {
             let b = self
                 .pool
                 .allocate(&self.ctx.device, mask_bytes)
-                .ok_or(Error::Format("Metal buffer alloc failed"))?;
+                .ok_or(Error::Gpu("Metal buffer alloc failed"))?;
             BufferPool::write_bytes(&b, &packed);
             buf_mask = Some((mask_bytes, b));
         }
@@ -180,7 +180,7 @@ impl GpuAttention {
             let b = self
                 .pool
                 .allocate(&self.ctx.device, pos_bytes)
-                .ok_or(Error::Format("Metal buffer alloc failed"))?;
+                .ok_or(Error::Gpu("Metal buffer alloc failed"))?;
             BufferPool::write_i64(&b, pos);
             buf_pos = Some((pos_bytes, b));
         }
@@ -268,10 +268,10 @@ fn run_kernel(
 ) -> Result<(), Error> {
     let cmd_buf = queue
         .commandBuffer()
-        .ok_or(Error::Format("Metal command buffer alloc failed"))?;
+        .ok_or(Error::Gpu("Metal command buffer alloc failed"))?;
     let encoder = cmd_buf
         .computeCommandEncoder()
-        .ok_or(Error::Format("Metal compute encoder alloc failed"))?;
+        .ok_or(Error::Gpu("Metal compute encoder alloc failed"))?;
     encoder.setComputePipelineState(pipeline);
     encode(&encoder);
     encoder.endEncoding();

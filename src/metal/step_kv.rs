@@ -162,11 +162,11 @@ pub fn pack_kv_cache_to_monolithic(
     max_seq: usize,
 ) -> Result<(), Error> {
     if kv.kv_len > max_seq {
-        return Err(Error::Format("kv_len exceeds max_seq"));
+        return Err(Error::Runtime("kv_len exceeds max_seq"));
     }
     for layer in 0..N_LAYERS.min(kv.layers.len()) {
         let l = &layout.layers[layer];
-        let kv_layer = kv.layer(layer).ok_or(Error::Format("missing kv layer"))?;
+        let kv_layer = kv.layer(layer).ok_or(Error::Runtime("missing kv layer"))?;
         if kv_layer.n_kv_heads as u32 != l.n_kv_heads || kv_layer.head_dim as u32 != l.head_dim {
             return Err(Error::Format("kv layer head dims mismatch"));
         }
@@ -180,7 +180,7 @@ pub fn pack_kv_cache_to_monolithic(
         let slot_stride_b = 2 * nkv * row_b;
         let byte_base = l.kv_region as usize;
         if byte_base + layer_slots(l, max_seq) * slot_stride_b > dst.len() {
-            return Err(Error::Format("monolithic kv buffer too small"));
+            return Err(Error::Gpu("monolithic kv buffer too small"));
         }
         let per_token = nkv * hd;
         for pos in 0..kv.kv_len {
@@ -247,7 +247,7 @@ pub fn write_monolithic_kv_buffer(
 ) -> Result<(), Error> {
     let need = kv_cache_total_bytes(layout, max_seq) as usize;
     if buf.length() < need {
-        return Err(Error::Format("monolithic kv buffer too small"));
+        return Err(Error::Gpu("monolithic kv buffer too small"));
     }
     let dst = unsafe { std::slice::from_raw_parts_mut(buf.contents().as_ptr() as *mut u8, need) };
     dst.fill(0);
@@ -269,7 +269,7 @@ pub fn read_monolithic_kv_prefix_to_cpu_cache(
         let l = &layout.layers[layer];
         let kv_layer = kv
             .layer_mut(layer)
-            .ok_or(Error::Format("missing kv layer"))?;
+            .ok_or(Error::Runtime("missing kv layer"))?;
         let nkv = l.n_kv_heads as usize;
         let hd = l.head_dim as usize;
         let per_token = nkv * hd;
@@ -418,10 +418,10 @@ pub fn prefill_monolithic_kv_with_cache_timed(
 ) -> Result<(usize, MonolithicPrefillTiming), Error> {
     let total_started = std::time::Instant::now();
     if token_ids.is_empty() {
-        return Err(Error::Format("prefill requires at least one token"));
+        return Err(Error::Runtime("prefill requires at least one token"));
     }
     if token_ids.len() > max_seq {
-        return Err(Error::Format("prefill exceeds max_seq"));
+        return Err(Error::Runtime("prefill exceeds max_seq"));
     }
     let text = &cache.model.config.text_config;
     let canvas = CANVAS;
@@ -474,11 +474,11 @@ pub fn prefill_monolithic_kv_with_cache_timed(
         .dec_scratch
         .gpu_kv
         .as_ref()
-        .ok_or(Error::Format("gpu kv missing after prefill"))?;
+        .ok_or(Error::Gpu("gpu kv missing after prefill"))?;
     let kv_len = gpu_kv.kv_len;
     let need = kv_cache_total_bytes(layout, max_seq) as usize;
     if kv_buf.length() < need {
-        return Err(Error::Format("monolithic kv buffer too small"));
+        return Err(Error::Gpu("monolithic kv buffer too small"));
     }
     let dst =
         unsafe { std::slice::from_raw_parts_mut(kv_buf.contents().as_ptr() as *mut u8, need) };
@@ -658,7 +658,7 @@ pub fn extend_monolithic_kv_with_cache(
         return Ok(kv_len_before);
     }
     if kv_len_before + new_token_ids.len() > max_seq {
-        return Err(Error::Format("monolithic kv extend exceeds max_seq"));
+        return Err(Error::Runtime("monolithic kv extend exceeds max_seq"));
     }
     let total_started = std::time::Instant::now();
     let text = &cache.model.config.text_config;
@@ -675,7 +675,7 @@ pub fn extend_monolithic_kv_with_cache(
         .dec_scratch
         .gpu_kv
         .take()
-        .ok_or(Error::Format("gpu kv cache missing"))?;
+        .ok_or(Error::Gpu("gpu kv cache missing"))?;
     let hydrate_started = std::time::Instant::now();
     hydrate_gpu_kv_from_monolithic(
         &mut cache.engine,
@@ -710,12 +710,12 @@ pub fn extend_monolithic_kv_with_cache(
         .dec_scratch
         .gpu_kv
         .as_ref()
-        .ok_or(Error::Format("gpu kv missing after extend"))?;
+        .ok_or(Error::Gpu("gpu kv missing after extend"))?;
     let new_kv_len = gpu_kv.kv_len;
     let append_len = new_token_ids.len();
     let need = kv_cache_total_bytes(layout, max_seq) as usize;
     if kv_buf.length() < need {
-        return Err(Error::Format("monolithic kv buffer too small"));
+        return Err(Error::Gpu("monolithic kv buffer too small"));
     }
 
     let pack_started = std::time::Instant::now();
@@ -760,7 +760,7 @@ pub fn extend_monolithic_kv_chunked(
         return Ok(kv_len_before);
     }
     if kv_len_before + new_token_ids.len() > max_seq {
-        return Err(Error::Format("monolithic kv extend exceeds max_seq"));
+        return Err(Error::Runtime("monolithic kv extend exceeds max_seq"));
     }
     let total_started = std::time::Instant::now();
     let text = &cache.model.config.text_config;
@@ -769,7 +769,7 @@ pub fn extend_monolithic_kv_chunked(
     let fmt = crate::flags::kv_format(max_seq);
     let need = kv_cache_total_bytes(layout, max_seq) as usize;
     if kv_buf.length() < need {
-        return Err(Error::Format("monolithic kv buffer too small"));
+        return Err(Error::Gpu("monolithic kv buffer too small"));
     }
 
     let encoder_kv_cap = (kv_len_before + new_token_ids.len()).min(max_seq);
@@ -780,7 +780,7 @@ pub fn extend_monolithic_kv_chunked(
         .dec_scratch
         .gpu_kv
         .take()
-        .ok_or(Error::Format("gpu kv cache missing"))?;
+        .ok_or(Error::Gpu("gpu kv cache missing"))?;
     let hydrate_started = std::time::Instant::now();
     hydrate_gpu_kv_from_monolithic(
         &mut cache.engine,
@@ -821,7 +821,7 @@ pub fn extend_monolithic_kv_chunked(
             .dec_scratch
             .gpu_kv
             .as_ref()
-            .ok_or(Error::Format("gpu kv missing after extend"))?;
+            .ok_or(Error::Gpu("gpu kv missing after extend"))?;
         let pack_started = std::time::Instant::now();
         pack_gpu_kv_prefix_to_monolithic(
             &mut cache.engine,
@@ -884,10 +884,10 @@ pub fn prefill_monolithic_kv_cpu(
         ));
     }
     if token_ids.is_empty() {
-        return Err(Error::Format("prefill requires at least one token"));
+        return Err(Error::Runtime("prefill requires at least one token"));
     }
     if token_ids.len() > max_seq {
-        return Err(Error::Format("prefill exceeds max_seq"));
+        return Err(Error::Runtime("prefill exceeds max_seq"));
     }
     let mut scratch = EncoderScratch::new(token_ids.len(), cfg);
     let out = crate::model::encoder::prefill(

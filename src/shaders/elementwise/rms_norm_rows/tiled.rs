@@ -194,10 +194,10 @@ fn gpu_tiled(f: &Fixture, variant: KernelVariant, tiled: TiledVariant) -> Result
     };
     let buf_x = pool
         .allocate(&ctx.device, x_bytes)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_y = pool
         .allocate(&ctx.device, len * 2)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let (blob, w_off) = match &f.weight {
         Some(w) => {
             let mut b = vec![0u8; 2];
@@ -208,7 +208,7 @@ fn gpu_tiled(f: &Fixture, variant: KernelVariant, tiled: TiledVariant) -> Result
     };
     let buf_blob = pool
         .allocate(&ctx.device, blob.len())
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let dump_bytes = if variant.dump_stage > 0 {
         f.rows * 4
     } else {
@@ -216,7 +216,7 @@ fn gpu_tiled(f: &Fixture, variant: KernelVariant, tiled: TiledVariant) -> Result
     };
     let buf_d = pool
         .allocate(&ctx.device, dump_bytes)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     if tiled.in_dtype == ElemDtype::F32 {
         BufferPool::write_f32(&buf_x, &f.x);
     } else {
@@ -224,8 +224,8 @@ fn gpu_tiled(f: &Fixture, variant: KernelVariant, tiled: TiledVariant) -> Result
     }
     BufferPool::write_bytes(&buf_blob, &blob);
     let (grid, tg) = dispatch_shape(f.rows);
-    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+    let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
     enc.setComputePipelineState(&pipeline.pipeline);
     bind_gpu_buffers(&enc, &buf_x, &buf_y, &buf_blob, &buf_d, w_off, f.dim as u32);
     enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);

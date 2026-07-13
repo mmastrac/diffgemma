@@ -31,7 +31,7 @@ pub fn embed_tokens_from_store(
                 .shape
                 .get(1)
                 .filter(|&&d| d as usize == hidden)
-                .ok_or(Error::Format("embed hidden mismatch"))?;
+                .ok_or(Error::Runtime("embed hidden mismatch"))?;
             let is_raw = crate::dgq::layout::parse_quant_kind(&entry.meta.kind).ok()
                 == Some(crate::dgq::layout::QuantKind::Raw);
             let src = dgq.tensor_bytes(EMBED_KEY)?;

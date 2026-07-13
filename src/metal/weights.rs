@@ -55,7 +55,7 @@ fn raw_blob_bf16_to_f32(view: &crate::metal::dgq_gpu::RawBlobView) -> Result<Buf
         )
     };
     if src.len() != view.numel * 2 {
-        return Err(Error::Format("raw bf16 norm size mismatch"));
+        return Err(Error::Runtime("raw bf16 norm size mismatch"));
     }
     Ok(bf16_tensor_to_f32_buffer(Bf16Slice::from_bytes(src)))
 }

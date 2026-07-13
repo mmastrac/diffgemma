@@ -62,15 +62,15 @@ impl Bf16Gemm {
         let buf_a = self
             .pool
             .allocate(&self.ctx.device, a_bytes)
-            .ok_or(Error::Format("Metal buffer alloc failed"))?;
+            .ok_or(Error::Gpu("Metal buffer alloc failed"))?;
         let buf_b = self
             .pool
             .allocate(&self.ctx.device, b_bytes)
-            .ok_or(Error::Format("Metal buffer alloc failed"))?;
+            .ok_or(Error::Gpu("Metal buffer alloc failed"))?;
         let buf_c = self
             .pool
             .allocate(&self.ctx.device, c_bytes)
-            .ok_or(Error::Format("Metal buffer alloc failed"))?;
+            .ok_or(Error::Gpu("Metal buffer alloc failed"))?;
 
         BufferPool::write_bf16(&buf_a, a);
         BufferPool::write_bf16(&buf_b, b);
@@ -80,10 +80,10 @@ impl Bf16Gemm {
             .ctx
             .queue
             .commandBuffer()
-            .ok_or(Error::Format("Metal command buffer alloc failed"))?;
+            .ok_or(Error::Gpu("Metal command buffer alloc failed"))?;
         let encoder = cmd_buf
             .computeCommandEncoder()
-            .ok_or(Error::Format("Metal compute encoder alloc failed"))?;
+            .ok_or(Error::Gpu("Metal compute encoder alloc failed"))?;
 
         encode_gemm(
             &encoder,
@@ -129,15 +129,15 @@ impl Bf16Gemm {
         let buf_a = self
             .pool
             .allocate(&self.ctx.device, a_bytes)
-            .ok_or(Error::Format("Metal buffer alloc failed"))?;
+            .ok_or(Error::Gpu("Metal buffer alloc failed"))?;
         let buf_w = self
             .pool
             .allocate(&self.ctx.device, w_bytes)
-            .ok_or(Error::Format("Metal buffer alloc failed"))?;
+            .ok_or(Error::Gpu("Metal buffer alloc failed"))?;
         let buf_c = self
             .pool
             .allocate(&self.ctx.device, c_bytes)
-            .ok_or(Error::Format("Metal buffer alloc failed"))?;
+            .ok_or(Error::Gpu("Metal buffer alloc failed"))?;
 
         BufferPool::write_f32(&buf_a, a);
         BufferPool::write_bf16(&buf_w, w);
@@ -147,10 +147,10 @@ impl Bf16Gemm {
             .ctx
             .queue
             .commandBuffer()
-            .ok_or(Error::Format("Metal command buffer alloc failed"))?;
+            .ok_or(Error::Gpu("Metal command buffer alloc failed"))?;
         let encoder = cmd_buf
             .computeCommandEncoder()
-            .ok_or(Error::Format("Metal compute encoder alloc failed"))?;
+            .ok_or(Error::Gpu("Metal compute encoder alloc failed"))?;
 
         encode_gemm(
             &encoder,
@@ -188,10 +188,10 @@ impl Bf16Gemm {
             .ctx
             .queue
             .commandBuffer()
-            .ok_or(Error::Format("Metal command buffer alloc failed"))?;
+            .ok_or(Error::Gpu("Metal command buffer alloc failed"))?;
         let encoder = cmd_buf
             .computeCommandEncoder()
-            .ok_or(Error::Format("Metal compute encoder alloc failed"))?;
+            .ok_or(Error::Gpu("Metal compute encoder alloc failed"))?;
         encode_gemm(
             &encoder,
             &self.f32_bf16_linear_pipeline.pipeline,
@@ -223,10 +223,10 @@ impl Bf16Gemm {
             .ctx
             .queue
             .commandBuffer()
-            .ok_or(Error::Format("Metal command buffer alloc failed"))?;
+            .ok_or(Error::Gpu("Metal command buffer alloc failed"))?;
         let encoder = cmd_buf
             .computeCommandEncoder()
-            .ok_or(Error::Format("Metal compute encoder alloc failed"))?;
+            .ok_or(Error::Gpu("Metal compute encoder alloc failed"))?;
         for _ in 0..count {
             encode_gemm(
                 &encoder,

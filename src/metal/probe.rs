@@ -54,10 +54,10 @@ fn probe_memcpy_bandwidth(ctx: &MetalContext) -> Result<f64, Error> {
     let mut pool = BufferPool::new();
     let src = pool
         .allocate(&ctx.device, bytes)
-        .ok_or(Error::Format("probe src alloc failed"))?;
+        .ok_or(Error::Gpu("probe src alloc failed"))?;
     let dst = pool
         .allocate(&ctx.device, bytes)
-        .ok_or(Error::Format("probe dst alloc failed"))?;
+        .ok_or(Error::Gpu("probe dst alloc failed"))?;
     BufferPool::write_f32(&src, &vec![1.0f32; n]);
 
     let pipeline = ctx.compile_kernel(PROBE_SHADER, MEMCPY_ENTRY)?;
@@ -88,10 +88,10 @@ fn run_memcpy_kernel(
     let cmd = ctx
         .queue
         .commandBuffer()
-        .ok_or(Error::Format("probe cmd buffer failed"))?;
+        .ok_or(Error::Gpu("probe cmd buffer failed"))?;
     let enc = cmd
         .computeCommandEncoder()
-        .ok_or(Error::Format("probe encoder failed"))?;
+        .ok_or(Error::Gpu("probe encoder failed"))?;
     enc.setComputePipelineState(pipeline);
     unsafe {
         enc.setBuffer_offset_atIndex(Some(src), 0, 0);
@@ -181,13 +181,13 @@ fn bench_linear_compute_only(
         let pool = gemm.pool_mut();
         let buf_a = pool
             .allocate(&device, a_bytes)
-            .ok_or(Error::Format("probe buf_a failed"))?;
+            .ok_or(Error::Gpu("probe buf_a failed"))?;
         let buf_w = pool
             .allocate(&device, w_bytes)
-            .ok_or(Error::Format("probe buf_w failed"))?;
+            .ok_or(Error::Gpu("probe buf_w failed"))?;
         let buf_c = pool
             .allocate(&device, c_bytes)
-            .ok_or(Error::Format("probe buf_c failed"))?;
+            .ok_or(Error::Gpu("probe buf_c failed"))?;
         BufferPool::write_f32(&buf_a, &vec![0.01f32; m * k]);
         BufferPool::write_bf16(&buf_w, &vec![0x3f80u16; n * k]);
         BufferPool::write_f32(&buf_c, &vec![0.0f32; m * n]);

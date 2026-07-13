@@ -75,7 +75,7 @@ pub fn stacked_pipeline_for(
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = cache
         .lock()
-        .map_err(|_| Error::Format("tunable stacked pipeline cache poisoned"))?;
+        .map_err(|_| Error::Gpu("tunable stacked pipeline cache poisoned"))?;
     if let Some(pipe) = guard.get(&key) {
         return Ok(std::sync::Arc::clone(pipe));
     }
@@ -198,25 +198,25 @@ pub(crate) fn gpu_sparse_tunable(
 
     let buf_a = pool
         .allocate(&ctx.device, f.a.len() * 4)
-        .ok_or(Error::Format("alloc a"))?;
+        .ok_or(Error::Gpu("alloc a"))?;
     let buf_w = pool
         .allocate(&ctx.device, w_blob.len())
-        .ok_or(Error::Format("alloc w"))?;
+        .ok_or(Error::Gpu("alloc w"))?;
     let buf_c = pool
         .allocate(&ctx.device, out_len * 4)
-        .ok_or(Error::Format("alloc c"))?;
+        .ok_or(Error::Gpu("alloc c"))?;
     let buf_jobs = pool
         .allocate(
             &ctx.device,
             jobs.len() * std::mem::size_of::<BlockGroupedJob>(),
         )
-        .ok_or(Error::Format("alloc jobs"))?;
+        .ok_or(Error::Gpu("alloc jobs"))?;
     let buf_rs = pool
         .allocate(&ctx.device, f.row_starts.len() * 4)
-        .ok_or(Error::Format("alloc rs"))?;
+        .ok_or(Error::Gpu("alloc rs"))?;
     let buf_route = pool
         .allocate(&ctx.device, std::mem::size_of::<RouteScratch>())
-        .ok_or(Error::Format("alloc route"))?;
+        .ok_or(Error::Gpu("alloc route"))?;
     BufferPool::write_f32(&buf_a, &f.a);
     BufferPool::write_bytes(&buf_w, &w_blob);
     BufferPool::write_bytes(&buf_jobs, unsafe {
@@ -249,8 +249,8 @@ pub(crate) fn gpu_sparse_tunable(
         height: 1,
         depth: 1,
     };
-    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+    let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
     enc.setComputePipelineState(&pipe.pipeline);
     crate::shaders::gemm_block_grouped::bind_gpu_buffers(
         &enc,
@@ -292,13 +292,13 @@ pub(crate) fn gpu_dense_tunable_nvfp4(
     let w_nvfp4 = crate::shaders::gemm_nvfp4::w_nvfp4(f);
     let buf_x = pool
         .allocate(&ctx.device, f.m * f.k * 2)
-        .ok_or(Error::Format("alloc x"))?;
+        .ok_or(Error::Gpu("alloc x"))?;
     let buf_y = pool
         .allocate(&ctx.device, f.m * f.n * 2)
-        .ok_or(Error::Format("alloc y"))?;
+        .ok_or(Error::Gpu("alloc y"))?;
     let buf_w = pool
         .allocate(&ctx.device, w_nvfp4.len())
-        .ok_or(Error::Format("alloc w"))?;
+        .ok_or(Error::Gpu("alloc w"))?;
     BufferPool::write_bf16(&buf_x, &bf16::f32_slice_to_bf16_bits(&f.x));
     BufferPool::write_bytes(&buf_w, &w_nvfp4);
     let pipe = pipeline_for(&ctx, f.n as u32, f.k as u32, QuantFormat::NvFp4)?;
@@ -312,8 +312,8 @@ pub(crate) fn gpu_dense_tunable_nvfp4(
         height: 1,
         depth: 1,
     };
-    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+    let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
     enc.setComputePipelineState(&pipe.pipeline);
     crate::shaders::gemm_nvfp4::bind_gpu_buffers(&enc, &buf_x, &buf_y, &buf_w, 0, f.m as u32);
     enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);

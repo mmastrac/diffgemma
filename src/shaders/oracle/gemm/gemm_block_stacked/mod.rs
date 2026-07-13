@@ -46,7 +46,7 @@ pub struct StackedSegFc {
 impl StackedSegFc {
     pub fn from_segments(segs: &[GemmStackedSeg]) -> Result<Self, Error> {
         if segs.is_empty() || segs.len() > 3 {
-            return Err(Error::Format("stacked GEMM supports 1..=3 segments"));
+            return Err(Error::Runtime("stacked GEMM supports 1..=3 segments"));
         }
         let mut w_off = [0u64; 3];
         let mut y_byte_off = [0u64; 3];
@@ -382,7 +382,7 @@ pub fn stacked_pipeline_for(
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = cache
         .lock()
-        .map_err(|_| Error::Format("stacked pipeline cache poisoned"))?;
+        .map_err(|_| Error::Gpu("stacked pipeline cache poisoned"))?;
     if let Some(pipe) = guard.get(&key) {
         return Ok(std::sync::Arc::clone(pipe));
     }
@@ -437,18 +437,18 @@ pub fn gpu_q4(
     let w_q4 = f.w_blob();
     let buf_x = pool
         .allocate(&ctx.device, f.m * f.k * 2)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_y = pool
         .allocate(&ctx.device, f.y_bytes())
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_w = pool
         .allocate(&ctx.device, w_q4.len())
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     BufferPool::write_bf16(&buf_x, &bf16::f32_slice_to_bf16_bits(&f.x));
     BufferPool::write_bytes(&buf_w, &w_q4);
     let (grid, tg) = gemm_common::dispatch_shape(f.m, f.n_total());
-    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+    let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
     enc.setComputePipelineState(&pipeline.pipeline);
     bind_gpu_buffers(&enc, &buf_x, &buf_y, &buf_w, f.m as u32);
     enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
@@ -479,21 +479,21 @@ pub fn gpu_q4_split(f: &StackedFixture) -> Result<Vec<f32>, Error> {
     let blob = f.w_blob();
     let buf_x = pool
         .allocate(&ctx.device, f.m * f.k * 2)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_y = pool
         .allocate(&ctx.device, f.y_bytes())
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_w = pool
         .allocate(&ctx.device, blob.len())
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     BufferPool::write_bf16(&buf_x, &bf16::f32_slice_to_bf16_bits(&f.x));
     BufferPool::write_bytes(&buf_w, &blob);
     let segs = f.gpu_segments();
     for (s, seg) in f.segments.iter().zip(segs.iter()) {
         let pipeline = gemm_q4::pipeline_for(&ctx, s.n as u32, f.k as u32)?;
         let (grid, tg) = gemm_common::dispatch_shape(f.m, s.n);
-        let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-        let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+        let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+        let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
         enc.setComputePipelineState(&pipeline.pipeline);
         unsafe {
             enc.setBuffer_offset_atIndex(Some(&buf_x), 0, 0);

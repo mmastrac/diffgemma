@@ -71,7 +71,7 @@ pub fn lm_head_tied_q8_gpu_buf(
     let total = seq_len * vocab_size;
     let buf_logits = logits
         .as_buf()
-        .ok_or(Error::Format("gpu logits buffer not allocated"))?;
+        .ok_or(Error::Gpu("gpu logits buffer not allocated"))?;
     zero_logits_buf(batch, kernels, buf_logits, total)?;
     let buf_a = batch.alloc_f32(hidden)?;
 

@@ -29,7 +29,7 @@ pub fn prefill_gpu(
     let text = &cfg.text_config;
     let seq_len = input.token_ids.len();
     if seq_len == 0 {
-        return Err(Error::Format("prefill requires at least one token"));
+        return Err(Error::Runtime("prefill requires at least one token"));
     }
     let hidden = text.hidden_size;
     let embed_scale = (hidden as f32).sqrt();
@@ -38,7 +38,7 @@ pub fn prefill_gpu(
     let mut gpu_kv = dec_scratch
         .gpu_kv
         .take()
-        .ok_or(Error::Format("gpu kv cache missing"))?;
+        .ok_or(Error::Gpu("gpu kv cache missing"))?;
     gpu_kv.reset_len();
 
     if let Some(embed) = weights.embed_q8() {
@@ -234,7 +234,7 @@ pub fn extend_prefill_gpu(
     let mut gpu_kv = dec_scratch
         .gpu_kv
         .take()
-        .ok_or(Error::Format("gpu kv cache missing"))?;
+        .ok_or(Error::Gpu("gpu kv cache missing"))?;
     let text = &cfg.text_config;
     let seq_len = token_ids.len();
     if seq_len == 0 {
@@ -244,7 +244,7 @@ pub fn extend_prefill_gpu(
     let embed_scale = (hidden as f32).sqrt();
     let kv_len_before = gpu_kv.kv_len;
     if kv_len_before != kv_cache.kv_len {
-        return Err(Error::Format("gpu/cpu kv_len mismatch"));
+        return Err(Error::Gpu("gpu/cpu kv_len mismatch"));
     }
 
     if let Some(embed) = weights.embed_q8() {

@@ -1098,7 +1098,7 @@ impl StepPipelines {
     fn dense_nvfp4(&self, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
         self.gemm_tunable_nvfp4
             .get(&(n, k))
-            .ok_or(Error::Format("missing tunable nvfp4 dense pipeline"))
+            .ok_or(Error::Gpu("missing tunable nvfp4 dense pipeline"))
     }
 
     /// Tunable block-sparse pipeline (q4/q6 experts) if built (DGQ_GEMM_TUNABLE).
@@ -1130,14 +1130,14 @@ impl StepPipelines {
     fn q8_rowk_xfp16(&self, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
         self.gemm_q8_rowk_xfp16
             .get(&(n, k))
-            .ok_or(Error::Format("missing q8 rowk fp16-input pipeline"))
+            .ok_or(Error::Gpu("missing q8 rowk fp16-input pipeline"))
     }
 
     #[allow(dead_code)]
     fn q8_rowk(&self, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
         self.gemm_q8_rowk
             .get(&(n, k))
-            .ok_or(Error::Format("missing q8 rowk pipeline"))
+            .ok_or(Error::Gpu("missing q8 rowk pipeline"))
     }
 
     fn block_gemm(&self, format: QuantFormat, n: u32, k: u32) -> Result<&ComputePipeline, Error> {
@@ -1883,7 +1883,7 @@ impl StepEnc<'_> {
             .ps
             .gemm_q8_rowk_acc_f32
             .get(&(n, k))
-            .ok_or(Error::Format("missing gemm_q8_rowk_acc_f32 pipeline"))?;
+            .ok_or(Error::Gpu("missing gemm_q8_rowk_acc_f32 pipeline"))?;
         self.sink_set_pipeline(ps);
         self.sink_set_buffer(&self.bufs.sc_probs, 0, 0);
         self.sink_set_buffer(y_buf, 0, 1);
@@ -1917,7 +1917,7 @@ impl StepEnc<'_> {
             .ps
             .gemm_bf16_rowk_acc_f32
             .get(&(n, k))
-            .ok_or(Error::Format("missing gemm_bf16_rowk_acc_f32 pipeline"))?;
+            .ok_or(Error::Gpu("missing gemm_bf16_rowk_acc_f32 pipeline"))?;
         self.sink_set_pipeline(ps);
         self.sink_set_buffer(&self.bufs.sc_probs, 0, 0);
         self.sink_set_buffer(y_buf, 0, 1);
@@ -3948,7 +3948,7 @@ fn alloc_buffer(
 ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
     device
         .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
-        .ok_or(Error::Format("Metal buffer alloc failed"))
+        .ok_or(Error::Gpu("Metal buffer alloc failed"))
 }
 
 /// Keepalive + auto-cleanup for a `DGQ_KV_MMAP` file-backed KV buffer. Holds the
@@ -3998,7 +3998,7 @@ fn alloc_kv_buffer(
     file.set_len(len as u64)?;
     let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file)? };
     let ptr = std::ptr::NonNull::new(mmap.as_mut_ptr() as *mut std::ffi::c_void)
-        .ok_or(Error::Format("kv mmap null pointer"))?;
+        .ok_or(Error::Runtime("kv mmap null pointer"))?;
     let buffer = unsafe {
         device
             .newBufferWithBytesNoCopy_length_options_deallocator(
@@ -4007,7 +4007,7 @@ fn alloc_kv_buffer(
                 MTLResourceOptions::StorageModeShared,
                 None,
             )
-            .ok_or(Error::Format("kv mmap buffer alloc failed"))?
+            .ok_or(Error::Gpu("kv mmap buffer alloc failed"))?
     };
     eprintln!(
         "kv cache: mmap-backed ({:.2} GiB) at {}",
@@ -4427,12 +4427,12 @@ impl StepRuntime {
                 .ps
                 .kv_f32_side_hydrate
                 .clone()
-                .ok_or(Error::Format("kv_f32_side_hydrate pipeline missing"))?;
+                .ok_or(Error::Gpu("kv_f32_side_hydrate pipeline missing"))?;
             let sbuf = enc
                 .bufs
                 .kv_f32_side
                 .clone()
-                .ok_or(Error::Format("kv_f32_side buffer missing"))?;
+                .ok_or(Error::Runtime("kv_f32_side buffer missing"))?;
             for layer in 0..layers {
                 let l = &layout.layers[layer];
                 let slots = if l.kv_ring_mask != 0 {
@@ -4699,7 +4699,7 @@ impl StepRuntime {
         let (finite, max_abs) = half_buffer_stats(&self.bufs.logits, 0, CANVAS * VOCAB, sample);
         if !finite {
             eprintln!("non-finite logits (max_abs={max_abs:.4}, sample={sample})");
-            return Err(Error::Format("non-finite logits"));
+            return Err(Error::Runtime("non-finite logits"));
         }
         Ok(())
     }
@@ -4720,7 +4720,7 @@ impl StepRuntime {
             .ctx
             .queue
             .commandBuffer()
-            .ok_or(Error::Format("command buffer alloc failed"))?;
+            .ok_or(Error::Gpu("command buffer alloc failed"))?;
         let ps: &StepPipelines = if self.arena_f16_mode {
             self.pipelines_prefill_f16.unwrap_or(self.pipelines)
         } else {
@@ -4736,7 +4736,7 @@ impl StepRuntime {
         let mut enc = StepEnc {
             enc: cmd
                 .computeCommandEncoder()
-                .ok_or(Error::Format("compute encoder alloc failed"))?,
+                .ok_or(Error::Gpu("compute encoder alloc failed"))?,
             ctx: &self.ctx,
             ps,
             bufs: &self.bufs,
@@ -5171,7 +5171,7 @@ fn shared_step_pipelines(
     let cache = STEP_PIPELINES_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let mut guard = cache
         .lock()
-        .map_err(|_| Error::Format("step pipelines cache poisoned"))?;
+        .map_err(|_| Error::Gpu("step pipelines cache poisoned"))?;
     if let Some(&pipelines) = guard.get(&key) {
         return Ok(pipelines);
     }
@@ -5455,7 +5455,7 @@ pub fn build_step_runtime(
                 layers,
             )?;
             if kv_len as u32 != prefill_len {
-                return Err(Error::Format("prefill kv_len mismatch"));
+                return Err(Error::Runtime("prefill kv_len mismatch"));
             }
             eprintln!("step-kernel: prefilled kv_len={kv_len} tokens");
         }
@@ -5505,7 +5505,7 @@ pub fn build_step_runtime(
             let started = Instant::now();
             let kv_len = rt.prefill_chunks(token_ids)?;
             if kv_len as u32 != prefill_len {
-                return Err(Error::Format("fast-prefill kv_len mismatch"));
+                return Err(Error::Runtime("fast-prefill kv_len mismatch"));
             }
             if crate::flags::progress_enabled() {
                 eprintln!(

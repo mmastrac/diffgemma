@@ -129,13 +129,13 @@ fn gpu_affine(fix: &Fixture, variant: KernelVariant, affine: bool) -> Result<Vec
     let len = fix.out_len();
     let buf_x = pool
         .allocate(&ctx.device, len * 4)
-        .ok_or(Error::Format("buffer alloc failed"))?;
+        .ok_or(Error::Gpu("buffer alloc failed"))?;
     let buf_w = pool
         .allocate(&ctx.device, fix.hidden * 4)
-        .ok_or(Error::Format("buffer alloc failed"))?;
+        .ok_or(Error::Gpu("buffer alloc failed"))?;
     let buf_o = pool
         .allocate(&ctx.device, len * 4)
-        .ok_or(Error::Format("buffer alloc failed"))?;
+        .ok_or(Error::Gpu("buffer alloc failed"))?;
     let dump_bytes = if variant.dump_stage > 0 {
         fix.seq_len * 4
     } else {
@@ -143,7 +143,7 @@ fn gpu_affine(fix: &Fixture, variant: KernelVariant, affine: bool) -> Result<Vec
     };
     let buf_dump = pool
         .allocate(&ctx.device, dump_bytes)
-        .ok_or(Error::Format("buffer alloc failed"))?;
+        .ok_or(Error::Gpu("buffer alloc failed"))?;
 
     BufferPool::write_f32(&buf_x, &fix.x);
     BufferPool::write_f32(&buf_w, &fix.weight);
@@ -152,10 +152,10 @@ fn gpu_affine(fix: &Fixture, variant: KernelVariant, affine: bool) -> Result<Vec
     let cmd = ctx
         .queue
         .commandBuffer()
-        .ok_or(Error::Format("command buffer failed"))?;
+        .ok_or(Error::Gpu("command buffer failed"))?;
     let enc = cmd
         .computeCommandEncoder()
-        .ok_or(Error::Format("encoder failed"))?;
+        .ok_or(Error::Gpu("encoder failed"))?;
     enc.setComputePipelineState(&pipeline.pipeline);
     unsafe {
         enc.setBuffer_offset_atIndex(Some(&buf_x), 0, 0);

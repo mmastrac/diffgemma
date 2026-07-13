@@ -111,7 +111,7 @@ pub fn align_offset(offset: u64) -> u64 {
 /// Convert a `.dgq` blob byte offset for host pointer / MTL buffer slicing.
 /// NVFP4 blobs can exceed `u32::MAX`; never truncate to u32 before this call.
 pub fn blob_offset_usize(off: u64) -> Result<usize, Error> {
-    usize::try_from(off).map_err(|_| Error::Format("dgq blob offset exceeds host address space"))
+    usize::try_from(off).map_err(|_| Error::Runtime("dgq blob offset exceeds host address space"))
 }
 
 /// `(start, end)` byte indices into a blob slice, with bounds checks.
@@ -120,10 +120,10 @@ pub fn blob_slice_range(off: u64, len: u64, blob_len: u64) -> Result<(usize, usi
     let len_usize = blob_offset_usize(len)?;
     let end = start
         .checked_add(len_usize)
-        .ok_or(Error::Format("dgq tensor slice overflow"))?;
+        .ok_or(Error::Runtime("dgq tensor slice overflow"))?;
     let blob_end = blob_offset_usize(blob_len)?;
     if end > blob_end {
-        return Err(Error::Format("dgq tensor extends past blob"));
+        return Err(Error::Runtime("dgq tensor extends past blob"));
     }
     Ok((start, end))
 }

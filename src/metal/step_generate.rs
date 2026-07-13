@@ -500,7 +500,7 @@ pub fn generate_with_session(
     prompt_label: &str,
 ) -> Result<GenerateOutput, Error> {
     if prompt_token_ids.is_empty() {
-        return Err(Error::Format("generate requires a non-empty prompt"));
+        return Err(Error::Runtime("generate requires a non-empty prompt"));
     }
     let canvas_len = CANVAS;
     let layers = session.layers;

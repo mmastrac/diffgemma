@@ -44,9 +44,9 @@ pub fn dequant_embed_row_cpu(
     let row = token as usize;
     let end = (row + 1)
         .checked_mul(row_bytes)
-        .ok_or(Error::Format("embed row overflow"))?;
+        .ok_or(Error::Runtime("embed row overflow"))?;
     if end > src.len() {
-        return Err(Error::Format("embed token out of range"));
+        return Err(Error::Runtime("embed token out of range"));
     }
     let row_src = &src[row * row_bytes..end];
     let scale_bits = u16::from_le_bytes([row_src[0], row_src[1]]);
@@ -68,7 +68,7 @@ pub fn load_bf16_embed_row(
     let row = token as usize;
     let base = row * hidden;
     if base + hidden > bf16.len() {
-        return Err(Error::Format("embed token out of range in bf16 ref"));
+        return Err(Error::Runtime("embed token out of range in bf16 ref"));
     }
     let bytes = bf16.as_bytes();
     let mut out = vec![0.0f32; hidden];

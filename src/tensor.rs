@@ -43,7 +43,7 @@ impl<'a> TensorView<'a> {
             .iter()
             .map(|&d| {
                 if d < 0 {
-                    Err(Error::Format("negative dimension"))
+                    Err(Error::Runtime("negative dimension"))
                 } else {
                     Ok(d as usize)
                 }

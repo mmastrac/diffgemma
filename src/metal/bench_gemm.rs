@@ -47,7 +47,7 @@ pub fn parse_shapes(spec: &str) -> Result<Vec<GemmShape>, Error> {
         });
     }
     if out.is_empty() {
-        return Err(Error::Format("bench-gemm: no shapes"));
+        return Err(Error::Runtime("bench-gemm: no shapes"));
     }
     Ok(out)
 }
@@ -112,20 +112,20 @@ pub fn bench_gemm_block_q4(shapes: &[GemmShape], iters: usize) -> Result<Vec<Gem
         let w_q4 = gemm_q4::w_q4(&fixture);
         let buf_x = pool
             .allocate(&ctx.device, m * k * 2)
-            .ok_or(Error::Format("bench gemm_block x"))?;
+            .ok_or(Error::Gpu("bench gemm_block x"))?;
         let buf_y = pool
             .allocate(&ctx.device, m * n * 2)
-            .ok_or(Error::Format("bench gemm_block y"))?;
+            .ok_or(Error::Gpu("bench gemm_block y"))?;
         let buf_w = pool
             .allocate(&ctx.device, w_q4.len())
-            .ok_or(Error::Format("bench gemm_block w"))?;
+            .ok_or(Error::Gpu("bench gemm_block w"))?;
         BufferPool::write_bf16(&buf_x, &bf16::f32_slice_to_bf16_bits(&fixture.x));
         BufferPool::write_bytes(&buf_w, &w_q4);
         let (grid, tg) = gemm_common::dispatch_shape(m, n);
 
         let dispatch = |count: usize| -> Result<(), Error> {
-            let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-            let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+            let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+            let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
             for _ in 0..count {
                 enc.setComputePipelineState(&pipeline.pipeline);
                 gemm_q4::bind_gpu_buffers(&enc, &buf_x, &buf_y, &buf_w, 0, m as u32);
@@ -191,24 +191,24 @@ pub fn bench_gemm_tunable(shapes: &[GemmShape], iters: usize) -> Result<Vec<Gemm
         let w_q4 = gemm_q4::w_q4(&fixture);
         let buf_x = pool
             .allocate(&ctx.device, m * k * 2)
-            .ok_or(Error::Format("bench tunable x"))?;
+            .ok_or(Error::Runtime("bench tunable x"))?;
         let buf_y = pool
             .allocate(&ctx.device, m * n * 2)
-            .ok_or(Error::Format("bench tunable y"))?;
+            .ok_or(Error::Runtime("bench tunable y"))?;
         let buf_ref = pool
             .allocate(&ctx.device, m * n * 2)
-            .ok_or(Error::Format("bench tunable ref"))?;
+            .ok_or(Error::Runtime("bench tunable ref"))?;
         let buf_w = pool
             .allocate(&ctx.device, w_q4.len())
-            .ok_or(Error::Format("bench tunable w"))?;
+            .ok_or(Error::Runtime("bench tunable w"))?;
         BufferPool::write_bf16(&buf_x, &bf16::f32_slice_to_bf16_bits(&fixture.x));
         BufferPool::write_bytes(&buf_w, &w_q4);
 
         // Reference output from the production kernel.
         {
             let ref_pipe = gemm_q4::pipeline_for(&ctx, n as u32, k as u32)?;
-            let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-            let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+            let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+            let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
             enc.setComputePipelineState(&ref_pipe.pipeline);
             gemm_q4::bind_gpu_buffers(&enc, &buf_x, &buf_ref, &buf_w, 0, m as u32);
             let (rgrid, rtg) = crate::shaders::gemm_common::dispatch_shape(m, n);
@@ -240,8 +240,8 @@ pub fn bench_gemm_tunable(shapes: &[GemmShape], iters: usize) -> Result<Vec<Gemm
                 depth: 1,
             };
             let dispatch = |count: usize| -> Result<(), Error> {
-                let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-                let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+                let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+                let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
                 for _ in 0..count {
                     enc.setComputePipelineState(&pipeline.pipeline);
                     gemm_q4::bind_gpu_buffers(&enc, &buf_x, &buf_y, &buf_w, 0, m as u32);
@@ -294,12 +294,12 @@ pub fn bench_gemm_tunable(shapes: &[GemmShape], iters: usize) -> Result<Vec<Gemm
             let w_bits = bf16::f32_slice_to_bf16_bits(&fixture.w_f32);
             let buf_wr = pool
                 .allocate(&ctx.device, w_bits.len() * 2)
-                .ok_or(Error::Format("bench tunable wraw"))?;
+                .ok_or(Error::Runtime("bench tunable wraw"))?;
             BufferPool::write_bf16(&buf_wr, &w_bits);
             {
                 let ref_pipe = crate::shaders::gemm_bf16::pipeline_for(&ctx, n as u32, k as u32)?;
-                let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-                let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+                let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+                let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
                 enc.setComputePipelineState(&ref_pipe.pipeline);
                 gemm_q4::bind_gpu_buffers(&enc, &buf_x, &buf_ref, &buf_wr, 0, m as u32);
                 let (rgrid, rtg) = crate::shaders::gemm_common::dispatch_shape(m, n);
@@ -329,8 +329,8 @@ pub fn bench_gemm_tunable(shapes: &[GemmShape], iters: usize) -> Result<Vec<Gemm
                 depth: 1,
             };
             let dispatch = |count: usize| -> Result<(), Error> {
-                let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-                let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+                let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+                let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
                 for _ in 0..count {
                     enc.setComputePipelineState(&pipeline.pipeline);
                     gemm_q4::bind_gpu_buffers(&enc, &buf_x, &buf_y, &buf_wr, 0, m as u32);
@@ -409,8 +409,8 @@ pub fn bench_gemm_bf16(shapes: &[GemmShape], iters: usize) -> Result<Vec<GemmBen
         let (grid, tg) = gemm_common::dispatch_shape(m, n);
 
         let dispatch = |count: usize| -> Result<(), Error> {
-            let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-            let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+            let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+            let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
             for _ in 0..count {
                 enc.setComputePipelineState(&pipeline.pipeline);
                 gemm_q8::bind_gpu_buffers(&enc, &buf_x, &buf_y, &buf_w, 0, m as u32);
@@ -478,13 +478,13 @@ fn bench_resident(
         let pool = gemm.pool_mut();
         let buf_a = pool
             .allocate(&device, a_bytes)
-            .ok_or(Error::Format("bench buf_a failed"))?;
+            .ok_or(Error::Gpu("bench buf_a failed"))?;
         let buf_w = pool
             .allocate(&device, w_bytes)
-            .ok_or(Error::Format("bench buf_w failed"))?;
+            .ok_or(Error::Gpu("bench buf_w failed"))?;
         let buf_c = pool
             .allocate(&device, c_bytes)
-            .ok_or(Error::Format("bench buf_c failed"))?;
+            .ok_or(Error::Gpu("bench buf_c failed"))?;
         BufferPool::write_f32(&buf_a, &vec![0.01f32; m * k]);
         BufferPool::write_bf16(&buf_w, &vec![0x3f80u16; n * k]);
         BufferPool::write_f32(&buf_c, &vec![0.0f32; m * n]);
@@ -544,12 +544,12 @@ pub fn bench_mpsgraph_oracle(
             .map_err(Error::Io)?;
         if !out.status.success() {
             eprintln!("{}", String::from_utf8_lossy(&out.stderr));
-            return Err(Error::Format("mps oracle swift failed"));
+            return Err(Error::Gpu("mps oracle swift failed"));
         }
         let gflops: f64 = String::from_utf8_lossy(&out.stdout)
             .trim()
             .parse()
-            .map_err(|_| Error::Format("mps oracle bad stdout"))?;
+            .map_err(|_| Error::Gpu("mps oracle bad stdout"))?;
         rows.push(GemmBenchRow {
             shape,
             label: "mps/matmul".into(),
@@ -621,7 +621,7 @@ pub fn bench_gemm_tunable_sparse(iters: usize) -> Result<Vec<GemmBenchRow>, Erro
         }
         let buf_w = pool
             .allocate(&ctx.device, blob.len())
-            .ok_or(Error::Format("sparse bench w"))?;
+            .ok_or(Error::Runtime("sparse bench w"))?;
         BufferPool::write_bytes(&buf_w, &blob);
         drop(blob);
 
@@ -637,7 +637,7 @@ pub fn bench_gemm_tunable_sparse(iters: usize) -> Result<Vec<GemmBenchRow>, Erro
                 &ctx.device,
                 jobs.len() * std::mem::size_of::<BlockGroupedJob>(),
             )
-            .ok_or(Error::Format("sparse bench jobs"))?;
+            .ok_or(Error::Runtime("sparse bench jobs"))?;
         BufferPool::write_bytes(&buf_jobs, unsafe {
             std::slice::from_raw_parts(
                 jobs.as_ptr().cast::<u8>(),
@@ -654,24 +654,24 @@ pub fn bench_gemm_tunable_sparse(iters: usize) -> Result<Vec<GemmBenchRow>, Erro
                 .collect();
             let buf_a = pool
                 .allocate(&ctx.device, a.len() * 4)
-                .ok_or(Error::Format("sparse bench a"))?;
+                .ok_or(Error::Runtime("sparse bench a"))?;
             BufferPool::write_f32(&buf_a, &a);
             drop(a);
 
             let row_starts: Vec<u32> = (0..=N_EXPERTS).map(|e| (e * rpe) as u32).collect();
             let buf_rs = pool
                 .allocate(&ctx.device, row_starts.len() * 4)
-                .ok_or(Error::Format("sparse bench rs"))?;
+                .ok_or(Error::Runtime("sparse bench rs"))?;
             BufferPool::write_bytes(&buf_rs, unsafe {
                 std::slice::from_raw_parts(row_starts.as_ptr().cast::<u8>(), row_starts.len() * 4)
             });
 
             let buf_c = pool
                 .allocate(&ctx.device, slots * n * 4)
-                .ok_or(Error::Format("sparse bench c"))?;
+                .ok_or(Error::Runtime("sparse bench c"))?;
             let buf_route = pool
                 .allocate(&ctx.device, std::mem::size_of::<RouteScratch>())
-                .ok_or(Error::Format("sparse bench route"))?;
+                .ok_or(Error::Runtime("sparse bench route"))?;
 
             // Route with block list at height `bm` (bucket_fill phase 1 mirror).
             let write_route = |bm: usize| -> u32 {
@@ -727,8 +727,8 @@ pub fn bench_gemm_tunable_sparse(iters: usize) -> Result<Vec<GemmBenchRow>, Erro
                     depth: 1,
                 };
                 let dispatch = |count: usize| -> Result<(), Error> {
-                    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-                    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+                    let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+                    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
                     for _ in 0..count {
                         enc.setComputePipelineState(&pipe.pipeline);
                         crate::shaders::gemm_block_grouped::bind_gpu_buffers(

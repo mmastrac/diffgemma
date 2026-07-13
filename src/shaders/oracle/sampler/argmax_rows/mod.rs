@@ -91,10 +91,10 @@ pub fn gpu(f: &Fixture) -> Result<Vec<f32>, Error> {
     let out_bytes = f.rows * 4;
     let buf_in = pool
         .allocate(&ctx.device, in_bytes)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_out = pool
         .allocate(&ctx.device, out_bytes)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     BufferPool::write_f32(&buf_in, &f.logits);
 
     let dims = [f.rows as u32, f.cols as u32];

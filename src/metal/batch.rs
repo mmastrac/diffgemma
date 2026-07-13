@@ -39,10 +39,10 @@ impl<'a> GpuBatch<'a> {
     ) -> Result<GpuBatch<'a>, Error> {
         let cmd = queue
             .commandBuffer()
-            .ok_or(Error::Format("Metal command buffer alloc failed"))?;
+            .ok_or(Error::Gpu("Metal command buffer alloc failed"))?;
         let enc = cmd
             .computeCommandEncoder()
-            .ok_or(Error::Format("Metal compute encoder alloc failed"))?;
+            .ok_or(Error::Gpu("Metal compute encoder alloc failed"))?;
         Ok(Self {
             pool,
             device,
@@ -133,7 +133,7 @@ impl<'a> GpuBatch<'a> {
         let buf = self
             .pool
             .allocate(self.device, bytes)
-            .ok_or(Error::Format("Metal buffer alloc failed"))?;
+            .ok_or(Error::Gpu("Metal buffer alloc failed"))?;
         BufferPool::write_f32(&buf, data);
         self.track_release(bytes, buf.clone());
         Ok(buf)
@@ -147,7 +147,7 @@ impl<'a> GpuBatch<'a> {
         let buf = self
             .pool
             .allocate(self.device, bytes)
-            .ok_or(Error::Format("Metal buffer alloc failed"))?;
+            .ok_or(Error::Gpu("Metal buffer alloc failed"))?;
         // Pooled buffers may hold stale bytes; zero so partial kernel coverage cannot leak.
         unsafe {
             let ptr = buf.contents().as_ptr() as *mut u8;
@@ -172,7 +172,7 @@ impl<'a> GpuBatch<'a> {
         let buf = self
             .pool
             .allocate(self.device, bytes)
-            .ok_or(Error::Format("Metal buffer alloc failed"))?;
+            .ok_or(Error::Gpu("Metal buffer alloc failed"))?;
         BufferPool::write_bytes(&buf, data);
         self.track_release(bytes, buf.clone());
         Ok(buf)
@@ -186,7 +186,7 @@ impl<'a> GpuBatch<'a> {
         let buf = self
             .pool
             .allocate(self.device, bytes)
-            .ok_or(Error::Format("Metal buffer alloc failed"))?;
+            .ok_or(Error::Gpu("Metal buffer alloc failed"))?;
         BufferPool::write_i64(&buf, data);
         self.track_release(bytes, buf.clone());
         Ok(buf)

@@ -113,7 +113,9 @@ fn single_expert_cpu_ref(
     let ctx = MetalContext::new()?;
     let cache = GpuDecoderWeightCache::load(&store, &text, 0, &ctx.device)?;
     if !cache.is_dgq() {
-        return Err(Error::Format("single-expert cpu ref requires .dgq weights"));
+        return Err(Error::Runtime(
+            "single-expert cpu ref requires .dgq weights",
+        ));
     }
 
     let mut moe_in = vec![0.0f32; CANVAS * HID];

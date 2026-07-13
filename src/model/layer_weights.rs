@@ -82,7 +82,7 @@ impl DecoderLayerShapes {
         let layer_type = cfg
             .layer_types
             .get(layer)
-            .ok_or(Error::Format("invalid layer index"))?;
+            .ok_or(Error::Runtime("invalid layer index"))?;
         let h = cfg.hidden_size as i64;
         let (head_dim, n_kv) = match layer_type {
             LayerType::SlidingAttention => (cfg.head_dim, cfg.num_key_value_heads),

@@ -192,13 +192,13 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let grid = out_len;
     let buf_src = pool
         .allocate(&ctx.device, f.src.len() * 4)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_idx = pool
         .allocate(&ctx.device, f.indices.len() * 4)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_dst = pool
         .allocate(&ctx.device, out_len * 4)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let dump_bytes = if variant.dump_stage > 0 {
         out_len * 4
     } else {
@@ -206,7 +206,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     };
     let buf_d = pool
         .allocate(&ctx.device, dump_bytes)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     BufferPool::write_f32(&buf_src, &f.src);
     let idx_bytes =
         unsafe { std::slice::from_raw_parts(f.indices.as_ptr().cast::<u8>(), f.indices.len() * 4) };

@@ -34,7 +34,7 @@ impl GpuLogitsBuf {
         if self.cap < len || self.buf.is_none() {
             self.buf = Some(
                 pool.allocate(device, bytes)
-                    .ok_or(Error::Format("Metal logits buffer alloc failed"))?,
+                    .ok_or(Error::Gpu("Metal logits buffer alloc failed"))?,
             );
             self.cap = len;
         }

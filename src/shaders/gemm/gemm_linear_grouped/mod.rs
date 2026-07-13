@@ -242,22 +242,22 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
 
     let buf_a = pool
         .allocate(&ctx.device, f.a.len() * 4)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_w = pool
         .allocate(&ctx.device, w_blob.len())
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_c = pool
         .allocate(&ctx.device, out_len * 4)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_jobs = pool
         .allocate(
             &ctx.device,
             jobs.len() * std::mem::size_of::<BlockGroupedJob>(),
         )
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_rs = pool
         .allocate(&ctx.device, f.row_starts.len() * 4)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
 
     BufferPool::write_f32(&buf_a, &f.a);
     BufferPool::write_bytes(&buf_w, &w_blob);
@@ -282,8 +282,8 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         height: 1,
         depth: 1,
     };
-    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+    let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
     enc.setComputePipelineState(&pipeline.pipeline);
     bind_gpu_buffers(
         &enc,
@@ -323,19 +323,19 @@ pub fn gpu_on_blob(
 
     let buf_a = pool
         .allocate(&ctx.device, p.a.len() * 4)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_c = pool
         .allocate(&ctx.device, out_len * 4)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_jobs = pool
         .allocate(
             &ctx.device,
             p.jobs.len() * std::mem::size_of::<BlockGroupedJob>(),
         )
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_rs = pool
         .allocate(&ctx.device, p.row_starts.len() * 4)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
 
     BufferPool::write_f32(&buf_a, p.a);
     BufferPool::write_f32(&buf_c, &vec![0.0f32; out_len]);
@@ -359,8 +359,8 @@ pub fn gpu_on_blob(
         height: 1,
         depth: 1,
     };
-    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+    let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
     enc.setComputePipelineState(&pipeline.pipeline);
     bind_gpu_buffers(
         &enc,

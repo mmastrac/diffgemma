@@ -247,7 +247,7 @@ fn forward_inner(
                 &mut scratch.cpu.sc_signal,
             )?;
         } else {
-            return Err(Error::Format("gpu sc logits missing"));
+            return Err(Error::Gpu("gpu sc logits missing"));
         }
     } else if let Some(logits) = input.self_conditioning_logits {
         if let Some(embed_q8) = weights.embed_q8() {
@@ -389,7 +389,7 @@ fn forward_inner(
                     input
                         .kv_cache
                         .layer(layer)
-                        .ok_or(Error::Format("missing kv layer"))?,
+                        .ok_or(Error::Runtime("missing kv layer"))?,
                     input.kv_cache.kv_len,
                 ),
                 mask,
@@ -531,12 +531,12 @@ fn forward_inner(
                 )?;
                 batch.end()?;
             } else {
-                return Err(Error::Format("gpu sampler requires .dgq embed"));
+                return Err(Error::Runtime("gpu sampler requires .dgq embed"));
             }
         } else if let Some(out) = input.logits_out.as_mut() {
             let need = seq_len * vocab;
             if out.len() != need {
-                return Err(Error::Format("logits_out length mismatch"));
+                return Err(Error::Runtime("logits_out length mismatch"));
             }
             if let Some(embed_q8) = weights.embed_q8() {
                 use crate::metal::batch::begin_engine_batch;

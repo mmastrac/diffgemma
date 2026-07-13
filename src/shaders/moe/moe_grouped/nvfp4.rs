@@ -148,26 +148,26 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let moe_in_f16 = bf16::f32_slice_to_bf16_bits(&f.moe_in);
     let buf_in = pool
         .allocate(&ctx.device, moe_in_f16.len() * 2)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let route = f.route_scratch();
     let slots = route.num_slots as usize;
     let slot_elems = slots * f.hidden;
     let buf_slots = pool
         .allocate(&ctx.device, slot_elems * 4)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_out = pool
         .allocate(&ctx.device, f.out_len() * 4)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let blob = f.nvfp4_blob();
     let buf_blob = pool
         .allocate(&ctx.device, blob.len())
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_layer = pool
         .allocate(&ctx.device, std::mem::size_of::<LayerOffsets>())
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_route = pool
         .allocate(&ctx.device, std::mem::size_of::<RouteScratch>())
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
 
     BufferPool::write_bf16(&buf_in, &moe_in_f16);
     BufferPool::write_f32(&buf_slots, &vec![0.0f32; slot_elems]);
@@ -189,8 +189,8 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     });
 
     let dims = f.dims();
-    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+    let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
     enc.setComputePipelineState(&pipeline.pipeline);
     unsafe {
         enc.setBuffer_offset_atIndex(Some(&buf_in), 0, 0);

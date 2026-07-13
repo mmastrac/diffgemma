@@ -126,7 +126,7 @@ fn dequant_q8_tensor(src: &[u8], shape: &[i64], dst: &mut [f32]) -> Result<(), E
 fn dequant_raw_tensor(src: &[u8], shape: &[i64], dst: &mut [f32]) -> Result<(), Error> {
     let numel: usize = shape.iter().product::<i64>() as usize;
     if dst.len() != numel {
-        return Err(Error::Format("raw dst numel mismatch"));
+        return Err(Error::Runtime("raw dst numel mismatch"));
     }
     if src.len() == numel * 4 {
         for (i, chunk) in src.chunks_exact(4).enumerate() {
@@ -145,7 +145,7 @@ fn dequant_raw_tensor(src: &[u8], shape: &[i64], dst: &mut [f32]) -> Result<(), 
         }
         Ok(())
     } else {
-        Err(Error::Format("raw element size mismatch"))
+        Err(Error::Runtime("raw element size mismatch"))
     }
 }
 

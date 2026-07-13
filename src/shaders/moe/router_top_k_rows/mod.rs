@@ -99,16 +99,16 @@ pub fn gpu(fix: &Fixture, variant: KernelVariant) -> Result<RouteOut, Error> {
     let out_len = fix.out_indices_len();
     let buf_p = pool
         .allocate(&ctx.device, prob_len * 4)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_s = pool
         .allocate(&ctx.device, fix.experts * 4)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_i = pool
         .allocate(&ctx.device, out_len * 4)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_w = pool
         .allocate(&ctx.device, out_len * 4)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let dump_bytes = if variant.dump_stage > 0 {
         fix.rows * 8
     } else {
@@ -116,13 +116,13 @@ pub fn gpu(fix: &Fixture, variant: KernelVariant) -> Result<RouteOut, Error> {
     };
     let buf_dump = pool
         .allocate(&ctx.device, dump_bytes)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
 
     BufferPool::write_f32(&buf_p, &fix.probs);
     BufferPool::write_f32(&buf_s, &fix.per_expert_scale);
 
-    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+    let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
     enc.setComputePipelineState(&pipeline.pipeline);
     let params = [fix.rows as u32, fix.experts as u32, fix.top_k as u32];
     bind_gpu_buffers(&enc, &buf_p, &buf_s, &buf_i, &buf_w, &buf_dump, &params);

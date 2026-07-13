@@ -215,7 +215,7 @@ pub fn gather_rows_gpu(
 ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
     let batch_size = indices.len();
     if batch_size == 0 {
-        return Err(Error::Format("gather_rows empty batch"));
+        return Err(Error::Runtime("gather_rows empty batch"));
     }
     let idx_bytes =
         unsafe { std::slice::from_raw_parts(indices.as_ptr().cast::<u8>(), batch_size * 4) };

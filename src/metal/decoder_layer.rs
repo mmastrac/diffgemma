@@ -626,7 +626,7 @@ impl PrefillResidentBufs {
             engine
                 .pool
                 .allocate(&engine.ctx.device, bytes)
-                .ok_or(Error::Format("prefill resident buffer alloc failed"))
+                .ok_or(Error::Gpu("prefill resident buffer alloc failed"))
         };
         Ok(Self {
             hidden: [alloc()?, alloc()?],
@@ -639,7 +639,7 @@ impl PrefillResidentBufs {
     /// Upload the embedding output into the layer-0 input buffer.
     pub fn upload_hidden(&self, idx: usize, data: &[f32]) -> Result<(), Error> {
         if data.len() != self.len {
-            return Err(Error::Format("prefill resident hidden size mismatch"));
+            return Err(Error::Runtime("prefill resident hidden size mismatch"));
         }
         crate::metal::buffer::BufferPool::write_f32(&self.hidden[idx], data);
         Ok(())

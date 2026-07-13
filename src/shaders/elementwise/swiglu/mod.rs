@@ -259,18 +259,18 @@ fn gpu_split(
     let len = f.len();
     let buf_g = pool
         .allocate(&ctx.device, len * 4)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_u = pool
         .allocate(&ctx.device, len * 4)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let dump_bytes = if variant.dump_stage > 0 { len * 4 } else { 4 };
     let buf_dump = pool
         .allocate(&ctx.device, dump_bytes)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     BufferPool::write_f32(&buf_g, &f.gate);
     BufferPool::write_f32(&buf_u, &f.up);
-    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+    let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
     enc.setComputePipelineState(&pipeline.pipeline);
     bind_split_in_place_f32(&enc, &buf_g, &buf_u, &buf_dump, len as u32);
     let tg = 256usize.min(len);
@@ -310,17 +310,17 @@ pub fn gpu_half_glu(f: &HalfFixture, variant: KernelVariant) -> Result<Vec<f32>,
     let len = f.len();
     let buf_g = pool
         .allocate(&ctx.device, len * 2)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_u = pool
         .allocate(&ctx.device, len * 2)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_y = pool
         .allocate(&ctx.device, len * 2)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let dump_bytes = if variant.dump_stage > 0 { len * 4 } else { 4 };
     let buf_d = pool
         .allocate(&ctx.device, dump_bytes)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     BufferPool::write_bf16(&buf_g, &bf16::f32_slice_to_bf16_bits(&f.gate));
     BufferPool::write_bf16(&buf_u, &bf16::f32_slice_to_bf16_bits(&f.up));
     gpu_common::dispatch_1d(&ctx.queue, &pipeline.pipeline, len, |enc| {
@@ -345,10 +345,10 @@ pub fn gpu_interleaved(f: &InterleavedFixture, variant: KernelVariant) -> Result
     let out_len = f.out_len();
     let buf_in = pool
         .allocate(&ctx.device, in_len * 4)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_out = pool
         .allocate(&ctx.device, out_len * 4)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let dump_bytes = if variant.dump_stage > 0 {
         out_len * 4
     } else {
@@ -356,10 +356,10 @@ pub fn gpu_interleaved(f: &InterleavedFixture, variant: KernelVariant) -> Result
     };
     let buf_dump = pool
         .allocate(&ctx.device, dump_bytes)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     BufferPool::write_f32(&buf_in, &f.gate_up);
-    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+    let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
     enc.setComputePipelineState(&pipeline.pipeline);
     let dims = [f.batch_size as u32, f.moe_inter as u32];
     bind_moe_gate_up(&enc, &buf_in, &buf_out, &buf_dump, &dims);

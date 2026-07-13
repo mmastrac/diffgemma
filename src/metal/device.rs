@@ -82,10 +82,10 @@ pub struct MetalContext {
 
 impl MetalContext {
     pub fn new() -> Result<Self, Error> {
-        let device = MTLCreateSystemDefaultDevice().ok_or(Error::Format("no Metal device"))?;
+        let device = MTLCreateSystemDefaultDevice().ok_or(Error::Gpu("no Metal device"))?;
         let queue = device
             .newCommandQueue()
-            .ok_or(Error::Format("failed to create Metal command queue"))?;
+            .ok_or(Error::Gpu("failed to create Metal command queue"))?;
         // Record the working-set cap so the q8-KV auto policy (flags::kv_q8)
         // can scale to this device's RAM.
         crate::flags::set_gpu_working_set_cap(device.recommendedMaxWorkingSetSize());
@@ -124,7 +124,7 @@ impl MetalContext {
         let name = NSString::from_str(entry);
         let function = library
             .newFunctionWithName(&name)
-            .ok_or(Error::Format("Metal kernel not found"))?;
+            .ok_or(Error::Runtime("Metal kernel not found"))?;
         let cache = PipelineArchiveCache::shared(device)?;
         let pipeline = cache.compile_compute(device, &function, entry)?;
         Ok(ComputePipeline { pipeline })

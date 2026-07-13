@@ -259,10 +259,10 @@ pub fn quantize_expert_stack_q4(
     let stride = out_dim * in_dim * 2;
     let expert_q = q4_matrix_bytes(out_dim, in_dim);
     if src.len() != experts * stride {
-        return Err(Error::Format("expert bf16 size mismatch"));
+        return Err(Error::Runtime("expert bf16 size mismatch"));
     }
     if dst.len() != experts * expert_q {
-        return Err(Error::Format("expert q4 dst size mismatch"));
+        return Err(Error::Runtime("expert q4 dst size mismatch"));
     }
     for e in 0..experts {
         quantize_bf16_matrix_q4(
@@ -317,10 +317,10 @@ pub fn quantize_expert_stack_q6(
     let stride = out_dim * in_dim * 2;
     let expert_q = q6_matrix_bytes(out_dim, in_dim);
     if src.len() != experts * stride {
-        return Err(Error::Format("expert bf16 size mismatch"));
+        return Err(Error::Runtime("expert bf16 size mismatch"));
     }
     if dst.len() != experts * expert_q {
-        return Err(Error::Format("expert q6 dst size mismatch"));
+        return Err(Error::Runtime("expert q6 dst size mismatch"));
     }
     for e in 0..experts {
         quantize_bf16_matrix_q6(

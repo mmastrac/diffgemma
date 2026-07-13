@@ -135,7 +135,7 @@ pub fn forward(
         let kv_layer = input
             .kv_cache
             .layer(layer)
-            .ok_or(Error::Format("missing kv layer"))?;
+            .ok_or(Error::Runtime("missing kv layer"))?;
         let kv = LayerKvView::from_layer(kv_layer, input.kv_cache.kv_len);
         layer_forward(
             out_buf,
@@ -169,7 +169,7 @@ pub fn forward(
         if let Some(out) = input.logits_out.as_mut() {
             let need = seq_len * vocab;
             if out.len() != need {
-                return Err(Error::Format("logits_out length mismatch"));
+                return Err(Error::Runtime("logits_out length mismatch"));
             }
             lm_head_tied_from_store(
                 store,

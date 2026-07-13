@@ -239,10 +239,10 @@ pub fn quantize_expert_stack_nvfp4(
     let per_expert = nvfp4_matrix_bytes(out_dim, in_dim);
     let stride = out_dim * in_dim * 2;
     if src.len() != experts * stride {
-        return Err(Error::Format("expert bf16 size mismatch"));
+        return Err(Error::Runtime("expert bf16 size mismatch"));
     }
     if dst.len() != experts * per_expert {
-        return Err(Error::Format("expert nvfp4 dst size mismatch"));
+        return Err(Error::Runtime("expert nvfp4 dst size mismatch"));
     }
     for e in 0..experts {
         quantize_bf16_matrix_nvfp4(

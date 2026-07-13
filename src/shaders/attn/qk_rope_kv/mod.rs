@@ -320,16 +320,16 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let _hd = f.head_dim();
     let buf_q = pool
         .allocate(&ctx.device, f.q.len() * 2)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_k = pool
         .allocate(&ctx.device, f.k.len() * 2)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_v = pool
         .allocate(&ctx.device, f.v.len() * 2)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_kv = pool
         .allocate(&ctx.device, f.kvcache.len() * 2)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let blob = [
         bf16::pack_bf16_slice(&f.q_norm_w),
         bf16::pack_bf16_slice(&f.k_norm_w),
@@ -337,10 +337,10 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     .concat();
     let buf_blob = pool
         .allocate(&ctx.device, blob.len())
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_layer = pool
         .allocate(&ctx.device, std::mem::size_of::<LayerOffsets>())
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
 
     BufferPool::write_bf16(&buf_q, &bf16::f32_slice_to_bf16_bits(&f.q));
     BufferPool::write_bf16(&buf_k, &bf16::f32_slice_to_bf16_bits(&f.k));
@@ -378,8 +378,8 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         window: 0,
     };
 
-    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+    let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
     enc.setComputePipelineState(&pipeline.pipeline);
     unsafe {
         enc.setBuffer_offset_atIndex(Some(&buf_q), 0, 0);

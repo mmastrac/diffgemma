@@ -120,7 +120,7 @@ fn dump_row(
     watch_tokens: &[u32],
 ) -> Result<LogitsRowDump, Error> {
     if position >= CANVAS {
-        return Err(Error::Format("logits dump position out of range"));
+        return Err(Error::Runtime("logits dump position out of range"));
     }
     let row = row_slice(&out.logits, position);
     let t = temperature.max(1e-6);
@@ -202,7 +202,7 @@ pub fn run_step_bf16_oracle_logits_dump(
     let prompt = cfg
         .prefill_token_ids
         .as_ref()
-        .ok_or_else(|| Error::Format("bf16 oracle dump requires prefill token ids"))?;
+        .ok_or_else(|| Error::Runtime("bf16 oracle dump requires prefill token ids"))?;
     let layers = cfg
         .layers
         .min(model.config.text_config.num_hidden_layers)
@@ -280,7 +280,7 @@ pub fn run_step_bf16_oracle_logits_dump_gpu_kv(
     let prompt = cfg
         .prefill_token_ids
         .as_ref()
-        .ok_or_else(|| Error::Format("bf16 gpu-kv oracle requires prefill token ids"))?;
+        .ok_or_else(|| Error::Runtime("bf16 gpu-kv oracle requires prefill token ids"))?;
     let layers = cfg
         .layers
         .min(model.config.text_config.num_hidden_layers)
@@ -293,7 +293,7 @@ pub fn run_step_bf16_oracle_logits_dump_gpu_kv(
     let gpu_buf = ctx
         .device
         .newBufferWithLength_options(kv_bytes, MTLResourceOptions::StorageModeShared)
-        .ok_or(Error::Format("gpu-kv oracle buffer alloc failed"))?;
+        .ok_or(Error::Gpu("gpu-kv oracle buffer alloc failed"))?;
     let mut enc_cache = MonolithicEncoderCache::open_opt(dgq_dir, CANVAS, max_seq, None)?;
     let (kv_len, _) = prefill_monolithic_kv_with_cache(
         &mut enc_cache,
@@ -473,7 +473,7 @@ pub fn parse_positions(spec: &str) -> Result<Vec<usize>, Error> {
         .map(|s| {
             s.trim()
                 .parse::<usize>()
-                .map_err(|_| Error::Format("invalid --positions"))
+                .map_err(|_| Error::Runtime("invalid --positions"))
         })
         .collect()
 }

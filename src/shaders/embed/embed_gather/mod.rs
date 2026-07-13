@@ -211,23 +211,23 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let embed_q8 = f.embed_q8();
     let buf_blob = pool
         .allocate(&ctx.device, embed_q8.len())
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_ids = pool
         .allocate(&ctx.device, f.ids.len() * 4)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_out = pool
         .allocate(&ctx.device, f.out_len() * 2)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_dbg = pool
         .allocate(&ctx.device, crate::metal::debug_status::DEBUG_STATUS_BYTES)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     BufferPool::write_bytes(&buf_blob, &embed_q8);
     let idx_bytes =
         unsafe { std::slice::from_raw_parts(f.ids.as_ptr().cast::<u8>(), f.ids.len() * 4) };
     BufferPool::write_bytes(&buf_ids, idx_bytes);
     let (grid, tg) = dispatch_shape(f.hidden, f.num_tokens);
-    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+    let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
     enc.setComputePipelineState(&pipeline.pipeline);
     bind_gpu_buffers(
         &enc,

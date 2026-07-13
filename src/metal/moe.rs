@@ -193,7 +193,7 @@ pub fn load_expert_bf16_slices(
     let gu_off = expert * gu_stride;
     let dn_off = expert * dn_stride;
     if gu_off + gu_stride > gu_all.len() || dn_off + dn_stride > dn_all.len() {
-        return Err(Error::Format("expert bf16 slice out of range"));
+        return Err(Error::Runtime("expert bf16 slice out of range"));
     }
     Ok((
         gu_all[gu_off..gu_off + gu_stride].to_vec(),
@@ -259,7 +259,7 @@ pub fn experts_forward_gpu_batched(
     out_arena.resize(out_len, 0.0);
 
     if !dgq {
-        let weights = _weights.ok_or(Error::Format("bf16 moe needs layer weights"))?;
+        let weights = _weights.ok_or(Error::Runtime("bf16 moe needs layer weights"))?;
         let gate_up = weights.experts_gate_up.bf16()?;
         let down = weights.experts_down.bf16()?;
         for job in &jobs {

@@ -39,12 +39,8 @@ pub fn dispatch_1d_ranged(
     const THREADS_PER_TG: usize = 256;
     const MAX_GROUPS: usize = 65535;
     const CHUNK: usize = MAX_GROUPS * THREADS_PER_TG;
-    let cmd = queue
-        .commandBuffer()
-        .ok_or(Error::Format("command buffer"))?;
-    let enc = cmd
-        .computeCommandEncoder()
-        .ok_or(Error::Format("encoder"))?;
+    let cmd = queue.commandBuffer().ok_or(Error::Gpu("command buffer"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("encoder"))?;
     enc.setComputePipelineState(pipeline);
     let mut base = 0usize;
     while base < count {
@@ -81,12 +77,8 @@ pub fn dispatch_rows(
     encode: impl FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>),
 ) -> Result<(), Error> {
     const THREADGROUP_WIDTH: usize = 256;
-    let cmd = queue
-        .commandBuffer()
-        .ok_or(Error::Format("command buffer"))?;
-    let enc = cmd
-        .computeCommandEncoder()
-        .ok_or(Error::Format("encoder"))?;
+    let cmd = queue.commandBuffer().ok_or(Error::Gpu("command buffer"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("encoder"))?;
     enc.setComputePipelineState(pipeline);
     encode(&enc);
     enc.dispatchThreadgroups_threadsPerThreadgroup(
@@ -133,12 +125,8 @@ pub fn dispatch_1d(
     count: usize,
     encode: impl FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>),
 ) -> Result<(), Error> {
-    let cmd = queue
-        .commandBuffer()
-        .ok_or(Error::Format("command buffer"))?;
-    let enc = cmd
-        .computeCommandEncoder()
-        .ok_or(Error::Format("encoder"))?;
+    let cmd = queue.commandBuffer().ok_or(Error::Gpu("command buffer"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("encoder"))?;
     enc.setComputePipelineState(pipeline);
     encode(&enc);
     let tg = 256usize.min(count);
@@ -170,12 +158,8 @@ pub fn dispatch_grid(
     tg_width: usize,
     encode: impl FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>),
 ) -> Result<(), Error> {
-    let cmd = queue
-        .commandBuffer()
-        .ok_or(Error::Format("command buffer"))?;
-    let enc = cmd
-        .computeCommandEncoder()
-        .ok_or(Error::Format("encoder"))?;
+    let cmd = queue.commandBuffer().ok_or(Error::Gpu("command buffer"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("encoder"))?;
     enc.setComputePipelineState(pipeline);
     encode(&enc);
     enc.dispatchThreadgroups_threadsPerThreadgroup(

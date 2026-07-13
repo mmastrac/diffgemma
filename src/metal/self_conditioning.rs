@@ -29,7 +29,7 @@ pub fn apply_gpu(
     let len = seq_len * hidden;
     let act_len = seq_len * inter;
     if hidden_a.len() != len || embed_buf.len() != len || soft_signal.len() != len {
-        return Err(Error::Format("self_conditioning gpu shape mismatch"));
+        return Err(Error::Gpu("self_conditioning gpu shape mismatch"));
     }
 
     let telemetry = engine.batch_telemetry();

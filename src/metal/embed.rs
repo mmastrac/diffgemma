@@ -400,7 +400,7 @@ pub fn embed_token_ids_q8_gpu(
     let half_len = len * 2;
     let buf_half = batch
         .alloc_bytes(&vec![0u8; half_len])
-        .map_err(|_| Error::Format("embed half alloc failed"))?;
+        .map_err(|_| Error::Gpu("embed half alloc failed"))?;
     let buf_f32 = batch.alloc_f32_out(len)?;
     let dump = batch.alloc_f32_out(1)?;
 

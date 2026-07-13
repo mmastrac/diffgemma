@@ -338,7 +338,7 @@ pub fn pipeline_for(
     let mut pipelines = ctx.compile_kernels(SHADER, &[ENTRY])?;
     pipelines
         .pop()
-        .ok_or(Error::Format("Metal pipeline missing"))
+        .ok_or(Error::Runtime("Metal pipeline missing"))
 }
 
 #[cfg(target_os = "macos")]
@@ -360,16 +360,16 @@ pub fn gpu(f: &Fixture) -> Result<Vec<f32>, Error> {
 
     let buf_q = pool
         .allocate(&ctx.device, q_bytes)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_k = pool
         .allocate(&ctx.device, k_bytes)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_v = pool
         .allocate(&ctx.device, v_bytes)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_o = pool
         .allocate(&ctx.device, o_bytes)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
 
     BufferPool::write_f32(&buf_q, &f.q);
     BufferPool::write_f32(&buf_k, &f.k);
@@ -384,7 +384,7 @@ pub fn gpu(f: &Fixture) -> Result<Vec<f32>, Error> {
         let mask_bytes = packed.len();
         let b = pool
             .allocate(&ctx.device, mask_bytes)
-            .ok_or(Error::Format("alloc"))?;
+            .ok_or(Error::Gpu("alloc"))?;
         BufferPool::write_bytes(&b, &packed);
         buf_mask = Some((mask_bytes, b));
     }
@@ -394,7 +394,7 @@ pub fn gpu(f: &Fixture) -> Result<Vec<f32>, Error> {
         let pos_bytes = pos.len() * 8;
         let b = pool
             .allocate(&ctx.device, pos_bytes)
-            .ok_or(Error::Format("alloc"))?;
+            .ok_or(Error::Gpu("alloc"))?;
         BufferPool::write_i64(&b, pos);
         buf_pos = Some((pos_bytes, b));
     }
@@ -402,8 +402,8 @@ pub fn gpu(f: &Fixture) -> Result<Vec<f32>, Error> {
     let params =
         GqaParams::for_attention(f.seq_len, f.total_kv, &f.params, mask_kind, kv_cache_len);
 
-    let cmd = ctx.queue.commandBuffer().ok_or(Error::Format("cmd"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Format("enc"))?;
+    let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
     enc.setComputePipelineState(&pipeline.pipeline);
     unsafe {
         enc.setBuffer_offset_atIndex(Some(&buf_q), 0, 0);

@@ -68,7 +68,7 @@ pub fn route_gpu_in_batch(
     if route_scratch.indices.len() != seq_len * top_k
         || route_scratch.weights.len() != seq_len * top_k
     {
-        return Err(Error::Format("route scratch size mismatch"));
+        return Err(Error::Runtime("route scratch size mismatch"));
     }
 
     let buf_router_in =

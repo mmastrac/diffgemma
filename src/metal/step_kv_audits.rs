@@ -42,7 +42,9 @@ pub fn run_step_kv_bf16_cross_parity(
     max_seq: usize,
 ) -> Result<StepKvBf16CrossResult, Error> {
     if token_ids.is_empty() {
-        return Err(Error::Format("kv cross parity requires at least one token"));
+        return Err(Error::Runtime(
+            "kv cross parity requires at least one token",
+        ));
     }
     let layers = layers.max(1).min(N_LAYERS);
     let dgq_store = DgqStore::open(dgq_dir)?;
@@ -58,7 +60,7 @@ pub fn run_step_kv_bf16_cross_parity(
     let alloc_kv = || -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
         ctx.device
             .newBufferWithLength_options(kv_bytes, MTLResourceOptions::StorageModeShared)
-            .ok_or(Error::Format("kv cross buffer alloc failed"))
+            .ok_or(Error::Gpu("kv cross buffer alloc failed"))
     };
     let gpu_buf = alloc_kv()?;
     let cpu_buf = alloc_kv()?;
@@ -80,7 +82,7 @@ pub fn run_step_kv_bf16_cross_parity(
         max_seq,
     )?;
     if cpu_kv_len != kv_len {
-        return Err(Error::Format("gpu/cpu bf16 cross kv_len mismatch"));
+        return Err(Error::Gpu("gpu/cpu bf16 cross kv_len mismatch"));
     }
     let (max_kv_diff, max_kv_diff_layer, max_kv_diff_pos) =
         monolithic_kv_prefix_max_diff(&gpu_buf, &cpu_buf, &layout, kv_len, layers);
@@ -176,7 +178,7 @@ pub fn run_step_kv_audit(
     let kv_buf = ctx
         .device
         .newBufferWithLength_options(kv_bytes, objc2_metal::MTLResourceOptions::StorageModeShared)
-        .ok_or(Error::Format("kv audit buffer alloc failed"))?;
+        .ok_or(Error::Gpu("kv audit buffer alloc failed"))?;
     let actual_kv = prefill_monolithic_kv(model_dir, &prompt, &kv_buf, &layout, max_seq, layers)?;
     let prefix_max = kvcache_prefix_max_abs(&kv_buf, &layout, 0, actual_kv);
 
@@ -207,7 +209,7 @@ pub fn run_step_kv_audit(
                 kv_bytes,
                 objc2_metal::MTLResourceOptions::StorageModeShared,
             )
-            .ok_or(Error::Format("kv extend audit buffer alloc failed"))?;
+            .ok_or(Error::Gpu("kv extend audit buffer alloc failed"))?;
         let prefill_actual = prefill_monolithic_kv(
             model_dir,
             prefill_only,
@@ -409,7 +411,7 @@ pub fn run_step_attn_probe(
     use crate::shaders::cpu::rms_norm;
 
     if token_ids.is_empty() {
-        return Err(Error::Format("step-attn-probe requires prompt tokens"));
+        return Err(Error::Runtime("step-attn-probe requires prompt tokens"));
     }
     let layer = layer.min(N_LAYERS.saturating_sub(1));
     let canvas_len = CANVAS;
@@ -425,7 +427,7 @@ pub fn run_step_attn_probe(
             kv_cache_total_bytes(&layout, max_seq) as usize,
             MTLResourceOptions::StorageModeShared,
         )
-        .ok_or(Error::Format("kv buffer alloc failed"))?;
+        .ok_or(Error::Gpu("kv buffer alloc failed"))?;
     let mut native_cache = MonolithicEncoderCache::open_opt(model_dir, canvas_len, max_seq, None)?;
     let (kv_len, _) = prefill_monolithic_kv_with_cache(
         &mut native_cache,
@@ -558,10 +560,10 @@ pub fn run_step_kv_parity(
     seed: u64,
 ) -> Result<StepKvParityResult, Error> {
     if token_ids.is_empty() {
-        return Err(Error::Format("step-kv-parity requires at least one token"));
+        return Err(Error::Runtime("step-kv-parity requires at least one token"));
     }
     if token_ids.len() > max_seq {
-        return Err(Error::Format("token_ids exceed max_seq"));
+        return Err(Error::Runtime("token_ids exceed max_seq"));
     }
     let layers = layers.max(1).min(N_LAYERS);
     let store = DgqStore::open(model_dir)?;
@@ -572,7 +574,7 @@ pub fn run_step_kv_parity(
     let alloc_kv = || -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
         ctx.device
             .newBufferWithLength_options(kv_bytes, MTLResourceOptions::StorageModeShared)
-            .ok_or(Error::Format("kv parity buffer alloc failed"))
+            .ok_or(Error::Gpu("kv parity buffer alloc failed"))
     };
 
     let mut cache_a = MonolithicEncoderCache::open_opt(model_dir, CANVAS, max_seq, None)?;
@@ -598,7 +600,7 @@ pub fn run_step_kv_parity(
         layers,
     )?;
     if kv_len_b != kv_len {
-        return Err(Error::Format("encoder prefill kv_len mismatch"));
+        return Err(Error::Runtime("encoder prefill kv_len mismatch"));
     }
 
     let prefix_max_l0 = kvcache_prefix_max_abs(&buf_a, &layout, 0, kv_len);
@@ -655,7 +657,7 @@ pub fn run_encoder_moe_kv_parity(
     let alloc_kv = || -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, Error> {
         ctx.device
             .newBufferWithLength_options(kv_bytes, MTLResourceOptions::StorageModeShared)
-            .ok_or(Error::Format("encoder moe kv buffer alloc failed"))
+            .ok_or(Error::Gpu("encoder moe kv buffer alloc failed"))
     };
 
     let mut cpu_cache = MonolithicEncoderCache::open_opt(model_dir, CANVAS, max_seq, None)?;
@@ -683,7 +685,9 @@ pub fn run_encoder_moe_kv_parity(
         layers,
     )?;
     if gpu_kv_len != cpu_kv_len {
-        return Err(Error::Format("cpu/gpu encoder moe prefill kv_len mismatch"));
+        return Err(Error::Runtime(
+            "cpu/gpu encoder moe prefill kv_len mismatch",
+        ));
     }
     let (max_diff, layer, pos) =
         monolithic_kv_prefix_max_diff(&cpu_buf, &gpu_buf, &layout, cpu_kv_len, layers);

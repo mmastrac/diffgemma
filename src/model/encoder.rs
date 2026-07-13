@@ -77,7 +77,7 @@ pub fn prefill(
         let mut layer_scratch = DecoderLayerScratch::new(seq_len, text, layer)?;
         let kv_layer = kv_cache
             .layer_mut(layer)
-            .ok_or(Error::Format("missing kv layer"))?;
+            .ok_or(Error::Runtime("missing kv layer"))?;
         if use_a_input {
             layer_forward_encoder(
                 &mut scratch.hidden_b[..seq_len * hidden],
@@ -176,7 +176,7 @@ pub fn extend_prefill(
         let kv_view = {
             let kv_layer = kv_cache
                 .layer(layer)
-                .ok_or(Error::Format("missing kv layer"))?;
+                .ok_or(Error::Runtime("missing kv layer"))?;
             LayerKvView::from_layer(kv_layer, kv_len_before)
         };
         if use_a_input {
@@ -206,7 +206,7 @@ pub fn extend_prefill(
         }
         let kv_out = kv_cache
             .layer_mut(layer)
-            .ok_or(Error::Format("missing kv layer"))?;
+            .ok_or(Error::Runtime("missing kv layer"))?;
         kv_out.append_kv(&layer_scratch.attn.k, &layer_scratch.attn.v, seq_len)?;
         use_a_input = !use_a_input;
     }

@@ -149,13 +149,13 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let out_len = f.out_len();
     let buf_ex = pool
         .allocate(&ctx.device, f.expert_out.len() * 4)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_out = pool
         .allocate(&ctx.device, out_len * 4)
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     let buf_route = pool
         .allocate(&ctx.device, std::mem::size_of::<RouteScratch>())
-        .ok_or(Error::Format("alloc"))?;
+        .ok_or(Error::Gpu("alloc"))?;
     BufferPool::write_f32(&buf_ex, &f.expert_out);
     BufferPool::write_f32(&buf_out, &vec![0.0f32; out_len]);
     BufferPool::write_bytes(&buf_route, unsafe {

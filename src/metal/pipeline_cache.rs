@@ -158,7 +158,7 @@ impl PipelineArchiveCache {
         let desc = MTLBinaryArchiveDescriptor::new();
         let archive = device
             .newBinaryArchiveWithDescriptor_error(&desc)
-            .map_err(|_| Error::Format("MTLBinaryArchive create failed"))?;
+            .map_err(|_| Error::Gpu("MTLBinaryArchive create failed"))?;
         Ok(Self {
             inner: Mutex::new(ArchiveInner {
                 archive,
@@ -197,7 +197,7 @@ impl PipelineArchiveCache {
                 MTLPipelineOption::empty(),
                 None,
             )
-            .map_err(|_| Error::Format("Metal pipeline compile failed"))?;
+            .map_err(|_| Error::Gpu("Metal pipeline compile failed"))?;
 
         if self.persist
             && inner
