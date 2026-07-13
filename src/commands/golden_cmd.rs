@@ -303,6 +303,13 @@ pub(crate) fn run_golden_case(
     };
 
     let snap = session.snapshot_kv();
+    // Diagnostic (MoE-error qualification): `DGQ_GOLDEN_DUMP_KV=dir` writes the
+    // raw post-prefill KV bytes per case, so two block_m runs can be diffed for
+    // per-region rel-error / cosine. No effect when unset.
+    if let Ok(dir) = std::env::var("DGQ_GOLDEN_DUMP_KV") {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(format!("{dir}/{}.kv", case.id), snap.kv_bytes());
+    }
     Ok(golden::GoldenRecord {
         prompt_len,
         kv_valid_len: snap.tokens().len(),
