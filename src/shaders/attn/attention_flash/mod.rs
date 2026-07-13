@@ -256,6 +256,97 @@ pub fn gpu_flash(
     Ok(out)
 }
 
+/// Isolated timing: full-layer flash prefill (all heads, one command buffer),
+/// min-of-warmed-rounds ms/layer. Mirrors `attention_gemm::bench_gpu` so the two
+/// are directly comparable.
+#[cfg(target_os = "macos")]
+pub fn bench_flash(f: &crate::shaders::attention::Fixture, iters: usize) -> Result<f64, Error> {
+    use crate::metal::buffer::BufferPool;
+    use crate::metal::device::MetalContext;
+    use crate::shaders::bf16;
+    use crate::shaders::gpu_common;
+    use crate::shaders::variant::KernelVariant;
+    use objc2_metal::{
+        MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
+    };
+    use std::time::Instant;
+
+    let canvas = f.canvas;
+    let n_q_heads = f.n_q_heads;
+    let nkv = f.n_kv();
+    let hd = f.head_dim();
+    let group = n_q_heads / nkv;
+    let t_total = f.kv_len as usize + canvas;
+    let kstride = nkv * hd * 2;
+
+    let ctx = MetalContext::new()?;
+    let pipe = pipeline_flash(&ctx, KernelVariant::PRODUCTION, false, BQ, BK)?;
+    let mut pool = BufferPool::new();
+    let buf_q = pool
+        .allocate(&ctx.device, canvas * n_q_heads * hd * 2)
+        .ok_or(Error::Gpu("alloc q"))?;
+    BufferPool::write_bf16(&buf_q, &bf16::f32_slice_to_bf16_bits(&f.q));
+    let buf_out = pool
+        .allocate(&ctx.device, canvas * n_q_heads * hd * 2)
+        .ok_or(Error::Gpu("alloc out"))?;
+    let buf_kv = pool
+        .allocate(&ctx.device, (f.kvcache.len() + 8 * kstride) * 2)
+        .ok_or(Error::Gpu("alloc kv"))?;
+    {
+        let mut bits = crate::shaders::f16::f32_slice_to_f16(&f.kvcache);
+        bits.resize(bits.len() + 8 * kstride, 0);
+        BufferPool::write_bf16(&buf_kv, &bits);
+    }
+    let mut dims = FlashDims {
+        m: canvas as u32,
+        t_total: t_total as u32,
+        hd: hd as u32,
+        a_row_stride: (n_q_heads * hd) as u32,
+        b_row_stride: kstride as u32,
+        out_row_stride: (n_q_heads * hd) as u32,
+        kv_len: f.kv_len,
+        group: group as u32,
+        nkv: nkv as u32,
+        head_base: 0,
+        causal: 1,
+    };
+    let tg = MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+    let grid = MTLSize {
+        width: canvas.div_ceil(BQ),
+        height: 1,
+        depth: n_q_heads,
+    };
+    let mut best = f64::INFINITY;
+    for round in 0..6 {
+        let t = Instant::now();
+        let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+        let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
+        for _ in 0..iters {
+            dims.head_base = 0;
+            enc.setComputePipelineState(&pipe.pipeline);
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(&buf_q), 0, 0);
+                enc.setBuffer_offset_atIndex(Some(&buf_kv), 0, 1);
+                enc.setBuffer_offset_atIndex(Some(&buf_out), 0, 2);
+            }
+            gpu_common::set_bytes(&enc, &dims, 3);
+            enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+            enc.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers);
+        }
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+        if round > 0 {
+            best = best.min(t.elapsed().as_secs_f64() * 1e3 / iters as f64);
+        }
+    }
+    Ok(best)
+}
+
 #[cfg(test)]
 #[path = "mod_tests.rs"]
 mod mod_tests;

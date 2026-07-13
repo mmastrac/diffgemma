@@ -77,6 +77,36 @@ fn flash_gpu_full_grp2_causal_vs_cpu() {
     assert_oracle(&got, &oracle, 2e-2, 0.9999);
 }
 
+/// Isolated attention-kernel bench: E18 flash vs E17 GEMM-decomp vs
+/// attention_mma_full at real full-layer shape (canvas=256, 16 Q / 2 KV,
+/// hd=512). Ignored (timing). NOTE per the kv_block/holistic lesson: the
+/// isolated attention kernel OVER-weights attention vs real prefill — a win here
+/// is necessary but not sufficient; confirm on bench-prefill-super after wiring.
+/// Run: `cargo test --release flash_bench -- --ignored --nocapture`
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore]
+fn flash_bench() {
+    use crate::shaders::attn::attention_flash::bench_flash;
+    use crate::shaders::attn::attention_gemm::{bench_gpu, model_full_fixture};
+    let iters = 10usize;
+    println!("  kv      mma_full   e17(hc16)  e18-flash   flash/e17");
+    for kv_len in [8192u32, 30000, 60000, 100000] {
+        let f = model_full_fixture(kv_len);
+        let mma_full = crate::shaders::attention::bench_path(&f, iters, 3).unwrap();
+        let e17 = bench_gpu(&f, iters, 16).unwrap();
+        let flash = bench_flash(&f, iters).unwrap();
+        println!(
+            "  {:>6}  {:>8.3}  {:>9.3}  {:>9.3}   {:>5.2}x",
+            kv_len,
+            mma_full,
+            e17,
+            flash,
+            e17 / flash
+        );
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn flash_gpu_full_grp8_causal_side_vs_cpu() {
