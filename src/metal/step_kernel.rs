@@ -1280,7 +1280,7 @@ fn moe_grouped_grid_info() -> MoeGroupedGridInfo {
         hid: HID as u32,
         n_tile: crate::shaders::gemm_common::n_tile() as u32,
         tpg: crate::shaders::gemm_common::THREADS_PER_TG as u32,
-        tunable_n_tile: crate::shaders::gemm_tunable::SPARSE_BN as u32,
+        tunable_n_tile: crate::flags::moe_sparse_bn() as u32,
         tunable_wide_n_tile: 64,
     }
 }
@@ -1611,8 +1611,8 @@ impl StepEnc<'_> {
         self.sink_set_bytes(&w_off, 3);
         self.sink_set_bytes(&m, 4);
         let grid = MTLSize {
-            width: div_up(n as usize, crate::shaders::gemm_tunable::TUNE_BN),
-            height: div_up(m as usize, crate::shaders::gemm_tunable::TUNE_BM),
+            width: div_up(n as usize, crate::flags::gemm_tune_tile().1),
+            height: div_up(m as usize, crate::flags::gemm_tune_tile().0),
             depth: 1,
         };
         let tg = MTLSize {
@@ -1646,8 +1646,8 @@ impl StepEnc<'_> {
         self.bind_blob(2);
         self.sink_set_bytes(&m, 3);
         let grid = MTLSize {
-            width: div_up(n_total as usize, crate::shaders::gemm_tunable::TUNE_BN),
-            height: div_up(m as usize, crate::shaders::gemm_tunable::TUNE_BM),
+            width: div_up(n_total as usize, crate::flags::gemm_tune_tile().1),
+            height: div_up(m as usize, crate::flags::gemm_tune_tile().0),
             depth: 1,
         };
         let tg = MTLSize {
@@ -1678,8 +1678,8 @@ impl StepEnc<'_> {
             segs,
         )?;
         let grid = MTLSize {
-            width: div_up(n_total as usize, crate::shaders::gemm_tunable::TUNE_BN),
-            height: div_up(m as usize, crate::shaders::gemm_tunable::TUNE_BM),
+            width: div_up(n_total as usize, crate::flags::gemm_tune_tile().1),
+            height: div_up(m as usize, crate::flags::gemm_tune_tile().0),
             depth: 1,
         };
         self.sink_set_pipeline(ps.as_ref());
@@ -1770,8 +1770,8 @@ impl StepEnc<'_> {
     ) -> Result<(), Error> {
         let ps = self.ps.dense_q8(n, k)?;
         let grid = MTLSize {
-            width: div_up(n as usize, crate::shaders::gemm_tunable::TUNE_BN),
-            height: div_up(m as usize, crate::shaders::gemm_tunable::TUNE_BM),
+            width: div_up(n as usize, crate::flags::gemm_tune_tile().1),
+            height: div_up(m as usize, crate::flags::gemm_tune_tile().0),
             depth: 1,
         };
         self.sink_set_pipeline(ps);
@@ -1802,8 +1802,8 @@ impl StepEnc<'_> {
     ) -> Result<(), Error> {
         let ps = self.ps.dense_raw(n, k)?;
         let grid = MTLSize {
-            width: div_up(n as usize, crate::shaders::gemm_tunable::TUNE_BN),
-            height: div_up(m as usize, crate::shaders::gemm_tunable::TUNE_BM),
+            width: div_up(n as usize, crate::flags::gemm_tune_tile().1),
+            height: div_up(m as usize, crate::flags::gemm_tune_tile().0),
             depth: 1,
         };
         self.sink_set_pipeline(ps);
@@ -1834,8 +1834,8 @@ impl StepEnc<'_> {
     ) -> Result<(), Error> {
         let ps = self.ps.dense_raw(n, k)?;
         let grid = MTLSize {
-            width: div_up(n as usize, crate::shaders::gemm_tunable::TUNE_BN),
-            height: div_up(m as usize, crate::shaders::gemm_tunable::TUNE_BM),
+            width: div_up(n as usize, crate::flags::gemm_tune_tile().1),
+            height: div_up(m as usize, crate::flags::gemm_tune_tile().0),
             depth: 1,
         };
         self.sink_set_pipeline(ps);
@@ -1864,8 +1864,8 @@ impl StepEnc<'_> {
     ) -> Result<(), Error> {
         let ps = self.ps.dense_q8(n, k)?;
         let grid = MTLSize {
-            width: div_up(n as usize, crate::shaders::gemm_tunable::TUNE_BN),
-            height: div_up(m as usize, crate::shaders::gemm_tunable::TUNE_BM),
+            width: div_up(n as usize, crate::flags::gemm_tune_tile().1),
+            height: div_up(m as usize, crate::flags::gemm_tune_tile().0),
             depth: 1,
         };
         self.sink_set_pipeline(ps);

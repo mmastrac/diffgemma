@@ -28,8 +28,23 @@ pub fn pipeline_for(
     k: u32,
     format: QuantFormat,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
+    let (bm, bn) = crate::flags::gemm_tune_tile();
+    pipeline_for_tile(ctx, n, k, format, bm, bn)
+}
+
+/// Tile-parameterized dense pipeline (task #88 holistic sweep). Production
+/// passes the flag-driven tile; default (64x64) is byte-identical.
+#[cfg(target_os = "macos")]
+pub fn pipeline_for_tile(
+    ctx: &crate::metal::device::MetalContext,
+    n: u32,
+    k: u32,
+    format: QuantFormat,
+    bm: usize,
+    bn: usize,
+) -> Result<crate::metal::device::ComputePipeline, Error> {
     ctx.compile_gemm_subkernel(
-        &tuned_source(TUNE_BM, TUNE_BN),
+        &tuned_source(bm, bn),
         ENTRY,
         n,
         k,
@@ -47,7 +62,20 @@ pub fn pipeline_for_logits(
     k: u32,
     format: QuantFormat,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_gemm_subkernel_out_bf16(&tuned_source(TUNE_BM, TUNE_BN), ENTRY, n, k, format as u32)
+    let (bm, bn) = crate::flags::gemm_tune_tile();
+    pipeline_for_logits_tile(ctx, n, k, format, bm, bn)
+}
+
+#[cfg(target_os = "macos")]
+pub fn pipeline_for_logits_tile(
+    ctx: &crate::metal::device::MetalContext,
+    n: u32,
+    k: u32,
+    format: QuantFormat,
+    bm: usize,
+    bn: usize,
+) -> Result<crate::metal::device::ComputePipeline, Error> {
+    ctx.compile_gemm_subkernel_out_bf16(&tuned_source(bm, bn), ENTRY, n, k, format as u32)
 }
 
 pub const ENTRY_STACKED: &str = "gemm_tunable_stacked";
@@ -79,8 +107,9 @@ pub fn stacked_pipeline_for(
     if let Some(pipe) = guard.get(&key) {
         return Ok(std::sync::Arc::clone(pipe));
     }
+    let (bm, bn) = crate::flags::gemm_tune_tile();
     let pipe = std::sync::Arc::new(ctx.compile_gemm_stacked_subkernel(
-        &tuned_source(TUNE_BM, TUNE_BN),
+        &tuned_source(bm, bn),
         ENTRY_STACKED,
         n,
         k,
@@ -112,7 +141,17 @@ pub fn pipeline_for_sparse(
     gather: bool,
     format: QuantFormat,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    pipeline_for_sparse_bm(ctx, n, k, gather, format, SPARSE_BM)
+    // Block height stays SPARSE_BM=32 (baked into moe_bucket_fill); only the
+    // N-tile is tunable (task #88). Default moe_sparse_bn() = SPARSE_BN = 128.
+    pipeline_for_sparse_tile(
+        ctx,
+        n,
+        k,
+        gather,
+        format,
+        SPARSE_BM,
+        crate::flags::moe_sparse_bn(),
+    )
 }
 
 /// Tile-parameterized sparse variant. `bm` != 32 is the weight-stationary

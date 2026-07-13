@@ -122,6 +122,13 @@ pub struct PerfFlags {
     pub gemm_attn_pv_bm: usize,
     pub gemm_attn_pv_bn: usize,
     pub gemm_attn_sm_tpg: usize,
+    /// Holistic prefill sweep (task #88): dense tunable-GEMM tile + MoE-sparse
+    /// N-tile. Defaults reproduce the shipped kernels (64x64 dense, 128 sparse
+    /// N-tile with fixed 32-row block height). `DGQ_GEMM_TUNE_BM/BN`,
+    /// `DGQ_MOE_SPARSE_BN`.
+    pub gemm_tune_bm: usize,
+    pub gemm_tune_bn: usize,
+    pub moe_sparse_bn: usize,
 }
 
 impl Default for PerfFlags {
@@ -149,6 +156,9 @@ impl Default for PerfFlags {
             gemm_attn_pv_bm: 64,
             gemm_attn_pv_bn: 64,
             gemm_attn_sm_tpg: 256,
+            gemm_tune_bm: 64,
+            gemm_tune_bn: 64,
+            moe_sparse_bn: 128,
         }
     }
 }
@@ -387,6 +397,9 @@ impl RuntimeConfig {
                 gemm_attn_pv_bm: parse_usize("DGQ_GEMM_ATTN_PV_BM", 64).max(16),
                 gemm_attn_pv_bn: parse_usize("DGQ_GEMM_ATTN_PV_BN", 64).max(16),
                 gemm_attn_sm_tpg: parse_usize("DGQ_GEMM_ATTN_SM_TPG", 256).max(32),
+                gemm_tune_bm: parse_usize("DGQ_GEMM_TUNE_BM", 64).max(16),
+                gemm_tune_bn: parse_usize("DGQ_GEMM_TUNE_BN", 64).max(16),
+                moe_sparse_bn: parse_usize("DGQ_MOE_SPARSE_BN", 128).max(16),
             },
             prefill: PrefillFlags {
                 f16: env_on_if_one("DGQ_PREFILL_F16"),
@@ -656,6 +669,18 @@ pub fn gemm_attn_enabled() -> bool {
 /// 4). Bounds the S/P prefill scratch; clamped to n_q_heads at dispatch.
 pub fn gemm_attn_head_chunk() -> usize {
     config().perf.gemm_attn_head_chunk
+}
+
+/// Holistic sweep (task #88): dense tunable-GEMM tile (bm, bn); default 64x64.
+pub fn gemm_tune_tile() -> (usize, usize) {
+    let p = &config().perf;
+    (p.gemm_tune_bm, p.gemm_tune_bn)
+}
+
+/// Holistic sweep (task #88): MoE-sparse N-tile; default 128 (block height
+/// stays 32, baked into moe_bucket_fill).
+pub fn moe_sparse_bn() -> usize {
+    config().perf.moe_sparse_bn
 }
 
 /// E17 tunable tile config (task #87). Defaults reproduce the shipped
