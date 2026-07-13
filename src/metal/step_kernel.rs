@@ -727,6 +727,9 @@ struct StepPipelines {
     attention_mma2: ComputePipeline,
     /// MMA attention for full/global layers (`DGQ_ATTN_MMA_FULL`, register-O); scalar `attention` is the fallback/oracle.
     attention_mma_full: ComputePipeline,
+    /// E17 GEMM-attention for full-layer PREFILL (`DGQ_GEMM_ATTN`): [qk, softmax, pv].
+    /// None unless the flag is set. Prefill-only; denoise keeps attention_mma_full.
+    attn_gemm: Option<[ComputePipeline; 3]>,
     residual: ComputePipeline,
     glu: ComputePipeline,
     router: ComputePipeline,
@@ -1018,6 +1021,11 @@ impl StepPipelines {
             attention_mma_full: crate::shaders::attention::pipeline_mma_full_for_kv(
                 ctx, prod, fmt,
             )?,
+            attn_gemm: if crate::flags::gemm_attn_enabled() {
+                Some(crate::shaders::attention_gemm::pipelines(ctx, prod)?)
+            } else {
+                None
+            },
             residual: crate::shaders::residual_half::pipeline_for(ctx, prod)?,
             glu: crate::shaders::swiglu::pipeline_for(
                 ctx,
@@ -1187,6 +1195,12 @@ pub(crate) struct StepBuffers {
     /// Online-softmax state (f32 m/l + unnormalized O per head x canvas row)
     /// persisted between sequential kv-block dispatches of attention_mma_full.
     attn_state: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// E17 GEMM-attention prefill scratch (`DGQ_GEMM_ATTN`): score matrix S
+    /// (f32), probs P (f16), row denoms lrow (f32) — sized
+    /// [n_q_heads][CANVAS][n_pad(max_seq)]. None unless the flag is set.
+    attn_gemm_s: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    attn_gemm_p: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    attn_gemm_lrow: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
     /// E14 (DGQ_PREFILL_KV_F32): f32 side K/V ring for the sliding layers —
     /// written by the prefill rope, read by the prefill attention, so chunk
     /// boundaries never round K/V to f16. Same slot = pos & ring_mask
@@ -3072,6 +3086,114 @@ impl StepEnc<'_> {
         Ok(())
     }
 
+    /// E17: full-layer PREFILL attention via the GEMM decomposition
+    /// (`DGQ_GEMM_ATTN`). Three head-batched dispatches — QK (S=Q.K^T) ->
+    /// softmax (masked exp + row denom) -> PV (O=P.V / L) — reading f16 K/V
+    /// direct from the main cache, writing O to the attno arena. Prefill-only;
+    /// caller guarantees `prefill_causal && l.is_full == 1` and that the
+    /// pipelines/scratch are present. Not bit-identical to attention_mma_full.
+    fn encode_attn_gemm(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
+        use crate::shaders::attention_gemm::{BM, BN, SOFTMAX_TPG, n_pad};
+        let l = &layout.layers[layer];
+        let hd = l.head_dim as usize;
+        let nkv = l.n_kv_heads as usize;
+        let group = STEP_NQ_HEADS / nkv;
+        let m = self.active_canvas;
+        let kv_len = self.dispatch_kv_len() as usize;
+        let t_total = kv_len + m;
+        let np = n_pad(t_total);
+        // Q/O sub-chunk row offset into the batched prefill planes.
+        let qo_row = CANVAS * self.sub_c * STEP_NQ_HEADS * hd * 2;
+
+        let dims = crate::shaders::attention_gemm::AttnGemmDims {
+            m: m as u32,
+            n: t_total as u32,
+            k: hd as u32,
+            a_row_stride: (STEP_NQ_HEADS * hd) as u32,
+            b_row_stride: (nkv * hd * 2) as u32,
+            s_row_stride: np as u32,
+            out_row_stride: (STEP_NQ_HEADS * hd) as u32,
+            causal: 1,
+            kv_len: kv_len as u32,
+            hd: hd as u32,
+            group: group as u32,
+            nkv: nkv as u32,
+            s_head_stride: (m * np) as u32,
+        };
+        let dims_pv = crate::shaders::attention_gemm::AttnGemmDims {
+            n: hd as u32,
+            k: t_total as u32,
+            a_row_stride: np as u32,
+            ..dims
+        };
+
+        let tg128 = MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        };
+        let heads = STEP_NQ_HEADS;
+        let grid_qk = MTLSize {
+            width: t_total.div_ceil(BN),
+            height: m.div_ceil(BM),
+            depth: heads,
+        };
+        let grid_sm = MTLSize {
+            width: m,
+            height: heads,
+            depth: 1,
+        };
+        let tg_sm = MTLSize {
+            width: SOFTMAX_TPG,
+            height: 1,
+            depth: 1,
+        };
+        let grid_pv = MTLSize {
+            width: hd.div_ceil(BN),
+            height: m.div_ceil(BM),
+            depth: heads,
+        };
+
+        // QK: S = Q.K^T (all heads). Q at the sub-chunk offset; K at this
+        // layer's kv_region (kv16 base = kvcache + kv_region bytes).
+        self.sink_set_pipeline(&self.ps.attn_gemm.as_ref().unwrap()[0]);
+        self.sink_set_buffer(
+            &self.bufs.arena,
+            self.arena().attnq_off() as usize + qo_row,
+            0,
+        );
+        self.sink_set_buffer(&self.bufs.kvcache, l.kv_region as usize, 1);
+        self.sink_set_buffer(self.bufs.attn_gemm_s.as_ref().unwrap(), 0, 2);
+        self.sink_set_bytes(&dims, 3);
+        self.sink_dispatch(grid_qk, tg128);
+        self.sink_memory_barrier();
+
+        // Softmax: P = exp(S - rowmax), masked; denom -> lrow (all heads).
+        self.sink_set_pipeline(&self.ps.attn_gemm.as_ref().unwrap()[1]);
+        self.sink_set_buffer(self.bufs.attn_gemm_s.as_ref().unwrap(), 0, 0);
+        self.sink_set_buffer(self.bufs.attn_gemm_p.as_ref().unwrap(), 0, 1);
+        self.sink_set_buffer(self.bufs.attn_gemm_lrow.as_ref().unwrap(), 0, 2);
+        self.sink_set_bytes(&dims, 3);
+        self.sink_dispatch(grid_sm, tg_sm);
+        self.sink_memory_barrier();
+
+        // PV: O = (P.V) / L. V at kv_region (kernel adds (nkv+kvh)*hd); O at the
+        // sub-chunk offset in the attno plane.
+        self.sink_set_pipeline(&self.ps.attn_gemm.as_ref().unwrap()[2]);
+        self.sink_set_buffer(self.bufs.attn_gemm_p.as_ref().unwrap(), 0, 0);
+        self.sink_set_buffer(&self.bufs.kvcache, l.kv_region as usize, 1);
+        self.sink_set_buffer(
+            &self.bufs.arena,
+            self.arena().attno_off() as usize + qo_row,
+            2,
+        );
+        self.sink_set_buffer(self.bufs.attn_gemm_lrow.as_ref().unwrap(), 0, 3);
+        self.sink_set_bytes(&dims_pv, 4);
+        self.sink_dispatch(grid_pv, tg128);
+        self.sink_memory_barrier();
+        Ok(())
+    }
+
     fn encode_layer_attention_dispatch(
         &mut self,
         layer: usize,
@@ -3079,6 +3201,10 @@ impl StepEnc<'_> {
     ) -> Result<(), Error> {
         let layer_off = layer_byte_offset(layer);
         let l = &layout.layers[layer];
+        // E17: full-layer prefill attention through the GEMM decomposition.
+        if self.prefill_causal && l.is_full == 1 && self.ps.attn_gemm.is_some() {
+            return self.encode_attn_gemm(layer, layout);
+        }
         // GQA-grouped MMA attention (`DGQ_ATTN_MMA`) handles sliding layers (hd=256)
         // via attention_mma2; full hd=512 layers use attention_mma_full
         // (`DGQ_ATTN_MMA_FULL`, register-resident O + group K/V sharing) when
@@ -5418,6 +5544,32 @@ pub fn build_step_runtime(
             &ctx.device,
             STEP_NQ_HEADS * CANVAS * (2 + 512) * std::mem::size_of::<f32>(),
         )?,
+        // E17 GEMM-attention prefill scratch (opt-in). Sized to the largest
+        // per-sub score matrix: [n_q_heads][CANVAS][n_pad(max_seq)]. Only
+        // allocated when DGQ_GEMM_ATTN is set (2-3 GiB at long ctx).
+        attn_gemm_s: if crate::flags::gemm_attn_enabled() {
+            let np = crate::shaders::attention_gemm::n_pad(cfg.max_seq);
+            Some(alloc_buffer(
+                &ctx.device,
+                STEP_NQ_HEADS * CANVAS * np * std::mem::size_of::<f32>(),
+            )?)
+        } else {
+            None
+        },
+        attn_gemm_p: if crate::flags::gemm_attn_enabled() {
+            let np = crate::shaders::attention_gemm::n_pad(cfg.max_seq);
+            Some(alloc_buffer(&ctx.device, STEP_NQ_HEADS * CANVAS * np * 2)?)
+        } else {
+            None
+        },
+        attn_gemm_lrow: if crate::flags::gemm_attn_enabled() {
+            Some(alloc_buffer(
+                &ctx.device,
+                STEP_NQ_HEADS * CANVAS * std::mem::size_of::<f32>(),
+            )?)
+        } else {
+            None
+        },
         params_sub: alloc_buffer(
             &ctx.device,
             PREFILL_SUBS * std::mem::size_of::<StepParams>(),

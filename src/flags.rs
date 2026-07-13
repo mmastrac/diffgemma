@@ -104,6 +104,11 @@ pub struct PerfFlags {
     pub prefill_resident: bool,
     /// `DGQ_ATTN_KV_BLOCK`: block size for sequential full-attention. Default 0 (OFF).
     pub attn_kv_block: usize,
+    /// `DGQ_GEMM_ATTN` (E17): route full-layer PREFILL attention through the
+    /// GEMM decomposition (attn_gemm_qk/softmax/pv) instead of attention_mma_full.
+    /// ~1.78x on the attention kernel; not bit-identical (full quality gate).
+    /// Default OFF.
+    pub gemm_attn: bool,
 }
 
 impl Default for PerfFlags {
@@ -124,6 +129,7 @@ impl Default for PerfFlags {
             fast_block_extend: true,
             prefill_resident: true,
             attn_kv_block: 0,
+            gemm_attn: false,
         }
     }
 }
@@ -355,6 +361,7 @@ impl RuntimeConfig {
                 fast_block_extend: env_on_unless_zero("DGQ_FAST_BLOCK_EXTEND"),
                 prefill_resident: env_on_unless_zero("DGQ_PREFILL_RESIDENT"),
                 attn_kv_block: parse_usize("DGQ_ATTN_KV_BLOCK", 0),
+                gemm_attn: env_on_if_one("DGQ_GEMM_ATTN"),
             },
             prefill: PrefillFlags {
                 f16: env_on_if_one("DGQ_PREFILL_F16"),
@@ -611,6 +618,13 @@ pub fn attn_mma_enabled() -> bool {
 /// `DGQ_ATTN_MMA_FULL=0` restores the scalar kernel.
 pub fn attn_mma_full_enabled() -> bool {
     config().perf.attn_mma_full
+}
+
+/// E17: route full-layer PREFILL attention through the GEMM decomposition
+/// (attn_gemm_qk/softmax/pv) instead of attention_mma_full. ~1.78x on the
+/// attention kernel; not bit-identical (full quality gate). `DGQ_GEMM_ATTN=1`.
+pub fn gemm_attn_enabled() -> bool {
+    config().perf.gemm_attn
 }
 
 /// Router-as-GEMM (~30ms/step). Non-bit-identical (near-tie expert flips =
