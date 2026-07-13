@@ -279,6 +279,10 @@ pub(crate) fn run_smoketest_cmd(
         // the default gate runs only adherence+convergence and stays fast.
         if longctx {
             println!("\n[longctx doc-QA]");
+            // Keyword-level retrieval accounting (catches stochastic drift that
+            // the per-doc binary pass/fail hides): count markers found vs total.
+            let mut kw_found = 0usize;
+            let mut kw_total = 0usize;
             for p in &spec.longctx {
                 total += 1;
                 if !doc_ids_cache.contains_key(&p.doc) {
@@ -315,6 +319,8 @@ pub(crate) fn run_smoketest_cmd(
                     .filter(|k| !smoke_answer_matches(&reply, k, &[]))
                     .map(String::as_str)
                     .collect();
+                kw_total += p.require.len();
+                kw_found += p.require.len() - missing.len();
                 let conv_ok = st <= p.max_steps;
                 let ok = missing.is_empty() && conv_ok;
                 if ok {
@@ -334,11 +340,22 @@ pub(crate) fn run_smoketest_cmd(
                     .take(72)
                     .collect::<String>()
                     .replace('\n', " ");
+                let found = p.require.len() - missing.len();
                 println!(
-                    "  {id:<22} {mark:<4} doc {n:>5}tok steps {st:>3}/{max:<3} {af}  | {prev}",
-                    id = p.id
+                    "  {id:<22} {mark:<4} doc {n:>5}tok steps {st:>3}/{max:<3} kw {found}/{tot} {af}  | {prev}",
+                    id = p.id,
+                    tot = p.require.len()
                 );
             }
+            let rate = if kw_total > 0 {
+                100.0 * kw_found as f64 / kw_total as f64
+            } else {
+                100.0
+            };
+            println!(
+                "longctx keyword retrieval: {kw_found}/{kw_total} ({rate:.1}%)  [drift = {:.1}%]",
+                100.0 - rate
+            );
             continue;
         }
         if !spec.adherence.is_empty() {
