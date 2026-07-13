@@ -215,7 +215,7 @@
         "block_steps_eff": [
           3
         ],
-        "kv_hash": "kv_96115f3801729639"
+        "kv_hash": "kv_13e03cac36057864"
       }
     },
     {
@@ -683,7 +683,7 @@
           10,
           5
         ],
-        "kv_hash": "kv_39fbc187341dd2c5"
+        "kv_hash": "kv_f194aecb357e818e"
       }
     },
     {
@@ -3883,13 +3883,13 @@
           236828,
           84750
         ],
-        "denoise_steps_run": 6,
+        "denoise_steps_run": 5,
         "blocks_committed": 1,
         "stopped_on_eot": true,
         "block_steps_eff": [
-          6
+          5
         ],
-        "kv_hash": "kv_0e02fb8b43ce378e"
+        "kv_hash": "kv_48f67b52461b26f5"
       }
     },
     {
@@ -6420,6 +6420,7 @@
           38917,
           711,
           4928,
+          1018,
           496,
           1550,
           573,
@@ -6429,16 +6430,15 @@
           1989,
           236779,
           10589,
-          236929,
-          84750
+          21233
         ],
-        "denoise_steps_run": 7,
+        "denoise_steps_run": 6,
         "blocks_committed": 1,
         "stopped_on_eot": true,
         "block_steps_eff": [
-          7
+          6
         ],
-        "kv_hash": "kv_e7b0884fd132dfce"
+        "kv_hash": "kv_bac1a05fd6df55b8"
       }
     },
     {
@@ -19309,8 +19309,7 @@
           236751,
           1018,
           568,
-          17868,
-          236761,
+          78470,
           236743,
           236812,
           236761,
@@ -19326,7 +19325,7 @@
         "block_steps_eff": [
           5
         ],
-        "kv_hash": "kv_10f9dc8140182c97"
+        "kv_hash": "kv_581807b4692d170e"
       }
     }
   ]

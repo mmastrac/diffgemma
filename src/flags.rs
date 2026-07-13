@@ -106,8 +106,10 @@ pub struct PerfFlags {
     pub attn_kv_block: usize,
     /// `DGQ_GEMM_ATTN` (E17): route full-layer PREFILL attention through the
     /// GEMM decomposition (attn_gemm_qk/softmax/pv) instead of attention_mma_full.
-    /// ~1.78x on the attention kernel; not bit-identical (full quality gate).
-    /// Default OFF.
+    /// ~1.78x on the attention kernel, -16-19% real 30k prefill. Not bit-identical
+    /// (decomposition batch-softmax vs the flash kernel's online softmax) but
+    /// gate-passing (17/17 x{7,42,123}, longctx 4/4); signed off default ON
+    /// 2026-07-13. Prefill-only; denoise keeps attention_mma_full. `=0` restores it.
     pub gemm_attn: bool,
     /// `DGQ_GEMM_ATTN_HC` (E17a): Q heads processed per E17 dispatch batch.
     /// Bounds the S/P scratch to [HC][CANVAS][n_pad(max_seq)]. Default 4.
@@ -132,7 +134,7 @@ impl Default for PerfFlags {
             fast_block_extend: true,
             prefill_resident: true,
             attn_kv_block: 0,
-            gemm_attn: false,
+            gemm_attn: true,
             gemm_attn_head_chunk: 4,
         }
     }
@@ -365,7 +367,7 @@ impl RuntimeConfig {
                 fast_block_extend: env_on_unless_zero("DGQ_FAST_BLOCK_EXTEND"),
                 prefill_resident: env_on_unless_zero("DGQ_PREFILL_RESIDENT"),
                 attn_kv_block: parse_usize("DGQ_ATTN_KV_BLOCK", 0),
-                gemm_attn: env_on_if_one("DGQ_GEMM_ATTN"),
+                gemm_attn: env_on_unless_zero("DGQ_GEMM_ATTN"),
                 gemm_attn_head_chunk: parse_usize("DGQ_GEMM_ATTN_HC", 4).max(1),
             },
             prefill: PrefillFlags {
