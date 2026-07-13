@@ -1026,14 +1026,36 @@ impl StepPipelines {
                 ctx, prod, fmt,
             )?,
             attn_gemm: if crate::flags::gemm_attn_enabled() {
-                Some(crate::shaders::attention_gemm::pipelines(ctx, prod)?)
+                let (qk_bm, qk_bn, pv_bm, pv_bn, sm_tpg) = crate::flags::gemm_attn_tile();
+                let cfg = crate::shaders::attention_gemm::TuneCfg {
+                    hc: crate::flags::gemm_attn_head_chunk(),
+                    qk_bm,
+                    qk_bn,
+                    pv_bm,
+                    pv_bn,
+                    sm_tpg,
+                };
+                Some(crate::shaders::attention_gemm::pipelines_cfg(
+                    ctx, prod, cfg, false,
+                )?)
             } else {
                 None
             },
             attn_gemm_side: if crate::flags::gemm_attn_enabled()
                 && crate::flags::prefill_kv_f32_enabled()
             {
-                Some(crate::shaders::attention_gemm::pipelines_side(ctx, prod)?)
+                let (qk_bm, qk_bn, pv_bm, pv_bn, sm_tpg) = crate::flags::gemm_attn_tile();
+                let cfg = crate::shaders::attention_gemm::TuneCfg {
+                    hc: crate::flags::gemm_attn_head_chunk(),
+                    qk_bm,
+                    qk_bn,
+                    pv_bm,
+                    pv_bn,
+                    sm_tpg,
+                };
+                Some(crate::shaders::attention_gemm::pipelines_cfg(
+                    ctx, prod, cfg, true,
+                )?)
             } else {
                 None
             },
@@ -3104,7 +3126,9 @@ impl StepEnc<'_> {
     /// caller guarantees `prefill_causal && l.is_full == 1` and that the
     /// pipelines/scratch are present. Not bit-identical to attention_mma_full.
     fn encode_attn_gemm(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
-        use crate::shaders::attention_gemm::{BM, BN, SOFTMAX_TPG, n_pad};
+        use crate::shaders::attention_gemm::n_pad;
+        // Tunable tile geometry (task #87) — must match the compiled pipelines.
+        let (qk_bm, qk_bn, pv_bm, pv_bn, sm_tpg) = crate::flags::gemm_attn_tile();
         let l = &layout.layers[layer];
         let hd = l.head_dim as usize;
         let nkv = l.n_kv_heads as usize;
@@ -3139,7 +3163,7 @@ impl StepEnc<'_> {
             depth: 1,
         };
         let tg_sm = MTLSize {
-            width: SOFTMAX_TPG,
+            width: sm_tpg,
             height: 1,
             depth: 1,
         };
@@ -3167,8 +3191,8 @@ impl StepEnc<'_> {
                 ..dims
             };
             let grid_qk = MTLSize {
-                width: t_total.div_ceil(BN),
-                height: m.div_ceil(BM),
+                width: t_total.div_ceil(qk_bn),
+                height: m.div_ceil(qk_bm),
                 depth: hb,
             };
             let grid_sm = MTLSize {
@@ -3177,8 +3201,8 @@ impl StepEnc<'_> {
                 depth: 1,
             };
             let grid_pv = MTLSize {
-                width: hd.div_ceil(BN),
-                height: m.div_ceil(BM),
+                width: hd.div_ceil(pv_bn),
+                height: m.div_ceil(pv_bm),
                 depth: hb,
             };
 

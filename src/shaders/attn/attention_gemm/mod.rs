@@ -133,6 +133,36 @@ pub fn pipelines_side(
     ])
 }
 
+/// Production pipelines specialized for a tunable tile config (task #87): QK +
+/// softmax compiled with the QK tile, PV with the PV tile (independent shapes).
+/// The default cfg (64x64/64x64/256) yields byte-identical kernels to
+/// `pipelines`/`pipelines_side`, so a default-flag build is unchanged.
+#[cfg(target_os = "macos")]
+pub fn pipelines_cfg(
+    ctx: &crate::metal::device::MetalContext,
+    variant: crate::shaders::variant::KernelVariant,
+    cfg: TuneCfg,
+    side: bool,
+) -> Result<[crate::metal::device::ComputePipeline; 3], Error> {
+    use crate::shaders::variant::FcBool;
+    let bools: &[FcBool] = if side {
+        &[FcBool {
+            index: 30,
+            value: true,
+        }]
+    } else {
+        &[]
+    };
+    let label = if side { "cfg_side" } else { "cfg" };
+    let src_qk = tuned_source(cfg.qk_bm, cfg.qk_bn, cfg.sm_tpg);
+    let src_pv = tuned_source(cfg.pv_bm, cfg.pv_bn, cfg.sm_tpg);
+    Ok([
+        ctx.compile_subkernel_ex(&src_qk, ENTRY_QK, variant, label, bools, &[])?,
+        ctx.compile_subkernel_ex(&src_qk, ENTRY_SOFTMAX, variant, label, bools, &[])?,
+        ctx.compile_subkernel_ex(&src_pv, ENTRY_PV, variant, label, bools, &[])?,
+    ])
+}
+
 // --------------------------------------------------------------------------
 // GPU oracle: run the 3-kernel decomposition over an `attention::Fixture` and
 // return bf16-rounded outputs, to cross-check against the CPU attention oracle

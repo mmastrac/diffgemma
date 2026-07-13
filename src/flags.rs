@@ -114,6 +114,14 @@ pub struct PerfFlags {
     /// `DGQ_GEMM_ATTN_HC` (E17a): Q heads processed per E17 dispatch batch.
     /// Bounds the S/P scratch to [HC][CANVAS][n_pad(max_seq)]. Default 4.
     pub gemm_attn_head_chunk: usize,
+    /// E17 tunable tile geometry (task #87 sweep). QK GEMM tile qk_bm x qk_bn,
+    /// PV GEMM tile pv_bm x pv_bn, softmax threads/row. Defaults reproduce the
+    /// shipped 64x64/256 kernel. `DGQ_GEMM_ATTN_{QK_BM,QK_BN,PV_BM,PV_BN,SM_TPG}`.
+    pub gemm_attn_qk_bm: usize,
+    pub gemm_attn_qk_bn: usize,
+    pub gemm_attn_pv_bm: usize,
+    pub gemm_attn_pv_bn: usize,
+    pub gemm_attn_sm_tpg: usize,
 }
 
 impl Default for PerfFlags {
@@ -136,6 +144,11 @@ impl Default for PerfFlags {
             attn_kv_block: 0,
             gemm_attn: true,
             gemm_attn_head_chunk: 4,
+            gemm_attn_qk_bm: 64,
+            gemm_attn_qk_bn: 64,
+            gemm_attn_pv_bm: 64,
+            gemm_attn_pv_bn: 64,
+            gemm_attn_sm_tpg: 256,
         }
     }
 }
@@ -369,6 +382,11 @@ impl RuntimeConfig {
                 attn_kv_block: parse_usize("DGQ_ATTN_KV_BLOCK", 0),
                 gemm_attn: env_on_unless_zero("DGQ_GEMM_ATTN"),
                 gemm_attn_head_chunk: parse_usize("DGQ_GEMM_ATTN_HC", 4).max(1),
+                gemm_attn_qk_bm: parse_usize("DGQ_GEMM_ATTN_QK_BM", 64).max(16),
+                gemm_attn_qk_bn: parse_usize("DGQ_GEMM_ATTN_QK_BN", 64).max(16),
+                gemm_attn_pv_bm: parse_usize("DGQ_GEMM_ATTN_PV_BM", 64).max(16),
+                gemm_attn_pv_bn: parse_usize("DGQ_GEMM_ATTN_PV_BN", 64).max(16),
+                gemm_attn_sm_tpg: parse_usize("DGQ_GEMM_ATTN_SM_TPG", 256).max(32),
             },
             prefill: PrefillFlags {
                 f16: env_on_if_one("DGQ_PREFILL_F16"),
@@ -638,6 +656,19 @@ pub fn gemm_attn_enabled() -> bool {
 /// 4). Bounds the S/P prefill scratch; clamped to n_q_heads at dispatch.
 pub fn gemm_attn_head_chunk() -> usize {
     config().perf.gemm_attn_head_chunk
+}
+
+/// E17 tunable tile config (task #87). Defaults reproduce the shipped
+/// 64x64/256 kernel. Returns (qk_bm, qk_bn, pv_bm, pv_bn, sm_tpg).
+pub fn gemm_attn_tile() -> (usize, usize, usize, usize, usize) {
+    let p = &config().perf;
+    (
+        p.gemm_attn_qk_bm,
+        p.gemm_attn_qk_bn,
+        p.gemm_attn_pv_bm,
+        p.gemm_attn_pv_bn,
+        p.gemm_attn_sm_tpg,
+    )
 }
 
 /// Router-as-GEMM (~30ms/step). Non-bit-identical (near-tie expert flips =
