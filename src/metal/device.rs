@@ -1,5 +1,5 @@
+use crate::Error;
 use crate::metal::pipeline_cache::PipelineArchiveCache;
-use crate::safetensors::Error;
 use crate::shaders::variant::KernelVariant;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;

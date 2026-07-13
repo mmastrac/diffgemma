@@ -1,9 +1,9 @@
 //! Device bandwidth and GEMM throughput probes (Q0).
 
+use crate::Error;
 use crate::metal::buffer::BufferPool;
 use crate::metal::device::MetalContext;
 use crate::metal::gemm::Bf16Gemm;
-use crate::safetensors::Error;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,

@@ -51,12 +51,12 @@ pub struct DenoiseTrace {
 }
 
 impl DenoiseTrace {
-    pub fn write(&self, path: &std::path::Path) -> Result<(), crate::safetensors::Error> {
+    pub fn write(&self, path: &std::path::Path) -> Result<(), crate::Error> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(crate::safetensors::Error::Io)?;
+            std::fs::create_dir_all(parent).map_err(crate::Error::Io)?;
         }
-        let text = serde_json::to_string_pretty(self).map_err(crate::safetensors::Error::Json)?;
-        std::fs::write(path, text).map_err(crate::safetensors::Error::Io)
+        let text = serde_json::to_string_pretty(self).map_err(crate::Error::Json)?;
+        std::fs::write(path, text).map_err(crate::Error::Io)
     }
 }
 

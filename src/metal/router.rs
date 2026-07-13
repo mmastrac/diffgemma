@@ -1,12 +1,12 @@
 //! GPU MoE router: RMSNorm → scale → linear → top-k → softmax(top-k).
 
+use crate::Error;
 use crate::config::TextConfig;
 use crate::metal::batch::GpuBatch;
 use crate::metal::batched_kernels::{self as bk, f32_f32_linear_gpu_bufs};
 use crate::metal::kernels::GpuKernels;
 use crate::metal::weights::GpuLayerWeightCache;
 use crate::model::moe::RouteResult;
-use crate::safetensors::Error;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLBuffer;
 

@@ -30,7 +30,7 @@ pub(crate) fn attach_step_prefill(
     kv_len: u32,
     prompt: Option<&str>,
     raw_prompt: bool,
-) -> Result<(), safetensors::Error> {
+) -> Result<(), crate::Error> {
     if kv_len == 0 && prompt.is_none() {
         return Ok(());
     }
@@ -47,7 +47,7 @@ pub(crate) fn attach_step_prefill(
 pub(crate) fn resolve_model_layers(
     model_dir: &std::path::Path,
     override_layers: Option<usize>,
-) -> Result<usize, safetensors::Error> {
+) -> Result<usize, crate::Error> {
     let cfg = crate::config::ModelConfig::load(model_dir)?;
     let n = cfg.text_config.num_hidden_layers.max(1);
     Ok(override_layers.unwrap_or(n).max(1).min(n))
@@ -59,7 +59,7 @@ pub(crate) fn build_prompt_tokens(
     vocab: usize,
     raw_prompt: bool,
     history: &[chat_template::ChatTurn],
-) -> Result<Vec<u32>, safetensors::Error> {
+) -> Result<Vec<u32>, crate::Error> {
     if let Some(text) = prompt_text {
         let tok_path = model_dir.join("tokenizer.json");
         let tokenizer = tokenizer::Tokenizer::load(&tok_path)?;
@@ -86,7 +86,7 @@ pub(crate) fn build_chat_prompt_tokens(
     model_dir: &std::path::Path,
     history: &[chat_template::ChatTurn],
     raw_prompt: bool,
-) -> Result<Vec<u32>, safetensors::Error> {
+) -> Result<Vec<u32>, crate::Error> {
     let tok_path = model_dir.join("tokenizer.json");
     let tokenizer = tokenizer::Tokenizer::load(&tok_path)?;
     if raw_prompt {

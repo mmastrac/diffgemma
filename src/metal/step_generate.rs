@@ -1,5 +1,6 @@
 //! M2/M4: end-to-end monolithic generate loop (prefill → denoise blocks → KV extend).
 
+use crate::Error;
 use crate::denoise_trace::{DenoiseTrace, SCHEMA_VERSION, step_trace_from_stats};
 use crate::generate::GenerateOutput;
 use crate::metal::step_kernel::{
@@ -13,7 +14,6 @@ use crate::metal::step_kv::{
     extend_monolithic_kv_with_cache, prefill_monolithic_kv_with_cache,
 };
 use crate::metal::{ForwardTelemetry, SessionTelemetry, StepPhaseTelemetry};
-use crate::safetensors::Error;
 use crate::sample::{Rng, SamplerConfig, step_entropy_stats};
 use crate::tokenizer::Tokenizer;
 use std::path::{Path, PathBuf};

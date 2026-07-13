@@ -1,6 +1,6 @@
 //! GELU (PyTorch tanh) — CPU oracle, GPU dispatch, tier-1 tests.
 
-use crate::safetensors::Error;
+use crate::Error;
 use crate::shaders::cpu;
 use crate::shaders::manifest;
 use crate::shaders::test_util::ElemFormat;

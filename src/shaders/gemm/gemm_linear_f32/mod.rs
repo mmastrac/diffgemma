@@ -1,9 +1,9 @@
 //! Scalar f32 block GEMM: `C[M,N] = A[M,K] @ W[N,K]^T` (engine reference path).
 
+use crate::Error;
 use crate::dgq::block::quantize_row_q4;
 use crate::dgq::layout::{nvfp4_matrix_bytes, q4_matrix_bytes, q4_row_bytes};
 use crate::dgq::nvfp4::quantize_f32_matrix_nvfp4_with_scale;
-use crate::safetensors::Error;
 use crate::shaders::QuantFormat;
 use crate::shaders::cpu::gemm_linear_f32::gemm_linear_f32_cpu;
 use crate::shaders::gpu_common;

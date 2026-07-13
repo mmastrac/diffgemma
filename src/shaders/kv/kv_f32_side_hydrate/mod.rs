@@ -2,7 +2,7 @@
 //! cache (f16 or q8 source) — used when a fast prefill resumes at an offset
 //! the side ring is not valid for.
 
-use crate::safetensors::Error;
+use crate::Error;
 use crate::shaders::variant::KernelVariant;
 
 pub const ENTRY: &str = "kv_f32_side_hydrate";

@@ -1,10 +1,10 @@
 //! Grouped MoE NVFP4: per-expert gate||up → GELU×up → down, weighted scatter.
 
 use super::{Fixture, THREADGROUP_WIDTH, tiny_fixture as q4_tiny, wide_fixture as q4_wide};
+use crate::Error;
 use crate::dgq::layout::nvfp4_matrix_bytes;
 use crate::dgq::nvfp4::quantize_f32_matrix_nvfp4;
 use crate::metal::{LayerOffsets, RouteScratch};
-use crate::safetensors::Error;
 use crate::shaders::bf16;
 use crate::shaders::cpu::moe_grouped::moe_grouped_nvfp4;
 use crate::shaders::gpu_common;

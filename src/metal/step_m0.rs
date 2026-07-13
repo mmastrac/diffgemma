@@ -1,5 +1,6 @@
 //! Phase M0 correctness gates for the monolithic step kernel (`PLAN_MONOLITHIC.md`).
 
+use crate::Error;
 use crate::dgq::block::{dequant_row_q4, q4_weight_at};
 use crate::dgq::layout::GROUP_SIZE;
 use crate::metal::GpuDecoderEngine;
@@ -10,7 +11,6 @@ use crate::metal::step_kernel::{
 };
 use crate::model::decoder::DecoderForwardInput;
 use crate::model::mask::DecoderAttnMask;
-use crate::safetensors::Error;
 use crate::sample::{Rng, SamplerConfig, initialize_canvas};
 use std::path::Path;
 

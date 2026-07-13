@@ -1,10 +1,10 @@
 //! Validate `config.json` against monolithic shader compile-time constants (M4.5).
 
+use crate::Error;
 use crate::config::{LayerType, ModelConfig};
 use crate::metal::step_kernel::{
     CANVAS, DENSE_FF, FULL_LAYERS, HID, MOE_FF, N_EXPERTS, N_LAYERS, TOP_K, VOCAB,
 };
-use crate::safetensors::Error;
 use std::path::Path;
 
 #[derive(Debug, Clone)]

@@ -19,6 +19,8 @@ mod config;
 mod conversation;
 mod denoise_trace;
 mod dgq;
+mod error;
+pub use error::Error;
 mod fast_slice;
 mod flags;
 mod generate;

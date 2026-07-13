@@ -1,6 +1,6 @@
+use crate::Error;
 use crate::config::TextConfig;
 use crate::model::layer_weights::DecoderLayerWeights;
-use crate::safetensors::Error;
 use crate::shaders::cpu::{gelu_pytorch_tanh, linear_bf16_slice, rms_norm_no_scale, rms_norm_rows};
 use crate::tensor::Bf16Slice;
 

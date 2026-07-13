@@ -1,8 +1,8 @@
 //! Batched Metal dispatches: many kernels, one `commit` + `waitUntilCompleted`.
 
+use crate::Error;
 use crate::metal::buffer::BufferPool;
 use crate::metal::telemetry::ForwardTelemetry;
-use crate::safetensors::Error;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{

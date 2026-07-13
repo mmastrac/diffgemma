@@ -1,7 +1,7 @@
 //! Top-k MoE routing from raw logits per row.
 
+use crate::Error;
 use crate::model::moe::top_k_route_from_raw_logits;
-use crate::safetensors::Error;
 use crate::shaders::test_util::ElemFormat;
 use crate::shaders::variant::KernelVariant;
 

@@ -3,7 +3,7 @@
 //! over src/dst element dtype (f32 vs activation-arena bf16/fp16) via FC4/FC5.
 //! Subsumes half_to_f32, half_scale (in-place), copy_f32, f32_to_half_scale.
 
-use crate::safetensors::Error;
+use crate::Error;
 use crate::shaders::variant::KernelVariant;
 
 pub const ENTRY: &str = "convert_scale";

@@ -1,7 +1,7 @@
 //! Per-layer MoE/FFN dumps (router picks, dense + MoE outputs) for MLX parity.
 
+use crate::Error;
 use crate::metal::step_kernel::{LayerMoeCapture, StepSmokeConfig, run_step_moe_layer_capture};
-use crate::safetensors::Error;
 use serde::Serialize;
 use std::path::Path;
 

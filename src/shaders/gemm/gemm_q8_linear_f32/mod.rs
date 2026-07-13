@@ -1,8 +1,8 @@
 //! Scalar f32 Q8 GEMM: `C[M,N] = A[M,K] @ W[N,K]^T`.
 
+use crate::Error;
 use crate::dgq::block::{q8_gemm_cpu, quantize_row_q8};
 use crate::dgq::layout::{q8_matrix_bytes, q8_row_bytes};
-use crate::safetensors::Error;
 use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;
 use crate::shaders::variant::KernelVariant;

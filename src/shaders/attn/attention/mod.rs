@@ -1,7 +1,7 @@
 //! All-valid GQA attention over monolithic KV cache (online softmax).
 
+use crate::Error;
 use crate::metal::{LayerOffsets, StepParams};
-use crate::safetensors::Error;
 use crate::shaders::bf16;
 use crate::shaders::cpu::attention::{self, LayerAttnParams};
 use crate::shaders::gpu_common;

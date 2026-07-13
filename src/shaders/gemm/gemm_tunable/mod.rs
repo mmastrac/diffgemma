@@ -6,7 +6,7 @@
 //! Production wiring behind `DGQ_GEMM_TUNABLE` starts with the Raw (bf16
 //! weight) plain path; 64x64 won every production shape in the sweep.
 
-use crate::safetensors::Error;
+use crate::Error;
 use crate::shaders::QuantFormat;
 
 pub const ENTRY: &str = "gemm_tunable";

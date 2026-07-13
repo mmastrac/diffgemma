@@ -1,6 +1,6 @@
 //! Pack engine GpuKvCache f32 K/V into monolithic b4 layout.
 
-use crate::safetensors::Error;
+use crate::Error;
 use crate::shaders::variant::KernelVariant;
 
 pub const ENTRY: &str = "pack_encoder_kv";

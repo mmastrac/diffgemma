@@ -1,7 +1,7 @@
 //! Tempered row stats + entropy + argmax for monolithic sampler pass 1.
 
+use crate::Error;
 use crate::metal::{CANVAS, CanvasState, StepParams};
-use crate::safetensors::Error;
 use crate::sample::PAD_TOKEN_ID;
 use crate::shaders::bf16;
 use crate::shaders::cpu::sampler::{temp_at, tempered_row_stats};

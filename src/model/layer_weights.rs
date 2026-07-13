@@ -1,5 +1,5 @@
+use crate::Error;
 use crate::config::{LayerType, TextConfig};
-use crate::safetensors::Error;
 use crate::tensor::TensorView;
 use crate::weights::WeightStore;
 

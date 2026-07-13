@@ -1,7 +1,7 @@
 //! Sampler pass 3: categorical inverse-CDF per row from tempered logits.
 
+use crate::Error;
 use crate::metal::{CANVAS, CanvasState, StepParams};
-use crate::safetensors::Error;
 use crate::shaders::bf16;
 use crate::shaders::cpu::sampler::{
     TemperedRowStats, temp_at, tempered_row_stats, tempered_sample_row,

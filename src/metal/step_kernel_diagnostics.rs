@@ -3,10 +3,10 @@
 //! from step_kernel.rs (backlog item 4). Non-production paths only; the hot
 //! per-step engine stays in the parent module.
 
+use crate::Error;
 use crate::dgq::DgqStore;
 use crate::metal::step_quant::MoeExecutionStyle;
 use crate::model::moe::RouteResult;
-use crate::safetensors::Error;
 use crate::sample::Rng;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLBuffer;

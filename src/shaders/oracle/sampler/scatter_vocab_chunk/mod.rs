@@ -1,7 +1,7 @@
 //! Scatter lm_head GEMM chunk into `[seq, vocab]` logits.
 
+use crate::Error;
 use crate::model::embed::LM_HEAD_CHUNK;
-use crate::safetensors::Error;
 use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;
 

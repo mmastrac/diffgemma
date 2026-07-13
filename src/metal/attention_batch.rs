@@ -1,9 +1,9 @@
 //! Attention kernels batched through `GpuBatch` (shared engine pool/queue).
 
+use crate::Error;
 use crate::metal::batch::{GpuBatch, set_bytes};
 use crate::metal::device::ComputePipeline;
 use crate::model::attention::{AttentionParams, GqaMask, MASK_NEG};
-use crate::safetensors::Error;
 use crate::shaders::engine_gqa_common::{self, GqaParams};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;

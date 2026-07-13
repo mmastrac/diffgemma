@@ -9,8 +9,8 @@ pub mod mask;
 pub mod moe;
 pub mod self_conditioning;
 
+use crate::Error;
 use crate::config::ModelConfig;
-use crate::safetensors::Error;
 use crate::weights::WeightStore;
 use std::path::Path;
 

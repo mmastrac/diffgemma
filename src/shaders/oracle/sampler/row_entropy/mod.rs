@@ -1,6 +1,6 @@
 //! Per-row Shannon entropy from logits `[rows, cols]`.
 
-use crate::safetensors::Error;
+use crate::Error;
 use crate::sample::token_entropy;
 use crate::shaders::gpu_common;
 use crate::shaders::sampler_ranged::{CANVAS_LEN, VOCAB};

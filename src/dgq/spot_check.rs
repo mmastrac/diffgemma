@@ -1,8 +1,8 @@
 //! Spot-check: compare `.dgq` dequant vs original bf16 safetensors.
 
+use crate::Error;
 use crate::dgq::DgqStore;
 use crate::dgq::layout::QuantKind;
-use crate::safetensors::Error;
 use crate::shaders::cpu::bf16_to_f32;
 use crate::weights::SafetensorStore;
 

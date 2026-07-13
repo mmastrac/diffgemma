@@ -4,7 +4,7 @@
 //! text path: special tokens (`<bos>`, `<|turn>`, `<turn|>`, `<|channel>`,
 //! `<channel|>`) are inserted by ID; role lines and content are BPE-encoded.
 
-use crate::safetensors::Error;
+use crate::Error;
 use crate::tokenizer::Tokenizer;
 
 pub const BOS_TOKEN: &str = "<bos>";

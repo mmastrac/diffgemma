@@ -1,7 +1,7 @@
 //! Monolithic MoE router: RMSNorm → scale → linear → top-k → softmax(top-k).
 
+use crate::Error;
 use crate::metal::{LayerOffsets, RouteScratch, TOP_K};
-use crate::safetensors::Error;
 use crate::shaders::bf16;
 use crate::shaders::cpu::moe_router::{
     RouterDims as CpuRouterDims, moe_router_rows, pack_route_rows,

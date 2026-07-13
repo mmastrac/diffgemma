@@ -3,7 +3,7 @@
 //! (no-quant) CPU reference + weight bytes. The `Raw` weight format loads bf16
 //! weights directly (no dequant). Kernel source: `gemm_block/gemm_block.metal`.
 
-use crate::safetensors::Error;
+use crate::Error;
 use crate::shaders::QuantFormat;
 use crate::shaders::bf16;
 use crate::shaders::test_util::ElemFormat;

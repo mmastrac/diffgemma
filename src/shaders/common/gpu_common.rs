@@ -1,7 +1,7 @@
 //! Shared Metal helpers for tier-1 subkernel GPU tests.
 
 #[cfg(target_os = "macos")]
-use crate::safetensors::Error;
+use crate::Error;
 #[cfg(target_os = "macos")]
 use objc2::runtime::ProtocolObject;
 #[cfg(target_os = "macos")]

@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
-use crate::safetensors::{DType, Error, TensorInfo};
+use crate::Error;
+use crate::safetensors::{DType, TensorInfo};
 
 /// Zero-copy view into mmap'd safetensors payload.
 #[derive(Debug, Clone, Copy)]

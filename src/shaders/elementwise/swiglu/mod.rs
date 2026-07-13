@@ -1,6 +1,6 @@
 //! SwiGLU family: gate×up with layout/dtype/gelu/in-place compile-time axes.
 
-use crate::safetensors::Error;
+use crate::Error;
 use crate::shaders::bf16;
 use crate::shaders::cpu::{gelu_pytorch_tanh, gelu_pytorch_tanh_f32};
 use crate::shaders::gpu_common;

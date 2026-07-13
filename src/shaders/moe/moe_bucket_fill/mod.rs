@@ -1,8 +1,8 @@
 //! Expert bucketing phases 0/1/2 for grouped MoE dispatch.
 
 use super::moe_router::RouterDims;
+use crate::Error;
 use crate::metal::{RouteScratch, TOP_K};
-use crate::safetensors::Error;
 use crate::shaders::cpu::moe_router::{moe_bucket_phases, pack_bucket_state};
 use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;

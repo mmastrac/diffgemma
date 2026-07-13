@@ -1,5 +1,6 @@
 //! Soft embeddings and related GPU embed ops (`.dgq` q8 table).
 
+use crate::Error;
 use crate::metal::batch::{GpuBatch, begin_engine_batch};
 use crate::metal::batched_kernels as bk;
 use crate::metal::dgq_gpu::Q8LinearGpu;
@@ -7,7 +8,6 @@ use crate::metal::engine::GpuDecoderEngine;
 use crate::metal::kernels::GpuKernels;
 use crate::metal::linear::f32_q8_linear_kxn_gpu_bufs;
 use crate::model::embed::LM_HEAD_CHUNK;
-use crate::safetensors::Error;
 use crate::shaders::{gather_prob_cols, softmax_rows, vec_fill_zero, vec_scale_inplace};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;

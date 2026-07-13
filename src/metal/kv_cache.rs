@@ -1,10 +1,10 @@
 //! GPU-resident encoder KV for decoder attention (prefix on GPU; canvas suffix patched per forward).
 
+use crate::Error;
 use crate::config::TextConfig;
 use crate::metal::buffer::BufferPool;
 use crate::model::attention::AttentionParams;
 use crate::model::kv_cache::{KvCache, LayerKvView};
-use crate::safetensors::Error;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};

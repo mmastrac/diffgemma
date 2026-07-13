@@ -1,6 +1,6 @@
 //! Per-row max + sumexp over half logits (SC row stats at t=1).
 
-use crate::safetensors::Error;
+use crate::Error;
 use crate::shaders::bf16;
 use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;

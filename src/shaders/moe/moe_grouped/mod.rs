@@ -1,9 +1,9 @@
 //! Grouped MoE Q4: per-expert gate||up → GELU×up → down, weighted scatter.
 
+use crate::Error;
 use crate::dgq::block::quantize_row_q4;
 use crate::dgq::layout::{q4_matrix_bytes, q4_row_bytes};
 use crate::metal::{LayerOffsets, RouteScratch, TOP_K};
-use crate::safetensors::Error;
 use crate::shaders::bf16;
 use crate::shaders::cpu::moe_grouped::{GroupedRoute, MoeGroupedDims, moe_grouped_q4};
 use crate::shaders::cpu::moe_router::moe_bucket_phases;

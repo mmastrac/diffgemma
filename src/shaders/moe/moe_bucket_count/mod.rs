@@ -1,7 +1,7 @@
 //! Zero expert counts before MoE bucketing.
 
+use crate::Error;
 use crate::metal::{N_EXPERTS, RouteScratch};
-use crate::safetensors::Error;
 use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;
 use crate::shaders::variant::KernelVariant;

@@ -5,7 +5,7 @@ use crate::shaders::sampler_ranged::{CANVAS_LEN, VOCAB};
 use crate::shaders::test_util::ElemFormat;
 use crate::shaders::variant::KernelVariant;
 
-use crate::safetensors::Error;
+use crate::Error;
 
 pub const ENTRY: &str = "softmax_rows";
 pub const THREADGROUP_WIDTH: usize = 256;

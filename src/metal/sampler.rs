@@ -5,10 +5,10 @@
 //! (which samples via `shaders::sample::*` + `step_kernel`).
 #![allow(dead_code)]
 
+use crate::Error;
 use crate::metal::batch::{GpuBatch, set_bytes};
 use crate::metal::buffer::BufferPool;
 use crate::metal::sampler_kernels::GpuSamplerKernels;
-use crate::safetensors::Error;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder, MTLDevice};

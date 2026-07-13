@@ -1,5 +1,5 @@
+use crate::Error;
 use crate::metal::device::{ComputePipeline, MetalContext};
-use crate::safetensors::Error;
 use crate::shaders::variant::KernelVariant;
 
 pub struct GpuKernels {

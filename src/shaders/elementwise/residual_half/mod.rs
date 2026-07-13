@@ -1,6 +1,6 @@
 //! Half residual add with optional bf16 layer scalar from blob.
 
-use crate::safetensors::Error;
+use crate::Error;
 use crate::shaders::bf16;
 use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;

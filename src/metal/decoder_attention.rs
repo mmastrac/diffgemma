@@ -1,3 +1,4 @@
+use crate::Error;
 use crate::config::TextConfig;
 use crate::metal::attention_batch::{
     decoder_gqa_gpu_kv_batched_chained_qbuf, dispatch_copy_f32_to_buf, gqa_batched_chained,
@@ -12,7 +13,6 @@ use crate::metal::weights::GpuLayerWeightCache;
 use crate::model::attention::{AttentionParams, AttentionScratch, GqaMask, concat_kv_for_decoder};
 use crate::model::kv_cache::LayerKvView;
 use crate::model::mask::DecoderAttnMask;
-use crate::safetensors::Error;
 use crate::shaders::cpu::{compute_rope_freqs, rope_kind_for_layer};
 
 fn fused_input_qkv_heads(

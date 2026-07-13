@@ -3,7 +3,7 @@
 //! Persists device-specific pipeline ISA to disk so cold starts can skip
 //! recompilation after the first run (pure runtime API; no Metal SDK required).
 
-use crate::safetensors::Error;
+use crate::Error;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSArray, NSString, NSURL};

@@ -1,5 +1,6 @@
 //! Safetensors → `.dgq` offline quantizer (always from raw bf16 weights).
 
+use crate::Error;
 use crate::dgq::block::{
     quantize_bf16_matrix_q4, quantize_bf16_matrix_q6, quantize_bf16_matrix_q8,
     quantize_expert_stack_q4, quantize_expert_stack_q6,
@@ -9,7 +10,6 @@ use crate::dgq::layout::{
     align_offset, classify_tensor, dgq_version_for_profile,
 };
 use crate::dgq::nvfp4::{quantize_bf16_matrix_nvfp4, quantize_expert_stack_nvfp4};
-use crate::safetensors::Error;
 use crate::weights::SafetensorStore;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};

@@ -3,7 +3,7 @@
 //! (arena_row, weight) lists are built in expert-job order so the f32 sum
 //! order — and thus rounding — is bit-identical to the CPU scatter.
 
-use crate::safetensors::Error;
+use crate::Error;
 use crate::shaders::gpu_common;
 use crate::shaders::variant::KernelVariant;
 

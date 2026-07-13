@@ -1,7 +1,7 @@
+use crate::Error;
 use crate::metal::buffer::BufferPool;
 use crate::metal::device::{ComputePipeline, MetalContext};
 use crate::model::attention::{AttentionParams, GqaMask};
-use crate::safetensors::Error;
 use crate::shaders::engine_gqa_common::{self, GqaParams};
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{

@@ -1,5 +1,6 @@
 //! Single-expert MoE probe: bypass router, compare GPU grouped kernel vs CPU Q4 ref.
 
+use crate::Error;
 use crate::config::ModelConfig;
 use crate::dgq::DgqStore;
 use crate::metal::device::MetalContext;
@@ -12,7 +13,6 @@ use crate::metal::step_kernel::{
 };
 use crate::metal::weights::GpuDecoderWeightCache;
 use crate::model::moe::{MoeScratch, RouteResult};
-use crate::safetensors::Error;
 use crate::weights::WeightStore;
 use serde::Serialize;
 use std::path::Path;

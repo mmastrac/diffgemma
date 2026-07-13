@@ -1,5 +1,6 @@
 //! GPU decoder weights: bf16 paging + expert LRU, or resident `.dgq` blob.
 
+use crate::Error;
 use crate::buffer::Buffer;
 use crate::config::TextConfig;
 use crate::dgq::DgqStore;
@@ -12,7 +13,6 @@ use crate::metal::expert_cache::{ExpertCacheStats, ExpertWeightCache};
 use crate::metal::linear::GpuLinearWeight;
 use crate::metal::self_conditioning::GpuSelfConditioningWeights;
 use crate::model::layer_weights::DecoderLayerWeights;
-use crate::safetensors::Error;
 use crate::tensor::Bf16Slice;
 use crate::weights::WeightStore;
 use objc2::runtime::ProtocolObject;

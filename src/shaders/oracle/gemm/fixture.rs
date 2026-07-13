@@ -3,7 +3,7 @@
 //! weight-quant, and `QuantFormat`; the fixture shape and the GPU dispatch dance
 //! live here. Validation-only (bit-exact twins of `gemm_tunable`).
 
-use crate::safetensors::Error;
+use crate::Error;
 
 pub const ENTRY: &str = "gemm_block";
 pub const SHADER: &str = include_str!("gemm_block/gemm_block.metal");

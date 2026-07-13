@@ -1,6 +1,6 @@
 //! Gemma BPE tokenizer loaded from HuggingFace `tokenizer.json`.
 
-use crate::safetensors::Error;
+use crate::Error;
 use std::collections::HashMap;
 use std::path::Path;
 

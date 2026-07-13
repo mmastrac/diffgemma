@@ -419,7 +419,7 @@ pub(crate) fn write_generate_golden(
     steps: usize,
     weights_profile: &str,
     out: &generate::GenerateOutput,
-) -> Result<(), safetensors::Error> {
+) -> Result<(), crate::Error> {
     let golden = generate_golden::GenerateGolden::from_run(
         name,
         prompt,

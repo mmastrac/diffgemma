@@ -22,8 +22,8 @@
 //!
 //! [`finalize`]: ConversationManager::finalize
 
+use crate::Error;
 use crate::metal::{KvSnapshot, StepGenerateSession};
-use crate::safetensors::Error;
 use std::collections::HashMap;
 use std::path::PathBuf;
 

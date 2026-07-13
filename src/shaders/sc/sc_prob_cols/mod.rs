@@ -1,6 +1,6 @@
 //! Chunked SC softmax columns from logits + row stats (avoids full vocab prob matrix).
 
-use crate::safetensors::Error;
+use crate::Error;
 use crate::shaders::bf16;
 use crate::shaders::f16;
 use crate::shaders::gpu_common;

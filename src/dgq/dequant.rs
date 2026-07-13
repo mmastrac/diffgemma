@@ -1,9 +1,9 @@
 //! CPU dequant: quantized blob slices → f32 (oracle / parity path).
 
+use crate::Error;
 use crate::dgq::block::{dequant_matrix_q4, dequant_matrix_q8};
 use crate::dgq::layout::{QuantKind, q4_matrix_bytes, q8_matrix_bytes};
 use crate::dgq::nvfp4::dequant_matrix_nvfp4_payload;
-use crate::safetensors::Error;
 use crate::shaders::cpu::bf16_to_f32;
 
 /// Dequant a tensor payload to f32 row-major flat buffer.

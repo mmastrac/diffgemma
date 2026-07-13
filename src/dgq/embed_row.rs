@@ -1,10 +1,10 @@
 //! Single embed-table row dequant (q8_row) for parity vs MLX / GPU gather.
 
+use crate::Error;
 use crate::dgq::block::dequant_row_q8;
 use crate::dgq::layout::q8_row_bytes;
 use crate::dgq::store::DgqStore;
 use crate::model::embed::EMBED_TENSOR;
-use crate::safetensors::Error;
 use crate::shaders::cpu::bf16_to_f32;
 use serde::Serialize;
 use std::path::Path;

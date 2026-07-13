@@ -226,7 +226,7 @@ pub(crate) fn run_golden_case(
     spec_dir: &std::path::Path,
     doc_cache: &mut std::collections::HashMap<String, Vec<u32>>,
     case: &golden::GoldenCase,
-) -> Result<golden::GoldenRecord, safetensors::Error> {
+) -> Result<golden::GoldenRecord, crate::Error> {
     use metal::{StepGenerateConfig, generate_with_session};
 
     session.reset_kv();
@@ -262,8 +262,7 @@ pub(crate) fn run_golden_case(
     } else if let Some(doc) = &case.doc {
         // Longctx / fast-prefill / ring-wrap: doc excerpt + question.
         if !doc_cache.contains_key(doc) {
-            let text =
-                std::fs::read_to_string(spec_dir.join(doc)).map_err(safetensors::Error::Io)?;
+            let text = std::fs::read_to_string(spec_dir.join(doc)).map_err(crate::Error::Io)?;
             doc_cache.insert(doc.clone(), tokenizer.encode(&text, false));
         }
         let ids = &doc_cache[doc];

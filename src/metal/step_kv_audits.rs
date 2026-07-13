@@ -3,6 +3,7 @@
 //! step_kv.rs (backlog item 4). Non-production paths only; the monolithic-KV
 //! prefill/extend plumbing stays in the parent module.
 
+use crate::Error;
 use crate::config::ModelConfig;
 use crate::dgq::DgqStore;
 use crate::metal::device::MetalContext;
@@ -11,7 +12,6 @@ use crate::metal::step_kernel::{
     build_offsets_from_store, build_step_runtime, run_step_forward, step_params_from_sampler,
 };
 use crate::model::Model;
-use crate::safetensors::Error;
 use crate::sample::{Rng, SamplerConfig, step_entropy_stats};
 use crate::shaders::f16::f16_bits_to_f32;
 use objc2::rc::Retained;

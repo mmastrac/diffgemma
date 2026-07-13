@@ -7,7 +7,7 @@
 //! into `gemm_block`. The shared kernel is `oracle/gemm/gemm_block_stacked/gemm_block_stacked.metal`.
 
 use super::gemm_block_stacked::GemmStackedSeg;
-use crate::safetensors::Error;
+use crate::Error;
 
 #[cfg(target_os = "macos")]
 pub fn stacked_pipeline_for(

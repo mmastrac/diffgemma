@@ -2,9 +2,9 @@
 //! fixture/runner in [`super::fixture`]; this module supplies the q4 CPU
 //! reference + weight quant. Kernel source: `gemm_block/gemm_block.metal`.
 
+use crate::Error;
 use crate::dgq::block::{q4_gemm_cpu, quantize_row_q4};
 use crate::dgq::layout::{q4_matrix_bytes, q4_row_bytes};
-use crate::safetensors::Error;
 use crate::shaders::QuantFormat;
 use crate::shaders::bf16;
 use crate::shaders::test_util::ElemFormat;

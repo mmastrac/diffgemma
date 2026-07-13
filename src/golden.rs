@@ -23,7 +23,7 @@
 //! numeric change is re-blessed only via `--bless-golden` after the Tier-2/3
 //! ritual (multi-seed smoketest + longctx + census + sign-off).
 
-use crate::safetensors::Error;
+use crate::Error;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 

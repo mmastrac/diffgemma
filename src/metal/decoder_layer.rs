@@ -1,3 +1,4 @@
+use crate::Error;
 use crate::config::TextConfig;
 use crate::metal::batch::begin_engine_batch;
 use crate::metal::batched_kernels::{self as bk};
@@ -16,7 +17,6 @@ use crate::model::kv_cache::LayerKvView;
 use crate::model::layer_weights::DecoderLayerWeights;
 use crate::model::mask::DecoderAttnMask;
 use crate::model::moe::prepare_expert_input;
-use crate::safetensors::Error;
 
 pub struct GpuDecoderLayerScratch {
     pub cpu: DecoderLayerScratch,

@@ -3,9 +3,9 @@
 //! CPU reference + weight quant (with per-fixture `global_scale`). Kernel
 //! source: `gemm_block/gemm_block.metal`.
 
+use crate::Error;
 use crate::dgq::layout::{NVFP4_HEADER_BYTES, nvfp4_matrix_bytes};
 use crate::dgq::nvfp4::{nvfp4_gemm_cpu, quantize_f32_matrix_nvfp4_with_scale};
-use crate::safetensors::Error;
 use crate::shaders::QuantFormat;
 use crate::shaders::bf16;
 use crate::shaders::test_util::ElemFormat;

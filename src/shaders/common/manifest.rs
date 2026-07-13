@@ -14,7 +14,7 @@
 //! ARCHITECTURE.md.
 
 use super::variant::{ElemDtype, FcBool, FcUInt, KernelVariant, QuantFormat};
-use crate::safetensors::Error;
+use crate::Error;
 
 /// Collected kernel specs (each lives beside its kernel).
 pub struct Manifest {

@@ -5,8 +5,8 @@
 //! (`cpu`), buffer binder (`bind_gpu_buffers`), and types (`Fixture`,
 //! `BlobGroupedParams`) here are PRODUCTION/shared test infrastructure.
 
+use crate::Error;
 use crate::metal::{BlockGroupedJob, RouteScratch};
-use crate::safetensors::Error;
 use crate::shaders::QuantFormat;
 use crate::shaders::bf16;
 use crate::shaders::cpu::gemm_linear_grouped::gemm_linear_grouped_cpu;

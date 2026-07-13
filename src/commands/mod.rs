@@ -7,7 +7,7 @@ pub(crate) use crate::cli::{Cli, Command};
 // submodule can `use super::*` and keep the crate-root call style it grew up with.
 pub(crate) use crate::{
     chat_template, chat_ui, config, dgq, flags, generate, generate_golden, golden, metal, model,
-    safetensors, sample, server, tokenizer, tools, weights,
+    sample, server, tokenizer, tools, weights,
 };
 pub(crate) use std::path::PathBuf;
 pub(crate) use std::process::ExitCode;

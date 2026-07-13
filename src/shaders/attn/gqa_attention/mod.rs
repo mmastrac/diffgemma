@@ -3,9 +3,9 @@
 use super::engine_gqa_common::{
     self, GqaParams, MASK_CAUSAL_SLIDING, MASK_DECODER_BITMAP, MASK_ENCODER_EXTEND,
 };
+use crate::Error;
 use crate::model::attention::{self, AttentionParams, GqaMask};
 use crate::model::mask::DecoderAttnMask;
-use crate::safetensors::Error;
 use crate::shaders::test_util::ElemFormat;
 
 pub const ENTRY: &str = "gqa_attention";

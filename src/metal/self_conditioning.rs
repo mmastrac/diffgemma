@@ -1,12 +1,12 @@
 //! Self-conditioning on GPU (`.dgq` q8 projections).
 
+use crate::Error;
 use crate::buffer::Buffer;
 use crate::metal::batch::begin_engine_batch;
 use crate::metal::batched_kernels as bk;
 use crate::metal::dgq_gpu::Q8LinearGpu;
 use crate::metal::engine::GpuDecoderEngine;
 use crate::metal::linear::f32_q8_linear_gpu_bufs;
-use crate::safetensors::Error;
 
 pub struct GpuSelfConditioningWeights {
     pub pre_norm: Buffer<f32>,

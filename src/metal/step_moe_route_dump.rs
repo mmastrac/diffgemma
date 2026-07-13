@@ -1,9 +1,9 @@
 //! MoE router bucketing state on the fused denoise path.
 
+use crate::Error;
 use crate::metal::step_kernel::{
     CANVAS, HID, N_EXPERTS, StepSmokeConfig, run_step_moe_route_capture,
 };
-use crate::safetensors::Error;
 use serde::Serialize;
 use std::path::Path;
 

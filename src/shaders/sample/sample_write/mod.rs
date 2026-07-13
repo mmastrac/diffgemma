@@ -1,7 +1,7 @@
 //! Sampler pass 4: apply accept mask and renoise rejected positions.
 
+use crate::Error;
 use crate::metal::{CANVAS, CanvasState};
-use crate::safetensors::Error;
 use crate::shaders::cpu::sampler::sample_write_cpu;
 use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;

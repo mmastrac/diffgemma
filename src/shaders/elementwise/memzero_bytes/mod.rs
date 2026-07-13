@@ -1,6 +1,6 @@
 //! Zero memory in 16-byte `uchar4` chunks (monolith arena clears).
 
-use crate::safetensors::Error;
+use crate::Error;
 use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;
 use crate::shaders::variant::KernelVariant;

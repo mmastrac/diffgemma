@@ -148,7 +148,7 @@ pub(crate) fn run_chat_cmd(
 
     let mut run_turn = |history: &mut Vec<chat_template::ChatTurn>,
                         turn_idx: &mut u64|
-     -> Result<(), safetensors::Error> {
+     -> Result<(), crate::Error> {
         let prompt = build_chat_prompt_tokens(model_dir, history, raw_prompt)?;
         let prompt_len = prompt.len();
         // KV arena is fixed at session open (CHAT_MAX_SEQ); the reply may use

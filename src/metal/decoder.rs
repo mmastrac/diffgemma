@@ -1,3 +1,4 @@
+use crate::Error;
 use crate::config::{LayerType, ModelConfig, TextConfig};
 use crate::metal::decoder_layer::{GpuDecoderLayerScratch, forward_decoder as layer_forward};
 use crate::metal::engine::GpuDecoderEngine;
@@ -7,7 +8,6 @@ use crate::model::decoder::{DecoderForwardInput, DecoderForwardOutput, DecoderSc
 use crate::model::embed::{embed_tokens_from_store, lm_head_tied_from_store, logit_softcapping};
 use crate::model::kv_cache::LayerKvView;
 use crate::model::self_conditioning::apply_from_store;
-use crate::safetensors::Error;
 use crate::shaders::cpu::rms_norm_no_scale;
 use crate::weights::WeightStore;
 

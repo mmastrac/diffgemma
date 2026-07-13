@@ -1,5 +1,6 @@
 //! GPU encoder prefill and extend (KV stays on Metal buffers).
 
+use crate::Error;
 use crate::config::ModelConfig;
 use crate::metal::decoder_layer::{forward_encoder_extend, forward_encoder_prefill};
 use crate::metal::engine::GpuDecoderEngine;
@@ -9,7 +10,6 @@ use crate::model::encoder::EncoderPrefillInput;
 use crate::model::encoder::EncoderScratch;
 use crate::model::kv_cache::KvCache;
 use crate::model::layer_weights::DecoderLayerWeights;
-use crate::safetensors::Error;
 use crate::weights::WeightStore;
 
 use crate::flags::progress_enabled;

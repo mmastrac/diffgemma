@@ -1,7 +1,7 @@
 //! Weighted scatter of batched MoE expert outputs to canvas rows.
 
+use crate::Error;
 use crate::metal::RouteScratch;
-use crate::safetensors::Error;
 use crate::shaders::bf16;
 use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;

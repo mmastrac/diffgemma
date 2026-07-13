@@ -1,10 +1,10 @@
+use crate::Error;
 use crate::metal::attention::GpuAttentionKernels;
 use crate::metal::buffer::BufferPool;
 use crate::metal::device::{ComputePipeline, MetalContext};
 use crate::metal::kernels::GpuKernels;
 use crate::metal::sampler_kernels::GpuSamplerKernels;
 use crate::metal::telemetry::ForwardTelemetry;
-use crate::safetensors::Error;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::rc::Rc;

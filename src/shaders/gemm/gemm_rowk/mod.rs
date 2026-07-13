@@ -2,9 +2,9 @@
 //! K-indexed rows. Runs the generic `gemm_rowk` kernel (format + output-mode FC)
 //! in its arena-overwrite / q8 configuration (SC softembed path).
 
+use crate::Error;
 use crate::dgq::block::{q8_gemm_rowk_cpu, quantize_row_q8};
 use crate::dgq::layout::q8_row_bytes;
-use crate::safetensors::Error;
 use crate::shaders::bf16;
 use crate::shaders::test_util::ElemFormat;
 

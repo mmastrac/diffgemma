@@ -5,9 +5,9 @@
 //! here (`GemmStackedSeg`, `StackedSegFc`, `StackedPipelineKey`) are PRODUCTION:
 //! `gemm_tunable::stacked_pipeline_for` builds on them.
 
+use crate::Error;
 use crate::dgq::block::{q4_gemm_cpu, quantize_row_q4};
 use crate::dgq::layout::{q4_matrix_bytes, q4_row_bytes};
-use crate::safetensors::Error;
 use crate::shaders::QuantFormat;
 use crate::shaders::bf16;
 use crate::shaders::gemm_common;

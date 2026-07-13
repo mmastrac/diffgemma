@@ -1,6 +1,6 @@
 //! Gather rows by index from a row-major `[tokens, hidden]` source.
 
-use crate::safetensors::Error;
+use crate::Error;
 use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;
 use crate::shaders::variant::KernelVariant;

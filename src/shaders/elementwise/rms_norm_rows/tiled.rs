@@ -1,6 +1,6 @@
 //! Threadgroup RMSNorm (monolith): half or f32 in, half out, optional bf16 weight blob.
 
-use crate::safetensors::Error;
+use crate::Error;
 use crate::shaders::bf16;
 use crate::shaders::cpu;
 use crate::shaders::gpu_common;

@@ -1,6 +1,6 @@
 //! Tier-1 oracle helpers and the variant-matrix test macro.
 
-use crate::safetensors::Error;
+use crate::Error;
 
 /// Element storage format for the variant matrix (f32 today; bf16/fp4 for GEMM kernels).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

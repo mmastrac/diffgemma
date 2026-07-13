@@ -1,6 +1,6 @@
+use crate::Error;
 use crate::metal::buffer::BufferPool;
 use crate::metal::device::{ComputePipeline, MetalContext};
-use crate::safetensors::Error;
 use crate::shaders::cpu::bf16_to_f32;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{

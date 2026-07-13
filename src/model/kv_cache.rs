@@ -1,6 +1,6 @@
+use crate::Error;
 use crate::config::TextConfig;
 use crate::model::attention::AttentionParams;
-use crate::safetensors::Error;
 
 /// Per-layer encoder KV buffers (post-RoPE layout: `[kv_len, n_kv_heads, head_dim]` row-major).
 #[derive(Debug, Clone)]

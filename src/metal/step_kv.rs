@@ -24,6 +24,7 @@
 //! Engine `GpuKvCache` uses separate f32 K/V buffers with RoPE applied at read time; the monolithic
 //! cache stores **post-RoPE K** and **V** in the layout above. M1.2 packs CPU encoder prefill output.
 
+use crate::Error;
 use crate::config::ModelConfig;
 use crate::flags::progress_enabled;
 use crate::metal::GpuDecoderScratch;
@@ -36,7 +37,6 @@ use crate::metal::weights::GpuDecoderWeightCache;
 use crate::model::Model;
 use crate::model::encoder::{EncoderPrefillInput, EncoderScratch};
 use crate::model::kv_cache::KvCache;
-use crate::safetensors::Error;
 use crate::shaders::f16::{f16_bits_to_f32, f32_to_f16_bits};
 use crate::weights::WeightStore;
 use objc2::runtime::ProtocolObject;

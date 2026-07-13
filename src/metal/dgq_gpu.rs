@@ -1,11 +1,11 @@
 //! Zero-copy `.dgq` blob → `MTLBuffer` and per-tensor GPU views.
 
+use crate::Error;
 use crate::dgq::DgqStore;
 use crate::dgq::layout::{
     MANIFEST_FILE, QuantKind, blob_offset_for_mtl, dgq_version_supported, nvfp4_matrix_bytes,
     q4_matrix_bytes, q8_row_bytes,
 };
-use crate::safetensors::Error;
 use memmap2::Mmap;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;

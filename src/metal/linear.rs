@@ -1,9 +1,9 @@
+use crate::Error;
 use crate::buffer::Buffer;
 use crate::metal::batch::GpuBatch;
 use crate::metal::buffer::BufferPool;
 use crate::metal::device::ComputePipeline;
 use crate::metal::dgq_gpu::{Q4LinearGpu, Q8LinearGpu};
-use crate::safetensors::Error;
 use crate::tensor::Bf16Slice;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;

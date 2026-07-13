@@ -1,5 +1,6 @@
 //! NVFP4 block quant/dequant (MLX 2-tier: E2M1 + per-block FP8 E4M3 scale).
 
+use crate::Error;
 use crate::dgq::fp4::{
     FP4_E2M1_MAX, e2m1_from_f32, e2m1_to_f32, fp8_e4m3_from_f32, fp8_e4m3_to_f32,
 };
@@ -7,7 +8,6 @@ use crate::dgq::layout::{
     NVFP4_GROUP_SIZE, NVFP4_HEADER_BYTES, nvfp4_data_row_bytes, nvfp4_matrix_bytes,
     nvfp4_row_bytes, nvfp4_scales_row_bytes,
 };
-use crate::safetensors::Error;
 use crate::shaders::cpu::bf16_to_f32;
 
 #[cfg(test)]

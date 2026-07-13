@@ -1,6 +1,7 @@
+use crate::Error;
 use crate::dgq::DgqStore;
 use crate::dgq::store::looks_like_dgq_dir;
-use crate::safetensors::{Error, SafetensorsFile, TensorInfo};
+use crate::safetensors::{SafetensorsFile, TensorInfo};
 use crate::tensor::TensorView;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};

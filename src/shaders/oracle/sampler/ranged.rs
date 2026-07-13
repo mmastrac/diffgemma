@@ -2,8 +2,8 @@
 //! (copy_f32 merged into the generic `convert_scale` kernel; its oracle lives
 //! there.)
 
+use crate::Error;
 use crate::model::embed::logit_softcapping;
-use crate::safetensors::Error;
 use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;
 

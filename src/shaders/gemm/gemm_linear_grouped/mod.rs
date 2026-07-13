@@ -1,10 +1,10 @@
 //! Grouped MoE block GEMM: flattened expert rows in one dispatch.
 
+use crate::Error;
 use crate::dgq::block::quantize_row_q4;
 use crate::dgq::layout::{nvfp4_matrix_bytes, q4_matrix_bytes, q4_row_bytes};
 use crate::dgq::nvfp4::quantize_f32_matrix_nvfp4;
 use crate::metal::BlockGroupedJob;
-use crate::safetensors::Error;
 use crate::shaders::QuantFormat;
 use crate::shaders::cpu::gemm_linear_grouped::gemm_linear_grouped_cpu;
 use crate::shaders::gpu_common;

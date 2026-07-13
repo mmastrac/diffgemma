@@ -1,7 +1,7 @@
 //! Sampler pass 2: LCG u_cat, entropy sort, accept mask, early stop.
 
+use crate::Error;
 use crate::metal::{CANVAS, CanvasState, StepParams};
-use crate::safetensors::Error;
 use crate::sample::ARGMAX_HIST_MAX;
 use crate::sample::{FILLER_TOKEN_ID, PAD_TOKEN_ID};
 use crate::shaders::cpu::sampler::{CommitParams, sample_commit_cpu};

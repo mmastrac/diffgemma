@@ -1,7 +1,7 @@
 //! Encoder-path RoPE on `[seq, heads, head_dim]` (f32, one thread per head×seq).
 
 use super::engine_gqa_common::{self, GqaParams};
-use crate::safetensors::Error;
+use crate::Error;
 use crate::shaders::cpu::{self, RopeKind};
 use crate::shaders::test_util::ElemFormat;
 

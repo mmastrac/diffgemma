@@ -229,7 +229,7 @@ pub(crate) fn run_smoketest_cmd(
     };
 
     // (denoise_steps, reply) for one fresh single-turn generation.
-    let mut run_one = |prompt_text: &str| -> Result<(usize, String), safetensors::Error> {
+    let mut run_one = |prompt_text: &str| -> Result<(usize, String), crate::Error> {
         // Each prompt is independent — drop prior KV so we re-prefill fresh
         // (chat's KV-reuse continuation would otherwise answer the first prompt).
         session.reset_kv();

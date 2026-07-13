@@ -1,7 +1,7 @@
 //! Tier-1 pin: per-stage GPU vs CPU oracle inside batched MoE (gather → GEMM×2 → swiglu → scatter).
 
+use crate::Error;
 use crate::metal::step_kernel::{StepSmokeConfig, run_step_moe_batched_pin_capture};
-use crate::safetensors::Error;
 use crate::shaders::moe_batched_pin::MoeBatchedPinDump;
 use std::path::Path;
 

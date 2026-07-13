@@ -13,6 +13,7 @@
 //!     → sample_commit → sample_apply → sample_write.
 //! The buffer/struct ABI is authoritative in Rust (`abi.rs`, `arena_layout.rs`).
 
+use crate::Error;
 use crate::config::{ModelConfig, TextConfig};
 use crate::dgq::DgqStore;
 use crate::metal::device::{ComputePipeline, MetalContext};
@@ -21,7 +22,6 @@ use crate::metal::moe::experts_forward_dgq_cpu;
 use crate::metal::step_quant::{BlockGroupedJob, MoeExecutionStyle, StepBlockProfile};
 use crate::metal::weights::GpuDecoderWeightCache;
 use crate::model::moe::MoeScratch;
-use crate::safetensors::Error;
 use crate::sample::{Rng, SamplerConfig, initialize_canvas};
 use crate::shaders::QuantFormat;
 use crate::weights::WeightStore;

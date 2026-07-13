@@ -1,7 +1,7 @@
 //! Preamble (canvas embed) hidden dumps for MLX parity before layer 0.
 
+use crate::Error;
 use crate::metal::step_kernel::{PreambleCapture, StepSmokeConfig, run_step_preamble_capture};
-use crate::safetensors::Error;
 use serde::Serialize;
 use std::path::Path;
 

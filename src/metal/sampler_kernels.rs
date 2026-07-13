@@ -3,8 +3,8 @@
 //! ORACLE-ONLY: the decode-engine sampler pipeline handles (validation path).
 #![allow(dead_code)]
 
+use crate::Error;
 use crate::metal::device::{ComputePipeline, MetalContext};
-use crate::safetensors::Error;
 use crate::shaders::KernelVariant;
 use crate::shaders::softmax_rows;
 

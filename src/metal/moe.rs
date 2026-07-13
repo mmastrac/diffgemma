@@ -1,3 +1,4 @@
+use crate::Error;
 use crate::config::TextConfig;
 use crate::dgq::DgqStore;
 use crate::dgq::block::{q4_gemm_cpu, q4_weight_at};
@@ -13,7 +14,6 @@ use crate::metal::telemetry::ForwardTelemetry;
 use crate::metal::weights::GpuDecoderWeightCache;
 use crate::model::layer_weights::DecoderLayerWeights;
 use crate::model::moe::{MoeScratch, RouteResult};
-use crate::safetensors::Error;
 use crate::shaders::cpu::{gelu_pytorch_tanh, gelu_pytorch_tanh_f32, linear};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;

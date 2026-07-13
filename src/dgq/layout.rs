@@ -1,6 +1,6 @@
 //! On-disk layout for `.dgq` quantized weights.
 
-use crate::safetensors::Error;
+use crate::Error;
 use serde::{Deserialize, Serialize};
 
 pub const MANIFEST_FILE: &str = "model.dgq.json";

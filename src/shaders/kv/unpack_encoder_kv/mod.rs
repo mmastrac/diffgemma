@@ -1,7 +1,7 @@
 //! Hydrate engine GpuKvCache f32 K/V from monolithic b4 layout (inverse of
 //! pack_encoder_kv; ring-aware source, linear engine destination).
 
-use crate::safetensors::Error;
+use crate::Error;
 use crate::shaders::variant::KernelVariant;
 
 pub const ENTRY: &str = "unpack_encoder_kv";

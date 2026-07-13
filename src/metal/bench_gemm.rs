@@ -1,8 +1,8 @@
 //! GEMM throughput bench: full-call vs resident compute vs MPSGraph oracle.
 
+use crate::Error;
 use crate::metal::buffer::BufferPool;
 use crate::metal::gemm::Bf16Gemm;
-use crate::safetensors::Error;
 use crate::shaders::bf16;
 use std::path::Path;
 use std::process::Command;

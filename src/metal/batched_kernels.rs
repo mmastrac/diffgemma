@@ -1,8 +1,8 @@
 //! Elementwise kernels encoded into a shared `GpuBatch`.
 
+use crate::Error;
 use crate::metal::batch::GpuBatch;
 use crate::metal::kernels::GpuKernels;
-use crate::safetensors::Error;
 use crate::shaders::{
     gather_rows, gelu, rms_norm_rows, router_scale_rows, swiglu, vec_add_inplace,
 };

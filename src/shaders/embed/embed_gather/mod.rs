@@ -1,9 +1,9 @@
 //! Q8 embed-table gather: dequant row by token id and apply embed scale.
 
+use crate::Error;
 use crate::dgq::block::{dequant_row_q8, quantize_row_q8};
 use crate::dgq::embed_row::EMBED_SCALE;
 use crate::dgq::layout::q8_row_bytes;
-use crate::safetensors::Error;
 use crate::shaders::bf16;
 use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;

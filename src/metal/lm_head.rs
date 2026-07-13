@@ -1,5 +1,6 @@
 //! Tied lm_head on GPU (q8 embed weights from `.dgq` blob).
 
+use crate::Error;
 use crate::metal::batch::{GpuBatch, set_bytes};
 use crate::metal::device::ComputePipeline;
 use crate::metal::dgq_gpu::Q8LinearGpu;
@@ -7,7 +8,6 @@ use crate::metal::linear::f32_q8_linear_gpu_bufs;
 use crate::metal::sampler::GpuLogitsBuf;
 use crate::metal::sampler_kernels::GpuSamplerKernels;
 use crate::model::embed::LM_HEAD_CHUNK;
-use crate::safetensors::Error;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder};
 

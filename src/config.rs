@@ -1,7 +1,7 @@
 //! Model configuration from `config.json`. Fields are consumed across later phases.
 #![allow(dead_code)]
 
-use crate::safetensors::Error;
+use crate::Error;
 use serde::Deserialize;
 use std::path::Path;
 

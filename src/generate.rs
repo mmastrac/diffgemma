@@ -1,6 +1,6 @@
 //! End-to-end block diffusion generation (CPU decoder; optional Metal GPU decoder).
 
-use crate::safetensors::Error;
+use crate::Error;
 use crate::sample::SamplerConfig;
 
 #[derive(Debug, Clone)]

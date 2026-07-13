@@ -1,7 +1,7 @@
 //! Checked-in generate regression fixtures (token ids + run config).
 
+use crate::Error;
 use crate::generate::{GenerateConfig, GenerateOutput};
-use crate::safetensors::Error;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 

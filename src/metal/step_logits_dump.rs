@@ -1,10 +1,10 @@
 //! Step-1 logit row dumps for MLX parity (post-softcap, pre/post temperature).
 
+use crate::Error;
 use crate::metal::step_kernel::{
     CANVAS, HID, LayerHiddenProbeResult, StepFinishMode, StepForwardOutput, StepSmokeConfig, VOCAB,
     run_step_forward, run_step_layer_hidden_probe, scheduled_temperature,
 };
-use crate::safetensors::Error;
 use crate::sample::{self, SamplerConfig};
 use serde::Serialize;
 use std::path::Path;

@@ -1,7 +1,7 @@
 //! Per-layer attention dumps (Q/K/scores/attn_out) for MLX parity at a canvas row.
 
+use crate::Error;
 use crate::metal::step_kernel::{LayerAttnCapture, StepSmokeConfig, run_step_attn_layer_capture};
-use crate::safetensors::Error;
 use serde::Serialize;
 use std::path::Path;
 

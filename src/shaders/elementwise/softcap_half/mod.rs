@@ -1,6 +1,6 @@
 //! Logit softcap: `tanh(v/30)*30` in fp16.
 
-use crate::safetensors::Error;
+use crate::Error;
 use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;
 use crate::shaders::variant::KernelVariant;

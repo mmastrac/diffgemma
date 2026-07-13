@@ -1,11 +1,11 @@
 //! Mmap-backed `.dgq` weight store.
 
+use crate::Error;
 use crate::dgq::dequant::dequant_to_f32;
 use crate::dgq::layout::{
     DgqManifest, MANIFEST_FILE, QuantKind, blob_slice_range, dgq_version_supported,
     parse_quant_kind,
 };
-use crate::safetensors::Error;
 use crate::tensor::TensorView;
 use memmap2::Mmap;
 use std::collections::HashMap;

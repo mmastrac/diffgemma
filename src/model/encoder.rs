@@ -1,3 +1,4 @@
+use crate::Error;
 use crate::config::ModelConfig;
 use crate::model::decoder_layer::{
     DecoderLayerScratch, forward_encoder as layer_forward_encoder,
@@ -7,7 +8,6 @@ use crate::model::embed::embed_tokens;
 use crate::model::kv_cache::KvCache;
 use crate::model::kv_cache::LayerKvView;
 use crate::model::layer_weights::DecoderLayerWeights;
-use crate::safetensors::Error;
 use crate::shaders::cpu::rms_norm_rows;
 use crate::weights::WeightStore;
 
