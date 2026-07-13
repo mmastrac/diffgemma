@@ -520,3 +520,45 @@ pub(crate) fn run_bench_prefill_attn(
         }
     }
 }
+
+/// Holistic prefill proxy (task #87): time one real M=1024 super-chunk (all
+/// stages, real weights) at `kv_len`, honoring the tunable tile flags. Prints a
+/// human line + machine `RESULT {json}` (ms/super-chunk) — the objective for a
+/// whole-model BO sweep. Faithful to real prefill's per-super-chunk cost at
+/// ~1-2s instead of the full 100-560s.
+#[cfg(target_os = "macos")]
+pub(crate) fn run_bench_prefill_super_cmd(
+    model_dir: &std::path::Path,
+    kv_len: u32,
+    iters: usize,
+) -> ExitCode {
+    use metal::bench_step_kernel_prefill_super;
+    if !dgq::store::looks_like_dgq_dir(model_dir) {
+        eprintln!("error: bench-prefill-super requires a .dgq directory");
+        return ExitCode::FAILURE;
+    }
+    // Headroom for the super-chunk (kv + n_subs*256 + 256); +2048 margin.
+    let max_seq = (kv_len as usize + 2048).max(2048);
+    let cfg = step_kernel_config(30, kv_len, 42, max_seq, true);
+    let (qk_bm, qk_bn, pv_bm, pv_bn, sm_tpg) = flags::gemm_attn_tile();
+    let hc = flags::gemm_attn_head_chunk();
+    match bench_step_kernel_prefill_super(model_dir, cfg, kv_len, iters.max(1)) {
+        Ok(d) => {
+            let ms = d.as_secs_f64() * 1e3;
+            eprintln!(
+                "prefill-super kv={kv_len} qk={qk_bm}x{qk_bn} pv={pv_bm}x{pv_bn} hc={hc} \
+                 tpg={sm_tpg}: {ms:.3} ms/super-chunk (M=1024)"
+            );
+            println!(
+                "RESULT {{\"ok\": true, \"ms\": {ms:.4}, \"kv_len\": {kv_len}, \
+                 \"qk_bm\": {qk_bm}, \"qk_bn\": {qk_bn}, \"pv_bm\": {pv_bm}, \"pv_bn\": {pv_bn}, \
+                 \"hc\": {hc}, \"sm_tpg\": {sm_tpg}}}"
+            );
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            println!("RESULT {{\"ok\": false, \"reason\": \"{err}\"}}");
+            ExitCode::FAILURE
+        }
+    }
+}

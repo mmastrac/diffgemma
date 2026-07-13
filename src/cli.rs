@@ -74,6 +74,13 @@ pub(crate) enum Command {
         side: bool,
         iters: usize,
     },
+    /// Holistic prefill proxy (task #87): time one real M=1024 super-chunk (all
+    /// stages, real weights) at --kv-len; prints RESULT {json: ms}. Honors the
+    /// tunable tile flags — the objective for a whole-model BO sweep.
+    BenchPrefillSuper {
+        kv_len: u32,
+        iters: usize,
+    },
     Quantize {
         output: PathBuf,
         profile: String,
@@ -754,6 +761,10 @@ pub(crate) fn parse_cli() -> Cli {
             hc: ag_hc,
             sm_tpg: ag_sm_tpg,
             side: ag_side,
+            iters: bench_iters.max(1),
+        },
+        Some("bench-prefill-super") => Command::BenchPrefillSuper {
+            kv_len: if step_kv_len > 0 { step_kv_len } else { 15000 },
             iters: bench_iters.max(1),
         },
         Some("quantize") => {

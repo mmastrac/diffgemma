@@ -358,6 +358,9 @@ pub(crate) fn dispatch(cli: Cli) -> ExitCode {
             profile_steps,
             layer_profile,
         ),
+        Command::BenchPrefillSuper { kv_len, iters } => {
+            run_bench_prefill_super_cmd(&cli.model_dir, kv_len, iters)
+        }
         Command::BenchGemmFusion {
             layers,
             kv_len,
@@ -594,6 +597,7 @@ pub(crate) fn run_command(
         Command::StepCi { .. } => ExitCode::FAILURE,
         Command::StepParity { .. } => ExitCode::FAILURE,
         Command::BenchStepKernel { .. } => ExitCode::FAILURE,
+        Command::BenchPrefillSuper { .. } => ExitCode::FAILURE,
         Command::BenchGemmFusion { .. } => ExitCode::FAILURE,
         Command::GenerateMonolithic { .. } => ExitCode::FAILURE,
         Command::GenerateMonolithicParity { .. } => ExitCode::FAILURE,

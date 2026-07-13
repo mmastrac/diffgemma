@@ -5289,6 +5289,43 @@ impl StepRuntime {
     }
 
     /// P2.2 Phase A: one command buffer + one GPU sync per denoise step.
+    /// Holistic prefill proxy (task #87): time ONE M=1024 super-chunk forward at
+    /// kv=`kv_len` — all stages (QKV/o-proj/dense GEMMs, rope, attention per sub,
+    /// router, MoE-expert GEMM, norms) interleaved in one command buffer exactly
+    /// as production, with real weights. This is the true per-super-chunk cost;
+    /// summed over the kv brackets a prompt sweeps it estimates real prefill,
+    /// but at ~1-2s instead of the full 100-560s. Timing is KV-value-independent
+    /// (attention streams kv_len rows regardless), so no actual prefill is
+    /// needed — just set kv_len. Uses whatever tile config the flags compiled the
+    /// pipelines with. Returns mean ms/super-chunk (min-of-rounds).
+    pub(crate) fn bench_prefill_super(
+        &mut self,
+        kv_len: u32,
+        iters: usize,
+    ) -> Result<std::time::Duration, Error> {
+        use std::time::Instant;
+        let layout = self.layout;
+        let layers = self.layers;
+        let n_subs = PREFILL_SUBS;
+        let m = n_subs * CANVAS;
+        let ids = vec![0u32; m];
+        self.set_canvas_ids(&ids)?;
+        self.set_kv_len(kv_len);
+        self.write_params_sub(kv_len, n_subs);
+        self.arena_f16_mode = self.pipelines_prefill_f16.is_some();
+        // 1 warm-up round + min over timed rounds (factors out clock ramp).
+        let mut best = std::time::Duration::MAX;
+        for round in 0..(iters.max(1) + 1) {
+            let t = Instant::now();
+            self.dispatch_and_wait(|enc| enc.encode_prefill_super(&layout, layers, n_subs))?;
+            if round > 0 {
+                best = best.min(t.elapsed());
+            }
+        }
+        self.arena_f16_mode = false;
+        Ok(best)
+    }
+
     fn run_forward_once(&mut self, finish: StepFinishMode) -> Result<(), Error> {
         if let Some(ref dbg) = self.bufs.debug_status {
             crate::metal::debug_status::zero_buffer(dbg);

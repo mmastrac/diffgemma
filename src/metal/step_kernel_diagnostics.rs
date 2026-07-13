@@ -1186,6 +1186,19 @@ pub fn bench_step_kernel_encode_subprofile(
     Ok(prof)
 }
 
+/// Holistic prefill proxy (task #87): build the runtime (compiling pipelines
+/// per the current tile flags) and time one M=1024 super-chunk at `kv_len`.
+/// Returns mean ms/super-chunk.
+pub fn bench_step_kernel_prefill_super(
+    model_dir: &Path,
+    cfg: StepSmokeConfig,
+    kv_len: u32,
+    iters: usize,
+) -> Result<std::time::Duration, Error> {
+    let (mut rt, _build) = build_step_runtime(model_dir, &cfg)?;
+    rt.bench_prefill_super(kv_len, iters)
+}
+
 /// Profile the first `n_steps` denoise forwards (canvas `st.step` 0..n_steps-1).
 /// Step 0 has no SC preamble; step >= 1 includes self-conditioning.
 pub fn bench_step_kernel_profile_steps(
