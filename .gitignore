@@ -4,3 +4,8 @@
 /python/.venv/
 __pycache__/
 *.pyc
+
+# Optuna BO study databases (runtime artifacts, not source)
+/python/holistic*.db
+/python/holistic*.db-wal
+/python/holistic*.db-shm
