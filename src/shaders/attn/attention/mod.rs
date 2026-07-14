@@ -303,7 +303,8 @@ pub fn pipeline_mma2_for_kv_side(
 }
 
 /// E14 prefill variant (FC30) for FULL layers: linear f32 side K/V,
-/// all-float MMA. See attention_mma_full.metal.
+/// all-float MMA. See attention_mma_full.metal. FC31 (QK_ILP2) is set when
+/// `DGQ_ATTN_MMA_FULL_QK_ILP2` is on.
 #[cfg(target_os = "macos")]
 pub fn pipeline_mma_full_for_kv_side(
     ctx: &crate::metal::device::MetalContext,
@@ -311,11 +312,21 @@ pub fn pipeline_mma_full_for_kv_side(
     fmt: crate::shaders::kv_quant::KvFormat,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
     let (uints, label) = kv_fc(fmt);
-    let label = format!("{label}_side");
-    let bools = [crate::shaders::variant::FcBool {
+    let mut label = format!("{label}_side");
+    let ilp2 = crate::flags::attn_mma_full_qk_ilp2();
+    if ilp2 {
+        label.push_str("_ilp2");
+    }
+    let mut bools = vec![crate::shaders::variant::FcBool {
         index: 30,
         value: true,
     }];
+    if ilp2 {
+        bools.push(crate::shaders::variant::FcBool {
+            index: 31,
+            value: true,
+        });
+    }
     ctx.compile_subkernel_ex(
         SHADER_MMA_FULL,
         ENTRY_MMA_FULL,
@@ -333,7 +344,27 @@ pub fn pipeline_mma_full_for_kv(
     fmt: crate::shaders::kv_quant::KvFormat,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
     let (uints, label) = kv_fc(fmt);
-    ctx.compile_subkernel_ex(SHADER_MMA_FULL, ENTRY_MMA_FULL, variant, label, &[], &uints)
+    let mut label = label.to_string();
+    let ilp2 = crate::flags::attn_mma_full_qk_ilp2();
+    if ilp2 {
+        label.push_str("_ilp2");
+    }
+    let bools: Vec<crate::shaders::variant::FcBool> = if ilp2 {
+        vec![crate::shaders::variant::FcBool {
+            index: 31,
+            value: true,
+        }]
+    } else {
+        vec![]
+    };
+    ctx.compile_subkernel_ex(
+        SHADER_MMA_FULL,
+        ENTRY_MMA_FULL,
+        variant,
+        &label,
+        &bools,
+        &uints,
+    )
 }
 
 #[cfg(target_os = "macos")]

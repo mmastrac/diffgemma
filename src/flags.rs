@@ -139,6 +139,11 @@ pub struct PerfFlags {
     /// decomposition. Prefill-only, full-attention layers. Default OFF (opt-in,
     /// pending sign-off). `bq`/`bk` = query-row tile / key-block streamed.
     pub flash_prefill: bool,
+    /// `DGQ_ATTN_MMA_FULL_QK_ILP2` (E5 ILP2): split the 32-deep serial QK dot
+    /// in `attention_mma_full` into two interleaved 16-deep accumulator chains
+    /// (even/odd chunks), summed at the end. Halves the QK serial-dependency
+    /// depth. Non-bit-identical (FP-associativity); quality-gated. Default OFF.
+    pub attn_mma_full_qk_ilp2: bool,
     pub flash_prefill_bq: usize,
     pub flash_prefill_bk: usize,
 }
@@ -174,6 +179,7 @@ impl Default for PerfFlags {
             flash_prefill: false,
             flash_prefill_bq: 16,
             flash_prefill_bk: 64,
+            attn_mma_full_qk_ilp2: false,
         }
     }
 }
@@ -418,6 +424,7 @@ impl RuntimeConfig {
                 flash_prefill: env_on_if_one("DGQ_FLASH_PREFILL"),
                 flash_prefill_bq: parse_usize("DGQ_FLASH_PREFILL_BQ", 16).max(8),
                 flash_prefill_bk: parse_usize("DGQ_FLASH_PREFILL_BK", 64).max(16),
+                attn_mma_full_qk_ilp2: env_on_if_one("DGQ_ATTN_MMA_FULL_QK_ILP2"),
             },
             prefill: PrefillFlags {
                 f16: env_on_if_one("DGQ_PREFILL_F16"),
@@ -699,6 +706,12 @@ pub fn gemm_tune_tile() -> (usize, usize) {
 /// stays 32, baked into moe_bucket_fill).
 pub fn moe_sparse_bn() -> usize {
     config().perf.moe_sparse_bn
+}
+
+/// `DGQ_ATTN_MMA_FULL_QK_ILP2`: split the QK dot in `attention_mma_full`
+/// into two interleaved accumulator chains (FC31). Default OFF.
+pub fn attn_mma_full_qk_ilp2() -> bool {
+    config().perf.attn_mma_full_qk_ilp2
 }
 
 /// E18 fused flash prefill. `.0` = enabled, `.1` = BQ (query-row tile), `.2` =

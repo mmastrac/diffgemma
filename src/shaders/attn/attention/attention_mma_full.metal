@@ -50,6 +50,17 @@ constant bool KV_F32_SIDE_FC [[function_constant(30)]];
 constant bool KV_F32_SIDE =
     is_function_constant_defined(KV_F32_SIDE_FC) && KV_F32_SIDE_FC;
 
+// E5 QK-ILP2 chain-split (FC31, opt-in `DGQ_ATTN_MMA_FULL_QK_ILP2`): split the
+// 32-deep serial QK dot into two interleaved 16-deep accumulator chains (even/
+// odd chunks), summed at the end. The two chains have no data dependency on
+// each other, so the GPU issues both MMAs concurrently — halving the
+// serial-dependency depth of the QK stage. PV is already per-chunk
+// independent (no change). Non-bit-identical (different FP-associativity);
+// quality-gated. Default OFF.
+constant bool QK_ILP2_FC [[function_constant(31)]];
+constant bool QK_ILP2 =
+    is_function_constant_defined(QK_ILP2_FC) && QK_ILP2_FC;
+
 kernel void attention_mma_full(
     device const ushort *q [[buffer(0)]],
     device const ushort *kvcache [[buffer(1)]],
@@ -122,6 +133,9 @@ kernel void attention_mma_full(
     // dead-stripped from f16 pipelines).
     threadgroup half kq8[NCH][8][8];
     threadgroup float st[QG][MT][8];    // per-half partial QK scores
+    // E5 ILP2 only: second QK partial per half (even/odd chunk split).
+    // Dead-stripped from the non-ILP2 pipeline by QK_ILP2.
+    threadgroup float st_ilp[QG][MT][8];
     threadgroup half ph[MT][8];         // softmax probs (shared)
     threadgroup float pvt[QG][MT][8];   // P.V chunk per half
     threadgroup float mrow[MT];         // running max per row (shared)
@@ -197,25 +211,61 @@ kernel void attention_mma_full(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         simdgroup_float8x8 sacc(0.f);
-        for (uint c = 0u; c < NCH_H; ++c) {
-            uint kd = dlo + c * 8u;
-            if (KV_F32_SIDE) {
-                simdgroup_float8x8 af, bf;
-                simdgroup_load(af, &qsf[0][kd], HD);
-                simdgroup_load(bf, kbf + kd, kstride, ulong2(0, 0), true);
-                simdgroup_multiply_accumulate(sacc, af, bf, sacc);
-                continue;
+        if (QK_ILP2) {
+            // E5 ILP2: two independent 16-deep chains (even/odd chunks), no data
+            // dependency between them -> the GPU issues both MMAs concurrently,
+            // halving the QK serial-dependency depth. Store each chain to its
+            // own tgmem slot; the cross-half softmax sums all four partials.
+            simdgroup_float8x8 sacc0(0.f), sacc1(0.f);
+            for (uint c = 0u; c < NCH_H; c += 2u) {
+                uint kd0 = dlo + c * 8u;
+                uint kd1 = dlo + (c + 1u) * 8u;
+                if (KV_F32_SIDE) {
+                    simdgroup_float8x8 a0, b0, a1, b1;
+                    simdgroup_load(a0, &qsf[0][kd0], HD);
+                    simdgroup_load(b0, kbf + kd0, kstride, ulong2(0, 0), true);
+                    simdgroup_load(a1, &qsf[0][kd1], HD);
+                    simdgroup_load(b1, kbf + kd1, kstride, ulong2(0, 0), true);
+                    simdgroup_multiply_accumulate(sacc0, a0, b0, sacc0);
+                    simdgroup_multiply_accumulate(sacc1, a1, b1, sacc1);
+                } else {
+                    simdgroup_half8x8 a0, b0, a1, b1;
+                    simdgroup_load(a0, &qs[0][kd0], HD);
+                    simdgroup_load(a1, &qs[0][kd1], HD);
+                    if (KV_Q8) {
+                        simdgroup_load(b0, &kq8[kd0 / 8u][0][0], 8, ulong2(0, 0), true);
+                        simdgroup_load(b1, &kq8[kd1 / 8u][0][0], 8, ulong2(0, 0), true);
+                    } else {
+                        simdgroup_load(b0, kb + kd0, kstride, ulong2(0, 0), true);
+                        simdgroup_load(b1, kb + kd1, kstride, ulong2(0, 0), true);
+                    }
+                    simdgroup_multiply_accumulate(sacc0, a0, b0, sacc0);
+                    simdgroup_multiply_accumulate(sacc1, a1, b1, sacc1);
+                }
             }
-            simdgroup_half8x8 a, b;
-            simdgroup_load(a, &qs[0][kd], HD);
-            if (KV_Q8) {
-                simdgroup_load(b, &kq8[kd / 8u][0][0], 8, ulong2(0, 0), true);
-            } else {
-                simdgroup_load(b, kb + kd, kstride, ulong2(0, 0), true);  // -> b[d][key]
+            simdgroup_store(sacc0, &st[sg][0][0], 8);
+            simdgroup_store(sacc1, &st_ilp[sg][0][0], 8);
+        } else {
+            for (uint c = 0u; c < NCH_H; ++c) {
+                uint kd = dlo + c * 8u;
+                if (KV_F32_SIDE) {
+                    simdgroup_float8x8 af, bf;
+                    simdgroup_load(af, &qsf[0][kd], HD);
+                    simdgroup_load(bf, kbf + kd, kstride, ulong2(0, 0), true);
+                    simdgroup_multiply_accumulate(sacc, af, bf, sacc);
+                    continue;
+                }
+                simdgroup_half8x8 a, b;
+                simdgroup_load(a, &qs[0][kd], HD);
+                if (KV_Q8) {
+                    simdgroup_load(b, &kq8[kd / 8u][0][0], 8, ulong2(0, 0), true);
+                } else {
+                    simdgroup_load(b, kb + kd, kstride, ulong2(0, 0), true);  // -> b[d][key]
+                }
+                simdgroup_multiply_accumulate(sacc, a, b, sacc);
             }
-            simdgroup_multiply_accumulate(sacc, a, b, sacc);
+            simdgroup_store(sacc, &st[sg][0][0], 8);
         }
-        simdgroup_store(sacc, &st[sg][0][0], 8);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // ---- cross-half sum + online softmax over this 8-key tile (sg0) ----
@@ -226,7 +276,12 @@ kernel void attention_mma_full(
             float tmax = -INFINITY;
             for (uint t = 0u; t < 8u; ++t) {
                 bool valid = (t0 + t < T) && (!causal || t0 + t <= qpos);
-                s[t] = st[0][row][t] + st[1][row][t];
+                if (QK_ILP2) {
+                    s[t] = st[0][row][t] + st_ilp[0][row][t]
+                         + st[1][row][t] + st_ilp[1][row][t];
+                } else {
+                    s[t] = st[0][row][t] + st[1][row][t];
+                }
                 if (valid) {
                     tmax = max(tmax, s[t]);
                 }

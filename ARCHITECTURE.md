@@ -477,6 +477,38 @@ opt-in flags for A/B.
   Lesson: when compute >> load (the 6× margin regime), software-pipelined
   double-buffering is a regression, not a lever — the doubled tgmem footprint
   + extra sync costs more than the already-hidden load overlap returns.
+- **E5 QK-ILP2 chain-split (full-layer attention)** — PENDING BO 2026-07-14
+  (a single-axis A/B was INCONCLUSIVE — it didn't exercise the path). The
+  production `attention_mma_full` QK dot runs a single 32-deep serial
+  `simdgroup_multiply_accumulate` chain (one accumulator, NCH_H=32 chunks).
+  The ILP2 prototype (FC31 `DGQ_ATTN_MMA_FULL_QK_ILP2`, opt-in) splits it
+  into two independent 16-deep chains (even/odd chunks) so the GPU can issue
+  both MMAs concurrently, halving the QK serial-dependency depth. Each chain
+  stores to its own tgmem slot (`st` + `st_ilp`); the cross-half softmax
+  sums all four partials. Built as a function-constant variant of the
+  production kernel (one body, FC31-selected) — non-bit-identical (different
+  FP-associativity), parity checked via step-probe (identical max_abs at
+  every stage). A warm 3-trial A/B at kv=15000 with E17 ON (default) showed
+  no measurable difference (3365 vs 3370 ms) — **but this was an invalid
+  test**: with E17 default-on, full layers route to `attention_gemm`, so
+  `attention_mma_full` (and ILP2) is inert for the dominant attention cost.
+  The earlier E5 sweep's ~5% kernel / ~3% prefill was measured pre-E17, on
+  the path ILP2 actually runs. PHYSICS (unresolved): ILP2 helps when the
+  bottleneck is *dependency latency* in the MMA pipeline; the full-attn
+  layers may be instruction-issue-bound (per the perf-regime note + the
+  existing "Flash-decode / sequential KV blocking" negative), in which case
+  splitting one chain into two independent chains buys nothing (the same
+  total MMAs compete for the same issue slots). But that regime call was
+  also made on the E17 path, not on mma_full+ILP2. **The lever is added as
+  a categorical axis (paired with `gemm_attn` on/off) in the holistic
+  prefill BO** (`tune_prefill_attn.py --proxy`) so TPE can test the joint
+  {E17, ILP2, tiles} space — single-axis A/B at default settings cannot see
+  levers that only activate in combination or in the off-default path.
+  Kept behind default-OFF FC31; not wired to production pending the BO
+  result. Lesson: a single-axis A/B that doesn't exercise the modified path
+  is not a disproof — verify the dispatch path before declaring a lever
+  inert, and prefer the joint BO for levers that interact with path
+  selection.
 
 **Quality levers, disproven by measurement:**
 - **Hard freeze of accepted positions** — WAS the flat-row wart driver
