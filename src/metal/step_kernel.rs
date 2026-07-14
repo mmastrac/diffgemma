@@ -5309,11 +5309,12 @@ impl StepRuntime {
         &mut self,
         kv_len: u32,
         iters: usize,
+        n_subs: usize,
     ) -> Result<std::time::Duration, Error> {
         use std::time::Instant;
         let layout = self.layout;
         let layers = self.layers;
-        let n_subs = PREFILL_SUBS;
+        let n_subs = n_subs.clamp(1, PREFILL_SUBS);
         let m = n_subs * CANVAS;
         let ids = vec![0u32; m];
         self.set_canvas_ids(&ids)?;
@@ -5342,6 +5343,7 @@ impl StepRuntime {
         &mut self,
         kv_len: u32,
         iters: usize,
+        n_subs: usize,
     ) -> Result<(f64, Vec<(&'static str, f64)>), Error> {
         use step_schedule::StepStage;
         use step_schedule::StepStage::*;
@@ -5368,11 +5370,11 @@ impl StepRuntime {
             ),
             ("embed", &[EmbedGather]),
         ];
-        let full = self.bench_prefill_super(kv_len, iters)?.as_secs_f64() * 1e3;
+        let full = self.bench_prefill_super(kv_len, iters, n_subs)?.as_secs_f64() * 1e3;
         let mut out = Vec::new();
         for (label, stages) in groups {
             set_prefill_bench_skip(stages);
-            let ablated = self.bench_prefill_super(kv_len, iters)?.as_secs_f64() * 1e3;
+            let ablated = self.bench_prefill_super(kv_len, iters, n_subs)?.as_secs_f64() * 1e3;
             set_prefill_bench_skip(&[]);
             out.push((*label, (full - ablated).max(0.0)));
         }

@@ -81,6 +81,7 @@ pub(crate) enum Command {
         kv_len: u32,
         iters: usize,
         stages: bool,
+        n_subs: usize,
     },
     Quantize {
         output: PathBuf,
@@ -362,6 +363,7 @@ pub(crate) fn parse_cli() -> Cli {
     let mut step_kv_len = 0u32;
     let mut step_max_seq = 512usize;
     let mut step_forward_only = false;
+    let mut bench_n_subs: usize = 0;
     let mut step_profile = false;
     let mut step_profile_steps = 0usize;
     let mut step_layer_profile = false;
@@ -559,6 +561,14 @@ pub(crate) fn parse_cli() -> Cli {
             "--stages" => bench_stages = true,
             "--forward-only" => step_forward_only = true,
             "--step-profile" => step_profile = true,
+            "--n-subs" => {
+                if let Some(v) = args.next() {
+                    bench_n_subs = v.parse().unwrap_or_else(|_| {
+                        eprintln!("invalid --n-subs");
+                        std::process::exit(2);
+                    });
+                }
+            }
             "--layer-profile" => step_layer_profile = true,
             "--profile-steps" => {
                 if let Some(v) = args.next() {
@@ -770,6 +780,7 @@ pub(crate) fn parse_cli() -> Cli {
             kv_len: if step_kv_len > 0 { step_kv_len } else { 15000 },
             iters: bench_iters.max(1),
             stages: bench_stages,
+            n_subs: bench_n_subs,
         },
         Some("quantize") => {
             let out = output_dir.unwrap_or_else(|| {

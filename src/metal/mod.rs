@@ -73,8 +73,8 @@ pub use step_generate::{
 };
 pub use step_kernel::{
     CANVAS, CanvasState, EncodeSubProfileResult, FROZEN_WORDS, HID, LayerEncodeSubProfile,
-    LayerOffsets, MOE_FF, MOE_MAX_BLOCKS, MoeEncodeSubProfile, N_EXPERTS, PREFILL_M, RouteScratch,
-    StepFinishMode, StepParams, StepSmokeConfig, TOP_K, bench_fused_gemm_dispatches,
+    LayerOffsets, MOE_FF, MOE_MAX_BLOCKS, MoeEncodeSubProfile, N_EXPERTS, PREFILL_M, PREFILL_SUBS,
+    RouteScratch, StepFinishMode, StepParams, StepSmokeConfig, TOP_K, bench_fused_gemm_dispatches,
     bench_step_kernel, bench_step_kernel_encode_subprofile, bench_step_kernel_prefill_super,
     bench_step_kernel_prefill_super_stages, bench_step_kernel_profile,
     bench_step_kernel_profile_steps, fill_token_slot,

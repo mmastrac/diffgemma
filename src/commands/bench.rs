@@ -559,12 +559,19 @@ pub(crate) fn run_bench_prefill_super_cmd(
     kv_len: u32,
     iters: usize,
     stages: bool,
+    n_subs: usize,
 ) -> ExitCode {
     use metal::{bench_step_kernel_prefill_super, bench_step_kernel_prefill_super_stages};
     if !dgq::store::looks_like_dgq_dir(model_dir) {
         eprintln!("error: bench-prefill-super requires a .dgq directory");
         return ExitCode::FAILURE;
     }
+    let n_subs = if n_subs == 0 {
+        metal::PREFILL_SUBS
+    } else {
+        n_subs.clamp(1, metal::PREFILL_SUBS)
+    };
+    let m = n_subs * metal::CANVAS;
     // Headroom for the super-chunk (kv + n_subs*256 + 256); +2048 margin.
     let max_seq = (kv_len as usize + 2048).max(2048);
     let cfg = step_kernel_config(30, kv_len, 42, max_seq, true);
@@ -572,9 +579,11 @@ pub(crate) fn run_bench_prefill_super_cmd(
     let hc = flags::gemm_attn_head_chunk();
     if stages {
         // Floor decomposition: full super-chunk + per-stage-group cost (ablation).
-        match bench_step_kernel_prefill_super_stages(model_dir, cfg, kv_len, iters.max(1)) {
+        match bench_step_kernel_prefill_super_stages(model_dir, cfg, kv_len, iters.max(1), n_subs) {
             Ok((full, groups)) => {
-                eprintln!("prefill-super kv={kv_len} FLOOR DECOMPOSITION (hc={hc}):");
+                eprintln!(
+                    "prefill-super kv={kv_len} n_subs={n_subs} (M={m}) FLOOR DECOMPOSITION (hc={hc}):"
+                );
                 let sum: f64 = groups.iter().map(|(_, ms)| ms).sum();
                 for (label, ms) in &groups {
                     eprintln!("  {label:<24} {ms:8.3} ms  ({:5.1}%)", 100.0 * ms / full);
@@ -586,7 +595,7 @@ pub(crate) fn run_bench_prefill_super_cmd(
                     .collect();
                 println!(
                     "RESULT {{\"ok\": true, \"ms\": {full:.4}, \"kv_len\": {kv_len}, \
-                     \"stages\": {{{}}}}}",
+                     \"n_subs\": {n_subs}, \"stages\": {{{}}}}}",
                     items.join(", ")
                 );
                 return ExitCode::SUCCESS;
@@ -597,17 +606,17 @@ pub(crate) fn run_bench_prefill_super_cmd(
             }
         }
     }
-    match bench_step_kernel_prefill_super(model_dir, cfg, kv_len, iters.max(1)) {
+    match bench_step_kernel_prefill_super(model_dir, cfg, kv_len, iters.max(1), n_subs) {
         Ok(d) => {
             let ms = d.as_secs_f64() * 1e3;
             eprintln!(
-                "prefill-super kv={kv_len} qk={qk_bm}x{qk_bn} pv={pv_bm}x{pv_bn} hc={hc} \
-                 tpg={sm_tpg}: {ms:.3} ms/super-chunk (M=1024)"
+                "prefill-super kv={kv_len} n_subs={n_subs} (M={m}) qk={qk_bm}x{qk_bn} \
+                 pv={pv_bm}x{pv_bn} hc={hc} tpg={sm_tpg}: {ms:.3} ms/super-chunk"
             );
             println!(
                 "RESULT {{\"ok\": true, \"ms\": {ms:.4}, \"kv_len\": {kv_len}, \
-                 \"qk_bm\": {qk_bm}, \"qk_bn\": {qk_bn}, \"pv_bm\": {pv_bm}, \"pv_bn\": {pv_bn}, \
-                 \"hc\": {hc}, \"sm_tpg\": {sm_tpg}}}"
+                 \"n_subs\": {n_subs}, \"qk_bm\": {qk_bm}, \"qk_bn\": {qk_bn}, \
+                 \"pv_bm\": {pv_bm}, \"pv_bn\": {pv_bn}, \"hc\": {hc}, \"sm_tpg\": {sm_tpg}}}"
             );
             ExitCode::SUCCESS
         }

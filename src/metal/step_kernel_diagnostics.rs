@@ -1194,9 +1194,10 @@ pub fn bench_step_kernel_prefill_super(
     cfg: StepSmokeConfig,
     kv_len: u32,
     iters: usize,
+    n_subs: usize,
 ) -> Result<std::time::Duration, Error> {
     let (mut rt, _build) = build_step_runtime(model_dir, &cfg)?;
-    rt.bench_prefill_super(kv_len, iters)
+    rt.bench_prefill_super(kv_len, iters, n_subs)
 }
 
 /// Floor decomposition: full super-chunk time + per-stage-group cost (ablation).
@@ -1205,9 +1206,10 @@ pub fn bench_step_kernel_prefill_super_stages(
     cfg: StepSmokeConfig,
     kv_len: u32,
     iters: usize,
+    n_subs: usize,
 ) -> Result<(f64, Vec<(&'static str, f64)>), Error> {
     let (mut rt, _build) = build_step_runtime(model_dir, &cfg)?;
-    rt.bench_prefill_super_stages(kv_len, iters)
+    rt.bench_prefill_super_stages(kv_len, iters, n_subs)
 }
 
 /// Profile the first `n_steps` denoise forwards (canvas `st.step` 0..n_steps-1).

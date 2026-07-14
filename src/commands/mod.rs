@@ -362,7 +362,8 @@ pub(crate) fn dispatch(cli: Cli) -> ExitCode {
             kv_len,
             iters,
             stages,
-        } => run_bench_prefill_super_cmd(&cli.model_dir, kv_len, iters, stages),
+            n_subs,
+        } => run_bench_prefill_super_cmd(&cli.model_dir, kv_len, iters, stages, n_subs),
         Command::BenchGemmFusion {
             layers,
             kv_len,
