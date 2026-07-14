@@ -311,6 +311,101 @@ pub(crate) fn gpu_sparse_tunable(
     Ok(out)
 }
 
+/// Block-height-parameterized sparse GEMM (the DGQ_MOE_PREFILL_BM path). Builds
+/// the block list at `bm` and compiles/dispatches the wide-bm pipeline exactly
+/// like production (bn = SPARSE_BN at bm=32, else 64; grid width = n/bn). Block
+/// height is mathematically irrelevant, so this MUST match the bm=32 output /
+/// CPU oracle — the missing correctness gate that let block_m>32 ship a bug.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn gpu_sparse_tunable_bm(
+    f: &crate::shaders::gemm_linear_grouped::Fixture,
+    bm: usize,
+    bn: usize,
+) -> Result<Vec<f32>, Error> {
+    use crate::metal::buffer::BufferPool;
+    use crate::metal::device::MetalContext;
+    use crate::metal::{BlockGroupedJob, RouteScratch};
+    use objc2_metal::{
+        MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
+    };
+
+    let ctx = MetalContext::new()?;
+    let mut pool = BufferPool::new();
+    let jobs = f.jobs();
+    let w_blob = f.w_blob();
+    let out_len = f.out_len();
+    let num_jobs = f.num_jobs();
+
+    let mut route: Box<RouteScratch> = unsafe { Box::new(std::mem::zeroed()) };
+    for (i, &rs) in f.row_starts.iter().enumerate().take(num_jobs + 1) {
+        route.row_start[i] = rs;
+    }
+    route.num_active_experts = num_jobs as u32;
+    for e in 0..num_jobs {
+        route.active_expert[e] = e as u32;
+    }
+    // Block emission at height `bm` — the production bucket_fill phase-1 rule
+    // (`(count + bm - 1)/bm` blocks, row0 = base + b*bm).
+    let mut blk = 0usize;
+    for e in 0..num_jobs {
+        let base = f.row_starts[e];
+        let count = f.row_starts[e + 1] - f.row_starts[e];
+        for b in 0..(count as usize).div_ceil(bm) {
+            route.block_expert[blk] = e as u32;
+            route.block_row0[blk] = base + (b * bm) as u32;
+            blk += 1;
+        }
+    }
+    route.num_blocks = blk as u32;
+
+    let buf_a = pool.allocate(&ctx.device, f.a.len() * 4).ok_or(Error::Gpu("alloc a"))?;
+    let buf_w = pool.allocate(&ctx.device, w_blob.len()).ok_or(Error::Gpu("alloc w"))?;
+    let buf_c = pool.allocate(&ctx.device, out_len * 4).ok_or(Error::Gpu("alloc c"))?;
+    let buf_jobs = pool
+        .allocate(&ctx.device, jobs.len() * std::mem::size_of::<BlockGroupedJob>())
+        .ok_or(Error::Gpu("alloc jobs"))?;
+    let buf_rs = pool
+        .allocate(&ctx.device, f.row_starts.len() * 4)
+        .ok_or(Error::Gpu("alloc rs"))?;
+    let buf_route = pool
+        .allocate(&ctx.device, std::mem::size_of::<RouteScratch>())
+        .ok_or(Error::Gpu("alloc route"))?;
+    BufferPool::write_f32(&buf_a, &f.a);
+    BufferPool::write_bytes(&buf_w, &w_blob);
+    BufferPool::write_bytes(&buf_jobs, unsafe {
+        std::slice::from_raw_parts(jobs.as_ptr().cast::<u8>(), jobs.len() * std::mem::size_of::<BlockGroupedJob>())
+    });
+    BufferPool::write_bytes(&buf_rs, unsafe {
+        std::slice::from_raw_parts(f.row_starts.as_ptr().cast::<u8>(), f.row_starts.len() * 4)
+    });
+    BufferPool::write_bytes(&buf_route, unsafe {
+        std::slice::from_raw_parts(route.as_ref() as *const RouteScratch as *const u8, std::mem::size_of::<RouteScratch>())
+    });
+    BufferPool::write_f32(&buf_c, &vec![0.0f32; out_len]);
+
+    let pipe = pipeline_for_sparse_tile(&ctx, f.n as u32, f.k as u32, false, f.format, bm, bn)?;
+    let grid = MTLSize {
+        width: f.n.div_ceil(bn),
+        height: route.num_blocks as usize,
+        depth: 1,
+    };
+    let tg = MTLSize { width: crate::shaders::gemm_common::THREADS_PER_TG, height: 1, depth: 1 };
+    let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
+    enc.setComputePipelineState(&pipe.pipeline);
+    crate::shaders::gemm_block_grouped::bind_gpu_buffers(
+        &enc, &buf_a, &buf_w, &buf_c, &buf_jobs, &buf_rs, &buf_route, num_jobs as u32,
+    );
+    enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    enc.endEncoding();
+    cmd.commit();
+    cmd.waitUntilCompleted();
+
+    let mut out = vec![0.0f32; out_len];
+    BufferPool::read_f32(&buf_c, &mut out);
+    Ok(out)
+}
+
 /// Run the dense `gemm_tunable` kernel on a legacy nvfp4 dense fixture
 /// (x bf16, single weight matrix at w_off=0). Self-contained; used by the
 /// dense nvfp4 port oracle. Returns bf16-decoded outputs.
@@ -543,5 +638,41 @@ mod sparse_nvfp4_tests {
         let tuned = gpu_sparse_tunable(&f).expect("tunable sparse");
         let oracle = crate::shaders::gemm_block_grouped::cpu(&f);
         assert_oracle(&tuned, &oracle, 0.05, 0.999);
+    }
+
+    /// THE MISSING GATE (DGQ_MOE_PREFILL_BM correctness): block HEIGHT is
+    /// mathematically irrelevant, so the wide-block (bm=64/128) sparse GEMM must
+    /// match the bm=32 output / CPU oracle at EVERY tile. Counts > 128 exercise
+    /// the ragged last-block padding path.
+    ///
+    /// REGRESSION HISTORY: bm=64/128 once returned cos≈0.59-0.74 here — NOT a
+    /// kernel bug but a pipeline-cache-label collision (device.rs): the tunable
+    /// tile geometry lives in the source `#define`, not a function constant, so
+    /// the cache label omitted it and a bm=32 pipeline silently satisfied a
+    /// bm=64 request, zeroing rows 32..63 of each 64-row block. Fixed by folding
+    /// the source hash into the label. This test loops multiple tiles IN ONE
+    /// PROCESS specifically to force that collision if it ever regresses.
+    #[test]
+    fn sparse_block_m_invariant() {
+        let counts: &[usize] = &[200, 77, 150, 5, 300, 33, 128];
+        let f = grouped_fixture(QuantFormat::Q4Affine, 128, 256, counts);
+        let oracle = crate::shaders::gemm_block_grouped::cpu(&f);
+        let cos = |a: &[f32], b: &[f32]| -> f32 {
+            let (mut d, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+            for (x, y) in a.iter().zip(b) {
+                d += (*x as f64) * (*y as f64);
+                na += (*x as f64).powi(2);
+                nb += (*y as f64).powi(2);
+            }
+            (d / (na.sqrt() * nb.sqrt() + 1e-12)) as f32
+        };
+        // Loop tiles in one process: bm=32 compiles first, so a cache-label that
+        // omits the tile would hand its pipeline to the bm=64/128 requests.
+        for (bm, bn) in [(32usize, 128usize), (32, 64), (64, 64), (128, 64)] {
+            let got = gpu_sparse_tunable_bm(&f, bm, bn).expect("sparse bm");
+            let c = cos(&got, &oracle);
+            println!("  bm={bm:>3} bn={bn:>3}: cos={c:.6} vs CPU oracle");
+            assert!(c > 0.999, "sparse tile bm={bm} bn={bn} diverged: cos={c:.6}");
+        }
     }
 }

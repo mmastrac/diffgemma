@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
-# Thorough holistic prefill BO (task #88): 9-dim search (attn QK/PV tiles, HC,
-# softmax TPG, dense-GEMM tile, MoE-sparse N-tile) against the faithful
-# super-chunk proxy, at multiple kv brackets — to see if the optimum shifts with
-# kv (which would justify a kv-adaptive config). One-process-at-a-time.
+# Thorough holistic prefill BO (task #88): 10-dim search (attn QK/PV tiles, HC,
+# softmax TPG, dense-GEMM tile, MoE-sparse N-tile, MoE-prefill block HEIGHT)
+# against the faithful super-chunk proxy, at multiple kv brackets — to see if the
+# optimum shifts with kv (which would justify a kv-adaptive config).
+# One-process-at-a-time.
+#
+# holistic_v2.db is a FRESH study: the pre-fix holistic.db predates both the
+# pipeline-cache-label correctness fix (bm>32 sparse GEMM was silently a bm=32
+# kernel = half the rows zeroed) and the new moe_prefill_bm axis, so its bm>32
+# region is invalid. Do not resume the old db.
 set -u
 cd "$(dirname "$0")/.."          # -> python/
 BIN=../target/release/diffgemma-mps
 M=../model/diffusiongemma-q4emb
-DB="sqlite:///$(pwd)/holistic.db"
+DB="sqlite:///$(pwd)/${DBFILE:-holistic_v2.db}"
 TRIALS=${TRIALS:-80}
 ITERS=${ITERS:-3}
 

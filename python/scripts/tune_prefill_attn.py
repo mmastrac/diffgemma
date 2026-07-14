@@ -37,6 +37,13 @@ BM_CHOICES = [16, 32, 48, 64]
 BN_CHOICES = [32, 64, 128]
 HC_CHOICES = [1, 2, 4, 8, 16]
 TPG_CHOICES = [64, 128, 256, 512, 1024]
+# Sparse MoE expert-GEMM block HEIGHT (DGQ_MOE_PREFILL_BM). 32 = shipped
+# default; 64/128 = weight-stationary wide blocks. Correct at every height
+# since the pipeline-cache-label fix (the source-baked TUNE_BM now disambiguates
+# the cache; pre-fix, bm>32 silently ran a bm=32 kernel = half the rows zeroed).
+# Proxy-only (needs real weights). Wide path pins its N-tile at 64 today, so the
+# moe_bn axis is inert when this is >32 (a known, harmless redundancy).
+MOE_PREFILL_BM_CHOICES = [32, 64, 128]
 
 
 def run_bench(binary: Path, kv_len: int, iters: int, side: bool, cfg: dict,
@@ -65,6 +72,7 @@ def run_bench(binary: Path, kv_len: int, iters: int, side: bool, cfg: dict,
             "DGQ_GEMM_TUNE_BM": str(cfg["gemm_bm"]),
             "DGQ_GEMM_TUNE_BN": str(cfg["gemm_bn"]),
             "DGQ_MOE_SPARSE_BN": str(cfg["moe_bn"]),
+            "DGQ_MOE_PREFILL_BM": str(cfg["moe_prefill_bm"]),
         })
     if proxy:  # holistic: one real super-chunk at kv=proxy, needs the model
         args = [str(binary), "-m", model, "bench-prefill-super",
@@ -124,6 +132,8 @@ def main() -> int:
             cfg["gemm_bm"] = trial.suggest_categorical("gemm_bm", BM_CHOICES)
             cfg["gemm_bn"] = trial.suggest_categorical("gemm_bn", BN_CHOICES)
             cfg["moe_bn"] = trial.suggest_categorical("moe_bn", BN_CHOICES)
+            cfg["moe_prefill_bm"] = trial.suggest_categorical(
+                "moe_prefill_bm", MOE_PREFILL_BM_CHOICES)
         model = str(Path(args.model).resolve()) if args.proxy else None
         res = run_bench(binary, args.kv_len, args.iters, args.side, cfg,
                         "proxy" if args.proxy else None, model)
@@ -147,10 +157,13 @@ def main() -> int:
 
     # Pin the shipped default as trial 0 so best-vs-default is measured
     # apples-to-apples within THIS run (not vs a separately-benched baseline).
+    # HC=16 and moe_prefill_bm=32 are the SHIPPED production defaults, so trial 0
+    # measures best-vs-production apples-to-apples within this run.
     default_cfg = {"qk_bm": 64, "qk_bn": 64, "pv_bm": 64, "pv_bn": 64,
-                   "hc": 4, "sm_tpg": 256}
+                   "hc": 16, "sm_tpg": 256}
     if args.proxy:
-        default_cfg.update({"gemm_bm": 64, "gemm_bn": 64, "moe_bn": 128})
+        default_cfg.update({"gemm_bm": 64, "gemm_bn": 64, "moe_bn": 128,
+                            "moe_prefill_bm": 32})
     if not (args.storage and any(
             t.params == default_cfg for t in study.get_trials(deepcopy=False))):
         study.enqueue_trial(default_cfg)
@@ -169,11 +182,17 @@ def main() -> int:
 
     study.optimize(objective, n_trials=args.trials, callbacks=[cb])
 
+    def gemm_moe_tag(cfg: dict) -> str:
+        if "gemm_bm" not in cfg:
+            return ""
+        return (f" gemm={cfg['gemm_bm']}x{cfg['gemm_bn']} moe_bn={cfg['moe_bn']} "
+                f"moe_bm={cfg['moe_prefill_bm']}")
+
     print("\n=== top 8 configs ===")
     for ms, cfg, res in sorted(results)[:8]:
         print(f"  {ms:8.3f} ms/layer  {res.get('tf_s', 0):5.2f} TF/s  "
               f"qk={cfg['qk_bm']}x{cfg['qk_bn']} pv={cfg['pv_bm']}x{cfg['pv_bn']} "
-              f"hc={cfg['hc']} tpg={cfg['sm_tpg']}")
+              f"hc={cfg['hc']} tpg={cfg['sm_tpg']}{gemm_moe_tag(cfg)}")
     if results:
         best_ms, best_cfg, best_res = min(results)
         print(f"\nBEST {path} kv={args.kv_len}: {best_ms:.3f} ms/layer "
@@ -181,12 +200,15 @@ def main() -> int:
         print(f"  flags: --qk-bm {best_cfg['qk_bm']} --qk-bn {best_cfg['qk_bn']} "
               f"--pv-bm {best_cfg['pv_bm']} --pv-bn {best_cfg['pv_bn']} "
               f"--hc {best_cfg['hc']} --sm-tpg {best_cfg['sm_tpg']}")
-        # Default 64x64/hc4/256 baseline for reference (if it was sampled).
-        base = next((r for r in results
-                     if r[1] == {"qk_bm": 64, "qk_bn": 64, "pv_bm": 64,
-                                 "pv_bn": 64, "hc": 4, "sm_tpg": 256}), None)
+        if "gemm_bm" in best_cfg:
+            print(f"  env:   DGQ_GEMM_TUNE_BM={best_cfg['gemm_bm']} "
+                  f"DGQ_GEMM_TUNE_BN={best_cfg['gemm_bn']} "
+                  f"DGQ_MOE_SPARSE_BN={best_cfg['moe_bn']} "
+                  f"DGQ_MOE_PREFILL_BM={best_cfg['moe_prefill_bm']}")
+        # Shipped-default baseline for reference (enqueued as trial 0).
+        base = next((r for r in results if r[1] == default_cfg), None)
         if base:
-            print(f"  vs default 64x64/hc4/256: {base[0]:.3f} ms -> "
+            print(f"  vs shipped default: {base[0]:.3f} ms -> "
                   f"{best_ms:.3f} ms ({base[0]/best_ms:.2f}x)")
     return 0
 

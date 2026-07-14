@@ -27,6 +27,26 @@ pub(crate) struct GemmCompileConfig {
     pub out_bf16: bool,
     /// FC30 K_ROWK_OUT_ARENA: arena-overwrite output mode of `gemm_rowk`.
     pub out_arena: bool,
+    /// Hash of the compiled SOURCE. The tunable tile geometry (TUNE_BM/TUNE_BN)
+    /// is baked into the source `#define` prepend, NOT a function constant, so
+    /// it does NOT appear in the FC-derived label. Without this, two different
+    /// tiles at the same (n, k, format) produce the SAME cache label and the
+    /// PipelineArchiveCache silently returns the first-compiled pipeline — a
+    /// bm=32 kernel fed 64-row blocks then zeroes rows 32..63 (found via the
+    /// sparse_block_m_invariant oracle). Folding the source hash into the label
+    /// makes any source-define difference cache-distinct.
+    pub src_hash: u64,
+}
+
+/// Stable (no-random-seed) hash of a shader source for cache-label disambiguation.
+pub(crate) fn source_hash(source: &str) -> u64 {
+    // FNV-1a: deterministic across runs (std DefaultHasher is randomized).
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in source.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }
 
 impl GemmCompileConfig {
@@ -47,6 +67,7 @@ impl GemmCompileConfig {
             gather_a: false,
             out_bf16: false,
             out_arena: false,
+            src_hash: 0,
         }
     }
 
@@ -142,12 +163,9 @@ impl MetalContext {
         x_fp16: bool,
     ) -> Result<ComputePipeline, Error> {
         let library = self.compile_library(source)?;
-        Self::compile_gemm_subkernel_on_device(
-            &self.device,
-            &library,
-            entry,
-            &GemmCompileConfig::raw(gemm_n, gemm_k, is_full_layer, quant_format, x_fp16),
-        )
+        let mut cfg = GemmCompileConfig::raw(gemm_n, gemm_k, is_full_layer, quant_format, x_fp16);
+        cfg.src_hash = source_hash(source);
+        Self::compile_gemm_subkernel_on_device(&self.device, &library, entry, &cfg)
     }
 
     /// As `compile_gemm_subkernel` but forces bf16 output (FC29) — lm_head logits
@@ -161,12 +179,9 @@ impl MetalContext {
         quant_format: u32,
     ) -> Result<ComputePipeline, Error> {
         let library = self.compile_library(source)?;
-        Self::compile_gemm_subkernel_on_device(
-            &self.device,
-            &library,
-            entry,
-            &GemmCompileConfig::out_bf16(gemm_n, gemm_k, quant_format),
-        )
+        let mut cfg = GemmCompileConfig::out_bf16(gemm_n, gemm_k, quant_format);
+        cfg.src_hash = source_hash(source);
+        Self::compile_gemm_subkernel_on_device(&self.device, &library, entry, &cfg)
     }
 
     /// As `compile_gemm_subkernel` but sets GATHER_A (FC28) — the fused-MoE
@@ -180,12 +195,9 @@ impl MetalContext {
         quant_format: u32,
     ) -> Result<ComputePipeline, Error> {
         let library = self.compile_library(source)?;
-        Self::compile_gemm_subkernel_on_device(
-            &self.device,
-            &library,
-            entry,
-            &GemmCompileConfig::gather(gemm_n, gemm_k, quant_format),
-        )
+        let mut cfg = GemmCompileConfig::gather(gemm_n, gemm_k, quant_format);
+        cfg.src_hash = source_hash(source);
+        Self::compile_gemm_subkernel_on_device(&self.device, &library, entry, &cfg)
     }
 
     /// As `compile_gemm_subkernel` but sets K_ROWK_OUT_ARENA (FC30) — the
@@ -201,12 +213,9 @@ impl MetalContext {
         x_fp16: bool,
     ) -> Result<ComputePipeline, Error> {
         let library = self.compile_library(source)?;
-        Self::compile_gemm_subkernel_on_device(
-            &self.device,
-            &library,
-            entry,
-            &GemmCompileConfig::rowk_arena(gemm_n, gemm_k, quant_format, x_fp16),
-        )
+        let mut cfg = GemmCompileConfig::rowk_arena(gemm_n, gemm_k, quant_format, x_fp16);
+        cfg.src_hash = source_hash(source);
+        Self::compile_gemm_subkernel_on_device(&self.device, &library, entry, &cfg)
     }
 
     /// Specialize stacked GEMM: base FC1–11 plus segment table FC12–27.
@@ -228,9 +237,11 @@ impl MetalContext {
             gemm_k,
             quant_format,
             stacked,
+            source_hash(source),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn compile_gemm_stacked_subkernel_on_device(
         device: &ProtocolObject<dyn MTLDevice>,
         library: &ProtocolObject<dyn MTLLibrary>,
@@ -239,6 +250,7 @@ impl MetalContext {
         gemm_k: u32,
         quant_format: u32,
         stacked: &crate::shaders::gemm_block_stacked::StackedSegFc,
+        src_hash: u64,
     ) -> Result<ComputePipeline, Error> {
         let variant = crate::shaders::variant::runtime_step_variant();
         let fc = MTLFunctionConstantValues::new();
@@ -360,7 +372,7 @@ impl MetalContext {
             .newFunctionWithName_constantValues_error(&name, &fc)
             .map_err(|e| shader_compile_error(e))?;
         let label = format!(
-            "{entry}_qf{quant_format}_n{gemm_n}_k{gemm_k}_nt{gemm_n_tile}_af{}_ns{}_e{}_{}_{}_w{}_{}_{}_y{}_{}_{}",
+            "{entry}_qf{quant_format}_n{gemm_n}_k{gemm_k}_nt{gemm_n_tile}_af{}_ns{}_e{}_{}_{}_w{}_{}_{}_y{}_{}_{}_s{src_hash:x}",
             u8::from(arena_f16),
             stacked.n_segs,
             stacked.end0,
@@ -393,6 +405,7 @@ impl MetalContext {
             gather_a,
             out_bf16,
             out_arena,
+            src_hash,
         } = *cfg;
         let variant = crate::shaders::variant::runtime_step_variant();
         let fc = MTLFunctionConstantValues::new();
@@ -485,7 +498,7 @@ impl MetalContext {
             .newFunctionWithName_constantValues_error(&name, &fc)
             .map_err(|e| shader_compile_error(e))?;
         let label = format!(
-            "{entry}_qf{quant_format}_n{gemm_n}_k{gemm_k}_nt{gemm_n_tile}_xfp16{}_sa{}_df{}_dd{}_g{}_o{}_oa{}_af{}",
+            "{entry}_qf{quant_format}_n{gemm_n}_k{gemm_k}_nt{gemm_n_tile}_xfp16{}_sa{}_df{}_dd{}_g{}_o{}_oa{}_af{}_s{src_hash:x}",
             u8::from(x_fp16),
             u8::from(shape_assert),
             u8::from(debug_fast),
