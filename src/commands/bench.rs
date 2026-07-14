@@ -363,6 +363,30 @@ pub(crate) fn run_bench_gemm(shapes: &str, oracle: Option<&str>, iters: usize) -
         print_bench_rows(&rows);
         return ExitCode::SUCCESS;
     }
+    // `--shapes db`: head-to-head single-buffered (gemm_tunable) vs
+    // double-buffered steel-loader (gemm_tunable_db) at the prefill-relevant
+    // dense shapes. Direct comparability — same shape, same fixture, same
+    // tile (64x64 production). The `tunable_db_*` row carries a BITEXACT/
+    // MISMATCH tag (gate the perf number on correctness in-place).
+    if shapes == "db" {
+        let dense_shapes = &[
+            metal::GemmShape { m: 256, k: 2816, n: 2816 },
+            metal::GemmShape { m: 1024, k: 2816, n: 2816 },
+        ];
+        let mut rows = match metal::bench_gemm_tunable(dense_shapes, iters) {
+            Ok(r) => r,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        match metal::bench_gemm_tunable_db(dense_shapes, iters) {
+            Ok(mut r) => rows.append(&mut r),
+            Err(err) => eprintln!("warning: gemm_tunable_db bench: {err}"),
+        }
+        print_bench_rows(&rows);
+        return ExitCode::SUCCESS;
+    }
     let parsed = match parse_shapes(shapes) {
         Ok(s) => s,
         Err(err) => {

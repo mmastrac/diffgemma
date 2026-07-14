@@ -450,8 +450,33 @@ opt-in flags for A/B.
   breaks convergence even at N=2; MoE is bandwidth-bound not row-bound.
 - **Dispatch/sync micro-optimization** — encode is ~0.2 ms/step; non-lever.
   Same for MLX-style `load_unsafe`/bounds-check tricks and ICB record/replay.
-- **Steel-loader GEMM port** — real but worth ≤2-3% end-to-end at ~10-15%
-  kernel gap vs MLX qmm; parked on ROI.
+- **Steel-loader GEMM port (software-pipelined double-buffering)** — DISPROVEN
+  2026-07-14 (the parked ≤2-3% ROI estimate was optimistic). Built the real
+  prototype: `gemm_tunable_db` (sibling entry in `gemm_tunable.metal`) doubles
+  the tgmem tiles `Xs[2][BM][PAD]` + `Ws[2][BN][PAD]`, runs a prologue load
+  tile 0, then in the K-loop overlaps the device→tgmem load of tile N+1 with
+  the MMA of tile N (one barrier/K-tile vs two in the single-buffered kernel).
+  Bit-exact vs the single-buffered `gemm_tunable` (Tier-1 test green; the
+  K-accumulation chain, dequant, and store rounding are unchanged — only the
+  tgmem buffering schedule differs). Benched head-to-head at the prefill-
+  relevant dense shapes (256×2816×2816 + 1024×2816×2816, production tile
+  64×64, q4 weights): double-buf = **3.377 / 3.566 TF/s** vs single-buf =
+  **3.611 / 3.919 TF/s** → **0.93× / 0.91× (7-9% SLOWER)**. PHYSICS: the
+  device→tgmem load is already fully hidden behind the ~6× compute margin
+  (compute >> load, so single-buffered load already overlaps with the next
+  K-tile's compute via the GPU's natural instruction issue). The extra
+  barrier sync + doubled tgmem footprint (which hurts tile occupancy / SLC
+  pressure) costs more than the explicit load/MMA overlap gains. There is no
+  async-copy engine on Apple GPU — the "overlap" is just re-issuing the load
+  instructions before the MMA, which the single-buffered version already does
+  implicitly because the GPU issues load/store and matrix-unit instructions
+  concurrently. This is the same shape as the int8 dot disproof: the physics
+  (compute-bound regime, load already hidden) predicted the result, and a real
+  prototype on real shapes confirmed it. `gemm_tunable_db` + the `bench-gemm
+  --shapes db` harness kept as a documented negative; not wired to production.
+  Lesson: when compute >> load (the 6× margin regime), software-pipelined
+  double-buffering is a regression, not a lever — the doubled tgmem footprint
+  + extra sync costs more than the already-hidden load overlap returns.
 
 **Quality levers, disproven by measurement:**
 - **Hard freeze of accepted positions** — WAS the flat-row wart driver

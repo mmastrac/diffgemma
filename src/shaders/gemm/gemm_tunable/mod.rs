@@ -11,6 +11,10 @@ use crate::shaders::QuantFormat;
 
 pub const ENTRY: &str = "gemm_tunable";
 
+/// Double-buffered (steel-loader prototype) entry — same source, different
+/// kernel name. Prototype only; wired to bench-gemm, not production.
+pub const ENTRY_DB: &str = "gemm_tunable_db";
+
 pub const SHADER: &str = include_str!("gemm_tunable.metal");
 
 /// Production tile config: 64x64 won every swept production shape.
@@ -30,6 +34,21 @@ pub fn pipeline_for(
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
     let (bm, bn) = crate::flags::gemm_tune_tile();
     pipeline_for_tile(ctx, n, k, format, bm, bn)
+}
+
+/// Compile the double-buffered variant at the production tile (64x64). Same
+/// FC axes / source hash as the single-buffered path — the kernel name differs
+/// so the pipeline-cache label disambiguates.
+#[cfg(target_os = "macos")]
+pub fn pipeline_for_db(
+    ctx: &crate::metal::device::MetalContext,
+    n: u32,
+    k: u32,
+    format: QuantFormat,
+) -> Result<crate::metal::device::ComputePipeline, Error> {
+    let (bm, bn) = crate::flags::gemm_tune_tile();
+    let src = tuned_source(bm, bn);
+    ctx.compile_gemm_subkernel(&src, ENTRY_DB, n, k, false, format as u32, false)
 }
 
 /// Tile-parameterized dense pipeline (task #88 holistic sweep). Production
@@ -674,5 +693,116 @@ mod sparse_nvfp4_tests {
             println!("  bm={bm:>3} bn={bn:>3}: cos={c:.6} vs CPU oracle");
             assert!(c > 0.999, "sparse tile bm={bm} bn={bn} diverged: cos={c:.6}");
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod double_buffer_tests {
+    use super::*;
+    use crate::metal::buffer::BufferPool;
+    use crate::metal::device::MetalContext;
+    use crate::shaders::bf16;
+    use crate::shaders::gemm_q4;
+    use objc2_metal::{
+        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+        MTLComputeCommandEncoder, MTLSize,
+    };
+
+    /// Bit-exact oracle: the double-buffered `gemm_tunable_db` must produce
+    /// byte-identical output to the single-buffered `gemm_tunable` on the same
+    /// q4 dense fixture (the K-accumulation chain, dequant, and store rounding
+    /// are unchanged — only the tgmem buffering schedule differs). Guards the
+    /// steel-loader prototype before any perf claim (the DGQ_MOE_PREFILL_BM
+    /// fake-win lesson: gate perf on correctness FIRST).
+    #[test]
+    fn gemm_tunable_db_bitexact_vs_single_buffer() {
+        let ctx = MetalContext::new().expect("metal ctx");
+        let mut pool = BufferPool::new();
+        // tile_fixture: m=8, n=128, k=128 — exercises multiple K-tiles (BK=32
+        // -> 4 K-tiles, so the double-buffer prologue/main/epilogue all run).
+        let f = gemm_q4::tile_fixture(crate::shaders::test_util::ElemFormat::F32);
+        let w_q4 = gemm_q4::w_q4(&f);
+        let buf_x = pool
+            .allocate(&ctx.device, f.m * f.k * 2)
+            .expect("x");
+        let buf_y_single = pool.allocate(&ctx.device, f.m * f.n * 2).expect("y_single");
+        let buf_y_db = pool.allocate(&ctx.device, f.m * f.n * 2).expect("y_db");
+        let buf_w = pool.allocate(&ctx.device, w_q4.len()).expect("w");
+        BufferPool::write_bf16(&buf_x, &bf16::f32_slice_to_bf16_bits(&f.x));
+        BufferPool::write_bytes(&buf_w, &w_q4);
+
+        let (bm, bn) = (TUNE_BM, TUNE_BN);
+        let src = tuned_source(bm, bn);
+        let grid = MTLSize {
+            width: f.n.div_ceil(bn),
+            height: f.m.div_ceil(bm),
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        };
+
+        // Single-buffered reference.
+        {
+            let pipe = ctx
+                .compile_gemm_subkernel(
+                    &src,
+                    ENTRY,
+                    f.n as u32,
+                    f.k as u32,
+                    false,
+                    crate::shaders::QuantFormat::Q4Affine as u32,
+                    false,
+                )
+                .expect("single pipeline");
+            let cmd = ctx.queue.commandBuffer().expect("cmd");
+            let enc = cmd.computeCommandEncoder().expect("enc");
+            enc.setComputePipelineState(&pipe.pipeline);
+            gemm_q4::bind_gpu_buffers(&enc, &buf_x, &buf_y_single, &buf_w, 0, f.m as u32);
+            enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+            enc.endEncoding();
+            cmd.commit();
+            cmd.waitUntilCompleted();
+        }
+        // Double-buffered variant.
+        {
+            let pipe = pipeline_for_db(
+                &ctx,
+                f.n as u32,
+                f.k as u32,
+                crate::shaders::QuantFormat::Q4Affine,
+            )
+            .expect("db pipeline");
+            let cmd = ctx.queue.commandBuffer().expect("cmd");
+            let enc = cmd.computeCommandEncoder().expect("enc");
+            enc.setComputePipelineState(&pipe.pipeline);
+            gemm_q4::bind_gpu_buffers(&enc, &buf_x, &buf_y_db, &buf_w, 0, f.m as u32);
+            enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+            enc.endEncoding();
+            cmd.commit();
+            cmd.waitUntilCompleted();
+        }
+
+        let sp = buf_y_single.contents().as_ptr() as *const u16;
+        let dp = buf_y_db.contents().as_ptr() as *const u16;
+        let mut mismatches = 0usize;
+        for i in 0..(f.m * f.n) {
+            let a = unsafe { *sp.add(i) };
+            let b = unsafe { *dp.add(i) };
+            if a != b {
+                mismatches += 1;
+                if mismatches <= 5 {
+                    let af = bf16::bf16_bits_to_f32(a);
+                    let bf = bf16::bf16_bits_to_f32(b);
+                    eprintln!("  [{i}] single={a:#06x} ({af}) db={b:#06x} ({bf})");
+                }
+            }
+        }
+        assert_eq!(
+            mismatches, 0,
+            "gemm_tunable_db produced {mismatches} mismatches vs gemm_tunable"
+        );
     }
 }

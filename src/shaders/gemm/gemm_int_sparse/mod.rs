@@ -323,7 +323,7 @@ mod tests {
         let (a_int8, w_int8, scale_a, scale_w) = f.int8_side_channel();
         let jobs = f.jobs();
         let (route, _num_blocks) = build_route(&f.row_starts, f.num_jobs(), INT_BM);
-        let oracle = gemm_int_sparse_cpu(
+        let oracle = cpu::gemm_int_sparse_cpu(
             &a_int8,
             &w_int8,
             &scale_a,
@@ -355,7 +355,7 @@ mod tests {
         let jobs = f.jobs();
         for (bm, bn) in [(32usize, 128usize), (64, 64), (128, 64)] {
             let (route, _num_blocks) = build_route(&f.row_starts, f.num_jobs(), bm);
-            let oracle = gemm_int_sparse_cpu(
+            let oracle = cpu::gemm_int_sparse_cpu(
                 &a_int8,
                 &w_int8,
                 &scale_a,

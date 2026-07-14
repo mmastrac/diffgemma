@@ -212,6 +212,237 @@ kernel void gemm_tunable(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Double-buffered variant (steel-loader prototype): overlaps the K-tile
+// device->tgmem load of tile N+1 with the MMA of tile N. Same K-accumulation
+// chain + dequant + store rounding as gemm_tunable -> BIT-EXACT expected.
+//
+// Metal has no async-copy primitive; the overlap comes from issuing the load
+// instructions (which execute on the load/store units) before the MMA
+// instructions (which execute on the matrix units), with a single barrier per
+// K-tile instead of two. tgmem footprint doubles (Xs[2][BM][PAD] + Ws[2][BN]
+// [PAD]) — fits M3's 32 KiB threadgroup limit at production tiles (64x64:
+// 2*64*40*2 + 2*64*40*2 = 20480 bytes; 32x128: 2*32*40*2 + 2*128*40*2 = 25600
+// bytes). Prototype only — wired to bench-gemm, not production.
+// ---------------------------------------------------------------------------
+
+/// A-tile loader, double-buffered slot variant.
+inline void tunable_load_a_db(
+    device const ushort *x,
+    threadgroup half Xs[2][TUNE_BM][40],
+    uint buf,
+    uint m0,
+    uint M,
+    uint K,
+    uint k0,
+    uint ltid
+) {
+    for (uint i = ltid * 4u; i < BM * BK; i += 128u * 4u) {
+        const uint mm = i / BK;
+        const uint kk = i % BK;
+        half4 h;
+        if (m0 + mm < M) {
+            const ushort4 u = *(device const ushort4 *)(x + (ulong)(m0 + mm) * K + k0 + kk);
+            h = K_ARENA_F16 ? as_type<half4>(u) : half4(as_type<float4>(uint4(u) << 16u));
+        } else {
+            h = half4(0);
+        }
+        *(threadgroup half4 *)(&Xs[buf][mm][kk]) = h;
+    }
+}
+
+/// Double-buffered dense GEMM. Same buffer layout + dispatch contract as
+/// `gemm_tunable`; differs only in the K-loop scheduling.
+kernel void gemm_tunable_db(
+    device const ushort *x [[buffer(0)]],
+    device ushort *y [[buffer(1)]],
+    device const uchar *blob [[buffer(2)]],
+    constant ulong &w_off [[buffer(3)]],
+    constant uint &M [[buffer(4)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint3 lid [[thread_position_in_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint N = GEMM_N, K = GEMM_K;
+    threadgroup half Xs[2][BM][PAD];
+    threadgroup half Ws[2][BN][PAD]; // row-major [n][k]
+
+    const uint m0 = tgid.y * BM;
+    const uint n0 = tgid.x * BN;
+    const uint ltid = lid.x;
+
+    const bool is_raw = (K_QUANT_FORMAT == QUANT_RAW);
+    const bool is_q8 = (K_QUANT_FORMAT == QUANT_Q8);
+    const bool is_nvfp4 = (K_QUANT_FORMAT == QUANT_NVFP4);
+    const ulong rowB = is_raw
+        ? (ulong)K * 2ul
+        : (is_q8 ? q8_row_bytes(K) : (is_nvfp4 ? nvfp4_row_bytes(K) : q4_row_bytes(K)));
+    const ulong body = is_nvfp4 ? w_off + 4ul : w_off;
+    const float nvfp4_gscale =
+        is_nvfp4 ? as_type<float>(*(device const uint *)(blob + w_off)) : 0.0f;
+
+    uint fm, fn;
+    frag_lane_coords(lane, fm, fn);
+
+    simdgroup_float8x8 C[TM][TN];
+    for (uint i = 0u; i < TM; ++i) {
+        for (uint j = 0u; j < TN; ++j) {
+            C[i][j] = simdgroup_float8x8(0.f);
+        }
+    }
+    const uint sr = (BM / 2u) * (sgid >> 1u);
+    const uint sc = (BN / 2u) * (sgid & 1u);
+
+    const uint w_tpr = 128u / BN;
+    const uint w_cols = BK / w_tpr;
+    const uint w_r = ltid / w_tpr;
+    const uint w_q = (ltid % w_tpr) * w_cols;
+
+    // Prologue: load tile 0 into slot 0.
+    tunable_load_a_db(x, Xs, 0u, m0, M, K, 0u, ltid);
+    {
+        const uint gn = n0 + w_r;
+        if (gn < N) {
+            if (is_raw) {
+                device const ushort *wr =
+                    (device const ushort *)(blob + w_off + (ulong)gn * rowB);
+                for (uint j = 0u; j < w_cols; j += 4u) {
+                    const ushort4 u = *(device const ushort4 *)(wr + 0u + w_q + j);
+                    *(threadgroup half4 *)(&Ws[0][w_r][w_q + j]) =
+                        half4(as_type<float4>(uint4(u) << 16u));
+                }
+            } else if (is_q8) {
+                device const uchar *rb = blob + w_off + (ulong)gn * rowB;
+                const float sq8 = bf16_bytes(rb);
+                for (uint j = 0u; j < w_cols; ++j) {
+                    const char qv = *((device const char *)(rb + 2u + 0u + w_q + j));
+                    Ws[0][w_r][w_q + j] = half(float(qv) * sq8);
+                }
+            } else if (is_nvfp4) {
+                dequant_nvfp4_tile_half_fused_tg_range(
+                    blob + body + (ulong)gn * rowB, K, 0u,
+                    &Ws[0][w_r][w_q], nvfp4_gscale, 0u + w_q, w_cols);
+            } else {
+                device const uchar *g =
+                    blob + w_off + (ulong)gn * rowB + (ulong)(0u / 32u) * 20ul;
+                const half s = half(bf16_bytes(g));
+                const half mn = half(bf16_bytes(g + 2));
+                for (uint j8 = 0u; j8 < w_cols; j8 += 8u) {
+                    const uint jj = w_q + j8;
+                    device const uchar *p = g + 4u + jj / 2u;
+                    const uint v = uint(p[0]) | (uint(p[1]) << 8u) |
+                        (uint(p[2]) << 16u) | (uint(p[3]) << 24u);
+                    const half4 q0 = half4(
+                        half(v & 0xFu), half((v >> 4u) & 0xFu),
+                        half((v >> 8u) & 0xFu), half((v >> 12u) & 0xFu));
+                    const half4 q1 = half4(
+                        half((v >> 16u) & 0xFu), half((v >> 20u) & 0xFu),
+                        half((v >> 24u) & 0xFu), half(v >> 28u));
+                    *(threadgroup half4 *)(&Ws[0][w_r][jj]) = s * q0 + half4(mn);
+                    *(threadgroup half4 *)(&Ws[0][w_r][jj + 4u]) = s * q1 + half4(mn);
+                }
+            }
+        } else {
+            for (uint j = 0u; j < w_cols; j += 4u) {
+                *(threadgroup half4 *)(&Ws[0][w_r][w_q + j]) = half4(0);
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Main loop: overlap load of tile N+1 (slot `next`) with MMA of tile N
+    // (slot `cur`). One barrier per K-tile (vs two in the single-buffered
+    // kernel) — it waits for both the prev-tile MMA to finish consuming `cur`
+    // AND the next-tile load to finish filling `next`, then swaps.
+    uint cur = 0u;
+    for (uint k0 = 0u; k0 < K; k0 += BK) {
+        const uint k0_next = k0 + BK;
+        const uint next = cur ^ 1u;
+        if (k0_next < K) {
+            tunable_load_a_db(x, Xs, next, m0, M, K, k0_next, ltid);
+            {
+                const uint gn = n0 + w_r;
+                if (gn < N) {
+                    if (is_raw) {
+                        device const ushort *wr =
+                            (device const ushort *)(blob + w_off + (ulong)gn * rowB);
+                        for (uint j = 0u; j < w_cols; j += 4u) {
+                            const ushort4 u = *(device const ushort4 *)(wr + k0_next + w_q + j);
+                            *(threadgroup half4 *)(&Ws[next][w_r][w_q + j]) =
+                                half4(as_type<float4>(uint4(u) << 16u));
+                        }
+                    } else if (is_q8) {
+                        device const uchar *rb = blob + w_off + (ulong)gn * rowB;
+                        const float sq8 = bf16_bytes(rb);
+                        for (uint j = 0u; j < w_cols; ++j) {
+                            const char qv = *((device const char *)(rb + 2u + k0_next + w_q + j));
+                            Ws[next][w_r][w_q + j] = half(float(qv) * sq8);
+                        }
+                    } else if (is_nvfp4) {
+                        dequant_nvfp4_tile_half_fused_tg_range(
+                            blob + body + (ulong)gn * rowB, K, k0_next,
+                            &Ws[next][w_r][w_q], nvfp4_gscale, k0_next + w_q, w_cols);
+                    } else {
+                        device const uchar *g =
+                            blob + w_off + (ulong)gn * rowB + (ulong)(k0_next / 32u) * 20ul;
+                        const half s = half(bf16_bytes(g));
+                        const half mn = half(bf16_bytes(g + 2));
+                        for (uint j8 = 0u; j8 < w_cols; j8 += 8u) {
+                            const uint jj = w_q + j8;
+                            device const uchar *p = g + 4u + jj / 2u;
+                            const uint v = uint(p[0]) | (uint(p[1]) << 8u) |
+                                (uint(p[2]) << 16u) | (uint(p[3]) << 24u);
+                            const half4 q0 = half4(
+                                half(v & 0xFu), half((v >> 4u) & 0xFu),
+                                half((v >> 8u) & 0xFu), half((v >> 12u) & 0xFu));
+                            const half4 q1 = half4(
+                                half((v >> 16u) & 0xFu), half((v >> 20u) & 0xFu),
+                                half((v >> 24u) & 0xFu), half(v >> 28u));
+                            *(threadgroup half4 *)(&Ws[next][w_r][jj]) = s * q0 + half4(mn);
+                            *(threadgroup half4 *)(&Ws[next][w_r][jj + 4u]) = s * q1 + half4(mn);
+                        }
+                    }
+                } else {
+                    for (uint j = 0u; j < w_cols; j += 4u) {
+                        *(threadgroup half4 *)(&Ws[next][w_r][w_q + j]) = half4(0);
+                    }
+                }
+            }
+        }
+        // MMA on the current tile (overlapped with the next-tile load above).
+        frag_mma_ktile(Xs[cur], Ws[cur], C, sr, sc, fm, fn);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        cur = next;
+    }
+
+    // Per-lane direct store: identical to gemm_tunable.
+    for (uint i = 0u; i < TM; ++i) {
+        const uint row = m0 + sr + 8u * i + fm;
+        if (row >= M) {
+            continue;
+        }
+        for (uint j = 0u; j < TN; ++j) {
+            const uint col = n0 + sc + 8u * j + fn;
+            const thread float2 &ec = reinterpret_cast<thread float2 &>(C[i][j].thread_elements());
+            if (col < N) {
+                if (K_OUT_BF16) {
+                    arena_store_bf16(y, (ulong)row * N + col, ec[0]);
+                } else {
+                    arena_store(y, (ulong)row * N + col, ec[0]);
+                }
+            }
+            if (col + 1u < N) {
+                if (K_OUT_BF16) {
+                    arena_store_bf16(y, (ulong)row * N + col + 1u, ec[1]);
+                } else {
+                    arena_store(y, (ulong)row * N + col + 1u, ec[1]);
+                }
+            }
+        }
+    }
+}
+
 /// Stacked tunable GEMM: segment table via FC12-27 (same contract as
 /// gemm_block_stacked) — qkv and dense gate/up fused dispatches. Raw + q4
 /// weight formats (production stacked paths); per-element segment resolve on
