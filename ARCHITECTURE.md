@@ -410,6 +410,27 @@ planning perf or quality work; the machinery for several survives behind
 opt-in flags for A/B.
 
 **Speed levers, disproven by regime:**
+- **int8/int4 dot-product MoE expert GEMM (E18 redirect)** — built a real
+  int8-accumulated block-sparse MoE expert GEMM (`gemm_int_sparse`) and benched
+  it head-to-head vs the production q4→half-MMA path at real MoE shapes
+  (128 experts, gate_up 1408×2816 + down 2816×704, rpe 64/16). Correctness
+  gated FIRST (cos=1.000000 vs CPU int8 oracle at every tile). RESULT: int8 =
+  ~0.43 TFLOP/s vs production = ~3.78 TFLOP/s → **~9× SLOWER**. The synthetic
+  `int_mma_probe` microbench reported int8 dot ≈ f32 FMA ≈ 14× half-MMA in
+  per-instruction GMAC/s and could NOT settle this — the trap is that
+  per-instruction throughput is misleading for GEMM shapes: the half-simdgroup
+  -MMA does 512 MAC/simdgroup-inst (16 MAC/lane) while the int8 char4 dot does
+  4 MAC/lane/inst, AND the int8 path pays 32 sequential dependent int32 adds
+  per fragment element (no MMA register-array parallelism). On M3's
+  SIMD-ALU-emulated matrix unit the half-MMA's per-instruction width dominates
+  the int8 dot's per-lane scalar chain by ~9×, exactly the measured gap. The
+  MLX-dequants-to-half "tell" was PROOF, not oversight. Tile sweep (BM=32/64,
+  BN=64/128) did not help — the loss is in the inner accumulation, not tiling.
+  int4 cannot close a 9× compute gap (and has no dot instruction on M3 — would
+  unpack to int8). `gemm_int_sparse` + `bench-gemm --shapes sparse` kept as
+  documented negative; not wired to production. Lesson: a per-instruction
+  GMAC/s microbench cannot settle a GEMM-shape question — only a real prototype
+  on real shapes can.
 - **Flash-decode / sequential KV blocking** — attention is issue-bound at
   SLC service; the lockstep sweep already gets SLC locality. Restructuring
   the sweep bought nothing (`DGQ_ATTN_KV_BLOCK`, default off).

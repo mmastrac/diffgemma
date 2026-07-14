@@ -766,3 +766,224 @@ pub fn bench_gemm_tunable_sparse(iters: usize) -> Result<Vec<GemmBenchRow>, Erro
     }
     Ok(rows)
 }
+
+/// int8-accumulated block-sparse MoE expert GEMM bench (E18 redirect
+/// prototype). Mirrors `bench_gemm_tunable_sparse` shapes (128 experts,
+/// prefill rpe=64 + denoise rpe=16, gate_up 1408×K and down 2816×K) but swaps
+/// the production q4→half-MMA path for the int8 dot-product path
+/// (`gemm_int_sparse`): activations and weights are per-row-absmax int8,
+/// `int32 += int8*int8` per output cell, rescaled once at the end. Head-to-head
+/// vs `bench_gemm_tunable_sparse` rows in the same `bench-gemm --shapes sparse`
+/// output. Reports USEFUL TF/s (routed rows only — padding excluded, matching
+/// the production methodology).
+#[cfg(target_os = "macos")]
+pub fn bench_gemm_int_sparse(iters: usize) -> Result<Vec<GemmBenchRow>, Error> {
+    use crate::metal::device::MetalContext;
+    use crate::metal::{BlockGroupedJob, RouteScratch};
+    use crate::shaders::gemm_int_sparse;
+    use crate::shaders::gpu_common;
+    use objc2_metal::{
+        MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
+    };
+
+    let ctx = MetalContext::new()?;
+    let mut pool = BufferPool::new();
+    let warmup = 3usize;
+    let mut rows = Vec::new();
+    const N_EXPERTS: usize = 128;
+    const SHAPES: &[(usize, usize, &str)] = &[(1408, 2816, "gate_up"), (2816, 704, "down")];
+    const ROWS_PER_EXPERT: &[usize] = &[64, 16];
+
+    for &(n, k, tag) in SHAPES {
+        // Synthetic f32 expert weights + activations (distinct addresses, not
+        // realistic values — perf fidelity needs the cache footprint, not the
+        // numeric content). The int8 side-channel re-quants these per-row.
+        let w_f32_experts: Vec<Vec<f32>> = (0..N_EXPERTS)
+            .map(|e| {
+                (0..n * k)
+                    .map(|i| (((e + 1) as f32) * 0.11 + (i as f32) * 0.007).cos() * 0.03)
+                    .collect()
+            })
+            .collect();
+        let jobs: Vec<BlockGroupedJob> = (0..N_EXPERTS)
+            .map(|e| BlockGroupedJob {
+                w_byte_off: (e * n * k) as u64,
+                groups_per_row: 0,
+                _pad: 0,
+            })
+            .collect();
+
+        // Pack the int8 W blob + per-column scale envelope (shared across
+        // experts — see the kernel header comment).
+        let mut w_int8 = Vec::<u8>::with_capacity(N_EXPERTS * n * k);
+        let mut scale_w = vec![0.0f32; n];
+        for w in &w_f32_experts {
+            for c in 0..n {
+                let row = &w[c * k..(c + 1) * k];
+                let max_abs = row.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+                scale_w[c] = scale_w[c].max(max_abs / 127.0);
+            }
+        }
+        for w in &w_f32_experts {
+            for c in 0..n {
+                let row = &w[c * k..(c + 1) * k];
+                let s = scale_w[c];
+                for &v in row {
+                    let r = (v / s).round().clamp(-128.0, 127.0) as i8;
+                    w_int8.push(r as u8);
+                }
+            }
+        }
+        drop(w_f32_experts);
+
+        let buf_w = pool
+            .allocate(&ctx.device, w_int8.len())
+            .ok_or(Error::Runtime("int8 sparse bench w"))?;
+        BufferPool::write_bytes(&buf_w, &w_int8);
+        drop(w_int8);
+
+        let buf_sw = pool
+            .allocate(&ctx.device, scale_w.len() * 4)
+            .ok_or(Error::Runtime("int8 sparse bench sw"))?;
+        BufferPool::write_f32(&buf_sw, &scale_w);
+
+        let buf_jobs = pool
+            .allocate(
+                &ctx.device,
+                jobs.len() * std::mem::size_of::<BlockGroupedJob>(),
+            )
+            .ok_or(Error::Runtime("int8 sparse bench jobs"))?;
+        BufferPool::write_bytes(&buf_jobs, unsafe {
+            std::slice::from_raw_parts(
+                jobs.as_ptr() as *const u8,
+                jobs.len() * std::mem::size_of::<BlockGroupedJob>(),
+            )
+        });
+
+        for &rpe in ROWS_PER_EXPERT {
+            let slots = N_EXPERTS * rpe;
+            let shape = GemmShape { m: slots, k, n };
+
+            // Same f32 A reference as bench_gemm_tunable_sparse.
+            let a_f32: Vec<f32> = (0..slots * k)
+                .map(|i| ((i as f32) * 0.013).sin() * 0.2)
+                .collect();
+            // Per-row absmax int8 A.
+            let mut a_int8 = vec![0u8; slots * k];
+            let mut scale_a = vec![0.0f32; slots];
+            for s in 0..slots {
+                let row = &a_f32[s * k..(s + 1) * k];
+                let max_abs = row.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+                let sc = if max_abs == 0.0 { 1.0 } else { max_abs / 127.0 };
+                scale_a[s] = sc;
+                for (j, &v) in row.iter().enumerate() {
+                    let r = (v / sc).round().clamp(-128.0, 127.0) as i8;
+                    a_int8[s * k + j] = r as u8;
+                }
+            }
+            drop(a_f32);
+
+            let buf_a = pool
+                .allocate(&ctx.device, a_int8.len())
+                .ok_or(Error::Runtime("int8 sparse bench a"))?;
+            BufferPool::write_bytes(&buf_a, &a_int8);
+            drop(a_int8);
+
+            let buf_sa = pool
+                .allocate(&ctx.device, scale_a.len() * 4)
+                .ok_or(Error::Runtime("int8 sparse bench sa"))?;
+            BufferPool::write_f32(&buf_sa, &scale_a);
+
+            let row_starts: Vec<u32> = (0..=N_EXPERTS).map(|e| (e * rpe) as u32).collect();
+            let buf_rs = pool
+                .allocate(&ctx.device, row_starts.len() * 4)
+                .ok_or(Error::Runtime("int8 sparse bench rs"))?;
+            BufferPool::write_bytes(&buf_rs, unsafe {
+                std::slice::from_raw_parts(row_starts.as_ptr() as *const u8, row_starts.len() * 4)
+            });
+
+            let buf_c = pool
+                .allocate(&ctx.device, slots * n * 4)
+                .ok_or(Error::Runtime("int8 sparse bench c"))?;
+            let buf_route = pool
+                .allocate(&ctx.device, std::mem::size_of::<RouteScratch>())
+                .ok_or(Error::Runtime("int8 sparse bench route"))?;
+
+            for (bm, bn) in [(32usize, 128usize), (64, 64)] {
+                // Wider-than-32 blocks only pay off when an expert spans
+                // multiple 32-blocks (the prefill case rpe=64); 32 always runs.
+                if bm != 32 && bm > rpe {
+                    continue;
+                }
+                let (route, num_blocks) =
+                    gemm_int_sparse::build_route(&row_starts, N_EXPERTS, bm);
+                BufferPool::write_bytes(&buf_route, unsafe {
+                    std::slice::from_raw_parts(
+                        route.as_ref() as *const RouteScratch as *const u8,
+                        std::mem::size_of::<RouteScratch>(),
+                    )
+                });
+                let pipe = gemm_int_sparse::pipeline_for_tile(
+                    &ctx,
+                    n as u32,
+                    k as u32,
+                    bm,
+                    bn,
+                    gemm_int_sparse::INT_BK,
+                )?;
+                let grid = MTLSize {
+                    width: n.div_ceil(bn),
+                    height: num_blocks as usize,
+                    depth: 1,
+                };
+                let tg = MTLSize {
+                    width: crate::shaders::gemm_common::THREADS_PER_TG,
+                    height: 1,
+                    depth: 1,
+                };
+                let dispatch = |count: usize| -> Result<(), Error> {
+                    let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
+                    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
+                    for _ in 0..count {
+                        enc.setComputePipelineState(&pipe.pipeline);
+                        unsafe {
+                            enc.setBuffer_offset_atIndex(Some(&buf_a), 0, 0);
+                            enc.setBuffer_offset_atIndex(Some(&buf_w), 0, 1);
+                            enc.setBuffer_offset_atIndex(Some(&buf_c), 0, 2);
+                            enc.setBuffer_offset_atIndex(Some(&buf_jobs), 0, 3);
+                            enc.setBuffer_offset_atIndex(Some(&buf_rs), 0, 4);
+                            enc.setBuffer_offset_atIndex(Some(&buf_route), 0, 6);
+                            enc.setBuffer_offset_atIndex(Some(&buf_sa), 0, 7);
+                            enc.setBuffer_offset_atIndex(Some(&buf_sw), 0, 8);
+                        }
+                        gpu_common::set_bytes(&enc, &(N_EXPERTS as u32), 5);
+                        enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+                    }
+                    enc.endEncoding();
+                    cmd.commit();
+                    cmd.waitUntilCompleted();
+                    Ok(())
+                };
+                dispatch(1)?;
+                dispatch(warmup)?;
+                let started = Instant::now();
+                dispatch(iters)?;
+                let rate = gflops(slots, k, n, iters, started.elapsed().as_secs_f64());
+                rows.push(GemmBenchRow {
+                    shape,
+                    label: format!("int8_{tag}_r{rpe}_{bm}x{bn}/x{iters}"),
+                    gflops: rate,
+                });
+            }
+            pool.release(slots * k, buf_a);
+            pool.release(slots * 4, buf_sa);
+            pool.release(slots * n * 4, buf_c);
+            pool.release(row_starts.len() * 4, buf_rs);
+            pool.release(std::mem::size_of::<RouteScratch>(), buf_route);
+        }
+        pool.release(N_EXPERTS * n * k, buf_w);
+        pool.release(n * 4, buf_sw);
+        pool.release(jobs.len() * std::mem::size_of::<BlockGroupedJob>(), buf_jobs);
+    }
+    Ok(rows)
+}

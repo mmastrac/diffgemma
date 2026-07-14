@@ -56,8 +56,9 @@ pub use step_kernel::build_offsets_from_store;
 
 pub use attention::GpuAttention;
 pub use bench_gemm::{
-    bench_custom_kernel, bench_gemm_bf16, bench_gemm_block_q4, bench_gemm_tunable,
-    bench_gemm_tunable_sparse, bench_mpsgraph_oracle, parse_shapes, print_bench_rows,
+    bench_custom_kernel, bench_gemm_bf16, bench_gemm_block_q4, bench_gemm_int_sparse,
+    bench_gemm_tunable, bench_gemm_tunable_sparse, bench_mpsgraph_oracle, parse_shapes,
+    print_bench_rows,
 };
 pub use decoder::GpuDecoderScratch;
 pub use engine::GpuDecoderEngine;

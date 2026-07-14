@@ -349,16 +349,19 @@ pub(crate) fn run_bench_gemm(shapes: &str, oracle: Option<&str>, iters: usize) -
     // `--shapes sparse`: block-sparse MoE bench at the production route
     // distributions (MxKxN comes from the model shapes; the spec is ignored).
     if shapes == "sparse" {
-        return match metal::bench_gemm_tunable_sparse(iters) {
-            Ok(rows) => {
-                print_bench_rows(&rows);
-                ExitCode::SUCCESS
-            }
+        let mut rows = match metal::bench_gemm_tunable_sparse(iters) {
+            Ok(r) => r,
             Err(err) => {
                 eprintln!("error: {err}");
-                ExitCode::FAILURE
+                return ExitCode::FAILURE;
             }
         };
+        match metal::bench_gemm_int_sparse(iters) {
+            Ok(mut r) => rows.append(&mut r),
+            Err(err) => eprintln!("warning: int8 sparse bench: {err}"),
+        }
+        print_bench_rows(&rows);
+        return ExitCode::SUCCESS;
     }
     let parsed = match parse_shapes(shapes) {
         Ok(s) => s,
