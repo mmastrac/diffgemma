@@ -82,6 +82,7 @@ pub static MANIFEST: Manifest = Manifest {
         &crate::shaders::qk_rope_kv::SPEC,
         &crate::shaders::attention::SPEC,
         &crate::shaders::attention_gemm::SPEC,
+        &crate::shaders::attention_topk::SPEC,
         &crate::shaders::moe_router::SPEC,
         &crate::shaders::moe_bucket_count::SPEC,
         &crate::shaders::moe_bucket_fill::SPEC,

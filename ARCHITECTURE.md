@@ -438,6 +438,19 @@ opt-in flags for A/B.
   +9% prefill / +54% denoise at 33k; only −6% even at 105k. Kernels are
   issue-bound, not byte-starved. q8 KV survives as the MEMORY lever
   (auto-on at long context).
+- **int4/int8 KV cache quantization at long context (Gemma attn_scale)** —
+  disproven for Gemma architectures *by physics, not just measurement*: Gemma's
+  undampened attention scale (attn_scale = 1.0, vs Llama's 1/√d ≈ 0.088) means
+  a per-element affine error of ε is amplified 25-100× *per layer* through the
+  softmax. Across 60+ layers this compounds into incoherent output. Open-TQ-Metal
+  (2026-04, ensue.dev/blog/introducing-open-tq-metal) independently confirmed:
+  int4 group-32 KV works on Llama (cosine 0.998, identical output) but on Gemma 4
+  degrades past ~950 tokens (int4) / ~1k tokens (int8). PolarQuant/QJL angular
+  methods produce outright gibberish on Gemma (cosine 0.621). This is why the
+  project uses f16 main cache + f32 side ring (E14), not int4 KV. The attn_scale
+  finding explains the ceiling: no per-group scheme can recover the 25-100×
+  amplification at α=1.0. Re-test only if the architecture changes (dampened
+  scale) or for sub-1k-token sessions (where it's a memory lever, not speed).
 - **Weight-stationary expert GEMM** (taller prefill MoE blocks) — the expert
   GEMM at M=1024 is compute-bound ~6× over weight bytes; BM=64 wash, BM=128
   3.6× slower (register spill). Byte-cutting can't win; the lever is GEMM

@@ -146,6 +146,14 @@ pub struct PerfFlags {
     pub attn_mma_full_qk_ilp2: bool,
     pub flash_prefill_bq: usize,
     pub flash_prefill_bk: usize,
+    /// `DGQ_ATTN_TOPK` (E20): top-k sparse attention for full-layer PREFILL.
+    /// Reuses E17's QK kernel, then selects the top-k highest-scoring keys per
+    /// (row, head) and gathers V at those indices. Non-bit-identical (only the
+    /// top-k keys are kept); quality-gated. Default OFF (opt-in prototype).
+    pub attn_topk: bool,
+    /// `DGQ_ATTN_TOPK_K`: k per query row. Must be <= K_PAD (compile-time, see
+    /// `attention_topk::K_PAD`). Default 64.
+    pub attn_topk_k: usize,
 }
 
 impl Default for PerfFlags {
@@ -180,6 +188,8 @@ impl Default for PerfFlags {
             flash_prefill_bq: 16,
             flash_prefill_bk: 64,
             attn_mma_full_qk_ilp2: false,
+            attn_topk: false,
+            attn_topk_k: 64,
         }
     }
 }
@@ -425,6 +435,8 @@ impl RuntimeConfig {
                 flash_prefill_bq: parse_usize("DGQ_FLASH_PREFILL_BQ", 16).max(8),
                 flash_prefill_bk: parse_usize("DGQ_FLASH_PREFILL_BK", 64).max(16),
                 attn_mma_full_qk_ilp2: env_on_if_one("DGQ_ATTN_MMA_FULL_QK_ILP2"),
+                attn_topk: env_on_if_one("DGQ_ATTN_TOPK"),
+                attn_topk_k: parse_usize("DGQ_ATTN_TOPK_K", 64).max(1),
             },
             prefill: PrefillFlags {
                 f16: env_on_if_one("DGQ_PREFILL_F16"),
@@ -712,6 +724,23 @@ pub fn moe_sparse_bn() -> usize {
 /// into two interleaved accumulator chains (FC31). Default OFF.
 pub fn attn_mma_full_qk_ilp2() -> bool {
     config().perf.attn_mma_full_qk_ilp2
+}
+
+/// E20: top-k sparse attention for full-layer PREFILL. Default OFF (opt-in
+/// prototype, quality-gated). Returns (enabled, k).
+pub fn attn_topk() -> (bool, usize) {
+    let p = &config().perf;
+    (p.attn_topk, p.attn_topk_k)
+}
+
+/// E20 enabled predicate (the only check `step_kernel` needs for routing).
+pub fn attn_topk_enabled() -> bool {
+    config().perf.attn_topk
+}
+
+/// E20 k per query row. Clamped to K_PAD at compile time host-side.
+pub fn attn_topk_k() -> usize {
+    config().perf.attn_topk_k
 }
 
 /// E18 fused flash prefill. `.0` = enabled, `.1` = BQ (query-row tile), `.2` =

@@ -734,6 +734,13 @@ struct StepPipelines {
     /// None unless DGQ_GEMM_ATTN && DGQ_PREFILL_KV_F32. Preferred over `attn_gemm`
     /// when present (matches attention_mma_full_side precision).
     attn_gemm_side: Option<[ComputePipeline; 3]>,
+    /// E20 top-k sparse attention for full-layer PREFILL (`DGQ_ATTN_TOPK`):
+    /// [qk (reused from E17), topk_softmax, topk_pv]. None unless the flag is
+    /// set. Prefill-only; quality-gated (non-bit-identical).
+    attn_topk: Option<[ComputePipeline; 3]>,
+    /// E20 f32-side-KV variant (FC30). None unless DGQ_ATTN_TOPK &&
+    /// DGQ_PREFILL_KV_F32.
+    attn_topk_side: Option<[ComputePipeline; 3]>,
     residual: ComputePipeline,
     glu: ComputePipeline,
     router: ComputePipeline,
@@ -1059,6 +1066,18 @@ impl StepPipelines {
             } else {
                 None
             },
+            attn_topk: if crate::flags::attn_topk_enabled() {
+                Some(crate::shaders::attention_topk::pipelines(ctx, prod, false)?)
+            } else {
+                None
+            },
+            attn_topk_side: if crate::flags::attn_topk_enabled()
+                && crate::flags::prefill_kv_f32_enabled()
+            {
+                Some(crate::shaders::attention_topk::pipelines(ctx, prod, true)?)
+            } else {
+                None
+            },
             residual: crate::shaders::residual_half::pipeline_for(ctx, prod)?,
             glu: crate::shaders::swiglu::pipeline_for(
                 ctx,
@@ -1234,6 +1253,14 @@ pub(crate) struct StepBuffers {
     attn_gemm_s: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
     attn_gemm_p: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
     attn_gemm_lrow: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    /// E20 top-k sparse attention scratch (`DGQ_ATTN_TOPK`): compressed
+    /// probs P [HC][CANVAS][K_PAD] (f32), top-k indices Idx [HC][CANVAS][K_PAD]
+    /// (u32), row denoms lrow [HC][CANVAS] (f32). The S plane is SHARED with
+    /// `attn_gemm_s` (identical layout; only one path is active at a time).
+    /// None unless the flag is set.
+    attn_topk_p: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    attn_topk_idx: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    attn_topk_lrow: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
     /// E14 (DGQ_PREFILL_KV_F32): f32 side K/V ring for the sliding layers —
     /// written by the prefill rope, read by the prefill attention, so chunk
     /// boundaries never round K/V to f16. Same slot = pos & ring_mask
@@ -3254,6 +3281,115 @@ impl StepEnc<'_> {
         Ok(())
     }
 
+    /// E20: top-k sparse attention dispatch for full-layer PREFILL. Mirrors
+    /// `encode_attn_gemm` for the QK stage (same kernel, same S plane), then
+    /// dispatches `attn_topk_softmax` (top-k selection + renormalization) and
+    /// `attn_topk_pv` (gathered-V PV) instead of E17's softmax + PV.
+    fn encode_attn_topk(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
+        use crate::shaders::attention_gemm::n_pad;
+        use crate::shaders::attention_topk::{BM, BN, K_PAD, PV_BN, SOFTMAX_TPG};
+        let l = &layout.layers[layer];
+        let hd = l.head_dim as usize;
+        let nkv = l.n_kv_heads as usize;
+        let group = STEP_NQ_HEADS / nkv;
+        let m = self.active_canvas;
+        let kv_len = self.dispatch_kv_len() as usize;
+        let t_total = kv_len + m;
+        let np = n_pad(t_total);
+        let qo_row = CANVAS * self.sub_c * STEP_NQ_HEADS * hd * 2;
+
+        let mut dims = crate::shaders::attention_gemm::AttnGemmDims {
+            m: m as u32,
+            n: t_total as u32,
+            k: hd as u32,
+            a_row_stride: (STEP_NQ_HEADS * hd) as u32,
+            b_row_stride: (nkv * hd * 2) as u32,
+            s_row_stride: np as u32,
+            out_row_stride: (STEP_NQ_HEADS * hd) as u32,
+            causal: 1,
+            kv_len: kv_len as u32,
+            hd: hd as u32,
+            group: group as u32,
+            nkv: nkv as u32,
+            s_head_stride: (m * np) as u32,
+            head_base: 0,
+        };
+        let k_param = crate::flags::attn_topk_k().min(K_PAD) as u32;
+        let tg128 = MTLSize { width: 128, height: 1, depth: 1 };
+        let tg_sm = MTLSize { width: SOFTMAX_TPG, height: 1, depth: 1 };
+        let tg_pv = MTLSize { width: 32, height: 1, depth: 1 };  // one simdgroup
+        let hc = crate::shaders::attention_gemm::TuneCfg::default().hc.min(STEP_NQ_HEADS);
+        let side = self.ps.attn_topk_side.is_some();
+        let side_off = self.bufs.kv_f32_side_offs[layer] as usize;
+        let pipes = if side {
+            self.ps.attn_topk_side.as_ref().unwrap().clone()
+        } else {
+            self.ps.attn_topk.as_ref().unwrap().clone()
+        };
+        let mut h0 = 0usize;
+        while h0 < STEP_NQ_HEADS {
+            let hb = (STEP_NQ_HEADS - h0).min(hc);
+            dims.head_base = h0 as u32;
+            let grid_qk = MTLSize {
+                width: t_total.div_ceil(BN),
+                height: m.div_ceil(BM),
+                depth: hb,
+            };
+            let grid_sm = MTLSize { width: m, height: hb, depth: 1 };
+            let grid_pv = MTLSize {
+                width: hd.div_ceil(PV_BN),
+                height: m,
+                depth: hb,
+            };
+            // QK: same dispatch as E17 (reuses attn_gemm_qk).
+            self.sink_set_pipeline(&pipes[0]);
+            self.sink_set_buffer(
+                &self.bufs.arena,
+                self.arena().attnq_off() as usize + qo_row,
+                0,
+            );
+            self.sink_set_buffer(&self.bufs.kvcache, l.kv_region as usize, 1);
+            self.sink_set_buffer(self.bufs.attn_gemm_s.as_ref().unwrap(), 0, 2);
+            if side {
+                self.sink_set_buffer(self.bufs.kv_f32_side.as_ref().unwrap(), side_off, 9);
+            }
+            self.sink_set_bytes(&dims, 3);
+            self.sink_dispatch(grid_qk, tg128);
+            self.sink_memory_barrier();
+
+            // topk_softmax: S -> P (compressed), Idx, lrow.
+            self.sink_set_pipeline(&pipes[1]);
+            self.sink_set_buffer(self.bufs.attn_gemm_s.as_ref().unwrap(), 0, 0);
+            self.sink_set_buffer(self.bufs.attn_topk_p.as_ref().unwrap(), 0, 1);
+            self.sink_set_buffer(self.bufs.attn_topk_idx.as_ref().unwrap(), 0, 2);
+            self.sink_set_buffer(self.bufs.attn_topk_lrow.as_ref().unwrap(), 0, 3);
+            self.sink_set_bytes(&dims, 4);
+            self.sink_set_bytes(&k_param, 5);
+            self.sink_dispatch(grid_sm, tg_sm);
+            self.sink_memory_barrier();
+
+            // topk_pv: O = (P · V_gathered) / L.
+            self.sink_set_pipeline(&pipes[2]);
+            self.sink_set_buffer(self.bufs.attn_topk_p.as_ref().unwrap(), 0, 0);
+            self.sink_set_buffer(self.bufs.attn_topk_idx.as_ref().unwrap(), 0, 1);
+            self.sink_set_buffer(&self.bufs.kvcache, l.kv_region as usize, 2);
+            self.sink_set_buffer(
+                &self.bufs.arena,
+                self.arena().attno_off() as usize + qo_row,
+                3,
+            );
+            self.sink_set_buffer(self.bufs.attn_topk_lrow.as_ref().unwrap(), 0, 4);
+            if side {
+                self.sink_set_buffer(self.bufs.kv_f32_side.as_ref().unwrap(), side_off, 9);
+            }
+            self.sink_set_bytes(&dims, 5);
+            self.sink_dispatch(grid_pv, tg_pv);
+            self.sink_memory_barrier();
+            h0 += hb;
+        }
+        Ok(())
+    }
+
     fn encode_layer_attention_dispatch(
         &mut self,
         layer: usize,
@@ -3261,6 +3397,11 @@ impl StepEnc<'_> {
     ) -> Result<(), Error> {
         let layer_off = layer_byte_offset(layer);
         let l = &layout.layers[layer];
+        // E20: top-k sparse attention for full-layer prefill (opt-in, quality-gated).
+        // Takes precedence over E17 when enabled.
+        if self.prefill_causal && l.is_full == 1 && self.ps.attn_topk.is_some() {
+            return self.encode_attn_topk(layer, layout);
+        }
         // E17: full-layer prefill attention through the GEMM decomposition.
         if self.prefill_causal && l.is_full == 1 && self.ps.attn_gemm.is_some() {
             return self.encode_attn_gemm(layer, layout);
@@ -5715,10 +5856,17 @@ pub fn build_step_runtime(
         )?,
         // E17 GEMM-attention prefill scratch (opt-in). Head-chunked (E17a): the
         // score matrix S/P holds only HC heads at a time —
-        // [HC][CANVAS][n_pad(max_seq)]. Only allocated when DGQ_GEMM_ATTN is set.
-        attn_gemm_s: if crate::flags::gemm_attn_enabled() {
+        // [HC][CANVAS][n_pad(max_seq)]. Allocated when DGQ_GEMM_ATTN OR
+        // DGQ_ATTN_TOPK is set (E20 reuses the same S plane; the two paths are
+        // never both live on the same layer).
+        attn_gemm_s: if crate::flags::gemm_attn_enabled() || crate::flags::attn_topk_enabled() {
             let np = crate::shaders::attention_gemm::n_pad(cfg.max_seq);
-            let hc = crate::flags::gemm_attn_head_chunk().min(STEP_NQ_HEADS);
+            let hc = if crate::flags::gemm_attn_enabled() {
+                crate::flags::gemm_attn_head_chunk()
+            } else {
+                crate::shaders::attention_gemm::TuneCfg::default().hc
+            }
+            .min(STEP_NQ_HEADS);
             Some(alloc_buffer(
                 &ctx.device,
                 hc * CANVAS * np * std::mem::size_of::<f32>(),
@@ -5736,6 +5884,36 @@ pub fn build_step_runtime(
         },
         attn_gemm_lrow: if crate::flags::gemm_attn_enabled() {
             let hc = crate::flags::gemm_attn_head_chunk().min(STEP_NQ_HEADS);
+            Some(alloc_buffer(
+                &ctx.device,
+                hc * CANVAS * std::mem::size_of::<f32>(),
+            )?)
+        } else {
+            None
+        },
+        // E20 top-k scratch: compressed P [HC][CANVAS][K_PAD] (f32), indices
+        // Idx [HC][CANVAS][K_PAD] (u32), lrow [HC][CANVAS] (f32). The S plane
+        // is shared with attn_gemm_s (allocated above when either flag is set).
+        attn_topk_p: if crate::flags::attn_topk_enabled() {
+            let hc = crate::shaders::attention_gemm::TuneCfg::default().hc.min(STEP_NQ_HEADS);
+            Some(alloc_buffer(
+                &ctx.device,
+                hc * CANVAS * crate::shaders::attention_topk::K_PAD * std::mem::size_of::<f32>(),
+            )?)
+        } else {
+            None
+        },
+        attn_topk_idx: if crate::flags::attn_topk_enabled() {
+            let hc = crate::shaders::attention_gemm::TuneCfg::default().hc.min(STEP_NQ_HEADS);
+            Some(alloc_buffer(
+                &ctx.device,
+                hc * CANVAS * crate::shaders::attention_topk::K_PAD * std::mem::size_of::<u32>(),
+            )?)
+        } else {
+            None
+        },
+        attn_topk_lrow: if crate::flags::attn_topk_enabled() {
+            let hc = crate::shaders::attention_gemm::TuneCfg::default().hc.min(STEP_NQ_HEADS);
             Some(alloc_buffer(
                 &ctx.device,
                 hc * CANVAS * std::mem::size_of::<f32>(),
