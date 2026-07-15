@@ -486,6 +486,62 @@ pub fn has_incomplete_tool_call(text: &str) -> bool {
     false
 }
 
+/// True when a completed `call:NAME{…}` is followed by non-empty prose (after
+/// optional `<tool_call|>` closers). The serve client drops that trailing text
+/// when packaging `tool_calls`, so ending the turn there abandons mid-thought
+/// self-talk (`…}<tool_call|>Wait, I` + `<eos>`) and the next request often
+/// empty-eos's. Caller should keep denoising instead.
+pub fn has_trailing_after_tool_calls(text: &str) -> bool {
+    let mut last_complete_end: Option<usize> = None;
+    let mut base = 0usize;
+    while base < text.len() {
+        let rest = &text[base..];
+        let Some(pos) = rest.find("call:") else {
+            break;
+        };
+        let abs = base + pos;
+        let after = &text[abs + "call:".len()..];
+        let Some(brace) = after.find('{') else {
+            break;
+        };
+        match read_braced(&after[brace..]) {
+            Some((_, consumed)) => {
+                let end = abs + "call:".len() + brace + consumed;
+                last_complete_end = Some(end);
+                base = end;
+            }
+            None => break,
+        }
+    }
+    let Some(end) = last_complete_end else {
+        return false;
+    };
+    let mut t = text[end..].trim_start();
+    loop {
+        let before = t;
+        for closer in [
+            "<tool_call|>",
+            "</tool_call>",
+            "</tool_call|>",
+            "<|tool_call|>",
+        ] {
+            if let Some(s) = t.strip_prefix(closer) {
+                t = s.trim_start();
+            }
+        }
+        if t == before {
+            break;
+        }
+    }
+    !t.is_empty()
+}
+
+/// Tool-mode stop deferral: open tool call, or finished tool call(s) with
+/// abandoned trailing prose that would be dropped from the OpenAI payload.
+pub fn should_continue_past_stop(text: &str) -> bool {
+    has_incomplete_tool_call(text) || has_trailing_after_tool_calls(text)
+}
+
 /// Parse every `call:NAME{ARGS}` in model output into structured tool calls,
 /// tolerant of the exact wrapper tokens around/between them.
 pub fn parse_tool_calls(text: &str) -> Vec<ParsedToolCall> {
@@ -737,6 +793,28 @@ mod tests {
         let content = calls[0].arguments["content"].as_str().unwrap();
         assert!(content.contains("text: &str"));
         assert!(!calls[0].arguments.get("text").is_some());
+    }
+
+    #[test]
+    fn trailing_after_tool_calls_continues_past_stop() {
+        let clean = concat!(
+            "call:write{content:<|\"|>ok<|\"|>,filePath:<|\"|>/tmp/x.rs<|\"|>}",
+            "<tool_call|>",
+        );
+        assert!(!has_trailing_after_tool_calls(clean));
+        assert!(!should_continue_past_stop(clean));
+
+        let mid_thought = concat!(
+            "call:write{content:<|\"|>ok<|\"|>,filePath:<|\"|>/tmp/x.rs<|\"|>}",
+            "<tool_call|>Wait, I",
+        );
+        assert!(has_trailing_after_tool_calls(mid_thought));
+        assert!(should_continue_past_stop(mid_thought));
+
+        // Incomplete call still continues (via the incomplete path).
+        assert!(should_continue_past_stop(
+            "call:write{content:<|\"|>partial"
+        ));
     }
 
     #[test]

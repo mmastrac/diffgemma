@@ -60,9 +60,10 @@ pub struct StepGenerateConfig {
     /// block emits any of these. Empty preserves the fixed `max_new_tokens`
     /// budget behavior used by parity/golden paths.
     pub stop_token_ids: Vec<u32>,
-    /// When set (serve tool-mode), a stop token that lands inside an unfinished
-    /// `call:NAME{…}` does not end the turn: the stop is trimmed and generation
-    /// continues into the next block so the tool call can complete.
+    /// When set (serve tool-mode), a stop token does not end the turn if the
+    /// reply still looks unfinished: open `call:NAME{…}`, or non-empty prose
+    /// after a closed tool call (`…}<tool_call|>Wait, I`). Stop is trimmed and
+    /// generation continues into the next block.
     pub continue_incomplete_tool_calls: bool,
     /// E6 empty/degenerate-reply canvas re-roll (with `DGQ_EMPTY_REPLY_RETRY>0`).
     /// Given the first block's committed argmax, returns true when it renders as
@@ -1065,8 +1066,8 @@ pub fn generate_with_session(
         // Full-message stop: end the turn as soon as the committed block emits a
         // stop token (e.g. <turn|> or <eos>). Trim it and everything after so the
         // reply is exactly the model's turn, and skip the KV extend — unless
-        // `continue_incomplete_tool_calls` and the reply still has an open
-        // `call:NAME{…}`, in which case trim the stop and keep generating.
+        // `continue_incomplete_tool_calls` and the reply still looks unfinished
+        // (open `call:NAME{…}`, or trailing prose after a closed tool call).
         let mut end_turn = false;
         if !cfg.stop_token_ids.is_empty() {
             if let Some(rel) = argmax_tokens
@@ -1088,14 +1089,14 @@ pub fn generate_with_session(
                     let reply = &sequences[prompt_token_ids.len()..];
                     let cleaned = crate::sample::strip_degenerate_token_ids(reply);
                     session.step_text_tokenizer.as_ref().is_some_and(|tok| {
-                        crate::tools::has_incomplete_tool_call(&tok.decode(&cleaned))
+                        crate::tools::should_continue_past_stop(&tok.decode(&cleaned))
                     })
                 };
 
                 if defer_stop {
                     stats.continued_past_stop = true;
                     eprintln!(
-                        "serve: incomplete tool call after stop token {}; continuing to next block",
+                        "serve: unfinished tool turn after stop token {}; continuing to next block",
                         argmax_tokens[rel],
                     );
                 } else {

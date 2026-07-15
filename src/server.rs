@@ -352,9 +352,9 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
             }
             self.last_argmax.clear();
             self.streak.clear();
-            // Premature stop inside an unfinished tool call: keep the mapper
-            // open so later blocks can append the rest of the call.
-            if hit_stop && !crate::tools::has_incomplete_tool_call(&self.emitted_content) {
+            // Premature stop inside an unfinished tool turn (open call, or
+            // trailing prose after a closed call): keep the mapper open.
+            if hit_stop && !crate::tools::should_continue_past_stop(&self.emitted_content) {
                 self.ended = true;
             }
         }
