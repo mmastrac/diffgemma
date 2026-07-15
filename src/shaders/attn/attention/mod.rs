@@ -986,14 +986,14 @@ mod tests {
     /// 8 kv_heads) at the sliding window (kv=1024). Backs out the TF/s to
     /// check whether mma2 is at the half-MMA wall (~3.8 TF/s) or leaving
     /// compute on the table — and whether flash's barrier-free PV loop wins
-    /// despite scanning the full t_total (no window support in flash v1).
+    /// once both paths honor the same window.
     /// Run: `cargo test --release mma2_prod_bench -- --ignored --nocapture`
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore]
     fn mma2_prod_bench() {
         use crate::shaders::attention::{bench_path, model_attn_fixture};
-        use crate::shaders::attn::attention_flash::bench_flash;
+        use crate::shaders::attn::attention_flash::{bench_flash, bench_flash_window};
         let iters = 50usize;
         let canvas = 1024usize;
         let nq = 16usize;
@@ -1002,26 +1002,31 @@ mod tests {
         let kv_len = 1024u32; // sliding window
         let f = model_attn_fixture(canvas, nq, nkv, hd, kv_len, false);
         let mma2 = bench_path(&f, iters, 2).expect("mma2 bench");
-        // Compute: QK = nq * M * W * hd * 2; PV = nq * M * hd * W * 2 (dense)
-        // mma2 scans window=1024 keys/row (so W=kv_len here). flash scans
-        // t_total=kv_len+canvas=2048 (no window). Report both at their actual
-        // work so TF/s is the utilization rate.
+        // mma2 scans window=1024 keys/row (so W=kv_len here). flash without
+        // window scans t_total=kv_len+canvas=2048. flash with window=1024
+        // should match mma2's work.
         let t = kv_len as usize + canvas;
-        let mma2_flops = 2.0 * (nq * canvas * kv_len as usize * hd * 2) as f64; // QK+PV dense @window
+        let mma2_flops = 2.0 * (nq * canvas * kv_len as usize * hd * 2) as f64;
         let mma2_tf_s = mma2_flops / (mma2 * 1e-3) / 1e12;
         println!(
             "mma2 prod (M={canvas}, hd={hd}, nq={nq}, nkv={nkv}, kv={kv_len}): {mma2:.3} ms, {mma2_tf_s:.2} TF/s ({:.1}% of 3.8 wall)",
             100.0 * mma2_tf_s / 3.8
         );
-        // Flash scans full t_total (no window) — 2× the keys, but no per-chunk
-        // barriers in PV. If flash's TF/s > mma2's TF/s, the barrier-free loop wins.
-        let flash16 = bench_flash(&f, iters, 16).expect("flash bq16");
-        let flash_flops = 2.0 * (nq * canvas * t * hd * 2) as f64;
-        let flash_tf_s = flash_flops / (flash16 * 1e-3) / 1e12;
+        let flash_nowin = bench_flash(&f, iters, 16).expect("flash no-window");
+        let flash_nowin_flops = 2.0 * (nq * canvas * t * hd * 2) as f64;
+        let flash_nowin_tf = flash_nowin_flops / (flash_nowin * 1e-3) / 1e12;
         println!(
-            "flash bq16 (no window, scans t={t}): {flash16:.3} ms, {flash_tf_s:.2} TF/s ({:.1}% of 3.8 wall)  — vs mma2 {:.2}x",
-            100.0 * flash_tf_s / 3.8,
-            mma2 / flash16,
+            "flash bq16 (no window, scans t={t}): {flash_nowin:.3} ms, {flash_nowin_tf:.2} TF/s ({:.1}% wall)  — vs mma2 {:.2}x",
+            100.0 * flash_nowin_tf / 3.8,
+            mma2 / flash_nowin,
+        );
+        let flash_win = bench_flash_window(&f, iters, 16, kv_len).expect("flash window");
+        let flash_win_flops = 2.0 * (nq * canvas * kv_len as usize * hd * 2) as f64;
+        let flash_win_tf = flash_win_flops / (flash_win * 1e-3) / 1e12;
+        println!(
+            "flash bq16 (window={kv_len}):            {flash_win:.3} ms, {flash_win_tf:.2} TF/s ({:.1}% wall)  — vs mma2 {:.2}x",
+            100.0 * flash_win_tf / 3.8,
+            mma2 / flash_win,
         );
     }
 }

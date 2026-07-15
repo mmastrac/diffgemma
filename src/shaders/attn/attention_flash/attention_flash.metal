@@ -59,6 +59,8 @@ struct FlashDims {
     uint nkv;           // KV heads: V base = (nkv + kvh) * hd
     uint head_base;     // global Q head = head_base + tgid.z
     uint causal;        // 1 = causal prefill
+    uint window;        // sliding window (0 = full; else keys below qpos-(window-1) masked)
+    uint kv_ring_mask;  // 0 = linear full layers; else pos & mask (sliding ring)
 };
 
 kernel void attn_flash(
@@ -121,14 +123,31 @@ kernel void attn_flash(
 
     const uint t_stop = d.causal ? min(d.kv_len + (m0 + BQ - 1u), d.t_total - 1u)
                                  : d.t_total - 1u;
-    device const half *kb = kcache + (ulong)kvh * hd;               // K base
-    device const half *vb = kcache + (ulong)(d.nkv + kvh) * hd;     // V base
+    // Sliding window: tile loop starts at the oldest row's window start
+    // (tile-aligned); per-row softmax masks the rest. Matches attention_mma2.
+    const uint wm1 = (d.window != 0u) ? (d.window - 1u) : 0u;
+    uint t_lo = 0u;
+    if (d.window != 0u) {
+        const uint qpos0 = d.causal ? (d.kv_len + m0) : d.kv_len;
+        t_lo = (qpos0 > wm1) ? (qpos0 - wm1) : 0u;
+    }
+    const uint kt_start = (t_lo / BK) * BK;  // BK-aligned; softmax masks the edge
+    // K/V bases are head-relative; per-block slot0 (ring or linear) is added in
+    // the loop. Ring size is a multiple of BK, so a BK-aligned block's physical
+    // slots are contiguous (never straddles the wrap) — same invariant mma2
+    // relies on for its 8-key tiles.
+    device const half *kb_head = kcache + (ulong)kvh * hd;
+    device const half *vb_head = kcache + (ulong)(d.nkv + kvh) * hd;
 
-    for (uint kt = 0u; kt <= t_stop; kt += BK) {
+    for (uint kt = kt_start; kt <= t_stop; kt += BK) {
         const uint bk = min(BK, t_stop + 1u - kt);
+        const uint slot0 = (d.kv_ring_mask != 0u) ? (kt & d.kv_ring_mask) : kt;
+        device const half *kb = kb_head + (ulong)slot0 * bstride;
+        device const half *vb = vb_head + (ulong)slot0 * bstride;
 
         // (1) QK: simdgroup sg -> S[BQ][KPS] at cols [sg*KPS,+KPS). Device-load
         //     K transposed (kf[hd][key]); contract hd 8 at a time. No staging.
+        //     key_off is relative to kt/slot0 (kb already points at the block).
         simdgroup_float8x8 Cs[FL_BQ / 8u][FL_BK / 64u];  // [TM][TK]
         for (uint i = 0u; i < TM; ++i) {
             for (uint j = 0u; j < TK; ++j) {
@@ -141,9 +160,9 @@ kernel void attn_flash(
                 simdgroup_load(qf[i], &Qs[(8u * i) * qpad_hd + kk], qpad_hd);
             }
             for (uint j = 0u; j < TK; ++j) {
-                const uint key0 = kt + sgid * KPS + 8u * j;   // >= t_total safe (pad)
+                const uint key_off = sgid * KPS + 8u * j; // 0..BK within block
                 simdgroup_half8x8 kf;
-                simdgroup_load(kf, kb + (ulong)key0 * bstride + kk, bstride,
+                simdgroup_load(kf, kb + (ulong)key_off * bstride + kk, bstride,
                                ulong2(0, 0), /*transpose=*/true);
                 for (uint i = 0u; i < TM; ++i) {
                     simdgroup_multiply_accumulate(Cs[i][j], qf[i], kf, Cs[i][j]);
@@ -160,12 +179,18 @@ kernel void attn_flash(
         // (2) online softmax (one thread per row).
         for (uint r = tid; r < BQ; r += TPG) {
             const uint grow = m0 + r;
+            const uint qpos = d.kv_len + grow;
+            const uint row_lo = (d.window == 0u)
+                ? 0u
+                : (d.causal ? ((qpos > wm1) ? qpos - wm1 : 0u) : t_lo);
             float mb = -INFINITY;
             for (uint c = 0u; c < bk; ++c) {
-                if (!d.causal || kt + c <= d.kv_len + grow) {
-                    if (grow < d.m) {
-                        mb = max(mb, Sf[r * BK + c]);
-                    }
+                const uint t = kt + c;
+                const bool valid = (grow < d.m)
+                    && (!d.causal || t <= qpos)
+                    && (t >= row_lo);
+                if (valid) {
+                    mb = max(mb, Sf[r * BK + c]);
                 }
             }
             bmax[r] = mb;
@@ -173,13 +198,22 @@ kernel void attn_flash(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint r = tid; r < BQ; r += TPG) {
             const uint grow = m0 + r;
+            const uint qpos = d.kv_len + grow;
+            const uint row_lo = (d.window == 0u)
+                ? 0u
+                : (d.causal ? ((qpos > wm1) ? qpos - wm1 : 0u) : t_lo);
             const float mold = rm[r];
             const float mnew = max(mold, bmax[r]);
             float lsum = 0.f;
             for (uint c = 0u; c < BK; ++c) {
                 float p = 0.f;
-                if (c < bk && (!d.causal || kt + c <= d.kv_len + grow)
-                    && grow < d.m && isfinite(mnew)) {
+                const uint t = kt + c;
+                const bool valid = (c < bk)
+                    && (grow < d.m)
+                    && isfinite(mnew)
+                    && (!d.causal || t <= qpos)
+                    && (t >= row_lo);
+                if (valid) {
                     p = exp(Sf[r * BK + c] - mnew);
                     lsum += p;
                 }
@@ -211,7 +245,7 @@ kernel void attn_flash(
             }
             for (uint j = 0u; j < TN; ++j) {
                 simdgroup_half8x8 vf;
-                simdgroup_load(vf, vb + (ulong)(kt + ks) * bstride + sgid * ND + 8u * j,
+                simdgroup_load(vf, vb + (ulong)ks * bstride + sgid * ND + 8u * j,
                                bstride);
                 for (uint i = 0u; i < TM; ++i) {
                     simdgroup_multiply_accumulate(O[i][j], pf[i], vf, O[i][j]);

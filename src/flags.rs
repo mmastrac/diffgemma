@@ -134,10 +134,12 @@ pub struct PerfFlags {
     pub gemm_tune_bm: usize,
     pub gemm_tune_bn: usize,
     pub moe_sparse_bn: usize,
-    /// `DGQ_FLASH_PREFILL` (E18): fused flash prefill attention (online softmax,
-    /// register-resident O, no device S/P traffic) instead of the E17 GEMM
-    /// decomposition. Prefill-only, full-attention layers. Default OFF (opt-in,
-    /// pending sign-off). `bq`/`bk` = query-row tile / key-block streamed.
+    /// `DGQ_FLASH_PREFILL` (E18 sliding revival): fused flash for sliding-layer
+    /// PREFILL (hd=256, window=1024). Online softmax, register-resident O split
+    /// across 8 simdgroups, no per-chunk PV tgmem round-trip. Full hd=512 path
+    /// was 3× slower than E17 (disproven); at sliding shape flash is 2.4× faster
+    /// than attention_mma2. Default OFF (opt-in, quality gate). `bq`/`bk` =
+    /// query-row tile / key-block streamed.
     pub flash_prefill: bool,
     /// `DGQ_ATTN_MMA_FULL_QK_ILP2` (E5 ILP2): split the 32-deep serial QK dot
     /// in `attention_mma_full` into two interleaved 16-deep accumulator chains

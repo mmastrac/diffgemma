@@ -741,6 +741,9 @@ struct StepPipelines {
     /// E20 f32-side-KV variant (FC30). None unless DGQ_ATTN_TOPK &&
     /// DGQ_PREFILL_KV_F32.
     attn_topk_side: Option<[ComputePipeline; 3]>,
+    /// E18 flash for sliding-layer PREFILL (`DGQ_FLASH_PREFILL`): hd=256,
+    /// window-aware + ring-aware. None unless the flag is set.
+    attn_flash_sliding: Option<ComputePipeline>,
     residual: ComputePipeline,
     glu: ComputePipeline,
     router: ComputePipeline,
@@ -1077,6 +1080,17 @@ impl StepPipelines {
                 Some(crate::shaders::attention_topk::pipelines(ctx, prod, true)?)
             } else {
                 None
+            },
+            attn_flash_sliding: {
+                let (on, bq, bk) = crate::flags::flash_prefill();
+                if on {
+                    // Sliding layers only (hd=256). Full hd=512 stays on E17.
+                    Some(crate::shaders::attention_flash::pipeline_flash(
+                        ctx, prod, bq, bk, 256,
+                    )?)
+                } else {
+                    None
+                }
             },
             residual: crate::shaders::residual_half::pipeline_for(ctx, prod)?,
             glu: crate::shaders::swiglu::pipeline_for(
@@ -3390,6 +3404,72 @@ impl StepEnc<'_> {
         Ok(())
     }
 
+    /// E18: sliding-layer PREFILL via fused flash (`DGQ_FLASH_PREFILL`).
+    /// Window-aware + ring-aware; hd must be 256 (compile-time FL_HD). f16 KV.
+    fn encode_attn_flash_sliding(
+        &mut self,
+        layer: usize,
+        layout: &ModelLayout,
+    ) -> Result<(), Error> {
+        let (_, bq, _bk) = crate::flags::flash_prefill();
+        let l = &layout.layers[layer];
+        let hd = l.head_dim as usize;
+        debug_assert_eq!(hd, 256, "flash sliding is compiled for hd=256");
+        let nkv = l.n_kv_heads as usize;
+        let group = STEP_NQ_HEADS / nkv;
+        let m = self.active_canvas;
+        let kv_len = self.dispatch_kv_len() as usize;
+        let t_total = kv_len + m;
+        let qo_row = CANVAS * self.sub_c * STEP_NQ_HEADS * hd * 2;
+        let window = if attn_window_enabled() {
+            self.sliding_window
+        } else {
+            0
+        };
+        let dims = crate::shaders::attention_flash::FlashDims {
+            m: m as u32,
+            t_total: t_total as u32,
+            hd: hd as u32,
+            a_row_stride: (STEP_NQ_HEADS * hd) as u32,
+            b_row_stride: (nkv * hd * 2) as u32,
+            out_row_stride: (STEP_NQ_HEADS * hd) as u32,
+            kv_len: kv_len as u32,
+            group: group as u32,
+            nkv: nkv as u32,
+            head_base: 0,
+            causal: 1,
+            window,
+            kv_ring_mask: l.kv_ring_mask,
+        };
+        let pipe = self.ps.attn_flash_sliding.as_ref().unwrap();
+        let tg = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+        let grid = MTLSize {
+            width: m.div_ceil(bq),
+            height: 1,
+            depth: STEP_NQ_HEADS,
+        };
+        self.sink_set_pipeline(pipe);
+        self.sink_set_buffer(
+            &self.bufs.arena,
+            self.arena().attnq_off() as usize + qo_row,
+            0,
+        );
+        self.sink_set_buffer(&self.bufs.kvcache, l.kv_region as usize, 1);
+        self.sink_set_buffer(
+            &self.bufs.arena,
+            self.arena().attno_off() as usize + qo_row,
+            2,
+        );
+        self.sink_set_bytes(&dims, 3);
+        self.sink_dispatch(grid, tg);
+        self.sink_memory_barrier();
+        Ok(())
+    }
+
     fn encode_layer_attention_dispatch(
         &mut self,
         layer: usize,
@@ -3397,6 +3477,11 @@ impl StepEnc<'_> {
     ) -> Result<(), Error> {
         let layer_off = layer_byte_offset(layer);
         let l = &layout.layers[layer];
+        // E18: sliding-layer prefill flash (opt-in, quality-gated). Takes
+        // precedence over mma2 when enabled.
+        if self.prefill_causal && l.is_full == 0 && self.ps.attn_flash_sliding.is_some() {
+            return self.encode_attn_flash_sliding(layer, layout);
+        }
         // E20: top-k sparse attention for full-layer prefill (opt-in, quality-gated).
         // Takes precedence over E17 when enabled.
         if self.prefill_causal && l.is_full == 1 && self.ps.attn_topk.is_some() {
