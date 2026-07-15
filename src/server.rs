@@ -18,9 +18,10 @@
 //! - **`reasoning_content`** — the model's private thought channel
 //!   (`<|channel>thought…<channel|>`), streamed on its own delta field the way
 //!   DeepSeek/vLLM/OpenWebUI expect. Rendered by clients as a collapsible
-//!   "thinking" block. Opt-in per request (`enable_thinking:true`): the default
-//!   keeps the gate-validated prompt (empty thought channel seeded), and enabling
-//!   thinking unseeds it.
+//!   "thinking" block. Default on via serve `--think` (override with
+//!   `--think=false`). Per request: `model:think` / `:think=true` / `:think=false`,
+//!   or body `enable_thinking` / `chat_template_kwargs.enable_thinking`
+//!   (suffix wins, then body, then server default).
 //! - **`x-diffusion-draft`** — the *shimmering private messages*: as the canvas
 //!   denoises, positions flip in place before they commit. Standard `content`
 //!   only ever carries block-**committed** (immutable) text, so any OpenAI client
@@ -49,6 +50,9 @@ const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Deserialize)]
 struct ChatRequest {
+    /// Client model id; supports `:think` / `:think=true` / `:think=false` suffixes.
+    #[serde(default)]
+    model: Option<String>,
     /// Raw OpenAI messages, kept as JSON so the tool-aware renderer sees
     /// `tool_calls` / `tool` roles / content-parts verbatim. `content` (string or
     /// parts array) is flattened by `tools::message_text` for the plain path.
@@ -68,14 +72,57 @@ struct ChatRequest {
     #[serde(default)]
     #[allow(dead_code)]
     temperature: Option<f32>,
-    /// Expose the private thought channel as `reasoning_content`. Default: the
-    /// server default (on). Accepts `chat_template_kwargs.enable_thinking` too.
+    /// Expose the private thought channel as `reasoning_content`. Precedence:
+    /// `model:think…` suffix > this field / `chat_template_kwargs` > serve `--think`.
     #[serde(default)]
     enable_thinking: Option<bool>,
+    #[serde(default)]
+    chat_template_kwargs: Option<ChatTemplateKwargs>,
     /// Stream speculative pre-commit canvas drafts as `x-diffusion-draft`.
     /// Default: on.
     #[serde(default)]
     x_diffusion_drafts: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+struct ChatTemplateKwargs {
+    #[serde(default)]
+    enable_thinking: Option<bool>,
+}
+
+/// Parse a trailing `:think` / `:think=true` / `:think=false` from a model id.
+pub(crate) fn parse_model_think_suffix(model: &str) -> Option<bool> {
+    let (_, suffix) = model.rsplit_once(':')?;
+    let s = suffix.trim();
+    let lower = s.to_ascii_lowercase();
+    if lower == "think" {
+        return Some(true);
+    }
+    if let Some(v) = lower.strip_prefix("think=") {
+        return match v {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// Resolve thinking for one request: model suffix > body fields > server default.
+pub(crate) fn resolve_enable_thinking(
+    model: Option<&str>,
+    enable_thinking: Option<bool>,
+    chat_template_kwargs: Option<bool>,
+    server_default: bool,
+) -> bool {
+    if let Some(model) = model {
+        if let Some(v) = parse_model_think_suffix(model) {
+            return v;
+        }
+    }
+    enable_thinking
+        .or(chat_template_kwargs)
+        .unwrap_or(server_default)
 }
 
 /// One streamed delta produced by the mapper, before OpenAI-envelope framing.
@@ -305,7 +352,9 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
             }
             self.last_argmax.clear();
             self.streak.clear();
-            if hit_stop {
+            // Premature stop inside an unfinished tool call: keep the mapper
+            // open so later blocks can append the rest of the call.
+            if hit_stop && !crate::tools::has_incomplete_tool_call(&self.emitted_content) {
                 self.ended = true;
             }
         }
@@ -446,6 +495,13 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 // ===========================================================================
 // GPU worker: owns the session, drains the job queue one at a time.
 // ===========================================================================
@@ -461,6 +517,9 @@ struct Worker {
     no_early_stop: bool,
     base_cfg: crate::metal::StepGenerateConfig,
     tool_compact: Option<ToolCompactCfg>,
+    /// When set, each completed request writes one `{seq}.jsonl` here.
+    log_dir: Option<std::path::PathBuf>,
+    turn_seq: AtomicU64,
 }
 
 /// Tool-output compaction settings (`--tool-compact` / `DGQ_TOOL_COMPACT=1`).
@@ -480,16 +539,31 @@ type ServeMapper = Arc<Mutex<DiffusionStreamMapper<Arc<crate::tokenizer::Tokeniz
 
 /// When `strip_tool_markup` is set, hide `<|tool_call>...` grammar from
 /// streamed content/draft; clients get structured `delta.tool_calls` at Done.
+/// When `log_progress` is set, print a condensed serve progress line every five
+/// denoise steps (and on block commit).
 fn attach_stream_observer(
     cfg: &mut crate::metal::StepGenerateConfig,
     mapper: &ServeMapper,
     resp: &mpsc::Sender<ServerEvent>,
     strip_tool_markup: bool,
+    log_progress: bool,
 ) {
     let mapper = Arc::clone(mapper);
     let resp = resp.clone();
     let suppress = std::sync::atomic::AtomicBool::new(false);
     cfg.step_observer = Some(Arc::new(move |ev: &crate::metal::StepProgressEvent<'_>| {
+        if log_progress
+            && (ev.step_in_block == 1 || ev.step_in_block % 5 == 0 || ev.block_done)
+        {
+            eprintln!(
+                "serve: block {}/{} step {}/{} {}%",
+                ev.block_idx,
+                ev.max_blocks,
+                ev.step_in_block,
+                ev.max_steps,
+                serve_progress_pct(ev.accept_count, ev.mean_entropy, ev.argmax.len()),
+            );
+        }
         let deltas = mapper.lock().unwrap().on_step(ev);
         for d in deltas {
             let Some(d) = filter_tool_markup_delta(d, strip_tool_markup, &suppress) else {
@@ -498,6 +572,108 @@ fn attach_stream_observer(
             let _ = resp.send(ServerEvent::Delta(d));
         }
     }));
+}
+
+/// Block progress % from accept density + mean entropy. Entropy carries more
+/// weight: accept plateaus well below canvas length under early-stop, while
+/// mean_ent drops ~2.5 -> ~0.02 as the canvas converges.
+fn serve_progress_pct(accept: u32, mean_ent: f32, canvas: usize) -> u32 {
+    let n = canvas.max(1) as f32;
+    let a = (accept as f32 / n).clamp(0.0, 1.0);
+    let e = 1.0 - (mean_ent / 4.0).clamp(0.0, 1.0);
+    (100.0 * (0.4 * a + 0.6 * e)).round() as u32
+}
+
+/// One-line preview of `text`, max `max_chars` Unicode scalars, newlines flattened.
+pub(crate) fn trunc_preview(text: &str, max_chars: usize) -> String {
+    let one_line = text.replace(['\n', '\r'], " ");
+    let mut chars = one_line.chars();
+    let head: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{head}...")
+    } else {
+        head
+    }
+}
+
+/// Write a pretty-printed JSON object to `path`.
+pub(crate) fn write_json_log(
+    path: &std::path::Path,
+    record: &serde_json::Value,
+) -> Result<(), String> {
+    let body = serde_json::to_string_pretty(record).map_err(|e| e.to_string())?;
+    std::fs::write(path, body).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// `serve-NNNNN.json` — server-side turn record for response `seq`.
+pub(crate) fn write_serve_log(
+    dir: &std::path::Path,
+    seq: u64,
+    record: &serde_json::Value,
+) -> Result<std::path::PathBuf, String> {
+    let path = dir.join(format!("serve-{seq:05}.json"));
+    write_json_log(&path, record)?;
+    Ok(path)
+}
+
+/// `model-NNNNN-MMMMM.json` — per-block denoise stats for response `seq`, block `block`.
+pub(crate) fn write_model_block_log(
+    dir: &std::path::Path,
+    seq: u64,
+    block: usize,
+    record: &serde_json::Value,
+) -> Result<std::path::PathBuf, String> {
+    let path = dir.join(format!("model-{seq:05}-{block:05}.json"));
+    write_json_log(&path, record)?;
+    Ok(path)
+}
+
+fn finish_reason_for(tool_calls: &[serde_json::Value], stopped: bool) -> &'static str {
+    if !tool_calls.is_empty() {
+        "tool_calls"
+    } else if stopped {
+        "stop"
+    } else {
+        "length"
+    }
+}
+
+fn block_stats_to_json(
+    stats: &crate::generate::BlockDenoiseStats,
+    tokenizer: &crate::tokenizer::Tokenizer,
+    stop_token: Option<&str>,
+) -> serde_json::Value {
+    let tokens: Vec<serde_json::Value> = stats
+        .token_ids
+        .iter()
+        .map(|&id| {
+            let text = tokenizer.id_to_token(id).unwrap_or("");
+            serde_json::json!([id, text])
+        })
+        .collect();
+    serde_json::json!({
+        "block": stats.block_idx,
+        "max_blocks": stats.max_blocks,
+        "steps_eff": stats.steps_eff,
+        "denoise_secs": stats.denoise_secs,
+        "accept_per_step": stats.accept_per_step,
+        "min_ent_per_step": stats.min_ent_per_step,
+        "mean_ent_per_step": stats.mean_ent_per_step,
+        "low_ent_per_step": stats.low_ent_per_step,
+        "late_window": {
+            "accept_sum": stats.late_accept_sum,
+            "min_ent": stats.late_min_ent,
+            "mean_ent": stats.late_mean_ent,
+            "max_low_ent": stats.late_max_low_ent,
+        },
+        "denoise_stop": stats.denoise_stop,
+        "kept_tokens": stats.kept_tokens,
+        "tokens": tokens,
+        "stop_token_id": stats.stop_token_id,
+        "stop_token": stop_token,
+        "stop_offset": stats.stop_offset,
+        "continued_past_stop": stats.continued_past_stop,
+    })
 }
 
 /// Truncate / suppress wire deltas that would leak native tool-call markup into
@@ -627,8 +803,18 @@ pub fn run_serve(
     steps: usize,
     max_layers: Option<usize>,
     tool_compact: bool,
+    log_dir: Option<std::path::PathBuf>,
+    think: bool,
 ) -> Result<(), String> {
     use crate::metal::StepGenerateConfig;
+
+    // Quiet by default: serve prints its own condensed turn log. Explicit
+    // DGQ_QUIET=0 (or any non-1) was set by the user if quiet_from_env; chat
+    // restores verbose via --verbose, serve has no such flag so leave their
+    // choice alone when the env was present.
+    if !crate::flags::quiet_set_by_user() {
+        crate::flags::set_quiet(true);
+    }
 
     if !crate::dgq::store::looks_like_dgq_dir(model_dir) {
         return Err(format!(
@@ -641,6 +827,11 @@ pub fn run_serve(
 
     // Fail-fast context budget guard before loading weights (mirrors chat/ask).
     crate::commands::check_ctx_budget(ctx)?;
+
+    if let Some(ref dir) = log_dir {
+        std::fs::create_dir_all(dir).map_err(|e| format!("--log-dir {}: {e}", dir.display()))?;
+        eprintln!("serve: turn log -> {}", dir.display());
+    }
 
     let stop_token_ids = crate::config::load_generation_stop_tokens(model_dir);
     let sampler = crate::sample::sampler_for_steps(steps, false);
@@ -680,6 +871,8 @@ pub fn run_serve(
             max_expand_rounds: 4,
             summarize_max_new: 512,
         }),
+        log_dir,
+        turn_seq: AtomicU64::new(1),
     };
     eprintln!("serve: loading model…");
     let worker_handle = std::thread::spawn(move || worker.run(ready_tx, job_rx));
@@ -691,14 +884,20 @@ pub fn run_serve(
 
     let listener = TcpListener::bind(addr).map_err(|e| format!("bind {addr}: {e}"))?;
     let local = listener.local_addr().map_err(|e| e.to_string())?;
-    eprintln!("serve: listening on http://{local}  (POST /v1/chat/completions)");
+    eprintln!(
+        "serve: listening on http://{local}  (POST /v1/chat/completions; think default={think})"
+    );
+    eprintln!(
+        "serve: model `{}` — override with model:think / :think=false / enable_thinking",
+        model_name
+    );
 
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
                 let jobs = job_tx.clone();
                 let name = Arc::clone(&model_name);
-                std::thread::spawn(move || handle_connection(stream, jobs, name));
+                std::thread::spawn(move || handle_connection(stream, jobs, name, think));
             }
             Err(err) => eprintln!("serve: accept error: {err}"),
         }

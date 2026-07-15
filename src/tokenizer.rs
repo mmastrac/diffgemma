@@ -389,18 +389,21 @@ impl Tokenizer {
     /// Incremental decode: appends the text for `ids` to `out`. This mirrors
     /// [`decode`](Self::decode) but lets callers reuse a buffer across calls so
     /// streaming UIs don't re-decode the whole committed prefix every step.
+    ///
+    /// Matches `tokenizer.json`'s Replace decoder: every U+2581 (`▁`) becomes a
+    /// space. Collapsing a leading-only `▁` (older behavior) turns indent tokens
+    /// like `▁▁▁▁` (id 140) into a single space and loses nesting in tool writes.
     pub fn decode_append(&self, out: &mut String, ids: &[u32]) {
         for &id in ids {
             let Some(piece) = self.id_to_token(id) else {
                 continue;
             };
-            if piece.starts_with(SPACE_REPLACEMENT) {
-                if !out.is_empty() {
+            for ch in piece.chars() {
+                if ch == SPACE_REPLACEMENT {
                     out.push(' ');
+                } else {
+                    out.push(ch);
                 }
-                out.push_str(piece.trim_start_matches(SPACE_REPLACEMENT));
-            } else {
-                out.push_str(piece);
             }
         }
     }
@@ -434,5 +437,30 @@ mod tests {
             return;
         };
         assert_eq!(tok.encode("Hello world", false), vec![9259, 1902]);
+    }
+
+    #[test]
+    fn decode_preserves_multi_space_indent() {
+        let Some(tok) = model_tokenizer_q4_or_transformer() else {
+            return;
+        };
+        // HF: "    return" -> [140, 2060] tokens ['▁▁▁▁','return'] -> "    return"
+        let ids = tok.encode("    return", false);
+        assert_eq!(ids, vec![140, 2060], "unexpected encode of 4-space indent");
+        assert_eq!(tok.decode(&ids), "    return");
+        assert_eq!(tok.decode(&[144, 584]), "        if"); // 8 spaces + if
+        assert_eq!(tok.decode(&tok.encode("\treturn", false)), "\treturn");
+    }
+
+    fn model_tokenizer_q4_or_transformer() -> Option<Tokenizer> {
+        for path in [
+            PathBuf::from("model/diffusiongemma-q4emb/tokenizer.json"),
+            PathBuf::from("model/transformer/tokenizer.json"),
+        ] {
+            if path.exists() {
+                return Tokenizer::load(path).ok();
+            }
+        }
+        None
     }
 }

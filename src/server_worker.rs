@@ -12,6 +12,11 @@ impl Worker {
     /// Open the session (Metal objects are not `Send`, so they must be created
     /// on this thread), signal readiness, then drain the job queue one at a time.
     pub(crate) fn run(self, ready: mpsc::Sender<Result<(), String>>, jobs: mpsc::Receiver<Job>) {
+        // Quiet is thread-local: the accept-thread set_quiet never reaches this
+        // worker, so flip it here unless DGQ_QUIET was set in the env.
+        if !crate::flags::quiet_set_by_user() {
+            crate::flags::set_quiet(true);
+        }
         let open_started = std::time::Instant::now();
         let session =
             match crate::metal::StepGenerateSession::open(&self.model_dir, &self.base_cfg, None) {
@@ -63,16 +68,20 @@ impl Worker {
         // Plain turns for the non-tool prompt/finalize path (gate-validated).
         let history = build_turns(&job.messages);
 
-        let prompt = if tool_mode {
+        let (prompt, prompt_text) = if tool_mode {
             let s = crate::tools::render_conversation(&job.messages, &job.tools, true, thinking);
-            self.tokenizer.encode_with_specials(&s)
+            let ids = self.tokenizer.encode_with_specials(&s);
+            (ids, s)
         } else {
             let opts = crate::chat_template::ChatFormatOptions {
                 add_generation_prompt: true,
                 enable_thinking: thinking,
             };
             match crate::chat_template::format_chat_token_ids(&self.tokenizer, &history, &opts) {
-                Ok(p) => p,
+                Ok(ids) => {
+                    let s = self.tokenizer.decode(&ids);
+                    (ids, s)
+                }
                 Err(err) => {
                     let _ = job.resp.send(ServerEvent::Error(format!("prompt: {err}")));
                     return;
@@ -95,36 +104,132 @@ impl Worker {
 
         let mut cfg = self.per_request_cfg(&job, budget);
         let mapper = self.make_mapper(&job);
-        attach_stream_observer(&mut cfg, &mapper, &job.resp, tool_mode);
+        attach_stream_observer(&mut cfg, &mapper, &job.resp, tool_mode, true);
 
-        // Route this prompt to its conversation (longest-prefix match), loading
-        // that conversation's KV into the hot buffer. `generate_with_session`
-        // then reuses the conversation's prefix and prefills only the new-turn
-        // delta (or re-prefills whole for a new/evicted conversation).
+        // Route to the conversation first so `kv_valid_tokens` is the right
+        // prefix; the incremental log is the prompt delta beyond that.
         let conv_id = manager.activate(&prompt);
+        let reuse = {
+            let valid = manager.session_mut().kv_valid_tokens();
+            valid
+                .iter()
+                .zip(prompt.iter())
+                .take_while(|(a, b)| *a == *b)
+                .count()
+        };
+        let delta_ids = &prompt[reuse..];
+        let delta_text = self.tokenizer.decode(delta_ids);
+        eprintln!(
+            "serve: in +{}tok {}",
+            delta_ids.len(),
+            trunc_preview(&delta_text, 120)
+        );
 
         let out =
             crate::metal::generate_with_session(manager.session_mut(), &prompt, &cfg, "serve");
         cfg.step_observer = None;
         match out {
             Ok(out) => {
-                let raw = mapper.lock().unwrap().content().to_string();
+                let raw_text = mapper.lock().unwrap().content().to_string();
                 let reasoning = mapper.lock().unwrap().reasoning().to_string();
                 let completion_tokens = out.token_ids.len().saturating_sub(prompt_len);
+                let raw_ids_decode = self.tokenizer.decode(
+                    &crate::sample::strip_degenerate_token_ids(&out.token_ids[prompt_len..]),
+                );
 
                 // In tool mode the committed text may contain `<|tool_call>…` spans:
                 // parse them out; `content` becomes the preamble before the first
                 // call. A tool_call does NOT end the turn, so the model may emit
                 // several calls + interleaved text — we capture all calls.
                 let (content, tool_calls) = if tool_mode {
-                    let calls = crate::tools::parse_tool_calls(&raw);
+                    let calls = crate::tools::parse_tool_calls(&raw_text);
+                    if calls.is_empty() && raw_text.contains("call:") {
+                        eprintln!(
+                            "serve: tool-mode: raw has call: but parse returned 0 ({})",
+                            trunc_preview(&raw_text, 160)
+                        );
+                    }
                     (
-                        crate::tools::content_before_tool_calls(&raw),
+                        crate::tools::content_before_tool_calls(&raw_text),
                         crate::tools::to_openai_tool_calls(&calls),
                     )
                 } else {
-                    (raw, Vec::new())
+                    (raw_text.clone(), Vec::new())
                 };
+
+                let finish_reason = finish_reason_for(&tool_calls, out.stopped_on_eot);
+                if let Some(dir) = &self.log_dir {
+                    let seq = self.turn_seq.fetch_add(1, Ordering::Relaxed);
+                    let stop_token = out.stop_token_id.and_then(|id| {
+                        self.tokenizer
+                            .id_to_token(id)
+                            .map(|s| s.to_string())
+                            .or_else(|| Some(format!("id:{id}")))
+                    });
+                    let record = serde_json::json!({
+                        "seq": seq,
+                        "ts_unix_ms": now_ms(),
+                        "tool_mode": tool_mode,
+                        "tool_compact": false,
+                        "seed": job.seed,
+                        "max_tokens": job.max_tokens,
+                        "messages": &job.messages,
+                        "tools": &job.tools,
+                        "prompt_text": &prompt_text,
+                        "prompt_tokens": prompt_len,
+                        "completion_tokens": completion_tokens,
+                        "raw_text": &raw_text,
+                        "raw_ids_decode": &raw_ids_decode,
+                        "reasoning": &reasoning,
+                        "content": &content,
+                        "tool_calls": &tool_calls,
+                        "stopped": out.stopped_on_eot,
+                        "stop_token_id": out.stop_token_id,
+                        "stop_token": stop_token,
+                        "stop_block": out.stop_block_idx,
+                        "stop_offset": out.stop_offset,
+                        "finish_reason": finish_reason,
+                        "blocks_committed": out.blocks_committed,
+                        "prefill_secs": out.prefill_elapsed.as_secs_f64(),
+                        "denoise_secs": out.denoise_elapsed.as_secs_f64(),
+                        "extend_secs": out.extend_elapsed.as_secs_f64(),
+                    });
+                    self.write_response_logs(dir, seq, &record, &out.block_stats);
+                }
+
+                let prefill_toks = delta_ids.len().max(1) as f64;
+                let prefill_tps = if out.prefill_elapsed.as_secs_f64() > 0.0 {
+                    prefill_toks / out.prefill_elapsed.as_secs_f64()
+                } else {
+                    0.0
+                };
+                let denoise_tps = if out.denoise_elapsed.as_secs_f64() > 0.0 {
+                    completion_tokens as f64 / out.denoise_elapsed.as_secs_f64()
+                } else {
+                    0.0
+                };
+                let call_note = if tool_calls.is_empty() {
+                    String::new()
+                } else {
+                    let names: Vec<&str> = tool_calls
+                        .iter()
+                        .filter_map(|tc| {
+                            tc.get("function")
+                                .and_then(|f| f.get("name"))
+                                .and_then(|n| n.as_str())
+                        })
+                        .collect();
+                    format!(" tools=[{}]", names.join(","))
+                };
+                let preview = if content.trim().is_empty() && !tool_calls.is_empty() {
+                    "(tool_calls only)".to_string()
+                } else {
+                    trunc_preview(&content, 120)
+                };
+                eprintln!(
+                    "serve: out {}tok {}{call_note}  prefill={prefill_tps:.0} tok/s  denoise={denoise_tps:.0} tok/s",
+                    completion_tokens, preview,
+                );
 
                 // Finalize to the canonical completed-turns log so the snapshot is a
                 // clean prefix of the next turn's prompt (reasoning never persists;
@@ -186,6 +291,8 @@ impl Worker {
         cfg.max_new_tokens = job.max_tokens.map_or(budget, |c| c.min(budget));
         cfg.seed = job.seed.unwrap_or(self.base_cfg.seed);
         cfg.stop_token_ids = self.stop_token_ids.clone();
+        cfg.continue_incomplete_tool_calls =
+            needs_tool_rendering(&job.messages, &job.tools);
         cfg.degenerate_reply_check =
             crate::chat_template::empty_reply_check(&self.model_dir, self.stop_token_ids.clone());
         cfg
@@ -248,6 +355,20 @@ impl Worker {
                     thinking,
                 ));
         let conv_id = manager.activate(&routing_prompt);
+        let reuse = {
+            let valid = manager.session_mut().kv_valid_tokens();
+            valid
+                .iter()
+                .zip(routing_prompt.iter())
+                .take_while(|(a, b)| *a == *b)
+                .count()
+        };
+        let delta_ids = &routing_prompt[reuse..];
+        eprintln!(
+            "serve: in +{}tok {}",
+            delta_ids.len(),
+            trunc_preview(&self.tokenizer.decode(delta_ids), 120)
+        );
 
         // Summarize passes for new over-threshold responses, in message order
         // (each sees prior substitutions). Failures degrade to a mechanical
@@ -340,7 +461,12 @@ impl Worker {
         let mut completion_tokens = 0usize;
         let mut tool_calls_out: Vec<serde_json::Value> = Vec::new();
         let mut stopped = false;
+        let mut stop_token_id: Option<u32> = None;
+        let mut stop_block_idx: Option<usize> = None;
+        let mut stop_offset: Option<usize> = None;
+        let mut all_block_stats: Vec<crate::generate::BlockDenoiseStats> = Vec::new();
         let mut round_prompt = prompt;
+        let mut raw_rounds: Vec<String> = Vec::new();
 
         for round in 0..=cc.max_expand_rounds {
             let remaining = job.max_tokens.map(|m| m.saturating_sub(completion_tokens));
@@ -361,7 +487,7 @@ impl Worker {
             // generation, and a prior round's stop token must not eat this
             // round's text.
             let mapper = self.make_mapper(&job);
-            attach_stream_observer(&mut cfg, &mapper, &job.resp, true);
+            attach_stream_observer(&mut cfg, &mapper, &job.resp, true, true);
 
             let out = crate::metal::generate_with_session(
                 manager.session_mut(),
@@ -380,6 +506,11 @@ impl Worker {
             reasoning.push_str(mapper.lock().unwrap().reasoning());
             completion_tokens += out.token_ids.len().saturating_sub(round_prompt.len());
             stopped = out.stopped_on_eot;
+            stop_token_id = out.stop_token_id;
+            stop_block_idx = out.stop_block_idx;
+            stop_offset = out.stop_offset;
+            all_block_stats.extend(out.block_stats);
+            raw_rounds.push(raw.clone());
 
             let calls = crate::tools::parse_tool_calls(&raw);
             let piece = crate::tools::content_before_tool_calls(&raw);
@@ -474,6 +605,45 @@ impl Worker {
 
         // Unblock the client before the finalize KV rebuild (same reasoning as
         // the plain path — the reply doesn't depend on it).
+        let finish_reason = finish_reason_for(&tool_calls_out, stopped);
+        if let Some(dir) = &self.log_dir {
+            let seq = self.turn_seq.fetch_add(1, Ordering::Relaxed);
+            let stop_token = stop_token_id.and_then(|id| {
+                self.tokenizer
+                    .id_to_token(id)
+                    .map(|s| s.to_string())
+                    .or_else(|| Some(format!("id:{id}")))
+            });
+            let record = serde_json::json!({
+                "seq": seq,
+                "ts_unix_ms": now_ms(),
+                "tool_mode": true,
+                "tool_compact": true,
+                "seed": job.seed,
+                "max_tokens": job.max_tokens,
+                "messages": &job.messages,
+                "tools": &job.tools,
+                "prompt_tokens": prompt_len,
+                "completion_tokens": completion_tokens,
+                "raw_rounds": &raw_rounds,
+                "raw_text": raw_rounds.last().cloned().unwrap_or_default(),
+                "reasoning": &reasoning,
+                "content": &content,
+                "tool_calls": &tool_calls_out,
+                "stopped": stopped,
+                "stop_token_id": stop_token_id,
+                "stop_token": stop_token,
+                "stop_block": stop_block_idx,
+                "stop_offset": stop_offset,
+                "finish_reason": finish_reason,
+            });
+            self.write_response_logs(dir, seq, &record, &all_block_stats);
+        }
+        eprintln!(
+            "serve: out {}tok {}",
+            completion_tokens,
+            trunc_preview(&content, 120)
+        );
         let _ = job.resp.send(ServerEvent::Done {
             content,
             reasoning,
@@ -485,6 +655,35 @@ impl Worker {
 
         if let Err(err) = manager.finalize(conv_id, &canonical) {
             eprintln!("serve: conversation finalize failed: {err}");
+        }
+    }
+
+    fn write_response_logs(
+        &self,
+        dir: &std::path::Path,
+        seq: u64,
+        serve_record: &serde_json::Value,
+        block_stats: &[crate::generate::BlockDenoiseStats],
+    ) {
+        match write_serve_log(dir, seq, serve_record) {
+            Ok(path) => eprintln!("serve: wrote {}", path.display()),
+            Err(err) => eprintln!("serve: serve log failed: {err}"),
+        }
+        for (i, stats) in block_stats.iter().enumerate() {
+            let stop_token = stats.stop_token_id.and_then(|id| {
+                self.tokenizer
+                    .id_to_token(id)
+                    .map(|s| s.to_string())
+                    .or_else(|| Some(format!("id:{id}")))
+            });
+            let mut record = block_stats_to_json(stats, &self.tokenizer, stop_token.as_deref());
+            if let Some(obj) = record.as_object_mut() {
+                obj.insert("file_block".into(), serde_json::json!(i + 1));
+            }
+            match write_model_block_log(dir, seq, i + 1, &record) {
+                Ok(path) => eprintln!("serve: wrote {}", path.display()),
+                Err(err) => eprintln!("serve: model log failed: {err}"),
+            }
         }
     }
 }

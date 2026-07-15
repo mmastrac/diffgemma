@@ -100,6 +100,7 @@ pub(crate) fn handle_connection(
     mut stream: TcpStream,
     jobs: mpsc::Sender<Job>,
     model_name: Arc<str>,
+    think_default: bool,
 ) {
     let req = match read_request(&mut stream) {
         Ok(Some(r)) => r,
@@ -119,12 +120,16 @@ pub(crate) fn handle_connection(
                 "200 OK",
                 &serde_json::json!({
                     "object": "list",
-                    "data": [{ "id": &*model_name, "object": "model", "owned_by": "local" }],
+                    "data": [
+                        { "id": &*model_name, "object": "model", "owned_by": "local" },
+                        { "id": format!("{}:think", model_name), "object": "model", "owned_by": "local" },
+                        { "id": format!("{}:think=false", model_name), "object": "model", "owned_by": "local" },
+                    ],
                 }),
             );
         }
         ("POST", "/v1/chat/completions") => {
-            handle_chat(&mut stream, &req.body, &jobs, &model_name);
+            handle_chat(&mut stream, &req.body, &jobs, &model_name, think_default);
         }
         ("OPTIONS", _) => {
             write_response(&mut stream, "204 No Content", "text/plain", b"");
@@ -144,6 +149,7 @@ fn handle_chat(
     body: &[u8],
     jobs: &mpsc::Sender<Job>,
     model_name: &Arc<str>,
+    think_default: bool,
 ) {
     let req: ChatRequest = match serde_json::from_slice(body) {
         Ok(r) => r,
@@ -169,6 +175,21 @@ fn handle_chat(
         return;
     }
 
+    let enable_thinking = resolve_enable_thinking(
+        req.model.as_deref(),
+        req.enable_thinking,
+        req.chat_template_kwargs
+            .as_ref()
+            .and_then(|k| k.enable_thinking),
+        think_default,
+    );
+    let response_model: Arc<str> = Arc::from(
+        req.model
+            .as_deref()
+            .unwrap_or(model_name.as_ref())
+            .to_string(),
+    );
+
     let (resp_tx, resp_rx) = mpsc::channel();
     let job = Job {
         messages: req.messages,
@@ -176,12 +197,7 @@ fn handle_chat(
         stream: req.stream,
         max_tokens: req.max_tokens,
         seed: req.seed,
-        // Default OFF: matches the gate-validated prompt (which seeds an empty
-        // thought channel). Enabling thinking unseeds it — an unmeasured prompt
-        // change — and this checkpoint does not reliably emit a thought channel
-        // anyway, so reasoning_content stays empty. Clients opt in per request;
-        // the reasoning_content plumbing is fully wired for when it fires.
-        enable_thinking: req.enable_thinking.unwrap_or(false),
+        enable_thinking,
         // Draft deltas only exist for streaming responses; a non-streaming
         // request would decode the full canvas every step just to have
         // respond_json discard the events.
@@ -199,9 +215,9 @@ fn handle_chat(
     }
 
     if streaming {
-        stream_sse(stream, resp_rx, model_name);
+        stream_sse(stream, resp_rx, &response_model);
     } else {
-        respond_json(stream, resp_rx, model_name);
+        respond_json(stream, resp_rx, &response_model);
     }
 }
 

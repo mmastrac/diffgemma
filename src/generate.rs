@@ -47,6 +47,15 @@ pub struct GenerateOutput {
     /// end-of-turn / EOS token (full-message mode) rather than exhausting the
     /// `max_new_tokens` budget.
     pub stopped_on_eot: bool,
+    /// Stop-token id when [`Self::stopped_on_eot`], else `None`.
+    pub stop_token_id: Option<u32>,
+    /// 1-based block index that emitted the stop token.
+    pub stop_block_idx: Option<usize>,
+    /// Offset of the stop token within that block's committed canvas.
+    pub stop_offset: Option<usize>,
+    /// Per committed block: the final-token stats that the verbose step-generate
+    /// log prints (accept/min_ent/mean_ent/low_ent histograms + late window).
+    pub block_stats: Vec<BlockDenoiseStats>,
     /// Effective denoise steps per committed block (monolithic path).
     pub block_steps_eff: Vec<u32>,
     /// Accepted positions per step in the last committed block.
@@ -60,6 +69,34 @@ pub struct GenerateOutput {
     pub session_telemetry: crate::metal::SessionTelemetry,
     #[cfg(target_os = "macos")]
     pub denoise_trace: Option<crate::denoise_trace::DenoiseTrace>,
+}
+
+/// Per-block denoise summary (same content as the quiet-suppressed step-generate
+/// block footer lines).
+#[derive(Debug, Clone)]
+pub struct BlockDenoiseStats {
+    pub block_idx: usize,
+    pub max_blocks: usize,
+    pub steps_eff: u32,
+    pub denoise_secs: f64,
+    pub accept_per_step: Vec<u32>,
+    pub min_ent_per_step: Vec<f32>,
+    pub mean_ent_per_step: Vec<f32>,
+    pub low_ent_per_step: Vec<u32>,
+    pub late_accept_sum: u32,
+    pub late_min_ent: f32,
+    pub late_mean_ent: f32,
+    pub late_max_low_ent: u32,
+    /// `confident` | `plateau` | `max_steps`
+    pub denoise_stop: String,
+    /// Tokens kept from this block after stop-token trim (full canvas if none).
+    pub kept_tokens: usize,
+    /// Kept token ids for this block (same slice as Kv-extend / reply append).
+    pub token_ids: Vec<u32>,
+    pub stop_token_id: Option<u32>,
+    pub stop_offset: Option<usize>,
+    /// Stop token was trimmed but generation continued (incomplete tool call).
+    pub continued_past_stop: bool,
 }
 
 #[cfg(target_os = "macos")]

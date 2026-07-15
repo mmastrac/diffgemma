@@ -455,6 +455,8 @@ pub(crate) fn dispatch(cli: Cli) -> ExitCode {
             max_layers,
             ctx,
             tool_compact,
+            log_dir,
+            think,
         } => match server::run_serve(
             &cli.model_dir,
             &addr,
@@ -463,6 +465,8 @@ pub(crate) fn dispatch(cli: Cli) -> ExitCode {
             steps,
             max_layers,
             tool_compact,
+            log_dir,
+            think,
         ) {
             Ok(()) => ExitCode::SUCCESS,
             Err(msg) => {

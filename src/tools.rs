@@ -460,6 +460,32 @@ pub struct ParsedToolCall {
     pub arguments: Value,
 }
 
+/// True when `text` has a `call:NAME{…}` that is still open (no closing `}`),
+/// or a `<|tool_call>` opener with no `call:` yet. Used to keep generating
+/// blocks instead of ending the turn on a premature stop token.
+pub fn has_incomplete_tool_call(text: &str) -> bool {
+    if let Some(i) = text.rfind("<|tool_call>") {
+        let after = &text[i..];
+        if !after.contains("call:") {
+            return true;
+        }
+    }
+    let mut rest = text;
+    while let Some(pos) = rest.find("call:") {
+        let after = &rest[pos + "call:".len()..];
+        let Some(brace) = after.find('{') else {
+            return true;
+        };
+        match read_braced(&after[brace..]) {
+            Some((_, consumed)) => {
+                rest = &after[brace + consumed..];
+            }
+            None => return true,
+        }
+    }
+    false
+}
+
 /// Parse every `call:NAME{ARGS}` in model output into structured tool calls,
 /// tolerant of the exact wrapper tokens around/between them.
 pub fn parse_tool_calls(text: &str) -> Vec<ParsedToolCall> {
@@ -485,15 +511,28 @@ pub fn parse_tool_calls(text: &str) -> Vec<ParsedToolCall> {
 }
 
 /// Given a string starting with '{', return (inner content, bytes consumed incl.
-/// both braces), respecting nested braces. `None` if unbalanced.
+/// both braces), respecting nested braces and `<|"|>`-quoted runs (braces inside
+/// quotes do not affect depth -- otherwise `call:edit{oldString:<|"|>...{...}<|"|>}`
+/// is reported unbalanced and the whole tool call is dropped).
 fn read_braced(s: &str) -> Option<(&str, usize)> {
+    let qb = Q.as_bytes();
     let b = s.as_bytes();
     if b.first() != Some(&b'{') {
         return None;
     }
     let mut depth = 0i32;
-    for (i, &c) in b.iter().enumerate() {
-        match c {
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i..].starts_with(qb) {
+            let after = i + qb.len();
+            if let Some(rel) = find_bytes(&b[after..], qb) {
+                i = after + rel + qb.len();
+                continue;
+            }
+            // Unclosed quote: remaining bytes are opaque (no brace/comma effects).
+            break;
+        }
+        match b[i] {
             b'{' => depth += 1,
             b'}' => {
                 depth -= 1;
@@ -503,6 +542,7 @@ fn read_braced(s: &str) -> Option<(&str, usize)> {
             }
             _ => {}
         }
+        i += 1;
     }
     None
 }
@@ -590,6 +630,8 @@ fn split_top_level(s: &str) -> Vec<&str> {
                 i = after + rel + qb.len();
                 continue;
             }
+            // Unclosed quote: remainder is opaque — do not split on commas/braces.
+            break;
         }
         match bytes[i] {
             b'{' | b'[' => depth += 1,
@@ -663,6 +705,81 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].arguments, json!({"path":"/tmp"}));
         assert_eq!(calls[1].arguments, json!({"path":"/home"}));
+    }
+
+    #[test]
+    fn unclosed_quote_does_not_invent_fields_from_rust_commas() {
+        // Real failure mode: write{content:<|"|>… pattern: &str, text: &str …}
+        // with no closing quote. Commas / braces inside must not become new
+        // top-level keys (that produced {"content":"…","text":"…"} and dropped
+        // filePath, which OpenCode then rejected).
+        let text = concat!(
+            "call:write{content:<|\"|>fn regex_lite(pattern: &str, text: &str) -> bool {\n",
+            " let x = 1;\n",
+            "}\n",
+            // no closing <|\"|>, and no filePath yet — incomplete
+        );
+        assert!(has_incomplete_tool_call(text));
+        assert!(parse_tool_calls(text).is_empty());
+
+        let complete = concat!(
+            "call:write{content:<|\"|>fn regex_lite(pattern: &str, text: &str) -> bool {\n",
+            " let x = 1;\n",
+            "}<|\"|>,filePath:<|\"|>/tmp/regex_test.rs<|\"|>}",
+        );
+        let calls = parse_tool_calls(complete);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "write");
+        assert_eq!(
+            calls[0].arguments.get("filePath").and_then(|v| v.as_str()),
+            Some("/tmp/regex_test.rs")
+        );
+        let content = calls[0].arguments["content"].as_str().unwrap();
+        assert!(content.contains("text: &str"));
+        assert!(!calls[0].arguments.get("text").is_some());
+    }
+
+    #[test]
+    fn incomplete_tool_call_detection() {
+        assert!(!has_incomplete_tool_call("just prose, no tools"));
+        assert!(!has_incomplete_tool_call(
+            "<|tool_call>call:bash{command:<|\"|>ls<|\"|>}<tool_call|>"
+        ));
+        assert!(has_incomplete_tool_call(
+            "<|tool_call>call:write{content:<|\"|>: regex::_......."
+        ));
+        assert!(has_incomplete_tool_call("<|tool_call>"));
+        assert!(has_incomplete_tool_call("call:write{content:<|\"|>oops"));
+        // Complete call then a trailing incomplete one.
+        assert!(has_incomplete_tool_call(concat!(
+            "call:bash{command:<|\"|>ls<|\"|>}",
+            "call:write{content:<|\"|>partial"
+        )));
+    }
+
+    #[test]
+    fn parse_braces_inside_quoted_string_args() {
+        // OpenCode edit tools send source snippets; an unbalanced-looking `{`
+        // inside `<|"|>...<|"|>` must not kill the call (that left serve returning
+        // empty content + finish_reason=stop, so the harness hung).
+        let text = concat!(
+            "<|tool_call>call:edit{",
+            "path:<|\"|>/tmp/regex_test.rs<|\"|>,",
+            "oldString:<|\"|>for (pattern, text, expected) in tests {<|\"|>,",
+            "newString:<|\"|>for (pattern, text, expected) in &tests {<|\"|>",
+            "}<tool_call|>"
+        );
+        let calls = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "edit");
+        assert_eq!(
+            calls[0].arguments,
+            json!({
+                "path": "/tmp/regex_test.rs",
+                "oldString": "for (pattern, text, expected) in tests {",
+                "newString": "for (pattern, text, expected) in &tests {",
+            })
+        );
     }
 
     #[test]

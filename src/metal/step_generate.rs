@@ -26,6 +26,8 @@ use std::time::{Duration, Instant};
 pub struct StepProgressEvent<'a> {
     /// 1-based committed-block index this step belongs to.
     pub block_idx: usize,
+    /// Total blocks budgeted for this generate (`max_new_tokens / CANVAS`).
+    pub max_blocks: usize,
     /// 1-based denoise step within the block.
     pub step_in_block: u32,
     pub max_steps: usize,
@@ -33,6 +35,8 @@ pub struct StepProgressEvent<'a> {
     pub argmax: &'a [u32],
     /// Positions accepted by the entropy-bound rule this step.
     pub accept_count: u32,
+    /// Mean per-position entropy (nats) this step.
+    pub mean_entropy: f32,
     /// True when this was the block's final step (its argmax got committed).
     pub block_done: bool,
 }
@@ -56,6 +60,10 @@ pub struct StepGenerateConfig {
     /// block emits any of these. Empty preserves the fixed `max_new_tokens`
     /// budget behavior used by parity/golden paths.
     pub stop_token_ids: Vec<u32>,
+    /// When set (serve tool-mode), a stop token that lands inside an unfinished
+    /// `call:NAME{…}` does not end the turn: the stop is trimmed and generation
+    /// continues into the next block so the tool call can complete.
+    pub continue_incomplete_tool_calls: bool,
     /// E6 empty/degenerate-reply canvas re-roll (with `DGQ_EMPTY_REPLY_RETRY>0`).
     /// Given the first block's committed argmax, returns true when it renders as
     /// an empty user-facing reply (eos-first canvas OR `<|channel>thought`
@@ -77,6 +85,10 @@ impl std::fmt::Debug for StepGenerateConfig {
             .field("sampler", &self.sampler)
             .field("no_early_stop", &self.no_early_stop)
             .field("stop_token_ids", &self.stop_token_ids)
+            .field(
+                "continue_incomplete_tool_calls",
+                &self.continue_incomplete_tool_calls,
+            )
             .field(
                 "degenerate_reply_check",
                 &self.degenerate_reply_check.is_some(),
@@ -104,6 +116,7 @@ impl StepGenerateConfig {
             no_early_stop,
             initial_canvas_ids: None,
             stop_token_ids: Vec::new(),
+            continue_incomplete_tool_calls: false,
             degenerate_reply_check: None,
             step_observer: None,
         }
@@ -131,6 +144,17 @@ enum DenoiseStopReason {
     Confident,
     Plateau,
     MaxSteps,
+}
+
+impl DenoiseStopReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Confident => "confident",
+            Self::Plateau => "plateau",
+            Self::MaxSteps => "max_steps",
+        }
+    }
 }
 
 fn log_denoise_step_progress(
@@ -658,6 +682,10 @@ pub fn generate_with_session(
     let max_steps = cfg.sampler.max_denoising_steps.max(1);
     let mut initial_canvas_ids: Option<Vec<u32>> = None;
     let mut stopped_on_eot = false;
+    let mut stop_token_id: Option<u32> = None;
+    let mut stop_block_idx: Option<usize> = None;
+    let mut stop_offset: Option<usize> = None;
+    let mut block_stats: Vec<crate::generate::BlockDenoiseStats> = Vec::new();
 
     for _block in 0..max_blocks {
         if sequences.len() >= prompt_token_ids.len() + cfg.max_new_tokens {
@@ -706,7 +734,15 @@ pub fn generate_with_session(
             0
         };
         let mut empty_retry_attempt = 0u32;
-        let (st, block_step_count, accept_hist, min_entropy_hist, mean_entropy_hist, low_ent_hist) = 'attempt: loop {
+        let (
+            st,
+            block_step_count,
+            accept_hist,
+            min_entropy_hist,
+            mean_entropy_hist,
+            low_ent_hist,
+            denoise_stop,
+        ) = 'attempt: loop {
             // Shrink-on-retry (E3/E6): attempt 0 uses the full canvas (handles
             // long answers); each degenerate retry narrows it (256→128→64),
             // where the empty/ceremony attractor is far weaker (72%→3% by width).
@@ -725,7 +761,7 @@ pub fn generate_with_session(
             let mut last_st;
             let mut prev_step_argmax: Option<[u32; CANVAS]> = None;
             let prefix_stable_streak = 0u32;
-            loop {
+            let last_denoise_stop = loop {
                 let step_started = Instant::now();
                 rt.run_denoise_step()?;
                 let check_logits = crate::metal::step_kernel::logits_finite_check_enabled();
@@ -895,17 +931,19 @@ pub fn generate_with_session(
                 if let Some(ref observer) = cfg.step_observer {
                     observer(&StepProgressEvent {
                         block_idx,
+                        max_blocks,
                         step_in_block: block_step_count,
                         max_steps,
                         argmax: &st.prev_argmax,
                         accept_count: stats.accept_count,
+                        mean_entropy: st.mean_entropy,
                         block_done: stop_reason != DenoiseStopReason::None,
                     });
                 }
                 if stop_reason != DenoiseStopReason::None {
-                    break;
+                    break stop_reason;
                 }
-            }
+            };
             let st = last_st;
             // Empty/degenerate-reply detection: does the committed argmax render as
             // an empty user-facing reply (eos-first canvas OR `<|channel>thought`
@@ -938,6 +976,7 @@ pub fn generate_with_session(
                 min_entropy_hist,
                 mean_entropy_hist,
                 low_ent_hist,
+                last_denoise_stop,
             );
         };
         let block_elapsed = block_started.elapsed();
@@ -955,6 +994,10 @@ pub fn generate_with_session(
             .get(late..)
             .and_then(|s| s.iter().copied().reduce(u32::max))
             .unwrap_or(0);
+        let late_mean_ent = mean_entropy_hist
+            .get(late..)
+            .and_then(|s| s.iter().copied().reduce(f32::min))
+            .unwrap_or(f32::NAN);
         if progress_enabled() {
             eprintln!(
                 "step-generate: block {} denoise={block_elapsed:.2?} steps_eff={block_step_count} accept/step={accept_hist:?}",
@@ -972,10 +1015,6 @@ pub fn generate_with_session(
                 "step-generate: block {} low_ent(<0.1)/step={low_ent_hist:?}",
                 block_idx
             );
-            let late_mean_ent = mean_entropy_hist
-                .get(late..)
-                .and_then(|s| s.iter().copied().reduce(f32::min))
-                .unwrap_or(f32::NAN);
             eprintln!(
                 "step-generate: block {} late-window (last 8 steps): accept_sum={late_accept} min_ent={late_min_ent:.4} mean_ent={late_mean_ent:.4} max_low_ent={late_low_ent} (early stop: accept plateau>={} or prefix mean_ent<{:.4} + stable argmax)",
                 block_idx,
@@ -1002,26 +1041,86 @@ pub fn generate_with_session(
         sequences.extend_from_slice(&argmax_tokens);
         blocks_committed += 1;
 
+        let mut stats = crate::generate::BlockDenoiseStats {
+            block_idx,
+            max_blocks,
+            steps_eff: block_step_count,
+            denoise_secs: block_elapsed.as_secs_f64(),
+            accept_per_step: accept_hist,
+            min_ent_per_step: min_entropy_hist,
+            mean_ent_per_step: mean_entropy_hist,
+            low_ent_per_step: low_ent_hist,
+            late_accept_sum: late_accept,
+            late_min_ent,
+            late_mean_ent,
+            late_max_low_ent: late_low_ent,
+            denoise_stop: denoise_stop.as_str().to_string(),
+            kept_tokens: committed_canvas,
+            token_ids: Vec::new(),
+            stop_token_id: None,
+            stop_offset: None,
+            continued_past_stop: false,
+        };
+
         // Full-message stop: end the turn as soon as the committed block emits a
         // stop token (e.g. <turn|> or <eos>). Trim it and everything after so the
-        // reply is exactly the model's turn, and skip the KV extend.
+        // reply is exactly the model's turn, and skip the KV extend — unless
+        // `continue_incomplete_tool_calls` and the reply still has an open
+        // `call:NAME{…}`, in which case trim the stop and keep generating.
+        let mut end_turn = false;
         if !cfg.stop_token_ids.is_empty() {
             if let Some(rel) = argmax_tokens
                 .iter()
                 .position(|id| cfg.stop_token_ids.contains(id))
             {
                 sequences.truncate(block_base + rel);
-                stopped_on_eot = true;
-                if progress_enabled() {
+                stats.kept_tokens = rel;
+                stats.stop_token_id = Some(argmax_tokens[rel]);
+                stats.stop_offset = Some(rel);
+
+                let defer_stop = cfg.continue_incomplete_tool_calls && {
+                    if session.step_text_tokenizer.is_none() {
+                        let tok_path = session.model_dir.join("tokenizer.json");
+                        if let Ok(tok) = Tokenizer::load(&tok_path) {
+                            session.step_text_tokenizer = Some(tok);
+                        }
+                    }
+                    let reply = &sequences[prompt_token_ids.len()..];
+                    let cleaned = crate::sample::strip_degenerate_token_ids(reply);
+                    session.step_text_tokenizer.as_ref().is_some_and(|tok| {
+                        crate::tools::has_incomplete_tool_call(&tok.decode(&cleaned))
+                    })
+                };
+
+                if defer_stop {
+                    stats.continued_past_stop = true;
                     eprintln!(
-                        "step-generate: block {block_idx} hit stop token {} at offset {rel}; ending turn ({} new tokens)",
+                        "serve: incomplete tool call after stop token {}; continuing to next block",
                         argmax_tokens[rel],
-                        sequences.len() - prompt_token_ids.len()
                     );
+                } else {
+                    stopped_on_eot = true;
+                    stop_token_id = Some(argmax_tokens[rel]);
+                    stop_block_idx = Some(block_idx);
+                    stop_offset = Some(rel);
+                    end_turn = true;
+                    if progress_enabled() {
+                        eprintln!(
+                            "step-generate: block {block_idx} hit stop token {} at offset {rel}; ending turn ({} new tokens)",
+                            argmax_tokens[rel],
+                            sequences.len() - prompt_token_ids.len()
+                        );
+                    }
                 }
-                break;
             }
         }
+        let kept = stats.kept_tokens;
+        stats.token_ids = argmax_tokens[..kept].to_vec();
+        block_stats.push(stats);
+        if end_turn {
+            break;
+        }
+        let extend_tokens = &argmax_tokens[..kept];
 
         // Whitespace-collapse STOPGAP (opt-in, see flags::ws_block_stop_enabled:
         // the attractor is being treated as an unfixed bug and a default-on
@@ -1029,7 +1128,7 @@ pub fn generate_with_session(
         // pure whitespace / all pad-filler ends the turn instead of crawling
         // toward the context wall at max_steps per block.
         if crate::flags::ws_block_stop_enabled() {
-            let cleaned = crate::sample::strip_degenerate_token_ids(&argmax_tokens);
+            let cleaned = crate::sample::strip_degenerate_token_ids(extend_tokens);
             let all_ws = cleaned.is_empty()
                 || session
                     .step_text_tokenizer
@@ -1047,7 +1146,7 @@ pub fn generate_with_session(
             }
         }
 
-        if !is_last_block {
+        if !is_last_block && kept > 0 {
             let extend_started = Instant::now();
             let kv_before = rt.read_params().kv_len as usize;
             let new_kv_len = if crate::flags::fast_block_extend_enabled() {
@@ -1056,7 +1155,7 @@ pub fn generate_with_session(
                 // engine extend costs ~10s per 256-token block (the dominant
                 // cost of multi-block replies); this is one prefill-chunk
                 // forward (~0.85s).
-                rt.prefill_chunks_from(kv_before, &argmax_tokens)?
+                rt.prefill_chunks_from(kv_before, extend_tokens)?
             } else {
                 if session.encoder.is_none() {
                     session.encoder = Some(MonolithicEncoderCache::open_opt(
@@ -1072,7 +1171,7 @@ pub fn generate_with_session(
                     rt.kvcache(),
                     rt.layout(),
                     kv_before,
-                    &argmax_tokens,
+                    extend_tokens,
                     cfg.max_seq,
                     layers,
                 )?
@@ -1083,7 +1182,7 @@ pub fn generate_with_session(
             if progress_enabled() {
                 eprintln!(
                     "step-generate: extended kv {kv_before} -> {new_kv_len} (+{} tokens) ({block_extend:.2?})",
-                    argmax_tokens.len()
+                    extend_tokens.len()
                 );
             }
         }
@@ -1112,6 +1211,10 @@ pub fn generate_with_session(
         denoise_steps_run,
         blocks_committed,
         stopped_on_eot,
+        stop_token_id,
+        stop_block_idx,
+        stop_offset,
+        block_stats,
         block_steps_eff,
         last_block_accept_hist,
         last_block_min_entropy_hist,

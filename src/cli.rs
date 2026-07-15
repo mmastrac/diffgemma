@@ -10,6 +10,14 @@ fn layers_for_parity_dump(parity_layers: Option<usize>) -> usize {
     parity_layers.unwrap_or(30).max(1).min(30)
 }
 
+fn parse_cli_bool(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Cli {
     pub(crate) model_dir: PathBuf,
@@ -289,6 +297,11 @@ pub(crate) enum Command {
         ctx: usize,
         /// Tool-output compaction (KV rewinder). Also `DGQ_TOOL_COMPACT=1`.
         tool_compact: bool,
+        /// Directory for per-turn JSONL debug logs (`--log-dir`).
+        log_dir: Option<PathBuf>,
+        /// Default thought-channel enablement when the request does not set
+        /// `enable_thinking` or a `model:think…` suffix. CLI `--think` / `--think=false`.
+        think: bool,
     },
     Smoketest {
         prompts_path: Option<PathBuf>,
@@ -325,6 +338,8 @@ pub(crate) fn parse_cli() -> Cli {
     let mut chat_ctx: Option<usize> = None;
     let mut serve_addr: String = "127.0.0.1:8080".to_string();
     let mut serve_tool_compact = false;
+    let mut serve_log_dir: Option<PathBuf> = None;
+    let mut serve_think: Option<bool> = None;
     let mut steps_override: Option<usize> = None;
     let mut prompt_len = 8usize;
     let mut max_new_tokens = 256usize;
@@ -452,6 +467,19 @@ pub(crate) fn parse_cli() -> Cli {
                 }
             }
             "--tool-compact" => serve_tool_compact = true,
+            "--think" => serve_think = Some(true),
+            s if s.starts_with("--think=") => {
+                let v = &s["--think=".len()..];
+                serve_think = Some(parse_cli_bool(v).unwrap_or_else(|| {
+                    eprintln!("invalid --think={v} (expected true/false)");
+                    true
+                }));
+            }
+            "--log-dir" => {
+                if let Some(v) = args.next() {
+                    serve_log_dir = Some(PathBuf::from(v));
+                }
+            }
             "--assert" => kernel_assert = true,
             "--debug-deep" => kernel_debug_deep = true,
             "--gpu-kv" => step_gpu_kv = true,
@@ -734,6 +762,8 @@ pub(crate) fn parse_cli() -> Cli {
             max_layers: parity_layers,
             ctx: chat_ctx.unwrap_or(8192),
             tool_compact: serve_tool_compact,
+            log_dir: serve_log_dir.clone(),
+            think: serve_think.unwrap_or(true),
         },
         Some("smoketest") => Command::Smoketest {
             prompts_path: positional.get(1).map(PathBuf::from),

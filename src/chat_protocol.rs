@@ -256,10 +256,12 @@ mod tests {
     fn step<'a>(block: usize, step: u32, argmax: &'a [u32], done: bool) -> StepProgressEvent<'a> {
         StepProgressEvent {
             block_idx: block,
+            max_blocks: 4,
             step_in_block: step,
             max_steps: 48,
             argmax,
             accept_count: 0,
+            mean_entropy: 0.0,
             block_done: done,
         }
     }
