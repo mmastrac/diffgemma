@@ -5489,7 +5489,8 @@ impl StepRuntime {
         use step_schedule::StepStage;
         use step_schedule::StepStage::*;
         let groups: &[(&str, &[StepStage])] = &[
-            ("attention", &[LayerQkRopeKv, LayerAttention]),
+            ("qk_rope_kv", &[LayerQkRopeKv]),
+            ("attn_only", &[LayerAttention]),
             ("qkv_proj+inorm", &[LayerInputNormQkv]),
             ("o_proj", &[LayerOProjPostAttn]),
             ("router", &[LayerRouter]),
