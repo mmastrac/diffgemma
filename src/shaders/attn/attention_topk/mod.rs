@@ -296,6 +296,33 @@ mod tests {
             );
         }
     }
+
+    /// Per-kernel breakdown at the PRODUCTION prefill super-chunk shape
+    /// (M=1024, n_q_heads=16, nkv=2, hd=512) — matches `bench-prefill-super`.
+    /// Used to verify QK is at the half-MMA compute wall (not a kernel bug).
+    /// Run: `cargo test --release topk_bench_prod -- --ignored --nocapture`
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn topk_bench_prod() {
+        let iters = 5usize;
+        println!("PROD shape (M=1024, n_q_heads=16, nkv=2, hd=512)");
+        println!("  kv    e17_dense   topk       ratio   | qk     sm     pv");
+        for kv_len in [15000u32, 30000, 60000] {
+            let f = crate::shaders::attention_gemm::model_full_fixture_prod(kv_len);
+            let e17 = crate::shaders::attention_gemm::bench_gpu(&f, iters, 4).unwrap();
+            let topk = bench_gpu(&f, iters, 4, K_PAD).unwrap();
+            let (qk_t, sm_t, pv_t) = bench_stages(&f, iters, 4, K_PAD).unwrap();
+            // Per-head QK FLOPs = 2 * M * t_total * hd. n_q_heads independent QK GEMMs.
+            let t_total = kv_len as usize + 1024;
+            let qk_flops = 2.0 * 1024.0 * t_total as f64 * 512.0 * 16.0;
+            let qk_tf_s = qk_flops / (qk_t * 1e-3) / 1e12;
+            println!(
+                "{kv_len:>6}  {e17:9.3}  {topk:9.3}  {ratio:.2}x   | {qk_t:6.2} {sm_t:6.2} {pv_t:6.2}  (qk={qk_tf_s:.2} TF/s)",
+                ratio = e17 / topk
+            );
+        }
+    }
 }
 
 /// Bench the 3-kernel top-k sequence over all heads (one full-attention layer,

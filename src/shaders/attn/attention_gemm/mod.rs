@@ -415,6 +415,42 @@ pub fn cpu_causal(f: &crate::shaders::attention::Fixture, round_kv_f16: bool) ->
 pub fn model_full_fixture(kv_len: u32) -> crate::shaders::attention::Fixture {
     use crate::shaders::cpu::attention::LayerAttnParams;
     let (canvas, n_q_heads, nkv, hd) = (256usize, 16usize, 2usize, 512usize);
+    model_full_fixture_with(kv_len, canvas, n_q_heads, nkv, hd, LayerAttnParams {
+        head_dim: hd as u32,
+        n_kv_heads: nkv as u32,
+        is_full: true,
+        v_proj: 0,
+        kv_region: 0,
+        q_norm_off: 0,
+        k_norm_off: 0,
+    })
+}
+
+/// Same as `model_full_fixture` but with the production prefill super-chunk
+/// canvas (M=1024 = 4 sub-chunks). Matches the shape `bench-prefill-super`
+/// routes through `encode_attn_topk` in production.
+pub fn model_full_fixture_prod(kv_len: u32) -> crate::shaders::attention::Fixture {
+    use crate::shaders::cpu::attention::LayerAttnParams;
+    let (canvas, n_q_heads, nkv, hd) = (1024usize, 16usize, 2usize, 512usize);
+    model_full_fixture_with(kv_len, canvas, n_q_heads, nkv, hd, LayerAttnParams {
+        head_dim: hd as u32,
+        n_kv_heads: nkv as u32,
+        is_full: true,
+        v_proj: 0,
+        kv_region: 0,
+        q_norm_off: 0,
+        k_norm_off: 0,
+    })
+}
+
+fn model_full_fixture_with(
+    kv_len: u32,
+    canvas: usize,
+    n_q_heads: usize,
+    nkv: usize,
+    hd: usize,
+    layer: crate::shaders::cpu::attention::LayerAttnParams,
+) -> crate::shaders::attention::Fixture {
     let t_total = kv_len as usize + canvas;
     let mut kvcache = vec![0.0f32; t_total * nkv * hd * 2];
     for (i, x) in kvcache.iter_mut().enumerate() {
@@ -425,15 +461,7 @@ pub fn model_full_fixture(kv_len: u32) -> crate::shaders::attention::Fixture {
             .map(|i| (i as f32 * 0.013).sin() * 0.4)
             .collect(),
         kvcache,
-        layer: LayerAttnParams {
-            head_dim: hd as u32,
-            n_kv_heads: nkv as u32,
-            is_full: true,
-            v_proj: 0,
-            kv_region: 0,
-            q_norm_off: 0,
-            k_norm_off: 0,
-        },
+        layer,
         canvas,
         n_q_heads,
         kv_len,
