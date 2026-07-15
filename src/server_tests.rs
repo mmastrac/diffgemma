@@ -111,3 +111,32 @@ fn draft_of(deltas: &[WireDelta]) -> Option<String> {
         _ => None,
     })
 }
+
+    #[test]
+    fn tool_markup_strip_truncates_content_at_opener() {
+        use std::sync::atomic::AtomicBool;
+        let suppress = AtomicBool::new(false);
+        let out = filter_tool_markup_delta(
+            WireDelta::Content("I'll check.<|tool_call>call:x{}<tool_call|>".into()),
+            true,
+            &suppress,
+        );
+        assert_eq!(out, Some(WireDelta::Content("I'll check.".into())));
+        assert!(suppress.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(
+            filter_tool_markup_delta(WireDelta::Content("trailing".into()), true, &suppress),
+            None
+        );
+    }
+
+    #[test]
+    fn tool_markup_strip_noop_when_disabled() {
+        use std::sync::atomic::AtomicBool;
+        let suppress = AtomicBool::new(false);
+        let raw = WireDelta::Content("<|tool_call>call:x{}<tool_call|>".into());
+        assert_eq!(
+            filter_tool_markup_delta(raw.clone(), false, &suppress),
+            Some(raw)
+        );
+        assert!(!suppress.load(std::sync::atomic::Ordering::Relaxed));
+    }

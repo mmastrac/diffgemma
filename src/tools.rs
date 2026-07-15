@@ -401,13 +401,19 @@ pub fn content_before_tool_calls(text: &str) -> String {
     }
 }
 
-/// Parsed calls → OpenAI `tool_calls` array (`arguments` serialized as a string).
+/// Parsed calls -> OpenAI `tool_calls` array (`arguments` serialized as a string).
+///
+/// Includes `index` on every entry so the same array is valid for both
+/// `message.tool_calls` and streaming `delta.tool_calls`. OpenCode's chat
+/// protocol keys stream deltas by `index`; omitting it leaves `undefined` and
+/// breaks tool-call assembly.
 pub fn to_openai_tool_calls(calls: &[ParsedToolCall]) -> Vec<Value> {
     calls
         .iter()
         .enumerate()
         .map(|(i, c)| {
             serde_json::json!({
+                "index": i,
                 "id": format!("call_{i}"),
                 "type": "function",
                 "function": {"name": c.name, "arguments": c.arguments.to_string()},
@@ -667,6 +673,23 @@ mod tests {
             calls[0].arguments,
             json!({"query":"rust","count":5,"safe":true})
         );
+    }
+
+    #[test]
+    fn openai_tool_calls_include_stream_index() {
+        let calls = parse_tool_calls(
+            "<|tool_call>call:list_dir{path:<|\"|>/tmp<|\"|>}<tool_call>call:list_dir{path:<|\"|>/home<|\"|>}<tool_call|>",
+        );
+        let out = to_openai_tool_calls(&calls);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["index"], 0);
+        assert_eq!(out[0]["id"], "call_0");
+        assert_eq!(out[0]["type"], "function");
+        assert_eq!(out[0]["function"]["name"], "list_dir");
+        assert_eq!(out[0]["function"]["arguments"], "{\"path\":\"/tmp\"}");
+        assert_eq!(out[1]["index"], 1);
+        assert_eq!(out[1]["id"], "call_1");
+        assert_eq!(out[1]["function"]["arguments"], "{\"path\":\"/home\"}");
     }
 
     #[test]

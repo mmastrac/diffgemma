@@ -95,7 +95,7 @@ impl Worker {
 
         let mut cfg = self.per_request_cfg(&job, budget);
         let mapper = self.make_mapper(&job);
-        attach_stream_observer(&mut cfg, &mapper, &job.resp);
+        attach_stream_observer(&mut cfg, &mapper, &job.resp, tool_mode);
 
         // Route this prompt to its conversation (longest-prefix match), loading
         // that conversation's KV into the hot buffer. `generate_with_session`
@@ -361,7 +361,7 @@ impl Worker {
             // generation, and a prior round's stop token must not eat this
             // round's text.
             let mapper = self.make_mapper(&job);
-            attach_stream_observer(&mut cfg, &mapper, &job.resp);
+            attach_stream_observer(&mut cfg, &mapper, &job.resp, true);
 
             let out = crate::metal::generate_with_session(
                 manager.session_mut(),

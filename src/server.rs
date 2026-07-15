@@ -478,19 +478,74 @@ mod worker;
 
 type ServeMapper = Arc<Mutex<DiffusionStreamMapper<Arc<crate::tokenizer::Tokenizer>>>>;
 
+/// When `strip_tool_markup` is set, hide `<|tool_call>...` grammar from
+/// streamed content/draft; clients get structured `delta.tool_calls` at Done.
 fn attach_stream_observer(
     cfg: &mut crate::metal::StepGenerateConfig,
     mapper: &ServeMapper,
     resp: &mpsc::Sender<ServerEvent>,
+    strip_tool_markup: bool,
 ) {
     let mapper = Arc::clone(mapper);
     let resp = resp.clone();
+    let suppress = std::sync::atomic::AtomicBool::new(false);
     cfg.step_observer = Some(Arc::new(move |ev: &crate::metal::StepProgressEvent<'_>| {
         let deltas = mapper.lock().unwrap().on_step(ev);
         for d in deltas {
+            let Some(d) = filter_tool_markup_delta(d, strip_tool_markup, &suppress) else {
+                continue;
+            };
             let _ = resp.send(ServerEvent::Delta(d));
         }
     }));
+}
+
+/// Truncate / suppress wire deltas that would leak native tool-call markup into
+/// OpenAI `content`. Returns `None` when the delta should not be sent.
+fn filter_tool_markup_delta(
+    d: WireDelta,
+    strip: bool,
+    suppress: &std::sync::atomic::AtomicBool,
+) -> Option<WireDelta> {
+    use std::sync::atomic::Ordering;
+    if !strip {
+        return Some(d);
+    }
+    match d {
+        WireDelta::Content(s) => {
+            if suppress.load(Ordering::Relaxed) {
+                return None;
+            }
+            match s.find("<|tool_call>") {
+                Some(i) => {
+                    suppress.store(true, Ordering::Relaxed);
+                    let keep = s[..i].trim_end().to_string();
+                    (!keep.is_empty()).then_some(WireDelta::Content(keep))
+                }
+                None => Some(WireDelta::Content(s)),
+            }
+        }
+        WireDelta::Draft {
+            mut text,
+            committed,
+            block,
+            step,
+        } => {
+            if let Some(i) = text.find("<|tool_call>") {
+                text.truncate(i);
+                while text.ends_with(char::is_whitespace) {
+                    text.pop();
+                }
+            }
+            Some(WireDelta::Draft {
+                text,
+                committed,
+                block,
+                step,
+            })
+        }
+        other => Some(other),
+    }
 }
 
 /// One checkpoint-bracketed summarize generation: render `messages_ctx`
