@@ -138,8 +138,9 @@ pub struct PerfFlags {
     /// PREFILL (hd=256, window=1024). Online softmax, register-resident O split
     /// across 8 simdgroups, no per-chunk PV tgmem round-trip. Full hd=512 path
     /// was 3× slower than E17 (disproven); at sliding shape flash is 2.4× faster
-    /// than attention_mma2. Default OFF (opt-in, quality gate). `bq`/`bk` =
-    /// query-row tile / key-block streamed.
+    /// than attention_mma2. Default ON (quality: smoketest 17/17 ×{7,42,123},
+    /// longctx 4/4). `DGQ_FLASH_PREFILL=0` restores mma2. `bq`/`bk` = query-row
+    /// tile / key-block streamed.
     pub flash_prefill: bool,
     /// `DGQ_ATTN_MMA_FULL_QK_ILP2` (E5 ILP2): split the 32-deep serial QK dot
     /// in `attention_mma_full` into two interleaved 16-deep accumulator chains
@@ -186,7 +187,7 @@ impl Default for PerfFlags {
             gemm_tune_bm: 64,
             gemm_tune_bn: 64,
             moe_sparse_bn: 128,
-            flash_prefill: false,
+            flash_prefill: true,
             flash_prefill_bq: 16,
             flash_prefill_bk: 64,
             attn_mma_full_qk_ilp2: false,
@@ -433,7 +434,7 @@ impl RuntimeConfig {
                 gemm_tune_bm: parse_usize("DGQ_GEMM_TUNE_BM", 64).max(16),
                 gemm_tune_bn: parse_usize("DGQ_GEMM_TUNE_BN", 64).max(16),
                 moe_sparse_bn: parse_usize("DGQ_MOE_SPARSE_BN", 128).max(16),
-                flash_prefill: env_on_if_one("DGQ_FLASH_PREFILL"),
+                flash_prefill: env_on_unless_zero("DGQ_FLASH_PREFILL"),
                 flash_prefill_bq: parse_usize("DGQ_FLASH_PREFILL_BQ", 16).max(8),
                 flash_prefill_bk: parse_usize("DGQ_FLASH_PREFILL_BK", 64).max(16),
                 attn_mma_full_qk_ilp2: env_on_if_one("DGQ_ATTN_MMA_FULL_QK_ILP2"),
