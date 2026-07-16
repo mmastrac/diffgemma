@@ -1,20 +1,30 @@
 // E20: top-k sparse attention for full-layer PREFILL (sibling of E17).
 //
-// Reuses E17's `attn_gemm_qk` verbatim (the S plane is identical:
-//   S[HC][canvas][n_pad] f32, causal-masked positions left as whatever QK
-//   wrote). Then replaces softmax+PV with:
-//   2. attn_topk_softmax  — per (row, head): find the top-k highest-scoring
-//      keys via 32-iteration binary-search-on-float-bits, emit (score, idx)
-//      pairs where score >= threshold, softmax over the emitted set.
+// Uses E17's `attn_gemm_qk` compiled with FC32 (EMIT_PAT16): alongside the S
+// plane (S[HC][canvas][n_pad] f32) it emits a u16 PATTERN plane — the top 16
+// bits of each score's float-bit-monotonic key. The selection passes compare
+// ONLY those 16 bits, so they read the u16 plane (half the bytes of S; the
+// stage is DRAM-bound) and touch f32 S only for the <=k winners:
+//   2. attn_topk_softmax  — per (row, head): 4-level radix histogram finds the
+//      k-th-largest FULL 32-bit key (levels 1-2 on the u16 plane; levels 3-4
+//      refine among u16-ties, reading f32 S only for those candidates — so
+//      selection is EXACT top-k by f32 score); a count + exclusive prefix-sum
+//      pass then emits EXACTLY k (score, idx) pairs in fixed thread-major
+//      order (residual ties = bit-identical scores, broken by thread-major
+//      rank — DETERMINISTIC, no atomic compaction; the cd66294 shape).
+//      Softmax over the emitted set.
 //      Output: P[HC][canvas][K_PAD] (f32), Idx[HC][canvas][K_PAD] (u32),
 //      lrow[HC][canvas] (f32).
 //   3. attn_topk_pv       — O[i,d] = sum_{j=0..K_PAD} P[i,j] * V[idx[i,j], d] / L_i.
 //      Gathered-V: each query row has its own key indices, so V is gathered
 //      per-row. Prototype uses a scalar per-row accumulator (lane owns 2
 //      d-cols, loops over K_PAD keys) — correct, issue-bound (matches the
-//      attention_mma shape that pinned E17's motivation).
+//      attention_mma shape that pinned E17's motivation). Sums P in list
+//      order — deterministic because the list is.
 //
 // NOT bit-identical to dense attention (only top-k keys are kept). Quality-gated.
+// Selection = exact top-k by f32 score; only bit-identical scores are
+// interchangeable to the selector (tie-break = thread-major rank, fixed).
 // Causal mask: invalid keys (t > kv_len + row, or t >= t_total) are treated as
 // -inf and never selected. The QK kernel leaves those S entries as whatever
 // the partial GEMM produced (pad cols past T are never written; causal-past
@@ -111,6 +121,7 @@ kernel void attn_topk_softmax(
     device float  *lrow      [[buffer(3)]],  // [HC][m] f32 row denoms
     constant AttnGemmDims &d [[buffer(4)]],
     constant uint &k_param   [[buffer(5)]],  // k (max keys to keep)
+    device const ushort *pat [[buffer(6)]],  // u16 key plane [HC][m][n_pad]
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 lid  [[thread_position_in_threadgroup]]
 ) {
@@ -127,6 +138,7 @@ kernel void attn_topk_softmax(
     const uint qpos = kv_len + row;
 
     s   += (ulong)qh_local * d.s_head_stride + (ulong)row * n_pad;
+    pat += (ulong)qh_local * d.s_head_stride + (ulong)row * n_pad;
     p   += (ulong)qh_local * d.m * K_PAD + (ulong)row * K_PAD;
     idx += (ulong)qh_local * d.m * K_PAD + (ulong)row * K_PAD;
     lrow += (ulong)qh_local * d.m + row;
@@ -160,8 +172,7 @@ kernel void attn_topk_softmax(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint t = tid; t < t_total; t += SM_TPG) {
         if (!causal || t <= qpos) {
-            uint pat = topk_float_to_key(s[t]);
-            uint bin = pat >> 24u;  // top 8 bits
+            uint bin = uint(pat[t]) >> 8u;  // top 8 bits of the u16 key
             atomic_fetch_add_explicit(&hist[bin], 1u, memory_order_relaxed);
         }
     }
@@ -211,11 +222,10 @@ kernel void attn_topk_softmax(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint t = tid; t < t_total; t += SM_TPG) {
         if (!causal || t <= qpos) {
-            uint pat = topk_float_to_key(s[t]);
-            uint b1 = pat >> 24u;
-            if (b1 == bin1) {
-                uint b2 = (pat >> 16u) & 0xFFu;
-                atomic_fetch_add_explicit(&hist[b2], 1u, memory_order_relaxed);
+            uint p16 = uint(pat[t]);
+            if ((p16 >> 8u) == bin1) {
+                atomic_fetch_add_explicit(&hist[p16 & 0xFFu], 1u,
+                                          memory_order_relaxed);
             }
         }
     }
@@ -238,33 +248,172 @@ kernel void attn_topk_softmax(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint bin2 = bin2_share;
-    // The threshold pattern is: top-16-bits = (bin1 << 8) | bin2, lower bits = 0.
-    // Emit keys with pattern >= this threshold. Keys with top-byte > bin1 are
-    // always emitted; keys with top-byte == bin1 and second-byte > bin2 are
-    // emitted; keys with top-byte == bin1 and second-byte == bin2 may or may
-    // not be emitted (ties) — we emit all and cap at K_PAD.
+    // The u16-level threshold is (bin1 << 8) | bin2. The tie bucket at this
+    // level spans 2^16 float patterns and typically holds MANY keys (scores
+    // share an exponent), so selecting among u16-ties arbitrarily would miss
+    // the true top keys (k=1 must pick the argmax). Refine to full f32-key
+    // precision with two more radix levels over the tie candidates only —
+    // f32 S is read ONLY where the u16 key equals the threshold.
     const uint thresh_top16 = (bin1 << 8u) | bin2;
 
-    // ---- Pass 3: emit (score, index) where pattern >= threshold. ----
-    threadgroup atomic_uint emit_cnt;
-    if (tid == 0u) atomic_store_explicit(&emit_cnt, 0u, memory_order_relaxed);
+    // ---- Pass 2b: bits 15-8 of the full key, among u16-level ties. ----
+    threadgroup atomic_uint above16_share;
+    if (tid == 0u) atomic_store_explicit(&above16_share, 0u, memory_order_relaxed);
+    for (uint b = tid; b < 256u; b += SM_TPG) {
+        atomic_store_explicit(&hist[b], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint above16_local = 0u;
+    for (uint t = tid; t < t_total; t += SM_TPG) {
+        if (!causal || t <= qpos) {
+            uint p16 = uint(pat[t]);
+            if (p16 > thresh_top16) {
+                above16_local++;
+            } else if (p16 == thresh_top16) {
+                uint full = topk_float_to_key(s[t]);
+                atomic_fetch_add_explicit(&hist[(full >> 8u) & 0xFFu], 1u,
+                                          memory_order_relaxed);
+            }
+        }
+    }
+    atomic_fetch_add_explicit(&above16_share, above16_local, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint above16 = atomic_load_explicit(&above16_share, memory_order_relaxed);
+    const uint need_low = k - min(above16, k);   // to take among u16-ties
+    threadgroup uint bin3_share;
+    threadgroup uint need2c_share;
+    if (tid == 0u) {
+        uint c = 0u;
+        uint found = 0u;
+        for (int b = 255; b >= 0; --b) {
+            uint cnt = atomic_load_explicit(&hist[b], memory_order_relaxed);
+            if (c + cnt >= need_low) {
+                found = uint(b);
+                break;
+            }
+            c += cnt;
+        }
+        bin3_share = found;
+        need2c_share = need_low - c;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint bin3 = bin3_share;
+    const uint need_2c = need2c_share;
+
+    // ---- Pass 2c: bits 7-0, among ties that also match bin3. ----
+    for (uint b = tid; b < 256u; b += SM_TPG) {
+        atomic_store_explicit(&hist[b], 0u, memory_order_relaxed);
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint t = tid; t < t_total; t += SM_TPG) {
         if (!causal || t <= qpos) {
-            uint pat = topk_float_to_key(s[t]);
-            uint top16 = pat >> 16u;
-            if (top16 >= thresh_top16) {
-                uint slot = atomic_fetch_add_explicit(&emit_cnt, 1u, memory_order_relaxed);
-                if (slot < K_PAD) {
-                    p[slot] = s[t];
-                    idx[slot] = t;
+            if (uint(pat[t]) == thresh_top16) {
+                uint full = topk_float_to_key(s[t]);
+                if (((full >> 8u) & 0xFFu) == bin3) {
+                    atomic_fetch_add_explicit(&hist[full & 0xFFu], 1u,
+                                              memory_order_relaxed);
                 }
             }
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    uint k_emit = atomic_load_explicit(&emit_cnt, memory_order_relaxed);
-    if (k_emit > K_PAD) k_emit = K_PAD;
+    threadgroup uint bin4_share;
+    if (tid == 0u) {
+        uint c = 0u;
+        uint found = 0u;
+        for (int b = 255; b >= 0; --b) {
+            uint cnt = atomic_load_explicit(&hist[b], memory_order_relaxed);
+            if (c + cnt >= need_2c) {
+                found = uint(b);
+                break;
+            }
+            c += cnt;
+        }
+        bin4_share = found;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Full 32-bit threshold: selection is now exact top-k by the f32 key;
+    // ties below need exact bit-equality of scores (identical f32 values).
+    const uint thresh32 = (thresh_top16 << 16u) | (bin3 << 8u) | bin4_share;
+
+    // ---- Pass 3a: per-thread above/tie counts + exclusive prefix-sums. ----
+    // DETERMINISTIC emission (the cd66294 shape: count -> prefix-sum ->
+    // thread-major emit) replacing the old atomic-slot append, whose ORDER was
+    // race-determined and — because ties at the u16 threshold overflow K_PAD on
+    // the normal path — whose surviving SET was race-determined too. Ties are
+    // now resolved by fixed thread-major rank (t % SM_TPG, then t), so the set
+    // and the order are pure functions of the scores. attn_topk_pv sums P in
+    // list order; a fixed list makes the whole path run-to-run reproducible.
+    uint cnt_above = 0u;
+    uint cnt_tie = 0u;
+    for (uint t = tid; t < t_total; t += SM_TPG) {
+        if (!causal || t <= qpos) {
+            uint p16 = uint(pat[t]);
+            if (p16 > thresh_top16) {
+                cnt_above++;               // top16 greater => full key greater
+            } else if (p16 == thresh_top16) {
+                uint full = topk_float_to_key(s[t]);
+                if (full > thresh32) {
+                    cnt_above++;
+                } else if (full == thresh32) {
+                    cnt_tie++;
+                }
+            }
+        }
+    }
+    threadgroup uint scan_a[SM_TPG];
+    threadgroup uint scan_t[SM_TPG];
+    scan_a[tid] = cnt_above;
+    scan_t[tid] = cnt_tie;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint off = 1u; off < SM_TPG; off <<= 1u) {
+        uint va = 0u, vt = 0u;
+        if (tid >= off) {
+            va = scan_a[tid - off];
+            vt = scan_t[tid - off];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        scan_a[tid] += va;
+        scan_t[tid] += vt;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const uint above_base = scan_a[tid] - cnt_above;   // exclusive
+    const uint tie_base = scan_t[tid] - cnt_tie;
+    const uint above_total = scan_a[SM_TPG - 1u];
+    // Threshold construction guarantees above_total < k <= above_total + ties;
+    // the min() is belt-and-braces against a degenerate histogram.
+    const uint need_ties = k - min(above_total, k);
+
+    // ---- Pass 3b: emit. Above keys fill [0, above_total) in thread-major
+    // order; the first `need_ties` ties (thread-major rank) fill the rest.
+    // k_emit == k exactly (k <= K_PAD via the host clamp + n_valid min).
+    for (uint t = tid, wa = 0u, wt = 0u; t < t_total; t += SM_TPG) {
+        if (!causal || t <= qpos) {
+            uint p16 = uint(pat[t]);
+            if (p16 < thresh_top16) {
+                continue;
+            }
+            uint full = (p16 > thresh_top16) ? ~0u : topk_float_to_key(s[t]);
+            if (p16 > thresh_top16 || full > thresh32) {
+                uint slot = above_base + wa;
+                p[slot] = s[t];
+                idx[slot] = t;
+                wa++;
+            } else if (full == thresh32) {
+                uint r = tie_base + wt;
+                if (r < need_ties) {
+                    uint slot = above_total + r;
+                    p[slot] = s[t];
+                    idx[slot] = t;
+                }
+                wt++;
+            }
+        }
+    }
+    // P/Idx are device buffers cross-read by other threads in the softmax
+    // phase below — fence device memory, not just tgmem.
+    threadgroup_barrier(mem_flags::mem_device);
+    const uint k_emit = above_total + need_ties;
     if (k_emit == 0u) {
         if (tid == 0u) lrow[0] = 0.f;
         for (uint j = tid; j < K_PAD; j += SM_TPG) { p[j] = 0.f; idx[j] = 0u; }

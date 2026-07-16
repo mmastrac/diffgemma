@@ -67,6 +67,24 @@ constant bool KV_F32_SIDE_FC [[function_constant(30)]];
 constant bool KV_F32_SIDE =
     is_function_constant_defined(KV_F32_SIDE_FC) && KV_F32_SIDE_FC;
 
+// E20 u16 pattern plane (FC32): alongside S, emit the top 16 bits of each
+// score's float-bit-monotonic key to a u16 plane (same [HC][m][n_pad] geometry,
+// half the bytes). attn_topk_softmax's selection passes compare ONLY these 16
+// bits, so reading the u16 plane instead of re-deriving keys from f32 S halves
+// selection bandwidth (sm is DRAM-bound at ~80% of the wall) with bit-identical
+// selection semantics. QK is compute-bound (~10% of bandwidth) — the extra
+// write is free. Only the top-k pipeline set compiles with FC32.
+constant bool EMIT_PAT16_FC [[function_constant(32)]];
+constant bool EMIT_PAT16 =
+    is_function_constant_defined(EMIT_PAT16_FC) && EMIT_PAT16_FC;
+
+// Monotonic float key (larger uint = larger float); must match
+// topk_float_to_key in attention_topk.metal.
+inline uint attn_pat_key(float f) {
+    uint u = as_type<uint>(f);
+    return (u & 0x80000000u) ? (~u) : (u ^ 0x80000000u);
+}
+
 // Passed from the host per (layer, sub-chunk) dispatch. The Q head is the grid
 // z index (tgid.z); this struct carries shapes, row strides, the per-head base
 // strides, and the softmax mask parameters. All 16 Q heads run in one dispatch
@@ -98,6 +116,7 @@ kernel void attn_gemm_qk(
     device float *s [[buffer(2)]],            // [n_q_heads][m][s_row_stride] f32
     constant AttnGemmDims &d [[buffer(3)]],
     device const float *kv_f32_side [[buffer(9), function_constant(KV_F32_SIDE_FC)]],
+    device ushort *pat16 [[buffer(8), function_constant(EMIT_PAT16_FC)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 lid [[thread_position_in_threadgroup]],
     uint sgid [[simdgroup_index_in_threadgroup]],
@@ -115,6 +134,9 @@ kernel void attn_gemm_qk(
     const uint kvh = qh / d.group;
     q += (ulong)qh * d.hd;                    // this head's Q base
     s += (ulong)tgid.z * d.s_head_stride;     // this batch-local S slice
+    if (EMIT_PAT16) {
+        pat16 += (ulong)tgid.z * d.s_head_stride;  // same slice geometry as S
+    }
     device const half *kb = kcache + (ulong)kvh * d.hd;         // f16 K base
     device const float *kbf =
         KV_F32_SIDE ? (kv_f32_side + (ulong)kvh * d.hd) : (device const float *)nullptr;
@@ -217,9 +239,17 @@ kernel void attn_gemm_qk(
                 reinterpret_cast<thread float2 &>(C[i][j].thread_elements());
             if (col < N) {
                 s[(ulong)row * d.s_row_stride + col] = ec[0];
+                if (EMIT_PAT16) {
+                    pat16[(ulong)row * d.s_row_stride + col] =
+                        ushort(attn_pat_key(ec[0]) >> 16u);
+                }
             }
             if (col + 1u < N) {
                 s[(ulong)row * d.s_row_stride + col + 1u] = ec[1];
+                if (EMIT_PAT16) {
+                    pat16[(ulong)row * d.s_row_stride + col + 1u] =
+                        ushort(attn_pat_key(ec[1]) >> 16u);
+                }
             }
         }
     }

@@ -23,9 +23,17 @@ pub const ENTRY_TOPK_SM: &str = "attn_topk_softmax";
 pub const ENTRY_TOPK_PV: &str = "attn_topk_pv";
 pub const SHADER_TOPK: &str = include_str!("attention_topk.metal");
 
-/// Compile-time slot capacity for the compressed P/Idx planes. The runtime k
-/// (DGQ_ATTN_TOPK_K) may be <= K_PAD. Pad-to-power-of-2 keeps stride math cheap.
+/// Default compile-time slot capacity for the compressed P/Idx planes. The
+/// production K_PAD is `flags::attn_topk_k_pad()` (next-pow2 of the requested
+/// k, task #95); this const is the kernel's `#ifndef` default and the value
+/// tests/benches use.
 pub const K_PAD: usize = 64;
+
+/// Slot capacity for a requested k (mirrors `flags::attn_topk_k_pad`).
+#[inline]
+pub fn k_pad_for(k: usize) -> usize {
+    k.max(1).next_power_of_two().clamp(K_PAD, 1024)
+}
 
 /// Default tile geometry (matches E17's defaults for the QK half).
 pub const BM: usize = 64;
@@ -52,22 +60,30 @@ pub fn pipelines(
     ctx: &crate::metal::device::MetalContext,
     variant: crate::shaders::variant::KernelVariant,
     side: bool,
+    k_pad: usize,
 ) -> Result<[crate::metal::device::ComputePipeline; 3], Error> {
     use crate::shaders::variant::FcBool;
-    let bools: &[FcBool] = if side {
-        &[FcBool {
-            index: 30,
-            value: true,
-        }]
-    } else {
-        &[]
+    let pat16 = FcBool {
+        index: 32,
+        value: true,
     };
+    let side_fc = FcBool {
+        index: 30,
+        value: true,
+    };
+    // QK from E17's source with FC32 (EMIT_PAT16): also writes the u16 key
+    // plane the selection passes read (buffer 8). E17's own QK pipeline leaves
+    // FC32 undefined — distinct cache label via the FC-value suffix.
+    let qk_bools: &[FcBool] = if side { &[side_fc, pat16] } else { &[pat16] };
+    let bools: &[FcBool] = if side { &[side_fc] } else { &[] };
     let label = if side { "side" } else { "default" };
-    // QK pipeline from E17's source (same entry, same FC30 handling).
-    let pipe_qk = ctx.compile_subkernel_ex(SHADER_QK, ENTRY_QK, variant, label, bools, &[])?;
-    // topk_softmax + topk_pv from this module's source (KV_F32_SIDE iff side).
-    let pipe_sm = ctx.compile_subkernel_ex(SHADER_TOPK, ENTRY_TOPK_SM, variant, label, bools, &[])?;
-    let pipe_pv = ctx.compile_subkernel_ex(SHADER_TOPK, ENTRY_TOPK_PV, variant, label, bools, &[])?;
+    let pipe_qk = ctx.compile_subkernel_ex(SHADER_QK, ENTRY_QK, variant, label, qk_bools, &[])?;
+    // topk_softmax + topk_pv with K_PAD baked to the requested capacity (task
+    // #95: the k knob is live). Source-baked defines are safe in the pipeline
+    // cache — the label includes source_hash (the #99 generic fix).
+    let src = tuned_source(BM, BN, SOFTMAX_TPG, k_pad);
+    let pipe_sm = ctx.compile_subkernel_ex(&src, ENTRY_TOPK_SM, variant, label, bools, &[])?;
+    let pipe_pv = ctx.compile_subkernel_ex(&src, ENTRY_TOPK_PV, variant, label, bools, &[])?;
     Ok([pipe_qk, pipe_sm, pipe_pv])
 }
 
@@ -98,10 +114,11 @@ pub fn gpu(
     let t_total = kv_len + canvas;
     let np = n_pad(t_total);
     let kstride = nkv * hd * 2;
-    let k = k.max(1).min(K_PAD);
+    let kp = k_pad_for(k);
+    let k = k.max(1).min(kp);
 
     let ctx = MetalContext::new()?;
-    let [pipe_qk, pipe_sm, pipe_pv] = pipelines(&ctx, KernelVariant::PRODUCTION, side)?;
+    let [pipe_qk, pipe_sm, pipe_pv] = pipelines(&ctx, KernelVariant::PRODUCTION, side, kp)?;
     let mut pool = BufferPool::new();
     let buf_q = pool
         .allocate(&ctx.device, canvas * n_q_heads * hd * 2)
@@ -133,14 +150,18 @@ pub fn gpu(
         .ok_or(Error::Gpu("alloc s"))?;
     // P plane is f32 always (topk writes f32 probs regardless of side).
     let buf_p = pool
-        .allocate(&ctx.device, hc * canvas * K_PAD * 4)
+        .allocate(&ctx.device, hc * canvas * kp * 4)
         .ok_or(Error::Gpu("alloc p"))?;
     let buf_idx = pool
-        .allocate(&ctx.device, hc * canvas * K_PAD * 4)
+        .allocate(&ctx.device, hc * canvas * kp * 4)
         .ok_or(Error::Gpu("alloc idx"))?;
     let buf_lrow = pool
         .allocate(&ctx.device, hc * canvas * 4)
         .ok_or(Error::Gpu("alloc lrow"))?;
+    // u16 key plane (FC32 output of QK, read by the selection passes).
+    let buf_pat = pool
+        .allocate(&ctx.device, hc * canvas * np * 2)
+        .ok_or(Error::Gpu("alloc pat"))?;
 
     let mut dims = crate::shaders::attention_gemm::AttnGemmDims {
         m: canvas as u32,
@@ -181,25 +202,28 @@ pub fn gpu(
             height: canvas,
             depth: hb,
         };
-        // QK: same dispatch as E17.
+        // QK: same dispatch as E17 (+ u16 key plane at 8, FC32).
         enc.setComputePipelineState(&pipe_qk.pipeline);
         unsafe {
             enc.setBuffer_offset_atIndex(Some(&buf_q), 0, 0);
             enc.setBuffer_offset_atIndex(Some(&buf_kv), 0, 1);
             enc.setBuffer_offset_atIndex(Some(&buf_s), 0, 2);
+            enc.setBuffer_offset_atIndex(Some(&buf_pat), 0, 8);
             if side { enc.setBuffer_offset_atIndex(Some(&buf_kvf), 0, 9); }
         }
         gpu_common::set_bytes(&enc, &dims, 3);
         enc.dispatchThreadgroups_threadsPerThreadgroup(grid_qk, tg128);
         enc.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers);
 
-        // topk_softmax: buffers S -> 0, P -> 1, Idx -> 2, lrow -> 3, dims -> 4, k -> 5
+        // topk_softmax: S -> 0, P -> 1, Idx -> 2, lrow -> 3, dims -> 4, k -> 5,
+        // pat16 -> 6.
         enc.setComputePipelineState(&pipe_sm.pipeline);
         unsafe {
             enc.setBuffer_offset_atIndex(Some(&buf_s), 0, 0);
             enc.setBuffer_offset_atIndex(Some(&buf_p), 0, 1);
             enc.setBuffer_offset_atIndex(Some(&buf_idx), 0, 2);
             enc.setBuffer_offset_atIndex(Some(&buf_lrow), 0, 3);
+            enc.setBuffer_offset_atIndex(Some(&buf_pat), 0, 6);
         }
         gpu_common::set_bytes(&enc, &dims, 4);
         gpu_common::set_bytes(&enc, &k_u32, 5);
@@ -246,8 +270,9 @@ mod tests {
         let f = crate::shaders::attention::full_grp8_hd512_fixture(ElemFormat::F32);
         let got = gpu(&f, true, false, K_PAD).expect("gpu topk causal");
         let oracle = cpu::topk_causal(&f, true, K_PAD);
-        // topk is exact (same selection + same renormalization); tolerance is
-        // for f16-KV rounding + bf16 output rounding + bf16 Q rounding.
+        // Selection is exact top-k by f32 score (4-level radix); only
+        // bit-identical scores are interchangeable. Tolerance covers f16-KV /
+        // bf16 rounding.
         assert_oracle(&got, &oracle, 2e-2, 0.9999);
     }
 
@@ -274,6 +299,18 @@ mod tests {
         let oracle = cpu::topk_causal(&f, true, 1);
         // Relaxed: ties at k=1 may pick a different (tied) key.
         assert_oracle(&got, &oracle, 2e-2, 0.999);
+    }
+
+    /// k=128 > default K_PAD=64: proves the k knob is live end-to-end (task
+    /// #95) — the kernel compiles with AG_K_PAD=128 and the selection keeps
+    /// 128 keys, matching the CPU oracle at the same k.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn topk_k128_matches_cpu() {
+        let f = crate::shaders::attention::full_grp8_hd512_fixture(ElemFormat::F32);
+        let got = gpu(&f, true, false, 128).expect("gpu topk k=128");
+        let oracle = cpu::topk_causal(&f, true, 128);
+        assert_oracle(&got, &oracle, 2e-2, 0.9999);
     }
 
     /// Premise bench: top-k attention vs E17 (dense) at model shape. One
@@ -353,10 +390,11 @@ pub fn bench_gpu(
     let t_total = kv_len + canvas;
     let np = n_pad(t_total);
     let kstride = nkv * hd * 2;
-    let k = k.max(1).min(K_PAD);
+    let kp = k_pad_for(k);
+    let k = k.max(1).min(kp);
 
     let ctx = MetalContext::new()?;
-    let [pipe_qk, pipe_sm, pipe_pv] = pipelines(&ctx, KernelVariant::PRODUCTION, false)?;
+    let [pipe_qk, pipe_sm, pipe_pv] = pipelines(&ctx, KernelVariant::PRODUCTION, false, kp)?;
     let mut pool = BufferPool::new();
     let buf_q = pool
         .allocate(&ctx.device, canvas * n_q_heads * hd * 2)
@@ -378,14 +416,17 @@ pub fn bench_gpu(
         .allocate(&ctx.device, hc * canvas * np * 4)
         .ok_or(Error::Gpu("alloc s"))?;
     let buf_p = pool
-        .allocate(&ctx.device, hc * canvas * K_PAD * 4)
+        .allocate(&ctx.device, hc * canvas * kp * 4)
         .ok_or(Error::Gpu("alloc p"))?;
     let buf_idx = pool
-        .allocate(&ctx.device, hc * canvas * K_PAD * 4)
+        .allocate(&ctx.device, hc * canvas * kp * 4)
         .ok_or(Error::Gpu("alloc idx"))?;
     let buf_lrow = pool
         .allocate(&ctx.device, hc * canvas * 4)
         .ok_or(Error::Gpu("alloc lrow"))?;
+    let buf_pat = pool
+        .allocate(&ctx.device, hc * canvas * np * 2)
+        .ok_or(Error::Gpu("alloc pat"))?;
 
     let mut dims = crate::shaders::attention_gemm::AttnGemmDims {
         m: canvas as u32,
@@ -434,6 +475,7 @@ pub fn bench_gpu(
                     enc.setBuffer_offset_atIndex(Some(&buf_q), 0, 0);
                     enc.setBuffer_offset_atIndex(Some(&buf_kv), 0, 1);
                     enc.setBuffer_offset_atIndex(Some(&buf_s), 0, 2);
+                    enc.setBuffer_offset_atIndex(Some(&buf_pat), 0, 8);
                 }
                 gpu_common::set_bytes(&enc, &dims, 3);
                 enc.dispatchThreadgroups_threadsPerThreadgroup(grid_qk, tg128);
@@ -445,6 +487,7 @@ pub fn bench_gpu(
                     enc.setBuffer_offset_atIndex(Some(&buf_p), 0, 1);
                     enc.setBuffer_offset_atIndex(Some(&buf_idx), 0, 2);
                     enc.setBuffer_offset_atIndex(Some(&buf_lrow), 0, 3);
+                    enc.setBuffer_offset_atIndex(Some(&buf_pat), 0, 6);
                 }
                 gpu_common::set_bytes(&enc, &dims, 4);
                 gpu_common::set_bytes(&enc, &k_u32, 5);
@@ -502,10 +545,11 @@ pub fn bench_stages(
     let t_total = kv_len + canvas;
     let np = n_pad(t_total);
     let kstride = nkv * hd * 2;
-    let k = k.max(1).min(K_PAD);
+    let kp = k_pad_for(k);
+    let k = k.max(1).min(kp);
 
     let ctx = MetalContext::new()?;
-    let [pipe_qk, pipe_sm, pipe_pv] = pipelines(&ctx, KernelVariant::PRODUCTION, false)?;
+    let [pipe_qk, pipe_sm, pipe_pv] = pipelines(&ctx, KernelVariant::PRODUCTION, false, kp)?;
     let mut pool = BufferPool::new();
     let buf_q = pool
         .allocate(&ctx.device, canvas * n_q_heads * hd * 2)
@@ -527,14 +571,17 @@ pub fn bench_stages(
         .allocate(&ctx.device, hc * canvas * np * 4)
         .ok_or(Error::Gpu("alloc s"))?;
     let buf_p = pool
-        .allocate(&ctx.device, hc * canvas * K_PAD * 4)
+        .allocate(&ctx.device, hc * canvas * kp * 4)
         .ok_or(Error::Gpu("alloc p"))?;
     let buf_idx = pool
-        .allocate(&ctx.device, hc * canvas * K_PAD * 4)
+        .allocate(&ctx.device, hc * canvas * kp * 4)
         .ok_or(Error::Gpu("alloc idx"))?;
     let buf_lrow = pool
         .allocate(&ctx.device, hc * canvas * 4)
         .ok_or(Error::Gpu("alloc lrow"))?;
+    let buf_pat = pool
+        .allocate(&ctx.device, hc * canvas * np * 2)
+        .ok_or(Error::Gpu("alloc pat"))?;
 
     let mut dims = crate::shaders::attention_gemm::AttnGemmDims {
         m: canvas as u32,
@@ -586,6 +633,7 @@ pub fn bench_stages(
                             enc.setBuffer_offset_atIndex(Some(&buf_q), 0, 0);
                             enc.setBuffer_offset_atIndex(Some(&buf_kv), 0, 1);
                             enc.setBuffer_offset_atIndex(Some(&buf_s), 0, 2);
+                            enc.setBuffer_offset_atIndex(Some(&buf_pat), 0, 8);
                         }
                         gpu_common::set_bytes(&enc, &dims, 3);
                         enc.dispatchThreadgroups_threadsPerThreadgroup(grid_qk, tg128);
@@ -597,6 +645,7 @@ pub fn bench_stages(
                             enc.setBuffer_offset_atIndex(Some(&buf_p), 0, 1);
                             enc.setBuffer_offset_atIndex(Some(&buf_idx), 0, 2);
                             enc.setBuffer_offset_atIndex(Some(&buf_lrow), 0, 3);
+                            enc.setBuffer_offset_atIndex(Some(&buf_pat), 0, 6);
                         }
                         gpu_common::set_bytes(&enc, &dims, 4);
                         gpu_common::set_bytes(&enc, &k_u32, 5);

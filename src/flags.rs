@@ -154,8 +154,10 @@ pub struct PerfFlags {
     /// (row, head) and gathers V at those indices. Non-bit-identical (only the
     /// top-k keys are kept); quality-gated. Default OFF (opt-in prototype).
     pub attn_topk: bool,
-    /// `DGQ_ATTN_TOPK_K`: k per query row. Must be <= K_PAD (compile-time, see
-    /// `attention_topk::K_PAD`). Default 64.
+    /// `DGQ_ATTN_TOPK_K`: k per query row. The kernel's slot capacity K_PAD is
+    /// compiled to `next_power_of_two(k)` (min 64, max 1024) via
+    /// `attention_topk::tuned_source`, so any k in [1, 1024] is honored (task
+    /// #95 unblocked the knob — it used to clamp silently to 64). Default 64.
     pub attn_topk_k: usize,
 }
 
@@ -743,7 +745,14 @@ pub fn attn_topk_enabled() -> bool {
 
 /// E20 k per query row. Clamped to K_PAD at compile time host-side.
 pub fn attn_topk_k() -> usize {
-    config().perf.attn_topk_k
+    config().perf.attn_topk_k.clamp(1, 1024)
+}
+/// Compile-time slot capacity for the top-k P/Idx planes: next power of two of
+/// the requested k, floored at the shipped 64 (kernel default) and capped at
+/// 1024. Pipeline compile (`tuned_source` AG_K_PAD) and the Rust-side plane
+/// allocations must BOTH use this — same value, one source (#97's lesson).
+pub fn attn_topk_k_pad() -> usize {
+    attn_topk_k().next_power_of_two().clamp(64, 1024)
 }
 
 /// E18 fused flash prefill. `.0` = enabled, `.1` = BQ (query-row tile), `.2` =

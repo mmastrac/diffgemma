@@ -1070,14 +1070,14 @@ impl StepPipelines {
                 None
             },
             attn_topk: if crate::flags::attn_topk_enabled() {
-                Some(crate::shaders::attention_topk::pipelines(ctx, prod, false)?)
+                Some(crate::shaders::attention_topk::pipelines(ctx, prod, false, crate::flags::attn_topk_k_pad())?)
             } else {
                 None
             },
             attn_topk_side: if crate::flags::attn_topk_enabled()
                 && crate::flags::prefill_kv_f32_enabled()
             {
-                Some(crate::shaders::attention_topk::pipelines(ctx, prod, true)?)
+                Some(crate::shaders::attention_topk::pipelines(ctx, prod, true, crate::flags::attn_topk_k_pad())?)
             } else {
                 None
             },
@@ -1275,6 +1275,7 @@ pub(crate) struct StepBuffers {
     attn_topk_p: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
     attn_topk_idx: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
     attn_topk_lrow: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    attn_topk_pat: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
     /// E14 (DGQ_PREFILL_KV_F32): f32 side K/V ring for the sliding layers —
     /// written by the prefill rope, read by the prefill attention, so chunk
     /// boundaries never round K/V to f16. Same slot = pos & ring_mask
@@ -3301,7 +3302,7 @@ impl StepEnc<'_> {
     /// `attn_topk_pv` (gathered-V PV) instead of E17's softmax + PV.
     fn encode_attn_topk(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
         use crate::shaders::attention_gemm::n_pad;
-        use crate::shaders::attention_topk::{BM, BN, K_PAD, PV_BN, SOFTMAX_TPG};
+        use crate::shaders::attention_topk::{BM, BN, PV_BN, SOFTMAX_TPG};
         let l = &layout.layers[layer];
         let hd = l.head_dim as usize;
         let nkv = l.n_kv_heads as usize;
@@ -3328,11 +3329,14 @@ impl StepEnc<'_> {
             s_head_stride: (m * np) as u32,
             head_base: 0,
         };
-        let k_param = crate::flags::attn_topk_k().min(K_PAD) as u32;
+        let k_param = crate::flags::attn_topk_k().min(crate::flags::attn_topk_k_pad()) as u32;
         let tg128 = MTLSize { width: 128, height: 1, depth: 1 };
         let tg_sm = MTLSize { width: SOFTMAX_TPG, height: 1, depth: 1 };
         let tg_pv = MTLSize { width: 32, height: 1, depth: 1 };  // one simdgroup
-        let hc = crate::shaders::attention_gemm::TuneCfg::default().hc.min(STEP_NQ_HEADS);
+        // Head-chunk from the SAME flag the scratch allocation reads (task #97:
+        // this used to hardcode TuneCfg::default().hc=4, ignoring the shipped
+        // BO optimum DGQ_GEMM_ATTN_HC=16 and mis-sizing vs the S plane).
+        let hc = crate::flags::gemm_attn_head_chunk().min(STEP_NQ_HEADS);
         let side = self.ps.attn_topk_side.is_some();
         let side_off = self.bufs.kv_f32_side_offs[layer] as usize;
         let pipes = if side {
@@ -3355,7 +3359,7 @@ impl StepEnc<'_> {
                 height: m,
                 depth: hb,
             };
-            // QK: same dispatch as E17 (reuses attn_gemm_qk).
+            // QK: same dispatch as E17 (attn_gemm_qk + FC32 u16 key plane at 8).
             self.sink_set_pipeline(&pipes[0]);
             self.sink_set_buffer(
                 &self.bufs.arena,
@@ -3364,6 +3368,7 @@ impl StepEnc<'_> {
             );
             self.sink_set_buffer(&self.bufs.kvcache, l.kv_region as usize, 1);
             self.sink_set_buffer(self.bufs.attn_gemm_s.as_ref().unwrap(), 0, 2);
+            self.sink_set_buffer(self.bufs.attn_topk_pat.as_ref().unwrap(), 0, 8);
             if side {
                 self.sink_set_buffer(self.bufs.kv_f32_side.as_ref().unwrap(), side_off, 9);
             }
@@ -3371,12 +3376,13 @@ impl StepEnc<'_> {
             self.sink_dispatch(grid_qk, tg128);
             self.sink_memory_barrier();
 
-            // topk_softmax: S -> P (compressed), Idx, lrow.
+            // topk_softmax: S + u16 keys -> P (compressed), Idx, lrow.
             self.sink_set_pipeline(&pipes[1]);
             self.sink_set_buffer(self.bufs.attn_gemm_s.as_ref().unwrap(), 0, 0);
             self.sink_set_buffer(self.bufs.attn_topk_p.as_ref().unwrap(), 0, 1);
             self.sink_set_buffer(self.bufs.attn_topk_idx.as_ref().unwrap(), 0, 2);
             self.sink_set_buffer(self.bufs.attn_topk_lrow.as_ref().unwrap(), 0, 3);
+            self.sink_set_buffer(self.bufs.attn_topk_pat.as_ref().unwrap(), 0, 6);
             self.sink_set_bytes(&dims, 4);
             self.sink_set_bytes(&k_param, 5);
             self.sink_dispatch(grid_sm, tg_sm);
@@ -5953,12 +5959,10 @@ pub fn build_step_runtime(
         // never both live on the same layer).
         attn_gemm_s: if crate::flags::gemm_attn_enabled() || crate::flags::attn_topk_enabled() {
             let np = crate::shaders::attention_gemm::n_pad(cfg.max_seq);
-            let hc = if crate::flags::gemm_attn_enabled() {
-                crate::flags::gemm_attn_head_chunk()
-            } else {
-                crate::shaders::attention_gemm::TuneCfg::default().hc
-            }
-            .min(STEP_NQ_HEADS);
+            // Both E17 and E20 encoders batch heads by DGQ_GEMM_ATTN_HC (task
+            // #97 unified them); size from the same flag so the encoder can
+            // never outrun the scratch.
+            let hc = crate::flags::gemm_attn_head_chunk().min(STEP_NQ_HEADS);
             Some(alloc_buffer(
                 &ctx.device,
                 hc * CANVAS * np * std::mem::size_of::<f32>(),
@@ -5984,31 +5988,44 @@ pub fn build_step_runtime(
             None
         },
         // E20 top-k scratch: compressed P [HC][CANVAS][K_PAD] (f32), indices
-        // Idx [HC][CANVAS][K_PAD] (u32), lrow [HC][CANVAS] (f32). The S plane
-        // is shared with attn_gemm_s (allocated above when either flag is set).
+        // Idx [HC][CANVAS][K_PAD] (u32), lrow [HC][CANVAS] (f32), and the u16
+        // key plane [HC][CANVAS][n_pad] (FC32 output of QK, read by the
+        // selection passes — half the bytes of the S plane). HC comes from the
+        // same flag the encoder batches by (task #97). The S plane is shared
+        // with attn_gemm_s (allocated above when either flag is set).
         attn_topk_p: if crate::flags::attn_topk_enabled() {
-            let hc = crate::shaders::attention_gemm::TuneCfg::default().hc.min(STEP_NQ_HEADS);
+            let hc = crate::flags::gemm_attn_head_chunk().min(STEP_NQ_HEADS);
             Some(alloc_buffer(
                 &ctx.device,
-                hc * CANVAS * crate::shaders::attention_topk::K_PAD * std::mem::size_of::<f32>(),
+                hc * CANVAS * crate::flags::attn_topk_k_pad() * std::mem::size_of::<f32>(),
             )?)
         } else {
             None
         },
         attn_topk_idx: if crate::flags::attn_topk_enabled() {
-            let hc = crate::shaders::attention_gemm::TuneCfg::default().hc.min(STEP_NQ_HEADS);
+            let hc = crate::flags::gemm_attn_head_chunk().min(STEP_NQ_HEADS);
             Some(alloc_buffer(
                 &ctx.device,
-                hc * CANVAS * crate::shaders::attention_topk::K_PAD * std::mem::size_of::<u32>(),
+                hc * CANVAS * crate::flags::attn_topk_k_pad() * std::mem::size_of::<u32>(),
             )?)
         } else {
             None
         },
         attn_topk_lrow: if crate::flags::attn_topk_enabled() {
-            let hc = crate::shaders::attention_gemm::TuneCfg::default().hc.min(STEP_NQ_HEADS);
+            let hc = crate::flags::gemm_attn_head_chunk().min(STEP_NQ_HEADS);
             Some(alloc_buffer(
                 &ctx.device,
                 hc * CANVAS * std::mem::size_of::<f32>(),
+            )?)
+        } else {
+            None
+        },
+        attn_topk_pat: if crate::flags::attn_topk_enabled() {
+            let np = crate::shaders::attention_gemm::n_pad(cfg.max_seq);
+            let hc = crate::flags::gemm_attn_head_chunk().min(STEP_NQ_HEADS);
+            Some(alloc_buffer(
+                &ctx.device,
+                hc * CANVAS * np * std::mem::size_of::<u16>(),
             )?)
         } else {
             None
