@@ -3,6 +3,7 @@
 //! (backlog item 10); the `Worker` struct + wire/job/event types stay in the
 //! parent, so `use super::*` + ancestry reach them (incl. private fields).
 
+use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -105,6 +106,9 @@ impl Worker {
         let mut cfg = self.per_request_cfg(&job, budget);
         let mapper = self.make_mapper(&job);
         attach_stream_observer(&mut cfg, &mapper, &job.resp, tool_mode, true);
+        let log_seq = self.allocate_log_seq();
+        let file_block = Arc::new(AtomicUsize::new(0));
+        self.attach_block_commit_logger(&mut cfg, log_seq, &file_block);
 
         // Route to the conversation first so `kv_valid_tokens` is the right
         // prefix; the incremental log is the prompt delta beyond that.
@@ -128,6 +132,7 @@ impl Worker {
         let out =
             crate::metal::generate_with_session(manager.session_mut(), &prompt, &cfg, "serve");
         cfg.step_observer = None;
+        cfg.block_commit_observer = None;
         match out {
             Ok(out) => {
                 let raw_text = mapper.lock().unwrap().content().to_string();
@@ -158,8 +163,7 @@ impl Worker {
                 };
 
                 let finish_reason = finish_reason_for(&tool_calls, out.stopped_on_eot);
-                if let Some(dir) = &self.log_dir {
-                    let seq = self.turn_seq.fetch_add(1, Ordering::Relaxed);
+                if let (Some(dir), Some(seq)) = (&self.log_dir, log_seq) {
                     let stop_token = out.stop_token_id.and_then(|id| {
                         self.tokenizer
                             .id_to_token(id)
@@ -194,7 +198,7 @@ impl Worker {
                         "denoise_secs": out.denoise_elapsed.as_secs_f64(),
                         "extend_secs": out.extend_elapsed.as_secs_f64(),
                     });
-                    self.write_response_logs(dir, seq, &record, &out.block_stats);
+                    self.write_serve_turn_log(dir, seq, &record);
                 }
 
                 let prefill_toks = delta_ids.len().max(1) as f64;
@@ -464,9 +468,10 @@ impl Worker {
         let mut stop_token_id: Option<u32> = None;
         let mut stop_block_idx: Option<usize> = None;
         let mut stop_offset: Option<usize> = None;
-        let mut all_block_stats: Vec<crate::generate::BlockDenoiseStats> = Vec::new();
         let mut round_prompt = prompt;
         let mut raw_rounds: Vec<String> = Vec::new();
+        let log_seq = self.allocate_log_seq();
+        let file_block = Arc::new(AtomicUsize::new(0));
 
         for round in 0..=cc.max_expand_rounds {
             let remaining = job.max_tokens.map(|m| m.saturating_sub(completion_tokens));
@@ -488,6 +493,7 @@ impl Worker {
             // round's text.
             let mapper = self.make_mapper(&job);
             attach_stream_observer(&mut cfg, &mapper, &job.resp, true, true);
+            self.attach_block_commit_logger(&mut cfg, log_seq, &file_block);
 
             let out = crate::metal::generate_with_session(
                 manager.session_mut(),
@@ -509,7 +515,6 @@ impl Worker {
             stop_token_id = out.stop_token_id;
             stop_block_idx = out.stop_block_idx;
             stop_offset = out.stop_offset;
-            all_block_stats.extend(out.block_stats);
             raw_rounds.push(raw.clone());
 
             let calls = crate::tools::parse_tool_calls(&raw);
@@ -579,7 +584,10 @@ impl Worker {
             }
             let session = manager.session_mut();
             let reuse = lcp(session.kv_valid_tokens(), &ext);
-            session.truncate_kv_to(reuse);
+            if let Err(err) = session.truncate_kv_to(reuse) {
+                eprintln!("serve: tool-compact: expand KV truncate failed: {err}");
+                break;
+            }
             if let Err(err) = session.extend_kv(&ext[reuse..]) {
                 eprintln!("serve: tool-compact: expand KV extend failed: {err}");
                 break;
@@ -606,8 +614,7 @@ impl Worker {
         // Unblock the client before the finalize KV rebuild (same reasoning as
         // the plain path — the reply doesn't depend on it).
         let finish_reason = finish_reason_for(&tool_calls_out, stopped);
-        if let Some(dir) = &self.log_dir {
-            let seq = self.turn_seq.fetch_add(1, Ordering::Relaxed);
+        if let (Some(dir), Some(seq)) = (&self.log_dir, log_seq) {
             let stop_token = stop_token_id.and_then(|id| {
                 self.tokenizer
                     .id_to_token(id)
@@ -636,8 +643,9 @@ impl Worker {
                 "stop_block": stop_block_idx,
                 "stop_offset": stop_offset,
                 "finish_reason": finish_reason,
+                "blocks_committed": file_block.load(Ordering::Relaxed),
             });
-            self.write_response_logs(dir, seq, &record, &all_block_stats);
+            self.write_serve_turn_log(dir, seq, &record);
         }
         eprintln!(
             "serve: out {}tok {}",
@@ -658,32 +666,53 @@ impl Worker {
         }
     }
 
-    fn write_response_logs(
+    fn allocate_log_seq(&self) -> Option<u64> {
+        self.log_dir
+            .as_ref()
+            .map(|_| self.turn_seq.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Flush each committed denoise block to `model-NNNNN-MMMMM.json` as it
+    /// finishes (fsync'd), so killing the server mid-turn still leaves
+    /// completed blocks on disk. `file_block` counts across expand rounds.
+    fn attach_block_commit_logger(
+        &self,
+        cfg: &mut crate::metal::StepGenerateConfig,
+        log_seq: Option<u64>,
+        file_block: &Arc<AtomicUsize>,
+    ) {
+        let (Some(seq), Some(dir)) = (log_seq, self.log_dir.clone()) else {
+            return;
+        };
+        let tok = Arc::clone(&self.tokenizer);
+        let file_block = Arc::clone(file_block);
+        cfg.block_commit_observer = Some(Arc::new(move |stats| {
+            let n = file_block.fetch_add(1, Ordering::Relaxed) + 1;
+            let stop_token = stats.stop_token_id.and_then(|id| {
+                tok.id_to_token(id)
+                    .map(|s| s.to_string())
+                    .or_else(|| Some(format!("id:{id}")))
+            });
+            let mut record = block_stats_to_json(stats, &tok, stop_token.as_deref());
+            if let Some(obj) = record.as_object_mut() {
+                obj.insert("file_block".into(), serde_json::json!(n));
+            }
+            match write_model_block_log(&dir, seq, n, &record) {
+                Ok(path) => eprintln!("serve: wrote {}", path.display()),
+                Err(err) => eprintln!("serve: model log failed: {err}"),
+            }
+        }));
+    }
+
+    fn write_serve_turn_log(
         &self,
         dir: &std::path::Path,
         seq: u64,
         serve_record: &serde_json::Value,
-        block_stats: &[crate::generate::BlockDenoiseStats],
     ) {
         match write_serve_log(dir, seq, serve_record) {
             Ok(path) => eprintln!("serve: wrote {}", path.display()),
             Err(err) => eprintln!("serve: serve log failed: {err}"),
-        }
-        for (i, stats) in block_stats.iter().enumerate() {
-            let stop_token = stats.stop_token_id.and_then(|id| {
-                self.tokenizer
-                    .id_to_token(id)
-                    .map(|s| s.to_string())
-                    .or_else(|| Some(format!("id:{id}")))
-            });
-            let mut record = block_stats_to_json(stats, &self.tokenizer, stop_token.as_deref());
-            if let Some(obj) = record.as_object_mut() {
-                obj.insert("file_block".into(), serde_json::json!(i + 1));
-            }
-            match write_model_block_log(dir, seq, i + 1, &record) {
-                Ok(path) => eprintln!("serve: wrote {}", path.display()),
-                Err(err) => eprintln!("serve: model log failed: {err}"),
-            }
         }
     }
 }

@@ -14,6 +14,68 @@ green, census signed off).
 
 ## Open items
 
+### Concept — span handles / compact history (engine revisit)
+
+**Symptom to diagnose first:** long OpenCode/agent turns look stuck in a
+**newline / structure collapse** — indent and line grid degrade across
+repair loops; the model rewrites the same file, emits mid-tool self-talk,
+and burns context. Localize before building (decode `▁→space` is already
+fixed; remaining collapse may be sampler/early-stop, attention on dense
+code, or history shape). Do not treat "more context" as the fix until the
+collapse axis is named.
+
+**Idea (tool-compact sibling):** keep large code/tool bodies out of the
+long-lived canonical KV as full token streams; store them as **handles**
+(opaque id + optional line/span metadata) that expand on demand for the
+client and for turn-local generation, then evaporate again at finalize.
+
+Rough grammar (illustrative, not committed):
+
+```text
+<|copy id=sp_… start="pub fn foo()" lines=10 replace=… |>
+```
+
+Server holds the span blob (same lifecycle class as `ToolOutputStore`).
+Serve soft-expands when packaging `write`/`edit` / when the model calls
+`expand_*`; finalize keeps only the handle in the conversation prefix so
+OpenAI re-send + KV reuse still match.
+
+**Constraints already known (do not re-explore as free wins):**
+
+- Attention only sees tokens in the active sequence. A handle in KV does
+  **not** grant access to the full span without expand / turn-local inject.
+- Sliding-ring KV vs full-layer KV are **parallel layer classes**, not a
+  promote-and-drop pipeline. Ring-only litter handles that "throw away on
+  promote" are not available; any real token position is written through
+  the residual and full layers keep it for the whole context.
+- Invisible litter that only the GPU sees breaks conversation prefix
+  identity (clients re-send history without the litter). Handles must be
+  in the canonical log or deterministically rehydrated before `activate`.
+- Prefer content-hash / span ids over positional newline markers; edits
+  invalidate line-number maps.
+- Complementary to (not replacing) current serve tooling: incomplete-tool
+  continue, trailing-after-tool continue, thought strip on finalize,
+  tool-compact summarize/expand.
+
+**Proposed phases (concept only):**
+
+1. **Diagnose newline/structure collapse** on a fixed OpenCode repro
+   (token dumps per block: newline/`▁` indent stats, entropy, stop deferral
+   counts). Name the axis before shipping handles.
+2. **Span store MVP** — on `write`/large tool text, hash→blob; messages
+   may keep full text until a compact substitution path exists.
+3. **Handle substitution + expand tool** — mirror tool-compact
+   (`full_output_id` / `expand_summary`) for code spans; gate on
+   prefix-stable KV reuse + smoketest/longctx.
+4. **Client expand** — soft-expand handles in emitted tool args so
+   OpenCode never race-compiles a handle string; keep serial tool policy
+   (or one side-effect tool per turn) as a separate harness concern.
+5. **Optional sparse visible anchors** only if (1) shows attention needs
+   a line spine — explicit, id'd, in-canonical; not ring-side-band.
+
+Parked until (1) is clear: regex-patch-in-handle grammar, per-newline
+special-token litter, ring-only markers.
+
 **Standing lever-hygiene principle (2026-07-13):** a lever disproven on one
 architecture/shape is not disproven forever. When the shape changes (new path,
 new tiler, new M regime), *cheaply* re-test the disproven levers it could have
@@ -38,6 +100,7 @@ can test the joint {E17, ILP2, tiles} space. Kept behind default-OFF FC31.
 
 | Item | Notes |
 |---|---|
+| **Span handles / compact history (concept)** — OPEN; blocked on collapse diagnosis | See section above. Engine revisit: newline/structure collapse under agent loops first; then tool-compact-like span store + expand. Not a sliding-KV free lunch. |
 | **MoE weight-stationary prefill — `DGQ_MOE_PREFILL_BM`** — **ROOT-CAUSE FOUND + FIXED; the "win" was FAKE; honest re-measure IN PROGRESS 2026-07-13** | **The `block_m>32` "correctness bug" was NEVER in the kernel — it was a pipeline-cache-label collision (`src/metal/device.rs`).** The tunable tile geometry (`TUNE_BM`/`TUNE_BN`) is baked into the shader SOURCE `#define`, not a function constant, so the GEMM cache label omitted it. A process that compiled the sparse GEMM at *both* `bm=32` (denoise) and `bm=64` (prefill) → **same label → `PipelineArchiveCache` silently returned the first-compiled pipeline.** A `bm=32` kernel fed 64-row blocks processes rows 0-31 and leaves **32-63 exactly zero** — confirmed by per-row dump (`cos=0.707=√½` = "half the rows"; `[40]`-block → `cos=0.90=√(32/40)`). **FIX: fold a `source_hash` into the cache label** (closes the whole class of source-define collisions, not just tiles). Verified: `sparse_block_m_invariant` oracle **cos=1.000000 at every tile** {32,64,128}×{64,128} (was 0.59–0.74); **golden 8/8** (fix invisible to production — same source hashes identically); **suite 551/0**. The oracle now loops tiles *in one process* to force the collision if it regresses. **CONSEQUENCE: the earlier −11/−20% "win" was FAKE** — a `bm=32` kernel doing half the work is faster *because it skips rows*. Likewise the "golden 5/8 + longctx stochastic fact-dropping" quality story was the zeroed KV rows, not a real perturbation. A *correct* wide block does the FULL work, so it needs an honest re-measure (early 3-trial smoke: correct `bm=64` is **slower**, 3264/3377 vs 2838ms default — consistent with the fake-win theory). **`DGQ_MOE_PREFILL_BM` is now a correct, sweepable axis** (added to the 10-dim holistic BO; needs no Rust change — the flag drives the fixed machinery). Wide-path N-tile still pinned at 64 in two coupled sites (grid `step_kernel:1284` + compile `pipeline_for_sparse_bm`); unpinning it into a joint `(BM,BN)` sweep is a follow-up *if* corrected `bm>32` proves worth it. `DGQ_MOE_PREFILL_BM_MAXKV` / the kv-adaptive ship plan are MOOT unless the honest sweep shows a real win. |
 | **Prefill floor decomposition** — **DONE 2026-07-13 (`bench-prefill-super --stages`)** | Stage-ablation of the M=1024 super-chunk (skip a stage group, delta = its cost; timing data-independent). @kv2k ms/super-chunk: **moe_experts 881 (35%)**, attention 657 (26%, grows w/ kv), qkv_proj+inorm 298 (12%), dense_ffn 296 (12%), o_proj 119 (5%), moe_postnorm+combine **only 102 (4%)**, router/embed ~0. FINDINGS: (1) floor ~1685ms is MoE-dominated + dead-constant across kv; (2) attention is 26% even @kv2k (large FIXED cost, not negligible); (3) the "fuse the norm/combine" shot is DEFLATED — the memory-bound part is only 4% (the 383ms "elementwise" was 296ms compute-bound dense-FFN GEMM + 102ms elementwise); a fusion recovers ~1.4% → below bar, NOT built. ~90% of prefill is compute-bound GEMM/MoE at the wall → residual MLX gap = per-flop constant factor; the one non-wall lever was the MoE weight-load regime above. |
 | **E18 fused flash prefill** — **CLOSED (full hd=512) 2026-07-13; SLIDING SHIPPED default-on 2026-07-15 (`DGQ_FLASH_PREFILL`)** | Full hd=512 path CLOSED (3× slower than E17). **Sliding-layer revival SHIPPED default-on:** window + ring support on `attn_flash`; `encode_attn_flash_sliding` routes the 25 hd=256 sliding layers. Isolated: mma2 34.4 ms / 0.50 TF/s vs flash+window 14.1 ms / 1.22 TF/s = **2.44×**. E2E kv=15k M=1024 (with topk): attn 973→807 (−17%), total 2837→2666 (−6%). Gate PASS: smoketest 17/17 ×{7,42,123}, longctx 4/4. Non-bit-identical (online softmax). `DGQ_FLASH_PREFILL=0` restores mma2. 

@@ -142,7 +142,7 @@ fn tool_compact_m1_m2_and_overlong_smoke() {
             .zip(session.kv_valid_tokens())
             .take_while(|(a, b)| a == b)
             .count();
-        session.truncate_kv_to(reuse);
+        session.truncate_kv_to(reuse).unwrap();
         session.extend_kv(&ext[reuse..]).unwrap();
         assert_eq!(session.kv_valid_tokens(), &ext[..]);
 
@@ -170,7 +170,7 @@ fn tool_compact_m1_m2_and_overlong_smoke() {
             .zip(session.kv_valid_tokens())
             .take_while(|(a, b)| a == b)
             .count();
-        session.truncate_kv_to(reuse);
+        session.truncate_kv_to(reuse).unwrap();
         session.extend_kv(&canonical[reuse..]).unwrap();
         assert_eq!(session.kv_valid_tokens(), &canonical[..]);
         assert!(

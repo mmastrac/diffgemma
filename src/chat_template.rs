@@ -170,6 +170,11 @@ pub fn format_user_prompt(user_text: &str) -> String {
 }
 
 /// Strip control tokens from decoded model output before storing in history.
+///
+/// Also removes thought-channel spans and orphan `<channel|>` / `<|channel>`
+/// markers. The model sometimes re-emits a close after the answer
+/// (`…rustc.<channel|><|tool_call>…`); stream split only consumes the first
+/// close, so leftovers must die here or they leak into OpenAI `content`.
 pub fn sanitize_model_reply(text: &str) -> String {
     let mut s = text.to_string();
     if let Some(idx) = s.find(TURN_CLOSE) {
@@ -178,9 +183,20 @@ pub fn sanitize_model_reply(text: &str) -> String {
     if let Some(idx) = s.find(TURN_OPEN) {
         s.truncate(idx);
     }
-    s = s.replace(&format!("{CHANNEL_OPEN}thought\n{CHANNEL_CLOSE}"), "");
-    s = s.replace(&format!("{CHANNEL_OPEN}thought\n"), "");
+    s = strip_channel_markup(&s);
     s.trim().to_string()
+}
+
+/// Drop `<|channel>…<channel|>` spans and any leftover channel markers.
+fn strip_channel_markup(text: &str) -> String {
+    let mut result = String::new();
+    for part in text.split(CHANNEL_CLOSE) {
+        match part.split_once(CHANNEL_OPEN) {
+            Some((before, _)) => result.push_str(before),
+            None => result.push_str(part),
+        }
+    }
+    result.replace(CHANNEL_OPEN, "").replace(CHANNEL_CLOSE, "")
 }
 
 #[cfg(test)]
@@ -222,6 +238,26 @@ mod tests {
     #[test]
     fn sanitize_strips_turn_close() {
         assert_eq!(sanitize_model_reply("Hello world<turn|>\n"), "Hello world");
+    }
+
+    #[test]
+    fn sanitize_strips_trailing_channel_close() {
+        assert_eq!(
+            sanitize_model_reply("then I will run it using rustc.<channel|>"),
+            "then I will run it using rustc."
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_empty_thought_ceremony_and_orphan_close() {
+        assert_eq!(
+            sanitize_model_reply("<|channel>thought\n<channel|>Answer.<channel|>"),
+            "Answer."
+        );
+        assert_eq!(
+            sanitize_model_reply("<|channel>\n\n<channel|>Plan.<channel|>"),
+            "Plan."
+        );
     }
 
     #[test]

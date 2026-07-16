@@ -229,11 +229,7 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
         match (self.thinking, close_at) {
             (true, Some(k)) => {
                 let reasoning = self.clean_reasoning(&ids[..k]);
-                let content = crate::chat_template::sanitize_model_reply(
-                    &self
-                        .decoder
-                        .decode(&crate::sample::strip_degenerate_token_ids(&ids[k + 1..])),
-                );
+                let content = self.decode_content(&ids[k + 1..]);
                 Split { reasoning, content }
             }
             (true, None) => Split {
@@ -242,31 +238,59 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
             },
             (false, _) => Split {
                 reasoning: String::new(),
-                content: crate::chat_template::sanitize_model_reply(
-                    &self
-                        .decoder
-                        .decode(&crate::sample::strip_degenerate_token_ids(ids)),
-                ),
+                content: self.decode_content(ids),
             },
         }
+    }
+
+    /// Decode answer-side ids: drop further channel specials (the model may
+    /// re-emit `<channel|>` after the answer), then sanitize the text.
+    fn decode_content(&self, ids: &[u32]) -> String {
+        let filtered: Vec<u32> = ids
+            .iter()
+            .copied()
+            .filter(|&id| {
+                Some(id) != self.channel_open && Some(id) != self.channel_close
+            })
+            .collect();
+        crate::chat_template::sanitize_model_reply(
+            &self
+                .decoder
+                .decode(&crate::sample::strip_degenerate_token_ids(&filtered)),
+        )
     }
 
     /// Decode a reasoning-region id slice and strip the `<|channel>thought\n`
     /// opener scaffold the model emits when thinking is enabled.
     fn clean_reasoning(&self, ids: &[u32]) -> String {
-        // Drop a leading channel-open special id if present.
-        let start = match (self.channel_open, ids.first()) {
-            (Some(open), Some(&first)) if first == open => 1,
-            _ => 0,
-        };
+        // Drop channel specials entirely — mid-thought re-opens (or stale-canvas
+        // leftovers) must not survive as nested Thought UI markup.
+        let filtered: Vec<u32> = ids
+            .iter()
+            .copied()
+            .filter(|&id| {
+                Some(id) != self.channel_open && Some(id) != self.channel_close
+            })
+            .collect();
         let raw = self
             .decoder
-            .decode(&crate::sample::strip_degenerate_token_ids(&ids[start..]));
-        raw.trim_start_matches("<|channel>")
+            .decode(&crate::sample::strip_degenerate_token_ids(&filtered));
+        let mut s = raw
+            .trim_start_matches("<|channel>")
             .trim_start()
             .trim_start_matches("thought")
             .trim()
-            .to_string()
+            .to_string();
+        // Text-form markers (BPE of the scaffold, or decoded specials).
+        for marker in [
+            "<|channel>thought\n",
+            "<|channel>thought",
+            "<|channel>",
+            "<channel|>",
+        ] {
+            s = s.replace(marker, "");
+        }
+        s.trim().to_string()
     }
 
     /// The current speculative answer draft: the stable-prefix answer region,
@@ -605,6 +629,22 @@ pub(crate) fn write_json_log(
     std::fs::write(path, body).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// Same as [`write_json_log`], then `fsync` so a killed process still leaves a
+/// durable file (used for per-block model logs flushed mid-generation).
+pub(crate) fn write_json_log_sync(
+    path: &std::path::Path,
+    record: &serde_json::Value,
+) -> Result<(), String> {
+    use std::io::Write;
+    let body = serde_json::to_string_pretty(record).map_err(|e| e.to_string())?;
+    let mut f = std::fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    f.write_all(body.as_bytes())
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    f.sync_all()
+        .map_err(|e| format!("{}: sync: {e}", path.display()))?;
+    Ok(())
+}
+
 /// `serve-NNNNN.json` — server-side turn record for response `seq`.
 pub(crate) fn write_serve_log(
     dir: &std::path::Path,
@@ -617,6 +657,7 @@ pub(crate) fn write_serve_log(
 }
 
 /// `model-NNNNN-MMMMM.json` — per-block denoise stats for response `seq`, block `block`.
+/// Syncs to disk so mid-turn kills still leave completed blocks.
 pub(crate) fn write_model_block_log(
     dir: &std::path::Path,
     seq: u64,
@@ -624,7 +665,7 @@ pub(crate) fn write_model_block_log(
     record: &serde_json::Value,
 ) -> Result<std::path::PathBuf, String> {
     let path = dir.join(format!("model-{seq:05}-{block:05}.json"));
-    write_json_log(&path, record)?;
+    write_json_log_sync(&path, record)?;
     Ok(path)
 }
 
@@ -638,7 +679,7 @@ fn finish_reason_for(tool_calls: &[serde_json::Value], stopped: bool) -> &'stati
     }
 }
 
-fn block_stats_to_json(
+pub(crate) fn block_stats_to_json(
     stats: &crate::generate::BlockDenoiseStats,
     tokenizer: &crate::tokenizer::Tokenizer,
     stop_token: Option<&str>,
@@ -761,7 +802,10 @@ pub(crate) fn run_summarize_pass(
     let result = crate::metal::generate_with_session(session, &prompt, &cfg, "tool-compact");
     // Always rewind — the verbose response, the instruction, and the summary
     // itself must never persist in the conversation's KV.
-    session.rollback_to(&cp);
+    if let Err(err) = session.rollback_to(&cp) {
+        eprintln!("serve: tool-compact: summarize KV rollback failed: {err}");
+        return None;
+    }
     let out = match result {
         Ok(o) => o,
         Err(err) => {

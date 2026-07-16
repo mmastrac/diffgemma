@@ -11,6 +11,8 @@
 //! token log — the sanitized answer, no `thought` channel, no generation-prompt
 //! scaffold. That log is a genuine prefix of the next turn's prompt, so the
 //! snapshot survives a swap and reasoning never persists. See [`finalize`].
+//! Truncating past a sliding-ring wrap re-prefills the kept prefix (clamping
+//! `kv_len` alone would leave early ring slots holding post-wrap K/V).
 //!
 //! **Tiers** (v2). A conversation's KV snapshot lives in exactly one place:
 //! - **RAM** — recent snapshots, bounded by a byte budget.
@@ -325,6 +327,10 @@ impl ConversationManager {
     /// re-deriving the tail. That log is a clean prefix of the next turn's prompt,
     /// so the snapshot stays reusable across the swap and reasoning never persists.
     ///
+    /// After the hot sequence wraps a sliding ring, truncate rebuilds the kept
+    /// prefix by re-prefill (ring slots for early absolute positions were
+    /// overwritten). Below the wrap this stays an O(1) `kv_len` clamp.
+    ///
     /// A near-context-full turn can produce a canonical log longer than the KV
     /// can hold with canvas headroom (the last block may overshoot the token
     /// budget by up to a block): the KV keeps the longest fitting *prefix* —
@@ -333,7 +339,7 @@ impl ConversationManager {
     pub fn finalize(&mut self, id: u64, canonical_tokens: &[u32]) -> Result<(), Error> {
         let fit = canonical_tokens.len().min(self.session.extend_capacity());
         let reuse = common_prefix_len(self.session.kv_valid_tokens(), canonical_tokens).min(fit);
-        self.session.truncate_kv_to(reuse);
+        self.session.truncate_kv_to(reuse)?;
         self.session.extend_kv(&canonical_tokens[reuse..fit])?;
         if let Some(c) = self.convs.get_mut(&id) {
             c.tokens = canonical_tokens.to_vec();

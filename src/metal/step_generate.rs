@@ -20,9 +20,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Per-denoise-step progress snapshot for live UIs (chat streaming/spinner).
-/// `argmax` is the current full-canvas argmax — under the MLX-exact sampler
-/// the block's final commit IS the last step's argmax, so a stable prefix of
-/// this is a faithful preview of the final text.
+/// `argmax` is the **active** canvas slice only (not stale rows past
+/// `active_canvas` after E6 shrink-on-retry). Under the MLX-exact sampler the
+/// block's final commit IS that slice, so a stable prefix is a faithful preview.
 pub struct StepProgressEvent<'a> {
     /// 1-based committed-block index this step belongs to.
     pub block_idx: usize,
@@ -31,19 +31,28 @@ pub struct StepProgressEvent<'a> {
     /// 1-based denoise step within the block.
     pub step_in_block: u32,
     pub max_steps: usize,
-    /// Full-canvas argmax of this step (CANVAS entries).
+    /// Active-canvas argmax of this step (`active_canvas` entries).
     pub argmax: &'a [u32],
     /// Positions accepted by the entropy-bound rule this step.
     pub accept_count: u32,
     /// Mean per-position entropy (nats) this step.
     pub mean_entropy: f32,
-    /// True when this was the block's final step (its argmax got committed).
+    /// True when this block's argmax is finalized and will not be E6-retried.
+    /// Mid-attempt "would-stop" steps stay false so stream mappers never commit
+    /// a discarded empty/degenerate canvas (which used to splice a second
+    /// `<|channel>thought` into `reasoning_content`).
     pub block_done: bool,
 }
 
 /// Called after every denoise step with the current canvas snapshot. Must be
 /// cheap; runs on the generation thread.
 pub type StepObserver = std::sync::Arc<dyn Fn(&StepProgressEvent<'_>) + Send + Sync>;
+
+/// Called once per committed denoise block after its stats (incl. token ids and
+/// stop metadata) are finalized. Serve uses this to flush `model-*.json` to
+/// disk before the next block so a killed process still leaves partial logs.
+pub type BlockCommitObserver =
+    std::sync::Arc<dyn Fn(&crate::generate::BlockDenoiseStats) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct StepGenerateConfig {
@@ -74,6 +83,8 @@ pub struct StepGenerateConfig {
     pub degenerate_reply_check: Option<std::sync::Arc<dyn Fn(&[u32]) -> bool + Send + Sync>>,
     /// Optional per-step progress callback (chat streaming / spinner).
     pub step_observer: Option<StepObserver>,
+    /// Optional per-block commit callback (serve model-log flush).
+    pub block_commit_observer: Option<BlockCommitObserver>,
 }
 
 impl std::fmt::Debug for StepGenerateConfig {
@@ -95,6 +106,10 @@ impl std::fmt::Debug for StepGenerateConfig {
                 &self.degenerate_reply_check.is_some(),
             )
             .field("step_observer", &self.step_observer.is_some())
+            .field(
+                "block_commit_observer",
+                &self.block_commit_observer.is_some(),
+            )
             .finish()
     }
 }
@@ -120,6 +135,7 @@ impl StepGenerateConfig {
             continue_incomplete_tool_calls: false,
             degenerate_reply_check: None,
             step_observer: None,
+            block_commit_observer: None,
         }
     }
 }
@@ -235,6 +251,18 @@ fn longest_common_prefix(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
+/// Whether shortening KV from `old_len` to `new_len` must re-prefill the kept
+/// prefix. After a sliding ring wraps, slots for early absolute positions hold
+/// post-wrap K/V; clamping `kv_len` alone would leave them stale (serve
+/// finalize after a long aborted write → next-turn alpha soup).
+pub(crate) fn kv_truncate_needs_ring_rebuild(
+    old_len: usize,
+    new_len: usize,
+    ring: Option<usize>,
+) -> bool {
+    new_len < old_len && ring.is_some_and(|r| old_len > r)
+}
+
 /// A saved KV position captured by [`StepGenerateSession::checkpoint`] and
 /// restored by [`StepGenerateSession::rollback_to`]. Plain values (no borrow of
 /// the session), so a conversation manager can hold one across turns.
@@ -340,12 +368,17 @@ impl StepGenerateSession {
     /// pins both the runtime `kv_len` and the length of the causal token log so
     /// the two stay consistent. Values only — safe to hold across turns.
     ///
-    /// Rollback is O(1): the physical KV past `kv_len` is left stale but is never
-    /// read (attention reads `[0, kv_len)`) and is overwritten by the next
-    /// prefill. This is the low-level control the conversation manager uses to
-    /// keep ephemeral content — e.g. a turn's `thought`-channel reasoning — OUT
-    /// of the persisted context: checkpoint after the user message, generate,
-    /// roll back, then extend with only the sanitized answer.
+    /// The conversation manager uses this to keep ephemeral content — e.g. a
+    /// turn's `thought`-channel reasoning — OUT of the persisted context:
+    /// checkpoint after the user message, generate, roll back, then extend with
+    /// only the sanitized answer.
+    ///
+    /// When the sequence never wrapped a sliding ring, rollback is O(1)
+    /// (`kv_len` clamp; bytes past the new length are unread). After a ring
+    /// wrap, rollback must re-prefill the kept prefix — early ring slots were
+    /// overwritten by absolute positions `≥ ring` and truncating `kv_len` alone
+    /// would leave those positions with the wrong K/V (serve finalize repro:
+    /// aborted long write → truncate → next turn alpha-soup).
     pub fn checkpoint(&self) -> KvCheckpoint {
         KvCheckpoint {
             kv_len: self.rt.read_params().kv_len,
@@ -353,26 +386,68 @@ impl StepGenerateSession {
         }
     }
 
+    /// Sliding-ring slot count (power-of-two window), or `None` if every layer
+    /// is linear (no wrap possible).
+    fn sliding_ring_len(&self) -> Option<usize> {
+        self.rt.layout().layers.iter().find_map(|l| {
+            (l.kv_ring_mask != 0).then_some(l.kv_ring_mask as usize + 1)
+        })
+    }
+
+    /// Rebuild causal positions `[0, tokens)` by reset + prefill. Used when a
+    /// ring wrap has invalidated the kept prefix's sliding-layer slots.
+    fn rebuild_kv_prefix(&mut self, tokens: &[u32]) -> Result<(), Error> {
+        self.reset_kv();
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        self.extend_kv(tokens)
+    }
+
     /// Return the session's KV to a previously captured `checkpoint`, discarding
     /// everything causally appended since (see [`checkpoint`](Self::checkpoint)).
     /// The checkpoint must not be ahead of the current KV — a stale checkpoint
     /// from a longer past state is ignored (clamped) rather than trusted.
-    pub fn rollback_to(&mut self, cp: &KvCheckpoint) {
-        let tokens = cp.tokens.min(self.kv_valid_tokens.len());
+    pub fn rollback_to(&mut self, cp: &KvCheckpoint) -> Result<(), Error> {
+        let old = self.kv_valid_tokens.len();
+        let tokens = cp.tokens.min(old);
+        if kv_truncate_needs_ring_rebuild(old, tokens, self.sliding_ring_len()) {
+            let kept = self.kv_valid_tokens[..tokens].to_vec();
+            return self.rebuild_kv_prefix(&kept);
+        }
         self.rt
             .set_kv_len(cp.kv_len.min(self.kv_valid_tokens.len() as u32));
         self.kv_valid_tokens.truncate(tokens);
+        Ok(())
     }
 
-    /// Truncate the resident KV to its first `n_tokens` causal positions (the
-    /// physical bytes past `n_tokens` are left stale but never read; the next
-    /// `extend_kv`/prefill overwrites them). The raw-length twin of
-    /// `rollback_to`, used by the conversation manager's turn finalize: roll back
-    /// to the reuse point, then `extend_kv` the canonical (thought-free) tail.
-    pub fn truncate_kv_to(&mut self, n_tokens: usize) {
-        let n = n_tokens.min(self.kv_valid_tokens.len());
+    /// Truncate the resident KV to its first `n_tokens` causal positions.
+    /// Twin of `rollback_to` for the conversation manager's turn finalize:
+    /// roll back to the reuse point, then `extend_kv` the canonical
+    /// (thought-free) tail.
+    ///
+    /// If `n_tokens < len` after the sequence wrapped a sliding ring, rebuilds
+    /// the kept prefix via re-prefill (see [`checkpoint`](Self::checkpoint)).
+    /// Otherwise O(1): bytes past `n_tokens` are left stale but unread.
+    pub fn truncate_kv_to(&mut self, n_tokens: usize) -> Result<(), Error> {
+        let old = self.kv_valid_tokens.len();
+        let n = n_tokens.min(old);
+        if n == old {
+            return Ok(());
+        }
+        if kv_truncate_needs_ring_rebuild(old, n, self.sliding_ring_len()) {
+            let kept = self.kv_valid_tokens[..n].to_vec();
+            if crate::flags::progress_enabled() {
+                eprintln!(
+                    "truncate_kv_to: ring rebuild {old} -> {n} tokens (ring={:?})",
+                    self.sliding_ring_len()
+                );
+            }
+            return self.rebuild_kv_prefix(&kept);
+        }
         self.rt.set_kv_len(n as u32);
         self.kv_valid_tokens.truncate(n);
+        Ok(())
     }
 
     /// The most causal tokens the KV can hold while leaving room for one canvas
@@ -930,15 +1005,17 @@ pub fn generate_with_session(
                     stop_reason,
                 );
                 if let Some(ref observer) = cfg.step_observer {
+                    // Never mark block_done here: E6 may still discard this canvas.
+                    // Active slice only — rows past `active` are stale after shrink.
                     observer(&StepProgressEvent {
                         block_idx,
                         max_blocks,
                         step_in_block: block_step_count,
                         max_steps,
-                        argmax: &st.prev_argmax,
+                        argmax: &st.prev_argmax[..active],
                         accept_count: stats.accept_count,
                         mean_entropy: st.mean_entropy,
-                        block_done: stop_reason != DenoiseStopReason::None,
+                        block_done: false,
                     });
                 }
                 if stop_reason != DenoiseStopReason::None {
@@ -969,6 +1046,19 @@ pub fn generate_with_session(
                 );
                 rt.reset_block(VOCAB, &mut rng, params);
                 continue 'attempt;
+            }
+            // Accepted: notify streamers that this block's active argmax is final.
+            if let Some(ref observer) = cfg.step_observer {
+                observer(&StepProgressEvent {
+                    block_idx,
+                    max_blocks,
+                    step_in_block: block_step_count,
+                    max_steps,
+                    argmax: &st.prev_argmax[..active],
+                    accept_count: accept_hist.last().copied().unwrap_or(0),
+                    mean_entropy: st.mean_entropy,
+                    block_done: true,
+                });
             }
             break 'attempt (
                 st,
@@ -1117,6 +1207,9 @@ pub fn generate_with_session(
         }
         let kept = stats.kept_tokens;
         stats.token_ids = argmax_tokens[..kept].to_vec();
+        if let Some(ref obs) = cfg.block_commit_observer {
+            obs(&stats);
+        }
         block_stats.push(stats);
         if end_turn {
             break;

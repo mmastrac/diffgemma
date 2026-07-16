@@ -89,6 +89,85 @@ fn thinking_splits_reasoning_from_content() {
 }
 
 #[test]
+fn thinking_drops_trailing_channel_close_from_content() {
+    // Real log shape: <open> … <close> Answer <close> (extra close before tools).
+    let open = 1u32;
+    let close = 2u32;
+    let mut m =
+        DiffusionStreamMapper::new(FakeDecoder, vec![], Some(open), Some(close), true, false);
+    let canvas = [
+        open,
+        c('x'),
+        close,
+        c('O'),
+        c('k'),
+        close, // must not leak into content
+        c('!'),
+    ];
+    let _ = m.on_step(&step(1, 2, &canvas, true));
+    assert_eq!(m.content(), "Ok!");
+}
+
+/// Decoder that surfaces channel specials as their literal markup (like the
+/// real SentencePiece specials), so mid-thought re-opens stay detectable.
+struct ChannelDecoder;
+impl TextDecoder for ChannelDecoder {
+    fn decode(&self, ids: &[u32]) -> String {
+        let mut s = String::new();
+        self.decode_append(&mut s, ids);
+        s
+    }
+    fn decode_append(&self, out: &mut String, ids: &[u32]) {
+        for &id in ids {
+            match id {
+                1 => out.push_str("<|channel>"),
+                2 => out.push_str("<channel|>"),
+                3 => out.push_str("thought"),
+                10 => out.push('\n'),
+                id if (32..127).contains(&id) => out.push(id as u8 as char),
+                _ => {}
+            }
+        }
+    }
+}
+
+#[test]
+fn thinking_strips_nested_channel_reopen_from_reasoning() {
+    // OpenCode nests a Thought UI when `<|channel>thought` appears mid-reasoning.
+    let open = 1u32;
+    let close = 2u32;
+    let thought = 3u32;
+    let mut m =
+        DiffusionStreamMapper::new(ChannelDecoder, vec![], Some(open), Some(close), true, false);
+    // <open> thought \n Hello <open> thought \n world <close>
+    let canvas = [
+        open,
+        thought,
+        c('\n'),
+        c('H'),
+        c('i'),
+        open,
+        thought,
+        c('\n'),
+        c('!'),
+        close,
+        c('A'),
+    ];
+    let _ = m.on_step(&step(1, 2, &canvas, true));
+    assert!(
+        !m.reasoning().contains("<|channel>"),
+        "nested open leaked: {:?}",
+        m.reasoning()
+    );
+    assert!(
+        !m.reasoning().contains("<channel|>"),
+        "close leaked: {:?}",
+        m.reasoning()
+    );
+    assert_eq!(m.content(), "A");
+}
+
+#[test]
 fn stop_token_ends_and_cuts() {
     let mut m = DiffusionStreamMapper::new(FakeDecoder, vec![99], None, None, false, false);
     let canvas = [c('O'), c('k'), 99, c('X')];
