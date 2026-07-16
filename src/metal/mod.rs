@@ -77,7 +77,7 @@ pub use step_kernel::{
     RouteScratch, StepFinishMode, StepParams, StepSmokeConfig, TOP_K, bench_fused_gemm_dispatches,
     bench_step_kernel, bench_step_kernel_encode_subprofile, bench_step_kernel_prefill_super,
     bench_step_kernel_prefill_super_stages, bench_step_kernel_profile,
-    bench_step_kernel_profile_steps, fill_token_slot,
+    bench_step_kernel_profile_steps, fill_token_slot, run_step_attn_qk_plane_dump,
     layer_moe_block_jobs, run_embed_row_gpu, run_step_probe, run_step_smoke,
 };
 pub use step_kv::{

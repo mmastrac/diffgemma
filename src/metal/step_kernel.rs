@@ -3329,7 +3329,10 @@ impl StepEnc<'_> {
             s_head_stride: (m * np) as u32,
             head_base: 0,
         };
-        let k_param = crate::flags::attn_topk_k().min(crate::flags::attn_topk_k_pad()) as u32;
+        // kv-adaptive k (DGQ_ATTN_TOPK_DYN): k grows with context, capped by
+        // the compiled K_PAD. Fixed DGQ_ATTN_TOPK_K otherwise.
+        let k_param =
+            crate::flags::attn_topk_k_for(t_total).min(crate::flags::attn_topk_k_pad()) as u32;
         let tg128 = MTLSize { width: 128, height: 1, depth: 1 };
         let tg_sm = MTLSize { width: SOFTMAX_TPG, height: 1, depth: 1 };
         let tg_pv = MTLSize { width: 32, height: 1, depth: 1 };  // one simdgroup

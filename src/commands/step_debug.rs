@@ -298,6 +298,56 @@ pub(crate) fn run_step_attn_dump_cmd(
         }
     }
 }
+/// E22-M0 (task #101): prefill a document, run one denoise-step forward to
+/// `--attn-layer`, and dump the full canvas Q plane + the layer's K cache as
+/// raw f32 binaries (+ meta json) into `-o OUT_DIR`. Consumed by
+/// `python/scripts/e22_block_mass.py`.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_step_attn_qk_dump_cmd(
+    model_dir: &std::path::Path,
+    prompt: Option<String>,
+    layers: usize,
+    seed: u64,
+    max_seq: usize,
+    raw_prompt: bool,
+    output: &std::path::Path,
+    layer: usize,
+) -> ExitCode {
+    use metal::{StepSmokeConfig, run_step_attn_qk_plane_dump};
+
+    if !dgq::store::looks_like_dgq_dir(model_dir) {
+        eprintln!("error: step-attn-qk-dump requires a .dgq directory");
+        return ExitCode::FAILURE;
+    }
+    let mut cfg = StepSmokeConfig {
+        layers,
+        steps: 2,
+        kv_len: 0,
+        seed,
+        max_seq,
+        finish: metal::StepFinishMode::ForwardOnly,
+        prefill_token_ids: None,
+        no_early_stop: false,
+    };
+    if let Err(err) = attach_step_prefill(&mut cfg, model_dir, 0, prompt.as_deref(), raw_prompt) {
+        eprintln!("error: {err}");
+        return ExitCode::FAILURE;
+    }
+    match run_step_attn_qk_plane_dump(model_dir, &cfg, layer, output) {
+        Ok((kv_len, total_kv)) => {
+            println!(
+                "wrote q/k planes to {} (layer={layer}, kv_len={kv_len}, total_kv={total_kv})",
+                output.display()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
 #[cfg(target_os = "macos")]
 pub(crate) fn run_step_moe_dump_cmd(
     model_dir: &std::path::Path,

@@ -475,6 +475,73 @@ pub fn run_step_attn_layer_capture(
     })
 }
 
+/// E22-M0 (task #101): dump the FULL step-1 canvas Q plane (post-RoPE, all 256
+/// rows × 16 heads × hd) and the layer's complete K cache, as raw f32 binaries
+/// + a meta json, for offline block-mass analysis
+/// (`python/scripts/e22_block_mass.py`). Same capture flow as
+/// `run_step_attn_layer_capture` but skips the per-row CPU score math — the
+/// planes are the product. Returns (kv_len, total_kv).
+pub fn run_step_attn_qk_plane_dump(
+    model_dir: &Path,
+    cfg: &StepSmokeConfig,
+    layer: usize,
+    out_dir: &Path,
+) -> Result<(u32, usize), Error> {
+    use crate::metal::step_kv::read_layer_k_cache_f32;
+
+    let layer = layer.min(cfg.layers.saturating_sub(1));
+    let (mut rt, _) = build_step_runtime(model_dir, cfg)?;
+    let layout = rt.layout;
+
+    rt.dispatch_and_wait(|enc| {
+        enc.encode_step_preamble(&layout, 1)?;
+        Ok(())
+    })?;
+    for l in 0..layer {
+        rt.encode_full_layer(l)?;
+    }
+    rt.dispatch_and_wait(|enc| {
+        enc.encode_layer_qkv_gemm(layer, &layout)?;
+        Ok(())
+    })?;
+    rt.dispatch_and_wait(|enc| {
+        enc.encode_layer_qk_rope_and_attention(layer, &layout)?;
+        Ok(())
+    })?;
+
+    let l = &layout.layers[layer];
+    let hd = l.head_dim as usize;
+    let nkv = l.n_kv_heads as usize;
+    let q_width = STEP_NQ_HEADS * hd;
+    let kv_len = rt.read_params().kv_len;
+    let total_kv = kv_len as usize + CANVAS;
+
+    let q_all = read_arena_buffer_f32(
+        &rt.bufs.arena,
+        rt.bufs.arena_map.attnq_off() as usize,
+        CANVAS * q_width,
+    );
+    let k_cache = read_layer_k_cache_f32(rt.kvcache(), &layout, layer, total_kv);
+
+    std::fs::create_dir_all(out_dir).map_err(Error::Io)?;
+    let write_f32 = |name: String, v: &[f32]| -> Result<(), Error> {
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
+        std::fs::write(out_dir.join(name), bytes).map_err(Error::Io)
+    };
+    write_f32(format!("q_L{layer}_kv{kv_len}.f32"), &q_all)?;
+    write_f32(format!("k_L{layer}_kv{kv_len}.f32"), &k_cache)?;
+    let is_full = l.is_full != 0;
+    let meta = format!(
+        "{{\"layer\":{layer},\"kv_len\":{kv_len},\"total_kv\":{total_kv},\
+         \"canvas\":{CANVAS},\"n_heads\":{STEP_NQ_HEADS},\"n_kv_heads\":{nkv},\
+         \"head_dim\":{hd},\"is_full\":{is_full}}}"
+    );
+    std::fs::write(out_dir.join(format!("meta_L{layer}_kv{kv_len}.json")), meta)
+        .map_err(Error::Io)?;
+    Ok((kv_len, total_kv))
+}
+
 #[derive(Debug, Clone)]
 pub struct LayerMoeCapture {
     pub layer: usize,

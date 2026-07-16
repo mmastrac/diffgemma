@@ -159,6 +159,14 @@ pub struct PerfFlags {
     /// `attention_topk::tuned_source`, so any k in [1, 1024] is honored (task
     /// #95 unblocked the knob — it used to clamp silently to 64). Default 64.
     pub attn_topk_k: usize,
+    /// `DGQ_ATTN_TOPK_DYN`: kv-adaptive k — per dispatch, k =
+    /// clamp(t_total/128, 64, 512), i.e. a constant ~0.8% FRACTION of context
+    /// instead of a constant count. Motivated by the E22-M0 finding that
+    /// attention mass DIFFUSES with depth (row-top-64 mass: 41% @12k -> 13%
+    /// @121k), while the findings-doc FLOP argument makes large k nearly free
+    /// at long T (QK dominates). Overrides DGQ_ATTN_TOPK_K when set; K_PAD
+    /// compiles at 512. Default OFF.
+    pub attn_topk_dyn: bool,
 }
 
 impl Default for PerfFlags {
@@ -195,6 +203,7 @@ impl Default for PerfFlags {
             attn_mma_full_qk_ilp2: false,
             attn_topk: false,
             attn_topk_k: 64,
+            attn_topk_dyn: false,
         }
     }
 }
@@ -442,6 +451,7 @@ impl RuntimeConfig {
                 attn_mma_full_qk_ilp2: env_on_if_one("DGQ_ATTN_MMA_FULL_QK_ILP2"),
                 attn_topk: env_on_if_one("DGQ_ATTN_TOPK"),
                 attn_topk_k: parse_usize("DGQ_ATTN_TOPK_K", 64).max(1),
+                attn_topk_dyn: env_on_if_one("DGQ_ATTN_TOPK_DYN"),
             },
             prefill: PrefillFlags {
                 f16: env_on_if_one("DGQ_PREFILL_F16"),
@@ -752,7 +762,24 @@ pub fn attn_topk_k() -> usize {
 /// 1024. Pipeline compile (`tuned_source` AG_K_PAD) and the Rust-side plane
 /// allocations must BOTH use this — same value, one source (#97's lesson).
 pub fn attn_topk_k_pad() -> usize {
+    if attn_topk_dyn() {
+        return 512; // dyn k caps at 512 (see attn_topk_k_for)
+    }
     attn_topk_k().next_power_of_two().clamp(64, 1024)
+}
+/// `DGQ_ATTN_TOPK_DYN` (kv-adaptive k).
+pub fn attn_topk_dyn() -> bool {
+    config().perf.attn_topk_dyn
+}
+/// Effective k for a dispatch at `t_total` keys: fixed DGQ_ATTN_TOPK_K, or —
+/// with DGQ_ATTN_TOPK_DYN — a constant ~0.8% fraction of context,
+/// clamp(t_total/128, 64, 512).
+pub fn attn_topk_k_for(t_total: usize) -> usize {
+    if attn_topk_dyn() {
+        (t_total / 128).clamp(64, 512)
+    } else {
+        attn_topk_k()
+    }
 }
 
 /// E18 fused flash prefill. `.0` = enabled, `.1` = BQ (query-row tile), `.2` =

@@ -185,6 +185,17 @@ pub(crate) enum Command {
         layer: usize,
         position: usize,
     },
+    /// E22-M0: dump the full canvas Q plane + layer K cache (raw f32) for
+    /// offline block-mass analysis.
+    StepAttnQkDump {
+        prompt: Option<String>,
+        layers: usize,
+        seed: u64,
+        max_seq: usize,
+        raw_prompt: bool,
+        output: PathBuf,
+        layer: usize,
+    },
     StepMoeDump {
         prompt: Option<String>,
         layers: usize,
@@ -399,6 +410,18 @@ pub(crate) fn parse_cli() -> Cli {
             "-p" | "--prompt" => {
                 if let Some(text) = args.next() {
                     prompt = Some(text);
+                }
+            }
+            // Large prompts (100k-token oracle corpora) don't fit in argv.
+            "--prompt-file" => {
+                if let Some(path) = args.next() {
+                    match std::fs::read_to_string(&path) {
+                        Ok(text) => prompt = Some(text),
+                        Err(err) => {
+                            eprintln!("error: --prompt-file {path}: {err}");
+                            std::process::exit(2);
+                        }
+                    }
                 }
             }
             "-m" | "--model" => {
@@ -964,6 +987,24 @@ pub(crate) fn parse_cli() -> Cli {
                 output,
                 layer: step_attn_layer,
                 position: step_layer_position,
+            }
+        }
+        Some("step-attn-qk-dump") => {
+            let output = output_dir.unwrap_or_else(|| {
+                eprintln!(
+                    "usage: diffgemma-mps step-attn-qk-dump -m MODEL -o OUT_DIR \
+                     [--prompt-file DOC] [--attn-layer 5] [--max-seq N] [--seed 42]"
+                );
+                std::process::exit(2);
+            });
+            Command::StepAttnQkDump {
+                prompt: prompt.clone(),
+                layers: layers_for_parity_dump(parity_layers),
+                seed,
+                max_seq: step_max_seq.max(64),
+                raw_prompt,
+                output,
+                layer: step_attn_layer,
             }
         }
         Some("step-moe-dump") => {
