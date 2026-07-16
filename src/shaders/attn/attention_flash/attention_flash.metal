@@ -108,6 +108,15 @@ kernel void attn_flash(
         rm[r] = -INFINITY;
         rl[r] = 0.f;
     }
+    // Qs is staged STRIDED BY tid above but every simdgroup reads the WHOLE tile
+    // (simdgroup_load in the QK step). Without this barrier the first K-block
+    // iteration races the staging: correctness then depends on warp timing, so
+    // prefill stops being reproducible run-to-run (task #99 — layer 0's KV stayed
+    // bit-identical because it is written before attention, while layer 0's
+    // attention OUTPUT diverged and amplified through depth). Later iterations
+    // are covered by the barrier at the end of the K-block loop; only the first
+    // read was exposed.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     simdgroup_float8x8 O[FL_BQ / 8u][(FL_HD / 8u) / 8u];   // [TM][TN]
     for (uint i = 0u; i < TM; ++i) {
         for (uint j = 0u; j < TN; ++j) {

@@ -629,7 +629,36 @@ impl MetalContext {
         let function = library
             .newFunctionWithName_constantValues_error(&name, &fc)
             .map_err(|e| shader_compile_error(e))?;
-        let label = variant.cache_label_extra(entry, extra_label);
+        // Fold the SOURCE hash + the extra function-constant values into the cache
+        // label. `PipelineArchiveCache` dedupes by label, and `cache_label_extra`
+        // only covers `entry` + the shared FC triple + whatever string the caller
+        // remembered to pass — so anything a kernel specializes on OUTSIDE that
+        // set collides silently and the first-compiled pipeline is handed back.
+        //
+        // Two live instances this closes:
+        //   - `attention_flash::pipeline_flash` prepends `#define FL_HD/FL_BQ/FL_BK`
+        //     via `tuned_source` but labels every variant `"flash"` — so hd=256
+        //     (sliding, production) and hd=512 (full) shared a label, and whichever
+        //     compiled first won. Same for `attention_gemm`'s `"tune"`.
+        //   - extra_bools/extra_uints are real specializations that never reached
+        //     the label; call sites encode them by CONVENTION (`"side"`/`"default"`,
+        //     `fmt.label()`), which is one forgotten string away from a silent
+        //     miscompile.
+        //
+        // This is the same class as the GEMM `bm=32`/`bm=64` collision fixed in
+        // 0281c0a (source-baked TUNE_BM absent from the label → a bm=32 kernel ran
+        // for bm=64 and zeroed half the rows). That fix hashed the source into the
+        // *GEMM* label only; this closes the class for every `compile_subkernel_ex`
+        // caller. Deriving the label from the actual inputs beats remembering to
+        // pass a distinguishing string.
+        let mut label = variant.cache_label_extra(entry, extra_label);
+        label.push_str(&format!("_s{:x}", source_hash(source)));
+        for b in extra_bools {
+            label.push_str(&format!("_b{}={}", b.index, u8::from(b.value)));
+        }
+        for u in extra_uints {
+            label.push_str(&format!("_u{}={}", u.index, u.value));
+        }
         let cache = PipelineArchiveCache::shared(device)?;
         let pipeline = cache.compile_compute(device, &function, &label)?;
         Ok(ComputePipeline { pipeline })
