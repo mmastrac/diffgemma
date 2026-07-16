@@ -4748,6 +4748,12 @@ impl StepRuntime {
         &self.layout
     }
 
+    /// Model sliding-window size (Gemma-4: 1024). A sliding layer's query at
+    /// position `q` reads keys `[q - (window-1), q]`.
+    pub fn sliding_window(&self) -> usize {
+        self.text_config.sliding_window
+    }
+
     pub fn kvcache(&self) -> &ProtocolObject<dyn MTLBuffer> {
         &self.bufs.kvcache
     }

@@ -255,12 +255,43 @@ fn longest_common_prefix(a: &[u32], b: &[u32]) -> usize {
 /// prefix. After a sliding ring wraps, slots for early absolute positions hold
 /// post-wrap K/V; clamping `kv_len` alone would leave them stale (serve
 /// finalize after a long aborted write → next-turn alpha soup).
+///
+/// A sliding layer stores position `p` at slot `p & (ring-1)`, so the ring only
+/// ever holds the last `ring` **written** positions. Two subtleties make this
+/// exact, and getting either wrong is a corruption or a perf bug:
+///
+/// 1. **Written ≠ committed.** Denoise writes its canvas at `[kv_len,
+///    kv_len+CANVAS)` unconditionally (`kv_write_end = u32::MAX`), even for a
+///    block that is never committed — so an aborted long generation leaves
+///    post-wrap K/V in the early slots while `old_len` still sits below the ring
+///    size. Testing `old_len > ring` (the highest *committed* position) misses
+///    every `old_len ∈ (ring-CANVAS, ring]`, which is a live corruption.
+/// 2. **Only the last window matters.** After truncating to `new_len`, the
+///    deepest position any later query can read is `new_len - (window-1)` (the
+///    first re-issued query sits at `new_len`). Truncations shallower than that
+///    need no rebuild at *any* context length — rebuilding them anyway costs a
+///    full re-prefill of the whole conversation for a 1-token rewind.
+///
+/// So: rebuild iff the deepest position we will still read has already had its
+/// slot reused by a higher one. The `saturating_sub`s are load-bearing — they
+/// are what keeps a not-yet-wrapped ring (incl. `DGQ_KV_RING_UNCAPPED` and any
+/// `max_seq <= ring`, where the ring provably never wraps) off the rebuild path.
 pub(crate) fn kv_truncate_needs_ring_rebuild(
     old_len: usize,
     new_len: usize,
     ring: Option<usize>,
+    window: usize,
 ) -> bool {
-    new_len < old_len && ring.is_some_and(|r| old_len > r)
+    let Some(ring) = ring else {
+        return false; // all-linear layers: slots are never aliased.
+    };
+    if new_len >= old_len {
+        return false;
+    }
+    let written_end = old_len + crate::metal::CANVAS;
+    let oldest_live = written_end.saturating_sub(ring);
+    let deepest_needed = new_len.saturating_sub(window.saturating_sub(1));
+    deepest_needed < oldest_live
 }
 
 /// A saved KV position captured by [`StepGenerateSession::checkpoint`] and
@@ -389,9 +420,11 @@ impl StepGenerateSession {
     /// Sliding-ring slot count (power-of-two window), or `None` if every layer
     /// is linear (no wrap possible).
     fn sliding_ring_len(&self) -> Option<usize> {
-        self.rt.layout().layers.iter().find_map(|l| {
-            (l.kv_ring_mask != 0).then_some(l.kv_ring_mask as usize + 1)
-        })
+        self.rt
+            .layout()
+            .layers
+            .iter()
+            .find_map(|l| (l.kv_ring_mask != 0).then_some(l.kv_ring_mask as usize + 1))
     }
 
     /// Rebuild causal positions `[0, tokens)` by reset + prefill. Used when a
@@ -411,7 +444,12 @@ impl StepGenerateSession {
     pub fn rollback_to(&mut self, cp: &KvCheckpoint) -> Result<(), Error> {
         let old = self.kv_valid_tokens.len();
         let tokens = cp.tokens.min(old);
-        if kv_truncate_needs_ring_rebuild(old, tokens, self.sliding_ring_len()) {
+        if kv_truncate_needs_ring_rebuild(
+            old,
+            tokens,
+            self.sliding_ring_len(),
+            self.rt.sliding_window(),
+        ) {
             let kept = self.kv_valid_tokens[..tokens].to_vec();
             return self.rebuild_kv_prefix(&kept);
         }
@@ -435,7 +473,8 @@ impl StepGenerateSession {
         if n == old {
             return Ok(());
         }
-        if kv_truncate_needs_ring_rebuild(old, n, self.sliding_ring_len()) {
+        if kv_truncate_needs_ring_rebuild(old, n, self.sliding_ring_len(), self.rt.sliding_window())
+        {
             let kept = self.kv_valid_tokens[..n].to_vec();
             if crate::flags::progress_enabled() {
                 eprintln!(
