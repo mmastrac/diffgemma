@@ -173,6 +173,19 @@ prefill, `u32::MAX` otherwise) suppresses their cache stores in
 `qk_rope_kv`. On a ring, past-the-end positions are NOT dead: they wrap onto
 `pos & kv_ring_mask` and clobber the oldest live window slots.
 
+**Full-layer prefill attention runs TOP-K SPARSE by default with kv-adaptive
+k (E20 + `DGQ_ATTN_TOPK_DYN`, signed off 2026-07-16):** per query row, keep
+the k = clamp(t_total/128, 64, 512) highest-scoring keys (exact top-k by f32
+score via 4-level radix on a u16 key plane; deterministic count/prefix-sum
+emission), softmax over that set, gathered-V PV. The k fraction (~0.8% of
+context) exists because attention mass DIFFUSES with depth — fixed k=64
+measurably drops the deepest needle at 121k while dyn matches dense 4/4.
+NOT bit-identical to dense (`DGQ_ATTN_TOPK=0` restores E17 dense; golden
+blessed on the sparse default). Perf: −16% prefill @30k, −28% @100k → within
+~2.5% of MLX-4bit chunked at both depths. Sliding layers are untouched (E18
+flash, window-bounded). Denoise attention remains DENSE — top-k applies to
+prefill full layers only.
+
 ## 4. Denoise step (one forward = one canvas refinement)
 
 Order of operations per step (monolithic GPU path, `interpret_step`):
@@ -392,8 +405,14 @@ Metal's single-buffer cap (20.25 GiB on M3 Pro/36 GB) are split at
 - **Occupancy is the recurring attention wall**: threadgroup-memory footprint
   gates residency; register tiles beat tgmem tiles.
 - Wall-clock: beats MLX-4bit (their fastest config) on short/medium chat;
-  needle-exact to 105k (KV 2.4 GiB); denoise convergence parity-class
+  needle-exact to 121k (KV 2.4 GiB); denoise convergence parity-class
   (~1.15× steps vs MLX's best config, matched-canvas multi-seed).
+- **Long-context prefill (2026-07-16, dynamic top-k default): parity with
+  MLX-4bit chunked across the range** — 30k: 343 vs 355 tok/s (1.04×); 100k:
+  242 vs 248 (0.975×). Dense-attention fallback trails MLX 1.43× at 100k.
+- **Decode at 100k is a SHARED ceiling, not our gap**: ours 1.21 tok/s
+  (~4.4 s/step) vs MLX generation 1.16 tok/s, same round. Sparse DECODE
+  attention is the open differentiation lever (top-k is prefill-only today).
 - Memory: single 36 GB machine is NOT swap-bound to 105k; the cliff is
   ~262k f16 KV (q8-auto covers it) or running beside another model.
 
@@ -414,23 +433,66 @@ opt-in flags for A/B.
   int8-accumulated block-sparse MoE expert GEMM (`gemm_int_sparse`) and benched
   it head-to-head vs the production q4→half-MMA path at real MoE shapes
   (128 experts, gate_up 1408×2816 + down 2816×704, rpe 64/16). Correctness
-  gated FIRST (cos=1.000000 vs CPU int8 oracle at every tile). RESULT: int8 =
-  ~0.43 TFLOP/s vs production = ~3.78 TFLOP/s → **~9× SLOWER**. The synthetic
-  `int_mma_probe` microbench reported int8 dot ≈ f32 FMA ≈ 14× half-MMA in
-  per-instruction GMAC/s and could NOT settle this — the trap is that
-  per-instruction throughput is misleading for GEMM shapes: the half-simdgroup
-  -MMA does 512 MAC/simdgroup-inst (16 MAC/lane) while the int8 char4 dot does
-  4 MAC/lane/inst, AND the int8 path pays 32 sequential dependent int32 adds
-  per fragment element (no MMA register-array parallelism). On M3's
-  SIMD-ALU-emulated matrix unit the half-MMA's per-instruction width dominates
-  the int8 dot's per-lane scalar chain by ~9×, exactly the measured gap. The
-  MLX-dequants-to-half "tell" was PROOF, not oversight. Tile sweep (BM=32/64,
-  BN=64/128) did not help — the loss is in the inner accumulation, not tiling.
-  int4 cannot close a 9× compute gap (and has no dot instruction on M3 — would
-  unpack to int8). `gemm_int_sparse` + `bench-gemm --shapes sparse` kept as
-  documented negative; not wired to production. Lesson: a per-instruction
-  GMAC/s microbench cannot settle a GEMM-shape question — only a real prototype
-  on real shapes can.
+  gated FIRST (cos=1.000000 vs CPU int8 oracle at every tile). Measured: int8 =
+  ~0.43 TFLOP/s vs production = ~3.78 TFLOP/s (~9× slower as built). **RECORD
+  CORRECTED 2026-07-16 (audit reproduced 0.438 TF/s / 9.70×, then decomposed
+  one variable at a time; `debug/review_2026-07-16.md` Part 2): the honest bar
+  for a FUTURE attempt is 5.6×, not 9×, and the mechanism on record was a
+  curve fit.** The 9.7× multiplies THREE factors: **1.72×** = the prototype's
+  own un-register-blocked inner loop (operands re-fetched from tgmem per
+  (i,j); the baseline it was benched against hoists A/B into registers —
+  384 vs 80 tgmem loads per lane per BK=32; register-blocking measured
+  0.755 TF/s), × **2.22×** = int32-multiply vs f32-mad on M3 (the REAL
+  specifically-int8 hardware penalty, never identified in the original
+  write-up), × **2.54×** = what simdgroup-MMA is actually worth vs scalar f32
+  (NOT the ~9× the old entry claimed — the 512-vs-4 MAC arithmetic implies ~4×
+  and cannot produce 9×; it "matched exactly" only by silently absorbing the
+  other two factors). **CONCLUSION UNCHANGED — dead end, do NOT re-test**: a
+  perfectly register-blocked int8 kernel is still 5.6× off, and the two
+  residual factors are hardware properties no restructuring addresses. Also
+  probed the runtime compiler directly on this M3 Pro: `dot(char4,char4)`,
+  `simd_dot_acc_int8`, `dot_product_4x8_packed` are ALL REJECTED — **there is
+  no DP4A-style packed integer dot in MSL**, so the manual 4-scalar expansion
+  was the only expressible form and no fast primitive was missed. int8 W is
+  also ~2× the weight BYTES of q4 (bandwidth penalty independent of the math).
+  `gemm_int_sparse` + `bench-gemm --shapes sparse` kept as documented
+  negatives; not wired to production. Lessons: a per-instruction GMAC/s
+  microbench cannot settle a GEMM-shape question; and **a disproof whose
+  stated mechanism was never independently measured is a curve fit** — a
+  "matches exactly" physics story is the failure mode to distrust, and whoever
+  register-blocks this kernel would have measured a 1.7× win against a strawman
+  bar and mistaken it for progress.
+- **E21: SLC-chunked online-softmax E17 (flash at dispatch granularity)** —
+  parked at its pre-registered kill bar 2026-07-16: E17's S/P DRAM round-trips
+  are only ~8% of the attention stage and the share is FLAT in T (S/P traffic
+  and QK/PV compute both scale linearly — no long-context regime where it
+  grows). ~3% end-to-end, non-bit-identical: below the bar. Revive only for
+  the memory co-benefit (chunking makes S/P scratch T-independent, 1.6 GiB →
+  ~130 MB @100k) if scratch pressure ever bites.
+- **E22: block-granular pre-QK attention selection (Quest/MInference-class)**
+  — killed by measurement 2026-07-16: attention mass is NOT block-concentrated
+  at depth on this model. Real Q/K planes (`step-attn-qk-dump` +
+  `python/scripts/e22_block_mass.py`), real 121k mixed corpus: even ORACLE
+  top-32-of-944 blocks holds 17% of mass; the across-head union reaches 36%
+  only by going ~dense. Selection fidelity was fine (centroid Spearman
+  0.73-0.86) — the territory failed, not the mechanism. Parked toward E16
+  token compaction: the measured structure (sharp retrieval peaks + near-
+  uniform diffuse background) is EVIDENCE FOR fusing aged tokens.
+- **Attention-mass coverage as a quality oracle — IMPEACHED on this model**
+  (2026-07-16): exact row-top-512 holds only 30% of mass at 121k and row-top-64
+  only 13%, yet behavioral retrieval at those k values is clean (doc-QA 4/4 to
+  20.6k at k=64; needle-exact 4/4 at 121k with dynamic k). Mass and quality
+  DECOUPLE: the diffuse background's average — not its composition — is what
+  the output needs. **Never gate a sparsity lever on mass coverage here;
+  behavioral retrieval probes only** (and a probe's markers must be
+  corpus-unique: a "NEEDLE"-named marker inside a corpus of our own docs that
+  discuss needle tests produced pure confabulation artifacts).
+- **E18 flash BQ/BK tile geometry** — non-lever (2026-07-16): interleaved
+  same-batch A/B at kv=15k puts BK=128 at −1.9% and BQ=32 at +0.7%; BK=32/256
+  don't compile. Default (16, 64) stands. The first single-pass sweep showed
+  BK=128 at "−7.9%" — cross-process `bench-prefill-super` runs drift up to
+  ~±4% same-config same-day (vs 0.08% within-process): **never read a
+  cross-process proxy delta <5% without interleaved repeats.**
 - **Flash-decode / sequential KV blocking** — attention is issue-bound at
   SLC service; the lockstep sweep already gets SLC locality. Restructuring
   the sweep bought nothing (`DGQ_ATTN_KV_BLOCK`, default off).

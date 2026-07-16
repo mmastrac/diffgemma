@@ -150,9 +150,13 @@ pub struct PerfFlags {
     pub flash_prefill_bq: usize,
     pub flash_prefill_bk: usize,
     /// `DGQ_ATTN_TOPK` (E20): top-k sparse attention for full-layer PREFILL.
-    /// Reuses E17's QK kernel, then selects the top-k highest-scoring keys per
-    /// (row, head) and gathers V at those indices. Non-bit-identical (only the
-    /// top-k keys are kept); quality-gated. Default OFF (opt-in prototype).
+    /// Reuses E17's QK kernel (+FC32 u16 key plane), selects the top-k
+    /// highest-scoring keys per (row, head) — exact by f32 score,
+    /// deterministic — and gathers V at those indices. Non-bit-identical to
+    /// dense. **Default ON (signed off 2026-07-16** after smoketest 17/17
+    /// ×{7,42,123}, longctx 4/4, needle-exact 4/4 @121k with dynamic k, and
+    /// 100k prefill within 2.5% of MLX; golden blessed on this default).
+    /// `DGQ_ATTN_TOPK=0` restores dense E17.
     pub attn_topk: bool,
     /// `DGQ_ATTN_TOPK_K`: k per query row. The kernel's slot capacity K_PAD is
     /// compiled to `next_power_of_two(k)` (min 64, max 1024) via
@@ -165,7 +169,9 @@ pub struct PerfFlags {
     /// attention mass DIFFUSES with depth (row-top-64 mass: 41% @12k -> 13%
     /// @121k), while the findings-doc FLOP argument makes large k nearly free
     /// at long T (QK dominates). Overrides DGQ_ATTN_TOPK_K when set; K_PAD
-    /// compiles at 512. Default OFF.
+    /// compiles at 512. **Default ON** (the ship policy — fixed k=64
+    /// measurably drops the deepest needle at 121k; dyn matches dense 4/4).
+    /// `DGQ_ATTN_TOPK_DYN=0` + `DGQ_ATTN_TOPK_K=n` restores fixed k.
     pub attn_topk_dyn: bool,
 }
 
@@ -201,9 +207,9 @@ impl Default for PerfFlags {
             flash_prefill_bq: 16,
             flash_prefill_bk: 64,
             attn_mma_full_qk_ilp2: false,
-            attn_topk: false,
+            attn_topk: true,
             attn_topk_k: 64,
-            attn_topk_dyn: false,
+            attn_topk_dyn: true,
         }
     }
 }
@@ -449,9 +455,9 @@ impl RuntimeConfig {
                 flash_prefill_bq: parse_usize("DGQ_FLASH_PREFILL_BQ", 16).max(8),
                 flash_prefill_bk: parse_usize("DGQ_FLASH_PREFILL_BK", 64).max(16),
                 attn_mma_full_qk_ilp2: env_on_if_one("DGQ_ATTN_MMA_FULL_QK_ILP2"),
-                attn_topk: env_on_if_one("DGQ_ATTN_TOPK"),
+                attn_topk: env_on_unless_zero("DGQ_ATTN_TOPK"),
                 attn_topk_k: parse_usize("DGQ_ATTN_TOPK_K", 64).max(1),
-                attn_topk_dyn: env_on_if_one("DGQ_ATTN_TOPK_DYN"),
+                attn_topk_dyn: env_on_unless_zero("DGQ_ATTN_TOPK_DYN"),
             },
             prefill: PrefillFlags {
                 f16: env_on_if_one("DGQ_PREFILL_F16"),
