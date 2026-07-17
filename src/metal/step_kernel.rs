@@ -4859,6 +4859,71 @@ impl StepRuntime {
         self.write_params(params);
     }
 
+    /// FNV-1a (continuing `seed_hash`) over the READABLE KV state at `kv_len`:
+    /// full (linear) layers hash their whole `[0, kv_len)` prefix; sliding
+    /// (ring) layers hash only the last `min(kv_len, window)` positions in
+    /// position order. Ring slots below the window are unreachable by any
+    /// future read and legitimately hold residue after extends near ring
+    /// aliasing (an extend writes slot `pos & mask`; a later truncate cannot
+    /// un-write the dead position that slot used to alias) — so the token
+    /// pipeline's rewind gates probe THIS, not the raw ring bytes.
+    pub fn live_kv_fnv(&self, kv_len: usize, seed_hash: u64) -> u64 {
+        let fmt = crate::flags::kv_format(self.max_seq);
+        let src = unsafe {
+            std::slice::from_raw_parts(
+                self.bufs.kvcache.contents().as_ptr() as *const u8,
+                self.bufs.kvcache.length(),
+            )
+        };
+        let mut h = seed_hash;
+        let mut eat = |bytes: &[u8]| {
+            for &b in bytes {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        };
+        let window = self.sliding_window();
+        for l in &self.layout.layers {
+            let group =
+                crate::metal::step_kv::kv_region_bytes(l.n_kv_heads, l.head_dim, 1, fmt) as usize;
+            let base = l.kv_region as usize;
+            if l.kv_ring_mask == 0 {
+                eat(&src[base..base + kv_len * group]);
+            } else {
+                for p in kv_len.saturating_sub(window)..kv_len {
+                    let off = base + (p & l.kv_ring_mask as usize) * group;
+                    eat(&src[off..off + group]);
+                }
+            }
+        }
+        h
+    }
+
+    /// Fill the ENTIRE monolithic KV cache with a deterministic pseudorandom
+    /// f16-safe pattern (fixed small exponent, random sign + mantissa →
+    /// ±[0.125, 0.25)) and declare `n_tokens` of it causally valid. Test
+    /// infrastructure for the token pipeline's long-context byte-consistency
+    /// gates: a "100k-token" context in ~a second instead of a ~7-minute
+    /// prefill. The values are semantically meaningless but numerically tame,
+    /// so forwards over them stay finite and bit-deterministic — which is all
+    /// the order-of-operations gates assert.
+    pub fn synthetic_fill_kv(&mut self, n_tokens: usize, seed: u64) {
+        let len_bytes = self.bufs.kvcache.length() as usize;
+        let ptr = self.bufs.kvcache.contents().as_ptr() as *mut u16;
+        let words = len_bytes / 2;
+        let mut s = seed | 1;
+        for i in 0..words {
+            // xorshift64* — cheap, deterministic, no external state.
+            s ^= s >> 12;
+            s ^= s << 25;
+            s ^= s >> 27;
+            let r = (s.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as u16;
+            let v = (r & 0x03FF) | 0x3000 | ((r & 0x0400) << 5);
+            unsafe { *ptr.add(i) = v };
+        }
+        self.set_kv_len(n_tokens as u32);
+    }
+
     /// Compact byte snapshot of the live `[0, kv_len)` KV, for saving a
     /// conversation out of the single hot buffer (multi-conversation swap).
     /// Gathers only each layer's valid prefix (see `gather_kv_prefix`), so the

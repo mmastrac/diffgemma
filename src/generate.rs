@@ -99,15 +99,16 @@ pub struct BlockDenoiseStats {
     pub continued_past_stop: bool,
 }
 
+/// Build the step-level config for a generate command (layers resolution,
+/// full-message stop tokens, E6 degenerate-reply check). Shared by the direct
+/// path and the token-pipeline path so both run the identical policy.
 #[cfg(target_os = "macos")]
-pub fn generate_monolithic_gpu(
+pub fn step_config_for_generate(
     model_dir: &std::path::Path,
-    prompt_token_ids: &[u32],
     gen_cfg: &GenerateConfig,
     max_seq: usize,
-    prompt_label: &str,
-) -> Result<GenerateOutput, Error> {
-    use crate::metal::{StepGenerateConfig, generate_monolithic, validate_step_model};
+) -> Result<crate::metal::StepGenerateConfig, Error> {
+    use crate::metal::{StepGenerateConfig, validate_step_model};
     let validated = validate_step_model(model_dir)?;
     let layers = gen_cfg
         .max_layers
@@ -133,7 +134,52 @@ pub fn generate_monolithic_gpu(
     // E6 empty/degenerate-reply canvas re-roll (only when enabled). Detects an
     // empty user-facing reply from the decoded+sanitized committed block.
     cfg.degenerate_reply_check = crate::chat_template::empty_reply_check(model_dir, stops);
-    generate_monolithic(model_dir, prompt_token_ids, &cfg, prompt_label)
+    Ok(cfg)
+}
+
+#[cfg(target_os = "macos")]
+pub fn generate_monolithic_gpu(
+    model_dir: &std::path::Path,
+    prompt_token_ids: &[u32],
+    gen_cfg: &GenerateConfig,
+    max_seq: usize,
+    prompt_label: &str,
+) -> Result<GenerateOutput, Error> {
+    let cfg = step_config_for_generate(model_dir, gen_cfg, max_seq)?;
+    crate::metal::generate_monolithic(model_dir, prompt_token_ids, &cfg, prompt_label)
+}
+
+/// `generate_monolithic_gpu` routed through the token pipeline (its first
+/// production client): same config build, but the session lives on the
+/// pipeline thread and the generate is a serialized op. Output equivalence
+/// with the direct path is pinned by `ask_via_pipeline_matches_direct`.
+#[cfg(target_os = "macos")]
+pub fn generate_monolithic_gpu_pipeline(
+    model_dir: &std::path::Path,
+    prompt_token_ids: &[u32],
+    gen_cfg: &GenerateConfig,
+    max_seq: usize,
+    prompt_label: &str,
+) -> Result<GenerateOutput, Error> {
+    let cfg = step_config_for_generate(model_dir, gen_cfg, max_seq)?;
+    let pipeline = crate::pipeline::Pipeline::spawn(
+        model_dir.to_path_buf(),
+        max_seq,
+        gen_cfg.sampler.max_denoising_steps.max(1),
+    );
+    match pipeline.call(crate::pipeline::PipelineOp::Generate {
+        prompt: prompt_token_ids.to_vec(),
+        cfg: Box::new(cfg),
+        label: prompt_label.to_string(),
+    }) {
+        crate::pipeline::PipelineEvent::Generated { out, .. } => Ok(*out),
+        crate::pipeline::PipelineEvent::Error(msg) => {
+            Err(Error::Pipeline(format!("generate: {msg}")))
+        }
+        other => Err(Error::Pipeline(format!(
+            "generate: unexpected event {other:?}"
+        ))),
+    }
 }
 
 #[cfg(test)]

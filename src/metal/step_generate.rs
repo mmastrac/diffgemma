@@ -314,24 +314,6 @@ pub struct KvSnapshot {
 }
 
 impl KvSnapshot {
-    /// FNV-1a over the snapshot's KV bytes and causal token log — the token
-    /// pipeline's rewind byte-consistency probe (PLAN: any lineage residue a
-    /// rewind leaves behind flips this hash).
-    pub fn fnv64(&self) -> u64 {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        let mut eat = |bytes: &[u8]| {
-            for &b in bytes {
-                h ^= b as u64;
-                h = h.wrapping_mul(0x0000_0100_0000_01b3);
-            }
-        };
-        eat(&self.kv_bytes);
-        for &t in &self.tokens {
-            eat(&t.to_le_bytes());
-        }
-        h
-    }
-
     /// Bytes this snapshot occupies in the pool (the KV buffer copy).
     pub fn byte_len(&self) -> usize {
         self.kv_bytes.len()
@@ -537,6 +519,48 @@ impl StepGenerateSession {
         self.rt.prefill_chunks_from(offset, tokens)?;
         self.kv_valid_tokens.extend_from_slice(tokens);
         Ok(())
+    }
+
+    /// Replace the session's state with a deterministic pseudorandom KV
+    /// declared to be `n_tokens` long (see `StepRuntime::synthetic_fill_kv`).
+    /// The synthetic causal token log is seed-derived (ids well inside vocab,
+    /// so an accidental ring rebuild embeds valid — if meaningless — tokens
+    /// rather than tripping asserts; note a rebuild REPLACES the synthetic
+    /// bytes with real KV, so byte-consistency tests must stay inside the
+    /// O(1)-truncate slack). Test infrastructure only.
+    pub fn synthetic_fill_kv(&mut self, n_tokens: usize, seed: u64) -> Result<(), Error> {
+        if n_tokens + crate::metal::CANVAS > self.rt.max_seq() {
+            return Err(Error::Format(
+                "synthetic fill exceeds max_seq - CANVAS headroom",
+            ));
+        }
+        self.rt.synthetic_fill_kv(n_tokens, seed);
+        let mut s = seed ^ 0x9E37_79B9_7F4A_7C15 | 1;
+        self.kv_valid_tokens = (0..n_tokens)
+            .map(|_| {
+                s ^= s >> 12;
+                s ^= s << 25;
+                s ^= s >> 27;
+                ((s.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 33) % 200_000) as u32
+            })
+            .collect();
+        Ok(())
+    }
+
+    /// FNV-1a over the session's READABLE state: the causal token log plus the
+    /// live KV (`StepRuntime::live_kv_fnv` — linear layers whole prefix, ring
+    /// layers window-only). The token pipeline's rewind/extension gates probe
+    /// this; it is invariant across ring-slot residue that no future read can
+    /// observe.
+    pub fn live_kv_fingerprint(&self) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &t in &self.kv_valid_tokens {
+            for b in t.to_le_bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        self.rt.live_kv_fnv(self.kv_valid_tokens.len(), h)
     }
 
     /// Full snapshot of the session's KV state (buffer bytes + causal token log),

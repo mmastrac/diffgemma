@@ -233,7 +233,16 @@ pub(crate) fn run_generate_monolithic_cmd(
     let started = std::time::Instant::now();
 
     let prompt_label = prompt_text.clone().unwrap_or_default();
-    match generate::generate_monolithic_gpu(model_dir, &prompt, &gen_cfg, max_seq, &prompt_label) {
+    // `ask` is the token pipeline's first production client (equivalence with
+    // the direct path pinned by `ask_via_pipeline_matches_direct`); the parity
+    // command below stays on the direct path.
+    match generate::generate_monolithic_gpu_pipeline(
+        model_dir,
+        &prompt,
+        &gen_cfg,
+        max_seq,
+        &prompt_label,
+    ) {
         Ok(out) => {
             if let Some(ref name) = write_golden {
                 let prompt_str = prompt_text.clone().unwrap_or_default();

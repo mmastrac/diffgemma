@@ -17,6 +17,9 @@ pub enum Error {
     /// Runtime / logic error: invalid argument, budget or limit exceeded,
     /// unsupported configuration, missing state.
     Runtime(&'static str),
+    /// Token-pipeline op failure (the underlying error stringified on the
+    /// pipeline thread, prefixed with the op).
+    Pipeline(String),
     NotFound(String),
     DType {
         name: String,
@@ -34,6 +37,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(e) => write!(f, "io error: {e}"),
+            Self::Pipeline(msg) => write!(f, "pipeline: {msg}"),
             Self::Json(e) => write!(f, "json error: {e}"),
             Self::Format(msg) => write!(f, "format error: {msg}"),
             Self::Gpu(msg) => write!(f, "gpu error: {msg}"),
