@@ -1,9 +1,47 @@
 //! Tests for `tool_compact_smoke`, extracted from server.rs (backlog item 3).
 
 use crate::metal::{StepGenerateConfig, StepGenerateSession, generate_with_session};
+use crate::pipeline::{KvId, PipelineEvent, PipelineOp, PipelineStage};
 use crate::toolcompact as tc;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+
+/// Minimal stage over a test-owned session (the ops `run_summarize_pass`
+/// uses: Mark / Generate / Rewind) — the reference shape for wrapping an
+/// existing session in the op vocabulary without spawning a pipeline thread.
+struct SessionStage<'a>(std::cell::RefCell<&'a mut crate::conversation::ConversationManager>);
+
+impl PipelineStage for SessionStage<'_> {
+    fn call(&self, op: PipelineOp) -> PipelineEvent {
+        let mut m = self.0.borrow_mut();
+        let session = m.session_mut();
+        match op {
+            PipelineOp::Mark => PipelineEvent::Marked {
+                kv: KvId {
+                    epoch: 0,
+                    pos: session.kv_valid_tokens().len(),
+                },
+            },
+            PipelineOp::Rewind(id) => match session.truncate_kv_to(id.pos) {
+                Ok(()) => PipelineEvent::Rewound { kv: id },
+                Err(err) => PipelineEvent::Error(format!("rewind: {err}")),
+            },
+            PipelineOp::Generate { prompt, cfg, label } => {
+                match generate_with_session(session, &prompt, &cfg, &label) {
+                    Ok(out) => PipelineEvent::Generated {
+                        out: Box::new(out),
+                        kv: KvId {
+                            epoch: 0,
+                            pos: session.kv_valid_tokens().len(),
+                        },
+                    },
+                    Err(err) => PipelineEvent::Error(format!("generate: {err}")),
+                }
+            }
+            _ => PipelineEvent::Error("unsupported op in SessionStage".into()),
+        }
+    }
+}
 
 // The verbose fixture renders ~1800 tokens; 4096 leaves room for the
 // summarize prompt + a canvas block at every step.
@@ -207,18 +245,12 @@ fn tool_compact_m1_m2_and_overlong_smoke() {
     let mut ctx = messages.clone();
     ctx.push(json!({"role":"user","content": tc::summarize_instruction()}));
     let stop = crate::config::load_generation_stop_tokens(&dir);
-    let summary_opt = super::run_summarize_pass(
-        manager.session_mut(),
-        &tok,
-        &cfg,
-        24,
-        &stop,
-        &dir,
-        MAX_SEQ,
-        256,
-        &ctx,
-        &tools,
-    );
+    let summary_opt = {
+        let stage = SessionStage(std::cell::RefCell::new(&mut manager));
+        super::run_summarize_pass(
+            &stage, &tok, &cfg, 24, &stop, &dir, MAX_SEQ, 256, &ctx, &tools,
+        )
+    };
     assert_eq!(
         manager.session_mut().kv_valid_tokens(),
         &before[..],

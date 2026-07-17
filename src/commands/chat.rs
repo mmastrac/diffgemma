@@ -115,20 +115,25 @@ pub(crate) fn run_chat_cmd(
         let _ = io::stdout().flush();
     }
     let open_started = std::time::Instant::now();
-    let mut session = match StepGenerateSession::open(model_dir, &step_cfg, None) {
-        Ok((s, compile)) => {
+    // Chat is a token-pipeline client: the session lives on the pipeline
+    // thread; each turn is a Generate op (stage chains insert here later).
+    let pipeline = crate::pipeline::Pipeline::spawn(model_dir.to_path_buf(), CHAT_MAX_SEQ, steps);
+    match pipeline.call(crate::pipeline::PipelineOp::Ping) {
+        crate::pipeline::PipelineEvent::Pong => {
             if interactive {
                 println!("ready ({:.1}s)", open_started.elapsed().as_secs_f64());
             } else if verbose {
-                eprintln!("chat: session ready ({compile:.2?}, layers={layers})");
+                eprintln!(
+                    "chat: pipeline ready ({:.2?}, layers={layers})",
+                    open_started.elapsed()
+                );
             }
-            s
         }
-        Err(err) => {
-            eprintln!("error: {err}");
+        ev => {
+            eprintln!("error: pipeline open failed: {ev:?}");
             return ExitCode::FAILURE;
         }
-    };
+    }
 
     let tok_path = model_dir.join("tokenizer.json");
     let tokenizer = match tokenizer::Tokenizer::load(&tok_path) {
@@ -183,7 +188,17 @@ pub(crate) fn run_chat_cmd(
             prompt_len,
         );
         step_cfg.step_observer = Some(stream.observer());
-        let out = generate_with_session(&mut session, &prompt, &step_cfg, "chat")?;
+        let out = match pipeline.call(crate::pipeline::PipelineOp::Generate {
+            prompt: prompt.clone(),
+            cfg: Box::new(step_cfg.clone()),
+            label: "chat".into(),
+        }) {
+            crate::pipeline::PipelineEvent::Generated { out, .. } => *out,
+            crate::pipeline::PipelineEvent::Error(err) => {
+                return Err(crate::Error::Pipeline(err));
+            }
+            ev => return Err(crate::Error::Pipeline(format!("unexpected event {ev:?}"))),
+        };
         step_cfg.step_observer = None;
         let elapsed = started.elapsed();
 

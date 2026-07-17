@@ -767,7 +767,7 @@ fn filter_tool_markup_delta(
 /// or the model produced no usable tags (caller falls back mechanically).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_summarize_pass(
-    session: &mut crate::metal::StepGenerateSession,
+    stage: &dyn crate::pipeline::PipelineStage,
     tokenizer: &crate::tokenizer::Tokenizer,
     base_cfg: &crate::metal::StepGenerateConfig,
     steps: usize,
@@ -792,18 +792,31 @@ pub(crate) fn run_summarize_pass(
         crate::chat_template::empty_reply_check(model_dir, stop_token_ids.to_vec());
     cfg.step_observer = None;
 
-    let cp = session.checkpoint();
-    let result = crate::metal::generate_with_session(session, &prompt, &cfg, "tool-compact");
+    // Mark → Generate → Rewind: the checkpoint/generate/rollback pattern as
+    // pipeline ops, so this pass composes with any stage chain.
+    use crate::pipeline::{PipelineEvent, PipelineOp};
+    let mark = match stage.call(PipelineOp::Mark) {
+        PipelineEvent::Marked { kv } => kv,
+        ev => {
+            eprintln!("serve: tool-compact: summarize mark failed: {ev:?}");
+            return None;
+        }
+    };
+    let result = stage.call(PipelineOp::Generate {
+        prompt: prompt.clone(),
+        cfg: Box::new(cfg),
+        label: "tool-compact".into(),
+    });
     // Always rewind — the verbose response, the instruction, and the summary
     // itself must never persist in the conversation's KV.
-    if let Err(err) = session.rollback_to(&cp) {
+    if let PipelineEvent::Error(err) = stage.call(PipelineOp::Rewind(mark)) {
         eprintln!("serve: tool-compact: summarize KV rollback failed: {err}");
         return None;
     }
     let out = match result {
-        Ok(o) => o,
-        Err(err) => {
-            eprintln!("serve: tool-compact: summarize pass failed: {err}");
+        PipelineEvent::Generated { out, .. } => *out,
+        ev => {
+            eprintln!("serve: tool-compact: summarize pass failed: {ev:?}");
             return None;
         }
     };
@@ -812,11 +825,6 @@ pub(crate) fn run_summarize_pass(
         &tokenizer.decode(&crate::sample::strip_degenerate_token_ids(generated)),
     );
     crate::toolcompact::extract_summary(&text)
-}
-
-/// Longest common prefix (in tokens).
-fn lcp(a: &[u32], b: &[u32]) -> usize {
-    a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
 /// Cap an expand excerpt to a token budget so retrieval can't blow the

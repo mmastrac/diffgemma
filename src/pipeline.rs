@@ -1,12 +1,12 @@
-//! Token pipeline (P0) — the serialized op-stream core (design: PLAN.md
+//! Token pipeline — the serialized op-stream core (design: PLAN.md
 //! "Token pipeline").
 //!
-//! One dedicated thread owns the model session (GPU + KV); clients speak
-//! token IDS only — never strings — through an input queue of ops and an
-//! output queue of events. P0 scope: `Extend` / `Generate` (whole-reply via
-//! `generate_with_session`; the per-block propose/commit protocol is P2) /
-//! `Rewind` / `KvFingerprint`, plus the standing rewind byte-consistency
-//! gate. Nothing is rerouted through this yet.
+//! One dedicated thread owns the model session AND the multi-conversation
+//! registry (GPU + KV); clients speak token IDS only — never strings —
+//! through an input queue of ops and an output queue of events. Current
+//! clients: `ask` (Generate), `chat` (Generate per turn), `serve`
+//! (Activate / Generate / Finalize / AlignTo / Mark+Rewind for
+//! tool-compact). The per-block propose/commit protocol is P2.
 //!
 //! KV identity: [`KvId`] = (epoch, position). Lineage-invalidating ops
 //! (today: `Rewind`) bump the epoch; a rewind to a stale-epoch id fails
@@ -53,6 +53,32 @@ pub enum PipelineOp {
     /// byte-consistency probe. Ring residue no future read can observe is
     /// deliberately excluded.
     KvFingerprint,
+    /// Readiness / liveness probe. The first `Pong` proves the model session
+    /// opened (serve blocks its "listening" print on it).
+    Ping,
+    /// Capture the current lineage position (the checkpoint half of the
+    /// checkpoint→generate→rollback pattern; the rollback half is `Rewind`).
+    Mark,
+    /// Route `prompt` to its conversation (longest-prefix match), swapping KV
+    /// through the multi-conversation registry as needed. Bumps the epoch
+    /// (activation may replace the whole resident state).
+    Activate {
+        prompt: Vec<u32>,
+    },
+    /// Finalize a conversation to its canonical (thought-free) token log:
+    /// truncate to the common prefix, extend the canonical tail, record the
+    /// log in the registry. Bumps the epoch.
+    Finalize {
+        conv_id: u64,
+        canonical: Vec<u32>,
+    },
+    /// Align the resident KV to `target`: truncate to the longest common
+    /// prefix with the causal log, extend the remainder. The tool-compact
+    /// expand loop's primitive (and the session-level core of `Finalize`,
+    /// without the registry write). Bumps the epoch.
+    AlignTo {
+        target: Vec<u32>,
+    },
     Shutdown,
 }
 
@@ -79,6 +105,24 @@ pub enum PipelineEvent {
         fnv: u64,
         kv: KvId,
     },
+    Pong,
+    Marked {
+        kv: KvId,
+    },
+    /// `reused` = longest common prefix of the resident causal log and the
+    /// activating prompt (the cross-turn reuse the serve log reports).
+    Activated {
+        conv_id: u64,
+        kv: KvId,
+        reused: usize,
+    },
+    Finalized {
+        kv: KvId,
+    },
+    Aligned {
+        kv: KvId,
+        reused: usize,
+    },
     Error(String),
     ShutDown,
 }
@@ -98,8 +142,93 @@ impl std::fmt::Debug for PipelineEvent {
             Self::Fingerprint { fnv, kv } => {
                 write!(f, "Fingerprint {{ fnv: {fnv:#x}, kv: {kv:?} }}")
             }
+            Self::Pong => write!(f, "Pong"),
+            Self::Marked { kv } => write!(f, "Marked {{ kv: {kv:?} }}"),
+            Self::Activated {
+                conv_id,
+                kv,
+                reused,
+            } => write!(
+                f,
+                "Activated {{ conv: {conv_id}, kv: {kv:?}, reused: {reused} }}"
+            ),
+            Self::Finalized { kv } => write!(f, "Finalized {{ kv: {kv:?} }}"),
+            Self::Aligned { kv, reused } => {
+                write!(f, "Aligned {{ kv: {kv:?}, reused: {reused} }}")
+            }
             Self::Error(msg) => write!(f, "Error({msg:?})"),
             Self::ShutDown => write!(f, "ShutDown"),
+        }
+    }
+}
+
+/// One link in the op chain. The terminal stage is [`Pipeline`] (the model
+/// thread); wrappers — tool compaction, span handles, validators, the op-log —
+/// implement the same trait around an inner stage and compose freely. Clients
+/// (ask/chat/serve) talk to the top of whatever chain they were given.
+pub trait PipelineStage {
+    fn call(&self, op: PipelineOp) -> PipelineEvent;
+}
+
+/// The first wrapper stage: append every op + event to a JSONL op-log (the
+/// design's durable replay artifact). Deliberately minimal — it demonstrates
+/// the chain shape and gives field sessions a replayable trace.
+pub struct OpLogStage<S> {
+    inner: S,
+    log: std::sync::Mutex<std::io::BufWriter<std::fs::File>>,
+}
+
+impl<S: PipelineStage> OpLogStage<S> {
+    pub fn new(inner: S, path: &std::path::Path) -> std::io::Result<Self> {
+        Ok(Self {
+            inner,
+            log: std::sync::Mutex::new(std::io::BufWriter::new(
+                std::fs::File::options()
+                    .create(true)
+                    .append(true)
+                    .open(path)?,
+            )),
+        })
+    }
+}
+
+impl<S: PipelineStage> PipelineStage for OpLogStage<S> {
+    fn call(&self, op: PipelineOp) -> PipelineEvent {
+        use std::io::Write;
+        let op_line = op.log_line();
+        let event = self.inner.call(op);
+        if let Ok(mut w) = self.log.lock() {
+            let _ = writeln!(
+                w,
+                "{{\"op\":{op_line},\"event\":{:?}}}",
+                format!("{event:?}")
+            );
+            let _ = w.flush();
+        }
+        event
+    }
+}
+
+impl PipelineOp {
+    /// Compact JSON-ish description for the op-log (ids elided past a prefix —
+    /// the log records the op SHAPE; full replay logging is P4).
+    fn log_line(&self) -> String {
+        match self {
+            Self::Extend(ids) => format!("{{\"extend\":{}}}", ids.len()),
+            Self::Generate { prompt, .. } => format!("{{\"generate\":{}}}", prompt.len()),
+            Self::Rewind(id) => format!("{{\"rewind\":[{},{}]}}", id.epoch, id.pos),
+            Self::SyntheticFill { tokens, seed } => {
+                format!("{{\"synthetic_fill\":[{tokens},{seed}]}}")
+            }
+            Self::KvFingerprint => "\"fingerprint\"".into(),
+            Self::Ping => "\"ping\"".into(),
+            Self::Mark => "\"mark\"".into(),
+            Self::Activate { prompt } => format!("{{\"activate\":{}}}", prompt.len()),
+            Self::Finalize { conv_id, canonical } => {
+                format!("{{\"finalize\":[{conv_id},{}]}}", canonical.len())
+            }
+            Self::AlignTo { target } => format!("{{\"align_to\":{}}}", target.len()),
+            Self::Shutdown => "\"shutdown\"".into(),
         }
     }
 }
@@ -108,6 +237,12 @@ pub struct Pipeline {
     tx: Sender<PipelineOp>,
     rx: Receiver<PipelineEvent>,
     join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PipelineStage for Pipeline {
+    fn call(&self, op: PipelineOp) -> PipelineEvent {
+        Pipeline::call(self, op)
+    }
 }
 
 impl Pipeline {
@@ -173,25 +308,34 @@ fn run_pipeline(
         crate::sample::sampler_for_steps(steps, false),
         false,
     );
-    let mut session = match StepGenerateSession::open(model_dir, &open_cfg, None) {
+    let session = match StepGenerateSession::open(model_dir, &open_cfg, None) {
         Ok((s, _)) => s,
         Err(err) => {
             let _ = ev_tx.send(PipelineEvent::Error(format!("session open: {err}")));
             return;
         }
     };
+    // The multi-conversation registry lives ON the pipeline thread with the
+    // session it wraps (serve's Activate/Finalize become ops; single-client
+    // callers like ask/chat simply never Activate).
+    let mut manager = crate::conversation::ConversationManager::new(
+        session,
+        crate::flags::conv_cache_bytes(),
+        crate::flags::conv_disk_bytes(),
+        crate::flags::conv_cache_dir(),
+    );
 
     let mut epoch: u64 = 0;
-    let kv_id = |epoch: u64, session: &StepGenerateSession| KvId {
+    let kv_id = |epoch: u64, manager: &mut crate::conversation::ConversationManager| KvId {
         epoch,
-        pos: session.kv_valid_tokens().len(),
+        pos: manager.session_mut().kv_valid_tokens().len(),
     };
 
     while let Ok(op) = op_rx.recv() {
         let event = match op {
-            PipelineOp::Extend(ids) => match session.extend_kv(&ids) {
+            PipelineOp::Extend(ids) => match manager.session_mut().extend_kv(&ids) {
                 Ok(()) => PipelineEvent::Extended {
-                    kv: kv_id(epoch, &session),
+                    kv: kv_id(epoch, &mut manager),
                 },
                 Err(err) => PipelineEvent::Error(format!("extend: {err}")),
             },
@@ -199,10 +343,10 @@ fn run_pipeline(
                 let mut cfg = *cfg;
                 cfg.layers = layers;
                 cfg.max_seq = max_seq;
-                match generate_with_session(&mut session, &prompt, &cfg, &label) {
+                match generate_with_session(manager.session_mut(), &prompt, &cfg, &label) {
                     Ok(out) => PipelineEvent::Generated {
                         out: Box::new(out),
-                        kv: kv_id(epoch, &session),
+                        kv: kv_id(epoch, &mut manager),
                     },
                     Err(err) => PipelineEvent::Error(format!("generate: {err}")),
                 }
@@ -214,11 +358,11 @@ fn run_pipeline(
                         id.epoch
                     ))
                 } else {
-                    match session.truncate_kv_to(id.pos) {
+                    match manager.session_mut().truncate_kv_to(id.pos) {
                         Ok(()) => {
                             epoch += 1;
                             PipelineEvent::Rewound {
-                                kv: kv_id(epoch, &session),
+                                kv: kv_id(epoch, &mut manager),
                             }
                         }
                         Err(err) => PipelineEvent::Error(format!("rewind: {err}")),
@@ -226,20 +370,73 @@ fn run_pipeline(
                 }
             }
             PipelineOp::SyntheticFill { tokens, seed } => {
-                match session.synthetic_fill_kv(tokens, seed) {
+                match manager.session_mut().synthetic_fill_kv(tokens, seed) {
                     Ok(()) => {
                         epoch += 1;
                         PipelineEvent::Filled {
-                            kv: kv_id(epoch, &session),
+                            kv: kv_id(epoch, &mut manager),
                         }
                     }
                     Err(err) => PipelineEvent::Error(format!("synthetic fill: {err}")),
                 }
             }
             PipelineOp::KvFingerprint => PipelineEvent::Fingerprint {
-                fnv: session.live_kv_fingerprint(),
-                kv: kv_id(epoch, &session),
+                fnv: manager.session_mut().live_kv_fingerprint(),
+                kv: kv_id(epoch, &mut manager),
             },
+            PipelineOp::Ping => PipelineEvent::Pong,
+            PipelineOp::Mark => PipelineEvent::Marked {
+                kv: kv_id(epoch, &mut manager),
+            },
+            PipelineOp::Activate { prompt } => {
+                let conv_id = manager.activate(&prompt);
+                epoch += 1;
+                let reused = manager
+                    .session_mut()
+                    .kv_valid_tokens()
+                    .iter()
+                    .zip(prompt.iter())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                PipelineEvent::Activated {
+                    conv_id,
+                    kv: kv_id(epoch, &mut manager),
+                    reused,
+                }
+            }
+            PipelineOp::Finalize { conv_id, canonical } => {
+                match manager.finalize(conv_id, &canonical) {
+                    Ok(()) => {
+                        epoch += 1;
+                        PipelineEvent::Finalized {
+                            kv: kv_id(epoch, &mut manager),
+                        }
+                    }
+                    Err(err) => PipelineEvent::Error(format!("finalize: {err}")),
+                }
+            }
+            PipelineOp::AlignTo { target } => {
+                let session = manager.session_mut();
+                let reused = session
+                    .kv_valid_tokens()
+                    .iter()
+                    .zip(target.iter())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                let aligned = session
+                    .truncate_kv_to(reused)
+                    .and_then(|()| session.extend_kv(&target[reused..]));
+                match aligned {
+                    Ok(()) => {
+                        epoch += 1;
+                        PipelineEvent::Aligned {
+                            kv: kv_id(epoch, &mut manager),
+                            reused,
+                        }
+                    }
+                    Err(err) => PipelineEvent::Error(format!("align: {err}")),
+                }
+            }
             PipelineOp::Shutdown => {
                 let _ = ev_tx.send(PipelineEvent::ShutDown);
                 return;

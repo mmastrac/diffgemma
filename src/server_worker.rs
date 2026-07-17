@@ -19,19 +19,33 @@ impl Worker {
             crate::flags::set_quiet(true);
         }
         let open_started = std::time::Instant::now();
-        let session =
-            match crate::metal::StepGenerateSession::open(&self.model_dir, &self.base_cfg, None) {
-                Ok((s, _compile)) => s,
+        // The token pipeline owns the session + conversation registry on its
+        // own thread; this worker is a message-layer client speaking ops.
+        // Stage chains (tool compaction, op-log, span handles) insert between
+        // the two without either side knowing.
+        let pipeline =
+            crate::pipeline::Pipeline::spawn(self.model_dir.clone(), self.max_seq, self.steps);
+        // First chain link: with --log-dir, every op + event is journaled to
+        // ops.jsonl beside the turn dumps (the replayable op-log).
+        let stage: Box<dyn crate::pipeline::PipelineStage> = match &self.log_dir {
+            Some(dir) => match crate::pipeline::OpLogStage::new(pipeline, &dir.join("ops.jsonl")) {
+                Ok(logged) => Box::new(logged),
                 Err(err) => {
-                    let _ = ready.send(Err(err.to_string()));
+                    let _ = ready.send(Err(format!("op-log open failed: {err}")));
                     return;
                 }
-            };
+            },
+            None => Box::new(pipeline),
+        };
+        match stage.call(crate::pipeline::PipelineOp::Ping) {
+            crate::pipeline::PipelineEvent::Pong => {}
+            ev => {
+                let _ = ready.send(Err(format!("pipeline open failed: {ev:?}")));
+                return;
+            }
+        }
         let ram_bytes = crate::flags::conv_cache_bytes();
         let disk_bytes = crate::flags::conv_disk_bytes();
-        let disk_dir = crate::flags::conv_cache_dir();
-        let mut manager =
-            crate::conversation::ConversationManager::new(session, ram_bytes, disk_bytes, disk_dir);
         let mut tool_store = self.tool_compact.as_ref().map(|cc| {
             eprintln!(
                 "serve: tool-compact ON (threshold {} tokens, {} expand rounds)",
@@ -51,19 +65,20 @@ impl Worker {
             return;
         }
         for job in jobs {
-            self.handle(&mut manager, tool_store.as_mut(), job);
+            self.handle(&*stage, tool_store.as_mut(), job);
         }
     }
 
     fn handle(
         &self,
-        manager: &mut crate::conversation::ConversationManager,
+        stage: &dyn crate::pipeline::PipelineStage,
         store: Option<&mut crate::toolcompact::ToolOutputStore>,
         job: Job,
     ) {
+        use crate::pipeline::{PipelineEvent, PipelineOp};
         let tool_mode = needs_tool_rendering(&job.messages, &job.tools);
         if tool_mode && let (Some(cc), Some(store)) = (&self.tool_compact, store) {
-            return self.handle_tool_compact(manager, store, cc, job);
+            return self.handle_tool_compact(stage, store, cc, job);
         }
         let thinking = job.enable_thinking;
         // Plain turns for the non-tool prompt/finalize path (gate-validated).
@@ -110,16 +125,20 @@ impl Worker {
         let file_block = Arc::new(AtomicUsize::new(0));
         self.attach_block_commit_logger(&mut cfg, log_seq, &file_block);
 
-        // Route to the conversation first so `kv_valid_tokens` is the right
+        // Route to the conversation first so the resident KV is the right
         // prefix; the incremental log is the prompt delta beyond that.
-        let conv_id = manager.activate(&prompt);
-        let reuse = {
-            let valid = manager.session_mut().kv_valid_tokens();
-            valid
-                .iter()
-                .zip(prompt.iter())
-                .take_while(|(a, b)| *a == *b)
-                .count()
+        let (conv_id, reuse) = match stage.call(PipelineOp::Activate {
+            prompt: prompt.clone(),
+        }) {
+            PipelineEvent::Activated {
+                conv_id, reused, ..
+            } => (conv_id, reused),
+            ev => {
+                let _ = job
+                    .resp
+                    .send(ServerEvent::Error(format!("activate: {ev:?}")));
+                return;
+            }
         };
         let delta_ids = &prompt[reuse..];
         let delta_text = self.tokenizer.decode(delta_ids);
@@ -129,10 +148,15 @@ impl Worker {
             trunc_preview(&delta_text, 120)
         );
 
-        let out =
-            crate::metal::generate_with_session(manager.session_mut(), &prompt, &cfg, "serve");
-        cfg.step_observer = None;
-        cfg.block_commit_observer = None;
+        let out = match stage.call(PipelineOp::Generate {
+            prompt: prompt.clone(),
+            cfg: Box::new(cfg),
+            label: "serve".into(),
+        }) {
+            PipelineEvent::Generated { out, .. } => Ok(*out),
+            PipelineEvent::Error(err) => Err(crate::Error::Pipeline(err)),
+            ev => Err(crate::Error::Pipeline(format!("unexpected event {ev:?}"))),
+        };
         match out {
             Ok(out) => {
                 let raw_text = mapper.lock().unwrap().content().to_string();
@@ -276,12 +300,13 @@ impl Worker {
                     stopped: out.stopped_on_eot,
                 });
 
-                if let Some(canonical) = canonical {
-                    if let Err(err) = manager.finalize(conv_id, &canonical) {
-                        // A failed finalize only costs reuse (next turn re-prefills);
-                        // the reply is already correct.
-                        eprintln!("serve: conversation finalize failed: {err}");
-                    }
+                if let Some(canonical) = canonical
+                    && let PipelineEvent::Error(err) =
+                        stage.call(PipelineOp::Finalize { conv_id, canonical })
+                {
+                    // A failed finalize only costs reuse (next turn re-prefills);
+                    // the reply is already correct.
+                    eprintln!("serve: conversation finalize failed: {err}");
                 }
             }
             Err(err) => {
@@ -323,7 +348,7 @@ impl Worker {
     /// evicting them from KV.
     fn handle_tool_compact(
         &self,
-        manager: &mut crate::conversation::ConversationManager,
+        stage: &dyn crate::pipeline::PipelineStage,
         store: &mut crate::toolcompact::ToolOutputStore,
         cc: &ToolCompactCfg,
         job: Job,
@@ -359,14 +384,19 @@ impl Worker {
                     true,
                     thinking,
                 ));
-        let conv_id = manager.activate(&routing_prompt);
-        let reuse = {
-            let valid = manager.session_mut().kv_valid_tokens();
-            valid
-                .iter()
-                .zip(routing_prompt.iter())
-                .take_while(|(a, b)| *a == *b)
-                .count()
+        use crate::pipeline::{PipelineEvent, PipelineOp};
+        let (conv_id, reuse) = match stage.call(PipelineOp::Activate {
+            prompt: routing_prompt.clone(),
+        }) {
+            PipelineEvent::Activated {
+                conv_id, reused, ..
+            } => (conv_id, reused),
+            ev => {
+                let _ = job
+                    .resp
+                    .send(ServerEvent::Error(format!("activate: {ev:?}")));
+                return;
+            }
         };
         let delta_ids = &routing_prompt[reuse..];
         eprintln!(
@@ -407,7 +437,7 @@ impl Worker {
                 None
             } else {
                 run_summarize_pass(
-                    manager.session_mut(),
+                    stage,
                     &self.tokenizer,
                     &self.base_cfg,
                     self.steps,
@@ -496,16 +526,14 @@ impl Worker {
             attach_stream_observer(&mut cfg, &mapper, &job.resp, true, true);
             self.attach_block_commit_logger(&mut cfg, log_seq, &file_block);
 
-            let out = crate::metal::generate_with_session(
-                manager.session_mut(),
-                &round_prompt,
-                &cfg,
-                "serve",
-            );
-            let out = match out {
-                Ok(o) => o,
-                Err(err) => {
-                    let _ = job.resp.send(ServerEvent::Error(format!("{err}")));
+            let out = match stage.call(PipelineOp::Generate {
+                prompt: round_prompt.clone(),
+                cfg: Box::new(cfg),
+                label: "serve".into(),
+            }) {
+                PipelineEvent::Generated { out, .. } => *out,
+                ev => {
+                    let _ = job.resp.send(ServerEvent::Error(format!("{ev:?}")));
                     return;
                 }
             };
@@ -583,14 +611,10 @@ impl Worker {
                 );
                 break;
             }
-            let session = manager.session_mut();
-            let reuse = lcp(session.kv_valid_tokens(), &ext);
-            if let Err(err) = session.truncate_kv_to(reuse) {
-                eprintln!("serve: tool-compact: expand KV truncate failed: {err}");
-                break;
-            }
-            if let Err(err) = session.extend_kv(&ext[reuse..]) {
-                eprintln!("serve: tool-compact: expand KV extend failed: {err}");
+            if let PipelineEvent::Error(err) = stage.call(PipelineOp::AlignTo {
+                target: ext.clone(),
+            }) {
+                eprintln!("serve: tool-compact: expand KV align failed: {err}");
                 break;
             }
             round_prompt = ext;
@@ -662,7 +686,10 @@ impl Worker {
             stopped,
         });
 
-        if let Err(err) = manager.finalize(conv_id, &canonical) {
+        if let PipelineEvent::Error(err) = stage.call(PipelineOp::Finalize {
+            conv_id,
+            canonical: canonical.clone(),
+        }) {
             eprintln!("serve: conversation finalize failed: {err}");
         }
     }
