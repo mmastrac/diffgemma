@@ -537,6 +537,8 @@ struct Worker {
     no_early_stop: bool,
     base_cfg: crate::metal::StepGenerateConfig,
     tool_compact: Option<ToolCompactCfg>,
+    /// `--tool-validate`: rewind + regenerate on malformed tool-call grammar.
+    tool_validate: bool,
     /// When set, each completed request writes one `{seq}.jsonl` here.
     log_dir: Option<std::path::PathBuf>,
     turn_seq: AtomicU64,
@@ -856,6 +858,7 @@ pub fn run_serve(
     steps: usize,
     max_layers: Option<usize>,
     tool_compact: bool,
+    tool_validate: bool,
     log_dir: Option<std::path::PathBuf>,
     think: bool,
 ) -> Result<(), String> {
@@ -909,6 +912,7 @@ pub fn run_serve(
     let (job_tx, job_rx) = mpsc::channel::<Job>();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
     let tool_compact = tool_compact || crate::flags::tool_compact_enabled();
+    let tool_validate = tool_validate || crate::flags::tool_validate_enabled();
     let worker = Worker {
         model_dir: model_dir.to_path_buf(),
         tokenizer,
@@ -924,6 +928,7 @@ pub fn run_serve(
             max_expand_rounds: 4,
             summarize_max_new: 512,
         }),
+        tool_validate,
         log_dir,
         turn_seq: AtomicU64::new(1),
     };

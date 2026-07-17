@@ -308,6 +308,9 @@ pub(crate) enum Command {
         ctx: usize,
         /// Tool-output compaction (KV rewinder). Also `DGQ_TOOL_COMPACT=1`.
         tool_compact: bool,
+        /// Rewind + regenerate on malformed tool-call grammar. Also
+        /// `DGQ_TOOL_VALIDATE=1`.
+        tool_validate: bool,
         /// Directory for per-turn JSONL debug logs (`--log-dir`).
         log_dir: Option<PathBuf>,
         /// Default thought-channel enablement when the request does not set
@@ -331,6 +334,15 @@ pub(crate) enum Command {
     /// Golden byte-identity pack — the Tier-1 refactor gate (task #73).
     /// Print the generated kernel FC-axis manifest (TOML) to stdout.
     Manifest,
+    /// Re-execute an `ops.jsonl` op-log (serve `--log-dir`) against a fresh
+    /// pipeline and diff every event against the recorded one.
+    Replay {
+        /// Path to the ops.jsonl to replay.
+        log_path: PathBuf,
+        /// Spawn overrides; default to the log's `meta` header.
+        ctx: Option<usize>,
+        steps: Option<usize>,
+    },
     Golden {
         /// Pack spec (default `fixtures/golden/golden.json`).
         pack_path: Option<PathBuf>,
@@ -349,6 +361,7 @@ pub(crate) fn parse_cli() -> Cli {
     let mut chat_ctx: Option<usize> = None;
     let mut serve_addr: String = "127.0.0.1:8080".to_string();
     let mut serve_tool_compact = false;
+    let mut serve_tool_validate = false;
     let mut serve_log_dir: Option<PathBuf> = None;
     let mut serve_think: Option<bool> = None;
     let mut steps_override: Option<usize> = None;
@@ -490,6 +503,7 @@ pub(crate) fn parse_cli() -> Cli {
                 }
             }
             "--tool-compact" => serve_tool_compact = true,
+            "--tool-validate" => serve_tool_validate = true,
             "--think" => serve_think = Some(true),
             s if s.starts_with("--think=") => {
                 let v = &s["--think=".len()..];
@@ -785,6 +799,7 @@ pub(crate) fn parse_cli() -> Cli {
             max_layers: parity_layers,
             ctx: chat_ctx.unwrap_or(8192),
             tool_compact: serve_tool_compact,
+            tool_validate: serve_tool_validate,
             log_dir: serve_log_dir.clone(),
             think: serve_think.unwrap_or(true),
         },
@@ -798,6 +813,16 @@ pub(crate) fn parse_cli() -> Cli {
             longctx: smoke_longctx,
         },
         Some("manifest") => Command::Manifest,
+        Some("replay") => Command::Replay {
+            log_path: positional.get(1).map(PathBuf::from).unwrap_or_else(|| {
+                eprintln!(
+                    "usage: diffgemma-mps replay <ops.jsonl> [-m MODEL] [--ctx N] [--steps N]"
+                );
+                std::process::exit(2);
+            }),
+            ctx: chat_ctx,
+            steps: steps_override,
+        },
         Some("golden") => Command::Golden {
             pack_path: positional.get(1).map(PathBuf::from),
             bless: golden_bless,

@@ -306,6 +306,10 @@ pub struct ServerFlags {
     pub conv_cache_dir: PathBuf,
     /// `DGQ_TOOL_COMPACT`: enable the tool-output compactor. Default OFF.
     pub tool_compact: bool,
+    /// `DGQ_TOOL_VALIDATE`: serve validates tool-call grammar on every reply
+    /// and, on a malformed one, rewinds and regenerates at a bumped seed
+    /// (the failed attempt never enters the causal context). Default OFF.
+    pub tool_validate: bool,
     /// `DGQ_TOOL_COMPACT_THRESHOLD`: tokens above which a tool response compacts.
     pub tool_compact_threshold: usize,
     /// `DGQ_TOOL_COMPACT_DIR`: full-output store dir (default per-process temp subdir).
@@ -319,6 +323,7 @@ impl Default for ServerFlags {
             conv_disk_bytes: 0,
             conv_cache_dir: default_conv_cache_dir(),
             tool_compact: false,
+            tool_validate: false,
             tool_compact_threshold: 384,
             tool_compact_dir: default_tool_compact_dir(),
         }
@@ -528,6 +533,7 @@ impl RuntimeConfig {
                     .map(PathBuf::from)
                     .unwrap_or_else(default_conv_cache_dir),
                 tool_compact: env_on_if_one("DGQ_TOOL_COMPACT"),
+                tool_validate: env_on_if_one("DGQ_TOOL_VALIDATE"),
                 tool_compact_threshold: std::env::var("DGQ_TOOL_COMPACT_THRESHOLD")
                     .ok()
                     .and_then(|v| v.parse::<usize>().ok())
@@ -936,6 +942,14 @@ pub fn conv_disk_bytes() -> usize {
 /// Directory for the SSD conversation-snapshot tier (`DGQ_CONV_CACHE_DIR`).
 pub fn conv_cache_dir() -> PathBuf {
     config().server.conv_cache_dir.clone()
+}
+
+/// `DGQ_TOOL_VALIDATE=1`: serve rewinds + regenerates (bumped seed) when a
+/// reply's tool-call grammar is malformed. Opt-IN and default OFF
+/// (quality-affecting: a retry replaces the reply). Equivalent to
+/// `serve --tool-validate`.
+pub fn tool_validate_enabled() -> bool {
+    config().server.tool_validate
 }
 
 /// `DGQ_TOOL_COMPACT=1`: enable the serve tool-output compactor (KV rewinder).

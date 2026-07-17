@@ -84,6 +84,18 @@ pub enum PipelineOp {
     AlignTo {
         target: Vec<u32>,
     },
+    /// Surgically replace `[start..end)` of the causal token log with
+    /// `replacement`, re-encoding the tail at its new offset. The
+    /// anti-collapse move: failed attempts, malformed calls, and expired
+    /// transient hints are REMOVED from context instead of accumulating
+    /// (tool-compact substitution and span handles are Splice clients).
+    /// Composite of Rewind(start) + Extend(replacement + tail). Bumps the
+    /// epoch.
+    Splice {
+        start: usize,
+        end: usize,
+        replacement: Vec<u32>,
+    },
     /// Open a per-block turn: prefill `prompt`, then drive generation with
     /// `ProposeBlock`/`CommitBlock`/`DiscardBlock`, closing with `EndTurn`.
     /// While a turn is open, lineage-mutating ops are rejected. `Generate`
@@ -154,6 +166,12 @@ pub enum PipelineEvent {
         kv: KvId,
         reused: usize,
     },
+    /// `removed`/`inserted` = the splice delta; `kv` = the new log end.
+    Spliced {
+        kv: KvId,
+        removed: usize,
+        inserted: usize,
+    },
     /// A turn is open; block ops drive it until `EndTurn`.
     TurnStarted {
         kv: KvId,
@@ -214,6 +232,14 @@ impl std::fmt::Debug for PipelineEvent {
             Self::Aligned { kv, reused } => {
                 write!(f, "Aligned {{ kv: {kv:?}, reused: {reused} }}")
             }
+            Self::Spliced {
+                kv,
+                removed,
+                inserted,
+            } => write!(
+                f,
+                "Spliced {{ kv: {kv:?}, removed: {removed}, inserted: {inserted} }}"
+            ),
             Self::TurnStarted { kv } => write!(f, "TurnStarted {{ kv: {kv:?} }}"),
             Self::Proposed {
                 ids,
@@ -250,9 +276,107 @@ pub trait PipelineStage {
     fn call(&self, op: PipelineOp) -> PipelineEvent;
 }
 
-/// The first wrapper stage: append every op + event to a JSONL op-log (the
-/// design's durable replay artifact). Deliberately minimal — it demonstrates
-/// the chain shape and gives field sessions a replayable trace.
+impl<S: PipelineStage + ?Sized> PipelineStage for Box<S> {
+    fn call(&self, op: PipelineOp) -> PipelineEvent {
+        (**self).call(op)
+    }
+}
+
+/// Chain stage: tool-grammar validation with the anti-collapse retry. On a
+/// `Generate` whose reply speaks malformed tool grammar (incomplete call, or
+/// `call:` that parses to nothing), Rewind to the pre-generate mark and
+/// re-Generate at a bumped seed — the failed attempt never enters the causal
+/// context (the surgical-removal move from the collapse root-cause). Retries
+/// are ordinary ops through the inner stage, so they land in the op-log and
+/// replay faithfully. All other ops pass through untouched.
+pub struct ToolValidatorStage<S> {
+    inner: S,
+    tokenizer: std::sync::Arc<crate::tokenizer::Tokenizer>,
+    retries: u64,
+}
+
+impl<S: PipelineStage> ToolValidatorStage<S> {
+    pub fn new(
+        inner: S,
+        tokenizer: std::sync::Arc<crate::tokenizer::Tokenizer>,
+        retries: u64,
+    ) -> Self {
+        Self {
+            inner,
+            tokenizer,
+            retries,
+        }
+    }
+
+    fn reply_verdict(
+        &self,
+        out: &crate::generate::GenerateOutput,
+        prompt_len: usize,
+    ) -> Result<(), &'static str> {
+        let start = prompt_len.min(out.token_ids.len());
+        let cleaned = crate::sample::strip_degenerate_token_ids(&out.token_ids[start..]);
+        crate::tools::validate_tool_reply(&self.tokenizer.decode(&cleaned))
+    }
+}
+
+impl<S: PipelineStage> PipelineStage for ToolValidatorStage<S> {
+    fn call(&self, op: PipelineOp) -> PipelineEvent {
+        let PipelineOp::Generate { prompt, cfg, label } = op else {
+            return self.inner.call(op);
+        };
+        let mut mark = match self.inner.call(PipelineOp::Mark) {
+            PipelineEvent::Marked { kv } => kv,
+            ev => return ev,
+        };
+        let mut event = self.inner.call(PipelineOp::Generate {
+            prompt: prompt.clone(),
+            cfg: cfg.clone(),
+            label: label.clone(),
+        });
+        for attempt in 1..=self.retries {
+            let PipelineEvent::Generated { out, .. } = &event else {
+                return event;
+            };
+            let Err(reason) = self.reply_verdict(out, prompt.len()) else {
+                return event;
+            };
+            eprintln!(
+                "tool-validate: malformed reply ({reason}); rewinding and regenerating (attempt {attempt}/{})",
+                self.retries
+            );
+            match self.inner.call(PipelineOp::Rewind(mark)) {
+                // Rewind bumps the epoch; refresh the mark for a later retry.
+                PipelineEvent::Rewound { kv } => mark = kv,
+                ev => {
+                    eprintln!("tool-validate: rewind failed ({ev:?}); keeping original reply");
+                    return event;
+                }
+            }
+            let mut retry_cfg = cfg.clone();
+            retry_cfg.seed = cfg.seed.wrapping_add(0x9e37 * attempt);
+            event = self.inner.call(PipelineOp::Generate {
+                prompt: prompt.clone(),
+                cfg: retry_cfg,
+                label: label.clone(),
+            });
+        }
+        if let PipelineEvent::Generated { out, .. } = &event
+            && let Err(reason) = self.reply_verdict(out, prompt.len())
+        {
+            eprintln!(
+                "tool-validate: still malformed after {} retries ({reason}); passing through",
+                self.retries
+            );
+        }
+        event
+    }
+}
+
+/// The first wrapper stage: append every op + event to a JSONL op-log — the
+/// design's durable replay artifact. Ops are logged at FULL fidelity (every
+/// id, plus the replayable core of a Generate cfg); events carry digests
+/// (token counts, ids FNV, fingerprints) so `replay` can re-execute the ops
+/// and diff outcomes line by line.
 pub struct OpLogStage<S> {
     inner: S,
     log: std::sync::Mutex<std::io::BufWriter<std::fs::File>>,
@@ -270,18 +394,32 @@ impl<S: PipelineStage> OpLogStage<S> {
             )),
         })
     }
+
+    /// Write the session header (`{"meta":…}`): the spawn parameters a replay
+    /// needs to reconstruct the pipeline. Call once, before the first op.
+    pub fn log_meta(&self, model: &str, max_seq: usize, steps: usize) {
+        use std::io::Write;
+        if let Ok(mut w) = self.log.lock() {
+            let _ = writeln!(
+                w,
+                "{}",
+                serde_json::json!({"meta": {"model": model, "max_seq": max_seq, "steps": steps}})
+            );
+            let _ = w.flush();
+        }
+    }
 }
 
 impl<S: PipelineStage> PipelineStage for OpLogStage<S> {
     fn call(&self, op: PipelineOp) -> PipelineEvent {
         use std::io::Write;
-        let op_line = op.log_line();
+        let op_json = op.log_json();
         let event = self.inner.call(op);
         if let Ok(mut w) = self.log.lock() {
             let _ = writeln!(
                 w,
-                "{{\"op\":{op_line},\"event\":{:?}}}",
-                format!("{event:?}")
+                "{}",
+                serde_json::json!({"op": op_json, "event": event.log_json()})
             );
             let _ = w.flush();
         }
@@ -289,33 +427,253 @@ impl<S: PipelineStage> PipelineStage for OpLogStage<S> {
     }
 }
 
+/// FNV-1a over token ids (the event digest `replay` diffs against).
+pub(crate) fn ids_fnv(ids: &[u32]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &id in ids {
+        for b in id.to_le_bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x1_0000_0000_01b3);
+        }
+    }
+    h
+}
+
 impl PipelineOp {
-    /// Compact JSON-ish description for the op-log (ids elided past a prefix —
-    /// the log records the op SHAPE; full replay logging is P4).
-    fn log_line(&self) -> String {
+    /// Short op name for error messages and progress lines.
+    fn name(&self) -> &'static str {
         match self {
-            Self::Extend(ids) => format!("{{\"extend\":{}}}", ids.len()),
-            Self::Generate { prompt, .. } => format!("{{\"generate\":{}}}", prompt.len()),
-            Self::Rewind(id) => format!("{{\"rewind\":[{},{}]}}", id.epoch, id.pos),
+            Self::Extend(_) => "extend",
+            Self::Generate { .. } => "generate",
+            Self::Rewind(_) => "rewind",
+            Self::SyntheticFill { .. } => "synthetic_fill",
+            Self::KvFingerprint => "fingerprint",
+            Self::Ping => "ping",
+            Self::Mark => "mark",
+            Self::Activate { .. } => "activate",
+            Self::Finalize { .. } => "finalize",
+            Self::AlignTo { .. } => "align_to",
+            Self::Splice { .. } => "splice",
+            Self::BeginTurn { .. } => "begin_turn",
+            Self::ProposeBlock => "propose_block",
+            Self::CommitBlock { .. } => "commit_block",
+            Self::DiscardBlock => "discard_block",
+            Self::EndTurn => "end_turn",
+            Self::Shutdown => "shutdown",
+        }
+    }
+
+    /// Full-fidelity JSON for the op-log: every id, plus the replayable core
+    /// of a Generate/BeginTurn cfg. Observers and cancel tokens don't
+    /// serialize — they never alter the token trajectory. `replay`
+    /// reconstructs ops from exactly this shape (see `op_from_log_json`).
+    pub fn log_json(&self) -> serde_json::Value {
+        use serde_json::json;
+        fn cfg_json(cfg: &crate::metal::StepGenerateConfig) -> serde_json::Value {
+            json!({
+                "seed": cfg.seed,
+                "max_new_tokens": cfg.max_new_tokens,
+                "steps": cfg.sampler.max_denoising_steps,
+                "no_early_stop": cfg.no_early_stop,
+                "sampler_no_early_stop": cfg.sampler.confidence_threshold == f32::MAX,
+                "stop_token_ids": cfg.stop_token_ids,
+                "continue_incomplete_tool_calls": cfg.continue_incomplete_tool_calls,
+                "degenerate_reply_check": cfg.degenerate_reply_check.is_some(),
+            })
+        }
+        match self {
+            Self::Extend(ids) => json!({"extend": {"ids": ids}}),
+            Self::Generate { prompt, cfg, label } => {
+                json!({"generate": {"prompt": prompt, "label": label, "cfg": cfg_json(cfg)}})
+            }
+            Self::Rewind(id) => json!({"rewind": {"epoch": id.epoch, "pos": id.pos}}),
             Self::SyntheticFill { tokens, seed } => {
-                format!("{{\"synthetic_fill\":[{tokens},{seed}]}}")
+                json!({"synthetic_fill": {"tokens": tokens, "seed": seed}})
             }
-            Self::KvFingerprint => "\"fingerprint\"".into(),
-            Self::Ping => "\"ping\"".into(),
-            Self::Mark => "\"mark\"".into(),
-            Self::Activate { prompt } => format!("{{\"activate\":{}}}", prompt.len()),
+            Self::KvFingerprint => json!("fingerprint"),
+            Self::Ping => json!("ping"),
+            Self::Mark => json!("mark"),
+            Self::Activate { prompt } => json!({"activate": {"prompt": prompt}}),
             Self::Finalize { conv_id, canonical } => {
-                format!("{{\"finalize\":[{conv_id},{}]}}", canonical.len())
+                json!({"finalize": {"conv_id": conv_id, "canonical": canonical}})
             }
-            Self::AlignTo { target } => format!("{{\"align_to\":{}}}", target.len()),
-            Self::BeginTurn { prompt, .. } => format!("{{\"begin_turn\":{}}}", prompt.len()),
-            Self::ProposeBlock => "\"propose_block\"".into(),
+            Self::AlignTo { target } => json!({"align_to": {"target": target}}),
+            Self::Splice {
+                start,
+                end,
+                replacement,
+            } => json!({"splice": {"start": start, "end": end, "replacement": replacement}}),
+            Self::BeginTurn { prompt, cfg, label } => {
+                json!({"begin_turn": {"prompt": prompt, "label": label, "cfg": cfg_json(cfg)}})
+            }
+            Self::ProposeBlock => json!("propose_block"),
             Self::CommitBlock { kept_len, extend } => {
-                format!("{{\"commit_block\":[{kept_len},{extend}]}}")
+                json!({"commit_block": {"kept_len": kept_len, "extend": extend}})
             }
-            Self::DiscardBlock => "\"discard_block\"".into(),
-            Self::EndTurn => "\"end_turn\"".into(),
-            Self::Shutdown => "\"shutdown\"".into(),
+            Self::DiscardBlock => json!("discard_block"),
+            Self::EndTurn => json!("end_turn"),
+            Self::Shutdown => json!("shutdown"),
+        }
+    }
+}
+
+impl PipelineOp {
+    /// Reconstruct an op from its [`Self::log_json`] form (the replay half).
+    /// `model_dir` rebuilds the non-serializable cfg parts (the
+    /// degenerate-reply check needs the tokenizer). `None` = unknown shape.
+    pub fn from_log_json(v: &serde_json::Value, model_dir: &std::path::Path) -> Option<PipelineOp> {
+        fn ids(v: &serde_json::Value) -> Option<Vec<u32>> {
+            v.as_array()?
+                .iter()
+                .map(|x| x.as_u64().map(|n| n as u32))
+                .collect()
+        }
+        fn cfg_from(
+            v: &serde_json::Value,
+            model_dir: &std::path::Path,
+        ) -> Option<crate::metal::StepGenerateConfig> {
+            let seed = v.get("seed")?.as_u64()?;
+            let max_new = v.get("max_new_tokens")?.as_u64()? as usize;
+            let steps = v.get("steps")?.as_u64()? as usize;
+            let no_early = v.get("no_early_stop")?.as_bool()?;
+            let sampler_ne = v.get("sampler_no_early_stop")?.as_bool()?;
+            let stop_ids = ids(v.get("stop_token_ids")?)?;
+            let cont = v.get("continue_incomplete_tool_calls")?.as_bool()?;
+            let degen = v.get("degenerate_reply_check")?.as_bool()?;
+            let sampler = crate::sample::sampler_for_steps(steps, sampler_ne);
+            // layers/max_seq are session-owned and overwritten by the pipeline.
+            let mut cfg = crate::metal::StepGenerateConfig::from_generate(
+                seed, max_new, 0, 0, sampler, no_early,
+            );
+            cfg.stop_token_ids = stop_ids.clone();
+            cfg.continue_incomplete_tool_calls = cont;
+            if degen {
+                cfg.degenerate_reply_check =
+                    crate::chat_template::empty_reply_check(model_dir, stop_ids);
+            }
+            Some(cfg)
+        }
+        if let Some(s) = v.as_str() {
+            return match s {
+                "fingerprint" => Some(Self::KvFingerprint),
+                "ping" => Some(Self::Ping),
+                "mark" => Some(Self::Mark),
+                "propose_block" => Some(Self::ProposeBlock),
+                "discard_block" => Some(Self::DiscardBlock),
+                "end_turn" => Some(Self::EndTurn),
+                "shutdown" => Some(Self::Shutdown),
+                _ => None,
+            };
+        }
+        let obj = v.as_object()?;
+        let (key, body) = obj.iter().next()?;
+        match key.as_str() {
+            "extend" => Some(Self::Extend(ids(body.get("ids")?)?)),
+            "generate" => Some(Self::Generate {
+                prompt: ids(body.get("prompt")?)?,
+                cfg: Box::new(cfg_from(body.get("cfg")?, model_dir)?),
+                label: body.get("label")?.as_str()?.to_string(),
+            }),
+            "rewind" => Some(Self::Rewind(KvId {
+                epoch: body.get("epoch")?.as_u64()?,
+                pos: body.get("pos")?.as_u64()? as usize,
+            })),
+            "synthetic_fill" => Some(Self::SyntheticFill {
+                tokens: body.get("tokens")?.as_u64()? as usize,
+                seed: body.get("seed")?.as_u64()?,
+            }),
+            "activate" => Some(Self::Activate {
+                prompt: ids(body.get("prompt")?)?,
+            }),
+            "finalize" => Some(Self::Finalize {
+                conv_id: body.get("conv_id")?.as_u64()?,
+                canonical: ids(body.get("canonical")?)?,
+            }),
+            "align_to" => Some(Self::AlignTo {
+                target: ids(body.get("target")?)?,
+            }),
+            "splice" => Some(Self::Splice {
+                start: body.get("start")?.as_u64()? as usize,
+                end: body.get("end")?.as_u64()? as usize,
+                replacement: ids(body.get("replacement")?)?,
+            }),
+            "begin_turn" => Some(Self::BeginTurn {
+                prompt: ids(body.get("prompt")?)?,
+                cfg: Box::new(cfg_from(body.get("cfg")?, model_dir)?),
+                label: body.get("label")?.as_str()?.to_string(),
+            }),
+            "commit_block" => Some(Self::CommitBlock {
+                kept_len: body.get("kept_len")?.as_u64()? as usize,
+                extend: body.get("extend")?.as_bool()?,
+            }),
+            _ => None,
+        }
+    }
+}
+
+impl PipelineEvent {
+    /// Digest JSON for the op-log: enough to DIFF a replay against (token
+    /// counts, ids FNV, KV fingerprints, lineage ids) without storing every
+    /// generated id.
+    pub fn log_json(&self) -> serde_json::Value {
+        use serde_json::json;
+        fn kv_json(kv: &KvId) -> serde_json::Value {
+            json!({"epoch": kv.epoch, "pos": kv.pos})
+        }
+        match self {
+            Self::Extended { kv } => json!({"extended": {"kv": kv_json(kv)}}),
+            Self::Generated { out, kv } => json!({"generated": {
+                "tokens": out.token_ids.len(),
+                "blocks": out.blocks_committed,
+                "cancelled": out.cancelled,
+                "ids_fnv": format!("{:#x}", ids_fnv(&out.token_ids)),
+                "kv": kv_json(kv),
+            }}),
+            Self::Rewound { kv } => json!({"rewound": {"kv": kv_json(kv)}}),
+            Self::Filled { kv } => json!({"filled": {"kv": kv_json(kv)}}),
+            Self::Fingerprint { fnv, kv } => {
+                json!({"fingerprint": {"fnv": format!("{fnv:#x}"), "kv": kv_json(kv)}})
+            }
+            Self::Pong => json!("pong"),
+            Self::Marked { kv } => json!({"marked": {"kv": kv_json(kv)}}),
+            Self::Activated {
+                conv_id,
+                kv,
+                reused,
+            } => json!({"activated": {"conv_id": conv_id, "reused": reused, "kv": kv_json(kv)}}),
+            Self::Finalized { kv } => json!({"finalized": {"kv": kv_json(kv)}}),
+            Self::Aligned { kv, reused } => {
+                json!({"aligned": {"reused": reused, "kv": kv_json(kv)}})
+            }
+            Self::Spliced {
+                kv,
+                removed,
+                inserted,
+            } => json!({"spliced": {"removed": removed, "inserted": inserted, "kv": kv_json(kv)}}),
+            Self::TurnStarted { kv } => json!({"turn_started": {"kv": kv_json(kv)}}),
+            Self::Proposed {
+                ids,
+                stop,
+                steps_eff,
+                late_mean_ent,
+                kv,
+            } => json!({"proposed": {
+                "tokens": ids.len(),
+                "ids_fnv": format!("{:#x}", ids_fnv(ids)),
+                "stop": stop.map(|(off, id)| json!([off, id])),
+                "steps_eff": steps_eff,
+                "late_mean_ent": late_mean_ent,
+                "kv": kv_json(kv),
+            }}),
+            Self::TurnStalled { reason, kv } => {
+                json!({"turn_stalled": {"reason": reason, "kv": kv_json(kv)}})
+            }
+            Self::BlockCommitted { kv, new_tokens } => {
+                json!({"block_committed": {"new_tokens": new_tokens, "kv": kv_json(kv)}})
+            }
+            Self::BlockDiscarded { kv } => json!({"block_discarded": {"kv": kv_json(kv)}}),
+            Self::Error(msg) => json!({"error": msg}),
+            Self::ShutDown => json!("shutdown"),
         }
     }
 }
@@ -434,6 +792,7 @@ fn run_pipeline(
                 | PipelineOp::Activate { .. }
                 | PipelineOp::Finalize { .. }
                 | PipelineOp::AlignTo { .. }
+                | PipelineOp::Splice { .. }
                 | PipelineOp::BeginTurn { .. }
         )
     }
@@ -442,7 +801,7 @@ fn run_pipeline(
         if turn.is_some() && conflicts_with_open_turn(&op) {
             let refused = PipelineEvent::Error(format!(
                 "op rejected while a turn is open (end or discard first): {}",
-                op.log_line()
+                op.name()
             ));
             if ev_tx.send(refused).is_err() {
                 return;
@@ -552,6 +911,38 @@ fn run_pipeline(
                         }
                     }
                     Err(err) => PipelineEvent::Error(format!("align: {err}")),
+                }
+            }
+            PipelineOp::Splice {
+                start,
+                end,
+                replacement,
+            } => {
+                let session = manager.session_mut();
+                let log_len = session.kv_valid_tokens().len();
+                if start > end || end > log_len {
+                    PipelineEvent::Error(format!(
+                        "splice: range {start}..{end} out of bounds (log {log_len})"
+                    ))
+                } else {
+                    let inserted = replacement.len();
+                    let removed = end - start;
+                    let mut tail = replacement;
+                    tail.extend_from_slice(&session.kv_valid_tokens()[end..]);
+                    let spliced = session
+                        .truncate_kv_to(start)
+                        .and_then(|()| session.extend_kv(&tail));
+                    match spliced {
+                        Ok(()) => {
+                            epoch += 1;
+                            PipelineEvent::Spliced {
+                                kv: kv_id(epoch, &mut manager),
+                                removed,
+                                inserted,
+                            }
+                        }
+                        Err(err) => PipelineEvent::Error(format!("splice: {err}")),
+                    }
                 }
             }
             PipelineOp::BeginTurn { prompt, cfg, label } => {
@@ -677,6 +1068,259 @@ fn run_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scripted inner stage for validator tests: returns canned events in
+    /// order and records the op names it saw.
+    struct ScriptedStage {
+        script: std::cell::RefCell<Vec<PipelineEvent>>,
+        seen: std::cell::RefCell<Vec<&'static str>>,
+    }
+
+    impl PipelineStage for ScriptedStage {
+        fn call(&self, op: PipelineOp) -> PipelineEvent {
+            self.seen.borrow_mut().push(op.name());
+            self.script.borrow_mut().remove(0)
+        }
+    }
+
+    fn generated_event(token_ids: Vec<u32>, kv: KvId) -> PipelineEvent {
+        PipelineEvent::Generated {
+            out: Box::new(crate::generate::GenerateOutput {
+                token_ids,
+                denoise_steps_run: 1,
+                blocks_committed: 1,
+                cancelled: false,
+                stopped_on_eot: true,
+                stop_token_id: None,
+                stop_block_idx: None,
+                stop_offset: None,
+                block_stats: Vec::new(),
+                block_steps_eff: vec![1],
+                last_block_accept_hist: Vec::new(),
+                last_block_min_entropy_hist: Vec::new(),
+                prefill_elapsed: std::time::Duration::ZERO,
+                denoise_elapsed: std::time::Duration::ZERO,
+                extend_elapsed: std::time::Duration::ZERO,
+                #[cfg(target_os = "macos")]
+                session_telemetry: crate::metal::SessionTelemetry::default(),
+                #[cfg(target_os = "macos")]
+                denoise_trace: None,
+            }),
+            kv,
+        }
+    }
+
+    /// The validator's retry choreography, pinned against a scripted inner
+    /// stage: malformed first reply -> Mark, Generate, Rewind, Generate — and
+    /// the second (clean) reply is what the caller receives. No GPU; the
+    /// tokenizer comes from the model dir.
+    #[test]
+    fn tool_validator_rewinds_and_retries_malformed_reply() {
+        let Some(dir) = crate::shaders::test_util::dgq_model_dir() else {
+            return;
+        };
+        let tokenizer = std::sync::Arc::new(
+            crate::tokenizer::Tokenizer::load(&dir.join("tokenizer.json")).expect("tokenizer"),
+        );
+        let prompt: Vec<u32> = vec![10, 11, 12];
+        let malformed: Vec<u32> = {
+            let mut ids = prompt.clone();
+            ids.extend(tokenizer.encode_with_specials("<|tool_call>call:list_dir{path:"));
+            ids
+        };
+        let clean: Vec<u32> = {
+            let mut ids = prompt.clone();
+            ids.extend(tokenizer.encode_with_specials("All done."));
+            ids
+        };
+        let kv = |pos| KvId { epoch: 0, pos };
+        let inner = ScriptedStage {
+            script: std::cell::RefCell::new(vec![
+                PipelineEvent::Marked { kv: kv(3) },
+                generated_event(malformed, kv(3)),
+                PipelineEvent::Rewound { kv: kv(3) },
+                generated_event(clean.clone(), kv(3)),
+            ]),
+            seen: std::cell::RefCell::new(Vec::new()),
+        };
+        let validator = ToolValidatorStage::new(inner, tokenizer, 1);
+        let cfg = crate::metal::StepGenerateConfig::from_generate(
+            42,
+            64,
+            1024,
+            0,
+            crate::sample::sampler_for_steps(8, false),
+            false,
+        );
+        let ev = validator.call(PipelineOp::Generate {
+            prompt,
+            cfg: Box::new(cfg),
+            label: "validator-test".into(),
+        });
+        let PipelineEvent::Generated { out, .. } = ev else {
+            panic!("validator swallowed the Generated event: {ev:?}");
+        };
+        assert_eq!(
+            out.token_ids, clean,
+            "caller must receive the retried reply"
+        );
+        assert_eq!(
+            *validator.inner.seen.borrow(),
+            vec!["mark", "generate", "rewind", "generate"],
+            "retry choreography mismatch"
+        );
+    }
+
+    /// The op-log round trip: ops journaled by OpLogStage reconstruct via
+    /// `from_log_json` and re-execute on a fresh pipeline to bit-identical
+    /// event digests (fingerprints, generated ids FNV, lineage ids). This is
+    /// the standing replay gate — a field ops.jsonl IS a repro artifact.
+    #[test]
+    fn oplog_roundtrip_replays_bit_identically() {
+        let Some(dir) = crate::shaders::test_util::dgq_model_dir() else {
+            return;
+        };
+        let log_path =
+            std::env::temp_dir().join(format!("dgq-oplog-gate-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&log_path);
+        let ids: Vec<u32> = (0..300u32).map(|i| 1000 + (i * 5087) % 30000).collect();
+        let cfg = || {
+            crate::metal::StepGenerateConfig::from_generate(
+                42,
+                192,
+                4096,
+                0,
+                crate::sample::sampler_for_steps(24, false),
+                false,
+            )
+        };
+
+        // Record a session through the op-log.
+        {
+            let stage = OpLogStage::new(Pipeline::spawn(dir.clone(), 4096, 24), &log_path)
+                .expect("op-log open");
+            let PipelineEvent::Extended { .. } = stage.call(PipelineOp::Extend(ids.clone())) else {
+                panic!("extend failed");
+            };
+            let PipelineEvent::Marked { kv: mark } = stage.call(PipelineOp::Mark) else {
+                panic!("mark failed");
+            };
+            let PipelineEvent::Fingerprint { .. } = stage.call(PipelineOp::KvFingerprint) else {
+                panic!("fingerprint failed");
+            };
+            let PipelineEvent::Generated { .. } = stage.call(PipelineOp::Generate {
+                prompt: ids.clone(),
+                cfg: Box::new(cfg()),
+                label: "oplog-gate".into(),
+            }) else {
+                panic!("generate failed");
+            };
+            let PipelineEvent::Rewound { .. } = stage.call(PipelineOp::Rewind(mark)) else {
+                panic!("rewind failed");
+            };
+            let PipelineEvent::Fingerprint { .. } = stage.call(PipelineOp::KvFingerprint) else {
+                panic!("fingerprint failed");
+            };
+            // Stage (and its pipeline) drop here — the GPU session closes
+            // before the replay pipeline opens.
+        }
+
+        // Replay the journal on a fresh pipeline; every event digest must match.
+        let text = std::fs::read_to_string(&log_path).expect("read op-log");
+        let p = Pipeline::spawn(dir.clone(), 4096, 24);
+        for (lineno, line) in text.lines().enumerate() {
+            let v: serde_json::Value = serde_json::from_str(line).expect("op-log line parses");
+            let (Some(op_json), Some(recorded)) = (v.get("op"), v.get("event")) else {
+                panic!("line {} has no op/event: {line}", lineno + 1);
+            };
+            let op = PipelineOp::from_log_json(op_json, &dir)
+                .unwrap_or_else(|| panic!("line {}: op did not reconstruct", lineno + 1));
+            let got = p.call(op).log_json();
+            assert_eq!(
+                &got,
+                recorded,
+                "replay diverged at line {} ({})",
+                lineno + 1,
+                op_json
+            );
+        }
+        let _ = std::fs::remove_file(&log_path);
+    }
+
+    /// The Splice gate: surgically replacing a mid-log span must leave state
+    /// byte-identical to building the target log fresh — no residue from the
+    /// removed span, and the tail re-encode at its new offset must be
+    /// bit-deterministic (the offset-resume property, exercised at a splice
+    /// boundary instead of a turn boundary).
+    #[test]
+    fn splice_matches_fresh_build() {
+        let Some(dir) = crate::shaders::test_util::dgq_model_dir() else {
+            return;
+        };
+        let p = Pipeline::spawn(dir, 4096, 24);
+        let ids: Vec<u32> = (0..600u32).map(|i| 1000 + (i * 6151) % 30000).collect();
+        let replacement: Vec<u32> = (0..50u32).map(|i| 9000 + i * 17).collect();
+        let mut target = ids[..200].to_vec();
+        target.extend_from_slice(&replacement);
+        target.extend_from_slice(&ids[300..]);
+
+        let PipelineEvent::Extended { .. } = p.call(PipelineOp::Extend(ids.clone())) else {
+            panic!("extend failed");
+        };
+        let ev = p.call(PipelineOp::Splice {
+            start: 200,
+            end: 300,
+            replacement,
+        });
+        let PipelineEvent::Spliced {
+            kv,
+            removed,
+            inserted,
+        } = ev
+        else {
+            panic!("splice failed: {ev:?}");
+        };
+        assert_eq!((removed, inserted), (100, 50));
+        assert_eq!(kv.pos, target.len(), "spliced log length wrong");
+        let PipelineEvent::Fingerprint {
+            fnv: fp_spliced, ..
+        } = p.call(PipelineOp::KvFingerprint)
+        else {
+            panic!("fingerprint failed");
+        };
+
+        // Fresh build of the identical target log on the same session.
+        let zero = KvId {
+            epoch: kv.epoch,
+            pos: 0,
+        };
+        let PipelineEvent::Rewound { .. } = p.call(PipelineOp::Rewind(zero)) else {
+            panic!("rewind to 0 failed");
+        };
+        let PipelineEvent::Extended { .. } = p.call(PipelineOp::Extend(target)) else {
+            panic!("fresh extend failed");
+        };
+        let PipelineEvent::Fingerprint { fnv: fp_fresh, .. } = p.call(PipelineOp::KvFingerprint)
+        else {
+            panic!("fingerprint failed");
+        };
+        assert_eq!(
+            fp_spliced, fp_fresh,
+            "splice left residue vs a fresh build of the same log"
+        );
+
+        // Range validation fails loudly.
+        match p.call(PipelineOp::Splice {
+            start: 10_000,
+            end: 10_001,
+            replacement: vec![1],
+        }) {
+            PipelineEvent::Error(msg) => {
+                assert!(msg.contains("out of bounds"), "wrong error: {msg}")
+            }
+            ev => panic!("out-of-range splice must fail, got {ev:?}"),
+        }
+    }
 
     /// The P2 equivalence gate: a client driving
     /// BeginTurn/ProposeBlock/CommitBlock/EndTurn with the default policy

@@ -18,6 +18,7 @@ mod common;
 mod gen_cmd;
 mod golden_cmd;
 mod model_ops;
+mod replay;
 mod smoketest;
 mod step_debug;
 mod step_gate;
@@ -28,6 +29,7 @@ pub(crate) use common::*;
 pub(crate) use gen_cmd::*;
 pub(crate) use golden_cmd::*;
 pub(crate) use model_ops::*;
+pub(crate) use replay::*;
 pub(crate) use smoketest::*;
 pub(crate) use step_debug::*;
 pub(crate) use step_gate::*;
@@ -473,6 +475,7 @@ pub(crate) fn dispatch(cli: Cli) -> ExitCode {
             max_layers,
             ctx,
             tool_compact,
+            tool_validate,
             log_dir,
             think,
         } => match server::run_serve(
@@ -483,6 +486,7 @@ pub(crate) fn dispatch(cli: Cli) -> ExitCode {
             steps,
             max_layers,
             tool_compact,
+            tool_validate,
             log_dir,
             think,
         ) {
@@ -528,6 +532,14 @@ pub(crate) fn dispatch(cli: Cli) -> ExitCode {
         ),
         #[cfg(not(target_os = "macos"))]
         Command::Golden { .. } => ExitCode::FAILURE,
+        #[cfg(target_os = "macos")]
+        Command::Replay {
+            log_path,
+            ctx,
+            steps,
+        } => run_replay_cmd(&cli.model_dir, &log_path, ctx, steps),
+        #[cfg(not(target_os = "macos"))]
+        Command::Replay { .. } => ExitCode::FAILURE,
         Command::Quantize { output, profile } => run_quantize(&cli.model_dir, &output, &profile),
         Command::Tokenize(text) => run_tokenize(&cli.model_dir, &text, cli.raw_prompt),
         Command::Gemm { size } => run_gemm(size),
@@ -592,6 +604,7 @@ pub(crate) fn run_command(
         Command::Serve { .. } => ExitCode::FAILURE,
         Command::Smoketest { .. } => ExitCode::FAILURE,
         Command::Golden { .. } => ExitCode::FAILURE,
+        Command::Replay { .. } => ExitCode::FAILURE,
         Command::Manifest => {
             print!("{}", crate::shaders::manifest::render_toml());
             ExitCode::SUCCESS

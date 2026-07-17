@@ -29,13 +29,34 @@ impl Worker {
         // ops.jsonl beside the turn dumps (the replayable op-log).
         let stage: Box<dyn crate::pipeline::PipelineStage> = match &self.log_dir {
             Some(dir) => match crate::pipeline::OpLogStage::new(pipeline, &dir.join("ops.jsonl")) {
-                Ok(logged) => Box::new(logged),
+                Ok(logged) => {
+                    // Session header: what `replay` needs to respawn the
+                    // pipeline this log ran against.
+                    logged.log_meta(
+                        &self.model_dir.display().to_string(),
+                        self.max_seq,
+                        self.steps,
+                    );
+                    Box::new(logged)
+                }
                 Err(err) => {
                     let _ = ready.send(Err(format!("op-log open failed: {err}")));
                     return;
                 }
             },
             None => Box::new(pipeline),
+        };
+        // Validator OUTSIDE the op-log: its Mark/Rewind/retry ops flow through
+        // the log, so a validated session's ops.jsonl replays faithfully.
+        let stage: Box<dyn crate::pipeline::PipelineStage> = if self.tool_validate {
+            eprintln!("serve: tool-validate ON (rewind + regenerate on malformed tool grammar)");
+            Box::new(crate::pipeline::ToolValidatorStage::new(
+                stage,
+                Arc::clone(&self.tokenizer),
+                1,
+            ))
+        } else {
+            stage
         };
         match stage.call(crate::pipeline::PipelineOp::Ping) {
             crate::pipeline::PipelineEvent::Pong => {}

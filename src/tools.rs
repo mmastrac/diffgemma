@@ -542,6 +542,20 @@ pub fn should_continue_past_stop(text: &str) -> bool {
     has_incomplete_tool_call(text) || has_trailing_after_tool_calls(text)
 }
 
+/// Strict reply-level grammar verdict for the validator stage: a reply that
+/// speaks the tool grammar at all must parse cleanly. Plain prose is `Ok`.
+/// (Prose containing a bare `call:` is flagged, consistent with
+/// `should_continue_past_stop` treating it as an unfinished tool turn.)
+pub fn validate_tool_reply(text: &str) -> Result<(), &'static str> {
+    if has_incomplete_tool_call(text) {
+        return Err("incomplete tool call");
+    }
+    if text.contains("call:") && parse_tool_calls(text).is_empty() {
+        return Err("tool-call grammar present but nothing parseable");
+    }
+    Ok(())
+}
+
 /// Parse every `call:NAME{ARGS}` in model output into structured tool calls,
 /// tolerant of the exact wrapper tokens around/between them.
 pub fn parse_tool_calls(text: &str) -> Vec<ParsedToolCall> {
@@ -713,6 +727,21 @@ fn split_top_level(s: &str) -> Vec<&str> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn validate_tool_reply_verdicts() {
+        // Plain prose and well-formed calls pass.
+        assert!(validate_tool_reply("The answer is 42.").is_ok());
+        assert!(
+            validate_tool_reply("<|tool_call>call:list_dir{path:<|\"|>/tmp<|\"|>}<tool_call|>")
+                .is_ok()
+        );
+        // Incomplete grammar fails: opener without a call, call without braces,
+        // unbalanced braces.
+        assert!(validate_tool_reply("<|tool_call>").is_err());
+        assert!(validate_tool_reply("<|tool_call>call:list_dir").is_err());
+        assert!(validate_tool_reply("<|tool_call>call:list_dir{path:").is_err());
+    }
 
     // Oracle strings from python/scripts/tool_format_oracle.py (the reference jinja).
 

@@ -88,6 +88,28 @@ the freeze lesson applies to reject-masks). Later: multi-conv absorption,
 Reground, lineage-drift gate. Every phase: golden 8/8 + suite; behavior
 changes additionally smoketest ×{7,42,123}.
 
+**P4 Splice + op-log replay + tool validator (SHIPPED):** (1) `Splice
+{start, end, replacement}` op — surgical mid-log replacement (truncate to
+start + re-extend replacement + tail), epoch-bumping;
+`splice_matches_fresh_build` pins spliced state byte-identical to a
+fresh build of the target log. (2) Full-fidelity op-log:
+`PipelineOp::log_json` records every id + the replayable cfg core
+(seed/budget/steps/stops/E6-flag); events log digests (ids FNV,
+fingerprints, lineage ids); serve writes a `{"meta":…}` header
+(model/ctx/steps). `diffgemma-mps replay <ops.jsonl>` re-executes the
+log on a fresh pipeline and diffs every event
+(`oplog_roundtrip_replays_bit_identically` + live serve-session replay
+7/7 ops, 0 diverged — a field ops.jsonl IS a repro artifact). Replay
+caveat: DGQ_* flags come from the current env; a second meta line
+(serve restart) stops the replay. (3) `ToolValidatorStage` — chain
+stage wrapping Generate with Mark→validate→Rewind→re-Generate (bumped
+seed): malformed tool grammar (`tools::validate_tool_reply`) never
+enters causal context; retries flow through the op-log (validator sits
+OUTSIDE OpLogStage). Opt-in `serve --tool-validate` /
+`DGQ_TOOL_VALIDATE=1`, default OFF (quality-affecting: a retry replaces
+the reply; needs field sign-off). Remaining P4-adjacent: replay across
+serve restarts; grammar-aware kept_len at the per-block layer.
+
 **P2 per-block propose/commit (SHIPPED):** `generate_with_session`
 decomposed into `begin_turn` (prefill selection) / `propose_block` (one
 block's attempt loop, E6 + commit-guard re-rolls intact, commits
