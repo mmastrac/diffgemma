@@ -5,3 +5,6 @@
 
 # style: apply cargo fmt across the tree
 2ef3476834a1b8198476589e8c04732274f14b36
+
+# style: cargo fmt — normalize drift from the 2026-07-16 campaign commits
+04f197c42b0e116c0a7ca0e02405582bd391b49d
