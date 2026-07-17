@@ -38,8 +38,7 @@ pub fn build_expert_jobs(routes: &[RouteResult], experts: usize) -> Vec<ExpertJo
     }
 
     let mut jobs = Vec::new();
-    for expert in 0..experts {
-        let tokens = &buckets[expert];
+    for (expert, tokens) in buckets.iter().enumerate() {
         if tokens.is_empty() {
             continue;
         }

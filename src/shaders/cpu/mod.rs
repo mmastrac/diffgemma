@@ -18,7 +18,7 @@ pub use crate::shaders::moe::moe_router::cpu as moe_router;
 pub use crate::shaders::moe::moe_scatter_weighted::cpu as moe_scatter_weighted;
 pub use crate::shaders::sample::cpu as sampler;
 
-const GELU_TANH_COEF: f32 = 0.797_884_560_802_865_4; // sqrt(2/pi)
+const GELU_TANH_COEF: f32 = 0.797_884_6; // sqrt(2/pi)
 
 /// RMSNorm without learnable scale (`router` gate input, `v_norm`).
 pub fn rms_norm_no_scale(out: &mut [f32], x: &[f32], eps: f32) {

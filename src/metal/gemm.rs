@@ -286,7 +286,7 @@ fn encode_gemm(
 }
 
 fn div_up(value: usize, group: usize) -> usize {
-    (value + group - 1) / group
+    value.div_ceil(group)
 }
 
 #[cfg(test)]

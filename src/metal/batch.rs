@@ -279,7 +279,6 @@ impl<'a> GpuBatch<'a> {
 
     /// `dispatch_linear` with the weight bound at a byte offset (bf16 weights
     /// read straight from the resident `.dgq` blob — no upload).
-    #[allow(clippy::too_many_arguments)]
     pub fn dispatch_linear_w_off(
         &self,
         pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
@@ -543,7 +542,7 @@ impl<'a> GpuBatch<'a> {
 }
 
 pub(crate) fn div_up(value: usize, group: usize) -> usize {
-    (value + group - 1) / group
+    value.div_ceil(group)
 }
 
 /// Start a batch with optional step telemetry (only `pool` is mutably borrowed).

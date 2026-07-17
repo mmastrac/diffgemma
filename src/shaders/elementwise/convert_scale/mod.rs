@@ -46,7 +46,6 @@ use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder};
 /// Bind the 7-arg convert/scale signature. `src`/`dst` may be the same buffer
 /// (in-place, e.g. half_scale). `dump` is only written when K_DUMP_STAGE >= 1.
 #[cfg(target_os = "macos")]
-#[allow(clippy::too_many_arguments)]
 pub fn bind_gpu_buffers(
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     src: &ProtocolObject<dyn MTLBuffer>,

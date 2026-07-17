@@ -85,10 +85,10 @@ pub(crate) fn run_golden_cmd(
     let mut doc_cache: std::collections::HashMap<String, Vec<u32>> = Default::default();
 
     for case in &mut pack.cases {
-        if let Some(pat) = filter {
-            if !case.id.to_lowercase().contains(&pat.to_lowercase()) {
-                continue;
-            }
+        if let Some(pat) = filter
+            && !case.id.to_lowercase().contains(&pat.to_lowercase())
+        {
+            continue;
         }
         total += 1;
 
@@ -214,7 +214,6 @@ pub(crate) fn steps_production_default() -> usize {
 /// keeps its own KV across turns (cross-turn reuse). Returns the FINAL turn's
 /// output + a hash of the resident causal KV.
 #[cfg(target_os = "macos")]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_golden_case(
     session: &mut metal::StepGenerateSession,
     tokenizer: &tokenizer::Tokenizer,

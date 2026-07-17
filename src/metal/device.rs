@@ -121,7 +121,7 @@ impl MetalContext {
         let ns_source = NSString::from_str(&crate::shaders::expand::expand(source));
         self.device
             .newLibraryWithSource_options_error(&ns_source, None)
-            .map_err(|e| shader_compile_error(e))
+            .map_err(shader_compile_error)
     }
 
     pub fn compile_kernel(&self, source: &str, entry: &str) -> Result<ComputePipeline, Error> {
@@ -241,7 +241,6 @@ impl MetalContext {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn compile_gemm_stacked_subkernel_on_device(
         device: &ProtocolObject<dyn MTLDevice>,
         library: &ProtocolObject<dyn MTLLibrary>,
@@ -370,7 +369,7 @@ impl MetalContext {
         let name = NSString::from_str(entry);
         let function = library
             .newFunctionWithName_constantValues_error(&name, &fc)
-            .map_err(|e| shader_compile_error(e))?;
+            .map_err(shader_compile_error)?;
         let label = format!(
             "{entry}_qf{quant_format}_n{gemm_n}_k{gemm_k}_nt{gemm_n_tile}_af{}_ns{}_e{}_{}_{}_w{}_{}_{}_y{}_{}_{}_s{src_hash:x}",
             u8::from(arena_f16),
@@ -496,7 +495,7 @@ impl MetalContext {
         let name = NSString::from_str(entry);
         let function = library
             .newFunctionWithName_constantValues_error(&name, &fc)
-            .map_err(|e| shader_compile_error(e))?;
+            .map_err(shader_compile_error)?;
         let label = format!(
             "{entry}_qf{quant_format}_n{gemm_n}_k{gemm_k}_nt{gemm_n_tile}_xfp16{}_sa{}_df{}_dd{}_g{}_o{}_oa{}_af{}_s{src_hash:x}",
             u8::from(x_fp16),
@@ -570,7 +569,7 @@ impl MetalContext {
             let ns_source = NSString::from_str(&crate::shaders::expand::expand(source));
             device
                 .newLibraryWithSource_options_error(&ns_source, None)
-                .map_err(|e| shader_compile_error(e))?
+                .map_err(shader_compile_error)?
         };
         let fc = MTLFunctionConstantValues::new();
         let shape_assert = variant.shape_assert;
@@ -628,7 +627,7 @@ impl MetalContext {
         let name = NSString::from_str(entry);
         let function = library
             .newFunctionWithName_constantValues_error(&name, &fc)
-            .map_err(|e| shader_compile_error(e))?;
+            .map_err(shader_compile_error)?;
         // Fold the SOURCE hash + the extra function-constant values into the cache
         // label. `PipelineArchiveCache` dedupes by label, and `cache_label_extra`
         // only covers `entry` + the shared FC triple + whatever string the caller

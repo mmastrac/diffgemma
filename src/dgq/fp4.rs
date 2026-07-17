@@ -73,7 +73,7 @@ pub fn fp8_e4m3_from_f32(f: f32) -> u8 {
         let adjusted_bits = adjusted.to_bits();
         (adjusted_bits - DENORM_MASK) as u8
     } else {
-        let mant_odd = ((f_bits >> 20) & 1) as u32;
+        let mant_odd = (f_bits >> 20) & 1;
         f_bits = f_bits.wrapping_add((7u32.wrapping_sub(127) << 23) + 0x7_FFFF);
         f_bits = f_bits.wrapping_add(mant_odd);
         (f_bits >> 20) as u8

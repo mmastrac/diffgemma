@@ -74,7 +74,7 @@ pub fn quantize_row_nvfp4(row: &[f32], in_dim: usize, dst: &mut [u8], global_sca
                 e2m1_from_f32(row[idx] * inv_global / scale)
             };
             let byte_i = idx / 2;
-            if idx % 2 == 0 {
+            if idx.is_multiple_of(2) {
                 data[byte_i] = (data[byte_i] & 0xf0) | (q & 0x0f);
             } else {
                 data[byte_i] = (data[byte_i] & 0x0f) | (q << 4);
@@ -198,7 +198,11 @@ pub fn nvfp4_weight_at(
     let row_off = row * row_bytes;
     let data_len = nvfp4_data_row_bytes(in_dim);
     let byte = src[row_off + col / 2];
-    let q = if col % 2 == 0 { byte & 0x0f } else { byte >> 4 };
+    let q = if col.is_multiple_of(2) {
+        byte & 0x0f
+    } else {
+        byte >> 4
+    };
     let scale = fp8_e4m3_to_f32(src[row_off + data_len + col / NVFP4_GROUP_SIZE]);
     e2m1_to_f32(q) * scale * global_scale
 }

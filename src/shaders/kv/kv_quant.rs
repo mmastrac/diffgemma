@@ -73,7 +73,7 @@ impl KvFormat {
 
 /// q8 group-32 round-trip of one head vector (matches `step_kv::kv_q8_pack_row`
 /// + `kv_q8_read` numerics; reproduced here so this module is self-contained
-/// and testable without the Metal path).
+///   and testable without the Metal path).
 pub fn q8_roundtrip(src: &[f32], out: &mut [f32]) {
     let hd = src.len();
     for g in 0..hd / KV_GROUP {

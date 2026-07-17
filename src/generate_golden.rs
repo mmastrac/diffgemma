@@ -232,14 +232,14 @@ pub fn check_chat_quality(
             gate.max_degenerate_ratio
         ));
     }
-    if let Some(min_steps) = gate.min_block_steps_eff {
-        if let Some(&steps_eff) = out.block_steps_eff.first() {
-            if steps_eff < min_steps && ratio > 0.5 {
-                return Err(format!(
-                    "block committed after {steps_eff} steps with {ratio:.0}% degenerate tokens (pad-aware stop regression)"
-                ));
-            }
-        }
+    if let Some(min_steps) = gate.min_block_steps_eff
+        && let Some(&steps_eff) = out.block_steps_eff.first()
+        && steps_eff < min_steps
+        && ratio > 0.5
+    {
+        return Err(format!(
+            "block committed after {steps_eff} steps with {ratio:.0}% degenerate tokens (pad-aware stop regression)"
+        ));
     }
     Ok(())
 }

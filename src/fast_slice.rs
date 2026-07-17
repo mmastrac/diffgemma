@@ -84,7 +84,7 @@ pub struct FastBf16Slice<'a> {
 impl<'a> FastBf16Slice<'a> {
     pub fn from_bf16(slice: Bf16Slice<'a>) -> Self {
         let bytes = slice.as_bytes();
-        debug_assert!(bytes.len() % 2 == 0);
+        debug_assert!(bytes.len().is_multiple_of(2));
         Self {
             ptr: bytes.as_ptr(),
             len: bytes.len() / 2,

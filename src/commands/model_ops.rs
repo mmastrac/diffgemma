@@ -64,7 +64,7 @@ pub(crate) fn run_quantize(
         }
     }
 }
-pub(crate) fn run_tokenize(model_dir: &PathBuf, text: &str, raw_prompt: bool) -> ExitCode {
+pub(crate) fn run_tokenize(model_dir: &std::path::Path, text: &str, raw_prompt: bool) -> ExitCode {
     let path = model_dir.join("tokenizer.json");
     match tokenizer::Tokenizer::load(&path) {
         Ok(tok) => {

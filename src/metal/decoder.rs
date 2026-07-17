@@ -441,47 +441,47 @@ fn forward_inner(
     }
     engine.pool.trim(4);
 
-    if let Some(path) = &layer_dump_path {
-        if layer_dump_pos < seq_len {
-            let off = layer_dump_pos * hidden;
-            layer_dump_rows.push((
-                "after_final_norm".into(),
-                norm_out[off..off + hidden].to_vec(),
-            ));
-            let checkpoints: Vec<serde_json::Value> = layer_dump_rows
-                .iter()
-                .map(|(label, h)| {
-                    let l2 = h
-                        .iter()
-                        .map(|v| (*v as f64) * (*v as f64))
-                        .sum::<f64>()
-                        .sqrt();
-                    let max_abs = h.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-                    serde_json::json!({
-                        "label": label,
-                        "hidden": h,
-                        "hidden_l2": l2 as f32,
-                        "hidden_max_abs": max_abs,
-                    })
+    if let Some(path) = &layer_dump_path
+        && layer_dump_pos < seq_len
+    {
+        let off = layer_dump_pos * hidden;
+        layer_dump_rows.push((
+            "after_final_norm".into(),
+            norm_out[off..off + hidden].to_vec(),
+        ));
+        let checkpoints: Vec<serde_json::Value> = layer_dump_rows
+            .iter()
+            .map(|(label, h)| {
+                let l2 = h
+                    .iter()
+                    .map(|v| (*v as f64) * (*v as f64))
+                    .sum::<f64>()
+                    .sqrt();
+                let max_abs = h.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                serde_json::json!({
+                    "label": label,
+                    "hidden": h,
+                    "hidden_l2": l2 as f32,
+                    "hidden_max_abs": max_abs,
                 })
-                .collect();
-            let doc = serde_json::json!({
-                "schema_version": 1,
-                "source": "engine-layer-dump",
-                "prompt": "",
-                "prompt_token_ids": [],
-                "initial_canvas_ids": input.token_ids,
-                "seed": 0,
-                "layers": n_layers,
-                "position": layer_dump_pos,
-                "canvas_token": input.token_ids.get(layer_dump_pos).copied().unwrap_or(0),
-                "checkpoints": checkpoints,
-            });
-            if let Err(e) = std::fs::write(path, serde_json::to_string(&doc).unwrap_or_default()) {
-                eprintln!("engine-layer-dump: write failed: {e}");
-            } else {
-                eprintln!("engine-layer-dump: wrote {path} (pos={layer_dump_pos})");
-            }
+            })
+            .collect();
+        let doc = serde_json::json!({
+            "schema_version": 1,
+            "source": "engine-layer-dump",
+            "prompt": "",
+            "prompt_token_ids": [],
+            "initial_canvas_ids": input.token_ids,
+            "seed": 0,
+            "layers": n_layers,
+            "position": layer_dump_pos,
+            "canvas_token": input.token_ids.get(layer_dump_pos).copied().unwrap_or(0),
+            "checkpoints": checkpoints,
+        });
+        if let Err(e) = std::fs::write(path, serde_json::to_string(&doc).unwrap_or_default()) {
+            eprintln!("engine-layer-dump: write failed: {e}");
+        } else {
+            eprintln!("engine-layer-dump: wrote {path} (pos={layer_dump_pos})");
         }
     }
 
@@ -493,11 +493,8 @@ fn forward_inner(
         tel.expert_misses += after.misses.saturating_sub(before.misses);
         tel.expert_upload_bytes += after.upload_bytes.saturating_sub(before.upload_bytes);
     }
-    if engine.telemetry_enabled() && input.compute_logits {
-        if !scratch.use_gpu_sampler {
-            engine.telemetry_handle().borrow_mut().lm_head_logits_bytes =
-                (seq_len * vocab * 4) as u64;
-        }
+    if engine.telemetry_enabled() && input.compute_logits && !scratch.use_gpu_sampler {
+        engine.telemetry_handle().borrow_mut().lm_head_logits_bytes = (seq_len * vocab * 4) as u64;
     }
 
     if input.compute_logits {

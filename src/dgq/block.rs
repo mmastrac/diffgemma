@@ -127,7 +127,7 @@ pub(crate) fn q4_weight_at(src: &[u8], row: usize, col: usize, in_dim: usize) ->
     let delta = bf16_to_f32(u16::from_le_bytes([src[si], src[si + 1]]));
     let min = bf16_to_f32(u16::from_le_bytes([src[si + 2], src[si + 3]]));
     let byte = src[si + 4 + j / 2];
-    let q = if j % 2 == 0 {
+    let q = if j.is_multiple_of(2) {
         (byte & 0x0f) as f32
     } else {
         (byte >> 4) as f32

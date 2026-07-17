@@ -376,12 +376,11 @@ pub(crate) fn run_generate_monolithic_parity_cmd(
 
     let profile = generate_golden::monolithic_weights_profile();
 
-    if let Some(ref name) = write_golden {
-        if let Err(err) = write_generate_golden(name, &prompt_label, &gen_cfg, steps, profile, &out)
-        {
-            eprintln!("error: {err}");
-            return ExitCode::FAILURE;
-        }
+    if let Some(ref name) = write_golden
+        && let Err(err) = write_generate_golden(name, &prompt_label, &gen_cfg, steps, profile, &out)
+    {
+        eprintln!("error: {err}");
+        return ExitCode::FAILURE;
     }
 
     let fixture_name = golden_name.or_else(|| {

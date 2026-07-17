@@ -46,7 +46,7 @@ pub fn run_step_kv_bf16_cross_parity(
             "kv cross parity requires at least one token",
         ));
     }
-    let layers = layers.max(1).min(N_LAYERS);
+    let layers = layers.clamp(1, N_LAYERS);
     let dgq_store = DgqStore::open(dgq_dir)?;
     let layout = build_layout(&build_offsets_from_store(&dgq_store), max_seq);
     let bf16_model = Model::open(bf16_dir)?;
@@ -475,15 +475,15 @@ pub fn run_step_attn_probe(
     for tok in 0..canvas_len {
         for h in 0..nheads {
             let off = (tok * nheads + h) * hd;
-            for d in 0..hd {
-                head[d] = (rng.next_f32() - 0.5) * 2.0;
+            for slot in head.iter_mut().take(hd) {
+                *slot = (rng.next_f32() - 0.5) * 2.0;
             }
             rms_norm(&mut q[off..off + hd], &head, &q_norm_w, eps);
         }
         for h in 0..nkv {
             let off = (tok * nkv + h) * hd;
-            for d in 0..hd {
-                head[d] = (rng.next_f32() - 0.5) * 2.0;
+            for slot in head.iter_mut().take(hd) {
+                *slot = (rng.next_f32() - 0.5) * 2.0;
             }
             rms_norm(&mut k_canvas[off..off + hd], &head, &k_norm_w, eps);
         }
@@ -565,7 +565,7 @@ pub fn run_step_kv_parity(
     if token_ids.len() > max_seq {
         return Err(Error::Runtime("token_ids exceed max_seq"));
     }
-    let layers = layers.max(1).min(N_LAYERS);
+    let layers = layers.clamp(1, N_LAYERS);
     let store = DgqStore::open(model_dir)?;
     let layout = build_layout(&build_offsets_from_store(&store), max_seq);
     let ctx = MetalContext::new()?;

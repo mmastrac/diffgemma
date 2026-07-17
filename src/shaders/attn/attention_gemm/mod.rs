@@ -7,10 +7,10 @@
 //!   1. `attn_gemm_qk`      NT-GEMM  S[i,t] = <Q_i, K_t>
 //!   2. `attn_gemm_softmax` rowwise  P = exp(S - rowmax) (masked), denom L
 //!   3. `attn_gemm_pv`      NN-GEMM  O[i,d] = sum_t P[i,t] V[t,d] / L_i
-//! No 1/sqrt(d) (folded into QK-norm upstream). P is left unnormalized; PV
-//! divides by L at store — mirroring `attention_mma_full`'s final divide so the
-//! two share numerics (f16 K/V, f32 accumulate). Not bit-identical; prefill
-//! only (denoise keeps `attention_mma_full`).
+//!      No 1/sqrt(d) (folded into QK-norm upstream). P is left unnormalized; PV
+//!      divides by L at store — mirroring `attention_mma_full`'s final divide so the
+//!      two share numerics (f16 K/V, f32 accumulate). Not bit-identical; prefill
+//!      only (denoise keeps `attention_mma_full`).
 
 #[cfg(target_os = "macos")]
 use crate::Error;
@@ -56,8 +56,8 @@ impl TuneCfg {
     /// Compile-time validity: BN divides 128 (loader thread split) and is a
     /// multiple of 16; BM a multiple of 16; SM_TPG a power of two in [32,1024].
     pub fn valid(&self) -> bool {
-        let ok_bn = |bn: usize| bn % 16 == 0 && 128 % bn == 0;
-        let ok_bm = |bm: usize| bm % 16 == 0 && bm > 0 && bm <= 128;
+        let ok_bn = |bn: usize| bn.is_multiple_of(16) && 128 % bn == 0;
+        let ok_bm = |bm: usize| bm.is_multiple_of(16) && bm > 0 && bm <= 128;
         ok_bn(self.qk_bn)
             && ok_bn(self.pv_bn)
             && ok_bm(self.qk_bm)

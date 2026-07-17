@@ -574,7 +574,7 @@ fn layer_byte_offset(layer: usize) -> u64 {
 }
 
 fn div_up(v: usize, g: usize) -> usize {
-    (v + g - 1) / g
+    v.div_ceil(g)
 }
 /// Fused Q‖K(‖V): one `GEMM_N` = q_n+k_n(+k_n); outputs land in native-width planes.
 pub(crate) fn qkv_stacked_segments(
@@ -1425,7 +1425,7 @@ fn layer_moe_block_jobs_impl(
     expert_base: u64,
 ) -> ([BlockGroupedJob; N_EXPERTS], [BlockGroupedJob; N_EXPERTS]) {
     use crate::dgq::layout::{nvfp4_matrix_bytes, q4_matrix_bytes, q6_matrix_bytes};
-    let hidden = HID as usize;
+    let hidden = HID;
     let moe_ff = MOE_FF as usize;
     let (gu_stride, dn_stride, gu_gpr, dn_gpr) = match format {
         QuantFormat::NvFp4 => (
@@ -2130,7 +2130,7 @@ impl StepEnc<'_> {
         self.memzero_buffer(&self.bufs.gemm_b, acc_bytes);
         self.sink_memory_barrier(); // memzero gemm_b before the first `+=`
 
-        let row_bytes = q8_row_bytes(HID as usize) as u64;
+        let row_bytes = q8_row_bytes(HID) as u64;
         let chunk_max = LM_HEAD_CHUNK as u32;
         let mut v0 = 0u32;
         while v0 < VOCAB as u32 {
@@ -3880,16 +3880,16 @@ impl StepEnc<'_> {
         first_step: u32,
         finish: StepFinishMode,
     ) -> Result<(), Error> {
-        if arena_liveness::runtime_arena_liveness_enabled() {
-            if let Err(e) = arena_liveness::check_step_arena_liveness(
+        if arena_liveness::runtime_arena_liveness_enabled()
+            && let Err(e) = arena_liveness::check_step_arena_liveness(
                 &self.block_profile,
                 layout,
                 layers,
                 first_step,
                 finish,
-            ) {
-                panic!("{e}");
-            }
+            )
+        {
+            panic!("{e}");
         }
         let schedule =
             step_schedule::build_step_schedule(&self.block_profile, finish == StepFinishMode::Full);
@@ -4908,7 +4908,7 @@ impl StepRuntime {
     /// so forwards over them stay finite and bit-deterministic — which is all
     /// the order-of-operations gates assert.
     pub fn synthetic_fill_kv(&mut self, n_tokens: usize, seed: u64) {
-        let len_bytes = self.bufs.kvcache.length() as usize;
+        let len_bytes = self.bufs.kvcache.length();
         let ptr = self.bufs.kvcache.contents().as_ptr() as *mut u16;
         let words = len_bytes / 2;
         let mut s = seed | 1;
@@ -4995,7 +4995,7 @@ impl StepRuntime {
                 enc.sink_set_buffer(&sbuf, enc.bufs.kv_f32_side_offs[layer] as usize, 1);
                 let shape = [count as u32, pos0 as u32, l.n_kv_heads, l.head_dim];
                 enc.sink_set_bytes(&shape, 2);
-                enc.sink_set_bytes(&(l.kv_region as u64), 3);
+                enc.sink_set_bytes(&{ l.kv_region }, 3);
                 enc.sink_set_bytes(&l.kv_ring_mask, 4);
                 let grid = MTLSize {
                     width: count,
@@ -5151,7 +5151,7 @@ impl StepRuntime {
     pub fn set_canvas_ids(&mut self, ids: &[u32]) -> Result<(), Error> {
         // CANVAS for denoise / plain prefill chunks; up to PREFILL_M for a
         // batched prefill super-chunk.
-        if ids.len() != CANVAS && (ids.len() > PREFILL_M || ids.len() % CANVAS != 0) {
+        if ids.len() != CANVAS && (ids.len() > PREFILL_M || !ids.len().is_multiple_of(CANVAS)) {
             return Err(Error::Format(
                 "canvas ids length must be CANVAS..=PREFILL_M",
             ));
@@ -6184,27 +6184,27 @@ pub fn build_step_runtime(
     // Fast-prefill (DGQ_FAST_PREFILL) runs on the step kernels AFTER `rt` is built
     // (prefill_chunks is a StepRuntime method); the slow f32-engine prefill runs
     // here at open time otherwise.
-    if let Some(ref token_ids) = cfg.prefill_token_ids {
-        if !should_fast_prefill(token_ids.len()) {
-            let mut encoder = crate::metal::step_kv::MonolithicEncoderCache::open_opt(
-                model_dir,
-                CANVAS,
-                cfg.max_seq,
-                Some(std::sync::Arc::clone(&gpu_blob)),
-            )?;
-            let (kv_len, _) = crate::metal::step_kv::prefill_monolithic_kv_with_cache(
-                &mut encoder,
-                token_ids,
-                &bufs.kvcache,
-                &layout,
-                cfg.max_seq,
-                layers,
-            )?;
-            if kv_len as u32 != prefill_len {
-                return Err(Error::Runtime("prefill kv_len mismatch"));
-            }
-            eprintln!("step-kernel: prefilled kv_len={kv_len} tokens");
+    if let Some(ref token_ids) = cfg.prefill_token_ids
+        && !should_fast_prefill(token_ids.len())
+    {
+        let mut encoder = crate::metal::step_kv::MonolithicEncoderCache::open_opt(
+            model_dir,
+            CANVAS,
+            cfg.max_seq,
+            Some(std::sync::Arc::clone(&gpu_blob)),
+        )?;
+        let (kv_len, _) = crate::metal::step_kv::prefill_monolithic_kv_with_cache(
+            &mut encoder,
+            token_ids,
+            &bufs.kvcache,
+            &layout,
+            cfg.max_seq,
+            layers,
+        )?;
+        if kv_len as u32 != prefill_len {
+            return Err(Error::Runtime("prefill kv_len mismatch"));
         }
+        eprintln!("step-kernel: prefilled kv_len={kv_len} tokens");
     }
 
     let build = StepRuntimeBuildTiming {
@@ -6246,19 +6246,19 @@ pub fn build_step_runtime(
             eprintln!("step-kernel: chunked SC softembed");
         }
     }
-    if let Some(ref token_ids) = cfg.prefill_token_ids {
-        if should_fast_prefill(token_ids.len()) {
-            let started = Instant::now();
-            let kv_len = rt.prefill_chunks(token_ids)?;
-            if kv_len as u32 != prefill_len {
-                return Err(Error::Runtime("fast-prefill kv_len mismatch"));
-            }
-            if crate::flags::progress_enabled() {
-                eprintln!(
-                    "step-kernel: fast-prefilled kv_len={kv_len} tokens ({:.2?})",
-                    started.elapsed()
-                );
-            }
+    if let Some(ref token_ids) = cfg.prefill_token_ids
+        && should_fast_prefill(token_ids.len())
+    {
+        let started = Instant::now();
+        let kv_len = rt.prefill_chunks(token_ids)?;
+        if kv_len as u32 != prefill_len {
+            return Err(Error::Runtime("fast-prefill kv_len mismatch"));
+        }
+        if crate::flags::progress_enabled() {
+            eprintln!(
+                "step-kernel: fast-prefilled kv_len={kv_len} tokens ({:.2?})",
+                started.elapsed()
+            );
         }
     }
     if let Some(path) = crate::flags::dump_kv_path() {

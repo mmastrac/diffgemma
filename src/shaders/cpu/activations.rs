@@ -1,6 +1,6 @@
 //! CPU twins for `shaders/include/activations.metal`.
 
-const GELU_TANH_COEF: f32 = 0.797_884_560_802_865_4;
+const GELU_TANH_COEF: f32 = 0.797_884_6;
 
 /// Mirror of `gelu_tanh` in `include/activations.metal`.
 pub fn gelu_tanh(x: f32) -> f32 {

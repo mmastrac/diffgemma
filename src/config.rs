@@ -27,12 +27,11 @@ fn parse_eos_token_ids(value: &serde_json::Value) -> Vec<u32> {
 pub fn load_generation_stop_tokens(model_dir: impl AsRef<Path>) -> Vec<u32> {
     let dir = model_dir.as_ref();
     let gen_path = dir.join("generation_config.json");
-    if let Ok(json) = std::fs::read_to_string(&gen_path) {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json) {
-            if let Some(eos) = value.get("eos_token_id") {
-                return parse_eos_token_ids(eos);
-            }
-        }
+    if let Ok(json) = std::fs::read_to_string(&gen_path)
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&json)
+        && let Some(eos) = value.get("eos_token_id")
+    {
+        return parse_eos_token_ids(eos);
     }
     ModelConfig::load(dir)
         .map(|c| c.eos_token_ids())

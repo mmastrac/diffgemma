@@ -86,21 +86,21 @@ fn format_property_body(v: &Value) -> String {
         if let Some(en) = v.get("enum").filter(|e| e.is_array()) {
             fields.push(format!("enum:{}", format_argument(en, true)));
         }
-    } else if ty == "ARRAY" {
-        if let Some(items) = v.get("items").filter(|i| i.is_object()) {
-            fields.push(format!("items:{{{}}}", format_items_body(items)));
-        }
+    } else if ty == "ARRAY"
+        && let Some(items) = v.get("items").filter(|i| i.is_object())
+    {
+        fields.push(format!("items:{{{}}}", format_items_body(items)));
     }
     if v.get("nullable").and_then(Value::as_bool) == Some(true) {
         fields.push("nullable:true".into());
     }
-    if ty == "OBJECT" {
-        if let Some(props) = v.get("properties").and_then(Value::as_object) {
-            fields.push(format!("properties:{{{}}}", format_parameters(props)));
-            let req = required_list(v);
-            if !req.is_empty() {
-                fields.push(format!("required:[{req}]"));
-            }
+    if ty == "OBJECT"
+        && let Some(props) = v.get("properties").and_then(Value::as_object)
+    {
+        fields.push(format!("properties:{{{}}}", format_parameters(props)));
+        let req = required_list(v);
+        if !req.is_empty() {
+            fields.push(format!("required:[{req}]"));
         }
     }
     fields.push(format!("type:{Q}{ty}{Q}"));
@@ -374,14 +374,13 @@ fn format_tool_response(name: String, msg: &Value) -> String {
 fn tool_name_for(msg: &Value, calls: Option<&Vec<Value>>) -> String {
     if let (Some(id), Some(calls)) = (msg.get("tool_call_id").and_then(Value::as_str), calls) {
         for tc in calls {
-            if tc.get("id").and_then(Value::as_str) == Some(id) {
-                if let Some(n) = tc
+            if tc.get("id").and_then(Value::as_str) == Some(id)
+                && let Some(n) = tc
                     .get("function")
                     .and_then(|f| f.get("name"))
                     .and_then(Value::as_str)
-                {
-                    return n.to_string();
-                }
+            {
+                return n.to_string();
             }
         }
     }
@@ -647,10 +646,10 @@ fn parse_value(s: &str, depth: u32) -> Value {
         return Value::String(inner.to_string());
     }
     if depth < MAX_ARG_DEPTH {
-        if s.starts_with('{') {
-            if let Some((body, _)) = read_braced(s) {
-                return parse_object(body, depth + 1);
-            }
+        if s.starts_with('{')
+            && let Some((body, _)) = read_braced(s)
+        {
+            return parse_object(body, depth + 1);
         }
         if let Some(body) = s.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
             return Value::Array(

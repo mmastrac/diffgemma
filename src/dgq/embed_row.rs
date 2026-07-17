@@ -10,7 +10,7 @@ use serde::Serialize;
 use std::path::Path;
 
 pub const SCHEMA_VERSION: u32 = 1;
-pub const EMBED_SCALE: f32 = 53.065_996_645_694_66;
+pub const EMBED_SCALE: f32 = 53.065_998;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct EmbedRowDump {

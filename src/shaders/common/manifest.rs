@@ -186,10 +186,10 @@ pub fn validate_shared(entry: &str, variant: KernelVariant) -> Result<(), Error>
 pub fn rms_norm_rows_variant(affine: bool) -> Result<RmsNormRowsVariant, Error> {
     let v = RmsNormRowsVariant { affine };
     let spec = spec_by_entry("rms_norm_rows").expect("manifest");
-    if let KernelVariants::RmsNormRows { rows } = spec.variants {
-        if rows.contains(&v) {
-            return Ok(v);
-        }
+    if let KernelVariants::RmsNormRows { rows } = spec.variants
+        && rows.contains(&v)
+    {
+        return Ok(v);
     }
     Err(Error::NotFound(format!(
         "manifest: invalid rms_norm_rows affine={affine}"
@@ -199,10 +199,10 @@ pub fn rms_norm_rows_variant(affine: bool) -> Result<RmsNormRowsVariant, Error> 
 pub fn rms_norm_rows_tiled_variant(in_dtype: ElemDtype) -> Result<RmsNormRowsTiledVariant, Error> {
     let v = RmsNormRowsTiledVariant { in_dtype };
     let spec = spec_by_entry("rms_norm_rows_tiled").expect("manifest");
-    if let KernelVariants::RmsNormRowsTiled { rows } = spec.variants {
-        if rows.contains(&v) {
-            return Ok(v);
-        }
+    if let KernelVariants::RmsNormRowsTiled { rows } = spec.variants
+        && rows.contains(&v)
+    {
+        return Ok(v);
     }
     Err(Error::NotFound(format!(
         "manifest: invalid rms_norm_rows_tiled in_dtype={in_dtype:?}"
@@ -211,10 +211,10 @@ pub fn rms_norm_rows_tiled_variant(in_dtype: ElemDtype) -> Result<RmsNormRowsTil
 
 pub fn swiglu_split_variant(v: SwigluSplitVariant) -> Result<SwigluSplitVariant, Error> {
     let spec = spec_by_entry("swiglu").expect("manifest");
-    if let KernelVariants::SwigluSplit { rows } = spec.variants {
-        if rows.contains(&v) {
-            return Ok(v);
-        }
+    if let KernelVariants::SwigluSplit { rows } = spec.variants
+        && rows.contains(&v)
+    {
+        return Ok(v);
     }
     Err(Error::NotFound(format!(
         "manifest: invalid swiglu split {v:?}"

@@ -10,7 +10,7 @@ pub(crate) fn run_step_verify_cmd(model_dir: &std::path::Path, layers: usize) ->
         eprintln!("error: step-verify requires a .dgq directory");
         return ExitCode::FAILURE;
     }
-    let probe_layers = layers.max(1).min(30);
+    let probe_layers = layers.clamp(1, 30);
     match run_step_verify(Some(model_dir), probe_layers) {
         Ok(r) => {
             let ok = r.all_pass();
@@ -44,7 +44,7 @@ pub(crate) fn run_step_ci_cmd(model_dir: &std::path::Path, layers: usize) -> Exi
         return ExitCode::SUCCESS;
     }
 
-    let probe_layers = layers.max(1).min(30);
+    let probe_layers = layers.clamp(1, 30);
     eprintln!("step-ci: layers={probe_layers}");
 
     match validate_step_model(model_dir) {
@@ -174,7 +174,7 @@ pub(crate) fn run_step_parity_cmd(
         return ExitCode::FAILURE;
     }
     let cfg = StepParityConfig {
-        layers: layers.max(1).min(30),
+        layers: layers.clamp(1, 30),
         kv_len,
         seed,
         max_seq: max_seq.max(64),

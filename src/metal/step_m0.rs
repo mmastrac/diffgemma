@@ -14,7 +14,7 @@ use crate::model::mask::DecoderAttnMask;
 use crate::sample::{Rng, SamplerConfig, initialize_canvas};
 use std::path::Path;
 
-pub const EMBED_SCALE: f32 = 53.065_996_645_694_66; // sqrt(2816)
+pub const EMBED_SCALE: f32 = 53.065_998; // sqrt(2816)
 /// Monolithic (GPU bf16/f16) vs f32 engine forward parity bounds.
 /// Hidden is compared by max|Δ| (catches localized divergence). Logits are
 /// compared by MEAN|Δ|, not max|Δ|: post-softcap logits live in [-30, 30], so a
@@ -448,7 +448,7 @@ pub(crate) fn engine_forward(
         &model.config,
         &mut input,
         &mut scratch,
-        &mut weights,
+        &weights,
         &mut engine,
         Some(layers),
     )?;

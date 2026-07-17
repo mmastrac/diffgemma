@@ -157,12 +157,12 @@ impl ArenaLiveness {
 
 fn apply_stage_aliases(stage: StepStage, ctx: LivenessCtx<'_>, live: &mut ArenaLiveness) {
     let _ = stage;
-    if let Some(l) = ctx.layer_info {
-        if l.v_proj == 0 && matches!(stage, StepStage::LayerInputNormQkv) {
-            if live.is_valid(ArenaPlane::AttnK) {
-                live.mark_valid(ArenaPlane::AttnV);
-            }
-        }
+    if let Some(l) = ctx.layer_info
+        && l.v_proj == 0
+        && matches!(stage, StepStage::LayerInputNormQkv)
+        && live.is_valid(ArenaPlane::AttnK)
+    {
+        live.mark_valid(ArenaPlane::AttnV);
     }
 }
 

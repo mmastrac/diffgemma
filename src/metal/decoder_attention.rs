@@ -206,7 +206,6 @@ fn encode_input_qkv_gpu_bufs(
 /// Encode QKV → KV suffix write → RoPE/GQA → o_proj into an open batch; the
 /// hidden input and the o_proj output stay on GPU. Core of both the classic
 /// (CPU-out) attention and the GPU-resident prefill path.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_fused_gpu_kv_attention_buf(
     batch: &mut crate::metal::batch::GpuBatch<'_>,
     kernels: &crate::metal::kernels::GpuKernels,

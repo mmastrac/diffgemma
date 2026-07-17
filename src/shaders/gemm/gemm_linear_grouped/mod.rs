@@ -273,7 +273,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     BufferPool::write_f32(&buf_c, &vec![0.0f32; out_len]);
 
     let grid = MTLSize {
-        width: f.n as usize,
+        width: f.n,
         height: total_m,
         depth: 1,
     };
@@ -328,10 +328,7 @@ pub fn gpu_on_blob(
         .allocate(&ctx.device, out_len * 4)
         .ok_or(Error::Gpu("alloc"))?;
     let buf_jobs = pool
-        .allocate(
-            &ctx.device,
-            p.jobs.len() * std::mem::size_of::<BlockGroupedJob>(),
-        )
+        .allocate(&ctx.device, std::mem::size_of_val(p.jobs))
         .ok_or(Error::Gpu("alloc"))?;
     let buf_rs = pool
         .allocate(&ctx.device, p.row_starts.len() * 4)
@@ -340,10 +337,7 @@ pub fn gpu_on_blob(
     BufferPool::write_f32(&buf_a, p.a);
     BufferPool::write_f32(&buf_c, &vec![0.0f32; out_len]);
     BufferPool::write_bytes(&buf_jobs, unsafe {
-        std::slice::from_raw_parts(
-            p.jobs.as_ptr().cast::<u8>(),
-            p.jobs.len() * std::mem::size_of::<BlockGroupedJob>(),
-        )
+        std::slice::from_raw_parts(p.jobs.as_ptr().cast::<u8>(), std::mem::size_of_val(p.jobs))
     });
     BufferPool::write_bytes(&buf_rs, unsafe {
         std::slice::from_raw_parts(p.row_starts.as_ptr().cast::<u8>(), p.row_starts.len() * 4)

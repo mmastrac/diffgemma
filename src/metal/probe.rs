@@ -105,7 +105,7 @@ fn run_memcpy_kernel(
     }
     const TG: usize = 256;
     let grid = MTLSize {
-        width: (n + TG - 1) / TG,
+        width: n.div_ceil(TG),
         height: 1,
         depth: 1,
     };

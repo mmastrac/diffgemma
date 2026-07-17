@@ -199,10 +199,9 @@ pub fn run_step_bf16_oracle_logits_dump(
             "bf16 oracle dump requires bf16 safetensors, not .dgq",
         ));
     }
-    let prompt = cfg
-        .prefill_token_ids
-        .as_ref()
-        .ok_or_else(|| Error::Runtime("bf16 oracle dump requires prefill token ids"))?;
+    let prompt = cfg.prefill_token_ids.as_ref().ok_or(Error::Runtime(
+        "bf16 oracle dump requires prefill token ids",
+    ))?;
     let layers = cfg
         .layers
         .min(model.config.text_config.num_hidden_layers)
@@ -277,10 +276,9 @@ pub fn run_step_bf16_oracle_logits_dump_gpu_kv(
             "bf16 gpu-kv oracle requires bf16 safetensors, not .dgq",
         ));
     }
-    let prompt = cfg
-        .prefill_token_ids
-        .as_ref()
-        .ok_or_else(|| Error::Runtime("bf16 gpu-kv oracle requires prefill token ids"))?;
+    let prompt = cfg.prefill_token_ids.as_ref().ok_or(Error::Runtime(
+        "bf16 gpu-kv oracle requires prefill token ids",
+    ))?;
     let layers = cfg
         .layers
         .min(model.config.text_config.num_hidden_layers)

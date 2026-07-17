@@ -154,7 +154,7 @@ impl Fixture {
         for (e, &off) in bucket.offset.iter().enumerate() {
             route.row_start[e] = off;
         }
-        let n = self.n_experts as usize;
+        let n = self.n_experts;
         route.row_start[n] = bucket.num_slots;
         for e in (n + 1)..=crate::metal::N_EXPERTS {
             route.row_start[e] = bucket.num_slots;

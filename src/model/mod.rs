@@ -24,14 +24,12 @@ impl Model {
         let open_started = std::time::Instant::now();
         let model_dir = model_dir.as_ref();
         let weights = WeightStore::open(model_dir)?;
-        if weights.is_quantized() {
-            if crate::flags::progress_enabled() {
-                eprintln!(
-                    "loaded .dgq quantized weights from {} ({:.2?})",
-                    model_dir.display(),
-                    open_started.elapsed()
-                );
-            }
+        if weights.is_quantized() && crate::flags::progress_enabled() {
+            eprintln!(
+                "loaded .dgq quantized weights from {} ({:.2?})",
+                model_dir.display(),
+                open_started.elapsed()
+            );
         }
         Ok(Self {
             config: ModelConfig::load(model_dir)?,

@@ -258,7 +258,7 @@ pub fn estimate_paged_layer_bytes(text: &TextConfig) -> u64 {
     let inter = text.intermediate_size as u64;
     let per_layer_dense = 2 * (inter * hidden + hidden * inter) + inter * hidden;
     // Attention + MLP transposed bf16 (q/k/v/o + gate/up/down); norms in f32.
-    let attn_dense = (hidden * hidden * 4) as u64 * 2; // rough upper bound q+k+v+o
+    let attn_dense = (hidden * hidden * 4) * 2; // rough upper bound q+k+v+o
     let per_layer_f32 =
         hidden * 9 + text.num_experts as u64 * hidden + hidden + text.num_experts as u64;
     per_layer_dense * 2 + attn_dense + per_layer_f32 * 4

@@ -48,7 +48,7 @@ pub fn prefill_gpu(
         crate::metal::embed::embed_token_ids_q8_gpu(
             engine,
             embed,
-            &blob,
+            blob,
             input.token_ids,
             seq_len,
             hidden,
@@ -254,7 +254,7 @@ pub fn extend_prefill_gpu(
         crate::metal::embed::embed_token_ids_q8_gpu(
             engine,
             embed,
-            &blob,
+            blob,
             token_ids,
             seq_len,
             hidden,

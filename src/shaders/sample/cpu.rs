@@ -110,9 +110,9 @@ pub fn sample_commit_cpu(step: u32, rng_state: u64, p: CommitParams<'_>) -> Comm
     let canvas = p.canvas_size;
     let mut u_cat = vec![0.0f32; canvas];
     let mut st = rng_state;
-    for i in 0..canvas {
+    for u in u_cat.iter_mut().take(canvas) {
         st = st.wrapping_mul(6_966_169_279).wrapping_add(1_039_523_323);
-        u_cat[i] = (st >> 32) as f32 / 4_294_967_296.0;
+        *u = (st >> 32) as f32 / 4_294_967_296.0;
     }
 
     let mut sorted_idx: Vec<u32> = (0..canvas as u32).collect();

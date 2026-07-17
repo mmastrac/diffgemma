@@ -61,7 +61,7 @@ impl StackedSegFc {
             y_col0[i] = s.y_col0;
             y_row_cols[i] = s.y_row_cols;
         }
-        if segs.len() >= 1 {
+        if !segs.is_empty() {
             end0 = segs[0].n_cols;
         }
         if segs.len() >= 2 {

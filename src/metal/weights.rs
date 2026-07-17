@@ -296,10 +296,10 @@ impl GpuLayerWeightCache {
                 bytes += c.w.len() as u64 * 2;
             }
         }
-        if let Some(v) = &self.v_proj {
-            if let GpuLinearWeight::Bf16(c) = v {
-                bytes += c.w.len() as u64 * 2;
-            }
+        if let Some(v) = &self.v_proj
+            && let GpuLinearWeight::Bf16(c) = v
+        {
+            bytes += c.w.len() as u64 * 2;
         }
         bytes
     }

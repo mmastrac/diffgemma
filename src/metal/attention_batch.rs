@@ -100,10 +100,10 @@ pub fn decoder_gqa_gpu_kv_batched(
     if q_pre_rope.len() != q_dim {
         return Err(Error::Format("decoder gpu kv gqa shape mismatch"));
     }
-    if let Some(out) = &attn_out {
-        if out.len() != out_dim {
-            return Err(Error::Format("decoder gpu kv gqa shape mismatch"));
-        }
+    if let Some(out) = &attn_out
+        && out.len() != out_dim
+    {
+        return Err(Error::Format("decoder gpu kv gqa shape mismatch"));
     }
 
     let buf_q = batch.alloc_f32(q_pre_rope)?;
@@ -309,10 +309,10 @@ fn gqa_batched_inner(
     if q_gpu.is_none() && q.len() != q_dim {
         return Err(Error::Format("gqa attention shape mismatch"));
     }
-    if let Some(out) = &attn_out {
-        if out.len() != out_dim {
-            return Err(Error::Format("gqa attention shape mismatch"));
-        }
+    if let Some(out) = &attn_out
+        && out.len() != out_dim
+    {
+        return Err(Error::Format("gqa attention shape mismatch"));
     }
     if let Some((k, v)) = kv_cpu {
         if k.len() != kv_dim_elems || v.len() != kv_dim_elems {

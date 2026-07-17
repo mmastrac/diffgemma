@@ -73,7 +73,7 @@ impl DgqGpuBlob {
         let split = manifest.expert_split.ok_or(Error::Format(
             "dgq blob exceeds device max buffer length and manifest has no expert_split — re-convert with the experts-last converter",
         ))? as usize;
-        if split % 16384 != 0 || split == 0 || split >= len {
+        if !split.is_multiple_of(16384) || split == 0 || split >= len {
             return Err(Error::Runtime("dgq expert_split invalid"));
         }
         if split > max_buf || (len - split) > max_buf {

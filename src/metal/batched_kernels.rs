@@ -30,7 +30,7 @@ pub fn rms_norm_rows(
     let buf_dump = batch.alloc_f32_out(1)?;
     let dims = [seq_len as u32, hidden as u32];
     batch.dispatch_1d(&kernels.rms_norm.pipeline, seq_len, |enc| {
-        rms_norm_rows::bind_gpu_buffers(&enc, &buf_x, &buf_w, &buf_o, &buf_dump, &dims, eps);
+        rms_norm_rows::bind_gpu_buffers(enc, &buf_x, &buf_w, &buf_o, &buf_dump, &dims, eps);
     });
     batch.register_read(buf_o, out);
     Ok(())
@@ -56,7 +56,7 @@ pub fn rms_norm_rows_gpu(
     let buf_dump = batch.alloc_f32_out(1)?;
     let dims = [seq_len as u32, hidden as u32];
     batch.dispatch_1d(&kernels.rms_norm.pipeline, seq_len, |enc| {
-        rms_norm_rows::bind_gpu_buffers(&enc, &buf_x, &buf_w, &buf_o, &buf_dump, &dims, eps);
+        rms_norm_rows::bind_gpu_buffers(enc, &buf_x, &buf_w, &buf_o, &buf_dump, &dims, eps);
     });
     Ok(buf_o)
 }
@@ -80,7 +80,7 @@ pub fn rms_norm_rows_gpu_buf(
     let buf_dump = batch.alloc_f32_out(1)?;
     let dims = [seq_len as u32, hidden as u32];
     batch.dispatch_1d(&kernels.rms_norm.pipeline, seq_len, |enc| {
-        rms_norm_rows::bind_gpu_buffers(&enc, x_buf, &buf_w, &buf_o, &buf_dump, &dims, eps);
+        rms_norm_rows::bind_gpu_buffers(enc, x_buf, &buf_w, &buf_o, &buf_dump, &dims, eps);
     });
     Ok(buf_o)
 }
@@ -100,7 +100,7 @@ pub fn rms_norm_rows_no_scale_gpu_buf(
     let buf_dump = batch.alloc_f32_out(1)?;
     let dims = [seq_len as u32, hidden as u32];
     batch.dispatch_1d(&kernels.rms_norm_no_scale.pipeline, seq_len, |enc| {
-        rms_norm_rows::bind_gpu_buffers(&enc, x_buf, &buf_w, &buf_o, &buf_dump, &dims, eps);
+        rms_norm_rows::bind_gpu_buffers(enc, x_buf, &buf_w, &buf_o, &buf_dump, &dims, eps);
     });
     Ok(buf_o)
 }
@@ -114,7 +114,7 @@ pub fn gelu_pytorch_tanh_gpu_buf(
     let len_u = len as u32;
     let buf_dump = batch.alloc_f32_out(1)?;
     batch.dispatch_1d(&kernels.gelu.pipeline, len, |enc| {
-        gelu::bind_gpu_in_place(&enc, buf, &buf_dump, len_u);
+        gelu::bind_gpu_in_place(enc, buf, &buf_dump, len_u);
     });
     Ok(())
 }
@@ -129,7 +129,7 @@ pub fn swiglu_mul_gpu_bufs(
     let len_u = len as u32;
     let buf_dump = batch.alloc_f32_out(1)?;
     batch.dispatch_1d(&kernels.swiglu_mul.pipeline, len, |enc| {
-        swiglu::bind_split_in_place_f32(&enc, gate_buf, up_buf, &buf_dump, len_u);
+        swiglu::bind_split_in_place_f32(enc, gate_buf, up_buf, &buf_dump, len_u);
     });
     Ok(())
 }
@@ -149,7 +149,7 @@ pub fn gelu_swiglu_gate_up_gpu(
     let buf_dump = batch.alloc_f32_out(1)?;
     let dims = [batch_size as u32, moe_inter as u32];
     batch.dispatch_1d(&kernels.gelu_swiglu_gate_up.pipeline, out_len, |enc| {
-        swiglu::bind_moe_gate_up(&enc, gate_up_buf, &buf_o, &buf_dump, &dims);
+        swiglu::bind_moe_gate_up(enc, gate_up_buf, &buf_o, &buf_dump, &dims);
     });
     Ok(buf_o)
 }
@@ -185,7 +185,7 @@ pub fn router_scale_rows_gpu_buf(
     let buf_dump = batch.alloc_f32_out(1)?;
     let dims = [seq_len as u32, hidden as u32];
     batch.dispatch_1d(&kernels.router_scale.pipeline, seq_len, |enc| {
-        router_scale_rows::bind_gpu_buffers(&enc, buf, &buf_scale, &buf_dump, &dims, root);
+        router_scale_rows::bind_gpu_buffers(enc, buf, &buf_scale, &buf_dump, &dims, root);
     });
     Ok(())
 }
@@ -226,7 +226,7 @@ pub fn gather_rows_gpu(
     let grid = batch_size * hidden;
     batch.dispatch_1d(&kernels.gather_rows.pipeline, grid, |enc| {
         gather_rows::bind_gpu_buffers(
-            &enc,
+            enc,
             src,
             &buf_idx,
             &buf_dst,
@@ -267,7 +267,7 @@ pub fn scatter_rows_weighted_gpu(
         seq_len * hidden,
         |enc| {
             crate::shaders::scatter_rows_weighted::bind_gpu_buffers(
-                &enc, arena_buf, &buf_rows, &buf_w, &buf_out, &buf_dump, &dims,
+                enc, arena_buf, &buf_rows, &buf_w, &buf_out, &buf_dump, &dims,
             );
         },
     );
@@ -285,7 +285,7 @@ pub fn vec_scale_gpu_buf(
     let len_u = len as u32;
     let buf_dump = batch.alloc_f32_out(1)?;
     batch.dispatch_1d(&kernels.vec_scale.pipeline, len, |enc| {
-        crate::shaders::vec_scale_inplace::bind_gpu_buffers(&enc, buf, &buf_dump, scale, len_u);
+        crate::shaders::vec_scale_inplace::bind_gpu_buffers(enc, buf, &buf_dump, scale, len_u);
     });
     Ok(())
 }
@@ -301,7 +301,7 @@ pub fn vec_add_gpu_bufs(
     let len_u = len as u32;
     let buf_dump = batch.alloc_f32_out(1)?;
     batch.dispatch_1d(&kernels.vec_add.pipeline, len, |enc| {
-        vec_add_inplace::bind_gpu_buffers(&enc, out_buf, addend_buf, &buf_dump, len_u);
+        vec_add_inplace::bind_gpu_buffers(enc, out_buf, addend_buf, &buf_dump, len_u);
     });
     Ok(())
 }

@@ -122,7 +122,7 @@ fn forward_layer_ff(
     if expert_cache.is_dgq() {
         forward_layer_ff_dgq_gpu(
             out,
-            &*cached,
+            cached,
             expert_cache,
             cfg,
             layer,
@@ -137,7 +137,7 @@ fn forward_layer_ff(
             out,
             hidden_states,
             weights,
-            &*cached,
+            cached,
             expert_cache,
             cfg,
             layer,
@@ -668,7 +668,6 @@ impl PrefillResidentBufs {
 ///
 /// Input hidden is `bufs.hidden[in_idx]`; output is written to
 /// `bufs.hidden[1 - in_idx]`. `.dgq` + GPU-MoE only (the production configuration).
-#[allow(clippy::too_many_arguments)]
 pub fn forward_encoder_prefill_resident(
     bufs: &PrefillResidentBufs,
     in_idx: usize,

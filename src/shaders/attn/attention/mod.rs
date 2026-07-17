@@ -102,8 +102,8 @@ pub fn wide_fixture(_: ElemFormat) -> Fixture {
     let kv_len = 4u32;
     let t_total = kv_len as usize + canvas;
     let mut kvcache = vec![0.0f32; t_total * n_kv * hd * 2];
-    for i in 0..kvcache.len() {
-        kvcache[i] = (i as f32 * 0.031).sin() * 0.3;
+    for (i, v) in kvcache.iter_mut().enumerate() {
+        *v = (i as f32 * 0.031).sin() * 0.3;
     }
     Fixture {
         q: (0..canvas * n_q_heads * hd)

@@ -174,7 +174,7 @@ impl StepGenerateConfig {
 
 fn smoke_config(cfg: &StepGenerateConfig, prefill_token_ids: Option<Vec<u32>>) -> StepSmokeConfig {
     StepSmokeConfig {
-        layers: cfg.layers.min(N_LAYERS).max(1),
+        layers: cfg.layers.clamp(1, N_LAYERS),
         steps: cfg.sampler.max_denoising_steps.max(1),
         kv_len: 0,
         seed: cfg.seed,
@@ -401,7 +401,7 @@ impl StepGenerateSession {
         cfg: &StepGenerateConfig,
         prefill_token_ids: Option<Vec<u32>>,
     ) -> Result<(Self, Duration), Error> {
-        let layers = cfg.layers.min(N_LAYERS).max(1);
+        let layers = cfg.layers.clamp(1, N_LAYERS);
         let (rt, build) = build_step_runtime(model_dir, &smoke_config(cfg, prefill_token_ids))?;
         if progress_enabled() {
             eprintln!(

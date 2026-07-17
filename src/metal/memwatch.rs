@@ -10,10 +10,10 @@
 //! - `vm.swapusage` (sysctl): swap-used delta during the section,
 //! - `kern.memorystatus_vm_pressure_level` (1 normal / 2 warn / 4 critical),
 //! - Metal `currentAllocatedSize` vs `recommendedMaxWorkingSetSize`.
-//! A nonzero swap delta or elevated pressure prints a LOUD "timings suspect"
-//! line so benches/probes can be discarded instead of misread (see the
-//! perf-timing methodology note: full-run wall-clock is questionable when
-//! the machine isn't idle).
+//!   A nonzero swap delta or elevated pressure prints a LOUD "timings suspect"
+//!   line so benches/probes can be discarded instead of misread (see the
+//!   perf-timing methodology note: full-run wall-clock is questionable when
+//!   the machine isn't idle).
 
 #![cfg(target_os = "macos")]
 

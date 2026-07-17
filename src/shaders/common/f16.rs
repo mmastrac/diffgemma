@@ -29,7 +29,7 @@ pub fn f32_to_f16_bits(v: f32) -> u16 {
     let bits = v.clamp(-65504.0, 65504.0).to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xff) as i32;
-    let mant = (bits & 0x7fffff) as u32;
+    let mant = bits & 0x7fffff;
     if exp == 0xff {
         return sign | if mant == 0 { 0 } else { 0x7e00 };
     }

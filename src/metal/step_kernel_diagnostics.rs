@@ -478,9 +478,9 @@ pub fn run_step_attn_layer_capture(
 /// E22-M0 (task #101): dump the FULL step-1 canvas Q plane (post-RoPE, all 256
 /// rows × 16 heads × hd) and the layer's complete K cache, as raw f32 binaries
 /// + a meta json, for offline block-mass analysis
-/// (`python/scripts/e22_block_mass.py`). Same capture flow as
-/// `run_step_attn_layer_capture` but skips the per-row CPU score math — the
-/// planes are the product. Returns (kv_len, total_kv).
+///   (`python/scripts/e22_block_mass.py`). Same capture flow as
+///   `run_step_attn_layer_capture` but skips the per-row CPU score math — the
+///   planes are the product. Returns (kv_len, total_kv).
 pub fn run_step_attn_qk_plane_dump(
     model_dir: &Path,
     cfg: &StepSmokeConfig,
@@ -665,14 +665,14 @@ fn route_override_from_ref_json(
     let experts: Vec<u32> = doc
         .get("experts")
         .and_then(|v| v.as_array())
-        .ok_or_else(|| Error::Runtime("route ref missing experts"))?
+        .ok_or(Error::Runtime("route ref missing experts"))?
         .iter()
         .map(|v| v.as_u64().unwrap_or(0) as u32)
         .collect();
     let weights: Vec<u16> = doc
         .get("expert_weights")
         .and_then(|v| v.as_array())
-        .ok_or_else(|| Error::Runtime("route ref missing expert_weights"))?
+        .ok_or(Error::Runtime("route ref missing expert_weights"))?
         .iter()
         .map(|v| {
             if let Some(n) = v.as_u64() {
@@ -1031,16 +1031,13 @@ pub fn run_step_moe_layer_capture(
 
     rt.dispatch_and_wait(|enc| enc.encode_layer_router_buckets(layer, &layout))?;
 
-    if let Some(path) = crate::flags::moe_route_ref_path() {
-        if let Some((experts, weights)) = route_override_from_ref_json(Path::new(&path), position)?
-        {
-            let mut route: RouteScratch = read_struct(&rt.bufs.route);
-            patch_route_position(&mut route, position, &experts, &weights);
-            write_struct(&rt.bufs.route, &route);
-            eprintln!(
-                "moe-capture: route override pos={position} experts={experts:?} (from {path})"
-            );
-        }
+    if let Some(path) = crate::flags::moe_route_ref_path()
+        && let Some((experts, weights)) = route_override_from_ref_json(Path::new(&path), position)?
+    {
+        let mut route: RouteScratch = read_struct(&rt.bufs.route);
+        patch_route_position(&mut route, position, &experts, &weights);
+        write_struct(&rt.bufs.route, &route);
+        eprintln!("moe-capture: route override pos={position} experts={experts:?} (from {path})");
     }
 
     rt.dispatch_and_wait(|enc| enc.encode_layer_moe_grouped(layer, &layout))?;

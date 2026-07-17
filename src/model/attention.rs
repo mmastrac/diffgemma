@@ -822,10 +822,10 @@ fn apply_encoder_extend_mask(
                     positions[ki - kv_cache_len]
                 };
                 let mut masked = pos_k > pos_q;
-                if let Some(window) = params.sliding_window {
-                    if pos_k + window as i64 <= pos_q {
-                        masked = true;
-                    }
+                if let Some(window) = params.sliding_window
+                    && pos_k + window as i64 <= pos_q
+                {
+                    masked = true;
                 }
                 if masked {
                     row[ki] = MASK_NEG;
@@ -845,10 +845,10 @@ fn apply_attention_mask(scores: &mut [f32], seq_len: usize, params: &AttentionPa
                 if ki > qi {
                     masked = true;
                 }
-                if let Some(window) = params.sliding_window {
-                    if ki + window <= qi {
-                        masked = true;
-                    }
+                if let Some(window) = params.sliding_window
+                    && ki + window <= qi
+                {
+                    masked = true;
                 }
                 if masked {
                     row[ki] = MASK_NEG;

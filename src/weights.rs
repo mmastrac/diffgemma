@@ -88,11 +88,11 @@ impl SafetensorStore {
             largest.push((name.clone(), t.numel(), format_shape(&t.shape)));
         }
 
-        largest.sort_by(|a, b| b.1.cmp(&a.1));
+        largest.sort_by_key(|b| std::cmp::Reverse(b.1));
         largest.truncate(12);
 
         let mut top_prefixes: Vec<_> = prefix_counts.into_iter().collect();
-        top_prefixes.sort_by(|a, b| b.1.cmp(&a.1));
+        top_prefixes.sort_by_key(|b| std::cmp::Reverse(b.1));
 
         Summary {
             shard_count: self.shards.len(),

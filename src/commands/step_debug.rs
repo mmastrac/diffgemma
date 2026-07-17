@@ -303,7 +303,6 @@ pub(crate) fn run_step_attn_dump_cmd(
 /// raw f32 binaries (+ meta json) into `-o OUT_DIR`. Consumed by
 /// `python/scripts/e22_block_mass.py`.
 #[cfg(target_os = "macos")]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_step_attn_qk_dump_cmd(
     model_dir: &std::path::Path,
     prompt: Option<String>,
@@ -842,7 +841,7 @@ pub(crate) fn run_step_kv_bf16_cross_cmd(
     eprintln!(
         "step-kv-bf16-cross: {} prompt tokens, layers={}",
         token_ids.len(),
-        layers.max(1).min(30)
+        layers.clamp(1, 30)
     );
     match run_step_kv_bf16_cross_parity(dgq_dir, bf16_dir, &token_ids, layers, max_seq.max(64)) {
         Ok(r) => {
@@ -903,7 +902,7 @@ pub(crate) fn run_step_kv_parity_cmd(
     eprintln!(
         "step-kv-parity: {} prompt tokens, layers={}",
         token_ids.len(),
-        layers.max(1).min(30)
+        layers.clamp(1, 30)
     );
     match run_step_kv_parity(model_dir, &token_ids, layers, max_seq.max(64), seed) {
         Ok(r) => {

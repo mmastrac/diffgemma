@@ -77,11 +77,9 @@ fn canvas_state_for_gpu(f: &Fixture) -> CanvasState {
     let mut ids = [0u32; crate::metal::PREFILL_M];
     let mut accept = [0u32; CANVAS];
     let mut new_sample = [0u32; CANVAS];
-    for i in 0..f.canvas_size {
-        ids[i] = f.ids[i];
-        accept[i] = f.accept[i];
-        new_sample[i] = f.new_sample[i];
-    }
+    ids[..f.canvas_size].copy_from_slice(&f.ids[..f.canvas_size]);
+    accept[..f.canvas_size].copy_from_slice(&f.accept[..f.canvas_size]);
+    new_sample[..f.canvas_size].copy_from_slice(&f.new_sample[..f.canvas_size]);
     CanvasState {
         ids,
         prev_argmax: [0; CANVAS],

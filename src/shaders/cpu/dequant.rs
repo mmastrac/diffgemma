@@ -56,7 +56,7 @@ pub fn nvfp4_tile_k_order_matrix(matrix: &[u8], row: usize, k0: usize, k_dim: us
     let body = &matrix[NVFP4_HEADER_BYTES..];
     let row_stride = nvfp4_row_bytes(k_dim);
     let row_base = &body[row * row_stride..(row + 1) * row_stride];
-    let data_len = (k_dim + 1) / 2;
+    let data_len = k_dim.div_ceil(2);
     let mut via_tile = [0.0f32; 32];
     for g in 0..2 {
         let g_idx = k0 / 16 + g;

@@ -3,7 +3,6 @@
 use super::*;
 
 #[cfg(target_os = "macos")]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_chat_cmd(
     model_dir: &std::path::Path,
     initial_prompt: Option<String>,

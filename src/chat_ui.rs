@@ -201,16 +201,16 @@ impl Render {
         // keeps the permanent region ending at a line boundary so the transient
         // below always starts at column 0.
         let region_end = self.committed_len.min(self.text.len());
-        if self.printed < region_end {
-            if let Some(rel) = self.text[self.printed..region_end].rfind('\n') {
-                let end = self.printed + rel + 1;
-                if !self.prefixed {
-                    print!("model> ");
-                    self.prefixed = true;
-                }
-                print!("{}", &self.text[self.printed..end]);
-                self.printed = end;
+        if self.printed < region_end
+            && let Some(rel) = self.text[self.printed..region_end].rfind('\n')
+        {
+            let end = self.printed + rel + 1;
+            if !self.prefixed {
+                print!("model> ");
+                self.prefixed = true;
             }
+            print!("{}", &self.text[self.printed..end]);
+            self.printed = end;
         }
         // Transient: the still-forming tail (uncommitted + any partial committed
         // line), dimmed, clamped to the screen so its redraw stays on-screen.
@@ -279,11 +279,11 @@ struct Shared {
 
 impl Shared {
     fn emit(&mut self, ev: &ChatEvent) {
-        if let Some(w) = self.json.as_mut() {
-            if serde_json::to_writer(&mut *w, ev).is_ok() {
-                let _ = w.write_all(b"\n");
-                let _ = w.flush();
-            }
+        if let Some(w) = self.json.as_mut()
+            && serde_json::to_writer(&mut *w, ev).is_ok()
+        {
+            let _ = w.write_all(b"\n");
+            let _ = w.flush();
         }
         if self.interactive {
             self.render.apply(ev);

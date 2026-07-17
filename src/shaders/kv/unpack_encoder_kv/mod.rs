@@ -36,7 +36,6 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder};
 
 #[cfg(target_os = "macos")]
-#[allow(clippy::too_many_arguments)]
 pub fn bind_gpu_buffers(
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     src: &ProtocolObject<dyn MTLBuffer>,

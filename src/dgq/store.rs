@@ -118,10 +118,10 @@ impl DgqStore {
             total_elements += numel;
             largest.push((t.name.clone(), numel, format_shape(&t.meta.shape)));
         }
-        largest.sort_by(|a, b| b.1.cmp(&a.1));
+        largest.sort_by_key(|b| std::cmp::Reverse(b.1));
         largest.truncate(12);
         let mut top_prefixes: Vec<_> = prefix_counts.into_iter().collect();
-        top_prefixes.sort_by(|a, b| b.1.cmp(&a.1));
+        top_prefixes.sort_by_key(|b| std::cmp::Reverse(b.1));
 
         crate::weights::Summary {
             shard_count: 1,

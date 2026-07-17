@@ -1,3 +1,10 @@
+// Kernel dispatch plumbing threads many scalar dims (M/N/K, offsets, layer
+// counts) through host wrappers, and GPU resource tuples run long — argument
+// counts and type width are the domain, not a smell. Allowed crate-wide
+// (user sign-off 2026-07-17) instead of per-fn attribute noise.
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::type_complexity)]
+
 // diffgemma-mps is an Apple-Silicon Metal inference engine. Metal is the only
 // backend — there is no CPU forward/generate path — so the whole program is
 // macOS-only. Fail fast on other targets with one clear message rather than a

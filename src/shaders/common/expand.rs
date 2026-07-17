@@ -104,8 +104,7 @@ pub fn expand(source: &str) -> String {
 fn expand_labeled(label: &str, source: &str) -> String {
     let mut out = String::with_capacity(source.len() * 2);
     out.push_str(&format!("#line 1 \"{label}\"\n"));
-    let mut line_num: u32 = 1;
-    for line in source.split_inclusive('\n') {
+    for (line_num, line) in (1_u32..).zip(source.split_inclusive('\n')) {
         if let Some(name) = parse_local_include(line) {
             let content = include_source(name).unwrap_or_else(|| {
                 panic!("expand: unknown include {name:?} (add it to src/shaders/include/ and the INCLUDES table)")
@@ -116,7 +115,6 @@ fn expand_labeled(label: &str, source: &str) -> String {
         } else {
             out.push_str(line);
         }
-        line_num += 1;
     }
     out
 }

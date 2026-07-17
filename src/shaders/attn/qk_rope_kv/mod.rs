@@ -22,8 +22,8 @@ pub struct AttnDims {
     /// Sliding-window size (1024 for sliding layers, 0 = unwindowed/full).
     /// Denoise (causal=0): canvas attends encoder keys [max(0, kv_len-(window-1)), kv_len)
     /// + all canvas (MLX `_make_decoder_masks` semantics). Causal (prefill):
-    /// query at pos q attends [max(0, q-(window-1)), q] (engine CausalSliding).
-    /// No-op while kv_len+tok < window, so short contexts are bit-identical.
+    ///   query at pos q attends [max(0, q-(window-1)), q] (engine CausalSliding).
+    ///   No-op while kv_len+tok < window, so short contexts are bit-identical.
     pub window: u32,
 }
 

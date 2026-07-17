@@ -115,10 +115,10 @@ pub(crate) fn resolve_enable_thinking(
     chat_template_kwargs: Option<bool>,
     server_default: bool,
 ) -> bool {
-    if let Some(model) = model {
-        if let Some(v) = parse_model_think_suffix(model) {
-            return v;
-        }
+    if let Some(model) = model
+        && let Some(v) = parse_model_think_suffix(model)
+    {
+        return v;
     }
     enable_thinking
         .or(chat_template_kwargs)
@@ -177,7 +177,6 @@ struct Split {
 }
 
 impl<D: TextDecoder> DiffusionStreamMapper<D> {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         decoder: D,
         stops: Vec<u32>,
@@ -579,7 +578,9 @@ fn attach_stream_observer(
     let cancel = crate::metal::CancelToken::new();
     cfg.cancel = Some(cancel.clone());
     cfg.step_observer = Some(Arc::new(move |ev: &crate::metal::StepProgressEvent<'_>| {
-        if log_progress && (ev.step_in_block == 1 || ev.step_in_block % 5 == 0 || ev.block_done) {
+        if log_progress
+            && (ev.step_in_block == 1 || ev.step_in_block.is_multiple_of(5) || ev.block_done)
+        {
             eprintln!(
                 "serve: block {}/{} step {}/{} {}%",
                 ev.block_idx,
@@ -774,7 +775,6 @@ fn filter_tool_markup_delta(
 /// `<summarize>…</summarize>` span, and roll the KV back so nothing of the
 /// pass persists. Returns None when the prompt doesn't fit, generation fails,
 /// or the model produced no usable tags (caller falls back mechanically).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_summarize_pass(
     stage: &dyn crate::pipeline::PipelineStage,
     tokenizer: &crate::tokenizer::Tokenizer,

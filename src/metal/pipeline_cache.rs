@@ -119,10 +119,8 @@ impl PipelineArchiveCache {
         let existed = cache_file.exists();
 
         let desc = MTLBinaryArchiveDescriptor::new();
-        if existed {
-            if let Some(url) = NSURL::from_file_path(&cache_file) {
-                desc.setUrl(Some(&url));
-            }
+        if existed && let Some(url) = NSURL::from_file_path(&cache_file) {
+            desc.setUrl(Some(&url));
         }
 
         let archive = device

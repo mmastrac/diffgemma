@@ -153,7 +153,7 @@ pub fn softmax_rows_gpu_buf(
     let dims = [seq_len as u32, cols as u32];
     let (grid, tg) = softmax_rows::dispatch_shape(seq_len);
     batch.dispatch_with_grid(&kernels.softmax_rows.pipeline, grid, tg, |enc| {
-        softmax_rows::bind_gpu_in_place(&enc, buf, &buf_dump, &dims);
+        softmax_rows::bind_gpu_in_place(enc, buf, &buf_dump, &dims);
     });
 }
 
@@ -171,7 +171,7 @@ pub fn gather_prob_cols_gpu_buf(
     let params = [seq_len as u32, vocab as u32, v0 as u32, chunk as u32];
     let (grid, tg) = gather_prob_cols::dispatch_shape(seq_len, chunk);
     batch.dispatch_with_grid(&kernels.gather_prob_cols.pipeline, grid, tg, |enc| {
-        gather_prob_cols::bind_gpu_buffers(&enc, probs, &buf_out, &buf_dump, &params);
+        gather_prob_cols::bind_gpu_buffers(enc, probs, &buf_out, &buf_dump, &params);
     });
     Ok(buf_out)
 }
@@ -184,7 +184,7 @@ pub fn vec_fill_zero_gpu_buf(
 ) {
     let buf_dump = batch.alloc_f32_out(1).expect("dump buf");
     batch.dispatch_1d_ranged(&kernels.vec_fill_zero.pipeline, len, |enc, base, chunk| {
-        vec_fill_zero::bind_gpu_buffers(&enc, buf, &buf_dump, base, chunk);
+        vec_fill_zero::bind_gpu_buffers(enc, buf, &buf_dump, base, chunk);
     });
 }
 
@@ -198,7 +198,7 @@ pub fn vec_scale_gpu_buf(
     let len_u = len as u32;
     let buf_dump = batch.alloc_f32_out(1).expect("dump buf");
     batch.dispatch_1d(&kernels.vec_scale.pipeline, len, |enc| {
-        vec_scale_inplace::bind_gpu_buffers(&enc, buf, &buf_dump, scale, len_u);
+        vec_scale_inplace::bind_gpu_buffers(enc, buf, &buf_dump, scale, len_u);
     });
 }
 

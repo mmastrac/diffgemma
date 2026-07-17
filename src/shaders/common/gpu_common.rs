@@ -25,7 +25,7 @@ pub fn set_bytes<T>(
 }
 
 pub fn div_up(value: usize, group: usize) -> usize {
-    (value + group - 1) / group
+    value.div_ceil(group)
 }
 
 /// Matches [`crate::metal::batch::GpuBatch::dispatch_1d_ranged`] chunking.
@@ -164,8 +164,8 @@ pub fn dispatch_grid(
     encode(&enc);
     enc.dispatchThreadgroups_threadsPerThreadgroup(
         MTLSize {
-            width: width,
-            height: height,
+            width,
+            height,
             depth: 1,
         },
         MTLSize {

@@ -97,7 +97,6 @@ pub fn route_with_cached_weights(
 /// asc) lives in [`top_k_route_from_raw_logits`]. Weights and scratch buffers are
 /// passed as disjoint slices so the dequant-on-load and pre-cached entry points
 /// share one implementation.
-#[allow(clippy::too_many_arguments)]
 fn route_core(
     residual: &[f32],
     router_proj: &[f32],

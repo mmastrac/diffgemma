@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 /// MLX parity dumps default to the full 30-layer decoder unless `--layers` is set.
 fn layers_for_parity_dump(parity_layers: Option<usize>) -> usize {
-    parity_layers.unwrap_or(30).max(1).min(30)
+    parity_layers.unwrap_or(30).clamp(1, 30)
 }
 
 fn parse_cli_bool(s: &str) -> Option<bool> {
@@ -871,7 +871,7 @@ pub(crate) fn parse_cli() -> Cli {
             }
         }
         Some("step-smoke") => Command::StepSmoke {
-            layers: bench_layers.max(1).min(30),
+            layers: bench_layers.clamp(1, 30),
             steps: steps_parity.max(1),
             kv_len: step_kv_len,
             seed,
@@ -880,7 +880,7 @@ pub(crate) fn parse_cli() -> Cli {
             prompt: prompt.clone(),
         },
         Some("step-probe") => Command::StepProbe {
-            layers: bench_layers.max(1).min(30),
+            layers: bench_layers.clamp(1, 30),
             kv_len: step_kv_len,
             seed,
             max_seq: step_max_seq.max(64),
@@ -888,14 +888,14 @@ pub(crate) fn parse_cli() -> Cli {
         },
         Some("step-kv-check") => Command::StepKvCheck {
             kv_len: step_kv_len.max(1) as usize,
-            layers: bench_layers.max(1).min(30),
+            layers: bench_layers.clamp(1, 30),
             seed,
             max_seq: step_max_seq.max(64),
         },
         Some("step-kv-parity") => Command::StepKvParity {
             prompt: prompt.clone(),
             prompt_len,
-            layers: bench_layers.max(1).min(30),
+            layers: bench_layers.clamp(1, 30),
             seed,
             max_seq: step_max_seq.max(64),
             raw_prompt,
@@ -1149,19 +1149,19 @@ pub(crate) fn parse_cli() -> Cli {
             }
         }
         Some("step-verify") => Command::StepVerify {
-            layers: bench_layers.max(1).min(30),
+            layers: bench_layers.clamp(1, 30),
         },
         Some("step-ci") => Command::StepCi {
-            layers: bench_layers.max(1).min(30),
+            layers: bench_layers.clamp(1, 30),
         },
         Some("step-parity") => Command::StepParity {
-            layers: bench_layers.max(1).min(30),
+            layers: bench_layers.clamp(1, 30),
             kv_len: step_kv_len,
             seed,
             max_seq: step_max_seq.max(64),
         },
         Some("bench-step-kernel") => Command::BenchStepKernel {
-            layers: bench_layers.max(1).min(30),
+            layers: bench_layers.clamp(1, 30),
             kv_len: step_kv_len,
             seed,
             max_seq: step_max_seq.max(64),
@@ -1172,7 +1172,7 @@ pub(crate) fn parse_cli() -> Cli {
             layer_profile: step_layer_profile,
         },
         Some("bench-gemm-fusion") => Command::BenchGemmFusion {
-            layers: bench_layers.max(1).min(30),
+            layers: bench_layers.clamp(1, 30),
             kv_len: step_kv_len,
             seed,
             max_seq: step_max_seq.max(64),

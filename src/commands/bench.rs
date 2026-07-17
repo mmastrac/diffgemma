@@ -37,7 +37,7 @@ pub(crate) fn print_encode_subprofile(p: &metal::EncodeSubProfileResult) {
             pct(prof.total())
         );
         let mut ranked: Vec<_> = rows.iter().collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        ranked.sort_by_key(|b| std::cmp::Reverse(b.1));
         for (name, d) in ranked {
             println!(
                 "  {:16} {:.2?}  ({:.1}%, {:.2?}/layer)",
@@ -64,7 +64,7 @@ pub(crate) fn print_encode_subprofile(p: &metal::EncodeSubProfileResult) {
             pct(prof.total())
         );
         let mut ranked: Vec<_> = rows.iter().collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        ranked.sort_by_key(|b| std::cmp::Reverse(b.1));
         for (name, d) in ranked {
             println!(
                 "  {:16} {:.2?}  ({:.1}%, {:.2?}/layer)",
@@ -503,7 +503,6 @@ pub(crate) fn run_gemm(size: usize) -> ExitCode {
 /// `RESULT {json}` line (ms/layer, TF/s) for the Optuna sweep driver. Needs no
 /// model weights — a synthetic fixture drives the kernels.
 #[cfg(target_os = "macos")]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_bench_prefill_attn(
     kv_len: u32,
     qk_bm: usize,

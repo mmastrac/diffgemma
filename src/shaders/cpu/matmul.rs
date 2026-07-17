@@ -91,7 +91,7 @@ fn try_blas_sgemm(
                 n as i32,
             );
         }
-        return true;
+        true
     }
     #[cfg(not(target_os = "macos"))]
     false
