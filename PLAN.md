@@ -21,7 +21,78 @@ decode headroom is STEP COUNT (E7), not per-step attention.
 
 ## Open items
 
+### Token pipeline — the new core (designed 2026-07-17, implementation starting)
+
+Serialized op-stream architecture around the model thread; everything else
+(serve, chat, tool handling, span handles) becomes a client. Motivated
+directly by the OpenCode-collapse investigation
+(`debug/opencode_collapse/`): serve's state mutations are scattered
+side-effects today — un-auditable, un-replayable, and append-only context
+turned out to be the collapse trigger.
+
+**Core (pipeline thread, ids only — never strings):**
+
+- One thread owns the GPU + KV; input = serialized ops, output = events.
+- Ops: `Extend(ids)`, `GenerateBlock(params) -> Proposal`,
+  `Refine {mask|forced_ids, budget}` (continue denoising the SAME
+  uncommitted canvas), `Commit(kept_len)`, `Discard {reroll}`,
+  `Rewind(kv_id)`, `Snapshot/Restore`, `Cancel`, later `Reground`
+  (idle re-prefill of the canonical stream = lineage reset).
+- `kv_id = (epoch, position)`; lineage-invalidating ops bump the epoch;
+  rewind to a stale-epoch id fails loudly (the turn-6 drift class becomes
+  type-checked). Rewind is token-granular; cheap within ring slack, else
+  the ring-rebuild fallback (`rollback_to` already implements both) — the
+  pipeline reports which one you paid.
+- Events: `Proposal {ids, stats}`, `Committed {ids, kv_id, stats}`,
+  `Strained`, `Aborted`, `Rewound`; drafts on a lossy side channel.
+  Cancellation: epoch bump checked between denoise steps / prefill
+  chunks; purges stale queued ops; ack reports last committed kv_id.
+- Per-block protocol (decided): the upper layer inspects every proposal
+  before commit — partial commit (`kept_len`) covers "good up to X, bad
+  tail"; commit-then-regenerate covers tail replacement. Commit re-encodes
+  the kept prefix causally, so refine/reject cycles leave no lineage
+  residue.
+
+**Message layer (owns all text/parsing/policy):**
+
+- Channel/tool-grammar parsing, canonicalization (thought-strip becomes
+  explicit Rewind+Extend, not a buried finalize), validator FSM:
+  propose -> validate -> refine/splice -> commit; on invalid content the
+  policy is immediate re-`GenerateBlock` after a surgical
+  `Splice(range -> replacement)` (= Rewind + Extend(replacement +
+  re-encoded tail)) that REMOVES failed attempts from context — the
+  anti-collapse move; transient hints extend in and evaporate the same
+  way. The commit guard (`DGQ_BLOCK_COMMIT_MAX_ENT`) folds in as one
+  validator policy. Tool-compact and span handles become Splice clients.
+
+**Op-log:** every op + seed durably logged; any session replays
+bit-exactly (the oc_sim/seed-42 reproducibility, but by construction);
+field failures become golden-style artifacts; KV lineage becomes
+measurable (replay with fresh-prefill-per-op and diff).
+
+**Standing gate — rewind byte-consistency:** seeded
+generate -> rewind -> generate -> rewind loops must (a) restore the KV
+bytes exactly after every rewind (FNV of the valid snapshot) and (b)
+regenerate bit-identical proposals at the same seed. Any lineage residue
+fails one of the two. Runs below the sliding-ring wrap in Tier 2; a
+wrap-crossing variant exercises the rebuild path.
+
+**Phases:** P0 op/event types + pipeline thread wrapping the existing
+session (Extend/Generate/Rewind), rewind gate green, nothing rerouted.
+P1 epochs + Cancel; reroute ask/chat. P2 per-block protocol (decomposes
+`generate_with_session` along op boundaries). P3 message layer v1 + serve
+reroute (client disconnect cancels — today serve generates 4k tokens into
+a dead socket). P4 Splice + tool-grammar validator + op-log persistence
+and replay tool. P5 Refine/canvas-edit primitives (quality-gated: census;
+the freeze lesson applies to reject-masks). Later: multi-conv absorption,
+Reground, lineage-drift gate. Every phase: golden 8/8 + suite; behavior
+changes additionally smoketest ×{7,42,123}.
+
 ### Concept — span handles / compact history (engine revisit)
+
+*(Substrate note 2026-07-17: implement on the token pipeline above — span
+handles are `Splice` choreography in the message layer; the collapse
+diagnosis it called for is DONE, see `debug/opencode_collapse/`.)*
 
 **Symptom to diagnose first:** long OpenCode/agent turns look stuck in a
 **newline / structure collapse** — indent and line grid degrade across
