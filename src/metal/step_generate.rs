@@ -709,12 +709,208 @@ pub fn generate_monolithic(
     generate_with_session(&mut session, prompt_token_ids, cfg, prompt_label)
 }
 
+/// One block's uncommitted denoise result: the active-canvas argmax plus the
+/// stats the monolithic path records. Produced by [`propose_block`]; the
+/// caller decides `kept_len` (stop-scan, validators) and applies it via
+/// [`commit_block`] — or drops the proposal, and the next [`propose_block`]
+/// re-rolls from fresh noise (the canvas rng advances every attempt).
+pub struct ProposedBlock {
+    /// Active-canvas argmax (shrink-on-retry may narrow it below `CANVAS`).
+    pub token_ids: Vec<u32>,
+    /// Stats for this block; `kept_tokens`/`token_ids` are finalized at
+    /// commit, the stop fields by the caller's policy.
+    pub stats: crate::generate::BlockDenoiseStats,
+    /// 1-based index this block would commit as.
+    pub block_idx: usize,
+}
+
+/// Outcome of one [`propose_block`] call.
+pub enum BlockOutcome {
+    /// A canvas converged and awaits the commit decision.
+    Proposal(Box<ProposedBlock>),
+    /// Token budget or block count already spent; nothing was denoised.
+    Exhausted,
+    /// The commit guard abandoned the turn (failed block's stats recorded).
+    Abandoned,
+    /// A [`CancelToken`] stopped the turn; any mid-flight canvas was dropped.
+    Cancelled,
+}
+
+/// Accumulating state of one generation turn, block by block: created by
+/// [`begin_turn`] (prefill + bookkeeping), advanced by
+/// [`propose_block`]/[`commit_block`], closed by [`finish_turn`]
+/// (`kv_valid_tokens` + `GenerateOutput`). [`generate_with_session`] is a
+/// driver over exactly these primitives; the pipeline exposes them as
+/// per-block ops.
+pub struct TurnState {
+    prompt_token_ids: Vec<u32>,
+    label: String,
+    sequences: Vec<u32>,
+    rng: Rng,
+    max_steps: usize,
+    max_blocks: usize,
+    denoise_steps_run: usize,
+    blocks_committed: usize,
+    block_steps_eff: Vec<u32>,
+    last_block_accept_hist: Vec<u32>,
+    last_block_min_entropy_hist: Vec<f32>,
+    prefill_elapsed: Duration,
+    denoise_elapsed: Duration,
+    extend_elapsed: Duration,
+    session_telemetry: SessionTelemetry,
+    step_traces: Vec<crate::denoise_trace::DenoiseStepTrace>,
+    initial_canvas_ids: Option<Vec<u32>>,
+    cancelled: bool,
+    stopped_on_eot: bool,
+    stop_token_id: Option<u32>,
+    stop_block_idx: Option<usize>,
+    stop_offset: Option<usize>,
+    block_stats: Vec<crate::generate::BlockDenoiseStats>,
+}
+
+impl TurnState {
+    /// New (non-prompt) tokens committed so far.
+    pub fn new_tokens(&self) -> usize {
+        self.sequences.len() - self.prompt_token_ids.len()
+    }
+
+    /// The full committed token log (prompt + committed blocks).
+    pub fn sequences(&self) -> &[u32] {
+        &self.sequences
+    }
+}
+
 pub fn generate_with_session(
     session: &mut StepGenerateSession,
     prompt_token_ids: &[u32],
     cfg: &StepGenerateConfig,
     prompt_label: &str,
 ) -> Result<GenerateOutput, Error> {
+    let mut ts = begin_turn(session, prompt_token_ids, cfg, prompt_label)?;
+    loop {
+        let pb = match propose_block(session, cfg, &mut ts)? {
+            BlockOutcome::Proposal(pb) => pb,
+            BlockOutcome::Exhausted | BlockOutcome::Abandoned | BlockOutcome::Cancelled => break,
+        };
+        if !default_commit_policy(session, cfg, &mut ts, *pb)? {
+            break;
+        }
+    }
+    finish_turn(session, cfg, ts)
+}
+
+/// The monolithic commit policy, unchanged from the pre-decomposition path:
+/// full-message stop-scan (with the tool-mode defer), the whitespace-collapse
+/// stopgap, and the causal KV extend for every non-final block. Returns
+/// whether the turn continues.
+fn default_commit_policy(
+    session: &mut StepGenerateSession,
+    cfg: &StepGenerateConfig,
+    ts: &mut TurnState,
+    mut pb: ProposedBlock,
+) -> Result<bool, Error> {
+    let remaining = ts.prompt_token_ids.len() + cfg.max_new_tokens - ts.sequences.len();
+    let is_last_block = remaining <= CANVAS;
+    let block_idx = pb.block_idx;
+    let argmax_tokens = pb.token_ids.clone();
+    let block_base = ts.sequences.len();
+
+    // Full-message stop: end the turn as soon as the committed block emits a
+    // stop token (e.g. <turn|> or <eos>). Trim it and everything after so the
+    // reply is exactly the model's turn, and skip the KV extend — unless
+    // `continue_incomplete_tool_calls` and the reply still looks unfinished
+    // (open `call:NAME{…}`, or trailing prose after a closed tool call).
+    let mut kept = argmax_tokens.len();
+    let mut end_turn = false;
+    if !cfg.stop_token_ids.is_empty()
+        && let Some(rel) = argmax_tokens
+            .iter()
+            .position(|id| cfg.stop_token_ids.contains(id))
+    {
+        kept = rel;
+        pb.stats.stop_token_id = Some(argmax_tokens[rel]);
+        pb.stats.stop_offset = Some(rel);
+
+        let defer_stop = cfg.continue_incomplete_tool_calls && {
+            if session.step_text_tokenizer.is_none() {
+                let tok_path = session.model_dir.join("tokenizer.json");
+                if let Ok(tok) = Tokenizer::load(&tok_path) {
+                    session.step_text_tokenizer = Some(tok);
+                }
+            }
+            let mut reply = ts.sequences[ts.prompt_token_ids.len()..].to_vec();
+            reply.extend_from_slice(&argmax_tokens[..rel]);
+            let cleaned = crate::sample::strip_degenerate_token_ids(&reply);
+            session
+                .step_text_tokenizer
+                .as_ref()
+                .is_some_and(|tok| crate::tools::should_continue_past_stop(&tok.decode(&cleaned)))
+        };
+
+        if defer_stop {
+            pb.stats.continued_past_stop = true;
+            eprintln!(
+                "serve: unfinished tool turn after stop token {}; continuing to next block",
+                argmax_tokens[rel],
+            );
+        } else {
+            ts.stopped_on_eot = true;
+            ts.stop_token_id = Some(argmax_tokens[rel]);
+            ts.stop_block_idx = Some(block_idx);
+            ts.stop_offset = Some(rel);
+            end_turn = true;
+            if progress_enabled() {
+                eprintln!(
+                    "step-generate: block {block_idx} hit stop token {} at offset {rel}; ending turn ({} new tokens)",
+                    argmax_tokens[rel],
+                    ts.new_tokens() + rel
+                );
+            }
+        }
+    }
+
+    // Whitespace-collapse STOPGAP (opt-in, see flags::ws_block_stop_enabled:
+    // the attractor is being treated as an unfixed bug and a default-on
+    // stopper would hide the evidence): a committed block whose text is
+    // pure whitespace / all pad-filler ends the turn instead of crawling
+    // toward the context wall at max_steps per block.
+    let mut ws_stop = false;
+    if !end_turn && crate::flags::ws_block_stop_enabled() {
+        let cleaned = crate::sample::strip_degenerate_token_ids(&argmax_tokens[..kept]);
+        let all_ws = cleaned.is_empty()
+            || session
+                .step_text_tokenizer
+                .as_ref()
+                .is_some_and(|tok| tok.decode(&cleaned).trim().is_empty());
+        if all_ws {
+            ws_stop = true;
+        }
+    }
+
+    let extend = !end_turn && !ws_stop && !is_last_block && kept > 0;
+    commit_block(session, cfg, ts, pb, kept, extend)?;
+    if ws_stop {
+        ts.sequences.truncate(block_base);
+        if progress_enabled() {
+            eprintln!(
+                "step-generate: block {block_idx} committed pure whitespace; ending turn (DGQ_WS_BLOCK_STOP, {} new tokens kept)",
+                ts.new_tokens()
+            );
+        }
+        return Ok(false);
+    }
+    Ok(!end_turn)
+}
+
+/// Open a turn: select and run the prefill path (cross-turn reuse / fast
+/// quantized / engine), leaving the session ready for the first
+/// [`propose_block`].
+pub fn begin_turn(
+    session: &mut StepGenerateSession,
+    prompt_token_ids: &[u32],
+    cfg: &StepGenerateConfig,
+    prompt_label: &str,
+) -> Result<TurnState, Error> {
     if prompt_token_ids.is_empty() {
         return Err(Error::Runtime("generate requires a non-empty prompt"));
     }
@@ -860,396 +1056,315 @@ pub fn generate_with_session(
         );
     }
 
-    let mut sequences = prompt_token_ids.to_vec();
-    let mut rng = Rng::new(cfg.seed);
-    let mut denoise_steps_run = 0usize;
-    let mut blocks_committed = 0usize;
-    let mut block_steps_eff = Vec::new();
-    let mut last_block_accept_hist = Vec::new();
-    let mut last_block_min_entropy_hist = Vec::new();
-    let mut denoise_elapsed = Duration::ZERO;
-    let mut extend_elapsed = Duration::ZERO;
-    let mut session_telemetry = SessionTelemetry::default();
-    let mut step_traces = Vec::new();
-    let max_steps = cfg.sampler.max_denoising_steps.max(1);
-    let mut initial_canvas_ids: Option<Vec<u32>> = None;
-    let mut cancelled = false;
-    let mut stopped_on_eot = false;
-    let mut stop_token_id: Option<u32> = None;
-    let mut stop_block_idx: Option<usize> = None;
-    let mut stop_offset: Option<usize> = None;
-    let mut block_stats: Vec<crate::generate::BlockDenoiseStats> = Vec::new();
+    Ok(TurnState {
+        prompt_token_ids: prompt_token_ids.to_vec(),
+        label: prompt_label.to_string(),
+        sequences: prompt_token_ids.to_vec(),
+        rng: Rng::new(cfg.seed),
+        max_steps: cfg.sampler.max_denoising_steps.max(1),
+        max_blocks,
+        denoise_steps_run: 0,
+        blocks_committed: 0,
+        block_steps_eff: Vec::new(),
+        last_block_accept_hist: Vec::new(),
+        last_block_min_entropy_hist: Vec::new(),
+        prefill_elapsed,
+        denoise_elapsed: Duration::ZERO,
+        extend_elapsed: Duration::ZERO,
+        session_telemetry: SessionTelemetry::default(),
+        step_traces: Vec::new(),
+        initial_canvas_ids: None,
+        cancelled: false,
+        stopped_on_eot: false,
+        stop_token_id: None,
+        stop_block_idx: None,
+        stop_offset: None,
+        block_stats: Vec::new(),
+    })
+}
 
-    for _block in 0..max_blocks {
-        if sequences.len() >= prompt_token_ids.len() + cfg.max_new_tokens {
-            break;
-        }
-        if cfg.cancel_requested() {
-            cancelled = true;
-            break;
-        }
+/// One block's denoise: reset the canvas, run the attempt loop (E6
+/// empty-retry + commit-guard re-rolls), return the uncommitted proposal or a
+/// terminal outcome. Commits NOTHING — the caller inspects the proposal and
+/// either [`commit_block`]s a kept prefix or drops it.
+pub fn propose_block(
+    session: &mut StepGenerateSession,
+    cfg: &StepGenerateConfig,
+    ts: &mut TurnState,
+) -> Result<BlockOutcome, Error> {
+    if ts.blocks_committed >= ts.max_blocks
+        || ts.sequences.len() >= ts.prompt_token_ids.len() + cfg.max_new_tokens
+    {
+        return Ok(BlockOutcome::Exhausted);
+    }
+    if cfg.cancel_requested() {
+        ts.cancelled = true;
+        return Ok(BlockOutcome::Cancelled);
+    }
+    let max_steps = ts.max_steps;
+    let max_blocks = ts.max_blocks;
+    let rt = &mut session.rt;
 
-        let remaining = prompt_token_ids.len() + cfg.max_new_tokens - sequences.len();
-        let is_last_block = remaining <= canvas_len;
-        let block_idx = blocks_committed + 1;
+    let remaining = ts.prompt_token_ids.len() + cfg.max_new_tokens - ts.sequences.len();
+    let block_idx = ts.blocks_committed + 1;
 
-        let params = step_params_from_sampler(
-            &cfg.sampler,
-            rt.read_params().kv_len,
-            cfg.no_early_stop,
-            rt.read_params().eos_token_id,
-        );
-        rt.reset_block(VOCAB, &mut rng, params);
-        if let Some(ref ids) = cfg.initial_canvas_ids {
-            rt.set_canvas_ids(ids)?;
-        }
-        if initial_canvas_ids.is_none() {
-            initial_canvas_ids = Some(rt.read_canvas_state().ids.to_vec());
-            if denoise_parity_log_enabled() {
-                let c = initial_canvas_ids.as_ref().expect("initial canvas");
-                eprintln!(
-                    "denoise-parity: initial_canvas[:8]={:?}",
-                    &c[..8.min(c.len())]
-                );
-            }
-        }
-
-        if progress_enabled() {
+    let params = step_params_from_sampler(
+        &cfg.sampler,
+        rt.read_params().kv_len,
+        cfg.no_early_stop,
+        rt.read_params().eos_token_id,
+    );
+    rt.reset_block(VOCAB, &mut ts.rng, params);
+    if let Some(ref ids) = cfg.initial_canvas_ids {
+        rt.set_canvas_ids(ids)?;
+    }
+    if ts.initial_canvas_ids.is_none() {
+        ts.initial_canvas_ids = Some(rt.read_canvas_state().ids.to_vec());
+        if denoise_parity_log_enabled() {
+            let c = ts.initial_canvas_ids.as_ref().expect("initial canvas");
             eprintln!(
-                "step-generate: block {block_idx}/{max_blocks} starting denoise (kv_len={}, max_steps={max_steps}, new_tokens_remaining={remaining})",
-                rt.read_params().kv_len
+                "denoise-parity: initial_canvas[:8]={:?}",
+                &c[..8.min(c.len())]
             );
         }
+    }
 
-        let block_started = Instant::now();
-        // E6: empty/degenerate-reply retry — first block only. If the committed
-        // canvas would trim to empty (position 0 is a stop/eos/control token),
-        // re-roll the canvas and re-denoise up to N times (DGQ_EMPTY_REPLY_RETRY).
-        let empty_retry_max = if block_idx == 1 {
-            crate::flags::empty_reply_retry()
-        } else {
-            0
+    if progress_enabled() {
+        eprintln!(
+            "step-generate: block {block_idx}/{max_blocks} starting denoise (kv_len={}, max_steps={max_steps}, new_tokens_remaining={remaining})",
+            rt.read_params().kv_len
+        );
+    }
+
+    let block_started = Instant::now();
+    // E6: empty/degenerate-reply retry — first block only. If the committed
+    // canvas would trim to empty (position 0 is a stop/eos/control token),
+    // re-roll the canvas and re-denoise up to N times (DGQ_EMPTY_REPLY_RETRY).
+    let empty_retry_max = if block_idx == 1 {
+        crate::flags::empty_reply_retry()
+    } else {
+        0
+    };
+    let mut empty_retry_attempt = 0u32;
+    // Non-convergence commit guard (`DGQ_BLOCK_COMMIT_MAX_ENT`): re-roll
+    // budget, and the abandon verdict when the budget is spent.
+    let mut nc_retry_attempt = 0u32;
+    let mut abandon_turn = false;
+    let (
+        st,
+        block_step_count,
+        accept_hist,
+        min_entropy_hist,
+        mean_entropy_hist,
+        low_ent_hist,
+        denoise_stop,
+    ) = 'attempt: loop {
+        // Shrink-on-retry (E3/E6): attempt 0 uses the full canvas (handles
+        // long answers); each degenerate retry narrows it (256→128→64),
+        // where the empty/ceremony attractor is far weaker (72%→3% by width).
+        let attempt_canvas = match empty_retry_attempt {
+            0 => CANVAS,
+            1 => 128,
+            _ => 64,
         };
-        let mut empty_retry_attempt = 0u32;
-        // Non-convergence commit guard (`DGQ_BLOCK_COMMIT_MAX_ENT`): re-roll
-        // budget, and the abandon verdict when the budget is spent.
-        let mut nc_retry_attempt = 0u32;
-        let mut abandon_turn = false;
-        let (
-            st,
-            block_step_count,
-            accept_hist,
-            min_entropy_hist,
-            mean_entropy_hist,
-            low_ent_hist,
-            denoise_stop,
-        ) = 'attempt: loop {
-            // Shrink-on-retry (E3/E6): attempt 0 uses the full canvas (handles
-            // long answers); each degenerate retry narrows it (256→128→64),
-            // where the empty/ceremony attractor is far weaker (72%→3% by width).
-            let attempt_canvas = match empty_retry_attempt {
-                0 => CANVAS,
-                1 => 128,
-                _ => 64,
-            };
-            rt.set_active_canvas(attempt_canvas);
-            let active = rt.active_canvas();
-            let mut block_step_count = 0u32;
-            let mut accept_hist = Vec::new();
-            let mut min_entropy_hist = Vec::new();
-            let mut mean_entropy_hist = Vec::new();
-            let mut low_ent_hist = Vec::new();
-            let mut last_st;
-            let mut prev_step_argmax: Option<[u32; CANVAS]> = None;
-            let prefix_stable_streak = 0u32;
-            let last_denoise_stop = loop {
-                let step_started = Instant::now();
-                rt.run_denoise_step()?;
-                let check_logits = crate::metal::step_kernel::logits_finite_check_enabled();
-                rt.check_logits_finite()?;
-                let step_elapsed = step_started.elapsed();
-                let step_ms = step_elapsed.as_secs_f64() * 1000.0;
-                let readback_bytes = StepRuntime::denoise_step_host_readback_bytes(check_logits);
-                let mut forward = ForwardTelemetry::monolithic_gpu_step(readback_bytes);
-                rt.fill_expert_forward_telemetry(&mut forward);
-                session_telemetry.steps.push(StepPhaseTelemetry {
-                    decoder_ms: step_ms,
-                    sampler_ms: 0.0,
-                    forward,
-                });
-                denoise_steps_run += 1;
-                block_step_count += 1;
-                let st = rt.read_canvas_state();
-                last_st = st;
-                if denoise_parity_log_enabled() {
-                    log_denoise_parity_step(
-                        &format!("block={block_idx} step_index={block_step_count}"),
-                        &st,
-                        &rt.read_params(),
-                        rt.logits(),
-                    );
-                }
-                if crate::flags::sc_log_enabled() {
-                    eprintln!(
-                        "monolithic denoise: step_index={block_step_count} st.step={} sc_active_next={}",
-                        st.step,
-                        st.step >= 1
-                    );
-                }
-                // Slice canvas stats/argmax to the ACTIVE rows — stale rows
-                // [active..CANVAS) hold reset sentinels (u32::MAX / 0) that would
-                // skew stats and (on decode) corrupt the reply.
-                let stats = step_entropy_stats(&st.entropy[..active], &st.accept[..active]);
-                accept_hist.push(stats.accept_count);
-                min_entropy_hist.push(stats.min_entropy);
-                mean_entropy_hist.push(st.mean_entropy);
-                low_ent_hist.push(stats.low_entropy_positions);
-                let max_steps_reached = st.step >= max_steps as u32;
-                let params = rt.read_params();
-                let region_end =
-                    crate::sample::answer_region_end(&st.ids[..active], params.eos_token_id);
-                let (full_diff, prefix_diff, prefix_stable_streak) = match prev_step_argmax {
-                    Some(prev) => {
-                        let full = crate::sample::count_argmax_diff(&st.prev_argmax, &prev, active);
-                        let prefix =
-                            crate::sample::count_argmax_diff(&st.prev_argmax, &prev, region_end);
-                        let streak = if prefix == 0 {
-                            prefix_stable_streak.saturating_add(1)
-                        } else {
-                            0
-                        };
-                        (Some(full), Some(prefix), streak)
-                    }
-                    None => (None, None, 0),
-                };
-                prev_step_argmax = Some(st.prev_argmax);
-                let early_stop = crate::sample::decode_early_stop_flag(st.stop_flag);
-                let snap = crate::sample::EarlyStopSnapshot {
-                    canvas_stable: st.canvas_stable,
-                    mean_entropy: st.mean_entropy,
-                    accept_plateau: st.accept_plateau,
-                    conf_threshold: params.conf_threshold,
-                    accept_plateau_threshold: params.accept_plateau_threshold,
-                    plateau_prefix_mean_max: params.plateau_prefix_mean_max,
-                };
-                let cpu_early =
-                    !cfg.no_early_stop && crate::sample::early_stop_from_snapshot(&snap);
-                let gpu_early =
-                    !cfg.no_early_stop && crate::sample::is_early_stop_flag(st.stop_flag);
-                let stop_reason = match early_stop {
-                    Some(crate::sample::EarlyStopKind::Confident) => DenoiseStopReason::Confident,
-                    Some(crate::sample::EarlyStopKind::Plateau) => DenoiseStopReason::Plateau,
-                    Some(crate::sample::EarlyStopKind::MaxSteps) => DenoiseStopReason::MaxSteps,
-                    None if max_steps_reached => DenoiseStopReason::MaxSteps,
-                    None => DenoiseStopReason::None,
-                };
-                if crate::flags::log_early_stop_enabled() {
-                    if gpu_early != cpu_early {
-                        eprintln!(
-                            "step-generate: early-stop mismatch step={} gpu_flag={} gpu_early={gpu_early} cpu_early={cpu_early} accept_plateau={} mean_ent={:.4} stable={} threshold={:.4}",
-                            st.step,
-                            st.stop_flag,
-                            st.accept_plateau,
-                            st.mean_entropy,
-                            st.canvas_stable,
-                            params.conf_threshold,
-                        );
-                    } else if gpu_early {
-                        let kind = match early_stop {
-                            Some(crate::sample::EarlyStopKind::Confident) => "confident_stable",
-                            Some(crate::sample::EarlyStopKind::Plateau) => "plateau_stop",
-                            _ => "early_stop",
-                        };
-                        eprintln!(
-                            "step-generate: early-stop step={} reason={kind} stop_flag={} accept_plateau={} mean_ent={:.4} stable={} accept={}",
-                            st.step,
-                            st.stop_flag,
-                            st.accept_plateau,
-                            st.mean_entropy,
-                            st.canvas_stable,
-                            stats.accept_count,
-                        );
-                    }
-                }
-                let (prefix_mean_log, region_end_log, answer_text_log) = if step_text_log_enabled()
-                {
-                    // Slice to the ACTIVE canvas: the readback buffers are
-                    // PREFILL_M-sized, and rows [active..] hold stale data
-                    // (was: ans_len=1024 + stale positions polluting
-                    // prefix_mean/text on every step line).
-                    let ids = &st.ids[..active.min(st.ids.len())];
-                    let entropy = &st.entropy[..active.min(st.entropy.len())];
-                    let pm = crate::sample::mean_entropy_answer_prefix(
-                        entropy,
-                        ids,
-                        params.eos_token_id,
-                    );
-                    let (re, text) = step_answer_text(
-                        session.step_text_tokenizer.as_ref(),
-                        &st.prev_argmax,
-                        ids,
-                        params.eos_token_id,
-                    );
-                    (Some(pm), Some(re), text)
-                } else {
-                    (None, None, None)
-                };
-                let answer_text_ref = answer_text_log.as_deref();
-                step_traces.push(step_trace_from_stats(
-                    block_idx as u32,
-                    block_step_count,
-                    max_steps,
-                    &stats,
-                    &st.prev_argmax,
-                    if trace_entropy_enabled() {
-                        Some(&st.entropy)
+        rt.set_active_canvas(attempt_canvas);
+        let active = rt.active_canvas();
+        let mut block_step_count = 0u32;
+        let mut accept_hist = Vec::new();
+        let mut min_entropy_hist = Vec::new();
+        let mut mean_entropy_hist = Vec::new();
+        let mut low_ent_hist = Vec::new();
+        let mut last_st;
+        let mut prev_step_argmax: Option<[u32; CANVAS]> = None;
+        let prefix_stable_streak = 0u32;
+        let last_denoise_stop = loop {
+            let step_started = Instant::now();
+            rt.run_denoise_step()?;
+            let check_logits = crate::metal::step_kernel::logits_finite_check_enabled();
+            rt.check_logits_finite()?;
+            let step_elapsed = step_started.elapsed();
+            let step_ms = step_elapsed.as_secs_f64() * 1000.0;
+            let readback_bytes = StepRuntime::denoise_step_host_readback_bytes(check_logits);
+            let mut forward = ForwardTelemetry::monolithic_gpu_step(readback_bytes);
+            rt.fill_expert_forward_telemetry(&mut forward);
+            ts.session_telemetry.steps.push(StepPhaseTelemetry {
+                decoder_ms: step_ms,
+                sampler_ms: 0.0,
+                forward,
+            });
+            ts.denoise_steps_run += 1;
+            block_step_count += 1;
+            let st = rt.read_canvas_state();
+            last_st = st;
+            if denoise_parity_log_enabled() {
+                log_denoise_parity_step(
+                    &format!("block={block_idx} step_index={block_step_count}"),
+                    &st,
+                    &rt.read_params(),
+                    rt.logits(),
+                );
+            }
+            if crate::flags::sc_log_enabled() {
+                eprintln!(
+                    "monolithic denoise: step_index={block_step_count} st.step={} sc_active_next={}",
+                    st.step,
+                    st.step >= 1
+                );
+            }
+            // Slice canvas stats/argmax to the ACTIVE rows — stale rows
+            // [active..CANVAS) hold reset sentinels (u32::MAX / 0) that would
+            // skew stats and (on decode) corrupt the reply.
+            let stats = step_entropy_stats(&st.entropy[..active], &st.accept[..active]);
+            accept_hist.push(stats.accept_count);
+            min_entropy_hist.push(stats.min_entropy);
+            mean_entropy_hist.push(st.mean_entropy);
+            low_ent_hist.push(stats.low_entropy_positions);
+            let max_steps_reached = st.step >= max_steps as u32;
+            let params = rt.read_params();
+            let region_end =
+                crate::sample::answer_region_end(&st.ids[..active], params.eos_token_id);
+            let (full_diff, prefix_diff, prefix_stable_streak) = match prev_step_argmax {
+                Some(prev) => {
+                    let full = crate::sample::count_argmax_diff(&st.prev_argmax, &prev, active);
+                    let prefix =
+                        crate::sample::count_argmax_diff(&st.prev_argmax, &prev, region_end);
+                    let streak = if prefix == 0 {
+                        prefix_stable_streak.saturating_add(1)
                     } else {
-                        None
-                    },
-                    stop_reason != DenoiseStopReason::None,
-                ));
-                log_denoise_step_progress(
-                    block_idx,
-                    max_blocks,
-                    block_step_count,
-                    max_steps,
-                    &stats,
-                    st.mean_entropy,
-                    prefix_mean_log,
-                    region_end_log,
-                    answer_text_ref,
-                    st.canvas_stable,
-                    prefix_stable_streak,
-                    full_diff,
-                    prefix_diff,
-                    st.argmax_hist_len,
-                    st.accept_plateau,
-                    step_elapsed,
-                    block_started.elapsed(),
-                    denoise_elapsed + block_started.elapsed(),
-                    stop_reason,
-                );
-                if let Some(ref observer) = cfg.step_observer {
-                    // Never mark block_done here: E6 may still discard this canvas.
-                    // Active slice only — rows past `active` are stale after shrink.
-                    observer(&StepProgressEvent {
-                        block_idx,
-                        max_blocks,
-                        step_in_block: block_step_count,
-                        max_steps,
-                        argmax: &st.prev_argmax[..active],
-                        accept_count: stats.accept_count,
-                        mean_entropy: st.mean_entropy,
-                        block_done: false,
-                    });
+                        0
+                    };
+                    (Some(full), Some(prefix), streak)
                 }
-                if stop_reason != DenoiseStopReason::None {
-                    break stop_reason;
-                }
-                if cfg.cancel_requested() {
-                    break DenoiseStopReason::Cancelled;
-                }
+                None => (None, None, 0),
             };
-            let st = last_st;
-            // Cancelled mid-block: abandon this canvas uncommitted (the E6 /
-            // commit-guard checks below are moot for a reply nobody will read).
-            if last_denoise_stop == DenoiseStopReason::Cancelled {
-                cancelled = true;
-                abandon_turn = true;
-                break 'attempt (
-                    st,
-                    block_step_count,
-                    accept_hist,
-                    min_entropy_hist,
-                    mean_entropy_hist,
-                    low_ent_hist,
-                    last_denoise_stop,
-                );
-            }
-            // Empty/degenerate-reply detection: does the committed argmax render as
-            // an empty user-facing reply (eos-first canvas OR `<|channel>thought`
-            // ceremony)? Checked against the real decoded+sanitized output (E6
-            // attractor). Re-roll the canvas from the advancing rng and retry.
-            let degenerate = cfg
-                .degenerate_reply_check
-                .as_ref()
-                .is_some_and(|check| check(&st.prev_argmax[..active]));
-            if empty_retry_attempt < empty_retry_max && degenerate {
-                empty_retry_attempt += 1;
-                if progress_enabled() {
+            prev_step_argmax = Some(st.prev_argmax);
+            let early_stop = crate::sample::decode_early_stop_flag(st.stop_flag);
+            let snap = crate::sample::EarlyStopSnapshot {
+                canvas_stable: st.canvas_stable,
+                mean_entropy: st.mean_entropy,
+                accept_plateau: st.accept_plateau,
+                conf_threshold: params.conf_threshold,
+                accept_plateau_threshold: params.accept_plateau_threshold,
+                plateau_prefix_mean_max: params.plateau_prefix_mean_max,
+            };
+            let cpu_early = !cfg.no_early_stop && crate::sample::early_stop_from_snapshot(&snap);
+            let gpu_early = !cfg.no_early_stop && crate::sample::is_early_stop_flag(st.stop_flag);
+            let stop_reason = match early_stop {
+                Some(crate::sample::EarlyStopKind::Confident) => DenoiseStopReason::Confident,
+                Some(crate::sample::EarlyStopKind::Plateau) => DenoiseStopReason::Plateau,
+                Some(crate::sample::EarlyStopKind::MaxSteps) => DenoiseStopReason::MaxSteps,
+                None if max_steps_reached => DenoiseStopReason::MaxSteps,
+                None => DenoiseStopReason::None,
+            };
+            if crate::flags::log_early_stop_enabled() {
+                if gpu_early != cpu_early {
                     eprintln!(
-                        "step-generate: block {block_idx} empty/degenerate reply; re-rolling canvas (attempt {empty_retry_attempt}/{empty_retry_max})"
+                        "step-generate: early-stop mismatch step={} gpu_flag={} gpu_early={gpu_early} cpu_early={cpu_early} accept_plateau={} mean_ent={:.4} stable={} threshold={:.4}",
+                        st.step,
+                        st.stop_flag,
+                        st.accept_plateau,
+                        st.mean_entropy,
+                        st.canvas_stable,
+                        params.conf_threshold,
+                    );
+                } else if gpu_early {
+                    let kind = match early_stop {
+                        Some(crate::sample::EarlyStopKind::Confident) => "confident_stable",
+                        Some(crate::sample::EarlyStopKind::Plateau) => "plateau_stop",
+                        _ => "early_stop",
+                    };
+                    eprintln!(
+                        "step-generate: early-stop step={} reason={kind} stop_flag={} accept_plateau={} mean_ent={:.4} stable={} accept={}",
+                        st.step,
+                        st.stop_flag,
+                        st.accept_plateau,
+                        st.mean_entropy,
+                        st.canvas_stable,
+                        stats.accept_count,
                     );
                 }
-                let params = step_params_from_sampler(
-                    &cfg.sampler,
-                    rt.read_params().kv_len,
-                    cfg.no_early_stop,
-                    rt.read_params().eos_token_id,
-                );
-                rt.reset_block(VOCAB, &mut rng, params);
-                continue 'attempt;
             }
-            // Non-convergence commit guard: a block that burned the whole step
-            // schedule and still shows late-window mean entropy above the floor
-            // committed ~45%-accepted garble in the OpenCode collapse — and the
-            // committed flood is self-consistent, so later blocks converge onto
-            // it. Re-roll with fresh noise; if it still cannot converge, end
-            // the turn instead of committing the attractor.
-            let commit_max_ent = crate::flags::block_commit_max_ent();
-            let non_converged =
-                commit_max_ent > 0.0 && last_denoise_stop == DenoiseStopReason::MaxSteps && {
-                    let late0 = mean_entropy_hist.len().saturating_sub(8);
-                    let late_min = mean_entropy_hist[late0..]
-                        .iter()
-                        .copied()
-                        .fold(f32::INFINITY, f32::min);
-                    late_min.is_finite() && late_min > commit_max_ent
-                };
-            if non_converged {
-                if nc_retry_attempt < crate::flags::block_commit_retry() {
-                    nc_retry_attempt += 1;
-                    if progress_enabled() {
-                        eprintln!(
-                            "step-generate: block {block_idx} ended max_steps NON-CONVERGED (late mean_ent > {commit_max_ent}); re-rolling canvas (attempt {nc_retry_attempt}/{})",
-                            crate::flags::block_commit_retry()
-                        );
-                    }
-                    let params = step_params_from_sampler(
-                        &cfg.sampler,
-                        rt.read_params().kv_len,
-                        cfg.no_early_stop,
-                        rt.read_params().eos_token_id,
-                    );
-                    rt.reset_block(VOCAB, &mut rng, params);
-                    continue 'attempt;
-                }
-                // Budget spent: abandon without the block_done notification —
-                // this canvas must never reach a streamer as final.
-                abandon_turn = true;
-                break 'attempt (
-                    st,
-                    block_step_count,
-                    accept_hist,
-                    min_entropy_hist,
-                    mean_entropy_hist,
-                    low_ent_hist,
-                    last_denoise_stop,
+            let (prefix_mean_log, region_end_log, answer_text_log) = if step_text_log_enabled() {
+                // Slice to the ACTIVE canvas: the readback buffers are
+                // PREFILL_M-sized, and rows [active..] hold stale data
+                // (was: ans_len=1024 + stale positions polluting
+                // prefix_mean/text on every step line).
+                let ids = &st.ids[..active.min(st.ids.len())];
+                let entropy = &st.entropy[..active.min(st.entropy.len())];
+                let pm =
+                    crate::sample::mean_entropy_answer_prefix(entropy, ids, params.eos_token_id);
+                let (re, text) = step_answer_text(
+                    session.step_text_tokenizer.as_ref(),
+                    &st.prev_argmax,
+                    ids,
+                    params.eos_token_id,
                 );
-            }
-            // Accepted: notify streamers that this block's active argmax is final.
+                (Some(pm), Some(re), text)
+            } else {
+                (None, None, None)
+            };
+            let answer_text_ref = answer_text_log.as_deref();
+            ts.step_traces.push(step_trace_from_stats(
+                block_idx as u32,
+                block_step_count,
+                max_steps,
+                &stats,
+                &st.prev_argmax,
+                if trace_entropy_enabled() {
+                    Some(&st.entropy)
+                } else {
+                    None
+                },
+                stop_reason != DenoiseStopReason::None,
+            ));
+            log_denoise_step_progress(
+                block_idx,
+                max_blocks,
+                block_step_count,
+                max_steps,
+                &stats,
+                st.mean_entropy,
+                prefix_mean_log,
+                region_end_log,
+                answer_text_ref,
+                st.canvas_stable,
+                prefix_stable_streak,
+                full_diff,
+                prefix_diff,
+                st.argmax_hist_len,
+                st.accept_plateau,
+                step_elapsed,
+                block_started.elapsed(),
+                ts.denoise_elapsed + block_started.elapsed(),
+                stop_reason,
+            );
             if let Some(ref observer) = cfg.step_observer {
+                // Never mark block_done here: E6 may still discard this canvas.
+                // Active slice only — rows past `active` are stale after shrink.
                 observer(&StepProgressEvent {
                     block_idx,
                     max_blocks,
                     step_in_block: block_step_count,
                     max_steps,
                     argmax: &st.prev_argmax[..active],
-                    accept_count: accept_hist.last().copied().unwrap_or(0),
+                    accept_count: stats.accept_count,
                     mean_entropy: st.mean_entropy,
-                    block_done: true,
+                    block_done: false,
                 });
             }
+            if stop_reason != DenoiseStopReason::None {
+                break stop_reason;
+            }
+            if cfg.cancel_requested() {
+                break DenoiseStopReason::Cancelled;
+            }
+        };
+        let st = last_st;
+        // Cancelled mid-block: abandon this canvas uncommitted (the E6 /
+        // commit-guard checks below are moot for a reply nobody will read).
+        if last_denoise_stop == DenoiseStopReason::Cancelled {
+            ts.cancelled = true;
+            abandon_turn = true;
             break 'attempt (
                 st,
                 block_step_count,
@@ -1259,119 +1374,172 @@ pub fn generate_with_session(
                 low_ent_hist,
                 last_denoise_stop,
             );
-        };
-        let block_elapsed = block_started.elapsed();
-        denoise_elapsed += block_elapsed;
-        block_steps_eff.push(block_step_count);
-        last_block_accept_hist = accept_hist.clone();
-        last_block_min_entropy_hist = min_entropy_hist.clone();
-        let late = accept_hist.len().saturating_sub(8);
-        let late_accept: u32 = accept_hist.get(late..).unwrap_or(&[]).iter().sum();
-        let late_min_ent = min_entropy_hist
-            .get(late..)
-            .and_then(|s| s.iter().copied().reduce(f32::min))
-            .unwrap_or(f32::NAN);
-        let late_low_ent = low_ent_hist
-            .get(late..)
-            .and_then(|s| s.iter().copied().reduce(u32::max))
-            .unwrap_or(0);
-        let late_mean_ent = mean_entropy_hist
-            .get(late..)
-            .and_then(|s| s.iter().copied().reduce(f32::min))
-            .unwrap_or(f32::NAN);
-        if progress_enabled() {
-            eprintln!(
-                "step-generate: block {} denoise={block_elapsed:.2?} steps_eff={block_step_count} accept/step={accept_hist:?}",
-                block_idx
-            );
-            eprintln!(
-                "step-generate: block {} min_ent/step={min_entropy_hist:?}",
-                block_idx
-            );
-            eprintln!(
-                "step-generate: block {} mean_ent/step={mean_entropy_hist:?}",
-                block_idx
-            );
-            eprintln!(
-                "step-generate: block {} low_ent(<0.1)/step={low_ent_hist:?}",
-                block_idx
-            );
-            eprintln!(
-                "step-generate: block {} late-window (last 8 steps): accept_sum={late_accept} min_ent={late_min_ent:.4} mean_ent={late_mean_ent:.4} max_low_ent={late_low_ent} (early stop: accept plateau>={} or prefix mean_ent<{:.4} + stable argmax)",
-                block_idx,
-                crate::sample::ACCEPT_PLATEAU_THRESHOLD,
-                cfg.sampler.confidence_threshold,
-            );
         }
-        if final_entropy_log_enabled() {
-            log_final_per_token_entropy(
-                &format!("block {block_idx} final"),
-                &st,
-                st.stop_flag,
+        // Empty/degenerate-reply detection: does the committed argmax render as
+        // an empty user-facing reply (eos-first canvas OR `<|channel>thought`
+        // ceremony)? Checked against the real decoded+sanitized output (E6
+        // attractor). Re-roll the canvas from the advancing rng and retry.
+        let degenerate = cfg
+            .degenerate_reply_check
+            .as_ref()
+            .is_some_and(|check| check(&st.prev_argmax[..active]));
+        if empty_retry_attempt < empty_retry_max && degenerate {
+            empty_retry_attempt += 1;
+            if progress_enabled() {
+                eprintln!(
+                    "step-generate: block {block_idx} empty/degenerate reply; re-rolling canvas (attempt {empty_retry_attempt}/{empty_retry_max})"
+                );
+            }
+            let params = step_params_from_sampler(
+                &cfg.sampler,
+                rt.read_params().kv_len,
+                cfg.no_early_stop,
                 rt.read_params().eos_token_id,
             );
+            rt.reset_block(VOCAB, &mut ts.rng, params);
+            continue 'attempt;
         }
-
-        // Commit-guard abandon: the block ran out of schedule AND retries while
-        // non-converged. Commit nothing (the canvas is the garble attractor),
-        // record the failed block's stats for diagnosis, and end the turn with
-        // whatever earlier blocks produced.
-        if abandon_turn {
-            if cancelled {
-                eprintln!(
-                    "step-generate: block {block_idx} cancelled after {block_step_count} steps; ending turn without committing ({} new tokens kept)",
-                    sequences.len() - prompt_token_ids.len()
+        // Non-convergence commit guard: a block that burned the whole step
+        // schedule and still shows late-window mean entropy above the floor
+        // committed ~45%-accepted garble in the OpenCode collapse — and the
+        // committed flood is self-consistent, so later blocks converge onto
+        // it. Re-roll with fresh noise; if it still cannot converge, end
+        // the turn instead of committing the attractor.
+        let commit_max_ent = crate::flags::block_commit_max_ent();
+        let non_converged =
+            commit_max_ent > 0.0 && last_denoise_stop == DenoiseStopReason::MaxSteps && {
+                let late0 = mean_entropy_hist.len().saturating_sub(8);
+                let late_min = mean_entropy_hist[late0..]
+                    .iter()
+                    .copied()
+                    .fold(f32::INFINITY, f32::min);
+                late_min.is_finite() && late_min > commit_max_ent
+            };
+        if non_converged {
+            if nc_retry_attempt < crate::flags::block_commit_retry() {
+                nc_retry_attempt += 1;
+                if progress_enabled() {
+                    eprintln!(
+                        "step-generate: block {block_idx} ended max_steps NON-CONVERGED (late mean_ent > {commit_max_ent}); re-rolling canvas (attempt {nc_retry_attempt}/{})",
+                        crate::flags::block_commit_retry()
+                    );
+                }
+                let params = step_params_from_sampler(
+                    &cfg.sampler,
+                    rt.read_params().kv_len,
+                    cfg.no_early_stop,
+                    rt.read_params().eos_token_id,
                 );
-            } else {
-                eprintln!(
-                    "step-generate: block {block_idx} NON-CONVERGED after {} re-rolls (late mean_ent={late_mean_ent:.3} > {}); ending turn without committing ({} new tokens kept)",
-                    crate::flags::block_commit_retry(),
-                    crate::flags::block_commit_max_ent(),
-                    sequences.len() - prompt_token_ids.len()
-                );
+                rt.reset_block(VOCAB, &mut ts.rng, params);
+                continue 'attempt;
             }
-            let stats = crate::generate::BlockDenoiseStats {
+            // Budget spent: abandon without the block_done notification —
+            // this canvas must never reach a streamer as final.
+            abandon_turn = true;
+            break 'attempt (
+                st,
+                block_step_count,
+                accept_hist,
+                min_entropy_hist,
+                mean_entropy_hist,
+                low_ent_hist,
+                last_denoise_stop,
+            );
+        }
+        // Accepted: notify streamers that this block's active argmax is final.
+        if let Some(ref observer) = cfg.step_observer {
+            observer(&StepProgressEvent {
                 block_idx,
                 max_blocks,
-                steps_eff: block_step_count,
-                denoise_secs: block_elapsed.as_secs_f64(),
-                accept_per_step: accept_hist,
-                min_ent_per_step: min_entropy_hist,
-                mean_ent_per_step: mean_entropy_hist,
-                low_ent_per_step: low_ent_hist,
-                late_accept_sum: late_accept,
-                late_min_ent,
-                late_mean_ent,
-                late_max_low_ent: late_low_ent,
-                denoise_stop: if cancelled {
-                    "cancelled".to_string()
-                } else {
-                    "non_converged_abandon".to_string()
-                },
-                kept_tokens: 0,
-                token_ids: Vec::new(),
-                stop_token_id: None,
-                stop_offset: None,
-                continued_past_stop: false,
-            };
-            if let Some(ref obs) = cfg.block_commit_observer {
-                obs(&stats);
-            }
-            block_stats.push(stats);
-            break;
+                step_in_block: block_step_count,
+                max_steps,
+                argmax: &st.prev_argmax[..active],
+                accept_count: accept_hist.last().copied().unwrap_or(0),
+                mean_entropy: st.mean_entropy,
+                block_done: true,
+            });
         }
+        break 'attempt (
+            st,
+            block_step_count,
+            accept_hist,
+            min_entropy_hist,
+            mean_entropy_hist,
+            low_ent_hist,
+            last_denoise_stop,
+        );
+    };
+    let block_elapsed = block_started.elapsed();
+    ts.denoise_elapsed += block_elapsed;
+    ts.block_steps_eff.push(block_step_count);
+    ts.last_block_accept_hist = accept_hist.clone();
+    ts.last_block_min_entropy_hist = min_entropy_hist.clone();
+    let late = accept_hist.len().saturating_sub(8);
+    let late_accept: u32 = accept_hist.get(late..).unwrap_or(&[]).iter().sum();
+    let late_min_ent = min_entropy_hist
+        .get(late..)
+        .and_then(|s| s.iter().copied().reduce(f32::min))
+        .unwrap_or(f32::NAN);
+    let late_low_ent = low_ent_hist
+        .get(late..)
+        .and_then(|s| s.iter().copied().reduce(u32::max))
+        .unwrap_or(0);
+    let late_mean_ent = mean_entropy_hist
+        .get(late..)
+        .and_then(|s| s.iter().copied().reduce(f32::min))
+        .unwrap_or(f32::NAN);
+    if progress_enabled() {
+        eprintln!(
+            "step-generate: block {} denoise={block_elapsed:.2?} steps_eff={block_step_count} accept/step={accept_hist:?}",
+            block_idx
+        );
+        eprintln!(
+            "step-generate: block {} min_ent/step={min_entropy_hist:?}",
+            block_idx
+        );
+        eprintln!(
+            "step-generate: block {} mean_ent/step={mean_entropy_hist:?}",
+            block_idx
+        );
+        eprintln!(
+            "step-generate: block {} low_ent(<0.1)/step={low_ent_hist:?}",
+            block_idx
+        );
+        eprintln!(
+            "step-generate: block {} late-window (last 8 steps): accept_sum={late_accept} min_ent={late_min_ent:.4} mean_ent={late_mean_ent:.4} max_low_ent={late_low_ent} (early stop: accept plateau>={} or prefix mean_ent<{:.4} + stable argmax)",
+            block_idx,
+            crate::sample::ACCEPT_PLATEAU_THRESHOLD,
+            cfg.sampler.confidence_threshold,
+        );
+    }
+    if final_entropy_log_enabled() {
+        log_final_per_token_entropy(
+            &format!("block {block_idx} final"),
+            &st,
+            st.stop_flag,
+            rt.read_params().eos_token_id,
+        );
+    }
 
-        // The committed block is only the ACTIVE canvas rows (shrink-on-retry
-        // narrows a degenerate first block); rows [active..CANVAS) are stale
-        // sentinels. `rt.active_canvas()` after the loop is the successful
-        // attempt's width (no set_active_canvas ran after its break).
-        let committed_canvas = rt.active_canvas();
-        let argmax_tokens: Vec<u32> = st.prev_argmax[..committed_canvas].to_vec();
-        let block_base = sequences.len();
-        sequences.extend_from_slice(&argmax_tokens);
-        blocks_committed += 1;
-
-        let mut stats = crate::generate::BlockDenoiseStats {
+    // Commit-guard abandon: the block ran out of schedule AND retries while
+    // non-converged. Commit nothing (the canvas is the garble attractor),
+    // record the failed block's stats for diagnosis, and end the turn with
+    // whatever earlier blocks produced.
+    if abandon_turn {
+        if ts.cancelled {
+            eprintln!(
+                "step-generate: block {block_idx} cancelled after {block_step_count} steps; ending turn without committing ({} new tokens kept)",
+                ts.new_tokens()
+            );
+        } else {
+            eprintln!(
+                "step-generate: block {block_idx} NON-CONVERGED after {} re-rolls (late mean_ent={late_mean_ent:.3} > {}); ending turn without committing ({} new tokens kept)",
+                crate::flags::block_commit_retry(),
+                crate::flags::block_commit_max_ent(),
+                ts.new_tokens()
+            );
+        }
+        let stats = crate::generate::BlockDenoiseStats {
             block_idx,
             max_blocks,
             steps_eff: block_step_count,
@@ -1384,146 +1552,147 @@ pub fn generate_with_session(
             late_min_ent,
             late_mean_ent,
             late_max_low_ent: late_low_ent,
-            denoise_stop: denoise_stop.as_str().to_string(),
-            kept_tokens: committed_canvas,
+            denoise_stop: if ts.cancelled {
+                "cancelled".to_string()
+            } else {
+                "non_converged_abandon".to_string()
+            },
+            kept_tokens: 0,
             token_ids: Vec::new(),
             stop_token_id: None,
             stop_offset: None,
             continued_past_stop: false,
         };
-
-        // Full-message stop: end the turn as soon as the committed block emits a
-        // stop token (e.g. <turn|> or <eos>). Trim it and everything after so the
-        // reply is exactly the model's turn, and skip the KV extend — unless
-        // `continue_incomplete_tool_calls` and the reply still looks unfinished
-        // (open `call:NAME{…}`, or trailing prose after a closed tool call).
-        let mut end_turn = false;
-        if !cfg.stop_token_ids.is_empty() {
-            if let Some(rel) = argmax_tokens
-                .iter()
-                .position(|id| cfg.stop_token_ids.contains(id))
-            {
-                sequences.truncate(block_base + rel);
-                stats.kept_tokens = rel;
-                stats.stop_token_id = Some(argmax_tokens[rel]);
-                stats.stop_offset = Some(rel);
-
-                let defer_stop = cfg.continue_incomplete_tool_calls && {
-                    if session.step_text_tokenizer.is_none() {
-                        let tok_path = session.model_dir.join("tokenizer.json");
-                        if let Ok(tok) = Tokenizer::load(&tok_path) {
-                            session.step_text_tokenizer = Some(tok);
-                        }
-                    }
-                    let reply = &sequences[prompt_token_ids.len()..];
-                    let cleaned = crate::sample::strip_degenerate_token_ids(reply);
-                    session.step_text_tokenizer.as_ref().is_some_and(|tok| {
-                        crate::tools::should_continue_past_stop(&tok.decode(&cleaned))
-                    })
-                };
-
-                if defer_stop {
-                    stats.continued_past_stop = true;
-                    eprintln!(
-                        "serve: unfinished tool turn after stop token {}; continuing to next block",
-                        argmax_tokens[rel],
-                    );
-                } else {
-                    stopped_on_eot = true;
-                    stop_token_id = Some(argmax_tokens[rel]);
-                    stop_block_idx = Some(block_idx);
-                    stop_offset = Some(rel);
-                    end_turn = true;
-                    if progress_enabled() {
-                        eprintln!(
-                            "step-generate: block {block_idx} hit stop token {} at offset {rel}; ending turn ({} new tokens)",
-                            argmax_tokens[rel],
-                            sequences.len() - prompt_token_ids.len()
-                        );
-                    }
-                }
-            }
-        }
-        let kept = stats.kept_tokens;
-        stats.token_ids = argmax_tokens[..kept].to_vec();
         if let Some(ref obs) = cfg.block_commit_observer {
             obs(&stats);
         }
-        block_stats.push(stats);
-        if end_turn {
-            break;
-        }
-        let extend_tokens = &argmax_tokens[..kept];
-
-        // Whitespace-collapse STOPGAP (opt-in, see flags::ws_block_stop_enabled:
-        // the attractor is being treated as an unfixed bug and a default-on
-        // stopper would hide the evidence): a committed block whose text is
-        // pure whitespace / all pad-filler ends the turn instead of crawling
-        // toward the context wall at max_steps per block.
-        if crate::flags::ws_block_stop_enabled() {
-            let cleaned = crate::sample::strip_degenerate_token_ids(extend_tokens);
-            let all_ws = cleaned.is_empty()
-                || session
-                    .step_text_tokenizer
-                    .as_ref()
-                    .is_some_and(|tok| tok.decode(&cleaned).trim().is_empty());
-            if all_ws {
-                sequences.truncate(block_base);
-                if progress_enabled() {
-                    eprintln!(
-                        "step-generate: block {block_idx} committed pure whitespace; ending turn (DGQ_WS_BLOCK_STOP, {} new tokens kept)",
-                        sequences.len() - prompt_token_ids.len()
-                    );
-                }
-                break;
-            }
-        }
-
-        if !is_last_block && kept > 0 {
-            let extend_started = Instant::now();
-            let kv_before = rt.read_params().kv_len as usize;
-            let new_kv_len = if crate::flags::fast_block_extend_enabled() {
-                // Fast quantized causal extend of the committed canvas — the
-                // same offset-resume as the cross-turn delta prefill. The
-                // engine extend costs ~10s per 256-token block (the dominant
-                // cost of multi-block replies); this is one prefill-chunk
-                // forward (~0.85s).
-                rt.prefill_chunks_from(kv_before, extend_tokens)?
-            } else {
-                if session.encoder.is_none() {
-                    session.encoder = Some(MonolithicEncoderCache::open_opt(
-                        model_dir,
-                        canvas_len,
-                        cfg.max_seq,
-                        Some(std::sync::Arc::clone(&shared_blob)),
-                    )?);
-                }
-                let encoder = session.encoder.as_mut().expect("encoder cache");
-                extend_monolithic_kv_with_cache(
-                    encoder,
-                    rt.kvcache(),
-                    rt.layout(),
-                    kv_before,
-                    extend_tokens,
-                    cfg.max_seq,
-                    layers,
-                )?
-            };
-            rt.set_kv_len(new_kv_len as u32);
-            let block_extend = extend_started.elapsed();
-            extend_elapsed += block_extend;
-            if progress_enabled() {
-                eprintln!(
-                    "step-generate: extended kv {kv_before} -> {new_kv_len} (+{} tokens) ({block_extend:.2?})",
-                    extend_tokens.len()
-                );
-            }
-        }
+        ts.block_stats.push(stats);
+        return Ok(if ts.cancelled {
+            BlockOutcome::Cancelled
+        } else {
+            BlockOutcome::Abandoned
+        });
     }
 
-    if progress_enabled() && !session_telemetry.steps.is_empty() {
-        let n = session_telemetry.steps.len().max(1) as f64;
-        let agg = session_telemetry.aggregate_forward();
+    // The proposed block is only the ACTIVE canvas rows (shrink-on-retry
+    // narrows a degenerate first block); rows [active..CANVAS) are stale
+    // sentinels. `rt.active_canvas()` after the loop is the successful
+    // attempt's width (no set_active_canvas ran after its break).
+    let committed_canvas = rt.active_canvas();
+    let argmax_tokens: Vec<u32> = st.prev_argmax[..committed_canvas].to_vec();
+
+    let stats = crate::generate::BlockDenoiseStats {
+        block_idx,
+        max_blocks,
+        steps_eff: block_step_count,
+        denoise_secs: block_elapsed.as_secs_f64(),
+        accept_per_step: accept_hist,
+        min_ent_per_step: min_entropy_hist,
+        mean_ent_per_step: mean_entropy_hist,
+        low_ent_per_step: low_ent_hist,
+        late_accept_sum: late_accept,
+        late_min_ent,
+        late_mean_ent,
+        late_max_low_ent: late_low_ent,
+        denoise_stop: denoise_stop.as_str().to_string(),
+        kept_tokens: committed_canvas,
+        token_ids: Vec::new(),
+        stop_token_id: None,
+        stop_offset: None,
+        continued_past_stop: false,
+    };
+    Ok(BlockOutcome::Proposal(Box::new(ProposedBlock {
+        token_ids: argmax_tokens,
+        stats,
+        block_idx,
+    })))
+}
+
+/// Commit `kept` tokens of a proposal: append them to the token log, finalize
+/// and record the block stats, and (when `extend`) re-encode the kept prefix
+/// causally into KV. `extend: false` matches the monolithic contract for
+/// turn-final blocks — the canvas KV is bidirectional, so the next turn
+/// re-prefills it as prompt content.
+pub fn commit_block(
+    session: &mut StepGenerateSession,
+    cfg: &StepGenerateConfig,
+    ts: &mut TurnState,
+    mut pb: ProposedBlock,
+    kept: usize,
+    extend: bool,
+) -> Result<(), Error> {
+    if kept > pb.token_ids.len() {
+        return Err(Error::Runtime("commit_block: kept_len exceeds proposal"));
+    }
+    let canvas_len = CANVAS;
+    let layers = session.layers;
+    let block_base = ts.sequences.len();
+    ts.sequences.extend_from_slice(&pb.token_ids[..kept]);
+    ts.blocks_committed += 1;
+    pb.stats.kept_tokens = kept;
+    pb.stats.token_ids = pb.token_ids[..kept].to_vec();
+    if let Some(ref obs) = cfg.block_commit_observer {
+        obs(&pb.stats);
+    }
+    ts.block_stats.push(pb.stats);
+
+    if extend && kept > 0 {
+        let model_dir = session.model_dir.as_path();
+        let shared_blob = session.rt.shared_dgq_blob();
+        let rt = &mut session.rt;
+        let extend_tokens = &ts.sequences[block_base..];
+        let extend_started = Instant::now();
+        let kv_before = rt.read_params().kv_len as usize;
+        let new_kv_len = if crate::flags::fast_block_extend_enabled() {
+            // Fast quantized causal extend of the committed canvas — the
+            // same offset-resume as the cross-turn delta prefill. The
+            // engine extend costs ~10s per 256-token block (the dominant
+            // cost of multi-block replies); this is one prefill-chunk
+            // forward (~0.85s).
+            rt.prefill_chunks_from(kv_before, extend_tokens)?
+        } else {
+            if session.encoder.is_none() {
+                session.encoder = Some(MonolithicEncoderCache::open_opt(
+                    model_dir,
+                    canvas_len,
+                    cfg.max_seq,
+                    Some(std::sync::Arc::clone(&shared_blob)),
+                )?);
+            }
+            let encoder = session.encoder.as_mut().expect("encoder cache");
+            extend_monolithic_kv_with_cache(
+                encoder,
+                rt.kvcache(),
+                rt.layout(),
+                kv_before,
+                extend_tokens,
+                cfg.max_seq,
+                layers,
+            )?
+        };
+        rt.set_kv_len(new_kv_len as u32);
+        let block_extend = extend_started.elapsed();
+        ts.extend_elapsed += block_extend;
+        if progress_enabled() {
+            eprintln!(
+                "step-generate: extended kv {kv_before} -> {new_kv_len} (+{} tokens) ({block_extend:.2?})",
+                extend_tokens.len()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Close the turn: record `kv_valid_tokens` (the causal contract the next
+/// turn's cross-turn reuse diffs against) and assemble the output.
+pub fn finish_turn(
+    session: &mut StepGenerateSession,
+    cfg: &StepGenerateConfig,
+    ts: TurnState,
+) -> Result<GenerateOutput, Error> {
+    if progress_enabled() && !ts.session_telemetry.steps.is_empty() {
+        let n = ts.session_telemetry.steps.len().max(1) as f64;
+        let agg = ts.session_telemetry.aggregate_forward();
         eprintln!(
             "step-generate: P2.1 hot path mean {:.2} syncs/step, {:.1} KiB readback/step (DGQ_CHECK_LOGITS for opt-in logits scan)",
             agg.gpu_syncs as f64 / n,
@@ -1536,42 +1705,42 @@ pub fn generate_with_session(
     // final (last/stopped) block's canvas KV is bidirectional, so it is NOT
     // counted — the next turn re-prefills it as prompt content. This is what
     // the next turn's cross-turn reuse diffs against.
-    let valid_len = (rt.read_params().kv_len as usize).min(sequences.len());
-    session.kv_valid_tokens = sequences[..valid_len].to_vec();
+    let valid_len = (session.rt.read_params().kv_len as usize).min(ts.sequences.len());
+    session.kv_valid_tokens = ts.sequences[..valid_len].to_vec();
 
     Ok(GenerateOutput {
-        token_ids: sequences.clone(),
-        denoise_steps_run,
-        blocks_committed,
-        cancelled,
-        stopped_on_eot,
-        stop_token_id,
-        stop_block_idx,
-        stop_offset,
-        block_stats,
-        block_steps_eff,
-        last_block_accept_hist,
-        last_block_min_entropy_hist,
-        prefill_elapsed,
-        denoise_elapsed,
-        extend_elapsed,
-        session_telemetry,
+        token_ids: ts.sequences.clone(),
+        denoise_steps_run: ts.denoise_steps_run,
+        blocks_committed: ts.blocks_committed,
+        cancelled: ts.cancelled,
+        stopped_on_eot: ts.stopped_on_eot,
+        stop_token_id: ts.stop_token_id,
+        stop_block_idx: ts.stop_block_idx,
+        stop_offset: ts.stop_offset,
+        block_stats: ts.block_stats,
+        block_steps_eff: ts.block_steps_eff,
+        last_block_accept_hist: ts.last_block_accept_hist,
+        last_block_min_entropy_hist: ts.last_block_min_entropy_hist,
+        prefill_elapsed: ts.prefill_elapsed,
+        denoise_elapsed: ts.denoise_elapsed,
+        extend_elapsed: ts.extend_elapsed,
+        session_telemetry: ts.session_telemetry,
         denoise_trace: Some(DenoiseTrace {
             schema_version: SCHEMA_VERSION,
             source: "rust-monolithic".into(),
-            prompt: prompt_label.to_string(),
-            prompt_token_ids: prompt_token_ids.to_vec(),
+            prompt: ts.label,
+            prompt_token_ids: ts.prompt_token_ids,
             seed: cfg.seed,
-            max_denoise_steps: max_steps,
-            layers,
+            max_denoise_steps: ts.max_steps,
+            layers: session.layers,
             max_new_tokens: cfg.max_new_tokens,
             weights_profile: Some(crate::generate_golden::monolithic_weights_profile().into()),
             entropy_bound: cfg.sampler.entropy_bound,
-            step_traces,
-            denoise_steps_run,
-            blocks_committed,
-            output_token_ids: sequences.clone(),
-            initial_canvas_ids,
+            step_traces: ts.step_traces,
+            denoise_steps_run: ts.denoise_steps_run,
+            blocks_committed: ts.blocks_committed,
+            output_token_ids: ts.sequences,
+            initial_canvas_ids: ts.initial_canvas_ids,
             canvas_rng: Some("rust-lcg".into()),
         }),
     })

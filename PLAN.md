@@ -88,6 +88,23 @@ the freeze lesson applies to reject-masks). Later: multi-conv absorption,
 Reground, lineage-drift gate. Every phase: golden 8/8 + suite; behavior
 changes additionally smoketest ×{7,42,123}.
 
+**P2 per-block propose/commit (SHIPPED):** `generate_with_session`
+decomposed into `begin_turn` (prefill selection) / `propose_block` (one
+block's attempt loop, E6 + commit-guard re-rolls intact, commits
+nothing) / `commit_block(kept_len, extend)` / `finish_turn`
+(`kv_valid_tokens` + output) in step_generate.rs, with the monolithic
+path now a thin driver over exactly those primitives
+(`default_commit_policy` = stop-scan/defer/ws-guard). Pipeline ops:
+`BeginTurn`/`ProposeBlock` (event carries the argmax + advisory
+stop-scan)/`CommitBlock {kept_len, extend}`/`DiscardBlock`/`EndTurn`;
+lineage-mutating ops are rejected while a turn is open. Gates:
+`per_block_ops_match_monolithic_generate` (byte-identical to the
+whole-turn op), `per_block_partial_commit_and_discard_consistency`
+(partial commit + discard leave zero residue past a rewind), golden 8/8
+byte-identical post-decomposition. Notes: op-driven turns report stop
+metadata only via block stats (`stopped_on_eot` is driver policy); the
+message layer (P4) owns grammar-aware kept_len.
+
 **Cancel (SHIPPED):** a `CancelToken` rides in `StepGenerateConfig` the
 same way the observer Arcs do (works through any stage chain, per-op
 scoped so no reset races). Checked between denoise steps and between

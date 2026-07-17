@@ -68,8 +68,9 @@ pub use probe::{print_probe_result, probe_device};
 pub use step_attn_dump::{run_step_attn_layer_dump, write_step_attn_layer_dump};
 pub use step_config::{log_validated_step_model, validate_step_model};
 pub use step_generate::{
-    CancelToken, KvSnapshot, StepGenerateConfig, StepGenerateSession, StepObserver,
-    StepProgressEvent, generate_monolithic, generate_with_session,
+    BlockOutcome, CancelToken, KvSnapshot, ProposedBlock, StepGenerateConfig, StepGenerateSession,
+    StepObserver, StepProgressEvent, TurnState, begin_turn, commit_block, finish_turn,
+    generate_monolithic, generate_with_session, propose_block,
 };
 pub use step_kernel::{
     CANVAS, CanvasState, EncodeSubProfileResult, FROZEN_WORDS, HID, LayerEncodeSubProfile,

@@ -6,7 +6,12 @@
 //! through an input queue of ops and an output queue of events. Current
 //! clients: `ask` (Generate), `chat` (Generate per turn), `serve`
 //! (Activate / Generate / Finalize / AlignTo / Mark+Rewind for
-//! tool-compact). The per-block propose/commit protocol is P2.
+//! tool-compact). The per-block protocol
+//! (BeginTurn/ProposeBlock/CommitBlock/DiscardBlock/EndTurn) exposes each
+//! uncommitted canvas for inspection: partial commit covers
+//! good-prefix/bad-tail, discard re-rolls from fresh noise, and `Generate`
+//! remains the whole-turn composite over the identical primitives
+//! (equivalence pinned byte-exactly by `per_block_ops_match_monolithic_generate`).
 //!
 //! KV identity: [`KvId`] = (epoch, position). Lineage-invalidating ops
 //! (today: `Rewind`) bump the epoch; a rewind to a stale-epoch id fails
@@ -79,6 +84,32 @@ pub enum PipelineOp {
     AlignTo {
         target: Vec<u32>,
     },
+    /// Open a per-block turn: prefill `prompt`, then drive generation with
+    /// `ProposeBlock`/`CommitBlock`/`DiscardBlock`, closing with `EndTurn`.
+    /// While a turn is open, lineage-mutating ops are rejected. `Generate`
+    /// remains the whole-turn composite (identical machinery, default policy).
+    BeginTurn {
+        prompt: Vec<u32>,
+        cfg: Box<crate::metal::StepGenerateConfig>,
+        label: String,
+    },
+    /// Denoise one block WITHOUT committing it. The `Proposed` event carries
+    /// the canvas argmax for inspection; nothing lands in the token log or
+    /// causal KV until `CommitBlock`.
+    ProposeBlock,
+    /// Commit `kept_len` tokens of the pending proposal (partial commit =
+    /// good-prefix/bad-tail). `extend: false` skips the causal KV re-encode —
+    /// the monolithic contract for turn-final blocks.
+    CommitBlock {
+        kept_len: usize,
+        extend: bool,
+    },
+    /// Drop the pending proposal; the next `ProposeBlock` re-rolls the canvas
+    /// from fresh noise (the rng advances every attempt).
+    DiscardBlock,
+    /// Close the open turn: record `kv_valid_tokens` and return the assembled
+    /// `Generated` output (same shape as the whole-turn op).
+    EndTurn,
     Shutdown,
 }
 
@@ -123,6 +154,32 @@ pub enum PipelineEvent {
         kv: KvId,
         reused: usize,
     },
+    /// A turn is open; block ops drive it until `EndTurn`.
+    TurnStarted {
+        kv: KvId,
+    },
+    /// An uncommitted block awaits the commit decision. `stop` is the
+    /// advisory stop-token scan over `cfg.stop_token_ids`: (offset, id).
+    Proposed {
+        ids: Vec<u32>,
+        stop: Option<(usize, u32)>,
+        steps_eff: u32,
+        late_mean_ent: f32,
+        kv: KvId,
+    },
+    /// No further proposals will come (budget spent, commit-guard abandon, or
+    /// cancel); `EndTurn` collects the output.
+    TurnStalled {
+        reason: &'static str,
+        kv: KvId,
+    },
+    BlockCommitted {
+        kv: KvId,
+        new_tokens: usize,
+    },
+    BlockDiscarded {
+        kv: KvId,
+    },
     Error(String),
     ShutDown,
 }
@@ -157,6 +214,28 @@ impl std::fmt::Debug for PipelineEvent {
             Self::Aligned { kv, reused } => {
                 write!(f, "Aligned {{ kv: {kv:?}, reused: {reused} }}")
             }
+            Self::TurnStarted { kv } => write!(f, "TurnStarted {{ kv: {kv:?} }}"),
+            Self::Proposed {
+                ids,
+                stop,
+                steps_eff,
+                late_mean_ent,
+                kv,
+            } => write!(
+                f,
+                "Proposed {{ tokens: {}, stop: {stop:?}, steps_eff: {steps_eff}, late_mean_ent: {late_mean_ent:.3}, kv: {kv:?} }}",
+                ids.len()
+            ),
+            Self::TurnStalled { reason, kv } => {
+                write!(f, "TurnStalled {{ reason: {reason:?}, kv: {kv:?} }}")
+            }
+            Self::BlockCommitted { kv, new_tokens } => {
+                write!(
+                    f,
+                    "BlockCommitted {{ kv: {kv:?}, new_tokens: {new_tokens} }}"
+                )
+            }
+            Self::BlockDiscarded { kv } => write!(f, "BlockDiscarded {{ kv: {kv:?} }}"),
             Self::Error(msg) => write!(f, "Error({msg:?})"),
             Self::ShutDown => write!(f, "ShutDown"),
         }
@@ -229,6 +308,13 @@ impl PipelineOp {
                 format!("{{\"finalize\":[{conv_id},{}]}}", canonical.len())
             }
             Self::AlignTo { target } => format!("{{\"align_to\":{}}}", target.len()),
+            Self::BeginTurn { prompt, .. } => format!("{{\"begin_turn\":{}}}", prompt.len()),
+            Self::ProposeBlock => "\"propose_block\"".into(),
+            Self::CommitBlock { kept_len, extend } => {
+                format!("{{\"commit_block\":[{kept_len},{extend}]}}")
+            }
+            Self::DiscardBlock => "\"discard_block\"".into(),
+            Self::EndTurn => "\"end_turn\"".into(),
             Self::Shutdown => "\"shutdown\"".into(),
         }
     }
@@ -332,7 +418,37 @@ fn run_pipeline(
         pos: manager.session_mut().kv_valid_tokens().len(),
     };
 
+    // Per-block turn state: at most one open turn, at most one pending
+    // proposal. Lineage-mutating ops are rejected while a turn is open —
+    // the turn's TurnState and the session would silently diverge otherwise.
+    let mut turn: Option<Box<crate::metal::TurnState>> = None;
+    let mut turn_cfg: Option<Box<crate::metal::StepGenerateConfig>> = None;
+    let mut pending: Option<Box<crate::metal::ProposedBlock>> = None;
+    fn conflicts_with_open_turn(op: &PipelineOp) -> bool {
+        matches!(
+            op,
+            PipelineOp::Extend(_)
+                | PipelineOp::Generate { .. }
+                | PipelineOp::Rewind(_)
+                | PipelineOp::SyntheticFill { .. }
+                | PipelineOp::Activate { .. }
+                | PipelineOp::Finalize { .. }
+                | PipelineOp::AlignTo { .. }
+                | PipelineOp::BeginTurn { .. }
+        )
+    }
+
     while let Ok(op) = op_rx.recv() {
+        if turn.is_some() && conflicts_with_open_turn(&op) {
+            let refused = PipelineEvent::Error(format!(
+                "op rejected while a turn is open (end or discard first): {}",
+                op.log_line()
+            ));
+            if ev_tx.send(refused).is_err() {
+                return;
+            }
+            continue;
+        }
         let event = match op {
             PipelineOp::Extend(ids) => match manager.session_mut().extend_kv(&ids) {
                 Ok(()) => PipelineEvent::Extended {
@@ -438,6 +554,115 @@ fn run_pipeline(
                     Err(err) => PipelineEvent::Error(format!("align: {err}")),
                 }
             }
+            PipelineOp::BeginTurn { prompt, cfg, label } => {
+                let mut cfg = *cfg;
+                cfg.layers = layers;
+                cfg.max_seq = max_seq;
+                match crate::metal::begin_turn(manager.session_mut(), &prompt, &cfg, &label) {
+                    Ok(ts) => {
+                        turn = Some(Box::new(ts));
+                        turn_cfg = Some(Box::new(cfg));
+                        PipelineEvent::TurnStarted {
+                            kv: kv_id(epoch, &mut manager),
+                        }
+                    }
+                    Err(err) => PipelineEvent::Error(format!("begin_turn: {err}")),
+                }
+            }
+            PipelineOp::ProposeBlock => match (turn.as_mut(), turn_cfg.as_ref()) {
+                _ if pending.is_some() => PipelineEvent::Error(
+                    "propose_block: proposal pending (commit or discard first)".into(),
+                ),
+                (Some(ts), Some(cfg)) => {
+                    match crate::metal::propose_block(manager.session_mut(), cfg, ts) {
+                        Ok(crate::metal::BlockOutcome::Proposal(pb)) => {
+                            let stop = pb
+                                .token_ids
+                                .iter()
+                                .position(|id| cfg.stop_token_ids.contains(id))
+                                .map(|off| (off, pb.token_ids[off]));
+                            let ev = PipelineEvent::Proposed {
+                                ids: pb.token_ids.clone(),
+                                stop,
+                                steps_eff: pb.stats.steps_eff,
+                                late_mean_ent: pb.stats.late_mean_ent,
+                                kv: kv_id(epoch, &mut manager),
+                            };
+                            pending = Some(pb);
+                            ev
+                        }
+                        Ok(outcome) => PipelineEvent::TurnStalled {
+                            reason: match outcome {
+                                crate::metal::BlockOutcome::Exhausted => "exhausted",
+                                crate::metal::BlockOutcome::Abandoned => "abandoned",
+                                crate::metal::BlockOutcome::Cancelled => "cancelled",
+                                crate::metal::BlockOutcome::Proposal(_) => unreachable!(),
+                            },
+                            kv: kv_id(epoch, &mut manager),
+                        },
+                        Err(err) => PipelineEvent::Error(format!("propose_block: {err}")),
+                    }
+                }
+                _ => PipelineEvent::Error("propose_block: no open turn".into()),
+            },
+            PipelineOp::CommitBlock { kept_len, extend } => {
+                if pending
+                    .as_ref()
+                    .is_some_and(|pb| kept_len > pb.token_ids.len())
+                {
+                    PipelineEvent::Error(format!(
+                        "commit_block: kept_len {kept_len} exceeds proposal ({})",
+                        pending.as_ref().map_or(0, |pb| pb.token_ids.len())
+                    ))
+                } else {
+                    match (turn.as_mut(), turn_cfg.as_ref(), pending.take()) {
+                        (Some(ts), Some(cfg), Some(pb)) => match crate::metal::commit_block(
+                            manager.session_mut(),
+                            cfg,
+                            ts,
+                            *pb,
+                            kept_len,
+                            extend,
+                        ) {
+                            Ok(()) => PipelineEvent::BlockCommitted {
+                                kv: kv_id(epoch, &mut manager),
+                                new_tokens: turn.as_ref().expect("turn open").new_tokens(),
+                            },
+                            Err(err) => PipelineEvent::Error(format!("commit_block: {err}")),
+                        },
+                        (_, _, None) => {
+                            PipelineEvent::Error("commit_block: no pending proposal".into())
+                        }
+                        _ => PipelineEvent::Error("commit_block: no open turn".into()),
+                    }
+                }
+            }
+            PipelineOp::DiscardBlock => {
+                if pending.take().is_some() {
+                    PipelineEvent::BlockDiscarded {
+                        kv: kv_id(epoch, &mut manager),
+                    }
+                } else {
+                    PipelineEvent::Error("discard_block: no pending proposal".into())
+                }
+            }
+            PipelineOp::EndTurn => {
+                if pending.is_some() {
+                    PipelineEvent::Error(
+                        "end_turn: proposal pending (commit or discard first)".into(),
+                    )
+                } else if let (Some(ts), Some(cfg)) = (turn.take(), turn_cfg.take()) {
+                    match crate::metal::finish_turn(manager.session_mut(), &cfg, *ts) {
+                        Ok(out) => PipelineEvent::Generated {
+                            out: Box::new(out),
+                            kv: kv_id(epoch, &mut manager),
+                        },
+                        Err(err) => PipelineEvent::Error(format!("end_turn: {err}")),
+                    }
+                } else {
+                    PipelineEvent::Error("end_turn: no open turn".into())
+                }
+            }
             PipelineOp::Shutdown => {
                 let _ = ev_tx.send(PipelineEvent::ShutDown);
                 return;
@@ -452,6 +677,178 @@ fn run_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The P2 equivalence gate: a client driving
+    /// BeginTurn/ProposeBlock/CommitBlock/EndTurn with the default policy
+    /// (commit everything, mirror the monolithic extend rule) must produce
+    /// byte-identical token ids to the whole-turn Generate op at the same
+    /// seed. Pins the per-block protocol to the path it decomposed.
+    #[test]
+    fn per_block_ops_match_monolithic_generate() {
+        let Some(dir) = crate::shaders::test_util::dgq_model_dir() else {
+            return;
+        };
+        let p = Pipeline::spawn(dir, 4096, 24);
+        let ids: Vec<u32> = (0..400u32).map(|i| 1000 + (i * 7919) % 30000).collect();
+        let PipelineEvent::Extended { kv: mark } = p.call(PipelineOp::Extend(ids.clone())) else {
+            panic!("extend failed");
+        };
+
+        let max_new = 512usize; // two blocks
+        let cfg = || {
+            crate::metal::StepGenerateConfig::from_generate(
+                42,
+                max_new,
+                4096,
+                0, // session-owned; overwritten by the pipeline
+                crate::sample::sampler_for_steps(24, false),
+                false,
+            )
+        };
+        let ev = p.call(PipelineOp::Generate {
+            prompt: ids.clone(),
+            cfg: Box::new(cfg()),
+            label: "p2-mono".into(),
+        });
+        let PipelineEvent::Generated { out: mono, .. } = ev else {
+            panic!("monolithic generate failed: {ev:?}");
+        };
+
+        let PipelineEvent::Rewound { .. } = p.call(PipelineOp::Rewind(mark)) else {
+            panic!("rewind failed");
+        };
+
+        let ev = p.call(PipelineOp::BeginTurn {
+            prompt: ids.clone(),
+            cfg: Box::new(cfg()),
+            label: "p2-ops".into(),
+        });
+        let PipelineEvent::TurnStarted { .. } = ev else {
+            panic!("begin_turn failed: {ev:?}");
+        };
+        let mut new_tokens = 0usize;
+        loop {
+            match p.call(PipelineOp::ProposeBlock) {
+                PipelineEvent::Proposed {
+                    ids: block, stop, ..
+                } => {
+                    let kept = stop.map_or(block.len(), |(off, _)| off);
+                    let end = stop.is_some();
+                    let remaining = max_new - new_tokens;
+                    let is_last = remaining <= 256;
+                    let extend = !end && !is_last && kept > 0;
+                    let ev = p.call(PipelineOp::CommitBlock {
+                        kept_len: kept,
+                        extend,
+                    });
+                    let PipelineEvent::BlockCommitted { new_tokens: n, .. } = ev else {
+                        panic!("commit failed: {ev:?}");
+                    };
+                    new_tokens = n;
+                    if end {
+                        break;
+                    }
+                }
+                PipelineEvent::TurnStalled { .. } => break,
+                ev => panic!("unexpected propose event: {ev:?}"),
+            }
+        }
+        let ev = p.call(PipelineOp::EndTurn);
+        let PipelineEvent::Generated { out: ops, .. } = ev else {
+            panic!("end_turn failed: {ev:?}");
+        };
+        assert_eq!(
+            mono.token_ids, ops.token_ids,
+            "per-block ops diverged from the monolithic path"
+        );
+        assert_eq!(mono.blocks_committed, ops.blocks_committed);
+    }
+
+    /// Partial commit (good-prefix/bad-tail) + discard leave a consistent
+    /// lineage: EndTurn reports exactly the committed prefix, a second
+    /// proposal generates beyond it, lineage-mutating ops are rejected while
+    /// the turn is open, and a rewind past the whole turn restores the base
+    /// fingerprint bit-exactly.
+    #[test]
+    fn per_block_partial_commit_and_discard_consistency() {
+        let Some(dir) = crate::shaders::test_util::dgq_model_dir() else {
+            return;
+        };
+        let p = Pipeline::spawn(dir, 4096, 24);
+        let ids: Vec<u32> = (0..400u32).map(|i| 2000 + (i * 4093) % 30000).collect();
+        let PipelineEvent::Extended { kv: mark } = p.call(PipelineOp::Extend(ids.clone())) else {
+            panic!("extend failed");
+        };
+        let PipelineEvent::Fingerprint { fnv: fp0, .. } = p.call(PipelineOp::KvFingerprint) else {
+            panic!("fingerprint failed");
+        };
+
+        let cfg = crate::metal::StepGenerateConfig::from_generate(
+            7,
+            512,
+            4096,
+            0,
+            crate::sample::sampler_for_steps(24, false),
+            false,
+        );
+        let ev = p.call(PipelineOp::BeginTurn {
+            prompt: ids.clone(),
+            cfg: Box::new(cfg),
+            label: "p2-partial".into(),
+        });
+        let PipelineEvent::TurnStarted { .. } = ev else {
+            panic!("begin_turn failed: {ev:?}");
+        };
+
+        // Rewind is a lineage op: rejected while the turn is open.
+        match p.call(PipelineOp::Rewind(mark)) {
+            PipelineEvent::Error(msg) => {
+                assert!(msg.contains("turn is open"), "wrong error: {msg}")
+            }
+            ev => panic!("rewind during open turn must fail, got {ev:?}"),
+        }
+
+        let PipelineEvent::Proposed { ids: block, .. } = p.call(PipelineOp::ProposeBlock) else {
+            panic!("propose failed");
+        };
+        assert!(!block.is_empty());
+        let kept = block.len() / 2;
+        let ev = p.call(PipelineOp::CommitBlock {
+            kept_len: kept,
+            extend: true,
+        });
+        let PipelineEvent::BlockCommitted { new_tokens, .. } = ev else {
+            panic!("partial commit failed: {ev:?}");
+        };
+        assert_eq!(new_tokens, kept);
+
+        // The next proposal builds on the committed prefix; reject it.
+        let PipelineEvent::Proposed { .. } = p.call(PipelineOp::ProposeBlock) else {
+            panic!("second propose failed");
+        };
+        let PipelineEvent::BlockDiscarded { .. } = p.call(PipelineOp::DiscardBlock) else {
+            panic!("discard failed");
+        };
+
+        let PipelineEvent::Generated { out, .. } = p.call(PipelineOp::EndTurn) else {
+            panic!("end_turn failed");
+        };
+        assert_eq!(
+            out.token_ids.len(),
+            ids.len() + kept,
+            "committed prefix mismatch"
+        );
+        assert_eq!(out.blocks_committed, 1);
+        assert_eq!(&out.token_ids[ids.len()..], &block[..kept]);
+
+        let PipelineEvent::Rewound { .. } = p.call(PipelineOp::Rewind(mark)) else {
+            panic!("rewind after turn failed");
+        };
+        let PipelineEvent::Fingerprint { fnv, .. } = p.call(PipelineOp::KvFingerprint) else {
+            panic!("fingerprint failed");
+        };
+        assert_eq!(fnv, fp0, "partial-commit turn left KV residue");
+    }
 
     /// The standing rewind byte-consistency gate (PLAN "Token pipeline").
     /// Seeded generate -> rewind loops must (a) restore the KV snapshot hash
@@ -687,7 +1084,10 @@ mod tests {
         let PipelineEvent::Generated { out, .. } = ev else {
             panic!("generate failed: {ev:?}");
         };
-        assert!(out.cancelled, "generate ran to completion before the cancel");
+        assert!(
+            out.cancelled,
+            "generate ran to completion before the cancel"
+        );
         assert!(
             out.token_ids.len() < ids.len() + 2048,
             "cancelled generate still produced the full budget"
