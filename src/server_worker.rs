@@ -141,7 +141,6 @@ impl Worker {
 
         let mut cfg = self.per_request_cfg(&job, budget);
         let mapper = self.make_mapper(&job);
-        attach_stream_observer(&mut cfg, &mapper, &job.resp, tool_mode, true);
         let log_seq = self.allocate_log_seq();
         let file_block = Arc::new(AtomicUsize::new(0));
         self.attach_block_commit_logger(&mut cfg, log_seq, &file_block);
@@ -167,6 +166,26 @@ impl Worker {
             "serve: in +{}tok {}",
             delta_ids.len(),
             trunc_preview(&delta_text, 120)
+        );
+
+        // Dry-start status: a big prompt delta means a long, otherwise-silent
+        // prefill before the first streamed delta. Emit a synthetic reasoning
+        // status + heartbeat; the stream observer ends it at the first
+        // denoise step.
+        let prefill_status = (job.stream
+            && crate::flags::prefill_status_enabled()
+            && delta_ids.len() >= PREFILL_STATUS_MIN_TOKENS)
+            .then(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        if let Some(ref started) = prefill_status {
+            spawn_prefill_status(&job.resp, delta_ids.len(), reuse, started);
+        }
+        attach_stream_observer(
+            &mut cfg,
+            &mapper,
+            &job.resp,
+            tool_mode,
+            true,
+            prefill_status,
         );
 
         let out = match stage.call(PipelineOp::Generate {
@@ -554,7 +573,7 @@ impl Worker {
             // generation, and a prior round's stop token must not eat this
             // round's text.
             let mapper = self.make_mapper(&job);
-            attach_stream_observer(&mut cfg, &mapper, &job.resp, true, true);
+            attach_stream_observer(&mut cfg, &mapper, &job.resp, true, true, None);
             self.attach_block_commit_logger(&mut cfg, log_seq, &file_block);
 
             let out = match stage.call(PipelineOp::Generate {

@@ -558,16 +558,66 @@ mod worker;
 
 type ServeMapper = Arc<Mutex<DiffusionStreamMapper<Arc<crate::tokenizer::Tokenizer>>>>;
 
+/// Tokens of un-reused prompt delta below which the prefill status line is
+/// not worth the noise (a sub-second prefill).
+pub(crate) const PREFILL_STATUS_MIN_TOKENS: usize = 1024;
+
+/// The dry-start status: while a large prompt delta prefills, no step
+/// observer fires, so a streaming client sees dead air (OpenCode's silent
+/// cold start). Emit a synthetic `reasoning_content` line + elapsed
+/// heartbeat until the first denoise step sets `started` (the stream
+/// observer flips it and appends a separator). Transient by construction:
+/// the text never enters the mapper, so the final `Done` payload and the
+/// canonical log are untouched.
+pub(crate) fn spawn_prefill_status(
+    resp: &mpsc::Sender<ServerEvent>,
+    delta_tokens: usize,
+    reused: usize,
+    started: &Arc<std::sync::atomic::AtomicBool>,
+) {
+    let resp = resp.clone();
+    let started = Arc::clone(started);
+    std::thread::spawn(move || {
+        let t0 = std::time::Instant::now();
+        let msg = format!("Reading context: {delta_tokens} new tokens ({reused} reused)…");
+        if resp
+            .send(ServerEvent::Delta(WireDelta::Reasoning(msg)))
+            .is_err()
+        {
+            return;
+        }
+        let mut next_tick = 3u64;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            if started.load(Ordering::Relaxed) {
+                return;
+            }
+            let secs = t0.elapsed().as_secs();
+            if secs >= next_tick {
+                next_tick = secs + 3;
+                let tick = ServerEvent::Delta(WireDelta::Reasoning(format!(" {secs}s")));
+                if started.load(Ordering::Relaxed) || resp.send(tick).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+}
+
 /// When `strip_tool_markup` is set, hide `<|tool_call>...` grammar from
 /// streamed content/draft; clients get structured `delta.tool_calls` at Done.
 /// When `log_progress` is set, print a condensed serve progress line every five
 /// denoise steps (and on block commit).
+/// `prefill_status`: the dry-start heartbeat's flag — flipped on the first
+/// denoise step (ending the heartbeat), with a separator delta so the model's
+/// real reasoning starts on its own line.
 fn attach_stream_observer(
     cfg: &mut crate::metal::StepGenerateConfig,
     mapper: &ServeMapper,
     resp: &mpsc::Sender<ServerEvent>,
     strip_tool_markup: bool,
     log_progress: bool,
+    prefill_status: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
     let mapper = Arc::clone(mapper);
     let resp = resp.clone();
@@ -578,6 +628,11 @@ fn attach_stream_observer(
     let cancel = crate::metal::CancelToken::new();
     cfg.cancel = Some(cancel.clone());
     cfg.step_observer = Some(Arc::new(move |ev: &crate::metal::StepProgressEvent<'_>| {
+        if let Some(ref started) = prefill_status
+            && !started.swap(true, Ordering::Relaxed)
+        {
+            let _ = resp.send(ServerEvent::Delta(WireDelta::Reasoning("\n\n".into())));
+        }
         if log_progress
             && (ev.step_in_block == 1 || ev.step_in_block.is_multiple_of(5) || ev.block_done)
         {

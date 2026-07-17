@@ -304,6 +304,10 @@ pub struct ServerFlags {
     pub conv_disk_bytes: usize,
     /// `DGQ_CONV_CACHE_DIR`: SSD tier dir (default per-process temp subdir).
     pub conv_cache_dir: PathBuf,
+    /// `DGQ_PREFILL_STATUS`: streamed requests emit a synthetic
+    /// `reasoning_content` status line + elapsed heartbeat while a large
+    /// prompt delta prefills (the dry-start silence). Default ON; `=0` off.
+    pub prefill_status: bool,
     /// `DGQ_TOOL_COMPACT`: enable the tool-output compactor. Default OFF.
     pub tool_compact: bool,
     /// `DGQ_TOOL_VALIDATE`: serve validates tool-call grammar on every reply
@@ -322,6 +326,7 @@ impl Default for ServerFlags {
             conv_cache_bytes: 0,
             conv_disk_bytes: 0,
             conv_cache_dir: default_conv_cache_dir(),
+            prefill_status: true,
             tool_compact: false,
             tool_validate: false,
             tool_compact_threshold: 384,
@@ -532,6 +537,7 @@ impl RuntimeConfig {
                 conv_cache_dir: std::env::var_os("DGQ_CONV_CACHE_DIR")
                     .map(PathBuf::from)
                     .unwrap_or_else(default_conv_cache_dir),
+                prefill_status: env_on_unless_zero("DGQ_PREFILL_STATUS"),
                 tool_compact: env_on_if_one("DGQ_TOOL_COMPACT"),
                 tool_validate: env_on_if_one("DGQ_TOOL_VALIDATE"),
                 tool_compact_threshold: std::env::var("DGQ_TOOL_COMPACT_THRESHOLD")
@@ -942,6 +948,14 @@ pub fn conv_disk_bytes() -> usize {
 /// Directory for the SSD conversation-snapshot tier (`DGQ_CONV_CACHE_DIR`).
 pub fn conv_cache_dir() -> PathBuf {
     config().server.conv_cache_dir.clone()
+}
+
+/// `DGQ_PREFILL_STATUS` (default ON, `=0` disables): streamed serve requests
+/// emit a synthetic `reasoning_content` status line + elapsed heartbeat while
+/// a large prompt delta prefills — the dry-start would otherwise be silent
+/// until the first denoise step.
+pub fn prefill_status_enabled() -> bool {
+    config().server.prefill_status
 }
 
 /// `DGQ_TOOL_VALIDATE=1`: serve rewinds + regenerates (bumped seed) when a
