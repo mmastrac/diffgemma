@@ -867,17 +867,30 @@ fn run_pipeline(
             PipelineOp::Activate { prompt } => {
                 let conv_id = manager.activate(&prompt);
                 epoch += 1;
-                let reused = manager
-                    .session_mut()
+                let session = manager.session_mut();
+                let reused = session
                     .kv_valid_tokens()
                     .iter()
                     .zip(prompt.iter())
                     .take_while(|(a, b)| a == b)
                     .count();
-                PipelineEvent::Activated {
-                    conv_id,
-                    kv: kv_id(epoch, &mut manager),
-                    reused,
+                // KV-reuse-first tail salvage: routing may match a
+                // conversation whose log diverges from the prompt in its
+                // tail. Truncate the resident KV to the common prefix so
+                // every downstream consumer (reuse guard, delta prefill)
+                // sees a clean extend — O(1) inside the routing slack.
+                let salvage = if reused < session.kv_valid_tokens().len() {
+                    session.truncate_kv_to(reused).err()
+                } else {
+                    None
+                };
+                match salvage {
+                    None => PipelineEvent::Activated {
+                        conv_id,
+                        kv: kv_id(epoch, &mut manager),
+                        reused,
+                    },
+                    Some(err) => PipelineEvent::Error(format!("activate salvage: {err}")),
                 }
             }
             PipelineOp::Finalize { conv_id, canonical } => {
@@ -1245,6 +1258,76 @@ mod tests {
             );
         }
         let _ = std::fs::remove_file(&log_path);
+    }
+
+    /// The KV-reuse-first salvage gate: a follow-up prompt that diverges from
+    /// the finalized conversation only in its tail must route BACK to that
+    /// conversation with the shared prefix reused (truncate-to-LCP on
+    /// activate) — not fork a fresh conversation with reused: 0, which was
+    /// the OpenCode full-re-prefill-per-tool-turn bug. Deep divergence still
+    /// declines (a rebuild-depth truncate costs a fresh prefill anyway).
+    #[test]
+    fn activate_salvages_tail_divergent_conversation() {
+        let Some(dir) = crate::shaders::test_util::dgq_model_dir() else {
+            return;
+        };
+        let p = Pipeline::spawn(dir, 4096, 24);
+        let canonical: Vec<u32> = (0..600u32).map(|i| 1000 + (i * 3571) % 30000).collect();
+
+        let ev = p.call(PipelineOp::Activate {
+            prompt: canonical.clone(),
+        });
+        let PipelineEvent::Activated {
+            conv_id, reused, ..
+        } = ev
+        else {
+            panic!("first activate failed: {ev:?}");
+        };
+        assert_eq!(reused, 0);
+        let PipelineEvent::Finalized { kv } = p.call(PipelineOp::Finalize {
+            conv_id,
+            canonical: canonical.clone(),
+        }) else {
+            panic!("finalize failed");
+        };
+        assert_eq!(kv.pos, canonical.len());
+
+        // Follow-up whose last 40 canonical tokens were re-rendered.
+        let mut next = canonical[..560].to_vec();
+        next.extend((0..240u32).map(|i| 7000 + i));
+        let ev = p.call(PipelineOp::Activate { prompt: next });
+        let PipelineEvent::Activated {
+            conv_id: id2,
+            reused,
+            kv,
+        } = ev
+        else {
+            panic!("salvage activate failed: {ev:?}");
+        };
+        assert_eq!(id2, conv_id, "tail divergence must salvage, not fork");
+        assert_eq!(reused, 560, "shared prefix not reused");
+        assert_eq!(
+            kv.pos, 560,
+            "resident KV not truncated to the shared prefix"
+        );
+
+        // Divergence far above the tail slack: fresh conversation.
+        let mut deep = canonical[..100].to_vec();
+        deep.extend((0..300u32).map(|i| 8000 + i));
+        let ev = p.call(PipelineOp::Activate { prompt: deep });
+        let PipelineEvent::Activated {
+            conv_id: id3,
+            reused,
+            ..
+        } = ev
+        else {
+            panic!("deep activate failed: {ev:?}");
+        };
+        assert_ne!(
+            id3, conv_id,
+            "deep divergence must not steal the conversation"
+        );
+        assert_eq!(reused, 0);
     }
 
     /// The Splice gate: surgically replacing a mid-log span must leave state

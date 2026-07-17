@@ -727,6 +727,65 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The canonicalization invariant behind cross-turn KV reuse: a
+    /// tool-calling turn finalized WITHOUT its trailing prose must render as
+    /// a byte prefix of the next request (which carries the tool response +
+    /// the echoed prose). The grammar places the prose AFTER the response
+    /// splice, so a canonical that included it could never be a prefix —
+    /// the OpenCode full-re-prefill-per-tool-turn bug. String-prefix implies
+    /// token-prefix here because the boundary is the `<|tool_response>`
+    /// special (a hard tokenizer boundary).
+    #[test]
+    fn empty_content_canonical_is_prefix_of_next_request() {
+        let tools = vec![json!({"type":"function","function":{
+            "name":"write","description":"Write a file",
+            "parameters":{"type":"object","properties":{
+                "path":{"type":"string","description":"path"}},
+                "required":["path"]}}})];
+        let call = json!({"type":"function","function":{
+            "name":"write","arguments":"{\"path\":\"/tmp/x.rs\"}"}});
+        let user = json!({"role":"user","content":"Fix the file."});
+        let prose = "I will rewrite the file to fix the tests.";
+
+        // Finalize-time canonical: content EMPTY on the tool-calling turn.
+        let canon_msgs = vec![
+            user.clone(),
+            json!({"role":"assistant","content":"","tool_calls":[call.clone()]}),
+        ];
+        let canonical = render_conversation(&canon_msgs, &tools, false, false);
+        assert!(
+            canonical.ends_with("<|tool_response>"),
+            "canonical must end at the response opener: …{}",
+            &canonical[canonical.len().saturating_sub(40)..]
+        );
+
+        // Next request: the client echoes the assistant turn WITH its prose
+        // and appends the tool result.
+        let next_msgs = vec![
+            user,
+            json!({"role":"assistant","content":prose,"tool_calls":[call]}),
+            json!({"role":"tool","content":"Wrote file successfully.","name":"write"}),
+        ];
+        let next = render_conversation(&next_msgs, &tools, true, false);
+        assert!(
+            next.starts_with(&canonical),
+            "canonical is not a prefix of the next request\ncanonical tail: …{}\nnext at split: {}…",
+            &canonical[canonical.len().saturating_sub(60)..],
+            &next[canonical.len().min(next.len())..(canonical.len() + 60).min(next.len())]
+        );
+        // And the prose is still present, after the response splice.
+        assert!(next[canonical.len()..].contains(prose));
+
+        // A WITH-prose canonical is NOT a prefix (the defect this rule fixes).
+        let old_msgs = vec![
+            json!({"role":"user","content":"Fix the file."}),
+            json!({"role":"assistant","content":prose,"tool_calls":[json!({"type":"function","function":{
+                "name":"write","arguments":"{\"path\":\"/tmp/x.rs\"}"}})]}),
+        ];
+        let old_canonical = render_conversation(&old_msgs, &tools, false, false);
+        assert!(!next.starts_with(&old_canonical));
+    }
+
     #[test]
     fn validate_tool_reply_verdicts() {
         // Plain prose and well-formed calls pass.

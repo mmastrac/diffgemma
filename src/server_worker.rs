@@ -317,8 +317,19 @@ impl Worker {
                 // WITH its tool_calls via the tool-aware renderer.
                 let canonical = if tool_mode {
                     let mut completed = job.messages.clone();
-                    let mut assistant =
-                        serde_json::json!({"role": "assistant", "content": content});
+                    // KV-reuse-first: a tool-calling turn's trailing prose
+                    // renders AFTER the (future) tool responses in the
+                    // grammar, so baking it into the canonical would make the
+                    // canonical structurally non-prefix of the next request —
+                    // a full re-prefill every tool turn. Finalize through the
+                    // calls + response opener only (content empty in the
+                    // CANONICAL render). The conversation itself is
+                    // untouched: the client echoes the content back and the
+                    // next render places it after the responses.
+                    let mut assistant = serde_json::json!({
+                        "role": "assistant",
+                        "content": if tool_calls.is_empty() { content.as_str() } else { "" },
+                    });
                     if !tool_calls.is_empty() {
                         assistant["tool_calls"] = serde_json::Value::Array(tool_calls.clone());
                     }
@@ -681,7 +692,12 @@ impl Worker {
         // canonical at the assistant-turn boundary).
         let content = content_pieces.join("\n\n").trim().to_string();
         let mut completed = messages_sub;
-        let mut assistant = serde_json::json!({"role": "assistant", "content": content});
+        // Same prefix-stable canonical rule as the plain path: a tool-calling
+        // turn finalizes without its trailing prose (see handle()).
+        let mut assistant = serde_json::json!({
+            "role": "assistant",
+            "content": if tool_calls_out.is_empty() { content.as_str() } else { "" },
+        });
         if !tool_calls_out.is_empty() {
             assistant["tool_calls"] = serde_json::Value::Array(tool_calls_out.clone());
         }

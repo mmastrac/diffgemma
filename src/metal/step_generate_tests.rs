@@ -363,9 +363,14 @@ fn condense_step_text_transforms() {
     // Short text passes through untouched (no clip marker).
     assert_eq!(condense_step_text("short", 80), "short");
     // Long text middle-clips: head + marker + tail, tail gets the larger share.
-    let long: String = (0..200).map(|i| char::from(b'a' + (i % 26) as u8)).collect();
+    let long: String = (0..200)
+        .map(|i| char::from(b'a' + (i % 26) as u8))
+        .collect();
     let out = condense_step_text(&long, 80);
-    assert!(out.contains("<... [120] chars clipped>"), "marker missing: {out}");
+    assert!(
+        out.contains("<... [120] chars clipped>"),
+        "marker missing: {out}"
+    );
     assert!(out.starts_with(&long[..32]), "head missing: {out}");
     assert!(out.ends_with(&long[200 - 48..]), "tail missing: {out}");
 }

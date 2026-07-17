@@ -110,6 +110,43 @@ OUTSIDE OpLogStage). Opt-in `serve --tool-validate` /
 the reply; needs field sign-off). Remaining P4-adjacent: replay across
 serve restarts; grammar-aware kept_len at the per-block layer.
 
+**Tool-turn canonicalization vs cross-turn reuse (OPEN, root-caused
+2026-07-17):** the grammar renders an assistant tool turn as
+`calls → responses → content`, so a canonical finalized BEFORE the tool
+response exists (calls → content → dangling `<|tool_response>` opener)
+is structurally never a prefix of the next request — every OpenCode tool
+turn routes to a fresh conversation and re-prefills the full prompt
+(observed: 12,794/12,868-token shared prefix discarded, 33 s re-prefill;
+surfaced by the prefill-status heartbeat). Candidate fixes, decision
+pending (user: don't be hasty — the trailing prose is the model's own
+explanation of its next call):
+1. *Empty-content canonical*: finalize tool-calling turns through the
+   calls + response opener only (content omitted from the CANONICAL KV
+   log, not from the conversation — the client echoes it and the next
+   render places it after the responses; next-turn prompt provably
+   byte-identical). Restores full-prefix reuse with no client
+   cooperation. Risk surface: none found for content; clients that DROP
+   assistant content alongside tool_calls lose the prose in both designs
+   (client-owned conversation).
+2. *Private re-canonicalization blob*: return an opaque field the client
+   must round-trip (OpenAI encrypted-reasoning-item style) carrying the
+   exact finalized token log / digest + splice points, letting serve
+   re-canonicalize under ANY client re-rendering; same vehicle could
+   restore thinking and carry compaction state. Needs per-client
+   verification that unknown fields are echoed.
+3. *Tail-slack routing* (fallback, orthogonal): route by longest common
+   prefix when divergence is confined to the conversation tail, truncate
+   resident KV to the LCP on activate (74-token truncate is O(1) in ring
+   slack) — recovers most reuse under any tail re-render.
+
+**Tool-call triage via internal re-prompt (FUTURE, user design
+2026-07-17):** on questionable tool calls, run an internal model
+re-prompt asking WHICH call(s) to keep, then rewind/splice the KV so the
+context retains only the chosen call — the propose/inspect/commit and
+Splice primitives are the substrate (P2/P4 shipped); this is a message-
+layer policy on top. Related: the tool-grammar validator's
+retry-on-malformed is the degenerate case (keep zero, re-roll).
+
 **P2 per-block propose/commit (SHIPPED):** `generate_with_session`
 decomposed into `begin_turn` (prefill selection) / `propose_block` (one
 block's attempt loop, E6 + commit-guard re-rolls intact, commits

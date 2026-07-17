@@ -82,14 +82,40 @@ struct Conversation {
     last_used: u64,
 }
 
-/// Pick the conversation to continue for `prompt`: the one whose (non-empty)
-/// token log is a prefix of `prompt`, longest first. `None` → open a new one.
+/// Tail-salvage window (KV-reuse-first): a conversation whose log diverges
+/// from the prompt only in its last `TAIL_SLACK` tokens is still routed to —
+/// the caller truncates the resident KV to the common prefix, which is O(1)
+/// as long as the cut stays inside the sliding-ring slack (~769 tokens at
+/// ring 2048 / window 1024 / CANVAS 256; 512 keeps margin). Deeper
+/// divergence would force a ring rebuild ≈ a fresh prefill, so a new
+/// conversation is genuinely equivalent — that is the smart decline.
+const TAIL_SLACK: usize = 512;
+
+/// Minimum shared prefix before tail-salvage may claim a conversation:
+/// prevents two unrelated short prompts that share a few opening tokens from
+/// merging. Real clients share multi-hundred-token system/tool preambles.
+const MIN_SALVAGE_PREFIX: usize = 256;
+
+/// Pick the conversation to continue for `prompt`, longest common prefix
+/// first: an exact-prefix match (the log extends into the prompt) always
+/// qualifies; a tail-divergent log qualifies when the shared prefix is
+/// substantial (>= `MIN_SALVAGE_PREFIX`) and the divergence is confined to
+/// the last `TAIL_SLACK` tokens (clients re-render turn tails; the grammar
+/// moves a tool turn's prose across the response splice). `None` → new one.
 fn route(convs: &HashMap<u64, Conversation>, prompt: &[u32]) -> Option<u64> {
     convs
         .iter()
-        .filter(|(_, c)| !c.tokens.is_empty() && prompt.starts_with(&c.tokens))
-        .max_by_key(|(_, c)| c.tokens.len())
-        .map(|(id, _)| *id)
+        .filter_map(|(id, c)| {
+            if c.tokens.is_empty() {
+                return None;
+            }
+            let lcp = common_prefix_len(&c.tokens, prompt);
+            let exact = lcp == c.tokens.len();
+            let salvage = lcp >= MIN_SALVAGE_PREFIX && c.tokens.len() - lcp <= TAIL_SLACK;
+            (exact || salvage).then_some((*id, lcp))
+        })
+        .max_by_key(|&(_, lcp)| lcp)
+        .map(|(id, _)| id)
 }
 
 /// Least-recently-used conversation (excluding `current`) for which `pick`
@@ -384,6 +410,39 @@ mod tests {
         convs.insert(2, conv(&[10, 20, 30], 1, 0)); // longer prefix — wins
         convs.insert(3, conv(&[10, 99], 1, 0)); // diverges
         assert_eq!(route(&convs, &[10, 20, 30, 40]), Some(2));
+    }
+
+    /// KV-reuse-first tail salvage: a log diverging from the prompt only in
+    /// its tail (client re-rendered the last turn / the grammar moved a tool
+    /// turn's prose) still routes, provided the shared prefix is substantial.
+    #[test]
+    fn route_salvages_tail_divergence() {
+        let base: Vec<u32> = (0..1000u32).collect();
+        let mut convs = HashMap::new();
+        convs.insert(1, conv(&base, 1, 0));
+
+        // Prompt agrees except the log's last 74 tokens (the OpenCode case).
+        let mut prompt = base[..926].to_vec();
+        prompt.extend(5000..5400u32);
+        assert_eq!(route(&convs, &prompt), Some(1));
+
+        // Divergence deeper than TAIL_SLACK: salvage would need a ring
+        // rebuild, so decline (fresh conversation is equivalent cost).
+        let mut deep = base[..300].to_vec();
+        deep.extend(5000..5400u32);
+        assert_eq!(route(&convs, &deep), None);
+
+        // Substantial-prefix floor: short logs never salvage on a few shared
+        // opening tokens (two unrelated conversations must not merge).
+        let mut short_convs = HashMap::new();
+        short_convs.insert(1, conv(&[10, 20, 30, 40], 1, 0));
+        assert_eq!(route(&short_convs, &[10, 20, 99, 98, 97]), None);
+
+        // Exact-prefix match still wins over a salvage candidate.
+        let mut both = HashMap::new();
+        both.insert(1, conv(&base, 1, 0)); // needs salvage vs `prompt`
+        both.insert(2, conv(&prompt[..990], 1, 0)); // exact prefix, longer lcp
+        assert_eq!(route(&both, &prompt), Some(2));
     }
 
     #[test]

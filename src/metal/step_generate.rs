@@ -305,7 +305,10 @@ fn condense_step_text(text: &str, max: usize) -> String {
     let tail_n = max - head_n;
     let head: String = collapsed.chars().take(head_n).collect();
     let tail: String = collapsed.chars().skip(total - tail_n).collect();
-    format!("{head}<... [{}] chars clipped>{tail}", total - head_n - tail_n)
+    format!(
+        "{head}<... [{}] chars clipped>{tail}",
+        total - head_n - tail_n
+    )
 }
 
 fn step_answer_text(
