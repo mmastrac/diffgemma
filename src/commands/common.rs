@@ -64,7 +64,11 @@ pub(crate) fn build_prompt_tokens(
         let tok_path = model_dir.join("tokenizer.json");
         let tokenizer = tokenizer::Tokenizer::load(&tok_path)?;
         if raw_prompt {
-            Ok(tokenizer.encode(text, false))
+            // Specials-aware: literal `<|turn>`/`<|tool_call>`/`<bos>` markers
+            // encode to their special ids, matching serve's renderer — so a
+            // `serve --log-dir` prompt_text replays byte-faithfully. Text
+            // without special literals encodes identically to plain BPE.
+            Ok(tokenizer.encode_with_specials(text))
         } else {
             let mut turns = history.to_vec();
             turns.push(chat_template::ChatTurn::user(text));
