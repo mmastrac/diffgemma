@@ -88,6 +88,67 @@ the freeze lesson applies to reject-masks). Later: multi-conv absorption,
 Reground, lineage-drift gate. Every phase: golden 8/8 + suite; behavior
 changes additionally smoketest ×{7,42,123}.
 
+### Code-quality survey backlog (audited 2026-07-17, unfixed by design)
+
+Correctness-adjacent (do these first; each is small):
+
+- **Tier-1 attention fixture is below the worst tile**: `full_grp8_hd512_fixture`
+  (canvas=16, t_total=44) vs E17/E20's BM=BN=64, K_PAD=64 — every parity test
+  is single-tile; multi-M-tile stepping, ragged N-tile masking, and K_PAD
+  saturation are unexercised on the default-ON path, and
+  `topk_k128_matches_cpu` claims k>64 coverage while running on 44 keys.
+  Add a canvas≥65 / kv≥65 full-layer fixture.
+- **Missing CPU twins + Tier-1 tests**: `kv/unpack_encoder_kv` (ring-aware
+  hydrate; its inverse IS tested) and `kv/kv_f32_side_hydrate`
+  (producer/consumer dtype surface). ~40 lines each.
+- **server_worker render inconsistency**: the `encode_with_specials(render_conversation(…))`
+  pattern repeats at ~6 call sites and the tool-compact `too_big` sizing
+  closure passes `thinking: false` where its siblings pass the request flag —
+  sizing and rendering can disagree. Collapse into one `render_prompt` helper.
+- **Stale "prefill-only" docs** on the shipped decode path:
+  `step_kernel.rs` `attn_gemm`/`attn_topk` field docs and
+  `attention_gemm/mod.rs` module doc still say "denoise keeps
+  attention_mma_full".
+
+Duplication (largest mechanical wins):
+
+- **Attention GPU/bench harnesses**: ~1,300 duplicated lines across
+  `attention_topk`/`attention_gemm`/`attention_flash` `gpu()`/`bench_*()`
+  (same buffer-setup + head-chunk dispatch body, 3-4× per file); ~600-800
+  removable via a shared Fixture→buffers builder + dispatch closure +
+  min-of-rounds timer. Also a drift hazard: benches hard-code `causal: 1`
+  while the oracle takes it as an arg.
+- **`encode_attn_gemm` vs `encode_attn_topk`** are ~80% identical (~120
+  lines): shared QK stage + head-loop scaffold, stage-2/3 closure.
+
+Structural (absorbed by the token-pipeline phases where noted):
+
+- **`step_kernel.rs` (6.2k lines)**: ~90-method encoder object + 60-field
+  `StepPipelines` with a 381-line compile fn. Extractable seams: GEMM-encoder
+  family, SC-softembed encoders, ~1,300 lines of diagnostics/logging.
+- **`generate_with_session` (~830 lines, three nested retry axes)** —
+  decomposes along op boundaries in pipeline P2 (per-block protocol);
+  `GenerateOutput.block_stats` (currently write-only) becomes the
+  Proposal/Committed event payload there — do not delete it before P2.
+- **`handle_tool_compact` (346 lines)** — becomes message-layer choreography
+  over pipeline ops (checkpoint/rollback ≡ KvId mark + Rewind) in P3/P4.
+
+Trivia sweep (one batched cleanup commit):
+
+- cli.rs usage string: six advertised commands don't exist (`bench-step`,
+  `bench-prefill`, `decoder`, `decoder-gpu`, `prefill`, `generate-parity`),
+  `--compare-cpu` is never parsed, ~30 real commands undocumented; shared
+  mutable parse vars (`bench_layers` quadruple-duty) invite cross-wiring.
+- flags.rs: test-only `impl Default` duplicates the env defaults (can go
+  stale silently — derive or generate one from the other); dead
+  `attn_topk()` accessor; `DGQ_MOE_PREFILL_BM` carries disproven-experiment
+  surface.
+- Oracle sampler tests missing: `sample_from_probs_rows` (RNG/CDF walk — the
+  one worth a fixture), `scale_logits`, `logit_softcapping`.
+- Clippy: ~230 style warnings — 95 too-many-arguments (encoder plumbing;
+  bundle into dims/param structs as files get touched), 19 hand-rolled
+  clamps, collapsible-ifs. Opportunistic, not a campaign.
+
 ### Concept — span handles / compact history (engine revisit)
 
 *(Substrate note 2026-07-17: implement on the token pipeline above — span
