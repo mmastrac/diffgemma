@@ -177,7 +177,11 @@ impl Worker {
             && delta_ids.len() >= PREFILL_STATUS_MIN_TOKENS)
             .then(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
         if let Some(ref started) = prefill_status {
-            spawn_prefill_status(&job.resp, delta_ids.len(), reuse, started);
+            let rate = match self.prefill_rate_tok_s.load(Ordering::Relaxed) {
+                0 => PREFILL_RATE_DEFAULT_TOK_S,
+                r => r as f64,
+            };
+            spawn_prefill_status(&job.resp, delta_ids.len(), rate, started);
         }
         attach_stream_observer(
             &mut cfg,
@@ -274,6 +278,12 @@ impl Worker {
                 } else {
                     0.0
                 };
+                // Feed the dry-start status's duration estimate; only real
+                // prefills (skip reuse-hit no-ops whose rates are absurd).
+                if out.prefill_elapsed.as_secs_f64() > 0.25 && prefill_tps > 1.0 {
+                    self.prefill_rate_tok_s
+                        .store(prefill_tps as u64, Ordering::Relaxed);
+                }
                 let denoise_tps = if out.denoise_elapsed.as_secs_f64() > 0.0 {
                     completion_tokens as f64 / out.denoise_elapsed.as_secs_f64()
                 } else {

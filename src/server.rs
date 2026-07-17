@@ -541,6 +541,9 @@ struct Worker {
     /// When set, each completed request writes one `{seq}.jsonl` here.
     log_dir: Option<std::path::PathBuf>,
     turn_seq: AtomicU64,
+    /// Last observed prefill rate (tok/s; 0 = not yet measured), feeding the
+    /// dry-start status's expected-duration estimate.
+    prefill_rate_tok_s: AtomicU64,
 }
 
 /// Tool-output compaction settings (`--tool-compact` / `DGQ_TOOL_COMPACT=1`).
@@ -562,43 +565,67 @@ type ServeMapper = Arc<Mutex<DiffusionStreamMapper<Arc<crate::tokenizer::Tokeniz
 /// not worth the noise (a sub-second prefill).
 pub(crate) const PREFILL_STATUS_MIN_TOKENS: usize = 1024;
 
+/// Fallback prefill rate before the first in-process measurement (tok/s).
+/// Conservative — underestimating progress delays "Almost done." rather
+/// than firing it prematurely.
+const PREFILL_RATE_DEFAULT_TOK_S: f64 = 250.0;
+
 /// The dry-start status: while a large prompt delta prefills, no step
 /// observer fires, so a streaming client sees dead air (OpenCode's silent
-/// cold start). Emit a synthetic `reasoning_content` line + elapsed
-/// heartbeat until the first denoise step sets `started` (the stream
-/// observer flips it and appends a separator). Transient by construction:
-/// the text never enters the mapper, so the final `Done` payload and the
-/// canonical log are untouched.
+/// cold start). Staged synthetic `reasoning_content` messages: immediately
+/// "Warming up, give me a second."; at 5 s "Taking a closer look."; at
+/// 50% / 90% of the expected prefill duration "Getting there." / "Almost
+/// done." — expected duration = delta tokens / the worker's last observed
+/// prefill rate. When a later stage is already due, earlier ones are
+/// skipped rather than rushed. The first denoise step sets `started` (the
+/// stream observer flips it and appends a separator). Transient by
+/// construction: the text never enters the mapper, so the final `Done`
+/// payload and the canonical log are untouched.
 pub(crate) fn spawn_prefill_status(
     resp: &mpsc::Sender<ServerEvent>,
     delta_tokens: usize,
-    reused: usize,
+    rate_tok_s: f64,
     started: &Arc<std::sync::atomic::AtomicBool>,
 ) {
     let resp = resp.clone();
     let started = Arc::clone(started);
     std::thread::spawn(move || {
         let t0 = std::time::Instant::now();
-        let msg = format!("Reading context: {delta_tokens} new tokens ({reused} reused)…");
-        if resp
-            .send(ServerEvent::Delta(WireDelta::Reasoning(msg)))
-            .is_err()
-        {
+        let expected_secs = delta_tokens as f64 / rate_tok_s.max(1.0);
+        let send = |msg: &str| {
+            resp.send(ServerEvent::Delta(WireDelta::Reasoning(msg.to_string())))
+                .is_ok()
+        };
+        if !send("Warming up, give me a second.") {
             return;
         }
-        let mut next_tick = 3u64;
-        loop {
+        // Next unemitted stage: 1 = closer look (5 s), 2 = 50%, 3 = 90%.
+        let mut stage = 1u32;
+        while stage <= 3 {
             std::thread::sleep(std::time::Duration::from_millis(250));
             if started.load(Ordering::Relaxed) {
                 return;
             }
-            let secs = t0.elapsed().as_secs();
-            if secs >= next_tick {
-                next_tick = secs + 3;
-                let tick = ServerEvent::Delta(WireDelta::Reasoning(format!(" {secs}s")));
-                if started.load(Ordering::Relaxed) || resp.send(tick).is_err() {
+            let elapsed = t0.elapsed().as_secs_f64();
+            let due = if elapsed >= expected_secs * 0.9 {
+                3
+            } else if elapsed >= expected_secs * 0.5 {
+                2
+            } else if elapsed >= 5.0 {
+                1
+            } else {
+                0
+            };
+            if due >= stage {
+                let msg = match due {
+                    1 => "\nTaking a closer look.",
+                    2 => "\nGetting there.",
+                    _ => "\nAlmost done.",
+                };
+                if started.load(Ordering::Relaxed) || !send(msg) {
                     return;
                 }
+                stage = due + 1;
             }
         }
     });
@@ -986,6 +1013,7 @@ pub fn run_serve(
         tool_validate,
         log_dir,
         turn_seq: AtomicU64::new(1),
+        prefill_rate_tok_s: AtomicU64::new(0),
     };
     eprintln!("serve: loading model…");
     let worker_handle = std::thread::spawn(move || worker.run(ready_tx, job_rx));

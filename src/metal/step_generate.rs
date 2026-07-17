@@ -553,13 +553,16 @@ impl StepGenerateSession {
         if kv_truncate_needs_ring_rebuild(old, n, self.sliding_ring_len(), self.rt.sliding_window())
         {
             let kept = self.kv_valid_tokens[..n].to_vec();
+            let rebuild_started = Instant::now();
+            let result = self.rebuild_kv_prefix(&kept);
             if crate::flags::progress_enabled() {
                 eprintln!(
-                    "truncate_kv_to: ring rebuild {old} -> {n} tokens (ring={:?})",
-                    self.sliding_ring_len()
+                    "truncate_kv_to: ring rebuild {old} -> {n} tokens (ring={:?}) ({:.2?})",
+                    self.sliding_ring_len(),
+                    rebuild_started.elapsed()
                 );
             }
-            return self.rebuild_kv_prefix(&kept);
+            return result;
         }
         self.rt.set_kv_len(n as u32);
         self.kv_valid_tokens.truncate(n);
