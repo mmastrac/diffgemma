@@ -314,6 +314,24 @@ pub struct KvSnapshot {
 }
 
 impl KvSnapshot {
+    /// FNV-1a over the snapshot's KV bytes and causal token log — the token
+    /// pipeline's rewind byte-consistency probe (PLAN: any lineage residue a
+    /// rewind leaves behind flips this hash).
+    pub fn fnv64(&self) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut eat = |bytes: &[u8]| {
+            for &b in bytes {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        };
+        eat(&self.kv_bytes);
+        for &t in &self.tokens {
+            eat(&t.to_le_bytes());
+        }
+        h
+    }
+
     /// Bytes this snapshot occupies in the pool (the KV buffer copy).
     pub fn byte_len(&self) -> usize {
         self.kv_bytes.len()
@@ -1097,9 +1115,8 @@ pub fn generate_with_session(
             // it. Re-roll with fresh noise; if it still cannot converge, end
             // the turn instead of committing the attractor.
             let commit_max_ent = crate::flags::block_commit_max_ent();
-            let non_converged = commit_max_ent > 0.0
-                && last_denoise_stop == DenoiseStopReason::MaxSteps
-                && {
+            let non_converged =
+                commit_max_ent > 0.0 && last_denoise_stop == DenoiseStopReason::MaxSteps && {
                     let late0 = mean_entropy_hist.len().saturating_sub(8);
                     let late_min = mean_entropy_hist[late0..]
                         .iter()
