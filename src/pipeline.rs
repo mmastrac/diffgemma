@@ -1260,6 +1260,158 @@ mod tests {
         let _ = std::fs::remove_file(&log_path);
     }
 
+    /// Wrap-crossing rewind gate (the PLAN follow-up, now load-bearing):
+    /// every other byte-consistency gate runs below the sliding-ring wrap,
+    /// but real sessions rewind — guard re-rolls, cancels, salvage truncates
+    /// — at 5-13k tokens, past it. At ring 4096: (a) generate → rewind at
+    /// ~5k takes the past-wrap O(1) truncate and must restore the base
+    /// fingerprint; (b) a rewind deeper than the slack takes the ring-REBUILD
+    /// path and must land bit-identical to a fresh build of the same prefix.
+    #[test]
+    fn wrap_crossing_rewind_restores_state() {
+        let Some(dir) = crate::shaders::test_util::dgq_model_dir() else {
+            return;
+        };
+        let p = Pipeline::spawn(dir, 8192, 8);
+        // 5,000 tokens: past the default 4096 ring wrap.
+        let ids: Vec<u32> = (0..5000u32).map(|i| 1000 + (i * 2477) % 30000).collect();
+        let PipelineEvent::Extended { kv: mark } = p.call(PipelineOp::Extend(ids.clone())) else {
+            panic!("extend failed");
+        };
+        let PipelineEvent::Fingerprint { fnv: fp_base, .. } = p.call(PipelineOp::KvFingerprint)
+        else {
+            panic!("fingerprint failed");
+        };
+
+        let cfg = crate::metal::StepGenerateConfig::from_generate(
+            42,
+            384,
+            8192,
+            0,
+            crate::sample::sampler_for_steps(8, false),
+            false,
+        );
+        let PipelineEvent::Generated { .. } = p.call(PipelineOp::Generate {
+            prompt: ids.clone(),
+            cfg: Box::new(cfg),
+            label: "wrap-gate".into(),
+        }) else {
+            panic!("generate failed");
+        };
+        // (a) Past-wrap rewind of the generated turn: O(1) truncate territory.
+        let ev = p.call(PipelineOp::Rewind(mark));
+        let PipelineEvent::Rewound { kv } = ev else {
+            panic!("rewind failed: {ev:?}");
+        };
+        let PipelineEvent::Fingerprint { fnv, .. } = p.call(PipelineOp::KvFingerprint) else {
+            panic!("fingerprint failed");
+        };
+        assert_eq!(fnv, fp_base, "past-wrap generate->rewind left residue");
+
+        // (b) Deep rewind (5000 -> 1500 = 3500 back, beyond the 2817 slack):
+        // the ring-rebuild path. Must equal a fresh build of ids[..1500].
+        let deep = KvId {
+            epoch: kv.epoch,
+            pos: 1500,
+        };
+        let ev = p.call(PipelineOp::Rewind(deep));
+        let PipelineEvent::Rewound { kv } = ev else {
+            panic!("deep rewind failed: {ev:?}");
+        };
+        let PipelineEvent::Fingerprint {
+            fnv: fp_rebuilt, ..
+        } = p.call(PipelineOp::KvFingerprint)
+        else {
+            panic!("fingerprint failed");
+        };
+        let zero = KvId {
+            epoch: kv.epoch,
+            pos: 0,
+        };
+        let PipelineEvent::Rewound { .. } = p.call(PipelineOp::Rewind(zero)) else {
+            panic!("rewind to 0 failed");
+        };
+        let PipelineEvent::Extended { .. } = p.call(PipelineOp::Extend(ids[..1500].to_vec()))
+        else {
+            panic!("fresh extend failed");
+        };
+        let PipelineEvent::Fingerprint { fnv: fp_fresh, .. } = p.call(PipelineOp::KvFingerprint)
+        else {
+            panic!("fingerprint failed");
+        };
+        assert_eq!(
+            fp_rebuilt, fp_fresh,
+            "ring-rebuild rewind diverged from a fresh build of the same prefix"
+        );
+    }
+
+    /// In-block re-roll residue gate: an E6-discarded canvas attempt must
+    /// leave NO state the retry or later rewinds can observe. Forces exactly
+    /// one degenerate-reply re-roll per round (via cfg.degenerate_reply_check)
+    /// inside the standing generate → rewind loop: regeneration must stay
+    /// bit-identical across rounds and every rewind must restore the base
+    /// fingerprint. Also exercises shrink-on-retry (the retry canvas is 128).
+    #[test]
+    fn forced_reroll_leaves_no_residue() {
+        let Some(dir) = crate::shaders::test_util::dgq_model_dir() else {
+            return;
+        };
+        let p = Pipeline::spawn(dir, 4096, 8);
+        let ids: Vec<u32> = (0..400u32).map(|i| 1000 + (i * 6659) % 30000).collect();
+        let PipelineEvent::Extended { kv: mut mark } = p.call(PipelineOp::Extend(ids.clone()))
+        else {
+            panic!("extend failed");
+        };
+        let PipelineEvent::Fingerprint { fnv: fp0, .. } = p.call(PipelineOp::KvFingerprint) else {
+            panic!("fingerprint failed");
+        };
+
+        let mut first_reply: Option<Vec<u32>> = None;
+        for round in 0..2 {
+            let mut cfg = crate::metal::StepGenerateConfig::from_generate(
+                42,
+                192,
+                4096,
+                0,
+                crate::sample::sampler_for_steps(8, false),
+                false,
+            );
+            // Fires once per round: attempt 0's canvas is declared degenerate
+            // and discarded; attempt 1 (shrunk canvas) is the reply.
+            let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            cfg.degenerate_reply_check = Some(std::sync::Arc::new(move |_ids: &[u32]| {
+                !fired.swap(true, std::sync::atomic::Ordering::Relaxed)
+            }));
+            let ev = p.call(PipelineOp::Generate {
+                prompt: ids.clone(),
+                cfg: Box::new(cfg),
+                label: "reroll-gate".into(),
+            });
+            let PipelineEvent::Generated { out, .. } = ev else {
+                panic!("generate failed at round {round}: {ev:?}");
+            };
+            match &first_reply {
+                None => first_reply = Some(out.token_ids.clone()),
+                Some(f) => assert_eq!(
+                    f, &out.token_ids,
+                    "re-rolled regeneration diverged (round {round})"
+                ),
+            }
+            let ev = p.call(PipelineOp::Rewind(mark));
+            let PipelineEvent::Rewound { kv } = ev else {
+                panic!("rewind failed at round {round}: {ev:?}");
+            };
+            mark = kv;
+            let PipelineEvent::Fingerprint { fnv, .. } = p.call(PipelineOp::KvFingerprint) else {
+                panic!("fingerprint failed at round {round}");
+            };
+            assert_eq!(
+                fnv, fp0,
+                "discarded re-roll attempt left KV residue (round {round})"
+            );
+        }
+    }
+
     /// The KV-reuse-first salvage gate: a follow-up prompt that diverges from
     /// the finalized conversation only in its tail must route BACK to that
     /// conversation with the shared prefix reused (truncate-to-LCP on

@@ -309,6 +309,12 @@ pub(crate) fn run_golden_case(
         let _ = std::fs::create_dir_all(&dir);
         let _ = std::fs::write(format!("{dir}/{}.kv", case.id), snap.kv_bytes());
     }
+    // Position-ordered live fingerprint, NOT a raw snapshot-bytes digest: ring
+    // capacity (DGQ_KV_RING) relocates which SLOT a position lands in without
+    // changing any value — a layout-dependent hash churns on capacity changes
+    // while the model-visible state is bit-identical (same lesson as the
+    // synthetic-KV gate's over-strict first fingerprint).
+    let kv_hash = format!("kv_{:016x}", session.live_kv_fingerprint());
     Ok(golden::GoldenRecord {
         prompt_len,
         kv_valid_len: snap.tokens().len(),
@@ -317,6 +323,6 @@ pub(crate) fn run_golden_case(
         blocks_committed: out.blocks_committed,
         stopped_on_eot: out.stopped_on_eot,
         block_steps_eff: out.block_steps_eff,
-        kv_hash: golden::kv_digest(snap.kv_bytes()),
+        kv_hash,
     })
 }

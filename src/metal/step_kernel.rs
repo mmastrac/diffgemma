@@ -501,7 +501,9 @@ pub fn layer_kv_slots(is_full: bool, max_seq: usize) -> usize {
         // cost of full-length sliding KV (fine to ~8k).
         max_seq.next_power_of_two()
     } else {
-        max_seq.next_power_of_two().min(2048)
+        max_seq
+            .next_power_of_two()
+            .min(crate::flags::kv_ring_slots())
     }
 }
 

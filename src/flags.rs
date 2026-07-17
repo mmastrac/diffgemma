@@ -373,6 +373,14 @@ pub struct DebugFlags {
     /// `DGQ_KV_NOISE=<rel eps>`: perturb every live f16 KV value after prefill
     /// (task #67 sensitivity probe). None = off.
     pub kv_noise: Option<f32>,
+    /// `DGQ_KV_RING`: sliding-layer KV ring slots (power of two, min 2048 =
+    /// window-1 + canvas live positions). Default 4096: the O(1)-truncate
+    /// slack is ring − CANVAS − (window−1) — 769 slots at 2048, 2817 at
+    /// 4096 — so the bigger ring turns typical thought-strip finalize
+    /// truncates and validator/triage rewinds into O(1) instead of a ring
+    /// rebuild (≈ a full re-prefill of the kept prefix), for a fixed
+    /// few-hundred-MB of extra sliding KV independent of context length.
+    pub kv_ring_slots: usize,
     /// `DGQ_KV_RING_UNCAPPED`: linear (no-wrap) sliding KV storage (task #64
     /// ring-read isolation). Any set value enables.
     pub kv_ring_uncapped: bool,
@@ -409,6 +417,7 @@ impl Default for DebugFlags {
             prefill_profile: false,
             parity_debug: false,
             kv_noise: None,
+            kv_ring_slots: 4096,
             kv_ring_uncapped: false,
             arena_f16_all: false,
             metal_pipeline_cache: None,
@@ -586,6 +595,11 @@ impl RuntimeConfig {
                 kv_noise: std::env::var("DGQ_KV_NOISE")
                     .ok()
                     .and_then(|v| v.parse::<f32>().ok()),
+                kv_ring_slots: std::env::var("DGQ_KV_RING")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .map(|n| n.next_power_of_two().max(2048))
+                    .unwrap_or(4096),
                 kv_ring_uncapped: std::env::var("DGQ_KV_RING_UNCAPPED").is_ok(),
                 arena_f16_all: std::env::var("DGQ_ARENA_F16_ALL").is_ok(),
                 metal_pipeline_cache: std::env::var("DGQ_METAL_PIPELINE_CACHE").ok(),
@@ -1280,6 +1294,12 @@ pub fn parity_debug_enabled() -> bool {
 /// KV-noise sensitivity probe rel-eps (`DGQ_KV_NOISE=<f32>`; None = off).
 pub fn kv_noise() -> Option<f32> {
     config().debug.kv_noise
+}
+
+/// Sliding-layer KV ring slots (`DGQ_KV_RING`, default 4096; power of two,
+/// min 2048). See the field doc for the slack arithmetic.
+pub fn kv_ring_slots() -> usize {
+    config().debug.kv_ring_slots
 }
 
 /// Linear (no-wrap) sliding KV storage (`DGQ_KV_RING_UNCAPPED`).

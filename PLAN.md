@@ -74,8 +74,16 @@ measurable (replay with fresh-prefill-per-op and diff).
 generate -> rewind -> generate -> rewind loops must (a) restore the KV
 bytes exactly after every rewind (FNV of the valid snapshot) and (b)
 regenerate bit-identical proposals at the same seed. Any lineage residue
-fails one of the two. Runs below the sliding-ring wrap in Tier 2; a
-wrap-crossing variant exercises the rebuild path.
+fails one of the two. Coverage (all SHIPPED): below-wrap loop
+(`pipeline_rewind_kv_byte_consistency`); wrap-crossing variant
+(`wrap_crossing_rewind_restores_state`: past-wrap O(1) rewind of a
+generated turn + a beyond-slack rewind through the ring-REBUILD path,
+bit-identical to a fresh build); in-block re-roll residue
+(`forced_reroll_leaves_no_residue`: forced E6 discard + shrink-on-retry,
+regeneration bit-identical, fingerprints restored). Golden's
+`ring_wrap_4p6k` crosses the DEFAULT `DGQ_KV_RING` (4096) — when the
+ring default changes, RE-AIM the case or it silently stops testing the
+wrap (it did once: 2p5k stopped wrapping after the 4096 bump).
 
 **Phases:** P0 op/event types + pipeline thread wrapping the existing
 session (Extend/Generate/Rewind), rewind gate green, nothing rerouted.
