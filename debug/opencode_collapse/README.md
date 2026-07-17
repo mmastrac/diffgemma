@@ -83,8 +83,9 @@ in 50.
 
 ## Fixes, ranked
 
-1. **Commit policy — SHIPPED (`DGQ_BLOCK_COMMIT_MAX_ENT`, default 0.2;
-   `DGQ_BLOCK_COMMIT_RETRY`, default 1):** a block that burns the whole
+1. **Commit policy — BUILT, default OFF (`DGQ_BLOCK_COMMIT_MAX_ENT=0.2`
+   to enable; `DGQ_BLOCK_COMMIT_RETRY`, default 1). A stopgap for if the
+   collapse class bites again — the KV-lineage drift is the real bug:** a block that burns the whole
    step schedule with late-window mean entropy above the floor is re-rolled
    with fresh noise, and if still non-converged the turn ends WITHOUT
    committing it. Validated on the deterministic repro: run D matches the
@@ -92,7 +93,8 @@ in 50.
    (re-roll → still 0.258 > 0.2 → turn ends with blocks 1-4's 1024 tokens
    kept); the `}\n` flood never forms; 0 committed-strained blocks in 64.
    Healthy paths untouched: golden 8/8 byte-identical, suite 585/0,
-   smoketest 17/17. `=0` disables. Interacts with E7 (confidence accept).
+   smoketest 17/17 (validated at 0.2). Interacts with E7 (confidence
+   accept).
 2. **Mitigation also available:** `DGQ_KV_REUSE=0` on serve for agent
    workloads — costs a full prefill per turn (~25-40 s at 8-14k with
    dyn-topk prefill) and removed the collapse on this session.

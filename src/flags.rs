@@ -67,13 +67,16 @@ pub struct SamplerFlags {
     /// `DGQ_WS_BLOCK_STOP`: drop pure-whitespace committed blocks. Default OFF.
     pub ws_block_stop: bool,
     /// `DGQ_BLOCK_COMMIT_MAX_ENT` (nats; 0 disables): non-convergence commit
-    /// guard. A block that burns the whole step schedule (max_steps) and still
-    /// shows late-window mean entropy above this floor is NOT committed as-is:
+    /// guard, a STOPGAP for the OpenCode `}\n`-flood collapse class. A block
+    /// that burns the whole step schedule (max_steps) and still shows
+    /// late-window mean entropy above this floor is NOT committed as-is:
     /// re-roll the canvas up to `DGQ_BLOCK_COMMIT_RETRY` times, then end the
     /// turn rather than commit the garble (committed non-converged blocks are
-    /// the amplifier of the OpenCode `}\n`-flood collapse — the flood is
-    /// self-consistent, so later blocks converge cleanly ONTO it). Healthy
-    /// blocks end far below 0.05; strained blocks measure >= 0.43. Default 0.2.
+    /// self-consistent — later blocks converge cleanly ONTO the flood).
+    /// Healthy blocks end far below 0.05; strained blocks measure >= 0.26.
+    /// Validated on the deterministic repro at 0.2 (debug/opencode_collapse/).
+    /// Default OFF (0) — the underlying KV-lineage drift is treated as the
+    /// real bug; enable at 0.2 if the collapse class bites in the field.
     pub block_commit_max_ent: f32,
     /// `DGQ_BLOCK_COMMIT_RETRY`: fresh-noise re-rolls before the commit guard
     /// gives up and ends the turn. Default 1.
@@ -90,7 +93,7 @@ impl Default for SamplerFlags {
             early_stop_mean_ent: 0.05,
             empty_reply_retry: 3,
             ws_block_stop: false,
-            block_commit_max_ent: 0.2,
+            block_commit_max_ent: 0.0,
             block_commit_retry: 1,
             force_canvas: None,
         }
@@ -445,7 +448,7 @@ impl RuntimeConfig {
                     .ok()
                     .and_then(|v| v.parse::<f32>().ok())
                     .filter(|&x| x >= 0.0)
-                    .unwrap_or(0.2),
+                    .unwrap_or(0.0),
                 block_commit_retry: std::env::var("DGQ_BLOCK_COMMIT_RETRY")
                     .ok()
                     .and_then(|v| v.parse().ok())
