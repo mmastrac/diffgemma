@@ -110,8 +110,9 @@ OUTSIDE OpLogStage). Opt-in `serve --tool-validate` /
 the reply; needs field sign-off). Remaining P4-adjacent: replay across
 serve restarts; grammar-aware kept_len at the per-block layer.
 
-**Tool-turn canonicalization vs cross-turn reuse (OPEN, root-caused
-2026-07-17):** the grammar renders an assistant tool turn as
+**Tool-turn canonicalization vs cross-turn reuse (SHIPPED `098a98e`:
+options 1 + 3 below; option 2 remains a future design):** the grammar
+renders an assistant tool turn as
 `calls → responses → content`, so a canonical finalized BEFORE the tool
 response exists (calls → content → dangling `<|tool_response>` opener)
 is structurally never a prefix of the next request — every OpenCode tool
