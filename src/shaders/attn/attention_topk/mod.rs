@@ -1,10 +1,12 @@
-//! E20: top-k sparse attention for full-layer PREFILL.
+//! E20: top-k sparse attention for full layers — causal PREFILL
+//! (`DGQ_ATTN_TOPK`) and bidirectional DENOISE (`DGQ_ATTN_TOPK_DECODE`),
+//! both default ON.
 //!
 //! Sibling of E17 `attention_gemm`. Reuses E17's `attn_gemm_qk` kernel verbatim
 //! (the S plane is identical), then replaces softmax+PV with a top-k softmax +
 //! sparse-PV that gathers V at the per-row selected key indices.
 //! Quality-gated (non-bit-identical): only the top-`k` highest-scoring keys per
-//! (row, head) are kept and renormalized. Default OFF (`DGQ_ATTN_TOPK`).
+//! (row, head) are kept and renormalized.
 //!
 //! The CPU oracle (`cpu.rs`) is the authoritative numeric reference. The GPU
 //! kernels (`attn_topk_softmax`, `attn_topk_pv`) live in `attention_topk.metal`.
@@ -98,8 +100,8 @@ pub fn gpu(
 ) -> Result<Vec<f32>, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
-    use crate::shaders::{bf16, gpu_common};
     use crate::shaders::variant::KernelVariant;
+    use crate::shaders::{bf16, gpu_common};
     use objc2_metal::{
         MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
         MTLSize,
@@ -183,9 +185,21 @@ pub fn gpu(
 
     let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
     let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
-    let tg128 = MTLSize { width: 128, height: 1, depth: 1 };
-    let tg_sm = MTLSize { width: SOFTMAX_TPG, height: 1, depth: 1 };
-    let tg_pv = MTLSize { width: 32, height: 1, depth: 1 };  // one simdgroup
+    let tg128 = MTLSize {
+        width: 128,
+        height: 1,
+        depth: 1,
+    };
+    let tg_sm = MTLSize {
+        width: SOFTMAX_TPG,
+        height: 1,
+        depth: 1,
+    };
+    let tg_pv = MTLSize {
+        width: 32,
+        height: 1,
+        depth: 1,
+    }; // one simdgroup
 
     let mut h0 = 0usize;
     while h0 < n_q_heads {
@@ -196,7 +210,11 @@ pub fn gpu(
             height: canvas.div_ceil(BM),
             depth: hb,
         };
-        let grid_sm = MTLSize { width: canvas, height: hb, depth: 1 };
+        let grid_sm = MTLSize {
+            width: canvas,
+            height: hb,
+            depth: 1,
+        };
         let grid_pv = MTLSize {
             width: hd.div_ceil(PV_BN),
             height: canvas,
@@ -209,7 +227,9 @@ pub fn gpu(
             enc.setBuffer_offset_atIndex(Some(&buf_kv), 0, 1);
             enc.setBuffer_offset_atIndex(Some(&buf_s), 0, 2);
             enc.setBuffer_offset_atIndex(Some(&buf_pat), 0, 8);
-            if side { enc.setBuffer_offset_atIndex(Some(&buf_kvf), 0, 9); }
+            if side {
+                enc.setBuffer_offset_atIndex(Some(&buf_kvf), 0, 9);
+            }
         }
         gpu_common::set_bytes(&enc, &dims, 3);
         enc.dispatchThreadgroups_threadsPerThreadgroup(grid_qk, tg128);
@@ -238,7 +258,9 @@ pub fn gpu(
             enc.setBuffer_offset_atIndex(Some(&buf_kv), 0, 2);
             enc.setBuffer_offset_atIndex(Some(&buf_out), 0, 3);
             enc.setBuffer_offset_atIndex(Some(&buf_lrow), 0, 4);
-            if side { enc.setBuffer_offset_atIndex(Some(&buf_kvf), 0, 9); }
+            if side {
+                enc.setBuffer_offset_atIndex(Some(&buf_kvf), 0, 9);
+            }
         }
         gpu_common::set_bytes(&enc, &dims, 5);
         enc.dispatchThreadgroups_threadsPerThreadgroup(grid_pv, tg_pv);
@@ -273,6 +295,19 @@ mod tests {
         // Selection is exact top-k by f32 score (4-level radix); only
         // bit-identical scores are interchangeable. Tolerance covers f16-KV /
         // bf16 rounding.
+        assert_oracle(&got, &oracle, 2e-2, 0.9999);
+    }
+
+    /// Parity vs the CPU oracle, DENOISE mask (causal=0 — the decode arm's
+    /// dispatch mode, `DGQ_ATTN_TOPK_DECODE`): every canvas row sees all
+    /// kv_len + canvas keys. Same production full-layer shape as the causal
+    /// test.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn topk_full_grp8_denoise_vs_cpu() {
+        let f = crate::shaders::attention::full_grp8_hd512_fixture(ElemFormat::F32);
+        let got = gpu(&f, false, false, K_PAD).expect("gpu topk denoise");
+        let oracle = cpu::topk_denoise(&f, true, K_PAD);
         assert_oracle(&got, &oracle, 2e-2, 0.9999);
     }
 
@@ -334,6 +369,35 @@ mod tests {
         }
     }
 
+    /// Premise bench for the DECODE (denoise) arm: production
+    /// `attention_mma_full` (causal=0 monolithic — what denoise full layers
+    /// run today) vs E17 dense decomp vs top-k at kv-adaptive k, at the
+    /// denoise full-layer shape (canvas=256, 16Q/2KV, hd=512). The E17/topk
+    /// harnesses dispatch causal=1; at these kv lengths the causal mask
+    /// excludes <0.5% of keys, below bench noise.
+    /// Run: `cargo test --release topk_decode_bench -- --ignored --nocapture`
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn topk_decode_bench() {
+        let iters = 5usize;
+        println!("DECODE shape (canvas=256, 16Q/2KV, hd=512), k_dyn = clamp(t/128, 64, 512)");
+        println!("  kv    mma_full   e17_dense  topk_dyn   full/topk | qk     sm     pv");
+        for kv_len in [8192u32, 30000, 60000, 100000] {
+            let f = crate::shaders::attention_gemm::model_full_fixture(kv_len);
+            let t_total = kv_len as usize + f.canvas;
+            let k = (t_total / 128).clamp(64, 512);
+            let full = crate::shaders::attention::bench_path(&f, iters, 3).unwrap();
+            let e17 = crate::shaders::attention_gemm::bench_gpu(&f, iters, 16).unwrap();
+            let topk = bench_gpu(&f, iters, 16, k).unwrap();
+            let (qk_t, sm_t, pv_t) = bench_stages(&f, iters, 16, k).unwrap();
+            println!(
+                "{kv_len:>6}  {full:9.3}  {e17:9.3}  {topk:9.3}  {r:8.2}x | {qk_t:6.2} {sm_t:6.2} {pv_t:6.2}",
+                r = full / topk
+            );
+        }
+    }
+
     /// Per-kernel breakdown at the PRODUCTION prefill super-chunk shape
     /// (M=1024, n_q_heads=16, nkv=2, hd=512) — matches `bench-prefill-super`.
     /// Used to verify QK is at the half-MMA compute wall (not a kernel bug).
@@ -374,8 +438,8 @@ pub fn bench_gpu(
 ) -> Result<f64, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
-    use crate::shaders::{bf16, gpu_common};
     use crate::shaders::variant::KernelVariant;
+    use crate::shaders::{bf16, gpu_common};
     use objc2_metal::{
         MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
     };
@@ -445,9 +509,21 @@ pub fn bench_gpu(
         head_base: 0,
     };
     let k_u32 = k as u32;
-    let tg128 = MTLSize { width: 128, height: 1, depth: 1 };
-    let tg_sm = MTLSize { width: SOFTMAX_TPG, height: 1, depth: 1 };
-    let tg_pv = MTLSize { width: 32, height: 1, depth: 1 };
+    let tg128 = MTLSize {
+        width: 128,
+        height: 1,
+        depth: 1,
+    };
+    let tg_sm = MTLSize {
+        width: SOFTMAX_TPG,
+        height: 1,
+        depth: 1,
+    };
+    let tg_pv = MTLSize {
+        width: 32,
+        height: 1,
+        depth: 1,
+    };
 
     let mut best = f64::INFINITY;
     for round in 0..6 {
@@ -464,7 +540,11 @@ pub fn bench_gpu(
                     height: canvas.div_ceil(BM),
                     depth: hb,
                 };
-                let grid_sm = MTLSize { width: canvas, height: hb, depth: 1 };
+                let grid_sm = MTLSize {
+                    width: canvas,
+                    height: hb,
+                    depth: 1,
+                };
                 let grid_pv = MTLSize {
                     width: hd.div_ceil(PV_BN),
                     height: canvas,
@@ -529,8 +609,8 @@ pub fn bench_stages(
 ) -> Result<(f64, f64, f64), Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
-    use crate::shaders::{bf16, gpu_common};
     use crate::shaders::variant::KernelVariant;
+    use crate::shaders::{bf16, gpu_common};
     use objc2_metal::{
         MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
     };
@@ -600,9 +680,21 @@ pub fn bench_stages(
         head_base: 0,
     };
     let k_u32 = k as u32;
-    let tg128 = MTLSize { width: 128, height: 1, depth: 1 };
-    let tg_sm = MTLSize { width: SOFTMAX_TPG, height: 1, depth: 1 };
-    let tg_pv = MTLSize { width: 32, height: 1, depth: 1 };
+    let tg128 = MTLSize {
+        width: 128,
+        height: 1,
+        depth: 1,
+    };
+    let tg_sm = MTLSize {
+        width: SOFTMAX_TPG,
+        height: 1,
+        depth: 1,
+    };
+    let tg_pv = MTLSize {
+        width: 32,
+        height: 1,
+        depth: 1,
+    };
 
     // Helper: time `stage` (0=qk, 1=sm, 2=pv) for `iters` per command buffer.
     let mut time_stage = |stage: usize| -> Result<f64, Error> {
@@ -621,7 +713,11 @@ pub fn bench_stages(
                         height: canvas.div_ceil(BM),
                         depth: hb,
                     };
-                    let grid_sm = MTLSize { width: canvas, height: hb, depth: 1 };
+                    let grid_sm = MTLSize {
+                        width: canvas,
+                        height: hb,
+                        depth: 1,
+                    };
                     let grid_pv = MTLSize {
                         width: hd.div_ceil(PV_BN),
                         height: canvas,

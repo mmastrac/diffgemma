@@ -173,6 +173,18 @@ pub struct PerfFlags {
     /// measurably drops the deepest needle at 121k; dyn matches dense 4/4).
     /// `DGQ_ATTN_TOPK_DYN=0` + `DGQ_ATTN_TOPK_K=n` restores fixed k.
     pub attn_topk_dyn: bool,
+    /// `DGQ_ATTN_TOPK_DECODE`: top-k sparse attention for full-layer DENOISE
+    /// (decode) dispatches — the same 3-kernel E20 pipeline as prefill top-k,
+    /// causal=0, k from the same fixed/dyn policy. Denoise full-layer
+    /// attention is issue-bound in `attention_mma_full` (~705 ms/layer @100k
+    /// at canvas=256); the GEMM-decomp top-k runs the same work 3.1× faster
+    /// (100k e2e: 4.42→1.84 s/step). Non-bit-identical; every denoise step
+    /// compounds, so the gate is the multi-seed census + doc-QA ladder, not
+    /// needles. **Default ON (signed off 2026-07-16** after smoketest 17/17
+    /// ×{7,42,123}, longctx 4/4 kw 8/8 drift 0.0%, determinism ×8 short +
+    /// ×3 @45.6k, census parity; golden blessed on this default).
+    /// `DGQ_ATTN_TOPK_DECODE=0` restores dense mma_full denoise attention.
+    pub attn_topk_decode: bool,
 }
 
 impl Default for PerfFlags {
@@ -210,6 +222,7 @@ impl Default for PerfFlags {
             attn_topk: true,
             attn_topk_k: 64,
             attn_topk_dyn: true,
+            attn_topk_decode: true,
         }
     }
 }
@@ -458,6 +471,7 @@ impl RuntimeConfig {
                 attn_topk: env_on_unless_zero("DGQ_ATTN_TOPK"),
                 attn_topk_k: parse_usize("DGQ_ATTN_TOPK_K", 64).max(1),
                 attn_topk_dyn: env_on_unless_zero("DGQ_ATTN_TOPK_DYN"),
+                attn_topk_decode: env_on_unless_zero("DGQ_ATTN_TOPK_DECODE"),
             },
             prefill: PrefillFlags {
                 f16: env_on_if_one("DGQ_PREFILL_F16"),
@@ -747,8 +761,8 @@ pub fn attn_mma_full_qk_ilp2() -> bool {
     config().perf.attn_mma_full_qk_ilp2
 }
 
-/// E20: top-k sparse attention for full-layer PREFILL. Default OFF (opt-in
-/// prototype, quality-gated). Returns (enabled, k).
+/// E20: top-k sparse attention for full-layer PREFILL. Default ON. Returns
+/// (enabled, k).
 pub fn attn_topk() -> (bool, usize) {
     let p = &config().perf;
     (p.attn_topk, p.attn_topk_k)
@@ -776,6 +790,11 @@ pub fn attn_topk_k_pad() -> usize {
 /// `DGQ_ATTN_TOPK_DYN` (kv-adaptive k).
 pub fn attn_topk_dyn() -> bool {
     config().perf.attn_topk_dyn
+}
+/// `DGQ_ATTN_TOPK_DECODE`: top-k sparse attention on full-layer DENOISE
+/// dispatches. Default ON (signed off 2026-07-16); =0 restores dense.
+pub fn attn_topk_decode_enabled() -> bool {
+    config().perf.attn_topk_decode
 }
 /// Effective k for a dispatch at `t_total` keys: fixed DGQ_ATTN_TOPK_K, or —
 /// with DGQ_ATTN_TOPK_DYN — a constant ~0.8% fraction of context,

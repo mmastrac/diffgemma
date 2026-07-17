@@ -173,18 +173,24 @@ prefill, `u32::MAX` otherwise) suppresses their cache stores in
 `qk_rope_kv`. On a ring, past-the-end positions are NOT dead: they wrap onto
 `pos & kv_ring_mask` and clobber the oldest live window slots.
 
-**Full-layer prefill attention runs TOP-K SPARSE by default with kv-adaptive
-k (E20 + `DGQ_ATTN_TOPK_DYN`, signed off 2026-07-16):** per query row, keep
-the k = clamp(t_total/128, 64, 512) highest-scoring keys (exact top-k by f32
-score via 4-level radix on a u16 key plane; deterministic count/prefix-sum
-emission), softmax over that set, gathered-V PV. The k fraction (~0.8% of
-context) exists because attention mass DIFFUSES with depth — fixed k=64
-measurably drops the deepest needle at 121k while dyn matches dense 4/4.
-NOT bit-identical to dense (`DGQ_ATTN_TOPK=0` restores E17 dense; golden
-blessed on the sparse default). Perf: −16% prefill @30k, −28% @100k → within
-~2.5% of MLX-4bit chunked at both depths. Sliding layers are untouched (E18
-flash, window-bounded). Denoise attention remains DENSE — top-k applies to
-prefill full layers only.
+**Full-layer attention runs TOP-K SPARSE by default with kv-adaptive k on
+BOTH the prefill (E20 + `DGQ_ATTN_TOPK_DYN`) and denoise
+(`DGQ_ATTN_TOPK_DECODE`) paths — signed off 2026-07-16:** per query row,
+keep the k = clamp(t_total/128, 64, 512) highest-scoring keys (exact top-k
+by f32 score via 4-level radix on a u16 key plane; deterministic
+count/prefix-sum emission), softmax over that set, gathered-V PV. Prefill
+dispatches causal=1; denoise dispatches the same 3-kernel pipeline causal=0
+(bidirectional canvas), reading the main f16 cache only (never the E14 f32
+side ring, which denoise-step canvas writes do not maintain). The k fraction
+(~0.8% of context) exists because attention mass DIFFUSES with depth —
+fixed k=64 measurably drops the deepest needle at 121k while dyn matches
+dense 4/4. NOT bit-identical to dense (`DGQ_ATTN_TOPK=0` /
+`DGQ_ATTN_TOPK_DECODE=0` restore E17 dense prefill / mma_full dense
+denoise; golden blessed on the sparse defaults). Perf: prefill −16% @30k,
+−28% @100k → within ~2.5% of MLX-4bit chunked; decode 4.42→1.84 s/step
+@100k (isolated 3.1× — mma_full is issue-bound at the denoise shape,
+705 ms/layer @100k vs 229 top-k / 352 dense-E17). Sliding layers are
+untouched (E18 flash / mma2, window-bounded).
 
 ## 4. Denoise step (one forward = one canvas refinement)
 

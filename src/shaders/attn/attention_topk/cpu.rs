@@ -26,6 +26,17 @@ use crate::shaders::attention::Fixture;
 /// Causal top-k attention CPU reference. Returns `[canvas][n_q_heads][hd]`
 /// f32 (bf16-rounded at store, matching `cpu_causal`).
 pub fn topk_causal(f: &Fixture, round_kv_f16: bool, k: usize) -> Vec<f32> {
+    topk_attn(f, round_kv_f16, k, true)
+}
+
+/// Bidirectional (denoise) top-k attention CPU reference: every canvas row
+/// sees all `kv_len + canvas` keys. Mirrors the decode arm
+/// (`DGQ_ATTN_TOPK_DECODE`), where the kernel runs with `causal=0`.
+pub fn topk_denoise(f: &Fixture, round_kv_f16: bool, k: usize) -> Vec<f32> {
+    topk_attn(f, round_kv_f16, k, false)
+}
+
+fn topk_attn(f: &Fixture, round_kv_f16: bool, k: usize, causal: bool) -> Vec<f32> {
     use crate::shaders::{bf16, f16};
     let hd = f.head_dim();
     let nkv = f.n_kv();
@@ -49,8 +60,12 @@ pub fn topk_causal(f: &Fixture, round_kv_f16: bool, k: usize) -> Vec<f32> {
             let kvh = qh / group;
             let q_off = (tok * n_q_heads + qh) * hd;
             let qv = &q[q_off..q_off + hd];
-            let t_stop = kv_len + tok; // inclusive causal cutoff
-            let n_valid = t_stop + 1;
+            // Causal: inclusive cutoff kv_len + tok. Denoise: all keys valid.
+            let n_valid = if causal {
+                kv_len + tok + 1
+            } else {
+                kv_len + canvas
+            };
             // Step 1: compute all valid scores.
             let mut scores: Vec<(f32, usize)> = Vec::with_capacity(n_valid);
             for t in 0..n_valid {
@@ -150,6 +165,76 @@ mod tests {
         );
     }
 
+    /// Sanity: denoise (causal=0) topk with k >= n_valid must equal dense
+    /// bidirectional softmax attention over all kv_len + canvas keys,
+    /// computed inline. Pure-CPU.
+    #[test]
+    fn topk_denoise_recovers_dense_when_k_ge_n_valid() {
+        let f = Fixture {
+            q: (0..4 * 8 * 16)
+                .map(|i| (i as f32 * 0.07).sin() * 0.5)
+                .collect(),
+            kvcache: (0..24 * 8 * 16 * 2)
+                .map(|i| (i as f32 * 0.003).sin() * 0.3)
+                .collect(),
+            layer: crate::shaders::cpu::attention::LayerAttnParams {
+                head_dim: 16,
+                n_kv_heads: 8,
+                is_full: true,
+                v_proj: 0,
+                kv_region: 0,
+                q_norm_off: 0,
+                k_norm_off: 0,
+            },
+            canvas: 4,
+            n_q_heads: 8,
+            kv_len: 20,
+        };
+        let topk = topk_denoise(&f, false, 1024); // k >> n_valid = 24
+        // Dense bidirectional reference, bf16-rounded Q + output like the oracle.
+        let hd = f.head_dim();
+        let nkv = f.n_kv();
+        let group = f.n_q_heads / nkv;
+        let n_valid = f.kv_len as usize + f.canvas;
+        let q = crate::shaders::bf16::bf16_slice_to_f32(
+            &crate::shaders::bf16::f32_slice_to_bf16_bits(&f.q),
+        );
+        let mut max_diff = 0.0f32;
+        for tok in 0..f.canvas {
+            for qh in 0..f.n_q_heads {
+                let kvh = qh / group;
+                let q_off = (tok * f.n_q_heads + qh) * hd;
+                let scores: Vec<f32> = (0..n_valid)
+                    .map(|t| {
+                        let k_off = t * nkv * hd * 2 + kvh * hd;
+                        q[q_off..q_off + hd]
+                            .iter()
+                            .zip(f.kvcache[k_off..k_off + hd].iter())
+                            .map(|(a, b)| a * b)
+                            .sum()
+                    })
+                    .collect();
+                let mmax = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let l: f32 = scores.iter().map(|s| (s - mmax).exp()).sum();
+                for d in 0..hd {
+                    let o: f32 = (0..n_valid)
+                        .map(|t| {
+                            let v_off = t * nkv * hd * 2 + nkv * hd + kvh * hd;
+                            (scores[t] - mmax).exp() / l * f.kvcache[v_off + d]
+                        })
+                        .sum();
+                    let expected = crate::shaders::bf16::store_bf16_round_half(o);
+                    max_diff =
+                        max_diff.max((topk[(tok * f.n_q_heads + qh) * hd + d] - expected).abs());
+                }
+            }
+        }
+        assert!(
+            max_diff < 1e-4,
+            "denoise topk(k=∞) should equal dense bidirectional; max_diff={max_diff}"
+        );
+    }
+
     /// Sanity: topk with k=1 picks the argmax key per (row, head) and the
     /// output equals V[argmax] (renormalized to 1.0). Cheap deterministic
     /// check on a tiny fixture. Pure-CPU (no GPU dependency).
@@ -206,9 +291,11 @@ mod tests {
                 for d in 0..hd {
                     let expected =
                         crate::shaders::bf16::store_bf16_round_half(f.kvcache[v_off + d]);
-                    assert!((topk[o_off + d] - expected).abs() < 1e-5,
+                    assert!(
+                        (topk[o_off + d] - expected).abs() < 1e-5,
                         "topk_k1 mismatch at tok={tok} qh={qh} d={d}: got {} expected {expected}",
-                        topk[o_off + d]);
+                        topk[o_off + d]
+                    );
                 }
             }
         }

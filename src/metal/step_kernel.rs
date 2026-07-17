@@ -1069,15 +1069,27 @@ impl StepPipelines {
             } else {
                 None
             },
-            attn_topk: if crate::flags::attn_topk_enabled() {
-                Some(crate::shaders::attention_topk::pipelines(ctx, prod, false, crate::flags::attn_topk_k_pad())?)
+            attn_topk: if crate::flags::attn_topk_enabled()
+                || crate::flags::attn_topk_decode_enabled()
+            {
+                Some(crate::shaders::attention_topk::pipelines(
+                    ctx,
+                    prod,
+                    false,
+                    crate::flags::attn_topk_k_pad(),
+                )?)
             } else {
                 None
             },
             attn_topk_side: if crate::flags::attn_topk_enabled()
                 && crate::flags::prefill_kv_f32_enabled()
             {
-                Some(crate::shaders::attention_topk::pipelines(ctx, prod, true, crate::flags::attn_topk_k_pad())?)
+                Some(crate::shaders::attention_topk::pipelines(
+                    ctx,
+                    prod,
+                    true,
+                    crate::flags::attn_topk_k_pad(),
+                )?)
             } else {
                 None
             },
@@ -3296,9 +3308,11 @@ impl StepEnc<'_> {
         Ok(())
     }
 
-    /// E20: top-k sparse attention dispatch for full-layer PREFILL. Mirrors
-    /// `encode_attn_gemm` for the QK stage (same kernel, same S plane), then
-    /// dispatches `attn_topk_softmax` (top-k selection + renormalization) and
+    /// E20: top-k sparse attention dispatch for full layers — causal PREFILL
+    /// (`DGQ_ATTN_TOPK`) and bidirectional DENOISE (`DGQ_ATTN_TOPK_DECODE`);
+    /// `self.prefill_causal` selects the mask. Mirrors `encode_attn_gemm` for
+    /// the QK stage (same kernel, same S plane), then dispatches
+    /// `attn_topk_softmax` (top-k selection + renormalization) and
     /// `attn_topk_pv` (gathered-V PV) instead of E17's softmax + PV.
     fn encode_attn_topk(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
         use crate::shaders::attention_gemm::n_pad;
@@ -3321,7 +3335,7 @@ impl StepEnc<'_> {
             b_row_stride: (nkv * hd * 2) as u32,
             s_row_stride: np as u32,
             out_row_stride: (STEP_NQ_HEADS * hd) as u32,
-            causal: 1,
+            causal: u32::from(self.prefill_causal),
             kv_len: kv_len as u32,
             hd: hd as u32,
             group: group as u32,
@@ -3333,14 +3347,29 @@ impl StepEnc<'_> {
         // the compiled K_PAD. Fixed DGQ_ATTN_TOPK_K otherwise.
         let k_param =
             crate::flags::attn_topk_k_for(t_total).min(crate::flags::attn_topk_k_pad()) as u32;
-        let tg128 = MTLSize { width: 128, height: 1, depth: 1 };
-        let tg_sm = MTLSize { width: SOFTMAX_TPG, height: 1, depth: 1 };
-        let tg_pv = MTLSize { width: 32, height: 1, depth: 1 };  // one simdgroup
+        let tg128 = MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        };
+        let tg_sm = MTLSize {
+            width: SOFTMAX_TPG,
+            height: 1,
+            depth: 1,
+        };
+        let tg_pv = MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        }; // one simdgroup
         // Head-chunk from the SAME flag the scratch allocation reads (task #97:
         // this used to hardcode TuneCfg::default().hc=4, ignoring the shipped
         // BO optimum DGQ_GEMM_ATTN_HC=16 and mis-sizing vs the S plane).
         let hc = crate::flags::gemm_attn_head_chunk().min(STEP_NQ_HEADS);
-        let side = self.ps.attn_topk_side.is_some();
+        // The f32 side ring is a PREFILL mechanism — denoise-step canvas KV
+        // writes only reach the main f16 cache, so decode dispatches must
+        // read it (never the side ring) even when E14 is on.
+        let side = self.ps.attn_topk_side.is_some() && self.prefill_causal;
         let side_off = self.bufs.kv_f32_side_offs[layer] as usize;
         let pipes = if side {
             self.ps.attn_topk_side.as_ref().unwrap().clone()
@@ -3356,7 +3385,11 @@ impl StepEnc<'_> {
                 height: m.div_ceil(BM),
                 depth: hb,
             };
-            let grid_sm = MTLSize { width: m, height: hb, depth: 1 };
+            let grid_sm = MTLSize {
+                width: m,
+                height: hb,
+                depth: 1,
+            };
             let grid_pv = MTLSize {
                 width: hd.div_ceil(PV_BN),
                 height: m,
@@ -3491,9 +3524,25 @@ impl StepEnc<'_> {
         if self.prefill_causal && l.is_full == 0 && self.ps.attn_flash_sliding.is_some() {
             return self.encode_attn_flash_sliding(layer, layout);
         }
-        // E20: top-k sparse attention for full-layer prefill (opt-in, quality-gated).
-        // Takes precedence over E17 when enabled.
-        if self.prefill_causal && l.is_full == 1 && self.ps.attn_topk.is_some() {
+        // E20: top-k sparse attention for full-layer prefill (quality-gated).
+        // Takes precedence over E17 when enabled. The pipelines can also be
+        // compiled for the decode arm alone, so gate on the prefill flag.
+        if self.prefill_causal
+            && l.is_full == 1
+            && crate::flags::attn_topk_enabled()
+            && self.ps.attn_topk.is_some()
+        {
+            return self.encode_attn_topk(layer, layout);
+        }
+        // Decode arm (`DGQ_ATTN_TOPK_DECODE`): the same top-k pipeline on
+        // full-layer DENOISE dispatches (causal=0). Full-layer denoise
+        // attention in mma_full is issue-bound and linear in context — the
+        // GEMM-decomp top-k runs it ~3× faster at long kv.
+        if !self.prefill_causal
+            && l.is_full == 1
+            && crate::flags::attn_topk_decode_enabled()
+            && self.ps.attn_topk.is_some()
+        {
             return self.encode_attn_topk(layer, layout);
         }
         // E17: full-layer prefill attention through the GEMM decomposition.
@@ -5612,11 +5661,17 @@ impl StepRuntime {
             ),
             ("embed", &[EmbedGather]),
         ];
-        let full = self.bench_prefill_super(kv_len, iters, n_subs)?.as_secs_f64() * 1e3;
+        let full = self
+            .bench_prefill_super(kv_len, iters, n_subs)?
+            .as_secs_f64()
+            * 1e3;
         let mut out = Vec::new();
         for (label, stages) in groups {
             set_prefill_bench_skip(stages);
-            let ablated = self.bench_prefill_super(kv_len, iters, n_subs)?.as_secs_f64() * 1e3;
+            let ablated = self
+                .bench_prefill_super(kv_len, iters, n_subs)?
+                .as_secs_f64()
+                * 1e3;
             set_prefill_bench_skip(&[]);
             out.push((*label, (full - ablated).max(0.0)));
         }
@@ -5960,7 +6015,10 @@ pub fn build_step_runtime(
         // [HC][CANVAS][n_pad(max_seq)]. Allocated when DGQ_GEMM_ATTN OR
         // DGQ_ATTN_TOPK is set (E20 reuses the same S plane; the two paths are
         // never both live on the same layer).
-        attn_gemm_s: if crate::flags::gemm_attn_enabled() || crate::flags::attn_topk_enabled() {
+        attn_gemm_s: if crate::flags::gemm_attn_enabled()
+            || crate::flags::attn_topk_enabled()
+            || crate::flags::attn_topk_decode_enabled()
+        {
             let np = crate::shaders::attention_gemm::n_pad(cfg.max_seq);
             // Both E17 and E20 encoders batch heads by DGQ_GEMM_ATTN_HC (task
             // #97 unified them); size from the same flag so the encoder can
@@ -5996,7 +6054,9 @@ pub fn build_step_runtime(
         // selection passes — half the bytes of the S plane). HC comes from the
         // same flag the encoder batches by (task #97). The S plane is shared
         // with attn_gemm_s (allocated above when either flag is set).
-        attn_topk_p: if crate::flags::attn_topk_enabled() {
+        attn_topk_p: if crate::flags::attn_topk_enabled()
+            || crate::flags::attn_topk_decode_enabled()
+        {
             let hc = crate::flags::gemm_attn_head_chunk().min(STEP_NQ_HEADS);
             Some(alloc_buffer(
                 &ctx.device,
@@ -6005,7 +6065,9 @@ pub fn build_step_runtime(
         } else {
             None
         },
-        attn_topk_idx: if crate::flags::attn_topk_enabled() {
+        attn_topk_idx: if crate::flags::attn_topk_enabled()
+            || crate::flags::attn_topk_decode_enabled()
+        {
             let hc = crate::flags::gemm_attn_head_chunk().min(STEP_NQ_HEADS);
             Some(alloc_buffer(
                 &ctx.device,
@@ -6014,7 +6076,9 @@ pub fn build_step_runtime(
         } else {
             None
         },
-        attn_topk_lrow: if crate::flags::attn_topk_enabled() {
+        attn_topk_lrow: if crate::flags::attn_topk_enabled()
+            || crate::flags::attn_topk_decode_enabled()
+        {
             let hc = crate::flags::gemm_attn_head_chunk().min(STEP_NQ_HEADS);
             Some(alloc_buffer(
                 &ctx.device,
@@ -6023,7 +6087,9 @@ pub fn build_step_runtime(
         } else {
             None
         },
-        attn_topk_pat: if crate::flags::attn_topk_enabled() {
+        attn_topk_pat: if crate::flags::attn_topk_enabled()
+            || crate::flags::attn_topk_decode_enabled()
+        {
             let np = crate::shaders::attention_gemm::n_pad(cfg.max_seq);
             let hc = crate::flags::gemm_attn_head_chunk().min(STEP_NQ_HEADS);
             Some(alloc_buffer(
