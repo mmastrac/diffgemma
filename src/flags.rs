@@ -66,6 +66,18 @@ pub struct SamplerFlags {
     pub empty_reply_retry: u32,
     /// `DGQ_WS_BLOCK_STOP`: drop pure-whitespace committed blocks. Default OFF.
     pub ws_block_stop: bool,
+    /// `DGQ_BLOCK_COMMIT_MAX_ENT` (nats; 0 disables): non-convergence commit
+    /// guard. A block that burns the whole step schedule (max_steps) and still
+    /// shows late-window mean entropy above this floor is NOT committed as-is:
+    /// re-roll the canvas up to `DGQ_BLOCK_COMMIT_RETRY` times, then end the
+    /// turn rather than commit the garble (committed non-converged blocks are
+    /// the amplifier of the OpenCode `}\n`-flood collapse — the flood is
+    /// self-consistent, so later blocks converge cleanly ONTO it). Healthy
+    /// blocks end far below 0.05; strained blocks measure >= 0.43. Default 0.2.
+    pub block_commit_max_ent: f32,
+    /// `DGQ_BLOCK_COMMIT_RETRY`: fresh-noise re-rolls before the commit guard
+    /// gives up and ends the turn. Default 1.
+    pub block_commit_retry: u32,
     /// `DGQ_FORCE_CANVAS`: force the active canvas width (diagnostic). None = 256.
     pub force_canvas: Option<u32>,
 }
@@ -78,6 +90,8 @@ impl Default for SamplerFlags {
             early_stop_mean_ent: 0.05,
             empty_reply_retry: 3,
             ws_block_stop: false,
+            block_commit_max_ent: 0.2,
+            block_commit_retry: 1,
             force_canvas: None,
         }
     }
@@ -427,6 +441,15 @@ impl RuntimeConfig {
                     .and_then(|v| v.parse::<u32>().ok())
                     .unwrap_or(3),
                 ws_block_stop: env_on_if_one("DGQ_WS_BLOCK_STOP"),
+                block_commit_max_ent: std::env::var("DGQ_BLOCK_COMMIT_MAX_ENT")
+                    .ok()
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .filter(|&x| x >= 0.0)
+                    .unwrap_or(0.2),
+                block_commit_retry: std::env::var("DGQ_BLOCK_COMMIT_RETRY")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1),
                 force_canvas: std::env::var("DGQ_FORCE_CANVAS")
                     .ok()
                     .and_then(|v| v.parse::<u32>().ok())
@@ -676,6 +699,16 @@ pub fn early_stop_mean_ent() -> f32 {
 /// advancing seed stream and re-run, up to N times. DEFAULT 3 (user sign-off
 /// 2026-07-07; seed-123 gate answers 13→17, seeds 7/42 unchanged 17/17).
 /// `DGQ_EMPTY_REPLY_RETRY=0` disables.
+/// Non-convergence commit guard threshold (nats); 0.0 = guard disabled.
+pub fn block_commit_max_ent() -> f32 {
+    config().sampler.block_commit_max_ent
+}
+
+/// Fresh-noise re-rolls before the commit guard ends the turn.
+pub fn block_commit_retry() -> u32 {
+    config().sampler.block_commit_retry
+}
+
 pub fn empty_reply_retry() -> u32 {
     config().sampler.empty_reply_retry
 }

@@ -83,19 +83,26 @@ in 50.
 
 ## Fixes, ranked
 
-1. **Commit policy (recommended, kills the catastrophic mode):** a block
-   finishing its schedule under a convergence floor (e.g. accepted < 60%
-   or late-window mean_ent >> stop threshold) must not be committed
-   as-is — rollback + retry with a different seed, or end the turn.
-   Detector is already in the dumps: `steps_eff == 48 && mean_ent > 0.3`.
-   Interacts with E7 (confidence accept).
-2. **Mitigation available today:** `DGQ_KV_REUSE=0` on serve for agent
+1. **Commit policy — SHIPPED (`DGQ_BLOCK_COMMIT_MAX_ENT`, default 0.2;
+   `DGQ_BLOCK_COMMIT_RETRY`, default 1):** a block that burns the whole
+   step schedule with late-window mean entropy above the floor is re-rolled
+   with fresh noise, and if still non-converged the turn ends WITHOUT
+   committing it. Validated on the deterministic repro: run D matches the
+   collapsing run A turn-for-turn, then at turn-7 block 5 the guard fires
+   (re-roll → still 0.258 > 0.2 → turn ends with blocks 1-4's 1024 tokens
+   kept); the `}\n` flood never forms; 0 committed-strained blocks in 64.
+   Healthy paths untouched: golden 8/8 byte-identical, suite 585/0,
+   smoketest 17/17. `=0` disables. Interacts with E7 (confidence accept).
+2. **Mitigation also available:** `DGQ_KV_REUSE=0` on serve for agent
    workloads — costs a full prefill per turn (~25-40 s at 8-14k with
    dyn-topk prefill) and removed the collapse on this session.
 3. **Longer term:** quantify + shrink lineage drift (re-ground
    conversations with a fresh prefill every N turns; or measure which
    extend path contributes most drift); the span-handles concept attacks
-   the same repair-loop context shape from the content side.
+   the same repair-loop context shape from the content side. The model
+   still fails INTO the strain on repair-loop content (run D turns 7-10
+   ramble in thought and hit the length cap) — the guard contains the
+   damage; it does not make the model good at the task.
 
 ## Files
 

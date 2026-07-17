@@ -849,6 +849,10 @@ pub fn generate_with_session(
             0
         };
         let mut empty_retry_attempt = 0u32;
+        // Non-convergence commit guard (`DGQ_BLOCK_COMMIT_MAX_ENT`): re-roll
+        // budget, and the abandon verdict when the budget is spent.
+        let mut nc_retry_attempt = 0u32;
+        let mut abandon_turn = false;
         let (
             st,
             block_step_count,
@@ -1086,6 +1090,54 @@ pub fn generate_with_session(
                 rt.reset_block(VOCAB, &mut rng, params);
                 continue 'attempt;
             }
+            // Non-convergence commit guard: a block that burned the whole step
+            // schedule and still shows late-window mean entropy above the floor
+            // committed ~45%-accepted garble in the OpenCode collapse — and the
+            // committed flood is self-consistent, so later blocks converge onto
+            // it. Re-roll with fresh noise; if it still cannot converge, end
+            // the turn instead of committing the attractor.
+            let commit_max_ent = crate::flags::block_commit_max_ent();
+            let non_converged = commit_max_ent > 0.0
+                && last_denoise_stop == DenoiseStopReason::MaxSteps
+                && {
+                    let late0 = mean_entropy_hist.len().saturating_sub(8);
+                    let late_min = mean_entropy_hist[late0..]
+                        .iter()
+                        .copied()
+                        .fold(f32::INFINITY, f32::min);
+                    late_min.is_finite() && late_min > commit_max_ent
+                };
+            if non_converged {
+                if nc_retry_attempt < crate::flags::block_commit_retry() {
+                    nc_retry_attempt += 1;
+                    if progress_enabled() {
+                        eprintln!(
+                            "step-generate: block {block_idx} ended max_steps NON-CONVERGED (late mean_ent > {commit_max_ent}); re-rolling canvas (attempt {nc_retry_attempt}/{})",
+                            crate::flags::block_commit_retry()
+                        );
+                    }
+                    let params = step_params_from_sampler(
+                        &cfg.sampler,
+                        rt.read_params().kv_len,
+                        cfg.no_early_stop,
+                        rt.read_params().eos_token_id,
+                    );
+                    rt.reset_block(VOCAB, &mut rng, params);
+                    continue 'attempt;
+                }
+                // Budget spent: abandon without the block_done notification —
+                // this canvas must never reach a streamer as final.
+                abandon_turn = true;
+                break 'attempt (
+                    st,
+                    block_step_count,
+                    accept_hist,
+                    min_entropy_hist,
+                    mean_entropy_hist,
+                    low_ent_hist,
+                    last_denoise_stop,
+                );
+            }
             // Accepted: notify streamers that this block's active argmax is final.
             if let Some(ref observer) = cfg.step_observer {
                 observer(&StepProgressEvent {
@@ -1159,6 +1211,44 @@ pub fn generate_with_session(
                 st.stop_flag,
                 rt.read_params().eos_token_id,
             );
+        }
+
+        // Commit-guard abandon: the block ran out of schedule AND retries while
+        // non-converged. Commit nothing (the canvas is the garble attractor),
+        // record the failed block's stats for diagnosis, and end the turn with
+        // whatever earlier blocks produced.
+        if abandon_turn {
+            eprintln!(
+                "step-generate: block {block_idx} NON-CONVERGED after {} re-rolls (late mean_ent={late_mean_ent:.3} > {}); ending turn without committing ({} new tokens kept)",
+                crate::flags::block_commit_retry(),
+                crate::flags::block_commit_max_ent(),
+                sequences.len() - prompt_token_ids.len()
+            );
+            let stats = crate::generate::BlockDenoiseStats {
+                block_idx,
+                max_blocks,
+                steps_eff: block_step_count,
+                denoise_secs: block_elapsed.as_secs_f64(),
+                accept_per_step: accept_hist,
+                min_ent_per_step: min_entropy_hist,
+                mean_ent_per_step: mean_entropy_hist,
+                low_ent_per_step: low_ent_hist,
+                late_accept_sum: late_accept,
+                late_min_ent,
+                late_mean_ent,
+                late_max_low_ent: late_low_ent,
+                denoise_stop: "non_converged_abandon".to_string(),
+                kept_tokens: 0,
+                token_ids: Vec::new(),
+                stop_token_id: None,
+                stop_offset: None,
+                continued_past_stop: false,
+            };
+            if let Some(ref obs) = cfg.block_commit_observer {
+                obs(&stats);
+            }
+            block_stats.push(stats);
+            break;
         }
 
         // The committed block is only the ACTIVE canvas rows (shrink-on-retry
