@@ -571,6 +571,11 @@ fn attach_stream_observer(
     let mapper = Arc::clone(mapper);
     let resp = resp.clone();
     let suppress = std::sync::atomic::AtomicBool::new(false);
+    // Dead-socket cancel: the connection thread drops its receiver when the
+    // client hangs up (SSE write error), so the next delta send fails — stop
+    // the in-flight generate instead of denoising into the void.
+    let cancel = crate::metal::CancelToken::new();
+    cfg.cancel = Some(cancel.clone());
     cfg.step_observer = Some(Arc::new(move |ev: &crate::metal::StepProgressEvent<'_>| {
         if log_progress && (ev.step_in_block == 1 || ev.step_in_block % 5 == 0 || ev.block_done) {
             eprintln!(
@@ -587,7 +592,9 @@ fn attach_stream_observer(
             let Some(d) = filter_tool_markup_delta(d, strip_tool_markup, &suppress) else {
                 continue;
             };
-            let _ = resp.send(ServerEvent::Delta(d));
+            if resp.send(ServerEvent::Delta(d)).is_err() {
+                cancel.cancel();
+            }
         }
     }));
 }

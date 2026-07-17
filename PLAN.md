@@ -88,6 +88,22 @@ the freeze lesson applies to reject-masks). Later: multi-conv absorption,
 Reground, lineage-drift gate. Every phase: golden 8/8 + suite; behavior
 changes additionally smoketest ×{7,42,123}.
 
+**Cancel (SHIPPED):** a `CancelToken` rides in `StepGenerateConfig` the
+same way the observer Arcs do (works through any stage chain, per-op
+scoped so no reset races). Checked between denoise steps and between
+blocks; the in-flight canvas is abandoned uncommitted and
+`GenerateOutput.cancelled` reports it; KV stays consistent with the
+returned token log (`pipeline_cancel_stops_generate_kv_clean` pins
+residue-free rewind past a cancelled generate). Serve wires it in
+`attach_stream_observer`: the connection thread drops its receiver when
+the SSE socket dies, the next delta send fails, the observer cancels —
+and the worker skips the finalize rebuild. Remaining gaps: (1)
+non-streaming requests only detect disconnect at the final write (needs
+socket read-EOF polling on the connection thread); (2) prefill chunks
+are not yet cancellation points (a 100k prefill runs to completion; the
+chunk loops live in `prefill_chunks*`/`extend_monolithic_kv_chunked` and
+need a consistent partial-prefix story before a mid-prefill stop).
+
 ### Code-quality survey backlog (audited 2026-07-17, unfixed by design)
 
 Correctness-adjacent (do these first; each is small):

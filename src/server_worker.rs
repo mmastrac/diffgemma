@@ -219,6 +219,7 @@ impl Worker {
                         "stop_block": out.stop_block_idx,
                         "stop_offset": out.stop_offset,
                         "finish_reason": finish_reason,
+                        "cancelled": out.cancelled,
                         "blocks_committed": out.blocks_committed,
                         "prefill_secs": out.prefill_elapsed.as_secs_f64(),
                         "denoise_secs": out.denoise_elapsed.as_secs_f64(),
@@ -260,6 +261,15 @@ impl Worker {
                     "serve: out {}tok {}{call_note}  prefill={prefill_tps:.0} tok/s  denoise={denoise_tps:.0} tok/s",
                     completion_tokens, preview,
                 );
+                if out.cancelled {
+                    // Client hung up mid-generate (stream observer cancelled the
+                    // token). Skip the finalize KV rebuild — nothing will
+                    // continue this partial turn; the next request re-activates.
+                    eprintln!(
+                        "serve: client disconnected; generate cancelled after {completion_tokens} tokens"
+                    );
+                    return;
+                }
 
                 // Finalize to the canonical completed-turns log so the snapshot is a
                 // clean prefix of the next turn's prompt (reasoning never persists;
@@ -545,6 +555,12 @@ impl Worker {
             stop_block_idx = out.stop_block_idx;
             stop_offset = out.stop_offset;
             raw_rounds.push(raw.clone());
+            if out.cancelled {
+                // Client hung up mid-generate: end the turn here; skip the
+                // finalize rebuild (next request re-activates the conversation).
+                eprintln!("serve: client disconnected; generate cancelled mid-turn");
+                return;
+            }
 
             let calls = crate::tools::parse_tool_calls(&raw);
             let piece = crate::tools::content_before_tool_calls(&raw);

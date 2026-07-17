@@ -342,6 +342,7 @@ mod tests {
                 token_ids,
                 denoise_steps_run: 2,
                 blocks_committed: 1,
+                cancelled: false,
                 stopped_on_eot: false,
                 stop_token_id: None,
                 stop_block_idx: None,

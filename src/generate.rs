@@ -43,6 +43,10 @@ pub struct GenerateOutput {
     pub token_ids: Vec<u32>,
     pub denoise_steps_run: usize,
     pub blocks_committed: usize,
+    /// True when a [`crate::metal::CancelToken`] stopped generation early: the
+    /// in-flight canvas was abandoned uncommitted and `token_ids` holds only
+    /// the prompt plus fully committed blocks (KV-consistent).
+    pub cancelled: bool,
     /// True when generation ended because a committed block emitted an
     /// end-of-turn / EOS token (full-message mode) rather than exhausting the
     /// `max_new_tokens` budget.

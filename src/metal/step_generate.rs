@@ -54,6 +54,29 @@ pub type StepObserver = std::sync::Arc<dyn Fn(&StepProgressEvent<'_>) + Send + S
 pub type BlockCommitObserver =
     std::sync::Arc<dyn Fn(&crate::generate::BlockDenoiseStats) + Send + Sync>;
 
+/// Cooperative cancellation for an in-flight generate. Checked between denoise
+/// steps and between blocks: the current canvas is abandoned uncommitted (never
+/// reaches a streamer as final) and generation returns the blocks committed so
+/// far with [`crate::generate::GenerateOutput::cancelled`] set. The KV stays
+/// consistent with the returned token log. Clone freely; any holder — a
+/// client-side thread, serve's stream observer on a dead socket — can cancel.
+#[derive(Clone, Default)]
+pub struct CancelToken(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl CancelToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 #[derive(Clone)]
 pub struct StepGenerateConfig {
     pub seed: u64,
@@ -85,6 +108,9 @@ pub struct StepGenerateConfig {
     pub step_observer: Option<StepObserver>,
     /// Optional per-block commit callback (serve model-log flush).
     pub block_commit_observer: Option<BlockCommitObserver>,
+    /// Optional cooperative cancel (serve wires its stream observer's dead
+    /// socket to this; pipeline clients keep a clone across the channel).
+    pub cancel: Option<CancelToken>,
 }
 
 impl std::fmt::Debug for StepGenerateConfig {
@@ -110,6 +136,7 @@ impl std::fmt::Debug for StepGenerateConfig {
                 "block_commit_observer",
                 &self.block_commit_observer.is_some(),
             )
+            .field("cancel", &self.cancel.is_some())
             .finish()
     }
 }
@@ -136,7 +163,12 @@ impl StepGenerateConfig {
             degenerate_reply_check: None,
             step_observer: None,
             block_commit_observer: None,
+            cancel: None,
         }
+    }
+
+    fn cancel_requested(&self) -> bool {
+        self.cancel.as_ref().is_some_and(CancelToken::is_cancelled)
     }
 }
 
@@ -161,6 +193,7 @@ enum DenoiseStopReason {
     Confident,
     Plateau,
     MaxSteps,
+    Cancelled,
 }
 
 impl DenoiseStopReason {
@@ -170,6 +203,7 @@ impl DenoiseStopReason {
             Self::Confident => "confident",
             Self::Plateau => "plateau",
             Self::MaxSteps => "max_steps",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -203,6 +237,7 @@ fn log_denoise_step_progress(
         DenoiseStopReason::Confident => " confident_stop",
         DenoiseStopReason::Plateau => " plateau_stop",
         DenoiseStopReason::MaxSteps => " max_steps",
+        DenoiseStopReason::Cancelled => " cancelled",
     };
     let mut extra = String::new();
     if let Some(pm) = prefix_mean {
@@ -838,6 +873,7 @@ pub fn generate_with_session(
     let mut step_traces = Vec::new();
     let max_steps = cfg.sampler.max_denoising_steps.max(1);
     let mut initial_canvas_ids: Option<Vec<u32>> = None;
+    let mut cancelled = false;
     let mut stopped_on_eot = false;
     let mut stop_token_id: Option<u32> = None;
     let mut stop_block_idx: Option<usize> = None;
@@ -846,6 +882,10 @@ pub fn generate_with_session(
 
     for _block in 0..max_blocks {
         if sequences.len() >= prompt_token_ids.len() + cfg.max_new_tokens {
+            break;
+        }
+        if cfg.cancel_requested() {
+            cancelled = true;
             break;
         }
 
@@ -1106,8 +1146,26 @@ pub fn generate_with_session(
                 if stop_reason != DenoiseStopReason::None {
                     break stop_reason;
                 }
+                if cfg.cancel_requested() {
+                    break DenoiseStopReason::Cancelled;
+                }
             };
             let st = last_st;
+            // Cancelled mid-block: abandon this canvas uncommitted (the E6 /
+            // commit-guard checks below are moot for a reply nobody will read).
+            if last_denoise_stop == DenoiseStopReason::Cancelled {
+                cancelled = true;
+                abandon_turn = true;
+                break 'attempt (
+                    st,
+                    block_step_count,
+                    accept_hist,
+                    min_entropy_hist,
+                    mean_entropy_hist,
+                    low_ent_hist,
+                    last_denoise_stop,
+                );
+            }
             // Empty/degenerate-reply detection: does the committed argmax render as
             // an empty user-facing reply (eos-first canvas OR `<|channel>thought`
             // ceremony)? Checked against the real decoded+sanitized output (E6
@@ -1259,12 +1317,19 @@ pub fn generate_with_session(
         // record the failed block's stats for diagnosis, and end the turn with
         // whatever earlier blocks produced.
         if abandon_turn {
-            eprintln!(
-                "step-generate: block {block_idx} NON-CONVERGED after {} re-rolls (late mean_ent={late_mean_ent:.3} > {}); ending turn without committing ({} new tokens kept)",
-                crate::flags::block_commit_retry(),
-                crate::flags::block_commit_max_ent(),
-                sequences.len() - prompt_token_ids.len()
-            );
+            if cancelled {
+                eprintln!(
+                    "step-generate: block {block_idx} cancelled after {block_step_count} steps; ending turn without committing ({} new tokens kept)",
+                    sequences.len() - prompt_token_ids.len()
+                );
+            } else {
+                eprintln!(
+                    "step-generate: block {block_idx} NON-CONVERGED after {} re-rolls (late mean_ent={late_mean_ent:.3} > {}); ending turn without committing ({} new tokens kept)",
+                    crate::flags::block_commit_retry(),
+                    crate::flags::block_commit_max_ent(),
+                    sequences.len() - prompt_token_ids.len()
+                );
+            }
             let stats = crate::generate::BlockDenoiseStats {
                 block_idx,
                 max_blocks,
@@ -1278,7 +1343,11 @@ pub fn generate_with_session(
                 late_min_ent,
                 late_mean_ent,
                 late_max_low_ent: late_low_ent,
-                denoise_stop: "non_converged_abandon".to_string(),
+                denoise_stop: if cancelled {
+                    "cancelled".to_string()
+                } else {
+                    "non_converged_abandon".to_string()
+                },
                 kept_tokens: 0,
                 token_ids: Vec::new(),
                 stop_token_id: None,
@@ -1474,6 +1543,7 @@ pub fn generate_with_session(
         token_ids: sequences.clone(),
         denoise_steps_run,
         blocks_committed,
+        cancelled,
         stopped_on_eot,
         stop_token_id,
         stop_block_idx,

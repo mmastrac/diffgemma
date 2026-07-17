@@ -133,9 +133,10 @@ impl std::fmt::Debug for PipelineEvent {
             Self::Extended { kv } => write!(f, "Extended {{ kv: {kv:?} }}"),
             Self::Generated { out, kv } => write!(
                 f,
-                "Generated {{ tokens: {}, blocks: {}, kv: {kv:?} }}",
+                "Generated {{ tokens: {}, blocks: {}, cancelled: {}, kv: {kv:?} }}",
                 out.token_ids.len(),
-                out.blocks_committed
+                out.blocks_committed,
+                out.cancelled
             ),
             Self::Rewound { kv } => write!(f, "Rewound {{ kv: {kv:?} }}"),
             Self::Filled { kv } => write!(f, "Filled {{ kv: {kv:?} }}"),
@@ -641,6 +642,64 @@ mod tests {
             direct.token_ids, piped.token_ids,
             "pipeline ask path diverged from the direct path"
         );
+    }
+
+    /// The cancel gate: a [`crate::metal::CancelToken`] riding in the Generate
+    /// cfg (the same way observer Arcs do) stops an in-flight generation
+    /// between denoise steps, and the abandoned canvas leaves NO residue — a
+    /// rewind to the pre-generate mark must restore the base fingerprint
+    /// exactly. This is the serve dead-socket fix's core contract (the stream
+    /// observer cancels when the client hangs up).
+    #[test]
+    fn pipeline_cancel_stops_generate_kv_clean() {
+        let Some(dir) = crate::shaders::test_util::dgq_model_dir() else {
+            return;
+        };
+        let p = Pipeline::spawn(dir, 4096, 24);
+        let ids: Vec<u32> = (0..400u32).map(|i| 1000 + (i * 7919) % 30000).collect();
+        let PipelineEvent::Extended { kv: mark } = p.call(PipelineOp::Extend(ids.clone())) else {
+            panic!("extend failed");
+        };
+        let PipelineEvent::Fingerprint { fnv: fp0, .. } = p.call(PipelineOp::KvFingerprint) else {
+            panic!("fingerprint failed");
+        };
+
+        let mut cfg = crate::metal::StepGenerateConfig::from_generate(
+            42,
+            2048, // 8 blocks — far more than can denoise before the cancel lands
+            4096,
+            0, // session-owned; overwritten by the pipeline
+            crate::sample::sampler_for_steps(24, false),
+            false,
+        );
+        let cancel = crate::metal::CancelToken::new();
+        cfg.cancel = Some(cancel.clone());
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            cancel.cancel();
+        });
+        let ev = p.call(PipelineOp::Generate {
+            prompt: ids.clone(),
+            cfg: Box::new(cfg),
+            label: "cancel-gate".into(),
+        });
+        canceller.join().expect("canceller thread");
+        let PipelineEvent::Generated { out, .. } = ev else {
+            panic!("generate failed: {ev:?}");
+        };
+        assert!(out.cancelled, "generate ran to completion before the cancel");
+        assert!(
+            out.token_ids.len() < ids.len() + 2048,
+            "cancelled generate still produced the full budget"
+        );
+
+        let PipelineEvent::Rewound { .. } = p.call(PipelineOp::Rewind(mark)) else {
+            panic!("rewind after cancel failed");
+        };
+        let PipelineEvent::Fingerprint { fnv, .. } = p.call(PipelineOp::KvFingerprint) else {
+            panic!("fingerprint failed");
+        };
+        assert_eq!(fnv, fp0, "cancelled generate left KV residue past the mark");
     }
 
     /// Stale-epoch rewinds must fail loudly (the drift class, type-checked):
