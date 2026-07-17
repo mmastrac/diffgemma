@@ -247,15 +247,7 @@ fn log_denoise_step_progress(
         extra.push_str(&format!(" ans_len={re}"));
     }
     if let Some(text) = answer_text {
-        // Show the TAIL of the converging text: the head is stable after the
-        // first steps, the interesting churn is at the end of the canvas.
-        const SHOW: usize = 120;
-        let one_line = text.replace(['\n', '\r'], "\\n");
-        let shown = match one_line.char_indices().nth_back(SHOW) {
-            Some((i, _)) => format!("…{}", &one_line[i..]),
-            None => one_line,
-        };
-        extra.push_str(&format!(" text={shown:?}"));
+        extra.push_str(&format!(" text={:?}", condense_step_text(text, 80)));
     }
     if let Some(d) = full_argmax_diff {
         extra.push_str(&format!(" full_diff={d}"));
@@ -267,6 +259,53 @@ fn log_denoise_step_progress(
         "step-generate: block {block_idx}/{max_blocks} step {step_idx}/{max_steps} accept={} low_ent={} min_ent={:.4} mean_ent={mean_entropy_gpu:.4} canvas_stable={canvas_stable} prefix_stable={prefix_stable} hist_len={argmax_hist_len} plateau={accept_plateau}{extra} step={step_elapsed:.2?} block={block_elapsed:.2?} denoise={denoise_elapsed:.2?}{stop_note}",
         stats.accept_count, stats.low_entropy_positions, stats.min_entropy,
     );
+}
+
+/// Condense a decoded canvas for the per-step progress line. A raw mid-denoise
+/// canvas is mostly noise: pad/space floods and an `<eos>` tail run drown the
+/// few tokens that matter. Three transforms: (1) collapse every whitespace run
+/// (incl. newlines) to one space, (2) drop every `<eos>` except the last, and
+/// (3) middle-clip to ~`max` chars — the head shows where the reply starts,
+/// the tail is where the churn is (so it gets the larger share).
+fn condense_step_text(text: &str, max: usize) -> String {
+    const EOS: &str = "<eos>";
+
+    let mut collapsed = String::with_capacity(text.len());
+    let mut in_ws = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            in_ws = true;
+        } else {
+            if in_ws && !collapsed.is_empty() {
+                collapsed.push(' ');
+            }
+            in_ws = false;
+            collapsed.push(ch);
+        }
+    }
+
+    // Keep only the LAST <eos>: interior ones are denoise churn, the tail run
+    // is redundant, but one marks "the model thinks it is done here".
+    if let Some(last) = collapsed.rfind(EOS) {
+        let tail = collapsed.split_off(last);
+        collapsed = collapsed.replace(EOS, "");
+        collapsed.push_str(&tail);
+    }
+    // The eos removal can leave doubled spaces behind ("a <eos> b" → "a  b").
+    while collapsed.contains("  ") {
+        collapsed = collapsed.replace("  ", " ");
+    }
+    let collapsed = collapsed.trim();
+
+    let total = collapsed.chars().count();
+    if total <= max {
+        return collapsed.to_string();
+    }
+    let head_n = max * 2 / 5;
+    let tail_n = max - head_n;
+    let head: String = collapsed.chars().take(head_n).collect();
+    let tail: String = collapsed.chars().skip(total - tail_n).collect();
+    format!("{head}<... [{}] chars clipped>{tail}", total - head_n - tail_n)
 }
 
 fn step_answer_text(
