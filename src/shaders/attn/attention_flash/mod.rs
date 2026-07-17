@@ -147,18 +147,15 @@ pub fn pipeline_flash(
 /// bf16-rounded O — same target as `attention_gemm::gpu` / `cpu_causal`. f16 KV
 /// only. Full layers (hd=512) and sliding (hd=256); hd a multiple of NSG*8=64.
 #[cfg(target_os = "macos")]
-pub fn gpu_flash(
-    f: &crate::shaders::attention::Fixture,
-    causal: bool,
-) -> Result<Vec<f32>, Error> {
+pub fn gpu_flash(f: &crate::shaders::attention::Fixture, causal: bool) -> Result<Vec<f32>, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
     use crate::shaders::bf16;
     use crate::shaders::gpu_common;
     use crate::shaders::variant::KernelVariant;
     use objc2_metal::{
-        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-        MTLComputeCommandEncoder, MTLSize,
+        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+        MTLSize,
     };
 
     let canvas = f.canvas;

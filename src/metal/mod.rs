@@ -56,9 +56,9 @@ pub use step_kernel::build_offsets_from_store;
 
 pub use attention::GpuAttention;
 pub use bench_gemm::{
-    bench_custom_kernel, bench_gemm_bf16, bench_gemm_block_q4, bench_gemm_int_sparse,
+    GemmShape, bench_custom_kernel, bench_gemm_bf16, bench_gemm_block_q4, bench_gemm_int_sparse,
     bench_gemm_tunable, bench_gemm_tunable_db, bench_gemm_tunable_sparse, bench_mpsgraph_oracle,
-    parse_shapes, print_bench_rows, GemmShape,
+    parse_shapes, print_bench_rows,
 };
 pub use decoder::GpuDecoderScratch;
 pub use engine::GpuDecoderEngine;
@@ -77,8 +77,8 @@ pub use step_kernel::{
     RouteScratch, StepFinishMode, StepParams, StepSmokeConfig, TOP_K, bench_fused_gemm_dispatches,
     bench_step_kernel, bench_step_kernel_encode_subprofile, bench_step_kernel_prefill_super,
     bench_step_kernel_prefill_super_stages, bench_step_kernel_profile,
-    bench_step_kernel_profile_steps, fill_token_slot, run_step_attn_qk_plane_dump,
-    layer_moe_block_jobs, run_embed_row_gpu, run_step_probe, run_step_smoke,
+    bench_step_kernel_profile_steps, fill_token_slot, layer_moe_block_jobs, run_embed_row_gpu,
+    run_step_attn_qk_plane_dump, run_step_probe, run_step_smoke,
 };
 pub use step_kv::{
     run_step_attn_probe, run_step_kv_audit, run_step_kv_bf16_cross_parity, run_step_kv_parity,

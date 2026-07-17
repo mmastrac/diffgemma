@@ -915,8 +915,7 @@ pub fn bench_gemm_int_sparse(iters: usize) -> Result<Vec<GemmBenchRow>, Error> {
                 if bm != 32 && bm > rpe {
                     continue;
                 }
-                let (route, num_blocks) =
-                    gemm_int_sparse::build_route(&row_starts, N_EXPERTS, bm);
+                let (route, num_blocks) = gemm_int_sparse::build_route(&row_starts, N_EXPERTS, bm);
                 BufferPool::write_bytes(&buf_route, unsafe {
                     std::slice::from_raw_parts(
                         route.as_ref() as *const RouteScratch as *const u8,
@@ -983,7 +982,10 @@ pub fn bench_gemm_int_sparse(iters: usize) -> Result<Vec<GemmBenchRow>, Error> {
         }
         pool.release(N_EXPERTS * n * k, buf_w);
         pool.release(n * 4, buf_sw);
-        pool.release(jobs.len() * std::mem::size_of::<BlockGroupedJob>(), buf_jobs);
+        pool.release(
+            jobs.len() * std::mem::size_of::<BlockGroupedJob>(),
+            buf_jobs,
+        );
     }
     Ok(rows)
 }
@@ -996,13 +998,16 @@ pub fn bench_gemm_int_sparse(iters: usize) -> Result<Vec<GemmBenchRow>, Error> {
 /// in-place (the DGQ_MOE_PREFILL_BM fake-win lesson). Wired to `bench-gemm`
 /// via the dense-shape path so rows are directly comparable to `tunable_*`.
 #[cfg(target_os = "macos")]
-pub fn bench_gemm_tunable_db(shapes: &[GemmShape], iters: usize) -> Result<Vec<GemmBenchRow>, Error> {
+pub fn bench_gemm_tunable_db(
+    shapes: &[GemmShape],
+    iters: usize,
+) -> Result<Vec<GemmBenchRow>, Error> {
     use crate::metal::device::MetalContext;
     use crate::shaders::gemm_q4;
     use crate::shaders::gemm_tunable;
     use objc2_metal::{
-        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-        MTLComputeCommandEncoder, MTLSize,
+        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+        MTLSize,
     };
 
     const SHADER_TUNE: &str = crate::shaders::gemm_tunable::SHADER;
@@ -1017,7 +1022,9 @@ pub fn bench_gemm_tunable_db(shapes: &[GemmShape], iters: usize) -> Result<Vec<G
             .map(|i| ((i as f32) * 0.0007).cos() * 0.02)
             .collect();
         let fixture = gemm_q4::Fixture {
-            x: (0..m * k).map(|i| ((i as f32) * 0.013).sin() * 0.2).collect(),
+            x: (0..m * k)
+                .map(|i| ((i as f32) * 0.013).sin() * 0.2)
+                .collect(),
             w_f32,
             m,
             n,
@@ -1062,7 +1069,11 @@ pub fn bench_gemm_tunable_db(shapes: &[GemmShape], iters: usize) -> Result<Vec<G
                 height: m.div_ceil(bm),
                 depth: 1,
             };
-            let tg = MTLSize { width: 128, height: 1, depth: 1 };
+            let tg = MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            };
             enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
             enc.endEncoding();
             cmd.commit();
@@ -1081,7 +1092,11 @@ pub fn bench_gemm_tunable_db(shapes: &[GemmShape], iters: usize) -> Result<Vec<G
             height: m.div_ceil(bm),
             depth: 1,
         };
-        let tg = MTLSize { width: 128, height: 1, depth: 1 };
+        let tg = MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        };
         let dispatch = |count: usize| -> Result<(), Error> {
             let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
             let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;

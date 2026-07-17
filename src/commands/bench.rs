@@ -370,8 +370,16 @@ pub(crate) fn run_bench_gemm(shapes: &str, oracle: Option<&str>, iters: usize) -
     // MISMATCH tag (gate the perf number on correctness in-place).
     if shapes == "db" {
         let dense_shapes = &[
-            metal::GemmShape { m: 256, k: 2816, n: 2816 },
-            metal::GemmShape { m: 1024, k: 2816, n: 2816 },
+            metal::GemmShape {
+                m: 256,
+                k: 2816,
+                n: 2816,
+            },
+            metal::GemmShape {
+                m: 1024,
+                k: 2816,
+                n: 2816,
+            },
         ];
         let mut rows = match metal::bench_gemm_tunable(dense_shapes, iters) {
             Ok(r) => r,

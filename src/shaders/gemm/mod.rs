@@ -2,14 +2,14 @@
 //! simple f32×bf16 linear entry points (compiled via include_str! in
 //! src/metal/{engine,gemm}.rs).
 pub mod common;
-pub mod gemm_linear_f32;
-#[cfg(target_os = "macos")]
-pub mod int_mma_probe;
 pub mod gemm_int_sparse;
+pub mod gemm_linear_f32;
 pub mod gemm_linear_grouped;
 pub mod gemm_q8_linear_f32;
 pub mod gemm_rowk;
 pub mod gemm_tunable;
+#[cfg(target_os = "macos")]
+pub mod int_mma_probe;
 
 /// Engine simple-linear entry points (`bf16_gemm` / `f32_bf16_linear` /
 /// `f32_f32_linear` in `gemm.metal`) — compiled by src/metal/{engine,gemm}.rs.

@@ -415,15 +415,22 @@ pub fn cpu_causal(f: &crate::shaders::attention::Fixture, round_kv_f16: bool) ->
 pub fn model_full_fixture(kv_len: u32) -> crate::shaders::attention::Fixture {
     use crate::shaders::cpu::attention::LayerAttnParams;
     let (canvas, n_q_heads, nkv, hd) = (256usize, 16usize, 2usize, 512usize);
-    model_full_fixture_with(kv_len, canvas, n_q_heads, nkv, hd, LayerAttnParams {
-        head_dim: hd as u32,
-        n_kv_heads: nkv as u32,
-        is_full: true,
-        v_proj: 0,
-        kv_region: 0,
-        q_norm_off: 0,
-        k_norm_off: 0,
-    })
+    model_full_fixture_with(
+        kv_len,
+        canvas,
+        n_q_heads,
+        nkv,
+        hd,
+        LayerAttnParams {
+            head_dim: hd as u32,
+            n_kv_heads: nkv as u32,
+            is_full: true,
+            v_proj: 0,
+            kv_region: 0,
+            q_norm_off: 0,
+            k_norm_off: 0,
+        },
+    )
 }
 
 /// Same as `model_full_fixture` but with the production prefill super-chunk
@@ -432,15 +439,22 @@ pub fn model_full_fixture(kv_len: u32) -> crate::shaders::attention::Fixture {
 pub fn model_full_fixture_prod(kv_len: u32) -> crate::shaders::attention::Fixture {
     use crate::shaders::cpu::attention::LayerAttnParams;
     let (canvas, n_q_heads, nkv, hd) = (1024usize, 16usize, 2usize, 512usize);
-    model_full_fixture_with(kv_len, canvas, n_q_heads, nkv, hd, LayerAttnParams {
-        head_dim: hd as u32,
-        n_kv_heads: nkv as u32,
-        is_full: true,
-        v_proj: 0,
-        kv_region: 0,
-        q_norm_off: 0,
-        k_norm_off: 0,
-    })
+    model_full_fixture_with(
+        kv_len,
+        canvas,
+        n_q_heads,
+        nkv,
+        hd,
+        LayerAttnParams {
+            head_dim: hd as u32,
+            n_kv_heads: nkv as u32,
+            is_full: true,
+            v_proj: 0,
+            kv_region: 0,
+            q_norm_off: 0,
+            k_norm_off: 0,
+        },
+    )
 }
 
 fn model_full_fixture_with(

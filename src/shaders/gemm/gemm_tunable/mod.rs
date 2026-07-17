@@ -377,11 +377,20 @@ pub(crate) fn gpu_sparse_tunable_bm(
     }
     route.num_blocks = blk as u32;
 
-    let buf_a = pool.allocate(&ctx.device, f.a.len() * 4).ok_or(Error::Gpu("alloc a"))?;
-    let buf_w = pool.allocate(&ctx.device, w_blob.len()).ok_or(Error::Gpu("alloc w"))?;
-    let buf_c = pool.allocate(&ctx.device, out_len * 4).ok_or(Error::Gpu("alloc c"))?;
+    let buf_a = pool
+        .allocate(&ctx.device, f.a.len() * 4)
+        .ok_or(Error::Gpu("alloc a"))?;
+    let buf_w = pool
+        .allocate(&ctx.device, w_blob.len())
+        .ok_or(Error::Gpu("alloc w"))?;
+    let buf_c = pool
+        .allocate(&ctx.device, out_len * 4)
+        .ok_or(Error::Gpu("alloc c"))?;
     let buf_jobs = pool
-        .allocate(&ctx.device, jobs.len() * std::mem::size_of::<BlockGroupedJob>())
+        .allocate(
+            &ctx.device,
+            jobs.len() * std::mem::size_of::<BlockGroupedJob>(),
+        )
         .ok_or(Error::Gpu("alloc jobs"))?;
     let buf_rs = pool
         .allocate(&ctx.device, f.row_starts.len() * 4)
@@ -392,13 +401,19 @@ pub(crate) fn gpu_sparse_tunable_bm(
     BufferPool::write_f32(&buf_a, &f.a);
     BufferPool::write_bytes(&buf_w, &w_blob);
     BufferPool::write_bytes(&buf_jobs, unsafe {
-        std::slice::from_raw_parts(jobs.as_ptr().cast::<u8>(), jobs.len() * std::mem::size_of::<BlockGroupedJob>())
+        std::slice::from_raw_parts(
+            jobs.as_ptr().cast::<u8>(),
+            jobs.len() * std::mem::size_of::<BlockGroupedJob>(),
+        )
     });
     BufferPool::write_bytes(&buf_rs, unsafe {
         std::slice::from_raw_parts(f.row_starts.as_ptr().cast::<u8>(), f.row_starts.len() * 4)
     });
     BufferPool::write_bytes(&buf_route, unsafe {
-        std::slice::from_raw_parts(route.as_ref() as *const RouteScratch as *const u8, std::mem::size_of::<RouteScratch>())
+        std::slice::from_raw_parts(
+            route.as_ref() as *const RouteScratch as *const u8,
+            std::mem::size_of::<RouteScratch>(),
+        )
     });
     BufferPool::write_f32(&buf_c, &vec![0.0f32; out_len]);
 
@@ -408,12 +423,23 @@ pub(crate) fn gpu_sparse_tunable_bm(
         height: route.num_blocks as usize,
         depth: 1,
     };
-    let tg = MTLSize { width: crate::shaders::gemm_common::THREADS_PER_TG, height: 1, depth: 1 };
+    let tg = MTLSize {
+        width: crate::shaders::gemm_common::THREADS_PER_TG,
+        height: 1,
+        depth: 1,
+    };
     let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
     let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
     enc.setComputePipelineState(&pipe.pipeline);
     crate::shaders::gemm_block_grouped::bind_gpu_buffers(
-        &enc, &buf_a, &buf_w, &buf_c, &buf_jobs, &buf_rs, &buf_route, num_jobs as u32,
+        &enc,
+        &buf_a,
+        &buf_w,
+        &buf_c,
+        &buf_jobs,
+        &buf_rs,
+        &buf_route,
+        num_jobs as u32,
     );
     enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
     enc.endEncoding();
@@ -691,7 +717,10 @@ mod sparse_nvfp4_tests {
             let got = gpu_sparse_tunable_bm(&f, bm, bn).expect("sparse bm");
             let c = cos(&got, &oracle);
             println!("  bm={bm:>3} bn={bn:>3}: cos={c:.6} vs CPU oracle");
-            assert!(c > 0.999, "sparse tile bm={bm} bn={bn} diverged: cos={c:.6}");
+            assert!(
+                c > 0.999,
+                "sparse tile bm={bm} bn={bn} diverged: cos={c:.6}"
+            );
         }
     }
 }
@@ -704,8 +733,8 @@ mod double_buffer_tests {
     use crate::shaders::bf16;
     use crate::shaders::gemm_q4;
     use objc2_metal::{
-        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-        MTLComputeCommandEncoder, MTLSize,
+        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+        MTLSize,
     };
 
     /// Bit-exact oracle: the double-buffered `gemm_tunable_db` must produce
@@ -722,9 +751,7 @@ mod double_buffer_tests {
         // -> 4 K-tiles, so the double-buffer prologue/main/epilogue all run).
         let f = gemm_q4::tile_fixture(crate::shaders::test_util::ElemFormat::F32);
         let w_q4 = gemm_q4::w_q4(&f);
-        let buf_x = pool
-            .allocate(&ctx.device, f.m * f.k * 2)
-            .expect("x");
+        let buf_x = pool.allocate(&ctx.device, f.m * f.k * 2).expect("x");
         let buf_y_single = pool.allocate(&ctx.device, f.m * f.n * 2).expect("y_single");
         let buf_y_db = pool.allocate(&ctx.device, f.m * f.n * 2).expect("y_db");
         let buf_w = pool.allocate(&ctx.device, w_q4.len()).expect("w");

@@ -193,22 +193,22 @@ fn draft_of(deltas: &[WireDelta]) -> Option<String> {
     })
 }
 
-    #[test]
-    fn tool_markup_strip_truncates_content_at_opener() {
-        use std::sync::atomic::AtomicBool;
-        let suppress = AtomicBool::new(false);
-        let out = filter_tool_markup_delta(
-            WireDelta::Content("I'll check.<|tool_call>call:x{}<tool_call|>".into()),
-            true,
-            &suppress,
-        );
-        assert_eq!(out, Some(WireDelta::Content("I'll check.".into())));
-        assert!(suppress.load(std::sync::atomic::Ordering::Relaxed));
-        assert_eq!(
-            filter_tool_markup_delta(WireDelta::Content("trailing".into()), true, &suppress),
-            None
-        );
-    }
+#[test]
+fn tool_markup_strip_truncates_content_at_opener() {
+    use std::sync::atomic::AtomicBool;
+    let suppress = AtomicBool::new(false);
+    let out = filter_tool_markup_delta(
+        WireDelta::Content("I'll check.<|tool_call>call:x{}<tool_call|>".into()),
+        true,
+        &suppress,
+    );
+    assert_eq!(out, Some(WireDelta::Content("I'll check.".into())));
+    assert!(suppress.load(std::sync::atomic::Ordering::Relaxed));
+    assert_eq!(
+        filter_tool_markup_delta(WireDelta::Content("trailing".into()), true, &suppress),
+        None
+    );
+}
 
 #[test]
 fn tool_markup_strip_noop_when_disabled() {
@@ -233,10 +233,7 @@ fn trunc_preview_flattens_and_caps() {
 
 #[test]
 fn write_serve_and_model_logs() {
-    let dir = std::env::temp_dir().join(format!(
-        "dgq-serve-log-test-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("dgq-serve-log-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let serve = serde_json::json!({"seq": 7, "finish_reason": "stop"});

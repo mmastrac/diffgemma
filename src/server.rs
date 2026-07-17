@@ -249,9 +249,7 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
         let filtered: Vec<u32> = ids
             .iter()
             .copied()
-            .filter(|&id| {
-                Some(id) != self.channel_open && Some(id) != self.channel_close
-            })
+            .filter(|&id| Some(id) != self.channel_open && Some(id) != self.channel_close)
             .collect();
         crate::chat_template::sanitize_model_reply(
             &self
@@ -268,9 +266,7 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
         let filtered: Vec<u32> = ids
             .iter()
             .copied()
-            .filter(|&id| {
-                Some(id) != self.channel_open && Some(id) != self.channel_close
-            })
+            .filter(|&id| Some(id) != self.channel_open && Some(id) != self.channel_close)
             .collect();
         let raw = self
             .decoder
@@ -576,9 +572,7 @@ fn attach_stream_observer(
     let resp = resp.clone();
     let suppress = std::sync::atomic::AtomicBool::new(false);
     cfg.step_observer = Some(Arc::new(move |ev: &crate::metal::StepProgressEvent<'_>| {
-        if log_progress
-            && (ev.step_in_block == 1 || ev.step_in_block % 5 == 0 || ev.block_done)
-        {
+        if log_progress && (ev.step_in_block == 1 || ev.step_in_block % 5 == 0 || ev.block_done) {
             eprintln!(
                 "serve: block {}/{} step {}/{} {}%",
                 ev.block_idx,

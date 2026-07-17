@@ -123,39 +123,50 @@ pub fn run() -> Result<(f64, f64, f64), crate::Error> {
     let simdgroups = threads / 32;
     let iters: u32 = 20_000;
 
-    let bench = |entry: &str, macs_per_iter_per_unit: f64, units: f64| -> Result<f64, crate::Error> {
-        let pipe = ctx.compile_subkernel(SRC, entry, KernelVariant::PRODUCTION)?;
-        // dispatchThreadgroups takes the THREADGROUP count, not thread count.
-        let grid = MTLSize { width: tgs as usize, height: 1, depth: 1 };
-        let tgd = MTLSize { width: tg as usize, height: 1, depth: 1 };
-        let mut best = f64::INFINITY;
-        for round in 0..5 {
-            let cmd = ctx.queue.commandBuffer().ok_or(crate::Error::Gpu("cmd"))?;
-            let enc = cmd.computeCommandEncoder().ok_or(crate::Error::Gpu("enc"))?;
-            enc.setComputePipelineState(&pipe.pipeline);
-            unsafe {
-                enc.setBuffer_offset_atIndex(Some(&out), 0, 0);
+    let bench =
+        |entry: &str, macs_per_iter_per_unit: f64, units: f64| -> Result<f64, crate::Error> {
+            let pipe = ctx.compile_subkernel(SRC, entry, KernelVariant::PRODUCTION)?;
+            // dispatchThreadgroups takes the THREADGROUP count, not thread count.
+            let grid = MTLSize {
+                width: tgs as usize,
+                height: 1,
+                depth: 1,
+            };
+            let tgd = MTLSize {
+                width: tg as usize,
+                height: 1,
+                depth: 1,
+            };
+            let mut best = f64::INFINITY;
+            for round in 0..5 {
+                let cmd = ctx.queue.commandBuffer().ok_or(crate::Error::Gpu("cmd"))?;
+                let enc = cmd
+                    .computeCommandEncoder()
+                    .ok_or(crate::Error::Gpu("enc"))?;
+                enc.setComputePipelineState(&pipe.pipeline);
+                unsafe {
+                    enc.setBuffer_offset_atIndex(Some(&out), 0, 0);
+                }
+                crate::shaders::gpu_common::set_bytes(&enc, &iters, 1);
+                let t = Instant::now();
+                enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tgd);
+                enc.endEncoding();
+                cmd.commit();
+                cmd.waitUntilCompleted();
+                if round > 0 {
+                    best = best.min(t.elapsed().as_secs_f64());
+                }
             }
-            crate::shaders::gpu_common::set_bytes(&enc, &iters, 1);
-            let t = Instant::now();
-            enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tgd);
-            enc.endEncoding();
-            cmd.commit();
-            cmd.waitUntilCompleted();
-            if round > 0 {
-                best = best.min(t.elapsed().as_secs_f64());
-            }
-        }
-        // total MACs = macs_per_iter_per_unit * iters * units
-        let macs = macs_per_iter_per_unit * iters as f64 * units;
-        eprintln!(
-            "    [{entry}] {:.4}s/dispatch, {:.3e} MAC -> {:.1} GMAC/s",
-            best,
-            macs,
-            macs / best / 1e9
-        );
-        Ok(macs / best / 1e9) // GMAC/s
-    };
+            // total MACs = macs_per_iter_per_unit * iters * units
+            let macs = macs_per_iter_per_unit * iters as f64 * units;
+            eprintln!(
+                "    [{entry}] {:.4}s/dispatch, {:.3e} MAC -> {:.1} GMAC/s",
+                best,
+                macs,
+                macs / best / 1e9
+            );
+            Ok(macs / best / 1e9) // GMAC/s
+        };
 
     // ILP=8 independent chains. MMA: 512 MAC/iter/chain per SIMDGROUP; int8/fma:
     // 4 / 1 MAC/iter/chain per LANE(thread).
@@ -176,10 +187,18 @@ mod tests {
         println!("  half tensor-MMA : {mma:10.1}  (simdgroup_multiply_accumulate)");
         println!("  int8 4-wide dot : {int8:10.1}  (int32 += char4.char4)");
         println!("  f32 scalar FMA  : {fma:10.1}  (reference, non-tensor)");
-        println!("  --> int8/MMA = {:.2}x ; int8/FMA = {:.2}x", int8 / mma, int8 / fma);
+        println!(
+            "  --> int8/MMA = {:.2}x ; int8/FMA = {:.2}x",
+            int8 / mma,
+            int8 / fma
+        );
         println!(
             "  VERDICT: int8 dot-product {} the tensor-MMA for GEMM-shaped work.",
-            if int8 >= mma { "MATCHES/BEATS" } else { "LOSES TO" }
+            if int8 >= mma {
+                "MATCHES/BEATS"
+            } else {
+                "LOSES TO"
+            }
         );
     }
 }

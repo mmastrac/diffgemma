@@ -138,9 +138,11 @@ impl Worker {
                 let raw_text = mapper.lock().unwrap().content().to_string();
                 let reasoning = mapper.lock().unwrap().reasoning().to_string();
                 let completion_tokens = out.token_ids.len().saturating_sub(prompt_len);
-                let raw_ids_decode = self.tokenizer.decode(
-                    &crate::sample::strip_degenerate_token_ids(&out.token_ids[prompt_len..]),
-                );
+                let raw_ids_decode =
+                    self.tokenizer
+                        .decode(&crate::sample::strip_degenerate_token_ids(
+                            &out.token_ids[prompt_len..],
+                        ));
 
                 // In tool mode the committed text may contain `<|tool_call>…` spans:
                 // parse them out; `content` becomes the preamble before the first
@@ -295,8 +297,7 @@ impl Worker {
         cfg.max_new_tokens = job.max_tokens.map_or(budget, |c| c.min(budget));
         cfg.seed = job.seed.unwrap_or(self.base_cfg.seed);
         cfg.stop_token_ids = self.stop_token_ids.clone();
-        cfg.continue_incomplete_tool_calls =
-            needs_tool_rendering(&job.messages, &job.tools);
+        cfg.continue_incomplete_tool_calls = needs_tool_rendering(&job.messages, &job.tools);
         cfg.degenerate_reply_check =
             crate::chat_template::empty_reply_check(&self.model_dir, self.stop_token_ids.clone());
         cfg

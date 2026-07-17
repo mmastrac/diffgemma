@@ -78,11 +78,8 @@ impl IntFixture {
     /// The CPU oracle and the GPU kernel consume the same bytes + scales.
     pub fn int8_side_channel(&self) -> (Vec<i8>, Vec<u8>, Vec<f32>, Vec<f32>) {
         // A: per-row absmax int8.
-        let (a_int8, scale_a) = cpu::quantize_matrix_int8_row_major(
-            &self.a_f32,
-            self.total_m(),
-            self.k,
-        );
+        let (a_int8, scale_a) =
+            cpu::quantize_matrix_int8_row_major(&self.a_f32, self.total_m(), self.k);
         // W: per-expert per-N-row absmax int8; collect scales per output column
         // (shared envelope across experts — see the kernel header comment).
         let mut w_int8 = Vec::<u8>::new();
@@ -196,12 +193,7 @@ pub fn build_route(row_starts: &[u32], num_experts: usize, bm: usize) -> (Box<Ro
 /// Run `gemm_int_sparse` on an IntFixture at tile `(bm, bn, bk)` and return the
 /// f32 slot output. Mirrors `gemm_tunable::gpu_sparse_tunable_bm` wiring.
 #[cfg(target_os = "macos")]
-pub fn gpu_int_sparse(
-    f: &IntFixture,
-    bm: usize,
-    bn: usize,
-    bk: usize,
-) -> Result<Vec<f32>, Error> {
+pub fn gpu_int_sparse(f: &IntFixture, bm: usize, bn: usize, bk: usize) -> Result<Vec<f32>, Error> {
     use crate::metal::buffer::BufferPool;
     use crate::metal::device::MetalContext;
     use objc2_metal::{
@@ -231,7 +223,10 @@ pub fn gpu_int_sparse(
         .allocate(&ctx.device, scale_w.len() * 4)
         .ok_or(Error::Gpu("alloc scale_w"))?;
     let buf_jobs = pool
-        .allocate(&ctx.device, jobs.len() * std::mem::size_of::<BlockGroupedJob>())
+        .allocate(
+            &ctx.device,
+            jobs.len() * std::mem::size_of::<BlockGroupedJob>(),
+        )
         .ok_or(Error::Gpu("alloc jobs"))?;
     let buf_rs = pool
         .allocate(&ctx.device, f.row_starts.len() * 4)
@@ -371,7 +366,10 @@ mod tests {
             assert_eq!(gpu.len(), oracle.len());
             let c = cos(&gpu, &oracle);
             println!("  bm={bm:>3} bn={bn:>3}: cos={c:.6} vs CPU oracle");
-            assert!(c > 0.999, "int8 sparse tile bm={bm} bn={bn} diverged: cos={c:.6}");
+            assert!(
+                c > 0.999,
+                "int8 sparse tile bm={bm} bn={bn} diverged: cos={c:.6}"
+            );
         }
     }
 }

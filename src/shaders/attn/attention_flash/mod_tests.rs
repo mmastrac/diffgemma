@@ -12,7 +12,10 @@ use crate::shaders::test_util::ElemFormat;
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
-    a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max)
 }
 
 // Block-streaming online softmax is mathematically identical to the single-pass
@@ -117,9 +120,9 @@ fn flash_bench() {
 #[test]
 #[ignore]
 fn flash_bench_hd256() {
+    use crate::shaders::attention::model_bench_fixture;
     use crate::shaders::attn::attention_flash::bench_flash;
     use crate::shaders::attn::attention_gemm::bench_gpu;
-    use crate::shaders::attention::model_bench_fixture;
     let iters = 10usize;
     println!("  kv       e17(hd256)  flash-bq16  flash-bq32   best/e17");
     for kv_len in [8192u32, 30000, 60000] {
@@ -129,8 +132,11 @@ fn flash_bench_hd256() {
         let b32 = bench_flash(&f, iters, 32).unwrap();
         println!(
             "  {:>6}  {:>9.3}  {:>9.3}  {:>9.3}   {:>5.2}x",
-            kv_len, e17, b16, b32, e17 / b16.min(b32)
+            kv_len,
+            e17,
+            b16,
+            b32,
+            e17 / b16.min(b32)
         );
     }
 }
-

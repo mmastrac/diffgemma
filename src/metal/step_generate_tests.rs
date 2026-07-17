@@ -133,7 +133,10 @@ fn prefill_nondeterminism_probe() {
             l.head_dim,
             count(la, lb),
             count(lb, lc),
-            la.iter().zip(lb).position(|(x, y)| x != y).map(|p| p / per_slot),
+            la.iter()
+                .zip(lb)
+                .position(|(x, y)| x != y)
+                .map(|p| p / per_slot),
         );
         off += bytes;
     }

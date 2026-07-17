@@ -28,8 +28,8 @@ pub mod sc;
 
 #[allow(unused_imports)]
 pub use attn::{
-    apply_rope_heads, attention, attention_flash, attention_gemm, attention_topk, engine_gqa_common,
-    gqa_attention, qk_rope_kv,
+    apply_rope_heads, attention, attention_flash, attention_gemm, attention_topk,
+    engine_gqa_common, gqa_attention, qk_rope_kv,
 };
 #[allow(unused_imports)]
 pub use common::expand;
@@ -47,7 +47,10 @@ pub use embed::embed_gather;
 #[allow(unused_imports)]
 pub use gemm::common as gemm_common;
 #[allow(unused_imports)]
-pub use gemm::{gemm_int_sparse, gemm_linear_f32, gemm_linear_grouped, gemm_q8_linear_f32, gemm_rowk, gemm_tunable};
+pub use gemm::{
+    gemm_int_sparse, gemm_linear_f32, gemm_linear_grouped, gemm_q8_linear_f32, gemm_rowk,
+    gemm_tunable,
+};
 #[allow(unused_imports)]
 pub use kv::{hadamard, kv_f32_side_hydrate, kv_quant, pack_encoder_kv, unpack_encoder_kv};
 #[allow(unused_imports)]
