@@ -265,6 +265,23 @@ layer → #3 → #4 falls out of the same scanner.
   trajectory luck (baseline runs stumbled into repair cycles, treated
   didn't); the strain-battery result is the controlled evidence. Both
   trim flags remain default OFF pending census+longctx.
+  FOURTH SURFACE, OUT OF SCOPE for confidence gates (field 2026-07-18,
+  alpha/beta run): CONFIDENT MISCOUNT of repetitive content —
+  `betababeta` committed at p_max ≈ 1.0 (`bet·ab·ab·eta`, one BPE piece
+  dropped from "betabetabeta") inside thinking, contradicting the
+  correct observed tool output and triggering a 68s "Wait, let me
+  re-count" ×5 verification spiral (final answer still correct; cost is
+  latency). Confidence-gating is blind here by construction — the model
+  is wrong AND sure. Full anatomy (all confidence-verified): miscount
+  (≈1.0) → faithful propagation ("alphaalphaalphabetababeta" at
+  0.92–1.0) → INSTANT confident contradiction-detection ("Wait" at 1.0)
+  → retry-by-re-rendering hits the same weakness ×5. Detection is not
+  the deficit; the retry strategy is. Mitigation = message/triage-layer
+  loop breaker that breaks the tie TOWARD observed tool output ("ground
+  truth beats re-derivation after N failed reconciliations"), same
+  policy family as narrate-vs-act. Or accept as intrinsic model
+  weakness (repetition arithmetic) serving can only bound. Trace
+  evidence: /tmp/logs pmax_trace + serve-00004.
 - **Environmental confound audit (user-prompted 2026-07-18)**: swap/
   compression lossless; no purgeable Metal buffers anywhere; GPU RESETS
   were the real vector — the engine-prefill batch path (`batch.rs end()`)
