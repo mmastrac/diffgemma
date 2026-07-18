@@ -22,12 +22,18 @@ pub(crate) const Q: &str = "<|\"|>";
 mod parse;
 mod render;
 
+#[cfg(test)]
+pub use parse::ParsedToolCall;
 pub(crate) use parse::strip_thinking;
 pub use parse::{
     content_before_tool_calls, message_text, parse_tool_calls, scan_call_attempts,
     should_continue_past_stop, thinking_call_names, to_openai_tool_calls,
     tool_call_lost_in_thinking, validate_tool_reply,
 };
+#[cfg(test)]
+pub use render::format_tool_declarations;
+#[cfg(test)]
+pub(crate) use render::render_tool_response;
 pub(crate) use render::render_tool_response_guarded;
 pub use render::{render_conversation, render_conversation_guarded, strip_client_guards};
 
