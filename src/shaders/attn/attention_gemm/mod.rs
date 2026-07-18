@@ -1,4 +1,5 @@
-//! E17: GEMM-attention for full-layer PREFILL.
+//! E17: GEMM-attention for full-layer prefill (and the QK stage of E20
+//! top-k denoise attention, `DGQ_ATTN_TOPK_DECODE`).
 //!
 //! `attention_mma_full` is pinned at ~1.25 TF/s by the hd=512 / 8x8-fragment
 //! occupancy shape. During prefill the score matrix `S = Q.K^T` fits in memory
@@ -9,8 +10,9 @@
 //!   3. `attn_gemm_pv`      NN-GEMM  O[i,d] = sum_t P[i,t] V[t,d] / L_i
 //!      No 1/sqrt(d) (folded into QK-norm upstream). P is left unnormalized; PV
 //!      divides by L at store — mirroring `attention_mma_full`'s final divide so the
-//!      two share numerics (f16 K/V, f32 accumulate). Not bit-identical; prefill
-//!      only (denoise keeps `attention_mma_full`).
+//!      two share numerics (f16 K/V, f32 accumulate). Not bit-identical.
+//!      Prefill runs the full decomp; denoise reaches the qk stage through E20
+//!      top-k (default on), with `attention_mma_full` as the topk-off fallback.
 
 #[cfg(target_os = "macos")]
 use crate::Error;

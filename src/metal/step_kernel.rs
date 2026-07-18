@@ -729,16 +729,18 @@ struct StepPipelines {
     attention_mma2: ComputePipeline,
     /// MMA attention for full/global layers (`DGQ_ATTN_MMA_FULL`, register-O); scalar `attention` is the fallback/oracle.
     attention_mma_full: ComputePipeline,
-    /// E17 GEMM-attention for full-layer PREFILL (`DGQ_GEMM_ATTN`): [qk, softmax, pv].
-    /// None unless the flag is set. Prefill-only; denoise keeps attention_mma_full.
+    /// E17 GEMM-attention for full-layer PREFILL (`DGQ_GEMM_ATTN`, default on):
+    /// [qk, softmax, pv]. Prefill runs the full decomp; denoise reuses the qk
+    /// stage through E20 top-k (`DGQ_ATTN_TOPK_DECODE`).
     attn_gemm: Option<[ComputePipeline; 3]>,
     /// E17b f32-side-KV variant (FC30): reads the f32 side ring, all-float MMA.
     /// None unless DGQ_GEMM_ATTN && DGQ_PREFILL_KV_F32. Preferred over `attn_gemm`
     /// when present (matches attention_mma_full_side precision).
     attn_gemm_side: Option<[ComputePipeline; 3]>,
-    /// E20 top-k sparse attention for full-layer PREFILL (`DGQ_ATTN_TOPK`):
-    /// [qk (reused from E17), topk_softmax, topk_pv]. None unless the flag is
-    /// set. Prefill-only; quality-gated (non-bit-identical).
+    /// E20 top-k sparse attention for full layers, BOTH phases (`DGQ_ATTN_TOPK`
+    /// prefill, `DGQ_ATTN_TOPK_DECODE` denoise — both default on):
+    /// [qk (reused from E17), topk_softmax, topk_pv]. Quality-gated
+    /// (non-bit-identical).
     attn_topk: Option<[ComputePipeline; 3]>,
     /// E20 f32-side-KV variant (FC30). None unless DGQ_ATTN_TOPK &&
     /// DGQ_PREFILL_KV_F32.
