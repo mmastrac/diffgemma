@@ -227,9 +227,20 @@ layer → #3 → #4 falls out of the same scanner.
   50-field struct read throughout — a peer-module split forces ~50-100
   promotions. If done: move StepEnc+StepRuntime+build as ONE execution
   child. Full golden+suite gate mandatory.
-- **`metal/oracle/` quarantine**: needs an accurate oracle-vs-production
-  audit first — `engine`/`decoder`/`kv_cache` are production
-  (encoder-prefill path), only a subset is genuinely oracle-only.
+- **`metal/oracle/` quarantine**: audit DONE (2026-07-17). Confirmed:
+  `engine`/`decoder`/`kv_cache`/`decoder_layer`/`decoder_attention`/
+  `weights`/`moe`/`router` are production via the prefill path
+  (`MonolithicEncoderCache` owns `GpuDecoderEngine` and drives
+  `forward_encoder_prefill_resident`). Safe-to-quarantine set (zero
+  production callers): `step_m0`, `step_kernel_diagnostics`,
+  `step_kv_audits`, `bench_gemm`, `probe`, `step_attn_dump`,
+  `step_logits_dump`, `step_moe_{,route_,batched_pin_,single_}dump`,
+  `step_preamble_dump`. MIXED, split before moving: `decoder.rs`
+  (`load_weight_cache*`/`GpuDecoderScratch` prod vs `forward`/
+  `forward_inner` validation-only — the validation forward is what pulls
+  in `lm_head.rs` and the `sampler.rs` GPU path), `decoder_layer.rs`
+  (prefill fns prod vs `forward_decoder*` validation),
+  `memwatch.rs` (`physical_ram_bytes` prod). Move pending user sign-off.
 - **Clippy residue**: 60 warnings remain post-cleanup (arg-count/
   type-width allowed crate-level); opportunistic, not a campaign.
 - **cli.rs usage string**: six advertised commands don't exist,
