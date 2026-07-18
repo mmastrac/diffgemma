@@ -542,6 +542,7 @@ pub fn propose_block(
                         "active": active,
                         "mean_entropy": st.mean_entropy,
                         "stop_flag": st.stop_flag,
+                        "step_ms": step_ms,
                         "pmax": pmax_from_rowstats(&rt.read_sample_rowstats(active)),
                         "entropy": &st.entropy[..active],
                         "accept": &st.accept[..active],
@@ -977,6 +978,7 @@ pub fn propose_block(
     // block re-denoises the dropped tail against committed left context.
     // Floor: rows inside the first MIN_CONF_KEEP never trim (progress
     // guarantee; the E6/commit-guard paths own those failures).
+    let mut conf_trim_row: Option<usize> = None;
     let mut conf_tau = crate::flags::commit_conf_trim();
     if conf_tau <= 0.0 && denoise_stop == DenoiseStopReason::PrefixExit {
         // A prefix-exited head shares the mean's blind spot (one unresolved
@@ -1015,7 +1017,23 @@ pub fn propose_block(
                 );
             }
             argmax_tokens.truncate(first_bad);
+            conf_trim_row = Some(first_bad);
         }
+    }
+
+    if progress_enabled() {
+        let toks = argmax_tokens.len();
+        let secs = block_elapsed.as_secs_f64().max(1e-9);
+        eprintln!(
+            "step-generate: block {block_idx} commit {toks}/{committed_canvas} tokens after {block_step_count} steps (stop={}) {:.1} tok/s{}",
+            denoise_stop.as_str(),
+            toks as f64 / secs,
+            if toks < committed_canvas {
+                " [early exit / trim]"
+            } else {
+                ""
+            },
+        );
     }
 
     if let Some(path) = crate::flags::trace_pmax_jsonl() {
@@ -1024,10 +1042,19 @@ pub fn propose_block(
             serde_json::json!({
                 "kind": "block_commit",
                 "block": block_idx,
+                // Turn identity + position: label changes per request, and
+                // block_base (prompt + committed so far) orders blocks within
+                // a turn — the trace is analyzable without stderr logs.
+                "label": ts.label,
+                "block_base": ts.sequences.len(),
                 "steps": block_step_count,
+                "denoise_secs": block_elapsed.as_secs_f64(),
+                "attempt_empty_retries": empty_retry_attempt,
+                "attempt_nc_retries": nc_retry_attempt,
                 "active": committed_canvas,
                 // Post-confidence-trim proposal length (== active when off).
                 "kept": argmax_tokens.len(),
+                "conf_trim_row": conf_trim_row,
                 "stop_reason": denoise_stop.as_str(),
                 "eos": rt.read_params().eos_token_id,
                 "mean_entropy": st.mean_entropy,

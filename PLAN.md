@@ -218,6 +218,47 @@ layer → #3 → #4 falls out of the same scanner.
 
 ### Correctness debt
 
+- **Hard-kill flag validation (user-directed 2026-07-18)**: any `DGQ_*`
+  flag present in the env with an unparseable or out-of-range value must
+  exit the process with a clear message instead of silently falling back
+  to the default (today `DGQ_PREFIX_EXIT=1` silently disables — the exact
+  footgun). Implement centrally in `RuntimeConfig::from_reader` so every
+  flag gets it; keep unset = default. Mind `EMPTY_ENV`/test parsing and
+  the drift-tripwire pattern.
+- **KV reuse+delta ≠ fresh prefill (PROVEN divergence, 2026-07-18; the
+  likely "KV-lineage drift" root)**: chasing a live `existingIf`
+  insertion-typo seam (which is NOT an off-by-one — it committed
+  mid-block in a `confident`-stopped block, the non-dup cousin of the
+  stutter; the analog reproduced in replay at p_max 0.405, `ownBut`)
+  established: byte-identical prompt (58,017 chars), same seed/flags/
+  binary, engine fully deterministic (two identical fresh-prefill
+  requests → 47/47 blocks bit-identical argmax) — yet the live turn
+  (reused 14,509 + 266 delta-extend, epoch 22, ring wrapped ~3.5×)
+  forked from fresh prefill at block 1. Therefore reuse+delta KV is
+  numerically ≠ fresh-prefill KV. Prime suspect: chunk-path mismatch
+  (M=1024 batched super-chunk vs small-extend path bf16 accumulation
+  order) and/or deep-epoch ring state. NEXT: generation-free two-path
+  kv_hash test — build the same tokens via (a) fresh prefill (b) prefix
+  prefill → truncate → delta-extend, compare position-ordered kv_hash;
+  bisect over wrap depth × delta size. Artifacts: scratchpad pmax/
+  turn11 traces, /tmp/logs (live), ops line 232.
+- **Exact-prefix repeat misses reuse**: re-POSTing an identical request
+  paid `truncate_kv_to` ring rebuild 22263→14775 (39.45s!) then
+  re-prefilled all 14,775 with `reused 0`. Should be ~100% reuse
+  (KV-reuse-first). Read `route()`/`reset_kv_unless_extends` for the
+  delta==0 edge.
+- **Two-tier conf-trim candidate (from replay p_max data)**: insertion
+  typos commit below ~0.5 (`ownBut` 0.405, ` for` 0.39, code garble
+  0.27–0.55) while benign soft rows dominate 0.55+; add an unconditional
+  `p_max < 0.5` trim tier alongside the dup-conjunctive 0.9 tier. Needs
+  the same smoketest ×3 + strain gates (sub-0.5 rows do occur in
+  creative blocks ~1/several blocks).
+- **serve ops.jsonl is no longer token-level replayable**: the registry
+  op format (activate/generate/finalize summaries) is skipped by
+  `replay` ("unknown op shape") — the collapse-repro workflow's replay
+  path is broken for current serve logs. Either teach `replay` the
+  registry format (activate carries the full prompt token array) or log
+  a parallel token-level stream.
 - **`generate_with_session` ring-truncate duplicate (task #93, still
   open)**: `step_generate.rs` reuse path calls `prefill_chunks_from(reuse,
   delta)` with no `kv_truncate_needs_ring_rebuild` check (the fixed
