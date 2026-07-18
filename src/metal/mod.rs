@@ -6,6 +6,7 @@ mod attention_batch;
 pub(crate) mod batch;
 mod batched_kernels;
 mod bench_gemm;
+mod bench_gemm_sparse;
 pub(crate) mod buffer;
 pub(crate) mod debug_status;
 mod decoder;
@@ -56,9 +57,11 @@ pub use step_kernel::build_offsets_from_store;
 
 pub use attention::GpuAttention;
 pub use bench_gemm::{
-    GemmShape, bench_custom_kernel, bench_gemm_bf16, bench_gemm_block_q4, bench_gemm_int_sparse,
-    bench_gemm_tunable, bench_gemm_tunable_db, bench_gemm_tunable_sparse, bench_mpsgraph_oracle,
-    parse_shapes, print_bench_rows,
+    GemmShape, bench_custom_kernel, bench_gemm_bf16, bench_gemm_block_q4, bench_gemm_tunable,
+    bench_mpsgraph_oracle, parse_shapes, print_bench_rows,
+};
+pub use bench_gemm_sparse::{
+    bench_gemm_int_sparse, bench_gemm_tunable_db, bench_gemm_tunable_sparse,
 };
 pub use decoder::GpuDecoderScratch;
 pub use engine::GpuDecoderEngine;

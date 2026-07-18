@@ -908,5 +908,9 @@ pub fn prefill_monolithic_kv_cpu(
 mod engine_extend_bench_tests;
 
 #[cfg(all(test, target_os = "macos"))]
+#[path = "step_kv_fusion_tests.rs"]
+mod fusion_tests;
+
+#[cfg(all(test, target_os = "macos"))]
 #[path = "step_kv_encoder_moe_tests.rs"]
 mod encoder_moe_kv_tests;

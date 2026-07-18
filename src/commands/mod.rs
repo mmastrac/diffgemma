@@ -21,6 +21,7 @@ mod model_ops;
 mod replay;
 mod smoketest;
 mod step_debug;
+mod step_debug_dumps;
 mod step_gate;
 
 pub(crate) use bench::*;
@@ -32,6 +33,7 @@ pub(crate) use model_ops::*;
 pub(crate) use replay::*;
 pub(crate) use smoketest::*;
 pub(crate) use step_debug::*;
+pub(crate) use step_debug_dumps::*;
 pub(crate) use step_gate::*;
 
 pub(crate) fn dispatch(cli: Cli) -> ExitCode {
