@@ -19,6 +19,28 @@ fn log_neutralized(n: usize) {
 }
 
 impl Worker {
+    /// The one render+encode seam: guarded tool-grammar render of
+    /// `messages`+`tools`, encoded with client-text special literals
+    /// neutralized. Returns (token ids, neutralized count, guarded render) —
+    /// callers decide whether to log the count (the sizing closure renders in
+    /// a loop and stays silent).
+    fn render_prompt(
+        &self,
+        messages: &[serde_json::Value],
+        tools: &[serde_json::Value],
+        add_generation_prompt: bool,
+        thinking: bool,
+    ) -> (Vec<u32>, usize, String) {
+        let g = crate::tools::render_conversation_guarded(
+            messages,
+            tools,
+            add_generation_prompt,
+            thinking,
+        );
+        let (ids, neutralized) = self.tokenizer.encode_prompt(&g);
+        (ids, neutralized, g)
+    }
+
     /// Open the session (Metal objects are not `Send`, so they must be created
     /// on this thread), signal readiness, then drain the job queue one at a time.
     pub(crate) fn run(self, ready: mpsc::Sender<Result<(), String>>, jobs: mpsc::Receiver<Job>) {
@@ -130,13 +152,8 @@ impl Worker {
         let history = build_turns(&job.messages);
 
         let (prompt, prompt_text) = if tool_mode {
-            let g = crate::tools::render_conversation_guarded(
-                &job.messages,
-                &job.tools,
-                true,
-                thinking,
-            );
-            let (ids, neutralized) = self.tokenizer.encode_prompt(&g);
+            let (ids, neutralized, g) =
+                self.render_prompt(&job.messages, &job.tools, true, thinking);
             log_neutralized(neutralized);
             (ids, crate::tools::strip_client_guards(&g))
         } else {
@@ -395,10 +412,10 @@ impl Worker {
                         assistant["tool_calls"] = serde_json::Value::Array(tool_calls.clone());
                     }
                     completed.push(assistant);
-                    let g = crate::tools::render_conversation_guarded(
-                        &completed, &job.tools, false, thinking,
-                    );
-                    Some(self.tokenizer.encode_prompt(&g).0)
+                    Some(
+                        self.render_prompt(&completed, &job.tools, false, thinking)
+                            .0,
+                    )
                 } else {
                     let mut completed = history.clone();
                     completed.push(crate::chat_template::ChatTurn::model(content.clone()));
@@ -508,13 +525,8 @@ impl Worker {
         // responses (still verbose here) have been summarized yet.
         let routing_messages = substitute(store, &job.messages);
         let routing_prompt = {
-            let g = crate::tools::render_conversation_guarded(
-                &routing_messages,
-                &tools_aug,
-                true,
-                thinking,
-            );
-            let (ids, neutralized) = self.tokenizer.encode_prompt(&g);
+            let (ids, neutralized, _) =
+                self.render_prompt(&routing_messages, &tools_aug, true, thinking);
             log_neutralized(neutralized);
             ids
         };
@@ -553,8 +565,10 @@ impl Worker {
                 "role": "user", "content": tc::summarize_instruction(),
             }));
             let too_big = |ctx: &[serde_json::Value]| {
-                let g = crate::tools::render_conversation_guarded(ctx, &tools_aug, true, false);
-                self.tokenizer.encode_prompt(&g).0.len() + canvas + 64 > self.max_seq
+                // NOTE: thinking=false here where siblings pass the request
+                // flag — preserved as-is (sizing-only render; PLAN item).
+                self.render_prompt(ctx, &tools_aug, true, false).0.len() + canvas + 64
+                    > self.max_seq
             };
             if too_big(&ctx) {
                 // The verbose response alone blows the context: summarize a
@@ -602,8 +616,7 @@ impl Worker {
         // routing render IS the main prompt — skip the duplicate render+encode.
         let (messages_sub, prompt) = if summarized_any {
             let msgs = substitute(store, &job.messages);
-            let g = crate::tools::render_conversation_guarded(&msgs, &tools_aug, true, thinking);
-            let p = self.tokenizer.encode_prompt(&g).0;
+            let p = self.render_prompt(&msgs, &tools_aug, true, thinking).0;
             (msgs, p)
         } else {
             (routing_messages, routing_prompt)
