@@ -329,14 +329,31 @@ impl<S: PipelineStage> ToolRepairStage<S> {
     }
 
     /// One error tool-response per invalid call attempt in `reply` (generic
-    /// name when unrecoverable); a single generic error when the reply is
+    /// name when unrecoverable); a tailored error when the call was emitted
+    /// inside the thinking block; a single generic error when the reply is
     /// invalid without any recognizable call attempt.
     fn error_responses(reply: &str) -> String {
         const ERR: &str = "error: this tool call was malformed and has been discarded. \
              Regenerate your narration and tool calls, corrected, in full, then \
              continue as before.";
+        const ERR_THINKING: &str = "error: you emitted this tool call inside your thinking \
+             block, where it cannot be executed. It has been discarded. Regenerate \
+             your reply with the narration and the tool call in the visible \
+             response, then continue as before.";
         let mut out = String::new();
-        for (name, valid) in crate::tools::scan_call_attempts(reply) {
+        if crate::tools::tool_call_lost_in_thinking(reply) {
+            for name in crate::tools::thinking_call_names(reply) {
+                let name = if name.is_empty() { "tool" } else { &name };
+                out.push_str(&crate::tools::render_tool_response(
+                    name,
+                    &serde_json::json!({"content": ERR_THINKING}),
+                ));
+            }
+        }
+        // Malformed-call errors are judged on the VISIBLE text only: a
+        // fragment rehearsed inside thought is not an attempt to act.
+        for (name, valid) in crate::tools::scan_call_attempts(&crate::tools::strip_thinking(reply))
+        {
             if valid {
                 continue;
             }
@@ -1325,6 +1342,29 @@ mod tests {
                 _ => PipelineEvent::Error("unexpected op".into()),
             }
         }
+    }
+
+    /// A call emitted inside the thinking block gets the tailored error
+    /// (naming the lost call), not the generic malformed-call text.
+    #[test]
+    fn repair_error_responses_for_thinking_call() {
+        let lost = "<|channel>thought\n<|tool_call>call:write{path:<|\"|>/tmp/x<|\"|>}<tool_call|><channel|>";
+        let errs = ToolRepairStage::<RepairScript>::error_responses(lost);
+        assert!(
+            errs.contains("inside your thinking block"),
+            "missing thinking-specific error: {errs}"
+        );
+        assert!(
+            errs.contains("response:write"),
+            "error must name the lost call: {errs}"
+        );
+
+        let malformed = "<|tool_call>call:write{path:";
+        let errs = ToolRepairStage::<RepairScript>::error_responses(malformed);
+        assert!(
+            errs.contains("was malformed"),
+            "generic path broken: {errs}"
+        );
     }
 
     /// The repair stage's choreography, pinned against a scripted inner: an

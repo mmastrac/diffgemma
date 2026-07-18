@@ -436,7 +436,7 @@ pub fn message_text(m: &Value) -> String {
 }
 
 /// Remove `<|channel>…<channel|>` thought spans (jinja `strip_thinking`).
-fn strip_thinking(text: &str) -> String {
+pub(crate) fn strip_thinking(text: &str) -> String {
     let mut result = String::new();
     for part in text.split("<channel|>") {
         match part.split_once("<|channel>") {
@@ -576,13 +576,52 @@ pub fn scan_call_attempts(text: &str) -> Vec<(String, bool)> {
     out
 }
 
+/// Complete tool calls emitted INSIDE the thought channel while the visible
+/// reply has none: the model acted in the wrong channel, and the thought
+/// strip would silently discard its action. Rehearsing a call in thought
+/// while ALSO emitting it visibly is common and fine — only the lost case
+/// flags.
+pub fn tool_call_lost_in_thinking(text: &str) -> bool {
+    if !parse_tool_calls(&strip_thinking(text)).is_empty() {
+        return false; // a visible call exists; thought content is moot
+    }
+    let mut rest = text;
+    while let Some(open) = rest.find("<|channel>") {
+        let span = &rest[open + "<|channel>".len()..];
+        let end = span.find("<channel|>").unwrap_or(span.len());
+        if !parse_tool_calls(&span[..end]).is_empty() {
+            return true;
+        }
+        rest = &span[end..];
+    }
+    false
+}
+
+/// Names of complete calls found inside thought spans (for the repair
+/// stage's error responses).
+pub fn thinking_call_names(text: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find("<|channel>") {
+        let span = &rest[open + "<|channel>".len()..];
+        let end = span.find("<channel|>").unwrap_or(span.len());
+        names.extend(parse_tool_calls(&span[..end]).into_iter().map(|c| c.name));
+        rest = &span[end..];
+    }
+    names
+}
+
 /// Strict reply-level grammar verdict for the validator stage: a reply that
-/// speaks the tool grammar at all must parse cleanly. Plain prose is `Ok`.
-/// (Prose containing a bare `call:` is flagged, consistent with
-/// `should_continue_past_stop` treating it as an unfinished tool turn.)
+/// speaks the tool grammar at all must parse cleanly and in the VISIBLE
+/// channel. Plain prose is `Ok`. (Prose containing a bare `call:` is
+/// flagged, consistent with `should_continue_past_stop` treating it as an
+/// unfinished tool turn.)
 pub fn validate_tool_reply(text: &str) -> Result<(), &'static str> {
     if has_incomplete_tool_call(text) {
         return Err("incomplete tool call");
+    }
+    if tool_call_lost_in_thinking(text) {
+        return Err("tool call inside thinking block");
     }
     if text.contains("call:") && parse_tool_calls(text).is_empty() {
         return Err("tool-call grammar present but nothing parseable");
@@ -819,6 +858,25 @@ mod tests {
         ];
         let old_canonical = render_conversation(&old_msgs, &tools, false, false);
         assert!(!next.starts_with(&old_canonical));
+    }
+
+    #[test]
+    fn tool_call_lost_in_thinking_verdicts() {
+        let lost = "<|channel>thought\nI should write the file.<|tool_call>call:write{path:<|\"|>/tmp/x<|\"|>}<tool_call|><channel|>Done thinking.";
+        assert!(tool_call_lost_in_thinking(lost));
+        assert_eq!(thinking_call_names(lost), vec!["write".to_string()]);
+        assert_eq!(
+            validate_tool_reply(lost),
+            Err("tool call inside thinking block")
+        );
+
+        // Rehearsal in thought + the real call visible: fine and common.
+        let rehearsed = "<|channel>thought\nI will call:write{path:<|\"|>/tmp/x<|\"|>}<channel|><|tool_call>call:write{path:<|\"|>/tmp/x<|\"|>}<tool_call|>";
+        assert!(!tool_call_lost_in_thinking(rehearsed));
+        assert!(validate_tool_reply(rehearsed).is_ok());
+
+        // No thought channel at all.
+        assert!(!tool_call_lost_in_thinking("plain answer, no tools"));
     }
 
     #[test]
