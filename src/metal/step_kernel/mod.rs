@@ -170,6 +170,14 @@ pub struct ModelLayout {
     pub layers: [LayerOffsets; N_LAYERS],
 }
 
+/// Which stage-2/3 pair rides on the shared E17 QK decomposition
+/// (`encode_attn_decomp`): E17's dense softmax+PV or E20's top-k pair.
+#[derive(Clone, Copy)]
+enum AttnDecompKind {
+    Gemm,
+    TopK,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct StepParams {
@@ -3178,148 +3186,35 @@ impl StepEnc<'_> {
         Ok(())
     }
 
-    /// E17: full-layer PREFILL attention via the GEMM decomposition
-    /// (`DGQ_GEMM_ATTN`). Three head-batched dispatches — QK (S=Q.K^T) ->
-    /// softmax (masked exp + row denom) -> PV (O=P.V / L) — reading f16 K/V
-    /// direct from the main cache, writing O to the attno arena. Prefill-only;
-    /// caller guarantees `prefill_causal && l.is_full == 1` and that the
-    /// pipelines/scratch are present. Not bit-identical to attention_mma_full.
+    /// E17 full-layer prefill attention: the [qk, softmax, pv] GEMM
+    /// decomposition (see `shaders/attn/attention_gemm`).
     fn encode_attn_gemm(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
-        use crate::shaders::attention_gemm::n_pad;
-        // Tunable tile geometry (task #87) — must match the compiled pipelines.
-        let (qk_bm, qk_bn, pv_bm, pv_bn, sm_tpg) = crate::flags::gemm_attn_tile();
-        let l = &layout.layers[layer];
-        let hd = l.head_dim as usize;
-        let nkv = l.n_kv_heads as usize;
-        let group = STEP_NQ_HEADS / nkv;
-        let m = self.active_canvas;
-        let kv_len = self.dispatch_kv_len() as usize;
-        let t_total = kv_len + m;
-        let np = n_pad(t_total);
-        // Q/O sub-chunk row offset into the batched prefill planes.
-        let qo_row = CANVAS * self.sub_c * STEP_NQ_HEADS * hd * 2;
-
-        let mut dims = crate::shaders::attention_gemm::AttnGemmDims {
-            m: m as u32,
-            n: t_total as u32,
-            k: hd as u32,
-            a_row_stride: (STEP_NQ_HEADS * hd) as u32,
-            b_row_stride: (nkv * hd * 2) as u32,
-            s_row_stride: np as u32,
-            out_row_stride: (STEP_NQ_HEADS * hd) as u32,
-            causal: 1,
-            kv_len: kv_len as u32,
-            hd: hd as u32,
-            group: group as u32,
-            nkv: nkv as u32,
-            s_head_stride: (m * np) as u32,
-            head_base: 0,
-        };
-
-        let tg128 = MTLSize {
-            width: 128,
-            height: 1,
-            depth: 1,
-        };
-        let tg_sm = MTLSize {
-            width: sm_tpg,
-            height: 1,
-            depth: 1,
-        };
-        // E17a: process Q heads in batches of HC so the S/P scratch holds only
-        // HC heads. Data offsets use the global head (head_base + tgid.z); the
-        // scratch is indexed by the batch-local tgid.z.
-        let hc = crate::flags::gemm_attn_head_chunk().min(STEP_NQ_HEADS);
-        // E17b: prefer the f32-side-KV variant (reads the f32 side ring at
-        // buffer 9) when compiled — matches attention_mma_full_side precision.
-        let side = self.ps.attn_gemm_side.is_some();
-        let side_off = self.bufs.kv_f32_side_offs[layer] as usize;
-        let pipes = if side {
-            self.ps.attn_gemm_side.as_ref().unwrap().clone()
-        } else {
-            self.ps.attn_gemm.as_ref().unwrap().clone()
-        };
-        let mut h0 = 0usize;
-        while h0 < STEP_NQ_HEADS {
-            let hb = (STEP_NQ_HEADS - h0).min(hc);
-            dims.head_base = h0 as u32;
-            let dims_pv = crate::shaders::attention_gemm::AttnGemmDims {
-                n: hd as u32,
-                k: t_total as u32,
-                a_row_stride: np as u32,
-                ..dims
-            };
-            let grid_qk = MTLSize {
-                width: t_total.div_ceil(qk_bn),
-                height: m.div_ceil(qk_bm),
-                depth: hb,
-            };
-            let grid_sm = MTLSize {
-                width: m,
-                height: hb,
-                depth: 1,
-            };
-            let grid_pv = MTLSize {
-                width: hd.div_ceil(pv_bn),
-                height: m.div_ceil(pv_bm),
-                depth: hb,
-            };
-
-            // QK: S = Q.K^T. Q at the sub-chunk offset; K from the f16 main cache
-            // (buffer 1 @ kv_region) or the f32 side ring (buffer 9 @ side_off).
-            self.sink_set_pipeline(&pipes[0]);
-            self.sink_set_buffer(
-                &self.bufs.arena,
-                self.arena().attnq_off() as usize + qo_row,
-                0,
-            );
-            self.sink_set_buffer(&self.bufs.kvcache, l.kv_region as usize, 1);
-            self.sink_set_buffer(self.bufs.attn_gemm_s.as_ref().unwrap(), 0, 2);
-            if side {
-                self.sink_set_buffer(self.bufs.kv_f32_side.as_ref().unwrap(), side_off, 9);
-            }
-            self.sink_set_bytes(&dims, 3);
-            self.sink_dispatch(grid_qk, tg128);
-            self.sink_memory_barrier();
-
-            // Softmax: P = exp(S - rowmax), masked; denom -> lrow.
-            self.sink_set_pipeline(&pipes[1]);
-            self.sink_set_buffer(self.bufs.attn_gemm_s.as_ref().unwrap(), 0, 0);
-            self.sink_set_buffer(self.bufs.attn_gemm_p.as_ref().unwrap(), 0, 1);
-            self.sink_set_buffer(self.bufs.attn_gemm_lrow.as_ref().unwrap(), 0, 2);
-            self.sink_set_bytes(&dims, 3);
-            self.sink_dispatch(grid_sm, tg_sm);
-            self.sink_memory_barrier();
-
-            // PV: O = (P.V) / L. V from the f16 cache (buffer 1) or f32 side ring
-            // (buffer 9); O at the sub-chunk offset in the attno plane.
-            self.sink_set_pipeline(&pipes[2]);
-            self.sink_set_buffer(self.bufs.attn_gemm_p.as_ref().unwrap(), 0, 0);
-            self.sink_set_buffer(&self.bufs.kvcache, l.kv_region as usize, 1);
-            self.sink_set_buffer(
-                &self.bufs.arena,
-                self.arena().attno_off() as usize + qo_row,
-                2,
-            );
-            self.sink_set_buffer(self.bufs.attn_gemm_lrow.as_ref().unwrap(), 0, 3);
-            if side {
-                self.sink_set_buffer(self.bufs.kv_f32_side.as_ref().unwrap(), side_off, 9);
-            }
-            self.sink_set_bytes(&dims_pv, 4);
-            self.sink_dispatch(grid_pv, tg128);
-            self.sink_memory_barrier();
-            h0 += hb;
-        }
-        Ok(())
+        self.encode_attn_decomp(layer, layout, AttnDecompKind::Gemm)
     }
 
     /// E20: top-k sparse attention dispatch for full layers — causal PREFILL
     /// (`DGQ_ATTN_TOPK`) and bidirectional DENOISE (`DGQ_ATTN_TOPK_DECODE`);
-    /// `self.prefill_causal` selects the mask. Mirrors `encode_attn_gemm` for
-    /// the QK stage (same kernel, same S plane), then dispatches
-    /// `attn_topk_softmax` (top-k selection + renormalization) and
-    /// `attn_topk_pv` (gathered-V PV) instead of E17's softmax + PV.
+    /// `self.prefill_causal` selects the mask. Shares the E17 QK stage (same
+    /// kernel, same S plane), then dispatches `attn_topk_softmax` (top-k
+    /// selection + renormalization) and `attn_topk_pv` (gathered-V PV)
+    /// instead of E17's softmax + PV.
     fn encode_attn_topk(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
+        self.encode_attn_decomp(layer, layout, AttnDecompKind::TopK)
+    }
+
+    /// The shared E17/E20 driver: one QK scaffold (identical dims, S plane,
+    /// head-chunk loop), per-variant stage 2/3. Merged from the two ~80%%-
+    /// identical encoders so the QK stages can never drift apart.
+    ///
+    /// `causal`: E17 is only dispatched on the prefill path
+    /// (`self.prefill_causal == true`), so deriving both variants' mask from
+    /// `prefill_causal` is bit-identical to E17's old hard-coded `causal: 1`.
+    fn encode_attn_decomp(
+        &mut self,
+        layer: usize,
+        layout: &ModelLayout,
+        kind: AttnDecompKind,
+    ) -> Result<(), Error> {
         use crate::shaders::attention_gemm::n_pad;
         use crate::shaders::attention_topk::{BM, BN, PV_BN, SOFTMAX_TPG};
         let l = &layout.layers[layer];
@@ -3330,7 +3225,15 @@ impl StepEnc<'_> {
         let kv_len = self.dispatch_kv_len() as usize;
         let t_total = kv_len + m;
         let np = n_pad(t_total);
+        // Q/O sub-chunk row offset into the batched prefill planes.
         let qo_row = CANVAS * self.sub_c * STEP_NQ_HEADS * hd * 2;
+        // Tunable tile geometry (task #87) — must match the compiled E17
+        // pipelines. E20's tiles are compile-time consts.
+        let (qk_bm_f, qk_bn_f, pv_bm_f, pv_bn_f, sm_tpg) = crate::flags::gemm_attn_tile();
+        let (qk_bm, qk_bn) = match kind {
+            AttnDecompKind::Gemm => (qk_bm_f, qk_bn_f),
+            AttnDecompKind::TopK => (BM, BN),
+        };
 
         let mut dims = crate::shaders::attention_gemm::AttnGemmDims {
             m: m as u32,
@@ -3349,7 +3252,7 @@ impl StepEnc<'_> {
             head_base: 0,
         };
         // kv-adaptive k (DGQ_ATTN_TOPK_DYN): k grows with context, capped by
-        // the compiled K_PAD. Fixed DGQ_ATTN_TOPK_K otherwise.
+        // the compiled K_PAD. Fixed DGQ_ATTN_TOPK_K otherwise. (E20 only.)
         let k_param =
             crate::flags::attn_topk_k_for(t_total).min(crate::flags::attn_topk_k_pad()) as u32;
         let tg128 = MTLSize {
@@ -3358,36 +3261,45 @@ impl StepEnc<'_> {
             depth: 1,
         };
         let tg_sm = MTLSize {
-            width: SOFTMAX_TPG,
+            width: match kind {
+                AttnDecompKind::Gemm => sm_tpg,
+                AttnDecompKind::TopK => SOFTMAX_TPG,
+            },
             height: 1,
             depth: 1,
         };
-        let tg_pv = MTLSize {
+        let tg_pv_topk = MTLSize {
             width: 32,
             height: 1,
             depth: 1,
         }; // one simdgroup
-        // Head-chunk from the SAME flag the scratch allocation reads (task #97:
-        // this used to hardcode TuneCfg::default().hc=4, ignoring the shipped
-        // BO optimum DGQ_GEMM_ATTN_HC=16 and mis-sizing vs the S plane).
+        // E17a: process Q heads in batches of HC so the S/P scratch holds only
+        // HC heads. Data offsets use the global head (head_base + tgid.z); the
+        // scratch is indexed by the batch-local tgid.z. Both variants read the
+        // SAME flag the scratch allocation reads (task #97).
         let hc = crate::flags::gemm_attn_head_chunk().min(STEP_NQ_HEADS);
-        // The f32 side ring is a PREFILL mechanism — denoise-step canvas KV
-        // writes only reach the main f16 cache, so decode dispatches must
-        // read it (never the side ring) even when E14 is on.
-        let side = self.ps.attn_topk_side.is_some() && self.prefill_causal;
+        // E17b/E20-side: prefer the f32-side-KV pipelines when compiled. The
+        // f32 side ring is a PREFILL mechanism — denoise-step canvas KV writes
+        // only reach the main f16 cache, so decode dispatches must read it
+        // (never the side ring) even when E14 is on.
+        let side = match kind {
+            AttnDecompKind::Gemm => self.ps.attn_gemm_side.is_some(),
+            AttnDecompKind::TopK => self.ps.attn_topk_side.is_some() && self.prefill_causal,
+        };
         let side_off = self.bufs.kv_f32_side_offs[layer] as usize;
-        let pipes = if side {
-            self.ps.attn_topk_side.as_ref().unwrap().clone()
-        } else {
-            self.ps.attn_topk.as_ref().unwrap().clone()
+        let pipes = match (kind, side) {
+            (AttnDecompKind::Gemm, true) => self.ps.attn_gemm_side.as_ref().unwrap().clone(),
+            (AttnDecompKind::Gemm, false) => self.ps.attn_gemm.as_ref().unwrap().clone(),
+            (AttnDecompKind::TopK, true) => self.ps.attn_topk_side.as_ref().unwrap().clone(),
+            (AttnDecompKind::TopK, false) => self.ps.attn_topk.as_ref().unwrap().clone(),
         };
         let mut h0 = 0usize;
         while h0 < STEP_NQ_HEADS {
             let hb = (STEP_NQ_HEADS - h0).min(hc);
             dims.head_base = h0 as u32;
             let grid_qk = MTLSize {
-                width: t_total.div_ceil(BN),
-                height: m.div_ceil(BM),
+                width: t_total.div_ceil(qk_bn),
+                height: m.div_ceil(qk_bm),
                 depth: hb,
             };
             let grid_sm = MTLSize {
@@ -3395,12 +3307,11 @@ impl StepEnc<'_> {
                 height: hb,
                 depth: 1,
             };
-            let grid_pv = MTLSize {
-                width: hd.div_ceil(PV_BN),
-                height: m,
-                depth: hb,
-            };
-            // QK: same dispatch as E17 (attn_gemm_qk + FC32 u16 key plane at 8).
+
+            // QK: S = Q.K^T — the shared stage. Q at the sub-chunk offset; K
+            // from the f16 main cache (buffer 1 @ kv_region) or the f32 side
+            // ring (buffer 9 @ side_off). E20 additionally writes the FC32
+            // u16 key plane at 8 for the selection passes.
             self.sink_set_pipeline(&pipes[0]);
             self.sink_set_buffer(
                 &self.bufs.arena,
@@ -3409,7 +3320,9 @@ impl StepEnc<'_> {
             );
             self.sink_set_buffer(&self.bufs.kvcache, l.kv_region as usize, 1);
             self.sink_set_buffer(self.bufs.attn_gemm_s.as_ref().unwrap(), 0, 2);
-            self.sink_set_buffer(self.bufs.attn_topk_pat.as_ref().unwrap(), 0, 8);
+            if let AttnDecompKind::TopK = kind {
+                self.sink_set_buffer(self.bufs.attn_topk_pat.as_ref().unwrap(), 0, 8);
+            }
             if side {
                 self.sink_set_buffer(self.bufs.kv_f32_side.as_ref().unwrap(), side_off, 9);
             }
@@ -3417,35 +3330,83 @@ impl StepEnc<'_> {
             self.sink_dispatch(grid_qk, tg128);
             self.sink_memory_barrier();
 
-            // topk_softmax: S + u16 keys -> P (compressed), Idx, lrow.
-            self.sink_set_pipeline(&pipes[1]);
-            self.sink_set_buffer(self.bufs.attn_gemm_s.as_ref().unwrap(), 0, 0);
-            self.sink_set_buffer(self.bufs.attn_topk_p.as_ref().unwrap(), 0, 1);
-            self.sink_set_buffer(self.bufs.attn_topk_idx.as_ref().unwrap(), 0, 2);
-            self.sink_set_buffer(self.bufs.attn_topk_lrow.as_ref().unwrap(), 0, 3);
-            self.sink_set_buffer(self.bufs.attn_topk_pat.as_ref().unwrap(), 0, 6);
-            self.sink_set_bytes(&dims, 4);
-            self.sink_set_bytes(&k_param, 5);
-            self.sink_dispatch(grid_sm, tg_sm);
-            self.sink_memory_barrier();
+            match kind {
+                AttnDecompKind::Gemm => {
+                    let dims_pv = crate::shaders::attention_gemm::AttnGemmDims {
+                        n: hd as u32,
+                        k: t_total as u32,
+                        a_row_stride: np as u32,
+                        ..dims
+                    };
+                    let grid_pv = MTLSize {
+                        width: hd.div_ceil(pv_bn_f),
+                        height: m.div_ceil(pv_bm_f),
+                        depth: hb,
+                    };
+                    // Softmax: P = exp(S - rowmax), masked; denom -> lrow.
+                    self.sink_set_pipeline(&pipes[1]);
+                    self.sink_set_buffer(self.bufs.attn_gemm_s.as_ref().unwrap(), 0, 0);
+                    self.sink_set_buffer(self.bufs.attn_gemm_p.as_ref().unwrap(), 0, 1);
+                    self.sink_set_buffer(self.bufs.attn_gemm_lrow.as_ref().unwrap(), 0, 2);
+                    self.sink_set_bytes(&dims, 3);
+                    self.sink_dispatch(grid_sm, tg_sm);
+                    self.sink_memory_barrier();
 
-            // topk_pv: O = (P · V_gathered) / L.
-            self.sink_set_pipeline(&pipes[2]);
-            self.sink_set_buffer(self.bufs.attn_topk_p.as_ref().unwrap(), 0, 0);
-            self.sink_set_buffer(self.bufs.attn_topk_idx.as_ref().unwrap(), 0, 1);
-            self.sink_set_buffer(&self.bufs.kvcache, l.kv_region as usize, 2);
-            self.sink_set_buffer(
-                &self.bufs.arena,
-                self.arena().attno_off() as usize + qo_row,
-                3,
-            );
-            self.sink_set_buffer(self.bufs.attn_topk_lrow.as_ref().unwrap(), 0, 4);
-            if side {
-                self.sink_set_buffer(self.bufs.kv_f32_side.as_ref().unwrap(), side_off, 9);
+                    // PV: O = (P.V) / L. V from the f16 cache (buffer 1) or f32
+                    // side ring (buffer 9); O at the sub-chunk offset.
+                    self.sink_set_pipeline(&pipes[2]);
+                    self.sink_set_buffer(self.bufs.attn_gemm_p.as_ref().unwrap(), 0, 0);
+                    self.sink_set_buffer(&self.bufs.kvcache, l.kv_region as usize, 1);
+                    self.sink_set_buffer(
+                        &self.bufs.arena,
+                        self.arena().attno_off() as usize + qo_row,
+                        2,
+                    );
+                    self.sink_set_buffer(self.bufs.attn_gemm_lrow.as_ref().unwrap(), 0, 3);
+                    if side {
+                        self.sink_set_buffer(self.bufs.kv_f32_side.as_ref().unwrap(), side_off, 9);
+                    }
+                    self.sink_set_bytes(&dims_pv, 4);
+                    self.sink_dispatch(grid_pv, tg128);
+                    self.sink_memory_barrier();
+                }
+                AttnDecompKind::TopK => {
+                    let grid_pv = MTLSize {
+                        width: hd.div_ceil(PV_BN),
+                        height: m,
+                        depth: hb,
+                    };
+                    // topk_softmax: S + u16 keys -> P (compressed), Idx, lrow.
+                    self.sink_set_pipeline(&pipes[1]);
+                    self.sink_set_buffer(self.bufs.attn_gemm_s.as_ref().unwrap(), 0, 0);
+                    self.sink_set_buffer(self.bufs.attn_topk_p.as_ref().unwrap(), 0, 1);
+                    self.sink_set_buffer(self.bufs.attn_topk_idx.as_ref().unwrap(), 0, 2);
+                    self.sink_set_buffer(self.bufs.attn_topk_lrow.as_ref().unwrap(), 0, 3);
+                    self.sink_set_buffer(self.bufs.attn_topk_pat.as_ref().unwrap(), 0, 6);
+                    self.sink_set_bytes(&dims, 4);
+                    self.sink_set_bytes(&k_param, 5);
+                    self.sink_dispatch(grid_sm, tg_sm);
+                    self.sink_memory_barrier();
+
+                    // topk_pv: O = (P · V_gathered) / L.
+                    self.sink_set_pipeline(&pipes[2]);
+                    self.sink_set_buffer(self.bufs.attn_topk_p.as_ref().unwrap(), 0, 0);
+                    self.sink_set_buffer(self.bufs.attn_topk_idx.as_ref().unwrap(), 0, 1);
+                    self.sink_set_buffer(&self.bufs.kvcache, l.kv_region as usize, 2);
+                    self.sink_set_buffer(
+                        &self.bufs.arena,
+                        self.arena().attno_off() as usize + qo_row,
+                        3,
+                    );
+                    self.sink_set_buffer(self.bufs.attn_topk_lrow.as_ref().unwrap(), 0, 4);
+                    if side {
+                        self.sink_set_buffer(self.bufs.kv_f32_side.as_ref().unwrap(), side_off, 9);
+                    }
+                    self.sink_set_bytes(&dims, 5);
+                    self.sink_dispatch(grid_pv, tg_pv_topk);
+                    self.sink_memory_barrier();
+                }
             }
-            self.sink_set_bytes(&dims, 5);
-            self.sink_dispatch(grid_pv, tg_pv);
-            self.sink_memory_barrier();
             h0 += hb;
         }
         Ok(())

@@ -24,15 +24,12 @@ mod render;
 
 pub(crate) use parse::strip_thinking;
 pub use parse::{
-    ParsedToolCall, content_before_tool_calls, has_incomplete_tool_call,
-    has_trailing_after_tool_calls, message_text, parse_tool_calls, scan_call_attempts,
+    content_before_tool_calls, message_text, parse_tool_calls, scan_call_attempts,
     should_continue_past_stop, thinking_call_names, to_openai_tool_calls,
     tool_call_lost_in_thinking, validate_tool_reply,
 };
-pub use render::{
-    format_tool_declarations, render_conversation, render_conversation_guarded, strip_client_guards,
-};
-pub(crate) use render::{render_tool_response, render_tool_response_guarded};
+pub(crate) use render::render_tool_response_guarded;
+pub use render::{render_conversation, render_conversation_guarded, strip_client_guards};
 
 #[cfg(test)]
 mod tests;

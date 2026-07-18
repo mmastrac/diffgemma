@@ -31,7 +31,7 @@
 //!   (per-request `x_diffusion_drafts:false` opts out).
 
 use crate::chat_protocol::TextDecoder;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;

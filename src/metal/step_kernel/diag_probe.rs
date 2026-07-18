@@ -5,8 +5,6 @@
 
 use crate::Error;
 use crate::dgq::DgqStore;
-use crate::metal::step_quant::MoeExecutionStyle;
-use crate::model::moe::RouteResult;
 use crate::sample::Rng;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLBuffer;
