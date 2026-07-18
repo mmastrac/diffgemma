@@ -98,6 +98,7 @@ impl Bf16Gemm {
         encoder.endEncoding();
         cmd_buf.commit();
         cmd_buf.waitUntilCompleted();
+        crate::metal::assert_cmd_ok(&cmd_buf, "gemm");
 
         BufferPool::read_f32(&buf_c, c);
 
@@ -165,6 +166,7 @@ impl Bf16Gemm {
         encoder.endEncoding();
         cmd_buf.commit();
         cmd_buf.waitUntilCompleted();
+        crate::metal::assert_cmd_ok(&cmd_buf, "gemm");
 
         BufferPool::read_f32(&buf_c, c);
 
@@ -205,6 +207,7 @@ impl Bf16Gemm {
         encoder.endEncoding();
         cmd_buf.commit();
         cmd_buf.waitUntilCompleted();
+        crate::metal::assert_cmd_ok(&cmd_buf, "gemm");
         Ok(())
     }
 
@@ -242,6 +245,7 @@ impl Bf16Gemm {
         encoder.endEncoding();
         cmd_buf.commit();
         cmd_buf.waitUntilCompleted();
+        crate::metal::assert_cmd_ok(&cmd_buf, "gemm");
         Ok(())
     }
 }

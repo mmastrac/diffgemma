@@ -277,5 +277,6 @@ fn run_kernel(
     encoder.endEncoding();
     cmd_buf.commit();
     cmd_buf.waitUntilCompleted();
+    crate::metal::assert_cmd_ok(&cmd_buf, "attention");
     Ok(())
 }

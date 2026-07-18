@@ -118,6 +118,7 @@ fn run_memcpy_kernel(
     enc.endEncoding();
     cmd.commit();
     cmd.waitUntilCompleted();
+    crate::metal::assert_cmd_ok(&cmd, "probe");
     Ok(())
 }
 

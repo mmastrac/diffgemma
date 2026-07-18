@@ -524,6 +524,19 @@ impl<'a> GpuBatch<'a> {
         let cmd = self.cmd.take().expect("batch command buffer missing");
         cmd.commit();
         cmd.waitUntilCompleted();
+        // A GPU reset/watchdog kill (sleep/wake edges, driver recovery) fails
+        // the command buffer; without this check the readbacks below would
+        // silently deliver garbage — and for the ENGINE PREFILL path that
+        // means silently corrupt KV poisoning every later turn.
+        if let Some(err) = cmd.error() {
+            return Err(Error::Format(
+                format!(
+                    "engine batch command buffer failed: {}",
+                    err.localizedDescription()
+                )
+                .leak(),
+            ));
+        }
 
         if let Some(cell) = self.telemetry.as_ref() {
             let mut tel = cell.borrow_mut();

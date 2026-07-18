@@ -247,15 +247,35 @@ layer → #3 → #4 falls out of the same scanner.
   re-prefilled all 14,775 with `reused 0`. Should be ~100% reuse
   (KV-reuse-first). Read `route()`/`reset_kv_unless_extends` for the
   delta==0 edge.
-- **Two-tier conf-trim candidate (from replay p_max data)**: insertion
-  typos commit below ~0.5 (`ownBut` 0.405, ` for` 0.39, code garble
-  0.27–0.55) while benign soft rows dominate 0.55+; add an unconditional
-  `p_max < 0.5` trim tier alongside the dup-conjunctive 0.9 tier. Needs
-  the same smoketest ×3 + strain gates (sub-0.5 rows do occur in
-  creative blocks ~1/several blocks). More field specimens 2026-07-18
-  (live OpenCode, prefix-exit serve): `냥` (a Korean syllable) inserted
-  mid-English thinking, and a stray `("."` fragment INSIDE Edit tool-call
-  args — the tool-arg stutter-typo small end, adjacent to a repair cycle.
+- **Two-tier conf-trim LANDED; microscope A/B run (2026-07-18)**: the
+  contested-row commit class has THREE surfaces — duplication, insertion
+  (`냥`, `("."`, `ownBut` 0.405), and OMISSION ("Then I'll ~~start~~ with
+  line 61" — the whole clause committed at 0.296–0.49). Hard tier =
+  unconditional `p_max < 0.5` trim alongside the dup 0.9 tier (same
+  answer-region scan/floor). Live OpenCode regex-lite microscope
+  (tool-repair + PREFIX_EXIT=0.05, traced): baseline 2 runs = 29 sub-0.5
+  commits in 152 blocks incl. a missing-word clause, a `,,` inside Edit
+  args adjacent to the schema-error retry, a garbled phrase; treated
+  (adds trim) 2 runs + full strain battery = **0 sub-0.5 commits / 0
+  stutters in 137 blocks**, 36 of which PREFIX-EXITED — the layers
+  compose: prefix-exit defuses stuck tails upstream, dup tier catches
+  commit-time stutters, hard tier is the insertion backstop (validated
+  on baseline data; not yet observed firing live because upstream layers
+  starve it). CAVEAT recorded: the OpenCode-arm comparison is partly
+  trajectory luck (baseline runs stumbled into repair cycles, treated
+  didn't); the strain-battery result is the controlled evidence. Both
+  trim flags remain default OFF pending census+longctx.
+- **Environmental confound audit (user-prompted 2026-07-18)**: swap/
+  compression lossless; no purgeable Metal buffers anywhere; GPU RESETS
+  were the real vector — the engine-prefill batch path (`batch.rs end()`)
+  did NOT check `cmd.error()` after waitUntilCompleted, so a reset
+  (sleep/wake edge, driver recovery — a yellow lock screen is a
+  compositor-recovery symptom) could silently commit corrupt KV that
+  poisons every later turn. Fixed: typed error there + loud
+  `assert_cmd_ok` at all 6 diagnostic sites (hot path already checked).
+  12h system-log scan: no GPU restart events found. The live-vs-replay
+  KV divergence finding now carries an environmental-confound caveat —
+  the controlled kv_hash two-path test is the decisive experiment.
 - **serve ops.jsonl is no longer token-level replayable**: the registry
   op format (activate/generate/finalize summaries) is skipped by
   `replay` ("unknown op shape") — the collapse-repro workflow's replay

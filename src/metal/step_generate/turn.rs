@@ -1035,17 +1035,29 @@ pub fn propose_block(
                     || *t == crate::sample::FILLER_TOKEN_ID
             })
             .unwrap_or(argmax_tokens.len());
+        // Two tiers: the dup-conjunctive tier at τ (the stutter signature),
+        // and an UNCONDITIONAL hard tier at p_max < 0.5 (the insertion-typo
+        // class: `ownBut` 0.405, ` for` 0.39, code garble 0.27–0.55, and the
+        // field `냥`/`("."` specimens — clearly-broken insertions cluster
+        // below ~0.5 while benign creative soft rows dominate 0.55+).
+        const HARD_TRIM_PMAX: f32 = 0.5;
         let dup_at = |i: usize| {
             (i > 0 && argmax_tokens[i] == argmax_tokens[i - 1])
                 || (i + 1 < region_end && argmax_tokens[i] == argmax_tokens[i + 1])
         };
-        if let Some(first_bad) =
-            (MIN_CONF_KEEP..region_end).find(|&i| pmax[i] < conf_tau && dup_at(i))
+        if let Some(first_bad) = (MIN_CONF_KEEP..region_end)
+            .find(|&i| pmax[i] < HARD_TRIM_PMAX || (pmax[i] < conf_tau && dup_at(i)))
         {
             if progress_enabled() {
                 eprintln!(
-                    "step-generate: block {block_idx} confidence-trim at row {first_bad}/{committed_canvas} (dup token {} at p_max {:.3} < {conf_tau})",
-                    argmax_tokens[first_bad], pmax[first_bad],
+                    "step-generate: block {block_idx} confidence-trim at row {first_bad}/{committed_canvas} ({} token {} at p_max {:.3})",
+                    if pmax[first_bad] < HARD_TRIM_PMAX {
+                        "hard-tier"
+                    } else {
+                        "dup"
+                    },
+                    argmax_tokens[first_bad],
+                    pmax[first_bad],
                 );
             }
             argmax_tokens.truncate(first_bad);

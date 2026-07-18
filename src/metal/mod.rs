@@ -25,6 +25,21 @@ mod linear;
 mod lm_head;
 mod memory;
 pub mod memwatch;
+
+/// Panic loudly if a completed command buffer carries an error (GPU
+/// reset/watchdog kill — sleep/wake edges, driver recovery). Diagnostic and
+/// bench paths use this after `waitUntilCompleted`; silent garbage readbacks
+/// are never acceptable. Production paths return typed errors instead.
+pub(crate) fn assert_cmd_ok(
+    cmd: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
+    what: &str,
+) {
+    use objc2_metal::MTLCommandBuffer as _;
+    if let Some(err) = cmd.error() {
+        panic!("{what}: command buffer failed: {}", err.localizedDescription());
+    }
+}
+
 mod moe;
 mod pipeline_cache;
 mod probe;
