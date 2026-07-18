@@ -148,64 +148,34 @@ pub fn pipeline_flash(
 /// only. Full layers (hd=512) and sliding (hd=256); hd a multiple of NSG*8=64.
 #[cfg(target_os = "macos")]
 pub fn gpu_flash(f: &crate::shaders::attention::Fixture, causal: bool) -> Result<Vec<f32>, Error> {
-    use crate::metal::buffer::BufferPool;
-    use crate::metal::device::MetalContext;
-    use crate::shaders::bf16;
+    use crate::shaders::attn::harness::AttnRig;
     use crate::shaders::gpu_common;
     use crate::shaders::variant::KernelVariant;
-    use objc2_metal::{
-        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-        MTLSize,
-    };
+    use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
 
-    let canvas = f.canvas;
-    let n_q_heads = f.n_q_heads;
-    let nkv = f.n_kv();
-    let hd = f.head_dim();
-    let group = n_q_heads / nkv;
-    let kv_len = f.kv_len as usize;
-    let t_total = kv_len + canvas;
-    let kstride = nkv * hd * 2;
+    // Standard rig; +BK pad key rows (device tile-loads read up to key
+    // kt+BK-1 past T). f16 KV only — no side ring.
+    let rig = AttnRig::from_fixture(f, BK, false)?;
+    let (canvas, n_q_heads, hd) = (rig.canvas, rig.n_q_heads, rig.hd);
 
-    let ctx = MetalContext::new()?;
-    let pipe = pipeline_flash(&ctx, KernelVariant::PRODUCTION, BQ, BK, hd)?;
-    let mut pool = BufferPool::new();
-
-    let buf_q = pool
-        .allocate(&ctx.device, canvas * n_q_heads * hd * 2)
-        .ok_or(Error::Gpu("alloc q"))?;
-    BufferPool::write_bf16(&buf_q, &bf16::f32_slice_to_bf16_bits(&f.q));
-    let buf_out = pool
-        .allocate(&ctx.device, canvas * n_q_heads * hd * 2)
-        .ok_or(Error::Gpu("alloc out"))?;
-    // +BK pad rows: device tile-loads read up to key kt+BK-1 past T.
-    let buf_kv = pool
-        .allocate(&ctx.device, (f.kvcache.len() + BK * kstride) * 2)
-        .ok_or(Error::Gpu("alloc kv"))?;
-    {
-        let mut bits = crate::shaders::f16::f32_slice_to_f16(&f.kvcache);
-        bits.resize(bits.len() + BK * kstride, 0);
-        BufferPool::write_bf16(&buf_kv, &bits);
-    }
+    let pipe = pipeline_flash(&rig.ctx, KernelVariant::PRODUCTION, BQ, BK, hd)?;
 
     let mut dims = FlashDims {
         m: canvas as u32,
-        t_total: t_total as u32,
+        t_total: rig.t_total as u32,
         hd: hd as u32,
         a_row_stride: (n_q_heads * hd) as u32,
-        b_row_stride: kstride as u32,
+        b_row_stride: rig.kstride as u32,
         out_row_stride: (n_q_heads * hd) as u32,
         kv_len: f.kv_len,
-        group: group as u32,
-        nkv: nkv as u32,
+        group: rig.group as u32,
+        nkv: rig.nkv as u32,
         head_base: 0,
         causal: u32::from(causal),
         window: 0,
         kv_ring_mask: 0,
     };
 
-    let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
     let tg = MTLSize {
         width: 256,
         height: 1,
@@ -216,122 +186,33 @@ pub fn gpu_flash(f: &crate::shaders::attention::Fixture, causal: bool) -> Result
         height: 1,
         depth: n_q_heads,
     };
-    dims.head_base = 0;
-    enc.setComputePipelineState(&pipe.pipeline);
-    unsafe {
-        enc.setBuffer_offset_atIndex(Some(&buf_q), 0, 0);
-        enc.setBuffer_offset_atIndex(Some(&buf_kv), 0, 1);
-        enc.setBuffer_offset_atIndex(Some(&buf_out), 0, 2);
-    }
-    gpu_common::set_bytes(&enc, &dims, 3);
-    enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
-    enc.endEncoding();
-    cmd.commit();
-    cmd.waitUntilCompleted();
+    rig.run_once(|enc| {
+        dims.head_base = 0;
+        enc.setComputePipelineState(&pipe.pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&rig.buf_q), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(&rig.buf_kv), 0, 1);
+            enc.setBuffer_offset_atIndex(Some(&rig.buf_out), 0, 2);
+        }
+        gpu_common::set_bytes(enc, &dims, 3);
+        enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    })?;
 
-    let mut out = vec![0.0f32; f.out_len()];
-    let ptr = buf_out.contents().as_ptr() as *const u16;
-    for (i, o) in out.iter_mut().enumerate() {
-        *o = bf16::bf16_bits_to_f32(unsafe { *ptr.add(i) });
-    }
-    Ok(out)
+    Ok(rig.read_out_f32(f.out_len()))
 }
 
 /// Isolated timing: full-layer flash prefill (all heads, one command buffer),
 /// min-of-warmed-rounds ms/layer. Mirrors `attention_gemm::bench_gpu` so the two
-/// are directly comparable.
+/// are directly comparable. `causal` mirrors `gpu_flash()` (benches historically
+/// dispatched causal=1).
 #[cfg(target_os = "macos")]
 pub fn bench_flash(
     f: &crate::shaders::attention::Fixture,
     iters: usize,
     bq: usize,
+    causal: bool,
 ) -> Result<f64, Error> {
-    use crate::metal::buffer::BufferPool;
-    use crate::metal::device::MetalContext;
-    use crate::shaders::bf16;
-    use crate::shaders::gpu_common;
-    use crate::shaders::variant::KernelVariant;
-    use objc2_metal::{
-        MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
-    };
-    use std::time::Instant;
-
-    let canvas = f.canvas;
-    let n_q_heads = f.n_q_heads;
-    let nkv = f.n_kv();
-    let hd = f.head_dim();
-    let group = n_q_heads / nkv;
-    let t_total = f.kv_len as usize + canvas;
-    let kstride = nkv * hd * 2;
-
-    let ctx = MetalContext::new()?;
-    let pipe = pipeline_flash(&ctx, KernelVariant::PRODUCTION, bq, BK, hd)?;
-    let mut pool = BufferPool::new();
-    let buf_q = pool
-        .allocate(&ctx.device, canvas * n_q_heads * hd * 2)
-        .ok_or(Error::Gpu("alloc q"))?;
-    BufferPool::write_bf16(&buf_q, &bf16::f32_slice_to_bf16_bits(&f.q));
-    let buf_out = pool
-        .allocate(&ctx.device, canvas * n_q_heads * hd * 2)
-        .ok_or(Error::Gpu("alloc out"))?;
-    let buf_kv = pool
-        .allocate(&ctx.device, (f.kvcache.len() + BK * kstride) * 2)
-        .ok_or(Error::Gpu("alloc kv"))?;
-    {
-        let mut bits = crate::shaders::f16::f32_slice_to_f16(&f.kvcache);
-        bits.resize(bits.len() + BK * kstride, 0);
-        BufferPool::write_bf16(&buf_kv, &bits);
-    }
-    let mut dims = FlashDims {
-        m: canvas as u32,
-        t_total: t_total as u32,
-        hd: hd as u32,
-        a_row_stride: (n_q_heads * hd) as u32,
-        b_row_stride: kstride as u32,
-        out_row_stride: (n_q_heads * hd) as u32,
-        kv_len: f.kv_len,
-        group: group as u32,
-        nkv: nkv as u32,
-        head_base: 0,
-        causal: 1,
-        window: 0,
-        kv_ring_mask: 0,
-    };
-    let tg = MTLSize {
-        width: 256,
-        height: 1,
-        depth: 1,
-    };
-    let grid = MTLSize {
-        width: canvas.div_ceil(bq),
-        height: 1,
-        depth: n_q_heads,
-    };
-    let mut best = f64::INFINITY;
-    for round in 0..6 {
-        let t = Instant::now();
-        let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
-        let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
-        for _ in 0..iters {
-            dims.head_base = 0;
-            enc.setComputePipelineState(&pipe.pipeline);
-            unsafe {
-                enc.setBuffer_offset_atIndex(Some(&buf_q), 0, 0);
-                enc.setBuffer_offset_atIndex(Some(&buf_kv), 0, 1);
-                enc.setBuffer_offset_atIndex(Some(&buf_out), 0, 2);
-            }
-            gpu_common::set_bytes(&enc, &dims, 3);
-            enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
-            enc.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers);
-        }
-        enc.endEncoding();
-        cmd.commit();
-        cmd.waitUntilCompleted();
-        if round > 0 {
-            best = best.min(t.elapsed().as_secs_f64() * 1e3 / iters as f64);
-        }
-    }
-    Ok(best)
+    bench_flash_window(f, iters, bq, 0, causal)
 }
 
 /// Same as `bench_flash` with an explicit sliding window (`0` = full causal).
@@ -341,55 +222,29 @@ pub fn bench_flash_window(
     iters: usize,
     bq: usize,
     window: u32,
+    causal: bool,
 ) -> Result<f64, Error> {
-    use crate::metal::buffer::BufferPool;
-    use crate::metal::device::MetalContext;
-    use crate::shaders::bf16;
+    use crate::shaders::attn::harness::AttnRig;
     use crate::shaders::gpu_common;
     use crate::shaders::variant::KernelVariant;
-    use objc2_metal::{
-        MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
-    };
-    use std::time::Instant;
+    use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
 
-    let canvas = f.canvas;
-    let n_q_heads = f.n_q_heads;
-    let nkv = f.n_kv();
-    let hd = f.head_dim();
-    let group = n_q_heads / nkv;
-    let t_total = f.kv_len as usize + canvas;
-    let kstride = nkv * hd * 2;
+    let rig = AttnRig::from_fixture(f, BK, false)?;
+    let (canvas, n_q_heads, hd) = (rig.canvas, rig.n_q_heads, rig.hd);
 
-    let ctx = MetalContext::new()?;
-    let pipe = pipeline_flash(&ctx, KernelVariant::PRODUCTION, bq, BK, hd)?;
-    let mut pool = BufferPool::new();
-    let buf_q = pool
-        .allocate(&ctx.device, canvas * n_q_heads * hd * 2)
-        .ok_or(Error::Gpu("alloc q"))?;
-    BufferPool::write_bf16(&buf_q, &bf16::f32_slice_to_bf16_bits(&f.q));
-    let buf_out = pool
-        .allocate(&ctx.device, canvas * n_q_heads * hd * 2)
-        .ok_or(Error::Gpu("alloc out"))?;
-    let buf_kv = pool
-        .allocate(&ctx.device, (f.kvcache.len() + BK * kstride) * 2)
-        .ok_or(Error::Gpu("alloc kv"))?;
-    {
-        let mut bits = crate::shaders::f16::f32_slice_to_f16(&f.kvcache);
-        bits.resize(bits.len() + BK * kstride, 0);
-        BufferPool::write_bf16(&buf_kv, &bits);
-    }
+    let pipe = pipeline_flash(&rig.ctx, KernelVariant::PRODUCTION, bq, BK, hd)?;
     let mut dims = FlashDims {
         m: canvas as u32,
-        t_total: t_total as u32,
+        t_total: rig.t_total as u32,
         hd: hd as u32,
         a_row_stride: (n_q_heads * hd) as u32,
-        b_row_stride: kstride as u32,
+        b_row_stride: rig.kstride as u32,
         out_row_stride: (n_q_heads * hd) as u32,
         kv_len: f.kv_len,
-        group: group as u32,
-        nkv: nkv as u32,
+        group: rig.group as u32,
+        nkv: rig.nkv as u32,
         head_base: 0,
-        causal: 1,
+        causal: u32::from(causal),
         window,
         kv_ring_mask: 0,
     };
@@ -403,31 +258,18 @@ pub fn bench_flash_window(
         height: 1,
         depth: n_q_heads,
     };
-    let mut best = f64::INFINITY;
-    for round in 0..6 {
-        let t = Instant::now();
-        let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
-        let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
-        for _ in 0..iters {
-            dims.head_base = 0;
-            enc.setComputePipelineState(&pipe.pipeline);
-            unsafe {
-                enc.setBuffer_offset_atIndex(Some(&buf_q), 0, 0);
-                enc.setBuffer_offset_atIndex(Some(&buf_kv), 0, 1);
-                enc.setBuffer_offset_atIndex(Some(&buf_out), 0, 2);
-            }
-            gpu_common::set_bytes(&enc, &dims, 3);
-            enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
-            enc.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers);
+    rig.time_rounds(iters, |enc| {
+        dims.head_base = 0;
+        enc.setComputePipelineState(&pipe.pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&rig.buf_q), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(&rig.buf_kv), 0, 1);
+            enc.setBuffer_offset_atIndex(Some(&rig.buf_out), 0, 2);
         }
-        enc.endEncoding();
-        cmd.commit();
-        cmd.waitUntilCompleted();
-        if round > 0 {
-            best = best.min(t.elapsed().as_secs_f64() * 1e3 / iters as f64);
-        }
-    }
-    Ok(best)
+        gpu_common::set_bytes(enc, &dims, 3);
+        enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        enc.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers);
+    })
 }
 
 #[cfg(test)]

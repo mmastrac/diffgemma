@@ -97,8 +97,8 @@ fn flash_bench() {
     for kv_len in [8192u32, 30000, 60000, 100000] {
         let f = model_full_fixture(kv_len);
         let mma_full = crate::shaders::attention::bench_path(&f, iters, 3).unwrap();
-        let e17 = bench_gpu(&f, iters, 16).unwrap();
-        let flash = bench_flash(&f, iters, 16).unwrap();
+        let e17 = bench_gpu(&f, iters, 16, true).unwrap();
+        let flash = bench_flash(&f, iters, 16, true).unwrap();
         println!(
             "  {:>6}  {:>8.3}  {:>9.3}  {:>9.3}   {:>5.2}x",
             kv_len,
@@ -127,9 +127,9 @@ fn flash_bench_hd256() {
     println!("  kv       e17(hd256)  flash-bq16  flash-bq32   best/e17");
     for kv_len in [8192u32, 30000, 60000] {
         let f = model_bench_fixture(256, kv_len, true);
-        let e17 = bench_gpu(&f, iters, 16).unwrap();
-        let b16 = bench_flash(&f, iters, 16).unwrap();
-        let b32 = bench_flash(&f, iters, 32).unwrap();
+        let e17 = bench_gpu(&f, iters, 16, true).unwrap();
+        let b16 = bench_flash(&f, iters, 16, true).unwrap();
+        let b32 = bench_flash(&f, iters, 32, true).unwrap();
         println!(
             "  {:>6}  {:>9.3}  {:>9.3}  {:>9.3}   {:>5.2}x",
             kv_len,

@@ -562,8 +562,11 @@ pub(crate) fn dispatch(cli: Cli) -> ExitCode {
             hc,
             sm_tpg,
             side,
+            causal,
             iters,
-        } => run_bench_prefill_attn(kv_len, qk_bm, qk_bn, pv_bm, pv_bn, hc, sm_tpg, side, iters),
+        } => run_bench_prefill_attn(
+            kv_len, qk_bm, qk_bn, pv_bm, pv_bn, hc, sm_tpg, side, causal, iters,
+        ),
         command => {
             eprintln!("loading from {}", cli.model_dir.display());
             match model::Model::open(&cli.model_dir) {

@@ -69,6 +69,7 @@ pub(crate) enum Command {
         hc: usize,
         sm_tpg: usize,
         side: bool,
+        causal: bool,
         iters: usize,
     },
     /// Holistic prefill proxy (task #87): time one real M=1024 super-chunk (all

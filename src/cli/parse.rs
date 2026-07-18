@@ -64,6 +64,7 @@ pub(crate) fn parse_cli() -> Cli {
     let mut ag_hc = 4usize;
     let mut ag_sm_tpg = 256usize;
     let mut ag_side = false;
+    let mut ag_causal = true;
     let mut bench_stages = false;
     let mut bench_gemm_oracle: Option<String> = None;
     let mut step_kv_len = 0u32;
@@ -291,6 +292,7 @@ pub(crate) fn parse_cli() -> Cli {
                 }
             }
             "--side" => ag_side = true,
+            "--non-causal" => ag_causal = false,
             "--stages" => bench_stages = true,
             "--forward-only" => step_forward_only = true,
             "--step-profile" => step_profile = true,
@@ -521,6 +523,7 @@ pub(crate) fn parse_cli() -> Cli {
             hc: ag_hc,
             sm_tpg: ag_sm_tpg,
             side: ag_side,
+            causal: ag_causal,
             iters: bench_iters.max(1),
         },
         Some("bench-prefill-super") => Command::BenchPrefillSuper {

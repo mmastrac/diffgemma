@@ -512,6 +512,7 @@ pub(crate) fn run_bench_prefill_attn(
     hc: usize,
     sm_tpg: usize,
     side: bool,
+    causal: bool,
     iters: usize,
 ) -> ExitCode {
     use crate::shaders::attention_gemm::{TuneCfg, bench_tuned, model_full_fixture};
@@ -533,7 +534,7 @@ pub(crate) fn run_bench_prefill_attn(
     let t_total = kv_len as usize + canvas;
     // QK (2*M*T*hd) + PV (2*M*T*hd) MAC pairs per head, x heads.
     let flops = (n_q_heads as f64) * 4.0 * (canvas as f64) * (t_total as f64) * (hd as f64);
-    match bench_tuned(&f, iters, cfg, side) {
+    match bench_tuned(&f, iters, cfg, side, causal) {
         Ok(ms) => {
             let tf_s = flops / (ms / 1e3) / 1e12;
             println!(
