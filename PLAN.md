@@ -235,13 +235,21 @@ layer → #3 → #4 falls out of the same scanner.
   requests → 47/47 blocks bit-identical argmax) — yet the live turn
   (reused 14,509 + 266 delta-extend, epoch 22, ring wrapped ~3.5×)
   forked from fresh prefill at block 1. Therefore reuse+delta KV is
-  numerically ≠ fresh-prefill KV. Prime suspect: chunk-path mismatch
-  (M=1024 batched super-chunk vs small-extend path bf16 accumulation
-  order) and/or deep-epoch ring state. NEXT: generation-free two-path
-  kv_hash test — build the same tokens via (a) fresh prefill (b) prefix
-  prefill → truncate → delta-extend, compare position-ordered kv_hash;
-  bisect over wrap depth × delta size. Artifacts: scratchpad pmax/
-  turn11 traces, /tmp/logs (live), ops line 232.
+  numerically ≠ fresh-prefill KV. ROOT ISOLATED (kv_lineage_tests,
+  2026-07-18): **q8 ring-wrap delta-extend path-dependence**. The
+  two-path fingerprint matrix (fresh vs prefix+delta vs
+  overshoot+truncate(+re-extend)) is IDENTICAL on f16 at every config
+  including wrapped — and identical on q8 BELOW the wrap — but a q8
+  delta-extend into a WRAPPED ring diverges from fresh prefill
+  (total=6400 delta=256; deterministic, generation-free, ~3 min). The
+  live serve auto-selects q8 at ctx 100000 → long sessions accumulate
+  requantization drift vs fresh, explaining the trajectory fork (and
+  plausibly feeding strained conditioning). The q8 test is `#[ignore]`d
+  KNOWN RED; the f16 matrix is a live Tier-1 gate. NEXT: mechanism in
+  the q8 ring-write/requant seam (block scales at wrap boundaries vs
+  linear offsets?), fix, un-ignore. Environmental caveat RESOLVED — the
+  divergence is real and internal. Artifacts: scratchpad pmax/ turn11
+  traces, /tmp/logs (live), ops line 232.
 - **Exact-prefix repeat misses reuse**: re-POSTing an identical request
   paid `truncate_kv_to` ring rebuild 22263→14775 (39.45s!) then
   re-prefilled all 14,775 with `reused 0`. Should be ~100% reuse

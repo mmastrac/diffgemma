@@ -36,7 +36,10 @@ pub(crate) fn assert_cmd_ok(
 ) {
     use objc2_metal::MTLCommandBuffer as _;
     if let Some(err) = cmd.error() {
-        panic!("{what}: command buffer failed: {}", err.localizedDescription());
+        panic!(
+            "{what}: command buffer failed: {}",
+            err.localizedDescription()
+        );
     }
 }
 

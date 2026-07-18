@@ -906,6 +906,9 @@ pub fn prefill_monolithic_kv_cpu(
 mod engine_extend_bench_tests;
 
 #[cfg(all(test, target_os = "macos"))]
+mod kv_lineage_tests;
+
+#[cfg(all(test, target_os = "macos"))]
 mod fusion_tests;
 
 #[cfg(all(test, target_os = "macos"))]
