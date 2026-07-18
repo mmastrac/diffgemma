@@ -44,14 +44,18 @@ pub(crate) mod arena_liveness;
 // gate). Split out of this file for size (backlog item 4). A child module, so
 // it sees this module's private items via ancestry; re-exported flat so the
 // existing `step_kernel::<fn>` paths keep resolving.
+mod build;
 mod diag_bench;
 mod diag_moe;
 mod diag_probe;
-mod exec;
+mod enc;
+mod runtime;
+pub use build::*;
 pub use diag_bench::*;
 pub use diag_moe::*;
 pub use diag_probe::*;
-pub use exec::*;
+pub use enc::*;
+pub use runtime::*;
 
 pub const HID: usize = 2816;
 pub const VOCAB: usize = 262144;
