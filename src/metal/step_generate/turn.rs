@@ -269,18 +269,50 @@ pub fn begin_turn(
         }
     }
 
+    // Owned: the rewind guard below needs `&mut session` before the encoder
+    // paths use the dir again.
+    let model_dir = model_dir.to_path_buf();
+    let model_dir = model_dir.as_path();
     let prefill_started = Instant::now();
     let existing_kv = rt.read_params().kv_len as usize;
     let n_prompt = prompt_token_ids.len();
     // Cross-turn KV reuse: the session's `kv_valid_tokens` are already causal in
     // the KV. Reuse the longest common prefix (capped at what the runtime
     // actually holds) and prefill only the delta at that offset.
-    let reuse = if crate::flags::kv_reuse_enabled() {
+    let mut reuse = if crate::flags::kv_reuse_enabled() {
         longest_common_prefix(&session.kv_valid_tokens, prompt_token_ids).min(existing_kv)
     } else {
         0
     };
-    let (kv_len, prefill_timing, prefill_elapsed) = if existing_kv >= n_prompt && existing_kv > 0 {
+    // Rewind/divergence guard (task #93): a resident causal log that extends
+    // past — or diverges from — the prompt's common prefix is stale for this
+    // turn and must go before any reuse. O(1) truncate inside the ring slack;
+    // a DEEP rewind resets instead (no-rebuild-to-salvage: a ring rebuild
+    // costs ≈ a fresh prefill of the kept prefix and yields lineage KV — see
+    // memory kv-reuse-delta-divergence). The session-open prefill (empty
+    // kv_valid log, primed KV) is exempt: it was prefilled for exactly this
+    // prompt.
+    if !session.kv_valid_tokens.is_empty() && session.kv_valid_tokens.len() > reuse {
+        if session.truncate_needs_rebuild(reuse) {
+            if progress_enabled() {
+                eprintln!(
+                    "step-generate: deep rewind {} -> {reuse}; dropping KV for fresh prefill (no-rebuild-to-salvage)",
+                    session.kv_valid_tokens.len(),
+                );
+            }
+            session.reset_kv();
+            reuse = 0;
+        } else {
+            session.truncate_kv_to(reuse)?;
+        }
+    }
+    let rt = &mut session.rt;
+    // Post-guard truth: a reset zeroed it; a truncate clamped it to `reuse`.
+    let existing_kv = rt.read_params().kv_len as usize;
+    let open_prefill = session.kv_valid_tokens.is_empty() && existing_kv >= n_prompt;
+    let (kv_len, prefill_timing, prefill_elapsed) = if (open_prefill || reuse >= n_prompt)
+        && existing_kv > 0
+    {
         // Whole prompt already prefilled (session-open prefill, or full reuse).
         if progress_enabled() {
             eprintln!("step-generate: using step-kernel prefill kv_len={existing_kv}");

@@ -111,8 +111,14 @@ fn route(convs: &HashMap<u64, Conversation>, prompt: &[u32]) -> Option<u64> {
             }
             let lcp = common_prefix_len(&c.tokens, prompt);
             let exact = lcp == c.tokens.len();
+            // Rewind: the prompt is a prefix of the canonical log (repeat,
+            // retry, regenerate, edited last turn) — the log's first `lcp`
+            // positions ARE the prompt, so the conversation's KV prefix is
+            // fully reusable after a truncate (begin_turn's rewind guard
+            // handles O(1)-vs-reset).
+            let rewind = lcp == prompt.len() && lcp >= MIN_SALVAGE_PREFIX;
             let salvage = lcp >= MIN_SALVAGE_PREFIX && c.tokens.len() - lcp <= TAIL_SLACK;
-            (exact || salvage).then_some((*id, lcp))
+            (exact || rewind || salvage).then_some((*id, lcp))
         })
         .max_by_key(|&(_, lcp)| lcp)
         .map(|(id, _)| id)
@@ -365,8 +371,19 @@ impl ConversationManager {
     pub fn finalize(&mut self, id: u64, canonical_tokens: &[u32]) -> Result<(), Error> {
         let fit = canonical_tokens.len().min(self.session.extend_capacity());
         let reuse = common_prefix_len(self.session.kv_valid_tokens(), canonical_tokens).min(fit);
-        self.session.truncate_kv_to(reuse)?;
-        self.session.extend_kv(&canonical_tokens[reuse..fit])?;
+        if self.session.truncate_needs_rebuild(reuse) {
+            // Deep thought-strip rewind (a long-thinking reply overflowed the
+            // ring's O(1) slack): a rebuild here costs ≈ a fresh prefill of
+            // the kept prefix (measured 39s at 14.7k) and yields lineage KV
+            // (see memory kv-reuse-delta-divergence). Drop the hot KV instead
+            // — the canonical token log still routes, and the next activation
+            // re-prefills lazily, which costs the same only when the
+            // conversation actually continues.
+            self.session.reset_kv();
+        } else {
+            self.session.truncate_kv_to(reuse)?;
+            self.session.extend_kv(&canonical_tokens[reuse..fit])?;
+        }
         if let Some(c) = self.convs.get_mut(&id) {
             c.tokens = canonical_tokens.to_vec();
             c.last_used = self.tick;
@@ -443,6 +460,19 @@ mod tests {
         both.insert(1, conv(&base, 1, 0)); // needs salvage vs `prompt`
         both.insert(2, conv(&prompt[..990], 1, 0)); // exact prefix, longer lcp
         assert_eq!(route(&both, &prompt), Some(2));
+    }
+
+    #[test]
+    fn route_accepts_rewind_prompt_prefix_of_canonical() {
+        // Repeat/retry: the prompt is a prefix of the canonical log.
+        let mut convs = HashMap::new();
+        let canonical: Vec<u32> = (0..1000).collect();
+        convs.insert(7, conv(&canonical, 0, 1));
+        let prompt: Vec<u32> = (0..600).collect();
+        assert_eq!(route(&convs, &prompt), Some(7));
+        // Below the salvage floor a rewind does NOT route (fresh conv).
+        let tiny: Vec<u32> = (0..100).collect();
+        assert_eq!(route(&convs, &tiny), None);
     }
 
     #[test]

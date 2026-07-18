@@ -230,6 +230,22 @@ impl StepGenerateSession {
     /// If `n_tokens < len` after the sequence wrapped a sliding ring, rebuilds
     /// the kept prefix via re-prefill (see [`checkpoint`](Self::checkpoint)).
     /// Otherwise O(1): bytes past `n_tokens` are left stale but unread.
+    /// Would [`truncate_kv_to`](Self::truncate_kv_to)`(n_tokens)` pay a ring
+    /// rebuild (deep rewind past the O(1) slack)? Rebuild cost ≈ a fresh
+    /// prefill of the kept prefix, so callers implementing the
+    /// no-rebuild-to-salvage policy check this and drop/re-prefill instead.
+    pub fn truncate_needs_rebuild(&self, n_tokens: usize) -> bool {
+        let old = self.kv_valid_tokens.len();
+        let n = n_tokens.min(old);
+        n < old
+            && kv_truncate_needs_ring_rebuild(
+                old,
+                n,
+                self.sliding_ring_len(),
+                self.rt.sliding_window(),
+            )
+    }
+
     pub fn truncate_kv_to(&mut self, n_tokens: usize) -> Result<(), Error> {
         let old = self.kv_valid_tokens.len();
         let n = n_tokens.min(old);

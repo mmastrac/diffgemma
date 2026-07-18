@@ -259,13 +259,18 @@ layer → #3 → #4 falls out of the same scanner.
   path is broken for current serve logs. Either teach `replay` the
   registry format (activate carries the full prompt token array) or log
   a parallel token-level stream.
-- **`generate_with_session` ring-truncate duplicate (task #93, still
-  open)**: `step_generate.rs` reuse path calls `prefill_chunks_from(reuse,
-  delta)` with no `kv_truncate_needs_ring_rebuild` check (the fixed
-  predicate guards `truncate_kv_to` only). serve is shielded by `route()`'s
-  prefix guarantee; `chat` (raw-vs-sanitized divergence) and
-  `run_summarize_pass` are NOT. Also `rollback_to`'s "restores the
-  conversation" contract is still false for its only production caller.
+- **Task #93 FIXED (2026-07-18, reuse-bugs commit)**: `begin_turn` now has
+  the rewind/divergence guard — resident causal log extending past or
+  diverging from the prompt's common prefix is truncated before reuse
+  (O(1) inside the ring slack) or, on a deep rewind, reset for a fresh
+  prefill (no-rebuild-to-salvage: rebuild ≈ fresh-prefill cost + lineage
+  KV). Same policy at conversation `finalize` (long-thinking thought-strip
+  no longer pays the ~39s ring rebuild) and `route()` now accepts REWIND
+  prompts (prompt is a prefix of the canonical log — repeat/retry/edit),
+  verified live: exact-repeat request went `reused 0` + full prefill →
+  `+0tok (reused 6900)`. Remaining from old #93 note: `rollback_to`'s
+  "restores the conversation" contract is still false for its only
+  production caller.
 - **Long-ctx re-validation debt**: re-run needle 33k/105k and the 100k
   field-incident repro on the uncapped fast path (post root-cause fix).
 - **Tier-1 attention fixture below the worst tile**: `full_grp8_hd512_fixture`
