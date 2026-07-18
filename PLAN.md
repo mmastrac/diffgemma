@@ -18,7 +18,7 @@ op-logged and bit-exactly replayable. The OpenCode collapse is SOLVED
 (defer default OFF) and `ToolRepairStage` turns invalid tool calls into
 evaporating drafts. Cross-turn KV reuse for tool sessions ~99.8%
 (KV-reuse-first canonical + tail-salvage routing). Gates green: smoketest
-17/17 ×{7,42,123}, golden 8/8, suite 603/0. Remaining decode headroom is
+17/17 ×{7,42,123}, golden 8/8, suite 621/0. Remaining decode headroom is
 STEP COUNT (E7), not per-step attention.
 
 ## Open items
@@ -194,10 +194,10 @@ layer → #3 → #4 falls out of the same scanner.
   Add a canvas≥65 / kv≥65 full-layer fixture.
 - **Missing CPU twins**: `kv/unpack_encoder_kv` and `kv/kv_f32_side_hydrate`
   (~40 lines each).
-- **server_worker render inconsistency**: `encode_with_specials(render_conversation(…))`
-  repeats at ~6 sites; the tool-compact sizing closure passes
-  `thinking: false` where siblings pass the request flag. Collapse into one
-  `render_prompt` helper (also the natural seam for channel-hygiene #1).
+- **tool-compact sizing closure thinking-flag**: `render_prompt` (the one
+  render+encode seam, landed 2026-07-18) preserves the sizing closure's
+  `thinking: false` where siblings pass the request flag — intent still
+  undecided (NOTE at the call site).
 - **Stale "prefill-only" docs** on the shipped decode path:
   `step_kernel.rs` `attn_gemm`/`attn_topk` field docs and
   `attention_gemm/mod.rs` module doc still say "denoise keeps
@@ -213,20 +213,26 @@ layer → #3 → #4 falls out of the same scanner.
   activates when per-TG goes compute-bound (this regime); the live kernel
   comment still calls padding "immaterial" (a stale denoise conclusion).
 
-### Code duplication / structure (2026-07-17 audit)
+### Code duplication / structure (2026-07-17 audit; burn-down 2026-07-18)
 
-- **Attention GPU/bench harnesses**: ~1,300 duplicated lines across
-  `attention_topk`/`attention_gemm`/`attention_flash` `gpu()`/`bench_*()`;
-  ~600-800 removable via a shared Fixture→buffers builder + dispatch
-  closure + min-of-rounds timer. Drift hazard: benches hard-code
-  `causal: 1` while the oracle takes it as an arg.
-- **`encode_attn_gemm` vs `encode_attn_topk`** are ~80% identical (~120
-  lines): shared QK stage + head-loop scaffold, stage-2/3 closure.
-- **`step_kernel.rs` core carve (deferred, own gated task)**: StepEnc (152
-  fns) is struct-literal-constructed by StepRuntime and StepPipelines is a
-  50-field struct read throughout — a peer-module split forces ~50-100
-  promotions. If done: move StepEnc+StepRuntime+build as ONE execution
-  child. Full golden+suite gate mandatory.
+DONE 2026-07-18 (commit messages carry details): big-file splits
+(pipeline/, step_generate/, tools/, server wire+log, diagnostics
+probe/moe/bench, flags/, cli/, step_debug dumps, bench_gemm sparse,
+step_kv fusion tests), server/step_kv/step_kernel directory folds,
+attention-harness AttnRig dedup (~1,050 dup lines out; bench `causal`
+now a real arg), encode_attn_gemm/topk merged into one decomp driver
+(shared QK stage), step_kernel exec.rs carve (StepEnc+StepRuntime+build
+as one child; golden 8/8 + suite gated), cli usage truth pass, flags
+EnvReader Default-dedup + dead accessor, worker render_prompt seam,
+membudget permits. Still open below.
+
+- **Clippy residue**: ~60 warnings (arg-count/type-width allowed
+  crate-level); opportunistic, not a campaign.
+- **cli.rs parser structure**: usage string is now true, but parse_cli
+  still uses ~80 shared mutable locals (cross-wiring hazard); a
+  per-command arg-struct redesign remains open.
+- **Oracle sampler tests missing**: `sample_from_probs_rows` (the one worth
+  a fixture), `scale_logits`, `logit_softcapping`.
 - **`metal/oracle/` quarantine**: audit DONE (2026-07-17). Confirmed:
   `engine`/`decoder`/`kv_cache`/`decoder_layer`/`decoder_attention`/
   `weights`/`moe`/`router` are production via the prefill path
@@ -241,15 +247,6 @@ layer → #3 → #4 falls out of the same scanner.
   in `lm_head.rs` and the `sampler.rs` GPU path), `decoder_layer.rs`
   (prefill fns prod vs `forward_decoder*` validation),
   `memwatch.rs` (`physical_ram_bytes` prod). Move pending user sign-off.
-- **Clippy residue**: 60 warnings remain post-cleanup (arg-count/
-  type-width allowed crate-level); opportunistic, not a campaign.
-- **cli.rs usage string**: six advertised commands don't exist,
-  `--compare-cpu` never parsed, ~30 real commands undocumented; shared
-  mutable parse vars invite cross-wiring.
-- **flags.rs**: test-only `impl Default` duplicates env defaults (can go
-  stale silently); dead `attn_topk()` accessor.
-- **Oracle sampler tests missing**: `sample_from_probs_rows` (the one worth
-  a fixture), `scale_logits`, `logit_softcapping`.
 
 ### Concept — span handles / compact history (parked)
 
