@@ -46,6 +46,21 @@ impl Worker {
             },
             None => Box::new(pipeline),
         };
+        // Repair OUTSIDE the op-log: its Mark/Generate/Rewind choreography
+        // flows through the log, so a repaired session's ops.jsonl replays
+        // faithfully.
+        let stage: Box<dyn crate::pipeline::PipelineStage> = if self.tool_repair {
+            eprintln!(
+                "serve: tool-repair ON (error tool-response -> corrected call -> corrupt exchange rewound)"
+            );
+            Box::new(crate::pipeline::ToolRepairStage::new(
+                stage,
+                Arc::clone(&self.tokenizer),
+                1,
+            ))
+        } else {
+            stage
+        };
         // Validator OUTSIDE the op-log: its Mark/Rewind/retry ops flow through
         // the log, so a validated session's ops.jsonl replays faithfully.
         let stage: Box<dyn crate::pipeline::PipelineStage> = if self.tool_validate {
@@ -393,7 +408,15 @@ impl Worker {
         cfg.max_new_tokens = job.max_tokens.map_or(budget, |c| c.min(budget));
         cfg.seed = job.seed.unwrap_or(self.base_cfg.seed);
         cfg.stop_token_ids = self.stop_token_ids.clone();
-        cfg.continue_incomplete_tool_calls = needs_tool_rendering(&job.messages, &job.tools);
+        // Continue-past-stop is OFF by default (2026-07-17 strain-battery
+        // finding): a stop token inside an open tool call is a DEGRADATION
+        // SYMPTOM — the deterministic collapse cell shows the deferred
+        // continuation flooding for 8 blocks and never rescuing the call.
+        // Honor the model's stop; repair belongs to the tool-repair stage
+        // (feedback + rewind), not forced continuation. `DGQ_CONTINUE_PAST_STOP=1`
+        // restores the old bet.
+        cfg.continue_incomplete_tool_calls = crate::flags::continue_past_stop_enabled()
+            && needs_tool_rendering(&job.messages, &job.tools);
         cfg.degenerate_reply_check =
             crate::chat_template::empty_reply_check(&self.model_dir, self.stop_token_ids.clone());
         cfg

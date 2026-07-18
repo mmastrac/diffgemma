@@ -541,6 +541,41 @@ pub fn should_continue_past_stop(text: &str) -> bool {
     has_incomplete_tool_call(text) || has_trailing_after_tool_calls(text)
 }
 
+/// Every `call:` attempt in `text`, in order, with its name (may be empty
+/// when unrecoverable) and whether it parses as a complete call. The repair
+/// stage emits one error tool-response per invalid attempt.
+pub fn scan_call_attempts(text: &str) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(pos) = rest.find("call:") {
+        let after = &rest[pos + "call:".len()..];
+        let Some(brace) = after.find('{') else {
+            out.push((
+                after
+                    .trim()
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_string(),
+                false,
+            ));
+            break;
+        };
+        let name = after[..brace].trim().to_string();
+        match read_braced(&after[brace..]) {
+            Some((_, consumed)) => {
+                out.push((name, true));
+                rest = &after[brace + consumed..];
+            }
+            None => {
+                out.push((name, false));
+                break; // unbalanced tail: nothing further can parse
+            }
+        }
+    }
+    out
+}
+
 /// Strict reply-level grammar verdict for the validator stage: a reply that
 /// speaks the tool grammar at all must parse cleanly. Plain prose is `Ok`.
 /// (Prose containing a bare `call:` is flagged, consistent with
@@ -784,6 +819,17 @@ mod tests {
         ];
         let old_canonical = render_conversation(&old_msgs, &tools, false, false);
         assert!(!next.starts_with(&old_canonical));
+    }
+
+    #[test]
+    fn scan_call_attempts_orders_and_flags() {
+        let text =
+            "<|tool_call>call:todowrite{todos:[{a:<|\"|>x<|\"|>}]}<tool_call>call:write{path:";
+        let attempts = scan_call_attempts(text);
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0], ("todowrite".to_string(), true));
+        assert_eq!(attempts[1], ("write".to_string(), false));
+        assert!(scan_call_attempts("no calls here").is_empty());
     }
 
     #[test]

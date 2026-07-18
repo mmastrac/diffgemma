@@ -96,6 +96,34 @@ the freeze lesson applies to reject-masks). Later: multi-conv absorption,
 Reground, lineage-drift gate. Every phase: golden 8/8 + suite; behavior
 changes additionally smoketest ×{7,42,123}.
 
+**Collapse causal chain SOLVED + ToolRepairStage (2026-07-17 night):**
+strain battery (`debug/strain_battery/battery.py`; matched OpenCode
+prompt pair × 5 seeds × 4 arms) reproduced the live collapse in exactly
+one cell (base/collapse-prompt/seed 42; knob arms uninformative — every
+flag forks the trajectory). Decisive same-trajectory A/B: chain =
+premature stop mid-turn → `continue_incomplete_tool_calls` defer forces
+continuation → OOD continuation → filler fixed point → commit
+amplifier → flood. Defer now DEFAULT OFF (`DGQ_CONTINUE_PAST_STOP=1`
+restores); `ToolRepairStage` (user design; `serve --tool-repair` /
+`DGQ_TOOL_REPAIR`, default OFF) handles the invalid remainder: error
+tool-response → model regenerates reading the error → rewind to prompt
+end (KV-reuse-first; corrupt exchange + feedback never in canonical KV).
+Same deterministic cell: 8-min flood → 46-s clean call. Choreography
+op-logged/replayable; pinned by `tool_repair_feeds_error_and_rewinds_corrupt_call`.
+Residual model wart: narrate-instead-of-act (turn ends after announcing
+the write; no call emitted) — a policy for tool-triage (below), not a
+serve defect. Open: should --tool-repair default ON after field trial?
+
+**Framing (user, 2026-07-17): the failed call is invisible "extra
+thinking".** The repair cycle is draft → critique → revise: the
+regeneration conditions on the model's own failed attempt plus the error
+feedback (its thought explicitly diagnoses the mistake), then the rewind
+evaporates draft + critique from causal KV — the conversation pays only
+for the final clean answer. This generalizes beyond errors: the
+Mark → generate → feedback → regenerate → Rewind choreography is a
+reusable evaporating-draft primitive (tool-call triage is this shape;
+deliberate critique passes on high-stakes turns would be too).
+
 **P4 Splice + op-log replay + tool validator (SHIPPED):** (1) `Splice
 {start, end, replacement}` op — surgical mid-log replacement (truncate to
 start + re-extend replacement + tail), epoch-bumping;

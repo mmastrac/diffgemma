@@ -308,6 +308,9 @@ pub(crate) enum Command {
         ctx: usize,
         /// Tool-output compaction (KV rewinder). Also `DGQ_TOOL_COMPACT=1`.
         tool_compact: bool,
+        /// Model-guided tool-call repair (error response -> corrected call ->
+        /// corrupt exchange rewound out of KV). Also `DGQ_TOOL_REPAIR=1`.
+        tool_repair: bool,
         /// Rewind + regenerate on malformed tool-call grammar. Also
         /// `DGQ_TOOL_VALIDATE=1`.
         tool_validate: bool,
@@ -361,6 +364,7 @@ pub(crate) fn parse_cli() -> Cli {
     let mut chat_ctx: Option<usize> = None;
     let mut serve_addr: String = "127.0.0.1:8080".to_string();
     let mut serve_tool_compact = false;
+    let mut serve_tool_repair = false;
     let mut serve_tool_validate = false;
     let mut serve_log_dir: Option<PathBuf> = None;
     let mut serve_think: Option<bool> = None;
@@ -503,6 +507,7 @@ pub(crate) fn parse_cli() -> Cli {
                 }
             }
             "--tool-compact" => serve_tool_compact = true,
+            "--tool-repair" => serve_tool_repair = true,
             "--tool-validate" => serve_tool_validate = true,
             "--think" => serve_think = Some(true),
             s if s.starts_with("--think=") => {
@@ -799,6 +804,7 @@ pub(crate) fn parse_cli() -> Cli {
             max_layers: parity_layers,
             ctx: chat_ctx.unwrap_or(8192),
             tool_compact: serve_tool_compact,
+            tool_repair: serve_tool_repair,
             tool_validate: serve_tool_validate,
             log_dir: serve_log_dir.clone(),
             think: serve_think.unwrap_or(true),

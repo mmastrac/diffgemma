@@ -536,6 +536,9 @@ struct Worker {
     no_early_stop: bool,
     base_cfg: crate::metal::StepGenerateConfig,
     tool_compact: Option<ToolCompactCfg>,
+    /// `--tool-repair`: model-guided repair — error tool-response, corrected
+    /// call, corrupt exchange rewound out of KV.
+    tool_repair: bool,
     /// `--tool-validate`: rewind + regenerate on malformed tool-call grammar.
     tool_validate: bool,
     /// When set, each completed request writes one `{seq}.jsonl` here.
@@ -940,6 +943,7 @@ pub fn run_serve(
     steps: usize,
     max_layers: Option<usize>,
     tool_compact: bool,
+    tool_repair: bool,
     tool_validate: bool,
     log_dir: Option<std::path::PathBuf>,
     think: bool,
@@ -994,6 +998,7 @@ pub fn run_serve(
     let (job_tx, job_rx) = mpsc::channel::<Job>();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
     let tool_compact = tool_compact || crate::flags::tool_compact_enabled();
+    let tool_repair = tool_repair || crate::flags::tool_repair_enabled();
     let tool_validate = tool_validate || crate::flags::tool_validate_enabled();
     let worker = Worker {
         model_dir: model_dir.to_path_buf(),
@@ -1010,6 +1015,7 @@ pub fn run_serve(
             max_expand_rounds: 4,
             summarize_max_new: 512,
         }),
+        tool_repair,
         tool_validate,
         log_dir,
         turn_seq: AtomicU64::new(1),

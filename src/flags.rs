@@ -308,8 +308,18 @@ pub struct ServerFlags {
     /// `reasoning_content` status line + elapsed heartbeat while a large
     /// prompt delta prefills (the dry-start silence). Default ON; `=0` off.
     pub prefill_status: bool,
+    /// `DGQ_CONTINUE_PAST_STOP`: serve's old defer bet — a stop token inside
+    /// an unfinished tool reply continues generation into the next block.
+    /// Default OFF since the strain battery showed the premature stop is a
+    /// degradation symptom and the forced continuation floods. Opt-in.
+    pub continue_past_stop: bool,
     /// `DGQ_TOOL_COMPACT`: enable the tool-output compactor. Default OFF.
     pub tool_compact: bool,
+    /// `DGQ_TOOL_REPAIR`: serve's model-guided tool-call repair — an invalid
+    /// tool reply gets a synthetic error tool-response, the model emits a
+    /// corrected call, and the corrupt exchange is rewound out of KV.
+    /// Default OFF (quality-affecting; field sign-off pending).
+    pub tool_repair: bool,
     /// `DGQ_TOOL_VALIDATE`: serve validates tool-call grammar on every reply
     /// and, on a malformed one, rewinds and regenerates at a bumped seed
     /// (the failed attempt never enters the causal context). Default OFF.
@@ -326,8 +336,10 @@ impl Default for ServerFlags {
             conv_cache_bytes: 0,
             conv_disk_bytes: 0,
             conv_cache_dir: default_conv_cache_dir(),
+            continue_past_stop: false,
             prefill_status: true,
             tool_compact: false,
+            tool_repair: false,
             tool_validate: false,
             tool_compact_threshold: 384,
             tool_compact_dir: default_tool_compact_dir(),
@@ -546,8 +558,10 @@ impl RuntimeConfig {
                 conv_cache_dir: std::env::var_os("DGQ_CONV_CACHE_DIR")
                     .map(PathBuf::from)
                     .unwrap_or_else(default_conv_cache_dir),
+                continue_past_stop: env_on_if_one("DGQ_CONTINUE_PAST_STOP"),
                 prefill_status: env_on_unless_zero("DGQ_PREFILL_STATUS"),
                 tool_compact: env_on_if_one("DGQ_TOOL_COMPACT"),
+                tool_repair: env_on_if_one("DGQ_TOOL_REPAIR"),
                 tool_validate: env_on_if_one("DGQ_TOOL_VALIDATE"),
                 tool_compact_threshold: std::env::var("DGQ_TOOL_COMPACT_THRESHOLD")
                     .ok()
@@ -964,12 +978,25 @@ pub fn conv_cache_dir() -> PathBuf {
     config().server.conv_cache_dir.clone()
 }
 
+/// `DGQ_CONTINUE_PAST_STOP=1`: restore serve's defer-past-stop bet (default
+/// OFF; the premature stop is a strain symptom, not a formatting hiccup).
+pub fn continue_past_stop_enabled() -> bool {
+    config().server.continue_past_stop
+}
+
 /// `DGQ_PREFILL_STATUS` (default ON, `=0` disables): streamed serve requests
 /// emit a synthetic `reasoning_content` status line + elapsed heartbeat while
 /// a large prompt delta prefills — the dry-start would otherwise be silent
 /// until the first denoise step.
 pub fn prefill_status_enabled() -> bool {
     config().server.prefill_status
+}
+
+/// `DGQ_TOOL_REPAIR=1`: model-guided tool-call repair (error tool-response →
+/// corrected call → corrupt exchange rewound out of KV). Equivalent to
+/// `serve --tool-repair`. Default OFF.
+pub fn tool_repair_enabled() -> bool {
+    config().server.tool_repair
 }
 
 /// `DGQ_TOOL_VALIDATE=1`: serve rewinds + regenerates (bumped seed) when a

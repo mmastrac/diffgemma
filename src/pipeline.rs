@@ -282,6 +282,177 @@ impl<S: PipelineStage + ?Sized> PipelineStage for Box<S> {
     }
 }
 
+/// Chain stage — the model-guided tool-call repair loop (user design
+/// 2026-07-17): when a tool-mode reply ends with INVALID tool grammar
+/// (incomplete call — the premature-stop strain symptom — or unparseable
+/// calls), do not blindly re-roll. Feed the model a synthetic tool RESPONSE
+/// describing the error and let it emit a corrected call; then Rewind to the
+/// pre-turn mark so the corrupt call AND the error exchange never enter the
+/// causal KV. The caller receives `prompt + the new reply`; finalize extends
+/// the clean canonical from the mark. Every op flows through the inner stage,
+/// so the whole choreography is op-logged and replayable.
+pub struct ToolRepairStage<S> {
+    inner: S,
+    tokenizer: std::sync::Arc<crate::tokenizer::Tokenizer>,
+    attempts: u64,
+}
+
+impl<S: PipelineStage> ToolRepairStage<S> {
+    pub fn new(
+        inner: S,
+        tokenizer: std::sync::Arc<crate::tokenizer::Tokenizer>,
+        attempts: u64,
+    ) -> Self {
+        Self {
+            inner,
+            tokenizer,
+            attempts,
+        }
+    }
+
+    fn reply_verdict(
+        &self,
+        out: &crate::generate::GenerateOutput,
+        prompt_len: usize,
+    ) -> Result<(), &'static str> {
+        let start = prompt_len.min(out.token_ids.len());
+        let cleaned = crate::sample::strip_degenerate_token_ids(&out.token_ids[start..]);
+        crate::tools::validate_tool_reply(&self.tokenizer.decode(&cleaned))
+    }
+
+    /// The `<|tool_response>` opener's token id (when it encodes to a single
+    /// special), used to (a) let the repair regeneration run past it to a
+    /// natural `<eos>` and (b) trim any hallucinated response tail after.
+    fn response_opener_id(&self) -> Option<u32> {
+        let ids = self.tokenizer.encode_with_specials("<|tool_response>");
+        (ids.len() == 1).then(|| ids[0])
+    }
+
+    /// One error tool-response per invalid call attempt in `reply` (generic
+    /// name when unrecoverable); a single generic error when the reply is
+    /// invalid without any recognizable call attempt.
+    fn error_responses(reply: &str) -> String {
+        const ERR: &str = "error: this tool call was malformed and has been discarded. \
+             Regenerate your narration and tool calls, corrected, in full, then \
+             continue as before.";
+        let mut out = String::new();
+        for (name, valid) in crate::tools::scan_call_attempts(reply) {
+            if valid {
+                continue;
+            }
+            let name = if name.is_empty() { "tool" } else { &name };
+            out.push_str(&crate::tools::render_tool_response(
+                name,
+                &serde_json::json!({"content": ERR}),
+            ));
+        }
+        if out.is_empty() {
+            out = crate::tools::render_tool_response("tool", &serde_json::json!({"content": ERR}));
+        }
+        out
+    }
+}
+
+impl<S: PipelineStage> PipelineStage for ToolRepairStage<S> {
+    fn call(&self, op: PipelineOp) -> PipelineEvent {
+        let PipelineOp::Generate { prompt, cfg, label } = op else {
+            return self.inner.call(op);
+        };
+        let mut mark = match self.inner.call(PipelineOp::Mark) {
+            PipelineEvent::Marked { kv } => kv,
+            ev => return ev,
+        };
+        let mut event = self.inner.call(PipelineOp::Generate {
+            prompt: prompt.clone(),
+            cfg: cfg.clone(),
+            label: label.clone(),
+        });
+        for attempt in 1..=self.attempts {
+            let PipelineEvent::Generated { out, .. } = &event else {
+                return event;
+            };
+            let Err(reason) = self.reply_verdict(out, prompt.len()) else {
+                return event;
+            };
+            let reply_text = self
+                .tokenizer
+                .decode(&crate::sample::strip_degenerate_token_ids(
+                    &out.token_ids[prompt.len().min(out.token_ids.len())..],
+                ));
+            eprintln!(
+                "tool-repair: invalid reply ({reason}); returning an error tool response and regenerating (attempt {attempt}/{})",
+                self.attempts
+            );
+            let err_text = Self::error_responses(&reply_text);
+            // The repair continuation: the model's own turn as generated,
+            // plus the error response(s) — a delta prefill over resident KV.
+            let mut repair_prompt = out.token_ids.clone();
+            repair_prompt.extend(self.tokenizer.encode_with_specials(&err_text));
+            // Let the regeneration run to a natural <eos>: the response-opener
+            // stop is a forced early cut, and forced cuts are their own
+            // degeneracy source. Hallucinated response text past the opener
+            // is trimmed below instead.
+            let mut regen_cfg = cfg.clone();
+            if let Some(open) = self.response_opener_id() {
+                regen_cfg.stop_token_ids.retain(|&id| id != open);
+            }
+            let repair_ev = self.inner.call(PipelineOp::Generate {
+                prompt: repair_prompt.clone(),
+                cfg: regen_cfg,
+                label: label.clone(),
+            });
+            let PipelineEvent::Generated { out: repaired, .. } = repair_ev else {
+                eprintln!("tool-repair: repair generate failed; keeping the invalid reply");
+                return event;
+            };
+            // Surgical removal: rewind the corrupt call + error exchange out
+            // of KV; the stitched output is original prompt + the NEW reply,
+            // and finalize extends the clean canonical from there. KV-reuse-
+            // first: the prompt's prefill is a valid causal prefix — rewind
+            // to its end, not the pre-generate mark (which may be 0 on a
+            // fresh conversation and would discard the whole prefill).
+            let target = KvId {
+                epoch: mark.epoch,
+                pos: mark.pos.max(prompt.len()),
+            };
+            let rewound = match self.inner.call(PipelineOp::Rewind(target)) {
+                PipelineEvent::Rewound { kv } => kv,
+                ev => {
+                    eprintln!("tool-repair: rewind failed ({ev:?}); keeping the invalid reply");
+                    return event;
+                }
+            };
+            mark = rewound;
+            let mut stitched = *repaired;
+            let new_reply_start = repair_prompt.len().min(stitched.token_ids.len());
+            let mut new_reply = stitched.token_ids[new_reply_start..].to_vec();
+            // Keep narration + calls; drop everything from the first response
+            // opener on (the model ran to eos, so any response content there
+            // is hallucinated — the REAL response arrives from the client).
+            if let Some(open) = self.response_opener_id()
+                && let Some(cut) = new_reply.iter().position(|&id| id == open)
+            {
+                new_reply.truncate(cut);
+            }
+            stitched.token_ids = prompt.clone();
+            stitched.token_ids.extend(new_reply);
+            event = PipelineEvent::Generated {
+                out: Box::new(stitched),
+                kv: rewound,
+            };
+        }
+        if let PipelineEvent::Generated { out, .. } = &event
+            && let Err(reason) = self.reply_verdict(out, prompt.len())
+        {
+            eprintln!(
+                "tool-repair: still invalid after {} repair attempt(s) ({reason}); passing through",
+                self.attempts
+            );
+        }
+        event
+    }
+}
+
 /// Chain stage: tool-grammar validation with the anti-collapse retry. On a
 /// `Generate` whose reply speaks malformed tool grammar (incomplete call, or
 /// `call:` that parses to nothing), Rewind to the pre-generate mark and
@@ -1121,6 +1292,109 @@ mod tests {
             }),
             kv,
         }
+    }
+
+    /// Scripted inner for the repair test: echoes each Generate's prompt with
+    /// a canned reply suffix (so the stage's self-built repair prompt flows
+    /// through naturally), and records ops + Generate prompt lengths.
+    struct RepairScript {
+        replies: std::cell::RefCell<Vec<Vec<u32>>>,
+        seen: std::cell::RefCell<Vec<&'static str>>,
+        gen_prompt_lens: std::cell::RefCell<Vec<usize>>,
+        rewind_pos: std::cell::RefCell<Vec<usize>>,
+    }
+
+    impl PipelineStage for RepairScript {
+        fn call(&self, op: PipelineOp) -> PipelineEvent {
+            self.seen.borrow_mut().push(op.name());
+            // Fresh conversation: the pre-generate mark sits at position 0.
+            let kv = KvId { epoch: 0, pos: 0 };
+            match op {
+                PipelineOp::Mark => PipelineEvent::Marked { kv },
+                PipelineOp::Rewind(id) => {
+                    self.rewind_pos.borrow_mut().push(id.pos);
+                    PipelineEvent::Rewound { kv: id }
+                }
+                PipelineOp::Generate { prompt, .. } => {
+                    self.gen_prompt_lens.borrow_mut().push(prompt.len());
+                    let reply = self.replies.borrow_mut().remove(0);
+                    let mut ids = prompt;
+                    ids.extend(reply);
+                    generated_event(ids, kv)
+                }
+                _ => PipelineEvent::Error("unexpected op".into()),
+            }
+        }
+    }
+
+    /// The repair stage's choreography, pinned against a scripted inner: an
+    /// invalid first reply (incomplete call) triggers error-response feedback
+    /// (the second Generate's prompt = the failed turn + the rendered error
+    /// tool response), then a Rewind — and the caller receives the ORIGINAL
+    /// prompt + the corrected reply, with the corrupt exchange gone.
+    #[test]
+    fn tool_repair_feeds_error_and_rewinds_corrupt_call() {
+        let Some(dir) = crate::shaders::test_util::dgq_model_dir() else {
+            return;
+        };
+        let tokenizer = std::sync::Arc::new(
+            crate::tokenizer::Tokenizer::load(&dir.join("tokenizer.json")).expect("tokenizer"),
+        );
+        let prompt: Vec<u32> = vec![10, 11, 12];
+        let bad_reply = tokenizer.encode_with_specials("<|tool_call>call:write{path:");
+        let good_reply = tokenizer
+            .encode_with_specials("<|tool_call>call:write{path:<|\"|>/tmp/x.rs<|\"|>}<tool_call|>");
+        // The regeneration runs to eos, so it may append a hallucinated tool
+        // response — the stage must trim from the opener on.
+        let mut regen_reply = good_reply.clone();
+        regen_reply.extend(
+            tokenizer
+                .encode_with_specials("<|tool_response>response:write{value:<|\"|>fake<|\"|>}"),
+        );
+        let inner = RepairScript {
+            replies: std::cell::RefCell::new(vec![bad_reply.clone(), regen_reply]),
+            seen: std::cell::RefCell::new(Vec::new()),
+            gen_prompt_lens: std::cell::RefCell::new(Vec::new()),
+            rewind_pos: std::cell::RefCell::new(Vec::new()),
+        };
+        let repair = ToolRepairStage::new(inner, tokenizer, 1);
+        let cfg = crate::metal::StepGenerateConfig::from_generate(
+            42,
+            64,
+            1024,
+            0,
+            crate::sample::sampler_for_steps(8, false),
+            false,
+        );
+        let ev = repair.call(PipelineOp::Generate {
+            prompt: prompt.clone(),
+            cfg: Box::new(cfg),
+            label: "repair-test".into(),
+        });
+        let PipelineEvent::Generated { out, .. } = ev else {
+            panic!("repair swallowed the Generated event: {ev:?}");
+        };
+        let mut expect = prompt.clone();
+        expect.extend(good_reply);
+        assert_eq!(
+            out.token_ids, expect,
+            "caller must receive original prompt + the corrected reply, hallucinated response trimmed"
+        );
+        assert_eq!(
+            *repair.inner.seen.borrow(),
+            vec!["mark", "generate", "generate", "rewind"],
+            "repair choreography mismatch"
+        );
+        let lens = repair.inner.gen_prompt_lens.borrow();
+        assert!(
+            lens[1] > prompt.len() + bad_reply.len(),
+            "repair prompt must include the failed turn + the error response ({} vs {})",
+            lens[1],
+            prompt.len() + bad_reply.len()
+        );
+        // KV-reuse-first: the rewind must land at the end of the prompt (its
+        // prefill is a valid causal prefix), not the position-0 mark.
+        assert_eq!(*repair.inner.rewind_pos.borrow(), vec![prompt.len()]);
     }
 
     /// The validator's retry choreography, pinned against a scripted inner
