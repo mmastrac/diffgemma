@@ -36,21 +36,16 @@ use std::mem::offset_of;
 use std::path::Path;
 use std::time::Instant;
 
-#[path = "step_schedule.rs"]
 mod step_schedule;
 
-#[path = "arena_liveness.rs"]
 pub(crate) mod arena_liveness;
 
 // Probe / capture / bench harnesses (CLI step-debug subcommands + step-smoke
 // gate). Split out of this file for size (backlog item 4). A child module, so
 // it sees this module's private items via ancestry; re-exported flat so the
 // existing `step_kernel::<fn>` paths keep resolving.
-#[path = "step_kernel_diag_bench.rs"]
 mod diag_bench;
-#[path = "step_kernel_diag_moe.rs"]
 mod diag_moe;
-#[path = "step_kernel_diag_probe.rs"]
 mod diag_probe;
 pub use diag_bench::*;
 pub use diag_moe::*;
@@ -6293,5 +6288,4 @@ pub fn build_step_runtime(
 }
 
 #[cfg(all(test, target_os = "macos"))]
-#[path = "step_kernel_tests.rs"]
 mod tests;

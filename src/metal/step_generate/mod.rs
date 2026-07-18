@@ -13,5 +13,4 @@ pub use turn::{
 };
 
 #[cfg(test)]
-#[path = "../step_generate_tests.rs"]
 mod tests;

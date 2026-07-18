@@ -62,7 +62,6 @@ use objc2_metal::{MTLDevice, MTLResourceOptions};
 // subcommands). Split out for size (backlog item 4); a child module, so it sees
 // this module's private items via ancestry. Re-exported flat so the existing
 // `step_kv::<fn>` paths keep resolving.
-#[path = "step_kv_audits.rs"]
 mod audits;
 pub use audits::*;
 
@@ -904,13 +903,10 @@ pub fn prefill_monolithic_kv_cpu(
 }
 
 #[cfg(all(test, target_os = "macos"))]
-#[path = "step_kv_bench_tests.rs"]
 mod engine_extend_bench_tests;
 
 #[cfg(all(test, target_os = "macos"))]
-#[path = "step_kv_fusion_tests.rs"]
 mod fusion_tests;
 
 #[cfg(all(test, target_os = "macos"))]
-#[path = "step_kv_encoder_moe_tests.rs"]
 mod encoder_moe_kv_tests;

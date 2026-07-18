@@ -37,9 +37,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-#[path = "server_log.rs"]
 mod log;
-#[path = "server_wire.rs"]
 mod wire;
 pub(crate) use log::*;
 pub(crate) use wire::*;
@@ -197,7 +195,6 @@ struct ToolCompactCfg {
     summarize_max_new: usize,
 }
 
-#[path = "server_worker.rs"]
 mod worker;
 
 type ServeMapper = Arc<Mutex<DiffusionStreamMapper<Arc<crate::tokenizer::Tokenizer>>>>;
@@ -416,7 +413,6 @@ pub(crate) fn run_summarize_pass(
 
 /// Cap an expand excerpt to a token budget so retrieval can't blow the
 /// context the compactor just reclaimed.
-#[path = "server_http.rs"]
 mod http;
 pub(crate) use http::*;
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -552,7 +548,6 @@ pub fn run_serve(
 // ===========================================================================
 
 #[cfg(test)]
-#[path = "server_tests.rs"]
 mod tests;
 
 // ===========================================================================
@@ -564,7 +559,6 @@ mod tests;
 // is what the degradation experiment showed is the stable invariant.
 // ===========================================================================
 #[cfg(all(test, target_os = "macos"))]
-#[path = "server_tool_smoke_tests.rs"]
 mod tool_smoke;
 
 // ===========================================================================
@@ -576,5 +570,4 @@ mod tool_smoke;
 // logs), never on summary wording (seed-robust).
 // ===========================================================================
 #[cfg(all(test, target_os = "macos"))]
-#[path = "server_tool_compact_tests.rs"]
 mod tool_compact_smoke;
