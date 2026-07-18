@@ -174,93 +174,47 @@ pub fn gpu(
     causal: bool,
     side: bool,
 ) -> Result<Vec<f32>, Error> {
-    use crate::metal::buffer::BufferPool;
-    use crate::metal::device::MetalContext;
-    use crate::shaders::bf16;
+    use crate::shaders::attn::harness::AttnRig;
     use crate::shaders::gpu_common;
     use crate::shaders::variant::KernelVariant;
-    use objc2_metal::{
-        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-        MTLSize,
-    };
+    use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
 
-    let canvas = f.canvas;
-    let n_q_heads = f.n_q_heads;
-    let nkv = f.n_kv();
-    let hd = f.head_dim();
-    let group = n_q_heads / nkv;
-    let kv_len = f.kv_len as usize;
-    let t_total = kv_len + canvas;
+    // Standard rig: bf16 Q/out, f16 KV +8 pad key rows (direct-load whole
+    // 8-key tiles), f32 side-ring mirror for the FC30 path.
+    let mut rig = AttnRig::from_fixture(f, 8, true)?;
+    let (canvas, n_q_heads, hd) = (rig.canvas, rig.n_q_heads, rig.hd);
+    let t_total = rig.t_total;
     let np = n_pad(t_total);
-    let kstride = nkv * hd * 2; // elements between per-token KV rows (K then V)
 
-    let ctx = MetalContext::new()?;
     let [pipe_qk, pipe_sm, pipe_pv] = if side {
-        pipelines_side(&ctx, KernelVariant::PRODUCTION)?
+        pipelines_side(&rig.ctx, KernelVariant::PRODUCTION)?
     } else {
-        pipelines(&ctx, KernelVariant::PRODUCTION)?
+        pipelines(&rig.ctx, KernelVariant::PRODUCTION)?
     };
-    let mut pool = BufferPool::new();
-
-    // Q / out: [canvas][n_q_heads][hd] bf16 (arena default).
-    let buf_q = pool
-        .allocate(&ctx.device, canvas * n_q_heads * hd * 2)
-        .ok_or(Error::Gpu("alloc q"))?;
-    BufferPool::write_bf16(&buf_q, &bf16::f32_slice_to_bf16_bits(&f.q));
-    let buf_out = pool
-        .allocate(&ctx.device, canvas * n_q_heads * hd * 2)
-        .ok_or(Error::Gpu("alloc out"))?;
-    // KV: f16 main cache (f16 path). +8 pad key rows (direct-load whole 8-key tiles).
-    let buf_kv = pool
-        .allocate(&ctx.device, (f.kvcache.len() + 8 * kstride) * 2)
-        .ok_or(Error::Gpu("alloc kv"))?;
-    {
-        let mut bits = crate::shaders::f16::f32_slice_to_f16(&f.kvcache);
-        bits.resize(bits.len() + 8 * kstride, 0);
-        BufferPool::write_bf16(&buf_kv, &bits);
-    }
-    // f32 side ring (f32 path): the fixture kvcache is already [t][nkv*hd*2] f32
-    // in the ring layout. +8 pad rows.
-    let buf_kvf = pool
-        .allocate(&ctx.device, (f.kvcache.len() + 8 * kstride) * 4)
-        .ok_or(Error::Gpu("alloc kvf"))?;
-    {
-        let mut fs = f.kvcache.clone();
-        fs.resize(fs.len() + 8 * kstride, 0.0);
-        BufferPool::write_f32(&buf_kvf, &fs);
-    }
     // Scratch: S (f32), P (half or f32 in the side path), lrow (f32) — HC slices.
     let hc = 4.min(n_q_heads);
     let p_elem = if side { 4 } else { 2 };
-    let buf_s = pool
-        .allocate(&ctx.device, hc * canvas * np * 4)
-        .ok_or(Error::Gpu("alloc s"))?;
-    let buf_p = pool
-        .allocate(&ctx.device, hc * canvas * np * p_elem)
-        .ok_or(Error::Gpu("alloc p"))?;
-    let buf_lrow = pool
-        .allocate(&ctx.device, hc * canvas * 4)
-        .ok_or(Error::Gpu("alloc lrow"))?;
+    let buf_s = rig.alloc(hc * canvas * np * 4, "alloc s")?;
+    let buf_p = rig.alloc(hc * canvas * np * p_elem, "alloc p")?;
+    let buf_lrow = rig.alloc(hc * canvas * 4, "alloc lrow")?;
 
     let mut dims = AttnGemmDims {
         m: canvas as u32,
         n: t_total as u32,
         k: hd as u32,
         a_row_stride: (n_q_heads * hd) as u32,
-        b_row_stride: kstride as u32,
+        b_row_stride: rig.kstride as u32,
         s_row_stride: np as u32,
         out_row_stride: (n_q_heads * hd) as u32,
         causal: u32::from(causal),
         kv_len: f.kv_len,
         hd: hd as u32,
-        group: group as u32,
-        nkv: nkv as u32,
+        group: rig.group as u32,
+        nkv: rig.nkv as u32,
         s_head_stride: (canvas * np) as u32,
         head_base: 0,
     };
 
-    let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
-    let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
     let tg128 = MTLSize {
         width: 128,
         height: 1,
@@ -272,80 +226,73 @@ pub fn gpu(
         depth: 1,
     };
 
-    let mut h0 = 0usize;
-    while h0 < n_q_heads {
-        let hb = (n_q_heads - h0).min(hc);
-        dims.head_base = h0 as u32;
-        let dims_pv = AttnGemmDims {
-            n: hd as u32,
-            k: t_total as u32,
-            a_row_stride: np as u32,
-            ..dims
-        };
-        let grid_qk = MTLSize {
-            width: t_total.div_ceil(BN),
-            height: canvas.div_ceil(BM),
-            depth: hb,
-        };
-        let grid_sm = MTLSize {
-            width: canvas,
-            height: hb,
-            depth: 1,
-        };
-        let grid_pv = MTLSize {
-            width: hd.div_ceil(BN),
-            height: canvas.div_ceil(BM),
-            depth: hb,
-        };
-        enc.setComputePipelineState(&pipe_qk.pipeline);
-        unsafe {
-            enc.setBuffer_offset_atIndex(Some(&buf_q), 0, 0);
-            enc.setBuffer_offset_atIndex(Some(&buf_kv), 0, 1);
-            enc.setBuffer_offset_atIndex(Some(&buf_s), 0, 2);
-            if side {
-                enc.setBuffer_offset_atIndex(Some(&buf_kvf), 0, 9);
+    rig.run_once(|enc| {
+        let mut h0 = 0usize;
+        while h0 < n_q_heads {
+            let hb = (n_q_heads - h0).min(hc);
+            dims.head_base = h0 as u32;
+            let dims_pv = AttnGemmDims {
+                n: hd as u32,
+                k: t_total as u32,
+                a_row_stride: np as u32,
+                ..dims
+            };
+            let grid_qk = MTLSize {
+                width: t_total.div_ceil(BN),
+                height: canvas.div_ceil(BM),
+                depth: hb,
+            };
+            let grid_sm = MTLSize {
+                width: canvas,
+                height: hb,
+                depth: 1,
+            };
+            let grid_pv = MTLSize {
+                width: hd.div_ceil(BN),
+                height: canvas.div_ceil(BM),
+                depth: hb,
+            };
+            enc.setComputePipelineState(&pipe_qk.pipeline);
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(&rig.buf_q), 0, 0);
+                enc.setBuffer_offset_atIndex(Some(&rig.buf_kv), 0, 1);
+                enc.setBuffer_offset_atIndex(Some(&buf_s), 0, 2);
+                if side {
+                    enc.setBuffer_offset_atIndex(Some(rig.kvf()), 0, 9);
+                }
             }
-        }
-        gpu_common::set_bytes(&enc, &dims, 3);
-        enc.dispatchThreadgroups_threadsPerThreadgroup(grid_qk, tg128);
-        enc.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers);
+            gpu_common::set_bytes(enc, &dims, 3);
+            enc.dispatchThreadgroups_threadsPerThreadgroup(grid_qk, tg128);
+            enc.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers);
 
-        enc.setComputePipelineState(&pipe_sm.pipeline);
-        unsafe {
-            enc.setBuffer_offset_atIndex(Some(&buf_s), 0, 0);
-            enc.setBuffer_offset_atIndex(Some(&buf_p), 0, 1);
-            enc.setBuffer_offset_atIndex(Some(&buf_lrow), 0, 2);
-        }
-        gpu_common::set_bytes(&enc, &dims, 3);
-        enc.dispatchThreadgroups_threadsPerThreadgroup(grid_sm, tg_sm);
-        enc.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers);
-
-        enc.setComputePipelineState(&pipe_pv.pipeline);
-        unsafe {
-            enc.setBuffer_offset_atIndex(Some(&buf_p), 0, 0);
-            enc.setBuffer_offset_atIndex(Some(&buf_kv), 0, 1);
-            enc.setBuffer_offset_atIndex(Some(&buf_out), 0, 2);
-            enc.setBuffer_offset_atIndex(Some(&buf_lrow), 0, 3);
-            if side {
-                enc.setBuffer_offset_atIndex(Some(&buf_kvf), 0, 9);
+            enc.setComputePipelineState(&pipe_sm.pipeline);
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(&buf_s), 0, 0);
+                enc.setBuffer_offset_atIndex(Some(&buf_p), 0, 1);
+                enc.setBuffer_offset_atIndex(Some(&buf_lrow), 0, 2);
             }
+            gpu_common::set_bytes(enc, &dims, 3);
+            enc.dispatchThreadgroups_threadsPerThreadgroup(grid_sm, tg_sm);
+            enc.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers);
+
+            enc.setComputePipelineState(&pipe_pv.pipeline);
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(&buf_p), 0, 0);
+                enc.setBuffer_offset_atIndex(Some(&rig.buf_kv), 0, 1);
+                enc.setBuffer_offset_atIndex(Some(&rig.buf_out), 0, 2);
+                enc.setBuffer_offset_atIndex(Some(&buf_lrow), 0, 3);
+                if side {
+                    enc.setBuffer_offset_atIndex(Some(rig.kvf()), 0, 9);
+                }
+            }
+            gpu_common::set_bytes(enc, &dims_pv, 4);
+            enc.dispatchThreadgroups_threadsPerThreadgroup(grid_pv, tg128);
+            enc.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers);
+            h0 += hb;
         }
-        gpu_common::set_bytes(&enc, &dims_pv, 4);
-        enc.dispatchThreadgroups_threadsPerThreadgroup(grid_pv, tg128);
-        enc.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers);
-        h0 += hb;
-    }
+    })?;
 
-    enc.endEncoding();
-    cmd.commit();
-    cmd.waitUntilCompleted();
-
-    let mut out = vec![0.0f32; f.out_len()];
-    let ptr = buf_out.contents().as_ptr() as *const u16;
-    for (i, o) in out.iter_mut().enumerate() {
-        *o = bf16::bf16_bits_to_f32(unsafe { *ptr.add(i) });
-    }
-    Ok(out)
+    Ok(rig.read_out_f32(f.out_len()))
 }
 
 /// Causal CPU reference (prefill mask): query row `tok` sits at absolute
@@ -485,74 +432,44 @@ fn model_full_fixture_with(
 /// Time `iters` back-to-back runs of the full E17 3-kernel sequence over all
 /// heads (one full-attention layer, one prefill sub-chunk) in a single command
 /// buffer; 1 warm-up round + min over timed rounds (factors out clock ramp).
-/// Returns mean ms per layer.
+/// Returns mean ms per layer. `causal` mirrors `gpu()` (benches historically
+/// dispatched the prefill mask, causal=1).
 #[cfg(target_os = "macos")]
 pub fn bench_gpu(
     f: &crate::shaders::attention::Fixture,
     iters: usize,
     hc: usize,
+    causal: bool,
 ) -> Result<f64, Error> {
-    use crate::metal::buffer::BufferPool;
-    use crate::metal::device::MetalContext;
-    use crate::shaders::bf16;
+    use crate::shaders::attn::harness::AttnRig;
     use crate::shaders::gpu_common;
     use crate::shaders::variant::KernelVariant;
-    use objc2_metal::{
-        MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
-    };
-    use std::time::Instant;
+    use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
 
-    let canvas = f.canvas;
-    let n_q_heads = f.n_q_heads;
-    let nkv = f.n_kv();
-    let hd = f.head_dim();
-    let group = n_q_heads / nkv;
-    let t_total = f.kv_len as usize + canvas;
+    let mut rig = AttnRig::from_fixture(f, 8, false)?;
+    let (canvas, n_q_heads, hd) = (rig.canvas, rig.n_q_heads, rig.hd);
+    let t_total = rig.t_total;
     let np = n_pad(t_total);
-    let kstride = nkv * hd * 2;
 
-    let ctx = MetalContext::new()?;
-    let [pipe_qk, pipe_sm, pipe_pv] = pipelines(&ctx, KernelVariant::PRODUCTION)?;
-    let mut pool = BufferPool::new();
-    let buf_q = pool
-        .allocate(&ctx.device, canvas * n_q_heads * hd * 2)
-        .ok_or(Error::Gpu("alloc q"))?;
-    BufferPool::write_bf16(&buf_q, &bf16::f32_slice_to_bf16_bits(&f.q));
-    let buf_out = pool
-        .allocate(&ctx.device, canvas * n_q_heads * hd * 2)
-        .ok_or(Error::Gpu("alloc out"))?;
-    let buf_kv = pool
-        .allocate(&ctx.device, (f.kvcache.len() + 8 * kstride) * 2)
-        .ok_or(Error::Gpu("alloc kv"))?;
-    {
-        let mut bits = crate::shaders::f16::f32_slice_to_f16(&f.kvcache);
-        bits.resize(bits.len() + 8 * kstride, 0);
-        BufferPool::write_bf16(&buf_kv, &bits);
-    }
+    let [pipe_qk, pipe_sm, pipe_pv] = pipelines(&rig.ctx, KernelVariant::PRODUCTION)?;
     let hc = hc.clamp(1, n_q_heads);
-    let buf_s = pool
-        .allocate(&ctx.device, hc * canvas * np * 4)
-        .ok_or(Error::Gpu("alloc s"))?;
-    let buf_p = pool
-        .allocate(&ctx.device, hc * canvas * np * 2)
-        .ok_or(Error::Gpu("alloc p"))?;
-    let buf_lrow = pool
-        .allocate(&ctx.device, hc * canvas * 4)
-        .ok_or(Error::Gpu("alloc lrow"))?;
+    let buf_s = rig.alloc(hc * canvas * np * 4, "alloc s")?;
+    let buf_p = rig.alloc(hc * canvas * np * 2, "alloc p")?;
+    let buf_lrow = rig.alloc(hc * canvas * 4, "alloc lrow")?;
 
     let mut dims = AttnGemmDims {
         m: canvas as u32,
         n: t_total as u32,
         k: hd as u32,
         a_row_stride: (n_q_heads * hd) as u32,
-        b_row_stride: kstride as u32,
+        b_row_stride: rig.kstride as u32,
         s_row_stride: np as u32,
         out_row_stride: (n_q_heads * hd) as u32,
-        causal: 1,
+        causal: u32::from(causal),
         kv_len: f.kv_len,
         hd: hd as u32,
-        group: group as u32,
-        nkv: nkv as u32,
+        group: rig.group as u32,
+        nkv: rig.nkv as u32,
         s_head_stride: (canvas * np) as u32,
         head_base: 0,
     };
@@ -567,111 +484,90 @@ pub fn bench_gpu(
         depth: 1,
     };
 
-    let mut best = f64::INFINITY;
-    for round in 0..6 {
-        let t = Instant::now();
-        let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
-        let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
-        for _ in 0..iters {
-            let mut h0 = 0usize;
-            while h0 < n_q_heads {
-                let hb = (n_q_heads - h0).min(hc);
-                dims.head_base = h0 as u32;
-                let dims_pv = AttnGemmDims {
-                    n: hd as u32,
-                    k: t_total as u32,
-                    a_row_stride: np as u32,
-                    ..dims
-                };
-                let grid_qk = MTLSize {
-                    width: t_total.div_ceil(BN),
-                    height: canvas.div_ceil(BM),
-                    depth: hb,
-                };
-                let grid_sm = MTLSize {
-                    width: canvas,
-                    height: hb,
-                    depth: 1,
-                };
-                let grid_pv = MTLSize {
-                    width: hd.div_ceil(BN),
-                    height: canvas.div_ceil(BM),
-                    depth: hb,
-                };
-                enc.setComputePipelineState(&pipe_qk.pipeline);
-                unsafe {
-                    enc.setBuffer_offset_atIndex(Some(&buf_q), 0, 0);
-                    enc.setBuffer_offset_atIndex(Some(&buf_kv), 0, 1);
-                    enc.setBuffer_offset_atIndex(Some(&buf_s), 0, 2);
-                }
-                gpu_common::set_bytes(&enc, &dims, 3);
-                enc.dispatchThreadgroups_threadsPerThreadgroup(grid_qk, tg128);
-                enc.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers);
-                enc.setComputePipelineState(&pipe_sm.pipeline);
-                unsafe {
-                    enc.setBuffer_offset_atIndex(Some(&buf_s), 0, 0);
-                    enc.setBuffer_offset_atIndex(Some(&buf_p), 0, 1);
-                    enc.setBuffer_offset_atIndex(Some(&buf_lrow), 0, 2);
-                }
-                gpu_common::set_bytes(&enc, &dims, 3);
-                enc.dispatchThreadgroups_threadsPerThreadgroup(grid_sm, tg_sm);
-                enc.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers);
-                enc.setComputePipelineState(&pipe_pv.pipeline);
-                unsafe {
-                    enc.setBuffer_offset_atIndex(Some(&buf_p), 0, 0);
-                    enc.setBuffer_offset_atIndex(Some(&buf_kv), 0, 1);
-                    enc.setBuffer_offset_atIndex(Some(&buf_out), 0, 2);
-                    enc.setBuffer_offset_atIndex(Some(&buf_lrow), 0, 3);
-                }
-                gpu_common::set_bytes(&enc, &dims_pv, 4);
-                enc.dispatchThreadgroups_threadsPerThreadgroup(grid_pv, tg128);
-                enc.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers);
-                h0 += hb;
+    rig.time_rounds(iters, |enc| {
+        let mut h0 = 0usize;
+        while h0 < n_q_heads {
+            let hb = (n_q_heads - h0).min(hc);
+            dims.head_base = h0 as u32;
+            let dims_pv = AttnGemmDims {
+                n: hd as u32,
+                k: t_total as u32,
+                a_row_stride: np as u32,
+                ..dims
+            };
+            let grid_qk = MTLSize {
+                width: t_total.div_ceil(BN),
+                height: canvas.div_ceil(BM),
+                depth: hb,
+            };
+            let grid_sm = MTLSize {
+                width: canvas,
+                height: hb,
+                depth: 1,
+            };
+            let grid_pv = MTLSize {
+                width: hd.div_ceil(BN),
+                height: canvas.div_ceil(BM),
+                depth: hb,
+            };
+            enc.setComputePipelineState(&pipe_qk.pipeline);
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(&rig.buf_q), 0, 0);
+                enc.setBuffer_offset_atIndex(Some(&rig.buf_kv), 0, 1);
+                enc.setBuffer_offset_atIndex(Some(&buf_s), 0, 2);
             }
+            gpu_common::set_bytes(enc, &dims, 3);
+            enc.dispatchThreadgroups_threadsPerThreadgroup(grid_qk, tg128);
+            enc.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers);
+            enc.setComputePipelineState(&pipe_sm.pipeline);
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(&buf_s), 0, 0);
+                enc.setBuffer_offset_atIndex(Some(&buf_p), 0, 1);
+                enc.setBuffer_offset_atIndex(Some(&buf_lrow), 0, 2);
+            }
+            gpu_common::set_bytes(enc, &dims, 3);
+            enc.dispatchThreadgroups_threadsPerThreadgroup(grid_sm, tg_sm);
+            enc.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers);
+            enc.setComputePipelineState(&pipe_pv.pipeline);
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(&buf_p), 0, 0);
+                enc.setBuffer_offset_atIndex(Some(&rig.buf_kv), 0, 1);
+                enc.setBuffer_offset_atIndex(Some(&rig.buf_out), 0, 2);
+                enc.setBuffer_offset_atIndex(Some(&buf_lrow), 0, 3);
+            }
+            gpu_common::set_bytes(enc, &dims_pv, 4);
+            enc.dispatchThreadgroups_threadsPerThreadgroup(grid_pv, tg128);
+            enc.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers);
+            h0 += hb;
         }
-        enc.endEncoding();
-        cmd.commit();
-        cmd.waitUntilCompleted();
-        if round > 0 {
-            best = best.min(t.elapsed().as_secs_f64() * 1e3 / iters as f64);
-        }
-    }
-    Ok(best)
+    })
 }
 
 /// Sweep bench (task #87): compile the E17 kernels for a `TuneCfg` (QK/softmax
 /// with the QK tile, PV with the PV tile) and time the full head-chunked prefill
 /// sequence at model shape. Returns mean ms/layer (min over warmed rounds), or
 /// Err if the config fails to compile (bad tile / register spill). `side` = the
-/// f32 side-KV variant.
+/// f32 side-KV variant. `causal` mirrors `gpu()` (the sweep historically
+/// dispatched the prefill mask, causal=1).
 #[cfg(target_os = "macos")]
 pub fn bench_tuned(
     f: &crate::shaders::attention::Fixture,
     iters: usize,
     cfg: TuneCfg,
     side: bool,
+    causal: bool,
 ) -> Result<f64, Error> {
-    use crate::metal::buffer::BufferPool;
-    use crate::metal::device::MetalContext;
-    use crate::shaders::bf16;
+    use crate::shaders::attn::harness::AttnRig;
     use crate::shaders::gpu_common;
     use crate::shaders::variant::{FcBool, KernelVariant};
-    use objc2_metal::{
-        MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
-    };
-    use std::time::Instant;
+    use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
 
-    let canvas = f.canvas;
-    let n_q_heads = f.n_q_heads;
-    let nkv = f.n_kv();
-    let hd = f.head_dim();
-    let group = n_q_heads / nkv;
-    let t_total = f.kv_len as usize + canvas;
+    let mut rig = AttnRig::from_fixture(f, 8, true)?;
+    let (canvas, n_q_heads, hd) = (rig.canvas, rig.n_q_heads, rig.hd);
+    let t_total = rig.t_total;
     let np = n_pad(t_total);
-    let kstride = nkv * hd * 2;
     let hc = cfg.hc.clamp(1, n_q_heads);
 
-    let ctx = MetalContext::new()?;
     let prod = KernelVariant::PRODUCTION;
     let side_fc: &[FcBool] = if side {
         &[FcBool {
@@ -683,58 +579,34 @@ pub fn bench_tuned(
     };
     let src_qk = tuned_source(cfg.qk_bm, cfg.qk_bn, cfg.sm_tpg);
     let src_pv = tuned_source(cfg.pv_bm, cfg.pv_bn, cfg.sm_tpg);
-    let pipe_qk = ctx.compile_subkernel_ex(&src_qk, ENTRY_QK, prod, "tune", side_fc, &[])?;
-    let pipe_sm = ctx.compile_subkernel_ex(&src_qk, ENTRY_SOFTMAX, prod, "tune", side_fc, &[])?;
-    let pipe_pv = ctx.compile_subkernel_ex(&src_pv, ENTRY_PV, prod, "tune", side_fc, &[])?;
+    let pipe_qk = rig
+        .ctx
+        .compile_subkernel_ex(&src_qk, ENTRY_QK, prod, "tune", side_fc, &[])?;
+    let pipe_sm =
+        rig.ctx
+            .compile_subkernel_ex(&src_qk, ENTRY_SOFTMAX, prod, "tune", side_fc, &[])?;
+    let pipe_pv = rig
+        .ctx
+        .compile_subkernel_ex(&src_pv, ENTRY_PV, prod, "tune", side_fc, &[])?;
 
-    let mut pool = BufferPool::new();
-    let buf_q = pool
-        .allocate(&ctx.device, canvas * n_q_heads * hd * 2)
-        .ok_or(Error::Gpu("alloc q"))?;
-    BufferPool::write_bf16(&buf_q, &bf16::f32_slice_to_bf16_bits(&f.q));
-    let buf_out = pool
-        .allocate(&ctx.device, canvas * n_q_heads * hd * 2)
-        .ok_or(Error::Gpu("alloc out"))?;
-    let buf_kv = pool
-        .allocate(&ctx.device, (f.kvcache.len() + 8 * kstride) * 2)
-        .ok_or(Error::Gpu("alloc kv"))?;
-    {
-        let mut bits = crate::shaders::f16::f32_slice_to_f16(&f.kvcache);
-        bits.resize(bits.len() + 8 * kstride, 0);
-        BufferPool::write_bf16(&buf_kv, &bits);
-    }
-    let buf_kvf = pool
-        .allocate(&ctx.device, (f.kvcache.len() + 8 * kstride) * 4)
-        .ok_or(Error::Gpu("alloc kvf"))?;
-    {
-        let mut fs = f.kvcache.clone();
-        fs.resize(fs.len() + 8 * kstride, 0.0);
-        BufferPool::write_f32(&buf_kvf, &fs);
-    }
     let p_elem = if side { 4 } else { 2 };
-    let buf_s = pool
-        .allocate(&ctx.device, hc * canvas * np * 4)
-        .ok_or(Error::Gpu("alloc s"))?;
-    let buf_p = pool
-        .allocate(&ctx.device, hc * canvas * np * p_elem)
-        .ok_or(Error::Gpu("alloc p"))?;
-    let buf_lrow = pool
-        .allocate(&ctx.device, hc * canvas * 4)
-        .ok_or(Error::Gpu("alloc lrow"))?;
+    let buf_s = rig.alloc(hc * canvas * np * 4, "alloc s")?;
+    let buf_p = rig.alloc(hc * canvas * np * p_elem, "alloc p")?;
+    let buf_lrow = rig.alloc(hc * canvas * 4, "alloc lrow")?;
 
     let mut dims = AttnGemmDims {
         m: canvas as u32,
         n: t_total as u32,
         k: hd as u32,
         a_row_stride: (n_q_heads * hd) as u32,
-        b_row_stride: kstride as u32,
+        b_row_stride: rig.kstride as u32,
         s_row_stride: np as u32,
         out_row_stride: (n_q_heads * hd) as u32,
-        causal: 1,
+        causal: u32::from(causal),
         kv_len: f.kv_len,
         hd: hd as u32,
-        group: group as u32,
-        nkv: nkv as u32,
+        group: rig.group as u32,
+        nkv: rig.nkv as u32,
         s_head_stride: (canvas * np) as u32,
         head_base: 0,
     };
@@ -754,82 +626,69 @@ pub fn bench_tuned(
         depth: 1,
     };
 
-    let mut best = f64::INFINITY;
-    for round in 0..6 {
-        let t = Instant::now();
-        let cmd = ctx.queue.commandBuffer().ok_or(Error::Gpu("cmd"))?;
-        let enc = cmd.computeCommandEncoder().ok_or(Error::Gpu("enc"))?;
-        for _ in 0..iters {
-            let mut h0 = 0usize;
-            while h0 < n_q_heads {
-                let hb = (n_q_heads - h0).min(hc);
-                dims.head_base = h0 as u32;
-                let dims_pv = AttnGemmDims {
-                    n: hd as u32,
-                    k: t_total as u32,
-                    a_row_stride: np as u32,
-                    ..dims
-                };
-                let grid_qk = MTLSize {
-                    width: t_total.div_ceil(cfg.qk_bn),
-                    height: canvas.div_ceil(cfg.qk_bm),
-                    depth: hb,
-                };
-                let grid_sm = MTLSize {
-                    width: canvas,
-                    height: hb,
-                    depth: 1,
-                };
-                let grid_pv = MTLSize {
-                    width: hd.div_ceil(cfg.pv_bn),
-                    height: canvas.div_ceil(cfg.pv_bm),
-                    depth: hb,
-                };
-                enc.setComputePipelineState(&pipe_qk.pipeline);
-                unsafe {
-                    enc.setBuffer_offset_atIndex(Some(&buf_q), 0, 0);
-                    enc.setBuffer_offset_atIndex(Some(&buf_kv), 0, 1);
-                    enc.setBuffer_offset_atIndex(Some(&buf_s), 0, 2);
-                    if side {
-                        enc.setBuffer_offset_atIndex(Some(&buf_kvf), 0, 9);
-                    }
+    rig.time_rounds(iters, |enc| {
+        let mut h0 = 0usize;
+        while h0 < n_q_heads {
+            let hb = (n_q_heads - h0).min(hc);
+            dims.head_base = h0 as u32;
+            let dims_pv = AttnGemmDims {
+                n: hd as u32,
+                k: t_total as u32,
+                a_row_stride: np as u32,
+                ..dims
+            };
+            let grid_qk = MTLSize {
+                width: t_total.div_ceil(cfg.qk_bn),
+                height: canvas.div_ceil(cfg.qk_bm),
+                depth: hb,
+            };
+            let grid_sm = MTLSize {
+                width: canvas,
+                height: hb,
+                depth: 1,
+            };
+            let grid_pv = MTLSize {
+                width: hd.div_ceil(cfg.pv_bn),
+                height: canvas.div_ceil(cfg.pv_bm),
+                depth: hb,
+            };
+            enc.setComputePipelineState(&pipe_qk.pipeline);
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(&rig.buf_q), 0, 0);
+                enc.setBuffer_offset_atIndex(Some(&rig.buf_kv), 0, 1);
+                enc.setBuffer_offset_atIndex(Some(&buf_s), 0, 2);
+                if side {
+                    enc.setBuffer_offset_atIndex(Some(rig.kvf()), 0, 9);
                 }
-                gpu_common::set_bytes(&enc, &dims, 3);
-                enc.dispatchThreadgroups_threadsPerThreadgroup(grid_qk, tg_qk);
-                enc.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers);
-                enc.setComputePipelineState(&pipe_sm.pipeline);
-                unsafe {
-                    enc.setBuffer_offset_atIndex(Some(&buf_s), 0, 0);
-                    enc.setBuffer_offset_atIndex(Some(&buf_p), 0, 1);
-                    enc.setBuffer_offset_atIndex(Some(&buf_lrow), 0, 2);
-                }
-                gpu_common::set_bytes(&enc, &dims, 3);
-                enc.dispatchThreadgroups_threadsPerThreadgroup(grid_sm, tg_sm);
-                enc.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers);
-                enc.setComputePipelineState(&pipe_pv.pipeline);
-                unsafe {
-                    enc.setBuffer_offset_atIndex(Some(&buf_p), 0, 0);
-                    enc.setBuffer_offset_atIndex(Some(&buf_kv), 0, 1);
-                    enc.setBuffer_offset_atIndex(Some(&buf_out), 0, 2);
-                    enc.setBuffer_offset_atIndex(Some(&buf_lrow), 0, 3);
-                    if side {
-                        enc.setBuffer_offset_atIndex(Some(&buf_kvf), 0, 9);
-                    }
-                }
-                gpu_common::set_bytes(&enc, &dims_pv, 4);
-                enc.dispatchThreadgroups_threadsPerThreadgroup(grid_pv, tg_pv);
-                enc.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers);
-                h0 += hb;
             }
+            gpu_common::set_bytes(enc, &dims, 3);
+            enc.dispatchThreadgroups_threadsPerThreadgroup(grid_qk, tg_qk);
+            enc.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers);
+            enc.setComputePipelineState(&pipe_sm.pipeline);
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(&buf_s), 0, 0);
+                enc.setBuffer_offset_atIndex(Some(&buf_p), 0, 1);
+                enc.setBuffer_offset_atIndex(Some(&buf_lrow), 0, 2);
+            }
+            gpu_common::set_bytes(enc, &dims, 3);
+            enc.dispatchThreadgroups_threadsPerThreadgroup(grid_sm, tg_sm);
+            enc.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers);
+            enc.setComputePipelineState(&pipe_pv.pipeline);
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(&buf_p), 0, 0);
+                enc.setBuffer_offset_atIndex(Some(&rig.buf_kv), 0, 1);
+                enc.setBuffer_offset_atIndex(Some(&rig.buf_out), 0, 2);
+                enc.setBuffer_offset_atIndex(Some(&buf_lrow), 0, 3);
+                if side {
+                    enc.setBuffer_offset_atIndex(Some(rig.kvf()), 0, 9);
+                }
+            }
+            gpu_common::set_bytes(enc, &dims_pv, 4);
+            enc.dispatchThreadgroups_threadsPerThreadgroup(grid_pv, tg_pv);
+            enc.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers);
+            h0 += hb;
         }
-        enc.endEncoding();
-        cmd.commit();
-        cmd.waitUntilCompleted();
-        if round > 0 {
-            best = best.min(t.elapsed().as_secs_f64() * 1e3 / iters as f64);
-        }
-    }
-    Ok(best)
+    })
 }
 
 #[cfg(test)]
@@ -897,10 +756,10 @@ mod tests {
         for kv_len in [8192u32, 30000, 60000] {
             let f = model_full_fixture(kv_len);
             let mma_full = crate::shaders::attention::bench_path(&f, iters, 3).unwrap();
-            let hc16 = bench_gpu(&f, iters, 16).unwrap();
-            let hc8 = bench_gpu(&f, iters, 8).unwrap();
-            let hc4 = bench_gpu(&f, iters, 4).unwrap();
-            let hc2 = bench_gpu(&f, iters, 2).unwrap();
+            let hc16 = bench_gpu(&f, iters, 16, true).unwrap();
+            let hc8 = bench_gpu(&f, iters, 8, true).unwrap();
+            let hc4 = bench_gpu(&f, iters, 4, true).unwrap();
+            let hc2 = bench_gpu(&f, iters, 2, true).unwrap();
             let best = hc16.min(hc8).min(hc4).min(hc2);
             println!(
                 "{kv_len:>6}  {mma_full:9.3}  {hc16:9.3}  {hc8:9.3}  {hc4:9.3}  {hc2:9.3}  {:.2}x",

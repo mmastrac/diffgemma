@@ -1012,7 +1012,7 @@ mod tests {
             "mma2 prod (M={canvas}, hd={hd}, nq={nq}, nkv={nkv}, kv={kv_len}): {mma2:.3} ms, {mma2_tf_s:.2} TF/s ({:.1}% of 3.8 wall)",
             100.0 * mma2_tf_s / 3.8
         );
-        let flash_nowin = bench_flash(&f, iters, 16).expect("flash no-window");
+        let flash_nowin = bench_flash(&f, iters, 16, true).expect("flash no-window");
         let flash_nowin_flops = 2.0 * (nq * canvas * t * hd * 2) as f64;
         let flash_nowin_tf = flash_nowin_flops / (flash_nowin * 1e-3) / 1e12;
         println!(
@@ -1020,7 +1020,7 @@ mod tests {
             100.0 * flash_nowin_tf / 3.8,
             mma2 / flash_nowin,
         );
-        let flash_win = bench_flash_window(&f, iters, 16, kv_len).expect("flash window");
+        let flash_win = bench_flash_window(&f, iters, 16, kv_len, true).expect("flash window");
         let flash_win_flops = 2.0 * (nq * canvas * kv_len as usize * hd * 2) as f64;
         let flash_win_tf = flash_win_flops / (flash_win * 1e-3) / 1e12;
         println!(

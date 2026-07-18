@@ -8,4 +8,6 @@ pub mod attention_topk;
 pub mod cpu;
 pub mod engine_gqa_common;
 pub mod gqa_attention;
+#[cfg(target_os = "macos")]
+pub(crate) mod harness;
 pub mod qk_rope_kv;
