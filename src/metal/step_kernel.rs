@@ -4765,6 +4765,10 @@ fn arena_hidden_stats(
 }
 
 pub struct StepRuntime {
+    /// Byte grant covering this runtime's footprint (weights blob + KV +
+    /// scratch slack). Held for the runtime's lifetime; releasing IS dropping
+    /// the runtime, so the budget cannot be held wrong. See `membudget`.
+    _mem_permit: crate::membudget::MemPermit,
     ctx: MetalContext,
     pipelines: &'static StepPipelines,
     /// fp16-arena pipeline set (E11, DGQ_PREFILL_F16): identical kernels
@@ -5949,6 +5953,16 @@ pub fn build_step_runtime(
         }
     }
 
+    // Take the machine-wide memory grant BEFORE any model-scale allocation.
+    // Blocks (FIFO, cross-process aware) until the footprint fits; see
+    // `membudget` for the contract. Estimate: the weights blob (GPU upload;
+    // the mmap side is clean file-backed and evictable), the KV cache at this
+    // max_seq, and a fixed slack for arena/scratch/encoder-cache structures.
+    let estimate = store.blob_bytes() as usize
+        + crate::metal::step_kv::kv_cache_total_bytes(&layout, cfg.max_seq) as usize
+        + (2usize << 30);
+    let mem_permit = crate::membudget::MemBudget::global().acquire(estimate, "step-runtime");
+
     let ctx = MetalContext::new()?;
     let compile_started = Instant::now();
     let kv_fmt = crate::flags::kv_format(cfg.max_seq);
@@ -6222,6 +6236,7 @@ pub fn build_step_runtime(
         );
     }
     let mut rt = StepRuntime {
+        _mem_permit: mem_permit,
         ctx,
         pipelines,
         pipelines_prefill_f16,

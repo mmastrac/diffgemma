@@ -33,6 +33,7 @@ mod flags;
 mod generate;
 mod generate_golden;
 mod golden;
+mod membudget;
 #[cfg(target_os = "macos")]
 mod metal;
 mod model;
