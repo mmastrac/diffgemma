@@ -117,6 +117,12 @@ pub struct SamplerFlags {
     pub block_commit_retry: u32,
     /// `DGQ_FORCE_CANVAS`: force the active canvas width (diagnostic). None = 256.
     pub force_canvas: Option<u32>,
+    /// `DGQ_COMMIT_CONF_TRIM` (p_max τ in (0,1]; 0 disables): trim a proposed
+    /// block at the first canvas row whose final-step p_max is below τ —
+    /// unresolved rows argmax-copy their neighbor (the duplication
+    /// micro-stutter), so the tail re-denoises next block against committed
+    /// context instead. Default OFF (0) pending multi-seed A/B.
+    pub commit_conf_trim: f32,
 }
 
 impl Default for SamplerFlags {
@@ -357,6 +363,10 @@ pub struct DebugFlags {
     pub trace_ranges: bool,
     pub mem_watch: bool,
     pub dump_kv_path: Option<String>,
+    /// `DGQ_TRACE_PMAX_JSONL=<path>`: append one JSON line per denoise step
+    /// (per-position p_max/entropy/accept/argmax) plus a block-commit line —
+    /// the E7 M0 instrumentation (readback-only, zero behavior change).
+    pub trace_pmax_jsonl: Option<String>,
     pub moe_route_ref_path: Option<String>,
     pub engine_layer_dump_path: Option<String>,
     pub engine_layer_dump_pos: usize,
@@ -454,6 +464,12 @@ impl RuntimeConfig {
                     .ok()
                     .and_then(|v| v.parse::<u32>().ok())
                     .filter(|&w| w >= 1),
+                commit_conf_trim: r
+                    .var("DGQ_COMMIT_CONF_TRIM")
+                    .ok()
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .filter(|&x| (0.0..=1.0).contains(&x))
+                    .unwrap_or(0.0),
             },
             perf: PerfFlags {
                 moe_fuse_gather: r.on_unless_zero("DGQ_MOE_FUSE_GATHER"),
@@ -575,6 +591,7 @@ impl RuntimeConfig {
                 trace_ranges: r.var("DGQ_TRACE_RANGES").is_ok(),
                 mem_watch: r.on_if_one("DGQ_MEM_WATCH"),
                 dump_kv_path: r.var("DGQ_DUMP_KV").ok(),
+                trace_pmax_jsonl: r.var("DGQ_TRACE_PMAX_JSONL").ok().filter(|v| !v.is_empty()),
                 moe_route_ref_path: r.var("DGQ_MOE_ROUTE_REF").ok(),
                 engine_layer_dump_path: r.var("DGQ_ENGINE_LAYER_DUMP").ok(),
                 engine_layer_dump_pos: parse_usize("DGQ_ENGINE_LAYER_POS", 129),

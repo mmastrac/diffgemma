@@ -240,7 +240,14 @@ pub fn begin_turn(
     }
     let canvas_len = CANVAS;
     let layers = session.layers;
-    let max_blocks = cfg.max_new_tokens.div_ceil(canvas_len).max(1);
+    let mut max_blocks = cfg.max_new_tokens.div_ceil(canvas_len).max(1);
+    if crate::flags::commit_conf_trim() > 0.0 {
+        // Confidence-trimmed blocks commit fewer than CANVAS tokens; keep the
+        // TOKEN budget as the binding limit with 2x block headroom so trims
+        // don't silently truncate long replies (the trim floor still
+        // guarantees >=16 tokens of progress per block).
+        max_blocks *= 2;
+    }
     let model_dir = session.model_dir.as_path();
     let shared_blob = session.rt.shared_dgq_blob();
     let rt = &mut session.rt;
@@ -520,6 +527,24 @@ pub fn propose_block(
             block_step_count += 1;
             let st = rt.read_canvas_state();
             last_st = st;
+            if let Some(path) = crate::flags::trace_pmax_jsonl() {
+                trace_pmax_append(
+                    &path,
+                    serde_json::json!({
+                        "kind": "step",
+                        "block": block_idx,
+                        "step_index": block_step_count,
+                        "st_step": st.step,
+                        "active": active,
+                        "mean_entropy": st.mean_entropy,
+                        "stop_flag": st.stop_flag,
+                        "pmax": pmax_from_rowstats(&rt.read_sample_rowstats(active)),
+                        "entropy": &st.entropy[..active],
+                        "accept": &st.accept[..active],
+                        "argmax": &st.prev_argmax[..active],
+                    }),
+                );
+            }
             if denoise_parity_log_enabled() {
                 log_denoise_parity_step(
                     &format!("block={block_idx} step_index={block_step_count}"),
@@ -903,7 +928,52 @@ pub fn propose_block(
     // sentinels. `rt.active_canvas()` after the loop is the successful
     // attempt's width (no set_active_canvas ran after its break).
     let committed_canvas = rt.active_canvas();
-    let argmax_tokens: Vec<u32> = st.prev_argmax[..committed_canvas].to_vec();
+    let mut argmax_tokens: Vec<u32> = st.prev_argmax[..committed_canvas].to_vec();
+
+    // Confidence trim (`DGQ_COMMIT_CONF_TRIM=τ`, default off): drop the canvas
+    // tail from the first row whose final-step p_max is below τ. An unresolved
+    // row's argmax tends to copy its neighbor (the duplication micro-stutter:
+    // `the the`, `<|"|><|"|>` — every strain-battery stutter committed at
+    // p_max 0.40-0.86 vs ≥0.9 for 98% of clean commits), and the next block
+    // re-denoises the dropped tail against committed left context instead.
+    // Floor: a low-confidence row inside the first MIN_CONF_KEEP rows does not
+    // trim (progress guarantee; the E6/commit-guard paths own those failures).
+    let conf_tau = crate::flags::commit_conf_trim();
+    if conf_tau > 0.0 {
+        const MIN_CONF_KEEP: usize = 16;
+        let pmax = pmax_from_rowstats(&rt.read_sample_rowstats(committed_canvas));
+        if let Some(first_low) = pmax.iter().position(|&p| p < conf_tau)
+            && first_low >= MIN_CONF_KEEP
+        {
+            argmax_tokens.truncate(first_low);
+            if progress_enabled() {
+                eprintln!(
+                    "step-generate: block {block_idx} confidence-trim at row {first_low}/{committed_canvas} (p_max {:.3} < {conf_tau})",
+                    pmax[first_low],
+                );
+            }
+        }
+    }
+
+    if let Some(path) = crate::flags::trace_pmax_jsonl() {
+        trace_pmax_append(
+            &path,
+            serde_json::json!({
+                "kind": "block_commit",
+                "block": block_idx,
+                "steps": block_step_count,
+                "active": committed_canvas,
+                // Post-confidence-trim proposal length (== active when off).
+                "kept": argmax_tokens.len(),
+                "stop_reason": denoise_stop.as_str(),
+                "eos": rt.read_params().eos_token_id,
+                "mean_entropy": st.mean_entropy,
+                "pmax": pmax_from_rowstats(&rt.read_sample_rowstats(committed_canvas)),
+                "entropy": &st.entropy[..committed_canvas],
+                "argmax": &st.prev_argmax[..committed_canvas],
+            }),
+        );
+    }
 
     let stats = crate::generate::BlockDenoiseStats {
         block_idx,
@@ -919,7 +989,7 @@ pub fn propose_block(
         late_mean_ent,
         late_max_low_ent: late_low_ent,
         denoise_stop: denoise_stop.as_str().to_string(),
-        kept_tokens: committed_canvas,
+        kept_tokens: argmax_tokens.len(),
         token_ids: Vec::new(),
         stop_token_id: None,
         stop_offset: None,
@@ -1068,4 +1138,26 @@ pub fn finish_turn(
             canvas_rng: Some("rust-lcg".into()),
         }),
     })
+}
+
+/// `p_max = 1/sum` from the sampler rowstat plane `{mx, sum}` (the softmax is
+/// centered on the max logit, so the max token's unnormalized weight is 1).
+fn pmax_from_rowstats(rowstats: &[[f32; 2]]) -> Vec<f32> {
+    rowstats
+        .iter()
+        .map(|s| if s[1] > 0.0 { 1.0 / s[1] } else { 0.0 })
+        .collect()
+}
+
+/// Append one line to the `DGQ_TRACE_PMAX_JSONL` trace (E7 M0). Best-effort:
+/// trace I/O must never fail a generation.
+fn trace_pmax_append(path: &str, v: serde_json::Value) {
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{v}");
+    }
 }

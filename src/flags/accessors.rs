@@ -73,6 +73,11 @@ pub fn force_canvas() -> Option<u32> {
     config().sampler.force_canvas
 }
 
+/// Commit-time confidence trim τ (`DGQ_COMMIT_CONF_TRIM`; 0 = off).
+pub fn commit_conf_trim() -> f32 {
+    config().sampler.commit_conf_trim
+}
+
 // ===========================================================================
 // Production perf toggles (all default ON, opt-out for A/B triage)
 // ===========================================================================
@@ -584,6 +589,11 @@ pub fn mem_watch_enabled() -> bool {
 /// Dump per-layer prefill KV to `<path>` (`DGQ_DUMP_KV=<path>`).
 pub fn dump_kv_path() -> Option<String> {
     config().debug.dump_kv_path.clone()
+}
+
+/// E7 M0 p_max trace JSONL path (`DGQ_TRACE_PMAX_JSONL=<path>`).
+pub fn trace_pmax_jsonl() -> Option<String> {
+    config().debug.trace_pmax_jsonl.clone()
 }
 
 /// Dump MoE routes to `<path>` (`DGQ_MOE_ROUTE_REF=<path>`).

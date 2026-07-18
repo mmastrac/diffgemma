@@ -395,6 +395,18 @@ impl StepRuntime {
         read_struct(&self.bufs.state)
     }
 
+    /// Read the sampler rowstat plane `{mx, sum}` (f32 pairs, tempered
+    /// distribution) for the first `rows` canvas rows. `p_max = 1/sum` since
+    /// the softmax is centered on the max logit. Trace-only readback
+    /// (`DGQ_TRACE_PMAX_JSONL`) — never on a hot path.
+    pub fn read_sample_rowstats(&self, rows: usize) -> Vec<[f32; 2]> {
+        let byte_off = self.bufs.arena_map.rs_samp_off() as usize;
+        let ptr = unsafe { self.bufs.arena.contents().as_ptr().add(byte_off) as *const f32 };
+        (0..rows.min(CANVAS))
+            .map(|r| unsafe { [*ptr.add(r * 2), *ptr.add(r * 2 + 1)] })
+            .collect()
+    }
+
     pub fn set_canvas_ids(&mut self, ids: &[u32]) -> Result<(), Error> {
         // CANVAS for denoise / plain prefill chunks; up to PREFILL_M for a
         // batched prefill super-chunk.
