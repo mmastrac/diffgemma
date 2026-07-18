@@ -255,6 +255,7 @@ impl Worker {
         };
         match out {
             Ok(out) => {
+                flush_paced(&mapper, &job.resp, tool_mode);
                 let raw_text = mapper.lock().unwrap().content().to_string();
                 let reasoning = mapper.lock().unwrap().reasoning().to_string();
                 let completion_tokens = out.token_ids.len().saturating_sub(prompt_len);
@@ -269,28 +270,38 @@ impl Worker {
                 // call. A tool_call does NOT end the turn, so the model may emit
                 // several calls + interleaved text — we capture all calls.
                 let (content, tool_calls) = if tool_mode {
-                    let calls = crate::tools::parse_tool_calls(&raw_text);
+                    let mut calls = crate::tools::parse_tool_calls(&raw_text);
                     if calls.is_empty() && raw_text.contains("call:") {
                         eprintln!(
                             "serve: tool-mode: raw has call: but parse returned 0 ({})",
                             trunc_preview(&raw_text, 160)
                         );
                     }
-                    // Splitter-disagreement tripwire: the raw reply carries a
-                    // well-formed call outside any thought span, but the
-                    // mapper's channel split kept it out of content. Should
-                    // be unreachable now that both sides are span-explicit —
-                    // fires loudly if their semantics ever drift apart again.
-                    if calls.is_empty()
-                        && !crate::tools::parse_tool_calls(&crate::tools::strip_thinking(
-                            &raw_ids_decode,
-                        ))
-                        .is_empty()
-                    {
-                        eprintln!(
-                            "serve: CHANNEL MISMATCH: visible well-formed call lost by the stream split ({})",
-                            trunc_preview(&raw_ids_decode, 160)
+                    // Splitter-disagreement recovery: the raw reply carries a
+                    // well-formed call the mapper's channel split kept out of
+                    // content (e.g. an unclosed thought span around the call —
+                    // repair-round conditioning provokes these; the repair
+                    // validator judges such replies clean, so dropping the
+                    // call here handed the client prose with no tool_calls,
+                    // field incident 2026-07-18). Adopt the calls from the
+                    // thought-stripped raw decode instead of only logging.
+                    if calls.is_empty() {
+                        // Unclosed span: strip_thinking keeps its text.
+                        let mut salvage = crate::tools::parse_tool_calls(
+                            &crate::tools::strip_thinking(&raw_ids_decode),
                         );
+                        if salvage.is_empty() {
+                            // Closed span: the call lives in reasoning text.
+                            salvage = crate::tools::parse_tool_calls(&reasoning);
+                        }
+                        if !salvage.is_empty() {
+                            eprintln!(
+                                "serve: CHANNEL MISMATCH: {} call(s) lost by the stream split; recovered from raw reply ({})",
+                                salvage.len(),
+                                trunc_preview(&raw_ids_decode, 160)
+                            );
+                            calls = salvage;
+                        }
                     }
                     (
                         crate::tools::content_before_tool_calls(&raw_text),
@@ -484,6 +495,7 @@ impl Worker {
             self.channel_close,
             job.enable_thinking,
             job.emit_drafts,
+            crate::flags::paced_stream_enabled(),
         )))
     }
 
@@ -677,6 +689,7 @@ impl Worker {
                     return;
                 }
             };
+            flush_paced(&mapper, &job.resp, true);
             let raw = mapper.lock().unwrap().content().to_string();
             reasoning.push_str(mapper.lock().unwrap().reasoning());
             completion_tokens += out.token_ids.len().saturating_sub(round_prompt.len());
@@ -692,7 +705,20 @@ impl Worker {
                 return;
             }
 
-            let calls = crate::tools::parse_tool_calls(&raw);
+            let mut calls = crate::tools::parse_tool_calls(&raw);
+            if calls.is_empty() {
+                // Splitter-disagreement recovery (see the non-compact path):
+                // a call misclassified into the round's reasoning must not
+                // silently end the turn as a plain answer.
+                let salvage = crate::tools::parse_tool_calls(&mapper.lock().unwrap().reasoning());
+                if !salvage.is_empty() {
+                    eprintln!(
+                        "serve: CHANNEL MISMATCH: {} call(s) lost by the stream split; recovered from round reasoning",
+                        salvage.len(),
+                    );
+                    calls = salvage;
+                }
+            }
             let piece = crate::tools::content_before_tool_calls(&raw);
             if !piece.is_empty() {
                 content_pieces.push(piece);

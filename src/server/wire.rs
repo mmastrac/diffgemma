@@ -43,12 +43,30 @@ pub struct DiffusionStreamMapper<D: TextDecoder> {
     streak: Vec<u32>,
     /// Block-committed token ids accumulated across all committed blocks.
     committed_ids: Vec<u32>,
-    /// Reasoning / content text already emitted as deltas (append cursors).
+    /// Full committed reasoning / content text (the split of `committed_ids`).
+    /// With pacing on, deltas may lag these; [`content`](Self::content) /
+    /// [`reasoning`](Self::reasoning) always return the full committed text.
     emitted_reasoning: String,
     emitted_content: String,
     /// Last draft text emitted (dedupe replace-semantics chunks).
     last_draft: String,
     ended: bool,
+
+    /// Paced release: hold a committed block's text and dribble it out during
+    /// the NEXT block's denoise (paced by its step progress against an EMA of
+    /// block step counts) so multi-block turns stream smoothly instead of
+    /// bursting a block every N seconds. Everything flushes at turn end or
+    /// the moment a tool call appears in committed content (agents consume
+    /// tool turns whole — never delay them).
+    paced: bool,
+    /// Byte cursors into `emitted_reasoning` / `emitted_content` already
+    /// RELEASED as deltas (== full lengths when pacing is off).
+    released_reasoning: usize,
+    released_content: usize,
+    /// EMA of committed blocks' step counts — the pacing denominator.
+    est_block_steps: f32,
+    /// Pacing permanently off for this turn (tool call seen).
+    pace_off: bool,
 }
 
 /// Reasoning (thought-channel) and answer text split out of a committed id list.
@@ -58,6 +76,7 @@ struct Split {
 }
 
 impl<D: TextDecoder> DiffusionStreamMapper<D> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         decoder: D,
         stops: Vec<u32>,
@@ -65,6 +84,7 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
         channel_close: Option<u32>,
         thinking: bool,
         emit_drafts: bool,
+        paced: bool,
     ) -> Self {
         Self {
             decoder,
@@ -81,6 +101,11 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
             emitted_content: String::new(),
             last_draft: String::new(),
             ended: false,
+            paced,
+            released_reasoning: 0,
+            released_content: 0,
+            est_block_steps: 16.0,
+            pace_off: false,
         }
     }
 
@@ -120,12 +145,28 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
         let mut reasoning_ids: Vec<u32> = Vec::new();
         let mut content_ids: Vec<u32> = Vec::new();
         let mut in_thought = false;
+        // A `<|channel>` takes its NAME token (+ trailing newline) with it: the
+        // open special is dropped here, so a mid-span re-open would otherwise
+        // leak a bare "thought" line into the client's Thought UI (field
+        // glitch 2026-07-18, repair-round conditioning).
+        let mut skip_name = false;
         for &id in ids {
             if Some(id) == self.channel_open {
                 in_thought = true;
+                skip_name = true;
             } else if Some(id) == self.channel_close {
                 in_thought = false;
             } else if in_thought {
+                if skip_name {
+                    let tok = self.decoder.decode(&[id]);
+                    if tok == "thought" {
+                        continue;
+                    }
+                    skip_name = false;
+                    if tok == "\n" {
+                        continue;
+                    }
+                }
                 reasoning_ids.push(id);
             } else {
                 content_ids.push(id);
@@ -156,7 +197,8 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
     /// opener scaffold the model emits when thinking is enabled.
     fn clean_reasoning(&self, ids: &[u32]) -> String {
         // Drop channel specials entirely — mid-thought re-opens (or stale-canvas
-        // leftovers) must not survive as nested Thought UI markup.
+        // leftovers) must not survive as nested Thought UI markup. (Name-token
+        // swallowing happens in `split`, where the opens are still visible.)
         let filtered: Vec<u32> = ids
             .iter()
             .copied()
@@ -251,19 +293,24 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
             }
         }
 
-        // Commit: fold this block's stable ids into the committed stream and
-        // emit any newly-committed reasoning / content as append deltas.
+        // Commit: fold this block's stable ids into the committed stream.
+        // Unpaced (or flush conditions): emit the newly-committed text now.
+        // Paced: hold it and let the per-step release below dribble it out
+        // during the next block's denoise.
         if ev.block_done {
             self.committed_ids.extend_from_slice(&stable_ids);
             let split = self.split(&self.committed_ids);
-            if let Some(delta) = append_delta(&self.emitted_reasoning, &split.reasoning) {
-                out.push(WireDelta::Reasoning(delta));
-                self.emitted_reasoning = split.reasoning;
+            // A rare non-prefix revision invalidates the release cursors.
+            if !split.reasoning.starts_with(&self.emitted_reasoning) {
+                self.released_reasoning = 0;
             }
-            if let Some(delta) = append_delta(&self.emitted_content, &split.content) {
-                out.push(WireDelta::Content(delta));
-                self.emitted_content = split.content;
+            if !split.content.starts_with(&self.emitted_content) {
+                self.released_content = 0;
             }
+            self.emitted_reasoning = split.reasoning;
+            self.emitted_content = split.content;
+            // EMA of block step counts — the pacing denominator.
+            self.est_block_steps = 0.5 * self.est_block_steps + 0.5 * ev.step_in_block as f32;
             self.last_argmax.clear();
             self.streak.clear();
             // Premature stop inside an unfinished tool turn (open call, or
@@ -271,7 +318,68 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
             if hit_stop && !crate::tools::should_continue_past_stop(&self.emitted_content) {
                 self.ended = true;
             }
+            // Tool call in committed content: agents consume tool turns whole
+            // — flush and stop pacing for the rest of the turn.
+            if self.emitted_content.contains("call:") {
+                self.pace_off = true;
+            }
+            if !self.paced || self.pace_off || self.ended {
+                self.release_up_to(usize::MAX, usize::MAX, &mut out);
+            }
+        } else if self.paced && !self.pace_off {
+            // Paced release: fraction of the HELD text proportional to this
+            // block's step progress against the estimated block length, so
+            // the previous block's text finishes streaming roughly when this
+            // block commits.
+            let frac = (ev.step_in_block as f32 / self.est_block_steps.max(1.0)).clamp(0.0, 1.0);
+            let target = |released: usize, full: usize| {
+                released + ((full - released) as f32 * frac) as usize
+            };
+            self.release_up_to(
+                target(self.released_reasoning, self.emitted_reasoning.len()),
+                target(self.released_content, self.emitted_content.len()),
+                &mut out,
+            );
         }
+        out
+    }
+
+    /// Emit append deltas advancing the release cursors toward the byte
+    /// targets (clamped to full length, snapped back to char boundaries).
+    fn release_up_to(
+        &mut self,
+        reasoning_target: usize,
+        content_target: usize,
+        out: &mut Vec<WireDelta>,
+    ) {
+        let cut = |s: &str, mut t: usize| -> usize {
+            t = t.min(s.len());
+            while t < s.len() && !s.is_char_boundary(t) {
+                t -= 1;
+            }
+            t
+        };
+        let rt = cut(&self.emitted_reasoning, reasoning_target);
+        if rt > self.released_reasoning {
+            out.push(WireDelta::Reasoning(
+                self.emitted_reasoning[self.released_reasoning..rt].to_string(),
+            ));
+            self.released_reasoning = rt;
+        }
+        let ct = cut(&self.emitted_content, content_target);
+        if ct > self.released_content {
+            out.push(WireDelta::Content(
+                self.emitted_content[self.released_content..ct].to_string(),
+            ));
+            self.released_content = ct;
+        }
+    }
+
+    /// Release everything still held (end of generation — a turn that ends
+    /// without a stop token must not strand paced text).
+    pub fn final_flush(&mut self) -> Vec<WireDelta> {
+        let mut out = Vec::new();
+        self.release_up_to(usize::MAX, usize::MAX, &mut out);
         out
     }
 }

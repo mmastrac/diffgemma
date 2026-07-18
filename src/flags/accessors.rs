@@ -313,6 +313,11 @@ pub fn tool_validate_enabled() -> bool {
 /// `DGQ_TOOL_COMPACT=1`: enable the serve tool-output compactor (KV rewinder).
 /// Opt-IN and default OFF (quality-affecting, not yet gate-signed-off).
 /// Equivalent to `serve --tool-compact`.
+/// Paced commit streaming (`DGQ_PACED_STREAM`; default ON, `0` disables).
+pub fn paced_stream_enabled() -> bool {
+    config().server.paced_stream
+}
+
 pub fn tool_compact_enabled() -> bool {
     config().server.tool_compact
 }

@@ -252,7 +252,10 @@ layer → #3 → #4 falls out of the same scanner.
   0.27–0.55) while benign soft rows dominate 0.55+; add an unconditional
   `p_max < 0.5` trim tier alongside the dup-conjunctive 0.9 tier. Needs
   the same smoketest ×3 + strain gates (sub-0.5 rows do occur in
-  creative blocks ~1/several blocks).
+  creative blocks ~1/several blocks). More field specimens 2026-07-18
+  (live OpenCode, prefix-exit serve): `냥` (a Korean syllable) inserted
+  mid-English thinking, and a stray `("."` fragment INSIDE Edit tool-call
+  args — the tool-arg stutter-typo small end, adjacent to a repair cycle.
 - **serve ops.jsonl is no longer token-level replayable**: the registry
   op format (activate/generate/finalize summaries) is skipped by
   `replay` ("unknown op shape") — the collapse-repro workflow's replay

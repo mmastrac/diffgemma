@@ -331,6 +331,20 @@ fn attach_stream_observer(
     }));
 }
 
+/// Release any text the paced-stream mapper is still holding (a turn can end
+/// without a stop token — token budget, cancel — and held text must reach the
+/// client before the final frames). Fresh markup-filter state is safe here:
+/// tool markup disables pacing at commit time, so held text never contains it.
+fn flush_paced(mapper: &ServeMapper, resp: &mpsc::Sender<ServerEvent>, strip_tool_markup: bool) {
+    let deltas = mapper.lock().unwrap().final_flush();
+    let suppress = std::sync::atomic::AtomicBool::new(false);
+    for d in deltas {
+        if let Some(d) = filter_tool_markup_delta(d, strip_tool_markup, &suppress) {
+            let _ = resp.send(ServerEvent::Delta(d));
+        }
+    }
+}
+
 /// Block progress % from accept density + mean entropy. Entropy carries more
 /// weight: accept plateaus well below canvas length under early-stop, while
 /// mean_ent drops ~2.5 -> ~0.02 as the canvas converges.

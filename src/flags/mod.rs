@@ -301,6 +301,10 @@ impl Default for KvFlags {
 /// Server (serve) configuration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServerFlags {
+    /// `DGQ_PACED_STREAM`: hold a committed block's streamed text and release
+    /// it progressively during the next block's denoise (flushes at turn end
+    /// or first tool call). Default ON; `0` restores burst-per-block.
+    pub paced_stream: bool,
     /// `DGQ_CONV_CACHE_GB` → bytes for the RAM conversation-snapshot pool.
     pub conv_cache_bytes: usize,
     /// `DGQ_CONV_DISK_GB` → bytes for the SSD conversation-snapshot tier.
@@ -551,6 +555,7 @@ impl RuntimeConfig {
                     .unwrap_or_else(std::env::temp_dir),
             },
             server: ServerFlags {
+                paced_stream: r.on_unless_zero("DGQ_PACED_STREAM"),
                 conv_cache_bytes: r.gib_bytes("DGQ_CONV_CACHE_GB"),
                 conv_disk_bytes: r.gib_bytes("DGQ_CONV_DISK_GB"),
                 conv_cache_dir: r
