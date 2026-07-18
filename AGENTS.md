@@ -131,6 +131,14 @@ rewriting a kernel you can't explain.
   isolated benches on representative subsets, within-process adjacent
   (`bench-step-kernel`, `bench-gemm`), never full-wall-clock comparisons of
   mixed work.
+- **Lever hygiene**: a lever disproven on one shape is not disproven
+  forever — when the shape changes, cheaply re-test the levers it could
+  have unblocked. But gate every re-test on an output oracle FIRST: a
+  re-test that reports a speedup with no correctness check at the new
+  config is not a vindication (the fake `DGQ_MOE_PREFILL_BM` win). And a
+  physics story that "matches exactly" is the failure mode to distrust —
+  decompose the claimed mechanism one variable at a time before recording
+  it (the int8 9× that was really 1.7×bug × 2.2× × 2.5×).
 
 ---
 
@@ -210,6 +218,12 @@ GPU tests SIGSEGV). Model-gated tests key off `test_util::dgq_model_dir()`.
 - **Producer/consumer dtype mismatch is the real precision hazard**, not the
   choice of dtype. When changing a plane's dtype, convert every writer and
   reader together and audit the toggleable loaders.
+- **KV-reuse-first** (user directive 2026-07-17): lean toward reusing 100%
+  of the KV cache — these are small machines. Any path that discards
+  resident KV (fresh-conversation fork, deep truncate, canonical that
+  isn't a prefix of the next request) must be a smart, explicit,
+  cost-justified decision, and rewinds land at `max(mark, prompt end)`,
+  never below a live prefill.
 
 ---
 
@@ -280,6 +294,8 @@ GPU tests SIGSEGV). Model-gated tests key off `test_util::dgq_model_dir()`.
 diffgemma-mps ask  -m $WEIGHTS -p "Hello" --seed 42
 diffgemma-mps chat -m $WEIGHTS                  # --ctx N for long context
 diffgemma-mps serve -m $WEIGHTS --ctx 8192      # OpenAI-compatible HTTP
+#   serve extras: --log-dir DIR (op-log ops.jsonl), --tool-repair, --tool-validate
+diffgemma-mps replay /path/ops.jsonl -m $WEIGHTS  # re-execute + diff an op-log
 
 # Gates (run before commit)
 diffgemma-mps smoketest -m $WEIGHTS             # 17/17 required

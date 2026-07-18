@@ -353,6 +353,59 @@ Metal's single-buffer cap (20.25 GiB on M3 Pro/36 GB) are split at
 - One production step path (the "monolith"); the f32 engine survives for
   ≤256-token prefill and as the step-parity oracle.
 
+## The token pipeline (the runtime's front door; P0–P4 shipped 2026-07-17)
+
+`src/pipeline.rs`. One thread owns the GPU + KV; every client (ask, chat,
+serve) speaks serialized **ops** in and **events** out. Ops carry token ids
+only, never strings — all text, parsing, and policy live in the message
+layer (`server_worker.rs`). Motivation: serve's scattered state mutations
+were un-auditable; the OpenCode collapse took a night to root-cause, and a
+serialized replayable op-log turns any field failure into a golden-style
+artifact.
+
+- **Ops**: `Extend`, `Generate`, `Rewind`, `Splice {start,end,replacement}`
+  (surgical mid-log replacement = truncate + re-extend), `SyntheticFill`,
+  `KvFingerprint`, `Mark`, `Activate`, `Finalize`, `AlignTo`, `Ping`,
+  `Cancel`, per-block `BeginTurn`/`ProposeBlock`/`CommitBlock {kept_len}`/
+  `DiscardBlock`/`EndTurn`, `Shutdown`. `KvId = (epoch, pos)`; lineage-
+  invalidating ops bump the epoch and a stale-epoch rewind fails loudly.
+- **Per-block protocol**: `generate_with_session` is a thin driver over
+  `begin_turn` / `propose_block` / `commit_block` / `finish_turn`
+  (`default_commit_policy` = stop-scan/defer/ws-guard); op-driven turns are
+  byte-identical to the monolithic path (golden-pinned).
+- **Stage chain**: `PipelineStage` trait, Pipeline terminal, wrappers
+  compose freely. `OpLogStage` journals every op+event as full-fidelity
+  JSONL (`serve --log-dir`); `diffgemma-mps replay <ops.jsonl>` re-executes
+  a session and diffs every event — field sessions are executable repro
+  artifacts. `ToolValidatorStage` (opt-in `--tool-validate`) retries
+  malformed tool grammar with a bumped seed. `ToolRepairStage` (opt-in
+  `--tool-repair`) is the **evaporating-draft** primitive: Mark → Generate →
+  on invalid tool reply, feed one error tool-response per invalid call →
+  regenerate to natural `<eos>` (response-opener removed from stops; forced
+  early cuts are a degeneracy source) → trim any hallucinated response
+  tail → Rewind to prompt end. The corrupt exchange and the feedback never
+  enter canonical KV; the conversation pays only for the clean final reply.
+- **Cancel**: a `CancelToken` rides in `StepGenerateConfig` like the
+  observer Arcs; checked between denoise steps and blocks. Serve cancels
+  when the SSE socket dies (observer send fails) and skips finalize.
+- **Stop conditioning**: `continue_incomplete_tool_calls` is DEFAULT OFF
+  (`DGQ_CONTINUE_PAST_STOP=1` restores). The defer was the load-bearing
+  amplifier of the 2026-07-17 collapse chain (premature stop → forced
+  continuation → OOD → filler fixed point → commit amplifier → flood).
+- **KV-reuse-first serving** (see the principle in AGENTS.md §6):
+  tool-calling turns finalize with EMPTY content in the canonical render
+  (prefix-stable: ends at the `<|tool_response>` opener; the client echoes
+  the prose and the next render places it); `route()` picks the
+  conversation with the longest common prefix and salvages tail divergence
+  (lcp ≥ 256 && tail ≤ 512 → O(1) ring truncate on Activate); anything
+  deeper is an explicit, logged decision to re-prefill.
+- **Standing gate — rewind byte-consistency**: seeded
+  generate → rewind → generate loops must restore KV bytes exactly
+  (position-ordered `live_kv_fingerprint`) and regenerate bit-identically.
+  Covered below the wrap, across the wrap, through the ring-rebuild path,
+  and after in-block re-rolls; golden's `ring_wrap_4p6k` crosses the
+  DEFAULT `DGQ_KV_RING` (4096) — re-aim it if the default changes.
+
 ## Standing design decisions
 
 - **Checkpoint-orientation quant layout** (row-major `[out,in]`, not
