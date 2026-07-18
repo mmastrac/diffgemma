@@ -196,7 +196,11 @@ fn thinking_pre_open_tokens_stay_content() {
     let canvas = [c('A'), open, c('z'), close, c('B')];
     let _ = m.on_step(&step(1, 2, &canvas, true));
     assert_eq!(m.content(), "AB");
-    assert!(m.reasoning().contains('z'), "thought span lost: {:?}", m.reasoning());
+    assert!(
+        m.reasoning().contains('z'),
+        "thought span lost: {:?}",
+        m.reasoning()
+    );
 }
 
 #[test]

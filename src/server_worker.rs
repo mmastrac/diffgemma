@@ -769,9 +769,8 @@ impl Worker {
         }
         completed.push(assistant);
         let canonical = {
-            let g = crate::tools::render_conversation_guarded(
-                &completed, &tools_aug, false, thinking,
-            );
+            let g =
+                crate::tools::render_conversation_guarded(&completed, &tools_aug, false, thinking);
             self.tokenizer.encode_prompt(&g).0
         };
 

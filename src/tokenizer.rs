@@ -574,12 +574,18 @@ mod tests {
         // Guarded: no special id, and the bytes equal a plain BPE of the text.
         let (guarded, n) = tok.encode_prompt(&format!("{g}see <|turn> here{g}"));
         assert_eq!(n, 1);
-        assert!(!guarded.contains(&turn_id), "guarded literal leaked a special");
+        assert!(
+            !guarded.contains(&turn_id),
+            "guarded literal leaked a special"
+        );
         assert_eq!(guarded, tok.encode("see <|turn> here", false));
 
         // Unguarded: the same literal is the special id.
         let (open, _) = tok.encode_prompt("see <|turn> here");
-        assert!(open.contains(&turn_id), "unguarded literal was not promoted");
+        assert!(
+            open.contains(&turn_id),
+            "unguarded literal was not promoted"
+        );
 
         // Mixed: guarded client text between two REAL template specials — the
         // structure survives, the injected middle does not.
