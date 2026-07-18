@@ -176,7 +176,12 @@ pub fn build_step_runtime(
     let estimate = store.blob_bytes() as usize
         + crate::metal::step_kv::kv_cache_total_bytes(&layout, cfg.max_seq) as usize
         + (2usize << 30);
-    let mem_permit = crate::membudget::MemBudget::global().acquire(estimate, "step-runtime");
+    let mem_permit = crate::membudget::MemBudget::global()
+        .acquire(estimate, "step-runtime")
+        .map_err(|e| {
+            eprintln!("membudget: {e}");
+            Error::Runtime("membudget: timed out waiting for memory grant (holders on stderr)")
+        })?;
 
     let ctx = MetalContext::new()?;
     let compile_started = Instant::now();
