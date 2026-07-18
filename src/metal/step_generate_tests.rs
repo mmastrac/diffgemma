@@ -1,10 +1,12 @@
 //! Tests for `tests`, extracted from step_generate.rs (backlog item 3).
 
+use super::progress::condense_step_text;
+use super::session::kv_truncate_needs_ring_rebuild;
 use super::*;
 use crate::metal::step_kernel::{
-    StepRuntime, init_canvas_state_from_rng, logits_finite_check_enabled,
+    CANVAS, StepRuntime, VOCAB, init_canvas_state_from_rng, logits_finite_check_enabled,
 };
-use crate::sample::initialize_canvas;
+use crate::sample::{Rng, initialize_canvas};
 
 /// Byte length of layer 0's live KV region — the leading slice of a
 /// `snapshot_kv` blob (`gather_kv_prefix` concatenates layers in order).

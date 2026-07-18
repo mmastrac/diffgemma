@@ -1,4 +1,3 @@
-
 use super::*;
 
 /// A scripted inner stage for validator tests: returns canned events in

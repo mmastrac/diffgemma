@@ -428,7 +428,7 @@ pub(crate) fn engine_forward(
     input.return_hidden = true;
 
     let mut scratch = GpuDecoderScratch::new(canvas_len, &model.config);
-    let mut weights = load_weight_cache(
+    let weights = load_weight_cache(
         &model.weights,
         &model.config.text_config,
         canvas_len,
