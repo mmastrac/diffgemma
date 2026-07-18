@@ -177,17 +177,29 @@ layer → #3 → #4 falls out of the same scanner.
   denoise on stutter-heavy turns; real OpenCode bug-fix run clean (7
   turns, correct edit, verified, zero trims). Remaining before default-on:
   census multi-seed + longctx.
-- **Prefix-exit early block commit (user-proposed, simulated PROMISING —
-  next speed lever)**: per step, if a head prefix (largest of active/2,
-  /4, /8) has mean entropy < 0.05 while the tail churns (≥2×), and the
-  head argmax is 2-step stable, commit the head and let the next block
-  re-denoise the rest against real context. Offline simulation on the 70
-  traced M0 blocks: fires on 29%, saves ~28% of denoise steps gross
-  (extend cost ≈0.6 step vs ~7 saved per firing), head bit-identical to
-  the eventual commit in 17/20 firings (other 3 differ by 1 token). Must
-  run the conjunctive dup-scan on the exited head (prefix MEAN has the
-  same tail-hiding flaw). Net savings need a live A/B (`DGQ_PREFIX_EXIT`,
-  default off); gates: smoketest ×3, strain, census multi-seed.
+- **Prefix-exit early block commit `DGQ_PREFIX_EXIT` (landed default OFF;
+  reframed speed→quality)**: per step, commit the settled active/2 head
+  (mean ent < τ, 2-step stable) when the tail is HARD-stuck (mean ≥
+  max(2τ, 0.3) nats); tail re-denoises next block; conjunctive dup-scan
+  always runs on the exited head. LESSONS: (a) the 28%-savings offline sim
+  was wrong — replay never charges the successor block, and live small-head
+  (/4, /8) exits CASCADED into mini-block chains (blocks 19→23, steps net
+  worse) — trajectory-feedback sim bias, now a memory; (b) with the
+  tightened rule: smoketest 17/17 ×3 (fires ≈0 on short prompts — correct),
+  strain 3 faster / 2 parity / 1 healthy long-fork (trajectory variance
+  dominates timing; zero stutters anywhere; stuck blocks salvaged at 9–19
+  steps instead of schedule-burn at mean-ent 0.7–1.5). VERDICT: not a
+  reliable speed lever; quality-safe. KEY EXHIBIT (clean/seed-123
+  regex_lite turn): base arm thought 141 tokens (plan restatement, 2
+  blocks); prefix-exit arm thought 2,040 tokens (glob-vs-regex semantics
+  deliberation, UTF-8 hazard caught, full matcher drafted in-thought, 14
+  test cases; 12 blocks) — stuck tails ARE mid-thought states, and exits
+  honor them instead of steamrolling; both arms emitted clean tool calls
+  (single sample; needs the quality gate). NEXT: quality-mode experiment —
+  aggressive exits at matched TOKEN budgets, judged on census multi-seed +
+  strain tool-arg typo rates (the "commit-when-stable ≈ more-causal
+  factorization ≈ fewer independence violations" hypothesis; VSB
+  arXiv:2604.23994 reports +4–10% from the trained analog).
 - **MLX matched-canvas dig on the preserved collapse trajectory** — can
   MLX's sampler survive the same conditioning? Artifacts preserved in-repo:
   `debug/strain_battery/collapse_seed42/` (ops.jsonl + serve log),

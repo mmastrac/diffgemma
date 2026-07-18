@@ -9,6 +9,9 @@ pub(super) enum DenoiseStopReason {
     Confident,
     Plateau,
     MaxSteps,
+    /// `DGQ_PREFIX_EXIT`: a settled head was committed early; the tail
+    /// re-denoises next block.
+    PrefixExit,
     Cancelled,
 }
 
@@ -19,6 +22,7 @@ impl DenoiseStopReason {
             Self::Confident => "confident",
             Self::Plateau => "plateau",
             Self::MaxSteps => "max_steps",
+            Self::PrefixExit => "prefix_exit",
             Self::Cancelled => "cancelled",
         }
     }
@@ -53,6 +57,7 @@ pub(super) fn log_denoise_step_progress(
         DenoiseStopReason::Confident => " confident_stop",
         DenoiseStopReason::Plateau => " plateau_stop",
         DenoiseStopReason::MaxSteps => " max_steps",
+        DenoiseStopReason::PrefixExit => " prefix_exit",
         DenoiseStopReason::Cancelled => " cancelled",
     };
     let mut extra = String::new();

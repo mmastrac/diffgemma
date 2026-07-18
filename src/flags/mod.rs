@@ -123,6 +123,14 @@ pub struct SamplerFlags {
     /// micro-stutter), so the tail re-denoises next block against committed
     /// context instead. Default OFF (0) pending multi-seed A/B.
     pub commit_conf_trim: f32,
+    /// `DGQ_PREFIX_EXIT` (head mean-entropy threshold in nats, (0, 0.5];
+    /// 0/out-of-range disables): per denoise step, if a head prefix (largest
+    /// of active/2, /4, /8; ≥16 rows) has mean entropy below this while the
+    /// tail still churns (≥2×) and the head argmax is 2-step stable, end the
+    /// block and commit only the head — the tail re-denoises next block
+    /// against committed context. Recommended 0.05 (the early-stop
+    /// threshold). Default OFF (0) pending live A/B.
+    pub prefix_exit: f32,
 }
 
 impl Default for SamplerFlags {
@@ -469,6 +477,12 @@ impl RuntimeConfig {
                     .ok()
                     .and_then(|v| v.parse::<f32>().ok())
                     .filter(|&x| (0.0..=1.0).contains(&x))
+                    .unwrap_or(0.0),
+                prefix_exit: r
+                    .var("DGQ_PREFIX_EXIT")
+                    .ok()
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .filter(|&x| x > 0.0 && x <= 0.5)
                     .unwrap_or(0.0),
             },
             perf: PerfFlags {

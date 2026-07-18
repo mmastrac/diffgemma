@@ -78,6 +78,11 @@ pub fn commit_conf_trim() -> f32 {
     config().sampler.commit_conf_trim
 }
 
+/// Prefix-exit head mean-entropy threshold (`DGQ_PREFIX_EXIT`; 0 = off).
+pub fn prefix_exit() -> f32 {
+    config().sampler.prefix_exit
+}
+
 // ===========================================================================
 // Production perf toggles (all default ON, opt-out for A/B triage)
 // ===========================================================================

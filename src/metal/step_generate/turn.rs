@@ -241,11 +241,11 @@ pub fn begin_turn(
     let canvas_len = CANVAS;
     let layers = session.layers;
     let mut max_blocks = cfg.max_new_tokens.div_ceil(canvas_len).max(1);
-    if crate::flags::commit_conf_trim() > 0.0 {
-        // Confidence-trimmed blocks commit fewer than CANVAS tokens; keep the
-        // TOKEN budget as the binding limit with 2x block headroom so trims
-        // don't silently truncate long replies (the trim floor still
-        // guarantees >=16 tokens of progress per block).
+    if crate::flags::commit_conf_trim() > 0.0 || crate::flags::prefix_exit() > 0.0 {
+        // Trimmed / prefix-exited blocks commit fewer than CANVAS tokens;
+        // keep the TOKEN budget as the binding limit with 2x block headroom
+        // so partial commits don't silently truncate long replies (both
+        // floors still guarantee >=16 tokens of progress per block).
         max_blocks *= 2;
     }
     let model_dir = session.model_dir.as_path();
@@ -481,6 +481,9 @@ pub fn propose_block(
     // budget, and the abandon verdict when the budget is spent.
     let mut nc_retry_attempt = 0u32;
     let mut abandon_turn = false;
+    // Head width committed by a PrefixExit stop (None = full active canvas).
+    // Outlives the 'attempt loop; reset at each attempt start.
+    let mut prefix_exit_head: Option<usize> = None;
     let (
         st,
         block_step_count,
@@ -500,6 +503,7 @@ pub fn propose_block(
         };
         rt.set_active_canvas(attempt_canvas);
         let active = rt.active_canvas();
+        prefix_exit_head = None;
         let mut block_step_count = 0u32;
         let mut accept_hist = Vec::new();
         let mut min_entropy_hist = Vec::new();
@@ -586,6 +590,12 @@ pub fn propose_block(
                 }
                 None => (None, None, 0),
             };
+            let prefix_exit_candidate = prefix_exit_candidate(
+                &st.entropy[..active],
+                &st.prev_argmax[..active],
+                prev_step_argmax.as_ref().map(|p| &p[..active]),
+                block_step_count,
+            );
             prev_step_argmax = Some(st.prev_argmax);
             let early_stop = crate::sample::decode_early_stop_flag(st.stop_flag);
             let snap = crate::sample::EarlyStopSnapshot {
@@ -598,13 +608,26 @@ pub fn propose_block(
             };
             let cpu_early = !cfg.no_early_stop && crate::sample::early_stop_from_snapshot(&snap);
             let gpu_early = !cfg.no_early_stop && crate::sample::is_early_stop_flag(st.stop_flag);
-            let stop_reason = match early_stop {
+            let mut stop_reason = match early_stop {
                 Some(crate::sample::EarlyStopKind::Confident) => DenoiseStopReason::Confident,
                 Some(crate::sample::EarlyStopKind::Plateau) => DenoiseStopReason::Plateau,
                 Some(crate::sample::EarlyStopKind::MaxSteps) => DenoiseStopReason::MaxSteps,
                 None if max_steps_reached => DenoiseStopReason::MaxSteps,
                 None => DenoiseStopReason::None,
             };
+            // Prefix-exit: only when no natural stop fires this step (a
+            // whole-canvas stop always commits more for the same steps).
+            if stop_reason == DenoiseStopReason::None
+                && let Some(p) = prefix_exit_candidate
+            {
+                prefix_exit_head = Some(p);
+                stop_reason = DenoiseStopReason::PrefixExit;
+                if progress_enabled() {
+                    eprintln!(
+                        "step-generate: block {block_idx} prefix-exit at step {block_step_count}: head {p}/{active} settled, tail still churning",
+                    );
+                }
+            }
             if crate::flags::log_early_stop_enabled() {
                 if gpu_early != cpu_early {
                     eprintln!(
@@ -796,13 +819,15 @@ pub fn propose_block(
             );
         }
         // Accepted: notify streamers that this block's active argmax is final.
+        // A prefix-exited block's final draft is only the settled head — the
+        // churning tail rows must never stream as final text.
         if let Some(ref observer) = cfg.step_observer {
             observer(&StepProgressEvent {
                 block_idx,
                 max_blocks,
                 step_in_block: block_step_count,
                 max_steps,
-                argmax: &st.prev_argmax[..active],
+                argmax: &st.prev_argmax[..prefix_exit_head.unwrap_or(active).min(active)],
                 accept_count: accept_hist.last().copied().unwrap_or(0),
                 mean_entropy: st.mean_entropy,
                 block_done: true,
@@ -930,6 +955,14 @@ pub fn propose_block(
     let committed_canvas = rt.active_canvas();
     let mut argmax_tokens: Vec<u32> = st.prev_argmax[..committed_canvas].to_vec();
 
+    // Prefix-exit commit: only the settled head; the churning tail rows are
+    // dropped and re-denoise next block against this committed context.
+    if denoise_stop == DenoiseStopReason::PrefixExit
+        && let Some(p) = prefix_exit_head
+    {
+        argmax_tokens.truncate(p);
+    }
+
     // Confidence trim (`DGQ_COMMIT_CONF_TRIM=τ`, default off): drop the canvas
     // tail from the first row that is BOTH low-confidence (final-step p_max
     // < τ) AND forming a duplication (argmax equals a neighbor's argmax) —
@@ -944,7 +977,12 @@ pub fn propose_block(
     // block re-denoises the dropped tail against committed left context.
     // Floor: rows inside the first MIN_CONF_KEEP never trim (progress
     // guarantee; the E6/commit-guard paths own those failures).
-    let conf_tau = crate::flags::commit_conf_trim();
+    let mut conf_tau = crate::flags::commit_conf_trim();
+    if conf_tau <= 0.0 && denoise_stop == DenoiseStopReason::PrefixExit {
+        // A prefix-exited head shares the mean's blind spot (one unresolved
+        // row hides in a settled head's mean) — always dup-scan it.
+        conf_tau = 0.9;
+    }
     if conf_tau > 0.0 {
         const MIN_CONF_KEEP: usize = 16;
         let pmax = pmax_from_rowstats(&rt.read_sample_rowstats(committed_canvas));
@@ -1163,6 +1201,47 @@ pub fn finish_turn(
             canvas_rng: Some("rust-lcg".into()),
         }),
     })
+}
+
+/// Minimum steps invested before a prefix exit may fire. Higher than the
+/// offline sim's 3: cheap full convergence typically lands at 5-12 steps on
+/// short answers, and preempting it buys nothing.
+const PREFIX_EXIT_MIN_STEPS: u32 = 5;
+/// Absolute tail mean-entropy floor for an exit: the tail must be GENUINELY
+/// stuck (strain stuck-tails sit at 1-3 nats), not merely a step or two from
+/// converging (~0.1 nats). A relative 2τ bar fired on imminently-converging
+/// tails and cascaded into mini-block churn.
+const PREFIX_EXIT_TAIL_MIN_ENT: f32 = 0.3;
+
+/// `DGQ_PREFIX_EXIT`: the settled active/2 head this step, or None. Live A/B
+/// killed smaller heads (/4, /8): an early exit reshapes the NEXT block's
+/// trajectory so it, too, settles a small head first — a cascade of
+/// mini-blocks that each re-pay minimum steps (smoke 3-seed: blocks 19→23,
+/// steps NET WORSE; the offline sim missed this trajectory feedback because
+/// it never charged the successor block). An exit must be worth a block:
+/// half-canvas head, hard-stuck tail, ≥2-step head stability.
+fn prefix_exit_candidate(
+    entropy: &[f32],
+    cur_argmax: &[u32],
+    prev_argmax: Option<&[u32]>,
+    step_in_block: u32,
+) -> Option<usize> {
+    let tau = crate::flags::prefix_exit();
+    if tau <= 0.0 || step_in_block < PREFIX_EXIT_MIN_STEPS {
+        return None;
+    }
+    let prev = prev_argmax?;
+    let active = entropy.len();
+    let p = active / 2;
+    if p < 16 || p >= active {
+        return None;
+    }
+    let head = entropy[..p].iter().sum::<f32>() / p as f32;
+    let tail = entropy[p..].iter().sum::<f32>() / (active - p) as f32;
+    (head < tau
+        && tail >= (tau * 2.0).max(PREFIX_EXIT_TAIL_MIN_ENT)
+        && cur_argmax[..p] == prev[..p])
+        .then_some(p)
 }
 
 /// `p_max = 1/sum` from the sampler rowstat plane `{mx, sum}` (the softmax is
