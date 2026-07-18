@@ -144,23 +144,50 @@ layer → #3 → #4 falls out of the same scanner.
 
 ### Quality track (the current frontier)
 
-- **Duplication micro-stutter is the core quality signature**: `the the
-  the`, `},{{`, `<|"|><|"|>`, `(".` → `....` — one family at all scales;
-  the collapse was its amplified endpoint, and the surviving field bugs
-  (stutter typos inside tool args) are its small end. E7 is the open
-  lever aimed at it.
-- **E7 confidence-threshold sampler**: accept canvas positions at top-token
-  confidence ≥ τ instead of the entropy budget (MLX
-  `diffusion_threshold=0.9`). Semantics pinned: p_max from the
-  distributions the entropy reduction already reads; floor = schedule's
-  per-step count (hybrid), literal-MLX as parity mode; measure WITH
-  early-stop on, report MARGINAL steps. Wart hypothesis: threshold refuses
-  the flat-distribution creative-tail rows that budget-accept commits. M0
-  (zero behavior change): p_max histograms + would-accept counts at
-  τ∈{0.8,0.9,0.95} across the 17-prompt gate; KILL if predicted marginal
-  savings <8-10%. M1 `DGQ_ACCEPT_THRESHOLD` + matched-canvas multi-seed
-  A/B. M2 gates: smoketest ×{7,42,123}, census multi-seed (decision gate),
-  longctx; golden negative expected.
+- **Duplication micro-stutter — mechanism FOUND (E7 M0, 2026-07-18,
+  commit 07ace48)**: `DGQ_TRACE_PMAX_JSONL` traced smoketest ×{7,42,123}
+  + strain battery ×3 seeds. Every strain adjacent-dup commit (`",",
+  `<|"|><|"|>`, doubled 8-space indent, `the the`) committed at final-step
+  p_max 0.40–0.86 while 98% of non-dup commits sit ≥0.9. Mechanism: the
+  MEAN-entropy stops fire while individual rows are unresolved (one
+  1.9-nat row hides inside the 0.05×256 budget), and an unresolved row's
+  argmax copies its neighbor (uncertain diffusion marginals at i and i+1
+  look alike). Three observed sub-cases: late destabilization (answer
+  region grows past a settled eos, stop fires mid-re-resolution),
+  canvas-tail ambiguity (last rows unknowable at the block edge), and
+  contested flat rows (never resolve in-block). Commit-level dups mostly
+  get absorbed by downstream defenses before user-visible text; the tool-
+  arg stutter typos are the survivors.
+- **E7 confidence-threshold sampler: speed lever KILLED per pre-registered
+  criterion** — M0 would-accept proxy measured 6.5% (smoke) / 1.2%
+  (strain) marginal steps at τ=0.9 vs the 8–10% KILL line. The wart
+  hypothesis half was CONFIRMED (see above) and is now pursued as
+  commit-time confidence trim instead of a sampler swap.
+- **Confidence trim `DGQ_COMMIT_CONF_TRIM` — A/B CLEAN, default-on
+  decision pending**: final rule (2026-07-18) is CONJUNCTIVE and
+  answer-region-scoped — trim at the first row that is both low-confidence
+  (p_max < τ) AND argmax-duplicating a neighbor, scanning only before the
+  first stop/pad/filler row (floor 16, 2× max_blocks headroom). p_max
+  alone does NOT separate wart from art (benign creative soft rows sit at
+  0.58–0.87 and judged fine; fixed-τ trim regressed smoketest 15-16/17 via
+  step-budget churn; eos-padding runs are structural dups). τ-insensitive
+  across 0.9–0.95. A/B at τ=0.9: smoketest 17/17 ×3 seeds with dup commits
+  6→0 (one trim in 51 turns); strain battery dup commits 6→0 with trims at
+  exactly the 3 known stutter sites, tool health/flood identical, +10.6%
+  denoise on stutter-heavy turns; real OpenCode bug-fix run clean (7
+  turns, correct edit, verified, zero trims). Remaining before default-on:
+  census multi-seed + longctx.
+- **Prefix-exit early block commit (user-proposed, simulated PROMISING —
+  next speed lever)**: per step, if a head prefix (largest of active/2,
+  /4, /8) has mean entropy < 0.05 while the tail churns (≥2×), and the
+  head argmax is 2-step stable, commit the head and let the next block
+  re-denoise the rest against real context. Offline simulation on the 70
+  traced M0 blocks: fires on 29%, saves ~28% of denoise steps gross
+  (extend cost ≈0.6 step vs ~7 saved per firing), head bit-identical to
+  the eventual commit in 17/20 firings (other 3 differ by 1 token). Must
+  run the conjunctive dup-scan on the exited head (prefix MEAN has the
+  same tail-hiding flaw). Net savings need a live A/B (`DGQ_PREFIX_EXIT`,
+  default off); gates: smoketest ×3, strain, census multi-seed.
 - **MLX matched-canvas dig on the preserved collapse trajectory** — can
   MLX's sampler survive the same conditioning? Artifacts preserved in-repo:
   `debug/strain_battery/collapse_seed42/` (ops.jsonl + serve log),

@@ -931,27 +931,52 @@ pub fn propose_block(
     let mut argmax_tokens: Vec<u32> = st.prev_argmax[..committed_canvas].to_vec();
 
     // Confidence trim (`DGQ_COMMIT_CONF_TRIM=τ`, default off): drop the canvas
-    // tail from the first row whose final-step p_max is below τ. An unresolved
-    // row's argmax tends to copy its neighbor (the duplication micro-stutter:
-    // `the the`, `<|"|><|"|>` — every strain-battery stutter committed at
-    // p_max 0.40-0.86 vs ≥0.9 for 98% of clean commits), and the next block
-    // re-denoises the dropped tail against committed left context instead.
-    // Floor: a low-confidence row inside the first MIN_CONF_KEEP rows does not
-    // trim (progress guarantee; the E6/commit-guard paths own those failures).
+    // tail from the first row that is BOTH low-confidence (final-step p_max
+    // < τ) AND forming a duplication (argmax equals a neighbor's argmax) —
+    // the duplication micro-stutter signature: an unresolved row's marginal
+    // copies its neighbor (`the the`, `<|"|><|"|>`; every strain-battery
+    // stutter committed at p_max 0.40-0.86). The conjunction is what makes
+    // the rule surgical: benign creative soft rows overlap the same p_max
+    // range but do NOT duplicate their neighbor — a p_max-only trim churned
+    // half-canvases on creative prompts and blew the step budget (smoketest
+    // 15-16/17), while the conjunctive rule fires exactly on the 5 real
+    // stutter formations across 51 traced turns and nowhere else. The next
+    // block re-denoises the dropped tail against committed left context.
+    // Floor: rows inside the first MIN_CONF_KEEP never trim (progress
+    // guarantee; the E6/commit-guard paths own those failures).
     let conf_tau = crate::flags::commit_conf_trim();
     if conf_tau > 0.0 {
         const MIN_CONF_KEEP: usize = 16;
         let pmax = pmax_from_rowstats(&rt.read_sample_rowstats(committed_canvas));
-        if let Some(first_low) = pmax.iter().position(|&p| p < conf_tau)
-            && first_low >= MIN_CONF_KEEP
+        // Scan only the ANSWER region: everything at/after the first
+        // stop/pad/filler row belongs to the stop-scan, and eos-padding runs
+        // are structural duplicates (adjacent identical <eos> at 0.76-0.87
+        // confidence trip the dup rule and cost half a canvas for nothing —
+        // the seed-123 sky_blue step blowup).
+        let eos = rt.read_params().eos_token_id;
+        let region_end = argmax_tokens
+            .iter()
+            .position(|t| {
+                cfg.stop_token_ids.contains(t)
+                    || *t == eos
+                    || *t == crate::sample::PAD_TOKEN_ID
+                    || *t == crate::sample::FILLER_TOKEN_ID
+            })
+            .unwrap_or(argmax_tokens.len());
+        let dup_at = |i: usize| {
+            (i > 0 && argmax_tokens[i] == argmax_tokens[i - 1])
+                || (i + 1 < region_end && argmax_tokens[i] == argmax_tokens[i + 1])
+        };
+        if let Some(first_bad) =
+            (MIN_CONF_KEEP..region_end).find(|&i| pmax[i] < conf_tau && dup_at(i))
         {
-            argmax_tokens.truncate(first_low);
             if progress_enabled() {
                 eprintln!(
-                    "step-generate: block {block_idx} confidence-trim at row {first_low}/{committed_canvas} (p_max {:.3} < {conf_tau})",
-                    pmax[first_low],
+                    "step-generate: block {block_idx} confidence-trim at row {first_bad}/{committed_canvas} (dup token {} at p_max {:.3} < {conf_tau})",
+                    argmax_tokens[first_bad], pmax[first_bad],
                 );
             }
+            argmax_tokens.truncate(first_bad);
         }
     }
 
