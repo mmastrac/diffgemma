@@ -6,6 +6,14 @@ use std::path::Path;
 
 const SPACE_REPLACEMENT: char = '\u{2581}';
 
+/// Sentinel bracketing client-supplied text in a GUARDED prompt render
+/// (private-use codepoint; carries no meaning in real text). Emitted by the
+/// tool-aware renderer around every client-controlled insertion — message
+/// content, tool names/descriptions/keys, argument and response values — and
+/// consumed by [`Tokenizer::encode_prompt`], which refuses to special-match
+/// inside guarded ranges. Never reaches the model or the display render.
+pub const CLIENT_GUARD: char = '\u{E000}';
+
 #[derive(Debug, serde::Deserialize)]
 struct AddedTokenJson {
     id: u32,
@@ -138,6 +146,74 @@ impl Tokenizer {
             self.encode_append(&mut out, &text[text_start..]);
         }
         out
+    }
+
+    /// Encode a GUARDED prompt render (client-supplied text wrapped in
+    /// [`CLIENT_GUARD`] sentinel pairs by the tool-aware renderer): identical
+    /// scan to [`encode_with_specials`](Self::encode_with_specials), except a
+    /// special-token literal whose match STARTS inside a client-guarded range
+    /// is NOT matched — it stays in the surrounding text run and BPE-encodes
+    /// as plain characters. This closes the token-injection hole where a file
+    /// body or web page containing `<|tool_response>`/`<|turn>user` literals
+    /// became real protocol tokens. Guard-free input takes the exact same
+    /// code path with the same run boundaries, so benign prompts encode
+    /// bit-identically to `encode_with_specials`.
+    ///
+    /// Returns `(ids, neutralized)` — the count of special literals refused.
+    pub fn encode_prompt(&self, guarded: &str) -> (Vec<u32>, usize) {
+        // Strip sentinels, recording the client byte-ranges they delimited.
+        let mut text = String::with_capacity(guarded.len());
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut open: Option<usize> = None;
+        for ch in guarded.chars() {
+            if ch == CLIENT_GUARD {
+                match open.take() {
+                    Some(s) => ranges.push((s, text.len())),
+                    None => open = Some(text.len()),
+                }
+            } else {
+                text.push(ch);
+            }
+        }
+        if let Some(s) = open {
+            // Unbalanced guard: treat everything to the end as client text
+            // (fail closed — over-guarding only costs special recognition).
+            ranges.push((s, text.len()));
+        }
+
+        let mut out = Vec::new();
+        let mut neutralized = 0usize;
+        let mut text_start = 0;
+        let mut i = 0;
+        let mut r = 0;
+        while i < text.len() {
+            while r < ranges.len() && ranges[r].1 <= i {
+                r += 1;
+            }
+            let in_client = r < ranges.len() && ranges[r].0 <= i && i < ranges[r].1;
+            if let Some((lit_len, id)) = self.match_special_at(&text[i..]) {
+                if in_client {
+                    // Refuse the match: the literal stays in the pending text
+                    // run; skip its bytes so nested shorter specials inside it
+                    // are not re-matched.
+                    neutralized += 1;
+                    i += lit_len;
+                    continue;
+                }
+                if text_start < i {
+                    self.encode_append(&mut out, &text[text_start..i]);
+                }
+                out.push(id);
+                i += lit_len;
+                text_start = i;
+            } else {
+                i += text[i..].chars().next().map_or(1, char::len_utf8);
+            }
+        }
+        if text_start < text.len() {
+            self.encode_append(&mut out, &text[text_start..]);
+        }
+        (out, neutralized)
     }
 
     /// Longest special-token literal that `s` starts with → (byte length, id).
@@ -462,5 +538,74 @@ mod tests {
             }
         }
         None
+    }
+
+    /// Guard-free input: `encode_prompt` == `encode_with_specials`, 0
+    /// neutralized. This is the transparency contract for non-tool paths.
+    #[test]
+    fn encode_prompt_transparent_without_guards() {
+        let Some(tok) = model_tokenizer_q4_or_transformer() else {
+            return;
+        };
+        for s in [
+            "Hello world",
+            "<|turn>user\nhi<turn|>",
+            "<|tool_call>call:x{a:<|\"|>b<|\"|>}<tool_call|>",
+            "",
+        ] {
+            let (ids, n) = tok.encode_prompt(s);
+            assert_eq!(n, 0, "unguarded input tripped the guard: {s:?}");
+            assert_eq!(ids, tok.encode_with_specials(s), "drift on {s:?}");
+        }
+    }
+
+    /// A special literal inside a guarded range encodes as PLAIN TEXT (byte-
+    /// identical to BPE-ing the raw string), while an IDENTICAL literal
+    /// outside the guard becomes its special id. Same string, opposite fate —
+    /// the whole point of the mechanism.
+    #[test]
+    fn encode_prompt_guarded_literal_is_plain_text() {
+        let Some(tok) = model_tokenizer_q4_or_transformer() else {
+            return;
+        };
+        let g = CLIENT_GUARD;
+        let turn_id = tok.encode_with_specials("<|turn>")[0];
+
+        // Guarded: no special id, and the bytes equal a plain BPE of the text.
+        let (guarded, n) = tok.encode_prompt(&format!("{g}see <|turn> here{g}"));
+        assert_eq!(n, 1);
+        assert!(!guarded.contains(&turn_id), "guarded literal leaked a special");
+        assert_eq!(guarded, tok.encode("see <|turn> here", false));
+
+        // Unguarded: the same literal is the special id.
+        let (open, _) = tok.encode_prompt("see <|turn> here");
+        assert!(open.contains(&turn_id), "unguarded literal was not promoted");
+
+        // Mixed: guarded client text between two REAL template specials — the
+        // structure survives, the injected middle does not.
+        let (mixed, n) = tok.encode_prompt(&format!("<|turn>{g}<|turn>{g}<turn|>"));
+        assert_eq!(n, 1);
+        assert_eq!(
+            mixed.iter().filter(|&&x| x == turn_id).count(),
+            1,
+            "exactly the one real leading <|turn> should be special"
+        );
+    }
+
+    /// Unbalanced guard fails closed: everything after a lone open guard is
+    /// treated as client text (over-guarding, never under-guarding).
+    #[test]
+    fn encode_prompt_unbalanced_guard_fails_closed() {
+        let Some(tok) = model_tokenizer_q4_or_transformer() else {
+            return;
+        };
+        let turn_id = tok.encode_with_specials("<|turn>")[0];
+        let (ids, n) = tok.encode_prompt(&format!("<|turn>{}tail <|turn>", CLIENT_GUARD));
+        assert_eq!(n, 1, "the post-open <|turn> must be neutralized");
+        assert_eq!(
+            ids.iter().filter(|&&x| x == turn_id).count(),
+            1,
+            "only the pre-guard <|turn> stays special"
+        );
     }
 }

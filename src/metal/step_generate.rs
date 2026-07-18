@@ -111,6 +111,12 @@ pub struct StepGenerateConfig {
     /// Optional cooperative cancel (serve wires its stream observer's dead
     /// socket to this; pipeline clients keep a clone across the channel).
     pub cancel: Option<CancelToken>,
+    /// Optional status hook: message-layer stages (tool repair / validator)
+    /// call this with a short first-person status when they intervene
+    /// mid-turn; serve wires it to a synthetic `reasoning_content` delta so
+    /// streaming clients see a thinking block instead of a silent do-over.
+    /// Wire-only — the text never enters the token log or canonical KV.
+    pub status_notify: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 impl std::fmt::Debug for StepGenerateConfig {
@@ -137,6 +143,7 @@ impl std::fmt::Debug for StepGenerateConfig {
                 &self.block_commit_observer.is_some(),
             )
             .field("cancel", &self.cancel.is_some())
+            .field("status_notify", &self.status_notify.is_some())
             .finish()
     }
 }
@@ -164,6 +171,7 @@ impl StepGenerateConfig {
             step_observer: None,
             block_commit_observer: None,
             cancel: None,
+            status_notify: None,
         }
     }
 
@@ -555,13 +563,13 @@ impl StepGenerateSession {
             let kept = self.kv_valid_tokens[..n].to_vec();
             let rebuild_started = Instant::now();
             let result = self.rebuild_kv_prefix(&kept);
-            if crate::flags::progress_enabled() {
-                eprintln!(
-                    "truncate_kv_to: ring rebuild {old} -> {n} tokens (ring={:?}) ({:.2?})",
-                    self.sliding_ring_len(),
-                    rebuild_started.elapsed()
-                );
-            }
+            // Unconditional: rebuilds are rare, cost seconds, and the line is
+            // the only visibility into them once serve runs quiet.
+            eprintln!(
+                "truncate_kv_to: ring rebuild {old} -> {n} tokens (ring={:?}) ({:.2?})",
+                self.sliding_ring_len(),
+                rebuild_started.elapsed()
+            );
             return result;
         }
         self.rt.set_kv_len(n as u32);

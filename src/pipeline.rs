@@ -340,11 +340,13 @@ impl<S: PipelineStage> ToolRepairStage<S> {
              block, where it cannot be executed. It has been discarded. Regenerate \
              your reply with the narration and the tool call in the visible \
              response, then continue as before.";
+        // Guarded renders: the call NAME is model-authored text — a name
+        // containing special literals must not encode as protocol tokens.
         let mut out = String::new();
         if crate::tools::tool_call_lost_in_thinking(reply) {
             for name in crate::tools::thinking_call_names(reply) {
                 let name = if name.is_empty() { "tool" } else { &name };
-                out.push_str(&crate::tools::render_tool_response(
+                out.push_str(&crate::tools::render_tool_response_guarded(
                     name,
                     &serde_json::json!({"content": ERR_THINKING}),
                 ));
@@ -358,13 +360,16 @@ impl<S: PipelineStage> ToolRepairStage<S> {
                 continue;
             }
             let name = if name.is_empty() { "tool" } else { &name };
-            out.push_str(&crate::tools::render_tool_response(
+            out.push_str(&crate::tools::render_tool_response_guarded(
                 name,
                 &serde_json::json!({"content": ERR}),
             ));
         }
         if out.is_empty() {
-            out = crate::tools::render_tool_response("tool", &serde_json::json!({"content": ERR}));
+            out = crate::tools::render_tool_response_guarded(
+                "tool",
+                &serde_json::json!({"content": ERR}),
+            );
         }
         out
     }
@@ -384,13 +389,24 @@ impl<S: PipelineStage> PipelineStage for ToolRepairStage<S> {
             cfg: cfg.clone(),
             label: label.clone(),
         });
+        // Set at the first invalid detection; a later valid verdict prints
+        // the repaired-in line against it.
+        let mut first_invalid_at: Option<std::time::Instant> = None;
         for attempt in 1..=self.attempts {
             let PipelineEvent::Generated { out, .. } = &event else {
                 return event;
             };
             let Err(reason) = self.reply_verdict(out, prompt.len()) else {
+                if let Some(t0) = first_invalid_at {
+                    eprintln!(
+                        "tool-repair: repaired — clean reply after {} attempt(s) ({:.1?})",
+                        attempt - 1,
+                        t0.elapsed()
+                    );
+                }
                 return event;
             };
+            first_invalid_at.get_or_insert_with(std::time::Instant::now);
             let reply_text = self
                 .tokenizer
                 .decode(&crate::sample::strip_degenerate_token_ids(
@@ -400,11 +416,16 @@ impl<S: PipelineStage> PipelineStage for ToolRepairStage<S> {
                 "tool-repair: invalid reply ({reason}); returning an error tool response and regenerating (attempt {attempt}/{})",
                 self.attempts
             );
+            // Streaming clients have already seen the bad attempt: surface
+            // the do-over as a thinking block instead of silent dead air.
+            if let Some(notify) = cfg.status_notify.as_ref() {
+                notify("I made a mistake with my tool call, let me try again.");
+            }
             let err_text = Self::error_responses(&reply_text);
             // The repair continuation: the model's own turn as generated,
             // plus the error response(s) — a delta prefill over resident KV.
             let mut repair_prompt = out.token_ids.clone();
-            repair_prompt.extend(self.tokenizer.encode_with_specials(&err_text));
+            repair_prompt.extend(self.tokenizer.encode_prompt(&err_text).0);
             // Let the regeneration run to a natural <eos>: the response-opener
             // stop is a forced early cut, and forced cuts are their own
             // degeneracy source. Hallucinated response text past the opener
@@ -458,13 +479,22 @@ impl<S: PipelineStage> PipelineStage for ToolRepairStage<S> {
                 kv: rewound,
             };
         }
-        if let PipelineEvent::Generated { out, .. } = &event
-            && let Err(reason) = self.reply_verdict(out, prompt.len())
-        {
-            eprintln!(
-                "tool-repair: still invalid after {} repair attempt(s) ({reason}); passing through",
-                self.attempts
-            );
+        if let PipelineEvent::Generated { out, .. } = &event {
+            match self.reply_verdict(out, prompt.len()) {
+                Err(reason) => eprintln!(
+                    "tool-repair: still invalid after {} repair attempt(s) ({reason}); passing through",
+                    self.attempts
+                ),
+                Ok(()) => {
+                    if let Some(t0) = first_invalid_at {
+                        eprintln!(
+                            "tool-repair: repaired — clean reply after {} attempt(s) ({:.1?})",
+                            self.attempts,
+                            t0.elapsed()
+                        );
+                    }
+                }
+            }
         }
         event
     }
@@ -532,6 +562,9 @@ impl<S: PipelineStage> PipelineStage for ToolValidatorStage<S> {
                 "tool-validate: malformed reply ({reason}); rewinding and regenerating (attempt {attempt}/{})",
                 self.retries
             );
+            if let Some(notify) = cfg.status_notify.as_ref() {
+                notify("I made a mistake with my tool call, let me try again.");
+            }
             match self.inner.call(PipelineOp::Rewind(mark)) {
                 // Rewind bumps the epoch; refresh the mark for a later retry.
                 PipelineEvent::Rewound { kv } => mark = kv,
@@ -885,9 +918,16 @@ impl Pipeline {
     pub fn spawn(model_dir: PathBuf, max_seq: usize, steps: usize) -> Self {
         let (tx, op_rx) = channel();
         let (ev_tx, rx) = channel();
+        // Quiet is thread-local: inherit the spawner's effective choice, or
+        // serve/chat's set_quiet never reaches the thread that actually runs
+        // generate (which is how the per-step debug spew came back in serve).
+        let inherit_quiet = !crate::flags::progress_enabled();
         let join = std::thread::Builder::new()
             .name("token-pipeline".into())
-            .spawn(move || run_pipeline(&model_dir, max_seq, steps, &op_rx, &ev_tx))
+            .spawn(move || {
+                crate::flags::set_quiet(inherit_quiet);
+                run_pipeline(&model_dir, max_seq, steps, &op_rx, &ev_tx)
+            })
             .expect("spawn token-pipeline thread");
         Self {
             tx,
@@ -1349,7 +1389,10 @@ mod tests {
     #[test]
     fn repair_error_responses_for_thinking_call() {
         let lost = "<|channel>thought\n<|tool_call>call:write{path:<|\"|>/tmp/x<|\"|>}<tool_call|><channel|>";
-        let errs = ToolRepairStage::<RepairScript>::error_responses(lost);
+        let errs =
+            crate::tools::strip_client_guards(&ToolRepairStage::<RepairScript>::error_responses(
+                lost,
+            ));
         assert!(
             errs.contains("inside your thinking block"),
             "missing thinking-specific error: {errs}"
@@ -1360,7 +1403,10 @@ mod tests {
         );
 
         let malformed = "<|tool_call>call:write{path:";
-        let errs = ToolRepairStage::<RepairScript>::error_responses(malformed);
+        let errs =
+            crate::tools::strip_client_guards(&ToolRepairStage::<RepairScript>::error_responses(
+                malformed,
+            ));
         assert!(
             errs.contains("was malformed"),
             "generic path broken: {errs}"
@@ -1398,7 +1444,7 @@ mod tests {
             rewind_pos: std::cell::RefCell::new(Vec::new()),
         };
         let repair = ToolRepairStage::new(inner, tokenizer, 1);
-        let cfg = crate::metal::StepGenerateConfig::from_generate(
+        let mut cfg = crate::metal::StepGenerateConfig::from_generate(
             42,
             64,
             1024,
@@ -1406,11 +1452,23 @@ mod tests {
             crate::sample::sampler_for_steps(8, false),
             false,
         );
+        // The repair must announce itself through the status hook exactly
+        // once (serve renders this as a thinking block on the stream).
+        let statuses = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let statuses_sink = std::sync::Arc::clone(&statuses);
+        cfg.status_notify = Some(std::sync::Arc::new(move |msg: &str| {
+            statuses_sink.lock().unwrap().push(msg.to_string());
+        }));
         let ev = repair.call(PipelineOp::Generate {
             prompt: prompt.clone(),
             cfg: Box::new(cfg),
             label: "repair-test".into(),
         });
+        assert_eq!(
+            *statuses.lock().unwrap(),
+            vec!["I made a mistake with my tool call, let me try again.".to_string()],
+            "repair must emit exactly one status notification"
+        );
         let PipelineEvent::Generated { out, .. } = ev else {
             panic!("repair swallowed the Generated event: {ev:?}");
         };

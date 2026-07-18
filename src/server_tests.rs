@@ -167,6 +167,38 @@ fn thinking_strips_nested_channel_reopen_from_reasoning() {
     assert_eq!(m.content(), "A");
 }
 
+/// Field regression (2026-07-17 regex_lite turn 14): thinking mode ON but
+/// the model skips the thought ceremony and answers with a bare tool call —
+/// no channel markers anywhere in the reply. The old "everything is
+/// reasoning until a close appears" rule streamed the whole call as
+/// reasoning_content and the client got an empty message. Classification
+/// must follow emission: no thought span ⇒ all content.
+#[test]
+fn thinking_bare_reply_without_thought_span_is_content() {
+    let open = 1u32;
+    let close = 2u32;
+    let mut m =
+        DiffusionStreamMapper::new(FakeDecoder, vec![], Some(open), Some(close), true, false);
+    let canvas: Vec<u32> = "call:edit{x:1}".chars().map(|ch| ch as u32).collect();
+    let _ = m.on_step(&step(1, 2, &canvas, true));
+    assert_eq!(m.content(), "call:edit{x:1}");
+    assert_eq!(m.reasoning(), "");
+}
+
+/// Tokens before the first explicit thought open are content (turn-opener
+/// ceremony etc.), not retroactively reasoning.
+#[test]
+fn thinking_pre_open_tokens_stay_content() {
+    let open = 1u32;
+    let close = 2u32;
+    let mut m =
+        DiffusionStreamMapper::new(FakeDecoder, vec![], Some(open), Some(close), true, false);
+    let canvas = [c('A'), open, c('z'), close, c('B')];
+    let _ = m.on_step(&step(1, 2, &canvas, true));
+    assert_eq!(m.content(), "AB");
+    assert!(m.reasoning().contains('z'), "thought span lost: {:?}", m.reasoning());
+}
+
 #[test]
 fn stop_token_ends_and_cuts() {
     let mut m = DiffusionStreamMapper::new(FakeDecoder, vec![99], None, None, false, false);

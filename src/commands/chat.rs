@@ -17,7 +17,7 @@ pub(crate) fn run_chat_cmd(
     json: bool,
     ctx: Option<usize>,
 ) -> ExitCode {
-    use metal::{StepGenerateConfig, StepGenerateSession, generate_with_session};
+    use metal::StepGenerateConfig;
     use std::io::{self, IsTerminal, Write};
 
     // Quiet by default: chat is a UI, not a log. `--verbose` restores the

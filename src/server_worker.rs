@@ -9,6 +9,15 @@ use std::sync::{Arc, Mutex};
 
 use super::*;
 
+/// Loud tripwire for the token-injection hardening: client text carried
+/// special-token literals that `encode_prompt` refused to promote to
+/// protocol tokens (they encoded as plain text instead).
+fn log_neutralized(n: usize) {
+    if n > 0 {
+        eprintln!("serve: neutralized {n} special-token literal(s) in client text");
+    }
+}
+
 impl Worker {
     /// Open the session (Metal objects are not `Send`, so they must be created
     /// on this thread), signal readiness, then drain the job queue one at a time.
@@ -121,9 +130,15 @@ impl Worker {
         let history = build_turns(&job.messages);
 
         let (prompt, prompt_text) = if tool_mode {
-            let s = crate::tools::render_conversation(&job.messages, &job.tools, true, thinking);
-            let ids = self.tokenizer.encode_with_specials(&s);
-            (ids, s)
+            let g = crate::tools::render_conversation_guarded(
+                &job.messages,
+                &job.tools,
+                true,
+                thinking,
+            );
+            let (ids, neutralized) = self.tokenizer.encode_prompt(&g);
+            log_neutralized(neutralized);
+            (ids, crate::tools::strip_client_guards(&g))
         } else {
             let opts = crate::chat_template::ChatFormatOptions {
                 add_generation_prompt: true,
@@ -178,7 +193,7 @@ impl Worker {
         let delta_ids = &prompt[reuse..];
         let delta_text = self.tokenizer.decode(delta_ids);
         eprintln!(
-            "serve: in +{}tok {}",
+            "serve: in +{}tok (reused {reuse}) {}",
             delta_ids.len(),
             trunc_preview(&delta_text, 120)
         );
@@ -196,6 +211,11 @@ impl Worker {
                 0 => PREFILL_RATE_DEFAULT_TOK_S,
                 r => r as f64,
             };
+            eprintln!(
+                "serve: prefill heartbeat ON ({} new tokens, ~{:.0}s expected at {rate:.0} tok/s)",
+                delta_ids.len(),
+                delta_ids.len() as f64 / rate.max(1.0),
+            );
             spawn_prefill_status(&job.resp, delta_ids.len(), rate, started);
         }
         attach_stream_observer(
@@ -237,6 +257,22 @@ impl Worker {
                         eprintln!(
                             "serve: tool-mode: raw has call: but parse returned 0 ({})",
                             trunc_preview(&raw_text, 160)
+                        );
+                    }
+                    // Splitter-disagreement tripwire: the raw reply carries a
+                    // well-formed call outside any thought span, but the
+                    // mapper's channel split kept it out of content. Should
+                    // be unreachable now that both sides are span-explicit —
+                    // fires loudly if their semantics ever drift apart again.
+                    if calls.is_empty()
+                        && !crate::tools::parse_tool_calls(&crate::tools::strip_thinking(
+                            &raw_ids_decode,
+                        ))
+                        .is_empty()
+                    {
+                        eprintln!(
+                            "serve: CHANNEL MISMATCH: visible well-formed call lost by the stream split ({})",
+                            trunc_preview(&raw_ids_decode, 160)
                         );
                     }
                     (
@@ -359,9 +395,10 @@ impl Worker {
                         assistant["tool_calls"] = serde_json::Value::Array(tool_calls.clone());
                     }
                     completed.push(assistant);
-                    let s =
-                        crate::tools::render_conversation(&completed, &job.tools, false, thinking);
-                    Some(self.tokenizer.encode_with_specials(&s))
+                    let g = crate::tools::render_conversation_guarded(
+                        &completed, &job.tools, false, thinking,
+                    );
+                    Some(self.tokenizer.encode_prompt(&g).0)
                 } else {
                     let mut completed = history.clone();
                     completed.push(crate::chat_template::ChatTurn::model(content.clone()));
@@ -470,14 +507,17 @@ impl Worker {
         // longest-prefix match holds whether or not this turn's NEW tool
         // responses (still verbose here) have been summarized yet.
         let routing_messages = substitute(store, &job.messages);
-        let routing_prompt =
-            self.tokenizer
-                .encode_with_specials(&crate::tools::render_conversation(
-                    &routing_messages,
-                    &tools_aug,
-                    true,
-                    thinking,
-                ));
+        let routing_prompt = {
+            let g = crate::tools::render_conversation_guarded(
+                &routing_messages,
+                &tools_aug,
+                true,
+                thinking,
+            );
+            let (ids, neutralized) = self.tokenizer.encode_prompt(&g);
+            log_neutralized(neutralized);
+            ids
+        };
         use crate::pipeline::{PipelineEvent, PipelineOp};
         let (conv_id, reuse) = match stage.call(PipelineOp::Activate {
             prompt: routing_prompt.clone(),
@@ -513,12 +553,8 @@ impl Worker {
                 "role": "user", "content": tc::summarize_instruction(),
             }));
             let too_big = |ctx: &[serde_json::Value]| {
-                let p = self
-                    .tokenizer
-                    .encode_with_specials(&crate::tools::render_conversation(
-                        ctx, &tools_aug, true, false,
-                    ));
-                p.len() + canvas + 64 > self.max_seq
+                let g = crate::tools::render_conversation_guarded(ctx, &tools_aug, true, false);
+                self.tokenizer.encode_prompt(&g).0.len() + canvas + 64 > self.max_seq
             };
             if too_big(&ctx) {
                 // The verbose response alone blows the context: summarize a
@@ -566,11 +602,8 @@ impl Worker {
         // routing render IS the main prompt — skip the duplicate render+encode.
         let (messages_sub, prompt) = if summarized_any {
             let msgs = substitute(store, &job.messages);
-            let p = self
-                .tokenizer
-                .encode_with_specials(&crate::tools::render_conversation(
-                    &msgs, &tools_aug, true, thinking,
-                ));
+            let g = crate::tools::render_conversation_guarded(&msgs, &tools_aug, true, thinking);
+            let p = self.tokenizer.encode_prompt(&g).0;
             (msgs, p)
         } else {
             (routing_messages, routing_prompt)
@@ -698,13 +731,13 @@ impl Worker {
                     round + 1,
                     excerpt.len()
                 );
-                resp_text.push_str(&crate::tools::render_tool_response(
+                resp_text.push_str(&crate::tools::render_tool_response_guarded(
                     tc::EXPAND_TOOL_NAME,
                     &serde_json::json!({ "content": excerpt }),
                 ));
             }
             let mut ext = out.token_ids.clone();
-            ext.extend(self.tokenizer.encode_with_specials(&resp_text));
+            ext.extend(self.tokenizer.encode_prompt(&resp_text).0);
             if ext.len() + canvas >= self.max_seq {
                 eprintln!(
                     "serve: tool-compact: expand response would overflow the context; finishing turn"
@@ -735,11 +768,12 @@ impl Worker {
             assistant["tool_calls"] = serde_json::Value::Array(tool_calls_out.clone());
         }
         completed.push(assistant);
-        let canonical = self
-            .tokenizer
-            .encode_with_specials(&crate::tools::render_conversation(
+        let canonical = {
+            let g = crate::tools::render_conversation_guarded(
                 &completed, &tools_aug, false, thinking,
-            ));
+            );
+            self.tokenizer.encode_prompt(&g).0
+        };
 
         // Unblock the client before the finalize KV rebuild (same reasoning as
         // the plain path — the reply doesn't depend on it).

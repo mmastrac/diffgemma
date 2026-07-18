@@ -176,7 +176,20 @@ pub fn format_user_prompt(user_text: &str) -> String {
 /// (`…rustc.<channel|><|tool_call>…`); stream split only consumes the first
 /// close, so leftovers must die here or they leak into OpenAI `content`.
 pub fn sanitize_model_reply(text: &str) -> String {
-    let mut s = text.to_string();
+    // Absorb LEADING turn ceremony first: after a tool-response prompt the
+    // generation opener is not seeded, so the model legitimately begins its
+    // reply with `<|turn>model\n` — truncating at that turn-open would erase
+    // the whole reply. Only trailing turn markers are hallucinated next
+    // turns and get cut below.
+    let mut s = text.trim_start().to_string();
+    while let Some(rest) = s.strip_prefix(TURN_OPEN) {
+        // Skip the role line ("model\n"); a marker with no newline yet is a
+        // still-converging fragment — drop what's there.
+        s = match rest.split_once('\n') {
+            Some((_, body)) => body.trim_start().to_string(),
+            None => String::new(),
+        };
+    }
     if let Some(idx) = s.find(TURN_CLOSE) {
         s.truncate(idx);
     }
@@ -238,6 +251,19 @@ mod tests {
     #[test]
     fn sanitize_strips_turn_close() {
         assert_eq!(sanitize_model_reply("Hello world<turn|>\n"), "Hello world");
+    }
+
+    /// Post-tool-response turns get no seeded generation opener, so the model
+    /// legitimately begins its reply with `<|turn>model\n` — that leading
+    /// ceremony is absorbed, while a trailing turn-open (hallucinated next
+    /// turn) still truncates.
+    #[test]
+    fn sanitize_absorbs_leading_turn_open_keeps_trailing_cut() {
+        assert_eq!(sanitize_model_reply("<|turn>model\nHello"), "Hello");
+        assert_eq!(sanitize_model_reply("Hi<|turn>user\nnext"), "Hi");
+        assert_eq!(sanitize_model_reply("<|turn>model\nOk<|turn>user\nx"), "Ok");
+        // Still-converging bare opener fragment: nothing usable yet.
+        assert_eq!(sanitize_model_reply("<|turn>model"), "");
     }
 
     #[test]

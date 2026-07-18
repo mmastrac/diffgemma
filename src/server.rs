@@ -218,27 +218,41 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
         self.ended
     }
 
-    /// Split committed ids into (reasoning, content). With thinking off, or once
-    /// no channel is present, everything is content. While thinking and before
-    /// the channel closes, everything committed so far is reasoning.
+    /// Split committed ids into (reasoning, content). With thinking off,
+    /// everything is content. With thinking on, reasoning is ONLY what sits
+    /// inside an explicit `<|channel>…<channel|>` span the model actually
+    /// emitted — classification follows emission, not the mode flag. The old
+    /// rule ("everything is reasoning until a close appears") silently
+    /// swallowed a whole turn when the model skipped the thought ceremony
+    /// and answered with a bare tool call (field incident 2026-07-17: a
+    /// well-formed edit call streamed as reasoning_content, client got an
+    /// empty message, and the repair stage — which judged the call visible
+    /// and valid — was rightly silent). An unclosed span still runs to the
+    /// end of the committed ids, so mid-thought streaming is unchanged.
     fn split(&self, ids: &[u32]) -> Split {
-        let close_at = self
-            .channel_close
-            .and_then(|c| ids.iter().position(|&id| id == c));
-        match (self.thinking, close_at) {
-            (true, Some(k)) => {
-                let reasoning = self.clean_reasoning(&ids[..k]);
-                let content = self.decode_content(&ids[k + 1..]);
-                Split { reasoning, content }
-            }
-            (true, None) => Split {
-                reasoning: self.clean_reasoning(ids),
-                content: String::new(),
-            },
-            (false, _) => Split {
+        if !self.thinking {
+            return Split {
                 reasoning: String::new(),
                 content: self.decode_content(ids),
-            },
+            };
+        }
+        let mut reasoning_ids: Vec<u32> = Vec::new();
+        let mut content_ids: Vec<u32> = Vec::new();
+        let mut in_thought = false;
+        for &id in ids {
+            if Some(id) == self.channel_open {
+                in_thought = true;
+            } else if Some(id) == self.channel_close {
+                in_thought = false;
+            } else if in_thought {
+                reasoning_ids.push(id);
+            } else {
+                content_ids.push(id);
+            }
+        }
+        Split {
+            reasoning: self.clean_reasoning(&reasoning_ids),
+            content: self.decode_content(&content_ids),
         }
     }
 
@@ -650,6 +664,15 @@ fn attach_stream_observer(
     prefill_status: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
     let mapper = Arc::clone(mapper);
+    // Message-layer status (tool repair / validator interventions) surfaces
+    // as a synthetic thinking block, same channel as the prefill heartbeat.
+    // Wire-only: the text never reaches the mapper or the canonical log.
+    let status_resp = resp.clone();
+    cfg.status_notify = Some(Arc::new(move |msg: &str| {
+        let _ = status_resp.send(ServerEvent::Delta(WireDelta::Reasoning(format!(
+            "\n\n{msg}\n\n"
+        ))));
+    }));
     let resp = resp.clone();
     let suppress = std::sync::atomic::AtomicBool::new(false);
     // Dead-socket cancel: the connection thread drops its receiver when the
@@ -872,8 +895,8 @@ pub(crate) fn run_summarize_pass(
     messages_ctx: &[serde_json::Value],
     tools: &[serde_json::Value],
 ) -> Option<String> {
-    let s = crate::tools::render_conversation(messages_ctx, tools, true, false);
-    let prompt = tokenizer.encode_with_specials(&s);
+    let g = crate::tools::render_conversation_guarded(messages_ctx, tools, true, false);
+    let prompt = tokenizer.encode_prompt(&g).0;
     let room = max_seq.saturating_sub(prompt.len() + crate::metal::CANVAS);
     if room < 64 {
         return None;
@@ -885,6 +908,9 @@ pub(crate) fn run_summarize_pass(
     cfg.degenerate_reply_check =
         crate::chat_template::empty_reply_check(model_dir, stop_token_ids.to_vec());
     cfg.step_observer = None;
+    // Internal pass: a stage intervention here must not surface a thinking
+    // block into whatever client stream the base cfg was wired to.
+    cfg.status_notify = None;
 
     // Mark → Generate → Rewind: the checkpoint/generate/rollback pattern as
     // pipeline ops, so this pass composes with any stage chain.

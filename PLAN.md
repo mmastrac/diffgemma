@@ -50,11 +50,42 @@ STEP COUNT (E7), not per-step attention.
 
 ### Channel-hygiene fixes (survey 2026-07-17, unimplemented)
 
+**Field incident 2026-07-17 late (regex_lite session, turn 14) — the dual-
+splitter disagreement has a live casualty.** The model skipped the thought
+ceremony and emitted a bare, WELL-FORMED edit call (no channel markers in
+the reply at all; finish=stop, 170 tok). The wire mapper's rule is
+"thinking mode ⇒ everything is reasoning until a `<channel|>` CLOSE id
+appears" (`split()`, no open required — lenient because the model
+sometimes emits the opener as text BPE, not the special id), so the whole
+call was streamed as `reasoning_content` and the client got an EMPTY
+message; the validator/repair side (string-based, explicit-span-driven)
+correctly judged the call visible+valid → verdict Ok → repair rightly
+silent. Verified by probe: every reply shape containing a `<|channel>`
+opener flags for repair; only the bare-call shape passes Ok — and the turn
+prompt was byte-clean (no leaked thought, correct ordering). So the loss
+is OURS (misclassification), not the model's grammar. Candidate tactical
+fix ahead of the full unification: in the mapper's
+reasoning-until-close branch, if the committed region contains NO channel
+open (id or text form) and parses as a complete tool call, classify it as
+content — plus a worker-level loud log when mapper and validator disagree
+about whether a reply contains a call.
+
 Findings, in proposed fix order:
 
-1. **Special-token injection**: client-supplied text is encoded with
-   `encode_with_specials` at ~6 render sites — a user message containing
-   `<|tool_response>` etc. becomes real protocol tokens.
+1. ~~**Special-token injection**~~ **FIXED (2026-07-17, session freebie).**
+   Client text (message bodies, tool outputs, tool names/descriptions/keys/
+   values) is wrapped in `CLIENT_GUARD` (U+E000) sentinels by
+   `render_conversation_guarded`, and `Tokenizer::encode_prompt` refuses to
+   special-match inside guarded ranges — a `<|tool_response>`/`<|turn>` in
+   a file body or web page now encodes as PLAIN TEXT, not protocol tokens.
+   Benign input is bit-identical to the old
+   `encode_with_specials(render_conversation(…))` (compat-pinned; golden
+   8/8 unchanged, same kv hash). Serve logs `neutralized N special-token
+   literal(s)` when it fires. Live-verified: an injected fake `<|turn>user`
+   boundary in a tool response was neutralized and the model treated it as
+   content instead of structure. Tests: `encode_prompt_*` (tokenizer +
+   tools). Follow-up: the same guard vocabulary is the substrate for the
+   unified channel scanner (#4).
 2. **`strip_thinking` is not quote-aware** — thought markers inside string
    literals/code fences get treated as channel boundaries.
 3. **Channel-unaware stop-scan** — the stop scanner doesn't know which
@@ -80,7 +111,36 @@ layer → #3 → #4 falls out of the same scanner.
   validator's retry-on-malformed is the degenerate case (keep zero).
 - **Narrate-instead-of-act policy**: residual model wart — turn ends after
   announcing a write with no call emitted; a triage-layer policy, not a
-  serve defect.
+  serve defect. The inverse (act-without-narrating: every turn of the
+  2026-07-17 regex_lite session was tool_calls-only) is the amnesia
+  driver below — the policy should push toward "one line of visible
+  narration per tool turn", not just "don't narrate without acting".
+- **Thinking persistence across tool turns (design option, NOT decided —
+  survey 2026-07-17):** all three frontier labs preserve FULL reasoning
+  across the tool-calling loop and drop it at user-turn boundaries —
+  OpenAI encrypted reasoning items round-tripped with tool outputs
+  (docs: measurably better function-calling), Anthropic signed thinking
+  blocks required back with `tool_result`, Gemini thought signatures.
+  Nobody feeds back the display summaries; harness-level compaction
+  (summarize-history-into-a-note) is the only summary-as-context pattern.
+  We currently sit at the DeepSeek-R1 end (strip everything, every turn),
+  and the cost is measured: turn 7 of the regex_lite session spent 32.7 s
+  re-deriving state it had already reasoned out (prompt verified
+  byte-clean — pure thought-evaporation amnesia, model recovered by
+  reading its own edit call out of context). Because the canonical KV is
+  SERVER-OWNED, we could do what the labs do with zero client
+  cooperation: defer thought-stripping to the TASK boundary — keep
+  thinking in canonical KV across consecutive tool-call turns (each
+  `<|tool_response>` extend continues the same reasoning context), strip
+  only when a real user message arrives or the turn truly ends. Within a
+  task the client only appends tool responses, which the LCP routing
+  already handles. Costs to weigh before committing: ring pressure
+  (thoughts × tool hops accumulate against DGQ_KV_RING=4096 and the
+  salvage window) and a larger canonical-vs-client divergence mid-task.
+  The interleaving-restoration blob (above) is the cross-restart/
+  cross-client hardening of the same idea (≈ OpenAI's encrypted items).
+  User directive that still stands until revisited: thinking never
+  reaches KV RE-PREFILL from the client side.
 
 ### Quality track (the current frontier)
 

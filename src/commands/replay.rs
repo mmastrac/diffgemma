@@ -13,7 +13,7 @@
 
 use std::process::ExitCode;
 
-use crate::pipeline::{Pipeline, PipelineOp, PipelineStage};
+use crate::pipeline::{Pipeline, PipelineOp};
 
 pub(crate) fn run_replay_cmd(
     model_dir: &std::path::Path,
