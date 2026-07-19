@@ -12,9 +12,10 @@
 //! the process env gets, so a typo'd arm is rejected before the campaign
 //! spends GPU hours on it. An arm states only what it overrides.
 //!
-//! A BATTERY is a unit of gated work (`smoke`, `longctx`). Every battery
-//! yields the same metric shape, because the census numbers come from the
-//! denoise path's p_max trace rather than from anything battery-specific:
+//! A BATTERY is a unit of gated work (`smoke`, `longctx`, `programmatic`,
+//! `soft`). Every battery yields the same wart metrics, because those come
+//! from the denoise path's p_max trace rather than from anything
+//! battery-specific:
 //!
 //!   hard  — a COMMITTED row with p_max < 0.5 (insertion/omission class)
 //!   dup   — a COMMITTED row below tau that argmax-copies a neighbour
@@ -68,6 +69,13 @@ struct Metrics {
     wrong_output: u64,
     fenced: u64,
     probes: u64,
+    /// `soft` battery. `absence_*` is a SEPARATE rate because those probes
+    /// invert the metric — a correct answer is a refusal — and averaging them
+    /// into retrieval would let confident hallucination cancel good recall.
+    soft_found: u64,
+    soft_total: u64,
+    absence_ok: u64,
+    absence_total: u64,
 }
 
 impl Metrics {
@@ -92,6 +100,10 @@ impl Metrics {
         self.wrong_output += o.wrong_output;
         self.fenced += o.fenced;
         self.probes += o.probes;
+        self.soft_found += o.soft_found;
+        self.soft_total += o.soft_total;
+        self.absence_ok += o.absence_ok;
+        self.absence_total += o.absence_total;
     }
 
     /// Steps thrown away by re-rolls.
@@ -142,6 +154,24 @@ impl Metrics {
             100.0 * self.fenced as f64 / self.probes as f64
         }
     }
+    /// Indirect-retrieval rate. 0 when nothing ran, like `prog_pass_pct`:
+    /// an unmeasured quality rate must not PASS a gate that asks for a floor.
+    fn soft_pct(&self) -> f64 {
+        if self.soft_total == 0 {
+            0.0
+        } else {
+            100.0 * self.soft_found as f64 / self.soft_total as f64
+        }
+    }
+    /// Share of ABSENCE probes correctly declined — the hallucination rate,
+    /// inverted. Low here means the model invents facts the document lacks.
+    fn absence_pct(&self) -> f64 {
+        if self.absence_total == 0 {
+            0.0
+        } else {
+            100.0 * self.absence_ok as f64 / self.absence_total as f64
+        }
+    }
     fn mean_steps(&self) -> f64 {
         if self.blocks == 0 {
             0.0
@@ -174,6 +204,12 @@ impl Metrics {
             "prog_pass_pct" => self.prog_pass_pct(),
             "compile_fail_pct" => self.compile_fail_pct(),
             "fenced_pct" => self.fenced_pct(),
+            "soft_found" => self.soft_found as f64,
+            "soft_total" => self.soft_total as f64,
+            "soft_pct" => self.soft_pct(),
+            "absence_ok" => self.absence_ok as f64,
+            "absence_total" => self.absence_total as f64,
+            "absence_pct" => self.absence_pct(),
             _ => return None,
         })
     }
@@ -279,6 +315,12 @@ fn append_run_summary(path: &Path, out: &super::smoketest::SmokeOutcome) {
         obj.insert("fenced".into(), p.fenced.into());
         obj.insert("probes".into(), p.probes.into());
     }
+    if let (Some(sf), Some(obj)) = (&out.soft, rec.as_object_mut()) {
+        obj.insert("soft_found".into(), sf.found.into());
+        obj.insert("soft_total".into(), sf.total.into());
+        obj.insert("absence_ok".into(), sf.absence_ok.into());
+        obj.insert("absence_total".into(), sf.absence_total.into());
+    }
     match std::fs::OpenOptions::new().create(true).append(true).open(path) {
         Ok(mut f) => {
             let _ = writeln!(f, "{rec}");
@@ -324,6 +366,10 @@ fn scan_trace(path: &Path, tau: f32) -> Metrics {
                 m.wrong_output += u("wrong_output");
                 m.fenced += u("fenced");
                 m.probes += u("probes");
+                m.soft_found += u("soft_found");
+                m.soft_total += u("soft_total");
+                m.absence_ok += u("absence_ok");
+                m.absence_total += u("absence_total");
                 continue;
             }
             _ => continue,
@@ -635,6 +681,32 @@ fn report(
         }
     }
 
+    // Soft retrieval prints separately too, and shows the two rates side by
+    // side: recall means little without the hallucination rate next to it,
+    // since a model that answers everything scores well on one and badly on
+    // the other.
+    if results.values().any(|m| m.soft_total > 0 || m.absence_total > 0) {
+        println!();
+        println!(
+            "{:<12} {:<13} {:>10} {:>8} {:>12} {:>10}",
+            "arm", "battery", "soft_found", "soft%", "absence_ok", "absence%"
+        );
+        for ((arm, battery), m) in results
+            .iter()
+            .filter(|(_, m)| m.soft_total > 0 || m.absence_total > 0)
+        {
+            println!(
+                "{:<12} {:<13} {:>10} {:>8.1} {:>12} {:>10.1}",
+                arm,
+                battery,
+                format!("{}/{}", m.soft_found, m.soft_total),
+                m.soft_pct(),
+                format!("{}/{}", m.absence_ok, m.absence_total),
+                m.absence_pct(),
+            );
+        }
+    }
+
     if let Some(dir) = out_dir {
         let json: Vec<serde_json::Value> = results
             .iter()
@@ -659,6 +731,10 @@ fn report(
                     "prog_pass_pct": m.prog_pass_pct(),
                     "compile_fail_pct": m.compile_fail_pct(),
                     "fenced_pct": m.fenced_pct(),
+                    "soft_found": m.soft_found, "soft_total": m.soft_total,
+                    "soft_pct": m.soft_pct(),
+                    "absence_ok": m.absence_ok, "absence_total": m.absence_total,
+                    "absence_pct": m.absence_pct(),
                 })
             })
             .collect();

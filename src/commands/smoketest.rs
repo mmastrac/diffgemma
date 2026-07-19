@@ -2,6 +2,7 @@
 
 use super::*;
 use super::programmatic::{ProgCounts, ProgProbe};
+use super::soft::{SoftCounts, SoftProbe};
 
 /// Which tier of the spec a run exercises. The tiers have different session
 /// budgets and different judging, so exactly one runs per invocation; `census`
@@ -16,6 +17,8 @@ pub(crate) enum Battery {
     LongCtx,
     /// Generate a program, execute it, judge stdout + exit code.
     Programmatic,
+    /// Indirect ("soft") retrieval + hallucination. Rates only, non-blocking.
+    Soft,
 }
 
 #[cfg(target_os = "macos")]
@@ -26,10 +29,11 @@ impl Battery {
             "smoke" => Self::Smoke,
             "longctx" => Self::LongCtx,
             "programmatic" => Self::Programmatic,
+            "soft" => Self::Soft,
             _ => return None,
         })
     }
-    pub(crate) const KNOWN: &'static str = "smoke, longctx, programmatic";
+    pub(crate) const KNOWN: &'static str = "smoke, longctx, programmatic, soft";
 }
 
 /// Smoketest prompt spec (`fixtures/smoketest/prompts.json`).
@@ -51,6 +55,10 @@ pub(crate) struct SmoketestSpec {
     /// by RUNNING the generated program — see `commands::programmatic`.
     #[serde(default)]
     programmatic: Vec<ProgProbe>,
+    /// Indirect-retrieval probes (`census --battery soft`); see
+    /// `commands::soft`. Rates only — never pass/fail.
+    #[serde(default)]
+    soft: Vec<SoftProbe>,
     /// Gate baseline seed. Trajectory-reshuffling accepted changes re-baseline
     /// the gate here (single-seed pass/fail is arbitrary for such changes; the
     /// multi-seed aggregate is the real quality metric — see working notes).
@@ -165,6 +173,8 @@ pub(crate) struct SmokeOutcome {
     /// for every other battery, so the census reports "no cases" rather than a
     /// fabricated 0/0 pass rate.
     pub(crate) prog: Option<ProgCounts>,
+    /// Indirect-retrieval + hallucination rates (`Battery::Soft` only).
+    pub(crate) soft: Option<SoftCounts>,
     /// Set when the run could not start (bad model dir, missing spec, …);
     /// distinct from "ran and failed prompts".
     pub(crate) error: Option<String>,
@@ -274,9 +284,11 @@ pub(crate) fn run_smoketest(
             .retain(|p| p.id.to_ascii_lowercase().contains(&pat));
         spec.programmatic
             .retain(|p| p.id.to_ascii_lowercase().contains(&pat));
+        spec.soft.retain(|p| p.id.to_ascii_lowercase().contains(&pat));
         let kept = match battery {
             Battery::LongCtx => spec.longctx.len(),
             Battery::Programmatic => spec.programmatic.len(),
+            Battery::Soft => spec.soft.len(),
             Battery::Smoke => spec.adherence.len() + spec.convergence.len(),
         };
         if kept == 0 {
@@ -296,6 +308,18 @@ pub(crate) fn run_smoketest(
         // the model's compile failure.
         if let Err(e) = programmatic::preflight(&spec.programmatic) {
             return SmokeOutcome::err(e);
+        }
+    }
+    if battery == Battery::Soft {
+        if spec.soft.is_empty() {
+            return SmokeOutcome::err("smoketest: the spec has no soft probes");
+        }
+        // A probe whose answer leaks into its own question still PASSES; it
+        // just stops measuring indirection. That is invisible in the results,
+        // so it is a hard startup error rather than a review item.
+        let bad = soft::authoring_violations(&spec.soft);
+        if !bad.is_empty() {
+            return SmokeOutcome::err(bad.join("\n"));
         }
     }
 
@@ -328,10 +352,13 @@ pub(crate) fn run_smoketest(
     // error. The cap must sit well clear of the longest probe, or every hard
     // probe silently measures the budget instead of the model.
     const PROG_MAX_SEQ: usize = 4096;
+    // Soft probes feed a whole fixture document, so they need doc headroom.
+    const SOFT_MAX_SEQ: usize = 8192;
     const PROG_GEN_CAP: usize = 1536;
     let smoke_max_seq = match battery {
         Battery::LongCtx => LONGCTX_MAX_SEQ,
         Battery::Programmatic => PROG_MAX_SEQ,
+        Battery::Soft => SOFT_MAX_SEQ,
         Battery::Smoke => SMOKE_MAX_SEQ,
     };
     let gen_cap = match battery {
@@ -405,6 +432,7 @@ pub(crate) fn run_smoketest(
     let mut kw_found_total = 0usize;
     let mut kw_total_total = 0usize;
     let mut prog_counts: Option<ProgCounts> = None;
+    let mut soft_counts: Option<SoftCounts> = None;
 
     println!(
         "\nsmoketest: {} (seed {seed}, {layers}L, sampler cap {steps} steps)",
@@ -535,6 +563,76 @@ pub(crate) fn run_smoketest(
             );
             continue;
         }
+        // `soft` is NON-BLOCKING: a probe that ran counts as passed whatever
+        // it answered, and the signal lives entirely in the reported rates.
+        // Only a probe that could not run at all is a failure.
+        if battery == Battery::Soft {
+            println!("\n[soft retrieval]");
+            let acc = soft_counts.get_or_insert_with(SoftCounts::default);
+            for p in &spec.soft {
+                total += 1;
+                if !doc_ids_cache.contains_key(&p.doc) {
+                    let doc_path = spec_dir.join(&p.doc);
+                    match std::fs::read_to_string(&doc_path) {
+                        Ok(text) => {
+                            doc_ids_cache.insert(p.doc.clone(), tokenizer.encode(&text, false));
+                        }
+                        Err(err) => {
+                            println!("  {:<22} ERROR  read {}: {err}", p.id, doc_path.display());
+                            failures.push(p.id.clone());
+                            continue;
+                        }
+                    }
+                }
+                let ids = &doc_ids_cache[&p.doc];
+                let n = if p.doc_tokens == 0 {
+                    ids.len()
+                } else {
+                    p.doc_tokens.min(ids.len())
+                };
+                let excerpt = tokenizer.decode(&ids[..n]);
+                let (st, reply) = match run_one(&soft::prompt_for(&excerpt, &p.question)) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        println!("  {:<22} ERROR  {err}", p.id);
+                        failures.push(p.id.clone());
+                        continue;
+                    }
+                };
+                passed += 1; // ran => passed; the rate carries the quality.
+                let hit = soft::matched(&reply, p);
+                if p.absence {
+                    acc.absence_total += 1;
+                    if hit {
+                        acc.absence_ok += 1;
+                    }
+                } else {
+                    acc.total += 1;
+                    if hit {
+                        acc.found += 1;
+                    }
+                }
+                let prev = reply.chars().take(58).collect::<String>().replace('\n', " ");
+                println!(
+                    "  {id:<22} {mark:<4} {cls:<34} steps {st:>3}/{max:<3} | {prev}",
+                    id = p.id,
+                    mark = if hit { "HIT " } else { "miss" },
+                    cls = p.class,
+                    max = p.max_steps,
+                );
+            }
+            let pct = |a: u64, b: u64| if b == 0 { 0.0 } else { 100.0 * a as f64 / b as f64 };
+            println!(
+                "soft retrieval: {}/{} ({:.1}%)   absence-declined: {}/{} ({:.1}%)  [rates only — not pass/fail]",
+                acc.found,
+                acc.total,
+                pct(acc.found, acc.total),
+                acc.absence_ok,
+                acc.absence_total,
+                pct(acc.absence_ok, acc.absence_total),
+            );
+            continue;
+        }
         if !spec.adherence.is_empty() {
             println!("\n[adherence]");
             for p in &spec.adherence {
@@ -617,6 +715,7 @@ pub(crate) fn run_smoketest(
         steps_total: steps_run_total,
         failures,
         prog: prog_counts,
+        soft: soft_counts,
         error: None,
     }
 }

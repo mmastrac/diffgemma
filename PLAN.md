@@ -181,6 +181,77 @@ it?"; answer must still contain "mauve".
   currently covers it — and INVERTS the metric, so it needs its own rate
   rather than being averaged in.
 
+**`soft` — built and run (2026-07-19). It SATURATES, and more importantly it
+CANNOT exercise the lever it was built for.**
+
+Predictions were: soft_pct >= 70 (right); `soft_unit_convert` the likeliest
+miss (wrong — it answered "1,200 centimetres"); absence_pct <= 50 (wrong —
+2/2 declined). Result: **10/10 retrieval and 2/2 absence at every one of
+seeds {7,42,123}** — 30/30 and 6/6, all eleven indirection classes, no
+variation. Contrast `programmatic`, which swings 12/14–14/14 across the same
+seeds: indirect retrieval at this document length is a stable solved
+capability for this model, while code generation is trajectory-fragile.
+
+Saturation alone would not be fatal — a ceiling battery cannot show
+IMPROVEMENT but is a clean REGRESSION detector, which is the actual
+`DGQ_COMMIT_CONF_HARD` risk. The fatal part is structural:
+
+**`soft` cannot reach the hard trim at all.** An `off` vs
+`hard:DGQ_COMMIT_CONF_HARD=0.5` comparison over 3 seeds returned
+BIT-IDENTICAL metrics in both arms, `trims 0` in both. Cause: the trim scans
+`(MIN_CONF_KEEP..region_end)` — it skips the first 16 rows and stops at the
+first eos/stop/pad. Soft answers run 4–31 rows (median 13); only 11 of 36
+probes have an answer region reaching past 16 at all, and the single
+sub-0.5 committed row in the campaign is an `<eos>` at index 13, i.e. the
+region terminator itself. The lever is structurally unreachable.
+
+So PLAN's premise — "the `soft` battery is what should settle the
+`DGQ_COMMIT_CONF_HARD` decision" — is FALSE as built, and a green
+`soft` run must NOT be read as evidence for that decision. To settle it,
+soft probes need LONG-FORM answers (multi-sentence, answer region well past
+16 rows); the `doc_tokens` field is already in the fixture schema for the
+depth ladder that would come with them.
+
+**Instrument finding, needs a decision before anything is re-signed-off:
+census `dup` counts what the trim deliberately ignores.** `scan_trace`
+counts every committed row below `kept`; the trim scans only the answer
+region. Measured split of census-counted dup rows:
+
+- soft battery, 3 seeds: 9 dup rows — 0 in the answer region, 9 in the
+  eos/pad tail.
+- smoke battery, seed 7: 3 dup rows — 0 in the answer region, 3 in the tail.
+  (Its 1 `hard` row IS in-region, so the hard component looks sound.)
+
+The trim's own comment says eos-padding runs are structural duplicates it
+excludes on purpose. So `contested_per_1k` — the documented decision line —
+has a dup component that on both sampled batteries is 100% eos padding, and
+the dup-tier sign-off (1.31 -> 1.03 per 1k) rests partly on it. NOT yet an
+indictment: that sign-off used 3 seeds x 4 arms and only one arm/seed was
+re-measured here. But it must be re-checked before that number is cited
+again, and the fix (mirror the trim's answer-region rule in `scan_trace`)
+would change a metric a shipped decision rests on, so it is a deliberate
+call rather than a drive-by patch.
+
+**Campaign plan (GPU session 2026-07-19), predictions pre-registered.**
+Validity check first in each case: confirm `trims > 0` in the treatment arm,
+because the `soft` lesson is that a lever which never fires produces a green
+that means nothing.
+
+- **A — dup-tier metric re-audit.** `smoke` x {off, dup, hard, both} x 3
+  seeds, scoring `contested_per_1k` BOTH ways (as census computes it, and
+  restricted to the region the trim scans). Prediction: the corrected figure
+  is far lower for every arm, and the ARM ORDERING changes — i.e. the dup
+  tier's shipped 1.31 -> 1.03 margin shrinks or inverts once eos padding is
+  excluded. If the ordering holds, the sign-off stands and this is settled.
+- **B — hard-tier regression on LONG-FORM soft.** 6 long-form probes added
+  (answers must clear the 16-row floor), `soft` x {off, hard} x 3 seeds.
+  Prediction: `trims > 0` at last, and NO retrieval regression.
+- **C — hard-tier regression on CODE.** `programmatic` x {off, dup, hard,
+  both} x 3 seeds. Code has ~60-row answer regions, the best lever
+  engagement available, and is the most fragile output type we generate.
+  Prediction: the hard arm costs steps but does NOT raise `compile_fail` —
+  a trimmed tail is re-denoised against committed context, not corrupted.
+
 Why this before the next big campaign: the `DGQ_COMMIT_CONF_HARD` decision
 is blocked on a metric mismatch (below). Both existing signals are proxies;
 neither says whether trimming makes answers BETTER.

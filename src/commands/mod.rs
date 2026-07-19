@@ -22,6 +22,7 @@ mod model_ops;
 mod programmatic;
 mod replay;
 mod smoketest;
+mod soft;
 mod step_debug;
 mod step_debug_dumps;
 mod step_gate;

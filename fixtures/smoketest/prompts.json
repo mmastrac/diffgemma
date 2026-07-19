@@ -144,6 +144,155 @@
       "max_steps": 60
     }
   ],
+  "_comment_soft": "INDIRECT retrieval (`census --battery soft`; excluded from the default gate and NON-BLOCKING — reported as rates, not pass/fail). softdoc.md plants each fact; the question reaches it through an attribute, synonym, ordinal, unit conversion, aggregation, exception, or a two-hop chain, and shares NO tokens with the answer. That authoring rule is enforced mechanically (`soft::authoring_violations`, checked before any GPU time and pinned by a test over this file): if an expected answer appears in its own question the probe silently degenerates into a plain longctx lookup and measures nothing. `expect_any` is ANY-of, never all-of — soft answers vary in phrasing and all-of re-imports the brittleness this exists to escape. ABSENCE probes ask about what the document never says and INVERT the metric, so they carry their own rate (hallucination) rather than being averaged into retrieval.",
+  "soft": [
+    {
+      "id": "soft_attribute",
+      "class": "attribute indirection",
+      "doc": "softdoc.md",
+      "question": "One of the animals at the station wears a collar. What colour is it?",
+      "expect_any": ["mauve"],
+      "max_steps": 60
+    },
+    {
+      "id": "soft_synonym",
+      "class": "synonym paraphrase",
+      "doc": "softdoc.md",
+      "question": "How often does the generator get topped up?",
+      "expect_any": ["fortnight", "two weeks", "14 days", "fortnightly"],
+      "max_steps": 60
+    },
+    {
+      "id": "soft_unit_convert",
+      "class": "numeric restatement / unit conversion",
+      "doc": "softdoc.md",
+      "question": "How tall is the signal mast in centimetres?",
+      "expect_any": ["1200", "1,200"],
+      "max_steps": 60
+    },
+    {
+      "id": "soft_exception",
+      "class": "negation / exception",
+      "doc": "softdoc.md",
+      "question": "Which instrument does not follow the standard reporting schedule?",
+      "expect_any": ["tide gauge", "gauge"],
+      "max_steps": 60
+    },
+    {
+      "id": "soft_aggregation",
+      "class": "aggregation",
+      "doc": "softdoc.md",
+      "question": "How many people are stationed there this season?",
+      "expect_any": ["3", "three"],
+      "max_steps": 60
+    },
+    {
+      "id": "soft_multihop",
+      "class": "multi-hop",
+      "doc": "softdoc.md",
+      "question": "Who sends the weekly summary up to Bran Harbour?",
+      "expect_any": ["combe", "petra"],
+      "max_steps": 60
+    },
+    {
+      "id": "soft_ordinal",
+      "class": "ordinal",
+      "doc": "softdoc.md",
+      "question": "Who was the second person to reach the station this season?",
+      "expect_any": ["rusk", "iver"],
+      "max_steps": 60
+    },
+    {
+      "id": "soft_superlative",
+      "class": "superlative",
+      "doc": "softdoc.md",
+      "question": "Which of the sampling sites is the deepest?",
+      "expect_any": ["bram", "47"],
+      "max_steps": 60
+    },
+    {
+      "id": "soft_temporal",
+      "class": "temporal ordering",
+      "doc": "softdoc.md",
+      "question": "Of the mooring survey and the antenna repair, which month did the earlier one happen in?",
+      "expect_any": ["march"],
+      "max_steps": 60
+    },
+    {
+      "id": "soft_callback",
+      "class": "referential callback",
+      "doc": "softdoc.md",
+      "question": "What name do the crew use for the winter resupply run?",
+      "expect_any": ["long haul"],
+      "max_steps": 60
+    },
+    {
+      "id": "softlong_gauge",
+      "class": "long-form: exception + rationale",
+      "doc": "softdoc.md",
+      "question": "One instrument reports on a different schedule from all the others. Explain in full what the log says about that arrangement and why it is intentional rather than a defect.",
+      "expect_any": ["averages"],
+      "max_steps": 90
+    },
+    {
+      "id": "softlong_arrivals",
+      "class": "long-form: ordering + cause",
+      "doc": "softdoc.md",
+      "question": "Walk through the order in which the crew reached the station this season, and say what held up the final arrival.",
+      "expect_any": ["ice"],
+      "max_steps": 90
+    },
+    {
+      "id": "softlong_sites",
+      "class": "long-form: enumeration + comparison",
+      "doc": "softdoc.md",
+      "question": "Give a full account of the sampling sites, including how deep each one goes and how they compare to one another.",
+      "expect_any": ["31"],
+      "max_steps": 90
+    },
+    {
+      "id": "softlong_maintenance",
+      "class": "long-form: aggregation across sections",
+      "doc": "softdoc.md",
+      "question": "Summarise everything the log flags as needing attention before the next season.",
+      "expect_any": ["felting", "felted"],
+      "max_steps": 90
+    },
+    {
+      "id": "softlong_mast",
+      "class": "long-form: attribute + fault report",
+      "doc": "softdoc.md",
+      "question": "Explain the state of the signal mast: how big it is, how it is held up, and any problem the log notes with it.",
+      "expect_any": ["hums", "humming"],
+      "max_steps": 90
+    },
+    {
+      "id": "softlong_resupply",
+      "class": "long-form: callback + rationale",
+      "doc": "softdoc.md",
+      "question": "Describe the winter resupply run in full: what it carries, what the crew call it, and why it cannot be shifted to another date.",
+      "expect_any": ["long haul"],
+      "max_steps": 90
+    },
+    {
+      "id": "soft_absence_budget",
+      "class": "absence",
+      "absence": true,
+      "doc": "softdoc.md",
+      "question": "What is the station's annual operating budget?",
+      "expect_any": ["not mentioned", "does not mention", "no mention", "not stated", "not specified", "not given", "no information", "does not say", "not say", "not include"],
+      "max_steps": 60
+    },
+    {
+      "id": "soft_absence_depth",
+      "class": "absence",
+      "absence": true,
+      "doc": "softdoc.md",
+      "question": "How many metres does Site Crake silt up over the winter?",
+      "expect_any": ["not mentioned", "does not mention", "no mention", "not stated", "not specified", "not given", "no information", "does not say", "not say", "not include"],
+      "max_steps": 60
+    }
+  ],
   "_comment_programmatic": "Executable correctness (`census --battery programmatic`; excluded from the default gate). The reply is COMPILED (rust) or syntax-checked (python, bash) and then RUN against every case: stdout AND exit code must match. Three outcome states are reported — compile_fail / wrong_output / pass — because well-formed-but-wrong is a different finding from unparseable. Every prompt ends with the same 'no markdown code fences' instruction, so a fenced reply disobeyed it and FAILS its probe — but the fence is still stripped and the program still run, so a fenced-but-correct probe reports all cases passing next to a failed verdict ('wrote the program, ignored the format'). `fenced%` keeps the rate visible. Each probe has several cases so a program that hardcodes the prompt's example fails. `max_steps` here is a runaway guard, NOT a ratchet: this battery judges execution, not convergence. Every prompt ends with the same bare-source instruction, so `fenced%` compares across probes. No probe may need the network.",
   "programmatic": [
     {
