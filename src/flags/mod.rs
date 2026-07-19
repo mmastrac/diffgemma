@@ -189,10 +189,25 @@ pub struct SamplerFlags {
     /// `DGQ_FORCE_CANVAS`: force the active canvas width (diagnostic). None = 256.
     pub force_canvas: Option<u32>,
     /// `DGQ_COMMIT_CONF_TRIM` (p_max τ in (0,1]; 0 disables): trim a proposed
-    /// block at the first canvas row whose final-step p_max is below τ —
-    /// unresolved rows argmax-copy their neighbor (the duplication
-    /// micro-stutter), so the tail re-denoises next block against committed
-    /// context instead. Default OFF (0) pending multi-seed A/B.
+    /// block at the first answer-region row that is BOTH below τ and
+    /// argmax-duplicating a neighbour — unresolved rows argmax-copy their
+    /// neighbour (the duplication micro-stutter), so the tail re-denoises
+    /// next block against committed context instead.
+    ///
+    /// DEFAULT ON at 0.9 (user sign-off 2026-07-19). Census evidence
+    /// (`census --arm ... --battery smoke --seeds 7,42,123`, ~13.7k
+    /// committed rows per arm), dup tier alone vs off:
+    ///   contested-committed 1.31 -> 1.03 per 1k rows
+    ///   (hard-class 5 -> 3, dup-class 13 -> 11)
+    ///   smoke 17/17 x 3 seeds, retrieval 100%, +1 step total (362 -> 363)
+    /// It fires rarely (1 trim across 51 prompt-runs) and is close to free.
+    /// Note it lowers HARD-class commits too without a hard tier: truncating
+    /// at a dup row keeps later contested rows out of KV and re-denoises
+    /// them. The unconditional hard tier is the separate
+    /// `DGQ_COMMIT_CONF_HARD`, still OFF — it kills the insertion class
+    /// outright (5 -> 0) but fires 4x as often, needs 58 blocks instead of
+    /// 57, and tips `transformer` over its 39-step convergence budget at
+    /// seed 7 (that budget was ratcheted on a NON-trimming baseline).
     pub commit_conf_trim: f32,
     /// `DGQ_COMMIT_CONF_HARD` (p_max floor in [0,1]; 0 disables): trim a
     /// proposed block at the first answer-region row committing BELOW this
@@ -592,7 +607,7 @@ impl RuntimeConfig {
                     .and_then(|v| v.parse::<u32>().ok())
                     .filter(|&w| w >= 1),
                 commit_conf_trim: r
-                    .ranged_f32("DGQ_COMMIT_CONF_TRIM", 0.0, 0.0, 1.0),
+                    .ranged_f32("DGQ_COMMIT_CONF_TRIM", 0.9, 0.0, 1.0),
                 commit_conf_hard: r.ranged_f32("DGQ_COMMIT_CONF_HARD", 0.0, 0.0, 1.0),
                 prefix_exit: r
                     // 0.0 disables; the old filter REJECTED 1 and silently

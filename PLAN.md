@@ -156,6 +156,57 @@ Findings, in proposed fix order:
   User directive that still stands until revisited: thinking never
   reaches KV RE-PREFILL from the client side.
 
+### Census batteries — next build (designed 2026-07-19, not started)
+
+`census` (arms x batteries x gates, `src/commands/census.rs`) has `smoke`
+and `longctx`. Two new batteries, in build order:
+
+**1. `programmatic` — executable correctness.** Generate a program, RUN it,
+judge stdout + exit code. Nothing else in the gates measures whether output
+is executably correct rather than textually plausible.
+- Fixture shape: `{id, lang, prompt, cases:[{args, stdin?, stdout, exit}]}`;
+  `lang` in {rust, python, bash} dispatches compile+run. Multiple cases per
+  probe (the same program re-invoked with different args).
+- THREE outcome states, not two: `compile_fail` / `wrong_output` / `pass`.
+  Collapsing the first two throws away the diagnostic (well-formed-but-wrong
+  is a different failure than unparseable).
+- Models emit markdown fences despite being told not to. Strip a
+  leading/trailing fence but COUNT it (`fenced`) — instruction-following is
+  a real signal, don't silently normalize it away.
+- SAFETY (not optional, even trusting the engine): fresh temp cwd per case,
+  hard timeout + kill (~10s), captured stdout/stderr (never inherit the
+  terminal), no probe needing network. A hanging generation must be a failed
+  case, not a wedged machine.
+- Probes: rust_hello_42 (exit-code semantics via `std::process::exit`),
+  py_word_lengths (x2 cases, argv + per-token map), bash_underscores (literal
+  loop + exact formatting), rust_primes (argv parse + algorithm),
+  py_sort_csv, bash_sum_args (bash arithmetic — a common stumble),
+  rust_reverse_words, py_count_lines_stdin (exercises stdin piping).
+
+**2. `soft` retrieval — indirect facts, NON-blocking.** The softness is in
+the QUERY, not the judging: the planted fact shares NO tokens with the
+question, so it needs semantic matching, but scoring stays keyword-based
+(cheap, deterministic, no judge model). Doc plants "the cat had a mauve
+collar"; query asks "there was an animal with a collar, what colour was
+it?"; answer must still contain "mauve".
+- `expect_any` (any-of), NOT require-all: soft answers vary in phrasing and
+  all-of re-imports the brittleness this exists to escape.
+- Reported as a rate, EXCLUDED from pass/fail. Gateable only if someone opts
+  in (`--gate 'soft_pct>=baseline'`).
+- Authoring rule: if the fact shares tokens with the query the probe
+  silently degenerates into an ordinary longctx probe and measures nothing.
+- Classes: attribute indirection, referential callback ("using something we
+  wrote here before"), numeric restatement/unit conversion, negation
+  /exception, aggregation, synonym paraphrase, multi-hop, ordinal,
+  superlative, temporal ordering, and ABSENCE (ask about something not in
+  the doc, expect "not mentioned"). Absence measures hallucination — nothing
+  currently covers it — and INVERTS the metric, so it needs its own rate
+  rather than being averaged in.
+
+Why these before the next big campaign: the `DGQ_COMMIT_CONF_HARD` decision
+is blocked on a metric mismatch (below). Both existing signals are proxies;
+neither says whether trimming makes answers BETTER.
+
 ### Quality track (the current frontier)
 
 - **Duplication micro-stutter — mechanism FOUND (E7 M0, 2026-07-18,
@@ -177,20 +228,44 @@ Findings, in proposed fix order:
   (strain) marginal steps at τ=0.9 vs the 8–10% KILL line. The wart
   hypothesis half was CONFIRMED (see above) and is now pursued as
   commit-time confidence trim instead of a sampler swap.
-- **Confidence trim `DGQ_COMMIT_CONF_TRIM` — A/B CLEAN, default-on
-  decision pending**: final rule (2026-07-18) is CONJUNCTIVE and
-  answer-region-scoped — trim at the first row that is both low-confidence
-  (p_max < τ) AND argmax-duplicating a neighbor, scanning only before the
-  first stop/pad/filler row (floor 16, 2× max_blocks headroom). p_max
-  alone does NOT separate wart from art (benign creative soft rows sit at
-  0.58–0.87 and judged fine; fixed-τ trim regressed smoketest 15-16/17 via
-  step-budget churn; eos-padding runs are structural dups). τ-insensitive
-  across 0.9–0.95. A/B at τ=0.9: smoketest 17/17 ×3 seeds with dup commits
-  6→0 (one trim in 51 turns); strain battery dup commits 6→0 with trims at
-  exactly the 3 known stutter sites, tool health/flood identical, +10.6%
-  denoise on stutter-heavy turns; real OpenCode bug-fix run clean (7
-  turns, correct edit, verified, zero trims). Remaining before default-on:
-  census multi-seed + longctx.
+- **Confidence trim: dup tier SHIPPED default-ON at 0.9 (sign-off
+  2026-07-19); hard tier SPLIT OUT and still OFF.** The two tiers were one
+  flag; `DGQ_COMMIT_CONF_HARD` (unconditional p_max floor) is now
+  independent of `DGQ_COMMIT_CONF_TRIM` (dup-conjunctive at tau), because
+  the census showed they behave nothing alike. Isolation run
+  (`census --arm off/hard/dup/both --battery smoke --seeds 7,42,123`,
+  ~13.7k committed rows/arm):
+
+      arm   pass  hard<0.5  dup  trims  cont/1k  steps  retry
+      off   yes        5     13     0     1.31    362     24
+      dup   yes        3     11     1     1.03    363     24
+      hard  NO         0     12     4     0.88    376     24
+      both  NO         0     11     4     0.80    377     24
+
+  DUP is nearly free: passes every gate, +1 step total, contested 1.31 ->
+  1.03. It also lowers HARD-class commits (5 -> 3) without a hard tier —
+  truncating at a dup row keeps later contested rows out of KV and
+  re-denoises them, so the tiers are not independent in effect. Golden 8/8
+  byte-identical (the trim never fires on golden cases, no re-bless).
+  Note: with it default-on, the `max_blocks *= 2` headroom that trimming
+  enables is now always active.
+
+  HARD is the tier that actually kills the insertion/omission class
+  (5 -> 0) but stays OFF: it fires 4x as often, needs 58 blocks instead of
+  57, burns +14 steps (~4%), and tips `transformer` over its 39-step
+  convergence budget at seed 7 (16/17). Retry steps are IDENTICAL (24)
+  across all arms — the cost is committed steps, not re-rolls.
+  BLOCKED ON A METRIC MISMATCH, not on the tier being bad: that budget was
+  ratcheted on a NON-trimming baseline, so a lever that deliberately
+  commits partial blocks will always read as a convergence regression to
+  it. Resolve with the `soft` battery (does trimming make answers better?)
+  before deciding; if soft retrieval holds under `hard`, re-baseline
+  `transformer` rather than shelving the tier. Caveats: 3 seeds, smoke
+  only, and the failure is ONE step over (40 vs 39).
+  PREDICTION LOG (worth keeping — it was wrong): I predicted hard-only
+  would be free and dup-only would own the failure. Exactly inverted. Then
+  predicted "any trim causes it" — also wrong; dup trims once and costs +1
+  step. The trim RATE is what matters, not the tier.
 - **Prefix-exit early block commit `DGQ_PREFIX_EXIT` (landed default OFF;
   reframed speed→quality)**: per step, commit the settled active/2 head
   (mean ent < τ, 2-step stable) when the tail is HARD-stuck (mean ≥
