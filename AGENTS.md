@@ -191,8 +191,23 @@ Tier 1 and engine-vs-engine agreement is automatic.
 rewrites — a cos≈0.34 oracle failure usually means the HARNESS dispatches an
 old shape, not that the kernel math broke. Check the harness grid first.
 
-**Suite mechanics**: `cargo test --release -- --test-threads=1` (parallel
-GPU tests SIGSEGV). Model-gated tests key off `test_util::dgq_model_dir()`.
+**Suite mechanics**: `cargo test --release`. Model-gated tests key off
+`test_util::dgq_model_dir()`.
+
+The old `--test-threads=1` is no longer required. It existed because
+concurrent pipeline compilation raced a non-thread-safe `MTLBinaryArchive`
+(fixed: the archive is behind a `Mutex`), and because ~9 model-gated tests
+each load ~19 GiB and would blow the 36 GB ceiling if they overlapped —
+which `membudget` now prevents: model-loading paths take a byte permit and a
+second one WAITS on a condvar (flock across processes) instead of OOMing.
+Expect only ~20-30% off the wall: the heavy tests still serialize on memory
+and dominate it; the other ~640 are µs CPU oracles.
+
+If parallelism regresses it fails LOUD (SIGSEGV, or a membudget timeout that
+names the holder) — revert to `--test-threads=1` and say why. Note
+`membudget` still PANICS on a nested acquire on ONE thread: build a second
+runtime only after dropping the first. And the separate hard rule stands —
+never two model-loading PROCESSES at once, regardless of thread count.
 
 ---
 
@@ -317,7 +332,7 @@ diffgemma-mps replay /path/ops.jsonl -m $WEIGHTS  # re-execute + diff an op-log
 diffgemma-mps smoketest -m $WEIGHTS             # 17/17 required
 diffgemma-mps smoketest -m $WEIGHTS --longctx   # doc-QA ladder
 diffgemma-mps golden -m $WEIGHTS                # byte-identity 8/8
-cargo test --release -- --test-threads=1
+cargo test --release
 
 # Campaigns: flag ARMS x BATTERIES with explicit gates, one process, stats
 # to a dir. This is how a quality lever is decided — not a shell loop.

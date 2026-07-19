@@ -42,8 +42,12 @@ jobs:
           # way. Step-scoped so the test compile below (which still carries
           # test-only dead_code) is not gated here.
           RUSTFLAGS: "-D warnings"
-      - name: Test (single-threaded — parallel GPU tests crash)
-        run: cargo test --release -- --test-threads=1
+      # Parallel is safe since membudget gates model-loading paths (a second
+      # 19 GiB load waits on a permit instead of OOMing) and the pipeline
+      # archive is Mutex-guarded. Revert to --test-threads=1 if this ever
+      # SIGSEGVs or times out on a membudget holder.
+      - name: Test
+        run: cargo test --release
 
   clippy:
     # Non-blocking: ~400 pre-existing warnings. Surfaces new lints in the log
