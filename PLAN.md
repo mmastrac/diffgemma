@@ -156,34 +156,12 @@ Findings, in proposed fix order:
   User directive that still stands until revisited: thinking never
   reaches KV RE-PREFILL from the client side.
 
-### Census batteries — next build (designed 2026-07-19, not started)
+### Census batteries
 
-`census` (arms x batteries x gates, `src/commands/census.rs`) has `smoke`
-and `longctx`. Two new batteries, in build order:
+`census` (arms x batteries x gates, `src/commands/census.rs`) has `smoke`,
+`longctx` and `programmatic`. One battery still to build:
 
-**1. `programmatic` — executable correctness.** Generate a program, RUN it,
-judge stdout + exit code. Nothing else in the gates measures whether output
-is executably correct rather than textually plausible.
-- Fixture shape: `{id, lang, prompt, cases:[{args, stdin?, stdout, exit}]}`;
-  `lang` in {rust, python, bash} dispatches compile+run. Multiple cases per
-  probe (the same program re-invoked with different args).
-- THREE outcome states, not two: `compile_fail` / `wrong_output` / `pass`.
-  Collapsing the first two throws away the diagnostic (well-formed-but-wrong
-  is a different failure than unparseable).
-- Models emit markdown fences despite being told not to. Strip a
-  leading/trailing fence but COUNT it (`fenced`) — instruction-following is
-  a real signal, don't silently normalize it away.
-- SAFETY (not optional, even trusting the engine): fresh temp cwd per case,
-  hard timeout + kill (~10s), captured stdout/stderr (never inherit the
-  terminal), no probe needing network. A hanging generation must be a failed
-  case, not a wedged machine.
-- Probes: rust_hello_42 (exit-code semantics via `std::process::exit`),
-  py_word_lengths (x2 cases, argv + per-token map), bash_underscores (literal
-  loop + exact formatting), rust_primes (argv parse + algorithm),
-  py_sort_csv, bash_sum_args (bash arithmetic — a common stumble),
-  rust_reverse_words, py_count_lines_stdin (exercises stdin piping).
-
-**2. `soft` retrieval — indirect facts, NON-blocking.** The softness is in
+**`soft` retrieval — indirect facts, NON-blocking.** The softness is in
 the QUERY, not the judging: the planted fact shares NO tokens with the
 question, so it needs semantic matching, but scoring stays keyword-based
 (cheap, deterministic, no judge model). Doc plants "the cat had a mauve
@@ -203,9 +181,97 @@ it?"; answer must still contain "mauve".
   currently covers it — and INVERTS the metric, so it needs its own rate
   rather than being averaged in.
 
-Why these before the next big campaign: the `DGQ_COMMIT_CONF_HARD` decision
+Why this before the next big campaign: the `DGQ_COMMIT_CONF_HARD` decision
 is blocked on a metric mismatch (below). Both existing signals are proxies;
 neither says whether trimming makes answers BETTER.
+
+**`programmatic` — what three rounds of probes established.** Predictions
+were pre-registered each round and are kept here because the FALSIFIED ones
+are the useful part: nobody should re-derive these premises.
+
+Falsified: "models emit markdown fences despite instructions" (`fenced` has
+been 0 across all 14 probes, every round); "compile failures concentrate in
+rust because generation truncates"; "pass rate under 50%"; "bash arithmetic
+stumbles"; "RPN operand order (`2 3 -` → -1) is a trap"; "a `.`/`*` regex
+matcher needs backtracking the model won't write" (it passed 8/8, including
+`a*`/"" and `a*a`/"aaa"). Confirmed: `py_text_wrap` passes; the long probes
+need more than one 256-token block. Roughly one prediction in four survived.
+
+**Current state: 12/14 probes, 36/44 cases (81.8%), compile_fail 8,
+wrong_output 0, fenced 0** (`--arm 'default:' --seeds 7`).
+
+The finding that matters is the SHAPE of the two failures, not the rate.
+`wrong_output` is ZERO across all 44 cases: this model never computes the
+wrong thing. Both failures are a correct algorithm carrying one unparseable
+token — `bash_stdin_and_argv` wrote `*$SEARCH"*` (misplaced quote, unbalanced
+`"`), `rust_base_convert` wrote `let final: String = ...` (`final` is a Rust
+reserved word, a Java/JS habit). Code failure here is LEXICAL, not
+algorithmic. No text-judged gate can see this — both replies read as good
+programs — which is precisely what the compile_fail/wrong_output split was
+built to expose, and it is the battery's first real earned result.
+
+`rust_base_convert` initially failed as "unclosed delimiter" and that was
+OUR ceiling, not the model: the 512-token `SMOKE_GEN_CAP` cut a 60-line
+program mid-expression. The battery was one head-only preview away from
+reporting a harness artifact as a model defect. Fixed by giving the battery
+its own budget (`PROG_GEN_CAP` 1536, `PROG_MAX_SEQ` 4096) and by printing
+the rejected source HEAD AND TAIL, since truncation is only visible in the
+tail. Any future probe that gets harder must re-check this ceiling first.
+
+Open work on this battery:
+- **Judge it by the multi-seed aggregate, never one seed.** Seed 42 scores
+  14/14 and seed 7 scores 12/14 on identical code; a single-seed run of this
+  battery is close to meaningless, exactly as for the smoke gate.
+- **Whether it can discriminate ARMS is still unknown** — every run so far
+  is one arm. That, not the pass rate, decides whether it is usable for any
+  lever decision. The per-seed spread (12–14/14) suggests the noise floor is
+  ~2 probes, so an arm comparison needs several seeds to see past it.
+- Prediction that failed, logged so it is not retried as-is:
+  `bash_stdin_and_argv` was predicted to fail at ≥2 of 3 seeds as a stable
+  habit. It failed at exactly one.
+
+**SETTLED (2026-07-19, 3 seeds): code failures are TRAJECTORY-dependent but
+CONFIDENTLY committed — no confidence-trim tier can reach them.**
+
+Aggregate over `--seeds 7,42,123`: 42 probes, 132 cases, **121 pass (91.7%)**,
+compile_fail 10, wrong_output 1. Per seed 12/14, **14/14**, 12/14 — and a
+different pair of probes fails each time:
+
+- seed 7: `bash_stdin_and_argv` (wrote `*$SEARCH"*`), `rust_base_convert`
+  (`let final:` — a Rust reserved word)
+- seed 42: nothing fails
+- seed 123: `bash_underscores` (**wrong_output** — `$*` under default IFS
+  printed `red green blue`), `rust_primes` (compile_fail)
+
+Two claims from the single-seed round were WRONG and are corrected here:
+
+- "The model never computes the wrong thing" — false. Seed 123's
+  `bash_underscores` is a well-formed program that computes the wrong
+  result. `wrong_output` has now fired against the model, so the three-state
+  split is validated by live evidence, not only by the fixture control.
+- "This is a knowledge defect, not a sampling defect" — false, and it was a
+  single-seed overclaim. `bash_stdin_and_argv` is CORRECT at seed 123
+  (`*"$SEARCH"*`) and wrong at seed 7. The model has no fixed inability
+  here; different denoise trajectories land on different code.
+
+What DOES survive, and is the useful part: within a trajectory the wrong
+token is committed at high confidence — seed 7's `"*` at 0.9993 and ` final`
+at 1.0000, seed 123's failing rows at 0.83–0.98 — while committed rows below
+0.9 number 9/4490, 5/4343, 12/4352 across the three seeds. Dup-stutter
+commits live at 0.40–0.86. No `DGQ_COMMIT_CONF_*` threshold separates a
+confidently-wrong token from a confidently-right one, so `programmatic` is
+NOT an instrument for the `DGQ_COMMIT_CONF_HARD` decision; `soft` remains
+the right one.
+
+Mechanism worth keeping: seed 7 emitted `*` `$` `SEARCH` `"*` where seed 123
+emitted `*"$` `SEARCH` `"*`. The SAME closing token `"*` at ~0.998 is right
+or wrong depending on an upstream omission — the model confidently closed a
+quote it never opened. The defect is an upstream token choice, not a bad
+token at the visible error site.
+
+(Not established, n=3: the perfect seed had the fewest sub-0.9 committed rows
+(5) and the worst had the most (12). Three points is not a correlation — do
+not build on it without a real sweep.)
 
 ### Quality track (the current frontier)
 

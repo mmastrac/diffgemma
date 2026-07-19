@@ -56,6 +56,18 @@ struct Metrics {
     /// battery-level numbers below are unknown (an older trace), which is
     /// why the pass column reads "-" rather than a fabricated verdict.
     summaries: u64,
+    /// `programmatic` battery: executable correctness. THREE outcome states,
+    /// kept apart on purpose — `compile_fail` (not a program) and
+    /// `wrong_output` (a program that computes the wrong thing) are different
+    /// findings, and their sum with `prog_pass` is `cases`. `fenced` counts
+    /// PROBES whose reply arrived wrapped in a markdown fence, which measures
+    /// instruction-following rather than correctness.
+    cases: u64,
+    prog_pass: u64,
+    compile_fail: u64,
+    wrong_output: u64,
+    fenced: u64,
+    probes: u64,
 }
 
 impl Metrics {
@@ -74,6 +86,12 @@ impl Metrics {
         self.steps_committed += o.steps_committed;
         self.steps_run += o.steps_run;
         self.summaries += o.summaries;
+        self.cases += o.cases;
+        self.prog_pass += o.prog_pass;
+        self.compile_fail += o.compile_fail;
+        self.wrong_output += o.wrong_output;
+        self.fenced += o.fenced;
+        self.probes += o.probes;
     }
 
     /// Steps thrown away by re-rolls.
@@ -96,6 +114,32 @@ impl Metrics {
             0.0
         } else {
             1000.0 * (self.hard + self.dup) as f64 / self.committed_rows as f64
+        }
+    }
+    /// Share of executed cases that produced the expected stdout AND exit
+    /// code. 0 when nothing ran — the OPPOSITE default from `retrieval_pct`,
+    /// because "no cases executed" is a floor here, not an unmeasured
+    /// dimension a gate should be blind to.
+    fn prog_pass_pct(&self) -> f64 {
+        if self.cases == 0 {
+            0.0
+        } else {
+            100.0 * self.prog_pass as f64 / self.cases as f64
+        }
+    }
+    fn compile_fail_pct(&self) -> f64 {
+        if self.cases == 0 {
+            0.0
+        } else {
+            100.0 * self.compile_fail as f64 / self.cases as f64
+        }
+    }
+    /// Probes whose reply arrived fenced, as a percentage.
+    fn fenced_pct(&self) -> f64 {
+        if self.probes == 0 {
+            0.0
+        } else {
+            100.0 * self.fenced as f64 / self.probes as f64
         }
     }
     fn mean_steps(&self) -> f64 {
@@ -121,6 +165,15 @@ impl Metrics {
             "steps_committed" => self.steps_committed as f64,
             "steps_run" => self.steps_run as f64,
             "steps_retry" => self.steps_retry() as f64,
+            "cases" => self.cases as f64,
+            "prog_pass" => self.prog_pass as f64,
+            "compile_fail" => self.compile_fail as f64,
+            "wrong_output" => self.wrong_output as f64,
+            "fenced" => self.fenced as f64,
+            "probes" => self.probes as f64,
+            "prog_pass_pct" => self.prog_pass_pct(),
+            "compile_fail_pct" => self.compile_fail_pct(),
+            "fenced_pct" => self.fenced_pct(),
             _ => return None,
         })
     }
@@ -205,7 +258,7 @@ fn cmp_ok(op: &str, lhs: f64, rhs: f64) -> bool {
 #[cfg(target_os = "macos")]
 fn append_run_summary(path: &Path, out: &super::smoketest::SmokeOutcome) {
     use std::io::Write;
-    let rec = serde_json::json!({
+    let mut rec = serde_json::json!({
         "kind": "run_summary",
         "passed": out.ok(),
         "prompts_passed": out.passed,
@@ -215,6 +268,17 @@ fn append_run_summary(path: &Path, out: &super::smoketest::SmokeOutcome) {
         "steps_committed": out.steps_committed,
         "steps_run": out.steps_total,
     });
+    // Only the `programmatic` battery carries these; omitting them entirely
+    // for the others keeps "did not run" distinguishable from "ran and scored
+    // zero", which a defaulted 0 would erase.
+    if let (Some(p), Some(obj)) = (&out.prog, rec.as_object_mut()) {
+        obj.insert("cases".into(), p.cases.into());
+        obj.insert("prog_pass".into(), p.pass.into());
+        obj.insert("compile_fail".into(), p.compile_fail.into());
+        obj.insert("wrong_output".into(), p.wrong_output.into());
+        obj.insert("fenced".into(), p.fenced.into());
+        obj.insert("probes".into(), p.probes.into());
+    }
     match std::fs::OpenOptions::new().create(true).append(true).open(path) {
         Ok(mut f) => {
             let _ = writeln!(f, "{rec}");
@@ -254,6 +318,12 @@ fn scan_trace(path: &Path, tau: f32) -> Metrics {
                 m.kw_total += u("kw_total");
                 m.steps_committed += u("steps_committed");
                 m.steps_run += u("steps_run");
+                m.cases += u("cases");
+                m.prog_pass += u("prog_pass");
+                m.compile_fail += u("compile_fail");
+                m.wrong_output += u("wrong_output");
+                m.fenced += u("fenced");
+                m.probes += u("probes");
                 continue;
             }
             _ => continue,
@@ -401,10 +471,19 @@ pub(crate) fn run_census_cmd(
     if bad {
         return ExitCode::FAILURE;
     }
+    // `Battery::parse` is the single source of truth for the known names, so
+    // adding a battery cannot leave this check behind.
+    let mut battery_kinds = Vec::new();
     for b in batteries {
-        if !matches!(b.as_str(), "smoke" | "longctx") {
-            eprintln!("census: unknown battery {b:?} (known: smoke, longctx)");
-            return ExitCode::FAILURE;
+        match super::smoketest::Battery::parse(b) {
+            Some(k) => battery_kinds.push(k),
+            None => {
+                eprintln!(
+                    "census: unknown battery {b:?} (known: {})",
+                    super::smoketest::Battery::KNOWN
+                );
+                return ExitCode::FAILURE;
+            }
         }
     }
     if let Some(b) = baseline
@@ -433,7 +512,7 @@ pub(crate) fn run_census_cmd(
     // rows so a gate can target one of them.
     let mut results: BTreeMap<(String, String), Metrics> = BTreeMap::new();
     for (arm, cfg) in arms.iter().zip(&configs) {
-        for battery in batteries {
+        for (battery, &kind) in batteries.iter().zip(&battery_kinds) {
             for &seed in seeds {
                 let tag = format!("{}.{}.seed{seed}", arm.name, battery);
                 let trace = trace_dir.join(format!("{tag}.jsonl"));
@@ -459,7 +538,7 @@ pub(crate) fn run_census_cmd(
                     false,
                     None,
                     1,
-                    battery == "longctx",
+                    kind,
                 );
                 if let Some(e) = &outcome.error {
                     eprintln!("census: [{tag}] {e}");
@@ -530,6 +609,32 @@ fn report(
         );
     }
 
+    // Executable correctness gets its own block: the three outcome states are
+    // only meaningful together, and bolting five columns onto the wart table
+    // would make both unreadable. Printed only when something executed.
+    if results.values().any(|m| m.cases > 0) {
+        println!();
+        println!(
+            "{:<12} {:<13} {:>6} {:>6} {:>6} {:>13} {:>13} {:>7} {:>7}",
+            "arm", "battery", "probes", "cases", "pass", "compile_fail", "wrong_output", "pass%",
+            "fenced%"
+        );
+        for ((arm, battery), m) in results.iter().filter(|(_, m)| m.cases > 0) {
+            println!(
+                "{:<12} {:<13} {:>6} {:>6} {:>6} {:>13} {:>13} {:>7.1} {:>7.1}",
+                arm,
+                battery,
+                m.probes,
+                m.cases,
+                m.prog_pass,
+                m.compile_fail,
+                m.wrong_output,
+                m.prog_pass_pct(),
+                m.fenced_pct(),
+            );
+        }
+    }
+
     if let Some(dir) = out_dir {
         let json: Vec<serde_json::Value> = results
             .iter()
@@ -546,6 +651,14 @@ fn report(
                     "steps_committed": m.steps_committed,
                     "steps_run": m.steps_run,
                     "steps_retry": m.steps_retry(),
+                    "probes": m.probes, "cases": m.cases,
+                    "prog_pass": m.prog_pass,
+                    "compile_fail": m.compile_fail,
+                    "wrong_output": m.wrong_output,
+                    "fenced": m.fenced,
+                    "prog_pass_pct": m.prog_pass_pct(),
+                    "compile_fail_pct": m.compile_fail_pct(),
+                    "fenced_pct": m.fenced_pct(),
                 })
             })
             .collect();
@@ -721,6 +834,42 @@ mod tests {
         // The block_commit record is still counted for wart stats.
         assert_eq!(m.blocks, 1);
         assert_eq!(m.committed_rows, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `programmatic` battery's three states survive the trace round-trip
+    /// and are reachable as gate metrics — the whole point of routing them
+    /// through `Metrics::get` rather than printing them and moving on.
+    #[test]
+    fn programmatic_states_round_trip_and_are_gateable() {
+        let dir = std::env::temp_dir().join(format!("dgq-census-prog-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("t.jsonl");
+        std::fs::write(
+            &f,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "kind": "run_summary", "passed": false,
+                    "prompts_passed": 5, "prompts_total": 8,
+                    "steps_committed": 400, "steps_run": 400,
+                    "probes": 8, "cases": 16, "prog_pass": 12,
+                    "compile_fail": 3, "wrong_output": 1, "fenced": 2,
+                }),
+            ),
+        )
+        .unwrap();
+        let m = scan_trace(&f, 0.9);
+        assert_eq!(m.cases, m.prog_pass + m.compile_fail + m.wrong_output);
+        assert_eq!(m.get("compile_fail"), Some(3.0));
+        assert_eq!(m.get("wrong_output"), Some(1.0), "distinct from compile_fail");
+        assert_eq!(m.get("prog_pass_pct"), Some(75.0));
+        assert_eq!(m.get("fenced_pct"), Some(25.0), "over PROBES, not cases");
+        // A battery that ran no cases floors at 0 rather than the 100 that
+        // `retrieval_pct` uses: an unmeasured retrieval must not fail a gate,
+        // but an unmeasured pass rate must not PASS one.
+        assert_eq!(Metrics::default().prog_pass_pct(), 0.0);
+        assert_eq!(Metrics::default().retrieval_pct(), 100.0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

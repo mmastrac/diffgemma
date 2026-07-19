@@ -331,7 +331,24 @@ Metal's single-buffer cap (20.25 GiB on M3 Pro/36 GB) are split at
   denoise p_max trace so they are battery-independent
   (`contested_per_1k`, `hard`, `dup`, `steps_committed`/`steps_run`/
   `steps_retry`, `retrieval_pct`). `--analyze DIR` re-reports an existing
-  campaign with no GPU. This is how a quality lever is decided.
+  campaign with no GPU. This is how a quality lever is decided. Batteries:
+  `smoke`, `longctx`, `programmatic`.
+- **Executable correctness** (`census --battery programmatic`): the reply is
+  compiled (rust) or syntax-checked (python, bash) and RUN against fixture
+  cases; stdout and exit code must both match. The only harness that judges
+  whether output is executably correct rather than textually plausible.
+  Three outcome states — `compile_fail` / `wrong_output` / `pass` — are kept
+  distinct because well-formed-but-wrong is a different finding from
+  unparseable; their sharpness is language-dependent, so compare
+  `compile_fail` within a language, not across (`bash -n` accepts prose).
+  A probe fails on any of three independent axes: a wrong case, a blown step
+  budget, or a markdown fence — every prompt forbids fences, so a fenced
+  reply disobeyed an explicit instruction. The fence is still stripped and
+  the program still run, so a fenced-but-correct probe reports full case
+  credit beside a failed verdict, and `fenced%` keeps the rate visible.
+  Each case runs in a fresh temp cwd
+  under a hard 10 s timeout with captured pipes: a hanging generated program
+  is a failed case, never a wedged machine.
 - **Smoketest gate** (`smoketest`, fixtures/smoketest/prompts.json): 12
   adherence + 5 convergence prompts; spec seed 7. Multi-seed aggregate
   {7,42,123} judges trajectory-reshuffling changes.
@@ -654,6 +671,21 @@ opt-in flags for A/B.
   selection.
 
 **Quality levers, disproven by measurement:**
+- **Confidence trim as a fix for CODE-correctness errors** — the
+  `programmatic` battery's failures looked like the low-p_max tool-arg
+  stutter class. `DGQ_TRACE_PMAX_JSONL` over seeds {7,42,123} says
+  otherwise: the wrong tokens commit at the TOP of the distribution (seed
+  7's `"*` at **0.9993**, ` final` at **1.0000**; seed 123's failing rows
+  0.83–0.98), inside blocks that are ~1.0 throughout with
+  `conf_trim_row=None`; committed rows below 0.9 number just 9/4490,
+  5/4343, 12/4352. Dup-stutter commits live at 0.40–0.86 — a different
+  regime. **No threshold separates a confidently-WRONG token from a
+  confidently-right one**, so no trim tier addresses this class. The
+  failures are trajectory-dependent, not a fixed model limitation (seed 42
+  scores 14/14; `bash_stdin_and_argv` is correct at seed 123 and wrong at
+  seed 7), and the defect sits UPSTREAM of the visible error: seed 7 wrote
+  `*` `$` `SEARCH` `"*`, confidently closing a quote it never opened, while
+  seed 123 wrote `*"$` `SEARCH` `"*` — the same closing token, correct.
 - **Hard freeze of accepted positions** — WAS the flat-row wart driver
   (census 4/10 → 0/10 on removal); reference semantics have no freeze.
 - **Expert quantization as wart driver** — q6 experts (2% err vs q4's 7.9%)

@@ -328,7 +328,7 @@ pub(crate) enum Command {
     Census {
         /// `NAME:KEY=VAL,...` per arm; `NAME:` is a no-override baseline.
         arms: Vec<String>,
-        /// `smoke` and/or `longctx`.
+        /// Any of `smoke`, `longctx`, `programmatic`.
         batteries: Vec<String>,
         seeds: Vec<u64>,
         /// `METRIC<OP>VALUE`, value may be `baseline[*factor]`.

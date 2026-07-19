@@ -1,6 +1,36 @@
 //! `smoketest` gate subcommand + fixture spec types.
 
 use super::*;
+use super::programmatic::{ProgCounts, ProgProbe};
+
+/// Which tier of the spec a run exercises. The tiers have different session
+/// budgets and different judging, so exactly one runs per invocation; `census`
+/// names them as batteries.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum Battery {
+    /// Adherence + convergence — the 17/17 commit gate.
+    #[default]
+    Smoke,
+    /// Long-context doc-QA ladder (E13).
+    LongCtx,
+    /// Generate a program, execute it, judge stdout + exit code.
+    Programmatic,
+}
+
+#[cfg(target_os = "macos")]
+impl Battery {
+    /// Single source of truth for the battery names `census --battery` accepts.
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "smoke" => Self::Smoke,
+            "longctx" => Self::LongCtx,
+            "programmatic" => Self::Programmatic,
+            _ => return None,
+        })
+    }
+    pub(crate) const KNOWN: &'static str = "smoke, longctx, programmatic";
+}
 
 /// Smoketest prompt spec (`fixtures/smoketest/prompts.json`).
 #[cfg(target_os = "macos")]
@@ -17,6 +47,10 @@ pub(crate) struct SmoketestSpec {
     /// answers collapsed into fluent hallucination).
     #[serde(default)]
     longctx: Vec<SmokeLongCtx>,
+    /// Executable-correctness probes (`census --battery programmatic`). Judged
+    /// by RUNNING the generated program — see `commands::programmatic`.
+    #[serde(default)]
+    programmatic: Vec<ProgProbe>,
     /// Gate baseline seed. Trajectory-reshuffling accepted changes re-baseline
     /// the gate here (single-seed pass/fail is arbitrary for such changes; the
     /// multi-seed aggregate is the real quality metric — see working notes).
@@ -127,6 +161,10 @@ pub(crate) struct SmokeOutcome {
     /// difference is what retries actually cost.
     pub(crate) steps_total: usize,
     pub(crate) failures: Vec<String>,
+    /// Executable-correctness tallies (`Battery::Programmatic` only). `None`
+    /// for every other battery, so the census reports "no cases" rather than a
+    /// fabricated 0/0 pass rate.
+    pub(crate) prog: Option<ProgCounts>,
     /// Set when the run could not start (bad model dir, missing spec, …);
     /// distinct from "ran and failed prompts".
     pub(crate) error: Option<String>,
@@ -171,7 +209,11 @@ pub(crate) fn run_smoketest_cmd(
         raw_prompt,
         filter,
         repeat,
-        longctx,
+        if longctx {
+            Battery::LongCtx
+        } else {
+            Battery::Smoke
+        },
     );
     if let Some(e) = &out.error {
         eprintln!("{e}");
@@ -197,9 +239,11 @@ pub(crate) fn run_smoketest(
     raw_prompt: bool,
     filter: Option<&str>,
     repeat: usize,
-    longctx: bool,
+    battery: Battery,
 ) -> SmokeOutcome {
     use metal::{StepGenerateConfig, StepGenerateSession, generate_with_session};
+
+    let longctx = battery == Battery::LongCtx;
 
     if !dgq::store::looks_like_dgq_dir(model_dir) {
         return SmokeOutcome::err("error: smoketest requires a .dgq directory (-m /path/to/quantized-weights)");
@@ -228,10 +272,12 @@ pub(crate) fn run_smoketest(
             .retain(|p| p.id.to_ascii_lowercase().contains(&pat));
         spec.longctx
             .retain(|p| p.id.to_ascii_lowercase().contains(&pat));
-        let kept = if longctx {
-            spec.longctx.len()
-        } else {
-            spec.adherence.len() + spec.convergence.len()
+        spec.programmatic
+            .retain(|p| p.id.to_ascii_lowercase().contains(&pat));
+        let kept = match battery {
+            Battery::LongCtx => spec.longctx.len(),
+            Battery::Programmatic => spec.programmatic.len(),
+            Battery::Smoke => spec.adherence.len() + spec.convergence.len(),
         };
         if kept == 0 {
             return SmokeOutcome::err(format!("smoketest: no prompts match filter {pat:?}"));
@@ -240,6 +286,17 @@ pub(crate) fn run_smoketest(
     }
     if longctx && spec.longctx.is_empty() {
         return SmokeOutcome::err("smoketest: --longctx but the spec has no longctx probes");
+    }
+    if battery == Battery::Programmatic {
+        if spec.programmatic.is_empty() {
+            return SmokeOutcome::err("smoketest: the spec has no programmatic probes");
+        }
+        // Toolchains are checked BEFORE the session opens: a missing `rustc`
+        // must cost a second, not a campaign, and must never be recorded as
+        // the model's compile failure.
+        if let Err(e) = programmatic::preflight(&spec.programmatic) {
+            return SmokeOutcome::err(e);
+        }
     }
 
     // Gate baseline seed: the spec pins it (re-baselined with accepted
@@ -265,10 +322,21 @@ pub(crate) fn run_smoketest(
     const SMOKE_GEN_CAP: usize = 512; // ~2 canvas blocks; bounds gate time + KV
     // Longctx tier needs headroom for the deepest ladder rung (~20.6k doc).
     const LONGCTX_MAX_SEQ: usize = 24576;
-    let smoke_max_seq = if longctx {
-        LONGCTX_MAX_SEQ
-    } else {
-        SMOKE_MAX_SEQ
+    // Programs are far longer than gate answers. At the 512-token smoke cap a
+    // ~60-line Rust program was cut off mid-expression and scored
+    // `compile_fail` — the battery reporting OUR ceiling as the model's
+    // error. The cap must sit well clear of the longest probe, or every hard
+    // probe silently measures the budget instead of the model.
+    const PROG_MAX_SEQ: usize = 4096;
+    const PROG_GEN_CAP: usize = 1536;
+    let smoke_max_seq = match battery {
+        Battery::LongCtx => LONGCTX_MAX_SEQ,
+        Battery::Programmatic => PROG_MAX_SEQ,
+        Battery::Smoke => SMOKE_MAX_SEQ,
+    };
+    let gen_cap = match battery {
+        Battery::Programmatic => PROG_GEN_CAP,
+        _ => SMOKE_GEN_CAP,
     };
     let stop_token_ids = config::load_generation_stop_tokens(model_dir);
     let sampler = sample::sampler_for_steps(steps, false);
@@ -310,8 +378,7 @@ pub(crate) fn run_smoketest(
         let prompt = build_chat_prompt_tokens(model_dir, &history, raw_prompt)?;
         let prompt_len = prompt.len();
         // Bound generation (and thus time + KV) — a gate doesn't need essays.
-        step_cfg.max_new_tokens =
-            SMOKE_GEN_CAP.min(smoke_max_seq.saturating_sub(prompt_len).max(1));
+        step_cfg.max_new_tokens = gen_cap.min(smoke_max_seq.saturating_sub(prompt_len).max(1));
         let out = generate_with_session(&mut session, &prompt, &step_cfg, "smoketest")?;
         let new_ids =
             sample::strip_degenerate_token_ids(out.token_ids.get(prompt_len..).unwrap_or(&[]));
@@ -337,6 +404,7 @@ pub(crate) fn run_smoketest(
     // (the per-tier locals below still drive the printed line).
     let mut kw_found_total = 0usize;
     let mut kw_total_total = 0usize;
+    let mut prog_counts: Option<ProgCounts> = None;
 
     println!(
         "\nsmoketest: {} (seed {seed}, {layers}L, sampler cap {steps} steps)",
@@ -439,6 +507,34 @@ pub(crate) fn run_smoketest(
             );
             continue;
         }
+        // `programmatic` likewise runs alone: its verdict is execution, not
+        // text, and mixing it into the commit gate would make a `rustc`
+        // hiccup fail the gate.
+        if battery == Battery::Programmatic {
+            println!("\n[programmatic]");
+            let (counts, p, t, mut f) = programmatic::run_probes(&spec.programmatic, &mut run_one);
+            passed += p;
+            total += t;
+            failures.append(&mut f);
+            let acc = prog_counts.get_or_insert_with(ProgCounts::default);
+            acc.probes += counts.probes;
+            acc.cases += counts.cases;
+            acc.pass += counts.pass;
+            acc.compile_fail += counts.compile_fail;
+            acc.wrong_output += counts.wrong_output;
+            acc.fenced += counts.fenced;
+            let rate = if counts.cases > 0 {
+                100.0 * counts.pass as f64 / counts.cases as f64
+            } else {
+                0.0
+            };
+            println!(
+                "programmatic: {}/{} cases pass ({rate:.1}%)  compile_fail {}  wrong_output {}  fenced {}/{} probes",
+                counts.pass, counts.cases, counts.compile_fail, counts.wrong_output,
+                counts.fenced, counts.probes,
+            );
+            continue;
+        }
         if !spec.adherence.is_empty() {
             println!("\n[adherence]");
             for p in &spec.adherence {
@@ -520,6 +616,7 @@ pub(crate) fn run_smoketest(
         steps_committed: steps_committed_total,
         steps_total: steps_run_total,
         failures,
+        prog: prog_counts,
         error: None,
     }
 }

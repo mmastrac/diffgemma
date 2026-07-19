@@ -341,6 +341,9 @@ diffgemma-mps census -m $WEIGHTS \
   --battery smoke,longctx --seeds 7,42,123 --baseline off \
   --out runs/c1 --gate 'passed==1' --gate 'contested_per_1k<=baseline'
 diffgemma-mps census -m $WEIGHTS --analyze runs/c1   # re-report, no GPU
+#   batteries: smoke | longctx | programmatic (generate a program, RUN it,
+#   judge stdout + exit code; metrics prog_pass_pct, compile_fail,
+#   wrong_output, fenced_pct)
 
 # Bench / diagnostics
 diffgemma-mps bench-step-kernel -m $WEIGHTS --profile-steps 8

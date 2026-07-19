@@ -19,6 +19,7 @@ mod common;
 mod gen_cmd;
 mod golden_cmd;
 mod model_ops;
+mod programmatic;
 mod replay;
 mod smoketest;
 mod step_debug;
