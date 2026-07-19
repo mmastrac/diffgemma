@@ -748,3 +748,68 @@ fn lineage_matrix(force_q8: bool) {
         "truncate+re-extend (finalize shape) KV diverges from fresh prefill"
     );
 }
+
+/// GENERATION determinism across context lengths (2026-07-19). Prefill KV is
+/// stable (`q8_ring_wrap_divergence_probe` F1-vs-F2) and golden is byte-exact,
+/// yet the SAME unmodified binary, same seed, same prompt produced different
+/// longctx answers across two process runs — so the instability is in the
+/// generate path, not prefill. This runs the same generation twice IN-PROCESS
+/// from identical state and diffs the committed token ids, sweeping length to
+/// find where determinism breaks. In-process removes every process-level
+/// suspect (pipeline-archive cold/warm compile, allocator/address layout).
+#[test]
+#[ignore = "diagnostic: sweeps generation determinism vs context length"]
+fn generation_determinism_vs_context_length() {
+    let Some(dir) = model_dir() else {
+        return;
+    };
+    let _g = crate::flags::install_for_test(crate::flags::RuntimeConfig::default());
+    let max_seq = 32768usize;
+    let cfg = StepGenerateConfig::from_generate(
+        42,
+        48, // a couple of blocks is enough to expose a divergence
+        max_seq,
+        N_LAYERS,
+        sample::sampler_for_steps(48, false),
+        false,
+    );
+    let (mut session, _) = StepGenerateSession::open(&dir, &cfg, None).expect("session");
+
+    for &n in &[512usize, 2048, 8192, 13300, 20600] {
+        let prompt = synth_ids(n);
+        let mut runs: Vec<Vec<u32>> = Vec::new();
+        for _ in 0..2 {
+            session.reset_kv();
+            let out = crate::metal::step_generate::generate_with_session(
+                &mut session,
+                &prompt,
+                &cfg,
+                "determinism-probe",
+            )
+            .expect("generate");
+            runs.push(out.token_ids[prompt.len()..].to_vec());
+        }
+        let first_diff = runs[0]
+            .iter()
+            .zip(&runs[1])
+            .position(|(a, b)| a != b)
+            .map(|i| i.to_string())
+            .unwrap_or_else(|| {
+                if runs[0].len() == runs[1].len() {
+                    "none".into()
+                } else {
+                    format!("length {} vs {}", runs[0].len(), runs[1].len())
+                }
+            });
+        eprintln!(
+            "determinism ctx={n:6}: run1={} tok run2={} tok -> {}",
+            runs[0].len(),
+            runs[1].len(),
+            if first_diff == "none" {
+                "IDENTICAL".to_string()
+            } else {
+                format!("DIVERGES at {first_diff}")
+            },
+        );
+    }
+}

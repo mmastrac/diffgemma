@@ -327,70 +327,22 @@ Findings, in proposed fix order:
   Deriving k from the RAW per-row count instead is also phase-invariant
   but shrinks k for early rows and broke golden 7/8 — the round-up is
   load-bearing, don't "simplify" it.
-- **Long-context generation is NOT run-to-run reproducible (found
-  2026-07-19, cause NOT isolated)**: the UNMODIFIED binary, same seed
-  (42), same prompt, run twice, produced different longctx answers —
-  doc_13k "It reached **3.07 TF/s**" (10 steps) vs "The 64x64x32 tile
-  reached a rate of" (12 steps), and doc_20k likewise. This is a
-  measurement-infrastructure problem before it is a quality one: it
-  silently invalidates any single-sample prose A/B at long context, and
-  it is very likely a chunk of what this PLAN records elsewhere as
-  "trajectory luck". It cost a wrong conclusion in this very session — a
-  dropped word at doc_20k was attributed to an E20 change until the
-  baseline was re-run and produced the same wart unprompted. Candidates,
-  untested: pipeline-ARCHIVE cold-vs-warm compile differences (the two
-  differing runs were the first and second for that source hash), a
-  residual race (the top-k emission race was already closed by cd66294,
-  so this would be elsewhere), or nondeterministic reduction order in a
-  long-context kernel. NEXT: pin it with a generation-level repro (same
-  binary, same seed, N runs, diff), then decide; until then treat every
-  long-context prose comparison as needing REPLICATED samples per arm,
-  not one. Note the generation-free KV fingerprint tests ARE stable
-  (`q8_ring_wrap_divergence_probe` F1-vs-F2), so KV-level gates are
-  unaffected.
-- **q8 fast-prefill is broken WHOLESALE (forensics 2026-07-18,
-  `q8_ring_wrap_divergence_probe` — supersedes the "ring-wrap requant
-  seam" framing)**: in any q8 session the fast-prefill forward goes
-  **NaN** after layer 0 — layer-0 Q/K/V land real (verified byte-level),
-  yet the attention output plane comes back non-finite on BOTH the
-  scalar and mma2 kernels, and the plane trace shows
-  hidden/attn_out/ffg/dense/moein all `non_finite=true, max_abs=0.0`
-  from row 0 on. Every later layer then quantizes a NaN hidden stream:
-  the tell is a KV row of ALL `-127` codes, which is the q8 signature of
-  a NaN source (`fmax(NaN,lo)=lo`, so Metal's `clamp(NaN,-127,127)`
-  yields -127; it is NOT a quantized zero — proven by the scale-floor
-  fix below, after which the scales became normal but the codes stayed
-  -127). Established by elimination: scrubbed builds are
-  deterministic AND path-independent (the RED "divergence" needed
-  cross-build residue: unwritten rows keep whatever the previous build
-  left); chunking only changes which DEAD bands survive ring
-  overwrites; the f16 control writes every row in every layer.
-  Exposure: auto-q8 needs f16-resident > 85% of the GPU working set
-  (MEASURED on this 36 GB M3 Pro: cap 27.00 GiB, crossover max_seq
-  178,176) or a forced `DGQ_KV_Q8=1` — so production has effectively
-  never run q8; nothing gates it (the
-  attention harness has ZERO q8 coverage; smoketest is short-prompt;
-  golden deliberately sizes `GOLDEN_MAX_SEQ` to stay UNDER the q8-auto
-  threshold, so it only ever gates f16). NEXT: (1) isolated q8
-  attention harness case (scalar + mma2 vs the CPU oracle over a
-  crafted q8 cache) to pin where the NaN is born — the session-level
-  probes can see it happen but not inside one dispatch; (2) fix; (3)
-  un-ignore `kv_lineage_paths_are_fingerprint_identical_q8`; (4) only
-  then is q8 a usable >178k memory lever. The probe test documents
-  every forensic arm and stays runnable.
-  TWO QUANTIZER DEFECTS FOUND + FIXED ALONG THE WAY (upstream of the
-  NaN, not its cause): the q8 group-scale floor was `1e-8`, which is
-  unrepresentable in f16, so (a) it rounded to +0.0 and `x/scale`
-  divided by zero — the NaN clamping to -127 on GPU but 0 in the Rust
-  mirror, and (b) Metal emits subnormal halves while this crate's
-  `f32_to_f16_bits` FLUSHES subnormals to zero, so every group with
-  `max|x| < 127*2^-14 = 7.75e-3` stored a different scale on the CPU
-  packer than the GPU kernel — two silent CPU/GPU divergences in a pair
-  documented as bit-for-bit. Both closed by flooring the scale at the
-  min NORMAL half (`Q8_MIN_SCALE` / `KV_Q8_MIN_SCALE`, 2^-14), which is
-  a fixed point of both conversions; real KV rows sit orders of
-  magnitude above it, so no realistic row's bytes change (golden 8/8
-  unchanged). Test: `q8_small_groups_quantize_finitely_at_a_representable_scale`.
+- ~~**Long-context generation is NOT run-to-run reproducible**~~
+  **RETRACTED 2026-07-19, same day it was filed — the engine IS
+  deterministic.** The "same binary, same seed, different answers"
+  observation was an INVOCATION error: `smoketest --longctx` defaults to
+  seed **7**, not 42, so a no-`--seed` run compared against `--seed 42`
+  runs is comparing two different seeds. Verified deterministic three
+  ways: in-process back-to-back generations are identical at 512/2048/
+  8192/13300/20600 (`generation_determinism_vs_context_length`); cold vs
+  warm Metal pipeline archive (isolated XDG_CACHE_HOME) identical; and
+  re-running with the seed made explicit reproduces each earlier output
+  exactly. The E20 fix is confirmed numerics-preserving end-to-end (v3
+  matches baseline at seed 7 AND seed 42), which is stronger than the
+  golden-only evidence. FOOTGUN WORTH KEEPING: never mix defaulted and
+  explicit-seed invocations in one A/B — the tool prints `seed N`, read
+  it. And run the cheapest control (re-run the exact failing command)
+  before hypothesising about GPU races or codegen.
 - **Exact-prefix repeat misses reuse**: re-POSTing an identical request
   paid `truncate_kv_to` ring rebuild 22263→14775 (39.45s!) then
   re-prefilled all 14,775 with `reused 0`. Should be ~100% reuse
