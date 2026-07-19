@@ -232,13 +232,24 @@ Findings, in proposed fix order:
 
 ### Correctness debt
 
-- **Hard-kill flag validation (user-directed 2026-07-18)**: any `DGQ_*`
-  flag present in the env with an unparseable or out-of-range value must
-  exit the process with a clear message instead of silently falling back
-  to the default (today `DGQ_PREFIX_EXIT=1` silently disables — the exact
-  footgun). Implement centrally in `RuntimeConfig::from_reader` so every
-  flag gets it; keep unset = default. Mind `EMPTY_ENV`/test parsing and
-  the drift-tripwire pattern.
+- ~~**Hard-kill flag validation**~~ **DONE (2026-07-19)**: a set-but-
+  invalid `DGQ_*` value now exits(2) naming every offender, instead of
+  silently running the default. `DGQ_PREFIX_EXIT=1` — which used to
+  DISABLE the lever it read like it was enabling — is fatal with
+  `expected a number in [0, 0.5]`. Implemented in the shared parse
+  helpers (`on_if_one`/`on_unless_zero` via `bool_value`, `parse_usize`,
+  `gib_bytes`, new `ranged_f32`) rather than a per-flag table, so it
+  cannot drift from the parsing; rejections accumulate in a thread-local
+  and `from_env` drains + kills, so ONE run reports EVERY bad flag.
+  Bools now accept 1/0, true/false, yes/no, on/off and reject the rest
+  (previously a typo silently meant OFF under opt-in flags and ON under
+  opt-out ones — opposite failure modes for the same typo). Unset is
+  untouched: still the documented default, still silent. Tests use a
+  test-only FAKE_ENV (no `set_var`, which is unsafe/racy under edition
+  2024). REMAINING: the ~29 flags parsed inline via bespoke `var(...)`
+  chains (enums, u32 ranges, paths) still swallow bad values — convert
+  them to checked helpers as they are touched; the 4 shared helpers plus
+  the 3 ranged floats cover the bulk and the known footgun.
 - **KV reuse+delta ≠ fresh prefill (PROVEN divergence, 2026-07-18; the
   likely "KV-lineage drift" root)**: chasing a live `existingIf`
   insertion-typo seam (which is NOT an off-by-one — it committed

@@ -32,7 +32,6 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
-/// `=0`/`false` disables; anything else (or unset) leaves it ON.
 /// Env access for flag parsing, mirroring `std::env` signatures. `REAL_ENV`
 /// reads the process env; `EMPTY_ENV` backs `Default`, so the documented
 /// defaults and unset-env parsing CANNOT drift apart
@@ -43,13 +42,29 @@ struct EnvReader {
 const REAL_ENV: EnvReader = EnvReader { real: true };
 const EMPTY_ENV: EnvReader = EnvReader { real: false };
 
+/// Test-only fake environment consulted by [`EnvReader::var`] on the
+/// non-real reader, so flag VALIDATION can be tested without `set_var`
+/// (unsafe/racy under edition 2024) and without a real process env.
+#[cfg(test)]
+thread_local! {
+    static FAKE_ENV: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
+}
+
 impl EnvReader {
     fn var(&self, name: &str) -> Result<String, std::env::VarError> {
         if self.real {
-            std::env::var(name)
-        } else {
-            Err(std::env::VarError::NotPresent)
+            return std::env::var(name);
         }
+        #[cfg(test)]
+        if let Some(v) = FAKE_ENV.with(|f| {
+            f.borrow()
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        }) {
+            return Ok(v);
+        }
+        Err(std::env::VarError::NotPresent)
     }
     fn var_os(&self, name: &str) -> Option<std::ffi::OsString> {
         if self.real {
@@ -61,25 +76,81 @@ impl EnvReader {
     /// Set-and-not-"0"/"false" — the default-ON pattern.
     fn on_unless_zero(&self, name: &str) -> bool {
         match self.var(name) {
-            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Ok(v) => bool_value(name, &v).unwrap_or(true),
             Err(_) => true,
         }
     }
-    /// `=1`/`true` enables; anything else (or unset) leaves it OFF.
+    /// `=1`/`true` enables; `0`/`false` disables; unset leaves it OFF.
     fn on_if_one(&self, name: &str) -> bool {
         match self.var(name) {
-            Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+            Ok(v) => bool_value(name, &v).unwrap_or(false),
             Err(_) => false,
         }
     }
     fn gib_bytes(&self, name: &str) -> usize {
-        self.var(name)
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|g| *g > 0.0)
-            .map(|g| (g * 1024.0 * 1024.0 * 1024.0) as usize)
-            .unwrap_or(0)
+        let Ok(raw) = self.var(name) else { return 0 };
+        match raw.parse::<f64>() {
+            Ok(g) if g > 0.0 => (g * 1024.0 * 1024.0 * 1024.0) as usize,
+            _ => {
+                reject(name, &raw, "a positive number of GiB");
+                0
+            }
+        }
     }
+
+    /// A float flag with an inclusive valid range. A set-but-invalid value is
+    /// REJECTED rather than silently replaced by `default` — the
+    /// `DGQ_PREFIX_EXIT=1` footgun (1.0 is out of range for a 0..1 threshold,
+    /// so it silently DISABLED the very lever the operator was enabling).
+    fn ranged_f32(&self, name: &str, default: f32, lo: f32, hi: f32) -> f32 {
+        let Ok(raw) = self.var(name) else { return default };
+        match raw.parse::<f32>() {
+            Ok(v) if (lo..=hi).contains(&v) => v,
+            _ => {
+                reject(name, &raw, &format!("a number in [{lo}, {hi}]"));
+                default
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Flag validation: a set-but-invalid DGQ_* value is fatal, never a silent
+// fallback to the default (user-directed 2026-07-18). Parse helpers record
+// rejections here; `from_env` drains them and kills the process. Collected
+// rather than failing fast so ONE run reports EVERY bad flag.
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    static FLAG_ERRORS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Shared truthiness for both boolean patterns. Anything outside the
+/// accepted set is REJECTED rather than silently read as its "other" value
+/// — `DGQ_X=yes` used to mean OFF under `on_if_one` and ON under
+/// `on_unless_zero`, which is the opposite of what an operator typing it
+/// intends in at least one of those cases.
+fn bool_value(name: &str, raw: &str) -> Option<bool> {
+    match raw.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => {
+            reject(name, raw, "one of 1/0, true/false, yes/no, on/off");
+            None
+        }
+    }
+}
+
+fn reject(name: &str, raw: &str, expected: &str) {
+    FLAG_ERRORS.with(|e| {
+        e.borrow_mut()
+            .push(format!("{name}={raw:?} is not valid; expected {expected}"))
+    });
+}
+
+fn take_flag_errors() -> Vec<String> {
+    FLAG_ERRORS.with(|e| std::mem::take(&mut *e.borrow_mut()))
 }
 
 // ===========================================================================
@@ -431,16 +502,42 @@ pub struct RuntimeConfig {
 impl RuntimeConfig {
     /// Parse every `DGQ_*` env flag once. The single source of env truth.
     pub fn from_env() -> Self {
-        Self::from_reader(&REAL_ENV)
+        let (cfg, errors) = Self::from_reader_checked(&REAL_ENV);
+        if !errors.is_empty() {
+            eprintln!("fatal: invalid DGQ_* flag value(s):");
+            for e in &errors {
+                eprintln!("  {e}");
+            }
+            eprintln!(
+                "A set-but-invalid flag is NOT silently ignored: it would run with the \
+                 default while reading like it was configured (e.g. DGQ_PREFIX_EXIT=1 \
+                 used to DISABLE prefix-exit). Fix or unset the flag."
+            );
+            std::process::exit(2);
+        }
+        cfg
+    }
+
+    /// [`from_reader`](Self::from_reader) plus the rejections it recorded —
+    /// the testable half of the hard-kill validation, so tests can assert the
+    /// diagnosis without the process exit.
+    fn from_reader_checked(r: &EnvReader) -> (Self, Vec<String>) {
+        let _ = take_flag_errors(); // discard anything a prior parse left
+        let cfg = Self::from_reader(r);
+        (cfg, take_flag_errors())
     }
 
     /// The one parse. `Default` goes through this with [`EMPTY_ENV`].
     fn from_reader(r: &EnvReader) -> Self {
         let parse_usize = |name: &str, default: usize| -> usize {
-            r.var(name)
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(default)
+            let Ok(raw) = r.var(name) else { return default };
+            match raw.parse::<usize>() {
+                Ok(v) => v,
+                Err(_) => {
+                    reject(name, &raw, "a non-negative integer");
+                    default
+                }
+            }
         };
         let quiet_from_env = r.var_os("DGQ_QUIET").is_some();
 
@@ -448,24 +545,16 @@ impl RuntimeConfig {
             sampler: SamplerFlags {
                 freeze: r.on_if_one("DGQ_FREEZE"),
                 denoiser_argmax: r.on_unless_zero("DGQ_DENOISER_ARGMAX"),
-                early_stop_mean_ent: r
-                    .var("DGQ_EARLY_STOP_MEAN_ENT")
-                    .ok()
-                    .and_then(|v| v.parse::<f32>().ok())
-                    .filter(|&x| x >= 0.0)
-                    .unwrap_or(0.05),
-                empty_reply_retry: r
-                    .var("DGQ_EMPTY_REPLY_RETRY")
-                    .ok()
-                    .and_then(|v| v.parse::<u32>().ok())
-                    .unwrap_or(3),
+                early_stop_mean_ent: r.ranged_f32(
+                    "DGQ_EARLY_STOP_MEAN_ENT",
+                    0.05,
+                    0.0,
+                    f32::MAX,
+                ),
+                empty_reply_retry: parse_usize("DGQ_EMPTY_REPLY_RETRY", 3) as u32,
                 ws_block_stop: r.on_if_one("DGQ_WS_BLOCK_STOP"),
                 block_commit_max_ent: r
-                    .var("DGQ_BLOCK_COMMIT_MAX_ENT")
-                    .ok()
-                    .and_then(|v| v.parse::<f32>().ok())
-                    .filter(|&x| x >= 0.0)
-                    .unwrap_or(0.0),
+                    .ranged_f32("DGQ_BLOCK_COMMIT_MAX_ENT", 0.0, 0.0, f32::MAX),
                 block_commit_retry: r
                     .var("DGQ_BLOCK_COMMIT_RETRY")
                     .ok()
@@ -477,17 +566,12 @@ impl RuntimeConfig {
                     .and_then(|v| v.parse::<u32>().ok())
                     .filter(|&w| w >= 1),
                 commit_conf_trim: r
-                    .var("DGQ_COMMIT_CONF_TRIM")
-                    .ok()
-                    .and_then(|v| v.parse::<f32>().ok())
-                    .filter(|&x| (0.0..=1.0).contains(&x))
-                    .unwrap_or(0.0),
+                    .ranged_f32("DGQ_COMMIT_CONF_TRIM", 0.0, 0.0, 1.0),
                 prefix_exit: r
-                    .var("DGQ_PREFIX_EXIT")
-                    .ok()
-                    .and_then(|v| v.parse::<f32>().ok())
-                    .filter(|&x| x > 0.0 && x <= 0.5)
-                    .unwrap_or(0.0),
+                    // 0.0 disables; the old filter REJECTED 1 and silently
+                    // fell back to 0.0 — i.e. `=1` disabled the lever it read
+                    // like it was enabling. Now `=1` is fatal with a message.
+                    .ranged_f32("DGQ_PREFIX_EXIT", 0.0, 0.0, 0.5),
             },
             perf: PerfFlags {
                 moe_fuse_gather: r.on_unless_zero("DGQ_MOE_FUSE_GATHER"),
@@ -708,3 +792,84 @@ impl Drop for TestGuard {
 
 mod accessors;
 pub use accessors::*;
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+
+    /// Parse with a fake env, returning the recorded rejections.
+    fn parse_with(vars: &[(&str, &str)]) -> (RuntimeConfig, Vec<String>) {
+        FAKE_ENV.with(|f| {
+            *f.borrow_mut() = vars
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        });
+        let out = RuntimeConfig::from_reader_checked(&EMPTY_ENV);
+        FAKE_ENV.with(|f| f.borrow_mut().clear());
+        out
+    }
+
+    /// THE footgun this exists for: `DGQ_PREFIX_EXIT=1` is out of the lever's
+    /// (0, 0.5] range, so it used to fall back to 0.0 — DISABLING the very
+    /// thing the operator was switching on, silently.
+    #[test]
+    fn out_of_range_float_is_rejected_not_silently_defaulted() {
+        let (cfg, errs) = parse_with(&[("DGQ_PREFIX_EXIT", "1")]);
+        assert_eq!(cfg.sampler.prefix_exit, 0.0, "value must not be adopted");
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("DGQ_PREFIX_EXIT"), "{errs:?}");
+        assert!(errs[0].contains("[0, 0.5]"), "range must be stated: {errs:?}");
+        // In range still works, and reports nothing.
+        let (cfg, errs) = parse_with(&[("DGQ_PREFIX_EXIT", "0.05")]);
+        assert_eq!(cfg.sampler.prefix_exit, 0.05);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    /// A typo'd bool used to be read as its "other" value, and which value
+    /// depended on whether the flag was opt-in or opt-out.
+    #[test]
+    fn unparseable_bool_is_rejected_under_both_patterns() {
+        // on_if_one (default OFF) and on_unless_zero (default ON).
+        let (_, errs) = parse_with(&[("DGQ_FREEZE", "yep"), ("DGQ_DENOISER_ARGMAX", "nope")]);
+        assert_eq!(errs.len(), 2, "{errs:?}");
+        assert!(errs.iter().any(|e| e.contains("DGQ_FREEZE")), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.contains("DGQ_DENOISER_ARGMAX")),
+            "{errs:?}"
+        );
+        // The documented spellings all parse, both directions.
+        for v in ["1", "true", "yes", "on", "0", "false", "no", "off", "TRUE"] {
+            let (_, errs) = parse_with(&[("DGQ_FREEZE", v)]);
+            assert!(errs.is_empty(), "{v} rejected: {errs:?}");
+        }
+    }
+
+    #[test]
+    fn unparseable_integer_is_rejected() {
+        let (_, errs) = parse_with(&[("DGQ_EMPTY_REPLY_RETRY", "lots")]);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("DGQ_EMPTY_REPLY_RETRY"), "{errs:?}");
+    }
+
+    /// Every bad flag in one run, so an operator fixes them in one pass
+    /// instead of one-per-restart.
+    #[test]
+    fn all_bad_flags_are_reported_together() {
+        let (_, errs) = parse_with(&[
+            ("DGQ_PREFIX_EXIT", "1"),
+            ("DGQ_FREEZE", "maybe"),
+            ("DGQ_EMPTY_REPLY_RETRY", "x"),
+        ]);
+        assert_eq!(errs.len(), 3, "{errs:?}");
+    }
+
+    /// Unset stays default and silent — the whole point is that only a
+    /// PRESENT-but-invalid value is fatal.
+    #[test]
+    fn unset_env_is_default_and_reports_nothing() {
+        let (cfg, errs) = parse_with(&[]);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg, RuntimeConfig::default());
+    }
+}
