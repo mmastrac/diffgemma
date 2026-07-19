@@ -256,12 +256,36 @@ Findings, in proposed fix order:
   `q8_ring_wrap_divergence_probe`) — see the q8 item below; crucially,
   the live ctx-100000 serve ran F16 (measured: `q8_auto_threshold_crossover`
   — 27.00 GiB working-set cap, q8 engages only at max_seq >= 178,176), so
-  the LIVE fork is NOT explained by q8 and REMAINS OPEN.**
-  Next live-fork suspects: non-256-aligned delta offsets (live reused
-  14,509 — the lineage matrix only exercised aligned deltas), deep-epoch
-  ring state, snapshot/restore seams. Environmental caveat RESOLVED —
-  the divergence is real and internal. Artifacts: scratchpad pmax/
+  the LIVE fork is NOT explained by q8.** Environmental caveat RESOLVED
+  — the divergence is real and internal. Artifacts: scratchpad pmax/
   turn11 traces, /tmp/logs (live), ops line 232.
+  **REPRODUCED ON f16, 2026-07-19 (`kv_lineage_unaligned_delta_offsets_*`,
+  KNOWN RED)**: the aligned matrix could not reach the live shape. The
+  sliding ring (4096) is a multiple of the 256-token prefill chunk, so a
+  256-ALIGNED resume can never put a chunk boundary mid-ring; every
+  matrix case was aligned (6144/5376) while the live turn resumed at
+  14,509 (residue 173). Feeding the live shape in forks — on the
+  production f16 path. Verdicts: misaligned + ONE-chunk delta = OK;
+  misaligned + MULTI-chunk delta = FORK; the live 14,509+266 = FORK.
+  The fork needs ALL THREE of wrapped ring + misaligned resume +
+  multi-chunk delta: below the ring every alignment x chunk-count combo
+  is clean (`kv_lineage_alignment_vs_chunkcount_sweep`), and the aligned
+  matrix passes at every size. Batched super-chunks EXONERATED
+  (`kv_lineage_unaligned_batch_bisect` — identical with prefill_batch
+  on/off). Position map: layers 0-5 clean across the whole ring, every
+  layer from 6 on diverges starting at EXACTLY the resume position,
+  max|delta| growing 0.5 -> 9.3 with depth — so the seed is earlier and
+  sub-ULP (f16 KV hides it until it grows), and layer 6 is a VISIBILITY
+  threshold, not the origin. NEXT: pin the phase-dependent reduction.
+  Leading hypothesis: the same absolute position occupies a different row
+  index / a different `kv_len`+`t_total` tiling in the two arms, so the
+  key-axis reduction is grouped differently (E17/E20 full-layer GEMM
+  attention tiles by `t_total`; mma2's tile start is 8-aligned in
+  ABSOLUTE position and so should be phase-free — start by diffing a
+  single layer's attention output between arms at one position, and
+  bisect flags: DGQ_GEMM_ATTN / DGQ_ATTN_TOPK / DGQ_ATTN_MMA). This is
+  a bit-identity break that AMPLIFIES through depth into a different
+  trajectory, which is exactly the field symptom.
 - **q8 fast-prefill is broken WHOLESALE (forensics 2026-07-18,
   `q8_ring_wrap_divergence_probe` — supersedes the "ring-wrap requant
   seam" framing)**: in any q8 session the fast-prefill forward goes

@@ -30,6 +30,335 @@ fn kv_lineage_paths_are_fingerprint_identical() {
     lineage_matrix(false);
 }
 
+/// f16 lineage across delta offsets that are NOT 256-aligned — the axis
+/// [`lineage_matrix`] structurally cannot reach.
+///
+/// The sliding ring (4096) is a multiple of the 256-token prefill chunk, so
+/// with a 256-ALIGNED resume offset a chunk can never straddle the ring
+/// wrap. Every case in the matrix was aligned (offsets 6144 / 5376), while
+/// the diverging live turn resumed at 14,509 (residue 173) — so a
+/// wrap-straddling chunk, and chunk-phase effects generally, were never
+/// under test. Cases here: a plain misaligned resume, one whose delta chunk
+/// STRADDLES the ring wrap, and the live turn's exact shape
+/// (14,509 + 266). Fresh vs prefix+delta must still agree.
+///
+/// Buffers are scrubbed between arms: a `reset_kv` alone leaves residue in
+/// rows the next build never writes, which is what made the q8 arm look
+/// path-dependent (see `q8_ring_wrap_divergence_probe`).
+///
+/// KNOWN RED (2026-07-19) — and it reproduces the LIVE configuration on the
+/// production f16 path, so this is the real "KV-lineage drift", not q8.
+/// Verdicts:
+///   - misaligned resume, delta fits ONE chunk           -> OK
+///   - misaligned resume, delta spans TWO chunks         -> FORK
+///   - the live turn's exact shape (14,509 + 266)        -> FORK
+/// The fork needs all three of: a WRAPPED ring, a MISALIGNED resume, and a
+/// MULTI-CHUNK delta. Any one removed and it passes — below the ring
+/// (`kv_lineage_alignment_vs_chunkcount_sweep`, totals < 4096) every
+/// alignment x chunk-count combination is clean, and the original
+/// 256-ALIGNED matrix passes at every size. Batched super-chunks are
+/// EXONERATED (`kv_lineage_unaligned_batch_bisect`: identical verdicts with
+/// `prefill_batch` on and off).
+///
+/// Position map (`kv_lineage_fork_position_map`): layers 0-5 are clean
+/// across the whole ring; every layer from 6 on diverges starting at
+/// EXACTLY the resume position, with |delta| grid 0.5 -> 9.3 by depth.
+/// That amplification says the seed is earlier and sub-ULP (stored KV is
+/// f16, so a tiny difference is invisible until it grows past the rounding
+/// step) — "born at layer 6" is a VISIBILITY threshold, not the origin.
+/// Leading hypothesis: a reduction whose grouping depends on chunk PHASE
+/// (the same absolute position sits at a different row index / a different
+/// `kv_len` + `t_total` tiling in the two arms), so the two arms sum the
+/// same values in a different order. Not yet pinned — see PLAN.
+#[test]
+#[ignore = "KNOWN RED: wrapped-ring + misaligned + multi-chunk delta forks (PLAN correctness debt)"]
+fn kv_lineage_unaligned_delta_offsets_are_fingerprint_identical() {
+    unaligned_matrix(None);
+}
+
+/// Same matrix with the batched prefill super-chunk forced OFF, to test its
+/// "bit-identical to sequential chunks" contract at misaligned offsets.
+#[test]
+#[ignore = "diagnostic: unaligned lineage matrix with DGQ_PREFILL_BATCH forced on/off"]
+fn kv_lineage_unaligned_batch_bisect() {
+    eprintln!("--- prefill_batch = true (production default)");
+    let on = std::panic::catch_unwind(|| unaligned_matrix(Some(true))).is_ok();
+    eprintln!("--- prefill_batch = false (plain 256-chunks)");
+    let off = std::panic::catch_unwind(|| unaligned_matrix(Some(false))).is_ok();
+    eprintln!("VERDICT: batch_on_clean={on} batch_off_clean={off}");
+}
+
+/// Sweep the two candidate axes independently: resume ALIGNMENT and delta
+/// CHUNK COUNT, at totals below the sliding ring (4096) so the ring cannot
+/// participate. Fast (a few seconds per case).
+#[test]
+#[ignore = "diagnostic: isolates resume-alignment vs delta-chunk-count, ring excluded"]
+fn kv_lineage_alignment_vs_chunkcount_sweep() {
+    let Some(dir) = model_dir() else {
+        return;
+    };
+    let mut fl = crate::flags::RuntimeConfig::default();
+    fl.kv.q8_override = Some(false);
+    let _g = crate::flags::install_for_test(fl);
+    let cfg = StepGenerateConfig::from_generate(
+        7,
+        64,
+        16384,
+        N_LAYERS,
+        sample::sampler_for_steps(48, false),
+        false,
+    );
+    let (mut session, _) = StepGenerateSession::open(&dir, &cfg, None).expect("session");
+    // total 2000 < ring 4096: no wrap anywhere. Resume aligned vs not,
+    // delta spanning one chunk vs two.
+    let cases = [
+        (2000usize, 256usize),  // aligned resume 1744? no: 1744%256=208
+        (2048, 256),            // resume 1792 = 7*256 ALIGNED, 1 chunk
+        (2048, 512),            // resume 1536 ALIGNED, 2 chunks
+        (2000, 200),            // resume 1800 misaligned, 1 chunk
+        (2000, 300),            // resume 1700 misaligned, 2 chunks
+        (2000, 257),            // resume 1743 misaligned, 2 chunks (just over)
+        (2000, 255),            // resume 1745 misaligned, 1 chunk (just under)
+    ];
+    for (total, delta) in cases {
+        let offset = total - delta;
+        let ids = synth_ids(total);
+        session.scrub_kv_for_test();
+        session.extend_kv(&ids).expect("fresh");
+        let fresh = session.live_kv_fingerprint();
+        session.scrub_kv_for_test();
+        session.extend_kv(&ids[..offset]).expect("prefix");
+        session.extend_kv(&ids[offset..]).expect("delta");
+        let two = session.live_kv_fingerprint();
+        eprintln!(
+            "sweep total={total:5} delta={delta:4} resume={offset:5} \
+             (aligned={:5}, delta_chunks={}): {}",
+            offset % 256 == 0,
+            delta.div_ceil(256),
+            if fresh == two { "OK" } else { "FORK" },
+        );
+    }
+}
+
+/// WHICH positions diverge, for the live-shape case. Compares the readable
+/// window position-by-position between the fresh and prefix+delta arms and
+/// reports contiguous differing ranges, per layer kind — the fingerprint
+/// only says "something differs".
+#[test]
+#[ignore = "diagnostic: locates the diverging POSITIONS of the wrapped misaligned fork"]
+fn kv_lineage_fork_position_map() {
+    let Some(dir) = model_dir() else {
+        return;
+    };
+    let mut fl = crate::flags::RuntimeConfig::default();
+    fl.kv.q8_override = Some(false);
+    let _g = crate::flags::install_for_test(fl);
+    let max_seq = 16384usize;
+    let cfg = StepGenerateConfig::from_generate(
+        7,
+        64,
+        max_seq,
+        N_LAYERS,
+        sample::sampler_for_steps(48, false),
+        false,
+    );
+    let (mut session, _) = StepGenerateSession::open(&dir, &cfg, None).expect("session");
+    let (total, delta) = (14775usize, 266usize);
+    let offset = total - delta;
+    let ids = synth_ids(total);
+
+    // Snapshot each layer's whole region so positions can be compared by slot.
+    let grab = |s: &StepGenerateSession| -> Vec<Vec<u8>> {
+        use objc2_metal::MTLBuffer as _;
+        let buf = s.kv_buffer_for_test();
+        let layout = s.layout_for_test();
+        let src =
+            unsafe { std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, buf.length()) };
+        (0..N_LAYERS)
+            .map(|i| {
+                let l = &layout.layers[i];
+                let slots = if l.kv_ring_mask != 0 {
+                    l.kv_ring_mask as usize + 1
+                } else {
+                    max_seq
+                };
+                let bytes = crate::metal::step_kv::kv_region_bytes(
+                    l.n_kv_heads,
+                    l.head_dim,
+                    slots,
+                    crate::shaders::kv_quant::KvFormat::F16,
+                ) as usize;
+                let base = l.kv_region as usize;
+                src[base..base + bytes].to_vec()
+            })
+            .collect()
+    };
+
+    session.scrub_kv_for_test();
+    session.extend_kv(&ids).expect("fresh");
+    let fresh = grab(&session);
+    session.scrub_kv_for_test();
+    session.extend_kv(&ids[..offset]).expect("prefix");
+    session.extend_kv(&ids[offset..]).expect("delta");
+    let two = grab(&session);
+
+    let layout = *session.layout_for_test();
+    let window = 1024usize;
+    // Which layers differ at all, and by how much (K vs V, max |delta|).
+    for li in 0..N_LAYERS {
+        let l = &layout.layers[li];
+        let nkv = l.n_kv_heads as usize;
+        let hd = l.head_dim as usize;
+        let row_b = 2 * hd;
+        let stride = 2 * nkv * row_b;
+        // Ring layers: scan the WHOLE ring (every live position), not just
+        // the fingerprint window — a query reads back `window` positions, so
+        // divergence below the window still feeds the forward.
+        let (lo, hi) = if l.kv_ring_mask != 0 {
+            (total.saturating_sub(l.kv_ring_mask as usize + 1), total)
+        } else {
+            (0, total)
+        };
+        let (mut k_diff, mut v_diff, mut max_abs) = (0usize, 0usize, 0.0f32);
+        let mut first_diff = None;
+        for p in lo..hi {
+            let slot = if l.kv_ring_mask != 0 {
+                p & l.kv_ring_mask as usize
+            } else {
+                p
+            };
+            for row in 0..2 * nkv {
+                let o = slot * stride + row * row_b;
+                if fresh[li][o..o + row_b] != two[li][o..o + row_b] {
+                    if row < nkv {
+                        k_diff += 1;
+                    } else {
+                        v_diff += 1;
+                    }
+                    first_diff.get_or_insert(p);
+                    for d in (0..row_b).step_by(2) {
+                        let a = crate::shaders::f16::f16_bits_to_f32(u16::from_le_bytes([
+                            fresh[li][o + d],
+                            fresh[li][o + d + 1],
+                        ]));
+                        let b = crate::shaders::f16::f16_bits_to_f32(u16::from_le_bytes([
+                            two[li][o + d],
+                            two[li][o + d + 1],
+                        ]));
+                        max_abs = max_abs.max((a - b).abs());
+                    }
+                }
+            }
+        }
+        if k_diff + v_diff > 0 {
+            eprintln!(
+                "fork-layers layer{li:2} ({}, scanned [{lo},{hi})): K rows differ={k_diff} \
+                 V rows differ={v_diff} first_diff_pos={first_diff:?} max|delta|={max_abs:.6}",
+                if l.kv_ring_mask != 0 { "ring" } else { "linear" },
+            );
+        }
+    }
+    for li in [0usize, 1, 5, 29] {
+        let l = &layout.layers[li];
+        let stride = 2 * l.n_kv_heads as usize * (2 * l.head_dim as usize);
+        // Positions the fingerprint actually reads.
+        let (lo, hi) = if l.kv_ring_mask != 0 {
+            (total.saturating_sub(window), total)
+        } else {
+            (0, total)
+        };
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for p in lo..hi {
+            let slot = if l.kv_ring_mask != 0 {
+                p & l.kv_ring_mask as usize
+            } else {
+                p
+            };
+            let o = slot * stride;
+            let differs = fresh[li][o..o + stride] != two[li][o..o + stride];
+            match (differs, runs.last_mut()) {
+                (true, Some(r)) if r.1 == p => r.1 = p + 1,
+                (true, _) => runs.push((p, p + 1)),
+                _ => {}
+            }
+        }
+        eprintln!(
+            "fork-map layer{li:2} ({}, window=[{lo},{hi})): {} differing run(s) {:?}",
+            if l.kv_ring_mask != 0 { "ring" } else { "linear" },
+            runs.len(),
+            &runs[..runs.len().min(6)],
+        );
+    }
+    eprintln!(
+        "reference points: resume={offset} (chunk1 {offset}..{}), chunk2 {}..{total}, \
+         window starts {}, ring slot of resume {}",
+        offset + 256,
+        offset + 256,
+        total - window,
+        offset % 4096,
+    );
+}
+
+fn unaligned_matrix(batch: Option<bool>) {
+    let Some(dir) = model_dir() else {
+        return;
+    };
+    let mut fl = crate::flags::RuntimeConfig::default();
+    fl.kv.q8_override = Some(false); // f16: what production actually runs
+    if let Some(b) = batch {
+        fl.perf.prefill_batch = b;
+    }
+    let _g = crate::flags::install_for_test(fl);
+    let max_seq = 16384usize;
+    let cfg = StepGenerateConfig::from_generate(
+        7,
+        64,
+        max_seq,
+        N_LAYERS,
+        sample::sampler_for_steps(48, false),
+        false,
+    );
+    let (mut session, _) = StepGenerateSession::open(&dir, &cfg, None).expect("session");
+    let ring = 4096usize;
+
+    // (total, delta, why)
+    let cases = [
+        (6400usize, 173usize, "misaligned resume, no wrap crossing"),
+        (8300, 300, "delta chunk STRADDLES the ring wrap"),
+        (14775, 266, "the live turn's exact shape (resume 14,509)"),
+    ];
+    // Report the whole matrix, then assert — a per-case panic hides the
+    // cells after it, and which cells fail IS the diagnosis.
+    let mut failures = Vec::new();
+    for (total, delta, why) in cases {
+        let offset = total - delta;
+        let ids = synth_ids(total);
+        session.scrub_kv_for_test();
+        session.extend_kv(&ids).expect("fresh prefill");
+        let fresh = session.live_kv_fingerprint();
+        session.scrub_kv_for_test();
+        session.extend_kv(&ids[..offset]).expect("prefix prefill");
+        session.extend_kv(&ids[offset..]).expect("delta extend");
+        let two_path = session.live_kv_fingerprint();
+        let straddles = (offset % ring) + delta.min(256) > ring;
+        let verdict = if fresh == two_path { "OK  " } else { "FORK" };
+        eprintln!(
+            "lineage total={total:6} delta={delta:4} resume={offset:6} \
+             (256-residue {:3}, ring {:4}->{:4}, straddles_wrap={straddles:5}): {verdict} — {why}",
+            offset % 256,
+            offset % ring,
+            (offset + delta) % ring,
+        );
+        if fresh != two_path {
+            failures.push(format!("total={total} delta={delta} resume={offset} ({why})"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "delta-extend KV diverges from fresh prefill: {failures:?}"
+    );
+}
+
 /// Same matrix on Q8 KV.
 ///
 /// KNOWN RED — but NOT a ring/requant seam (forensics 2026-07-18, see
@@ -42,10 +371,10 @@ fn kv_lineage_paths_are_fingerprint_identical() {
 /// produced IDENTICAL garbage; at wrap, chunk grouping changes which
 /// bands survive ring overwrites, so fingerprints fork. f16 is fully
 /// healthy (path- and chunking-independent, every row written). The
-/// production auto-q8 threshold is ~186k tokens on 36 GB, so live serve
-/// (ctx 100k) always ran f16 — the live reuse-vs-fresh fork is NOT
-/// explained by this. Un-ignore when the q8 read path is fixed and
-/// harness-covered.
+/// production auto-q8 threshold is max_seq 178,176 on this 36 GB box
+/// (measured: `q8_auto_threshold_crossover`), so live serve (ctx 100k)
+/// always ran f16 — the live reuse-vs-fresh fork is NOT explained by
+/// this. Un-ignore when the q8 read path is fixed and harness-covered.
 #[test]
 #[ignore = "KNOWN RED: q8 fast-prefill forward dies after layer 0 (PLAN correctness debt)"]
 fn kv_lineage_paths_are_fingerprint_identical_q8() {
