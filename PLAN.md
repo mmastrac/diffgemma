@@ -274,18 +274,36 @@ Findings, in proposed fix order:
   (`kv_lineage_unaligned_batch_bisect` — identical with prefill_batch
   on/off). Position map: layers 0-5 clean across the whole ring, every
   layer from 6 on diverges starting at EXACTLY the resume position,
-  max|delta| growing 0.5 -> 9.3 with depth — so the seed is earlier and
-  sub-ULP (f16 KV hides it until it grows), and layer 6 is a VISIBILITY
-  threshold, not the origin. NEXT: pin the phase-dependent reduction.
-  Leading hypothesis: the same absolute position occupies a different row
-  index / a different `kv_len`+`t_total` tiling in the two arms, so the
-  key-axis reduction is grouped differently (E17/E20 full-layer GEMM
-  attention tiles by `t_total`; mma2's tile start is 8-aligned in
-  ABSOLUTE position and so should be phase-free — start by diffing a
-  single layer's attention output between arms at one position, and
-  bisect flags: DGQ_GEMM_ATTN / DGQ_ATTN_TOPK / DGQ_ATTN_MMA). This is
-  a bit-identity break that AMPLIFIES through depth into a different
-  trajectory, which is exactly the field symptom.
+  max|delta| growing 0.5 -> 9.3 with depth.
+  **CULPRIT PINNED: E20 top-k sparse attention (`DGQ_ATTN_TOPK`, default
+  ON).** `kv_lineage_fork_attention_bisect` runs the live case under each
+  attention lever; ONLY `attn_topk=0` comes back clean (gemm_attn=0 /
+  attn_mma=0 / attn_mma_full=0 all still FORK). Mechanism: top-k's
+  parameters come from the DISPATCH's `t_total = kv_len + canvas`, not
+  from the query's own causal context, so the same absolute position gets
+  a different approximation depending on how the prefill was chunked.
+  `attn_topk_k_for` = `(t_total/128).clamp(64,512)`, and in the live case
+  one query gets **k=114 fresh vs k=115 reused** (then 116/115, 116/117)
+  — a different NUMBER OF ATTENDED KEYS for identical Q and identical KV.
+  That is a discrete approximation change, not a rounding difference,
+  which is why it amplifies into a different trajectory. CAVEAT: case 2
+  forks even where k is EQUAL in both arms, so the `t_total`-dependent
+  selection/tiling is a SECOND phase-dependent input, not yet isolated.
+  Layer-6 onset is now explained (and an earlier "sub-ULP seed" reading
+  RETRACTED): top-k runs on FULL layers (5,11,17,23,29) and a layer
+  writes KV BEFORE its attention, so layer 5's KV is clean while its
+  attention OUTPUT differs — layer 6 is "first top-k layer + 1", not a
+  visibility threshold. Don't hunt a tiny seed in layers 0-5.
+  FIX DIRECTION: derive k (and the selection) from the query's own causal
+  key count (`kv_len + tok`) instead of the dispatch `t_total` —
+  phase-invariant, and should keep E20's -19% prefill win. Then re-gate:
+  un-ignore `kv_lineage_unaligned_delta_offsets_*`, and re-check the
+  decode arm (`DGQ_ATTN_TOPK_DECODE`, also default on) for the same
+  dependence. DECISION FOR THE USER: until fixed, every multi-turn serve
+  session runs an approximation whose parameters depend on resume
+  history, so reused-KV turns are not reproducible from fresh prefill —
+  this is the measured field symptom, and `DGQ_ATTN_TOPK=0` is the
+  immediate (perf-costing) mitigation.
 - **q8 fast-prefill is broken WHOLESALE (forensics 2026-07-18,
   `q8_ring_wrap_divergence_probe` — supersedes the "ring-wrap requant
   seam" framing)**: in any q8 session the fast-prefill forward goes

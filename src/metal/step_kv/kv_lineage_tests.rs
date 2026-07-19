@@ -60,16 +60,33 @@ fn kv_lineage_paths_are_fingerprint_identical() {
 /// EXONERATED (`kv_lineage_unaligned_batch_bisect`: identical verdicts with
 /// `prefill_batch` on and off).
 ///
-/// Position map (`kv_lineage_fork_position_map`): layers 0-5 are clean
-/// across the whole ring; every layer from 6 on diverges starting at
-/// EXACTLY the resume position, with |delta| grid 0.5 -> 9.3 by depth.
-/// That amplification says the seed is earlier and sub-ULP (stored KV is
-/// f16, so a tiny difference is invisible until it grows past the rounding
-/// step) — "born at layer 6" is a VISIBILITY threshold, not the origin.
-/// Leading hypothesis: a reduction whose grouping depends on chunk PHASE
-/// (the same absolute position sits at a different row index / a different
-/// `kv_len` + `t_total` tiling in the two arms), so the two arms sum the
-/// same values in a different order. Not yet pinned — see PLAN.
+/// CULPRIT: **E20 top-k sparse attention** (`DGQ_ATTN_TOPK`, default ON).
+/// `kv_lineage_fork_attention_bisect` runs the live case under each
+/// attention lever; only `attn_topk=0` comes back clean (gemm_attn=0,
+/// attn_mma=0, attn_mma_full=0 all still FORK).
+///
+/// Mechanism: top-k's parameters are derived from the DISPATCH's
+/// `t_total = kv_len + canvas`, not from the query's own causal context —
+/// so the same absolute position gets a different approximation depending
+/// on how the prefill was chunked. Concretely, `attn_topk_k_for` computes
+/// `k = (t_total/128).clamp(64,512)`, and in the live case the same query
+/// gets k=114 in the fresh arm vs k=115 in the delta arm (also 116 vs 115,
+/// 116 vs 117 further in) — a different NUMBER OF ATTENDED KEYS for
+/// identical Q and identical KV. Note case 2 forks even where k is EQUAL in
+/// both arms, so the t_total-dependent selection/tiling is a second
+/// phase-dependent input; that one is not yet isolated.
+///
+/// This also explains the layer pattern, and corrects an earlier misread:
+/// top-k runs on FULL layers (5, 11, 17, 23, 29), and a layer's KV is
+/// written BEFORE its attention (QkRopeKv -> Attention). So layer 5's KV is
+/// identical while its attention OUTPUT differs, and the first KV to carry
+/// the difference is layer 6. **Layer 6 is "first top-k layer + 1", NOT a
+/// sub-ULP visibility threshold** — do not go hunting for a tiny seed in
+/// layers 0-5; there isn't one.
+///
+/// Fix direction: make k (and the selection) depend on the query's own
+/// causal key count (`kv_len + tok`) rather than the dispatch's `t_total`,
+/// which is phase-invariant and should preserve E20's win.
 #[test]
 #[ignore = "KNOWN RED: wrapped-ring + misaligned + multi-chunk delta forks (PLAN correctness debt)"]
 fn kv_lineage_unaligned_delta_offsets_are_fingerprint_identical() {
@@ -297,6 +314,71 @@ fn kv_lineage_fork_position_map() {
         total - window,
         offset % 4096,
     );
+}
+
+/// Which attention path carries the phase dependence? Runs the live-shape
+/// case under each attention lever. A config that comes back OK is the
+/// culprit's off-switch; all-FORK means the phase dependence is not in
+/// attention at all (look at the MoE/GEMM stages next).
+#[test]
+#[ignore = "diagnostic: bisects the lineage fork across attention levers"]
+fn kv_lineage_fork_attention_bisect() {
+    let Some(dir) = model_dir() else {
+        return;
+    };
+    // (label, mutator)
+    type Tweak = (&'static str, fn(&mut crate::flags::RuntimeConfig));
+    let configs: &[Tweak] = &[
+        ("baseline (production defaults)", |_| {}),
+        ("gemm_attn=0 (E17 off, full layers)", |f| {
+            f.perf.gemm_attn = false;
+        }),
+        ("attn_topk=0 (E20 off)", |f| {
+            f.perf.attn_topk = false;
+        }),
+        ("attn_mma=0 (scalar sliding attn)", |f| {
+            f.perf.attn_mma = false;
+        }),
+        ("attn_mma_full=0", |f| {
+            f.perf.attn_mma_full = false;
+        }),
+        ("all attention levers off", |f| {
+            f.perf.gemm_attn = false;
+            f.perf.attn_topk = false;
+            f.perf.attn_mma = false;
+            f.perf.attn_mma_full = false;
+        }),
+    ];
+    let (total, delta) = (14775usize, 266usize);
+    let offset = total - delta;
+    let ids = synth_ids(total);
+    for (label, tweak) in configs {
+        let mut fl = crate::flags::RuntimeConfig::default();
+        fl.kv.q8_override = Some(false);
+        tweak(&mut fl);
+        let _g = crate::flags::install_for_test(fl);
+        let cfg = StepGenerateConfig::from_generate(
+            7,
+            64,
+            16384,
+            N_LAYERS,
+            sample::sampler_for_steps(48, false),
+            false,
+        );
+        let (mut s, _) = StepGenerateSession::open(&dir, &cfg, None).expect("session");
+        s.scrub_kv_for_test();
+        s.extend_kv(&ids).expect("fresh");
+        let fresh = s.live_kv_fingerprint();
+        s.scrub_kv_for_test();
+        s.extend_kv(&ids[..offset]).expect("prefix");
+        s.extend_kv(&ids[offset..]).expect("delta");
+        let two = s.live_kv_fingerprint();
+        eprintln!(
+            "attn-bisect {:38}: {}",
+            label,
+            if fresh == two { "OK   <-- suspect" } else { "FORK" }
+        );
+    }
 }
 
 fn unaligned_matrix(batch: Option<bool>) {
