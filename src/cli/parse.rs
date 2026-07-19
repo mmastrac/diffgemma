@@ -51,6 +51,7 @@ pub(crate) fn parse_cli() -> Cli {
     let mut census_baseline: Option<String> = None;
     let mut census_out: Option<PathBuf> = None;
     let mut census_tau: f32 = 0.9;
+    let mut census_analyze: Option<PathBuf> = None;
     let mut golden_bless = false;
     let mut write_golden: Option<String> = None;
     let mut write_trace: Option<PathBuf> = None;
@@ -256,6 +257,7 @@ pub(crate) fn parse_cli() -> Cli {
                 }
             }
             "--baseline" => census_baseline = args.next(),
+            "--analyze" => census_analyze = args.next().map(PathBuf::from),
             "--out" => census_out = args.next().map(PathBuf::from),
             "--tau" => {
                 if let Some(v) = args.next() {
@@ -549,6 +551,7 @@ pub(crate) fn parse_cli() -> Cli {
             out_dir: census_out.clone(),
             tau: census_tau,
             steps: steps_production,
+            analyze: census_analyze.clone(),
         },
         Some("manifest") => Command::Manifest,
         Some("replay") => Command::Replay {

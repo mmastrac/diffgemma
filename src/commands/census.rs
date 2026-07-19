@@ -213,6 +213,35 @@ fn scan_trace(path: &Path, tau: f32) -> Metrics {
     m
 }
 
+/// Scan a directory of traces WITHOUT running anything: the same report and
+/// the same gates over an existing campaign's output. Keeps trace analysis
+/// inside the binary (no side-car script to drift from the scanner the
+/// command itself uses). Files are `<arm>.<battery>.<seed>.jsonl`.
+fn analyze_dir(dir: &Path, tau: f32) -> BTreeMap<(String, String), Metrics> {
+    let mut out: BTreeMap<(String, String), Metrics> = BTreeMap::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        eprintln!("census: cannot read {}", dir.display());
+        return out;
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
+        .collect();
+    files.sort();
+    for f in files {
+        let stem = f.file_stem().unwrap_or_default().to_string_lossy().to_string();
+        let mut parts = stem.split('.');
+        let arm = parts.next().unwrap_or("?").to_string();
+        let battery = parts.next().unwrap_or("all").to_string();
+        let m = scan_trace(&f, tau);
+        out.entry((arm, battery))
+            .and_modify(|acc| acc.merge(&m))
+            .or_insert(m);
+    }
+    out
+}
+
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_census_cmd(
@@ -225,7 +254,30 @@ pub(crate) fn run_census_cmd(
     out_dir: Option<&Path>,
     tau: f32,
     steps: usize,
+    analyze: Option<&Path>,
 ) -> ExitCode {
+    // Analyze-only: no arms, no GPU, just the report + gates over traces.
+    if let Some(dir) = analyze {
+        let results = analyze_dir(dir, tau);
+        if results.is_empty() {
+            eprintln!("census: no *.jsonl traces in {}", dir.display());
+            return ExitCode::FAILURE;
+        }
+        let mut gates = Vec::new();
+        for spec in gate_specs {
+            match parse_gate(spec) {
+                Ok(g) => gates.push(g),
+                Err(e) => {
+                    eprintln!("census: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        // Traces carry no pass/fail (that is the battery's verdict), so a
+        // `passed` gate is meaningless here; report and gate on counts.
+        return report(&results, &gates, baseline, out_dir, tau, seeds, false);
+    }
+
     // ---- Parse + VALIDATE everything before any GPU time is spent. -------
     let mut arms = Vec::new();
     for spec in arm_specs {
@@ -337,19 +389,39 @@ pub(crate) fn run_census_cmd(
         }
     }
 
-    // ---- Report. ---------------------------------------------------------
+    report(&results, &gates, baseline, out_dir, tau, seeds, true)
+}
+
+/// Print the matrix, optionally persist it, then evaluate gates.
+/// `with_pass` marks whether the pass/fail column is meaningful (it is not
+/// in analyze-only mode, where nothing was executed).
+fn report(
+    results: &BTreeMap<(String, String), Metrics>,
+    gates: &[Gate],
+    baseline: Option<&str>,
+    out_dir: Option<&Path>,
+    tau: f32,
+    seeds: &[u64],
+    with_pass: bool,
+) -> ExitCode {
     println!();
     println!(
         "{:<12} {:<9} {:>6} {:>7} {:>12} {:>6} {:>5} {:>6} {:>9} {:>10}",
         "arm", "battery", "pass", "blocks", "commit_rows", "hard", "dup", "trims",
         "cont/1k", "steps/blk"
     );
-    for ((arm, battery), m) in &results {
+    for ((arm, battery), m) in results {
         println!(
             "{:<12} {:<9} {:>6} {:>7} {:>12} {:>6} {:>5} {:>6} {:>9.2} {:>10.1}",
             arm,
             battery,
-            if m.passed { "yes" } else { "NO" },
+            if !with_pass {
+                "-"
+            } else if m.passed {
+                "yes"
+            } else {
+                "NO"
+            },
             m.blocks,
             m.committed_rows,
             m.hard,
@@ -394,8 +466,8 @@ pub(crate) fn run_census_cmd(
     }
     println!();
     let mut failed = false;
-    for ((arm, battery), m) in &results {
-        for g in &gates {
+    for ((arm, battery), m) in results {
+        for g in gates {
             // `battery.metric` targets one battery; a bare metric applies to all.
             let (want_battery, metric) = match g.metric.split_once('.') {
                 Some((b, k)) => (Some(b), k),

@@ -530,6 +530,7 @@ pub(crate) fn dispatch(cli: Cli) -> ExitCode {
             out_dir,
             tau,
             steps,
+            analyze,
         } => census::run_census_cmd(
             &cli.model_dir,
             &arms,
@@ -540,6 +541,7 @@ pub(crate) fn dispatch(cli: Cli) -> ExitCode {
             out_dir.as_deref(),
             tau,
             steps,
+            analyze.as_deref(),
         ),
         Command::Manifest => {
             print!("{}", crate::shaders::manifest::render_toml());

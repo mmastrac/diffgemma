@@ -338,6 +338,8 @@ pub(crate) enum Command {
         /// Dup-tier p_max threshold used when COUNTING warts (not a lever).
         tau: f32,
         steps: usize,
+        /// Report on an existing trace dir instead of running (no GPU).
+        analyze: Option<PathBuf>,
     },
     /// Golden byte-identity pack — the Tier-1 refactor gate (task #73).
     /// Print the generated kernel FC-axis manifest (TOML) to stdout.
