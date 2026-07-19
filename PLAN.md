@@ -294,16 +294,49 @@ Findings, in proposed fix order:
   writes KV BEFORE its attention, so layer 5's KV is clean while its
   attention OUTPUT differs — layer 6 is "first top-k layer + 1", not a
   visibility threshold. Don't hunt a tiny seed in layers 0-5.
-  FIX DIRECTION: derive k (and the selection) from the query's own causal
-  key count (`kv_len + tok`) instead of the dispatch `t_total` —
-  phase-invariant, and should keep E20's -19% prefill win. Then re-gate:
-  un-ignore `kv_lineage_unaligned_delta_offsets_*`, and re-check the
-  decode arm (`DGQ_ATTN_TOPK_DECODE`, also default on) for the same
-  dependence. DECISION FOR THE USER: until fixed, every multi-turn serve
-  session runs an approximation whose parameters depend on resume
-  history, so reused-KV turns are not reproducible from fresh prefill —
-  this is the measured field symptom, and `DGQ_ATTN_TOPK=0` is the
-  immediate (perf-costing) mitigation.
+  **FIXED 2026-07-19**: `attn_topk_softmax` now derives k per row from
+  that row's own `n_valid` (causal key count = absolute position + 1), a
+  phase-invariant quantity; the host ships the DIVISOR
+  (`attn_topk_k_cfg` = fixed_k, dyn_divisor, k_min, k_max) instead of a
+  resolved k, and the old host-side `attn_topk_k_for` is DELETED so it
+  can't be reused. Non-causal (denoise) is unchanged by construction —
+  there `n_valid == t_total` already — so the decode arm
+  (`DGQ_ATTN_TOPK_DECODE`) needed no change. The lineage gate is green
+  3/3 including the live shape and is now UN-IGNORED. The earlier
+  "second phase-dependent input" caveat is resolved: per-row k also
+  closed the case that forked at equal-k positions (a wrong k anywhere
+  in a full layer perturbs the shared hidden stream).
+  The per-row count is rounded UP to the prefill CHUNK GRID (passed
+  explicitly by the host, NOT inferred from the dispatch row count), which
+  is the `t_total` an aligned fresh chunk would have had for that
+  position — so k is phase-invariant AND numerically unchanged.
+  GATE STATUS: golden **8/8 byte-identical**, smoketest 17/17 x{42,7,123},
+  longctx 4/4 + retrieval 8/8 + drift 0.0%. No re-bless needed: fresh
+  prefill is bit-identical, only reused-KV paths move (into agreement).
+  Deriving k from the RAW per-row count instead is also phase-invariant
+  but shrinks k for early rows and broke golden 7/8 — the round-up is
+  load-bearing, don't "simplify" it.
+- **Long-context generation is NOT run-to-run reproducible (found
+  2026-07-19, cause NOT isolated)**: the UNMODIFIED binary, same seed
+  (42), same prompt, run twice, produced different longctx answers —
+  doc_13k "It reached **3.07 TF/s**" (10 steps) vs "The 64x64x32 tile
+  reached a rate of" (12 steps), and doc_20k likewise. This is a
+  measurement-infrastructure problem before it is a quality one: it
+  silently invalidates any single-sample prose A/B at long context, and
+  it is very likely a chunk of what this PLAN records elsewhere as
+  "trajectory luck". It cost a wrong conclusion in this very session — a
+  dropped word at doc_20k was attributed to an E20 change until the
+  baseline was re-run and produced the same wart unprompted. Candidates,
+  untested: pipeline-ARCHIVE cold-vs-warm compile differences (the two
+  differing runs were the first and second for that source hash), a
+  residual race (the top-k emission race was already closed by cd66294,
+  so this would be elsewhere), or nondeterministic reduction order in a
+  long-context kernel. NEXT: pin it with a generation-level repro (same
+  binary, same seed, N runs, diff), then decide; until then treat every
+  long-context prose comparison as needing REPLICATED samples per arm,
+  not one. Note the generation-free KV fingerprint tests ARE stable
+  (`q8_ring_wrap_divergence_probe` F1-vs-F2), so KV-level gates are
+  unaffected.
 - **q8 fast-prefill is broken WHOLESALE (forensics 2026-07-18,
   `q8_ring_wrap_divergence_probe` — supersedes the "ring-wrap requant
   seam" framing)**: in any q8 session the fast-prefill forward goes

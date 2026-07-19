@@ -46,49 +46,49 @@ fn kv_lineage_paths_are_fingerprint_identical() {
 /// rows the next build never writes, which is what made the q8 arm look
 /// path-dependent (see `q8_ring_wrap_divergence_probe`).
 ///
-/// KNOWN RED (2026-07-19) — and it reproduces the LIVE configuration on the
-/// production f16 path, so this is the real "KV-lineage drift", not q8.
-/// Verdicts:
-///   - misaligned resume, delta fits ONE chunk           -> OK
-///   - misaligned resume, delta spans TWO chunks         -> FORK
-///   - the live turn's exact shape (14,509 + 266)        -> FORK
-/// The fork needs all three of: a WRAPPED ring, a MISALIGNED resume, and a
-/// MULTI-CHUNK delta. Any one removed and it passes — below the ring
+/// This reproduces the LIVE configuration on the production f16 path — it
+/// was the real "KV-lineage drift" (not q8), and it is FIXED (2026-07-19):
+/// E20's kv-adaptive k is now derived per row inside the kernel from that
+/// row's own causal key count, instead of host-side from the dispatch's
+/// `t_total`. All three cases pass; before the fix the two multi-chunk ones
+/// forked.
+///
+/// Kept as a GATE because the failing configuration is one the aligned
+/// matrix structurally cannot reach: the fork needed all three of a WRAPPED
+/// ring, a MISALIGNED resume, and a MULTI-CHUNK delta — below the ring
 /// (`kv_lineage_alignment_vs_chunkcount_sweep`, totals < 4096) every
 /// alignment x chunk-count combination is clean, and the original
 /// 256-ALIGNED matrix passes at every size. Batched super-chunks are
 /// EXONERATED (`kv_lineage_unaligned_batch_bisect`: identical verdicts with
 /// `prefill_batch` on and off).
 ///
-/// CULPRIT: **E20 top-k sparse attention** (`DGQ_ATTN_TOPK`, default ON).
-/// `kv_lineage_fork_attention_bisect` runs the live case under each
-/// attention lever; only `attn_topk=0` comes back clean (gemm_attn=0,
-/// attn_mma=0, attn_mma_full=0 all still FORK).
+/// CULPRIT (found via `kv_lineage_fork_attention_bisect`, which runs the
+/// live case under each attention lever — only `attn_topk=0` came back
+/// clean): **E20 top-k sparse attention**. Its kv-adaptive k was computed
+/// host-side as `(t_total/128).clamp(64,512)` from the DISPATCH's
+/// `t_total = kv_len + canvas`, so the same absolute position got a
+/// different k depending on how the prefill was chunked — k=114 on a fresh
+/// prefill vs k=115 when resumed mid-context, i.e. a different NUMBER OF
+/// ATTENDED KEYS for identical Q and identical KV. A discrete change in the
+/// approximation, not a rounding difference, which is why it amplified with
+/// depth instead of washing out. FIXED by deriving k inside the kernel from
+/// each row's own causal key count (`n_valid`), a function of the row's
+/// ABSOLUTE position alone. Non-causal (denoise) is unchanged, since there
+/// `n_valid == t_total` already.
 ///
-/// Mechanism: top-k's parameters are derived from the DISPATCH's
-/// `t_total = kv_len + canvas`, not from the query's own causal context —
-/// so the same absolute position gets a different approximation depending
-/// on how the prefill was chunked. Concretely, `attn_topk_k_for` computes
-/// `k = (t_total/128).clamp(64,512)`, and in the live case the same query
-/// gets k=114 in the fresh arm vs k=115 in the delta arm (also 116 vs 115,
-/// 116 vs 117 further in) — a different NUMBER OF ATTENDED KEYS for
-/// identical Q and identical KV. Note case 2 forks even where k is EQUAL in
-/// both arms, so the t_total-dependent selection/tiling is a second
-/// phase-dependent input; that one is not yet isolated.
+/// The layer pattern follows from this (and corrects an earlier misread of
+/// mine): top-k runs on FULL layers (5, 11, 17, 23, 29), and a layer writes
+/// its KV BEFORE its attention (QkRopeKv -> Attention). So layer 5's KV was
+/// identical while its attention OUTPUT differed, and the first KV to carry
+/// the difference was layer 6. **Layer 6 was "first top-k layer + 1", NOT a
+/// sub-ULP visibility threshold** — there was no tiny seed in layers 0-5.
 ///
-/// This also explains the layer pattern, and corrects an earlier misread:
-/// top-k runs on FULL layers (5, 11, 17, 23, 29), and a layer's KV is
-/// written BEFORE its attention (QkRopeKv -> Attention). So layer 5's KV is
-/// identical while its attention OUTPUT differs, and the first KV to carry
-/// the difference is layer 6. **Layer 6 is "first top-k layer + 1", NOT a
-/// sub-ULP visibility threshold** — do not go hunting for a tiny seed in
-/// layers 0-5; there isn't one.
-///
-/// Fix direction: make k (and the selection) depend on the query's own
-/// causal key count (`kv_len + tok`) rather than the dispatch's `t_total`,
-/// which is phase-invariant and should preserve E20's win.
+/// Note the fix also closed case 2, which forked at positions where k was
+/// EQUAL in both arms — so the earlier "second phase-dependent input"
+/// caveat is resolved: per-row k covers it (rows whose k was equal still
+/// sat in a chunk whose OTHER rows' k differed, and a wrong k anywhere in
+/// a full layer perturbs the shared hidden stream).
 #[test]
-#[ignore = "KNOWN RED: wrapped-ring + misaligned + multi-chunk delta forks (PLAN correctness debt)"]
 fn kv_lineage_unaligned_delta_offsets_are_fingerprint_identical() {
     unaligned_matrix(None);
 }

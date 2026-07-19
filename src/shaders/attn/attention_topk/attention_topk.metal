@@ -120,7 +120,10 @@ kernel void attn_topk_softmax(
     device uint   *idx       [[buffer(2)]],  // Idx plane [HC][m][K_PAD] u32
     device float  *lrow      [[buffer(3)]],  // [HC][m] f32 row denoms
     constant AttnGemmDims &d [[buffer(4)]],
-    constant uint &k_param   [[buffer(5)]],  // k (max keys to keep)
+    // k config: (fixed_k, dyn_divisor, k_min, k_max). dyn_divisor == 0 uses
+    // fixed_k; otherwise k is derived PER ROW from that row's own causal key
+    // count (see the note at `n_valid` below).
+    constant uint4 &k_cfg    [[buffer(5)]],
     device const ushort *pat [[buffer(6)]],  // u16 key plane [HC][m][n_pad]
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 lid  [[thread_position_in_threadgroup]]
@@ -157,7 +160,31 @@ kernel void attn_topk_softmax(
     atomic_fetch_add_explicit(&vshare, n_valid_local, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint n_valid = atomic_load_explicit(&vshare, memory_order_relaxed);
-    const uint k = min(k_param, n_valid);
+    // kv-adaptive k is derived HERE rather than host-side from the DISPATCH's
+    // `t_total`, which made k depend on how the prefill was chunked: the same
+    // query got k=114 on a fresh prefill and k=115 when resumed mid-context —
+    // a different NUMBER OF ATTENDED KEYS for identical Q and KV, which forked
+    // the trajectory of every reused-KV turn (see kv_lineage_tests).
+    //
+    // For a causal (prefill) row, round that row's own key count UP to the
+    // chunk grid: that is exactly the `t_total` an ALIGNED fresh-prefill chunk
+    // would have had for this position, so k is bit-identical to the shipped,
+    // quality-gated numerics while depending only on the absolute position.
+    // The grid comes from the host (k_cfg.x), NOT from `d.m` — `d.m` is the
+    // dispatch's row count, which is not guaranteed to be the chunk stride.
+    // Using the raw per-row count instead of rounding up is also
+    // phase-invariant but SHRINKS k for early rows in a chunk, which measured
+    // as worse long-context prose. Non-causal (denoise) keeps
+    // `n_valid == t_total` untouched.
+    uint k_req;
+    if (k_cfg.y != 0u) {
+        const uint gran = max(k_cfg.x, 1u);
+        const uint t_equiv = causal ? ((n_valid + gran - 1u) / gran) * gran : n_valid;
+        k_req = clamp(t_equiv / k_cfg.y, k_cfg.z, k_cfg.w);
+    } else {
+        k_req = k_cfg.x;
+    }
+    const uint k = min(k_req, n_valid);
     if (k == 0u) {
         if (tid == 0u) lrow[0] = 0.f;
         for (uint j = tid; j < K_PAD; j += SM_TPG) { p[j] = 0.f; idx[j] = 0u; }

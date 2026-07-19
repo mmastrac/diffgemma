@@ -162,7 +162,7 @@ pub fn attn_topk_k() -> usize {
 /// allocations must BOTH use this — same value, one source (#97's lesson).
 pub fn attn_topk_k_pad() -> usize {
     if attn_topk_dyn() {
-        return 512; // dyn k caps at 512 (see attn_topk_k_for)
+        return 512; // dyn k caps at 512 (see attn_topk_k_cfg)
     }
     attn_topk_k().next_power_of_two().clamp(64, 1024)
 }
@@ -175,14 +175,38 @@ pub fn attn_topk_dyn() -> bool {
 pub fn attn_topk_decode_enabled() -> bool {
     config().perf.attn_topk_decode
 }
-/// Effective k for a dispatch at `t_total` keys: fixed DGQ_ATTN_TOPK_K, or —
-/// with DGQ_ATTN_TOPK_DYN — a constant ~0.8% fraction of context,
-/// clamp(t_total/128, 64, 512).
-pub fn attn_topk_k_for(t_total: usize) -> usize {
+/// E20 k config handed to `attn_topk_softmax`: `(fixed_k, dyn_divisor,
+/// k_min, k_max)`, with `dyn_divisor == 0` selecting `fixed_k`.
+///
+/// Under kv-adaptive k (`DGQ_ATTN_TOPK_DYN`) the DIVISOR ships and the
+/// KERNEL derives k per row, from that row's own causal key count rounded
+/// UP to the canvas grid — the value an aligned fresh-prefill chunk would
+/// have had for that position. So k is a function of the absolute position
+/// alone (phase-invariant) AND numerically unchanged from the shipped,
+/// quality-gated behaviour.
+///
+/// It used to be resolved host-side from the DISPATCH's `t_total`
+/// (`clamp(t_total/128, 64, 512)`, one k for every row in the chunk), which
+/// made k depend on how the prefill happened to be chunked: the same query
+/// got k=114 on a fresh prefill and k=115 when resumed mid-context, so a
+/// reused-KV turn attended a different number of keys than a fresh one and
+/// forked away from it. That host-side helper is deliberately GONE rather
+/// than left for reuse. See `kv_lineage_tests` and the PLAN lineage item.
+///
+/// Do NOT "simplify" the kernel to use the raw per-row count: that is also
+/// phase-invariant but SHRINKS k for early rows in a chunk, which measured
+/// as worse long-context prose (a dropped word in doc_20k on 2/3 seeds,
+/// invisible to the retrieval gate).
+pub fn attn_topk_k_cfg() -> [u32; 4] {
+    let pad = attn_topk_k_pad() as u32;
     if attn_topk_dyn() {
-        (t_total / 128).clamp(64, 512)
+        // `.x` carries the CHUNK GRID (the fast prefill's fixed CANVAS stride)
+        // the kernel rounds each row's key count up to; `fixed_k` is unused in
+        // this mode. It must be the prefill chunk stride, not the dispatch row
+        // count, or k stops matching the aligned fresh-prefill value.
+        [crate::metal::CANVAS as u32, 128, 64, 512.min(pad)]
     } else {
-        attn_topk_k()
+        [(attn_topk_k() as u32).min(pad), 0, 0, 0]
     }
 }
 

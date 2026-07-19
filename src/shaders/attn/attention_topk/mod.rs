@@ -138,7 +138,8 @@ pub fn gpu(
         s_head_stride: (canvas * np) as u32,
         head_base: 0,
     };
-    let k_u32 = k as u32;
+    // Harness/oracle path is always FIXED k: dyn_divisor 0.
+    let k_u32: [u32; 4] = [k as u32, 0, 0, 0];
 
     let tg128 = MTLSize {
         width: 128,
@@ -390,7 +391,8 @@ struct BenchRig {
     buf_lrow: crate::shaders::attn::harness::Buf,
     buf_pat: crate::shaders::attn::harness::Buf,
     dims: crate::shaders::attention_gemm::AttnGemmDims,
-    k_u32: u32,
+    /// (fixed_k, dyn_divisor, k_min, k_max) — harness is always fixed k.
+    k_u32: [u32; 4],
     hc: usize,
 }
 
@@ -447,7 +449,7 @@ impl BenchRig {
             buf_lrow,
             buf_pat,
             dims,
-            k_u32: k as u32,
+            k_u32: [k as u32, 0, 0, 0],
             hc,
         })
     }

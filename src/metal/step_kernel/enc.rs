@@ -1843,8 +1843,10 @@ impl StepEnc<'_> {
         };
         // kv-adaptive k (DGQ_ATTN_TOPK_DYN): k grows with context, capped by
         // the compiled K_PAD. Fixed DGQ_ATTN_TOPK_K otherwise. (E20 only.)
-        let k_param =
-            crate::flags::attn_topk_k_for(t_total).min(crate::flags::attn_topk_k_pad()) as u32;
+        // The DIVISOR ships, not a resolved k: the kernel derives k per row
+        // from that row's own causal key count, so k can't depend on how the
+        // prefill was chunked (the reuse-vs-fresh fork; see attn_topk_k_cfg).
+        let k_cfg = crate::flags::attn_topk_k_cfg();
         let tg128 = MTLSize {
             width: 128,
             height: 1,
@@ -1974,7 +1976,7 @@ impl StepEnc<'_> {
                     self.sink_set_buffer(self.bufs.attn_topk_lrow.as_ref().unwrap(), 0, 3);
                     self.sink_set_buffer(self.bufs.attn_topk_pat.as_ref().unwrap(), 0, 6);
                     self.sink_set_bytes(&dims, 4);
-                    self.sink_set_bytes(&k_param, 5);
+                    self.sink_set_bytes(&k_cfg, 5);
                     self.sink_dispatch(grid_sm, tg_sm);
                     self.sink_memory_barrier();
 
