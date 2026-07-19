@@ -52,6 +52,10 @@ struct Metrics {
     /// discarded by re-rolls). The gap is what retries cost.
     steps_committed: u64,
     steps_run: u64,
+    /// How many runs contributed a `run_summary` record. 0 means the
+    /// battery-level numbers below are unknown (an older trace), which is
+    /// why the pass column reads "-" rather than a fabricated verdict.
+    summaries: u64,
 }
 
 impl Metrics {
@@ -69,6 +73,7 @@ impl Metrics {
         self.kw_total += o.kw_total;
         self.steps_committed += o.steps_committed;
         self.steps_run += o.steps_run;
+        self.summaries += o.summaries;
     }
 
     /// Steps thrown away by re-rolls.
@@ -195,6 +200,29 @@ fn cmp_ok(op: &str, lhs: f64, rhs: f64) -> bool {
     }
 }
 
+/// Append the battery's own verdict to the trace, so the file carries
+/// everything a later analysis needs.
+#[cfg(target_os = "macos")]
+fn append_run_summary(path: &Path, out: &super::smoketest::SmokeOutcome) {
+    use std::io::Write;
+    let rec = serde_json::json!({
+        "kind": "run_summary",
+        "passed": out.ok(),
+        "prompts_passed": out.passed,
+        "prompts_total": out.total,
+        "kw_found": out.kw_found,
+        "kw_total": out.kw_total,
+        "steps_committed": out.steps_committed,
+        "steps_run": out.steps_total,
+    });
+    match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        Ok(mut f) => {
+            let _ = writeln!(f, "{rec}");
+        }
+        Err(e) => eprintln!("census: cannot append summary to {}: {e}", path.display()),
+    }
+}
+
 /// Count contested COMMITTED rows in one p_max trace file.
 fn scan_trace(path: &Path, tau: f32) -> Metrics {
     let mut m = Metrics {
@@ -208,8 +236,27 @@ fn scan_trace(path: &Path, tau: f32) -> Metrics {
         let Ok(rec) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        if rec.get("kind").and_then(|k| k.as_str()) != Some("block_commit") {
-            continue;
+        match rec.get("kind").and_then(|k| k.as_str()) {
+            Some("block_commit") => {}
+            // Written by census at the end of each run so a trace is
+            // self-describing: `--analyze` recovers the battery verdict and
+            // step accounting without the live outcome in hand.
+            Some("run_summary") => {
+                let u = |k: &str| rec.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+                m.summaries += 1;
+                m.passed &= rec
+                    .get("passed")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                m.prompts_passed += u("prompts_passed");
+                m.prompts_total += u("prompts_total");
+                m.kw_found += u("kw_found");
+                m.kw_total += u("kw_total");
+                m.steps_committed += u("steps_committed");
+                m.steps_run += u("steps_run");
+                continue;
+            }
+            _ => continue,
         }
         let pmax: Vec<f64> = rec
             .get("pmax")
@@ -310,7 +357,8 @@ pub(crate) fn run_census_cmd(
         }
         // Traces carry no pass/fail (that is the battery's verdict), so a
         // `passed` gate is meaningless here; report and gate on counts.
-        return report(&results, &gates, baseline, out_dir, tau, seeds, false);
+        let have_verdicts = results.values().any(|m| m.summaries > 0);
+        return report(&results, &gates, baseline, out_dir, tau, seeds, have_verdicts);
     }
 
     // ---- Parse + VALIDATE everything before any GPU time is spent. -------
@@ -423,14 +471,11 @@ pub(crate) fn run_census_cmd(
                         outcome.failed_ids().join(", "),
                     );
                 }
-                let mut m = scan_trace(&trace, tau);
-                m.passed = outcome.ok();
-                m.prompts_passed = outcome.passed as u64;
-                m.prompts_total = outcome.total as u64;
-                m.kw_found = outcome.kw_found as u64;
-                m.kw_total = outcome.kw_total as u64;
-                m.steps_committed = outcome.steps_committed as u64;
-                m.steps_run = outcome.steps_total as u64;
+                append_run_summary(&trace, &outcome);
+                // scan_trace is now the SINGLE reader of a run's numbers, so
+                // a live run and a later `--analyze` of the same trace agree
+                // by construction.
+                let m = scan_trace(&trace, tau);
                 let _ = cfg; // arm cfg kept for reporting; run_cfg is what ran
                 results
                     .entry((arm.name.clone(), battery.clone()))
@@ -638,6 +683,44 @@ mod tests {
         assert_eq!(m.hard, 1, "only the COMMITTED 0.40 row counts");
         assert_eq!(m.trims, 1);
         assert_eq!(m.steps, 18);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A trace carrying a `run_summary` is self-describing: `--analyze`
+    /// recovers the verdict and step accounting that used to live only in
+    /// the live run's outcome.
+    #[test]
+    fn run_summary_makes_a_trace_self_describing() {
+        let dir = std::env::temp_dir().join(format!("dgq-census-sum-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("t.jsonl");
+        std::fs::write(
+            &f,
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "kind": "block_commit", "steps": 7, "kept": 2,
+                    "pmax": [0.99, 0.99], "argmax": [1, 2],
+                }),
+                serde_json::json!({
+                    "kind": "run_summary", "passed": true,
+                    "prompts_passed": 17, "prompts_total": 17,
+                    "kw_found": 8, "kw_total": 8,
+                    "steps_committed": 120, "steps_run": 145,
+                }),
+            ),
+        )
+        .unwrap();
+        let m = scan_trace(&f, 0.9);
+        assert_eq!(m.summaries, 1);
+        assert!(m.passed);
+        assert_eq!(m.prompts_passed, 17);
+        assert_eq!(m.retrieval_pct(), 100.0);
+        assert_eq!(m.steps_run, 145);
+        assert_eq!(m.steps_retry(), 25, "run - committed = discarded re-rolls");
+        // The block_commit record is still counted for wart stats.
+        assert_eq!(m.blocks, 1);
+        assert_eq!(m.committed_rows, 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
