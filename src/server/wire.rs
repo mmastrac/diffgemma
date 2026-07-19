@@ -35,6 +35,16 @@ pub struct DiffusionStreamMapper<D: TextDecoder> {
     stops: Vec<u32>,
     channel_open: Option<u32>,
     channel_close: Option<u32>,
+    /// The `<|"|>` string-quote special id (tool mode only). Inside an open
+    /// quote run, channel ids are literal arg content: they neither toggle
+    /// the thought state nor get filtered out — a tool call writing a file
+    /// that contains chat markup must round-trip it byte-exact.
+    quote: Option<u32>,
+    /// Skip stop ids inside an open quote run (must mirror the engine's
+    /// `continue_incomplete_tool_calls` policy — if the engine honors a
+    /// quoted stop, cutting later here would stream text the engine
+    /// dropped, and vice versa).
+    stop_skip_quoted: bool,
     thinking: bool,
     emit_drafts: bool,
 
@@ -82,6 +92,8 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
         stops: Vec<u32>,
         channel_open: Option<u32>,
         channel_close: Option<u32>,
+        quote: Option<u32>,
+        stop_skip_quoted: bool,
         thinking: bool,
         emit_drafts: bool,
         paced: bool,
@@ -91,6 +103,8 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
             stops,
             channel_open,
             channel_close,
+            quote,
+            stop_skip_quoted,
             thinking,
             emit_drafts,
             block_idx: 0,
@@ -145,13 +159,29 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
         let mut reasoning_ids: Vec<u32> = Vec::new();
         let mut content_ids: Vec<u32> = Vec::new();
         let mut in_thought = false;
+        let mut in_quote = false;
         // A `<|channel>` takes its NAME token (+ trailing newline) with it: the
         // open special is dropped here, so a mid-span re-open would otherwise
         // leak a bare "thought" line into the client's Thought UI (field
         // glitch 2026-07-18, repair-round conditioning).
         let mut skip_name = false;
         for &id in ids {
-            if Some(id) == self.channel_open {
+            if Some(id) == self.quote {
+                in_quote = !in_quote;
+                // The quote id is grammar the parser needs — keep it.
+                if in_thought {
+                    reasoning_ids.push(id);
+                } else {
+                    content_ids.push(id);
+                }
+            } else if in_quote {
+                // Literal quoted content: channel ids included, verbatim.
+                if in_thought {
+                    reasoning_ids.push(id);
+                } else {
+                    content_ids.push(id);
+                }
+            } else if Some(id) == self.channel_open {
                 in_thought = true;
                 skip_name = true;
             } else if Some(id) == self.channel_close {
@@ -178,35 +208,30 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
         }
     }
 
-    /// Decode answer-side ids: drop further channel specials (the model may
-    /// re-emit `<channel|>` after the answer), then sanitize the text.
+    /// Decode answer-side ids and sanitize the text. Stray channel specials
+    /// (the model may re-emit `<channel|>` after the answer) are dropped by
+    /// the `split` walk before ids get here; text-form leftovers die in the
+    /// masked `sanitize_model_reply` — while QUOTED channel markup (literal
+    /// tool-arg content) survives both.
     fn decode_content(&self, ids: &[u32]) -> String {
-        let filtered: Vec<u32> = ids
-            .iter()
-            .copied()
-            .filter(|&id| Some(id) != self.channel_open && Some(id) != self.channel_close)
-            .collect();
         crate::chat_template::sanitize_model_reply(
             &self
                 .decoder
-                .decode(&crate::sample::strip_degenerate_token_ids(&filtered)),
+                .decode(&crate::sample::strip_degenerate_token_ids(ids)),
         )
     }
 
     /// Decode a reasoning-region id slice and strip the `<|channel>thought\n`
     /// opener scaffold the model emits when thinking is enabled.
+    ///
+    /// Mid-thought re-open ids never reach here (the `split` walk consumes
+    /// them as toggles); the string replaces below catch TEXT-FORM (BPE)
+    /// markers. Display-only: quoted literals in a rehearsed call may lose
+    /// markers here, but repair/salvage read the raw decode, not this.
     fn clean_reasoning(&self, ids: &[u32]) -> String {
-        // Drop channel specials entirely — mid-thought re-opens (or stale-canvas
-        // leftovers) must not survive as nested Thought UI markup. (Name-token
-        // swallowing happens in `split`, where the opens are still visible.)
-        let filtered: Vec<u32> = ids
-            .iter()
-            .copied()
-            .filter(|&id| Some(id) != self.channel_open && Some(id) != self.channel_close)
-            .collect();
         let raw = self
             .decoder
-            .decode(&crate::sample::strip_degenerate_token_ids(&filtered));
+            .decode(&crate::sample::strip_degenerate_token_ids(ids));
         let mut s = raw
             .trim_start_matches("<|channel>")
             .trim_start()
@@ -271,8 +296,17 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
         };
         let mut stable_ids = Vec::with_capacity(prefix_end);
         let mut hit_stop = false;
+        // Quote parity carries over from the already-committed stream: a stop
+        // id inside an open `<|"|>` run is literal arg content, skipped only
+        // when the engine's stop-scan does the same (see `stop_skip_quoted`).
+        let mut in_quote = self.stop_skip_quoted
+            && self.quote.is_some_and(|q| {
+                self.committed_ids.iter().filter(|&&id| id == q).count() % 2 == 1
+            });
         for &id in &ev.argmax[..prefix_end] {
-            if self.stops.contains(&id) {
+            if self.stop_skip_quoted && Some(id) == self.quote {
+                in_quote = !in_quote;
+            } else if !in_quote && self.stops.contains(&id) {
                 hit_stop = true;
                 break;
             }

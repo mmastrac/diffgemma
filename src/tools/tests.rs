@@ -491,6 +491,123 @@ fn render_tool_call_and_response_matches_oracle() {
     );
 }
 
+// ===========================================================================
+// Masked marker scanning: chat markup inside quoted tool args / code fences
+// is literal DATA (the OpenCode scenario: an edit call writing a file that
+// contains this very grammar — e.g. chat_template.jinja).
+// ===========================================================================
+
+/// A complete edit call whose quoted arg contains the full thought ceremony.
+fn markup_edit_call() -> String {
+    "I'll update the template.<|tool_call>call:edit{path:<|\"|>chat_template.jinja<|\"|>,\
+     newString:<|\"|>{{ '<|channel>thought\n' }}{{ '<channel|>' }}<|\"|>}<tool_call|>"
+        .to_string()
+}
+
+#[test]
+fn quoted_channel_markup_survives_strip_thinking() {
+    let reply = markup_edit_call();
+    // No real thought span: strip must be a byte-preserving no-op (mod trim).
+    assert_eq!(strip_thinking(&reply), reply);
+    // With a REAL thought span in front, only the span goes.
+    let with_thought = format!("<|channel>thought\nplan the edit<channel|>{reply}");
+    assert_eq!(strip_thinking(&with_thought), reply);
+    // The call parses with the markup byte-exact in the arg.
+    let calls = parse_tool_calls(&strip_thinking(&with_thought));
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].arguments["newString"].as_str().unwrap(),
+        "{{ '<|channel>thought\n' }}{{ '<channel|>' }}"
+    );
+}
+
+#[test]
+fn quoted_markup_reply_is_valid_and_not_lost_in_thinking() {
+    let reply = markup_edit_call();
+    assert_eq!(validate_tool_reply(&reply), Ok(()));
+    assert!(!tool_call_lost_in_thinking(&reply));
+    // A quoted <channel|> inside a call REHEARSED in thought must not
+    // truncate the span scan mid-arg: the whole call is still recovered.
+    let rehearsed = format!("<|channel>thinking about it {}", markup_edit_call());
+    let names = thinking_call_names(&rehearsed);
+    assert_eq!(names, vec!["edit".to_string()]);
+}
+
+#[test]
+fn quoted_tool_opener_and_stop_text_do_not_flag_incomplete() {
+    // A written file containing `<|tool_call>` (and no call: after it) must
+    // not hold the turn open forever, and a quoted `call:` fragment must
+    // not read as an unfinished call.
+    let reply = "<|tool_call>call:write{path:<|\"|>tools.md<|\"|>,text:<|\"|>\
+                 The opener is <|tool_call> and calls look like call:name\
+                 <|\"|>}<tool_call|>";
+    assert!(!has_incomplete_tool_call(reply));
+    assert_eq!(validate_tool_reply(reply), Ok(()));
+    let calls = parse_tool_calls(reply);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].arguments["text"].as_str().unwrap(),
+        "The opener is <|tool_call> and calls look like call:name"
+    );
+}
+
+#[test]
+fn quoted_content_is_not_trailing_prose() {
+    // content_before_tool_calls must cut at the REAL opener, not a quoted one.
+    let reply = markup_edit_call();
+    assert_eq!(content_before_tool_calls(&reply), "I'll update the template.");
+    assert!(!has_trailing_after_tool_calls(&reply));
+}
+
+#[test]
+fn fenced_channel_marker_is_inert() {
+    // Prose quoting the grammar in a CLOSED code fence keeps its text.
+    let reply = "The open marker is ```<|channel>``` and the close is \
+                 ```<channel|>```. Answer: 42.";
+    assert_eq!(strip_thinking(reply), reply);
+    // An UNCLOSED fence stays ordinary text: the real thought span after it
+    // still strips (fail-open would leak thought into content/KV).
+    let unclosed = "Fence: ``` oops<|channel>secret<channel|>done";
+    assert_eq!(strip_thinking(unclosed), "Fence: ``` oopsdone");
+}
+
+#[test]
+fn fenced_incomplete_call_fragment_is_inert() {
+    // Documentation pseudo-code in a closed fence must not defer stops.
+    let reply = "Calls look like:\n```\ncall:bash{command\n```\nDone.";
+    assert!(!has_incomplete_tool_call(reply));
+    assert_eq!(validate_tool_reply(reply), Ok(()));
+    assert!(scan_call_attempts(reply).is_empty());
+}
+
+#[test]
+fn fence_pair_cannot_swallow_a_real_call() {
+    // An unclosed fence in prose + a fence inside a later real call's quoted
+    // arg must NOT pair up and hide the call.
+    let reply = "Preview:\n``` \n<|tool_call>call:edit{new:<|\"|>```rust\ncode\n```<|\"|>}<tool_call|>";
+    let calls = parse_tool_calls(reply);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].arguments["new"].as_str().unwrap(),
+        "```rust\ncode\n```"
+    );
+}
+
+#[test]
+fn masked_ranges_shapes() {
+    // Complete call arg body masked; the call: keyword itself is not.
+    let text = "call:a{x:<|\"|>v<|\"|>} tail";
+    let masks = masked_ranges(text);
+    assert_eq!(masks.len(), 1);
+    assert_eq!(&text[masks[0].0..masks[0].1], "{x:<|\"|>v<|\"|>}");
+    assert_eq!(find_unmasked(text, &masks, "call:", 0), Some(0));
+    // Closed fence masked, unclosed fence not.
+    let fenced = "a ```b``` c ```d";
+    let masks = masked_ranges(fenced);
+    assert_eq!(masks.len(), 1);
+    assert_eq!(&fenced[masks[0].0..masks[0].1], "```b```");
+}
+
 #[test]
 fn render_system_plus_tools_matches_oracle() {
     let msgs = [

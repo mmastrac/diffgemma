@@ -48,27 +48,18 @@ STEP COUNT (E7), not per-step attention.
   A KV snapshot restore path could make deep rewinds cheap; measure demand
   from field op-logs first.
 
-### Channel-hygiene fixes (survey 2026-07-17, unimplemented)
+### Channel-hygiene fixes (survey 2026-07-17; #1-#3 done, #4 partial)
 
-**Field incident 2026-07-17 late (regex_lite session, turn 14) — the dual-
-splitter disagreement has a live casualty.** The model skipped the thought
-ceremony and emitted a bare, WELL-FORMED edit call (no channel markers in
-the reply at all; finish=stop, 170 tok). The wire mapper's rule is
-"thinking mode ⇒ everything is reasoning until a `<channel|>` CLOSE id
-appears" (`split()`, no open required — lenient because the model
-sometimes emits the opener as text BPE, not the special id), so the whole
-call was streamed as `reasoning_content` and the client got an EMPTY
-message; the validator/repair side (string-based, explicit-span-driven)
-correctly judged the call visible+valid → verdict Ok → repair rightly
-silent. Verified by probe: every reply shape containing a `<|channel>`
-opener flags for repair; only the bare-call shape passes Ok — and the turn
-prompt was byte-clean (no leaked thought, correct ordering). So the loss
-is OURS (misclassification), not the model's grammar. Candidate tactical
-fix ahead of the full unification: in the mapper's
-reasoning-until-close branch, if the committed region contains NO channel
-open (id or text form) and parses as a complete tool call, classify it as
-content — plus a worker-level loud log when mapper and validator disagree
-about whether a reply contains a call.
+~~**Field incident 2026-07-17 late (regex_lite session, turn 14) — the
+dual-splitter disagreement has a live casualty.**~~ **FIXED (782345c)**:
+the model skipped the thought ceremony and emitted a bare, well-formed
+edit call; the mapper's old "everything is reasoning until a close id"
+rule streamed it all as `reasoning_content` and the client got an EMPTY
+message while the validator (rightly) judged the reply clean. `split()`
+now classifies by EMISSION (reasoning is only what sits inside an explicit
+thought span), the CHANNEL MISMATCH tripwire logs any mapper/validator
+disagreement, and both assembly paths ADOPT calls salvaged from the raw
+decode / round reasoning instead of only logging.
 
 Findings, in proposed fix order:
 
@@ -86,17 +77,40 @@ Findings, in proposed fix order:
    content instead of structure. Tests: `encode_prompt_*` (tokenizer +
    tools). Follow-up: the same guard vocabulary is the substrate for the
    unified channel scanner (#4).
-2. **`strip_thinking` is not quote-aware** — thought markers inside string
-   literals/code fences get treated as channel boundaries.
-3. **Channel-unaware stop-scan** — the stop scanner doesn't know which
-   channel it's in; directly protects the repair loop.
-4. **Dual thought-splitters** — mapper (id-based) vs strip (string-based)
-   can disagree; unify on one scanner.
+2. ~~**`strip_thinking` is not quote-aware**~~ **FIXED (2026-07-18,
+   masked-scanner commit).** `tools::masked_ranges` computes the literal
+   regions of a reply — complete `call:NAME{…}` arg bodies (anchored at the
+   grammar via the same consumption scan as `parse_tool_calls`; global
+   `<|"|>` parity deliberately NOT used — one displayed quote literal in
+   prose would flip it and hide every later marker) plus closed ``` fences
+   that don't straddle a real call's args. EVERY string-side marker scan
+   goes through it: `strip_thinking`, `sanitize_model_reply` turn/channel
+   cuts, `thinking_spans`, `has_incomplete_tool_call` (a quoted
+   `<|tool_call>` literal no longer holds the turn open),
+   `has_trailing_after_tool_calls`, `scan_call_attempts`,
+   `parse_tool_calls`, `content_before_tool_calls`, `validate_tool_reply`.
+   An edit call writing this repo's own `chat_template.jinja` now
+   round-trips byte-exact. Unmasked semantics are pinned unchanged by the
+   pre-existing suite; new tests: `quoted_*`/`fenced_*`/`masked_ranges_*`
+   (tools), `sanitize_keeps_quoted_markers_cuts_unquoted`.
+3. ~~**Channel-unaware stop-scan**~~ **DONE (same commit), gated**: engine
+   stop-scan (`first_unquoted_stop`) and the mapper stop-cut skip stop ids
+   inside an open `<|"|>` run (parity carried across blocks), but ONLY
+   under `continue_incomplete_tool_calls` (`DGQ_CONTINUE_PAST_STOP`,
+   default OFF) so engine and stream stay in lockstep and the 2026-07-17
+   honor-the-stop policy is preserved; default path still ends the turn
+   and lets tool-repair regenerate. `quote_token_id` rides the op-log cfg
+   (absent in old logs → plain scan, replay-faithful). Revisit the gate
+   only with field evidence of quoted-stop truncations.
+4. **Dual thought-splitters — PARTIAL**: mapper `split()` is now
+   quote-aware at the id level (quoted channel ids stay in content
+   verbatim; unconditional channel-id filters removed — masked
+   `sanitize_model_reply` handles text-form leftovers), so both splitters
+   share the marker vocabulary and the literal-region rule. Remaining:
+   one walk implementation (string-scanner-driven mapper) — the CHANNEL
+   MISMATCH tripwire + salvage covers the residual disagreement window.
 5. `channel_id` None fallback hardening; 6. thinking-flag flip silently
    loses KV reuse (add a log line).
-
-Plan: #1+#2 together via one quote/special-aware sanitization/scanner
-layer → #3 → #4 falls out of the same scanner.
 
 ### Message-layer designs (user-directed, not started)
 

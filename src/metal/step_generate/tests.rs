@@ -376,3 +376,24 @@ fn condense_step_text_transforms() {
     assert!(out.starts_with(&long[..32]), "head missing: {out}");
     assert!(out.ends_with(&long[200 - 48..]), "tail missing: {out}");
 }
+
+#[test]
+fn first_unquoted_stop_respects_quote_parity() {
+    use super::turn::first_unquoted_stop;
+    let stops = [99u32];
+    // No quote id: plain scan.
+    assert_eq!(first_unquoted_stop(&[7, 99, 8], &stops, None, &[]), Some(1));
+    // Quoted stop skipped; the next unquoted one found.
+    assert_eq!(
+        first_unquoted_stop(&[4, 99, 4, 99], &stops, Some(4), &[]),
+        Some(3)
+    );
+    // Parity carries in from the already-committed reply: an ODD number of
+    // quote ids there means this block STARTS inside a quote run.
+    assert_eq!(
+        first_unquoted_stop(&[99, 4, 99], &stops, Some(4), &[7, 4, 8]),
+        Some(2)
+    );
+    // Fully quoted block: no stop at all.
+    assert_eq!(first_unquoted_stop(&[99, 99], &stops, Some(4), &[4]), None);
+}

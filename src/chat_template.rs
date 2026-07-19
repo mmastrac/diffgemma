@@ -175,6 +175,11 @@ pub fn format_user_prompt(user_text: &str) -> String {
 /// markers. The model sometimes re-emits a close after the answer
 /// (`…rustc.<channel|><|tool_call>…`); stream split only consumes the first
 /// close, so leftovers must die here or they leak into OpenAI `content`.
+///
+/// Marker scanning is masked (`tools::masked_ranges`): a turn or channel
+/// marker inside a complete call's quoted args or a closed code fence is
+/// literal data — truncating there corrupted tool args whose content quoted
+/// the chat grammar (e.g. an edit to a jinja chat template).
 pub fn sanitize_model_reply(text: &str) -> String {
     // Absorb LEADING turn ceremony first: after a tool-response prompt the
     // generation opener is not seeded, so the model legitimately begins its
@@ -190,26 +195,19 @@ pub fn sanitize_model_reply(text: &str) -> String {
             None => String::new(),
         };
     }
-    if let Some(idx) = s.find(TURN_CLOSE) {
+    let masks = crate::tools::masked_ranges(&s);
+    // Truncation at an unmasked position keeps every remaining mask intact
+    // (a mask never straddles an unmasked byte), so one mask pass serves
+    // both cuts.
+    if let Some(idx) = crate::tools::find_unmasked(&s, &masks, TURN_CLOSE, 0) {
         s.truncate(idx);
     }
-    if let Some(idx) = s.find(TURN_OPEN) {
+    if let Some(idx) = crate::tools::find_unmasked(&s, &masks, TURN_OPEN, 0) {
         s.truncate(idx);
     }
-    s = strip_channel_markup(&s);
-    s.trim().to_string()
-}
-
-/// Drop `<|channel>…<channel|>` spans and any leftover channel markers.
-fn strip_channel_markup(text: &str) -> String {
-    let mut result = String::new();
-    for part in text.split(CHANNEL_CLOSE) {
-        match part.split_once(CHANNEL_OPEN) {
-            Some((before, _)) => result.push_str(before),
-            None => result.push_str(part),
-        }
-    }
-    result.replace(CHANNEL_OPEN, "").replace(CHANNEL_CLOSE, "")
+    // Thought spans + orphan channel markers (masked): same machine as the
+    // tools-side splitter, one source of truth.
+    crate::tools::strip_thinking(&s)
 }
 
 #[cfg(test)]
@@ -264,6 +262,20 @@ mod tests {
         assert_eq!(sanitize_model_reply("<|turn>model\nOk<|turn>user\nx"), "Ok");
         // Still-converging bare opener fragment: nothing usable yet.
         assert_eq!(sanitize_model_reply("<|turn>model"), "");
+    }
+
+    /// Turn/channel markers inside a complete call's quoted args are literal
+    /// content (a written file quoting the chat grammar) — sanitize must not
+    /// truncate or strip them, while the same markers OUTSIDE quotes still die.
+    #[test]
+    fn sanitize_keeps_quoted_markers_cuts_unquoted() {
+        let call = "<|tool_call>call:edit{path:<|\"|>t.jinja<|\"|>,new:<|\"|>\
+                    <|turn>user\n<turn|><|channel>x<channel|><|\"|>}<tool_call|>";
+        let reply = format!("Updating.{call}");
+        assert_eq!(sanitize_model_reply(&reply), reply);
+        // Trailing hallucinated turn AFTER the call still truncates there.
+        let with_tail = format!("{reply}<|turn>user\nnext");
+        assert_eq!(sanitize_model_reply(&with_tail), reply);
     }
 
     #[test]

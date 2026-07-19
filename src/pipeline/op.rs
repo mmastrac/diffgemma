@@ -135,6 +135,7 @@ impl PipelineOp {
                 "sampler_no_early_stop": cfg.sampler.confidence_threshold == f32::MAX,
                 "stop_token_ids": cfg.stop_token_ids,
                 "continue_incomplete_tool_calls": cfg.continue_incomplete_tool_calls,
+                "quote_token_id": cfg.quote_token_id,
                 "degenerate_reply_check": cfg.degenerate_reply_check.is_some(),
             })
         }
@@ -204,6 +205,12 @@ impl PipelineOp {
             );
             cfg.stop_token_ids = stop_ids.clone();
             cfg.continue_incomplete_tool_calls = cont;
+            // Absent in pre-2026-07-18 logs → None (the plain stop-scan),
+            // which is exactly what those sessions ran.
+            cfg.quote_token_id = v
+                .get("quote_token_id")
+                .and_then(|q| q.as_u64())
+                .map(|q| q as u32);
             if degen {
                 cfg.degenerate_reply_check =
                     crate::chat_template::empty_reply_check(model_dir, stop_ids);

@@ -79,6 +79,12 @@ pub struct StepGenerateConfig {
     /// after a closed tool call (`…}<tool_call|>Wait, I`). Stop is trimmed and
     /// generation continues into the next block.
     pub continue_incomplete_tool_calls: bool,
+    /// The `<|"|>` string-quote special id. Only read when
+    /// `continue_incomplete_tool_calls` is set: a stop id inside an open
+    /// quote run is literal tool-arg content (a file being written that
+    /// contains chat markup), not a stop — the scan skips it instead of
+    /// truncating the call mid-arg. `None` preserves the plain scan.
+    pub quote_token_id: Option<u32>,
     /// E6 empty/degenerate-reply canvas re-roll (with `DGQ_EMPTY_REPLY_RETRY>0`).
     /// Given the first block's committed argmax, returns true when it renders as
     /// an empty user-facing reply (eos-first canvas OR `<|channel>thought`
@@ -149,6 +155,7 @@ impl StepGenerateConfig {
             initial_canvas_ids: None,
             stop_token_ids: Vec::new(),
             continue_incomplete_tool_calls: false,
+            quote_token_id: None,
             degenerate_reply_check: None,
             step_observer: None,
             block_commit_observer: None,

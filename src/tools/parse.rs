@@ -2,11 +2,108 @@ use serde_json::{Map, Value};
 
 use super::Q;
 
+// ===========================================================================
+// Masked-marker scanning: which bytes of a reply are DATA, not protocol.
+//
+// Model text carries protocol markers (`<|channel>`, `<|tool_call>`, `call:`,
+// turn tokens) *and* arbitrary literal content that may contain the same byte
+// sequences — a tool call editing this repo's own `chat_template.jinja`, or
+// prose quoting the grammar in a code fence. Every marker scan in this module
+// (and `chat_template::sanitize_model_reply`) goes through these helpers so
+// markers inside literal regions are inert instead of corrupting the reply.
+// ===========================================================================
+
+/// Byte ranges of `text` that are literal data:
+///
+/// - The braced ARG BODY (delimiters included) of every complete
+///   `call:NAME{…}` — file contents and strings ride inside `<|"|>`-quoted
+///   args, and `read_braced` already treats those runs as opaque, so this
+///   pass is anchored at the grammar and immune to stray quote literals in
+///   prose (global `<|"|>` parity is deliberately NOT used: one displayed
+///   quote token in prose would flip it and hide every later real marker).
+/// - CLOSED ``` code fences whose delimiters sit outside those arg bodies
+///   and which do not swallow one (prose quoting markers or example calls).
+///   An unclosed fence stays ordinary text: failing open there would let a
+///   single stray fence hide every later real marker.
+///
+/// Ranges are ascending and non-overlapping.
+pub(crate) fn masked_ranges(text: &str) -> Vec<(usize, usize)> {
+    const FENCE: &str = "```";
+    // Pass 1: complete call arg bodies, by the same consumption scan
+    // `parse_tool_calls` uses.
+    let mut masks: Vec<(usize, usize)> = Vec::new();
+    let mut pos = 0usize;
+    while let Some(rel) = text[pos..].find("call:") {
+        let at = pos + rel;
+        let after = &text[at + "call:".len()..];
+        let Some(brace) = after.find('{') else { break };
+        match read_braced(&after[brace..]) {
+            Some((_, consumed)) => {
+                let start = at + "call:".len() + brace;
+                masks.push((start, start + consumed));
+                pos = start + consumed;
+            }
+            None => pos = at + "call:".len(),
+        }
+    }
+    // Pass 2: closed fences outside the arg bodies.
+    let args = masks.clone();
+    let mut at = 0usize;
+    while let Some(open) = find_unmasked(text, &args, FENCE, at) {
+        let Some(close) = find_unmasked(text, &args, FENCE, open + FENCE.len()) else {
+            break; // unclosed fence: ordinary text
+        };
+        let end = close + FENCE.len();
+        // A pair straddling a real call's args would hide that call; treat
+        // this opener as text and try the next one.
+        if args.iter().any(|&(s, e)| open < s && e <= end) {
+            at = open + FENCE.len();
+            continue;
+        }
+        masks.push((open, end));
+        at = end;
+    }
+    masks.sort_unstable();
+    masks
+}
+
+/// First occurrence of `needle` at/after byte `from` that does not start
+/// inside a masked range. Masks must come from `masked_ranges(text)`.
+pub(crate) fn find_unmasked(
+    text: &str,
+    masks: &[(usize, usize)],
+    needle: &str,
+    from: usize,
+) -> Option<usize> {
+    let mut at = from;
+    while at <= text.len() {
+        let rel = text[at..].find(needle)?;
+        let pos = at + rel;
+        match masks.iter().find(|&&(s, e)| pos >= s && pos < e) {
+            Some(&(_, e)) => at = e,
+            None => return Some(pos),
+        }
+    }
+    None
+}
+
+/// Last unmasked occurrence of `needle` in `text`.
+fn rfind_unmasked(text: &str, masks: &[(usize, usize)], needle: &str) -> Option<usize> {
+    let mut last = None;
+    let mut at = 0usize;
+    while let Some(pos) = find_unmasked(text, masks, needle, at) {
+        last = Some(pos);
+        at = pos + needle.len();
+    }
+    last
+}
+
 /// The user-facing content of a tool-call response: the preamble before the
 /// first `<|tool_call>` (the between-call / trailing text is dropped — clients
 /// treat `content` as the preamble when `tool_calls` are present).
 pub fn content_before_tool_calls(text: &str) -> String {
-    match text.find("<|tool_call>") {
+    let masks = masked_ranges(text);
+    match find_unmasked(text, &masks, "<|tool_call>", 0) {
         Some(i) => text[..i].trim().to_string(),
         None => text.trim().to_string(),
     }
@@ -48,15 +145,53 @@ pub fn message_text(m: &Value) -> String {
 }
 
 /// Remove `<|channel>…<channel|>` thought spans (jinja `strip_thinking`).
+///
+/// Marker scanning is masked: a `<|channel>`/`<channel|>` inside a
+/// `<|"|>`-quoted tool arg or a closed code fence is literal content and
+/// neither opens nor closes a span. Unmasked semantics are unchanged from
+/// the historical split-based version: stray closes are dropped, an
+/// UNCLOSED span drops its text to the end, nested opens don't stack.
 pub(crate) fn strip_thinking(text: &str) -> String {
-    let mut result = String::new();
-    for part in text.split("<channel|>") {
-        match part.split_once("<|channel>") {
-            Some((before, _)) => result.push_str(before),
-            None => result.push_str(part),
+    const OPEN: &str = "<|channel>";
+    const CLOSE: &str = "<channel|>";
+    let masks = masked_ranges(text);
+    let mut out = String::new();
+    let mut pos = 0usize;
+    let mut in_thought = false;
+    loop {
+        if in_thought {
+            match find_unmasked(text, &masks, CLOSE, pos) {
+                Some(c) => {
+                    pos = c + CLOSE.len();
+                    in_thought = false;
+                }
+                None => break, // unclosed span: tail is thought, dropped
+            }
+        } else {
+            let open = find_unmasked(text, &masks, OPEN, pos);
+            let close = find_unmasked(text, &masks, CLOSE, pos);
+            match (open, close) {
+                (Some(o), Some(c)) if c < o => {
+                    out.push_str(&text[pos..c]);
+                    pos = c + CLOSE.len();
+                }
+                (Some(o), _) => {
+                    out.push_str(&text[pos..o]);
+                    pos = o + OPEN.len();
+                    in_thought = true;
+                }
+                (None, Some(c)) => {
+                    out.push_str(&text[pos..c]);
+                    pos = c + CLOSE.len();
+                }
+                (None, None) => {
+                    out.push_str(&text[pos..]);
+                    break;
+                }
+            }
         }
     }
-    result.trim().to_string()
+    out.trim().to_string()
 }
 
 // ===========================================================================
@@ -75,21 +210,21 @@ pub struct ParsedToolCall {
 /// or a `<|tool_call>` opener with no `call:` yet. Used to keep generating
 /// blocks instead of ending the turn on a premature stop token.
 pub fn has_incomplete_tool_call(text: &str) -> bool {
-    if let Some(i) = text.rfind("<|tool_call>") {
-        let after = &text[i..];
-        if !after.contains("call:") {
-            return true;
-        }
+    let masks = masked_ranges(text);
+    if let Some(i) = rfind_unmasked(text, &masks, "<|tool_call>")
+        && find_unmasked(text, &masks, "call:", i).is_none()
+    {
+        return true;
     }
-    let mut rest = text;
-    while let Some(pos) = rest.find("call:") {
-        let after = &rest[pos + "call:".len()..];
+    let mut pos = 0usize;
+    while let Some(at) = find_unmasked(text, &masks, "call:", pos) {
+        let after = &text[at + "call:".len()..];
         let Some(brace) = after.find('{') else {
             return true;
         };
         match read_braced(&after[brace..]) {
             Some((_, consumed)) => {
-                rest = &after[brace + consumed..];
+                pos = at + "call:".len() + brace + consumed;
             }
             None => return true,
         }
@@ -103,14 +238,13 @@ pub fn has_incomplete_tool_call(text: &str) -> bool {
 /// self-talk (`…}<tool_call|>Wait, I` + `<eos>`) and the next request often
 /// empty-eos's. Caller should keep denoising instead.
 pub fn has_trailing_after_tool_calls(text: &str) -> bool {
+    let masks = masked_ranges(text);
     let mut last_complete_end: Option<usize> = None;
     let mut base = 0usize;
     while base < text.len() {
-        let rest = &text[base..];
-        let Some(pos) = rest.find("call:") else {
+        let Some(abs) = find_unmasked(text, &masks, "call:", base) else {
             break;
         };
-        let abs = base + pos;
         let after = &text[abs + "call:".len()..];
         let Some(brace) = after.find('{') else {
             break;
@@ -157,10 +291,11 @@ pub fn should_continue_past_stop(text: &str) -> bool {
 /// when unrecoverable) and whether it parses as a complete call. The repair
 /// stage emits one error tool-response per invalid attempt.
 pub fn scan_call_attempts(text: &str) -> Vec<(String, bool)> {
+    let masks = masked_ranges(text);
     let mut out = Vec::new();
-    let mut rest = text;
-    while let Some(pos) = rest.find("call:") {
-        let after = &rest[pos + "call:".len()..];
+    let mut pos = 0usize;
+    while let Some(at) = find_unmasked(text, &masks, "call:", pos) {
+        let after = &text[at + "call:".len()..];
         let Some(brace) = after.find('{') else {
             out.push((
                 after
@@ -177,7 +312,7 @@ pub fn scan_call_attempts(text: &str) -> Vec<(String, bool)> {
         match read_braced(&after[brace..]) {
             Some((_, consumed)) => {
                 out.push((name, true));
-                rest = &after[brace + consumed..];
+                pos = at + "call:".len() + brace + consumed;
             }
             None => {
                 out.push((name, false));
@@ -197,30 +332,42 @@ pub fn tool_call_lost_in_thinking(text: &str) -> bool {
     if !parse_tool_calls(&strip_thinking(text)).is_empty() {
         return false; // a visible call exists; thought content is moot
     }
-    let mut rest = text;
-    while let Some(open) = rest.find("<|channel>") {
-        let span = &rest[open + "<|channel>".len()..];
-        let end = span.find("<channel|>").unwrap_or(span.len());
-        if !parse_tool_calls(&span[..end]).is_empty() {
-            return true;
-        }
-        rest = &span[end..];
-    }
-    false
+    thinking_spans(text)
+        .into_iter()
+        .any(|(s, e)| !parse_tool_calls(&text[s..e]).is_empty())
 }
 
 /// Names of complete calls found inside thought spans (for the repair
 /// stage's error responses).
 pub fn thinking_call_names(text: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut rest = text;
-    while let Some(open) = rest.find("<|channel>") {
-        let span = &rest[open + "<|channel>".len()..];
-        let end = span.find("<channel|>").unwrap_or(span.len());
-        names.extend(parse_tool_calls(&span[..end]).into_iter().map(|c| c.name));
-        rest = &span[end..];
+    thinking_spans(text)
+        .into_iter()
+        .flat_map(|(s, e)| parse_tool_calls(&text[s..e]).into_iter().map(|c| c.name))
+        .collect()
+}
+
+/// Byte ranges of the BODIES of `<|channel>…<channel|>` thought spans (an
+/// unclosed span runs to the end), with masked markers inert.
+fn thinking_spans(text: &str) -> Vec<(usize, usize)> {
+    const OPEN: &str = "<|channel>";
+    const CLOSE: &str = "<channel|>";
+    let masks = masked_ranges(text);
+    let mut spans = Vec::new();
+    let mut pos = 0usize;
+    while let Some(open) = find_unmasked(text, &masks, OPEN, pos) {
+        let body = open + OPEN.len();
+        match find_unmasked(text, &masks, CLOSE, body) {
+            Some(close) => {
+                spans.push((body, close));
+                pos = close + CLOSE.len();
+            }
+            None => {
+                spans.push((body, text.len()));
+                break;
+            }
+        }
     }
-    names
+    spans
 }
 
 /// Strict reply-level grammar verdict for the validator stage: a reply that
@@ -235,7 +382,10 @@ pub fn validate_tool_reply(text: &str) -> Result<(), &'static str> {
     if tool_call_lost_in_thinking(text) {
         return Err("tool call inside thinking block");
     }
-    if text.contains("call:") && parse_tool_calls(text).is_empty() {
+    // Masked find: a `call:` inside a quoted arg or code fence is quoted
+    // DATA, not an attempt to speak the grammar.
+    let masks = masked_ranges(text);
+    if find_unmasked(text, &masks, "call:", 0).is_some() && parse_tool_calls(text).is_empty() {
         return Err("tool-call grammar present but nothing parseable");
     }
     Ok(())
@@ -244,15 +394,16 @@ pub fn validate_tool_reply(text: &str) -> Result<(), &'static str> {
 /// Parse every `call:NAME{ARGS}` in model output into structured tool calls,
 /// tolerant of the exact wrapper tokens around/between them.
 pub fn parse_tool_calls(text: &str) -> Vec<ParsedToolCall> {
+    let masks = masked_ranges(text);
     let mut out = Vec::new();
-    let mut rest = text;
-    while let Some(pos) = rest.find("call:") {
-        let after = &rest[pos + "call:".len()..];
+    let mut pos = 0usize;
+    while let Some(at) = find_unmasked(text, &masks, "call:", pos) {
+        let after = &text[at + "call:".len()..];
         let Some(brace) = after.find('{') else { break };
         // A malformed/unbalanced call must not drop the calls that follow it:
         // skip past this `call:` and keep scanning.
         let Some((inner, consumed)) = read_braced(&after[brace..]) else {
-            rest = after;
+            pos = at + "call:".len();
             continue;
         };
         let name = after[..brace].trim().to_string();
@@ -260,7 +411,7 @@ pub fn parse_tool_calls(text: &str) -> Vec<ParsedToolCall> {
             name,
             arguments: parse_object(inner, 0),
         });
-        rest = &after[brace + consumed..];
+        pos = at + "call:".len() + brace + consumed;
     }
     out
 }

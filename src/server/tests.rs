@@ -40,7 +40,7 @@ fn c(ch: char) -> u32 {
 
 #[test]
 fn content_only_commits_answer_text() {
-    let mut m = DiffusionStreamMapper::new(FakeDecoder, vec![], None, None, false, false, false);
+    let mut m = DiffusionStreamMapper::new(FakeDecoder, vec![], None, None, None, false, false, false, false);
     let hi = [c('H'), c('i')];
     // Not committed yet: no content deltas.
     assert!(m.on_step(&step(1, 1, &hi, false)).is_empty());
@@ -52,7 +52,7 @@ fn content_only_commits_answer_text() {
 
 #[test]
 fn draft_streams_stable_prefix_before_commit() {
-    let mut m = DiffusionStreamMapper::new(FakeDecoder, vec![], None, None, false, true, false);
+    let mut m = DiffusionStreamMapper::new(FakeDecoder, vec![], None, None, None, false, false, true, false);
     let hi = [c('H'), c('i')];
     // Streak must reach STABLE_STREAK before the draft shows anything.
     assert!(draft_of(&m.on_step(&step(1, 1, &hi, false))).is_none());
@@ -71,6 +71,8 @@ fn thinking_splits_reasoning_from_content() {
         vec![],
         Some(open),
         Some(close),
+        None,
+        false,
         true,
         false,
         false,
@@ -105,6 +107,8 @@ fn thinking_drops_trailing_channel_close_from_content() {
         vec![],
         Some(open),
         Some(close),
+        None,
+        false,
         true,
         false,
         false,
@@ -137,6 +141,7 @@ impl TextDecoder for ChannelDecoder {
                 1 => out.push_str("<|channel>"),
                 2 => out.push_str("<channel|>"),
                 3 => out.push_str("thought"),
+                4 => out.push_str("<|\"|>"),
                 10 => out.push('\n'),
                 id if (32..127).contains(&id) => out.push(id as u8 as char),
                 _ => {}
@@ -156,6 +161,8 @@ fn thinking_strips_nested_channel_reopen_from_reasoning() {
         vec![],
         Some(open),
         Some(close),
+        None,
+        false,
         true,
         false,
         false,
@@ -210,6 +217,8 @@ fn thinking_bare_reply_without_thought_span_is_content() {
         vec![],
         Some(open),
         Some(close),
+        None,
+        false,
         true,
         false,
         false,
@@ -231,6 +240,8 @@ fn thinking_pre_open_tokens_stay_content() {
         vec![],
         Some(open),
         Some(close),
+        None,
+        false,
         true,
         false,
         false,
@@ -245,9 +256,73 @@ fn thinking_pre_open_tokens_stay_content() {
     );
 }
 
+/// A channel-open id inside a `<|"|>` quote run is literal tool-arg content:
+/// it must stay in content verbatim (not toggle the thought state, not get
+/// filtered) so the parsed call's args round-trip byte-exact.
+#[test]
+fn quoted_channel_id_stays_in_content_verbatim() {
+    let (open, close, quote) = (1u32, 2u32, 4u32);
+    let mut m = DiffusionStreamMapper::new(
+        ChannelDecoder,
+        vec![],
+        Some(open),
+        Some(close),
+        Some(quote),
+        false,
+        true,
+        false,
+        false,
+    );
+    // call:e{x:<Q> <open> <Q>}   — the quoted open is data.
+    let mut canvas: Vec<u32> = "call:e{x:".chars().map(|ch| ch as u32).collect();
+    canvas.extend([quote, open, quote]);
+    canvas.push(c('}'));
+    let _ = m.on_step(&step(1, 2, &canvas, true));
+    assert_eq!(m.content(), "call:e{x:<|\"|><|channel><|\"|>}");
+    assert_eq!(m.reasoning(), "");
+    let calls = crate::tools::parse_tool_calls(m.content());
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].arguments["x"].as_str().unwrap(), "<|channel>");
+}
+
+/// With stop-skip enabled (mirroring the engine's continue-past-stop
+/// policy), a stop id inside an open quote run is content, not a stop —
+/// including when the quote opened in an earlier committed block.
+#[test]
+fn quoted_stop_id_streams_through_when_skip_enabled() {
+    let quote = 4u32;
+    let mk = |skip: bool| {
+        DiffusionStreamMapper::new(
+            ChannelDecoder,
+            vec![99],
+            None,
+            None,
+            Some(quote),
+            skip,
+            false,
+            false,
+            false,
+        )
+    };
+    // Block 1 leaves the quote OPEN; block 2 carries the stop id inside it.
+    let block1: Vec<u32> = vec![c('a'), quote, c('b')];
+    let block2: Vec<u32> = vec![c('c'), 99, quote, c('d')];
+    let mut m = mk(true);
+    let _ = m.on_step(&step(1, 2, &block1, true));
+    let _ = m.on_step(&step(2, 2, &block2, true));
+    assert!(!m.ended(), "quoted stop must not end the stream");
+    assert!(m.content().contains('d'), "content: {:?}", m.content());
+    // Same stream without the skip: the stop cuts inside the quote.
+    let mut m = mk(false);
+    let _ = m.on_step(&step(1, 2, &block1, true));
+    let _ = m.on_step(&step(2, 2, &block2, true));
+    assert!(m.ended());
+    assert!(!m.content().contains('d'));
+}
+
 #[test]
 fn stop_token_ends_and_cuts() {
-    let mut m = DiffusionStreamMapper::new(FakeDecoder, vec![99], None, None, false, false, false);
+    let mut m = DiffusionStreamMapper::new(FakeDecoder, vec![99], None, None, None, false, false, false, false);
     let canvas = [c('O'), c('k'), 99, c('X')];
     let out = m.on_step(&step(1, 2, &canvas, true));
     assert_eq!(out, vec![WireDelta::Content("Ok".to_string())]);
@@ -406,7 +481,7 @@ fn resolve_thinking_precedence() {
 
 #[test]
 fn paced_stream_holds_commit_and_releases_during_next_block() {
-    let mut m = DiffusionStreamMapper::new(FakeDecoder, vec![], None, None, false, false, true);
+    let mut m = DiffusionStreamMapper::new(FakeDecoder, vec![], None, None, None, false, false, false, true);
     let text: Vec<u32> = "abcdefghij".chars().map(|ch| ch as u32).collect();
     // Block 1 commits after 16 steps (seeds the EMA at (16+16)/2 = 16):
     // paced mode holds the text — no Content delta at commit.
@@ -434,7 +509,7 @@ fn paced_stream_holds_commit_and_releases_during_next_block() {
     assert!("abcdefghij".starts_with(&streamed));
     // Block 2 commits with a stop -> turn ends -> everything flushes.
     let stop = [c('z'), 999];
-    let mut m2 = DiffusionStreamMapper::new(FakeDecoder, vec![999], None, None, false, false, true);
+    let mut m2 = DiffusionStreamMapper::new(FakeDecoder, vec![999], None, None, None, false, false, false, true);
     let _ = m2.on_step(&step(1, 16, &text, true));
     let out = m2.on_step(&step(2, 4, &stop, true));
     let content: String = out
@@ -449,7 +524,7 @@ fn paced_stream_holds_commit_and_releases_during_next_block() {
 
 #[test]
 fn paced_stream_final_flush_releases_held_text() {
-    let mut m = DiffusionStreamMapper::new(FakeDecoder, vec![], None, None, false, false, true);
+    let mut m = DiffusionStreamMapper::new(FakeDecoder, vec![], None, None, None, false, false, false, true);
     let text: Vec<u32> = "hold me".chars().map(|ch| ch as u32).collect();
     let _ = m.on_step(&step(1, 16, &text, true));
     // Turn ends without a stop token (budget): final_flush drains the rest.
@@ -467,7 +542,7 @@ fn paced_stream_final_flush_releases_held_text() {
 
 #[test]
 fn paced_stream_tool_call_disables_pacing() {
-    let mut m = DiffusionStreamMapper::new(FakeDecoder, vec![], None, None, false, false, true);
+    let mut m = DiffusionStreamMapper::new(FakeDecoder, vec![], None, None, None, false, false, false, true);
     let text: Vec<u32> = "call:read{".chars().map(|ch| ch as u32).collect();
     // A committed block containing a tool call flushes immediately.
     let out = m.on_step(&step(1, 8, &text, true));

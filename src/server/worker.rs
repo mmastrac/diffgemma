@@ -286,7 +286,10 @@ impl Worker {
                     // field incident 2026-07-18). Adopt the calls from the
                     // thought-stripped raw decode instead of only logging.
                     if calls.is_empty() {
-                        // Unclosed span: strip_thinking keeps its text.
+                        // Bare/markerless reply: strip_thinking is a no-op on
+                        // it, so the raw decode carries the call. (Marker
+                        // scans are masked — a call whose args quote channel
+                        // markup survives the strip intact.)
                         let mut salvage = crate::tools::parse_tool_calls(
                             &crate::tools::strip_thinking(&raw_ids_decode),
                         );
@@ -482,17 +485,29 @@ impl Worker {
         // restores the old bet.
         cfg.continue_incomplete_tool_calls = crate::flags::continue_past_stop_enabled()
             && needs_tool_rendering(&job.messages, &job.tools);
+        // Only read under the flag above: quoted stop ids are literal
+        // tool-arg content, not stops (mirrored by `make_mapper`'s
+        // stop_skip_quoted so stream and turn stay in lockstep).
+        cfg.quote_token_id = self.quote_tok;
         cfg.degenerate_reply_check =
             crate::chat_template::empty_reply_check(&self.model_dir, self.stop_token_ids.clone());
         cfg
     }
 
     fn make_mapper(&self, job: &Job) -> ServeMapper {
+        let tool_mode = needs_tool_rendering(&job.messages, &job.tools);
         Arc::new(Mutex::new(DiffusionStreamMapper::new(
             Arc::clone(&self.tokenizer),
             self.stop_token_ids.clone(),
             self.channel_open,
             self.channel_close,
+            // Quote-parity split only makes sense where `<|"|>` runs are
+            // grammar — tool mode.
+            tool_mode.then_some(self.quote_tok).flatten(),
+            // Stop-skip must MIRROR the engine's stop policy (see
+            // `per_request_cfg`): skipping a quoted stop the engine honors
+            // (or vice versa) would desync stream and turn.
+            crate::flags::continue_past_stop_enabled() && tool_mode,
             job.enable_thinking,
             job.emit_drafts,
             crate::flags::paced_stream_enabled(),

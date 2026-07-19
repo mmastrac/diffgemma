@@ -167,6 +167,9 @@ struct Worker {
     stop_token_ids: Vec<u32>,
     channel_open: Option<u32>,
     channel_close: Option<u32>,
+    /// The `<|"|>` string-quote special id (mapper quote-parity: quoted
+    /// channel/stop ids are literal tool-arg content).
+    quote_tok: Option<u32>,
     max_seq: usize,
     steps: usize,
     no_early_stop: bool,
@@ -489,6 +492,7 @@ pub fn run_serve(
     );
     let channel_open = tokenizer.special_token_id("<|channel>");
     let channel_close = tokenizer.special_token_id("<channel|>");
+    let quote_tok = tokenizer.special_token_id("<|\"|>");
     let model_name: Arc<str> = Arc::from(
         model_dir
             .file_name()
@@ -509,6 +513,7 @@ pub fn run_serve(
         stop_token_ids,
         channel_open,
         channel_close,
+        quote_tok,
         max_seq: ctx,
         steps,
         no_early_stop: false,

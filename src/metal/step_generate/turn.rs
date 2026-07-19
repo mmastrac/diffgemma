@@ -144,12 +144,22 @@ fn default_commit_policy(
     // reply is exactly the model's turn, and skip the KV extend — unless
     // `continue_incomplete_tool_calls` and the reply still looks unfinished
     // (open `call:NAME{…}`, or trailing prose after a closed tool call).
+    // In that tool mode, a stop id inside an open `<|"|>` quote run is
+    // literal arg content (a written file containing chat markup), not a
+    // stop — without the skip, `kept = rel` silently drops the marker and
+    // the rest of the block out of the call's args.
     let mut kept = argmax_tokens.len();
     let mut end_turn = false;
+    let quote_skip = cfg
+        .quote_token_id
+        .filter(|_| cfg.continue_incomplete_tool_calls);
     if !cfg.stop_token_ids.is_empty()
-        && let Some(rel) = argmax_tokens
-            .iter()
-            .position(|id| cfg.stop_token_ids.contains(id))
+        && let Some(rel) = first_unquoted_stop(
+            &argmax_tokens,
+            &cfg.stop_token_ids,
+            quote_skip,
+            &ts.sequences[ts.prompt_token_ids.len()..],
+        )
     {
         kept = rel;
         pb.stats.stop_token_id = Some(argmax_tokens[rel]);
@@ -224,6 +234,29 @@ fn default_commit_policy(
         return Ok(false);
     }
     Ok(!end_turn)
+}
+
+/// Index of the first stop id in `block` that is not inside an open `<|"|>`
+/// quote run, with quote parity carried in from `reply_so_far` (the reply
+/// tokens committed before this block). `quote = None` is the plain scan.
+pub(super) fn first_unquoted_stop(
+    block: &[u32],
+    stops: &[u32],
+    quote: Option<u32>,
+    reply_so_far: &[u32],
+) -> Option<usize> {
+    let Some(q) = quote else {
+        return block.iter().position(|id| stops.contains(id));
+    };
+    let mut in_quote = reply_so_far.iter().filter(|&&id| id == q).count() % 2 == 1;
+    for (i, &id) in block.iter().enumerate() {
+        if id == q {
+            in_quote = !in_quote;
+        } else if !in_quote && stops.contains(&id) {
+            return Some(i);
+        }
+    }
+    None
 }
 
 /// Open a turn: select and run the prefill path (cross-turn reuse / fast
