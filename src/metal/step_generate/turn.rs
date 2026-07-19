@@ -274,7 +274,10 @@ pub fn begin_turn(
     let canvas_len = CANVAS;
     let layers = session.layers;
     let mut max_blocks = cfg.max_new_tokens.div_ceil(canvas_len).max(1);
-    if crate::flags::commit_conf_trim() > 0.0 || crate::flags::prefix_exit() > 0.0 {
+    if crate::flags::commit_conf_trim() > 0.0
+        || crate::flags::commit_conf_hard() > 0.0
+        || crate::flags::prefix_exit() > 0.0
+    {
         // Trimmed / prefix-exited blocks commit fewer than CANVAS tokens;
         // keep the TOKEN budget as the binding limit with 2x block headroom
         // so partial commits don't silently truncate long replies (both
@@ -1045,12 +1048,16 @@ pub fn propose_block(
     // guarantee; the E6/commit-guard paths own those failures).
     let mut conf_trim_row: Option<usize> = None;
     let mut conf_tau = crate::flags::commit_conf_trim();
+    // Hard tier is now its OWN flag: the census showed it carries the value
+    // (contested-committed 5 -> 0) while the dup tier cost a step-budget
+    // failure, so they must be gateable apart.
+    let hard_tau = crate::flags::commit_conf_hard();
     if conf_tau <= 0.0 && denoise_stop == DenoiseStopReason::PrefixExit {
         // A prefix-exited head shares the mean's blind spot (one unresolved
         // row hides in a settled head's mean) — always dup-scan it.
         conf_tau = 0.9;
     }
-    if conf_tau > 0.0 {
+    if conf_tau > 0.0 || hard_tau > 0.0 {
         const MIN_CONF_KEEP: usize = 16;
         let pmax = pmax_from_rowstats(&rt.read_sample_rowstats(committed_canvas));
         // Scan only the ANSWER region: everything at/after the first
@@ -1073,18 +1080,18 @@ pub fn propose_block(
         // class: `ownBut` 0.405, ` for` 0.39, code garble 0.27–0.55, and the
         // field `냥`/`("."` specimens — clearly-broken insertions cluster
         // below ~0.5 while benign creative soft rows dominate 0.55+).
-        const HARD_TRIM_PMAX: f32 = 0.5;
         let dup_at = |i: usize| {
             (i > 0 && argmax_tokens[i] == argmax_tokens[i - 1])
                 || (i + 1 < region_end && argmax_tokens[i] == argmax_tokens[i + 1])
         };
-        if let Some(first_bad) = (MIN_CONF_KEEP..region_end)
-            .find(|&i| pmax[i] < HARD_TRIM_PMAX || (pmax[i] < conf_tau && dup_at(i)))
-        {
+        if let Some(first_bad) = (MIN_CONF_KEEP..region_end).find(|&i| {
+            (hard_tau > 0.0 && pmax[i] < hard_tau)
+                || (conf_tau > 0.0 && pmax[i] < conf_tau && dup_at(i))
+        }) {
             if progress_enabled() {
                 eprintln!(
                     "step-generate: block {block_idx} confidence-trim at row {first_bad}/{committed_canvas} ({} token {} at p_max {:.3})",
-                    if pmax[first_bad] < HARD_TRIM_PMAX {
+                    if hard_tau > 0.0 && pmax[first_bad] < hard_tau {
                         "hard-tier"
                     } else {
                         "dup"

@@ -108,10 +108,49 @@ pub(crate) fn smoke_answer_matches(reply: &str, answer: &str, accept: &[String])
             !an.is_empty() && r.contains(&format!(" {an} "))
         })
 }
-/// Convergence + adherence gate over a prompt set. Reuses the chat session path
-/// so each prompt is a fresh single-turn generation; reports actual vs threshold
-/// denoise steps (ratchet thresholds down in the JSON as the engine improves).
+/// Structured result of one battery run.
+///
+/// The gate's verdict used to be an `ExitCode` and nothing else, so any
+/// caller wanting more (the `census` campaign runner) had to recover
+/// pass/fail from a process exit status and everything else from side
+/// channels. Returning the numbers directly makes them gateable.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SmokeOutcome {
+    pub(crate) passed: usize,
+    pub(crate) total: usize,
+    /// Long-context keyword retrieval (`--longctx` only; 0/0 otherwise).
+    pub(crate) kw_found: usize,
+    pub(crate) kw_total: usize,
+    /// Denoise steps of the COMMITTED blocks (what the gate ratchets on).
+    pub(crate) steps_committed: usize,
+    /// ALL denoise steps run, including work discarded by re-rolls — the
+    /// difference is what retries actually cost.
+    pub(crate) steps_total: usize,
+    pub(crate) failures: Vec<String>,
+    /// Set when the run could not start (bad model dir, missing spec, …);
+    /// distinct from "ran and failed prompts".
+    pub(crate) error: Option<String>,
+}
+
+impl SmokeOutcome {
+    fn err(msg: impl Into<String>) -> Self {
+        Self {
+            error: Some(msg.into()),
+            ..Default::default()
+        }
+    }
+    /// Ids of the prompts that failed, for a caller that reports detail.
+    pub(crate) fn failed_ids(&self) -> &[String] {
+        &self.failures
+    }
+    pub(crate) fn ok(&self) -> bool {
+        self.error.is_none() && self.total > 0 && self.passed == self.total
+    }
+}
+
+/// CLI adapter: run the gate, map the outcome to a process exit code.
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_smoketest_cmd(
     model_dir: &std::path::Path,
     prompts_path: Option<&std::path::Path>,
@@ -123,11 +162,47 @@ pub(crate) fn run_smoketest_cmd(
     repeat: usize,
     longctx: bool,
 ) -> ExitCode {
+    let out = run_smoketest(
+        model_dir,
+        prompts_path,
+        seed,
+        steps,
+        max_layers,
+        raw_prompt,
+        filter,
+        repeat,
+        longctx,
+    );
+    if let Some(e) = &out.error {
+        eprintln!("{e}");
+    }
+    if out.ok() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// Convergence + adherence gate over a prompt set. Reuses the chat session path
+/// so each prompt is a fresh single-turn generation; reports actual vs threshold
+/// denoise steps (ratchet thresholds down in the JSON as the engine improves).
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_smoketest(
+    model_dir: &std::path::Path,
+    prompts_path: Option<&std::path::Path>,
+    seed: Option<u64>,
+    steps: usize,
+    max_layers: Option<usize>,
+    raw_prompt: bool,
+    filter: Option<&str>,
+    repeat: usize,
+    longctx: bool,
+) -> SmokeOutcome {
     use metal::{StepGenerateConfig, StepGenerateSession, generate_with_session};
 
     if !dgq::store::looks_like_dgq_dir(model_dir) {
-        eprintln!("error: smoketest requires a .dgq directory (-m /path/to/quantized-weights)");
-        return ExitCode::FAILURE;
+        return SmokeOutcome::err("error: smoketest requires a .dgq directory (-m /path/to/quantized-weights)");
     }
 
     let default_path = std::path::PathBuf::from("fixtures/smoketest/prompts.json");
@@ -136,13 +211,11 @@ pub(crate) fn run_smoketest_cmd(
         Ok(text) => match serde_json::from_str(&text) {
             Ok(s) => s,
             Err(err) => {
-                eprintln!("error: parse {}: {err}", path.display());
-                return ExitCode::FAILURE;
+                return SmokeOutcome::err(format!("error: parse {}: {err}", path.display()));
             }
         },
         Err(err) => {
-            eprintln!("error: read {}: {err}", path.display());
-            return ExitCode::FAILURE;
+            return SmokeOutcome::err(format!("error: read {}: {err}", path.display()));
         }
     };
 
@@ -161,14 +234,12 @@ pub(crate) fn run_smoketest_cmd(
             spec.adherence.len() + spec.convergence.len()
         };
         if kept == 0 {
-            eprintln!("smoketest: no prompts match filter {pat:?}");
-            return ExitCode::FAILURE;
+            return SmokeOutcome::err(format!("smoketest: no prompts match filter {pat:?}"));
         }
         eprintln!("smoketest: filter {pat:?} -> {kept} prompt(s)");
     }
     if longctx && spec.longctx.is_empty() {
-        eprintln!("smoketest: --longctx but the spec has no longctx probes");
-        return ExitCode::FAILURE;
+        return SmokeOutcome::err("smoketest: --longctx but the spec has no longctx probes");
     }
 
     // Gate baseline seed: the spec pins it (re-baselined with accepted
@@ -181,8 +252,7 @@ pub(crate) fn run_smoketest_cmd(
     let layers = match resolve_model_layers(model_dir, max_layers) {
         Ok(n) => n,
         Err(err) => {
-            eprintln!("error: {err}");
-            return ExitCode::FAILURE;
+            return SmokeOutcome::err(format!("error: {err}"));
         }
     };
 
@@ -214,8 +284,7 @@ pub(crate) fn run_smoketest_cmd(
             s
         }
         Err(err) => {
-            eprintln!("error: {err}");
-            return ExitCode::FAILURE;
+            return SmokeOutcome::err(format!("error: {err}"));
         }
     };
 
@@ -223,11 +292,15 @@ pub(crate) fn run_smoketest_cmd(
     let tokenizer = match tokenizer::Tokenizer::load(&tok_path) {
         Ok(t) => t,
         Err(err) => {
-            eprintln!("error: {err}");
-            return ExitCode::FAILURE;
+            return SmokeOutcome::err(format!("error: {err}"));
         }
     };
 
+    // Step accounting, accumulated by the closure below: committed steps are
+    // what the gate ratchets on; the total additionally counts work thrown
+    // away by re-rolls, so `total - committed` is the retry cost.
+    let mut steps_committed_total = 0usize;
+    let mut steps_run_total = 0usize;
     // (denoise_steps, reply) for one fresh single-turn generation.
     let mut run_one = |prompt_text: &str| -> Result<(usize, String), crate::Error> {
         // Each prompt is independent — drop prior KV so we re-prefill fresh
@@ -249,6 +322,8 @@ pub(crate) fn run_smoketest_cmd(
         // first block — discarded re-roll steps are latency, not a convergence
         // regression, so they must not count against the per-prompt budget.
         let committed_steps: usize = out.block_steps_eff.iter().map(|&s| s as usize).sum();
+        steps_committed_total += committed_steps;
+        steps_run_total += out.denoise_steps_run;
         Ok((committed_steps, reply))
     };
 
@@ -258,6 +333,10 @@ pub(crate) fn run_smoketest_cmd(
     let mut passed = 0usize;
     let mut total = 0usize;
     let mut failures: Vec<String> = Vec::new();
+    // Hoisted out of the longctx branch so the outcome can carry retrieval
+    // (the per-tier locals below still drive the printed line).
+    let mut kw_found_total = 0usize;
+    let mut kw_total_total = 0usize;
 
     println!(
         "\nsmoketest: {} (seed {seed}, {layers}L, sampler cap {steps} steps)",
@@ -321,6 +400,8 @@ pub(crate) fn run_smoketest_cmd(
                     .collect();
                 kw_total += p.require.len();
                 kw_found += p.require.len() - missing.len();
+                kw_total_total += p.require.len();
+                kw_found_total += p.require.len() - missing.len();
                 let conv_ok = st <= p.max_steps;
                 let ok = missing.is_empty() && conv_ok;
                 if ok {
@@ -428,10 +509,17 @@ pub(crate) fn run_smoketest_cmd(
     } // end repeat loop
 
     println!("\nsmoketest: {passed}/{total} passed");
-    if passed == total {
-        ExitCode::SUCCESS
-    } else {
+    if passed != total {
         println!("failed: {}", failures.join(", "));
-        ExitCode::FAILURE
+    }
+    SmokeOutcome {
+        passed,
+        total,
+        kw_found: kw_found_total,
+        kw_total: kw_total_total,
+        steps_committed: steps_committed_total,
+        steps_total: steps_run_total,
+        failures,
+        error: None,
     }
 }

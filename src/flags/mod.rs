@@ -194,6 +194,18 @@ pub struct SamplerFlags {
     /// micro-stutter), so the tail re-denoises next block against committed
     /// context instead. Default OFF (0) pending multi-seed A/B.
     pub commit_conf_trim: f32,
+    /// `DGQ_COMMIT_CONF_HARD` (p_max floor in [0,1]; 0 disables): trim a
+    /// proposed block at the first answer-region row committing BELOW this
+    /// confidence, regardless of whether it duplicates a neighbour — the
+    /// insertion/omission class (`ownBut` 0.405, `("."`, whole clauses
+    /// dropped at 0.296-0.49) that the dup-conjunctive tier is blind to.
+    /// Split from `DGQ_COMMIT_CONF_TRIM` (which used to imply a hard tier at
+    /// 0.5) so the two tiers can be gated independently: the census found
+    /// the hard tier carries the value (contested-committed 5 -> 0) while
+    /// the dup tier cost a step-budget failure. 0.5 is the measured
+    /// separation point between broken insertions and benign creative soft
+    /// rows. Default OFF (0).
+    pub commit_conf_hard: f32,
     /// `DGQ_PREFIX_EXIT` (head mean-entropy threshold in nats, (0, 0.5];
     /// 0/out-of-range disables): per denoise step, if a head prefix (largest
     /// of active/2, /4, /8; ≥16 rows) has mean entropy below this while the
@@ -581,6 +593,7 @@ impl RuntimeConfig {
                     .filter(|&w| w >= 1),
                 commit_conf_trim: r
                     .ranged_f32("DGQ_COMMIT_CONF_TRIM", 0.0, 0.0, 1.0),
+                commit_conf_hard: r.ranged_f32("DGQ_COMMIT_CONF_HARD", 0.0, 0.0, 1.0),
                 prefix_exit: r
                     // 0.0 disables; the old filter REJECTED 1 and silently
                     // fell back to 0.0 — i.e. `=1` disabled the lever it read

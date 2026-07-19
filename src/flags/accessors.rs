@@ -73,7 +73,14 @@ pub fn force_canvas() -> Option<u32> {
     config().sampler.force_canvas
 }
 
-/// Commit-time confidence trim τ (`DGQ_COMMIT_CONF_TRIM`; 0 = off).
+/// Unconditional hard-tier trim floor (`DGQ_COMMIT_CONF_HARD`; 0 = off).
+/// Independent of the dup tier since the split.
+pub fn commit_conf_hard() -> f32 {
+    config().sampler.commit_conf_hard
+}
+
+/// Dup-conjunctive commit-time confidence trim τ (`DGQ_COMMIT_CONF_TRIM`;
+/// 0 = off). Trims only rows that are BOTH below τ and argmax-duplicating.
 pub fn commit_conf_trim() -> f32 {
     config().sampler.commit_conf_trim
 }

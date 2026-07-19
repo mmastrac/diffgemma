@@ -44,6 +44,14 @@ struct Metrics {
     dup: u64,
     trims: u64,
     steps: u64,
+    prompts_passed: u64,
+    prompts_total: u64,
+    kw_found: u64,
+    kw_total: u64,
+    /// Denoise steps of committed blocks, and ALL steps run (incl. work
+    /// discarded by re-rolls). The gap is what retries cost.
+    steps_committed: u64,
+    steps_run: u64,
 }
 
 impl Metrics {
@@ -55,6 +63,27 @@ impl Metrics {
         self.dup += o.dup;
         self.trims += o.trims;
         self.steps += o.steps;
+        self.prompts_passed += o.prompts_passed;
+        self.prompts_total += o.prompts_total;
+        self.kw_found += o.kw_found;
+        self.kw_total += o.kw_total;
+        self.steps_committed += o.steps_committed;
+        self.steps_run += o.steps_run;
+    }
+
+    /// Steps thrown away by re-rolls.
+    fn steps_retry(&self) -> u64 {
+        self.steps_run.saturating_sub(self.steps_committed)
+    }
+
+    /// Keyword retrieval across the arm's runs; 100 when unmeasured, so a
+    /// retrieval gate cannot fail a battery that has no keywords.
+    fn retrieval_pct(&self) -> f64 {
+        if self.kw_total == 0 {
+            100.0
+        } else {
+            100.0 * self.kw_found as f64 / self.kw_total as f64
+        }
     }
     /// The decision line: contested rows that reached KV, per 1k committed.
     fn contested_per_1k(&self) -> f64 {
@@ -81,6 +110,12 @@ impl Metrics {
             "trims" => self.trims as f64,
             "contested_per_1k" => self.contested_per_1k(),
             "mean_steps" => self.mean_steps(),
+            "prompts_passed" => self.prompts_passed as f64,
+            "prompts_total" => self.prompts_total as f64,
+            "retrieval_pct" => self.retrieval_pct(),
+            "steps_committed" => self.steps_committed as f64,
+            "steps_run" => self.steps_run as f64,
+            "steps_retry" => self.steps_retry() as f64,
             _ => return None,
         })
     }
@@ -367,7 +402,7 @@ pub(crate) fn run_census_cmd(
                 debug_assert!(errs.is_empty(), "{errs:?}");
                 let _guard = crate::flags::install_scoped(run_cfg);
                 eprintln!("census: [{tag}] running");
-                let code = super::smoketest::run_smoketest_cmd(
+                let outcome = super::smoketest::run_smoketest(
                     model_dir,
                     None,
                     Some(seed),
@@ -378,8 +413,24 @@ pub(crate) fn run_census_cmd(
                     1,
                     battery == "longctx",
                 );
+                if let Some(e) = &outcome.error {
+                    eprintln!("census: [{tag}] {e}");
+                } else if !outcome.ok() {
+                    eprintln!(
+                        "census: [{tag}] {}/{} passed; failed: {}",
+                        outcome.passed,
+                        outcome.total,
+                        outcome.failed_ids().join(", "),
+                    );
+                }
                 let mut m = scan_trace(&trace, tau);
-                m.passed = code == ExitCode::SUCCESS;
+                m.passed = outcome.ok();
+                m.prompts_passed = outcome.passed as u64;
+                m.prompts_total = outcome.total as u64;
+                m.kw_found = outcome.kw_found as u64;
+                m.kw_total = outcome.kw_total as u64;
+                m.steps_committed = outcome.steps_committed as u64;
+                m.steps_run = outcome.steps_total as u64;
                 let _ = cfg; // arm cfg kept for reporting; run_cfg is what ran
                 results
                     .entry((arm.name.clone(), battery.clone()))
@@ -406,13 +457,13 @@ fn report(
 ) -> ExitCode {
     println!();
     println!(
-        "{:<12} {:<9} {:>6} {:>7} {:>12} {:>6} {:>5} {:>6} {:>9} {:>10}",
+        "{:<12} {:<9} {:>6} {:>7} {:>12} {:>6} {:>5} {:>6} {:>9} {:>7} {:>8} {:>7}",
         "arm", "battery", "pass", "blocks", "commit_rows", "hard", "dup", "trims",
-        "cont/1k", "steps/blk"
+        "cont/1k", "retr%", "steps", "retry"
     );
     for ((arm, battery), m) in results {
         println!(
-            "{:<12} {:<9} {:>6} {:>7} {:>12} {:>6} {:>5} {:>6} {:>9.2} {:>10.1}",
+            "{:<12} {:<9} {:>6} {:>7} {:>12} {:>6} {:>5} {:>6} {:>9.2} {:>7.1} {:>8} {:>7}",
             arm,
             battery,
             if !with_pass {
@@ -428,7 +479,9 @@ fn report(
             m.dup,
             m.trims,
             m.contested_per_1k(),
-            m.mean_steps(),
+            m.retrieval_pct(),
+            m.steps_run,
+            m.steps_retry(),
         );
     }
 
@@ -442,6 +495,12 @@ fn report(
                     "hard": m.hard, "dup": m.dup, "trims": m.trims,
                     "contested_per_1k": m.contested_per_1k(),
                     "mean_steps": m.mean_steps(),
+                    "prompts_passed": m.prompts_passed,
+                    "prompts_total": m.prompts_total,
+                    "retrieval_pct": m.retrieval_pct(),
+                    "steps_committed": m.steps_committed,
+                    "steps_run": m.steps_run,
+                    "steps_retry": m.steps_retry(),
                 })
             })
             .collect();
