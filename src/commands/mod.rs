@@ -13,6 +13,7 @@ pub(crate) use std::path::PathBuf;
 pub(crate) use std::process::ExitCode;
 
 mod bench;
+mod census;
 mod chat;
 mod common;
 mod gen_cmd;
@@ -519,6 +520,27 @@ pub(crate) fn dispatch(cli: Cli) -> ExitCode {
             repeat,
             longctx,
         ),
+        #[cfg(target_os = "macos")]
+        Command::Census {
+            arms,
+            batteries,
+            seeds,
+            gates,
+            baseline,
+            out_dir,
+            tau,
+            steps,
+        } => census::run_census_cmd(
+            &cli.model_dir,
+            &arms,
+            &batteries,
+            &seeds,
+            &gates,
+            baseline.as_deref(),
+            out_dir.as_deref(),
+            tau,
+            steps,
+        ),
         Command::Manifest => {
             print!("{}", crate::shaders::manifest::render_toml());
             ExitCode::SUCCESS
@@ -609,7 +631,7 @@ pub(crate) fn run_command(
         Command::Attention => run_attention_parity(m),
         Command::Chat { .. } => ExitCode::FAILURE,
         Command::Serve { .. } => ExitCode::FAILURE,
-        Command::Smoketest { .. } => ExitCode::FAILURE,
+        Command::Smoketest { .. } | Command::Census { .. } => ExitCode::FAILURE,
         Command::Golden { .. } => ExitCode::FAILURE,
         Command::Replay { .. } => ExitCode::FAILURE,
         Command::Manifest => {

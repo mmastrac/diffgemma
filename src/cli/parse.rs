@@ -44,6 +44,13 @@ pub(crate) fn parse_cli() -> Cli {
     let mut smoke_filter: Option<String> = None;
     let mut smoke_repeat: usize = 1;
     let mut smoke_longctx = false;
+    let mut census_arms: Vec<String> = Vec::new();
+    let mut census_batteries: Vec<String> = Vec::new();
+    let mut census_seeds: Vec<u64> = Vec::new();
+    let mut census_gates: Vec<String> = Vec::new();
+    let mut census_baseline: Option<String> = None;
+    let mut census_out: Option<PathBuf> = None;
+    let mut census_tau: f32 = 0.9;
     let mut golden_bless = false;
     let mut write_golden: Option<String> = None;
     let mut write_trace: Option<PathBuf> = None;
@@ -219,6 +226,48 @@ pub(crate) fn parse_cli() -> Cli {
                 }
             }
             "--longctx" => smoke_longctx = true,
+            // census: --arm repeats; the rest are comma-lists.
+            "--arm" => {
+                if let Some(v) = args.next() {
+                    census_arms.push(v);
+                }
+            }
+            "--battery" => {
+                if let Some(v) = args.next() {
+                    census_batteries.extend(v.split(',').map(|s| s.trim().to_string()));
+                }
+            }
+            "--seeds" => {
+                if let Some(v) = args.next() {
+                    for part in v.split(',') {
+                        match part.trim().parse::<u64>() {
+                            Ok(n) => census_seeds.push(n),
+                            Err(_) => {
+                                eprintln!("--seeds: {part:?} is not a number");
+                                std::process::exit(2);
+                            }
+                        }
+                    }
+                }
+            }
+            "--gate" => {
+                if let Some(v) = args.next() {
+                    census_gates.push(v);
+                }
+            }
+            "--baseline" => census_baseline = args.next(),
+            "--out" => census_out = args.next().map(PathBuf::from),
+            "--tau" => {
+                if let Some(v) = args.next() {
+                    match v.parse::<f32>() {
+                        Ok(t) if (0.0..=1.0).contains(&t) => census_tau = t,
+                        _ => {
+                            eprintln!("--tau: expected a number in [0, 1], got {v:?}");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+            }
             "--bless-golden" | "--bless" => golden_bless = true,
             "--size" => {
                 if let Some(v) = args.next() {
@@ -482,6 +531,24 @@ pub(crate) fn parse_cli() -> Cli {
             filter: smoke_filter.clone(),
             repeat: smoke_repeat.max(1),
             longctx: smoke_longctx,
+        },
+        Some("census") => Command::Census {
+            arms: census_arms.clone(),
+            batteries: if census_batteries.is_empty() {
+                vec!["smoke".to_string()]
+            } else {
+                census_batteries.clone()
+            },
+            seeds: if census_seeds.is_empty() {
+                vec![7, 42, 123]
+            } else {
+                census_seeds.clone()
+            },
+            gates: census_gates.clone(),
+            baseline: census_baseline.clone(),
+            out_dir: census_out.clone(),
+            tau: census_tau,
+            steps: steps_production,
         },
         Some("manifest") => Command::Manifest,
         Some("replay") => Command::Replay {
@@ -857,7 +924,7 @@ pub(crate) fn parse_cli() -> Cli {
                 "  default (no command): generate-monolithic on .dgq, else generate-gpu (bf16)"
             );
             eprintln!(
-                "  main: ask | chat | serve | replay | smoketest | golden | quantize | tokenize <text>"
+                "  main: ask | chat | serve | replay | smoketest | census | golden | quantize | tokenize <text>"
             );
             eprintln!("  info: summary | config | manifest | weights <name> | probe-device");
             eprintln!(

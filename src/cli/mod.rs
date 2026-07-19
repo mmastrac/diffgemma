@@ -324,6 +324,21 @@ pub(crate) enum Command {
         /// Run ONLY the long-context doc-QA tier (bigger session; E13).
         longctx: bool,
     },
+    /// Flag-arm x battery campaign with explicit acceptance gates.
+    Census {
+        /// `NAME:KEY=VAL,...` per arm; `NAME:` is a no-override baseline.
+        arms: Vec<String>,
+        /// `smoke` and/or `longctx`.
+        batteries: Vec<String>,
+        seeds: Vec<u64>,
+        /// `METRIC<OP>VALUE`, value may be `baseline[*factor]`.
+        gates: Vec<String>,
+        baseline: Option<String>,
+        out_dir: Option<PathBuf>,
+        /// Dup-tier p_max threshold used when COUNTING warts (not a lever).
+        tau: f32,
+        steps: usize,
+    },
     /// Golden byte-identity pack — the Tier-1 refactor gate (task #73).
     /// Print the generated kernel FC-axis manifest (TOML) to stdout.
     Manifest,

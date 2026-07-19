@@ -36,33 +36,33 @@ use std::sync::{Arc, OnceLock};
 /// reads the process env; `EMPTY_ENV` backs `Default`, so the documented
 /// defaults and unset-env parsing CANNOT drift apart
 /// (`default_equals_empty_env_parse` pins the equivalence).
-struct EnvReader {
+struct EnvReader<'a> {
     real: bool,
+    /// An EXPLICIT set of pairs standing in for the process env (census
+    /// arms, tests). Takes precedence over `real`; absent names fall
+    /// through to "unset", so an arm specifies only what it overrides.
+    pairs: Option<&'a [(String, String)]>,
 }
-const REAL_ENV: EnvReader = EnvReader { real: true };
-const EMPTY_ENV: EnvReader = EnvReader { real: false };
+const REAL_ENV: EnvReader<'static> = EnvReader {
+    real: true,
+    pairs: None,
+};
+const EMPTY_ENV: EnvReader<'static> = EnvReader {
+    real: false,
+    pairs: None,
+};
 
-/// Test-only fake environment consulted by [`EnvReader::var`] on the
-/// non-real reader, so flag VALIDATION can be tested without `set_var`
-/// (unsafe/racy under edition 2024) and without a real process env.
-#[cfg(test)]
-thread_local! {
-    static FAKE_ENV: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
-}
-
-impl EnvReader {
+impl EnvReader<'_> {
     fn var(&self, name: &str) -> Result<String, std::env::VarError> {
-        if self.real {
-            return std::env::var(name);
-        }
-        #[cfg(test)]
-        if let Some(v) = FAKE_ENV.with(|f| {
-            f.borrow()
+        if let Some(pairs) = self.pairs {
+            return pairs
                 .iter()
                 .find(|(k, _)| k == name)
                 .map(|(_, v)| v.clone())
-        }) {
-            return Ok(v);
+                .ok_or(std::env::VarError::NotPresent);
+        }
+        if self.real {
+            return std::env::var(name);
         }
         Err(std::env::VarError::NotPresent)
     }
@@ -518,17 +518,31 @@ impl RuntimeConfig {
         cfg
     }
 
+    /// Parse an EXPLICIT set of `DGQ_*` pairs exactly as if they were the
+    /// process env — same helpers, same validation, same defaults for
+    /// anything absent. This is how a census ARM is built: an arm states
+    /// only what it overrides, and a typo in an arm is caught by the same
+    /// rules that would kill the process at startup, before any GPU time is
+    /// spent on it. Returns the rejections instead of exiting so the caller
+    /// can attribute them to the arm that owns them.
+    pub fn from_pairs(pairs: &[(String, String)]) -> (Self, Vec<String>) {
+        Self::from_reader_checked(&EnvReader {
+            real: false,
+            pairs: Some(pairs),
+        })
+    }
+
     /// [`from_reader`](Self::from_reader) plus the rejections it recorded —
     /// the testable half of the hard-kill validation, so tests can assert the
     /// diagnosis without the process exit.
-    fn from_reader_checked(r: &EnvReader) -> (Self, Vec<String>) {
+    fn from_reader_checked(r: &EnvReader<'_>) -> (Self, Vec<String>) {
         let _ = take_flag_errors(); // discard anything a prior parse left
         let cfg = Self::from_reader(r);
         (cfg, take_flag_errors())
     }
 
     /// The one parse. `Default` goes through this with [`EMPTY_ENV`].
-    fn from_reader(r: &EnvReader) -> Self {
+    fn from_reader(r: &EnvReader<'_>) -> Self {
         let parse_usize = |name: &str, default: usize| -> usize {
             let Ok(raw) = r.var(name) else { return default };
             match raw.parse::<usize>() {
@@ -766,24 +780,31 @@ pub fn quiet_set_by_user() -> bool {
     config().debug.quiet_from_env
 }
 
-/// Install `cfg` as the config for the CURRENT THREAD's scope; the returned
-/// guard restores the prior thread-local override on drop. TEST ONLY.
 #[cfg(test)]
 #[must_use = "the override is reverted when the guard drops"]
-pub fn install_for_test(cfg: RuntimeConfig) -> TestGuard {
-    let prev = OVERRIDE.with(|o| o.borrow_mut().replace(Arc::new(cfg)));
-    TestGuard { prev }
+pub fn install_for_test(cfg: RuntimeConfig) -> ScopedGuard {
+    install_scoped(cfg)
 }
 
-/// RAII guard from [`install_for_test`]: restores the prior thread-local
+/// Install `cfg` as the config for the CURRENT THREAD's scope; the returned
+/// guard restores the prior thread-local override on drop.
+///
+/// Thread-local by design, so a scoped override can never leak to another
+/// reader. Used by tests, and by `census` to run one ARM of a campaign
+/// without re-launching the process.
+#[must_use = "the override is reverted when the guard drops"]
+pub fn install_scoped(cfg: RuntimeConfig) -> ScopedGuard {
+    let prev = OVERRIDE.with(|o| o.borrow_mut().replace(Arc::new(cfg)));
+    ScopedGuard { prev }
+}
+
+/// RAII guard from [`install_scoped`]: restores the prior thread-local
 /// override (possibly `None`) on drop.
-#[cfg(test)]
-pub struct TestGuard {
+pub struct ScopedGuard {
     prev: Option<Arc<RuntimeConfig>>,
 }
 
-#[cfg(test)]
-impl Drop for TestGuard {
+impl Drop for ScopedGuard {
     fn drop(&mut self) {
         let prev = self.prev.take();
         OVERRIDE.with(|o| *o.borrow_mut() = prev);
@@ -797,17 +818,13 @@ pub use accessors::*;
 mod validation_tests {
     use super::*;
 
-    /// Parse with a fake env, returning the recorded rejections.
+    /// Parse an explicit pair set, returning the recorded rejections.
     fn parse_with(vars: &[(&str, &str)]) -> (RuntimeConfig, Vec<String>) {
-        FAKE_ENV.with(|f| {
-            *f.borrow_mut() = vars
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect()
-        });
-        let out = RuntimeConfig::from_reader_checked(&EMPTY_ENV);
-        FAKE_ENV.with(|f| f.borrow_mut().clear());
-        out
+        let owned: Vec<(String, String)> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        RuntimeConfig::from_pairs(&owned)
     }
 
     /// THE footgun this exists for: `DGQ_PREFIX_EXIT=1` is out of the lever's
@@ -871,5 +888,43 @@ mod validation_tests {
         let (cfg, errs) = parse_with(&[]);
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(cfg, RuntimeConfig::default());
+    }
+}
+
+#[cfg(test)]
+mod arm_tests {
+    use super::*;
+
+    /// A census ARM states only its overrides; everything else is the
+    /// documented default, so arms compose without restating the world.
+    #[test]
+    fn arm_overrides_only_what_it_names() {
+        let (cfg, errs) = RuntimeConfig::from_pairs(&[(
+            "DGQ_COMMIT_CONF_TRIM".into(),
+            "0.9".into(),
+        )]);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.sampler.commit_conf_trim, 0.9);
+        // Untouched flags keep their defaults.
+        let base = RuntimeConfig::default();
+        assert_eq!(cfg.sampler.prefix_exit, base.sampler.prefix_exit);
+        assert_eq!(cfg.perf.attn_topk, base.perf.attn_topk);
+        // An empty arm IS the default config.
+        let (empty, errs) = RuntimeConfig::from_pairs(&[]);
+        assert!(errs.is_empty());
+        assert_eq!(empty, base);
+    }
+
+    /// A typo in an arm must be caught by the SAME rules that guard the
+    /// process env — before the campaign spends GPU hours on it.
+    #[test]
+    fn arm_validation_matches_process_env_rules() {
+        let (_, errs) = RuntimeConfig::from_pairs(&[
+            ("DGQ_PREFIX_EXIT".into(), "1".into()),
+            ("DGQ_FREEZE".into(), "sometimes".into()),
+        ]);
+        assert_eq!(errs.len(), 2, "{errs:?}");
+        assert!(errs.iter().any(|e| e.contains("DGQ_PREFIX_EXIT")), "{errs:?}");
+        assert!(errs.iter().any(|e| e.contains("DGQ_FREEZE")), "{errs:?}");
     }
 }
