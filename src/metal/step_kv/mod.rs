@@ -218,7 +218,8 @@ fn kv_q8_pack_row(row: &mut [u8], src: &[f32]) {
     for g in 0..hd / 32 {
         let grp = &src[g * 32..g * 32 + 32];
         let mx = grp.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
-        let scale_bits = f32_to_f16_bits((mx / 127.0).max(1e-8));
+        let scale_bits =
+            f32_to_f16_bits((mx / 127.0).max(crate::shaders::kv_quant::Q8_MIN_SCALE));
         let sf = f16_bits_to_f32(scale_bits);
         row[hd + g * 2..hd + g * 2 + 2].copy_from_slice(&scale_bits.to_le_bytes());
         for j in 0..32 {

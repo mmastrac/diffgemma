@@ -249,21 +249,62 @@ Findings, in proposed fix order:
   requests → 47/47 blocks bit-identical argmax) — yet the live turn
   (reused 14,509 + 266 delta-extend, epoch 22, ring wrapped ~3.5×)
   forked from fresh prefill at block 1. Therefore reuse+delta KV is
-  numerically ≠ fresh-prefill KV. ROOT ISOLATED (kv_lineage_tests,
-  2026-07-18): **q8 ring-wrap delta-extend path-dependence**. The
-  two-path fingerprint matrix (fresh vs prefix+delta vs
-  overshoot+truncate(+re-extend)) is IDENTICAL on f16 at every config
-  including wrapped — and identical on q8 BELOW the wrap — but a q8
-  delta-extend into a WRAPPED ring diverges from fresh prefill
-  (total=6400 delta=256; deterministic, generation-free, ~3 min). The
-  live serve auto-selects q8 at ctx 100000 → long sessions accumulate
-  requantization drift vs fresh, explaining the trajectory fork (and
-  plausibly feeding strained conditioning). The q8 test is `#[ignore]`d
-  KNOWN RED; the f16 matrix is a live Tier-1 gate. NEXT: mechanism in
-  the q8 ring-write/requant seam (block scales at wrap boundaries vs
-  linear offsets?), fix, un-ignore. Environmental caveat RESOLVED — the
-  divergence is real and internal. Artifacts: scratchpad pmax/ turn11
-  traces, /tmp/logs (live), ops line 232.
+  numerically ≠ fresh-prefill KV. The f16 lineage matrix (fresh vs
+  prefix+delta vs overshoot+truncate(+re-extend)) is IDENTICAL at every
+  config including wrapped and is a live Tier-1 gate. **The q8 arm's
+  "ring-wrap path-dependence" was REFRAMED by forensics (2026-07-18,
+  `q8_ring_wrap_divergence_probe`) — see the q8 item below; crucially,
+  the live ctx-100000 serve ran F16 (measured: `q8_auto_threshold_crossover`
+  — 27.00 GiB working-set cap, q8 engages only at max_seq >= 178,176), so
+  the LIVE fork is NOT explained by q8 and REMAINS OPEN.**
+  Next live-fork suspects: non-256-aligned delta offsets (live reused
+  14,509 — the lineage matrix only exercised aligned deltas), deep-epoch
+  ring state, snapshot/restore seams. Environmental caveat RESOLVED —
+  the divergence is real and internal. Artifacts: scratchpad pmax/
+  turn11 traces, /tmp/logs (live), ops line 232.
+- **q8 fast-prefill is broken WHOLESALE (forensics 2026-07-18,
+  `q8_ring_wrap_divergence_probe` — supersedes the "ring-wrap requant
+  seam" framing)**: in any q8 session the fast-prefill forward goes
+  **NaN** after layer 0 — layer-0 Q/K/V land real (verified byte-level),
+  yet the attention output plane comes back non-finite on BOTH the
+  scalar and mma2 kernels, and the plane trace shows
+  hidden/attn_out/ffg/dense/moein all `non_finite=true, max_abs=0.0`
+  from row 0 on. Every later layer then quantizes a NaN hidden stream:
+  the tell is a KV row of ALL `-127` codes, which is the q8 signature of
+  a NaN source (`fmax(NaN,lo)=lo`, so Metal's `clamp(NaN,-127,127)`
+  yields -127; it is NOT a quantized zero — proven by the scale-floor
+  fix below, after which the scales became normal but the codes stayed
+  -127). Established by elimination: scrubbed builds are
+  deterministic AND path-independent (the RED "divergence" needed
+  cross-build residue: unwritten rows keep whatever the previous build
+  left); chunking only changes which DEAD bands survive ring
+  overwrites; the f16 control writes every row in every layer.
+  Exposure: auto-q8 needs f16-resident > 85% of the GPU working set
+  (MEASURED on this 36 GB M3 Pro: cap 27.00 GiB, crossover max_seq
+  178,176) or a forced `DGQ_KV_Q8=1` — so production has effectively
+  never run q8; nothing gates it (the
+  attention harness has ZERO q8 coverage; smoketest is short-prompt;
+  golden deliberately sizes `GOLDEN_MAX_SEQ` to stay UNDER the q8-auto
+  threshold, so it only ever gates f16). NEXT: (1) isolated q8
+  attention harness case (scalar + mma2 vs the CPU oracle over a
+  crafted q8 cache) to pin where the NaN is born — the session-level
+  probes can see it happen but not inside one dispatch; (2) fix; (3)
+  un-ignore `kv_lineage_paths_are_fingerprint_identical_q8`; (4) only
+  then is q8 a usable >178k memory lever. The probe test documents
+  every forensic arm and stays runnable.
+  TWO QUANTIZER DEFECTS FOUND + FIXED ALONG THE WAY (upstream of the
+  NaN, not its cause): the q8 group-scale floor was `1e-8`, which is
+  unrepresentable in f16, so (a) it rounded to +0.0 and `x/scale`
+  divided by zero — the NaN clamping to -127 on GPU but 0 in the Rust
+  mirror, and (b) Metal emits subnormal halves while this crate's
+  `f32_to_f16_bits` FLUSHES subnormals to zero, so every group with
+  `max|x| < 127*2^-14 = 7.75e-3` stored a different scale on the CPU
+  packer than the GPU kernel — two silent CPU/GPU divergences in a pair
+  documented as bit-for-bit. Both closed by flooring the scale at the
+  min NORMAL half (`Q8_MIN_SCALE` / `KV_Q8_MIN_SCALE`, 2^-14), which is
+  a fixed point of both conversions; real KV rows sit orders of
+  magnitude above it, so no realistic row's bytes change (golden 8/8
+  unchanged). Test: `q8_small_groups_quantize_finitely_at_a_representable_scale`.
 - **Exact-prefix repeat misses reuse**: re-POSTing an identical request
   paid `truncate_kv_to` ring rebuild 22263→14775 (39.45s!) then
   re-prefilled all 14,775 with `reused 0`. Should be ~100% reuse
@@ -433,8 +474,9 @@ soft-expand → (only if evidence demands) sparse visible anchors.
 - **E9 rotated experts** (near-bf16 fidelity within the 4-bit budget;
   prove with plain absmax q4 first)
 - **E10 precision-decay KV** (value is 18-24 GB Macs / >262k, not 36 GB)
-- **q6/q5 non-expert weights** (memory lever redundant with q8-KV-auto on
-  36 GB)
+- **q6/q5 non-expert weights** (memory lever was judged redundant with
+  q8-KV-auto on 36 GB — REVISIT: q8 KV is broken and ungated, so that
+  fallback does not currently exist; see the q8 correctness-debt item)
 - **E8 rotated/un-RoPE'd KV** — parked on value; revive only if q4-KV
   becomes necessary (see Negative Knowledge)
 - **E22 block-granular pre-QK top-k** — KILLED on the mass oracle

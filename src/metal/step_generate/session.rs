@@ -370,6 +370,22 @@ impl StepGenerateSession {
         &self.kv_valid_tokens
     }
 
+    /// TEST-ONLY: zero the monolithic KV + f32 side ring and reset the
+    /// side-ring cursor (see `StepRuntime::debug_scrub_kv`). Lineage probes
+    /// use this to rule cross-build residue in or out.
+    #[cfg(test)]
+    pub(crate) fn scrub_kv_for_test(&mut self) {
+        self.reset_kv();
+        self.rt.debug_scrub_kv();
+    }
+
+    /// TEST-ONLY: selective scrub (see `StepRuntime::debug_scrub_kv_parts`).
+    #[cfg(test)]
+    pub(crate) fn scrub_kv_parts_for_test(&mut self, monolithic: bool, side: bool) {
+        self.reset_kv();
+        self.rt.debug_scrub_kv_parts(monolithic, side);
+    }
+
     /// Direct KV buffer + layout access for oracle-style tests that MUTATE
     /// stored KV between prefill and denoise (E16 fusion replay: rewrite aged
     /// full-layer rows, then re-enter generation on the doctored cache).

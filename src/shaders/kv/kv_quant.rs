@@ -17,6 +17,17 @@ use crate::shaders::hadamard::fwht_normalized;
 
 pub const KV_GROUP: usize = 32;
 
+/// Smallest group scale the q8 KV quantizer may store: 2^-14, the min
+/// positive NORMAL half. MUST match the Metal `KV_Q8_MIN_SCALE` — see the
+/// note there. The previous `1e-8` floor was unrepresentable in f16, which
+/// broke the CPU/GPU mirror twice over: it rounded to +0.0 (so `x / scale`
+/// divided by zero, and the NaN clamped to -127 on the GPU but 0 here), and
+/// Metal emits subnormal halves while [`f32_to_f16_bits`] flushes them to
+/// zero, so every group with `max|x| < 127*2^-14 = 7.75e-3` stored a
+/// different scale on each side. Real KV rows sit orders of magnitude above
+/// this floor, so no realistic row's bytes change.
+pub const Q8_MIN_SCALE: f32 = 1.0 / 16384.0; // 2^-14, exact in f32
+
 /// KV-cache storage format — the code threaded through the Rust API and set
 /// as the `KV_FMT` uint function constant (index 4) the KV kernels specialize
 /// on. Always a code, never a bool: the format is multi-state (f16 / q8 / q4)
@@ -79,7 +90,7 @@ pub fn q8_roundtrip(src: &[f32], out: &mut [f32]) {
     for g in 0..hd / KV_GROUP {
         let grp = &src[g * KV_GROUP..(g + 1) * KV_GROUP];
         let mx = grp.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
-        let sf = f16_bits_to_f32(f32_to_f16_bits((mx / 127.0).max(1e-8)));
+        let sf = f16_bits_to_f32(f32_to_f16_bits((mx / 127.0).max(Q8_MIN_SCALE)));
         for j in 0..KV_GROUP {
             let q = (grp[j] / sf).round_ties_even().clamp(-127.0, 127.0);
             out[g * KV_GROUP + j] = q * sf;
@@ -235,6 +246,46 @@ mod tests {
             }
         }
         v
+    }
+
+    /// Small-magnitude groups must quantize FINITELY and to a scale both
+    /// halves of the mirror can represent. Two defects motivated the
+    /// [`Q8_MIN_SCALE`] floor (see its doc): the old `1e-8` floor rounded to
+    /// +0.0 (0/0 -> NaN, clamped to -127 on GPU but 0 on CPU), and Metal's
+    /// subnormal halves vs this crate's flush-to-zero `f32_to_f16_bits` gave
+    /// the two sides different scales for every group under 7.75e-3.
+    #[test]
+    fn q8_small_groups_quantize_finitely_at_a_representable_scale() {
+        let hd = KV_GROUP * 2;
+        // Every magnitude band, including the two old failure regions.
+        for &mag in &[0.0f32, 1e-7, 1e-5, 1e-3, 7.0e-3, 0.5, 22.0] {
+            let src: Vec<f32> = (0..hd)
+                .map(|i| mag * if i % 3 == 0 { -1.0 } else { 1.0 })
+                .collect();
+            let mut out = vec![f32::NAN; hd];
+            q8_roundtrip(&src, &mut out);
+            assert!(out.iter().all(|v| v.is_finite()), "mag {mag}: {out:?}");
+            // The stored scale must survive BOTH f16 conversions unchanged —
+            // i.e. never land in the subnormal range this crate flushes.
+            let mx = src.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+            let scale = (mx / 127.0).max(Q8_MIN_SCALE);
+            let stored = f16_bits_to_f32(f32_to_f16_bits(scale));
+            assert!(stored > 0.0, "mag {mag}: scale flushed to zero");
+            assert_eq!(
+                stored,
+                f16_bits_to_f32(f32_to_f16_bits(stored)),
+                "mag {mag}: scale not a fixed point of f16 rounding"
+            );
+        }
+        // A zero row is exactly zero (scale is the floor, all codes 0).
+        let mut zero_out = vec![f32::NAN; hd];
+        q8_roundtrip(&vec![0.0f32; hd], &mut zero_out);
+        assert!(zero_out.iter().all(|&v| v == 0.0), "{zero_out:?}");
+        // Realistic rows are unaffected by the floor.
+        let real: Vec<f32> = (0..hd).map(|i| ((i as f32) * 0.03).sin() * 3.0).collect();
+        let mut real_out = vec![0.0f32; hd];
+        q8_roundtrip(&real, &mut real_out);
+        assert!(rel_rms(&real, &real_out) < 0.01);
     }
 
     #[test]

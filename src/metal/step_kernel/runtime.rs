@@ -146,6 +146,39 @@ impl StepRuntime {
         h
     }
 
+    /// TEST-ONLY diagnostic: zero the monolithic KV cache and the E14 f32
+    /// side ring, and invalidate the side-ring cursor — removes all
+    /// cross-build residue so lineage probes can distinguish true
+    /// path-dependence from stale-state leakage.
+    #[cfg(test)]
+    pub fn debug_scrub_kv(&mut self) {
+        self.debug_scrub_kv_parts(true, true);
+    }
+
+    /// TEST-ONLY: selectively zero the monolithic cache and/or the f32 side
+    /// ring — lets lineage probes identify WHICH buffer's residue a stale
+    /// read is picking up.
+    #[cfg(test)]
+    pub fn debug_scrub_kv_parts(&mut self, monolithic: bool, side: bool) {
+        if monolithic {
+            unsafe {
+                std::ptr::write_bytes(
+                    self.bufs.kvcache.contents().as_ptr() as *mut u8,
+                    0,
+                    self.bufs.kvcache.length(),
+                );
+            }
+        }
+        if side && let Some(s) = &self.bufs.kv_f32_side {
+            unsafe {
+                std::ptr::write_bytes(s.contents().as_ptr() as *mut u8, 0, s.length());
+            }
+        }
+        if side {
+            self.kv_f32_side_valid = 0;
+        }
+    }
+
     /// Fill the ENTIRE monolithic KV cache with a deterministic pseudorandom
     /// f16-safe pattern (fixed small exponent, random sign + mantissa →
     /// ±[0.125, 0.25)) and declare `n_tokens` of it causally valid. Test

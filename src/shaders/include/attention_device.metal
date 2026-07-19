@@ -53,6 +53,21 @@ inline void kv_store(device ushort *p, uint i, float v) {
 // [K rows x nkv][V rows x nkv].
 constant uint KV_Q8_GROUP = 32u;
 
+/// Smallest group scale either side of the mirror may STORE: 2^-14, the min
+/// positive NORMAL half. The old `1e-8` floor was unrepresentable in f16 and
+/// broke the CPU/GPU pair two different ways (both fixed by this floor):
+///   - `1e-8` rounds to +0.0, so `src / sf` divided by zero. The NaN clamped
+///     to -127 here (Metal's clamp = fmin(fmax(x,lo),hi), and fmax(NaN,lo)
+///     returns lo) but to 0 in Rust (`NaN as i8`).
+///   - Metal's `half()` emits SUBNORMALS; the Rust `f32_to_f16_bits` flushes
+///     them to zero. So every group with max|x| < 127*2^-14 = 7.75e-3 stored
+///     a valid subnormal scale on the GPU and a ZERO scale on the CPU —
+///     silently different bytes for the same KV.
+/// Flooring at the min normal keeps both conversions exact and identical.
+/// Real KV (|x| <~ 22 -> scale ~0.17) is orders of magnitude above it, so no
+/// realistic row's bytes change.
+constant float KV_Q8_MIN_SCALE = 1.0f / 16384.0f;  // 2^-14, exact
+
 // KV storage format code (mirrors Rust KvFormat::code(); the KV_FMT function
 // constant): 0 = f16, 1 = q8 (group-32 i8+f16 scales), 2 = q4 (group-32
 // i4+f16 scales, reserved for the rotated-KV lever). Row bytes per format:
@@ -106,7 +121,7 @@ inline void kv_q8_store_group(device uchar *row, uint g, thread const float *src
     for (uint j = 0u; j < KV_Q8_GROUP; ++j) {
         mx = max(mx, fabs(src[j]));
     }
-    const float scale = max(mx / 127.0f, 1e-8f);
+    const float scale = max(mx / 127.0f, KV_Q8_MIN_SCALE);
     // Quantize with the f16-ROUNDED scale so dequant is exact w.r.t. the
     // stored scale (and the CPU mirror agrees bit-for-bit).
     const half sh = half(scale);
