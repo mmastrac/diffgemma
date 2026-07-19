@@ -155,7 +155,7 @@ Settled against the reference implementations and the CPU oracle — do NOT
 
 ## 3. Prefill path selection
 
-`should_fast_prefill(prompt_len)` (src/flags.rs): prompts ≤ 256 tokens use
+`should_fast_prefill(prompt_len)` (src/flags/): prompts ≤ 256 tokens use
 the **f32 engine** prefill; longer prompts use the **fast quantized (bf16
 activation) prefill** (~3 ms/token, ~20× the engine, doc-QA-grounded to 13k+
 and needle-exact to 105k). `DGQ_FAST_PREFILL_MAX` (default 0 = uncapped) can
@@ -219,7 +219,7 @@ Order of operations per step (monolithic GPU path, `interpret_step`):
 `probs = softmax(logits / T_schedule)` per position;
 `soft_embed = probs @ embed × sqrt(hidden)`; fed to the next step.
 
-Production paths (`src/flags.rs`):
+Production paths (`src/flags/`):
 - **Sparse (default on bf16-embed models, `DGQ_SC_SPARSE=0` opts out)**:
   gather only survivor tokens with prob ≥ e^-10 of the row max. APPROXIMATE
   (drops the tail); signed off — ~16%/step, output-level equivalent to MLX.
@@ -320,9 +320,18 @@ Metal's single-buffer cap (20.25 GiB on M3 Pro/36 GB) are split at
 | 9 | Entropy accept + stop thresholds in nats | same as MLX (natural log) | noted because prose sometimes says "bits" — the code is nats everywhere |
 | 10 | Entropy-only early stop (mean H < 0.05, §6) | ours only | tail steps only micro-flip near-ties; signed off, census cost = creative-tail only |
 | 11 | Degenerate-first-block re-roll + shrink-on-retry | ours only | empty-reply attractor is intrinsic; deterministic per seed; no-op on good replies |
+| 12 | Commit-time confidence trim, dup tier (`DGQ_COMMIT_CONF_TRIM=0.9`, §6) | ours only | a proposed block is cut at the first answer-region row that is BOTH below τ and argmax-duplicating a neighbour — an unresolved row copies its neighbour, so the tail re-denoises next block against committed context. Default ON 2026-07-19 (census: contested-committed 1.31→1.03 per 1k rows, smoke 17/17 ×3, longctx 4/4, retrieval 100%, +1 step, golden 8/8 byte-identical — it never fires on a golden case). Enables the `max_blocks *= 2` token-budget headroom. The UNCONDITIONAL hard tier is the separate `DGQ_COMMIT_CONF_HARD`, still OFF |
 
 ## 10. Validation harnesses
 
+- **Census campaigns** (`census`): flag ARMS × BATTERIES with explicit
+  acceptance gates in ONE process, stats to a directory. Arms are `DGQ_*`
+  overrides in env form parsed through the same validation as the process
+  env (a typo'd arm dies before any model load); metrics come from the
+  denoise p_max trace so they are battery-independent
+  (`contested_per_1k`, `hard`, `dup`, `steps_committed`/`steps_run`/
+  `steps_retry`, `retrieval_pct`). `--analyze DIR` re-reports an existing
+  campaign with no GPU. This is how a quality lever is decided.
 - **Smoketest gate** (`smoketest`, fixtures/smoketest/prompts.json): 12
   adherence + 5 convergence prompts; spec seed 7. Multi-seed aggregate
   {7,42,123} judges trajectory-reshuffling changes.

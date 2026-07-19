@@ -242,9 +242,17 @@ GPU tests SIGSEGV). Model-gated tests key off `test_util::dgq_model_dir()`.
   them from general Gemma knowledge without checking the reference.
 - **Kernel FC registration:** each kernel's `SPEC` const;
   `diffgemma-mps manifest` renders the full TOML view.
-- **Env flags:** `src/flags.rs` is the single registry — check it before
-  inventing any `DGQ_` flag. Flags are parsed once into `Config`; tests use
-  `install_for_test(cfg)`.
+- **Env flags:** `src/flags/` (mod.rs = registry + parse, accessors.rs =
+  read surface) is the single registry — check it before inventing any
+  `DGQ_` flag. Parsed once into `RuntimeConfig`; scoped overrides via
+  `install_scoped(cfg)`, and `RuntimeConfig::from_pairs` parses an explicit
+  set (census arms) through the same helpers and validation.
+- **A set-but-invalid `DGQ_*` value is FATAL** (exit 2, every offender
+  named), never a silent fallback to the default — `DGQ_PREFIX_EXIT=1` used
+  to DISABLE the lever it read like it was enabling. Unset is still the
+  documented default. Add new flags via the checked helpers
+  (`on_if_one`/`on_unless_zero`/`parse_usize`/`ranged_f32`), not a bespoke
+  `var(...)` chain, or the value silently stops being validated.
 - **Do not trust comments over code/manifest.** A stale comment has already
   misled. Verify against the authoritative source.
 
@@ -267,6 +275,14 @@ GPU tests SIGSEGV). Model-gated tests key off `test_util::dgq_model_dir()`.
   ~15 GiB = machine crash). `pgrep -f "diffgemma-mps -m"` before any GPU run;
   serialize every bench.
 - **Wart census** (10-seed greentext) is the sensitive sampler probe.
+- **Pass `--seed` EXPLICITLY on every arm of a comparison.** `smoketest
+  --longctx` defaults to seed 7, not 42, so a defaulted run and a
+  `--seed 42` run are different experiments. This cost a whole false
+  "long-context nondeterminism" finding (2026-07-19, retracted): the two
+  differing runs were seeds 7 and 42. The tool prints `seed N` — read it.
+- **Replicate BOTH arms before believing a difference, and run the cheapest
+  control first**: re-run the exact failing command verbatim. A control on
+  only the arm you suspect proves nothing about the one you trust.
 - **State assumptions as checks, not beliefs.** "The stride is K+2" → assert
   it against the manifest and a byte dump.
 - **One bisecting measurement beats three rounds of theory.**
@@ -302,6 +318,14 @@ diffgemma-mps smoketest -m $WEIGHTS             # 17/17 required
 diffgemma-mps smoketest -m $WEIGHTS --longctx   # doc-QA ladder
 diffgemma-mps golden -m $WEIGHTS                # byte-identity 8/8
 cargo test --release -- --test-threads=1
+
+# Campaigns: flag ARMS x BATTERIES with explicit gates, one process, stats
+# to a dir. This is how a quality lever is decided — not a shell loop.
+diffgemma-mps census -m $WEIGHTS \
+  --arm 'off:' --arm 'trim:DGQ_COMMIT_CONF_TRIM=0.9' \
+  --battery smoke,longctx --seeds 7,42,123 --baseline off \
+  --out runs/c1 --gate 'passed==1' --gate 'contested_per_1k<=baseline'
+diffgemma-mps census -m $WEIGHTS --analyze runs/c1   # re-report, no GPU
 
 # Bench / diagnostics
 diffgemma-mps bench-step-kernel -m $WEIGHTS --profile-steps 8
