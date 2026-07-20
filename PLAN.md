@@ -1203,6 +1203,40 @@ markup as literal text (48 tokens vs 22), so it is unreachable from
 `step-layer-probe` today. Probing it properly needs tools support added to
 that command — a separate small engine change.
 
+**RETRACTION (2026-07-19): every "warm / committed canvas" result is VOID.**
+The `--warm-steps` probe does NOT denoise toward the prompt. Calling
+`run_denoise_step()` directly after `reset_block` churns noise instead of
+converging: after 6 steps, 60 DIFFERENT prompts produce only 4 distinct
+canvases, filled with multilingual garbage
+(`𝔸 রক্তের ley ...`). A canvas actually resolving would give 60
+distinct, prompt-specific canvases containing Python and prose. It evidently
+needs state the generate loop configures and this path does not.
+
+Retracted as a result: "the language signal is weaker on the committed canvas
+(effect 1.12 -> 0.31)" — that compared cold against a DIFFERENTLY-NOISY
+canvas, not a resolved one; and the positions-8/20/35/55 experiment, which
+probed junk rather than generated code. **"Probe when ready to commit" is
+UNTESTED, not answered.**
+
+UNAFFECTED: everything on the cold path (`warm=0`), which uses the original
+working probe and shows 1 distinct canvas across all 60 prompts (exact
+control) — the L6 code/prose axis, the rust-vs-python language probe, the
+gap/scatter decomposition, and the markdown/fenced/tool-mode results.
+
+Fix path if resumed: find what `run_forward_once(StepFinishMode::Full)` needs
+that `build_step_runtime` + `reset_block` does not supply (accept/commit
+thresholds, step schedule, or SC state are the candidates), or drive the
+canvas through the real generate loop and snapshot it. The `--warm-steps`
+flag stays UNCOMMITTED — it is not fit for its stated purpose.
+
+**Note for tree-sitter rerolling**: this bug is the point. "Advance the canvas
+under control, then inspect" is exactly what a reroll needs, and it is NOT
+readily available today. The prerequisite is therefore the **P5 `Refine`
+primitive**, not tree-sitter and not the classifier. Also worth recording:
+tree-sitter rerolling does NOT depend on the mode/language classifier at all
+for single-language generations, where the language is already known from the
+prompt or the fence. The classifier only earns its keep on MIXED content.
+
 **TOOL-CALLING IS ITS OWN MODE (2026-07-19), with the control that proves it.**
 No engine change was needed: `--raw` (NOT `--raw-prompt`, which is silently
 ignored — unknown flags do not error) round-trips the chat template
