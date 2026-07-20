@@ -82,6 +82,8 @@ pub struct LayerHiddenProbeCheckpoint {
 #[derive(Debug)]
 pub struct LayerHiddenProbeResult {
     pub position: usize,
+    /// Denoise steps run before the instrumented forward (0 = seeded canvas).
+    pub warm_steps: usize,
     pub canvas_token: u32,
     pub token_ids: Vec<u32>,
     pub checkpoints: Vec<LayerHiddenProbeCheckpoint>,
@@ -111,11 +113,17 @@ fn hidden_vec_stats(v: &[f32]) -> (f32, f32) {
     (l2, max_abs)
 }
 
-/// Step-1 forward with per-layer hidden readback at one canvas row (for MLX parity).
+/// Per-layer hidden readback at one canvas row (for MLX parity).
+///
+/// `warm_steps` denoise steps run BEFORE the instrumented forward, so the
+/// canvas can be probed once it has actually resolved rather than while it is
+/// still seeded noise. 0 (the default everywhere except an explicit
+/// `--warm-steps`) reproduces the original step-1 behaviour exactly.
 pub fn run_step_layer_hidden_probe(
     model_dir: &Path,
     cfg: &StepSmokeConfig,
     position: usize,
+    warm_steps: usize,
 ) -> Result<LayerHiddenProbeResult, Error> {
     if position >= CANVAS {
         return Err(Error::Runtime("layer probe position out of range"));
@@ -135,8 +143,16 @@ pub fn run_step_layer_hidden_probe(
     let layers = rt.layers;
     let mut checkpoints = Vec::new();
 
+    // Advance the canvas to the state we actually want to inspect. Each call
+    // is a full denoise step (forward + sampler + commit), so after N the
+    // canvas holds what the model has settled on, not the seeded noise.
+    for _ in 0..warm_steps {
+        rt.run_denoise_step()?;
+    }
+    let step_index = warm_steps as u32 + 1;
+
     rt.dispatch_and_wait(|enc| {
-        enc.encode_step_preamble(&layout, 1)?;
+        enc.encode_step_preamble(&layout, step_index)?;
         Ok(())
     })?;
     {
@@ -191,6 +207,7 @@ pub fn run_step_layer_hidden_probe(
     let state: CanvasState = read_struct(&rt.bufs.state);
     Ok(LayerHiddenProbeResult {
         position,
+        warm_steps,
         canvas_token: state.ids[position],
         token_ids: state.ids.to_vec(),
         checkpoints,

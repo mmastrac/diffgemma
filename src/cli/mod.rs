@@ -164,6 +164,19 @@ pub(crate) enum Command {
         raw_prompt: bool,
         output: PathBuf,
         position: usize,
+        /// Denoise steps to run BEFORE probing (`--warm-steps`). 0 probes the
+        /// seeded-noise canvas; N>0 probes what the model has settled on.
+        warm_steps: usize,
+    },
+    /// Fit an output-token classification probe for THIS model from a labelled
+    /// prompt spec. Hidden space is checkpoint-specific, so the probe is
+    /// regenerated locally rather than shipped baked.
+    FitTokenProbe {
+        spec: PathBuf,
+        output: PathBuf,
+        layer: Option<usize>,
+        seed: u64,
+        max_seq: usize,
     },
     StepAttnDump {
         prompt: Option<String>,

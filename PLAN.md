@@ -914,6 +914,42 @@ membudget permits. Still open below.
   (prefill fns prod vs `forward_decoder*` validation),
   `memwatch.rs` (`physical_ram_bytes` prod). Move pending user sign-off.
 
+### Output-token classification (in progress 2026-07-20)
+
+`fit-token-probe` SHIPPED and working: 44-sample labelled spec
+(`fixtures/token_probe/code_prose.json`) -> LOO accuracy 1.000, effect size
+2.59 at L9, ~100 s on an M3 Pro. Deliberately NOT a baked artifact — hidden
+space is checkpoint-specific, so an end user refits locally after swapping or
+requantizing a model. Measured layer ranking on that spec: L6 1.000/2.75,
+L9 1.000/2.59, L29 0.977/0.97. Default is L9, because L6 is marginally better
+for TASK INTENT while L9 is the better tracker of the CURRENTLY EMITTED mode,
+which is what token colouring needs (and L9 gives up almost nothing on
+intent). Compare layers on EFFECT SIZE; accuracy saturates.
+
+Remaining: `DGQ_TOKEN_CLASS=<probe.json>` -> capture layer-L hidden into a
+side buffer during the denoise forward -> classify at block commit ->
+per-token labels on `ChatEvent::BlockCommit` -> colour in `chat_ui`. The
+engine capture is the real work: the arena holds hidden for the CURRENT layer
+only and overwrites it per layer, so reading L9 at commit needs an encoder
+change to copy that plane aside.
+
+**PERF IS A REQUIREMENT, NOT AN AFTERTHOUGHT — two separate obligations:**
+1. **Exactly zero cost when OFF.** The capture must not be ENCODED at all
+   when disabled — not "encoded and discarded", not a per-step flag read.
+   Flag parsed once into `RuntimeConfig` ([[flags-config]] discipline), and
+   the dispatch omitted entirely.
+2. **Measured cost when ON.** Expected ~1.44 MiB device copy per step
+   (256 x 2816 bf16), which should be single-digit microseconds against a
+   ~700 ms step — but this project's own rule is that the guess does not
+   count. Classification happens at COMMIT, so there is one readback per
+   BLOCK, not per step.
+
+Measurement protocol (per [[perf-timing-methodology]]): `bench-step-kernel
+--profile-steps N`, off vs on, ADJACENT within one session, several
+iterations, nothing else on the GPU. Report per-step deltas, not totals.
+Acceptance: OFF must be indistinguishable from the pre-change baseline; ON
+must be justified by what it buys.
+
 ### WAY OUT THERE — can the generation LANGUAGE be read off the model's own state?
 
 Speculative, not planned, nobody is convinced. Recorded because the core

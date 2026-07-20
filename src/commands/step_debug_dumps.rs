@@ -155,6 +155,7 @@ pub(crate) fn run_step_layer_probe_cmd(
     raw_prompt: bool,
     output: &std::path::Path,
     position: usize,
+    warm_steps: usize,
 ) -> ExitCode {
     use metal::{StepSmokeConfig, run_step_layer_hidden_dump, write_step_layer_hidden_dump};
 
@@ -177,16 +178,17 @@ pub(crate) fn run_step_layer_probe_cmd(
         return ExitCode::FAILURE;
     }
     let label = prompt.unwrap_or_else(|| "Hello".to_string());
-    match run_step_layer_hidden_dump(model_dir, &cfg, &label, position) {
+    match run_step_layer_hidden_dump(model_dir, &cfg, &label, position, warm_steps) {
         Ok(dump) => {
             if let Err(err) = write_step_layer_hidden_dump(output, &dump) {
                 eprintln!("error: {err}");
                 return ExitCode::FAILURE;
             }
             println!(
-                "wrote {} (pos={}, {} checkpoints)",
+                "wrote {} (pos={}, warm_steps={}, {} checkpoints)",
                 output.display(),
                 dump.position,
+                dump.warm_steps,
                 dump.checkpoints.len()
             );
             ExitCode::SUCCESS

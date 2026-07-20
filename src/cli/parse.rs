@@ -85,6 +85,12 @@ pub(crate) fn parse_cli() -> Cli {
     let mut step_logit_positions = String::new();
     let mut step_logit_top_k = 10usize;
     let mut step_layer_position = 129usize;
+    // `--warm-steps N`: denoise N steps before probing, so the canvas holds
+    // what the model settled on rather than seeded noise. 0 = original behaviour.
+    let mut step_warm_steps = 0usize;
+    // `fit-token-probe --spec <labelled prompts>`; `--layer` overrides the spec.
+    let mut probe_spec: Option<PathBuf> = None;
+    let mut probe_layer: Option<usize> = None;
     let mut step_attn_layer = 2usize;
     let mut step_moe_expert = 18u32;
     let mut step_moe_route_grouped = true;
@@ -375,6 +381,29 @@ pub(crate) fn parse_cli() -> Cli {
                         eprintln!("invalid --logit-top-k");
                         std::process::exit(2);
                     });
+                }
+            }
+            "--spec" => probe_spec = args.next().map(PathBuf::from),
+            "--layer" => {
+                if let Some(v) = args.next() {
+                    match v.parse::<usize>() {
+                        Ok(n) => probe_layer = Some(n),
+                        Err(_) => {
+                            eprintln!("--layer: expected an integer, got {v:?}");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+            }
+            "--warm-steps" => {
+                if let Some(v) = args.next() {
+                    match v.parse::<usize>() {
+                        Ok(n) => step_warm_steps = n,
+                        Err(_) => {
+                            eprintln!("--warm-steps: expected a non-negative integer, got {v:?}");
+                            std::process::exit(2);
+                        }
+                    }
                 }
             }
             "--layer-position" => {
@@ -721,6 +750,25 @@ pub(crate) fn parse_cli() -> Cli {
                 gpu_kv: step_gpu_kv,
             }
         }
+        Some("fit-token-probe") => {
+            let output = output_dir.unwrap_or_else(|| {
+                eprintln!(
+                    "usage: diffgemma-mps fit-token-probe -m MODEL --spec SPEC.json -o PROBE.json [--layer 29] [--seed 42]"
+                );
+                std::process::exit(2);
+            });
+            let Some(spec) = probe_spec.clone() else {
+                eprintln!("fit-token-probe: --spec SPEC.json is required");
+                std::process::exit(2);
+            };
+            Command::FitTokenProbe {
+                spec,
+                output,
+                layer: probe_layer,
+                seed,
+                max_seq: step_max_seq.max(64),
+            }
+        }
         Some("step-layer-probe") => {
             let output = output_dir.unwrap_or_else(|| {
                 eprintln!(
@@ -736,6 +784,7 @@ pub(crate) fn parse_cli() -> Cli {
                 raw_prompt,
                 output,
                 position: step_layer_position,
+                warm_steps: step_warm_steps,
             }
         }
         Some("step-attn-dump") => {

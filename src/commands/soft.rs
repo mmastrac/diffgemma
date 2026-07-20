@@ -28,8 +28,6 @@
 //! counts as passed if it ran at all. Anyone who wants a floor opts in with
 //! `--gate 'soft_pct>=baseline'`.
 
-use super::*;
-
 /// One indirect-retrieval probe.
 #[derive(serde::Deserialize)]
 pub(crate) struct SoftProbe {

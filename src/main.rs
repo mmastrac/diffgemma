@@ -45,6 +45,7 @@ mod server;
 #[allow(dead_code)]
 mod shaders;
 mod tensor;
+mod token_class;
 mod tokenizer;
 mod toolcompact;
 mod tools;

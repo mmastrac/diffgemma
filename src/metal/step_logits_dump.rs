@@ -404,6 +404,9 @@ pub struct StepLayerHiddenDump {
     pub seed: u64,
     pub layers: usize,
     pub position: usize,
+    /// Denoise steps run before the probe: 0 probes the seeded canvas, N>0
+    /// probes what the model has actually settled on.
+    pub warm_steps: usize,
     pub canvas_token: u32,
     pub checkpoints: Vec<LayerHiddenCheckpoint>,
 }
@@ -424,6 +427,7 @@ fn layer_hidden_dump_from_probe(
         seed,
         layers,
         position: probe.position,
+        warm_steps: probe.warm_steps,
         canvas_token: probe.canvas_token,
         checkpoints: probe
             .checkpoints
@@ -444,8 +448,9 @@ pub fn run_step_layer_hidden_dump(
     cfg: &StepSmokeConfig,
     prompt_label: &str,
     position: usize,
+    warm_steps: usize,
 ) -> Result<StepLayerHiddenDump, Error> {
-    let probe = run_step_layer_hidden_probe(model_dir, cfg, position)?;
+    let probe = run_step_layer_hidden_probe(model_dir, cfg, position, warm_steps)?;
     Ok(layer_hidden_dump_from_probe(
         &probe,
         prompt_label,

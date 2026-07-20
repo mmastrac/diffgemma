@@ -16,6 +16,7 @@ mod bench;
 mod census;
 mod chat;
 mod common;
+mod fit_token_probe;
 mod gen_cmd;
 mod golden_cmd;
 mod model_ops;
@@ -30,6 +31,7 @@ mod step_gate;
 pub(crate) use bench::*;
 pub(crate) use chat::*;
 pub(crate) use common::*;
+pub(crate) use fit_token_probe::*;
 pub(crate) use gen_cmd::*;
 pub(crate) use golden_cmd::*;
 pub(crate) use model_ops::*;
@@ -187,6 +189,7 @@ pub(crate) fn dispatch(cli: Cli) -> ExitCode {
             raw_prompt,
             output,
             position,
+            warm_steps,
         } => run_step_layer_probe_cmd(
             &cli.model_dir,
             prompt,
@@ -196,7 +199,15 @@ pub(crate) fn dispatch(cli: Cli) -> ExitCode {
             raw_prompt,
             &output,
             position,
+            warm_steps,
         ),
+        Command::FitTokenProbe {
+            spec,
+            output,
+            layer,
+            seed,
+            max_seq,
+        } => run_fit_token_probe_cmd(&cli.model_dir, &spec, &output, layer, seed, max_seq),
         Command::StepAttnDump {
             prompt,
             layers,
@@ -635,7 +646,9 @@ pub(crate) fn run_command(
         Command::Attention => run_attention_parity(m),
         Command::Chat { .. } => ExitCode::FAILURE,
         Command::Serve { .. } => ExitCode::FAILURE,
-        Command::Smoketest { .. } | Command::Census { .. } => ExitCode::FAILURE,
+        Command::Smoketest { .. } | Command::Census { .. } | Command::FitTokenProbe { .. } => {
+            ExitCode::FAILURE
+        }
         Command::Golden { .. } => ExitCode::FAILURE,
         Command::Replay { .. } => ExitCode::FAILURE,
         Command::Manifest => {
