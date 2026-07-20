@@ -942,12 +942,51 @@ several inline spans, and (b) a signal that exists BEFORE tokens resolve —
 and (b) currently has no consumer, since in-step grammar constraint does not
 transfer to diffusion (no well-defined prefix state to constrain against).
 
+**Probe the CANVAS HIDDEN STATE, not the KV cache.** These are different
+tensors and only one of them answers the question. The KV cache holds
+COMMITTED context (prompt + committed blocks) and persists; the canvas hidden
+state is the residual stream at the 256 canvas positions, recomputed from
+scratch every denoise step and never cached. During denoise the canvas
+attends causally to KV and BIDIRECTIONALLY to itself.
+
+That asymmetry is why the canvas is the right target. "This is Rust" is
+plausibly encoded diffusely across many KV positions (the instruction, `fn`,
+`};`), each weak on its own, and a single K/V vector is a compressed local
+slice of it. A canvas position after several attention layers is an
+AGGREGATE of those positions, and aggregation is what makes distributed
+information locally decodable. The bidirectional canvas self-attention
+amplifies this further: once a few positions resolve to `fn`/`let`, EVERY
+canvas position can absorb it, including ones to the left of the evidence and
+ones whose own token is a bare newline. An AR decoder cannot do that.
+
+**TWO CONTROLS, without which a high number means nothing.** Both exist to
+stop the probe from being an expensive tokenizer:
+1. **Language-neutral positions.** A probe on almost any layer will score
+   highly by reading TOKEN IDENTITY — `def`, `fn`, `};` are trivially
+   diagnostic. Evaluate on positions whose own token is neutral (bare
+   newline, indent run, plain identifier, `}`). If accuracy survives there,
+   the language state is genuinely carried in context; if it collapses, the
+   probe was reading the tokens.
+2. **Prompts that do NOT name the language.** Every `programmatic` probe says
+   "Write a complete Rust program", so the instruction alone settles it and a
+   probe would just be re-reading the prompt. Continue-this-snippet prompts
+   are needed to test whether the model tracks language from the code it is
+   WRITING.
+
+**The measurement is a gradient, not a yes/no** — which makes it falsifiable.
+At a language-neutral canvas position, probe accuracy should RISE with layer
+depth (aggregation accumulates) and RISE with denoise step (the canvas
+resolves, so self-attention has more evidence to pool). Flat-and-high from
+step 1 layer 1 = reading the prompt instruction. Flat-and-low = no signal.
+A rising curve is the interesting result.
+
 **Cheapest experiment that could kill it, in order:**
 1. `step-moe-route-dump` on a handful of known-bash / known-python /
    known-prose generations. Do the expert histograms separate AT ALL? No
    probe training needed to answer this. If they do not separate, stop.
-2. If they separate: linear probe on routes (or hidden states) for
-   per-position language, scored against token-derived labels.
+2. If they separate: linear probe on canvas hidden states (`step-layer-probe`
+   dumps per-layer activations at a position) for per-position language,
+   WITH both controls above, scored as the layer x step gradient.
 3. Only then consider an on-device implementation.
 
 **If it ever gets built, it should be a KERNEL, not a readback.** Router state
