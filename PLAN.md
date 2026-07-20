@@ -980,6 +980,26 @@ resolves, so self-attention has more evidence to pool). Flat-and-high from
 step 1 layer 1 = reading the prompt instruction. Flat-and-low = no signal.
 A rising curve is the interesting result.
 
+**If the KV cache IS probed, probe V in the GLOBAL layers.** Note first that
+"the KV signal is weak" is an INFERENCE, not a measurement — nothing here has
+been probed yet, so do not go looking for why it is weak before establishing
+that it is. Precision is ruled out on the numbers: KV is f16, range-checked,
+max|KV| ~ 22 against an f16 max of 65504, and linear probes for coarse
+categorical features survive int8. Two architectural reasons are real,
+though:
+- **Cached K is POST-RoPE** (`QKV -> RoPE -> attention`; Negative Knowledge
+  discusses un-RoPE-ing pre-cache). Position-dependent rotation smears a
+  fixed linear direction across positions, so a position-agnostic probe on K
+  underperforms for reasons unrelated to whether the feature exists. **V is
+  un-rotated** — `values = keys` happens BEFORE k_norm/rope — so V is the
+  strictly better target.
+- **25 of 30 layers are sliding-window**; a cached position there is only
+  attended by nearby queries. Long-range context state should concentrate in
+  the **5 global layers**.
+Everything else (GQA compression, the distributed-fragment argument) is about
+ACCESSIBILITY rather than presence and would persist even in a hypothetical
+f32 full-attention cache.
+
 **Cheapest experiment that could kill it, in order:**
 1. `step-moe-route-dump` on a handful of known-bash / known-python /
    known-prose generations. Do the expert histograms separate AT ALL? No
