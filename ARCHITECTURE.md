@@ -52,6 +52,31 @@ random tokens; denoising iteratively re-predicts every position in parallel
 until the sequence snaps into focus. Distinct from masked LMs: uncertain
 positions get fresh random samples each step, not a stable `[MASK]`.
 
+**Consequence: joint constraints across positions are not representable.**
+Each step samples every position from its OWN marginal. Where correctness
+depends on a relationship BETWEEN adjacent positions, nothing in the update
+enforces it — each position independently picks what is locally plausible.
+The visible symptom is a **convention blend**: when two valid surface forms
+compete, the canvas can settle on a mixture that is valid under neither.
+Observed in generated shell code, in both directions:
+
+    emitted            valid form A        valid form B
+    if [ $#" -lt 1 ]   if [ $# -lt 1 ]     if [ "$#" -ne 1 ]
+    == *$SEARCH"*      == *$SEARCH*        == *"$SEARCH"*
+
+Both are single-token surface defects inside otherwise-correct programs, and
+both commit at p_max ~1.0 — after the blend each position is individually
+plausible; only the PAIR is wrong. A sequential decoder cannot produce this
+class, because it conditions on its own previous emission. No confidence
+threshold detects it either (see the trim tiers in §6 and Negative
+Knowledge): the tokens are not uncertain, they are jointly inconsistent.
+
+The blending mechanism is inferred from step traces rather than proven, and
+its RATE is unquantified; what is measured is that the model does not
+coordinate such a pair (37.5% of doubled-delimiter states resolve by both
+positions correcting at once, n=16, rejecting a coordinated null at
+p=0.003).
+
 ## Two attention phases, one set of weights
 
 - **Causal prefill (encoder role)**: the prompt — and later each committed

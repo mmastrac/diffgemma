@@ -156,6 +156,31 @@ Findings, in proposed fix order:
   User directive that still stands until revisited: thinking never
   reaches KV RE-PREFILL from the client side.
 
+### Census batteries — open items
+
+- **Quantify the convention-blend rate.** The mechanism is now in
+  ARCHITECTURE Part I ("Discrete diffusion, not continuous") as a property of
+  parallel per-position decoding: where two valid surface forms compete, the
+  canvas can settle on a mixture valid under neither (`if [ $#" -lt 1 ]`,
+  `== *$SEARCH"*`). Characterised and directionally confirmed, NOT
+  quantified. Next step: a detector for unbalanced delimiter counts in the
+  committed answer region, run against convention-ambiguous constructs, to
+  get a rate rather than six specimens. Everything needed is already in the
+  `DGQ_TRACE_PMAX_JSONL` traces — no GPU required to build it, only to
+  generate more samples.
+- **RETIRE `soft` as an instrument for `DGQ_COMMIT_CONF_HARD`** (do not try
+  to repair it). Grounded retrieval never produces the sub-0.5 rows the tier
+  triggers on — min p_max across 881 trim-scannable soft rows is 0.733 — so
+  the lever is unreachable by construction, and lengthening the answers did
+  not change that. `soft` remains valuable as a retrieval/hallucination
+  rate; it is simply the wrong instrument for that decision. `programmatic`
+  and `smoke` DO exercise the tier.
+- **`scan_trace` answer-region fix — optional, low priority.** Mirroring the
+  trim's `(MIN_CONF_KEEP..region_end)` rule would make `contested_per_1k`
+  mean what its name implies and sharpen effect sizes. The arm ORDERING was
+  verified to survive the correction, so this is legibility, not
+  correctness — and it still moves a published number.
+
 ### Census batteries
 
 `census` (arms x batteries x gates, `src/commands/census.rs`) has `smoke`,
