@@ -442,6 +442,56 @@ inference rather than a controlled result: a clean test would compare
 same-step resolutions of a doubled state against across-step ones, which
 needs more harmful instances than 2.
 
+**Controlled test of the joint-constraint mechanism — RAN, and it refined the
+hypothesis rather than confirming it (campaign E: 4 delimiter-stress probes,
+18 fresh seeds, 407 generations).**
+
+Two analysis bugs were caught before reporting, both of which INFLATED the
+result: (a) arms share trajectories until a trim fires, so the same
+generation was counted up to 4x; (b) a dropped `pend=[]` made every commit
+re-scan the whole step history. Uncorrected they read 8-vs-6 and then
+14-vs-14; corrected, the prior data held 4 events, not 14. Dedup by
+(battery, seed, generation) and reset per generation.
+
+Pre-registered predictions scored: event rate >=3x -> 2.7x (NARROWLY
+FALSIFIED); overshoot >=30% if real / <10% under a coordinated null -> 37.5%
+(supports); glob probes fail in correlated fashion -> weak, 3+1 of 18 seeds.
+
+Pooled result, n=16 doubled-state resolutions: **6 overshoot (37.5%), 10
+correct.** Note the perfect "both positions moved <-> overshoot" association
+is ARITHMETIC, not evidence — with one quote per position a pure removal
+gives 0 iff both moved. The informative quantity is the SIMULTANEOUS
+double-update rate. Against a coordinated null (overshoot rare, p=0.10),
+P(X>=6) = 0.0033, REJECTED. Against weak coordination (p=0.25) or full
+independence (p=0.50), not rejected. So: **the model demonstrably does not
+coordinate the pair, but n=16 cannot separate weak coordination from
+independence.**
+
+**The contradiction that matters, and the real finding.** The seeds with
+overshoot events (103, 107, 137, 173) and the seeds that actually FAILED
+(139, 151, 157, 181) have ZERO overlap, and every failure is an unbalanced
+quote. So the adjacent-pair double-removal does NOT account for the observed
+failures. Inspecting them:
+
+    seed 139 FAIL:  if [ $#" -lt 1 ]; then     <- spurious CLOSING quote (11, odd)
+    seed 103 pass:  if [ $#  -lt 1 ]; then
+    seed 103 pass:  if [ "$#" -ne 1 ]; then
+
+Both quoting conventions are valid (`[ $# ]` and `[ "$#" ]`); seed 139 landed
+on a BLEND of the two, valid under neither. That is the same shape as seed
+7's `*$SEARCH"*` (blend of `*$X*` and `*"$X"*`) but in the opposite
+direction. **The general mechanism is not "double removal" — it is that the
+model holds two competing valid surface conventions and independent
+per-position updates can emit a MIXTURE of them.** My double-removal
+hypothesis was one special case of this and explained only the subtractive
+direction.
+
+Status: the broader blend hypothesis now covers every quote failure observed
+(seeds 7, 17, 139, 151, 157, 181) in both directions. It is NOT yet
+quantified — a detector for "final answer region has odd quote count" run
+against convention-ambiguous constructs would do it, and is the obvious next
+step if this is worth more time.
+
 Open work on this battery:
 - **Judge it by the multi-seed aggregate, never one seed.** Seed 42 scores
   14/14 and seed 7 scores 12/14 on identical code; a single-seed run of this

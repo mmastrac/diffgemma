@@ -411,6 +411,47 @@
       "max_steps": 120
     },
     {
+      "id": "bash_glob_prefix",
+      "lang": "bash",
+      "prompt": "Write a complete bash script. Its first command-line argument is a prefix; the remaining arguments are words. Print, one per line and in the order given, only those words that begin with the prefix. It must always exit with status 0, even when no word matches. Print nothing else. Output only the script source, with no explanation and no markdown code fences.",
+      "cases": [
+        { "args": ["ap", "apple", "apricot", "banana"], "stdout": "apple\napricot", "exit": 0 },
+        { "args": ["con", "apple", "apricot", "banana"], "stdout": "", "exit": 0 },
+        { "args": ["b", "banana", "berry"], "stdout": "banana\nberry", "exit": 0 }
+      ],
+      "max_steps": 120
+    },
+    {
+      "id": "bash_glob_suffix",
+      "lang": "bash",
+      "prompt": "Write a complete bash script. Its first command-line argument is a suffix; the remaining arguments are words. Print, one per line and in the order given, only those words that end with the suffix. It must always exit with status 0, even when no word matches. Print nothing else. Output only the script source, with no explanation and no markdown code fences.",
+      "cases": [
+        { "args": ["ry", "berry", "cherry", "apple"], "stdout": "berry\ncherry", "exit": 0 },
+        { "args": ["zz", "berry", "apple"], "stdout": "", "exit": 0 }
+      ],
+      "max_steps": 120
+    },
+    {
+      "id": "bash_quote_wrap",
+      "lang": "bash",
+      "prompt": "Write a complete bash script. It prints each of its command-line arguments on its own line, wrapped in double-quote characters, in the order given. For an argument of hi the line printed must be exactly \"hi\" including the quote characters. Print nothing else. Output only the script source, with no explanation and no markdown code fences.",
+      "cases": [
+        { "args": ["a", "b"], "stdout": "\"a\"\n\"b\"", "exit": 0 },
+        { "args": ["hello world"], "stdout": "\"hello world\"", "exit": 0 }
+      ],
+      "max_steps": 120
+    },
+    {
+      "id": "py_quote_swap",
+      "lang": "python",
+      "prompt": "Write a complete Python 3 program. It takes one command-line argument and prints it with every single-quote character replaced by a double-quote character. Print nothing else. Output only the Python source code, with no explanation and no markdown code fences.",
+      "cases": [
+        { "args": ["it's 'here'"], "stdout": "it\"s \"here\"", "exit": 0 },
+        { "args": ["none"], "stdout": "none", "exit": 0 }
+      ],
+      "max_steps": 120
+    },
+    {
       "id": "rust_regex_lite",
       "lang": "rust",
       "prompt": "Write a complete Rust program. It takes two command-line arguments: a pattern and a text. In the pattern, the character . matches any single character, and the character * matches zero or more repetitions of the single character immediately preceding it. All other characters match themselves literally. The pattern must match the ENTIRE text, not merely a part of it. Print true if the pattern matches the text and false if it does not. Do not use any external crate and do not use any regular expression library. Print nothing else. Output only the Rust source code, with no explanation and no markdown code fences.",
