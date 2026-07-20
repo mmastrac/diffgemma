@@ -1203,6 +1203,43 @@ markup as literal text (48 tokens vs 22), so it is unreachable from
 `step-layer-probe` today. Probing it properly needs tools support added to
 that command — a separate small engine change.
 
+**MODE TRACKS THE MOST RECENT COMMITTED CONTENT — the cheap output-time
+classifier looks VIABLE (2026-07-19).** Ran entirely on the working COLD path
+(exact token control), sidestepping the broken warm probe: partial content is
+placed in the prompt AFTER the model-turn marker, which reproduces the
+output-time situation where already-committed tokens live in KV. 4 conditions
+x 6 items.
+
+                  purecode   endcode  pureprose  endprose   (L29)
+    purecode          1.00      0.74      -0.90     -0.86
+    endcode           0.74      1.00      -0.89     -0.84
+    pureprose        -0.90     -0.89       1.00      0.75
+    endprose         -0.86     -0.84       0.75      1.00
+
+Both MIXED contexts follow their ENDING content, not their instruction:
+`endcode` (prose intro then code) sits with pure code (+0.74/-0.89), and
+`endprose` (code then prose) sits with pure prose (+0.75/-0.86). A probe
+labelled by trailing content scores LOO acc 0.96 (L6) / 1.00 (L9) / 1.00
+(L29), effects 1.43 / 1.22 / 0.92.
+
+Two refinements this forces:
+- **Late layers are better for SEGMENTATION**, inverting the earlier L6
+  advice. The split: **L6 reads task INTENT** ("what was I asked to do"),
+  **L29 reads current MODE** ("what am I emitting now"). Per-token
+  classification wants the late layer.
+- **Mode transitions look ASYMMETRIC.** At L6 `endcode` locks onto code at
+  once (+0.75) while `endprose` only weakly returns to prose (+0.08), needing
+  L29 to fully reassert (+0.75). Code context is "stickier"; code->prose may
+  be the harder transition to detect. n=6 per group — treat as a lead.
+
+**Scope boundary, important:** the committed content here sits in the PROMPT
+(KV), which models the CROSS-BLOCK case (earlier blocks already committed).
+Within a block the current content lives in the CANVAS, which canvas positions
+see bidirectionally — and testing THAT was exactly what the broken warm path
+was for. So: cross-block mode tracking is DEMONSTRATED; intra-block per-token
+classification remains UNTESTED and is blocked on repairing the diag denoise
+path.
+
 **RETRACTION (2026-07-19): every "warm / committed canvas" result is VOID.**
 The `--warm-steps` probe does NOT denoise toward the prompt. Calling
 `run_denoise_step()` directly after `reset_block` churns noise instead of
