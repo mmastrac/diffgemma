@@ -1000,6 +1000,57 @@ Everything else (GQA compression, the distributed-fragment argument) is about
 ACCESSIBILITY rather than presence and would persist even in a hypothetical
 f32 full-attention cache.
 
+**FIRST RESULTS (2026-07-19, `step-layer-probe`, 18 prompts, seed 42).**
+Probed the CANVAS hidden state at position 129 across all 30 layers. The tool
+gives a free version of the control we wanted: the canvas token at that
+position is seeded noise, IDENTICAL (id 71153) in every condition, and at the
+`after_preamble` checkpoint every condition is cosine 1.000 — so all structure
+below is attention-derived from the prompt, at a position whose own token
+carries no language. Analysis is mean-centred cosine across conditions.
+
+**The dominant axis at L6 is TASK (write-code vs prose), not topic.** Perfect
+linear separation, no overlap, over 12 prompts — neighbours of `rust_write`:
+
+    py_write +0.73  rust_fenced +0.61  rosetta_p2r +0.57  rosetta_r2p +0.52
+    bash_write +0.42  py_fenced +0.34  |  rust_talk -0.19  py_snake -0.33
+    py_talk -0.64  rust_chem -0.82  prose -0.87
+
+**Token identity is ruled out**, and not by the homonyms (capitalisation
+differs, so "Rust"/"rust" may be different tokens). The decisive case is
+`rust_talk`: it contains the IDENTICAL "Rust" token as `rust_write` yet sits
+at -0.19 on the prose side, while `py_write` — a different language — is the
+nearest neighbour at +0.73. Supporting homonym evidence: `rust_chem ~ prose`
++0.93 while `rust_chem ~ rust_write` -0.82; `py_snake ~ py_write` -0.47.
+
+**A language sub-axis exists, is weaker, and INVERTS with depth.** A properly
+crossed 2 languages x 3 contents design (only the language word differs across
+rows) gives same-language-vs-same-content:
+
+    L3 +0.445   L6 +0.563   L9 -0.207   L18 -0.394   L29 -0.529
+
+So language dominates content at L3-L6 and content dominates language from L9
+on — plausibly because the late residual encodes the specific computation and
+next tokens rather than the dialect.
+
+**Rosetta (both languages in one prompt)** lands in the code region between
+the two: `rosetta_p2r` rust +0.57 / py +0.40, `rosetta_r2p` rust +0.52 / py
++0.51, both ~-0.66 vs prose. Translation DIRECTION barely registers — the two
+rosetta prompts are +0.847 similar to each other.
+
+**Starting place if this is ever pursued: L6, canvas hidden state.** That is
+where both axes are strongest.
+
+**Caveats — this is similarity structure, not a classifier.** One probe
+position, one seed, 12 + 6 prompts, no trained probe and no held-out
+accuracy. The centring mean is over only ~12 conditions. A methodological
+trap worth recording: an earlier pass reported "max language separation at
+L29 = 0.618" by averaging the two within-language pairs — side by side they
+had OPPOSITE SIGNS at L15/18/21/27/29 (L29: rust -0.31, python +0.92).
+Averaging disagreeing pairs manufactured the result; the crossed design above
+replaced it. The within-language pairs in that first design also differed by a
+"markdown code block" instruction, a bigger perturbation than the language
+itself.
+
 **Cheapest experiment that could kill it, in order:**
 1. `step-moe-route-dump` on a handful of known-bash / known-python /
    known-prose generations. Do the expert histograms separate AT ALL? No
