@@ -466,6 +466,12 @@ pub struct DebugFlags {
     pub final_entropy_log: bool,
     /// `DGQ_LOG_STEP_TEXT`: per-step decoded answer text. Default ON.
     pub step_text_log: bool,
+    /// `DGQ_TOKEN_CLASS=<probe.json>`: classify each committed token's output
+    /// mode with a linear probe (see `crate::token_class`). Pure
+    /// instrumentation — it reads hidden state at COMMIT and never steers, so
+    /// generation stays byte-identical. Unset = no readback is performed at
+    /// all, so the hot path is untouched.
+    pub token_class_probe: Option<String>,
     pub denoise_parity_log: bool,
     pub denoise_parity_positions: usize,
     pub log_early_stop: bool,
@@ -737,6 +743,7 @@ impl RuntimeConfig {
                 mem_watch: r.on_if_one("DGQ_MEM_WATCH"),
                 dump_kv_path: r.var("DGQ_DUMP_KV").ok(),
                 trace_pmax_jsonl: r.var("DGQ_TRACE_PMAX_JSONL").ok().filter(|v| !v.is_empty()),
+                token_class_probe: r.var("DGQ_TOKEN_CLASS").ok().filter(|v| !v.is_empty()),
                 moe_route_ref_path: r.var("DGQ_MOE_ROUTE_REF").ok(),
                 engine_layer_dump_path: r.var("DGQ_ENGINE_LAYER_DUMP").ok(),
                 engine_layer_dump_pos: parse_usize("DGQ_ENGINE_LAYER_POS", 129),

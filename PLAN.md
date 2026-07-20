@@ -933,6 +933,67 @@ engine capture is the real work: the arena holds hidden for the CURRENT layer
 only and overwrites it per layer, so reading L9 at commit needs an encoder
 change to copy that plane aside.
 
+**CAPTURE BUILT AND TESTED — per-token classification of COMMITTED tokens
+DOES NOT WORK (2026-07-20).** `DGQ_TOKEN_CLASS=<probe.json>` reads the
+last-layer hidden plane at block commit and classifies each row. No capture
+kernel was needed: no finish stage writes `hidden_off`, so the final decoder
+layer's output survives lm_head and the sampler. Readback is one per BLOCK and
+only when the flag is set, so cost when off is structurally zero.
+
+Result on a code prompt that generated `def main(): ...`: every score lands in
+a narrow band from -0.019 to -0.095 and NEVER crosses zero. That is not a weak
+signal, it is a systematic OFFSET — a distribution shift. The probe's `mid` was
+fitted on canvas positions holding SEEDED NOISE (reading prompt context through
+attention); at commit those positions hold their OWN RESOLVED TOKENS, a
+different hidden distribution with a different mean. Subtracting the cold
+midpoint leaves a shift that swamps the class component.
+
+This is the cold-vs-intra-block gap recorded above, now MEASURED: the
+direction does not transfer between the two regimes.
+
+**FIXED AND WORKING: classify at BLOCK START.** Moved the hook to fire once
+per block, right after the FIRST forward, while the canvas is still seeded
+noise — the exact regime the probe was fitted in, so no distribution shift.
+Every position sees the same context, so the block label is a majority vote
+and the margin is mean |score|. Live results, all correct:
+
+    prompt                              block 1        vote   margin
+    code (sum two numbers)              code            60/64  0.0148
+    prose (water cycle)                 prose           64/64  0.0561
+    HARD NEG prose about compilers      prose           50/64  0.0255
+    VERB prose that says "Write"        prose           64/64  0.0700
+    VERB code without "Write"           code            61/64  0.0132
+    FENCED code                         code            64/64  0.0206
+    MARKDOWN prose                      prose           64/64  0.0321
+
+5/5 on the harder set, and all three fitting controls (hard negatives, verb,
+format) hold LIVE in the engine rather than only in the fit. The margin is
+honest about ambiguity: the single near-tie (34/64, margin 0.007) is a
+trailing block that is mostly eos padding.
+
+Known asymmetry: prose margins (0.022-0.070) run consistently higher than code
+(0.013-0.021), so the zero threshold is not centred. A calibrated threshold
+would likely sharpen code confidence — not yet done.
+
+Granularity is per BLOCK, not per token. That is enough to route a repair
+strategy or select a grammar; it does not colour individual tokens. Per-token
+would need the probe fitted in the resolved-canvas regime, which is blocked on
+repairing the diag denoise path.
+
+**Superseded: the principled fix WAS to classify at BLOCK START, not commit.** The
+regime that IS validated (ctx experiment, LOO 1.00) is a NOISE canvas position
+reading committed content from KV — i.e. "what mode is the block about to be",
+evaluated before the canvas resolves. That is exactly the fitting condition,
+so no distribution shift. It yields BLOCK-granularity labels rather than
+per-token, which still routes a repair strategy but does not colour individual
+tokens.
+
+Options if per-token is wanted: (a) fit the probe in the deployment regime,
+which needs resolved-canvas hidden state and is blocked on repairing the diag
+denoise path; (b) per-block re-centring at inference, which removes the shift
+but destroys absolute class assignment when a block is single-class — so it
+only works on mixed blocks and is not a general fix.
+
 **PERF IS A REQUIREMENT, NOT AN AFTERTHOUGHT — two separate obligations:**
 1. **Exactly zero cost when OFF.** The capture must not be ENCODED at all
    when disabled — not "encoded and discarded", not a per-step flag read.

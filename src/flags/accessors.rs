@@ -637,6 +637,12 @@ pub fn trace_pmax_jsonl() -> Option<String> {
     config().debug.trace_pmax_jsonl.clone()
 }
 
+/// Path to an output-token classification probe (`DGQ_TOKEN_CLASS=<file>`).
+/// `None` means the classifier is off and NO hidden readback is performed.
+pub fn token_class_probe() -> Option<String> {
+    config().debug.token_class_probe.clone()
+}
+
 /// Dump MoE routes to `<path>` (`DGQ_MOE_ROUTE_REF=<path>`).
 pub fn moe_route_ref_path() -> Option<String> {
     config().debug.moe_route_ref_path.clone()

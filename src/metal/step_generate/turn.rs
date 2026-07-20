@@ -597,6 +597,33 @@ pub fn propose_block(
             });
             ts.denoise_steps_run += 1;
             block_step_count += 1;
+            // Output-mode classification fires ONCE per block, right after the
+            // first forward — while the canvas is still seeded noise. That is
+            // the regime the probe was FITTED in (a noise position reading
+            // committed context through attention), so there is no
+            // distribution shift. Classifying at COMMIT was measured to fail:
+            // by then each position holds its own resolved token, a different
+            // hidden distribution, and the offset swamps the class signal.
+            // Every position sees the same context, so the block's label is
+            // the majority vote and the margin is the mean |score|.
+            if block_step_count == 1
+                && let Some(probe) = token_class_probe_cached()
+            {
+                let rows = 64usize;
+                let plane = rt.read_hidden_rows(rows);
+                let (labels, scores) = probe.classify_rows(&plane, rows);
+                if !labels.is_empty() {
+                    let pos = labels.iter().filter(|l| **l == 1).count();
+                    let label = u8::from(pos * 2 >= labels.len());
+                    let margin = scores.iter().map(|s| s.abs()).sum::<f32>() / scores.len() as f32;
+                    let agree = if label == 1 { pos } else { labels.len() - pos };
+                    eprintln!(
+                        "token-class: block {block_idx} -> {} (vote {agree}/{}, mean |score| {margin:.4})",
+                        probe.class_name(label),
+                        labels.len()
+                    );
+                }
+            }
             let st = rt.read_canvas_state();
             last_st = st;
             if let Some(path) = crate::flags::trace_pmax_jsonl() {
@@ -1366,6 +1393,34 @@ fn pmax_from_rowstats(rowstats: &[[f32; 2]]) -> Vec<f32> {
 
 /// Append one line to the `DGQ_TRACE_PMAX_JSONL` trace (E7 M0). Best-effort:
 /// trace I/O must never fail a generation.
+/// Load the `DGQ_TOKEN_CLASS` probe once and reuse it. Returns `None` when the
+/// flag is unset (the classifier is off) or the file failed to load — a bad
+/// probe path warns once and then stays quiet rather than shouting per block.
+fn token_class_probe_cached() -> Option<&'static crate::token_class::TokenClassProbe> {
+    use std::sync::OnceLock;
+    static PROBE: OnceLock<Option<crate::token_class::TokenClassProbe>> = OnceLock::new();
+    PROBE
+        .get_or_init(|| {
+            let path = crate::flags::token_class_probe()?;
+            match crate::token_class::TokenClassProbe::load(std::path::Path::new(&path)) {
+                Ok(p) => {
+                    eprintln!(
+                        "token-class: loaded probe ({} classes, layer {}, dim {})",
+                        p.class_names.len(),
+                        p.layer,
+                        p.hidden_dim()
+                    );
+                    Some(p)
+                }
+                Err(e) => {
+                    eprintln!("token-class: cannot load {path}: {e}");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
 fn trace_pmax_append(path: &str, v: serde_json::Value) {
     use std::io::Write as _;
     if let Ok(mut f) = std::fs::OpenOptions::new()

@@ -440,6 +440,23 @@ impl StepRuntime {
             .collect()
     }
 
+    /// Last-layer hidden rows for the canvas, `rows x HID` row-major.
+    ///
+    /// Valid only AFTER a full forward: no finish stage writes `hidden_off`, so
+    /// the final decoder layer's output survives lm_head and the sampler. Used
+    /// by the output-token classifier at COMMIT — one readback per block, and
+    /// only when `DGQ_TOKEN_CLASS` is set, so the hot path is untouched when
+    /// the feature is off.
+    pub fn read_hidden_rows(&self, rows: usize) -> Vec<f32> {
+        let byte_off = self.bufs.arena_map.hidden_off() as usize;
+        let n = rows.min(CANVAS);
+        crate::metal::step_kernel::diag_bench::read_arena_buffer_f32(
+            &self.bufs.arena,
+            byte_off,
+            n * HID,
+        )
+    }
+
     pub fn set_canvas_ids(&mut self, ids: &[u32]) -> Result<(), Error> {
         // CANVAS for denoise / plain prefill chunks; up to PREFILL_M for a
         // batched prefill super-chunk.
