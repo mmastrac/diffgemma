@@ -144,6 +144,67 @@ fn l2_normalise(v: &mut [f32]) {
     }
 }
 
+/// Fit from PRODUCTION generations: run each labelled prompt through the real
+/// generate path and collect hidden rows at block COMMIT, so the probe is
+/// fitted in the regime where it is used. Every answer-region row of a sample
+/// inherits that sample's class — per-token ground truth is unavailable, but a
+/// code prompt's answer is code throughout, which is the labelling the probe
+/// needs. The eos/pad tail is excluded at the capture site.
+#[cfg(target_os = "macos")]
+fn collect_rows_from_generation(
+    model_dir: &std::path::Path,
+    spec: &ProbeSpec,
+    seed: u64,
+    max_seq: usize,
+    max_rows_per_sample: usize,
+) -> Result<(Vec<Vec<f32>>, Vec<u8>), String> {
+    use metal::{StepGenerateConfig, StepGenerateSession, generate_with_session};
+
+    let layers = resolve_model_layers(model_dir, None).map_err(|e| e.to_string())?;
+    let stop_token_ids = config::load_generation_stop_tokens(model_dir);
+    let sampler = sample::sampler_for_steps(48, false);
+    let mut step_cfg =
+        StepGenerateConfig::from_generate(seed, 256, max_seq.max(2048), layers, sampler, false);
+    step_cfg.degenerate_reply_check =
+        chat_template::empty_reply_check(model_dir, stop_token_ids.clone());
+    step_cfg.stop_token_ids = stop_token_ids;
+    let (mut session, _) =
+        StepGenerateSession::open(model_dir, &step_cfg, None).map_err(|e| e.to_string())?;
+
+    let mut rows = Vec::new();
+    let mut y = Vec::new();
+    crate::token_class::collect::enable();
+    for (i, s) in spec.samples.iter().enumerate() {
+        let class_idx = spec
+            .class_names
+            .iter()
+            .position(|c| *c == s.class)
+            .ok_or_else(|| format!("sample {i}: unknown class {:?}", s.class))? as u8;
+        session.reset_kv();
+        let history = vec![chat_template::ChatTurn::user(&s.prompt)];
+        let prompt = build_chat_prompt_tokens(model_dir, &history, false).map_err(|e| e.to_string())?;
+        let _ = crate::token_class::collect::take(); // drop anything stale
+        generate_with_session(&mut session, &prompt, &step_cfg, "fit-token-probe")
+            .map_err(|e| e.to_string())?;
+        let mut got = crate::token_class::collect::take();
+        got.truncate(max_rows_per_sample);
+        eprintln!(
+            "fit-token-probe: sample {}/{} ({}) -> {} rows",
+            i + 1,
+            spec.samples.len(),
+            s.class,
+            got.len()
+        );
+        for mut r in got {
+            l2_normalise(&mut r);
+            rows.push(r);
+            y.push(class_idx);
+        }
+    }
+    crate::token_class::collect::disable();
+    Ok((rows, y))
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn run_fit_token_probe_cmd(
     model_dir: &std::path::Path,
@@ -152,6 +213,7 @@ pub(crate) fn run_fit_token_probe_cmd(
     layer_override: Option<usize>,
     seed: u64,
     max_seq: usize,
+    from_generation: bool,
 ) -> ExitCode {
     use metal::{StepSmokeConfig, run_step_layer_hidden_dump};
 
@@ -197,6 +259,36 @@ pub(crate) fn run_fit_token_probe_cmd(
         spec.position
     );
 
+    if from_generation {
+        // The commit-time readback can only see the LAST decoder layer:
+        // `hidden_off` holds that layer's output and no finish stage
+        // overwrites it, but earlier layers are gone by then (the arena
+        // reuses the plane per layer). Reaching an earlier layer would need a
+        // capture kernel. Say so rather than stamping a layer we did not fit.
+        let captured_layer = layers.saturating_sub(1);
+        if layer_override.is_some_and(|l| l != captured_layer) {
+            eprintln!(
+                "fit-token-probe: --layer is ignored with --from-generation; the commit \
+                 readback can only see layer {captured_layer} (the last)"
+            );
+        }
+        eprintln!(
+            "fit-token-probe: fitting from PRODUCTION generations (committed rows at block \
+             commit, layer {captured_layer})"
+        );
+        let (rows, y) = match collect_rows_from_generation(model_dir, &spec, seed, max_seq, 48) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let n = rows.len();
+        let mut spec_for_fit = spec;
+        spec_for_fit.layer = captured_layer;
+        return finish_fit(&rows, &y, &spec_for_fit, n, spec_path, output, seed);
+    }
+
     let mut rows: Vec<Vec<f32>> = Vec::with_capacity(spec.samples.len());
     let mut y: Vec<u8> = Vec::with_capacity(spec.samples.len());
     for (i, s) in spec.samples.iter().enumerate() {
@@ -238,6 +330,21 @@ pub(crate) fn run_fit_token_probe_cmd(
         }
     }
 
+    finish_fit(&rows, &y, &spec, spec.samples.len(), spec_path, output, seed)
+}
+
+/// Shared tail: fit the direction, report a held-out score, write the probe.
+#[cfg(target_os = "macos")]
+fn finish_fit(
+    rows: &[Vec<f32>],
+    y: &[u8],
+    spec: &ProbeSpec,
+    n_samples: usize,
+    spec_path: &std::path::Path,
+    output: &std::path::Path,
+    seed: u64,
+) -> ExitCode {
+    let layer = spec.layer;
     if !y.contains(&0) || !y.contains(&1) {
         eprintln!("error: spec must contain samples of BOTH classes");
         return ExitCode::FAILURE;
@@ -247,7 +354,7 @@ pub(crate) fn run_fit_token_probe_cmd(
     let mut m1 = vec![0.0f32; dim];
     let mut m0 = vec![0.0f32; dim];
     let (mut n1, mut n0) = (0f32, 0f32);
-    for (r, c) in rows.iter().zip(&y) {
+    for (r, c) in rows.iter().zip(y.iter()) {
         let (m, n) = if *c == 1 {
             (&mut m1, &mut n1)
         } else {
@@ -285,9 +392,9 @@ pub(crate) fn run_fit_token_probe_cmd(
         w,
         mid,
         provenance: format!(
-            "fit-token-probe: {} samples from {}, layer {layer}, position {}, seed {seed}; \
+            "fit-token-probe: {} fit rows from {}, layer {layer}, position {}, seed {seed}; \
              leave-one-out acc {acc:.3}, effect {eff:.2}",
-            spec.samples.len(),
+            n_samples,
             spec_path.display(),
             spec.position,
         ),

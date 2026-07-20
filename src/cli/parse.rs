@@ -91,6 +91,7 @@ pub(crate) fn parse_cli() -> Cli {
     // `fit-token-probe --spec <labelled prompts>`; `--layer` overrides the spec.
     let mut probe_spec: Option<PathBuf> = None;
     let mut probe_layer: Option<usize> = None;
+    let mut probe_from_generation = false;
     let mut step_attn_layer = 2usize;
     let mut step_moe_expert = 18u32;
     let mut step_moe_route_grouped = true;
@@ -384,6 +385,7 @@ pub(crate) fn parse_cli() -> Cli {
                 }
             }
             "--spec" => probe_spec = args.next().map(PathBuf::from),
+            "--from-generation" => probe_from_generation = true,
             "--layer" => {
                 if let Some(v) = args.next() {
                     match v.parse::<usize>() {
@@ -767,6 +769,7 @@ pub(crate) fn parse_cli() -> Cli {
                 layer: probe_layer,
                 seed,
                 max_seq: step_max_seq.max(64),
+                from_generation: probe_from_generation,
             }
         }
         Some("step-layer-probe") => {

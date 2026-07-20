@@ -1147,6 +1147,30 @@ pub fn propose_block(
         );
     }
 
+    // Fitting capture (see `token_class::collect`): committed ANSWER-REGION
+    // hidden rows, for fitting a probe in the regime where it will actually be
+    // used. Cut at the first eos/pad — the tail is padding whose label is
+    // meaningless and would dominate the fit. Off unless a fitting command
+    // enabled the collector, so normal generation never pays for it.
+    if crate::token_class::collect::is_enabled() {
+        let eos = rt.read_params().eos_token_id;
+        let end = argmax_tokens
+            .iter()
+            .position(|t| {
+                *t == eos
+                    || *t == crate::sample::PAD_TOKEN_ID
+                    || *t == crate::sample::FILLER_TOKEN_ID
+            })
+            .unwrap_or(argmax_tokens.len());
+        if end > 0 {
+            let plane = rt.read_hidden_rows(end);
+            let dim = plane.len() / end.max(1);
+            crate::token_class::collect::push_rows(
+                (0..end).map(|r| plane[r * dim..(r + 1) * dim].to_vec()),
+            );
+        }
+    }
+
     if let Some(path) = crate::flags::trace_pmax_jsonl() {
         trace_pmax_append(
             &path,

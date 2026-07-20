@@ -994,6 +994,40 @@ denoise path; (b) per-block re-centring at inference, which removes the shift
 but destroys absolute class assignment when a block is single-class — so it
 only works on mixed blocks and is not a general fix.
 
+**FITTING IN THE DEPLOYMENT REGIME — DONE, AND PER-TOKEN CLASSIFICATION IS
+NOT VIABLE (2026-07-20).** `fit-token-probe --from-generation` drives real
+generations over the labelled spec and collects committed ANSWER-REGION hidden
+rows at block commit (eos/pad tail excluded at the capture site), so the probe
+is fitted exactly where it is used. 44 generations, ~1900 rows, 11.5 min.
+
+    fit regime                     LOO acc   effect
+    pre-denoise canvas (cold)       1.000     2.59     <- but does NOT transfer
+    committed rows (in-regime)      0.641     0.24     <- chance is 0.500
+
+So the earlier failure was NOT merely a transfer/distribution-shift problem.
+Even fitted ON committed positions the signal is weak. Mechanism, consistent
+with everything measured: a committed position's hidden state is dominated by
+ITS OWN TOKEN IDENTITY, and "which mode" is a small residual component. The
+cold probe works precisely BECAUSE the position has no token of its own — it
+is a pure summary of context.
+
+Two caveats that make 0.641 an OPTIMISTIC ceiling, not a floor:
+- Leave-one-out runs over ROWS, and ~48 rows come from each generation, so a
+  held-out row has its own neighbours in the training set. A held-out-by-
+  SAMPLE score would be lower.
+- The capture can only see the LAST decoder layer. `hidden_off` holds it and
+  no finish stage overwrites it, but earlier layers are gone by commit (the
+  arena reuses the plane per layer). L9 measured better than L29 in the cold
+  fit (2.59 vs 0.97), so an earlier layer might do better here too — but
+  reaching one needs a capture kernel, and that is only worth building if
+  there is reason to expect it clears 0.641 by a lot.
+
+**Verdict: per-BLOCK classification ships and works (5/5 live, all three
+controls); per-TOKEN classification does not, and is not one fix away.** The
+block-level classifier is the right granularity for routing a repair strategy
+or picking a grammar, which is what the delimiter/parity checker actually
+needs. Do not spend a capture kernel on per-token without new evidence.
+
 **PERF IS A REQUIREMENT, NOT AN AFTERTHOUGHT — two separate obligations:**
 1. **Exactly zero cost when OFF.** The capture must not be ENCODED at all
    when disabled — not "encoded and discarded", not a per-step flag read.
@@ -1046,6 +1080,49 @@ regime, dump hidden at COMMIT from production runs over the labelled spec
 (the same fixture `fit-token-probe` uses) and fit on that, instead of fitting
 on cold canvases and hoping the direction transfers. That transfer was
 measured to fail, which is the actual finding.
+
+### Delimiter parity check + self-eval reroll (design, 2026-07-20)
+
+Proposed: use the BLOCK-LEVEL mode classifier to pick a grammar, run a
+delimiter/parity check on the committed block, and on failure fork the KV,
+ask the model to adjudicate ("mismatched delimiter — `<keep>` if intentional,
+`<regenerate>` otherwise"), then act.
+
+**Machinery already exists.** `KvCheckpoint` / `checkpoint()` / `rollback_to()`
+are built and currently UNUSED (they surface as dead-code warnings), and
+`ToolRepairStage` already implements this exact choreography for tool calls
+(invalid output -> error feedback -> regen -> rewind, with the repair turn
+EVAPORATING rather than entering context). This is "ToolRepairStage for
+delimiters", not new architecture.
+
+**OBJECTION, from this session's own data: the model is the wrong adjudicator
+for its own defect.** Convention-blend errors commit at p_max 0.9993-1.0
+([[code-errors-are-confident]]) — it was CERTAIN when it emitted
+`*$SEARCH"*`. The same confidence is likely to answer `<keep>`. Consulting the
+witness who made the error is the weakest part of the design.
+
+**Fix, which mostly removes the need to ask:** gate the CHECKER by block mode
+rather than gating the QUESTION.
+- PROSE block -> do not run the delimiter check at all. Apostrophes, smileys
+  and lone parens are normal; this kills the dominant false-positive source.
+- CODE block -> an unbalanced quote is essentially never intentional.
+  Regenerate without asking.
+- The self-eval turn is then only for the ambiguous middle, which may be small
+  enough to skip in v1.
+
+**Two practical constraints:**
+- **Regeneration must change something.** Rewind + regenerate on the same KV
+  and seed reproduces the identical block. The engine already solves this for
+  degenerate blocks with shrink-on-retry (256->128->64); reuse that.
+- Trajectory-affecting, so: golden re-bless, and a LIVE A/B — a replay sim of
+  a trajectory-changing policy overestimates it
+  ([[trajectory-feedback-sim-bias]]).
+
+**Sequencing:** MEASURE the parity-failure rate first, split by block mode. If
+code blocks fail at ~1 in 200 generations and gated prose never trips, the
+checker alone is worth shipping and the self-eval turn is unnecessary. If
+prose still trips often, the ask earns its place and the rate is known before
+paying for it.
 
 ### WAY OUT THERE — can the generation LANGUAGE be read off the model's own state?
 

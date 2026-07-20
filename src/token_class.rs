@@ -124,6 +124,50 @@ impl TokenClassProbe {
     }
 }
 
+/// Collector for FITTING a probe in the deployment regime.
+///
+/// The cold-fitted direction was measured NOT to transfer to committed
+/// positions (every score landed on one side of zero — a distribution shift,
+/// since a noise position and a position holding its own resolved token have
+/// different hidden means). So the probe has to be fitted on hidden state
+/// captured where it will be USED: at block commit, during real generation.
+///
+/// The engine cannot know a sample's class label, so the flow is inverted: a
+/// command enables collection, runs one generation, drains the rows, and
+/// attaches the label it already knows. Off unless explicitly enabled, and
+/// the push site is behind that check, so normal generation is untouched.
+pub mod collect {
+    use std::sync::Mutex;
+
+    static SINK: Mutex<Option<Vec<Vec<f32>>>> = Mutex::new(None);
+
+    /// Start collecting. Any previously collected rows are discarded.
+    pub fn enable() {
+        *SINK.lock().unwrap() = Some(Vec::new());
+    }
+    /// Stop collecting and discard anything buffered.
+    pub fn disable() {
+        *SINK.lock().unwrap() = None;
+    }
+    pub fn is_enabled() -> bool {
+        SINK.lock().unwrap().is_some()
+    }
+    /// Append committed answer-region rows. No-op when disabled.
+    pub fn push_rows(rows: impl Iterator<Item = Vec<f32>>) {
+        if let Some(sink) = SINK.lock().unwrap().as_mut() {
+            sink.extend(rows);
+        }
+    }
+    /// Take everything collected so far, leaving collection enabled.
+    pub fn take() -> Vec<Vec<f32>> {
+        SINK.lock()
+            .unwrap()
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

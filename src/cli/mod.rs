@@ -177,6 +177,10 @@ pub(crate) enum Command {
         layer: Option<usize>,
         seed: u64,
         max_seq: usize,
+        /// `--from-generation`: fit on hidden captured at block COMMIT during
+        /// real generation, the regime the probe is used in. The default fits
+        /// on a pre-denoise canvas, which was measured NOT to transfer.
+        from_generation: bool,
     },
     StepAttnDump {
         prompt: Option<String>,

@@ -207,7 +207,16 @@ pub(crate) fn dispatch(cli: Cli) -> ExitCode {
             layer,
             seed,
             max_seq,
-        } => run_fit_token_probe_cmd(&cli.model_dir, &spec, &output, layer, seed, max_seq),
+            from_generation,
+        } => run_fit_token_probe_cmd(
+            &cli.model_dir,
+            &spec,
+            &output,
+            layer,
+            seed,
+            max_seq,
+            from_generation,
+        ),
         Command::StepAttnDump {
             prompt,
             layers,
