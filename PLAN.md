@@ -1107,6 +1107,102 @@ note RoPE is orthogonal so it PRESERVES inner products and does not obstruct
 same-position comparisons — it only breaks a probe direction shared ACROSS
 positions. A K probe therefore needs length-matched prompts, not an un-RoPE.
 
+**LANGUAGE PROBE (rust vs python), n=60 matched pairs, cold AND committed
+canvas.** 30 task descriptions x 2 languages, so content is matched pairwise
+and only the language word differs. `--warm-steps N` was added to
+`step-layer-probe` (opt-in; 0 reproduces the original step-1 behaviour) to run
+N real denoise steps before the instrumented forward.
+
+    layer      COLD acc  COLD eff   WARM acc  WARM eff
+    pre          0.00      0.00       0.37      0.13     <- cold control is exact
+    L6           1.00      0.75       0.65      0.20
+    L7 (peak)    1.00      1.12         --        --
+    L12          0.92      0.63       0.52      0.17
+    L27          1.00      0.40       0.57      0.23
+    L28 (peak)     --        --       0.77      0.31
+    final        1.00      0.55       0.70      0.31
+
+**The cold signal is REAL and reproduces at scale.** An earlier n=12 run gave
+peak eff 1.33; at n=60 it is 1.12 with accuracy 1.00 across L6-L9. I had
+predicted this was small-sample inflation and was WRONG — it held. The cold
+canvas token is identical in all 60 dumps (1 distinct value), so the control
+is exact and `pre` correctly reports 0.00.
+
+**Counter-intuitively the signal is WEAKER on the committed canvas** (peak eff
+0.31 vs 0.13 noise floor) than on the seeded-noise canvas (1.12 vs 0.00).
+Mechanism, plausible but not proven: with a noise token the probe position's
+hidden state is a PURE SUMMARY OF THE PROMPT, so context reads cleanly. Once
+the position holds resolved content its own token dominates and dilutes the
+prompt-derived signal. Caveat that bounds this: position 129 is unresolved
+TAIL FILLER (`kaart`/`modern`/`junior` junk), so the warm probe measures a
+position holding garbage, not committed program text. A position inside the
+generated program is the stronger test and loses the token control.
+
+**ONE regime, not two — the mid-layer "dip" was a DENOMINATOR artifact.**
+Decomposing effect = gap/scatter over the n=60 matched pairs:
+
+    layer   lang GAP   scatter   effect   LOO acc   content-gap
+    L0       0.0059    0.0169     0.35     0.58      0.0171
+    L6       0.0508    0.0673     0.75     1.00      0.0627
+    L12      0.2349    0.3717     0.63     0.92      0.3776
+    L18      0.3121    0.8550     0.36     0.95      0.8673
+    L24      0.2554    0.8213     0.31     0.93      0.8154
+    final    0.4555    0.8210     0.55     1.00      0.8086
+
+The language GAP never shrinks: it grows monotonically, ~77x from L0 to
+final, and is LARGEST at the output layer. The apparent dip at L18-L24 is
+scatter peaking (0.86), and `content-gap` tracks scatter almost exactly
+(0.867 vs 0.855) — the scatter IS content variation. Accuracy never falls
+below 0.92 anywhere after L3.
+
+This kills the natural three-phase story ("knows the language, diffuses
+language-agnostically, then crystallises"): nothing goes agnostic. Language
+identity is established early and monotonically SHARPENS to the output; the
+middle layers are merely busy with content, whose variance temporarily swamps
+the language component in any ratio statistic. An earlier note here claiming
+"two regimes with a dip" was reading the ratio and inventing structure in the
+denominator — retracted.
+
+Practical consequence, which INVERTS the earlier advice: for a trained
+fixed-direction probe use the FINAL layer (largest gap). L6 is only the best
+target if you are using raw cosine similarity, where content noise matters.
+
+Practical: for reading "which language" out of the engine, probe the CANVAS
+residual around L6-L9 BEFORE the position resolves. Language separability is
+about half the code-vs-prose axis (1.12 vs 2.05) and tracks language distance
+(rust-vs-bash 1.99 > python-vs-bash 1.87 > rust-vs-python 1.12-1.33).
+
+**OUTPUT-MODE probe (2026-07-19): the L6 axis is CONTENT TYPE, not output
+FORMAT.** 5 modes x 8 items, cold canvas, exact token control (1 distinct
+canvas token across all 40). Centroid cosines at L6:
+
+                  code   fenced    prose    mdgen  toolask
+    code          1.00     0.85    -0.72    -0.82    -0.15
+    fenced        0.85     1.00    -0.86    -0.70    -0.10
+    prose        -0.72    -0.86     1.00     0.66    -0.32
+    mdgen        -0.82    -0.70     0.66     1.00    -0.32
+    toolask      -0.15    -0.10    -0.33    -0.32     1.00
+
+Adding "put the code in a fenced markdown code block" leaves the prompt GLUED
+to plain code (+0.85) and OPPOSED to markdown prose (-0.70). The direction is
+almost blind to formatting instructions — which is the useful outcome, since
+"wrap it in a markdown block" is exactly the instruction most likely to fool a
+naive code detector.
+
+Two unplanned observations: markdown formatting perturbs PROSE more than
+fencing perturbs CODE (mdgen~prose 0.66 vs code~fenced 0.85); and by L29 the
+format distinction collapses further (code~fenced 0.91, prose~mdgen 0.90) —
+four modes become two clusters.
+
+`toolask` is near-ORTHOGONAL to all four modes (-0.10 to -0.33), suggesting
+tool-calling is its own region rather than a flavour of code. **HEAVILY
+CAVEATED**: this condition is a natural-language request for a tool action,
+NOT the real thing. Genuine tool-emission mode needs the system block with
+`<|tool>declaration:...<tool|>` special ids, and `--raw-prompt` BPEs that
+markup as literal text (48 tokens vs 22), so it is unreachable from
+`step-layer-probe` today. Probing it properly needs tools support added to
+that command — a separate small engine change.
+
 **Cheapest experiment that could kill it, in order:**
 1. `step-moe-route-dump` on a handful of known-bash / known-python /
    known-prose generations. Do the expert histograms separate AT ALL? No
