@@ -196,14 +196,33 @@ Saturation alone would not be fatal — a ceiling battery cannot show
 IMPROVEMENT but is a clean REGRESSION detector, which is the actual
 `DGQ_COMMIT_CONF_HARD` risk. The fatal part is structural:
 
-**`soft` cannot reach the hard trim at all.** An `off` vs
-`hard:DGQ_COMMIT_CONF_HARD=0.5` comparison over 3 seeds returned
-BIT-IDENTICAL metrics in both arms, `trims 0` in both. Cause: the trim scans
-`(MIN_CONF_KEEP..region_end)` — it skips the first 16 rows and stops at the
-first eos/stop/pad. Soft answers run 4–31 rows (median 13); only 11 of 36
-probes have an answer region reaching past 16 at all, and the single
-sub-0.5 committed row in the campaign is an `<eos>` at index 13, i.e. the
-region terminator itself. The lever is structurally unreachable.
+**`soft` cannot reach the hard trim — and the reason is CONFIDENCE, not
+answer length.** An `off` vs `hard:DGQ_COMMIT_CONF_HARD=0.5` comparison
+returned BIT-IDENTICAL metrics with `trims 0` in both arms, twice: once with
+the original short probes, and again (campaign B) after six long-form probes
+lifted the median answer region from 13 to 20 rows (max 94) and took
+trim-scannable rows from ~0 to 881.
+
+My first diagnosis — "soft answers are shorter than the 16-row
+`MIN_CONF_KEEP` floor" — was only part of it, and lengthening them did NOT
+make the lever reachable. The decisive number:
+
+    battery          scannable rows   rows<0.5 in scan   MIN p_max in scan
+    soft (long-form)      881               0                 0.733
+    smoke                2856               5                 0.299
+
+The hard tier fires at p_max < 0.5. Across every scannable soft row the most
+uncertain is 0.733, so no threshold in the tier's range can engage. Grounded
+retrieval is a HIGH-CONFIDENCE task; the model is never unsure. Open-ended
+generation (smoke's convergence prompts) is what produces genuine
+sub-0.5 rows, which is why the original sign-off could measure the lever
+there at all.
+
+General rule this establishes: **a battery can only evaluate a lever whose
+trigger its outputs actually produce.** Match the battery to the trigger
+distribution, not to the topic. Check `trims > 0` in the treatment arm before
+reading any arm comparison — twice now a green "no regression" was really
+"the lever never ran".
 
 So PLAN's premise — "the `soft` battery is what should settle the
 `DGQ_COMMIT_CONF_HARD` decision" — is FALSE as built, and a green
@@ -212,25 +231,38 @@ soft probes need LONG-FORM answers (multi-sentence, answer region well past
 16 rows); the `doc_tokens` field is already in the fixture schema for the
 depth ladder that would come with them.
 
-**Instrument finding, needs a decision before anything is re-signed-off:
-census `dup` counts what the trim deliberately ignores.** `scan_trace`
-counts every committed row below `kept`; the trim scans only the answer
-region. Measured split of census-counted dup rows:
+**Instrument audit — RESOLVED 2026-07-19, and my concern was WRONG on the
+point that mattered.** census `dup` counts every committed row below `kept`;
+the trim scans only `(MIN_CONF_KEEP..region_end)`. I found that on two small
+samples 100% of census-counted dup rows sat in the eos/pad tail and worried
+the shipped dup-tier sign-off had ranked arms on padding. Campaign A
+(`smoke` x 4 arms x 3 seeds, ~13.7k rows/arm) settles it. It first reproduced
+the original table to two decimals (off 1.31 / dup 1.03 / hard 0.88 / both
+0.80 — the engine is deterministic and the sign-off is replicable), then:
 
-- soft battery, 3 seeds: 9 dup rows — 0 in the answer region, 9 in the
-  eos/pad tail.
-- smoke battery, seed 7: 3 dup rows — 0 in the answer region, 3 in the tail.
-  (Its 1 `hard` row IS in-region, so the hard component looks sound.)
+    arm    census cont/1k    region-only cont/1k_r   in-region contested
+    off        1.31               2.80               8  (5 hard + 3 dup)
+    dup        1.03               1.06               3
+    hard       0.88               0.33               1
+    both       0.80               0.00               0
 
-The trim's own comment says eos-padding runs are structural duplicates it
-excludes on purpose. So `contested_per_1k` — the documented decision line —
-has a dup component that on both sampled batteries is 100% eos padding, and
-the dup-tier sign-off (1.31 -> 1.03 per 1k) rests partly on it. NOT yet an
-indictment: that sign-off used 3 seeds x 4 arms and only one arm/seed was
-re-measured here. But it must be re-checked before that number is cited
-again, and the fix (mirror the trim's answer-region rule in `scan_trace`)
-would change a metric a shipped decision rests on, so it is a deliberate
-call rather than a drive-by patch.
+**The ORDERING is preserved under both metrics** (off > dup > hard > both),
+so the dup-tier sign-off is vindicated and needs no re-litigation.
+
+Two corrections to what I claimed earlier:
+- "The dup component is entirely eos padding" was a SMALL-SAMPLE artifact
+  (one seed, 3 dup rows). At 3 seeds the `off` arm has 3 genuine in-region
+  dup rows out of 13. Padding does inflate the absolute counts; it does not
+  dominate them.
+- The correction makes the levers look STRONGER, not weaker: excluding
+  padding shrinks the denominator to rows the trim can actually act on, so
+  `off` rises 1.31 -> 2.80 and `both` falls 0.80 -> 0.00. The dup tier goes
+  from a 21% reduction on the reported metric to 8 -> 3 in-region rows.
+
+Remaining (optional, no longer urgent): mirroring the trim's region rule in
+`scan_trace` would sharpen effect sizes and make `contested_per_1k` mean what
+its name implies. It is now a legibility improvement, not a correctness fix,
+and it would still move a published number — so it stays a deliberate call.
 
 **Campaign plan (GPU session 2026-07-19), predictions pre-registered.**
 Validity check first in each case: confirm `trims > 0` in the treatment arm,
@@ -288,6 +320,127 @@ reporting a harness artifact as a model defect. Fixed by giving the battery
 its own budget (`PROG_GEN_CAP` 1536, `PROG_MAX_SEQ` 4096) and by printing
 the rejected source HEAD AND TAIL, since truncation is only visible in the
 tail. Any future probe that gets harder must re-check this ceiling first.
+
+**Why the bash probe passes at seed 123 and fails at seed 7 — traced to the
+STEP, no GPU needed.** The divergence is a denoise-trajectory difference, not
+a layer defect, and the per-step `argmax`/`pmax` already in the trace shows it
+directly. At the `[[ "$line" == *"$SEARCH"* ]]` site:
+
+    seed 7   step 3:  '*"'(0.87)  '"$'(0.89)   -> *""$SEARCH   (DOUBLED quote)
+    seed 7   step 4:  '*' (0.97)  '$' (0.95)   -> *$SEARCH     (ZERO quotes)
+    seed 123 step 3:  '*' (0.98)  '"$'(0.99)   -> *"$SEARCH    (correct, never revised)
+
+Seed 7 transiently landed in an over-quoted state, and the next step revised
+BOTH adjacent positions at once — each dropping its own quote — overshooting
+from two quotes to none. Seed 123 never entered that state. Correct output
+needs EXACTLY ONE of the two adjacent tokens to carry a quote.
+
+Hypothesis for the WHY, fitting but NOT established (n=1 harmful instance):
+diffusion updates positions from independent per-position marginals, and
+"exactly one quote across this pair" is a JOINT constraint that independent
+marginals cannot represent — so both positions correct the same visible
+doubling simultaneously. This would be a failure mode unavailable to a
+sequential decoder, which sees its own previous emission. It also explains
+the earlier observations: high commit confidence (post-correction each token
+is individually plausible; only the PAIR is wrong), trajectory dependence
+(only paths through the doubled state are at risk), and the compiler naming
+a downstream site.
+
+Surrounding evidence, from a detector over 52 generations looking for
+adjacent pairs whose non-quote content is identical but whose quote count
+changed: only 5 such edits exist. Two are seed 42 ADDING quotes
+(`$` -> `"$`, both p_max 1.00; seed 42 is the clean 14/14 run); three are
+seed 7 REMOVING them (p_max 0.83-1.00), of which one was harmless
+(`[ "$#" ...` -> `[ $# ...`, still valid) and one is the bug. So the harmful
+event is rare and the trajectory-level quote-edit direction differed between
+a passing and a failing seed.
+
+To CONFIRM or kill the joint-constraint hypothesis it needs many more harmful
+instances than one: sweep `programmatic` over ~20 seeds, collect every
+surgical pair edit, and test whether harmful double-removals occur
+disproportionately when both positions update in the SAME step rather than
+in different steps. That is the discriminating measurement; do not treat the
+mechanism as established until it is run.
+
+**Campaign C — the FIRST non-vacuous arm comparison of the session.** The
+lever actually fired on `programmatic` (`trims`: off 0, hard 1, dup 2, both
+2), because code generation produces the low-confidence rows retrieval never
+does. Result over 4 arms x 3 seeds x 14 probes:
+
+    arm    probes pass   cases pass   compile_fail   cont/1k
+    off       37/42       116/132         15          0.84
+    hard      37/42       116/132         15          0.46
+    dup       38/42       121/132         10          0.23
+    both      38/42       121/132         10          0.23
+
+**The entire difference is ONE probe at ONE seed**: `rust_base_convert` at
+seed 42, which `off`/`hard` fail and `dup`/`both` pass. Every other
+probe-seed cell is identical across all four arms. So:
+
+- The dup tier's apparent +3.8pp is a single probe flip. Direction is
+  favourable and the mechanism is plausible (the trim cuts the bad row, the
+  re-denoise picks a different identifier), but n=1 is not evidence. A
+  powered sweep is running (campaign D: off vs dup x 10 fresh seeds).
+- The hard tier did NOTHING: identical outcomes to `off` despite firing
+  once. That is the first genuine (if thin) regression signal for
+  `DGQ_COMMIT_CONF_HARD` — the lever ran and did no harm across 42
+  probe-runs. It is not evidence of BENEFIT. The decision stays parked.
+
+**Metric caution I introduced myself: case-level percentages amplify single
+probe flips.** `compile_fail` fans out to every case of an unbuildable probe
+(correct — it keeps the three states summing to `cases`), so one flipped
+5-case probe moves the case metric by 3.8pp while the probe metric moves by
+1/42. **Use probe-level counts for arm comparisons; case-level is for
+diagnosing WHAT failed, not HOW MUCH better an arm is.**
+
+**Campaign D (off vs dup x 10 fresh seeds) — the headline result: the WART
+PROXY DOES NOT PREDICT EXECUTABLE CORRECTNESS.**
+
+Probe level over 13 seeds (C+D): `off` 159/182, `dup` 161/182. Two flips,
+both favourable, none against — weak but consistent, and not significant on
+its own (p~0.25 as a coin flip). The dup tier is not harmful and may help
+slightly; that is the whole quality claim the data supports.
+
+The wart columns move enormously by comparison — `off` cont/1k 5.88 vs `dup`
+0.41, hard rows 262 vs 12 — but the effect is TAIL RISK, not a uniform
+improvement, and it does not reach the outcome:
+
+    seed   off hard rows   dup hard rows   probe outcomes
+      3        190              1          IDENTICAL (same 3 failures)
+      2         64              6          IDENTICAL (same 2 failures)
+      1          0              0          DIFFER (dup fixes rust_regex_lite)
+    other 8   0-3             0-2          identical
+
+Eight of ten seeds are near-identical; two degenerate badly under `off` and
+the dup tier rescues them. But **seed 3 committed 190 low-confidence rows and
+failed exactly the same probes as the arm that committed 1**, while the only
+quality difference appeared at a seed with ZERO hard rows. Contested-committed
+rows and executable correctness are close to decoupled here.
+
+This speaks directly to the blocked `DGQ_COMMIT_CONF_HARD` question, whose
+premise is "both existing signals are proxies; neither says whether trimming
+makes answers BETTER". Now measured: trimming improves the PROXY by ~14x and
+the OUTCOME by 2 probes in 182. **Do not size a lever decision on
+`contested_per_1k`.** Caveats: 13 seeds, one battery, one model, and
+executable correctness is a coarse per-probe binary — contested rows could
+still affect prose quality this battery cannot see.
+
+**Joint-constraint double-removal: REPLICATED.** Scanning 245 off-arm
+generations for adjacent pairs whose non-quote content is unchanged but whose
+quote count moved by >=2 with BOTH positions changing in the same step yields
+just 3 events. Two are byte-identical and independent:
+
+    seed  7 step 4:  ('*"', '"$')(2) -> ('*', '$')(0)   bash_stdin_and_argv FAILS
+    seed 17 step 4:  ('*"', '"$')(2) -> ('*', '$')(0)   bash_stdin_and_argv FAILS
+    seed  5 step 6:  ('(', '(')(0)  -> ('("', '("')(2)  benign addition
+
+Same token pair, same direction, same step, same resulting probe failure, at
+two unrelated seeds. The pattern is real and reproducible. The MECHANISM
+(independent per-position marginals cannot encode "exactly one quote across
+this pair", so both positions correct the same visible doubling) remains an
+inference rather than a controlled result: a clean test would compare
+same-step resolutions of a doubled state against across-step ones, which
+needs more harmful instances than 2.
 
 Open work on this battery:
 - **Judge it by the multi-seed aggregate, never one seed.** Seed 42 scores
