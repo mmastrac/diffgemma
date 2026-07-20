@@ -1011,6 +1011,48 @@ iterations, nothing else on the GPU. Report per-step deltas, not totals.
 Acceptance: OFF must be indistinguishable from the pre-change baseline; ON
 must be justified by what it buys.
 
+### Diag denoise path does not converge (investigation 2026-07-20)
+
+`StepRuntime::run_denoise_step` churns noise in the diagnostic path while the
+IDENTICAL call converges in production (golden 8/8, smoketest 17/17). Symptom
+is reproducible with the repo's own `step-smoke`: after 48 steps the canvas
+decodes to multilingual garbage (`न्ति pizzeria KEYS...`), mean_entropy 11.35
+against a ~12.5 vocab ceiling, `low_ent(<0.1) = 0`. Production reaches 128/128
+low-entropy rows on the same shape. This blocks warm/resolved-canvas probing
+(hence per-TOKEN classification; the per-BLOCK classifier ships and works).
+
+RULED OUT so far — do not re-check these:
+- **Schedule length.** `--steps 8` and `--steps 48` give identical
+  non-convergence (entropy 11.365 vs 11.350), so `sampler_for_steps(cfg.steps)`
+  sizing is not it.
+- **`active_canvas`.** Initialised to `CANVAS` at `build.rs:477`, so the
+  `clamp(1, CANVAS)` in `run_forward_once` is not silently narrowing to 1 row.
+- **Unpopulated `StepParams`.** `build.rs:224` builds them via
+  `step_params_from_sampler`, so thresholds/temps are not zeroed.
+- **Missing prefill / KV.** `kv_len=31` is prefilled, and the hidden states are
+  demonstrably prompt-dependent — the same path feeds `fit-token-probe` to LOO
+  accuracy 1.000 / effect 2.75.
+- **The forward itself.** Same evidence: hidden separates code from prose at
+  effect 2.75.
+- **Config shape.** Production's `smoke_config` produces the same
+  `StepSmokeConfig` (Full finish, steps from the sampler).
+
+REMAINING SUSPECTS, narrowed to what sits between a good forward and a flat
+sampled distribution:
+- **Self-conditioning state across steps.** `run_forward_once` sets
+  `first_step = (state.step == 0)`, then later steps are meant to feed the
+  PREVIOUS step's logits through the SC MLP. If that soft-embed is not carried
+  in this path the canvas never anneals — and SC=0 is a known degeneracy here
+  ([[cold-start-empty-reply]]).
+- **The accept/commit path in the sampler stages.**
+
+NEXT ACTION is a BISECTING MEASUREMENT, not more code reading (AGENTS §2:
+"same input, same weights, two paths, compare cosine"). `step-logits-dump` on
+one prompt+seed through the diagnostic path and through a production
+generation, comparing logits at step 1 and step 2. Step 1 should match (both
+use the deterministic SC seed); if step 2 diverges, SC carry-over is the
+defect and that localises it to one stage.
+
 ### WAY OUT THERE — can the generation LANGUAGE be read off the model's own state?
 
 Speculative, not planned, nobody is convinced. Recorded because the core
