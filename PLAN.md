@@ -1051,6 +1051,62 @@ replaced it. The within-language pairs in that first design also differed by a
 "markdown code block" instruction, a bigger perturbation than the language
 itself.
 
+**L6 PROBE BUILT AND TESTED (2026-07-19). A linear "about to write code"
+direction exists in the canvas hidden state, and survives four confounds.**
+44 prompts (22 code across rust/python/bash/js/c/go/java, 22 prose of which 11
+are HARD negatives — prose ABOUT programming: compilers, garbage collection,
+memory safety, recursion). Estimator is difference-of-class-means with
+leave-one-out, deliberately NOT logistic regression: at d=2816, n=44 any
+fitted linear separator hits 100% on train and means nothing.
+
+    layer   LOO acc   hard-neg   effect size (gap / within-class scatter)
+    pre       --        --         0.0000     <- control: bit-identical, refuses to guess
+    L3       1.000     1.000       1.51
+    L6       1.000     1.000       2.05       <- PEAK
+    L9       1.000     1.000       1.91
+    L21      1.000     1.000       0.50
+    final    1.000     1.000       0.59
+
+Accuracy SATURATES; effect size does not. L6 and L21 both score 1.000 but L6
+is 4x more separated — report effect size, not accuracy, when comparing
+layers.
+
+**Confounds excluded, each by construction:**
+- *Own token*: probe position holds identical seeded noise (id 71153) in every
+  condition; `after_preamble` is bit-identical with effect size exactly 0.
+- *Token identity of the topic word*: `rust_talk` has the SAME "Rust" token as
+  `rust_write` yet lands on the prose side; `py_write` (different language) is
+  the nearest neighbour.
+- *Technical vocabulary*: 11/11 hard negatives correct — "explain what garbage
+  collection is" reads as PROSE despite dense programming vocabulary. The axis
+  is "am I about to WRITE code", not "is this about programming".
+- *Instruction verb*: a held-out control of 3 prose prompts that SAY "Write"
+  and 3 code prompts that never do scores **6/6** at both L6 and L9. "Write a
+  paragraph explaining photosynthesis" -> prose; "Show me a Rust program" ->
+  code.
+- *Prompt length*: length alone classifies at only 0.659. *Norm*: all vectors
+  L2-normalised first.
+
+**METHOD TRAP worth remembering: leave-one-out leaked the label through
+floating-point rounding.** The first run scored 1.000 at `after_preamble`,
+where all vectors are BIT-IDENTICAL and separation is impossible. Cause: class
+means are summed over different-sized subsets, and LOO changes which class
+loses a member, so rounding differs systematically with the held-out sample's
+class. On a zero-signal layer that noise is the only signal and it encodes the
+answer. Fix: compute an effect size and refuse to predict when ||w|| is
+degenerate. Any LOO harness with per-class means has this bug.
+
+**Still open after this:** the LANGUAGE sub-axis (rust vs python) is much
+weaker than the code/prose axis and inverts with depth, so it is NOT
+established as a usable classifier. All prompts are ~22 tokens, so the
+sliding-window/global distinction was never exercised. And this is the CANVAS
+residual, which costs a forward pass — whether a single KV vector is linearly
+readable is untested, and blocked on tooling: **V is not captured in any dump**
+(`step-attn-dump` emits hidden_in/q_*/attn_out/k_samples only). K IS dumped;
+note RoPE is orthogonal so it PRESERVES inner products and does not obstruct
+same-position comparisons — it only breaks a probe direction shared ACROSS
+positions. A K probe therefore needs length-matched prompts, not an un-RoPE.
+
 **Cheapest experiment that could kill it, in order:**
 1. `step-moe-route-dump` on a handful of known-bash / known-python /
    known-prose generations. Do the expert histograms separate AT ALL? No
