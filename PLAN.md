@@ -914,6 +914,81 @@ membudget permits. Still open below.
   (prefill fns prod vs `forward_decoder*` validation),
   `memwatch.rs` (`physical_ram_bytes` prod). Move pending user sign-off.
 
+### WAY OUT THERE — can the generation LANGUAGE be read off the model's own state?
+
+Speculative, not planned, nobody is convinced. Recorded because the core
+question is interesting on its own terms and because a cheap experiment can
+kill it in an afternoon.
+
+**The question.** This is a 128-expert MoE, top-8 per position per layer.
+Expert specialisation by domain is a real effect in MoE models generally. Does
+the routing pattern carry a legible signal for *which language this position
+is being written in* — bash vs python vs rust vs prose? Same question for a
+linear probe on layer-N hidden states.
+
+**Why it would be useful.** Every structural-repair idea we have (delimiter
+balance, AST validation) needs to know WHICH SPANS ARE CODE, and in what
+language, before it can safely fire. Token heuristics answer that well for a
+whole reply but get fuzzy exactly at span boundaries — which is where a
+delimiter check most wants precision. Routing is PER-POSITION, so it is a
+segmentation rather than a document label, and it is already computed every
+step at no extra cost.
+
+**The honest counter-argument.** At commit time the text is already decoded
+(we need it to parse anyway), and `#!/bin/bash` / `fn main()` / `def ` are
+ruthlessly discriminative. Internal state has to beat a twenty-line token
+heuristic that costs nothing. It only clearly wins for (a) mixed replies with
+several inline spans, and (b) a signal that exists BEFORE tokens resolve —
+and (b) currently has no consumer, since in-step grammar constraint does not
+transfer to diffusion (no well-defined prefix state to constrain against).
+
+**Cheapest experiment that could kill it, in order:**
+1. `step-moe-route-dump` on a handful of known-bash / known-python /
+   known-prose generations. Do the expert histograms separate AT ALL? No
+   probe training needed to answer this. If they do not separate, stop.
+2. If they separate: linear probe on routes (or hidden states) for
+   per-position language, scored against token-derived labels.
+3. Only then consider an on-device implementation.
+
+**If it ever gets built, it should be a KERNEL, not a readback.** Router state
+is on-device; pulling it back every step is a pipeline stall, and this
+project's history is that instrumentation can dominate a step. The hot path
+already does 1.00 syncs/step and 36.1 KiB readback for sample rowstats — a
+detector that folds its output into THAT existing transfer adds no sync and
+no stall.
+
+**Adjacent, more tractable, same machinery** (worth doing first if any of
+this is done at all): a purely NUMERIC defect detector on device.
+- Per-token delimiter-delta table built once at load (each token's net quote
+  and bracket contribution), then delimiter balance at every canvas position
+  is a PREFIX SCAN — a primitive this repo already has from the SC sparse
+  compaction fix. That also settles the interior-vs-tail question directly:
+  you can see where balance breaks and whether it recovers before the block
+  edge.
+- A repair-partner table (delimiter-bearing token -> its corrected form) lets
+  the same kernel gather both logits and emit the likelihood delta for the
+  indifference test. Note this is the ONLY practical form of that test:
+  reading logits back to compare on CPU is 256 x 262144 x 4 = ~268 MB/step.
+- Two tiers: GPU numeric gate per block (~free) -> CPU decode/parse/repair
+  (rare). Parsing is irregular control flow with dynamic allocation; it does
+  not belong on a GPU and does not need to.
+
+**Why the sequencing is nice:** a detector that only COMPUTES and never steers
+is trajectory-neutral, so golden stays 8/8 byte-identical with no re-bless and
+no live A/B. It could ship observational behind a `DGQ_` flag and produce the
+blend RATE that is currently the top open item above — at zero risk to output.
+Wiring it to an actual repair is trajectory-affecting and needs the full
+ritual (golden re-bless, live A/B, not a replay sim).
+
+Obligations if built: a `cpu.rs` oracle under the unified kernel tree, and the
+dispatch cost MEASURED rather than assumed.
+
+**Blocked on nothing, but pointless before:** the 20-minute specimen test
+(take the six known blend specimens, construct the corrected canvas, compare
+joint log-prob under one forward pass; the hypothesis predicts |delta| ~ 0).
+A clean negative there collapses the indifference gate and shrinks all of the
+above to a bare balance scan.
+
 ### Concept — span handles / compact history (parked)
 
 Keep large code/tool bodies out of long-lived canonical KV as opaque
