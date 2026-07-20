@@ -1203,6 +1203,46 @@ markup as literal text (48 tokens vs 22), so it is unreachable from
 `step-layer-probe` today. Probing it properly needs tools support added to
 that command — a separate small engine change.
 
+**TOOL-CALLING IS ITS OWN MODE (2026-07-19), with the control that proves it.**
+No engine change was needed: `--raw` (NOT `--raw-prompt`, which is silently
+ignored — unknown flags do not error) round-trips the chat template
+byte-exactly, so the full `<|tool>declaration:...<tool|>` system block can be
+hand-built and encodes to real special ids. 4 conditions x 8 items, cold
+canvas, exact token control.
+
+                toolreal  toolidle     prose      code     (L6)
+    toolreal        1.00     -0.37     -0.82      0.18
+    toolidle       -0.37      1.00      0.43     -0.84
+    prose          -0.82      0.43      1.00     -0.54
+    code            0.18     -0.84     -0.54      1.00
+
+The decisive control is `toolreal` vs `toolidle`: IDENTICAL system block (same
+tool declaration), differing only in whether the user asks to use the tool.
+They separate at -0.37 (L6) and -0.72 (L29), so the state is tool-EMISSION
+intent, not "a tool declaration is in context". Tools merely present washes
+out with depth (`toolidle ~ prose` 0.43 -> 0.92 by L29).
+
+Tool mode is NOT a flavour of code (+0.18 at L6, -0.40 at L29) despite both
+being structured grammars. By L29 four conditions collapse to THREE clusters:
+{toolreal}, {toolidle, prose}, {code}.
+
+**Consequence for a cheap output-time token classifier** (the reason this
+matters): prompt-context mode is cleanly separable into at least 3-4 classes,
+and a linear probe is one dot product per position — 256 x 2816 ~ 720K MACs
+per direction, sub-microsecond against a ~700ms step, output 256 floats that
+folds into the EXISTING 36.1 KiB/step rowstats readback. No new sync. As pure
+instrumentation it is trajectory-neutral, so golden stays byte-identical and
+it can ship observational behind a `DGQ_` flag.
+
+**BUT the blocking question is unanswered**: every probe so far reads ONE
+position on a COLD canvas. Output-time classification reads EVERY position on
+a RESOLVED one, and the single warm test showed the signal drop hard (effect
+1.12 -> 0.31) — plausibly because once a position holds content, its own token
+dominates and dilutes the context signal. That test probed position 129, which
+held junk TAIL FILLER, not committed program text. Whether the signal survives
+at positions holding REAL generated code is the experiment that decides the
+whole idea, and it must run before any kernel work.
+
 **Cheapest experiment that could kill it, in order:**
 1. `step-moe-route-dump` on a handful of known-bash / known-python /
    known-prose generations. Do the expert histograms separate AT ALL? No
