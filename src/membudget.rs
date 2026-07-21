@@ -34,11 +34,18 @@ const DEFAULT_HEADROOM_BYTES: usize = 6 << 30;
 /// waits use a condvar and don't poll).
 const CROSS_PROCESS_POLL: Duration = Duration::from_millis(200);
 
-/// Default [`MemBudget::acquire`] wait deadline. Long enough for any healthy
-/// runtime turnover on this machine (the whole suite is ~9 min), short enough
-/// to surface a wedged or forgotten holder (an idle `serve` next to the
-/// suite) as an error naming the holder instead of an indefinite silent
-/// stall. `DGQ_MEM_LOCK_TIMEOUT` seconds overrides; `0` waits forever.
+/// Default [`MemBudget::acquire`] STALL deadline: how long nothing may move
+/// before a waiter gives up. It surfaces a wedged or forgotten holder (an idle
+/// `serve` next to the suite) as an error naming the holder, instead of an
+/// indefinite silent stall. `DGQ_MEM_LOCK_TIMEOUT` seconds overrides; `0`
+/// waits forever.
+///
+/// Deliberately NOT a bound on total wait. It used to be, with the rationale
+/// "the whole suite is ~9 min" — then the suite grew past 18 min and the
+/// constant silently became a correctness bug, failing 4 tests every run on a
+/// clean tree (see `acquire`). A stall deadline does not need recalibrating
+/// when the suite grows, which is the point: the previous formulation had to
+/// be, and nothing made that visible when it stopped holding.
 const DEFAULT_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(600);
 
 struct State {
@@ -50,6 +57,9 @@ struct State {
     /// be starved by a stream of small ones.
     queue: std::collections::VecDeque<u64>,
     next_ticket: u64,
+    /// Bumped on every release. A waiter that sees this change knows the
+    /// system is MOVING and restarts its stall deadline — see `acquire`.
+    releases: u64,
 }
 
 struct Inner {
@@ -64,7 +74,11 @@ struct Inner {
 /// `acquire` gave up waiting. Carries a holder listing for the error message.
 #[derive(Debug)]
 pub struct MemWaitTimeout {
+    /// Total time queued. Reported for context but NOT what tripped the
+    /// deadline — a long wait behind a draining queue is healthy.
     pub waited: Duration,
+    /// Time since anything last moved. THIS is what exceeded the timeout.
+    pub stalled: Duration,
     pub wanted: usize,
     /// One line per live holder: in-process grants and other processes'
     /// lock files (`pid-label.mem`).
@@ -75,10 +89,12 @@ impl std::fmt::Display for MemWaitTimeout {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "timed out after {:.0}s waiting for a {:.1} GiB memory grant; live holders: [{}] \
+            "no memory was released for {:.0}s while waiting for a {:.1} GiB grant \
+             ({:.0}s queued in total); live holders: [{}] \
              (kill the holder, raise DGQ_TEST_MEM_BUDGET, or set DGQ_MEM_LOCK_TIMEOUT=0 to wait)",
-            self.waited.as_secs_f64(),
+            self.stalled.as_secs_f64(),
             self.wanted as f64 / (1024.0 * 1024.0 * 1024.0),
+            self.waited.as_secs_f64(),
             if self.holders.is_empty() {
                 "none visible — budget smaller than the request while busy".to_string()
             } else {
@@ -160,6 +176,7 @@ impl MemBudget {
                     grants: Vec::new(),
                     queue: std::collections::VecDeque::new(),
                     next_ticket: 0,
+                    releases: 0,
                 }),
                 cv: Condvar::new(),
                 lock_dir,
@@ -192,14 +209,33 @@ impl MemBudget {
         st.queue.push_back(ticket);
         let wait_started = std::time::Instant::now();
         let mut announced = false;
+        // The deadline measures STALL, not total wait. Only one 21.7 GiB
+        // runtime fits in a 30 GiB budget, so every model-loading test
+        // serializes; a ticket at the back of a healthy FIFO waits as long as
+        // the whole queue takes to drain. Measuring total wait made that
+        // indistinguishable from a wedged holder, and once the suite outgrew
+        // the 600s default it failed 4 tests DETERMINISTICALLY (measured
+        // 2026-07-20: 706/4 by default vs 710/0 with DGQ_MEM_LOCK_TIMEOUT=0 —
+        // no leak, no wedge, just a deadline that had stopped meaning
+        // anything). Restarting the clock on progress restores the documented
+        // intent: the error fires when NOTHING HAS MOVED for the timeout while
+        // we still don't fit, which is exactly a wedged or forgotten holder.
+        let mut last_progress = wait_started;
+        // Progress = a grant was released, or we advanced in the queue.
+        let mut seen = (st.releases, st.queue.iter().position(|&t| t == ticket));
         loop {
             let external = inner.lock_dir.as_deref().map_or(0, external_used);
             let fits = st.used + external + bytes <= inner.total || (st.used == 0 && external == 0); // oversized-when-idle
             if st.queue.front() == Some(&ticket) && fits {
                 break;
             }
+            let now = (st.releases, st.queue.iter().position(|&t| t == ticket));
+            if now != seen {
+                seen = now;
+                last_progress = std::time::Instant::now();
+            }
             if let Some(limit) = inner.timeout
-                && wait_started.elapsed() >= limit
+                && last_progress.elapsed() >= limit
             {
                 st.queue.retain(|&t| t != ticket);
                 // A later ticket may be head-of-line now.
@@ -216,6 +252,7 @@ impl MemBudget {
                 HOLDING.with(|h| h.set(false));
                 return Err(MemWaitTimeout {
                     waited: wait_started.elapsed(),
+                    stalled: last_progress.elapsed(),
                     wanted: bytes,
                     holders,
                 });
@@ -234,7 +271,9 @@ impl MemBudget {
             // Cross-process holdings (and the deadline) can change without
             // waking our condvar — always wake to re-poll.
             let poll = match inner.timeout {
-                Some(limit) => CROSS_PROCESS_POLL.min(limit.saturating_sub(wait_started.elapsed())),
+                Some(limit) => {
+                    CROSS_PROCESS_POLL.min(limit.saturating_sub(last_progress.elapsed()))
+                }
                 None if inner.lock_dir.is_some() => CROSS_PROCESS_POLL,
                 None => {
                     st = inner.cv.wait(st).unwrap();
@@ -289,6 +328,7 @@ impl Drop for MemPermit {
         let mut st = self.inner.state.lock().unwrap();
         st.used = st.used.saturating_sub(self.bytes);
         st.grants.retain(|&(t, _, _)| t != self.ticket);
+        st.releases += 1;
         self.inner.cv.notify_all();
         if std::thread::current().id() == self.owner {
             HOLDING.with(|h| h.set(false));
@@ -543,6 +583,86 @@ mod tests {
         assert!(msg.contains("holder-a"), "holder not named: {msg}");
         drop(first);
         assert_eq!(waiter.join().unwrap().unwrap(), 80);
+    }
+
+    /// A LONG BUT DRAINING queue must not time out, however far the total wait
+    /// exceeds the deadline.
+    ///
+    /// This is the regression test for a real, shipped failure: only one
+    /// 21.7 GiB runtime fits in the 30 GiB budget, so every model-loading test
+    /// serializes, and the deadline used to measure TOTAL wait. Once the suite
+    /// grew past ~18 min, tickets at the back of a perfectly healthy queue blew
+    /// the 600s default and `cargo test --release` failed 4 tests on a clean
+    /// tree — 706/4 by default against 710/0 with `DGQ_MEM_LOCK_TIMEOUT=0`.
+    /// Here the waiter is queued for ~3x the deadline while never stalling
+    /// longer than a fraction of it.
+    #[test]
+    fn a_draining_queue_never_times_out_however_long_the_total_wait() {
+        const STEP: Duration = Duration::from_millis(300);
+        let b = Arc::new(MemBudget::with_timeout(100, None, Some(STEP + STEP)));
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        // Three holders, queued AHEAD of the waiter, releasing one at a time.
+        let holders: Vec<_> = (0..3)
+            .map(|i| {
+                let b = Arc::clone(&b);
+                let tx = acquired_tx.clone();
+                std::thread::spawn(move || {
+                    let p = b.acquire(30, "holder").unwrap();
+                    tx.send(()).unwrap();
+                    // Staggered releases: progress every STEP, never a stall
+                    // longer than STEP.
+                    std::thread::sleep(STEP * (i + 1));
+                    drop(p);
+                })
+            })
+            .collect();
+        for _ in 0..3 {
+            acquired_rx.recv().unwrap();
+        }
+        // 90 of 100 held; the waiter only fits once ALL THREE have released,
+        // i.e. after ~3 * STEP — well past the 2 * STEP deadline.
+        let started = std::time::Instant::now();
+        let waiter = {
+            let b = Arc::clone(&b);
+            std::thread::spawn(move || b.acquire(80, "patient").map(|p| p.bytes()))
+        };
+        let got = waiter.join().unwrap();
+        for h in holders {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            got.map_err(|e| e.to_string()),
+            Ok(80),
+            "a draining queue must not time out"
+        );
+        assert!(
+            started.elapsed() >= STEP * 2,
+            "test did not actually outlast the deadline ({:?})",
+            started.elapsed()
+        );
+    }
+
+    /// ...and the complement: a holder that never releases still fires, and the
+    /// error reports the STALL as the thing that tripped it.
+    #[test]
+    fn a_wedged_holder_still_times_out_and_reports_the_stall() {
+        let b = Arc::new(MemBudget::with_timeout(
+            100,
+            None,
+            Some(Duration::from_millis(100)),
+        ));
+        let _wedged = b.acquire(80, "wedged-holder").unwrap();
+        let err = {
+            let b = Arc::clone(&b);
+            std::thread::spawn(move || b.acquire(80, "waiter").err())
+        }
+        .join()
+        .unwrap()
+        .expect("a wedged holder must still time out");
+        assert!(err.stalled >= Duration::from_millis(100));
+        let msg = err.to_string();
+        assert!(msg.contains("no memory was released"), "{msg}");
+        assert!(msg.contains("wedged-holder"), "holder not named: {msg}");
     }
 
     #[test]

@@ -672,6 +672,32 @@ not build on it without a real sweep.)
 
 ### Correctness debt
 
+- ~~**membudget deadline measured total wait, not stall**~~ **FIXED
+  (2026-07-20)**: `cargo test --release` failed 4 tests on a CLEAN tree
+  (`fusion_matches_unfused_forward_logits`, `pipeline::
+  per_block_partial_commit_and_discard_consistency`,
+  `pipeline_cancel_stops_generate_kv_clean`,
+  `pipeline_rejects_stale_epoch_rewind`). Same tree with
+  `DGQ_MEM_LOCK_TIMEOUT=0`: **710 passed, 0 failed**. So there was no leak
+  and no wedged holder — the byte-permit serialization was correct and only
+  the deadline was wrong. Budget is 36 GiB RAM − 6 GiB headroom = 30 GiB and
+  one step-runtime is 21.7 GiB, so exactly ONE fits and all 33
+  `build_step_runtime` sites fully serialize; `acquire` compared
+  `wait_started.elapsed()` against the limit, which made a ticket at the back
+  of a healthy draining FIFO indistinguishable from one behind a wedge. The
+  suite grew past the "~9 min" the 600s default was chosen for (now ~18-20
+  min), so late tickets blew it DETERMINISTICALLY — the same 4 tests every
+  run, which is the tell that it was never a flake. Fix: the deadline now
+  measures STALL (restarted whenever a grant is released or the waiter
+  advances in the queue), so it means "nothing moved for 600s while we still
+  don't fit" = a wedged or forgotten holder, which is what the module doc
+  always claimed it meant. Bumping the constant was rejected: it re-breaks
+  the next time the suite grows, and nothing makes that visible when it does.
+  Regression test `a_draining_queue_never_times_out_however_long_the_total_
+  wait` was verified to FAIL against the old comparison before being kept.
+  **Lesson: a "known flaky under parallelism" label was doing real damage
+  here** — it excused a broken gate for as long as it went unexamined.
+
 - ~~**Hard-kill flag validation**~~ **DONE (2026-07-19)**: a set-but-
   invalid `DGQ_*` value now exits(2) naming every offender, instead of
   silently running the default. `DGQ_PREFIX_EXIT=1` — which used to
