@@ -637,6 +637,17 @@ pub fn trace_pmax_jsonl() -> Option<String> {
     config().debug.trace_pmax_jsonl.clone()
 }
 
+/// Structural delimiter/parity check on committed blocks (`DGQ_DELIM_CHECK=1`).
+/// Observational: it never steers generation.
+pub fn delim_check_enabled() -> bool {
+    config().debug.delim_check || config().debug.delim_check_jsonl.is_some()
+}
+
+/// Per-block delimiter-check JSONL path (`DGQ_DELIM_CHECK_JSONL=<path>`).
+pub fn delim_check_jsonl() -> Option<String> {
+    config().debug.delim_check_jsonl.clone()
+}
+
 /// Path to an output-token classification probe (`DGQ_TOKEN_CLASS=<file>`).
 /// `None` means the classifier is off and NO hidden readback is performed.
 pub fn token_class_probe() -> Option<String> {

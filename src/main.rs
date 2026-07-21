@@ -24,6 +24,7 @@ mod chat_ui;
 mod config;
 #[cfg(target_os = "macos")]
 mod conversation;
+mod delimiter;
 mod denoise_trace;
 mod dgq;
 mod error;

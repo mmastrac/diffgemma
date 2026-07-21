@@ -46,6 +46,11 @@ pub struct ProposedBlock {
     pub stats: crate::generate::BlockDenoiseStats,
     /// 1-based index this block would commit as.
     pub block_idx: usize,
+    /// Output mode this block was classified as at block START (the regime the
+    /// probe was fitted in), with the vote's mean |score| as a margin. `None`
+    /// when `DGQ_TOKEN_CLASS` is unset. Consumed by the delimiter check, which
+    /// skips content structure on prose.
+    pub block_mode: Option<(crate::delimiter::BlockMode, f32)>,
 }
 
 /// Outcome of one [`propose_block`] call.
@@ -288,9 +293,12 @@ pub fn begin_turn(
     let shared_blob = session.rt.shared_dgq_blob();
     let rt = &mut session.rt;
 
-    // The step-text log AND the whitespace-collapse guard both need to decode
-    // canvas tokens; load the tokenizer lazily once per session for either.
-    if (step_text_log_enabled() || crate::flags::ws_block_stop_enabled())
+    // The step-text log, the whitespace-collapse guard AND the delimiter check
+    // all need to decode canvas tokens; load the tokenizer lazily once per
+    // session for any of them.
+    if (step_text_log_enabled()
+        || crate::flags::ws_block_stop_enabled()
+        || crate::flags::delim_check_enabled())
         && session.step_text_tokenizer.is_none()
     {
         let tok_path = session.model_dir.join("tokenizer.json");
@@ -552,6 +560,10 @@ pub fn propose_block(
     // Head width committed by a PrefixExit stop (None = full active canvas).
     // Outlives the 'attempt loop; reset at each attempt start.
     let mut prefix_exit_head: Option<usize> = None;
+    // Block-level output mode, set by the classifier on each attempt's first
+    // forward. Outlives the 'attempt loop so the committed attempt's label
+    // reaches the delimiter check.
+    let mut block_mode: Option<(crate::delimiter::BlockMode, f32)> = None;
     let (
         st,
         block_step_count,
@@ -617,6 +629,10 @@ pub fn propose_block(
                     let label = u8::from(pos * 2 >= labels.len());
                     let margin = scores.iter().map(|s| s.abs()).sum::<f32>() / scores.len() as f32;
                     let agree = if label == 1 { pos } else { labels.len() - pos };
+                    block_mode = Some((
+                        crate::delimiter::BlockMode::from_class_name(probe.class_name(label)),
+                        margin,
+                    ));
                     eprintln!(
                         "token-class: block {block_idx} -> {} (vote {agree}/{}, mean |score| {margin:.4})",
                         probe.class_name(label),
@@ -1224,6 +1240,7 @@ pub fn propose_block(
         token_ids: argmax_tokens,
         stats,
         block_idx,
+        block_mode,
     })))
 }
 
@@ -1250,6 +1267,9 @@ pub fn commit_block(
     ts.blocks_committed += 1;
     pb.stats.kept_tokens = kept;
     pb.stats.token_ids = pb.token_ids[..kept].to_vec();
+    if crate::flags::delim_check_enabled() {
+        run_delimiter_check(session, cfg, ts, &pb, block_base);
+    }
     if let Some(ref obs) = cfg.block_commit_observer {
         obs(&pb.stats);
     }
@@ -1302,6 +1322,125 @@ pub fn commit_block(
     Ok(())
 }
 
+/// `DGQ_DELIM_CHECK`: structural verdict on the block just committed.
+///
+/// Pure instrumentation — it decodes text and counts delimiters, touching
+/// neither the canvas, the KV, nor the RNG, so generation stays byte-identical
+/// and `golden` needs no re-bless. Everything it needs is already at hand: the
+/// committed tokens, the block-start mode label, and the stop fields the commit
+/// policy just filled in.
+///
+/// Checked against the WHOLE reply, not the block in isolation: fences and
+/// tool calls span blocks, and `masked_ranges` needs both delimiters of a pair
+/// to decide what is data. Findings are then attributed to the byte range this
+/// block contributed, so one bad line is not re-counted by every later block.
+fn run_delimiter_check(
+    session: &mut StepGenerateSession,
+    cfg: &StepGenerateConfig,
+    ts: &TurnState,
+    pb: &ProposedBlock,
+    block_base: usize,
+) {
+    let Some(tok) = session.step_text_tokenizer.as_ref() else {
+        return; // tokenizer failed to load; already warned at turn start
+    };
+    let prompt_len = ts.prompt_token_ids.len();
+    let decode = |ids: &[u32]| tok.decode(&crate::sample::strip_degenerate_token_ids(ids));
+    let text = decode(&ts.sequences[prompt_len..]);
+    let prior = decode(&ts.sequences[prompt_len..block_base.max(prompt_len)]);
+    // Decoding a prefix yields a prefix of the whole, but clamp to a char
+    // boundary rather than trusting that across a tokenizer swap.
+    let mut block_start = prior.len().min(text.len());
+    while block_start > 0 && !text.is_char_boundary(block_start) {
+        block_start -= 1;
+    }
+
+    // Block-edge rule: only a block that ENDED (stop token, or eos inside the
+    // committed span) may be judged on trailing balance. A block that ran to
+    // the canvas edge legitimately leaves delimiters open for the next one.
+    // A deferred stop is not an ending — the turn continues.
+    let committed = &ts.sequences[block_base..];
+    let eos = session.rt.read_params().eos_token_id;
+    let terminated = (pb.stats.stop_token_id.is_some() && !pb.stats.continued_past_stop)
+        || crate::sample::answer_region_end(committed, eos) < committed.len()
+        || committed
+            .iter()
+            .any(|t| cfg.stop_token_ids.contains(t) || *t == eos);
+
+    let (mode, margin) = pb.block_mode.map_or(
+        (crate::delimiter::BlockMode::Unknown, f32::NAN),
+        |(m, s)| (m, s),
+    );
+    let report = crate::delimiter::check_block(&text, block_start, mode, terminated);
+
+    let block_idx = pb.block_idx;
+    if report.failed() {
+        for f in &report.findings {
+            eprintln!(
+                "delim-check: block {block_idx} mode={} terminated={terminated} FAIL {}/{} lang={} — {}",
+                mode.as_str(),
+                f.check,
+                f.kind.as_str(),
+                if f.lang.is_empty() { "?" } else { &f.lang },
+                f.detail,
+            );
+        }
+    } else if progress_enabled() {
+        eprintln!(
+            "delim-check: block {block_idx} mode={} terminated={terminated} OK{}",
+            mode.as_str(),
+            if report.prose_skipped {
+                " (prose: content checks skipped)"
+            } else {
+                ""
+            },
+        );
+    }
+
+    if let Some(path) = crate::flags::delim_check_jsonl() {
+        trace_pmax_append(
+            &path,
+            serde_json::json!({
+                "kind": "delim_check",
+                "label": ts.label,
+                "block": block_idx,
+                "block_base": block_base,
+                "mode": mode.as_str(),
+                // Probe margin (mean |score|): recorded so the failure rate can
+                // be re-split by a CALIBRATED threshold after the fact. Prose
+                // margins run consistently higher than code, so the zero
+                // threshold the label uses is known not to be centred.
+                "mode_margin": if margin.is_nan() { None } else { Some(margin) },
+                "terminated": terminated,
+                "prose_skipped": report.prose_skipped,
+                // Zero means NOTHING WAS SCANNED — an absent verdict, not a
+                // pass. Any rate computed from this trace must exclude these.
+                "regions_scanned": report.regions_scanned,
+                "kept_tokens": pb.stats.kept_tokens,
+                "stop_reason": pb.stats.denoise_stop,
+                "findings": report.findings.iter().map(|f| serde_json::json!({
+                    "check": f.check,
+                    "kind": f.kind.as_str(),
+                    "lang": f.lang,
+                    "detail": f.detail,
+                    // The offending text, for eyeballing false positives —
+                    // the whole point of an observational pass.
+                    "context": context_at(&text, f.at),
+                })).collect::<Vec<_>>(),
+            }),
+        );
+    }
+}
+
+/// The line containing byte `at`, trimmed and capped — enough to judge a
+/// finding by eye without dumping the whole reply into the trace.
+fn context_at(text: &str, at: usize) -> String {
+    let at = at.min(text.len().saturating_sub(1));
+    let start = text[..at].rfind('\n').map_or(0, |i| i + 1);
+    let end = text[at..].find('\n').map_or(text.len(), |i| at + i);
+    text[start..end].trim().chars().take(160).collect()
+}
+
 /// Close the turn: record `kv_valid_tokens` (the causal contract the next
 /// turn's cross-turn reuse diffs against) and assemble the output.
 pub fn finish_turn(
@@ -1316,6 +1455,21 @@ pub fn finish_turn(
             "step-generate: P2.1 hot path mean {:.2} syncs/step, {:.1} KiB readback/step (DGQ_CHECK_LOGITS for opt-in logits scan)",
             agg.gpu_syncs as f64 / n,
             agg.gpu_readback_bytes as f64 / 1024.0 / n
+        );
+    }
+
+    // Running delimiter-check totals. Printed unconditionally when the check
+    // is on: before believing any comparison of arms, the first question is
+    // whether the lever fired at all, and a zero here answers it.
+    if crate::flags::delim_check_enabled() {
+        let c = crate::delimiter::counters();
+        // `vacuous` is reported alongside the rate on purpose: a run where
+        // nothing was scannable produces the SAME zero as a run where
+        // everything passed, and the first `programmatic` measurement was
+        // exactly that (0/54 with no region scanned).
+        eprintln!(
+            "delim-check: session totals — {} checked, {} prose-gated, {} vacuous (nothing scannable), {} failed ({} findings)",
+            c.checked, c.prose_skipped, c.vacuous, c.failed, c.findings
         );
     }
 

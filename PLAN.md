@@ -1124,6 +1124,137 @@ checker alone is worth shipping and the self-eval turn is unnecessary. If
 prose still trips often, the ask earns its place and the rate is known before
 paying for it.
 
+**CHECKER BUILT, OBSERVATIONAL ONLY (2026-07-20).** `src/delimiter.rs`, behind
+`DGQ_DELIM_CHECK=1` (stderr verdict) / `DGQ_DELIM_CHECK_JSONL=<path>` (one
+record per checked block). Hooked at `commit_block`; reads decoded text only,
+so it touches neither canvas, KV nor RNG and `golden` needs no re-bless. NO
+repair is built — that decision waits on the numbers below.
+
+Five checks, reported SEPARATELY so a noisy one can be identified rather than
+averaged into the rate: `tool_grammar` (delegated wholesale to
+`validate_tool_reply` — a complete `call:` arg body is balanced by
+construction, which is why it is a masked range, so `{}`/`[]` needed no second
+implementation), `fence` (parity of unmasked ``` markers), `bracket`,
+`quote_line` (per-line parity — the sensitive one, catches `== *$SEARCH"*`),
+`quote_region` (a string state machine — the specific one).
+
+Two gates, per the design above: prose blocks skip all content checks;
+trailing imbalance is judged only on eos/stop-terminated blocks, while an
+UNDERFLOW (closer with no opener) is judged unconditionally. A CLOSED fence is
+a complete construct, so its interior is judged on trailing balance even at the
+canvas edge. Multi-line constructs are HANDLED, not skipped, for bash
+(heredocs, `'…'`), python (triple quotes), rust (raw strings; `'` excluded
+because a lifetime is an unpaired quote in correct code) and the c-family
+(template literals); every other language falls back to brackets-only, an
+explicit skip recorded as `lang` in the trace.
+
+**PRE-REGISTERED PREDICTIONS (written before the first run):**
+1. `golden` 8/8 byte-identical with the flag ON and OFF. If it is not, the hook
+   is not read-only — first suspect is the tokenizer lazy-load changing session
+   state ordering.
+2. Ungated (`mode=unknown`, no probe loaded), `smoke` battery: 5-20% of
+   terminated blocks flagged, DOMINATED by `bracket` and `fence`, not by the
+   quote checks — quote checks only run inside language-labelled fences, which
+   smoke prompts rarely produce.
+3. Gating buys LESS than the design narrative implies. Fences are checked in
+   every non-prose mode, so the prose gate only suppresses BARE-code scanning.
+   **If gating looks like a large win, distrust it and find the duplication.**
+4. `programmatic` battery, code blocks: HIGHER than the design's guessed ~1 in
+   200 — order 1-10% of terminated blocks — because bracket balance also
+   catches truncation artifacts, not just convention blends. Expect a
+   meaningful share of findings to be legitimate-but-truncated output, i.e.
+   failures of the block-edge rule rather than real defects.
+5. Watch for correlation between findings and blocks that were
+   confidence-trimmed or prefix-exited. Both deliberately truncate a committed
+   block's tail. The edge rule should already exclude them (a trimmed block
+   generally has no stop token, so `terminated` is false), but if findings
+   cluster there, the edge rule needs extending to cover trim, not the checker
+   loosening.
+
+**MEASURED (2026-07-20).** `census --battery programmatic --seeds 7,42,123`
+(64 blocks, 54 judgeable) and `smoketest` (19 blocks), each run twice — once
+with no probe and once with a freshly fitted L9 probe (LOO 1.000, effect 2.59).
+
+    battery        blocks  judgeable  failed        findings
+    programmatic       64         54   5  (9.3%)          12
+    smoke              19         15   0  (0.0%)           0
+
+    check          findings   TRUE   FALSE
+    quote_region          2      2       0
+    bracket               2      2       0
+    quote_line            8      2       6
+
+**The headline: both ARCHITECTURE convention-blend specimens were caught
+LIVE**, not reconstructed — `if [ $#" -lt 1 ]` and
+`if [[ "$line" == *$SEARCH"* ]]`, each flagged by three independent checks.
+This is the first detection of that defect class by any means; no confidence
+threshold reaches it (p_max ~1.0).
+
+**`quote_region` beat `quote_line` outright — 2/2 precision vs 2/8, at equal
+recall.** The two were built as a sensitive/specific pair on the assumption
+that per-line parity would catch blends the state machine misses (a stray quote
+re-paired later). That case did not occur once in 54 judgeable blocks, while
+the state machine's supposed weakness cost nothing. All 6 `quote_line` false
+positives are one idiom — cross-quoting, `replace("'", '"')` — which is correct
+code with both per-line counts odd. Pinned as a test rather than patched: the
+measurement's job was to decide which check earns its place, and it did.
+**Ship `quote_region` + `bracket`; `quote_line` is not shippable as-is.**
+
+**Prediction scorecard** (2 hits, 3 misses — all three misses were the checker
+being BLINDER than expected, none flattered it):
+1. HIT. `golden` 8/8 byte-identical, KV hashes identical, flag on and off, on
+   two separate builds. The `programmatic` census returned identical aggregates
+   (64 blocks, 16257 commit rows, 91.2% pass) with the checker on — a second,
+   independent confirmation of trajectory neutrality.
+2. MISS, and the population was mis-modelled: smoke is a PROSE battery whose
+   replies contain essentially no fenced code, so 0% was right for a reason the
+   prediction did not contain.
+3. HIT, harder than predicted. The gated and ungated `programmatic` runs
+   produced BYTE-IDENTICAL findings (same 5 blocks, same 12 findings). The
+   probe gated exactly 1 block. On a code battery the probe adds nothing the
+   content sniffer was not already doing.
+4. MISS on mechanism, right on magnitude. 9.3% is inside the predicted 1-10%,
+   but ZERO findings were truncation artifacts — the block-edge rule held, and
+   every finding was a genuine structural break in a terminated block.
+5. NOT OBSERVED. No finding coincided with a confidence-trimmed or
+   prefix-exited block; all 5 failing blocks stopped `confident`. The edge rule
+   needs no extension on this evidence.
+
+**TWO MEASUREMENT ERRORS CAUGHT, both of which produced a clean-looking zero:**
+- `census` builds each arm's config from the arm's pairs against an EMPTY env
+  base, so process-env `DGQ_*` flags never reach it. The first `programmatic`
+  run recorded 0 findings with the checker never once invoked. Flags must be
+  passed as ARM OVERRIDES (`--arm "base:DGQ_DELIM_CHECK=1,..."`).
+- The second run recorded a clean 0/54 that was the checker having nothing to
+  look at: the battery emits BARE unfenced code (census reports `fenced 0/18
+  probes`) and the checker only scanned fences. Fixed two ways — a conservative
+  content language sniffer, and a `regions_scanned` / `vacuous` counter so a
+  zero denominator can never again read as a pass.
+
+**On the block-mode gate: the probe is NOT what suppresses prose — the language
+sniffer is.** On `smoke` the probe labelled 17 of 19 blocks `code` (these are
+water-cycle and primary-colours prompts), yet the false-positive count stayed 0
+because an unsniffable span gets brackets-only and prose brackets balance. So
+the gate that the design leaned on is doing little, and a cheap content
+heuristic is carrying it. Two consequences: the checker is useful with NO probe
+loaded (the default), and the probe's block labels deserve re-validation before
+anything else is built on them — PLAN records 5/5 live on a curated set, which
+does not match 17/19 mislabels here.
+
+**Verdict on the self-eval reroll: still not justified, and now for a measured
+reason.** The design said to build it only if the ambiguous middle is non-empty.
+It is empty. Every one of the 4 true findings is unambiguously broken code, and
+every one of the 6 false findings is unambiguously correct code — the split is
+clean and mechanical, decided by which CHECK fired, not by any judgement the
+model could add. Asking the model to adjudicate would add a turn, a rewind and
+a confidence-1.0 opinion to a decision a state machine already makes correctly.
+
+**Next, if repair is wanted:** rate is ~1 in 11 judgeable code blocks, all on
+`quote_region`/`bracket`, all in terminated blocks — a well-defined trigger.
+Regeneration must change something (reuse shrink-on-retry 256->128->64), and it
+is trajectory-affecting, so it needs golden re-bless plus a LIVE A/B, never a
+replay sim ([[trajectory-feedback-sim-bias]]).
+
 ### WAY OUT THERE — can the generation LANGUAGE be read off the model's own state?
 
 Speculative, not planned, nobody is convinced. Recorded because the core

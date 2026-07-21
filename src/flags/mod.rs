@@ -483,6 +483,15 @@ pub struct DebugFlags {
     /// (per-position p_max/entropy/accept/argmax) plus a block-commit line —
     /// the E7 M0 instrumentation (readback-only, zero behavior change).
     pub trace_pmax_jsonl: Option<String>,
+    /// `DGQ_DELIM_CHECK=1`: run the structural delimiter/parity checker on
+    /// every committed block and log the verdict (see [`crate::delimiter`]).
+    /// Observational only — it decodes committed text and counts delimiters,
+    /// never steering, so generation stays byte-identical.
+    pub delim_check: bool,
+    /// `DGQ_DELIM_CHECK_JSONL=<path>`: append one JSON record per checked
+    /// block (mode, margin, terminated, findings) — the measurement vehicle
+    /// for the failure rate split by block mode.
+    pub delim_check_jsonl: Option<String>,
     pub moe_route_ref_path: Option<String>,
     pub engine_layer_dump_path: Option<String>,
     pub engine_layer_dump_pos: usize,
@@ -744,6 +753,8 @@ impl RuntimeConfig {
                 dump_kv_path: r.var("DGQ_DUMP_KV").ok(),
                 trace_pmax_jsonl: r.var("DGQ_TRACE_PMAX_JSONL").ok().filter(|v| !v.is_empty()),
                 token_class_probe: r.var("DGQ_TOKEN_CLASS").ok().filter(|v| !v.is_empty()),
+                delim_check: r.on_if_one("DGQ_DELIM_CHECK"),
+                delim_check_jsonl: r.var("DGQ_DELIM_CHECK_JSONL").ok().filter(|v| !v.is_empty()),
                 moe_route_ref_path: r.var("DGQ_MOE_ROUTE_REF").ok(),
                 engine_layer_dump_path: r.var("DGQ_ENGINE_LAYER_DUMP").ok(),
                 engine_layer_dump_pos: parse_usize("DGQ_ENGINE_LAYER_POS", 129),
