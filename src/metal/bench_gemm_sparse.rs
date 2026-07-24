@@ -426,13 +426,13 @@ pub fn bench_gemm_int_sparse(iters: usize) -> Result<Vec<GemmBenchRow>, Error> {
     Ok(rows)
 }
 
-/// Double-buffered (steel-loader) dense tunable GEMM bench: overlaps the
-/// K-tile device->tgmem load of tile N+1 with the MMA of tile N (one barrier
-/// per K-tile vs two in the single-buffered kernel). Same K-accumulation chain
-/// -> BIT-EXACT vs the single-buffered `gemm_tunable`; the bench row carries
-/// the BITEXACT/MISMATCH tag so the perf number is gated on correctness
-/// in-place (the DGQ_MOE_PREFILL_BM fake-win lesson). Wired to `bench-gemm`
-/// via the dense-shape path so rows are directly comparable to `tunable_*`.
+/// Double-buffered dense tunable GEMM bench: overlaps the K-tile device->tgmem
+/// load of tile N+1 with the MMA of tile N (one barrier per K-tile vs two in
+/// the single-buffered kernel). Same K-accumulation chain -> BIT-EXACT vs the
+/// single-buffered `gemm_tunable`; the bench row carries the BITEXACT/MISMATCH
+/// tag so the perf number is gated on correctness in-place (the
+/// DGQ_MOE_PREFILL_BM fake-win lesson). Wired to `bench-gemm` via the
+/// dense-shape path so rows are directly comparable to `tunable_*`.
 #[cfg(target_os = "macos")]
 pub fn bench_gemm_tunable_db(
     shapes: &[GemmShape],

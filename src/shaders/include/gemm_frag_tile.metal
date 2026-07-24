@@ -1,5 +1,5 @@
-// Steel-style per-lane fragment tiler — the shared MMA core for gemm_tunable
-// (weight GEMM, task #19) and attention_gemm (E17 QK/PV). One BK=32-wide NT MMA
+// Per-lane fragment tiler — the shared MMA core for gemm_tunable
+// and attention_gemm (E17 QK/PV). One BK=32-wide NT MMA
 // phase: C[m][n] += sum_k A[m][k] * B[n][k], with A staged in Xs[m][k] and B
 // staged TRANSPOSED in Ws[n][k]. 4 simdgroups in a 2x2 grid, 8x8 fragments,
 // per-lane thread_elements() loads (never simdgroup_load from tgmem). Only the
@@ -26,7 +26,7 @@
 #define FRAG_TM (FRAG_BM / 16u)
 #define FRAG_TN (FRAG_BN / 16u)
 
-// Steel lane->element coordinates: this lane owns fragment elements (fm, fn)
+// Lane->element coordinates: this lane owns fragment elements (fm, fn)
 // and (fm, fn+1).
 inline void frag_lane_coords(uint lane, thread uint &fm, thread uint &fn) {
     const uint qid = lane / 4u;

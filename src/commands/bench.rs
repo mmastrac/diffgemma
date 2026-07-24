@@ -364,10 +364,10 @@ pub(crate) fn run_bench_gemm(shapes: &str, oracle: Option<&str>, iters: usize) -
         return ExitCode::SUCCESS;
     }
     // `--shapes db`: head-to-head single-buffered (gemm_tunable) vs
-    // double-buffered steel-loader (gemm_tunable_db) at the prefill-relevant
-    // dense shapes. Direct comparability — same shape, same fixture, same
-    // tile (64x64 production). The `tunable_db_*` row carries a BITEXACT/
-    // MISMATCH tag (gate the perf number on correctness in-place).
+    // double-buffered (gemm_tunable_db) at the prefill-relevant dense shapes.
+    // Direct comparability — same shape, same fixture, same tile (64x64
+    // production). The `tunable_db_*` row carries a BITEXACT/ MISMATCH tag
+    // (gate the perf number on correctness in-place).
     if shapes == "db" {
         let dense_shapes = &[
             metal::GemmShape {

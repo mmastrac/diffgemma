@@ -183,7 +183,7 @@ Settled against the reference implementations and the CPU oracle — do NOT
 `should_fast_prefill(prompt_len)` (src/flags/): prompts ≤ 256 tokens use
 the **f32 engine** prefill; longer prompts use the **fast quantized (bf16
 activation) prefill** (~3 ms/token, ~20× the engine, doc-QA-grounded to 13k+
-and needle-exact to 105k). `DGQ_FAST_PREFILL_MAX` (default 0 = uncapped) can
+and needle-exact to 121k). `DGQ_FAST_PREFILL_MAX` (default 0 = uncapped) can
 reinstate an upper band routed back to the engine; `DGQ_FAST_PREFILL=1|0`
 forces either path. Cross-turn delta reuse follows the same rule on the
 DELTA length.
@@ -200,7 +200,7 @@ prefill, `u32::MAX` otherwise) suppresses their cache stores in
 
 **Full-layer attention runs TOP-K SPARSE by default with kv-adaptive k on
 BOTH the prefill (E20 + `DGQ_ATTN_TOPK_DYN`) and denoise
-(`DGQ_ATTN_TOPK_DECODE`) paths — signed off 2026-07-16:** per query row,
+(`DGQ_ATTN_TOPK_DECODE`) paths:** per query row,
 keep the k = clamp(t_total/128, 64, 512) highest-scoring keys (exact top-k
 by f32 score via 4-level radix on a u16 key plane; deterministic
 count/prefix-sum emission), softmax over that set, gathered-V PV. Prefill
@@ -343,9 +343,9 @@ Metal's single-buffer cap (20.25 GiB on M3 Pro/36 GB) are split at
 | 7 | Length-heuristic prefill (engine f32 ≤ 256 tokens) | ours only | §3 — quality + wall-clock; MLX prefills one way |
 | 8 | Canvas init RNG (seeded LCG) | different RNG than mx.random | noise is noise; parity tooling pins exact canvases via `initial_canvas_ids` |
 | 9 | Entropy accept + stop thresholds in nats | same as MLX (natural log) | noted because prose sometimes says "bits" — the code is nats everywhere |
-| 10 | Entropy-only early stop (mean H < 0.05, §6) | ours only | tail steps only micro-flip near-ties; signed off, census cost = creative-tail only |
+| 10 | Entropy-only early stop (mean H < 0.05, §6) | ours only | tail steps only micro-flip near-ties; census cost = creative-tail only |
 | 11 | Degenerate-first-block re-roll + shrink-on-retry | ours only | empty-reply attractor is intrinsic; deterministic per seed; no-op on good replies |
-| 12 | Commit-time confidence trim, dup tier (`DGQ_COMMIT_CONF_TRIM=0.9`, §6) | ours only | a proposed block is cut at the first answer-region row that is BOTH below τ and argmax-duplicating a neighbour — an unresolved row copies its neighbour, so the tail re-denoises next block against committed context. Default ON 2026-07-19 (census: contested-committed 1.31→1.03 per 1k rows, smoke 17/17 ×3, longctx 4/4, retrieval 100%, +1 step, golden 8/8 byte-identical — it never fires on a golden case). Enables the `max_blocks *= 2` token-budget headroom. The UNCONDITIONAL hard tier is the separate `DGQ_COMMIT_CONF_HARD`, still OFF |
+| 12 | Commit-time confidence trim, dup tier (`DGQ_COMMIT_CONF_TRIM=0.9`, §6) | ours only | a proposed block is cut at the first answer-region row that is BOTH below τ and argmax-duplicating a neighbour — an unresolved row copies its neighbour, so the tail re-denoises next block against committed context. Default ON; never fires on a golden case (golden 8/8 byte-identical). Enables the `max_blocks *= 2` token-budget headroom. The UNCONDITIONAL hard tier is the separate `DGQ_COMMIT_CONF_HARD`, still OFF |
 
 ## 10. Validation harnesses
 
@@ -404,12 +404,12 @@ Metal's single-buffer cap (20.25 GiB on M3 Pro/36 GB) are split at
 - One production step path (the "monolith"); the f32 engine survives for
   ≤256-token prefill and as the step-parity oracle.
 
-## The token pipeline (the runtime's front door; P0–P4 shipped 2026-07-17)
+## The token pipeline (the runtime's front door; P0–P4 shipped)
 
-`src/pipeline.rs`. One thread owns the GPU + KV; every client (ask, chat,
+`src/pipeline/`. One thread owns the GPU + KV; every client (ask, chat,
 serve) speaks serialized **ops** in and **events** out. Ops carry token ids
 only, never strings — all text, parsing, and policy live in the message
-layer (`server_worker.rs`). Motivation: serve's scattered state mutations
+layer (`src/server/worker.rs`). Motivation: serve's scattered state mutations
 were un-auditable; the OpenCode collapse took a night to root-cause, and a
 serialized replayable op-log turns any field failure into a golden-style
 artifact.
@@ -441,7 +441,7 @@ artifact.
   when the SSE socket dies (observer send fails) and skips finalize.
 - **Stop conditioning**: `continue_incomplete_tool_calls` is DEFAULT OFF
   (`DGQ_CONTINUE_PAST_STOP=1` restores). The defer was the load-bearing
-  amplifier of the 2026-07-17 collapse chain (premature stop → forced
+  amplifier of the OpenCode collapse chain (premature stop → forced
   continuation → OOD → filler fixed point → commit amplifier → flood).
 - **KV-reuse-first serving** (see the principle in AGENTS.md §6):
   tool-calling turns finalize with EMPTY content in the canonical render
@@ -501,7 +501,7 @@ artifact.
 ## Performance regime (M3 Pro, measured)
 
 - **Denoise GEMMs: compute-bound at the MPS matmul wall** (~3.7-3.9 TF/s
-  tunable dense = MPS 3.65-3.69; MLX steel qmm 3.96-4.15 — the residual
+  tunable dense = MPS 3.65-3.69; MLX qmm 3.96-4.15 — the residual
   ~10-15% is their software-pipelined loader, worth ≤2-3% end-to-end:
   non-lever). Smaller quant formats buy ~nothing in speed — everything
   dequantizes to f16 for the MMA units; there is no native low-bit compute
@@ -517,12 +517,14 @@ artifact.
 - Wall-clock: beats MLX-4bit (their fastest config) on short/medium chat;
   needle-exact to 121k (KV 2.4 GiB); denoise convergence parity-class
   (~1.15× steps vs MLX's best config, matched-canvas multi-seed).
-- **Long-context prefill (2026-07-16, dynamic top-k default): parity with
-  MLX-4bit chunked across the range** — 30k: 343 vs 355 tok/s (1.04×); 100k:
-  242 vs 248 (0.975×). Dense-attention fallback trails MLX 1.43× at 100k.
-- **Decode at 100k is a SHARED ceiling, not our gap**: ours 1.21 tok/s
-  (~4.4 s/step) vs MLX generation 1.16 tok/s, same round. Sparse DECODE
-  attention is the open differentiation lever (top-k is prefill-only today).
+- **Long-context prefill (dynamic top-k default): parity with MLX-4bit
+  chunked across the range** — see README for the canonical head-to-head
+  numbers. The gap does not widen with context; it is a dead heat at 100k.
+  The dense-attention fallback (top-k off) trails MLX ~1.43× at 100k.
+- **Decode is well ahead at long context**: dynamic top-k attention runs on
+  the denoise path too (`DGQ_ATTN_TOPK_DECODE`, default on), cutting 100k
+  decode from ~4.4 to ~1.8 s/step — ~3.9× vs MLX generation (see README).
+  The dense `mma_full` fallback was the wrong decode kernel at this depth.
 - Memory: single 36 GB machine is NOT swap-bound to 105k; the cliff is
   ~262k f16 KV (q8-auto covers it) or running beside another model.
 
@@ -545,7 +547,7 @@ opt-in flags for A/B.
   (128 experts, gate_up 1408×2816 + down 2816×704, rpe 64/16). Correctness
   gated FIRST (cos=1.000000 vs CPU int8 oracle at every tile). Measured: int8 =
   ~0.43 TFLOP/s vs production = ~3.78 TFLOP/s (~9× slower as built). **RECORD
-  CORRECTED 2026-07-16 (audit reproduced 0.438 TF/s / 9.70×, then decomposed
+  CORRECTED (audit reproduced 0.438 TF/s / 9.70×, then decomposed
   one variable at a time; `debug/review_2026-07-16.md` Part 2): the honest bar
   for a FUTURE attempt is 5.6×, not 9×, and the mechanism on record was a
   curve fit.** The 9.7× multiplies THREE factors: **1.72×** = the prototype's
@@ -573,14 +575,14 @@ opt-in flags for A/B.
   register-blocks this kernel would have measured a 1.7× win against a strawman
   bar and mistaken it for progress.
 - **E21: SLC-chunked online-softmax E17 (flash at dispatch granularity)** —
-  parked at its pre-registered kill bar 2026-07-16: E17's S/P DRAM round-trips
+  parked at its pre-registered kill bar: E17's S/P DRAM round-trips
   are only ~8% of the attention stage and the share is FLAT in T (S/P traffic
   and QK/PV compute both scale linearly — no long-context regime where it
   grows). ~3% end-to-end, non-bit-identical: below the bar. Revive only for
   the memory co-benefit (chunking makes S/P scratch T-independent, 1.6 GiB →
   ~130 MB @100k) if scratch pressure ever bites.
 - **E22: block-granular pre-QK attention selection (Quest/MInference-class)**
-  — killed by measurement 2026-07-16: attention mass is NOT block-concentrated
+  — killed by measurement: attention mass is NOT block-concentrated
   at depth on this model. Real Q/K planes (`step-attn-qk-dump` +
   `python/scripts/e22_block_mass.py`), real 121k mixed corpus: even ORACLE
   top-32-of-944 blocks holds 17% of mass; the across-head union reaches 36%
@@ -588,8 +590,8 @@ opt-in flags for A/B.
   0.73-0.86) — the territory failed, not the mechanism. Parked toward E16
   token compaction: the measured structure (sharp retrieval peaks + near-
   uniform diffuse background) is EVIDENCE FOR fusing aged tokens.
-- **Attention-mass coverage as a quality oracle — IMPEACHED on this model**
-  (2026-07-16): exact row-top-512 holds only 30% of mass at 121k and row-top-64
+- **Attention-mass coverage as a quality oracle — IMPEACHED on this model**:
+  exact row-top-512 holds only 30% of mass at 121k and row-top-64
   only 13%, yet behavioral retrieval at those k values is clean (doc-QA 4/4 to
   20.6k at k=64; needle-exact 4/4 at 121k with dynamic k). Mass and quality
   DECOUPLE: the diffuse background's average — not its composition — is what
@@ -597,7 +599,7 @@ opt-in flags for A/B.
   behavioral retrieval probes only** (and a probe's markers must be
   corpus-unique: a "NEEDLE"-named marker inside a corpus of our own docs that
   discuss needle tests produced pure confabulation artifacts).
-- **E18 flash BQ/BK tile geometry** — non-lever (2026-07-16): interleaved
+- **E18 flash BQ/BK tile geometry** — non-lever: interleaved
   same-batch A/B at kv=15k puts BK=128 at −1.9% and BQ=32 at +0.7%; BK=32/256
   don't compile. Default (16, 64) stands. The first single-pass sweep showed
   BK=128 at "−7.9%" — cross-process `bench-prefill-super` runs drift up to
@@ -635,8 +637,8 @@ opt-in flags for A/B.
   breaks convergence even at N=2; MoE is bandwidth-bound not row-bound.
 - **Dispatch/sync micro-optimization** — encode is ~0.2 ms/step; non-lever.
   Same for MLX-style `load_unsafe`/bounds-check tricks and ICB record/replay.
-- **Steel-loader GEMM port (software-pipelined double-buffering)** — DISPROVEN
-  2026-07-14 (the parked ≤2-3% ROI estimate was optimistic). Built the real
+- **Software-pipelined double-buffering GEMM port** — DISPROVEN
+  (the parked ≤2-3% ROI estimate was optimistic). Built the real
   prototype: `gemm_tunable_db` (sibling entry in `gemm_tunable.metal`) doubles
   the tgmem tiles `Xs[2][BM][PAD]` + `Ws[2][BN][PAD]`, runs a prologue load
   tile 0, then in the K-loop overlaps the device→tgmem load of tile N+1 with
@@ -662,38 +664,6 @@ opt-in flags for A/B.
   Lesson: when compute >> load (the 6× margin regime), software-pipelined
   double-buffering is a regression, not a lever — the doubled tgmem footprint
   + extra sync costs more than the already-hidden load overlap returns.
-- **E5 QK-ILP2 chain-split (full-layer attention)** — PENDING BO 2026-07-14
-  (a single-axis A/B was INCONCLUSIVE — it didn't exercise the path). The
-  production `attention_mma_full` QK dot runs a single 32-deep serial
-  `simdgroup_multiply_accumulate` chain (one accumulator, NCH_H=32 chunks).
-  The ILP2 prototype (FC31 `DGQ_ATTN_MMA_FULL_QK_ILP2`, opt-in) splits it
-  into two independent 16-deep chains (even/odd chunks) so the GPU can issue
-  both MMAs concurrently, halving the QK serial-dependency depth. Each chain
-  stores to its own tgmem slot (`st` + `st_ilp`); the cross-half softmax
-  sums all four partials. Built as a function-constant variant of the
-  production kernel (one body, FC31-selected) — non-bit-identical (different
-  FP-associativity), parity checked via step-probe (identical max_abs at
-  every stage). A warm 3-trial A/B at kv=15000 with E17 ON (default) showed
-  no measurable difference (3365 vs 3370 ms) — **but this was an invalid
-  test**: with E17 default-on, full layers route to `attention_gemm`, so
-  `attention_mma_full` (and ILP2) is inert for the dominant attention cost.
-  The earlier E5 sweep's ~5% kernel / ~3% prefill was measured pre-E17, on
-  the path ILP2 actually runs. PHYSICS (unresolved): ILP2 helps when the
-  bottleneck is *dependency latency* in the MMA pipeline; the full-attn
-  layers may be instruction-issue-bound (per the perf-regime note + the
-  existing "Flash-decode / sequential KV blocking" negative), in which case
-  splitting one chain into two independent chains buys nothing (the same
-  total MMAs compete for the same issue slots). But that regime call was
-  also made on the E17 path, not on mma_full+ILP2. **The lever is added as
-  a categorical axis (paired with `gemm_attn` on/off) in the holistic
-  prefill BO** (`tune_prefill_attn.py --proxy`) so TPE can test the joint
-  {E17, ILP2, tiles} space — single-axis A/B at default settings cannot see
-  levers that only activate in combination or in the off-default path.
-  Kept behind default-OFF FC31; not wired to production pending the BO
-  result. Lesson: a single-axis A/B that doesn't exercise the modified path
-  is not a disproof — verify the dispatch path before declaring a lever
-  inert, and prefer the joint BO for levers that interact with path
-  selection.
 
 **Quality levers, disproven by measurement:**
 - **Confidence trim as a fix for CODE-correctness errors** — the

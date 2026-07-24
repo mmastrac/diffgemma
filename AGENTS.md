@@ -233,7 +233,7 @@ never two model-loading PROCESSES at once, regardless of thread count.
 - **Producer/consumer dtype mismatch is the real precision hazard**, not the
   choice of dtype. When changing a plane's dtype, convert every writer and
   reader together and audit the toggleable loaders.
-- **KV-reuse-first** (user directive 2026-07-17): lean toward reusing 100%
+- **KV-reuse-first** (user directive): lean toward reusing 100%
   of the KV cache — these are small machines. Any path that discards
   resident KV (fresh-conversation fork, deep truncate, canonical that
   isn't a prefix of the next request) must be a smart, explicit,
@@ -293,7 +293,7 @@ never two model-loading PROCESSES at once, regardless of thread count.
 - **Pass `--seed` EXPLICITLY on every arm of a comparison.** `smoketest
   --longctx` defaults to seed 7, not 42, so a defaulted run and a
   `--seed 42` run are different experiments. This cost a whole false
-  "long-context nondeterminism" finding (2026-07-19, retracted): the two
+  "long-context nondeterminism" finding (later retracted): the two
   differing runs were seeds 7 and 42. The tool prints `seed N` — read it.
 - **Replicate BOTH arms before believing a difference, and run the cheapest
   control first**: re-run the exact failing command verbatim. A control on
@@ -343,7 +343,8 @@ diffgemma-mps census -m $WEIGHTS \
 diffgemma-mps census -m $WEIGHTS --analyze runs/c1   # re-report, no GPU
 #   batteries: smoke | longctx | programmatic (generate a program, RUN it,
 #   judge stdout + exit code; metrics prog_pass_pct, compile_fail,
-#   wrong_output, fenced_pct)
+#   wrong_output, fenced_pct) | soft (indirect retrieval + hallucination
+#   rates, non-blocking)
 
 # Bench / diagnostics
 diffgemma-mps bench-step-kernel -m $WEIGHTS --profile-steps 8
@@ -365,4 +366,4 @@ MLX parity tooling (`python/scripts/`): `mlx_generate.py`,
 ALWAYS prompt-match layer-cos comparisons.
 
 Debug/probe env flags (`DGQ_TRACE_*`, `DGQ_LOG_*`, `DGQ_MEM_WATCH`, …) are
-documented in `src/flags.rs`.
+documented in `src/flags/`.

@@ -11,8 +11,6 @@ use crate::shaders::QuantFormat;
 
 pub const ENTRY: &str = "gemm_tunable";
 
-/// Double-buffered (steel-loader prototype) entry — same source, different
-/// kernel name. Prototype only; wired to bench-gemm, not production.
 pub const ENTRY_DB: &str = "gemm_tunable_db";
 
 pub const SHADER: &str = include_str!("gemm_tunable.metal");
@@ -740,9 +738,7 @@ mod double_buffer_tests {
     /// Bit-exact oracle: the double-buffered `gemm_tunable_db` must produce
     /// byte-identical output to the single-buffered `gemm_tunable` on the same
     /// q4 dense fixture (the K-accumulation chain, dequant, and store rounding
-    /// are unchanged — only the tgmem buffering schedule differs). Guards the
-    /// steel-loader prototype before any perf claim (the DGQ_MOE_PREFILL_BM
-    /// fake-win lesson: gate perf on correctness FIRST).
+    /// are unchanged — only the tgmem buffering schedule differs).
     #[test]
     fn gemm_tunable_db_bitexact_vs_single_buffer() {
         let ctx = MetalContext::new().expect("metal ctx");

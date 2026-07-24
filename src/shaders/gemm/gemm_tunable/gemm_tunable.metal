@@ -12,7 +12,7 @@ using namespace metal;
 ///
 /// The 2026-07-02 bench prototypes proved macro tiling alone cannot reach
 /// the MPS/MLX 3.4-4.4 TF/s at our shapes; the delta is fragment-level
-/// codegen. This kernel replicates MLX steel's machinery in our framework:
+/// codegen.
 /// - per-lane thread_elements() fragment loads with compile-time strides
 ///   (never simdgroup_load from threadgroup memory),
 /// - simdgroup_barrier(mem_none) scheduling hints between load/mma phases,
@@ -98,7 +98,7 @@ kernel void gemm_tunable(
     const float nvfp4_gscale =
         is_nvfp4 ? as_type<float>(*(device const uint *)(blob + w_off)) : 0.0f;
 
-    // Steel lane->element coordinates within an 8x8 fragment: this lane owns
+    // Lane->element coordinates within an 8x8 fragment: this lane owns
     // elements (fm, fn) and (fm, fn+1).
     uint fm, fn;
     frag_lane_coords(lane, fm, fn);
@@ -213,9 +213,9 @@ kernel void gemm_tunable(
 }
 
 // ---------------------------------------------------------------------------
-// Double-buffered variant (steel-loader prototype): overlaps the K-tile
-// device->tgmem load of tile N+1 with the MMA of tile N. Same K-accumulation
-// chain + dequant + store rounding as gemm_tunable -> BIT-EXACT expected.
+// Double-buffered variant: overlaps the K-tile device->tgmem load of tile N+1
+// with the MMA of tile N. Same K-accumulation chain + dequant + store
+// rounding as gemm_tunable -> BIT-EXACT expected.
 //
 // Metal has no async-copy primitive; the overlap comes from issuing the load
 // instructions (which execute on the load/store units) before the MMA

@@ -60,10 +60,7 @@ constant uint TN = BN / 16u;
 
 // Lane -> element coordinates within an 8x8 fragment for the int8 dot path.
 // Each lane owns (fm, fn) and (fm, fn+1) — 2 of the 64 elements. 32 lanes
-// cover the whole 8x8 (8 rows x 4 col-pairs x 2 = 64). Simpler than steel's
-// frag_lane_coords (which is dictated by simdgroup_matrix register layout);
-// valid here because we do NOT use simdgroup_matrix (float/half/bf16 only per
-// PLAN.md E18 note) — the int8 dot product is a per-lane scalar chain.
+// cover the whole 8x8 (8 rows x 4 col-pairs x 2 = 64).
 inline void int_frag_lane_coords(uint lane, thread uint &fm, thread uint &fn) {
     fm = lane / 4u;
     fn = (lane % 4u) * 2u;
