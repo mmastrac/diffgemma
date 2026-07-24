@@ -52,6 +52,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     }
     if args.steps is not None:
         diffusion_kwargs["max_denoising_steps"] = args.steps
+    if getattr(args, "prefill_step_size", 0):
+        # Chunked prefill: keeps the attention intermediate [step, N] instead of
+        # a quadratic [N, N] buffer that OOMs single-shot past ~22k on a 36GB Mac.
+        diffusion_kwargs["prefill_step_size"] = args.prefill_step_size
 
     t1 = time.time()
     result = generate(
@@ -91,6 +95,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=DEFAULT_MODEL, help="MLX model dir or HF repo id")
     parser.add_argument("-p", "--prompt", default="Why is the sky blue? Answer in one sentence.")
+    parser.add_argument("--prompt-file", type=Path, default=None,
+                        help="read the prompt text from a file (overrides -p; for long needles)")
+    parser.add_argument("--prefill-step-size", type=int, default=0,
+                        help="0 = single-shot; >0 chunks prefill to avoid OOM at long ctx")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.0, help="0 = greedy (argmax)")
@@ -102,6 +110,8 @@ def main() -> int:
     )
     parser.add_argument("-o", "--output", type=Path, default=None)
     args = parser.parse_args()
+    if args.prompt_file is not None:
+        args.prompt = args.prompt_file.read_text()
 
     result = run(args)
     if args.output is not None:
