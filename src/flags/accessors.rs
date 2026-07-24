@@ -37,11 +37,6 @@ pub fn early_stop_mean_ent() -> f32 {
     config().sampler.early_stop_mean_ent
 }
 
-/// Empty/degenerate-reply retry (E6). On the FIRST denoise block only, if the
-/// committed canvas is degenerate, re-roll the initial canvas from the
-/// advancing seed stream and re-run, up to N times. DEFAULT 3 (user sign-off
-/// 2026-07-07; seed-123 gate answers 13→17, seeds 7/42 unchanged 17/17).
-/// `DGQ_EMPTY_REPLY_RETRY=0` disables.
 /// Non-convergence commit guard threshold (nats); 0.0 = guard disabled.
 pub fn block_commit_max_ent() -> f32 {
     config().sampler.block_commit_max_ent
@@ -52,6 +47,11 @@ pub fn block_commit_retry() -> u32 {
     config().sampler.block_commit_retry
 }
 
+/// Empty/degenerate-reply retry (E6). On the FIRST denoise block only, if the
+/// committed canvas is degenerate, re-roll the initial canvas from the
+/// advancing seed stream and re-run, up to N times. DEFAULT 3 (user sign-off
+/// 2026-07-07; seed-123 gate answers 13→17, seeds 7/42 unchanged 17/17).
+/// `DGQ_EMPTY_REPLY_RETRY=0` disables.
 pub fn empty_reply_retry() -> u32 {
     config().sampler.empty_reply_retry
 }
@@ -131,7 +131,9 @@ pub fn gemm_attn_enabled() -> bool {
 }
 
 /// E17a: Q heads processed per E17 dispatch batch (`DGQ_GEMM_ATTN_HC`, default
-/// 4). Bounds the S/P prefill scratch; clamped to n_q_heads at dispatch.
+/// 16 = all heads; drop to 4 for very long contexts if memory-pressured).
+/// Bounds the S/P prefill scratch; clamped to n_q_heads at dispatch. HC is
+/// numerically invariant (per-head disjoint scratch).
 pub fn gemm_attn_head_chunk() -> usize {
     config().perf.gemm_attn_head_chunk
 }
