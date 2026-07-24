@@ -253,7 +253,7 @@ pub(crate) fn run_step_attn_dump_cmd(
         }
     }
 }
-/// E22-M0 (task #101): prefill a document, run one denoise-step forward to
+/// Prefill a document, run one denoise-step forward to
 /// `--attn-layer`, and dump the full canvas Q plane + the layer's K cache as
 /// raw f32 binaries (+ meta json) into `-o OUT_DIR`. Consumed by
 /// `python/scripts/e22_block_mass.py`.

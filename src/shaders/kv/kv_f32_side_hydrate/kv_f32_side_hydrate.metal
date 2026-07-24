@@ -11,7 +11,7 @@ constant uint KV_FMT_FC [[function_constant(4)]];
 constant uint KV_FMT = is_function_constant_defined(KV_FMT_FC) ? KV_FMT_FC : 0u;
 constant bool KV_Q8 = (KV_FMT == 1u);
 
-/// E14: (re)hydrate a sliding layer's f32 side ring from the monolithic
+/// (Re)hydrate a sliding layer's f32 side ring from the monolithic
 /// cache for positions [pos0, pos0+count) — used when a prefill resumes at
 /// an offset the side ring is not valid for (session restore, rollback /
 /// truncate, conversation swap). Widening f16 -> f32 bakes in the single

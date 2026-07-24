@@ -1,5 +1,5 @@
 // Per-lane fragment tiler — the shared MMA core for gemm_tunable
-// and attention_gemm (E17 QK/PV). One BK=32-wide NT MMA
+// and attention_gemm (QK/PV). One BK=32-wide NT MMA
 // phase: C[m][n] += sum_k A[m][k] * B[n][k], with A staged in Xs[m][k] and B
 // staged TRANSPOSED in Ws[n][k]. 4 simdgroups in a 2x2 grid, 8x8 fragments,
 // per-lane thread_elements() loads (never simdgroup_load from tgmem). Only the
@@ -69,8 +69,8 @@ inline void frag_mma_ktile(
     }
 }
 
-// All-f32 variant (E17b): identical NT tiling with float threadgroup staging and
-// simdgroup_float8x8 A/B fragments (2 f32 elements/lane). Used by the E17
+// All-f32 variant: identical NT tiling with float threadgroup staging and
+// simdgroup_float8x8 A/B fragments (2 f32 elements/lane). Used by the
 // f32-side-KV attention path — Q/K/V come from the f32 side ring, so the MMA
 // runs in f32 to match attention_mma_full_side's precision. C stays f32.
 inline void frag_mma_ktile_f32(

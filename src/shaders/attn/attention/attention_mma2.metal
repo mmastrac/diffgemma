@@ -40,7 +40,7 @@ constant uint KV_FMT = is_function_constant_defined(KV_FMT_FC) ? KV_FMT_FC : 0u;
 constant bool KV_Q8 = (KV_FMT == 1u);
 constant bool KV_Q4 = (KV_FMT == 2u);
 
-// E14 prefill variant: K/V come from the f32 side ring (buffer 7, bound at
+// Prefill variant: K/V come from the f32 side ring (buffer 7, bound at
 // this layer's side offset; slot = pos & ring_mask, same 8-aligned-tile
 // contiguity argument as the f16 ring). Q is staged f32 and the MMA runs
 // all-float — rounding K/V (or Q) to half here would re-create the very f16

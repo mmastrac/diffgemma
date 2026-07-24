@@ -1,4 +1,4 @@
-//! Legacy block-GEMM family, retired 2026-07-11: kept as bit-exact validation
+//! Legacy block-GEMM family kept as bit-exact validation
 //! oracles for gemm_tunable (per-format fixtures + stacked/grouped variants).
 pub mod fixture;
 pub mod gemm_bf16;

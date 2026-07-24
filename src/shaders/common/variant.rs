@@ -1,4 +1,4 @@
-//! Compile-time subkernel variant tuple (AGENTS.md §4).
+//! Compile-time subkernel variant tuple.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -9,7 +9,7 @@ static ARENA_F16_COMPILE: AtomicBool = AtomicBool::new(false);
 /// Compile-mode switch: while true, `runtime_step_variant()` yields variants
 /// with `arena_f16` set, so a whole pipeline set (incl. the internal-variant
 /// GEMM compile paths) builds against fp16 activation-arena slots (FC9).
-/// Bracket the build of the E11 prefill pipeline set with this.
+/// Bracket the build of the prefill pipeline set with this.
 pub fn set_arena_f16_compile(enabled: bool) {
     ARENA_F16_COMPILE.store(enabled, Ordering::Relaxed);
 }
@@ -100,7 +100,7 @@ pub struct KernelVariant {
     pub dump_stage: u32,
     /// Quant format selector (FC3). Inert on elementwise bodies (must be Q4Affine).
     pub quant_format: QuantFormat,
-    /// Activation-arena slots are fp16 instead of bf16 (FC9; E11 prefill stream).
+    /// Activation-arena slots are fp16 instead of bf16 (FC9).
     pub arena_f16: bool,
 }
 

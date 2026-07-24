@@ -6,20 +6,17 @@ using namespace metal;
 #include "common.metal"
 #include "arena.metal"
 
-// E18: FUSED FLASH attention for FULL-layer PREFILL (device-load rewrite).
+// FUSED FLASH attention for FULL-layer PREFILL (device-load rewrite).
 //
-// E17 (attention_gemm) materializes S=Q.K^T and P to device (~4 canvas x T
-// round-trips/head). Flash keeps the O accumulator resident and streams the
-// keys, combining each block into the running (row-max m, denom l, O) with the
-// online softmax rescale -- S/P never touch device.
+// Unlike dense GEMM-decomposition, flash keeps the O accumulator resident and
+// streams the keys, combining each block into the running (row-max m, denom l, O)
+// with the online softmax rescale -- S/P never touch device.
 //
-// The v1 staged flash was 5.8x SLOWER than E17 at hd=512: staging K/V to tgmem
-// in hd-chunks / key-sub-blocks (forced by the 32 KiB limit) exploded the
-// barrier count (~80k/head-tile @100k). This rewrite loads K and V 8x8 tiles
-// DIRECTLY from device via simdgroup_load in the MMA -- no tgmem staging, no
-// staging barriers. Only Q is staged (once; it is bf16 and needs conversion) and
-// the small S/P planes. f16 KV only (production prefill main path); the f32-side
-// ring can't simdgroup_load-convert and would blow tgmem at hd=512.
+// Loads K and V 8x8 tiles DIRECTLY from device via simdgroup_load in the MMA --
+// no tgmem staging, no staging barriers. Only Q is staged (once; it is bf16 and
+// needs conversion) and the small S/P planes. f16 KV only (production prefill
+// main path); the f32-side ring can't simdgroup_load-convert and would blow tgmem
+// at hd=512.
 //
 // Layout: 256 threads = 8 simdgroups; BQ=16 query rows/threadgroup; O split
 // across simdgroups by head-dim (ND = hd/8 = 64). QK: simdgroup sg computes S
@@ -27,7 +24,7 @@ using namespace metal;
 // accumulates O[:, sg*ND..] via device-load V untransposed. The KV buffer must
 // be padded +BK rows so tile-loads past T stay in bounds (masked cols are
 // ignored by softmax / zeroed in P).
-// Grid: (ceil(M/BQ) row tiles, 1, HC heads); head_base like E17a.
+// Grid: (ceil(M/BQ) row tiles, 1, HC heads); head_base like the GEMM variant.
 
 #ifndef FL_BQ
 #define FL_BQ 16
@@ -110,12 +107,9 @@ kernel void attn_flash(
     }
     // Qs is staged STRIDED BY tid above but every simdgroup reads the WHOLE tile
     // (simdgroup_load in the QK step). Without this barrier the first K-block
-    // iteration races the staging: correctness then depends on warp timing, so
-    // prefill stops being reproducible run-to-run (task #99 — layer 0's KV stayed
-    // bit-identical because it is written before attention, while layer 0's
-    // attention OUTPUT diverged and amplified through depth). Later iterations
-    // are covered by the barrier at the end of the K-block loop; only the first
-    // read was exposed.
+    // iteration races the staging: correctness depends on warp timing, so
+    // prefill becomes nondeterministic run-to-run. Later iterations are covered
+    // by the barrier at the end of the K-block loop; only the first read was exposed.
     threadgroup_barrier(mem_flags::mem_threadgroup);
     simdgroup_float8x8 O[FL_BQ / 8u][(FL_HD / 8u) / 8u];   // [TM][TN]
     for (uint i = 0u; i < TM; ++i) {

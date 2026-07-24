@@ -1,8 +1,7 @@
-//! E20: top-k sparse attention for full layers — causal PREFILL
-//! (`DGQ_ATTN_TOPK`) and bidirectional DENOISE (`DGQ_ATTN_TOPK_DECODE`),
-//! both default ON.
+//! Top-k sparse attention for full layers — causal PREFILL (`DGQ_ATTN_TOPK`)
+//! and bidirectional DENOISE (`DGQ_ATTN_TOPK_DECODE`), both default ON.
 //!
-//! Sibling of E17 `attention_gemm`. Reuses E17's `attn_gemm_qk` kernel verbatim
+//! Sibling of dense GEMM attention. Reuses the `attn_gemm_qk` kernel verbatim
 //! (the S plane is identical), then replaces softmax+PV with a top-k softmax +
 //! sparse-PV that gathers V at the per-row selected key indices.
 //! Quality-gated (non-bit-identical): only the top-`k` highest-scoring keys per
@@ -16,9 +15,9 @@ use crate::Error;
 
 pub mod cpu;
 
-/// The QK pipeline is compiled from E17's source (the kernel is identical).
+/// The QK pipeline is compiled from the GEMM-attention source (the kernel is identical).
 pub const ENTRY_QK: &str = crate::shaders::attention_gemm::ENTRY_QK;
-/// E17's shader source (reused verbatim for the QK pipeline).
+/// The GEMM-attention shader source (reused verbatim for the QK pipeline).
 pub const SHADER_QK: &str = crate::shaders::attention_gemm::SHADER;
 
 pub const ENTRY_TOPK_SM: &str = "attn_topk_softmax";
@@ -26,9 +25,8 @@ pub const ENTRY_TOPK_PV: &str = "attn_topk_pv";
 pub const SHADER_TOPK: &str = include_str!("attention_topk.metal");
 
 /// Default compile-time slot capacity for the compressed P/Idx planes. The
-/// production K_PAD is `flags::attn_topk_k_pad()` (next-pow2 of the requested
-/// k, task #95); this const is the kernel's `#ifndef` default and the value
-/// tests/benches use.
+/// production K_PAD is `flags::attn_topk_k_pad()` (next-pow2 of the requested k);
+/// this const is the kernel's `#ifndef` default and the value tests/benches use.
 pub const K_PAD: usize = 64;
 
 /// Slot capacity for a requested k (mirrors `flags::attn_topk_k_pad`).
@@ -37,19 +35,19 @@ pub fn k_pad_for(k: usize) -> usize {
     k.max(1).next_power_of_two().clamp(K_PAD, 1024)
 }
 
-/// Default tile geometry (matches E17's defaults for the QK half).
+/// Default tile geometry (matches the GEMM-attention defaults for the QK half).
 pub const BM: usize = 64;
 pub const BN: usize = 64;
 pub const SOFTMAX_TPG: usize = 256;
 pub const PV_BN: usize = 64;
 
-/// Padded score-matrix width (delegates to E17's n_pad — same S plane layout).
+/// Padded score-matrix width (delegates to the GEMM-attention n_pad — same S plane layout).
 #[inline]
 pub fn n_pad(t_total: usize) -> usize {
     crate::shaders::attention_gemm::n_pad(t_total)
 }
 
-/// Prepend the tile #defines (for tuning sweeps). The QK kernel uses E17's
+/// Prepend the tile #defines (for tuning sweeps). The QK kernel uses the GEMM-attention
 /// source directly; only the new topk kernels read these defines.
 pub fn tuned_source(bm: usize, bn: usize, sm_tpg: usize, k_pad: usize) -> String {
     format!(
@@ -73,16 +71,16 @@ pub fn pipelines(
         index: 30,
         value: true,
     };
-    // QK from E17's source with FC32 (EMIT_PAT16): also writes the u16 key
-    // plane the selection passes read (buffer 8). E17's own QK pipeline leaves
+    // QK from the GEMM-attention source with FC32 (EMIT_PAT16): also writes the u16 key
+    // plane the selection passes read (buffer 8). The GEMM-attention QK pipeline leaves
     // FC32 undefined — distinct cache label via the FC-value suffix.
     let qk_bools: &[FcBool] = if side { &[side_fc, pat16] } else { &[pat16] };
     let bools: &[FcBool] = if side { &[side_fc] } else { &[] };
     let label = if side { "side" } else { "default" };
     let pipe_qk = ctx.compile_subkernel_ex(SHADER_QK, ENTRY_QK, variant, label, qk_bools, &[])?;
-    // topk_softmax + topk_pv with K_PAD baked to the requested capacity (task
-    // #95: the k knob is live). Source-baked defines are safe in the pipeline
-    // cache — the label includes source_hash (the #99 generic fix).
+    // topk_softmax + topk_pv with K_PAD baked to the requested capacity
+    // (the k knob is live). Source-baked defines are safe in the pipeline cache —
+    // the label includes source_hash for cache correctness.
     let src = tuned_source(BM, BN, SOFTMAX_TPG, k_pad);
     let pipe_sm = ctx.compile_subkernel_ex(&src, ENTRY_TOPK_SM, variant, label, bools, &[])?;
     let pipe_pv = ctx.compile_subkernel_ex(&src, ENTRY_TOPK_PV, variant, label, bools, &[])?;
@@ -103,7 +101,7 @@ pub fn gpu(
     use crate::shaders::variant::KernelVariant;
     use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
 
-    // Standard rig: bf16 Q/out, f16 KV +8 pad key rows (E17 tile geometry),
+    // Standard rig: bf16 Q/out, f16 KV +8 pad key rows (GEMM-attention tile geometry),
     // f32 side-ring mirror for the FC30 path.
     let mut rig = AttnRig::from_fixture(f, 8, true)?;
     let (canvas, n_q_heads, hd) = (rig.canvas, rig.n_q_heads, rig.hd);
@@ -177,7 +175,7 @@ pub fn gpu(
                 height: canvas,
                 depth: hb,
             };
-            // QK: same dispatch as E17 (+ u16 key plane at 8, FC32).
+            // QK: same dispatch as the GEMM-attention (+ u16 key plane at 8, FC32).
             enc.setComputePipelineState(&pipe_qk.pipeline);
             unsafe {
                 enc.setBuffer_offset_atIndex(Some(&rig.buf_q), 0, 0);
@@ -298,7 +296,7 @@ mod tests {
         assert_oracle(&got, &oracle, 2e-2, 0.9999);
     }
 
-    /// Premise bench: top-k attention vs E17 (dense) at model shape. One
+    /// Premise bench: top-k attention vs dense at model shape. One
     /// command buffer each, min-of-rounds. Ignored (timing).
     /// Run: `cargo test --release topk_bench -- --ignored --nocapture`
     #[cfg(target_os = "macos")]
@@ -321,8 +319,8 @@ mod tests {
 
     /// Premise bench for the DECODE (denoise) arm: production
     /// `attention_mma_full` (causal=0 monolithic — what denoise full layers
-    /// run today) vs E17 dense decomp vs top-k at kv-adaptive k, at the
-    /// denoise full-layer shape (canvas=256, 16Q/2KV, hd=512). The E17/topk
+    /// run today) vs dense decomp vs top-k at kv-adaptive k, at the
+    /// denoise full-layer shape (canvas=256, 16Q/2KV, hd=512). The dense/topk
     /// harnesses dispatch causal=1; at these kv lengths the causal mask
     /// excludes <0.5% of keys, below bench noise.
     /// Run: `cargo test --release topk_decode_bench -- --ignored --nocapture`

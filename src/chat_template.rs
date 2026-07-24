@@ -56,7 +56,7 @@ impl Default for ChatFormatOptions {
     }
 }
 
-/// Predicate for the E6 empty/degenerate-reply canvas re-roll: given a
+/// Predicate for empty/degenerate-reply canvas re-roll: given a
 /// committed block's full-canvas argmax, returns true when it would render as
 /// an EMPTY user-facing reply. It checks the actual output STATE — take the
 /// answer region (up to the first stop/eos token), strip pad/filler, decode,
@@ -80,7 +80,7 @@ pub fn empty_reply_predicate(
     }
 }
 
-/// Build the E6 empty-reply predicate for `StepGenerateConfig`, or `None` when
+/// Build the empty-reply predicate for `StepGenerateConfig`, or `None` when
 /// the retry is disabled (`DGQ_EMPTY_REPLY_RETRY=0`) or the tokenizer/config
 /// can't be loaded — so the re-roll only ever activates when enabled.
 pub fn empty_reply_check(

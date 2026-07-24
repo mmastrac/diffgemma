@@ -1,30 +1,27 @@
-// E20: top-k sparse attention for full-layer PREFILL (sibling of E17).
+// Top-k sparse attention for full-layer PREFILL (sibling of dense GEMM).
 //
-// Uses E17's `attn_gemm_qk` compiled with FC32 (EMIT_PAT16): alongside the S
-// plane (S[HC][canvas][n_pad] f32) it emits a u16 PATTERN plane — the top 16
-// bits of each score's float-bit-monotonic key. The selection passes compare
-// ONLY those 16 bits, so they read the u16 plane (half the bytes of S; the
-// stage is DRAM-bound) and touch f32 S only for the <=k winners:
+// Uses the `attn_gemm_qk` kernel compiled with FC32 (EMIT_PAT16): alongside
+// the S plane (S[HC][canvas][n_pad] f32) it emits a u16 PATTERN plane — the
+// top 16 bits of each score's float-bit-monotonic key. The selection passes
+// compare ONLY those 16 bits, so they read the u16 plane (half the bytes of S;
+// the stage is DRAM-bound) and touch f32 S only for the <=k winners:
 //   2. attn_topk_softmax  — per (row, head): 4-level radix histogram finds the
 //      k-th-largest FULL 32-bit key (levels 1-2 on the u16 plane; levels 3-4
 //      refine among u16-ties, reading f32 S only for those candidates — so
 //      selection is EXACT top-k by f32 score); a count + exclusive prefix-sum
 //      pass then emits EXACTLY k (score, idx) pairs in fixed thread-major
-//      order (residual ties = bit-identical scores, broken by thread-major
-//      rank — DETERMINISTIC, no atomic compaction; the cd66294 shape).
+//      order (residual ties = bit-identical scores, broken by thread-major rank).
 //      Softmax over the emitted set.
 //      Output: P[HC][canvas][K_PAD] (f32), Idx[HC][canvas][K_PAD] (u32),
 //      lrow[HC][canvas] (f32).
 //   3. attn_topk_pv       — O[i,d] = sum_{j=0..K_PAD} P[i,j] * V[idx[i,j], d] / L_i.
 //      Gathered-V: each query row has its own key indices, so V is gathered
-//      per-row. Prototype uses a scalar per-row accumulator (lane owns 2
-//      d-cols, loops over K_PAD keys) — correct, issue-bound (matches the
-//      attention_mma shape that pinned E17's motivation). Sums P in list
-//      order — deterministic because the list is.
+//      per-row. Uses a scalar per-row accumulator (lane owns 2 d-cols, loops
+//      over K_PAD keys) — correct and issue-bound. Sums P in list order.
 //
 // NOT bit-identical to dense attention (only top-k keys are kept). Quality-gated.
 // Selection = exact top-k by f32 score; only bit-identical scores are
-// interchangeable to the selector (tie-break = thread-major rank, fixed).
+// interchangeable (tie-break = thread-major rank, fixed).
 // Causal mask: invalid keys (t > kv_len + row, or t >= t_total) are treated as
 // -inf and never selected. The QK kernel leaves those S entries as whatever
 // the partial GEMM produced (pad cols past T are never written; causal-past
@@ -32,8 +29,7 @@
 // re-mask here, reading d.causal / d.kv_len to clamp the candidate set.
 //
 // Tile geometry is tunable: prepend `#define AG_BM/AG_BN/AG_SM_TPG/AG_K_PAD`
-// (via attention_topk::tuned_source) to sweep. Defaults reproduce the shipped
-// 64x64/256/K_PAD=64 kernel.
+// to sweep. Defaults reproduce the shipped 64x64/256/K_PAD=64 kernel.
 
 #include <metal_stdlib>
 #include <metal_simdgroup_matrix>
@@ -69,12 +65,12 @@ constant uint K_PAD = AG_K_PAD;
 #define FRAG_BN AG_BN
 #include "gemm_frag_tile.metal"
 
-// E17b: f32 side-KV variant (FC30) — same axis as attention_gemm.
+// F32 side-KV variant (FC30) — same axis as the GEMM attention path.
 constant bool KV_F32_SIDE_FC [[function_constant(30)]];
 constant bool KV_F32_SIDE =
     is_function_constant_defined(KV_F32_SIDE_FC) && KV_F32_SIDE_FC;
 
-// The same dims struct as E17 (re-declared here so this shader is self-contained
+// The same dims struct as the GEMM-attention shader (re-declared here so this shader is self-contained
 // for compilation; the host passes the same AttnGemmDims bytes).
 struct AttnGemmDims {
     uint m;

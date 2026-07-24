@@ -13,7 +13,7 @@ pub(crate) enum Battery {
     /// Adherence + convergence — the 17/17 commit gate.
     #[default]
     Smoke,
-    /// Long-context doc-QA ladder (E13).
+    /// Long-context doc-QA ladder.
     LongCtx,
     /// Generate a program, execute it, judge stdout + exit code.
     Programmatic,
@@ -44,9 +44,9 @@ pub(crate) struct SmoketestSpec {
     convergence: Vec<SmokeConvergence>,
     #[serde(default)]
     adherence: Vec<SmokeAdherence>,
-    /// Long-context doc-QA ladder (E13; `smoketest --longctx` only). Judges
+    /// Long-context doc-QA ladder (`smoketest --longctx` only). Judges
     /// grounded COMPREHENSION of a real document at increasing prompt lengths
-    /// — the failure class needle probes provably miss (task #64: retrieval
+    /// — the failure class needle probes provably miss (retrieval
     /// rides a few sharp attention edges and stayed EXACT while grounded
     /// answers collapsed into fluent hallucination).
     #[serde(default)]
@@ -61,7 +61,7 @@ pub(crate) struct SmoketestSpec {
     soft: Vec<SoftProbe>,
     /// Gate baseline seed. Trajectory-reshuffling accepted changes re-baseline
     /// the gate here (single-seed pass/fail is arbitrary for such changes; the
-    /// multi-seed aggregate is the real quality metric — see working notes).
+    /// multi-seed aggregate is the real quality metric).
     /// An explicit CLI `--seed` (anything != 42) still overrides for sweeps.
     #[serde(default)]
     seed: Option<u64>,

@@ -6,14 +6,12 @@ using namespace metal;
 #include "common.metal"
 #include "arena.metal"
 
-// E17: GEMM-attention for FULL-layer PREFILL.
+// GEMM-attention for FULL-layer PREFILL.
 //
-// attention_mma_full is pinned at ~1.25 TF/s by the hd=512 / 8x8-fragment
-// occupancy shape (a complete axis sweep — MT/NKT/fragment-O/QG/occupancy — is
-// Negative Knowledge in prefill-kernel-levers). During prefill the score matrix
-// S = Q.K^T fits in memory per 256-row sub-chunk, so full attention decomposes
-// into two big GEMMs at the tunable-GEMM rate (2.3-4 TF/s) plus a rowwise
-// softmax:
+// The MMA path is constrained by hd=512 / 8x8-fragment occupancy shape. During
+// prefill the score matrix S = Q.K^T fits in memory per 256-row sub-chunk, so
+// full attention decomposes into two big GEMMs at higher compute rates plus
+// a rowwise softmax:
 //   1) S[i,t]  = <Q_i, K_t>                 (attn_gemm_qk,     NT-GEMM)
 //   2) P[i,t]  = exp(S - rowmax)  (masked)   (attn_gemm_softmax, rowwise)
 //   3) O[i,d]  = sum_t P[i,t] V[t,d] / L_i   (attn_gemm_pv,     NN via Vt-stage)
@@ -22,13 +20,13 @@ using namespace metal;
 // divides O by the row denom L_i at store time — mirroring mma_full's final
 // divide, so the two paths share numerics (f16 K/V, f32 accumulate).
 //
-// Both matmuls reduce to the SAME NT fragment tiler as gemm_tunable
+// Both matmuls use the same NT fragment tiler as gemm_tunable
 // (C[m][n] = sum_k Xs[m][k] * Ws[n][k], 64x64 output tile, 4 simdgroups in a
 // 2x2 grid, 8x8 fragments, BK=32) — only the tile LOADERS differ:
 //   QK: A = Q[i][d] (arena, row stride n_q_heads*hd);  B = K[t][d] native.
 //   PV: A = P[i][t] (contiguous, row stride T);        B = V staged TRANSPOSED
 //       to Ws[d][t] from native V[t][d] (so <P_i, V[:,d]> = O[i][d]).
-// This is prefill-only; denoise keeps attention_mma_full. Not bit-identical.
+// Prefill-only; denoise keeps attention_mma_full. Not bit-identical.
 
 // Tile geometry is tunable: prepend `#define AG_BM/AG_BN/AG_SM_TPG` (via
 // attention_gemm::tuned_source) to sweep. Defaults reproduce the shipped 64x64
@@ -59,19 +57,19 @@ constant uint TN = BN / 16u;     // fragments per simdgroup along N
 #define FRAG_BN AG_BN
 #include "gemm_frag_tile.metal"
 
-// E17b: read Q/K/V from the f32 side ring (buffer 9) and run the MMA all-float,
-// matching attention_mma_full_side's precision (FC30, same axis the sliding/full
-// mma kernels use). Unset = the f16 main-cache path. The dead branch's f32/f16
-// threadgroup staging is stripped at compile time.
+// F32 side-KV variant (FC30): read Q/K/V from the f32 side ring (buffer 9)
+// and run the MMA all-float, matching the precision of the MMA-full side path.
+// Unset = the f16 main-cache path. The dead branch's f32/f16 threadgroup
+// staging is stripped at compile time.
 constant bool KV_F32_SIDE_FC [[function_constant(30)]];
 constant bool KV_F32_SIDE =
     is_function_constant_defined(KV_F32_SIDE_FC) && KV_F32_SIDE_FC;
 
-// E20 u16 pattern plane (FC32): alongside S, emit the top 16 bits of each
+// U16 pattern plane (FC32): alongside S, emit the top 16 bits of each
 // score's float-bit-monotonic key to a u16 plane (same [HC][m][n_pad] geometry,
-// half the bytes). attn_topk_softmax's selection passes compare ONLY these 16
-// bits, so reading the u16 plane instead of re-deriving keys from f32 S halves
-// selection bandwidth (sm is DRAM-bound at ~80% of the wall) with bit-identical
+// half the bytes). The top-k selection passes compare ONLY these 16 bits, so
+// reading the u16 plane instead of re-deriving keys from f32 S halves selection
+// bandwidth (selection is DRAM-bound at ~80% of the wall) with bit-identical
 // selection semantics. QK is compute-bound (~10% of bandwidth) — the extra
 // write is free. Only the top-k pipeline set compiles with FC32.
 constant bool EMIT_PAT16_FC [[function_constant(32)]];
@@ -104,7 +102,7 @@ struct AttnGemmDims {
     uint group;         // GQA group (n_q_heads / nkv): kvh = qh / group
     uint nkv;           // KV heads: V base = (nkv + kvh) * hd
     uint s_head_stride; // elems between heads in the S/P planes (m * s_row_stride)
-    uint head_base;     // E17a head-chunk: global Q head = head_base + tgid.z;
+    uint head_base;     // head-chunk: global Q head = head_base + tgid.z;
                         // the S/P/lrow scratch is indexed by the LOCAL tgid.z,
                         // so it holds only this batch's HC heads.
 };

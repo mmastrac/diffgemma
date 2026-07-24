@@ -1,5 +1,5 @@
 //! CPU KV-cache quantizers (numerics reference + the pre-plumbing viability
-//! proof for the TurboQuant rotated-KV memory lever, E8/M1).
+//! proof for the TurboQuant rotated-KV memory lever).
 //!
 //! Group-32 symmetric, mirroring the shipped q8 path (`step_kv::kv_q8_*`):
 //! - q8 row = `[hd × i8][hd/32 × f16 scale]`, `hd + hd/16` bytes.
@@ -40,7 +40,7 @@ pub enum KvFormat {
     /// group-32 symmetric i8 + f16 scales (`[hd i8][hd/32 f16]`).
     Q8,
     /// group-32 q4 (`[hd/2 i4][hd/32 f16]`) — reserved for the rotated-KV
-    /// memory lever (E8); not yet implemented in the kernels.
+    /// memory lever; not yet implemented in the kernels.
     Q4,
 }
 

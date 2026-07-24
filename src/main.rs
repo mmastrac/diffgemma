@@ -1,7 +1,7 @@
 // Kernel dispatch plumbing threads many scalar dims (M/N/K, offsets, layer
 // counts) through host wrappers, and GPU resource tuples run long — argument
 // counts and type width are the domain, not a smell. Allowed crate-wide
-// (user sign-off 2026-07-17) instead of per-fn attribute noise.
+// instead of per-fn attribute noise.
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::type_complexity)]
 

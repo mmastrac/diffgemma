@@ -14,7 +14,7 @@ constant uint KV_FMT = is_function_constant_defined(KV_FMT_FC) ? KV_FMT_FC : 0u;
 constant bool KV_Q8 = (KV_FMT == 1u);
 constant bool KV_Q4 = (KV_FMT == 2u);
 
-// E14: during fast prefill, every layer ALSO writes post-RoPE K / normed V
+// During fast prefill, every layer ALSO writes post-RoPE K / normed V
 // into an f32 side cache (buffer 9, bound at the layer's side offset; same
 // kv_slot_of addressing — ring for sliding layers, linear for full). The
 // prefill attention reads the side instead of the f16 cache, so

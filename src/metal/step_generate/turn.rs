@@ -328,14 +328,13 @@ pub fn begin_turn(
     } else {
         0
     };
-    // Rewind/divergence guard (task #93): a resident causal log that extends
-    // past — or diverges from — the prompt's common prefix is stale for this
-    // turn and must go before any reuse. O(1) truncate inside the ring slack;
-    // a DEEP rewind resets instead (no-rebuild-to-salvage: a ring rebuild
-    // costs ≈ a fresh prefill of the kept prefix and yields lineage KV — see
-    // memory kv-reuse-delta-divergence). The session-open prefill (empty
-    // kv_valid log, primed KV) is exempt: it was prefilled for exactly this
-    // prompt.
+    // Rewind/divergence guard: a resident causal log that extends past — or
+    // diverges from — the prompt's common prefix is stale for this turn and
+    // must go before any reuse. O(1) truncate inside the ring slack; a DEEP
+    // rewind resets instead (no-rebuild-to-salvage: a ring rebuild costs ≈ a
+    // fresh prefill of the kept prefix and yields lineage KV). The
+    // session-open prefill (empty kv_valid log, primed KV) is exempt: it was
+    // prefilled for exactly this prompt.
     if !session.kv_valid_tokens.is_empty() && session.kv_valid_tokens.len() > reuse {
         if session.truncate_needs_rebuild(reuse) {
             if progress_enabled() {
@@ -369,9 +368,9 @@ pub fn begin_turn(
     } else if reuse > 0 {
         // Keep KV[0..reuse] (causally valid), prefill the delta [reuse..] at
         // that offset. Short deltas take the fast quantized resume; a delta
-        // past the fast-prefill trust cap (task #64: the bf16 stream
-        // accumulates error with length) extends via the f32 engine in
-        // canvas-sized blocks instead — slower, correct.
+        // past the fast-prefill trust cap (the bf16 stream accumulates error
+        // with length) extends via the f32 engine in canvas-sized blocks
+        // instead — slower, correct.
         let delta = &prompt_token_ids[reuse..];
         let max = crate::flags::fast_prefill_max_tokens();
         let kv_len = if max == 0 || delta.len() <= max {
@@ -444,11 +443,10 @@ pub fn begin_turn(
         let prefill_elapsed = prefill_started.elapsed();
         (kv_len, prefill_timing, prefill_elapsed)
     };
-    // DIAGNOSTIC (task #67 sensitivity probe): DGQ_KV_NOISE=<rel eps>
-    // perturbs every live f16 KV value after prefill (whichever path ran) by
-    // a random relative factor — separates "the model is knife-edge
-    // sensitive to KV noise at this length" from "the fast path has a real
-    // defect".
+    // Diagnostic: DGQ_KV_NOISE=<rel eps> perturbs every live f16 KV value
+    // after prefill (whichever path ran) by a random relative factor —
+    // separates "the model is knife-edge sensitive to KV noise at this length"
+    // from "the fast path has a real defect".
     if let Some(eps) = crate::flags::kv_noise() {
         perturb_live_kv_f16(rt, kv_len, eps, cfg.seed);
     }
@@ -490,10 +488,10 @@ pub fn begin_turn(
     })
 }
 
-/// One block's denoise: reset the canvas, run the attempt loop (E6
-/// empty-retry + commit-guard re-rolls), return the uncommitted proposal or a
-/// terminal outcome. Commits NOTHING — the caller inspects the proposal and
-/// either [`commit_block`]s a kept prefix or drops it.
+/// One block's denoise: reset the canvas, run the attempt loop (empty-retry
+/// and commit-guard re-rolls), return the uncommitted proposal or a terminal
+/// outcome. Commits NOTHING — the caller inspects the proposal and either
+/// [`commit_block`]s a kept prefix or drops it.
 pub fn propose_block(
     session: &mut StepGenerateSession,
     cfg: &StepGenerateConfig,
@@ -544,7 +542,7 @@ pub fn propose_block(
     }
 
     let block_started = Instant::now();
-    // E6: empty/degenerate-reply retry — first block only. If the committed
+    // Empty/degenerate-reply retry — first block only. If the committed
     // canvas would trim to empty (position 0 is a stop/eos/control token),
     // re-roll the canvas and re-denoise up to N times (DGQ_EMPTY_REPLY_RETRY).
     let empty_retry_max = if block_idx == 1 {
@@ -573,7 +571,7 @@ pub fn propose_block(
         low_ent_hist,
         denoise_stop,
     ) = 'attempt: loop {
-        // Shrink-on-retry (E3/E6): attempt 0 uses the full canvas (handles
+        // Shrink-on-retry: attempt 0 uses the full canvas (handles
         // long answers); each degenerate retry narrows it (256→128→64),
         // where the empty/ceremony attractor is far weaker (72%→3% by width).
         let attempt_canvas = match empty_retry_attempt {
@@ -823,7 +821,7 @@ pub fn propose_block(
                 stop_reason,
             );
             if let Some(ref observer) = cfg.step_observer {
-                // Never mark block_done here: E6 may still discard this canvas.
+                // Never mark block_done here: the empty-retry path may still discard this canvas.
                 // Active slice only — rows past `active` are stale after shrink.
                 observer(&StepProgressEvent {
                     block_idx,
@@ -844,7 +842,7 @@ pub fn propose_block(
             }
         };
         let st = last_st;
-        // Cancelled mid-block: abandon this canvas uncommitted (the E6 /
+        // Cancelled mid-block: abandon this canvas uncommitted (the empty-retry /
         // commit-guard checks below are moot for a reply nobody will read).
         if last_denoise_stop == DenoiseStopReason::Cancelled {
             ts.cancelled = true;
@@ -861,8 +859,8 @@ pub fn propose_block(
         }
         // Empty/degenerate-reply detection: does the committed argmax render as
         // an empty user-facing reply (eos-first canvas OR `<|channel>thought`
-        // ceremony)? Checked against the real decoded+sanitized output (E6
-        // attractor). Re-roll the canvas from the advancing rng and retry.
+        // ceremony)? Checked against the real decoded+sanitized output (the
+        // degenerate-reply attractor). Re-roll the canvas from the advancing rng and retry.
         let degenerate = cfg
             .degenerate_reply_check
             .as_ref()
@@ -1088,7 +1086,7 @@ pub fn propose_block(
     // stutter formations across 51 traced turns and nowhere else. The next
     // block re-denoises the dropped tail against committed left context.
     // Floor: rows inside the first MIN_CONF_KEEP never trim (progress
-    // guarantee; the E6/commit-guard paths own those failures).
+    // guarantee; the empty-retry/commit-guard paths own those failures).
     let mut conf_trim_row: Option<usize> = None;
     let mut conf_tau = crate::flags::commit_conf_trim();
     // Hard tier is now its OWN flag: the census showed it carries the value
@@ -1569,7 +1567,7 @@ fn pmax_from_rowstats(rowstats: &[[f32; 2]]) -> Vec<f32> {
         .collect()
 }
 
-/// Append one line to the `DGQ_TRACE_PMAX_JSONL` trace (E7 M0). Best-effort:
+/// Append one line to the `DGQ_TRACE_PMAX_JSONL` trace. Best-effort:
 /// trace I/O must never fail a generation.
 /// Load the `DGQ_TOKEN_CLASS` probe once and reuse it. Returns `None` when the
 /// flag is unset (the classifier is off) or the file failed to load — a bad

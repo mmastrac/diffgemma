@@ -30,11 +30,11 @@ pub(super) struct StepEnc<'a> {
     /// stage (embed, norms, QKV/o_proj/FFN GEMMs, router, MoE) dispatches at
     /// this M; attention + rope/KV-write stay per-CANVAS-sub-chunk.
     pub(super) forward_m: usize,
-    /// Active canvas width for a DENOISE step (E3/E6 shrink-on-retry): the
-    /// number of canvas rows actually denoised, `CANVAS` (256) normally, less
-    /// on a narrowed retry. Drives the denoise-only width sites (attention
-    /// seq-len + grid, SC softembed, lm_head, sampler) and `forward_m`. Stays
-    /// `CANVAS` for prefill chunks/super-chunks (their sub width is 256).
+    /// Active canvas width for a DENOISE step (shrink-on-retry): the number
+    /// of canvas rows actually denoised, `CANVAS` (256) normally, less on a
+    /// narrowed retry. Drives the denoise-only width sites (attention seq-len
+    /// + grid, SC softembed, lm_head, sampler) and `forward_m`. Stays `CANVAS`
+    /// for prefill chunks/super-chunks (their sub width is 256).
     pub(super) active_canvas: usize,
     /// Current sub-chunk (0..PREFILL_SUBS) for the per-sub attention/rope
     /// dispatches of a super-chunk: arena rows offset by sub_c*CANVAS and
@@ -1710,7 +1710,7 @@ impl StepEnc<'_> {
         let qk_y = (16 + 2 * l.n_kv_heads) as usize;
         let layer_off = layer_byte_offset(layer);
 
-        // E14: prefill writes sliding K/V to the f32 side ring too.
+        // Prefill writes sliding K/V to the f32 side ring too.
         let side = if self.prefill_causal {
             self.bufs
                 .kv_f32_side
@@ -1776,29 +1776,29 @@ impl StepEnc<'_> {
         Ok(())
     }
 
-    /// E17 full-layer prefill attention: the [qk, softmax, pv] GEMM
+    /// Full-layer prefill attention: the [qk, softmax, pv] GEMM
     /// decomposition (see `shaders/attn/attention_gemm`).
     fn encode_attn_gemm(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
         self.encode_attn_decomp(layer, layout, AttnDecompKind::Gemm)
     }
 
-    /// E20: top-k sparse attention dispatch for full layers — causal PREFILL
+    /// Top-k sparse attention dispatch for full layers — causal PREFILL
     /// (`DGQ_ATTN_TOPK`) and bidirectional DENOISE (`DGQ_ATTN_TOPK_DECODE`);
-    /// `self.prefill_causal` selects the mask. Shares the E17 QK stage (same
+    /// `self.prefill_causal` selects the mask. Shares the QK stage (same
     /// kernel, same S plane), then dispatches `attn_topk_softmax` (top-k
     /// selection + renormalization) and `attn_topk_pv` (gathered-V PV)
-    /// instead of E17's softmax + PV.
+    /// instead of the dense softmax + PV.
     fn encode_attn_topk(&mut self, layer: usize, layout: &ModelLayout) -> Result<(), Error> {
         self.encode_attn_decomp(layer, layout, AttnDecompKind::TopK)
     }
 
-    /// The shared E17/E20 driver: one QK scaffold (identical dims, S plane,
+    /// The shared GEMM/top-k driver: one QK scaffold (identical dims, S plane,
     /// head-chunk loop), per-variant stage 2/3. Merged from the two ~80%%-
     /// identical encoders so the QK stages can never drift apart.
     ///
-    /// `causal`: E17 is only dispatched on the prefill path
+    /// `causal`: the GEMM variant is only dispatched on the prefill path
     /// (`self.prefill_causal == true`), so deriving both variants' mask from
-    /// `prefill_causal` is bit-identical to E17's old hard-coded `causal: 1`.
+    /// `prefill_causal` is bit-identical to the old hard-coded `causal: 1`.
     fn encode_attn_decomp(
         &mut self,
         layer: usize,
@@ -1817,8 +1817,8 @@ impl StepEnc<'_> {
         let np = n_pad(t_total);
         // Q/O sub-chunk row offset into the batched prefill planes.
         let qo_row = CANVAS * self.sub_c * STEP_NQ_HEADS * hd * 2;
-        // Tunable tile geometry (task #87) — must match the compiled E17
-        // pipelines. E20's tiles are compile-time consts.
+        // Tunable tile geometry — must match the compiled GEMM
+        // pipelines. The top-k tiles are compile-time consts.
         let (qk_bm_f, qk_bn_f, pv_bm_f, pv_bn_f, sm_tpg) = crate::flags::gemm_attn_tile();
         let (qk_bm, qk_bn) = match kind {
             AttnDecompKind::Gemm => (qk_bm_f, qk_bn_f),
@@ -1842,7 +1842,7 @@ impl StepEnc<'_> {
             head_base: 0,
         };
         // kv-adaptive k (DGQ_ATTN_TOPK_DYN): k grows with context, capped by
-        // the compiled K_PAD. Fixed DGQ_ATTN_TOPK_K otherwise. (E20 only.)
+        // the compiled K_PAD. Fixed DGQ_ATTN_TOPK_K otherwise. (top-k only.)
         // The DIVISOR ships, not a resolved k: the kernel derives k per row
         // from that row's own causal key count, so k can't depend on how the
         // prefill was chunked (the reuse-vs-fresh fork; see attn_topk_k_cfg).
@@ -1865,15 +1865,15 @@ impl StepEnc<'_> {
             height: 1,
             depth: 1,
         }; // one simdgroup
-        // E17a: process Q heads in batches of HC so the S/P scratch holds only
+        // Process Q heads in batches of HC so the S/P scratch holds only
         // HC heads. Data offsets use the global head (head_base + tgid.z); the
         // scratch is indexed by the batch-local tgid.z. Both variants read the
-        // SAME flag the scratch allocation reads (task #97).
+        // SAME flag the scratch allocation reads.
         let hc = crate::flags::gemm_attn_head_chunk().min(STEP_NQ_HEADS);
-        // E17b/E20-side: prefer the f32-side-KV pipelines when compiled. The
+        // Prefer the f32-side-KV pipelines when compiled. The
         // f32 side ring is a PREFILL mechanism — denoise-step canvas KV writes
         // only reach the main f16 cache, so decode dispatches must read it
-        // (never the side ring) even when E14 is on.
+        // (never the side ring) even when the side ring is on.
         let side = match kind {
             AttnDecompKind::Gemm => self.ps.attn_gemm_side.is_some(),
             AttnDecompKind::TopK => self.ps.attn_topk_side.is_some() && self.prefill_causal,
@@ -1902,8 +1902,8 @@ impl StepEnc<'_> {
 
             // QK: S = Q.K^T — the shared stage. Q at the sub-chunk offset; K
             // from the f16 main cache (buffer 1 @ kv_region) or the f32 side
-            // ring (buffer 9 @ side_off). E20 additionally writes the FC32
-            // u16 key plane at 8 for the selection passes.
+            // ring (buffer 9 @ side_off). The top-k path additionally writes
+            // the FC32 u16 key plane at 8 for the selection passes.
             self.sink_set_pipeline(&pipes[0]);
             self.sink_set_buffer(
                 &self.bufs.arena,
@@ -2004,7 +2004,7 @@ impl StepEnc<'_> {
         Ok(())
     }
 
-    /// E18: sliding-layer PREFILL via fused flash (`DGQ_FLASH_PREFILL`).
+    /// Sliding-layer PREFILL via fused flash (`DGQ_FLASH_PREFILL`).
     /// Window-aware + ring-aware; hd must be 256 (compile-time FL_HD). f16 KV.
     fn encode_attn_flash_sliding(
         &mut self,
@@ -2077,14 +2077,15 @@ impl StepEnc<'_> {
     ) -> Result<(), Error> {
         let layer_off = layer_byte_offset(layer);
         let l = &layout.layers[layer];
-        // E18: sliding-layer prefill flash (opt-in, quality-gated). Takes
+        // Sliding-layer prefill flash (opt-in, quality-gated). Takes
         // precedence over mma2 when enabled.
         if self.prefill_causal && l.is_full == 0 && self.ps.attn_flash_sliding.is_some() {
             return self.encode_attn_flash_sliding(layer, layout);
         }
-        // E20: top-k sparse attention for full-layer prefill (quality-gated).
-        // Takes precedence over E17 when enabled. The pipelines can also be
-        // compiled for the decode arm alone, so gate on the prefill flag.
+        // Top-k sparse attention for full-layer prefill (quality-gated).
+        // Takes precedence over the GEMM decomposition when enabled. The
+        // pipelines can also be compiled for the decode arm alone, so gate on
+        // the prefill flag.
         if self.prefill_causal
             && l.is_full == 1
             && crate::flags::attn_topk_enabled()
@@ -2103,7 +2104,7 @@ impl StepEnc<'_> {
         {
             return self.encode_attn_topk(layer, layout);
         }
-        // E17: full-layer prefill attention through the GEMM decomposition.
+        // Full-layer prefill attention through the GEMM decomposition.
         if self.prefill_causal && l.is_full == 1 && self.ps.attn_gemm.is_some() {
             return self.encode_attn_gemm(layer, layout);
         }
@@ -2121,7 +2122,7 @@ impl StepEnc<'_> {
         let mma_ok = !self.prefill_causal || crate::flags::prefill_mma_enabled();
         let use_mma2 = mma_ok && attn_mma_enabled() && l.is_full == 0;
         let use_mma_full = mma_ok && attn_mma_full_enabled() && l.is_full == 1;
-        // E14: prefill attention reads K/V from the f32 side cache.
+        // Prefill attention reads K/V from the f32 side cache.
         let side = if self.prefill_causal && use_mma2 {
             self.bufs
                 .kv_f32_side
@@ -2521,7 +2522,7 @@ impl StepEnc<'_> {
             layout,
             StepFinishMode::ForwardOnly,
         )?;
-        // NO RmsNormHidden here (task #64/#68 ROOT CAUSE, fixed 2026-07-10):
+        // NO RmsNormHidden here (ROOT CAUSE):
         // normalizing the embedded hidden is the DENOISE preamble's convention
         // (canvas stream, parity-validated); the reference ENCODER pass feeds
         // embed*sqrt(H) straight into layer 0. The norm is per-row
@@ -2564,7 +2565,7 @@ impl StepEnc<'_> {
             layout,
             StepFinishMode::ForwardOnly,
         )?;
-        // NO RmsNormHidden here (task #64/#68 ROOT CAUSE, fixed 2026-07-10):
+        // NO RmsNormHidden here (ROOT CAUSE):
         // normalizing the embedded hidden is the DENOISE preamble's convention
         // (canvas stream, parity-validated); the reference ENCODER pass feeds
         // embed*sqrt(H) straight into layer 0. The norm is per-row
@@ -2813,7 +2814,7 @@ impl StepEnc<'_> {
 
     fn encode_step_sampler(&mut self, _layout: &ModelLayout) -> Result<(), Error> {
         let cols = VOCAB as u32;
-        // Active denoise width (E3/E6 shrink-on-retry): the sampler stats
+        // Active denoise width (shrink-on-retry): the sampler stats
         // (mean-entropy, canvas-stable, accept-plateau) that drive early-stop
         // must cover exactly the active rows — stale rows [active..CANVAS) would
         // corrupt convergence. rowstats/apply run one threadgroup per row;

@@ -575,9 +575,9 @@ pub fn read_layer_k_cache_f32(
 /// weight — safe because GpuKvCache buffers are zero-filled at allocation and
 /// only ever written by forwards/hydrates (always finite; 0.0 * finite = 0.0).
 ///
-/// (The pre-3285ebe-era CPU predecessor of this function read monolithic slots
-/// LINEARLY — wrong past the ring wrap — and cost O(kv_len) scalar f16
-/// conversions per call, O(n²) over a chunked delta.)
+/// (The CPU predecessor of this function read monolithic slots LINEARLY —
+/// wrong past the ring wrap — and cost O(kv_len) scalar f16 conversions per
+/// call, O(n²) over a chunked delta.)
 fn hydrate_gpu_kv_from_monolithic(
     engine: &mut GpuDecoderEngine,
     kv_buf: &ProtocolObject<dyn MTLBuffer>,
@@ -746,7 +746,7 @@ pub fn extend_monolithic_kv_with_cache(
 /// same chunking, same f16 pack/unpack roundtrips at chunk boundaries) minus
 /// that path's per-chunk re-hydration — which is O(prefix) per chunk, O(n²)
 /// over a long delta. This is the production path for cross-turn deltas past
-/// the fast-prefill trust cap (task #64).
+/// the fast-prefill trust cap.
 pub fn extend_monolithic_kv_chunked(
     cache: &mut MonolithicEncoderCache,
     kv_buf: &ProtocolObject<dyn MTLBuffer>,

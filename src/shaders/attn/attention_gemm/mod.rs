@@ -1,18 +1,18 @@
-//! E17: GEMM-attention for full-layer prefill (and the QK stage of E20
-//! top-k denoise attention, `DGQ_ATTN_TOPK_DECODE`).
+//! GEMM-attention for full-layer prefill (and the QK stage of top-k
+//! attention, `DGQ_ATTN_TOPK_DECODE`).
 //!
-//! `attention_mma_full` is pinned at ~1.25 TF/s by the hd=512 / 8x8-fragment
-//! occupancy shape. During prefill the score matrix `S = Q.K^T` fits in memory
-//! per 256-row sub-chunk, so full attention decomposes into two big GEMMs at
-//! the tunable-GEMM rate (2.3-4 TF/s) plus a rowwise softmax:
+//! The MMA path is constrained by hd=512 / 8x8-fragment occupancy shape.
+//! During prefill the score matrix `S = Q.K^T` fits in memory per 256-row
+//! sub-chunk, so full attention decomposes into two big GEMMs at higher rates
+//! plus a rowwise softmax:
 //!   1. `attn_gemm_qk`      NT-GEMM  S[i,t] = <Q_i, K_t>
 //!   2. `attn_gemm_softmax` rowwise  P = exp(S - rowmax) (masked), denom L
 //!   3. `attn_gemm_pv`      NN-GEMM  O[i,d] = sum_t P[i,t] V[t,d] / L_i
 //!      No 1/sqrt(d) (folded into QK-norm upstream). P is left unnormalized; PV
 //!      divides by L at store — mirroring `attention_mma_full`'s final divide so the
 //!      two share numerics (f16 K/V, f32 accumulate). Not bit-identical.
-//!      Prefill runs the full decomp; denoise reaches the qk stage through E20
-//!      top-k (default on), with `attention_mma_full` as the topk-off fallback.
+//!      Prefill runs the full decomposition; denoise reaches the QK stage through
+//!      top-k attention (default on), with `attention_mma_full` as the fallback.
 
 #[cfg(target_os = "macos")]
 use crate::Error;
@@ -28,7 +28,7 @@ pub const BM: usize = 64;
 pub const BN: usize = 64;
 pub const SOFTMAX_TPG: usize = 256;
 
-/// Tunable config for a prefill-attention sweep (task #87). The two GEMMs have
+/// Tunable config for a prefill-attention sweep. The two GEMMs have
 /// different shapes (QK: M=canvas,K=hd,N=T; PV: M=canvas,K=T,N=hd), so their
 /// tiles tune independently — compiled by prepending `#define AG_*`.
 #[derive(Clone, Copy, Debug)]
@@ -117,8 +117,8 @@ pub fn pipelines(
     ])
 }
 
-/// E17b: f32-side-KV variant (FC30) — Q/K/V from the f32 side ring, all-float
-/// MMA, f32 probs. Matches attention_mma_full_side precision.
+/// F32-side-KV variant (FC30) — Q/K/V from the f32 side ring, all-float
+/// MMA, f32 probs. Matches the MMA-full side path precision.
 #[cfg(target_os = "macos")]
 pub fn pipelines_side(
     ctx: &crate::metal::device::MetalContext,
@@ -135,7 +135,7 @@ pub fn pipelines_side(
     ])
 }
 
-/// Production pipelines specialized for a tunable tile config (task #87): QK +
+/// Production pipelines specialized for a tunable tile config: QK +
 /// softmax compiled with the QK tile, PV with the PV tile (independent shapes).
 /// The default cfg (64x64/64x64/256) yields byte-identical kernels to
 /// `pipelines`/`pipelines_side`, so a default-flag build is unchanged.
@@ -359,7 +359,7 @@ pub fn cpu_causal(f: &crate::shaders::attention::Fixture, round_kv_f16: bool) ->
 }
 
 /// Model-shaped full-layer fixture (canvas=256, 16 Q / 2 KV, hd=512) for
-/// benching E17 against `attention_mma_full` at realistic KV lengths.
+/// benching the GEMM decomposition against `attention_mma_full` at realistic KV lengths.
 #[cfg(target_os = "macos")]
 pub fn model_full_fixture(kv_len: u32) -> crate::shaders::attention::Fixture {
     use crate::shaders::cpu::attention::LayerAttnParams;
@@ -431,7 +431,7 @@ fn model_full_fixture_with(
     }
 }
 
-/// Time `iters` back-to-back runs of the full E17 3-kernel sequence over all
+/// Time `iters` back-to-back runs of the full 3-kernel sequence over all
 /// heads (one full-attention layer, one prefill sub-chunk) in a single command
 /// buffer; 1 warm-up round + min over timed rounds (factors out clock ramp).
 /// Returns mean ms per layer. `causal` mirrors `gpu()` (benches historically
@@ -545,7 +545,7 @@ pub fn bench_gpu(
     })
 }
 
-/// Sweep bench (task #87): compile the E17 kernels for a `TuneCfg` (QK/softmax
+/// Sweep bench: compile the kernels for a `TuneCfg` (QK/softmax
 /// with the QK tile, PV with the PV tile) and time the full head-chunked prefill
 /// sequence at model shape. Returns mean ms/layer (min over warmed rounds), or
 /// Err if the config fails to compile (bad tile / register spill). `side` = the
@@ -733,7 +733,7 @@ mod tests {
         assert_oracle(&got, &oracle, 2e-2, 0.9999);
     }
 
-    /// E17b f32-side-KV path (FC30): all-float MMA reading the f32 side ring;
+    /// F32-side-KV path (FC30): all-float MMA reading the f32 side ring;
     /// vs the causal CPU reference with RAW f32 KV (no f16 rounding).
     #[cfg(target_os = "macos")]
     #[test]
@@ -745,7 +745,7 @@ mod tests {
         assert_oracle(&got, &oracle, 2e-2, 0.9999);
     }
 
-    /// Premise check: E17 GEMM-attention vs `attention_mma_full` at real
+    /// Premise check: GEMM-attention vs `attention_mma_full` at real
     /// full-layer shape (canvas=256, 16 Q / 2 KV, hd=512). One command buffer
     /// each, min-of-rounds. Ignored (timing).
     /// Run: `cargo test --release attn_gemm_bench -- --ignored --nocapture`

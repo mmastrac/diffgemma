@@ -3,7 +3,7 @@
 //!
 //! Mirrors `attention_gemm::cpu_causal`'s rounding (Q -> bf16, KV -> f16 if
 //! `round_kv_f16`, else raw f32; output bf16-rounded) so tolerances line up
-//! with the E17 oracle. The top-k path is NOT bit-identical to dense
+//! with the GEMM oracle. The top-k path is NOT bit-identical to dense
 //! attention: only the top-k highest-scoring keys per (row, head) are kept
 //! and renormalized. Quality-gated, not a refactor.
 //!

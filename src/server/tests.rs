@@ -1,4 +1,4 @@
-//! Tests for `tests`, extracted from server.rs (backlog item 3).
+//! Tests for `tests`, extracted from server.rs.
 
 use super::*;
 use crate::metal::StepProgressEvent;
@@ -193,7 +193,7 @@ fn thinking_strips_nested_channel_reopen_from_reasoning() {
         m.reasoning()
     );
     // The re-open's NAME must go with it — a bare "thought" line otherwise
-    // leaks into the client's Thought UI (field glitch 2026-07-18).
+    // leaks into the client's Thought UI.
     assert!(
         !m.reasoning().contains("thought"),
         "channel name leaked: {:?}",
@@ -202,8 +202,8 @@ fn thinking_strips_nested_channel_reopen_from_reasoning() {
     assert_eq!(m.content(), "A");
 }
 
-/// Field regression (2026-07-17 regex_lite turn 14): thinking mode ON but
-/// the model skips the thought ceremony and answers with a bare tool call —
+/// Field regression: thinking mode ON but the model skips the thought
+/// ceremony and answers with a bare tool call —
 /// no channel markers anywhere in the reply. The old "everything is
 /// reasoning until a close appears" rule streamed the whole call as
 /// reasoning_content and the client got an empty message. Classification

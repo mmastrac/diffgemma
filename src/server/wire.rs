@@ -144,10 +144,7 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
     /// emitted — classification follows emission, not the mode flag. The old
     /// rule ("everything is reasoning until a close appears") silently
     /// swallowed a whole turn when the model skipped the thought ceremony
-    /// and answered with a bare tool call (field incident 2026-07-17: a
-    /// well-formed edit call streamed as reasoning_content, client got an
-    /// empty message, and the repair stage — which judged the call visible
-    /// and valid — was rightly silent). An unclosed span still runs to the
+    /// and answered with a bare tool call. An unclosed span still runs to the
     /// end of the committed ids, so mid-thought streaming is unchanged.
     fn split(&self, ids: &[u32]) -> Split {
         if !self.thinking {
@@ -162,8 +159,7 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
         let mut in_quote = false;
         // A `<|channel>` takes its NAME token (+ trailing newline) with it: the
         // open special is dropped here, so a mid-span re-open would otherwise
-        // leak a bare "thought" line into the client's Thought UI (field
-        // glitch 2026-07-18, repair-round conditioning).
+        // leak a bare "thought" line into the client's Thought UI.
         let mut skip_name = false;
         for &id in ids {
             if Some(id) == self.quote {

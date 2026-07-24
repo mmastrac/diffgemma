@@ -58,7 +58,7 @@ pub(crate) enum Command {
         oracle: Option<String>,
         iters: usize,
     },
-    /// Tunable E17 prefill-attention bench for sweeps (task #87): compiles the
+    /// Tunable prefill-attention bench for sweeps: compiles the
     /// kernels for a tile/HC/TPG config and prints RESULT {json: ms, tf_s}.
     BenchPrefillAttn {
         kv_len: u32,
@@ -72,7 +72,7 @@ pub(crate) enum Command {
         causal: bool,
         iters: usize,
     },
-    /// Holistic prefill proxy (task #87): time one real M=1024 super-chunk (all
+    /// Holistic prefill proxy: time one real M=1024 super-chunk (all
     /// stages, real weights) at --kv-len; prints RESULT {json: ms}. Honors the
     /// tunable tile flags — the objective for a whole-model BO sweep.
     BenchPrefillSuper {
@@ -192,7 +192,7 @@ pub(crate) enum Command {
         layer: usize,
         position: usize,
     },
-    /// E22-M0: dump the full canvas Q plane + layer K cache (raw f32) for
+    /// Dump the full canvas Q plane + layer K cache (raw f32) for
     /// offline block-mass analysis.
     StepAttnQkDump {
         prompt: Option<String>,
@@ -338,7 +338,7 @@ pub(crate) enum Command {
         /// Repeat the whole (filtered) prompt sequence N times in ONE session
         /// (no re-warmup) — surfaces reset_kv session-state carryover.
         repeat: usize,
-        /// Run ONLY the long-context doc-QA tier (bigger session; E13).
+        /// Run ONLY the long-context doc-QA tier (bigger session).
         longctx: bool,
     },
     /// Flag-arm x battery campaign with explicit acceptance gates.
@@ -358,7 +358,7 @@ pub(crate) enum Command {
         /// Report on an existing trace dir instead of running (no GPU).
         analyze: Option<PathBuf>,
     },
-    /// Golden byte-identity pack — the Tier-1 refactor gate (task #73).
+    /// Golden byte-identity pack — the Tier-1 refactor gate.
     /// Print the generated kernel FC-axis manifest (TOML) to stdout.
     Manifest,
     /// Re-execute an `ops.jsonl` op-log (serve `--log-dir`) against a fresh

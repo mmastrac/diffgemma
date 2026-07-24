@@ -5,7 +5,7 @@
 #include "arena_fc.metal"
 
 // Activation arena: 2-byte slots — bf16 by default (settled precision policy),
-// fp16 when compiled with K_ARENA_F16 (E11 fp16 prefill stream: 2^-11 relative
+// fp16 when compiled with K_ARENA_F16 (fp16 prefill stream: 2^-11 relative
 // step instead of 2^-8; M0 range trace shows all planes peak <130 vs fp16 max
 // 65504). Same byte layout either way; the FC folds at compile time.
 

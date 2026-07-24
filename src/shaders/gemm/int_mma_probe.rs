@@ -1,7 +1,7 @@
 //! Raw-throughput microbench: half tensor-MMA vs int8 4-wide dot-product vs f32
 //! scalar FMA on M3. HISTORICAL ONLY — superseded by the real int8 MoE expert
-//! GEMM prototype (`gemm_int_sparse`, 2026-07-14), which DISPROVED the
-//! "int8 dot could beat half-MMA" hypothesis the probe was built to settle.
+//! GEMM prototype (`gemm_int_sparse`), which demonstrates the "int8 dot could
+//! beat half-MMA" hypothesis was incorrect.
 //!
 //! The probe's per-instruction GMAC/s (int8 dot ≈ f32 FMA ≈ 14× half-MMA) is
 //! ~4× compiler-inflated in absolute terms AND misleading for GEMM shapes: it
@@ -11,8 +11,7 @@
 //! shapes showed int8 is ~9× SLOWER than half-MMA (0.43 vs 3.78 TFLOP/s) —
 //! the half-simdgroup-MMA does 512 MAC/simdgroup-inst (16 MAC/lane) vs the
 //! int8 char4 dot's 4 MAC/lane/inst, plus the int8 path pays 32 sequential
-//! dependent int32 adds per fragment element. See PLAN.md E18 redirect
-//! (DISPROVEN 2026-07-14) + ARCHITECTURE.md Negative Knowledge.
+//! dependent int32 adds per fragment element.
 //!
 //! Kept as a documented negative: the probe is a valid measure of
 //! per-instruction ALU throughput, but it CANNOT settle a GEMM-shape question.

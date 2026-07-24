@@ -69,7 +69,7 @@ fn the_valid_forms_the_blend_mixes_are_silent() {
     }
 }
 
-/// MEASURED false positive (`programmatic`, 3 blocks, 6 findings, 2026-07-20):
+/// MEASURED false positive (`programmatic`, 3 blocks, 6 findings):
 /// the cross-quoting idiom makes BOTH per-line quote counts odd in perfectly
 /// correct python. This is why `quote_line` and `quote_region` are reported as
 /// separate checks — on the same run `quote_region` scored 2/2 precision and

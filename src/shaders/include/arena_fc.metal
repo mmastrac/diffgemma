@@ -1,4 +1,4 @@
-// FC9 = K_ARENA_F16 (activation-arena dtype: fp16 instead of bf16; E11).
+// FC9 = K_ARENA_F16 (activation-arena dtype: fp16 instead of bf16).
 // Lives in its own header so arena.metal/dequant.metal can declare it without
 // pulling in fc_axes.metal — the monolithic step shader declares its OWN
 // constants at indices 1-3 and must not see fc_axes' globals.

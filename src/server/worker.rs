@@ -1,7 +1,7 @@
 //! `Worker`: the single GPU-owning thread that drains the job queue and runs
-//! generation (`run` / `handle` / tool-compaction). Extracted from server.rs
-//! (backlog item 10); the `Worker` struct + wire/job/event types stay in the
-//! parent, so `use super::*` + ancestry reach them (incl. private fields).
+//! generation (`run` / `handle` / tool-compaction). Extracted from server.rs;
+//! the `Worker` struct + wire/job/event types stay in the parent, so
+//! `use super::*` + ancestry reach them (incl. private fields).
 
 use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc;
@@ -283,7 +283,7 @@ impl Worker {
                     // repair-round conditioning provokes these; the repair
                     // validator judges such replies clean, so dropping the
                     // call here handed the client prose with no tool_calls,
-                    // field incident 2026-07-18). Adopt the calls from the
+                    // field incident). Adopt the calls from the
                     // thought-stripped raw decode instead of only logging.
                     if calls.is_empty() {
                         // Bare/markerless reply: strip_thinking is a no-op on
@@ -476,13 +476,12 @@ impl Worker {
         cfg.max_new_tokens = job.max_tokens.map_or(budget, |c| c.min(budget));
         cfg.seed = job.seed.unwrap_or(self.base_cfg.seed);
         cfg.stop_token_ids = self.stop_token_ids.clone();
-        // Continue-past-stop is OFF by default (2026-07-17 strain-battery
-        // finding): a stop token inside an open tool call is a DEGRADATION
-        // SYMPTOM — the deterministic collapse cell shows the deferred
-        // continuation flooding for 8 blocks and never rescuing the call.
-        // Honor the model's stop; repair belongs to the tool-repair stage
-        // (feedback + rewind), not forced continuation. `DGQ_CONTINUE_PAST_STOP=1`
-        // restores the old bet.
+        // Continue-past-stop is OFF by default: a stop token inside an open
+        // tool call is a DEGRADATION SYMPTOM — the deterministic collapse cell
+        // shows the deferred continuation flooding for 8 blocks and never
+        // rescuing the call. Honor the model's stop; repair belongs to the
+        // tool-repair stage (feedback + rewind), not forced continuation.
+        // `DGQ_CONTINUE_PAST_STOP=1` restores the old bet.
         cfg.continue_incomplete_tool_calls = crate::flags::continue_past_stop_enabled()
             && needs_tool_rendering(&job.messages, &job.tools);
         // Only read under the flag above: quoted stop ids are literal
@@ -593,7 +592,7 @@ impl Worker {
             }));
             let too_big = |ctx: &[serde_json::Value]| {
                 // NOTE: thinking=false here where siblings pass the request
-                // flag — preserved as-is (sizing-only render; PLAN item).
+                // flag — preserved as-is (sizing-only render).
                 self.render_prompt(ctx, &tools_aug, true, false).0.len() + canvas + 64
                     > self.max_seq
             };

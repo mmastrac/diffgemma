@@ -10,7 +10,7 @@ pub struct StepRuntime {
     pub(super) _mem_permit: crate::membudget::MemPermit,
     pub(super) ctx: MetalContext,
     pub(super) pipelines: &'static StepPipelines,
-    /// fp16-arena pipeline set (E11, DGQ_PREFILL_F16): identical kernels
+    /// fp16-arena pipeline set (DGQ_PREFILL_F16): identical kernels
     /// compiled with K_ARENA_F16 — the fast prefill dispatches through these
     /// while denoise keeps the gate-validated bf16 set. None when off.
     pub(super) pipelines_prefill_f16: Option<&'static StepPipelines>,
@@ -32,12 +32,12 @@ pub struct StepRuntime {
     /// denoise block writes a CANVAS-wide canvas at [kv_len..kv_len+CANVAS], so
     /// kv_len + CANVAS must never exceed this — checked in `set_kv_len`.
     pub(super) max_seq: usize,
-    /// E14: KV position the f32 side ring is valid up to. A fast prefill
-    /// resuming at a different offset re-hydrates the window from the
-    /// monolithic cache first (rollback / restore / conversation swap all
-    /// invalidate silently — the mismatch check heals every case).
+    /// KV position the f32 side ring is valid up to. A fast prefill resuming
+    /// at a different offset re-hydrates the window from the monolithic cache
+    /// first (rollback / restore / conversation swap all invalidate silently —
+    /// the mismatch check heals every case).
     pub(super) kv_f32_side_valid: usize,
-    /// Active canvas width for the NEXT denoise step (E3/E6 shrink-on-retry).
+    /// Active canvas width for the NEXT denoise step (shrink-on-retry).
     /// `CANVAS` (256) normally; the block loop narrows it (128/64) when re-
     /// rolling a degenerate reply. Clamped to [1, CANVAS].
     pub(super) active_canvas: usize,
@@ -146,10 +146,10 @@ impl StepRuntime {
         h
     }
 
-    /// TEST-ONLY diagnostic: zero the monolithic KV cache and the E14 f32
-    /// side ring, and invalidate the side-ring cursor — removes all
-    /// cross-build residue so lineage probes can distinguish true
-    /// path-dependence from stale-state leakage.
+    /// TEST-ONLY diagnostic: zero the monolithic KV cache and the f32 side
+    /// ring, and invalidate the side-ring cursor — removes all cross-build
+    /// residue so lineage probes can distinguish true path-dependence from
+    /// stale-state leakage.
     #[cfg(test)]
     pub fn debug_scrub_kv(&mut self) {
         self.debug_scrub_kv_parts(true, true);
@@ -243,7 +243,7 @@ impl StepRuntime {
         self.prefill_chunks_from(0, prompt_token_ids)
     }
 
-    /// E14: refill each sliding layer's f32 side ring from the monolithic
+    /// Refill each sliding layer's f32 side ring from the monolithic
     /// cache for the last `min(upto, ring)` positions below `upto` (f16→f32
     /// widening — bakes in the one rounding those values already carry, no
     /// further compounding). One dispatch for all layers, ~ms.
@@ -311,7 +311,7 @@ impl StepRuntime {
         let n = offset + delta_token_ids.len();
         let mut pos = offset;
         let batch = crate::flags::prefill_batch_enabled();
-        // E11 M0 range trace (DGQ_TRACE_RANGES=1): after each chunk forward the
+        // M0 range trace (DGQ_TRACE_RANGES=1): after each chunk forward the
         // arena planes hold the LAST layer's stage outputs — sample max|x| and
         // non-finites per plane across all chunks, so position-dependence is
         // covered. Answers "do prefill activations fit fp16 (max 65504)?".
@@ -357,9 +357,9 @@ impl StepRuntime {
         };
         // Suppress KV writes for the zero-PADDED tail rows (positions >= n):
         // on sliding layers a pad position wraps onto (pos & ring_mask) and
-        // would clobber the oldest live window slots (task #64).
+        // would clobber the oldest live window slots.
         self.set_kv_write_end(n as u32);
-        // E14: the prefill attention reads sliding K/V from the f32 side ring;
+        // The prefill attention reads sliding K/V from the f32 side ring;
         // make its window current for a resume at `offset` (fresh prefill at
         // 0 needs nothing — every read position gets written first).
         if self.bufs.kv_f32_side.is_some() && offset > 0 && self.kv_f32_side_valid != offset {
@@ -489,7 +489,7 @@ impl StepRuntime {
     }
 
     /// New denoise block: fresh random canvas, reset step/stop, patch sampler params.
-    /// Active denoise canvas width for subsequent steps (E3/E6 shrink-on-retry).
+    /// Active denoise canvas width for subsequent steps (shrink-on-retry).
     /// Clamped to [1, CANVAS]. A `DGQ_FORCE_CANVAS` override still wins at the
     /// dispatch site. The block loop reads it back via `active_canvas()`.
     pub fn set_active_canvas(&mut self, w: usize) {
@@ -963,7 +963,7 @@ impl StepRuntime {
     }
 
     /// P2.2 Phase A: one command buffer + one GPU sync per denoise step.
-    /// Holistic prefill proxy (task #87): time ONE M=1024 super-chunk forward at
+    /// Holistic prefill proxy: time ONE M=1024 super-chunk forward at
     /// kv=`kv_len` — all stages (QKV/o-proj/dense GEMMs, rope, attention per sub,
     /// router, MoE-expert GEMM, norms) interleaved in one command buffer exactly
     /// as production, with real weights. This is the true per-super-chunk cost;
@@ -1073,7 +1073,7 @@ impl StepRuntime {
         }
         let first_step = if st_before.step == 0 { 1u32 } else { 0u32 };
         let partial_lm_m = partial_lm_active_rows(&st_before);
-        // Denoise (Full) may run a narrowed canvas (E3/E6 shrink-on-retry);
+        // Denoise (Full) may run a narrowed canvas (shrink-on-retry);
         // ForwardOnly (prefill/dump) always uses the full CANVAS sub width.
         let active_canvas = if finish == StepFinishMode::Full {
             crate::flags::force_canvas()

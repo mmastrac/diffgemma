@@ -2,7 +2,7 @@
 
 use super::*;
 
-/// Golden byte-identity pack (task #73) — the Tier-1 refactor gate. Runs a fixed
+/// Golden byte-identity pack — the Tier-1 refactor gate. Runs a fixed
 /// path-matrix through the PRODUCTION `generate_with_session` path and asserts
 /// byte identity (token_ids + causal-KV hash + denoise metadata) against the
 /// checked-in pack. `bless` re-records instead of checking.

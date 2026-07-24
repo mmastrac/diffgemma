@@ -205,7 +205,7 @@ impl PipelineOp {
             );
             cfg.stop_token_ids = stop_ids.clone();
             cfg.continue_incomplete_tool_calls = cont;
-            // Absent in pre-2026-07-18 logs → None (the plain stop-scan),
+            // Absent in old logs → None (the plain stop-scan),
             // which is exactly what those sessions ran.
             cfg.quote_token_id = v
                 .get("quote_token_id")

@@ -203,8 +203,8 @@ pub fn bench_gemm_tunable_sparse(iters: usize) -> Result<Vec<GemmBenchRow>, Erro
     Ok(rows)
 }
 
-/// int8-accumulated block-sparse MoE expert GEMM bench (E18 redirect
-/// prototype). Mirrors `bench_gemm_tunable_sparse` shapes (128 experts,
+/// int8-accumulated block-sparse MoE expert GEMM bench.
+/// Mirrors `bench_gemm_tunable_sparse` shapes (128 experts,
 /// prefill rpe=64 + denoise rpe=16, gate_up 1408×K and down 2816×K) but swaps
 /// the production q4→half-MMA path for the int8 dot-product path
 /// (`gemm_int_sparse`): activations and weights are per-row-absmax int8,

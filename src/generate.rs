@@ -104,7 +104,7 @@ pub struct BlockDenoiseStats {
 }
 
 /// Build the step-level config for a generate command (layers resolution,
-/// full-message stop tokens, E6 degenerate-reply check). Shared by the direct
+/// full-message stop tokens, degenerate-reply check). Shared by the direct
 /// path and the token-pipeline path so both run the identical policy.
 #[cfg(target_os = "macos")]
 pub fn step_config_for_generate(
@@ -135,7 +135,7 @@ pub fn step_config_for_generate(
         Vec::new()
     };
     cfg.stop_token_ids = stops.clone();
-    // E6 empty/degenerate-reply canvas re-roll (only when enabled). Detects an
+    // Empty/degenerate-reply canvas re-roll (only when enabled). Detects an
     // empty user-facing reply from the decoded+sanitized committed block.
     cfg.degenerate_reply_check = crate::chat_template::empty_reply_check(model_dir, stops);
     Ok(cfg)

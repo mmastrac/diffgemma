@@ -494,12 +494,11 @@ pub fn run_step_attn_layer_capture(
     })
 }
 
-/// E22-M0 (task #101): dump the FULL step-1 canvas Q plane (post-RoPE, all 256
-/// rows × 16 heads × hd) and the layer's complete K cache, as raw f32 binaries
-/// + a meta json, for offline block-mass analysis
-///   (`python/scripts/e22_block_mass.py`). Same capture flow as
-///   `run_step_attn_layer_capture` but skips the per-row CPU score math — the
-///   planes are the product. Returns (kv_len, total_kv).
+/// Dump the FULL step-1 canvas Q plane (post-RoPE, all 256 rows × 16 heads
+/// × hd) and the layer's complete K cache, as raw f32 binaries + a meta json,
+/// for offline block-mass analysis. Same capture flow as
+/// `run_step_attn_layer_capture` but skips the per-row CPU score math — the
+/// planes are the product. Returns (kv_len, total_kv).
 pub fn run_step_attn_qk_plane_dump(
     model_dir: &Path,
     cfg: &StepSmokeConfig,

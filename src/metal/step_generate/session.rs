@@ -387,7 +387,7 @@ impl StepGenerateSession {
     }
 
     /// Direct KV buffer + layout access for oracle-style tests that MUTATE
-    /// stored KV between prefill and denoise (E16 fusion replay: rewrite aged
+    /// stored KV between prefill and denoise (fusion replay: rewrite aged
     /// full-layer rows, then re-enter generation on the doctored cache).
     /// Diagnostic only — production code goes through the runtime.
     #[allow(dead_code)]
@@ -418,7 +418,7 @@ impl StepGenerateSession {
     }
 }
 
-/// DIAGNOSTIC (task #67): multiply every live f16 KV value by (1 + eps*u),
+/// DIAGNOSTIC: multiply every live f16 KV value by (1 + eps*u),
 /// u uniform in [-1, 1] — models the fast path's per-value computation noise
 /// on top of a KNOWN-GOOD engine prefill. f16 sessions only (q8 skipped).
 pub(super) fn perturb_live_kv_f16(

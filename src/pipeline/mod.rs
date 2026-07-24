@@ -1,5 +1,4 @@
-//! Token pipeline — the serialized op-stream core (design: PLAN.md
-//! "Token pipeline").
+//! Token pipeline — the serialized op-stream core.
 //!
 //! One dedicated thread owns the model session AND the multi-conversation
 //! registry (GPU + KV); clients speak token IDS only — never strings —

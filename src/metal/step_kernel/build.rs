@@ -186,8 +186,8 @@ pub fn build_step_runtime(
     let ctx = MetalContext::new()?;
     let compile_started = Instant::now();
     let kv_fmt = crate::flags::kv_format(cfg.max_seq);
-    // TEMP diagnostic (E11 bring-up): DGQ_ARENA_F16_ALL=1 builds the MAIN set
-    // fp16 too — bisects kernel-level breakage from mode-switch wiring.
+    // Diagnostic: DGQ_ARENA_F16_ALL=1 builds the MAIN set fp16 too — bisects
+    // kernel-level breakage from mode-switch wiring.
     let f16_all = crate::flags::arena_f16_all_enabled();
     if f16_all {
         crate::shaders::variant::set_arena_f16_compile(true);
@@ -239,7 +239,7 @@ pub fn build_step_runtime(
     // real file instead of anonymous swap. `kv_mmap_backing` must outlive
     // `kvcache` — it is declared after it in `StepBuffers` so it drops later.
     let (kvcache, kv_mmap_backing) = alloc_kv_buffer(&ctx.device, kv_bytes)?;
-    // E14 f32 side K/V ring for sliding layers (DGQ_PREFILL_KV_F32).
+    // f32 side K/V ring for sliding layers (DGQ_PREFILL_KV_F32).
     let mut kv_f32_side_offs = [u64::MAX; N_LAYERS];
     let kv_f32_side = if crate::flags::prefill_kv_f32_enabled() {
         let mut off = 0u64;
@@ -313,19 +313,18 @@ pub fn build_step_runtime(
             &ctx.device,
             STEP_NQ_HEADS * CANVAS * (2 + 512) * std::mem::size_of::<f32>(),
         )?,
-        // E17 GEMM-attention prefill scratch (opt-in). Head-chunked (E17a): the
+        // GEMM-attention prefill scratch (opt-in). Head-chunked: the
         // score matrix S/P holds only HC heads at a time —
         // [HC][CANVAS][n_pad(max_seq)]. Allocated when DGQ_GEMM_ATTN OR
-        // DGQ_ATTN_TOPK is set (E20 reuses the same S plane; the two paths are
+        // DGQ_ATTN_TOPK is set (top-k reuses the same S plane; the two paths are
         // never both live on the same layer).
         attn_gemm_s: if crate::flags::gemm_attn_enabled()
             || crate::flags::attn_topk_enabled()
             || crate::flags::attn_topk_decode_enabled()
         {
             let np = crate::shaders::attention_gemm::n_pad(cfg.max_seq);
-            // Both E17 and E20 encoders batch heads by DGQ_GEMM_ATTN_HC (task
-            // #97 unified them); size from the same flag so the encoder can
-            // never outrun the scratch.
+            // Both encoders batch heads by DGQ_GEMM_ATTN_HC; size from the
+            // same flag so the encoder can never outrun the scratch.
             let hc = crate::flags::gemm_attn_head_chunk().min(STEP_NQ_HEADS);
             Some(alloc_buffer(
                 &ctx.device,
@@ -351,12 +350,12 @@ pub fn build_step_runtime(
         } else {
             None
         },
-        // E20 top-k scratch: compressed P [HC][CANVAS][K_PAD] (f32), indices
+        // Top-k scratch: compressed P [HC][CANVAS][K_PAD] (f32), indices
         // Idx [HC][CANVAS][K_PAD] (u32), lrow [HC][CANVAS] (f32), and the u16
         // key plane [HC][CANVAS][n_pad] (FC32 output of QK, read by the
         // selection passes — half the bytes of the S plane). HC comes from the
-        // same flag the encoder batches by (task #97). The S plane is shared
-        // with attn_gemm_s (allocated above when either flag is set).
+        // same flag the encoder batches by. The S plane is shared with
+        // attn_gemm_s (allocated above when either flag is set).
         attn_topk_p: if crate::flags::attn_topk_enabled()
             || crate::flags::attn_topk_decode_enabled()
         {

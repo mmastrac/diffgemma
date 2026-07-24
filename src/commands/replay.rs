@@ -5,7 +5,7 @@
 //! drift, nondeterminism, or a behavior change since the log was recorded).
 //!
 //! Fidelity notes: ops are reconstructed from the log's full-id records; the
-//! replayable cfg core (seed/budget/steps/stops/E6-check) is rebuilt exactly,
+//! replayable cfg core (seed/budget/steps/stops) is rebuilt exactly,
 //! but DGQ_* flags come from the CURRENT environment — run the replay under
 //! the same flags (and build) as the recorded session for a meaningful diff.
 //! A second `meta` line marks a serve restart; replay stops there (the fresh

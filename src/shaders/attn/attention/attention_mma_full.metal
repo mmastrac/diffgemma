@@ -43,14 +43,14 @@ constant uint KV_FMT = is_function_constant_defined(KV_FMT_FC) ? KV_FMT_FC : 0u;
 constant bool KV_Q8 = (KV_FMT == 1u);
 constant bool KV_Q4 = (KV_FMT == 2u);
 
-// E14 prefill variant: K/V come from the f32 side cache (buffer 9, bound at
+// Prefill variant: K/V come from the f32 side cache (buffer 9, bound at
 // this layer's side offset; full layers are LINEAR — index by absolute t0).
 // Q is staged f32 and the MMA runs all-float. See attention_mma2.metal.
 constant bool KV_F32_SIDE_FC [[function_constant(30)]];
 constant bool KV_F32_SIDE =
     is_function_constant_defined(KV_F32_SIDE_FC) && KV_F32_SIDE_FC;
 
-// E5 QK-ILP2 chain-split (FC31, opt-in `DGQ_ATTN_MMA_FULL_QK_ILP2`): split the
+// QK-ILP2 chain-split (FC31, opt-in `DGQ_ATTN_MMA_FULL_QK_ILP2`): split the
 // 32-deep serial QK dot into two interleaved 16-deep accumulator chains (even/
 // odd chunks), summed at the end. The two chains have no data dependency on
 // each other, so the GPU issues both MMAs concurrently — halving the
@@ -133,7 +133,7 @@ kernel void attention_mma_full(
     // dead-stripped from f16 pipelines).
     threadgroup half kq8[NCH][8][8];
     threadgroup float st[QG][MT][8];    // per-half partial QK scores
-    // E5 ILP2 only: second QK partial per half (even/odd chunk split).
+    // ILP2 only: second QK partial per half (even/odd chunk split).
     // Dead-stripped from the non-ILP2 pipeline by QK_ILP2.
     threadgroup float st_ilp[QG][MT][8];
     threadgroup half ph[MT][8];         // softmax probs (shared)
@@ -212,7 +212,7 @@ kernel void attention_mma_full(
         }
         simdgroup_float8x8 sacc(0.f);
         if (QK_ILP2) {
-            // E5 ILP2: two independent 16-deep chains (even/odd chunks), no data
+            // ILP2: two independent 16-deep chains (even/odd chunks), no data
             // dependency between them -> the GPU issues both MMAs concurrently,
             // halving the QK serial-dependency depth. Store each chain to its
             // own tgmem slot; the cross-half softmax sums all four partials.

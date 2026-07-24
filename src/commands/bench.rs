@@ -497,7 +497,7 @@ pub(crate) fn run_gemm(size: usize) -> ExitCode {
     }
 }
 
-/// Tunable E17 prefill-attention bench (task #87). Compiles the kernels for a
+/// Tunable prefill-attention bench. Compiles the kernels for a
 /// tile/HC/TPG config and times the full head-chunked prefill sequence at model
 /// shape (canvas=256, 16 Q / 2 KV, hd=512). Prints a human line + a machine
 /// `RESULT {json}` line (ms/layer, TF/s) for the Optuna sweep driver. Needs no
@@ -556,7 +556,7 @@ pub(crate) fn run_bench_prefill_attn(
     }
 }
 
-/// Holistic prefill proxy (task #87): time one real M=1024 super-chunk (all
+/// Holistic prefill proxy: time one real M=1024 super-chunk (all
 /// stages, real weights) at `kv_len`, honoring the tunable tile flags. Prints a
 /// human line + machine `RESULT {json}` (ms/super-chunk) — the objective for a
 /// whole-model BO sweep. Faithful to real prefill's per-super-chunk cost at

@@ -138,13 +138,12 @@ fn assert_hydrate_exact(
     eprintln!("hydrate exact at kv_len={kv_len} (all {layers} layers, live slots bit-equal)");
 }
 
-/// E12 baseline: extend-vs-full-prefill KV diffs below (1500) and above
-/// (3000) the sliding ring wrap (2048) — DIAGNOSTIC (chunk boundaries
-/// expose the prefix through f16 pack/unpack; the forward chaos-amplifies
-/// that, so nonzero diffs are physics, not defects). The hard gates are
-/// (a) hydrate exactness incl. ring mapping, (b) extend completes and
-/// produces finite KV. Timing per extend printed by the monolithic-extend
-/// instrumentation.
+/// Baseline: extend-vs-full-prefill KV diffs below (1500) and above (3000)
+/// the sliding ring wrap (2048) — diagnostic (chunk boundaries expose the
+/// prefix through f16 pack/unpack; the forward chaos-amplifies that, so
+/// nonzero diffs are physics, not defects). The hard gates are (a) hydrate
+/// exactness including ring mapping, (b) extend completes and produces finite
+/// KV. Timing per extend printed by the monolithic-extend instrumentation.
 #[test]
 #[ignore = "model-gated bench: cargo test --release engine_extend_baseline -- --ignored --nocapture"]
 fn engine_extend_baseline() {
@@ -306,10 +305,10 @@ fn engine_hydrate_ring_exactness() {
     assert_eq!(off, 2488 + CANVAS);
 }
 
-/// E15: fast-vs-engine per-layer per-position-band KV divergence at 4.2k.
-/// The DGQ_KV_NOISE anchor (engine + 1% noise on every KV value answers
-/// the 4.2k doc probe correctly) makes the criterion hard: rel-RMS > ~3%
-/// in some (layer, band) = the bug's first expression; below = ignorable.
+/// Fast-vs-engine per-layer per-position-band KV divergence at 4.2k. The
+/// DGQ_KV_NOISE anchor (engine + 1% noise on every KV value answers the 4.2k
+/// doc probe correctly) makes the criterion hard: rel-RMS > ~3% in some
+/// (layer, band) indicates the bug's first expression; below is ignorable.
 /// Fixture path via DGQ_E15_PROMPT (defaults to the session scratchpad
 /// probe_4k.txt).
 #[test]
@@ -414,13 +413,13 @@ fn e15_layer_kv_bisect() {
     );
 }
 
-/// E15 causality check (chaos-immune): fast-prefill of tokens[..k] must
-/// leave BYTE-IDENTICAL full-layer KV for positions [0, k) as a fast
-/// prefill of the whole prompt — each position's KV is fixed by its causal
-/// context. Any difference = later tokens corrupting earlier state (a
-/// write-range/aliasing bug), with no routing-chaos excuse (same path,
-/// same kernels, bit comparison). Full layers only (linear storage; the
-/// sliding rings hold different position windows in the two runs).
+/// Causality check (chaos-immune): fast-prefill of tokens[..k] must leave
+/// BYTE-IDENTICAL full-layer KV for positions [0, k) as a fast prefill of
+/// the whole prompt — each position's KV is fixed by its causal context. Any
+/// difference indicates later tokens corrupting earlier state (a
+/// write-range/aliasing bug), with no routing-chaos excuse (same path, same
+/// kernels, bit comparison). Full layers only (linear storage; the sliding
+/// rings hold different position windows in the two runs).
 #[test]
 #[ignore = "model-gated: cargo test --release e15_causality_check -- --ignored --nocapture"]
 fn e15_causality_check() {
@@ -495,16 +494,16 @@ fn e15_causality_check() {
     }
 }
 
-/// E8-M0 (task #71, the "un-RoPE the KV" idea): does PRE-RoPE K quantize
-/// better than the POST-RoPE K we store today? RoPE mixes dim pairs with
-/// position-dependent angles and can widen per-group ranges; if pre-RoPE K
-/// brings affine-q4 error toward q8-class, storing K pre-RoPE (RoPE at
-/// attention-read time) both restores the offline Hadamard fold AND
-/// improves plain quantization. Method: fast-prefill a real prompt at
-/// max_seq=2048 (slot == pos on every layer: sliding rings are 2048 slots,
-/// no wrap), read the stored post-RoPE f16 K rows, invert RoPE exactly on
-/// CPU (orthogonal rotation; the f16 storage noise ~1e-3 is far below the
-/// 1-8% quant errors under study), and compare kv_quant round-trips.
+/// Does PRE-RoPE K quantize better than the POST-RoPE K we store today?
+/// RoPE mixes dim pairs with position-dependent angles and can widen
+/// per-group ranges; if pre-RoPE K brings affine-q4 error toward q8-class,
+/// storing K pre-RoPE (RoPE at attention-read time) both restores the
+/// offline Hadamard fold AND improves plain quantization. Method: fast-prefill
+/// a real prompt at max_seq=2048 (slot == pos on every layer: sliding rings
+/// are 2048 slots, no wrap), read the stored post-RoPE f16 K rows, invert
+/// RoPE exactly on CPU (orthogonal rotation; the f16 storage noise ~1e-3 is
+/// far below the 1-8% quant errors under study), and compare kv_quant
+/// round-trips.
 #[test]
 #[ignore = "model-gated: cargo test --release e8_prerope_k_quant_stats -- --ignored --nocapture"]
 fn e8_prerope_k_quant_stats() {

@@ -1,13 +1,13 @@
-//! E18: fused flash prefill attention (online softmax, register-resident O, no
-//! device S/P traffic), in contrast to E17's `attention_gemm` decomposition
-//! which materializes S=Q·Kᵀ and P to device.
+//! Fused flash prefill attention (online softmax, register-resident O, no
+//! device S/P traffic), in contrast to dense GEMM-decomposition which
+//! materializes S=Q·Kᵀ and P to device.
 //!
 //! The Metal kernel (`attention_flash.metal`) streams the keys in BK-wide
 //! blocks and keeps the O accumulator resident across the stream, combining
 //! each block into the running (max, denom, O) with the standard flash rescale.
 //! This module currently holds the **CPU block-streaming reference** used to
 //! pin the exact blocking/masking/GQA scheme the kernel mirrors, validated
-//! against the E17 `attention_gemm::cpu_causal` batch reference (both compute
+//! against the `attention_gemm::cpu_causal` batch reference (both compute
 //! the same softmax; flash just blocks it). GPU pipeline + oracle land with the
 //! kernel.
 

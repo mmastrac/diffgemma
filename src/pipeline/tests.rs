@@ -319,7 +319,7 @@ fn oplog_roundtrip_replays_bit_identically() {
     let _ = std::fs::remove_file(&log_path);
 }
 
-/// Wrap-crossing rewind gate (the PLAN follow-up, now load-bearing):
+/// Wrap-crossing rewind gate (now load-bearing):
 /// every other byte-consistency gate runs below the sliding-ring wrap,
 /// but real sessions rewind — guard re-rolls, cancels, salvage truncates
 /// — at 5-13k tokens, past it. At ring 4096: (a) generate → rewind at
@@ -401,8 +401,8 @@ fn wrap_crossing_rewind_restores_state() {
     );
 }
 
-/// In-block re-roll residue gate: an E6-discarded canvas attempt must
-/// leave NO state the retry or later rewinds can observe. Forces exactly
+/// In-block re-roll residue gate: a discarded canvas attempt must leave NO
+/// state the retry or later rewinds can observe. Forces exactly
 /// one degenerate-reply re-roll per round (via cfg.degenerate_reply_check)
 /// inside the standing generate → rewind loop: regeneration must stay
 /// bit-identical across rounds and every rewind must restore the base
@@ -783,7 +783,7 @@ fn per_block_partial_commit_and_discard_consistency() {
     assert_eq!(fnv, fp0, "partial-commit turn left KV residue");
 }
 
-/// The standing rewind byte-consistency gate (PLAN "Token pipeline").
+/// The standing rewind byte-consistency gate.
 /// Seeded generate -> rewind loops must (a) restore the KV snapshot hash
 /// exactly after every rewind and (b) regenerate bit-identical replies at
 /// the same seed. Any lineage residue a rewind leaves behind fails one of
@@ -842,8 +842,8 @@ fn pipeline_rewind_kv_byte_consistency() {
     }
 }
 
-/// Long-context extension byte-consistency on a synthetic 100k KV (PLAN
-/// "Token pipeline"): a pseudorandom KV declared 100k tokens costs ~1 s
+/// Long-context extension byte-consistency on a synthetic 100k KV: a
+/// pseudorandom KV declared 100k tokens costs ~1 s
 /// instead of a ~7-minute prefill, and the gates only assert
 /// order-of-operations bit-identity, never semantics. For each delta
 /// (1 token, then 256 = one full chunk): extend → fingerprint; rewind →

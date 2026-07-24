@@ -34,9 +34,9 @@ fn layer0_live_bytes(session: &StepGenerateSession, kv_len: usize, max_seq: usiz
 /// reproducible across identical `reset_kv` + `extend_kv` cycles at 1200 tokens
 /// (measured: ~80% of bytes differ, and differ again on a third run, so it is
 /// not a stale-buffer function). Layer 0 clean + layer 1 dirty localizes that to
-/// layer 0's attention/MoE OUTPUT, amplified through depth. See task #99 — it is
+/// layer 0's attention/MoE OUTPUT, amplified through depth. This is
 /// a separate, pre-existing bug (this control touches neither `truncate_kv_to`
-/// nor `rollback_to`). Widen this assert to the whole blob once #99 lands.
+/// nor `rollback_to`). Widen this assert to the whole blob once that lands.
 #[test]
 fn layer0_prefill_kv_is_bit_reproducible() {
     let Some(dir) = crate::shaders::test_util::dgq_model_dir() else {
@@ -62,7 +62,7 @@ fn layer0_prefill_kv_is_bit_reproducible() {
     );
 }
 
-/// DIAGNOSTIC (task #99): is prefill reproducible across identical
+/// DIAGNOSTIC: is prefill reproducible across identical
 /// `reset_kv` + `extend_kv` cycles? Reports per-layer A-vs-B and B-vs-C byte
 /// diffs. B-vs-C is the discriminator: if A!=B but B==C, prefill is a
 /// deterministic function of stale buffer residue; if B!=C it is genuinely
@@ -144,7 +144,7 @@ fn prefill_nondeterminism_probe() {
     }
 }
 
-/// THE RING-TRUNCATE ORACLE (the gate `632aa69` was missing).
+/// THE RING-TRUNCATE ORACLE.
 ///
 /// INVARIANT: after `truncate_kv_to(n)`, the live KV must equal what a fresh
 /// prefill of the same `n` tokens produces. `snapshot_kv` gathers exactly each
@@ -157,7 +157,7 @@ fn prefill_nondeterminism_probe() {
 /// denoise still writes its canvas at `[kv_len, kv_len+CANVAS)` unconditionally
 /// (`kv_write_end = u32::MAX`). So after a short reply at `kv_len=2000`, slots
 /// 0..=207 hold positions 2048..=2255 while `kv_valid_tokens` still reads 2000 —
-/// under the ring size. `632aa69`'s predicate tested `old_len > ring`, called
+/// under the ring size. The initial predicate tested `old_len > ring`, called
 /// that safe, and `finalize`'s truncate then handed the next turn a window with
 /// 31 poisoned positions in it.
 ///
@@ -165,7 +165,7 @@ fn prefill_nondeterminism_probe() {
 /// poisoned by exactly the same mechanism as every other sliding layer, and its
 /// KV is attention-independent hence bit-reproducible — see
 /// `layer0_prefill_kv_is_bit_reproducible`. Layers 1..29 cannot be byte-compared
-/// today (task #99); widen this when that lands.
+/// today; widen this when that capability is available.
 ///
 /// This test FAILS on the pre-fix predicate (it takes the O(1) clamp path and
 /// slots 177..=207 differ) and passes on the corrected one.

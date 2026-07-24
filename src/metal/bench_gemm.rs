@@ -154,7 +154,7 @@ pub fn bench_gemm_block_q4(shapes: &[GemmShape], iters: usize) -> Result<Vec<Gem
     Ok(rows)
 }
 
-/// Tunable GEMM (task #19): sweeps TUNE_BM/TUNE_BN configs via
+/// Tunable GEMM: sweeps TUNE_BM/TUNE_BN configs via
 /// #define prepend; per-lane fragment loads (no simdgroup_load from tgmem).
 /// Each config is correctness-checked against gemm_block (expected BIT-exact:
 /// same K-chain, dequant, and bf16 rounding).

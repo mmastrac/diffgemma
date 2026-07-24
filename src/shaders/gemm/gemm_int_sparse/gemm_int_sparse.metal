@@ -1,10 +1,10 @@
-// int8-accumulated block-sparse MoE expert GEMM (E18 redirect prototype).
+// int8-accumulated block-sparse MoE expert GEMM.
 //
 // Standalone bench kernel — NOT wired to production. Settles whether skipping
 // the q4->half dequant + half-simdgroup-MMA path (the production
 // `gemm_tunable_sparse`) and accumulating `int += int8*int8` instead wins on
 // M3, where there is no dedicated tensor hardware and the synthetic microbench
-// is unreliable in absolute terms (see PLAN.md E18 redirect).
+// is unreliable in absolute terms.
 //
 // Dispatch contract mirrors `gemm_tunable_sparse` for direct comparability:
 //   - grid = (N/BN, num_blocks)

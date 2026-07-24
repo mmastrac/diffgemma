@@ -214,8 +214,8 @@ impl MemBudget {
         // serializes; a ticket at the back of a healthy FIFO waits as long as
         // the whole queue takes to drain. Measuring total wait made that
         // indistinguishable from a wedged holder, and once the suite outgrew
-        // the 600s default it failed 4 tests DETERMINISTICALLY (measured
-        // 2026-07-20: 706/4 by default vs 710/0 with DGQ_MEM_LOCK_TIMEOUT=0 —
+        // the 600s default it failed 4 tests DETERMINISTICALLY (706/4 by
+        // default vs 710/0 with DGQ_MEM_LOCK_TIMEOUT=0 —
         // no leak, no wedge, just a deadline that had stopped meaning
         // anything). Restarting the clock on progress restores the documented
         // intent: the error fires when NOTHING HAS MOVED for the timeout while

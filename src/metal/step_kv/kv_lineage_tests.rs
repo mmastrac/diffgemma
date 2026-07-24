@@ -46,12 +46,10 @@ fn kv_lineage_paths_are_fingerprint_identical() {
 /// rows the next build never writes, which is what made the q8 arm look
 /// path-dependent (see `q8_ring_wrap_divergence_probe`).
 ///
-/// This reproduces the LIVE configuration on the production f16 path — it
-/// was the real "KV-lineage drift" (not q8), and it is FIXED (2026-07-19):
-/// E20's kv-adaptive k is now derived per row inside the kernel from that
-/// row's own causal key count, instead of host-side from the dispatch's
-/// `t_total`. All three cases pass; before the fix the two multi-chunk ones
-/// forked.
+/// This reproduces the LIVE configuration on the production f16 path — the
+/// kv-adaptive k is derived per row inside the kernel from that row's own
+/// causal key count, instead of host-side from the dispatch's `t_total`.
+/// All three cases pass; before the fix the two multi-chunk ones forked.
 ///
 /// Kept as a GATE because the failing configuration is one the aligned
 /// matrix structurally cannot reach: the fork needed all three of a WRAPPED
@@ -64,7 +62,7 @@ fn kv_lineage_paths_are_fingerprint_identical() {
 ///
 /// CULPRIT (found via `kv_lineage_fork_attention_bisect`, which runs the
 /// live case under each attention lever — only `attn_topk=0` came back
-/// clean): **E20 top-k sparse attention**. Its kv-adaptive k was computed
+/// clean): **Top-k sparse attention**. Its kv-adaptive k was computed
 /// host-side as `(t_total/128).clamp(64,512)` from the DISPATCH's
 /// `t_total = kv_len + canvas`, so the same absolute position got a
 /// different k depending on how the prefill was chunked — k=114 on a fresh
@@ -443,9 +441,8 @@ fn unaligned_matrix(batch: Option<bool>) {
 
 /// Same matrix on Q8 KV.
 ///
-/// KNOWN RED — but NOT a ring/requant seam (forensics 2026-07-18, see
-/// `q8_ring_wrap_divergence_probe` + PLAN "q8 fast-prefill is broken
-/// wholesale"): the q8 fast-prefill FORWARD goes NaN after layer 0 —
+/// KNOWN RED — but NOT a ring/requant seam (see
+/// `q8_ring_wrap_divergence_probe`): the q8 fast-prefill FORWARD goes NaN after layer 0 —
 /// layer-0 Q/K/V land real in cache and arena, yet the attention output
 /// plane comes back non-finite (scalar AND mma2), so every later layer's
 /// K/V quantizes a NaN hidden stream into all-`-127` rows.
@@ -464,7 +461,7 @@ fn kv_lineage_paths_are_fingerprint_identical_q8() {
 }
 
 /// DIAGNOSTIC (run explicitly): the forensics battery that reframed the q8
-/// ring-wrap RED (2026-07-18). Findings, in the order the arms establish
+/// ring-wrap RED. Findings, in the order the arms establish
 /// them:
 ///   1. Scrubbed builds are deterministic AND path-independent (fresh ==
 ///      two-path); the original "divergence" needed cross-build residue.
@@ -614,7 +611,7 @@ fn q8_ring_wrap_divergence_probe() {
     // second build inherits the first's residue over rows this build never
     // writes (all the dead ones). Chunking then decides which dead bands
     // survive ring overwrites, which is what made it look chunking- and
-    // wrap-dependent. LESSON: scrub before comparing KV across builds.
+    // wrap-dependent. Scrub before comparing KV across builds.
     {
         let mut fl = crate::flags::RuntimeConfig::default();
         fl.kv.q8_override = Some(true);
@@ -749,9 +746,9 @@ fn lineage_matrix(force_q8: bool) {
     );
 }
 
-/// GENERATION determinism across context lengths (2026-07-19). Prefill KV is
-/// stable (`q8_ring_wrap_divergence_probe` F1-vs-F2) and golden is byte-exact,
-/// yet the SAME unmodified binary, same seed, same prompt produced different
+/// GENERATION determinism across context lengths. Prefill KV is stable
+/// (`q8_ring_wrap_divergence_probe` F1-vs-F2) and golden is byte-exact, yet
+/// the SAME unmodified binary, same seed, same prompt produced different
 /// longctx answers across two process runs — so the instability is in the
 /// generate path, not prefill. This runs the same generation twice IN-PROCESS
 /// from identical state and diffs the committed token ids, sweeping length to

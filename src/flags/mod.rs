@@ -116,7 +116,7 @@ impl EnvReader<'_> {
 
 // ---------------------------------------------------------------------------
 // Flag validation: a set-but-invalid DGQ_* value is fatal, never a silent
-// fallback to the default (user-directed 2026-07-18). Parse helpers record
+// fallback to the default. Parse helpers record
 // rejections here; `from_env` drains them and kills the process. Collected
 // rather than failing fast so ONE run reports EVERY bad flag.
 // ---------------------------------------------------------------------------
@@ -167,7 +167,7 @@ pub struct SamplerFlags {
     pub denoiser_argmax: bool,
     /// `DGQ_EARLY_STOP_MEAN_ENT` (nats; 0 disables). Default 0.05.
     pub early_stop_mean_ent: f32,
-    /// `DGQ_EMPTY_REPLY_RETRY`: E6 degenerate-first-block re-roll count. Default 3.
+    /// `DGQ_EMPTY_REPLY_RETRY`: degenerate-first-block re-roll count. Default 3.
     pub empty_reply_retry: u32,
     /// `DGQ_WS_BLOCK_STOP`: drop pure-whitespace committed blocks. Default OFF.
     pub ws_block_stop: bool,
@@ -194,7 +194,7 @@ pub struct SamplerFlags {
     /// neighbour (the duplication micro-stutter), so the tail re-denoises
     /// next block against committed context instead.
     ///
-    /// DEFAULT ON at 0.9 (user sign-off 2026-07-19). Census evidence
+    /// DEFAULT ON at 0.9. Census evidence
     /// (`census --arm ... --battery smoke --seeds 7,42,123`, ~13.7k
     /// committed rows per arm), dup tier alone vs off:
     ///   contested-committed 1.31 -> 1.03 per 1k rows
@@ -242,7 +242,7 @@ impl Default for SamplerFlags {
 /// Production perf toggles (all default ON, opt-out for A/B triage).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PerfFlags {
-    /// `DGQ_MOE_FUSE_GATHER`: fused gate_up A-gather in the tunable expert GEMM.
+    /// `DGQ_MOE_FUSE_GATHER`: fuse gather into gate_up expert GEMM.
     pub moe_fuse_gather: bool,
     /// `DGQ_MOE_PREFILL_BM`: 64|128 opt-in, else 32 (OFF).
     pub moe_prefill_block_m: u32,
@@ -260,22 +260,18 @@ pub struct PerfFlags {
     pub prefill_resident: bool,
     /// `DGQ_ATTN_KV_BLOCK`: block size for sequential full-attention. Default 0 (OFF).
     pub attn_kv_block: usize,
-    /// `DGQ_GEMM_ATTN` (E17): route full-layer PREFILL attention through the
+    /// `DGQ_GEMM_ATTN`: route full-layer PREFILL attention through the
     /// GEMM decomposition (attn_gemm_qk/softmax/pv) instead of attention_mma_full.
-    /// ~1.78x on the attention kernel, -16-19% real 30k prefill. Not bit-identical
-    /// (decomposition batch-softmax vs the flash kernel's online softmax) but
-    /// gate-passing (17/17 x{7,42,123}, longctx 4/4); signed off default ON
-    /// 2026-07-13. Denoise reuses the qk stage through E20 top-k (DGQ_ATTN_TOPK_DECODE). `=0` restores mma_full.
+    /// Not bit-identical but quality-gated. Denoise reuses the qk stage through
+    /// top-k (DGQ_ATTN_TOPK_DECODE). `=0` restores mma_full.
     pub gemm_attn: bool,
-    /// `DGQ_GEMM_ATTN_HC` (E17a): Q heads processed per E17 dispatch batch.
+    /// `DGQ_GEMM_ATTN_HC`: Q heads processed per dispatch batch.
     /// Bounds the S/P scratch to [HC][CANVAS][n_pad(max_seq)]. Default 16 (all
-    /// heads): the holistic prefill BO (task #88) found HC=16 the proxy optimum
-    /// at every kv (−0.3/1.5/3.1/3.6% at 2k/8k/30k/100k vs HC=4), and HC is
-    /// numerically invariant (per-head disjoint scratch), so this is a bit-
-    /// identical perf ship. Scratch ~1.6 GiB @100k on 36 GB; drop to 4 for very
-    /// long contexts if memory-pressured.
+    /// heads). HC is numerically invariant (per-head disjoint scratch).
+    /// Scratch ~1.6 GiB @100k on 36 GB; drop to 4 for very long contexts
+    /// if memory-pressured.
     pub gemm_attn_head_chunk: usize,
-    /// E17 tunable tile geometry (task #87 sweep). QK GEMM tile qk_bm x qk_bn,
+    /// Tunable tile geometry. QK GEMM tile qk_bm x qk_bn,
     /// PV GEMM tile pv_bm x pv_bn, softmax threads/row. Defaults reproduce the
     /// shipped 64x64/256 kernel. `DGQ_GEMM_ATTN_{QK_BM,QK_BN,PV_BM,PV_BN,SM_TPG}`.
     pub gemm_attn_qk_bm: usize,
@@ -283,63 +279,45 @@ pub struct PerfFlags {
     pub gemm_attn_pv_bm: usize,
     pub gemm_attn_pv_bn: usize,
     pub gemm_attn_sm_tpg: usize,
-    /// Holistic prefill sweep (task #88): dense tunable-GEMM tile + MoE-sparse
-    /// N-tile. Defaults reproduce the shipped kernels (64x64 dense, 128 sparse
-    /// N-tile with fixed 32-row block height). `DGQ_GEMM_TUNE_BM/BN`,
-    /// `DGQ_MOE_SPARSE_BN`.
+    /// Dense tunable-GEMM tile + MoE-sparse N-tile. Defaults reproduce the
+    /// shipped kernels (64x64 dense, 128 sparse N-tile with fixed 32-row block
+    /// height). `DGQ_GEMM_TUNE_BM/BN`, `DGQ_MOE_SPARSE_BN`.
     pub gemm_tune_bm: usize,
     pub gemm_tune_bn: usize,
     pub moe_sparse_bn: usize,
-    /// `DGQ_FLASH_PREFILL` (E18 sliding revival): fused flash for sliding-layer
-    /// PREFILL (hd=256, window=1024). Online softmax, register-resident O split
-    /// across 8 simdgroups, no per-chunk PV tgmem round-trip. Full hd=512 path
-    /// was 3× slower than E17 (disproven); at sliding shape flash is 2.4× faster
-    /// than attention_mma2. Default ON (quality: smoketest 17/17 ×{7,42,123},
-    /// longctx 4/4). `DGQ_FLASH_PREFILL=0` restores mma2. `bq`/`bk` = query-row
-    /// tile / key-block streamed.
+    /// `DGQ_FLASH_PREFILL`: fused flash for sliding-layer PREFILL (hd=256,
+    /// window=1024). Online softmax, register-resident O split across 8
+    /// simdgroups, no per-chunk PV tgmem round-trip. Default ON.
+    /// `DGQ_FLASH_PREFILL=0` restores mma2. `bq`/`bk` = query-row tile /
+    /// key-block streamed.
     pub flash_prefill: bool,
-    /// `DGQ_ATTN_MMA_FULL_QK_ILP2` (E5 ILP2): split the 32-deep serial QK dot
+    /// `DGQ_ATTN_MMA_FULL_QK_ILP2`: split the 32-deep serial QK dot
     /// in `attention_mma_full` into two interleaved 16-deep accumulator chains
-    /// (even/odd chunks), summed at the end. Halves the QK serial-dependency
-    /// depth. Non-bit-identical (FP-associativity); quality-gated. Default OFF.
+    /// (even/odd chunks), summed at the end. Non-bit-identical; quality-gated.
+    /// Default OFF.
     pub attn_mma_full_qk_ilp2: bool,
     pub flash_prefill_bq: usize,
     pub flash_prefill_bk: usize,
-    /// `DGQ_ATTN_TOPK` (E20): top-k sparse attention for full-layer PREFILL.
-    /// Reuses E17's QK kernel (+FC32 u16 key plane), selects the top-k
-    /// highest-scoring keys per (row, head) — exact by f32 score,
-    /// deterministic — and gathers V at those indices. Non-bit-identical to
-    /// dense. **Default ON (signed off 2026-07-16** after smoketest 17/17
-    /// ×{7,42,123}, longctx 4/4, needle-exact 4/4 @121k with dynamic k, and
-    /// 100k prefill within 2.5% of MLX; golden blessed on this default).
-    /// `DGQ_ATTN_TOPK=0` restores dense E17.
+    /// `DGQ_ATTN_TOPK`: top-k sparse attention for full-layer PREFILL.
+    /// Selects the top-k highest-scoring keys per (row, head) — exact by f32
+    /// score, deterministic — and gathers V at those indices. Non-bit-identical
+    /// to dense. Default ON. `DGQ_ATTN_TOPK=0` restores dense.
     pub attn_topk: bool,
     /// `DGQ_ATTN_TOPK_K`: k per query row. The kernel's slot capacity K_PAD is
     /// compiled to `next_power_of_two(k)` (min 64, max 1024) via
-    /// `attention_topk::tuned_source`, so any k in [1, 1024] is honored (task
-    /// #95 unblocked the knob — it used to clamp silently to 64). Default 64.
+    /// `attention_topk::tuned_source`, so any k in [1, 1024] is honored.
+    /// Default 64.
     pub attn_topk_k: usize,
-    /// `DGQ_ATTN_TOPK_DYN`: kv-adaptive k — per dispatch, k =
-    /// clamp(t_total/128, 64, 512), i.e. a constant ~0.8% FRACTION of context
-    /// instead of a constant count. Motivated by the E22-M0 finding that
-    /// attention mass DIFFUSES with depth (row-top-64 mass: 41% @12k -> 13%
-    /// @121k), while the findings-doc FLOP argument makes large k nearly free
-    /// at long T (QK dominates). Overrides DGQ_ATTN_TOPK_K when set; K_PAD
-    /// compiles at 512. **Default ON** (the ship policy — fixed k=64
-    /// measurably drops the deepest needle at 121k; dyn matches dense 4/4).
+    /// `DGQ_ATTN_TOPK_DYN`: kv-adaptive k — per dispatch, k is a constant
+    /// fraction of context instead of a constant count. Overrides DGQ_ATTN_TOPK_K
+    /// when set; K_PAD compiles at 512. Default ON.
     /// `DGQ_ATTN_TOPK_DYN=0` + `DGQ_ATTN_TOPK_K=n` restores fixed k.
     pub attn_topk_dyn: bool,
     /// `DGQ_ATTN_TOPK_DECODE`: top-k sparse attention for full-layer DENOISE
-    /// (decode) dispatches — the same 3-kernel E20 pipeline as prefill top-k,
-    /// causal=0, k from the same fixed/dyn policy. Denoise full-layer
-    /// attention is issue-bound in `attention_mma_full` (~705 ms/layer @100k
-    /// at canvas=256); the GEMM-decomp top-k runs the same work 3.1× faster
-    /// (100k e2e: 4.42→1.84 s/step). Non-bit-identical; every denoise step
-    /// compounds, so the gate is the multi-seed census + doc-QA ladder, not
-    /// needles. **Default ON (signed off 2026-07-16** after smoketest 17/17
-    /// ×{7,42,123}, longctx 4/4 kw 8/8 drift 0.0%, determinism ×8 short +
-    /// ×3 @45.6k, census parity; golden blessed on this default).
-    /// `DGQ_ATTN_TOPK_DECODE=0` restores dense mma_full denoise attention.
+    /// (decode) dispatches — the same pipeline as prefill top-k, causal=0,
+    /// k from the same fixed/dyn policy. Non-bit-identical; every denoise step
+    /// compounds, so the gate is the multi-seed census + doc-QA ladder.
+    /// Default ON. `DGQ_ATTN_TOPK_DECODE=0` restores dense attention.
     pub attn_topk_decode: bool,
 }
 
@@ -356,7 +334,7 @@ impl Default for PerfFlags {
 pub struct PrefillFlags {
     /// `DGQ_PREFILL_F16`: fp16 activation arena in fast prefill. Default OFF.
     pub f16: bool,
-    /// `DGQ_PREFILL_KV_F32`: E14 f32 side ring for sliding KV. Default OFF.
+    /// `DGQ_PREFILL_KV_F32`: f32 side ring for sliding KV. Default OFF.
     pub kv_f32: bool,
     /// `DGQ_FAST_PREFILL_MAX`: max prompt tokens the fast path handles (0 = uncapped).
     pub fast_prefill_max: usize,
@@ -376,7 +354,7 @@ impl Default for PrefillFlags {
 #[derive(Debug, Clone, PartialEq)]
 pub struct KvFlags {
     /// `DGQ_KV_Q8` override: `Some(true)` forces q8, `Some(false)` forces f16,
-    /// `None` = the auto policy. Unified 2026-07-11: `kv_format` and
+    /// `None` = the auto policy. `kv_format` and
     /// `estimate_resident_bytes` previously disagreed on non-`1`/`0` values;
     /// both now honor this bool identically (nobody relied on the divergence).
     pub q8_override: Option<bool>,
@@ -481,7 +459,7 @@ pub struct DebugFlags {
     pub dump_kv_path: Option<String>,
     /// `DGQ_TRACE_PMAX_JSONL=<path>`: append one JSON line per denoise step
     /// (per-position p_max/entropy/accept/argmax) plus a block-commit line —
-    /// the E7 M0 instrumentation (readback-only, zero behavior change).
+    /// the M0 instrumentation (readback-only, zero behavior change).
     pub trace_pmax_jsonl: Option<String>,
     /// `DGQ_DELIM_CHECK=1`: run the structural delimiter/parity checker on
     /// every committed block and log the verdict (see [`crate::delimiter`]).
@@ -498,7 +476,7 @@ pub struct DebugFlags {
     pub prefill_profile: bool,
     pub parity_debug: bool,
     /// `DGQ_KV_NOISE=<rel eps>`: perturb every live f16 KV value after prefill
-    /// (task #67 sensitivity probe). None = off.
+    /// (sensitivity probe). None = off.
     pub kv_noise: Option<f32>,
     /// `DGQ_KV_RING`: sliding-layer KV ring slots (power of two, min 2048 =
     /// window-1 + canvas live positions). Default 4096: the O(1)-truncate
@@ -508,10 +486,10 @@ pub struct DebugFlags {
     /// rebuild (≈ a full re-prefill of the kept prefix), for a fixed
     /// few-hundred-MB of extra sliding KV independent of context length.
     pub kv_ring_slots: usize,
-    /// `DGQ_KV_RING_UNCAPPED`: linear (no-wrap) sliding KV storage (task #64
-    /// ring-read isolation). Any set value enables.
+    /// `DGQ_KV_RING_UNCAPPED`: linear (no-wrap) sliding KV storage
+    /// (ring-read isolation). Any set value enables.
     pub kv_ring_uncapped: bool,
-    /// `DGQ_ARENA_F16_ALL`: build the MAIN activation set fp16 too (E11 bring-up
+    /// `DGQ_ARENA_F16_ALL`: build the MAIN activation set fp16 too (bring-up
     /// bisect). Any set value enables.
     pub arena_f16_all: bool,
     /// `DGQ_METAL_PIPELINE_CACHE` raw override (unset = None): `0`/`false`

@@ -1,5 +1,5 @@
 //! Pure-CPU validation of the flash block-streaming numerics (no GPU): the
-//! block-streaming online softmax must match E17's `cpu_causal` reference (which
+//! block-streaming online softmax must match the `cpu_causal` reference (which
 //! itself matches the shipped GPU decomposition within eps) for every block
 //! size — this pins the kernel's inner-loop rescale before any Metal exists.
 
@@ -34,7 +34,7 @@ fn assert_flash_matches(f: &crate::shaders::attention::Fixture, round_kv_f16: bo
     }
 }
 
-// Full-attention layer (hd=512, group 2) — E18's target shape — f16 + f32-side.
+// Full-attention layer (hd=512, group 2) — target shape for fused flash — f16 + f32-side.
 #[test]
 fn flash_blocked_matches_cpu_causal_full_hd512_f16() {
     assert_flash_matches(&full_hd512_fixture(ElemFormat::F32), true);
@@ -80,11 +80,11 @@ fn flash_gpu_full_grp2_causal_vs_cpu() {
     assert_oracle(&got, &oracle, 2e-2, 0.9999);
 }
 
-/// Isolated attention-kernel bench: E18 flash vs E17 GEMM-decomp vs
+/// Isolated attention-kernel bench: fused flash vs GEMM-decomposition vs
 /// attention_mma_full at real full-layer shape (canvas=256, 16 Q / 2 KV,
-/// hd=512). Ignored (timing). NOTE per the kv_block/holistic lesson: the
-/// isolated attention kernel OVER-weights attention vs real prefill — a win here
-/// is necessary but not sufficient; confirm on bench-prefill-super after wiring.
+/// hd=512). Ignored (timing). Note: isolated attention kernel measurements
+/// over-weight attention vs real prefill — a win here is necessary but not
+/// sufficient; confirm on real prefill benchmarks after integration.
 /// Run: `cargo test --release flash_bench -- --ignored --nocapture`
 #[cfg(target_os = "macos")]
 #[test]
@@ -110,11 +110,11 @@ fn flash_bench() {
     }
 }
 
-/// Confirmation (user's hypothesis): at hd=256 the O register cap relaxes, so
-/// flash can run larger BQ (16/32/64) → bigger MMA tiles. Compares flash at each
-/// BQ vs E17 at the SAME hd=256 full-attn shape. Ignored (timing).
-/// NOTE: hd=256 = the sliding layers, which in production are window-bounded
-/// (1024) — a win here is on a non-bottleneck. This just tests the tile physics.
+/// Hypothesis: at hd=256 the O register cap relaxes, so flash can run larger BQ
+/// (16/32/64) → bigger MMA tiles. Compares flash at each BQ vs the
+/// GEMM-decomposition at the same hd=256 full-attention shape. Ignored (timing).
+/// Note: hd=256 applies to sliding layers, which in production are
+/// window-bounded (1024) — measurements here test tile physics on a non-bottleneck.
 /// Run: `cargo test --release flash_bench_hd256 -- --ignored --nocapture`
 #[cfg(target_os = "macos")]
 #[test]

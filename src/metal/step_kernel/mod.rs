@@ -176,8 +176,8 @@ pub struct ModelLayout {
     pub layers: [LayerOffsets; N_LAYERS],
 }
 
-/// Which stage-2/3 pair rides on the shared E17 QK decomposition
-/// (`encode_attn_decomp`): E17's dense softmax+PV or E20's top-k pair.
+/// Which stage-2/3 pair rides on the shared QK decomposition
+/// (`encode_attn_decomp`): dense softmax+PV or top-k pair.
 #[derive(Clone, Copy)]
 enum AttnDecompKind {
     Gemm,
@@ -203,10 +203,10 @@ pub struct StepParams {
     /// pad K/V: on linear (full-attention) regions pad writes land past
     /// kv_len and are causally masked — harmless — but on the sliding RING
     /// they wrap onto (pad_pos & ring_mask) and CLOBBER the oldest live
-    /// window positions. That clobber (prompts > ring size, i.e. >2k tokens)
-    /// destroyed the window start on all 25 sliding layers and broke
-    /// long-prompt comprehension entirely (task #64). u32::MAX = no
-    /// suppression (denoise canvas writes must always land).
+    /// window positions. That clobber on long prompts (>2k tokens) destroyed
+    /// the window start on all 25 sliding layers and broke long-prompt
+    /// comprehension. u32::MAX = no suppression (denoise canvas writes must
+    /// always land).
     pub kv_write_end: u32,
 }
 
@@ -513,7 +513,7 @@ pub fn layer_kv_slots(is_full: bool, max_seq: usize) -> usize {
         // (layer 29 — the last region — is a full layer).
         (max_seq + 8).next_multiple_of(8)
     } else if crate::flags::kv_ring_uncapped_enabled() {
-        // DIAGNOSTIC (task #64 follow-up): linear sliding storage — no ring
+        // DIAGNOSTIC: linear sliding storage — no ring
         // wrap ever. Isolates ring-READ defects from everything else at the
         // cost of full-length sliding KV (fine to ~8k).
         max_seq.next_power_of_two()
@@ -735,7 +735,7 @@ struct StepPipelines {
     /// f32→bf16 convert with scale, for chunked SC softembed accumulator → half arena.
     f32_to_half_scale: ComputePipeline,
     qk_rope_kv: ComputePipeline,
-    /// E14 prefill variants (FC30, DGQ_PREFILL_KV_F32): rope also writes the
+    /// Prefill variants (FC30, DGQ_PREFILL_KV_F32): rope also writes the
     /// f32 side ring; mma2 reads K/V from it (all-float MMA). None = flag off.
     qk_rope_kv_side: Option<ComputePipeline>,
     attention_mma2_side: Option<ComputePipeline>,
@@ -746,23 +746,23 @@ struct StepPipelines {
     attention_mma2: ComputePipeline,
     /// MMA attention for full/global layers (`DGQ_ATTN_MMA_FULL`, register-O); scalar `attention` is the fallback/oracle.
     attention_mma_full: ComputePipeline,
-    /// E17 GEMM-attention for full-layer PREFILL (`DGQ_GEMM_ATTN`, default on):
+    /// GEMM-attention for full-layer PREFILL (`DGQ_GEMM_ATTN`, default on):
     /// [qk, softmax, pv]. Prefill runs the full decomp; denoise reuses the qk
-    /// stage through E20 top-k (`DGQ_ATTN_TOPK_DECODE`).
+    /// stage through top-k (`DGQ_ATTN_TOPK_DECODE`).
     attn_gemm: Option<[ComputePipeline; 3]>,
-    /// E17b f32-side-KV variant (FC30): reads the f32 side ring, all-float MMA.
+    /// f32-side-KV variant (FC30): reads the f32 side ring, all-float MMA.
     /// None unless DGQ_GEMM_ATTN && DGQ_PREFILL_KV_F32. Preferred over `attn_gemm`
     /// when present (matches attention_mma_full_side precision).
     attn_gemm_side: Option<[ComputePipeline; 3]>,
-    /// E20 top-k sparse attention for full layers, BOTH phases (`DGQ_ATTN_TOPK`
+    /// Top-k sparse attention for full layers, BOTH phases (`DGQ_ATTN_TOPK`
     /// prefill, `DGQ_ATTN_TOPK_DECODE` denoise — both default on):
-    /// [qk (reused from E17), topk_softmax, topk_pv]. Quality-gated
+    /// [qk (reused from GEMM-attention), topk_softmax, topk_pv]. Quality-gated
     /// (non-bit-identical).
     attn_topk: Option<[ComputePipeline; 3]>,
-    /// E20 f32-side-KV variant (FC30). None unless DGQ_ATTN_TOPK &&
+    /// f32-side-KV variant (FC30). None unless DGQ_ATTN_TOPK &&
     /// DGQ_PREFILL_KV_F32.
     attn_topk_side: Option<[ComputePipeline; 3]>,
-    /// E18 flash for sliding-layer PREFILL (`DGQ_FLASH_PREFILL`): hd=256,
+    /// Flash for sliding-layer PREFILL (`DGQ_FLASH_PREFILL`): hd=256,
     /// window-aware + ring-aware. None unless the flag is set.
     attn_flash_sliding: Option<ComputePipeline>,
     residual: ComputePipeline,
@@ -1117,7 +1117,7 @@ impl StepPipelines {
             attn_flash_sliding: {
                 let (on, bq, bk) = crate::flags::flash_prefill();
                 if on {
-                    // Sliding layers only (hd=256). Full hd=512 stays on E17.
+                    // Sliding layers only (hd=256). Full hd=512 stays on GEMM-attention.
                     Some(crate::shaders::attention_flash::pipeline_flash(
                         ctx, prod, bq, bk, 256,
                     )?)
@@ -1294,13 +1294,13 @@ pub(crate) struct StepBuffers {
     /// Online-softmax state (f32 m/l + unnormalized O per head x canvas row)
     /// persisted between sequential kv-block dispatches of attention_mma_full.
     attn_state: Retained<ProtocolObject<dyn MTLBuffer>>,
-    /// E17 GEMM-attention prefill scratch (`DGQ_GEMM_ATTN`): score matrix S
+    /// GEMM-attention prefill scratch (`DGQ_GEMM_ATTN`): score matrix S
     /// (f32), probs P (f16), row denoms lrow (f32) — sized
     /// [n_q_heads][CANVAS][n_pad(max_seq)]. None unless the flag is set.
     attn_gemm_s: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
     attn_gemm_p: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
     attn_gemm_lrow: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
-    /// E20 top-k sparse attention scratch (`DGQ_ATTN_TOPK`): compressed
+    /// Top-k sparse attention scratch (`DGQ_ATTN_TOPK`): compressed
     /// probs P [HC][CANVAS][K_PAD] (f32), top-k indices Idx [HC][CANVAS][K_PAD]
     /// (u32), row denoms lrow [HC][CANVAS] (f32). The S plane is SHARED with
     /// `attn_gemm_s` (identical layout; only one path is active at a time).
@@ -1309,7 +1309,7 @@ pub(crate) struct StepBuffers {
     attn_topk_idx: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
     attn_topk_lrow: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
     attn_topk_pat: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
-    /// E14 (DGQ_PREFILL_KV_F32): f32 side K/V ring for the sliding layers —
+    /// DGQ_PREFILL_KV_F32: f32 side K/V ring for the sliding layers —
     /// written by the prefill rope, read by the prefill attention, so chunk
     /// boundaries never round K/V to f16. Same slot = pos & ring_mask
     /// addressing as the f16 ring; per-layer byte offsets in
@@ -1338,7 +1338,7 @@ struct MoeGroupedGridInfo {
     tpg: u32,
     /// N-tile width of the tunable sparse pipelines (indirect slots 4/5).
     tunable_n_tile: u32,
-    /// N-tile width of the wide-block (E1, block_m != 32) tunable sparse
+    /// N-tile width of the wide-block (block_m != 32) tunable sparse
     /// pipelines — they pin BN=64. bucket_fill picks this for slots 4/5
     /// when dims.block_m != 32.
     tunable_wide_n_tile: u32,

@@ -89,7 +89,7 @@ pub(crate) struct StackedPipelineKey {
     k: u32,
     format: u32,
     stacked: StackedSegFc,
-    /// fp16 activation arena (FC9) — the compiled body differs (E11).
+    /// fp16 activation arena (FC9) — the compiled body differs.
     arena_f16: bool,
 }
 

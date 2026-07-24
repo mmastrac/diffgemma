@@ -7,8 +7,7 @@ use super::*;
 // ===========================================================================
 
 /// Hard-freeze of accepted canvas rows (`DGQ_FREEZE=1` re-enables the legacy
-/// behavior). Default OFF since 2026-07-05 (user sign-off): the freeze was
-/// PROVEN to be the flat-row wart driver (census 4/10 warty -> 0/10). OFF =
+/// behavior). Default OFF: the freeze was the flat-row wart driver. OFF =
 /// MLX/HF reference semantics (matches the CPU sampler in `sample.rs`): the
 /// accept set is re-decided from fresh entropies every step, accepted rows
 /// take that step's fresh denoiser token, dropped rows renoise, and the final
@@ -19,11 +18,10 @@ pub fn freeze_enabled() -> bool {
 }
 
 /// Commit the row argmax instead of the tempered categorical sample
-/// (`DGQ_DENOISER_ARGMAX=0` restores HF categorical). Default ON since
-/// 2026-07-05 (user sign-off): matches MLX's default user temperature=0
-/// denoiser — the linear schedule temperature only shapes entropy and the SC
-/// soft-embed, never the committed token. With no-freeze this is the
-/// MLX-exact config (gate 16,16,11; census 0/10 warty).
+/// (`DGQ_DENOISER_ARGMAX=0` restores HF categorical). Default ON:
+/// matches MLX's default user temperature=0 denoiser — the linear schedule
+/// temperature only shapes entropy and the SC soft-embed, never the committed
+/// token. With no-freeze this is the MLX-exact config.
 pub fn denoiser_argmax_enabled() -> bool {
     config().sampler.denoiser_argmax
 }
@@ -31,8 +29,7 @@ pub fn denoiser_argmax_enabled() -> bool {
 /// Entropy-only early stop (`DGQ_EARLY_STOP_MEAN_ENT=<nats>`; 0 disables).
 /// A denoise block stops as soon as the full-canvas mean entropy falls below
 /// this (after `min_early_stop_steps`), WITHOUT waiting for full argmax
-/// stability. DEFAULT ON at 0.05 (user sign-off 2026-07-06; probe answers
-/// byte-identical, multi-seed gate + wart census neutral).
+/// stability. DEFAULT ON at 0.05.
 pub fn early_stop_mean_ent() -> f32 {
     config().sampler.early_stop_mean_ent
 }
@@ -47,10 +44,9 @@ pub fn block_commit_retry() -> u32 {
     config().sampler.block_commit_retry
 }
 
-/// Empty/degenerate-reply retry (E6). On the FIRST denoise block only, if the
+/// Empty/degenerate-reply retry. On the FIRST denoise block only, if the
 /// committed canvas is degenerate, re-roll the initial canvas from the
-/// advancing seed stream and re-run, up to N times. DEFAULT 3 (user sign-off
-/// 2026-07-07; seed-123 gate answers 13→17, seeds 7/42 unchanged 17/17).
+/// advancing seed stream and re-run, up to N times. DEFAULT 3.
 /// `DGQ_EMPTY_REPLY_RETRY=0` disables.
 pub fn empty_reply_retry() -> u32 {
     config().sampler.empty_reply_retry
@@ -65,7 +61,7 @@ pub fn ws_block_stop_enabled() -> bool {
     config().sampler.ws_block_stop
 }
 
-/// TEST override for the denoise canvas width (E3/E6 shrink machinery). When
+/// TEST override for the denoise canvas width (shrink machinery). When
 /// set (`DGQ_FORCE_CANVAS=64|128|...`), every denoise step runs at this active
 /// canvas width instead of 256. `None` = normal (256). Clamped to [1, CANVAS]
 /// at the use site. Diagnostic only; not a product flag.
@@ -101,36 +97,35 @@ pub fn moe_fuse_gather_enabled() -> bool {
 }
 
 /// Weight-stationary expert GEMM for batched-prefill super-chunks
-/// (`DGQ_MOE_PREFILL_BM=64|128` opts in; default 32 = OFF). BUILT + DISPROVEN
-/// 2026-07-07 (ROADMAP E1): at M=1024 the expert GEMM is COMPUTE-bound at the
-/// ~2.3 TF/s kernel wall, so cutting weight bytes can't speed it (64 = wash,
-/// 128 = 3.6x slower via register spill). Machinery kept for re-tests.
+/// (`DGQ_MOE_PREFILL_BM=64|128` opts in; default 32 = OFF). At M=1024 the
+/// expert GEMM is compute-bound at the ~2.3 TF/s kernel wall, so cutting
+/// weight bytes can't speed it. Machinery kept for re-tests.
 pub fn moe_prefill_block_m() -> u32 {
     config().perf.moe_prefill_block_m
 }
 
-/// GQA matrix-unit attention on sliding layers (~3-4.5%/step). Non-bit-
-/// identical (f16 MMA vs f32 scalar) but quality-neutral (multi-seed + MLX
-/// bench). `DGQ_ATTN_MMA=0` restores the scalar kernel.
+/// GQA matrix-unit attention on sliding layers. Non-bit-
+/// identical (f16 MMA vs f32 scalar) but quality-neutral.
+/// `DGQ_ATTN_MMA=0` restores the scalar kernel.
 pub fn attn_mma_enabled() -> bool {
     config().perf.attn_mma
 }
 
 /// Matrix-unit attention on FULL layers (hd=512; attention -29% at kv=512).
-/// Non-bit-identical but quality-neutral (sign-off 2026-06-28).
+/// Non-bit-identical but quality-neutral.
 /// `DGQ_ATTN_MMA_FULL=0` restores the scalar kernel.
 pub fn attn_mma_full_enabled() -> bool {
     config().perf.attn_mma_full
 }
 
-/// E17: route full-layer PREFILL attention through the GEMM decomposition
-/// (attn_gemm_qk/softmax/pv) instead of attention_mma_full. ~1.78x on the
-/// attention kernel; not bit-identical (full quality gate). `DGQ_GEMM_ATTN=1`.
+/// Route full-layer PREFILL attention through the GEMM decomposition
+/// (attn_gemm_qk/softmax/pv) instead of attention_mma_full. Not bit-identical
+/// but quality-gated. `DGQ_GEMM_ATTN=1`.
 pub fn gemm_attn_enabled() -> bool {
     config().perf.gemm_attn
 }
 
-/// E17a: Q heads processed per E17 dispatch batch (`DGQ_GEMM_ATTN_HC`, default
+/// Q heads processed per dispatch batch (`DGQ_GEMM_ATTN_HC`, default
 /// 16 = all heads; drop to 4 for very long contexts if memory-pressured).
 /// Bounds the S/P prefill scratch; clamped to n_q_heads at dispatch. HC is
 /// numerically invariant (per-head disjoint scratch).
@@ -138,13 +133,13 @@ pub fn gemm_attn_head_chunk() -> usize {
     config().perf.gemm_attn_head_chunk
 }
 
-/// Holistic sweep (task #88): dense tunable-GEMM tile (bm, bn); default 64x64.
+/// Dense tunable-GEMM tile (bm, bn); default 64x64.
 pub fn gemm_tune_tile() -> (usize, usize) {
     let p = &config().perf;
     (p.gemm_tune_bm, p.gemm_tune_bn)
 }
 
-/// Holistic sweep (task #88): MoE-sparse N-tile; default 128 (block height
+/// MoE-sparse N-tile; default 128 (block height
 /// stays 32, baked into moe_bucket_fill).
 pub fn moe_sparse_bn() -> usize {
     config().perf.moe_sparse_bn
@@ -156,19 +151,19 @@ pub fn attn_mma_full_qk_ilp2() -> bool {
     config().perf.attn_mma_full_qk_ilp2
 }
 
-/// E20 enabled predicate (the only check `step_kernel` needs for routing).
+/// Top-k enabled predicate (the only check `step_kernel` needs for routing).
 pub fn attn_topk_enabled() -> bool {
     config().perf.attn_topk
 }
 
-/// E20 k per query row. Clamped to K_PAD at compile time host-side.
+/// K per query row. Clamped to K_PAD at compile time host-side.
 pub fn attn_topk_k() -> usize {
     config().perf.attn_topk_k.clamp(1, 1024)
 }
 /// Compile-time slot capacity for the top-k P/Idx planes: next power of two of
 /// the requested k, floored at the shipped 64 (kernel default) and capped at
 /// 1024. Pipeline compile (`tuned_source` AG_K_PAD) and the Rust-side plane
-/// allocations must BOTH use this — same value, one source (#97's lesson).
+/// allocations must BOTH use this — same value, one source.
 pub fn attn_topk_k_pad() -> usize {
     if attn_topk_dyn() {
         return 512; // dyn k caps at 512 (see attn_topk_k_cfg)
@@ -180,11 +175,11 @@ pub fn attn_topk_dyn() -> bool {
     config().perf.attn_topk_dyn
 }
 /// `DGQ_ATTN_TOPK_DECODE`: top-k sparse attention on full-layer DENOISE
-/// dispatches. Default ON (signed off 2026-07-16); =0 restores dense.
+/// dispatches. Default ON; =0 restores dense.
 pub fn attn_topk_decode_enabled() -> bool {
     config().perf.attn_topk_decode
 }
-/// E20 k config handed to `attn_topk_softmax`: `(fixed_k, dyn_divisor,
+/// Top-k config handed to `attn_topk_softmax`: `(fixed_k, dyn_divisor,
 /// k_min, k_max)`, with `dyn_divisor == 0` selecting `fixed_k`.
 ///
 /// Under kv-adaptive k (`DGQ_ATTN_TOPK_DYN`) the DIVISOR ships and the
@@ -219,14 +214,14 @@ pub fn attn_topk_k_cfg() -> [u32; 4] {
     }
 }
 
-/// E18 fused flash prefill. `.0` = enabled, `.1` = BQ (query-row tile), `.2` =
+/// Fused flash prefill. `.0` = enabled, `.1` = BQ (query-row tile), `.2` =
 /// BK (streamed key block). Default off / 16 / 64.
 pub fn flash_prefill() -> (bool, usize, usize) {
     let p = &config().perf;
     (p.flash_prefill, p.flash_prefill_bq, p.flash_prefill_bk)
 }
 
-/// E17 tunable tile config (task #87). Defaults reproduce the shipped
+/// Tunable tile config. Defaults reproduce the shipped
 /// 64x64/256 kernel. Returns (qk_bm, qk_bn, pv_bm, pv_bn, sm_tpg).
 pub fn gemm_attn_tile() -> (usize, usize, usize, usize, usize) {
     let p = &config().perf;
@@ -239,9 +234,8 @@ pub fn gemm_attn_tile() -> (usize, usize, usize, usize, usize) {
     )
 }
 
-/// Router-as-GEMM (~30ms/step). Non-bit-identical (near-tie expert flips =
-/// trajectory re-roll, not bias); accepted 2026-07-02 on multi-seed evidence
-/// and the gate was re-baselined with it. `DGQ_ROUTER_GEMM=0` restores the
+/// Router-as-GEMM. Non-bit-identical (near-tie expert flips =
+/// trajectory re-roll, not bias). `DGQ_ROUTER_GEMM=0` restores the
 /// serial router kernel.
 pub fn router_gemm_enabled() -> bool {
     config().perf.router_gemm
@@ -368,7 +362,7 @@ pub fn tool_compact_dir() -> PathBuf {
 }
 
 /// `DGQ_KV_MMAP=1`: back the session KV cache with a `MAP_SHARED` temp-file mmap
-/// (wrapped no-copy as the Metal buffer). Opt-in experiment. Default OFF.
+/// (wrapped no-copy as the Metal buffer). Opt-in. Default OFF.
 pub fn kv_mmap() -> bool {
     config().kv.mmap
 }
@@ -393,11 +387,11 @@ pub fn set_gpu_working_set_cap(bytes: u64) {
 }
 
 /// q8 KV cache storage. Group-32 symmetric i8 + f16 scales (0.92% rel-RMS),
-/// halves KV memory. **AUTO at long context since 2026-07-07**: enabled when
-/// the estimated f16 resident at `max_seq` would approach the GPU working-set
-/// cap, so very long sessions stay resident instead of swapping. `DGQ_KV_Q8=1`
-/// forces on, `=0` forces off. Format is fixed per session at open; every KV
-/// writer/reader compiles a matching function-constant variant.
+/// halves KV memory. Auto-enabled at long context when the estimated f16
+/// resident at `max_seq` would approach the GPU working-set cap, so very long
+/// sessions stay resident instead of swapping. `DGQ_KV_Q8=1` forces on, `=0`
+/// forces off. Format is fixed per session at open; every KV writer/reader
+/// compiles a matching function-constant variant.
 pub fn kv_format(max_seq: usize) -> crate::shaders::kv_quant::KvFormat {
     use crate::shaders::kv_quant::KvFormat;
     // Explicit override wins.
@@ -424,7 +418,7 @@ pub fn kv_format(max_seq: usize) -> crate::shaders::kv_quant::KvFormat {
     }
 }
 
-// Resident-memory model for the q4emb checkpoint (measured 2026-07-07; see
+// Resident-memory model for the q4emb checkpoint (see
 // `kv_format`): resident ≈ 19.73 GiB weights+arena + KV linear in tokens.
 const CTX_BASE_BYTES: f64 = 19.73 * 1024.0 * 1024.0 * 1024.0;
 const CTX_F16_KV_PER_TOKEN: f64 = 19.0 * 1024.0;
@@ -474,9 +468,8 @@ pub fn max_feasible_ctx(budget_bytes: u64) -> usize {
 }
 
 /// KV block size for sequential-block full-attention (`DGQ_ATTN_KV_BLOCK`;
-/// DEFAULT 0 = OFF). BIT-IDENTICAL to the monolithic pass but DISPROVEN AS A
-/// PERF LEVER 2026-07-06 (the SLC already serves the shared key stream in
-/// near-lockstep). Kept as scaffolding for a future parallel-split/quantized-KV pass.
+/// DEFAULT 0 = OFF). Bit-identical to the monolithic pass. Kept as scaffolding
+/// for a future parallel-split/quantized-KV pass.
 pub fn attn_kv_block() -> usize {
     config().perf.attn_kv_block
 }
@@ -517,27 +510,20 @@ pub fn prefill_resident_enabled() -> bool {
 /// heuristic default. Short prompts stay on the accurate f32 engine.
 pub const FAST_PREFILL_MIN_TOKENS: usize = 256;
 
-/// E11 (DISPROVEN as the long-prompt fix; kept as a diagnostic): fast prefill
-/// runs on fp16 activation-arena pipelines instead of bf16. The real cause of
-/// task #64 was the spurious encoder RmsNormHidden (fixed 2b0d12b). Opt-in.
+/// Fast prefill runs on fp16 activation-arena pipelines instead of bf16 (diagnostic). Opt-in.
 pub fn prefill_f16_enabled() -> bool {
     config().prefill.f16
 }
 
-/// E14: during fast prefill, sliding layers write/read K/V through an f32 side
-/// ring (window-sized) instead of the f16 monolithic cache — kills the
-/// chunk-boundary rounding that compounds through the causal chain and
-/// destroyed long-prompt comprehension (task #64/#67). Requires the MMA
+/// During fast prefill, sliding layers write/read K/V through an f32 side
+/// ring (window-sized) instead of the f16 monolithic cache. Requires the MMA
 /// prefill attention (default).
 pub fn prefill_kv_f32_enabled() -> bool {
     config().prefill.kv_f32
 }
 
 /// Max prompt length (tokens) the fast quantized prefill handles
-/// (`DGQ_FAST_PREFILL_MAX`; 0 = no cap). DEFAULT 0 (uncapped) since the task
-/// #64/#68 root-cause fix (2b0d12b, 2026-07-10): the length-dependent
-/// comprehension collapse was a spurious encoder-pass RmsNormHidden, not
-/// accumulating precision error.
+/// (`DGQ_FAST_PREFILL_MAX`; 0 = no cap). DEFAULT 0 (uncapped).
 pub fn fast_prefill_max_tokens() -> usize {
     config().prefill.fast_prefill_max
 }
@@ -590,8 +576,8 @@ pub fn final_entropy_log_enabled() -> bool {
 }
 
 /// Decode the answer-region argmax each denoise step and show it in the step
-/// progress line. Log-only — generation is bit-identical either way. DEFAULT ON
-/// since 2026-07-09. `DGQ_LOG_STEP_TEXT=0` disables.
+/// progress line. Log-only — generation is bit-identical either way. DEFAULT ON.
+/// `DGQ_LOG_STEP_TEXT=0` disables.
 pub fn step_text_log_enabled() -> bool {
     config().debug.step_text_log
 }
@@ -634,7 +620,7 @@ pub fn dump_kv_path() -> Option<String> {
     config().debug.dump_kv_path.clone()
 }
 
-/// E7 M0 p_max trace JSONL path (`DGQ_TRACE_PMAX_JSONL=<path>`).
+/// P_max trace JSONL path (`DGQ_TRACE_PMAX_JSONL=<path>`).
 pub fn trace_pmax_jsonl() -> Option<String> {
     config().debug.trace_pmax_jsonl.clone()
 }

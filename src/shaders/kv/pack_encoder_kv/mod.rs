@@ -86,9 +86,8 @@ pub fn dispatch_shape(
 }
 
 // Armor for the KV-plumbing family (`pack_encoder_kv` / `unpack_encoder_kv` /
-// `kv_f32_side_hydrate`) — the three kernels behind the 2026-07-10 ring-write
-// hazard postmortem that had NO coverage. These round-trip the encoder f32
-// K/V through the byte-packed monolithic cache and back, exercising the ring
+// `kv_f32_side_hydrate`) — these kernels round-trip the encoder f32 K/V
+// through the byte-packed monolithic cache and back, exercising the ring
 // slot arithmetic (`slot = pos & mask`) that clobbered live window slots when
 // it was wrong. Rounding-mode-robust by construction (see the module doc on
 // each test): f16 asserts bit-exact on f16-exact inputs, q8 asserts within the

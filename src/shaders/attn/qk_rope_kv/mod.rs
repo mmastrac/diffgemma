@@ -283,8 +283,7 @@ pub fn pipeline_for_kv(
     ctx.compile_subkernel_ex(SHADER, ENTRY, variant, fmt.label(), &[], &uints)
 }
 
-/// E14 prefill variant (FC30): sliding layers also write post-RoPE K /
-/// normed V into the f32 side ring (buffer 9).
+/// Sliding layers also write post-RoPE K / normed V into the f32 side ring (buffer 9).
 #[cfg(target_os = "macos")]
 pub fn pipeline_for_kv_side(
     ctx: &crate::metal::device::MetalContext,

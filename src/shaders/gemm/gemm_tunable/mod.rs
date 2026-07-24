@@ -1,4 +1,4 @@
-//! Tunable GEMM (task #19): fragment-level block GEMM with
+//! Tunable GEMM: fragment-level block GEMM with
 //! per-lane thread_elements() loads and vectorized loaders; tile geometry via
 //! TUNE_BM/TUNE_BN #define prepend. BIT-EXACT vs gemm_block (same ascending-K
 //! accumulation chain, dequant math, and store rounding) — verified per
@@ -49,7 +49,7 @@ pub fn pipeline_for_db(
     ctx.compile_gemm_subkernel(&src, ENTRY_DB, n, k, false, format as u32, false)
 }
 
-/// Tile-parameterized dense pipeline (task #88 holistic sweep). Production
+/// Tile-parameterized dense pipeline. Production
 /// passes the flag-driven tile; default (64x64) is byte-identical.
 #[cfg(target_os = "macos")]
 pub fn pipeline_for_tile(
@@ -138,11 +138,9 @@ pub fn stacked_pipeline_for(
 }
 
 /// Sparse (block-sparse MoE) tile config: BM fixed at the 32-row block height
-/// baked into moe_bucket_fill. BN=128 since 2026-07-07 (`bench-gemm --shapes
-/// sparse`, within-run A/B at the prefill distribution r64: gate_up 3.33 →
-/// 3.52 TF/s, down 3.36 → 3.63; denoise r16 neutral-to-+2%). Both MoE N dims
-/// (1408, 2816) divide 128 exactly; same 32-row block list; bit-identical
-/// (N-tile width never touches the per-output K-chain).
+/// baked into moe_bucket_fill. BN=128 for MoE N dims (1408, 2816) which divide
+/// 128 exactly; same 32-row block list; bit-identical (N-tile width never
+/// touches the per-output K-chain).
 pub const SPARSE_BM: usize = 32;
 pub const SPARSE_BN: usize = 128;
 
@@ -159,7 +157,7 @@ pub fn pipeline_for_sparse(
     format: QuantFormat,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
     // Block height stays SPARSE_BM=32 (baked into moe_bucket_fill); only the
-    // N-tile is tunable (task #88). Default moe_sparse_bn() = SPARSE_BN = 128.
+    // N-tile is tunable. Default moe_sparse_bn() = SPARSE_BN = 128.
     pipeline_for_sparse_tile(
         ctx,
         n,
@@ -173,9 +171,9 @@ pub fn pipeline_for_sparse(
 
 /// Tile-parameterized sparse variant. `bm` != 32 is the weight-stationary
 /// prefill experiment (DGQ_MOE_PREFILL_BM — requires the block list to be
-/// built at the same height via RouterDims.block_m; disproven as perf, kept
-/// opt-in). `bn` != 64 changes only the N-tile width (same 32-row block
-/// list; dispatch grid width must use the same bn).
+/// built at the same height via RouterDims.block_m; kept opt-in). `bn` != 64
+/// changes only the N-tile width (same 32-row block list; dispatch grid width
+/// must use the same bn).
 #[cfg(target_os = "macos")]
 pub fn pipeline_for_sparse_tile(
     ctx: &crate::metal::device::MetalContext,
@@ -203,7 +201,7 @@ pub fn pipeline_for_sparse_bm(
     format: QuantFormat,
     bm: usize,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    // The wide-block (E1) variants pin BN=64: bm=64 x BN=128 would be 32
+    // The wide-block variants pin BN=64: bm=64 x BN=128 would be 32
     // accumulator fragments (64 f32/lane) — the known register-spill regime.
     let bn = if bm == 32 { SPARSE_BN } else { 64 };
     pipeline_for_sparse_tile(ctx, n, k, gather, format, bm, bn)

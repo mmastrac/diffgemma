@@ -1,21 +1,20 @@
-//! E16 token-fusion oracle tests. Split from step_kv_bench_tests.rs;
+//! Token-fusion oracle tests. Split from step_kv_bench_tests.rs;
 //! shares its helpers via the sibling module.
 
 use super::engine_extend_bench_tests::{model_dir, synth_ids};
 use super::*;
 use crate::metal::device::MetalContext;
 
-/// E16-M0b (token fusion): how MERGEABLE are neighboring full-layer KV
-/// rows? Token fusion (CaM/KVMerger/Compressive-Transformer class) would
-/// coalesce aged rows of the 5 FULL layers (the only long-range memory =
-/// all the KV bytes and the O(kv_len) step cost). Merging by averaging is
-/// promising iff neighbors are correlated — and structurally they should
-/// be: proportional RoPE ropes only rot=hd/4 dims, so 75% of every
-/// full-layer K row is position-independent. Measures adjacent-row and
-/// block-of-4 cosine (K whole / K roped-dims / K unroped-dims / V), by
-/// age band, plus the constant-row-norm check (scalar k_norm → rows on a
-/// sphere). Full layers store linearly (slot == pos at any length), so a
-/// longer prompt is fine here.
+/// How MERGEABLE are neighboring full-layer KV rows? Token fusion
+/// (CaM/KVMerger/Compressive-Transformer class) would coalesce aged rows of
+/// the 5 FULL layers (the only long-range memory = all the KV bytes and the
+/// O(kv_len) step cost). Merging by averaging is promising iff neighbors are
+/// correlated — and structurally they should be: proportional RoPE ropes only
+/// rot=hd/4 dims, so 75% of every full-layer K row is position-independent.
+/// Measures adjacent-row and block-of-4 cosine (K whole / K roped-dims / K
+/// unroped-dims / V), by age band, plus the constant-row-norm check (scalar
+/// k_norm → rows on a sphere). Full layers store linearly (slot == pos at
+/// any length), so a longer prompt is fine here.
 #[test]
 #[ignore = "model-gated: cargo test --release e16_fusion_mergeability_stats -- --ignored --nocapture"]
 fn e16_fusion_mergeability_stats() {
@@ -159,17 +158,17 @@ fn e16_fusion_mergeability_stats() {
     }
 }
 
-/// E16-M0c (token fusion ORACLE): quality frontier of count-weighted KV
-/// fusion with ZERO kernel changes. Trick: prefill normally, then rewrite
-/// each aged full-layer block of r rows as r DUPLICATES of its mean-K /
-/// mean-V — duplicated keys contribute r·exp(q·k̄) to the softmax, which
-/// is EXACTLY the count-weighted merged-attention semantics a real fused
-/// kernel would implement (and duplicated V̄ gives the right weighted
-/// average). Then re-enter generation on the doctored cache (restore →
-/// mutate → generate re-entry skips prefill since kv_valid == prompt) and
-/// judge the doc_13k ladder question. Faithful to a real M1 including the
-/// merged-RoPE-position effect (we merge stored post-RoPE rows). Sliding
-/// layers untouched (they never see aged tokens anyway).
+/// Quality frontier of count-weighted KV fusion with ZERO kernel changes.
+/// Trick: prefill normally, then rewrite each aged full-layer block of r
+/// rows as r DUPLICATES of its mean-K / mean-V — duplicated keys contribute
+/// r·exp(q·k̄) to the softmax, which is EXACTLY the count-weighted
+/// merged-attention semantics a real fused kernel would implement (and
+/// duplicated V̄ gives the right weighted average). Then re-enter generation
+/// on the doctored cache (restore → mutate → generate re-entry skips prefill
+/// since kv_valid == prompt) and judge the doc_13k ladder question. Faithful
+/// to a real implementation including the merged-RoPE-position effect (we
+/// merge stored post-RoPE rows). Sliding layers untouched (they never see
+/// aged tokens anyway).
 #[test]
 #[ignore = "model-gated: cargo test --release e16_fusion_oracle_replay -- --ignored --nocapture"]
 fn e16_fusion_oracle_replay() {
@@ -393,7 +392,7 @@ fn e16_fusion_oracle_replay() {
     }
 }
 
-/// E16 multi-needle oracle: binomial-strength fusion-quality stats,
+/// Multi-needle oracle: binomial-strength fusion-quality stats,
 /// carrier-selectable (`DGQ_E16_CARRIER`: text file path; default = the
 /// English markdown fixture — run it on code/log carriers too, the
 /// mergeability census showed raw K-similarity is mostly model-intrinsic

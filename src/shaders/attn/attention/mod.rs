@@ -285,7 +285,7 @@ pub fn pipeline_mma2_for_kv(
     ctx.compile_subkernel_ex(SHADER_MMA2, ENTRY_MMA2, variant, label, &[], &uints)
 }
 
-/// E14 prefill variant (FC30): sliding K/V read from the f32 side ring,
+/// Prefill variant (FC30): sliding K/V read from the f32 side ring,
 /// all-float MMA. See attention_mma2.metal.
 #[cfg(target_os = "macos")]
 pub fn pipeline_mma2_for_kv_side(
@@ -302,7 +302,7 @@ pub fn pipeline_mma2_for_kv_side(
     ctx.compile_subkernel_ex(SHADER_MMA2, ENTRY_MMA2, variant, &label, &bools, &uints)
 }
 
-/// E14 prefill variant (FC30) for FULL layers: linear f32 side K/V,
+/// Prefill variant (FC30) for FULL layers: linear f32 side K/V,
 /// all-float MMA. See attention_mma_full.metal. FC31 (QK_ILP2) is set when
 /// `DGQ_ATTN_MMA_FULL_QK_ILP2` is on.
 #[cfg(target_os = "macos")]
@@ -884,7 +884,6 @@ mod tests {
     }
 
     // ---- Matrix-unit (flash) paths: parity vs the same CPU oracle ----
-    // (1-head attention_mma deleted 2026-07-02: superseded by mma2/mma_full.)
 
     // ---- Full-layer MMA path (register-O, QG-grouped K/V): parity vs oracle ----
 

@@ -1,4 +1,4 @@
-//! E14: (re)hydrate a sliding layer's f32 side KV ring from the monolithic
+//! (Re)hydrate a sliding layer's f32 side KV ring from the monolithic
 //! cache (f16 or q8 source) — used when a fast prefill resumes at an offset
 //! the side ring is not valid for.
 

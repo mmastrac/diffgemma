@@ -59,7 +59,7 @@ pub fn bench_step_kernel_encode_subprofile(
     if crate::flags::trace_ranges_enabled() {
         // Warm to a steady-state (denoised) step, then trace one step's ranges.
         // Under DGQ_PREFILL_F16 the traced step runs on the fp16 pipeline set
-        // (per-stage localization for the E11 arena dtype flip).
+        // (per-stage localization for the arena dtype flip).
         rt.arena_f16_mode = rt.pipelines_prefill_f16.is_some();
         rt.run_forward_once(cfg.finish)?;
         rt.trace_step_ranges()?;
@@ -70,9 +70,8 @@ pub fn bench_step_kernel_encode_subprofile(
     Ok(prof)
 }
 
-/// Holistic prefill proxy (task #87): build the runtime (compiling pipelines
-/// per the current tile flags) and time one M=1024 super-chunk at `kv_len`.
-/// Returns mean ms/super-chunk.
+/// Build the runtime (compiling pipelines per the current tile flags) and
+/// time one M=1024 super-chunk at `kv_len`. Returns mean ms/super-chunk.
 pub fn bench_step_kernel_prefill_super(
     model_dir: &Path,
     cfg: StepSmokeConfig,

@@ -8,9 +8,9 @@ using namespace metal;
 #include "arena.metal"
 #include "gemm_stacked_fc.metal"
 
-/// TUNABLE GEMM (task #19): fragment-level block GEMM.
+/// TUNABLE GEMM: fragment-level block GEMM.
 ///
-/// The 2026-07-02 bench prototypes proved macro tiling alone cannot reach
+/// The bench prototypes proved macro tiling alone cannot reach
 /// the MPS/MLX 3.4-4.4 TF/s at our shapes; the delta is fragment-level
 /// codegen.
 /// - per-lane thread_elements() fragment loads with compile-time strides
@@ -39,7 +39,7 @@ constant uint TM = BM / 16u; // 8x8 fragments per simdgroup along M
 constant uint TN = BN / 16u; // 8x8 fragments per simdgroup along N
 
 // Shared NT fragment tiler (frag_mma_ktile + frag_lane_coords) — the same MMA
-// core attention_gemm (E17) reuses; only the tile loaders differ per op.
+// core attention_gemm reuses; only the tile loaders differ per op.
 #define FRAG_BM TUNE_BM
 #define FRAG_BN TUNE_BN
 #include "gemm_frag_tile.metal"

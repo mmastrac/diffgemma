@@ -9,7 +9,7 @@ using namespace metal;
 
 /// Read one activation arena slot into half — bf16->f32->half by default
 /// (exact: bf16's 8 mantissa bits fit half's 10), direct reinterpret under
-/// K_ARENA_F16 (E11 fp16 prefill stream). Matches arena_store's precision.
+/// K_ARENA_F16 (fp16 prefill stream). Matches arena_store's precision.
 inline half arena_act_half(device const ushort *x, ulong i) {
     return K_ARENA_F16 ? as_type<half>(x[i]) : half(bf16_to_f32(x[i]));
 }

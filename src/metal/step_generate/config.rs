@@ -3,7 +3,7 @@ use crate::sample::SamplerConfig;
 
 /// Per-denoise-step progress snapshot for live UIs (chat streaming/spinner).
 /// `argmax` is the **active** canvas slice only (not stale rows past
-/// `active_canvas` after E6 shrink-on-retry). Under the MLX-exact sampler the
+/// `active_canvas` after shrink-on-retry). Under the MLX-exact sampler the
 /// block's final commit IS that slice, so a stable prefix is a faithful preview.
 pub struct StepProgressEvent<'a> {
     /// 1-based committed-block index this step belongs to.
@@ -19,7 +19,7 @@ pub struct StepProgressEvent<'a> {
     pub accept_count: u32,
     /// Mean per-position entropy (nats) this step.
     pub mean_entropy: f32,
-    /// True when this block's argmax is finalized and will not be E6-retried.
+    /// True when this block's argmax is finalized and will not be retried.
     /// Mid-attempt "would-stop" steps stay false so stream mappers never commit
     /// a discarded empty/degenerate canvas (which used to splice a second
     /// `<|channel>thought` into `reasoning_content`).
@@ -85,7 +85,7 @@ pub struct StepGenerateConfig {
     /// contains chat markup), not a stop — the scan skips it instead of
     /// truncating the call mid-arg. `None` preserves the plain scan.
     pub quote_token_id: Option<u32>,
-    /// E6 empty/degenerate-reply canvas re-roll (with `DGQ_EMPTY_REPLY_RETRY>0`).
+    /// Empty/degenerate-reply canvas re-roll (with `DGQ_EMPTY_REPLY_RETRY>0`).
     /// Given the first block's committed argmax, returns true when it renders as
     /// an empty user-facing reply (eos-first canvas OR `<|channel>thought`
     /// ceremony) — checked against the real decoded+sanitized output, not a

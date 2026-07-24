@@ -6,7 +6,7 @@
 //   7  K_DEBUG_FAST     bool   shape/dim/index bounds (cheap; P3.7)
 //   8  K_DEBUG_DEEP     bool   NaN/Inf scans (expensive; P3.7)
 //   9  K_ARENA_F16      bool   activation-arena slots are fp16 instead of bf16
-//                              (E11 fp16 prefill stream; unset/false = bf16)
+//                              (fp16 prefill stream; unset/false = bf16)
 //
 // Per-kernel semantic axes (4+ except 7-9): declared in that kernel's entry file only.
 

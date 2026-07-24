@@ -1,7 +1,7 @@
 use super::{KvId, PipelineEvent, PipelineOp, PipelineStage};
 
-/// Chain stage — the model-guided tool-call repair loop (user design
-/// 2026-07-17): when a tool-mode reply ends with INVALID tool grammar
+/// Chain stage — the model-guided tool-call repair loop: when a tool-mode
+/// reply ends with INVALID tool grammar
 /// (incomplete call — the premature-stop strain symptom — or unparseable
 /// calls), do not blindly re-roll. Feed the model a synthetic tool RESPONSE
 /// describing the error and let it emit a corrected call; then Rewind to the
