@@ -55,6 +55,10 @@ pub enum ChatEvent {
         stopped: bool,
         text: String,
     },
+    /// A low-priority, model-drafted guess at the user's *next* message,
+    /// produced after the reply. `turn` is the upcoming turn it would seed.
+    /// Advisory: a driver may submit it verbatim, edit it, or ignore it.
+    Suggestion { turn: u64, text: String },
 }
 
 /// Token-id → text decoding, abstracted so the decoder is testable without the
@@ -274,6 +278,19 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn suggestion_event_serializes_tagged() {
+        let ev = ChatEvent::Suggestion {
+            turn: 3,
+            text: "Sounds good — ship it.".to_string(),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"suggestion","turn":3,"text":"Sounds good — ship it."}"#
+        );
     }
 
     #[test]
