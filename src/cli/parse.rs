@@ -63,6 +63,11 @@ pub(crate) fn parse_cli() -> Cli {
     let mut kernel_debug_deep = false;
     let mut output_dir: Option<PathBuf> = None;
     let mut quant_profile = String::from("q4");
+    // `download` options: HF repo, revision, and full re-fetch.
+    let mut download_repo: Option<String> = None;
+    let mut download_revision = String::from("main");
+    let mut download_force = false;
+    let mut download_jobs = 4usize;
     let mut bench_gemm_shapes = String::from("256x2816x2816,33x2816x1408");
     // Tunable prefill-attention sweep (bench-prefill-attn).
     let mut ag_qk_bm = 64usize;
@@ -447,6 +452,25 @@ pub(crate) fn parse_cli() -> Cli {
                 }
             }
             "--raw" => raw_prompt = true,
+            "--repo" => {
+                if let Some(v) = args.next() {
+                    download_repo = Some(v);
+                }
+            }
+            "--revision" => {
+                if let Some(v) = args.next() {
+                    download_revision = v;
+                }
+            }
+            "--force" => download_force = true,
+            "--jobs" => {
+                if let Some(v) = args.next() {
+                    download_jobs = v.parse().unwrap_or_else(|_| {
+                        eprintln!("invalid --jobs");
+                        std::process::exit(2);
+                    });
+                }
+            }
             "--max-seq" => {
                 if let Some(v) = args.next() {
                     step_max_seq = v.parse().unwrap_or_else(|_| {
@@ -643,6 +667,15 @@ pub(crate) fn parse_cli() -> Cli {
                 profile: quant_profile,
             }
         }
+        Some("download") => Command::Download {
+            // Default repo/dest mirror the model card; -o overrides the target.
+            repo: download_repo
+                .unwrap_or_else(|| "mmastrac/diffusiongemma-q4emb".to_string()),
+            revision: download_revision,
+            dest: output_dir.unwrap_or_else(|| PathBuf::from("model/diffusiongemma-q4emb")),
+            force: download_force,
+            jobs: download_jobs,
+        },
         Some("step-smoke") => Command::StepSmoke {
             layers: bench_layers.clamp(1, 30),
             steps: steps_parity.max(1),
@@ -979,7 +1012,7 @@ pub(crate) fn parse_cli() -> Cli {
                 "  default (no command): generate-monolithic on .dgq, else generate-gpu (bf16)"
             );
             eprintln!(
-                "  main: ask | chat | serve | replay | smoketest | census | golden | quantize | tokenize <text>"
+                "  main: ask | chat | serve | download | replay | smoketest | census | golden | quantize | tokenize <text>"
             );
             eprintln!("  info: summary | config | manifest | weights <name> | probe-device");
             eprintln!(

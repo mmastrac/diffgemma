@@ -16,6 +16,7 @@ mod bench;
 mod census;
 mod chat;
 mod common;
+mod download;
 mod fit_token_probe;
 mod gen_cmd;
 mod golden_cmd;
@@ -31,6 +32,7 @@ mod step_gate;
 pub(crate) use bench::*;
 pub(crate) use chat::*;
 pub(crate) use common::*;
+pub(crate) use download::*;
 pub(crate) use fit_token_probe::*;
 pub(crate) use gen_cmd::*;
 pub(crate) use golden_cmd::*;
@@ -591,6 +593,13 @@ pub(crate) fn dispatch(cli: Cli) -> ExitCode {
         #[cfg(not(target_os = "macos"))]
         Command::Replay { .. } => ExitCode::FAILURE,
         Command::Quantize { output, profile } => run_quantize(&cli.model_dir, &output, &profile),
+        Command::Download {
+            repo,
+            revision,
+            dest,
+            force,
+            jobs,
+        } => run_download(&repo, &revision, &dest, force, jobs),
         Command::Tokenize(text) => run_tokenize(&cli.model_dir, &text, cli.raw_prompt),
         Command::Gemm { size } => run_gemm(size),
         Command::ProbeDevice => run_probe_device(),
@@ -668,6 +677,7 @@ pub(crate) fn run_command(
         Command::Gemm { .. } => ExitCode::FAILURE,
         Command::ProbeDevice { .. } => ExitCode::FAILURE,
         Command::Quantize { .. } => ExitCode::FAILURE,
+        Command::Download { .. } => ExitCode::FAILURE,
         Command::BenchGemm { .. } => ExitCode::FAILURE,
         Command::BenchPrefillAttn { .. } => ExitCode::FAILURE,
         Command::StepSmoke { .. } => ExitCode::FAILURE,

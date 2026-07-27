@@ -85,6 +85,16 @@ pub(crate) enum Command {
         output: PathBuf,
         profile: String,
     },
+    /// Fetch a `.dgq` model from HuggingFace into a local model dir.
+    Download {
+        repo: String,
+        revision: String,
+        dest: PathBuf,
+        /// Re-fetch every file even if already present locally or cached.
+        force: bool,
+        /// Parallel byte-range chunk fetches for the large blob.
+        jobs: usize,
+    },
     StepSmoke {
         layers: usize,
         steps: usize,

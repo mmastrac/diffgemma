@@ -27,6 +27,7 @@ dependencies = [
  "objc2-metal",
  "serde",
  "serde_json",
+ "shell-download",
 ]
 
 [[package]]
@@ -153,6 +154,12 @@ dependencies = [
  "serde_core",
  "zmij",
 ]
+
+[[package]]
+name = "shell-download"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e84488ad03fb880b07044ec9440360abcf0c6a0fcffe40deb20fd857d9ff9a5a"
 
 [[package]]
 name = "syn"
