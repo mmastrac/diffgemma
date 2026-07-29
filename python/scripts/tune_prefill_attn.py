@@ -91,6 +91,7 @@ def run_bench(binary: Path, kv_len: int, iters: int, side: bool, cfg: dict,
             "DGQ_GEMM_TUNE_BN": str(cfg["gemm_bn"]),
             "DGQ_MOE_SPARSE_BN": str(cfg["moe_bn"]),
             "DGQ_MOE_PREFILL_BM": str(cfg["moe_prefill_bm"]),
+            "DGQ_GEMM_W32": str(cfg["gemm_w32"]),
         })
     # E17 path selection + E5 ILP2 (proxy only — these are full-prefill knobs,
     # not isolated-attention-kernel params). mma_full_qk_ilp2 is only active
@@ -159,6 +160,10 @@ def main() -> int:
             cfg["moe_bn"] = trial.suggest_categorical("moe_bn", BN_CHOICES)
             cfg["moe_prefill_bm"] = trial.suggest_categorical(
                 "moe_prefill_bm", MOE_PREFILL_BM_CHOICES)
+            # Aligned u32 weight-byte loads (bit-identical; DGQ_GEMM_W32).
+            # Flat at the default tiles in the single-axis A/B; joint axis so
+            # TPE can test whether it shifts the tile optimum.
+            cfg["gemm_w32"] = trial.suggest_categorical("gemm_w32", [0, 1])
             # E17 path + E5 ILP2 — only meaningful together (ILP2 grafts onto
             # mma_full, which is the E17-off path). Categorical so TPE can
             # explore the joint {gemm_attn, ilp2} space, not just default × ILP2.
@@ -211,12 +216,20 @@ def main() -> int:
                    "hc": 16, "sm_tpg": 256}
     if args.proxy:
         default_cfg.update({"gemm_bm": 64, "gemm_bn": 64, "moe_bn": 128,
-                            "moe_prefill_bm": 32,
+                            "moe_prefill_bm": 32, "gemm_w32": 0,
                             "gemm_attn": 1, "mma_full_qk_ilp2": 0,
                             "n_subs": 4})
     if not (args.storage and any(
             t.params == default_cfg for t in study.get_trials(deepcopy=False))):
         study.enqueue_trial(default_cfg)
+    # Also pin default-tiles + W32 so the single-axis effect is measured
+    # in-study alongside the joint search.
+    if args.proxy:
+        w32_cfg = dict(default_cfg)
+        w32_cfg["gemm_w32"] = 1
+        if not (args.storage and any(
+                t.params == w32_cfg for t in study.get_trials(deepcopy=False))):
+            study.enqueue_trial(w32_cfg)
 
     path = "PROXY:super-chunk" if args.proxy else ("f32-side" if args.side else "f16")
     print(f"tuning prefill-attn ({path}, kv={args.kv_len}, {args.trials} trials, "

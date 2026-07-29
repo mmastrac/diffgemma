@@ -30,6 +30,9 @@ using namespace metal;
 #ifndef TUNE_BN
 #define TUNE_BN 64
 #endif
+#ifndef TUNE_W32
+#define TUNE_W32 0
+#endif
 
 constant uint BM = TUNE_BM;
 constant uint BN = TUNE_BN;
@@ -43,6 +46,19 @@ constant uint TN = BN / 16u; // 8x8 fragments per simdgroup along N
 #define FRAG_BM TUNE_BM
 #define FRAG_BN TUNE_BN
 #include "gemm_frag_tile.metal"
+
+/// Little-endian u32 from 4 packed q4 nibble bytes. Under TUNE_W32 an aligned
+/// pointer takes a single u32 load; the byte assembly is the same-value
+/// fallback (and the only path at TUNE_W32=0).
+inline uint tunable_load_u32_le(device const uchar *p) {
+#if TUNE_W32
+    if (((ulong)p & 3ul) == 0ul) {
+        return *(device const uint *)p;
+    }
+#endif
+    return uint(p[0]) | (uint(p[1]) << 8u) | (uint(p[2]) << 16u) |
+        (uint(p[3]) << 24u);
+}
 
 /// A-tile loader: vectorized 4-wide bf16(or f16)->half loads, per-4 row guard.
 inline void tunable_load_a(
@@ -160,8 +176,7 @@ kernel void gemm_tunable(
                     for (uint j8 = 0u; j8 < w_cols; j8 += 8u) {
                         const uint jj = w_q + j8;
                         device const uchar *p = g + 4u + jj / 2u;
-                        const uint v = uint(p[0]) | (uint(p[1]) << 8u) |
-                            (uint(p[2]) << 16u) | (uint(p[3]) << 24u);
+                        const uint v = tunable_load_u32_le(p);
                         const half4 q0 = half4(
                             half(v & 0xFu), half((v >> 4u) & 0xFu),
                             half((v >> 8u) & 0xFu), half((v >> 12u) & 0xFu));
@@ -331,8 +346,7 @@ kernel void gemm_tunable_db(
                 for (uint j8 = 0u; j8 < w_cols; j8 += 8u) {
                     const uint jj = w_q + j8;
                     device const uchar *p = g + 4u + jj / 2u;
-                    const uint v = uint(p[0]) | (uint(p[1]) << 8u) |
-                        (uint(p[2]) << 16u) | (uint(p[3]) << 24u);
+                    const uint v = tunable_load_u32_le(p);
                     const half4 q0 = half4(
                         half(v & 0xFu), half((v >> 4u) & 0xFu),
                         half((v >> 8u) & 0xFu), half((v >> 12u) & 0xFu));
@@ -391,8 +405,7 @@ kernel void gemm_tunable_db(
                         for (uint j8 = 0u; j8 < w_cols; j8 += 8u) {
                             const uint jj = w_q + j8;
                             device const uchar *p = g + 4u + jj / 2u;
-                            const uint v = uint(p[0]) | (uint(p[1]) << 8u) |
-                                (uint(p[2]) << 16u) | (uint(p[3]) << 24u);
+                            const uint v = tunable_load_u32_le(p);
                             const half4 q0 = half4(
                                 half(v & 0xFu), half((v >> 4u) & 0xFu),
                                 half((v >> 8u) & 0xFu), half((v >> 12u) & 0xFu));
@@ -524,8 +537,7 @@ kernel void gemm_tunable_stacked(
                     for (uint j8 = 0u; j8 < w_cols; j8 += 8u) {
                         const uint jj = w_q + j8;
                         device const uchar *pp = g + 4u + jj / 2u;
-                        const uint v = uint(pp[0]) | (uint(pp[1]) << 8u) |
-                            (uint(pp[2]) << 16u) | (uint(pp[3]) << 24u);
+                        const uint v = tunable_load_u32_le(pp);
                         const half4 q0 = half4(
                             half(v & 0xFu), half((v >> 4u) & 0xFu),
                             half((v >> 8u) & 0xFu), half((v >> 12u) & 0xFu));
@@ -713,8 +725,7 @@ kernel void gemm_tunable_sparse(
                     for (uint j8 = 0u; j8 < w_cols; j8 += 8u) {
                         const uint jj = w_q + j8;
                         device const uchar *pp = g + 4u + jj / 2u;
-                        const uint v = uint(pp[0]) | (uint(pp[1]) << 8u) |
-                            (uint(pp[2]) << 16u) | (uint(pp[3]) << 24u);
+                        const uint v = tunable_load_u32_le(pp);
                         const half4 q0 = half4(
                             half(v & 0xFu), half((v >> 4u) & 0xFu),
                             half((v >> 8u) & 0xFu), half((v >> 12u) & 0xFu));

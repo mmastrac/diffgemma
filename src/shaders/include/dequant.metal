@@ -384,6 +384,26 @@ inline void dequant_nvfp4_tile_half_fused_tg_range(
     uint col_count
 ) {
     uint data_len = (K + 1u) / 2u;
+#if defined(TUNE_W32) && TUNE_W32
+    // An 8-column chunk starting at a multiple of 8 lies inside one 16-wide
+    // group: one aligned u32 load covers its 8 nibbles and the group scale
+    // decodes once instead of per column. Per-output half(e2m1*scale) is the
+    // same expression as the scalar loop below, which stays the fallback for
+    // unaligned rows — either path is bit-identical.
+    if (((col_start | col_count) & 7u) == 0u && ((ulong)row & 3ul) == 0ul) {
+        for (uint c = 0u; c < col_count; c += 8u) {
+            const uint col0 = col_start + c;
+            const uint g = col0 / 16u;
+            const float scale = fp8_e4m3_to_f32(row[data_len + g]) * gscale;
+            const uint v = *(device const uint *)(
+                row + (ulong)g * 8ul + (ulong)((col0 & 15u) >> 1));
+            for (uint i = 0u; i < 8u; ++i) {
+                out[c + i] = half(e2m1_to_f32((v >> (4u * i)) & 0xFu) * scale);
+            }
+        }
+        return;
+    }
+#endif
     for (uint i = 0u; i < col_count; ++i) {
         const uint col = col_start + i;
         const uint g = col / 16u;

@@ -285,6 +285,11 @@ pub struct PerfFlags {
     pub gemm_tune_bm: usize,
     pub gemm_tune_bn: usize,
     pub moe_sparse_bn: usize,
+    /// `DGQ_GEMM_W32`: single aligned u32 loads for packed q4/nvfp4 weight
+    /// bytes in the tunable GEMM (replaces per-byte assembly; hoists the nvfp4
+    /// group-scale decode). Bit-identical — the kernel falls back to byte
+    /// loads when a row pointer is not 4-byte aligned. Default OFF pending A/B.
+    pub gemm_w32: bool,
     /// `DGQ_FLASH_PREFILL`: fused flash for sliding-layer PREFILL (hd=256,
     /// window=1024). Online softmax, register-resident O split across 8
     /// simdgroups, no per-chunk PV tgmem round-trip. Default ON.
@@ -641,6 +646,7 @@ impl RuntimeConfig {
                 gemm_tune_bm: parse_usize("DGQ_GEMM_TUNE_BM", 64).max(16),
                 gemm_tune_bn: parse_usize("DGQ_GEMM_TUNE_BN", 64).max(16),
                 moe_sparse_bn: parse_usize("DGQ_MOE_SPARSE_BN", 128).max(16),
+                gemm_w32: r.on_if_one("DGQ_GEMM_W32"),
                 flash_prefill: r.on_unless_zero("DGQ_FLASH_PREFILL"),
                 flash_prefill_bq: parse_usize("DGQ_FLASH_PREFILL_BQ", 16).max(8),
                 flash_prefill_bk: parse_usize("DGQ_FLASH_PREFILL_BK", 64).max(16),

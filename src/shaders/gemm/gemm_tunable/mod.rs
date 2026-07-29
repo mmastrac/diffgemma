@@ -20,7 +20,15 @@ pub const TUNE_BM: usize = 64;
 pub const TUNE_BN: usize = 64;
 
 pub fn tuned_source(bm: usize, bn: usize) -> String {
-    format!("#define TUNE_BM {bm}\n#define TUNE_BN {bn}\n{SHADER}")
+    tuned_source_w32(bm, bn, crate::flags::gemm_w32())
+}
+
+/// Explicit W32 axis (aligned u32 weight-byte loads; bit-identical either
+/// way). Production goes through `tuned_source`, which reads `DGQ_GEMM_W32`;
+/// this variant exists for the A/B oracle tests.
+pub fn tuned_source_w32(bm: usize, bn: usize, w32: bool) -> String {
+    let w = w32 as u32;
+    format!("#define TUNE_BM {bm}\n#define TUNE_BN {bn}\n#define TUNE_W32 {w}\n{SHADER}")
 }
 
 #[cfg(target_os = "macos")]
@@ -717,6 +725,101 @@ mod sparse_nvfp4_tests {
                 c > 0.999,
                 "sparse tile bm={bm} bn={bn} diverged: cos={c:.6}"
             );
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod w32_tests {
+    use super::*;
+    use crate::metal::buffer::BufferPool;
+    use crate::metal::device::MetalContext;
+    use crate::shaders::bf16;
+    use crate::shaders::{gemm_nvfp4, gemm_q4};
+    use objc2_metal::{
+        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+        MTLSize,
+    };
+
+    /// Compile `gemm_tunable` from `src` and run one dense dispatch; returns
+    /// the raw u16 output words.
+    fn run_dense(
+        ctx: &MetalContext,
+        src: &str,
+        x_f32: &[f32],
+        w_blob: &[u8],
+        m: usize,
+        n: usize,
+        k: usize,
+        format: QuantFormat,
+    ) -> Vec<u16> {
+        let mut pool = BufferPool::new();
+        let buf_x = pool.allocate(&ctx.device, m * k * 2).expect("x");
+        let buf_y = pool.allocate(&ctx.device, m * n * 2).expect("y");
+        let buf_w = pool.allocate(&ctx.device, w_blob.len()).expect("w");
+        BufferPool::write_bf16(&buf_x, &bf16::f32_slice_to_bf16_bits(x_f32));
+        BufferPool::write_bytes(&buf_w, w_blob);
+        let pipe = ctx
+            .compile_gemm_subkernel(src, ENTRY, n as u32, k as u32, false, format as u32, false)
+            .expect("w32 pipeline");
+        let grid = MTLSize {
+            width: n.div_ceil(TUNE_BN),
+            height: m.div_ceil(TUNE_BM),
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        };
+        let cmd = ctx.queue.commandBuffer().expect("cmd");
+        let enc = cmd.computeCommandEncoder().expect("enc");
+        enc.setComputePipelineState(&pipe.pipeline);
+        gemm_q4::bind_gpu_buffers(&enc, &buf_x, &buf_y, &buf_w, 0, m as u32);
+        enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+        let ptr = buf_y.contents().as_ptr() as *const u16;
+        (0..m * n).map(|i| unsafe { *ptr.add(i) }).collect()
+    }
+
+    /// TUNE_W32=1 must be byte-identical to TUNE_W32=0: the aligned u32 load
+    /// reads the same 4 weight bytes, and the hoisted nvfp4 group scale is the
+    /// same value the scalar path recomputes per column. Covers the q4 dense
+    /// W-load and both nvfp4 fixtures (incl. the non-trivial global scale).
+    #[test]
+    fn w32_bitexact_vs_byte_loads() {
+        let ctx = MetalContext::new().expect("metal ctx");
+        let src0 = tuned_source_w32(TUNE_BM, TUNE_BN, false);
+        let src1 = tuned_source_w32(TUNE_BM, TUNE_BN, true);
+
+        // q4 dense: 20-byte groups; nibble words sit at 4-byte offsets.
+        {
+            let f = gemm_q4::tile_fixture(crate::shaders::test_util::ElemFormat::F32);
+            let w = gemm_q4::w_q4(&f);
+            let a = run_dense(&ctx, &src0, &f.x, &w, f.m, f.n, f.k, QuantFormat::Q4Affine);
+            let b = run_dense(&ctx, &src1, &f.x, &w, f.m, f.n, f.k, QuantFormat::Q4Affine);
+            assert_eq!(a, b, "q4 W32 output differs from byte-load path");
+        }
+
+        // nvfp4 dense: fast path engages only when rows stay 4-byte aligned
+        // (body at +4, stride 9*(K/16)); assert the fixture actually covers it.
+        for fixture_fn in [
+            gemm_nvfp4::tile_fixture as fn(_) -> _,
+            gemm_nvfp4::gscale_fixture,
+        ] {
+            let f = fixture_fn(crate::shaders::test_util::ElemFormat::F32);
+            assert_eq!(
+                crate::dgq::layout::nvfp4_row_bytes(f.k) % 4,
+                0,
+                "fixture k={} leaves nvfp4 rows unaligned; W32 fast path would not engage",
+                f.k
+            );
+            let w = gemm_nvfp4::w_nvfp4(&f);
+            let a = run_dense(&ctx, &src0, &f.x, &w, f.m, f.n, f.k, QuantFormat::NvFp4);
+            let b = run_dense(&ctx, &src1, &f.x, &w, f.m, f.n, f.k, QuantFormat::NvFp4);
+            assert_eq!(a, b, "nvfp4 W32 output differs from byte-load path (k={})", f.k);
         }
     }
 }

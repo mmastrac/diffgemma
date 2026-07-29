@@ -139,6 +139,12 @@ pub fn gemm_tune_tile() -> (usize, usize) {
     (p.gemm_tune_bm, p.gemm_tune_bn)
 }
 
+/// `DGQ_GEMM_W32`: aligned u32 weight-byte loads in the tunable GEMM
+/// (bit-identical to the per-byte path). Default OFF.
+pub fn gemm_w32() -> bool {
+    config().perf.gemm_w32
+}
+
 /// MoE-sparse N-tile; default 128 (block height
 /// stays 32, baked into moe_bucket_fill).
 pub fn moe_sparse_bn() -> usize {
