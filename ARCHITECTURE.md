@@ -328,7 +328,94 @@ argmax fixed-point and the initial canvas washes out.
 affine (q6 / nvfp4 under `--profile`); SC MLP → q8 per-row; embed,
 attention, dense FFN, router, norms → Raw bf16 (lossless). Blobs above
 Metal's single-buffer cap (20.25 GiB on M3 Pro/36 GB) are split at
-`expert_split` into two no-copy MTLBuffer regions.
+`expert_split` into two no-copy MTLBuffer regions. Raw tensors are written
+byte-for-byte VERBATIM from the source safetensors (no transform) — the
+property layered packs (below) depend on. Every other kind is a genuine
+transform (quantized) and can only ever live in a pack's own blob.
+
+### 8.1 Layered / overlay packs
+
+A `.dgq` pack is either **self-contained** (every tensor's bytes live in its
+own `model.dgq.bin`, `DgqTensorMeta::source == None` — the only shape before
+this section, and still the default `quantize` output) or **layered**: some
+entries carry a `source` redirecting to where their bytes actually live.
+`DgqManifest::is_layered()` is `true` iff any entry has one.
+
+- **`TensorSource::Local { local_offset }`** — bytes are in this pack's own
+  (compact) blob, at a DIFFERENT position than the entry's canonical
+  `offset` (a layered pack's local blob has no gaps for tensors it doesn't
+  store).
+- **`TensorSource::External { file, offset }`** — bytes are in an external
+  file, keyed into `DgqManifest::external_files` (role `hf_safetensors`: a
+  shard inside the pinned `base_model` HF snapshot; role `pack_bin`: another
+  pack's blob). `offset` is the byte offset **within that file**.
+
+The entry's own `offset`/`byte_len` stay the single addressing contract
+every downstream consumer uses unchanged (`build_offsets_from_store`'s
+`w_off` constants, `DgqGpuBlob::buffer_for`, the split-blob region math) —
+they describe a **canonical unified address space**, identical in shape to
+what a self-contained pack's blob would have been, regardless of where the
+bytes are actually sourced from. `source` only tells the loader where to
+copy FROM; it never changes what any consumer reads offsets AGAINST.
+
+**Overlay packs**: today's only layered pack shape. Every Raw tensor becomes
+an `External` ref into the HF base's safetensors shards (byte-identical
+bf16, so no requantization); every quantized/transformed tensor (experts,
+SC q8) stays `Local` in a small blob holding only those bytes (~13.3 GiB for
+the shipped q4 profile, vs. ~18.84 GiB self-contained). The HF base lives
+only in the user's `~/.cache/huggingface` (`hf download
+google/diffusiongemma-26B-A4B-it`); `external_files` pins each referenced
+shard's exact byte size and a `header_sha256` (hash of the 8-byte header
+length + header JSON — not the multi-GiB payload) so a stale or wrong cache
+fails loud with the exact `hf download` command to fix it
+(`src/dgq/hf_resolve.rs`; cache root: `DGQ_HF_HOME` → `HF_HOME` →
+`~/.cache/huggingface`).
+
+**Loading**: at open, `DgqGpuBlob::from_store` resolves every external file,
+then assembles the canonical address space from two regions. The expert tail
+`[expert_split, total)` is offset-mmap'd DIRECTLY off the pack's own blob at
+`local_expert_split` (the writer lays the local expert region out
+byte-identical to the canonical tail, 16384-aligned) — never copied. The raw
+head `[0, expert_split)` is gather-copied at canonical offsets into
+`model.dgq.head` next to the pack — built ONCE, keyed by a sha256 of the
+manifest JSON (`model.dgq.head.meta`), then mmap'd read-only on every later
+load. Both regions are therefore file-backed CLEAN pages: shared across
+concurrent instances/processes of the same pack and evictable-and-re-readable
+under memory pressure, exactly like a self-contained pack's blob. (A private
+anonymous head per load — the first implementation — cost ~5.5 GiB of
+swap-backed dirty pages PER runtime and stalled the test suite behind
+fault-bound re-reads.) The mapping bases coincide with the `MTLBuffer` bases,
+so the no-copy wrap, `host_ptr`, and every `w_off` consumer run unchanged —
+correctness rides on the SAME code path a self-contained pack uses, not a
+parallel one. If the pack dir is not writable the head falls back to a
+private anonymous mapping. The CPU-side path (`DgqStore::tensor_bytes`, used
+for e.g. the embed-token gather) never materializes: it is a per-tensor
+redirect to whichever mmap (own blob or external file) actually holds the
+bytes.
+
+**Deferred**: direct per-tensor `MTLBuffer` binds straight into mmap'd
+external files (no head cache at all) — would drop the one-time ~5.5 GiB
+head build and its on-disk copy for the shipped q4 overlay. Blocked on: today every
+`Q4LinearGpu`/`Q8LinearGpu`/`RawBlobView` carries `(Arc<DgqGpuBlob>,
+byte_offset)` into ONE blob abstraction; a direct-mmap loader needs those
+views to instead carry a per-source buffer handle (one no-copy `MTLBuffer`
+per external file + the pack's own), and every Metal `setBuffer` call site
+that assumes "the blob buffer" needs the tensor's source-specific buffer —
+mechanical but touches every weight-view constructor and dispatch site, not
+a boundary change. Reserve the flag name `DGQ_PACK_MMAP_EXT` for this when
+it lands.
+
+**Tooling**: `repack --overlay -m PACK -o DIR` splits an existing
+self-contained pack: it verifies each Raw tensor's bytes are byte-identical
+to the HF base while streaming (doubling as the verbatim audit — a mismatch
+falls back to storing that tensor locally rather than failing the whole
+repack) and auto-detects `(repo, revision)` from the source path's
+`models--org--name/snapshots/<rev>` HF-cache layout (`--hf-repo`/
+`--hf-revision` override when it isn't one). `quantize --overlay` produces
+an experts-only overlay directly from an HF snapshot (any profile,
+including `nvfp4`) without a self-contained intermediate — the same
+`classify_tensor`/quantization code path, only the emission target differs
+for Raw tensors.
 
 ## 9. Deliberate divergences from the MLX/HF reference
 

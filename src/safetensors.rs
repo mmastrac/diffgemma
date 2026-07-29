@@ -128,7 +128,14 @@ impl SafetensorsFile {
 
     /// Valid while this `SafetensorsFile` is alive.
     pub fn data(&self, tensor: &TensorInfo) -> &[u8] {
-        let base = 8 + self.header_size + tensor.data_offset;
+        let base = self.absolute_data_offset(tensor) as usize;
         &self.mmap[base..base + tensor.data_size]
+    }
+
+    /// Byte offset of a tensor's data from the START of this file (past the
+    /// 8-byte header-length prefix and the JSON header) — the offset an
+    /// external ref into this shard is expressed against.
+    pub fn absolute_data_offset(&self, tensor: &TensorInfo) -> u64 {
+        (8 + self.header_size + tensor.data_offset) as u64
     }
 }

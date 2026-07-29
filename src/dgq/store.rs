@@ -3,7 +3,7 @@
 use crate::Error;
 use crate::dgq::dequant::dequant_to_f32;
 use crate::dgq::layout::{
-    DgqManifest, MANIFEST_FILE, QuantKind, blob_slice_range, dgq_version_supported,
+    DgqManifest, MANIFEST_FILE, QuantKind, TensorSource, blob_slice_range, dgq_version_supported,
     parse_quant_kind,
 };
 use crate::tensor::TensorView;
@@ -17,6 +17,10 @@ pub struct DgqStore {
     manifest: DgqManifest,
     blob: Mmap,
     index: HashMap<String, usize>,
+    /// Layered packs only: one resolved mmap per `external_files` key,
+    /// opened eagerly at `open()` so a missing/mismatched HF cache fails
+    /// loud at load time, not on first read of some tensor deep into a run.
+    external: HashMap<String, Mmap>,
 }
 
 impl DgqStore {
@@ -35,20 +39,51 @@ impl DgqStore {
         for (i, t) in manifest.tensors.iter().enumerate() {
             index.insert(t.name.clone(), i);
         }
+        let mut external = HashMap::with_capacity(manifest.external_files.len());
+        for (key, ext_file) in &manifest.external_files {
+            let path = crate::dgq::hf_resolve::resolve_external_file(
+                &model_dir,
+                manifest.base_model.as_ref(),
+                key,
+                ext_file,
+            )?;
+            let f = File::open(&path)?;
+            let mm = unsafe { Mmap::map(&f)? };
+            external.insert(key.clone(), mm);
+        }
         Ok(Self {
             model_dir,
             manifest,
             blob,
             index,
+            external,
         })
+    }
+
+    pub fn is_layered(&self) -> bool {
+        self.manifest.is_layered()
     }
 
     pub fn profile(&self) -> crate::dgq::layout::QuantProfile {
         self.manifest.profile
     }
 
+    /// Total canonical/unified blob length: for a self-contained pack this is
+    /// the local bin's file size (identity); for a layered pack it is the
+    /// address-space size the loader materializes on the GPU (`offset` /
+    /// `w_off` math is expressed against this, not the local bin's — much
+    /// smaller — on-disk size).
     pub fn blob_bytes(&self) -> u64 {
-        self.blob.len() as u64
+        if self.manifest.is_layered() {
+            self.manifest
+                .tensors
+                .iter()
+                .map(|t| t.meta.offset + t.meta.byte_len)
+                .max()
+                .unwrap_or(0)
+        } else {
+            self.blob.len() as u64
+        }
     }
 
     pub fn tensor_entries(&self) -> &[crate::dgq::layout::DgqTensorEntry] {
@@ -60,13 +95,40 @@ impl DgqStore {
         Some(&self.manifest.tensors[idx])
     }
 
+    /// Resolve a tensor's bytes from wherever they actually live: this pack's
+    /// own blob at `offset` (`source: None`, every pre-layering pack), this
+    /// pack's own blob at a different (compact) `local_offset`
+    /// (`TensorSource::Local`), or a resolved external file
+    /// (`TensorSource::External`).
     pub fn tensor_bytes(&self, name: &str) -> Result<&[u8], Error> {
         let entry = self
             .get_entry(name)
             .ok_or_else(|| Error::NotFound(name.to_string()))?;
-        let (start, end) =
-            blob_slice_range(entry.meta.offset, entry.meta.byte_len, self.blob_bytes())?;
-        Ok(&self.blob[start..end])
+        match &entry.meta.source {
+            None => {
+                let (start, end) = blob_slice_range(
+                    entry.meta.offset,
+                    entry.meta.byte_len,
+                    self.blob.len() as u64,
+                )?;
+                Ok(&self.blob[start..end])
+            }
+            Some(TensorSource::Local { local_offset }) => {
+                let (start, end) =
+                    blob_slice_range(*local_offset, entry.meta.byte_len, self.blob.len() as u64)?;
+                Ok(&self.blob[start..end])
+            }
+            Some(TensorSource::External { file, offset }) => {
+                let mm = self.external.get(file).ok_or_else(|| {
+                    Error::Layered(format!(
+                        "tensor {name} references external file '{file}' which was not \
+                         resolved at open()"
+                    ))
+                })?;
+                let (start, end) = blob_slice_range(*offset, entry.meta.byte_len, mm.len() as u64)?;
+                Ok(&mm[start..end])
+            }
+        }
     }
 
     /// Materialize tensor as f32 (CPU oracle path).

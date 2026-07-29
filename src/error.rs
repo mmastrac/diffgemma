@@ -21,6 +21,10 @@ pub enum Error {
     /// pipeline thread, prefixed with the op).
     Pipeline(String),
     NotFound(String),
+    /// Layered-pack external-ref resolution/integrity failure (missing HF
+    /// snapshot, size/header mismatch, unpinned base). Always carries an
+    /// actionable message (e.g. the exact `hf download` command to run).
+    Layered(String),
     DType {
         name: String,
         expected: DType,
@@ -43,6 +47,7 @@ impl std::fmt::Display for Error {
             Self::Gpu(msg) => write!(f, "gpu error: {msg}"),
             Self::Runtime(msg) => write!(f, "runtime error: {msg}"),
             Self::NotFound(name) => write!(f, "tensor not found: {name}"),
+            Self::Layered(msg) => write!(f, "{msg}"),
             Self::DType {
                 name,
                 expected,

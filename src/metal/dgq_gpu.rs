@@ -3,22 +3,31 @@
 use crate::Error;
 use crate::dgq::DgqStore;
 use crate::dgq::layout::{
-    MANIFEST_FILE, QuantKind, blob_offset_for_mtl, dgq_version_supported, nvfp4_matrix_bytes,
-    q4_matrix_bytes, q8_row_bytes,
+    DgqManifest, MANIFEST_FILE, QuantKind, TensorSource, blob_offset_for_mtl, blob_offset_usize,
+    dgq_version_supported, nvfp4_matrix_bytes, q4_matrix_bytes, q8_row_bytes,
 };
-use memmap2::Mmap;
+use memmap2::{Mmap, MmapMut};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fs::File;
+use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
 /// Keeps mmap + file alive while the GPU buffer references the mapping.
+/// `_file`/`_mmap` back region 1 (head); `_tail_file`/`_tail_mmap` are only
+/// `Some` when region 2 (experts) is backed by a DIFFERENT mapping than
+/// region 1 — the layered split-source path below, where the (large) expert
+/// tail is wrapped straight off this pack's own blob file instead of being
+/// gather-copied. `_file` is `None` for an anonymous (materialized) mapping.
 pub struct DgqGpuBlob {
-    _file: File,
+    _file: Option<File>,
     _mmap: Mmap,
+    _tail_file: Option<File>,
+    _tail_mmap: Option<Mmap>,
     /// Region 1: [0, expert_split) when split, else the whole blob.
     pub buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// Region 2 [expert_split, len) when the blob exceeds max buffer length.
@@ -36,13 +45,164 @@ impl DgqGpuBlob {
         let model_dir = store.model_dir.clone();
         let manifest_path = model_dir.join(MANIFEST_FILE);
         let manifest_json = std::fs::read_to_string(&manifest_path)?;
-        let manifest: crate::dgq::layout::DgqManifest = serde_json::from_str(&manifest_json)?;
+        let manifest: DgqManifest = serde_json::from_str(&manifest_json)?;
         if !dgq_version_supported(manifest.version) {
             return Err(Error::Format("unsupported .dgq version"));
+        }
+        if manifest.is_layered() {
+            if let (Some(expert_split), Some(local_expert_split)) =
+                (manifest.expert_split, manifest.local_expert_split)
+            {
+                // Preferred layered path: the writer arranged the local blob
+                // so its expert region is byte-identical (same relative
+                // offsets) to the canonical expert tail. Materialize only the
+                // (much smaller) head into an anonymous mapping and wrap the
+                // expert tail as a direct file-backed no-copy region straight
+                // off this pack's own blob — the ~13 GiB expert region is
+                // never gather-copied, and its pages stay evictable/
+                // re-readable from disk under memory pressure (anonymous
+                // pages are not).
+                return Self::from_store_layered_split(
+                    &model_dir,
+                    &manifest,
+                    expert_split,
+                    local_expert_split,
+                    device,
+                );
+            }
+            // Fallback: gather-copy every tensor's bytes — from this pack's
+            // own (compact) blob or a resolved external file — into one
+            // anonymous mapping laid out at the manifest's CANONICAL
+            // offsets. Everything downstream (region wrap, w_off addressing,
+            // split-blob math) then runs completely unchanged, because it
+            // sees the exact byte layout a self-contained pack would have
+            // produced. Costs a full-blob memcpy and anonymous (swap-backed,
+            // not evictable-and-re-readable) resident pages — see
+            // ARCHITECTURE.md's pack-format section.
+            let mmap = materialize_layered_blob(&model_dir, &manifest)?;
+            return Self::wrap_mmap(None, mmap, manifest.expert_split, device);
         }
         let blob_path = model_dir.join(&manifest.blob_file);
         let file = File::open(&blob_path)?;
         let mmap = unsafe { Mmap::map(&file)? };
+        Self::wrap_mmap(Some(file), mmap, manifest.expert_split, device)
+    }
+
+    /// Layered split-source path: head materialized anonymously, expert tail
+    /// wrapped directly off `manifest.blob_file` at `local_expert_split`
+    /// (page-aligned, so the pointer arithmetic mirrors the self-contained
+    /// split-buffer wrap in [`Self::wrap_mmap`]).
+    fn from_store_layered_split(
+        model_dir: &Path,
+        manifest: &DgqManifest,
+        expert_split: u64,
+        local_expert_split: u64,
+        device: &ProtocolObject<dyn MTLDevice>,
+    ) -> Result<Arc<Self>, Error> {
+        let (head_file, head_mmap) = layered_head_mmap(model_dir, manifest, expert_split)?;
+        let local_bin_path = model_dir.join(&manifest.blob_file);
+        let local_file = File::open(&local_bin_path)?;
+        if !local_expert_split.is_multiple_of(16384) {
+            return Err(Error::Layered(format!(
+                "dgq layered blob: local_expert_split {local_expert_split} is not 16384-aligned — \
+                 cannot offset-map / no-copy wrap the expert tail; re-run repack/quantize --overlay"
+            )));
+        }
+        // Map the tail STARTING AT local_expert_split so the mapping's base
+        // address and the region-2 MTLBuffer's base address coincide: host_ptr
+        // and the GPU wrap then share the single rebase rule
+        // (off - expert_split), with no second file-side base to forget.
+        let local_mmap = unsafe {
+            memmap2::MmapOptions::new()
+                .offset(local_expert_split)
+                .map(&local_file)?
+        };
+        let tail_len = local_mmap.len();
+        if tail_len == 0 {
+            return Err(Error::Runtime(
+                "dgq: local_expert_split at or past end of local blob",
+            ));
+        }
+
+        let head_len = head_mmap.len();
+        // Defense in depth: the writer's `local_expert_split` claim (tail is
+        // byte-identical, same relative offsets, to canonical
+        // [expert_split, total)) is exactly what `w_off` addressing depends
+        // on. A mismatched tail length means a writer bug, not a value to
+        // silently absorb.
+        let canonical_total = manifest
+            .tensors
+            .iter()
+            .map(|t| t.meta.offset + t.meta.byte_len)
+            .max()
+            .unwrap_or(0);
+        let expected_tail_len = blob_offset_usize(canonical_total)?
+            .checked_sub(blob_offset_usize(expert_split)?)
+            .ok_or(Error::Runtime("dgq: expert_split past canonical total"))?;
+        if tail_len != expected_tail_len {
+            return Err(Error::Layered(format!(
+                "dgq layered blob: local expert-region length {tail_len} != canonical expert \
+                 region length {expected_tail_len} — local_expert_split does not describe this \
+                 blob_file; re-run repack/quantize --overlay"
+            )));
+        }
+        let max_buf = device.maxBufferLength();
+        if head_len > max_buf || tail_len > max_buf {
+            return Err(Error::Format(
+                "dgq layered blob region exceeds device max buffer length even after expert split",
+            ));
+        }
+        eprintln!(
+            "dgq layered blob: head {:.2} GiB materialized, expert tail {:.2} GiB file-backed (no copy)",
+            head_len as f64 / 1073741824.0,
+            tail_len as f64 / 1073741824.0,
+        );
+        let head_ptr =
+            NonNull::new(head_mmap.as_ptr() as *mut c_void).ok_or(Error::Runtime("dgq mmap null"))?;
+        let buffer = unsafe {
+            device
+                .newBufferWithBytesNoCopy_length_options_deallocator(
+                    head_ptr,
+                    head_len,
+                    MTLResourceOptions::StorageModeShared,
+                    None,
+                )
+                .ok_or(Error::Gpu("dgq gpu blob region1 alloc failed"))?
+        };
+        let tail_ptr = NonNull::new(local_mmap.as_ptr() as *mut c_void)
+            .ok_or(Error::Runtime("dgq mmap region2 null"))?;
+        let buffer_experts = unsafe {
+            device
+                .newBufferWithBytesNoCopy_length_options_deallocator(
+                    tail_ptr,
+                    tail_len,
+                    MTLResourceOptions::StorageModeShared,
+                    None,
+                )
+                .ok_or(Error::Gpu("dgq gpu blob region2 alloc failed"))?
+        };
+        Ok(Arc::new(Self {
+            _file: head_file,
+            _mmap: head_mmap,
+            _tail_file: Some(local_file),
+            _tail_mmap: Some(local_mmap),
+            buffer,
+            buffer_experts: Some(buffer_experts),
+            expert_split,
+            len: head_len + tail_len,
+        }))
+    }
+
+    /// Wrap an already-materialized mmap (self-contained file-backed, or a
+    /// layered pack's gather-copied anonymous mapping) as one or two no-copy
+    /// `MTLBuffer`s, splitting at `expert_split` when the blob exceeds the
+    /// device's max single-buffer length.
+    fn wrap_mmap(
+        file: Option<File>,
+        mmap: Mmap,
+        expert_split_hint: Option<u64>,
+        device: &ProtocolObject<dyn MTLDevice>,
+    ) -> Result<Arc<Self>, Error> {
         let len = mmap.len();
         let ptr =
             NonNull::new(mmap.as_ptr() as *mut c_void).ok_or(Error::Runtime("dgq mmap null"))?;
@@ -61,6 +221,8 @@ impl DgqGpuBlob {
             return Ok(Arc::new(Self {
                 _file: file,
                 _mmap: mmap,
+                _tail_file: None,
+                _tail_mmap: None,
                 buffer,
                 buffer_experts: None,
                 expert_split: 0,
@@ -70,7 +232,7 @@ impl DgqGpuBlob {
         // Blob exceeds the device's max single-buffer length: wrap it as two
         // no-copy regions split at the (page-aligned) expert boundary the
         // converter recorded (experts are written last).
-        let split = manifest.expert_split.ok_or(Error::Format(
+        let split = expert_split_hint.ok_or(Error::Format(
             "dgq blob exceeds device max buffer length and manifest has no expert_split — re-convert with the experts-last converter",
         ))? as usize;
         if !split.is_multiple_of(16384) || split == 0 || split >= len {
@@ -113,6 +275,8 @@ impl DgqGpuBlob {
         Ok(Arc::new(Self {
             _file: file,
             _mmap: mmap,
+            _tail_file: None,
+            _tail_mmap: None,
             buffer,
             buffer_experts: Some(buffer_experts),
             expert_split: split as u64,
@@ -140,11 +304,257 @@ impl DgqGpuBlob {
         }
     }
 
-    /// Host pointer at an absolute blob offset (region-independent: reads the
-    /// underlying mmap directly).
+    /// Host pointer at an absolute blob offset: reads the tail mapping when
+    /// one is present and `off` falls in the expert region, else the head
+    /// mapping (which spans the whole blob when there is no separate tail).
     pub fn host_ptr(&self, off: u64) -> *const u8 {
+        if let Some(tail) = &self._tail_mmap
+            && self.expert_split > 0
+            && off >= self.expert_split
+        {
+            return unsafe { tail.as_ptr().add(blob_offset_for_mtl(off - self.expert_split)) };
+        }
         unsafe { self._mmap.as_ptr().add(blob_offset_for_mtl(off)) }
     }
+}
+
+/// Open one mmap per file a layered manifest's `external_files` references.
+fn resolve_external_mmaps(
+    model_dir: &Path,
+    manifest: &DgqManifest,
+) -> Result<HashMap<String, Mmap>, Error> {
+    let mut external = HashMap::with_capacity(manifest.external_files.len());
+    for (key, ext_file) in &manifest.external_files {
+        let path = crate::dgq::hf_resolve::resolve_external_file(
+            model_dir,
+            manifest.base_model.as_ref(),
+            key,
+            ext_file,
+        )?;
+        let f = File::open(&path)?;
+        external.insert(key.clone(), unsafe { Mmap::map(&f)? });
+    }
+    Ok(external)
+}
+
+/// Bounds-checked sub-slice: a manifest entry whose offset+len exceeds its
+/// (already size-verified) source file means a corrupt or mismatched pack,
+/// not a host process crash.
+fn checked_slice<'a>(buf: &'a [u8], start: usize, len: usize, what: &str) -> Result<&'a [u8], Error> {
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| Error::Layered(format!("{what}: offset overflow")))?;
+    buf.get(start..end).ok_or_else(|| {
+        Error::Layered(format!(
+            "{what}: extends past its source (needs {end} bytes, source has {})",
+            buf.len()
+        ))
+    })
+}
+
+/// Resolve one tensor entry's source bytes (own blob, local-redirected, or
+/// external), bounds-checked against whichever mmap actually holds them.
+fn source_slice<'a>(
+    entry: &crate::dgq::layout::DgqTensorEntry,
+    local_mmap: &'a [u8],
+    external: &'a HashMap<String, Mmap>,
+    len: usize,
+) -> Result<&'a [u8], Error> {
+    match &entry.meta.source {
+        None => checked_slice(local_mmap, blob_offset_usize(entry.meta.offset)?, len, &entry.name),
+        Some(TensorSource::Local { local_offset }) => {
+            checked_slice(local_mmap, blob_offset_usize(*local_offset)?, len, &entry.name)
+        }
+        Some(TensorSource::External { file, offset }) => {
+            let mm = external.get(file).ok_or_else(|| {
+                Error::Layered(format!(
+                    "tensor {} references external file '{file}' which was not resolved",
+                    entry.name
+                ))
+            })?;
+            checked_slice(mm, blob_offset_usize(*offset)?, len, &entry.name)
+        }
+    }
+}
+
+/// Gather-copy a layered pack's tensors into one anonymous mapping at their
+/// CANONICAL offsets — i.e. reconstruct exactly the bytes a self-contained
+/// pack's blob would contain, from wherever they actually live (this pack's
+/// own compact blob, or a resolved external HF-safetensors shard). Bounded
+/// memory: each tensor is copied straight from its source mmap (already
+/// page-cached, no intermediate heap buffer); only the destination mapping
+/// (~18 GiB for the shipped q4 pack) is resident, exactly as a self-contained
+/// pack's blob would be once mmap'd. Fallback when the writer didn't record
+/// `local_expert_split` — see `materialize_layered_head` for the preferred,
+/// much cheaper path.
+fn materialize_layered_blob(model_dir: &Path, manifest: &DgqManifest) -> Result<Mmap, Error> {
+    let local_bin = File::open(model_dir.join(&manifest.blob_file))?;
+    let local_mmap = unsafe { Mmap::map(&local_bin)? };
+    let external = resolve_external_mmaps(model_dir, manifest)?;
+
+    let total_len = manifest
+        .tensors
+        .iter()
+        .map(|t| t.meta.offset + t.meta.byte_len)
+        .max()
+        .unwrap_or(0);
+    let total_len = blob_offset_usize(total_len)?;
+    let mut anon = MmapMut::map_anon(total_len)?;
+
+    for entry in &manifest.tensors {
+        let dst_start = blob_offset_usize(entry.meta.offset)?;
+        let len = blob_offset_usize(entry.meta.byte_len)?;
+        let dst_end = dst_start
+            .checked_add(len)
+            .ok_or(Error::Runtime("dgq materialize: offset overflow"))?;
+        if dst_end > total_len {
+            return Err(Error::Runtime("dgq materialize: tensor extends past blob"));
+        }
+        let src = source_slice(entry, &local_mmap, &external, len)?;
+        anon[dst_start..dst_end].copy_from_slice(src);
+    }
+    drop(external);
+    drop(local_mmap);
+    Ok(anon.make_read_only()?)
+}
+
+/// Like `materialize_layered_blob` but copies only tensors in the canonical
+/// HEAD region `[0, expert_split)` — the (large) expert tail is wrapped
+/// directly off the pack's own blob by `DgqGpuBlob::from_store_layered_split`
+/// instead of being gather-copied here.
+/// Gather-copy every sub-`expert_split` tensor into `dst` at its canonical
+/// offset (`dst.len()` must equal the head length).
+fn fill_layered_head(
+    dst: &mut [u8],
+    model_dir: &Path,
+    manifest: &DgqManifest,
+    expert_split: u64,
+) -> Result<(), Error> {
+    let local_bin = File::open(model_dir.join(&manifest.blob_file))?;
+    let local_mmap = unsafe { Mmap::map(&local_bin)? };
+    let external = resolve_external_mmaps(model_dir, manifest)?;
+
+    let head_len = dst.len();
+    for entry in &manifest.tensors {
+        if entry.meta.offset >= expert_split {
+            continue;
+        }
+        let dst_start = blob_offset_usize(entry.meta.offset)?;
+        let len = blob_offset_usize(entry.meta.byte_len)?;
+        let dst_end = dst_start
+            .checked_add(len)
+            .ok_or(Error::Runtime("dgq materialize: offset overflow"))?;
+        if dst_end > head_len {
+            return Err(Error::Runtime(
+                "dgq materialize: head tensor extends past expert_split",
+            ));
+        }
+        let src = source_slice(entry, &local_mmap, &external, len)?;
+        dst[dst_start..dst_end].copy_from_slice(src);
+    }
+    Ok(())
+}
+
+const HEAD_CACHE_FILE: &str = "model.dgq.head";
+const HEAD_CACHE_META: &str = "model.dgq.head.meta";
+
+/// sha256 hex of the manifest JSON bytes — the head cache's identity. Any
+/// manifest change (offsets, sources, external pins) invalidates the cache.
+fn manifest_sha256_hex(model_dir: &Path) -> Result<String, Error> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(model_dir.join(MANIFEST_FILE))?;
+    Ok(Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
+/// The materialized head as a FILE-BACKED mapping: `model.dgq.head` next to
+/// the pack, built once (manifest-hash-validated) and mmap'd read-only ever
+/// after. File-backed clean pages are shared across every concurrent
+/// instance/process of the same pack and evict-and-re-read under memory
+/// pressure — a private anonymous copy per load does neither (each instance
+/// paid ~5.5 GiB of swap-backed dirty pages; N test runtimes made that N-fold
+/// and stalled the suite behind fault-bound re-reads). Falls back to the
+/// anonymous copy when the pack dir is not writable.
+fn layered_head_mmap(
+    model_dir: &Path,
+    manifest: &DgqManifest,
+    expert_split: u64,
+) -> Result<(Option<File>, Mmap), Error> {
+    let head_len = blob_offset_usize(expert_split)?;
+    let meta_want = format!("{} {head_len}\n", manifest_sha256_hex(model_dir)?);
+    let head_path = model_dir.join(HEAD_CACHE_FILE);
+    let meta_path = model_dir.join(HEAD_CACHE_META);
+    if std::fs::read_to_string(&meta_path).is_ok_and(|m| m == meta_want)
+        && std::fs::metadata(&head_path).is_ok_and(|md| md.len() == head_len as u64)
+    {
+        let f = File::open(&head_path)?;
+        let mmap = unsafe { Mmap::map(&f)? };
+        return Ok((Some(f), mmap));
+    }
+    match build_head_cache(
+        model_dir,
+        manifest,
+        expert_split,
+        head_len,
+        &meta_want,
+        &head_path,
+        &meta_path,
+    ) {
+        Ok(pair) => Ok(pair),
+        Err(err) => {
+            eprintln!(
+                "dgq layered blob: head cache unavailable ({err}); materializing anonymously"
+            );
+            let mut anon = MmapMut::map_anon(head_len)?;
+            fill_layered_head(&mut anon, model_dir, manifest, expert_split)?;
+            Ok((None, anon.make_read_only()?))
+        }
+    }
+}
+
+fn build_head_cache(
+    model_dir: &Path,
+    manifest: &DgqManifest,
+    expert_split: u64,
+    head_len: usize,
+    meta_want: &str,
+    head_path: &Path,
+    meta_path: &Path,
+) -> Result<(Option<File>, Mmap), Error> {
+    let pid = std::process::id();
+    let tmp_path = model_dir.join(format!("{HEAD_CACHE_FILE}.tmp.{pid}"));
+    let tmp = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp_path)?;
+    tmp.set_len(head_len as u64)?;
+    let mut map = unsafe { MmapMut::map_mut(&tmp)? };
+    if let Err(err) = fill_layered_head(&mut map, model_dir, manifest, expert_split) {
+        drop(map);
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    map.flush()?;
+    drop(map);
+    drop(tmp);
+    std::fs::rename(&tmp_path, head_path)?;
+    // Meta is written LAST: a crash between the renames leaves a stale/absent
+    // meta, which just forces a rebuild — never a valid meta over wrong data.
+    let meta_tmp = model_dir.join(format!("{HEAD_CACHE_META}.tmp.{pid}"));
+    std::fs::write(&meta_tmp, meta_want)?;
+    std::fs::rename(&meta_tmp, meta_path)?;
+    eprintln!(
+        "dgq layered blob: built head cache {} ({:.2} GiB)",
+        head_path.display(),
+        head_len as f64 / 1073741824.0,
+    );
+    let f = File::open(head_path)?;
+    let mmap = unsafe { Mmap::map(&f)? };
+    Ok((Some(f), mmap))
 }
 
 /// Quantized linear weight view into a shared blob buffer (PyTorch `[out, in]`).

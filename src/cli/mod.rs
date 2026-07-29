@@ -84,6 +84,19 @@ pub(crate) enum Command {
     Quantize {
         output: PathBuf,
         profile: String,
+        /// Emit an experts-only OVERLAY (Raw tensors become external refs
+        /// into the HF base) instead of a self-contained pack.
+        overlay: bool,
+        hf_repo: Option<String>,
+        hf_revision: Option<String>,
+    },
+    /// Split a self-contained `.dgq` pack into an experts-only overlay whose
+    /// Raw tensors reference the HF base's safetensors shards.
+    Repack {
+        output: PathBuf,
+        hf_source: Option<PathBuf>,
+        hf_repo: Option<String>,
+        hf_revision: Option<String>,
     },
     /// Fetch a `.dgq` model from HuggingFace into a local model dir.
     Download {

@@ -592,7 +592,32 @@ pub(crate) fn dispatch(cli: Cli) -> ExitCode {
         } => run_replay_cmd(&cli.model_dir, &log_path, ctx, steps),
         #[cfg(not(target_os = "macos"))]
         Command::Replay { .. } => ExitCode::FAILURE,
-        Command::Quantize { output, profile } => run_quantize(&cli.model_dir, &output, &profile),
+        Command::Quantize {
+            output,
+            profile,
+            overlay,
+            hf_repo,
+            hf_revision,
+        } => run_quantize(
+            &cli.model_dir,
+            &output,
+            &profile,
+            overlay,
+            hf_repo.as_deref(),
+            hf_revision.as_deref(),
+        ),
+        Command::Repack {
+            output,
+            hf_source,
+            hf_repo,
+            hf_revision,
+        } => run_repack_overlay(
+            &cli.model_dir,
+            &output,
+            hf_source.as_deref(),
+            hf_repo.as_deref(),
+            hf_revision.as_deref(),
+        ),
         Command::Download {
             repo,
             revision,
@@ -677,6 +702,7 @@ pub(crate) fn run_command(
         Command::Gemm { .. } => ExitCode::FAILURE,
         Command::ProbeDevice { .. } => ExitCode::FAILURE,
         Command::Quantize { .. } => ExitCode::FAILURE,
+        Command::Repack { .. } => ExitCode::FAILURE,
         Command::Download { .. } => ExitCode::FAILURE,
         Command::BenchGemm { .. } => ExitCode::FAILURE,
         Command::BenchPrefillAttn { .. } => ExitCode::FAILURE,

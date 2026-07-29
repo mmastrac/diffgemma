@@ -378,6 +378,13 @@ pub fn kv_mmap_dir() -> PathBuf {
     config().kv.mmap_dir.clone()
 }
 
+/// `DGQ_HF_HOME` override for the HuggingFace cache root (layered-pack
+/// external-ref resolution). `None` = fall through to `HF_HOME` then
+/// `~/.cache/huggingface`.
+pub fn hf_home_override() -> Option<PathBuf> {
+    config().pack.hf_home.clone()
+}
+
 // ===========================================================================
 // GPU working-set cap (a device fact, not env config)
 // ===========================================================================

@@ -6,6 +6,9 @@ pub(crate) fn run_quantize(
     source_dir: &std::path::Path,
     output: &std::path::Path,
     profile: &str,
+    overlay: bool,
+    hf_repo: Option<&str>,
+    hf_revision: Option<&str>,
 ) -> ExitCode {
     use dgq::layout::QuantProfile;
     use dgq::{QuantizeOptions, quantize_model};
@@ -28,23 +31,53 @@ pub(crate) fn run_quantize(
         output.to_path_buf()
     };
 
+    let overlay_base = if overlay {
+        let hf_store = match weights::SafetensorStore::open(source_dir) {
+            Ok(s) => s,
+            Err(err) => {
+                eprintln!("error: opening HF source {}: {err}", source_dir.display());
+                return ExitCode::FAILURE;
+            }
+        };
+        match dgq::overlay::auto_or_override_base_model(
+            source_dir,
+            &hf_store,
+            hf_repo.map(str::to_string),
+            hf_revision.map(str::to_string),
+        ) {
+            Ok(base) => Some(base),
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+
     eprintln!(
-        "quantize: {} -> {} (profile={profile_name})",
+        "quantize: {} -> {} (profile={profile_name}{})",
         source_dir.display(),
         out_dir.display(),
+        if overlay { ", overlay" } else { "" },
     );
     let started = std::time::Instant::now();
     match quantize_model(QuantizeOptions {
         source_dir: source_dir.to_path_buf(),
         output_prefix: out_dir.clone(),
         profile,
+        overlay_base,
     }) {
         Ok(summary) => {
             let gib = summary.blob_bytes as f64 / (1024.0_f64.powi(3));
+            let local_gib = summary.local_blob_bytes as f64 / (1024.0_f64.powi(3));
             println!("quantize ok");
             println!("  output dir:    {}", out_dir.display());
             println!("  tensors:       {}", summary.tensor_count);
-            println!("  blob size:     {gib:.2} GiB");
+            println!("  canonical size:{gib:.2} GiB");
+            if overlay {
+                println!("  local blob:    {local_gib:.2} GiB");
+            }
             println!("  q4 tensors:    {}", summary.q4_tensors);
             println!("  q6 tensors:    {}", summary.q6_tensors);
             println!("  nvfp4 tensors: {}", summary.nvfp4_tensors);
@@ -56,6 +89,61 @@ pub(crate) fn run_quantize(
                 out_dir.display(),
                 dgq::layout::MANIFEST_FILE
             );
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+pub(crate) fn run_repack_overlay(
+    pack_dir: &std::path::Path,
+    output: &std::path::Path,
+    hf_source: Option<&std::path::Path>,
+    hf_repo: Option<&str>,
+    hf_revision: Option<&str>,
+) -> ExitCode {
+    use dgq::overlay::{RepackOverlayOptions, repack_overlay};
+
+    let out_dir = if output.extension().is_some_and(|e| e == "dgq") {
+        output.with_extension("")
+    } else {
+        output.to_path_buf()
+    };
+
+    eprintln!(
+        "repack --overlay: {} -> {}",
+        pack_dir.display(),
+        out_dir.display(),
+    );
+    let started = std::time::Instant::now();
+    match repack_overlay(RepackOverlayOptions {
+        pack_dir: pack_dir.to_path_buf(),
+        output_dir: out_dir.clone(),
+        hf_source_dir: hf_source.map(std::path::Path::to_path_buf),
+        hf_repo_override: hf_repo.map(str::to_string),
+        hf_revision_override: hf_revision.map(str::to_string),
+    }) {
+        Ok(summary) => {
+            let gib = summary.local_blob_bytes as f64 / (1024.0_f64.powi(3));
+            println!("repack --overlay ok");
+            println!("  output dir:       {}", out_dir.display());
+            println!("  tensors:          {}", summary.total_tensors);
+            println!("  external (HF):    {}", summary.external_tensors);
+            println!("  local:            {}", summary.local_tensors);
+            println!("  local blob:       {gib:.2} GiB");
+            println!(
+                "  base model:       {}@{}",
+                summary.base_model.repo, summary.base_model.revision
+            );
+            println!("  HF shards refd:   {}", summary.shard_count);
+            println!(
+                "  verbatim mismatches: {}",
+                summary.verbatim_mismatches.len()
+            );
+            println!("  elapsed:          {:.2?}", started.elapsed());
             ExitCode::SUCCESS
         }
         Err(err) => {

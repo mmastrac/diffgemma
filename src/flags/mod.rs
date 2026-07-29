@@ -379,6 +379,24 @@ impl Default for KvFlags {
     }
 }
 
+/// Layered `.dgq` pack loading (external HF-safetensors / pack-bin refs).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PackFlags {
+    /// `DGQ_HF_HOME`: override for the HuggingFace cache root used to
+    /// resolve `HfSafetensors` external refs. Falls back to the `HF_HOME`
+    /// env var, then `~/.cache/huggingface` (the `huggingface_hub`
+    /// default). Unset = None (fall through the chain).
+    pub hf_home: Option<PathBuf>,
+}
+
+impl Default for PackFlags {
+    /// The unset-env parse IS the default — one source of truth,
+    /// nothing to drift (see `EnvReader`).
+    fn default() -> Self {
+        RuntimeConfig::from_reader(&EMPTY_ENV).pack
+    }
+}
+
 /// Server (serve) configuration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServerFlags {
@@ -522,6 +540,7 @@ pub struct RuntimeConfig {
     pub kv: KvFlags,
     pub server: ServerFlags,
     pub debug: DebugFlags,
+    pub pack: PackFlags,
 }
 
 impl RuntimeConfig {
@@ -678,6 +697,9 @@ impl RuntimeConfig {
                     .var_os("DGQ_KV_MMAP_DIR")
                     .map(PathBuf::from)
                     .unwrap_or_else(std::env::temp_dir),
+            },
+            pack: PackFlags {
+                hf_home: r.var_os("DGQ_HF_HOME").map(PathBuf::from),
             },
             server: ServerFlags {
                 paced_stream: r.on_unless_zero("DGQ_PACED_STREAM"),

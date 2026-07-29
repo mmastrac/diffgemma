@@ -357,6 +357,11 @@ diffgemma-mps manifest                          # kernel FC-axis TOML
 # Requantize from HF safetensors
 diffgemma-mps quantize -m model/transformer -o model/diffusiongemma-q4emb --profile q4
 
+# Layered/overlay packs (ARCHITECTURE.md §8.1): raw tensors ref the HF base
+# in ~/.cache/huggingface instead of being copied into the pack.
+diffgemma-mps quantize -m model/transformer -o model/pack-overlay --profile nvfp4 --overlay
+diffgemma-mps repack --overlay -m model/diffusiongemma-q4emb -o model/pack-overlay
+
 # MLX reference comparison (SERIALIZE with our runs — never in parallel)
 python/.venv/bin/python python/scripts/mlx_generate.py -p "..." -o /tmp/mlx.json
 ```

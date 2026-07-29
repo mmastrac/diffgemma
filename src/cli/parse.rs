@@ -63,6 +63,12 @@ pub(crate) fn parse_cli() -> Cli {
     let mut kernel_debug_deep = false;
     let mut output_dir: Option<PathBuf> = None;
     let mut quant_profile = String::from("q4");
+    // `quantize --overlay` / `repack --overlay`: emit an experts-only
+    // overlay instead of a self-contained pack.
+    let mut overlay_flag = false;
+    let mut hf_repo: Option<String> = None;
+    let mut hf_revision: Option<String> = None;
+    let mut hf_source: Option<PathBuf> = None;
     // `download` options: HF repo, revision, and full re-fetch.
     let mut download_repo: Option<String> = None;
     let mut download_revision = String::from("main");
@@ -312,6 +318,22 @@ pub(crate) fn parse_cli() -> Cli {
             "--profile" => {
                 if let Some(v) = args.next() {
                     quant_profile = v;
+                }
+            }
+            "--overlay" => overlay_flag = true,
+            "--hf-repo" => {
+                if let Some(v) = args.next() {
+                    hf_repo = Some(v);
+                }
+            }
+            "--hf-revision" => {
+                if let Some(v) = args.next() {
+                    hf_revision = Some(v);
+                }
+            }
+            "--hf-source" => {
+                if let Some(v) = args.next() {
+                    hf_source = Some(PathBuf::from(v));
                 }
             }
             "--shapes" => {
@@ -659,12 +681,34 @@ pub(crate) fn parse_cli() -> Cli {
         },
         Some("quantize") => {
             let out = output_dir.unwrap_or_else(|| {
-                eprintln!("usage: diffgemma-mps quantize -o OUTPUT_DIR -m SOURCE [--profile q4|q5|q6|nvfp4]");
+                eprintln!(
+                    "usage: diffgemma-mps quantize -o OUTPUT_DIR -m SOURCE [--profile q4|q5|q6|nvfp4] \
+                     [--overlay [--hf-repo ORG/NAME --hf-revision REV]]"
+                );
                 std::process::exit(2);
             });
             Command::Quantize {
                 output: out,
                 profile: quant_profile,
+                overlay: overlay_flag,
+                hf_repo,
+                hf_revision,
+            }
+        }
+        Some("repack") => {
+            if !overlay_flag {
+                eprintln!("usage: diffgemma-mps repack --overlay -o OUTPUT_DIR -m SOURCE_PACK [--hf-source DIR] [--hf-repo ORG/NAME --hf-revision REV]");
+                std::process::exit(2);
+            }
+            let out = output_dir.unwrap_or_else(|| {
+                eprintln!("usage: diffgemma-mps repack --overlay -o OUTPUT_DIR -m SOURCE_PACK");
+                std::process::exit(2);
+            });
+            Command::Repack {
+                output: out,
+                hf_source,
+                hf_repo,
+                hf_revision,
             }
         }
         Some("download") => Command::Download {
