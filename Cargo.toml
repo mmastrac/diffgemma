@@ -28,6 +28,12 @@ shell-download = "0.22"
 # safetensors header only, not the multi-GiB payload — see dgq/hf_resolve.rs).
 sha2 = "0.10"
 
+# Host-side test code runs real inference (smokes, KV fingerprints over
+# hundreds of MB); at opt-level 0 the per-byte loops dominate suite wall.
+# opt-level 1 changes no outputs (no fast-math) — debug_assertions stay on.
+[profile.test]
+opt-level = 1
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", default-features = false, features = ["std"] }
 objc2-metal = { version = "0.3", default-features = false, features = [
