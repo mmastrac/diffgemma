@@ -333,6 +333,100 @@ byte-for-byte VERBATIM from the source safetensors (no transform) — the
 property layered packs (below) depend on. Every other kind is a genuine
 transform (quantized) and can only ever live in a pack's own blob.
 
+`--profile` picks one of five fixed policies (q4/q5/q6/nvfp4/nvfp4x);
+`quantize --set class=format` (§8.2) overrides `classify_tensor`'s output
+per tensor CLASS on top of a chosen profile, for mixed-precision experiment
+arms that don't fit a canned profile.
+
+### 8.2 Custom quantization classes (`--set`)
+
+`quantize --profile BASE --set class=format [--set class=format ...]`
+layers per-class format overrides on top of a base profile
+(`classify_tensor_custom`, src/dgq/layout.rs). Zero overrides is IDENTICAL
+to the base profile — `classify_tensor_custom` only ever consults the
+override map for a tensor `tensor_class` maps to a class, and every other
+tensor (including every locked one) falls through to `classify_tensor`
+unchanged.
+
+**Classes** (`TensorClass`, name/shape patterns independent of any profile):
+`experts` (`.experts.` 3D stacks; expands to both `experts.gate_up` and
+`experts.down`, addressable separately), `attn` (decoder `self_attn`
+q/k/v/o_proj), `dense` (decoder dense-FFN gate/up/down), `vision` (vision-
+tower `self_attn`/`mlp` linears + `embed_vision.embedding_projection` —
+inert today, see below), `sc` (the 3 self-conditioning MLP tensors).
+
+**Formats**: `raw`, `q4`, `q6`, `q8`, `nvfp4` — the existing block codecs,
+no new ones. Each class only accepts the formats the step-kernel runtime has
+a compiled kernel for (`TensorClass::supported_formats`), checked at CLI
+parse time (before the source model is even opened):
+- `experts`/`experts.gate_up`/`experts.down`: q4, q6, nvfp4 (block-sparse
+  grouped GEMM). Not raw/q8 — those would silently fall back to the scalar
+  per-expert kernel, which is a probe/oracle surface only, never a
+  production dispatch path.
+- `attn`/`dense`/`sc`: raw, q8, q4, nvfp4 (dense-linear GEMM). Not q6 — q6
+  dequant is wired into the block-SPARSE (expert) kernel body only; the
+  dense-linear kernel has no q6 branch. `--set attn=q6` is rejected with
+  this reason rather than silently mis-dispatching.
+- `vision`: all five. The vision tower is not wired into the step-kernel
+  forward pass at all (no source file references `vision_tower` /
+  `embed_vision`) — any codec is a pure disk-size lever until a vision
+  forward path exists.
+
+`experts.gate_up` and `experts.down` must resolve to the SAME format if both
+are set: the batched grouped-GEMM dispatch and blob-byte math key on one
+shared value (`StepBlockProfile`, below) — splitting them independently
+would need per-stack format plumbing through the MoE encode path, which is
+deferred (not needed by any shipped arm yet).
+
+**Locked classes** — not knobs, fatal if targeted, reason printed:
+`embed`/`embed_tokens` (tied to the lm_head and SC soft-embed; bf16 keeps
+tail-token logits sharp), `router` (routing decisions are precision-
+sensitive; the tensors are tiny), `norms`/`layer_scalar` (tiny,
+precision-sensitive scale vectors). `tensor_class` never maps a locked
+tensor to a `TensorClass` at all, so no override can reach one even by
+accident; `--set` additionally rejects the locked names outright with the
+reason above.
+
+**Validation, before any bytes are written**: dimension constraints per
+resolved (tensor, format) — q4/q6 need K (last dim) a multiple of 32, nvfp4
+a multiple of 16, q8 needs rank 2 (`validate_format_dims`). An invalid
+combo names the offending tensor and fails before the output dir exists.
+
+**Manifest**: `DgqManifest::custom_classes` (`BTreeMap<String, String>`,
+e.g. `{"attn": "nvfp4_block"}`) records the resolved overrides actually
+applied, alongside the unchanged `profile` base. It is purely descriptive —
+the loader never consults it. Every tensor's `kind` is self-sufficient for
+dispatch (`DgqStore::tensor_bytes`/`tensor_f32` and the step-kernel's
+per-tensor `parse_quant_kind` reads), so a binary that predates this field
+still loads a custom pack correctly; it just can't print the class map. The
+manifest version is bumped to `DGQ_VERSION_NVFP4` whenever an nvfp4 tensor
+is actually PRESENT (checked over the resolved kinds, not `profile`) so a
+pre-nvfp4 binary still refuses rather than misreads — the same gate a plain
+`--profile nvfp4` pack already relies on.
+
+**Runtime dispatch reads the manifest, never `profile`**: the step-kernel
+runtime (`src/metal/step_kernel/build.rs`) derives THREE independent
+formats from the tensors it actually finds — `attn_format`/`dense_format`
+(`DenseWeightFormat`: bf16 / q8 / block(q4 or nvfp4), from the q_proj /
+mlp.gate_proj kind respectively) and the expert `StepBlockProfile` (from the
+gate_up kind, asserted equal to down's). Before this generalization
+(`src/metal/step_quant.rs`), the runtime derived one shared format from
+`QuantProfile` alone and assumed attention and dense-FFN always matched the
+experts' format — true for every profile-only pack, but wrong the instant a
+custom pack puts attention in a different format than the experts (or than
+dense-FFN). `QuantProfile::Nvfp4Experts` (the `nvfp4x` profile) was the
+special-cased instance of exactly this need before `--set` existed; it
+still deserializes (old `nvfp4x`-profile manifests keep loading), but
+`quantize --profile nvfp4x` now simply expands to `--profile q4 --set
+experts=nvfp4` — the general mechanism replaces the special case.
+
+**Tooling**: `quantize --set ... --overlay` composes with layered overlays
+(§8.1) unchanged — a tensor class switched from raw to a quantized format
+simply moves from an `External` HF-safetensors ref to a `Local` blob entry,
+same as any other Raw→quantized transition; `--set` only changes what
+`classify_tensor_custom` returns per tensor, not how the writer decides
+`External` vs `Local` (still keyed on `kind == Raw`).
+
 ### 8.1 Layered / overlay packs
 
 A `.dgq` pack is either **self-contained** (every tensor's bytes live in its

@@ -598,6 +598,7 @@ pub(crate) fn dispatch(cli: Cli) -> ExitCode {
             overlay,
             hf_repo,
             hf_revision,
+            sets,
         } => run_quantize(
             &cli.model_dir,
             &output,
@@ -605,6 +606,7 @@ pub(crate) fn dispatch(cli: Cli) -> ExitCode {
             overlay,
             hf_repo.as_deref(),
             hf_revision.as_deref(),
+            &sets,
         ),
         Command::Repack {
             output,

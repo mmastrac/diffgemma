@@ -132,14 +132,27 @@ pub fn build_step_runtime(
     }
     let layers = cfg.layers.min(validated.num_layers).max(1);
 
-    // Mixed-precision .dgq stores attention + dense-FFN as bf16 (Raw) — or q8 on
-    // earlier checkpoints. Detect from the actual stored kind so any vintage
-    // dispatches correctly (bf16 / q8 / uniform-q4).
-    let attn_ffn_kind = store
+    // Mixed-precision .dgq stores attention and dense-FFN INDEPENDENTLY —
+    // custom-class packs (`quantize --set attn=... --set dense=...`) can put
+    // them in different formats. Detect each from its own representative
+    // tensor's actual manifest kind (never from the coarse `QuantProfile`
+    // enum — see step_quant.rs doc comment).
+    let attn_kind = store
         .get_entry("model.decoder.layers.0.self_attn.q_proj.weight")
-        .and_then(|e| crate::dgq::layout::parse_quant_kind(&e.meta.kind).ok());
-    let attn_ffn_q8 = attn_ffn_kind == Some(crate::dgq::layout::QuantKind::Q8Row);
-    let attn_ffn_bf16 = attn_ffn_kind == Some(crate::dgq::layout::QuantKind::Raw);
+        .and_then(|e| crate::dgq::layout::parse_quant_kind(&e.meta.kind).ok())
+        .ok_or(Error::Format("missing/unreadable attn q_proj kind"))?;
+    let dense_kind = store
+        .get_entry("model.decoder.layers.0.mlp.gate_proj.weight")
+        .and_then(|e| crate::dgq::layout::parse_quant_kind(&e.meta.kind).ok())
+        .ok_or(Error::Format("missing/unreadable dense-FFN gate_proj kind"))?;
+    let attn_format = crate::metal::step_quant::DenseWeightFormat::from_kind(attn_kind)?;
+    let dense_format = crate::metal::step_quant::DenseWeightFormat::from_kind(dense_kind)?;
+    // Self-conditioning MLP: default q8_row; `--set sc=raw/q4/nvfp4` overrides.
+    let sc_kind = store
+        .get_entry("model.decoder.self_conditioning.gate_proj.weight")
+        .and_then(|e| crate::dgq::layout::parse_quant_kind(&e.meta.kind).ok())
+        .ok_or(Error::Format("missing/unreadable self_conditioning gate_proj kind"))?;
+    let sc_format = crate::metal::step_quant::DenseWeightFormat::from_kind(sc_kind)?;
 
     // Embed (tied lm_head + SC soft-embed) is q8-per-row on most checkpoints, bf16
     // (Raw) on newer ones. Detect from the stored kind so all three embed consumers
@@ -148,16 +161,38 @@ pub fn build_step_runtime(
         .get_entry("model.decoder.embed_tokens.weight")
         .and_then(|e| crate::dgq::layout::parse_quant_kind(&e.meta.kind).ok())
         == Some(crate::dgq::layout::QuantKind::Raw);
-    let block_profile = StepBlockProfile::from_store_profile(store.profile());
+
+    // Expert stacks: gate_up and down must resolve to the SAME format — the
+    // batched grouped-GEMM dispatch and blob-byte math (`grouped_expert_blob_bytes_per_expert`,
+    // `sparse_tunable_fmt`) key on one value. A custom pack that split
+    // `experts.gate_up`/`experts.down` into different formats would silently
+    // mis-dispatch one of the two stacks, so this is checked here rather than
+    // left implicit.
+    let expert_gate_up_kind = store
+        .get_entry("model.decoder.layers.0.experts.gate_up_proj")
+        .and_then(|e| crate::dgq::layout::parse_quant_kind(&e.meta.kind).ok())
+        .ok_or(Error::Format("missing/unreadable expert gate_up_proj kind"))?;
+    let expert_down_kind = store
+        .get_entry("model.decoder.layers.0.experts.down_proj")
+        .and_then(|e| crate::dgq::layout::parse_quant_kind(&e.meta.kind).ok())
+        .ok_or(Error::Format("missing/unreadable expert down_proj kind"))?;
+    if expert_gate_up_kind != expert_down_kind {
+        return Err(Error::Format(
+            "expert gate_up/down format mismatch: the step runtime dispatches both \
+             stacks through one shared format (not yet supported independently)",
+        ));
+    }
+    let block_profile = StepBlockProfile::from_kind(expert_gate_up_kind)?;
     if crate::flags::progress_enabled() {
         if embed_bf16 {
             eprintln!("step-kernel: bf16 embed (tied lm_head + SC)");
         }
         match block_profile.format {
-            QuantFormat::NvFp4 => eprintln!("step-kernel: nvfp4 block weights"),
-            QuantFormat::Q4Affine => eprintln!("step-kernel: q4 block weights"),
-            _ => eprintln!("step-kernel: block weights ({:?})", block_profile.format),
+            QuantFormat::NvFp4 => eprintln!("step-kernel: nvfp4 expert weights"),
+            QuantFormat::Q4Affine => eprintln!("step-kernel: q4 expert weights"),
+            _ => eprintln!("step-kernel: expert weights ({:?})", block_profile.format),
         }
+        eprintln!("step-kernel: attn weights ({attn_format:?}), dense-FFN weights ({dense_format:?})");
         match block_profile.moe_style() {
             MoeExecutionStyle::BatchedGrouped => {
                 eprintln!("step-kernel: batched grouped MoE");
@@ -466,8 +501,9 @@ pub fn build_step_runtime(
         weight_cache,
         text_config,
         block_profile,
-        attn_ffn_q8,
-        attn_ffn_bf16,
+        attn_format,
+        dense_format,
+        sc_format,
         embed_bf16,
         layout,
         tensor_offsets: offsets,

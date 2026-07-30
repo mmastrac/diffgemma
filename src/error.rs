@@ -25,6 +25,11 @@ pub enum Error {
     /// snapshot, size/header mismatch, unpinned base). Always carries an
     /// actionable message (e.g. the exact `hf download` command to run).
     Layered(String),
+    /// User-facing CLI/config validation failure (`quantize --set class=format`):
+    /// unknown class, locked class, unsupported class×format combo, or a
+    /// dimension constraint the offending tensor violates. Always names the
+    /// offending class/tensor/format in the message.
+    Config(String),
     DType {
         name: String,
         expected: DType,
@@ -48,6 +53,7 @@ impl std::fmt::Display for Error {
             Self::Runtime(msg) => write!(f, "runtime error: {msg}"),
             Self::NotFound(name) => write!(f, "tensor not found: {name}"),
             Self::Layered(msg) => write!(f, "{msg}"),
+            Self::Config(msg) => write!(f, "{msg}"),
             Self::DType {
                 name,
                 expected,

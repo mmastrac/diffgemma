@@ -66,6 +66,8 @@ pub(crate) fn parse_cli() -> Cli {
     // `quantize --overlay` / `repack --overlay`: emit an experts-only
     // overlay instead of a self-contained pack.
     let mut overlay_flag = false;
+    // `quantize --set class=format` (repeatable).
+    let mut quant_sets: Vec<String> = Vec::new();
     let mut hf_repo: Option<String> = None;
     let mut hf_revision: Option<String> = None;
     let mut hf_source: Option<PathBuf> = None;
@@ -321,6 +323,14 @@ pub(crate) fn parse_cli() -> Cli {
                 }
             }
             "--overlay" => overlay_flag = true,
+            "--set" => {
+                if let Some(v) = args.next() {
+                    quant_sets.push(v);
+                } else {
+                    eprintln!("usage: --set CLASS=FORMAT (e.g. --set experts=nvfp4)");
+                    std::process::exit(2);
+                }
+            }
             "--hf-repo" => {
                 if let Some(v) = args.next() {
                     hf_repo = Some(v);
@@ -682,8 +692,8 @@ pub(crate) fn parse_cli() -> Cli {
         Some("quantize") => {
             let out = output_dir.unwrap_or_else(|| {
                 eprintln!(
-                    "usage: diffgemma-mps quantize -o OUTPUT_DIR -m SOURCE [--profile q4|q5|q6|nvfp4] \
-                     [--overlay [--hf-repo ORG/NAME --hf-revision REV]]"
+                    "usage: diffgemma-mps quantize -o OUTPUT_DIR -m SOURCE [--profile q4|q5|q6|nvfp4|nvfp4x] \
+                     [--set class=format ...] [--overlay [--hf-repo ORG/NAME --hf-revision REV]]"
                 );
                 std::process::exit(2);
             });
@@ -693,6 +703,7 @@ pub(crate) fn parse_cli() -> Cli {
                 overlay: overlay_flag,
                 hf_repo,
                 hf_revision,
+                sets: quant_sets,
             }
         }
         Some("repack") => {

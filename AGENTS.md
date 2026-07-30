@@ -357,8 +357,20 @@ diffgemma-mps manifest                          # kernel FC-axis TOML
 # Requantize from HF safetensors
 diffgemma-mps quantize -m model/transformer -o model/diffusiongemma-q4emb --profile q4
 
+# Custom quantization classes (ARCHITECTURE.md §8.2): --set class=format
+# overrides classify_tensor's per-class output on top of --profile. Classes:
+# experts (or experts.gate_up / experts.down separately), attn, dense,
+# vision, sc. Formats: raw, q4, q6, q8, nvfp4 (per-class support varies —
+# an unsupported combo is a fatal error before anything is written).
+diffgemma-mps quantize -m model/transformer -o model/pack-mixed --profile q4 \
+  --set experts=q6 --set attn=nvfp4
+# nvfp4x is sugar for --profile q4 --set experts=nvfp4.
+diffgemma-mps quantize -m model/transformer -o model/pack-nvfp4x --profile nvfp4x
+
 # Layered/overlay packs (ARCHITECTURE.md §8.1): raw tensors ref the HF base
-# in ~/.cache/huggingface instead of being copied into the pack.
+# in ~/.cache/huggingface instead of being copied into the pack. Composes
+# with --set: a class switched from raw to quantized just moves from an
+# external ref to a local blob entry.
 diffgemma-mps quantize -m model/transformer -o model/pack-overlay --profile nvfp4 --overlay
 diffgemma-mps repack --overlay -m model/diffusiongemma-q4emb -o model/pack-overlay
 

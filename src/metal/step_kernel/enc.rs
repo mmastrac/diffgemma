@@ -13,12 +13,15 @@ pub(super) struct StepEnc<'a> {
     pub(super) tensor_offsets: &'a HashMap<String, u64>,
     /// Active canvas rows for lm_head (P2.5); `CANVAS` when full lm_head.
     pub(super) partial_lm_m: u32,
-    /// Attention + dense-FFN weights are stored q8 (mixed-precision .dgq): route
-    /// their GEMMs through the q8 kernel and skip the q4-only fused stacked path.
-    pub(super) attn_ffn_q8: bool,
-    /// Attention + dense-FFN weights are stored bf16 (Raw): route their GEMMs
-    /// through the bf16 kernel and skip the q4-only fused stacked path.
-    pub(super) attn_ffn_bf16: bool,
+    /// Attention (q/k/v/o_proj) weight format — independent of `dense_format`
+    /// (custom classes let them diverge, e.g. `--set attn=nvfp4`).
+    pub(super) attn_format: crate::metal::step_quant::DenseWeightFormat,
+    /// Dense-FFN (gate/up/down) weight format — independent of `attn_format`.
+    pub(super) dense_format: crate::metal::step_quant::DenseWeightFormat,
+    /// Self-conditioning MLP (gate/up/down) weight format — independent of
+    /// `attn_format`/`dense_format` (default q8, custom classes can override
+    /// via `--set sc=...`).
+    pub(super) sc_format: crate::metal::step_quant::DenseWeightFormat,
     /// Embed (tied lm_head + SC soft-embed) is stored bf16 (Raw) rather than
     /// q8-per-row: dispatch the bf16 gather / lm_head / softembed paths.
     pub(super) embed_bf16: bool,
@@ -218,8 +221,12 @@ impl StepEnc<'_> {
         });
     }
 
-    fn gemm_q4(
+    /// Dense (per-token) linear GEMM for an attention or dense-FFN weight —
+    /// `fmt` is the CALLER's `self.attn_format` or `self.dense_format` (never
+    /// a shared/global value: the two can diverge under a custom-class pack).
+    fn gemm_dense_linear(
         &mut self,
+        fmt: DenseWeightFormat,
         x_off: u64,
         y_off: u64,
         w_off: u64,
@@ -227,16 +234,16 @@ impl StepEnc<'_> {
         n: u32,
         k: u32,
     ) -> Result<(), Error> {
-        // Attention/dense-FFN weights are the only tensors routed through gemm_q4;
-        // in mixed-precision .dgq they are stored bf16 (or q8 on older checkpoints),
-        // so dispatch the matching kernel.
-        if self.attn_ffn_bf16 {
+        if fmt.is_bf16() {
             return self.gemm_bf16(x_off, y_off, w_off, m, n, k);
         }
-        if self.attn_ffn_q8 {
+        if fmt.is_q8() {
             return self.gemm_q8(x_off, y_off, w_off, m, n, k);
         }
-        let ps = self.ps.block_gemm(self.block_profile.format, n, k)?;
+        let block_fmt = fmt
+            .block_format()
+            .ok_or(Error::Format("dense linear: unresolved block format"))?;
+        let ps = self.ps.block_gemm(block_fmt, n, k)?;
         self.sink_set_pipeline(ps);
         self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
         self.sink_set_buffer(&self.bufs.arena, y_off as usize, 1);
@@ -259,6 +266,7 @@ impl StepEnc<'_> {
 
     fn gemm_q4_stacked(
         &mut self,
+        fmt: crate::shaders::QuantFormat,
         x_off: u64,
         segs: &[crate::shaders::gemm_block_stacked::GemmStackedSeg],
         m: u32,
@@ -267,11 +275,7 @@ impl StepEnc<'_> {
     ) -> Result<(), Error> {
         debug_assert!(segs.len() <= STACKED_SEG_MAX, "too many stacked segments");
         let ps = crate::shaders::gemm_tunable::stacked_pipeline_for(
-            self.ctx,
-            n_total,
-            k,
-            self.block_profile.format,
-            segs,
+            self.ctx, n_total, k, fmt, segs,
         )?;
         self.sink_set_pipeline(ps.as_ref());
         self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
@@ -873,7 +877,8 @@ impl StepEnc<'_> {
         let fm = self.forward_m;
         let l = &layout.layers[layer];
         let o_k = if l.is_full != 0 { 8192 } else { 4096 };
-        self.gemm_q4(
+        self.gemm_dense_linear(
+            self.attn_format,
             self.arena().attno_off(),
             self.arena().tmp_off(),
             l.o_proj,
@@ -946,7 +951,8 @@ impl StepEnc<'_> {
     ) -> Result<(), Error> {
         let fm = self.forward_m;
         let l = &layout.layers[layer];
-        self.gemm_q4(
+        self.gemm_dense_linear(
+            self.dense_format,
             self.arena().ffg_off(),
             self.arena().dense_off(),
             l.mlp_down,
@@ -963,7 +969,7 @@ impl StepEnc<'_> {
     ) -> Result<(), Error> {
         let fm = self.forward_m;
         let l = &layout.layers[layer];
-        if fused_gate_up_enabled() && self.attn_ffn_bf16 {
+        if fused_gate_up_enabled() && self.dense_format.is_bf16() {
             let (segs, n_total) = gate_up_stacked_segments(l, self.arena());
             self.gemm_bf16_stacked(
                 self.arena().tmp_off(),
@@ -972,9 +978,12 @@ impl StepEnc<'_> {
                 HID as u32,
                 n_total,
             )?;
-        } else if fused_gate_up_enabled() && !self.attn_ffn_q8 && !self.attn_ffn_bf16 {
+        } else if fused_gate_up_enabled()
+            && let Some(fmt) = self.dense_format.block_format()
+        {
             let (segs, n_total) = gate_up_stacked_segments(l, self.arena());
             self.gemm_q4_stacked(
+                fmt,
                 self.arena().tmp_off(),
                 &segs,
                 fm as u32,
@@ -982,7 +991,8 @@ impl StepEnc<'_> {
                 n_total,
             )?;
         } else {
-            self.gemm_q4(
+            self.gemm_dense_linear(
+                self.dense_format,
                 self.arena().tmp_off(),
                 self.arena().ffg_off(),
                 l.mlp_gate,
@@ -990,7 +1000,8 @@ impl StepEnc<'_> {
                 DENSE_FF,
                 HID as u32,
             )?;
-            self.gemm_q4(
+            self.gemm_dense_linear(
+                self.dense_format,
                 self.arena().tmp_off(),
                 self.arena().ffu_off(),
                 l.mlp_up,
@@ -1561,7 +1572,7 @@ impl StepEnc<'_> {
             HID as u32,
             fm,
         );
-        if fused_qkv_enabled() && self.attn_ffn_bf16 {
+        if fused_qkv_enabled() && self.attn_format.is_bf16() {
             let (segs, n_total) = qkv_stacked_segments(l, self.arena());
             self.gemm_bf16_stacked(
                 self.arena().tmp_off(),
@@ -1570,9 +1581,12 @@ impl StepEnc<'_> {
                 HID as u32,
                 n_total,
             )?;
-        } else if fused_qkv_enabled() && !self.attn_ffn_q8 && !self.attn_ffn_bf16 {
+        } else if fused_qkv_enabled()
+            && let Some(fmt) = self.attn_format.block_format()
+        {
             let (segs, n_total) = qkv_stacked_segments(l, self.arena());
             self.gemm_q4_stacked(
+                fmt,
                 self.arena().tmp_off(),
                 &segs,
                 fm as u32,
@@ -1582,7 +1596,8 @@ impl StepEnc<'_> {
         } else {
             let q_n = if l.is_full != 0 { 8192 } else { 4096 };
             let k_n = if l.is_full != 0 { 1024 } else { 2048 };
-            self.gemm_q4(
+            self.gemm_dense_linear(
+                self.attn_format,
                 self.arena().tmp_off(),
                 self.arena().attnq_off(),
                 l.q_proj,
@@ -1590,7 +1605,8 @@ impl StepEnc<'_> {
                 q_n,
                 HID as u32,
             )?;
-            self.gemm_q4(
+            self.gemm_dense_linear(
+                self.attn_format,
                 self.arena().tmp_off(),
                 self.arena().attnk_off(),
                 l.k_proj,
@@ -1599,7 +1615,8 @@ impl StepEnc<'_> {
                 HID as u32,
             )?;
             if l.v_proj != 0 {
-                self.gemm_q4(
+                self.gemm_dense_linear(
+                    self.attn_format,
                     self.arena().tmp_off(),
                     self.arena().attnv_off(),
                     l.v_proj,
@@ -1621,8 +1638,13 @@ impl StepEnc<'_> {
     ) -> Result<(), Error> {
         let l = &layout.layers[layer];
         if stacked {
+            let fmt = self
+                .attn_format
+                .block_format()
+                .ok_or(Error::Format("dispatch_qkv_gemms: stacked requires a block attn format"))?;
             let (segs, n_total) = qkv_stacked_segments(l, self.arena());
             self.gemm_q4_stacked(
+                fmt,
                 self.arena().tmp_off(),
                 &segs,
                 CANVAS as u32,
@@ -1632,7 +1654,8 @@ impl StepEnc<'_> {
         } else {
             let q_n = if l.is_full != 0 { 8192 } else { 4096 };
             let k_n = if l.is_full != 0 { 1024 } else { 2048 };
-            self.gemm_q4(
+            self.gemm_dense_linear(
+                self.attn_format,
                 self.arena().tmp_off(),
                 self.arena().attnq_off(),
                 l.q_proj,
@@ -1640,7 +1663,8 @@ impl StepEnc<'_> {
                 q_n,
                 HID as u32,
             )?;
-            self.gemm_q4(
+            self.gemm_dense_linear(
+                self.attn_format,
                 self.arena().tmp_off(),
                 self.arena().attnk_off(),
                 l.k_proj,
@@ -1649,7 +1673,8 @@ impl StepEnc<'_> {
                 HID as u32,
             )?;
             if l.v_proj != 0 {
-                self.gemm_q4(
+                self.gemm_dense_linear(
+                    self.attn_format,
                     self.arena().tmp_off(),
                     self.arena().attnv_off(),
                     l.v_proj,
@@ -1671,8 +1696,12 @@ impl StepEnc<'_> {
     ) -> Result<(), Error> {
         let l = &layout.layers[layer];
         if stacked {
+            let fmt = self.dense_format.block_format().ok_or(Error::Format(
+                "dispatch_gate_up_gemms: stacked requires a block dense format",
+            ))?;
             let (segs, n_total) = gate_up_stacked_segments(l, self.arena());
             self.gemm_q4_stacked(
+                fmt,
                 self.arena().tmp_off(),
                 &segs,
                 CANVAS as u32,
@@ -1680,7 +1709,8 @@ impl StepEnc<'_> {
                 n_total,
             )?;
         } else {
-            self.gemm_q4(
+            self.gemm_dense_linear(
+                self.dense_format,
                 self.arena().tmp_off(),
                 self.arena().ffg_off(),
                 l.mlp_gate,
@@ -1688,7 +1718,8 @@ impl StepEnc<'_> {
                 DENSE_FF,
                 HID as u32,
             )?;
-            self.gemm_q4(
+            self.gemm_dense_linear(
+                self.dense_format,
                 self.arena().tmp_off(),
                 self.arena().ffu_off(),
                 l.mlp_up,
@@ -2301,7 +2332,8 @@ impl StepEnc<'_> {
                 );
                 Ok(())
             }
-            StepStage::ScGateGemm => self.gemm_q8(
+            StepStage::ScGateGemm => self.gemm_dense_linear(
+                self.sc_format,
                 self.arena().tmp_off(),
                 self.arena().ffg_off(),
                 layout.sc_gate,
@@ -2309,7 +2341,8 @@ impl StepEnc<'_> {
                 DENSE_FF,
                 HID as u32,
             ),
-            StepStage::ScUpGemm => self.gemm_q8(
+            StepStage::ScUpGemm => self.gemm_dense_linear(
+                self.sc_format,
                 self.arena().tmp_off(),
                 self.arena().ffu_off(),
                 layout.sc_up,
@@ -2326,7 +2359,8 @@ impl StepEnc<'_> {
                 );
                 Ok(())
             }
-            StepStage::ScDownGemm => self.gemm_q8(
+            StepStage::ScDownGemm => self.gemm_dense_linear(
+                self.sc_format,
                 self.arena().ffg_off(),
                 self.arena().dense_off(),
                 layout.sc_down,
@@ -2661,7 +2695,8 @@ impl StepEnc<'_> {
                 HID as u32,
                 CANVAS,
             );
-            self.gemm_q8(
+            self.gemm_dense_linear(
+                self.sc_format,
                 self.arena().tmp_off(),
                 self.arena().ffg_off(),
                 layout.sc_gate,
@@ -2669,7 +2704,8 @@ impl StepEnc<'_> {
                 DENSE_FF,
                 HID as u32,
             )?;
-            self.gemm_q8(
+            self.gemm_dense_linear(
+                self.sc_format,
                 self.arena().tmp_off(),
                 self.arena().ffu_off(),
                 layout.sc_up,
@@ -2683,7 +2719,8 @@ impl StepEnc<'_> {
                 self.arena().ffg_off(),
                 CANVAS * DENSE_FF as usize,
             );
-            self.gemm_q8(
+            self.gemm_dense_linear(
+                self.sc_format,
                 self.arena().ffg_off(),
                 self.arena().dense_off(),
                 layout.sc_down,

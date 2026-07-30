@@ -198,6 +198,10 @@ pub fn repack_overlay(opts: RepackOverlayOptions) -> Result<RepackOverlaySummary
         local_expert_split,
         base_model: Some(base_model.clone()),
         external_files: external_files.clone(),
+        // Repacking only moves bytes (external ref vs local blob) — it never
+        // requantizes, so any custom-class overrides the source pack was
+        // built with still describe it exactly.
+        custom_classes: manifest_of(&opts.pack_dir)?.custom_classes,
         tensors: entries,
     };
     let manifest_json = serde_json::to_string_pretty(&manifest)?;

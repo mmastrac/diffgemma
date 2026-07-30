@@ -89,6 +89,9 @@ pub(crate) enum Command {
         overlay: bool,
         hf_repo: Option<String>,
         hf_revision: Option<String>,
+        /// Repeatable `--set class=format` overrides on top of `profile`
+        /// (e.g. `--set experts=nvfp4 --set attn=q6`).
+        sets: Vec<String>,
     },
     /// Split a self-contained `.dgq` pack into an experts-only overlay whose
     /// Raw tensors reference the HF base's safetensors shards.

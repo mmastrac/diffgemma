@@ -2,6 +2,87 @@
 
 use super::*;
 
+/// `QuantKind` -> the short `--set class=FORMAT` spelling (inverse of
+/// `dgq::layout::parse_custom_format`), for error messages that must echo
+/// back what the user typed rather than the on-disk `kind` string.
+fn short_format_name(kind: dgq::layout::QuantKind) -> &'static str {
+    match kind {
+        dgq::layout::QuantKind::Raw => "raw",
+        dgq::layout::QuantKind::Q4Block => "q4",
+        dgq::layout::QuantKind::Q6Block => "q6",
+        dgq::layout::QuantKind::Q8Row => "q8",
+        dgq::layout::QuantKind::Nvfp4Block => "nvfp4",
+    }
+}
+
+/// Parse `--set class=format` CLI strings into a resolved
+/// `TensorClass -> QuantKind` override map, validating as we go:
+/// - malformed `class=format` shape
+/// - unknown / locked class (`parse_tensor_class` names the lock reason)
+/// - unknown format
+/// - format not supported for that class (`TensorClass::supported_formats`)
+/// - conflicting duplicate overrides for the same exact class in one invocation
+///
+/// Does NOT validate per-tensor dimension constraints — that happens inside
+/// `quantize_model` against the real source shapes (this function runs before
+/// the source model is even opened).
+fn parse_custom_overrides(
+    sets: &[String],
+) -> Result<std::collections::BTreeMap<dgq::layout::TensorClass, dgq::layout::QuantKind>, String> {
+    use dgq::layout::{parse_custom_format, parse_tensor_class};
+    let mut overrides = std::collections::BTreeMap::new();
+    for spec in sets {
+        let (class_str, format_str) = spec
+            .split_once('=')
+            .ok_or_else(|| format!("--set '{spec}': expected CLASS=FORMAT (e.g. attn=q6)"))?;
+        let classes = parse_tensor_class(class_str).map_err(|e| e.to_string())?;
+        let kind = parse_custom_format(format_str).map_err(|e| e.to_string())?;
+        for class in classes {
+            if !class.supported_formats().contains(&kind) {
+                let supported: Vec<&str> = class
+                    .supported_formats()
+                    .iter()
+                    .map(|&k| short_format_name(k))
+                    .collect();
+                return Err(format!(
+                    "--set {}={format_str}: unsupported for class '{}' (the runtime has no \
+                     kernel for this combination); supported formats: {}",
+                    class_str,
+                    class.as_str(),
+                    supported.join(", ")
+                ));
+            }
+            if let Some(&prev) = overrides.get(&class)
+                && prev != kind
+            {
+                return Err(format!(
+                    "--set: conflicting overrides for class '{}' ({} then {format_str})",
+                    class.as_str(),
+                    format_str
+                ));
+            }
+            overrides.insert(class, kind);
+        }
+    }
+    // Expert gate_up/down must resolve to one shared format — the step
+    // runtime's batched grouped-GEMM dispatch keys on a single value (see
+    // build_step_runtime's gate_up/down match assertion in step_kernel/build.rs).
+    if let (Some(&gu), Some(&down)) = (
+        overrides.get(&dgq::layout::TensorClass::ExpertsGateUp),
+        overrides.get(&dgq::layout::TensorClass::ExpertsDown),
+    ) && gu != down
+    {
+        return Err(format!(
+            "--set: experts.gate_up={} and experts.down={} diverge — the step runtime \
+             dispatches both expert stacks through one shared format (not yet supported \
+             independently); use the same format for both, or omit one to inherit the profile.",
+            short_format_name(gu),
+            short_format_name(down)
+        ));
+    }
+    Ok(overrides)
+}
+
 pub(crate) fn run_quantize(
     source_dir: &std::path::Path,
     output: &std::path::Path,
@@ -9,21 +90,35 @@ pub(crate) fn run_quantize(
     overlay: bool,
     hf_repo: Option<&str>,
     hf_revision: Option<&str>,
+    sets: &[String],
 ) -> ExitCode {
     use dgq::layout::QuantProfile;
     use dgq::{QuantizeOptions, quantize_model};
 
     let profile_name = profile;
-    let profile = match profile {
-        "q4" => QuantProfile::Q4,
-        "q5" => QuantProfile::Q5,
-        "q6" => QuantProfile::Q6,
-        "nvfp4" => QuantProfile::Nvfp4,
-        // Perf-isolation only (see QuantProfile::Nvfp4Experts doc comment):
-        // experts nvfp4, everything else classified exactly like q4.
-        "nvfp4x" => QuantProfile::Nvfp4Experts,
+    // "nvfp4x" is sugar for `--profile q4 --set experts=nvfp4` — the general
+    // mechanism this knob surface replaces the old QuantProfile::Nvfp4Experts
+    // special case with (that variant still exists so already-written
+    // nvfp4_experts-profile manifests keep loading; new quantize runs never
+    // produce it again).
+    let (profile, sugar_sets): (QuantProfile, &[&str]) = match profile {
+        "q4" => (QuantProfile::Q4, &[]),
+        "q5" => (QuantProfile::Q5, &[]),
+        "q6" => (QuantProfile::Q6, &[]),
+        "nvfp4" => (QuantProfile::Nvfp4, &[]),
+        "nvfp4x" => (QuantProfile::Q4, &["experts=nvfp4"]),
         other => {
             eprintln!("error: unknown profile {other} (use q4, q5, q6, nvfp4, or nvfp4x)");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut all_sets: Vec<String> = sugar_sets.iter().map(|s| s.to_string()).collect();
+    all_sets.extend(sets.iter().cloned());
+    let custom_overrides = match parse_custom_overrides(&all_sets) {
+        Ok(o) => o,
+        Err(msg) => {
+            eprintln!("error: {msg}");
             return ExitCode::FAILURE;
         }
     };
@@ -64,12 +159,21 @@ pub(crate) fn run_quantize(
         out_dir.display(),
         if overlay { ", overlay" } else { "" },
     );
+    if !custom_overrides.is_empty() {
+        let mut pairs: Vec<String> = custom_overrides
+            .iter()
+            .map(|(c, k)| format!("{}={}", c.as_str(), k.as_str()))
+            .collect();
+        pairs.sort();
+        eprintln!("  custom classes: {}", pairs.join(", "));
+    }
     let started = std::time::Instant::now();
     match quantize_model(QuantizeOptions {
         source_dir: source_dir.to_path_buf(),
         output_prefix: out_dir.clone(),
         profile,
         overlay_base,
+        custom_overrides,
     }) {
         Ok(summary) => {
             let gib = summary.blob_bytes as f64 / (1024.0_f64.powi(3));
@@ -86,6 +190,19 @@ pub(crate) fn run_quantize(
             println!("  nvfp4 tensors: {}", summary.nvfp4_tensors);
             println!("  q8 tensors:    {}", summary.q8_tensors);
             println!("  raw tensors:   {}", summary.raw_tensors);
+            if !summary.custom_classes.is_empty() {
+                println!("  resolved class map (overrides only):");
+                for (class, kind) in &summary.custom_classes {
+                    println!("    {class:<16} -> {kind}");
+                }
+            }
+            println!("  per-class disk usage (canonical):");
+            for (class, bytes) in &summary.class_bytes {
+                println!(
+                    "    {class:<16} {:.3} GiB",
+                    *bytes as f64 / (1024.0_f64.powi(3))
+                );
+            }
             println!("  elapsed:       {:.2?}", started.elapsed());
             println!(
                 "  manifest:      {}/{}",

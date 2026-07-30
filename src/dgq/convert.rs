@@ -6,9 +6,10 @@ use crate::dgq::block::{
     quantize_expert_stack_q4, quantize_expert_stack_q6,
 };
 use crate::dgq::layout::{
-    BLOB_FILE, BaseModelRef, DGQ_VERSION_LAYERED, DgqManifest, DgqTensorEntry, DgqTensorMeta,
-    ExternalFile, ExternalRole, MANIFEST_FILE, QuantKind, QuantProfile, TensorSource,
-    align_offset, classify_tensor, dgq_version_for_profile,
+    BLOB_FILE, BaseModelRef, DGQ_VERSION_LAYERED, DGQ_VERSION_NVFP4, DgqManifest, DgqTensorEntry,
+    DgqTensorMeta, ExternalFile, ExternalRole, MANIFEST_FILE, QuantKind, QuantProfile,
+    TensorClass, TensorSource, align_offset, classify_tensor_custom, dgq_version_for_profile,
+    tensor_class, validate_format_dims,
 };
 use crate::dgq::hf_resolve::hash_safetensors_header;
 use crate::dgq::nvfp4::{quantize_bf16_matrix_nvfp4, quantize_expert_stack_nvfp4};
@@ -30,6 +31,9 @@ pub struct QuantizeOptions {
     /// `source_dir` to be (symlinks into) a resolvable HF cache snapshot —
     /// see `dgq::overlay::auto_or_override_base_model`.
     pub overlay_base: Option<BaseModelRef>,
+    /// `quantize --set class=format` overrides layered on `profile`
+    /// (`classify_tensor_custom`). Empty = identical to the base profile.
+    pub custom_overrides: BTreeMap<TensorClass, QuantKind>,
 }
 
 pub struct QuantizeSummary {
@@ -45,7 +49,18 @@ pub struct QuantizeSummary {
     pub nvfp4_tensors: usize,
     pub q8_tensors: usize,
     pub raw_tensors: usize,
+    /// Resolved class -> format actually applied (mirrors the manifest's
+    /// `custom_classes`; empty for a plain base-profile pack).
+    pub custom_classes: BTreeMap<String, String>,
+    /// Per-class byte totals (canonical, i.e. `blob_bytes`-space) for the
+    /// disk-math printout: `TensorClass::as_str()` for knob-addressable
+    /// tensors, `"locked/other"` for everything `tensor_class` doesn't map
+    /// (router, norms, embed_tokens, and anything else outside the five
+    /// classes).
+    pub class_bytes: BTreeMap<String, u64>,
 }
+
+const LOCKED_BUCKET: &str = "locked/other";
 
 pub fn quantize_model(opts: QuantizeOptions) -> Result<QuantizeSummary, Error> {
     let out_dir = opts.output_prefix;
@@ -53,6 +68,16 @@ pub fn quantize_model(opts: QuantizeOptions) -> Result<QuantizeSummary, Error> {
     copy_sidecar_files(&opts.source_dir, &out_dir)?;
 
     let store = SafetensorStore::open(&opts.source_dir)?;
+
+    // Validate every tensor's resolved (class, format) combination BEFORE
+    // writing a single byte — an invalid combo must never leave a partially
+    // written pack on disk.
+    for name in store.weight_map.keys() {
+        let (_, info) = store.get(name).ok_or_else(|| Error::NotFound(name.clone()))?;
+        let kind = classify_tensor_custom(name, &info.shape, opts.profile, &opts.custom_overrides);
+        validate_format_dims(name, &info.shape, kind)?;
+    }
+
     let blob_path = out_dir.join(BLOB_FILE);
     let mut blob = BufWriter::new(File::create(&blob_path)?);
 
@@ -70,6 +95,7 @@ pub fn quantize_model(opts: QuantizeOptions) -> Result<QuantizeSummary, Error> {
     let mut nvfp4_tensors = 0usize;
     let mut q8_tensors = 0usize;
     let mut raw_tensors = 0usize;
+    let mut class_bytes: BTreeMap<String, u64> = BTreeMap::new();
     let mut external_files: BTreeMap<String, ExternalFile> = BTreeMap::new();
     let mut shard_pin_cache: BTreeMap<String, (u64, String)> = BTreeMap::new();
 
@@ -101,7 +127,10 @@ pub fn quantize_model(opts: QuantizeOptions) -> Result<QuantizeSummary, Error> {
             .get(name)
             .ok_or_else(|| Error::NotFound(name.clone()))?;
         let src = shard.data(info);
-        let kind = classify_tensor(name, &info.shape, opts.profile);
+        let kind = classify_tensor_custom(name, &info.shape, opts.profile, &opts.custom_overrides);
+        let class_bucket = tensor_class(name, &info.shape)
+            .map(TensorClass::as_str)
+            .unwrap_or(LOCKED_BUCKET);
 
         offset = align_offset(offset);
         if expert_split.is_none() && is_expert(name) {
@@ -186,6 +215,7 @@ pub fn quantize_model(opts: QuantizeOptions) -> Result<QuantizeSummary, Error> {
             (byte_len, source)
         };
         offset += byte_len;
+        *class_bytes.entry(class_bucket.to_string()).or_insert(0) += byte_len;
 
         entries.push(DgqTensorEntry {
             name: name.clone(),
@@ -211,12 +241,31 @@ pub fn quantize_model(opts: QuantizeOptions) -> Result<QuantizeSummary, Error> {
     }
     blob.flush()?;
 
+    // Resolved class -> format map actually applied (only the classes the
+    // caller explicitly overrode — a plain base-profile pack has none).
+    let custom_classes: BTreeMap<String, String> = opts
+        .custom_overrides
+        .iter()
+        .map(|(&class, &kind)| (class.as_str().to_string(), kind.as_str().to_string()))
+        .collect();
+
+    // Version gates readers that predate a format's introduction (see
+    // `DGQ_VERSION_NVFP4` doc comment): a custom pack can introduce nvfp4
+    // tensors even when `profile` alone wouldn't (e.g. `--profile q4 --set
+    // experts=nvfp4`), so the bump is keyed on tensors ACTUALLY present, not
+    // on `profile`.
+    let base_version = dgq_version_for_profile(opts.profile);
+    let has_nvfp4 = entries.iter().any(|e| e.meta.kind == "nvfp4_block");
+    let version = if opts.overlay_base.is_some() {
+        DGQ_VERSION_LAYERED
+    } else if has_nvfp4 {
+        base_version.max(DGQ_VERSION_NVFP4)
+    } else {
+        base_version
+    };
+
     let manifest = DgqManifest {
-        version: if opts.overlay_base.is_some() {
-            DGQ_VERSION_LAYERED
-        } else {
-            dgq_version_for_profile(opts.profile)
-        },
+        version,
         profile: opts.profile,
         expert_split,
         local_expert_split,
@@ -224,6 +273,7 @@ pub fn quantize_model(opts: QuantizeOptions) -> Result<QuantizeSummary, Error> {
         blob_file: BLOB_FILE.to_string(),
         base_model: opts.overlay_base.clone(),
         external_files,
+        custom_classes: custom_classes.clone(),
         tensors: entries,
     };
     let manifest_json = serde_json::to_string_pretty(&manifest)?;
@@ -238,6 +288,8 @@ pub fn quantize_model(opts: QuantizeOptions) -> Result<QuantizeSummary, Error> {
         nvfp4_tensors,
         q8_tensors,
         raw_tensors,
+        custom_classes,
+        class_bytes,
     })
 }
 

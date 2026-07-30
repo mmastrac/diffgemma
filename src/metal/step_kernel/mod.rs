@@ -19,7 +19,9 @@ use crate::dgq::DgqStore;
 use crate::metal::device::{ComputePipeline, MetalContext};
 use crate::metal::dgq_gpu::DgqGpuBlob;
 use crate::metal::moe::experts_forward_dgq_cpu;
-use crate::metal::step_quant::{BlockGroupedJob, MoeExecutionStyle, StepBlockProfile};
+use crate::metal::step_quant::{
+    BlockGroupedJob, DenseWeightFormat, MoeExecutionStyle, StepBlockProfile,
+};
 use crate::metal::weights::GpuDecoderWeightCache;
 use crate::model::moe::MoeScratch;
 use crate::sample::{Rng, SamplerConfig, initialize_canvas};
