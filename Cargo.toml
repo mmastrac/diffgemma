@@ -36,6 +36,8 @@ opt-level = 1
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", default-features = false, features = ["std"] }
+# Raw mmap/MAP_FIXED for the VA-splice diagnostic probe (test-only usage).
+libc = "0.2"
 objc2-metal = { version = "0.3", default-features = false, features = [
     "MTLDevice",
     "MTLCommandQueue",
