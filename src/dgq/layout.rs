@@ -15,6 +15,10 @@ pub const BLOB_FILE: &str = "model.dgq.bin";
 pub const DGQ_VERSION_AFFINE: u32 = 1;
 pub const DGQ_VERSION_NVFP4: u32 = 2;
 pub const DGQ_VERSION_LAYERED: u32 = 3;
+/// Any pack with a non-empty `custom_classes` map. Binaries that predate
+/// kind-driven dispatch derived kernel formats from `profile` and would
+/// silently mis-dispatch a class that diverges from it — they must refuse.
+pub const DGQ_VERSION_CUSTOM: u32 = 4;
 
 pub fn dgq_version_for_profile(profile: QuantProfile) -> u32 {
     match profile {
@@ -24,7 +28,10 @@ pub fn dgq_version_for_profile(profile: QuantProfile) -> u32 {
 }
 
 pub fn dgq_version_supported(version: u32) -> bool {
-    version == DGQ_VERSION_AFFINE || version == DGQ_VERSION_NVFP4 || version == DGQ_VERSION_LAYERED
+    version == DGQ_VERSION_AFFINE
+        || version == DGQ_VERSION_NVFP4
+        || version == DGQ_VERSION_LAYERED
+        || version == DGQ_VERSION_CUSTOM
 }
 /// Affine int4 group size (legacy `q4_block`).
 pub const GROUP_SIZE: usize = 32;
@@ -800,7 +807,8 @@ mod tests {
     #[test]
     fn layered_version_gate() {
         assert!(dgq_version_supported(DGQ_VERSION_LAYERED));
-        assert!(!dgq_version_supported(4));
+        assert!(dgq_version_supported(DGQ_VERSION_CUSTOM));
+        assert!(!dgq_version_supported(5));
     }
 
     // -- Custom quantization classes (`quantize --set class=format`) --------

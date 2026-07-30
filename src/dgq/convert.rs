@@ -8,7 +8,8 @@ use crate::dgq::block::{
 use crate::dgq::layout::{
     BLOB_FILE, BaseModelRef, DGQ_VERSION_LAYERED, DGQ_VERSION_NVFP4, DgqManifest, DgqTensorEntry,
     DgqTensorMeta, ExternalFile, ExternalRole, MANIFEST_FILE, QuantKind, QuantProfile,
-    TensorClass, TensorSource, align_offset, classify_tensor_custom, dgq_version_for_profile,
+    DGQ_VERSION_CUSTOM, TensorClass, TensorSource, align_offset, classify_tensor_custom,
+    dgq_version_for_profile,
     tensor_class, validate_format_dims,
 };
 use crate::dgq::hf_resolve::hash_safetensors_header;
@@ -256,7 +257,13 @@ pub fn quantize_model(opts: QuantizeOptions) -> Result<QuantizeSummary, Error> {
     // on `profile`.
     let base_version = dgq_version_for_profile(opts.profile);
     let has_nvfp4 = entries.iter().any(|e| e.meta.kind == "nvfp4_block");
-    let version = if opts.overlay_base.is_some() {
+    // Custom class overrides outrank everything: pre-knob binaries derive
+    // kernel formats from `profile` and would silently mis-dispatch any class
+    // that diverges from it (layered-era binaries accept v3, nvfp4-era v2) —
+    // v4 makes every one of them refuse loudly instead.
+    let version = if !custom_classes.is_empty() {
+        DGQ_VERSION_CUSTOM
+    } else if opts.overlay_base.is_some() {
         DGQ_VERSION_LAYERED
     } else if has_nvfp4 {
         base_version.max(DGQ_VERSION_NVFP4)
