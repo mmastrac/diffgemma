@@ -27,7 +27,7 @@ impl StepBlockProfile {
 
 pub fn quant_format_from_profile(p: QuantProfile) -> QuantFormat {
     match p {
-        QuantProfile::Nvfp4 => QuantFormat::NvFp4,
+        QuantProfile::Nvfp4 | QuantProfile::Nvfp4Experts => QuantFormat::NvFp4,
         QuantProfile::Q4 | QuantProfile::Q5 => QuantFormat::Q4Affine,
         QuantProfile::Q6 => QuantFormat::Q6,
     }

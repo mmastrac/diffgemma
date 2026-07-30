@@ -19,8 +19,11 @@ pub(crate) fn run_quantize(
         "q5" => QuantProfile::Q5,
         "q6" => QuantProfile::Q6,
         "nvfp4" => QuantProfile::Nvfp4,
+        // Perf-isolation only (see QuantProfile::Nvfp4Experts doc comment):
+        // experts nvfp4, everything else classified exactly like q4.
+        "nvfp4x" => QuantProfile::Nvfp4Experts,
         other => {
-            eprintln!("error: unknown profile {other} (use q4, q5, q6, or nvfp4)");
+            eprintln!("error: unknown profile {other} (use q4, q5, q6, nvfp4, or nvfp4x)");
             return ExitCode::FAILURE;
         }
     };

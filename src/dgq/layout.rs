@@ -17,7 +17,7 @@ pub const DGQ_VERSION_LAYERED: u32 = 3;
 
 pub fn dgq_version_for_profile(profile: QuantProfile) -> u32 {
     match profile {
-        QuantProfile::Nvfp4 => DGQ_VERSION_NVFP4,
+        QuantProfile::Nvfp4 | QuantProfile::Nvfp4Experts => DGQ_VERSION_NVFP4,
         QuantProfile::Q4 | QuantProfile::Q5 | QuantProfile::Q6 => DGQ_VERSION_AFFINE,
     }
 }
@@ -39,6 +39,13 @@ pub enum QuantProfile {
     Q5,
     Q6,
     Nvfp4,
+    /// Perf-isolation variant (not a shipped profile): experts go
+    /// `nvfp4_block` exactly like `Nvfp4`, but every other tensor is
+    /// classified exactly as `Q4` classifies it (attention/dense FFN/vision
+    /// linears + embed stay `Raw`). Isolates the expert-format variable from
+    /// the `Nvfp4` profile's confound of also quantizing those other
+    /// tensors, for an apples-to-apples decode/prefill perf A/B against q4.
+    Nvfp4Experts,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -308,7 +315,9 @@ pub fn classify_tensor(name: &str, shape: &[i64], profile: QuantProfile) -> Quan
         // tiles (the source weights are bf16), beating MLX's q8 on these tensors.
         // Only the bulky MoE experts go to 4-bit. nvfp4 keeps its block format.
         return match profile {
-            QuantProfile::Q4 | QuantProfile::Q5 | QuantProfile::Q6 => QuantKind::Raw,
+            QuantProfile::Q4 | QuantProfile::Q5 | QuantProfile::Q6 | QuantProfile::Nvfp4Experts => {
+                QuantKind::Raw
+            }
             QuantProfile::Nvfp4 => QuantKind::Nvfp4Block,
         };
     }
@@ -316,7 +325,7 @@ pub fn classify_tensor(name: &str, shape: &[i64], profile: QuantProfile) -> Quan
         return match profile {
             QuantProfile::Q4 | QuantProfile::Q5 => QuantKind::Q4Block,
             QuantProfile::Q6 => QuantKind::Q6Block,
-            QuantProfile::Nvfp4 => QuantKind::Nvfp4Block,
+            QuantProfile::Nvfp4 | QuantProfile::Nvfp4Experts => QuantKind::Nvfp4Block,
         };
     }
     QuantKind::Raw
