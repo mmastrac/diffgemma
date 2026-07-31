@@ -67,6 +67,20 @@ impl EnvReader<'_> {
         Err(std::env::VarError::NotPresent)
     }
     fn var_os(&self, name: &str) -> Option<std::ffi::OsString> {
+        // Mirror `var`'s precedence: an explicit pairs set (tests, census
+        // arms) stands in for the env completely, checked BEFORE `real`.
+        // This was missing — DGQ_HF_HOME/DGQ_QUIET/DGQ_KV_MMAP_DIR/
+        // DGQ_CONV_CACHE_DIR/DGQ_TOOL_COMPACT_DIR/DGQ_PARITY_DEBUG (the only
+        // `var_os` consumers) silently ignored `from_pairs` overrides and
+        // fell straight through to "unset", even though `RuntimeConfig::
+        // from_pairs`'s contract (used by `install_for_test` and census arms)
+        // is "same helpers, same validation" as the real env.
+        if let Some(pairs) = self.pairs {
+            return pairs
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| std::ffi::OsString::from(v.clone()));
+        }
         if self.real {
             std::env::var_os(name)
         } else {
