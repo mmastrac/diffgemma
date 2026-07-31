@@ -613,7 +613,7 @@ pub(crate) fn parse_cli() -> Cli {
             seed,
             steps: steps_production,
             max_layers: parity_layers,
-            ctx: chat_ctx.unwrap_or(8192),
+            ctx: chat_ctx.unwrap_or(128 * 1024),
             tool_compact: serve_tool_compact,
             tool_repair: serve_tool_repair,
             tool_validate: serve_tool_validate,

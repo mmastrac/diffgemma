@@ -128,7 +128,7 @@ Interactive chat:
 target/release/diffgemma-mps chat -m model/diffgemma-26b-a4b-it-q4
 ```
 
-OpenAI-compatible HTTP server (defaults to `127.0.0.1:8080`, 8192-token
+OpenAI-compatible HTTP server (defaults to `127.0.0.1:8080`, 128k-token
 context):
 
 ```bash

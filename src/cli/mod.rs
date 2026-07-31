@@ -347,7 +347,7 @@ pub(crate) enum Command {
         seed: u64,
         steps: usize,
         max_layers: Option<usize>,
-        /// Context window (max_seq); default 8192.
+        /// Context window (max_seq); default 128k tokens.
         ctx: usize,
         /// Tool-output compaction (KV rewinder). Also `DGQ_TOOL_COMPACT=1`.
         tool_compact: bool,

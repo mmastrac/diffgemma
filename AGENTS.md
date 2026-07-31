@@ -324,7 +324,7 @@ never two model-loading PROCESSES at once, regardless of thread count.
 # Generate / chat / serve
 diffgemma-mps ask  -m $WEIGHTS -p "Hello" --seed 42
 diffgemma-mps chat -m $WEIGHTS                  # --ctx N for long context
-diffgemma-mps serve -m $WEIGHTS --ctx 8192      # OpenAI-compatible HTTP
+diffgemma-mps serve -m $WEIGHTS                 # OpenAI-compatible HTTP; --ctx N (default 128k)
 #   serve extras: --log-dir DIR (op-log ops.jsonl), --tool-repair, --tool-validate
 diffgemma-mps replay /path/ops.jsonl -m $WEIGHTS  # re-execute + diff an op-log
 
