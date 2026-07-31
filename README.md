@@ -23,8 +23,9 @@ no Python, no PyTorch, no MLX at run time.
 - **36 GB unified memory** minimum. The model quantizes to ~19 GiB of weights;
   headroom above that is the KV cache and working set.
 - **Rust** (stable) — install via [rustup](https://rustup.rs).
-- The **DiffusionGemma bf16 checkpoint** from Hugging Face (~50 GB download,
-  quantized locally to ~19 GiB of weights). See below.
+- A **quantized `.dgq` pack** (~19 GiB for `q4`). Either download a ready-made
+  one with the built-in `download` command, or fetch the ~50 GB bf16
+  DiffusionGemma checkpoint from Hugging Face and quantize it locally. See below.
 
 ## Quickstart
 
@@ -41,58 +42,95 @@ cargo build --release
 
 The binary lands at `target/release/diffgemma-mps`.
 
-### 2. Fetch the base model
+### 2. Get the model
 
-Download the bf16 checkpoint (config, tokenizer, and safetensors shards) from
-Hugging Face. You need `huggingface-cli` (`pip install -U huggingface_hub`) and
-access to the gated repo:
+There are two ways to end up with a runnable pack.
+
+**Option A — download a ready-to-run quantized pack (recommended).** The engine
+has a built-in `download` command that fetches a pre-quantized `.dgq` pack from
+Hugging Face and verifies it (manifest, version, blob length) before it prints
+`download ok`:
 
 ```bash
-huggingface-cli download google/diffusiongemma-26B-A4B-it \
-  --local-dir model/transformer
+target/release/diffgemma-mps download
+# defaults to mmastrac/diffusiongemma-q4emb -> model/diffusiongemma-q4emb
 ```
 
-Time here depends entirely on your connection — the checkpoint is ~50 GB.
+Pass `-o DIR` for a different target, or `--repo ORG/NAME --revision REV` for a
+specific pack. `download` **reuses your Hugging Face cache**: any file already
+under `~/.cache/huggingface/hub/` is symlinked in instead of re-fetched, so
 
-### 3. Quantize to `.dgq`
+```bash
+hf download mmastrac/diffusiongemma-q4emb   # populates the HF cache
+target/release/diffgemma-mps download        # links from cache, no second transfer
+```
 
-Convert the bf16 weights to the on-disk quantized format this engine loads.
-The default `q4` profile keeps the MoE experts at 4-bit (the bulk of the bytes)
-and is what the 36 GB target assumes:
+costs one transfer, not two. Skip straight to [step 3](#3-run).
+
+**Option B — quantize it yourself from the base checkpoint.** Fetch the bf16
+DiffusionGemma weights into your Hugging Face cache. You need the `hf` CLI
+(`pip install -U huggingface_hub`) and access to the gated repo:
+
+```bash
+hf download google/diffusiongemma-26B-A4B-it
+```
+
+This is ~50 GB and lands in `~/.cache/huggingface/hub/`. You do **not** need
+`--local-dir` — the quantizer reads the checkpoint straight from the cache by
+its repo id. Then quantize:
 
 ```bash
 target/release/diffgemma-mps quantize \
-  -m model/transformer \
-  -o model/diffusiongemma-q4 \
+  -m google/diffusiongemma-26B-A4B-it \
+  -o model/diffgemma-26b-a4b-it-q4 \
   --profile q4
 ```
 
-This writes a self-contained `model/diffusiongemma-q4/` directory
-(`model.dgq.json` manifest, `model.dgq.bin` blob, plus the copied tokenizer and
-config). Quantization runs offline from the raw bf16 weights and takes a few
-minutes. Profiles: `q4` (default), `q5`, `q6`, `nvfp4`.
+`-m` accepts a local directory or an `org/name` Hugging Face repo id; a repo id
+resolves to the newest snapshot in your cache (and fails with the exact `hf
+download` command to run if nothing is cached). This writes a self-contained
+`model/diffgemma-26b-a4b-it-q4/` directory (`model.dgq.json` manifest,
+`model.dgq.bin` blob, plus the copied tokenizer and config) in a few minutes.
 
-### 4. Run
+**Profiles** (embeddings, router, and norms always stay bf16 — precision-
+sensitive and small):
+
+| Profile        | MoE experts       | Attention + dense FFN | ~weights |
+|----------------|-------------------|-----------------------|----------|
+| `q4` (default) | 4-bit affine (5.0b) | bf16                | ~19 GiB  |
+| `nvfp4x`       | NVFP4 (~4.5b)     | bf16                  | ~18 GiB  |
+| `nvfp4`        | NVFP4             | NVFP4                 | ~16 GiB  |
+| `q6`           | 6-bit affine (7.0b) | bf16                | ~24 GiB  |
+
+`--set class=format` overrides one tensor class for finer control (e.g. `--set
+experts=nvfp4`, which is exactly what `nvfp4x` expands to). See
+[ARCHITECTURE.md](ARCHITECTURE.md) for the full class/format matrix.
+
+### 3. Run
+
+Point `-m` at whichever pack directory step 2 produced
+(`model/diffusiongemma-q4emb` for Option A, `model/diffgemma-26b-a4b-it-q4` for
+Option B).
 
 One-shot prompt:
 
 ```bash
 target/release/diffgemma-mps ask \
-  -m model/diffusiongemma-q4 \
+  -m model/diffusiongemma-q4emb \
   -p "Explain block diffusion decoding in two sentences."
 ```
 
 Interactive chat:
 
 ```bash
-target/release/diffgemma-mps chat -m model/diffusiongemma-q4
+target/release/diffgemma-mps chat -m model/diffusiongemma-q4emb
 ```
 
 OpenAI-compatible HTTP server (defaults to `127.0.0.1:8080`, 8192-token
 context):
 
 ```bash
-target/release/diffgemma-mps serve -m model/diffusiongemma-q4
+target/release/diffgemma-mps serve -m model/diffusiongemma-q4emb
 # then POST to http://127.0.0.1:8080/v1/chat/completions
 ```
 
