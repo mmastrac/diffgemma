@@ -317,7 +317,7 @@ never two model-loading PROCESSES at once, regardless of thread count.
 
 ## 9. Command reference
 
-`WEIGHTS=model/diffusiongemma-q4emb`; binary at `target/release/diffgemma-mps`
+`WEIGHTS=model/diffgemma-26b-a4b-it-q4`; binary at `target/release/diffgemma-mps`
 (build: `cargo build --release`).
 
 ```bash
@@ -359,18 +359,18 @@ diffgemma-mps manifest                          # kernel FC-axis TOML
 # local HF cache is resolved, or the exact `hf download` remedy is printed.
 # Works for every command that takes -m, including quantize/repack source.
 diffgemma-mps chat -m google/diffusiongemma-26B-A4B-it
-diffgemma-mps chat -m mmastrac/diffusiongemma-q4emb   # a downloaded pack, read-only
+diffgemma-mps chat -m mmastrac/diffgemma-26b-a4b-it-q4   # a downloaded pack, read-only
 
 # Fetch a monolithic pack from HF — the distribution format (layered/overlay
 # packs are local-only dev tooling, never what ships to users). Verifies the
 # transfer (manifest version, blob length) and prints a one-line pack
 # summary once done.
-diffgemma-mps download --repo mmastrac/diffusiongemma-q4emb -o model/diffusiongemma-q4emb
+diffgemma-mps download --repo mmastrac/diffgemma-26b-a4b-it-q4 -o model/diffgemma-26b-a4b-it-q4
 
 # Requantize from HF safetensors (source: a local dir or a repo id, per
 # above — a repo id ALSO pins (repo, revision) exactly for --overlay below,
 # in place of the single-symlink-hop auto-detect).
-diffgemma-mps quantize -m model/transformer -o model/diffusiongemma-q4emb --profile q4
+diffgemma-mps quantize -m model/transformer -o model/diffgemma-26b-a4b-it-q4 --profile q4
 
 # Custom quantization classes (ARCHITECTURE.md §8.2): --set class=format
 # overrides classify_tensor's per-class output on top of --profile. Classes:
@@ -389,10 +389,10 @@ diffgemma-mps quantize -m model/transformer -o model/pack-nvfp4x --profile nvfp4
 # switched from raw to quantized just moves from an external ref to a local
 # blob entry.
 diffgemma-mps quantize -m model/transformer -o model/pack-overlay --profile nvfp4 --overlay
-diffgemma-mps repack --overlay -m model/diffusiongemma-q4emb -o model/pack-overlay
+diffgemma-mps repack --overlay -m model/diffgemma-26b-a4b-it-q4 -o model/pack-overlay
 # The dual: flatten a layered pack back to a self-contained (monolithic) one
 # — no requantization, just a byte-copy driven by the manifest's own offsets.
-diffgemma-mps repack --monolithic -m model/pack-overlay -o model/diffusiongemma-q4emb
+diffgemma-mps repack --monolithic -m model/pack-overlay -o model/diffgemma-26b-a4b-it-q4
 
 # MLX reference comparison (SERIALIZE with our runs — never in parallel)
 python/.venv/bin/python python/scripts/mlx_generate.py -p "..." -o /tmp/mlx.json

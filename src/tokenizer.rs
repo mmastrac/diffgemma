@@ -530,7 +530,7 @@ mod tests {
 
     fn model_tokenizer_q4_or_transformer() -> Option<Tokenizer> {
         for path in [
-            PathBuf::from("model/diffusiongemma-q4emb/tokenizer.json"),
+            PathBuf::from("model/diffgemma-26b-a4b-it-q4/tokenizer.json"),
             PathBuf::from("model/transformer/tokenizer.json"),
         ] {
             if path.exists() {

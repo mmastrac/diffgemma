@@ -179,7 +179,7 @@ fn sc_chunked_softembed_nondeterminism_probe() {
     use std::path::Path;
 
     let dir = [
-        Path::new("model/diffusiongemma-q4emb"),
+        Path::new("model/diffgemma-26b-a4b-it-q4"),
         Path::new("/tmp/quantized-weights"),
         Path::new("model/diffusiongemma-q4"),
         Path::new("model/q4"),
@@ -276,7 +276,7 @@ fn offset_prefill_kv_bit_identity() {
     use std::path::Path;
 
     let dir = [
-        Path::new("model/diffusiongemma-q4emb"),
+        Path::new("model/diffgemma-26b-a4b-it-q4"),
         Path::new("/tmp/quantized-weights"),
         Path::new("model/diffusiongemma-q4"),
         Path::new("model/q4"),
@@ -432,7 +432,7 @@ fn fused_gate_up_gemm_matches_split_in_full_arena() {
     }
 
     let dir = [
-        Path::new("model/diffusiongemma-q4emb"),
+        Path::new("model/diffgemma-26b-a4b-it-q4"),
         Path::new("/tmp/quantized-weights"),
     ]
     .into_iter()
@@ -528,7 +528,7 @@ fn generate_path_reset_block_matches_step_smoke_ids() {
     use std::path::Path;
 
     let dir = [
-        Path::new("model/diffusiongemma-q4emb"),
+        Path::new("model/diffgemma-26b-a4b-it-q4"),
         Path::new("/tmp/quantized-weights"),
     ]
     .into_iter()
@@ -594,7 +594,7 @@ fn fusion_matches_unfused_forward_logits() {
     }
 
     let dir = [
-        Path::new("model/diffusiongemma-q4emb"),
+        Path::new("model/diffgemma-26b-a4b-it-q4"),
         Path::new("/tmp/quantized-weights"),
     ]
     .into_iter()

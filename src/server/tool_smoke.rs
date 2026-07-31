@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 fn model_dir() -> Option<PathBuf> {
-    for p in ["model/diffusiongemma-q4emb", "/tmp/quantized-weights"] {
+    for p in ["model/diffgemma-26b-a4b-it-q4", "/tmp/quantized-weights"] {
         let d = PathBuf::from(p);
         if d.join("model.dgq.json").exists() {
             return Some(d);

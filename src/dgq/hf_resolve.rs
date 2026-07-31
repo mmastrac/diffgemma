@@ -256,7 +256,7 @@ mod tests {
     #[test]
     fn repo_id_shape_detection() {
         assert!(looks_like_hf_repo_id("google/diffusiongemma-26B-A4B-it"));
-        assert!(looks_like_hf_repo_id("mmastrac/diffusiongemma-q4emb"));
+        assert!(looks_like_hf_repo_id("mmastrac/diffgemma-26b-a4b-it-q4"));
         assert!(looks_like_hf_repo_id("model/transformer")); // shape-only; disambiguated by is_dir() first
         assert!(!looks_like_hf_repo_id("model/transformer/extra"));
         assert!(!looks_like_hf_repo_id("just-a-name"));

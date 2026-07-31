@@ -735,9 +735,9 @@ pub(crate) fn parse_cli() -> Cli {
         Some("download") => Command::Download {
             // Default repo/dest mirror the model card; -o overrides the target.
             repo: download_repo
-                .unwrap_or_else(|| "mmastrac/diffusiongemma-q4emb".to_string()),
+                .unwrap_or_else(|| "mmastrac/diffgemma-26b-a4b-it-q4".to_string()),
             revision: download_revision,
-            dest: output_dir.unwrap_or_else(|| PathBuf::from("model/diffusiongemma-q4emb")),
+            dest: output_dir.unwrap_or_else(|| PathBuf::from("model/diffgemma-26b-a4b-it-q4")),
             force: download_force,
             jobs: download_jobs,
         },

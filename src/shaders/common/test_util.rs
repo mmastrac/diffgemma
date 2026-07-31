@@ -11,7 +11,7 @@ pub enum ElemFormat {
 /// Quantized-model directory for real-weight tests: the in-repo model first,
 /// then the legacy /tmp path. Tests gated on this skip gracefully when absent.
 pub fn dgq_model_dir() -> Option<std::path::PathBuf> {
-    for p in ["model/diffusiongemma-q4emb", "/tmp/quantized-weights"] {
+    for p in ["model/diffgemma-26b-a4b-it-q4", "/tmp/quantized-weights"] {
         let d = std::path::PathBuf::from(p);
         if d.join("model.dgq.json").exists() {
             return Some(d);

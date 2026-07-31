@@ -4,11 +4,11 @@ use super::*;
 use crate::metal::device::MetalContext;
 
 pub(super) fn model_dir() -> Option<std::path::PathBuf> {
-    let dir = std::path::Path::new("model/diffusiongemma-q4emb");
+    let dir = std::path::Path::new("model/diffgemma-26b-a4b-it-q4");
     if dir.join("model.dgq.json").exists() {
         Some(dir.to_path_buf())
     } else {
-        eprintln!("skip: model/diffusiongemma-q4emb missing");
+        eprintln!("skip: model/diffgemma-26b-a4b-it-q4 missing");
         None
     }
 }

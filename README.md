@@ -53,7 +53,7 @@ Hugging Face and verifies it (manifest, version, blob length) before it prints
 
 ```bash
 target/release/diffgemma-mps download
-# defaults to mmastrac/diffusiongemma-q4emb -> model/diffusiongemma-q4emb
+# defaults to mmastrac/diffgemma-26b-a4b-it-q4 -> model/diffgemma-26b-a4b-it-q4
 ```
 
 Pass `-o DIR` for a different target, or `--repo ORG/NAME --revision REV` for a
@@ -61,7 +61,7 @@ specific pack. `download` **reuses your Hugging Face cache**: any file already
 under `~/.cache/huggingface/hub/` is symlinked in instead of re-fetched, so
 
 ```bash
-hf download mmastrac/diffusiongemma-q4emb   # populates the HF cache
+hf download mmastrac/diffgemma-26b-a4b-it-q4   # populates the HF cache
 target/release/diffgemma-mps download        # links from cache, no second transfer
 ```
 
@@ -108,29 +108,28 @@ experts=nvfp4`, which is exactly what `nvfp4x` expands to). See
 
 ### 3. Run
 
-Point `-m` at whichever pack directory step 2 produced
-(`model/diffusiongemma-q4emb` for Option A, `model/diffgemma-26b-a4b-it-q4` for
-Option B).
+Point `-m` at the pack directory step 2 produced — `model/diffgemma-26b-a4b-it-q4`
+for either option.
 
 One-shot prompt:
 
 ```bash
 target/release/diffgemma-mps ask \
-  -m model/diffusiongemma-q4emb \
+  -m model/diffgemma-26b-a4b-it-q4 \
   -p "Explain block diffusion decoding in two sentences."
 ```
 
 Interactive chat:
 
 ```bash
-target/release/diffgemma-mps chat -m model/diffusiongemma-q4emb
+target/release/diffgemma-mps chat -m model/diffgemma-26b-a4b-it-q4
 ```
 
 OpenAI-compatible HTTP server (defaults to `127.0.0.1:8080`, 8192-token
 context):
 
 ```bash
-target/release/diffgemma-mps serve -m model/diffusiongemma-q4emb
+target/release/diffgemma-mps serve -m model/diffgemma-26b-a4b-it-q4
 # then POST to http://127.0.0.1:8080/v1/chat/completions
 ```
 

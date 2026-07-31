@@ -822,7 +822,7 @@ mod tests {
     #[test]
     fn custom_zero_override_matches_base_profile_on_real_manifest() {
         let Some(dir) = crate::shaders::test_util::dgq_model_dir() else {
-            eprintln!("skip: no dgq model dir (model/diffusiongemma-q4emb missing)");
+            eprintln!("skip: no dgq model dir (model/diffgemma-26b-a4b-it-q4 missing)");
             return;
         };
         let json = std::fs::read_to_string(dir.join(MANIFEST_FILE)).expect("read manifest");
@@ -851,7 +851,7 @@ mod tests {
     #[test]
     fn custom_override_kind_histograms() {
         let Some(dir) = crate::shaders::test_util::dgq_model_dir() else {
-            eprintln!("skip: no dgq model dir (model/diffusiongemma-q4emb missing)");
+            eprintln!("skip: no dgq model dir (model/diffgemma-26b-a4b-it-q4 missing)");
             return;
         };
         let json = std::fs::read_to_string(dir.join(MANIFEST_FILE)).expect("read manifest");
