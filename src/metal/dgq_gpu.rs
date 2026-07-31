@@ -3,8 +3,8 @@
 use crate::Error;
 use crate::dgq::DgqStore;
 use crate::dgq::layout::{
-    DgqManifest, MANIFEST_FILE, QuantKind, TensorSource, blob_offset_for_mtl, blob_offset_usize,
-    dgq_version_supported, nvfp4_matrix_bytes, q4_matrix_bytes, q8_row_bytes,
+    DgqManifest, DgqTensorEntry, MANIFEST_FILE, QuantKind, TensorSource, blob_offset_for_mtl,
+    blob_offset_usize, dgq_version_supported, nvfp4_matrix_bytes, q4_matrix_bytes, q8_row_bytes,
 };
 use memmap2::{Mmap, MmapMut};
 use objc2::rc::Retained;
@@ -13,19 +13,26 @@ use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fs::File;
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::Arc;
+
+/// Apple Silicon page size — both the VM granule `MAP_FIXED`/`mmap` offsets
+/// must respect and the "page-congruent" unit the head-splice plan and
+/// writer agree on.
+const HEAD_SPLICE_PAGE: u64 = 16384;
 
 /// Keeps mmap + file alive while the GPU buffer references the mapping.
 /// `_file`/`_mmap` back region 1 (head); `_tail_file`/`_tail_mmap` are only
 /// `Some` when region 2 (experts) is backed by a DIFFERENT mapping than
 /// region 1 — the layered split-source path below, where the (large) expert
 /// tail is wrapped straight off this pack's own blob file instead of being
-/// gather-copied. `_file` is `None` for an anonymous (materialized) mapping.
+/// gather-copied. `_file` is `None` for an anonymous (materialized) mapping
+/// or a VA-spliced head (see `HeadRegion`).
 pub struct DgqGpuBlob {
     _file: Option<File>,
-    _mmap: Mmap,
+    _mmap: HeadRegion,
     _tail_file: Option<File>,
     _tail_mmap: Option<Mmap>,
     /// Region 1: [0, expert_split) when split, else the whole blob.
@@ -35,6 +42,51 @@ pub struct DgqGpuBlob {
     /// 0 when single-buffer.
     pub expert_split: u64,
     pub len: usize,
+}
+
+/// Minimum canonical-offset alignment every `.dgq` tensor entry has always
+/// had, unconditionally, since before layered packs existed: several
+/// production kernels reinterpret `blob + w_off` as a typed pointer (e.g.
+/// `gemm_rowk.metal`: `device const ushort *w = (device const ushort
+/// *)(blob + w_off)`, then indexed) — correctness of that read depends on
+/// `w_off` being sufficiently aligned, and 64 bytes is the value every
+/// working pack (self-contained or layered) has always used via the writer's
+/// unconditional `align_offset`.
+const TENSOR_OFFSET_ALIGN: u64 = 64;
+
+/// Load-time tripwire for the failure class a byte-content check CANNOT see:
+/// a `w_off` that is byte-CORRECT (right tensor, right value once read) but
+/// insufficiently aligned for the typed-pointer reads several kernels do.
+/// This is cheap (manifest-only, no I/O) and unconditional — it runs for
+/// every pack, not just layered ones, and would have caught, at load time
+/// with a clear diagnostic instead of silently wrong generation, the writer
+/// regression `writer_plan_integration_tests` predates (a VA-splice writer
+/// draft dropped per-tensor alignment inside a shard-run to mirror the
+/// source file's zero-gap layout — safe for byte CONTENT, unsafe for GPU
+/// reads; `gpu_buffer_matches_store_for_every_tensor`'s host_ptr-vs-
+/// `DgqStore` comparison does NOT catch this, because both sides read
+/// through untyped byte pointers with no alignment requirement of their
+/// own — only the actual GPU kernel's typed reinterpret-cast cares).
+fn assert_tensor_offset_alignment(manifest: &DgqManifest) -> Result<(), Error> {
+    let offenders: Vec<&str> = manifest
+        .tensors
+        .iter()
+        .filter(|t| !t.meta.offset.is_multiple_of(TENSOR_OFFSET_ALIGN))
+        .map(|t| t.name.as_str())
+        .collect();
+    if offenders.is_empty() {
+        return Ok(());
+    }
+    eprintln!(
+        "dgq: {} tensor(s) have a canonical offset not aligned to {TENSOR_OFFSET_ALIGN} bytes \
+         — this pack is unsafe to load (GPU kernels read weight bytes through a typed pointer \
+         cast at that offset); first few: {:?}",
+        offenders.len(),
+        &offenders[..offenders.len().min(10)]
+    );
+    Err(Error::Format(
+        "dgq: manifest has misaligned tensor offset(s) — refusing to load",
+    ))
 }
 
 impl DgqGpuBlob {
@@ -49,6 +101,7 @@ impl DgqGpuBlob {
         if !dgq_version_supported(manifest.version) {
             return Err(Error::Format("unsupported .dgq version"));
         }
+        assert_tensor_offset_alignment(&manifest)?;
         if manifest.is_layered() {
             if let (Some(expert_split), Some(local_expert_split)) =
                 (manifest.expert_split, manifest.local_expert_split)
@@ -88,10 +141,28 @@ impl DgqGpuBlob {
         Self::wrap_mmap(Some(file), mmap, manifest.expert_split, device)
     }
 
-    /// Layered split-source path: head materialized anonymously, expert tail
-    /// wrapped directly off `manifest.blob_file` at `local_expert_split`
-    /// (page-aligned, so the pointer arithmetic mirrors the self-contained
-    /// split-buffer wrap in [`Self::wrap_mmap`]).
+    /// Layered split-source path: head served via VA-splice when the plan
+    /// allows it (`build_head_splice`), expert tail wrapped directly off
+    /// `manifest.blob_file` at `local_expert_split` (page-aligned, so the
+    /// pointer arithmetic mirrors the self-contained split-buffer wrap in
+    /// [`Self::wrap_mmap`]). On ANY failure in the splice attempt
+    /// (unsatisfiable plan, OS/Metal step failure) falls back to
+    /// materializing ONLY the head into a private anonymous mapping — the
+    /// (large) expert tail STAYS the cheap file-backed no-copy mmap either
+    /// way. This is deliberately NOT the whole-blob `materialize_layered_blob`
+    /// fallback: that path re-gathers the entire canonical blob (head AND
+    /// the multi-GiB expert tail) into anonymous memory, which is fine for
+    /// its OTHER caller (a manifest missing `local_expert_split` entirely,
+    /// where there's no cheap tail wrap to preserve) but would silently
+    /// double the resident/dirty memory of every load whenever splicing
+    /// fails — measured live: with zero splice coverage on the shipped
+    /// model (see ARCHITECTURE.md §8.1), routing here through the whole-blob
+    /// path made every model-gated test pay a private ~18.84 GiB anonymous
+    /// buffer instead of a shared ~13.3 GiB mmap, and two such loads
+    /// overlapping (membudget permits it; each looks like one "load") OOM-
+    /// killed the process the full suite ran in. Correctness never depends
+    /// on the splice succeeding either way — only which fallback shape a
+    /// failure takes.
     fn from_store_layered_split(
         model_dir: &Path,
         manifest: &DgqManifest,
@@ -99,7 +170,30 @@ impl DgqGpuBlob {
         local_expert_split: u64,
         device: &ProtocolObject<dyn MTLDevice>,
     ) -> Result<Arc<Self>, Error> {
-        let (head_file, head_mmap) = layered_head_mmap(model_dir, manifest, expert_split)?;
+        let head = match build_head_splice(model_dir, manifest, expert_split) {
+            Ok(spliced) => HeadRegion::Spliced(spliced),
+            Err(err) => {
+                eprintln!(
+                    "dgq layered blob: head splice unavailable ({err}); materializing just the \
+                     head anonymously (expert tail stays the cheap file-backed no-copy mmap) — \
+                     correctness never depends on splice"
+                );
+                HeadRegion::Mmap(materialize_layered_head_only(model_dir, manifest, expert_split)?)
+            }
+        };
+        Self::finish_layered_split(model_dir, manifest, expert_split, local_expert_split, head, device)
+    }
+
+    fn finish_layered_split(
+        model_dir: &Path,
+        manifest: &DgqManifest,
+        expert_split: u64,
+        local_expert_split: u64,
+        head: HeadRegion,
+        device: &ProtocolObject<dyn MTLDevice>,
+    ) -> Result<Arc<Self>, Error> {
+        let head_len = head.len();
+
         let local_bin_path = model_dir.join(&manifest.blob_file);
         let local_file = File::open(&local_bin_path)?;
         if !local_expert_split.is_multiple_of(16384) {
@@ -124,7 +218,6 @@ impl DgqGpuBlob {
             ));
         }
 
-        let head_len = head_mmap.len();
         // Defense in depth: the writer's `local_expert_split` claim (tail is
         // byte-identical, same relative offsets, to canonical
         // [expert_split, total)) is exactly what `w_off` addressing depends
@@ -152,13 +245,8 @@ impl DgqGpuBlob {
                 "dgq layered blob region exceeds device max buffer length even after expert split",
             ));
         }
-        eprintln!(
-            "dgq layered blob: head {:.2} GiB materialized, expert tail {:.2} GiB file-backed (no copy)",
-            head_len as f64 / 1073741824.0,
-            tail_len as f64 / 1073741824.0,
-        );
         let head_ptr =
-            NonNull::new(head_mmap.as_ptr() as *mut c_void).ok_or(Error::Runtime("dgq mmap null"))?;
+            NonNull::new(head.as_ptr() as *mut c_void).ok_or(Error::Runtime("dgq mmap null"))?;
         let buffer = unsafe {
             device
                 .newBufferWithBytesNoCopy_length_options_deallocator(
@@ -167,7 +255,7 @@ impl DgqGpuBlob {
                     MTLResourceOptions::StorageModeShared,
                     None,
                 )
-                .ok_or(Error::Gpu("dgq gpu blob region1 alloc failed"))?
+                .ok_or(Error::Gpu("dgq gpu blob region1 (head) alloc failed"))?
         };
         let tail_ptr = NonNull::new(local_mmap.as_ptr() as *mut c_void)
             .ok_or(Error::Runtime("dgq mmap region2 null"))?;
@@ -182,8 +270,8 @@ impl DgqGpuBlob {
                 .ok_or(Error::Gpu("dgq gpu blob region2 alloc failed"))?
         };
         Ok(Arc::new(Self {
-            _file: head_file,
-            _mmap: head_mmap,
+            _file: None,
+            _mmap: head,
             _tail_file: Some(local_file),
             _tail_mmap: Some(local_mmap),
             buffer,
@@ -220,7 +308,7 @@ impl DgqGpuBlob {
             };
             return Ok(Arc::new(Self {
                 _file: file,
-                _mmap: mmap,
+                _mmap: HeadRegion::Mmap(mmap),
                 _tail_file: None,
                 _tail_mmap: None,
                 buffer,
@@ -274,7 +362,7 @@ impl DgqGpuBlob {
         };
         Ok(Arc::new(Self {
             _file: file,
-            _mmap: mmap,
+            _mmap: HeadRegion::Mmap(mmap),
             _tail_file: None,
             _tail_mmap: None,
             buffer,
@@ -418,23 +506,26 @@ fn materialize_layered_blob(model_dir: &Path, manifest: &DgqManifest) -> Result<
     Ok(anon.make_read_only()?)
 }
 
-/// Like `materialize_layered_blob` but copies only tensors in the canonical
-/// HEAD region `[0, expert_split)` — the (large) expert tail is wrapped
-/// directly off the pack's own blob by `DgqGpuBlob::from_store_layered_split`
-/// instead of being gather-copied here.
-/// Gather-copy every sub-`expert_split` tensor into `dst` at its canonical
-/// offset (`dst.len()` must equal the head length).
-fn fill_layered_head(
-    dst: &mut [u8],
+/// Gather-copy ONLY the canonical HEAD region `[0, expert_split)` into one
+/// anonymous mapping — the fallback `from_store_layered_split` uses when
+/// `build_head_splice` can't prove a splice safe. Deliberately narrower than
+/// `materialize_layered_blob`: the (large) expert tail is NEVER touched
+/// here, because the caller always keeps it as the existing cheap
+/// file-backed `local_expert_split` mmap regardless of whether the head
+/// splices or falls back — gathering the tail too would needlessly double
+/// the anonymous (dirty, non-shared, non-evictable-and-re-readable)
+/// resident memory of every load whenever the head can't be spliced.
+fn materialize_layered_head_only(
     model_dir: &Path,
     manifest: &DgqManifest,
     expert_split: u64,
-) -> Result<(), Error> {
+) -> Result<Mmap, Error> {
+    let head_len = blob_offset_usize(expert_split)?;
     let local_bin = File::open(model_dir.join(&manifest.blob_file))?;
     let local_mmap = unsafe { Mmap::map(&local_bin)? };
     let external = resolve_external_mmaps(model_dir, manifest)?;
 
-    let head_len = dst.len();
+    let mut anon = MmapMut::map_anon(head_len)?;
     for entry in &manifest.tensors {
         if entry.meta.offset >= expert_split {
             continue;
@@ -450,111 +541,389 @@ fn fill_layered_head(
             ));
         }
         let src = source_slice(entry, &local_mmap, &external, len)?;
-        dst[dst_start..dst_end].copy_from_slice(src);
+        anon[dst_start..dst_end].copy_from_slice(src);
     }
-    Ok(())
+    drop(external);
+    drop(local_mmap);
+    Ok(anon.make_read_only()?)
 }
 
-const HEAD_CACHE_FILE: &str = "model.dgq.head";
-const HEAD_CACHE_META: &str = "model.dgq.head.meta";
+// ---------------------------------------------------------------------------
+// VA-splice: the layered-head mechanism (replaces the old model.dgq.head
+// gather-cache). See `plan_head_splice` for the pure planning logic and
+// `build_head_splice` for the unsafe execution; `src/metal/va_splice_probe.rs`
+// is the canary that verified Metal accepts a no-copy `MTLBuffer` spanning a
+// VA range spliced from multiple distinct mappings.
+// ---------------------------------------------------------------------------
 
-/// sha256 hex of the manifest JSON bytes — the head cache's identity. Any
-/// manifest change (offsets, sources, external pins) invalidates the cache.
-fn manifest_sha256_hex(model_dir: &Path) -> Result<String, Error> {
-    use sha2::{Digest, Sha256};
-    let bytes = std::fs::read(model_dir.join(MANIFEST_FILE))?;
-    Ok(Sha256::digest(&bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect())
+/// Backing for `DgqGpuBlob`'s region-1 (head) mapping: either a single
+/// `memmap2::Mmap` (self-contained pack, or the full-materialize fallback),
+/// or a VA-spliced reservation stitched from multiple `MAP_FIXED` sub-
+/// mappings (`HeadSplice`, the layered-pack fast path). Both expose ONE base
+/// pointer + length for the WHOLE head range — every consumer (`host_ptr`,
+/// the no-copy `MTLBuffer` wrap) already treats "the head mapping" as one
+/// opaque contiguous region, so this is a drop-in swap.
+enum HeadRegion {
+    Mmap(Mmap),
+    Spliced(HeadSplice),
 }
 
-/// The materialized head as a FILE-BACKED mapping: `model.dgq.head` next to
-/// the pack, built once (manifest-hash-validated) and mmap'd read-only ever
-/// after. File-backed clean pages are shared across every concurrent
-/// instance/process of the same pack and evict-and-re-read under memory
-/// pressure — a private anonymous copy per load does neither (each instance
-/// paid ~5.5 GiB of swap-backed dirty pages; N test runtimes made that N-fold
-/// and stalled the suite behind fault-bound re-reads). Falls back to the
-/// anonymous copy when the pack dir is not writable.
-fn layered_head_mmap(
-    model_dir: &Path,
-    manifest: &DgqManifest,
-    expert_split: u64,
-) -> Result<(Option<File>, Mmap), Error> {
-    let head_len = blob_offset_usize(expert_split)?;
-    let meta_want = format!("{} {head_len}\n", manifest_sha256_hex(model_dir)?);
-    let head_path = model_dir.join(HEAD_CACHE_FILE);
-    let meta_path = model_dir.join(HEAD_CACHE_META);
-    if std::fs::read_to_string(&meta_path).is_ok_and(|m| m == meta_want)
-        && std::fs::metadata(&head_path).is_ok_and(|md| md.len() == head_len as u64)
-    {
-        let f = File::open(&head_path)?;
-        let mmap = unsafe { Mmap::map(&f)? };
-        return Ok((Some(f), mmap));
+impl HeadRegion {
+    fn as_ptr(&self) -> *const u8 {
+        match self {
+            Self::Mmap(m) => m.as_ptr(),
+            Self::Spliced(s) => s.base.as_ptr().cast(),
+        }
     }
-    match build_head_cache(
-        model_dir,
-        manifest,
-        expert_split,
-        head_len,
-        &meta_want,
-        &head_path,
-        &meta_path,
-    ) {
-        Ok(pair) => Ok(pair),
-        Err(err) => {
-            eprintln!(
-                "dgq layered blob: head cache unavailable ({err}); materializing anonymously"
-            );
-            let mut anon = MmapMut::map_anon(head_len)?;
-            fill_layered_head(&mut anon, model_dir, manifest, expert_split)?;
-            Ok((None, anon.make_read_only()?))
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Mmap(m) => m.len(),
+            Self::Spliced(s) => s.len,
         }
     }
 }
 
-fn build_head_cache(
+/// RAII VA reservation stitched from multiple `MAP_FIXED` sub-mappings
+/// (files + anon fill) — see `build_head_splice`. `Drop` tears the WHOLE
+/// range down in one `munmap`, which correctly unmaps every sub-mapping
+/// inside it regardless of how many distinct `MAP_FIXED` calls built it (the
+/// kernel tracks VMA splits internally; one `munmap(addr, len)` over a range
+/// spanning several VMAs unmaps all of them).
+struct HeadSplice {
+    base: NonNull<c_void>,
+    len: usize,
+}
+
+// SAFETY: `base` points at read-only memory after `build_head_splice`
+// finishes (every sub-mapping is either a read-only file mapping, or an
+// anon mapping we `mprotect`ed to PROT_READ once done writing) — no
+// interior mutability, no aliasing writer, same reasoning `memmap2::Mmap`
+// itself relies on for its own Send+Sync impl.
+unsafe impl Send for HeadSplice {}
+unsafe impl Sync for HeadSplice {}
+
+impl Drop for HeadSplice {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.base.as_ptr(), self.len);
+        }
+    }
+}
+
+/// One maximal run of head tensors safe to `MAP_FIXED`-splice straight off
+/// an external HF shard: contiguous in BOTH the canonical (manifest
+/// `offset`) and source-file address spaces, with a page-congruent start
+/// (`canonical_start ≡ file_start mod PAGE`) — see `plan_head_splice`.
+#[derive(Debug, Clone)]
+struct SpliceRun {
+    file_key: String,
+    canonical_start: u64,
+    canonical_end: u64,
+    file_start: u64,
+    tensor_names: Vec<String>,
+}
+
+/// The loader's plan for the head region `[0, expert_split)`: which maximal
+/// runs are safe to splice, and which entries fall back to a plain memcpy
+/// into the reservation's anonymous backdrop (every `Local`-sourced entry —
+/// by design, never spliced, see the writer's "local head bytes... grouped
+/// into their own run" — plus any `External` entry this loader can't PROVE
+/// is safe: non-congruent, or whose rounded page range would clobber a
+/// neighboring tensor's real bytes).
+#[derive(Debug, Default)]
+struct SplicePlan {
+    splice_runs: Vec<SpliceRun>,
+    anon_entries: Vec<String>,
+}
+
+/// Pure planning logic (no I/O, no unsafe): derive the splice plan from the
+/// manifest's own entries. Never trusts the writer's intent — every run is
+/// independently re-validated for (a) page congruence and (b) NOT
+/// overlapping, once rounded to page boundaries, any OTHER head tensor's
+/// true declared byte range. (b) is what makes this safe regardless of what
+/// the writer did: even a run that IS page-congruent gets rejected (falls
+/// back to anon-fill for its members) if splicing it would read one of its
+/// rounding fringes over a neighbor's real bytes. Two runs' fringes may
+/// still overlap EACH OTHER — harmless, since no declared tensor lives in
+/// either fringe once both pass their own neighbor check.
+fn plan_head_splice(manifest: &DgqManifest, expert_split: u64) -> Result<SplicePlan, Error> {
+    const PAGE: u64 = HEAD_SPLICE_PAGE;
+
+    let mut head: Vec<&DgqTensorEntry> = manifest
+        .tensors
+        .iter()
+        .filter(|t| t.meta.offset < expert_split)
+        .collect();
+    head.sort_by_key(|t| t.meta.offset);
+
+    // Defensive: head entries must not overlap each other in canonical
+    // space — every assumption below (and every downstream `w_off`
+    // consumer) depends on this. A corrupt/hand-edited manifest must fail
+    // loud here, not feed garbage into a splice plan.
+    for w in head.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if a.meta.offset + a.meta.byte_len > b.meta.offset {
+            return Err(Error::Layered(format!(
+                "dgq head splice plan: tensors {} and {} overlap in canonical space \
+                 ({}..{} vs {}..)",
+                a.name,
+                b.name,
+                a.meta.offset,
+                a.meta.offset + a.meta.byte_len,
+                b.meta.offset
+            )));
+        }
+    }
+
+    struct Building<'a> {
+        file_key: &'a str,
+        canonical_start: u64,
+        canonical_end: u64,
+        file_start: u64,
+        file_end: u64,
+        names: Vec<&'a str>,
+    }
+
+    let mut plan = SplicePlan::default();
+    let mut candidates: Vec<Building> = Vec::new();
+    let mut building: Option<Building> = None;
+
+    for entry in &head {
+        match &entry.meta.source {
+            Some(TensorSource::External { file, offset }) => {
+                let extends = building.as_ref().is_some_and(|b| {
+                    b.file_key == file.as_str()
+                        && b.canonical_end == entry.meta.offset
+                        && b.file_end == *offset
+                });
+                if extends {
+                    let b = building.as_mut().expect("checked above");
+                    b.canonical_end = entry.meta.offset + entry.meta.byte_len;
+                    b.file_end = offset + entry.meta.byte_len;
+                    b.names.push(&entry.name);
+                } else {
+                    candidates.extend(building.take());
+                    building = Some(Building {
+                        file_key: file.as_str(),
+                        canonical_start: entry.meta.offset,
+                        canonical_end: entry.meta.offset + entry.meta.byte_len,
+                        file_start: *offset,
+                        file_end: offset + entry.meta.byte_len,
+                        names: vec![&entry.name],
+                    });
+                }
+            }
+            // Local-sourced (or, defensively, a bare `None` source — should
+            // never appear in a layered pack's head, but handled the same
+            // safe way rather than assumed away) tensors are never spliced.
+            _ => {
+                candidates.extend(building.take());
+                plan.anon_entries.push(entry.name.clone());
+            }
+        }
+    }
+    candidates.extend(building.take());
+
+    for cand in candidates {
+        let congruent = (cand.canonical_start % PAGE) == (cand.file_start % PAGE);
+        if !congruent {
+            plan.anon_entries.extend(cand.names.iter().map(|s| s.to_string()));
+            continue;
+        }
+        let map_start = (cand.canonical_start / PAGE) * PAGE;
+        let map_end = cand.canonical_end.div_ceil(PAGE) * PAGE;
+        let overlaps_other = head.iter().any(|e| {
+            if cand.names.contains(&e.name.as_str()) {
+                return false;
+            }
+            let e_start = e.meta.offset;
+            let e_end = e.meta.offset + e.meta.byte_len;
+            e_start < map_end && map_start < e_end
+        });
+        if overlaps_other {
+            plan.anon_entries.extend(cand.names.iter().map(|s| s.to_string()));
+            continue;
+        }
+        plan.splice_runs.push(SpliceRun {
+            file_key: cand.file_key.to_string(),
+            canonical_start: cand.canonical_start,
+            canonical_end: cand.canonical_end,
+            file_start: cand.file_start,
+            tensor_names: cand.names.iter().map(|s| s.to_string()).collect(),
+        });
+    }
+
+    Ok(plan)
+}
+
+/// Build the head region `[0, expert_split)` by VA-splice: reserve a
+/// contiguous range, `MAP_FIXED` every validated `SpliceRun` straight off
+/// its resolved external HF shard, and memcpy everything else (`Local`
+/// tensors, any run this loader couldn't prove safe) into the reservation's
+/// anonymous backdrop. Returns `Err` for anything that keeps this from
+/// being provably correct — including the degenerate "old non-congruent
+/// pack" case (external head tensors present, zero runs qualified) — so the
+/// caller can fall back to the whole-blob `materialize_layered_blob` path.
+fn build_head_splice(
     model_dir: &Path,
     manifest: &DgqManifest,
     expert_split: u64,
-    head_len: usize,
-    meta_want: &str,
-    head_path: &Path,
-    meta_path: &Path,
-) -> Result<(Option<File>, Mmap), Error> {
-    let pid = std::process::id();
-    let tmp_path = model_dir.join(format!("{HEAD_CACHE_FILE}.tmp.{pid}"));
-    let tmp = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&tmp_path)?;
-    tmp.set_len(head_len as u64)?;
-    let mut map = unsafe { MmapMut::map_mut(&tmp)? };
-    if let Err(err) = fill_layered_head(&mut map, model_dir, manifest, expert_split) {
-        drop(map);
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(err);
+) -> Result<HeadSplice, Error> {
+    const PAGE: u64 = HEAD_SPLICE_PAGE;
+    let head_len = blob_offset_usize(expert_split)?.max(1);
+    let plan = plan_head_splice(manifest, expert_split)?;
+
+    let has_external_head_tensor = manifest
+        .tensors
+        .iter()
+        .any(|t| t.meta.offset < expert_split && matches!(t.meta.source, Some(TensorSource::External { .. })));
+    if plan.splice_runs.is_empty() && has_external_head_tensor {
+        return Err(Error::Layered(
+            "zero splice runs qualified despite external head tensors — this pack's canonical \
+             head layout doesn't mirror shard byte order (an old pre-splice overlay pack?); \
+             re-run quantize/repack --overlay to get a spliceable layout"
+                .to_string(),
+        ));
     }
-    map.flush()?;
-    drop(map);
-    drop(tmp);
-    std::fs::rename(&tmp_path, head_path)?;
-    // Meta is written LAST: a crash between the renames leaves a stale/absent
-    // meta, which just forces a rebuild — never a valid meta over wrong data.
-    let meta_tmp = model_dir.join(format!("{HEAD_CACHE_META}.tmp.{pid}"));
-    std::fs::write(&meta_tmp, meta_want)?;
-    std::fs::rename(&meta_tmp, meta_path)?;
-    eprintln!(
-        "dgq layered blob: built head cache {} ({:.2} GiB)",
-        head_path.display(),
-        head_len as f64 / 1073741824.0,
-    );
-    let f = File::open(head_path)?;
-    let mmap = unsafe { Mmap::map(&f)? };
-    Ok((Some(f), mmap))
+
+    let local_bin_path = model_dir.join(&manifest.blob_file);
+    let local_file = File::open(&local_bin_path)?;
+    let local_mmap = unsafe { Mmap::map(&local_file)? };
+    let external = resolve_external_mmaps(model_dir, manifest)?;
+
+    unsafe {
+        let base = libc::mmap(
+            std::ptr::null_mut(),
+            head_len,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        );
+        if base == libc::MAP_FAILED {
+            return Err(Error::Runtime("dgq head splice: VA reservation failed"));
+        }
+        // Any early return below must release the reservation — disarmed
+        // (via `is_committed`) only once `HeadSplice` is about to own it.
+        struct ReserveGuard {
+            base: *mut c_void,
+            len: usize,
+            committed: bool,
+        }
+        impl Drop for ReserveGuard {
+            fn drop(&mut self) {
+                if !self.committed {
+                    unsafe {
+                        libc::munmap(self.base, self.len);
+                    }
+                }
+            }
+        }
+        let mut guard = ReserveGuard {
+            base,
+            len: head_len,
+            committed: false,
+        };
+
+        let anon = libc::mmap(
+            base,
+            head_len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
+            -1,
+            0,
+        );
+        if anon == libc::MAP_FAILED || anon != base {
+            return Err(Error::Runtime("dgq head splice: anon backdrop mmap failed"));
+        }
+
+        for name in &plan.anon_entries {
+            let entry = manifest
+                .tensors
+                .iter()
+                .find(|t| &t.name == name)
+                .ok_or_else(|| Error::NotFound(name.clone()))?;
+            let len = blob_offset_usize(entry.meta.byte_len)?;
+            let dst_start = blob_offset_usize(entry.meta.offset)?;
+            if dst_start + len > head_len {
+                return Err(Error::Runtime(
+                    "dgq head splice: anon-fill tensor extends past expert_split",
+                ));
+            }
+            let src = source_slice(entry, &local_mmap, &external, len)?;
+            std::ptr::copy_nonoverlapping(src.as_ptr(), base.cast::<u8>().add(dst_start), len);
+        }
+
+        for run in &plan.splice_runs {
+            let ext_file = manifest.external_files.get(&run.file_key).ok_or_else(|| {
+                Error::Layered(format!(
+                    "dgq head splice: run references unresolved external file '{}'",
+                    run.file_key
+                ))
+            })?;
+            let path = crate::dgq::hf_resolve::resolve_external_file(
+                model_dir,
+                manifest.base_model.as_ref(),
+                &run.file_key,
+                ext_file,
+            )?;
+            let file = File::open(&path)?;
+            let file_len = file.metadata()?.len();
+
+            let map_start = (run.canonical_start / PAGE) * PAGE;
+            let map_end = run.canonical_end.div_ceil(PAGE) * PAGE;
+            let file_map_start = (run.file_start / PAGE) * PAGE;
+            if map_start > map_end || blob_offset_usize(map_end)? > head_len {
+                return Err(Error::Runtime(
+                    "dgq head splice: run's rounded range falls outside the head reservation",
+                ));
+            }
+            let map_len = blob_offset_usize(map_end - map_start)?;
+            if file_map_start + map_len as u64 > file_len {
+                return Err(Error::Layered(format!(
+                    "dgq head splice: run over '{}' ({} tensors) would read {} bytes from file \
+                     offset {file_map_start}, but the shard is only {file_len} bytes",
+                    run.file_key,
+                    run.tensor_names.len(),
+                    map_len
+                )));
+            }
+
+            let dst = base.cast::<u8>().add(blob_offset_usize(map_start)?);
+            let mapped = libc::mmap(
+                dst.cast(),
+                map_len,
+                libc::PROT_READ,
+                libc::MAP_SHARED | libc::MAP_FIXED,
+                file.as_raw_fd(),
+                file_map_start as libc::off_t,
+            );
+            if mapped == libc::MAP_FAILED || mapped != dst.cast() {
+                return Err(Error::Runtime("dgq head splice: MAP_FIXED file splice failed"));
+            }
+            // `file` (the fd) can drop now — the MAP_SHARED mapping outlives it.
+        }
+
+        if libc::mprotect(base, head_len, libc::PROT_READ) != 0 {
+            return Err(Error::Runtime("dgq head splice: mprotect(PROT_READ) failed"));
+        }
+
+        eprintln!(
+            "dgq layered blob: head {:.2} GiB VA-spliced ({} run(s) over {} tensor(s), \
+             {} tensor(s) anon-copied)",
+            head_len as f64 / 1073741824.0,
+            plan.splice_runs.len(),
+            plan.splice_runs.iter().map(|r| r.tensor_names.len()).sum::<usize>(),
+            plan.anon_entries.len(),
+        );
+
+        guard.committed = true;
+        Ok(HeadSplice {
+            base: NonNull::new(base).ok_or(Error::Runtime("dgq head splice: null base"))?,
+            len: head_len,
+        })
+    }
 }
 
 /// Quantized linear weight view into a shared blob buffer (PyTorch `[out, in]`).
@@ -902,6 +1271,385 @@ pub fn load_raw_view(
         byte_len: entry.meta.byte_len,
         numel,
     })
+}
+
+/// Pure `plan_head_splice` tests: no I/O, no unsafe, no GPU — the plan is
+/// just arithmetic over a hand-built manifest.
+#[cfg(test)]
+mod splice_plan_tests {
+    use super::*;
+    use crate::dgq::layout::{DgqTensorMeta, QuantProfile};
+
+    fn manifest(tensors: Vec<DgqTensorEntry>) -> DgqManifest {
+        DgqManifest {
+            version: crate::dgq::layout::DGQ_VERSION_LAYERED,
+            profile: QuantProfile::Q4,
+            source_model: "src".to_string(),
+            blob_file: "model.dgq.bin".to_string(),
+            expert_split: None,
+            local_expert_split: None,
+            base_model: None,
+            external_files: Default::default(),
+            custom_classes: Default::default(),
+            tensors,
+        }
+    }
+
+    fn external(name: &str, file: &str, canonical: u64, file_off: u64, len: u64) -> DgqTensorEntry {
+        DgqTensorEntry {
+            name: name.to_string(),
+            meta: DgqTensorMeta {
+                kind: "raw".to_string(),
+                dtype: "bf16".to_string(),
+                shape: vec![1],
+                offset: canonical,
+                byte_len: len,
+                source: Some(TensorSource::External {
+                    file: file.to_string(),
+                    offset: file_off,
+                }),
+            },
+        }
+    }
+
+    fn local(name: &str, canonical: u64, len: u64) -> DgqTensorEntry {
+        DgqTensorEntry {
+            name: name.to_string(),
+            meta: DgqTensorMeta {
+                kind: "q8_row".to_string(),
+                dtype: "bf16".to_string(),
+                shape: vec![1],
+                offset: canonical,
+                byte_len: len,
+                source: Some(TensorSource::Local { local_offset: 0 }),
+            },
+        }
+    }
+
+    #[test]
+    fn contiguous_congruent_run_splices_as_one() {
+        // Both tensors start at canonical/file offset 0 (trivially
+        // congruent) and mirror the shard's own zero-gap layout.
+        let a1 = external("a1", "shardA", 0, 0, 100);
+        let a2 = external("a2", "shardA", 100, 100, 150); // extends the run
+        let loc = local("local1", 20000, 64); // well clear of the run's rounded [0,16384)
+        let m = manifest(vec![a1, a2, loc]);
+
+        let plan = plan_head_splice(&m, 32768).expect("plan");
+        assert_eq!(plan.splice_runs.len(), 1, "{plan:?}");
+        assert_eq!(plan.splice_runs[0].tensor_names, vec!["a1", "a2"]);
+        assert_eq!(plan.splice_runs[0].canonical_start, 0);
+        assert_eq!(plan.splice_runs[0].canonical_end, 250);
+        assert_eq!(plan.anon_entries, vec!["local1".to_string()]);
+    }
+
+    #[test]
+    fn non_congruent_run_falls_back_to_anon() {
+        // canonical starts at 0 (remainder 0) but the file offset's
+        // remainder is nonzero — congruence fails, must anon-fill.
+        let a = external("a", "shardA", 0, 5, 100);
+        let m = manifest(vec![a]);
+        let plan = plan_head_splice(&m, 16384).expect("plan");
+        assert!(plan.splice_runs.is_empty(), "{plan:?}");
+        assert_eq!(plan.anon_entries, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn run_whose_rounded_fringe_would_clobber_a_neighbor_is_rejected() {
+        // `a`: canonical [0, 20000), file [0, 20000) — congruent (both
+        // remainder 0), but 20000 isn't page-aligned so `a`'s OWN rounded
+        // range extends to 32768.
+        let a = external("a", "shardA", 0, 0, 20000);
+        // `b`: canonical [20000, 21000) from a DIFFERENT shard, chosen so
+        // its own start is ALSO congruent (20000 % 16384 == 3616 == 3616 %
+        // 16384) — a legitimate-looking run on its own, but its rounded
+        // start (16384) falls INSIDE `a`'s true byte range [0, 20000).
+        let b = external("b", "shardB", 20000, 3616, 1000);
+        let m = manifest(vec![a, b]);
+
+        let plan = plan_head_splice(&m, 32768).expect("plan");
+        assert!(
+            plan.splice_runs.is_empty(),
+            "both runs must be rejected (each other's fringe clobbers real bytes): {plan:?}"
+        );
+        let mut anon = plan.anon_entries.clone();
+        anon.sort();
+        assert_eq!(anon, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn different_shards_break_the_run_even_with_zero_canonical_gap() {
+        let a = external("a", "shardA", 0, 0, 16384); // page-aligned end
+        let b = external("b", "shardB", 16384, 0, 100); // starts exactly where `a` ends
+        let m = manifest(vec![a, b]);
+        let plan = plan_head_splice(&m, 32768).expect("plan");
+        // Two independent single-tensor runs — neither's rounded range
+        // overlaps the other's true bytes (a's end IS the page boundary).
+        assert_eq!(plan.splice_runs.len(), 2, "{plan:?}");
+        assert!(plan.anon_entries.is_empty());
+    }
+
+    #[test]
+    fn overlapping_manifest_entries_are_rejected_outright() {
+        let a = external("a", "shardA", 0, 0, 200);
+        let b = external("b", "shardA", 100, 100, 200); // overlaps a's [0,200)
+        let m = manifest(vec![a, b]);
+        let err = plan_head_splice(&m, 16384).expect_err("must reject overlapping entries");
+        assert!(err.to_string().contains("overlap"), "{err}");
+    }
+
+    #[test]
+    fn offset_alignment_tripwire_accepts_64_aligned_manifest() {
+        let m = manifest(vec![external("a", "shardA", 0, 0, 128), local("b", 128, 64)]);
+        assert_tensor_offset_alignment(&m).expect("64-byte-aligned manifest must pass");
+    }
+
+    #[test]
+    fn offset_alignment_tripwire_rejects_misaligned_tensor() {
+        // canonical offset 130 is not a multiple of 64 — exactly the class
+        // of writer bug this tripwire exists to catch at load time (byte
+        // content can be perfectly correct and this would still be unsafe
+        // for a GPU kernel's typed pointer read).
+        let m = manifest(vec![external("a", "shardA", 0, 0, 128), local("b", 130, 64)]);
+        let err = assert_tensor_offset_alignment(&m).expect_err("must reject misaligned offset");
+        assert!(err.to_string().contains("misaligned"), "{err}");
+    }
+}
+
+/// Writer <-> loader integration: a freshly written overlay manifest (real
+/// `quantize_model` writer, tiny synthetic HF fixture) must produce a
+/// splice plan with ZERO External fallbacks — the writer's shard-order +
+/// page-congruent layout is exactly what the loader's plan needs.
+#[cfg(test)]
+mod writer_plan_integration_tests {
+    use super::*;
+    use crate::dgq::layout::{QuantProfile, TensorSource as Src};
+    use crate::dgq::test_fixtures::{bf16_payload, write_index, write_shard};
+    use crate::dgq::{QuantizeOptions, quantize_model};
+
+    #[test]
+    fn quantize_overlay_writer_produces_zero_external_fallbacks() {
+        let root = std::env::temp_dir().join(format!(
+            "dgq-splice-plan-writer-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let snapshot_dir = root.join("hf_home/hub/models--acme--widgets/snapshots/cafef00d");
+        std::fs::create_dir_all(&snapshot_dir).expect("mkdir snapshot");
+
+        // Several attn/dense (Raw-classified) tensors from the SAME shard,
+        // deliberately written out of alphabetical order in the file to
+        // prove the writer reorders by actual shard byte position, not by
+        // name — plus one local (SC q8) tensor and one expert tensor, per
+        // real overlay pack shape.
+        let t1 = ("model.decoder.layers.1.self_attn.q_proj.weight", vec![8, 32], bf16_payload(8 * 32, 1));
+        let t0 = ("model.decoder.layers.0.self_attn.q_proj.weight", vec![8, 32], bf16_payload(8 * 32, 2));
+        let t2 = ("model.decoder.layers.2.self_attn.q_proj.weight", vec![8, 32], bf16_payload(8 * 32, 3));
+        let sc = (
+            "model.decoder.self_conditioning.down_proj.weight",
+            vec![4, 8],
+            bf16_payload(32, 4),
+        );
+        let experts = (
+            "model.decoder.layers.0.experts.gate_up_proj",
+            vec![2, 4, 32],
+            bf16_payload(2 * 4 * 32, 5),
+        );
+        let names: Vec<&str> = vec![t1.0, t0.0, t2.0, sc.0, experts.0];
+        write_shard(
+            &snapshot_dir.join("model-00001-of-00001.safetensors"),
+            &[t1, t0, t2, sc, experts],
+        );
+        write_index(&snapshot_dir, "model-00001-of-00001.safetensors", &names);
+
+        let cfg = crate::flags::RuntimeConfig::from_pairs(&[(
+            "DGQ_HF_HOME".to_string(),
+            root.join("hf_home").display().to_string(),
+        )])
+        .0;
+        let _guard = crate::flags::install_for_test(cfg);
+
+        let out_dir = root.join("overlay");
+        let summary = quantize_model(QuantizeOptions {
+            source_dir: snapshot_dir,
+            output_prefix: out_dir.clone(),
+            profile: QuantProfile::Q4,
+            overlay_base: Some(crate::dgq::layout::BaseModelRef {
+                repo: "acme/widgets".to_string(),
+                revision: "cafef00d".to_string(),
+            }),
+            custom_overrides: Default::default(),
+        })
+        .expect("quantize --overlay");
+        assert_eq!(summary.raw_tensors, 3, "3 attn tensors should be Raw");
+
+        let manifest_json = std::fs::read_to_string(out_dir.join(MANIFEST_FILE)).expect("read manifest");
+        let manifest: DgqManifest = serde_json::from_str(&manifest_json).expect("parse manifest");
+        let expert_split = manifest.expert_split.expect("expert_split set");
+
+        let plan = plan_head_splice(&manifest, expert_split).expect("plan");
+        let external_anon: Vec<&String> = plan
+            .anon_entries
+            .iter()
+            .filter(|name| {
+                manifest
+                    .tensors
+                    .iter()
+                    .any(|t| &t.name == *name && matches!(t.meta.source, Some(Src::External { .. })))
+            })
+            .collect();
+        assert!(
+            external_anon.is_empty(),
+            "writer's layout should make every External head tensor spliceable; \
+             fallbacks: {external_anon:?} full plan: {plan:?}"
+        );
+        // The three attn tensors should collapse into exactly one run (same
+        // shard, writer visits them in FILE order regardless of name order).
+        assert_eq!(plan.splice_runs.len(), 1, "{plan:?}");
+        assert_eq!(plan.splice_runs[0].tensor_names.len(), 3);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Same property, for the OTHER writer: `repack --overlay` splitting a
+    /// self-contained pack must ALSO produce a spliceable head layout — it
+    /// reassigns canonical offsets fresh (not carried over from the
+    /// self-contained source's alphabetical layout), using the same
+    /// shard-order + page-congruent scheme as `quantize --overlay`.
+    #[test]
+    fn repack_overlay_writer_produces_zero_external_fallbacks() {
+        use crate::dgq::overlay::{RepackOverlayOptions, repack_overlay};
+
+        let root = std::env::temp_dir().join(format!("dgq-splice-plan-repack-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let snapshot_dir = root.join("hf_home/hub/models--acme--widgets/snapshots/cafef00d");
+        std::fs::create_dir_all(&snapshot_dir).expect("mkdir snapshot");
+
+        let t1 = ("model.decoder.layers.1.self_attn.q_proj.weight", vec![8, 32], bf16_payload(8 * 32, 1));
+        let t0 = ("model.decoder.layers.0.self_attn.q_proj.weight", vec![8, 32], bf16_payload(8 * 32, 2));
+        let t2 = ("model.decoder.layers.2.self_attn.q_proj.weight", vec![8, 32], bf16_payload(8 * 32, 3));
+        let sc = (
+            "model.decoder.self_conditioning.down_proj.weight",
+            vec![4, 8],
+            bf16_payload(32, 4),
+        );
+        let experts = (
+            "model.decoder.layers.0.experts.gate_up_proj",
+            vec![2, 4, 32],
+            bf16_payload(2 * 4 * 32, 5),
+        );
+        let names: Vec<&str> = vec![t1.0, t0.0, t2.0, sc.0, experts.0];
+        write_shard(
+            &snapshot_dir.join("model-00001-of-00001.safetensors"),
+            &[t1, t0, t2, sc, experts],
+        );
+        write_index(&snapshot_dir, "model-00001-of-00001.safetensors", &names);
+
+        let cfg = crate::flags::RuntimeConfig::from_pairs(&[(
+            "DGQ_HF_HOME".to_string(),
+            root.join("hf_home").display().to_string(),
+        )])
+        .0;
+        let _guard = crate::flags::install_for_test(cfg);
+
+        // A plain self-contained pack (alphabetical layout, no splicing
+        // relevance) from the same fixture — the input `repack --overlay`
+        // must reshape.
+        let self_contained = root.join("self_contained");
+        quantize_model(QuantizeOptions {
+            source_dir: snapshot_dir.clone(),
+            output_prefix: self_contained.clone(),
+            profile: QuantProfile::Q4,
+            overlay_base: None,
+            custom_overrides: Default::default(),
+        })
+        .expect("plain quantize");
+
+        let overlay_out = root.join("repacked_overlay");
+        repack_overlay(RepackOverlayOptions {
+            pack_dir: self_contained,
+            output_dir: overlay_out.clone(),
+            hf_source_dir: Some(snapshot_dir),
+            hf_repo_override: Some("acme/widgets".to_string()),
+            hf_revision_override: Some("cafef00d".to_string()),
+        })
+        .expect("repack --overlay");
+
+        let manifest_json = std::fs::read_to_string(overlay_out.join(MANIFEST_FILE)).expect("read manifest");
+        let manifest: DgqManifest = serde_json::from_str(&manifest_json).expect("parse manifest");
+        let expert_split = manifest.expert_split.expect("expert_split set");
+
+        let plan = plan_head_splice(&manifest, expert_split).expect("plan");
+        let external_anon: Vec<&String> = plan
+            .anon_entries
+            .iter()
+            .filter(|name| {
+                manifest
+                    .tensors
+                    .iter()
+                    .any(|t| &t.name == *name && matches!(t.meta.source, Some(Src::External { .. })))
+            })
+            .collect();
+        assert!(
+            external_anon.is_empty(),
+            "repack --overlay's layout should make every External head tensor spliceable; \
+             fallbacks: {external_anon:?} full plan: {plan:?}"
+        );
+        assert_eq!(plan.splice_runs.len(), 1, "{plan:?}");
+        assert_eq!(plan.splice_runs[0].tensor_names.len(), 3);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod diagnostic_gpu_vs_store_tests {
+    use super::*;
+    use crate::dgq::DgqStore;
+    use crate::metal::device::MetalContext;
+
+    /// Ad hoc diagnostic (not a CI gate): DGQ_DIAG_PACK_DIR points at a pack;
+    /// compares `DgqGpuBlob::host_ptr` (what the GPU buffer actually
+    /// contains) against `DgqStore::tensor_bytes` (the independent CPU-side
+    /// source-dispatch resolution) for every tensor. Skips silently if the
+    /// env var is unset.
+    #[test]
+    fn gpu_buffer_matches_store_for_every_tensor() {
+        let Ok(dir) = std::env::var("DGQ_DIAG_PACK_DIR") else {
+            eprintln!("skip: set DGQ_DIAG_PACK_DIR to run this diagnostic");
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let store = DgqStore::open(&dir).expect("open store");
+        let ctx = MetalContext::new().expect("metal");
+        let blob = DgqGpuBlob::from_store(&store, &ctx.device).expect("blob");
+
+        let mut mismatches = Vec::new();
+        let mut checked = 0usize;
+        for entry in store.tensor_entries() {
+            let want = store.tensor_bytes(&entry.name).expect("store bytes");
+            let len = want.len();
+            let got =
+                unsafe { std::slice::from_raw_parts(blob.host_ptr(entry.meta.offset), len) };
+            checked += 1;
+            if got != want {
+                let first_diff = want
+                    .iter()
+                    .zip(got.iter())
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(0);
+                mismatches.push((entry.name.clone(), entry.meta.offset, len, first_diff));
+            }
+        }
+        eprintln!(
+            "diagnostic: checked {checked} tensors, {} mismatches",
+            mismatches.len()
+        );
+        for (name, off, len, first_diff) in mismatches.iter().take(20) {
+            eprintln!("  MISMATCH {name} offset={off} len={len} first_diff_at={first_diff}");
+        }
+        assert!(mismatches.is_empty(), "{} tensor(s) mismatched", mismatches.len());
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]

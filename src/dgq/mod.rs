@@ -12,6 +12,8 @@ pub mod overlay;
 #[cfg(test)]
 pub mod spot_check;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod test_fixtures;
 
 pub use convert::{QuantizeOptions, quantize_model};
 pub use embed_row::{run_embed_row_dump, write_embed_row_dump};

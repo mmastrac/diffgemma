@@ -354,7 +354,22 @@ diffgemma-mps step-parity -m $WEIGHTS           # engine-vs-monolith oracle
 diffgemma-mps probe-device; diffgemma-mps summary; diffgemma-mps config
 diffgemma-mps manifest                          # kernel FC-axis TOML
 
-# Requantize from HF safetensors
+# -m accepts a local directory OR a bare HF repo id (org/name): an existing
+# directory is used as-is; otherwise the newest matching snapshot in the
+# local HF cache is resolved, or the exact `hf download` remedy is printed.
+# Works for every command that takes -m, including quantize/repack source.
+diffgemma-mps chat -m google/diffusiongemma-26B-A4B-it
+diffgemma-mps chat -m mmastrac/diffusiongemma-q4emb   # a downloaded pack, read-only
+
+# Fetch a monolithic pack from HF — the distribution format (layered/overlay
+# packs are local-only dev tooling, never what ships to users). Verifies the
+# transfer (manifest version, blob length) and prints a one-line pack
+# summary once done.
+diffgemma-mps download --repo mmastrac/diffusiongemma-q4emb -o model/diffusiongemma-q4emb
+
+# Requantize from HF safetensors (source: a local dir or a repo id, per
+# above — a repo id ALSO pins (repo, revision) exactly for --overlay below,
+# in place of the single-symlink-hop auto-detect).
 diffgemma-mps quantize -m model/transformer -o model/diffusiongemma-q4emb --profile q4
 
 # Custom quantization classes (ARCHITECTURE.md §8.2): --set class=format
@@ -367,12 +382,17 @@ diffgemma-mps quantize -m model/transformer -o model/pack-mixed --profile q4 \
 # nvfp4x is sugar for --profile q4 --set experts=nvfp4.
 diffgemma-mps quantize -m model/transformer -o model/pack-nvfp4x --profile nvfp4x
 
-# Layered/overlay packs (ARCHITECTURE.md §8.1): raw tensors ref the HF base
-# in ~/.cache/huggingface instead of being copied into the pack. Composes
-# with --set: a class switched from raw to quantized just moves from an
-# external ref to a local blob entry.
+# Layered/overlay packs (ARCHITECTURE.md §8.1) — LOCAL-ONLY DEV TOOLING for
+# experiment arms, never the distribution format: raw tensors ref the HF
+# base in ~/.cache/huggingface instead of being copied into the pack, served
+# zero-copy via VA-splice (no head cache). Composes with --set: a class
+# switched from raw to quantized just moves from an external ref to a local
+# blob entry.
 diffgemma-mps quantize -m model/transformer -o model/pack-overlay --profile nvfp4 --overlay
 diffgemma-mps repack --overlay -m model/diffusiongemma-q4emb -o model/pack-overlay
+# The dual: flatten a layered pack back to a self-contained (monolithic) one
+# — no requantization, just a byte-copy driven by the manifest's own offsets.
+diffgemma-mps repack --monolithic -m model/pack-overlay -o model/diffusiongemma-q4emb
 
 # MLX reference comparison (SERIALIZE with our runs — never in parallel)
 python/.venv/bin/python python/scripts/mlx_generate.py -p "..." -o /tmp/mlx.json

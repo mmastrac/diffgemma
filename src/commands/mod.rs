@@ -43,7 +43,40 @@ pub(crate) use step_debug::*;
 pub(crate) use step_debug_dumps::*;
 pub(crate) use step_gate::*;
 
+/// Commands that never touch `-m` at all — resolving it for these would
+/// wrongly fail on the (very common) case where nobody has set up a model
+/// dir yet, since these commands don't need one. Every other command is
+/// resolved once, here, per `dgq::hf_resolve::resolve_model_source`: an
+/// existing directory is used as-is; otherwise an `org/name`-shaped value is
+/// resolved against the local HF cache (newest snapshot), failing loud with
+/// the exact `hf download` remedy if nothing is cached.
+fn command_uses_model_dir(command: &Command) -> bool {
+    !matches!(
+        command,
+        Command::Gemm { .. }
+            | Command::ProbeDevice
+            | Command::BenchGemm { .. }
+            | Command::BenchPrefillAttn { .. }
+            | Command::Manifest
+            | Command::Download { .. }
+    )
+}
+
 pub(crate) fn dispatch(cli: Cli) -> ExitCode {
+    let mut cli = cli;
+    let mut quantize_repo_pin: Option<dgq::layout::BaseModelRef> = None;
+    if command_uses_model_dir(&cli.command) {
+        match dgq::hf_resolve::resolve_model_source(&cli.model_dir) {
+            Ok(resolved) => {
+                cli.model_dir = resolved.dir;
+                quantize_repo_pin = resolved.repo_pin;
+            }
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     match cli.command {
         Command::StepSmoke {
             layers,
@@ -599,27 +632,64 @@ pub(crate) fn dispatch(cli: Cli) -> ExitCode {
             hf_repo,
             hf_revision,
             sets,
-        } => run_quantize(
-            &cli.model_dir,
-            &output,
-            &profile,
-            overlay,
-            hf_repo.as_deref(),
-            hf_revision.as_deref(),
-            &sets,
-        ),
+        } => {
+            // A `-m org/name` repo-id source pins (repo, revision) EXACTLY
+            // (the snapshot dir name IS the revision) — prefer it over the
+            // single-symlink-hop auto-detect `--overlay` otherwise falls
+            // back to, unless the caller gave explicit --hf-repo/--hf-revision.
+            let (hf_repo, hf_revision) = match (&hf_repo, &hf_revision, &quantize_repo_pin) {
+                (None, None, Some(pin)) => (Some(pin.repo.clone()), Some(pin.revision.clone())),
+                _ => (hf_repo, hf_revision),
+            };
+            run_quantize(
+                &cli.model_dir,
+                &output,
+                &profile,
+                overlay,
+                hf_repo.as_deref(),
+                hf_revision.as_deref(),
+                &sets,
+            )
+        }
         Command::Repack {
             output,
             hf_source,
             hf_repo,
             hf_revision,
-        } => run_repack_overlay(
-            &cli.model_dir,
-            &output,
-            hf_source.as_deref(),
-            hf_repo.as_deref(),
-            hf_revision.as_deref(),
-        ),
+        } => {
+            // `--hf-source` is a second, independent model-source path (the
+            // HF safetensors dir to verify against) — route it through the
+            // same `-m` resolution rule when given.
+            let hf_source_pin: Option<dgq::layout::BaseModelRef>;
+            let hf_source = match &hf_source {
+                Some(spec) => match dgq::hf_resolve::resolve_model_source(spec) {
+                    Ok(resolved) => {
+                        hf_source_pin = resolved.repo_pin;
+                        Some(resolved.dir)
+                    }
+                    Err(err) => {
+                        eprintln!("error: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                },
+                None => {
+                    hf_source_pin = None;
+                    None
+                }
+            };
+            let (hf_repo, hf_revision) = match (&hf_repo, &hf_revision, &hf_source_pin) {
+                (None, None, Some(pin)) => (Some(pin.repo.clone()), Some(pin.revision.clone())),
+                _ => (hf_repo, hf_revision),
+            };
+            run_repack_overlay(
+                &cli.model_dir,
+                &output,
+                hf_source.as_deref(),
+                hf_repo.as_deref(),
+                hf_revision.as_deref(),
+            )
+        }
+        Command::RepackMonolithic { output } => run_repack_monolithic(&cli.model_dir, &output),
         Command::Download {
             repo,
             revision,
@@ -705,6 +775,7 @@ pub(crate) fn run_command(
         Command::ProbeDevice { .. } => ExitCode::FAILURE,
         Command::Quantize { .. } => ExitCode::FAILURE,
         Command::Repack { .. } => ExitCode::FAILURE,
+        Command::RepackMonolithic { .. } => ExitCode::FAILURE,
         Command::Download { .. } => ExitCode::FAILURE,
         Command::BenchGemm { .. } => ExitCode::FAILURE,
         Command::BenchPrefillAttn { .. } => ExitCode::FAILURE,

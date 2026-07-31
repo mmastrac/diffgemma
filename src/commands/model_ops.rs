@@ -272,6 +272,48 @@ pub(crate) fn run_repack_overlay(
         }
     }
 }
+pub(crate) fn run_repack_monolithic(
+    pack_dir: &std::path::Path,
+    output: &std::path::Path,
+) -> ExitCode {
+    use dgq::overlay::{RepackMonolithicOptions, repack_monolithic};
+
+    let out_dir = if output.extension().is_some_and(|e| e == "dgq") {
+        output.with_extension("")
+    } else {
+        output.to_path_buf()
+    };
+
+    eprintln!(
+        "repack --monolithic: {} -> {}",
+        pack_dir.display(),
+        out_dir.display(),
+    );
+    let started = std::time::Instant::now();
+    match repack_monolithic(RepackMonolithicOptions {
+        pack_dir: pack_dir.to_path_buf(),
+        output_dir: out_dir.clone(),
+    }) {
+        Ok(summary) => {
+            let gib = summary.blob_bytes as f64 / (1024.0_f64.powi(3));
+            println!("repack --monolithic ok");
+            println!("  output dir:    {}", out_dir.display());
+            println!("  tensors:       {}", summary.tensor_count);
+            println!("  blob size:     {gib:.2} GiB");
+            println!("  kind histogram:");
+            for (kind, count) in &summary.kind_histogram {
+                println!("    {kind:<12} {count}");
+            }
+            println!("  elapsed:       {:.2?}", started.elapsed());
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 pub(crate) fn run_tokenize(model_dir: &std::path::Path, text: &str, raw_prompt: bool) -> ExitCode {
     let path = model_dir.join("tokenizer.json");
     match tokenizer::Tokenizer::load(&path) {

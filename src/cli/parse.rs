@@ -66,6 +66,9 @@ pub(crate) fn parse_cli() -> Cli {
     // `quantize --overlay` / `repack --overlay`: emit an experts-only
     // overlay instead of a self-contained pack.
     let mut overlay_flag = false;
+    // `repack --monolithic`: flatten a layered pack back to self-contained
+    // (the dual of `repack --overlay`).
+    let mut monolithic_flag = false;
     // `quantize --set class=format` (repeatable).
     let mut quant_sets: Vec<String> = Vec::new();
     let mut hf_repo: Option<String> = None;
@@ -323,6 +326,7 @@ pub(crate) fn parse_cli() -> Cli {
                 }
             }
             "--overlay" => overlay_flag = true,
+            "--monolithic" => monolithic_flag = true,
             "--set" => {
                 if let Some(v) = args.next() {
                     quant_sets.push(v);
@@ -707,19 +711,25 @@ pub(crate) fn parse_cli() -> Cli {
             }
         }
         Some("repack") => {
-            if !overlay_flag {
-                eprintln!("usage: diffgemma-mps repack --overlay -o OUTPUT_DIR -m SOURCE_PACK [--hf-source DIR] [--hf-repo ORG/NAME --hf-revision REV]");
+            if overlay_flag == monolithic_flag {
+                eprintln!(
+                    "usage: diffgemma-mps repack --overlay -o OUTPUT_DIR -m SOURCE_PACK [--hf-source DIR] [--hf-repo ORG/NAME --hf-revision REV]\n   or: diffgemma-mps repack --monolithic -o OUTPUT_DIR -m SOURCE_PACK   (exactly one of --overlay/--monolithic)"
+                );
                 std::process::exit(2);
             }
             let out = output_dir.unwrap_or_else(|| {
-                eprintln!("usage: diffgemma-mps repack --overlay -o OUTPUT_DIR -m SOURCE_PACK");
+                eprintln!("usage: diffgemma-mps repack --overlay|--monolithic -o OUTPUT_DIR -m SOURCE_PACK");
                 std::process::exit(2);
             });
-            Command::Repack {
-                output: out,
-                hf_source,
-                hf_repo,
-                hf_revision,
+            if monolithic_flag {
+                Command::RepackMonolithic { output: out }
+            } else {
+                Command::Repack {
+                    output: out,
+                    hf_source,
+                    hf_repo,
+                    hf_revision,
+                }
             }
         }
         Some("download") => Command::Download {

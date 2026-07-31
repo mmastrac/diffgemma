@@ -101,6 +101,13 @@ pub(crate) enum Command {
         hf_repo: Option<String>,
         hf_revision: Option<String>,
     },
+    /// Flatten a layered `.dgq` pack (overlay) back into a self-contained
+    /// one — the dual of `Repack` (`--overlay`). No requantization: every
+    /// tensor's existing bytes (local or resolved external) are copied to
+    /// the canonical offset a plain `quantize` would have used.
+    RepackMonolithic {
+        output: PathBuf,
+    },
     /// Fetch a `.dgq` model from HuggingFace into a local model dir.
     Download {
         repo: String,

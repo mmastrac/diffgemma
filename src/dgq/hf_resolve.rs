@@ -34,6 +34,104 @@ fn repo_folder_name(repo: &str) -> String {
     format!("models--{}", repo.replace('/', "--"))
 }
 
+/// `-m` value resolution result: the directory to actually open, plus an
+/// exact `(repo, revision)` pin when the directory was found by resolving a
+/// bare HF repo id (the snapshot dir name IS the revision — no guessing).
+#[derive(Debug)]
+pub struct ResolvedModelSource {
+    pub dir: PathBuf,
+    pub repo_pin: Option<BaseModelRef>,
+}
+
+/// `org/name` shape: exactly one `/`, both segments non-empty and made of
+/// characters HF repo ids/usernames actually use. Deliberately conservative
+/// — a relative path with a slash (`model/transformer`) also matches this
+/// shape, but `resolve_model_source` only ever consults it once the
+/// existing-directory check has already failed, so a real local dir never
+/// gets reinterpreted as a repo id.
+pub fn looks_like_hf_repo_id(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('/').collect();
+    if parts.len() != 2 {
+        return false;
+    }
+    let ok_segment = |seg: &str| {
+        !seg.is_empty()
+            && seg != "."
+            && seg != ".."
+            && seg
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    ok_segment(parts[0]) && ok_segment(parts[1])
+}
+
+/// Resolve `-m` to a directory: use it as-is if it already exists; else, if
+/// it looks like an HF repo id, resolve the newest local HF-cache snapshot
+/// for that repo (fails with the exact `hf download` remedy if none is
+/// cached). This is the ONE place `-m` resolution happens; every command
+/// that takes `-m` should route through it (see `commands::dispatch`).
+pub fn resolve_model_source(spec: &Path) -> Result<ResolvedModelSource, Error> {
+    if spec.is_dir() {
+        return Ok(ResolvedModelSource {
+            dir: spec.to_path_buf(),
+            repo_pin: None,
+        });
+    }
+    let s = spec.to_string_lossy().into_owned();
+    if looks_like_hf_repo_id(&s) {
+        let (dir, revision) = newest_local_snapshot(&s)?;
+        return Ok(ResolvedModelSource {
+            dir,
+            repo_pin: Some(BaseModelRef { repo: s, revision }),
+        });
+    }
+    Err(Error::Layered(format!(
+        "-m {}: not a local directory, and it doesn't look like an HF repo id \
+         (expected org/name) either — pass an existing directory or a repo id.",
+        spec.display()
+    )))
+}
+
+/// The newest (by mtime) locally cached snapshot dir for `repo`, plus its
+/// revision (the snapshot dir's own name — always a commit hash, so this is
+/// exact, unlike the single-symlink-hop auto-detect `overlay` uses when the
+/// caller only has a shard path). Fails loud with the `hf download` remedy
+/// when the repo has no cached snapshots at all.
+pub fn newest_local_snapshot(repo: &str) -> Result<(PathBuf, String), Error> {
+    let snapshots_dir = hf_home().join("hub").join(repo_folder_name(repo)).join("snapshots");
+    let remedy = || {
+        Error::Layered(format!(
+            "-m {repo}: no local directory by that name, and no cached HF snapshot found \
+             (checked {} under HF cache root {}).\n\
+             Fetch it with:\n\n    hf download {repo}\n\n\
+             or set DGQ_HF_HOME / HF_HOME if it's cached somewhere else, or pass an existing \
+             local directory instead.",
+            snapshots_dir.display(),
+            hf_home().display(),
+        ))
+    };
+    let read = std::fs::read_dir(&snapshots_dir).map_err(|_| remedy())?;
+    let mut best: Option<(std::time::SystemTime, PathBuf, String)> = None;
+    for entry in read {
+        let Ok(entry) = entry else { continue };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() && !file_type.is_symlink() {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let revision = entry.file_name().to_string_lossy().into_owned();
+        if best.as_ref().is_none_or(|(t, ..)| mtime > *t) {
+            best = Some((mtime, entry.path(), revision));
+        }
+    }
+    best.map(|(_, path, rev)| (path, rev)).ok_or_else(remedy)
+}
+
 /// Resolve a pinned HF snapshot dir, or fail with the exact command to fetch
 /// it.
 pub fn resolve_snapshot_dir(base: &BaseModelRef) -> Result<PathBuf, Error> {
@@ -153,6 +251,85 @@ mod tests {
             repo_folder_name("google/diffusiongemma-26B-A4B-it"),
             "models--google--diffusiongemma-26B-A4B-it"
         );
+    }
+
+    #[test]
+    fn repo_id_shape_detection() {
+        assert!(looks_like_hf_repo_id("google/diffusiongemma-26B-A4B-it"));
+        assert!(looks_like_hf_repo_id("mmastrac/diffusiongemma-q4emb"));
+        assert!(looks_like_hf_repo_id("model/transformer")); // shape-only; disambiguated by is_dir() first
+        assert!(!looks_like_hf_repo_id("model/transformer/extra"));
+        assert!(!looks_like_hf_repo_id("just-a-name"));
+        assert!(!looks_like_hf_repo_id("/absolute/two/segs"));
+        assert!(!looks_like_hf_repo_id("org/"));
+        assert!(!looks_like_hf_repo_id("/name"));
+        assert!(!looks_like_hf_repo_id("../escape"));
+    }
+
+    #[test]
+    fn resolve_model_source_uses_existing_dir_verbatim() {
+        let dir = std::env::temp_dir().join(format!("dgq-resolve-existing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let resolved = resolve_model_source(&dir).expect("existing dir resolves");
+        assert_eq!(resolved.dir, dir);
+        assert!(resolved.repo_pin.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_model_source_repo_id_picks_newest_snapshot() {
+        let hf_home = std::env::temp_dir().join(format!("dgq-resolve-repo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&hf_home);
+        let snapshots = hf_home
+            .join("hub")
+            .join("models--acme--widgets")
+            .join("snapshots");
+        let old = snapshots.join("aaaaaaa");
+        let new = snapshots.join("bbbbbbb");
+        std::fs::create_dir_all(&old).expect("mkdir old");
+        // Ensure a real mtime gap regardless of filesystem timestamp granularity.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::create_dir_all(&new).expect("mkdir new");
+
+        let cfg = crate::flags::RuntimeConfig::from_pairs(&[(
+            "DGQ_HF_HOME".to_string(),
+            hf_home.display().to_string(),
+        )])
+        .0;
+        let _guard = crate::flags::install_for_test(cfg);
+
+        let resolved =
+            resolve_model_source(Path::new("acme/widgets")).expect("repo id resolves");
+        assert_eq!(resolved.dir, new);
+        let pin = resolved.repo_pin.expect("repo pin");
+        assert_eq!(pin.repo, "acme/widgets");
+        assert_eq!(pin.revision, "bbbbbbb");
+
+        let _ = std::fs::remove_dir_all(&hf_home);
+    }
+
+    #[test]
+    fn resolve_model_source_repo_id_no_cache_gives_remedy() {
+        let hf_home = std::env::temp_dir().join(format!("dgq-resolve-empty-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&hf_home);
+        let cfg = crate::flags::RuntimeConfig::from_pairs(&[(
+            "DGQ_HF_HOME".to_string(),
+            hf_home.display().to_string(),
+        )])
+        .0;
+        let _guard = crate::flags::install_for_test(cfg);
+
+        let err = resolve_model_source(Path::new("acme/nonexistent")).expect_err("must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("hf download acme/nonexistent"), "{msg}");
+        let _ = std::fs::remove_dir_all(&hf_home);
+    }
+
+    #[test]
+    fn resolve_model_source_neither_dir_nor_repo_shape_fails() {
+        let err = resolve_model_source(Path::new("../not/a/real/multi/segment/path"))
+            .expect_err("must fail: not a dir, not repo-id shaped");
+        assert!(err.to_string().contains("doesn't look like an HF repo id"));
     }
 
     #[test]

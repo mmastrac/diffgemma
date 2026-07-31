@@ -465,39 +465,148 @@ fails loud with the exact `hf download` command to fix it
 (`src/dgq/hf_resolve.rs`; cache root: `DGQ_HF_HOME` → `HF_HOME` →
 `~/.cache/huggingface`).
 
-**Loading**: at open, `DgqGpuBlob::from_store` resolves every external file,
-then assembles the canonical address space from two regions. The expert tail
-`[expert_split, total)` is offset-mmap'd DIRECTLY off the pack's own blob at
-`local_expert_split` (the writer lays the local expert region out
-byte-identical to the canonical tail, 16384-aligned) — never copied. The raw
-head `[0, expert_split)` is gather-copied at canonical offsets into
-`model.dgq.head` next to the pack — built ONCE, keyed by a sha256 of the
-manifest JSON (`model.dgq.head.meta`), then mmap'd read-only on every later
-load. Both regions are therefore file-backed CLEAN pages: shared across
-concurrent instances/processes of the same pack and evictable-and-re-readable
-under memory pressure, exactly like a self-contained pack's blob. (A private
-anonymous head per load — the first implementation — cost ~5.5 GiB of
-swap-backed dirty pages PER runtime and stalled the test suite behind
-fault-bound re-reads.) The mapping bases coincide with the `MTLBuffer` bases,
-so the no-copy wrap, `host_ptr`, and every `w_off` consumer run unchanged —
-correctness rides on the SAME code path a self-contained pack uses, not a
-parallel one. If the pack dir is not writable the head falls back to a
-private anonymous mapping. The CPU-side path (`DgqStore::tensor_bytes`, used
-for e.g. the embed-token gather) never materializes: it is a per-tensor
-redirect to whichever mmap (own blob or external file) actually holds the
-bytes.
+**Loading — VA-splice**: at open, `DgqGpuBlob::from_store` resolves every
+external file, then assembles the canonical address space from two regions.
+The expert tail `[expert_split, total)` is offset-mmap'd DIRECTLY off the
+pack's own blob at `local_expert_split` (the writer lays the local expert
+region out byte-identical to the canonical tail, 16384-aligned) — never
+copied, unchanged from before this section. The raw head `[0, expert_split)`
+is served by splicing multiple mappings into ONE contiguous virtual range and
+wrapping the WHOLE range in a single no-copy `MTLBuffer`
+(`src/metal/dgq_gpu.rs::build_head_splice`):
 
-**Deferred**: direct per-tensor `MTLBuffer` binds straight into mmap'd
-external files (no head cache at all) — would drop the one-time ~5.5 GiB
-head build and its on-disk copy for the shipped q4 overlay. Blocked on: today every
-`Q4LinearGpu`/`Q8LinearGpu`/`RawBlobView` carries `(Arc<DgqGpuBlob>,
-byte_offset)` into ONE blob abstraction; a direct-mmap loader needs those
-views to instead carry a per-source buffer handle (one no-copy `MTLBuffer`
-per external file + the pack's own), and every Metal `setBuffer` call site
-that assumes "the blob buffer" needs the tensor's source-specific buffer —
-mechanical but touches every weight-view constructor and dispatch site, not
-a boundary change. Reserve the flag name `DGQ_PACK_MMAP_EXT` for this when
-it lands.
+1. Reserve `[0, expert_split)` bytes of address space (`mmap` with
+   `PROT_NONE`, then `MAP_FIXED` a R/W anonymous backdrop over the whole
+   thing).
+2. `plan_head_splice` groups the manifest's head entries into maximal runs
+   that are contiguous in BOTH the canonical and source-file address spaces
+   with a page-congruent start (`canonical_off ≡ file_off mod 16384`) — see
+   "Writer layout" below for how the writer arranges this. Each validated
+   run is `MAP_FIXED`-spliced straight off its resolved external HF shard,
+   replacing the corresponding pages of the anonymous backdrop.
+3. Everything NOT covered by a run — every `Local`-sourced tensor (the SC
+   q8 trio, or any custom-class override that isn't Raw), and any run the
+   plan couldn't PROVE safe — is memcpy'd into the remaining anonymous
+   pages, exactly like the old gather-copy for that (much smaller) residual.
+4. The whole reservation is `mprotect`ed to `PROT_READ` and wrapped in ONE
+   `newBufferWithBytesNoCopy` call.
+
+The plan never trusts the writer's intent: a run is spliced only if, after
+rounding to page boundaries, its mapped range does not overlap any OTHER
+manifest tensor's true declared bytes — this is what makes correctness not
+depend on the writer getting the layout exactly right (a run that fails
+either check just falls back to anon-copy for its own members, not a global
+failure). `build_head_splice` itself returns `Err` for anything it can't
+prove correct — including the degenerate case of an old pre-splice pack
+(external head tensors present, zero runs qualified) — and the caller falls
+back to the pre-splice whole-blob `materialize_layered_blob` path. Either
+way, the head ends up as ONE base pointer + length (`HeadRegion`, either a
+plain `Mmap` or the spliced reservation), which is all `host_ptr` and the
+`MTLBuffer` wrap need — every consumer already treated "the head mapping" as
+one opaque region, so the splice is a drop-in swap at that boundary, not a
+per-view-type change.
+
+The behavior a single no-copy `MTLBuffer` can wrap a VA range spliced from
+several distinct mappings is UNDOCUMENTED Metal behavior, verified by a
+standing canary probe (`src/metal/va_splice_probe.rs`,
+`cargo test --release va_splice -- --ignored --nocapture`): `[file A | anon |
+file B]` splice, compute-shader readback bit-exact across both seams, at
+production scale (3×512 MiB). Re-run it after an OS update; if it ever
+regresses, `build_head_splice`'s own failure path (Metal returning nil, or a
+command-buffer error surfacing downstream) falls back to
+`materialize_layered_blob`, so a regression degrades performance, not
+correctness — but the canary is the fast way to find out on purpose instead
+of by surprise.
+
+**Writer layout**: both overlay writers (`quantize --overlay` in
+`src/dgq/convert.rs`, `repack --overlay` in `src/dgq/overlay.rs`) lay the
+head out to make the loader's plan satisfiable where possible: every
+externalized Raw tensor is visited grouped by source HF shard, in that
+shard's own byte order (so consecutive same-shard tensors CAN advance the
+canonical cursor by exactly their `byte_len` — zero gap, mirroring the file
+exactly, not just orderwise), with a congruent-mod-16384 pad
+(`congruent_pad`) considered at each new shard-run's start.
+
+**Every tensor's canonical offset is 64-byte aligned, unconditionally, with
+no exception for splice-run members** — this is a hard GPU-correctness
+requirement, not a splice nicety: `gemm_rowk.metal` and structurally
+identical kernels reinterpret `blob + w_off` as `device const ushort *`
+(`half4`/`simdgroup_load`-fed tiles) and index it, which is only
+well-defined for a sufficiently aligned `w_off`. An earlier version of this
+writer skipped alignment INSIDE a run to preserve the "zero gap mirrors the
+file" property — it produced a pack with byte-IDENTICAL tensor content
+(verified exhaustively against the source) that nonetheless generated
+garbage from decoder layer 1 onward, because the GPU kernel's typed read at
+a misaligned `w_off` is silently wrong while every byte-content check
+(`host_ptr` vs `DgqStore::tensor_bytes`, both untyped pointer reads) stays
+green. `align_offset`'s 64-byte bump is a no-op whenever the previous
+tensor's byte length is itself a 64-byte multiple — true for essentially
+every real weight matrix here (`hidden_size=2816` ⇒ row strides are
+multiples of 64) — so this rarely disturbs zero-gap mirroring in practice;
+it only ends a run early at a non-64-multiple tensor (`layer_scalar`, 2
+bytes).
+
+**Page-congruence and 64-byte alignment are mutually exclusive for a run
+whose OWN file offset isn't itself a multiple of 64**: rounding both the
+canonical and file positions to the same 16384-byte page necessarily
+preserves their shared remainder mod 64 (64 divides 16384), so a run can
+only be made BOTH congruent and 64-aligned when `file_start % 64 == 0` to
+begin with. The writer checks this before attempting `congruent_pad`;
+otherwise the tensor stays 64-aligned (correct) but not page-congruent
+(un-spliceable), and `plan_head_splice` correctly anon-fills it. Every run
+boundary that IS attempted (closing a run, opening one, or both back to
+back) additionally rounds the cursor up to a full 16384-byte page
+(`round_up_page`, which implies 64-byte alignment) before that congruence
+nudge: congruence alone is not enough, because a spliced run's *rounded*
+range can extend past its own true end, and without a full page of
+separation that rounding fringe can land on a neighboring tensor's real
+bytes (caught live by `writer_plan_integration_tests` in
+`src/metal/dgq_gpu.rs`, which runs the real writer against a synthetic
+fixture and re-derives the loader's own plan to assert zero fallbacks — that
+fixture's shard header is deliberately padded to land its first tensor on a
+64-byte-aligned file offset, the same property real shards only sometimes
+have). Local head tensors (quantized/custom-class, always anon-filled, never
+spliced) are grouped into their own block after every shard-run; experts
+stay last, unchanged. `repack --overlay` computes this layout from scratch
+rather than carrying over the self-contained source's (alphabetical,
+non-congruent) offsets.
+
+**Measured consequence on the shipped model**: an HF safetensors shard's
+header length (`8 + header_json_len`, the byte offset its first tensor
+lands at) is effectively arbitrary mod 64, so whether ANY given shard-run's
+first tensor happens to be 64-aligned is close to a 1-in-64 draw per
+run-start, independent per shard. On `google/diffusiongemma-26B-A4B-it`'s
+11 shards this drew zero hits — every one of the ~147 candidate runs the
+writer forms (some spanning up to 18 tensors) fails the 64-byte gate, so the
+shipped pack currently takes the `materialize_layered_blob` fallback for
+every load. Correctness is unaffected (that fallback is the same,
+independently-tested gather-copy path a pre-splice pack always used) but the
+splice mechanism's performance benefit is not currently realized on this
+model. Loosening the requirement below 64 bytes (if a real kernel minimum
+turns out to be smaller) is the follow-up that would change this — not
+attempted here for lack of time to audit every kernel's actual alignment
+assumption; 64 bytes is the value proven safe (it's what every previously-
+working pack always used).
+
+**Load-time tripwire**: `assert_tensor_offset_alignment`
+(`src/metal/dgq_gpu.rs`) checks every tensor's canonical offset against the
+64-byte requirement unconditionally at `DgqGpuBlob::from_store` — for EVERY
+pack, not just layered ones — and refuses to load (loud, before any GPU
+buffer is created) rather than silently producing wrong output. This is the
+check that would have caught the writer regression above; a byte-content
+tripwire alone (comparing the assembled buffer against `DgqStore`'s
+independent resolution) provably does not, since both sides read through
+untyped pointers with no alignment requirement of their own.
+
+**Compat**: the plan is derived purely from each entry's own `offset`/
+`source` — no manifest version bump. An old (pre-splice) layered pack simply
+fails the congruence check (zero runs qualify) and takes the
+`materialize_layered_blob` fallback under a NEW binary; a NEW spliceable
+pack still loads correctly under an OLD binary through that binary's own
+`layered_head_mmap`-era code, since nothing about the entry format changed
+— only where canonical offsets happen to land (and every offset stays
+64-byte aligned, the same invariant an old binary's writer already
+produced).
 
 **Tooling**: `repack --overlay -m PACK -o DIR` splits an existing
 self-contained pack: it verifies each Raw tensor's bytes are byte-identical
@@ -509,7 +618,16 @@ repack) and auto-detects `(repo, revision)` from the source path's
 an experts-only overlay directly from an HF snapshot (any profile,
 including `nvfp4`) without a self-contained intermediate — the same
 `classify_tensor`/quantization code path, only the emission target differs
-for Raw tensors.
+for Raw tensors. `repack --monolithic -m PACK -o DIR` is the dual: it
+flattens a layered pack back into a self-contained one, streaming every
+tensor's resolved bytes (local or external) to a fresh blob at canonical
+offsets — no requantization, and no splice-layout requirement, since a
+monolithic pack has no external refs to splice.
+
+**Product framing**: monolithic (self-contained) packs are how models are
+distributed to users (`download`, HF-hosted packs). Layered/overlay packs
+are local-only dev tooling for experiment arms (`quantize --overlay`,
+`repack --overlay`/`--monolithic`) — never the distribution artifact.
 
 ## 9. Deliberate divergences from the MLX/HF reference
 

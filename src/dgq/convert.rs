@@ -100,8 +100,6 @@ pub fn quantize_model(opts: QuantizeOptions) -> Result<QuantizeSummary, Error> {
     let mut external_files: BTreeMap<String, ExternalFile> = BTreeMap::new();
     let mut shard_pin_cache: BTreeMap<String, (u64, String)> = BTreeMap::new();
 
-    let mut names: Vec<String> = store.weight_map.keys().cloned().collect();
-    names.sort();
     // Experts LAST: lets the loader wrap [0, split) + [split, end) as two
     // no-copy MTLBuffers when the blob exceeds the device's max single-buffer
     // length (M3 Pro/36GB: 20.25 GiB; q6 blob: ~24 GiB).
@@ -111,7 +109,29 @@ pub fn quantize_model(opts: QuantizeOptions) -> Result<QuantizeSummary, Error> {
             .map(|(_, info)| n.contains(".experts.") && info.shape.len() == 3)
             .unwrap_or(false)
     };
-    names.sort_by_key(|n| (is_expert(n), n.clone()));
+    let names: Vec<String> = if opts.overlay_base.is_some() {
+        // Overlay mode: lay the head out for VA-splice (ARCHITECTURE.md
+        // §8.1) — every externalizable Raw tensor grouped by source shard,
+        // in that shard's own byte order, so the loader's `plan_head_splice`
+        // can recognize each shard's raw tensors as ONE contiguous run.
+        let classified: Vec<(String, QuantKind)> = store
+            .weight_map
+            .keys()
+            .map(|n| {
+                let (_, info) = store.get(n).expect("weight_map key exists");
+                (
+                    n.clone(),
+                    classify_tensor_custom(n, &info.shape, opts.profile, &opts.custom_overrides),
+                )
+            })
+            .collect();
+        build_overlay_tensor_order(&store, &classified, &is_expert)
+    } else {
+        let mut ns: Vec<String> = store.weight_map.keys().cloned().collect();
+        ns.sort();
+        ns.sort_by_key(|n| (is_expert(n), n.clone()));
+        ns
+    };
     let mut expert_split: Option<u64> = None;
     // Overlay mode only: the local blob's own expert-region start, page-
     // aligned the same way as `expert_split`. Because `names` visits experts
@@ -123,6 +143,21 @@ pub fn quantize_model(opts: QuantizeOptions) -> Result<QuantizeSummary, Error> {
     // instead of gather-copying it (see `DgqManifest::local_expert_split`).
     let mut local_expert_split: Option<u64> = None;
     const EXPERT_SPLIT_ALIGN: u64 = 16384; // page alignment for no-copy regions
+    // Overlay mode only: `(shard, next expected file byte offset)` while
+    // we're inside a head run, so consecutive tensors advance the canonical
+    // cursor by EXACTLY their byte_len (zero gap, mirroring the shard's own
+    // layout) — but ONLY when they are ACTUALLY file-contiguous. Same-shard
+    // alone is NOT enough: two Raw tensors from the same HF shard can sit
+    // gigabytes apart in the file (e.g. `embed_tokens` then, gigabytes of
+    // interleaved expert tensors later, `layers.0.input_layernorm`) — an
+    // earlier version of this code merged them into one canonical zero-gap
+    // "run" on shard-name alone, which then hit `plan_head_splice`'s own
+    // (correct, file-contiguity-checked) grouping as two SEPARATE runs with
+    // NO page separation between them — the writer had skipped the run-
+    // boundary page bump because it never saw a boundary. Caught live
+    // running the real model regen through `golden`, not by the (same-
+    // shard, small, actually-contiguous) synthetic test fixture.
+    let mut head_run: Option<(String, u64)> = None;
     for (i, name) in names.iter().enumerate() {
         let (shard, info) = store
             .get(name)
@@ -133,15 +168,104 @@ pub fn quantize_model(opts: QuantizeOptions) -> Result<QuantizeSummary, Error> {
             .map(TensorClass::as_str)
             .unwrap_or(LOCKED_BUCKET);
 
-        offset = align_offset(offset);
+        let is_head_external =
+            opts.overlay_base.is_some() && kind == QuantKind::Raw && !is_expert(name);
+        let file_start = is_head_external.then(|| shard.absolute_data_offset(info));
+        let continues = match (&head_run, file_start) {
+            (Some((shard_name, next_file_off)), Some(fs)) => {
+                *shard_name == store.weight_map[name] && *next_file_off == fs
+            }
+            _ => false,
+        };
+
+        if continues {
+            // Nominally "continuing" the shard-run in FILE terms — but every
+            // tensor's OWN canonical start must STILL be 64-byte aligned
+            // regardless: `gemm_rowk`-class kernels reinterpret
+            // `blob + w_off` as `device const ushort *` and index it, which
+            // is only well-defined/correct for a sufficiently aligned
+            // `w_off` (confirmed empirically: the working pack has all 1047
+            // canonical offsets 64-byte aligned via the old unconditional
+            // `align_offset`; an earlier version of this writer skipped
+            // alignment entirely inside a run and produced a pack whose
+            // GPU-read weights were silently wrong from layer 1 onward
+            // despite byte-identical tensor CONTENT — golden caught it,
+            // `gpu_buffer_matches_store_for_every_tensor` did not, because
+            // that diagnostic reads via `host_ptr`, which has no alignment
+            // requirement). `align_offset` is a NO-OP whenever the previous
+            // tensor's byte length was already a 64-byte multiple — true for
+            // essentially every real weight matrix here (hidden_size=2816 ⇒
+            // row strides are multiples of 64) — so in the common case this
+            // does not disturb the zero-gap mirroring the splice plan needs;
+            // on a rare non-64-multiple tensor (e.g. `layer_scalar`, 2
+            // bytes) it inserts padding, which correctly ENDS the run there
+            // (the loader's independent canonical-contiguity check agrees)
+            // rather than producing a misaligned-but-nominally-contiguous
+            // run.
+            offset = align_offset(offset);
+        } else {
+            // A run boundary on EITHER side (closing a shard-run, opening
+            // one, or both back-to-back) needs a FULL page of separation,
+            // not just congruence: `plan_head_splice`'s MAP_FIXED range for
+            // a run is rounded to page boundaries, so a run's own trailing
+            // (or leading) fringe can otherwise land on a neighboring
+            // tensor's true bytes — caught by
+            // `writer_plan_integration_tests`. `round_up_page` also implies
+            // 64-byte alignment (16384 is a multiple of 64), so this keeps
+            // the same GPU-correctness invariant as the `continues` branch.
+            // An ordinary local-to-local transition (neither side a run)
+            // stays on the cheap 64-byte `align_offset`.
+            if head_run.is_some() || is_head_external {
+                offset = round_up_page(offset, EXPERT_SPLIT_ALIGN);
+            } else {
+                offset = align_offset(offset);
+            }
+            if let Some(fs) = file_start
+                && fs.is_multiple_of(64)
+            {
+                // Starting a NEW shard-run WHOSE FILE OFFSET IS ITSELF
+                // 64-byte aligned: nudge forward (< 16 KiB more) to also
+                // make this run's canonical start page-congruent with its
+                // file offset. The nudge amount is guaranteed to stay a
+                // multiple of 64 too, because both `offset` (just rounded
+                // to a 16384-byte, hence 64-byte, boundary) and `fs` are
+                // multiples of 64: `congruent_pad` only ever adds a
+                // difference/sum of two such multiples. When `fs` is NOT
+                // 64-aligned, congruence and 64-byte alignment are
+                // mutually exclusive for this tensor (rounding both to the
+                // same page necessarily preserves their mod-64 remainder,
+                // which is what `gemm_rowk`-class kernels depend on) — so
+                // this tensor simply stays aligned-but-not-congruent,
+                // which `plan_head_splice` correctly reads as "not
+                // spliceable" and anon-fills instead. Correctness first;
+                // splice coverage follows from real tensor byte lengths
+                // already being 64-byte multiples for this model.
+                offset = congruent_pad(offset, fs, EXPERT_SPLIT_ALIGN);
+            }
+        }
+        head_run = file_start.map(|fs| (store.weight_map[name].clone(), fs + src.len() as u64));
+
         if expert_split.is_none() && is_expert(name) {
             offset = (offset + EXPERT_SPLIT_ALIGN - 1) & !(EXPERT_SPLIT_ALIGN - 1);
             expert_split = Some(offset);
+            // Bump the LOCAL blob cursor to the same 16 KiB boundary
+            // UNCONDITIONALLY — not just in overlay mode. A self-contained
+            // pack's `source` is always `None`, so every reader (including
+            // `wrap_mmap`'s expert-region split) treats `meta.offset`
+            // (canonical) as the tensor's ACTUAL position in `blob_file`.
+            // Bumping only the canonical cursor here (the old behavior) let
+            // it diverge from `local_bytes_written` by up to 16383 bytes
+            // from the first expert tensor onward, so every expert (and
+            // everything after) would be written at one file position while
+            // the manifest claimed a different one — silently wrong weights
+            // for any self-contained multi-expert pack. No test exercised
+            // `overlay_base: None` before the round-trip test that caught
+            // this (`dgq::overlay::monolithic_roundtrip_tests`).
+            let aligned = (local_bytes_written + EXPERT_SPLIT_ALIGN - 1) & !(EXPERT_SPLIT_ALIGN - 1);
+            let pad = (aligned - local_bytes_written) as usize;
+            blob.write_all(&vec![0u8; pad])?;
+            local_bytes_written = aligned;
             if opts.overlay_base.is_some() {
-                let aligned = (local_bytes_written + EXPERT_SPLIT_ALIGN - 1) & !(EXPERT_SPLIT_ALIGN - 1);
-                let pad = (aligned - local_bytes_written) as usize;
-                blob.write_all(&vec![0u8; pad])?;
-                local_bytes_written = aligned;
                 local_expert_split = Some(aligned);
             }
         }
@@ -298,6 +422,75 @@ pub fn quantize_model(opts: QuantizeOptions) -> Result<QuantizeSummary, Error> {
         custom_classes,
         class_bytes,
     })
+}
+
+/// Overlay-mode tensor visiting order: every externalizable Raw tensor
+/// first, grouped by source HF shard and sorted WITHIN each shard by the
+/// tensor's own byte offset there (mirrors the shard's internal layout
+/// exactly — no gaps this loop doesn't already know about) — the property
+/// `src/metal/dgq_gpu.rs::plan_head_splice` needs to recognize a shard's raw
+/// tensors as one contiguous, page-congruent run. Shards are visited in
+/// filename order (deterministic, otherwise arbitrary — repack --overlay
+/// mirrors this same order independently). Every other non-expert tensor
+/// (Local: quantized, or a custom-class override that isn't Raw) follows,
+/// name-sorted; experts are always last (unchanged tail-split invariant).
+fn build_overlay_tensor_order(
+    store: &SafetensorStore,
+    classified: &[(String, QuantKind)],
+    is_expert: &impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut shard_groups: BTreeMap<String, Vec<(u64, String)>> = BTreeMap::new();
+    let mut local_head: Vec<String> = Vec::new();
+    let mut experts: Vec<String> = Vec::new();
+
+    for (name, kind) in classified {
+        if is_expert(name) {
+            experts.push(name.clone());
+            continue;
+        }
+        if *kind == QuantKind::Raw {
+            let (shard, info) = store.get(name).expect("classified name is in weight_map");
+            let shard_name = store.weight_map[name].clone();
+            shard_groups
+                .entry(shard_name)
+                .or_default()
+                .push((shard.absolute_data_offset(info), name.clone()));
+        } else {
+            local_head.push(name.clone());
+        }
+    }
+
+    let mut order = Vec::with_capacity(classified.len());
+    for (_shard, mut tensors) in shard_groups {
+        tensors.sort_by_key(|(file_off, _)| *file_off);
+        order.extend(tensors.into_iter().map(|(_, name)| name));
+    }
+    local_head.sort();
+    order.extend(local_head);
+    experts.sort();
+    order.extend(experts);
+    order
+}
+
+/// Smallest value `>= cursor` that is congruent with `file_off` mod `page`
+/// (`0 <= result - cursor < page`) — the padding a new head-splice run needs
+/// so its canonical start lines up with its own source-file start once both
+/// are rounded down to a page boundary (see `plan_head_splice`'s doc
+/// comment for why that's the exact property splicing needs).
+pub(crate) fn congruent_pad(cursor: u64, file_off: u64, page: u64) -> u64 {
+    let target = file_off % page;
+    let cur = cursor % page;
+    let add = if target >= cur {
+        target - cur
+    } else {
+        page - cur + target
+    };
+    cursor + add
+}
+
+/// Smallest page-aligned value `>= cursor`.
+pub(crate) fn round_up_page(cursor: u64, page: u64) -> u64 {
+    cursor.div_ceil(page) * page
 }
 
 fn write_q6_tensor(out: &mut impl Write, src: &[u8], shape: &[i64]) -> Result<u64, Error> {
