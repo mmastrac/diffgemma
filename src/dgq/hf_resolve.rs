@@ -54,6 +54,13 @@ pub fn looks_like_hf_repo_id(s: &str) -> bool {
     if parts.len() != 2 {
         return false;
     }
+    // `model/` and `models/` are the conventional LOCAL weights directories,
+    // not HF orgs. Treat them as local relative paths so a missing
+    // `-m model/transformer` reports a "no such directory" error instead of a
+    // nonsensical `hf download model/transformer` remedy.
+    if matches!(parts[0], "model" | "models") {
+        return false;
+    }
     let ok_segment = |seg: &str| {
         !seg.is_empty()
             && seg != "."
@@ -130,6 +137,134 @@ pub fn newest_local_snapshot(repo: &str) -> Result<(PathBuf, String), Error> {
         }
     }
     best.map(|(_, path, rev)| (path, rev)).ok_or_else(remedy)
+}
+
+/// The canonical published pack: the `download` default, and the pack the
+/// default `-m` resolver prefers locally and in the HF cache.
+pub const DEFAULT_MODEL_REPO: &str = "mmastrac/diffgemma-26b-a4b-it-q4";
+/// The bare model name of [`DEFAULT_MODEL_REPO`] (its local `model/<name>` dir).
+pub const DEFAULT_MODEL_NAME: &str = "diffgemma-26b-a4b-it-q4";
+
+/// Resolve the model source when `-m` was NOT given. Walks a fallback chain and
+/// returns the first hit:
+///
+///   1. `model/transformer`              (the bf16 base-checkpoint convention)
+///   2. `model/diffgemma-26b-a4b-it-q4`  (the canonical local pack)
+///   3. `model/diffgemma-*`              (any other local diffgemma pack)
+///   4. HF-cached `mmastrac/diffgemma-26b-a4b-it-q4`
+///   5. any HF-cached `*/diffgemma-*` pack (newest snapshot wins)
+///
+/// Fails with a `download`-pointing remedy when nothing is found. Unlike a bare
+/// `-m` value this never treats the names as HF repo ids, so it can't emit a
+/// bogus `hf download model/transformer`.
+pub fn resolve_default_model_source() -> Result<ResolvedModelSource, Error> {
+    resolve_default_model_source_in(Path::new("model"))
+}
+
+/// [`resolve_default_model_source`] against an explicit local `model/` root, so
+/// the chain is testable without depending on the process's cwd.
+fn resolve_default_model_source_in(model_root: &Path) -> Result<ResolvedModelSource, Error> {
+    // 1 + 2: named local dirs, in preference order.
+    for name in ["transformer", DEFAULT_MODEL_NAME] {
+        let dir = model_root.join(name);
+        if dir.is_dir() {
+            return Ok(ResolvedModelSource { dir, repo_pin: None });
+        }
+    }
+
+    // 3: any other local `model/diffgemma-*` pack (name-sorted, deterministic).
+    if let Some(dir) = first_local_pack(model_root, "diffgemma-") {
+        return Ok(ResolvedModelSource { dir, repo_pin: None });
+    }
+
+    // 4: the canonical pack in the HF cache.
+    if let Some((dir, revision)) = newest_pack_snapshot(DEFAULT_MODEL_REPO) {
+        return Ok(ResolvedModelSource {
+            dir,
+            repo_pin: Some(BaseModelRef {
+                repo: DEFAULT_MODEL_REPO.to_string(),
+                revision,
+            }),
+        });
+    }
+
+    // 5: any `*/diffgemma-*` pack in the HF cache (newest snapshot wins).
+    if let Some((repo, dir, revision)) = newest_cached_diffgemma_pack() {
+        return Ok(ResolvedModelSource {
+            dir,
+            repo_pin: Some(BaseModelRef { repo, revision }),
+        });
+    }
+
+    Err(Error::Layered(format!(
+        "no model given (-m) and no default model found.\n\
+         Looked for local dirs: {root}/transformer, {root}/{DEFAULT_MODEL_NAME}, {root}/diffgemma-*\n\
+         and HF-cached packs: {DEFAULT_MODEL_REPO}, any */diffgemma-* under {hub}.\n\n\
+         Fetch the default pack with:\n\n    diffgemma-mps download\n\n\
+         or pass an existing model with -m <dir | org/name>.",
+        root = model_root.display(),
+        hub = hf_home().join("hub").display(),
+    )))
+}
+
+/// Name-sorted first subdir of `root` whose name starts with `prefix` and that
+/// contains a `.dgq` manifest (i.e. a real pack, not an arbitrary dir).
+fn first_local_pack(root: &Path, prefix: &str) -> Option<PathBuf> {
+    let mut hits: Vec<PathBuf> = std::fs::read_dir(root)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(prefix))
+                && p.join(crate::dgq::layout::MANIFEST_FILE).is_file()
+        })
+        .collect();
+    hits.sort();
+    hits.into_iter().next()
+}
+
+/// Newest cache snapshot of `repo` that actually contains a `.dgq` manifest
+/// (so a metadata-only or truncated cache entry is skipped, not selected).
+fn newest_pack_snapshot(repo: &str) -> Option<(PathBuf, String)> {
+    let (dir, revision) = newest_local_snapshot(repo).ok()?;
+    dir.join(crate::dgq::layout::MANIFEST_FILE)
+        .is_file()
+        .then_some((dir, revision))
+}
+
+/// Scan the HF cache for `*/diffgemma-*` model repos and return the one whose
+/// newest pack snapshot is most recently modified: `(repo_id, snapshot, rev)`.
+fn newest_cached_diffgemma_pack() -> Option<(String, PathBuf, String)> {
+    let hub = hf_home().join("hub");
+    let mut best: Option<(std::time::SystemTime, String, PathBuf, String)> = None;
+    for entry in std::fs::read_dir(&hub).ok()?.filter_map(|e| e.ok()) {
+        let fname = entry.file_name();
+        let fname = fname.to_string_lossy();
+        // Cache dir names are `models--{org}--{name}` (org has no `--`).
+        let Some(rest) = fname.strip_prefix("models--") else {
+            continue;
+        };
+        let Some((org, name)) = rest.split_once("--") else {
+            continue;
+        };
+        if !name.starts_with("diffgemma-") {
+            continue;
+        }
+        let repo = format!("{org}/{name}");
+        let Some((dir, revision)) = newest_pack_snapshot(&repo) else {
+            continue;
+        };
+        let mtime = std::fs::metadata(&dir)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if best.as_ref().is_none_or(|(t, ..)| mtime > *t) {
+            best = Some((mtime, repo, dir, revision));
+        }
+    }
+    best.map(|(_, repo, dir, revision)| (repo, dir, revision))
 }
 
 /// Resolve a pinned HF snapshot dir, or fail with the exact command to fetch
@@ -257,7 +392,10 @@ mod tests {
     fn repo_id_shape_detection() {
         assert!(looks_like_hf_repo_id("google/diffusiongemma-26B-A4B-it"));
         assert!(looks_like_hf_repo_id("mmastrac/diffgemma-26b-a4b-it-q4"));
-        assert!(looks_like_hf_repo_id("model/transformer")); // shape-only; disambiguated by is_dir() first
+        // `model/` and `models/` are local weights dirs, never repo ids, so a
+        // missing `-m model/transformer` is a path error, not `hf download ...`.
+        assert!(!looks_like_hf_repo_id("model/transformer"));
+        assert!(!looks_like_hf_repo_id("models/diffgemma-26b-a4b-it-q4"));
         assert!(!looks_like_hf_repo_id("model/transformer/extra"));
         assert!(!looks_like_hf_repo_id("just-a-name"));
         assert!(!looks_like_hf_repo_id("/absolute/two/segs"));
@@ -381,5 +519,90 @@ mod tests {
             .expect_err("must fail: size mismatch");
         assert!(err.to_string().contains("size"));
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    fn write_pack(dir: &Path) {
+        std::fs::create_dir_all(dir).expect("mkdir pack");
+        std::fs::write(dir.join(crate::dgq::layout::MANIFEST_FILE), "{}").expect("write manifest");
+    }
+
+    #[test]
+    fn default_resolver_prefers_canonical_local_pack() {
+        let root = std::env::temp_dir().join(format!("dgq-default-named-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        write_pack(&root.join("diffgemma-26b-a4b-it-nvfp4"));
+        write_pack(&root.join(DEFAULT_MODEL_NAME));
+        let r = resolve_default_model_source_in(&root).expect("resolves");
+        assert_eq!(r.dir, root.join(DEFAULT_MODEL_NAME));
+        assert!(r.repo_pin.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn default_resolver_globs_other_local_pack_ignoring_non_packs() {
+        let root = std::env::temp_dir().join(format!("dgq-default-glob-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        write_pack(&root.join("diffgemma-26b-a4b-it-nvfp4"));
+        // Prefixed but not a pack (no manifest); must be skipped.
+        std::fs::create_dir_all(root.join("diffgemma-notes")).expect("mkdir");
+        let r = resolve_default_model_source_in(&root).expect("resolves");
+        assert_eq!(r.dir, root.join("diffgemma-26b-a4b-it-nvfp4"));
+        assert!(r.repo_pin.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn default_resolver_scans_hf_cache_for_any_diffgemma() {
+        let root = std::env::temp_dir().join(format!("dgq-default-cache-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("empty model root"); // falls through to cache
+
+        let hf_home = std::env::temp_dir().join(format!("dgq-default-cache-hf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&hf_home);
+        let snap = hf_home
+            .join("hub")
+            .join("models--acme--diffgemma-tiny")
+            .join("snapshots")
+            .join("abc123");
+        write_pack(&snap);
+        let cfg = crate::flags::RuntimeConfig::from_pairs(&[(
+            "DGQ_HF_HOME".to_string(),
+            hf_home.display().to_string(),
+        )])
+        .0;
+        let _guard = crate::flags::install_for_test(cfg);
+
+        let r = resolve_default_model_source_in(&root).expect("resolves from cache");
+        assert_eq!(r.dir, snap);
+        let pin = r.repo_pin.expect("cache hit pins the repo");
+        assert_eq!(pin.repo, "acme/diffgemma-tiny");
+        assert_eq!(pin.revision, "abc123");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&hf_home);
+    }
+
+    #[test]
+    fn default_resolver_not_found_points_to_download() {
+        let root = std::env::temp_dir().join(format!("dgq-default-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("empty model root");
+        let hf_home = std::env::temp_dir().join(format!("dgq-default-empty-hf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&hf_home);
+        std::fs::create_dir_all(hf_home.join("hub")).expect("empty hub");
+        let cfg = crate::flags::RuntimeConfig::from_pairs(&[(
+            "DGQ_HF_HOME".to_string(),
+            hf_home.display().to_string(),
+        )])
+        .0;
+        let _guard = crate::flags::install_for_test(cfg);
+
+        let err = resolve_default_model_source_in(&root).expect_err("nothing found");
+        let msg = err.to_string();
+        assert!(msg.contains("diffgemma-mps download"), "{msg}");
+        assert!(msg.contains("no default model found"), "{msg}");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&hf_home);
     }
 }

@@ -10,6 +10,9 @@ use std::path::PathBuf;
 #[derive(Debug)]
 pub(crate) struct Cli {
     pub(crate) model_dir: PathBuf,
+    /// False when `-m`/`--model` was omitted, so dispatch walks the default
+    /// model fallback chain instead of resolving the `model_dir` placeholder.
+    pub(crate) model_dir_explicit: bool,
     pub(crate) command: Command,
     /// When true, `-p` text is BPE-encoded as-is (no chat template).
     pub(crate) raw_prompt: bool,

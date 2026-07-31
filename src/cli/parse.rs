@@ -20,7 +20,10 @@ fn parse_cli_bool(s: &str) -> Option<bool> {
 
 pub(crate) fn parse_cli() -> Cli {
     let mut args = env::args().skip(1);
+    // Placeholder default; when `-m` is omitted, dispatch ignores this and walks
+    // the default model fallback chain (`model_dir_explicit` stays false).
     let mut model_dir = PathBuf::from("model/transformer");
+    let mut model_dir_explicit = false;
     let mut positional = Vec::new();
     let mut seed = 42u64;
     let mut seed_explicit = false;
@@ -139,6 +142,7 @@ pub(crate) fn parse_cli() -> Cli {
             "-m" | "--model" => {
                 if let Some(path) = args.next() {
                     model_dir = PathBuf::from(path);
+                    model_dir_explicit = true;
                 }
             }
             "-o" | "--output" => {
@@ -734,10 +738,13 @@ pub(crate) fn parse_cli() -> Cli {
         }
         Some("download") => Command::Download {
             // Default repo/dest mirror the model card; -o overrides the target.
-            repo: download_repo
-                .unwrap_or_else(|| "mmastrac/diffgemma-26b-a4b-it-q4".to_string()),
+            repo: download_repo.unwrap_or_else(|| {
+                crate::dgq::hf_resolve::DEFAULT_MODEL_REPO.to_string()
+            }),
             revision: download_revision,
-            dest: output_dir.unwrap_or_else(|| PathBuf::from("model/diffgemma-26b-a4b-it-q4")),
+            dest: output_dir.unwrap_or_else(|| {
+                PathBuf::from(format!("model/{}", crate::dgq::hf_resolve::DEFAULT_MODEL_NAME))
+            }),
             force: download_force,
             jobs: download_jobs,
         },
@@ -1100,6 +1107,7 @@ pub(crate) fn parse_cli() -> Cli {
 
     Cli {
         model_dir,
+        model_dir_explicit,
         command,
         raw_prompt,
     }

@@ -66,8 +66,18 @@ pub(crate) fn dispatch(cli: Cli) -> ExitCode {
     let mut cli = cli;
     let mut quantize_repo_pin: Option<dgq::layout::BaseModelRef> = None;
     if command_uses_model_dir(&cli.command) {
-        match dgq::hf_resolve::resolve_model_source(&cli.model_dir) {
+        // Explicit `-m` resolves that one value; an omitted `-m` walks the
+        // default fallback chain (local `model/` dirs, then the HF cache).
+        let resolved = if cli.model_dir_explicit {
+            dgq::hf_resolve::resolve_model_source(&cli.model_dir)
+        } else {
+            dgq::hf_resolve::resolve_default_model_source()
+        };
+        match resolved {
             Ok(resolved) => {
+                if !cli.model_dir_explicit {
+                    eprintln!("using model: {}", resolved.dir.display());
+                }
                 cli.model_dir = resolved.dir;
                 quantize_repo_pin = resolved.repo_pin;
             }
