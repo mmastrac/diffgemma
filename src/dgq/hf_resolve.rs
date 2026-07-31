@@ -200,39 +200,44 @@ fn resolve_default_model_source_in(model_root: &Path) -> Result<ResolvedModelSou
         "no model given (-m) and no default model found.\n\
          Looked for local dirs: {root}/transformer, {root}/{DEFAULT_MODEL_NAME}, {root}/diffgemma-*\n\
          and HF-cached packs: {DEFAULT_MODEL_REPO}, any */diffgemma-* under {hub}.\n\n\
-         Fetch the default pack with:\n\n    diffgemma-mps download\n\n\
+         Fetch the default pack with either:\n\n    diffgemma-mps download\n    hf download {DEFAULT_MODEL_REPO}\n\n\
          or pass an existing model with -m <dir | org/name>.",
         root = model_root.display(),
         hub = hf_home().join("hub").display(),
     )))
 }
 
-/// Name-sorted first subdir of `root` whose name starts with `prefix` and that
-/// contains a `.dgq` manifest (i.e. a real pack, not an arbitrary dir).
+/// A usable monolithic pack has both the `.dgq` manifest and its blob. A
+/// partial or in-progress HF-cache download has the small manifest well before
+/// the multi-GiB blob lands; auto-selecting it would fail at load, so it's
+/// skipped.
+fn is_pack_dir(dir: &Path) -> bool {
+    dir.join(crate::dgq::layout::MANIFEST_FILE).is_file()
+        && dir.join(crate::dgq::layout::BLOB_FILE).is_file()
+}
+
+/// Name-sorted first subdir of `root` whose name starts with `prefix` and is a
+/// usable pack.
 fn first_local_pack(root: &Path, prefix: &str) -> Option<PathBuf> {
     let mut hits: Vec<PathBuf> = std::fs::read_dir(root)
         .ok()?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| {
-            p.is_dir()
-                && p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with(prefix))
-                && p.join(crate::dgq::layout::MANIFEST_FILE).is_file()
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(prefix))
+                && is_pack_dir(p)
         })
         .collect();
     hits.sort();
     hits.into_iter().next()
 }
 
-/// Newest cache snapshot of `repo` that actually contains a `.dgq` manifest
-/// (so a metadata-only or truncated cache entry is skipped, not selected).
+/// Newest cache snapshot of `repo` that is a usable pack.
 fn newest_pack_snapshot(repo: &str) -> Option<(PathBuf, String)> {
     let (dir, revision) = newest_local_snapshot(repo).ok()?;
-    dir.join(crate::dgq::layout::MANIFEST_FILE)
-        .is_file()
-        .then_some((dir, revision))
+    is_pack_dir(&dir).then_some((dir, revision))
 }
 
 /// Scan the HF cache for `*/diffgemma-*` model repos and return the one whose
@@ -524,6 +529,7 @@ mod tests {
     fn write_pack(dir: &Path) {
         std::fs::create_dir_all(dir).expect("mkdir pack");
         std::fs::write(dir.join(crate::dgq::layout::MANIFEST_FILE), "{}").expect("write manifest");
+        std::fs::write(dir.join(crate::dgq::layout::BLOB_FILE), b"blob").expect("write blob");
     }
 
     #[test]
@@ -545,6 +551,11 @@ mod tests {
         write_pack(&root.join("diffgemma-26b-a4b-it-nvfp4"));
         // Prefixed but not a pack (no manifest); must be skipped.
         std::fs::create_dir_all(root.join("diffgemma-notes")).expect("mkdir");
+        // Sorts first, manifest but no blob (partial download): must be skipped
+        // rather than picked over the complete pack.
+        let partial = root.join("diffgemma-00-partial");
+        std::fs::create_dir_all(&partial).expect("mkdir");
+        std::fs::write(partial.join(crate::dgq::layout::MANIFEST_FILE), "{}").expect("manifest");
         let r = resolve_default_model_source_in(&root).expect("resolves");
         assert_eq!(r.dir, root.join("diffgemma-26b-a4b-it-nvfp4"));
         assert!(r.repo_pin.is_none());
@@ -599,8 +610,9 @@ mod tests {
 
         let err = resolve_default_model_source_in(&root).expect_err("nothing found");
         let msg = err.to_string();
-        assert!(msg.contains("diffgemma-mps download"), "{msg}");
         assert!(msg.contains("no default model found"), "{msg}");
+        assert!(msg.contains("diffgemma-mps download"), "{msg}");
+        assert!(msg.contains("hf download mmastrac/diffgemma-26b-a4b-it-q4"), "{msg}");
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&hf_home);

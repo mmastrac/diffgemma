@@ -108,8 +108,11 @@ experts=nvfp4`, which is exactly what `nvfp4x` expands to). See
 
 ### 3. Run
 
-Point `-m` at the pack directory step 2 produced — `model/diffgemma-26b-a4b-it-q4`
-for either option.
+`-m` is optional. With no `-m`, the engine auto-discovers a model: a local
+`model/diffgemma-*` pack, or a `diffgemma-*` pack already in your Hugging Face
+cache. So `hf download mmastrac/diffgemma-26b-a4b-it-q4` on its own is enough to
+then run flagless (the engine prints `using model: <dir>` for what it picked).
+The examples below pass `-m <dir | org/name>` to choose a model explicitly.
 
 One-shot prompt:
 
