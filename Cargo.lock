@@ -70,7 +70,6 @@ dependencies = [
 name = "diffgemma-mps"
 version = "0.1.0"
 dependencies = [
- "libc",
  "memmap2",
  "objc2",
  "objc2-foundation",

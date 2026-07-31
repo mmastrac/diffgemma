@@ -15,8 +15,6 @@ mod decoder_layer;
 pub(crate) mod device;
 mod dgq_gpu;
 mod embed;
-#[cfg(all(test, target_os = "macos"))]
-mod va_splice_probe;
 mod encoder_extend;
 mod engine;
 mod expert_cache;

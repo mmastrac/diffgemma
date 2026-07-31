@@ -4,7 +4,7 @@
 //! (transformed) tensors into a small local blob. No requantization.
 
 use crate::Error;
-use crate::dgq::convert::{congruent_pad, copy_sidecar_files};
+use crate::dgq::convert::copy_sidecar_files;
 use crate::dgq::hf_resolve::{hash_safetensors_header, resolve_snapshot_dir};
 use crate::dgq::layout::{
     BLOB_FILE, BaseModelRef, DGQ_VERSION_LAYERED, DgqManifest, DgqTensorEntry, ExternalFile,
@@ -130,45 +130,23 @@ pub fn repack_overlay(opts: RepackOverlayOptions) -> Result<RepackOverlaySummary
         decisions.push(Decision { entry, external });
     }
 
-    // Pass 2: visiting order for VA-splice (ARCHITECTURE.md §8.1) — every
-    // externalized tensor grouped by shard, in that shard's own byte order
-    // (mirrors `build_overlay_tensor_order` in convert.rs exactly, just
-    // driven by `Decision` instead of a fresh classify pass); every Local
-    // tensor follows, name-sorted; experts always last.
-    let mut shard_groups: BTreeMap<String, Vec<(u64, usize)>> = BTreeMap::new();
-    let mut local_idx: Vec<usize> = Vec::new();
-    let mut expert_idx: Vec<usize> = Vec::new();
-    for (i, d) in decisions.iter().enumerate() {
-        if is_expert_entry(d.entry) {
-            expert_idx.push(i);
-        } else if let Some((shard, file_off)) = &d.external {
-            shard_groups.entry(shard.clone()).or_default().push((*file_off, i));
-        } else {
-            local_idx.push(i);
-        }
-    }
-    let mut order: Vec<usize> = Vec::with_capacity(decisions.len());
-    for (_shard, mut v) in shard_groups {
-        v.sort_by_key(|(file_off, _)| *file_off);
-        order.extend(v.into_iter().map(|(_, i)| i));
-    }
-    local_idx.sort_by_key(|&i| decisions[i].entry.name.clone());
-    order.extend(local_idx);
-    expert_idx.sort_by_key(|&i| decisions[i].entry.name.clone());
-    order.extend(expert_idx);
+    // Pass 2: visiting order — name-sorted, experts always last (the
+    // expert-tail no-copy wrap depends on experts occupying the blob tail).
+    let mut order: Vec<usize> = (0..decisions.len()).collect();
+    order.sort_by_key(|&i| {
+        (
+            is_expert_entry(decisions[i].entry),
+            decisions[i].entry.name.clone(),
+        )
+    });
 
     // Pass 3: write the local blob and assign fresh canonical offsets in
-    // `order` — zero-gap within a shard run (mirrors the shard exactly),
-    // page-congruent-with-file-offset at the start of each new run.
+    // `order`, every tensor 64-byte aligned (GPU typed-pointer invariant —
+    // see the matching comment in convert.rs's `quantize_model`).
     let mut offset = 0u64;
     let mut local_offset = 0u64;
     let mut expert_split: Option<u64> = None;
     let mut local_expert_split: Option<u64> = None;
-    // `(shard, next expected file byte offset)` while inside a head run —
-    // same-shard alone is NOT enough to continue a run (two Raw tensors from
-    // the same shard can sit gigabytes apart in the file); see the matching
-    // comment in convert.rs's `quantize_model` for how this was found.
-    let mut head_run: Option<(String, u64)> = None;
     const EXPERT_SPLIT_ALIGN: u64 = 16384;
     let mut external_tensors = 0usize;
     let mut local_tensors = 0usize;
@@ -178,50 +156,7 @@ pub fn repack_overlay(opts: RepackOverlayOptions) -> Result<RepackOverlaySummary
     for (progress, &i) in order.iter().enumerate() {
         let d = &decisions[i];
         let entry = d.entry;
-        let continues = match (&head_run, &d.external) {
-            (Some((shard_name, next_file_off)), Some((shard, file_off))) => {
-                shard_name == shard && *next_file_off == *file_off
-            }
-            _ => false,
-        };
-
-        if continues {
-            // Nominally "continuing" in FILE terms — every tensor's OWN
-            // canonical start must STILL be 64-byte aligned regardless
-            // (GPU-correctness invariant; see the matching, detailed
-            // comment in convert.rs's `quantize_model` for the mechanism
-            // and how it was found). `align_offset` is a no-op whenever the
-            // previous tensor's byte length was already a 64-byte
-            // multiple — true for essentially every real weight matrix —
-            // so this rarely disturbs zero-gap mirroring; it correctly ENDS
-            // the run on a non-64-multiple tensor instead of producing a
-            // misaligned-but-nominally-contiguous run.
-            offset = align_offset(offset);
-        } else {
-            // A run boundary on either side needs a full page of
-            // separation (not just congruence) — see the matching comment
-            // in convert.rs's `quantize_model`; both writers must agree.
-            // `round_up_page` also implies 64-byte alignment.
-            if head_run.is_some() || d.external.is_some() {
-                offset = crate::dgq::convert::round_up_page(offset, EXPERT_SPLIT_ALIGN);
-            } else {
-                offset = align_offset(offset);
-            }
-            if let Some((_, file_off)) = &d.external
-                && file_off.is_multiple_of(64)
-            {
-                // Only nudge to page-congruence when the file offset is
-                // ITSELF 64-aligned — otherwise congruence and 64-byte
-                // alignment are mutually exclusive for this tensor (see
-                // convert.rs). Correctness first; this tensor just stays
-                // aligned-but-not-spliceable otherwise.
-                offset = congruent_pad(offset, *file_off, EXPERT_SPLIT_ALIGN);
-            }
-        }
-        head_run = d
-            .external
-            .as_ref()
-            .map(|(shard, file_off)| (shard.clone(), file_off + entry.meta.byte_len));
+        offset = align_offset(offset);
 
         if expert_split.is_none() && is_expert_entry(entry) {
             offset = (offset + EXPERT_SPLIT_ALIGN - 1) & !(EXPERT_SPLIT_ALIGN - 1);
