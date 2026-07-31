@@ -137,6 +137,45 @@ The chat template is applied automatically. Pass `--raw` to send bare
 tokenizer input, `--ctx N` to change the context budget, `--seed N` for a fixed
 seed (default 42).
 
+### Drive it from opencode
+
+`serve` speaks the OpenAI API, so [opencode](https://opencode.ai) can use it as a
+provider. `serve` exposes the model under the **basename of the pack directory**
+— `-m model/diffgemma-26b-a4b-it-q4` serves the model id
+`diffgemma-26b-a4b-it-q4` at `http://127.0.0.1:8080/v1` (check it with
+`curl 127.0.0.1:8080/v1/models`). Start it:
+
+```bash
+target/release/diffgemma-mps serve -m model/diffgemma-26b-a4b-it-q4 --ctx 100000
+```
+
+opencode has to know that endpoint as a provider — but you **don't need to edit a
+config file**. opencode reads a full config inline from the
+`OPENCODE_CONFIG_CONTENT` environment variable, so you can register the provider
+and pick the model in one shot (`-m provider/model`):
+
+```bash
+OPENCODE_CONFIG_CONTENT='{
+  "provider": {
+    "diffgemma": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "diffgemma-mps (local)",
+      "options": { "baseURL": "http://127.0.0.1:8080/v1", "apiKey": "unused" },
+      "models": { "diffgemma-26b-a4b-it-q4": { "name": "DiffGemma 26B-A4B q4" } }
+    }
+  }
+}' opencode -m diffgemma/diffgemma-26b-a4b-it-q4
+```
+
+`serve` does no auth, so the `apiKey` is a placeholder (opencode's provider still
+wants the field present). The model id must match what `serve` reports; append
+`:think` or `:think=false` to force thinking on or off
+(e.g. `diffgemma-26b-a4b-it-q4:think=false`).
+
+For a permanent setup, drop that same `"provider"` block into `opencode.json`
+(project) or `~/.config/opencode/opencode.json` (global) and just run
+`opencode -m diffgemma/diffgemma-26b-a4b-it-q4`.
+
 ## Scope & requirements
 
 **v1 is text-only.** The DiffusionGemma vision tower (~550M params, SigLIP
