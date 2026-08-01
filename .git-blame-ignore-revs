@@ -8,3 +8,6 @@
 
 # style: cargo fmt — normalize drift from the 2026-07-16 campaign commits
 04f197c42b0e116c0a7ca0e02405582bd391b49d
+
+# style: apply cargo fmt across the tree (rustfmt 1.9.0 drift)
+961b6196c9f5e30704fd4e5c0f10d8a70c9d618e
