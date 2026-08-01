@@ -85,6 +85,9 @@ mod tests {
     /// mirror at the arena's bf16 precision (bf16-exact inputs).
     #[test]
     fn all_four_corners_match_cpu() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         // bf16-exact input values so arena round-trips are exact.
         let src_f32_vals: Vec<f32> = (0..16).map(|i| (i as f32 - 8.0) * 0.5).collect();
         let scale = 0.25f32;

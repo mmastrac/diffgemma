@@ -245,6 +245,9 @@ mod tests {
 
     #[test]
     fn gpu_postprocess_matches_cpu() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         let canvas_len = 8usize;
         let vocab = 512usize;
         let total = canvas_len * vocab;

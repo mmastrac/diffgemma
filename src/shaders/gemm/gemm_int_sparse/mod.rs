@@ -313,6 +313,9 @@ mod tests {
     /// path (same shape contract as gemm_tunable::sparse_block_m_invariant).
     #[test]
     fn sparse_int8_matches_cpu_oracle() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         let counts: &[usize] = &[200, 77, 150, 5, 300, 33, 128];
         let f = grouped_int_fixture(256, 128, counts);
         let (a_int8, w_int8, scale_a, scale_w) = f.int8_side_channel();
@@ -344,6 +347,9 @@ mod tests {
     /// process to force the collision if the source-hash fix regresses.
     #[test]
     fn sparse_int8_block_m_invariant() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         let counts: &[usize] = &[200, 77, 150, 5, 300, 33, 128];
         let f = grouped_int_fixture(256, 128, counts);
         let (a_int8, w_int8, scale_a, scale_w) = f.int8_side_channel();

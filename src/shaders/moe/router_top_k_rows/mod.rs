@@ -227,6 +227,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn gpu_matches_cpu_tiny() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         let fix = tiny_fixture(ElemFormat::F32);
         let cpu = cpu(&fix);
         let gpu = gpu(&fix, KernelVariant::PRODUCTION).expect("gpu");
@@ -236,6 +239,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn gpu_matches_cpu_moe() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         let fix = moe_fixture(ElemFormat::F32);
         let cpu = cpu(&fix);
         let gpu = gpu(&fix, KernelVariant::PRODUCTION).expect("gpu");

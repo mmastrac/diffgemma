@@ -282,6 +282,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn gpu_row_invariants() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         let fix = router_fixture(ElemFormat::F32);
         let out = gpu(&fix, KernelVariant::PRODUCTION).expect("gpu");
         assert_row_invariants(&out, fix.rows, fix.cols);

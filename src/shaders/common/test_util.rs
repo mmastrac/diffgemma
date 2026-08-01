@@ -57,6 +57,15 @@ pub fn assert_oracle(a: &[f32], b: &[f32], max_tol: f32, min_cos: f32) {
     );
 }
 
+/// Hosted CI runners (`CI=true`, e.g. GitHub Actions) have no usable Metal
+/// device, so kernel tests that dispatch to the GPU early-return there. CPU
+/// oracle tests still run. A local run (no `CI` in the environment) exercises
+/// the GPU as normal. This is the single gate every GPU test consults.
+#[cfg(test)]
+pub fn skip_gpu_on_ci() -> bool {
+    std::env::var_os("CI").is_some()
+}
+
 /// Expand fixture × format cells into CPU-only and GPU-vs-CPU oracle tests.
 #[macro_export]
 macro_rules! kernel_oracle_matrix {
@@ -94,6 +103,9 @@ macro_rules! kernel_oracle_matrix {
                     #[cfg(target_os = "macos")]
                     #[test]
                     fn gpu_matches_cpu() {
+                        if $crate::shaders::test_util::skip_gpu_on_ci() {
+                            return;
+                        }
                         let fix = $fixture_fn(ElemFormat::$fmt);
                         let cpu = $cpu_fn(&fix);
                         let gpu = $gpu_fn(&fix, $crate::shaders::KernelVariant::PRODUCTION)
@@ -104,6 +116,9 @@ macro_rules! kernel_oracle_matrix {
                     #[cfg(target_os = "macos")]
                     #[test]
                     fn gpu_assert_variant_matches_cpu() {
+                        if $crate::shaders::test_util::skip_gpu_on_ci() {
+                            return;
+                        }
                         let fix = $fixture_fn(ElemFormat::$fmt);
                         let cpu = $cpu_fn(&fix);
                         let gpu = $gpu_fn(&fix, $crate::shaders::KernelVariant::TEST_ASSERT)

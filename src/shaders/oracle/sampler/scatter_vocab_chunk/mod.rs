@@ -158,23 +158,35 @@ mod tests {
 
     #[test]
     fn cpu_tiny() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         run_matrix(tiny_fixture, 0.0);
     }
 
     #[test]
     fn cpu_lm_head_chunk() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         run_matrix(lm_head_chunk_fixture, 0.0);
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn gpu_tiny() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         run_matrix(tiny_fixture, 0.0);
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn gpu_lm_head_chunk() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         run_matrix(lm_head_chunk_fixture, 0.0);
     }
 }

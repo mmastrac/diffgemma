@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rustfmt
       - run: cargo fmt --check
@@ -34,7 +34,7 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.96.0
       - name: Build (rustc-warning-clean gate)
         run: cargo build --release
         env:
@@ -57,7 +57,7 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: clippy
       - run: cargo clippy --release
@@ -71,7 +71,7 @@ jobs:
 #     runs-on: [self-hosted, macos, dgq-weights]
 #     steps:
 #       - uses: actions/checkout@v4
-#       - uses: dtolnay/rust-toolchain@stable
+#       - uses: dtolnay/rust-toolchain@1.96.0
 #       - run: cargo build --release
 #       - name: Golden byte-identity pack (Tier-1 refactor gate — task #73;
 #         # exact token_ids + causal-KV hash across the prefill/generation path

@@ -120,6 +120,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn gpu_tiled_matches_linear_f32() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         for fixture_fn in [tiny_fixture as fn(_) -> _, tile_fixture, gscale_fixture] {
             let gf = fixture_fn(ElemFormat::F32);
             let lf = linear_f32_fixture(&gf);

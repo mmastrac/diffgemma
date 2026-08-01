@@ -131,23 +131,35 @@ mod tests {
 
     #[test]
     fn cpu_tiny() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         run_matrix(tiny_fixture, 0.0);
     }
 
     #[test]
     fn cpu_canvas_vocab() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         run_matrix(canvas_vocab_fixture, 0.0);
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn gpu_tiny() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         run_matrix(tiny_fixture, 0.0);
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn gpu_canvas_vocab() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         run_matrix(canvas_vocab_fixture, 0.0);
     }
 }

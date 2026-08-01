@@ -1,0 +1,7 @@
+# Pin the toolchain so rustfmt output and clippy lints stay deterministic.
+# CI installs this exact version too (see .github/workflows/ci.yml). An unpinned
+# `@stable` let rustfmt drift once and silently reflow the whole tree, so the
+# fmt version is now nailed down here and there in lockstep. Bump both together.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]

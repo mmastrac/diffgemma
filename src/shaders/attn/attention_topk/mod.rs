@@ -451,6 +451,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn topk_full_grp8_causal_vs_cpu() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         let f = crate::shaders::attention::full_grp8_hd512_fixture(ElemFormat::F32);
         let got = gpu(&f, true, false, K_PAD).expect("gpu topk causal");
         let oracle = cpu::topk_causal(&f, true, K_PAD);
@@ -467,6 +470,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn topk_full_grp8_denoise_vs_cpu() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         let f = crate::shaders::attention::full_grp8_hd512_fixture(ElemFormat::F32);
         let got = gpu(&f, false, false, K_PAD).expect("gpu topk denoise");
         let oracle = cpu::topk_denoise(&f, true, K_PAD);
@@ -477,6 +483,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn topk_full_grp8_causal_side_vs_cpu() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         let f = crate::shaders::attention::full_grp8_hd512_fixture(ElemFormat::F32);
         let got = gpu(&f, true, true, K_PAD).expect("gpu topk causal side");
         let oracle = cpu::topk_causal(&f, false, K_PAD);
@@ -491,6 +500,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn topk_k1_matches_argmax_value() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         let f = crate::shaders::attention::full_grp8_hd512_fixture(ElemFormat::F32);
         let got = gpu(&f, true, false, 1).expect("gpu topk k=1");
         let oracle = cpu::topk_causal(&f, true, 1);
@@ -504,6 +516,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn topk_k128_matches_cpu() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         let f = crate::shaders::attention::full_grp8_hd512_fixture(ElemFormat::F32);
         let got = gpu(&f, true, false, 128).expect("gpu topk k=128");
         let oracle = cpu::topk_causal(&f, true, 128);

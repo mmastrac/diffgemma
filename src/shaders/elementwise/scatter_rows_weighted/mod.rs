@@ -76,6 +76,9 @@ mod tests {
 
     #[test]
     fn gpu_matches_cpu_reference() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         let seq_len = 5usize;
         let hidden = 32usize;
         let top_k = 3usize;
