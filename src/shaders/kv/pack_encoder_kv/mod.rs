@@ -295,6 +295,9 @@ mod roundtrip_tests {
     /// the linear slot indexing with zero rounding-mode ambiguity.
     #[test]
     fn pack_unpack_roundtrip_f16_linear() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         let tc = 6;
         let n = tc * NKV * HD;
         let keys: Vec<f32> = wave(n, 0.0, 3.0, 0.017)
@@ -316,6 +319,9 @@ mod roundtrip_tests {
     /// so the identity must still hold bit-for-bit.
     #[test]
     fn pack_unpack_roundtrip_f16_ring_wrap() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         let tc = 4;
         let n = tc * NKV * HD;
         let keys: Vec<f32> = wave(n, 0.5, 3.0, 0.017)
@@ -337,6 +343,9 @@ mod roundtrip_tests {
     /// token lands where → error explodes far past this bound).
     #[test]
     fn pack_unpack_roundtrip_q8_linear() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         let tc = 6;
         let n = tc * NKV * HD;
         let keys = wave(n, 0.0, 3.0, 0.017);
@@ -375,6 +384,9 @@ mod roundtrip_tests {
     /// this armor is independent of any CPU f16/q8 rounding model.
     #[test]
     fn hydrate_matches_unpack_f16() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         let tc = 6;
         let n = tc * NKV * HD;
         let keys: Vec<f32> = wave(n, 0.0, 3.0, 0.017)
@@ -393,6 +405,9 @@ mod roundtrip_tests {
 
     #[test]
     fn hydrate_matches_unpack_q8() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         let tc = 6;
         let n = tc * NKV * HD;
         let keys = wave(n, 0.0, 3.0, 0.017);

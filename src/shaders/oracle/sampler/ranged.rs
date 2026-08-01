@@ -187,11 +187,17 @@ mod tests {
 
         #[test]
         fn gpu_softcap_matches_cpu() {
+            if crate::shaders::test_util::skip_gpu_on_ci() {
+                return;
+            }
             run(RangedOp::Softcap, 0.000011);
         }
 
         #[test]
         fn gpu_scale_matches_cpu() {
+            if crate::shaders::test_util::skip_gpu_on_ci() {
+                return;
+            }
             run(RangedOp::Scale, 0.000013);
         }
     }

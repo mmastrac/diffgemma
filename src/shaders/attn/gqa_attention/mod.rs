@@ -463,36 +463,57 @@ mod tests {
 
     #[test]
     fn cpu_tiny() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         run_matrix(tiny_fixture, 1e-4);
     }
 
     #[test]
     fn cpu_sliding_prefill() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         run_matrix(sliding_prefill_fixture, 1e-4);
     }
 
     #[test]
     fn cpu_encoder_extend() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         run_matrix(encoder_extend_fixture, 1e-4);
     }
 
     #[test]
     fn cpu_full_layer() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         run_matrix(full_layer_fixture, 1e-4);
     }
 
     #[test]
     fn cpu_decoder_bitmap() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         run_matrix(decoder_bitmap_fixture, 1e-4);
     }
 
     #[test]
     fn cpu_sparse_decoder_bitmap() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         run_matrix(sparse_decoder_bitmap_fixture, 1e-4);
     }
 
     #[test]
     fn cpu_sliding_tight() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         run_matrix(sliding_tight_fixture, 1e-4);
     }
 }

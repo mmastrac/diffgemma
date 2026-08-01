@@ -738,6 +738,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn stacked_gpu_matches_split_gate_up_canvas() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         use crate::shaders::variant::KernelVariant;
         let f = gate_up_canvas_fixture(ElemFormat::F32);
         let stacked = gpu_q4(&f, KernelVariant::PRODUCTION).expect("stacked");
@@ -749,6 +752,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn stacked_gpu_matches_split_gate_up_tiny() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         use crate::shaders::variant::KernelVariant;
         let f = gate_up_tiny_fixture(ElemFormat::F32);
         let stacked = gpu_q4(&f, KernelVariant::PRODUCTION).expect("stacked");
@@ -760,6 +766,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn stacked_gpu_matches_split_qkv_sliding_prod() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         use crate::shaders::variant::KernelVariant;
         let f = qkv_sliding_prod_fixture(ElemFormat::F32);
         let stacked = gpu_q4(&f, KernelVariant::PRODUCTION).expect("stacked");

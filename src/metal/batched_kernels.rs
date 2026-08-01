@@ -317,6 +317,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn gpu_gelu_large_input() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         let mut cpu = vec![10.229641f32];
         let mut gpu = cpu.clone();
         gelu_pytorch_tanh(&mut cpu);
@@ -336,6 +339,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn gpu_gelu_matches_cpu() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         let mut cpu = vec![-2.0f32, -1.0, 0.0, 0.5, 1.5, 3.0];
         let mut gpu = cpu.clone();
         gelu_pytorch_tanh(&mut cpu);
@@ -358,6 +364,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn gpu_gelu_matches_cpu_mlp_shape() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         let len = 16 * 2112;
         let data: Vec<f32> = (0..len).map(|i| ((i as f32) * 0.001).sin()).collect();
         let mut cpu = data.clone();

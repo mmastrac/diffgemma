@@ -244,21 +244,33 @@ mod tests {
 
     #[test]
     fn cpu_tiny() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         run_matrix(tiny_fixture, 1e-5);
     }
 
     #[test]
     fn cpu_sliding_prefill() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         run_matrix(sliding_prefill_fixture, 1e-5);
     }
 
     #[test]
     fn cpu_full_partial() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         run_matrix(full_partial_fixture, 1e-5);
     }
 
     #[test]
     fn cpu_k_offset() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         run_matrix(k_offset_fixture, 1e-5);
     }
 

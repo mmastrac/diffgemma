@@ -712,6 +712,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn attn_gemm_full_grp8_vs_cpu() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         use crate::shaders::test_util::{ElemFormat, assert_oracle};
         let f = crate::shaders::attention::full_grp8_hd512_fixture(ElemFormat::F32);
         let got = gpu(&f, false, false).expect("gpu attn_gemm");
@@ -722,6 +725,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn attn_gemm_full_grp2_vs_cpu() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         use crate::shaders::test_util::{ElemFormat, assert_oracle};
         let f = crate::shaders::attention::full_hd512_fixture(ElemFormat::F32);
         let got = gpu(&f, false, false).expect("gpu attn_gemm");
@@ -735,6 +741,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn attn_gemm_full_grp8_causal_vs_cpu() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         use crate::shaders::test_util::{ElemFormat, assert_oracle};
         let f = crate::shaders::attention::full_grp8_hd512_fixture(ElemFormat::F32);
         let got = gpu(&f, true, false).expect("gpu attn_gemm causal");
@@ -747,6 +756,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn attn_gemm_full_grp8_causal_side_vs_cpu() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         use crate::shaders::test_util::{ElemFormat, assert_oracle};
         let f = crate::shaders::attention::full_grp8_hd512_fixture(ElemFormat::F32);
         let got = gpu(&f, true, true).expect("gpu attn_gemm causal side");

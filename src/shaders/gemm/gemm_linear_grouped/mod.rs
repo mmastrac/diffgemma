@@ -487,6 +487,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn gpu_tiled_grouped_matches_linear_grouped_nvfp4() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         use crate::shaders::gemm_block_grouped;
         use crate::shaders::test_util::{ElemFormat, assert_oracle};
         use crate::shaders::variant::KernelVariant;

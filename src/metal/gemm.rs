@@ -338,6 +338,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn gpu_f32_bf16_linear_matches_cpu_decoder_mlp_shape() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         let m = 256usize;
         let k = 2816usize;
         let n = 2112usize;
@@ -364,6 +367,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn gpu_gemm_matches_cpu_decoder_mlp_shape() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         let m = 256usize;
         let k = 2816usize;
         let n = 2112usize;

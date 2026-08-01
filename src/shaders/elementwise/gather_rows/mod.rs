@@ -309,6 +309,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn format_specializations_agree() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         let f = tiny_fixture(ElemFormat::F32);
         let expect = cpu(&f);
         for (sf, df, label) in [

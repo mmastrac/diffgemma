@@ -552,6 +552,9 @@ mod stacked_nvfp4_tests {
     /// range decode). Covers the qkv (3-seg) and gate/up (2-seg) layouts.
     #[test]
     fn stacked_nvfp4_bitexact_vs_gemm_block_stacked() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         for fixture_fn in [
             gemm_block_stacked::gate_up_tiny_fixture as fn(_) -> _,
             gemm_block_stacked::qkv_tiny_fixture,
@@ -640,6 +643,9 @@ mod dense_nvfp4_tests {
     /// to the dense W-load when gemm_block was retired.
     #[test]
     fn dense_nvfp4_bitexact_vs_gemm_block() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         for fixture_fn in [
             gemm_nvfp4::tile_fixture as fn(_) -> _,
             gemm_nvfp4::gscale_fixture,
@@ -662,6 +668,9 @@ mod dense_nvfp4_tests {
     /// tracks the CPU reference within quant tolerance.
     #[test]
     fn dense_nvfp4_matches_cpu_oracle() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         let f = gemm_nvfp4::tile_fixture(ElemFormat::F32);
         let tuned = gpu_dense_tunable_nvfp4(&f).expect("tunable dense");
         let oracle = gemm_nvfp4::cpu(&f);
@@ -683,6 +692,9 @@ mod sparse_nvfp4_tests {
     /// cross-check retired with that kernel.)
     #[test]
     fn sparse_nvfp4_matches_cpu_oracle() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         let f = grouped_fixture(QuantFormat::NvFp4, 64, 192, COUNTS);
         let tuned = gpu_sparse_tunable(&f).expect("tunable sparse");
         let oracle = crate::shaders::gemm_block_grouped::cpu(&f);
@@ -703,6 +715,9 @@ mod sparse_nvfp4_tests {
     /// PROCESS specifically to force that collision if it ever regresses.
     #[test]
     fn sparse_block_m_invariant() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         let counts: &[usize] = &[200, 77, 150, 5, 300, 33, 128];
         let f = grouped_fixture(QuantFormat::Q4Affine, 128, 256, counts);
         let oracle = crate::shaders::gemm_block_grouped::cpu(&f);
@@ -790,6 +805,9 @@ mod w32_tests {
     /// W-load and both nvfp4 fixtures (incl. the non-trivial global scale).
     #[test]
     fn w32_bitexact_vs_byte_loads() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         let ctx = MetalContext::new().expect("metal ctx");
         let src0 = tuned_source_w32(TUNE_BM, TUNE_BN, false);
         let src1 = tuned_source_w32(TUNE_BM, TUNE_BN, true);
@@ -846,6 +864,9 @@ mod double_buffer_tests {
     /// are unchanged — only the tgmem buffering schedule differs).
     #[test]
     fn gemm_tunable_db_bitexact_vs_single_buffer() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
         let ctx = MetalContext::new().expect("metal ctx");
         let mut pool = BufferPool::new();
         // tile_fixture: m=8, n=128, k=128 — exercises multiple K-tiles (BK=32

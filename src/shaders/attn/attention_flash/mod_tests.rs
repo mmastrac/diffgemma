@@ -61,6 +61,9 @@ fn flash_blocked_matches_cpu_causal_sliding_hd256_f16() {
 #[cfg(target_os = "macos")]
 #[test]
 fn flash_gpu_full_grp8_causal_vs_cpu() {
+    if crate::shaders::test_util::skip_gpu_on_ci() {
+        return;
+    }
     use crate::shaders::attn::attention_flash::gpu_flash;
     use crate::shaders::test_util::assert_oracle;
     let f = full_grp8_hd512_fixture(ElemFormat::F32);
@@ -72,6 +75,9 @@ fn flash_gpu_full_grp8_causal_vs_cpu() {
 #[cfg(target_os = "macos")]
 #[test]
 fn flash_gpu_full_grp2_causal_vs_cpu() {
+    if crate::shaders::test_util::skip_gpu_on_ci() {
+        return;
+    }
     use crate::shaders::attn::attention_flash::gpu_flash;
     use crate::shaders::test_util::assert_oracle;
     let f = full_hd512_fixture(ElemFormat::F32);
