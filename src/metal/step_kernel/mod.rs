@@ -56,7 +56,7 @@ pub use build::*;
 pub use diag_bench::*;
 pub use diag_moe::*;
 pub use diag_probe::*;
-pub use enc::*;
+use enc::*;
 pub use runtime::*;
 
 pub const HID: usize = 2816;
@@ -914,7 +914,8 @@ impl StepPipelines {
         const ROWK_ACC_SHADER: &str = crate::shaders::gemm_rowk::SHADER;
         let mut gemm_q8_rowk_acc_f32 = HashMap::new();
         {
-            for &(n, k) in &[(HID as u32, crate::model::embed::LM_HEAD_CHUNK as u32)] {
+            {
+                let &(n, k) = &(HID as u32, crate::model::embed::LM_HEAD_CHUNK as u32);
                 gemm_q8_rowk_acc_f32.insert(
                     (n, k),
                     ctx.compile_gemm_subkernel(
@@ -931,7 +932,8 @@ impl StepPipelines {
         }
         let mut gemm_bf16_rowk_acc_f32 = HashMap::new();
         {
-            for &(n, k) in &[(HID as u32, crate::model::embed::LM_HEAD_CHUNK as u32)] {
+            {
+                let &(n, k) = &(HID as u32, crate::model::embed::LM_HEAD_CHUNK as u32);
                 gemm_bf16_rowk_acc_f32.insert(
                     (n, k),
                     ctx.compile_gemm_subkernel(
@@ -1742,6 +1744,8 @@ pub fn log_denoise_parity_step(
         crate::sample::count_low_entropy_positions(&state.entropy, params.entropy_bound),
     );
     let n = denoise_parity_log_positions().min(CANVAS);
+    // Bounded by n (log positions), and indexes several parallel per-position arrays.
+    #[allow(clippy::needless_range_loop)]
     for pos in 0..n {
         let argmax = state.prev_argmax[pos];
         let logit = read_logit_f32(logits, pos, argmax);

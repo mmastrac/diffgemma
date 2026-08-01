@@ -109,7 +109,7 @@ mod tests {
         let dims = [seq_len as u32, hidden as u32, top_k as u32];
         batch.dispatch_1d(&pipeline.pipeline, seq_len * hidden, |enc| {
             bind_gpu_buffers(
-                &enc, &buf_arena, &buf_rows, &buf_w, &buf_out, &buf_dump, &dims,
+                enc, &buf_arena, &buf_rows, &buf_w, &buf_out, &buf_dump, &dims,
             );
         });
         let mut gpu = vec![0.0f32; seq_len * hidden];

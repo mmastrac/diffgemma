@@ -112,7 +112,7 @@ fn tool_repair_feeds_error_and_rewinds_corrupt_call() {
         return;
     };
     let tokenizer = std::sync::Arc::new(
-        crate::tokenizer::Tokenizer::load(&dir.join("tokenizer.json")).expect("tokenizer"),
+        crate::tokenizer::Tokenizer::load(dir.join("tokenizer.json")).expect("tokenizer"),
     );
     let prompt: Vec<u32> = vec![10, 11, 12];
     let bad_reply = tokenizer.encode_with_specials("<|tool_call>call:write{path:");
@@ -192,7 +192,7 @@ fn tool_validator_rewinds_and_retries_malformed_reply() {
         return;
     };
     let tokenizer = std::sync::Arc::new(
-        crate::tokenizer::Tokenizer::load(&dir.join("tokenizer.json")).expect("tokenizer"),
+        crate::tokenizer::Tokenizer::load(dir.join("tokenizer.json")).expect("tokenizer"),
     );
     let prompt: Vec<u32> = vec![10, 11, 12];
     let malformed: Vec<u32> = {

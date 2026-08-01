@@ -1,11 +1,10 @@
 use super::parse::*;
 use super::render::*;
-use super::*;
 use serde_json::{Value, json};
 
 fn model_tokenizer() -> Option<crate::tokenizer::Tokenizer> {
     let dir = crate::shaders::test_util::dgq_model_dir()?;
-    crate::tokenizer::Tokenizer::load(&dir.join("tokenizer.json")).ok()
+    crate::tokenizer::Tokenizer::load(dir.join("tokenizer.json")).ok()
 }
 
 /// A conversation exercising every client-text insertion point: system
@@ -288,7 +287,7 @@ fn unclosed_quote_does_not_invent_fields_from_rust_commas() {
     );
     let content = calls[0].arguments["content"].as_str().unwrap();
     assert!(content.contains("text: &str"));
-    assert!(!calls[0].arguments.get("text").is_some());
+    assert!(calls[0].arguments.get("text").is_none());
 }
 
 #[test]

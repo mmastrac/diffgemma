@@ -790,13 +790,13 @@ fn attention_scores_gqa(
             let q_off = (qi * params.n_heads + h) * hd;
             let row = &mut scores
                 [(qi * params.n_heads + h) * seq_len..(qi * params.n_heads + h + 1) * seq_len];
-            for ki in 0..seq_len {
+            for (ki, row_ki) in row.iter_mut().enumerate() {
                 let k_off = (ki * params.n_kv_heads + kv_h) * hd;
                 let mut dot = 0.0f32;
                 for d in 0..hd {
                     dot += q[q_off + d] * k[k_off + d];
                 }
-                row[ki] = dot;
+                *row_ki = dot;
             }
         }
     }
@@ -840,7 +840,7 @@ fn apply_attention_mask(scores: &mut [f32], seq_len: usize, params: &AttentionPa
         for h in 0..params.n_heads {
             let row = &mut scores
                 [(qi * params.n_heads + h) * seq_len..(qi * params.n_heads + h + 1) * seq_len];
-            for ki in 0..seq_len {
+            for (ki, row_ki) in row.iter_mut().enumerate() {
                 let mut masked = false;
                 if ki > qi {
                     masked = true;
@@ -851,7 +851,7 @@ fn apply_attention_mask(scores: &mut [f32], seq_len: usize, params: &AttentionPa
                     masked = true;
                 }
                 if masked {
-                    row[ki] = MASK_NEG;
+                    *row_ki = MASK_NEG;
                 }
             }
         }
@@ -874,13 +874,13 @@ fn attention_scores_gqa_ext(
             let q_off = (qi * params.n_heads + h) * hd;
             let row = &mut scores
                 [(qi * params.n_heads + h) * total_kv..(qi * params.n_heads + h + 1) * total_kv];
-            for ki in 0..total_kv {
+            for (ki, row_ki) in row.iter_mut().enumerate() {
                 let k_off = ki * kv_dim + kv_h * hd;
                 let mut dot = 0.0f32;
                 for d in 0..hd {
                     dot += q[q_off + d] * k[k_off + d];
                 }
-                row[ki] = dot;
+                *row_ki = dot;
             }
         }
     }
@@ -897,9 +897,9 @@ fn apply_decoder_mask(
         for h in 0..params.n_heads {
             let row = &mut scores
                 [(qi * params.n_heads + h) * total_kv..(qi * params.n_heads + h + 1) * total_kv];
-            for ki in 0..total_kv {
+            for (ki, row_ki) in row.iter_mut().enumerate() {
                 if !mask.can_attend(qi, ki) {
-                    row[ki] = MASK_NEG;
+                    *row_ki = MASK_NEG;
                 }
             }
         }
@@ -923,8 +923,7 @@ fn attention_output_gqa_ext(
             let score_row = &scores
                 [(qi * params.n_heads + h) * total_kv..(qi * params.n_heads + h + 1) * total_kv];
             let o_off = (qi * params.n_heads + h) * hd;
-            for ki in 0..total_kv {
-                let w = score_row[ki];
+            for (ki, &w) in score_row.iter().enumerate() {
                 let v_off = ki * kv_dim + kv_h * hd;
                 for d in 0..hd {
                     out[o_off + d] += w * v[v_off + d];
@@ -1053,7 +1052,7 @@ mod tests {
         let mut scores = vec![0.0f32; 9];
         apply_attention_mask(&mut scores, 3, &params);
         // query 2: can attend 1,2 only (window=2)
-        assert_eq!(scores[2 * 3 + 0], MASK_NEG);
+        assert_eq!(scores[2 * 3], MASK_NEG);
         assert_eq!(scores[2 * 3 + 1], 0.0);
         assert_eq!(scores[2 * 3 + 2], 0.0);
     }

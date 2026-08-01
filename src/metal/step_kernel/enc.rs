@@ -35,8 +35,8 @@ pub(super) struct StepEnc<'a> {
     pub(super) forward_m: usize,
     /// Active canvas width for a DENOISE step (shrink-on-retry): the number
     /// of canvas rows actually denoised, `CANVAS` (256) normally, less on a
-    /// narrowed retry. Drives the denoise-only width sites (attention seq-len
-    /// + grid, SC softembed, lm_head, sampler) and `forward_m`. Stays `CANVAS`
+    /// narrowed retry. Drives the denoise-only width sites (attention seq-len +
+    /// grid, SC softembed, lm_head, sampler) and `forward_m`. Stays `CANVAS`
     /// for prefill chunks/super-chunks (their sub width is 256).
     pub(super) active_canvas: usize,
     /// Current sub-chunk (0..PREFILL_SUBS) for the per-sub attention/rope

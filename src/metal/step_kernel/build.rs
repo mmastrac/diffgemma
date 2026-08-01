@@ -278,9 +278,9 @@ pub fn build_step_runtime(
     let mut kv_f32_side_offs = [u64::MAX; N_LAYERS];
     let kv_f32_side = if crate::flags::prefill_kv_f32_enabled() {
         let mut off = 0u64;
-        for i in 0..N_LAYERS {
+        for (i, side_off) in kv_f32_side_offs.iter_mut().enumerate() {
             let l = &layout.layers[i];
-            kv_f32_side_offs[i] = off;
+            *side_off = off;
             off += (layer_kv_slots(l.is_full != 0, cfg.max_seq)
                 * (l.n_kv_heads * l.head_dim) as usize
                 * 2

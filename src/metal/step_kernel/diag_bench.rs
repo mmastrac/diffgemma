@@ -426,6 +426,7 @@ pub fn run_step_forward(
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // min_entropy/low_entropy_positions carried for probes that don't read them yet
 pub struct DenoiseStepStats {
     pub accept_count: u32,
     pub mean_entropy: f32,
@@ -438,7 +439,7 @@ pub struct DenoiseStepStats {
 pub fn hello_chat_prefill_token_ids(model_dir: &Path) -> Result<Vec<u32>, Error> {
     use crate::chat_template::{ChatFormatOptions, ChatTurn, format_chat_token_ids};
     use crate::tokenizer::Tokenizer;
-    let tok = Tokenizer::load(&model_dir.join("tokenizer.json"))?;
+    let tok = Tokenizer::load(model_dir.join("tokenizer.json"))?;
     format_chat_token_ids(
         &tok,
         &[ChatTurn::user("Hello")],

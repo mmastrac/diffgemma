@@ -286,7 +286,7 @@ mod tests {
         let mut src = vec![0u8; out_dim * in_dim * 2];
         for row in 0..out_dim {
             for col in 0..in_dim {
-                let v = ((row * in_dim + col) as f32 * 0.01 - 0.5) as f32;
+                let v = (row * in_dim + col) as f32 * 0.01 - 0.5;
                 let bits = f32_to_bf16_bits(v).to_le_bytes();
                 let i = (row * in_dim + col) * 2;
                 src[i] = bits[0];

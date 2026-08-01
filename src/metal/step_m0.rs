@@ -94,9 +94,9 @@ pub(crate) fn dequant_q4_group_cpu(g: &[u8; 20]) -> [f32; 32] {
 /// K-order decode via col-indexed path (mirrors `q4_at_col` in dequant.metal).
 pub(crate) fn q4_weight_at_k_order_group(row: &[u8], base_k: usize, in_dim: usize) -> [f32; 32] {
     let mut out = [0.0f32; GROUP_SIZE];
-    for m in 0..GROUP_SIZE {
+    for (m, o) in out.iter_mut().enumerate() {
         let col = base_k + m;
-        out[m] = q4_weight_at(row, 0, col, in_dim);
+        *o = q4_weight_at(row, 0, col, in_dim);
     }
     out
 }

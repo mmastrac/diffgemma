@@ -364,13 +364,13 @@ mod tests {
         let gate = default_chat_quality_fixture();
         let prompt_len = 10;
         let mut token_ids = vec![1u32; prompt_len];
-        token_ids.extend(std::iter::repeat(PAD_TOKEN_ID).take(256));
+        token_ids.extend(std::iter::repeat_n(PAD_TOKEN_ID, 256));
         let out = fixture_out(token_ids, vec![2]);
         assert!(check_chat_quality(&out, prompt_len, &gate).is_err());
 
         let mut good_ids = vec![1u32; prompt_len];
         good_ids.extend((0..32).map(|i| 100 + i));
-        good_ids.extend(std::iter::repeat(FILLER_TOKEN_ID).take(224));
+        good_ids.extend(std::iter::repeat_n(FILLER_TOKEN_ID, 224));
         assert!(check_chat_quality(&fixture_out(good_ids, vec![20]), prompt_len, &gate).is_ok());
     }
 }

@@ -123,9 +123,9 @@ pub fn moe_bucket_phases(experts: &[Vec<u32>], n_experts: u32, top_k: u32) -> Bu
     let slots = num_slots as usize;
     let mut token_list = vec![0u32; slots];
     let mut slot_list = vec![0u32; slots];
-    for tok in 0..canvas {
-        for kk in 0..top_k {
-            let e = experts[tok][kk] as usize;
+    for (tok, expert_row) in experts.iter().enumerate() {
+        for (kk, &e_raw) in expert_row.iter().enumerate().take(top_k) {
+            let e = e_raw as usize;
             let slot = offset[e] + count[e];
             count[e] += 1;
             token_list[slot as usize] = tok as u32;

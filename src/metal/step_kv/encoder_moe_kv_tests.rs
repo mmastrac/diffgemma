@@ -6,7 +6,7 @@ use crate::metal::device::MetalContext;
 use crate::tokenizer::Tokenizer;
 
 fn calgary_prefill(model_dir: &Path) -> Vec<u32> {
-    let tok = Tokenizer::load(&model_dir.join("tokenizer.json")).expect("tokenizer");
+    let tok = Tokenizer::load(model_dir.join("tokenizer.json")).expect("tokenizer");
     format_chat_token_ids(
         &tok,
         &[ChatTurn::user("How can I get from Calgary to Namibia?")],

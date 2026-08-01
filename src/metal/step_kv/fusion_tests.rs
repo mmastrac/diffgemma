@@ -29,7 +29,7 @@ fn e16_fusion_mergeability_stats() {
     // must not rest on one carrier.
     let carrier =
         std::env::var("DGQ_E16_CARRIER").unwrap_or_else(|_| "fixtures/smoketest/longdoc.md".into());
-    let tok = Tokenizer::load(&dir.join("tokenizer.json")).expect("tokenizer");
+    let tok = Tokenizer::load(dir.join("tokenizer.json")).expect("tokenizer");
     let max_seq = 8192usize;
     let mut ids = if carrier == "random" {
         synth_ids(max_seq)
@@ -181,7 +181,7 @@ fn e16_fusion_oracle_replay() {
     use crate::shaders::f16::f32_to_f16_bits;
     use crate::tokenizer::Tokenizer;
     let Some(dir) = model_dir() else { return };
-    let tok = Tokenizer::load(&dir.join("tokenizer.json")).expect("tokenizer");
+    let tok = Tokenizer::load(dir.join("tokenizer.json")).expect("tokenizer");
     let text = std::fs::read_to_string("fixtures/smoketest/longdoc.md").expect("probe fixture");
     let doc_ids = tok.encode(&text, false);
     let excerpt = tok.decode(&doc_ids[..13300]);
@@ -294,6 +294,7 @@ fn e16_fusion_oracle_replay() {
                                 for i in 0..m {
                                     for j in i + 1..m {
                                         let (mut d, mut na, mut nb) = (0f64, 0f64, 0f64);
+                                        #[allow(clippy::needless_range_loop)] // x indexes ks[i] and ks[j] in lockstep
                                         for x in 0..hd {
                                             d += ks[i][x] * ks[j][x];
                                             na += ks[i][x] * ks[i][x];
@@ -412,7 +413,7 @@ fn e16_fusion_multineedle_oracle() {
     use crate::shaders::f16::f32_to_f16_bits;
     use crate::tokenizer::Tokenizer;
     let Some(dir) = model_dir() else { return };
-    let tok = Tokenizer::load(&dir.join("tokenizer.json")).expect("tokenizer");
+    let tok = Tokenizer::load(dir.join("tokenizer.json")).expect("tokenizer");
     let carrier =
         std::env::var("DGQ_E16_CARRIER").unwrap_or_else(|_| "fixtures/smoketest/longdoc.md".into());
     let mut raw = std::fs::read_to_string(&carrier).expect("carrier fixture");
@@ -554,8 +555,8 @@ fn e16_fusion_multineedle_oracle() {
                 for hh in 0..nkv {
                     for b in 0..n_bands {
                         let c = band_cnt[hh][b].max(1) as f64;
-                        for d in 0..hd {
-                            band_mean[hh][b][d] /= c;
+                        for v in band_mean[hh][b].iter_mut() {
+                            *v /= c;
                         }
                     }
                 }
@@ -565,6 +566,7 @@ fn e16_fusion_multineedle_oracle() {
                 let b1 = (b0 + r).min(a1);
                 let m = b1 - b0;
                 if m >= 2 {
+                    #[allow(clippy::needless_range_loop)] // hh indexes several parallel per-kv-head arrays
                     for hh in 0..nkv {
                         cand += m;
                         let merge = match resid_tau {
@@ -581,6 +583,7 @@ fn e16_fusion_multineedle_oracle() {
                                 for i in 0..m {
                                     for j in i + 1..m {
                                         let (mut d, mut na, mut nb) = (0f64, 0f64, 0f64);
+                                        #[allow(clippy::needless_range_loop)] // x indexes rs[i] and rs[j] in lockstep
                                         for x in 0..hd {
                                             d += rs[i][x] * rs[j][x];
                                             na += rs[i][x] * rs[i][x];

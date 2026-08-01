@@ -343,6 +343,9 @@ pub struct DgqResident {
 }
 
 /// GPU weight cache: paged bf16 (safetensors) or fully resident `.dgq`.
+// Both variants are large (multi-GiB GPU-resident caches) and there is exactly
+// one live per model, so boxing the larger to shrink the enum buys nothing.
+#[allow(clippy::large_enum_variant)]
 pub enum GpuDecoderWeightCache {
     Bf16(Bf16Paged),
     Dgq(DgqResident),

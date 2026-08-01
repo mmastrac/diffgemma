@@ -125,6 +125,7 @@ impl<'a> Bf16Slice<'a> {
             .join(", ")
     }
 
+    #[allow(clippy::wrong_self_convention)] // borrows the bf16 view to allocate an f32 copy, must not consume self
     pub fn to_f32_vec(&self) -> Vec<f32> {
         (0..self.len())
             .map(|i| f32::from_bits((self.get(i) as u32) << 16))

@@ -724,7 +724,7 @@ impl Worker {
                 // Splitter-disagreement recovery (see the non-compact path):
                 // a call misclassified into the round's reasoning must not
                 // silently end the turn as a plain answer.
-                let salvage = crate::tools::parse_tool_calls(&mapper.lock().unwrap().reasoning());
+                let salvage = crate::tools::parse_tool_calls(mapper.lock().unwrap().reasoning());
                 if !salvage.is_empty() {
                     eprintln!(
                         "serve: CHANNEL MISMATCH: {} call(s) lost by the stream split; recovered from round reasoning",

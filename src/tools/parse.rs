@@ -299,7 +299,6 @@ pub fn scan_call_attempts(text: &str) -> Vec<(String, bool)> {
         let Some(brace) = after.find('{') else {
             out.push((
                 after
-                    .trim()
                     .split_whitespace()
                     .next()
                     .unwrap_or("")

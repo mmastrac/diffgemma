@@ -311,7 +311,7 @@ pub fn render_conversation_guarded(
 
         if prev == PrevType::ToolCall && !responses_emitted {
             out.push_str("<|tool_response>");
-        } else if !(responses_emitted && !has_content) {
+        } else if !responses_emitted || has_content {
             out.push_str("<turn|>\n");
             prev = PrevType::Other;
         }
@@ -363,6 +363,7 @@ fn format_tool_call(tc: &Value) -> String {
 /// Render one tool response in the canonical grammar (server-side tool
 /// execution, e.g. the compactor's `expand_summary`, extends KV with this).
 /// Display form — guards stripped; use the `_guarded` twin for encoding.
+#[cfg(test)]
 pub(crate) fn render_tool_response(name: &str, msg: &Value) -> String {
     strip_client_guards(&format_tool_response(name.to_string(), msg))
 }

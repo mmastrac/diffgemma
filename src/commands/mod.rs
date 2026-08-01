@@ -782,7 +782,7 @@ pub(crate) fn run_command(
         }
         Command::Tokenize(_) => ExitCode::FAILURE,
         Command::Gemm { .. } => ExitCode::FAILURE,
-        Command::ProbeDevice { .. } => ExitCode::FAILURE,
+        Command::ProbeDevice => ExitCode::FAILURE,
         Command::Quantize { .. } => ExitCode::FAILURE,
         Command::Repack { .. } => ExitCode::FAILURE,
         Command::RepackMonolithic { .. } => ExitCode::FAILURE,

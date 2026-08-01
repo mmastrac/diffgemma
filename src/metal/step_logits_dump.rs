@@ -58,7 +58,7 @@ pub struct StepLogitsDump {
     pub rows: Vec<LogitsRowDump>,
 }
 
-fn row_slice<'a>(logits: &'a [f32], row: usize) -> &'a [f32] {
+fn row_slice(logits: &[f32], row: usize) -> &[f32] {
     let base = row * VOCAB;
     &logits[base..base + VOCAB]
 }

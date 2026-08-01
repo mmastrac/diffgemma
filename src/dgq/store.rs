@@ -64,10 +64,6 @@ impl DgqStore {
         self.manifest.is_layered()
     }
 
-    pub fn profile(&self) -> crate::dgq::layout::QuantProfile {
-        self.manifest.profile
-    }
-
     /// Total canonical/unified blob length: for a self-contained pack this is
     /// the local bin's file size (identity); for a layered pack it is the
     /// address-space size the loader materializes on the GPU (`offset` /

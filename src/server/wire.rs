@@ -417,6 +417,7 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
 /// If `next` extends `prev` (or diverges), return the suffix to append. Returns
 /// `None` when nothing new. On a rare non-prefix revision, re-emit the whole new
 /// text (append-only sinks can't retract; committed text almost never revises).
+#[cfg(test)]
 pub(crate) fn append_delta(prev: &str, next: &str) -> Option<String> {
     if next == prev {
         None

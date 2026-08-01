@@ -104,6 +104,7 @@ impl<'a> FastBf16Slice<'a> {
     }
 
     #[inline(always)]
+    #[allow(clippy::wrong_self_convention)] // reads one element from a borrowed view, not a by-value conversion
     pub unsafe fn to_f32_unchecked(&self, index: usize) -> f32 {
         unsafe { f32::from_bits((self.get_u16_unchecked(index) as u32) << 16) }
     }

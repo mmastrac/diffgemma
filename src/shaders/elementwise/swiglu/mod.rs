@@ -387,9 +387,32 @@ pub fn gpu_interleaved(f: &InterleavedFixture, variant: KernelVariant) -> Result
 #[cfg(target_os = "macos")]
 use crate::shaders::gpu_common::div_up;
 
+/// Manifest registration; collected in common/manifest.rs::MANIFEST.
+pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
+    name: "swiglu",
+    entry: "swiglu",
+    quant_formats: &[crate::shaders::variant::QuantFormat::Q4Affine],
+    fc: &[(4, "K_IO_DTYPE"), (5, "K_GELU_GATE"), (6, "K_IN_PLACE")],
+    variants: crate::shaders::manifest::KernelVariants::SwigluSplit {
+        rows: &[
+            crate::shaders::manifest::SwigluSplitVariant::DECODER_MUL,
+            crate::shaders::manifest::SwigluSplitVariant::MONOLITH_GLU,
+        ],
+    },
+};
+
+/// Colocated subkernel registration (swiglu_moe_gate_up.metal).
+pub const SPEC_MOE_GATE_UP: crate::shaders::manifest::KernelSpec =
+    crate::shaders::manifest::KernelSpec {
+        name: "swiglu_moe_gate_up",
+        entry: "swiglu_moe_gate_up",
+        quant_formats: &[crate::shaders::variant::QuantFormat::Q4Affine],
+        fc: &[],
+        variants: crate::shaders::manifest::KernelVariants::SwigluMoeGateUp,
+    };
+
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::kernel_oracle_matrix;
 
     kernel_oracle_matrix! {
@@ -452,27 +475,3 @@ mod tests {
         min_cos = 0.9999,
     }
 }
-
-/// Manifest registration; collected in common/manifest.rs::MANIFEST.
-pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
-    name: "swiglu",
-    entry: "swiglu",
-    quant_formats: &[crate::shaders::variant::QuantFormat::Q4Affine],
-    fc: &[(4, "K_IO_DTYPE"), (5, "K_GELU_GATE"), (6, "K_IN_PLACE")],
-    variants: crate::shaders::manifest::KernelVariants::SwigluSplit {
-        rows: &[
-            crate::shaders::manifest::SwigluSplitVariant::DECODER_MUL,
-            crate::shaders::manifest::SwigluSplitVariant::MONOLITH_GLU,
-        ],
-    },
-};
-
-/// Colocated subkernel registration (swiglu_moe_gate_up.metal).
-pub const SPEC_MOE_GATE_UP: crate::shaders::manifest::KernelSpec =
-    crate::shaders::manifest::KernelSpec {
-        name: "swiglu_moe_gate_up",
-        entry: "swiglu_moe_gate_up",
-        quant_formats: &[crate::shaders::variant::QuantFormat::Q4Affine],
-        fc: &[],
-        variants: crate::shaders::manifest::KernelVariants::SwigluMoeGateUp,
-    };

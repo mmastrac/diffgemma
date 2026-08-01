@@ -159,6 +159,7 @@ impl MemBudget {
 
     /// In-process-or-given-dir budget that waits forever (test constructor;
     /// the global gets the env-configured timeout).
+    #[cfg(test)]
     pub fn new(total: usize, lock_dir: Option<PathBuf>) -> Self {
         Self::with_timeout(total, lock_dir, None)
     }

@@ -138,13 +138,13 @@ pub fn linear_bf16_slice(
     for s in 0..seq_len {
         let x_row = &x[s * in_dim..(s + 1) * in_dim];
         let y_row = &mut y[s * out_dim..(s + 1) * out_dim];
-        for o in 0..out_dim {
+        for (o, y_o) in y_row.iter_mut().enumerate() {
             let mut sum = 0.0f32;
             let row_off = w_elem_offset + o * in_dim;
-            for i in 0..in_dim {
-                sum += x_row[i] * unsafe { wfast.to_f32_unchecked(row_off + i) };
+            for (i, &xi) in x_row.iter().enumerate() {
+                sum += xi * unsafe { wfast.to_f32_unchecked(row_off + i) };
             }
-            y_row[o] = sum;
+            *y_o = sum;
         }
     }
 }

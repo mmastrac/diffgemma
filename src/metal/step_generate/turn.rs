@@ -103,10 +103,6 @@ impl TurnState {
         self.sequences.len() - self.prompt_token_ids.len()
     }
 
-    /// The full committed token log (prompt + committed blocks).
-    pub fn sequences(&self) -> &[u32] {
-        &self.sequences
-    }
 }
 
 pub fn generate_with_session(
@@ -116,11 +112,7 @@ pub fn generate_with_session(
     prompt_label: &str,
 ) -> Result<GenerateOutput, Error> {
     let mut ts = begin_turn(session, prompt_token_ids, cfg, prompt_label)?;
-    loop {
-        let pb = match propose_block(session, cfg, &mut ts)? {
-            BlockOutcome::Proposal(pb) => pb,
-            BlockOutcome::Exhausted | BlockOutcome::Abandoned | BlockOutcome::Cancelled => break,
-        };
+    while let BlockOutcome::Proposal(pb) = propose_block(session, cfg, &mut ts)? {
         if !default_commit_policy(session, cfg, &mut ts, *pb)? {
             break;
         }
@@ -556,8 +548,8 @@ pub fn propose_block(
     let mut nc_retry_attempt = 0u32;
     let mut abandon_turn = false;
     // Head width committed by a PrefixExit stop (None = full active canvas).
-    // Outlives the 'attempt loop; reset at each attempt start.
-    let mut prefix_exit_head: Option<usize> = None;
+    // Outlives the 'attempt loop; assigned at each attempt start before use.
+    let mut prefix_exit_head: Option<usize>;
     // Block-level output mode, set by the classifier on each attempt's first
     // forward. Outlives the 'attempt loop so the committed attempt's label
     // reaches the delimiter check.

@@ -59,6 +59,9 @@ pub struct GenerateOutput {
     pub stop_offset: Option<usize>,
     /// Per committed block: the final-token stats that the verbose step-generate
     /// log prints (accept/min_ent/mean_ent/low_ent histograms + late window).
+    /// Plumbed through from `TurnState`; the live verbose log currently reads
+    /// block stats off the pipeline event, so nothing consumes this field yet.
+    #[allow(dead_code)]
     pub block_stats: Vec<BlockDenoiseStats>,
     /// Effective denoise steps per committed block (monolithic path).
     pub block_steps_eff: Vec<u32>,

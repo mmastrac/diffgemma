@@ -266,9 +266,17 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     Ok(pack_out(&rowstat, &entropy, &prev))
 }
 
+/// Manifest registration; collected in common/manifest.rs::MANIFEST.
+pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
+    name: "sample_rowstats",
+    entry: "sample_rowstats",
+    quant_formats: &[crate::shaders::variant::QuantFormat::Q4Affine],
+    fc: &[],
+    variants: crate::shaders::manifest::KernelVariants::Elementwise,
+};
+
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::kernel_oracle_matrix;
 
     kernel_oracle_matrix! {
@@ -307,12 +315,3 @@ mod tests {
         min_cos = 0.9999,
     }
 }
-
-/// Manifest registration; collected in common/manifest.rs::MANIFEST.
-pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
-    name: "sample_rowstats",
-    entry: "sample_rowstats",
-    quant_formats: &[crate::shaders::variant::QuantFormat::Q4Affine],
-    fc: &[],
-    variants: crate::shaders::manifest::KernelVariants::Elementwise,
-};

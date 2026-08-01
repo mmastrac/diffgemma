@@ -88,8 +88,8 @@ pub fn embed_gather_cpu(
     assert_eq!(out.len(), num_tokens * hidden);
     let row_bytes = q8_row_bytes(hidden);
     let mut raw = vec![0.0f32; hidden];
-    for tok in 0..num_tokens {
-        let row = ids[tok] as usize;
+    for (tok, &id) in ids.iter().enumerate().take(num_tokens) {
+        let row = id as usize;
         let row_off = row * row_bytes;
         dequant_row_q8(&embed_q8[row_off..row_off + row_bytes], hidden, &mut raw);
         let dst = tok * hidden;
@@ -255,9 +255,17 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         .collect())
 }
 
+/// Manifest registration; collected in common/manifest.rs::MANIFEST.
+pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
+    name: "embed_gather",
+    entry: "embed_gather",
+    quant_formats: &[crate::shaders::variant::QuantFormat::Q8],
+    fc: &[],
+    variants: crate::shaders::manifest::KernelVariants::Elementwise,
+};
+
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::kernel_oracle_matrix;
 
     kernel_oracle_matrix! {
@@ -284,12 +292,3 @@ mod tests {
         min_cos = 0.9999,
     }
 }
-
-/// Manifest registration; collected in common/manifest.rs::MANIFEST.
-pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
-    name: "embed_gather",
-    entry: "embed_gather",
-    quant_formats: &[crate::shaders::variant::QuantFormat::Q8],
-    fc: &[],
-    variants: crate::shaders::manifest::KernelVariants::Elementwise,
-};

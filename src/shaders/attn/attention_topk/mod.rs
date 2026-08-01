@@ -227,153 +227,6 @@ pub fn gpu(
     Ok(rig.read_out_f32(f.out_len()))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::shaders::test_util::{ElemFormat, assert_oracle};
-
-    /// Parity vs the CPU oracle, causal prefill, f16 KV path. Full-layer shape,
-    /// GQA group 8 (the production full-layer shape). k = K_PAD = 64.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn topk_full_grp8_causal_vs_cpu() {
-        let f = crate::shaders::attention::full_grp8_hd512_fixture(ElemFormat::F32);
-        let got = gpu(&f, true, false, K_PAD).expect("gpu topk causal");
-        let oracle = cpu::topk_causal(&f, true, K_PAD);
-        // Selection is exact top-k by f32 score (4-level radix); only
-        // bit-identical scores are interchangeable. Tolerance covers f16-KV /
-        // bf16 rounding.
-        assert_oracle(&got, &oracle, 2e-2, 0.9999);
-    }
-
-    /// Parity vs the CPU oracle, DENOISE mask (causal=0 — the decode arm's
-    /// dispatch mode, `DGQ_ATTN_TOPK_DECODE`): every canvas row sees all
-    /// kv_len + canvas keys. Same production full-layer shape as the causal
-    /// test.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn topk_full_grp8_denoise_vs_cpu() {
-        let f = crate::shaders::attention::full_grp8_hd512_fixture(ElemFormat::F32);
-        let got = gpu(&f, false, false, K_PAD).expect("gpu topk denoise");
-        let oracle = cpu::topk_denoise(&f, true, K_PAD);
-        assert_oracle(&got, &oracle, 2e-2, 0.9999);
-    }
-
-    /// Parity vs CPU oracle, f32 side-KV path (FC30).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn topk_full_grp8_causal_side_vs_cpu() {
-        let f = crate::shaders::attention::full_grp8_hd512_fixture(ElemFormat::F32);
-        let got = gpu(&f, true, true, K_PAD).expect("gpu topk causal side");
-        let oracle = cpu::topk_causal(&f, false, K_PAD);
-        assert_oracle(&got, &oracle, 2e-2, 0.9999);
-    }
-
-    /// k=1 sanity: top-1 picks argmax per (row, head). Relaxed tolerance:
-    /// the threshold-based selection may include ties at the threshold, so for
-    /// k=1 with tied scores the GPU may pick a different (tied) key than the
-    /// CPU oracle's lower-index tie-break. cos >= 0.999 is sufficient to
-    /// confirm the selection is correct (output is one of the tied V rows).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn topk_k1_matches_argmax_value() {
-        let f = crate::shaders::attention::full_grp8_hd512_fixture(ElemFormat::F32);
-        let got = gpu(&f, true, false, 1).expect("gpu topk k=1");
-        let oracle = cpu::topk_causal(&f, true, 1);
-        // Relaxed: ties at k=1 may pick a different (tied) key.
-        assert_oracle(&got, &oracle, 2e-2, 0.999);
-    }
-
-    /// k=128 > default K_PAD=64: proves the k knob is live end-to-end (task
-    /// #95) — the kernel compiles with AG_K_PAD=128 and the selection keeps
-    /// 128 keys, matching the CPU oracle at the same k.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn topk_k128_matches_cpu() {
-        let f = crate::shaders::attention::full_grp8_hd512_fixture(ElemFormat::F32);
-        let got = gpu(&f, true, false, 128).expect("gpu topk k=128");
-        let oracle = cpu::topk_causal(&f, true, 128);
-        assert_oracle(&got, &oracle, 2e-2, 0.9999);
-    }
-
-    /// Premise bench: top-k attention vs dense at model shape. One
-    /// command buffer each, min-of-rounds. Ignored (timing).
-    /// Run: `cargo test --release topk_bench -- --ignored --nocapture`
-    #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore]
-    fn topk_bench() {
-        let iters = 10usize;
-        println!("  kv    e17_dense   topk       ratio   | qk     sm     pv");
-        for kv_len in [8192u32, 30000, 60000, 100000] {
-            let f = crate::shaders::attention_gemm::model_full_fixture(kv_len);
-            let e17 = crate::shaders::attention_gemm::bench_gpu(&f, iters, 4, true).unwrap();
-            let topk = bench_gpu(&f, iters, 4, K_PAD, true).unwrap();
-            let (qk_t, sm_t, pv_t) = bench_stages(&f, iters, 4, K_PAD, true).unwrap();
-            println!(
-                "{kv_len:>6}  {e17:9.3}  {topk:9.3}  {ratio:.2}x   | {qk_t:6.2} {sm_t:6.2} {pv_t:6.2}",
-                ratio = e17 / topk
-            );
-        }
-    }
-
-    /// Premise bench for the DECODE (denoise) arm: production
-    /// `attention_mma_full` (causal=0 monolithic — what denoise full layers
-    /// run today) vs dense decomp vs top-k at kv-adaptive k, at the
-    /// denoise full-layer shape (canvas=256, 16Q/2KV, hd=512). The dense/topk
-    /// harnesses dispatch causal=1; at these kv lengths the causal mask
-    /// excludes <0.5% of keys, below bench noise.
-    /// Run: `cargo test --release topk_decode_bench -- --ignored --nocapture`
-    #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore]
-    fn topk_decode_bench() {
-        let iters = 5usize;
-        println!("DECODE shape (canvas=256, 16Q/2KV, hd=512), k_dyn = clamp(t/128, 64, 512)");
-        println!("  kv    mma_full   e17_dense  topk_dyn   full/topk | qk     sm     pv");
-        for kv_len in [8192u32, 30000, 60000, 100000] {
-            let f = crate::shaders::attention_gemm::model_full_fixture(kv_len);
-            let t_total = kv_len as usize + f.canvas;
-            let k = (t_total / 128).clamp(64, 512);
-            let full = crate::shaders::attention::bench_path(&f, iters, 3).unwrap();
-            let e17 = crate::shaders::attention_gemm::bench_gpu(&f, iters, 16, true).unwrap();
-            let topk = bench_gpu(&f, iters, 16, k, true).unwrap();
-            let (qk_t, sm_t, pv_t) = bench_stages(&f, iters, 16, k, true).unwrap();
-            println!(
-                "{kv_len:>6}  {full:9.3}  {e17:9.3}  {topk:9.3}  {r:8.2}x | {qk_t:6.2} {sm_t:6.2} {pv_t:6.2}",
-                r = full / topk
-            );
-        }
-    }
-
-    /// Per-kernel breakdown at the PRODUCTION prefill super-chunk shape
-    /// (M=1024, n_q_heads=16, nkv=2, hd=512) — matches `bench-prefill-super`.
-    /// Used to verify QK is at the half-MMA compute wall (not a kernel bug).
-    /// Run: `cargo test --release topk_bench_prod -- --ignored --nocapture`
-    #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore]
-    fn topk_bench_prod() {
-        let iters = 5usize;
-        println!("PROD shape (M=1024, n_q_heads=16, nkv=2, hd=512)");
-        println!("  kv    e17_dense   topk       ratio   | qk     sm     pv");
-        for kv_len in [15000u32, 30000, 60000] {
-            let f = crate::shaders::attention_gemm::model_full_fixture_prod(kv_len);
-            let e17 = crate::shaders::attention_gemm::bench_gpu(&f, iters, 4, true).unwrap();
-            let topk = bench_gpu(&f, iters, 4, K_PAD, true).unwrap();
-            let (qk_t, sm_t, pv_t) = bench_stages(&f, iters, 4, K_PAD, true).unwrap();
-            // Per-head QK FLOPs = 2 * M * t_total * hd. n_q_heads independent QK GEMMs.
-            let t_total = kv_len as usize + 1024;
-            let qk_flops = 2.0 * 1024.0 * t_total as f64 * 512.0 * 16.0;
-            let qk_tf_s = qk_flops / (qk_t * 1e-3) / 1e12;
-            println!(
-                "{kv_len:>6}  {e17:9.3}  {topk:9.3}  {ratio:.2}x   | {qk_t:6.2} {sm_t:6.2} {pv_t:6.2}  (qk={qk_tf_s:.2} TF/s)",
-                ratio = e17 / topk
-            );
-        }
-    }
-}
-
 /// Shared state for the top-k benches: rig + pipelines + scratch, and the
 /// per-head-chunk encoder both `bench_gpu` and `bench_stages` dispatch through
 /// (f16 KV path, no side ring — matching the historical benches).
@@ -587,3 +440,150 @@ pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest:
     fc: &[],
     variants: crate::shaders::manifest::KernelVariants::Elementwise,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shaders::test_util::{ElemFormat, assert_oracle};
+
+    /// Parity vs the CPU oracle, causal prefill, f16 KV path. Full-layer shape,
+    /// GQA group 8 (the production full-layer shape). k = K_PAD = 64.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn topk_full_grp8_causal_vs_cpu() {
+        let f = crate::shaders::attention::full_grp8_hd512_fixture(ElemFormat::F32);
+        let got = gpu(&f, true, false, K_PAD).expect("gpu topk causal");
+        let oracle = cpu::topk_causal(&f, true, K_PAD);
+        // Selection is exact top-k by f32 score (4-level radix); only
+        // bit-identical scores are interchangeable. Tolerance covers f16-KV /
+        // bf16 rounding.
+        assert_oracle(&got, &oracle, 2e-2, 0.9999);
+    }
+
+    /// Parity vs the CPU oracle, DENOISE mask (causal=0 — the decode arm's
+    /// dispatch mode, `DGQ_ATTN_TOPK_DECODE`): every canvas row sees all
+    /// kv_len + canvas keys. Same production full-layer shape as the causal
+    /// test.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn topk_full_grp8_denoise_vs_cpu() {
+        let f = crate::shaders::attention::full_grp8_hd512_fixture(ElemFormat::F32);
+        let got = gpu(&f, false, false, K_PAD).expect("gpu topk denoise");
+        let oracle = cpu::topk_denoise(&f, true, K_PAD);
+        assert_oracle(&got, &oracle, 2e-2, 0.9999);
+    }
+
+    /// Parity vs CPU oracle, f32 side-KV path (FC30).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn topk_full_grp8_causal_side_vs_cpu() {
+        let f = crate::shaders::attention::full_grp8_hd512_fixture(ElemFormat::F32);
+        let got = gpu(&f, true, true, K_PAD).expect("gpu topk causal side");
+        let oracle = cpu::topk_causal(&f, false, K_PAD);
+        assert_oracle(&got, &oracle, 2e-2, 0.9999);
+    }
+
+    /// k=1 sanity: top-1 picks argmax per (row, head). Relaxed tolerance:
+    /// the threshold-based selection may include ties at the threshold, so for
+    /// k=1 with tied scores the GPU may pick a different (tied) key than the
+    /// CPU oracle's lower-index tie-break. cos >= 0.999 is sufficient to
+    /// confirm the selection is correct (output is one of the tied V rows).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn topk_k1_matches_argmax_value() {
+        let f = crate::shaders::attention::full_grp8_hd512_fixture(ElemFormat::F32);
+        let got = gpu(&f, true, false, 1).expect("gpu topk k=1");
+        let oracle = cpu::topk_causal(&f, true, 1);
+        // Relaxed: ties at k=1 may pick a different (tied) key.
+        assert_oracle(&got, &oracle, 2e-2, 0.999);
+    }
+
+    /// k=128 > default K_PAD=64: proves the k knob is live end-to-end (task
+    /// #95) — the kernel compiles with AG_K_PAD=128 and the selection keeps
+    /// 128 keys, matching the CPU oracle at the same k.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn topk_k128_matches_cpu() {
+        let f = crate::shaders::attention::full_grp8_hd512_fixture(ElemFormat::F32);
+        let got = gpu(&f, true, false, 128).expect("gpu topk k=128");
+        let oracle = cpu::topk_causal(&f, true, 128);
+        assert_oracle(&got, &oracle, 2e-2, 0.9999);
+    }
+
+    /// Premise bench: top-k attention vs dense at model shape. One
+    /// command buffer each, min-of-rounds. Ignored (timing).
+    /// Run: `cargo test --release topk_bench -- --ignored --nocapture`
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn topk_bench() {
+        let iters = 10usize;
+        println!("  kv    e17_dense   topk       ratio   | qk     sm     pv");
+        for kv_len in [8192u32, 30000, 60000, 100000] {
+            let f = crate::shaders::attention_gemm::model_full_fixture(kv_len);
+            let e17 = crate::shaders::attention_gemm::bench_gpu(&f, iters, 4, true).unwrap();
+            let topk = bench_gpu(&f, iters, 4, K_PAD, true).unwrap();
+            let (qk_t, sm_t, pv_t) = bench_stages(&f, iters, 4, K_PAD, true).unwrap();
+            println!(
+                "{kv_len:>6}  {e17:9.3}  {topk:9.3}  {ratio:.2}x   | {qk_t:6.2} {sm_t:6.2} {pv_t:6.2}",
+                ratio = e17 / topk
+            );
+        }
+    }
+
+    /// Premise bench for the DECODE (denoise) arm: production
+    /// `attention_mma_full` (causal=0 monolithic — what denoise full layers
+    /// run today) vs dense decomp vs top-k at kv-adaptive k, at the
+    /// denoise full-layer shape (canvas=256, 16Q/2KV, hd=512). The dense/topk
+    /// harnesses dispatch causal=1; at these kv lengths the causal mask
+    /// excludes <0.5% of keys, below bench noise.
+    /// Run: `cargo test --release topk_decode_bench -- --ignored --nocapture`
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn topk_decode_bench() {
+        let iters = 5usize;
+        println!("DECODE shape (canvas=256, 16Q/2KV, hd=512), k_dyn = clamp(t/128, 64, 512)");
+        println!("  kv    mma_full   e17_dense  topk_dyn   full/topk | qk     sm     pv");
+        for kv_len in [8192u32, 30000, 60000, 100000] {
+            let f = crate::shaders::attention_gemm::model_full_fixture(kv_len);
+            let t_total = kv_len as usize + f.canvas;
+            let k = (t_total / 128).clamp(64, 512);
+            let full = crate::shaders::attention::bench_path(&f, iters, 3).unwrap();
+            let e17 = crate::shaders::attention_gemm::bench_gpu(&f, iters, 16, true).unwrap();
+            let topk = bench_gpu(&f, iters, 16, k, true).unwrap();
+            let (qk_t, sm_t, pv_t) = bench_stages(&f, iters, 16, k, true).unwrap();
+            println!(
+                "{kv_len:>6}  {full:9.3}  {e17:9.3}  {topk:9.3}  {r:8.2}x | {qk_t:6.2} {sm_t:6.2} {pv_t:6.2}",
+                r = full / topk
+            );
+        }
+    }
+
+    /// Per-kernel breakdown at the PRODUCTION prefill super-chunk shape
+    /// (M=1024, n_q_heads=16, nkv=2, hd=512) — matches `bench-prefill-super`.
+    /// Used to verify QK is at the half-MMA compute wall (not a kernel bug).
+    /// Run: `cargo test --release topk_bench_prod -- --ignored --nocapture`
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn topk_bench_prod() {
+        let iters = 5usize;
+        println!("PROD shape (M=1024, n_q_heads=16, nkv=2, hd=512)");
+        println!("  kv    e17_dense   topk       ratio   | qk     sm     pv");
+        for kv_len in [15000u32, 30000, 60000] {
+            let f = crate::shaders::attention_gemm::model_full_fixture_prod(kv_len);
+            let e17 = crate::shaders::attention_gemm::bench_gpu(&f, iters, 4, true).unwrap();
+            let topk = bench_gpu(&f, iters, 4, K_PAD, true).unwrap();
+            let (qk_t, sm_t, pv_t) = bench_stages(&f, iters, 4, K_PAD, true).unwrap();
+            // Per-head QK FLOPs = 2 * M * t_total * hd. n_q_heads independent QK GEMMs.
+            let t_total = kv_len as usize + 1024;
+            let qk_flops = 2.0 * 1024.0 * t_total as f64 * 512.0 * 16.0;
+            let qk_tf_s = qk_flops / (qk_t * 1e-3) / 1e12;
+            println!(
+                "{kv_len:>6}  {e17:9.3}  {topk:9.3}  {ratio:.2}x   | {qk_t:6.2} {sm_t:6.2} {pv_t:6.2}  (qk={qk_tf_s:.2} TF/s)",
+                ratio = e17 / topk
+            );
+        }
+    }
+}
