@@ -24,22 +24,22 @@ pub fn expert_forward_q4_mirror(
 ) -> Vec<f32> {
     assert_eq!(x.len(), hidden);
     let mut act = vec![0.0f32; moe_ff];
-    for r in 0..moe_ff {
+    for (r, act_r) in act.iter_mut().enumerate() {
         let mut g = 0.0f32;
         let mut u = 0.0f32;
-        for k in 0..hidden {
-            g += q4_weight_at(gate_up, r, k, hidden) * x[k];
-            u += q4_weight_at(gate_up, r + moe_ff, k, hidden) * x[k];
+        for (k, &xk) in x.iter().enumerate() {
+            g += q4_weight_at(gate_up, r, k, hidden) * xk;
+            u += q4_weight_at(gate_up, r + moe_ff, k, hidden) * xk;
         }
-        act[r] = bf16::round_bf16_f32(gelu_pytorch_tanh_f32(g) * u);
+        *act_r = bf16::round_bf16_f32(gelu_pytorch_tanh_f32(g) * u);
     }
     let mut out = vec![0.0f32; hidden];
-    for d in 0..hidden {
+    for (d, out_d) in out.iter_mut().enumerate() {
         let mut o = 0.0f32;
-        for k in 0..moe_ff {
-            o += q4_weight_at(down, d, k, moe_ff) * act[k];
+        for (k, &ak) in act.iter().enumerate() {
+            o += q4_weight_at(down, d, k, moe_ff) * ak;
         }
-        out[d] = bf16::round_bf16_f32(o);
+        *out_d = bf16::round_bf16_f32(o);
     }
     out
 }
@@ -59,22 +59,22 @@ pub fn expert_forward_nvfp4_mirror(
     let dn_body = &down[NVFP4_HEADER_BYTES..];
 
     let mut act = vec![0.0f32; moe_ff];
-    for r in 0..moe_ff {
+    for (r, act_r) in act.iter_mut().enumerate() {
         let mut g = 0.0f32;
         let mut u = 0.0f32;
-        for k in 0..hidden {
-            g += nvfp4_weight_at(gu_body, r, k, hidden, gu_scale) * x[k];
-            u += nvfp4_weight_at(gu_body, r + moe_ff, k, hidden, gu_scale) * x[k];
+        for (k, &xk) in x.iter().enumerate() {
+            g += nvfp4_weight_at(gu_body, r, k, hidden, gu_scale) * xk;
+            u += nvfp4_weight_at(gu_body, r + moe_ff, k, hidden, gu_scale) * xk;
         }
-        act[r] = bf16::round_bf16_f32(gelu_pytorch_tanh_f32(g) * u);
+        *act_r = bf16::round_bf16_f32(gelu_pytorch_tanh_f32(g) * u);
     }
     let mut out = vec![0.0f32; hidden];
-    for d in 0..hidden {
+    for (d, out_d) in out.iter_mut().enumerate() {
         let mut o = 0.0f32;
-        for k in 0..moe_ff {
-            o += nvfp4_weight_at(dn_body, d, k, moe_ff, dn_scale) * act[k];
+        for (k, &ak) in act.iter().enumerate() {
+            o += nvfp4_weight_at(dn_body, d, k, moe_ff, dn_scale) * ak;
         }
-        out[d] = bf16::round_bf16_f32(o);
+        *out_d = bf16::round_bf16_f32(o);
     }
     out
 }

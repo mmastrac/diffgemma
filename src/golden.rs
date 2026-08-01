@@ -29,6 +29,7 @@ use std::path::Path;
 
 /// FNV-1a over raw bytes (restart-stable change detector for the KV snapshot).
 /// Mirrors `toolcompact::fnv1a64` but takes bytes, not `&str`.
+#[cfg(test)]
 pub fn fnv1a64_bytes(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
@@ -39,6 +40,7 @@ pub fn fnv1a64_bytes(bytes: &[u8]) -> u64 {
 }
 
 /// `kv_<16 hex>` digest of a `snapshot_kv` byte blob.
+#[cfg(test)]
 pub fn kv_digest(bytes: &[u8]) -> String {
     format!("kv_{:016x}", fnv1a64_bytes(bytes))
 }

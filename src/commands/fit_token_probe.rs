@@ -374,8 +374,8 @@ fn finish_fit(
     let w: Vec<f32> = m1.iter().zip(&m0).map(|(a, b)| a - b).collect();
     let mid: Vec<f32> = m1.iter().zip(&m0).map(|(a, b)| (a + b) * 0.5).collect();
 
-    let acc = loo_accuracy(&rows, &y);
-    let eff = effect_size(&rows, &y);
+    let acc = loo_accuracy(rows, y);
+    let eff = effect_size(rows, y);
     println!(
         "fit-token-probe: layer {layer}  leave-one-out accuracy {acc:.3}  effect size {eff:.2}"
     );

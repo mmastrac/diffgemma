@@ -157,7 +157,6 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::kernel_oracle_matrix;
 
     kernel_oracle_matrix! {

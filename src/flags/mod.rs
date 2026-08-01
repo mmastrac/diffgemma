@@ -648,14 +648,10 @@ impl RuntimeConfig {
             },
             perf: PerfFlags {
                 moe_fuse_gather: r.on_unless_zero("DGQ_MOE_FUSE_GATHER"),
-                moe_prefill_block_m: match r
+                moe_prefill_block_m: r
                     .var("DGQ_MOE_PREFILL_BM")
                     .ok()
-                    .and_then(|v| v.parse::<u32>().ok())
-                {
-                    Some(bm @ (64 | 128)) => bm,
-                    _ => 32,
-                },
+                    .and_then(|v| v.parse::<u32>().ok()).unwrap_or(32),
                 attn_mma: r.on_unless_zero("DGQ_ATTN_MMA"),
                 attn_mma_full: r.on_unless_zero("DGQ_ATTN_MMA_FULL"),
                 router_gemm: r.on_unless_zero("DGQ_ROUTER_GEMM"),
@@ -798,7 +794,7 @@ impl RuntimeConfig {
     }
 }
 
-/// `DGQ_*_GB` gibibytes → bytes (0 / absent / non-positive → 0).
+// `DGQ_*_GB` gibibytes → bytes (0 / absent / non-positive → 0).
 
 // ===========================================================================
 // Process-global config + test override

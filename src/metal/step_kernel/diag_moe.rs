@@ -92,8 +92,8 @@ fn rebucket_route_scratch(route: &mut RouteScratch) {
         }
     }
     let mut active = 0u32;
-    for e in 0..N_EXPERTS {
-        if has[e] {
+    for (e, &present) in has.iter().enumerate() {
+        if present {
             route.active_expert[active as usize] = e as u32;
             active += 1;
         }
@@ -113,10 +113,8 @@ fn patch_route_position(
     weights: &[u16],
 ) {
     assert!(position < CANVAS);
-    for k in 0..TOP_K {
-        route.expert[position][k] = experts[k];
-        route.weight[position][k] = weights[k];
-    }
+    route.expert[position][..TOP_K].copy_from_slice(&experts[..TOP_K]);
+    route.weight[position][..TOP_K].copy_from_slice(&weights[..TOP_K]);
     rebucket_route_scratch(route);
 }
 

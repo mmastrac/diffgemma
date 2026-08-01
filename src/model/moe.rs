@@ -210,8 +210,8 @@ pub fn experts_forward(
                 &mut scratch.gate_up,
                 &mut scratch.gate_act,
             );
-            for i in 0..hidden {
-                o[i] += weight * scratch.expert_out[i];
+            for (i, o_i) in o.iter_mut().enumerate() {
+                *o_i += weight * scratch.expert_out[i];
             }
         }
     }

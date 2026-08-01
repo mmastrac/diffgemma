@@ -144,7 +144,7 @@ pub(crate) struct Job {
 }
 
 /// Events the worker streams back to the connection thread.
-enum ServerEvent {
+pub(crate) enum ServerEvent {
     Delta(WireDelta),
     Done {
         content: String,

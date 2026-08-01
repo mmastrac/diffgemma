@@ -184,8 +184,8 @@ fn softmax_row_into(logit_row: &[f32], prob_scratch: &mut Buffer<f32>) {
     let mut sum = 0.0f32;
     {
         let mut probs = prob_scratch.as_fast_slice_mut();
-        for i in 0..vocab {
-            let p = (logit_row[i] - max_logit).exp();
+        for (i, &lg) in logit_row.iter().enumerate() {
+            let p = (lg - max_logit).exp();
             unsafe {
                 probs.write_unchecked(i, p);
             }
@@ -219,9 +219,9 @@ fn soft_embed_row_from_table(
             continue;
         }
         let row_off = token * hidden;
-        for h in 0..hidden {
+        for (h, o) in out_row[..hidden].iter_mut().enumerate() {
             unsafe {
-                out_row[h] += prob * table.to_f32_unchecked(row_off + h) * scale;
+                *o += prob * table.to_f32_unchecked(row_off + h) * scale;
             }
         }
     }

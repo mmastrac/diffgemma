@@ -57,7 +57,7 @@ mod tests {
             return None;
         }
         let prefill = hello_chat_prefill_token_ids(dir).ok()?;
-        let mut cfg = calgary_cfg(prefill);
+        let cfg = calgary_cfg(prefill);
         if prompt.contains("calgary") {
             // templated Calgary prompt uses same hello prefill ids in prior captures
         }

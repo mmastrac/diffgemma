@@ -72,10 +72,10 @@ pub fn load_bf16_embed_row(
     }
     let bytes = bf16.as_bytes();
     let mut out = vec![0.0f32; hidden];
-    for i in 0..hidden {
+    for (i, o) in out.iter_mut().enumerate() {
         let off = (base + i) * 2;
         let bits = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
-        out[i] = bf16_to_f32(bits);
+        *o = bf16_to_f32(bits);
     }
     Ok(out)
 }

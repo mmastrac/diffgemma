@@ -62,15 +62,6 @@ pub(crate) struct SoftCounts {
     pub(crate) absence_total: u64,
 }
 
-impl SoftCounts {
-    pub(crate) fn merge(&mut self, o: &Self) {
-        self.found += o.found;
-        self.total += o.total;
-        self.absence_ok += o.absence_ok;
-        self.absence_total += o.absence_total;
-    }
-}
-
 /// Did the reply contain any accepted answer?
 pub(crate) fn matched(reply: &str, probe: &SoftProbe) -> bool {
     probe

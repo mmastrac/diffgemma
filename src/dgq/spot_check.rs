@@ -95,6 +95,7 @@ pub fn spot_check(
 }
 
 /// Sample first row of a large matrix (e.g. embed) without full dequant compare cost.
+#[allow(dead_code)] // diagnostic helper: manual embed spot-check, not wired to a command
 pub fn spot_check_embed_row(
     safetensors_dir: &std::path::Path,
     dgq_dir: &std::path::Path,

@@ -644,6 +644,18 @@ pub fn qkv_sliding_prod_fixture(_: ElemFormat) -> StackedFixture {
     }
 }
 
+/// Manifest registration; collected in common/manifest.rs::MANIFEST.
+pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
+    name: "gemm_block_stacked",
+    entry: "gemm_block_stacked",
+    quant_formats: &[
+        crate::shaders::variant::QuantFormat::Q4Affine,
+        crate::shaders::variant::QuantFormat::NvFp4,
+    ],
+    fc: &[(4, "IS_FULL_LAYER"), (5, "GEMM_N"), (6, "GEMM_K")],
+    variants: crate::shaders::manifest::KernelVariants::GemmBlock,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -726,7 +738,6 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn stacked_gpu_matches_split_gate_up_canvas() {
-        use crate::shaders::gemm_q4;
         use crate::shaders::variant::KernelVariant;
         let f = gate_up_canvas_fixture(ElemFormat::F32);
         let stacked = gpu_q4(&f, KernelVariant::PRODUCTION).expect("stacked");
@@ -738,7 +749,6 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn stacked_gpu_matches_split_gate_up_tiny() {
-        use crate::shaders::gemm_q4;
         use crate::shaders::variant::KernelVariant;
         let f = gate_up_tiny_fixture(ElemFormat::F32);
         let stacked = gpu_q4(&f, KernelVariant::PRODUCTION).expect("stacked");
@@ -750,7 +760,6 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn stacked_gpu_matches_split_qkv_sliding_prod() {
-        use crate::shaders::gemm_q4;
         use crate::shaders::variant::KernelVariant;
         let f = qkv_sliding_prod_fixture(ElemFormat::F32);
         let stacked = gpu_q4(&f, KernelVariant::PRODUCTION).expect("stacked");
@@ -1000,15 +1009,3 @@ mod tests {
         assert!(max < 0.05, "dgq qkv stacked vs split max_abs={max}");
     }
 }
-
-/// Manifest registration; collected in common/manifest.rs::MANIFEST.
-pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
-    name: "gemm_block_stacked",
-    entry: "gemm_block_stacked",
-    quant_formats: &[
-        crate::shaders::variant::QuantFormat::Q4Affine,
-        crate::shaders::variant::QuantFormat::NvFp4,
-    ],
-    fc: &[(4, "IS_FULL_LAYER"), (5, "GEMM_N"), (6, "GEMM_K")],
-    variants: crate::shaders::manifest::KernelVariants::GemmBlock,
-};

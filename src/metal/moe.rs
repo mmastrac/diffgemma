@@ -155,22 +155,22 @@ pub fn expert_forward_k_moe_grouped_mirror(
     let gu = gate_up_w.src_slice();
     let dn = down_w.src_slice();
     let mut act = vec![0.0f32; moe_inter];
-    for r in 0..moe_inter {
+    for (r, act_r) in act.iter_mut().enumerate() {
         let mut g = 0.0f32;
         let mut u = 0.0f32;
-        for k in 0..hidden {
-            g += q4_weight_at(gu, r, k, hidden) * x[k];
-            u += q4_weight_at(gu, r + moe_inter, k, hidden) * x[k];
+        for (k, &xk) in x.iter().enumerate() {
+            g += q4_weight_at(gu, r, k, hidden) * xk;
+            u += q4_weight_at(gu, r + moe_inter, k, hidden) * xk;
         }
-        act[r] = gelu_pytorch_tanh_f32(g) * u;
+        *act_r = gelu_pytorch_tanh_f32(g) * u;
     }
     let mut out = vec![0.0f32; hidden];
-    for d in 0..hidden {
+    for (d, out_d) in out.iter_mut().enumerate() {
         let mut o = 0.0f32;
-        for k in 0..moe_inter {
-            o += q4_weight_at(dn, d, k, moe_inter) * act[k];
+        for (k, &ak) in act.iter().enumerate() {
+            o += q4_weight_at(dn, d, k, moe_inter) * ak;
         }
-        out[d] = o;
+        *out_d = o;
     }
     out
 }
@@ -589,8 +589,8 @@ pub fn experts_forward_dgq_cpu(
             let gate_up = expert_cache.expert_gate_up_q4(layer, expert);
             let down = expert_cache.expert_down_q4(layer, expert);
             let staged = expert_forward_staged_dgq(x, &gate_up, &down, moe_inter, hidden, scratch);
-            for i in 0..hidden {
-                o[i] += weight * staged.out[i];
+            for (i, o_i) in o.iter_mut().enumerate() {
+                *o_i += weight * staged.out[i];
             }
         }
     }
@@ -606,7 +606,6 @@ mod dgq_expert_tests {
     use crate::metal::device::MetalContext;
     use crate::metal::weights::GpuDecoderWeightCache;
     use crate::weights::WeightStore;
-    use std::sync::Arc;
 
     fn cosine(a: &[f32], b: &[f32]) -> f32 {
         let mut dot = 0.0f64;
@@ -658,7 +657,7 @@ mod dgq_expert_tests {
         assert_eq!(down.q4_byte_len(), q4_matrix_bytes(hidden, moe_inter));
 
         let x: Vec<f32> = (0..hidden)
-            .map(|i| ((i as f32 * 0.013 + 0.7).sin() * 0.05) as f32)
+            .map(|i| (i as f32 * 0.013 + 0.7).sin() * 0.05)
             .collect();
         let mut scratch = MoeScratch::new(1, &text);
 

@@ -219,8 +219,8 @@ pub fn forward(
         hidden,
         eps,
     );
-    for i in 0..out.len() {
-        out[i] += scratch.residual[i];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o += scratch.residual[i];
     }
 
     let layer_scalar = weights.layer_scalar.bf16_scalar()?;
@@ -365,8 +365,8 @@ pub fn forward_encoder(
         hidden,
         eps,
     );
-    for i in 0..out.len() {
-        out[i] += scratch.residual[i];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o += scratch.residual[i];
     }
 
     let layer_scalar = weights.layer_scalar.bf16_scalar()?;
@@ -512,8 +512,8 @@ pub fn forward_encoder_extend(
         hidden,
         eps,
     );
-    for i in 0..out.len() {
-        out[i] += scratch.residual[i];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o += scratch.residual[i];
     }
 
     let layer_scalar = weights.layer_scalar.bf16_scalar()?;
@@ -660,8 +660,8 @@ pub fn forward_decoder(
         hidden,
         eps,
     );
-    for i in 0..out.len() {
-        out[i] += scratch.residual[i];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o += scratch.residual[i];
     }
 
     let layer_scalar = weights.layer_scalar.bf16_scalar()?;

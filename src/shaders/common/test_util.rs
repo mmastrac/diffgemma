@@ -72,9 +72,10 @@ macro_rules! kernel_oracle_matrix {
         min_cos = $min_cos:expr $(,)?
     ) => {
         mod $mod_name {
-            use $crate::shaders::test_util::{assert_oracle, ElemFormat};
-
             $(
+                // Module name mirrors the `ElemFormat` variant (`F32`, `BF16`,
+                // …), which is intentionally not snake_case.
+                #[allow(non_snake_case)]
                 mod $fmt {
                     use $crate::shaders::test_util::{assert_oracle, ElemFormat};
 

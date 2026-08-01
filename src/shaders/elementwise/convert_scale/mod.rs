@@ -129,12 +129,12 @@ mod tests {
             cmd.commit();
             cmd.waitUntilCompleted();
 
-            for i in 0..n {
+            for (i, &sv) in src_f32_vals.iter().enumerate().take(n) {
                 // CPU mirror: src already bf16-exact, so from_src == value.
-                let want = bf16::store_bf16_round_half(src_f32_vals[i] * scale);
+                let want = bf16::store_bf16_round_half(sv * scale);
                 let want = if dst_f32 {
                     // dst f32 stores the (bf16-rounded on read? no) exact product.
-                    src_f32_vals[i] * scale
+                    sv * scale
                 } else {
                     want
                 };

@@ -38,8 +38,8 @@ fn open_rig(
     (tok, cfg, session)
 }
 
-/// One tool turn, driven exactly like the server worker: render the messages
-/// + tools in the model's canonical format, tokenize the specials, generate
+/// One tool turn, driven exactly like the server worker: render the messages +
+/// tools in the model's canonical format, tokenize the specials, generate
 /// (stop at eos), then parse the calls back. Returns (raw reply, calls).
 /// `generate_with_session` resets the KV when the prompt doesn't extend it.
 fn tool_turn(

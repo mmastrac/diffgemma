@@ -321,7 +321,7 @@ fn e15_layer_kv_bisect() {
             "/private/tmp/claude-501/-Users-matt-Documents-github-diffgemma-mps/2f485cb9-ac37-41aa-bfea-e7eb74c44b4d/scratchpad/probe_4k.txt".into()
         });
     let text = std::fs::read_to_string(&prompt_path).expect("probe fixture");
-    let tok = Tokenizer::load(&dir.join("tokenizer.json")).expect("tokenizer");
+    let tok = Tokenizer::load(dir.join("tokenizer.json")).expect("tokenizer");
     let ids = tok.encode(&text, false);
     let n = ids.len();
     eprintln!("e15: {n} tokens from {prompt_path}");
@@ -430,7 +430,7 @@ fn e15_causality_check() {
             "/private/tmp/claude-501/-Users-matt-Documents-github-diffgemma-mps/2f485cb9-ac37-41aa-bfea-e7eb74c44b4d/scratchpad/probe_4k.txt".into()
         });
     let text = std::fs::read_to_string(&prompt_path).expect("probe fixture");
-    let tok = Tokenizer::load(&dir.join("tokenizer.json")).expect("tokenizer");
+    let tok = Tokenizer::load(dir.join("tokenizer.json")).expect("tokenizer");
     let ids = tok.encode(&text, false);
     let n = ids.len();
     let k = 2048usize.min(n / 2 * 2);
@@ -518,7 +518,7 @@ fn e8_prerope_k_quant_stats() {
     let prompt_path =
         std::env::var("DGQ_E8_PROMPT").unwrap_or_else(|_| "fixtures/smoketest/longdoc.md".into());
     let text = std::fs::read_to_string(&prompt_path).expect("probe fixture");
-    let tok = Tokenizer::load(&dir.join("tokenizer.json")).expect("tokenizer");
+    let tok = Tokenizer::load(dir.join("tokenizer.json")).expect("tokenizer");
     let mut ids = tok.encode(&text, false);
     // Keep slot == pos (sliding ring = 2048 slots at this max_seq) AND
     // leave the CANVAS block the prefill reserves (kv_len + 256 <= max_seq).

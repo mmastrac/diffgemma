@@ -1,7 +1,6 @@
 //! Tests for `tests`, extracted from step_kernel.rs (backlog item 3).
 
 use super::*;
-use std::path::Path;
 
 #[test]
 #[ignore = "model-gated diagnostic: e2e accept-count/entropy tripwire (cargo test --release monolith_one_step_accept_regression -- --ignored)"]
@@ -351,6 +350,9 @@ fn offset_prefill_kv_bit_identity() {
     assert_eq!(bad, 0, "offset prefill not bit-identical to full prefill");
 }
 
+// Full-GPU-state snapshot/restore harness (all step buffers). Currently unused;
+// kept as the primitive for KV-rewind / run-to-run determinism debugging.
+#[allow(dead_code)]
 fn read_buffer_bytes(buf: &ProtocolObject<dyn MTLBuffer>, byte_off: usize, len: usize) -> Vec<u8> {
     unsafe {
         std::slice::from_raw_parts(buf.contents().as_ptr().add(byte_off) as *const u8, len).to_vec()
@@ -367,6 +369,7 @@ fn write_buffer_bytes(buf: &ProtocolObject<dyn MTLBuffer>, byte_off: usize, data
     }
 }
 
+#[allow(dead_code)]
 struct StepGpuSnapshot {
     state: CanvasState,
     arena: Vec<u8>,
@@ -378,6 +381,7 @@ struct StepGpuSnapshot {
     gemm_b: Vec<u8>,
 }
 
+#[allow(dead_code)]
 fn snapshot_step_gpu(rt: &StepRuntime) -> StepGpuSnapshot {
     StepGpuSnapshot {
         state: rt.read_canvas_state(),
@@ -391,6 +395,7 @@ fn snapshot_step_gpu(rt: &StepRuntime) -> StepGpuSnapshot {
     }
 }
 
+#[allow(dead_code)]
 fn restore_step_gpu(rt: &mut StepRuntime, snap: &StepGpuSnapshot) {
     rt.write_canvas_state(&snap.state);
     write_buffer_bytes(&rt.bufs.arena, 0, &snap.arena);

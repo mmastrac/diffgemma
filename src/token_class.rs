@@ -94,6 +94,7 @@ impl TokenClassProbe {
     }
 
     /// Class index for one position: 0 = negative side, 1 = positive side.
+    #[cfg(test)]
     pub fn classify(&self, hidden: &[f32]) -> u8 {
         u8::from(self.score(hidden) > 0.0)
     }

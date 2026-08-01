@@ -476,6 +476,7 @@ fn kv_lineage_paths_are_fingerprint_identical_q8() {
 ///      the scalar and mma2 attention kernels.
 ///   4. The f16 control writes every row in every layer — the hole is
 ///      q8-only.
+///
 /// Next step lives in PLAN: an isolated q8 attention harness case
 /// (currently ZERO q8 coverage) to pin the read-side defect, then fix and
 /// un-ignore the q8 lineage matrix.

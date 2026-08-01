@@ -51,10 +51,7 @@ use crate::shaders::kv_quant::KvFormat;
 #[cfg(test)]
 use crate::dgq::DgqStore;
 #[cfg(test)]
-use crate::metal::step_kernel::{
-    StepFinishMode, StepSmokeConfig, VOCAB, build_layout, build_offsets_from_store,
-    build_step_runtime,
-};
+use crate::metal::step_kernel::{VOCAB, build_layout, build_offsets_from_store};
 #[cfg(test)]
 use objc2_metal::{MTLDevice, MTLResourceOptions};
 

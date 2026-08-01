@@ -156,6 +156,9 @@ impl DgqGpuBlob {
         Self::finish_layered_split(model_dir, manifest, expert_split, local_expert_split, head, device)
     }
 
+    // Arc holds a GPU blob (Metal buffers, not Send/Sync); the Arc is for shared
+    // ownership on one thread, never cross-thread, so the lint does not apply.
+    #[allow(clippy::arc_with_non_send_sync)]
     fn finish_layered_split(
         model_dir: &Path,
         manifest: &DgqManifest,
@@ -257,6 +260,9 @@ impl DgqGpuBlob {
     /// layered pack's gather-copied anonymous mapping) as one or two no-copy
     /// `MTLBuffer`s, splitting at `expert_split` when the blob exceeds the
     /// device's max single-buffer length.
+    // Arc holds a GPU blob (Metal buffers, not Send/Sync); the Arc is for shared
+    // ownership on one thread, never cross-thread, so the lint does not apply.
+    #[allow(clippy::arc_with_non_send_sync)]
     fn wrap_mmap(
         file: Option<File>,
         mmap: Mmap,
@@ -1161,7 +1167,7 @@ mod q4_gpu_tests {
         let k = q4.in_dim;
         let n = q4.out_dim;
         let a: Vec<f32> = (0..m * k)
-            .map(|i| ((i as f32 * 0.0009).sin() * 0.03 + (i % 17) as f32 * 0.0001))
+            .map(|i| (i as f32 * 0.0009).sin() * 0.03 + (i % 17) as f32 * 0.0001)
             .collect();
         let f32_w = store.tensor_f32(tensor).expect("dequant");
         let mut cpu_out = vec![0.0f32; m * n];

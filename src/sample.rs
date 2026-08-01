@@ -290,8 +290,10 @@ pub fn denoise_steps_completed(max_steps: usize, cur_step: usize) -> u32 {
 
 /// Build sampler config for a run; `no_early_stop` forces all `steps` denoise iterations.
 pub fn sampler_for_steps(steps: usize, no_early_stop: bool) -> SamplerConfig {
-    let mut cfg = SamplerConfig::default();
-    cfg.max_denoising_steps = steps.max(1);
+    let mut cfg = SamplerConfig {
+        max_denoising_steps: steps.max(1),
+        ..SamplerConfig::default()
+    };
     if no_early_stop {
         cfg.confidence_threshold = f32::MAX;
         cfg.stability_threshold = usize::MAX;
@@ -658,9 +660,9 @@ impl StableConfidentStopper {
             return true;
         }
 
-        let plateau_stop = self.accept_plateau >= self.accept_plateau_threshold as u32
-            && mean_entropy < self.plateau_prefix_mean_max;
-        plateau_stop
+        
+        self.accept_plateau >= self.accept_plateau_threshold as u32
+            && mean_entropy < self.plateau_prefix_mean_max
     }
 }
 
@@ -776,7 +778,7 @@ mod tests {
         let ids = vec![42u32; 256];
         let ent: Vec<f32> = vec![0.05f32; 73]
             .into_iter()
-            .chain(std::iter::repeat(0.12f32).take(256 - 73))
+            .chain(std::iter::repeat_n(0.12f32, 256 - 73))
             .collect();
         let accept = vec![0u32; 256];
         assert!(!stopper.should_stop_with_entropies(&argmax, &ent, &ids, &accept, 1));
@@ -793,7 +795,7 @@ mod tests {
         let eos = 1u32;
         let mut ids = vec![42u32; 12];
         ids.push(eos);
-        ids.extend(std::iter::repeat(eos).take(4));
+        ids.extend(std::iter::repeat_n(eos, 4));
         let mut ent = vec![0.001f32; 17];
         for e in ent.iter_mut().skip(13) {
             *e = 2.0;
@@ -842,8 +844,8 @@ mod tests {
         assert!(!early_stop_allowed(2, &degenerate));
 
         let mut sparse = vec![PAD_TOKEN_ID; 256];
-        for i in 0..4 {
-            sparse[i] = 42;
+        for s in sparse.iter_mut().take(4) {
+            *s = 42;
         }
         assert!(!early_stop_allowed(2, &sparse));
         assert!(early_stop_allowed(MIN_EARLY_STOP_STEPS, &sparse));

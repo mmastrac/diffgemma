@@ -636,6 +636,7 @@ pub fn run_step_kv_parity(
 }
 
 #[cfg(test)]
+#[allow(dead_code)] // KV-parity audit harness, run manually when chasing MoE divergence
 /// Compare monolithic b4 KV from encoder prefill with CPU MoE vs grouped GPU MoE (same dense path).
 pub fn run_encoder_moe_kv_parity(
     model_dir: &Path,
@@ -648,7 +649,7 @@ pub fn run_encoder_moe_kv_parity(
             "encoder moe kv parity requires at least one token",
         ));
     }
-    let layers = layers.max(1).min(N_LAYERS);
+    let layers = layers.clamp(1, N_LAYERS);
     let store = DgqStore::open(model_dir)?;
     let layout = build_layout(&build_offsets_from_store(&store), max_seq);
     let ctx = MetalContext::new()?;

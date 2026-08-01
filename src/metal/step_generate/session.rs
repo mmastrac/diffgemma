@@ -60,6 +60,13 @@ pub(crate) fn kv_truncate_needs_ring_rebuild(
 /// A saved KV position captured by [`StepGenerateSession::checkpoint`] and
 /// restored by [`StepGenerateSession::rollback_to`]. Plain values (no borrow of
 /// the session), so a conversation manager can hold one across turns.
+///
+/// Parked KV-rewind scaffolding: the checkpoint/rollback pair is the primitive
+/// the conversation manager would use to drop `thought`-channel reasoning from
+/// persisted context, but no production caller is wired to it yet. Kept (rather
+/// than deleted) because it is the tested, ring-wrap-correct primitive for that
+/// path; see the `checkpoint`/`rollback_to` docs below.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KvCheckpoint {
     kv_len: u32,
@@ -173,6 +180,7 @@ impl StepGenerateSession {
     /// overwritten by absolute positions `≥ ring` and truncating `kv_len` alone
     /// would leave those positions with the wrong K/V (serve finalize repro:
     /// aborted long write → truncate → next turn alpha-soup).
+    #[allow(dead_code)] // parked: see KvCheckpoint
     pub fn checkpoint(&self) -> KvCheckpoint {
         KvCheckpoint {
             kv_len: self.rt.read_params().kv_len,
@@ -204,6 +212,7 @@ impl StepGenerateSession {
     /// everything causally appended since (see [`checkpoint`](Self::checkpoint)).
     /// The checkpoint must not be ahead of the current KV — a stale checkpoint
     /// from a longer past state is ignored (clamped) rather than trusted.
+    #[allow(dead_code)] // parked: see KvCheckpoint
     pub fn rollback_to(&mut self, cp: &KvCheckpoint) -> Result<(), Error> {
         let old = self.kv_valid_tokens.len();
         let tokens = cp.tokens.min(old);
@@ -381,6 +390,7 @@ impl StepGenerateSession {
 
     /// TEST-ONLY: selective scrub (see `StepRuntime::debug_scrub_kv_parts`).
     #[cfg(test)]
+    #[allow(dead_code)] // diagnostic probe kept alongside scrub_kv_for_test
     pub(crate) fn scrub_kv_parts_for_test(&mut self, monolithic: bool, side: bool) {
         self.reset_kv();
         self.rt.debug_scrub_kv_parts(monolithic, side);

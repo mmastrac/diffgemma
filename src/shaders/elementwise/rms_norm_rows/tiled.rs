@@ -238,9 +238,26 @@ fn gpu_tiled(f: &Fixture, variant: KernelVariant, tiled: TiledVariant) -> Result
         .collect())
 }
 
+/// Manifest registration; collected in common/manifest.rs::MANIFEST.
+pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
+    name: "rms_norm_rows_tiled",
+    entry: "rms_norm_rows_tiled",
+    quant_formats: &[crate::shaders::variant::QuantFormat::Q4Affine],
+    fc: &[(4, "K_IN_DTYPE")],
+    variants: crate::shaders::manifest::KernelVariants::RmsNormRowsTiled {
+        rows: &[
+            crate::shaders::manifest::RmsNormRowsTiledVariant {
+                in_dtype: crate::shaders::variant::ElemDtype::F32,
+            },
+            crate::shaders::manifest::RmsNormRowsTiledVariant {
+                in_dtype: crate::shaders::variant::ElemDtype::Half,
+            },
+        ],
+    },
+};
+
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::kernel_oracle_matrix;
 
     kernel_oracle_matrix! {
@@ -279,21 +296,3 @@ mod tests {
         min_cos = 0.9999,
     }
 }
-
-/// Manifest registration; collected in common/manifest.rs::MANIFEST.
-pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
-    name: "rms_norm_rows_tiled",
-    entry: "rms_norm_rows_tiled",
-    quant_formats: &[crate::shaders::variant::QuantFormat::Q4Affine],
-    fc: &[(4, "K_IN_DTYPE")],
-    variants: crate::shaders::manifest::KernelVariants::RmsNormRowsTiled {
-        rows: &[
-            crate::shaders::manifest::RmsNormRowsTiledVariant {
-                in_dtype: crate::shaders::variant::ElemDtype::F32,
-            },
-            crate::shaders::manifest::RmsNormRowsTiledVariant {
-                in_dtype: crate::shaders::variant::ElemDtype::Half,
-            },
-        ],
-    },
-};
