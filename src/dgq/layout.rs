@@ -412,9 +412,11 @@ impl TensorClass {
             // kernel. Raw/q8 experts would fall back to the scalar per-expert
             // kernel, which AGENTS.md documents as a probe/oracle surface
             // only — not a production path — so they are excluded here.
-            Self::ExpertsGateUp | Self::ExpertsDown => {
-                &[QuantKind::Q4Block, QuantKind::Q6Block, QuantKind::Nvfp4Block]
-            }
+            Self::ExpertsGateUp | Self::ExpertsDown => &[
+                QuantKind::Q4Block,
+                QuantKind::Q6Block,
+                QuantKind::Nvfp4Block,
+            ],
             // Dense-linear GEMM: raw/q8/q4/nvfp4 all have a compiled kernel
             // at these (n,k) shapes. q6 does not (block-sparse/experts-only
             // dequant, never wired into the dense-linear kernel body).
@@ -580,9 +582,9 @@ pub fn validate_format_dims(name: &str, shape: &[i64], kind: QuantKind) -> Resul
             Ok(())
         }
         QuantKind::Q4Block | QuantKind::Q6Block => {
-            let k = *shape
-                .last()
-                .ok_or_else(|| Error::Config(format!("{name}: q4/q6 requires a non-scalar tensor")))?;
+            let k = *shape.last().ok_or_else(|| {
+                Error::Config(format!("{name}: q4/q6 requires a non-scalar tensor"))
+            })?;
             if k % GROUP_SIZE as i64 != 0 {
                 return Err(Error::Config(format!(
                     "{name}: {} requires K (last dim, {k}) to be a multiple of {GROUP_SIZE}",
@@ -592,9 +594,9 @@ pub fn validate_format_dims(name: &str, shape: &[i64], kind: QuantKind) -> Resul
             Ok(())
         }
         QuantKind::Nvfp4Block => {
-            let k = *shape
-                .last()
-                .ok_or_else(|| Error::Config(format!("{name}: nvfp4 requires a non-scalar tensor")))?;
+            let k = *shape.last().ok_or_else(|| {
+                Error::Config(format!("{name}: nvfp4 requires a non-scalar tensor"))
+            })?;
             if k % NVFP4_GROUP_SIZE as i64 != 0 {
                 return Err(Error::Config(format!(
                     "{name}: nvfp4 requires K (last dim, {k}) to be a multiple of {NVFP4_GROUP_SIZE}"
@@ -748,7 +750,10 @@ mod tests {
         let json = serde_json::to_string_pretty(&m).expect("serialize");
         let back: DgqManifest = serde_json::from_str(&json).expect("deserialize");
         assert!(back.is_layered());
-        assert_eq!(back.base_model.as_ref().unwrap().repo, m.base_model.unwrap().repo);
+        assert_eq!(
+            back.base_model.as_ref().unwrap().repo,
+            m.base_model.unwrap().repo
+        );
         assert_eq!(back.external_files.len(), 1);
         match &back.tensors[1].meta.source {
             Some(TensorSource::External { file, offset }) => {
@@ -870,7 +875,10 @@ mod tests {
             h
         };
         let count = |h: &[(QuantKind, usize)], k: QuantKind| {
-            h.iter().find(|(kk, _)| *kk == k).map(|(_, n)| *n).unwrap_or(0)
+            h.iter()
+                .find(|(kk, _)| *kk == k)
+                .map(|(_, n)| *n)
+                .unwrap_or(0)
         };
 
         // Base q4 (no overrides): 60 expert stacks q4_block (30 gate_up + 30
@@ -918,7 +926,14 @@ mod tests {
     /// message, never silently ignored; unknown classes are also rejected.
     #[test]
     fn locked_classes_rejected_with_reason() {
-        for locked in ["embed", "embed_tokens", "router", "norms", "norm", "layer_scalar"] {
+        for locked in [
+            "embed",
+            "embed_tokens",
+            "router",
+            "norms",
+            "norm",
+            "layer_scalar",
+        ] {
             let err = parse_tensor_class(locked).expect_err("locked class must be rejected");
             let msg = err.to_string();
             assert!(
@@ -952,9 +967,21 @@ mod tests {
     /// block-sparse expert classes accept it.
     #[test]
     fn class_supported_formats_excludes_unsupported_combos() {
-        assert!(!TensorClass::Attn.supported_formats().contains(&QuantKind::Q6Block));
-        assert!(!TensorClass::Dense.supported_formats().contains(&QuantKind::Q6Block));
-        assert!(!TensorClass::Sc.supported_formats().contains(&QuantKind::Q6Block));
+        assert!(
+            !TensorClass::Attn
+                .supported_formats()
+                .contains(&QuantKind::Q6Block)
+        );
+        assert!(
+            !TensorClass::Dense
+                .supported_formats()
+                .contains(&QuantKind::Q6Block)
+        );
+        assert!(
+            !TensorClass::Sc
+                .supported_formats()
+                .contains(&QuantKind::Q6Block)
+        );
         assert!(
             TensorClass::ExpertsGateUp
                 .supported_formats()
@@ -966,6 +993,10 @@ mod tests {
                 .contains(&QuantKind::Raw),
             "raw experts would fall back to the scalar per-expert kernel (probe/oracle only)"
         );
-        assert!(TensorClass::Vision.supported_formats().contains(&QuantKind::Q6Block));
+        assert!(
+            TensorClass::Vision
+                .supported_formats()
+                .contains(&QuantKind::Q6Block)
+        );
     }
 }

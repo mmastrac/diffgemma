@@ -211,7 +211,11 @@ struct Ran {
 /// stdout/stderr are drained on their own threads: polling `try_wait` while a
 /// child fills a pipe buffer deadlocks, which would turn the timeout this
 /// function exists to enforce into the hang it exists to prevent.
-fn run_capture(cmd: &mut Command, stdin_data: Option<&str>, timeout: Duration) -> std::io::Result<Ran> {
+fn run_capture(
+    cmd: &mut Command,
+    stdin_data: Option<&str>,
+    timeout: Duration,
+) -> std::io::Result<Ran> {
     cmd.stdin(if stdin_data.is_some() {
         Stdio::piped()
     } else {
@@ -429,7 +433,12 @@ pub(crate) fn run_probes(
     let root = scratch_root();
     if let Err(e) = std::fs::create_dir_all(&root) {
         eprintln!("programmatic: cannot create {}: {e}", root.display());
-        return (counts, 0, probes.len(), probes.iter().map(|p| p.id.clone()).collect());
+        return (
+            counts,
+            0,
+            probes.len(),
+            probes.iter().map(|p| p.id.clone()).collect(),
+        );
     }
 
     for (pi, p) in probes.iter().enumerate() {
@@ -490,7 +499,10 @@ pub(crate) fn run_probes(
                     show(0..lines.len());
                 } else {
                     show(0..SOURCE_PREVIEW_LINES);
-                    println!("      ... {} line(s) elided ...", lines.len() - SOURCE_PREVIEW_LINES * 2);
+                    println!(
+                        "      ... {} line(s) elided ...",
+                        lines.len() - SOURCE_PREVIEW_LINES * 2
+                    );
                     show(lines.len() - SOURCE_PREVIEW_LINES..lines.len());
                 }
                 continue;
@@ -643,10 +655,7 @@ mod tests {
             }
         };
 
-        assert_eq!(
-            judge("good", "IFS=_; echo \"$*\""),
-            CaseOutcome::Pass,
-        );
+        assert_eq!(judge("good", "IFS=_; echo \"$*\""), CaseOutcome::Pass,);
         assert_eq!(
             judge("wrong", "echo \"$*\""),
             CaseOutcome::WrongOutput,
@@ -666,14 +675,19 @@ mod tests {
         let root = scratch_root();
         let d = root.join("exit");
         std::fs::create_dir_all(&d).unwrap();
-        let built = build(ProgLang::Bash, "echo hello\nexit 42", &d).unwrap().unwrap();
+        let built = build(ProgLang::Bash, "echo hello\nexit 42", &d)
+            .unwrap()
+            .unwrap();
         let want = |exit| ProgCase {
             args: Vec::new(),
             stdin: None,
             stdout: "hello".into(),
             exit,
         };
-        assert_eq!(run_case(&built, &want(42), &d).unwrap().0, CaseOutcome::Pass);
+        assert_eq!(
+            run_case(&built, &want(42), &d).unwrap().0,
+            CaseOutcome::Pass
+        );
         assert_eq!(
             run_case(&built, &want(0), &d).unwrap().0,
             CaseOutcome::WrongOutput
@@ -687,7 +701,9 @@ mod tests {
         let root = scratch_root();
         let d = root.join("hang");
         std::fs::create_dir_all(&d).unwrap();
-        let built = build(ProgLang::Bash, "while true; do :; done", &d).unwrap().unwrap();
+        let built = build(ProgLang::Bash, "while true; do :; done", &d)
+            .unwrap()
+            .unwrap();
         let case = ProgCase {
             args: Vec::new(),
             stdin: None,
@@ -739,11 +755,11 @@ mod tests {
         .unwrap();
 
         let replies = [
-            "echo \"$1\"",                     // correct for both cases
-            "echo \"$1\"",                     // correct for case 0 only
-            "if [ 1 -eq 1 ]; then\necho x",    // unterminated -> compile_fail
-            "```bash\necho hi\n```",           // correct, but fenced
-            "echo hi",                         // correct, but over the budget
+            "echo \"$1\"",                  // correct for both cases
+            "echo \"$1\"",                  // correct for case 0 only
+            "if [ 1 -eq 1 ]; then\necho x", // unterminated -> compile_fail
+            "```bash\necho hi\n```",        // correct, but fenced
+            "echo hi",                      // correct, but over the budget
         ];
         let mut n = 0usize;
         let mut fake = |_: &str| -> Result<(usize, String), crate::Error> {
@@ -790,7 +806,9 @@ mod tests {
         let e = root.join("deaf");
         std::fs::create_dir_all(&d).unwrap();
         std::fs::create_dir_all(&e).unwrap();
-        let counter = build(ProgLang::Bash, "wc -l | tr -d ' '", &d).unwrap().unwrap();
+        let counter = build(ProgLang::Bash, "wc -l | tr -d ' '", &d)
+            .unwrap()
+            .unwrap();
         let case = ProgCase {
             args: Vec::new(),
             stdin: Some("a\nb\nc\n".into()),

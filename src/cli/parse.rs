@@ -738,12 +738,14 @@ pub(crate) fn parse_cli() -> Cli {
         }
         Some("download") => Command::Download {
             // Default repo/dest mirror the model card; -o overrides the target.
-            repo: download_repo.unwrap_or_else(|| {
-                crate::dgq::hf_resolve::DEFAULT_MODEL_REPO.to_string()
-            }),
+            repo: download_repo
+                .unwrap_or_else(|| crate::dgq::hf_resolve::DEFAULT_MODEL_REPO.to_string()),
             revision: download_revision,
             dest: output_dir.unwrap_or_else(|| {
-                PathBuf::from(format!("model/{}", crate::dgq::hf_resolve::DEFAULT_MODEL_NAME))
+                PathBuf::from(format!(
+                    "model/{}",
+                    crate::dgq::hf_resolve::DEFAULT_MODEL_NAME
+                ))
             }),
             force: download_force,
             jobs: download_jobs,

@@ -127,13 +127,13 @@ fn kv_lineage_alignment_vs_chunkcount_sweep() {
     // total 2000 < ring 4096: no wrap anywhere. Resume aligned vs not,
     // delta spanning one chunk vs two.
     let cases = [
-        (2000usize, 256usize),  // aligned resume 1744? no: 1744%256=208
-        (2048, 256),            // resume 1792 = 7*256 ALIGNED, 1 chunk
-        (2048, 512),            // resume 1536 ALIGNED, 2 chunks
-        (2000, 200),            // resume 1800 misaligned, 1 chunk
-        (2000, 300),            // resume 1700 misaligned, 2 chunks
-        (2000, 257),            // resume 1743 misaligned, 2 chunks (just over)
-        (2000, 255),            // resume 1745 misaligned, 1 chunk (just under)
+        (2000usize, 256usize), // aligned resume 1744? no: 1744%256=208
+        (2048, 256),           // resume 1792 = 7*256 ALIGNED, 1 chunk
+        (2048, 512),           // resume 1536 ALIGNED, 2 chunks
+        (2000, 200),           // resume 1800 misaligned, 1 chunk
+        (2000, 300),           // resume 1700 misaligned, 2 chunks
+        (2000, 257),           // resume 1743 misaligned, 2 chunks (just over)
+        (2000, 255),           // resume 1745 misaligned, 1 chunk (just under)
     ];
     for (total, delta) in cases {
         let offset = total - delta;
@@ -187,8 +187,9 @@ fn kv_lineage_fork_position_map() {
         use objc2_metal::MTLBuffer as _;
         let buf = s.kv_buffer_for_test();
         let layout = s.layout_for_test();
-        let src =
-            unsafe { std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, buf.length()) };
+        let src = unsafe {
+            std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, buf.length())
+        };
         (0..N_LAYERS)
             .map(|i| {
                 let l = &layout.layers[i];
@@ -269,7 +270,11 @@ fn kv_lineage_fork_position_map() {
             eprintln!(
                 "fork-layers layer{li:2} ({}, scanned [{lo},{hi})): K rows differ={k_diff} \
                  V rows differ={v_diff} first_diff_pos={first_diff:?} max|delta|={max_abs:.6}",
-                if l.kv_ring_mask != 0 { "ring" } else { "linear" },
+                if l.kv_ring_mask != 0 {
+                    "ring"
+                } else {
+                    "linear"
+                },
             );
         }
     }
@@ -299,7 +304,11 @@ fn kv_lineage_fork_position_map() {
         }
         eprintln!(
             "fork-map layer{li:2} ({}, window=[{lo},{hi})): {} differing run(s) {:?}",
-            if l.kv_ring_mask != 0 { "ring" } else { "linear" },
+            if l.kv_ring_mask != 0 {
+                "ring"
+            } else {
+                "linear"
+            },
             runs.len(),
             &runs[..runs.len().min(6)],
         );
@@ -374,7 +383,11 @@ fn kv_lineage_fork_attention_bisect() {
         eprintln!(
             "attn-bisect {:38}: {}",
             label,
-            if fresh == two { "OK   <-- suspect" } else { "FORK" }
+            if fresh == two {
+                "OK   <-- suspect"
+            } else {
+                "FORK"
+            }
         );
     }
 }
@@ -430,7 +443,9 @@ fn unaligned_matrix(batch: Option<bool>) {
             (offset + delta) % ring,
         );
         if fresh != two_path {
-            failures.push(format!("total={total} delta={delta} resume={offset} ({why})"));
+            failures.push(format!(
+                "total={total} delta={delta} resume={offset} ({why})"
+            ));
         }
     }
     assert!(
@@ -503,18 +518,13 @@ fn q8_ring_wrap_divergence_probe() {
     /// Per-layer classification of the first `n` slots' K and V rows.
     /// A q8 row is DEAD when every code is -127 (the NaN signature); it is
     /// UNWRITTEN when the row is still all zero bytes.
-    fn classify(
-        session: &StepGenerateSession,
-        n: usize,
-        layers: &[usize],
-        label: &str,
-        q8: bool,
-    ) {
+    fn classify(session: &StepGenerateSession, n: usize, layers: &[usize], label: &str, q8: bool) {
         use objc2_metal::MTLBuffer as _;
         let layout = *session.layout_for_test();
         let buf = session.kv_buffer_for_test();
-        let src =
-            unsafe { std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, buf.length()) };
+        let src = unsafe {
+            std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, buf.length())
+        };
         let fmt = if q8 {
             crate::shaders::kv_quant::KvFormat::Q8
         } else {
@@ -618,15 +628,16 @@ fn q8_ring_wrap_divergence_probe() {
         fl.kv.q8_override = Some(true);
         let _g = crate::flags::install_for_test(fl);
         let (mut s, _) = StepGenerateSession::open(&dir, &cfg(), None).expect("q8 session");
-        let fp = |s: &mut StepGenerateSession, scrub: bool, build: &dyn Fn(&mut StepGenerateSession)| {
-            if scrub {
-                s.scrub_kv_for_test();
-            } else {
-                s.reset_kv();
-            }
-            build(s);
-            s.live_kv_fingerprint()
-        };
+        let fp =
+            |s: &mut StepGenerateSession, scrub: bool, build: &dyn Fn(&mut StepGenerateSession)| {
+                if scrub {
+                    s.scrub_kv_for_test();
+                } else {
+                    s.reset_kv();
+                }
+                build(s);
+                s.live_kv_fingerprint()
+            };
         let fresh = |s: &mut StepGenerateSession| {
             s.extend_kv(&ids).expect("fresh");
         };

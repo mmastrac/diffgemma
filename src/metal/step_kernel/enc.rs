@@ -274,9 +274,8 @@ impl StepEnc<'_> {
         n_total: u32,
     ) -> Result<(), Error> {
         debug_assert!(segs.len() <= STACKED_SEG_MAX, "too many stacked segments");
-        let ps = crate::shaders::gemm_tunable::stacked_pipeline_for(
-            self.ctx, n_total, k, fmt, segs,
-        )?;
+        let ps =
+            crate::shaders::gemm_tunable::stacked_pipeline_for(self.ctx, n_total, k, fmt, segs)?;
         self.sink_set_pipeline(ps.as_ref());
         self.sink_set_buffer(&self.bufs.arena, x_off as usize, 0);
         self.sink_set_buffer(&self.bufs.arena, 0, 1);
@@ -1638,10 +1637,9 @@ impl StepEnc<'_> {
     ) -> Result<(), Error> {
         let l = &layout.layers[layer];
         if stacked {
-            let fmt = self
-                .attn_format
-                .block_format()
-                .ok_or(Error::Format("dispatch_qkv_gemms: stacked requires a block attn format"))?;
+            let fmt = self.attn_format.block_format().ok_or(Error::Format(
+                "dispatch_qkv_gemms: stacked requires a block attn format",
+            ))?;
             let (segs, n_total) = qkv_stacked_segments(l, self.arena());
             self.gemm_q4_stacked(
                 fmt,

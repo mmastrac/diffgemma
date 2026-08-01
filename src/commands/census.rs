@@ -217,9 +217,9 @@ impl Metrics {
 
 /// `NAME:KEY=VAL,KEY=VAL` (the override list may be empty: `base:`).
 fn parse_arm(spec: &str) -> Result<Arm, String> {
-    let (name, rest) = spec
-        .split_once(':')
-        .ok_or_else(|| format!("arm {spec:?} must be NAME:KEY=VAL[,KEY=VAL...] (use NAME: for no overrides)"))?;
+    let (name, rest) = spec.split_once(':').ok_or_else(|| {
+        format!("arm {spec:?} must be NAME:KEY=VAL[,KEY=VAL...] (use NAME: for no overrides)")
+    })?;
     if name.is_empty() {
         return Err(format!("arm {spec:?} has an empty name"));
     }
@@ -257,7 +257,9 @@ fn parse_gate(spec: &str) -> Result<Gate, String> {
                 } else if f.is_empty() {
                     1.0
                 } else {
-                    return Err(format!("gate {spec:?}: expected `baseline` or `baseline*N`"));
+                    return Err(format!(
+                        "gate {spec:?}: expected `baseline` or `baseline*N`"
+                    ));
                 };
                 (true, factor)
             } else {
@@ -275,7 +277,9 @@ fn parse_gate(spec: &str) -> Result<Gate, String> {
             });
         }
     }
-    Err(format!("gate {spec:?} must be METRIC<OP>VALUE (<=, >=, ==, <, >)"))
+    Err(format!(
+        "gate {spec:?} must be METRIC<OP>VALUE (<=, >=, ==, <, >)"
+    ))
 }
 
 fn cmp_ok(op: &str, lhs: f64, rhs: f64) -> bool {
@@ -321,7 +325,11 @@ fn append_run_summary(path: &Path, out: &super::smoketest::SmokeOutcome) {
         obj.insert("absence_ok".into(), sf.absence_ok.into());
         obj.insert("absence_total".into(), sf.absence_total.into());
     }
-    match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         Ok(mut f) => {
             let _ = writeln!(f, "{rec}");
         }
@@ -392,8 +400,15 @@ fn scan_trace(path: &Path, tau: f32) -> Metrics {
             .min(argmax.len());
         m.blocks += 1;
         m.committed_rows += kept as u64;
-        m.steps += rec.get("steps").and_then(serde_json::Value::as_u64).unwrap_or(0);
-        if rec.get("conf_trim_row").map(|v| !v.is_null()).unwrap_or(false) {
+        m.steps += rec
+            .get("steps")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if rec
+            .get("conf_trim_row")
+            .map(|v| !v.is_null())
+            .unwrap_or(false)
+        {
             m.trims += 1;
         }
         for i in 0..kept {
@@ -428,7 +443,11 @@ fn analyze_dir(dir: &Path, tau: f32) -> BTreeMap<(String, String), Metrics> {
         .collect();
     files.sort();
     for f in files {
-        let stem = f.file_stem().unwrap_or_default().to_string_lossy().to_string();
+        let stem = f
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         let mut parts = stem.split('.');
         let arm = parts.next().unwrap_or("?").to_string();
         let battery = parts.next().unwrap_or("all").to_string();
@@ -474,7 +493,15 @@ pub(crate) fn run_census_cmd(
         // Traces carry no pass/fail (that is the battery's verdict), so a
         // `passed` gate is meaningless here; report and gate on counts.
         let have_verdicts = results.values().any(|m| m.summaries > 0);
-        return report(&results, &gates, baseline, out_dir, tau, seeds, have_verdicts);
+        return report(
+            &results,
+            &gates,
+            baseline,
+            out_dir,
+            tau,
+            seeds,
+            have_verdicts,
+        );
     }
 
     // ---- Parse + VALIDATE everything before any GPU time is spent. -------
@@ -628,8 +655,18 @@ fn report(
     println!();
     println!(
         "{:<12} {:<9} {:>6} {:>7} {:>12} {:>6} {:>5} {:>6} {:>9} {:>7} {:>8} {:>7}",
-        "arm", "battery", "pass", "blocks", "commit_rows", "hard", "dup", "trims",
-        "cont/1k", "retr%", "steps", "retry"
+        "arm",
+        "battery",
+        "pass",
+        "blocks",
+        "commit_rows",
+        "hard",
+        "dup",
+        "trims",
+        "cont/1k",
+        "retr%",
+        "steps",
+        "retry"
     );
     for ((arm, battery), m) in results {
         println!(
@@ -662,7 +699,14 @@ fn report(
         println!();
         println!(
             "{:<12} {:<13} {:>6} {:>6} {:>6} {:>13} {:>13} {:>7} {:>7}",
-            "arm", "battery", "probes", "cases", "pass", "compile_fail", "wrong_output", "pass%",
+            "arm",
+            "battery",
+            "probes",
+            "cases",
+            "pass",
+            "compile_fail",
+            "wrong_output",
+            "pass%",
             "fenced%"
         );
         for ((arm, battery), m) in results.iter().filter(|(_, m)| m.cases > 0) {
@@ -685,7 +729,10 @@ fn report(
     // side: recall means little without the hallucination rate next to it,
     // since a model that answers everything scores well on one and badly on
     // the other.
-    if results.values().any(|m| m.soft_total > 0 || m.absence_total > 0) {
+    if results
+        .values()
+        .any(|m| m.soft_total > 0 || m.absence_total > 0)
+    {
         println!();
         println!(
             "{:<12} {:<13} {:>10} {:>8} {:>12} {:>10}",
@@ -832,7 +879,10 @@ mod tests {
     #[test]
     fn gate_spec_parses_numbers_and_baseline_relatives() {
         let g = parse_gate("contested_per_1k<=0.5").unwrap();
-        assert_eq!((g.metric.as_str(), g.op.as_str(), g.value), ("contested_per_1k", "<=", 0.5));
+        assert_eq!(
+            (g.metric.as_str(), g.op.as_str(), g.value),
+            ("contested_per_1k", "<=", 0.5)
+        );
         assert!(!g.vs_baseline);
         let g = parse_gate("mean_steps<=baseline*1.10").unwrap();
         assert!(g.vs_baseline);
@@ -938,7 +988,11 @@ mod tests {
         let m = scan_trace(&f, 0.9);
         assert_eq!(m.cases, m.prog_pass + m.compile_fail + m.wrong_output);
         assert_eq!(m.get("compile_fail"), Some(3.0));
-        assert_eq!(m.get("wrong_output"), Some(1.0), "distinct from compile_fail");
+        assert_eq!(
+            m.get("wrong_output"),
+            Some(1.0),
+            "distinct from compile_fail"
+        );
         assert_eq!(m.get("prog_pass_pct"), Some(75.0));
         assert_eq!(m.get("fenced_pct"), Some(25.0), "over PROBES, not cases");
         // A battery that ran no cases floors at 0 rather than the 100 that

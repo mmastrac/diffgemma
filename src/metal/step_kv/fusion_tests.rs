@@ -294,7 +294,8 @@ fn e16_fusion_oracle_replay() {
                                 for i in 0..m {
                                     for j in i + 1..m {
                                         let (mut d, mut na, mut nb) = (0f64, 0f64, 0f64);
-                                        #[allow(clippy::needless_range_loop)] // x indexes ks[i] and ks[j] in lockstep
+                                        #[allow(clippy::needless_range_loop)]
+                                        // x indexes ks[i] and ks[j] in lockstep
                                         for x in 0..hd {
                                             d += ks[i][x] * ks[j][x];
                                             na += ks[i][x] * ks[i][x];
@@ -566,7 +567,8 @@ fn e16_fusion_multineedle_oracle() {
                 let b1 = (b0 + r).min(a1);
                 let m = b1 - b0;
                 if m >= 2 {
-                    #[allow(clippy::needless_range_loop)] // hh indexes several parallel per-kv-head arrays
+                    #[allow(clippy::needless_range_loop)]
+                    // hh indexes several parallel per-kv-head arrays
                     for hh in 0..nkv {
                         cand += m;
                         let merge = match resid_tau {
@@ -583,7 +585,8 @@ fn e16_fusion_multineedle_oracle() {
                                 for i in 0..m {
                                     for j in i + 1..m {
                                         let (mut d, mut na, mut nb) = (0f64, 0f64, 0f64);
-                                        #[allow(clippy::needless_range_loop)] // x indexes rs[i] and rs[j] in lockstep
+                                        #[allow(clippy::needless_range_loop)]
+                                        // x indexes rs[i] and rs[j] in lockstep
                                         for x in 0..hd {
                                             d += rs[i][x] * rs[j][x];
                                             na += rs[i][x] * rs[i][x];

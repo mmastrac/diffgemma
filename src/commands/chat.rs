@@ -418,10 +418,16 @@ pub(crate) fn run_chat_cmd(
     // Behind an `Arc<Mutex<>>` so the async suggester can drive the same single
     // GPU queue from its own thread — each `call` is one atomic lock, preserving
     // op→event pairing and the one-op-at-a-time invariant.
-    let pipeline = std::sync::Arc::new(std::sync::Mutex::new(
-        crate::pipeline::Pipeline::spawn(model_dir.to_path_buf(), CHAT_MAX_SEQ, steps),
-    ));
-    match pipeline.lock().unwrap().call(crate::pipeline::PipelineOp::Ping) {
+    let pipeline = std::sync::Arc::new(std::sync::Mutex::new(crate::pipeline::Pipeline::spawn(
+        model_dir.to_path_buf(),
+        CHAT_MAX_SEQ,
+        steps,
+    )));
+    match pipeline
+        .lock()
+        .unwrap()
+        .call(crate::pipeline::PipelineOp::Ping)
+    {
         crate::pipeline::PipelineEvent::Pong => {
             if interactive {
                 println!("ready ({:.1}s)", open_started.elapsed().as_secs_f64());
@@ -474,7 +480,9 @@ pub(crate) fn run_chat_cmd(
                      \x20 to fix: restart chat with a larger window, e.g. `--ctx {}`; or send a \
                      shorter message, `/load` smaller files, or `/exit` and start a fresh session \
                      to drop the accumulated history.",
-                    (prompt_len + metal::CANVAS).next_power_of_two().max(CHAT_MAX_SEQ * 2)
+                    (prompt_len + metal::CANVAS)
+                        .next_power_of_two()
+                        .max(CHAT_MAX_SEQ * 2)
                 );
             }
             history.push(chat_template::ChatTurn::model(String::new()));
@@ -496,11 +504,14 @@ pub(crate) fn run_chat_cmd(
             prompt_len,
         );
         step_cfg.step_observer = Some(stream.observer());
-        let out = match pipeline.lock().unwrap().call(crate::pipeline::PipelineOp::Generate {
-            prompt: prompt.clone(),
-            cfg: Box::new(step_cfg.clone()),
-            label: "chat".into(),
-        }) {
+        let out = match pipeline
+            .lock()
+            .unwrap()
+            .call(crate::pipeline::PipelineOp::Generate {
+                prompt: prompt.clone(),
+                cfg: Box::new(step_cfg.clone()),
+                label: "chat".into(),
+            }) {
             crate::pipeline::PipelineEvent::Generated { out, .. } => *out,
             crate::pipeline::PipelineEvent::Error(err) => {
                 return Err(crate::Error::Pipeline(err));
@@ -624,7 +635,7 @@ pub(crate) fn run_chat_cmd(
         .and_then(|ed| ed.create_external_printer().ok())
         .map(|p| {
             std::sync::Arc::new(std::sync::Mutex::new(
-                Box::new(p) as Box<dyn rustyline::ExternalPrinter + Send>,
+                Box::new(p) as Box<dyn rustyline::ExternalPrinter + Send>
             ))
         });
 
@@ -656,7 +667,11 @@ pub(crate) fn run_chat_cmd(
                     seed: seed.wrapping_add(turn_idx).wrapping_add(0x5_1793),
                     cell: have_editor.then(|| std::sync::Arc::clone(&suggestion_cell)),
                     printer: printer.clone(),
-                    json_sink: if want_json { make_json_sink(true) } else { None },
+                    json_sink: if want_json {
+                        make_json_sink(true)
+                    } else {
+                        None
+                    },
                 };
                 task = Some(suggester.spawn(history.clone(), turn_idx));
             }
@@ -803,9 +818,15 @@ mod tests {
             "summarize ALPHA then BETA"
         );
         // Same marker used twice expands each time.
-        assert_eq!(expand_file_markers("$$file1$$ $$file1$$", &files), "ALPHA ALPHA");
+        assert_eq!(
+            expand_file_markers("$$file1$$ $$file1$$", &files),
+            "ALPHA ALPHA"
+        );
         // An unloaded slot survives as plain text rather than disappearing.
-        assert_eq!(expand_file_markers("see $$file9$$", &files), "see $$file9$$");
+        assert_eq!(
+            expand_file_markers("see $$file9$$", &files),
+            "see $$file9$$"
+        );
         // No markers, no files: passthrough.
         assert_eq!(expand_file_markers("plain question", &[]), "plain question");
     }

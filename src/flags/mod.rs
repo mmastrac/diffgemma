@@ -117,7 +117,9 @@ impl EnvReader<'_> {
     /// `DGQ_PREFIX_EXIT=1` footgun (1.0 is out of range for a 0..1 threshold,
     /// so it silently DISABLED the very lever the operator was enabling).
     fn ranged_f32(&self, name: &str, default: f32, lo: f32, hi: f32) -> f32 {
-        let Ok(raw) = self.var(name) else { return default };
+        let Ok(raw) = self.var(name) else {
+            return default;
+        };
         match raw.parse::<f32>() {
             Ok(v) if (lo..=hi).contains(&v) => v,
             _ => {
@@ -617,16 +619,10 @@ impl RuntimeConfig {
             sampler: SamplerFlags {
                 freeze: r.on_if_one("DGQ_FREEZE"),
                 denoiser_argmax: r.on_unless_zero("DGQ_DENOISER_ARGMAX"),
-                early_stop_mean_ent: r.ranged_f32(
-                    "DGQ_EARLY_STOP_MEAN_ENT",
-                    0.05,
-                    0.0,
-                    f32::MAX,
-                ),
+                early_stop_mean_ent: r.ranged_f32("DGQ_EARLY_STOP_MEAN_ENT", 0.05, 0.0, f32::MAX),
                 empty_reply_retry: parse_usize("DGQ_EMPTY_REPLY_RETRY", 3) as u32,
                 ws_block_stop: r.on_if_one("DGQ_WS_BLOCK_STOP"),
-                block_commit_max_ent: r
-                    .ranged_f32("DGQ_BLOCK_COMMIT_MAX_ENT", 0.0, 0.0, f32::MAX),
+                block_commit_max_ent: r.ranged_f32("DGQ_BLOCK_COMMIT_MAX_ENT", 0.0, 0.0, f32::MAX),
                 block_commit_retry: r
                     .var("DGQ_BLOCK_COMMIT_RETRY")
                     .ok()
@@ -637,8 +633,7 @@ impl RuntimeConfig {
                     .ok()
                     .and_then(|v| v.parse::<u32>().ok())
                     .filter(|&w| w >= 1),
-                commit_conf_trim: r
-                    .ranged_f32("DGQ_COMMIT_CONF_TRIM", 0.9, 0.0, 1.0),
+                commit_conf_trim: r.ranged_f32("DGQ_COMMIT_CONF_TRIM", 0.9, 0.0, 1.0),
                 commit_conf_hard: r.ranged_f32("DGQ_COMMIT_CONF_HARD", 0.0, 0.0, 1.0),
                 prefix_exit: r
                     // 0.0 disables; the old filter REJECTED 1 and silently
@@ -651,7 +646,8 @@ impl RuntimeConfig {
                 moe_prefill_block_m: r
                     .var("DGQ_MOE_PREFILL_BM")
                     .ok()
-                    .and_then(|v| v.parse::<u32>().ok()).unwrap_or(32),
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(32),
                 attn_mma: r.on_unless_zero("DGQ_ATTN_MMA"),
                 attn_mma_full: r.on_unless_zero("DGQ_ATTN_MMA_FULL"),
                 router_gemm: r.on_unless_zero("DGQ_ROUTER_GEMM"),
@@ -770,7 +766,10 @@ impl RuntimeConfig {
                 trace_pmax_jsonl: r.var("DGQ_TRACE_PMAX_JSONL").ok().filter(|v| !v.is_empty()),
                 token_class_probe: r.var("DGQ_TOKEN_CLASS").ok().filter(|v| !v.is_empty()),
                 delim_check: r.on_if_one("DGQ_DELIM_CHECK"),
-                delim_check_jsonl: r.var("DGQ_DELIM_CHECK_JSONL").ok().filter(|v| !v.is_empty()),
+                delim_check_jsonl: r
+                    .var("DGQ_DELIM_CHECK_JSONL")
+                    .ok()
+                    .filter(|v| !v.is_empty()),
                 moe_route_ref_path: r.var("DGQ_MOE_ROUTE_REF").ok(),
                 engine_layer_dump_path: r.var("DGQ_ENGINE_LAYER_DUMP").ok(),
                 engine_layer_dump_pos: parse_usize("DGQ_ENGINE_LAYER_POS", 129),
@@ -898,7 +897,10 @@ mod validation_tests {
         assert_eq!(cfg.sampler.prefix_exit, 0.0, "value must not be adopted");
         assert_eq!(errs.len(), 1, "{errs:?}");
         assert!(errs[0].contains("DGQ_PREFIX_EXIT"), "{errs:?}");
-        assert!(errs[0].contains("[0, 0.5]"), "range must be stated: {errs:?}");
+        assert!(
+            errs[0].contains("[0, 0.5]"),
+            "range must be stated: {errs:?}"
+        );
         // In range still works, and reports nothing.
         let (cfg, errs) = parse_with(&[("DGQ_PREFIX_EXIT", "0.05")]);
         assert_eq!(cfg.sampler.prefix_exit, 0.05);
@@ -961,10 +963,8 @@ mod arm_tests {
     /// documented default, so arms compose without restating the world.
     #[test]
     fn arm_overrides_only_what_it_names() {
-        let (cfg, errs) = RuntimeConfig::from_pairs(&[(
-            "DGQ_COMMIT_CONF_TRIM".into(),
-            "0.9".into(),
-        )]);
+        let (cfg, errs) =
+            RuntimeConfig::from_pairs(&[("DGQ_COMMIT_CONF_TRIM".into(), "0.9".into())]);
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(cfg.sampler.commit_conf_trim, 0.9);
         // Untouched flags keep their defaults.
@@ -986,7 +986,10 @@ mod arm_tests {
             ("DGQ_FREEZE".into(), "sometimes".into()),
         ]);
         assert_eq!(errs.len(), 2, "{errs:?}");
-        assert!(errs.iter().any(|e| e.contains("DGQ_PREFIX_EXIT")), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.contains("DGQ_PREFIX_EXIT")),
+            "{errs:?}"
+        );
         assert!(errs.iter().any(|e| e.contains("DGQ_FREEZE")), "{errs:?}");
     }
 }

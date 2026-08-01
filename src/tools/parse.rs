@@ -298,11 +298,7 @@ pub fn scan_call_attempts(text: &str) -> Vec<(String, bool)> {
         let after = &text[at + "call:".len()..];
         let Some(brace) = after.find('{') else {
             out.push((
-                after
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .to_string(),
+                after.split_whitespace().next().unwrap_or("").to_string(),
                 false,
             ));
             break;
