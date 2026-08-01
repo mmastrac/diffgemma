@@ -107,12 +107,14 @@ pub fn repack_overlay(opts: RepackOverlayOptions) -> Result<RepackOverlaySummary
                             (size, hash)
                         }
                     };
-                    external_files.entry(shard_name.clone()).or_insert(ExternalFile {
-                        role: ExternalRole::HfSafetensors,
-                        path: shard_name.clone(),
-                        expected_size: size,
-                        header_sha256: Some(hash),
-                    });
+                    external_files
+                        .entry(shard_name.clone())
+                        .or_insert(ExternalFile {
+                            role: ExternalRole::HfSafetensors,
+                            path: shard_name.clone(),
+                            expected_size: size,
+                            header_sha256: Some(hash),
+                        });
                     Some((shard_name, shard.absolute_data_offset(info)))
                 }
                 Some(_) => {
@@ -500,7 +502,11 @@ mod monolithic_roundtrip_tests {
             .join("cafef00d");
         std::fs::create_dir_all(&snapshot_dir).expect("mkdir snapshot");
 
-        let attn = ("model.decoder.layers.0.self_attn.q_proj.weight", vec![4, 8], bf16_payload(32, 1));
+        let attn = (
+            "model.decoder.layers.0.self_attn.q_proj.weight",
+            vec![4, 8],
+            bf16_payload(32, 1),
+        );
         let sc = (
             "model.decoder.self_conditioning.down_proj.weight",
             vec![4, 8],
@@ -529,10 +535,8 @@ mod monolithic_roundtrip_tests {
 
     #[test]
     fn overlay_then_monolithic_matches_plain_quantize() {
-        let root = std::env::temp_dir().join(format!(
-            "dgq-monolithic-roundtrip-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("dgq-monolithic-roundtrip-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let hf_home = root.join("hf_home");
         let (snapshot_dir, base) = build_fixture_snapshot(&hf_home);
@@ -583,8 +587,12 @@ mod monolithic_roundtrip_tests {
 
         // Sample-compare every tensor's bytes against the baseline.
         for entry in baseline_store.tensor_entries() {
-            let want = baseline_store.tensor_bytes(&entry.name).expect("baseline bytes");
-            let got = mono_store.tensor_bytes(&entry.name).expect("monolithic bytes");
+            let want = baseline_store
+                .tensor_bytes(&entry.name)
+                .expect("baseline bytes");
+            let got = mono_store
+                .tensor_bytes(&entry.name)
+                .expect("monolithic bytes");
             assert_eq!(
                 want, got,
                 "tensor {} diverged after overlay -> monolithic round trip",

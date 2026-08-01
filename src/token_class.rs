@@ -59,13 +59,17 @@ impl TokenClassProbe {
 
     fn validate(&self) -> Result<(), Error> {
         if self.w.len() != self.mid.len() {
-            return Err(Error::Runtime("token-class probe: w and mid differ in length"));
+            return Err(Error::Runtime(
+                "token-class probe: w and mid differ in length",
+            ));
         }
         if self.w.is_empty() {
             return Err(Error::Runtime("token-class probe: empty direction"));
         }
         if self.class_names.len() != 2 {
-            return Err(Error::Runtime("token-class probe: expected exactly 2 class names"));
+            return Err(Error::Runtime(
+                "token-class probe: expected exactly 2 class names",
+            ));
         }
         Ok(())
     }
@@ -233,6 +237,9 @@ mod tests {
         assert!(p.validate().is_err(), "w/mid length mismatch");
         let mut p = probe();
         p.class_names.push("tool".into());
-        assert!(p.validate().is_err(), "sign threshold implies exactly 2 classes");
+        assert!(
+            p.validate().is_err(),
+            "sign threshold implies exactly 2 classes"
+        );
     }
 }

@@ -197,7 +197,12 @@ fn verify_downloaded_pack(dest: &Path) -> Result<String, String> {
     if layered {
         base_line = match &manifest.base_model {
             Some(base) => match crate::dgq::hf_resolve::resolve_snapshot_dir(base) {
-                Ok(dir) => format!("\n  base model {}@{} resolved: {}", base.repo, base.revision, dir.display()),
+                Ok(dir) => format!(
+                    "\n  base model {}@{} resolved: {}",
+                    base.repo,
+                    base.revision,
+                    dir.display()
+                ),
                 Err(err) => format!("\n{err}"),
             },
             None => "\n  warning: layered pack has no base_model pin in its manifest".to_string(),
@@ -341,9 +346,7 @@ fn download_file(
             match file_len(&part) {
                 Some(got) if got == expected => {}
                 Some(got) => {
-                    return Err(format!(
-                        "chunk {idx}: got {got} bytes, expected {expected}"
-                    ));
+                    return Err(format!("chunk {idx}: got {got} bytes, expected {expected}"));
                 }
                 None => return Err(format!("chunk {idx}: part missing after fetch")),
             }
@@ -359,11 +362,7 @@ fn download_file(
 /// Start a background fetch of `url` to `dest`, optionally for one inclusive
 /// byte range. `quiet(OnSuccess)` keeps parallel chunk fetches from interleaving
 /// progress bars while still surfacing a failed child's output.
-fn start_fetch(
-    url: &str,
-    dest: &Path,
-    range: Option<(u64, u64)>,
-) -> Result<RequestHandle, String> {
+fn start_fetch(url: &str, dest: &Path, range: Option<(u64, u64)>) -> Result<RequestHandle, String> {
     let mut req = RequestBuilder::new(url)
         .follow_redirects(true)
         .quiet(Quiet::OnSuccess);
@@ -383,13 +382,17 @@ fn part_path(dest: &Path, i: u64) -> PathBuf {
 /// consumed. Parts are 256 MiB; a plain buffered copy is fine.
 fn concat_parts(dest: &Path, parts: &[(PathBuf, u64)]) -> Result<(), String> {
     use std::io::{BufWriter, Write};
-    eprintln!("       assembling {} chunks -> {}", parts.len(), dest.display());
+    eprintln!(
+        "       assembling {} chunks -> {}",
+        parts.len(),
+        dest.display()
+    );
     let out = std::fs::File::create(dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
     let mut writer = BufWriter::with_capacity(8 << 20, out);
     for (part, _) in parts {
-        let mut r = std::fs::File::open(part).map_err(|e| format!("open {}: {e}", part.display()))?;
-        std::io::copy(&mut r, &mut writer)
-            .map_err(|e| format!("copy {}: {e}", part.display()))?;
+        let mut r =
+            std::fs::File::open(part).map_err(|e| format!("open {}: {e}", part.display()))?;
+        std::io::copy(&mut r, &mut writer).map_err(|e| format!("copy {}: {e}", part.display()))?;
     }
     writer.flush().map_err(|e| e.to_string())?;
     drop(writer);
@@ -438,15 +441,13 @@ fn link_or_copy(src: &Path, dst: &Path) -> std::io::Result<&'static str> {
 mod verify_pack_tests {
     use super::*;
     use dgq::layout::{
-        BaseModelRef, BLOB_FILE, DGQ_VERSION_AFFINE, DGQ_VERSION_LAYERED, DgqManifest,
+        BLOB_FILE, BaseModelRef, DGQ_VERSION_AFFINE, DGQ_VERSION_LAYERED, DgqManifest,
         DgqTensorEntry, DgqTensorMeta, MANIFEST_FILE, QuantProfile, TensorSource,
     };
 
     fn scratch_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "dgq-download-verify-{tag}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("dgq-download-verify-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
         dir

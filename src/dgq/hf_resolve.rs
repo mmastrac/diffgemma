@@ -105,7 +105,10 @@ pub fn resolve_model_source(spec: &Path) -> Result<ResolvedModelSource, Error> {
 /// caller only has a shard path). Fails loud with the `hf download` remedy
 /// when the repo has no cached snapshots at all.
 pub fn newest_local_snapshot(repo: &str) -> Result<(PathBuf, String), Error> {
-    let snapshots_dir = hf_home().join("hub").join(repo_folder_name(repo)).join("snapshots");
+    let snapshots_dir = hf_home()
+        .join("hub")
+        .join(repo_folder_name(repo))
+        .join("snapshots");
     let remedy = || {
         Error::Layered(format!(
             "-m {repo}: no local directory by that name, and no cached HF snapshot found \
@@ -168,13 +171,19 @@ fn resolve_default_model_source_in(model_root: &Path) -> Result<ResolvedModelSou
     for name in ["transformer", DEFAULT_MODEL_NAME] {
         let dir = model_root.join(name);
         if dir.is_dir() {
-            return Ok(ResolvedModelSource { dir, repo_pin: None });
+            return Ok(ResolvedModelSource {
+                dir,
+                repo_pin: None,
+            });
         }
     }
 
     // 3: any other local `model/diffgemma-*` pack (name-sorted, deterministic).
     if let Some(dir) = first_local_pack(model_root, "diffgemma-") {
-        return Ok(ResolvedModelSource { dir, repo_pin: None });
+        return Ok(ResolvedModelSource {
+            dir,
+            repo_pin: None,
+        });
     }
 
     // 4: the canonical pack in the HF cache.
@@ -441,8 +450,7 @@ mod tests {
         .0;
         let _guard = crate::flags::install_for_test(cfg);
 
-        let resolved =
-            resolve_model_source(Path::new("acme/widgets")).expect("repo id resolves");
+        let resolved = resolve_model_source(Path::new("acme/widgets")).expect("repo id resolves");
         assert_eq!(resolved.dir, new);
         let pin = resolved.repo_pin.expect("repo pin");
         assert_eq!(pin.repo, "acme/widgets");
@@ -453,7 +461,8 @@ mod tests {
 
     #[test]
     fn resolve_model_source_repo_id_no_cache_gives_remedy() {
-        let hf_home = std::env::temp_dir().join(format!("dgq-resolve-empty-{}", std::process::id()));
+        let hf_home =
+            std::env::temp_dir().join(format!("dgq-resolve-empty-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&hf_home);
         let cfg = crate::flags::RuntimeConfig::from_pairs(&[(
             "DGQ_HF_HOME".to_string(),
@@ -564,11 +573,13 @@ mod tests {
 
     #[test]
     fn default_resolver_scans_hf_cache_for_any_diffgemma() {
-        let root = std::env::temp_dir().join(format!("dgq-default-cache-root-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("dgq-default-cache-root-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("empty model root"); // falls through to cache
 
-        let hf_home = std::env::temp_dir().join(format!("dgq-default-cache-hf-{}", std::process::id()));
+        let hf_home =
+            std::env::temp_dir().join(format!("dgq-default-cache-hf-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&hf_home);
         let snap = hf_home
             .join("hub")
@@ -598,7 +609,8 @@ mod tests {
         let root = std::env::temp_dir().join(format!("dgq-default-empty-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("empty model root");
-        let hf_home = std::env::temp_dir().join(format!("dgq-default-empty-hf-{}", std::process::id()));
+        let hf_home =
+            std::env::temp_dir().join(format!("dgq-default-empty-hf-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&hf_home);
         std::fs::create_dir_all(hf_home.join("hub")).expect("empty hub");
         let cfg = crate::flags::RuntimeConfig::from_pairs(&[(
@@ -612,7 +624,10 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("no default model found"), "{msg}");
         assert!(msg.contains("diffgemma-mps download"), "{msg}");
-        assert!(msg.contains("hf download mmastrac/diffgemma-26b-a4b-it-q4"), "{msg}");
+        assert!(
+            msg.contains("hf download mmastrac/diffgemma-26b-a4b-it-q4"),
+            "{msg}"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&hf_home);

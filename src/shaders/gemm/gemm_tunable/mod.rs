@@ -819,7 +819,11 @@ mod w32_tests {
             let w = gemm_nvfp4::w_nvfp4(&f);
             let a = run_dense(&ctx, &src0, &f.x, &w, f.m, f.n, f.k, QuantFormat::NvFp4);
             let b = run_dense(&ctx, &src1, &f.x, &w, f.m, f.n, f.k, QuantFormat::NvFp4);
-            assert_eq!(a, b, "nvfp4 W32 output differs from byte-load path (k={})", f.k);
+            assert_eq!(
+                a, b,
+                "nvfp4 W32 output differs from byte-load path (k={})",
+                f.k
+            );
         }
     }
 }

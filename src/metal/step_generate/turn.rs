@@ -102,7 +102,6 @@ impl TurnState {
     pub fn new_tokens(&self) -> usize {
         self.sequences.len() - self.prompt_token_ids.len()
     }
-
 }
 
 pub fn generate_with_session(

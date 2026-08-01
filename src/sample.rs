@@ -660,7 +660,6 @@ impl StableConfidentStopper {
             return true;
         }
 
-        
         self.accept_plateau >= self.accept_plateau_threshold as u32
             && mean_entropy < self.plateau_prefix_mean_max
     }

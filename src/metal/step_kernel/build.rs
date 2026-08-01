@@ -151,7 +151,9 @@ pub fn build_step_runtime(
     let sc_kind = store
         .get_entry("model.decoder.self_conditioning.gate_proj.weight")
         .and_then(|e| crate::dgq::layout::parse_quant_kind(&e.meta.kind).ok())
-        .ok_or(Error::Format("missing/unreadable self_conditioning gate_proj kind"))?;
+        .ok_or(Error::Format(
+            "missing/unreadable self_conditioning gate_proj kind",
+        ))?;
     let sc_format = crate::metal::step_quant::DenseWeightFormat::from_kind(sc_kind)?;
 
     // Embed (tied lm_head + SC soft-embed) is q8-per-row on most checkpoints, bf16
@@ -192,7 +194,9 @@ pub fn build_step_runtime(
             QuantFormat::Q4Affine => eprintln!("step-kernel: q4 expert weights"),
             _ => eprintln!("step-kernel: expert weights ({:?})", block_profile.format),
         }
-        eprintln!("step-kernel: attn weights ({attn_format:?}), dense-FFN weights ({dense_format:?})");
+        eprintln!(
+            "step-kernel: attn weights ({attn_format:?}), dense-FFN weights ({dense_format:?})"
+        );
         match block_profile.moe_style() {
             MoeExecutionStyle::BatchedGrouped => {
                 eprintln!("step-kernel: batched grouped MoE");
