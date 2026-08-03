@@ -17,6 +17,7 @@ const CHANNEL_CLOSE: &str = "<channel|>";
 pub enum ChatRole {
     User,
     Model,
+    System,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +37,13 @@ impl ChatTurn {
     pub fn model(content: impl Into<String>) -> Self {
         Self {
             role: ChatRole::Model,
+            content: content.into(),
+        }
+    }
+
+    pub fn system(content: impl Into<String>) -> Self {
+        Self {
+            role: ChatRole::System,
             content: content.into(),
         }
     }
@@ -103,6 +111,7 @@ fn role_name(role: ChatRole) -> &'static str {
     match role {
         ChatRole::User => "user",
         ChatRole::Model => "model",
+        ChatRole::System => "system",
     }
 }
 
@@ -244,6 +253,17 @@ mod tests {
         assert!(formatted.contains("<|turn>model\nHello!<turn|>\n"));
         assert!(formatted.contains("<|turn>user\nTell me more<turn|>\n"));
         assert!(formatted.ends_with("<|turn>model\n<|channel>thought\n<channel|>"));
+    }
+
+    #[test]
+    fn system_prompt_renders_as_a_leading_block() {
+        let Some(tok) = model_tokenizer() else {
+            return;
+        };
+        let turns = [ChatTurn::system("You are a pirate."), ChatTurn::user("Hi")];
+        let plain =
+            tok.decode(&format_chat_token_ids(&tok, &turns, &ChatFormatOptions::default()).unwrap());
+        assert!(plain.contains("<|turn>system\nYou are a pirate.<turn|>"));
     }
 
     #[test]

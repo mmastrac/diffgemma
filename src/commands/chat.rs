@@ -7,6 +7,7 @@ use super::*;
 const SLASH_HELP: &str = "\
 slash commands:
   /help            show this help
+  /prompt <text>   set the system prompt (bare clears it)
   /load <file>     attach a file; expands as $$fileN$$ in your next message
   /private         wipe recall history up to now; recording continues after
   /exit, /quit     end the session (Ctrl-D also exits)";
@@ -299,6 +300,21 @@ fn expand_file_markers(line: &str, loaded_files: &[String]) -> String {
     out
 }
 
+/// History with the `/prompt` system prompt (if any) prepended as a leading
+/// System turn, the shape both prompt builders expect for a system message.
+#[cfg(target_os = "macos")]
+fn prepend_system(
+    system: Option<&str>,
+    history: &[chat_template::ChatTurn],
+) -> Vec<chat_template::ChatTurn> {
+    let mut turns = Vec::with_capacity(history.len() + 1);
+    if let Some(s) = system.filter(|s| !s.trim().is_empty()) {
+        turns.push(chat_template::ChatTurn::system(s));
+    }
+    turns.extend_from_slice(history);
+    turns
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn run_chat_cmd(
     model_dir: &std::path::Path,
@@ -453,11 +469,17 @@ pub(crate) fn run_chat_cmd(
 
     let mut history: Vec<chat_template::ChatTurn> = Vec::new();
     let mut turn_idx = 0u64;
+    // System prompt set via `/prompt`; prepended as a leading System turn on
+    // every build. Passed per-call, not captured, so `/prompt` can still mutate
+    // it between turns.
+    let mut system_prompt: Option<String> = None;
 
     let mut run_turn = |history: &mut Vec<chat_template::ChatTurn>,
-                        turn_idx: &mut u64|
+                        turn_idx: &mut u64,
+                        system: Option<&str>|
      -> Result<(), crate::Error> {
-        let prompt = build_chat_prompt_tokens(model_dir, history, raw_prompt)?;
+        let turns = prepend_system(system, history);
+        let prompt = build_chat_prompt_tokens(model_dir, &turns, raw_prompt)?;
         let prompt_len = prompt.len();
         // KV arena is fixed at session open (CHAT_MAX_SEQ); the reply may use
         // the whole remaining context (no artificial cap), or the caller's
@@ -555,7 +577,7 @@ pub(crate) fn run_chat_cmd(
         let first = first.trim();
         if !first.is_empty() {
             history.push(chat_template::ChatTurn::user(first));
-            if let Err(err) = run_turn(&mut history, &mut turn_idx) {
+            if let Err(err) = run_turn(&mut history, &mut turn_idx, system_prompt.as_deref()) {
                 eprintln!("error: {err}");
                 return ExitCode::FAILURE;
             }
@@ -717,6 +739,29 @@ pub(crate) fn run_chat_cmd(
             }
             continue;
         }
+        // `/prompt <text>`: set the system prompt (bare clears it). It prepends a
+        // system turn on every build; setting it mid-conversation applies from
+        // the next message, so it is most useful before the first message.
+        if line == "/prompt" || line.starts_with("/prompt ") {
+            let text = line["/prompt".len()..].trim();
+            if text.is_empty() {
+                system_prompt = None;
+                if !json {
+                    println!("system prompt cleared");
+                }
+            } else {
+                system_prompt = Some(text.to_string());
+                if !json {
+                    let note = if history.is_empty() {
+                        ""
+                    } else {
+                        " (applies from your next message)"
+                    };
+                    println!("system prompt set{note}");
+                }
+            }
+            continue;
+        }
         // `/private`: blow away all recall history up to this point (in-memory
         // and on disk), then keep recording forward. Call it again to wipe again
         // — each invocation is a fresh privacy checkpoint.
@@ -757,7 +802,7 @@ pub(crate) fn run_chat_cmd(
 
         let submitted = expand_file_markers(line, &loaded_files);
         history.push(chat_template::ChatTurn::user(&submitted));
-        if let Err(err) = run_turn(&mut history, &mut turn_idx) {
+        if let Err(err) = run_turn(&mut history, &mut turn_idx, system_prompt.as_deref()) {
             eprintln!("error: {err}");
             return ExitCode::FAILURE;
         }
