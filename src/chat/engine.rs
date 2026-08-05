@@ -50,9 +50,10 @@ fn prefill_conversation(
             },
         )?
     } else {
+        // enable_thinking must match the tool loop's render (always on), or
+        // this prefix would never be reused by the next turn's prompt.
         let messages = chat_turns_to_messages(&turns);
-        let guarded =
-            crate::tools::render_conversation_guarded(&messages, tools_json, false, false);
+        let guarded = crate::tools::render_conversation_guarded(&messages, tools_json, false, true);
         tokenizer.encode_prompt(&guarded).0
     };
     match pipeline
@@ -752,15 +753,12 @@ impl TurnRunner<'_> {
             } else {
                 None
             };
-            // `--show-thinking` (or a `/prethink` seed) opens the thought channel
-            // so the model reasons before it answers; otherwise it answers direct.
-            let thinking = self.show_thinking || think_seed.is_some();
-            let mut guarded = crate::tools::render_conversation_guarded(
-                &messages,
-                self.tools_json,
-                true,
-                thinking,
-            );
+            // The thought channel is always open — the model plans its calls,
+            // exactly as a plain turn always reasons. Displaying the thought
+            // stays behind `--show-thinking` / a `/prethink` seed.
+            let display_thinking = self.show_thinking || think_seed.is_some();
+            let mut guarded =
+                crate::tools::render_conversation_guarded(&messages, self.tools_json, true, true);
             if let Some(s) = think_seed {
                 guarded.push_str("<|channel>thought\n");
                 guarded.push_str(s);
@@ -778,13 +776,13 @@ impl TurnRunner<'_> {
             self.step_cfg.max_new_tokens = self.explicit_cap.map_or(budget, |c| c.min(budget));
             self.step_cfg.seed = self.seed.wrapping_add(turn_idx).wrapping_add(round as u64);
 
-            // Every round streams into the sinks; the live terminal preview
-            // additionally runs on an interactive tty while reasoning shows.
-            let live = self.interactive && thinking;
+            // Every round streams into the sinks; an interactive tty always
+            // gets the live view (spinner, streamed output, thought when
+            // surfaced) — never dead air while a round generates.
             let stream = ChatStream::start(
                 std::sync::Arc::clone(self.tokenizer),
                 self.step_cfg.stop_token_ids.clone(),
-                live,
+                self.interactive,
                 StreamDisplay {
                     show_thinking: self.show_thinking,
                     prethink_seed: think_seed.map(str::to_string),
@@ -800,26 +798,22 @@ impl TurnRunner<'_> {
             let new_tokens = out.token_ids.len().saturating_sub(prompt_len);
             total_tokens += new_tokens;
             total_steps += out.denoise_steps_run;
-            // Direct echo for the interactive display where neither the live
-            // renderer (this round) nor the PlainSink (plain sessions) owns it.
-            let echo = self.interactive && !live;
 
             let new_ids =
                 sample::strip_degenerate_token_ids(out.token_ids.get(prompt_len..).unwrap_or(&[]));
             let (thought, content) = ChannelIds::from_tokenizer(self.tokenizer).settle_tool_reply(
                 self.tokenizer,
-                thinking,
+                true,
                 think_seed.unwrap_or(""),
                 &new_ids,
             );
+            // The thought rides events (and the display) only when surfaced —
+            // hidden reasoning stays hidden, as on a plain turn.
             let thought = thought
                 .as_deref()
                 .map(str::trim)
-                .filter(|t| !t.is_empty())
+                .filter(|t| display_thinking && !t.is_empty())
                 .map(str::to_string);
-            if echo && let Some(t) = &thought {
-                print_think(t);
-            }
 
             // No `call:` attempt at all: this is the final answer.
             let attempts = crate::tools::scan_call_attempts(&content);
@@ -828,13 +822,6 @@ impl TurnRunner<'_> {
                 let secs = started.elapsed().as_secs_f64();
                 let stats = stats_line(total_tokens, total_steps, secs, out.stopped_on_eot);
                 stream.finish(Some(&answer), Some(&stats));
-                if echo {
-                    if answer.is_empty() {
-                        println!("model> (empty response)");
-                    } else {
-                        println!("model> {answer}");
-                    }
-                }
                 self.emit(&ChatEvent::Done {
                     tokens: total_tokens,
                     steps: total_steps,
@@ -861,9 +848,6 @@ impl TurnRunner<'_> {
             );
             let preamble_line = (!preamble.trim().is_empty()).then(|| preamble.trim());
             stream.finish(preamble_line, None);
-            if echo && let Some(p) = preamble_line {
-                println!("model> {p}");
-            }
             // The turn continues into tool execution; `Done` comes later.
             self.emit(&ChatEvent::RoundEnd {
                 round,
