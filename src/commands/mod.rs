@@ -525,6 +525,7 @@ pub(crate) fn dispatch(cli: Cli) -> ExitCode {
             json,
             ctx,
             tools,
+            harness,
             show_thinking,
             stream_output,
         } => run_chat_cmd(
@@ -541,6 +542,7 @@ pub(crate) fn dispatch(cli: Cli) -> ExitCode {
             json,
             ctx,
             tools,
+            harness,
             show_thinking,
             stream_output,
         ),

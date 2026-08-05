@@ -11,12 +11,15 @@
 //! - [`decode`] — the pure decoding core: stable-prefix stabilization over
 //!   per-step canvas snapshots and the token-level thought/answer split.
 //! - [`engine`] — turn production: generation, the tool loop, forced replies.
+//! - [`harness`] — the `--harness` JSON format: a session as a small
+//!   tool-driven application.
 //! - [`render`] — the interactive terminal renderer (viewport pane, spinner),
 //!   a `ChatEvent` consumer.
 
 mod decode;
 pub(crate) mod engine;
 mod event;
+pub(crate) mod harness;
 mod render;
 mod sink;
 
