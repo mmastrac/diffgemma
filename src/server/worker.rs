@@ -596,19 +596,21 @@ impl Worker {
         let tool_mode = needs_tool_rendering(&job.messages, &job.tools);
         let mut mapper = DiffusionStreamMapper::new(
             Arc::clone(&self.tokenizer),
-            self.stop_token_ids.clone(),
-            self.channel_open,
-            self.channel_close,
-            // Quote-parity split only makes sense where `<|"|>` runs are
-            // grammar — tool mode.
-            tool_mode.then_some(self.quote_tok).flatten(),
-            // Stop-skip must MIRROR the engine's stop policy (see
-            // `per_request_cfg`): skipping a quoted stop the engine honors
-            // (or vice versa) would desync stream and turn.
-            crate::flags::continue_past_stop_enabled() && tool_mode,
-            job.enable_thinking,
-            job.emit_drafts,
-            crate::flags::paced_stream_enabled(),
+            MapperConfig {
+                stops: self.stop_token_ids.clone(),
+                channel_open: self.channel_open,
+                channel_close: self.channel_close,
+                // Quote-parity split only applies where `<|"|>` runs are
+                // grammar, which is tool mode.
+                quote: tool_mode.then_some(self.quote_tok).flatten(),
+                // Stop-skip must mirror the engine's stop policy (see
+                // `per_request_cfg`), or skipping a quoted stop the engine
+                // honors (or the reverse) would desync stream and turn.
+                stop_skip_quoted: crate::flags::continue_past_stop_enabled() && tool_mode,
+                thinking: job.enable_thinking,
+                emit_drafts: job.emit_drafts,
+                paced: crate::flags::paced_stream_enabled(),
+            },
         );
         if start_in_thought {
             mapper = mapper.starting_in_thought();

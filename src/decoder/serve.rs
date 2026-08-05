@@ -23,6 +23,20 @@ pub enum WireDelta {
     },
 }
 
+/// Options for a [`DiffusionStreamMapper`], all defaulting to off or none so a
+/// caller sets only what differs from a plain content-only stream.
+#[derive(Default)]
+pub struct MapperConfig {
+    pub stops: Vec<u32>,
+    pub channel_open: Option<u32>,
+    pub channel_close: Option<u32>,
+    pub quote: Option<u32>,
+    pub stop_skip_quoted: bool,
+    pub thinking: bool,
+    pub emit_drafts: bool,
+    pub paced: bool,
+}
+
 pub struct DiffusionStreamMapper<D: TextDecoder> {
     decoder: D,
     /// The shared stable-prefix front end (streak tracking, stop cut, quoted-
@@ -73,35 +87,24 @@ struct Split {
 }
 
 impl<D: TextDecoder> DiffusionStreamMapper<D> {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        decoder: D,
-        stops: Vec<u32>,
-        channel_open: Option<u32>,
-        channel_close: Option<u32>,
-        quote: Option<u32>,
-        stop_skip_quoted: bool,
-        thinking: bool,
-        emit_drafts: bool,
-        paced: bool,
-    ) -> Self {
+    pub fn new(decoder: D, cfg: MapperConfig) -> Self {
         Self {
             decoder,
-            stab: Stabilizer::new(stops, quote, stop_skip_quoted),
+            stab: Stabilizer::new(cfg.stops, cfg.quote, cfg.stop_skip_quoted),
             channels: ChannelIds {
-                open: channel_open,
-                close: channel_close,
-                quote,
+                open: cfg.channel_open,
+                close: cfg.channel_close,
+                quote: cfg.quote,
             },
-            thinking,
-            emit_drafts,
+            thinking: cfg.thinking,
+            emit_drafts: cfg.emit_drafts,
             start_in_thought: false,
             committed_ids: Vec::new(),
             emitted_reasoning: String::new(),
             emitted_content: String::new(),
             last_draft: String::new(),
             ended: false,
-            paced,
+            paced: cfg.paced,
             released_reasoning: 0,
             released_content: 0,
             est_block_steps: 16.0,
@@ -343,6 +346,16 @@ mod tests {
         })
     }
 
+    /// Channels 1/2/4 with thinking on, the common setup for the split tests.
+    fn thinking_cfg() -> MapperConfig {
+        MapperConfig {
+            channel_open: Some(1),
+            channel_close: Some(2),
+            thinking: true,
+            ..Default::default()
+        }
+    }
+
     /// Decoder that surfaces channel specials as their literal markup (like the
     /// real SentencePiece specials), so mid-thought re-opens stay detectable.
     struct ChannelDecoder;
@@ -369,17 +382,7 @@ mod tests {
 
     #[test]
     fn content_only_commits_answer_text() {
-        let mut m = DiffusionStreamMapper::new(
-            FakeDecoder,
-            vec![],
-            None,
-            None,
-            None,
-            false,
-            false,
-            false,
-            false,
-        );
+        let mut m = DiffusionStreamMapper::new(FakeDecoder, MapperConfig::default());
         let hi = [c('H'), c('i')];
         // Not committed yet: no content deltas.
         assert!(m.on_step(&step(1, 1, &hi, false)).is_empty());
@@ -393,14 +396,10 @@ mod tests {
     fn draft_streams_stable_prefix_before_commit() {
         let mut m = DiffusionStreamMapper::new(
             FakeDecoder,
-            vec![],
-            None,
-            None,
-            None,
-            false,
-            false,
-            true,
-            false,
+            MapperConfig {
+                emit_drafts: true,
+                ..Default::default()
+            },
         );
         let hi = [c('H'), c('i')];
         // Streak must reach STABLE_STREAK before the draft shows anything.
@@ -412,22 +411,10 @@ mod tests {
 
     #[test]
     fn thinking_splits_reasoning_from_content() {
-        // channel_open=1, channel_close=2. Canvas: <open> t h o u g h t <close> H i
-        let open = 1u32;
-        let close = 2u32;
-        let mut m = DiffusionStreamMapper::new(
-            FakeDecoder,
-            vec![],
-            Some(open),
-            Some(close),
-            None,
-            false,
-            true,
-            false,
-            false,
-        );
+        // Canvas: <open> t h o u g h t <close> H i
+        let mut m = DiffusionStreamMapper::new(FakeDecoder, thinking_cfg());
         let canvas = [
-            open,
+            1,
             c('t'),
             c('h'),
             c('o'),
@@ -435,7 +422,7 @@ mod tests {
             c('g'),
             c('h'),
             c('t'),
-            close,
+            2,
             c('H'),
             c('i'),
         ];
@@ -449,26 +436,14 @@ mod tests {
     #[test]
     fn thinking_drops_trailing_channel_close_from_content() {
         // Real log shape: <open> ... <close> Answer <close> (extra close before tools).
-        let open = 1u32;
-        let close = 2u32;
-        let mut m = DiffusionStreamMapper::new(
-            FakeDecoder,
-            vec![],
-            Some(open),
-            Some(close),
-            None,
-            false,
-            true,
-            false,
-            false,
-        );
+        let mut m = DiffusionStreamMapper::new(FakeDecoder, thinking_cfg());
         let canvas = [
-            open,
+            1,
             c('x'),
-            close,
+            2,
             c('O'),
             c('k'),
-            close, // must not leak into content
+            2, // must not leak into content
             c('!'),
         ];
         let _ = m.on_step(&step(1, 2, &canvas, true));
@@ -478,32 +453,20 @@ mod tests {
     #[test]
     fn thinking_strips_nested_channel_reopen_from_reasoning() {
         // OpenCode nests a Thought UI when `<|channel>thought` appears mid-reasoning.
-        let open = 1u32;
-        let close = 2u32;
         let thought = 3u32;
-        let mut m = DiffusionStreamMapper::new(
-            ChannelDecoder,
-            vec![],
-            Some(open),
-            Some(close),
-            None,
-            false,
-            true,
-            false,
-            false,
-        );
+        let mut m = DiffusionStreamMapper::new(ChannelDecoder, thinking_cfg());
         // <open> thought \n Hi <open> thought \n ! <close> A
         let canvas = [
-            open,
+            1,
             thought,
             c('\n'),
             c('H'),
             c('i'),
-            open,
+            1,
             thought,
             c('\n'),
             c('!'),
-            close,
+            2,
             c('A'),
         ];
         let _ = m.on_step(&step(1, 2, &canvas, true));
@@ -532,19 +495,7 @@ mod tests {
     /// follows emission: with no thought span, everything is content.
     #[test]
     fn thinking_bare_reply_without_thought_span_is_content() {
-        let open = 1u32;
-        let close = 2u32;
-        let mut m = DiffusionStreamMapper::new(
-            FakeDecoder,
-            vec![],
-            Some(open),
-            Some(close),
-            None,
-            false,
-            true,
-            false,
-            false,
-        );
+        let mut m = DiffusionStreamMapper::new(FakeDecoder, thinking_cfg());
         let canvas: Vec<u32> = "call:edit{x:1}".chars().map(|ch| ch as u32).collect();
         let _ = m.on_step(&step(1, 2, &canvas, true));
         assert_eq!(m.content(), "call:edit{x:1}");
@@ -555,20 +506,8 @@ mod tests {
     /// ceremony), classified by emission order.
     #[test]
     fn thinking_pre_open_tokens_stay_content() {
-        let open = 1u32;
-        let close = 2u32;
-        let mut m = DiffusionStreamMapper::new(
-            FakeDecoder,
-            vec![],
-            Some(open),
-            Some(close),
-            None,
-            false,
-            true,
-            false,
-            false,
-        );
-        let canvas = [c('A'), open, c('z'), close, c('B')];
+        let mut m = DiffusionStreamMapper::new(FakeDecoder, thinking_cfg());
+        let canvas = [c('A'), 1, c('z'), 2, c('B')];
         let _ = m.on_step(&step(1, 2, &canvas, true));
         assert_eq!(m.content(), "AB");
         assert!(
@@ -583,21 +522,17 @@ mod tests {
     /// filtered) so the parsed call's args round-trip byte-exact.
     #[test]
     fn quoted_channel_id_stays_in_content_verbatim() {
-        let (open, close, quote) = (1u32, 2u32, 4u32);
+        let quote = 4u32;
         let mut m = DiffusionStreamMapper::new(
             ChannelDecoder,
-            vec![],
-            Some(open),
-            Some(close),
-            Some(quote),
-            false,
-            true,
-            false,
-            false,
+            MapperConfig {
+                quote: Some(quote),
+                ..thinking_cfg()
+            },
         );
         // call:e{x:<Q> <open> <Q>}, where the quoted open is data.
         let mut canvas: Vec<u32> = "call:e{x:".chars().map(|ch| ch as u32).collect();
-        canvas.extend([quote, open, quote]);
+        canvas.extend([quote, 1, quote]);
         canvas.push(c('}'));
         let _ = m.on_step(&step(1, 2, &canvas, true));
         assert_eq!(m.content(), "call:e{x:<|\"|><|channel><|\"|>}");
@@ -616,14 +551,12 @@ mod tests {
         let mk = |skip: bool| {
             DiffusionStreamMapper::new(
                 ChannelDecoder,
-                vec![99],
-                None,
-                None,
-                Some(quote),
-                skip,
-                false,
-                false,
-                false,
+                MapperConfig {
+                    stops: vec![99],
+                    quote: Some(quote),
+                    stop_skip_quoted: skip,
+                    ..Default::default()
+                },
             )
         };
         // Block 1 leaves the quote open, block 2 carries the stop id inside it.
@@ -646,14 +579,10 @@ mod tests {
     fn stop_token_ends_and_cuts() {
         let mut m = DiffusionStreamMapper::new(
             FakeDecoder,
-            vec![99],
-            None,
-            None,
-            None,
-            false,
-            false,
-            false,
-            false,
+            MapperConfig {
+                stops: vec![99],
+                ..Default::default()
+            },
         );
         let canvas = [c('O'), c('k'), 99, c('X')];
         let out = m.on_step(&step(1, 2, &canvas, true));
@@ -673,17 +602,13 @@ mod tests {
 
     #[test]
     fn paced_stream_holds_commit_and_releases_during_next_block() {
-        let mut m = DiffusionStreamMapper::new(
-            FakeDecoder,
-            vec![],
-            None,
-            None,
-            None,
-            false,
-            false,
-            false,
-            true,
-        );
+        let paced = || {
+            MapperConfig {
+                paced: true,
+                ..Default::default()
+            }
+        };
+        let mut m = DiffusionStreamMapper::new(FakeDecoder, paced());
         let text: Vec<u32> = "abcdefghij".chars().map(|ch| ch as u32).collect();
         // Block 1 commits after 16 steps (seeds the EMA at (16+16)/2 = 16), and
         // paced mode holds the text, so no Content delta at commit.
@@ -713,14 +638,10 @@ mod tests {
         let stop = [c('z'), 999];
         let mut m2 = DiffusionStreamMapper::new(
             FakeDecoder,
-            vec![999],
-            None,
-            None,
-            None,
-            false,
-            false,
-            false,
-            true,
+            MapperConfig {
+                stops: vec![999],
+                ..paced()
+            },
         );
         let _ = m2.on_step(&step(1, 16, &text, true));
         let out = m2.on_step(&step(2, 4, &stop, true));
@@ -738,14 +659,10 @@ mod tests {
     fn paced_stream_final_flush_releases_held_text() {
         let mut m = DiffusionStreamMapper::new(
             FakeDecoder,
-            vec![],
-            None,
-            None,
-            None,
-            false,
-            false,
-            false,
-            true,
+            MapperConfig {
+                paced: true,
+                ..Default::default()
+            },
         );
         let text: Vec<u32> = "hold me".chars().map(|ch| ch as u32).collect();
         let _ = m.on_step(&step(1, 16, &text, true));
@@ -766,14 +683,10 @@ mod tests {
     fn paced_stream_tool_call_disables_pacing() {
         let mut m = DiffusionStreamMapper::new(
             FakeDecoder,
-            vec![],
-            None,
-            None,
-            None,
-            false,
-            false,
-            false,
-            true,
+            MapperConfig {
+                paced: true,
+                ..Default::default()
+            },
         );
         let text: Vec<u32> = "call:read{".chars().map(|ch| ch as u32).collect();
         // A committed block containing a tool call flushes immediately.
@@ -800,20 +713,9 @@ mod tests {
     /// content starts after the model's `<channel|>`.
     #[test]
     fn start_in_thought_classifies_leading_ids_as_reasoning() {
-        let close = 2u32;
-        let mut m = DiffusionStreamMapper::new(
-            FakeDecoder,
-            vec![],
-            Some(1),
-            Some(close),
-            None,
-            false,
-            true,
-            false,
-            false,
-        )
-        .starting_in_thought();
-        let canvas = [c('p'), c('l'), c('a'), c('n'), close, c('O'), c('k')];
+        let mut m =
+            DiffusionStreamMapper::new(FakeDecoder, thinking_cfg()).starting_in_thought();
+        let canvas = [c('p'), c('l'), c('a'), c('n'), 2, c('O'), c('k')];
         let _ = m.on_step(&step(1, 2, &canvas, true));
         assert_eq!(m.reasoning(), "plan");
         assert_eq!(m.content(), "Ok");
