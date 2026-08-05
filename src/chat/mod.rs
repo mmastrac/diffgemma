@@ -28,4 +28,4 @@ pub use event::ChatEvent;
 pub use render::{ChatStream, StreamDisplay, render_demo};
 pub use sink::{JsonlSink, PlainSink, SharedSinks, SinkSet, emit};
 
-pub(crate) use decode::{ChannelIds, Stabilizer};
+pub(crate) use decode::{ChannelIds, Stabilizer, salvage_answer};

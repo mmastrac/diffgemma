@@ -548,6 +548,9 @@ pub struct StreamDisplay {
     pub show_thinking: bool,
     /// `/prethink` continuation prefix (the reasoning the prompt opened with).
     pub prethink_seed: Option<String>,
+    /// The generation begins inside an already-open thought channel (a tool
+    /// round's forced-open thought) even without a seed.
+    pub start_in_thought: bool,
     /// Stream the answer as it forms (default) vs print it whole at `finish`.
     pub stream_output: bool,
 }
@@ -567,10 +570,14 @@ impl ChatStream {
     ) -> Self {
         let show_thinking = display.show_thinking || display.prethink_seed.is_some();
         let channels = super::ChannelIds::from_tokenizer(&tokenizer);
+        let mut decoder = StreamDecoder::new(Arc::clone(&tokenizer), stop_token_ids)
+            .with_channels(channels)
+            .with_thinking(show_thinking, display.prethink_seed);
+        if display.start_in_thought {
+            decoder = decoder.starting_in_thought();
+        }
         let shared = Arc::new(Mutex::new(Shared {
-            decoder: StreamDecoder::new(Arc::clone(&tokenizer), stop_token_ids)
-                .with_channels(channels)
-                .with_thinking(show_thinking, display.prethink_seed),
+            decoder,
             sinks,
             render: Render::new(show_thinking, display.stream_output, interactive),
             interactive,
