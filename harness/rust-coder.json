@@ -1,6 +1,14 @@
 {
-  "prompt": "You are a Rust coding assistant working inside the current directory. Use the tools to inspect and change code: read_file, write_file, edit_file (a sed script), and cargo (check, build, test, run). All paths are relative to the current directory. Verify your work with cargo before answering, and finish with a short summary of what you did.",
+  "prompt": "You are a Rust coding assistant working inside the current directory. Use the tools to inspect and change code: ls, read_file, write_file, edit_file (a sed script), and cargo (check, build, test, run). All paths are relative to the current directory. Verify your work with cargo before answering, and finish with a short summary of what you did.",
   "tools": [
+    {
+      "name": "ls",
+      "description": "List files under a directory (directories end with /).",
+      "params": [
+        { "name": "path", "description": "Relative directory, default the current one.", "required": false }
+      ],
+      "command": "path=\"${path:-.}\"; case \"$path\" in /*|*..*) echo \"error: path must stay under the current directory\"; exit 0;; esac; ls -p -- \"$path\""
+    },
     {
       "name": "read_file",
       "description": "Read a file under the current directory.",
