@@ -705,6 +705,26 @@ fn salvage_answer(completion: &str) -> String {
     t.rsplit("\n\n").next().unwrap_or(t).trim().to_string()
 }
 
+/// Split a tool-turn generation into `(reasoning, rest)`. A closed thought
+/// channel (`<channel|>`) separates the reasoning (shown as `think>`) from the
+/// answer / tool calls; `seed` (a `/prethink` continuation) prefixes it and the
+/// model's own open marker is dropped. Without a close the model went straight
+/// to output -- often tool calls -- so there is no separate reasoning and `rest`
+/// is the whole text, keeping the calls parseable.
+#[cfg(target_os = "macos")]
+fn split_reasoning(raw: &str, thinking: bool, seed: &str) -> (Option<String>, String) {
+    if thinking
+        && let Some((t, rest)) = raw.split_once("<channel|>")
+    {
+        let thought = crate::chat_protocol::strip_thought_open(&format!("{seed}{t}"))
+            .trim()
+            .to_string();
+        (Some(thought), rest.to_string())
+    } else {
+        (None, raw.to_string())
+    }
+}
+
 #[cfg(target_os = "macos")]
 impl Turn<'_> {
     /// Produce this turn's `(reply, persisted_thought)`. `history` holds the
@@ -1012,26 +1032,7 @@ impl TurnRunner<'_> {
             let new_ids =
                 sample::strip_degenerate_token_ids(out.token_ids.get(prompt_len..).unwrap_or(&[]));
             let raw = self.tokenizer.decode(&new_ids);
-            // With the thought channel open the generation begins inside it: split
-            // at the model's `<channel|>` into the reasoning and the answer / tool
-            // calls. An unclosed thought means the model answered inside its
-            // reasoning; salvage the answer from the tail.
-            let (thought, content) = if thinking {
-                let seed = think_seed.unwrap_or("");
-                let (t, rest) = if raw.contains("<channel|>") {
-                    split_thought(seed, &raw)
-                } else {
-                    (format!("{seed}{raw}"), salvage_answer(&raw))
-                };
-                // An unseeded turn emits its own `<|channel>thought` open marker;
-                // drop it (a seeded continuation has none, so this is a no-op).
-                (
-                    Some(crate::chat_protocol::strip_thought_open(&t).to_string()),
-                    rest,
-                )
-            } else {
-                (None, raw.clone())
-            };
+            let (thought, content) = split_reasoning(&raw, thinking, think_seed.unwrap_or(""));
             if human
                 && let Some(t) = thought.as_deref().map(str::trim).filter(|t| !t.is_empty())
             {
@@ -1076,12 +1077,18 @@ impl TurnRunner<'_> {
                     None => format!("error: no tool named '{}'", call.name),
                 };
                 if !self.json {
-                    println!(
-                        "tool> {}({}) -> {}",
-                        call.name,
-                        preview(&input, 48),
-                        preview(&output, 72)
-                    );
+                    let head = format!("tool> {}({})", call.name, preview(&input, 48));
+                    match output.trim_end() {
+                        "" => println!("{head} -> (no output)"),
+                        body if body.contains('\n') => {
+                            // Multi-line output: header, then the body indented.
+                            println!("{head} ->");
+                            for line in body.lines() {
+                                println!("  {line}");
+                            }
+                        }
+                        body => println!("{head} -> {body}"),
+                    }
                 }
                 let mut msg =
                     serde_json::json!({ "role": "tool", "name": call.name, "content": output });
@@ -1896,8 +1903,10 @@ pub(crate) fn run_chat_cmd(
 mod tests {
     use super::{
         JsonInput, expand_file_markers, expand_thinking, json_command_to_line, parse_tool_spec,
-        run_shell_tool, salvage_answer, split_thought, tab_fill_text, tool_declaration,
+        run_shell_tool, salvage_answer, split_reasoning, split_thought, tab_fill_text,
+        tool_declaration,
     };
+    use crate::tools::parse_tool_calls;
     use crate::chat_template::ChatTurn;
 
     /// The `/slash` line a JSON command translates to (or a marker for the
@@ -2008,6 +2017,24 @@ mod tests {
             split_thought("seed", " unfinished"),
             ("seed unfinished".to_string(), String::new())
         );
+    }
+
+    #[test]
+    fn split_reasoning_keeps_tool_calls_without_a_channel_close() {
+        let calls = "<|tool_call>call:a{input:<|\"|>x<|\"|>}<tool_call|>";
+        // A closed channel separates reasoning from the calls.
+        let (thought, content) =
+            split_reasoning(&format!("<|channel>thought\nreasoning<channel|>{calls}"), true, "");
+        assert_eq!(thought.as_deref(), Some("reasoning"));
+        assert_eq!(content, calls);
+        // No close (model went straight to calls): whole text is kept so the
+        // calls still parse -- the regression this guards against.
+        let (thought, content) = split_reasoning(calls, true, "");
+        assert_eq!(thought, None);
+        assert_eq!(content, calls);
+        assert_eq!(parse_tool_calls(&content).len(), 1);
+        // Thinking off: never split.
+        assert_eq!(split_reasoning(calls, false, ""), (None, calls.to_string()));
     }
 
     #[test]
