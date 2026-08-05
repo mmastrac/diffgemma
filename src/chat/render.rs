@@ -1,12 +1,10 @@
-//! Live chat rendering, driven by the `ChatEvent` protocol (`chat::event`).
+//! The interactive terminal renderer, driven by the `ChatEvent` protocol.
 //!
-//! Two sinks consume the event stream:
-//! - **JSONL** (optional): every event as one JSON line, to a file (`--events`)
-//!   or stdout (`--json`). This is the observable ground truth.
-//! - **Terminal** (default, interactive tty): a spinner + streamed text.
-//!
-//! The terminal renderer reserves a live pane at the bottom of the screen (a
-//! DECSTBM scroll region) while a turn generates:
+//! [`ChatStream`] runs one generation's stream: its observer decodes each
+//! denoise step, pumps the events into the session sinks, and (on an
+//! interactive tty) applies them to the live display. The renderer reserves a
+//! pane at the bottom of the screen (a DECSTBM scroll region) while the
+//! generation runs:
 //! - A background **ticker** thread is the *sole* writer to stdout, redrawing the
 //!   pane on a fixed timer so the spinner keeps moving across the silent
 //!   KV-extend / prefill gaps between blocks.

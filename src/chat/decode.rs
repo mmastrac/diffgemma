@@ -681,7 +681,14 @@ mod tests {
         assert_eq!(thoughts(&e), vec!["Hi"]);
         assert_eq!(texts(&e), Vec::<&str>::new());
         // Now the thought closes and the answer appears (committed on block_done).
-        let full = [OPEN, b'H' as u32, b'i' as u32, CLOSE, b'O' as u32, b'k' as u32];
+        let full = [
+            OPEN,
+            b'H' as u32,
+            b'i' as u32,
+            CLOSE,
+            b'O' as u32,
+            b'k' as u32,
+        ];
         let done = d.on_step(&step(1, 4, &full, true));
         assert_eq!(texts(&done), vec!["Ok"]);
     }
@@ -703,7 +710,14 @@ mod tests {
             .with_channels(channel_ids())
             .with_thinking(true, None);
         // Block 1 completes: thought "Hi" closes, answer "Ab" is committed (len 2).
-        let b1 = [OPEN, b'H' as u32, b'i' as u32, CLOSE, b'A' as u32, b'b' as u32];
+        let b1 = [
+            OPEN,
+            b'H' as u32,
+            b'i' as u32,
+            CLOSE,
+            b'A' as u32,
+            b'b' as u32,
+        ];
         assert_eq!(
             pairs(&d.on_step(&step(1, 1, &b1, true))),
             vec![(2, "Ab".into())]
@@ -816,7 +830,16 @@ mod tests {
         let ids = channel_ids();
         let calls = [b'c' as u32, b'a' as u32, b'l' as u32, b'l' as u32];
         // A closed span separates reasoning from the calls.
-        let stream = [OPEN, b'H' as u32, b'i' as u32, CLOSE, calls[0], calls[1], calls[2], calls[3]];
+        let stream = [
+            OPEN,
+            b'H' as u32,
+            b'i' as u32,
+            CLOSE,
+            calls[0],
+            calls[1],
+            calls[2],
+            calls[3],
+        ];
         let (thought, content) = ids.settle_tool_reply(&FakeDecoder, true, "", &stream);
         assert_eq!(thought.as_deref(), Some("Hi"));
         assert_eq!(content, "call");

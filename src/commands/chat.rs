@@ -291,7 +291,10 @@ impl Suggester {
             {
                 let _ = p.print(format!("\x1b[90m⇥ {text}\x1b[0m"));
             }
-            crate::chat::emit(&self.sinks, &crate::chat::ChatEvent::Suggestion { turn, text });
+            crate::chat::emit(
+                &self.sinks,
+                &crate::chat::ChatEvent::Suggestion { turn, text },
+            );
         });
         SuggestTask { cancel, handle }
     }

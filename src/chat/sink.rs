@@ -76,6 +76,12 @@ pub struct PlainSink;
 const GREY: &str = "\x1b[90m";
 const RESET: &str = "\x1b[0m";
 
+/// Print a settled `think>` line in the reasoning grey (shared by the plain
+/// sink and the engine's interactive echo).
+pub(crate) fn print_think(text: &str) {
+    println!("{GREY}think> {text}{RESET}");
+}
+
 /// First line of `s`, clipped to `n` chars with an ellipsis marker, for a
 /// one-line preview of a tool argument or value.
 pub(crate) fn preview(s: &str, n: usize) -> String {
@@ -90,7 +96,7 @@ pub(crate) fn preview(s: &str, n: usize) -> String {
 impl PlainSink {
     fn settled(&self, text: &str, thought: Option<&str>) {
         if let Some(t) = thought.map(str::trim).filter(|t| !t.is_empty()) {
-            println!("{GREY}think> {t}{RESET}");
+            print_think(t);
         }
         if text.is_empty() {
             if thought.is_some() {
@@ -113,7 +119,7 @@ impl EventSink for PlainSink {
             ChatEvent::RoundEnd { text, thought, .. } => {
                 let t = thought.as_deref().map(str::trim).filter(|t| !t.is_empty());
                 if let Some(t) = t {
-                    println!("{GREY}think> {t}{RESET}");
+                    print_think(t);
                 }
                 if !text.trim().is_empty() {
                     println!("model> {}", text.trim());
@@ -154,7 +160,11 @@ impl EventSink for PlainSink {
             } => {
                 self.settled(text, thought.as_deref());
                 if *tokens > 0 {
-                    let cap_note = if *stopped { "" } else { " · hit context limit" };
+                    let cap_note = if *stopped {
+                        ""
+                    } else {
+                        " · hit context limit"
+                    };
                     println!(
                         "  ({tokens} tok · {steps} steps · {secs:.1}s · {:.1} tok/s{cap_note})",
                         *tokens as f64 / secs.max(1e-9),

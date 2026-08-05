@@ -7,7 +7,10 @@
 //! emitting every protocol event through the session sinks. The REPL in
 //! `commands::chat` only parses input and owns conversation state.
 
-use super::{ChannelIds, ChatEvent, ChatStream, SharedSinks, StreamDisplay, sink::preview};
+use super::{
+    ChannelIds, ChatEvent, ChatStream, SharedSinks, StreamDisplay,
+    sink::{preview, print_think},
+};
 use crate::{chat_template, metal, sample, tokenizer};
 
 fn prepend_system(
@@ -448,7 +451,7 @@ impl TurnRunner<'_> {
             && self.interactive
             && let Some(s) = &seed
         {
-            println!("\x1b[90mthink> {}\x1b[0m", s.trim());
+            print_think(s.trim());
         }
         let started = std::time::Instant::now();
         // `/prethink` (open seed) streams the reasoning implicitly; a plain turn
@@ -495,17 +498,18 @@ impl TurnRunner<'_> {
         // the model's `<channel|>` (before = thought, after = answer) with the
         // token-level walk. Closed `/thought` and plain turns: the whole
         // generation is the answer.
-        let (reply, split_thought_display) = match &seed {
-            Some(seed) if !close => {
-                let (thought, answer) = ChannelIds::from_tokenizer(self.tokenizer)
-                    .settle_prethink(self.tokenizer, seed.trim(), &new_ids);
-                (chat_template::sanitize_model_reply(&answer), Some(thought))
-            }
-            _ => (
-                chat_template::sanitize_model_reply(&self.tokenizer.decode(&new_ids)),
-                None,
-            ),
-        };
+        let (reply, split_thought_display) =
+            match &seed {
+                Some(seed) if !close => {
+                    let (thought, answer) = ChannelIds::from_tokenizer(self.tokenizer)
+                        .settle_prethink(self.tokenizer, seed.trim(), &new_ids);
+                    (chat_template::sanitize_model_reply(&answer), Some(thought))
+                }
+                _ => (
+                    chat_template::sanitize_model_reply(&self.tokenizer.decode(&new_ids)),
+                    None,
+                ),
+            };
         let new_tokens = out.token_ids.len().saturating_sub(prompt_len);
         let secs = elapsed.as_secs_f64();
         let stats = stats_line(new_tokens, out.denoise_steps_run, secs, out.stopped_on_eot);
@@ -573,8 +577,12 @@ impl TurnRunner<'_> {
             // `--show-thinking` (or a `/prethink` seed) opens the thought channel
             // so the model reasons before it answers; otherwise it answers direct.
             let thinking = self.show_thinking || think_seed.is_some();
-            let mut guarded =
-                crate::tools::render_conversation_guarded(&messages, self.tools_json, true, thinking);
+            let mut guarded = crate::tools::render_conversation_guarded(
+                &messages,
+                self.tools_json,
+                true,
+                thinking,
+            );
             if let Some(s) = think_seed {
                 guarded.push_str("<|channel>thought\n");
                 guarded.push_str(s);
@@ -620,20 +628,19 @@ impl TurnRunner<'_> {
 
             let new_ids =
                 sample::strip_degenerate_token_ids(out.token_ids.get(prompt_len..).unwrap_or(&[]));
-            let (thought, content) = ChannelIds::from_tokenizer(self.tokenizer)
-                .settle_tool_reply(
-                    self.tokenizer,
-                    thinking,
-                    think_seed.unwrap_or(""),
-                    &new_ids,
-                );
+            let (thought, content) = ChannelIds::from_tokenizer(self.tokenizer).settle_tool_reply(
+                self.tokenizer,
+                thinking,
+                think_seed.unwrap_or(""),
+                &new_ids,
+            );
             let thought = thought
                 .as_deref()
                 .map(str::trim)
                 .filter(|t| !t.is_empty())
                 .map(str::to_string);
             if echo && let Some(t) = &thought {
-                println!("\x1b[90mthink> {t}\x1b[0m");
+                print_think(t);
             }
 
             // No `call:` attempt at all: this is the final answer.
@@ -811,7 +818,7 @@ impl TurnRunner<'_> {
         // interactive tty; plain sessions display from the events below.
         if self.interactive {
             if let Some(t) = &thought {
-                println!("\x1b[90mthink> {}\x1b[0m", t.trim());
+                print_think(t.trim());
             }
             println!("model> {reply}");
         }
@@ -874,7 +881,6 @@ pub(crate) fn run_turn(
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -904,7 +910,10 @@ mod tests {
         );
         // Missing system / no user turn -> empty substitutions, no panic.
         let empty = std::collections::HashMap::new();
-        assert_eq!(expand_thinking("[$$prompt$$]", &history, None, &empty), "[]");
+        assert_eq!(
+            expand_thinking("[$$prompt$$]", &history, None, &empty),
+            "[]"
+        );
         assert_eq!(expand_thinking("$$last$$", &[], None, &empty), "");
         // A template with no placeholders passes through.
         assert_eq!(
@@ -937,7 +946,9 @@ mod tests {
         // Mixed: the scene text survives, the set is consumed.
         let (content, dirs) = parse_tool_directives("A dim bistro.\n::set scene=A dim bistro.");
         assert_eq!(content, "A dim bistro.");
-        assert!(matches!(&dirs[..], [ToolDirective::Set(n, v)] if n == "scene" && v == "A dim bistro."));
+        assert!(
+            matches!(&dirs[..], [ToolDirective::Set(n, v)] if n == "scene" && v == "A dim bistro.")
+        );
         // Bare end, and a non-directive `::` line stays content.
         let (content, dirs) = parse_tool_directives("::end\n::not a directive");
         assert_eq!(content, "::not a directive");
@@ -982,5 +993,4 @@ mod tests {
             "string"
         );
     }
-
 }
