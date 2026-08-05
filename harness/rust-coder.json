@@ -1,11 +1,16 @@
 {
-  "prompt": "You are a Rust coding assistant working inside the current directory. Use the tools to inspect and change code: ls, read_file, write_file, edit_file (a sed script), and cargo (check, build, test, run). All paths are relative to the current directory. Verify your work with cargo before answering, and finish with a short summary of what you did.",
+  "prompt": "You are a Rust coding assistant working inside the current directory. Use the tools to inspect and change code: ls, read_file, write_file, edit_file (a sed script), and cargo (check, build, test, run). All paths are relative to the current directory. If there is no Cargo.toml here, run cargo with args 'init --lib' or 'init' to start a project IN PLACE - do not use cargo new, which nests a subdirectory. If you do work in a subdirectory project, pass its dir to the cargo tool. Verify your work with cargo before answering, and finish with a short summary of what you did. If edit_file reports that nothing changed, do not retry the same script - rewrite the whole file with write_file instead.",
+  "max_rounds": 16,
   "tools": [
     {
       "name": "ls",
       "description": "List files under a directory (directories end with /).",
       "params": [
-        { "name": "path", "description": "Relative directory, default the current one.", "required": false }
+        {
+          "name": "path",
+          "description": "Relative directory, default the current one.",
+          "required": false
+        }
       ],
       "command": "path=\"${path:-.}\"; case \"$path\" in /*|*..*) echo \"error: path must stay under the current directory\"; exit 0;; esac; ls -p -- \"$path\""
     },
@@ -13,7 +18,10 @@
       "name": "read_file",
       "description": "Read a file under the current directory.",
       "params": [
-        { "name": "path", "description": "Relative path to the file." }
+        {
+          "name": "path",
+          "description": "Relative path to the file."
+        }
       ],
       "command": "case \"$path\" in /*|*..*) echo \"error: path must stay under the current directory\"; exit 0;; esac; cat -- \"$path\""
     },
@@ -21,8 +29,14 @@
       "name": "write_file",
       "description": "Create or overwrite a file under the current directory.",
       "params": [
-        { "name": "path", "description": "Relative path to the file." },
-        { "name": "content", "description": "The complete file contents." }
+        {
+          "name": "path",
+          "description": "Relative path to the file."
+        },
+        {
+          "name": "content",
+          "description": "The complete file contents."
+        }
       ],
       "command": "case \"$path\" in /*|*..*) echo \"error: path must stay under the current directory\"; exit 0;; esac; mkdir -p \"$(dirname \"$path\")\" && printf '%s' \"$content\" > \"$path\" && echo \"wrote $path ($(wc -c < \"$path\" | tr -d ' ') bytes)\""
     },
@@ -30,18 +44,32 @@
       "name": "edit_file",
       "description": "Edit a file in place with a sed script (BSD sed), e.g. 's/foo/bar/g' or '3d'.",
       "params": [
-        { "name": "path", "description": "Relative path to the file." },
-        { "name": "script", "description": "The sed script to apply." }
+        {
+          "name": "path",
+          "description": "Relative path to the file."
+        },
+        {
+          "name": "script",
+          "description": "The sed script to apply."
+        }
       ],
-      "command": "case \"$path\" in /*|*..*) echo \"error: path must stay under the current directory\"; exit 0;; esac; sed -i '' -e \"$script\" -- \"$path\" && echo \"edited $path\" && cat -- \"$path\""
+      "command": "case \"$path\" in /*|*..*) echo \"error: path must stay under the current directory\"; exit 0;; esac; tmp=$(mktemp); cp -- \"$path\" \"$tmp\" 2>/dev/null || { echo \"error: cannot read $path\"; rm -f \"$tmp\"; exit 0; }; sed -i '' -e \"$script\" -- \"$path\" 2>&1 || { echo \"error: sed rejected the script\"; rm -f \"$tmp\"; exit 0; }; if cmp -s \"$tmp\" \"$path\"; then echo \"error: no changes made - the script matched nothing in $path; rewrite the file with write_file instead of retrying\"; else echo \"edited $path:\"; diff -u \"$tmp\" \"$path\" | tail -n +3; fi; rm -f \"$tmp\""
     },
     {
       "name": "cargo",
-      "description": "Run cargo with the given arguments, e.g. 'check', 'test', 'run --quiet'.",
+      "description": "Run cargo with the given arguments, e.g. 'check', 'test', 'run --quiet'. Runs in the current directory; pass dir to run inside a subdirectory project.",
       "params": [
-        { "name": "args", "description": "Arguments passed to cargo." }
+        {
+          "name": "args",
+          "description": "Arguments passed to cargo."
+        },
+        {
+          "name": "dir",
+          "description": "Relative directory to run in, default the current one.",
+          "required": false
+        }
       ],
-      "command": "cargo $args 2>&1 | tail -c 3500"
+      "command": "dir=\"${dir:-.}\"; case \"$dir\" in /*|*..*) echo \"error: dir must stay under the current directory\"; exit 0;; esac; cd -- \"$dir\" 2>/dev/null || { echo \"error: no such directory: $dir\"; exit 0; }; cargo $args 2>&1 | tail -c 3500"
     }
   ]
 }

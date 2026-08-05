@@ -1,0 +1,51 @@
+{
+  "prompt": "You are a storytime narrator. Each turn: move to or update a scene with set_scene, introduce or update people with add_character, tell the story with one or more add_paragraph calls, offer 2-3 add_choice options, then finish with commit. Scenes and characters are remembered by name - calling set_scene or add_character again with the same name updates it. The reply shown to the player is composed from your paragraphs and numbered choices by commit - never narrate outside the tools. When the player answers with a number, it picks that choice from the last turn.",
+  "prethink": "Story state so far.\nCurrent scene: $$scene$$\nKnown scenes:\n$$scenes$$\nCharacters:\n$$characters$$\nChoices offered last turn:\n$$choices$$\nThe player said: $$last$$ (a number picks that choice).\nPlan the next beat: where does it happen, who acts, and what choices follow?",
+  "vars": {
+    "scene": ".story/current_scene.txt",
+    "scenes": ".story/scenes.txt",
+    "characters": ".story/characters.txt",
+    "choices": ".story/last_choices.txt"
+  },
+  "tools": [
+    {
+      "name": "set_scene",
+      "description": "Move the story to a scene (kept by name; same name updates it).",
+      "params": [
+        { "name": "name", "description": "A short scene name, e.g. 'The smoky bar'." },
+        { "name": "description", "description": "One or two sentences describing the scene." }
+      ],
+      "command": "mkdir -p .story && f=.story/scenes.txt && was=$(awk -v n=\"$name\" -F': ' '$1==n{c=1}END{print c+0}' \"$f\" 2>/dev/null) && awk -v n=\"$name\" -F': ' '$1!=n' \"$f\" 2>/dev/null > \"$f.tmp\"; printf '%s: %s\\n' \"$name\" \"$description\" >> \"$f.tmp\" && mv \"$f.tmp\" \"$f\" && printf '%s: %s' \"$name\" \"$description\" > .story/current_scene.txt && if [ \"$was\" = 1 ]; then echo \"Scene $name updated; the story is there now.\"; else echo \"Scene $name recorded; the story is there now.\"; fi"
+    },
+    {
+      "name": "add_character",
+      "description": "Introduce or update a character (kept by name; same name updates them).",
+      "params": [
+        { "name": "name", "description": "The character's name." },
+        { "name": "description", "description": "A one-line description." }
+      ],
+      "command": "mkdir -p .story && f=.story/characters.txt && was=$(awk -v n=\"$name\" -F': ' '$1==n{c=1}END{print c+0}' \"$f\" 2>/dev/null) && awk -v n=\"$name\" -F': ' '$1!=n' \"$f\" 2>/dev/null > \"$f.tmp\"; printf '%s: %s\\n' \"$name\" \"$description\" >> \"$f.tmp\" && mv \"$f.tmp\" \"$f\" && if [ \"$was\" = 1 ]; then echo \"Updated $name.\"; else echo \"Added $name.\"; fi"
+    },
+    {
+      "name": "add_paragraph",
+      "description": "Add a paragraph of narration to this turn's reply.",
+      "params": [
+        { "name": "text", "description": "The paragraph." }
+      ],
+      "command": "mkdir -p .story && printf '%s\\n\\n' \"$text\" >> .story/turn_paragraphs.txt && echo 'Paragraph added.'"
+    },
+    {
+      "name": "add_choice",
+      "description": "Offer the player a numbered choice for this turn.",
+      "params": [
+        { "name": "text", "description": "The choice, phrased as an action." }
+      ],
+      "command": "mkdir -p .story && n=$(( $(wc -l < .story/turn_choices.txt 2>/dev/null || echo 0) + 1 )) && printf '%s) %s\\n' \"$n\" \"$text\" >> .story/turn_choices.txt && echo \"Choice $n noted.\""
+    },
+    {
+      "name": "commit",
+      "description": "Finish the turn: the player sees your paragraphs followed by the numbered choices.",
+      "command": "{ cat .story/turn_paragraphs.txt 2>/dev/null; echo 'What do you do?'; cat .story/turn_choices.txt 2>/dev/null; } && mv -f .story/turn_choices.txt .story/last_choices.txt 2>/dev/null; rm -f .story/turn_paragraphs.txt; echo '::end'"
+    }
+  ]
+}
