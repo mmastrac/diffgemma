@@ -39,6 +39,7 @@ use std::sync::{Arc, Mutex};
 
 mod log;
 mod wire;
+pub(crate) use crate::decoder::{DiffusionStreamMapper, WireDelta};
 pub(crate) use log::*;
 pub(crate) use wire::*;
 
