@@ -14,22 +14,6 @@ use crate::metal::StepProgressEvent;
 /// enough to stream. 2 proved too eager on fast-converging replies.
 pub(crate) const STABLE_STREAK: u32 = 2;
 
-/// Strip a leading thought-open marker (`<|channel>thought\n`) from decoded
-/// reasoning so the surfaced thought is clean text. A normal always-thinking
-/// turn generates the open marker itself; a `/prethink` continuation begins
-/// inside the thought (the marker was in the prompt) and is returned unchanged.
-/// String-level (post-decode) fallback for callers that split raw reply text;
-/// the streaming path consumes the marker at the token level instead.
-pub(crate) fn strip_thought_open(s: &str) -> &str {
-    let Some(rest) = s.strip_prefix("<|channel>") else {
-        return s; // no open marker: a prethink continuation
-    };
-    match rest.split_once('\n') {
-        Some((_role, body)) => body,
-        None => "", // role line ("thought\n") not complete yet
-    }
-}
-
 /// Token-id → text decoding, abstracted so the decoder is testable without the
 /// real 32 MB tokenizer.
 pub trait TextDecoder {
@@ -60,6 +44,10 @@ pub(crate) struct ChannelIds {
 pub(crate) struct SplitIds {
     pub reasoning: Vec<u32>,
     pub content: Vec<u32>,
+    /// A thought span actually closed (a `<channel|>` seen outside quotes).
+    /// False when the model never closed its thought — the settled-output
+    /// fallbacks key off this.
+    pub closed: bool,
 }
 
 impl ChannelIds {
@@ -96,6 +84,7 @@ impl ChannelIds {
         let mut content: Vec<u32> = Vec::new();
         let mut in_thought = start_in_thought;
         let mut in_quote = false;
+        let mut closed = false;
         // A `<|channel>` takes its NAME token (+ trailing newline) with it: the
         // open special is dropped here, so a mid-span re-open would otherwise
         // leak a bare "thought" line into the surfaced reasoning.
@@ -121,6 +110,7 @@ impl ChannelIds {
                 skip_name = true;
             } else if Some(id) == self.close {
                 in_thought = false;
+                closed = true;
             } else if in_thought {
                 if skip_name {
                     let tok = decoder.decode(&[id]);
@@ -137,8 +127,69 @@ impl ChannelIds {
                 content.push(id);
             }
         }
-        SplitIds { reasoning, content }
+        SplitIds {
+            reasoning,
+            content,
+            closed,
+        }
     }
+
+    /// Settle a finished `/prethink` generation (began inside an open thought)
+    /// into `(thought, answer)` text. The thought is `seed` + the model's
+    /// completion; the answer is what follows the model's `<channel|>`,
+    /// unsanitized. When the thought never closed the model usually stated
+    /// its answer inside the reasoning (a thought degeneracy) — salvage it
+    /// from the completion's tail rather than reporting none.
+    pub fn settle_prethink<D: TextDecoder>(
+        &self,
+        decoder: &D,
+        seed: &str,
+        ids: &[u32],
+    ) -> (String, String) {
+        let s = self.split(decoder, ids, true);
+        let completion = decoder.decode(&s.reasoning);
+        let answer = if s.closed {
+            decoder.decode(&s.content)
+        } else {
+            salvage_answer(&completion)
+        };
+        (format!("{seed}{completion}"), answer)
+    }
+
+    /// Settle a finished tool-mode generation into `(reasoning, rest)` text.
+    /// A closed thought separates the surfaced reasoning (prefixed by the
+    /// `/prethink` `seed`, if any) from the answer / tool calls. Without a
+    /// close the model went straight to output — often tool calls — so there
+    /// is no separate reasoning and `rest` is the whole decoded text, keeping
+    /// the calls parseable.
+    pub fn settle_tool_reply<D: TextDecoder>(
+        &self,
+        decoder: &D,
+        thinking: bool,
+        seed: &str,
+        ids: &[u32],
+    ) -> (Option<String>, String) {
+        if !thinking {
+            return (None, decoder.decode(ids));
+        }
+        let s = self.split(decoder, ids, !seed.is_empty());
+        if s.closed {
+            let thought = format!("{seed}{}", decoder.decode(&s.reasoning))
+                .trim()
+                .to_string();
+            (Some(thought), decoder.decode(&s.content))
+        } else {
+            (None, decoder.decode(ids))
+        }
+    }
+}
+
+/// Recover an answer from a thought that never closed: take the last
+/// blank-line-separated block (the model usually sets the answer off after a
+/// blank line), or the whole completion when there is no separator.
+pub(crate) fn salvage_answer(completion: &str) -> String {
+    let t = completion.trim();
+    t.rsplit("\n\n").next().unwrap_or(t).trim().to_string()
 }
 
 /// The stable, stop-cut prefix a single denoise step yields.
@@ -725,6 +776,66 @@ mod tests {
                 .any(|ev| matches!(ev, ChatEvent::Rewind { common: 1 }))
         );
         assert_eq!(texts(&last), vec!["Cot"]);
+    }
+
+    #[test]
+    fn salvage_answer_takes_the_trailing_block() {
+        // The model reasoned, then stated the answer after a blank line.
+        assert_eq!(
+            salvage_answer("The project 'Bluebird' ships in March.\n\nMarch."),
+            "March."
+        );
+        // No separator: the whole completion is the recovered answer.
+        assert_eq!(
+            salvage_answer("just reasoning, ending in 56"),
+            "just reasoning, ending in 56"
+        );
+        // Empty / whitespace: nothing to salvage.
+        assert_eq!(salvage_answer("  \n\n  "), "");
+    }
+
+    #[test]
+    fn settle_prethink_splits_at_close_and_salvages_without_one() {
+        let ids = channel_ids();
+        // Closed: seed + completion before the close; answer after.
+        let closed = [b'S' as u32, b'1' as u32, CLOSE, b'4' as u32, b'2' as u32];
+        assert_eq!(
+            ids.settle_prethink(&FakeDecoder, "Think. ", &closed),
+            ("Think. S1".to_string(), "42".to_string())
+        );
+        // Never closed: all thought; the answer is salvaged from its tail
+        // (here: no blank-line separator, so the whole completion).
+        let open = [b'S' as u32, b'1' as u32];
+        assert_eq!(
+            ids.settle_prethink(&FakeDecoder, "seed ", &open),
+            ("seed S1".to_string(), "S1".to_string())
+        );
+    }
+
+    #[test]
+    fn settle_tool_reply_keeps_calls_without_a_channel_close() {
+        let ids = channel_ids();
+        let calls = [b'c' as u32, b'a' as u32, b'l' as u32, b'l' as u32];
+        // A closed span separates reasoning from the calls.
+        let stream = [OPEN, b'H' as u32, b'i' as u32, CLOSE, calls[0], calls[1], calls[2], calls[3]];
+        let (thought, content) = ids.settle_tool_reply(&FakeDecoder, true, "", &stream);
+        assert_eq!(thought.as_deref(), Some("Hi"));
+        assert_eq!(content, "call");
+        // No close (model went straight to calls): whole text is kept so the
+        // calls still parse — the regression this guards against.
+        let (thought, content) = ids.settle_tool_reply(&FakeDecoder, true, "", &calls);
+        assert_eq!(thought, None);
+        assert_eq!(content, "call");
+        // Unclosed span: the raw decode (markers render as nothing here) is
+        // returned whole rather than an empty content.
+        let open_span = [OPEN, b'X' as u32, calls[0]];
+        let (thought, content) = ids.settle_tool_reply(&FakeDecoder, true, "", &open_span);
+        assert_eq!(thought, None);
+        assert_eq!(content, "Xc");
+        // Thinking off: never split.
+        let (thought, content) = ids.settle_tool_reply(&FakeDecoder, false, "", &stream);
+        assert_eq!(thought, None);
+        assert_eq!(content, "Hicall");
     }
 
     #[test]

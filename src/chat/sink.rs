@@ -78,7 +78,7 @@ const RESET: &str = "\x1b[0m";
 
 /// First line of `s`, clipped to `n` chars with an ellipsis marker, for a
 /// one-line preview of a tool argument or value.
-fn preview(s: &str, n: usize) -> String {
+pub(crate) fn preview(s: &str, n: usize) -> String {
     let line = s.lines().next().unwrap_or("");
     if line.chars().count() > n {
         format!("{}...", line.chars().take(n).collect::<String>())
