@@ -1,30 +1,6 @@
+use crate::decoder::StepProgressEvent;
 use crate::metal::step_kernel::{N_LAYERS, StepFinishMode, StepSmokeConfig};
 use crate::sample::SamplerConfig;
-
-/// Per-denoise-step progress snapshot for live UIs (chat streaming/spinner).
-/// `argmax` is the **active** canvas slice only (not stale rows past
-/// `active_canvas` after shrink-on-retry). Under the MLX-exact sampler the
-/// block's final commit IS that slice, so a stable prefix is a faithful preview.
-pub struct StepProgressEvent<'a> {
-    /// 1-based committed-block index this step belongs to.
-    pub block_idx: usize,
-    /// Total blocks budgeted for this generate (`max_new_tokens / CANVAS`).
-    pub max_blocks: usize,
-    /// 1-based denoise step within the block.
-    pub step_in_block: u32,
-    pub max_steps: usize,
-    /// Active-canvas argmax of this step (`active_canvas` entries).
-    pub argmax: &'a [u32],
-    /// Positions accepted by the entropy-bound rule this step.
-    pub accept_count: u32,
-    /// Mean per-position entropy (nats) this step.
-    pub mean_entropy: f32,
-    /// True when this block's argmax is finalized and will not be retried.
-    /// Mid-attempt "would-stop" steps stay false so stream mappers never commit
-    /// a discarded empty/degenerate canvas (which used to splice a second
-    /// `<|channel>thought` into `reasoning_content`).
-    pub block_done: bool,
-}
 
 /// Called after every denoise step with the current canvas snapshot. Must be
 /// cheap; runs on the generation thread.

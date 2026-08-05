@@ -383,7 +383,7 @@ impl Worker {
                         && !reasoning.trim().is_empty()
                     {
                         content = crate::chat_template::sanitize_model_reply(
-                            &crate::chat::salvage_answer(&reasoning),
+                            &crate::decoder::salvage_answer(&reasoning),
                         );
                     }
                     (content, crate::tools::to_openai_tool_calls(&calls))

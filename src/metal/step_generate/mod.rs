@@ -5,7 +5,7 @@ mod progress;
 mod session;
 mod turn;
 
-pub use config::{CancelToken, StepGenerateConfig, StepObserver, StepProgressEvent};
+pub use config::{CancelToken, StepGenerateConfig, StepObserver};
 pub use session::{KvSnapshot, StepGenerateSession};
 pub use turn::{
     BlockOutcome, ProposedBlock, TurnState, begin_turn, commit_block, finish_turn,

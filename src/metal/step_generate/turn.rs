@@ -16,7 +16,8 @@ use crate::tokenizer::Tokenizer;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use super::config::{StepGenerateConfig, StepProgressEvent};
+use super::config::StepGenerateConfig;
+use crate::decoder::StepProgressEvent;
 use super::progress::{DenoiseStopReason, log_denoise_step_progress, step_answer_text};
 use super::session::{StepGenerateSession, longest_common_prefix, perturb_live_kv_f16};
 use crate::flags::progress_enabled;

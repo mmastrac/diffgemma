@@ -30,7 +30,7 @@
 //!   diffusion-aware client can render the live shimmer. On by default
 //!   (per-request `x_diffusion_drafts:false` opts out).
 
-use crate::chat::TextDecoder;
+use crate::decoder::TextDecoder;
 use serde::Deserialize;
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -411,7 +411,7 @@ fn attach_stream_observer(
     // the in-flight generate instead of denoising into the void.
     let cancel = crate::metal::CancelToken::new();
     cfg.cancel = Some(cancel.clone());
-    cfg.step_observer = Some(Arc::new(move |ev: &crate::metal::StepProgressEvent<'_>| {
+    cfg.step_observer = Some(Arc::new(move |ev: &crate::decoder::StepProgressEvent<'_>| {
         if let Some(ref started) = prefill_status
             && !started.swap(true, Ordering::Relaxed)
         {
