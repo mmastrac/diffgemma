@@ -18,9 +18,11 @@
 mod decode;
 mod event;
 mod render;
+mod sink;
 
 pub use decode::{StreamDecoder, TextDecoder};
 pub use event::ChatEvent;
 pub use render::{ChatStream, StreamDisplay, render_demo};
+pub use sink::{JsonlSink, PlainSink, SharedSinks, SinkSet, emit};
 
 pub(crate) use decode::{ChannelIds, Stabilizer, strip_thought_open};

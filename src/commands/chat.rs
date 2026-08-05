@@ -243,14 +243,14 @@ struct Suggester {
     cell: Option<SuggestionCell>,
     /// Interactive reveal: prints the draft above the prompt when it lands.
     printer: Option<ExternalPrinterHandle>,
-    /// JSON driver sink: emits a `Suggestion` event when the draft lands.
-    json_sink: Option<Box<dyn std::io::Write + Send>>,
+    /// Session sinks: a landed draft emits a `Suggestion` event (JSON drivers
+    /// see it; the plain display ignores it).
+    sinks: crate::chat::SharedSinks,
 }
 
 #[cfg(target_os = "macos")]
 impl Suggester {
     fn spawn(self, history: Vec<chat_template::ChatTurn>, turn: u64) -> SuggestTask {
-        use std::io::Write as _;
         let cancel = metal::CancelToken::new();
         let cancel_bg = cancel.clone();
         let handle = std::thread::spawn(move || {
@@ -283,13 +283,7 @@ impl Suggester {
             {
                 let _ = p.print(format!("\x1b[90m⇥ {text}\x1b[0m"));
             }
-            if let Some(mut w) = self.json_sink {
-                let ev = crate::chat::ChatEvent::Suggestion { turn, text };
-                if serde_json::to_writer(&mut w, &ev).is_ok() {
-                    let _ = w.write_all(b"\n");
-                    let _ = w.flush();
-                }
-            }
+            crate::chat::emit(&self.sinks, &crate::chat::ChatEvent::Suggestion { turn, text });
         });
         SuggestTask { cancel, handle }
     }
@@ -564,6 +558,31 @@ fn chat_turns_to_messages(turns: &[chat_template::ChatTurn]) -> Vec<serde_json::
         .collect()
 }
 
+/// A terminal `Done` for a turn that produced nothing (context full, tool
+/// rounds exhausted): the protocol's invariant is that every `TurnStart` is
+/// closed by exactly one `Done`.
+#[cfg(target_os = "macos")]
+fn done_empty() -> crate::chat::ChatEvent {
+    crate::chat::ChatEvent::Done {
+        tokens: 0,
+        steps: 0,
+        secs: 0.0,
+        stopped: false,
+        text: String::new(),
+        thought: None,
+    }
+}
+
+/// The dim per-turn stats line: tokens, steps, wall time, rate.
+#[cfg(target_os = "macos")]
+fn stats_line(tokens: usize, steps: usize, secs: f64, stopped: bool) -> String {
+    let cap_note = if stopped { "" } else { " · hit context limit" };
+    format!(
+        "({tokens} tok · {steps} steps · {secs:.1}s · {:.1} tok/s{cap_note})",
+        tokens as f64 / secs.max(1e-9),
+    )
+}
+
 /// First line of `s`, clipped to `n` chars with an ellipsis marker, for a
 /// one-line preview of a tool argument or result.
 #[cfg(target_os = "macos")]
@@ -608,11 +627,12 @@ struct TurnRunner<'a> {
     model_dir: &'a std::path::Path,
     tools_json: &'a [serde_json::Value],
     shell_tools: &'a [ShellTool],
-    events_file: &'a Option<std::fs::File>,
+    /// The session's protocol + plain-display consumers. Every turn event
+    /// flows through here; the interactive renderer is the one extra view.
+    sinks: crate::chat::SharedSinks,
     raw_prompt: bool,
     interactive: bool,
     json: bool,
-    want_json: bool,
     max_seq: usize,
     explicit_cap: Option<usize>,
     seed: u64,
@@ -806,20 +826,9 @@ impl Turn<'_> {
 
 #[cfg(target_os = "macos")]
 impl TurnRunner<'_> {
-    /// Per-turn JSON sink: stdout for `--json`, a cloned events-file handle
-    /// otherwise, `None` when neither is wanted.
-    fn sink(&self) -> Option<Box<dyn std::io::Write + Send>> {
-        if !self.want_json {
-            return None;
-        }
-        if self.json {
-            Some(Box::new(std::io::stdout()))
-        } else {
-            self.events_file
-                .as_ref()
-                .and_then(|f| f.try_clone().ok())
-                .map(|f| Box::new(f) as Box<dyn std::io::Write + Send>)
-        }
+    /// Emit one protocol event through the session sinks.
+    fn emit(&self, ev: &crate::chat::ChatEvent) {
+        crate::chat::emit(&self.sinks, ev);
     }
 
     /// Normal / prethink turn: one `Generate` with the live streaming UI (the
@@ -868,6 +877,7 @@ impl TurnRunner<'_> {
                         .max(self.max_seq * 2)
                 );
             }
+            self.emit(&done_empty());
             return Ok((String::new(), None));
         }
         self.step_cfg.max_new_tokens = self.explicit_cap.map_or(budget, |c| c.min(budget));
@@ -876,8 +886,10 @@ impl TurnRunner<'_> {
         // A closed `/thought` streams only the answer (the thought is settled in
         // the prompt), so show the known thought up front; an open `/prethink`
         // streams as dimmed thinking and is split from the answer afterward.
+        // (Interactive only: the renderless display prints it settled, from
+        // `Done.thought`.)
         if close
-            && !self.json
+            && self.interactive
             && let Some(s) = &seed
         {
             println!("\x1b[90mthink> {}\x1b[0m", s.trim());
@@ -900,8 +912,8 @@ impl TurnRunner<'_> {
                 prethink_seed: open_seed,
                 stream_output: self.stream_output,
             },
-            self.sink(),
-            turn_idx,
+            std::sync::Arc::clone(&self.sinks),
+            0,
             prompt_len,
         );
         self.step_cfg.step_observer = Some(stream.observer());
@@ -943,49 +955,26 @@ impl TurnRunner<'_> {
         };
         let new_tokens = out.token_ids.len().saturating_sub(prompt_len);
         let secs = elapsed.as_secs_f64();
-        stream.finish(
-            Some(&reply),
-            new_tokens,
-            out.denoise_steps_run,
-            secs,
-            out.stopped_on_eot,
-        );
+        let stats = stats_line(new_tokens, out.denoise_steps_run, secs, out.stopped_on_eot);
+        stream.finish(Some(&reply), Some(&stats));
 
-        // The interactive renderer (`stream.finish`) owns the on-screen thought
-        // and answer. Only the non-interactive path (piped / `--verbose`) prints
-        // here, since the terminal renderer was disabled.
-        if !self.interactive && !self.json {
-            if let Some(thought) = &split_thought_display {
-                println!("\x1b[90mthink> {}\x1b[0m", thought.trim());
-            }
-            if reply.is_empty() {
-                if split_thought_display.is_some() {
-                    println!("model> (no answer; the model never closed the thought)");
-                } else {
-                    println!("model> (empty response)");
-                }
-            } else {
-                println!("model> {reply}");
-            }
-        }
-        if !self.json {
-            let cap_note = if out.stopped_on_eot {
-                ""
-            } else {
-                " · hit context limit"
-            };
-            println!(
-                "  ({new_tokens} tok · {} steps · {secs:.1}s · {:.1} tok/s{cap_note})",
-                out.denoise_steps_run,
-                new_tokens as f64 / secs.max(1e-9),
-            );
-        }
-        // A closed `/thought` persists its (expanded) thought with the reply.
+        // A closed `/thought` persists its (expanded) thought with the reply;
+        // the surfaced `Done.thought` is that or the split streamed reasoning.
         let persisted = if close { seed } else { None };
+        self.emit(&crate::chat::ChatEvent::Done {
+            tokens: new_tokens,
+            steps: out.denoise_steps_run,
+            secs,
+            stopped: out.stopped_on_eot,
+            text: reply.clone(),
+            thought: persisted
+                .clone()
+                .or_else(|| split_thought_display.map(|t| t.trim().to_string())),
+        });
         Ok((reply, persisted))
     }
 
-    /// Tool turn: run the render/generate/run-script loop, then the timing line.
+    /// Tool turn: run the render/generate/run-script loop.
     fn tool_turn(
         &mut self,
         history: &[chat_template::ChatTurn],
@@ -1003,12 +992,7 @@ impl TurnRunner<'_> {
             Thinking::Seed(t) => Some(expand_thinking(t, history, system, &self.vars)),
             Thinking::Off | Thinking::Prefilled(_) => None,
         };
-        let started = std::time::Instant::now();
-        let answer = self.tool_loop(messages, seed.as_deref(), reseed, turn_idx)?;
-        if !self.json {
-            println!("  ({:.1}s)", started.elapsed().as_secs_f64());
-        }
-        Ok(answer)
+        self.tool_loop(messages, seed.as_deref(), reseed, turn_idx)
     }
 
     /// The tool-calling loop: render with tool declarations, generate, run each
@@ -1023,6 +1007,10 @@ impl TurnRunner<'_> {
         turn_idx: u64,
     ) -> Result<String, crate::Error> {
         const MAX_ROUNDS: usize = 8;
+        let started = std::time::Instant::now();
+        // Turn totals for the terminal `Done` (per-round numbers ride the
+        // `RoundStart`/`RoundEnd` events).
+        let (mut total_tokens, mut total_steps) = (0usize, 0usize);
         for round in 0..MAX_ROUNDS {
             let think_seed = if round == 0 || reseed {
                 seed.map(str::trim)
@@ -1045,51 +1033,49 @@ impl TurnRunner<'_> {
                 if !self.json {
                     println!("model> (context full; cannot continue the tool conversation)");
                 }
+                self.emit(&done_empty());
                 return Ok(String::new());
             }
             self.step_cfg.max_new_tokens = self.explicit_cap.map_or(budget, |c| c.min(budget));
             self.step_cfg.seed = self.seed.wrapping_add(turn_idx).wrapping_add(round as u64);
 
-            // A stream drives the JSON sink (its observer streams events, `finish`
-            // closes with `Done`) and, on an interactive tty while reasoning, the
-            // live `think>` preview and settled display. Otherwise the `println!`s
-            // below (when `human`) own the display.
+            // The stream pumps decoder events into the sinks every round; the
+            // live terminal preview (`think>` + settled display) additionally
+            // runs on an interactive tty while reasoning is surfaced.
             let live = self.interactive && thinking;
-            let stream = (live || self.want_json).then(|| {
-                crate::chat::ChatStream::start(
-                    std::sync::Arc::clone(self.tokenizer),
-                    self.step_cfg.stop_token_ids.clone(),
-                    live,
-                    crate::chat::StreamDisplay {
-                        show_thinking: self.show_thinking,
-                        prethink_seed: think_seed.map(str::to_string),
-                        stream_output: self.stream_output,
-                    },
-                    self.sink(),
-                    turn_idx,
-                    prompt_len,
-                )
-            });
-            self.step_cfg.step_observer = stream.as_ref().map(crate::chat::ChatStream::observer);
+            let stream = crate::chat::ChatStream::start(
+                std::sync::Arc::clone(self.tokenizer),
+                self.step_cfg.stop_token_ids.clone(),
+                live,
+                crate::chat::StreamDisplay {
+                    show_thinking: self.show_thinking,
+                    prethink_seed: think_seed.map(str::to_string),
+                    stream_output: self.stream_output,
+                },
+                std::sync::Arc::clone(&self.sinks),
+                round,
+                prompt_len,
+            );
+            self.step_cfg.step_observer = Some(stream.observer());
             let out = pipeline_generate(self.pipeline, self.step_cfg, prompt)?;
             self.step_cfg.step_observer = None;
             let new_tokens = out.token_ids.len().saturating_sub(prompt_len);
-            let finish = |stream: Option<crate::chat::ChatStream>, reply: Option<&str>| {
-                if let Some(s) = stream {
-                    s.finish(reply, new_tokens, out.denoise_steps_run, 0.0, out.stopped_on_eot);
-                }
-            };
-            // The human display is `println!`s unless the interactive stream drew
-            // it (`live`); a JSON turn suppresses it entirely.
-            let human = !self.json && !live;
+            total_tokens += new_tokens;
+            total_steps += out.denoise_steps_run;
+            // Direct echo for the interactive display where neither the live
+            // renderer (this round) nor the PlainSink (plain sessions) owns it.
+            let echo = self.interactive && !live;
 
             let new_ids =
                 sample::strip_degenerate_token_ids(out.token_ids.get(prompt_len..).unwrap_or(&[]));
             let raw = self.tokenizer.decode(&new_ids);
             let (thought, content) = split_reasoning(&raw, thinking, think_seed.unwrap_or(""));
-            if human
-                && let Some(t) = thought.as_deref().map(str::trim).filter(|t| !t.is_empty())
-            {
+            let thought = thought
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string);
+            if echo && let Some(t) = &thought {
                 println!("\x1b[90mthink> {t}\x1b[0m");
             }
 
@@ -1097,14 +1083,24 @@ impl TurnRunner<'_> {
             let attempts = crate::tools::scan_call_attempts(&content);
             if attempts.is_empty() {
                 let answer = chat_template::sanitize_model_reply(&content);
-                finish(stream, Some(&answer));
-                if human {
+                let secs = started.elapsed().as_secs_f64();
+                let stats = stats_line(total_tokens, total_steps, secs, out.stopped_on_eot);
+                stream.finish(Some(&answer), Some(&stats));
+                if echo {
                     if answer.is_empty() {
                         println!("model> (empty response)");
                     } else {
                         println!("model> {answer}");
                     }
                 }
+                self.emit(&crate::chat::ChatEvent::Done {
+                    tokens: total_tokens,
+                    steps: total_steps,
+                    secs,
+                    stopped: out.stopped_on_eot,
+                    text: answer.clone(),
+                    thought,
+                });
                 return Ok(answer);
             }
             // Partial recovery: run the valid calls up to the first corrupted one,
@@ -1122,10 +1118,17 @@ impl TurnRunner<'_> {
                 &crate::tools::content_before_tool_calls(&content),
             );
             let preamble_line = (!preamble.trim().is_empty()).then(|| preamble.trim());
-            finish(stream, preamble_line);
-            if human && let Some(p) = preamble_line {
+            stream.finish(preamble_line, None);
+            if echo && let Some(p) = preamble_line {
                 println!("model> {p}");
             }
+            // The turn continues into tool execution: settle this round in the
+            // protocol (the terminal event is the turn-level `Done` below).
+            self.emit(&crate::chat::ChatEvent::RoundEnd {
+                round,
+                text: preamble.trim().to_string(),
+                thought: thought.clone(),
+            });
             let oai = crate::tools::to_openai_tool_calls(to_run);
             messages.push(serde_json::json!({
                 "role": "assistant", "content": "", "tool_calls": oai,
@@ -1137,6 +1140,11 @@ impl TurnRunner<'_> {
                     Some(v) => v.to_string(),
                     None => String::new(),
                 };
+                self.emit(&crate::chat::ChatEvent::ToolCall {
+                    round,
+                    name: call.name.clone(),
+                    input: input.clone(),
+                });
                 let raw_output = match self.shell_tools.iter().find(|t| t.name == call.name) {
                     Some(t) => run_shell_tool(t, &call.arguments),
                     None => format!("error: no tool named '{}'", call.name),
@@ -1147,15 +1155,25 @@ impl TurnRunner<'_> {
                 for d in directives {
                     match d {
                         ToolDirective::Set(name, value) => {
-                            if human {
+                            if self.interactive {
                                 println!("  · set {name} = {}", preview(&value, 60));
                             }
+                            self.emit(&crate::chat::ChatEvent::VarSet {
+                                name: name.clone(),
+                                value: value.clone(),
+                            });
                             self.vars.insert(name, value);
                         }
                         ToolDirective::End(reply) => ended = Some(reply),
                     }
                 }
-                if !self.json {
+                self.emit(&crate::chat::ChatEvent::ToolResult {
+                    round,
+                    name: call.name.clone(),
+                    input: input.clone(),
+                    output: output.clone(),
+                });
+                if self.interactive {
                     let head = format!("tool> {}({})", call.name, preview(&input, 48));
                     match output.trim_end() {
                         "" => println!("{head} -> (no output)"),
@@ -1179,23 +1197,17 @@ impl TurnRunner<'_> {
             // A tool ended the turn: use its reply as the final answer instead of
             // generating another round.
             if let Some(reply) = ended {
-                if human && !reply.is_empty() {
+                if self.interactive && !reply.is_empty() {
                     println!("model> {reply}");
                 }
-                if let Some(mut w) = self.sink() {
-                    use std::io::Write as _;
-                    let ev = crate::chat::ChatEvent::Done {
-                        tokens: 0,
-                        steps: 0,
-                        secs: 0.0,
-                        stopped: true,
-                        text: reply.clone(),
-                    };
-                    if serde_json::to_writer(&mut w, &ev).is_ok() {
-                        let _ = w.write_all(b"\n");
-                        let _ = w.flush();
-                    }
-                }
+                self.emit(&crate::chat::ChatEvent::Done {
+                    tokens: total_tokens,
+                    steps: total_steps,
+                    secs: started.elapsed().as_secs_f64(),
+                    stopped: true,
+                    text: reply.clone(),
+                    thought: None,
+                });
                 return Ok(reply);
             }
             // A corrupted call: the prefix ran; error on the corruption and let
@@ -1205,9 +1217,13 @@ impl TurnRunner<'_> {
                     .map(|k| attempts[k].0.clone())
                     .filter(|n| !n.is_empty())
                     .unwrap_or_else(|| "tool".to_string());
-                if human {
+                if self.interactive {
                     println!("tool> {name}(malformed) -> discarded; asking the model to reissue");
                 }
+                self.emit(&crate::chat::ChatEvent::ToolRetry {
+                    round,
+                    name: name.clone(),
+                });
                 messages.push(serde_json::json!({
                     "role": "tool", "name": name,
                     "content": "error: this tool call was malformed and was discarded; the calls \
@@ -1216,9 +1232,10 @@ impl TurnRunner<'_> {
                 continue;
             }
         }
-        if !self.json {
+        if self.interactive {
             println!("model> (stopped after {MAX_ROUNDS} tool rounds without a final answer)");
         }
+        self.emit(&done_empty());
         Ok(String::new())
     }
 
@@ -1234,12 +1251,31 @@ impl TurnRunner<'_> {
         reply: &str,
     ) -> Result<(String, Option<String>), crate::Error> {
         let thought = thought.map(|t| expand_thinking(t, history, system, &self.vars));
-        if !self.json {
+        // No generation ran, so no renderer exists: echo directly on an
+        // interactive tty; plain sessions display from the events below.
+        if self.interactive {
             if let Some(t) = &thought {
                 println!("\x1b[90mthink> {}\x1b[0m", t.trim());
             }
             println!("model> {reply}");
         }
+        if let Some(t) = &thought {
+            self.emit(&crate::chat::ChatEvent::Thought {
+                text: t.trim().to_string(),
+            });
+        }
+        self.emit(&crate::chat::ChatEvent::Text {
+            committed: reply.len(),
+            text: reply.to_string(),
+        });
+        self.emit(&crate::chat::ChatEvent::Done {
+            tokens: 0,
+            steps: 0,
+            secs: 0.0,
+            stopped: true,
+            text: reply.to_string(),
+            thought: thought.clone(),
+        });
         // Prefill the KV to the conversation including this forced turn (thought
         // rendered as a real channel). Raw-prompt sessions have no template to
         // prefill against; history alone carries it (lazy prefill next turn).
@@ -1273,6 +1309,7 @@ fn run_turn(
     turn: &Turn,
     system: Option<&str>,
 ) -> Result<(), crate::Error> {
+    runner.emit(&crate::chat::ChatEvent::TurnStart { turn: *turn_idx });
     let (reply, thought) = turn.produce(runner, history, system, *turn_idx)?;
     history.push(match thought {
         Some(t) => chat_template::ChatTurn::model_with_thought(t, reply),
@@ -1331,32 +1368,27 @@ pub(crate) fn run_chat_cmd(
     // spinner/streaming renderer runs on an interactive tty (not under
     // --verbose). `--events <path>` tees the JSONL to a file either way.
     let interactive = !json && !verbose && io::stdout().is_terminal();
-    let events_file = match &events_path {
-        Some(p) => match std::fs::File::create(p) {
-            Ok(f) => Some(f),
+    // The session's event sinks: every turn event flows through this set; the
+    // interactive renderer is the one extra view on the same stream.
+    let mut sink_set = crate::chat::SinkSet::new();
+    if json {
+        sink_set.push(Box::new(crate::chat::JsonlSink(io::stdout())));
+    }
+    if let Some(p) = &events_path {
+        match std::fs::File::create(p) {
+            Ok(f) => sink_set.push(Box::new(crate::chat::JsonlSink(f))),
             Err(err) => {
                 eprintln!("error: cannot open --events {}: {err}", p.display());
                 return ExitCode::FAILURE;
             }
-        },
-        None => None,
-    };
-    // Per-turn JSON sink factory: stdout for --json, a cloned handle to the
-    // events file otherwise. `None` when neither is requested.
-    let make_json_sink = |turn_active: bool| -> Option<Box<dyn Write + Send>> {
-        if !turn_active {
-            return None;
         }
-        if json {
-            Some(Box::new(io::stdout()))
-        } else {
-            events_file
-                .as_ref()
-                .and_then(|f| f.try_clone().ok())
-                .map(|f| Box::new(f) as Box<dyn Write + Send>)
-        }
-    };
-    let want_json = json || events_file.is_some();
+    }
+    if !interactive && !json {
+        // Renderless human display (piped stdin / --verbose): settled lines.
+        sink_set.push(Box::new(crate::chat::PlainSink));
+    }
+    let sinks = sink_set.into_shared();
+    let want_json = json || events_path.is_some();
 
     if !dgq::store::looks_like_dgq_dir(model_dir) {
         eprintln!("error: chat requires a .dgq directory (-m /path/to/quantized-weights)");
@@ -1485,11 +1517,10 @@ pub(crate) fn run_chat_cmd(
         model_dir,
         tools_json: &tools_json,
         shell_tools: &shell_tools,
-        events_file: &events_file,
+        sinks: std::sync::Arc::clone(&sinks),
         raw_prompt,
         interactive,
         json,
-        want_json,
         max_seq: CHAT_MAX_SEQ,
         explicit_cap,
         seed,
@@ -1639,11 +1670,7 @@ pub(crate) fn run_chat_cmd(
                     seed: seed.wrapping_add(turn_idx).wrapping_add(0x5_1793),
                     cell: have_editor.then(|| std::sync::Arc::clone(&suggestion_cell)),
                     printer: printer.clone(),
-                    json_sink: if want_json {
-                        make_json_sink(true)
-                    } else {
-                        None
-                    },
+                    sinks: std::sync::Arc::clone(&sinks),
                 };
                 task = Some(suggester.spawn(history.clone(), turn_idx));
             }
