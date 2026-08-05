@@ -1,8 +1,8 @@
 //! `smoketest` gate subcommand + fixture spec types.
 
-use super::*;
 use super::programmatic::{ProgCounts, ProgProbe};
 use super::soft::{SoftCounts, SoftProbe};
+use super::*;
 
 /// Which tier of the spec a run exercises. The tiers have different session
 /// budgets and different judging, so exactly one runs per invocation; `census`
@@ -256,7 +256,9 @@ pub(crate) fn run_smoketest(
     let longctx = battery == Battery::LongCtx;
 
     if !dgq::store::looks_like_dgq_dir(model_dir) {
-        return SmokeOutcome::err("error: smoketest requires a .dgq directory (-m /path/to/quantized-weights)");
+        return SmokeOutcome::err(
+            "error: smoketest requires a .dgq directory (-m /path/to/quantized-weights)",
+        );
     }
 
     let default_path = std::path::PathBuf::from("fixtures/smoketest/prompts.json");
@@ -284,7 +286,8 @@ pub(crate) fn run_smoketest(
             .retain(|p| p.id.to_ascii_lowercase().contains(&pat));
         spec.programmatic
             .retain(|p| p.id.to_ascii_lowercase().contains(&pat));
-        spec.soft.retain(|p| p.id.to_ascii_lowercase().contains(&pat));
+        spec.soft
+            .retain(|p| p.id.to_ascii_lowercase().contains(&pat));
         let kept = match battery {
             Battery::LongCtx => spec.longctx.len(),
             Battery::Programmatic => spec.programmatic.len(),
@@ -402,7 +405,7 @@ pub(crate) fn run_smoketest(
         // (chat's KV-reuse continuation would otherwise answer the first prompt).
         session.reset_kv();
         let history = vec![chat_template::ChatTurn::user(prompt_text)];
-        let prompt = build_chat_prompt_tokens(model_dir, &history, raw_prompt)?;
+        let prompt = build_chat_prompt_tokens(model_dir, &history, raw_prompt, false)?;
         let prompt_len = prompt.len();
         // Bound generation (and thus time + KV) — a gate doesn't need essays.
         step_cfg.max_new_tokens = gen_cap.min(smoke_max_seq.saturating_sub(prompt_len).max(1));
@@ -558,8 +561,12 @@ pub(crate) fn run_smoketest(
             };
             println!(
                 "programmatic: {}/{} cases pass ({rate:.1}%)  compile_fail {}  wrong_output {}  fenced {}/{} probes",
-                counts.pass, counts.cases, counts.compile_fail, counts.wrong_output,
-                counts.fenced, counts.probes,
+                counts.pass,
+                counts.cases,
+                counts.compile_fail,
+                counts.wrong_output,
+                counts.fenced,
+                counts.probes,
             );
             continue;
         }
@@ -612,7 +619,11 @@ pub(crate) fn run_smoketest(
                         acc.found += 1;
                     }
                 }
-                let prev = reply.chars().take(58).collect::<String>().replace('\n', " ");
+                let prev = reply
+                    .chars()
+                    .take(58)
+                    .collect::<String>()
+                    .replace('\n', " ");
                 println!(
                     "  {id:<22} {mark:<4} {cls:<34} steps {st:>3}/{max:<3} | {prev}",
                     id = p.id,
@@ -621,7 +632,13 @@ pub(crate) fn run_smoketest(
                     max = p.max_steps,
                 );
             }
-            let pct = |a: u64, b: u64| if b == 0 { 0.0 } else { 100.0 * a as f64 / b as f64 };
+            let pct = |a: u64, b: u64| {
+                if b == 0 {
+                    0.0
+                } else {
+                    100.0 * a as f64 / b as f64
+                }
+            };
             println!(
                 "soft retrieval: {}/{} ({:.1}%)   absence-declined: {}/{} ({:.1}%)  [rates only — not pass/fail]",
                 acc.found,

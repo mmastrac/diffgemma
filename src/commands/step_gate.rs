@@ -103,7 +103,7 @@ pub(crate) fn run_chat_quality_gate(model_dir: &std::path::Path, layers: usize) 
     };
 
     let history: Vec<chat_template::ChatTurn> = vec![chat_template::ChatTurn::user(&gate.prompt)];
-    let prompt = match build_chat_prompt_tokens(model_dir, &history, false) {
+    let prompt = match build_chat_prompt_tokens(model_dir, &history, false, false) {
         Ok(ids) => ids,
         Err(err) => {
             eprintln!("error: {err}");

@@ -238,6 +238,7 @@ pub(crate) fn build_turns(messages: &[serde_json::Value]) -> Vec<crate::chat_tem
             Some(crate::chat_template::ChatTurn {
                 role,
                 content: crate::tools::message_text(m),
+                thought: None,
             })
         })
         .collect()

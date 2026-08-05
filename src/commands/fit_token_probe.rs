@@ -179,10 +179,12 @@ fn collect_rows_from_generation(
             .class_names
             .iter()
             .position(|c| *c == s.class)
-            .ok_or_else(|| format!("sample {i}: unknown class {:?}", s.class))? as u8;
+            .ok_or_else(|| format!("sample {i}: unknown class {:?}", s.class))?
+            as u8;
         session.reset_kv();
         let history = vec![chat_template::ChatTurn::user(&s.prompt)];
-        let prompt = build_chat_prompt_tokens(model_dir, &history, false).map_err(|e| e.to_string())?;
+        let prompt = build_chat_prompt_tokens(model_dir, &history, false, false)
+            .map_err(|e| e.to_string())?;
         let _ = crate::token_class::collect::take(); // drop anything stale
         generate_with_session(&mut session, &prompt, &step_cfg, "fit-token-probe")
             .map_err(|e| e.to_string())?;
@@ -330,7 +332,15 @@ pub(crate) fn run_fit_token_probe_cmd(
         }
     }
 
-    finish_fit(&rows, &y, &spec, spec.samples.len(), spec_path, output, seed)
+    finish_fit(
+        &rows,
+        &y,
+        &spec,
+        spec.samples.len(),
+        spec_path,
+        output,
+        seed,
+    )
 }
 
 /// Shared tail: fit the direction, report a held-out score, write the probe.

@@ -14,6 +14,26 @@ use serde::Serialize;
 /// enough to stream. 2 proved too eager on fast-converging replies.
 const STABLE_STREAK: u32 = 2;
 
+/// Thought-channel markers as they decode to text (byte-identical to the ids).
+const CHANNEL_OPEN: &str = "<|channel>";
+const CHANNEL_CLOSE: &str = "<channel|>";
+
+/// Strip a leading thought-open marker (`<|channel>thought\n`) from decoded
+/// reasoning so the surfaced thought is clean text. A normal always-thinking
+/// turn generates the open marker itself; a `/prethink` continuation begins
+/// inside the thought (the marker was in the prompt) and is returned unchanged.
+/// While the role line is still forming (`<|channel>thou`), yields "" until the
+/// newline arrives rather than flashing the partial marker.
+fn strip_thought_open(s: &str) -> &str {
+    let Some(rest) = s.strip_prefix(CHANNEL_OPEN) else {
+        return s; // no open marker: a prethink continuation
+    };
+    match rest.split_once('\n') {
+        Some((_role, body)) => body,
+        None => "", // role line ("thought\n") not complete yet
+    }
+}
+
 /// One event in the chat stream. Serialized as a JSON object tagged by `type`.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -42,6 +62,11 @@ pub enum ChatEvent {
     /// revised). Always immediately followed by a `Text` with the new content.
     /// `common` is a char boundary.
     Rewind { common: usize },
+    /// Streamed reasoning (thought-channel) text so far. Rendered as grey
+    /// `think>` lines and never part of the committed answer. Emitted only when
+    /// a turn surfaces its reasoning live (`--show-thinking` / `/prethink`); a
+    /// plain turn keeps its thought hidden and this event is absent.
+    Thought { text: String },
     /// A canvas block's tokens became final (immutable).
     BlockCommit {
         block: usize,
@@ -107,6 +132,18 @@ pub struct StreamDecoder<D: TextDecoder> {
     committed_text: String,
     ended: bool,
     last_text: String,
+    /// Surface the reasoning live: emit `Thought` events for the thought-channel
+    /// content and only treat the post-`<channel|>` text as the answer. Set by
+    /// `--show-thinking` and implied by a `/prethink` seed. When false the
+    /// thought is stripped silently and only the answer streams (the default).
+    thinking_display: bool,
+    /// Last surfaced thought text, for `Thought`-event dedup.
+    last_thought: String,
+    /// Set for a `/prethink` turn: generation runs inside an already-open
+    /// thought channel, so the surfaced reasoning is `seed + thought-so-far`
+    /// (up to the model's `<channel|>`). Absent for a plain `--show-thinking`
+    /// turn, whose generation opens its own thought channel.
+    prethink_seed: Option<String>,
 }
 
 impl<D: TextDecoder> StreamDecoder<D> {
@@ -121,7 +158,20 @@ impl<D: TextDecoder> StreamDecoder<D> {
             committed_text: String::new(),
             ended: false,
             last_text: String::new(),
+            thinking_display: false,
+            last_thought: String::new(),
+            prethink_seed: None,
         }
+    }
+
+    /// Surface reasoning live: emit `Thought` events and split the answer at the
+    /// model's `<channel|>`. `seed` is the `/prethink` continuation prefix (the
+    /// reasoning the prompt already opened with); `None` for a plain
+    /// `--show-thinking` turn that opens its own thought channel.
+    pub fn with_thinking(mut self, show_thinking: bool, seed: Option<String>) -> Self {
+        self.thinking_display = show_thinking || seed.is_some();
+        self.prethink_seed = seed;
+        self
     }
 
     /// The immutable committed reply text so far.
@@ -187,6 +237,72 @@ impl<D: TextDecoder> StreamDecoder<D> {
             canvas: ev.argmax.len(),
             locked: block_ids.len(),
         });
+
+        // Thinking display (`--show-thinking` / `/prethink`): re-decode the whole
+        // generation each step and split it at the model's `<channel|>`. The
+        // reasoning before it streams as `Thought`, the answer after it as the
+        // normal `Text`. The full re-decode splits a thought that spans several
+        // blocks correctly, where the append-then-sanitize path below needs the
+        // open marker in the live block.
+        if self.thinking_display {
+            if ev.block_done {
+                self.committed_ids.extend_from_slice(&block_ids);
+                self.last_argmax.clear();
+                self.streak.clear();
+                if hit_stop {
+                    self.ended = true;
+                }
+            }
+            let seed = self.prethink_seed.as_deref().unwrap_or("");
+            // Split a decoded generation at the thought close: reasoning before,
+            // answer after (empty until the thought closes).
+            let split = |raw: &str| -> (String, String) {
+                match raw.split_once(CHANNEL_CLOSE) {
+                    Some((b, a)) => (
+                        format!("{seed}{}", strip_thought_open(b)),
+                        crate::chat_template::sanitize_model_reply(a),
+                    ),
+                    None => (format!("{seed}{}", strip_thought_open(raw)), String::new()),
+                }
+            };
+            let strip = crate::sample::strip_degenerate_token_ids;
+            // Committed view = finalized blocks only; its answer is the immutable
+            // prefix. Full view = committed + the live draft. Deriving `committed`
+            // from the committed view keeps it monotonic across blocks, so the
+            // renderer never resets its print cursor mid-answer and re-emits the
+            // whole reply on each block boundary.
+            let committed_raw = self.decoder.decode(&strip(&self.committed_ids));
+            let (_, committed_answer) = split(&committed_raw);
+            let full_raw = if ev.block_done {
+                committed_raw
+            } else {
+                let mut ids = self.committed_ids.clone();
+                ids.extend_from_slice(&block_ids);
+                self.decoder.decode(&strip(&ids))
+            };
+            let (thought, answer) = split(&full_raw);
+
+            if thought != self.last_thought {
+                out.push(ChatEvent::Thought {
+                    text: thought.clone(),
+                });
+                self.last_thought = thought;
+            }
+            if answer != self.last_text {
+                if !answer.starts_with(&self.last_text) {
+                    out.push(ChatEvent::Rewind {
+                        common: common_prefix_len(&self.last_text, &answer),
+                    });
+                }
+                let committed = common_prefix_len(&committed_answer, &answer);
+                out.push(ChatEvent::Text {
+                    committed,
+                    text: answer.clone(),
+                });
+                self.last_text = answer;
+            }
+            return out;
+        }
 
         if ev.block_done {
             self.committed_ids.extend_from_slice(&block_ids);
@@ -280,6 +396,16 @@ mod tests {
             .collect()
     }
 
+    fn thoughts(events: &[ChatEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ChatEvent::Thought { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn suggestion_event_serializes_tagged() {
         let ev = ChatEvent::Suggestion {
@@ -306,6 +432,128 @@ mod tests {
         // Step 3: streak 2 → both positions stream.
         let e3 = d.on_step(&step(1, 3, &hi, false));
         assert_eq!(texts(&e3), vec!["Hi"]);
+    }
+
+    #[test]
+    fn prethink_streams_seed_then_thought() {
+        let mut d =
+            StreamDecoder::new(FakeDecoder, vec![]).with_thinking(false, Some("SEED ".into()));
+        let hi = [b'H' as u32, b'i' as u32];
+        // The reasoning surfaces as `Thought` (never `Text`): the injected seed
+        // shows immediately, before any generated thought stabilizes.
+        let e1 = d.on_step(&step(1, 1, &hi, false));
+        assert_eq!(thoughts(&e1), vec!["SEED "]);
+        assert_eq!(texts(&e1), Vec::<&str>::new());
+        assert_eq!(
+            thoughts(&d.on_step(&step(1, 2, &hi, false))),
+            Vec::<&str>::new()
+        );
+        // Then the thought streams in, still prefixed by the seed.
+        assert_eq!(
+            thoughts(&d.on_step(&step(1, 3, &hi, false))),
+            vec!["SEED Hi"]
+        );
+    }
+
+    #[test]
+    fn strip_thought_open_drops_only_the_open_marker() {
+        // A normal turn opens its own thought: the marker + role line go.
+        assert_eq!(
+            strip_thought_open("<|channel>thought\nreasoning"),
+            "reasoning"
+        );
+        // A `/prethink` continuation has no open marker: unchanged.
+        assert_eq!(
+            strip_thought_open("continuing the seed"),
+            "continuing the seed"
+        );
+        // Role line still forming: nothing to show yet.
+        assert_eq!(strip_thought_open("<|channel>thou"), "");
+    }
+
+    /// Decoder that also renders two sentinel ids as the thought-channel markers,
+    /// so a normal-turn `--show-thinking` flow can be exercised end to end.
+    struct MarkerDecoder;
+    impl TextDecoder for MarkerDecoder {
+        fn decode(&self, ids: &[u32]) -> String {
+            let mut s = String::new();
+            self.decode_append(&mut s, ids);
+            s
+        }
+        fn decode_append(&self, out: &mut String, ids: &[u32]) {
+            for &id in ids {
+                match id {
+                    200 => out.push_str("<|channel>thought\n"),
+                    201 => out.push_str("<channel|>"),
+                    32..=127 => out.push(id as u8 as char),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn show_thinking_splits_reasoning_from_answer() {
+        // Normal turn (no seed) with show_thinking: the model opens its own
+        // thought, reasons, closes, then answers.
+        let mut d = StreamDecoder::new(MarkerDecoder, vec![]).with_thinking(true, None);
+        // Reasoning canvas: <|channel>thought\n 'H' 'i', stabilizes by step 3.
+        let reasoning = [200u32, b'H' as u32, b'i' as u32];
+        let _ = d.on_step(&step(1, 1, &reasoning, false));
+        let _ = d.on_step(&step(1, 2, &reasoning, false));
+        let e = d.on_step(&step(1, 3, &reasoning, false));
+        // The reasoning surfaced as Thought, never as answer Text.
+        assert_eq!(thoughts(&e), vec!["Hi"]);
+        assert_eq!(texts(&e), Vec::<&str>::new());
+        // Now the thought closes and the answer appears (committed on block_done).
+        let full = [
+            200u32,
+            b'H' as u32,
+            b'i' as u32,
+            201,
+            b'O' as u32,
+            b'k' as u32,
+        ];
+        let done = d.on_step(&step(1, 4, &full, true));
+        assert_eq!(texts(&done), vec!["Ok"]);
+    }
+
+    /// Regression: a multi-block answer's committed prefix must grow monotonically
+    /// (a decrease reset the renderer's print cursor and re-emitted the reply).
+    #[test]
+    fn thinking_answer_committed_is_monotonic_across_blocks() {
+        let pairs = |events: &[ChatEvent]| -> Vec<(usize, String)> {
+            events
+                .iter()
+                .filter_map(|e| match e {
+                    ChatEvent::Text { committed, text } => Some((*committed, text.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut d = StreamDecoder::new(MarkerDecoder, vec![]).with_thinking(true, None);
+        // Block 1 completes: thought "Hi" closes, answer "Ab" is committed (len 2).
+        let b1 = [
+            200u32,
+            b'H' as u32,
+            b'i' as u32,
+            201,
+            b'A' as u32,
+            b'b' as u32,
+        ];
+        assert_eq!(
+            pairs(&d.on_step(&step(1, 1, &b1, true))),
+            vec![(2, "Ab".into())]
+        );
+        // Block 2 extends the answer with a still-speculative "cd": the committed
+        // prefix stays at the finalized length 2, never dropping to 0.
+        let b2 = [b'c' as u32, b'd' as u32];
+        let _ = d.on_step(&step(2, 1, &b2, false));
+        let _ = d.on_step(&step(2, 2, &b2, false));
+        assert_eq!(
+            pairs(&d.on_step(&step(2, 3, &b2, false))),
+            vec![(2, "Abcd".into())]
+        );
     }
 
     #[test]

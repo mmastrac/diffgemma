@@ -12,6 +12,7 @@ const TURN_OPEN: &str = "<|turn>";
 const TURN_CLOSE: &str = "<turn|>";
 const CHANNEL_OPEN: &str = "<|channel>";
 const CHANNEL_CLOSE: &str = "<channel|>";
+const THINK: &str = "<|think|>";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatRole {
@@ -24,6 +25,11 @@ pub enum ChatRole {
 pub struct ChatTurn {
     pub role: ChatRole,
     pub content: String,
+    /// A completed thought rendered ahead of the content as a real thought
+    /// channel (`<|channel>thought\n...<channel|>`) and NOT stripped, so it
+    /// persists in the KV across turns. Only meaningful on a model turn; set by
+    /// the chat REPL's `/thought`. `None` for every ordinary turn.
+    pub thought: Option<String>,
 }
 
 impl ChatTurn {
@@ -31,6 +37,7 @@ impl ChatTurn {
         Self {
             role: ChatRole::User,
             content: content.into(),
+            thought: None,
         }
     }
 
@@ -38,6 +45,7 @@ impl ChatTurn {
         Self {
             role: ChatRole::Model,
             content: content.into(),
+            thought: None,
         }
     }
 
@@ -45,6 +53,16 @@ impl ChatTurn {
         Self {
             role: ChatRole::System,
             content: content.into(),
+            thought: None,
+        }
+    }
+
+    /// A model turn carrying a persistent (unstripped) thought before `content`.
+    pub fn model_with_thought(thought: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: ChatRole::Model,
+            content: content.into(),
+            thought: Some(thought.into()),
         }
     }
 }
@@ -123,6 +141,27 @@ fn push_special(out: &mut Vec<u32>, tok: &Tokenizer, token: &str) -> Result<(), 
     Ok(())
 }
 
+fn append_turns(out: &mut Vec<u32>, tok: &Tokenizer, turns: &[ChatTurn]) -> Result<(), Error> {
+    for turn in turns {
+        push_special(out, tok, TURN_OPEN)?;
+        tok.encode_append(out, &format!("{}\n", role_name(turn.role)));
+        // A `/thought` model turn carries its reasoning as a real (unstripped)
+        // thought channel ahead of the answer, so it persists in the KV.
+        if turn.role == ChatRole::Model
+            && let Some(thought) = &turn.thought
+        {
+            push_special(out, tok, CHANNEL_OPEN)?;
+            tok.encode_append(out, "thought\n");
+            tok.encode_append(out, thought.trim());
+            push_special(out, tok, CHANNEL_CLOSE)?;
+        }
+        tok.encode_append(out, turn.content.trim());
+        push_special(out, tok, TURN_CLOSE)?;
+        tok.encode_append(out, "\n");
+    }
+    Ok(())
+}
+
 /// Build chat prompt token ids (HF `apply_chat_template` compatible).
 pub fn format_chat_token_ids(
     tok: &Tokenizer,
@@ -131,21 +170,96 @@ pub fn format_chat_token_ids(
 ) -> Result<Vec<u32>, Error> {
     let mut out = Vec::new();
     push_special(&mut out, tok, BOS_TOKEN)?;
-    for turn in turns {
+    // Reasoning mode when the caller asks (`enable_thinking`) or any turn carries
+    // a persisted `/thought`: emit a `<|think|>` system block (folding a leading
+    // system prompt into it, HF order: flag first). With neither, and no system
+    // prompt, this branch is skipped, keeping output byte-identical to the plain
+    // path (the golden gate).
+    let think_mode = opts.enable_thinking || turns.iter().any(|t| t.thought.is_some());
+    let first_is_system = turns.first().is_some_and(|t| t.role == ChatRole::System);
+    let rest = if think_mode || first_is_system {
         push_special(&mut out, tok, TURN_OPEN)?;
-        tok.encode_append(&mut out, &format!("{}\n", role_name(turn.role)));
-        tok.encode_append(&mut out, turn.content.trim());
+        tok.encode_append(&mut out, "system\n");
+        if think_mode {
+            push_special(&mut out, tok, THINK)?;
+            tok.encode_append(&mut out, "\n");
+        }
+        let rest = if first_is_system {
+            tok.encode_append(&mut out, turns[0].content.trim());
+            &turns[1..]
+        } else {
+            turns
+        };
         push_special(&mut out, tok, TURN_CLOSE)?;
         tok.encode_append(&mut out, "\n");
-    }
+        rest
+    } else {
+        turns
+    };
+    append_turns(&mut out, tok, rest)?;
     if opts.add_generation_prompt {
         push_special(&mut out, tok, TURN_OPEN)?;
         tok.encode_append(&mut out, "model\n");
-        if !opts.enable_thinking {
+        // Seed the empty closed thought only in non-reasoning mode; in reasoning
+        // mode the model opens its own thought instead.
+        if !think_mode {
             push_special(&mut out, tok, CHANNEL_OPEN)?;
             tok.encode_append(&mut out, "thought\n");
             push_special(&mut out, tok, CHANNEL_CLOSE)?;
         }
+    }
+    Ok(out)
+}
+
+/// Build chat prompt tokens that put the model in reasoning mode and pre-seed
+/// its thought channel, left open, so generation continues inside the thought.
+/// Two pieces are required, mirroring HF `enable_thinking`:
+///  - a system turn carrying `<|think|>`, which tells the model to reason then
+///    answer. Without it the model is in default mode (thought channel always
+///    empty) and treats the seed as ordinary answer text, never closing it.
+///  - the generation prompt ends `<|channel>thought\n<prethink>` with no
+///    closing `<channel|>`, so the model completes the thought, closes it, then
+///    answers.
+///
+/// Powers the chat REPL's `/prethink`. The caller must split the generated text
+/// at the first `<channel|>` (thought vs answer): the opening marker lives here
+/// in the prompt, not the output, so `sanitize_model_reply` would keep the
+/// completed thought (it sees a close with no matching open).
+///
+/// `close`: when `false` (prethink) the thought is left open for the model to
+/// complete; when `true` (`/thought`) it is closed with `<channel|>`, so the
+/// model writes only the answer after a settled thought.
+pub fn format_chat_token_ids_prethink(
+    tok: &Tokenizer,
+    turns: &[ChatTurn],
+    prethink: &str,
+    close: bool,
+) -> Result<Vec<u32>, Error> {
+    let mut out = Vec::new();
+    push_special(&mut out, tok, BOS_TOKEN)?;
+    // One system block: the `<|think|>` reasoning-mode flag, then any system
+    // prompt (a leading System turn), folded in as HF does (think flag first).
+    push_special(&mut out, tok, TURN_OPEN)?;
+    tok.encode_append(&mut out, "system\n");
+    push_special(&mut out, tok, THINK)?;
+    tok.encode_append(&mut out, "\n");
+    let rest = match turns.first() {
+        Some(t) if t.role == ChatRole::System => {
+            tok.encode_append(&mut out, t.content.trim());
+            &turns[1..]
+        }
+        _ => turns,
+    };
+    push_special(&mut out, tok, TURN_CLOSE)?;
+    tok.encode_append(&mut out, "\n");
+    append_turns(&mut out, tok, rest)?;
+    push_special(&mut out, tok, TURN_OPEN)?;
+    tok.encode_append(&mut out, "model\n");
+    push_special(&mut out, tok, CHANNEL_OPEN)?;
+    tok.encode_append(&mut out, "thought\n");
+    tok.encode_append(&mut out, prethink.trim());
+    if close {
+        push_special(&mut out, tok, CHANNEL_CLOSE)?;
     }
     Ok(out)
 }
@@ -256,17 +370,6 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_renders_as_a_leading_block() {
-        let Some(tok) = model_tokenizer() else {
-            return;
-        };
-        let turns = [ChatTurn::system("You are a pirate."), ChatTurn::user("Hi")];
-        let plain =
-            tok.decode(&format_chat_token_ids(&tok, &turns, &ChatFormatOptions::default()).unwrap());
-        assert!(plain.contains("<|turn>system\nYou are a pirate.<turn|>"));
-    }
-
-    #[test]
     fn sanitize_strips_turn_close() {
         assert_eq!(sanitize_model_reply("Hello world<turn|>\n"), "Hello world");
     }
@@ -316,6 +419,77 @@ mod tests {
             sanitize_model_reply("<|channel>\n\n<channel|>Plan.<channel|>"),
             "Plan."
         );
+    }
+
+    #[test]
+    fn prethink_seeds_an_open_thought_channel() {
+        let Some(tok) = model_tokenizer() else {
+            return;
+        };
+        let ids = format_chat_token_ids_prethink(
+            &tok,
+            &[ChatTurn::user("Why is the sky blue?")],
+            "Let me reason carefully.",
+            false,
+        )
+        .expect("format");
+        // The default (closed, empty) thought tail: <|channel>thought\n<channel|>.
+        let closed = format_chat_token_ids(
+            &tok,
+            &[ChatTurn::user("Why is the sky blue?")],
+            &ChatFormatOptions::default(),
+        )
+        .expect("format");
+        let open = tok.special_token_id(CHANNEL_OPEN).unwrap();
+        let close = tok.special_token_id(CHANNEL_CLOSE).unwrap();
+        let think = tok.special_token_id(THINK).unwrap();
+        // Reasoning-mode flag present, thought channel opened but left open, and
+        // the seed text decodes back inside it.
+        assert!(ids.contains(&think), "must carry the <|think|> flag");
+        assert!(ids.contains(&open));
+        assert_ne!(ids.last(), Some(&close), "thought channel must stay open");
+        assert_eq!(closed.last(), Some(&close), "default seals the thought");
+        assert!(tok.decode(&ids).contains("Let me reason carefully."));
+    }
+
+    #[test]
+    fn persisted_thought_renders_channel_and_think_flag() {
+        let Some(tok) = model_tokenizer() else {
+            return;
+        };
+        let turns = [
+            ChatTurn::user("Hi"),
+            ChatTurn::model_with_thought("They greeted me.", "Hello!"),
+            ChatTurn::user("Bye"),
+        ];
+        let s = tok
+            .decode(&format_chat_token_ids(&tok, &turns, &ChatFormatOptions::default()).unwrap());
+        // Reasoning-mode flag (a thought is present) and the thought rendered as
+        // a real closed channel ahead of the answer, not stripped.
+        assert!(s.contains(THINK));
+        assert!(
+            s.contains("<|turn>model\n<|channel>thought\nThey greeted me.<channel|>Hello!<turn|>")
+        );
+        // A turn with no thought still renders the flag once (whole convo is in
+        // reasoning mode) but no extra thought channel on the user turns.
+        assert_eq!(s.matches("<|channel>thought").count(), 1);
+    }
+
+    #[test]
+    fn system_prompt_renders_as_a_leading_block() {
+        let Some(tok) = model_tokenizer() else {
+            return;
+        };
+        let turns = [ChatTurn::system("You are a pirate."), ChatTurn::user("Hi")];
+        // Default path: system block before the user turn, no <|think|>.
+        let plain = tok
+            .decode(&format_chat_token_ids(&tok, &turns, &ChatFormatOptions::default()).unwrap());
+        assert!(plain.contains("<|turn>system\nYou are a pirate.<turn|>"));
+        assert!(!plain.contains(THINK));
+        // Prethink path: ONE system block carrying both the flag and the prompt.
+        let pre = tok.decode(&format_chat_token_ids_prethink(&tok, &turns, "seed", false).unwrap());
+        assert_eq!(pre.matches("<|turn>system").count(), 1);
+        assert!(pre.contains(&format!("<|turn>system\n{THINK}\nYou are a pirate.<turn|>")));
     }
 
     #[test]
