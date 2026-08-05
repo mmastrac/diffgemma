@@ -7,12 +7,16 @@
 //! primitives, keeping chat and serve in step on the fragile stable-prefix and
 //! channel-split rules.
 
+mod serve;
 mod split;
 mod stabilize;
 mod stream;
 #[cfg(test)]
+mod testutil;
+#[cfg(test)]
 mod tests;
 
+pub use serve::{DiffusionStreamMapper, WireDelta};
 pub use stream::StreamDecoder;
 
 pub(crate) use split::{ChannelIds, salvage_answer};
