@@ -592,9 +592,8 @@ impl TurnRunner<'_> {
             self.step_cfg.max_new_tokens = self.explicit_cap.map_or(budget, |c| c.min(budget));
             self.step_cfg.seed = self.seed.wrapping_add(turn_idx).wrapping_add(round as u64);
 
-            // The stream pumps decoder events into the sinks every round; the
-            // live terminal preview (`think>` + settled display) additionally
-            // runs on an interactive tty while reasoning is surfaced.
+            // Every round streams into the sinks; the live terminal preview
+            // additionally runs on an interactive tty while reasoning shows.
             let live = self.interactive && thinking;
             let stream = ChatStream::start(
                 std::sync::Arc::clone(self.tokenizer),
@@ -680,8 +679,7 @@ impl TurnRunner<'_> {
             if echo && let Some(p) = preamble_line {
                 println!("model> {p}");
             }
-            // The turn continues into tool execution: settle this round in the
-            // protocol (the terminal event is the turn-level `Done` below).
+            // The turn continues into tool execution; `Done` comes later.
             self.emit(&ChatEvent::RoundEnd {
                 round,
                 text: preamble.trim().to_string(),

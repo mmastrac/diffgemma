@@ -230,7 +230,7 @@ is dominated by its own token identity, so mode is a weak residual (in-regime
 LOO 0.641 vs cold 1.000). See [[token-mode-probe]].
 
 Remaining (block-level only): colour the per-block labels on
-`ChatEvent::BlockCommit` in `chat_ui`. Perf obligations are HARD requirements
+`ChatEvent::BlockCommit` in `chat::render`. Perf obligations are HARD requirements
 ([[perf-timing-methodology]]): exactly zero cost when OFF (capture not
 encoded at all — flag parsed once into `RuntimeConfig`), and MEASURED cost
 when ON (~1.44 MiB device copy per block, `bench-step-kernel --profile-steps`

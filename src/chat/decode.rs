@@ -63,10 +63,9 @@ impl ChannelIds {
     ///
     /// Reasoning is ONLY what sits inside an explicit `<|channel>…<channel|>`
     /// span the model actually emitted — classification follows emission, not
-    /// a mode flag (the old string rule "everything is reasoning until a close
-    /// appears" silently swallowed a whole turn when the model skipped the
-    /// thought ceremony and answered with a bare tool call). An unclosed span
-    /// runs to the end, so mid-thought streaming works. Channel ids inside an
+    /// a mode flag, so a turn that skips the thought ceremony and answers with
+    /// a bare tool call keeps its whole output visible. An unclosed span runs
+    /// to the end, so mid-thought streaming works. Channel ids inside an
     /// open `<|"|>` quote run are literal arg content: they neither toggle the
     /// thought state nor get filtered — a tool call writing a file that
     /// contains chat markup round-trips it byte-exact.

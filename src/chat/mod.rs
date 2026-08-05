@@ -3,15 +3,14 @@
 //! Everything a turn does flows through [`ChatEvent`]: streamed thought and
 //! answer text, block commits, tool rounds, forced injections, and the final
 //! authoritative reply. Producers ([`StreamDecoder`] for the per-step token
-//! flow, the turn drivers in `commands::chat` for orchestration) emit into
-//! [`EventSink`]s; consumers (the terminal renderer, the JSONL writer) only
-//! ever observe the stream. No consumer computes semantics, no producer
-//! renders.
+//! flow, [`engine`] for turn orchestration) emit into sinks; consumers (the
+//! terminal renderer, the JSONL writer) only ever observe the stream. No
+//! consumer computes semantics, no producer renders.
 //!
-//! - [`event`] — the `ChatEvent` protocol (JSONL-serializable, versioned by
-//!   additivity).
+//! - [`event`] — the `ChatEvent` protocol (JSONL-serializable).
 //! - [`decode`] — the pure decoding core: stable-prefix stabilization over
 //!   per-step canvas snapshots and the token-level thought/answer split.
+//! - [`engine`] — turn production: generation, the tool loop, forced replies.
 //! - [`render`] — the interactive terminal renderer (viewport pane, spinner),
 //!   a `ChatEvent` consumer.
 

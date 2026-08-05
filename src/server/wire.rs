@@ -194,8 +194,6 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
             return out;
         }
 
-        // Shared stable-prefix front end: streak tracking, stop cut, and
-        // cross-block quote parity for quoted-stop skipping.
         let sp = self.stab.on_step(ev);
         let (stable_ids, hit_stop) = (sp.ids, sp.hit_stop);
 
