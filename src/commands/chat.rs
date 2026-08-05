@@ -7,7 +7,7 @@ use super::*;
 
 #[cfg(target_os = "macos")]
 use crate::chat::engine::{
-    Execution, ShellTool, Thinking, Turn, TurnRunner, parse_tool_spec, run_turn, tool_declaration,
+    PendingTurn, ShellTool, TurnRunner, TurnSpec, parse_tool_spec, run_turn, tool_declaration,
 };
 
 /// One-line-per-command summary printed by `/help`.
@@ -622,21 +622,12 @@ pub(crate) fn run_chat_cmd(
         let first = first.trim();
         if !first.is_empty() {
             history.push(chat_template::ChatTurn::user(first));
-            let turn = Turn {
-                execution: if tools_json.is_empty() {
-                    Execution::Generate
-                } else {
-                    Execution::Tools {
-                        reseed_each_round: false,
-                    }
-                },
-                thinking: Thinking::Off,
-            };
+            let spec = TurnSpec::resolve(PendingTurn::default(), !tools_json.is_empty());
             if let Err(err) = run_turn(
                 &mut runner,
                 &mut history,
                 &mut turn_idx,
-                &turn,
+                &spec,
                 system_prompt.as_deref(),
             ) {
                 eprintln!("error: {err}");
@@ -1070,49 +1061,22 @@ pub(crate) fn run_chat_cmd(
 
         let submitted = expand_file_markers(line, &loaded_files);
         history.push(chat_template::ChatTurn::user(&submitted));
-        // Resolve the turn from the pending /thought, /response, /prethink and
-        // --tool state. `/response` forces the reply (writing the /thought too, if
-        // set); `/thought` alone prefills the closed thought and the model answers
-        // after it; else a prethink seed, then tools/normal. Owned strings bound
-        // here so the borrowed `Turn` outlives the call.
-        let thought = pending_thought.take();
-        let response = pending_response.take();
-        let (seed_owned, reseed) = match pending_prethink.take() {
-            Some(s) => (Some(s), false),
-            None => (persistent_prethink.clone(), true),
-        };
-        let prethink = seed_owned.as_deref().map_or(Thinking::Off, Thinking::Seed);
-        let turn = if let Some(r) = &response {
-            Turn {
-                execution: Execution::Forced {
-                    thought: thought.as_deref(),
-                    reply: r,
-                },
-                thinking: Thinking::Off,
-            }
-        } else if let Some(t) = &thought {
-            Turn {
-                execution: Execution::Generate,
-                thinking: Thinking::Prefilled(t),
-            }
-        } else if !tools_json.is_empty() {
-            Turn {
-                execution: Execution::Tools {
-                    reseed_each_round: reseed,
-                },
-                thinking: prethink,
-            }
-        } else {
-            Turn {
-                execution: Execution::Generate,
-                thinking: prethink,
-            }
-        };
+        // One-shot state is consumed here; `TurnSpec::resolve` owns the
+        // precedence between /response, /thought, /prethink and --tool.
+        let spec = TurnSpec::resolve(
+            PendingTurn {
+                response: pending_response.take(),
+                thought: pending_thought.take(),
+                prethink: pending_prethink.take(),
+                persistent_prethink: persistent_prethink.clone(),
+            },
+            !tools_json.is_empty(),
+        );
         if let Err(err) = run_turn(
             &mut runner,
             &mut history,
             &mut turn_idx,
-            &turn,
+            &spec,
             system_prompt.as_deref(),
         ) {
             eprintln!("error: {err}");

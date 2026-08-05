@@ -1,11 +1,13 @@
 //! The turn engine: everything that produces one chat turn's event stream.
 //!
-//! A [`Turn`] pairs an [`Execution`] (generate / tool loop / forced reply)
-//! with the [`Thinking`] channel modifier (off / `/prethink` seed /
-//! `/thought` prefill); [`TurnRunner`] holds the per-session machinery (the
-//! GPU pipeline, tokenizer, generation config, tool set) and runs the turn,
-//! emitting every protocol event through the session sinks. The REPL in
-//! `commands::chat` only parses input and owns conversation state.
+//! A [`TurnSpec`] pairs a [`ReplySource`] (generate / tool loop / forced
+//! reply) with a [`ThoughtPlan`] (the model's own thinking, a `/prethink`
+//! seed, or an injected `/thought`); [`TurnSpec::resolve`] owns the
+//! precedence between the REPL's pending commands. [`TurnRunner`] holds the
+//! per-session machinery (the GPU pipeline, tokenizer, generation config,
+//! tool set) and runs the turn, emitting every protocol event through the
+//! session sinks. The REPL in `commands::chat` only parses input and owns
+//! conversation state.
 
 use super::{
     ChannelIds, ChatEvent, ChatStream, SharedSinks, StreamDisplay,
@@ -238,43 +240,111 @@ pub(crate) struct TurnRunner<'a> {
     pub vars: std::collections::HashMap<String, String>,
 }
 
-/// How a turn's thinking channel is seeded when the prompt is assembled: the
-/// one lifecycle point `/prethink` modifies. `Off` is the default closed empty
-/// thought (no reasoning). `Seed` carries a template expanded against the turn
-/// (see [`expand_thinking`]); the model completes it, then answers. A modifier
-/// orthogonal to execution: it applies to `Generate` and `Tools`, not `Forced`.
-#[derive(Clone, Copy)]
-pub(crate) enum Thinking<'a> {
-    Off,
-    /// Open seed: the model completes the reasoning, then answers (`/prethink`).
-    Seed(&'a str),
-    /// A closed, fully-formed thought: the model writes only the answer after
-    /// it, and the thought persists in the KV, unstripped (`/thought`).
-    Prefilled(&'a str),
-}
-
-/// What produces a turn's reply.
-pub(crate) enum Execution<'a> {
-    /// One `Generate` (streamed).
+/// What a turn's reply comes from.
+#[derive(Debug, PartialEq)]
+pub(crate) enum ReplySource {
+    /// One streamed `Generate`.
     Generate,
-    /// The tool-calling loop. `reseed_each_round` re-seeds the thought every
-    /// round (persistent prethink) rather than just round 0.
-    Tools { reseed_each_round: bool },
-    /// Force the reply with no generation (prefill only). `thought`, when set
-    /// (`/thought` alongside `/response`), is written as a persistent thought
-    /// before the reply.
-    Forced {
-        thought: Option<&'a str>,
-        reply: &'a str,
-    },
+    /// The tool-calling loop.
+    Tools,
+    /// A forced reply (`/response`): no generation, the text becomes the model
+    /// turn and the KV is prefilled to match.
+    Forced(String),
 }
 
-/// A resolved chat turn: an executor plus the thinking-channel modifier. The
-/// dispatch lives in one place; a new behavior is a new `Execution` arm or a new
-/// modifier, not a branch smeared through the loop.
-pub(crate) struct Turn<'a> {
-    pub execution: Execution<'a>,
-    pub thinking: Thinking<'a>,
+/// What the thought channel holds this turn. Templates expand against live
+/// turn state (see [`expand_thinking`]) when the prompt is assembled.
+#[derive(Debug, PartialEq)]
+pub(crate) enum ThoughtPlan {
+    /// The model's own thinking, per the session defaults.
+    Model,
+    /// `/prethink`: an open seed the model completes before answering. A
+    /// `persistent` seed re-applies on every tool round, a one-shot on round 0
+    /// only (a plain generate has one round, so the flag is inert there).
+    Seeded { template: String, persistent: bool },
+    /// `/thought`: a closed, fully-formed thought the reply follows; persisted
+    /// in the KV, unstripped. Composes with `Generate` (the model answers
+    /// after it) and `Forced` (both injected); [`TurnSpec::resolve`] never
+    /// pairs it with `Tools`.
+    Injected(String),
+}
+
+/// A resolved chat turn: the reply source plus the thought-channel plan. The
+/// dispatch lives in one place; a new behavior is a new arm, not a branch
+/// smeared through the loop.
+#[derive(Debug, PartialEq)]
+pub(crate) struct TurnSpec {
+    pub source: ReplySource,
+    pub thought: ThoughtPlan,
+}
+
+/// The REPL's pending command state at message submit; the REPL moves its
+/// one-shot slots in and [`TurnSpec::resolve`] consumes them.
+#[derive(Default)]
+pub(crate) struct PendingTurn {
+    /// `/response`: force the next reply.
+    pub response: Option<String>,
+    /// `/thought`: inject a closed thought.
+    pub thought: Option<String>,
+    /// `/prethink`: one-shot seed for the next message.
+    pub prethink: Option<String>,
+    /// `/prethink persistent`: seed for every message.
+    pub persistent_prethink: Option<String>,
+}
+
+impl TurnSpec {
+    /// Resolve pending REPL state into the turn to run. Precedence:
+    /// `/response` forces the reply, carrying a pending `/thought` with it;
+    /// `/thought` alone injects the closed thought before a plain generate
+    /// (bypassing tools — an injected thought pins what the reply follows,
+    /// and a tool round would generate past it); otherwise a prethink seed
+    /// (one-shot over persistent) modifies the tool loop or a plain generate.
+    pub fn resolve(pending: PendingTurn, has_tools: bool) -> TurnSpec {
+        let PendingTurn {
+            response,
+            thought,
+            prethink,
+            persistent_prethink,
+        } = pending;
+        if let Some(reply) = response {
+            return TurnSpec {
+                source: ReplySource::Forced(reply),
+                thought: thought.map_or(ThoughtPlan::Model, ThoughtPlan::Injected),
+            };
+        }
+        if let Some(t) = thought {
+            return TurnSpec {
+                source: ReplySource::Generate,
+                thought: ThoughtPlan::Injected(t),
+            };
+        }
+        let thought = match (prethink, persistent_prethink) {
+            (Some(template), _) => ThoughtPlan::Seeded {
+                template,
+                persistent: false,
+            },
+            (None, Some(template)) => ThoughtPlan::Seeded {
+                template,
+                persistent: true,
+            },
+            (None, None) => ThoughtPlan::Model,
+        };
+        TurnSpec {
+            source: if has_tools {
+                ReplySource::Tools
+            } else {
+                ReplySource::Generate
+            },
+            thought,
+        }
+    }
+}
+
+/// What a turn produced: the reply, and the thought that persists with it in
+/// history (a closed `/thought` turn keeps its thought in the KV).
+pub(crate) struct TurnOutcome {
+    pub reply: String,
+    pub thought: Option<String>,
 }
 
 /// Expand a `/prethink` seed template against the turn: `$$last$$` -> the user's
@@ -345,26 +415,39 @@ fn parse_tool_directives(output: &str) -> (String, Vec<ToolDirective>) {
     (content.join("\n"), directives)
 }
 
-/// Split a seeded-thought generation at the model's `<channel|>`: returns the
-/// completed thought (`seed` + what the model wrote before the close) and the
-impl Turn<'_> {
-    /// Produce this turn's `(reply, persisted_thought)`. `history` holds the
-    /// just-submitted user turn but not the reply; each arm handles its own
-    /// display. The caller stores the reply (with the thought, if any, as an
-    /// unstripped thought channel) and advances `turn_idx`.
+impl TurnSpec {
+    /// Produce this turn's outcome. `history` holds the just-submitted user
+    /// turn but not the reply; each arm handles its own display. The caller
+    /// stores the reply (with the thought, if any, as an unstripped thought
+    /// channel) and advances `turn_idx`.
     fn produce(
         &self,
         run: &mut TurnRunner,
         history: &[chat_template::ChatTurn],
         system: Option<&str>,
         turn_idx: u64,
-    ) -> Result<(String, Option<String>), crate::Error> {
-        match self.execution {
-            Execution::Generate => run.generate_turn(history, system, self.thinking, turn_idx),
-            Execution::Tools { reseed_each_round } => run
-                .tool_turn(history, system, self.thinking, reseed_each_round, turn_idx)
-                .map(|reply| (reply, None)),
-            Execution::Forced { thought, reply } => {
+    ) -> Result<TurnOutcome, crate::Error> {
+        match &self.source {
+            ReplySource::Generate => run.generate_turn(history, system, &self.thought, turn_idx),
+            ReplySource::Tools => {
+                let (seed, reseed) = match &self.thought {
+                    ThoughtPlan::Seeded {
+                        template,
+                        persistent,
+                    } => (Some(template.as_str()), *persistent),
+                    _ => (None, false),
+                };
+                run.tool_turn(history, system, seed, reseed, turn_idx)
+                    .map(|reply| TurnOutcome {
+                        reply,
+                        thought: None,
+                    })
+            }
+            ReplySource::Forced(reply) => {
+                let thought = match &self.thought {
+                    ThoughtPlan::Injected(t) => Some(t.as_str()),
+                    _ => None,
+                };
                 run.forced_turn(history, system, thought, reply)
             }
         }
@@ -384,20 +467,22 @@ impl TurnRunner<'_> {
         &mut self,
         history: &[chat_template::ChatTurn],
         system: Option<&str>,
-        thinking: Thinking,
+        thought: &ThoughtPlan,
         turn_idx: u64,
-    ) -> Result<(String, Option<String>), crate::Error> {
-        // Resolve the thinking seed now (`$$last$$`/`$$prompt$$` expand against
-        // this turn). `close` = a fully-formed `/thought` (closed channel, model
-        // answers after it, thought persisted); open = `/prethink`. Raw-prompt
-        // sessions have no thought scaffold, so seeding is inert there.
-        let (seed, close) = match thinking {
-            Thinking::Seed(t) if !self.raw_prompt => {
-                (Some(expand_thinking(t, history, system, &self.vars)), false)
-            }
-            Thinking::Prefilled(t) if !self.raw_prompt => {
-                (Some(expand_thinking(t, history, system, &self.vars)), true)
-            }
+    ) -> Result<TurnOutcome, crate::Error> {
+        // Expand the thought template now (`$$last$$`/`$$prompt$$` bind to this
+        // turn). `close` = an injected `/thought` (closed channel, model
+        // answers after it, thought persisted); open = a `/prethink` seed.
+        // Raw-prompt sessions have no thought scaffold, so both are inert there.
+        let (seed, close) = match thought {
+            ThoughtPlan::Seeded { template, .. } if !self.raw_prompt => (
+                Some(expand_thinking(template, history, system, &self.vars)),
+                false,
+            ),
+            ThoughtPlan::Injected(template) if !self.raw_prompt => (
+                Some(expand_thinking(template, history, system, &self.vars)),
+                true,
+            ),
             _ => (None, false),
         };
         let turns = prepend_system(system, history);
@@ -437,7 +522,10 @@ impl TurnRunner<'_> {
                 );
             }
             self.emit(&done_empty());
-            return Ok((String::new(), None));
+            return Ok(TurnOutcome {
+                reply: String::new(),
+                thought: None,
+            });
         }
         self.step_cfg.max_new_tokens = self.explicit_cap.map_or(budget, |c| c.min(budget));
         self.step_cfg.seed = self.seed.wrapping_add(turn_idx);
@@ -528,27 +616,25 @@ impl TurnRunner<'_> {
                 .clone()
                 .or_else(|| split_thought_display.map(|t| t.trim().to_string())),
         });
-        Ok((reply, persisted))
+        Ok(TurnOutcome {
+            reply,
+            thought: persisted,
+        })
     }
 
-    /// Tool turn: run the render/generate/run-script loop.
+    /// Tool turn: run the render/generate/run-script loop. `seed` is the raw
+    /// `/prethink` template; it expands once against this turn.
     fn tool_turn(
         &mut self,
         history: &[chat_template::ChatTurn],
         system: Option<&str>,
-        thinking: Thinking,
+        seed: Option<&str>,
         reseed: bool,
         turn_idx: u64,
     ) -> Result<String, crate::Error> {
         let turns = prepend_system(system, history);
         let messages = chat_turns_to_messages(&turns);
-        // Expand the thinking seed once for the turn (`$$last$$`/`$$prompt$$`).
-        // The tool path seeds an open thought only; `/thought` (Prefilled) routes
-        // to the plain generate path, never here.
-        let seed = match thinking {
-            Thinking::Seed(t) => Some(expand_thinking(t, history, system, &self.vars)),
-            Thinking::Off | Thinking::Prefilled(_) => None,
-        };
+        let seed = seed.map(|t| expand_thinking(t, history, system, &self.vars));
         self.tool_loop(messages, seed.as_deref(), reseed, turn_idx)
     }
 
@@ -805,14 +891,14 @@ impl TurnRunner<'_> {
     /// Forced reply (`/response`, optionally with a `/thought`): no generation.
     /// The given text (preceded by the thought, if any) becomes the model turn
     /// and the KV is prefilled from the full conversation, as if the model had
-    /// produced it. Returns `(reply, persisted_thought)`.
+    /// produced it.
     fn forced_turn(
         &self,
         history: &[chat_template::ChatTurn],
         system: Option<&str>,
         thought: Option<&str>,
         reply: &str,
-    ) -> Result<(String, Option<String>), crate::Error> {
+    ) -> Result<TurnOutcome, crate::Error> {
         let thought = thought.map(|t| expand_thinking(t, history, system, &self.vars));
         // No generation ran, so no renderer exists: echo directly on an
         // interactive tty; plain sessions display from the events below.
@@ -858,24 +944,27 @@ impl TurnRunner<'_> {
                 eprintln!("error: prefill failed: {err}");
             }
         }
-        Ok((reply.to_string(), thought))
+        Ok(TurnOutcome {
+            reply: reply.to_string(),
+            thought,
+        })
     }
 }
 
-/// Run one chat turn: `turn` produces the reply, which is stored as the model
+/// Run one chat turn: `spec` produces the reply, which is stored as the model
 /// turn; `turn_idx` advances. `history` already holds the user turn.
 pub(crate) fn run_turn(
     runner: &mut TurnRunner,
     history: &mut Vec<chat_template::ChatTurn>,
     turn_idx: &mut u64,
-    turn: &Turn,
+    spec: &TurnSpec,
     system: Option<&str>,
 ) -> Result<(), crate::Error> {
     runner.emit(&ChatEvent::TurnStart { turn: *turn_idx });
-    let (reply, thought) = turn.produce(runner, history, system, *turn_idx)?;
-    history.push(match thought {
-        Some(t) => chat_template::ChatTurn::model_with_thought(t, reply),
-        None => chat_template::ChatTurn::model(reply),
+    let out = spec.produce(runner, history, system, *turn_idx)?;
+    history.push(match out.thought {
+        Some(t) => chat_template::ChatTurn::model_with_thought(t, out.reply),
+        None => chat_template::ChatTurn::model(out.reply),
     });
     *turn_idx = turn_idx.wrapping_add(1);
     Ok(())
@@ -884,10 +973,76 @@ pub(crate) fn run_turn(
 #[cfg(test)]
 mod tests {
     use super::{
-        ToolDirective, expand_thinking, parse_tool_directives, parse_tool_spec, run_shell_tool,
-        tool_declaration, valid_prefix_len,
+        PendingTurn, ReplySource, ThoughtPlan, ToolDirective, TurnSpec, expand_thinking,
+        parse_tool_directives, parse_tool_spec, run_shell_tool, tool_declaration, valid_prefix_len,
     };
     use crate::chat_template::ChatTurn;
+
+    fn pending(
+        response: Option<&str>,
+        thought: Option<&str>,
+        prethink: Option<&str>,
+        persistent: Option<&str>,
+    ) -> PendingTurn {
+        let own = |v: Option<&str>| v.map(str::to_string);
+        PendingTurn {
+            response: own(response),
+            thought: own(thought),
+            prethink: own(prethink),
+            persistent_prethink: own(persistent),
+        }
+    }
+
+    #[test]
+    fn resolve_response_wins_and_carries_the_thought() {
+        // `/response` + `/thought`: both forced, prethink ignored.
+        let spec = TurnSpec::resolve(
+            pending(Some("canned"), Some("staged"), Some("seed"), None),
+            true,
+        );
+        assert_eq!(spec.source, ReplySource::Forced("canned".into()));
+        assert_eq!(spec.thought, ThoughtPlan::Injected("staged".into()));
+        // `/response` alone: no thought.
+        let spec = TurnSpec::resolve(pending(Some("canned"), None, None, None), false);
+        assert_eq!(spec.thought, ThoughtPlan::Model);
+    }
+
+    #[test]
+    fn resolve_injected_thought_bypasses_tools() {
+        let spec = TurnSpec::resolve(pending(None, Some("staged"), None, None), true);
+        assert_eq!(spec.source, ReplySource::Generate);
+        assert_eq!(spec.thought, ThoughtPlan::Injected("staged".into()));
+    }
+
+    #[test]
+    fn resolve_one_shot_prethink_beats_persistent() {
+        let spec = TurnSpec::resolve(pending(None, None, Some("once"), Some("always")), false);
+        assert_eq!(
+            spec.thought,
+            ThoughtPlan::Seeded {
+                template: "once".into(),
+                persistent: false,
+            }
+        );
+        let spec = TurnSpec::resolve(pending(None, None, None, Some("always")), true);
+        assert_eq!(spec.source, ReplySource::Tools);
+        assert_eq!(
+            spec.thought,
+            ThoughtPlan::Seeded {
+                template: "always".into(),
+                persistent: true,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_defaults_to_the_session_shape() {
+        let spec = TurnSpec::resolve(PendingTurn::default(), false);
+        assert_eq!(spec.source, ReplySource::Generate);
+        assert_eq!(spec.thought, ThoughtPlan::Model);
+        let spec = TurnSpec::resolve(PendingTurn::default(), true);
+        assert_eq!(spec.source, ReplySource::Tools);
+    }
 
     #[test]
     fn expand_thinking_substitutes_last_and_prompt() {
