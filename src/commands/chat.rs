@@ -437,8 +437,7 @@ pub(crate) fn run_chat_cmd(
 
     // Parse `--tool NAME[:DESC]=COMMAND` specs up front so a bad spec fails
     // before the model loads. Non-empty => every turn uses the tool path.
-    let mut shell_tools: Vec<ShellTool> = match tools.iter().map(|s| parse_tool_spec(s)).collect()
-    {
+    let mut shell_tools: Vec<ShellTool> = match tools.iter().map(|s| parse_tool_spec(s)).collect() {
         Ok(t) => t,
         Err(err) => {
             eprintln!("error: {err}");
@@ -677,8 +676,7 @@ pub(crate) fn run_chat_cmd(
     // seeds every message until cleared and survives `/clear`. A one-shot seed,
     // if set, wins for that single turn.
     let mut pending_prethink: Option<String> = None;
-    let mut persistent_prethink: Option<String> =
-        harness.as_ref().and_then(|h| h.prethink.clone());
+    let mut persistent_prethink: Option<String> = harness.as_ref().and_then(|h| h.prethink.clone());
 
     // One-shot forced reply from `/response <text>`: the next message skips
     // generation entirely: the text becomes the model turn and the KV is

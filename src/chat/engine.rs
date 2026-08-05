@@ -84,12 +84,7 @@ pub(crate) struct ShellTool {
 }
 
 impl ShellTool {
-    pub fn new(
-        name: String,
-        description: String,
-        command: String,
-        params: Vec<ToolParam>,
-    ) -> Self {
+    pub fn new(name: String, description: String, command: String, params: Vec<ToolParam>) -> Self {
         Self {
             name,
             description,
@@ -454,8 +449,10 @@ fn valid_prefix_len(attempts: &[(String, bool)], first_bad: Option<usize>) -> us
 }
 
 /// A control directive a tool emits through its output, out of band from the
-/// text the model sees. One per trimmed line: `::end [reply]` ends the turn (with
-/// an optional final reply), `::set NAME=VALUE` sets a session variable.
+/// text the model sees. One per trimmed line: `::end [reply]` ends the turn —
+/// with the rest of the line as the final reply, or, when bare, the tool's
+/// remaining output (the multi-line form: compose the reply, then `::end`) —
+/// and `::set NAME=VALUE` sets a session variable.
 enum ToolDirective {
     End(String),
     Set(String, String),
@@ -561,11 +558,21 @@ impl TurnRunner<'_> {
         // Raw-prompt sessions have no thought scaffold, so both are inert there.
         let (seed, close) = match thought {
             ThoughtPlan::Seeded { template, .. } if !self.raw_prompt => (
-                Some(expand_thinking(template, history, system, &self.live_vars())),
+                Some(expand_thinking(
+                    template,
+                    history,
+                    system,
+                    &self.live_vars(),
+                )),
                 false,
             ),
             ThoughtPlan::Injected(template) if !self.raw_prompt => (
-                Some(expand_thinking(template, history, system, &self.live_vars())),
+                Some(expand_thinking(
+                    template,
+                    history,
+                    system,
+                    &self.live_vars(),
+                )),
                 true,
             ),
             _ => (None, false),
@@ -894,7 +901,15 @@ impl TurnRunner<'_> {
                             });
                             self.vars.insert(name, value);
                         }
-                        ToolDirective::End(reply) => ended = Some(reply),
+                        ToolDirective::End(reply) => {
+                            // Bare `::end`: the tool's remaining output IS the
+                            // reply (the multi-line form).
+                            ended = Some(if reply.is_empty() {
+                                output.clone()
+                            } else {
+                                reply
+                            });
+                        }
                     }
                 }
                 self.emit(&ChatEvent::ToolResult {
@@ -1221,8 +1236,8 @@ mod tests {
 
     #[test]
     fn shell_tool_sees_state_vars_under_harness_prefix() {
-        let t = parse_tool_spec("bump=printf '::set n=%s\\nwas %s' \"$input\" \"$HARNESS_n\"")
-            .unwrap();
+        let t =
+            parse_tool_spec("bump=printf '::set n=%s\\nwas %s' \"$input\" \"$HARNESS_n\"").unwrap();
         let vars = std::collections::HashMap::from([("n".to_string(), "41".to_string())]);
         let out = run_shell_tool(&t, &serde_json::json!({ "input": "42" }), &vars);
         // The state var arrives prefixed; the directive line is control, the

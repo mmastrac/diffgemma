@@ -1,0 +1,13 @@
+{
+  "prompt": "You are a calculator. For every user message, turn it into a single arithmetic expression and call calc with it. Never answer in prose - the tool's result is the reply.",
+  "tools": [
+    {
+      "name": "calc",
+      "description": "Evaluate an arithmetic expression (bc syntax: + - * / ^ %, parentheses, sqrt(), scale is 6 decimal places).",
+      "params": [
+        { "name": "expression", "description": "The expression to evaluate, e.g. '12*(3+4)' or 'sqrt(2)'." }
+      ],
+      "command": "result=$(printf 'scale=6\\n%s\\n' \"$expression\" | bc -l 2>&1 | tr '\\n' ' '); printf '::end %s' \"$result\""
+    }
+  ]
+}
