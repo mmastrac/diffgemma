@@ -16,7 +16,7 @@ mod testutil;
 #[cfg(test)]
 mod tests;
 
-pub use serve::{DiffusionStreamMapper, WireDelta};
+pub use serve::{DiffusionStreamMapper, MapperConfig, WireDelta};
 pub use stream::StreamDecoder;
 
 pub(crate) use split::{ChannelIds, salvage_answer};
