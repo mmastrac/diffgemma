@@ -563,7 +563,7 @@ pub(crate) fn parse_cli() -> Cli {
         Some("config") => Command::Config,
         Some("weights") => {
             let name = positional.get(1).cloned().unwrap_or_else(|| {
-                eprintln!("usage: diffgemma-mps weights <tensor_name>");
+                eprintln!("usage: diffgemma weights <tensor_name>");
                 std::process::exit(2);
             });
             Command::Weights(name)
@@ -664,9 +664,7 @@ pub(crate) fn parse_cli() -> Cli {
         Some("manifest") => Command::Manifest,
         Some("replay") => Command::Replay {
             log_path: positional.get(1).map(PathBuf::from).unwrap_or_else(|| {
-                eprintln!(
-                    "usage: diffgemma-mps replay <ops.jsonl> [-m MODEL] [--ctx N] [--steps N]"
-                );
+                eprintln!("usage: diffgemma replay <ops.jsonl> [-m MODEL] [--ctx N] [--steps N]");
                 std::process::exit(2);
             }),
             ctx: chat_ctx,
@@ -679,7 +677,7 @@ pub(crate) fn parse_cli() -> Cli {
         },
         Some("tokenize") => {
             let text = positional.get(1).cloned().unwrap_or_else(|| {
-                eprintln!("usage: diffgemma-mps tokenize <text>");
+                eprintln!("usage: diffgemma tokenize <text>");
                 std::process::exit(2);
             });
             Command::Tokenize(text)
@@ -713,7 +711,7 @@ pub(crate) fn parse_cli() -> Cli {
         Some("quantize") => {
             let out = output_dir.unwrap_or_else(|| {
                 eprintln!(
-                    "usage: diffgemma-mps quantize -o OUTPUT_DIR -m SOURCE [--profile q4|q5|q6|nvfp4|nvfp4x] \
+                    "usage: diffgemma quantize -o OUTPUT_DIR -m SOURCE [--profile q4|q5|q6|nvfp4|nvfp4x] \
                      [--set class=format ...] [--overlay [--hf-repo ORG/NAME --hf-revision REV]]"
                 );
                 std::process::exit(2);
@@ -730,12 +728,14 @@ pub(crate) fn parse_cli() -> Cli {
         Some("repack") => {
             if overlay_flag == monolithic_flag {
                 eprintln!(
-                    "usage: diffgemma-mps repack --overlay -o OUTPUT_DIR -m SOURCE_PACK [--hf-source DIR] [--hf-repo ORG/NAME --hf-revision REV]\n   or: diffgemma-mps repack --monolithic -o OUTPUT_DIR -m SOURCE_PACK   (exactly one of --overlay/--monolithic)"
+                    "usage: diffgemma repack --overlay -o OUTPUT_DIR -m SOURCE_PACK [--hf-source DIR] [--hf-repo ORG/NAME --hf-revision REV]\n   or: diffgemma repack --monolithic -o OUTPUT_DIR -m SOURCE_PACK   (exactly one of --overlay/--monolithic)"
                 );
                 std::process::exit(2);
             }
             let out = output_dir.unwrap_or_else(|| {
-                eprintln!("usage: diffgemma-mps repack --overlay|--monolithic -o OUTPUT_DIR -m SOURCE_PACK");
+                eprintln!(
+                    "usage: diffgemma repack --overlay|--monolithic -o OUTPUT_DIR -m SOURCE_PACK"
+                );
                 std::process::exit(2);
             });
             if monolithic_flag {
@@ -824,7 +824,7 @@ pub(crate) fn parse_cli() -> Cli {
         Some("step-logits-dump") => {
             let output = output_dir.unwrap_or_else(|| {
                 eprintln!(
-                    "usage: diffgemma-mps step-logits-dump -m MODEL -o OUT.json [-p Hello] [--layers 30] [--steps 2] [--seed 42] [--logit-positions 0,43,58] [--logit-top-k 10]"
+                    "usage: diffgemma step-logits-dump -m MODEL -o OUT.json [-p Hello] [--layers 30] [--steps 2] [--seed 42] [--logit-positions 0,43,58] [--logit-top-k 10]"
                 );
                 std::process::exit(2);
             });
@@ -843,7 +843,7 @@ pub(crate) fn parse_cli() -> Cli {
         Some("step-bf16-logits-dump") => {
             let output = output_dir.unwrap_or_else(|| {
                 eprintln!(
-                    "usage: diffgemma-mps step-bf16-logits-dump -m DGQ_DIR --bf16-ref BF16_DIR -o OUT.json [-p Hello] [--layers 30] [--steps 2] [--seed 42] [--logit-positions 0,1] [--gpu-kv]"
+                    "usage: diffgemma step-bf16-logits-dump -m DGQ_DIR --bf16-ref BF16_DIR -o OUT.json [-p Hello] [--layers 30] [--steps 2] [--seed 42] [--logit-positions 0,1] [--gpu-kv]"
                 );
                 std::process::exit(2);
             });
@@ -875,7 +875,7 @@ pub(crate) fn parse_cli() -> Cli {
         Some("fit-token-probe") => {
             let output = output_dir.unwrap_or_else(|| {
                 eprintln!(
-                    "usage: diffgemma-mps fit-token-probe -m MODEL --spec SPEC.json -o PROBE.json [--layer 29] [--seed 42]"
+                    "usage: diffgemma fit-token-probe -m MODEL --spec SPEC.json -o PROBE.json [--layer 29] [--seed 42]"
                 );
                 std::process::exit(2);
             });
@@ -895,7 +895,7 @@ pub(crate) fn parse_cli() -> Cli {
         Some("step-layer-probe") => {
             let output = output_dir.unwrap_or_else(|| {
                 eprintln!(
-                    "usage: diffgemma-mps step-layer-probe -m MODEL -o OUT.json [-p Hello] [--layers 30] [--seed 42] [--layer-position 129]"
+                    "usage: diffgemma step-layer-probe -m MODEL -o OUT.json [-p Hello] [--layers 30] [--seed 42] [--layer-position 129]"
                 );
                 std::process::exit(2);
             });
@@ -913,7 +913,7 @@ pub(crate) fn parse_cli() -> Cli {
         Some("step-attn-dump") => {
             let output = output_dir.unwrap_or_else(|| {
                 eprintln!(
-                    "usage: diffgemma-mps step-attn-dump -m MODEL -o OUT.json [-p Hello] [--layers 30] [--seed 42] [--attn-layer 2] [--layer-position 129]"
+                    "usage: diffgemma step-attn-dump -m MODEL -o OUT.json [-p Hello] [--layers 30] [--seed 42] [--attn-layer 2] [--layer-position 129]"
                 );
                 std::process::exit(2);
             });
@@ -931,7 +931,7 @@ pub(crate) fn parse_cli() -> Cli {
         Some("step-attn-qk-dump") => {
             let output = output_dir.unwrap_or_else(|| {
                 eprintln!(
-                    "usage: diffgemma-mps step-attn-qk-dump -m MODEL -o OUT_DIR \
+                    "usage: diffgemma step-attn-qk-dump -m MODEL -o OUT_DIR \
                      [--prompt-file DOC] [--attn-layer 5] [--max-seq N] [--seed 42]"
                 );
                 std::process::exit(2);
@@ -949,7 +949,7 @@ pub(crate) fn parse_cli() -> Cli {
         Some("step-moe-dump") => {
             let output = output_dir.unwrap_or_else(|| {
                 eprintln!(
-                    "usage: diffgemma-mps step-moe-dump -m MODEL -o OUT.json [-p Hello] [--layers 30] [--seed 42] [--attn-layer 2] [--layer-position 129]"
+                    "usage: diffgemma step-moe-dump -m MODEL -o OUT.json [-p Hello] [--layers 30] [--seed 42] [--attn-layer 2] [--layer-position 129]"
                 );
                 std::process::exit(2);
             });
@@ -967,7 +967,7 @@ pub(crate) fn parse_cli() -> Cli {
         Some("step-moe-route-dump") => {
             let output = output_dir.unwrap_or_else(|| {
                 eprintln!(
-                    "usage: diffgemma-mps step-moe-route-dump -m MODEL -o OUT.json [-p Hello] [--layers 30] [--seed 42] [--attn-layer 0] [--skip-grouped]"
+                    "usage: diffgemma step-moe-route-dump -m MODEL -o OUT.json [-p Hello] [--layers 30] [--seed 42] [--attn-layer 0] [--skip-grouped]"
                 );
                 std::process::exit(2);
             });
@@ -985,7 +985,7 @@ pub(crate) fn parse_cli() -> Cli {
         Some("step-moe-batched-pin-dump") => {
             let output = output_dir.unwrap_or_else(|| {
                 eprintln!(
-                    "usage: diffgemma-mps step-moe-batched-pin-dump -m MODEL -o OUT.json [-p Hello] [--layers 30] [--seed 42] [--attn-layer 0]"
+                    "usage: diffgemma step-moe-batched-pin-dump -m MODEL -o OUT.json [-p Hello] [--layers 30] [--seed 42] [--attn-layer 0]"
                 );
                 std::process::exit(2);
             });
@@ -1002,7 +1002,7 @@ pub(crate) fn parse_cli() -> Cli {
         Some("step-moe-single-dump") => {
             let output = output_dir.unwrap_or_else(|| {
                 eprintln!(
-                    "usage: diffgemma-mps step-moe-single-dump -m MODEL -o OUT.json [--expert 18] [-p Hello] [--layers 30] [--seed 42] [--attn-layer 2] [--layer-position 129]"
+                    "usage: diffgemma step-moe-single-dump -m MODEL -o OUT.json [--expert 18] [-p Hello] [--layers 30] [--seed 42] [--attn-layer 2] [--layer-position 129]"
                 );
                 std::process::exit(2);
             });
@@ -1021,7 +1021,7 @@ pub(crate) fn parse_cli() -> Cli {
         Some("step-preamble-dump") => {
             let output = output_dir.unwrap_or_else(|| {
                 eprintln!(
-                    "usage: diffgemma-mps step-preamble-dump -m MODEL -o OUT.json [-p Hello] [--layers 30] [--seed 42] [--layer-position 129]"
+                    "usage: diffgemma step-preamble-dump -m MODEL -o OUT.json [-p Hello] [--layers 30] [--seed 42] [--layer-position 129]"
                 );
                 std::process::exit(2);
             });
@@ -1038,7 +1038,7 @@ pub(crate) fn parse_cli() -> Cli {
         Some("embed-row-dump") => {
             let output = output_dir.unwrap_or_else(|| {
                 eprintln!(
-                    "usage: diffgemma-mps embed-row-dump -m MODEL -o OUT.json [--embed-token 71153] [--embed-gpu] [--bf16-ref DIR]"
+                    "usage: diffgemma embed-row-dump -m MODEL -o OUT.json [--embed-token 71153] [--embed-gpu] [--bf16-ref DIR]"
                 );
                 std::process::exit(2);
             });
@@ -1094,7 +1094,7 @@ pub(crate) fn parse_cli() -> Cli {
         },
         Some(cmd) => {
             eprintln!("unknown command: {cmd}");
-            eprintln!("usage: diffgemma-mps [COMMAND] [-m MODEL] [-p PROMPT] [options]");
+            eprintln!("usage: diffgemma [COMMAND] [-m MODEL] [-p PROMPT] [options]");
             eprintln!(
                 "  default (no command): generate-monolithic on .dgq, else generate-gpu (bf16)"
             );

@@ -209,7 +209,7 @@ fn resolve_default_model_source_in(model_root: &Path) -> Result<ResolvedModelSou
         "no model given (-m) and no default model found.\n\
          Looked for local dirs: {root}/transformer, {root}/{DEFAULT_MODEL_NAME}, {root}/diffgemma-*\n\
          and HF-cached packs: {DEFAULT_MODEL_REPO}, any */diffgemma-* under {hub}.\n\n\
-         Fetch the default pack with either:\n\n    diffgemma-mps download\n    hf download {DEFAULT_MODEL_REPO}\n\n\
+         Fetch the default pack with either:\n\n    diffgemma download\n    hf download {DEFAULT_MODEL_REPO}\n\n\
          or pass an existing model with -m <dir | org/name>.",
         root = model_root.display(),
         hub = hf_home().join("hub").display(),
@@ -623,7 +623,7 @@ mod tests {
         let err = resolve_default_model_source_in(&root).expect_err("nothing found");
         let msg = err.to_string();
         assert!(msg.contains("no default model found"), "{msg}");
-        assert!(msg.contains("diffgemma-mps download"), "{msg}");
+        assert!(msg.contains("diffgemma download"), "{msg}");
         assert!(
             msg.contains("hf download mmastrac/diffgemma-26b-a4b-it-q4"),
             "{msg}"

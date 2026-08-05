@@ -11,7 +11,7 @@
 # region is invalid. Do not resume the old db.
 set -u
 cd "$(dirname "$0")/.."          # -> python/
-BIN=../target/release/diffgemma-mps
+BIN=../target/release/diffgemma
 M=../model/diffusiongemma-q4emb
 DB="sqlite:///$(pwd)/${DBFILE:-holistic_v2.db}"
 TRIALS=${TRIALS:-80}

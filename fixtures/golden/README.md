@@ -10,13 +10,13 @@ must reproduce every byte — far stronger and faster evidence than a quality ga
 
 ```
 # Check (the gate): every case must be byte-identical to its blessed record.
-diffgemma-mps golden -m model/diffusiongemma-q4emb
+diffgemma golden -m model/diffusiongemma-q4emb
 
 # Re-record (only for an INTENDED numeric change, after the Tier-2/3 ritual):
-diffgemma-mps golden -m model/diffusiongemma-q4emb --bless
+diffgemma golden -m model/diffusiongemma-q4emb --bless
 
 # One case:
-diffgemma-mps golden -m model/diffusiongemma-q4emb --filter longctx
+diffgemma golden -m model/diffusiongemma-q4emb --filter longctx
 ```
 
 ## What each case pins

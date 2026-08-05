@@ -14,7 +14,7 @@ reproduces the live failure; and give the run a 14-block runway
   serve dumps): `clean.json` (never collapsed) and `collapse.json` (the
   seed-42 flood cell).
 - `collapse_seed42/` — the preserved flood trajectory from a fresh-prefill
-  serve run: `ops.jsonl` (replayable via `diffgemma-mps replay`) and the
+  serve run: `ops.jsonl` (replayable via `diffgemma replay`) and the
   serve log. This is the input for the open "MLX matched-canvas dig" item
   in PLAN — can MLX's sampler survive the same conditioning?
 

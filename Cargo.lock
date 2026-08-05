@@ -67,7 +67,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "diffgemma-mps"
+name = "diffgemma"
 version = "0.1.0"
 dependencies = [
  "memmap2",

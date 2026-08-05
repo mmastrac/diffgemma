@@ -12,7 +12,7 @@ from transformers import AutoTokenizer
 
 ROOT = Path(__file__).resolve().parents[2]
 MODEL_DIR = ROOT / "model" / "transformer"
-BINARY = ROOT / "target" / "release" / "diffgemma-mps"
+BINARY = ROOT / "target" / "release" / "diffgemma"
 
 
 def _cargo_release_binary() -> Path | None:

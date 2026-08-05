@@ -6,7 +6,7 @@
 //! compiled, and tier-1 tests enumerate every valid variant row.
 //!
 //! The human-readable TOML form is GENERATED from these specs at runtime
-//! (`render_toml()`, `diffgemma-mps manifest`) — there is no checked-in
+//! (`render_toml()`, `diffgemma manifest`) — there is no checked-in
 //! manifest file to drift. FC 1–3 are reserved globally
 //! (src/shaders/include/fc_axes.metal); `fc` lists each kernel's LOCAL
 //! axes (index ≥ 4). Axes of non-registered kernels (the tunable GEMM
@@ -103,11 +103,11 @@ pub fn spec_by_entry(entry: &str) -> Option<&'static KernelSpec> {
 }
 
 /// Render the collected specs as the human-readable TOML manifest.
-/// (`diffgemma-mps manifest` — generated on demand, never checked in.)
+/// (`diffgemma manifest` — generated on demand, never checked in.)
 pub fn render_toml() -> String {
     let mut out = String::new();
     out.push_str(
-        "# Kernel function-constant manifest (GENERATED: diffgemma-mps manifest).\n\
+        "# Kernel function-constant manifest (GENERATED: diffgemma manifest).\n\
          #\n\
          # FC 1\u{2013}3 are reserved globally (see src/shaders/include/fc_axes.metal).\n\
          # FC 4+ are per-kernel; each kernel lists its full index map under [kernel.fc].\n\

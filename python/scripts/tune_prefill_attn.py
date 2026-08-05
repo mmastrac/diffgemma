@@ -127,7 +127,7 @@ def main() -> int:
     p.add_argument("--iters", type=int, default=10)
     p.add_argument("--side", action="store_true",
                    help="tune the f32-side-KV path (production default); else f16")
-    p.add_argument("--binary", default="../target/release/diffgemma-mps")
+    p.add_argument("--binary", default="../target/release/diffgemma")
     p.add_argument("--proxy", action="store_true",
                    help="objective = real M=1024 super-chunk (bench-prefill-super, FAITHFUL); "
                         "else the isolated attention kernel (fast but not real-prefill-tracking)")

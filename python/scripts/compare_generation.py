@@ -55,7 +55,7 @@ _TURN_RE = re.compile(
 
 
 def run_rust(args: argparse.Namespace) -> dict[str, Any]:
-    binary = (repo_root() / "target" / "release" / "diffgemma-mps").resolve()
+    binary = (repo_root() / "target" / "release" / "diffgemma").resolve()
     if not binary.exists():
         raise SystemExit(
             f"error: {binary} not found. Build it: cargo build --release"

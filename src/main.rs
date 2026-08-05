@@ -5,13 +5,13 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::type_complexity)]
 
-// diffgemma-mps is an Apple-Silicon Metal inference engine. Metal is the only
+// diffgemma is an Apple-Silicon Metal inference engine. Metal is the only
 // backend — there is no CPU forward/generate path — so the whole program is
 // macOS-only. Fail fast on other targets with one clear message rather than a
 // wall of "cannot find `metal`" errors from the GPU-referencing kernel code.
 #[cfg(not(target_os = "macos"))]
 compile_error!(
-    "diffgemma-mps requires macOS on Apple Silicon: Metal is the only backend \
+    "diffgemma requires macOS on Apple Silicon: Metal is the only backend \
      and there is no CPU inference path."
 );
 

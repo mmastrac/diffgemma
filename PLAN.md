@@ -1,4 +1,4 @@
-# diffgemma-mps — plan
+# diffgemma — plan
 
 Open work only. Design + contract: **ARCHITECTURE.md** (incl. the token
 pipeline and Negative Knowledge — check it before planning perf/quality

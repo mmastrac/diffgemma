@@ -135,7 +135,7 @@ pub(crate) fn run_download(
     }
 
     eprintln!("download ok: {}", dest.display());
-    eprintln!("  run: diffgemma-mps -m {} chat", dest.display());
+    eprintln!("  run: diffgemma -m {} chat", dest.display());
     ExitCode::SUCCESS
 }
 
@@ -162,7 +162,7 @@ fn verify_downloaded_pack(dest: &Path) -> Result<String, String> {
     if !dgq_version_supported(manifest.version) {
         return Err(format!(
             "manifest version {} is not supported by this binary (dgq_version_supported \
-             rejects it) — you likely need a newer diffgemma-mps build",
+             rejects it) — you likely need a newer diffgemma build",
             manifest.version
         ));
     }

@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
-const CACHE_BUNDLE_TAG: &str = "diffgemma-mps-v9-runtime-include";
+const CACHE_BUNDLE_TAG: &str = "diffgemma-v9-runtime-include";
 
 fn shader_bundle_token() -> u64 {
     use std::collections::hash_map::DefaultHasher;
@@ -42,7 +42,7 @@ fn cache_root_dir() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".cache")))
         .unwrap_or_else(|_| PathBuf::from("/tmp"))
-        .join("diffgemma-mps")
+        .join("diffgemma")
         .join("metal-pipelines")
 }
 

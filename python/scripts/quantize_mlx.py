@@ -2,7 +2,7 @@
 """
 Convert cached HuggingFace DiffusionGemma weights to MLX for low-RAM inference on Apple Silicon.
 
-This does NOT produce `.dgq` (Rust mmap format). Use `diffgemma-mps quantize` for that.
+This does NOT produce `.dgq` (Rust mmap format). Use `diffgemma quantize` for that.
 MLX output (~15–22 GiB on disk) loads in Python via mlx-vlm without materializing 48 GiB bf16.
 
 Example (requires `uv sync --extra mlx` and a local HF cache):
@@ -126,7 +126,7 @@ def main() -> int:
     print(f"convert: {hf_path} -> {out}")
     print(f"  quantize: {args.q_bits}-bit mode={args.q_mode} group={group_size}")
     print("  note: streams weights lazily; peak RAM is much lower than 48 GiB bf16")
-    print("  note: output is MLX format, not .dgq — Rust inference still uses diffgemma-mps quantize")
+    print("  note: output is MLX format, not .dgq — Rust inference still uses diffgemma quantize")
 
     convert(
         hf_path=hf_path,

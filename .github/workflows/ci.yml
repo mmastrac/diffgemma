@@ -77,12 +77,12 @@ jobs:
 #         # exact token_ids + causal-KV hash across the prefill/generation path
 #         # matrix. Brittle by design: any intended numeric change re-blesses via
 #         # `golden --bless` only after the multi-seed/longctx/census sign-off.)
-#         run: ./target/release/diffgemma-mps golden -m "$DGQ_MODEL"
+#         run: ./target/release/diffgemma golden -m "$DGQ_MODEL"
 #       - name: Spec-seed smoketest gate (17/17)
-#         run: ./target/release/diffgemma-mps smoketest -m "$DGQ_MODEL"
+#         run: ./target/release/diffgemma smoketest -m "$DGQ_MODEL"
 #       - name: Longctx doc-QA ladder (E13 — comprehension, not needles;
 #         # catches the task #64 class: fast-prefill grounding collapse at length)
-#         run: ./target/release/diffgemma-mps smoketest -m "$DGQ_MODEL" --longctx
+#         run: ./target/release/diffgemma smoketest -m "$DGQ_MODEL" --longctx
 #       - name: Needle retrieval (short)
-#         run: ./target/release/diffgemma-mps ask -m "$DGQ_MODEL" -p "..." # needle probe
+#         run: ./target/release/diffgemma ask -m "$DGQ_MODEL" -p "..." # needle probe
 # ---------------------------------------------------------------------------

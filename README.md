@@ -1,4 +1,4 @@
-# diffgemma-mps
+# diffgemma
 
 A low-dependency Rust + Metal inference engine for
 [DiffusionGemma 26B-A4B-it](https://huggingface.co/google/diffusiongemma-26B-A4B-it)
@@ -41,19 +41,19 @@ your `PATH`):
 cargo install --git https://github.com/mmastrac/diffgemma
 ```
 
-Now run `diffgemma-mps` from anywhere. Add `--tag <tag>` to pin a release
+Now run `diffgemma` from anywhere. Add `--tag <tag>` to pin a release
 instead of building the default branch.
 
 To hack on the engine or build a specific revision, clone and build in place:
 
 ```bash
-git clone https://github.com/mmastrac/diffgemma diffgemma-mps
-cd diffgemma-mps
+git clone https://github.com/mmastrac/diffgemma diffgemma
+cd diffgemma
 cargo build --release
 ```
 
-The binary lands at `target/release/diffgemma-mps`. The examples below use that
-path. If you installed with `cargo install`, just run `diffgemma-mps`.
+The binary lands at `target/release/diffgemma`. The examples below use that
+path. If you installed with `cargo install`, just run `diffgemma`.
 
 ### 2. Get the model
 
@@ -64,7 +64,7 @@ fetches a pre-quantized `.dgq` pack from Hugging Face and verifies it (manifest,
 version, blob length) before it prints `download ok`:
 
 ```bash
-target/release/diffgemma-mps download
+target/release/diffgemma download
 # defaults to mmastrac/diffgemma-26b-a4b-it-q4 -> model/diffgemma-26b-a4b-it-q4
 ```
 
@@ -74,7 +74,7 @@ specific pack. `download` reuses your Hugging Face cache: any file already under
 
 ```bash
 hf download mmastrac/diffgemma-26b-a4b-it-q4   # populates the HF cache
-target/release/diffgemma-mps download          # links from cache, no second transfer
+target/release/diffgemma download          # links from cache, no second transfer
 ```
 
 costs one transfer, not two. Skip to [step 3](#3-run).
@@ -92,7 +92,7 @@ That is ~50 GB and lands in `~/.cache/huggingface/hub/`. You do not need
 Then quantize:
 
 ```bash
-target/release/diffgemma-mps quantize \
+target/release/diffgemma quantize \
   -m google/diffusiongemma-26B-A4B-it \
   -o model/diffgemma-26b-a4b-it-q4 \
   --profile q4
@@ -129,7 +129,7 @@ The examples below pass `-m <dir | org/name>` to choose one explicitly.
 One-shot prompt:
 
 ```bash
-target/release/diffgemma-mps ask \
+target/release/diffgemma ask \
   -m model/diffgemma-26b-a4b-it-q4 \
   -p "Explain block diffusion decoding in two sentences."
 ```
@@ -137,14 +137,14 @@ target/release/diffgemma-mps ask \
 Interactive chat:
 
 ```bash
-target/release/diffgemma-mps chat -m model/diffgemma-26b-a4b-it-q4
+target/release/diffgemma chat -m model/diffgemma-26b-a4b-it-q4
 ```
 
 OpenAI-compatible HTTP server (defaults to `127.0.0.1:8080`, 128k-token
 context):
 
 ```bash
-target/release/diffgemma-mps serve -m model/diffgemma-26b-a4b-it-q4
+target/release/diffgemma serve -m model/diffgemma-26b-a4b-it-q4
 # then POST to http://127.0.0.1:8080/v1/chat/completions
 ```
 
@@ -161,7 +161,7 @@ at `http://127.0.0.1:8080/v1` (check it with `curl 127.0.0.1:8080/v1/models`).
 Start it:
 
 ```bash
-target/release/diffgemma-mps serve -m model/diffgemma-26b-a4b-it-q4 --ctx 100000
+target/release/diffgemma serve -m model/diffgemma-26b-a4b-it-q4 --ctx 100000
 ```
 
 opencode has to know that endpoint as a provider, but you **don't need to edit a
@@ -174,7 +174,7 @@ OPENCODE_CONFIG_CONTENT='{
   "provider": {
     "diffgemma": {
       "npm": "@ai-sdk/openai-compatible",
-      "name": "diffgemma-mps (local)",
+      "name": "diffgemma (local)",
       "options": { "baseURL": "http://127.0.0.1:8080/v1", "apiKey": "unused" },
       "models": { "diffgemma-26b-a4b-it-q4": { "name": "DiffGemma 26B-A4B q4" } }
     }

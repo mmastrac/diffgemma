@@ -1,4 +1,4 @@
-# diffgemma-mps — how to work on this codebase
+# diffgemma — how to work on this codebase
 
 Read this before writing kernels, tests, or chasing bugs. It is **how to work
 here without repeating the mistakes that have already cost days.**
@@ -160,7 +160,7 @@ knows `.metal` paths; `src/metal/` (the runtime) consumes pipelines via
   (`K_DUMP_STAGE`), not a separate probe kernel. Fold hunt-time probes back
   behind the dump flag once a bug is found.
 - FC 1–3 are global (shape-assert, dump, quant-format); local axes are
-  registered in each kernel's `SPEC` (see `diffgemma-mps manifest`).
+  registered in each kernel's `SPEC` (see `diffgemma manifest`).
 - Quoted `#include "x.metal"` resolves from `src/shaders/include/` at
   runtime (`common/expand.rs`); the pipeline binary archive keys on the
   whole-tree hash, so shader edits can never be served stale — but if golden
@@ -256,7 +256,7 @@ never two model-loading PROCESSES at once, regardless of thread count.
   checkpoint-specific and several are counterintuitive — do not "correct"
   them from general Gemma knowledge without checking the reference.
 - **Kernel FC registration:** each kernel's `SPEC` const;
-  `diffgemma-mps manifest` renders the full TOML view.
+  `diffgemma manifest` renders the full TOML view.
 - **Env flags:** `src/flags/` (mod.rs = registry + parse, accessors.rs =
   read surface) is the single registry — check it before inventing any
   `DGQ_` flag. Parsed once into `RuntimeConfig`; scoped overrides via
@@ -287,7 +287,7 @@ never two model-loading PROCESSES at once, regardless of thread count.
   sharp attention edges and stay exact while document comprehension is fully
   hallucinated.
 - **NEVER run two model-loading processes in parallel** (ours ~19 GiB + MLX
-  ~15 GiB = machine crash). `pgrep -f "diffgemma-mps -m"` before any GPU run;
+  ~15 GiB = machine crash). `pgrep -f "diffgemma -m"` before any GPU run;
   serialize every bench.
 - **Wart census** (10-seed greentext) is the sensitive sampler probe.
 - **Pass `--seed` EXPLICITLY on every arm of a comparison.** `smoketest
@@ -317,70 +317,70 @@ never two model-loading PROCESSES at once, regardless of thread count.
 
 ## 9. Command reference
 
-`WEIGHTS=model/diffgemma-26b-a4b-it-q4`; binary at `target/release/diffgemma-mps`
+`WEIGHTS=model/diffgemma-26b-a4b-it-q4`; binary at `target/release/diffgemma`
 (build: `cargo build --release`).
 
 ```bash
 # Generate / chat / serve
-diffgemma-mps ask  -m $WEIGHTS -p "Hello" --seed 42
-diffgemma-mps chat -m $WEIGHTS                  # --ctx N for long context
-diffgemma-mps serve -m $WEIGHTS                 # OpenAI-compatible HTTP; --ctx N (default 128k)
+diffgemma ask  -m $WEIGHTS -p "Hello" --seed 42
+diffgemma chat -m $WEIGHTS                  # --ctx N for long context
+diffgemma serve -m $WEIGHTS                 # OpenAI-compatible HTTP; --ctx N (default 128k)
 #   serve extras: --log-dir DIR (op-log ops.jsonl), --tool-repair, --tool-validate
-diffgemma-mps replay /path/ops.jsonl -m $WEIGHTS  # re-execute + diff an op-log
+diffgemma replay /path/ops.jsonl -m $WEIGHTS  # re-execute + diff an op-log
 
 # Gates (run before commit)
-diffgemma-mps smoketest -m $WEIGHTS             # 17/17 required
-diffgemma-mps smoketest -m $WEIGHTS --longctx   # doc-QA ladder
-diffgemma-mps golden -m $WEIGHTS                # byte-identity 8/8
+diffgemma smoketest -m $WEIGHTS             # 17/17 required
+diffgemma smoketest -m $WEIGHTS --longctx   # doc-QA ladder
+diffgemma golden -m $WEIGHTS                # byte-identity 8/8
 cargo test --release
 
 # Campaigns: flag ARMS x BATTERIES with explicit gates, one process, stats
 # to a dir. This is how a quality lever is decided — not a shell loop.
-diffgemma-mps census -m $WEIGHTS \
+diffgemma census -m $WEIGHTS \
   --arm 'off:' --arm 'trim:DGQ_COMMIT_CONF_TRIM=0.9' \
   --battery smoke,longctx --seeds 7,42,123 --baseline off \
   --out runs/c1 --gate 'passed==1' --gate 'contested_per_1k<=baseline'
-diffgemma-mps census -m $WEIGHTS --analyze runs/c1   # re-report, no GPU
+diffgemma census -m $WEIGHTS --analyze runs/c1   # re-report, no GPU
 #   batteries: smoke | longctx | programmatic (generate a program, RUN it,
 #   judge stdout + exit code; metrics prog_pass_pct, compile_fail,
 #   wrong_output, fenced_pct) | soft (indirect retrieval + hallucination
 #   rates, non-blocking)
 
 # Bench / diagnostics
-diffgemma-mps bench-step-kernel -m $WEIGHTS --profile-steps 8
-diffgemma-mps bench-gemm --shapes 256x2816x2816 --oracle mps --iters 10
-diffgemma-mps step-probe -m $WEIGHTS --layers 3 --kv-len 64 --seed 42
-diffgemma-mps step-parity -m $WEIGHTS           # engine-vs-monolith oracle
-diffgemma-mps probe-device; diffgemma-mps summary; diffgemma-mps config
-diffgemma-mps manifest                          # kernel FC-axis TOML
+diffgemma bench-step-kernel -m $WEIGHTS --profile-steps 8
+diffgemma bench-gemm --shapes 256x2816x2816 --oracle mps --iters 10
+diffgemma step-probe -m $WEIGHTS --layers 3 --kv-len 64 --seed 42
+diffgemma step-parity -m $WEIGHTS           # engine-vs-monolith oracle
+diffgemma probe-device; diffgemma summary; diffgemma config
+diffgemma manifest                          # kernel FC-axis TOML
 
 # -m accepts a local directory OR a bare HF repo id (org/name): an existing
 # directory is used as-is; otherwise the newest matching snapshot in the
 # local HF cache is resolved, or the exact `hf download` remedy is printed.
 # Works for every command that takes -m, including quantize/repack source.
-diffgemma-mps chat -m google/diffusiongemma-26B-A4B-it
-diffgemma-mps chat -m mmastrac/diffgemma-26b-a4b-it-q4   # a downloaded pack, read-only
+diffgemma chat -m google/diffusiongemma-26B-A4B-it
+diffgemma chat -m mmastrac/diffgemma-26b-a4b-it-q4   # a downloaded pack, read-only
 
 # Fetch a monolithic pack from HF — the distribution format (layered/overlay
 # packs are local-only dev tooling, never what ships to users). Verifies the
 # transfer (manifest version, blob length) and prints a one-line pack
 # summary once done.
-diffgemma-mps download --repo mmastrac/diffgemma-26b-a4b-it-q4 -o model/diffgemma-26b-a4b-it-q4
+diffgemma download --repo mmastrac/diffgemma-26b-a4b-it-q4 -o model/diffgemma-26b-a4b-it-q4
 
 # Requantize from HF safetensors (source: a local dir or a repo id, per
 # above — a repo id ALSO pins (repo, revision) exactly for --overlay below,
 # in place of the single-symlink-hop auto-detect).
-diffgemma-mps quantize -m model/transformer -o model/diffgemma-26b-a4b-it-q4 --profile q4
+diffgemma quantize -m model/transformer -o model/diffgemma-26b-a4b-it-q4 --profile q4
 
 # Custom quantization classes (ARCHITECTURE.md §8.2): --set class=format
 # overrides classify_tensor's per-class output on top of --profile. Classes:
 # experts (or experts.gate_up / experts.down separately), attn, dense,
 # vision, sc. Formats: raw, q4, q6, q8, nvfp4 (per-class support varies —
 # an unsupported combo is a fatal error before anything is written).
-diffgemma-mps quantize -m model/transformer -o model/pack-mixed --profile q4 \
+diffgemma quantize -m model/transformer -o model/pack-mixed --profile q4 \
   --set experts=q6 --set attn=nvfp4
 # nvfp4x is sugar for --profile q4 --set experts=nvfp4.
-diffgemma-mps quantize -m model/transformer -o model/pack-nvfp4x --profile nvfp4x
+diffgemma quantize -m model/transformer -o model/pack-nvfp4x --profile nvfp4x
 
 # Layered/overlay packs (ARCHITECTURE.md §8.1) — LOCAL-ONLY DEV TOOLING for
 # experiment arms, never the distribution format: raw tensors ref the HF
@@ -388,11 +388,11 @@ diffgemma-mps quantize -m model/transformer -o model/pack-nvfp4x --profile nvfp4
 # zero-copy via VA-splice (no head cache). Composes with --set: a class
 # switched from raw to quantized just moves from an external ref to a local
 # blob entry.
-diffgemma-mps quantize -m model/transformer -o model/pack-overlay --profile nvfp4 --overlay
-diffgemma-mps repack --overlay -m model/diffgemma-26b-a4b-it-q4 -o model/pack-overlay
+diffgemma quantize -m model/transformer -o model/pack-overlay --profile nvfp4 --overlay
+diffgemma repack --overlay -m model/diffgemma-26b-a4b-it-q4 -o model/pack-overlay
 # The dual: flatten a layered pack back to a self-contained (monolithic) one
 # — no requantization, just a byte-copy driven by the manifest's own offsets.
-diffgemma-mps repack --monolithic -m model/pack-overlay -o model/diffgemma-26b-a4b-it-q4
+diffgemma repack --monolithic -m model/pack-overlay -o model/diffgemma-26b-a4b-it-q4
 
 # MLX reference comparison (SERIALIZE with our runs — never in parallel)
 python/.venv/bin/python python/scripts/mlx_generate.py -p "..." -o /tmp/mlx.json

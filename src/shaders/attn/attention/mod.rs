@@ -946,7 +946,7 @@ mod tests {
     }
 
     /// Microbench: scalar vs matrix-unit attention at model shape. Ignored (timing).
-    /// Run: `cargo test --bin diffgemma-mps attn_mma_bench -- --ignored --nocapture`
+    /// Run: `cargo test --bin diffgemma attn_mma_bench -- --ignored --nocapture`
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore]
