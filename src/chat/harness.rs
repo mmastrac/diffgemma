@@ -42,6 +42,10 @@ pub(crate) struct Harness {
     /// file may not exist yet (reads empty until a tool writes it).
     #[serde(default)]
     pub vars: std::collections::HashMap<String, String>,
+    /// Tool rounds per turn before the loop gives up (default 8). Coding
+    /// harnesses with read/edit/verify cycles want more headroom.
+    #[serde(default)]
+    pub max_rounds: Option<usize>,
     #[serde(default)]
     tools: Vec<HarnessTool>,
 }

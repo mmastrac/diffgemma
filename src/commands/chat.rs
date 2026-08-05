@@ -627,6 +627,10 @@ pub(crate) fn run_chat_cmd(
         show_thinking,
         stream_output,
         vars: std::collections::HashMap::new(),
+        max_rounds: harness
+            .as_ref()
+            .and_then(|h| h.max_rounds)
+            .unwrap_or(crate::chat::engine::DEFAULT_MAX_ROUNDS),
         file_vars: harness
             .as_ref()
             .map(|h| {
