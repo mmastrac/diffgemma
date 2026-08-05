@@ -28,6 +28,9 @@ const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 
 const DIM: &str = "\x1b[2m";
 const UNDIM: &str = "\x1b[0m";
+/// Grey (bright-black): the reasoning colour, matching the `think>` lines the
+/// chat command prints elsewhere (`/thought`, forced replies).
+const GREY: &str = "\x1b[90m";
 
 /// Terminal (cols, rows) via macOS TIOCGWINSZ, falling back to $COLUMNS/80 × 24.
 fn terminal_size() -> (usize, usize) {
@@ -97,25 +100,38 @@ fn clamp_tail_rows(text: &str, cols: usize, max_rows: usize) -> String {
     format!("…\n{}", kept.join("\n"))
 }
 
-/// Terminal render state: inline dimmed streaming with no status line.
+/// Clip each line of `text` to `width` characters (no wrapping), so every line
+/// occupies exactly one physical terminal row. This keeps the transient's row
+/// count exact, so the cursor-up erase never leaves a stray row when a line
+/// would otherwise land on the terminal's wrap column.
+fn clip_lines(text: &str, width: usize) -> String {
+    text.split('\n')
+        .map(|line| line.chars().take(width).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Terminal render state: a live dimmed preview plus a one-shot final print.
 ///
-/// Layout: committed (block-final) text is printed permanently as NORMAL text,
-/// append-only, flushed only on complete lines so it always ends at a line
-/// boundary — it may wrap and scroll freely and is never re-touched. Below it, a
-/// **transient** region shows the current block's still-forming tail DIMMED,
-/// exactly where the text will land; when the block commits, that text is
-/// re-emitted permanently as normal (un-dimmed). The transient is redrawn each
-/// tick via relative cursor-up (`\x1b[1A\r\x1b[2K` per row) and is clamped to
-/// the screen height, so the clear never runs off the top — scroll-safe with no
-/// DECSC/DECRC (which don't survive scrolling).
+/// The forming answer shows in a **transient** region (dimmed, clipped to the
+/// screen), redrawn each tick via relative cursor-up (`\x1b[1A\r\x1b[2K` per row)
+/// and cleared before the next repaint. The answer is printed permanently only
+/// once, by `finish`, from the authoritative reply. The stream's stable prefix is
+/// speculative and can still be revised, so permanently flushing it would leave
+/// garbled or duplicated text in the scrollback that `finish` can no longer
+/// reach. The reasoning is the exception: it freezes to a permanent grey block
+/// above the answer (there is no separate authoritative copy to defer to).
+///
+/// Two orthogonal display toggles:
+/// - `show_thinking`: when set, the reasoning (`Thought` events) streams grey
+///   under `think>` during the thought phase, then freezes as one permanent grey
+///   block above the answer. When clear, the reasoning stays hidden (spinner).
+/// - `stream_output`: when set (default), the forming answer is previewed dimmed;
+///   when clear, only a spinner runs. Either way the final answer prints at
+///   `finish`.
 struct Render {
-    /// Full visible answer text; `[0, committed_len)` is immutable/committed.
+    /// Latest visible answer preview (whole speculative draft).
     text: String,
-    committed_len: usize,
-    /// Bytes of committed text already flushed permanently (ends at '\n' or 0).
-    printed: usize,
-    /// True once the permanent "model> " prefix has been printed.
-    prefixed: bool,
     /// Terminal rows the transient region currently occupies.
     transient_rows: usize,
     prefill: bool,
@@ -127,15 +143,22 @@ struct Render {
     spinner: usize,
     cols: usize,
     rows: usize,
+    /// Surface the reasoning live (`--show-thinking` / `/prethink`).
+    show_thinking: bool,
+    /// Stream the answer as it forms (default); else hold it until `finish`.
+    stream_output: bool,
+    /// Latest reasoning text (from `Thought` events); shown while thinking.
+    thought: String,
+    /// The answer has begun (a `Text` event arrived), so the thought is settled.
+    answer_started: bool,
+    /// The reasoning has been frozen to a permanent grey block already.
+    thought_printed: bool,
 }
 
 impl Render {
-    fn new(cols: usize, rows: usize) -> Self {
+    fn new(cols: usize, rows: usize, show_thinking: bool, stream_output: bool) -> Self {
         Render {
             text: String::new(),
-            committed_len: 0,
-            printed: 0,
-            prefixed: false,
             transient_rows: 0,
             prefill: true,
             block: 0,
@@ -146,6 +169,11 @@ impl Render {
             spinner: 0,
             cols,
             rows,
+            show_thinking,
+            stream_output,
+            thought: String::new(),
+            answer_started: false,
+            thought_printed: false,
         }
     }
 
@@ -167,12 +195,16 @@ impl Render {
                 self.canvas = *canvas;
                 self.locked = *locked;
             }
-            ChatEvent::Text { committed, text } => {
-                self.text = text.clone();
-                self.committed_len = *committed;
-                if self.printed > self.committed_len {
-                    self.printed = self.committed_len; // committed prefix shrank (rare)
+            ChatEvent::Thought { text } => {
+                if self.show_thinking {
+                    self.thought = text.clone();
                 }
+            }
+            ChatEvent::Text { text, .. } => {
+                // An answer `Text` means the thought has closed: settle it so the
+                // reasoning freezes above the answer on the next paint.
+                self.answer_started = true;
+                self.text = text.clone();
             }
             _ => {}
         }
@@ -194,74 +226,81 @@ impl Render {
         self.transient_rows = 0;
     }
 
+    /// Freeze the reasoning to one permanent grey `think>` block above the
+    /// answer, once (when the answer starts, or at `finish`). No-op unless
+    /// `show_thinking` and there is a thought to show.
+    fn freeze_thought(&mut self) {
+        if self.thought_printed || !self.show_thinking {
+            return;
+        }
+        let t = self.thought.trim();
+        if !t.is_empty() {
+            println!("{GREY}think> {t}{UNDIM}");
+        }
+        self.thought_printed = true;
+    }
+
     /// Repaint. Sole stdout writer during a turn.
     fn paint(&mut self) {
         self.erase_transient();
-        // Flush newly-committed COMPLETE lines permanently (normal text). This
-        // keeps the permanent region ending at a line boundary so the transient
-        // below always starts at column 0.
-        let region_end = self.committed_len.min(self.text.len());
-        if self.printed < region_end
-            && let Some(rel) = self.text[self.printed..region_end].rfind('\n')
-        {
-            let end = self.printed + rel + 1;
-            if !self.prefixed {
-                print!("model> ");
-                self.prefixed = true;
-            }
-            print!("{}", &self.text[self.printed..end]);
-            self.printed = end;
+        if self.answer_started {
+            self.freeze_thought();
         }
-        // Transient: the still-forming tail (uncommitted + any partial committed
-        // line), dimmed, clamped to the screen so its redraw stays on-screen.
-        // `styled` carries the dim/spinner escapes; `visible` is the same text
-        // without escapes, used to count the rows to clear next tick.
+        // Transient region, redrawn each tick. Every line is clipped to a single
+        // physical row (no wrapping), so `transient_rows` is exact and the
+        // cursor-up erase never leaves a stray dimmed row when a line lands on the
+        // wrap column. Clamped to the screen height so the redraw stays on-screen.
         let frame = SPINNER[self.spinner % SPINNER.len()];
-        let tail = &self.text[self.printed..];
-        let (styled, visible) = if self.prefill {
-            let s = format!("{frame} thinking…");
-            (s.clone(), s)
-        } else if tail.trim().is_empty() {
-            let s = format!(
-                "{frame} thinking · block {} · step {}/{} · {}/{} locked",
-                self.block, self.step, self.max_steps, self.locked, self.canvas
-            );
-            (s.clone(), s)
-        } else {
-            let prefix = if self.prefixed { "" } else { "model> " };
-            let body = clamp_tail_rows(tail, self.cols, self.rows.saturating_sub(1));
-            (
-                format!("{prefix}{DIM}{body}{UNDIM} {frame}"),
-                format!("{prefix}{body} {frame}"),
+        let status = |r: &Self| {
+            clip_lines(
+                &format!(
+                    "{frame} thinking · block {} · step {}/{} · {}/{} locked",
+                    r.block, r.step, r.max_steps, r.locked, r.canvas
+                ),
+                r.cols.saturating_sub(1),
             )
         };
+        // Leave room on a body line for a `think>`/`model>` prefix and the spinner.
+        let body_w = self.cols.saturating_sub(8).max(1);
+        let clamp = self.rows.saturating_sub(1);
+        let tail = self.text.trim();
+        let (styled, trows) = if self.prefill {
+            (format!("{frame} thinking…"), 1)
+        } else if self.show_thinking && !self.answer_started {
+            // Reasoning phase: stream the thought grey (spinner alone if empty).
+            let t = self.thought.trim();
+            if t.is_empty() {
+                (status(self), 1)
+            } else {
+                let body = clip_lines(&clamp_tail_rows(t, self.cols, clamp), body_w);
+                let rows = body.split('\n').count();
+                (format!("think> {GREY}{body}{UNDIM} {frame}"), rows)
+            }
+        } else if !self.stream_output || tail.is_empty() {
+            // Answer withheld (or none stable yet): a working spinner.
+            (status(self), 1)
+        } else {
+            let prefix = "model> ";
+            let body = clip_lines(&clamp_tail_rows(tail, self.cols, clamp), body_w);
+            let rows = body.split('\n').count();
+            (format!("{prefix}{DIM}{body}{UNDIM} {frame}"), rows)
+        };
         print!("{styled}");
-        self.transient_rows = rows_for(&visible, self.cols);
+        self.transient_rows = trows;
         let _ = std::io::stdout().flush();
         self.spinner = self.spinner.wrapping_add(1);
     }
 
-    /// Reconcile against the authoritative reply and end the line.
+    /// Erase the preview and print the authoritative reply — the sole permanent
+    /// answer write, so the speculative draft can never reach the scrollback.
     fn finish(&mut self, reply: &str) {
         self.erase_transient();
-        let shown = &self.text[..self.printed.min(self.text.len())];
+        // Ensure the reasoning is shown even when no answer ever streamed (a
+        // thought-only turn, or a salvaged answer).
+        self.freeze_thought();
         if reply.is_empty() {
-            if self.prefixed {
-                println!();
-            } else {
-                println!("model> (empty response)");
-            }
-            return;
-        }
-        if !self.prefixed {
-            println!("model> {reply}");
-        } else if let Some(rest) = reply.strip_prefix(shown) {
-            // Re-emit the remaining (previously-dimmed) text permanently, normal.
-            print!("{rest}");
-            println!();
+            println!("model> (empty response)");
         } else {
-            // Streamed prefix diverged from the final commit (rare); reprint.
-            println!();
             println!("model> {reply}");
         }
     }
@@ -298,24 +337,37 @@ pub struct ChatStream {
     ticker: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Live-display options for a streamed turn.
+pub struct StreamDisplay {
+    /// Surface the reasoning live (grey `think>`); implied by `prethink_seed`.
+    pub show_thinking: bool,
+    /// `/prethink` continuation prefix (the reasoning the prompt opened with).
+    pub prethink_seed: Option<String>,
+    /// Stream the answer as it forms (default) vs print it whole at `finish`.
+    pub stream_output: bool,
+}
+
 impl ChatStream {
-    /// `interactive` enables the terminal spinner/streaming (an interactive
-    /// tty). `json` is an optional JSONL sink (file or stdout). `turn` /
-    /// `prompt_tokens` seed the opening `TurnStart` event.
+    /// `interactive` enables the terminal spinner/streaming (an interactive tty).
+    /// `json` is an optional JSONL sink (file or stdout); `turn` / `prompt_tokens`
+    /// seed the opening `TurnStart` event.
     pub fn start(
         tokenizer: Arc<Tokenizer>,
         stop_token_ids: Vec<u32>,
         interactive: bool,
+        display: StreamDisplay,
         json: Option<Box<dyn Write + Send>>,
         turn: u64,
         prompt_tokens: usize,
     ) -> Self {
+        let show_thinking = display.show_thinking || display.prethink_seed.is_some();
         let shared = Arc::new(Mutex::new(Shared {
-            decoder: StreamDecoder::new(Arc::clone(&tokenizer), stop_token_ids),
+            decoder: StreamDecoder::new(Arc::clone(&tokenizer), stop_token_ids)
+                .with_thinking(show_thinking, display.prethink_seed),
             json,
             render: {
                 let (cols, rows) = terminal_size();
-                Render::new(cols, rows)
+                Render::new(cols, rows, show_thinking, display.stream_output)
             },
             interactive,
         }));

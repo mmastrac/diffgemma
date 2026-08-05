@@ -273,6 +273,7 @@ pub(crate) fn run_golden_case(
             model_dir,
             &[chat_template::ChatTurn::user(prompt_text)],
             false,
+            false,
         )?;
         cfg.max_new_tokens = clamp_new(prompt.len());
         let out = generate_with_session(session, &prompt, &cfg, "golden")?;
@@ -284,7 +285,7 @@ pub(crate) fn run_golden_case(
         let n_turns = case.turns.len().max(1);
         for (i, turn) in case.turns.iter().enumerate() {
             history.push(chat_template::ChatTurn::user(turn.clone()));
-            let prompt = build_chat_prompt_tokens(model_dir, &history, false)?;
+            let prompt = build_chat_prompt_tokens(model_dir, &history, false, false)?;
             cfg.max_new_tokens = clamp_new(prompt.len());
             let out = generate_with_session(session, &prompt, &cfg, "golden")?;
             if i + 1 < n_turns {

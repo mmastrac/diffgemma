@@ -405,7 +405,7 @@ pub(crate) fn run_smoketest(
         // (chat's KV-reuse continuation would otherwise answer the first prompt).
         session.reset_kv();
         let history = vec![chat_template::ChatTurn::user(prompt_text)];
-        let prompt = build_chat_prompt_tokens(model_dir, &history, raw_prompt)?;
+        let prompt = build_chat_prompt_tokens(model_dir, &history, raw_prompt, false)?;
         let prompt_len = prompt.len();
         // Bound generation (and thus time + KV) — a gate doesn't need essays.
         step_cfg.max_new_tokens = gen_cap.min(smoke_max_seq.saturating_sub(prompt_len).max(1));

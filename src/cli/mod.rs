@@ -340,6 +340,12 @@ pub(crate) enum Command {
         json: bool,
         /// Context window (max_seq) override; None = default 8192.
         ctx: Option<usize>,
+        /// Shell-backed tools (`--tool NAME[:DESC]=COMMAND`, repeatable).
+        tools: Vec<String>,
+        /// Stream the model's reasoning live (`--show-thinking`); default off.
+        show_thinking: bool,
+        /// Stream the answer as it forms (default); `--no-stream` withholds it.
+        stream_output: bool,
     },
     /// OpenAI-compatible HTTP server (`serve`). Single-GPU-queue chat completions.
     Serve {

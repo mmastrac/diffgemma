@@ -524,6 +524,9 @@ pub(crate) fn dispatch(cli: Cli) -> ExitCode {
             events_path,
             json,
             ctx,
+            tools,
+            show_thinking,
+            stream_output,
         } => run_chat_cmd(
             &cli.model_dir,
             initial_prompt,
@@ -537,6 +540,9 @@ pub(crate) fn dispatch(cli: Cli) -> ExitCode {
             events_path,
             json,
             ctx,
+            tools,
+            show_thinking,
+            stream_output,
         ),
         Command::Serve {
             addr,
