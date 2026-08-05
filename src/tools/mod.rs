@@ -25,8 +25,8 @@ mod render;
 #[cfg(test)]
 pub use parse::ParsedToolCall;
 pub use parse::{
-    content_before_tool_calls, message_text, parse_tool_calls, scan_call_attempts,
-    should_continue_past_stop, thinking_call_names, to_openai_tool_calls,
+    content_before_tool_calls, has_incomplete_tool_call, message_text, parse_tool_calls,
+    scan_call_attempts, should_continue_past_stop, thinking_call_names, to_openai_tool_calls,
     tool_call_lost_in_thinking, validate_tool_reply,
 };
 pub(crate) use parse::{find_unmasked, masked_ranges, strip_thinking};

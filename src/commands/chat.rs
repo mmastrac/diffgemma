@@ -1039,6 +1039,28 @@ impl TurnRunner<'_> {
                 println!("\x1b[90mthink> {t}\x1b[0m");
             }
 
+            // A malformed / unclosed call: honor the stop (no forced continuation)
+            // and feed an error tool response so the model regenerates cleanly,
+            // mirroring the serve tool-repair stage. Bounded by MAX_ROUNDS.
+            if crate::tools::has_incomplete_tool_call(&content) {
+                finish(stream, None);
+                if human {
+                    println!("tool> (malformed tool call discarded; regenerating)");
+                }
+                const ERR: &str = "error: this tool call was malformed and has been \
+                    discarded. Regenerate your narration and tool calls, corrected, in full.";
+                for (name, valid) in crate::tools::scan_call_attempts(&content) {
+                    if valid {
+                        continue;
+                    }
+                    let name = if name.is_empty() { "tool".to_string() } else { name };
+                    messages.push(serde_json::json!({
+                        "role": "tool", "name": name, "content": ERR,
+                    }));
+                }
+                continue;
+            }
+
             let calls = crate::tools::parse_tool_calls(&content);
             if calls.is_empty() {
                 let answer = chat_template::sanitize_model_reply(&content);
@@ -1339,11 +1361,13 @@ pub(crate) fn run_chat_cmd(
         }
     };
 
-    // Tool turns generate the `call:{...}` grammar: don't let a stop token inside
-    // an unclosed call end the turn, and mark the `<|"|>` quote so arg strings
-    // survive. (Harmless when unused; only tool turns emit calls.)
+    // Tool turns generate the `call:{...}` grammar. Honor the model's stop rather
+    // than forcing continuation past an open call -- a malformed call never
+    // rescues and floods blocks (see server::worker); `tool_loop` feeds an error
+    // tool response and regenerates instead. `DGQ_CONTINUE_PAST_STOP` restores the
+    // old bet. Mark the `<|"|>` quote so arg strings survive under it.
     if !tools_json.is_empty() {
-        step_cfg.continue_incomplete_tool_calls = true;
+        step_cfg.continue_incomplete_tool_calls = crate::flags::continue_past_stop_enabled();
         step_cfg.quote_token_id = tokenizer.special_token_id("<|\"|>");
     }
 
