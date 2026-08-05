@@ -1155,6 +1155,13 @@ pub(crate) fn run_chat_cmd(
     use metal::StepGenerateConfig;
     use std::io::{self, IsTerminal, Write};
 
+    // `DGQ_RENDER_DEMO`: exercise the terminal renderer with synthetic events and
+    // no model (terminal-choreography verification, e.g. under tmux).
+    if let Ok(stage) = std::env::var("DGQ_RENDER_DEMO") {
+        chat_ui::render_demo(&stage);
+        return ExitCode::SUCCESS;
+    }
+
     // Parse `--tool NAME[:DESC]=COMMAND` specs up front so a bad spec fails
     // before the model loads. Non-empty => every turn uses the tool path.
     let shell_tools: Vec<ShellTool> = match tools.iter().map(|s| parse_tool_spec(s)).collect() {
