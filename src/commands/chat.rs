@@ -421,6 +421,7 @@ pub(crate) fn run_chat_cmd(
     json: bool,
     ctx: Option<usize>,
     tools: Vec<String>,
+    harness: Option<PathBuf>,
     show_thinking: bool,
     stream_output: bool,
 ) -> ExitCode {
@@ -436,13 +437,27 @@ pub(crate) fn run_chat_cmd(
 
     // Parse `--tool NAME[:DESC]=COMMAND` specs up front so a bad spec fails
     // before the model loads. Non-empty => every turn uses the tool path.
-    let shell_tools: Vec<ShellTool> = match tools.iter().map(|s| parse_tool_spec(s)).collect() {
+    let mut shell_tools: Vec<ShellTool> = match tools.iter().map(|s| parse_tool_spec(s)).collect()
+    {
         Ok(t) => t,
         Err(err) => {
             eprintln!("error: {err}");
             return ExitCode::FAILURE;
         }
     };
+    // A `--harness` file bundles a prompt, prethink template, file-backed
+    // vars, and tools; its tools join any `--tool` definitions.
+    let harness = match harness.as_deref().map(crate::chat::harness::Harness::load) {
+        Some(Ok(h)) => Some(h),
+        Some(Err(err)) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+        None => None,
+    };
+    if let Some(h) = &harness {
+        shell_tools.extend(h.shell_tools());
+    }
     let tools_json: Vec<serde_json::Value> = shell_tools.iter().map(tool_declaration).collect();
 
     // Quiet by default: chat is a UI, not a log. `--verbose` restores the
@@ -595,7 +610,7 @@ pub(crate) fn run_chat_cmd(
     // System prompt set via `/prompt`; prepended as a leading System turn on
     // every build (survives `/clear`). Passed per-call, not captured, so
     // `/prompt` can still mutate it between turns.
-    let mut system_prompt: Option<String> = None;
+    let mut system_prompt: Option<String> = harness.as_ref().and_then(|h| h.prompt.clone());
 
     let mut runner = TurnRunner {
         pipeline: &pipeline,
@@ -613,6 +628,15 @@ pub(crate) fn run_chat_cmd(
         show_thinking,
         stream_output,
         vars: std::collections::HashMap::new(),
+        file_vars: harness
+            .as_ref()
+            .map(|h| {
+                h.vars
+                    .iter()
+                    .map(|(name, path)| (name.clone(), std::path::PathBuf::from(path)))
+                    .collect()
+            })
+            .unwrap_or_default(),
     };
 
     // Set after any completed turn: the next idle moment should draft a fresh
@@ -653,7 +677,8 @@ pub(crate) fn run_chat_cmd(
     // seeds every message until cleared and survives `/clear`. A one-shot seed,
     // if set, wins for that single turn.
     let mut pending_prethink: Option<String> = None;
-    let mut persistent_prethink: Option<String> = None;
+    let mut persistent_prethink: Option<String> =
+        harness.as_ref().and_then(|h| h.prethink.clone());
 
     // One-shot forced reply from `/response <text>`: the next message skips
     // generation entirely: the text becomes the model turn and the KV is

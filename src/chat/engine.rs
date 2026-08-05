@@ -66,17 +66,41 @@ fn prefill_conversation(
     }
 }
 
-/// A `--tool NAME[:DESC]=COMMAND` definition: the model calls `NAME` with one
-/// free-form string argument `input`, which is passed to `COMMAND` (run under
-/// `sh -c`) as the `$input` environment variable; the script's stdout is fed
-/// back as the tool result.
+/// One declared tool parameter (always a string on the wire).
+pub(crate) struct ToolParam {
+    pub name: String,
+    pub description: String,
+    pub required: bool,
+}
+
+/// A shell-backed tool definition: the model calls `name` with the declared
+/// string `params`, which reach `command` (run under `sh -c`) as environment
+/// variables; the script's stdout is fed back as the tool result.
 pub(crate) struct ShellTool {
     name: String,
     description: String,
     command: String,
+    params: Vec<ToolParam>,
 }
 
-/// Parse a `--tool` spec `NAME[:DESC]=COMMAND` (NAME and COMMAND required).
+impl ShellTool {
+    pub fn new(
+        name: String,
+        description: String,
+        command: String,
+        params: Vec<ToolParam>,
+    ) -> Self {
+        Self {
+            name,
+            description,
+            command,
+            params,
+        }
+    }
+}
+
+/// Parse a `--tool` spec `NAME[:DESC]=COMMAND` (NAME and COMMAND required):
+/// one free-form required string argument `input`.
 pub(crate) fn parse_tool_spec(spec: &str) -> Result<ShellTool, String> {
     let (meta, command) = spec
         .split_once('=')
@@ -95,15 +119,32 @@ pub(crate) fn parse_tool_spec(spec: &str) -> Result<ShellTool, String> {
     } else {
         desc.to_string()
     };
-    Ok(ShellTool {
-        name: name.to_string(),
+    Ok(ShellTool::new(
+        name.to_string(),
         description,
-        command: command.to_string(),
-    })
+        command.to_string(),
+        vec![ToolParam {
+            name: "input".to_string(),
+            description: "The input passed to the tool.".to_string(),
+            required: true,
+        }],
+    ))
 }
 
-/// OpenAI-shape declaration for the tool renderer: one required string arg.
+/// OpenAI-shape declaration for the tool renderer, one string property per
+/// declared param (none is valid: a no-argument tool).
 pub(crate) fn tool_declaration(t: &ShellTool) -> serde_json::Value {
+    let mut properties = serde_json::Map::new();
+    let mut required = Vec::new();
+    for p in &t.params {
+        properties.insert(
+            p.name.clone(),
+            serde_json::json!({ "type": "string", "description": p.description }),
+        );
+        if p.required {
+            required.push(serde_json::Value::String(p.name.clone()));
+        }
+    }
     serde_json::json!({
         "type": "function",
         "function": {
@@ -111,24 +152,31 @@ pub(crate) fn tool_declaration(t: &ShellTool) -> serde_json::Value {
             "description": t.description,
             "parameters": {
                 "type": "object",
-                "properties": { "input": {
-                    "type": "string",
-                    "description": "The input passed to the tool.",
-                }},
-                "required": ["input"],
+                "properties": properties,
+                "required": required,
             },
         },
     })
 }
 
-/// Run a tool's shell command, exposing each call argument as an env var (so
-/// model-supplied values are never re-parsed as shell syntax). Returns stdout,
-/// or a bracketed diagnostic on non-zero exit / spawn failure. Output is capped
-/// so a runaway script can't blow the context window.
-fn run_shell_tool(t: &ShellTool, arguments: &serde_json::Value) -> String {
+/// Run a tool's shell command. Each call argument exports as an env var of
+/// its own name, and every session variable as `HARNESS_<name>` — model-
+/// supplied values are never re-parsed as shell syntax, and the prefix keeps
+/// state vars from colliding with params, so a tool can read and carry its
+/// own state (`::set counter=$((HARNESS_counter + 1))`-style). Returns
+/// stdout, or a bracketed diagnostic on non-zero exit / spawn failure.
+/// Output is capped so a runaway script can't blow the context window.
+fn run_shell_tool(
+    t: &ShellTool,
+    arguments: &serde_json::Value,
+    vars: &std::collections::HashMap<String, String>,
+) -> String {
     const MAX_OUTPUT: usize = 4096;
     let mut cmd = std::process::Command::new("sh");
     cmd.arg("-c").arg(&t.command);
+    for (k, v) in vars {
+        cmd.env(format!("HARNESS_{k}"), v);
+    }
     if let Some(obj) = arguments.as_object() {
         for (k, v) in obj {
             let val = match v {
@@ -153,6 +201,24 @@ fn run_shell_tool(t: &ShellTool, arguments: &serde_json::Value) -> String {
             s
         }
         Err(e) => format!("[tool failed to run: {e}]"),
+    }
+}
+
+/// One-line rendering of a call's arguments for events and `tool>` lines: the
+/// bare value for the classic single `input` arg, `k=v` pairs otherwise.
+fn call_input_summary(arguments: &serde_json::Value) -> String {
+    let text = |v: &serde_json::Value| match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    match arguments.as_object() {
+        Some(obj) if obj.len() == 1 && obj.contains_key("input") => text(&obj["input"]),
+        Some(obj) => obj
+            .iter()
+            .map(|(k, v)| format!("{k}={}", text(v)))
+            .collect::<Vec<_>>()
+            .join(", "),
+        None => String::new(),
     }
 }
 
@@ -238,6 +304,11 @@ pub(crate) struct TurnRunner<'a> {
     /// Session variables set by a tool's `::set NAME=VALUE` output, referenced in
     /// a `/prethink` seed as `$$NAME$$`. Persist across turns.
     pub vars: std::collections::HashMap<String, String>,
+    /// Harness-declared file-backed variables: `name` reads from its file at
+    /// every use (empty until something writes it), so a tool can buffer
+    /// multi-line state in the file where a `::set` value is one line. A
+    /// file-backed name shadows a `::set` of the same name.
+    pub file_vars: std::collections::HashMap<String, std::path::PathBuf>,
 }
 
 /// What a turn's reply comes from.
@@ -349,9 +420,9 @@ pub(crate) struct TurnOutcome {
 
 /// Expand a `/prethink` seed template against the turn: `$$last$$` -> the user's
 /// most recent message, `$$prompt$$` -> the system prompt, `$$NAME$$` -> a
-/// tool-set session variable (all empty if absent). Runs when the thinking
-/// channel is assembled, so the seed is computed from live turn state rather than
-/// fixed at command time.
+/// session variable (all empty if absent). Runs when the thinking channel is
+/// assembled, so the seed is computed from live turn state rather than fixed
+/// at command time.
 fn expand_thinking(
     template: &str,
     history: &[chat_template::ChatTurn],
@@ -460,6 +531,20 @@ impl TurnRunner<'_> {
         super::emit(&self.sinks, ev);
     }
 
+    /// The session variables as seen right now: `::set` values overlaid by
+    /// file-backed variables read fresh (mid-turn writes are visible to the
+    /// next expansion or tool run; an unreadable file reads empty).
+    fn live_vars(&self) -> std::collections::HashMap<String, String> {
+        let mut vars = self.vars.clone();
+        for (name, path) in &self.file_vars {
+            vars.insert(
+                name.clone(),
+                std::fs::read_to_string(path).unwrap_or_default(),
+            );
+        }
+        vars
+    }
+
     /// Normal / prethink turn: one `Generate` with the live streaming UI (the
     /// plain answer, or the dimmed thinking when seeded), then the answer split
     /// from the thought.
@@ -476,11 +561,11 @@ impl TurnRunner<'_> {
         // Raw-prompt sessions have no thought scaffold, so both are inert there.
         let (seed, close) = match thought {
             ThoughtPlan::Seeded { template, .. } if !self.raw_prompt => (
-                Some(expand_thinking(template, history, system, &self.vars)),
+                Some(expand_thinking(template, history, system, &self.live_vars())),
                 false,
             ),
             ThoughtPlan::Injected(template) if !self.raw_prompt => (
-                Some(expand_thinking(template, history, system, &self.vars)),
+                Some(expand_thinking(template, history, system, &self.live_vars())),
                 true,
             ),
             _ => (None, false),
@@ -634,7 +719,7 @@ impl TurnRunner<'_> {
     ) -> Result<String, crate::Error> {
         let turns = prepend_system(system, history);
         let messages = chat_turns_to_messages(&turns);
-        let seed = seed.map(|t| expand_thinking(t, history, system, &self.vars));
+        let seed = seed.map(|t| expand_thinking(t, history, system, &self.live_vars()));
         self.tool_loop(messages, seed.as_deref(), reseed, turn_idx)
     }
 
@@ -784,18 +869,14 @@ impl TurnRunner<'_> {
             }));
             let mut ended: Option<String> = None;
             for (i, call) in to_run.iter().enumerate() {
-                let input = match call.arguments.get("input") {
-                    Some(serde_json::Value::String(s)) => s.clone(),
-                    Some(v) => v.to_string(),
-                    None => String::new(),
-                };
+                let input = call_input_summary(&call.arguments);
                 self.emit(&ChatEvent::ToolCall {
                     round,
                     name: call.name.clone(),
                     input: input.clone(),
                 });
                 let raw_output = match self.shell_tools.iter().find(|t| t.name == call.name) {
-                    Some(t) => run_shell_tool(t, &call.arguments),
+                    Some(t) => run_shell_tool(t, &call.arguments, &self.live_vars()),
                     None => format!("error: no tool named '{}'", call.name),
                 };
                 // A tool steers the session out of band via `::` directive lines;
@@ -899,7 +980,7 @@ impl TurnRunner<'_> {
         thought: Option<&str>,
         reply: &str,
     ) -> Result<TurnOutcome, crate::Error> {
-        let thought = thought.map(|t| expand_thinking(t, history, system, &self.vars));
+        let thought = thought.map(|t| expand_thinking(t, history, system, &self.live_vars()));
         // No generation ran, so no renderer exists: echo directly on an
         // interactive tty; plain sessions display from the events below.
         if self.interactive {
@@ -1129,12 +1210,28 @@ mod tests {
     #[test]
     fn shell_tool_runs_with_input_env_var() {
         let t = parse_tool_spec("shout=printf '%s' \"$input\" | tr a-z A-Z").unwrap();
-        let out = run_shell_tool(&t, &serde_json::json!({ "input": "hello" }));
+        let vars = std::collections::HashMap::new();
+        let out = run_shell_tool(&t, &serde_json::json!({ "input": "hello" }), &vars);
         assert_eq!(out, "HELLO");
         // A model-supplied value with shell metacharacters is data, not syntax.
         let t = parse_tool_spec("id=printf '%s' \"$input\"").unwrap();
-        let out = run_shell_tool(&t, &serde_json::json!({ "input": "; echo pwned" }));
+        let out = run_shell_tool(&t, &serde_json::json!({ "input": "; echo pwned" }), &vars);
         assert_eq!(out, "; echo pwned");
+    }
+
+    #[test]
+    fn shell_tool_sees_state_vars_under_harness_prefix() {
+        let t = parse_tool_spec("bump=printf '::set n=%s\\nwas %s' \"$input\" \"$HARNESS_n\"")
+            .unwrap();
+        let vars = std::collections::HashMap::from([("n".to_string(), "41".to_string())]);
+        let out = run_shell_tool(&t, &serde_json::json!({ "input": "42" }), &vars);
+        // The state var arrives prefixed; the directive line is control, the
+        // rest is the model-facing result.
+        let (content, directives) = super::parse_tool_directives(&out);
+        assert_eq!(content, "was 41");
+        assert!(
+            matches!(&directives[..], [super::ToolDirective::Set(n, v)] if n == "n" && v == "42")
+        );
     }
 
     #[test]

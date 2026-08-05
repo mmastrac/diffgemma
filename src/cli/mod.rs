@@ -342,6 +342,9 @@ pub(crate) enum Command {
         ctx: Option<usize>,
         /// Shell-backed tools (`--tool NAME[:DESC]=COMMAND`, repeatable).
         tools: Vec<String>,
+        /// Mini-harness JSON (`--harness <file>`): prompt, prethink,
+        /// file-backed vars, and tools in one file.
+        harness: Option<PathBuf>,
         /// Stream the model's reasoning live (`--show-thinking`); default off.
         show_thinking: bool,
         /// Stream the answer as it forms (default); `--no-stream` withholds it.

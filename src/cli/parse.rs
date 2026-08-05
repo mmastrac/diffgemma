@@ -63,6 +63,7 @@ pub(crate) fn parse_cli() -> Cli {
     let mut chat_events_path: Option<PathBuf> = None;
     let mut chat_json = false;
     let mut chat_tools: Vec<String> = Vec::new();
+    let mut chat_harness: Option<PathBuf> = None;
     let mut chat_show_thinking = false;
     let mut chat_stream_output = true;
     let mut kernel_assert = false;
@@ -201,6 +202,11 @@ pub(crate) fn parse_cli() -> Cli {
             "--events" => {
                 if let Some(v) = args.next() {
                     chat_events_path = Some(PathBuf::from(v));
+                }
+            }
+            "--harness" => {
+                if let Some(v) = args.next() {
+                    chat_harness = Some(PathBuf::from(v));
                 }
             }
             "--tool" => {
@@ -618,6 +624,7 @@ pub(crate) fn parse_cli() -> Cli {
             json: chat_json,
             ctx: chat_ctx,
             tools: chat_tools.clone(),
+            harness: chat_harness.clone(),
             show_thinking: chat_show_thinking,
             stream_output: chat_stream_output,
         },
