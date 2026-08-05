@@ -694,6 +694,16 @@ fn expand_thinking(
     out
 }
 
+/// How many valid tool calls to run before the first corruption: the valid
+/// attempts preceding the first invalid one (`first_bad`), or all valid attempts
+/// when the sequence is clean. Runs the good prefix rather than aborting every
+/// call, which makes the model re-plan from scratch.
+#[cfg(target_os = "macos")]
+fn valid_prefix_len(attempts: &[(String, bool)], first_bad: Option<usize>) -> usize {
+    let upto = first_bad.unwrap_or(attempts.len());
+    attempts[..upto].iter().filter(|(_, valid)| *valid).count()
+}
+
 /// A control directive a tool emits through its output, out of band from the
 /// text the model sees. One per trimmed line: `::end [reply]` ends the turn (with
 /// an optional final reply), `::set NAME=VALUE` sets a session variable.
@@ -1083,30 +1093,9 @@ impl TurnRunner<'_> {
                 println!("\x1b[90mthink> {t}\x1b[0m");
             }
 
-            // A malformed / unclosed call: honor the stop (no forced continuation)
-            // and feed an error tool response so the model regenerates cleanly,
-            // mirroring the serve tool-repair stage. Bounded by MAX_ROUNDS.
-            if crate::tools::has_incomplete_tool_call(&content) {
-                finish(stream, None);
-                if human {
-                    println!("tool> (malformed tool call discarded; regenerating)");
-                }
-                const ERR: &str = "error: this tool call was malformed and has been \
-                    discarded. Regenerate your narration and tool calls, corrected, in full.";
-                for (name, valid) in crate::tools::scan_call_attempts(&content) {
-                    if valid {
-                        continue;
-                    }
-                    let name = if name.is_empty() { "tool".to_string() } else { name };
-                    messages.push(serde_json::json!({
-                        "role": "tool", "name": name, "content": ERR,
-                    }));
-                }
-                continue;
-            }
-
-            let calls = crate::tools::parse_tool_calls(&content);
-            if calls.is_empty() {
+            // No `call:` attempt at all: this is the final answer.
+            let attempts = crate::tools::scan_call_attempts(&content);
+            if attempts.is_empty() {
                 let answer = chat_template::sanitize_model_reply(&content);
                 finish(stream, Some(&answer));
                 if human {
@@ -1118,8 +1107,17 @@ impl TurnRunner<'_> {
                 }
                 return Ok(answer);
             }
-            // The model asked to call tools: show any preamble, run each backing
-            // script, and append the call + results for another round.
+            // Partial recovery: run the valid calls up to the first corrupted one,
+            // then (if anything is corrupt) feed an error for it and let the model
+            // reissue from there. Aborting every call makes it re-plan from scratch
+            // and misattribute the failure. `corrupt` also covers a dangling
+            // `<|tool_call>` opener that `scan_call_attempts` does not list.
+            let calls = crate::tools::parse_tool_calls(&content);
+            let first_bad = attempts.iter().position(|(_, valid)| !valid);
+            let corrupt = crate::tools::has_incomplete_tool_call(&content);
+            let run_count = valid_prefix_len(&attempts, first_bad);
+            let to_run = &calls[..run_count.min(calls.len())];
+
             let preamble = chat_template::sanitize_model_reply(
                 &crate::tools::content_before_tool_calls(&content),
             );
@@ -1128,12 +1126,12 @@ impl TurnRunner<'_> {
             if human && let Some(p) = preamble_line {
                 println!("model> {p}");
             }
-            let oai = crate::tools::to_openai_tool_calls(&calls);
+            let oai = crate::tools::to_openai_tool_calls(to_run);
             messages.push(serde_json::json!({
                 "role": "assistant", "content": "", "tool_calls": oai,
             }));
             let mut ended: Option<String> = None;
-            for (i, call) in calls.iter().enumerate() {
+            for (i, call) in to_run.iter().enumerate() {
                 let input = match call.arguments.get("input") {
                     Some(serde_json::Value::String(s)) => s.clone(),
                     Some(v) => v.to_string(),
@@ -1199,6 +1197,23 @@ impl TurnRunner<'_> {
                     }
                 }
                 return Ok(reply);
+            }
+            // A corrupted call: the prefix ran; error on the corruption and let
+            // the model reissue from there (bounded by MAX_ROUNDS).
+            if corrupt {
+                let name = first_bad
+                    .map(|k| attempts[k].0.clone())
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| "tool".to_string());
+                if human {
+                    println!("tool> {name}(malformed) -> discarded; asking the model to reissue");
+                }
+                messages.push(serde_json::json!({
+                    "role": "tool", "name": name,
+                    "content": "error: this tool call was malformed and was discarded; the calls \
+                        before it ran. Reissue this call and any that should follow it, corrected.",
+                }));
+                continue;
             }
         }
         if !self.json {
@@ -2010,7 +2025,7 @@ mod tests {
     use super::{
         JsonInput, ToolDirective, expand_file_markers, expand_thinking, json_command_to_line,
         parse_tool_directives, parse_tool_spec, run_shell_tool, salvage_answer, split_reasoning,
-        split_thought, tab_fill_text, tool_declaration,
+        split_thought, tab_fill_text, tool_declaration, valid_prefix_len,
     };
     use crate::tools::parse_tool_calls;
     use crate::chat_template::ChatTurn;
@@ -2113,6 +2128,21 @@ mod tests {
             expand_thinking("plain seed", &history, None, &empty),
             "plain seed"
         );
+    }
+
+    #[test]
+    fn valid_prefix_runs_up_to_first_corruption() {
+        let ok = |n: &str| (n.to_string(), true);
+        let bad = |n: &str| (n.to_string(), false);
+        // Clean: run every valid call.
+        let clean = [ok("a"), ok("b"), ok("c")];
+        assert_eq!(valid_prefix_len(&clean, None), 3);
+        // Corruption at index 2: the two valid calls before it run.
+        let mixed = [ok("a"), ok("b"), bad("c"), ok("d")];
+        assert_eq!(valid_prefix_len(&mixed, Some(2)), 2);
+        // First call corrupt: nothing runs.
+        let lead = [bad("a"), ok("b")];
+        assert_eq!(valid_prefix_len(&lead, Some(0)), 0);
     }
 
     #[test]
