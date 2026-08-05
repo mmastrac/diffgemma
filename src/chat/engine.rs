@@ -305,7 +305,12 @@ pub(crate) struct TurnRunner<'a> {
     /// multi-line state in the file where a `::set` value is one line. A
     /// file-backed name shadows a `::set` of the same name.
     pub file_vars: std::collections::HashMap<String, std::path::PathBuf>,
+    /// Tool rounds per turn before the loop gives up.
+    pub max_rounds: usize,
 }
+
+/// Tool rounds per turn unless the harness raises it.
+pub(crate) const DEFAULT_MAX_ROUNDS: usize = 8;
 
 /// What a turn's reply comes from.
 #[derive(Debug, PartialEq)]
@@ -728,27 +733,47 @@ impl TurnRunner<'_> {
     ) -> Result<String, crate::Error> {
         let turns = prepend_system(system, history);
         let messages = chat_turns_to_messages(&turns);
+        let base =
+            crate::tools::render_conversation_guarded(&messages, self.tools_json, true, true);
         let seed = seed.map(|t| expand_thinking(t, history, system, &self.live_vars()));
-        self.tool_loop(messages, seed.as_deref(), reseed, turn_idx)
+        self.tool_loop(base, seed.as_deref(), reseed, turn_idx)
     }
 
-    /// The tool-calling loop: render with tool declarations, generate, run each
-    /// backing script, feed the results back for another round. Tool
-    /// calls/results live only inside this turn; only the final answer persists.
-    /// `seed` (already expanded) seeds round 0, every round if `reseed`.
+    /// The tool-calling loop: generate, run each backing script, feed the
+    /// results back for another round. Round 0 prompts with the rendered
+    /// conversation; every later round EXTENDS the model's own output
+    /// verbatim — its reasoning and calls stay in context (a re-render
+    /// dropped them and the model re-planned from scratch every round), and
+    /// each round is a pure KV extension instead of a rewind at the stripped
+    /// thought. Tool calls/results still live only inside this turn: the next
+    /// user turn renders thought-free from history as always. `seed` (already
+    /// expanded) seeds round 0, every round if `reseed`.
     fn tool_loop(
         &mut self,
-        mut messages: Vec<serde_json::Value>,
+        base: String,
         seed: Option<&str>,
         reseed: bool,
         turn_idx: u64,
     ) -> Result<String, crate::Error> {
-        const MAX_ROUNDS: usize = 8;
+        let max_rounds = self.max_rounds;
         let started = std::time::Instant::now();
         // Turn totals for the terminal `Done` (per-round numbers ride the
         // `RoundStart`/`RoundEnd` events).
         let (mut total_tokens, mut total_steps) = (0usize, 0usize);
-        for round in 0..MAX_ROUNDS {
+        let channels = ChannelIds::from_tokenizer(self.tokenizer);
+        // Force the thought OPEN in the prompt: left to open the channel
+        // itself, the model often narrates its plan into the visible answer
+        // instead. Beginning in-thought pins the reasoning to the thought
+        // block; the `/prethink` seed, when set, continues there.
+        let mut prompt = {
+            let mut text = base;
+            text.push_str("<|channel>thought\n");
+            if let Some(s) = seed {
+                text.push_str(s.trim());
+            }
+            self.tokenizer.encode_prompt(&text).0
+        };
+        for round in 0..max_rounds {
             let think_seed = if round == 0 || reseed {
                 seed.map(str::trim)
             } else {
@@ -758,17 +783,6 @@ impl TurnRunner<'_> {
             // exactly as a plain turn always reasons. Displaying the thought
             // stays behind `--show-thinking` / a `/prethink` seed.
             let display_thinking = self.show_thinking || think_seed.is_some();
-            let mut guarded =
-                crate::tools::render_conversation_guarded(&messages, self.tools_json, true, true);
-            // Force the thought OPEN in the prompt: left to open the channel
-            // itself, the model often narrates its plan into the visible
-            // answer instead. Beginning in-thought pins the reasoning to the
-            // thought block; the `/prethink` seed, when set, continues there.
-            guarded.push_str("<|channel>thought\n");
-            if let Some(s) = think_seed {
-                guarded.push_str(s);
-            }
-            let prompt = self.tokenizer.encode_prompt(&guarded).0;
             let prompt_len = prompt.len();
             let budget = self.max_seq.saturating_sub(prompt_len + metal::CANVAS);
             if budget == 0 {
@@ -799,7 +813,7 @@ impl TurnRunner<'_> {
                 prompt_len,
             );
             self.step_cfg.step_observer = Some(stream.observer());
-            let out = pipeline_generate(self.pipeline, self.step_cfg, prompt)?;
+            let out = pipeline_generate(self.pipeline, self.step_cfg, prompt.clone())?;
             self.step_cfg.step_observer = None;
             let new_tokens = out.token_ids.len().saturating_sub(prompt_len);
             total_tokens += new_tokens;
@@ -807,8 +821,8 @@ impl TurnRunner<'_> {
 
             let new_ids =
                 sample::strip_degenerate_token_ids(out.token_ids.get(prompt_len..).unwrap_or(&[]));
-            let (settled_thought, content) = ChannelIds::from_tokenizer(self.tokenizer)
-                .settle_tool_reply(self.tokenizer, think_seed.unwrap_or(""), &new_ids);
+            let (settled_thought, content) =
+                channels.settle_tool_reply(self.tokenizer, think_seed.unwrap_or(""), &new_ids);
             // `None` = the model never closed its thought (the round began
             // inside one). The thought rides events (and the display) only
             // when surfaced — hidden reasoning stays hidden, as on a plain
@@ -866,12 +880,9 @@ impl TurnRunner<'_> {
                 text: preamble.trim().to_string(),
                 thought: thought.clone(),
             });
-            let oai = crate::tools::to_openai_tool_calls(to_run);
-            messages.push(serde_json::json!({
-                "role": "assistant", "content": "", "tool_calls": oai,
-            }));
             let mut ended: Option<String> = None;
-            for (i, call) in to_run.iter().enumerate() {
+            let mut responses: Vec<(String, String)> = Vec::new();
+            for call in to_run.iter() {
                 let input = call_input_summary(&call.arguments);
                 self.emit(&ChatEvent::ToolCall {
                     round,
@@ -928,12 +939,7 @@ impl TurnRunner<'_> {
                         body => println!("{head} -> {body}"),
                     }
                 }
-                let mut msg =
-                    serde_json::json!({ "role": "tool", "name": call.name, "content": output });
-                if let Some(id) = oai.get(i).and_then(|c| c.get("id")).cloned() {
-                    msg["tool_call_id"] = id;
-                }
-                messages.push(msg);
+                responses.push((call.name.clone(), output));
             }
             // A tool ended the turn: use its reply as the final answer instead of
             // generating another round.
@@ -951,30 +957,45 @@ impl TurnRunner<'_> {
                 });
                 return Ok(reply);
             }
-            // A corrupted call: the prefix ran; error on the corruption and let
-            // the model reissue from there (bounded by MAX_ROUNDS).
+            // Continuation: the model's own tokens, the tool responses in call
+            // order, and a reopened thought for the next round. A corrupted
+            // call stays visible in the model's output with an error response
+            // answering it, so it can see what it did wrong and reissue.
+            let mut tail = String::new();
+            for (name, output) in &responses {
+                tail.push_str(&crate::tools::render_tool_response_guarded(
+                    name,
+                    &serde_json::json!({ "content": output }),
+                ));
+            }
             if corrupt {
                 let name = first_bad
                     .map(|k| attempts[k].0.clone())
                     .filter(|n| !n.is_empty())
                     .unwrap_or_else(|| "tool".to_string());
                 if self.interactive {
-                    println!("tool> {name}(malformed) -> discarded; asking the model to reissue");
+                    println!("tool> {name}(malformed) -> asking the model to reissue");
                 }
                 self.emit(&ChatEvent::ToolRetry {
                     round,
                     name: name.clone(),
                 });
-                messages.push(serde_json::json!({
-                    "role": "tool", "name": name,
-                    "content": "error: this tool call was malformed and was discarded; the calls \
-                        before it ran. Reissue this call and any that should follow it, corrected.",
-                }));
-                continue;
+                tail.push_str(&crate::tools::render_tool_response_guarded(
+                    &name,
+                    &serde_json::json!({ "content": "error: this tool call was malformed and was \
+                        not run; the calls before it ran. Reissue this call and any that should \
+                        follow it, corrected." }),
+                ));
             }
+            tail.push_str("<|channel>thought\n");
+            if reseed && let Some(s) = seed {
+                tail.push_str(s.trim());
+            }
+            prompt = out.token_ids;
+            prompt.extend(self.tokenizer.encode_prompt(&tail).0);
         }
         if self.interactive {
-            println!("model> (stopped after {MAX_ROUNDS} tool rounds without a final answer)");
+            println!("model> (stopped after {max_rounds} tool rounds without a final answer)");
         }
         self.emit(&done_empty());
         Ok(String::new())
