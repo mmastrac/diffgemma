@@ -158,6 +158,113 @@ pub(crate) enum ServerEvent {
 }
 
 // ===========================================================================
+// Tool-turn continuation (the intra-turn amnesia fix, ported from chat).
+//
+// The client drives the tool loop over HTTP: it posts the whole conversation
+// back with our returned `tool_calls` echoed and `tool`-role responses
+// appended. Re-rendering that conversation strips the model's reasoning, so
+// each round used to re-plan from scratch (observed as repeated identical
+// exploratory calls). Instead, the worker remembers the raw token log of the
+// turn it just answered with tool calls; a request recognized as that turn's
+// next round prompts as the raw log — reasoning intact — plus the rendered
+// responses and a reopened thought, and is a pure KV extension.
+// ===========================================================================
+
+/// What the worker remembers after answering a tool-mode request with tool
+/// calls: enough to recognize the turn's next round and extend it verbatim.
+pub(crate) struct PendingToolTurn {
+    /// The request's `messages` exactly as received.
+    pub messages: Vec<serde_json::Value>,
+    /// The OpenAI-format `tool_calls` we returned (ids `call_0`, `call_1`, …).
+    pub tool_calls: Vec<serde_json::Value>,
+    /// Full raw token log of the turn so far: prompt + every generated id,
+    /// reasoning and calls intact (`out.token_ids`, unstripped — the chat
+    /// continuation extends exactly these).
+    pub raw_log: Vec<u32>,
+    pub tools: Vec<serde_json::Value>,
+    pub thinking: bool,
+}
+
+/// Recognize `messages` as the next round of `pending`'s tool turn: the same
+/// message prefix, an assistant message echoing our calls (matched by id and
+/// function name; clients may re-serialize arguments and merge in preamble
+/// content), then `tool`-role responses answering exactly those calls. Returns
+/// the response texts in OUR call order, or `None` (caller falls back to the
+/// re-render path — recognition must never turn a valid request into an error).
+pub(crate) fn match_tool_continuation(
+    pending: &PendingToolTurn,
+    messages: &[serde_json::Value],
+    tools: &[serde_json::Value],
+    thinking: bool,
+) -> Option<Vec<(String, String)>> {
+    let n = pending.messages.len();
+    if thinking != pending.thinking
+        || tools != pending.tools.as_slice()
+        || messages.len() < n + 2
+        || messages[..n] != pending.messages[..]
+    {
+        return None;
+    }
+    let call_id = |c: &serde_json::Value| c.get("id")?.as_str().map(str::to_string);
+    let call_name =
+        |c: &serde_json::Value| c.get("function")?.get("name")?.as_str().map(str::to_string);
+    let assistant = &messages[n];
+    if assistant.get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let echoed = assistant
+        .get("tool_calls")
+        .and_then(serde_json::Value::as_array)?;
+    if echoed.len() != pending.tool_calls.len() {
+        return None;
+    }
+    for (ours, theirs) in pending.tool_calls.iter().zip(echoed) {
+        if call_id(ours) != call_id(theirs) || call_name(ours) != call_name(theirs) {
+            return None;
+        }
+    }
+    let responses = &messages[n + 1..];
+    if !responses
+        .iter()
+        .all(|m| m.get("role").and_then(serde_json::Value::as_str) == Some("tool"))
+    {
+        return None;
+    }
+    // Every call answered exactly once: match responses by `tool_call_id`, or
+    // by position when ids are absent and the counts line up.
+    let by_id: std::collections::HashMap<String, &serde_json::Value> = responses
+        .iter()
+        .filter_map(|m| Some((m.get("tool_call_id")?.as_str()?.to_string(), m)))
+        .collect();
+    let ordered: Vec<&serde_json::Value> = if by_id.len() == responses.len() {
+        if by_id.len() != pending.tool_calls.len() {
+            return None;
+        }
+        pending
+            .tool_calls
+            .iter()
+            .map(|c| by_id.get(&call_id(c)?).copied())
+            .collect::<Option<_>>()?
+    } else if responses.len() == pending.tool_calls.len() {
+        responses.iter().collect()
+    } else {
+        return None;
+    };
+    Some(
+        ordered
+            .iter()
+            .zip(&pending.tool_calls)
+            .map(|(m, c)| {
+                (
+                    call_name(c).unwrap_or_default(),
+                    crate::tools::message_text(m),
+                )
+            })
+            .collect(),
+    )
+}
+
+// ===========================================================================
 // GPU worker: owns the session, drains the job queue one at a time.
 // ===========================================================================
 

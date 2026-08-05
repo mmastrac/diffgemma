@@ -35,6 +35,11 @@ pub struct DiffusionStreamMapper<D: TextDecoder> {
     channels: ChannelIds,
     thinking: bool,
     emit_drafts: bool,
+    /// The generation begins inside an already-open thought channel whose
+    /// open marker was in the prompt (a tool round's forced-open thought).
+    /// The split must classify the leading ids as reasoning even though no
+    /// open marker appears in the stream.
+    start_in_thought: bool,
 
     /// Block-committed token ids accumulated across all committed blocks.
     committed_ids: Vec<u32>,
@@ -93,6 +98,7 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
             },
             thinking,
             emit_drafts,
+            start_in_thought: false,
             committed_ids: Vec::new(),
             emitted_reasoning: String::new(),
             emitted_content: String::new(),
@@ -104,6 +110,14 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
             est_block_steps: 16.0,
             pace_off: false,
         }
+    }
+
+    /// The generation begins inside an already-open thought (the open marker
+    /// was in the prompt). Only meaningful with `thinking` on — the forced
+    /// opener is never seeded on a thinking-off request.
+    pub fn starting_in_thought(mut self) -> Self {
+        self.start_in_thought = true;
+        self
     }
 
     /// Committed (immutable) answer text emitted so far.
@@ -131,7 +145,9 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
                 content: self.decode_content(ids),
             };
         }
-        let split = self.channels.split(&self.decoder, ids, false);
+        let split = self
+            .channels
+            .split(&self.decoder, ids, self.start_in_thought);
         Split {
             reasoning: self.clean_reasoning(&split.reasoning),
             content: self.decode_content(&split.content),

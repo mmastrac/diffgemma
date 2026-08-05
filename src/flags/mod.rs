@@ -435,6 +435,12 @@ pub struct ServerFlags {
     /// Default OFF since the strain battery showed the premature stop is a
     /// degradation symptom and the forced continuation floods. Opt-in.
     pub continue_past_stop: bool,
+    /// `DGQ_SERVE_TOOL_CONTINUATION`: a tool-mode request that extends the
+    /// previous tool turn (same messages + our returned calls + their
+    /// responses) prompts as the resident raw token log — reasoning intact —
+    /// plus the rendered responses and a reopened thought, instead of the
+    /// thought-free re-render. Default ON; `=0` off.
+    pub serve_tool_continuation: bool,
     /// `DGQ_TOOL_COMPACT`: enable the tool-output compactor. Default OFF.
     pub tool_compact: bool,
     /// `DGQ_TOOL_REPAIR`: serve's model-guided tool-call repair — an invalid
@@ -717,6 +723,7 @@ impl RuntimeConfig {
                     .unwrap_or_else(default_conv_cache_dir),
                 continue_past_stop: r.on_if_one("DGQ_CONTINUE_PAST_STOP"),
                 prefill_status: r.on_unless_zero("DGQ_PREFILL_STATUS"),
+                serve_tool_continuation: r.on_unless_zero("DGQ_SERVE_TOOL_CONTINUATION"),
                 tool_compact: r.on_if_one("DGQ_TOOL_COMPACT"),
                 tool_repair: r.on_if_one("DGQ_TOOL_REPAIR"),
                 tool_validate: r.on_if_one("DGQ_TOOL_VALIDATE"),

@@ -632,3 +632,111 @@ fn paced_stream_tool_call_disables_pacing() {
         "pace_off must persist: {out:?}"
     );
 }
+
+/// A tool round whose prompt seeds the thought OPEN (`start_in_thought`):
+/// the leading ids are reasoning even with no open marker in the stream, and
+/// content starts after the model's `<channel|>`.
+#[test]
+fn start_in_thought_classifies_leading_ids_as_reasoning() {
+    let close = 2u32;
+    let mut m = DiffusionStreamMapper::new(
+        FakeDecoder,
+        vec![],
+        Some(1),
+        Some(close),
+        None,
+        false,
+        true,
+        false,
+        false,
+    )
+    .starting_in_thought();
+    let canvas = [c('p'), c('l'), c('a'), c('n'), close, c('O'), c('k')];
+    let _ = m.on_step(&step(1, 2, &canvas, true));
+    assert_eq!(m.reasoning(), "plan");
+    assert_eq!(m.content(), "Ok");
+}
+
+fn pending_fixture() -> PendingToolTurn {
+    let messages = vec![serde_json::json!({"role": "user", "content": "list the files"})];
+    let tool_calls = vec![
+        serde_json::json!({"index": 0, "id": "call_0", "type": "function",
+            "function": {"name": "ls", "arguments": "{\"path\":\".\"}"}}),
+        serde_json::json!({"index": 1, "id": "call_1", "type": "function",
+            "function": {"name": "read", "arguments": "{\"path\":\"a\"}"}}),
+    ];
+    PendingToolTurn {
+        messages,
+        tool_calls,
+        raw_log: vec![1, 2, 3],
+        tools: vec![serde_json::json!({"type": "function", "function": {"name": "ls"}})],
+        thinking: true,
+    }
+}
+
+fn continuation_messages(p: &PendingToolTurn) -> Vec<serde_json::Value> {
+    let mut m = p.messages.clone();
+    m.push(serde_json::json!({
+        "role": "assistant", "content": "",
+        "tool_calls": p.tool_calls.clone(),
+    }));
+    m.push(serde_json::json!({
+        "role": "tool", "tool_call_id": "call_1", "name": "read", "content": "aaa"
+    }));
+    m.push(serde_json::json!({
+        "role": "tool", "tool_call_id": "call_0", "name": "ls", "content": "a b"
+    }));
+    m
+}
+
+#[test]
+fn continuation_matches_and_orders_responses_by_call() {
+    let p = pending_fixture();
+    let msgs = continuation_messages(&p);
+    // Responses arrive out of order; the match returns them in OUR call order.
+    let got = match_tool_continuation(&p, &msgs, &p.tools.clone(), true).unwrap();
+    assert_eq!(
+        got,
+        vec![
+            ("ls".to_string(), "a b".to_string()),
+            ("read".to_string(), "aaa".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn continuation_rejects_divergence() {
+    let p = pending_fixture();
+    let msgs = continuation_messages(&p);
+    // Thinking flip, tool-set change, edited history, missing/extra responses:
+    // all fall back to the re-render path.
+    assert!(match_tool_continuation(&p, &msgs, &p.tools.clone(), false).is_none());
+    assert!(match_tool_continuation(&p, &msgs, &[], true).is_none());
+    let mut edited = msgs.clone();
+    edited[0] = serde_json::json!({"role": "user", "content": "different"});
+    assert!(match_tool_continuation(&p, &edited, &p.tools.clone(), true).is_none());
+    let missing = &msgs[..msgs.len() - 1];
+    assert!(match_tool_continuation(&p, missing, &p.tools.clone(), true).is_none());
+    let mut extra = msgs.clone();
+    extra.push(serde_json::json!({"role": "user", "content": "and now this"}));
+    assert!(match_tool_continuation(&p, &extra, &p.tools.clone(), true).is_none());
+    // A response answering an unknown call id.
+    let mut wrong = msgs.clone();
+    wrong[2]["tool_call_id"] = serde_json::json!("call_9");
+    assert!(match_tool_continuation(&p, &wrong, &p.tools.clone(), true).is_none());
+}
+
+#[test]
+fn continuation_matches_by_position_without_ids() {
+    let p = pending_fixture();
+    let mut msgs = p.messages.clone();
+    msgs.push(serde_json::json!({
+        "role": "assistant", "content": "",
+        "tool_calls": p.tool_calls.clone(),
+    }));
+    msgs.push(serde_json::json!({"role": "tool", "name": "ls", "content": "a b"}));
+    msgs.push(serde_json::json!({"role": "tool", "name": "read", "content": "aaa"}));
+    let got = match_tool_continuation(&p, &msgs, &p.tools.clone(), true).unwrap();
+    assert_eq!(got[0].0, "ls");
+    assert_eq!(got[1].1, "aaa");
+}

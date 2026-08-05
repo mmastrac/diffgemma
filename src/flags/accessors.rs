@@ -328,6 +328,13 @@ pub fn prefill_status_enabled() -> bool {
     config().server.prefill_status
 }
 
+/// `DGQ_SERVE_TOOL_CONTINUATION` (default ON, `=0` disables): serve prompts a
+/// recognized tool-turn extension with the previous round's raw token log —
+/// reasoning intact — instead of the thought-free re-render.
+pub fn serve_tool_continuation_enabled() -> bool {
+    config().server.serve_tool_continuation
+}
+
 /// `DGQ_TOOL_REPAIR=1`: model-guided tool-call repair (error tool-response →
 /// corrected call → corrupt exchange rewound out of KV). Equivalent to
 /// `serve --tool-repair`. Default OFF.

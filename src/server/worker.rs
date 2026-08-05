@@ -24,19 +24,31 @@ impl Worker {
     /// neutralized. Returns (token ids, neutralized count, guarded render) —
     /// callers decide whether to log the count (the sizing closure renders in
     /// a loop and stays silent).
+    ///
+    /// `force_thought` (generation prompts on thinking requests): seed the
+    /// thought channel OPEN at the end of the prompt. Left to open the
+    /// channel itself, the model often narrates its plan into the visible
+    /// answer instead — beginning in-thought pins the reasoning to the
+    /// thought block. Skipped when the render ends mid-grammar in an open
+    /// `<|tool_response>` (an unanswered call the client posted back without
+    /// responses).
     fn render_prompt(
         &self,
         messages: &[serde_json::Value],
         tools: &[serde_json::Value],
         add_generation_prompt: bool,
         thinking: bool,
+        force_thought: bool,
     ) -> (Vec<u32>, usize, String) {
-        let g = crate::tools::render_conversation_guarded(
+        let mut g = crate::tools::render_conversation_guarded(
             messages,
             tools,
             add_generation_prompt,
             thinking,
         );
+        if force_thought && !g.ends_with("<|tool_response>") {
+            g.push_str("<|channel>thought\n");
+        }
         let (ids, neutralized) = self.tokenizer.encode_prompt(&g);
         (ids, neutralized, g)
     }
@@ -131,8 +143,12 @@ impl Worker {
         if ready.send(Ok(())).is_err() {
             return;
         }
+        // The most recent tool turn answered with tool calls (single slot: a
+        // second interleaved tool conversation replaces it and the displaced
+        // one falls back to the re-render path — a reuse cost, never an error).
+        let mut pending: Option<PendingToolTurn> = None;
         for job in jobs {
-            self.handle(&*stage, tool_store.as_mut(), job);
+            self.handle(&*stage, tool_store.as_mut(), &mut pending, job);
         }
     }
 
@@ -140,6 +156,7 @@ impl Worker {
         &self,
         stage: &dyn crate::pipeline::PipelineStage,
         store: Option<&mut crate::toolcompact::ToolOutputStore>,
+        pending: &mut Option<PendingToolTurn>,
         job: Job,
     ) {
         use crate::pipeline::{PipelineEvent, PipelineOp};
@@ -151,11 +168,60 @@ impl Worker {
         // Plain turns for the non-tool prompt/finalize path (gate-validated).
         let history = build_turns(&job.messages);
 
-        let (prompt, prompt_text) = if tool_mode {
+        // Continuation round of the turn we just answered with tool calls?
+        // Prompt with the model's own tokens verbatim — reasoning and calls
+        // intact — plus the responses in call order and a reopened thought,
+        // instead of the re-render that strips the reasoning and had the
+        // model re-planning from scratch every round. Also a pure KV
+        // extension: last round finalized the raw log as the routing log.
+        let continuation_on = crate::flags::serve_tool_continuation_enabled();
+        let continued = (tool_mode && continuation_on)
+            .then(|| {
+                let p = pending.as_ref()?;
+                let responses =
+                    match_tool_continuation(p, &job.messages, &job.tools, thinking)?;
+                let mut tail = String::new();
+                for (name, content) in &responses {
+                    tail.push_str(&crate::tools::render_tool_response_guarded(
+                        name,
+                        &serde_json::json!({ "content": content }),
+                    ));
+                }
+                if thinking {
+                    tail.push_str("<|channel>thought\n");
+                }
+                let (tail_ids, neutralized) = self.tokenizer.encode_prompt(&tail);
+                let mut ids = p.raw_log.clone();
+                ids.extend(tail_ids);
+                // The raw log carries the turn's reasoning, so it outgrows the
+                // thought-free re-render — when it no longer fits, fall back
+                // rather than failing a request the re-render could serve.
+                if ids.len() + crate::metal::CANVAS >= self.max_seq {
+                    eprintln!(
+                        "serve: tool continuation ({} tok) would overflow the context; re-rendering",
+                        ids.len()
+                    );
+                    return None;
+                }
+                log_neutralized(neutralized);
+                eprintln!(
+                    "serve: tool continuation ({} response(s) extend the {}-token turn log)",
+                    responses.len(),
+                    p.raw_log.len(),
+                );
+                Some(ids)
+            })
+            .flatten();
+        let was_continuation = continued.is_some();
+        let (prompt, prompt_text, start_in_thought) = if let Some(ids) = continued {
+            let text = self.tokenizer.decode(&ids);
+            (ids, text, thinking)
+        } else if tool_mode {
             let (ids, neutralized, g) =
-                self.render_prompt(&job.messages, &job.tools, true, thinking);
+                self.render_prompt(&job.messages, &job.tools, true, thinking, thinking);
             log_neutralized(neutralized);
-            (ids, crate::tools::strip_client_guards(&g))
+            let started = g.ends_with("<|channel>thought\n");
+            (ids, crate::tools::strip_client_guards(&g), started)
         } else {
             let opts = crate::chat_template::ChatFormatOptions {
                 add_generation_prompt: true,
@@ -164,7 +230,7 @@ impl Worker {
             match crate::chat_template::format_chat_token_ids(&self.tokenizer, &history, &opts) {
                 Ok(ids) => {
                     let s = self.tokenizer.decode(&ids);
-                    (ids, s)
+                    (ids, s, false)
                 }
                 Err(err) => {
                     let _ = job.resp.send(ServerEvent::Error(format!("prompt: {err}")));
@@ -187,7 +253,7 @@ impl Worker {
         }
 
         let mut cfg = self.per_request_cfg(&job, budget);
-        let mapper = self.make_mapper(&job);
+        let mapper = self.make_mapper(&job, start_in_thought);
         let log_seq = self.allocate_log_seq();
         let file_block = Arc::new(AtomicUsize::new(0));
         self.attach_block_commit_logger(&mut cfg, log_seq, &file_block);
@@ -306,10 +372,21 @@ impl Worker {
                             calls = salvage;
                         }
                     }
-                    (
-                        crate::tools::content_before_tool_calls(&raw_text),
-                        crate::tools::to_openai_tool_calls(&calls),
-                    )
+                    let mut content = crate::tools::content_before_tool_calls(&raw_text);
+                    // Final round whose forced-open thought never closed: the
+                    // model stated its answer inside the monologue (all of it
+                    // classified as reasoning) — salvage the tail rather than
+                    // replying with nothing.
+                    if calls.is_empty()
+                        && start_in_thought
+                        && content.trim().is_empty()
+                        && !reasoning.trim().is_empty()
+                    {
+                        content = crate::chat_template::sanitize_model_reply(
+                            &crate::chat::salvage_answer(&reasoning),
+                        );
+                    }
+                    (content, crate::tools::to_openai_tool_calls(&calls))
                 } else {
                     (raw_text.clone(), Vec::new())
                 };
@@ -327,6 +404,7 @@ impl Worker {
                         "ts_unix_ms": now_ms(),
                         "tool_mode": tool_mode,
                         "tool_compact": false,
+                        "continuation": was_continuation,
                         "seed": job.seed,
                         "max_tokens": job.max_tokens,
                         "messages": &job.messages,
@@ -407,7 +485,22 @@ impl Worker {
                 // clean prefix of the next turn's prompt (reasoning never persists;
                 // reuse survives a swap). Tool turns re-derive the assistant message
                 // WITH its tool_calls via the tool-aware renderer.
-                let canonical = if tool_mode {
+                let canonical = if tool_mode && continuation_on && !tool_calls.is_empty() {
+                    // The turn continues: finalize the RAW log — reasoning
+                    // intact — as the routing log, so the next round's
+                    // continuation prompt is a pure KV extension (a no-op
+                    // rebuild: the raw log IS the resident state). Thought
+                    // eviction is deferred to the round that ends the turn,
+                    // which finalizes thought-free below as always.
+                    *pending = Some(PendingToolTurn {
+                        messages: job.messages.clone(),
+                        tool_calls: tool_calls.clone(),
+                        raw_log: out.token_ids.clone(),
+                        tools: job.tools.clone(),
+                        thinking,
+                    });
+                    Some(out.token_ids.clone())
+                } else if tool_mode {
                     let mut completed = job.messages.clone();
                     // KV-reuse-first: a tool-calling turn's trailing prose
                     // renders AFTER the (future) tool responses in the
@@ -426,8 +519,11 @@ impl Worker {
                         assistant["tool_calls"] = serde_json::Value::Array(tool_calls.clone());
                     }
                     completed.push(assistant);
+                    // Turn over (or continuation off): reasoning is evicted
+                    // here, and any pending continuation state is stale.
+                    *pending = None;
                     Some(
-                        self.render_prompt(&completed, &job.tools, false, thinking)
+                        self.render_prompt(&completed, &job.tools, false, thinking, false)
                             .0,
                     )
                 } else {
@@ -493,9 +589,12 @@ impl Worker {
         cfg
     }
 
-    fn make_mapper(&self, job: &Job) -> ServeMapper {
+    /// `start_in_thought`: the prompt seeds an open thought (forced-open tool
+    /// round / continuation), so the split must classify the leading ids as
+    /// reasoning even with no open marker in the stream.
+    fn make_mapper(&self, job: &Job, start_in_thought: bool) -> ServeMapper {
         let tool_mode = needs_tool_rendering(&job.messages, &job.tools);
-        Arc::new(Mutex::new(DiffusionStreamMapper::new(
+        let mut mapper = DiffusionStreamMapper::new(
             Arc::clone(&self.tokenizer),
             self.stop_token_ids.clone(),
             self.channel_open,
@@ -510,7 +609,11 @@ impl Worker {
             job.enable_thinking,
             job.emit_drafts,
             crate::flags::paced_stream_enabled(),
-        )))
+        );
+        if start_in_thought {
+            mapper = mapper.starting_in_thought();
+        }
+        Arc::new(Mutex::new(mapper))
     }
 
     /// Tool-mode request with compaction on (the KV rewinder). Over-threshold
@@ -552,7 +655,7 @@ impl Worker {
         let routing_messages = substitute(store, &job.messages);
         let routing_prompt = {
             let (ids, neutralized, _) =
-                self.render_prompt(&routing_messages, &tools_aug, true, thinking);
+                self.render_prompt(&routing_messages, &tools_aug, true, thinking, thinking);
             log_neutralized(neutralized);
             ids
         };
@@ -593,7 +696,11 @@ impl Worker {
             let too_big = |ctx: &[serde_json::Value]| {
                 // NOTE: thinking=false here where siblings pass the request
                 // flag — preserved as-is (sizing-only render).
-                self.render_prompt(ctx, &tools_aug, true, false).0.len() + canvas + 64
+                self.render_prompt(ctx, &tools_aug, true, false, false)
+                    .0
+                    .len()
+                    + canvas
+                    + 64
                     > self.max_seq
             };
             if too_big(&ctx) {
@@ -642,7 +749,9 @@ impl Worker {
         // routing render IS the main prompt — skip the duplicate render+encode.
         let (messages_sub, prompt) = if summarized_any {
             let msgs = substitute(store, &job.messages);
-            let p = self.render_prompt(&msgs, &tools_aug, true, thinking).0;
+            let p = self
+                .render_prompt(&msgs, &tools_aug, true, thinking, thinking)
+                .0;
             (msgs, p)
         } else {
             (routing_messages, routing_prompt)
@@ -687,8 +796,10 @@ impl Worker {
             }
             // Fresh mapper per round: block indices restart at 1 on every
             // generation, and a prior round's stop token must not eat this
-            // round's text.
-            let mapper = self.make_mapper(&job);
+            // round's text. Every round's prompt seeds an open thought when
+            // thinking (the main prompt's forced opener / the expand tail's
+            // reopened one).
+            let mapper = self.make_mapper(&job, thinking);
             attach_stream_observer(&mut cfg, &mapper, &job.resp, true, true, None);
             self.attach_block_commit_logger(&mut cfg, log_seq, &file_block);
 
@@ -788,6 +899,11 @@ impl Worker {
                     tc::EXPAND_TOOL_NAME,
                     &serde_json::json!({ "content": excerpt }),
                 ));
+            }
+            // Reopen the thought for the next round (mirrors the forced-open
+            // opener every tool-mode generation prompt now carries).
+            if thinking {
+                resp_text.push_str("<|channel>thought\n");
             }
             let mut ext = out.token_ids.clone();
             ext.extend(self.tokenizer.encode_prompt(&resp_text).0);
