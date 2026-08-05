@@ -1,10 +1,6 @@
 use serde::Serialize;
 
-use crate::chat::TextDecoder;
-
-/// Consecutive-step repeats before a canvas position is treated as stable enough
-/// to stream (matches the terminal chat renderer's `STABLE_STREAK`).
-const STABLE_STREAK: u32 = 2;
+use crate::chat::{ChannelIds, Stabilizer, TextDecoder};
 
 /// One streamed delta produced by the mapper, before OpenAI-envelope framing.
 #[derive(Debug, Clone, PartialEq)]
@@ -32,25 +28,14 @@ pub enum WireDelta {
 
 pub struct DiffusionStreamMapper<D: TextDecoder> {
     decoder: D,
-    stops: Vec<u32>,
-    channel_open: Option<u32>,
-    channel_close: Option<u32>,
-    /// The `<|"|>` string-quote special id (tool mode only). Inside an open
-    /// quote run, channel ids are literal arg content: they neither toggle
-    /// the thought state nor get filtered out — a tool call writing a file
-    /// that contains chat markup must round-trip it byte-exact.
-    quote: Option<u32>,
-    /// Skip stop ids inside an open quote run (must mirror the engine's
-    /// `continue_incomplete_tool_calls` policy — if the engine honors a
-    /// quoted stop, cutting later here would stream text the engine
-    /// dropped, and vice versa).
-    stop_skip_quoted: bool,
+    /// The shared stable-prefix front end (streak tracking, stop cut, quoted-
+    /// stop skipping — one implementation with the terminal chat decoder).
+    stab: Stabilizer,
+    /// Channel/quote special ids for the shared token-level thought split.
+    channels: ChannelIds,
     thinking: bool,
     emit_drafts: bool,
 
-    block_idx: usize,
-    last_argmax: Vec<u32>,
-    streak: Vec<u32>,
     /// Block-committed token ids accumulated across all committed blocks.
     committed_ids: Vec<u32>,
     /// Full committed reasoning / content text (the split of `committed_ids`).
@@ -100,16 +85,14 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
     ) -> Self {
         Self {
             decoder,
-            stops,
-            channel_open,
-            channel_close,
-            quote,
-            stop_skip_quoted,
+            stab: Stabilizer::new(stops, quote, stop_skip_quoted),
+            channels: ChannelIds {
+                open: channel_open,
+                close: channel_close,
+                quote,
+            },
             thinking,
             emit_drafts,
-            block_idx: 0,
-            last_argmax: Vec::new(),
-            streak: Vec::new(),
             committed_ids: Vec::new(),
             emitted_reasoning: String::new(),
             emitted_content: String::new(),
@@ -138,14 +121,9 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
         self.ended
     }
 
-    /// Split committed ids into (reasoning, content). With thinking off,
-    /// everything is content. With thinking on, reasoning is ONLY what sits
-    /// inside an explicit `<|channel>…<channel|>` span the model actually
-    /// emitted — classification follows emission, not the mode flag. The old
-    /// rule ("everything is reasoning until a close appears") silently
-    /// swallowed a whole turn when the model skipped the thought ceremony
-    /// and answered with a bare tool call. An unclosed span still runs to the
-    /// end of the committed ids, so mid-thought streaming is unchanged.
+    /// Split committed ids into (reasoning, content) via the shared
+    /// token-level walk (`chat::ChannelIds::split`). With thinking off,
+    /// everything is content.
     fn split(&self, ids: &[u32]) -> Split {
         if !self.thinking {
             return Split {
@@ -153,54 +131,10 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
                 content: self.decode_content(ids),
             };
         }
-        let mut reasoning_ids: Vec<u32> = Vec::new();
-        let mut content_ids: Vec<u32> = Vec::new();
-        let mut in_thought = false;
-        let mut in_quote = false;
-        // A `<|channel>` takes its NAME token (+ trailing newline) with it: the
-        // open special is dropped here, so a mid-span re-open would otherwise
-        // leak a bare "thought" line into the client's Thought UI.
-        let mut skip_name = false;
-        for &id in ids {
-            if Some(id) == self.quote {
-                in_quote = !in_quote;
-                // The quote id is grammar the parser needs — keep it.
-                if in_thought {
-                    reasoning_ids.push(id);
-                } else {
-                    content_ids.push(id);
-                }
-            } else if in_quote {
-                // Literal quoted content: channel ids included, verbatim.
-                if in_thought {
-                    reasoning_ids.push(id);
-                } else {
-                    content_ids.push(id);
-                }
-            } else if Some(id) == self.channel_open {
-                in_thought = true;
-                skip_name = true;
-            } else if Some(id) == self.channel_close {
-                in_thought = false;
-            } else if in_thought {
-                if skip_name {
-                    let tok = self.decoder.decode(&[id]);
-                    if tok == "thought" {
-                        continue;
-                    }
-                    skip_name = false;
-                    if tok == "\n" {
-                        continue;
-                    }
-                }
-                reasoning_ids.push(id);
-            } else {
-                content_ids.push(id);
-            }
-        }
+        let split = self.channels.split(&self.decoder, ids, false);
         Split {
-            reasoning: self.clean_reasoning(&reasoning_ids),
-            content: self.decode_content(&content_ids),
+            reasoning: self.clean_reasoning(&split.reasoning),
+            content: self.decode_content(&split.content),
         }
     }
 
@@ -260,54 +194,10 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
             return out;
         }
 
-        if ev.block_idx != self.block_idx {
-            self.block_idx = ev.block_idx;
-            self.last_argmax.clear();
-            self.streak.clear();
-        }
-
-        // Per-position stable-streak update.
-        if self.last_argmax.len() != ev.argmax.len() {
-            self.last_argmax = ev.argmax.to_vec();
-            self.streak = vec![0; ev.argmax.len()];
-        } else {
-            for i in 0..ev.argmax.len() {
-                if ev.argmax[i] == self.last_argmax[i] {
-                    self.streak[i] = self.streak[i].saturating_add(1);
-                } else {
-                    self.streak[i] = 0;
-                    self.last_argmax[i] = ev.argmax[i];
-                }
-            }
-        }
-
-        // Stable prefix (whole canvas on commit), cut at the first stop token.
-        let prefix_end = if ev.block_done {
-            ev.argmax.len()
-        } else {
-            self.streak
-                .iter()
-                .position(|&k| k < STABLE_STREAK)
-                .unwrap_or(ev.argmax.len())
-        };
-        let mut stable_ids = Vec::with_capacity(prefix_end);
-        let mut hit_stop = false;
-        // Quote parity carries over from the already-committed stream: a stop
-        // id inside an open `<|"|>` run is literal arg content, skipped only
-        // when the engine's stop-scan does the same (see `stop_skip_quoted`).
-        let mut in_quote = self.stop_skip_quoted
-            && self
-                .quote
-                .is_some_and(|q| self.committed_ids.iter().filter(|&&id| id == q).count() % 2 == 1);
-        for &id in &ev.argmax[..prefix_end] {
-            if self.stop_skip_quoted && Some(id) == self.quote {
-                in_quote = !in_quote;
-            } else if !in_quote && self.stops.contains(&id) {
-                hit_stop = true;
-                break;
-            }
-            stable_ids.push(id);
-        }
+        // Shared stable-prefix front end: streak tracking, stop cut, and
+        // cross-block quote parity for quoted-stop skipping.
+        let sp = self.stab.on_step(ev);
+        let (stable_ids, hit_stop) = (sp.ids, sp.hit_stop);
 
         // Draft (replace-semantics), emitted every step it changes.
         if self.emit_drafts {
@@ -341,8 +231,6 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
             self.emitted_content = split.content;
             // EMA of block step counts — the pacing denominator.
             self.est_block_steps = 0.5 * self.est_block_steps + 0.5 * ev.step_in_block as f32;
-            self.last_argmax.clear();
-            self.streak.clear();
             // Premature stop inside an unfinished tool turn (open call, or
             // trailing prose after a closed call): keep the mapper open.
             if hit_stop && !crate::tools::should_continue_past_stop(&self.emitted_content) {

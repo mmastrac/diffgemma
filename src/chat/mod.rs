@@ -23,4 +23,4 @@ pub use decode::{StreamDecoder, TextDecoder};
 pub use event::ChatEvent;
 pub use render::{ChatStream, StreamDisplay, render_demo};
 
-pub(crate) use decode::strip_thought_open;
+pub(crate) use decode::{ChannelIds, Stabilizer, strip_thought_open};

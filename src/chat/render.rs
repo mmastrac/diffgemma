@@ -567,8 +567,10 @@ impl ChatStream {
         prompt_tokens: usize,
     ) -> Self {
         let show_thinking = display.show_thinking || display.prethink_seed.is_some();
+        let channels = super::ChannelIds::from_tokenizer(&tokenizer);
         let shared = Arc::new(Mutex::new(Shared {
             decoder: StreamDecoder::new(Arc::clone(&tokenizer), stop_token_ids)
+                .with_channels(channels)
                 .with_thinking(show_thinking, display.prethink_seed),
             json,
             render: Render::new(show_thinking, display.stream_output, interactive),
