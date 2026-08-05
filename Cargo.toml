@@ -1,10 +1,12 @@
 [package]
-name = "diffgemma-mps"
+name = "diffgemma"
 version = "0.1.0"
 edition = "2024"
+description = "Apple-Silicon Metal inference engine for diffusion-style LLM models"
+license = "MIT"
 
 [[bin]]
-name = "diffgemma-mps"
+name = "diffgemma"
 path = "src/main.rs"
 
 # This is an Apple-Silicon Metal inference engine. Metal is not an optional
