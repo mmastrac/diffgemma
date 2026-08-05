@@ -103,7 +103,16 @@ fn rfind_unmasked(text: &str, masks: &[(usize, usize)], needle: &str) -> Option<
 /// treat `content` as the preamble when `tool_calls` are present).
 pub fn content_before_tool_calls(text: &str) -> String {
     let masks = masked_ranges(text);
-    match find_unmasked(text, &masks, "<|tool_call>", 0) {
+    // The model may skip the `<|tool_call>` opener and go straight to the
+    // grammar — a bare `call:` starts the calls just the same.
+    let cut = [
+        find_unmasked(text, &masks, "<|tool_call>", 0),
+        find_unmasked(text, &masks, "call:", 0),
+    ]
+    .into_iter()
+    .flatten()
+    .min();
+    match cut {
         Some(i) => text[..i].trim().to_string(),
         None => text.trim().to_string(),
     }
