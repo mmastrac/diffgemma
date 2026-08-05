@@ -434,9 +434,11 @@ impl Render {
         }
     }
 
-    /// Print the authoritative reply once, into normal scrollback. For a
-    /// reasoning turn the settled `think>` block is printed above it.
-    fn finish(&mut self, reply: &str) {
+    /// Settle the turn into normal scrollback: the `think>` block (reasoning
+    /// turns) above the reply. `reply` is the answer text (empty renders as
+    /// `(empty response)`); `None` prints no `model>` line at all, for a tool-call
+    /// round that only reasoned before calling.
+    fn finish(&mut self, reply: Option<&str>) {
         let mut permanent = String::new();
         if self.show_thinking {
             let t = self.thought.trim();
@@ -444,10 +446,10 @@ impl Render {
                 permanent.push_str(&format!("{GREY}think> {t}{UNDIM}\n"));
             }
         }
-        if reply.is_empty() {
-            permanent.push_str("model> (empty response)\n");
-        } else {
-            permanent.push_str(&format!("model> {reply}\n"));
+        match reply {
+            Some(r) if !r.is_empty() => permanent.push_str(&format!("model> {r}\n")),
+            Some(_) => permanent.push_str("model> (empty response)\n"),
+            None => {}
         }
         match self.viewport.as_mut() {
             Some(vp) => vp.commit(&permanent),
@@ -504,7 +506,9 @@ pub fn render_demo(stage: &str) {
         r.paint();
         std::thread::sleep(Duration::from_millis(120));
     }
-    r.finish("The final settled answer, line one.\nAnd line two of the reply.");
+    r.finish(Some(
+        "The final settled answer, line one.\nAnd line two of the reply.",
+    ));
     std::thread::sleep(Duration::from_secs(30));
 }
 
@@ -614,8 +618,17 @@ impl ChatStream {
     }
 
     /// Reconcile the stream against the authoritative reply, terminate the
-    /// line, and close the JSON stream with a `Done` event.
-    pub fn finish(mut self, reply: &str, tokens: usize, steps: usize, secs: f64, stopped: bool) {
+    /// line, and close the JSON stream with a `Done` event. `reply` is the
+    /// answer text; `None` settles the interactive display with no `model>` line
+    /// (a tool-call round) and closes the `Done` with empty text.
+    pub fn finish(
+        mut self,
+        reply: Option<&str>,
+        tokens: usize,
+        steps: usize,
+        secs: f64,
+        stopped: bool,
+    ) {
         self.done.store(true, Ordering::Relaxed);
         if let Some(t) = self.ticker.take() {
             let _ = t.join();
@@ -629,7 +642,7 @@ impl ChatStream {
             steps,
             secs,
             stopped,
-            text: reply.to_string(),
+            text: reply.unwrap_or("").to_string(),
         });
     }
 }

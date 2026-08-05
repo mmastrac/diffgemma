@@ -24,7 +24,7 @@ const CHANNEL_CLOSE: &str = "<channel|>";
 /// inside the thought (the marker was in the prompt) and is returned unchanged.
 /// While the role line is still forming (`<|channel>thou`), yields "" until the
 /// newline arrives rather than flashing the partial marker.
-fn strip_thought_open(s: &str) -> &str {
+pub(crate) fn strip_thought_open(s: &str) -> &str {
     let Some(rest) = s.strip_prefix(CHANNEL_OPEN) else {
         return s; // no open marker: a prethink continuation
     };

@@ -870,7 +870,7 @@ impl TurnRunner<'_> {
         let new_tokens = out.token_ids.len().saturating_sub(prompt_len);
         let secs = elapsed.as_secs_f64();
         stream.finish(
-            &reply,
+            Some(&reply),
             new_tokens,
             out.denoise_steps_run,
             secs,
@@ -955,12 +955,11 @@ impl TurnRunner<'_> {
             } else {
                 None
             };
-            let mut guarded = crate::tools::render_conversation_guarded(
-                &messages,
-                self.tools_json,
-                true,
-                think_seed.is_some(),
-            );
+            // `--show-thinking` (or a `/prethink` seed) opens the thought channel
+            // so the model reasons before it answers; otherwise it answers direct.
+            let thinking = self.show_thinking || think_seed.is_some();
+            let mut guarded =
+                crate::tools::render_conversation_guarded(&messages, self.tools_json, true, thinking);
             if let Some(s) = think_seed {
                 guarded.push_str("<|channel>thought\n");
                 guarded.push_str(s);
@@ -978,17 +977,17 @@ impl TurnRunner<'_> {
             self.step_cfg.seed = self.seed.wrapping_add(turn_idx).wrapping_add(round as u64);
 
             // A stream drives the JSON sink (its observer streams events, `finish`
-            // closes with `Done`) and, when seeded on an interactive tty, the
-            // dimmed thinking preview. Without either, generate quietly; the
-            // `println!`s below own the human display.
-            let live = self.interactive && think_seed.is_some();
+            // closes with `Done`) and, on an interactive tty while reasoning, the
+            // live `think>` preview and settled display. Otherwise the `println!`s
+            // below (when `human`) own the display.
+            let live = self.interactive && thinking;
             let stream = (live || self.want_json).then(|| {
                 chat_ui::ChatStream::start(
                     std::sync::Arc::clone(self.tokenizer),
                     self.step_cfg.stop_token_ids.clone(),
                     live,
                     chat_ui::StreamDisplay {
-                        show_thinking: false,
+                        show_thinking: self.show_thinking,
                         prethink_seed: think_seed.map(str::to_string),
                         stream_output: self.stream_output,
                     },
@@ -1001,36 +1000,49 @@ impl TurnRunner<'_> {
             let out = pipeline_generate(self.pipeline, self.step_cfg, prompt)?;
             self.step_cfg.step_observer = None;
             let new_tokens = out.token_ids.len().saturating_sub(prompt_len);
-            // The interactive preview reprints via the `println!`s below, so its
-            // `Done` carries no text; a JSON-only stream carries the real reply.
-            let close = |stream: Option<chat_ui::ChatStream>, body: &str| {
+            let finish = |stream: Option<chat_ui::ChatStream>, reply: Option<&str>| {
                 if let Some(s) = stream {
-                    let text = if live { "" } else { body };
-                    s.finish(text, new_tokens, out.denoise_steps_run, 0.0, out.stopped_on_eot);
+                    s.finish(reply, new_tokens, out.denoise_steps_run, 0.0, out.stopped_on_eot);
                 }
             };
+            // The human display is `println!`s unless the interactive stream drew
+            // it (`live`); a JSON turn suppresses it entirely.
+            let human = !self.json && !live;
 
             let new_ids =
                 sample::strip_degenerate_token_ids(out.token_ids.get(prompt_len..).unwrap_or(&[]));
             let raw = self.tokenizer.decode(&new_ids);
-            // With a seeded thought the generation opens inside it: split at the
-            // model's `<channel|>`. Before is the completed thought (reprinted
-            // dimmed), after is the answer / tool calls.
-            let content = if let Some(s) = think_seed {
-                let (thought, rest) = split_thought(s, &raw);
-                if !self.json {
-                    println!("\x1b[90mthink> {}\x1b[0m", thought.trim());
-                }
-                rest
+            // With the thought channel open the generation begins inside it: split
+            // at the model's `<channel|>` into the reasoning and the answer / tool
+            // calls. An unclosed thought means the model answered inside its
+            // reasoning; salvage the answer from the tail.
+            let (thought, content) = if thinking {
+                let seed = think_seed.unwrap_or("");
+                let (t, rest) = if raw.contains("<channel|>") {
+                    split_thought(seed, &raw)
+                } else {
+                    (format!("{seed}{raw}"), salvage_answer(&raw))
+                };
+                // An unseeded turn emits its own `<|channel>thought` open marker;
+                // drop it (a seeded continuation has none, so this is a no-op).
+                (
+                    Some(crate::chat_protocol::strip_thought_open(&t).to_string()),
+                    rest,
+                )
             } else {
-                raw.clone()
+                (None, raw.clone())
             };
+            if human
+                && let Some(t) = thought.as_deref().map(str::trim).filter(|t| !t.is_empty())
+            {
+                println!("\x1b[90mthink> {t}\x1b[0m");
+            }
 
             let calls = crate::tools::parse_tool_calls(&content);
             if calls.is_empty() {
                 let answer = chat_template::sanitize_model_reply(&content);
-                close(stream, &answer);
-                if !self.json {
+                finish(stream, Some(&answer));
+                if human {
                     if answer.is_empty() {
                         println!("model> (empty response)");
                     } else {
@@ -1044,9 +1056,10 @@ impl TurnRunner<'_> {
             let preamble = chat_template::sanitize_model_reply(
                 &crate::tools::content_before_tool_calls(&content),
             );
-            close(stream, &preamble);
-            if !self.json && !preamble.trim().is_empty() {
-                println!("model> {}", preamble.trim());
+            let preamble_line = (!preamble.trim().is_empty()).then(|| preamble.trim());
+            finish(stream, preamble_line);
+            if human && let Some(p) = preamble_line {
+                println!("model> {p}");
             }
             let oai = crate::tools::to_openai_tool_calls(&calls);
             messages.push(serde_json::json!({
