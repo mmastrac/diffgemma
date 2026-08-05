@@ -1,6 +1,14 @@
-//! Interactive `chat` subcommand.
+//! Interactive `chat` subcommand: the REPL. Input parsing, slash commands,
+//! the ghost suggester, and conversation state live here; producing a turn —
+//! generation, tool loop, forced replies, and every protocol event — is
+//! `crate::chat::engine`.
 
 use super::*;
+
+#[cfg(target_os = "macos")]
+use crate::chat::engine::{
+    Execution, ShellTool, Thinking, Turn, TurnRunner, parse_tool_spec, run_turn, tool_declaration,
+};
 
 /// One-line-per-command summary printed by `/help`.
 #[cfg(target_os = "macos")]
@@ -243,14 +251,14 @@ struct Suggester {
     cell: Option<SuggestionCell>,
     /// Interactive reveal: prints the draft above the prompt when it lands.
     printer: Option<ExternalPrinterHandle>,
-    /// JSON driver sink: emits a `Suggestion` event when the draft lands.
-    json_sink: Option<Box<dyn std::io::Write + Send>>,
+    /// Session sinks: a landed draft emits a `Suggestion` event (JSON drivers
+    /// see it; the plain display ignores it).
+    sinks: crate::chat::SharedSinks,
 }
 
 #[cfg(target_os = "macos")]
 impl Suggester {
     fn spawn(self, history: Vec<chat_template::ChatTurn>, turn: u64) -> SuggestTask {
-        use std::io::Write as _;
         let cancel = metal::CancelToken::new();
         let cancel_bg = cancel.clone();
         let handle = std::thread::spawn(move || {
@@ -283,13 +291,10 @@ impl Suggester {
             {
                 let _ = p.print(format!("\x1b[90m⇥ {text}\x1b[0m"));
             }
-            if let Some(mut w) = self.json_sink {
-                let ev = crate::chat_protocol::ChatEvent::Suggestion { turn, text };
-                if serde_json::to_writer(&mut w, &ev).is_ok() {
-                    let _ = w.write_all(b"\n");
-                    let _ = w.flush();
-                }
-            }
+            crate::chat::emit(
+                &self.sinks,
+                &crate::chat::ChatEvent::Suggestion { turn, text },
+            );
         });
         SuggestTask { cancel, handle }
     }
@@ -402,887 +407,6 @@ fn toggle_flag(arg: &str, current: bool) -> Option<bool> {
 /// History with the `/prompt` system prompt (if any) prepended as a leading
 /// System turn, the shape both prompt builders expect for a system message.
 #[cfg(target_os = "macos")]
-fn prepend_system(
-    system: Option<&str>,
-    history: &[chat_template::ChatTurn],
-) -> Vec<chat_template::ChatTurn> {
-    let mut turns = Vec::with_capacity(history.len() + 1);
-    if let Some(s) = system.filter(|s| !s.trim().is_empty()) {
-        turns.push(chat_template::ChatTurn::system(s));
-    }
-    turns.extend_from_slice(history);
-    turns
-}
-
-/// Prefill the session KV to match the full conversation (no generation) via
-/// `AlignTo`, used by `/response` to inject a forced reply as if the model had
-/// produced it. Builds the target with no generation prompt so the next turn
-/// reuses this prefix. Mirrors the render the next turn will use (tool-aware
-/// when tools are active) so the KV prefix is reused rather than re-prefilled.
-#[cfg(target_os = "macos")]
-fn prefill_conversation(
-    pipeline: &std::sync::Mutex<crate::pipeline::Pipeline>,
-    tokenizer: &tokenizer::Tokenizer,
-    history: &[chat_template::ChatTurn],
-    system: Option<&str>,
-    tools_json: &[serde_json::Value],
-) -> Result<(), crate::Error> {
-    let turns = prepend_system(system, history);
-    let target = if tools_json.is_empty() {
-        chat_template::format_chat_token_ids(
-            tokenizer,
-            &turns,
-            &chat_template::ChatFormatOptions {
-                add_generation_prompt: false,
-                enable_thinking: true,
-            },
-        )?
-    } else {
-        let messages = chat_turns_to_messages(&turns);
-        let guarded =
-            crate::tools::render_conversation_guarded(&messages, tools_json, false, false);
-        tokenizer.encode_prompt(&guarded).0
-    };
-    match pipeline
-        .lock()
-        .unwrap()
-        .call(crate::pipeline::PipelineOp::AlignTo { target })
-    {
-        crate::pipeline::PipelineEvent::Aligned { .. } => Ok(()),
-        crate::pipeline::PipelineEvent::Error(err) => Err(crate::Error::Pipeline(err)),
-        ev => Err(crate::Error::Pipeline(format!("unexpected event {ev:?}"))),
-    }
-}
-
-/// A `--tool NAME[:DESC]=COMMAND` definition: the model calls `NAME` with one
-/// free-form string argument `input`, which is passed to `COMMAND` (run under
-/// `sh -c`) as the `$input` environment variable; the script's stdout is fed
-/// back as the tool result.
-#[cfg(target_os = "macos")]
-struct ShellTool {
-    name: String,
-    description: String,
-    command: String,
-}
-
-/// Parse a `--tool` spec `NAME[:DESC]=COMMAND` (NAME and COMMAND required).
-#[cfg(target_os = "macos")]
-fn parse_tool_spec(spec: &str) -> Result<ShellTool, String> {
-    let (meta, command) = spec
-        .split_once('=')
-        .ok_or_else(|| format!("--tool '{spec}': expected NAME[:DESC]=COMMAND"))?;
-    let command = command.trim();
-    if command.is_empty() {
-        return Err(format!("--tool '{spec}': empty command"));
-    }
-    let (name, desc) = meta.split_once(':').unwrap_or((meta, ""));
-    let (name, desc) = (name.trim(), desc.trim());
-    if name.is_empty() {
-        return Err(format!("--tool '{spec}': empty name"));
-    }
-    let description = if desc.is_empty() {
-        format!("The {name} tool. Takes one string argument `input`.")
-    } else {
-        desc.to_string()
-    };
-    Ok(ShellTool {
-        name: name.to_string(),
-        description,
-        command: command.to_string(),
-    })
-}
-
-/// OpenAI-shape declaration for the tool renderer: one required string arg.
-#[cfg(target_os = "macos")]
-fn tool_declaration(t: &ShellTool) -> serde_json::Value {
-    serde_json::json!({
-        "type": "function",
-        "function": {
-            "name": t.name,
-            "description": t.description,
-            "parameters": {
-                "type": "object",
-                "properties": { "input": {
-                    "type": "string",
-                    "description": "The input passed to the tool.",
-                }},
-                "required": ["input"],
-            },
-        },
-    })
-}
-
-/// Run a tool's shell command, exposing each call argument as an env var (so
-/// model-supplied values are never re-parsed as shell syntax). Returns stdout,
-/// or a bracketed diagnostic on non-zero exit / spawn failure. Output is capped
-/// so a runaway script can't blow the context window.
-#[cfg(target_os = "macos")]
-fn run_shell_tool(t: &ShellTool, arguments: &serde_json::Value) -> String {
-    const MAX_OUTPUT: usize = 4096;
-    let mut cmd = std::process::Command::new("sh");
-    cmd.arg("-c").arg(&t.command);
-    if let Some(obj) = arguments.as_object() {
-        for (k, v) in obj {
-            let val = match v {
-                serde_json::Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            cmd.env(k, val);
-        }
-    }
-    match cmd.output() {
-        Ok(o) => {
-            let mut s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if !o.status.success() {
-                let code = o.status.code().map_or("?".to_string(), |c| c.to_string());
-                let err = String::from_utf8_lossy(&o.stderr);
-                s = format!("[exit {code}] {}{}", s, err.trim());
-            }
-            if s.len() > MAX_OUTPUT {
-                s.truncate(MAX_OUTPUT);
-                s.push_str("... [truncated]");
-            }
-            s
-        }
-        Err(e) => format!("[tool failed to run: {e}]"),
-    }
-}
-
-/// `ChatTurn` history as OpenAI-shape JSON messages for the tool renderer.
-#[cfg(target_os = "macos")]
-fn chat_turns_to_messages(turns: &[chat_template::ChatTurn]) -> Vec<serde_json::Value> {
-    turns
-        .iter()
-        .map(|t| {
-            let role = match t.role {
-                chat_template::ChatRole::System => "system",
-                chat_template::ChatRole::User => "user",
-                chat_template::ChatRole::Model => "assistant",
-            };
-            serde_json::json!({ "role": role, "content": t.content })
-        })
-        .collect()
-}
-
-/// First line of `s`, clipped to `n` chars with an ellipsis marker, for a
-/// one-line preview of a tool argument or result.
-#[cfg(target_os = "macos")]
-fn preview(s: &str, n: usize) -> String {
-    let line = s.lines().next().unwrap_or("");
-    if line.chars().count() > n {
-        format!("{}...", line.chars().take(n).collect::<String>())
-    } else {
-        line.to_string()
-    }
-}
-
-/// One `PipelineOp::Generate`, unwrapped to the output or a pipeline error.
-#[cfg(target_os = "macos")]
-fn pipeline_generate(
-    pipeline: &std::sync::Mutex<crate::pipeline::Pipeline>,
-    step_cfg: &metal::StepGenerateConfig,
-    prompt: Vec<u32>,
-) -> Result<crate::generate::GenerateOutput, crate::Error> {
-    match pipeline
-        .lock()
-        .unwrap()
-        .call(crate::pipeline::PipelineOp::Generate {
-            prompt,
-            cfg: Box::new(step_cfg.clone()),
-            label: "chat-tool".into(),
-        }) {
-        crate::pipeline::PipelineEvent::Generated { out, .. } => Ok(*out),
-        crate::pipeline::PipelineEvent::Error(err) => Err(crate::Error::Pipeline(err)),
-        ev => Err(crate::Error::Pipeline(format!("unexpected event {ev:?}"))),
-    }
-}
-
-/// Per-session machinery a turn borrows: the GPU pipeline, tokenizer, the
-/// mutable generation config, the tool set, and the flags that decide display.
-/// Each [`TurnStrategy`] arm runs against this shared context.
-#[cfg(target_os = "macos")]
-struct TurnRunner<'a> {
-    pipeline: &'a std::sync::Arc<std::sync::Mutex<crate::pipeline::Pipeline>>,
-    tokenizer: &'a std::sync::Arc<tokenizer::Tokenizer>,
-    step_cfg: &'a mut metal::StepGenerateConfig,
-    model_dir: &'a std::path::Path,
-    tools_json: &'a [serde_json::Value],
-    shell_tools: &'a [ShellTool],
-    events_file: &'a Option<std::fs::File>,
-    raw_prompt: bool,
-    interactive: bool,
-    json: bool,
-    want_json: bool,
-    max_seq: usize,
-    explicit_cap: Option<usize>,
-    seed: u64,
-    /// Live display toggles (`--show-thinking` / `--no-stream`, or the
-    /// `/show-thinking` / `/show-output` slash commands). Mutated between turns.
-    show_thinking: bool,
-    stream_output: bool,
-    /// Session variables set by a tool's `::set NAME=VALUE` output, referenced in
-    /// a `/prethink` seed as `$$NAME$$`. Persist across turns.
-    vars: std::collections::HashMap<String, String>,
-}
-
-/// How a turn's thinking channel is seeded when the prompt is assembled: the
-/// one lifecycle point `/prethink` modifies. `Off` is the default closed empty
-/// thought (no reasoning). `Seed` carries a template expanded against the turn
-/// (see [`expand_thinking`]); the model completes it, then answers. A modifier
-/// orthogonal to execution: it applies to `Generate` and `Tools`, not `Forced`.
-#[cfg(target_os = "macos")]
-#[derive(Clone, Copy)]
-enum Thinking<'a> {
-    Off,
-    /// Open seed: the model completes the reasoning, then answers (`/prethink`).
-    Seed(&'a str),
-    /// A closed, fully-formed thought: the model writes only the answer after
-    /// it, and the thought persists in the KV, unstripped (`/thought`).
-    Prefilled(&'a str),
-}
-
-/// What produces a turn's reply.
-#[cfg(target_os = "macos")]
-enum Execution<'a> {
-    /// One `Generate` (streamed).
-    Generate,
-    /// The tool-calling loop. `reseed_each_round` re-seeds the thought every
-    /// round (persistent prethink) rather than just round 0.
-    Tools { reseed_each_round: bool },
-    /// Force the reply with no generation (prefill only). `thought`, when set
-    /// (`/thought` alongside `/response`), is written as a persistent thought
-    /// before the reply.
-    Forced {
-        thought: Option<&'a str>,
-        reply: &'a str,
-    },
-}
-
-/// A resolved chat turn: an executor plus the thinking-channel modifier. The
-/// dispatch lives in one place; a new behavior is a new `Execution` arm or a new
-/// modifier, not a branch smeared through the loop.
-#[cfg(target_os = "macos")]
-struct Turn<'a> {
-    execution: Execution<'a>,
-    thinking: Thinking<'a>,
-}
-
-/// Expand a `/prethink` seed template against the turn: `$$last$$` -> the user's
-/// most recent message, `$$prompt$$` -> the system prompt, `$$NAME$$` -> a
-/// tool-set session variable (all empty if absent). Runs when the thinking
-/// channel is assembled, so the seed is computed from live turn state rather than
-/// fixed at command time.
-#[cfg(target_os = "macos")]
-fn expand_thinking(
-    template: &str,
-    history: &[chat_template::ChatTurn],
-    system: Option<&str>,
-    vars: &std::collections::HashMap<String, String>,
-) -> String {
-    let last = history
-        .iter()
-        .rev()
-        .find(|t| t.role == chat_template::ChatRole::User)
-        .map(|t| t.content.as_str())
-        .unwrap_or("");
-    let mut out = template
-        .replace("$$last$$", last)
-        .replace("$$prompt$$", system.unwrap_or(""));
-    for (name, value) in vars {
-        out = out.replace(&format!("$${name}$$"), value);
-    }
-    out
-}
-
-/// How many valid tool calls to run before the first corruption: the valid
-/// attempts preceding the first invalid one (`first_bad`), or all valid attempts
-/// when the sequence is clean. Runs the good prefix rather than aborting every
-/// call, which makes the model re-plan from scratch.
-#[cfg(target_os = "macos")]
-fn valid_prefix_len(attempts: &[(String, bool)], first_bad: Option<usize>) -> usize {
-    let upto = first_bad.unwrap_or(attempts.len());
-    attempts[..upto].iter().filter(|(_, valid)| *valid).count()
-}
-
-/// A control directive a tool emits through its output, out of band from the
-/// text the model sees. One per trimmed line: `::end [reply]` ends the turn (with
-/// an optional final reply), `::set NAME=VALUE` sets a session variable.
-#[cfg(target_os = "macos")]
-enum ToolDirective {
-    End(String),
-    Set(String, String),
-}
-
-/// Split a tool's output into the model-facing text (directive lines removed) and
-/// the directives it carried.
-#[cfg(target_os = "macos")]
-fn parse_tool_directives(output: &str) -> (String, Vec<ToolDirective>) {
-    let mut content: Vec<&str> = Vec::new();
-    let mut directives = Vec::new();
-    for line in output.lines() {
-        let t = line.trim();
-        if t == "::end" {
-            directives.push(ToolDirective::End(String::new()));
-        } else if let Some(reply) = t.strip_prefix("::end ") {
-            directives.push(ToolDirective::End(reply.trim().to_string()));
-        } else if let Some(rest) = t.strip_prefix("::set ")
-            && let Some((name, value)) = rest.split_once('=')
-        {
-            directives.push(ToolDirective::Set(
-                name.trim().to_string(),
-                value.trim().to_string(),
-            ));
-        } else {
-            content.push(line);
-        }
-    }
-    (content.join("\n"), directives)
-}
-
-/// Split a seeded-thought generation at the model's `<channel|>`: returns the
-/// completed thought (`seed` + what the model wrote before the close) and the
-/// answer text after it. No close -> all thought, empty answer.
-#[cfg(target_os = "macos")]
-fn split_thought(seed: &str, raw: &str) -> (String, String) {
-    let (completion, answer) = raw.split_once("<channel|>").unwrap_or((raw, ""));
-    (format!("{seed}{completion}"), answer.to_string())
-}
-
-/// Recover an answer when a prethink thought never closed: the model sometimes
-/// states its answer inside the reasoning (a thought degeneracy) and stops
-/// without emitting `<channel|>`. Take the last blank-line-separated block (the
-/// model usually sets the answer off after a blank line), or the whole
-/// completion when there is no separator.
-#[cfg(target_os = "macos")]
-fn salvage_answer(completion: &str) -> String {
-    let t = completion.trim();
-    t.rsplit("\n\n").next().unwrap_or(t).trim().to_string()
-}
-
-/// Split a tool-turn generation into `(reasoning, rest)`. A closed thought
-/// channel (`<channel|>`) separates the reasoning (shown as `think>`) from the
-/// answer / tool calls; `seed` (a `/prethink` continuation) prefixes it and the
-/// model's own open marker is dropped. Without a close the model went straight
-/// to output -- often tool calls -- so there is no separate reasoning and `rest`
-/// is the whole text, keeping the calls parseable.
-#[cfg(target_os = "macos")]
-fn split_reasoning(raw: &str, thinking: bool, seed: &str) -> (Option<String>, String) {
-    if thinking
-        && let Some((t, rest)) = raw.split_once("<channel|>")
-    {
-        let thought = crate::chat_protocol::strip_thought_open(&format!("{seed}{t}"))
-            .trim()
-            .to_string();
-        (Some(thought), rest.to_string())
-    } else {
-        (None, raw.to_string())
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl Turn<'_> {
-    /// Produce this turn's `(reply, persisted_thought)`. `history` holds the
-    /// just-submitted user turn but not the reply; each arm handles its own
-    /// display. The caller stores the reply (with the thought, if any, as an
-    /// unstripped thought channel) and advances `turn_idx`.
-    fn produce(
-        &self,
-        run: &mut TurnRunner,
-        history: &[chat_template::ChatTurn],
-        system: Option<&str>,
-        turn_idx: u64,
-    ) -> Result<(String, Option<String>), crate::Error> {
-        match self.execution {
-            Execution::Generate => run.generate_turn(history, system, self.thinking, turn_idx),
-            Execution::Tools { reseed_each_round } => run
-                .tool_turn(history, system, self.thinking, reseed_each_round, turn_idx)
-                .map(|reply| (reply, None)),
-            Execution::Forced { thought, reply } => {
-                run.forced_turn(history, system, thought, reply)
-            }
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl TurnRunner<'_> {
-    /// Per-turn JSON sink: stdout for `--json`, a cloned events-file handle
-    /// otherwise, `None` when neither is wanted.
-    fn sink(&self) -> Option<Box<dyn std::io::Write + Send>> {
-        if !self.want_json {
-            return None;
-        }
-        if self.json {
-            Some(Box::new(std::io::stdout()))
-        } else {
-            self.events_file
-                .as_ref()
-                .and_then(|f| f.try_clone().ok())
-                .map(|f| Box::new(f) as Box<dyn std::io::Write + Send>)
-        }
-    }
-
-    /// Normal / prethink turn: one `Generate` with the live streaming UI (the
-    /// plain answer, or the dimmed thinking when seeded), then the answer split
-    /// from the thought.
-    fn generate_turn(
-        &mut self,
-        history: &[chat_template::ChatTurn],
-        system: Option<&str>,
-        thinking: Thinking,
-        turn_idx: u64,
-    ) -> Result<(String, Option<String>), crate::Error> {
-        // Resolve the thinking seed now (`$$last$$`/`$$prompt$$` expand against
-        // this turn). `close` = a fully-formed `/thought` (closed channel, model
-        // answers after it, thought persisted); open = `/prethink`. Raw-prompt
-        // sessions have no thought scaffold, so seeding is inert there.
-        let (seed, close) = match thinking {
-            Thinking::Seed(t) if !self.raw_prompt => {
-                (Some(expand_thinking(t, history, system, &self.vars)), false)
-            }
-            Thinking::Prefilled(t) if !self.raw_prompt => {
-                (Some(expand_thinking(t, history, system, &self.vars)), true)
-            }
-            _ => (None, false),
-        };
-        let turns = prepend_system(system, history);
-        let prompt = match &seed {
-            Some(seed) => build_chat_prompt_tokens_prethink(self.model_dir, &turns, seed, close)?,
-            None => build_chat_prompt_tokens(self.model_dir, &turns, self.raw_prompt, true)?,
-        };
-        let prompt_len = prompt.len();
-        // KV arena is fixed at session open; reserve one CANVAS block so the
-        // `set_kv_len` overflow assert stays unreachable near a full context.
-        let budget = self.max_seq.saturating_sub(prompt_len + metal::CANVAS);
-        if budget == 0 {
-            if !self.json {
-                println!(
-                    "model> (this turn's prompt is {prompt_len} tokens, which leaves no room \
-                     for a reply within the {}-token context; cannot generate)\n\
-                     \x20 to fix: restart chat with a larger window, e.g. `--ctx {}`; or send a \
-                     shorter message, `/load` smaller files, or `/exit` and start a fresh session \
-                     to drop the accumulated history.",
-                    self.max_seq,
-                    (prompt_len + metal::CANVAS)
-                        .next_power_of_two()
-                        .max(self.max_seq * 2)
-                );
-            }
-            return Ok((String::new(), None));
-        }
-        self.step_cfg.max_new_tokens = self.explicit_cap.map_or(budget, |c| c.min(budget));
-        self.step_cfg.seed = self.seed.wrapping_add(turn_idx);
-
-        // A closed `/thought` streams only the answer (the thought is settled in
-        // the prompt), so show the known thought up front; an open `/prethink`
-        // streams as dimmed thinking and is split from the answer afterward.
-        if close
-            && !self.json
-            && let Some(s) = &seed
-        {
-            println!("\x1b[90mthink> {}\x1b[0m", s.trim());
-        }
-        let started = std::time::Instant::now();
-        // `/prethink` (open seed) streams the reasoning implicitly; a plain turn
-        // does so only under `--show-thinking`. A closed `/thought` never enables
-        // thinking display: its generation is answer-only with no `<channel|>` to
-        // split on, and the thought is already printed above.
-        let open_seed = seed
-            .as_ref()
-            .filter(|_| !close)
-            .map(|s| s.trim().to_string());
-        let stream = chat_ui::ChatStream::start(
-            std::sync::Arc::clone(self.tokenizer),
-            self.step_cfg.stop_token_ids.clone(),
-            self.interactive,
-            chat_ui::StreamDisplay {
-                show_thinking: self.show_thinking && !close,
-                prethink_seed: open_seed,
-                stream_output: self.stream_output,
-            },
-            self.sink(),
-            turn_idx,
-            prompt_len,
-        );
-        self.step_cfg.step_observer = Some(stream.observer());
-        let out = match self
-            .pipeline
-            .lock()
-            .unwrap()
-            .call(crate::pipeline::PipelineOp::Generate {
-                prompt: prompt.clone(),
-                cfg: Box::new(self.step_cfg.clone()),
-                label: "chat".into(),
-            }) {
-            crate::pipeline::PipelineEvent::Generated { out, .. } => *out,
-            crate::pipeline::PipelineEvent::Error(err) => return Err(crate::Error::Pipeline(err)),
-            ev => return Err(crate::Error::Pipeline(format!("unexpected event {ev:?}"))),
-        };
-        self.step_cfg.step_observer = None;
-        let elapsed = started.elapsed();
-
-        let new_ids =
-            sample::strip_degenerate_token_ids(out.token_ids.get(prompt_len..).unwrap_or(&[]));
-        let raw = self.tokenizer.decode(&new_ids);
-        // Open seed: the generation begins inside the thought, so split `raw` at
-        // the model's `<channel|>` (before = thought, after = answer). Closed
-        // `/thought` and plain turns: `raw` is the answer.
-        let (reply, split_thought_display) = match &seed {
-            Some(seed) if !close => {
-                let (thought, answer) = split_thought(seed.trim(), &raw);
-                // If the model never closed the thought, salvage the answer from
-                // its tail rather than reporting none (see `salvage_answer`).
-                let answer = if raw.contains("<channel|>") {
-                    answer
-                } else {
-                    salvage_answer(&raw)
-                };
-                (chat_template::sanitize_model_reply(&answer), Some(thought))
-            }
-            _ => (chat_template::sanitize_model_reply(&raw), None),
-        };
-        let new_tokens = out.token_ids.len().saturating_sub(prompt_len);
-        let secs = elapsed.as_secs_f64();
-        stream.finish(
-            Some(&reply),
-            new_tokens,
-            out.denoise_steps_run,
-            secs,
-            out.stopped_on_eot,
-        );
-
-        // The interactive renderer (`stream.finish`) owns the on-screen thought
-        // and answer. Only the non-interactive path (piped / `--verbose`) prints
-        // here, since the terminal renderer was disabled.
-        if !self.interactive && !self.json {
-            if let Some(thought) = &split_thought_display {
-                println!("\x1b[90mthink> {}\x1b[0m", thought.trim());
-            }
-            if reply.is_empty() {
-                if split_thought_display.is_some() {
-                    println!("model> (no answer; the model never closed the thought)");
-                } else {
-                    println!("model> (empty response)");
-                }
-            } else {
-                println!("model> {reply}");
-            }
-        }
-        if !self.json {
-            let cap_note = if out.stopped_on_eot {
-                ""
-            } else {
-                " · hit context limit"
-            };
-            println!(
-                "  ({new_tokens} tok · {} steps · {secs:.1}s · {:.1} tok/s{cap_note})",
-                out.denoise_steps_run,
-                new_tokens as f64 / secs.max(1e-9),
-            );
-        }
-        // A closed `/thought` persists its (expanded) thought with the reply.
-        let persisted = if close { seed } else { None };
-        Ok((reply, persisted))
-    }
-
-    /// Tool turn: run the render/generate/run-script loop, then the timing line.
-    fn tool_turn(
-        &mut self,
-        history: &[chat_template::ChatTurn],
-        system: Option<&str>,
-        thinking: Thinking,
-        reseed: bool,
-        turn_idx: u64,
-    ) -> Result<String, crate::Error> {
-        let turns = prepend_system(system, history);
-        let messages = chat_turns_to_messages(&turns);
-        // Expand the thinking seed once for the turn (`$$last$$`/`$$prompt$$`).
-        // The tool path seeds an open thought only; `/thought` (Prefilled) routes
-        // to the plain generate path, never here.
-        let seed = match thinking {
-            Thinking::Seed(t) => Some(expand_thinking(t, history, system, &self.vars)),
-            Thinking::Off | Thinking::Prefilled(_) => None,
-        };
-        let started = std::time::Instant::now();
-        let answer = self.tool_loop(messages, seed.as_deref(), reseed, turn_idx)?;
-        if !self.json {
-            println!("  ({:.1}s)", started.elapsed().as_secs_f64());
-        }
-        Ok(answer)
-    }
-
-    /// The tool-calling loop: render with tool declarations, generate, run each
-    /// backing script, feed the results back for another round. Tool
-    /// calls/results live only inside this turn; only the final answer persists.
-    /// `seed` (already expanded) seeds round 0, every round if `reseed`.
-    fn tool_loop(
-        &mut self,
-        mut messages: Vec<serde_json::Value>,
-        seed: Option<&str>,
-        reseed: bool,
-        turn_idx: u64,
-    ) -> Result<String, crate::Error> {
-        const MAX_ROUNDS: usize = 8;
-        for round in 0..MAX_ROUNDS {
-            let think_seed = if round == 0 || reseed {
-                seed.map(str::trim)
-            } else {
-                None
-            };
-            // `--show-thinking` (or a `/prethink` seed) opens the thought channel
-            // so the model reasons before it answers; otherwise it answers direct.
-            let thinking = self.show_thinking || think_seed.is_some();
-            let mut guarded =
-                crate::tools::render_conversation_guarded(&messages, self.tools_json, true, thinking);
-            if let Some(s) = think_seed {
-                guarded.push_str("<|channel>thought\n");
-                guarded.push_str(s);
-            }
-            let prompt = self.tokenizer.encode_prompt(&guarded).0;
-            let prompt_len = prompt.len();
-            let budget = self.max_seq.saturating_sub(prompt_len + metal::CANVAS);
-            if budget == 0 {
-                if !self.json {
-                    println!("model> (context full; cannot continue the tool conversation)");
-                }
-                return Ok(String::new());
-            }
-            self.step_cfg.max_new_tokens = self.explicit_cap.map_or(budget, |c| c.min(budget));
-            self.step_cfg.seed = self.seed.wrapping_add(turn_idx).wrapping_add(round as u64);
-
-            // A stream drives the JSON sink (its observer streams events, `finish`
-            // closes with `Done`) and, on an interactive tty while reasoning, the
-            // live `think>` preview and settled display. Otherwise the `println!`s
-            // below (when `human`) own the display.
-            let live = self.interactive && thinking;
-            let stream = (live || self.want_json).then(|| {
-                chat_ui::ChatStream::start(
-                    std::sync::Arc::clone(self.tokenizer),
-                    self.step_cfg.stop_token_ids.clone(),
-                    live,
-                    chat_ui::StreamDisplay {
-                        show_thinking: self.show_thinking,
-                        prethink_seed: think_seed.map(str::to_string),
-                        stream_output: self.stream_output,
-                    },
-                    self.sink(),
-                    turn_idx,
-                    prompt_len,
-                )
-            });
-            self.step_cfg.step_observer = stream.as_ref().map(chat_ui::ChatStream::observer);
-            let out = pipeline_generate(self.pipeline, self.step_cfg, prompt)?;
-            self.step_cfg.step_observer = None;
-            let new_tokens = out.token_ids.len().saturating_sub(prompt_len);
-            let finish = |stream: Option<chat_ui::ChatStream>, reply: Option<&str>| {
-                if let Some(s) = stream {
-                    s.finish(reply, new_tokens, out.denoise_steps_run, 0.0, out.stopped_on_eot);
-                }
-            };
-            // The human display is `println!`s unless the interactive stream drew
-            // it (`live`); a JSON turn suppresses it entirely.
-            let human = !self.json && !live;
-
-            let new_ids =
-                sample::strip_degenerate_token_ids(out.token_ids.get(prompt_len..).unwrap_or(&[]));
-            let raw = self.tokenizer.decode(&new_ids);
-            let (thought, content) = split_reasoning(&raw, thinking, think_seed.unwrap_or(""));
-            if human
-                && let Some(t) = thought.as_deref().map(str::trim).filter(|t| !t.is_empty())
-            {
-                println!("\x1b[90mthink> {t}\x1b[0m");
-            }
-
-            // No `call:` attempt at all: this is the final answer.
-            let attempts = crate::tools::scan_call_attempts(&content);
-            if attempts.is_empty() {
-                let answer = chat_template::sanitize_model_reply(&content);
-                finish(stream, Some(&answer));
-                if human {
-                    if answer.is_empty() {
-                        println!("model> (empty response)");
-                    } else {
-                        println!("model> {answer}");
-                    }
-                }
-                return Ok(answer);
-            }
-            // Partial recovery: run the valid calls up to the first corrupted one,
-            // then (if anything is corrupt) feed an error for it and let the model
-            // reissue from there. Aborting every call makes it re-plan from scratch
-            // and misattribute the failure. `corrupt` also covers a dangling
-            // `<|tool_call>` opener that `scan_call_attempts` does not list.
-            let calls = crate::tools::parse_tool_calls(&content);
-            let first_bad = attempts.iter().position(|(_, valid)| !valid);
-            let corrupt = crate::tools::has_incomplete_tool_call(&content);
-            let run_count = valid_prefix_len(&attempts, first_bad);
-            let to_run = &calls[..run_count.min(calls.len())];
-
-            let preamble = chat_template::sanitize_model_reply(
-                &crate::tools::content_before_tool_calls(&content),
-            );
-            let preamble_line = (!preamble.trim().is_empty()).then(|| preamble.trim());
-            finish(stream, preamble_line);
-            if human && let Some(p) = preamble_line {
-                println!("model> {p}");
-            }
-            let oai = crate::tools::to_openai_tool_calls(to_run);
-            messages.push(serde_json::json!({
-                "role": "assistant", "content": "", "tool_calls": oai,
-            }));
-            let mut ended: Option<String> = None;
-            for (i, call) in to_run.iter().enumerate() {
-                let input = match call.arguments.get("input") {
-                    Some(serde_json::Value::String(s)) => s.clone(),
-                    Some(v) => v.to_string(),
-                    None => String::new(),
-                };
-                let raw_output = match self.shell_tools.iter().find(|t| t.name == call.name) {
-                    Some(t) => run_shell_tool(t, &call.arguments),
-                    None => format!("error: no tool named '{}'", call.name),
-                };
-                // A tool steers the session out of band via `::` directive lines;
-                // the rest is the result the model sees.
-                let (output, directives) = parse_tool_directives(&raw_output);
-                for d in directives {
-                    match d {
-                        ToolDirective::Set(name, value) => {
-                            if human {
-                                println!("  · set {name} = {}", preview(&value, 60));
-                            }
-                            self.vars.insert(name, value);
-                        }
-                        ToolDirective::End(reply) => ended = Some(reply),
-                    }
-                }
-                if !self.json {
-                    let head = format!("tool> {}({})", call.name, preview(&input, 48));
-                    match output.trim_end() {
-                        "" => println!("{head} -> (no output)"),
-                        body if body.contains('\n') => {
-                            // Multi-line output: header, then the body indented.
-                            println!("{head} ->");
-                            for line in body.lines() {
-                                println!("  {line}");
-                            }
-                        }
-                        body => println!("{head} -> {body}"),
-                    }
-                }
-                let mut msg =
-                    serde_json::json!({ "role": "tool", "name": call.name, "content": output });
-                if let Some(id) = oai.get(i).and_then(|c| c.get("id")).cloned() {
-                    msg["tool_call_id"] = id;
-                }
-                messages.push(msg);
-            }
-            // A tool ended the turn: use its reply as the final answer instead of
-            // generating another round.
-            if let Some(reply) = ended {
-                if human && !reply.is_empty() {
-                    println!("model> {reply}");
-                }
-                if let Some(mut w) = self.sink() {
-                    use std::io::Write as _;
-                    let ev = crate::chat_protocol::ChatEvent::Done {
-                        tokens: 0,
-                        steps: 0,
-                        secs: 0.0,
-                        stopped: true,
-                        text: reply.clone(),
-                    };
-                    if serde_json::to_writer(&mut w, &ev).is_ok() {
-                        let _ = w.write_all(b"\n");
-                        let _ = w.flush();
-                    }
-                }
-                return Ok(reply);
-            }
-            // A corrupted call: the prefix ran; error on the corruption and let
-            // the model reissue from there (bounded by MAX_ROUNDS).
-            if corrupt {
-                let name = first_bad
-                    .map(|k| attempts[k].0.clone())
-                    .filter(|n| !n.is_empty())
-                    .unwrap_or_else(|| "tool".to_string());
-                if human {
-                    println!("tool> {name}(malformed) -> discarded; asking the model to reissue");
-                }
-                messages.push(serde_json::json!({
-                    "role": "tool", "name": name,
-                    "content": "error: this tool call was malformed and was discarded; the calls \
-                        before it ran. Reissue this call and any that should follow it, corrected.",
-                }));
-                continue;
-            }
-        }
-        if !self.json {
-            println!("model> (stopped after {MAX_ROUNDS} tool rounds without a final answer)");
-        }
-        Ok(String::new())
-    }
-
-    /// Forced reply (`/response`, optionally with a `/thought`): no generation.
-    /// The given text (preceded by the thought, if any) becomes the model turn
-    /// and the KV is prefilled from the full conversation, as if the model had
-    /// produced it. Returns `(reply, persisted_thought)`.
-    fn forced_turn(
-        &self,
-        history: &[chat_template::ChatTurn],
-        system: Option<&str>,
-        thought: Option<&str>,
-        reply: &str,
-    ) -> Result<(String, Option<String>), crate::Error> {
-        let thought = thought.map(|t| expand_thinking(t, history, system, &self.vars));
-        if !self.json {
-            if let Some(t) = &thought {
-                println!("\x1b[90mthink> {}\x1b[0m", t.trim());
-            }
-            println!("model> {reply}");
-        }
-        // Prefill the KV to the conversation including this forced turn (thought
-        // rendered as a real channel). Raw-prompt sessions have no template to
-        // prefill against; history alone carries it (lazy prefill next turn).
-        if !self.raw_prompt {
-            let mut turns = history.to_vec();
-            turns.push(match &thought {
-                Some(t) => chat_template::ChatTurn::model_with_thought(t.clone(), reply),
-                None => chat_template::ChatTurn::model(reply),
-            });
-            if let Err(err) = prefill_conversation(
-                self.pipeline,
-                self.tokenizer,
-                &turns,
-                system,
-                self.tools_json,
-            ) {
-                eprintln!("error: prefill failed: {err}");
-            }
-        }
-        Ok((reply.to_string(), thought))
-    }
-}
-
-/// Run one chat turn: `turn` produces the reply, which is stored as the model
-/// turn; `turn_idx` advances. `history` already holds the user turn.
-#[cfg(target_os = "macos")]
-fn run_turn(
-    runner: &mut TurnRunner,
-    history: &mut Vec<chat_template::ChatTurn>,
-    turn_idx: &mut u64,
-    turn: &Turn,
-    system: Option<&str>,
-) -> Result<(), crate::Error> {
-    let (reply, thought) = turn.produce(runner, history, system, *turn_idx)?;
-    history.push(match thought {
-        Some(t) => chat_template::ChatTurn::model_with_thought(t, reply),
-        None => chat_template::ChatTurn::model(reply),
-    });
-    *turn_idx = turn_idx.wrapping_add(1);
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
 pub(crate) fn run_chat_cmd(
     model_dir: &std::path::Path,
     initial_prompt: Option<String>,
@@ -1306,7 +430,7 @@ pub(crate) fn run_chat_cmd(
     // `DGQ_RENDER_DEMO`: exercise the terminal renderer with synthetic events and
     // no model (terminal-choreography verification, e.g. under tmux).
     if let Ok(stage) = std::env::var("DGQ_RENDER_DEMO") {
-        chat_ui::render_demo(&stage);
+        crate::chat::render_demo(&stage);
         return ExitCode::SUCCESS;
     }
 
@@ -1331,32 +455,27 @@ pub(crate) fn run_chat_cmd(
     // spinner/streaming renderer runs on an interactive tty (not under
     // --verbose). `--events <path>` tees the JSONL to a file either way.
     let interactive = !json && !verbose && io::stdout().is_terminal();
-    let events_file = match &events_path {
-        Some(p) => match std::fs::File::create(p) {
-            Ok(f) => Some(f),
+    // The session's event sinks: every turn event flows through this set; the
+    // interactive renderer is the one extra view on the same stream.
+    let mut sink_set = crate::chat::SinkSet::new();
+    if json {
+        sink_set.push(Box::new(crate::chat::JsonlSink(io::stdout())));
+    }
+    if let Some(p) = &events_path {
+        match std::fs::File::create(p) {
+            Ok(f) => sink_set.push(Box::new(crate::chat::JsonlSink(f))),
             Err(err) => {
                 eprintln!("error: cannot open --events {}: {err}", p.display());
                 return ExitCode::FAILURE;
             }
-        },
-        None => None,
-    };
-    // Per-turn JSON sink factory: stdout for --json, a cloned handle to the
-    // events file otherwise. `None` when neither is requested.
-    let make_json_sink = |turn_active: bool| -> Option<Box<dyn Write + Send>> {
-        if !turn_active {
-            return None;
         }
-        if json {
-            Some(Box::new(io::stdout()))
-        } else {
-            events_file
-                .as_ref()
-                .and_then(|f| f.try_clone().ok())
-                .map(|f| Box::new(f) as Box<dyn Write + Send>)
-        }
-    };
-    let want_json = json || events_file.is_some();
+    }
+    if !interactive && !json {
+        // Renderless human display (piped stdin / --verbose): settled lines.
+        sink_set.push(Box::new(crate::chat::PlainSink));
+    }
+    let sinks = sink_set.into_shared();
+    let want_json = json || events_path.is_some();
 
     if !dgq::store::looks_like_dgq_dir(model_dir) {
         eprintln!("error: chat requires a .dgq directory (-m /path/to/quantized-weights)");
@@ -1482,14 +601,12 @@ pub(crate) fn run_chat_cmd(
         pipeline: &pipeline,
         tokenizer: &tokenizer,
         step_cfg: &mut step_cfg,
-        model_dir,
         tools_json: &tools_json,
         shell_tools: &shell_tools,
-        events_file: &events_file,
+        sinks: std::sync::Arc::clone(&sinks),
         raw_prompt,
         interactive,
         json,
-        want_json,
         max_seq: CHAT_MAX_SEQ,
         explicit_cap,
         seed,
@@ -1639,11 +756,7 @@ pub(crate) fn run_chat_cmd(
                     seed: seed.wrapping_add(turn_idx).wrapping_add(0x5_1793),
                     cell: have_editor.then(|| std::sync::Arc::clone(&suggestion_cell)),
                     printer: printer.clone(),
-                    json_sink: if want_json {
-                        make_json_sink(true)
-                    } else {
-                        None
-                    },
+                    sinks: std::sync::Arc::clone(&sinks),
                 };
                 task = Some(suggester.spawn(history.clone(), turn_idx));
             }
@@ -2022,13 +1135,7 @@ pub(crate) fn run_chat_cmd(
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
-    use super::{
-        JsonInput, ToolDirective, expand_file_markers, expand_thinking, json_command_to_line,
-        parse_tool_directives, parse_tool_spec, run_shell_tool, salvage_answer, split_reasoning,
-        split_thought, tab_fill_text, tool_declaration, valid_prefix_len,
-    };
-    use crate::tools::parse_tool_calls;
-    use crate::chat_template::ChatTurn;
+    use super::{JsonInput, expand_file_markers, json_command_to_line, tab_fill_text};
 
     /// The `/slash` line a JSON command translates to (or a marker for the
     /// non-command variants), so the mapping is asserted as plain strings.
@@ -2082,157 +1189,6 @@ mod tests {
         assert_eq!(json_line(r#"{"type":"exit"}"#), "<exit>");
         // Unknown type is rejected (caller ignores it).
         assert_eq!(json_line(r#"{"type":"frobnicate"}"#), "<none>");
-    }
-
-    #[test]
-    fn salvage_answer_takes_the_trailing_block() {
-        // The model reasoned, then stated the answer after a blank line.
-        assert_eq!(
-            salvage_answer("The project 'Bluebird' ships in March.\n\nMarch."),
-            "March."
-        );
-        // No separator: the whole completion is the recovered answer.
-        assert_eq!(
-            salvage_answer("just reasoning, ending in 56"),
-            "just reasoning, ending in 56"
-        );
-        // Empty / whitespace: nothing to salvage.
-        assert_eq!(salvage_answer("  \n\n  "), "");
-    }
-
-    #[test]
-    fn expand_thinking_substitutes_last_and_prompt() {
-        let history = [
-            ChatTurn::user("first question"),
-            ChatTurn::model("an answer"),
-            ChatTurn::user("what about New York?"),
-        ];
-        let mut vars = std::collections::HashMap::new();
-        vars.insert("mood".to_string(), "tense".to_string());
-        let out = expand_thinking(
-            "The user asked: $$last$$. Persona: $$prompt$$. Mood: $$mood$$.",
-            &history,
-            Some("be terse"),
-            &vars,
-        );
-        assert_eq!(
-            out,
-            "The user asked: what about New York?. Persona: be terse. Mood: tense."
-        );
-        // Missing system / no user turn -> empty substitutions, no panic.
-        let empty = std::collections::HashMap::new();
-        assert_eq!(expand_thinking("[$$prompt$$]", &history, None, &empty), "[]");
-        assert_eq!(expand_thinking("$$last$$", &[], None, &empty), "");
-        // A template with no placeholders passes through.
-        assert_eq!(
-            expand_thinking("plain seed", &history, None, &empty),
-            "plain seed"
-        );
-    }
-
-    #[test]
-    fn valid_prefix_runs_up_to_first_corruption() {
-        let ok = |n: &str| (n.to_string(), true);
-        let bad = |n: &str| (n.to_string(), false);
-        // Clean: run every valid call.
-        let clean = [ok("a"), ok("b"), ok("c")];
-        assert_eq!(valid_prefix_len(&clean, None), 3);
-        // Corruption at index 2: the two valid calls before it run.
-        let mixed = [ok("a"), ok("b"), bad("c"), ok("d")];
-        assert_eq!(valid_prefix_len(&mixed, Some(2)), 2);
-        // First call corrupt: nothing runs.
-        let lead = [bad("a"), ok("b")];
-        assert_eq!(valid_prefix_len(&lead, Some(0)), 0);
-    }
-
-    #[test]
-    fn parse_tool_directives_splits_control_from_content() {
-        // A pure directive: no model-facing content.
-        let (content, dirs) = parse_tool_directives("::end Ready.");
-        assert_eq!(content, "");
-        assert!(matches!(&dirs[..], [ToolDirective::End(r)] if r == "Ready."));
-        // Mixed: the scene text survives, the set is consumed.
-        let (content, dirs) = parse_tool_directives("A dim bistro.\n::set scene=A dim bistro.");
-        assert_eq!(content, "A dim bistro.");
-        assert!(matches!(&dirs[..], [ToolDirective::Set(n, v)] if n == "scene" && v == "A dim bistro."));
-        // Bare end, and a non-directive `::` line stays content.
-        let (content, dirs) = parse_tool_directives("::end\n::not a directive");
-        assert_eq!(content, "::not a directive");
-        assert!(matches!(&dirs[..], [ToolDirective::End(r)] if r.is_empty()));
-    }
-
-    #[test]
-    fn split_thought_splits_at_channel_close() {
-        // seed + completion before the close; answer after.
-        assert_eq!(
-            split_thought("Let me think.", " Step 1.<channel|>The answer is 42."),
-            (
-                "Let me think. Step 1.".to_string(),
-                "The answer is 42.".to_string()
-            )
-        );
-        // Never closed: all thought, empty answer.
-        assert_eq!(
-            split_thought("seed", " unfinished"),
-            ("seed unfinished".to_string(), String::new())
-        );
-    }
-
-    #[test]
-    fn split_reasoning_keeps_tool_calls_without_a_channel_close() {
-        let calls = "<|tool_call>call:a{input:<|\"|>x<|\"|>}<tool_call|>";
-        // A closed channel separates reasoning from the calls.
-        let (thought, content) =
-            split_reasoning(&format!("<|channel>thought\nreasoning<channel|>{calls}"), true, "");
-        assert_eq!(thought.as_deref(), Some("reasoning"));
-        assert_eq!(content, calls);
-        // No close (model went straight to calls): whole text is kept so the
-        // calls still parse -- the regression this guards against.
-        let (thought, content) = split_reasoning(calls, true, "");
-        assert_eq!(thought, None);
-        assert_eq!(content, calls);
-        assert_eq!(parse_tool_calls(&content).len(), 1);
-        // Thinking off: never split.
-        assert_eq!(split_reasoning(calls, false, ""), (None, calls.to_string()));
-    }
-
-    #[test]
-    fn tool_spec_parses_name_desc_and_command() {
-        let t = parse_tool_spec("weather:Get the weather=curl -s wttr.in/$input").unwrap();
-        assert_eq!(t.name, "weather");
-        assert_eq!(t.description, "Get the weather");
-        assert_eq!(t.command, "curl -s wttr.in/$input");
-        // No description: a generic one is synthesized.
-        let d = parse_tool_spec("echo=cat").unwrap();
-        assert_eq!(d.name, "echo");
-        assert!(d.description.contains("echo"));
-        // Malformed specs are rejected.
-        assert!(parse_tool_spec("noequals").is_err());
-        assert!(parse_tool_spec("=cmd").is_err());
-        assert!(parse_tool_spec("name=").is_err());
-    }
-
-    #[test]
-    fn shell_tool_runs_with_input_env_var() {
-        let t = parse_tool_spec("shout=printf '%s' \"$input\" | tr a-z A-Z").unwrap();
-        let out = run_shell_tool(&t, &serde_json::json!({ "input": "hello" }));
-        assert_eq!(out, "HELLO");
-        // A model-supplied value with shell metacharacters is data, not syntax.
-        let t = parse_tool_spec("id=printf '%s' \"$input\"").unwrap();
-        let out = run_shell_tool(&t, &serde_json::json!({ "input": "; echo pwned" }));
-        assert_eq!(out, "; echo pwned");
-    }
-
-    #[test]
-    fn tool_declaration_has_one_required_string_input() {
-        let t = parse_tool_spec("weather:desc=cmd").unwrap();
-        let d = tool_declaration(&t);
-        assert_eq!(d["function"]["name"], "weather");
-        assert_eq!(d["function"]["parameters"]["required"][0], "input");
-        assert_eq!(
-            d["function"]["parameters"]["properties"]["input"]["type"],
-            "string"
-        );
     }
 
     #[test]

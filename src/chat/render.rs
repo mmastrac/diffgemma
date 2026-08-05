@@ -1,12 +1,10 @@
-//! Live chat rendering, driven by the `ChatEvent` protocol (`chat_protocol`).
+//! The interactive terminal renderer, driven by the `ChatEvent` protocol.
 //!
-//! Two sinks consume the event stream:
-//! - **JSONL** (optional): every event as one JSON line, to a file (`--events`)
-//!   or stdout (`--json`). This is the observable ground truth.
-//! - **Terminal** (default, interactive tty): a spinner + streamed text.
-//!
-//! The terminal renderer reserves a live pane at the bottom of the screen (a
-//! DECSTBM scroll region) while a turn generates:
+//! [`ChatStream`] runs one generation's stream: its observer decodes each
+//! denoise step, pumps the events into the session sinks, and (on an
+//! interactive tty) applies them to the live display. The renderer reserves a
+//! pane at the bottom of the screen (a DECSTBM scroll region) while the
+//! generation runs:
 //! - A background **ticker** thread is the *sole* writer to stdout, redrawing the
 //!   pane on a fixed timer so the spinner keeps moving across the silent
 //!   KV-extend / prefill gaps between blocks.
@@ -14,7 +12,7 @@
 //!   turn commits; the normal scrollback above it is untouched. The authoritative
 //!   reply is printed once, into real scrollback, at `finish` (see [`Viewport`]).
 
-use crate::chat_protocol::{ChatEvent, StreamDecoder};
+use super::{ChatEvent, StreamDecoder};
 use crate::metal::{StepObserver, StepProgressEvent};
 use crate::tokenizer::Tokenizer;
 use std::io::Write;
@@ -435,10 +433,11 @@ impl Render {
     }
 
     /// Settle the turn into normal scrollback: the `think>` block (reasoning
-    /// turns) above the reply. `reply` is the answer text (empty renders as
-    /// `(empty response)`); `None` prints no `model>` line at all, for a tool-call
-    /// round that only reasoned before calling.
-    fn finish(&mut self, reply: Option<&str>) {
+    /// turns) above the reply, then `stats` as a trailing dim line. `reply` is
+    /// the answer text (empty renders as `(empty response)`); `None` prints no
+    /// `model>` line at all, for a tool-call round that only reasoned before
+    /// calling.
+    fn finish(&mut self, reply: Option<&str>, stats: Option<&str>) {
         let mut permanent = String::new();
         if self.show_thinking {
             let t = self.thought.trim();
@@ -450,6 +449,9 @@ impl Render {
             Some(r) if !r.is_empty() => permanent.push_str(&format!("model> {r}\n")),
             Some(_) => permanent.push_str("model> (empty response)\n"),
             None => {}
+        }
+        if let Some(line) = stats {
+            permanent.push_str(&format!("  {line}\n"));
         }
         match self.viewport.as_mut() {
             Some(vp) => vp.commit(&permanent),
@@ -506,30 +508,27 @@ pub fn render_demo(stage: &str) {
         r.paint();
         std::thread::sleep(Duration::from_millis(120));
     }
-    r.finish(Some(
-        "The final settled answer, line one.\nAnd line two of the reply.",
-    ));
+    r.finish(
+        Some("The final settled answer, line one.\nAnd line two of the reply."),
+        Some("(42 tok · 12 steps · 3.1s · 13.5 tok/s)"),
+    );
     std::thread::sleep(Duration::from_secs(30));
 }
 
-/// Shared state behind one mutex: the decoder + JSON sink (touched by the
-/// generation thread via the observer) and the terminal render state (painted
-/// by the ticker). Only the ticker and `finish` write to stdout.
+/// Shared state behind one mutex: the decoder (driven by the generation
+/// thread via the observer) and the terminal render state (painted by the
+/// ticker). Only the ticker and `finish` write to stdout. Protocol events
+/// fan out through the session [`super::SharedSinks`].
 struct Shared {
     decoder: StreamDecoder<Arc<Tokenizer>>,
-    json: Option<Box<dyn Write + Send>>,
+    sinks: super::SharedSinks,
     render: Render,
     interactive: bool,
 }
 
 impl Shared {
     fn emit(&mut self, ev: &ChatEvent) {
-        if let Some(w) = self.json.as_mut()
-            && serde_json::to_writer(&mut *w, ev).is_ok()
-        {
-            let _ = w.write_all(b"\n");
-            let _ = w.flush();
-        }
+        super::sink::emit(&self.sinks, ev);
         if self.interactive {
             self.render.apply(ev);
         }
@@ -555,29 +554,31 @@ pub struct StreamDisplay {
 
 impl ChatStream {
     /// `interactive` enables the terminal spinner/streaming (an interactive tty).
-    /// `json` is an optional JSONL sink (file or stdout); `turn` / `prompt_tokens`
-    /// seed the opening `TurnStart` event.
+    /// Protocol events flow through `sinks`; `round` / `prompt_tokens` seed the
+    /// opening `RoundStart` event.
     pub fn start(
         tokenizer: Arc<Tokenizer>,
         stop_token_ids: Vec<u32>,
         interactive: bool,
         display: StreamDisplay,
-        json: Option<Box<dyn Write + Send>>,
-        turn: u64,
+        sinks: super::SharedSinks,
+        round: usize,
         prompt_tokens: usize,
     ) -> Self {
         let show_thinking = display.show_thinking || display.prethink_seed.is_some();
+        let channels = super::ChannelIds::from_tokenizer(&tokenizer);
         let shared = Arc::new(Mutex::new(Shared {
             decoder: StreamDecoder::new(Arc::clone(&tokenizer), stop_token_ids)
+                .with_channels(channels)
                 .with_thinking(show_thinking, display.prethink_seed),
-            json,
+            sinks,
             render: Render::new(show_thinking, display.stream_output, interactive),
             interactive,
         }));
         {
             let mut s = shared.lock().unwrap();
-            s.emit(&ChatEvent::TurnStart {
-                turn,
+            s.emit(&ChatEvent::RoundStart {
+                round,
                 prompt_tokens,
             });
         }
@@ -617,32 +618,20 @@ impl ChatStream {
         })
     }
 
-    /// Reconcile the stream against the authoritative reply, terminate the
-    /// line, and close the JSON stream with a `Done` event. `reply` is the
-    /// answer text; `None` settles the interactive display with no `model>` line
-    /// (a tool-call round) and closes the `Done` with empty text.
-    pub fn finish(
-        mut self,
-        reply: Option<&str>,
-        tokens: usize,
-        steps: usize,
-        secs: f64,
-        stopped: bool,
-    ) {
+    /// Settle the interactive display against the authoritative reply:
+    /// stop the ticker, commit the viewport, and print `reply` (with `stats`
+    /// as a trailing dim line, if given) into real scrollback. `reply` =
+    /// `None` settles with no `model>` line (a tool-call round that only
+    /// narrated). Display-only — the caller emits the protocol's `RoundEnd`
+    /// or `Done` through the sinks.
+    pub fn finish(mut self, reply: Option<&str>, stats: Option<&str>) {
         self.done.store(true, Ordering::Relaxed);
         if let Some(t) = self.ticker.take() {
             let _ = t.join();
         }
         let mut s = self.shared.lock().unwrap();
         if self.interactive {
-            s.render.finish(reply);
+            s.render.finish(reply, stats);
         }
-        s.emit(&ChatEvent::Done {
-            tokens,
-            steps,
-            secs,
-            stopped,
-            text: reply.unwrap_or("").to_string(),
-        });
     }
 }

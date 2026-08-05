@@ -30,7 +30,7 @@
 //!   diffusion-aware client can render the live shimmer. On by default
 //!   (per-request `x_diffusion_drafts:false` opts out).
 
-use crate::chat_protocol::TextDecoder;
+use crate::chat::TextDecoder;
 use serde::Deserialize;
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicU64, Ordering};

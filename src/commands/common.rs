@@ -108,21 +108,6 @@ pub(crate) fn build_chat_prompt_tokens(
         )
     }
 }
-/// Like [`build_chat_prompt_tokens`], but seeds the model's thought channel with
-/// `seed` (the chat REPL's `/prethink`, or `/thought` when `close`). Always uses
-/// the chat template: a raw-prompt session has no thought scaffold to seed, so
-/// it is inert there and the caller gates on it.
-pub(crate) fn build_chat_prompt_tokens_prethink(
-    model_dir: &std::path::Path,
-    history: &[chat_template::ChatTurn],
-    seed: &str,
-    close: bool,
-) -> Result<Vec<u32>, crate::Error> {
-    let tok_path = model_dir.join("tokenizer.json");
-    let tokenizer = tokenizer::Tokenizer::load(&tok_path)?;
-    chat_template::format_chat_token_ids_prethink(&tokenizer, history, seed, close)
-}
-
 /// Fail-fast context-budget check (panic-to-error, ROADMAP 3.2): `Err(msg)`
 /// when the weights + KV at `max_seq` would exceed the safe fraction of the GPU
 /// working-set (estimated from physical RAM, ~72% on Apple Silicon), which
