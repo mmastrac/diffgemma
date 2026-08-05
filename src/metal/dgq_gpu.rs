@@ -153,7 +153,14 @@ impl DgqGpuBlob {
         device: &ProtocolObject<dyn MTLDevice>,
     ) -> Result<Arc<Self>, Error> {
         let head = materialize_layered_head_only(model_dir, manifest, expert_split)?;
-        Self::finish_layered_split(model_dir, manifest, expert_split, local_expert_split, head, device)
+        Self::finish_layered_split(
+            model_dir,
+            manifest,
+            expert_split,
+            local_expert_split,
+            head,
+            device,
+        )
     }
 
     fn finish_layered_split(
@@ -372,7 +379,10 @@ impl DgqGpuBlob {
             && self.expert_split > 0
             && off >= self.expert_split
         {
-            return unsafe { tail.as_ptr().add(blob_offset_for_mtl(off - self.expert_split)) };
+            return unsafe {
+                tail.as_ptr()
+                    .add(blob_offset_for_mtl(off - self.expert_split))
+            };
         }
         unsafe { self._mmap.as_ptr().add(blob_offset_for_mtl(off)) }
     }
@@ -400,7 +410,12 @@ fn resolve_external_mmaps(
 /// Bounds-checked sub-slice: a manifest entry whose offset+len exceeds its
 /// (already size-verified) source file means a corrupt or mismatched pack,
 /// not a host process crash.
-fn checked_slice<'a>(buf: &'a [u8], start: usize, len: usize, what: &str) -> Result<&'a [u8], Error> {
+fn checked_slice<'a>(
+    buf: &'a [u8],
+    start: usize,
+    len: usize,
+    what: &str,
+) -> Result<&'a [u8], Error> {
     let end = start
         .checked_add(len)
         .ok_or_else(|| Error::Layered(format!("{what}: offset overflow")))?;
@@ -421,10 +436,18 @@ fn source_slice<'a>(
     len: usize,
 ) -> Result<&'a [u8], Error> {
     match &entry.meta.source {
-        None => checked_slice(local_mmap, blob_offset_usize(entry.meta.offset)?, len, &entry.name),
-        Some(TensorSource::Local { local_offset }) => {
-            checked_slice(local_mmap, blob_offset_usize(*local_offset)?, len, &entry.name)
-        }
+        None => checked_slice(
+            local_mmap,
+            blob_offset_usize(entry.meta.offset)?,
+            len,
+            &entry.name,
+        ),
+        Some(TensorSource::Local { local_offset }) => checked_slice(
+            local_mmap,
+            blob_offset_usize(*local_offset)?,
+            len,
+            &entry.name,
+        ),
         Some(TensorSource::External { file, offset }) => {
             let mm = external.get(file).ok_or_else(|| {
                 Error::Layered(format!(
@@ -922,7 +945,10 @@ mod splice_plan_tests {
 
     #[test]
     fn offset_alignment_tripwire_accepts_64_aligned_manifest() {
-        let m = manifest(vec![external("a", "shardA", 0, 0, 128), local("b", 128, 64)]);
+        let m = manifest(vec![
+            external("a", "shardA", 0, 0, 128),
+            local("b", 128, 64),
+        ]);
         assert_tensor_offset_alignment(&m).expect("64-byte-aligned manifest must pass");
     }
 
@@ -932,7 +958,10 @@ mod splice_plan_tests {
         // of writer bug this tripwire exists to catch at load time (byte
         // content can be perfectly correct and this would still be unsafe
         // for a GPU kernel's typed pointer read).
-        let m = manifest(vec![external("a", "shardA", 0, 0, 128), local("b", 130, 64)]);
+        let m = manifest(vec![
+            external("a", "shardA", 0, 0, 128),
+            local("b", 130, 64),
+        ]);
         let err = assert_tensor_offset_alignment(&m).expect_err("must reject misaligned offset");
         assert!(err.to_string().contains("misaligned"), "{err}");
     }
@@ -965,8 +994,7 @@ mod diagnostic_gpu_vs_store_tests {
         for entry in store.tensor_entries() {
             let want = store.tensor_bytes(&entry.name).expect("store bytes");
             let len = want.len();
-            let got =
-                unsafe { std::slice::from_raw_parts(blob.host_ptr(entry.meta.offset), len) };
+            let got = unsafe { std::slice::from_raw_parts(blob.host_ptr(entry.meta.offset), len) };
             checked += 1;
             if got != want {
                 let first_diff = want
@@ -984,7 +1012,11 @@ mod diagnostic_gpu_vs_store_tests {
         for (name, off, len, first_diff) in mismatches.iter().take(20) {
             eprintln!("  MISMATCH {name} offset={off} len={len} first_diff_at={first_diff}");
         }
-        assert!(mismatches.is_empty(), "{} tensor(s) mismatched", mismatches.len());
+        assert!(
+            mismatches.is_empty(),
+            "{} tensor(s) mismatched",
+            mismatches.len()
+        );
     }
 }
 

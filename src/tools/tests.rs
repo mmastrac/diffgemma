@@ -555,7 +555,10 @@ fn quoted_tool_opener_and_stop_text_do_not_flag_incomplete() {
 fn quoted_content_is_not_trailing_prose() {
     // content_before_tool_calls must cut at the REAL opener, not a quoted one.
     let reply = markup_edit_call();
-    assert_eq!(content_before_tool_calls(&reply), "I'll update the template.");
+    assert_eq!(
+        content_before_tool_calls(&reply),
+        "I'll update the template."
+    );
     assert!(!has_trailing_after_tool_calls(&reply));
 }
 
@@ -584,7 +587,8 @@ fn fenced_incomplete_call_fragment_is_inert() {
 fn fence_pair_cannot_swallow_a_real_call() {
     // An unclosed fence in prose + a fence inside a later real call's quoted
     // arg must NOT pair up and hide the call.
-    let reply = "Preview:\n``` \n<|tool_call>call:edit{new:<|\"|>```rust\ncode\n```<|\"|>}<tool_call|>";
+    let reply =
+        "Preview:\n``` \n<|tool_call>call:edit{new:<|\"|>```rust\ncode\n```<|\"|>}<tool_call|>";
     let calls = parse_tool_calls(reply);
     assert_eq!(calls.len(), 1);
     assert_eq!(

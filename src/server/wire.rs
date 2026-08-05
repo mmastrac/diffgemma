@@ -296,9 +296,9 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
         // id inside an open `<|"|>` run is literal arg content, skipped only
         // when the engine's stop-scan does the same (see `stop_skip_quoted`).
         let mut in_quote = self.stop_skip_quoted
-            && self.quote.is_some_and(|q| {
-                self.committed_ids.iter().filter(|&&id| id == q).count() % 2 == 1
-            });
+            && self
+                .quote
+                .is_some_and(|q| self.committed_ids.iter().filter(|&&id| id == q).count() % 2 == 1);
         for &id in &ev.argmax[..prefix_end] {
             if self.stop_skip_quoted && Some(id) == self.quote {
                 in_quote = !in_quote;

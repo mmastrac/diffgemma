@@ -54,10 +54,7 @@ pub(crate) fn write_shard(path: &Path, tensors: &[(&str, Vec<i64>, Vec<u8>)]) {
     }
     // Filler `__metadata__` entry, then pad the value string until
     // `8 + header_len` is a multiple of 64.
-    header.insert(
-        "__metadata__".to_string(),
-        serde_json::json!({ "pad": "" }),
-    );
+    header.insert("__metadata__".to_string(), serde_json::json!({ "pad": "" }));
     let mut pad_len = 0usize;
     loop {
         header.insert(
@@ -69,7 +66,10 @@ pub(crate) fn write_shard(path: &Path, tensors: &[(&str, Vec<i64>, Vec<u8>)]) {
             break;
         }
         pad_len += 1;
-        assert!(pad_len < 128, "could not find a padding length within 128 bytes");
+        assert!(
+            pad_len < 128,
+            "could not find a padding length within 128 bytes"
+        );
     }
     let header_json = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
     assert!((8 + header_json.len()).is_multiple_of(64));

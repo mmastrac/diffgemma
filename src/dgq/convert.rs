@@ -5,14 +5,13 @@ use crate::dgq::block::{
     quantize_bf16_matrix_q4, quantize_bf16_matrix_q6, quantize_bf16_matrix_q8,
     quantize_expert_stack_q4, quantize_expert_stack_q6,
 };
-use crate::dgq::layout::{
-    BLOB_FILE, BaseModelRef, DGQ_VERSION_LAYERED, DGQ_VERSION_NVFP4, DgqManifest, DgqTensorEntry,
-    DgqTensorMeta, ExternalFile, ExternalRole, MANIFEST_FILE, QuantKind, QuantProfile,
-    DGQ_VERSION_CUSTOM, TensorClass, TensorSource, align_offset, classify_tensor_custom,
-    dgq_version_for_profile,
-    tensor_class, validate_format_dims,
-};
 use crate::dgq::hf_resolve::hash_safetensors_header;
+use crate::dgq::layout::{
+    BLOB_FILE, BaseModelRef, DGQ_VERSION_CUSTOM, DGQ_VERSION_LAYERED, DGQ_VERSION_NVFP4,
+    DgqManifest, DgqTensorEntry, DgqTensorMeta, ExternalFile, ExternalRole, MANIFEST_FILE,
+    QuantKind, QuantProfile, TensorClass, TensorSource, align_offset, classify_tensor_custom,
+    dgq_version_for_profile, tensor_class, validate_format_dims,
+};
 use crate::dgq::nvfp4::{quantize_bf16_matrix_nvfp4, quantize_expert_stack_nvfp4};
 use crate::weights::SafetensorStore;
 use std::collections::BTreeMap;
@@ -74,7 +73,9 @@ pub fn quantize_model(opts: QuantizeOptions) -> Result<QuantizeSummary, Error> {
     // writing a single byte — an invalid combo must never leave a partially
     // written pack on disk.
     for name in store.weight_map.keys() {
-        let (_, info) = store.get(name).ok_or_else(|| Error::NotFound(name.clone()))?;
+        let (_, info) = store
+            .get(name)
+            .ok_or_else(|| Error::NotFound(name.clone()))?;
         let kind = classify_tensor_custom(name, &info.shape, opts.profile, &opts.custom_overrides);
         validate_format_dims(name, &info.shape, kind)?;
     }
@@ -159,7 +160,8 @@ pub fn quantize_model(opts: QuantizeOptions) -> Result<QuantizeSummary, Error> {
             // for any self-contained multi-expert pack. No test exercised
             // `overlay_base: None` before the round-trip test that caught
             // this (`dgq::overlay::monolithic_roundtrip_tests`).
-            let aligned = (local_bytes_written + EXPERT_SPLIT_ALIGN - 1) & !(EXPERT_SPLIT_ALIGN - 1);
+            let aligned =
+                (local_bytes_written + EXPERT_SPLIT_ALIGN - 1) & !(EXPERT_SPLIT_ALIGN - 1);
             let pad = (aligned - local_bytes_written) as usize;
             blob.write_all(&vec![0u8; pad])?;
             local_bytes_written = aligned;
@@ -185,12 +187,14 @@ pub fn quantize_model(opts: QuantizeOptions) -> Result<QuantizeSummary, Error> {
                     (size, hash)
                 }
             };
-            external_files.entry(shard_name.clone()).or_insert(ExternalFile {
-                role: ExternalRole::HfSafetensors,
-                path: shard_name.clone(),
-                expected_size: size,
-                header_sha256: Some(hash),
-            });
+            external_files
+                .entry(shard_name.clone())
+                .or_insert(ExternalFile {
+                    role: ExternalRole::HfSafetensors,
+                    path: shard_name.clone(),
+                    expected_size: size,
+                    header_sha256: Some(hash),
+                });
             (
                 src.len() as u64,
                 Some(TensorSource::External {
@@ -229,12 +233,9 @@ pub fn quantize_model(opts: QuantizeOptions) -> Result<QuantizeSummary, Error> {
                 }
             };
             local_bytes_written += byte_len;
-            let source = opts
-                .overlay_base
-                .is_some()
-                .then_some(TensorSource::Local {
-                    local_offset: local_start,
-                });
+            let source = opts.overlay_base.is_some().then_some(TensorSource::Local {
+                local_offset: local_start,
+            });
             (byte_len, source)
         };
         offset += byte_len;

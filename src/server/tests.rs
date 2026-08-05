@@ -40,7 +40,17 @@ fn c(ch: char) -> u32 {
 
 #[test]
 fn content_only_commits_answer_text() {
-    let mut m = DiffusionStreamMapper::new(FakeDecoder, vec![], None, None, None, false, false, false, false);
+    let mut m = DiffusionStreamMapper::new(
+        FakeDecoder,
+        vec![],
+        None,
+        None,
+        None,
+        false,
+        false,
+        false,
+        false,
+    );
     let hi = [c('H'), c('i')];
     // Not committed yet: no content deltas.
     assert!(m.on_step(&step(1, 1, &hi, false)).is_empty());
@@ -52,7 +62,17 @@ fn content_only_commits_answer_text() {
 
 #[test]
 fn draft_streams_stable_prefix_before_commit() {
-    let mut m = DiffusionStreamMapper::new(FakeDecoder, vec![], None, None, None, false, false, true, false);
+    let mut m = DiffusionStreamMapper::new(
+        FakeDecoder,
+        vec![],
+        None,
+        None,
+        None,
+        false,
+        false,
+        true,
+        false,
+    );
     let hi = [c('H'), c('i')];
     // Streak must reach STABLE_STREAK before the draft shows anything.
     assert!(draft_of(&m.on_step(&step(1, 1, &hi, false))).is_none());
@@ -322,7 +342,17 @@ fn quoted_stop_id_streams_through_when_skip_enabled() {
 
 #[test]
 fn stop_token_ends_and_cuts() {
-    let mut m = DiffusionStreamMapper::new(FakeDecoder, vec![99], None, None, None, false, false, false, false);
+    let mut m = DiffusionStreamMapper::new(
+        FakeDecoder,
+        vec![99],
+        None,
+        None,
+        None,
+        false,
+        false,
+        false,
+        false,
+    );
     let canvas = [c('O'), c('k'), 99, c('X')];
     let out = m.on_step(&step(1, 2, &canvas, true));
     assert_eq!(out, vec![WireDelta::Content("Ok".to_string())]);
@@ -481,7 +511,17 @@ fn resolve_thinking_precedence() {
 
 #[test]
 fn paced_stream_holds_commit_and_releases_during_next_block() {
-    let mut m = DiffusionStreamMapper::new(FakeDecoder, vec![], None, None, None, false, false, false, true);
+    let mut m = DiffusionStreamMapper::new(
+        FakeDecoder,
+        vec![],
+        None,
+        None,
+        None,
+        false,
+        false,
+        false,
+        true,
+    );
     let text: Vec<u32> = "abcdefghij".chars().map(|ch| ch as u32).collect();
     // Block 1 commits after 16 steps (seeds the EMA at (16+16)/2 = 16):
     // paced mode holds the text — no Content delta at commit.
@@ -509,7 +549,17 @@ fn paced_stream_holds_commit_and_releases_during_next_block() {
     assert!("abcdefghij".starts_with(&streamed));
     // Block 2 commits with a stop -> turn ends -> everything flushes.
     let stop = [c('z'), 999];
-    let mut m2 = DiffusionStreamMapper::new(FakeDecoder, vec![999], None, None, None, false, false, false, true);
+    let mut m2 = DiffusionStreamMapper::new(
+        FakeDecoder,
+        vec![999],
+        None,
+        None,
+        None,
+        false,
+        false,
+        false,
+        true,
+    );
     let _ = m2.on_step(&step(1, 16, &text, true));
     let out = m2.on_step(&step(2, 4, &stop, true));
     let content: String = out
@@ -524,7 +574,17 @@ fn paced_stream_holds_commit_and_releases_during_next_block() {
 
 #[test]
 fn paced_stream_final_flush_releases_held_text() {
-    let mut m = DiffusionStreamMapper::new(FakeDecoder, vec![], None, None, None, false, false, false, true);
+    let mut m = DiffusionStreamMapper::new(
+        FakeDecoder,
+        vec![],
+        None,
+        None,
+        None,
+        false,
+        false,
+        false,
+        true,
+    );
     let text: Vec<u32> = "hold me".chars().map(|ch| ch as u32).collect();
     let _ = m.on_step(&step(1, 16, &text, true));
     // Turn ends without a stop token (budget): final_flush drains the rest.
@@ -542,7 +602,17 @@ fn paced_stream_final_flush_releases_held_text() {
 
 #[test]
 fn paced_stream_tool_call_disables_pacing() {
-    let mut m = DiffusionStreamMapper::new(FakeDecoder, vec![], None, None, None, false, false, false, true);
+    let mut m = DiffusionStreamMapper::new(
+        FakeDecoder,
+        vec![],
+        None,
+        None,
+        None,
+        false,
+        false,
+        false,
+        true,
+    );
     let text: Vec<u32> = "call:read{".chars().map(|ch| ch as u32).collect();
     // A committed block containing a tool call flushes immediately.
     let out = m.on_step(&step(1, 8, &text, true));
