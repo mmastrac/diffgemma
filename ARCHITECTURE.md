@@ -657,6 +657,18 @@ artifact.
   conversation with the longest common prefix and salvages tail divergence
   (lcp ≥ 256 && tail ≤ 512 → O(1) ring truncate on Activate); anything
   deeper is an explicit, logged decision to re-prefill.
+- **Tool-turn continuation** (`DGQ_SERVE_TOOL_CONTINUATION`, default ON):
+  a tool-mode generation prompt seeds the thought channel OPEN (reasoning
+  lands in the thought block by construction; `DiffusionStreamMapper`
+  starts in-thought so the wire split agrees), and a request recognized as
+  the previous tool turn's next round (`match_tool_continuation`: same
+  message prefix + our echoed calls + their responses) prompts as the raw
+  token log — reasoning intact — plus the rendered responses and a
+  reopened thought. Mid-turn rounds finalize the raw log (a no-op rebuild;
+  pure KV extension per round); the round that ends the turn finalizes
+  thought-free as always, so reasoning still never crosses a turn
+  boundary. Fixes the intra-turn amnesia of the thought-stripping
+  re-render (the model re-planned from scratch every round).
 - **Standing gate — rewind byte-consistency**: seeded
   generate → rewind → generate loops must restore KV bytes exactly
   (position-ordered `live_kv_fingerprint`) and regenerate bit-identically.
