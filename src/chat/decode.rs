@@ -156,22 +156,18 @@ impl ChannelIds {
     }
 
     /// Settle a finished tool-mode generation into `(reasoning, rest)` text.
-    /// A closed thought separates the surfaced reasoning (prefixed by the
+    /// The round began inside an open thought (the prompt seeds the marker);
+    /// the model's `<channel|>` separates the reasoning (prefixed by the
     /// `/prethink` `seed`, if any) from the answer / tool calls. Without a
-    /// close the model went straight to output — often tool calls — so there
-    /// is no separate reasoning and `rest` is the whole decoded text, keeping
-    /// the calls parseable.
+    /// close there is no separate reasoning — `rest` is the whole decoded
+    /// text, keeping calls the model left inside its thought parseable.
     pub fn settle_tool_reply<D: TextDecoder>(
         &self,
         decoder: &D,
-        thinking: bool,
         seed: &str,
         ids: &[u32],
     ) -> (Option<String>, String) {
-        if !thinking {
-            return (None, decoder.decode(ids));
-        }
-        let s = self.split(decoder, ids, !seed.is_empty());
+        let s = self.split(decoder, ids, true);
         if s.closed {
             let thought = format!("{seed}{}", decoder.decode(&s.reasoning))
                 .trim()
@@ -339,6 +335,11 @@ pub struct StreamDecoder<D: TextDecoder> {
     /// (up to the model's `<channel|>`). Absent for a plain `--show-thinking`
     /// turn, whose generation opens its own thought channel.
     prethink_seed: Option<String>,
+    /// The generation begins inside an already-open thought channel whose
+    /// open marker was in the prompt (a `/prethink` continuation, or a tool
+    /// round's forced-open thought). Independent of display: the split must
+    /// classify the leading ids as thought even when nothing shows it.
+    start_in_thought: bool,
 }
 
 impl<D: TextDecoder> StreamDecoder<D> {
@@ -354,6 +355,7 @@ impl<D: TextDecoder> StreamDecoder<D> {
             thinking_display: false,
             last_thought: String::new(),
             prethink_seed: None,
+            start_in_thought: false,
         }
     }
 
@@ -370,7 +372,16 @@ impl<D: TextDecoder> StreamDecoder<D> {
     /// `--show-thinking` turn that opens its own thought channel.
     pub fn with_thinking(mut self, show_thinking: bool, seed: Option<String>) -> Self {
         self.thinking_display = show_thinking || seed.is_some();
+        self.start_in_thought = self.start_in_thought || seed.is_some();
         self.prethink_seed = seed;
+        self
+    }
+
+    /// The generation begins inside an already-open thought (the open marker
+    /// was in the prompt). Reasoning is split out from the first id — and
+    /// silently discarded unless display is on.
+    pub fn starting_in_thought(mut self) -> Self {
+        self.start_in_thought = true;
         self
     }
 
@@ -410,20 +421,26 @@ impl<D: TextDecoder> StreamDecoder<D> {
             locked: sp.ids.len(),
         });
 
-        // Thinking display (`--show-thinking` / `/prethink`): split the whole
-        // generation at the token level each step. The reasoning streams as
-        // `Thought`, the answer after the model's `<channel|>` as the normal
-        // `Text`. The full re-split handles a thought that spans several blocks,
-        // where an append-only path would need the open marker in the live block.
-        if self.thinking_display {
+        // Reasoning-separating path (`--show-thinking`, `/prethink`, or a
+        // generation that begins in-thought): split the whole generation at
+        // the token level each step. The reasoning streams as `Thought` when
+        // displayed (discarded otherwise); the answer after the model's
+        // `<channel|>` streams as the normal `Text`. The full re-split handles
+        // a thought that spans several blocks, where an append-only path would
+        // need the open marker in the live block.
+        if self.thinking_display || self.start_in_thought {
             if ev.block_done {
                 self.committed_ids.extend_from_slice(&sp.ids);
+                out.push(ChatEvent::BlockCommit {
+                    block: ev.block_idx,
+                    committed_tokens: sp.ids.len(),
+                });
                 if sp.hit_stop {
                     self.ended = true;
                 }
             }
             let seed = self.prethink_seed.as_deref().unwrap_or("");
-            let in_thought = self.prethink_seed.is_some();
+            let in_thought = self.start_in_thought;
             let strip = crate::sample::strip_degenerate_token_ids;
             // Committed view = finalized blocks only; its answer is the immutable
             // prefix. Full view = committed + the live draft. Deriving `committed`
@@ -447,7 +464,7 @@ impl<D: TextDecoder> StreamDecoder<D> {
             );
             let answer = self.decode_content(&full_split.content);
 
-            if thought != self.last_thought {
+            if self.thinking_display && thought != self.last_thought {
                 out.push(ChatEvent::Thought {
                     text: thought.clone(),
                 });
@@ -829,9 +846,9 @@ mod tests {
     fn settle_tool_reply_keeps_calls_without_a_channel_close() {
         let ids = channel_ids();
         let calls = [b'c' as u32, b'a' as u32, b'l' as u32, b'l' as u32];
-        // A closed span separates reasoning from the calls.
+        // The round begins inside an open thought (the prompt seeds the
+        // marker); the close separates reasoning from the calls.
         let stream = [
-            OPEN,
             b'H' as u32,
             b'i' as u32,
             CLOSE,
@@ -840,24 +857,42 @@ mod tests {
             calls[2],
             calls[3],
         ];
-        let (thought, content) = ids.settle_tool_reply(&FakeDecoder, true, "", &stream);
+        let (thought, content) = ids.settle_tool_reply(&FakeDecoder, "", &stream);
         assert_eq!(thought.as_deref(), Some("Hi"));
         assert_eq!(content, "call");
-        // No close (model went straight to calls): whole text is kept so the
-        // calls still parse — the regression this guards against.
-        let (thought, content) = ids.settle_tool_reply(&FakeDecoder, true, "", &calls);
+        // A seed prefixes the surfaced reasoning.
+        let (thought, _) = ids.settle_tool_reply(&FakeDecoder, "Plan: ", &stream);
+        assert_eq!(thought.as_deref(), Some("Plan: Hi"));
+        // Never closed: whole text is kept so calls the model left inside its
+        // thought still parse — the regression this guards against.
+        let (thought, content) = ids.settle_tool_reply(&FakeDecoder, "", &calls);
         assert_eq!(thought, None);
         assert_eq!(content, "call");
-        // Unclosed span: the raw decode (markers render as nothing here) is
-        // returned whole rather than an empty content.
-        let open_span = [OPEN, b'X' as u32, calls[0]];
-        let (thought, content) = ids.settle_tool_reply(&FakeDecoder, true, "", &open_span);
-        assert_eq!(thought, None);
-        assert_eq!(content, "Xc");
-        // Thinking off: never split.
-        let (thought, content) = ids.settle_tool_reply(&FakeDecoder, false, "", &stream);
-        assert_eq!(thought, None);
-        assert_eq!(content, "Hicall");
+    }
+
+    /// A tool round's forced-open thought splits from the first id even when
+    /// nothing displays it: no `Thought` events, no reasoning leaking into
+    /// `Text`, the answer starts after the model's close.
+    #[test]
+    fn start_in_thought_hides_undisplayed_reasoning() {
+        let mut d = StreamDecoder::new(FakeDecoder, vec![])
+            .with_channels(channel_ids())
+            .starting_in_thought();
+        let reasoning = [b'H' as u32, b'i' as u32];
+        for s in 1..=3 {
+            let e = d.on_step(&step(1, s, &reasoning, false));
+            assert_eq!(thoughts(&e), Vec::<&str>::new());
+            assert_eq!(texts(&e), Vec::<&str>::new());
+        }
+        // The thought closes and the answer appears — reasoning never shown.
+        let full = [b'H' as u32, b'i' as u32, CLOSE, b'O' as u32, b'k' as u32];
+        let done = d.on_step(&step(1, 4, &full, true));
+        assert_eq!(thoughts(&done), Vec::<&str>::new());
+        assert_eq!(texts(&done), vec!["Ok"]);
+        assert!(
+            done.iter()
+                .any(|ev| matches!(ev, ChatEvent::BlockCommit { .. }))
+        );
     }
 
     #[test]

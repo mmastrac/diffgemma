@@ -650,6 +650,7 @@ impl TurnRunner<'_> {
             StreamDisplay {
                 show_thinking: self.show_thinking && !close,
                 prethink_seed: open_seed,
+                start_in_thought: false,
                 stream_output: self.stream_output,
             },
             std::sync::Arc::clone(&self.sinks),
@@ -759,8 +760,12 @@ impl TurnRunner<'_> {
             let display_thinking = self.show_thinking || think_seed.is_some();
             let mut guarded =
                 crate::tools::render_conversation_guarded(&messages, self.tools_json, true, true);
+            // Force the thought OPEN in the prompt: left to open the channel
+            // itself, the model often narrates its plan into the visible
+            // answer instead. Beginning in-thought pins the reasoning to the
+            // thought block; the `/prethink` seed, when set, continues there.
+            guarded.push_str("<|channel>thought\n");
             if let Some(s) = think_seed {
-                guarded.push_str("<|channel>thought\n");
                 guarded.push_str(s);
             }
             let prompt = self.tokenizer.encode_prompt(&guarded).0;
@@ -786,6 +791,7 @@ impl TurnRunner<'_> {
                 StreamDisplay {
                     show_thinking: self.show_thinking,
                     prethink_seed: think_seed.map(str::to_string),
+                    start_in_thought: true,
                     stream_output: self.stream_output,
                 },
                 std::sync::Arc::clone(&self.sinks),
@@ -801,24 +807,30 @@ impl TurnRunner<'_> {
 
             let new_ids =
                 sample::strip_degenerate_token_ids(out.token_ids.get(prompt_len..).unwrap_or(&[]));
-            let (thought, content) = ChannelIds::from_tokenizer(self.tokenizer).settle_tool_reply(
-                self.tokenizer,
-                true,
-                think_seed.unwrap_or(""),
-                &new_ids,
-            );
-            // The thought rides events (and the display) only when surfaced —
-            // hidden reasoning stays hidden, as on a plain turn.
-            let thought = thought
+            let (settled_thought, content) = ChannelIds::from_tokenizer(self.tokenizer)
+                .settle_tool_reply(self.tokenizer, think_seed.unwrap_or(""), &new_ids);
+            // `None` = the model never closed its thought (the round began
+            // inside one). The thought rides events (and the display) only
+            // when surfaced — hidden reasoning stays hidden, as on a plain
+            // turn.
+            let closed_thought = settled_thought.is_some();
+            let thought = settled_thought
                 .as_deref()
                 .map(str::trim)
                 .filter(|t| display_thinking && !t.is_empty())
                 .map(str::to_string);
 
-            // No `call:` attempt at all: this is the final answer.
+            // No `call:` attempt at all: this is the final answer. A round
+            // whose thought never closed stated it inside the reasoning —
+            // salvage the answer from the tail rather than replying with the
+            // whole monologue.
             let attempts = crate::tools::scan_call_attempts(&content);
             if attempts.is_empty() {
-                let answer = chat_template::sanitize_model_reply(&content);
+                let answer = if closed_thought {
+                    chat_template::sanitize_model_reply(&content)
+                } else {
+                    chat_template::sanitize_model_reply(&super::salvage_answer(&content))
+                };
                 let secs = started.elapsed().as_secs_f64();
                 let stats = stats_line(total_tokens, total_steps, secs, out.stopped_on_eot);
                 stream.finish(Some(&answer), Some(&stats));
