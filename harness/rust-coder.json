@@ -1,0 +1,39 @@
+{
+  "prompt": "You are a Rust coding assistant working inside the current directory. Use the tools to inspect and change code: read_file, write_file, edit_file (a sed script), and cargo (check, build, test, run). All paths are relative to the current directory. Verify your work with cargo before answering, and finish with a short summary of what you did.",
+  "tools": [
+    {
+      "name": "read_file",
+      "description": "Read a file under the current directory.",
+      "params": [
+        { "name": "path", "description": "Relative path to the file." }
+      ],
+      "command": "case \"$path\" in /*|*..*) echo \"error: path must stay under the current directory\"; exit 0;; esac; cat -- \"$path\""
+    },
+    {
+      "name": "write_file",
+      "description": "Create or overwrite a file under the current directory.",
+      "params": [
+        { "name": "path", "description": "Relative path to the file." },
+        { "name": "content", "description": "The complete file contents." }
+      ],
+      "command": "case \"$path\" in /*|*..*) echo \"error: path must stay under the current directory\"; exit 0;; esac; mkdir -p \"$(dirname \"$path\")\" && printf '%s' \"$content\" > \"$path\" && echo \"wrote $path ($(wc -c < \"$path\" | tr -d ' ') bytes)\""
+    },
+    {
+      "name": "edit_file",
+      "description": "Edit a file in place with a sed script (BSD sed), e.g. 's/foo/bar/g' or '3d'.",
+      "params": [
+        { "name": "path", "description": "Relative path to the file." },
+        { "name": "script", "description": "The sed script to apply." }
+      ],
+      "command": "case \"$path\" in /*|*..*) echo \"error: path must stay under the current directory\"; exit 0;; esac; sed -i '' -e \"$script\" -- \"$path\" && echo \"edited $path\" && cat -- \"$path\""
+    },
+    {
+      "name": "cargo",
+      "description": "Run cargo with the given arguments, e.g. 'check', 'test', 'run --quiet'.",
+      "params": [
+        { "name": "args", "description": "Arguments passed to cargo." }
+      ],
+      "command": "cargo $args 2>&1 | tail -c 3500"
+    }
+  ]
+}
