@@ -1,6 +1,6 @@
 # diffgemma-parity
 
-Reproducible Python reference checks for **diffgemma-mps** (tokenizer parity today; model hooks later).
+Reproducible Python reference checks for **diffgemma** (tokenizer parity today; model hooks later).
 
 Uses [uv](https://docs.astral.sh/uv/) for a locked virtualenv. Weights are read from `../model/transformer/` (symlinked Hugging Face cache).
 
@@ -43,7 +43,7 @@ uv sync --extra mlx
 uv run python scripts/quantize_mlx.py --hf-path google/diffusiongemma-26B-A4B-it -o ../model/mlx-mxfp4
 ```
 
-Rust `.dgq` for inference: `diffgemma-mps quantize -o /tmp/quantized-weights` (different format).
+Rust `.dgq` for inference: `diffgemma quantize -o /tmp/quantized-weights` (different format).
 
 ### MLX denoise trace (low-RAM reference @ 30L)
 

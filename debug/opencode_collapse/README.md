@@ -13,7 +13,7 @@ regex-lite task with REAL `write`/`bash`(rustc)/`edit` tools and nudges the
 model back into the loop if it gives up while tests still fail.
 
 ```bash
-target/release/diffgemma-mps serve -m model/diffusiongemma-q4emb \
+target/release/diffgemma serve -m model/diffusiongemma-q4emb \
   --addr 127.0.0.1:8100 --ctx 100000 --log-dir /tmp/logsX &
 python3 oc_sim.py 8100 /tmp/logsX          # NO seed arg — see below
 ```

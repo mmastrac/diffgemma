@@ -1,4 +1,4 @@
-# diffgemma-mps — architecture & implemented contract
+# diffgemma — architecture & implemented contract
 
 A low-dependency Rust + Metal inference engine for
 [DiffusionGemma](https://huggingface.co/google/diffusiongemma-26B-A4B-it)
@@ -633,7 +633,7 @@ artifact.
   byte-identical to the monolithic path (golden-pinned).
 - **Stage chain**: `PipelineStage` trait, Pipeline terminal, wrappers
   compose freely. `OpLogStage` journals every op+event as full-fidelity
-  JSONL (`serve --log-dir`); `diffgemma-mps replay <ops.jsonl>` re-executes
+  JSONL (`serve --log-dir`); `diffgemma replay <ops.jsonl>` re-executes
   a session and diffs every event — field sessions are executable repro
   artifacts. `ToolValidatorStage` (opt-in `--tool-validate`) retries
   malformed tool grammar with a bumped seed. `ToolRepairStage` (opt-in
