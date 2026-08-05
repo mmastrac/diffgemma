@@ -12,8 +12,9 @@
 //!   turn commits; the normal scrollback above it is untouched. The authoritative
 //!   reply is printed once, into real scrollback, at `finish` (see [`Viewport`]).
 
-use super::{ChatEvent, StreamDecoder};
-use crate::metal::{StepObserver, StepProgressEvent};
+use super::ChatEvent;
+use crate::decoder::{ChannelIds, StepProgressEvent, StreamDecoder};
+use crate::metal::StepObserver;
 use crate::tokenizer::Tokenizer;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -569,7 +570,7 @@ impl ChatStream {
         prompt_tokens: usize,
     ) -> Self {
         let show_thinking = display.show_thinking || display.prethink_seed.is_some();
-        let channels = super::ChannelIds::from_tokenizer(&tokenizer);
+        let channels = ChannelIds::from_tokenizer(&tokenizer);
         let mut decoder = StreamDecoder::new(Arc::clone(&tokenizer), stop_token_ids)
             .with_channels(channels)
             .with_thinking(show_thinking, display.prethink_seed);

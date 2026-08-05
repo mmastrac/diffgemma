@@ -10,9 +10,10 @@
 //! conversation state.
 
 use super::{
-    ChannelIds, ChatEvent, ChatStream, SharedSinks, StreamDisplay,
+    ChatEvent, ChatStream, SharedSinks, StreamDisplay,
     sink::{preview, print_think},
 };
+use crate::decoder::ChannelIds;
 use crate::{chat_template, metal, sample, tokenizer};
 
 fn prepend_system(
@@ -843,7 +844,7 @@ impl TurnRunner<'_> {
                 let answer = if closed_thought {
                     chat_template::sanitize_model_reply(&content)
                 } else {
-                    chat_template::sanitize_model_reply(&super::salvage_answer(&content))
+                    chat_template::sanitize_model_reply(&crate::decoder::salvage_answer(&content))
                 };
                 let secs = started.elapsed().as_secs_f64();
                 let stats = stats_line(total_tokens, total_steps, secs, out.stopped_on_eot);

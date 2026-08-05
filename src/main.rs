@@ -23,6 +23,8 @@ mod chat_template;
 mod config;
 #[cfg(target_os = "macos")]
 mod conversation;
+#[cfg(target_os = "macos")]
+mod decoder;
 mod delimiter;
 mod denoise_trace;
 mod dgq;

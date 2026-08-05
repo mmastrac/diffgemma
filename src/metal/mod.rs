@@ -90,7 +90,7 @@ pub use step_attn_dump::{run_step_attn_layer_dump, write_step_attn_layer_dump};
 pub use step_config::{log_validated_step_model, validate_step_model};
 pub use step_generate::{
     BlockOutcome, CancelToken, KvSnapshot, ProposedBlock, StepGenerateConfig, StepGenerateSession,
-    StepObserver, StepProgressEvent, TurnState, begin_turn, commit_block, finish_turn,
+    StepObserver, TurnState, begin_turn, commit_block, finish_turn,
     generate_monolithic, generate_with_session, propose_block,
 };
 pub use step_kernel::{

@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::chat::{ChannelIds, Stabilizer, TextDecoder};
+use crate::decoder::{ChannelIds, Stabilizer, TextDecoder};
 
 /// One streamed delta produced by the mapper, before OpenAI-envelope framing.
 #[derive(Debug, Clone, PartialEq)]
@@ -204,7 +204,7 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
         self.split(&all).content
     }
 
-    pub fn on_step(&mut self, ev: &crate::metal::StepProgressEvent<'_>) -> Vec<WireDelta> {
+    pub fn on_step(&mut self, ev: &crate::decoder::StepProgressEvent<'_>) -> Vec<WireDelta> {
         let mut out = Vec::new();
         if self.ended {
             return out;

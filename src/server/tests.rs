@@ -1,7 +1,7 @@
 //! Tests for `tests`, extracted from server.rs.
 
 use super::*;
-use crate::metal::StepProgressEvent;
+use crate::decoder::StepProgressEvent;
 
 /// Trivial decoder: printable-ASCII ids map to their char; others (special
 /// tokens) decode to nothing. Enough to exercise the id-level split logic.
