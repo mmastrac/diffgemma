@@ -1,4 +1,4 @@
-//! Live chat rendering, driven by the `ChatEvent` protocol (`chat_protocol`).
+//! Live chat rendering, driven by the `ChatEvent` protocol (`chat::event`).
 //!
 //! Two sinks consume the event stream:
 //! - **JSONL** (optional): every event as one JSON line, to a file (`--events`)
@@ -14,7 +14,7 @@
 //!   turn commits; the normal scrollback above it is untouched. The authoritative
 //!   reply is printed once, into real scrollback, at `finish` (see [`Viewport`]).
 
-use crate::chat_protocol::{ChatEvent, StreamDecoder};
+use super::{ChatEvent, StreamDecoder};
 use crate::metal::{StepObserver, StepProgressEvent};
 use crate::tokenizer::Tokenizer;
 use std::io::Write;

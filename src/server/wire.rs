@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::chat_protocol::TextDecoder;
+use crate::chat::TextDecoder;
 
 /// Consecutive-step repeats before a canvas position is treated as stable enough
 /// to stream (matches the terminal chat renderer's `STABLE_STREAK`).

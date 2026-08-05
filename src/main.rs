@@ -17,10 +17,9 @@ compile_error!(
 
 mod buffer;
 #[cfg(target_os = "macos")]
-mod chat_protocol;
+mod chat;
 mod chat_template;
 #[cfg(target_os = "macos")]
-mod chat_ui;
 mod config;
 #[cfg(target_os = "macos")]
 mod conversation;

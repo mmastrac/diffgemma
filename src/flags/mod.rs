@@ -26,7 +26,7 @@
 //! that are passed from the command line into `#[ignore]`d diagnostics
 //! (`DGQ_E15_PROMPT`, `DGQ_E8_PROMPT`, `DGQ_E16_CARRIER` in step_kv.rs — a
 //! crafted RuntimeConfig can't inject those), and the system-env fallbacks
-//! `XDG_CACHE_HOME`/`HOME` (pipeline_cache.rs) / `COLUMNS` (chat_ui.rs).
+//! `XDG_CACHE_HOME`/`HOME` (pipeline_cache.rs) / `COLUMNS` (chat::render).
 
 use std::cell::RefCell;
 use std::path::PathBuf;

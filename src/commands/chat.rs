@@ -284,7 +284,7 @@ impl Suggester {
                 let _ = p.print(format!("\x1b[90m⇥ {text}\x1b[0m"));
             }
             if let Some(mut w) = self.json_sink {
-                let ev = crate::chat_protocol::ChatEvent::Suggestion { turn, text };
+                let ev = crate::chat::ChatEvent::Suggestion { turn, text };
                 if serde_json::to_writer(&mut w, &ev).is_ok() {
                     let _ = w.write_all(b"\n");
                     let _ = w.flush();
@@ -770,7 +770,7 @@ fn split_reasoning(raw: &str, thinking: bool, seed: &str) -> (Option<String>, St
     if thinking
         && let Some((t, rest)) = raw.split_once("<channel|>")
     {
-        let thought = crate::chat_protocol::strip_thought_open(&format!("{seed}{t}"))
+        let thought = crate::chat::strip_thought_open(&format!("{seed}{t}"))
             .trim()
             .to_string();
         (Some(thought), rest.to_string())
@@ -891,11 +891,11 @@ impl TurnRunner<'_> {
             .as_ref()
             .filter(|_| !close)
             .map(|s| s.trim().to_string());
-        let stream = chat_ui::ChatStream::start(
+        let stream = crate::chat::ChatStream::start(
             std::sync::Arc::clone(self.tokenizer),
             self.step_cfg.stop_token_ids.clone(),
             self.interactive,
-            chat_ui::StreamDisplay {
+            crate::chat::StreamDisplay {
                 show_thinking: self.show_thinking && !close,
                 prethink_seed: open_seed,
                 stream_output: self.stream_output,
@@ -1056,11 +1056,11 @@ impl TurnRunner<'_> {
             // below (when `human`) own the display.
             let live = self.interactive && thinking;
             let stream = (live || self.want_json).then(|| {
-                chat_ui::ChatStream::start(
+                crate::chat::ChatStream::start(
                     std::sync::Arc::clone(self.tokenizer),
                     self.step_cfg.stop_token_ids.clone(),
                     live,
-                    chat_ui::StreamDisplay {
+                    crate::chat::StreamDisplay {
                         show_thinking: self.show_thinking,
                         prethink_seed: think_seed.map(str::to_string),
                         stream_output: self.stream_output,
@@ -1070,11 +1070,11 @@ impl TurnRunner<'_> {
                     prompt_len,
                 )
             });
-            self.step_cfg.step_observer = stream.as_ref().map(chat_ui::ChatStream::observer);
+            self.step_cfg.step_observer = stream.as_ref().map(crate::chat::ChatStream::observer);
             let out = pipeline_generate(self.pipeline, self.step_cfg, prompt)?;
             self.step_cfg.step_observer = None;
             let new_tokens = out.token_ids.len().saturating_sub(prompt_len);
-            let finish = |stream: Option<chat_ui::ChatStream>, reply: Option<&str>| {
+            let finish = |stream: Option<crate::chat::ChatStream>, reply: Option<&str>| {
                 if let Some(s) = stream {
                     s.finish(reply, new_tokens, out.denoise_steps_run, 0.0, out.stopped_on_eot);
                 }
@@ -1184,7 +1184,7 @@ impl TurnRunner<'_> {
                 }
                 if let Some(mut w) = self.sink() {
                     use std::io::Write as _;
-                    let ev = crate::chat_protocol::ChatEvent::Done {
+                    let ev = crate::chat::ChatEvent::Done {
                         tokens: 0,
                         steps: 0,
                         secs: 0.0,
@@ -1306,7 +1306,7 @@ pub(crate) fn run_chat_cmd(
     // `DGQ_RENDER_DEMO`: exercise the terminal renderer with synthetic events and
     // no model (terminal-choreography verification, e.g. under tmux).
     if let Ok(stage) = std::env::var("DGQ_RENDER_DEMO") {
-        chat_ui::render_demo(&stage);
+        crate::chat::render_demo(&stage);
         return ExitCode::SUCCESS;
     }
 
