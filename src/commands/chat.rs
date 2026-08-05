@@ -620,6 +620,9 @@ struct TurnRunner<'a> {
     /// `/show-thinking` / `/show-output` slash commands). Mutated between turns.
     show_thinking: bool,
     stream_output: bool,
+    /// Session variables set by a tool's `::set NAME=VALUE` output, referenced in
+    /// a `/prethink` seed as `$$NAME$$`. Persist across turns.
+    vars: std::collections::HashMap<String, String>,
 }
 
 /// How a turn's thinking channel is seeded when the prompt is assembled: the
@@ -665,14 +668,16 @@ struct Turn<'a> {
 }
 
 /// Expand a `/prethink` seed template against the turn: `$$last$$` -> the user's
-/// most recent message, `$$prompt$$` -> the system prompt (both empty if
-/// absent). Runs when the thinking channel is assembled, so the seed is
-/// computed from live turn state rather than fixed at command time.
+/// most recent message, `$$prompt$$` -> the system prompt, `$$NAME$$` -> a
+/// tool-set session variable (all empty if absent). Runs when the thinking
+/// channel is assembled, so the seed is computed from live turn state rather than
+/// fixed at command time.
 #[cfg(target_os = "macos")]
 fn expand_thinking(
     template: &str,
     history: &[chat_template::ChatTurn],
     system: Option<&str>,
+    vars: &std::collections::HashMap<String, String>,
 ) -> String {
     let last = history
         .iter()
@@ -680,9 +685,48 @@ fn expand_thinking(
         .find(|t| t.role == chat_template::ChatRole::User)
         .map(|t| t.content.as_str())
         .unwrap_or("");
-    template
+    let mut out = template
         .replace("$$last$$", last)
-        .replace("$$prompt$$", system.unwrap_or(""))
+        .replace("$$prompt$$", system.unwrap_or(""));
+    for (name, value) in vars {
+        out = out.replace(&format!("$${name}$$"), value);
+    }
+    out
+}
+
+/// A control directive a tool emits through its output, out of band from the
+/// text the model sees. One per trimmed line: `::end [reply]` ends the turn (with
+/// an optional final reply), `::set NAME=VALUE` sets a session variable.
+#[cfg(target_os = "macos")]
+enum ToolDirective {
+    End(String),
+    Set(String, String),
+}
+
+/// Split a tool's output into the model-facing text (directive lines removed) and
+/// the directives it carried.
+#[cfg(target_os = "macos")]
+fn parse_tool_directives(output: &str) -> (String, Vec<ToolDirective>) {
+    let mut content: Vec<&str> = Vec::new();
+    let mut directives = Vec::new();
+    for line in output.lines() {
+        let t = line.trim();
+        if t == "::end" {
+            directives.push(ToolDirective::End(String::new()));
+        } else if let Some(reply) = t.strip_prefix("::end ") {
+            directives.push(ToolDirective::End(reply.trim().to_string()));
+        } else if let Some(rest) = t.strip_prefix("::set ")
+            && let Some((name, value)) = rest.split_once('=')
+        {
+            directives.push(ToolDirective::Set(
+                name.trim().to_string(),
+                value.trim().to_string(),
+            ));
+        } else {
+            content.push(line);
+        }
+    }
+    (content.join("\n"), directives)
 }
 
 /// Split a seeded-thought generation at the model's `<channel|>`: returns the
@@ -784,10 +828,10 @@ impl TurnRunner<'_> {
         // sessions have no thought scaffold, so seeding is inert there.
         let (seed, close) = match thinking {
             Thinking::Seed(t) if !self.raw_prompt => {
-                (Some(expand_thinking(t, history, system)), false)
+                (Some(expand_thinking(t, history, system, &self.vars)), false)
             }
             Thinking::Prefilled(t) if !self.raw_prompt => {
-                (Some(expand_thinking(t, history, system)), true)
+                (Some(expand_thinking(t, history, system, &self.vars)), true)
             }
             _ => (None, false),
         };
@@ -946,7 +990,7 @@ impl TurnRunner<'_> {
         // The tool path seeds an open thought only; `/thought` (Prefilled) routes
         // to the plain generate path, never here.
         let seed = match thinking {
-            Thinking::Seed(t) => Some(expand_thinking(t, history, system)),
+            Thinking::Seed(t) => Some(expand_thinking(t, history, system, &self.vars)),
             Thinking::Off | Thinking::Prefilled(_) => None,
         };
         let started = std::time::Instant::now();
@@ -1088,16 +1132,31 @@ impl TurnRunner<'_> {
             messages.push(serde_json::json!({
                 "role": "assistant", "content": "", "tool_calls": oai,
             }));
+            let mut ended: Option<String> = None;
             for (i, call) in calls.iter().enumerate() {
                 let input = match call.arguments.get("input") {
                     Some(serde_json::Value::String(s)) => s.clone(),
                     Some(v) => v.to_string(),
                     None => String::new(),
                 };
-                let output = match self.shell_tools.iter().find(|t| t.name == call.name) {
+                let raw_output = match self.shell_tools.iter().find(|t| t.name == call.name) {
                     Some(t) => run_shell_tool(t, &call.arguments),
                     None => format!("error: no tool named '{}'", call.name),
                 };
+                // A tool steers the session out of band via `::` directive lines;
+                // the rest is the result the model sees.
+                let (output, directives) = parse_tool_directives(&raw_output);
+                for d in directives {
+                    match d {
+                        ToolDirective::Set(name, value) => {
+                            if human {
+                                println!("  · set {name} = {}", preview(&value, 60));
+                            }
+                            self.vars.insert(name, value);
+                        }
+                        ToolDirective::End(reply) => ended = Some(reply),
+                    }
+                }
                 if !self.json {
                     let head = format!("tool> {}({})", call.name, preview(&input, 48));
                     match output.trim_end() {
@@ -1119,6 +1178,28 @@ impl TurnRunner<'_> {
                 }
                 messages.push(msg);
             }
+            // A tool ended the turn: use its reply as the final answer instead of
+            // generating another round.
+            if let Some(reply) = ended {
+                if human && !reply.is_empty() {
+                    println!("model> {reply}");
+                }
+                if let Some(mut w) = self.sink() {
+                    use std::io::Write as _;
+                    let ev = crate::chat_protocol::ChatEvent::Done {
+                        tokens: 0,
+                        steps: 0,
+                        secs: 0.0,
+                        stopped: true,
+                        text: reply.clone(),
+                    };
+                    if serde_json::to_writer(&mut w, &ev).is_ok() {
+                        let _ = w.write_all(b"\n");
+                        let _ = w.flush();
+                    }
+                }
+                return Ok(reply);
+            }
         }
         if !self.json {
             println!("model> (stopped after {MAX_ROUNDS} tool rounds without a final answer)");
@@ -1137,7 +1218,7 @@ impl TurnRunner<'_> {
         thought: Option<&str>,
         reply: &str,
     ) -> Result<(String, Option<String>), crate::Error> {
-        let thought = thought.map(|t| expand_thinking(t, history, system));
+        let thought = thought.map(|t| expand_thinking(t, history, system, &self.vars));
         if !self.json {
             if let Some(t) = &thought {
                 println!("\x1b[90mthink> {}\x1b[0m", t.trim());
@@ -1399,6 +1480,7 @@ pub(crate) fn run_chat_cmd(
         seed,
         show_thinking,
         stream_output,
+        vars: std::collections::HashMap::new(),
     };
 
     // Set after any completed turn: the next idle moment should draft a fresh
@@ -1926,9 +2008,9 @@ pub(crate) fn run_chat_cmd(
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::{
-        JsonInput, expand_file_markers, expand_thinking, json_command_to_line, parse_tool_spec,
-        run_shell_tool, salvage_answer, split_reasoning, split_thought, tab_fill_text,
-        tool_declaration,
+        JsonInput, ToolDirective, expand_file_markers, expand_thinking, json_command_to_line,
+        parse_tool_directives, parse_tool_spec, run_shell_tool, salvage_answer, split_reasoning,
+        split_thought, tab_fill_text, tool_declaration,
     };
     use crate::tools::parse_tool_calls;
     use crate::chat_template::ChatTurn;
@@ -2010,20 +2092,43 @@ mod tests {
             ChatTurn::model("an answer"),
             ChatTurn::user("what about New York?"),
         ];
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("mood".to_string(), "tense".to_string());
         let out = expand_thinking(
-            "The user asked: $$last$$. Persona: $$prompt$$.",
+            "The user asked: $$last$$. Persona: $$prompt$$. Mood: $$mood$$.",
             &history,
             Some("be terse"),
+            &vars,
         );
         assert_eq!(
             out,
-            "The user asked: what about New York?. Persona: be terse."
+            "The user asked: what about New York?. Persona: be terse. Mood: tense."
         );
         // Missing system / no user turn -> empty substitutions, no panic.
-        assert_eq!(expand_thinking("[$$prompt$$]", &history, None), "[]");
-        assert_eq!(expand_thinking("$$last$$", &[], None), "");
+        let empty = std::collections::HashMap::new();
+        assert_eq!(expand_thinking("[$$prompt$$]", &history, None, &empty), "[]");
+        assert_eq!(expand_thinking("$$last$$", &[], None, &empty), "");
         // A template with no placeholders passes through.
-        assert_eq!(expand_thinking("plain seed", &history, None), "plain seed");
+        assert_eq!(
+            expand_thinking("plain seed", &history, None, &empty),
+            "plain seed"
+        );
+    }
+
+    #[test]
+    fn parse_tool_directives_splits_control_from_content() {
+        // A pure directive: no model-facing content.
+        let (content, dirs) = parse_tool_directives("::end Ready.");
+        assert_eq!(content, "");
+        assert!(matches!(&dirs[..], [ToolDirective::End(r)] if r == "Ready."));
+        // Mixed: the scene text survives, the set is consumed.
+        let (content, dirs) = parse_tool_directives("A dim bistro.\n::set scene=A dim bistro.");
+        assert_eq!(content, "A dim bistro.");
+        assert!(matches!(&dirs[..], [ToolDirective::Set(n, v)] if n == "scene" && v == "A dim bistro."));
+        // Bare end, and a non-directive `::` line stays content.
+        let (content, dirs) = parse_tool_directives("::end\n::not a directive");
+        assert_eq!(content, "::not a directive");
+        assert!(matches!(&dirs[..], [ToolDirective::End(r)] if r.is_empty()));
     }
 
     #[test]
