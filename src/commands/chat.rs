@@ -977,29 +977,37 @@ impl TurnRunner<'_> {
             self.step_cfg.max_new_tokens = self.explicit_cap.map_or(budget, |c| c.min(budget));
             self.step_cfg.seed = self.seed.wrapping_add(turn_idx).wrapping_add(round as u64);
 
-            // Stream the thinking live when seeded; otherwise generate quietly.
-            let out = if let Some(s) = think_seed {
-                let stream = chat_ui::ChatStream::start(
+            // A stream drives the JSON sink (its observer streams events, `finish`
+            // closes with `Done`) and, when seeded on an interactive tty, the
+            // dimmed thinking preview. Without either, generate quietly; the
+            // `println!`s below own the human display.
+            let live = self.interactive && think_seed.is_some();
+            let stream = (live || self.want_json).then(|| {
+                chat_ui::ChatStream::start(
                     std::sync::Arc::clone(self.tokenizer),
                     self.step_cfg.stop_token_ids.clone(),
-                    self.interactive,
+                    live,
                     chat_ui::StreamDisplay {
                         show_thinking: false,
-                        prethink_seed: Some(s.to_string()),
+                        prethink_seed: think_seed.map(str::to_string),
                         stream_output: self.stream_output,
                     },
-                    None,
+                    self.sink(),
                     turn_idx,
                     prompt_len,
-                );
-                self.step_cfg.step_observer = Some(stream.observer());
-                let out = pipeline_generate(self.pipeline, self.step_cfg, prompt)?;
-                self.step_cfg.step_observer = None;
-                stream.finish("", 0, out.denoise_steps_run, 0.0, out.stopped_on_eot);
-                out
-            } else {
-                self.step_cfg.step_observer = None;
-                pipeline_generate(self.pipeline, self.step_cfg, prompt)?
+                )
+            });
+            self.step_cfg.step_observer = stream.as_ref().map(chat_ui::ChatStream::observer);
+            let out = pipeline_generate(self.pipeline, self.step_cfg, prompt)?;
+            self.step_cfg.step_observer = None;
+            let new_tokens = out.token_ids.len().saturating_sub(prompt_len);
+            // The interactive preview reprints via the `println!`s below, so its
+            // `Done` carries no text; a JSON-only stream carries the real reply.
+            let close = |stream: Option<chat_ui::ChatStream>, body: &str| {
+                if let Some(s) = stream {
+                    let text = if live { "" } else { body };
+                    s.finish(text, new_tokens, out.denoise_steps_run, 0.0, out.stopped_on_eot);
+                }
             };
 
             let new_ids =
@@ -1021,6 +1029,7 @@ impl TurnRunner<'_> {
             let calls = crate::tools::parse_tool_calls(&content);
             if calls.is_empty() {
                 let answer = chat_template::sanitize_model_reply(&content);
+                close(stream, &answer);
                 if !self.json {
                     if answer.is_empty() {
                         println!("model> (empty response)");
@@ -1035,6 +1044,7 @@ impl TurnRunner<'_> {
             let preamble = chat_template::sanitize_model_reply(
                 &crate::tools::content_before_tool_calls(&content),
             );
+            close(stream, &preamble);
             if !self.json && !preamble.trim().is_empty() {
                 println!("model> {}", preamble.trim());
             }
