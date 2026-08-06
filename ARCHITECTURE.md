@@ -77,26 +77,17 @@ coordinate such a pair (37.5% of doubled-delimiter states resolve by both
 positions correcting at once, n=16, rejecting a coordinated null at
 p=0.003).
 
-## Two attention phases, one set of weights
+## The loop in one paragraph
 
-- **Causal prefill (encoder role)**: the prompt — and later each committed
-  block — is processed with standard causal attention to build the KV cache.
-- **Bidirectional denoise (decoder role)**: canvas positions attend causally
-  to the KV cache and fully/symmetrically to each other.
-
-## The entropy-bound sampler
-
-After each denoising forward, per-position prediction entropy decides which
-positions are kept; the rest are re-noised. Low entropy = the model has made
-up its mind. Production config (generation_config.json): entropy bound 0.1
-nats, max 48 steps, linear temperature decay 0.8 → 0.4, early stop on
-stable-and-confident canvases. ~15–20 tokens commit per forward in practice.
-
-## Block-autoregressive chaining
-
-Once a canvas converges it is committed, causally prefilled to extend the KV
-cache, and a fresh canvas begins. Left-to-right at block level; blocks are
-immutable once committed.
+One set of weights serves two attention phases: **causal prefill** builds the
+KV cache from the prompt (and from each committed block), then
+**bidirectional denoise** refines a canvas that attends causally to the cache
+and symmetrically to itself. After each denoising forward, per-position
+prediction entropy decides which positions are kept and which are re-noised —
+low entropy means the model has made up its mind, and ~15–20 tokens commit
+per forward. A converged canvas is committed, causally prefilled to extend the
+cache, and a fresh canvas begins; blocks are immutable once committed. Part II
+§2, §6 and §7 give the exact contract for each of those three pieces.
 
 ## Quality tradeoffs
 
@@ -338,6 +329,19 @@ transform (quantized) and can only ever live in a pack's own blob.
 per tensor CLASS on top of a chosen profile, for mixed-precision experiment
 arms that don't fit a canned profile.
 
+**Every tensor's canonical offset is 64-byte aligned, unconditionally, in
+every pack** — a hard GPU-correctness requirement, not a packing nicety:
+`gemm_rowk.metal` and structurally identical kernels reinterpret
+`blob + w_off` as `device const ushort *` (feeding `half4`/`simdgroup_load`
+tiles) and index it, which is only well-defined for a sufficiently aligned
+`w_off`. A writer variant that relaxed this produced a pack with
+byte-IDENTICAL tensor content that generated garbage from decoder layer 1
+onward: a misaligned typed read is silently wrong while every byte-granular
+check stays green, because those are untyped reads. Golden caught it; nothing
+byte-level can. `assert_tensor_offset_alignment` (`src/metal/dgq_gpu.rs`)
+enforces it at `DgqGpuBlob::from_store` for every pack and refuses to load
+before any GPU buffer is created.
+
 ### 8.2 Custom quantization classes (`--set`)
 
 `quantize --profile BASE --set class=format [--set class=format ...]`
@@ -348,77 +352,51 @@ override map for a tensor `tensor_class` maps to a class, and every other
 tensor (including every locked one) falls through to `classify_tensor`
 unchanged.
 
-**Classes** (`TensorClass`, name/shape patterns independent of any profile):
-`experts` (`.experts.` 3D stacks; expands to both `experts.gate_up` and
-`experts.down`, addressable separately), `attn` (decoder `self_attn`
-q/k/v/o_proj), `dense` (decoder dense-FFN gate/up/down), `vision` (vision-
-tower `self_attn`/`mlp` linears + `embed_vision.embedding_projection` —
-inert today, see below), `sc` (the 3 self-conditioning MLP tensors).
+**Classes and their legal formats** (`TensorClass`; enforced at CLI parse
+time by `supported_formats`, before the source model is opened). A class only
+accepts formats the step-kernel runtime has a compiled kernel for:
 
-**Formats**: `raw`, `q4`, `q6`, `q8`, `nvfp4` — the existing block codecs,
-no new ones. Each class only accepts the formats the step-kernel runtime has
-a compiled kernel for (`TensorClass::supported_formats`), checked at CLI
-parse time (before the source model is even opened):
-- `experts`/`experts.gate_up`/`experts.down`: q4, q6, nvfp4 (block-sparse
-  grouped GEMM). Not raw/q8 — those would silently fall back to the scalar
-  per-expert kernel, which is a probe/oracle surface only, never a
-  production dispatch path.
-- `attn`/`dense`/`sc`: raw, q8, q4, nvfp4 (dense-linear GEMM). Not q6 — q6
-  dequant is wired into the block-SPARSE (expert) kernel body only; the
-  dense-linear kernel has no q6 branch. `--set attn=q6` is rejected with
-  this reason rather than silently mis-dispatching.
-- `vision`: all five. The vision tower is not wired into the step-kernel
-  forward pass at all (no source file references `vision_tower` /
-  `embed_vision`) — any codec is a pure disk-size lever until a vision
-  forward path exists.
+| Class | Tensors | Formats | Why not the others |
+|---|---|---|---|
+| `experts` (also `experts.gate_up` / `experts.down`) | `.experts.` 3D stacks | q4, q6, nvfp4 | raw/q8 would silently fall back to the scalar per-expert kernel — a probe/oracle surface, never a production dispatch path |
+| `attn` | decoder `self_attn` q/k/v/o_proj | raw, q8, q4, nvfp4 | q6 dequant is wired into the block-SPARSE kernel body only; the dense-linear kernel has no q6 branch |
+| `dense` | decoder dense-FFN gate/up/down | raw, q8, q4, nvfp4 | as `attn` |
+| `sc` | the 3 self-conditioning MLP tensors | raw, q8, q4, nvfp4 | as `attn` |
+| `vision` | vision-tower linears + `embed_vision.embedding_projection` | all five | inert: no forward path references the vision tower, so any codec is a pure disk-size lever |
 
 `experts.gate_up` and `experts.down` must resolve to the SAME format if both
-are set: the batched grouped-GEMM dispatch and blob-byte math key on one
-shared value (`StepBlockProfile`, below) — splitting them independently
-would need per-stack format plumbing through the MoE encode path, which is
-deferred (not needed by any shipped arm yet).
+are set — the batched grouped-GEMM dispatch and blob-byte math key on one
+shared `StepBlockProfile`.
 
 **Locked classes** — not knobs, fatal if targeted, reason printed:
 `embed`/`embed_tokens` (tied to the lm_head and SC soft-embed; bf16 keeps
-tail-token logits sharp), `router` (routing decisions are precision-
-sensitive; the tensors are tiny), `norms`/`layer_scalar` (tiny,
-precision-sensitive scale vectors). `tensor_class` never maps a locked
-tensor to a `TensorClass` at all, so no override can reach one even by
-accident; `--set` additionally rejects the locked names outright with the
-reason above.
+tail-token logits sharp), `router` (routing is precision-sensitive, tensors
+are tiny), `norms`/`layer_scalar` (same). `tensor_class` never maps a locked
+tensor to a `TensorClass` at all, so no override can reach one by accident.
 
-**Validation, before any bytes are written**: dimension constraints per
-resolved (tensor, format) — q4/q6 need K (last dim) a multiple of 32, nvfp4
-a multiple of 16, q8 needs rank 2 (`validate_format_dims`). An invalid
-combo names the offending tensor and fails before the output dir exists.
+**Validation before any bytes are written**: dimension constraints per
+resolved (tensor, format) — q4/q6 need K a multiple of 32, nvfp4 a multiple
+of 16, q8 needs rank 2 (`validate_format_dims`). An invalid combo names the
+offending tensor and fails before the output dir exists.
 
-**Manifest**: `DgqManifest::custom_classes` (`BTreeMap<String, String>`,
-e.g. `{"attn": "nvfp4_block"}`) records the resolved overrides actually
-applied, alongside the unchanged `profile` base. It is purely descriptive —
-the loader never consults it. Every tensor's `kind` is self-sufficient for
-dispatch (`DgqStore::tensor_bytes`/`tensor_f32` and the step-kernel's
-per-tensor `parse_quant_kind` reads), so a binary that predates this field
-still loads a custom pack correctly; it just can't print the class map. The
-manifest version is bumped to `DGQ_VERSION_NVFP4` whenever an nvfp4 tensor
-is actually PRESENT (checked over the resolved kinds, not `profile`) so a
-pre-nvfp4 binary still refuses rather than misreads — the same gate a plain
-`--profile nvfp4` pack already relies on.
+**Manifest**: `DgqManifest::custom_classes` records the resolved overrides
+alongside the unchanged `profile` base, purely descriptively — the loader
+never consults it, because every tensor's `kind` is self-sufficient for
+dispatch. The manifest version bumps to `DGQ_VERSION_NVFP4` whenever an nvfp4
+tensor is actually PRESENT (checked over resolved kinds, not `profile`), so a
+pre-nvfp4 binary refuses rather than misreads.
 
 **Runtime dispatch reads the manifest, never `profile`**: the step-kernel
-runtime (`src/metal/step_kernel/build.rs`) derives THREE independent
-formats from the tensors it actually finds — `attn_format`/`dense_format`
+runtime (`src/metal/step_kernel/build.rs`) derives THREE independent formats
+from the tensors it actually finds — `attn_format` / `dense_format`
 (`DenseWeightFormat`: bf16 / q8 / block(q4 or nvfp4), from the q_proj /
 mlp.gate_proj kind respectively) and the expert `StepBlockProfile` (from the
-gate_up kind, asserted equal to down's). Before this generalization
-(`src/metal/step_quant.rs`), the runtime derived one shared format from
-`QuantProfile` alone and assumed attention and dense-FFN always matched the
-experts' format — true for every profile-only pack, but wrong the instant a
-custom pack puts attention in a different format than the experts (or than
-dense-FFN). `QuantProfile::Nvfp4Experts` (the `nvfp4x` profile) was the
-special-cased instance of exactly this need before `--set` existed; it
-still deserializes (old `nvfp4x`-profile manifests keep loading), but
-`quantize --profile nvfp4x` now simply expands to `--profile q4 --set
-experts=nvfp4` — the general mechanism replaces the special case.
+gate_up kind, asserted equal to down's). Deriving them per tensor rather than
+from one shared `QuantProfile` is what makes a mixed pack dispatchable at all:
+a profile-derived format silently assumes attention, dense-FFN, and experts
+all match. `QuantProfile::Nvfp4Experts` still deserializes so old `nvfp4x`
+manifests keep loading, but `quantize --profile nvfp4x` now expands to
+`--profile q4 --set experts=nvfp4`.
 
 **Tooling**: `quantize --set ... --overlay` composes with layered overlays
 (§8.1) unchanged — a tensor class switched from raw to a quantized format
@@ -429,92 +407,54 @@ same as any other Raw→quantized transition; `--set` only changes what
 
 ### 8.1 Layered / overlay packs
 
-A `.dgq` pack is either **self-contained** (every tensor's bytes live in its
-own `model.dgq.bin`, `DgqTensorMeta::source == None` — the only shape before
-this section, and still the default `quantize` output) or **layered**: some
-entries carry a `source` redirecting to where their bytes actually live.
-`DgqManifest::is_layered()` is `true` iff any entry has one.
+A `.dgq` pack is either **self-contained** (every tensor's bytes in its own
+`model.dgq.bin`, `DgqTensorMeta::source == None` — the default `quantize`
+output and the only shape that ships to users) or **layered**: some entries
+carry a `source` saying where their bytes actually live.
+`DgqManifest::is_layered()` is true iff any entry has one.
 
-- **`TensorSource::Local { local_offset }`** — bytes are in this pack's own
-  (compact) blob, at a DIFFERENT position than the entry's canonical
-  `offset` (a layered pack's local blob has no gaps for tensors it doesn't
-  store).
-- **`TensorSource::External { file, offset }`** — bytes are in an external
-  file, keyed into `DgqManifest::external_files` (role `hf_safetensors`: a
-  shard inside the pinned `base_model` HF snapshot; role `pack_bin`: another
-  pack's blob). `offset` is the byte offset **within that file**.
+- **`TensorSource::Local { local_offset }`** — in this pack's own compact
+  blob, at a different position than the entry's canonical `offset` (a
+  layered pack's blob has no gaps for tensors it doesn't store).
+- **`TensorSource::External { file, offset }`** — in an external file keyed
+  into `DgqManifest::external_files` (role `hf_safetensors`: a shard in the
+  pinned `base_model` HF snapshot; role `pack_bin`: another pack's blob).
 
-The entry's own `offset`/`byte_len` stay the single addressing contract
-every downstream consumer uses unchanged (`build_offsets_from_store`'s
-`w_off` constants, `DgqGpuBlob::buffer_for`, the split-blob region math) —
-they describe a **canonical unified address space**, identical in shape to
-what a self-contained pack's blob would have been, regardless of where the
-bytes are actually sourced from. `source` only tells the loader where to
-copy FROM; it never changes what any consumer reads offsets AGAINST.
+**The addressing contract is unchanged by layering.** An entry's own
+`offset`/`byte_len` describe a canonical unified address space, identical in
+shape to what a self-contained pack's blob would have been. `source` only
+tells the loader where to copy FROM; it never changes what any consumer reads
+offsets AGAINST (`build_offsets_from_store`'s `w_off` constants,
+`DgqGpuBlob::buffer_for`, the split-blob region math).
 
-**Overlay packs**: today's only layered pack shape. Every Raw tensor becomes
-an `External` ref into the HF base's safetensors shards (byte-identical
-bf16, so no requantization); every quantized/transformed tensor (experts,
-SC q8) stays `Local` in a small blob holding only those bytes (~13.3 GiB for
-the shipped q4 profile, vs. ~18.84 GiB self-contained). The HF base lives
-only in the user's `~/.cache/huggingface` (`hf download
-google/diffusiongemma-26B-A4B-it`); `external_files` pins each referenced
-shard's exact byte size and a `header_sha256` (hash of the 8-byte header
-length + header JSON — not the multi-GiB payload) so a stale or wrong cache
-fails loud with the exact `hf download` command to fix it
-(`src/dgq/hf_resolve.rs`; cache root: `DGQ_HF_HOME` → `HF_HOME` →
-`~/.cache/huggingface`).
+**Overlay packs** are today's only layered shape: every Raw tensor becomes an
+`External` ref into the HF base's safetensors shards (byte-identical bf16, so
+no requantization), every quantized tensor stays `Local` in a small blob
+(~13.3 GiB for the q4 profile vs ~18.84 GiB self-contained). `external_files`
+pins each shard's byte size and a `header_sha256` (the header only, not the
+multi-GiB payload) so a stale cache fails loud with the exact `hf download`
+command to fix it (`src/dgq/hf_resolve.rs`; cache root `DGQ_HF_HOME` →
+`HF_HOME` → `~/.cache/huggingface`).
 
-**Loading**: at open, `DgqGpuBlob::from_store` resolves every external
-file, then assembles the canonical address space from two regions. The
-expert tail `[expert_split, total)` is offset-mmap'd DIRECTLY off the pack's
-own blob at `local_expert_split` (the writer lays the local expert region
-out byte-identical to the canonical tail, 16384-aligned) — never copied,
-file-backed clean pages, shared and evictable. The raw head
-`[0, expert_split)` is gather-copied at canonical offsets into a private
-anonymous mapping on every load (`materialize_layered_head_only`) — an
-ACCEPTED per-load cost (~5.5 GiB dirty pages, a few seconds from page
-cache) for what layered packs are: local dev tooling for experiment arms.
-Distribution is monolithic (plain file-backed mmap, none of this applies);
-a dev machine loading overlay arms simply pays the materialize. A manifest
-with no `local_expert_split` (oldest layered packs) takes the whole-blob
-`materialize_layered_blob` fallback instead — same math, head AND tail
-gathered. Either way the head is ONE base pointer + length, which is all
-`host_ptr` and the no-copy `MTLBuffer` wrap need.
+**Loading** assembles the canonical space from two regions: the expert tail
+`[expert_split, total)` is offset-mmap'd directly off the pack's own blob at
+`local_expert_split` (never copied — file-backed, clean, evictable), and the
+raw head `[0, expert_split)` is gather-copied into a private anonymous
+mapping on every load (`materialize_layered_head_only`, ~5.5 GiB of dirty
+pages). That per-load copy is an accepted cost for what layered packs are:
+dev tooling for experiment arms. Distribution is monolithic and pays none of
+it. Oldest layered packs (no `local_expert_split`) take the whole-blob
+`materialize_layered_blob` fallback — same math, head and tail both gathered.
 
-**Every tensor's canonical offset is 64-byte aligned, unconditionally** —
-a hard GPU-correctness requirement: `gemm_rowk.metal` and structurally
-identical kernels reinterpret `blob + w_off` as `device const ushort *`
-(feeding `half4`/`simdgroup_load` tiles) and index it, which is only
-well-defined for a sufficiently aligned `w_off`. A (since-removed) writer
-variant that relaxed this produced a pack with byte-IDENTICAL tensor
-content that generated garbage from decoder layer 1 onward: the GPU's typed
-read at a misaligned `w_off` is silently wrong while every byte-granular
-check (`host_ptr` vs `DgqStore::tensor_bytes`, both untyped reads) stays
-green. Golden caught it; nothing byte-level can.
-
-**Load-time tripwire**: `assert_tensor_offset_alignment`
-(`src/metal/dgq_gpu.rs`) checks every tensor's canonical offset against the
-64-byte requirement unconditionally at `DgqGpuBlob::from_store` — for EVERY
-pack, not just layered ones — and refuses to load (loud, before any GPU
-buffer is created) rather than silently producing wrong output.
-
-**Retired: VA-splice head** (built and removed 2026-07-30; see commits
-374b0f5/db940d0 and their revert for the full mechanism). Serving the head
-zero-copy by MAP_FIXED-splicing HF shard ranges into one reserved VA range
-under a single no-copy `MTLBuffer` was mechanically VALIDATED — Metal
-accepts a no-copy buffer spanning multiple distinct mappings, compute-
-shader readback bit-exact across seams at 3×512 MiB (an undocumented-
-behavior probe existed at `src/metal/va_splice_probe.rs`; recover it from
-git history if this is ever revisited). It was removed because coverage on
-the real model is ZERO: splicing requires `canonical ≡ file (mod 16384)`
-page congruence, the 64-byte invariant above forces `canonical ≡ 0 (mod
-64)`, and both hold only when a shard run's own file offset is a multiple
-of 64 — an ~1-in-64 draw per shard (safetensors header lengths are
-arbitrary mod 64) that came up zero across all 11 shards. Reviving it
-requires first auditing every Raw-weight kernel's true minimum alignment
-(a floor below 64 reopens the odds); until someone needs that, the simple
-materialize wins on maintenance grounds.
+**Why the head is copied, not spliced**: serving it zero-copy by
+MAP_FIXED-splicing HF shard ranges into one reserved VA range was built,
+mechanically validated (Metal does accept a no-copy buffer spanning multiple
+mappings), and removed — coverage on the real model is ZERO. Splicing needs
+`canonical ≡ file (mod 16384)` page congruence while the 64-byte invariant
+above forces `canonical ≡ 0 (mod 64)`, which together hold only when a shard's
+own file offset is a multiple of 64: an ~1-in-64 draw per shard that came up
+zero across all 11. Reviving it means first auditing every Raw-weight kernel's
+true minimum alignment, since a floor below 64 reopens the odds.
 
 **Tooling**: `repack --overlay -m PACK -o DIR` splits an existing
 self-contained pack: it verifies each Raw tensor's bytes are byte-identical
@@ -549,10 +489,9 @@ are local-only dev tooling for experiment arms (`quantize --overlay`,
 | 6 | Sparse SC soft-embed (survivor gather) | ours only (approximate) | ~16%/step; output-level equivalent to MLX-4bit; exact chunked path is one flag away |
 | 7 | Length-heuristic prefill (engine f32 ≤ 256 tokens) | ours only | §3 — quality + wall-clock; MLX prefills one way |
 | 8 | Canvas init RNG (seeded LCG) | different RNG than mx.random | noise is noise; parity tooling pins exact canvases via `initial_canvas_ids` |
-| 9 | Entropy accept + stop thresholds in nats | same as MLX (natural log) | noted because prose sometimes says "bits" — the code is nats everywhere |
-| 10 | Entropy-only early stop (mean H < 0.05, §6) | ours only | tail steps only micro-flip near-ties; census cost = creative-tail only |
-| 11 | Degenerate-first-block re-roll + shrink-on-retry | ours only | empty-reply attractor is intrinsic; deterministic per seed; no-op on good replies |
-| 12 | Commit-time confidence trim, dup tier (`DGQ_COMMIT_CONF_TRIM=0.9`, §6) | ours only | a proposed block is cut at the first answer-region row that is BOTH below τ and argmax-duplicating a neighbour — an unresolved row copies its neighbour, so the tail re-denoises next block against committed context. Default ON; never fires on a golden case (golden 8/8 byte-identical). Enables the `max_blocks *= 2` token-budget headroom. The UNCONDITIONAL hard tier is the separate `DGQ_COMMIT_CONF_HARD`, still OFF |
+| 9 | Entropy-only early stop (mean H < 0.05, §6) | ours only | tail steps only micro-flip near-ties; census cost = creative-tail only |
+| 10 | Degenerate-first-block re-roll + shrink-on-retry | ours only | empty-reply attractor is intrinsic; deterministic per seed; no-op on good replies |
+| 11 | Commit-time confidence trim, dup tier (`DGQ_COMMIT_CONF_TRIM=0.9`, §6) | ours only | a proposed block is cut at the first answer-region row that is BOTH below τ and argmax-duplicating a neighbour — an unresolved row copies its neighbour, so the tail re-denoises next block against committed context. Default ON; never fires on a golden case (golden 8/8 byte-identical). Enables the `max_blocks *= 2` token-budget headroom. The UNCONDITIONAL hard tier is the separate `DGQ_COMMIT_CONF_HARD`, still OFF |
 
 ## 10. Validation harnesses
 
@@ -568,19 +507,17 @@ are local-only dev tooling for experiment arms (`quantize --overlay`,
 - **Executable correctness** (`census --battery programmatic`): the reply is
   compiled (rust) or syntax-checked (python, bash) and RUN against fixture
   cases; stdout and exit code must both match. The only harness that judges
-  whether output is executably correct rather than textually plausible.
-  Three outcome states — `compile_fail` / `wrong_output` / `pass` — are kept
-  distinct because well-formed-but-wrong is a different finding from
-  unparseable; their sharpness is language-dependent, so compare
-  `compile_fail` within a language, not across (`bash -n` accepts prose).
-  A probe fails on any of three independent axes: a wrong case, a blown step
-  budget, or a markdown fence — every prompt forbids fences, so a fenced
-  reply disobeyed an explicit instruction. The fence is still stripped and
-  the program still run, so a fenced-but-correct probe reports full case
-  credit beside a failed verdict, and `fenced%` keeps the rate visible.
-  Each case runs in a fresh temp cwd
-  under a hard 10 s timeout with captured pipes: a hanging generated program
-  is a failed case, never a wedged machine.
+  whether output is executably correct rather than textually plausible. Three
+  outcome states (`compile_fail` / `wrong_output` / `pass`) stay distinct
+  because well-formed-but-wrong is a different finding from unparseable —
+  compare `compile_fail` within a language, never across (`bash -n` accepts
+  prose). A probe fails on any of three independent axes: a wrong case, a
+  blown step budget, or a markdown fence (every prompt forbids fences, so a
+  fenced reply disobeyed an instruction — the fence is still stripped and the
+  program still run, so `fenced%` keeps the rate visible beside full case
+  credit). Each case runs in a fresh temp cwd under a hard 10 s timeout with
+  captured pipes: a hanging generated program is a failed case, never a wedged
+  machine.
 - **Smoketest gate** (`smoketest`, fixtures/smoketest/prompts.json): 12
   adherence + 5 convergence prompts; spec seed 7. Multi-seed aggregate
   {7,42,123} judges trajectory-reshuffling changes.
@@ -710,8 +647,11 @@ artifact.
 - **KV cache: f16.** Range-checked (max|KV| ≈ 22 vs f16 max 65504); f16's 10
   mantissa bits beat bf16's 7 across the live range, and f16 lets the MMA
   attention kernels `simdgroup_load` K/V straight from device memory — the
-  long-context attention enabler. q8 KV (group-32) auto-enables at very long
-  context as a MEMORY lever (`kv_q8(max_seq)`, `DGQ_KV_Q8` overrides).
+  long-context attention enabler. **q8 KV is wired but does not work**:
+  `kv_format(max_seq)` auto-selects group-32 q8 once estimated f16 resident
+  exceeds 85% of the GPU working-set cap (~178k tokens on 36 GB), and that
+  path goes NaN after layer 0 on fast prefill. No gate reaches the crossover,
+  so it has never run in production. `DGQ_KV_Q8=0` forces f16. Open v1 item.
 - **Always-f32**: moeout plane, rowstats planes, MoE grouped scratch, router
   logits.
 - The real hazard is producer/consumer dtype mismatch, not dtype choice
@@ -745,7 +685,8 @@ artifact.
   decode from ~4.4 to ~1.8 s/step — ~3.9× vs MLX generation (see README).
   The dense `mma_full` fallback was the wrong decode kernel at this depth.
 - Memory: single 36 GB machine is NOT swap-bound to 105k; the cliff is
-  ~262k f16 KV (q8-auto covers it) or running beside another model.
+  ~262k f16 KV or running beside another model. Nothing covers past the cliff
+  today — q8 KV is the intended lever and does not work.
 
 ---
 
@@ -760,39 +701,25 @@ planning perf or quality work; the machinery for several survives behind
 opt-in flags for A/B.
 
 **Speed levers, disproven by regime:**
-- **int8/int4 dot-product MoE expert GEMM (E18 redirect)** — built a real
-  int8-accumulated block-sparse MoE expert GEMM (`gemm_int_sparse`) and benched
-  it head-to-head vs the production q4→half-MMA path at real MoE shapes
-  (128 experts, gate_up 1408×2816 + down 2816×704, rpe 64/16). Correctness
-  gated FIRST (cos=1.000000 vs CPU int8 oracle at every tile). Measured: int8 =
-  ~0.43 TFLOP/s vs production = ~3.78 TFLOP/s (~9× slower as built). **RECORD
-  CORRECTED (audit reproduced 0.438 TF/s / 9.70×, then decomposed
-  one variable at a time; `debug/review_2026-07-16.md` Part 2): the honest bar
-  for a FUTURE attempt is 5.6×, not 9×, and the mechanism on record was a
-  curve fit.** The 9.7× multiplies THREE factors: **1.72×** = the prototype's
-  own un-register-blocked inner loop (operands re-fetched from tgmem per
-  (i,j); the baseline it was benched against hoists A/B into registers —
-  384 vs 80 tgmem loads per lane per BK=32; register-blocking measured
-  0.755 TF/s), × **2.22×** = int32-multiply vs f32-mad on M3 (the REAL
-  specifically-int8 hardware penalty, never identified in the original
-  write-up), × **2.54×** = what simdgroup-MMA is actually worth vs scalar f32
-  (NOT the ~9× the old entry claimed — the 512-vs-4 MAC arithmetic implies ~4×
-  and cannot produce 9×; it "matched exactly" only by silently absorbing the
-  other two factors). **CONCLUSION UNCHANGED — dead end, do NOT re-test**: a
-  perfectly register-blocked int8 kernel is still 5.6× off, and the two
-  residual factors are hardware properties no restructuring addresses. Also
-  probed the runtime compiler directly on this M3 Pro: `dot(char4,char4)`,
-  `simd_dot_acc_int8`, `dot_product_4x8_packed` are ALL REJECTED — **there is
-  no DP4A-style packed integer dot in MSL**, so the manual 4-scalar expansion
-  was the only expressible form and no fast primitive was missed. int8 W is
-  also ~2× the weight BYTES of q4 (bandwidth penalty independent of the math).
-  `gemm_int_sparse` + `bench-gemm --shapes sparse` kept as documented
-  negatives; not wired to production. Lessons: a per-instruction GMAC/s
-  microbench cannot settle a GEMM-shape question; and **a disproof whose
-  stated mechanism was never independently measured is a curve fit** — a
-  "matches exactly" physics story is the failure mode to distrust, and whoever
-  register-blocks this kernel would have measured a 1.7× win against a strawman
-  bar and mistaken it for progress.
+- **int8/int4 dot-product MoE expert GEMM (E18 redirect)** — `gemm_int_sparse`
+  (int8-accumulated block-sparse expert GEMM), correctness-gated first
+  (cos=1.000000 vs CPU oracle at every tile), measured 0.43 vs the production
+  q4→half-MMA path's 3.78 TF/s at real MoE shapes. The 9.7× gap decomposes
+  into three independently measured factors: **1.72×** the prototype's own
+  un-register-blocked inner loop (384 vs 80 tgmem loads per lane per BK=32;
+  register-blocking it measured 0.755 TF/s), **2.22×** int32-multiply vs
+  f32-mad on M3, **2.54×** what simdgroup-MMA is actually worth vs scalar f32.
+  So the honest bar for a future attempt is **5.6×, not 9×** — and it is still
+  a dead end, because the two residual factors are hardware properties no
+  restructuring addresses. There is also **no DP4A-style packed integer dot in
+  MSL** (`dot(char4,char4)`, `simd_dot_acc_int8`, `dot_product_4x8_packed` all
+  rejected by this M3 Pro's compiler), so the manual 4-scalar expansion was the
+  only expressible form; int8 weights cost ~2× q4's bytes on top. Kept as a
+  documented negative (`gemm_int_sparse` + `bench-gemm --shapes sparse`), not
+  wired to production. Lesson: **a disproof whose stated mechanism was never
+  independently measured is a curve fit** — the original write-up credited MMA
+  width with the whole 9× and "matched exactly" only by absorbing a 1.7× own
+  bug and a 2.2× effect nobody had identified.
 - **E21: SLC-chunked online-softmax E17 (flash at dispatch granularity)** —
   parked at its pre-registered kill bar: E17's S/P DRAM round-trips
   are only ~8% of the attention stage and the share is FLAT in T (S/P traffic
@@ -809,6 +736,17 @@ opt-in flags for A/B.
   0.73-0.86) — the territory failed, not the mechanism. Parked toward E16
   token compaction: the measured structure (sharp retrieval peaks + near-
   uniform diffuse background) is EVIDENCE FOR fusing aged tokens.
+- **Fixed-distance locality band** (attend only within ±N of the query) — a
+  2k-wide band holds just 39% of attention mass at kv=10k (measured on a full
+  layer, hd=512). The model has BOTH a prompt-start anchor (first 64 prompt
+  tokens carry 19% of mass) and retrieval from the far end of the prompt
+  (40%); a band structurally misses both. Top-k selection is the lever that
+  works here, not distance.
+- **A prompt-start anchor as a separate lever** (always include the first N
+  prompt positions on top of top-k) — adds nothing: top-128 retains the same
+  71.3% of mass with or without a 64-position anchor, because those positions
+  are already inside the natural top-k for most heads. The anchor is a subset
+  of top-k, not additive.
 - **Attention-mass coverage as a quality oracle — IMPEACHED on this model**:
   exact row-top-512 holds only 30% of mass at 121k and row-top-64
   only 13%, yet behavioral retrieval at those k values is clean (doc-QA 4/4 to
@@ -829,8 +767,8 @@ opt-in flags for A/B.
   the sweep bought nothing (`DGQ_ATTN_KV_BLOCK`, default off).
 - **Low-bit KV for speed** (q8, and TurboQuant-class by the same physics) —
   +9% prefill / +54% denoise at 33k; only −6% even at 105k. Kernels are
-  issue-bound, not byte-starved. q8 KV survives as the MEMORY lever
-  (auto-on at long context).
+  issue-bound, not byte-starved. q8 KV would only ever be a MEMORY lever, and
+  is currently broken (see the precision policy).
 - **int4/int8 KV cache quantization at long context (Gemma attn_scale)** —
   disproven for Gemma architectures *by physics, not just measurement*: Gemma's
   undampened attention scale (attn_scale = 1.0, vs Llama's 1/√d ≈ 0.088) means
@@ -856,33 +794,19 @@ opt-in flags for A/B.
   breaks convergence even at N=2; MoE is bandwidth-bound not row-bound.
 - **Dispatch/sync micro-optimization** — encode is ~0.2 ms/step; non-lever.
   Same for MLX-style `load_unsafe`/bounds-check tricks and ICB record/replay.
-- **Software-pipelined double-buffering GEMM port** — DISPROVEN
-  (the parked ≤2-3% ROI estimate was optimistic). Built the real
-  prototype: `gemm_tunable_db` (sibling entry in `gemm_tunable.metal`) doubles
-  the tgmem tiles `Xs[2][BM][PAD]` + `Ws[2][BN][PAD]`, runs a prologue load
-  tile 0, then in the K-loop overlaps the device→tgmem load of tile N+1 with
-  the MMA of tile N (one barrier/K-tile vs two in the single-buffered kernel).
-  Bit-exact vs the single-buffered `gemm_tunable` (Tier-1 test green; the
-  K-accumulation chain, dequant, and store rounding are unchanged — only the
-  tgmem buffering schedule differs). Benched head-to-head at the prefill-
-  relevant dense shapes (256×2816×2816 + 1024×2816×2816, production tile
-  64×64, q4 weights): double-buf = **3.377 / 3.566 TF/s** vs single-buf =
-  **3.611 / 3.919 TF/s** → **0.93× / 0.91× (7-9% SLOWER)**. PHYSICS: the
-  device→tgmem load is already fully hidden behind the ~6× compute margin
-  (compute >> load, so single-buffered load already overlaps with the next
-  K-tile's compute via the GPU's natural instruction issue). The extra
-  barrier sync + doubled tgmem footprint (which hurts tile occupancy / SLC
-  pressure) costs more than the explicit load/MMA overlap gains. There is no
-  async-copy engine on Apple GPU — the "overlap" is just re-issuing the load
-  instructions before the MMA, which the single-buffered version already does
-  implicitly because the GPU issues load/store and matrix-unit instructions
-  concurrently. This is the same shape as the int8 dot disproof: the physics
-  (compute-bound regime, load already hidden) predicted the result, and a real
-  prototype on real shapes confirmed it. `gemm_tunable_db` + the `bench-gemm
-  --shapes db` harness kept as a documented negative; not wired to production.
-  Lesson: when compute >> load (the 6× margin regime), software-pipelined
-  double-buffering is a regression, not a lever — the doubled tgmem footprint
-  + extra sync costs more than the already-hidden load overlap returns.
+- **Software-pipelined double-buffering GEMM port** — `gemm_tunable_db`
+  (sibling entry in `gemm_tunable.metal`) doubles the tgmem tiles, prologue-
+  loads tile 0, then overlaps the device→tgmem load of tile N+1 with the MMA of
+  tile N. Bit-exact vs single-buffered `gemm_tunable`, and **7-9% SLOWER** at
+  the prefill-relevant dense shapes (256×2816×2816 and 1024×2816×2816, tile
+  64×64, q4): 3.377 / 3.566 vs 3.611 / 3.919 TF/s. PHYSICS: there is no
+  async-copy engine on Apple GPU, so the "overlap" is just issuing the loads
+  before the MMA — which the single-buffered kernel already does implicitly,
+  because the load is fully hidden behind the ~6× compute margin. The extra
+  barrier and the doubled tgmem footprint (occupancy, SLC pressure) cost more
+  than the overlap returns. Kept as a documented negative (`gemm_tunable_db` +
+  `bench-gemm --shapes db`), not wired to production. Lesson: when
+  compute >> load, double-buffering is a regression, not a lever.
 
 **Quality levers, disproven by measurement:**
 - **Confidence trim as a fix for CODE-correctness errors** — the

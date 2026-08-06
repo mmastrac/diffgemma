@@ -9,19 +9,21 @@ canvas in parallel, trading memory bandwidth for compute. That's the regime
 Apple Silicon GPUs like. This engine ports that loop straight to Metal. No
 Python, no PyTorch, no MLX at run time.
 
-> **Scope (v1):** text-only, Apple Silicon (Metal) only, **36 GB unified memory
-> minimum**. The ~550M vision tower is not ported. There is no CPU path. This
-> binary only runs on macOS + Apple Silicon. See
-> [Scope & requirements](#scope--requirements).
-
 ---
 
 ## Requirements
 
-- **macOS on Apple Silicon** (M-series). Metal is the only backend. The program
-  will not build or run anywhere else.
-- **36 GB unified memory** minimum. Weights quantize to ~19 GiB. The rest is KV
-  cache and working set.
+- **macOS on Apple Silicon** (M-series). Metal is the only backend — there is
+  no CPU or CUDA fallback, and the binary refuses to build on non-macOS
+  targets. Developed and measured on M3 Pro; other M-series configs should
+  work but are not independently validated yet.
+- **36 GB unified memory** minimum. The `q4` model is ~19 GiB of weights; the
+  rest covers the KV cache and denoise working set. A single 36 GB machine
+  reaches ~105k-token context without swapping. Below 36 GB is out of scope
+  for v1.
+- **Text-only in v1.** The ~550M vision tower (SigLIP encoder + image
+  splicing) is not ported; only the text decoder runs. Image input is a v2
+  item.
 - **Rust** (stable), via [rustup](https://rustup.rs).
 - A **quantized `.dgq` pack** (~19 GiB for `q4`). Download a ready-made one with
   the built-in `download` command, or fetch the ~50 GB bf16 checkpoint from
@@ -191,21 +193,6 @@ For a permanent setup, drop that same `"provider"` block into `opencode.json`
 (project) or `~/.config/opencode/opencode.json` (global) and run
 `opencode -m diffgemma/diffgemma-26b-a4b-it-q4`.
 
-## Scope & requirements
-
-**v1 is text-only.** The DiffusionGemma vision tower (~550M params, SigLIP
-encoder + image splicing) is not ported. Only the text decoder runs. Image input
-is a v2 item.
-
-**Apple Silicon + Metal only.** There is no CPU or CUDA fallback. Metal is the
-sole backend, and the binary refuses to build on non-macOS targets. It has been
-developed and measured on M3 Pro. Other M-series configs should work but are not
-independently validated yet.
-
-**36 GB unified memory is the floor.** The `q4` model is ~19 GiB of weights. The
-rest covers the KV cache and denoise working set. A single 36 GB machine reaches
-~105k-token context without swapping. Below 36 GB is out of scope for v1.
-
 ## Performance
 
 Head-to-head against **MLX-4bit** (`mlx-community/diffusiongemma-26B-A4B-it-4bit`,
@@ -245,5 +232,5 @@ other hardware and refreshed against MLX's current build.
   with evidence), the engineering design, and a "Negative Knowledge" ledger of
   approaches that were built, measured, and disproven on this hardware.
 - **[AGENTS.md](AGENTS.md)**: how to work in this repo.
-- **[PLAN.md](PLAN.md)**: open work.
+- **[PLAN.md](PLAN.md)**: open work, split into v1 and v2.
 - Commit history is the changelog.

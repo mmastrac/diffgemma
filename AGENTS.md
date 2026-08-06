@@ -49,65 +49,50 @@ rewriting a kernel you can't explain.
 
 1. **Localize before you theorize.** Find the *smallest* unit that diverges
    from the reference. A 30-layer entropy collapse is not a bug location;
-   it's a symptom. Bisect: which layer, which kernel, which stage within the
-   kernel. The MoE hunt took ten turns because we theorized about kernel math
-   for several rounds before dumping the one value (`x`/`tok` as the kernel
-   actually read it) that localized it in one read.
+   it's a symptom. Bisect: which layer, which kernel, which stage. The MoE
+   hunt took ten turns because we theorized about kernel math for rounds
+   before dumping the one value that localized it in a single read.
 
-2. **Same input, same weights, two paths.** The fastest localization is
-   always: run the suspect GPU path and the CPU reference on *byte-identical*
-   input and weights, compare cosine. cos > 0.999 = that stage is fine.
-   cos ~0.5 = correlated-but-wrong (often a swap, a scale, or partial
-   corruption). cos ~0 = orthogonal, reading the wrong data entirely. The
-   cosine *magnitude* is a diagnostic, not just pass/fail — read it.
+2. **Same input, same weights, two paths.** Run the suspect GPU path and the
+   CPU reference on *byte-identical* input, compare cosine, and read the
+   magnitude as a diagnostic: >0.999 = that stage is fine; ~0.5 =
+   correlated-but-wrong (a swap, a scale, partial corruption); ~0 = reading
+   the wrong data entirely.
 
-3. **Dump the actual bytes/values the kernel reads, not what you think it
-   reads.** Repeatedly, the bug was "kernel reads a different thing than the
-   reference" — wrong row, wrong tensor, wrong activation. A CPU
-   transliteration of the *source* can match the reference while the *GPU
-   execution* diverges, because the transliteration can't reproduce
-   threadgroup semantics, arena bindings, or route resolution. When in doubt,
-   write the kernel's actual inputs to a scratch buffer and read them back.
+3. **Dump what the kernel actually reads, not what you think it reads.** A
+   CPU transliteration of the *source* can match the reference while the
+   *GPU execution* diverges — it can't reproduce threadgroup semantics, arena
+   bindings, or route resolution. Write the kernel's real inputs to a scratch
+   buffer and read them back.
 
 4. **Impossible numbers mean wrong N or wrong normalization.** Entropy >
-   ln(N), Z=0, cos > 1, values at ~1e38 — these are never "the model is just
-   bad." They are indexing, normalization, or precision-overflow bugs with a
-   specific cause. Chase them as such.
+   ln(N), Z=0, cos > 1, values at ~1e38 are never "the model is just bad" —
+   they are indexing, normalization, or overflow bugs with a specific cause.
 
-5. **Two paths failing differently is a gift, not noise.** When the engine
-   and monolithic paths diverge on the same input, the *difference* localizes
-   the bug to the path-specific code. One exploding (inf), one inert (zero)
-   meant two different bugs in the same conceptual spot — and finding one
-   explained the other.
+5. **Two paths failing differently is a gift.** The *difference* localizes the
+   bug to path-specific code. One exploding (inf) and one inert (zero) meant
+   two bugs in the same conceptual spot, and finding one explained the other.
 
-6. **Don't let a workaround end the investigation.** Swapping a broken fused
-   kernel for a slow reference path unblocks convergence but leaves the
-   latent bug in every *other* kernel that shares the flawed pattern.
-   Root-cause it, then decide whether to fix or replace.
+6. **A contradiction is a second bug, not an anomaly.** If a fix changes an
+   intermediate but not the output, you are measuring two different code
+   paths (probe vs production) or reading a stale buffer. Resolve it.
 
-7. **A contradiction is a second bug, not an anomaly.** "act went 0.015 → 1.0
-   but gpu_out is bit-identical" cannot happen in a correct pipeline. When a
-   fix changes an intermediate but not the output, you are measuring two
-   different code paths (probe vs production) or reading a stale buffer.
-   Resolve contradictions; do not note-and-move-on.
+7. **Don't let a workaround end the investigation.** Falling back to a slow
+   reference path unblocks convergence but leaves the latent bug in every
+   other kernel sharing the flawed pattern.
 
-8. **Reproduce a gap across inputs before attributing it to a bug.** A
-   difference measured on one prompt/seed can be *chaos*, not a defect: in a
-   sensitive iterative system (the denoise loop), a sub-1e-4 per-step
-   difference can flip an entropy-boundary accept decision and cascade into a
-   different — but equally valid — trajectory. Before chasing a single-input
-   delta, check that it's *systematic* (same direction across prompts/seeds)
-   and that per-unit parity is actually broken. Otherwise you'll "fix" noise.
+8. **Reproduce a gap across inputs before calling it a bug, and change one
+   variable at a time.** In the denoise loop a sub-1e-4 per-step difference
+   can flip an accept decision and cascade into a different but equally valid
+   trajectory, so a single-prompt delta can be chaos rather than a defect —
+   check it is systematic before chasing it. When it is real, bisect to the
+   axis (sampler / forward precision / a specific quantized tensor) before
+   rebuilding; "rebuild with everything different" tells you nothing.
 
-9. **Localize the gap to the right axis, then change one thing.** A quality
-   gap can live in any of {sampler, forward precision, a specific quantized
-   tensor}. Bisect to the axis before rebuilding; each step changes exactly
-   one variable. A "rebuild with everything different" tells you nothing.
-
-10. **Measure value/type ranges before calling a precision experiment
-    failed** (`DGQ_TRACE_RANGES`, value-cos) — and check the Negative
-    Knowledge section + agent memory for the lever family BEFORE planning
-    perf work; task descriptions carry stale premises.
+9. **Measure value/type ranges before calling a precision experiment failed**
+   (`DGQ_TRACE_RANGES`, value-cos), and check ARCHITECTURE.md's Negative
+   Knowledge + agent memory for the lever family BEFORE planning perf work —
+   task descriptions carry stale premises.
 
 ---
 
@@ -118,11 +103,10 @@ rewriting a kernel you can't explain.
   dominate a step.
 - **Attribute the time before reducing it.** Per-dispatch timing on one clean
   step. Do not guess which stage dominates; the guesses have been wrong.
-- **Know the regime** (see ARCHITECTURE.md): denoise GEMMs are compute-bound
-  at the MPS wall; attention is instruction-issue-bound at SLC service rates;
-  the expert GEMM at prefill M=1024 is compute-bound with ~6× margin over
-  weight bytes. Byte-cutting levers do not pay on issue/compute-bound
-  kernels — check Negative Knowledge before reaching for one.
+- **Know the regime** — ARCHITECTURE.md's "Performance regime" has the
+  measured classification and the numbers. The short version: nothing here is
+  bandwidth-bound, so byte-cutting levers do not pay. Check Negative Knowledge
+  before reaching for one.
 - **Sequence optimizations to the bottleneck.** At multi-second steps the win
   is "stop doing the slow/temporary thing" (remove probes, use the fused
   kernel, re-enable the fast path). Don't reach for architecture when the
@@ -192,22 +176,17 @@ rewrites — a cos≈0.34 oracle failure usually means the HARNESS dispatches an
 old shape, not that the kernel math broke. Check the harness grid first.
 
 **Suite mechanics**: `cargo test --release`. Model-gated tests key off
-`test_util::dgq_model_dir()`.
-
-The old `--test-threads=1` is no longer required. It existed because
-concurrent pipeline compilation raced a non-thread-safe `MTLBinaryArchive`
-(fixed: the archive is behind a `Mutex`), and because ~9 model-gated tests
-each load ~19 GiB and would blow the 36 GB ceiling if they overlapped —
-which `membudget` now prevents: model-loading paths take a byte permit and a
-second one WAITS on a condvar (flock across processes) instead of OOMing.
-Expect only ~20-30% off the wall: the heavy tests still serialize on memory
-and dominate it; the other ~640 are µs CPU oracles.
+`test_util::dgq_model_dir()`. `--test-threads=1` is no longer required —
+`membudget` gates concurrent model loads with byte permits (a second loader
+waits on a condvar instead of OOMing), and the pipeline archive is behind a
+`Mutex`. Expect only ~20-30% off the wall, since the ~9 heavy model-gated
+tests still serialize on memory and dominate it.
 
 If parallelism regresses it fails LOUD (SIGSEGV, or a membudget timeout that
-names the holder) — revert to `--test-threads=1` and say why. Note
-`membudget` still PANICS on a nested acquire on ONE thread: build a second
-runtime only after dropping the first. And the separate hard rule stands —
-never two model-loading PROCESSES at once, regardless of thread count.
+names the holder) — revert to `--test-threads=1` and say why. `membudget`
+PANICS on a nested acquire on ONE thread: build a second runtime only after
+dropping the first. The separate hard rule stands regardless of thread count:
+never two model-loading PROCESSES at once.
 
 ---
 
@@ -290,6 +269,12 @@ never two model-loading PROCESSES at once, regardless of thread count.
   ~15 GiB = machine crash). `pgrep -f "diffgemma -m"` before any GPU run;
   serialize every bench.
 - **Wart census** (10-seed greentext) is the sensitive sampler probe.
+- **A battery can only evaluate a lever whose TRIGGER its outputs actually
+  produce.** Check `trims > 0` (or the equivalent activation count) in the
+  treatment arm before reading any arm comparison — a battery that never fires
+  the lever reports a clean null three times in a row and means nothing. Judge
+  by the multi-seed aggregate; use PROBE-level counts for arm comparisons and
+  case-level only for diagnosing what failed.
 - **Pass `--seed` EXPLICITLY on every arm of a comparison.** `smoketest
   --longctx` defaults to seed 7, not 42, so a defaulted run and a
   `--seed 42` run are different experiments. This cost a whole false
