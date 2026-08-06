@@ -397,6 +397,19 @@ pub fn validate_tool_reply(text: &str) -> Result<(), &'static str> {
 
 /// Parse every `call:NAME{ARGS}` in model output into structured tool calls,
 /// tolerant of the exact wrapper tokens around/between them.
+/// Recover tool calls the stream split dropped: parse the thought-stripped raw
+/// decode when it is available, else the round reasoning. A call misclassified
+/// into the reasoning must not silently end the turn as a plain answer.
+pub(crate) fn salvage_lost_calls(raw_decode: Option<&str>, reasoning: &str) -> Vec<ParsedToolCall> {
+    if let Some(raw) = raw_decode {
+        let calls = parse_tool_calls(&strip_thinking(raw));
+        if !calls.is_empty() {
+            return calls;
+        }
+    }
+    parse_tool_calls(reasoning)
+}
+
 pub fn parse_tool_calls(text: &str) -> Vec<ParsedToolCall> {
     let masks = masked_ranges(text);
     let mut out = Vec::new();

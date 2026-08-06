@@ -141,7 +141,7 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
         if !self.thinking {
             return Split {
                 reasoning: String::new(),
-                content: self.decode_content(ids),
+                content: self.decoder.decode_content(ids),
             };
         }
         let split = self
@@ -149,21 +149,8 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
             .split(&self.decoder, ids, self.start_in_thought);
         Split {
             reasoning: self.clean_reasoning(&split.reasoning),
-            content: self.decode_content(&split.content),
+            content: self.decoder.decode_content(&split.content),
         }
-    }
-
-    /// Decode answer-side ids and sanitize the text. Stray channel specials (the
-    /// model may re-emit `<channel|>` after the answer) are dropped by the
-    /// `split` walk before ids reach here, and text-form leftovers fall to the
-    /// masked `sanitize_model_reply`, while quoted channel markup (literal
-    /// tool-arg content) survives both.
-    fn decode_content(&self, ids: &[u32]) -> String {
-        crate::chat_template::sanitize_model_reply(
-            &self
-                .decoder
-                .decode(&crate::sample::strip_degenerate_token_ids(ids)),
-        )
     }
 
     /// Decode a reasoning-region id slice and strip the `<|channel>thought\n`
@@ -312,21 +299,6 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
         let mut out = Vec::new();
         self.release_up_to(usize::MAX, usize::MAX, &mut out);
         out
-    }
-}
-
-/// If `next` extends `prev` (or diverges), return the suffix to append, or
-/// `None` when nothing is new. On a rare non-prefix revision, re-emit the whole
-/// new text, since append-only sinks cannot retract and committed text almost
-/// never revises.
-#[cfg(test)]
-pub(crate) fn append_delta(prev: &str, next: &str) -> Option<String> {
-    if next == prev {
-        None
-    } else if let Some(suffix) = next.strip_prefix(prev) {
-        (!suffix.is_empty()).then(|| suffix.to_string())
-    } else {
-        Some(next.to_string())
     }
 }
 
@@ -590,14 +562,6 @@ mod tests {
         assert!(m.ended());
         // Further steps are inert.
         assert!(m.on_step(&step(1, 3, &canvas, true)).is_empty());
-    }
-
-    #[test]
-    fn append_delta_semantics() {
-        assert_eq!(append_delta("", "Hi"), Some("Hi".to_string()));
-        assert_eq!(append_delta("Hi", "Hi there"), Some(" there".to_string()));
-        assert_eq!(append_delta("Hi", "Hi"), None);
-        assert_eq!(append_delta("Hello", "Help"), Some("Help".to_string()));
     }
 
     #[test]
