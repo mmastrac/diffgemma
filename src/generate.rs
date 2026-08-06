@@ -174,19 +174,12 @@ pub fn generate_monolithic_gpu_pipeline(
         max_seq,
         gen_cfg.sampler.max_denoising_steps.max(1),
     );
-    match pipeline.call(crate::pipeline::PipelineOp::Generate {
-        prompt: prompt_token_ids.to_vec(),
-        cfg: Box::new(cfg),
-        label: prompt_label.to_string(),
-    }) {
-        crate::pipeline::PipelineEvent::Generated { out, .. } => Ok(*out),
-        crate::pipeline::PipelineEvent::Error(msg) => {
-            Err(Error::Pipeline(format!("generate: {msg}")))
-        }
-        other => Err(Error::Pipeline(format!(
-            "generate: unexpected event {other:?}"
-        ))),
-    }
+    crate::pipeline::generate(
+        &pipeline,
+        prompt_token_ids.to_vec(),
+        Box::new(cfg),
+        prompt_label,
+    )
 }
 
 #[cfg(test)]

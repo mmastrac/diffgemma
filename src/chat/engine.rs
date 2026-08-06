@@ -257,26 +257,6 @@ fn stats_line(tokens: usize, steps: usize, secs: f64, stopped: bool) -> String {
     )
 }
 
-/// One `PipelineOp::Generate`, unwrapped to the output or a pipeline error.
-fn pipeline_generate(
-    pipeline: &std::sync::Mutex<crate::pipeline::Pipeline>,
-    step_cfg: &metal::StepGenerateConfig,
-    prompt: Vec<u32>,
-) -> Result<crate::generate::GenerateOutput, crate::Error> {
-    match pipeline
-        .lock()
-        .unwrap()
-        .call(crate::pipeline::PipelineOp::Generate {
-            prompt,
-            cfg: Box::new(step_cfg.clone()),
-            label: "chat-tool".into(),
-        }) {
-        crate::pipeline::PipelineEvent::Generated { out, .. } => Ok(*out),
-        crate::pipeline::PipelineEvent::Error(err) => Err(crate::Error::Pipeline(err)),
-        ev => Err(crate::Error::Pipeline(format!("unexpected event {ev:?}"))),
-    }
-}
-
 /// Per-session machinery a turn borrows: the GPU pipeline, tokenizer, the
 /// mutable generation config, the tool set, and the flags that decide display.
 pub(crate) struct TurnRunner<'a> {
@@ -664,19 +644,12 @@ impl TurnRunner<'_> {
             prompt_len,
         );
         self.step_cfg.step_observer = Some(stream.observer());
-        let out = match self
-            .pipeline
-            .lock()
-            .unwrap()
-            .call(crate::pipeline::PipelineOp::Generate {
-                prompt: prompt.clone(),
-                cfg: Box::new(self.step_cfg.clone()),
-                label: "chat".into(),
-            }) {
-            crate::pipeline::PipelineEvent::Generated { out, .. } => *out,
-            crate::pipeline::PipelineEvent::Error(err) => return Err(crate::Error::Pipeline(err)),
-            ev => return Err(crate::Error::Pipeline(format!("unexpected event {ev:?}"))),
-        };
+        let out = crate::pipeline::generate(
+            &*self.pipeline.lock().unwrap(),
+            prompt.clone(),
+            Box::new(self.step_cfg.clone()),
+            "chat",
+        )?;
         self.step_cfg.step_observer = None;
         let elapsed = started.elapsed();
 
@@ -814,7 +787,12 @@ impl TurnRunner<'_> {
                 prompt_len,
             );
             self.step_cfg.step_observer = Some(stream.observer());
-            let out = pipeline_generate(self.pipeline, self.step_cfg, prompt.clone())?;
+            let out = crate::pipeline::generate(
+                &*self.pipeline.lock().unwrap(),
+                prompt.clone(),
+                Box::new(self.step_cfg.clone()),
+                "chat-tool",
+            )?;
             self.step_cfg.step_observer = None;
             let new_tokens = out.token_ids.len().saturating_sub(prompt_len);
             total_tokens += new_tokens;

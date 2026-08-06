@@ -52,6 +52,26 @@ impl<S: PipelineStage + ?Sized> PipelineStage for Box<S> {
     }
 }
 
+/// One `PipelineOp::Generate`, unwrapped to its output or a pipeline error, the
+/// shared call-and-match every whole-turn generate site runs. The caller
+/// attaches any `step_observer` to `cfg` first.
+pub(crate) fn generate(
+    stage: &dyn PipelineStage,
+    prompt: Vec<u32>,
+    cfg: Box<crate::metal::StepGenerateConfig>,
+    label: &str,
+) -> Result<crate::generate::GenerateOutput, crate::Error> {
+    match stage.call(PipelineOp::Generate {
+        prompt,
+        cfg,
+        label: label.to_string(),
+    }) {
+        PipelineEvent::Generated { out, .. } => Ok(*out),
+        PipelineEvent::Error(err) => Err(crate::Error::Pipeline(err)),
+        ev => Err(crate::Error::Pipeline(format!("unexpected event {ev:?}"))),
+    }
+}
+
 /// FNV-1a over token ids (the event digest `replay` diffs against).
 pub(crate) fn ids_fnv(ids: &[u32]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
