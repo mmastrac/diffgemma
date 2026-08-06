@@ -962,13 +962,6 @@ impl TurnRunner<'_> {
             // order, and a reopened thought for the next round. A corrupted
             // call stays visible in the model's output with an error response
             // answering it, so it can see what it did wrong and reissue.
-            let mut tail = String::new();
-            for (name, output) in &responses {
-                tail.push_str(&crate::tools::render_tool_response_guarded(
-                    name,
-                    &serde_json::json!({ "content": output }),
-                ));
-            }
             if corrupt {
                 let name = first_bad
                     .map(|k| attempts[k].0.clone())
@@ -981,14 +974,16 @@ impl TurnRunner<'_> {
                     round,
                     name: name.clone(),
                 });
-                tail.push_str(&crate::tools::render_tool_response_guarded(
-                    &name,
-                    &serde_json::json!({ "content": "error: this tool call was malformed and was \
+                responses.push((
+                    name,
+                    "error: this tool call was malformed and was \
                         not run; the calls before it ran. Reissue this call and any that should \
-                        follow it, corrected." }),
+                        follow it, corrected."
+                        .to_string(),
                 ));
             }
-            tail.push_str(crate::tools::OPEN_THOUGHT);
+            // Chat always reopens the thought: a tool-mode turn always reasons.
+            let mut tail = crate::tools::tool_continuation_tail(&responses, true);
             if reseed && let Some(s) = seed {
                 tail.push_str(s.trim());
             }

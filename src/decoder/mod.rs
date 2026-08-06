@@ -53,6 +53,15 @@ pub struct StepProgressEvent<'a> {
 pub trait TextDecoder {
     fn decode(&self, ids: &[u32]) -> String;
     fn decode_append(&self, out: &mut String, ids: &[u32]);
+
+    /// Decode answer-side ids to sanitized visible text. Degenerate ids are
+    /// dropped and the text-form markers die in the masked sanitizer, while
+    /// quoted tool-arg markup survives both.
+    fn decode_content(&self, ids: &[u32]) -> String {
+        crate::chat_template::sanitize_model_reply(
+            &self.decode(&crate::sample::strip_degenerate_token_ids(ids)),
+        )
+    }
 }
 
 impl TextDecoder for std::sync::Arc<crate::tokenizer::Tokenizer> {

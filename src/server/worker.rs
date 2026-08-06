@@ -343,17 +343,8 @@ impl Worker {
                     // field incident). Adopt the calls from the
                     // thought-stripped raw decode instead of only logging.
                     if calls.is_empty() {
-                        // Bare/markerless reply: strip_thinking is a no-op on
-                        // it, so the raw decode carries the call. (Marker
-                        // scans are masked — a call whose args quote channel
-                        // markup survives the strip intact.)
-                        let mut salvage = crate::tools::parse_tool_calls(
-                            &crate::tools::strip_thinking(&raw_ids_decode),
-                        );
-                        if salvage.is_empty() {
-                            // Closed span: the call lives in reasoning text.
-                            salvage = crate::tools::parse_tool_calls(&reasoning);
-                        }
+                        let salvage =
+                            crate::tools::salvage_lost_calls(Some(&raw_ids_decode), &reasoning);
                         if !salvage.is_empty() {
                             eprintln!(
                                 "serve: CHANNEL MISMATCH: {} call(s) lost by the stream split; recovered from raw reply ({})",
@@ -825,10 +816,11 @@ impl Worker {
 
             let mut calls = crate::tools::parse_tool_calls(&raw);
             if calls.is_empty() {
-                // Splitter-disagreement recovery (see the non-compact path):
-                // a call misclassified into the round's reasoning must not
-                // silently end the turn as a plain answer.
-                let salvage = crate::tools::parse_tool_calls(mapper.lock().unwrap().reasoning());
+                // Splitter-disagreement recovery (see the non-compact path).
+                // The compact path has no per-round raw decode, so recover from
+                // the round reasoning only.
+                let salvage =
+                    crate::tools::salvage_lost_calls(None, mapper.lock().unwrap().reasoning());
                 if !salvage.is_empty() {
                     eprintln!(
                         "serve: CHANNEL MISMATCH: {} call(s) lost by the stream split; recovered from round reasoning",

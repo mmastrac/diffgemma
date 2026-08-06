@@ -99,15 +99,6 @@ impl<D: TextDecoder> StreamDecoder<D> {
         &self.committed_text
     }
 
-    /// Decode answer-side ids to sanitized visible text.
-    fn decode_content(&self, ids: &[u32]) -> String {
-        crate::chat_template::sanitize_model_reply(
-            &self
-                .decoder
-                .decode(&crate::sample::strip_degenerate_token_ids(ids)),
-        )
-    }
-
     pub fn on_step(&mut self, ev: &StepProgressEvent<'_>) -> Vec<ChatEvent> {
         let mut out = Vec::new();
         if self.ended {
@@ -158,7 +149,7 @@ impl<D: TextDecoder> StreamDecoder<D> {
             let committed_split =
                 self.channels
                     .split(&self.decoder, &strip(&self.committed_ids), in_thought);
-            let committed_answer = self.decode_content(&committed_split.content);
+            let committed_answer = self.decoder.decode_content(&committed_split.content);
             let full_split = if ev.block_done {
                 committed_split
             } else {
@@ -170,7 +161,7 @@ impl<D: TextDecoder> StreamDecoder<D> {
                 "{seed}{}",
                 self.decoder.decode(&strip(&full_split.reasoning))
             );
-            let answer = self.decode_content(&full_split.content);
+            let answer = self.decoder.decode_content(&full_split.content);
 
             if self.thinking_display && thought != self.last_thought {
                 out.push(ChatEvent::Thought {
@@ -196,7 +187,7 @@ impl<D: TextDecoder> StreamDecoder<D> {
 
         if ev.block_done {
             self.committed_ids.extend_from_slice(&sp.ids);
-            self.committed_text = self.decode_content(&self.committed_ids);
+            self.committed_text = self.decoder.decode_content(&self.committed_ids);
             out.push(ChatEvent::BlockCommit {
                 block: ev.block_idx,
                 committed_tokens: sp.ids.len(),

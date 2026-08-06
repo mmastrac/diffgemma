@@ -29,7 +29,7 @@ pub use parse::{
     scan_call_attempts, should_continue_past_stop, thinking_call_names, to_openai_tool_calls,
     tool_call_lost_in_thinking, validate_tool_reply,
 };
-pub(crate) use parse::{find_unmasked, masked_ranges, strip_thinking};
+pub(crate) use parse::{find_unmasked, masked_ranges, salvage_lost_calls, strip_thinking};
 #[cfg(test)]
 pub use render::format_tool_declarations;
 #[cfg(test)]
