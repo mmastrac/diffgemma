@@ -150,6 +150,46 @@ fn show_thinking_splits_reasoning_from_answer() {
     assert_eq!(texts(&done), vec!["Ok"]);
 }
 
+/// A text-form `<|channel>` marker a differently-BPE'd scaffold leaves in the
+/// reasoning ids is scrubbed from the displayed thought (the token-level split
+/// only drops the exact `thought` token, so `decode_reasoning` catches the rest).
+#[test]
+fn thinking_display_scrubs_leaked_channel_marker() {
+    struct LeakyDecoder;
+    impl TextDecoder for LeakyDecoder {
+        fn decode(&self, ids: &[u32]) -> String {
+            let mut s = String::new();
+            self.decode_append(&mut s, ids);
+            s
+        }
+        fn decode_append(&self, out: &mut String, ids: &[u32]) {
+            for &id in ids {
+                match id {
+                    400 => out.push_str("<|channel>"),
+                    32..=127 => out.push(id as u8 as char),
+                    _ => {}
+                }
+            }
+        }
+    }
+    let mut d = StreamDecoder::new(LeakyDecoder, vec![])
+        .with_channels(channel_ids())
+        .with_thinking(true, None);
+    // <open> <leaked-marker> H i <close> O k
+    let full = [
+        OPEN,
+        400,
+        b'H' as u32,
+        b'i' as u32,
+        CLOSE,
+        b'O' as u32,
+        b'k' as u32,
+    ];
+    let done = d.on_step(&step(1, 1, &full, true));
+    assert_eq!(thoughts(&done), vec!["Hi"]);
+    assert_eq!(texts(&done), vec!["Ok"]);
+}
+
 /// Regression: a multi-block answer's committed prefix must grow monotonically.
 /// A decrease reset the renderer's print cursor and re-emitted the reply.
 #[test]

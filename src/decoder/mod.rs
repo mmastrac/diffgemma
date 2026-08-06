@@ -62,6 +62,30 @@ pub trait TextDecoder {
             &self.decode(&crate::sample::strip_degenerate_token_ids(ids)),
         )
     }
+
+    /// Decode a reasoning-region id slice to display text, stripping the
+    /// `<|channel>thought` opener scaffold and any text-form channel markers a
+    /// differently-BPE'd scaffold leaves behind (the token-level split only
+    /// drops the scaffold when it decodes to the exact `thought` token). Repair
+    /// and salvage read the raw decode, so this cleanup is display-only.
+    fn decode_reasoning(&self, ids: &[u32]) -> String {
+        let raw = self.decode(&crate::sample::strip_degenerate_token_ids(ids));
+        let mut s = raw
+            .trim_start_matches("<|channel>")
+            .trim_start()
+            .trim_start_matches("thought")
+            .trim()
+            .to_string();
+        for marker in [
+            crate::tools::OPEN_THOUGHT,
+            "<|channel>thought",
+            "<|channel>",
+            "<channel|>",
+        ] {
+            s = s.replace(marker, "");
+        }
+        s.trim().to_string()
+    }
 }
 
 impl TextDecoder for std::sync::Arc<crate::tokenizer::Tokenizer> {
