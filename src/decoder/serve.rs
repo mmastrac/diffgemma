@@ -148,38 +148,9 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
             .channels
             .split(&self.decoder, ids, self.start_in_thought);
         Split {
-            reasoning: self.clean_reasoning(&split.reasoning),
+            reasoning: self.decoder.decode_reasoning(&split.reasoning),
             content: self.decoder.decode_content(&split.content),
         }
-    }
-
-    /// Decode a reasoning-region id slice and strip the `<|channel>thought\n`
-    /// opener scaffold the model emits when thinking is enabled.
-    ///
-    /// Mid-thought re-open ids arrive already consumed by the `split` walk, so
-    /// the string replaces below catch the text-form (BPE) markers. Display
-    /// only: quoted literals in a rehearsed call may lose markers here, but
-    /// repair and salvage read the raw decode rather than this.
-    fn clean_reasoning(&self, ids: &[u32]) -> String {
-        let raw = self
-            .decoder
-            .decode(&crate::sample::strip_degenerate_token_ids(ids));
-        let mut s = raw
-            .trim_start_matches("<|channel>")
-            .trim_start()
-            .trim_start_matches("thought")
-            .trim()
-            .to_string();
-        // Text-form markers (BPE of the scaffold, or decoded specials).
-        for marker in [
-            crate::tools::OPEN_THOUGHT,
-            "<|channel>thought",
-            "<|channel>",
-            "<channel|>",
-        ] {
-            s = s.replace(marker, "");
-        }
-        s.trim().to_string()
     }
 
     /// The current speculative answer draft: the stable-prefix answer region,

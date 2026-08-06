@@ -155,7 +155,7 @@ impl<D: TextDecoder> StreamDecoder<D> {
             };
             let thought = format!(
                 "{seed}{}",
-                self.decoder.decode(&strip(&full_split.reasoning))
+                self.decoder.decode_reasoning(&full_split.reasoning)
             );
             let answer = self.decoder.decode_content(&full_split.content);
 
