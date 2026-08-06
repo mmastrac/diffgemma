@@ -185,7 +185,7 @@ impl<D: TextDecoder> DiffusionStreamMapper<D> {
             .to_string();
         // Text-form markers (BPE of the scaffold, or decoded specials).
         for marker in [
-            "<|channel>thought\n",
+            crate::tools::OPEN_THOUGHT,
             "<|channel>thought",
             "<|channel>",
             "<channel|>",

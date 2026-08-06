@@ -47,7 +47,7 @@ impl Worker {
             thinking,
         );
         if force_thought && !g.ends_with("<|tool_response>") {
-            g.push_str("<|channel>thought\n");
+            g.push_str(crate::tools::OPEN_THOUGHT);
         }
         let (ids, neutralized) = self.tokenizer.encode_prompt(&g);
         (ids, neutralized, g)
@@ -180,16 +180,7 @@ impl Worker {
                 let p = pending.as_ref()?;
                 let responses =
                     match_tool_continuation(p, &job.messages, &job.tools, thinking)?;
-                let mut tail = String::new();
-                for (name, content) in &responses {
-                    tail.push_str(&crate::tools::render_tool_response_guarded(
-                        name,
-                        &serde_json::json!({ "content": content }),
-                    ));
-                }
-                if thinking {
-                    tail.push_str("<|channel>thought\n");
-                }
+                let tail = crate::tools::tool_continuation_tail(&responses, thinking);
                 let (tail_ids, neutralized) = self.tokenizer.encode_prompt(&tail);
                 let mut ids = p.raw_log.clone();
                 ids.extend(tail_ids);
@@ -220,7 +211,7 @@ impl Worker {
             let (ids, neutralized, g) =
                 self.render_prompt(&job.messages, &job.tools, true, thinking, thinking);
             log_neutralized(neutralized);
-            let started = g.ends_with("<|channel>thought\n");
+            let started = g.ends_with(crate::tools::OPEN_THOUGHT);
             (ids, crate::tools::strip_client_guards(&g), started)
         } else {
             let opts = crate::chat_template::ChatFormatOptions {
@@ -880,7 +871,7 @@ impl Worker {
             // responses (its actual ids — no decode/re-encode drift), then
             // re-enter generation with prompt == kv_valid_tokens (total reuse,
             // fresh block).
-            let mut resp_text = String::new();
+            let mut responses: Vec<(String, String)> = Vec::new();
             for call in &expand_calls {
                 let id = call
                     .arguments
@@ -897,16 +888,9 @@ impl Worker {
                     round + 1,
                     excerpt.len()
                 );
-                resp_text.push_str(&crate::tools::render_tool_response_guarded(
-                    tc::EXPAND_TOOL_NAME,
-                    &serde_json::json!({ "content": excerpt }),
-                ));
+                responses.push((tc::EXPAND_TOOL_NAME.to_string(), excerpt));
             }
-            // Reopen the thought for the next round (mirrors the forced-open
-            // opener every tool-mode generation prompt now carries).
-            if thinking {
-                resp_text.push_str("<|channel>thought\n");
-            }
+            let resp_text = crate::tools::tool_continuation_tail(&responses, thinking);
             let mut ext = out.token_ids.clone();
             ext.extend(self.tokenizer.encode_prompt(&resp_text).0);
             if ext.len() + canvas >= self.max_seq {

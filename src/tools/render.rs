@@ -373,6 +373,29 @@ pub(crate) fn render_tool_response_guarded(name: &str, msg: &Value) -> String {
     format_tool_response(name.to_string(), msg)
 }
 
+/// The forced-open thought marker appended to a tool-mode prompt: it opens the
+/// thought channel so the model plans its calls inside the reasoning block
+/// rather than narrating them into the visible answer. The decoder's channel
+/// split and reasoning cleanup key off the same marker.
+pub(crate) const OPEN_THOUGHT: &str = "<|channel>thought\n";
+
+/// Continuation tail for a tool round: each `(name, content)` response rendered
+/// as a guarded `<|tool_response>` block, then the reopened thought when
+/// `thinking` so the next round keeps planning inside the reasoning block.
+pub(crate) fn tool_continuation_tail(responses: &[(String, String)], thinking: bool) -> String {
+    let mut tail = String::new();
+    for (name, content) in responses {
+        tail.push_str(&render_tool_response_guarded(
+            name,
+            &serde_json::json!({ "content": content }),
+        ));
+    }
+    if thinking {
+        tail.push_str(OPEN_THOUGHT);
+    }
+    tail
+}
+
 /// `<|tool_response>response:NAME{…}<tool_response|>`. String content wraps in a
 /// `value:` key; object content is rendered field-by-field (bare keys).
 fn format_tool_response(name: String, msg: &Value) -> String {
