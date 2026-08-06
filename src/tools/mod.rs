@@ -34,7 +34,7 @@ pub(crate) use parse::{find_unmasked, masked_ranges, strip_thinking};
 pub use render::format_tool_declarations;
 #[cfg(test)]
 pub(crate) use render::render_tool_response;
-pub(crate) use render::render_tool_response_guarded;
+pub(crate) use render::{OPEN_THOUGHT, render_tool_response_guarded, tool_continuation_tail};
 pub use render::{render_conversation, render_conversation_guarded, strip_client_guards};
 
 #[cfg(test)]

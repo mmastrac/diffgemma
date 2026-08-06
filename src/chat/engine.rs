@@ -768,7 +768,7 @@ impl TurnRunner<'_> {
         // block; the `/prethink` seed, when set, continues there.
         let mut prompt = {
             let mut text = base;
-            text.push_str("<|channel>thought\n");
+            text.push_str(crate::tools::OPEN_THOUGHT);
             if let Some(s) = seed {
                 text.push_str(s.trim());
             }
@@ -988,7 +988,7 @@ impl TurnRunner<'_> {
                         follow it, corrected." }),
                 ));
             }
-            tail.push_str("<|channel>thought\n");
+            tail.push_str(crate::tools::OPEN_THOUGHT);
             if reseed && let Some(s) = seed {
                 tail.push_str(s.trim());
             }
