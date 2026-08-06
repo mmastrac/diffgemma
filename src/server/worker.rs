@@ -18,6 +18,16 @@ fn log_neutralized(n: usize) {
     }
 }
 
+/// Name of a stop token id for the serve logs, falling back to `id:N` when the
+/// tokenizer has no name for it.
+fn stop_token_name(tok: &crate::tokenizer::Tokenizer, id: Option<u32>) -> Option<String> {
+    id.and_then(|id| {
+        tok.id_to_token(id)
+            .map(|s| s.to_string())
+            .or_else(|| Some(format!("id:{id}")))
+    })
+}
+
 impl Worker {
     /// The one render+encode seam: guarded tool-grammar render of
     /// `messages`+`tools`, encoded with client-text special literals
@@ -375,12 +385,7 @@ impl Worker {
 
                 let finish_reason = finish_reason_for(&tool_calls, out.stopped_on_eot);
                 if let (Some(dir), Some(seq)) = (&self.log_dir, log_seq) {
-                    let stop_token = out.stop_token_id.and_then(|id| {
-                        self.tokenizer
-                            .id_to_token(id)
-                            .map(|s| s.to_string())
-                            .or_else(|| Some(format!("id:{id}")))
-                    });
+                    let stop_token = stop_token_name(&self.tokenizer, out.stop_token_id);
                     let record = serde_json::json!({
                         "seq": seq,
                         "ts_unix_ms": now_ms(),
@@ -925,12 +930,7 @@ impl Worker {
         // the plain path — the reply doesn't depend on it).
         let finish_reason = finish_reason_for(&tool_calls_out, stopped);
         if let (Some(dir), Some(seq)) = (&self.log_dir, log_seq) {
-            let stop_token = stop_token_id.and_then(|id| {
-                self.tokenizer
-                    .id_to_token(id)
-                    .map(|s| s.to_string())
-                    .or_else(|| Some(format!("id:{id}")))
-            });
+            let stop_token = stop_token_name(&self.tokenizer, stop_token_id);
             let record = serde_json::json!({
                 "seq": seq,
                 "ts_unix_ms": now_ms(),
@@ -1001,11 +1001,7 @@ impl Worker {
         let file_block = Arc::clone(file_block);
         cfg.block_commit_observer = Some(Arc::new(move |stats| {
             let n = file_block.fetch_add(1, Ordering::Relaxed) + 1;
-            let stop_token = stats.stop_token_id.and_then(|id| {
-                tok.id_to_token(id)
-                    .map(|s| s.to_string())
-                    .or_else(|| Some(format!("id:{id}")))
-            });
+            let stop_token = stop_token_name(&tok, stats.stop_token_id);
             let mut record = block_stats_to_json(stats, &tok, stop_token.as_deref());
             if let Some(obj) = record.as_object_mut() {
                 obj.insert("file_block".into(), serde_json::json!(n));

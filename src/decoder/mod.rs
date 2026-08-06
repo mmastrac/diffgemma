@@ -12,15 +12,15 @@ mod split;
 mod stabilize;
 mod stream;
 #[cfg(test)]
-mod testutil;
-#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod testutil;
 
 pub use serve::{DiffusionStreamMapper, MapperConfig, WireDelta};
 pub use stream::StreamDecoder;
 
 pub(crate) use split::{ChannelIds, salvage_answer};
-pub(crate) use stabilize::Stabilizer;
+pub(crate) use stabilize::{Stabilizer, first_unquoted_stop};
 
 /// Per-denoise-step progress snapshot, the contract between the generator and
 /// every stream decoder. `argmax` is the active canvas slice only, dropping

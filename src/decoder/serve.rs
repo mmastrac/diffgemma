@@ -407,7 +407,7 @@ mod tests {
 
     #[test]
     fn thinking_drops_trailing_channel_close_from_content() {
-        // Real log shape: <open> ... <close> Answer <close> (extra close before tools).
+        // Real log shape: <open> ... <close> answer <close> (extra close before tools).
         let mut m = DiffusionStreamMapper::new(FakeDecoder, thinking_cfg());
         let canvas = [
             1,
@@ -424,7 +424,7 @@ mod tests {
 
     #[test]
     fn thinking_strips_nested_channel_reopen_from_reasoning() {
-        // OpenCode nests a Thought UI when `<|channel>thought` appears mid-reasoning.
+        // OpenCode nests a thought UI when `<|channel>thought` appears mid-reasoning.
         let thought = 3u32;
         let mut m = DiffusionStreamMapper::new(ChannelDecoder, thinking_cfg());
         // <open> thought \n Hi <open> thought \n ! <close> A
@@ -453,7 +453,7 @@ mod tests {
             m.reasoning()
         );
         // The re-open's name token must go with it, or a bare "thought" line
-        // leaks into the client's Thought UI.
+        // leaks into the client's thought UI.
         assert!(
             !m.reasoning().contains("thought"),
             "channel name leaked: {:?}",
@@ -566,16 +566,14 @@ mod tests {
 
     #[test]
     fn paced_stream_holds_commit_and_releases_during_next_block() {
-        let paced = || {
-            MapperConfig {
-                paced: true,
-                ..Default::default()
-            }
+        let paced = || MapperConfig {
+            paced: true,
+            ..Default::default()
         };
         let mut m = DiffusionStreamMapper::new(FakeDecoder, paced());
         let text: Vec<u32> = "abcdefghij".chars().map(|ch| ch as u32).collect();
         // Block 1 commits after 16 steps (seeds the EMA at (16+16)/2 = 16), and
-        // paced mode holds the text, so no Content delta at commit.
+        // paced mode holds the text, so no `Content` delta at commit.
         let out = m.on_step(&step(1, 16, &text, true));
         assert!(
             out.iter().all(|d| !matches!(d, WireDelta::Content(_))),
@@ -677,8 +675,7 @@ mod tests {
     /// content starts after the model's `<channel|>`.
     #[test]
     fn start_in_thought_classifies_leading_ids_as_reasoning() {
-        let mut m =
-            DiffusionStreamMapper::new(FakeDecoder, thinking_cfg()).starting_in_thought();
+        let mut m = DiffusionStreamMapper::new(FakeDecoder, thinking_cfg()).starting_in_thought();
         let canvas = [c('p'), c('l'), c('a'), c('n'), 2, c('O'), c('k')];
         let _ = m.on_step(&step(1, 2, &canvas, true));
         assert_eq!(m.reasoning(), "plan");

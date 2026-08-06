@@ -106,12 +106,9 @@ impl ChannelIds {
         }
     }
 
-    /// Settle a finished `/prethink` generation (began inside an open thought)
-    /// into `(thought, answer)` text. The thought is `seed` plus the model's
-    /// completion. The answer is what follows the model's `<channel|>`,
-    /// unsanitized. A thought that never closes usually states its answer
-    /// inside the reasoning (a thought degeneracy), so salvage it from the
-    /// completion's tail rather than reporting none.
+    /// Settle a finished `/prethink` generation into `(thought, answer)`: `seed`
+    /// plus the completion, then the text after the model's `<channel|>`. When
+    /// the thought never closes, the answer is salvaged from the completion tail.
     pub fn settle_prethink<D: TextDecoder>(
         &self,
         decoder: &D,
@@ -128,12 +125,10 @@ impl ChannelIds {
         (format!("{seed}{completion}"), answer)
     }
 
-    /// Settle a finished tool-mode generation into `(reasoning, rest)` text.
-    /// The round began inside an open thought (the prompt seeds the marker), so
-    /// the model's `<channel|>` separates the reasoning (prefixed by the
-    /// `/prethink` `seed`, if any) from the answer and tool calls. A generation
-    /// with no close has no separate reasoning, so `rest` is the whole decoded
-    /// text, keeping calls the model left inside its thought parseable.
+    /// Settle a finished tool-mode generation into `(reasoning, rest)`. The
+    /// model's `<channel|>` separates the reasoning (with the `/prethink` `seed`
+    /// prefix, if any) from the answer and tool calls. With no close, `rest` is
+    /// the whole decode, so calls left inside the thought still parse.
     pub fn settle_tool_reply<D: TextDecoder>(
         &self,
         decoder: &D,

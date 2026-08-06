@@ -17,13 +17,36 @@ pub(crate) struct StablePrefix {
     pub hit_stop: bool,
 }
 
+/// Index of the first stop id in `ids` not inside an open `<|"|>` quote run,
+/// with quote parity seeded by `start_in_quote`. `quote = None` is the plain
+/// scan. Shared by the stream [`Stabilizer`] and the engine's generation-side
+/// stop-cut so the two cut identical text.
+pub(crate) fn first_unquoted_stop(
+    ids: &[u32],
+    stops: &[u32],
+    quote: Option<u32>,
+    start_in_quote: bool,
+) -> Option<usize> {
+    let Some(q) = quote else {
+        return ids.iter().position(|id| stops.contains(id));
+    };
+    let mut in_quote = start_in_quote;
+    for (i, &id) in ids.iter().enumerate() {
+        if id == q {
+            in_quote = !in_quote;
+        } else if !in_quote && stops.contains(&id) {
+            return Some(i);
+        }
+    }
+    None
+}
+
 /// Per-position stable-streak tracking plus a stop-token cut over raw per-step
 /// canvas snapshots. A position's argmax must hold for [`STABLE_STREAK`]
 /// consecutive steps before it streams. On `block_done` the whole canvas is
-/// stable by definition. With `stop_skip_quoted`, a stop id inside an open
-/// `<|"|>` quote run is literal content. That must match the engine's
-/// `continue_incomplete_tool_calls` scan so the stream and the engine cut the
-/// same text.
+/// stable by definition. The stop cut runs the shared [`first_unquoted_stop`],
+/// so a `stop_skip_quoted` run cuts exactly where the engine's generation-side
+/// stop does.
 pub(crate) struct Stabilizer {
     stops: Vec<u32>,
     quote: Option<u32>,
@@ -81,18 +104,11 @@ impl Stabilizer {
                 .position(|&k| k < STABLE_STREAK)
                 .unwrap_or(ev.argmax.len())
         };
-        let mut ids = Vec::with_capacity(prefix_end);
-        let mut hit_stop = false;
-        let mut in_quote = self.stop_skip_quoted && self.committed_quote_open;
-        for &id in &ev.argmax[..prefix_end] {
-            if self.stop_skip_quoted && Some(id) == self.quote {
-                in_quote = !in_quote;
-            } else if !in_quote && self.stops.contains(&id) {
-                hit_stop = true;
-                break;
-            }
-            ids.push(id);
-        }
+        let skip_quote = self.stop_skip_quoted.then_some(self.quote).flatten();
+        let prefix = &ev.argmax[..prefix_end];
+        let cut = first_unquoted_stop(prefix, &self.stops, skip_quote, self.committed_quote_open);
+        let hit_stop = cut.is_some();
+        let ids = prefix[..cut.unwrap_or(prefix_end)].to_vec();
 
         if ev.block_done {
             self.last_argmax.clear();
