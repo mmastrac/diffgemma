@@ -311,15 +311,7 @@ impl Worker {
             prefill_status,
         );
 
-        let out = match stage.call(PipelineOp::Generate {
-            prompt: prompt.clone(),
-            cfg: Box::new(cfg),
-            label: "serve".into(),
-        }) {
-            PipelineEvent::Generated { out, .. } => Ok(*out),
-            PipelineEvent::Error(err) => Err(crate::Error::Pipeline(err)),
-            ev => Err(crate::Error::Pipeline(format!("unexpected event {ev:?}"))),
-        };
+        let out = crate::pipeline::generate(stage, prompt.clone(), Box::new(cfg), "serve");
         match out {
             Ok(out) => {
                 flush_paced(&mapper, &job.resp, tool_mode);
@@ -553,6 +545,14 @@ impl Worker {
     }
 
     /// Per-request generation config shared by every serve path.
+    /// Continue-past-stop: on only under the flag and in tool mode. The engine
+    /// stop-cut and the stream mapper's quoted-stop skip both derive from this,
+    /// so they cannot drift out of lockstep.
+    fn continue_past_stop(&self, job: &Job) -> bool {
+        crate::flags::continue_past_stop_enabled()
+            && needs_tool_rendering(&job.messages, &job.tools)
+    }
+
     fn per_request_cfg(&self, job: &Job, budget: usize) -> crate::metal::StepGenerateConfig {
         let mut cfg = self.base_cfg.clone();
         cfg.sampler = crate::sample::sampler_for_steps(self.steps, self.no_early_stop);
@@ -565,11 +565,9 @@ impl Worker {
         // rescuing the call. Honor the model's stop; repair belongs to the
         // tool-repair stage (feedback + rewind), not forced continuation.
         // `DGQ_CONTINUE_PAST_STOP=1` restores the old bet.
-        cfg.continue_incomplete_tool_calls = crate::flags::continue_past_stop_enabled()
-            && needs_tool_rendering(&job.messages, &job.tools);
-        // Only read under the flag above: quoted stop ids are literal
-        // tool-arg content, not stops (mirrored by `make_mapper`'s
-        // stop_skip_quoted so stream and turn stay in lockstep).
+        cfg.continue_incomplete_tool_calls = self.continue_past_stop(job);
+        // Only read under the flag above: quoted stop ids are literal tool-arg
+        // content, not stops.
         cfg.quote_token_id = self.quote_tok;
         cfg.degenerate_reply_check =
             crate::chat_template::empty_reply_check(&self.model_dir, self.stop_token_ids.clone());
@@ -590,10 +588,7 @@ impl Worker {
                 // Quote-parity split only applies where `<|"|>` runs are
                 // grammar, which is tool mode.
                 quote: tool_mode.then_some(self.quote_tok).flatten(),
-                // Stop-skip must mirror the engine's stop policy (see
-                // `per_request_cfg`), or skipping a quoted stop the engine
-                // honors (or the reverse) would desync stream and turn.
-                stop_skip_quoted: crate::flags::continue_past_stop_enabled() && tool_mode,
+                stop_skip_quoted: self.continue_past_stop(job),
                 thinking: job.enable_thinking,
                 emit_drafts: job.emit_drafts,
                 paced: crate::flags::paced_stream_enabled(),
@@ -792,14 +787,15 @@ impl Worker {
             attach_stream_observer(&mut cfg, &mapper, &job.resp, true, true, None);
             self.attach_block_commit_logger(&mut cfg, log_seq, &file_block);
 
-            let out = match stage.call(PipelineOp::Generate {
-                prompt: round_prompt.clone(),
-                cfg: Box::new(cfg),
-                label: "serve".into(),
-            }) {
-                PipelineEvent::Generated { out, .. } => *out,
-                ev => {
-                    let _ = job.resp.send(ServerEvent::Error(format!("{ev:?}")));
+            let out = match crate::pipeline::generate(
+                stage,
+                round_prompt.clone(),
+                Box::new(cfg),
+                "serve",
+            ) {
+                Ok(out) => out,
+                Err(e) => {
+                    let _ = job.resp.send(ServerEvent::Error(format!("{e:?}")));
                     return;
                 }
             };
