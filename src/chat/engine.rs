@@ -982,7 +982,7 @@ impl TurnRunner<'_> {
                         .to_string(),
                 ));
             }
-            // Chat always reopens the thought: a tool-mode turn always reasons.
+            // The chat loop always reopens the thought: a tool-mode turn reasons.
             let mut tail = crate::tools::tool_continuation_tail(&responses, true);
             if reseed && let Some(s) = seed {
                 tail.push_str(s.trim());

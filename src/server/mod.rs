@@ -412,34 +412,36 @@ fn attach_stream_observer(
     // the in-flight generate instead of denoising into the void.
     let cancel = crate::metal::CancelToken::new();
     cfg.cancel = Some(cancel.clone());
-    cfg.step_observer = Some(Arc::new(move |ev: &crate::decoder::StepProgressEvent<'_>| {
-        if let Some(ref started) = prefill_status
-            && !started.swap(true, Ordering::Relaxed)
-        {
-            let _ = resp.send(ServerEvent::Delta(WireDelta::Reasoning("\n\n".into())));
-        }
-        if log_progress
-            && (ev.step_in_block == 1 || ev.step_in_block.is_multiple_of(5) || ev.block_done)
-        {
-            eprintln!(
-                "serve: block {}/{} step {}/{} {}%",
-                ev.block_idx,
-                ev.max_blocks,
-                ev.step_in_block,
-                ev.max_steps,
-                serve_progress_pct(ev.accept_count, ev.mean_entropy, ev.argmax.len()),
-            );
-        }
-        let deltas = mapper.lock().unwrap().on_step(ev);
-        for d in deltas {
-            let Some(d) = filter_tool_markup_delta(d, strip_tool_markup, &suppress) else {
-                continue;
-            };
-            if resp.send(ServerEvent::Delta(d)).is_err() {
-                cancel.cancel();
+    cfg.step_observer = Some(Arc::new(
+        move |ev: &crate::decoder::StepProgressEvent<'_>| {
+            if let Some(ref started) = prefill_status
+                && !started.swap(true, Ordering::Relaxed)
+            {
+                let _ = resp.send(ServerEvent::Delta(WireDelta::Reasoning("\n\n".into())));
             }
-        }
-    }));
+            if log_progress
+                && (ev.step_in_block == 1 || ev.step_in_block.is_multiple_of(5) || ev.block_done)
+            {
+                eprintln!(
+                    "serve: block {}/{} step {}/{} {}%",
+                    ev.block_idx,
+                    ev.max_blocks,
+                    ev.step_in_block,
+                    ev.max_steps,
+                    serve_progress_pct(ev.accept_count, ev.mean_entropy, ev.argmax.len()),
+                );
+            }
+            let deltas = mapper.lock().unwrap().on_step(ev);
+            for d in deltas {
+                let Some(d) = filter_tool_markup_delta(d, strip_tool_markup, &suppress) else {
+                    continue;
+                };
+                if resp.send(ServerEvent::Delta(d)).is_err() {
+                    cancel.cancel();
+                }
+            }
+        },
+    ));
 }
 
 /// Release any text the paced-stream mapper is still holding (a turn can end

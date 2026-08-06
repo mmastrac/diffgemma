@@ -17,9 +17,9 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use super::config::StepGenerateConfig;
-use crate::decoder::StepProgressEvent;
 use super::progress::{DenoiseStopReason, log_denoise_step_progress, step_answer_text};
 use super::session::{StepGenerateSession, longest_common_prefix, perturb_live_kv_f16};
+use crate::decoder::StepProgressEvent;
 use crate::flags::progress_enabled;
 
 /// Monolithic generate: prefill prompt → denoise blocks → extend KV (matches `generate_inner` structure).
@@ -150,12 +150,15 @@ fn default_commit_policy(
     let quote_skip = cfg
         .quote_token_id
         .filter(|_| cfg.continue_incomplete_tool_calls);
+    let reply_so_far = &ts.sequences[ts.prompt_token_ids.len()..];
+    let start_in_quote =
+        quote_skip.is_some_and(|q| reply_so_far.iter().filter(|&&id| id == q).count() % 2 == 1);
     if !cfg.stop_token_ids.is_empty()
-        && let Some(rel) = first_unquoted_stop(
+        && let Some(rel) = crate::decoder::first_unquoted_stop(
             &argmax_tokens,
             &cfg.stop_token_ids,
             quote_skip,
-            &ts.sequences[ts.prompt_token_ids.len()..],
+            start_in_quote,
         )
     {
         kept = rel;
@@ -231,29 +234,6 @@ fn default_commit_policy(
         return Ok(false);
     }
     Ok(!end_turn)
-}
-
-/// Index of the first stop id in `block` that is not inside an open `<|"|>`
-/// quote run, with quote parity carried in from `reply_so_far` (the reply
-/// tokens committed before this block). `quote = None` is the plain scan.
-pub(super) fn first_unquoted_stop(
-    block: &[u32],
-    stops: &[u32],
-    quote: Option<u32>,
-    reply_so_far: &[u32],
-) -> Option<usize> {
-    let Some(q) = quote else {
-        return block.iter().position(|id| stops.contains(id));
-    };
-    let mut in_quote = reply_so_far.iter().filter(|&&id| id == q).count() % 2 == 1;
-    for (i, &id) in block.iter().enumerate() {
-        if id == q {
-            in_quote = !in_quote;
-        } else if !in_quote && stops.contains(&id) {
-            return Some(i);
-        }
-    }
-    None
 }
 
 /// Open a turn: select and run the prefill path (cross-turn reuse / fast

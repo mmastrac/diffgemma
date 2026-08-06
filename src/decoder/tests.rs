@@ -134,7 +134,7 @@ fn show_thinking_splits_reasoning_from_answer() {
     let _ = d.on_step(&step(1, 1, &reasoning, false));
     let _ = d.on_step(&step(1, 2, &reasoning, false));
     let e = d.on_step(&step(1, 3, &reasoning, false));
-    // The reasoning surfaced as Thought, never as answer Text.
+    // The reasoning surfaced as a `Thought` event, never as answer `Text`.
     assert_eq!(thoughts(&e), vec!["Hi"]);
     assert_eq!(texts(&e), Vec::<&str>::new());
     // Now the thought closes and the answer appears (committed on block_done).
@@ -351,4 +351,26 @@ fn stabilizer_skips_quoted_stops_and_carries_parity() {
     assert!(sp.new_block);
     assert_eq!(sp.ids, vec![STOP, QUOTE]);
     assert!(sp.hit_stop); // the second STOP falls outside the closed quote
+}
+
+#[test]
+fn first_unquoted_stop_respects_quote_parity() {
+    let stops = [99u32];
+    // No quote id: plain scan.
+    assert_eq!(
+        first_unquoted_stop(&[7, 99, 8], &stops, None, false),
+        Some(1)
+    );
+    // Quoted stop skipped, the next unquoted one found.
+    assert_eq!(
+        first_unquoted_stop(&[4, 99, 4, 99], &stops, Some(4), false),
+        Some(3)
+    );
+    // Starting inside a quote run (odd parity carried in from the reply so far).
+    assert_eq!(
+        first_unquoted_stop(&[99, 4, 99], &stops, Some(4), true),
+        Some(2)
+    );
+    // Fully quoted block: no stop at all.
+    assert_eq!(first_unquoted_stop(&[99, 99], &stops, Some(4), true), None);
 }

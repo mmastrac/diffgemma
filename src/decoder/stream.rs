@@ -43,10 +43,9 @@ pub struct StreamDecoder<D: TextDecoder> {
     /// `--show-thinking` turn opens its own thought channel and leaves this
     /// `None`.
     prethink_seed: Option<String>,
-    /// The generation begins inside an already-open thought channel whose open
-    /// marker was in the prompt (a `/prethink` continuation, or a tool round's
-    /// forced-open thought). Independent of display: the split must classify the
-    /// leading ids as thought even when nothing surfaces them.
+    /// Generation begins inside an already-open thought (a `/prethink`
+    /// continuation or a tool round's forced-open thought). The split classifies
+    /// the leading ids as reasoning regardless of whether display is on.
     start_in_thought: bool,
 }
 
@@ -120,13 +119,10 @@ impl<D: TextDecoder> StreamDecoder<D> {
             locked: sp.ids.len(),
         });
 
-        // Reasoning-separating path (`--show-thinking`, `/prethink`, or a
-        // generation that begins in-thought): split the whole generation at the
-        // token level each step. The reasoning streams as `Thought` when
-        // displayed (discarded otherwise), and the answer after the model's
-        // `<channel|>` streams as the normal `Text`. The full re-split handles a
-        // thought that spans several blocks, where an append-only path would
-        // need the open marker in the live block.
+        // Reasoning-separating path (`--show-thinking`, `/prethink`, or
+        // start-in-thought): re-split the whole generation each step so a thought
+        // spanning several blocks still classifies. Reasoning streams as
+        // `Thought` (when displayed), the answer after `<channel|>` as `Text`.
         if self.thinking_display || self.start_in_thought {
             if ev.block_done {
                 self.committed_ids.extend_from_slice(&sp.ids);
