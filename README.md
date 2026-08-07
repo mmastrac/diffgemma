@@ -4,10 +4,10 @@ A low-dependency Rust + Metal inference engine for
 [DiffusionGemma 26B-A4B-it](https://huggingface.co/google/diffusiongemma-26B-A4B-it)
 (Gemma-4 26B-A4B MoE, discrete block diffusion) on Apple Silicon.
 
-DiffusionGemma doesn't decode one token at a time. It denoises a 256-token
-canvas in parallel, trading memory bandwidth for compute. That's the regime
-Apple Silicon GPUs like. This engine ports that loop straight to Metal. No
-Python, no PyTorch, no MLX at run time.
+Unlike a traditional LLM that generates one token at a time. DiffusionGemma
+denoises a 256-token canvas in parallel, trading memory bandwidth for compute.
+This engine ports that loop straight to Metal (ie: no Python, no PyTorch, no
+MLX at run time)
 
 ---
 
@@ -31,8 +31,9 @@ Python, no PyTorch, no MLX at run time.
 
 ## Quickstart
 
-Numbers below are for a clean M3 Pro / 36 GB. The long pole is the one-time
-model download. Build and quantize together take a few minutes.
+The recommended path is using `cargo install` and `diffgemma download` to get
+the binary and model. If you are familiar with the huggingface tools, `hf download`
+may be a faster way to download it.
 
 ### 1. Install
 
@@ -43,55 +44,33 @@ your `PATH`):
 cargo install --git https://github.com/mmastrac/diffgemma
 ```
 
-Now run `diffgemma` from anywhere. Add `--tag <tag>` to pin a release
-instead of building the default branch.
-
-To hack on the engine or build a specific revision, clone and build in place:
-
-```bash
-git clone https://github.com/mmastrac/diffgemma diffgemma
-cd diffgemma
-cargo build --release
-```
-
-The binary lands at `target/release/diffgemma`. The examples below use that
-path. If you installed with `cargo install`, just run `diffgemma`.
+Now run `diffgemma` from anywhere.
 
 ### 2. Get the model
 
-Two ways to end up with a runnable pack.
+The preferred model is `mmastrac/diffgemma-26b-a4b-it-q4` on huggingface. The `-q4`
+variant is designed to balance memory and generation performance on consumer hardware.
 
 **Option A: download a ready-to-run pack (recommended).** The `download` command
-fetches a pre-quantized `.dgq` pack from Hugging Face and verifies it (manifest,
-version, blob length) before it prints `download ok`:
+fetches a pre-quantized `.dgq` pack from huggingface and verifies it:
 
 ```bash
 target/release/diffgemma download
 # defaults to mmastrac/diffgemma-26b-a4b-it-q4 -> model/diffgemma-26b-a4b-it-q4
 ```
 
-Pass `-o DIR` for a different target, or `--repo ORG/NAME --revision REV` for a
-specific pack. `download` reuses your Hugging Face cache: any file already under
-`~/.cache/huggingface/hub/` is symlinked in rather than re-fetched, so
+Pass `--repo ORG/NAME --revision REV` for a specific quantization pack.
 
-```bash
-hf download mmastrac/diffgemma-26b-a4b-it-q4   # populates the HF cache
-target/release/diffgemma download          # links from cache, no second transfer
-```
-
-costs one transfer, not two. Skip to [step 3](#3-run).
+Skip to [step 3](#3-run).
 
 **Option B: quantize it yourself.** Fetch the bf16 weights into your Hugging
-Face cache. You need the `hf` CLI (`pip install -U huggingface_hub`) and access
-to the gated repo:
+Face cache. You need the `hf` CLI (`pip install -U huggingface_hub` or `uvx hf`):
 
 ```bash
 hf download google/diffusiongemma-26B-A4B-it
 ```
 
-That is ~50 GB and lands in `~/.cache/huggingface/hub/`. You do not need
-`--local-dir`. The quantizer reads the checkpoint from the cache by its repo id.
-Then quantize:
+That is ~50 GB and lands in `~/.cache/huggingface/hub/`. The quantizer reads the checkpoint:
 
 ```bash
 target/release/diffgemma quantize \
@@ -100,11 +79,11 @@ target/release/diffgemma quantize \
   --profile q4
 ```
 
-`-m` takes a local directory or an `org/name` Hugging Face repo id. A repo id
-resolves to the newest snapshot in your cache, and fails with the exact `hf
-download` command to run if nothing is cached. This writes a self-contained
-`model/diffgemma-26b-a4b-it-q4/` directory (`model.dgq.json` manifest,
-`model.dgq.bin` blob, plus the copied tokenizer and config) in a few minutes.
+`-m` takes a local directory or an `org/name` huggingface repo id.
+
+This writes a self-contained `model/diffgemma-26b-a4b-it-q4/`
+directory (`model.dgq.json` manifest, `model.dgq.bin` blob, plus the
+copied tokenizer and config) in a few minutes.
 
 Profiles (embeddings, router, and norms always stay bf16, since they are
 precision-sensitive and small):
@@ -122,31 +101,28 @@ precision-sensitive and small):
 
 ### 3. Run
 
-`-m` is optional. With no `-m`, the engine auto-discovers a model: a local
-`model/diffgemma-*` pack, or a `diffgemma-*` pack already in your Hugging Face
-cache. So `hf download mmastrac/diffgemma-26b-a4b-it-q4` on its own is enough to
-then run flagless (the engine prints `using model: <dir>` for what it picked).
-The examples below pass `-m <dir | org/name>` to choose one explicitly.
+`-m` is optional. The engine auto-discovers models (either a
+`model/diffgemma-*` pack, or a `diffgemma-*` pack already in your huggingface
+cache).
 
 One-shot prompt:
 
 ```bash
-target/release/diffgemma ask \
-  -m model/diffgemma-26b-a4b-it-q4 \
+diffgemma ask \
   -p "Explain block diffusion decoding in two sentences."
 ```
 
 Interactive chat:
 
 ```bash
-target/release/diffgemma chat -m model/diffgemma-26b-a4b-it-q4
+diffgemma chat -m model/diffgemma-26b-a4b-it-q4
 ```
 
 OpenAI-compatible HTTP server (defaults to `127.0.0.1:8080`, 128k-token
 context):
 
 ```bash
-target/release/diffgemma serve -m model/diffgemma-26b-a4b-it-q4
+diffgemma serve
 # then POST to http://127.0.0.1:8080/v1/chat/completions
 ```
 
@@ -163,7 +139,7 @@ at `http://127.0.0.1:8080/v1` (check it with `curl 127.0.0.1:8080/v1/models`).
 Start it:
 
 ```bash
-target/release/diffgemma serve -m model/diffgemma-26b-a4b-it-q4 --ctx 100000
+target/release/diffgemma serve --ctx 100000
 ```
 
 opencode has to know that endpoint as a provider, but you **don't need to edit a
@@ -184,14 +160,25 @@ OPENCODE_CONFIG_CONTENT='{
 }' opencode -m diffgemma/diffgemma-26b-a4b-it-q4
 ```
 
-`serve` does no auth, so the `apiKey` is a placeholder (opencode's provider still
-wants the field present). The model id must match what `serve` reports. Append
+The model id must match what `serve` reports. Append
 `:think` or `:think=false` to force thinking on or off (for example
 `diffgemma-26b-a4b-it-q4:think=false`).
 
 For a permanent setup, drop that same `"provider"` block into `opencode.json`
 (project) or `~/.config/opencode/opencode.json` (global) and run
 `opencode -m diffgemma/diffgemma-26b-a4b-it-q4`.
+
+## Local Development
+
+To hack on the engine or build a specific revision, clone and build in place:
+
+```bash
+git clone https://github.com/mmastrac/diffgemma diffgemma
+cd diffgemma
+cargo build --release
+```
+
+The binary is generated in `target/release/diffgemma`.
 
 ## Performance
 
