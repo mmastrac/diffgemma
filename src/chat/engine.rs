@@ -638,6 +638,7 @@ impl TurnRunner<'_> {
                 prethink_seed: open_seed,
                 start_in_thought: false,
                 stream_output: self.stream_output,
+                progressive: true,
             },
             std::sync::Arc::clone(&self.sinks),
             0,
@@ -781,6 +782,9 @@ impl TurnRunner<'_> {
                     prethink_seed: think_seed.map(str::to_string),
                     start_in_thought: true,
                     stream_output: self.stream_output,
+                    // Tool rounds settle through salvage/preamble extraction
+                    // and can evaporate under repair: pane-only preview.
+                    progressive: false,
                 },
                 std::sync::Arc::clone(&self.sinks),
                 round,

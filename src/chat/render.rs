@@ -271,6 +271,15 @@ impl Viewport {
         let _ = std::io::stdout().flush();
     }
 
+    /// Print `chunk` (whole lines, each ending with a newline) at the anchor
+    /// row while the region is still active: the region scrolls it up into
+    /// real scrollback and the pane below is untouched. Only text that can
+    /// never be revised may go through here: scrollback cannot be unprinted.
+    fn flush_permanent(&self, chunk: &str) {
+        print!("\x1b[{};1H{chunk}", self.anchor);
+        let _ = std::io::stdout().flush();
+    }
+
     /// Reset the region, wipe the pane, and print `permanent` (which should end
     /// with a newline) into normal flow from the anchor, where it scrolls into
     /// real scrollback. Idempotent teardown is left to `Drop`.
@@ -292,15 +301,29 @@ impl Drop for Viewport {
     }
 }
 
-/// Terminal render state: a live preview in a reserved bottom pane plus a
-/// one-shot authoritative print at `finish`.
+/// The flushable byte cut of `text`: the end of the last complete line that
+/// is both block-committed (`committed`, from the `Text` event) and settled
+/// (`tools::settled_prefix_len`: no unclosed fence or forming tool call whose
+/// completion could re-mask earlier bytes). Text before the cut can never
+/// change, so it is safe to print into scrollback.
+fn flush_cut(text: &str, committed: usize) -> usize {
+    let committed = committed.min(text.len());
+    let settled = crate::tools::settled_prefix_len(&text[..committed]);
+    text[..settled].rfind('\n').map_or(0, |i| i + 1)
+}
+
+/// Terminal render state: a live preview in a reserved bottom pane plus an
+/// authoritative print at `finish`.
 ///
-/// The forming answer/reasoning streams into a fixed [`Viewport`] pane; the
-/// authoritative reply is printed once, at `finish`, into normal scrollback. The
-/// stream's stable prefix is speculative and can still be revised, so it is never
-/// flushed permanently — only the settled reply is. When there is no viewport
-/// (no cursor report, or a non-tty), the preview degrades to a single spinner
-/// line and the reply still prints at `finish`.
+/// The forming answer/reasoning streams into a fixed [`Viewport`] pane. The
+/// stream's stable-prefix tail is speculative and can still be revised, so it
+/// lives only in the pane. Text behind [`flush_cut`] is final, and a
+/// `progressive` turn prints those whole lines into real scrollback as they
+/// settle, keeping only the still-converging tail in the pane. `finish`
+/// prints whatever the authoritative reply adds beyond the flushed prefix
+/// (all of it, on a non-progressive turn). When there is no viewport (no
+/// cursor report, or a non-tty), the preview degrades to a single spinner
+/// line and the reply still prints whole at `finish`.
 ///
 /// Two orthogonal display toggles:
 /// - `show_thinking`: stream the reasoning (`Thought` events) grey under `think>`
@@ -322,10 +345,25 @@ struct Render {
     answer_started: bool,
     /// The reserved bottom pane, when the terminal supports it.
     viewport: Option<Viewport>,
+    /// Flush committed settled lines into scrollback mid-turn. Off for tool
+    /// rounds, whose settled text is reshaped at round end (salvage, preamble
+    /// extraction), so their preview stays pane-only.
+    progressive: bool,
+    /// Committed byte prefix of `text` (from the latest `Text` event).
+    committed: usize,
+    /// Answer bytes already printed into scrollback; always a prefix of the
+    /// `text` they were cut from, ending at a newline.
+    flushed: String,
+    /// `text` stopped extending `flushed` (a rare committed-text revision):
+    /// flushing stops and `finish` reconciles against the authoritative reply.
+    frozen: bool,
+    /// The `think>` block printed ahead of the first flushed answer line, so
+    /// `finish` prints only what the thought gained since (usually nothing).
+    thought_flushed: String,
 }
 
 impl Render {
-    fn new(show_thinking: bool, stream_output: bool, interactive: bool) -> Self {
+    fn new(show_thinking: bool, stream_output: bool, interactive: bool, progressive: bool) -> Self {
         // A multi-line preview earns a tall pane; a spinner-only turn takes one row.
         let viewport = interactive.then(|| {
             let want = if show_thinking || stream_output {
@@ -350,6 +388,11 @@ impl Render {
             thought: String::new(),
             answer_started: false,
             viewport: viewport.flatten(),
+            progressive: progressive && stream_output,
+            committed: 0,
+            flushed: String::new(),
+            frozen: false,
+            thought_flushed: String::new(),
         }
     }
 
@@ -376,8 +419,9 @@ impl Render {
                     self.thought = text.clone();
                 }
             }
-            ChatEvent::Text { text, .. } => {
+            ChatEvent::Text { committed, text } => {
                 self.answer_started = true;
+                self.committed = *committed;
                 self.text = text.clone();
             }
             _ => {}
@@ -401,7 +445,13 @@ impl Render {
         let (marker, body, color) = if reasoning {
             ("think> ", self.thought.trim(), GREY)
         } else if self.stream_output {
-            ("model> ", self.text.trim(), DIM)
+            // After a progressive flush the pane holds only the unflushed
+            // tail, markerless: it continues the flushed lines above. A
+            // frozen turn falls back to previewing the whole text.
+            match self.text.strip_prefix(self.flushed.as_str()) {
+                Some(tail) if !self.flushed.is_empty() => ("", tail.trim(), DIM),
+                _ => ("model> ", self.text.trim(), DIM),
+            }
         } else {
             return vec![self.status_line(frame)]; // answer withheld
         };
@@ -416,10 +466,47 @@ impl Render {
             .collect()
     }
 
+    /// Flush newly settled committed lines into scrollback (progressive turns
+    /// with a viewport only). The one rare failure mode, `text` no longer
+    /// extending what was flushed, freezes flushing for the turn instead of
+    /// printing a revision.
+    fn flush_committed(&mut self) {
+        if !self.progressive || self.frozen || self.viewport.is_none() || !self.answer_started {
+            return;
+        }
+        if !self.text.starts_with(self.flushed.as_str()) {
+            self.frozen = true;
+            return;
+        }
+        let cut = flush_cut(&self.text, self.committed);
+        if cut <= self.flushed.len() {
+            return;
+        }
+        let mut chunk = String::new();
+        if self.flushed.is_empty() {
+            // The settled reasoning precedes the first answer line, exactly
+            // where `finish` would have put it.
+            if self.show_thinking {
+                let t = self.thought.trim();
+                if !t.is_empty() {
+                    chunk.push_str(&format!("{GREY}think> {t}{UNDIM}\n"));
+                    self.thought_flushed = t.to_string();
+                }
+            }
+            chunk.push_str("model> ");
+        }
+        chunk.push_str(&self.text[self.flushed.len()..cut]);
+        self.flushed = self.text[..cut].to_string();
+        if let Some(vp) = &self.viewport {
+            vp.flush_permanent(&chunk);
+        }
+    }
+
     /// Repaint. Sole stdout writer during a turn.
     fn paint(&mut self) {
         let frame = SPINNER[self.spinner % SPINNER.len()];
         self.spinner = self.spinner.wrapping_add(1);
+        self.flush_committed();
         match &self.viewport {
             Some(vp) => {
                 let lines = self.preview_lines(frame, vp.n as usize, winsize().0);
@@ -437,18 +524,40 @@ impl Render {
     /// turns) above the reply, then `stats` as a trailing dim line. `reply` is
     /// the answer text (empty renders as `(empty response)`); `None` prints no
     /// `model>` line at all, for a tool-call round that only reasoned before
-    /// calling.
+    /// calling. A progressive turn already flushed a prefix of the reply (and
+    /// its `think>` block), so only the remainder prints here. An
+    /// authoritative reply that does not extend the flushed prefix (the rare
+    /// committed-text revision) reprints whole under a correction notice.
     fn finish(&mut self, reply: Option<&str>, stats: Option<&str>) {
         let mut permanent = String::new();
         if self.show_thinking {
             let t = self.thought.trim();
-            if !t.is_empty() {
+            if !t.is_empty() && self.thought_flushed.is_empty() {
                 permanent.push_str(&format!("{GREY}think> {t}{UNDIM}\n"));
+            } else if let Some(gained) = t.strip_prefix(self.thought_flushed.as_str())
+                && !gained.trim().is_empty()
+            {
+                permanent.push_str(&format!("{GREY}think> {}{UNDIM}\n", gained.trim()));
             }
         }
         match reply {
-            Some(r) if !r.is_empty() => permanent.push_str(&format!("model> {r}\n")),
-            Some(_) => permanent.push_str("model> (empty response)\n"),
+            Some(r) if self.flushed.is_empty() => {
+                if !r.is_empty() {
+                    permanent.push_str(&format!("model> {r}\n"));
+                } else {
+                    permanent.push_str("model> (empty response)\n");
+                }
+            }
+            Some(r) => match r.strip_prefix(self.flushed.as_str()) {
+                Some(rest) => {
+                    if !rest.is_empty() {
+                        permanent.push_str(&format!("{rest}\n"));
+                    }
+                }
+                None => permanent.push_str(&format!(
+                    "{DIM}(the streamed reply above was revised, final version below){UNDIM}\nmodel> {r}\n"
+                )),
+            },
             None => {}
         }
         if let Some(line) = stats {
@@ -474,7 +583,7 @@ pub fn render_demo(stage: &str) {
     }
     println!("you> demo: explain the plan");
     let _ = std::io::stdout().flush();
-    let mut r = Render::new(true, true, true);
+    let mut r = Render::new(true, true, true, true);
     r.apply(&ChatEvent::Status {
         block: 1,
         step: 1,
@@ -505,12 +614,21 @@ pub fn render_demo(stage: &str) {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        r.apply(&ChatEvent::Text { committed: 0, text });
+        // All but the newest line reads as block-committed, so the demo
+        // exercises the progressive scrollback flush.
+        let committed = text.rfind('\n').map_or(0, |n| n + 1);
+        r.apply(&ChatEvent::Text { committed, text });
         r.paint();
         std::thread::sleep(Duration::from_millis(120));
     }
+    // The authoritative reply extends the streamed text (the normal case), so
+    // finish prints only the last, never-flushed line.
+    let reply = (0..6)
+        .map(|j| format!("answer line {j}: content long enough that it might overflow the pane"))
+        .collect::<Vec<_>>()
+        .join("\n");
     r.finish(
-        Some("The final settled answer, line one.\nAnd line two of the reply."),
+        Some(&reply),
         Some("(42 tok · 12 steps · 3.1s · 13.5 tok/s)"),
     );
     std::thread::sleep(Duration::from_secs(30));
@@ -554,6 +672,12 @@ pub struct StreamDisplay {
     pub start_in_thought: bool,
     /// Stream the answer as it forms (default) vs print it whole at `finish`.
     pub stream_output: bool,
+    /// Flush committed settled lines into real scrollback as the answer forms
+    /// (plain turns). Off for tool rounds: their settled text is reshaped at
+    /// round end (salvage, preamble extraction) and, under the opt-in
+    /// validator/repair stages, a whole streamed draft can evaporate. The
+    /// pane-only preview already shows those rounds streaming.
+    pub progressive: bool,
 }
 
 impl ChatStream {
@@ -580,7 +704,12 @@ impl ChatStream {
         let shared = Arc::new(Mutex::new(Shared {
             decoder,
             sinks,
-            render: Render::new(show_thinking, display.stream_output, interactive),
+            render: Render::new(
+                show_thinking,
+                display.stream_output,
+                interactive,
+                display.progressive,
+            ),
             interactive,
         }));
         {
