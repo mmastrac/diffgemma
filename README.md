@@ -47,12 +47,12 @@ After that, `diffgemma` should just work from anywhere.
 
 ### 2. Get the model
 
-The preferred pack is `mmastrac/diffgemma-26b-a4b-it-q4` on huggingface. The
-`-q4` variant is the one tuned for memory vs. generation speed on consumer
-hardware.
+The preferred pack is
+[`mmastrac/diffgemma-26b-a4b-it-q4`](https://huggingface.co/mmastrac/diffgemma-26b-a4b-it-q4)
+on Hugging Face. The `-q4` variant is the one tuned for memory vs. generation
+speed on consumer hardware.
 
-**Option A: download a ready-to-run pack (recommended).** `download` fetches a
-pre-quantized `.dgq` pack and verifies it:
+The `download` command fetches a pre-quantized `.dgq` pack and verifies it:
 
 ```bash
 diffgemma download
@@ -61,40 +61,8 @@ diffgemma download
 
 Pass `--repo ORG/NAME --revision REV` for a specific quantization pack.
 
-**Option B: quantize it yourself.** Pull the bf16 weights into your huggingface
-cache (`pip install -U huggingface_hub`, or `uvx hf`):
-
-```bash
-hf download google/diffusiongemma-26B-A4B-it
-```
-
-That will download ~50 GB into `~/.cache/huggingface/hub/`. Then point the
-quantizer at it:
-
-```bash
-diffgemma quantize \
-  -m google/diffusiongemma-26B-A4B-it \
-  -o model/diffgemma-26b-a4b-it-q4 \
-  --profile q4
-```
-
-`-m` accepts a local directory or an `org/name` repo id. You get a
-self-contained `model/diffgemma-26b-a4b-it-q4/` directory — manifest, blob,
-tokenizer, config — in a few minutes.
-
-Profiles (embeddings, router, and norms always stay bf16; they're
-precision-sensitive and small):
-
-| Profile        | MoE experts         | Attention + dense FFN | ~weights |
-| -------------- | ------------------- | --------------------- | -------- |
-| `q4` (default) | 4-bit affine (5.0b) | bf16                  | ~19 GiB  |
-| `nvfp4x`       | NVFP4 (~4.5b)       | bf16                  | ~18 GiB  |
-| `nvfp4`        | NVFP4               | NVFP4                 | ~16 GiB  |
-| `q6`           | 6-bit affine (7.0b) | bf16                  | ~24 GiB  |
-
-`--set class=format` overrides one tensor class (e.g. `--set experts=nvfp4`,
-which is what `nvfp4x` expands to). The full class/format matrix is available in
-[ARCHITECTURE.md](ARCHITECTURE.md).
+You can also [quantize the model yourself](#custom-quantization) for more
+control.
 
 ### 3. Run
 
@@ -161,6 +129,43 @@ For something permanent, drop that same `"provider"` block into `opencode.json`
 (project) or `~/.config/opencode/opencode.json` (global) and run
 `opencode -m diffgemma/diffgemma-26b-a4b-it-q4`.
 
+## Custom Quantization
+
+Pull the bf16 weights into your huggingface cache
+(`pip install -U huggingface_hub`, or `uvx hf`):
+
+```bash
+hf download google/diffusiongemma-26B-A4B-it
+```
+
+That will download ~50 GB into `~/.cache/huggingface/hub/`. Then point the
+quantizer at it:
+
+```bash
+diffgemma quantize \
+  -m google/diffusiongemma-26B-A4B-it \
+  -o model/diffgemma-26b-a4b-it-q4 \
+  --profile q4
+```
+
+`-m` accepts a local directory or an `org/name` repo id. You get a
+self-contained `model/diffgemma-26b-a4b-it-q4/` directory — manifest, blob,
+tokenizer, config — in a few minutes.
+
+Profiles (embeddings, router, and norms always stay bf16; they're
+precision-sensitive and small):
+
+| Profile        | MoE experts         | Attention + dense FFN | ~weights |
+| -------------- | ------------------- | --------------------- | -------- |
+| `q4` (default) | 4-bit affine (5.0b) | bf16                  | ~19 GiB  |
+| `nvfp4x`       | NVFP4 (~4.5b)       | bf16                  | ~18 GiB  |
+| `nvfp4`        | NVFP4               | NVFP4                 | ~16 GiB  |
+| `q6`           | 6-bit affine (7.0b) | bf16                  | ~24 GiB  |
+
+`--set class=format` overrides one tensor class (e.g. `--set experts=nvfp4`,
+which is what `nvfp4x` expands to). The full class/format matrix is available in
+[ARCHITECTURE.md](ARCHITECTURE.md).
+
 ## Local Development
 
 To hack on the engine or pin a specific revision, clone and build in place:
@@ -175,12 +180,15 @@ The binary will be written to `target/release/diffgemma`.
 
 ## Performance
 
-Head-to-head against **MLX-4bit**
-(`mlx-community/diffusiongemma-26B-A4B-it-4bit`, mlx-vlm 0.6.3 — Apple's fastest
-published config) on one M3 Pro / 36 GB machine.
+Head-to-head against MLX-4bit (`mlx-community/diffusiongemma-26B-A4B-it-4bit`)
+on one M3 Pro / 36 GB machine. Not quite the same quant: our default `q4` keeps
+attention, dense FFN, and embed at bf16 and only packs the MoE experts as
+group-32 affine (~5.0 bpw). MLX uses group-64 affine 4-bit across more of the
+model (~4.5 bpw on those tensors, with a few left at 8-bit). `diffgemma`'s
+default quantization keeps more precision outside of the MoE experts.
 
 **Prefill throughput** (tokens/sec processing the prompt), matched context
-length, mean of two interleaved runs on an idle machine:
+length:
 
 | Context | This engine |  MLX-4bit | Ratio              |
 | ------: | ----------: | --------: | :----------------- |
@@ -189,23 +197,12 @@ length, mean of two interleaved runs on an idle machine:
 |    100k |   233 tok/s | 238 tok/s | **parity (1.02×)** |
 
 MLX is a bit faster at short and medium context; at 100k it's a dead heat. The
-gap does **not** widen as context grows — earlier, pre-optimization builds used
-to collapse to ~2.4× slower at 100k. Both engines run chunked prefill, so
-neither OOMs on 36 GB.
+gap does **not** widen as context grows.
 
 **Recall** (needle-in-haystack, corpus-unique marker, retrieval verified): this
 engine is exact at 8k / 32k / 64k / 100k, with the marker ~40k tokens deep at
-100k. MLX matches at the 32k cross-check. Long-context KV uses a sliding-window
-ring, which is how a single 36 GB machine reaches ~105k tokens without swapping
-(MLX's full-precision KV would not fit that far).
-
-A few method notes, because these numbers are easy to over-read: prefill
-throughput is content-independent only above ~32k. At 8k it swings ~25% with
-prompt content (MoE routing locality), so the 8k row uses real text. The harness
-lives in `python/scripts/` (`mlx_prefill_bench.py`, `mlx_generate.py`). All of
-this is one machine and one MLX release — treat it as a single-config
-measurement until someone corroborates it on other hardware against a current
-MLX build.
+100k. Long-context KV uses a sliding-window ring, letting us reach ~105k tokens
+without swapping.
 
 ## Documentation
 
