@@ -597,6 +597,44 @@ fn fence_pair_cannot_swallow_a_real_call() {
 }
 
 #[test]
+fn settled_prefix_plain_and_closed_constructs_are_final() {
+    // Plain prose, a complete call, and a closed fence can never be
+    // reinterpreted by a suffix.
+    assert_eq!(settled_prefix_len("hello\nworld\n"), 12);
+    let call = "do it\ncall:edit{x:1}\ndone\n";
+    assert_eq!(settled_prefix_len(call), call.len());
+    let fenced = "before\n```rust\ncode\n```\nafter\n";
+    assert_eq!(settled_prefix_len(fenced), fenced.len());
+    // A `call:` with no brace yet is prose today and its mask, if a brace
+    // ever arrives, starts at that future brace: nothing here moves.
+    let bare = "as I said, call: me later\n";
+    assert_eq!(settled_prefix_len(bare), bare.len());
+}
+
+#[test]
+fn settled_prefix_holds_at_unfinished_constructs() {
+    // Unclosed fence: a future closer re-masks from the opener.
+    let open_fence = "safe line\n```rust\nstill streaming";
+    assert_eq!(settled_prefix_len(open_fence), 10);
+    // Unbalanced call body: a future `}` completes the arg mask at `call:`.
+    let open_call = "safe line\ncall:edit{x:<|\"|>partial";
+    assert_eq!(settled_prefix_len(open_call), 10);
+    // The earlier unfinished construct wins.
+    let both = "a\ncall:edit{open\n```\nb";
+    assert_eq!(settled_prefix_len(both), 2);
+}
+
+#[test]
+fn settled_prefix_matches_masked_ranges_straddle_walk() {
+    // The first opener's nearest closer straddles a call's args, so
+    // `masked_ranges` skips it; the next candidate opener (that closer) is
+    // then unclosed and a suffix ``` would mask from IT, not from the end.
+    let text = "``` call:edit{x:1} ``` tail";
+    let close = text.rfind("```").unwrap();
+    assert_eq!(settled_prefix_len(text), close);
+}
+
+#[test]
 fn masked_ranges_shapes() {
     // Complete call arg body masked; the call: keyword itself is not.
     let text = "call:a{x:<|\"|>v<|\"|>} tail";

@@ -67,6 +67,57 @@ pub(crate) fn masked_ranges(text: &str) -> Vec<(usize, usize)> {
     masks
 }
 
+/// Length of the prefix of `text` whose interpretation no appended suffix can
+/// change. Both mask passes fail open on an unfinished construct (an unclosed
+/// fence is ordinary text, an unbalanced call body is no call), so a later
+/// chunk that completes the construct retroactively re-masks bytes from where
+/// it started. Everything before the earliest unfinished construct is final:
+/// masks are built left-to-right and a suffix can only start new constructs
+/// at or after it. The chat renderer uses this to decide how much
+/// block-committed text may be flushed into terminal scrollback, where it can
+/// never be revised.
+pub(crate) fn settled_prefix_len(text: &str) -> usize {
+    let mut settled = text.len();
+    // Pass-1 replica: a `call:` whose braced body never balances is a call
+    // still forming; everything from the marker on may become an arg mask.
+    let mut args: Vec<(usize, usize)> = Vec::new();
+    let mut pos = 0usize;
+    while let Some(rel) = text[pos..].find("call:") {
+        let at = pos + rel;
+        let after = &text[at + "call:".len()..];
+        let Some(brace) = after.find('{') else { break };
+        match read_braced(&after[brace..]) {
+            Some((_, consumed)) => {
+                let start = at + "call:".len() + brace;
+                args.push((start, start + consumed));
+                pos = start + consumed;
+            }
+            None => {
+                settled = settled.min(at);
+                break;
+            }
+        }
+    }
+    // Pass-2 replica (same walk as `masked_ranges`, including the straddle
+    // skip): a fence opener with no closer yet may become a mask spanning
+    // from the opener once the closing ``` arrives.
+    const FENCE: &str = "```";
+    let mut at = 0usize;
+    while let Some(open) = find_unmasked(text, &args, FENCE, at) {
+        let Some(close) = find_unmasked(text, &args, FENCE, open + FENCE.len()) else {
+            settled = settled.min(open);
+            break;
+        };
+        let end = close + FENCE.len();
+        if args.iter().any(|&(s, e)| open < s && e <= end) {
+            at = open + FENCE.len();
+            continue;
+        }
+        at = end;
+    }
+    settled
+}
+
 /// First occurrence of `needle` at/after byte `from` that does not start
 /// inside a masked range. Masks must come from `masked_ranges(text)`.
 pub(crate) fn find_unmasked(
