@@ -650,6 +650,7 @@ impl TurnRunner<'_> {
                 start_in_thought: false,
                 stream_output: self.stream_output,
                 progressive: true,
+                paced: crate::flags::paced_stream_enabled(),
             },
             std::sync::Arc::clone(&self.sinks),
             0,
@@ -796,6 +797,7 @@ impl TurnRunner<'_> {
                     // Tool rounds settle through salvage/preamble extraction
                     // and can evaporate under repair: pane-only preview.
                     progressive: false,
+                    paced: crate::flags::paced_stream_enabled(),
                 },
                 std::sync::Arc::clone(&self.sinks),
                 round,

@@ -312,6 +312,55 @@ fn flush_cut(text: &str, committed: usize) -> usize {
     text[..settled].rfind('\n').map_or(0, |i| i + 1)
 }
 
+/// Bytes to newly reveal on a paced repaint: a fraction of the backlog so a
+/// block that lands whole drains fast at first then eases in, floored and capped
+/// so the rate stays legible either way. Tuned against the ~100 ms repaint tick.
+fn reveal_step(remaining: usize) -> usize {
+    (remaining / 8).clamp(6, 40).min(remaining)
+}
+
+/// Printable characters per group, and the pause between groups, for the
+/// no-viewport typewriter below.
+const TYPE_GROUP: usize = 4;
+const TYPE_DELAY_MS: u64 = 22;
+
+/// Print `s` to stdout as if typed: printable characters in small groups with a
+/// short pause between them, ANSI escape sequences passed through whole (never
+/// split, no pause). Used when a paced turn has no reserved pane to animate, so
+/// the settled reply streams into plain scrollback instead of landing at once.
+fn type_to_scrollback(s: &str) {
+    let mut out = std::io::stdout();
+    let mut buf = String::new();
+    let mut pending = 0usize;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        buf.push(c);
+        if c == '\x1b' {
+            // Pass the escape through atomically, up to its final letter.
+            while let Some(&n) = chars.peek() {
+                buf.push(n);
+                chars.next();
+                if n.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        pending += 1;
+        if pending >= TYPE_GROUP || c == '\n' {
+            let _ = write!(out, "{buf}");
+            let _ = out.flush();
+            std::thread::sleep(Duration::from_millis(TYPE_DELAY_MS));
+            buf.clear();
+            pending = 0;
+        }
+    }
+    if !buf.is_empty() {
+        let _ = write!(out, "{buf}");
+        let _ = out.flush();
+    }
+}
+
 /// Terminal render state: a live preview in a reserved bottom pane plus an
 /// authoritative print at `finish`.
 ///
@@ -349,6 +398,14 @@ struct Render {
     /// rounds, whose settled text is reshaped at round end (salvage, preamble
     /// extraction), so their preview stays pane-only.
     progressive: bool,
+    /// Pace the display: reveal the answer at a bounded rate per repaint so it
+    /// types out smoothly even when the model lands a whole block at once (the
+    /// held tail finishes typing in `finish`). Off shows every committed byte
+    /// immediately.
+    paced: bool,
+    /// Bytes of `text` currently allowed on screen while `paced`, advanced toward
+    /// `text.len()` each repaint. Unused when pacing is off.
+    revealed: usize,
     /// Committed byte prefix of `text` (from the latest `Text` event).
     committed: usize,
     /// Answer bytes already printed into scrollback; always a prefix of the
@@ -363,7 +420,13 @@ struct Render {
 }
 
 impl Render {
-    fn new(show_thinking: bool, stream_output: bool, interactive: bool, progressive: bool) -> Self {
+    fn new(
+        show_thinking: bool,
+        stream_output: bool,
+        interactive: bool,
+        progressive: bool,
+        paced: bool,
+    ) -> Self {
         // A multi-line preview earns a tall pane; a spinner-only turn takes one row.
         let viewport = interactive.then(|| {
             let want = if show_thinking || stream_output {
@@ -389,6 +452,8 @@ impl Render {
             answer_started: false,
             viewport: viewport.flatten(),
             progressive: progressive && stream_output,
+            paced: paced && stream_output && interactive,
+            revealed: 0,
             committed: 0,
             flushed: String::new(),
             frozen: false,
@@ -423,6 +488,9 @@ impl Render {
                 self.answer_started = true;
                 self.committed = *committed;
                 self.text = text.clone();
+                // A revision may shrink the text under the reveal cursor; never
+                // let it point past the end.
+                self.revealed = self.revealed.min(self.text.len());
             }
             _ => {}
         }
@@ -433,6 +501,49 @@ impl Render {
             "{frame} thinking · block {} · step {}/{} · {}/{} locked",
             self.block, self.step, self.max_steps, self.locked, self.canvas
         )
+    }
+
+    /// The answer text currently allowed on screen: capped to the reveal cursor
+    /// while paced (so it types out), the whole of `text` otherwise.
+    fn visible(&self) -> &str {
+        if self.paced {
+            &self.text[..self.revealed.min(self.text.len())]
+        } else {
+            &self.text
+        }
+    }
+
+    /// Advance the reveal cursor one repaint's worth toward `text.len()`, snapped
+    /// up to a char boundary. A no-op unless pacing is on and text remains.
+    fn advance_reveal(&mut self) {
+        if !self.paced || self.revealed >= self.text.len() {
+            return;
+        }
+        self.revealed += reveal_step(self.text.len() - self.revealed);
+        while self.revealed < self.text.len() && !self.text.is_char_boundary(self.revealed) {
+            self.revealed += 1;
+        }
+    }
+
+    /// Type out the remainder of a paced answer before it settles: adopt the
+    /// authoritative reply (it holds the final block the stream never revealed)
+    /// and repaint at the tick cadence until the reveal cursor catches up. A
+    /// no-op unless paced with a viewport and the reply extends what streamed; a
+    /// revision falls through to `finish`'s correction path.
+    fn drain_reveal(&mut self, reply: Option<&str>) {
+        let Some(r) = reply else { return };
+        if !self.paced || self.viewport.is_none() || !r.starts_with(self.flushed.as_str()) {
+            return;
+        }
+        self.answer_started = true;
+        self.prefill = false;
+        self.text = r.to_string();
+        self.committed = r.len();
+        self.revealed = self.revealed.min(self.text.len());
+        while self.revealed < self.text.len() {
+            self.paint(); // advances the reveal cursor, then redraws
+            std::thread::sleep(Duration::from_millis(55));
+        }
     }
 
     /// The pane's content: the current phase (reasoning, answer, or a status
@@ -448,9 +559,9 @@ impl Render {
             // After a progressive flush the pane holds only the unflushed
             // tail, markerless: it continues the flushed lines above. A
             // frozen turn falls back to previewing the whole text.
-            match self.text.strip_prefix(self.flushed.as_str()) {
+            match self.visible().strip_prefix(self.flushed.as_str()) {
                 Some(tail) if !self.flushed.is_empty() => ("", tail.trim(), DIM),
-                _ => ("model> ", self.text.trim(), DIM),
+                _ => ("model> ", self.visible().trim(), DIM),
             }
         } else {
             return vec![self.status_line(frame)]; // answer withheld
@@ -478,7 +589,14 @@ impl Render {
             self.frozen = true;
             return;
         }
-        let cut = flush_cut(&self.text, self.committed);
+        // While paced, only flush whole lines the reveal cursor has reached, so
+        // scrollback fills at the same typed rate as the pane.
+        let cap = if self.paced {
+            self.revealed
+        } else {
+            self.text.len()
+        };
+        let cut = flush_cut(&self.text, self.committed.min(cap));
         if cut <= self.flushed.len() {
             return;
         }
@@ -506,6 +624,7 @@ impl Render {
     fn paint(&mut self) {
         let frame = SPINNER[self.spinner % SPINNER.len()];
         self.spinner = self.spinner.wrapping_add(1);
+        self.advance_reveal();
         self.flush_committed();
         match &self.viewport {
             Some(vp) => {
@@ -563,9 +682,21 @@ impl Render {
         if let Some(line) = stats {
             permanent.push_str(&format!("  {line}\n"));
         }
+        let paced = self.paced;
         match self.viewport.as_mut() {
             Some(vp) => vp.commit(&permanent),
-            None => print!("\r\x1b[2K{permanent}"),
+            // No reserved pane (e.g. a terminal that never answered the cursor
+            // query): a paced turn types the settled reply into scrollback
+            // instead of dropping it whole; otherwise print it at once.
+            None => {
+                print!("\r\x1b[2K");
+                let _ = std::io::stdout().flush();
+                if paced {
+                    type_to_scrollback(&permanent);
+                } else {
+                    print!("{permanent}");
+                }
+            }
         }
         let _ = std::io::stdout().flush();
     }
@@ -583,7 +714,7 @@ pub fn render_demo(stage: &str) {
     }
     println!("you> demo: explain the plan");
     let _ = std::io::stdout().flush();
-    let mut r = Render::new(true, true, true, true);
+    let mut r = Render::new(true, true, true, true, false);
     r.apply(&ChatEvent::Status {
         block: 1,
         step: 1,
@@ -678,6 +809,10 @@ pub struct StreamDisplay {
     /// validator/repair stages, a whole streamed draft can evaporate. The
     /// pane-only preview already shows those rounds streaming.
     pub progressive: bool,
+    /// Dribble each committed block's answer out over the next block's denoise so
+    /// it types out smoothly instead of landing a block at a time. Serve's paced
+    /// streaming, in the terminal.
+    pub paced: bool,
 }
 
 impl ChatStream {
@@ -697,7 +832,8 @@ impl ChatStream {
         let channels = ChannelIds::from_tokenizer(&tokenizer);
         let mut decoder = StreamDecoder::new(Arc::clone(&tokenizer), stop_token_ids)
             .with_channels(channels)
-            .with_thinking(show_thinking, display.prethink_seed);
+            .with_thinking(show_thinking, display.prethink_seed)
+            .paced(display.paced);
         if display.start_in_thought {
             decoder = decoder.starting_in_thought();
         }
@@ -709,6 +845,7 @@ impl ChatStream {
                 display.stream_output,
                 interactive,
                 display.progressive,
+                display.paced,
             ),
             interactive,
         }));
@@ -768,6 +905,8 @@ impl ChatStream {
         }
         let mut s = self.shared.lock().unwrap();
         if self.interactive {
+            // Type out any paced remainder (the held final block) before settling.
+            s.render.drain_reveal(reply);
             s.render.finish(reply, stats);
         }
     }

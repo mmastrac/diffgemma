@@ -47,6 +47,23 @@ pub struct StreamDecoder<D: TextDecoder> {
     /// continuation or a tool round's forced-open thought). The split classifies
     /// the leading ids as reasoning regardless of whether display is on.
     start_in_thought: bool,
+    /// Paced release: hold a finished block's committed answer and dribble it out
+    /// over the next block's denoise (a fraction of the remaining length each
+    /// step, against an EMA of block step counts) so a multi-block answer types
+    /// out smoothly instead of a whole block landing every couple of seconds. The
+    /// serve mapper does this for the wire; this is its terminal-decoder twin
+    /// (see [`super::serve`]). Off by default, enabled per turn via
+    /// [`paced`](Self::paced). The final block has no successor to pace against,
+    /// so it lands whole at `finish`.
+    paced: bool,
+    /// Bytes of the committed answer already revealed as `Text` (equal to the
+    /// committed length when pacing is off).
+    released_content: usize,
+    /// EMA of committed blocks' step counts, the pacing denominator.
+    est_block_steps: f32,
+    /// Pacing off for the rest of this turn: a tool call was committed, and an
+    /// agent consumes a tool round whole, so it must never wait on a dribble.
+    pace_off: bool,
 }
 
 impl<D: TextDecoder> StreamDecoder<D> {
@@ -63,6 +80,10 @@ impl<D: TextDecoder> StreamDecoder<D> {
             last_thought: String::new(),
             prethink_seed: None,
             start_in_thought: false,
+            paced: false,
+            released_content: 0,
+            est_block_steps: 16.0,
+            pace_off: false,
         }
     }
 
@@ -92,10 +113,85 @@ impl<D: TextDecoder> StreamDecoder<D> {
         self
     }
 
+    /// Dribble each committed block's answer out over the next block's denoise
+    /// rather than surfacing it whole, so the answer types out smoothly. Mirrors
+    /// the serve mapper's paced release ([`super::serve`]); the final block still
+    /// lands at `finish`, having no successor to pace against.
+    pub fn paced(mut self, paced: bool) -> Self {
+        self.paced = paced;
+        self
+    }
+
     /// The immutable committed reply text so far.
     #[allow(dead_code)]
     pub fn committed_text(&self) -> &str {
         &self.committed_text
+    }
+
+    /// Cap the visible answer to the paced release cursor and advance it. Unpaced
+    /// (or once a tool call is committed) this reveals the whole draft, exactly as
+    /// before. Paced, it holds a finished block and releases a step-fraction of
+    /// the remaining committed length each following step, so the previous block
+    /// finishes streaming roughly as this one commits. Returns the
+    /// `(committed_prefix_len, visible_text)` for the `Text` event.
+    fn paced_reveal(
+        &mut self,
+        committed_answer: &str,
+        draft_answer: &str,
+        ev: &StepProgressEvent<'_>,
+    ) -> (usize, String) {
+        if self.paced && !self.pace_off && committed_answer.contains("call:") {
+            self.pace_off = true;
+        }
+        if ev.block_done {
+            // The block's true length is now known; fold it into the EMA that
+            // sets how fast the next block releases this one's text.
+            self.est_block_steps = 0.5 * self.est_block_steps + 0.5 * ev.step_in_block as f32;
+        }
+        if !self.paced || self.pace_off {
+            self.released_content = committed_answer.len();
+            return (
+                common_prefix_len(committed_answer, draft_answer),
+                draft_answer.to_string(),
+            );
+        }
+        // Paced. The cursor only ever trails the committed length: a block's own
+        // finishing step holds it (nothing new to pace against yet) and the
+        // following block's steps carry it forward.
+        self.released_content = self.released_content.min(committed_answer.len());
+        if !ev.block_done {
+            let frac = (ev.step_in_block as f32 / self.est_block_steps.max(1.0)).clamp(0.0, 1.0);
+            let remaining = committed_answer.len() - self.released_content;
+            self.released_content += (remaining as f32 * frac) as usize;
+        }
+        // Snap back to a char boundary so the slice never splits a code point.
+        while self.released_content < committed_answer.len()
+            && !committed_answer.is_char_boundary(self.released_content)
+        {
+            self.released_content -= 1;
+        }
+        (
+            self.released_content,
+            committed_answer[..self.released_content].to_string(),
+        )
+    }
+
+    /// Emit a `Text` (preceded by a `Rewind` when the new text revises rather
+    /// than extends what streamed), and remember it for the next diff.
+    fn emit_text(&mut self, out: &mut Vec<ChatEvent>, committed: usize, text: String) {
+        if text == self.last_text {
+            return;
+        }
+        if !text.starts_with(&self.last_text) {
+            out.push(ChatEvent::Rewind {
+                common: common_prefix_len(&self.last_text, &text),
+            });
+        }
+        out.push(ChatEvent::Text {
+            committed,
+            text: text.clone(),
+        });
+        self.last_text = text;
     }
 
     pub fn on_step(&mut self, ev: &StepProgressEvent<'_>) -> Vec<ChatEvent> {
@@ -165,19 +261,8 @@ impl<D: TextDecoder> StreamDecoder<D> {
                 });
                 self.last_thought = thought;
             }
-            if answer != self.last_text {
-                if !answer.starts_with(&self.last_text) {
-                    out.push(ChatEvent::Rewind {
-                        common: common_prefix_len(&self.last_text, &answer),
-                    });
-                }
-                let committed = common_prefix_len(&committed_answer, &answer);
-                out.push(ChatEvent::Text {
-                    committed,
-                    text: answer.clone(),
-                });
-                self.last_text = answer;
-            }
+            let (committed, text) = self.paced_reveal(&committed_answer, &answer, ev);
+            self.emit_text(&mut out, committed, text);
             return out;
         }
 
@@ -193,29 +278,20 @@ impl<D: TextDecoder> StreamDecoder<D> {
             }
         }
 
-        // Full visible text: committed plus this block's speculative draft.
-        let mut text = self.committed_text.clone();
+        // Full visible text: the committed answer plus this block's speculative
+        // draft. Cloned up front so the paced-reveal borrow does not collide with
+        // the committed field.
+        let committed_answer = self.committed_text.clone();
+        let mut draft = committed_answer.clone();
         if !ev.block_done {
             let suffix = crate::sample::strip_degenerate_token_ids(&sp.ids);
             if !suffix.is_empty() {
-                self.decoder.decode_append(&mut text, &suffix);
-                text = crate::chat_template::sanitize_model_reply(&text);
+                self.decoder.decode_append(&mut draft, &suffix);
+                draft = crate::chat_template::sanitize_model_reply(&draft);
             }
         }
-        let committed = common_prefix_len(&self.committed_text, &text);
-
-        if text != self.last_text {
-            if !text.starts_with(&self.last_text) {
-                out.push(ChatEvent::Rewind {
-                    common: common_prefix_len(&self.last_text, &text),
-                });
-            }
-            out.push(ChatEvent::Text {
-                committed,
-                text: text.clone(),
-            });
-            self.last_text = text;
-        }
+        let (committed, text) = self.paced_reveal(&committed_answer, &draft, ev);
+        self.emit_text(&mut out, committed, text);
         out
     }
 }
