@@ -414,3 +414,47 @@ fn first_unquoted_stop_respects_quote_parity() {
     // Fully quoted block: no stop at all.
     assert_eq!(first_unquoted_stop(&[99, 99], &stops, Some(4), true), None);
 }
+
+fn ids(s: &str) -> Vec<u32> {
+    s.chars().map(|c| c as u32).collect()
+}
+
+#[test]
+fn unpaced_reveals_a_committed_block_whole() {
+    // The default (pacing off) surfaces a finished block's answer at once.
+    let mut d = StreamDecoder::new(FakeDecoder, vec![]);
+    let e = d.on_step(&step(1, 10, &ids("Hello"), true));
+    assert_eq!(texts(&e), vec!["Hello"]);
+}
+
+#[test]
+fn paced_holds_a_block_then_dribbles_it_over_the_next() {
+    let mut d = StreamDecoder::new(FakeDecoder, vec![]).paced(true);
+    // Block 1 commits "Hello", but paced holds it: nothing visible yet. This
+    // also seeds the pacing denominator (EMA of 16 and this block's 10 -> 13).
+    let e = d.on_step(&step(1, 10, &ids("Hello"), true));
+    assert_eq!(texts(&e), Vec::<&str>::new());
+    // Block 2's denoise dribbles the held text out, growing monotonically and
+    // reaching the whole block by the time this one is as long as the estimate.
+    let mid = texts(&d.on_step(&step(2, 5, &ids("!"), false)))
+        .last()
+        .unwrap()
+        .to_string();
+    assert!(!mid.is_empty() && mid.len() < 5, "partial reveal: {mid:?}");
+    assert!("Hello".starts_with(&mid), "prefix of the block: {mid:?}");
+    let full = texts(&d.on_step(&step(2, 13, &ids("!"), false)))
+        .last()
+        .unwrap()
+        .to_string();
+    // The still-speculative "!" of block 2 is not shown; only block 1's text is.
+    assert_eq!(full, "Hello");
+}
+
+#[test]
+fn paced_flushes_and_stops_once_a_tool_call_commits() {
+    // An agent consumes a tool round whole, so a committed `call:` ends pacing
+    // and surfaces the block immediately rather than dribbling it.
+    let mut d = StreamDecoder::new(FakeDecoder, vec![]).paced(true);
+    let e = d.on_step(&step(1, 8, &ids("call:{x}"), true));
+    assert_eq!(texts(&e), vec!["call:{x}"]);
+}
