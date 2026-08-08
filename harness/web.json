@@ -1,6 +1,5 @@
 {
   "prompt": "You are a web browsing assistant driving a real headless browser. Work in small steps: navigate to a page, then read_page or find to see it, then click or type to act on it. Element refs come from find and reset on every navigation, so call find again after the page changes. To search the web, navigate to https://www.bing.com/search?q=your+query and read the results. The browser is normally hidden. If a page shows a human-verification challenge or login, do not try to beat it yourself: call show_browser to put the window on the user's screen, ask them to complete it there, and read the page again once they say it is done. Answer the user from what the pages actually say, quoting the relevant part, and say which page it came from. If a page is empty or unhelpful, try another route instead of retrying the same call.",
-  "prethink": "Current page: $$page$$\nThe user said: $$last$$\nPlan the next browsing step, or answer if the pages already read settle it.",
   "vars": { "page": ".web/page.txt" },
   "max_rounds": 16,
   "max_new_tokens": 8192,
@@ -11,7 +10,7 @@
       "params": [
         { "name": "url", "description": "The URL to open, e.g. https://example.com." }
       ],
-      "command": "bash web_driver.sh navigate"
+      "command": "bash \"$HARNESS_DIR/web_driver.sh\" navigate"
     },
     {
       "name": "read_page",
@@ -19,7 +18,7 @@
       "params": [
         { "name": "offset", "description": "Character offset to continue from, default 0.", "required": false }
       ],
-      "command": "bash web_driver.sh read"
+      "command": "bash \"$HARNESS_DIR/web_driver.sh\" read"
     },
     {
       "name": "find",
@@ -27,7 +26,7 @@
       "params": [
         { "name": "query", "description": "Case-insensitive filter on the element text, omit to list all.", "required": false }
       ],
-      "command": "bash web_driver.sh find"
+      "command": "bash \"$HARNESS_DIR/web_driver.sh\" find"
     },
     {
       "name": "click",
@@ -35,7 +34,7 @@
       "params": [
         { "name": "ref", "description": "The ref number, e.g. 3." }
       ],
-      "command": "bash web_driver.sh click"
+      "command": "bash \"$HARNESS_DIR/web_driver.sh\" click"
     },
     {
       "name": "type",
@@ -45,12 +44,12 @@
         { "name": "text", "description": "The text to type." },
         { "name": "submit", "description": "true to press Enter and submit after typing.", "required": false }
       ],
-      "command": "bash web_driver.sh type"
+      "command": "bash \"$HARNESS_DIR/web_driver.sh\" type"
     },
     {
       "name": "show_browser",
       "description": "Make the browser window visible on the user's screen, staying on the current page. Use when the user needs to complete a challenge or login themselves.",
-      "command": "bash web_driver.sh show"
+      "command": "bash \"$HARNESS_DIR/web_driver.sh\" show"
     },
     {
       "name": "eval",
@@ -58,7 +57,7 @@
       "params": [
         { "name": "js", "description": "The expression, e.g. document.title." }
       ],
-      "command": "bash web_driver.sh eval"
+      "command": "bash \"$HARNESS_DIR/web_driver.sh\" eval"
     }
   ]
 }

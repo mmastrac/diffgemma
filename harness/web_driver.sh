@@ -23,7 +23,9 @@ set -u
 W=.web
 CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 TEXT_CHUNK=3000
-IDLE_LIMIT=${WEB_IDLE_LIMIT:-300}
+# generous idle limit: only tool calls touch the activity stamp, and slow
+# generation between rounds must not get the browser reaped mid-turn
+IDLE_LIMIT=${WEB_IDLE_LIMIT:-1800}
 
 die() { echo "error: $1"; exit 0; }
 
@@ -37,12 +39,15 @@ start_watchdog() {
     (
         while sleep "$tick"; do
             alive || exit 0
-            last=$(stat -f %m "$W/last_used" 2>/dev/null || echo 0)
+            # a visible window belongs to the user, never reap it idle
+            [ -f "$W/visible" ] && continue
+            # a missing stamp means a fresh start, not an ancient one
+            last=$(stat -f %m "$W/last_used" 2>/dev/null) || continue
             [ $(( $(date +%s) - last )) -lt "$IDLE_LIMIT" ] && continue
             bash "$0" stop >/dev/null 2>&1
             exit 0
         done
-    ) &
+    ) </dev/null >/dev/null 2>&1 &
     echo $! > "$W/watchdog.pid"
 }
 
@@ -51,15 +56,20 @@ start_chrome() {
     mkfifo "$W/to" "$W/from"
     local headless="--headless"
     [ -f "$W/visible" ] && headless=""
+    # every daemon process detaches from the tool call's stdio: the engine
+    # reads the tool's stdout to EOF, so an inherited fd would hold the
+    # whole chat hostage until the daemon dies
     "$CHROME" $headless --remote-debugging-pipe --no-first-run \
         --window-size=1280,900 --user-data-dir="$W/profile" about:blank \
-        3<"$W/to" 4>"$W/from" 2>>"$W/chrome.log" &
+        3<"$W/to" 4>"$W/from" </dev/null >/dev/null 2>>"$W/chrome.log" &
     local cpid=$!
     echo "$cpid" > "$W/chrome.pid"
     # each holder keeps a FIFO end open and exits once Chrome dies
-    ( exec 3>"$W/to"; while kill -0 "$cpid" 2>/dev/null; do sleep 5; done ) &
+    ( exec 3>"$W/to"; while kill -0 "$cpid" 2>/dev/null; do sleep 5; done ) \
+        </dev/null >/dev/null 2>&1 &
     echo $! > "$W/holders.pid"
-    ( exec 3<"$W/from"; while kill -0 "$cpid" 2>/dev/null; do sleep 5; done ) &
+    ( exec 3<"$W/from"; while kill -0 "$cpid" 2>/dev/null; do sleep 5; done ) \
+        </dev/null >/dev/null 2>&1 &
     echo $! >> "$W/holders.pid"
     start_watchdog
 }
@@ -120,8 +130,9 @@ attach() {
 
 ensure() {
     mkdir -p "$W"
-    touch "$W/last_used"
+    # touch after any restart: start_chrome's shutdown clears the stamp
     alive || start_chrome
+    touch "$W/last_used"
     open_fds
     if [ -s "$W/session" ]; then
         SESSION=$(cat "$W/session")
@@ -130,16 +141,27 @@ ensure() {
     fi
 }
 
-# evaluate JS in the page and print its string value
-evaluate() {
+eval_once() {
     send Runtime.evaluate \
         "$(jq -cn --arg e "$1" '{expression:$e,returnByValue:true,awaitPromise:true}')" \
         "$SESSION"
+    wait_id "$SENT_ID" 15
+}
+
+session_dead() { printf '%s' "$1" | jq -e 'has("error")' >/dev/null 2>&1; }
+
+# evaluate JS in the page and print its string value; a dead session (the
+# user closed the tab or window) gets a fresh blank tab and one retry
+evaluate() {
     local r ex
-    r=$(wait_id "$SENT_ID" 15) || { echo "error: the page did not answer in time"; return 1; }
+    r=$(eval_once "$1") || { echo "error: the page did not answer in time"; return 1; }
+    if session_dead "$r"; then
+        attach
+        r=$(eval_once "$1") || { echo "error: the page did not answer in time"; return 1; }
+    fi
     ex=$(printf '%s' "$r" | jq -r '.result.exceptionDetails.exception.description // empty' 2>/dev/null | head -2)
     [ -z "$ex" ] || { echo "js error: $ex"; return 1; }
-    printf '%s' "$r" | jq -r '.result.result
+    printf '%s' "$r" | jq -r '(.result.result // {})
         | if has("value") then (.value | if type == "string" then . else tojson end)
           else (.type // "undefined") end'
 }
@@ -155,7 +177,8 @@ where() { echo "now at: $(cat "$W/page.txt" 2>/dev/null || echo unknown)"; }
 # JSON-encode an env var so it embeds safely in a JS expression
 jsq() { jq -cn --arg s "$1" '$s'; }
 
-FIND_JS='(()=>{const q=QJ.toLowerCase();let n=0;const out=[];
+FIND_JS='(()=>{if(location.href==="about:blank")return "(no page loaded; the browser restarted, navigate again)";
+const q=QJ.toLowerCase();let n=0;const out=[];
 const sel="a[href],button,input,textarea,select,[role=button],[role=link],[role=tab],[role=searchbox],[onclick]";
 for(const e of document.querySelectorAll(sel)){
 if(!(e.offsetParent||e.getClientRects().length))continue;
@@ -185,7 +208,8 @@ e.dispatchEvent(new KeyboardEvent("keydown",k));e.dispatchEvent(new KeyboardEven
 if(e.form){if(e.form.requestSubmit)e.form.requestSubmit();else e.form.submit()}}
 return "typed into ["+r+"]"+(s?", submitted":"")})()'
 
-READ_JS='(()=>{const o=OJ;const t=document.body?document.body.innerText:"";
+READ_JS='(()=>{if(location.href==="about:blank")return "(no page loaded; the browser restarted, navigate again)";
+const o=OJ;const t=document.body?document.body.innerText:"";
 if(!t)return "(the page has no text)";
 const chunk=t.slice(o,o+NJ).trim();
 if(!chunk)return "(offset "+o+" is past the end, the page text is "+t.length+" chars)";
@@ -193,10 +217,16 @@ return chunk+(t.length>o+NJ?"\n\n[chars "+o+".."+(o+NJ)+" of "+t.length+", call 
 
 cmd_navigate() {
     ensure
-    local u=${url:?} err
+    local u=${url:?} ack err
     case "$u" in http://*|https://*) ;; *) u="https://$u" ;; esac
     send Page.navigate "$(jq -cn --arg u "$u" '{url:$u}')" "$SESSION"
-    err=$(wait_id "$SENT_ID" 15 | jq -r '.result.errorText // empty')
+    ack=$(wait_id "$SENT_ID" 15)
+    if session_dead "$ack"; then
+        attach
+        send Page.navigate "$(jq -cn --arg u "$u" '{url:$u}')" "$SESSION"
+        ack=$(wait_id "$SENT_ID" 15)
+    fi
+    err=$(printf '%s' "$ack" | jq -r '.result.errorText // empty')
     [ -z "$err" ] || die "navigation failed: $err"
     wait_load 20 || true
     update_page
@@ -207,10 +237,16 @@ cmd_navigate() {
 
 cmd_read() {
     ensure
-    local o
+    local o out
     o=$(printf '%s' "${offset:-0}" | tr -cd '0-9')
     local js=${READ_JS//OJ/${o:-0}}
-    evaluate "${js//NJ/$TEXT_CHUNK}"
+    js=${js//NJ/$TEXT_CHUNK}
+    out=$(evaluate "$js")
+    if [ "$out" = "(the page has no text)" ]; then
+        sleep 2
+        out=$(evaluate "$js")
+    fi
+    printf '%s\n' "$out"
 }
 
 cmd_find() {
@@ -262,11 +298,23 @@ cmd_status() {
 }
 
 shutdown_chrome() {
-    [ -f "$W/chrome.pid" ] && kill "$(cat "$W/chrome.pid")" 2>/dev/null
+    local cpid=""
+    [ -f "$W/chrome.pid" ] && cpid=$(cat "$W/chrome.pid")
+    [ -n "$cpid" ] && kill "$cpid" 2>/dev/null
     [ -f "$W/holders.pid" ] && kill $(cat "$W/holders.pid") 2>/dev/null
     [ -f "$W/watchdog.pid" ] && kill "$(cat "$W/watchdog.pid")" 2>/dev/null
     rm -f "$W/chrome.pid" "$W/holders.pid" "$W/watchdog.pid" "$W/last_used" \
         "$W/session" "$W/seq" "$W/to" "$W/from"
+    # wait until the profile is released, or the next launch loses the
+    # profile-singleton race against the dying instance and quits
+    if [ -n "$cpid" ]; then
+        local i=0
+        while kill -0 "$cpid" 2>/dev/null && [ "$i" -lt 50 ]; do
+            sleep 0.2
+            i=$((i + 1))
+        done
+        kill -9 "$cpid" 2>/dev/null
+    fi
 }
 
 # restart with a visible window, back on the page we were on
@@ -277,11 +325,8 @@ cmd_show() {
         where
         return
     fi
-    local u=""
-    if alive; then
-        ensure
-        u=$(evaluate "location.href") || u=""
-    fi
+    local u
+    u=$(sed 's/.* :: //' "$W/page.txt" 2>/dev/null)
     touch "$W/visible"
     shutdown_chrome
     ensure

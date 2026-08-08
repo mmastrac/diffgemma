@@ -194,6 +194,17 @@ fn scan_call_attempts_orders_and_flags() {
     assert_eq!(attempts[0], ("todowrite".to_string(), true));
     assert_eq!(attempts[1], ("write".to_string(), false));
     assert!(scan_call_attempts("no calls here").is_empty());
+
+    // A round truncated mid-call (seen live: generation stopped right after
+    // the opening string quote) is one invalid attempt, flagged corrupt, and
+    // the preamble excludes the fragment.
+    let cut = "I should try a travel site.<|tool_call>call:navigate{url:<|\"|>";
+    assert_eq!(scan_call_attempts(cut), [("navigate".to_string(), false)]);
+    assert!(has_incomplete_tool_call(cut));
+    assert_eq!(
+        content_before_tool_calls(cut),
+        "I should try a travel site."
+    );
 }
 
 #[test]
