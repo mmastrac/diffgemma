@@ -85,6 +85,9 @@ pub(crate) struct ShellTool {
     params: Vec<ToolParam>,
     /// Working directory for `command`. None inherits the chat process cwd.
     work_dir: Option<std::path::PathBuf>,
+    /// Exported as `HARNESS_DIR`: the harness file's directory, so commands
+    /// can reference scripts shipped beside it while running in `work_dir`.
+    harness_dir: Option<std::path::PathBuf>,
 }
 
 impl ShellTool {
@@ -95,11 +98,17 @@ impl ShellTool {
             command,
             params,
             work_dir: None,
+            harness_dir: None,
         }
     }
 
-    pub fn in_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
-        self.work_dir = dir;
+    pub fn in_dirs(
+        mut self,
+        work_dir: Option<std::path::PathBuf>,
+        harness_dir: Option<std::path::PathBuf>,
+    ) -> Self {
+        self.work_dir = work_dir;
+        self.harness_dir = harness_dir;
         self
     }
 }
@@ -181,6 +190,9 @@ fn run_shell_tool(
     cmd.arg("-c").arg(&t.command);
     if let Some(dir) = &t.work_dir {
         cmd.current_dir(dir);
+    }
+    if let Some(dir) = &t.harness_dir {
+        cmd.env("HARNESS_DIR", dir);
     }
     for (k, v) in vars {
         cmd.env(format!("HARNESS_{k}"), v);
@@ -709,7 +721,8 @@ impl TurnRunner<'_> {
     }
 
     /// Tool turn: run the render/generate/run-script loop. `seed` is the raw
-    /// `/prethink` template; it expands once against this turn.
+    /// `/prethink` template, expanded per round so file-backed vars written
+    /// by tools mid-turn (the web harness's $$page$$) read current.
     fn tool_turn(
         &mut self,
         history: &[chat_template::ChatTurn],
@@ -722,8 +735,7 @@ impl TurnRunner<'_> {
         let messages = chat_turns_to_messages(&turns);
         let base =
             crate::tools::render_conversation_guarded(&messages, self.tools_json, true, true);
-        let seed = seed.map(|t| expand_thinking(t, history, system, &self.live_vars()));
-        self.tool_loop(base, seed.as_deref(), reseed, turn_idx)
+        self.tool_loop(base, seed, history, system, reseed, turn_idx)
     }
 
     /// The tool-calling loop: generate, run each backing script, feed the
@@ -733,12 +745,15 @@ impl TurnRunner<'_> {
     /// dropped them and the model re-planned from scratch every round), and
     /// each round is a pure KV extension instead of a rewind at the stripped
     /// thought. Tool calls/results still live only inside this turn: the next
-    /// user turn renders thought-free from history as always. `seed` (already
-    /// expanded) seeds round 0, every round if `reseed`.
+    /// user turn renders thought-free from history as always. `raw_seed` (the
+    /// unexpanded template) seeds round 0, every round if `reseed`, expanded
+    /// fresh at each injection so file-backed vars read current.
     fn tool_loop(
         &mut self,
         base: String,
-        seed: Option<&str>,
+        raw_seed: Option<&str>,
+        history: &[chat_template::ChatTurn],
+        system: Option<&str>,
         reseed: bool,
         turn_idx: u64,
     ) -> Result<String, crate::Error> {
@@ -748,6 +763,8 @@ impl TurnRunner<'_> {
         // `RoundStart`/`RoundEnd` events).
         let (mut total_tokens, mut total_steps) = (0usize, 0usize);
         let channels = ChannelIds::from_tokenizer(self.tokenizer);
+        let mut round_seed =
+            raw_seed.map(|t| expand_thinking(t, history, system, &self.live_vars()));
         // Force the thought OPEN in the prompt: left to open the channel
         // itself, the model often narrates its plan into the visible answer
         // instead. Beginning in-thought pins the reasoning to the thought
@@ -755,14 +772,14 @@ impl TurnRunner<'_> {
         let mut prompt = {
             let mut text = base;
             text.push_str(crate::tools::OPEN_THOUGHT);
-            if let Some(s) = seed {
+            if let Some(s) = &round_seed {
                 text.push_str(s.trim());
             }
             self.tokenizer.encode_prompt(&text).0
         };
         for round in 0..max_rounds {
             let think_seed = if round == 0 || reseed {
-                seed.map(str::trim)
+                round_seed.as_deref().map(str::trim)
             } else {
                 None
             };
@@ -979,8 +996,10 @@ impl TurnRunner<'_> {
             }
             // The chat loop always reopens the thought: a tool-mode turn reasons.
             let mut tail = crate::tools::tool_continuation_tail(&responses, true);
-            if reseed && let Some(s) = seed {
+            if reseed && let Some(t) = raw_seed {
+                let s = expand_thinking(t, history, system, &self.live_vars());
                 tail.push_str(s.trim());
+                round_seed = Some(s);
             }
             prompt = out.token_ids;
             prompt.extend(self.tokenizer.encode_prompt(&tail).0);
@@ -1243,13 +1262,13 @@ mod tests {
     }
 
     #[test]
-    fn shell_tool_runs_in_its_work_dir() {
+    fn shell_tool_runs_in_its_work_dir_with_harness_dir_env() {
         let dir = std::env::temp_dir().canonicalize().unwrap();
-        let t = parse_tool_spec("where=pwd")
+        let t = parse_tool_spec("where=printf '%s %s' \"$(pwd)\" \"$HARNESS_DIR\"")
             .unwrap()
-            .in_dir(Some(dir.clone()));
+            .in_dirs(Some(dir.clone()), Some("/tmp/h".into()));
         let out = run_shell_tool(&t, &serde_json::json!({}), &Default::default());
-        assert_eq!(std::path::PathBuf::from(out), dir);
+        assert_eq!(out, format!("{} /tmp/h", dir.display()));
     }
 
     #[test]

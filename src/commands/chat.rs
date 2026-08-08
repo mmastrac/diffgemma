@@ -446,13 +446,29 @@ pub(crate) fn run_chat_cmd(
     };
     // A `--harness` file bundles a prompt, prethink template, file-backed
     // vars, and tools; its tools join any `--tool` definitions. Tool commands
-    // run from the harness file's directory (and relative var paths anchor
-    // there) so a harness behaves the same from any invocation directory.
-    let harness_dir = harness
-        .as_deref()
-        .and_then(|p| p.parent())
-        .filter(|d| !d.as_os_str().is_empty())
-        .map(std::path::Path::to_path_buf);
+    // run from a per-harness scratch tmpdir (relative var paths anchor there
+    // too), with HARNESS_DIR pointing back at the harness file's directory,
+    // so a harness behaves the same from any invocation directory and its
+    // state never lands in the invoking project.
+    let harness_dir = harness.as_deref().map(|p| {
+        std::path::absolute(p)
+            .unwrap_or_else(|_| p.to_path_buf())
+            .parent()
+            .map_or_else(
+                || std::path::PathBuf::from("/"),
+                std::path::Path::to_path_buf,
+            )
+    });
+    let scratch_dir = harness.as_deref().map(crate::chat::harness::scratch_dir);
+    if let Some(dir) = &scratch_dir
+        && let Err(err) = std::fs::create_dir_all(dir)
+    {
+        eprintln!(
+            "error: cannot create harness scratch {}: {err}",
+            dir.display()
+        );
+        return ExitCode::FAILURE;
+    }
     let harness = match harness.as_deref().map(crate::chat::harness::Harness::load) {
         Some(Ok(h)) => Some(h),
         Some(Err(err)) => {
@@ -462,7 +478,10 @@ pub(crate) fn run_chat_cmd(
         None => None,
     };
     if let Some(h) = &harness {
-        shell_tools.extend(h.shell_tools(harness_dir.as_deref()));
+        shell_tools.extend(h.shell_tools(scratch_dir.as_deref(), harness_dir.as_deref()));
+        if verbose && let Some(dir) = &scratch_dir {
+            eprintln!("harness scratch: {}", dir.display());
+        }
     }
     let tools_json: Vec<serde_json::Value> = shell_tools.iter().map(tool_declaration).collect();
 
@@ -644,7 +663,7 @@ pub(crate) fn run_chat_cmd(
                 h.vars
                     .iter()
                     .map(|(name, path)| {
-                        let path = match &harness_dir {
+                        let path = match &scratch_dir {
                             Some(dir) => dir.join(path),
                             None => std::path::PathBuf::from(path),
                         };
@@ -662,7 +681,15 @@ pub(crate) fn run_chat_cmd(
         let first = first.trim();
         if !first.is_empty() {
             history.push(chat_template::ChatTurn::user(first));
-            let spec = TurnSpec::resolve(PendingTurn::default(), !tools_json.is_empty());
+            // The harness prethink applies to this first turn too, matching
+            // the REPL loop's PendingTurn below.
+            let spec = TurnSpec::resolve(
+                PendingTurn {
+                    persistent_prethink: harness.as_ref().and_then(|h| h.prethink.clone()),
+                    ..PendingTurn::default()
+                },
+                !tools_json.is_empty(),
+            );
             if let Err(err) = run_turn(
                 &mut runner,
                 &mut history,

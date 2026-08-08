@@ -7,8 +7,11 @@
 //! `::end` / `::set` directive lines in their output, `$$var$$` templates
 //! expand per turn, and a file-backed variable reads fresh from its file at
 //! every use so tools can buffer multi-line state there. Tool commands run
-//! from the harness file's directory, and relative var paths anchor there
-//! too, so a harness behaves the same from any invocation directory.
+//! from the harness's own scratch directory (see [`scratch_dir`]), relative
+//! var paths anchor there too, and `HARNESS_DIR` in the command environment
+//! points back at the harness file's directory for scripts shipped beside
+//! it. A harness behaves the same from any invocation directory, and its
+//! state never lands in the invoking project.
 //!
 //! ```json
 //! {
@@ -85,6 +88,26 @@ fn default_true() -> bool {
     true
 }
 
+/// The harness's scratch directory: tool commands run here and relative
+/// file vars resolve here. A tmpdir, so state is disposable, but stable
+/// across sessions until the OS cleans it. Keyed by file stem plus a hash
+/// of the absolute path so same-named harnesses stay apart.
+pub fn scratch_dir(path: &std::path::Path) -> std::path::PathBuf {
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in abs.as_os_str().as_encoded_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    let stem = abs
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("harness");
+    std::env::temp_dir()
+        .join("diffgemma-harness")
+        .join(format!("{stem}-{:08x}", h & 0xffff_ffff))
+}
+
 impl Harness {
     pub fn load(path: &std::path::Path) -> Result<Harness, String> {
         let text = std::fs::read_to_string(path)
@@ -118,9 +141,13 @@ impl Harness {
         Ok(())
     }
 
-    /// The harness tools as session [`ShellTool`]s, run from `dir` (the
-    /// harness file's directory) when given.
-    pub fn shell_tools(&self, dir: Option<&std::path::Path>) -> Vec<ShellTool> {
+    /// The harness tools as session [`ShellTool`]s, run from `scratch` with
+    /// `harness_dir` exported as `HARNESS_DIR`, when given.
+    pub fn shell_tools(
+        &self,
+        scratch: Option<&std::path::Path>,
+        harness_dir: Option<&std::path::Path>,
+    ) -> Vec<ShellTool> {
         self.tools
             .iter()
             .map(|t| {
@@ -142,7 +169,10 @@ impl Harness {
                         })
                         .collect(),
                 )
-                .in_dir(dir.map(std::path::Path::to_path_buf))
+                .in_dirs(
+                    scratch.map(std::path::Path::to_path_buf),
+                    harness_dir.map(std::path::Path::to_path_buf),
+                )
             })
             .collect()
     }
@@ -178,7 +208,7 @@ mod tests {
         assert_eq!(h.prompt.as_deref(), Some("You are a narrator."));
         assert_eq!(h.vars["scene"], ".story/scene.txt");
         assert_eq!(h.max_new_tokens, Some(8192));
-        let tools = h.shell_tools(None);
+        let tools = h.shell_tools(None, None);
         assert_eq!(tools.len(), 2);
         // A no-param tool declares an empty properties object.
         let decl = crate::chat::engine::tool_declaration(&tools[1]);
@@ -192,6 +222,18 @@ mod tests {
         // A default-description tool synthesizes one; params default required.
         let decl = crate::chat::engine::tool_declaration(&tools[0]);
         assert_eq!(decl["function"]["parameters"]["required"][0], "scene");
+    }
+
+    #[test]
+    fn scratch_dirs_are_stable_and_distinct() {
+        let a = super::scratch_dir(std::path::Path::new("/proj-a/web.json"));
+        let b = super::scratch_dir(std::path::Path::new("/proj-b/web.json"));
+        assert_eq!(
+            a,
+            super::scratch_dir(std::path::Path::new("/proj-a/web.json"))
+        );
+        assert_ne!(a, b);
+        assert!(a.file_name().unwrap().to_str().unwrap().starts_with("web-"));
     }
 
     #[test]
