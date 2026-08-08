@@ -4,6 +4,11 @@ A low-dependency Rust + Metal inference engine for
 [DiffusionGemma 26B-A4B-it](https://huggingface.co/google/diffusiongemma-26B-A4B-it)
 (Gemma-4 26B-A4B MoE, discrete block diffusion) on Apple Silicon.
 
+<p align="center">
+  <img src="docs/isprime-demo.gif" width="820"
+       alt="diffgemma's Rust harness writing an is_prime function: denoising a 256-token canvas, calling tools, and running cargo test">
+</p>
+
 ## Diffusion for Text?!?
 
 A traditional LLM emits one token per forward pass and spends most of its time
