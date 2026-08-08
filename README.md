@@ -52,7 +52,8 @@ The preferred pack is
 on Hugging Face. The `-q4` variant is the one tuned for memory vs. generation
 speed on consumer hardware.
 
-The `download` command fetches a pre-quantized `.dgq` pack and verifies it:
+The `download` command fetches a pre-quantized `.dgq` pack and verifies it. If
+the connection is interrupted, it will resume where it left off:
 
 ```bash
 diffgemma download
@@ -79,7 +80,8 @@ diffgemma ask \
 Interactive chat:
 
 ```bash
-diffgemma chat -m model/diffgemma-26b-a4b-it-q4
+# Start chat (first response takes a bit longer while the model is loading)
+diffgemma chat
 ```
 
 OpenAI-compatible HTTP server (defaults to `127.0.0.1:8080`, 128k context):
