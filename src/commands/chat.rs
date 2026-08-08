@@ -445,7 +445,14 @@ pub(crate) fn run_chat_cmd(
         }
     };
     // A `--harness` file bundles a prompt, prethink template, file-backed
-    // vars, and tools; its tools join any `--tool` definitions.
+    // vars, and tools; its tools join any `--tool` definitions. Tool commands
+    // run from the harness file's directory (and relative var paths anchor
+    // there) so a harness behaves the same from any invocation directory.
+    let harness_dir = harness
+        .as_deref()
+        .and_then(|p| p.parent())
+        .filter(|d| !d.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf);
     let harness = match harness.as_deref().map(crate::chat::harness::Harness::load) {
         Some(Ok(h)) => Some(h),
         Some(Err(err)) => {
@@ -455,7 +462,7 @@ pub(crate) fn run_chat_cmd(
         None => None,
     };
     if let Some(h) = &harness {
-        shell_tools.extend(h.shell_tools());
+        shell_tools.extend(h.shell_tools(harness_dir.as_deref()));
     }
     let tools_json: Vec<serde_json::Value> = shell_tools.iter().map(tool_declaration).collect();
 
@@ -522,7 +529,7 @@ pub(crate) fn run_chat_cmd(
     let explicit_cap = if max_new_tokens > 256 {
         Some(max_new_tokens)
     } else {
-        None
+        harness.as_ref().and_then(|h| h.max_new_tokens)
     };
 
     let stop_token_ids = config::load_generation_stop_tokens(model_dir);
@@ -636,7 +643,13 @@ pub(crate) fn run_chat_cmd(
             .map(|h| {
                 h.vars
                     .iter()
-                    .map(|(name, path)| (name.clone(), std::path::PathBuf::from(path)))
+                    .map(|(name, path)| {
+                        let path = match &harness_dir {
+                            Some(dir) => dir.join(path),
+                            None => std::path::PathBuf::from(path),
+                        };
+                        (name.clone(), path)
+                    })
                     .collect()
             })
             .unwrap_or_default(),

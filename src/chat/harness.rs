@@ -6,7 +6,9 @@
 //! parameters. The pieces compose with the session machinery: tools steer via
 //! `::end` / `::set` directive lines in their output, `$$var$$` templates
 //! expand per turn, and a file-backed variable reads fresh from its file at
-//! every use so tools can buffer multi-line state there.
+//! every use so tools can buffer multi-line state there. Tool commands run
+//! from the harness file's directory, and relative var paths anchor there
+//! too, so a harness behaves the same from any invocation directory.
 //!
 //! ```json
 //! {
@@ -46,6 +48,11 @@ pub(crate) struct Harness {
     /// harnesses with read/edit/verify cycles want more headroom.
     #[serde(default)]
     pub max_rounds: Option<usize>,
+    /// Per-turn output budget. Tool results extend the model's own output,
+    /// so tool-heavy harnesses exhaust the chat default and end the turn
+    /// with an empty reply. An explicit CLI `--max-new-tokens` wins.
+    #[serde(default)]
+    pub max_new_tokens: Option<usize>,
     #[serde(default)]
     tools: Vec<HarnessTool>,
 }
@@ -111,8 +118,9 @@ impl Harness {
         Ok(())
     }
 
-    /// The harness tools as session [`ShellTool`]s.
-    pub fn shell_tools(&self) -> Vec<ShellTool> {
+    /// The harness tools as session [`ShellTool`]s, run from `dir` (the
+    /// harness file's directory) when given.
+    pub fn shell_tools(&self, dir: Option<&std::path::Path>) -> Vec<ShellTool> {
         self.tools
             .iter()
             .map(|t| {
@@ -134,6 +142,7 @@ impl Harness {
                         })
                         .collect(),
                 )
+                .in_dir(dir.map(std::path::Path::to_path_buf))
             })
             .collect()
     }
@@ -156,6 +165,7 @@ mod tests {
                 "prompt": "You are a narrator.",
                 "prethink": "Scene: $$scene$$",
                 "vars": { "scene": ".story/scene.txt" },
+                "max_new_tokens": 8192,
                 "tools": [
                     { "name": "set_scene", "description": "Set the scene.",
                       "params": [ { "name": "scene" } ],
@@ -167,7 +177,8 @@ mod tests {
         .unwrap();
         assert_eq!(h.prompt.as_deref(), Some("You are a narrator."));
         assert_eq!(h.vars["scene"], ".story/scene.txt");
-        let tools = h.shell_tools();
+        assert_eq!(h.max_new_tokens, Some(8192));
+        let tools = h.shell_tools(None);
         assert_eq!(tools.len(), 2);
         // A no-param tool declares an empty properties object.
         let decl = crate::chat::engine::tool_declaration(&tools[1]);

@@ -83,6 +83,8 @@ pub(crate) struct ShellTool {
     description: String,
     command: String,
     params: Vec<ToolParam>,
+    /// Working directory for `command`. None inherits the chat process cwd.
+    work_dir: Option<std::path::PathBuf>,
 }
 
 impl ShellTool {
@@ -92,7 +94,13 @@ impl ShellTool {
             description,
             command,
             params,
+            work_dir: None,
         }
+    }
+
+    pub fn in_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        self.work_dir = dir;
+        self
     }
 }
 
@@ -171,6 +179,9 @@ fn run_shell_tool(
     const MAX_OUTPUT: usize = 4096;
     let mut cmd = std::process::Command::new("sh");
     cmd.arg("-c").arg(&t.command);
+    if let Some(dir) = &t.work_dir {
+        cmd.current_dir(dir);
+    }
     for (k, v) in vars {
         cmd.env(format!("HARNESS_{k}"), v);
     }
@@ -1227,6 +1238,16 @@ mod tests {
         let t = parse_tool_spec("id=printf '%s' \"$input\"").unwrap();
         let out = run_shell_tool(&t, &serde_json::json!({ "input": "; echo pwned" }), &vars);
         assert_eq!(out, "; echo pwned");
+    }
+
+    #[test]
+    fn shell_tool_runs_in_its_work_dir() {
+        let dir = std::env::temp_dir().canonicalize().unwrap();
+        let t = parse_tool_spec("where=pwd")
+            .unwrap()
+            .in_dir(Some(dir.clone()));
+        let out = run_shell_tool(&t, &serde_json::json!({}), &Default::default());
+        assert_eq!(std::path::PathBuf::from(out), dir);
     }
 
     #[test]

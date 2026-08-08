@@ -1,6 +1,7 @@
 /target
 /shader-include/target
 /model
+.web/
 /python/.venv/
 __pycache__/
 *.pyc
