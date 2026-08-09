@@ -419,6 +419,42 @@ fn ids(s: &str) -> Vec<u32> {
     s.chars().map(|c| c as u32).collect()
 }
 
+/// The last content `Text` in an event list, as `(committed, text)`.
+fn content(events: &[StreamEvent]) -> Option<(usize, String)> {
+    events.iter().rev().find_map(|e| match e {
+        StreamEvent::Text {
+            channel: Channel::Content,
+            committed,
+            text,
+        } => Some((*committed, text.clone())),
+        _ => None,
+    })
+}
+
+#[test]
+fn stream_finalized_prefix_never_changes() {
+    let mut s = DiffusionStream::new(
+        FakeDecoder,
+        StreamConfig {
+            stops: vec![],
+            ..Default::default()
+        },
+    );
+    // Block 1 commits "Ab": the whole two bytes are finalized.
+    assert_eq!(
+        content(&s.on_step(&step(1, 1, &ids("Ab"), true))),
+        Some((2, "Ab".into()))
+    );
+    // Block 2's draft grows the text, but `text[..committed]` stays "Ab" and the
+    // watermark only advances.
+    s.on_step(&step(2, 1, &ids("cd"), false));
+    s.on_step(&step(2, 2, &ids("cd"), false));
+    let (committed, text) = content(&s.on_step(&step(2, 3, &ids("cd"), false))).unwrap();
+    assert_eq!(&text[..2], "Ab");
+    assert!(committed >= 2);
+    assert_eq!(text, "Abcd");
+}
+
 #[test]
 fn unpaced_reveals_a_committed_block_whole() {
     // The default (pacing off) surfaces a finished block's answer at once.

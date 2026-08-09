@@ -900,21 +900,7 @@ pub fn propose_block(
                 last_denoise_stop,
             );
         }
-        // Accepted: notify streamers that this block's active argmax is final.
-        // A prefix-exited block's final draft is only the settled head — the
-        // churning tail rows must never stream as final text.
-        if let Some(ref observer) = cfg.step_observer {
-            observer(&StepProgressEvent {
-                block_idx,
-                max_blocks,
-                step_in_block: block_step_count,
-                max_steps,
-                argmax: &st.prev_argmax[..prefix_exit_head.unwrap_or(active).min(active)],
-                accept_count: accept_hist.last().copied().unwrap_or(0),
-                mean_entropy: st.mean_entropy,
-                block_done: true,
-            });
-        }
+        // block_done fires after the confidence trim below, with the committed tokens.
         break 'attempt (
             st,
             block_step_count,
@@ -1116,6 +1102,23 @@ pub fn propose_block(
             argmax_tokens.truncate(first_bad);
             conf_trim_row = Some(first_bad);
         }
+    }
+
+    // Accepted: notify streamers that this block is final, with the committed
+    // tokens (post prefix-exit and confidence trim), so a streamer's finalized
+    // text stays a prefix of the turn's reply. The trimmed tail re-denoises into
+    // the next block.
+    if let Some(ref observer) = cfg.step_observer {
+        observer(&StepProgressEvent {
+            block_idx,
+            max_blocks,
+            step_in_block: block_step_count,
+            max_steps,
+            argmax: &argmax_tokens,
+            accept_count: accept_hist.last().copied().unwrap_or(0),
+            mean_entropy: st.mean_entropy,
+            block_done: true,
+        });
     }
 
     if progress_enabled() {
