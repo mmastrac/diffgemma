@@ -7,6 +7,8 @@
 //! primitives, keeping chat and serve in step on the fragile stable-prefix and
 //! channel-split rules.
 
+mod core;
+mod pace;
 mod serve;
 mod split;
 mod stabilize;
@@ -19,6 +21,8 @@ mod testutil;
 pub use serve::{DiffusionStreamMapper, MapperConfig, WireDelta};
 pub use stream::StreamDecoder;
 
+pub(crate) use core::{Channel, DiffusionStream, StreamConfig, StreamEvent};
+pub(crate) use pace::PaceClock;
 pub(crate) use split::{ChannelIds, salvage_answer};
 pub(crate) use stabilize::{Stabilizer, first_unquoted_stop};
 
@@ -52,6 +56,9 @@ pub struct StepProgressEvent<'a> {
 /// real 32 MB tokenizer.
 pub trait TextDecoder {
     fn decode(&self, ids: &[u32]) -> String;
+    /// Decode-and-append. Only test doubles build `decode` on top of this now,
+    /// but the real tokenizer impl keeps it as the natural primitive.
+    #[allow(dead_code)]
     fn decode_append(&self, out: &mut String, ids: &[u32]);
 
     /// Decode answer-side ids to sanitized visible text. Degenerate ids are
