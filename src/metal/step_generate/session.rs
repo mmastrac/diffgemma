@@ -137,7 +137,8 @@ impl StepGenerateSession {
         prefill_token_ids: Option<Vec<u32>>,
     ) -> Result<(Self, Duration), Error> {
         let layers = cfg.layers.clamp(1, N_LAYERS);
-        let (rt, build) = build_step_runtime(model_dir, &smoke_config(cfg, prefill_token_ids))?;
+        let (rt, build) =
+            build_step_runtime(model_dir, &smoke_config(cfg, prefill_token_ids.clone()))?;
         if progress_enabled() {
             eprintln!(
                 "step-generate: runtime ready (total={:.2?}, compile={:.2?})",
@@ -151,7 +152,10 @@ impl StepGenerateSession {
                 layers,
                 encoder: None,
                 step_text_tokenizer: None,
-                kv_valid_tokens: Vec::new(),
+                // The open-time prefill is causal KV for exactly these tokens
+                // (build errors on a kv_len mismatch), so the log records them
+                // for begin_turn's reuse guard to verify against.
+                kv_valid_tokens: prefill_token_ids.unwrap_or_default(),
             },
             build.compile,
         ))

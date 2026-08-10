@@ -237,6 +237,66 @@ fn truncate_after_uncommitted_canvas_write_matches_fresh_prefill() {
     }
 }
 
+/// THE CROSS-TURN CONTAMINATION ORACLE (the foreign-draft-probe leak).
+///
+/// An ABANDONED turn (`begin_turn` with no `commit_block` and no
+/// `finish_turn`, the shape of every propose-only experiment) leaves the
+/// prompt's KV resident. When only `finish_turn` recorded `kv_valid_tokens`,
+/// that state read as an empty log with a primed KV, and the next
+/// `begin_turn`'s session-open-prefill exemption (empty log and `kv_len >=
+/// n_prompt`, no token verification) adopted the resident KV as this
+/// prompt's prefill. The second turn then denoised against the FIRST
+/// prompt's context: the foreign-draft probe's from-noise arms answered
+/// prompt 1 on prompt 2. `DGQ_KV_REUSE=0` did not protect, since the
+/// exemption was checked independently of the reuse flag.
+///
+/// The prompts share no common prefix, so the correct second `begin_turn` is
+/// a full re-prefill, and the oracle is a fresh prefill of the second
+/// prompt. Layer 0 only, bit-identical by
+/// `layer0_prefill_kv_is_bit_reproducible` (and `prefill_chunks` is
+/// `prefill_chunks_from(0, ..)`, so both sides use the same chunk geometry).
+#[test]
+fn begin_turn_after_abandoned_turn_prefills_the_new_prompt() {
+    let Some(dir) = crate::shaders::test_util::dgq_model_dir() else {
+        return;
+    };
+    const MAX_SEQ: usize = 4096;
+    let layers = crate::commands::resolve_model_layers(&dir, None).unwrap();
+    let sampler = crate::sample::sampler_for_steps(24, false);
+    let cfg = StepGenerateConfig::from_generate(7, 64, MAX_SEQ, layers, sampler, false);
+    let (mut session, _) = StepGenerateSession::open(&dir, &cfg, None).unwrap();
+
+    // p2 shorter than p1 (the buggy exemption also required `kv_len >=
+    // n_prompt`), first tokens differ (zero common prefix).
+    let p1: Vec<u32> = (0..500u32).map(|i| 1000 + (i * 7919) % 30000).collect();
+    let p2: Vec<u32> = (0..300u32).map(|i| 2000 + (i * 104_729) % 30000).collect();
+    assert_ne!(p1[0], p2[0]);
+
+    let _abandoned = begin_turn(&mut session, &p1, &cfg, "abandoned").unwrap();
+    let _victim = begin_turn(&mut session, &p2, &cfg, "victim").unwrap();
+    let got = session.rt.snapshot_kv(p2.len());
+
+    session.reset_kv();
+    session.extend_kv(&p2).unwrap();
+    let want = session.rt.snapshot_kv(p2.len());
+
+    assert_eq!(got.len(), want.len(), "snapshot geometry must match");
+    let l0 = layer0_live_bytes(&session, p2.len(), MAX_SEQ);
+    if got[..l0] != want[..l0] {
+        let per_slot = l0 / p2.len();
+        let bad = (0..p2.len())
+            .filter(|s| {
+                got[s * per_slot..(s + 1) * per_slot] != want[s * per_slot..(s + 1) * per_slot]
+            })
+            .count();
+        panic!(
+            "begin_turn after an abandoned turn reused the previous prompt's KV: \
+             {bad} of {} layer-0 slots differ from a fresh prefill of the new prompt",
+            p2.len()
+        );
+    }
+}
+
 #[test]
 fn p21_denoise_readback_under_1mb() {
     let bytes = StepRuntime::denoise_step_host_readback_bytes(false);

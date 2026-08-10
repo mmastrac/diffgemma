@@ -295,8 +295,15 @@ pub fn begin_turn(
     // Cross-turn KV reuse: the session's `kv_valid_tokens` are already causal in
     // the KV. Reuse the longest common prefix (capped at what the runtime
     // actually holds) and prefill only the delta at that offset.
-    let mut reuse = if crate::flags::kv_reuse_enabled() {
-        longest_common_prefix(&session.kv_valid_tokens, prompt_token_ids).min(existing_kv)
+    let matched =
+        longest_common_prefix(&session.kv_valid_tokens, prompt_token_ids).min(existing_kv);
+    // A resident KV that is a token-verified full prefill of exactly this
+    // prompt (the session-open prefill, or a repeated prompt) is kept even
+    // with cross-turn reuse disabled: keeping it is equivalent to
+    // re-prefilling it.
+    let exact_prefill = matched >= n_prompt && session.kv_valid_tokens.len() == n_prompt;
+    let mut reuse = if exact_prefill || crate::flags::kv_reuse_enabled() {
+        matched
     } else {
         0
     };
@@ -304,9 +311,7 @@ pub fn begin_turn(
     // diverges from — the prompt's common prefix is stale for this turn and
     // must go before any reuse. O(1) truncate inside the ring slack; a DEEP
     // rewind resets instead (no-rebuild-to-salvage: a ring rebuild costs ≈ a
-    // fresh prefill of the kept prefix and yields lineage KV). The
-    // session-open prefill (empty kv_valid log, primed KV) is exempt: it was
-    // prefilled for exactly this prompt.
+    // fresh prefill of the kept prefix and yields lineage KV).
     if !session.kv_valid_tokens.is_empty() && session.kv_valid_tokens.len() > reuse {
         if session.truncate_needs_rebuild(reuse) {
             if progress_enabled() {
@@ -324,10 +329,7 @@ pub fn begin_turn(
     let rt = &mut session.rt;
     // Post-guard truth: a reset zeroed it; a truncate clamped it to `reuse`.
     let existing_kv = rt.read_params().kv_len as usize;
-    let open_prefill = session.kv_valid_tokens.is_empty() && existing_kv >= n_prompt;
-    let (kv_len, prefill_timing, prefill_elapsed) = if (open_prefill || reuse >= n_prompt)
-        && existing_kv > 0
-    {
+    let (kv_len, prefill_timing, prefill_elapsed) = if reuse >= n_prompt && existing_kv > 0 {
         // Whole prompt already prefilled (session-open prefill, or full reuse).
         if progress_enabled() {
             eprintln!("step-generate: using step-kernel prefill kv_len={existing_kv}");
@@ -426,6 +428,14 @@ pub fn begin_turn(
     // kv_len is exactly the prompt length (the reuse/extend paths update KV but
     // not params; a full-reuse KV may also hold stale tokens past the prompt).
     rt.set_kv_len(kv_len as u32);
+    // A turn abandoned after this point (propose_block with no finish_turn)
+    // must still leave a truthful causal log, or the next begin_turn's guard
+    // has nothing to diff the prompt against and the resident KV answers the
+    // wrong prompt.
+    session.kv_valid_tokens.clear();
+    session
+        .kv_valid_tokens
+        .extend_from_slice(&prompt_token_ids[..kv_len.min(n_prompt)]);
     if progress_enabled() && prefill_elapsed > Duration::ZERO {
         eprintln!(
             "step-generate: prefilled kv_len={kv_len} ({prefill_elapsed:.2?}, gpu_forward={:.1}ms kv_pack={:.1}ms)",
@@ -1283,6 +1293,9 @@ pub fn commit_block(
             )?
         };
         rt.set_kv_len(new_kv_len as u32);
+        // The causal log tracks the KV it describes, so a turn abandoned
+        // after this commit still leaves the next begin_turn a truthful log.
+        session.kv_valid_tokens.extend_from_slice(extend_tokens);
         let block_extend = extend_started.elapsed();
         ts.extend_elapsed += block_extend;
         if progress_enabled() {
