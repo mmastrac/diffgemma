@@ -808,6 +808,40 @@ opt-in flags for A/B.
   `bench-gemm --shapes db`), not wired to production. Lesson: when
   compute >> load, double-buffering is a regression, not a lever.
 
+- **Sidecar speculative drafting (OoO-Spec-style MTP head, free-run)** — a
+  0.4B Gemma-4 assistant head (Google's `-assistant` checkpoint, KV-shared
+  with the backbone's last-sliding/last-full layers) ported to CPU f32 and
+  Metal (`mtp_head.rs` / `mtp_head_gpu.rs`, bit-exact CPU↔GPU, 12.2 ms/token),
+  rollout-fine-tuned (K=4, own hiddens at depth 2..K to kill exposure bias)
+  on a 540-sequence corpus (self-gen + 31B-teacher + think-relay). Best
+  measured: 3.40/8 accepted, 92.6% first-token on engine states — and the
+  honest HELD-OUT numbers are 76.1% first-token / 2.17-of-8 free-run, versus
+  the ~95%+ per-token a whole-answer draft needs (0.76^8 ≈ 11% survival).
+  STRUCTURAL blocker, not a training gap: the diffusion denoiser already
+  self-drafts the entire canvas each step, so an AR sidecar must out-draft
+  the model drafting for itself; per-token compounding then kills long
+  free-runs. Teacher-relay data was the strongest source (97.3%/5.13 train),
+  so corpus scale is the one untested lever, but the structural argument
+  stands. Machinery kept: head loaders/kernels, `capture_mtp_states`,
+  `mtp-dump`, the `mtp_*` probe tests.
+- **Step-simulator head / intermediate-step canvas seeding** — predict step
+  t+1's argmax (or the final canvas, or step 1 from prefill hiddens alone)
+  with a cheap head, interleave with real steps. Killed by an ORACLE control,
+  independent of head quality: seeding the canvas with the EXACT real step-1
+  argmax converges in 8.60 mean steps vs 7.13 from noise (head-predicted
+  8.47, majority-prior 11.00; `mtp_step1_seed_probe`, 15 held blocks).
+  Intermediate-step canvases do not shortcut convergence even at perfect
+  fidelity — the trajectory rides on the denoiser's own entropy/accept state,
+  which a content-seeded canvas re-derives differently (variance is huge:
+  oracle went 11→2 on one block and 11→22 on another). Only near-FINAL
+  canvases ratify (the 2-step rewound-canvas fixed point). Per-position
+  heads corroborate: next-step transformer hit 81% changed-position accuracy
+  on train but 19-22% held (flat 40→130 blocks — irreducible, not
+  data-starved); final-target and step-1-from-prefill variants landed at or
+  below their copy/prior baselines. Data: `corpus/steps_v0` (130 blocks of
+  per-step hiddens+argmax); capture machinery kept in `run_denoise_step` and
+  `capture_mtp_states`.
+
 **Quality levers, disproven by measurement:**
 - **Confidence trim as a fix for CODE-correctness errors** — the
   `programmatic` battery's failures looked like the low-p_max tool-arg

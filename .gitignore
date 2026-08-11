@@ -10,3 +10,5 @@ __pycache__/
 /python/holistic*.db
 /python/holistic*.db-wal
 /python/holistic*.db-shm
+/corpus/
+.DS_Store

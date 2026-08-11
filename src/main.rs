@@ -39,6 +39,9 @@ mod membudget;
 #[cfg(target_os = "macos")]
 mod metal;
 mod model;
+mod mtp_head;
+#[cfg(target_os = "macos")]
+mod mtp_head_gpu;
 mod pipeline;
 mod safetensors;
 mod sample;

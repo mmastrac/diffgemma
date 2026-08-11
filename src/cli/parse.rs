@@ -649,6 +649,20 @@ pub(crate) fn parse_cli() -> Cli {
             repeat: smoke_repeat.max(1),
             longctx: smoke_longctx,
         },
+        Some("mtp-dump") => {
+            let usage = "usage: diffgemma mtp-dump <corpus.jsonl> <out-dir> [limit] [-m MODEL]";
+            Command::MtpDump {
+                input: positional.get(1).map(PathBuf::from).unwrap_or_else(|| {
+                    eprintln!("{usage}");
+                    std::process::exit(2);
+                }),
+                out_dir: positional.get(2).map(PathBuf::from).unwrap_or_else(|| {
+                    eprintln!("{usage}");
+                    std::process::exit(2);
+                }),
+                limit: positional.get(3).and_then(|v| v.parse().ok()),
+            }
+        }
         Some("census") => Command::Census {
             arms: census_arms.clone(),
             batteries: if census_batteries.is_empty() {

@@ -386,6 +386,12 @@ pub(crate) enum Command {
         /// Run ONLY the long-context doc-QA tier (bigger session).
         longctx: bool,
     },
+    /// MTP training-state corpus dump (self-generate or teacher-forced).
+    MtpDump {
+        input: PathBuf,
+        out_dir: PathBuf,
+        limit: Option<usize>,
+    },
     /// Flag-arm x battery campaign with explicit acceptance gates.
     Census {
         /// `NAME:KEY=VAL,...` per arm; `NAME:` is a no-override baseline.

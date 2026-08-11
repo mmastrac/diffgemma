@@ -21,6 +21,7 @@ mod fit_token_probe;
 mod gen_cmd;
 mod golden_cmd;
 mod model_ops;
+mod mtp_dump;
 mod programmatic;
 mod replay;
 mod smoketest;
@@ -596,6 +597,18 @@ pub(crate) fn dispatch(cli: Cli) -> ExitCode {
             longctx,
         ),
         #[cfg(target_os = "macos")]
+        Command::MtpDump {
+            input,
+            out_dir,
+            limit,
+        } => {
+            if let Err(err) = mtp_dump::run_mtp_dump_cmd(&cli.model_dir, &input, &out_dir, limit) {
+                eprintln!("mtp-dump failed: {err}");
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        #[cfg(target_os = "macos")]
         Command::Census {
             arms,
             batteries,
@@ -779,7 +792,7 @@ pub(crate) fn run_command(
         Command::Attention => run_attention_parity(m),
         Command::Chat { .. } => ExitCode::FAILURE,
         Command::Serve { .. } => ExitCode::FAILURE,
-        Command::Smoketest { .. } | Command::Census { .. } | Command::FitTokenProbe { .. } => {
+        Command::Smoketest { .. } | Command::Census { .. } | Command::MtpDump { .. } | Command::FitTokenProbe { .. } => {
             ExitCode::FAILURE
         }
         Command::Golden { .. } => ExitCode::FAILURE,

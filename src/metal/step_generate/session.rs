@@ -469,3 +469,100 @@ pub(super) fn perturb_live_kv_f16(
     }
     eprintln!("DGQ_KV_NOISE: perturbed {n} f16 KV values by rel eps {eps}");
 }
+
+impl StepGenerateSession {
+    pub fn eos_token_id(&self) -> u32 {
+        self.rt.read_params().eos_token_id
+    }
+
+    /// MTP training-state extraction: fresh-prefill `seq` and return the
+    /// layer-29 pre-final-norm hiddens (seq * HID f32, row-major, all
+    /// positions) plus the last-sliding / last-full layer K/V decoded to f32
+    /// head-major planes. Resets the KV cache.
+    pub fn capture_mtp_states(
+        &mut self,
+        seq: &[u32],
+    ) -> Result<(Vec<f32>, crate::mtp_head::BackboneKv), Error> {
+        let s = seq.len();
+        self.reset_kv();
+        self.rt.set_prefill_hidden_capture(s);
+        self.extend_kv(seq)?;
+        let hidden = self
+            .rt
+            .take_prefill_hidden()
+            .ok_or(Error::Runtime("prefill hidden capture missing"))?;
+
+        let max_seq = self.rt.max_seq();
+        let fmt = crate::flags::kv_format(max_seq);
+        let snap = self.snapshot_kv();
+        let layout = self.rt.layout();
+        let last_swa = (0..crate::metal::step_kernel::N_LAYERS)
+            .rev()
+            .find(|&i| layout.layers[i].kv_ring_mask != 0)
+            .expect("no sliding layer");
+        let last_full = (0..crate::metal::step_kernel::N_LAYERS)
+            .rev()
+            .find(|&i| layout.layers[i].kv_ring_mask == 0)
+            .expect("no full layer");
+
+        let decode = |target: usize| -> (Vec<f32>, Vec<f32>) {
+            let mut off = 0usize;
+            for i in 0..crate::metal::step_kernel::N_LAYERS {
+                let l = &layout.layers[i];
+                let cap = if l.kv_ring_mask != 0 {
+                    l.kv_ring_mask as usize + 1
+                } else {
+                    (max_seq + 8).next_multiple_of(8)
+                };
+                let slots = s.min(cap);
+                let bytes =
+                    crate::metal::step_kv::kv_region_bytes(l.n_kv_heads, l.head_dim, slots, fmt)
+                        as usize;
+                if i == target {
+                    let (n_kv, hd) = (l.n_kv_heads as usize, l.head_dim as usize);
+                    let row_bytes = hd * 2;
+                    let slot_stride = 2 * n_kv * row_bytes;
+                    let mut k = vec![0.0f32; n_kv * s * hd];
+                    let mut v = vec![0.0f32; n_kv * s * hd];
+                    for pos in 0..s {
+                        let slot = if l.kv_ring_mask != 0 {
+                            pos & l.kv_ring_mask as usize
+                        } else {
+                            pos
+                        };
+                        for hh in 0..n_kv {
+                            let row = |r: usize, dst: &mut [f32]| {
+                                let base = off + slot * slot_stride + r * row_bytes;
+                                for (j, c) in snap.kv_bytes[base..base + row_bytes]
+                                    .chunks_exact(2)
+                                    .enumerate()
+                                {
+                                    dst[j] = crate::shaders::f16::f16_bits_to_f32(
+                                        u16::from_le_bytes([c[0], c[1]]),
+                                    );
+                                }
+                            };
+                            row(hh, &mut k[hh * s * hd + pos * hd..][..hd]);
+                            row(n_kv + hh, &mut v[hh * s * hd + pos * hd..][..hd]);
+                        }
+                    }
+                    return (k, v);
+                }
+                off += bytes;
+            }
+            unreachable!("layer {target} not reached");
+        };
+        let (k_swa, v_swa) = decode(last_swa);
+        let (k_full, v_full) = decode(last_full);
+        Ok((
+            hidden,
+            crate::mtp_head::BackboneKv {
+                k_swa,
+                v_swa,
+                k_full,
+                v_full,
+                seq: s,
+            },
+        ))
+    }
+}

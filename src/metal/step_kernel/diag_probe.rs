@@ -97,6 +97,23 @@ pub(super) fn read_arena_hidden_row(
     read_arena_row(arena, base, row, HID)
 }
 
+impl StepRuntime {
+    /// Arm the prefill hidden capture: the next fresh `prefill_chunks_from`
+    /// accumulates the first `rows` positions' hidden-plane rows (layer-29
+    /// output, pre-final-norm; `encode_step_finish` norms into `tmp`, so this
+    /// plane keeps the raw layer output) across its chunk loop, before the
+    /// arena is re-zeroed. bf16-plane reads (`DGQ_PREFILL_F16` must be off).
+    pub fn set_prefill_hidden_capture(&mut self, rows: usize) {
+        self.capture_prefill_hidden_rows = rows;
+        self.last_prefill_hidden = None;
+    }
+
+    /// Take the rows captured by the last prefill (rows * HID f32, row-major).
+    pub fn take_prefill_hidden(&mut self) -> Option<Vec<f32>> {
+        self.last_prefill_hidden.take()
+    }
+}
+
 pub(super) fn read_arena_row(
     arena: &ProtocolObject<dyn MTLBuffer>,
     base: u64,

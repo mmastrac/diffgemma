@@ -42,6 +42,15 @@ pub struct StepRuntime {
     /// `CANVAS` (256) normally; the block loop narrows it (128/64) when re-
     /// rolling a degenerate reply. Clamped to [1, CANVAS].
     pub(super) active_canvas: usize,
+    /// Positions of hidden-plane rows (layer-29 output, pre-final-norm) to
+    /// accumulate across the prefill chunk loop, before the arena re-zeros.
+    /// 0 = off. The MTP draft head consumes these.
+    pub(super) capture_prefill_hidden_rows: usize,
+    pub(super) last_prefill_hidden: Option<Vec<f32>>,
+    /// When set, each denoise step appends (canvas hiddens, canvas argmax)
+    /// to `step_captures` — training pairs for the step-simulator head.
+    pub(super) capture_step_hiddens: bool,
+    pub(super) step_captures: Vec<(Vec<f32>, Vec<u32>)>,
 }
 
 impl StepRuntime {
@@ -367,6 +376,23 @@ impl StepRuntime {
             self.hydrate_kv_f32_side(offset)?;
         }
         self.arena_f16_mode = self.pipelines_prefill_f16.is_some();
+        let mut hidden_capture = if self.capture_prefill_hidden_rows > 0 && offset == 0 {
+            assert!(
+                !self.arena_f16_mode,
+                "prefill hidden capture needs the bf16 arena (DGQ_PREFILL_F16 off)"
+            );
+            Some(vec![0.0f32; self.capture_prefill_hidden_rows.min(n) * HID])
+        } else {
+            None
+        };
+        let capture_rows = |rt: &Self, cap: &mut Vec<f32>, at: usize, len: usize| {
+            let base = rt.bufs.arena_map.hidden_off();
+            let end = cap.len() / HID;
+            for r in 0..len.min(end.saturating_sub(at)) {
+                let row = super::diag_probe::read_arena_hidden_row(&rt.bufs.arena, base, r);
+                cap[(at + r) * HID..(at + r + 1) * HID].copy_from_slice(&row);
+            }
+        };
         while pos < n {
             let remaining = n - pos;
             // Batched super-chunk: n_subs full-CANVAS causal sub-chunks as one
@@ -386,6 +412,9 @@ impl StepRuntime {
                 if let Some(peaks) = range_peaks.as_mut() {
                     probe_planes(self, m, peaks);
                 }
+                if let Some(cap) = hidden_capture.as_mut() {
+                    capture_rows(self, cap, pos, m);
+                }
                 pos += m;
                 continue;
             }
@@ -396,6 +425,9 @@ impl StepRuntime {
             self.set_canvas_ids(&ids)?;
             self.set_kv_len(pos as u32);
             self.dispatch_and_wait(|enc| enc.encode_prefill_chunk(&layout, layers))?;
+            if let Some(cap) = hidden_capture.as_mut() {
+                capture_rows(self, cap, pos, chunk_len);
+            }
             if let Some(peaks) = range_peaks.as_mut() {
                 probe_planes(self, CANVAS, peaks);
             }
@@ -414,6 +446,9 @@ impl StepRuntime {
         }
         self.set_kv_write_end(u32::MAX);
         self.set_kv_len(n as u32);
+        if let Some(cap) = hidden_capture {
+            self.last_prefill_hidden = Some(cap);
+        }
         // The prefill dirtied scratch (arena hidden/dense, MoE routing buffers,
         // logits); re-zero to the same clean state the (self-contained) engine
         // prefill leaves — mirrors the post-open zeros minus kvcache (holds the
@@ -524,7 +559,34 @@ impl StepRuntime {
 
     pub fn run_denoise_step(&mut self) -> Result<(), Error> {
         zero_buffer(&self.bufs.expert_layer_unique);
-        self.run_forward_once(StepFinishMode::Full)
+        self.run_forward_once(StepFinishMode::Full)?;
+        if self.capture_step_hiddens {
+            let base = self.bufs.arena_map.hidden_off();
+            let mut hidden = Vec::with_capacity(CANVAS * HID);
+            for r in 0..CANVAS {
+                hidden.extend(super::diag_probe::read_arena_hidden_row(
+                    &self.bufs.arena,
+                    base,
+                    r,
+                ));
+            }
+            let argmax = self.read_canvas_state().prev_argmax.to_vec();
+            self.step_captures.push((hidden, argmax));
+        }
+        Ok(())
+    }
+
+    /// Arm per-step canvas capture (hiddens are the layer-29 pre-final-norm
+    /// plane; argmax is the step's full-canvas argmax). Clears prior takes.
+    #[cfg(test)]
+    pub fn set_step_capture(&mut self, on: bool) {
+        self.capture_step_hiddens = on;
+        self.step_captures.clear();
+    }
+
+    #[cfg(test)]
+    pub fn take_step_captures(&mut self) -> Vec<(Vec<f32>, Vec<u32>)> {
+        std::mem::take(&mut self.step_captures)
     }
 
     /// Populate forward telemetry from per-layer expert counts (grouped MoE path).
