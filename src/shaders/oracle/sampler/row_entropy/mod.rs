@@ -153,3 +153,14 @@ mod tests {
         run_matrix(canvas_vocab_fixture, 2.5e-2);
     }
 }
+
+crate::kernel_spec! {
+    pub const SPEC {
+        name: "row_entropy",
+        entry: "row_entropy",
+        source: SHADER,
+        quant_formats: &[QuantFormat::Q4Affine],
+        fc: &[],
+        variants: KernelVariants::Elementwise,
+    }
+}

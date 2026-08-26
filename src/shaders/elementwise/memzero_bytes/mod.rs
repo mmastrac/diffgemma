@@ -118,3 +118,14 @@ mod tests {
         min_cos = 1.0,
     }
 }
+
+crate::kernel_spec! {
+    pub const SPEC {
+        name: "memzero_bytes",
+        entry: "memzero_bytes",
+        source: SHADER,
+        quant_formats: &[QuantFormat::Q4Affine],
+        fc: &[],
+        variants: KernelVariants::Elementwise,
+    }
+}

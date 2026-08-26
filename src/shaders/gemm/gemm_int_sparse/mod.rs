@@ -379,3 +379,14 @@ mod tests {
         }
     }
 }
+
+crate::kernel_spec! {
+    pub const SPEC {
+        name: "gemm_int_sparse",
+        entry: "gemm_int_sparse",
+        source: SHADER,
+        quant_formats: &[QuantFormat::Q4Affine],
+        fc: &[],
+        variants: KernelVariants::Elementwise,
+    }
+}

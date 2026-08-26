@@ -15,3 +15,14 @@ pub mod int_mma_probe;
 /// `f32_f32_linear` in `gemm.metal`) — compiled by src/metal/{engine,gemm}.rs.
 /// System includes only, so no include_metal! expansion is needed.
 pub const ENGINE_LINEAR_SHADER: &str = include_str!("gemm.metal");
+
+crate::kernel_spec! {
+    pub const SPEC {
+        name: "gemm",
+        entry: "bf16_gemm",
+        source: ENGINE_LINEAR_SHADER,
+        quant_formats: &[QuantFormat::Q4Affine],
+        fc: &[],
+        variants: KernelVariants::Elementwise,
+    }
+}

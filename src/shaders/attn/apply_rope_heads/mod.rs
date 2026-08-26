@@ -278,3 +278,14 @@ mod tests {
     // #[cfg(metal)] from the cpu_* tests above; the gpu_* copies were byte-
     // identical duplicates.)
 }
+
+crate::kernel_spec! {
+    pub const SPEC {
+        name: "apply_rope_heads",
+        entry: "apply_rope_heads",
+        source: SHADER,
+        quant_formats: &[QuantFormat::Q4Affine],
+        fc: &[],
+        variants: KernelVariants::Elementwise,
+    }
+}

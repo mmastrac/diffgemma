@@ -157,3 +157,14 @@ mod tests {
         }
     }
 }
+
+crate::kernel_spec! {
+    pub const SPEC {
+        name: "convert_scale",
+        entry: "convert_scale",
+        source: SHADER,
+        quant_formats: &[QuantFormat::Q4Affine],
+        fc: &[(4, "K_SRC_F32"), (5, "K_DST_F32")],
+        variants: KernelVariants::Elementwise,
+    }
+}

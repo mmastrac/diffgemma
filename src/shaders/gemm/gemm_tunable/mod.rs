@@ -955,3 +955,28 @@ mod double_buffer_tests {
         );
     }
 }
+
+crate::kernel_spec! {
+    pub const SPEC {
+        name: "gemm_tunable",
+        entry: "gemm_tunable",
+        source: SHADER,
+        quant_formats: &[
+            QuantFormat::Q4Affine,
+            QuantFormat::Q8,
+            QuantFormat::Q6,
+            QuantFormat::NvFp4,
+            QuantFormat::Raw,
+        ],
+        fc: &[
+            (4, "IS_FULL_LAYER"),
+            (5, "GEMM_N"),
+            (6, "GEMM_K"),
+            (10, "K_X_FP16"),
+            (11, "GEMM_N_TILE"),
+            (28, "TUNE_GATHER_A"),
+            (29, "K_OUT_BF16"),
+        ],
+        variants: KernelVariants::Elementwise,
+    }
+}

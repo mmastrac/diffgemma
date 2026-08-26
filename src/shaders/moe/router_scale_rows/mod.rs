@@ -134,3 +134,14 @@ mod tests {
         min_cos = 0.9999,
     }
 }
+
+crate::kernel_spec! {
+    pub const SPEC {
+        name: "router_scale_rows",
+        entry: "router_scale_rows",
+        source: SHADER,
+        quant_formats: &[QuantFormat::Q4Affine],
+        fc: &[],
+        variants: KernelVariants::Elementwise,
+    }
+}

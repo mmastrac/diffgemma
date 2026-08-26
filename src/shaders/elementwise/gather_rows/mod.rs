@@ -377,3 +377,14 @@ mod tests {
         min_cos = 0.9999,
     }
 }
+
+crate::kernel_spec! {
+    pub const SPEC {
+        name: "gather_rows",
+        entry: "gather_rows",
+        source: SHADER,
+        quant_formats: &[QuantFormat::Q4Affine],
+        fc: &[(4, "K_SRC_F32"), (5, "K_DST_F32")],
+        variants: KernelVariants::Elementwise,
+    }
+}

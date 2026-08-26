@@ -290,3 +290,14 @@ mod tests {
         assert_row_invariants(&out, fix.rows, fix.cols);
     }
 }
+
+crate::kernel_spec! {
+    pub const SPEC {
+        name: "softmax_rows",
+        entry: "softmax_rows",
+        source: SHADER,
+        quant_formats: &[QuantFormat::Q4Affine],
+        fc: &[],
+        variants: KernelVariants::Elementwise,
+    }
+}

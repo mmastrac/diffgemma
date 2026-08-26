@@ -11,9 +11,8 @@
 //! (`render_toml()`, `diffgemma manifest`) — there is no checked-in
 //! manifest file to drift. FC 1–3 are reserved globally
 //! (src/shaders/include/fc_axes.metal); `fc` lists each kernel's LOCAL
-//! axes (index ≥ 4). Axes of non-registered kernels (the tunable GEMM
-//! family's FC9–11/28–30, convert_scale's FC4/5, …) are documented in
-//! ARCHITECTURE.md.
+//! axes (index ≥ 4). Every entry `.metal` in the tree has a registered
+//! spec (enforced by `registered_sources_match_disk`).
 
 use super::variant::{ElemDtype, FcBool, FcUInt, KernelVariant, QuantFormat};
 use crate::Error;
@@ -406,9 +405,10 @@ mod tests {
     }
 
     /// Every registered source must be byte-identical to `<name>.metal` on
-    /// disk (catches a spec wired to the wrong `include_str!` const). Also
-    /// prints the coverage report: entry `.metal` files with no registered
-    /// spec (run with `--nocapture` to see it).
+    /// disk (catches a spec wired to the wrong `include_str!` const), and
+    /// every entry `.metal` in the tree must have a registered spec — full
+    /// coverage is what will let the pipeline-cache key derive from
+    /// registered content.
     #[test]
     fn registered_sources_match_disk() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shaders");
@@ -440,11 +440,9 @@ mod tests {
             "specs with no on-disk <name>.metal: {:?}",
             by_name.keys().collect::<Vec<_>>()
         );
-        println!(
-            "coverage: {} registered, {} entry files unregistered: {:?}",
-            specs().len(),
-            unregistered.len(),
-            unregistered
+        assert!(
+            unregistered.is_empty(),
+            "entry .metal files with no registered spec: {unregistered:?}"
         );
     }
 
