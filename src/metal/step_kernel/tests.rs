@@ -449,9 +449,9 @@ fn fused_gate_up_gemm_matches_split_in_full_arena() {
     let store = crate::dgq::store::DgqStore::open(dir).expect("dgq");
     let offsets = build_offsets_from_store(&store);
     let layout = build_layout(&offsets, 512);
-    let arena_map = step_arena_layout();
+    let arena_map = step_arena_layout(&crate::metal::step_config::ModelDims::reference());
     let l = &layout.layers[0];
-    let (segs, n_total) = gate_up_stacked_segments(l, &arena_map);
+    let (segs, n_total) = gate_up_stacked_segments(l, &arena_map, DENSE_FF);
 
     let ctx = MetalContext::new().expect("metal");
     let gpu_blob = DgqGpuBlob::from_store(&store, &ctx.device).expect("blob");

@@ -26,28 +26,33 @@ pub(super) fn prefill_bench_skipped(stage: step_schedule::StepStage) -> bool {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct StepPipelineKey(u8);
+struct StepPipelineKey(u8, u64);
 
 fn step_pipeline_key(
     variant: crate::shaders::variant::KernelVariant,
     fmt: crate::shaders::kv_quant::KvFormat,
+    dims: &crate::metal::step_config::ModelDims,
 ) -> StepPipelineKey {
     // KV format code occupies bits 3-4 (0=f16, 1=q8, 2=q4); bit 5 = fp16 arena.
+    // The dims fingerprint keeps the process-global cache correct if two
+    // models with different geometry load in one process.
     StepPipelineKey(
         u8::from(variant.shape_assert)
             | (u8::from(variant.debug_fast) << 1)
             | (u8::from(variant.debug_deep) << 2)
             | ((fmt.code() as u8) << 3)
             | (u8::from(variant.arena_f16) << 5),
+        dims.fingerprint(),
     )
 }
 
 fn shared_step_pipelines(
     ctx: &MetalContext,
     fmt: crate::shaders::kv_quant::KvFormat,
+    dims: &crate::metal::step_config::ModelDims,
 ) -> Result<&'static StepPipelines, Error> {
     let variant = crate::shaders::variant::runtime_step_variant();
-    let key = step_pipeline_key(variant, fmt);
+    let key = step_pipeline_key(variant, fmt, dims);
     let cache = STEP_PIPELINES_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let mut guard = cache
         .lock()
@@ -56,19 +61,24 @@ fn shared_step_pipelines(
         return Ok(pipelines);
     }
 
-    let pipelines = StepPipelines::new(ctx, variant, fmt)?;
+    let pipelines = StepPipelines::new(ctx, variant, fmt, dims)?;
     let leaked: &'static StepPipelines = Box::leak(Box::new(pipelines));
     guard.insert(key, leaked);
     gpukit::metal::PipelineArchiveCache::flush_global();
     Ok(leaked)
 }
 
-pub fn log_step_memory_budget(blob_bytes: u64, max_seq: usize, layout: &ModelLayout) {
+pub fn log_step_memory_budget(
+    blob_bytes: u64,
+    max_seq: usize,
+    layout: &ModelLayout,
+    dims: &crate::metal::step_config::ModelDims,
+) {
     let kv = kv_cache_bytes(layout, max_seq);
-    let logits = (CANVAS * VOCAB * 2) as u64;
-    let sc_probs = sc_probs_buffer_bytes() as u64;
-    let arena = step_arena_layout().bytes();
-    let (mx, mw) = gemm_scratch_bytes();
+    let logits = (dims.canvas * dims.vocab * 2) as u64;
+    let sc_probs = sc_probs_buffer_bytes(dims) as u64;
+    let arena = step_arena_layout(dims).bytes();
+    let (mx, mw) = gemm_scratch_bytes(dims);
     let gemm_scratch = (mx + mw) as u64;
     let gpu_static = kv + logits + sc_probs + arena + gemm_scratch;
     let total = blob_bytes + gpu_static;
@@ -231,12 +241,12 @@ pub fn build_step_runtime(
     if f16_all {
         crate::shaders::variant::set_arena_f16_compile(true);
     }
-    let pipelines = shared_step_pipelines(&ctx, kv_fmt)?;
+    let pipelines = shared_step_pipelines(&ctx, kv_fmt, &validated.dims)?;
     // f16_all: LEAVE the compile-mode atomic on — lazy dispatch-time compiles
     // (stacked GEMM) must also build f16 for the whole session.
     let pipelines_prefill_f16 = if crate::flags::prefill_f16_enabled() {
         crate::shaders::variant::set_arena_f16_compile(true);
-        let out = shared_step_pipelines(&ctx, kv_fmt);
+        let out = shared_step_pipelines(&ctx, kv_fmt, &validated.dims);
         crate::shaders::variant::set_arena_f16_compile(false);
         Some(out?)
     } else {
@@ -248,9 +258,9 @@ pub fn build_step_runtime(
     let gpu_blob = std::sync::Arc::clone(&gpu_blob);
     let kv_bytes = kv_cache_bytes(&layout, cfg.max_seq) as usize;
     let logits_bytes = CANVAS * VOCAB * 2;
-    let sc_probs_bytes = sc_probs_buffer_bytes();
+    let sc_probs_bytes = sc_probs_buffer_bytes(&validated.dims);
 
-    log_step_memory_budget(store.blob_bytes(), cfg.max_seq, &layout);
+    log_step_memory_budget(store.blob_bytes(), cfg.max_seq, &layout, &validated.dims);
 
     let sampler = crate::sample::sampler_for_steps(cfg.steps.max(1), cfg.no_early_stop);
     let prefill_len = cfg
@@ -262,7 +272,7 @@ pub fn build_step_runtime(
     let eos_token_id = model_cfg.eos_token_id_u32();
     let params = step_params_from_sampler(&sampler, prefill_len, cfg.no_early_stop, eos_token_id);
     let state = init_canvas_state(cfg.seed, VOCAB);
-    let (gemm_a_bytes, gemm_b_bytes) = gemm_scratch_bytes();
+    let (gemm_a_bytes, gemm_b_bytes) = gemm_scratch_bytes(&validated.dims);
 
     let text_config = model_cfg.text_config;
     let weight_store = WeightStore::open(model_dir)?;
@@ -273,7 +283,7 @@ pub fn build_step_runtime(
         std::sync::Arc::clone(&gpu_blob),
     )?;
 
-    let arena_map = step_arena_layout();
+    let arena_map = step_arena_layout(&validated.dims);
     // KV cache: optionally file-backed (DGQ_KV_MMAP) so dirty pages evict to a
     // real file instead of anonymous swap. `kv_mmap_backing` must outlive
     // `kvcache` — it is declared after it in `StepBuffers` so it drops later.

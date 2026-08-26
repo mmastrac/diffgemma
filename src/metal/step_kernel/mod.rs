@@ -105,21 +105,21 @@ pub use crate::flags::{
 pub const MAX_ATTN_Q_COLS: usize = 8192;
 pub const MAX_ATTN_KV_COLS: usize = 2048;
 
-pub fn step_arena_params() -> ArenaLayoutParams {
+pub fn step_arena_params(dims: &crate::metal::step_config::ModelDims) -> ArenaLayoutParams {
     ArenaLayoutParams {
-        // Planes hold PREFILL_M rows so the batched prefill super-chunk (4x256
+        // Planes hold prefill_m rows so the batched prefill super-chunk (4x256
         // causal sub-chunks in ONE forward) fits; denoise dispatches only ever
-        // touch rows [0..CANVAS) of each plane. Arena ~25.6 -> ~102 MiB.
-        canvas: PREFILL_M,
-        hidden: HID,
-        dense_ff: DENSE_FF as usize,
+        // touch rows [0..canvas) of each plane. Arena ~25.6 -> ~102 MiB.
+        canvas: dims.prefill_m(),
+        hidden: dims.hid,
+        dense_ff: dims.dense_ff,
         max_attn_q_cols: MAX_ATTN_Q_COLS,
         max_attn_kv_cols: MAX_ATTN_KV_COLS,
     }
 }
 
-pub fn step_arena_layout() -> ArenaLayout {
-    build_arena_layout(&step_arena_params())
+pub fn step_arena_layout(dims: &crate::metal::step_config::ModelDims) -> ArenaLayout {
+    build_arena_layout(&step_arena_params(dims))
 }
 
 pub const MOE_ACT_PROBE_FLOATS: usize = MOE_ACT_PROBE_ACT_FLOATS + MOE_ACT_PROBE_META_FLOATS;
@@ -471,14 +471,15 @@ pub fn build_offsets_from_store(store: &DgqStore) -> HashMap<String, u64> {
 /// Per-expert weight byte offset from `.dgq` manifest (stack base + expert × matrix bytes).
 pub fn manifest_offset(
     offsets: &HashMap<String, u64>,
+    dims: &crate::metal::step_config::ModelDims,
     layer: usize,
     expert: usize,
     kind: &str,
     format: QuantFormat,
 ) -> u64 {
     use crate::dgq::layout::{nvfp4_matrix_bytes, q4_matrix_bytes};
-    let hidden = HID;
-    let moe_ff = MOE_FF as usize;
+    let hidden = dims.hid;
+    let moe_ff = dims.moe_ff;
     let (tensor, n, k) = match kind {
         "gate_up" => (
             format!("model.decoder.layers.{layer}.experts.gate_up_proj"),
@@ -656,23 +657,24 @@ pub(crate) fn qkv_stacked_segments(
 pub(crate) fn gate_up_stacked_segments(
     l: &LayerOffsets,
     arena: &ArenaLayout,
+    dense_ff: u32,
 ) -> ([crate::shaders::gemm_block_stacked::GemmStackedSeg; 2], u32) {
     use crate::shaders::gemm_block_stacked::GemmStackedSeg;
-    let n2 = DENSE_FF * 2;
+    let n2 = dense_ff * 2;
     (
         [
             GemmStackedSeg {
-                n_cols: DENSE_FF,
+                n_cols: dense_ff,
                 y_col0: 0,
-                y_row_cols: DENSE_FF,
+                y_row_cols: dense_ff,
                 _pad: 0,
                 w_off: l.mlp_gate,
                 y_byte_off: arena.ffg_off(),
             },
             GemmStackedSeg {
-                n_cols: DENSE_FF,
+                n_cols: dense_ff,
                 y_col0: 0,
-                y_row_cols: DENSE_FF,
+                y_row_cols: dense_ff,
                 _pad: 0,
                 w_off: l.mlp_up,
                 y_byte_off: arena.ffu_off(),
@@ -683,16 +685,17 @@ pub(crate) fn gate_up_stacked_segments(
 }
 
 /// Scratch byte sizes for step-kernel grouped GEMM (max over all MoE/dense shapes).
-fn gemm_scratch_bytes() -> (usize, usize) {
+fn gemm_scratch_bytes(dims: &crate::metal::step_config::ModelDims) -> (usize, usize) {
+    let (hid, dense_ff) = (dims.hid as u32, dims.dense_ff as u32);
     let shapes = [
-        (CANVAS, 4096u32, HID as u32),
-        (CANVAS, 2048, HID as u32),
-        (CANVAS, 2816, 4096),
-        (CANVAS, 8192, HID as u32),
-        (CANVAS, 1024, HID as u32),
-        (CANVAS, 2816, 8192),
-        (CANVAS, DENSE_FF, HID as u32),
-        (CANVAS, 2816, DENSE_FF),
+        (dims.canvas, dims.q_cols(false) as u32, hid),
+        (dims.canvas, dims.kv_cols(false) as u32, hid),
+        (dims.canvas, hid, dims.q_cols(false) as u32),
+        (dims.canvas, dims.q_cols(true) as u32, hid),
+        (dims.canvas, dims.kv_cols(true) as u32, hid),
+        (dims.canvas, hid, dims.q_cols(true) as u32),
+        (dims.canvas, dense_ff, hid),
+        (dims.canvas, hid, dense_ff),
     ];
     let mut max_mk = 0usize;
     let mut max_nk = 0usize;
@@ -705,19 +708,21 @@ fn gemm_scratch_bytes() -> (usize, usize) {
     // (PREFILL_M x HID) and the swiglu activations (MOE_SLOTS x MOE_FF);
     // gemm_b holds the gathered expert A (MOE_SLOTS x HID at offset 0) plus
     // the gate_up activations (MOE_SLOTS x 2*MOE_FF at moe_w_byte_off_gu).
-    let moe_slots = PREFILL_M * TOP_K;
-    max_mk = max_mk.max(PREFILL_M * HID).max(moe_slots * MOE_FF as usize);
-    max_nk = max_nk.max(moe_slots * (HID + 2 * MOE_FF as usize));
+    let moe_slots = dims.prefill_m() * dims.top_k;
+    max_mk = max_mk
+        .max(dims.prefill_m() * dims.hid)
+        .max(moe_slots * dims.moe_ff);
+    max_nk = max_nk.max(moe_slots * (dims.hid + 2 * dims.moe_ff));
     (max_mk * f32, max_nk * f32)
 }
 
 /// SC prob staging: one vocab chunk of fp16 probs (the chunked softembed path).
-fn sc_probs_buffer_bytes() -> usize {
-    CANVAS * crate::model::embed::LM_HEAD_CHUNK * 2
+fn sc_probs_buffer_bytes(dims: &crate::metal::step_config::ModelDims) -> usize {
+    dims.canvas * crate::model::embed::LM_HEAD_CHUNK * 2
 }
 
-fn logits_finite_sample_bytes() -> u64 {
-    (logits_finite_sample_count().min(CANVAS * VOCAB) * 2) as u64
+fn logits_finite_sample_bytes(dims: &crate::metal::step_config::ModelDims) -> u64 {
+    (logits_finite_sample_count().min(dims.canvas * dims.vocab) * 2) as u64
 }
 
 struct StepPipelines {
@@ -820,6 +825,7 @@ impl StepPipelines {
         ctx: &MetalContext,
         variant: crate::shaders::variant::KernelVariant,
         fmt: crate::shaders::kv_quant::KvFormat,
+        dims: &crate::metal::step_config::ModelDims,
     ) -> Result<Self, Error> {
         let mut gemm_tunable_raw = HashMap::new();
         let mut gemm_tunable_q8 = HashMap::new();
@@ -830,22 +836,25 @@ impl StepPipelines {
         let sparse_wide_bm = crate::flags::moe_prefill_block_m();
         let mut gemm_q8_rowk = HashMap::new();
         let mut gemm_q8_rowk_xfp16 = HashMap::new();
+        let hid = dims.hid as u32;
+        let dense_ff = dims.dense_ff as u32;
+        let vocab = dims.vocab as u32;
         for &(n, k) in &[
-            (4096u32, HID as u32),
-            (2048, HID as u32),
-            (2816, 4096),
-            (8192, HID as u32),
-            (1024, HID as u32),
-            (2816, 8192),
-            (DENSE_FF, HID as u32),
-            (2816, DENSE_FF),
-            (VOCAB as u32, HID as u32),
-            // Router logits GEMM (DGQ_ROUTER_GEMM): [256, HID] @ router_proj^T[128, HID].
-            (N_EXPERTS as u32, HID as u32),
+            (dims.q_cols(false) as u32, hid),
+            (dims.kv_cols(false) as u32, hid),
+            (hid, dims.q_cols(false) as u32),
+            (dims.q_cols(true) as u32, hid),
+            (dims.kv_cols(true) as u32, hid),
+            (hid, dims.q_cols(true) as u32),
+            (dense_ff, hid),
+            (hid, dense_ff),
+            (vocab, hid),
+            // Router logits GEMM (DGQ_ROUTER_GEMM): [canvas, hid] @ router_proj^T[n_experts, hid].
+            (dims.n_experts as u32, hid),
         ] {
             // Raw (bf16-weight) dense: lm_head logits (n=VOCAB) forces bf16
             // output (range); others follow K_ACT_F16 for their activation out.
-            let raw = if n == VOCAB as u32 {
+            let raw = if n == vocab {
                 crate::shaders::gemm_tunable::pipeline_for_logits(
                     ctx,
                     n,
@@ -883,20 +892,20 @@ impl StepPipelines {
             );
         }
         for &(n, k) in &[
-            (DENSE_FF, HID as u32),
-            (2816, DENSE_FF),
-            (VOCAB as u32, HID as u32),
+            (dense_ff, hid),
+            (hid, dense_ff),
+            (vocab, hid),
             // Attention q/k/v/o_proj shapes (mixed-precision q8 attention path).
-            (4096u32, HID as u32),
-            (2048, HID as u32),
-            (8192, HID as u32),
-            (1024, HID as u32),
-            (2816, 4096),
-            (2816, 8192),
+            (dims.q_cols(false) as u32, hid),
+            (dims.kv_cols(false) as u32, hid),
+            (dims.q_cols(true) as u32, hid),
+            (dims.kv_cols(true) as u32, hid),
+            (hid, dims.q_cols(false) as u32),
+            (hid, dims.q_cols(true) as u32),
         ] {
             // q8 dense: lm_head logits (VOCAB) forces bf16 output; others follow
             // the arena activation dtype.
-            let q8 = if (n, k) == (VOCAB as u32, HID as u32) {
+            let q8 = if (n, k) == (vocab, hid) {
                 crate::shaders::gemm_tunable::pipeline_for_logits(
                     ctx,
                     n,
@@ -914,8 +923,8 @@ impl StepPipelines {
             gemm_tunable_q8.insert((n, k), q8);
         }
         for &(n, k) in &[
-            (HID as u32, VOCAB as u32),
-            (HID as u32, crate::model::embed::LM_HEAD_CHUNK as u32),
+            (hid, vocab),
+            (hid, crate::model::embed::LM_HEAD_CHUNK as u32),
         ] {
             gemm_q8_rowk.insert((n, k), crate::shaders::gemm_rowk::pipeline_for(ctx, n, k)?);
             gemm_q8_rowk_xfp16.insert(
@@ -929,7 +938,7 @@ impl StepPipelines {
         let mut gemm_q8_rowk_acc_f32 = HashMap::new();
         {
             {
-                let &(n, k) = &(HID as u32, crate::model::embed::LM_HEAD_CHUNK as u32);
+                let &(n, k) = &(hid, crate::model::embed::LM_HEAD_CHUNK as u32);
                 gemm_q8_rowk_acc_f32.insert(
                     (n, k),
                     ctx.compile_gemm_subkernel(
@@ -947,7 +956,7 @@ impl StepPipelines {
         let mut gemm_bf16_rowk_acc_f32 = HashMap::new();
         {
             {
-                let &(n, k) = &(HID as u32, crate::model::embed::LM_HEAD_CHUNK as u32);
+                let &(n, k) = &(hid, crate::model::embed::LM_HEAD_CHUNK as u32);
                 gemm_bf16_rowk_acc_f32.insert(
                     (n, k),
                     ctx.compile_gemm_subkernel(
@@ -970,7 +979,8 @@ impl StepPipelines {
         // swiglu output. Wide variants = weight-stationary prefill height
         // (TUNE_BM=sparse_wide_bm; the batched-prefill block list is built at
         // this height).
-        for &(n, k) in &[(MOE_FF * 2, HID as u32), (HID as u32, MOE_FF)] {
+        let moe_ff = dims.moe_ff as u32;
+        for &(n, k) in &[(moe_ff * 2, hid), (hid, moe_ff)] {
             for fmt in [
                 crate::shaders::QuantFormat::Q4Affine,
                 crate::shaders::QuantFormat::Q6,
@@ -980,7 +990,7 @@ impl StepPipelines {
                     (n, k, false, fmt as u32),
                     crate::shaders::gemm_tunable::pipeline_for_sparse(ctx, n, k, false, fmt)?,
                 );
-                if moe_fuse_gather_enabled() && (n, k) == (MOE_FF * 2, HID as u32) {
+                if moe_fuse_gather_enabled() && (n, k) == (moe_ff * 2, hid) {
                     gemm_tunable_sparse.insert(
                         (n, k, true, fmt as u32),
                         crate::shaders::gemm_tunable::pipeline_for_sparse(ctx, n, k, true, fmt)?,
@@ -998,7 +1008,7 @@ impl StepPipelines {
                             sparse_wide_bm as usize,
                         )?,
                     );
-                    if moe_fuse_gather_enabled() && (n, k) == (MOE_FF * 2, HID as u32) {
+                    if moe_fuse_gather_enabled() && (n, k) == (moe_ff * 2, hid) {
                         gemm_tunable_sparse_wide.insert(
                             (n, k, true, fmt as u32),
                             crate::shaders::gemm_tunable::pipeline_for_sparse_bm(
@@ -1378,10 +1388,13 @@ fn moe_grouped_grid_info() -> MoeGroupedGridInfo {
     }
 }
 
-fn grouped_expert_blob_bytes_per_expert(format: crate::shaders::QuantFormat) -> u64 {
+fn grouped_expert_blob_bytes_per_expert(
+    format: crate::shaders::QuantFormat,
+    dims: &crate::metal::step_config::ModelDims,
+) -> u64 {
     use crate::dgq::layout::{nvfp4_matrix_bytes, q4_matrix_bytes};
-    let hidden = HID;
-    let moe_ff = MOE_FF as usize;
+    let hidden = dims.hid;
+    let moe_ff = dims.moe_ff;
     match format {
         crate::shaders::QuantFormat::NvFp4 => {
             (nvfp4_matrix_bytes(moe_ff * 2, hidden) + nvfp4_matrix_bytes(hidden, moe_ff)) as u64
@@ -1402,19 +1415,21 @@ fn moe_w_byte_off_gu() -> usize {
 pub fn layer_moe_block_jobs(
     l: &LayerOffsets,
     format: QuantFormat,
+    dims: &crate::metal::step_config::ModelDims,
 ) -> ([BlockGroupedJob; N_EXPERTS], [BlockGroupedJob; N_EXPERTS]) {
-    layer_moe_block_jobs_impl(l, format, None, 0)
+    layer_moe_block_jobs_impl(l, format, dims, None, 0)
 }
 
 fn layer_moe_block_jobs_impl(
     l: &LayerOffsets,
     format: QuantFormat,
+    dims: &crate::metal::step_config::ModelDims,
     manifest: Option<(usize, &HashMap<String, u64>)>,
     expert_base: u64,
 ) -> ([BlockGroupedJob; N_EXPERTS], [BlockGroupedJob; N_EXPERTS]) {
     use crate::dgq::layout::{nvfp4_matrix_bytes, q4_matrix_bytes, q6_matrix_bytes};
-    let hidden = HID;
-    let moe_ff = MOE_FF as usize;
+    let hidden = dims.hid;
+    let moe_ff = dims.moe_ff;
     let (gu_stride, dn_stride, gu_gpr, dn_gpr) = match format {
         QuantFormat::NvFp4 => (
             nvfp4_matrix_bytes(moe_ff * 2, hidden) as u64,
@@ -1451,7 +1466,7 @@ fn layer_moe_block_jobs_impl(
         if let Some((layer, offsets)) = manifest {
             debug_assert_eq!(
                 gate[e].w_byte_off,
-                manifest_offset(offsets, layer, e, "gate_up", format),
+                manifest_offset(offsets, dims, layer, e, "gate_up", format),
                 "gate_up L{layer} E{e}: computed stride offset != manifest"
             );
         }

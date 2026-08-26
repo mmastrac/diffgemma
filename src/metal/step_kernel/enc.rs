@@ -212,7 +212,7 @@ impl StepEnc<'_> {
 
     /// Softcap logits (matches ranged logit_softcapping dispatch pattern).
     pub(super) fn dispatch_softcap(&mut self) {
-        let len = CANVAS * VOCAB;
+        let len = self.dims.canvas * self.dims.vocab;
         self.dispatch_1d_ranged(&self.ps.softcap, len, 256, |this, base, chunk| {
             this.sink_set_buffer(&this.bufs.logits, 0, 0);
             this.sink_set_bytes(&base, 1);
@@ -676,10 +676,10 @@ impl StepEnc<'_> {
         self.sink_set_pipeline(&self.ps.logit_rowstats);
         self.bind_logits(0);
         self.sink_set_buffer(&self.bufs.arena, self.arena().rs_sc_off() as usize, 1);
-        let dims = [CANVAS as u32, VOCAB as u32];
+        let dims = [self.dims.canvas as u32, self.dims.vocab as u32];
         self.sink_set_bytes(&dims, 2);
         self.bind_debug_status(3);
-        let (grid, tg) = crate::shaders::logit_rowstats::dispatch_shape(CANVAS);
+        let (grid, tg) = crate::shaders::logit_rowstats::dispatch_shape(self.dims.canvas);
         self.sink_dispatch(grid, tg);
     }
 
@@ -695,10 +695,11 @@ impl StepEnc<'_> {
         self.bind_logits(0);
         self.sink_set_buffer(&self.bufs.arena, self.arena().rs_sc_off() as usize, 1);
         self.bind_sc_probs(2);
-        let params = [CANVAS as u32, VOCAB as u32, v0, chunk];
+        let params = [self.dims.canvas as u32, self.dims.vocab as u32, v0, chunk];
         self.sink_set_bytes(&params, 3);
         self.bind_debug_status(4);
-        let (grid, tg) = crate::shaders::sc_prob_cols::dispatch_shape(CANVAS, chunk as usize);
+        let (grid, tg) =
+            crate::shaders::sc_prob_cols::dispatch_shape(self.dims.canvas, chunk as usize);
         self.sink_dispatch(grid, tg);
     }
 
@@ -709,23 +710,23 @@ impl StepEnc<'_> {
         use crate::model::embed::LM_HEAD_CHUNK;
 
         // f32 accumulator in gemm_b (free during preamble, before layer GEMMs).
-        let acc_bytes = (CANVAS * HID * std::mem::size_of::<f32>()) as u64;
+        let acc_bytes = (self.dims.canvas * self.dims.hid * std::mem::size_of::<f32>()) as u64;
         self.memzero_buffer(&self.bufs.gemm_b, acc_bytes);
         self.sink_memory_barrier(); // memzero gemm_b before the first `+=`
 
-        let row_bytes = q8_row_bytes(HID) as u64;
+        let row_bytes = q8_row_bytes(self.dims.hid) as u64;
         let chunk_max = LM_HEAD_CHUNK as u32;
         let mut v0 = 0u32;
-        while v0 < VOCAB as u32 {
-            let chunk = (VOCAB as u32 - v0).min(chunk_max);
+        while v0 < self.dims.vocab as u32 {
+            let chunk = (self.dims.vocab as u32 - v0).min(chunk_max);
             self.dispatch_sc_prob_cols(v0, chunk);
             if self.embed_bf16 {
-                let w_off = layout.embed + (v0 as u64) * (HID as u64) * 2;
+                let w_off = layout.embed + (v0 as u64) * (self.dims.hid as u64) * 2;
                 self.gemm_bf16_rowk_acc_f32(
                     &self.bufs.gemm_b,
                     w_off,
-                    CANVAS as u32,
-                    HID as u32,
+                    self.dims.canvas as u32,
+                    self.dims.hid as u32,
                     chunk,
                 )?;
             } else {
@@ -733,8 +734,8 @@ impl StepEnc<'_> {
                 self.gemm_q8_rowk_acc_f32(
                     &self.bufs.gemm_b,
                     w_off,
-                    CANVAS as u32,
-                    HID as u32,
+                    self.dims.canvas as u32,
+                    self.dims.hid as u32,
                     chunk,
                 )?;
             }
@@ -744,11 +745,11 @@ impl StepEnc<'_> {
         // Convert f32 accumulator → bf16 arena soft slot, applying embed_scale
         // (== sqrt(HID)) and dividing out the SC_PROB_GEMM_SCALE that sc_prob_cols
         // multiplied into the probs to keep them in fp16's normal range.
-        let scale = (HID as f32).sqrt() / SC_PROB_GEMM_SCALE;
+        let scale = (self.dims.hid as f32).sqrt() / SC_PROB_GEMM_SCALE;
         self.f32_to_half_scale(
             &self.bufs.gemm_b,
             self.arena().soft_off(),
-            CANVAS * HID,
+            self.dims.canvas * self.dims.hid,
             scale,
         );
         Ok(())
@@ -774,11 +775,11 @@ impl StepEnc<'_> {
         self.sink_set_buffer(&self.bufs.gemm_b, IDX_OFF, 2);
         self.sink_set_buffer(&self.bufs.gemm_a, PROB_OFF, 3);
         self.sink_set_buffer(&self.bufs.gemm_a, CNT_OFF, 4);
-        let p1 = [CANVAS as u32, VOCAB as u32, maxk, 0u32];
+        let p1 = [self.dims.canvas as u32, self.dims.vocab as u32, maxk, 0u32];
         self.sink_set_bytes(&p1, 5);
         self.sink_dispatch(
             MTLSize {
-                width: CANVAS,
+                width: self.dims.canvas,
                 height: 1,
                 depth: 1,
             },
@@ -798,11 +799,11 @@ impl StepEnc<'_> {
         self.bind_blob(3);
         self.sink_set_bytes(&layout.embed, 4);
         self.sink_set_buffer(&self.bufs.gemm_b, 0, 5);
-        let p2 = [CANVAS as u32, HID as u32, maxk, 0u32];
+        let p2 = [self.dims.canvas as u32, self.dims.hid as u32, maxk, 0u32];
         self.sink_set_bytes(&p2, 6);
         self.sink_dispatch(
             MTLSize {
-                width: CANVAS,
+                width: self.dims.canvas,
                 height: 1,
                 depth: 1,
             },
@@ -815,11 +816,11 @@ impl StepEnc<'_> {
         self.sink_memory_barrier();
 
         // Finalize: f32 accumulator → bf16 soft slot (÷ SC_PROB_GEMM_SCALE, × √HID).
-        let scale = (HID as f32).sqrt() / SC_PROB_GEMM_SCALE;
+        let scale = (self.dims.hid as f32).sqrt() / SC_PROB_GEMM_SCALE;
         self.f32_to_half_scale(
             &self.bufs.gemm_b,
             self.arena().soft_off(),
-            CANVAS * HID,
+            self.dims.canvas * self.dims.hid,
             scale,
         );
         Ok(())
@@ -883,7 +884,7 @@ impl StepEnc<'_> {
             self.arena().tmp_off(),
             l.o_proj,
             fm as u32,
-            HID as u32,
+            self.dims.hid as u32,
             o_k,
         )
     }
@@ -899,7 +900,7 @@ impl StepEnc<'_> {
             self.arena().tmp_off(),
             self.arena().tmp_off(),
             l.post_attn_ln,
-            HID as u32,
+            self.dims.hid as u32,
             fm,
         );
         self.residual(
@@ -907,7 +908,7 @@ impl StepEnc<'_> {
             self.arena().tmp_off(),
             self.arena().stream_off(),
             0,
-            fm * HID,
+            fm * self.dims.hid,
         );
         Ok(())
     }
@@ -923,7 +924,7 @@ impl StepEnc<'_> {
             self.arena().stream_off(),
             self.arena().tmp_off(),
             l.pre_ff_ln,
-            HID as u32,
+            self.dims.hid as u32,
             fm,
         );
         self.encode_layer_dense_gate_up(layer, layout)?;
@@ -931,14 +932,14 @@ impl StepEnc<'_> {
             self.arena().ffg_off(),
             self.arena().ffu_off(),
             self.arena().ffg_off(),
-            fm * DENSE_FF as usize,
+            fm * self.dims.dense_ff,
         );
         self.encode_layer_dense_down(layer, layout)?;
         self.rmsnorm(
             self.arena().dense_off(),
             self.arena().dense_off(),
             l.post_ff_ln_1,
-            HID as u32,
+            self.dims.hid as u32,
             fm,
         );
         Ok(())
@@ -957,8 +958,8 @@ impl StepEnc<'_> {
             self.arena().dense_off(),
             l.mlp_down,
             fm as u32,
-            HID as u32,
-            DENSE_FF,
+            self.dims.hid as u32,
+            self.dims.dense_ff as u32,
         )
     }
 
@@ -970,24 +971,26 @@ impl StepEnc<'_> {
         let fm = self.forward_m;
         let l = &layout.layers[layer];
         if fused_gate_up_enabled() && self.dense_format.is_bf16() {
-            let (segs, n_total) = gate_up_stacked_segments(l, self.arena());
+            let (segs, n_total) =
+                gate_up_stacked_segments(l, self.arena(), self.dims.dense_ff as u32);
             self.gemm_bf16_stacked(
                 self.arena().tmp_off(),
                 &segs,
                 fm as u32,
-                HID as u32,
+                self.dims.hid as u32,
                 n_total,
             )?;
         } else if fused_gate_up_enabled()
             && let Some(fmt) = self.dense_format.block_format()
         {
-            let (segs, n_total) = gate_up_stacked_segments(l, self.arena());
+            let (segs, n_total) =
+                gate_up_stacked_segments(l, self.arena(), self.dims.dense_ff as u32);
             self.gemm_q4_stacked(
                 fmt,
                 self.arena().tmp_off(),
                 &segs,
                 fm as u32,
-                HID as u32,
+                self.dims.hid as u32,
                 n_total,
             )?;
         } else {
@@ -997,8 +1000,8 @@ impl StepEnc<'_> {
                 self.arena().ffg_off(),
                 l.mlp_gate,
                 fm as u32,
-                DENSE_FF,
-                HID as u32,
+                self.dims.dense_ff as u32,
+                self.dims.hid as u32,
             )?;
             self.gemm_dense_linear(
                 self.dense_format,
@@ -1006,8 +1009,8 @@ impl StepEnc<'_> {
                 self.arena().ffu_off(),
                 l.mlp_up,
                 fm as u32,
-                DENSE_FF,
-                HID as u32,
+                self.dims.dense_ff as u32,
+                self.dims.hid as u32,
             )?;
         }
         Ok(())
@@ -1022,10 +1025,10 @@ impl StepEnc<'_> {
         let layer_off = layer_byte_offset(layer);
         let router_dims = crate::shaders::moe_router::RouterDims {
             canvas: fm as u32,
-            hidden: HID as u32,
-            n_experts: N_EXPERTS as u32,
-            top_k: TOP_K as u32,
-            router_hscale: (HID as f32).powf(-0.5),
+            hidden: self.dims.hid as u32,
+            n_experts: self.dims.n_experts as u32,
+            top_k: self.dims.top_k as u32,
+            router_hscale: (self.dims.hid as f32).powf(-0.5),
             block_m: self.moe_block_m(),
         };
         if router_gemm_enabled() {
@@ -1040,7 +1043,7 @@ impl StepEnc<'_> {
                 self.arena().stream_off(),
                 self.arena().tmp_off(),
                 l.router_scale,
-                HID as u32,
+                self.dims.hid as u32,
                 fm,
             );
             self.gemm_bf16(
@@ -1048,8 +1051,8 @@ impl StepEnc<'_> {
                 self.arena().ffg_off(),
                 l.router_proj,
                 fm as u32,
-                N_EXPERTS as u32,
-                HID as u32,
+                self.dims.n_experts as u32,
+                self.dims.hid as u32,
             )?;
             self.sink_set_pipeline(&self.ps.router_topk);
             self.sink_set_buffer(&self.bufs.arena, self.arena().ffg_off() as usize, 0);
@@ -1092,7 +1095,7 @@ impl StepEnc<'_> {
 
         self.sink_set_pipeline(&self.ps.bucket_count);
         self.bind_route(0);
-        let n_experts = N_EXPERTS as u32;
+        let n_experts = self.dims.n_experts as u32;
         self.sink_set_bytes(&n_experts, 1);
         self.dispatch_1d(&self.ps.bucket_count, 128, 128);
 
@@ -1108,7 +1111,7 @@ impl StepEnc<'_> {
             self.sink_set_buffer(&self.bufs.moe_grouped_indirect, 0, 6);
             let grid_info = moe_grouped_grid_info();
             self.sink_set_bytes(&grid_info, 7);
-            let count = if phase == 1 { 1 } else { fm * TOP_K };
+            let count = if phase == 1 { 1 } else { fm * self.dims.top_k };
             self.dispatch_1d(&self.ps.bucket_fill, count, 256);
         }
 
@@ -1117,10 +1120,10 @@ impl StepEnc<'_> {
             self.arena().stream_off(),
             self.arena().moein_off(),
             l.pre_ff_ln_2,
-            HID as u32,
+            self.dims.hid as u32,
             fm,
         );
-        self.memzero_bytes(self.arena().moeout_off(), (fm * HID * 4) as u64);
+        self.memzero_bytes(self.arena().moeout_off(), (fm * self.dims.hid * 4) as u64);
         Ok(())
     }
 
@@ -1131,7 +1134,7 @@ impl StepEnc<'_> {
     /// so dispatch_block_linear_grouped MUST select the matching pipeline —
     /// both read this one function.
     fn moe_block_m(&self) -> u32 {
-        if self.forward_m <= CANVAS {
+        if self.forward_m <= self.dims.canvas {
             return 32;
         }
         let fmt = self.block_profile.format;
@@ -1140,11 +1143,16 @@ impl StepEnc<'_> {
         // is only built for the block-expert formats q4/q6/nvfp4).
         let wide_ok = self
             .ps
-            .sparse_tunable_wide_fmt(fmt, MOE_FF * 2, HID as u32, false)
+            .sparse_tunable_wide_fmt(
+                fmt,
+                self.dims.moe_ff as u32 * 2,
+                self.dims.hid as u32,
+                false,
+            )
             .is_some()
             && self
                 .ps
-                .sparse_tunable_wide_fmt(fmt, HID as u32, MOE_FF, false)
+                .sparse_tunable_wide_fmt(fmt, self.dims.hid as u32, self.dims.moe_ff as u32, false)
                 .is_some();
         if wide_ok {
             if crate::flags::progress_enabled() {
@@ -1225,7 +1233,7 @@ impl StepEnc<'_> {
         self.sink_set_buffer(&self.bufs.gemm_b, buf_c_off, 2);
         self.sink_set_bytes(jobs, 3);
         self.sink_set_buffer(&self.bufs.route, row_start_off, 4);
-        let num_jobs = N_EXPERTS as u32;
+        let num_jobs = self.dims.n_experts as u32;
         self.sink_set_bytes(&num_jobs, 5);
         self.bind_route(6);
         if use_gather {
@@ -1265,9 +1273,9 @@ impl StepEnc<'_> {
 
     pub(super) fn encode_moe_batched_gather_bf16_to_f32(&mut self) -> Result<(), Error> {
         let token_list_off = std::mem::offset_of!(RouteScratch, token_list);
-        let gather_dims = [0u32, HID as u32];
-        let slots = (self.forward_m * TOP_K) as u32;
-        let gather_count = slots as usize * HID;
+        let gather_dims = [0u32, self.dims.hid as u32];
+        let slots = (self.forward_m * self.dims.top_k) as u32;
+        let gather_count = slots as usize * self.dims.hid;
         self.dispatch_1d_ranged(
             &self.ps.gather_rows_bf16_to_f32,
             gather_count,
@@ -1294,6 +1302,7 @@ impl StepEnc<'_> {
         let (gate_jobs, _) = layer_moe_block_jobs_impl(
             l,
             self.block_profile.format,
+            self.dims,
             Some((layer, self.tensor_offsets)),
             self.bufs.blob_expert_base,
         );
@@ -1303,8 +1312,8 @@ impl StepEnc<'_> {
             moe_w_byte_off_gu(),
             &gate_jobs,
             MOE_SLOTS,
-            HID as u32,
-            MOE_FF * 2,
+            self.dims.hid as u32,
+            self.dims.moe_ff as u32 * 2,
             0,
             moe_fuse_gather_enabled(),
         )
@@ -1312,13 +1321,13 @@ impl StepEnc<'_> {
 
     pub(super) fn encode_moe_batched_swiglu(&mut self) -> Result<(), Error> {
         let gu_off = moe_w_byte_off_gu();
-        let slots = (self.forward_m * TOP_K) as u32;
-        let act_elems = slots as usize * MOE_FF as usize;
+        let slots = (self.forward_m * self.dims.top_k) as u32;
+        let act_elems = slots as usize * self.dims.moe_ff;
         self.sink_set_pipeline(&self.ps.gelu_swiglu_gate_up);
         self.sink_set_buffer(&self.bufs.gemm_b, gu_off, 0);
         self.sink_set_buffer(&self.bufs.gemm_a, 0, 1);
         self.sink_set_buffer(&self.bufs.dummy_dump, 0, 3);
-        let swiglu_dims = [slots, MOE_FF];
+        let swiglu_dims = [slots, self.dims.moe_ff as u32];
         self.sink_set_bytes(&swiglu_dims, 2);
         self.dispatch_1d(&self.ps.gelu_swiglu_gate_up, act_elems, 256);
         Ok(())
@@ -1333,6 +1342,7 @@ impl StepEnc<'_> {
         let (_, down_jobs) = layer_moe_block_jobs_impl(
             l,
             self.block_profile.format,
+            self.dims,
             None,
             self.bufs.blob_expert_base,
         );
@@ -1342,8 +1352,8 @@ impl StepEnc<'_> {
             moe_w_byte_off_a(),
             &down_jobs,
             MOE_SLOTS,
-            MOE_FF,
-            HID as u32,
+            self.dims.moe_ff as u32,
+            self.dims.hid as u32,
             1,
             false,
         )
@@ -1355,7 +1365,7 @@ impl StepEnc<'_> {
         self.sink_set_buffer(&self.bufs.gemm_b, moe_w_byte_off_a(), 0);
         self.sink_set_buffer(&self.bufs.arena, self.arena().moeout_off() as usize, 1);
         self.bind_route(2);
-        let hidden = HID as u32;
+        let hidden = self.dims.hid as u32;
         let canvas = fm as u32;
         self.sink_set_bytes(&hidden, 3);
         self.sink_set_bytes(&canvas, 4);
@@ -1389,9 +1399,9 @@ impl StepEnc<'_> {
         self.bind_route(4);
         let grouped_dims = crate::shaders::moe_grouped::GroupedDims {
             canvas: fm as u32,
-            hidden: HID as u32,
-            moe_ff: MOE_FF,
-            n_experts: N_EXPERTS as u32,
+            hidden: self.dims.hid as u32,
+            moe_ff: self.dims.moe_ff as u32,
+            n_experts: self.dims.n_experts as u32,
         };
         self.sink_set_bytes(&grouped_dims, 5);
         if !self.block_profile.is_nvfp4() {
@@ -1399,7 +1409,7 @@ impl StepEnc<'_> {
         }
         let grid = MTLSize {
             width: fm,
-            height: N_EXPERTS,
+            height: self.dims.n_experts,
             depth: 1,
         };
         let tg = MTLSize {
@@ -1433,7 +1443,7 @@ impl StepEnc<'_> {
             self.arena().moeout_off(),
             self.arena().moein_off(),
             l.post_ff_ln_2,
-            HID as u32,
+            self.dims.hid as u32,
             fm,
         );
         Ok(())
@@ -1451,13 +1461,13 @@ impl StepEnc<'_> {
             self.arena().moein_off(),
             self.arena().tmp_off(),
             0,
-            fm * HID,
+            fm * self.dims.hid,
         );
         self.rmsnorm(
             self.arena().tmp_off(),
             self.arena().tmp_off(),
             l.post_ff_ln,
-            HID as u32,
+            self.dims.hid as u32,
             fm,
         );
         self.residual(
@@ -1465,7 +1475,7 @@ impl StepEnc<'_> {
             self.arena().tmp_off(),
             self.arena().hidden_off(),
             l.layer_scalar,
-            fm * HID,
+            fm * self.dims.hid,
         );
         Ok(())
     }
@@ -1505,10 +1515,13 @@ impl StepEnc<'_> {
             self.arena().stream_off(),
             self.arena().moein_off(),
             l.pre_ff_ln_2,
-            HID as u32,
-            CANVAS,
+            self.dims.hid as u32,
+            self.dims.canvas,
         );
-        self.memzero_bytes(self.arena().moeout_off(), (CANVAS * HID * 4) as u64);
+        self.memzero_bytes(
+            self.arena().moeout_off(),
+            (self.dims.canvas * self.dims.hid * 4) as u64,
+        );
         write_single_expert_route(&self.bufs.route, position, expert_id);
     }
 
@@ -1524,7 +1537,10 @@ impl StepEnc<'_> {
             ));
         }
         let layer_off = layer_byte_offset(layer);
-        self.memzero_bytes(self.arena().moeout_off(), (CANVAS * HID * 4) as u64);
+        self.memzero_bytes(
+            self.arena().moeout_off(),
+            (self.dims.canvas * self.dims.hid * 4) as u64,
+        );
         self.memzero_bytes(
             self.arena().soft_off(),
             (MOE_ACT_PROBE_FLOATS * std::mem::size_of::<f32>()) as u64,
@@ -1537,15 +1553,15 @@ impl StepEnc<'_> {
         self.bind_route(4);
         self.sink_set_buffer(&self.bufs.arena, self.arena().soft_off() as usize, 6);
         let grouped_dims = crate::shaders::moe_grouped::GroupedDims {
-            canvas: CANVAS as u32,
-            hidden: HID as u32,
-            moe_ff: MOE_FF,
-            n_experts: N_EXPERTS as u32,
+            canvas: self.dims.canvas as u32,
+            hidden: self.dims.hid as u32,
+            moe_ff: self.dims.moe_ff as u32,
+            n_experts: self.dims.n_experts as u32,
         };
         self.sink_set_bytes(&grouped_dims, 5);
         let grid = MTLSize {
-            width: CANVAS,
-            height: N_EXPERTS,
+            width: self.dims.canvas,
+            height: self.dims.n_experts,
             depth: 1,
         };
         let tg = MTLSize {
@@ -1569,7 +1585,7 @@ impl StepEnc<'_> {
             self.arena().hidden_off(),
             self.arena().tmp_off(),
             l.input_ln,
-            HID as u32,
+            self.dims.hid as u32,
             fm,
         );
         if fused_qkv_enabled() && self.attn_format.is_bf16() {
@@ -1578,7 +1594,7 @@ impl StepEnc<'_> {
                 self.arena().tmp_off(),
                 &segs,
                 fm as u32,
-                HID as u32,
+                self.dims.hid as u32,
                 n_total,
             )?;
         } else if fused_qkv_enabled()
@@ -1590,7 +1606,7 @@ impl StepEnc<'_> {
                 self.arena().tmp_off(),
                 &segs,
                 fm as u32,
-                HID as u32,
+                self.dims.hid as u32,
                 n_total,
             )?;
         } else {
@@ -1603,7 +1619,7 @@ impl StepEnc<'_> {
                 l.q_proj,
                 fm as u32,
                 q_n,
-                HID as u32,
+                self.dims.hid as u32,
             )?;
             self.gemm_dense_linear(
                 self.attn_format,
@@ -1612,7 +1628,7 @@ impl StepEnc<'_> {
                 l.k_proj,
                 fm as u32,
                 k_n,
-                HID as u32,
+                self.dims.hid as u32,
             )?;
             if l.v_proj != 0 {
                 self.gemm_dense_linear(
@@ -1622,7 +1638,7 @@ impl StepEnc<'_> {
                     l.v_proj,
                     fm as u32,
                     k_n,
-                    HID as u32,
+                    self.dims.hid as u32,
                 )?;
             }
         }
@@ -1646,8 +1662,8 @@ impl StepEnc<'_> {
                 fmt,
                 self.arena().tmp_off(),
                 &segs,
-                CANVAS as u32,
-                HID as u32,
+                self.dims.canvas as u32,
+                self.dims.hid as u32,
                 n_total,
             )?;
         } else {
@@ -1658,18 +1674,18 @@ impl StepEnc<'_> {
                 self.arena().tmp_off(),
                 self.arena().attnq_off(),
                 l.q_proj,
-                CANVAS as u32,
+                self.dims.canvas as u32,
                 q_n,
-                HID as u32,
+                self.dims.hid as u32,
             )?;
             self.gemm_dense_linear(
                 self.attn_format,
                 self.arena().tmp_off(),
                 self.arena().attnk_off(),
                 l.k_proj,
-                CANVAS as u32,
+                self.dims.canvas as u32,
                 k_n,
-                HID as u32,
+                self.dims.hid as u32,
             )?;
             if l.v_proj != 0 {
                 self.gemm_dense_linear(
@@ -1677,9 +1693,9 @@ impl StepEnc<'_> {
                     self.arena().tmp_off(),
                     self.arena().attnv_off(),
                     l.v_proj,
-                    CANVAS as u32,
+                    self.dims.canvas as u32,
                     k_n,
-                    HID as u32,
+                    self.dims.hid as u32,
                 )?;
             }
         }
@@ -1698,13 +1714,14 @@ impl StepEnc<'_> {
             let fmt = self.dense_format.block_format().ok_or(Error::Format(
                 "dispatch_gate_up_gemms: stacked requires a block dense format",
             ))?;
-            let (segs, n_total) = gate_up_stacked_segments(l, self.arena());
+            let (segs, n_total) =
+                gate_up_stacked_segments(l, self.arena(), self.dims.dense_ff as u32);
             self.gemm_q4_stacked(
                 fmt,
                 self.arena().tmp_off(),
                 &segs,
-                CANVAS as u32,
-                HID as u32,
+                self.dims.canvas as u32,
+                self.dims.hid as u32,
                 n_total,
             )?;
         } else {
@@ -1713,18 +1730,18 @@ impl StepEnc<'_> {
                 self.arena().tmp_off(),
                 self.arena().ffg_off(),
                 l.mlp_gate,
-                CANVAS as u32,
-                DENSE_FF,
-                HID as u32,
+                self.dims.canvas as u32,
+                self.dims.dense_ff as u32,
+                self.dims.hid as u32,
             )?;
             self.gemm_dense_linear(
                 self.dense_format,
                 self.arena().tmp_off(),
                 self.arena().ffu_off(),
                 l.mlp_up,
-                CANVAS as u32,
-                DENSE_FF,
-                HID as u32,
+                self.dims.canvas as u32,
+                self.dims.dense_ff as u32,
+                self.dims.hid as u32,
             )?;
         }
         Ok(())
@@ -1756,8 +1773,8 @@ impl StepEnc<'_> {
         // Per-sub-chunk row offsets into the batched Q/K/V planes (sub_c = 0
         // outside a super-chunk). K/V planes are written at the layer's native
         // widths (n_kv*hd); Q at n_q*hd.
-        let q_row = CANVAS * self.sub_c * STEP_NQ_HEADS * l.head_dim as usize * 2;
-        let kv_row = CANVAS * self.sub_c * (l.n_kv_heads * l.head_dim) as usize * 2;
+        let q_row = self.dims.canvas * self.sub_c * STEP_NQ_HEADS * l.head_dim as usize * 2;
+        let kv_row = self.dims.canvas * self.sub_c * (l.n_kv_heads * l.head_dim) as usize * 2;
         self.sink_set_buffer(
             &self.bufs.arena,
             self.arena().attnq_off() as usize + q_row,
@@ -1846,7 +1863,7 @@ impl StepEnc<'_> {
         let t_total = kv_len + m;
         let np = n_pad(t_total);
         // Q/O sub-chunk row offset into the batched prefill planes.
-        let qo_row = CANVAS * self.sub_c * STEP_NQ_HEADS * hd * 2;
+        let qo_row = self.dims.canvas * self.sub_c * STEP_NQ_HEADS * hd * 2;
         // Tunable tile geometry — must match the compiled GEMM
         // pipelines. The top-k tiles are compile-time consts.
         let (qk_bm_f, qk_bn_f, pv_bm_f, pv_bn_f, sm_tpg) = crate::flags::gemm_attn_tile();
@@ -2050,7 +2067,7 @@ impl StepEnc<'_> {
         let m = self.active_canvas;
         let kv_len = self.dispatch_kv_len() as usize;
         let t_total = kv_len + m;
-        let qo_row = CANVAS * self.sub_c * STEP_NQ_HEADS * hd * 2;
+        let qo_row = self.dims.canvas * self.sub_c * STEP_NQ_HEADS * hd * 2;
         let window = if attn_window_enabled() {
             self.sliding_window
         } else {
@@ -2177,7 +2194,7 @@ impl StepEnc<'_> {
         }
         // Per-sub-chunk row offsets into the batched Q/O planes (sub_c = 0
         // outside a super-chunk).
-        let qo_row = CANVAS * self.sub_c * STEP_NQ_HEADS * l.head_dim as usize * 2;
+        let qo_row = self.dims.canvas * self.sub_c * STEP_NQ_HEADS * l.head_dim as usize * 2;
         self.sink_set_buffer(
             &self.bufs.arena,
             self.arena().attnq_off() as usize + qo_row,
@@ -2326,8 +2343,8 @@ impl StepEnc<'_> {
                     self.arena().soft_off(),
                     self.arena().tmp_off(),
                     layout.sc_pre_norm,
-                    HID as u32,
-                    CANVAS,
+                    self.dims.hid as u32,
+                    self.dims.canvas,
                 );
                 Ok(())
             }
@@ -2336,25 +2353,25 @@ impl StepEnc<'_> {
                 self.arena().tmp_off(),
                 self.arena().ffg_off(),
                 layout.sc_gate,
-                CANVAS as u32,
-                DENSE_FF,
-                HID as u32,
+                self.dims.canvas as u32,
+                self.dims.dense_ff as u32,
+                self.dims.hid as u32,
             ),
             StepStage::ScUpGemm => self.gemm_dense_linear(
                 self.sc_format,
                 self.arena().tmp_off(),
                 self.arena().ffu_off(),
                 layout.sc_up,
-                CANVAS as u32,
-                DENSE_FF,
-                HID as u32,
+                self.dims.canvas as u32,
+                self.dims.dense_ff as u32,
+                self.dims.hid as u32,
             ),
             StepStage::ScGlu => {
                 self.glu(
                     self.arena().ffg_off(),
                     self.arena().ffu_off(),
                     self.arena().ffg_off(),
-                    CANVAS * DENSE_FF as usize,
+                    self.dims.canvas * self.dims.dense_ff,
                 );
                 Ok(())
             }
@@ -2363,9 +2380,9 @@ impl StepEnc<'_> {
                 self.arena().ffg_off(),
                 self.arena().dense_off(),
                 layout.sc_down,
-                CANVAS as u32,
-                HID as u32,
-                DENSE_FF,
+                self.dims.canvas as u32,
+                self.dims.hid as u32,
+                self.dims.dense_ff as u32,
             ),
             StepStage::EmbedGather => {
                 self.dispatch_embed_gather(layout.embed);
@@ -2377,7 +2394,7 @@ impl StepEnc<'_> {
                     self.arena().dense_off(),
                     self.arena().hidden_off(),
                     0,
-                    CANVAS * HID,
+                    self.dims.canvas * self.dims.hid,
                 );
                 Ok(())
             }
@@ -2386,7 +2403,7 @@ impl StepEnc<'_> {
                     self.arena().hidden_off(),
                     self.arena().hidden_off(),
                     0,
-                    HID as u32,
+                    self.dims.hid as u32,
                     self.forward_m,
                 );
                 Ok(())
@@ -2417,8 +2434,8 @@ impl StepEnc<'_> {
                     self.arena().hidden_off(),
                     self.arena().tmp_off(),
                     layout.final_norm,
-                    HID as u32,
-                    CANVAS,
+                    self.dims.hid as u32,
+                    self.dims.canvas,
                 );
                 Ok(())
             }
@@ -2430,20 +2447,20 @@ impl StepEnc<'_> {
                     self.gemm_bf16_logits(
                         self.arena().tmp_off(),
                         layout.embed,
-                        CANVAS as u32,
-                        VOCAB as u32,
-                        HID as u32,
+                        self.dims.canvas as u32,
+                        self.dims.vocab as u32,
+                        self.dims.hid as u32,
                         0,
                     )
-                } else if partial_lm_head_enabled() && m < CANVAS as u32 {
+                } else if partial_lm_head_enabled() && m < self.dims.canvas as u32 {
                     self.encode_partial_lm_head(layout, m)
                 } else {
                     self.gemm_q8_logits(
                         self.arena().tmp_off(),
                         layout.embed,
-                        CANVAS as u32,
-                        VOCAB as u32,
-                        HID as u32,
+                        self.dims.canvas as u32,
+                        self.dims.vocab as u32,
+                        self.dims.hid as u32,
                         0,
                     )
                 }
@@ -2499,8 +2516,8 @@ impl StepEnc<'_> {
                 self.arena().hidden_off(),
                 self.arena().tmp_off(),
                 layout.sc_pre_norm,
-                HID as u32,
-                CANVAS,
+                self.dims.hid as u32,
+                self.dims.canvas,
             );
             self.exec_stage(StepStage::ScGateGemm, 0, layout, finish)?;
             self.exec_stage(StepStage::ScUpGemm, 0, layout, finish)?;
@@ -2591,7 +2608,7 @@ impl StepEnc<'_> {
     ) -> Result<(), Error> {
         use step_schedule::StepStage;
         self.prefill_causal = true;
-        self.forward_m = n_subs * CANVAS;
+        self.forward_m = n_subs * self.dims.canvas;
         self.exec_stage(
             StepStage::EmbedGather,
             0,
@@ -2634,7 +2651,7 @@ impl StepEnc<'_> {
                 }
             }
         }
-        self.forward_m = CANVAS;
+        self.forward_m = self.dims.canvas;
         Ok(())
     }
 
@@ -2662,13 +2679,13 @@ impl StepEnc<'_> {
         self.bind_state(1);
         self.sink_set_buffer(&self.bufs.arena, self.arena().hidden_off() as usize, 2);
         self.sink_set_bytes(&embed_off, 3);
-        let dims = [HID as u32, fm as u32];
+        let dims = [self.dims.hid as u32, fm as u32];
         self.sink_set_bytes(&dims, 4);
         self.sink_set_bytes(&EMBED_SCALE, 5);
-        let vocab = VOCAB as u32;
+        let vocab = self.dims.vocab as u32;
         self.sink_set_bytes(&vocab, 6);
         self.bind_debug_status(7);
-        let (grid, tg) = crate::shaders::embed_gather::dispatch_shape(HID, fm);
+        let (grid, tg) = crate::shaders::embed_gather::dispatch_shape(self.dims.hid, fm);
         self.sink_dispatch(grid, tg);
     }
 
@@ -2691,41 +2708,41 @@ impl StepEnc<'_> {
                 self.arena().soft_off(),
                 self.arena().tmp_off(),
                 layout.sc_pre_norm,
-                HID as u32,
-                CANVAS,
+                self.dims.hid as u32,
+                self.dims.canvas,
             );
             self.gemm_dense_linear(
                 self.sc_format,
                 self.arena().tmp_off(),
                 self.arena().ffg_off(),
                 layout.sc_gate,
-                CANVAS as u32,
-                DENSE_FF,
-                HID as u32,
+                self.dims.canvas as u32,
+                self.dims.dense_ff as u32,
+                self.dims.hid as u32,
             )?;
             self.gemm_dense_linear(
                 self.sc_format,
                 self.arena().tmp_off(),
                 self.arena().ffu_off(),
                 layout.sc_up,
-                CANVAS as u32,
-                DENSE_FF,
-                HID as u32,
+                self.dims.canvas as u32,
+                self.dims.dense_ff as u32,
+                self.dims.hid as u32,
             )?;
             self.glu(
                 self.arena().ffg_off(),
                 self.arena().ffu_off(),
                 self.arena().ffg_off(),
-                CANVAS * DENSE_FF as usize,
+                self.dims.canvas * self.dims.dense_ff,
             );
             self.gemm_dense_linear(
                 self.sc_format,
                 self.arena().ffg_off(),
                 self.arena().dense_off(),
                 layout.sc_down,
-                CANVAS as u32,
-                HID as u32,
-                DENSE_FF,
+                self.dims.canvas as u32,
+                self.dims.hid as u32,
+                self.dims.dense_ff as u32,
             )?;
         }
         // first_step: self.arena().dense_off() stays zero; skip SC MLP + O(vocab) softembed.
@@ -2736,14 +2753,14 @@ impl StepEnc<'_> {
             self.arena().dense_off(),
             self.arena().hidden_off(),
             0,
-            CANVAS * HID,
+            self.dims.canvas * self.dims.hid,
         );
         self.rmsnorm(
             self.arena().hidden_off(),
             self.arena().hidden_off(),
             0,
-            HID as u32,
-            CANVAS,
+            self.dims.hid as u32,
+            self.dims.canvas,
         );
         Ok(())
     }
@@ -2751,8 +2768,8 @@ impl StepEnc<'_> {
     fn encode_partial_lm_head(&mut self, layout: &ModelLayout, m: u32) -> Result<(), Error> {
         let token_list_off = std::mem::offset_of!(RouteScratch, token_list);
         let num_slots_off = std::mem::offset_of!(RouteScratch, num_slots);
-        let compact_row = CANVAS as u32 - m;
-        let logits_off = (compact_row as usize) * VOCAB * 2;
+        let compact_row = self.dims.canvas as u32 - m;
+        let logits_off = (compact_row as usize) * self.dims.vocab * 2;
 
         self.sink_set_pipeline(&self.ps.compact_active_rows);
         self.bind_state(0);
@@ -2770,8 +2787,8 @@ impl StepEnc<'_> {
         };
         self.sink_dispatch(grid, tg);
 
-        let gather_dims = [0u32, HID as u32];
-        let gather_count = (m as usize) * HID;
+        let gather_dims = [0u32, self.dims.hid as u32];
+        let gather_count = (m as usize) * self.dims.hid;
         self.dispatch_1d_ranged(
             &self.ps.gather_rows_bf16,
             gather_count,
@@ -2791,19 +2808,19 @@ impl StepEnc<'_> {
             self.arena().dense_off(),
             layout.embed,
             m,
-            VOCAB as u32,
-            HID as u32,
+            self.dims.vocab as u32,
+            self.dims.hid as u32,
             logits_off,
         )?;
 
-        let dims = [m, VOCAB as u32];
+        let dims = [m, self.dims.vocab as u32];
         self.sink_set_pipeline(&self.ps.scatter_logits_rows);
         self.sink_set_buffer(&self.bufs.logits, logits_off, 0);
         self.sink_set_buffer(&self.bufs.logits, 0, 1);
         self.sink_set_buffer(&self.bufs.route, token_list_off, 2);
         self.sink_set_bytes(&dims, 3);
         let grid = MTLSize {
-            width: VOCAB,
+            width: self.dims.vocab,
             height: m as usize,
             depth: 1,
         };
@@ -2825,19 +2842,19 @@ impl StepEnc<'_> {
             self.arena().hidden_off(),
             self.arena().tmp_off(),
             layout.final_norm,
-            HID as u32,
-            CANVAS,
+            self.dims.hid as u32,
+            self.dims.canvas,
         );
         let m = self.partial_lm_m;
-        if partial_lm_head_enabled() && m < CANVAS as u32 {
+        if partial_lm_head_enabled() && m < self.dims.canvas as u32 {
             self.encode_partial_lm_head(layout, m)?;
         } else {
             self.gemm_q8_logits(
                 self.arena().tmp_off(),
                 layout.embed,
-                CANVAS as u32,
-                VOCAB as u32,
-                HID as u32,
+                self.dims.canvas as u32,
+                self.dims.vocab as u32,
+                self.dims.hid as u32,
                 0,
             )?;
         }
@@ -2849,7 +2866,7 @@ impl StepEnc<'_> {
     }
 
     fn encode_step_sampler(&mut self, _layout: &ModelLayout) -> Result<(), Error> {
-        let cols = VOCAB as u32;
+        let cols = self.dims.vocab as u32;
         // Active denoise width (shrink-on-retry): the sampler stats
         // (mean-entropy, canvas-stable, accept-plateau) that drive early-stop
         // must cover exactly the active rows — stale rows [active..CANVAS) would
@@ -2949,7 +2966,7 @@ impl StepEnc<'_> {
         let st: CanvasState = read_struct(&self.bufs.state);
         let params: StepParams = read_struct(&self.bufs.params);
         let t = scheduled_temperature(st.step, &params).max(1e-6);
-        self.scale_half_logits(CANVAS * VOCAB, 1.0 / t);
+        self.scale_half_logits(self.dims.canvas * self.dims.vocab, 1.0 / t);
         Ok(())
     }
 }

@@ -86,16 +86,16 @@ pub use gemm::{Bf16Gemm, bf16_matmul_cpu, f32_to_bf16};
 pub use kv_cache::GpuKvCache;
 pub use probe::{print_probe_result, probe_device};
 pub use step_attn_dump::{run_step_attn_layer_dump, write_step_attn_layer_dump};
-pub use step_config::{log_validated_step_model, validate_step_model};
+pub use step_config::{ModelDims, log_validated_step_model, validate_step_model};
 pub use step_generate::{
     BlockOutcome, CancelToken, KvSnapshot, ProposedBlock, StepGenerateConfig, StepGenerateSession,
     StepObserver, TurnState, begin_turn, commit_block, finish_turn, generate_monolithic,
     generate_with_session, propose_block,
 };
 pub use step_kernel::{
-    CANVAS, CanvasState, EncodeSubProfileResult, FROZEN_WORDS, HID, LayerEncodeSubProfile,
-    LayerOffsets, MOE_FF, MOE_MAX_BLOCKS, MoeEncodeSubProfile, N_EXPERTS, PREFILL_M, PREFILL_SUBS,
-    RouteScratch, StepFinishMode, StepParams, StepSmokeConfig, TOP_K, bench_fused_gemm_dispatches,
+    CANVAS, CanvasState, EncodeSubProfileResult, FROZEN_WORDS, LayerEncodeSubProfile, LayerOffsets,
+    MOE_FF, MOE_MAX_BLOCKS, MoeEncodeSubProfile, N_EXPERTS, PREFILL_M, PREFILL_SUBS, RouteScratch,
+    StepFinishMode, StepParams, StepSmokeConfig, TOP_K, bench_fused_gemm_dispatches,
     bench_step_kernel, bench_step_kernel_encode_subprofile, bench_step_kernel_prefill_super,
     bench_step_kernel_prefill_super_stages, bench_step_kernel_profile,
     bench_step_kernel_profile_steps, fill_token_slot, layer_moe_block_jobs, run_embed_row_gpu,

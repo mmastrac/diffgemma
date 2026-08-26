@@ -124,9 +124,39 @@ impl ModelDims {
         self.canvas * self.prefill_subs
     }
 
-    /// u32 words in the sampler's per-canvas accept bitmask.
-    pub fn frozen_words(&self) -> usize {
-        self.canvas / 32
+    /// Stable hash over every field, for cache keys that must distinguish
+    /// models (the process-global step-pipeline cache).
+    pub fn fingerprint(&self) -> u64 {
+        let mut h: u64 = 0xcbf29ce484222325;
+        let mut eat = |v: u64| {
+            for b in v.to_le_bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+        };
+        for v in [
+            self.hid,
+            self.vocab,
+            self.canvas,
+            self.n_layers,
+            self.dense_ff,
+            self.moe_ff,
+            self.n_experts,
+            self.top_k,
+            self.n_q_heads,
+            self.sliding_kv_heads,
+            self.sliding_head_dim,
+            self.full_kv_heads,
+            self.full_head_dim,
+            self.prefill_subs,
+        ] {
+            eat(v as u64);
+        }
+        for &l in &self.full_layers {
+            eat(l as u64);
+        }
+        eat(self.rms_eps.to_bits());
+        h
     }
 }
 
@@ -279,7 +309,7 @@ mod tests {
         assert_eq!(d.top_k, sk::TOP_K);
         assert_eq!(d.full_layers, sk::FULL_LAYERS);
         assert_eq!(d.prefill_m(), sk::PREFILL_M);
-        assert_eq!(d.frozen_words(), sk::FROZEN_WORDS);
+        assert_eq!(d.canvas / 32, sk::FROZEN_WORDS);
         // The head-geometry literals in enc.rs and the pipeline shape list.
         assert_eq!(d.q_cols(false), 4096);
         assert_eq!(d.q_cols(true), 8192);
