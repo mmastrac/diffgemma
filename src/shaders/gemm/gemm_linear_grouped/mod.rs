@@ -512,16 +512,15 @@ mod tests {
 
 pub mod cpu;
 
-/// Manifest registration; collected in common/manifest.rs::MANIFEST.
-pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
-    name: "gemm_linear_grouped",
-    entry: "gemm_linear_grouped",
-    quant_formats: &[
-        crate::shaders::variant::QuantFormat::Q4Affine,
-        crate::shaders::variant::QuantFormat::NvFp4,
-    ],
-    fc: &[],
-    variants: crate::shaders::manifest::KernelVariants::Elementwise,
-};
-
-crate::register_kernel_specs!(SPEC);
+crate::kernel_spec! {
+    pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
+        name: "gemm_linear_grouped",
+        entry: "gemm_linear_grouped",
+        quant_formats: &[
+            crate::shaders::variant::QuantFormat::Q4Affine,
+            crate::shaders::variant::QuantFormat::NvFp4,
+        ],
+        fc: &[],
+        variants: crate::shaders::manifest::KernelVariants::Elementwise,
+    };
+}

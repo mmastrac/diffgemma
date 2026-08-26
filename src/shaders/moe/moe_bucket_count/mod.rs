@@ -121,14 +121,15 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         .collect())
 }
 
-/// Manifest registration; collected in common/manifest.rs::MANIFEST.
-pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
-    name: "moe_bucket_count",
-    entry: "moe_bucket_count",
-    quant_formats: &[crate::shaders::variant::QuantFormat::Q4Affine],
-    fc: &[],
-    variants: crate::shaders::manifest::KernelVariants::Elementwise,
-};
+crate::kernel_spec! {
+    pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
+        name: "moe_bucket_count",
+        entry: "moe_bucket_count",
+        quant_formats: &[crate::shaders::variant::QuantFormat::Q4Affine],
+        fc: &[],
+        variants: crate::shaders::manifest::KernelVariants::Elementwise,
+    };
+}
 
 #[cfg(test)]
 mod tests {
@@ -146,5 +147,3 @@ mod tests {
         min_cos = 1.0,
     }
 }
-
-crate::register_kernel_specs!(SPEC);

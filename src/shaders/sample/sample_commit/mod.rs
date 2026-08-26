@@ -258,14 +258,15 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     Ok(pack_out(&state_out, f.canvas_size))
 }
 
-/// Manifest registration; collected in common/manifest.rs::MANIFEST.
-pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
-    name: "sample_commit",
-    entry: "sample_commit",
-    quant_formats: &[crate::shaders::variant::QuantFormat::Q4Affine],
-    fc: &[],
-    variants: crate::shaders::manifest::KernelVariants::Elementwise,
-};
+crate::kernel_spec! {
+    pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
+        name: "sample_commit",
+        entry: "sample_commit",
+        quant_formats: &[crate::shaders::variant::QuantFormat::Q4Affine],
+        fc: &[],
+        variants: crate::shaders::manifest::KernelVariants::Elementwise,
+    };
+}
 
 #[cfg(test)]
 mod tests {
@@ -295,5 +296,3 @@ mod tests {
         min_cos = 0.9999,
     }
 }
-
-crate::register_kernel_specs!(SPEC);
