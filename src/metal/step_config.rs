@@ -1,10 +1,9 @@
-//! Validate `config.json` against monolithic shader compile-time constants (M4.5).
+//! Model geometry from `config.json`: `ModelDims` (threaded through the step
+//! runtime) and the load-time envelope check (`validate_step_model`).
 
 use crate::Error;
 use crate::config::{LayerType, ModelConfig};
-use crate::metal::step_kernel::{
-    CANVAS, DENSE_FF, FULL_LAYERS, HID, MOE_FF, N_EXPERTS, N_LAYERS, TOP_K, VOCAB,
-};
+use crate::metal::step_kernel::{CANVAS, HID, MOE_FF, N_EXPERTS, N_LAYERS, TOP_K, VOCAB};
 use std::path::Path;
 
 #[derive(Debug, Clone)]
@@ -17,9 +16,9 @@ pub struct ValidatedStepModel {
 }
 
 /// Model geometry derived from `config.json`, threaded through the step
-/// runtime in place of the compile-time constants. While the constants
-/// exist, `validate_step_model` guarantees the two agree; the constants are
-/// removed consumer by consumer.
+/// runtime. The remaining compile-time constants are capacity bounds
+/// (`validate_step_model` checks dims fit them), except canvas/vocab/eps,
+/// which stay exact-match until their consumers are dims-driven.
 #[derive(Debug, Clone)]
 pub struct ModelDims {
     pub hid: usize,
@@ -197,10 +196,38 @@ fn full_layers_from_config(layer_types: &[LayerType]) -> Vec<usize> {
         .collect()
 }
 
-/// Load and validate model config against shader ABI. Fails fast on unsupported models.
+/// Load model config and check it fits the step kernel's envelope.
+///
+/// Dims flow from config at runtime (`ModelDims`), so most checks are caps
+/// and divisibility, not equality: a smaller model of the same architecture
+/// loads; a larger one fails naming the cap to raise. Three values stay
+/// exact-match until their consumers are dims-driven: `canvas_length` and
+/// `vocab_size` (the CPU sampler's `SAMPLER_CANVAS` / `FILLER_TOKEN_ID` and
+/// the `CanvasState` ABI), and `rms_norm_eps` (`ATTN_RMS_EPS` baked into
+/// attention_device.metal).
 pub fn validate_step_model(model_dir: &Path) -> Result<ValidatedStepModel, Error> {
     let cfg = ModelConfig::load(model_dir)?;
     let t = &cfg.text_config;
+
+    let cap = |field: &str, value: usize, cap: usize, holder: &str| {
+        if value > cap {
+            Err(Error::NotFound(format!(
+                "step-kernel {field}={value} exceeds the {holder} cap ({cap}); \
+                 raise the cap and recompile to load this model"
+            )))
+        } else {
+            Ok(())
+        }
+    };
+    let multiple = |field: &str, value: usize, of: usize, why: &str| {
+        if !value.is_multiple_of(of) {
+            Err(Error::NotFound(format!(
+                "step-kernel {field}={value} must be a multiple of {of} ({why})"
+            )))
+        } else {
+            Ok(())
+        }
+    };
 
     if cfg.canvas_length != CANVAS {
         return Err(mismatch("canvas_length", cfg.canvas_length, CANVAS));
@@ -208,76 +235,99 @@ pub fn validate_step_model(model_dir: &Path) -> Result<ValidatedStepModel, Error
     if t.vocab_size != VOCAB {
         return Err(mismatch("vocab_size", t.vocab_size, VOCAB));
     }
-    if t.hidden_size != HID {
-        return Err(mismatch("hidden_size", t.hidden_size, HID));
-    }
-    if t.num_hidden_layers > N_LAYERS {
-        return Err(Error::NotFound(format!(
-            "step-kernel supports at most {N_LAYERS} layers; config has {}",
-            t.num_hidden_layers
-        )));
-    }
-    if t.num_experts != N_EXPERTS {
-        return Err(mismatch("num_experts", t.num_experts, N_EXPERTS));
-    }
-    if t.top_k_experts != TOP_K {
-        return Err(mismatch("top_k_experts", t.top_k_experts, TOP_K));
-    }
-    if t.intermediate_size != DENSE_FF as usize {
-        return Err(mismatch(
-            "intermediate_size",
-            t.intermediate_size,
-            DENSE_FF as usize,
-        ));
-    }
-    if t.moe_intermediate_size != MOE_FF as usize {
-        return Err(mismatch(
-            "moe_intermediate_size",
-            t.moe_intermediate_size,
-            MOE_FF as usize,
-        ));
-    }
-    if t.num_attention_heads != 16 {
-        return Err(mismatch("num_attention_heads", t.num_attention_heads, 16));
-    }
-    if t.num_key_value_heads != 8 {
-        return Err(mismatch("num_key_value_heads", t.num_key_value_heads, 8));
-    }
-    if t.head_dim != 256 {
-        return Err(mismatch("head_dim", t.head_dim, 256));
-    }
-    if t.num_global_key_value_heads != 2 {
-        return Err(mismatch(
-            "num_global_key_value_heads",
-            t.num_global_key_value_heads,
-            2,
-        ));
-    }
-    if t.global_head_dim != 512 {
-        return Err(mismatch("global_head_dim", t.global_head_dim, 512));
-    }
     if (t.rms_norm_eps - 1e-6).abs() > 1e-9 {
         return Err(Error::NotFound(format!(
-            "step-kernel rms_norm_eps mismatch: config={} shader=1e-6",
+            "step-kernel rms_norm_eps mismatch: config={} shader=1e-6 (ATTN_RMS_EPS)",
             t.rms_norm_eps
         )));
     }
 
-    let full = full_layers_from_config(&t.layer_types);
-    if full.len() != FULL_LAYERS.len() {
+    cap(
+        "num_hidden_layers",
+        t.num_hidden_layers,
+        N_LAYERS,
+        "ModelLayout.layers",
+    )?;
+    cap(
+        "num_experts",
+        t.num_experts,
+        N_EXPERTS,
+        "RouteScratch/MOE_MAX_EXPERTS",
+    )?;
+    cap(
+        "top_k_experts",
+        t.top_k_experts,
+        TOP_K,
+        "RouteScratch/MOE_MAX_TOP_K",
+    )?;
+    if t.top_k_experts > t.num_experts {
         return Err(Error::NotFound(format!(
-            "step-kernel full_attention layer count mismatch: config={} shader={}",
-            full.len(),
-            FULL_LAYERS.len()
+            "step-kernel top_k_experts={} exceeds num_experts={}",
+            t.top_k_experts, t.num_experts
         )));
     }
-    for (i, &layer) in FULL_LAYERS.iter().enumerate() {
-        if full.get(i) != Some(&layer) {
-            return Err(Error::NotFound(format!(
-                "step-kernel full_attention indices mismatch at {i}: config={full:?} shader={FULL_LAYERS:?}"
-            )));
-        }
+    cap(
+        "moe_intermediate_size",
+        t.moe_intermediate_size,
+        MOE_FF as usize,
+        "MOE_MAX_FF",
+    )?;
+    cap("hidden_size", t.hidden_size, HID, "MOE_MAX_HIDDEN")?;
+    multiple("hidden_size", t.hidden_size, 64, "GEMM K-tile loads")?;
+    multiple(
+        "intermediate_size",
+        t.intermediate_size,
+        32,
+        "quant group size",
+    )?;
+    multiple(
+        "moe_intermediate_size",
+        t.moe_intermediate_size,
+        32,
+        "quant group size",
+    )?;
+
+    // The MMA attention kernels assume the reference GQA group shapes:
+    // attention_mma2 is written for group 2 (sliding), attention_mma_full and
+    // the top-k pipeline for group 8 (full).
+    if t.num_attention_heads != t.num_key_value_heads * 2 {
+        return Err(Error::NotFound(format!(
+            "step-kernel sliding GQA group must be 2 (mma2): q={} kv={}",
+            t.num_attention_heads, t.num_key_value_heads
+        )));
     }
+    if t.num_attention_heads != t.num_global_key_value_heads * 8 {
+        return Err(Error::NotFound(format!(
+            "step-kernel full GQA group must be 8 (mma_full): q={} kv={}",
+            t.num_attention_heads, t.num_global_key_value_heads
+        )));
+    }
+    cap("head_dim", t.head_dim, 256, "attention_mma2 HD_MAX")?;
+    cap(
+        "global_head_dim",
+        t.global_head_dim,
+        512,
+        "qk_rope_kv head buffer",
+    )?;
+    multiple("head_dim", t.head_dim, 8, "simdgroup 8x8 MMA tiles")?;
+    multiple(
+        "global_head_dim",
+        t.global_head_dim,
+        8,
+        "simdgroup 8x8 MMA tiles",
+    )?;
+    cap(
+        "q columns (heads * global_head_dim)",
+        t.num_attention_heads * t.global_head_dim,
+        crate::metal::step_kernel::MAX_ATTN_Q_COLS,
+        "arena attnq plane",
+    )?;
+    cap(
+        "kv columns (kv heads * head_dim)",
+        t.num_key_value_heads * t.head_dim,
+        crate::metal::step_kernel::MAX_ATTN_KV_COLS,
+        "arena attnk/v planes",
+    )?;
 
     Ok(ValidatedStepModel {
         num_layers: t.num_hidden_layers,

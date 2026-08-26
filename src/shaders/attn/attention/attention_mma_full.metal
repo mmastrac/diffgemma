@@ -29,7 +29,10 @@ using namespace metal;
 // stays in registers. nkv / n_q_heads stay runtime (KV addressing only).
 // Full layers only — assert head_dim==512.
 
-constant uint HD = 512u;        // full-layer head_dim (compile-time)
+#ifndef MMA_FULL_HD
+#define MMA_FULL_HD 512u
+#endif
+constant uint HD = MMA_FULL_HD; // full-layer head_dim (compile-time)
 constant uint NCH = HD / 8u;    // 64 head-dim chunks of 8
 constant uint MT = 8u;          // query rows per tile
 constant uint QG = 2u;          // simdgroups per tg = d-halves (tg width 64)
