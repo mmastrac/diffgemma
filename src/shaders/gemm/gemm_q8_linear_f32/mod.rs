@@ -196,11 +196,11 @@ mod tests {
 pub mod kxn;
 
 crate::kernel_spec! {
-    pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
+    pub const SPEC {
         name: "gemm_q8_linear_f32",
         entry: "gemm_q8_linear_f32",
-        quant_formats: &[crate::shaders::variant::QuantFormat::Q4Affine],
+        quant_formats: &[QuantFormat::Q4Affine],
         fc: &[],
-        variants: crate::shaders::manifest::KernelVariants::Elementwise,
-    };
+        variants: KernelVariants::Elementwise,
+    }
 }

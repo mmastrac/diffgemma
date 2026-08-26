@@ -4,15 +4,15 @@ pub const ENTRY: &str = "gemm_block";
 pub const SHADER: &str = include_str!("gemm_block.metal");
 
 crate::kernel_spec! {
-    pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
+    pub const SPEC {
         name: "gemm_block",
         entry: "gemm_block",
         quant_formats: &[
-            crate::shaders::variant::QuantFormat::Q4Affine,
-            crate::shaders::variant::QuantFormat::Q8,
-            crate::shaders::variant::QuantFormat::NvFp4,
+            QuantFormat::Q4Affine,
+            QuantFormat::Q8,
+            QuantFormat::NvFp4,
         ],
         fc: &[(4, "IS_FULL_LAYER"), (5, "GEMM_N"), (6, "GEMM_K")],
-        variants: crate::shaders::manifest::KernelVariants::GemmBlock,
-    };
+        variants: KernelVariants::GemmBlock,
+    }
 }

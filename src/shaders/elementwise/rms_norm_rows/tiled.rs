@@ -239,22 +239,22 @@ fn gpu_tiled(f: &Fixture, variant: KernelVariant, tiled: TiledVariant) -> Result
 }
 
 crate::kernel_spec! {
-    pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
+    pub const SPEC {
         name: "rms_norm_rows_tiled",
         entry: "rms_norm_rows_tiled",
-        quant_formats: &[crate::shaders::variant::QuantFormat::Q4Affine],
+        quant_formats: &[QuantFormat::Q4Affine],
         fc: &[(4, "K_IN_DTYPE")],
-        variants: crate::shaders::manifest::KernelVariants::RmsNormRowsTiled {
+        variants: KernelVariants::RmsNormRowsTiled {
             rows: &[
-                crate::shaders::manifest::RmsNormRowsTiledVariant {
-                    in_dtype: crate::shaders::variant::ElemDtype::F32,
+                RmsNormRowsTiledVariant {
+                    in_dtype: ElemDtype::F32,
                 },
-                crate::shaders::manifest::RmsNormRowsTiledVariant {
-                    in_dtype: crate::shaders::variant::ElemDtype::Half,
+                RmsNormRowsTiledVariant {
+                    in_dtype: ElemDtype::Half,
                 },
             ],
         },
-    };
+    }
 }
 
 #[cfg(test)]

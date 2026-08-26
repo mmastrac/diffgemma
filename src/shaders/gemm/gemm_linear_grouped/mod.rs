@@ -513,14 +513,14 @@ mod tests {
 pub mod cpu;
 
 crate::kernel_spec! {
-    pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
+    pub const SPEC {
         name: "gemm_linear_grouped",
         entry: "gemm_linear_grouped",
         quant_formats: &[
-            crate::shaders::variant::QuantFormat::Q4Affine,
-            crate::shaders::variant::QuantFormat::NvFp4,
+            QuantFormat::Q4Affine,
+            QuantFormat::NvFp4,
         ],
         fc: &[],
-        variants: crate::shaders::manifest::KernelVariants::Elementwise,
-    };
+        variants: KernelVariants::Elementwise,
+    }
 }

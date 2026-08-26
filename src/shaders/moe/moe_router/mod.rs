@@ -322,11 +322,11 @@ pub const TOPK_ENTRY: &str = "moe_router_topk";
 pub const TOPK_SHADER: &str = include_str!("moe_router_topk.metal");
 
 crate::kernel_spec! {
-    pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
+    pub const SPEC {
         name: "moe_router",
         entry: "moe_router",
-        quant_formats: &[crate::shaders::variant::QuantFormat::Q4Affine],
+        quant_formats: &[QuantFormat::Q4Affine],
         fc: &[],
-        variants: crate::shaders::manifest::KernelVariants::Elementwise,
-    };
+        variants: KernelVariants::Elementwise,
+    }
 }

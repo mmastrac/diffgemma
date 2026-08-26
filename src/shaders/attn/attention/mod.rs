@@ -831,13 +831,13 @@ pub fn bench_path(f: &Fixture, iters: usize, path: u8) -> Result<f64, Error> {
 }
 
 crate::kernel_spec! {
-    pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
+    pub const SPEC {
         name: "attention",
         entry: "attention",
-        quant_formats: &[crate::shaders::variant::QuantFormat::Q4Affine],
+        quant_formats: &[QuantFormat::Q4Affine],
         fc: &[],
-        variants: crate::shaders::manifest::KernelVariants::Elementwise,
-    };
+        variants: KernelVariants::Elementwise,
+    }
 }
 
 #[cfg(test)]

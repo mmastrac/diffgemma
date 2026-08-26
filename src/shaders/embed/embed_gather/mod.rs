@@ -256,13 +256,13 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
 }
 
 crate::kernel_spec! {
-    pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
+    pub const SPEC {
         name: "embed_gather",
         entry: "embed_gather",
-        quant_formats: &[crate::shaders::variant::QuantFormat::Q8],
+        quant_formats: &[QuantFormat::Q8],
         fc: &[],
-        variants: crate::shaders::manifest::KernelVariants::Elementwise,
-    };
+        variants: KernelVariants::Elementwise,
+    }
 }
 
 #[cfg(test)]
