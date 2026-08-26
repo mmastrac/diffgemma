@@ -262,6 +262,7 @@ crate::kernel_spec! {
     pub const SPEC {
         name: "sample_commit",
         entry: "sample_commit",
+        source: SHADER,
         quant_formats: &[QuantFormat::Q4Affine],
         fc: &[],
         variants: KernelVariants::Elementwise,

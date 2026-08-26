@@ -429,6 +429,7 @@ crate::kernel_spec! {
     pub const SPEC {
         name: "moe_grouped",
         entry: "moe_grouped",
+        source: SHADER,
         quant_formats: &[
             QuantFormat::Q4Affine,
             QuantFormat::NvFp4,

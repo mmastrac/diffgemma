@@ -254,6 +254,7 @@ crate::kernel_spec! {
     pub const SPEC {
         name: "sample_apply",
         entry: "sample_apply",
+        source: SHADER,
         quant_formats: &[QuantFormat::Q4Affine],
         fc: &[],
         variants: KernelVariants::Elementwise,

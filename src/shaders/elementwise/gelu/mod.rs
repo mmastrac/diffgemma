@@ -146,6 +146,7 @@ crate::kernel_spec! {
     pub const SPEC {
         name: "gelu",
         entry: "gelu",
+        source: SHADER,
         quant_formats: &[QuantFormat::Q4Affine],
         fc: &[],
         variants: KernelVariants::Gelu,

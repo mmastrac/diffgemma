@@ -194,6 +194,7 @@ crate::kernel_spec! {
     pub const SPEC {
         name: "gemm_rowk",
         entry: "gemm_rowk",
+        source: SHADER,
         quant_formats: &[QuantFormat::Q8],
         fc: &[
             (4, "IS_FULL_LAYER"),

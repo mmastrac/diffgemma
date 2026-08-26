@@ -431,6 +431,7 @@ crate::kernel_spec! {
     pub const SPEC {
         name: "qk_rope_kv",
         entry: "qk_rope_kv",
+        source: SHADER,
         quant_formats: &[QuantFormat::Q4Affine],
         fc: &[],
         variants: KernelVariants::Elementwise,

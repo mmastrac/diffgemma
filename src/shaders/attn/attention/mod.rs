@@ -834,6 +834,7 @@ crate::kernel_spec! {
     pub const SPEC {
         name: "attention",
         entry: "attention",
+        source: SHADER,
         quant_formats: &[QuantFormat::Q4Affine],
         fc: &[],
         variants: KernelVariants::Elementwise,

@@ -391,6 +391,7 @@ crate::kernel_spec! {
     pub const SPEC {
         name: "swiglu",
         entry: "swiglu",
+        source: SHADER,
         quant_formats: &[QuantFormat::Q4Affine],
         fc: &[(4, "K_IO_DTYPE"), (5, "K_GELU_GATE"), (6, "K_IN_PLACE")],
         variants: KernelVariants::SwigluSplit {
@@ -407,6 +408,7 @@ crate::kernel_spec! {
     pub const SPEC_MOE_GATE_UP {
         name: "swiglu_moe_gate_up",
         entry: "swiglu_moe_gate_up",
+        source: MOE_SHADER,
         quant_formats: &[QuantFormat::Q4Affine],
         fc: &[],
         variants: KernelVariants::SwigluMoeGateUp,

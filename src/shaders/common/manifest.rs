@@ -64,6 +64,12 @@ macro_rules! kernel_spec {
 pub struct KernelSpec {
     pub name: &'static str,
     pub entry: &'static str,
+    /// The kernel's Metal source (the module's `include_str!` const), so the
+    /// manifest can enumerate registered shader content: integrity tests
+    /// match it against the on-disk tree, and it is the base for deriving
+    /// the pipeline-cache key from registered content once coverage is
+    /// complete.
+    pub source: &'static str,
     /// Valid FC3 values. Empty means inert-only (must be `QuantFormat::Q4Affine`).
     pub quant_formats: &'static [QuantFormat],
     /// Local function-constant axes: (index ≥ 4, name). FC1–3 are implied.
@@ -385,6 +391,61 @@ mod tests {
         assert!(toml.contains("io_dtype = 1"));
         // The old hand-maintained file's drift cases stay dead.
         assert!(!toml.contains("sc_softembed"));
+    }
+
+    #[test]
+    fn spec_sources_contain_their_entry() {
+        for k in specs() {
+            assert!(
+                k.source.contains(&format!("kernel void {}", k.entry)),
+                "{}: source does not declare entry {} — wrong SHADER const wired?",
+                k.name,
+                k.entry
+            );
+        }
+    }
+
+    /// Every registered source must be byte-identical to `<name>.metal` on
+    /// disk (catches a spec wired to the wrong `include_str!` const). Also
+    /// prints the coverage report: entry `.metal` files with no registered
+    /// spec (run with `--nocapture` to see it).
+    #[test]
+    fn registered_sources_match_disk() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shaders");
+        let include = root.join("include");
+        let mut unregistered = Vec::new();
+        let mut by_name = std::collections::HashMap::new();
+        for k in specs() {
+            by_name.insert(format!("{}.metal", k.name), k);
+        }
+        for path in collect_metal_files(&root) {
+            if path.starts_with(&include) {
+                continue;
+            }
+            let basename = path.file_name().unwrap().to_str().unwrap();
+            match by_name.remove(basename) {
+                Some(k) => {
+                    let disk = std::fs::read_to_string(&path).expect("read kernel metal");
+                    assert_eq!(
+                        k.source, disk,
+                        "{}: registered source differs from {}",
+                        k.name, basename
+                    );
+                }
+                None => unregistered.push(basename.to_string()),
+            }
+        }
+        assert!(
+            by_name.is_empty(),
+            "specs with no on-disk <name>.metal: {:?}",
+            by_name.keys().collect::<Vec<_>>()
+        );
+        println!(
+            "coverage: {} registered, {} entry files unregistered: {:?}",
+            specs().len(),
+            unregistered.len(),
+            unregistered
+        );
     }
 
     #[test]

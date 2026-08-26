@@ -229,6 +229,7 @@ crate::kernel_spec! {
     pub const SPEC {
         name: "sc_prob_cols",
         entry: "sc_prob_cols",
+        source: SHADER,
         quant_formats: &[QuantFormat::Q4Affine],
         fc: &[],
         variants: KernelVariants::Elementwise,

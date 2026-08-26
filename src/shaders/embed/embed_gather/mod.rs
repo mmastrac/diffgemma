@@ -259,6 +259,7 @@ crate::kernel_spec! {
     pub const SPEC {
         name: "embed_gather",
         entry: "embed_gather",
+        source: SHADER,
         quant_formats: &[QuantFormat::Q8],
         fc: &[],
         variants: KernelVariants::Elementwise,

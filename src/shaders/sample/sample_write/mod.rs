@@ -182,6 +182,7 @@ crate::kernel_spec! {
     pub const SPEC {
         name: "sample_write",
         entry: "sample_write",
+        source: SHADER,
         quant_formats: &[QuantFormat::Q4Affine],
         fc: &[],
         variants: KernelVariants::Elementwise,

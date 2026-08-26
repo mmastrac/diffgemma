@@ -366,6 +366,7 @@ crate::kernel_spec! {
     pub const SPEC {
         name: "gemm_block_grouped",
         entry: "gemm_block_grouped",
+        source: SHADER,
         quant_formats: &[
             QuantFormat::Q4Affine,
             QuantFormat::NvFp4,
