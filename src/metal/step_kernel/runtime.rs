@@ -93,9 +93,10 @@ impl StepRuntime {
         // the buffer) and corrupts attention into word-salad. Fail loudly instead —
         // callers must size max_seq >= prompt + generated + CANVAS.
         assert!(
-            kv_len as usize + CANVAS <= self.max_seq,
-            "KV cache overflow: kv_len={kv_len} + CANVAS={CANVAS} > max_seq={}; \
-             size max_seq >= prompt_len + max_new_tokens + CANVAS",
+            kv_len as usize + self.dims.canvas <= self.max_seq,
+            "KV cache overflow: kv_len={kv_len} + canvas={} > max_seq={}; \
+             size max_seq >= prompt_len + max_new_tokens + canvas",
+            self.dims.canvas,
             self.max_seq,
         );
         let mut params = self.read_params();
@@ -328,13 +329,13 @@ impl StepRuntime {
         let probe_planes = |this: &Self, m_rows: usize, peaks: &mut RangePeaks| {
             let a = &this.bufs.arena_map;
             for (label, off, per_row) in [
-                ("hidden", a.hidden_off(), HID),
+                ("hidden", a.hidden_off(), this.dims.hid),
                 ("attnq(Q)", a.attnq_off(), 4096),
                 ("attn_out", a.attno_off(), 4096),
-                ("tmp(o_proj)", a.tmp_off(), HID),
-                ("ffg(gate_up)", a.ffg_off(), DENSE_FF as usize),
-                ("dense", a.dense_off(), HID),
-                ("moein", a.moein_off(), HID),
+                ("tmp(o_proj)", a.tmp_off(), this.dims.hid),
+                ("ffg(gate_up)", a.ffg_off(), this.dims.dense_ff),
+                ("dense", a.dense_off(), this.dims.hid),
+                ("moein", a.moein_off(), this.dims.hid),
             ] {
                 // half_buffer_stats returns (finite, max_abs) — bool true = healthy.
                 let (finite, mx) = if this.arena_f16_mode {
@@ -379,12 +380,12 @@ impl StepRuntime {
             // forward (needs kv headroom for the whole super-chunk). The tail
             // (< 2 full chunks) falls back to plain 256-chunks.
             let n_subs = if batch {
-                (remaining / CANVAS).min(PREFILL_SUBS)
+                (remaining / self.dims.canvas).min(PREFILL_SUBS)
             } else {
                 1
             };
-            if n_subs >= 2 && pos + n_subs * CANVAS + CANVAS <= self.max_seq {
-                let m = n_subs * CANVAS;
+            if n_subs >= 2 && pos + n_subs * self.dims.canvas + self.dims.canvas <= self.max_seq {
+                let m = n_subs * self.dims.canvas;
                 self.set_canvas_ids(&delta_token_ids[pos - offset..pos - offset + m])?;
                 self.set_kv_len(pos as u32);
                 self.write_params_sub(pos as u32, n_subs);
@@ -395,7 +396,7 @@ impl StepRuntime {
                 pos += m;
                 continue;
             }
-            let chunk_len = remaining.min(CANVAS);
+            let chunk_len = remaining.min(self.dims.canvas);
             let mut ids = [0u32; CANVAS];
             ids[..chunk_len]
                 .copy_from_slice(&delta_token_ids[pos - offset..pos - offset + chunk_len]);
@@ -403,7 +404,7 @@ impl StepRuntime {
             self.set_kv_len(pos as u32);
             self.dispatch_and_wait(|enc| enc.encode_prefill_chunk(&layout, layers))?;
             if let Some(peaks) = range_peaks.as_mut() {
-                probe_planes(self, CANVAS, peaks);
+                probe_planes(self, self.dims.canvas, peaks);
             }
             pos += chunk_len;
         }
@@ -442,7 +443,7 @@ impl StepRuntime {
     pub fn read_sample_rowstats(&self, rows: usize) -> Vec<[f32; 2]> {
         let byte_off = self.bufs.arena_map.rs_samp_off() as usize;
         let ptr = unsafe { self.bufs.arena.contents().as_ptr().add(byte_off) as *const f32 };
-        (0..rows.min(CANVAS))
+        (0..rows.min(self.dims.canvas))
             .map(|r| unsafe { [*ptr.add(r * 2), *ptr.add(r * 2 + 1)] })
             .collect()
     }
@@ -456,20 +457,22 @@ impl StepRuntime {
     /// the feature is off.
     pub fn read_hidden_rows(&self, rows: usize) -> Vec<f32> {
         let byte_off = self.bufs.arena_map.hidden_off() as usize;
-        let n = rows.min(CANVAS);
+        let n = rows.min(self.dims.canvas);
         crate::metal::step_kernel::diag_bench::read_arena_buffer_f32(
             &self.bufs.arena,
             byte_off,
-            n * HID,
+            n * self.dims.hid,
         )
     }
 
     pub fn set_canvas_ids(&mut self, ids: &[u32]) -> Result<(), Error> {
         // CANVAS for denoise / plain prefill chunks; up to PREFILL_M for a
         // batched prefill super-chunk.
-        if ids.len() != CANVAS && (ids.len() > PREFILL_M || !ids.len().is_multiple_of(CANVAS)) {
+        if ids.len() != self.dims.canvas
+            && (ids.len() > self.dims.prefill_m() || !ids.len().is_multiple_of(self.dims.canvas))
+        {
             return Err(Error::Format(
-                "canvas ids length must be CANVAS..=PREFILL_M",
+                "canvas ids length must be self.dims.canvas..=self.dims.prefill_m()",
             ));
         }
         let mut state = self.read_canvas_state();
@@ -486,7 +489,7 @@ impl StepRuntime {
         let mut p = read_struct::<StepParams>(&self.bufs.params);
         let ptr = self.bufs.params_sub.contents().as_ptr() as *mut StepParams;
         for c in 0..n_subs {
-            p.kv_len = base_kv_len + (c * CANVAS) as u32;
+            p.kv_len = base_kv_len + (c * self.dims.canvas) as u32;
             unsafe { std::ptr::write(ptr.add(c), p) };
         }
     }
@@ -500,7 +503,7 @@ impl StepRuntime {
     /// Clamped to [1, CANVAS]. A `DGQ_FORCE_CANVAS` override still wins at the
     /// dispatch site. The block loop reads it back via `active_canvas()`.
     pub fn set_active_canvas(&mut self, w: usize) {
-        self.active_canvas = w.clamp(1, CANVAS);
+        self.active_canvas = w.clamp(1, self.dims.canvas);
     }
 
     /// Effective active canvas width (the `DGQ_FORCE_CANVAS` test override, else
@@ -508,7 +511,7 @@ impl StepRuntime {
     /// stats/trim to this many rows.
     pub fn active_canvas(&self) -> usize {
         crate::flags::force_canvas()
-            .map(|w| (w as usize).clamp(1, CANVAS))
+            .map(|w| (w as usize).clamp(1, self.dims.canvas))
             .unwrap_or(self.active_canvas)
     }
 
@@ -537,7 +540,8 @@ impl StepRuntime {
     pub fn fill_expert_forward_telemetry(&self, forward: &mut crate::metal::ForwardTelemetry) {
         let ptr = self.bufs.expert_layer_unique.contents().as_ptr() as *const u32;
         let counts = unsafe { std::slice::from_raw_parts(ptr, self.layers) };
-        let weight_bytes = grouped_expert_blob_bytes_per_expert(self.block_profile.format);
+        let weight_bytes =
+            grouped_expert_blob_bytes_per_expert(self.block_profile.format, &self.dims);
         forward.record_expert_layers_grouped(counts, weight_bytes);
     }
 
@@ -545,11 +549,14 @@ impl StepRuntime {
     pub const CANVAS_STATE_BYTES: usize = std::mem::size_of::<CanvasState>();
 
     /// P2.1 budget: host bytes touched per denoise step on the generate hot path.
-    pub fn denoise_step_host_readback_bytes(check_logits: bool) -> u64 {
+    pub fn denoise_step_host_readback_bytes(
+        check_logits: bool,
+        dims: &crate::metal::step_config::ModelDims,
+    ) -> u64 {
         // Forward reads state once on CPU to seed preamble; generate polls once after sync.
         let mut bytes = (Self::CANVAS_STATE_BYTES as u64) * 2;
         if check_logits && logits_finite_check_enabled() {
-            bytes += logits_finite_sample_bytes();
+            bytes += logits_finite_sample_bytes(dims);
         }
         bytes
     }
@@ -559,8 +566,13 @@ impl StepRuntime {
         if !logits_finite_check_enabled() {
             return Ok(());
         }
-        let sample = logits_finite_sample_count().min(CANVAS * VOCAB);
-        let (finite, max_abs) = half_buffer_stats(&self.bufs.logits, 0, CANVAS * VOCAB, sample);
+        let sample = logits_finite_sample_count().min(self.dims.canvas * self.dims.vocab);
+        let (finite, max_abs) = half_buffer_stats(
+            &self.bufs.logits,
+            0,
+            self.dims.canvas * self.dims.vocab,
+            sample,
+        );
         if !finite {
             eprintln!("non-finite logits (max_abs={max_abs:.4}, sample={sample})");
             return Err(Error::Runtime("non-finite logits"));
@@ -607,14 +619,14 @@ impl StepRuntime {
             dims: &self.dims,
             block_profile: self.block_profile,
             tensor_offsets: &self.tensor_offsets,
-            partial_lm_m: CANVAS as u32,
+            partial_lm_m: self.dims.canvas as u32,
             attn_format: self.attn_format,
             dense_format: self.dense_format,
             sc_format: self.sc_format,
             embed_bf16: self.embed_bf16,
             prefill_causal: false,
-            forward_m: CANVAS,
-            active_canvas: CANVAS,
+            forward_m: self.dims.canvas,
+            active_canvas: self.dims.canvas,
             sub_c: 0,
             use_params_sub: false,
             sliding_window: self.text_config.sliding_window as u32,
@@ -644,17 +656,17 @@ impl StepRuntime {
         let moe_in = read_arena_buffer_f32(
             &self.bufs.arena,
             self.bufs.arena_map.moein_off() as usize,
-            CANVAS * HID,
+            self.dims.canvas * self.dims.hid,
         );
-        let mut moe_out = vec![0.0f32; CANVAS * HID];
-        let mut scratch = MoeScratch::new(CANVAS, &self.text_config);
+        let mut moe_out = vec![0.0f32; self.dims.canvas * self.dims.hid];
+        let mut scratch = MoeScratch::new(self.dims.canvas, &self.text_config);
         experts_forward_dgq_cpu(
             &mut moe_out,
             &moe_in,
             &self.weight_cache,
             layer,
             &self.text_config,
-            CANVAS,
+            self.dims.canvas,
             &routes,
             &mut scratch,
         )?;
@@ -778,19 +790,19 @@ impl StepRuntime {
             self,
             "preamble:soft",
             self.bufs.arena_map.soft_off(),
-            CANVAS * HID,
+            self.dims.canvas * self.dims.hid,
         );
         probe(
             self,
             "preamble:dense(sc_mlp)",
             self.bufs.arena_map.dense_off(),
-            CANVAS * HID,
+            self.dims.canvas * self.dims.hid,
         );
         probe(
             self,
             "preamble:hidden(embed+sc)",
             self.bufs.arena_map.hidden_off(),
-            CANVAS * HID,
+            self.dims.canvas * self.dims.hid,
         );
 
         for layer in 0..layers {
@@ -805,46 +817,66 @@ impl StepRuntime {
                 a.moein_off(),
             );
             self.time_enc_stage(|e| e.encode_layer_qkv_gemm(layer, &layout))?;
-            probe(self, "layer:qkv(Q)", attnq, CANVAS * 4096);
+            probe(self, "layer:qkv(Q)", attnq, self.dims.canvas * 4096);
             self.time_enc_stage(|e| e.encode_layer_qk_rope_kv_dispatch(layer, &layout))?;
             self.time_enc_stage(|e| e.encode_layer_attention_dispatch(layer, &layout))?;
-            probe(self, "layer:attn_out", attno, CANVAS * 4096);
+            probe(self, "layer:attn_out", attno, self.dims.canvas * 4096);
             self.time_enc_stage(|e| e.encode_layer_o_proj_gemm(layer, &layout))?;
-            probe(self, "layer:o_proj", tmp, CANVAS * HID);
+            probe(self, "layer:o_proj", tmp, self.dims.canvas * self.dims.hid);
             self.time_enc_stage(|e| e.encode_layer_o_proj_tail(layer, &layout))?;
-            probe(self, "layer:resid_pre_moe(hidden)", hidden, CANVAS * HID);
+            probe(
+                self,
+                "layer:resid_pre_moe(hidden)",
+                hidden,
+                self.dims.canvas * self.dims.hid,
+            );
             let l = &layout.layers[layer];
             self.time_enc_stage(|e| {
                 e.rmsnorm(
                     e.arena().stream_off(),
                     e.arena().tmp_off(),
                     l.pre_ff_ln,
-                    HID as u32,
-                    CANVAS,
+                    e.dims.hid as u32,
+                    e.dims.canvas,
                 );
                 Ok(())
             })?;
             self.time_enc_stage(|e| e.encode_layer_dense_gate_up(layer, &layout))?;
-            probe(self, "layer:gate_up", ffg, CANVAS * DENSE_FF as usize);
+            probe(
+                self,
+                "layer:gate_up",
+                ffg,
+                self.dims.canvas * self.dims.dense_ff,
+            );
             self.time_enc_stage(|e| {
                 e.glu(
                     e.arena().ffg_off(),
                     e.arena().ffu_off(),
                     e.arena().ffg_off(),
-                    CANVAS * DENSE_FF as usize,
+                    e.dims.canvas * e.dims.dense_ff,
                 );
                 Ok(())
             })?;
-            probe(self, "layer:swiglu", ffg, CANVAS * DENSE_FF as usize);
+            probe(
+                self,
+                "layer:swiglu",
+                ffg,
+                self.dims.canvas * self.dims.dense_ff,
+            );
             self.time_enc_stage(|e| e.encode_layer_dense_down(layer, &layout))?;
-            probe(self, "layer:dense_down", dense, CANVAS * HID);
+            probe(
+                self,
+                "layer:dense_down",
+                dense,
+                self.dims.canvas * self.dims.hid,
+            );
             self.time_enc_stage(|e| {
                 e.rmsnorm(
                     e.arena().dense_off(),
                     e.arena().dense_off(),
                     l.post_ff_ln_1,
-                    HID as u32,
-                    CANVAS,
+                    e.dims.hid as u32,
+                    e.dims.canvas,
                 );
                 Ok(())
             })?;
@@ -855,12 +887,26 @@ impl StepRuntime {
             self.time_enc_stage(|e| e.encode_moe_batched_down(layer, &layout))?;
             self.time_enc_stage(|e| e.encode_moe_batched_scatter())?;
             self.time_enc_stage(|e| e.encode_layer_moe_post_norm(layer, &layout))?;
-            probe(self, "layer:moe_norm(moein)", moein, CANVAS * HID);
+            probe(
+                self,
+                "layer:moe_norm(moein)",
+                moein,
+                self.dims.canvas * self.dims.hid,
+            );
             self.time_enc_stage(|e| e.encode_layer_moe_post_combine(layer, &layout))?;
-            probe(self, "layer:resid_post_moe(hidden)", hidden, CANVAS * HID);
+            probe(
+                self,
+                "layer:resid_post_moe(hidden)",
+                hidden,
+                self.dims.canvas * self.dims.hid,
+            );
             // Per-layer residual peak (the f16-overflow suspect).
-            let (_, hmx) =
-                half_buffer_stats(&self.bufs.arena, hidden as usize, CANVAS * HID, SAMPLE);
+            let (_, hmx) = half_buffer_stats(
+                &self.bufs.arena,
+                hidden as usize,
+                self.dims.canvas * self.dims.hid,
+                SAMPLE,
+            );
             eprintln!("  layer {layer:>2}: residual(hidden) max|x| = {hmx:.1}");
         }
 
@@ -914,8 +960,8 @@ impl StepRuntime {
                     e.arena().stream_off(),
                     e.arena().tmp_off(),
                     l.pre_ff_ln,
-                    HID as u32,
-                    CANVAS,
+                    e.dims.hid as u32,
+                    e.dims.canvas,
                 );
                 Ok(())
             })?;
@@ -926,7 +972,7 @@ impl StepRuntime {
                     e.arena().ffg_off(),
                     e.arena().ffu_off(),
                     e.arena().ffg_off(),
-                    CANVAS * DENSE_FF as usize,
+                    e.dims.canvas * e.dims.dense_ff,
                 );
                 Ok(())
             })?;
@@ -937,8 +983,8 @@ impl StepRuntime {
                     e.arena().dense_off(),
                     e.arena().dense_off(),
                     l.post_ff_ln_1,
-                    HID as u32,
-                    CANVAS,
+                    e.dims.hid as u32,
+                    e.dims.canvas,
                 );
                 Ok(())
             })?;
@@ -991,7 +1037,7 @@ impl StepRuntime {
         let layout = self.layout;
         let layers = self.layers;
         let n_subs = n_subs.clamp(1, PREFILL_SUBS);
-        let m = n_subs * CANVAS;
+        let m = n_subs * self.dims.canvas;
         let ids = vec![0u32; m];
         self.set_canvas_ids(&ids)?;
         self.set_kv_len(kv_len);
@@ -1072,7 +1118,7 @@ impl StepRuntime {
         let layers = self.layers;
         let st_before: CanvasState = read_struct(&self.bufs.state);
         if crate::metal::embed::sc_log_enabled() && st_before.step >= 1 {
-            let elems = CANVAS * VOCAB;
+            let elems = self.dims.canvas * self.dims.vocab;
             let sample = elems.min(8192);
             let (nf, mx) = half_buffer_stats(&self.bufs.logits, 0, elems, sample);
             eprintln!(
@@ -1086,11 +1132,11 @@ impl StepRuntime {
         // ForwardOnly (prefill/dump) always uses the full CANVAS sub width.
         let active_canvas = if finish == StepFinishMode::Full {
             crate::flags::force_canvas()
-                .map(|w| (w as usize).clamp(1, CANVAS))
+                .map(|w| (w as usize).clamp(1, self.dims.canvas))
                 .unwrap_or(self.active_canvas)
-                .clamp(1, CANVAS)
+                .clamp(1, self.dims.canvas)
         } else {
-            CANVAS
+            self.dims.canvas
         };
         self.dispatch_and_wait(|enc| {
             enc.partial_lm_m = partial_lm_m;

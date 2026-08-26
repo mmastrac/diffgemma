@@ -579,7 +579,8 @@ pub fn propose_block(
             rt.check_logits_finite()?;
             let step_elapsed = step_started.elapsed();
             let step_ms = step_elapsed.as_secs_f64() * 1000.0;
-            let readback_bytes = StepRuntime::denoise_step_host_readback_bytes(check_logits);
+            let readback_bytes =
+                StepRuntime::denoise_step_host_readback_bytes(check_logits, rt.dims());
             let mut forward = ForwardTelemetry::monolithic_gpu_step(readback_bytes);
             rt.fill_expert_forward_telemetry(&mut forward);
             ts.session_telemetry.steps.push(StepPhaseTelemetry {

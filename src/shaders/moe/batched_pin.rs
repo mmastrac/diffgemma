@@ -1,6 +1,6 @@
 //! Tier-1 pin: batched MoE pipeline stages with real routed jobs from denoise capture.
 
-use crate::metal::{HID, LayerOffsets, MOE_FF, N_EXPERTS, RouteScratch, layer_moe_block_jobs};
+use crate::metal::{LayerOffsets, MOE_FF, N_EXPERTS, RouteScratch, layer_moe_block_jobs};
 use crate::shaders::QuantFormat;
 use crate::shaders::cpu::gemm_linear_grouped::gemm_linear_grouped_cpu;
 use crate::shaders::cpu::moe_scatter_weighted::moe_scatter_weighted;
@@ -300,13 +300,14 @@ pub fn verify_batched_stages_cpu(
     MoeBatchedPinStageCos,
     GateUpDiffAnalysis,
 ) {
-    let hidden = HID;
-    let moe_ff = MOE_FF as usize;
+    let dims = crate::metal::ModelDims::reference();
+    let hidden = dims.hid;
+    let moe_ff = dims.moe_ff;
     let slots = route.num_slots as usize;
     let token_list = &route.token_list[..slots];
 
     let gather_cpu = cpu_gather_slots(moe_in, token_list, hidden);
-    let (gate_jobs, down_jobs) = layer_moe_block_jobs(layer_off, format);
+    let (gate_jobs, down_jobs) = layer_moe_block_jobs(layer_off, format, &dims);
     let row_start = &route.row_start[..=N_EXPERTS];
 
     let gate_up_cpu = gemm_linear_grouped_cpu(

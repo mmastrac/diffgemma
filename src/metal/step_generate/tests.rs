@@ -299,14 +299,18 @@ fn begin_turn_after_abandoned_turn_prefills_the_new_prompt() {
 
 #[test]
 fn p21_denoise_readback_under_1mb() {
-    let bytes = StepRuntime::denoise_step_host_readback_bytes(false);
+    let bytes =
+        StepRuntime::denoise_step_host_readback_bytes(false, &crate::metal::ModelDims::reference());
     assert!(
         bytes <= 1024 * 1024,
         "hot-path readback {bytes} B exceeds 1 MiB"
     );
     assert_eq!(bytes, (StepRuntime::CANVAS_STATE_BYTES * 2) as u64);
     if logits_finite_check_enabled() {
-        let with_check = StepRuntime::denoise_step_host_readback_bytes(true);
+        let with_check = StepRuntime::denoise_step_host_readback_bytes(
+            true,
+            &crate::metal::ModelDims::reference(),
+        );
         assert!(with_check <= 1024 * 1024);
     }
 }
