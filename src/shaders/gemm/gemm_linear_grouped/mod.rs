@@ -516,6 +516,7 @@ crate::kernel_spec! {
     pub const SPEC {
         name: "gemm_linear_grouped",
         entry: "gemm_linear_grouped",
+        source: SHADER,
         quant_formats: &[
             QuantFormat::Q4Affine,
             QuantFormat::NvFp4,

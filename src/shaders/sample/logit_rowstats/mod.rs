@@ -141,6 +141,7 @@ crate::kernel_spec! {
     pub const SPEC {
         name: "logit_rowstats",
         entry: "logit_rowstats",
+        source: SHADER,
         quant_formats: &[QuantFormat::Q4Affine],
         fc: &[],
         variants: KernelVariants::Elementwise,

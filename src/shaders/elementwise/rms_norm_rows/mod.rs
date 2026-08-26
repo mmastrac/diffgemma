@@ -334,6 +334,7 @@ crate::kernel_spec! {
     pub const SPEC {
         name: "rms_norm_rows",
         entry: "rms_norm_rows",
+        source: SHADER,
         quant_formats: &[QuantFormat::Q4Affine],
         fc: &[(4, "K_AFFINE")],
         variants: KernelVariants::RmsNormRows {

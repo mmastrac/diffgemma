@@ -325,6 +325,7 @@ crate::kernel_spec! {
     pub const SPEC {
         name: "moe_router",
         entry: "moe_router",
+        source: SHADER,
         quant_formats: &[QuantFormat::Q4Affine],
         fc: &[],
         variants: KernelVariants::Elementwise,

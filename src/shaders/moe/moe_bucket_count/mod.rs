@@ -125,6 +125,7 @@ crate::kernel_spec! {
     pub const SPEC {
         name: "moe_bucket_count",
         entry: "moe_bucket_count",
+        source: SHADER,
         quant_formats: &[QuantFormat::Q4Affine],
         fc: &[],
         variants: KernelVariants::Elementwise,

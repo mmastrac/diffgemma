@@ -436,6 +436,7 @@ crate::kernel_spec! {
     pub const SPEC {
         name: "attention_topk",
         entry: "attn_topk_softmax",
+        source: SHADER_TOPK,
         quant_formats: &[QuantFormat::Q4Affine],
         fc: &[],
         variants: KernelVariants::Elementwise,

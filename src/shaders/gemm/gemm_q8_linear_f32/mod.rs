@@ -199,6 +199,7 @@ crate::kernel_spec! {
     pub const SPEC {
         name: "gemm_q8_linear_f32",
         entry: "gemm_q8_linear_f32",
+        source: SHADER,
         quant_formats: &[QuantFormat::Q4Affine],
         fc: &[],
         variants: KernelVariants::Elementwise,

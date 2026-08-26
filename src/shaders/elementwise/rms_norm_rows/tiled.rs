@@ -242,6 +242,7 @@ crate::kernel_spec! {
     pub const SPEC {
         name: "rms_norm_rows_tiled",
         entry: "rms_norm_rows_tiled",
+        source: SHADER,
         quant_formats: &[QuantFormat::Q4Affine],
         fc: &[(4, "K_IN_DTYPE")],
         variants: KernelVariants::RmsNormRowsTiled {

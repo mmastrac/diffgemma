@@ -697,6 +697,7 @@ crate::kernel_spec! {
     pub const SPEC {
         name: "attention_gemm",
         entry: "attn_gemm_qk",
+        source: SHADER,
         quant_formats: &[QuantFormat::Q4Affine],
         fc: &[],
         variants: KernelVariants::Elementwise,

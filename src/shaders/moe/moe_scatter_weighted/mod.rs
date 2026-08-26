@@ -224,6 +224,7 @@ crate::kernel_spec! {
     pub const SPEC {
         name: "moe_scatter_weighted",
         entry: "moe_scatter_weighted",
+        source: SHADER,
         quant_formats: &[QuantFormat::Q4Affine],
         fc: &[],
         variants: KernelVariants::Elementwise,

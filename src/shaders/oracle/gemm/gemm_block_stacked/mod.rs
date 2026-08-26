@@ -648,6 +648,7 @@ crate::kernel_spec! {
     pub const SPEC {
         name: "gemm_block_stacked",
         entry: "gemm_block_stacked",
+        source: SHADER,
         quant_formats: &[
             QuantFormat::Q4Affine,
             QuantFormat::NvFp4,

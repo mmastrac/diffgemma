@@ -7,6 +7,7 @@ crate::kernel_spec! {
     pub const SPEC {
         name: "gemm_block",
         entry: "gemm_block",
+        source: SHADER,
         quant_formats: &[
             QuantFormat::Q4Affine,
             QuantFormat::Q8,
