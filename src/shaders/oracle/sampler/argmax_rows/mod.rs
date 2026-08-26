@@ -75,7 +75,7 @@ pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
 pub fn pipeline_for(
     ctx: &crate::metal::device::MetalContext,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_kernel(SHADER, ENTRY)
+    Ok(ctx.compile_kernel(SHADER, ENTRY)?)
 }
 
 #[cfg(target_os = "macos")]

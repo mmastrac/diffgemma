@@ -132,7 +132,7 @@ impl CachedLinear {
         let buf = pool
             .allocate(device, bytes)
             .expect("Metal weight buffer alloc failed");
-        BufferPool::write_bf16_ptr(&buf, self.w.as_slice().as_ptr(), self.w.len());
+        BufferPool::write_bf16(&buf, self.w.as_slice());
         *slot = Some(buf.clone());
         if let Some(acc) = upload_bytes {
             *acc += bytes as u64;

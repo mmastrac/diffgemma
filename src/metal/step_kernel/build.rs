@@ -59,7 +59,7 @@ fn shared_step_pipelines(
     let pipelines = StepPipelines::new(ctx, variant, fmt)?;
     let leaked: &'static StepPipelines = Box::leak(Box::new(pipelines));
     guard.insert(key, leaked);
-    crate::metal::pipeline_cache::PipelineArchiveCache::flush_global();
+    gpukit::metal::PipelineArchiveCache::flush_global();
     Ok(leaked)
 }
 

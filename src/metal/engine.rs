@@ -80,7 +80,7 @@ impl GpuDecoderEngine {
         let kernels = GpuKernels::new(&ctx)?;
         let attention = GpuAttentionKernels::new(&ctx)?;
         let sampler_kernels = GpuSamplerKernels::new(&ctx)?;
-        crate::metal::pipeline_cache::PipelineArchiveCache::flush_global();
+        gpukit::metal::PipelineArchiveCache::flush_global();
         Ok(Self {
             ctx,
             pool,
