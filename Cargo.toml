@@ -32,6 +32,9 @@ shell-download = "0.22"
 # Integrity pin for external HF-safetensors refs in layered packs (hash of the
 # safetensors header only, not the multi-GiB payload — see dgq/hf_resolve.rs).
 sha2 = "0.10"
+# Link-time kernel registry: each kernel's SPEC scatters into the gathered
+# manifest (src/shaders/common/manifest.rs).
+scattered-collect = "0.22"
 
 # Host-side test code runs real inference (smokes, KV fingerprints over
 # hundreds of MB); at opt-level 0 the per-byte loops dominate suite wall.

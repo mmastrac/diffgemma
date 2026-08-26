@@ -111,10 +111,7 @@ impl std::ops::Deref for MetalContext {
 
 impl MetalContext {
     pub fn new() -> Result<Self, Error> {
-        let inner = gk::Context::new(gk::ContextConfig {
-            includes: crate::shaders::expand::INCLUDES,
-            cache: cache_config(),
-        })?;
+        let inner = gk::Context::new(cache_config())?;
         // Record the working-set cap so the q8-KV auto policy (flags::kv_q8)
         // can scale to this device's RAM.
         crate::flags::set_gpu_working_set_cap(inner.device.recommendedMaxWorkingSetSize());

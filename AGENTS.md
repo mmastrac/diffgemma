@@ -146,7 +146,8 @@ knows `.metal` paths; `src/metal/` (the runtime) consumes pipelines via
 - FC 1–3 are global (shape-assert, dump, quant-format); local axes are
   registered in each kernel's `SPEC` (see `diffgemma manifest`).
 - Quoted `#include "x.metal"` resolves from `src/shaders/include/` at
-  runtime (table in `common/expand.rs`, mechanism in `crates/gpukit`); the
+  runtime (folder registered whole in `common/expand.rs` via
+  `gpukit::register_includes!`; adding a header is adding the file); the
   pipeline binary archive keys on the whole-tree hash, so shader edits can
   never be served stale — but if golden regresses right after a `.metal`
   edit, **rebuild clean before diagnosing** (a mid-sequence binary can
@@ -235,7 +236,8 @@ never two model-loading PROCESSES at once.
   attention scale, V aliased from raw k_proj on full layers). These are
   checkpoint-specific and several are counterintuitive — do not "correct"
   them from general Gemma knowledge without checking the reference.
-- **Kernel FC registration:** each kernel's `SPEC` const;
+- **Kernel FC registration:** each kernel's `SPEC` const, scattered into
+  the gathered manifest map beside its declaration (no central list);
   `diffgemma manifest` renders the full TOML view.
 - **Env flags:** `src/flags/` (mod.rs = registry + parse, accessors.rs =
   read surface) is the single registry — check it before inventing any

@@ -426,3 +426,7 @@ mod tests {
         min_cos = 0.999,
     }
 }
+
+#[scattered_collect::scatter(crate::shaders::common::manifest::MANIFEST)]
+static SPEC_REG: (&'static str, &'static crate::shaders::manifest::KernelSpec) =
+    (SPEC.entry, &SPEC);

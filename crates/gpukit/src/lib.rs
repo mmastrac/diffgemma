@@ -5,10 +5,13 @@
 //!
 //! The crate holds mechanism only. Anything policy-shaped — which axes a
 //! kernel specializes on, cache configuration, flag parsing — belongs to the
-//! caller and arrives through [`metal::ContextConfig`] and plain arguments.
+//! caller and arrives through [`metal::CacheConfig`], [`register_includes!`],
+//! and plain arguments.
 
 mod error;
 pub use error::Error;
+
+pub mod includes;
 
 #[cfg(target_os = "macos")]
 pub mod metal;

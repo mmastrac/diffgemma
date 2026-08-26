@@ -7,7 +7,7 @@ mod expand;
 mod pipeline_cache;
 
 pub use buffer::BufferPool;
-pub use context::{ComputePipeline, Context, ContextConfig, FcValues, source_hash};
+pub use context::{ComputePipeline, Context, FcValues, source_hash};
 pub use dispatch::{
     dispatch_1d, dispatch_1d_ranged, dispatch_grid, dispatch_rows, div_up, set_bytes,
 };

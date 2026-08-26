@@ -1018,3 +1018,7 @@ mod tests {
         assert!(max < 0.05, "dgq qkv stacked vs split max_abs={max}");
     }
 }
+
+#[scattered_collect::scatter(crate::shaders::common::manifest::MANIFEST)]
+static SPEC_REG: (&'static str, &'static crate::shaders::manifest::KernelSpec) =
+    (SPEC.entry, &SPEC);
