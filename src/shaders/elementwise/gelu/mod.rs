@@ -142,14 +142,15 @@ fn set_bytes<T>(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, value: &
 #[cfg(target_os = "macos")]
 use crate::shaders::gpu_common::div_up;
 
-/// Manifest registration; collected in common/manifest.rs::MANIFEST.
-pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
-    name: "gelu",
-    entry: "gelu",
-    quant_formats: &[crate::shaders::variant::QuantFormat::Q4Affine],
-    fc: &[],
-    variants: crate::shaders::manifest::KernelVariants::Gelu,
-};
+crate::kernel_spec! {
+    pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
+        name: "gelu",
+        entry: "gelu",
+        quant_formats: &[crate::shaders::variant::QuantFormat::Q4Affine],
+        fc: &[],
+        variants: crate::shaders::manifest::KernelVariants::Gelu,
+    };
+}
 
 #[cfg(test)]
 mod tests {
@@ -179,5 +180,3 @@ mod tests {
         min_cos = 0.9999,
     }
 }
-
-crate::register_kernel_specs!(SPEC);

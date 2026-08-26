@@ -22,22 +22,29 @@ use scattered_collect::{ScatteredMap, gather};
 #[gather]
 pub static MANIFEST: ScatteredMap<&'static str, &'static KernelSpec>;
 
-/// Scatter one or more `SPEC` consts into [`MANIFEST`], keyed by entry name.
-/// Invoke beside the declarations: `crate::register_kernel_specs!(SPEC);`
+/// Declare a `KernelSpec` const and scatter it into [`MANIFEST`], keyed by
+/// its entry name. Wraps the declaration verbatim, so a spec cannot exist
+/// without being registered:
+///
+/// ```ignore
+/// crate::kernel_spec! {
+///     pub const SPEC: crate::shaders::manifest::KernelSpec = ...;
+/// }
+/// ```
 #[macro_export]
-macro_rules! register_kernel_specs {
-    ($($spec:ident),+ $(,)?) => {
-        $(
-            // The const block scopes the static, so one module can register
-            // several specs without inventing unique names.
-            const _: () = {
-                #[::scattered_collect::scatter($crate::shaders::common::manifest::MANIFEST)]
-                static REG: (
-                    &'static str,
-                    &'static $crate::shaders::common::manifest::KernelSpec,
-                ) = ($spec.entry, &$spec);
-            };
-        )+
+macro_rules! kernel_spec {
+    ($(#[$meta:meta])* $vis:vis const $name:ident: $ty:ty = $spec:expr;) => {
+        $(#[$meta])*
+        $vis const $name: $ty = $spec;
+        // The const block scopes the static, so one module can declare
+        // several specs without inventing unique names.
+        const _: () = {
+            #[::scattered_collect::scatter($crate::shaders::common::manifest::MANIFEST)]
+            static REG: (
+                &'static str,
+                &'static $crate::shaders::common::manifest::KernelSpec,
+            ) = ($name.entry, &$name);
+        };
     };
 }
 

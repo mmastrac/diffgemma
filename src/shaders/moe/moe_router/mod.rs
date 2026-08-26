@@ -321,13 +321,12 @@ pub mod cpu;
 pub const TOPK_ENTRY: &str = "moe_router_topk";
 pub const TOPK_SHADER: &str = include_str!("moe_router_topk.metal");
 
-/// Manifest registration; collected in common/manifest.rs::MANIFEST.
-pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
-    name: "moe_router",
-    entry: "moe_router",
-    quant_formats: &[crate::shaders::variant::QuantFormat::Q4Affine],
-    fc: &[],
-    variants: crate::shaders::manifest::KernelVariants::Elementwise,
-};
-
-crate::register_kernel_specs!(SPEC);
+crate::kernel_spec! {
+    pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
+        name: "moe_router",
+        entry: "moe_router",
+        quant_formats: &[crate::shaders::variant::QuantFormat::Q4Affine],
+        fc: &[],
+        variants: crate::shaders::manifest::KernelVariants::Elementwise,
+    };
+}
