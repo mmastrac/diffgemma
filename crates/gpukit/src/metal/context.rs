@@ -33,6 +33,7 @@ pub struct FcValues {
     bools: Vec<(u32, bool)>,
     uints: Vec<(u32, u32)>,
     ulongs: Vec<(u32, u64)>,
+    floats: Vec<(u32, f32)>,
 }
 
 impl FcValues {
@@ -52,6 +53,11 @@ impl FcValues {
 
     pub fn set_ulong(&mut self, index: u32, value: u64) -> &mut Self {
         self.ulongs.push((index, value));
+        self
+    }
+
+    pub fn set_float(&mut self, index: u32, value: f32) -> &mut Self {
+        self.floats.push((index, value));
         self
     }
 
@@ -78,6 +84,13 @@ impl FcValues {
                     *index as usize,
                 );
             }
+            for (index, value) in &self.floats {
+                fc.setConstantValue_type_atIndex(
+                    std::ptr::NonNull::from_ref(value).cast(),
+                    MTLDataType::Float,
+                    *index as usize,
+                );
+            }
         }
     }
 
@@ -92,6 +105,9 @@ impl FcValues {
         }
         for (index, value) in &self.ulongs {
             let _ = write!(s, "_l{index}={value}");
+        }
+        for (index, value) in &self.floats {
+            let _ = write!(s, "_f{index}={:08x}", value.to_bits());
         }
         s
     }

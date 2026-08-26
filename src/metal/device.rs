@@ -137,6 +137,29 @@ impl MetalContext {
         extra_bools: &[crate::shaders::variant::FcBool],
         extra_uints: &[crate::shaders::variant::FcUInt],
     ) -> Result<ComputePipeline, Error> {
+        self.compile_subkernel_ex_floats(
+            source,
+            entry,
+            variant,
+            extra_label,
+            extra_bools,
+            extra_uints,
+            &[],
+        )
+    }
+
+    /// As `compile_subkernel_ex` with float axes (e.g. RoPE theta).
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile_subkernel_ex_floats(
+        &self,
+        source: &str,
+        entry: &str,
+        variant: KernelVariant,
+        extra_label: &str,
+        extra_bools: &[crate::shaders::variant::FcBool],
+        extra_uints: &[crate::shaders::variant::FcUInt],
+        extra_floats: &[crate::shaders::variant::FcFloat],
+    ) -> Result<ComputePipeline, Error> {
         let mut fc = gk::FcValues::new();
         fc.set_bool(1, variant.shape_assert)
             .set_uint(2, variant.dump_stage)
@@ -149,6 +172,9 @@ impl MetalContext {
         }
         for extra in extra_uints {
             fc.set_uint(extra.index, extra.value);
+        }
+        for extra in extra_floats {
+            fc.set_float(extra.index, extra.value);
         }
         let label = variant.cache_label_extra(entry, extra_label);
         Ok(self.inner.compile_specialized(source, entry, &fc, &label)?)

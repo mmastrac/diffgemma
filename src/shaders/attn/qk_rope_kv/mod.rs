@@ -275,12 +275,37 @@ pub fn pipeline_for_kv(
     ctx: &crate::metal::device::MetalContext,
     variant: KernelVariant,
     fmt: crate::shaders::kv_quant::KvFormat,
+    dims: &crate::metal::ModelDims,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    let uints = [crate::shaders::variant::FcUInt {
-        index: 4,
-        value: fmt.code(),
-    }];
-    ctx.compile_subkernel_ex(SHADER, ENTRY, variant, fmt.label(), &[], &uints)
+    let uints = [
+        crate::shaders::variant::FcUInt {
+            index: 4,
+            value: fmt.code(),
+        },
+        crate::shaders::variant::FcUInt {
+            index: 11,
+            value: dims.rot_sliding as u32,
+        },
+        crate::shaders::variant::FcUInt {
+            index: 12,
+            value: dims.rot_full as u32,
+        },
+    ];
+    let floats = rope_theta_fcs(dims);
+    ctx.compile_subkernel_ex_floats(SHADER, ENTRY, variant, fmt.label(), &[], &uints, &floats)
+}
+
+fn rope_theta_fcs(dims: &crate::metal::ModelDims) -> [crate::shaders::variant::FcFloat; 2] {
+    [
+        crate::shaders::variant::FcFloat {
+            index: 5,
+            value: dims.rope_theta_sliding as f32,
+        },
+        crate::shaders::variant::FcFloat {
+            index: 6,
+            value: dims.rope_theta_full as f32,
+        },
+    ]
 }
 
 /// Sliding layers also write post-RoPE K / normed V into the f32 side ring (buffer 9).
@@ -289,17 +314,36 @@ pub fn pipeline_for_kv_side(
     ctx: &crate::metal::device::MetalContext,
     variant: KernelVariant,
     fmt: crate::shaders::kv_quant::KvFormat,
+    dims: &crate::metal::ModelDims,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
-    let uints = [crate::shaders::variant::FcUInt {
-        index: 4,
-        value: fmt.code(),
-    }];
+    let uints = [
+        crate::shaders::variant::FcUInt {
+            index: 4,
+            value: fmt.code(),
+        },
+        crate::shaders::variant::FcUInt {
+            index: 11,
+            value: dims.rot_sliding as u32,
+        },
+        crate::shaders::variant::FcUInt {
+            index: 12,
+            value: dims.rot_full as u32,
+        },
+    ];
     let bools = [crate::shaders::variant::FcBool {
         index: 30,
         value: true,
     }];
     let label = format!("{}_side", fmt.label());
-    ctx.compile_subkernel_ex(SHADER, ENTRY, variant, &label, &bools, &uints)
+    ctx.compile_subkernel_ex_floats(
+        SHADER,
+        ENTRY,
+        variant,
+        &label,
+        &bools,
+        &uints,
+        &rope_theta_fcs(dims),
+    )
 }
 
 #[cfg(target_os = "macos")]

@@ -7,6 +7,13 @@ using namespace metal;
 #include "attention_device.metal"
 #include "sampler_device.metal"
 
+// RoPE geometry from config.json; unset (tier-1 harnesses) keeps the
+// reference checkpoint values via the fallbacks below.
+constant float ROPE_THETA_SLIDING_FC [[function_constant(5)]];
+constant float ROPE_THETA_FULL_FC [[function_constant(6)]];
+constant uint ROPE_ROT_SLIDING_FC [[function_constant(11)]];
+constant uint ROPE_ROT_FULL_FC [[function_constant(12)]];
+
 // Session-wide KV storage format: q8 (group-32) for long-context sessions,
 // f16 otherwise. Unset (oracle/test compiles) = f16.
 constant uint KV_FMT_FC [[function_constant(4)]];
@@ -58,8 +65,12 @@ kernel void qk_rope_kv(
     // a LIVE sliding-ring slot and clobbers the oldest window content).
     const bool kv_write = pos < P.kv_write_end;
     const bool full = L->is_full != 0u;
-    const uint rot = full ? (hd / 4u) : hd;
-    const float theta = full ? 1.0e6f : 1.0e4f;
+    const uint rot = full
+        ? (is_function_constant_defined(ROPE_ROT_FULL_FC) ? ROPE_ROT_FULL_FC : (hd / 4u))
+        : (is_function_constant_defined(ROPE_ROT_SLIDING_FC) ? ROPE_ROT_SLIDING_FC : hd);
+    const float theta = full
+        ? (is_function_constant_defined(ROPE_THETA_FULL_FC) ? ROPE_THETA_FULL_FC : 1.0e6f)
+        : (is_function_constant_defined(ROPE_THETA_SLIDING_FC) ? ROPE_THETA_SLIDING_FC : 1.0e4f);
 
     const bool isQ = h < dims.n_q_heads;
     const bool isK = !isQ && h < (dims.n_q_heads + nkv);

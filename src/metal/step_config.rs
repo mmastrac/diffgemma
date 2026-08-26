@@ -38,6 +38,12 @@ pub struct ModelDims {
     /// Layer indices with full (global) attention; the rest slide.
     pub full_layers: Vec<usize>,
     pub rms_eps: f64,
+    pub rope_theta_sliding: f64,
+    pub rope_theta_full: f64,
+    /// Rotated dims per layer kind (sliding: the whole head; full: the
+    /// partial_rotary_factor slice of it).
+    pub rot_sliding: usize,
+    pub rot_full: usize,
     /// Causal sub-chunks batched into one prefill forward (see PREFILL_SUBS).
     pub prefill_subs: usize,
 }
@@ -63,6 +69,10 @@ impl ModelDims {
             full_head_dim: 512,
             full_layers: sk::FULL_LAYERS.to_vec(),
             rms_eps: 1e-6,
+            rope_theta_sliding: 1.0e4,
+            rope_theta_full: 1.0e6,
+            rot_sliding: 256,
+            rot_full: 128,
             prefill_subs: sk::PREFILL_SUBS,
         }
     }
@@ -85,6 +95,15 @@ impl ModelDims {
             full_head_dim: t.global_head_dim,
             full_layers: full_layers_from_config(&t.layer_types),
             rms_eps: t.rms_norm_eps,
+            rope_theta_sliding: t.rope_parameters.sliding_attention.rope_theta,
+            rope_theta_full: t.rope_parameters.full_attention.rope_theta,
+            rot_sliding: t.head_dim,
+            rot_full: ((t.global_head_dim as f64)
+                * t.rope_parameters
+                    .full_attention
+                    .partial_rotary_factor
+                    .unwrap_or(0.25))
+            .round() as usize,
             prefill_subs: crate::metal::step_kernel::PREFILL_SUBS,
         }
     }
@@ -155,7 +174,11 @@ impl ModelDims {
         for &l in &self.full_layers {
             eat(l as u64);
         }
+        eat(self.rot_sliding as u64);
+        eat(self.rot_full as u64);
         eat(self.rms_eps.to_bits());
+        eat(self.rope_theta_sliding.to_bits());
+        eat(self.rope_theta_full.to_bits());
         h
     }
 }
