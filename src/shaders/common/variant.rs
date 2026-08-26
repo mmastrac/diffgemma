@@ -166,3 +166,10 @@ pub struct FcUInt {
     pub index: u32,
     pub value: u32,
 }
+
+/// Optional float function constant beyond the shared triple (index ≥ 4).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FcFloat {
+    pub index: u32,
+    pub value: f32,
+}

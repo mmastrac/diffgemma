@@ -1050,10 +1050,10 @@ impl StepPipelines {
             gemm_q8_rowk_acc_f32,
             gemm_bf16_rowk_acc_f32,
             f32_to_half_scale,
-            qk_rope_kv: crate::shaders::qk_rope_kv::pipeline_for_kv(ctx, prod, fmt)?,
+            qk_rope_kv: crate::shaders::qk_rope_kv::pipeline_for_kv(ctx, prod, fmt, dims)?,
             qk_rope_kv_side: if crate::flags::prefill_kv_f32_enabled() {
                 Some(crate::shaders::qk_rope_kv::pipeline_for_kv_side(
-                    ctx, prod, fmt,
+                    ctx, prod, fmt, dims,
                 )?)
             } else {
                 None
