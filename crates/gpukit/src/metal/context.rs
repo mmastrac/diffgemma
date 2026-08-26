@@ -10,16 +10,6 @@ use objc2_metal::{
 };
 use std::sync::Arc;
 
-/// Everything a [`Context`] needs from the application: the shared-header
-/// table for `#include` expansion and the pipeline-cache settings.
-#[derive(Clone)]
-pub struct ContextConfig {
-    /// Shared shader headers by include name, resolved during
-    /// [`Context::compile_library`]. An unknown `#include "name"` panics.
-    pub includes: &'static [(&'static str, &'static str)],
-    pub cache: CacheConfig,
-}
-
 /// Stable (no-random-seed) hash of a shader source for cache-label derivation.
 pub fn source_hash(source: &str) -> u64 {
     // FNV-1a: deterministic across runs (std DefaultHasher is randomized).
@@ -111,24 +101,26 @@ impl FcValues {
 pub struct Context {
     pub device: Retained<ProtocolObject<dyn MTLDevice>>,
     pub queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
-    config: ContextConfig,
+    includes: Vec<(&'static str, &'static str)>,
     cache: Arc<PipelineArchiveCache>,
 }
 
 impl Context {
-    /// Open the system default device. The first context in the process fixes
-    /// the pipeline cache's settings; later contexts share that cache and
-    /// their `cache` config is ignored.
-    pub fn new(config: ContextConfig) -> Result<Self, Error> {
+    /// Open the system default device. Shared headers come from the folders
+    /// registered with [`crate::register_includes!`]. The first context in
+    /// the process fixes the pipeline cache's settings; later contexts share
+    /// that cache and their `cache` config is ignored.
+    pub fn new(cache: CacheConfig) -> Result<Self, Error> {
+        let includes = crate::includes::include_table()?;
         let device = MTLCreateSystemDefaultDevice().ok_or(Error::Gpu("no Metal device"))?;
         let queue = device
             .newCommandQueue()
             .ok_or(Error::Gpu("failed to create Metal command queue"))?;
-        let cache = PipelineArchiveCache::shared(&device, &config.cache)?;
+        let cache = PipelineArchiveCache::shared(&device, &cache)?;
         Ok(Self {
             device,
             queue,
-            config,
+            includes,
             cache,
         })
     }
@@ -138,7 +130,7 @@ impl Context {
         &self,
         source: &str,
     ) -> Result<Retained<ProtocolObject<dyn MTLLibrary>>, Error> {
-        let ns_source = NSString::from_str(&expand(source, self.config.includes));
+        let ns_source = NSString::from_str(&expand(source, &self.includes));
         self.device
             .newLibraryWithSource_options_error(&ns_source, None)
             .map_err(compile_error)
@@ -236,16 +228,13 @@ kernel void pc_k2(device float* o [[buffer(0)]], uint i [[thread_position_in_gri
 kernel void pc_k3(device float* o [[buffer(0)]], uint i [[thread_position_in_grid]]) { o[i] = 3.0f; }
 ";
 
-    fn test_config() -> ContextConfig {
-        ContextConfig {
-            includes: &[],
-            cache: CacheConfig {
-                enabled: true,
-                dir: Some(std::env::temp_dir().join("gpukit-test-pipeline-cache")),
-                namespace: "gpukit-test",
-                key: 0x67706b74,
-                verbose: false,
-            },
+    fn test_config() -> CacheConfig {
+        CacheConfig {
+            enabled: true,
+            dir: Some(std::env::temp_dir().join("gpukit-test-pipeline-cache")),
+            namespace: "gpukit-test",
+            key: 0x67706b74,
+            verbose: false,
         }
     }
 

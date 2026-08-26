@@ -15,3 +15,7 @@ pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest:
     fc: &[(4, "IS_FULL_LAYER"), (5, "GEMM_N"), (6, "GEMM_K")],
     variants: crate::shaders::manifest::KernelVariants::GemmBlock,
 };
+
+#[scattered_collect::scatter(crate::shaders::common::manifest::MANIFEST)]
+static SPEC_REG: (&'static str, &'static crate::shaders::manifest::KernelSpec) =
+    (SPEC.entry, &SPEC);

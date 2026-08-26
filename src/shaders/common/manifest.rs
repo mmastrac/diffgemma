@@ -1,9 +1,11 @@
 //! Kernel FC axis manifest — validity contract for pipeline specialization.
 //!
 //! Each registered kernel declares its own `SPEC` const in its kernel
-//! directory (colocated with the Metal source); `MANIFEST` below collects
-//! them. This module is the enforcement layer: invalid tuples cannot be
-//! compiled, and tier-1 tests enumerate every valid variant row.
+//! directory (colocated with the Metal source) and scatters it into the
+//! gathered `MANIFEST` map beside the declaration — there is no central
+//! list to keep in sync. This module is the enforcement layer: invalid
+//! tuples cannot be compiled, and tier-1 tests enumerate every valid
+//! variant row.
 //!
 //! The human-readable TOML form is GENERATED from these specs at runtime
 //! (`render_toml()`, `diffgemma manifest`) — there is no checked-in
@@ -15,11 +17,10 @@
 
 use super::variant::{ElemDtype, FcBool, FcUInt, KernelVariant, QuantFormat};
 use crate::Error;
+use scattered_collect::{ScatteredMap, gather};
 
-/// Collected kernel specs (each lives beside its kernel).
-pub struct Manifest {
-    pub kernels: &'static [&'static KernelSpec],
-}
+#[gather]
+pub static MANIFEST: ScatteredMap<&'static str, &'static KernelSpec>;
 
 pub struct KernelSpec {
     pub name: &'static str,
@@ -65,41 +66,15 @@ pub struct SwigluSplitVariant {
     pub in_place: bool,
 }
 
-pub static MANIFEST: Manifest = Manifest {
-    kernels: &[
-        &crate::shaders::rms_norm_rows::SPEC,
-        &crate::shaders::rms_norm_rows_tiled::SPEC,
-        &crate::shaders::swiglu::SPEC,
-        &crate::shaders::swiglu::SPEC_MOE_GATE_UP,
-        &crate::shaders::gelu::SPEC,
-        &crate::shaders::embed_gather::SPEC,
-        &crate::shaders::logit_rowstats::SPEC,
-        &crate::shaders::sc_prob_cols::SPEC,
-        &crate::shaders::sample_rowstats::SPEC,
-        &crate::shaders::sample_commit::SPEC,
-        &crate::shaders::sample_apply::SPEC,
-        &crate::shaders::sample_write::SPEC,
-        &crate::shaders::qk_rope_kv::SPEC,
-        &crate::shaders::attention::SPEC,
-        &crate::shaders::attention_gemm::SPEC,
-        &crate::shaders::attention_topk::SPEC,
-        &crate::shaders::moe_router::SPEC,
-        &crate::shaders::moe_bucket_count::SPEC,
-        &crate::shaders::moe_bucket_fill::SPEC,
-        &crate::shaders::moe_grouped::SPEC,
-        &crate::shaders::moe_scatter_weighted::SPEC,
-        &crate::shaders::gemm_linear_grouped::SPEC,
-        &crate::shaders::gemm_block_grouped::SPEC,
-        &crate::shaders::gemm_linear_f32::SPEC,
-        &crate::shaders::gemm_q8_linear_f32::SPEC,
-        &crate::shaders::oracle::gemm::gemm_block::SPEC,
-        &crate::shaders::gemm_block_stacked::SPEC,
-        &crate::shaders::gemm_rowk::SPEC,
-    ],
-};
-
 pub fn spec_by_entry(entry: &str) -> Option<&'static KernelSpec> {
-    MANIFEST.kernels.iter().copied().find(|k| k.entry == entry)
+    MANIFEST.get(entry).copied()
+}
+
+/// Every registered spec, sorted by name for deterministic output.
+pub fn specs() -> Vec<&'static KernelSpec> {
+    let mut kernels: Vec<&'static KernelSpec> = MANIFEST.values().copied().collect();
+    kernels.sort_by_key(|k| k.name);
+    kernels
 }
 
 /// Render the collected specs as the human-readable TOML manifest.
@@ -114,7 +89,7 @@ pub fn render_toml() -> String {
          # Pipeline construction in Rust MUST only build tuples listed under [[kernel.variants]].\n\
          # Tier-1 tests MUST cover every [[kernel.variants]] row (see manifest.rs tests).\n",
     );
-    for k in MANIFEST.kernels {
+    for k in specs() {
         out.push_str(&format!(
             "\n[[kernel]]\nname = \"{}\"\nentry = \"{}\"\n",
             k.name, k.entry
@@ -326,14 +301,14 @@ mod tests {
     #[test]
     fn manifest_entries_unique() {
         let mut names = std::collections::HashSet::new();
-        for k in MANIFEST.kernels {
+        for k in specs() {
             assert!(names.insert(k.entry), "duplicate entry {}", k.entry);
         }
     }
 
     #[test]
     fn all_fc_maps_collision_free() {
-        for k in MANIFEST.kernels {
+        for k in specs() {
             let indices: Vec<u32> = k.fc.iter().map(|(idx, _)| *idx).collect();
             assert_no_fc_collisions(k.entry, &indices).unwrap();
         }
@@ -341,7 +316,7 @@ mod tests {
 
     #[test]
     fn all_manifest_variants_enumerated() {
-        for k in MANIFEST.kernels {
+        for k in specs() {
             match k.variants {
                 KernelVariants::RmsNormRows { rows } => assert_eq!(rows.len(), 2),
                 KernelVariants::RmsNormRowsTiled { rows } => assert_eq!(rows.len(), 2),
@@ -360,7 +335,7 @@ mod tests {
         let toml = render_toml();
         assert_eq!(
             toml.matches("[[kernel]]").count(),
-            MANIFEST.kernels.len(),
+            MANIFEST.len(),
             "one [[kernel]] block per spec"
         );
         assert!(toml.contains("K_QUANT_FORMAT"));
