@@ -23,19 +23,32 @@ use scattered_collect::{ScatteredMap, gather};
 pub static MANIFEST: ScatteredMap<&'static str, &'static KernelSpec>;
 
 /// Declare a `KernelSpec` const and scatter it into [`MANIFEST`], keyed by
-/// its entry name. Wraps the declaration verbatim, so a spec cannot exist
-/// without being registered:
+/// its entry name — a spec cannot exist without being registered. The macro
+/// supplies the type and brings this module's names plus `QuantFormat` /
+/// `ElemDtype` into scope for the field values:
 ///
 /// ```ignore
 /// crate::kernel_spec! {
-///     pub const SPEC: crate::shaders::manifest::KernelSpec = ...;
+///     pub const SPEC {
+///         name: "gelu",
+///         entry: "gelu",
+///         quant_formats: &[QuantFormat::Q4Affine],
+///         fc: &[],
+///         variants: KernelVariants::Gelu,
+///     }
 /// }
 /// ```
 #[macro_export]
 macro_rules! kernel_spec {
-    ($(#[$meta:meta])* $vis:vis const $name:ident: $ty:ty = $spec:expr;) => {
+    ($(#[$meta:meta])* $vis:vis const $name:ident { $($fields:tt)* }) => {
         $(#[$meta])*
-        $vis const $name: $ty = $spec;
+        $vis const $name: $crate::shaders::common::manifest::KernelSpec = {
+            #[allow(unused_imports)]
+            use $crate::shaders::common::manifest::*;
+            #[allow(unused_imports)]
+            use $crate::shaders::common::variant::{ElemDtype, QuantFormat};
+            KernelSpec { $($fields)* }
+        };
         // The const block scopes the static, so one module can declare
         // several specs without inventing unique names.
         const _: () = {

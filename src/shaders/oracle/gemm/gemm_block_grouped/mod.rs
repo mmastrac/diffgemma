@@ -363,16 +363,16 @@ pub fn gpu_on_blob(
 }
 
 crate::kernel_spec! {
-    pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
+    pub const SPEC {
         name: "gemm_block_grouped",
         entry: "gemm_block_grouped",
         quant_formats: &[
-            crate::shaders::variant::QuantFormat::Q4Affine,
-            crate::shaders::variant::QuantFormat::NvFp4,
+            QuantFormat::Q4Affine,
+            QuantFormat::NvFp4,
         ],
         fc: &[(4, "IS_FULL_LAYER"), (5, "GEMM_N"), (6, "GEMM_K")],
-        variants: crate::shaders::manifest::KernelVariants::GemmBlock,
-    };
+        variants: KernelVariants::GemmBlock,
+    }
 }
 
 #[cfg(test)]

@@ -331,16 +331,16 @@ mod tests {
 pub mod tiled;
 
 crate::kernel_spec! {
-    pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
+    pub const SPEC {
         name: "rms_norm_rows",
         entry: "rms_norm_rows",
-        quant_formats: &[crate::shaders::variant::QuantFormat::Q4Affine],
+        quant_formats: &[QuantFormat::Q4Affine],
         fc: &[(4, "K_AFFINE")],
-        variants: crate::shaders::manifest::KernelVariants::RmsNormRows {
+        variants: KernelVariants::RmsNormRows {
             rows: &[
-                crate::shaders::manifest::RmsNormRowsVariant { affine: false },
-                crate::shaders::manifest::RmsNormRowsVariant { affine: true },
+                RmsNormRowsVariant { affine: false },
+                RmsNormRowsVariant { affine: true },
             ],
         },
-    };
+    }
 }

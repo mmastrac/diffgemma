@@ -143,13 +143,13 @@ fn set_bytes<T>(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, value: &
 use crate::shaders::gpu_common::div_up;
 
 crate::kernel_spec! {
-    pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
+    pub const SPEC {
         name: "gelu",
         entry: "gelu",
-        quant_formats: &[crate::shaders::variant::QuantFormat::Q4Affine],
+        quant_formats: &[QuantFormat::Q4Affine],
         fc: &[],
-        variants: crate::shaders::manifest::KernelVariants::Gelu,
-    };
+        variants: KernelVariants::Gelu,
+    }
 }
 
 #[cfg(test)]

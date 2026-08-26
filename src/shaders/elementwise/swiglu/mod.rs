@@ -388,30 +388,29 @@ pub fn gpu_interleaved(f: &InterleavedFixture, variant: KernelVariant) -> Result
 use crate::shaders::gpu_common::div_up;
 
 crate::kernel_spec! {
-    pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
+    pub const SPEC {
         name: "swiglu",
         entry: "swiglu",
-        quant_formats: &[crate::shaders::variant::QuantFormat::Q4Affine],
+        quant_formats: &[QuantFormat::Q4Affine],
         fc: &[(4, "K_IO_DTYPE"), (5, "K_GELU_GATE"), (6, "K_IN_PLACE")],
-        variants: crate::shaders::manifest::KernelVariants::SwigluSplit {
+        variants: KernelVariants::SwigluSplit {
             rows: &[
-                crate::shaders::manifest::SwigluSplitVariant::DECODER_MUL,
-                crate::shaders::manifest::SwigluSplitVariant::MONOLITH_GLU,
+                SwigluSplitVariant::DECODER_MUL,
+                SwigluSplitVariant::MONOLITH_GLU,
             ],
         },
-    };
+    }
 }
 
 crate::kernel_spec! {
     /// Colocated subkernel registration (swiglu_moe_gate_up.metal).
-    pub const SPEC_MOE_GATE_UP: crate::shaders::manifest::KernelSpec =
-        crate::shaders::manifest::KernelSpec {
-            name: "swiglu_moe_gate_up",
-            entry: "swiglu_moe_gate_up",
-            quant_formats: &[crate::shaders::variant::QuantFormat::Q4Affine],
-            fc: &[],
-            variants: crate::shaders::manifest::KernelVariants::SwigluMoeGateUp,
-        };
+    pub const SPEC_MOE_GATE_UP {
+        name: "swiglu_moe_gate_up",
+        entry: "swiglu_moe_gate_up",
+        quant_formats: &[QuantFormat::Q4Affine],
+        fc: &[],
+        variants: KernelVariants::SwigluMoeGateUp,
+    }
 }
 
 #[cfg(test)]

@@ -221,11 +221,11 @@ mod tests {
 pub mod cpu;
 
 crate::kernel_spec! {
-    pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
+    pub const SPEC {
         name: "moe_scatter_weighted",
         entry: "moe_scatter_weighted",
-        quant_formats: &[crate::shaders::variant::QuantFormat::Q4Affine],
+        quant_formats: &[QuantFormat::Q4Affine],
         fc: &[],
-        variants: crate::shaders::manifest::KernelVariants::Elementwise,
-    };
+        variants: KernelVariants::Elementwise,
+    }
 }

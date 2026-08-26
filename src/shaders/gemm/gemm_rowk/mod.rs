@@ -191,18 +191,18 @@ pub fn gpu(f: &Fixture, _variant: crate::shaders::KernelVariant) -> Result<Vec<f
 }
 
 crate::kernel_spec! {
-    pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest::KernelSpec {
+    pub const SPEC {
         name: "gemm_rowk",
         entry: "gemm_rowk",
-        quant_formats: &[crate::shaders::variant::QuantFormat::Q8],
+        quant_formats: &[QuantFormat::Q8],
         fc: &[
             (4, "IS_FULL_LAYER"),
             (5, "GEMM_N"),
             (6, "GEMM_K"),
             (30, "K_ROWK_OUT_ARENA"),
         ],
-        variants: crate::shaders::manifest::KernelVariants::GemmRowk,
-    };
+        variants: KernelVariants::GemmRowk,
+    }
 }
 
 #[cfg(test)]
