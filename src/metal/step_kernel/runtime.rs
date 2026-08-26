@@ -21,6 +21,7 @@ pub struct StepRuntime {
     pub(super) gpu_blob: std::sync::Arc<DgqGpuBlob>,
     pub(super) weight_cache: GpuDecoderWeightCache,
     pub(super) text_config: TextConfig,
+    pub(super) dims: crate::metal::step_config::ModelDims,
     pub(super) block_profile: StepBlockProfile,
     pub(super) attn_format: crate::metal::step_quant::DenseWeightFormat,
     pub(super) dense_format: crate::metal::step_quant::DenseWeightFormat,
@@ -52,6 +53,11 @@ impl StepRuntime {
 
     pub fn layout(&self) -> &ModelLayout {
         &self.layout
+    }
+
+    /// Config-derived model geometry (see `ModelDims`).
+    pub fn dims(&self) -> &crate::metal::step_config::ModelDims {
+        &self.dims
     }
 
     /// Model sliding-window size (Gemma-4: 1024). A sliding layer's query at
@@ -598,6 +604,7 @@ impl StepRuntime {
             ctx: &self.ctx,
             ps,
             bufs: &self.bufs,
+            dims: &self.dims,
             block_profile: self.block_profile,
             tensor_offsets: &self.tensor_offsets,
             partial_lm_m: CANVAS as u32,
