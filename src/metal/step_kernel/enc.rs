@@ -1773,7 +1773,7 @@ impl StepEnc<'_> {
         // Per-sub-chunk row offsets into the batched Q/K/V planes (sub_c = 0
         // outside a super-chunk). K/V planes are written at the layer's native
         // widths (n_kv*hd); Q at n_q*hd.
-        let q_row = self.dims.canvas * self.sub_c * STEP_NQ_HEADS * l.head_dim as usize * 2;
+        let q_row = self.dims.canvas * self.sub_c * self.dims.n_q_heads * l.head_dim as usize * 2;
         let kv_row = self.dims.canvas * self.sub_c * (l.n_kv_heads * l.head_dim) as usize * 2;
         self.sink_set_buffer(
             &self.bufs.arena,

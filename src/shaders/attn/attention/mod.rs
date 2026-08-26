@@ -310,7 +310,9 @@ pub fn pipeline_mma_full_for_kv_side(
     ctx: &crate::metal::device::MetalContext,
     variant: KernelVariant,
     fmt: crate::shaders::kv_quant::KvFormat,
+    dims: &crate::metal::ModelDims,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
+    let src = mma_full_source(dims);
     let (uints, label) = kv_fc(fmt);
     let mut label = format!("{label}_side");
     let ilp2 = crate::flags::attn_mma_full_qk_ilp2();
@@ -327,13 +329,17 @@ pub fn pipeline_mma_full_for_kv_side(
             value: true,
         });
     }
-    ctx.compile_subkernel_ex(
-        SHADER_MMA_FULL,
-        ENTRY_MMA_FULL,
-        variant,
-        &label,
-        &bools,
-        &uints,
+    ctx.compile_subkernel_ex(&src, ENTRY_MMA_FULL, variant, &label, &bools, &uints)
+}
+
+/// Full-layer head_dim as a source define (it sizes threadgroup tiles and
+/// unrolled chunk loops); the source hash keeps differing values
+/// cache-distinct.
+#[cfg(target_os = "macos")]
+fn mma_full_source(dims: &crate::metal::ModelDims) -> String {
+    format!(
+        "#define MMA_FULL_HD {}u\n{}",
+        dims.full_head_dim, SHADER_MMA_FULL
     )
 }
 
@@ -342,7 +348,9 @@ pub fn pipeline_mma_full_for_kv(
     ctx: &crate::metal::device::MetalContext,
     variant: KernelVariant,
     fmt: crate::shaders::kv_quant::KvFormat,
+    dims: &crate::metal::ModelDims,
 ) -> Result<crate::metal::device::ComputePipeline, Error> {
+    let src = mma_full_source(dims);
     let (uints, label) = kv_fc(fmt);
     let mut label = label.to_string();
     let ilp2 = crate::flags::attn_mma_full_qk_ilp2();
@@ -357,14 +365,7 @@ pub fn pipeline_mma_full_for_kv(
     } else {
         vec![]
     };
-    ctx.compile_subkernel_ex(
-        SHADER_MMA_FULL,
-        ENTRY_MMA_FULL,
-        variant,
-        &label,
-        &bools,
-        &uints,
-    )
+    ctx.compile_subkernel_ex(&src, ENTRY_MMA_FULL, variant, &label, &bools, &uints)
 }
 
 #[cfg(target_os = "macos")]

@@ -1067,7 +1067,7 @@ impl StepPipelines {
             },
             attention_mma_full_side: if crate::flags::prefill_kv_f32_enabled() {
                 Some(crate::shaders::attention::pipeline_mma_full_for_kv_side(
-                    ctx, prod, fmt,
+                    ctx, prod, fmt, dims,
                 )?)
             } else {
                 None
@@ -1082,7 +1082,7 @@ impl StepPipelines {
             attention: crate::shaders::attention::pipeline_for_kv(ctx, prod, fmt)?,
             attention_mma2: crate::shaders::attention::pipeline_mma2_for_kv(ctx, prod, fmt)?,
             attention_mma_full: crate::shaders::attention::pipeline_mma_full_for_kv(
-                ctx, prod, fmt,
+                ctx, prod, fmt, dims,
             )?,
             attn_gemm: if crate::flags::gemm_attn_enabled() {
                 let (qk_bm, qk_bn, pv_bm, pv_bn, sm_tpg) = crate::flags::gemm_attn_tile();
