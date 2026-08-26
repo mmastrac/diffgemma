@@ -526,7 +526,21 @@ pub fn layer_kv_slots(is_full: bool, max_seq: usize) -> usize {
     }
 }
 
+/// Reference-checkpoint helper for tests and audits that run without a
+/// `config.json`; production paths call [`build_layout_with_dims`].
 pub fn build_layout(offsets: &HashMap<String, u64>, max_seq: usize) -> ModelLayout {
+    build_layout_with_dims(
+        offsets,
+        max_seq,
+        &crate::metal::step_config::ModelDims::reference(),
+    )
+}
+
+pub fn build_layout_with_dims(
+    offsets: &HashMap<String, u64>,
+    max_seq: usize,
+    dims: &crate::metal::step_config::ModelDims,
+) -> ModelLayout {
     // KV storage format is a per-session decision keyed off max_seq (plus the
     // DGQ_KV_Q8 override) — every sizing/pack/kernel site derives it the same
     // way so the layout stays coherent.
@@ -541,8 +555,8 @@ pub fn build_layout(offsets: &HashMap<String, u64>, max_seq: usize) -> ModelLayo
     let mut kv_off = 0u64;
     for (i, l) in layers.iter_mut().enumerate() {
         let p = format!("model.decoder.layers.{i}.");
-        let full = FULL_LAYERS.contains(&i);
-        let (hd, nkv) = if full { (512u32, 2u32) } else { (256, 8) };
+        let full = dims.is_full_layer(i);
+        let (hd, nkv) = (dims.head_dim(full) as u32, dims.kv_heads(full) as u32);
         let slots = layer_kv_slots(full, max_seq);
         *l = LayerOffsets {
             input_ln: g(&format!("{p}input_layernorm.weight")),

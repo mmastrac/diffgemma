@@ -119,7 +119,7 @@ pub fn build_step_runtime(
 
     let store = DgqStore::open(model_dir)?;
     let offsets = build_offsets_from_store(&store);
-    let layout = build_layout(&offsets, cfg.max_seq);
+    let layout = build_layout_with_dims(&offsets, cfg.max_seq, &validated.dims);
     if crate::flags::progress_enabled() {
         let fmt = crate::flags::kv_format(cfg.max_seq);
         if fmt != crate::shaders::kv_quant::KvFormat::F16 {
@@ -504,6 +504,7 @@ pub fn build_step_runtime(
         gpu_blob,
         weight_cache,
         text_config,
+        dims: validated.dims,
         block_profile,
         attn_format,
         dense_format,

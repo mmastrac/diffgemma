@@ -9,6 +9,7 @@ pub(super) struct StepEnc<'a> {
     pub(super) ctx: &'a MetalContext,
     pub(super) ps: &'a StepPipelines,
     pub(super) bufs: &'a StepBuffers,
+    pub(super) dims: &'a crate::metal::step_config::ModelDims,
     pub(super) block_profile: StepBlockProfile,
     pub(super) tensor_offsets: &'a HashMap<String, u64>,
     /// Active canvas rows for lm_head (P2.5); `CANVAS` when full lm_head.
@@ -875,7 +876,7 @@ impl StepEnc<'_> {
     ) -> Result<(), Error> {
         let fm = self.forward_m;
         let l = &layout.layers[layer];
-        let o_k = if l.is_full != 0 { 8192 } else { 4096 };
+        let o_k = self.dims.q_cols(l.is_full != 0) as u32;
         self.gemm_dense_linear(
             self.attn_format,
             self.arena().attno_off(),
@@ -1593,8 +1594,8 @@ impl StepEnc<'_> {
                 n_total,
             )?;
         } else {
-            let q_n = if l.is_full != 0 { 8192 } else { 4096 };
-            let k_n = if l.is_full != 0 { 1024 } else { 2048 };
+            let q_n = self.dims.q_cols(l.is_full != 0) as u32;
+            let k_n = self.dims.kv_cols(l.is_full != 0) as u32;
             self.gemm_dense_linear(
                 self.attn_format,
                 self.arena().tmp_off(),
@@ -1650,8 +1651,8 @@ impl StepEnc<'_> {
                 n_total,
             )?;
         } else {
-            let q_n = if l.is_full != 0 { 8192 } else { 4096 };
-            let k_n = if l.is_full != 0 { 1024 } else { 2048 };
+            let q_n = self.dims.q_cols(l.is_full != 0) as u32;
+            let k_n = self.dims.kv_cols(l.is_full != 0) as u32;
             self.gemm_dense_linear(
                 self.attn_format,
                 self.arena().tmp_off(),
