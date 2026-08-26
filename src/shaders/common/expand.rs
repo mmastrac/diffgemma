@@ -1,21 +1,12 @@
-//! Runtime `#include "x.metal"` expansion for shader sources.
+//! Diffgemma's shared-header table for gpukit's `#include` expansion.
 //!
-//! Kernels embed their Metal source with a file-relative `include_str!`
-//! (the .metal sits next to its mod.rs); the shared headers live in the
-//! table below. Expansion runs once per library compile in device.rs —
-//! string work measured in microseconds against a millisecond Metal
-//! compile. Emits `#line` directives so Metal compile errors map back to
-//! the original files (the entry file is labeled `kernel.metal`; its line
-//! numbers still match the original source).
-//!
-//! Only quoted local includes (`#include "name.metal"`) are expanded;
-//! system includes (`#include <metal_stdlib>`) pass through to the Metal
-//! runtime compiler untouched.
+//! Kernels embed their Metal source with a file-relative `include_str!` (the
+//! .metal sits next to its mod.rs); every shared header under
+//! `src/shaders/include/` gets a row here. Adding a header = add the file AND
+//! a row (the `include_table_matches_dir` test enforces both directions).
 
 /// Every shared header under `src/shaders/include/`, by include name.
-/// Adding a header = add the file AND a row here (the
-/// `include_table_matches_dir` test enforces both directions).
-static INCLUDES: &[(&str, &str)] = &[
+pub static INCLUDES: &[(&str, &str)] = &[
     (
         "activations.metal",
         include_str!("../include/activations.metal"),
@@ -84,41 +75,6 @@ static INCLUDES: &[(&str, &str)] = &[
     ),
 ];
 
-fn include_source(name: &str) -> Option<&'static str> {
-    INCLUDES.iter().find(|(n, _)| *n == name).map(|(_, s)| *s)
-}
-
-/// `#include "name.metal"` → `Some(name)`; anything else (system includes,
-/// code) → `None`. Mirrors the retired shader-include proc macro.
-fn parse_local_include(line: &str) -> Option<&str> {
-    let rest = line.trim().strip_prefix("#include \"")?;
-    let name = &rest[..rest.find('"')?];
-    name.ends_with(".metal").then_some(name)
-}
-
-/// Recursively expand quoted includes, emitting `#line` directives.
-pub fn expand(source: &str) -> String {
-    expand_labeled("kernel.metal", source)
-}
-
-fn expand_labeled(label: &str, source: &str) -> String {
-    let mut out = String::with_capacity(source.len() * 2);
-    out.push_str(&format!("#line 1 \"{label}\"\n"));
-    for (line_num, line) in (1_u32..).zip(source.split_inclusive('\n')) {
-        if let Some(name) = parse_local_include(line) {
-            let content = include_source(name).unwrap_or_else(|| {
-                panic!("expand: unknown include {name:?} (add it to src/shaders/include/ and the INCLUDES table)")
-            });
-            let resume = line_num + 1;
-            out.push_str(&expand_labeled(&format!("include/{name}"), content));
-            out.push_str(&format!("#line {resume} \"{label}\"\n"));
-        } else {
-            out.push_str(line);
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,41 +101,11 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn expand_moe_grouped() {
-        let s = expand(crate::shaders::moe_grouped::SHADER);
+    fn expand_resolves_every_production_include() {
+        let s = gpukit::metal::expand(crate::shaders::moe_grouped::SHADER, INCLUDES);
         assert!(s.contains("kernel void moe_grouped"));
         assert!(s.len() > 8000);
-    }
-
-    #[test]
-    fn emits_line_directives() {
-        let s = expand(crate::shaders::gelu::SHADER);
-        assert!(
-            s.contains("#line 1 \"kernel.metal\""),
-            "entry #line missing"
-        );
-        assert!(
-            s.contains("#line 1 \"include/fc_axes.metal\""),
-            "include #line missing"
-        );
-        assert!(
-            s.contains("#line 1 \"include/activations.metal\""),
-            "nested include #line missing"
-        );
-        // After the fc_axes include on line 4, gelu.metal resumes at line 5.
-        assert!(
-            s.contains("#line 5 \"kernel.metal\""),
-            "resume #line missing: {}",
-            &s[..s.len().min(800)]
-        );
-    }
-
-    #[test]
-    fn passthrough_without_local_includes() {
-        let s = expand(crate::shaders::gemm::ENGINE_LINEAR_SHADER);
-        // System includes untouched; content preserved verbatim after the label.
-        assert!(s.contains("#include <metal_stdlib>"));
-        assert!(s.contains("kernel void bf16_gemm"));
     }
 }

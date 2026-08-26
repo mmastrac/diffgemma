@@ -70,6 +70,7 @@ dependencies = [
 name = "diffgemma"
 version = "0.1.0"
 dependencies = [
+ "gpukit",
  "memmap2",
  "objc2",
  "objc2-foundation",
@@ -111,6 +112,15 @@ checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
 dependencies = [
  "typenum",
  "version_check",
+]
+
+[[package]]
+name = "gpukit"
+version = "0.1.0"
+dependencies = [
+ "objc2",
+ "objc2-foundation",
+ "objc2-metal",
 ]
 
 [[package]]

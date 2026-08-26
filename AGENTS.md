@@ -146,10 +146,11 @@ knows `.metal` paths; `src/metal/` (the runtime) consumes pipelines via
 - FC 1–3 are global (shape-assert, dump, quant-format); local axes are
   registered in each kernel's `SPEC` (see `diffgemma manifest`).
 - Quoted `#include "x.metal"` resolves from `src/shaders/include/` at
-  runtime (`common/expand.rs`); the pipeline binary archive keys on the
-  whole-tree hash, so shader edits can never be served stale — but if golden
-  regresses right after a `.metal` edit, **rebuild clean before diagnosing**
-  (a mid-sequence binary can still be stale).
+  runtime (table in `common/expand.rs`, mechanism in `crates/gpukit`); the
+  pipeline binary archive keys on the whole-tree hash, so shader edits can
+  never be served stale — but if golden regresses right after a `.metal`
+  edit, **rebuild clean before diagnosing** (a mid-sequence binary can
+  still be stale).
 
 ---
 

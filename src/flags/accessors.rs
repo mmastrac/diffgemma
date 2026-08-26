@@ -719,7 +719,7 @@ pub fn metal_pipeline_cache_enabled() -> bool {
 
 /// Explicit Metal pipeline-cache root dir from `DGQ_METAL_PIPELINE_CACHE` when
 /// it names a (non-empty, non-off) path; `None` falls back to the XDG/HOME
-/// default (kept in pipeline_cache.rs — those are system env, not DGQ config).
+/// default (resolved in gpukit — that is system env, not DGQ config).
 pub fn metal_pipeline_cache_dir_override() -> Option<PathBuf> {
     config()
         .debug

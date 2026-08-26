@@ -540,10 +540,15 @@ are local-only dev tooling for experiment arms (`quantize --overlay`,
 
 ## Runtime shape
 
+- `crates/gpukit` — GPU mechanism with no model or policy knowledge:
+  device/queue context, `#include` expansion, function-constant
+  specialization with cache labels derived from the full input set (FC
+  values + source hash), the pipeline binary-archive cache (keyed on the
+  whole shader-tree hash), buffer pool, one-shot dispatch helpers.
 - `src/shaders/<group>/<kernel>/` — every kernel's Rust wrapper, Metal
   source, CPU oracle, and manifest `SPEC` colocated (see AGENTS.md §4).
-- `src/metal/` — the runtime: device/queue, pipeline binary-archive cache
-  (keyed on the whole shader-tree hash), buffer arenas, KV cache, the
+- `src/metal/` — the runtime: the gpukit policy layer (`device.rs`: flag
+  wiring, `KernelVariant` → FC mapping), buffer arenas, KV cache, the
   production step dispatch (`step_kernel.rs`), and the f32 validation engine.
 - One production step path (the "monolith"); the f32 engine survives for
   ≤256-token prefill and as the step-parity oracle.

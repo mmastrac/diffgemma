@@ -15,35 +15,35 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
-const CACHE_BUNDLE_TAG: &str = "diffgemma-v9-runtime-include";
-
-fn shader_bundle_token() -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    // Whole-shader-tree hash from build.rs (walks shaders/**.metal). Replaces
-    // a hand-maintained include_str! list that had drifted to cover only 60 of
-    // 93 files — edits to unlisted kernels (qk_rope_kv, attention_device,
-    // gemm_tunable, sample_commit, ...) were served STALE from the archive.
-    env!("DGQ_SHADER_TREE_HASH").hash(&mut h);
-    CACHE_BUNDLE_TAG.hash(&mut h);
-    h.finish()
+/// On-disk pipeline cache settings, supplied by the application.
+#[derive(Clone)]
+pub struct CacheConfig {
+    /// `false` keeps an in-memory archive only (nothing touches disk).
+    pub enabled: bool,
+    /// Cache directory; `None` resolves `$XDG_CACHE_HOME` (else `~/.cache`,
+    /// else `/tmp`) + `<namespace>/metal-pipelines`.
+    pub dir: Option<PathBuf>,
+    pub namespace: &'static str,
+    /// Version key baked into the cache file name. Must change whenever any
+    /// shader source the archive may hold changes (hash the whole shader
+    /// tree), or an edited kernel is served stale from the old archive.
+    pub key: u64,
+    /// Print cache load/save lines to stderr.
+    pub verbose: bool,
 }
 
-fn cache_enabled() -> bool {
-    crate::flags::metal_pipeline_cache_enabled()
-}
-
-fn cache_root_dir() -> PathBuf {
-    if let Some(dir) = crate::flags::metal_pipeline_cache_dir_override() {
-        return dir;
+impl CacheConfig {
+    fn root_dir(&self) -> PathBuf {
+        if let Some(dir) = &self.dir {
+            return dir.clone();
+        }
+        std::env::var("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".cache")))
+            .unwrap_or_else(|_| PathBuf::from("/tmp"))
+            .join(self.namespace)
+            .join("metal-pipelines")
     }
-    std::env::var("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .unwrap_or_else(|_| PathBuf::from("/tmp"))
-        .join("diffgemma")
-        .join("metal-pipelines")
 }
 
 fn sanitize_device_name(name: &str) -> String {
@@ -67,13 +67,13 @@ pub struct PipelineArchiveCache {
     inner: Mutex<ArchiveInner>,
     cache_file: PathBuf,
     persist: bool,
+    verbose: bool,
 }
 
 struct ArchiveInner {
     archive: Retained<ProtocolObject<dyn MTLBinaryArchive>>,
-    /// Compiled pipelines keyed by the caller's label. The label encodes the
-    /// entry point plus the full function-constant config (see
-    /// `device.rs::compile_*`), so it uniquely identifies a pipeline — making
+    /// Compiled pipelines keyed by the caller's label. The label must encode
+    /// the full specialization (see `Context::compile_specialized`), making
     /// this an exact-match dedup, not a lossy hash.
     compiled: HashMap<String, Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     dirty: bool,
@@ -88,12 +88,19 @@ unsafe impl Sync for PipelineArchiveCache {}
 static GLOBAL_CACHE: OnceLock<Result<Arc<PipelineArchiveCache>, String>> = OnceLock::new();
 
 impl PipelineArchiveCache {
-    pub fn shared(device: &ProtocolObject<dyn MTLDevice>) -> Result<Arc<Self>, Error> {
-        match GLOBAL_CACHE
-            .get_or_init(|| Self::open(device).map(Arc::new).map_err(|e| e.to_string()))
-        {
+    /// The process-global cache. The first call fixes the configuration;
+    /// later calls return the same cache and ignore `config`.
+    pub fn shared(
+        device: &ProtocolObject<dyn MTLDevice>,
+        config: &CacheConfig,
+    ) -> Result<Arc<Self>, Error> {
+        match GLOBAL_CACHE.get_or_init(|| {
+            Self::open(device, config)
+                .map(Arc::new)
+                .map_err(|e| e.to_string())
+        }) {
             Ok(c) => Ok(Arc::clone(c)),
-            Err(msg) => Err(Error::NotFound(msg.clone())),
+            Err(msg) => Err(Error::Cache(msg.clone())),
         }
     }
 
@@ -103,19 +110,19 @@ impl PipelineArchiveCache {
         }
     }
 
-    fn open(device: &ProtocolObject<dyn MTLDevice>) -> Result<Self, Error> {
+    fn open(device: &ProtocolObject<dyn MTLDevice>, config: &CacheConfig) -> Result<Self, Error> {
         let open_started = std::time::Instant::now();
-        if !cache_enabled() {
+        if !config.enabled {
             return Self::open_ephemeral(device);
         }
 
-        let cache_dir = cache_root_dir();
+        let cache_dir = config.root_dir();
         std::fs::create_dir_all(&cache_dir)
-            .map_err(|e| Error::NotFound(format!("metal pipeline cache mkdir failed: {e}")))?;
+            .map_err(|e| Error::Cache(format!("mkdir failed: {e}")))?;
 
         let device_name = sanitize_device_name(&device.name().to_string());
-        let token = shader_bundle_token();
-        let cache_file = cache_dir.join(format!("{device_name}-{token:016x}.metallibarchive"));
+        let cache_file =
+            cache_dir.join(format!("{device_name}-{:016x}.metallibarchive", config.key));
         let existed = cache_file.exists();
 
         let desc = MTLBinaryArchiveDescriptor::new();
@@ -126,13 +133,13 @@ impl PipelineArchiveCache {
         let archive = device
             .newBinaryArchiveWithDescriptor_error(&desc)
             .map_err(|e| {
-                Error::NotFound(format!(
+                Error::Cache(format!(
                     "MTLBinaryArchive open failed: {}",
                     e.localizedDescription()
                 ))
             })?;
 
-        if crate::flags::progress_enabled() {
+        if config.verbose {
             eprintln!(
                 "metal pipeline cache: {} ({}, {:.2?})",
                 cache_file.display(),
@@ -149,6 +156,7 @@ impl PipelineArchiveCache {
             }),
             cache_file,
             persist: true,
+            verbose: config.verbose,
         })
     }
 
@@ -165,6 +173,7 @@ impl PipelineArchiveCache {
             }),
             cache_file: PathBuf::new(),
             persist: false,
+            verbose: false,
         })
     }
 
@@ -235,7 +244,7 @@ impl PipelineArchiveCache {
                     eprintln!("warning: metal pipeline cache rename failed: {e}");
                     return;
                 }
-                if crate::flags::progress_enabled() {
+                if self.verbose {
                     eprintln!(
                         "metal pipeline cache: saved {} ({:.2?})",
                         self.cache_file.display(),
@@ -250,50 +259,6 @@ impl PipelineArchiveCache {
                     e.localizedDescription()
                 );
             }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::super::device::MetalContext;
-
-    const SRC: &str = "\
-#include <metal_stdlib>
-using namespace metal;
-kernel void pc_k0(device float* o [[buffer(0)]], uint i [[thread_position_in_grid]]) { o[i] = 0.0f; }
-kernel void pc_k1(device float* o [[buffer(0)]], uint i [[thread_position_in_grid]]) { o[i] = 1.0f; }
-kernel void pc_k2(device float* o [[buffer(0)]], uint i [[thread_position_in_grid]]) { o[i] = 2.0f; }
-kernel void pc_k3(device float* o [[buffer(0)]], uint i [[thread_position_in_grid]]) { o[i] = 3.0f; }
-";
-
-    /// Hammer the process-global pipeline archive from many threads at once.
-    /// Same entry across threads exercises the dedup fast path; different entries
-    /// race concurrent `addComputePipelineFunctions`. Pre-Mutex this raced the
-    /// non-thread-safe `MTLBinaryArchive` and SIGSEGV'd — the reason the test
-    /// suite ran `--test-threads=1`. Manages its own threads, so it still
-    /// exercises concurrency under the serial test harness.
-    #[test]
-    fn concurrent_compile_is_race_free() {
-        if MetalContext::new().is_err() {
-            eprintln!("skip: no Metal device");
-            return;
-        }
-        let entries = ["pc_k0", "pc_k1", "pc_k2", "pc_k3"];
-        let handles: Vec<_> = (0..8)
-            .map(|_| {
-                std::thread::spawn(move || {
-                    let ctx = MetalContext::new().expect("device");
-                    for _ in 0..4 {
-                        for e in entries {
-                            ctx.compile_kernel(SRC, e).expect("pipeline compile");
-                        }
-                    }
-                })
-            })
-            .collect();
-        for h in handles {
-            h.join().expect("worker panicked — pipeline cache race?");
         }
     }
 }

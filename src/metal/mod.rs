@@ -44,7 +44,6 @@ pub(crate) fn assert_cmd_ok(
 }
 
 mod moe;
-mod pipeline_cache;
 mod probe;
 mod router;
 mod sampler;

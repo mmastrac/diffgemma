@@ -1,63 +1,57 @@
-use crate::Error;
-use crate::metal::pipeline_cache::PipelineArchiveCache;
-use crate::shaders::variant::KernelVariant;
-use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
-use objc2_foundation::{NSError, NSString};
-use objc2_metal::{
-    MTLCommandQueue, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDataType, MTLDevice,
-    MTLFunctionConstantValues, MTLLibrary,
-};
+//! Diffgemma's policy layer over the gpukit Metal context: flag-driven cache
+//! configuration, the include table, and the mapping from [`KernelVariant`] /
+//! GEMM axes onto function-constant values. The mechanism (compilation,
+//! specialization, cache-label derivation) lives in `gpukit`.
 
-/// Caller-chosen function-constant axes for a GEMM subkernel compile. The rest
-/// (shape_assert / debug_fast / debug_deep / arena_f16 / n_tile) come from the
-/// runtime [`KernelVariant`]. Named fields replace what was a trailing run of
-/// four positional bools on `compile_gemm_subkernel_on_device`.
-#[derive(Clone, Copy)]
-pub(crate) struct GemmCompileConfig {
-    pub gemm_n: u32,
-    pub gemm_k: u32,
-    pub is_full_layer: bool,
-    pub quant_format: u32,
-    /// FC10: f16 activation (A) input.
-    pub x_fp16: bool,
-    /// FC28 GATHER_A: fused-MoE gate_up gathers bf16 `moein` rows in the A-load.
-    pub gather_a: bool,
-    /// FC29: force bf16 output (lm_head logits — f16 acts, bf16-range logits).
-    pub out_bf16: bool,
-    /// FC30 K_ROWK_OUT_ARENA: arena-overwrite output mode of `gemm_rowk`.
-    pub out_arena: bool,
-    /// Hash of the compiled SOURCE. The tunable tile geometry (TUNE_BM/TUNE_BN)
-    /// is baked into the source `#define` prepend, NOT a function constant, so
-    /// it does NOT appear in the FC-derived label. Without this, two different
-    /// tiles at the same (n, k, format) produce the SAME cache label and the
-    /// PipelineArchiveCache silently returns the first-compiled pipeline — a
-    /// bm=32 kernel fed 64-row blocks then zeroes rows 32..63 (found via the
-    /// sparse_block_m_invariant oracle). Folding the source hash into the label
-    /// makes any source-define difference cache-distinct.
-    pub src_hash: u64,
+use crate::Error;
+use crate::shaders::variant::KernelVariant;
+use gpukit::metal as gk;
+use objc2_metal::MTLDevice;
+
+pub use gpukit::metal::ComputePipeline;
+
+/// Part of the archive file key; a change here orphans every on-disk
+/// archive. For label-scheme or FC-numbering changes the tree hash cannot
+/// see.
+const CACHE_BUNDLE_TAG: &str = "diffgemma-v10-gpukit";
+
+fn cache_config() -> gk::CacheConfig {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    // Whole-shader-tree hash from build.rs; a kernel edit changes the archive
+    // file name, so an edited kernel can never be served stale.
+    env!("DGQ_SHADER_TREE_HASH").hash(&mut h);
+    CACHE_BUNDLE_TAG.hash(&mut h);
+    gk::CacheConfig {
+        enabled: crate::flags::metal_pipeline_cache_enabled(),
+        dir: crate::flags::metal_pipeline_cache_dir_override(),
+        namespace: "diffgemma",
+        key: h.finish(),
+        verbose: crate::flags::progress_enabled(),
+    }
 }
 
-/// Stable (no-random-seed) hash of a shader source for cache-label disambiguation.
-pub(crate) fn source_hash(source: &str) -> u64 {
-    // FNV-1a: deterministic across runs (std DefaultHasher is randomized).
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in source.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
+/// Caller-chosen function-constant axes for a GEMM subkernel compile. The
+/// rest (shape_assert / debug_fast / debug_deep / arena_f16 / n_tile) come
+/// from the runtime [`KernelVariant`].
+#[derive(Clone, Copy)]
+struct GemmCompileConfig {
+    gemm_n: u32,
+    gemm_k: u32,
+    is_full_layer: bool,
+    quant_format: u32,
+    /// FC10: f16 activation (A) input.
+    x_fp16: bool,
+    /// FC28 GATHER_A: fused-MoE gate_up gathers bf16 `moein` rows in the A-load.
+    gather_a: bool,
+    /// FC29: force bf16 output (lm_head logits — f16 acts, bf16-range logits).
+    out_bf16: bool,
+    /// FC30 K_ROWK_OUT_ARENA: arena-overwrite output mode of `gemm_rowk`.
+    out_arena: bool,
 }
 
 impl GemmCompileConfig {
-    /// Default raw path (no gather / bf16-out / arena override).
-    pub fn raw(
-        gemm_n: u32,
-        gemm_k: u32,
-        is_full_layer: bool,
-        quant_format: u32,
-        x_fp16: bool,
-    ) -> Self {
+    fn raw(gemm_n: u32, gemm_k: u32, is_full_layer: bool, quant_format: u32, x_fp16: bool) -> Self {
         Self {
             gemm_n,
             gemm_k,
@@ -67,88 +61,100 @@ impl GemmCompileConfig {
             gather_a: false,
             out_bf16: false,
             out_arena: false,
-            src_hash: 0,
         }
     }
 
-    /// FC29 bf16 output (lm_head logits).
-    pub fn out_bf16(gemm_n: u32, gemm_k: u32, quant_format: u32) -> Self {
-        Self {
-            out_bf16: true,
-            ..Self::raw(gemm_n, gemm_k, false, quant_format, false)
+    /// Base GEMM axes (FC1–11) plus the conditional output-mode axes. The
+    /// conditional constants are set only when true: their absence is what
+    /// `is_function_constant_defined` guards test in the shaders.
+    fn fc_values(&self) -> gk::FcValues {
+        let variant = crate::shaders::variant::runtime_step_variant();
+        let mut fc = gk::FcValues::new();
+        fc.set_bool(1, variant.shape_assert)
+            .set_uint(2, 0)
+            .set_uint(3, self.quant_format)
+            .set_bool(7, variant.debug_fast)
+            .set_bool(8, variant.debug_deep)
+            .set_bool(9, variant.arena_f16)
+            .set_bool(4, self.is_full_layer)
+            .set_uint(5, self.gemm_n)
+            .set_uint(6, self.gemm_k)
+            .set_bool(10, self.x_fp16)
+            .set_uint(11, crate::shaders::gemm_common::n_tile() as u32);
+        if self.gather_a {
+            fc.set_bool(28, true);
         }
-    }
-
-    /// FC28 GATHER_A (fused-MoE gate_up).
-    pub fn gather(gemm_n: u32, gemm_k: u32, quant_format: u32) -> Self {
-        Self {
-            gather_a: true,
-            ..Self::raw(gemm_n, gemm_k, false, quant_format, false)
+        if self.out_bf16 {
+            fc.set_bool(29, true);
         }
-    }
-
-    /// FC30 arena-overwrite output (`gemm_rowk` SC softembed).
-    pub fn rowk_arena(gemm_n: u32, gemm_k: u32, quant_format: u32, x_fp16: bool) -> Self {
-        Self {
-            out_arena: true,
-            ..Self::raw(gemm_n, gemm_k, false, quant_format, x_fp16)
+        if self.out_arena {
+            fc.set_bool(30, true);
         }
+        fc
     }
 }
 
+/// A gpukit Metal context opened with diffgemma's configuration. Derefs to
+/// [`gk::Context`], so mechanism-level methods (`compile_kernel`,
+/// `compile_library`, …) are called directly on it.
 pub struct MetalContext {
-    pub device: Retained<ProtocolObject<dyn MTLDevice>>,
-    pub queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    inner: gk::Context,
+}
+
+impl std::ops::Deref for MetalContext {
+    type Target = gk::Context;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
 
 impl MetalContext {
     pub fn new() -> Result<Self, Error> {
-        let device = MTLCreateSystemDefaultDevice().ok_or(Error::Gpu("no Metal device"))?;
-        let queue = device
-            .newCommandQueue()
-            .ok_or(Error::Gpu("failed to create Metal command queue"))?;
+        let inner = gk::Context::new(gk::ContextConfig {
+            includes: crate::shaders::expand::INCLUDES,
+            cache: cache_config(),
+        })?;
         // Record the working-set cap so the q8-KV auto policy (flags::kv_q8)
         // can scale to this device's RAM.
-        crate::flags::set_gpu_working_set_cap(device.recommendedMaxWorkingSetSize());
-        Ok(Self { device, queue })
+        crate::flags::set_gpu_working_set_cap(inner.device.recommendedMaxWorkingSetSize());
+        Ok(Self { inner })
     }
 
-    pub fn compile_library(
+    /// Specialize an isolated subkernel (function constants 1–3 per AGENTS.md §4).
+    pub fn compile_subkernel(
         &self,
         source: &str,
-    ) -> Result<Retained<ProtocolObject<dyn MTLLibrary>>, Error> {
-        // Quoted #include expansion happens here (src/shaders/common/expand.rs).
-        let ns_source = NSString::from_str(&crate::shaders::expand::expand(source));
-        self.device
-            .newLibraryWithSource_options_error(&ns_source, None)
-            .map_err(shader_compile_error)
+        entry: &str,
+        variant: KernelVariant,
+    ) -> Result<ComputePipeline, Error> {
+        self.compile_subkernel_ex(source, entry, variant, "", &[], &[])
     }
 
-    pub fn compile_kernel(&self, source: &str, entry: &str) -> Result<ComputePipeline, Error> {
-        let library = self.compile_library(source)?;
-        self.compile_kernel_from_library(&library, entry)
-    }
-
-    pub fn compile_kernel_from_library(
+    pub fn compile_subkernel_ex(
         &self,
-        library: &ProtocolObject<dyn MTLLibrary>,
+        source: &str,
         entry: &str,
+        variant: KernelVariant,
+        extra_label: &str,
+        extra_bools: &[crate::shaders::variant::FcBool],
+        extra_uints: &[crate::shaders::variant::FcUInt],
     ) -> Result<ComputePipeline, Error> {
-        Self::compile_kernel_from_library_on_device(&self.device, library, entry)
-    }
-
-    pub fn compile_kernel_from_library_on_device(
-        device: &ProtocolObject<dyn MTLDevice>,
-        library: &ProtocolObject<dyn MTLLibrary>,
-        entry: &str,
-    ) -> Result<ComputePipeline, Error> {
-        let name = NSString::from_str(entry);
-        let function = library
-            .newFunctionWithName(&name)
-            .ok_or(Error::Runtime("Metal kernel not found"))?;
-        let cache = PipelineArchiveCache::shared(device)?;
-        let pipeline = cache.compile_compute(device, &function, entry)?;
-        Ok(ComputePipeline { pipeline })
+        let mut fc = gk::FcValues::new();
+        fc.set_bool(1, variant.shape_assert)
+            .set_uint(2, variant.dump_stage)
+            .set_uint(3, variant.quant_format as u32)
+            .set_bool(7, variant.debug_fast || variant.shape_assert)
+            .set_bool(8, variant.debug_deep)
+            .set_bool(9, variant.arena_f16);
+        for extra in extra_bools {
+            fc.set_bool(extra.index, extra.value);
+        }
+        for extra in extra_uints {
+            fc.set_uint(extra.index, extra.value);
+        }
+        let label = variant.cache_label_extra(entry, extra_label);
+        Ok(self.inner.compile_specialized(source, entry, &fc, &label)?)
     }
 
     /// Specialize a tiled quant GEMM subkernel (FC1–3 global, FC4–6 shape/format, FC9 I/O layout).
@@ -162,10 +168,8 @@ impl MetalContext {
         quant_format: u32,
         x_fp16: bool,
     ) -> Result<ComputePipeline, Error> {
-        let library = self.compile_library(source)?;
-        let mut cfg = GemmCompileConfig::raw(gemm_n, gemm_k, is_full_layer, quant_format, x_fp16);
-        cfg.src_hash = source_hash(source);
-        Self::compile_gemm_subkernel_on_device(&self.device, &library, entry, &cfg)
+        let cfg = GemmCompileConfig::raw(gemm_n, gemm_k, is_full_layer, quant_format, x_fp16);
+        self.compile_gemm(source, entry, &cfg)
     }
 
     /// As `compile_gemm_subkernel` but forces bf16 output (FC29) — lm_head logits
@@ -178,10 +182,11 @@ impl MetalContext {
         gemm_k: u32,
         quant_format: u32,
     ) -> Result<ComputePipeline, Error> {
-        let library = self.compile_library(source)?;
-        let mut cfg = GemmCompileConfig::out_bf16(gemm_n, gemm_k, quant_format);
-        cfg.src_hash = source_hash(source);
-        Self::compile_gemm_subkernel_on_device(&self.device, &library, entry, &cfg)
+        let cfg = GemmCompileConfig {
+            out_bf16: true,
+            ..GemmCompileConfig::raw(gemm_n, gemm_k, false, quant_format, false)
+        };
+        self.compile_gemm(source, entry, &cfg)
     }
 
     /// As `compile_gemm_subkernel` but sets GATHER_A (FC28) — the fused-MoE
@@ -194,10 +199,11 @@ impl MetalContext {
         gemm_k: u32,
         quant_format: u32,
     ) -> Result<ComputePipeline, Error> {
-        let library = self.compile_library(source)?;
-        let mut cfg = GemmCompileConfig::gather(gemm_n, gemm_k, quant_format);
-        cfg.src_hash = source_hash(source);
-        Self::compile_gemm_subkernel_on_device(&self.device, &library, entry, &cfg)
+        let cfg = GemmCompileConfig {
+            gather_a: true,
+            ..GemmCompileConfig::raw(gemm_n, gemm_k, false, quant_format, false)
+        };
+        self.compile_gemm(source, entry, &cfg)
     }
 
     /// As `compile_gemm_subkernel` but sets K_ROWK_OUT_ARENA (FC30) — the
@@ -212,10 +218,22 @@ impl MetalContext {
         quant_format: u32,
         x_fp16: bool,
     ) -> Result<ComputePipeline, Error> {
-        let library = self.compile_library(source)?;
-        let mut cfg = GemmCompileConfig::rowk_arena(gemm_n, gemm_k, quant_format, x_fp16);
-        cfg.src_hash = source_hash(source);
-        Self::compile_gemm_subkernel_on_device(&self.device, &library, entry, &cfg)
+        let cfg = GemmCompileConfig {
+            out_arena: true,
+            ..GemmCompileConfig::raw(gemm_n, gemm_k, false, quant_format, x_fp16)
+        };
+        self.compile_gemm(source, entry, &cfg)
+    }
+
+    fn compile_gemm(
+        &self,
+        source: &str,
+        entry: &str,
+        cfg: &GemmCompileConfig,
+    ) -> Result<ComputePipeline, Error> {
+        Ok(self
+            .inner
+            .compile_specialized(source, entry, &cfg.fc_values(), entry)?)
     }
 
     /// Specialize stacked GEMM: base FC1–11 plus segment table FC12–27.
@@ -228,457 +246,24 @@ impl MetalContext {
         quant_format: u32,
         stacked: &crate::shaders::gemm_block_stacked::StackedSegFc,
     ) -> Result<ComputePipeline, Error> {
-        let library = self.compile_library(source)?;
-        Self::compile_gemm_stacked_subkernel_on_device(
-            &self.device,
-            &library,
-            entry,
-            gemm_n,
-            gemm_k,
-            quant_format,
-            stacked,
-            source_hash(source),
-        )
-    }
-
-    fn compile_gemm_stacked_subkernel_on_device(
-        device: &ProtocolObject<dyn MTLDevice>,
-        library: &ProtocolObject<dyn MTLLibrary>,
-        entry: &str,
-        gemm_n: u32,
-        gemm_k: u32,
-        quant_format: u32,
-        stacked: &crate::shaders::gemm_block_stacked::StackedSegFc,
-        src_hash: u64,
-    ) -> Result<ComputePipeline, Error> {
-        let variant = crate::shaders::variant::runtime_step_variant();
-        let fc = MTLFunctionConstantValues::new();
-        let shape_assert = variant.shape_assert;
-        let dump_stage = 0u32;
-        let debug_fast = variant.debug_fast;
-        let debug_deep = variant.debug_deep;
-        let arena_f16 = variant.arena_f16;
-        let gemm_n_tile = crate::shaders::gemm_common::n_tile() as u32;
-        let is_full_layer = false;
-        let x_fp16 = false;
-        unsafe {
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&shape_assert).cast(),
-                MTLDataType::Bool,
-                1,
-            );
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&dump_stage).cast(),
-                MTLDataType::UInt,
-                2,
-            );
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&quant_format).cast(),
-                MTLDataType::UInt,
-                3,
-            );
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&debug_fast).cast(),
-                MTLDataType::Bool,
-                7,
-            );
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&debug_deep).cast(),
-                MTLDataType::Bool,
-                8,
-            );
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&arena_f16).cast(),
-                MTLDataType::Bool,
-                9,
-            );
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&is_full_layer).cast(),
-                MTLDataType::Bool,
-                4,
-            );
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&gemm_n).cast(),
-                MTLDataType::UInt,
-                5,
-            );
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&gemm_k).cast(),
-                MTLDataType::UInt,
-                6,
-            );
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&x_fp16).cast(),
-                MTLDataType::Bool,
-                10,
-            );
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&gemm_n_tile).cast(),
-                MTLDataType::UInt,
-                11,
-            );
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&stacked.n_segs).cast(),
-                MTLDataType::UInt,
-                12,
-            );
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&stacked.end0).cast(),
-                MTLDataType::UInt,
-                13,
-            );
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&stacked.end1).cast(),
-                MTLDataType::UInt,
-                14,
-            );
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&stacked.end2).cast(),
-                MTLDataType::UInt,
-                15,
-            );
-            for (i, w_off) in stacked.w_off.iter().enumerate() {
-                fc.setConstantValue_type_atIndex(
-                    std::ptr::NonNull::from_ref(w_off).cast(),
-                    MTLDataType::ULong,
-                    16 + i,
-                );
-            }
-            for (i, y_off) in stacked.y_byte_off.iter().enumerate() {
-                fc.setConstantValue_type_atIndex(
-                    std::ptr::NonNull::from_ref(y_off).cast(),
-                    MTLDataType::ULong,
-                    19 + i,
-                );
-            }
-            for (i, col0) in stacked.y_col0.iter().enumerate() {
-                fc.setConstantValue_type_atIndex(
-                    std::ptr::NonNull::from_ref(col0).cast(),
-                    MTLDataType::UInt,
-                    22 + i,
-                );
-            }
-            for (i, row_cols) in stacked.y_row_cols.iter().enumerate() {
-                fc.setConstantValue_type_atIndex(
-                    std::ptr::NonNull::from_ref(row_cols).cast(),
-                    MTLDataType::UInt,
-                    25 + i,
-                );
-            }
+        let cfg = GemmCompileConfig::raw(gemm_n, gemm_k, false, quant_format, false);
+        let mut fc = cfg.fc_values();
+        fc.set_uint(12, stacked.n_segs)
+            .set_uint(13, stacked.end0)
+            .set_uint(14, stacked.end1)
+            .set_uint(15, stacked.end2);
+        for (i, w_off) in stacked.w_off.iter().enumerate() {
+            fc.set_ulong(16 + i as u32, *w_off);
         }
-        let name = NSString::from_str(entry);
-        let function = library
-            .newFunctionWithName_constantValues_error(&name, &fc)
-            .map_err(shader_compile_error)?;
-        let label = format!(
-            "{entry}_qf{quant_format}_n{gemm_n}_k{gemm_k}_nt{gemm_n_tile}_af{}_ns{}_e{}_{}_{}_w{}_{}_{}_y{}_{}_{}_s{src_hash:x}",
-            u8::from(arena_f16),
-            stacked.n_segs,
-            stacked.end0,
-            stacked.end1,
-            stacked.end2,
-            stacked.w_off[0],
-            stacked.w_off[1],
-            stacked.w_off[2],
-            stacked.y_byte_off[0],
-            stacked.y_byte_off[1],
-            stacked.y_byte_off[2],
-        );
-        let cache = PipelineArchiveCache::shared(device)?;
-        let pipeline = cache.compile_compute(device, &function, &label)?;
-        Ok(ComputePipeline { pipeline })
-    }
-
-    fn compile_gemm_subkernel_on_device(
-        device: &ProtocolObject<dyn MTLDevice>,
-        library: &ProtocolObject<dyn MTLLibrary>,
-        entry: &str,
-        cfg: &GemmCompileConfig,
-    ) -> Result<ComputePipeline, Error> {
-        let GemmCompileConfig {
-            gemm_n,
-            gemm_k,
-            is_full_layer,
-            quant_format,
-            x_fp16,
-            gather_a,
-            out_bf16,
-            out_arena,
-            src_hash,
-        } = *cfg;
-        let variant = crate::shaders::variant::runtime_step_variant();
-        let fc = MTLFunctionConstantValues::new();
-        let shape_assert = variant.shape_assert;
-        let dump_stage = 0u32;
-        let debug_fast = variant.debug_fast;
-        let debug_deep = variant.debug_deep;
-        let arena_f16 = variant.arena_f16;
-        let gemm_n_tile = crate::shaders::gemm_common::n_tile() as u32;
-        unsafe {
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&shape_assert).cast(),
-                MTLDataType::Bool,
-                1,
-            );
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&dump_stage).cast(),
-                MTLDataType::UInt,
-                2,
-            );
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&quant_format).cast(),
-                MTLDataType::UInt,
-                3,
-            );
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&debug_fast).cast(),
-                MTLDataType::Bool,
-                7,
-            );
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&debug_deep).cast(),
-                MTLDataType::Bool,
-                8,
-            );
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&arena_f16).cast(),
-                MTLDataType::Bool,
-                9,
-            );
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&is_full_layer).cast(),
-                MTLDataType::Bool,
-                4,
-            );
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&gemm_n).cast(),
-                MTLDataType::UInt,
-                5,
-            );
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&gemm_k).cast(),
-                MTLDataType::UInt,
-                6,
-            );
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&x_fp16).cast(),
-                MTLDataType::Bool,
-                10,
-            );
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&gemm_n_tile).cast(),
-                MTLDataType::UInt,
-                11,
-            );
-            if gather_a {
-                fc.setConstantValue_type_atIndex(
-                    std::ptr::NonNull::from_ref(&gather_a).cast(),
-                    MTLDataType::Bool,
-                    28,
-                );
-            }
-            if out_bf16 {
-                fc.setConstantValue_type_atIndex(
-                    std::ptr::NonNull::from_ref(&out_bf16).cast(),
-                    MTLDataType::Bool,
-                    29,
-                );
-            }
-            if out_arena {
-                fc.setConstantValue_type_atIndex(
-                    std::ptr::NonNull::from_ref(&out_arena).cast(),
-                    MTLDataType::Bool,
-                    30,
-                );
-            }
+        for (i, y_off) in stacked.y_byte_off.iter().enumerate() {
+            fc.set_ulong(19 + i as u32, *y_off);
         }
-        let name = NSString::from_str(entry);
-        let function = library
-            .newFunctionWithName_constantValues_error(&name, &fc)
-            .map_err(shader_compile_error)?;
-        let label = format!(
-            "{entry}_qf{quant_format}_n{gemm_n}_k{gemm_k}_nt{gemm_n_tile}_xfp16{}_sa{}_df{}_dd{}_g{}_o{}_oa{}_af{}_s{src_hash:x}",
-            u8::from(x_fp16),
-            u8::from(shape_assert),
-            u8::from(debug_fast),
-            u8::from(debug_deep),
-            u8::from(gather_a),
-            u8::from(out_bf16),
-            u8::from(out_arena),
-            u8::from(arena_f16),
-        );
-        let cache = PipelineArchiveCache::shared(device)?;
-        let pipeline = cache.compile_compute(device, &function, &label)?;
-        Ok(ComputePipeline { pipeline })
-    }
-
-    pub fn compile_kernels(
-        &self,
-        source: &str,
-        entries: &[&str],
-    ) -> Result<Vec<ComputePipeline>, Error> {
-        let library = self.compile_library(source)?;
-        let mut pipelines = Vec::with_capacity(entries.len());
-        for entry in entries {
-            pipelines.push(self.compile_kernel_from_library(&library, entry)?);
+        for (i, col0) in stacked.y_col0.iter().enumerate() {
+            fc.set_uint(22 + i as u32, *col0);
         }
-        Ok(pipelines)
-    }
-
-    /// Specialize an isolated subkernel (function constants 1–3 per AGENTS.md §4).
-    pub fn compile_subkernel(
-        &self,
-        source: &str,
-        entry: &str,
-        variant: KernelVariant,
-    ) -> Result<ComputePipeline, Error> {
-        Self::compile_subkernel_on_device(&self.device, source, entry, variant, "", &[], &[])
-    }
-
-    pub fn compile_subkernel_ex(
-        &self,
-        source: &str,
-        entry: &str,
-        variant: KernelVariant,
-        extra_label: &str,
-        extra_bools: &[crate::shaders::variant::FcBool],
-        extra_uints: &[crate::shaders::variant::FcUInt],
-    ) -> Result<ComputePipeline, Error> {
-        Self::compile_subkernel_on_device(
-            &self.device,
-            source,
-            entry,
-            variant,
-            extra_label,
-            extra_bools,
-            extra_uints,
-        )
-    }
-
-    pub fn compile_subkernel_on_device(
-        device: &ProtocolObject<dyn MTLDevice>,
-        source: &str,
-        entry: &str,
-        variant: KernelVariant,
-        extra_label: &str,
-        extra_bools: &[crate::shaders::variant::FcBool],
-        extra_uints: &[crate::shaders::variant::FcUInt],
-    ) -> Result<ComputePipeline, Error> {
-        let library = {
-            // Quoted #include expansion happens here (src/shaders/common/expand.rs).
-            let ns_source = NSString::from_str(&crate::shaders::expand::expand(source));
-            device
-                .newLibraryWithSource_options_error(&ns_source, None)
-                .map_err(shader_compile_error)?
-        };
-        let fc = MTLFunctionConstantValues::new();
-        let shape_assert = variant.shape_assert;
-        let dump_stage = variant.dump_stage;
-        let quant_format = variant.quant_format as u32;
-        let debug_fast = variant.debug_fast || variant.shape_assert;
-        let debug_deep = variant.debug_deep;
-        let arena_f16 = variant.arena_f16;
-        unsafe {
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&shape_assert).cast(),
-                MTLDataType::Bool,
-                1,
-            );
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&dump_stage).cast(),
-                MTLDataType::UInt,
-                2,
-            );
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&quant_format).cast(),
-                MTLDataType::UInt,
-                3,
-            );
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&debug_fast).cast(),
-                MTLDataType::Bool,
-                7,
-            );
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&debug_deep).cast(),
-                MTLDataType::Bool,
-                8,
-            );
-            fc.setConstantValue_type_atIndex(
-                std::ptr::NonNull::from_ref(&arena_f16).cast(),
-                MTLDataType::Bool,
-                9,
-            );
-            for extra in extra_bools {
-                fc.setConstantValue_type_atIndex(
-                    std::ptr::NonNull::from_ref(&extra.value).cast(),
-                    MTLDataType::Bool,
-                    extra.index as usize,
-                );
-            }
-            for extra in extra_uints {
-                fc.setConstantValue_type_atIndex(
-                    std::ptr::NonNull::from_ref(&extra.value).cast(),
-                    MTLDataType::UInt,
-                    extra.index as usize,
-                );
-            }
+        for (i, row_cols) in stacked.y_row_cols.iter().enumerate() {
+            fc.set_uint(25 + i as u32, *row_cols);
         }
-        let name = NSString::from_str(entry);
-        let function = library
-            .newFunctionWithName_constantValues_error(&name, &fc)
-            .map_err(shader_compile_error)?;
-        // Fold the SOURCE hash + the extra function-constant values into the cache
-        // label. `PipelineArchiveCache` dedupes by label, and `cache_label_extra`
-        // only covers `entry` + the shared FC triple + whatever string the caller
-        // remembered to pass — so anything a kernel specializes on OUTSIDE that
-        // set collides silently and the first-compiled pipeline is handed back.
-        //
-        // Two live instances this closes:
-        //   - `attention_flash::pipeline_flash` prepends `#define FL_HD/FL_BQ/FL_BK`
-        //     via `tuned_source` but labels every variant `"flash"` — so hd=256
-        //     (sliding, production) and hd=512 (full) shared a label, and whichever
-        //     compiled first won. Same for `attention_gemm`'s `"tune"`.
-        //   - extra_bools/extra_uints are real specializations that never reached
-        //     the label; call sites encode them by CONVENTION (`"side"`/`"default"`,
-        //     `fmt.label()`), which is one forgotten string away from a silent
-        //     miscompile.
-        //
-        // This is the same class as the GEMM `bm=32`/`bm=64` collision fixed in
-        // 0281c0a (source-baked TUNE_BM absent from the label → a bm=32 kernel ran
-        // for bm=64 and zeroed half the rows). That fix hashed the source into the
-        // *GEMM* label only; this closes the class for every `compile_subkernel_ex`
-        // caller. Deriving the label from the actual inputs beats remembering to
-        // pass a distinguishing string.
-        let mut label = variant.cache_label_extra(entry, extra_label);
-        label.push_str(&format!("_s{:x}", source_hash(source)));
-        for b in extra_bools {
-            label.push_str(&format!("_b{}={}", b.index, u8::from(b.value)));
-        }
-        for u in extra_uints {
-            label.push_str(&format!("_u{}={}", u.index, u.value));
-        }
-        let cache = PipelineArchiveCache::shared(device)?;
-        let pipeline = cache.compile_compute(device, &function, &label)?;
-        Ok(ComputePipeline { pipeline })
+        Ok(self.inner.compile_specialized(source, entry, &fc, entry)?)
     }
-}
-
-pub struct ComputePipeline {
-    pub pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-}
-
-impl Clone for ComputePipeline {
-    fn clone(&self) -> Self {
-        Self {
-            pipeline: self.pipeline.clone(),
-        }
-    }
-}
-
-fn shader_compile_error(err: Retained<NSError>) -> Error {
-    Error::NotFound(format!(
-        "Metal shader compile failed: {}",
-        err.localizedDescription()
-    ))
 }
