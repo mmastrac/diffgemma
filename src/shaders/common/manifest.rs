@@ -22,6 +22,25 @@ use scattered_collect::{ScatteredMap, gather};
 #[gather]
 pub static MANIFEST: ScatteredMap<&'static str, &'static KernelSpec>;
 
+/// Scatter one or more `SPEC` consts into [`MANIFEST`], keyed by entry name.
+/// Invoke beside the declarations: `crate::register_kernel_specs!(SPEC);`
+#[macro_export]
+macro_rules! register_kernel_specs {
+    ($($spec:ident),+ $(,)?) => {
+        $(
+            // The const block scopes the static, so one module can register
+            // several specs without inventing unique names.
+            const _: () = {
+                #[::scattered_collect::scatter($crate::shaders::common::manifest::MANIFEST)]
+                static REG: (
+                    &'static str,
+                    &'static $crate::shaders::common::manifest::KernelSpec,
+                ) = ($spec.entry, &$spec);
+            };
+        )+
+    };
+}
+
 pub struct KernelSpec {
     pub name: &'static str,
     pub entry: &'static str,

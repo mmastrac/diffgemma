@@ -234,6 +234,4 @@ pub const SPEC: crate::shaders::manifest::KernelSpec = crate::shaders::manifest:
     variants: crate::shaders::manifest::KernelVariants::Elementwise,
 };
 
-#[scattered_collect::scatter(crate::shaders::common::manifest::MANIFEST)]
-static SPEC_REG: (&'static str, &'static crate::shaders::manifest::KernelSpec) =
-    (SPEC.entry, &SPEC);
+crate::register_kernel_specs!(SPEC);

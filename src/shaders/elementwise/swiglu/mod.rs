@@ -476,10 +476,4 @@ mod tests {
     }
 }
 
-#[scattered_collect::scatter(crate::shaders::common::manifest::MANIFEST)]
-static SPEC_REG: (&'static str, &'static crate::shaders::manifest::KernelSpec) =
-    (SPEC.entry, &SPEC);
-
-#[scattered_collect::scatter(crate::shaders::common::manifest::MANIFEST)]
-static SPEC_MOE_GATE_UP_REG: (&'static str, &'static crate::shaders::manifest::KernelSpec) =
-    (SPEC_MOE_GATE_UP.entry, &SPEC_MOE_GATE_UP);
+crate::register_kernel_specs!(SPEC, SPEC_MOE_GATE_UP);
