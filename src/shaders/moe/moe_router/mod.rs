@@ -331,3 +331,14 @@ crate::kernel_spec! {
         variants: KernelVariants::Elementwise,
     }
 }
+
+crate::kernel_spec! {
+    pub const SPEC_MOE_ROUTER_TOPK {
+        name: "moe_router_topk",
+        entry: "moe_router_topk",
+        source: TOPK_SHADER,
+        quant_formats: &[QuantFormat::Q4Affine],
+        fc: &[],
+        variants: KernelVariants::Elementwise,
+    }
+}

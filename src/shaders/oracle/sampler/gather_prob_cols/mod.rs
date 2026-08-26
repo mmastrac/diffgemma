@@ -183,3 +183,14 @@ mod tests {
         min_cos = 0.9999,
     }
 }
+
+crate::kernel_spec! {
+    pub const SPEC {
+        name: "gather_prob_cols",
+        entry: "gather_prob_cols",
+        source: SHADER,
+        quant_formats: &[QuantFormat::Q4Affine],
+        fc: &[],
+        variants: KernelVariants::Elementwise,
+    }
+}

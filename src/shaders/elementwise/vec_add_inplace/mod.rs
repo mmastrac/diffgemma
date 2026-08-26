@@ -118,3 +118,14 @@ mod tests {
         min_cos = 0.9999,
     }
 }
+
+crate::kernel_spec! {
+    pub const SPEC {
+        name: "vec_add_inplace",
+        entry: "vec_add_inplace",
+        source: SHADER,
+        quant_formats: &[QuantFormat::Q4Affine],
+        fc: &[],
+        variants: KernelVariants::Elementwise,
+    }
+}

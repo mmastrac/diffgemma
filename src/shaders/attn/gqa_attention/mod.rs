@@ -517,3 +517,14 @@ mod tests {
         run_matrix(sliding_tight_fixture, 1e-4);
     }
 }
+
+crate::kernel_spec! {
+    pub const SPEC {
+        name: "gqa_attention",
+        entry: "gqa_attention",
+        source: SHADER,
+        quant_formats: &[QuantFormat::Q4Affine],
+        fc: &[],
+        variants: KernelVariants::Elementwise,
+    }
+}

@@ -82,3 +82,14 @@ pub fn dispatch_shape(
         },
     )
 }
+
+crate::kernel_spec! {
+    pub const SPEC {
+        name: "unpack_encoder_kv",
+        entry: "unpack_encoder_kv",
+        source: SHADER,
+        quant_formats: &[QuantFormat::Q4Affine],
+        fc: &[(4, "KV_FMT_FC")],
+        variants: KernelVariants::Elementwise,
+    }
+}

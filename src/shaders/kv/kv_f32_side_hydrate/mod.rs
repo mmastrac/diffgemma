@@ -21,3 +21,14 @@ pub fn pipeline_for_kv(
     }];
     ctx.compile_subkernel_ex(SHADER, ENTRY, variant, fmt.label(), &[], &uints)
 }
+
+crate::kernel_spec! {
+    pub const SPEC {
+        name: "kv_f32_side_hydrate",
+        entry: "kv_f32_side_hydrate",
+        source: SHADER,
+        quant_formats: &[QuantFormat::Q4Affine],
+        fc: &[(4, "KV_FMT_FC")],
+        variants: KernelVariants::Elementwise,
+    }
+}

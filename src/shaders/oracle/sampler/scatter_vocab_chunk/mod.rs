@@ -190,3 +190,14 @@ mod tests {
         run_matrix(lm_head_chunk_fixture, 0.0);
     }
 }
+
+crate::kernel_spec! {
+    pub const SPEC {
+        name: "scatter_vocab_chunk",
+        entry: "scatter_vocab_chunk",
+        source: SHADER,
+        quant_formats: &[QuantFormat::Q4Affine],
+        fc: &[],
+        variants: KernelVariants::Elementwise,
+    }
+}

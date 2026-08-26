@@ -276,3 +276,14 @@ pub fn bench_flash_window(
 #[cfg(test)]
 #[path = "mod_tests.rs"]
 mod mod_tests;
+
+crate::kernel_spec! {
+    pub const SPEC {
+        name: "attention_flash",
+        entry: "attn_flash",
+        source: SHADER,
+        quant_formats: &[QuantFormat::Q4Affine],
+        fc: &[],
+        variants: KernelVariants::Elementwise,
+    }
+}

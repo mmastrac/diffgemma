@@ -163,3 +163,14 @@ mod tests {
         run_matrix(canvas_vocab_fixture, 0.0);
     }
 }
+
+crate::kernel_spec! {
+    pub const SPEC {
+        name: "argmax_rows",
+        entry: "argmax_rows",
+        source: SHADER,
+        quant_formats: &[QuantFormat::Q4Affine],
+        fc: &[],
+        variants: KernelVariants::Elementwise,
+    }
+}

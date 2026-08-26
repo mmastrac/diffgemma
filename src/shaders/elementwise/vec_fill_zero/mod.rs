@@ -117,3 +117,14 @@ mod tests {
         min_cos = 0.9999,
     }
 }
+
+crate::kernel_spec! {
+    pub const SPEC {
+        name: "vec_fill_zero",
+        entry: "vec_fill_zero",
+        source: SHADER,
+        quant_formats: &[QuantFormat::Q4Affine],
+        fc: &[],
+        variants: KernelVariants::Elementwise,
+    }
+}

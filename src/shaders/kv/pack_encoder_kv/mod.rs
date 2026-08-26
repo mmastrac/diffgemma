@@ -418,3 +418,14 @@ mod roundtrip_tests {
         assert_bits_eq(&hv, &uv, "hydrate vs unpack values (q8)");
     }
 }
+
+crate::kernel_spec! {
+    pub const SPEC {
+        name: "pack_encoder_kv",
+        entry: "pack_encoder_kv",
+        source: SHADER,
+        quant_formats: &[QuantFormat::Q4Affine],
+        fc: &[(4, "KV_FMT_FC")],
+        variants: KernelVariants::Elementwise,
+    }
+}

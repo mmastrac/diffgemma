@@ -248,3 +248,14 @@ mod tests {
         assert_route_eq(&cpu, &gpu);
     }
 }
+
+crate::kernel_spec! {
+    pub const SPEC {
+        name: "router_top_k_rows",
+        entry: "router_top_k_rows",
+        source: SHADER,
+        quant_formats: &[QuantFormat::Q4Affine],
+        fc: &[],
+        variants: KernelVariants::Elementwise,
+    }
+}

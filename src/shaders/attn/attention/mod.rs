@@ -1039,3 +1039,25 @@ mod tests {
         );
     }
 }
+
+crate::kernel_spec! {
+    pub const SPEC_ATTENTION_MMA2 {
+        name: "attention_mma2",
+        entry: "attention_mma2",
+        source: SHADER_MMA2,
+        quant_formats: &[QuantFormat::Q4Affine],
+        fc: &[(4, "KV_FMT_FC"), (30, "KV_F32_SIDE_FC")],
+        variants: KernelVariants::Elementwise,
+    }
+}
+
+crate::kernel_spec! {
+    pub const SPEC_ATTENTION_MMA_FULL {
+        name: "attention_mma_full",
+        entry: "attention_mma_full",
+        source: SHADER_MMA_FULL,
+        quant_formats: &[QuantFormat::Q4Affine],
+        fc: &[(4, "KV_FMT_FC"), (30, "KV_F32_SIDE_FC"), (31, "QK_ILP2_FC")],
+        variants: KernelVariants::Elementwise,
+    }
+}
