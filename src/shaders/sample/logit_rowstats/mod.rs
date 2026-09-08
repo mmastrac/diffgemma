@@ -6,10 +6,21 @@ use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;
 use crate::shaders::variant::KernelVariant;
 
-pub const ENTRY: &str = "logit_rowstats";
+crate::shader_kernel! {
+    name = "logit_rowstats",
+    metal = "logit_rowstats.metal",
+    pipeline = |ctx, variant| ctx.compile_subkernel(SHADER, ENTRY, variant),
+    spec = {
+            quant_formats: &[QuantFormat::Q4Affine],
+            fc: &[],
+            variants: KernelVariants::Elementwise,
+    },
+    tests = [
+        tiny => tiny_fixture => (1e-3, 0.9999),
+        wide => wide_fixture => (1e-2, 0.9999),
+    ],
+}
 pub const THREADGROUP_WIDTH: usize = 256;
-
-pub const SHADER: &str = include_str!("logit_rowstats.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {
@@ -22,10 +33,6 @@ impl Fixture {
     pub fn out_len(&self) -> usize {
         self.rows * 2
     }
-}
-
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.out_len()
 }
 
 pub fn tiny_fixture(_: ElemFormat) -> Fixture {
@@ -59,14 +66,6 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
 
 pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
     cpu(f)
-}
-
-#[cfg(target_os = "macos")]
-pub fn pipeline_for(
-    ctx: &crate::metal::device::MetalContext,
-    variant: KernelVariant,
-) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_subkernel(SHADER, ENTRY, variant)
 }
 
 #[cfg(target_os = "macos")]
@@ -135,44 +134,4 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let mut out = vec![0.0f32; f.out_len()];
     BufferPool::read_f32(&buf_out, &mut out);
     Ok(out)
-}
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "logit_rowstats",
-        entry: "logit_rowstats",
-        source: SHADER,
-        quant_formats: &[QuantFormat::Q4Affine],
-        fc: &[],
-        variants: KernelVariants::Elementwise,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::kernel_oracle_matrix;
-
-    kernel_oracle_matrix! {
-        mod tiny,
-        cpu = crate::shaders::logit_rowstats::cpu,
-        cpu_oracle = crate::shaders::logit_rowstats::cpu_oracle,
-        gpu = crate::shaders::logit_rowstats::gpu,
-        fixture = crate::shaders::logit_rowstats::tiny_fixture,
-        out_len = crate::shaders::logit_rowstats::fixture_len,
-        formats: [F32],
-        max_tol = 1e-3,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod wide,
-        cpu = crate::shaders::logit_rowstats::cpu,
-        cpu_oracle = crate::shaders::logit_rowstats::cpu_oracle,
-        gpu = crate::shaders::logit_rowstats::gpu,
-        fixture = crate::shaders::logit_rowstats::wide_fixture,
-        out_len = crate::shaders::logit_rowstats::fixture_len,
-        formats: [F32],
-        max_tol = 1e-2,
-        min_cos = 0.9999,
-    }
 }

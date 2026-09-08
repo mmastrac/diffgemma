@@ -85,10 +85,6 @@ fn quantize_stack_nvfp4(rows: &[f32], experts: usize, out_dim: usize, in_dim: us
     dst
 }
 
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.out_len()
-}
-
 pub fn tiny_fixture(fmt: ElemFormat) -> Fixture {
     q4_tiny(fmt)
 }
@@ -252,7 +248,6 @@ mod tests {
         cpu_oracle = crate::shaders::moe_grouped_nvfp4::cpu_oracle,
         gpu = crate::shaders::moe_grouped_nvfp4::gpu,
         fixture = crate::shaders::moe_grouped_nvfp4::tiny_fixture,
-        out_len = crate::shaders::moe_grouped_nvfp4::fixture_len,
         formats: [F32],
         max_tol = 5e-2,
         min_cos = 0.999,
@@ -264,7 +259,6 @@ mod tests {
         cpu_oracle = crate::shaders::moe_grouped_nvfp4::cpu_oracle,
         gpu = crate::shaders::moe_grouped_nvfp4::gpu,
         fixture = crate::shaders::moe_grouped_nvfp4::wide_fixture,
-        out_len = crate::shaders::moe_grouped_nvfp4::fixture_len,
         formats: [F32],
         max_tol = 8e-2,
         min_cos = 0.999,

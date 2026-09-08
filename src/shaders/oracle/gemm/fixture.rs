@@ -26,10 +26,6 @@ impl Fixture {
     }
 }
 
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.out_len()
-}
-
 /// Deterministic fixture: `x[i] = sin(i*xf)*xa + xb`, `w[i] = cos(i*wf)*wa + wb`.
 pub fn make_fixture(
     m: usize,

@@ -8,9 +8,22 @@ use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;
 use crate::shaders::variant::KernelVariant;
 
-pub const ENTRY: &str = "qk_rope_kv";
-
-pub const SHADER: &str = include_str!("qk_rope_kv.metal");
+crate::shader_kernel! {
+    name = "qk_rope_kv",
+    metal = "qk_rope_kv.metal",
+    pipeline = |ctx, variant| ctx.compile_subkernel(SHADER, ENTRY, variant),
+    spec = {
+            quant_formats: &[QuantFormat::Q4Affine],
+            fc: &[],
+            variants: KernelVariants::Elementwise,
+    },
+    tests = [
+        tiny => tiny_fixture => (1e-2, 0.9999),
+        full_layer => full_layer_fixture => (1e-2, 0.9999),
+        full_attn_v_alias => full_attn_v_alias_fixture => (1e-2, 0.9999),
+        full_hd512_v_alias => full_hd512_v_alias_fixture => (2e-2, 0.999),
+    ],
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -73,10 +86,6 @@ impl Fixture {
     pub fn out_len(&self) -> usize {
         self.q.len() + self.k.len() + self.canvas * self.n_kv() * self.head_dim() * 2
     }
-}
-
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.out_len()
 }
 
 pub fn tiny_fixture(_: ElemFormat) -> Fixture {
@@ -260,14 +269,6 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
 
 pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
     cpu(f)
-}
-
-#[cfg(target_os = "macos")]
-pub fn pipeline_for(
-    ctx: &crate::metal::device::MetalContext,
-    variant: KernelVariant,
-) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_subkernel(SHADER, ENTRY, variant)
 }
 
 #[cfg(target_os = "macos")]
@@ -469,68 +470,4 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         }
     }
     Ok(pack_out(&q, &k, &kvcache, f))
-}
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "qk_rope_kv",
-        entry: "qk_rope_kv",
-        source: SHADER,
-        quant_formats: &[QuantFormat::Q4Affine],
-        fc: &[],
-        variants: KernelVariants::Elementwise,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::kernel_oracle_matrix;
-
-    kernel_oracle_matrix! {
-        mod tiny,
-        cpu = crate::shaders::qk_rope_kv::cpu,
-        cpu_oracle = crate::shaders::qk_rope_kv::cpu_oracle,
-        gpu = crate::shaders::qk_rope_kv::gpu,
-        fixture = crate::shaders::qk_rope_kv::tiny_fixture,
-        out_len = crate::shaders::qk_rope_kv::fixture_len,
-        formats: [F32],
-        max_tol = 1e-2,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod full_layer,
-        cpu = crate::shaders::qk_rope_kv::cpu,
-        cpu_oracle = crate::shaders::qk_rope_kv::cpu_oracle,
-        gpu = crate::shaders::qk_rope_kv::gpu,
-        fixture = crate::shaders::qk_rope_kv::full_layer_fixture,
-        out_len = crate::shaders::qk_rope_kv::fixture_len,
-        formats: [F32],
-        max_tol = 1e-2,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod full_attn_v_alias,
-        cpu = crate::shaders::qk_rope_kv::cpu,
-        cpu_oracle = crate::shaders::qk_rope_kv::cpu_oracle,
-        gpu = crate::shaders::qk_rope_kv::gpu,
-        fixture = crate::shaders::qk_rope_kv::full_attn_v_alias_fixture,
-        out_len = crate::shaders::qk_rope_kv::fixture_len,
-        formats: [F32],
-        max_tol = 1e-2,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod full_hd512_v_alias,
-        cpu = crate::shaders::qk_rope_kv::cpu,
-        cpu_oracle = crate::shaders::qk_rope_kv::cpu_oracle,
-        gpu = crate::shaders::qk_rope_kv::gpu,
-        fixture = crate::shaders::qk_rope_kv::full_hd512_v_alias_fixture,
-        out_len = crate::shaders::qk_rope_kv::fixture_len,
-        formats: [F32],
-        max_tol = 2e-2,
-        min_cos = 0.999,
-    }
 }

@@ -1,17 +1,15 @@
 //! Backward pass of row softmax: ds = probs * (dp - sum(probs*dp)).
 
-use crate::Error;
-
-pub const ENTRY: &str = "softmax_backward";
-pub const METAL: &str = include_str!("softmax_backward.metal");
-
-#[cfg(all(feature = "cuda", dgops_cuda_kernels))]
-const CUBIN: &[u8] = include_bytes!(concat!(
-    env!("OUT_DIR"),
-    "/cuda/ops/softmax_backward/softmax_backward.cubin"
-));
-#[cfg(all(feature = "cuda", not(dgops_cuda_kernels)))]
-const CUBIN: &[u8] = &[];
+crate::op_kernel! {
+    name = "softmax_backward",
+    metal = "softmax_backward.metal",
+    cuda = "ops/softmax_backward/softmax_backward",
+    fixture = Fixture,
+    tests = [
+        tiny => tiny_fixture => (1e-6, 0.999999),
+        wide => wide_fixture => (1e-6, 0.999999),
+    ],
+}
 
 #[derive(Debug, Clone)]
 pub struct Fixture {
@@ -26,10 +24,6 @@ impl Fixture {
     pub fn len(&self) -> usize {
         self.rows * self.cols
     }
-}
-
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.len()
 }
 
 /// Row softmax, used to build a fixture's probs from logits.
@@ -92,52 +86,8 @@ pub fn cpu(fix: &Fixture) -> Vec<f32> {
     }
     out
 }
-
-pub fn gpu(fix: &Fixture) -> Result<Vec<f32>, Error> {
-    #[cfg(target_os = "macos")]
-    {
-        metal::gpu(fix)
-    }
-    #[cfg(all(feature = "cuda", not(target_os = "macos")))]
-    {
-        cuda::gpu(fix)
-    }
-    #[cfg(not(any(target_os = "macos", all(feature = "cuda", not(target_os = "macos")))))]
-    {
-        let _ = fix;
-        Err(Error::Gpu(
-            "no GPU backend enabled (build with --features cuda on a CUDA host)",
-        ))
-    }
-}
-
-#[cfg(feature = "cuda")]
-pub mod cuda;
-#[cfg(target_os = "macos")]
-pub mod metal;
-
 #[cfg(test)]
-mod tests {
-    crate::op_oracle_matrix! {
-        mod tiny,
-        cpu = crate::ops::softmax_backward::cpu,
-        gpu = crate::ops::softmax_backward::gpu,
-        fixture = crate::ops::softmax_backward::tiny_fixture,
-        out_len = crate::ops::softmax_backward::fixture_len,
-        max_tol = 1e-6,
-        min_cos = 0.999999,
-    }
-
-    crate::op_oracle_matrix! {
-        mod wide,
-        cpu = crate::ops::softmax_backward::cpu,
-        gpu = crate::ops::softmax_backward::gpu,
-        fixture = crate::ops::softmax_backward::wide_fixture,
-        out_len = crate::ops::softmax_backward::fixture_len,
-        max_tol = 1e-6,
-        min_cos = 0.999999,
-    }
-
+mod extra_tests {
     /// The defining invariant: every row's ds sums to zero.
     #[test]
     fn rows_sum_to_zero() {

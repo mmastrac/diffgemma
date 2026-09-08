@@ -5,9 +5,19 @@ use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;
 use crate::shaders::variant::KernelVariant;
 
-pub const ENTRY: &str = "vec_fill_zero";
-
-pub const SHADER: &str = include_str!("vec_fill_zero.metal");
+crate::shader_kernel! {
+    name = "vec_fill_zero",
+    metal = "vec_fill_zero.metal",
+    pipeline = |ctx, variant| ctx.compile_subkernel(SHADER, ENTRY, variant),
+    spec = {
+            quant_formats: &[QuantFormat::Q4Affine],
+            fc: &[],
+            variants: KernelVariants::Elementwise,
+    },
+    tests = [
+        tiny => tiny_fixture => (1e-6, 0.9999),
+    ],
+}
 
 #[derive(Debug, Clone)]
 pub struct Fixture {
@@ -20,10 +30,6 @@ impl Fixture {
     pub fn out_len(&self) -> usize {
         self.len as usize
     }
-}
-
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.out_len()
 }
 
 pub fn tiny_fixture(_: ElemFormat) -> Fixture {
@@ -44,14 +50,6 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
 
 pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
     cpu(f)
-}
-
-#[cfg(target_os = "macos")]
-pub fn pipeline_for(
-    ctx: &crate::metal::device::MetalContext,
-    variant: KernelVariant,
-) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_subkernel(SHADER, ENTRY, variant)
 }
 
 #[cfg(target_os = "macos")]
@@ -99,32 +97,4 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let mut full = vec![0.0f32; buf_len];
     BufferPool::read_f32(&buf, &mut full);
     Ok(full[f.base as usize..(f.base + f.len) as usize].to_vec())
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::kernel_oracle_matrix;
-
-    kernel_oracle_matrix! {
-        mod tiny,
-        cpu = crate::shaders::vec_fill_zero::cpu,
-        cpu_oracle = crate::shaders::vec_fill_zero::cpu_oracle,
-        gpu = crate::shaders::vec_fill_zero::gpu,
-        fixture = crate::shaders::vec_fill_zero::tiny_fixture,
-        out_len = crate::shaders::vec_fill_zero::fixture_len,
-        formats: [F32],
-        max_tol = 1e-6,
-        min_cos = 0.9999,
-    }
-}
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "vec_fill_zero",
-        entry: "vec_fill_zero",
-        source: SHADER,
-        quant_formats: &[QuantFormat::Q4Affine],
-        fc: &[],
-        variants: KernelVariants::Elementwise,
-    }
 }

@@ -8,9 +8,24 @@ use crate::model::attention::{self, AttentionParams, GqaMask};
 use crate::model::mask::DecoderAttnMask;
 use crate::shaders::test_util::ElemFormat;
 
-pub const ENTRY: &str = "gqa_attention";
-
-pub const SHADER: &str = include_str!("gqa_attention.metal");
+crate::shader_kernel! {
+    name = "gqa_attention",
+    metal = "gqa_attention.metal",
+    spec = {
+            quant_formats: &[QuantFormat::Q4Affine],
+            fc: &[],
+            variants: KernelVariants::Elementwise,
+    },
+    tests = [
+        tiny => tiny_fixture => no_variant => (1e-4, 0.9999),
+        sliding_prefill => sliding_prefill_fixture => no_variant => (1e-4, 0.9999),
+        encoder_extend => encoder_extend_fixture => no_variant => (1e-4, 0.9999),
+        full_layer => full_layer_fixture => no_variant => (1e-4, 0.9999),
+        decoder_bitmap => decoder_bitmap_fixture => no_variant => (1e-4, 0.9999),
+        sparse_decoder_bitmap => sparse_decoder_bitmap_fixture => no_variant => (1e-4, 0.9999),
+        sliding_tight => sliding_tight_fixture => no_variant => (1e-4, 0.9999),
+    ],
+}
 
 #[derive(Debug, Clone)]
 pub enum MaskMode {
@@ -37,10 +52,6 @@ impl Fixture {
     pub fn out_len(&self) -> usize {
         self.seq_len * self.params.n_heads * self.params.head_dim
     }
-}
-
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.out_len()
 }
 
 fn fill(len: usize, seed: f32) -> Vec<f32> {
@@ -441,90 +452,4 @@ pub fn gpu(f: &Fixture) -> Result<Vec<f32>, Error> {
         pool.release(bytes, b);
     }
     Ok(out)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::shaders::test_util::{ElemFormat, assert_oracle};
-
-    fn run_matrix(fixture_fn: fn(ElemFormat) -> Fixture, max_tol: f32) {
-        let fix = fixture_fn(ElemFormat::F32);
-        let cpu = cpu(&fix);
-        assert!(cpu.iter().all(|v| v.is_finite()));
-        assert_eq!(cpu.len(), fixture_len(&fix));
-
-        #[cfg(target_os = "macos")]
-        {
-            let gpu = gpu(&fix).expect("gpu");
-            assert_oracle(&gpu, &cpu, max_tol, 0.9999);
-        }
-    }
-
-    #[test]
-    fn cpu_tiny() {
-        if crate::shaders::test_util::skip_gpu_on_ci() {
-            return;
-        }
-        run_matrix(tiny_fixture, 1e-4);
-    }
-
-    #[test]
-    fn cpu_sliding_prefill() {
-        if crate::shaders::test_util::skip_gpu_on_ci() {
-            return;
-        }
-        run_matrix(sliding_prefill_fixture, 1e-4);
-    }
-
-    #[test]
-    fn cpu_encoder_extend() {
-        if crate::shaders::test_util::skip_gpu_on_ci() {
-            return;
-        }
-        run_matrix(encoder_extend_fixture, 1e-4);
-    }
-
-    #[test]
-    fn cpu_full_layer() {
-        if crate::shaders::test_util::skip_gpu_on_ci() {
-            return;
-        }
-        run_matrix(full_layer_fixture, 1e-4);
-    }
-
-    #[test]
-    fn cpu_decoder_bitmap() {
-        if crate::shaders::test_util::skip_gpu_on_ci() {
-            return;
-        }
-        run_matrix(decoder_bitmap_fixture, 1e-4);
-    }
-
-    #[test]
-    fn cpu_sparse_decoder_bitmap() {
-        if crate::shaders::test_util::skip_gpu_on_ci() {
-            return;
-        }
-        run_matrix(sparse_decoder_bitmap_fixture, 1e-4);
-    }
-
-    #[test]
-    fn cpu_sliding_tight() {
-        if crate::shaders::test_util::skip_gpu_on_ci() {
-            return;
-        }
-        run_matrix(sliding_tight_fixture, 1e-4);
-    }
-}
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "gqa_attention",
-        entry: "gqa_attention",
-        source: SHADER,
-        quant_formats: &[QuantFormat::Q4Affine],
-        fc: &[],
-        variants: KernelVariants::Elementwise,
-    }
 }

@@ -1,14 +1,15 @@
 //! AdamW update: p_new, m_new and v_new in one pass.
 
-use crate::Error;
-
-pub const ENTRY: &str = "adamw";
-pub const METAL: &str = include_str!("adamw.metal");
-
-#[cfg(all(feature = "cuda", dgops_cuda_kernels))]
-const CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cuda/ops/adamw/adamw.cubin"));
-#[cfg(all(feature = "cuda", not(dgops_cuda_kernels)))]
-const CUBIN: &[u8] = &[];
+crate::op_kernel! {
+    name = "adamw",
+    metal = "adamw.metal",
+    cuda = "ops/adamw/adamw",
+    fixture = Fixture,
+    tests = [
+        tiny => { fixture = tiny_fixture, gpu = gpu, out_len = out_len, tol = 1e-6, cos = 0.999999 },
+        bias_correction => { fixture = bias_correction_fixture, gpu = gpu, out_len = out_len, tol = 1e-6, cos = 0.999999 },
+    ],
+}
 
 /// Must stay layout-identical to AdamwParams in adamw.metal and adamw.cu.
 #[repr(C)]
@@ -107,50 +108,4 @@ pub fn cpu(fix: &Fixture) -> Vec<f32> {
         out[2 * n + i] = v_new;
     }
     out
-}
-
-pub fn gpu(fix: &Fixture) -> Result<Vec<f32>, Error> {
-    #[cfg(target_os = "macos")]
-    {
-        metal::gpu(fix)
-    }
-    #[cfg(all(feature = "cuda", not(target_os = "macos")))]
-    {
-        cuda::gpu(fix)
-    }
-    #[cfg(not(any(target_os = "macos", all(feature = "cuda", not(target_os = "macos")))))]
-    {
-        let _ = fix;
-        Err(Error::Gpu(
-            "no GPU backend enabled (build with --features cuda on a CUDA host)",
-        ))
-    }
-}
-
-#[cfg(feature = "cuda")]
-pub mod cuda;
-#[cfg(target_os = "macos")]
-pub mod metal;
-
-#[cfg(test)]
-mod tests {
-    crate::op_oracle_matrix! {
-        mod tiny,
-        cpu = crate::ops::adamw::cpu,
-        gpu = crate::ops::adamw::gpu,
-        fixture = crate::ops::adamw::tiny_fixture,
-        out_len = crate::ops::adamw::out_len,
-        max_tol = 1e-6,
-        min_cos = 0.999999,
-    }
-
-    crate::op_oracle_matrix! {
-        mod bias_correction,
-        cpu = crate::ops::adamw::cpu,
-        gpu = crate::ops::adamw::gpu,
-        fixture = crate::ops::adamw::bias_correction_fixture,
-        out_len = crate::ops::adamw::out_len,
-        max_tol = 1e-6,
-        min_cos = 0.999999,
-    }
 }

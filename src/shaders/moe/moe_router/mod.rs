@@ -10,10 +10,21 @@ use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;
 use crate::shaders::variant::KernelVariant;
 
-pub const ENTRY: &str = "moe_router";
+crate::shader_kernel! {
+    name = "moe_router",
+    metal = "moe_router.metal",
+    pipeline = |ctx, variant| ctx.compile_subkernel(SHADER, ENTRY, variant),
+    spec = {
+            quant_formats: &[QuantFormat::Q4Affine],
+            fc: &[],
+            variants: KernelVariants::Elementwise,
+    },
+    tests = [
+        tiny => tiny_fixture => (1e-2, 0.9999),
+        wide => wide_fixture => (2e-2, 0.9999),
+    ],
+}
 pub const THREADGROUP_WIDTH: usize = 128;
-
-pub const SHADER: &str = include_str!("moe_router.metal");
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -104,10 +115,6 @@ impl Fixture {
     }
 }
 
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.out_len()
-}
-
 pub fn tiny_fixture(_: ElemFormat) -> Fixture {
     let canvas = 2usize;
     let hidden = 64usize;
@@ -184,14 +191,6 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
 
 pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
     cpu(f)
-}
-
-#[cfg(target_os = "macos")]
-pub fn pipeline_for(
-    ctx: &crate::metal::device::MetalContext,
-    variant: KernelVariant,
-) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_subkernel(SHADER, ENTRY, variant)
 }
 
 #[cfg(target_os = "macos")]
@@ -285,52 +284,12 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     Ok(route_from_scratch(&route, f))
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::kernel_oracle_matrix;
-
-    kernel_oracle_matrix! {
-        mod tiny,
-        cpu = crate::shaders::moe_router::cpu,
-        cpu_oracle = crate::shaders::moe_router::cpu_oracle,
-        gpu = crate::shaders::moe_router::gpu,
-        fixture = crate::shaders::moe_router::tiny_fixture,
-        out_len = crate::shaders::moe_router::fixture_len,
-        formats: [F32],
-        max_tol = 1e-2,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod wide,
-        cpu = crate::shaders::moe_router::cpu,
-        cpu_oracle = crate::shaders::moe_router::cpu_oracle,
-        gpu = crate::shaders::moe_router::gpu,
-        fixture = crate::shaders::moe_router::wide_fixture,
-        out_len = crate::shaders::moe_router::fixture_len,
-        formats: [F32],
-        max_tol = 2e-2,
-        min_cos = 0.9999,
-    }
-}
-
 pub mod cpu;
 
 /// Subkernel: fused top-k over router probs (colocated `moe_router_topk.metal`,
 /// dispatched from step_kernel.rs).
 pub const TOPK_ENTRY: &str = "moe_router_topk";
 pub const TOPK_SHADER: &str = include_str!("moe_router_topk.metal");
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "moe_router",
-        entry: "moe_router",
-        source: SHADER,
-        quant_formats: &[QuantFormat::Q4Affine],
-        fc: &[],
-        variants: KernelVariants::Elementwise,
-    }
-}
 
 crate::kernel_spec! {
     pub const SPEC_MOE_ROUTER_TOPK {

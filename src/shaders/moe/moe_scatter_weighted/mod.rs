@@ -7,9 +7,20 @@ use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;
 use crate::shaders::variant::KernelVariant;
 
-pub const ENTRY: &str = "moe_scatter_weighted";
-
-pub const SHADER: &str = include_str!("moe_scatter_weighted.metal");
+crate::shader_kernel! {
+    name = "moe_scatter_weighted",
+    metal = "moe_scatter_weighted.metal",
+    pipeline = |ctx, variant| ctx.compile_subkernel(SHADER, ENTRY, variant),
+    spec = {
+            quant_formats: &[QuantFormat::Q4Affine],
+            fc: &[],
+            variants: KernelVariants::Elementwise,
+    },
+    tests = [
+        tiny => { fixture = tiny_fixture, gpu = gpu, cpu = cpu, oracle = cpu_oracle, tol = 1e-5, cos = 0.9999 },
+        moe_routing => { fixture = moe_routing_fixture, gpu = gpu, cpu = cpu, oracle = cpu_oracle, tol = 1e-5, cos = 0.9999 },
+    ],
+}
 
 #[derive(Clone)]
 pub struct Fixture {
@@ -108,14 +119,6 @@ pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
 }
 
 #[cfg(target_os = "macos")]
-pub fn pipeline_for(
-    ctx: &crate::metal::device::MetalContext,
-    variant: KernelVariant,
-) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_subkernel(SHADER, ENTRY, variant)
-}
-
-#[cfg(target_os = "macos")]
 use objc2::runtime::ProtocolObject;
 #[cfg(target_os = "macos")]
 use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder};
@@ -189,44 +192,4 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     Ok(out)
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::kernel_oracle_matrix;
-
-    kernel_oracle_matrix! {
-        mod tiny,
-        cpu = crate::shaders::moe_scatter_weighted::cpu,
-        cpu_oracle = crate::shaders::moe_scatter_weighted::cpu_oracle,
-        gpu = crate::shaders::moe_scatter_weighted::gpu,
-        fixture = crate::shaders::moe_scatter_weighted::tiny_fixture,
-        out_len = |f: &crate::shaders::moe_scatter_weighted::Fixture| f.out_len(),
-        formats: [F32],
-        max_tol = 1e-5,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod moe_routing,
-        cpu = crate::shaders::moe_scatter_weighted::cpu,
-        cpu_oracle = crate::shaders::moe_scatter_weighted::cpu_oracle,
-        gpu = crate::shaders::moe_scatter_weighted::gpu,
-        fixture = crate::shaders::moe_scatter_weighted::moe_routing_fixture,
-        out_len = |f: &crate::shaders::moe_scatter_weighted::Fixture| f.out_len(),
-        formats: [F32],
-        max_tol = 1e-5,
-        min_cos = 0.9999,
-    }
-}
-
 pub mod cpu;
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "moe_scatter_weighted",
-        entry: "moe_scatter_weighted",
-        source: SHADER,
-        quant_formats: &[QuantFormat::Q4Affine],
-        fc: &[],
-        variants: KernelVariants::Elementwise,
-    }
-}

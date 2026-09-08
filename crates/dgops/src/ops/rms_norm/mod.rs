@@ -1,17 +1,15 @@
 //! Per-row RMSNorm: out = x / sqrt(mean(x^2) + eps) * weight.
 
-use crate::Error;
-
-pub const ENTRY: &str = "rms_norm_rows";
-pub const METAL: &str = include_str!("rms_norm.metal");
-
-#[cfg(all(feature = "cuda", dgops_cuda_kernels))]
-const CUBIN: &[u8] = include_bytes!(concat!(
-    env!("OUT_DIR"),
-    "/cuda/ops/rms_norm/rms_norm.cubin"
-));
-#[cfg(all(feature = "cuda", not(dgops_cuda_kernels)))]
-const CUBIN: &[u8] = &[];
+crate::op_kernel! {
+    name = "rms_norm_rows",
+    metal = "rms_norm.metal",
+    cuda = "ops/rms_norm/rms_norm",
+    fixture = Fixture,
+    tests = [
+        tiny => tiny_fixture => (1e-5, 0.99999),
+        wide => wide_fixture => (1e-4, 0.99999),
+    ],
+}
 
 #[derive(Debug, Clone)]
 pub struct Fixture {
@@ -26,10 +24,6 @@ impl Fixture {
     pub fn len(&self) -> usize {
         self.rows * self.hidden
     }
-}
-
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.len()
 }
 
 pub fn tiny_fixture() -> Fixture {
@@ -72,50 +66,4 @@ pub fn cpu(fix: &Fixture) -> Vec<f32> {
         }
     }
     out
-}
-
-pub fn gpu(fix: &Fixture) -> Result<Vec<f32>, Error> {
-    #[cfg(target_os = "macos")]
-    {
-        metal::gpu(fix)
-    }
-    #[cfg(all(feature = "cuda", not(target_os = "macos")))]
-    {
-        cuda::gpu(fix)
-    }
-    #[cfg(not(any(target_os = "macos", all(feature = "cuda", not(target_os = "macos")))))]
-    {
-        let _ = fix;
-        Err(Error::Gpu(
-            "no GPU backend enabled (build with --features cuda on a CUDA host)",
-        ))
-    }
-}
-
-#[cfg(feature = "cuda")]
-pub mod cuda;
-#[cfg(target_os = "macos")]
-pub mod metal;
-
-#[cfg(test)]
-mod tests {
-    crate::op_oracle_matrix! {
-        mod tiny,
-        cpu = crate::ops::rms_norm::cpu,
-        gpu = crate::ops::rms_norm::gpu,
-        fixture = crate::ops::rms_norm::tiny_fixture,
-        out_len = crate::ops::rms_norm::fixture_len,
-        max_tol = 1e-5,
-        min_cos = 0.99999,
-    }
-
-    crate::op_oracle_matrix! {
-        mod wide,
-        cpu = crate::ops::rms_norm::cpu,
-        gpu = crate::ops::rms_norm::gpu,
-        fixture = crate::ops::rms_norm::wide_fixture,
-        out_len = crate::ops::rms_norm::fixture_len,
-        max_tol = 1e-4,
-        min_cos = 0.99999,
-    }
 }

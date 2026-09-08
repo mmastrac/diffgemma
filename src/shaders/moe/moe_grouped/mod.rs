@@ -11,10 +11,24 @@ use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;
 use crate::shaders::variant::KernelVariant;
 
-pub const ENTRY: &str = "moe_grouped";
+crate::shader_kernel! {
+    name = "moe_grouped",
+    metal = "moe_grouped.metal",
+    pipeline = |ctx, variant| ctx.compile_subkernel(SHADER, ENTRY, variant),
+    spec = {
+            quant_formats: &[
+                QuantFormat::Q4Affine,
+                QuantFormat::NvFp4,
+            ],
+            fc: &[],
+            variants: KernelVariants::Elementwise,
+    },
+    tests = [
+        tiny => tiny_fixture => (2e-2, 0.9999),
+        wide => wide_fixture => (3e-2, 0.9999),
+    ],
+}
 pub const THREADGROUP_WIDTH: usize = 128;
-
-pub const SHADER: &str = include_str!("moe_grouped.metal");
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -186,10 +200,6 @@ fn quantize_stack(rows: &[f32], experts: usize, out_dim: usize, in_dim: usize) -
     dst
 }
 
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.out_len()
-}
-
 pub fn tiny_fixture(_: ElemFormat) -> Fixture {
     let canvas = 1usize;
     let hidden = 64usize;
@@ -265,14 +275,6 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
 
 pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
     cpu(f)
-}
-
-#[cfg(target_os = "macos")]
-pub fn pipeline_for(
-    ctx: &crate::metal::device::MetalContext,
-    variant: KernelVariant,
-) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_subkernel(SHADER, ENTRY, variant)
 }
 
 #[cfg(target_os = "macos")]
@@ -393,48 +395,5 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     Ok(out)
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::kernel_oracle_matrix;
-
-    kernel_oracle_matrix! {
-        mod tiny,
-        cpu = crate::shaders::moe_grouped::cpu,
-        cpu_oracle = crate::shaders::moe_grouped::cpu_oracle,
-        gpu = crate::shaders::moe_grouped::gpu,
-        fixture = crate::shaders::moe_grouped::tiny_fixture,
-        out_len = crate::shaders::moe_grouped::fixture_len,
-        formats: [F32],
-        max_tol = 2e-2,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod wide,
-        cpu = crate::shaders::moe_grouped::cpu,
-        cpu_oracle = crate::shaders::moe_grouped::cpu_oracle,
-        gpu = crate::shaders::moe_grouped::gpu,
-        fixture = crate::shaders::moe_grouped::wide_fixture,
-        out_len = crate::shaders::moe_grouped::fixture_len,
-        formats: [F32],
-        max_tol = 3e-2,
-        min_cos = 0.9999,
-    }
-}
-
 pub mod cpu;
 pub mod nvfp4;
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "moe_grouped",
-        entry: "moe_grouped",
-        source: SHADER,
-        quant_formats: &[
-            QuantFormat::Q4Affine,
-            QuantFormat::NvFp4,
-        ],
-        fc: &[],
-        variants: KernelVariants::Elementwise,
-    }
-}

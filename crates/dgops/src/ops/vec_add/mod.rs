@@ -1,14 +1,15 @@
 //! out += addend, elementwise.
 
-use crate::Error;
-
-pub const ENTRY: &str = "vec_add_inplace";
-pub const METAL: &str = include_str!("vec_add.metal");
-
-#[cfg(all(feature = "cuda", dgops_cuda_kernels))]
-const CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cuda/ops/vec_add/vec_add.cubin"));
-#[cfg(all(feature = "cuda", not(dgops_cuda_kernels)))]
-const CUBIN: &[u8] = &[];
+crate::op_kernel! {
+    name = "vec_add_inplace",
+    metal = "vec_add.metal",
+    cuda = "ops/vec_add/vec_add",
+    fixture = Fixture,
+    tests = [
+        tiny => tiny_fixture => (0.0, 1.0),
+        long => long_fixture => (0.0, 1.0),
+    ],
+}
 
 #[derive(Debug, Clone)]
 pub struct Fixture {
@@ -20,10 +21,6 @@ impl Fixture {
     pub fn len(&self) -> usize {
         self.x.len()
     }
-}
-
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.len()
 }
 
 pub fn tiny_fixture() -> Fixture {
@@ -50,50 +47,4 @@ pub fn cpu(fix: &Fixture) -> Vec<f32> {
         .zip(fix.addend.iter())
         .map(|(x, a)| x + a)
         .collect()
-}
-
-pub fn gpu(fix: &Fixture) -> Result<Vec<f32>, Error> {
-    #[cfg(target_os = "macos")]
-    {
-        metal::gpu(fix)
-    }
-    #[cfg(all(feature = "cuda", not(target_os = "macos")))]
-    {
-        cuda::gpu(fix)
-    }
-    #[cfg(not(any(target_os = "macos", all(feature = "cuda", not(target_os = "macos")))))]
-    {
-        let _ = fix;
-        Err(Error::Gpu(
-            "no GPU backend enabled (build with --features cuda on a CUDA host)",
-        ))
-    }
-}
-
-#[cfg(feature = "cuda")]
-pub mod cuda;
-#[cfg(target_os = "macos")]
-pub mod metal;
-
-#[cfg(test)]
-mod tests {
-    crate::op_oracle_matrix! {
-        mod tiny,
-        cpu = crate::ops::vec_add::cpu,
-        gpu = crate::ops::vec_add::gpu,
-        fixture = crate::ops::vec_add::tiny_fixture,
-        out_len = crate::ops::vec_add::fixture_len,
-        max_tol = 0.0,
-        min_cos = 1.0,
-    }
-
-    crate::op_oracle_matrix! {
-        mod long,
-        cpu = crate::ops::vec_add::cpu,
-        gpu = crate::ops::vec_add::gpu,
-        fixture = crate::ops::vec_add::long_fixture,
-        out_len = crate::ops::vec_add::fixture_len,
-        max_tol = 0.0,
-        min_cos = 1.0,
-    }
 }

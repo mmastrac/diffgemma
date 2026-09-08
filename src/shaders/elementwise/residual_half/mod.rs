@@ -6,9 +6,20 @@ use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;
 use crate::shaders::variant::KernelVariant;
 
-pub const ENTRY: &str = "residual_half";
-
-pub const SHADER: &str = include_str!("residual_half.metal");
+crate::shader_kernel! {
+    name = "residual_half",
+    metal = "residual_half.metal",
+    pipeline = |ctx, variant| ctx.compile_subkernel(SHADER, ENTRY, variant),
+    spec = {
+            quant_formats: &[QuantFormat::Q4Affine],
+            fc: &[],
+            variants: KernelVariants::Elementwise,
+    },
+    tests = [
+        tiny => tiny_fixture => (1e-3, 0.9999),
+        no_scale => no_scale_fixture => (1e-3, 0.9999),
+    ],
+}
 
 #[derive(Debug, Clone)]
 pub struct Fixture {
@@ -18,13 +29,9 @@ pub struct Fixture {
 }
 
 impl Fixture {
-    pub fn len(&self) -> usize {
+    pub fn out_len(&self) -> usize {
         self.a.len()
     }
-}
-
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.len()
 }
 
 pub fn tiny_fixture(_: ElemFormat) -> Fixture {
@@ -53,14 +60,6 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
 
 pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
     cpu(f)
-}
-
-#[cfg(target_os = "macos")]
-pub fn pipeline_for(
-    ctx: &crate::metal::device::MetalContext,
-    variant: KernelVariant,
-) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_subkernel(SHADER, ENTRY, variant)
 }
 
 #[cfg(target_os = "macos")]
@@ -96,7 +95,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let ctx = MetalContext::new()?;
     let pipeline = pipeline_for(&ctx, variant)?;
     let mut pool = BufferPool::new();
-    let len = f.len();
+    let len = f.out_len();
     let a_f16 = bf16::f32_slice_to_bf16_bits(&f.a);
     let b_f16 = bf16::f32_slice_to_bf16_bits(&f.b);
     let buf_a = pool
@@ -133,44 +132,4 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     Ok((0..len)
         .map(|i| bf16::bf16_bits_to_f32(unsafe { *ptr.add(i) }))
         .collect())
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::kernel_oracle_matrix;
-
-    kernel_oracle_matrix! {
-        mod tiny,
-        cpu = crate::shaders::residual_half::cpu,
-        cpu_oracle = crate::shaders::residual_half::cpu_oracle,
-        gpu = crate::shaders::residual_half::gpu,
-        fixture = crate::shaders::residual_half::tiny_fixture,
-        out_len = crate::shaders::residual_half::fixture_len,
-        formats: [F32],
-        max_tol = 1e-3,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod no_scale,
-        cpu = crate::shaders::residual_half::cpu,
-        cpu_oracle = crate::shaders::residual_half::cpu_oracle,
-        gpu = crate::shaders::residual_half::gpu,
-        fixture = crate::shaders::residual_half::no_scale_fixture,
-        out_len = crate::shaders::residual_half::fixture_len,
-        formats: [F32],
-        max_tol = 1e-3,
-        min_cos = 0.9999,
-    }
-}
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "residual_half",
-        entry: "residual_half",
-        source: SHADER,
-        quant_formats: &[QuantFormat::Q4Affine],
-        fc: &[],
-        variants: KernelVariants::Elementwise,
-    }
 }

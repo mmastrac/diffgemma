@@ -4,16 +4,16 @@
 use crate::Error;
 use crate::shaders::variant::KernelVariant;
 
-pub const ENTRY: &str = "unpack_encoder_kv";
-
-pub const SHADER: &str = include_str!("unpack_encoder_kv.metal");
-
-#[cfg(target_os = "macos")]
-pub fn pipeline_for(
-    ctx: &crate::metal::device::MetalContext,
-    variant: KernelVariant,
-) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_subkernel(SHADER, ENTRY, variant)
+crate::shader_kernel! {
+    name = "unpack_encoder_kv",
+    metal = "unpack_encoder_kv.metal",
+    pipeline = |ctx, variant| ctx.compile_subkernel(SHADER, ENTRY, variant),
+    spec = {
+            quant_formats: &[QuantFormat::Q4Affine],
+            fc: &[(4, "KV_FMT_FC")],
+            variants: KernelVariants::Elementwise,
+    },
+    tests = {},
 }
 
 /// Quantized-KV variant (uint function constant 4 = KvFormat code).
@@ -81,15 +81,4 @@ pub fn dispatch_shape(
             depth: 1,
         },
     )
-}
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "unpack_encoder_kv",
-        entry: "unpack_encoder_kv",
-        source: SHADER,
-        quant_formats: &[QuantFormat::Q4Affine],
-        fc: &[(4, "KV_FMT_FC")],
-        variants: KernelVariants::Elementwise,
-    }
 }

@@ -5,7 +5,7 @@
 //! thread (a Metal context and its pipeline objects are not Send). No include
 //! table is used; no on-disk archive is touched.
 
-use gpukit::metal::{CacheConfig, ComputePipeline, Context, ContextConfig};
+use gpukit::metal::{CacheConfig, ComputePipeline, Context};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -21,15 +21,12 @@ pub fn context() -> Result<Rc<Context>, gpukit::Error> {
     CONTEXT.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
-            let ctx = Context::new(ContextConfig {
-                includes: &[],
-                cache: CacheConfig {
-                    enabled: false,
-                    dir: None,
-                    namespace: "dgemm",
-                    key: 0x6467_6d6d,
-                    verbose: false,
-                },
+            let ctx = Context::new(CacheConfig {
+                enabled: false,
+                dir: None,
+                namespace: "dgemm",
+                key: 0x6467_6d6d,
+                verbose: false,
             })?;
             *slot = Some(Rc::new(ctx));
         }

@@ -14,9 +14,26 @@ use crate::shaders::gemm_common;
 use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;
 
-pub const ENTRY: &str = "gemm_block_stacked";
-
-pub const SHADER: &str = include_str!("gemm_block_stacked.metal");
+crate::shader_kernel! {
+    name = "gemm_block_stacked",
+    metal = "gemm_block_stacked.metal",
+    spec = {
+            quant_formats: &[
+                QuantFormat::Q4Affine,
+                QuantFormat::NvFp4,
+            ],
+            fc: &[(4, "IS_FULL_LAYER"), (5, "GEMM_N"), (6, "GEMM_K")],
+            variants: KernelVariants::GemmBlock,
+    },
+    tests = [
+        gate_up_tiny => gate_up_tiny_fixture => gpu_q4 => (0.05, 0.999),
+        qkv_tiny => qkv_tiny_fixture => gpu_q4 => (0.05, 0.999),
+        qkv_qk_tiny => qkv_qk_tiny_fixture => gpu_q4 => (0.05, 0.999),
+        gate_up_padded_blob => gate_up_padded_blob_fixture => gpu_q4 => (0.05, 0.999),
+        gate_up_prod => gate_up_prod_fixture => gpu_q4 => (0.1, 0.999),
+        qkv_sliding_prod => qkv_sliding_prod_fixture => gpu_q4 => (0.05, 0.999),
+    ],
+}
 
 /// Must match `shaders/include/gemm_stacked.metal`.
 #[repr(C)]
@@ -125,6 +142,11 @@ pub struct StackedFixture {
 }
 
 impl StackedFixture {
+    /// Number of f32 elements the stacked GEMM writes.
+    pub fn out_len(&self) -> usize {
+        self.y_bytes() / 2
+    }
+
     pub fn n_total(&self) -> usize {
         self.segments.iter().map(|s| s.n).sum()
     }
@@ -319,10 +341,6 @@ pub fn qkv_qk_tiny_fixture(_: ElemFormat) -> StackedFixture {
         m,
         k,
     }
-}
-
-pub fn fixture_len(f: &StackedFixture) -> usize {
-    f.y_bytes() / 2
 }
 
 pub fn cpu(f: &StackedFixture) -> Vec<f32> {
@@ -644,98 +662,9 @@ pub fn qkv_sliding_prod_fixture(_: ElemFormat) -> StackedFixture {
     }
 }
 
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "gemm_block_stacked",
-        entry: "gemm_block_stacked",
-        source: SHADER,
-        quant_formats: &[
-            QuantFormat::Q4Affine,
-            QuantFormat::NvFp4,
-        ],
-        fc: &[(4, "IS_FULL_LAYER"), (5, "GEMM_N"), (6, "GEMM_K")],
-        variants: KernelVariants::GemmBlock,
-    }
-}
-
 #[cfg(test)]
-mod tests {
+mod extra_tests {
     use super::*;
-    use crate::kernel_oracle_matrix;
-
-    kernel_oracle_matrix! {
-        mod gate_up_tiny,
-        cpu = crate::shaders::gemm_block_stacked::cpu,
-        cpu_oracle = crate::shaders::gemm_block_stacked::cpu_oracle,
-        gpu = crate::shaders::gemm_block_stacked::gpu_q4,
-        fixture = crate::shaders::gemm_block_stacked::gate_up_tiny_fixture,
-        out_len = crate::shaders::gemm_block_stacked::fixture_len,
-        formats: [F32],
-        max_tol = 0.05,
-        min_cos = 0.999,
-    }
-
-    kernel_oracle_matrix! {
-        mod qkv_tiny,
-        cpu = crate::shaders::gemm_block_stacked::cpu,
-        cpu_oracle = crate::shaders::gemm_block_stacked::cpu_oracle,
-        gpu = crate::shaders::gemm_block_stacked::gpu_q4,
-        fixture = crate::shaders::gemm_block_stacked::qkv_tiny_fixture,
-        out_len = crate::shaders::gemm_block_stacked::fixture_len,
-        formats: [F32],
-        max_tol = 0.05,
-        min_cos = 0.999,
-    }
-
-    kernel_oracle_matrix! {
-        mod qkv_qk_tiny,
-        cpu = crate::shaders::gemm_block_stacked::cpu,
-        cpu_oracle = crate::shaders::gemm_block_stacked::cpu_oracle,
-        gpu = crate::shaders::gemm_block_stacked::gpu_q4,
-        fixture = crate::shaders::gemm_block_stacked::qkv_qk_tiny_fixture,
-        out_len = crate::shaders::gemm_block_stacked::fixture_len,
-        formats: [F32],
-        max_tol = 0.05,
-        min_cos = 0.999,
-    }
-
-    kernel_oracle_matrix! {
-        mod gate_up_padded_blob,
-        cpu = crate::shaders::gemm_block_stacked::cpu,
-        cpu_oracle = crate::shaders::gemm_block_stacked::cpu_oracle,
-        gpu = crate::shaders::gemm_block_stacked::gpu_q4,
-        fixture = crate::shaders::gemm_block_stacked::gate_up_padded_blob_fixture,
-        out_len = crate::shaders::gemm_block_stacked::fixture_len,
-        formats: [F32],
-        max_tol = 0.05,
-        min_cos = 0.999,
-    }
-
-    kernel_oracle_matrix! {
-        mod gate_up_prod,
-        cpu = crate::shaders::gemm_block_stacked::cpu,
-        cpu_oracle = crate::shaders::gemm_block_stacked::cpu_oracle,
-        gpu = crate::shaders::gemm_block_stacked::gpu_q4,
-        fixture = crate::shaders::gemm_block_stacked::gate_up_prod_fixture,
-        out_len = crate::shaders::gemm_block_stacked::fixture_len,
-        formats: [F32],
-        // Largest output element is ~8; one bf16 ULP (value/128) is ~0.0625, just over a
-        // 0.05 abs tol. cos stays the correctness guard (stacked-vs-split parity is exact 0.0).
-        max_tol = 0.1,
-        min_cos = 0.999,
-    }
-
-    kernel_oracle_matrix! {
-        mod qkv_sliding_prod,
-        cpu = crate::shaders::gemm_block_stacked::cpu,
-        cpu_oracle = crate::shaders::gemm_block_stacked::cpu_oracle,
-        gpu = crate::shaders::gemm_block_stacked::gpu_q4,
-        fixture = crate::shaders::gemm_block_stacked::qkv_sliding_prod_fixture,
-        out_len = crate::shaders::gemm_block_stacked::fixture_len,
-        formats: [F32],
-        max_tol = 0.05,
-        min_cos = 0.999,
-    }
 
     #[cfg(target_os = "macos")]
     #[test]

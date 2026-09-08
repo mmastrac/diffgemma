@@ -8,11 +8,31 @@ use crate::shaders::manifest::{self, RmsNormRowsTiledVariant};
 use crate::shaders::test_util::ElemFormat;
 use crate::shaders::variant::{ElemDtype, KernelVariant};
 
-pub const ENTRY: &str = "rms_norm_rows_tiled";
+crate::shader_kernel! {
+    name = "rms_norm_rows_tiled",
+    metal = "rms_norm_rows_tiled.metal",
+    spec = {
+            quant_formats: &[QuantFormat::Q4Affine],
+            fc: &[(4, "K_IN_DTYPE")],
+            variants: KernelVariants::RmsNormRowsTiled {
+                rows: &[
+                    RmsNormRowsTiledVariant {
+                        in_dtype: ElemDtype::F32,
+                    },
+                    RmsNormRowsTiledVariant {
+                        in_dtype: ElemDtype::Half,
+                    },
+                ],
+            },
+    },
+    tests = [
+        half_tiny => tiny_fixture => gpu_half => (1e-2, 0.9999),
+        half_no_scale => no_scale_fixture => gpu_half => (1e-3, 0.9999),
+        f32_in_tiny => { fixture = tiny_fixture, gpu = gpu_f32_in, cpu = cpu_f32_in, oracle = cpu_f32_in, tol = 1e-2, cos = 0.9999 },
+    ],
+}
 pub const RMS_EPS: f32 = 1e-6;
 pub const THREADS_PER_TG: usize = 256;
-
-pub const SHADER: &str = include_str!("rms_norm_rows_tiled.metal");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TiledVariant {
@@ -46,10 +66,6 @@ impl Fixture {
     pub fn out_len(&self) -> usize {
         self.rows * self.dim
     }
-}
-
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.out_len()
 }
 
 pub fn tiny_fixture(_: ElemFormat) -> Fixture {
@@ -236,65 +252,4 @@ fn gpu_tiled(f: &Fixture, variant: KernelVariant, tiled: TiledVariant) -> Result
     Ok((0..len)
         .map(|i| bf16::bf16_bits_to_f32(unsafe { *ptr.add(i) }))
         .collect())
-}
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "rms_norm_rows_tiled",
-        entry: "rms_norm_rows_tiled",
-        source: SHADER,
-        quant_formats: &[QuantFormat::Q4Affine],
-        fc: &[(4, "K_IN_DTYPE")],
-        variants: KernelVariants::RmsNormRowsTiled {
-            rows: &[
-                RmsNormRowsTiledVariant {
-                    in_dtype: ElemDtype::F32,
-                },
-                RmsNormRowsTiledVariant {
-                    in_dtype: ElemDtype::Half,
-                },
-            ],
-        },
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::kernel_oracle_matrix;
-
-    kernel_oracle_matrix! {
-        mod half_tiny,
-        cpu = crate::shaders::rms_norm_rows_tiled::cpu,
-        cpu_oracle = crate::shaders::rms_norm_rows_tiled::cpu_oracle,
-        gpu = crate::shaders::rms_norm_rows_tiled::gpu_half,
-        fixture = crate::shaders::rms_norm_rows_tiled::tiny_fixture,
-        out_len = crate::shaders::rms_norm_rows_tiled::fixture_len,
-        formats: [F32],
-        max_tol = 1e-2,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod half_no_scale,
-        cpu = crate::shaders::rms_norm_rows_tiled::cpu,
-        cpu_oracle = crate::shaders::rms_norm_rows_tiled::cpu_oracle,
-        gpu = crate::shaders::rms_norm_rows_tiled::gpu_half,
-        fixture = crate::shaders::rms_norm_rows_tiled::no_scale_fixture,
-        out_len = crate::shaders::rms_norm_rows_tiled::fixture_len,
-        formats: [F32],
-        max_tol = 1e-3,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod f32_in_tiny,
-        cpu = crate::shaders::rms_norm_rows_tiled::cpu_f32_in,
-        cpu_oracle = crate::shaders::rms_norm_rows_tiled::cpu_f32_in,
-        gpu = crate::shaders::rms_norm_rows_tiled::gpu_f32_in,
-        fixture = crate::shaders::rms_norm_rows_tiled::tiny_fixture,
-        out_len = crate::shaders::rms_norm_rows_tiled::fixture_len,
-        formats: [F32],
-        max_tol = 1e-2,
-        min_cos = 0.9999,
-    }
 }

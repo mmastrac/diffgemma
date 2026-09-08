@@ -10,7 +10,7 @@ use crate::shaders::bf16;
 use crate::shaders::test_util::ElemFormat;
 
 #[allow(unused_imports)]
-pub use super::fixture::{Fixture, bind_gpu_buffers, fixture_len};
+pub use super::fixture::{Fixture, bind_gpu_buffers};
 
 pub fn w_q4(f: &Fixture) -> Vec<u8> {
     let mut dst = vec![0u8; q4_matrix_bytes(f.n, f.k)];
@@ -67,7 +67,6 @@ mod tests {
         cpu_oracle = crate::shaders::gemm_q4::cpu_oracle,
         gpu = crate::shaders::gemm_q4::gpu,
         fixture = crate::shaders::gemm_q4::tiny_fixture,
-        out_len = crate::shaders::gemm_q4::fixture_len,
         formats: [F32],
         max_tol = 0.05,
         min_cos = 0.999,
@@ -79,7 +78,6 @@ mod tests {
         cpu_oracle = crate::shaders::gemm_q4::cpu_oracle,
         gpu = crate::shaders::gemm_q4::gpu,
         fixture = crate::shaders::gemm_q4::tile_fixture,
-        out_len = crate::shaders::gemm_q4::fixture_len,
         formats: [F32],
         max_tol = 0.05,
         min_cos = 0.999,

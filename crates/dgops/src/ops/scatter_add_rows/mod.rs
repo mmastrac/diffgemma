@@ -1,17 +1,15 @@
 //! Scatter-add whole rows into a row-major destination with atomic adds.
 
-use crate::Error;
-
-pub const ENTRY: &str = "scatter_add_rows";
-pub const METAL: &str = include_str!("scatter_add_rows.metal");
-
-#[cfg(all(feature = "cuda", dgops_cuda_kernels))]
-const CUBIN: &[u8] = include_bytes!(concat!(
-    env!("OUT_DIR"),
-    "/cuda/ops/scatter_add_rows/scatter_add_rows.cubin"
-));
-#[cfg(all(feature = "cuda", not(dgops_cuda_kernels)))]
-const CUBIN: &[u8] = &[];
+crate::op_kernel! {
+    name = "scatter_add_rows",
+    metal = "scatter_add_rows.metal",
+    cuda = "ops/scatter_add_rows/scatter_add_rows",
+    fixture = Fixture,
+    tests = [
+        tiny => tiny_fixture => (0.0, 1.0),
+        repeated => repeated_fixture => (1e-6, 1.0),
+    ],
+}
 
 #[derive(Debug, Clone)]
 pub struct Fixture {
@@ -26,10 +24,6 @@ impl Fixture {
     pub fn len(&self) -> usize {
         self.dst.len()
     }
-}
-
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.len()
 }
 
 pub fn tiny_fixture() -> Fixture {
@@ -76,55 +70,4 @@ pub fn cpu(fix: &Fixture) -> Vec<f32> {
         }
     }
     out
-}
-
-pub fn gpu(fix: &Fixture) -> Result<Vec<f32>, Error> {
-    #[cfg(target_os = "macos")]
-    {
-        metal::gpu(fix)
-    }
-    #[cfg(all(feature = "cuda", not(target_os = "macos")))]
-    {
-        cuda::gpu(fix)
-    }
-    #[cfg(not(any(target_os = "macos", all(feature = "cuda", not(target_os = "macos")))))]
-    {
-        let _ = fix;
-        Err(Error::Gpu(
-            "no GPU backend enabled (build with --features cuda on a CUDA host)",
-        ))
-    }
-}
-
-#[cfg(feature = "cuda")]
-pub mod cuda;
-#[cfg(target_os = "macos")]
-pub mod metal;
-
-#[cfg(test)]
-mod tests {
-    crate::op_oracle_matrix! {
-        mod tiny,
-        cpu = crate::ops::scatter_add_rows::cpu,
-        gpu = crate::ops::scatter_add_rows::gpu,
-        fixture = crate::ops::scatter_add_rows::tiny_fixture,
-        out_len = crate::ops::scatter_add_rows::fixture_len,
-        max_tol = 0.0,
-        min_cos = 1.0,
-    }
-
-    // Repeated indices are accumulated by device atomics, so the summation
-    // order differs from the CPU reference's row-by-row order and the result
-    // is not bit-identical: the measured worst case on the repeated fixture is
-    // 1.19e-7 absolute (2 ULP at ~0.99, 376/4096 elements off by 1-2 ULP).
-    // The tiny fixture's small exact-binary values still match bit for bit.
-    crate::op_oracle_matrix! {
-        mod repeated,
-        cpu = crate::ops::scatter_add_rows::cpu,
-        gpu = crate::ops::scatter_add_rows::gpu,
-        fixture = crate::ops::scatter_add_rows::repeated_fixture,
-        out_len = crate::ops::scatter_add_rows::fixture_len,
-        max_tol = 1e-6,
-        min_cos = 1.0,
-    }
 }

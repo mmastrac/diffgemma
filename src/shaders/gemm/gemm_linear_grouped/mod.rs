@@ -11,9 +11,26 @@ use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;
 use crate::shaders::variant::KernelVariant;
 
-pub const ENTRY: &str = "gemm_linear_grouped";
-
-pub const SHADER: &str = include_str!("gemm_linear_grouped.metal");
+crate::shader_kernel! {
+    name = "gemm_linear_grouped",
+    metal = "gemm_linear_grouped.metal",
+    spec = {
+            quant_formats: &[
+                QuantFormat::Q4Affine,
+                QuantFormat::NvFp4,
+            ],
+            fc: &[],
+            variants: KernelVariants::Elementwise,
+    },
+    tests = [
+        tiny_q4 => tiny_fixture_q4 => gpu_q4 => (1e-4, 0.9999),
+        tiny_nvfp4 => tiny_fixture_nvfp4 => gpu_nvfp4 => (1e-4, 0.9999),
+        tile_q4 => tile_fixture_q4 => gpu_q4 => (0.05, 0.999),
+        tile_nvfp4 => tile_fixture_nvfp4 => gpu_nvfp4 => (0.05, 0.999),
+        prefill_moe_nvfp4 => prefill_moe_fixture_nvfp4 => gpu_nvfp4 => (0.05, 0.999),
+        prefill_moe_q4 => prefill_moe_fixture_q4 => gpu_q4 => (1e-4, 0.9999),
+    ],
+}
 
 #[derive(Debug, Clone)]
 pub struct Fixture {
@@ -91,10 +108,6 @@ fn quantize_expert_matrix(format: QuantFormat, rows: &[f32], n: usize, k: usize)
             dst
         }
     }
-}
-
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.out_len()
 }
 
 /// One expert with M=100 (>32 M-tile stress) plus a smaller second expert.
@@ -407,82 +420,11 @@ pub fn gpu_nvfp4(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error>
     )
 }
 
+pub mod cpu;
+
 #[cfg(test)]
-mod tests {
+mod extra_tests {
     use super::*;
-    use crate::kernel_oracle_matrix;
-
-    kernel_oracle_matrix! {
-        mod tiny_q4,
-        cpu = crate::shaders::gemm_linear_grouped::cpu,
-        cpu_oracle = crate::shaders::gemm_linear_grouped::cpu_oracle,
-        gpu = crate::shaders::gemm_linear_grouped::gpu_q4,
-        fixture = crate::shaders::gemm_linear_grouped::tiny_fixture_q4,
-        out_len = crate::shaders::gemm_linear_grouped::fixture_len,
-        formats: [F32],
-        max_tol = 1e-4,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod tiny_nvfp4,
-        cpu = crate::shaders::gemm_linear_grouped::cpu,
-        cpu_oracle = crate::shaders::gemm_linear_grouped::cpu_oracle,
-        gpu = crate::shaders::gemm_linear_grouped::gpu_nvfp4,
-        fixture = crate::shaders::gemm_linear_grouped::tiny_fixture_nvfp4,
-        out_len = crate::shaders::gemm_linear_grouped::fixture_len,
-        formats: [F32],
-        max_tol = 1e-4,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod tile_q4,
-        cpu = crate::shaders::gemm_linear_grouped::cpu,
-        cpu_oracle = crate::shaders::gemm_linear_grouped::cpu_oracle,
-        gpu = crate::shaders::gemm_linear_grouped::gpu_q4,
-        fixture = crate::shaders::gemm_linear_grouped::tile_fixture_q4,
-        out_len = crate::shaders::gemm_linear_grouped::fixture_len,
-        formats: [F32],
-        max_tol = 0.05,
-        min_cos = 0.999,
-    }
-
-    kernel_oracle_matrix! {
-        mod tile_nvfp4,
-        cpu = crate::shaders::gemm_linear_grouped::cpu,
-        cpu_oracle = crate::shaders::gemm_linear_grouped::cpu_oracle,
-        gpu = crate::shaders::gemm_linear_grouped::gpu_nvfp4,
-        fixture = crate::shaders::gemm_linear_grouped::tile_fixture_nvfp4,
-        out_len = crate::shaders::gemm_linear_grouped::fixture_len,
-        formats: [F32],
-        max_tol = 0.05,
-        min_cos = 0.999,
-    }
-
-    kernel_oracle_matrix! {
-        mod prefill_moe_nvfp4,
-        cpu = crate::shaders::gemm_linear_grouped::cpu,
-        cpu_oracle = crate::shaders::gemm_linear_grouped::cpu_oracle,
-        gpu = crate::shaders::gemm_linear_grouped::gpu_nvfp4,
-        fixture = crate::shaders::gemm_linear_grouped::prefill_moe_fixture_nvfp4,
-        out_len = crate::shaders::gemm_linear_grouped::fixture_len,
-        formats: [F32],
-        max_tol = 0.05,
-        min_cos = 0.999,
-    }
-
-    kernel_oracle_matrix! {
-        mod prefill_moe_q4,
-        cpu = crate::shaders::gemm_linear_grouped::cpu,
-        cpu_oracle = crate::shaders::gemm_linear_grouped::cpu_oracle,
-        gpu = crate::shaders::gemm_linear_grouped::gpu_q4,
-        fixture = crate::shaders::gemm_linear_grouped::prefill_moe_fixture_q4,
-        out_len = crate::shaders::gemm_linear_grouped::fixture_len,
-        formats: [F32],
-        max_tol = 1e-4,
-        min_cos = 0.9999,
-    }
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -507,21 +449,5 @@ mod tests {
                 gpu_nvfp4(&fix, KernelVariant::PRODUCTION).expect("gemm_linear_grouped gpu");
             assert_oracle(&tiled, &linear, 0.05, 0.999);
         }
-    }
-}
-
-pub mod cpu;
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "gemm_linear_grouped",
-        entry: "gemm_linear_grouped",
-        source: SHADER,
-        quant_formats: &[
-            QuantFormat::Q4Affine,
-            QuantFormat::NvFp4,
-        ],
-        fc: &[],
-        variants: KernelVariants::Elementwise,
     }
 }

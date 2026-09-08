@@ -8,10 +8,28 @@ use crate::shaders::manifest::{self, SwigluSplitVariant};
 use crate::shaders::test_util::ElemFormat;
 use crate::shaders::variant::KernelVariant;
 
-pub const ENTRY: &str = "swiglu";
+crate::shader_kernel! {
+    name = "swiglu",
+    metal = "swiglu.metal",
+    spec = {
+            quant_formats: &[QuantFormat::Q4Affine],
+            fc: &[(4, "K_IO_DTYPE"), (5, "K_GELU_GATE"), (6, "K_IN_PLACE")],
+            variants: KernelVariants::SwigluSplit {
+                rows: &[
+                    SwigluSplitVariant::DECODER_MUL,
+                    SwigluSplitVariant::MONOLITH_GLU,
+                ],
+            },
+    },
+    tests = [
+        split_tiny => { fixture = split_tiny_fixture, gpu = gpu_split_mul, cpu = cpu_split_mul, oracle = cpu_split_mul, tol = 1e-5, cos = 0.9999 },
+        split_moe_inter => { fixture = split_moe_inter_fixture, gpu = gpu_split_mul, cpu = cpu_split_mul, oracle = cpu_split_mul, tol = 1e-5, cos = 0.9999 },
+        half_tiny => { fixture = half_tiny_fixture, gpu = gpu_half_glu, cpu = cpu_half_glu, oracle = cpu_oracle_half_glu, tol = 1e-3, cos = 0.9999 },
+        interleaved_tiny => { fixture = interleaved_tiny_fixture, gpu = gpu_interleaved, cpu = cpu_interleaved, oracle = cpu_oracle_interleaved, tol = 1e-4, cos = 0.9999 },
+        interleaved_moe => { fixture = interleaved_moe_fixture, gpu = gpu_interleaved, cpu = cpu_interleaved, oracle = cpu_oracle_interleaved, tol = 1e-4, cos = 0.9999 },
+    ],
+}
 pub const MOE_ENTRY: &str = "swiglu_moe_gate_up";
-
-pub const SHADER: &str = include_str!("swiglu.metal");
 
 pub const MOE_SHADER: &str = include_str!("swiglu_moe_gate_up.metal");
 
@@ -24,7 +42,7 @@ pub struct SplitFixture {
 }
 
 impl SplitFixture {
-    pub fn len(&self) -> usize {
+    pub fn out_len(&self) -> usize {
         self.gate.len()
     }
 }
@@ -61,7 +79,7 @@ pub struct HalfFixture {
 }
 
 impl HalfFixture {
-    pub fn len(&self) -> usize {
+    pub fn out_len(&self) -> usize {
         self.gate.len()
     }
 }
@@ -256,7 +274,7 @@ fn gpu_split(
     let ctx = MetalContext::new()?;
     let pipeline = pipeline_for(&ctx, split, variant)?;
     let mut pool = BufferPool::new();
-    let len = f.len();
+    let len = f.out_len();
     let buf_g = pool
         .allocate(&ctx.device, len * 4)
         .ok_or(Error::Gpu("alloc"))?;
@@ -307,7 +325,7 @@ pub fn gpu_half_glu(f: &HalfFixture, variant: KernelVariant) -> Result<Vec<f32>,
     let ctx = MetalContext::new()?;
     let pipeline = pipeline_for(&ctx, SwigluSplitVariant::MONOLITH_GLU, variant)?;
     let mut pool = BufferPool::new();
-    let len = f.len();
+    let len = f.out_len();
     let buf_g = pool
         .allocate(&ctx.device, len * 2)
         .ok_or(Error::Gpu("alloc"))?;
@@ -388,22 +406,6 @@ pub fn gpu_interleaved(f: &InterleavedFixture, variant: KernelVariant) -> Result
 use crate::shaders::gpu_common::div_up;
 
 crate::kernel_spec! {
-    pub const SPEC {
-        name: "swiglu",
-        entry: "swiglu",
-        source: SHADER,
-        quant_formats: &[QuantFormat::Q4Affine],
-        fc: &[(4, "K_IO_DTYPE"), (5, "K_GELU_GATE"), (6, "K_IN_PLACE")],
-        variants: KernelVariants::SwigluSplit {
-            rows: &[
-                SwigluSplitVariant::DECODER_MUL,
-                SwigluSplitVariant::MONOLITH_GLU,
-            ],
-        },
-    }
-}
-
-crate::kernel_spec! {
     /// Colocated subkernel registration (swiglu_moe_gate_up.metal).
     pub const SPEC_MOE_GATE_UP {
         name: "swiglu_moe_gate_up",
@@ -412,70 +414,5 @@ crate::kernel_spec! {
         quant_formats: &[QuantFormat::Q4Affine],
         fc: &[],
         variants: KernelVariants::SwigluMoeGateUp,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::kernel_oracle_matrix;
-
-    kernel_oracle_matrix! {
-        mod split_tiny,
-        cpu = crate::shaders::swiglu::cpu_split_mul,
-        cpu_oracle = crate::shaders::swiglu::cpu_split_mul,
-        gpu = crate::shaders::swiglu::gpu_split_mul,
-        fixture = crate::shaders::swiglu::split_tiny_fixture,
-        out_len = crate::shaders::swiglu::SplitFixture::len,
-        formats: [F32],
-        max_tol = 1e-5,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod split_moe_inter,
-        cpu = crate::shaders::swiglu::cpu_split_mul,
-        cpu_oracle = crate::shaders::swiglu::cpu_split_mul,
-        gpu = crate::shaders::swiglu::gpu_split_mul,
-        fixture = crate::shaders::swiglu::split_moe_inter_fixture,
-        out_len = crate::shaders::swiglu::SplitFixture::len,
-        formats: [F32],
-        max_tol = 1e-5,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod half_tiny,
-        cpu = crate::shaders::swiglu::cpu_half_glu,
-        cpu_oracle = crate::shaders::swiglu::cpu_oracle_half_glu,
-        gpu = crate::shaders::swiglu::gpu_half_glu,
-        fixture = crate::shaders::swiglu::half_tiny_fixture,
-        out_len = crate::shaders::swiglu::HalfFixture::len,
-        formats: [F32],
-        max_tol = 1e-3,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod interleaved_tiny,
-        cpu = crate::shaders::swiglu::cpu_interleaved,
-        cpu_oracle = crate::shaders::swiglu::cpu_oracle_interleaved,
-        gpu = crate::shaders::swiglu::gpu_interleaved,
-        fixture = crate::shaders::swiglu::interleaved_tiny_fixture,
-        out_len = crate::shaders::swiglu::InterleavedFixture::out_len,
-        formats: [F32],
-        max_tol = 1e-4,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod interleaved_moe,
-        cpu = crate::shaders::swiglu::cpu_interleaved,
-        cpu_oracle = crate::shaders::swiglu::cpu_oracle_interleaved,
-        gpu = crate::shaders::swiglu::gpu_interleaved,
-        fixture = crate::shaders::swiglu::interleaved_moe_fixture,
-        out_len = crate::shaders::swiglu::InterleavedFixture::out_len,
-        formats: [F32],
-        max_tol = 1e-4,
-        min_cos = 0.9999,
     }
 }

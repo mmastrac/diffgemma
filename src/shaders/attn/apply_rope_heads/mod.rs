@@ -5,9 +5,21 @@ use crate::Error;
 use crate::shaders::cpu::{self, RopeKind};
 use crate::shaders::test_util::ElemFormat;
 
-pub const ENTRY: &str = "apply_rope_heads";
-
-pub const SHADER: &str = include_str!("apply_rope_heads.metal");
+crate::shader_kernel! {
+    name = "apply_rope_heads",
+    metal = "apply_rope_heads.metal",
+    spec = {
+            quant_formats: &[QuantFormat::Q4Affine],
+            fc: &[],
+            variants: KernelVariants::Elementwise,
+    },
+    tests = [
+        tiny => tiny_fixture => no_variant => (1e-5, 0.9999),
+        sliding_prefill => sliding_prefill_fixture => no_variant => (1e-5, 0.9999),
+        full_partial => full_partial_fixture => no_variant => (1e-5, 0.9999),
+        k_offset => k_offset_fixture => no_variant => (1e-5, 0.9999),
+    ],
+}
 
 #[derive(Debug, Clone)]
 pub struct Fixture {
@@ -21,13 +33,9 @@ pub struct Fixture {
 }
 
 impl Fixture {
-    pub fn len(&self) -> usize {
+    pub fn out_len(&self) -> usize {
         self.x.len()
     }
-}
-
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.len()
 }
 
 fn fill_tensor(len: usize, seed: f32) -> Vec<f32> {
@@ -222,70 +230,4 @@ pub fn gpu(f: &Fixture) -> Result<Vec<f32>, Error> {
     pool.release(x_bytes, buf_x);
     pool.release(f_bytes, buf_f);
     Ok(out)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::shaders::test_util::{ElemFormat, assert_oracle};
-
-    fn run_matrix(fixture_fn: fn(ElemFormat) -> Fixture, max_tol: f32) {
-        let fix = fixture_fn(ElemFormat::F32);
-        let cpu = cpu(&fix);
-        assert!(cpu.iter().all(|v| v.is_finite()));
-        assert_eq!(cpu.len(), fixture_len(&fix));
-
-        #[cfg(target_os = "macos")]
-        {
-            let gpu = gpu(&fix).expect("gpu");
-            assert_oracle(&gpu, &cpu, max_tol, 0.9999);
-        }
-    }
-
-    #[test]
-    fn cpu_tiny() {
-        if crate::shaders::test_util::skip_gpu_on_ci() {
-            return;
-        }
-        run_matrix(tiny_fixture, 1e-5);
-    }
-
-    #[test]
-    fn cpu_sliding_prefill() {
-        if crate::shaders::test_util::skip_gpu_on_ci() {
-            return;
-        }
-        run_matrix(sliding_prefill_fixture, 1e-5);
-    }
-
-    #[test]
-    fn cpu_full_partial() {
-        if crate::shaders::test_util::skip_gpu_on_ci() {
-            return;
-        }
-        run_matrix(full_partial_fixture, 1e-5);
-    }
-
-    #[test]
-    fn cpu_k_offset() {
-        if crate::shaders::test_util::skip_gpu_on_ci() {
-            return;
-        }
-        run_matrix(k_offset_fixture, 1e-5);
-    }
-
-    // (GPU twins removed — `run_matrix` already exercises the GPU path under
-    // #[cfg(metal)] from the cpu_* tests above; the gpu_* copies were byte-
-    // identical duplicates.)
-}
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "apply_rope_heads",
-        entry: "apply_rope_heads",
-        source: SHADER,
-        quant_formats: &[QuantFormat::Q4Affine],
-        fc: &[],
-        variants: KernelVariants::Elementwise,
-    }
 }

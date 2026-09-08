@@ -4,6 +4,7 @@ pub mod dbg_kernel;
 pub mod expand;
 pub mod f16;
 pub mod gpu_common;
+pub mod kernel;
 pub mod manifest;
 pub mod test_util;
 pub mod variant;

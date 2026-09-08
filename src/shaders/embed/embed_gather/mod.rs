@@ -9,9 +9,19 @@ use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;
 use crate::shaders::variant::KernelVariant;
 
-pub const ENTRY: &str = "embed_gather";
-
-pub const SHADER: &str = include_str!("embed_gather.metal");
+crate::shader_kernel! {
+    name = "embed_gather",
+    metal = "embed_gather.metal",
+    spec = {
+            quant_formats: &[QuantFormat::Q8],
+            fc: &[],
+            variants: KernelVariants::Elementwise,
+    },
+    tests = [
+        tiny => tiny_fixture => (0.002, 0.9999),
+        tile => tile_fixture => (1e-2, 0.9999),
+    ],
+}
 
 #[derive(Debug, Clone)]
 pub struct Fixture {
@@ -41,10 +51,6 @@ impl Fixture {
         }
         dst
     }
-}
-
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.out_len()
 }
 
 pub fn tiny_fixture(_: ElemFormat) -> Fixture {
@@ -253,44 +259,4 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     Ok((0..f.out_len())
         .map(|i| bf16::bf16_bits_to_f32(unsafe { *ptr.add(i) }))
         .collect())
-}
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "embed_gather",
-        entry: "embed_gather",
-        source: SHADER,
-        quant_formats: &[QuantFormat::Q8],
-        fc: &[],
-        variants: KernelVariants::Elementwise,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::kernel_oracle_matrix;
-
-    kernel_oracle_matrix! {
-        mod tiny,
-        cpu = crate::shaders::embed_gather::cpu,
-        cpu_oracle = crate::shaders::embed_gather::cpu_oracle,
-        gpu = crate::shaders::embed_gather::gpu,
-        fixture = crate::shaders::embed_gather::tiny_fixture,
-        out_len = crate::shaders::embed_gather::fixture_len,
-        formats: [F32],
-        max_tol = 0.002,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod tile,
-        cpu = crate::shaders::embed_gather::cpu,
-        cpu_oracle = crate::shaders::embed_gather::cpu_oracle,
-        gpu = crate::shaders::embed_gather::gpu,
-        fixture = crate::shaders::embed_gather::tile_fixture,
-        out_len = crate::shaders::embed_gather::fixture_len,
-        formats: [F32],
-        max_tol = 1e-2,
-        min_cos = 0.9999,
-    }
 }

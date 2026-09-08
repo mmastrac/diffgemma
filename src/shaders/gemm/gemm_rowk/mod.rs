@@ -8,9 +8,24 @@ use crate::dgq::layout::q8_row_bytes;
 use crate::shaders::bf16;
 use crate::shaders::test_util::ElemFormat;
 
-pub const ENTRY: &str = "gemm_rowk";
-
-pub const SHADER: &str = include_str!("gemm_rowk.metal");
+crate::shader_kernel! {
+    name = "gemm_rowk",
+    metal = "gemm_rowk.metal",
+    spec = {
+            quant_formats: &[QuantFormat::Q8],
+            fc: &[
+                (4, "IS_FULL_LAYER"),
+                (5, "GEMM_N"),
+                (6, "GEMM_K"),
+                (30, "K_ROWK_OUT_ARENA"),
+            ],
+            variants: KernelVariants::GemmRowk,
+    },
+    tests = [
+        tiny => tiny_fixture => (0.05, 0.999),
+        tile => tile_fixture => (0.05, 0.999),
+    ],
+}
 
 #[derive(Debug, Clone)]
 pub struct Fixture {
@@ -30,10 +45,6 @@ impl Fixture {
     pub fn w_q8(&self) -> Vec<u8> {
         quantize_f32_matrix_q8_rowk(&self.w_f32, self.k, self.n)
     }
-}
-
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.out_len()
 }
 
 fn quantize_f32_matrix_q8_rowk(rows: &[f32], k_dim: usize, n_dim: usize) -> Vec<u8> {
@@ -188,49 +199,4 @@ pub fn gpu(f: &Fixture, _variant: crate::shaders::KernelVariant) -> Result<Vec<f
     Ok((0..f.out_len())
         .map(|i| bf16::bf16_bits_to_f32(unsafe { *ptr.add(i) }))
         .collect())
-}
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "gemm_rowk",
-        entry: "gemm_rowk",
-        source: SHADER,
-        quant_formats: &[QuantFormat::Q8],
-        fc: &[
-            (4, "IS_FULL_LAYER"),
-            (5, "GEMM_N"),
-            (6, "GEMM_K"),
-            (30, "K_ROWK_OUT_ARENA"),
-        ],
-        variants: KernelVariants::GemmRowk,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::kernel_oracle_matrix;
-
-    kernel_oracle_matrix! {
-        mod tiny,
-        cpu = crate::shaders::gemm_rowk::cpu,
-        cpu_oracle = crate::shaders::gemm_rowk::cpu_oracle,
-        gpu = crate::shaders::gemm_rowk::gpu,
-        fixture = crate::shaders::gemm_rowk::tiny_fixture,
-        out_len = crate::shaders::gemm_rowk::fixture_len,
-        formats: [F32],
-        max_tol = 0.05,
-        min_cos = 0.999,
-    }
-
-    kernel_oracle_matrix! {
-        mod tile,
-        cpu = crate::shaders::gemm_rowk::cpu,
-        cpu_oracle = crate::shaders::gemm_rowk::cpu_oracle,
-        gpu = crate::shaders::gemm_rowk::gpu,
-        fixture = crate::shaders::gemm_rowk::tile_fixture,
-        out_len = crate::shaders::gemm_rowk::fixture_len,
-        formats: [F32],
-        max_tol = 0.05,
-        min_cos = 0.999,
-    }
 }

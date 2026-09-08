@@ -10,10 +10,21 @@ use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;
 use crate::shaders::variant::KernelVariant;
 
-pub const ENTRY: &str = "sample_apply";
+crate::shader_kernel! {
+    name = "sample_apply",
+    metal = "sample_apply.metal",
+    pipeline = |ctx, variant| ctx.compile_subkernel(SHADER, ENTRY, variant),
+    spec = {
+            quant_formats: &[QuantFormat::Q4Affine],
+            fc: &[],
+            variants: KernelVariants::Elementwise,
+    },
+    tests = [
+        tiny => tiny_fixture => (1e-3, 0.9999),
+        wide => wide_fixture => (1e-2, 0.9999),
+    ],
+}
 pub const THREADGROUP_WIDTH: usize = 256;
-
-pub const SHADER: &str = include_str!("sample_apply.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {
@@ -39,10 +50,6 @@ impl Fixture {
             self.params.t_max,
         )
     }
-}
-
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.out_len()
 }
 
 pub fn tiny_fixture(_: ElemFormat) -> Fixture {
@@ -174,14 +181,6 @@ fn canvas_state_for_gpu(f: &Fixture) -> CanvasState {
 }
 
 #[cfg(target_os = "macos")]
-pub fn pipeline_for(
-    ctx: &crate::metal::device::MetalContext,
-    variant: KernelVariant,
-) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_subkernel(SHADER, ENTRY, variant)
-}
-
-#[cfg(target_os = "macos")]
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
 };
@@ -248,44 +247,4 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         &mut picks,
     );
     Ok(picks.iter().map(|&v| v as f32).collect())
-}
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "sample_apply",
-        entry: "sample_apply",
-        source: SHADER,
-        quant_formats: &[QuantFormat::Q4Affine],
-        fc: &[],
-        variants: KernelVariants::Elementwise,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::kernel_oracle_matrix;
-
-    kernel_oracle_matrix! {
-        mod tiny,
-        cpu = crate::shaders::sample_apply::cpu,
-        cpu_oracle = crate::shaders::sample_apply::cpu_oracle,
-        gpu = crate::shaders::sample_apply::gpu,
-        fixture = crate::shaders::sample_apply::tiny_fixture,
-        out_len = crate::shaders::sample_apply::fixture_len,
-        formats: [F32],
-        max_tol = 1e-3,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod wide,
-        cpu = crate::shaders::sample_apply::cpu,
-        cpu_oracle = crate::shaders::sample_apply::cpu_oracle,
-        gpu = crate::shaders::sample_apply::gpu,
-        fixture = crate::shaders::sample_apply::wide_fixture,
-        out_len = crate::shaders::sample_apply::fixture_len,
-        formats: [F32],
-        max_tol = 1e-2,
-        min_cos = 0.9999,
-    }
 }

@@ -6,9 +6,19 @@ use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;
 use crate::shaders::variant::KernelVariant;
 
-pub const ENTRY: &str = "moe_bucket_count";
-
-pub const SHADER: &str = include_str!("moe_bucket_count.metal");
+crate::shader_kernel! {
+    name = "moe_bucket_count",
+    metal = "moe_bucket_count.metal",
+    pipeline = |ctx, variant| ctx.compile_subkernel(SHADER, ENTRY, variant),
+    spec = {
+            quant_formats: &[QuantFormat::Q4Affine],
+            fc: &[],
+            variants: KernelVariants::Elementwise,
+    },
+    tests = [
+        tiny => tiny_fixture => (0.0, 1.0),
+    ],
+}
 
 #[derive(Debug, Clone)]
 pub struct Fixture {
@@ -19,10 +29,6 @@ impl Fixture {
     pub fn out_len(&self) -> usize {
         self.n_experts
     }
-}
-
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.out_len()
 }
 
 pub fn tiny_fixture(_: ElemFormat) -> Fixture {
@@ -41,14 +47,6 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
 
 pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
     cpu(f)
-}
-
-#[cfg(target_os = "macos")]
-pub fn pipeline_for(
-    ctx: &crate::metal::device::MetalContext,
-    variant: KernelVariant,
-) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_subkernel(SHADER, ENTRY, variant)
 }
 
 #[cfg(target_os = "macos")]
@@ -119,32 +117,4 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         .iter()
         .map(|&v| v as f32)
         .collect())
-}
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "moe_bucket_count",
-        entry: "moe_bucket_count",
-        source: SHADER,
-        quant_formats: &[QuantFormat::Q4Affine],
-        fc: &[],
-        variants: KernelVariants::Elementwise,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::kernel_oracle_matrix;
-
-    kernel_oracle_matrix! {
-        mod tiny,
-        cpu = crate::shaders::moe_bucket_count::cpu,
-        cpu_oracle = crate::shaders::moe_bucket_count::cpu_oracle,
-        gpu = crate::shaders::moe_bucket_count::gpu,
-        fixture = crate::shaders::moe_bucket_count::tiny_fixture,
-        out_len = crate::shaders::moe_bucket_count::fixture_len,
-        formats: [F32],
-        max_tol = 0.0,
-        min_cos = 1.0,
-    }
 }

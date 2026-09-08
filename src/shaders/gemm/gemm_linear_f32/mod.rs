@@ -10,9 +10,22 @@ use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;
 use crate::shaders::variant::KernelVariant;
 
-pub const ENTRY: &str = "gemm_linear_f32";
-
-pub const SHADER: &str = include_str!("gemm_linear_f32.metal");
+crate::shader_kernel! {
+    name = "gemm_linear_f32",
+    metal = "gemm_linear_f32.metal",
+    spec = {
+            quant_formats: &[
+                QuantFormat::Q4Affine,
+                QuantFormat::NvFp4,
+            ],
+            fc: &[],
+            variants: KernelVariants::Elementwise,
+    },
+    tests = [
+        tiny_q4 => tiny_fixture_q4 => gpu_q4 => (1e-4, 0.9999),
+        tiny_nvfp4 => tiny_fixture_nvfp4 => gpu_nvfp4 => (1e-4, 0.9999),
+    ],
+}
 
 const THREADGROUP: usize = 16;
 
@@ -64,10 +77,6 @@ impl Fixture {
     pub fn groups_per_row(&self) -> u32 {
         (self.k as u32).div_ceil(32)
     }
-}
-
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.out_len()
 }
 
 pub fn tiny_fixture_q4(_: ElemFormat) -> Fixture {
@@ -228,47 +237,4 @@ pub fn gpu_nvfp4(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error>
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::kernel_oracle_matrix;
-
-    kernel_oracle_matrix! {
-        mod tiny_q4,
-        cpu = crate::shaders::gemm_linear_f32::cpu,
-        cpu_oracle = crate::shaders::gemm_linear_f32::cpu_oracle,
-        gpu = crate::shaders::gemm_linear_f32::gpu_q4,
-        fixture = crate::shaders::gemm_linear_f32::tiny_fixture_q4,
-        out_len = crate::shaders::gemm_linear_f32::fixture_len,
-        formats: [F32],
-        max_tol = 1e-4,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod tiny_nvfp4,
-        cpu = crate::shaders::gemm_linear_f32::cpu,
-        cpu_oracle = crate::shaders::gemm_linear_f32::cpu_oracle,
-        gpu = crate::shaders::gemm_linear_f32::gpu_nvfp4,
-        fixture = crate::shaders::gemm_linear_f32::tiny_fixture_nvfp4,
-        out_len = crate::shaders::gemm_linear_f32::fixture_len,
-        formats: [F32],
-        max_tol = 1e-4,
-        min_cos = 0.9999,
-    }
-}
-
 pub mod cpu;
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "gemm_linear_f32",
-        entry: "gemm_linear_f32",
-        source: SHADER,
-        quant_formats: &[
-            QuantFormat::Q4Affine,
-            QuantFormat::NvFp4,
-        ],
-        fc: &[],
-        variants: KernelVariants::Elementwise,
-    }
-}

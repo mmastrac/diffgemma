@@ -11,7 +11,7 @@ use crate::shaders::bf16;
 use crate::shaders::test_util::ElemFormat;
 
 #[allow(unused_imports)]
-pub use super::fixture::{Fixture, bind_gpu_buffers, fixture_len};
+pub use super::fixture::{Fixture, bind_gpu_buffers};
 
 pub fn w_nvfp4(f: &Fixture) -> Vec<u8> {
     let mut dst = vec![0u8; nvfp4_matrix_bytes(f.n, f.k)];
@@ -75,7 +75,6 @@ mod tests {
         cpu_oracle = crate::shaders::gemm_nvfp4::cpu_oracle,
         gpu = crate::shaders::gemm_nvfp4::gpu,
         fixture = crate::shaders::gemm_nvfp4::tiny_fixture,
-        out_len = crate::shaders::gemm_nvfp4::fixture_len,
         formats: [F32],
         max_tol = 0.08,
         min_cos = 0.999,
@@ -87,7 +86,6 @@ mod tests {
         cpu_oracle = crate::shaders::gemm_nvfp4::cpu_oracle,
         gpu = crate::shaders::gemm_nvfp4::gpu,
         fixture = crate::shaders::gemm_nvfp4::tile_fixture,
-        out_len = crate::shaders::gemm_nvfp4::fixture_len,
         formats: [F32],
         max_tol = 0.08,
         min_cos = 0.999,
@@ -99,11 +97,45 @@ mod tests {
         cpu_oracle = crate::shaders::gemm_nvfp4::cpu_oracle,
         gpu = crate::shaders::gemm_nvfp4::gpu,
         fixture = crate::shaders::gemm_nvfp4::gscale_fixture,
-        out_len = crate::shaders::gemm_nvfp4::fixture_len,
         formats: [F32],
         max_tol = 0.08,
         min_cos = 0.999,
     }
+
+    fn linear_f32_fixture(gf: &Fixture) -> crate::shaders::gemm_linear_f32::Fixture {
+        crate::shaders::gemm_linear_f32::Fixture {
+            x: gf.x.clone(),
+            w_f32: gf.w_f32.clone(),
+            m: gf.m,
+            n: gf.n,
+            k: gf.k,
+            format: QuantFormat::NvFp4,
+            global_scale: gf.global_scale,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gpu_tiled_matches_linear_f32() {
+        if crate::shaders::test_util::skip_gpu_on_ci() {
+            return;
+        }
+        for fixture_fn in [tiny_fixture as fn(_) -> _, tile_fixture, gscale_fixture] {
+            let gf = fixture_fn(ElemFormat::F32);
+            let lf = linear_f32_fixture(&gf);
+            let tiled = gpu(&gf, KernelVariant::PRODUCTION).expect("gemm_block gpu");
+            let linear = crate::shaders::gemm_linear_f32::gpu_nvfp4(&lf, KernelVariant::PRODUCTION)
+                .expect("gemm_linear_f32 gpu");
+            assert_oracle(&tiled, &linear, 0.08, 0.999);
+        }
+    }
+}
+
+#[cfg(test)]
+mod extra_tests {
+    use super::*;
+    use crate::shaders::test_util::assert_oracle;
+    use crate::shaders::variant::KernelVariant;
 
     fn linear_f32_fixture(gf: &Fixture) -> crate::shaders::gemm_linear_f32::Fixture {
         crate::shaders::gemm_linear_f32::Fixture {

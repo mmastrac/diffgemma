@@ -7,13 +7,24 @@ use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;
 use crate::shaders::variant::KernelVariant;
 
-pub const ENTRY: &str = "sc_prob_cols";
+crate::shader_kernel! {
+    name = "sc_prob_cols",
+    metal = "sc_prob_cols.metal",
+    pipeline = |ctx, variant| ctx.compile_subkernel(SHADER, ENTRY, variant),
+    spec = {
+            quant_formats: &[QuantFormat::Q4Affine],
+            fc: &[],
+            variants: KernelVariants::Elementwise,
+    },
+    tests = [
+        tiny => tiny_fixture => (1e-3, 0.9999),
+        chunk => chunk_fixture => (1e-2, 0.999),
+    ],
+}
 const TILE: usize = 16;
 /// Prob up-scale before the fp16 GEMM tiles; must match `SC_PROB_GEMM_SCALE` in
 /// shaders/include/sc_prob_scale.metal and src/metal/step_kernel.rs.
 const SC_PROB_GEMM_SCALE: f32 = 4096.0;
-
-pub const SHADER: &str = include_str!("sc_prob_cols.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {
@@ -36,10 +47,6 @@ impl Fixture {
     pub fn out_len(&self) -> usize {
         self.rows * self.chunk
     }
-}
-
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.out_len()
 }
 
 pub fn tiny_fixture(_: ElemFormat) -> Fixture {
@@ -106,14 +113,6 @@ pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
         }
     }
     out
-}
-
-#[cfg(target_os = "macos")]
-pub fn pipeline_for(
-    ctx: &crate::metal::device::MetalContext,
-    variant: KernelVariant,
-) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_subkernel(SHADER, ENTRY, variant)
 }
 
 #[cfg(target_os = "macos")]
@@ -194,44 +193,4 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
         .collect())
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::kernel_oracle_matrix;
-
-    kernel_oracle_matrix! {
-        mod tiny,
-        cpu = crate::shaders::sc_prob_cols::cpu,
-        cpu_oracle = crate::shaders::sc_prob_cols::cpu_oracle,
-        gpu = crate::shaders::sc_prob_cols::gpu,
-        fixture = crate::shaders::sc_prob_cols::tiny_fixture,
-        out_len = crate::shaders::sc_prob_cols::fixture_len,
-        formats: [F32],
-        max_tol = 1e-3,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod chunk,
-        cpu = crate::shaders::sc_prob_cols::cpu,
-        cpu_oracle = crate::shaders::sc_prob_cols::cpu_oracle,
-        gpu = crate::shaders::sc_prob_cols::gpu,
-        fixture = crate::shaders::sc_prob_cols::chunk_fixture,
-        out_len = crate::shaders::sc_prob_cols::fixture_len,
-        formats: [F32],
-        max_tol = 1e-2,
-        min_cos = 0.999,
-    }
-}
-
 pub mod cpu;
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "sc_prob_cols",
-        entry: "sc_prob_cols",
-        source: SHADER,
-        quant_formats: &[QuantFormat::Q4Affine],
-        fc: &[],
-        variants: KernelVariants::Elementwise,
-    }
-}
