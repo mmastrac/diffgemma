@@ -9,6 +9,8 @@ pub enum Error {
     Cache(String),
     /// CUDA driver, module, or launch failure; carries the driver message.
     Cuda(String),
+    /// Malformed input data (a shape/size mismatch in a payload).
+    Format(&'static str),
 }
 
 impl std::fmt::Display for Error {
@@ -18,6 +20,7 @@ impl std::fmt::Display for Error {
             Self::Compile(msg) => write!(f, "shader compile failed: {msg}"),
             Self::Cache(msg) => write!(f, "pipeline cache: {msg}"),
             Self::Cuda(msg) => write!(f, "cuda: {msg}"),
+            Self::Format(msg) => write!(f, "format error: {msg}"),
         }
     }
 }
