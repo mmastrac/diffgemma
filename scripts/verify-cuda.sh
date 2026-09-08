@@ -6,7 +6,7 @@
 #
 # Mirrors the working tree, then runs, in order:
 #   1. gpukit driver smoke test (nvcc -> cubin -> cuLaunchKernel -> result)
-#   2. dgops tier-1 parity: every op's CUDA kernel vs its CPU oracle
+#   2. dgemm + dgops tier-1 parity: every CUDA body vs its CPU oracle
 #   3. nanogpt forward vs the independent CPU reference
 #   4. nanogpt finite-difference gradient check of the backward pass
 #   5. a short training run and a sample
@@ -26,14 +26,18 @@ if [ -z "$REMOTE_DIR" ]; then REMOTE_DIR=diffgemma-cuda; fi
 HERE="$(cd "$(dirname "$0")" && pwd)"
 "$HERE/sync-cuda.sh" "$HOST" --no-test
 
-ssh -o BatchMode=yes "$HOST" "cd $REMOTE_DIR && export PATH=\$HOME/.cargo/bin:\$PATH && set -e && \
-echo '=== 1/5 gpukit CUDA driver smoke ===' && \
-cargo test -p gpukit --features cuda --test cuda_smoke -- --nocapture && \
-echo '=== 2/5 dgops tier-1 parity on CUDA ===' && \
-cargo test --release -p dgops --features cuda && \
-echo '=== 3/5 nanogpt forward vs CPU reference ===' && \
-cargo run --release -p nanogpt --features cuda -- --check && \
-echo '=== 4/5 nanogpt gradient check ===' && \
-cargo run --release -p nanogpt --features cuda -- --gradcheck && \
-echo '=== 5/5 short train + sample ===' && \
-cargo run --release -p nanogpt --features cuda -- --train --steps 200 --batch 4 --seed 42 --sample --tokens 160"
+ssh -o BatchMode=yes "$HOST" "cd $REMOTE_DIR && bash -s" <<'EOS'
+set -e
+export PATH=$HOME/.cargo/bin:$PATH
+echo '=== 1/5 gpukit CUDA driver smoke ==='
+cargo test -p gpukit --features cuda --test cuda_smoke -- --nocapture
+echo '=== 2/5 dgemm + dgops tier-1 parity on CUDA ==='
+cargo test --release -p dgemm --features cuda
+cargo test --release -p dgops --features cuda
+echo '=== 3/5 nanogpt forward vs CPU reference ==='
+cargo run --release -p nanogpt --features cuda -- --check
+echo '=== 4/5 nanogpt gradient check ==='
+cargo run --release -p nanogpt --features cuda -- --gradcheck
+echo '=== 5/5 short train + sample ==='
+cargo run --release -p nanogpt --features cuda -- --train --steps 200 --batch 4 --seed 42 --sample --tokens 160
+EOS

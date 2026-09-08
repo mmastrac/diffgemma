@@ -135,7 +135,9 @@ knows `.metal` paths; `src/metal/` (the runtime) consumes pipelines via
 `shaders::<kernel>::pipeline_for*` / `{SHADER, ENTRY}`.
 
 - **Two homes for kernels.** The engine's kernels live in `src/shaders/`
-  (Metal only today). The backend-agnostic subset lives in `crates/dgops/`,
+  (Metal only today). The GEMM family lives in `crates/dgemm` (one body per
+  backend, format/structure/epilogue fusion as axis values); the rest of the
+  backend-agnostic subset lives in `crates/dgops/`,
   where an op has one CPU reference and a `.metal` + `.cu` body side by side,
   dispatched through `crates/gpukit` (Metal on macOS, CUDA elsewhere with
   `--features cuda`). A CUDA port of an engine kernel is a `cuda.cu` beside
@@ -331,9 +333,10 @@ diffgemma golden -m $WEIGHTS                # byte-identity 8/8
 cargo test --release
 
 # CUDA (Linux + NVIDIA GPU). The DiffusionGemma engine is still Metal-only;
-# this covers the portable layer in crates/dgops and the nanogpt example.
+# this covers crates/dgemm, crates/dgops and the nanogpt example.
 # From any machine with SSH to a CUDA box, scripts/verify-cuda.sh runs all of:
 #   scripts/verify-cuda.sh <user@@host>
+cargo test --release -p dgemm --features cuda   # GEMM CUDA vs CPU parity
 cargo test --release -p dgops --features cuda   # per-op CUDA vs CPU parity
 cargo run --release -p nanogpt --features cuda -- --check      # forward parity
 cargo run --release -p nanogpt --features cuda -- --gradcheck  # finite-diff grads
