@@ -73,7 +73,8 @@ impl KernelArgs {
     /// Two consecutive u32s (a uint2 kernel parameter).
     pub fn u32x2(&mut self, a: u32, b: u32) -> &mut Self {
         let packed = [(a as u64) | ((b as u64) << 32)];
-        self.args.push(Arg::Aligned(packed.to_vec().into_boxed_slice()));
+        self.args
+            .push(Arg::Aligned(packed.to_vec().into_boxed_slice()));
         self
     }
 
@@ -159,5 +160,11 @@ pub fn launch_grid(
         height <= 65535,
         "launch_grid height {height} exceeds the CUDA gridDim.y limit of 65535"
     );
-    ctx.launch(kernel, (width as u32, height as u32, 1), (block_width, 1, 1), 0, args)
+    ctx.launch(
+        kernel,
+        (width as u32, height as u32, 1),
+        (block_width, 1, 1),
+        0,
+        args,
+    )
 }

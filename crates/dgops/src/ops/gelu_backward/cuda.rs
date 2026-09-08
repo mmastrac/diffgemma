@@ -1,4 +1,4 @@
-//! CUDA dispatch for vec_scale.
+//! CUDA dispatch for gelu_backward.
 
 use super::{CUBIN, ENTRY};
 use crate::Error;
@@ -14,17 +14,21 @@ pub fn gpu(fix: &super::Fixture) -> Result<Vec<f32>, Error> {
     let kernel = crate::cuda_rt::kernel(CUBIN, ENTRY)?;
     let mut pool = BufferPool::new();
     let len = fix.len();
-    let buf = pool.allocate(ctx, len * 4)?;
-    buf.write_f32(&fix.x)?;
+    let buf_g = pool.allocate(ctx, len * 4)?;
+    let buf_dy = pool.allocate(ctx, len * 4)?;
+    let buf_out = pool.allocate(ctx, len * 4)?;
+    buf_g.write_f32(&fix.g)?;
+    buf_dy.write_f32(&fix.dy)?;
 
     let mut args = KernelArgs::new();
-    args.device_ptr(buf.device_ptr())
-        .f32(fix.scale)
+    args.device_ptr(buf_g.device_ptr())
+        .device_ptr(buf_dy.device_ptr())
+        .device_ptr(buf_out.device_ptr())
         .u32(len as u32);
     launch_1d(ctx, &kernel, len, &mut args)?;
     ctx.synchronize()?;
 
     let mut out = vec![0.0f32; len];
-    buf.read_f32(&mut out)?;
+    buf_out.read_f32(&mut out)?;
     Ok(out)
 }

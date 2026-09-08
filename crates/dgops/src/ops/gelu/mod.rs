@@ -11,7 +11,7 @@ const CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cuda/ops/gelu/gel
 const CUBIN: &[u8] = &[];
 
 /// Matches the engine's gelu_tanh in include/activations.metal.
-const GELU_TANH_COEF: f32 = 0.7978845608028654;
+const GELU_TANH_COEF: f32 = 0.797_884_6;
 
 #[derive(Debug, Clone)]
 pub struct Fixture {
@@ -77,10 +77,10 @@ pub fn gpu(fix: &Fixture) -> Result<Vec<f32>, Error> {
     }
 }
 
-#[cfg(target_os = "macos")]
-pub mod metal;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+#[cfg(target_os = "macos")]
+pub mod metal;
 
 #[cfg(test)]
 mod tests {

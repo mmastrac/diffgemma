@@ -38,7 +38,9 @@ pub fn long_fixture() -> Fixture {
     let len = 8192;
     Fixture {
         x: (0..len).map(|i| ((i as f32) * 0.003).sin()).collect(),
-        addend: (0..len).map(|i| ((i as f32) * 0.007).cos() * 0.25).collect(),
+        addend: (0..len)
+            .map(|i| ((i as f32) * 0.007).cos() * 0.25)
+            .collect(),
     }
 }
 
@@ -68,10 +70,10 @@ pub fn gpu(fix: &Fixture) -> Result<Vec<f32>, Error> {
     }
 }
 
-#[cfg(target_os = "macos")]
-pub mod metal;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+#[cfg(target_os = "macos")]
+pub mod metal;
 
 #[cfg(test)]
 mod tests {

@@ -43,7 +43,8 @@ type CuCtxSetCurrent = unsafe extern "C" fn(CUcontext) -> CUresult;
 type CuCtxSynchronize = unsafe extern "C" fn() -> CUresult;
 type CuModuleLoadData = unsafe extern "C" fn(*mut CUmodule, *const c_void) -> CUresult;
 type CuModuleUnload = unsafe extern "C" fn(CUmodule) -> CUresult;
-type CuModuleGetFunction = unsafe extern "C" fn(*mut CUfunction, CUmodule, *const c_char) -> CUresult;
+type CuModuleGetFunction =
+    unsafe extern "C" fn(*mut CUfunction, CUmodule, *const c_char) -> CUresult;
 type CuMemAlloc = unsafe extern "C" fn(*mut CUdeviceptr, usize) -> CUresult;
 type CuMemFree = unsafe extern "C" fn(CUdeviceptr) -> CUresult;
 type CuMemcpyHtoD = unsafe extern "C" fn(CUdeviceptr, *const c_void, usize) -> CUresult;

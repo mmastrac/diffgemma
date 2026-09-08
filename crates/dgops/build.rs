@@ -33,14 +33,12 @@ fn cuda_arch() -> String {
     if let Ok(out) = Command::new("nvidia-smi")
         .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
         .output()
+        && out.status.success()
+        && let Some(first) = String::from_utf8_lossy(&out.stdout).lines().next()
     {
-        if out.status.success() {
-            if let Some(first) = String::from_utf8_lossy(&out.stdout).lines().next() {
-                let digits: String = first.chars().filter(|c| c.is_ascii_digit()).collect();
-                if !digits.is_empty() {
-                    return format!("sm_{digits}");
-                }
-            }
+        let digits: String = first.chars().filter(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            return format!("sm_{digits}");
         }
     }
     "native".to_string()
