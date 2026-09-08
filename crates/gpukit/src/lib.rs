@@ -15,3 +15,8 @@ pub mod includes;
 
 #[cfg(target_os = "macos")]
 pub mod metal;
+
+/// CUDA backend (runtime-resolved driver; see the module docs). Gated behind
+/// the cuda feature so a Metal-only build never carries it.
+#[cfg(feature = "cuda")]
+pub mod cuda;

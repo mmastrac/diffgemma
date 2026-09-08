@@ -101,6 +101,7 @@ impl From<gpukit::Error> for Error {
             gpukit::Error::Gpu(msg) => Self::Gpu(msg),
             gpukit::Error::Compile(msg) => Self::NotFound(format!("shader compile failed: {msg}")),
             gpukit::Error::Cache(msg) => Self::NotFound(format!("pipeline cache: {msg}")),
+            gpukit::Error::Cuda(msg) => Self::Gpu(format!("cuda: {msg}")),
         }
     }
 }
