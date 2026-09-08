@@ -1,11 +1,12 @@
-//! Shared Metal context and per-thread pipeline cache for the GEMM bodies.
+//! Per-thread memoized Metal context and pipeline cache.
 //!
-//! Context creation and MSL compilation are both expensive, and a model step
-//! dispatches the same kernel thousands of times, so both are cached per
-//! thread (a Metal context and its pipeline objects are not Send). No include
-//! table is used; no on-disk archive is touched.
+//! Context creation and MSL compilation are both expensive, and a step
+//! dispatches the same handful of kernels thousands of times, so both are
+//! cached per thread (a Metal context and its pipeline objects are not Send).
+//! Callers that pass the same [`CacheConfig`] share one context and one
+//! pipeline cache per thread.
 
-use gpukit::metal::{CacheConfig, ComputePipeline, Context};
+use super::{CacheConfig, ComputePipeline, Context};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -17,17 +18,14 @@ thread_local! {
 }
 
 /// This thread's Metal context, created on first use.
-pub fn context() -> Result<Rc<Context>, gpukit::Error> {
+///
+/// The first caller's `cache` wins for the thread; a later caller asking for a
+/// different configuration reuses the cached context.
+pub fn cached_context(cache: CacheConfig) -> Result<Rc<Context>, crate::Error> {
     CONTEXT.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
-            let ctx = Context::new(CacheConfig {
-                enabled: false,
-                dir: None,
-                namespace: "dgemm",
-                key: 0x6467_6d6d,
-                verbose: false,
-            })?;
+            let ctx = Context::new(cache)?;
             *slot = Some(Rc::new(ctx));
         }
         Ok(Rc::clone(slot.as_ref().expect("just set")))
@@ -35,11 +33,11 @@ pub fn context() -> Result<Rc<Context>, gpukit::Error> {
 }
 
 /// A compiled pipeline for (source, entry), compiled at most once per thread.
-pub fn pipeline(
+pub fn cached_pipeline(
     ctx: &Context,
     source: &'static str,
     entry: &'static str,
-) -> Result<Rc<ComputePipeline>, gpukit::Error> {
+) -> Result<Rc<ComputePipeline>, crate::Error> {
     PIPELINES.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some(existing) = cache.get(&(source, entry)) {

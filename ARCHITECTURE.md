@@ -545,7 +545,9 @@ are local-only dev tooling for experiment arms (`quantize --overlay`,
   header folders (`register_includes!`), function-constant specialization
   with cache labels derived from the full input set (FC values + source
   hash), the pipeline binary-archive cache (keyed on the whole shader-tree
-  hash), buffer pool, one-shot dispatch helpers. The Metal backend is
+  hash), buffer pool, one-shot dispatch helpers, and the memoized runtime
+  caches every caller shares (`metal::cached_context` / `cached_pipeline`,
+  `cuda::cached_context` / `cached_kernel`). The Metal backend is
   `gpukit::metal`; `gpukit::cuda` (feature `cuda`) is the same mechanism over
   the CUDA driver API, resolved with `dlopen` at first use so the crate builds
   and type-checks on hosts with no CUDA installed.

@@ -10,8 +10,8 @@ pub fn gpu(fix: &super::Fixture) -> Result<Vec<f32>, Error> {
             "CUDA kernels were not built (nvcc missing at build time)",
         ));
     }
-    let ctx = crate::cuda_rt::context()?;
-    let kernel = crate::cuda_rt::kernel(CUBIN, ENTRY)?;
+    let ctx = gpukit::cuda::cached_context()?;
+    let kernel = gpukit::cuda::cached_kernel(CUBIN, ENTRY)?;
     let mut pool = BufferPool::new();
     let len = fix.len();
     let out_len = super::out_len(fix);
@@ -32,7 +32,7 @@ pub fn gpu(fix: &super::Fixture) -> Result<Vec<f32>, Error> {
         .device_ptr(buf_m.device_ptr())
         .device_ptr(buf_v.device_ptr())
         .device_ptr(buf_out.device_ptr())
-        .bytes(crate::cuda_rt::pod_bytes(&params))
+        .bytes(gpukit::cuda::pod_bytes(&params))
         .u32(len as u32);
     launch_1d(ctx, &kernel, len, &mut args)?;
     ctx.synchronize()?;

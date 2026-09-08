@@ -10,8 +10,8 @@ pub fn gpu(fix: &super::Fixture) -> Result<Vec<f32>, Error> {
             "CUDA kernels were not built (nvcc missing at build time)",
         ));
     }
-    let ctx = crate::cuda_rt::context()?;
-    let kernel = crate::cuda_rt::kernel(CUBIN, ENTRY)?;
+    let ctx = gpukit::cuda::cached_context()?;
+    let kernel = gpukit::cuda::cached_kernel(CUBIN, ENTRY)?;
     let mut pool = BufferPool::new();
     let len = fix.len();
     let buf_probs = pool.allocate(ctx, len * 4)?;

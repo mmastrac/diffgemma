@@ -11,8 +11,8 @@ pub fn gpu(call: &Call) -> Result<Vec<f32>, Error> {
             "CUDA kernels were not built (nvcc missing at build time)",
         ));
     }
-    let ctx = crate::cuda_rt::context()?;
-    let kernel = crate::cuda_rt::kernel(CUBIN, ENTRY)?;
+    let ctx = gpukit::cuda::cached_context()?;
+    let kernel = gpukit::cuda::cached_kernel(CUBIN, ENTRY)?;
     let p: AbiParams = call.problem.into();
     let out_len = call.out_len();
     let mut pool = BufferPool::new();
@@ -27,7 +27,7 @@ pub fn gpu(call: &Call) -> Result<Vec<f32>, Error> {
     args.device_ptr(buf_a.device_ptr())
         .device_ptr(buf_b.device_ptr())
         .device_ptr(buf_c.device_ptr())
-        .bytes(crate::cuda_rt::pod_bytes(&p));
+        .bytes(gpukit::cuda::pod_bytes(&p));
     launch_grid(
         ctx,
         &kernel,

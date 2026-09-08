@@ -11,11 +11,7 @@
 #![allow(clippy::len_without_is_empty)]
 
 pub mod backend;
-#[cfg(feature = "cuda")]
-pub(crate) mod cuda_rt;
 pub mod kernel;
-#[cfg(target_os = "macos")]
-pub(crate) mod metal_rt;
 pub mod ops;
 pub mod testing;
 

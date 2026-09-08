@@ -47,7 +47,10 @@ jobs:
       # archive is Mutex-guarded. Revert to --test-threads=1 if this ever
       # SIGSEGVs or times out on a membudget holder.
       - name: Test
-        run: cargo test --release
+        # --workspace so the member crates (dgops, dgemm, nanogpt) are built and
+        # tested too. A plain `cargo test` at the root compiles none of them,
+        # which once let a broken dgops Metal shim pass CI.
+        run: cargo test --release --workspace
 
   clippy:
     # Non-blocking: ~400 pre-existing warnings. Surfaces new lints in the log
