@@ -1,0 +1,13 @@
+//! Library surface for tests: the CUDA kernel source and a cuBLAS probe.
+
+#[cfg(feature = "cuda")]
+pub const KERNELS: &str = include_str!("kernels.cu");
+
+pub mod config;
+pub mod forward;
+#[cfg(feature = "cuda")]
+pub mod gpu;
+pub mod weights;
+
+#[cfg(feature = "cuda")]
+pub use gpu::cublas_probe;

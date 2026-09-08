@@ -12,6 +12,22 @@ pub struct DeviceBuffer {
 }
 
 impl DeviceBuffer {
+    /// Allocate a standalone device buffer (freed on drop). A pipeline that
+    /// wants many long-lived buffers uses [`BufferPool`] instead.
+    pub fn alloc(ctx: &Context, size: usize) -> Result<Self, Error> {
+        ctx.set_current()?;
+        let mut ptr: CUdeviceptr = 0;
+        ctx.driver().check(
+            unsafe { (ctx.driver().cu_mem_alloc)(&mut ptr, size) },
+            "cuMemAlloc",
+        )?;
+        Ok(Self {
+            ctx: ctx.clone(),
+            ptr,
+            size,
+        })
+    }
+
     pub fn size(&self) -> usize {
         self.size
     }

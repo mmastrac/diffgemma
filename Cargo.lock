@@ -104,6 +104,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dgqcuda"
+version = "0.1.0"
+dependencies = [
+ "dgemm",
+ "dgops",
+ "gpukit",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "diffgemma"
 version = "0.1.0"
 dependencies = [

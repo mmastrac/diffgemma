@@ -32,6 +32,19 @@ pub const BK: usize = 16;
 pub const THREADS: u32 = 256;
 
 pub const ENTRY: &str = "gemm_f32";
+
+/// The kernel's packed argument struct as bytes, for a caller that launches
+/// the body itself (a multi-kernel pipeline holding device buffers).
+pub fn abi_params(p: &Problem) -> Vec<u8> {
+    let abi = crate::problem::AbiParams::from(*p);
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            std::ptr::from_ref(&abi).cast::<u8>(),
+            size_of::<crate::problem::AbiParams>(),
+        )
+    };
+    bytes.to_vec()
+}
 pub const METAL: &str = include_str!("gemm.metal");
 
 /// CUDA C++ source, compiled by NVRTC on first dispatch.

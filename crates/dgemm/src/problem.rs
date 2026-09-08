@@ -88,7 +88,7 @@ impl Problem {
 /// struct in gemm.metal / gemm.cu.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct AbiParams {
+pub struct AbiParams {
     pub m: u32,
     pub n: u32,
     pub k: u32,

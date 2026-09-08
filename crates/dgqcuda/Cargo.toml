@@ -1,0 +1,25 @@
+[package]
+name = "dgqcuda"
+version = "0.1.0"
+edition = "2024"
+description = "CUDA inference path for the DiffusionGemma .dgq pack: forward pass, denoise loop, CLI"
+license = "MIT"
+
+[lib]
+name = "dgqcuda"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dgqcuda"
+path = "src/main.rs"
+
+[features]
+default = []
+cuda = ["dgops/cuda", "dgemm/cuda", "gpukit/cuda"]
+
+[dependencies]
+dgops = { path = "../dgops" }
+dgemm = { path = "../dgemm" }
+gpukit = { path = "../gpukit", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

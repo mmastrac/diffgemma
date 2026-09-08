@@ -49,6 +49,7 @@ type CuMemAlloc = unsafe extern "C" fn(*mut CUdeviceptr, usize) -> CUresult;
 type CuMemFree = unsafe extern "C" fn(CUdeviceptr) -> CUresult;
 type CuMemcpyHtoD = unsafe extern "C" fn(CUdeviceptr, *const c_void, usize) -> CUresult;
 type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize) -> CUresult;
+type CuMemcpyDtoD = unsafe extern "C" fn(CUdeviceptr, CUdeviceptr, usize) -> CUresult;
 type CuMemsetD8 = unsafe extern "C" fn(CUdeviceptr, u8, usize) -> CUresult;
 type CuLaunchKernel = unsafe extern "C" fn(
     CUfunction,
@@ -87,6 +88,7 @@ pub struct Driver {
     pub cu_mem_free: CuMemFree,
     pub cu_memcpy_htod: CuMemcpyHtoD,
     pub cu_memcpy_dtoh: CuMemcpyDtoH,
+    pub cu_memcpy_dtod: CuMemcpyDtoD,
     pub cu_memset_d8: CuMemsetD8,
     pub cu_launch_kernel: CuLaunchKernel,
     pub cu_func_set_attribute: CuFuncSetAttribute,
@@ -138,6 +140,7 @@ impl Driver {
             cu_mem_free: sym!(lib, "cuMemFree_v2", CuMemFree),
             cu_memcpy_htod: sym!(lib, "cuMemcpyHtoD_v2", CuMemcpyHtoD),
             cu_memcpy_dtoh: sym!(lib, "cuMemcpyDtoH_v2", CuMemcpyDtoH),
+            cu_memcpy_dtod: sym!(lib, "cuMemcpyDtoD_v2", CuMemcpyDtoD),
             cu_memset_d8: sym!(lib, "cuMemsetD8_v2", CuMemsetD8),
             cu_launch_kernel: sym!(lib, "cuLaunchKernel", CuLaunchKernel),
             cu_func_set_attribute: sym!(lib, "cuFuncSetAttribute", CuFuncSetAttribute),
