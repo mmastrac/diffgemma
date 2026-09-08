@@ -182,6 +182,9 @@ mechanism and resolves the CUDA driver at runtime with `dlopen` (nothing is
 linked against `libcuda`, so the crate still builds and type-checks on a host
 with no CUDA). `crates/dgops` holds one CPU reference per op with a Metal and a
 CUDA body side by side and a tier-1 test pinning both to that reference.
+`crates/dgemm` is the GEMM family: one tiled body per backend behind a
+problem/stride API, with weight format, structure and epilogue fusion as
+compile-time axis values on that body.
 `crates/nanogpt` is a tiny character-level GPT (forward, backward, AdamW)
 composed entirely from those ops, checked against an independent CPU forward.
 
@@ -196,6 +199,7 @@ cargo run --release -p nanogpt --features cuda -- --check       # GPU forward vs
 cargo run --release -p nanogpt --features cuda -- --gradcheck   # d(loss)/d(param)
 cargo run --release -p nanogpt --features cuda -- --train --steps 2000
 cargo run --release -p nanogpt --features cuda -- --sample --tokens 400
+cargo test --release -p dgemm --features cuda                   # GEMM parity
 cargo test --release -p dgops --features cuda                   # per-op parity
 ```
 

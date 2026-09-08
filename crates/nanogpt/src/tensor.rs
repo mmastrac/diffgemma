@@ -1,7 +1,7 @@
-//! Thin wrappers over dgops that keep the model code readable.
+//! Thin wrappers over dgops and dgemm that keep the model code readable.
 
+use dgemm::{Call, Problem, gpu as gemm_gpu};
 use dgops::Error;
-use dgops::ops::gemm::{Fixture, GemmParams, gpu as gemm_gpu};
 
 /// C = alpha * op(A) @ op(B) + beta * C, with explicit leading dimensions.
 #[allow(clippy::too_many_arguments)]
@@ -19,24 +19,24 @@ pub fn gemm(
     trans_b: bool,
     beta: f32,
 ) -> Result<Vec<f32>, Error> {
-    let fix = Fixture {
+    let call = Call {
         a: a.to_vec(),
         b: b.to_vec(),
         c,
-        params: GemmParams {
-            m: m as u32,
-            n: n as u32,
-            k: k as u32,
-            lda: lda as u32,
-            ldb: ldb as u32,
-            ldc: ldc as u32,
+        problem: Problem {
+            m,
+            n,
+            k,
+            lda,
+            ldb,
+            ldc,
             alpha: 1.0,
             beta,
-            trans_a: u32::from(trans_a),
-            trans_b: u32::from(trans_b),
+            trans_a,
+            trans_b,
         },
     };
-    gemm_gpu(&fix)
+    gemm_gpu(&call)
 }
 
 /// Y = X @ W^T with X (m,k), W (n,k) (PyTorch linear layout).

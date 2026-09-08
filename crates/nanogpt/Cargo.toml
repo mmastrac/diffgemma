@@ -10,8 +10,9 @@ name = "nanogpt"
 path = "src/main.rs"
 
 [dependencies]
+dgemm = { path = "../dgemm" }
 dgops = { path = "../dgops" }
 
 [features]
 default = []
-cuda = ["dgops/cuda"]
+cuda = ["dgemm/cuda", "dgops/cuda"]

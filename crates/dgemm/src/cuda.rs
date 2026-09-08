@@ -1,10 +1,11 @@
-//! CUDA dispatch for gemm.
+//! CUDA dispatch for the f32 GEMM.
 
-use super::{BM, BN, CUBIN, ENTRY, THREADS};
 use crate::Error;
+use crate::problem::{AbiParams, Call};
+use crate::{BM, BN, CUBIN, ENTRY, THREADS};
 use gpukit::cuda::{BufferPool, KernelArgs, div_up, launch_grid};
 
-pub fn gpu(fix: &super::Fixture) -> Result<Vec<f32>, Error> {
+pub fn gpu(call: &Call) -> Result<Vec<f32>, Error> {
     if CUBIN.is_empty() {
         return Err(Error::Gpu(
             "CUDA kernels were not built (nvcc missing at build time)",
@@ -12,15 +13,15 @@ pub fn gpu(fix: &super::Fixture) -> Result<Vec<f32>, Error> {
     }
     let ctx = crate::cuda_rt::context()?;
     let kernel = crate::cuda_rt::kernel(CUBIN, ENTRY)?;
-    let p = fix.params;
+    let p: AbiParams = call.problem.into();
+    let out_len = call.out_len();
     let mut pool = BufferPool::new();
-    let out_len = fix.out_len();
-    let buf_a = pool.allocate(ctx, fix.a.len() * 4)?;
-    let buf_b = pool.allocate(ctx, fix.b.len() * 4)?;
+    let buf_a = pool.allocate(ctx, call.a.len() * 4)?;
+    let buf_b = pool.allocate(ctx, call.b.len() * 4)?;
     let buf_c = pool.allocate(ctx, out_len * 4)?;
-    buf_a.write_f32(&fix.a)?;
-    buf_b.write_f32(&fix.b)?;
-    buf_c.write_f32(&fix.c)?;
+    buf_a.write_f32(&call.a)?;
+    buf_b.write_f32(&call.b)?;
+    buf_c.write_f32(&call.c)?;
 
     let mut args = KernelArgs::new();
     args.device_ptr(buf_a.device_ptr())

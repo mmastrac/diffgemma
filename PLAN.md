@@ -250,8 +250,16 @@ clears 0.641 by a lot.
   macOS-gated). Order: make `src/shaders` + `src/model` build on Linux behind
   the cuda feature (their GPU halves are already cfg-gated), port the tranche
   nanogpt covers as `cuda.cu` beside each `.metal` against the same CPU
-  oracle, then the quantized GEMM and attention families. A CUDA box can run
-  the tier-1 parity suite without the 19 GiB pack.
+  oracle, then attention. A CUDA box can run the tier-1 parity suite
+  without the 19 GiB pack.
+- **Move the engine GEMM family into `crates/dgemm`.** Stage 1 (the plain f32
+  body, shared with nanogpt) has landed. Next: extract the decode-only subset
+  of `src/dgq` into the crate's Format axis (q4/q6/q8/nvfp4), then move
+  `gemm_tunable` plus its bit-exact oracle twins (`gemm_block`,
+  `gemm_block_stacked`, `gemm_block_grouped`) in verbatim -- gated by
+  `bench-gemm --oracle` per-element bit-exactness across all production shapes,
+  which needs the 19 GiB pack. Stacked/gather/arena fusion stay compile-time
+  axis values on that body. Then the CUDA bodies, one per axis combination.
 
 ## Parked / speculative
 
