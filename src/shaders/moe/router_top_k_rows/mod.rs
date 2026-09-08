@@ -5,9 +5,58 @@ use crate::model::moe::top_k_route_from_raw_logits;
 use crate::shaders::test_util::ElemFormat;
 use crate::shaders::variant::KernelVariant;
 
-pub const ENTRY: &str = "router_top_k_rows";
+crate::shader_kernel! {
+    name = "router_top_k_rows",
+    metal = "router_top_k_rows.metal",
+    pipeline = |ctx, variant| ctx.compile_subkernel(SHADER, ENTRY, variant),
+    spec = {
+            quant_formats: &[QuantFormat::Q4Affine],
+            fc: &[],
+            variants: KernelVariants::Elementwise,
+    },
+    tests = {
+        use super::*;
 
-pub const SHADER: &str = include_str!("router_top_k_rows.metal");
+        #[test]
+        fn cpu_tiny_top_indices_descending() {
+            let fix = tiny_fixture(ElemFormat::F32);
+            let out = cpu(&fix);
+            // Row 0 softmax peak at expert 2 (logit 3.0).
+            assert_eq!(out.indices[0], 2);
+        }
+
+        #[test]
+        fn cpu_matches_oracle() {
+            for fix in [tiny_fixture(ElemFormat::F32), moe_fixture(ElemFormat::F32)] {
+                assert_route_eq(&cpu(&fix), &cpu_oracle(&fix));
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn gpu_matches_cpu_tiny() {
+            if crate::shaders::test_util::skip_gpu_on_ci() {
+                return;
+            }
+            let fix = tiny_fixture(ElemFormat::F32);
+            let cpu = cpu(&fix);
+            let gpu = gpu(&fix, KernelVariant::PRODUCTION).expect("gpu");
+            assert_route_eq(&cpu, &gpu);
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn gpu_matches_cpu_moe() {
+            if crate::shaders::test_util::skip_gpu_on_ci() {
+                return;
+            }
+            let fix = moe_fixture(ElemFormat::F32);
+            let cpu = cpu(&fix);
+            let gpu = gpu(&fix, KernelVariant::PRODUCTION).expect("gpu");
+            assert_route_eq(&cpu, &gpu);
+        }
+    },
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RouteOut {
@@ -155,14 +204,6 @@ pub fn gpu(fix: &Fixture, variant: KernelVariant) -> Result<RouteOut, Error> {
 }
 
 #[cfg(target_os = "macos")]
-pub fn pipeline_for(
-    ctx: &crate::metal::device::MetalContext,
-    variant: KernelVariant,
-) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_subkernel(SHADER, ENTRY, variant)
-}
-
-#[cfg(target_os = "macos")]
 use objc2::runtime::ProtocolObject;
 #[cfg(target_os = "macos")]
 use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder};
@@ -202,60 +243,5 @@ fn assert_route_eq(a: &RouteOut, b: &RouteOut) {
     assert_eq!(a.indices, b.indices, "indices mismatch");
     for (i, (&x, &y)) in a.weights.iter().zip(b.weights.iter()).enumerate() {
         assert!((x - y).abs() < 1e-5, "weight[{i}] cpu={x} gpu={y}");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cpu_tiny_top_indices_descending() {
-        let fix = tiny_fixture(ElemFormat::F32);
-        let out = cpu(&fix);
-        // Row 0 softmax peak at expert 2 (logit 3.0).
-        assert_eq!(out.indices[0], 2);
-    }
-
-    #[test]
-    fn cpu_matches_oracle() {
-        for fix in [tiny_fixture(ElemFormat::F32), moe_fixture(ElemFormat::F32)] {
-            assert_route_eq(&cpu(&fix), &cpu_oracle(&fix));
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn gpu_matches_cpu_tiny() {
-        if crate::shaders::test_util::skip_gpu_on_ci() {
-            return;
-        }
-        let fix = tiny_fixture(ElemFormat::F32);
-        let cpu = cpu(&fix);
-        let gpu = gpu(&fix, KernelVariant::PRODUCTION).expect("gpu");
-        assert_route_eq(&cpu, &gpu);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn gpu_matches_cpu_moe() {
-        if crate::shaders::test_util::skip_gpu_on_ci() {
-            return;
-        }
-        let fix = moe_fixture(ElemFormat::F32);
-        let cpu = cpu(&fix);
-        let gpu = gpu(&fix, KernelVariant::PRODUCTION).expect("gpu");
-        assert_route_eq(&cpu, &gpu);
-    }
-}
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "router_top_k_rows",
-        entry: "router_top_k_rows",
-        source: SHADER,
-        quant_formats: &[QuantFormat::Q4Affine],
-        fc: &[],
-        variants: KernelVariants::Elementwise,
     }
 }

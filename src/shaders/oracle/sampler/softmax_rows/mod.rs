@@ -7,10 +7,23 @@ use crate::shaders::variant::KernelVariant;
 
 use crate::Error;
 
-pub const ENTRY: &str = "softmax_rows";
+crate::shader_kernel! {
+    name = "softmax_rows",
+    metal = "softmax_rows.metal",
+    pipeline = |ctx, variant| ctx.compile_subkernel(SHADER, ENTRY, variant),
+    spec = {
+            quant_formats: &[QuantFormat::Q4Affine],
+            fc: &[],
+            variants: KernelVariants::Elementwise,
+    },
+    tests = [
+        tiny => tiny_fixture => (1e-5, 0.9999),
+        router => router_fixture => (1e-5, 0.9999),
+        wide_cols => wide_cols_fixture => (1e-5, 0.9999),
+        canvas_vocab => canvas_vocab_fixture => (1e-4, 0.9999),
+    ],
+}
 pub const THREADGROUP_WIDTH: usize = 256;
-
-pub const SHADER: &str = include_str!("softmax_rows.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {
@@ -20,13 +33,9 @@ pub struct Fixture {
 }
 
 impl Fixture {
-    pub fn len(&self) -> usize {
+    pub fn out_len(&self) -> usize {
         self.rows * self.cols
     }
-}
-
-pub fn fixture_len(fix: &Fixture) -> usize {
-    fix.len()
 }
 
 pub fn tiny_fixture(_fmt: ElemFormat) -> Fixture {
@@ -118,7 +127,7 @@ pub fn gpu(fix: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let ctx = MetalContext::new()?;
     let pipeline = pipeline_for(&ctx, variant)?;
     let mut pool = BufferPool::new();
-    let len = fix.len();
+    let len = fix.out_len();
     let buf = pool
         .allocate(&ctx.device, len * 4)
         .ok_or(Error::Gpu("buffer alloc failed"))?;
@@ -158,14 +167,6 @@ pub fn gpu(fix: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
 
 pub fn shader_source() -> &'static str {
     SHADER
-}
-
-#[cfg(target_os = "macos")]
-pub fn pipeline_for(
-    ctx: &crate::metal::device::MetalContext,
-    variant: KernelVariant,
-) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_subkernel(SHADER, ENTRY, variant)
 }
 
 #[cfg(target_os = "macos")]
@@ -215,57 +216,8 @@ fn set_bytes<T>(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, value: &
 }
 
 #[cfg(test)]
-mod tests {
+mod extra_tests {
     use super::*;
-    use crate::kernel_oracle_matrix;
-
-    kernel_oracle_matrix! {
-        mod tiny,
-        cpu = crate::shaders::softmax_rows::cpu,
-        cpu_oracle = crate::shaders::softmax_rows::cpu_oracle,
-        gpu = crate::shaders::softmax_rows::gpu,
-        fixture = crate::shaders::softmax_rows::tiny_fixture,
-        out_len = crate::shaders::softmax_rows::fixture_len,
-        formats: [F32],
-        max_tol = 1e-5,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod router,
-        cpu = crate::shaders::softmax_rows::cpu,
-        cpu_oracle = crate::shaders::softmax_rows::cpu_oracle,
-        gpu = crate::shaders::softmax_rows::gpu,
-        fixture = crate::shaders::softmax_rows::router_fixture,
-        out_len = crate::shaders::softmax_rows::fixture_len,
-        formats: [F32],
-        max_tol = 1e-5,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod wide_cols,
-        cpu = crate::shaders::softmax_rows::cpu,
-        cpu_oracle = crate::shaders::softmax_rows::cpu_oracle,
-        gpu = crate::shaders::softmax_rows::gpu,
-        fixture = crate::shaders::softmax_rows::wide_cols_fixture,
-        out_len = crate::shaders::softmax_rows::fixture_len,
-        formats: [F32],
-        max_tol = 1e-5,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod canvas_vocab,
-        cpu = crate::shaders::softmax_rows::cpu,
-        cpu_oracle = crate::shaders::softmax_rows::cpu_oracle,
-        gpu = crate::shaders::softmax_rows::gpu,
-        fixture = crate::shaders::softmax_rows::canvas_vocab_fixture,
-        out_len = crate::shaders::softmax_rows::fixture_len,
-        formats: [F32],
-        max_tol = 1e-4,
-        min_cos = 0.9999,
-    }
 
     #[test]
     fn cpu_row_invariants() {
@@ -288,16 +240,5 @@ mod tests {
         let fix = router_fixture(ElemFormat::F32);
         let out = gpu(&fix, KernelVariant::PRODUCTION).expect("gpu");
         assert_row_invariants(&out, fix.rows, fix.cols);
-    }
-}
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "softmax_rows",
-        entry: "softmax_rows",
-        source: SHADER,
-        quant_formats: &[QuantFormat::Q4Affine],
-        fc: &[],
-        variants: KernelVariants::Elementwise,
     }
 }

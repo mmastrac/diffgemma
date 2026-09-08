@@ -9,10 +9,27 @@ use crate::shaders::qk_rope_kv::AttnDims;
 use crate::shaders::test_util::ElemFormat;
 use crate::shaders::variant::KernelVariant;
 
-pub const ENTRY: &str = "attention";
+crate::shader_kernel! {
+    name = "attention",
+    metal = "attention.metal",
+    pipeline = |ctx, variant| ctx.compile_subkernel(SHADER, ENTRY, variant),
+    spec = {
+            quant_formats: &[QuantFormat::Q4Affine],
+            fc: &[],
+            variants: KernelVariants::Elementwise,
+    },
+    tests = [
+        tiny => tiny_fixture => (1e-2, 0.9999),
+        wide => wide_fixture => (2e-2, 0.9999),
+        full_hd512 => full_hd512_fixture => (2e-2, 0.9999),
+        sliding_hd256 => sliding_hd256_fixture => (2e-2, 0.9999),
+        mma_full_grp2 => full_hd512_fixture => gpu_mma_full => (2e-2, 0.9999),
+        mma_full_grp8 => full_grp8_hd512_fixture => gpu_mma_full => (2e-2, 0.9999),
+        mma2_tiny => tiny_fixture => gpu_mma2 => (1e-2, 0.9999),
+        mma2_sliding_hd256 => sliding_hd256_fixture => gpu_mma2 => (2e-2, 0.9999),
+    ],
+}
 pub const THREADGROUP_WIDTH: usize = 64;
-
-pub const SHADER: &str = include_str!("attention.metal");
 
 pub const MMA_M_TILE: usize = 8;
 
@@ -50,10 +67,6 @@ impl Fixture {
     pub fn out_len(&self) -> usize {
         self.canvas * self.n_q_heads * self.head_dim()
     }
-}
-
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.out_len()
 }
 
 pub fn tiny_fixture(_: ElemFormat) -> Fixture {
@@ -241,14 +254,6 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
 
 pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
     cpu(f)
-}
-
-#[cfg(target_os = "macos")]
-pub fn pipeline_for(
-    ctx: &crate::metal::device::MetalContext,
-    variant: KernelVariant,
-) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_subkernel(SHADER, ENTRY, variant)
 }
 
 /// Compile with the session KV storage format (uint function constant 4).
@@ -832,121 +837,34 @@ pub fn bench_path(f: &Fixture, iters: usize, path: u8) -> Result<f64, Error> {
 }
 
 crate::kernel_spec! {
-    pub const SPEC {
-        name: "attention",
-        entry: "attention",
-        source: SHADER,
+    pub const SPEC_ATTENTION_MMA2 {
+        name: "attention_mma2",
+        entry: "attention_mma2",
+        source: SHADER_MMA2,
         quant_formats: &[QuantFormat::Q4Affine],
-        fc: &[],
+        fc: &[(4, "KV_FMT_FC"), (30, "KV_F32_SIDE_FC")],
+        variants: KernelVariants::Elementwise,
+    }
+}
+
+crate::kernel_spec! {
+    pub const SPEC_ATTENTION_MMA_FULL {
+        name: "attention_mma_full",
+        entry: "attention_mma_full",
+        source: SHADER_MMA_FULL,
+        quant_formats: &[QuantFormat::Q4Affine],
+        fc: &[(4, "KV_FMT_FC"), (30, "KV_F32_SIDE_FC"), (31, "QK_ILP2_FC")],
         variants: KernelVariants::Elementwise,
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::kernel_oracle_matrix;
-
-    kernel_oracle_matrix! {
-        mod tiny,
-        cpu = crate::shaders::attention::cpu,
-        cpu_oracle = crate::shaders::attention::cpu_oracle,
-        gpu = crate::shaders::attention::gpu,
-        fixture = crate::shaders::attention::tiny_fixture,
-        out_len = crate::shaders::attention::fixture_len,
-        formats: [F32],
-        max_tol = 1e-2,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod wide,
-        cpu = crate::shaders::attention::cpu,
-        cpu_oracle = crate::shaders::attention::cpu_oracle,
-        gpu = crate::shaders::attention::gpu,
-        fixture = crate::shaders::attention::wide_fixture,
-        out_len = crate::shaders::attention::fixture_len,
-        formats: [F32],
-        max_tol = 2e-2,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod full_hd512,
-        cpu = crate::shaders::attention::cpu,
-        cpu_oracle = crate::shaders::attention::cpu_oracle,
-        gpu = crate::shaders::attention::gpu,
-        fixture = crate::shaders::attention::full_hd512_fixture,
-        out_len = crate::shaders::attention::fixture_len,
-        formats: [F32],
-        max_tol = 2e-2,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod sliding_hd256,
-        cpu = crate::shaders::attention::cpu,
-        cpu_oracle = crate::shaders::attention::cpu_oracle,
-        gpu = crate::shaders::attention::gpu,
-        fixture = crate::shaders::attention::sliding_hd256_fixture,
-        out_len = crate::shaders::attention::fixture_len,
-        formats: [F32],
-        max_tol = 2e-2,
-        min_cos = 0.9999,
-    }
-
+mod extra_tests {
     // ---- Matrix-unit (flash) paths: parity vs the same CPU oracle ----
 
     // ---- Full-layer MMA path (register-O, QG-grouped K/V): parity vs oracle ----
 
-    kernel_oracle_matrix! {
-        mod mma_full_grp2,
-        cpu = crate::shaders::attention::cpu,
-        cpu_oracle = crate::shaders::attention::cpu_oracle,
-        gpu = crate::shaders::attention::gpu_mma_full,
-        fixture = crate::shaders::attention::full_hd512_fixture,
-        out_len = crate::shaders::attention::fixture_len,
-        formats: [F32],
-        max_tol = 2e-2,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod mma_full_grp8,
-        cpu = crate::shaders::attention::cpu,
-        cpu_oracle = crate::shaders::attention::cpu_oracle,
-        gpu = crate::shaders::attention::gpu_mma_full,
-        fixture = crate::shaders::attention::full_grp8_hd512_fixture,
-        out_len = crate::shaders::attention::fixture_len,
-        formats: [F32],
-        max_tol = 2e-2,
-        min_cos = 0.9999,
-    }
-
     // ---- GQA-grouped MMA path (2 heads/tg): parity on group-size-2 fixtures ----
-
-    kernel_oracle_matrix! {
-        mod mma2_tiny,
-        cpu = crate::shaders::attention::cpu,
-        cpu_oracle = crate::shaders::attention::cpu_oracle,
-        gpu = crate::shaders::attention::gpu_mma2,
-        fixture = crate::shaders::attention::tiny_fixture,
-        out_len = crate::shaders::attention::fixture_len,
-        formats: [F32],
-        max_tol = 1e-2,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod mma2_sliding_hd256,
-        cpu = crate::shaders::attention::cpu,
-        cpu_oracle = crate::shaders::attention::cpu_oracle,
-        gpu = crate::shaders::attention::gpu_mma2,
-        fixture = crate::shaders::attention::sliding_hd256_fixture,
-        out_len = crate::shaders::attention::fixture_len,
-        formats: [F32],
-        max_tol = 2e-2,
-        min_cos = 0.9999,
-    }
 
     /// Microbench: scalar vs matrix-unit attention at model shape. Ignored (timing).
     /// Run: `cargo test --bin diffgemma attn_mma_bench -- --ignored --nocapture`
@@ -1038,27 +956,5 @@ mod tests {
             100.0 * flash_win_tf / 3.8,
             mma2 / flash_win,
         );
-    }
-}
-
-crate::kernel_spec! {
-    pub const SPEC_ATTENTION_MMA2 {
-        name: "attention_mma2",
-        entry: "attention_mma2",
-        source: SHADER_MMA2,
-        quant_formats: &[QuantFormat::Q4Affine],
-        fc: &[(4, "KV_FMT_FC"), (30, "KV_F32_SIDE_FC")],
-        variants: KernelVariants::Elementwise,
-    }
-}
-
-crate::kernel_spec! {
-    pub const SPEC_ATTENTION_MMA_FULL {
-        name: "attention_mma_full",
-        entry: "attention_mma_full",
-        source: SHADER_MMA_FULL,
-        quant_formats: &[QuantFormat::Q4Affine],
-        fc: &[(4, "KV_FMT_FC"), (30, "KV_F32_SIDE_FC"), (31, "QK_ILP2_FC")],
-        variants: KernelVariants::Elementwise,
     }
 }

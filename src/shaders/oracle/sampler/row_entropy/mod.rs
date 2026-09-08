@@ -6,9 +6,19 @@ use crate::shaders::gpu_common;
 use crate::shaders::sampler_ranged::{CANVAS_LEN, VOCAB};
 use crate::shaders::test_util::ElemFormat;
 
-pub const ENTRY: &str = "row_entropy";
-
-pub const SHADER: &str = include_str!("row_entropy.metal");
+crate::shader_kernel! {
+    name = "row_entropy",
+    metal = "row_entropy.metal",
+    spec = {
+            quant_formats: &[QuantFormat::Q4Affine],
+            fc: &[],
+            variants: KernelVariants::Elementwise,
+    },
+    tests = [
+        tiny => tiny_fixture => no_variant => (1e-4, 0.9999),
+        canvas_vocab => canvas_vocab_fixture => no_variant => (2.5e-2, 0.9999),
+    ],
+}
 
 #[derive(Debug, Clone)]
 pub struct Fixture {
@@ -21,10 +31,6 @@ impl Fixture {
     pub fn out_len(&self) -> usize {
         self.rows
     }
-}
-
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.out_len()
 }
 
 fn fill_logits(rows: usize, cols: usize, seed: f32) -> Vec<f32> {
@@ -99,68 +105,4 @@ pub fn gpu(f: &Fixture) -> Result<Vec<f32>, Error> {
     let mut out = vec![0.0f32; f.rows];
     BufferPool::read_f32(&buf_out, &mut out);
     Ok(out)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::shaders::test_util::{ElemFormat, assert_oracle};
-
-    fn run_matrix(fixture_fn: fn(ElemFormat) -> Fixture, max_tol: f32) {
-        let fix = fixture_fn(ElemFormat::F32);
-        let cpu = cpu(&fix);
-        assert!(cpu.iter().all(|v| v.is_finite()));
-        assert_eq!(cpu.len(), fixture_len(&fix));
-
-        #[cfg(target_os = "macos")]
-        {
-            let gpu = gpu(&fix).expect("gpu");
-            assert_oracle(&gpu, &cpu, max_tol, 0.9999);
-        }
-    }
-
-    #[test]
-    fn cpu_tiny() {
-        if crate::shaders::test_util::skip_gpu_on_ci() {
-            return;
-        }
-        run_matrix(tiny_fixture, 1e-4);
-    }
-
-    #[test]
-    fn cpu_canvas_vocab() {
-        if crate::shaders::test_util::skip_gpu_on_ci() {
-            return;
-        }
-        run_matrix(canvas_vocab_fixture, 2.5e-2);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn gpu_tiny() {
-        if crate::shaders::test_util::skip_gpu_on_ci() {
-            return;
-        }
-        run_matrix(tiny_fixture, 1e-4);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn gpu_canvas_vocab() {
-        if crate::shaders::test_util::skip_gpu_on_ci() {
-            return;
-        }
-        run_matrix(canvas_vocab_fixture, 2.5e-2);
-    }
-}
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "row_entropy",
-        entry: "row_entropy",
-        source: SHADER,
-        quant_formats: &[QuantFormat::Q4Affine],
-        fc: &[],
-        variants: KernelVariants::Elementwise,
-    }
 }

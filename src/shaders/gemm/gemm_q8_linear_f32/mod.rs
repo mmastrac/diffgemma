@@ -7,9 +7,18 @@ use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;
 use crate::shaders::variant::KernelVariant;
 
-pub const ENTRY: &str = "gemm_q8_linear_f32";
-
-pub const SHADER: &str = include_str!("gemm_q8_linear_f32.metal");
+crate::shader_kernel! {
+    name = "gemm_q8_linear_f32",
+    metal = "gemm_q8_linear_f32.metal",
+    spec = {
+            quant_formats: &[QuantFormat::Q4Affine],
+            fc: &[],
+            variants: KernelVariants::Elementwise,
+    },
+    tests = [
+        tiny => tiny_fixture => (1e-4, 0.9999),
+    ],
+}
 
 const THREADGROUP: usize = 16;
 
@@ -40,10 +49,6 @@ impl Fixture {
         }
         dst
     }
-}
-
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.out_len()
 }
 
 pub fn tiny_fixture(_: ElemFormat) -> Fixture {
@@ -176,32 +181,4 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     Ok(out)
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::kernel_oracle_matrix;
-
-    kernel_oracle_matrix! {
-        mod tiny,
-        cpu = crate::shaders::gemm_q8_linear_f32::cpu,
-        cpu_oracle = crate::shaders::gemm_q8_linear_f32::cpu_oracle,
-        gpu = crate::shaders::gemm_q8_linear_f32::gpu,
-        fixture = crate::shaders::gemm_q8_linear_f32::tiny_fixture,
-        out_len = crate::shaders::gemm_q8_linear_f32::fixture_len,
-        formats: [F32],
-        max_tol = 1e-4,
-        min_cos = 0.9999,
-    }
-}
-
 pub mod kxn;
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "gemm_q8_linear_f32",
-        entry: "gemm_q8_linear_f32",
-        source: SHADER,
-        quant_formats: &[QuantFormat::Q4Affine],
-        fc: &[],
-        variants: KernelVariants::Elementwise,
-    }
-}

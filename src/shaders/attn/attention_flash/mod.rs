@@ -99,8 +99,17 @@ pub fn cpu_flash_blocked(
 #[cfg(target_os = "macos")]
 use crate::Error;
 
-pub const SHADER: &str = include_str!("attention_flash.metal");
-pub const ENTRY: &str = "attn_flash";
+crate::shader_kernel! {
+    name = "attention_flash",
+    entry = "attn_flash",
+    metal = "attention_flash.metal",
+    spec = {
+            quant_formats: &[QuantFormat::Q4Affine],
+            fc: &[],
+            variants: KernelVariants::Elementwise,
+    },
+    tests = {},
+}
 
 /// Default tile geometry (must match the shader constants FL_BQ/FL_BK).
 pub const BQ: usize = 16;
@@ -276,14 +285,3 @@ pub fn bench_flash_window(
 #[cfg(test)]
 #[path = "mod_tests.rs"]
 mod mod_tests;
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "attention_flash",
-        entry: "attn_flash",
-        source: SHADER,
-        quant_formats: &[QuantFormat::Q4Affine],
-        fc: &[],
-        variants: KernelVariants::Elementwise,
-    }
-}

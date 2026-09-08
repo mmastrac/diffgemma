@@ -5,9 +5,16 @@
 use crate::Error;
 use crate::shaders::variant::KernelVariant;
 
-pub const ENTRY: &str = "kv_f32_side_hydrate";
-
-pub const SHADER: &str = include_str!("kv_f32_side_hydrate.metal");
+crate::shader_kernel! {
+    name = "kv_f32_side_hydrate",
+    metal = "kv_f32_side_hydrate.metal",
+    spec = {
+            quant_formats: &[QuantFormat::Q4Affine],
+            fc: &[(4, "KV_FMT_FC")],
+            variants: KernelVariants::Elementwise,
+    },
+    tests = {},
+}
 
 #[cfg(target_os = "macos")]
 pub fn pipeline_for_kv(
@@ -20,15 +27,4 @@ pub fn pipeline_for_kv(
         value: fmt.code(),
     }];
     ctx.compile_subkernel_ex(SHADER, ENTRY, variant, fmt.label(), &[], &uints)
-}
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "kv_f32_side_hydrate",
-        entry: "kv_f32_side_hydrate",
-        source: SHADER,
-        quant_formats: &[QuantFormat::Q4Affine],
-        fc: &[(4, "KV_FMT_FC")],
-        variants: KernelVariants::Elementwise,
-    }
 }

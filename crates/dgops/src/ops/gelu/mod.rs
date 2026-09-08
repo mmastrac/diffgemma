@@ -1,14 +1,15 @@
 //! PyTorch tanh-approximation GELU, in place.
 
-use crate::Error;
-
-pub const ENTRY: &str = "gelu";
-pub const METAL: &str = include_str!("gelu.metal");
-
-#[cfg(all(feature = "cuda", dgops_cuda_kernels))]
-const CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cuda/ops/gelu/gelu.cubin"));
-#[cfg(all(feature = "cuda", not(dgops_cuda_kernels)))]
-const CUBIN: &[u8] = &[];
+crate::op_kernel! {
+    name = "gelu",
+    metal = "gelu.metal",
+    cuda = "ops/gelu/gelu",
+    fixture = Fixture,
+    tests = [
+        tiny => tiny_fixture => (1e-5, 0.99999),
+        mlp_shape => mlp_shape_fixture => (1e-5, 0.99999),
+    ],
+}
 
 /// Matches the engine's gelu_tanh in include/activations.metal.
 const GELU_TANH_COEF: f32 = 0.797_884_6;
@@ -22,10 +23,6 @@ impl Fixture {
     pub fn len(&self) -> usize {
         self.x.len()
     }
-}
-
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.len()
 }
 
 pub fn tiny_fixture() -> Fixture {
@@ -57,50 +54,4 @@ pub fn gelu_tanh(x: f32) -> f32 {
 
 pub fn cpu(fix: &Fixture) -> Vec<f32> {
     fix.x.iter().copied().map(gelu_tanh).collect()
-}
-
-pub fn gpu(fix: &Fixture) -> Result<Vec<f32>, Error> {
-    #[cfg(target_os = "macos")]
-    {
-        metal::gpu(fix)
-    }
-    #[cfg(all(feature = "cuda", not(target_os = "macos")))]
-    {
-        cuda::gpu(fix)
-    }
-    #[cfg(not(any(target_os = "macos", all(feature = "cuda", not(target_os = "macos")))))]
-    {
-        let _ = fix;
-        Err(Error::Gpu(
-            "no GPU backend enabled (build with --features cuda on a CUDA host)",
-        ))
-    }
-}
-
-#[cfg(feature = "cuda")]
-pub mod cuda;
-#[cfg(target_os = "macos")]
-pub mod metal;
-
-#[cfg(test)]
-mod tests {
-    crate::op_oracle_matrix! {
-        mod tiny,
-        cpu = crate::ops::gelu::cpu,
-        gpu = crate::ops::gelu::gpu,
-        fixture = crate::ops::gelu::tiny_fixture,
-        out_len = crate::ops::gelu::fixture_len,
-        max_tol = 1e-5,
-        min_cos = 0.99999,
-    }
-
-    crate::op_oracle_matrix! {
-        mod mlp_shape,
-        cpu = crate::ops::gelu::cpu,
-        gpu = crate::ops::gelu::gpu,
-        fixture = crate::ops::gelu::mlp_shape_fixture,
-        out_len = crate::ops::gelu::fixture_len,
-        max_tol = 1e-5,
-        min_cos = 0.99999,
-    }
 }

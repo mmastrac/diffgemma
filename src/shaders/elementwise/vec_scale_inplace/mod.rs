@@ -5,9 +5,19 @@ use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;
 use crate::shaders::variant::KernelVariant;
 
-pub const ENTRY: &str = "vec_scale_inplace";
-
-pub const SHADER: &str = include_str!("vec_scale_inplace.metal");
+crate::shader_kernel! {
+    name = "vec_scale_inplace",
+    metal = "vec_scale_inplace.metal",
+    pipeline = |ctx, variant| ctx.compile_subkernel(SHADER, ENTRY, variant),
+    spec = {
+            quant_formats: &[QuantFormat::Q4Affine],
+            fc: &[],
+            variants: KernelVariants::Elementwise,
+    },
+    tests = [
+        tiny => tiny_fixture => (1e-6, 0.9999),
+    ],
+}
 
 #[derive(Debug, Clone)]
 pub struct Fixture {
@@ -16,13 +26,9 @@ pub struct Fixture {
 }
 
 impl Fixture {
-    pub fn len(&self) -> usize {
+    pub fn out_len(&self) -> usize {
         self.x.len()
     }
-}
-
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.len()
 }
 
 pub fn tiny_fixture(_: ElemFormat) -> Fixture {
@@ -42,14 +48,6 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
 
 pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {
     cpu(f)
-}
-
-#[cfg(target_os = "macos")]
-pub fn pipeline_for(
-    ctx: &crate::metal::device::MetalContext,
-    variant: KernelVariant,
-) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_subkernel(SHADER, ENTRY, variant)
 }
 
 #[cfg(target_os = "macos")]
@@ -81,7 +79,7 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let ctx = MetalContext::new()?;
     let pipeline = pipeline_for(&ctx, variant)?;
     let mut pool = BufferPool::new();
-    let len = f.len();
+    let len = f.out_len();
     let buf = pool
         .allocate(&ctx.device, len * 4)
         .ok_or(Error::Gpu("alloc"))?;
@@ -96,32 +94,4 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let mut out = vec![0.0f32; len];
     BufferPool::read_f32(&buf, &mut out);
     Ok(out)
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::kernel_oracle_matrix;
-
-    kernel_oracle_matrix! {
-        mod tiny,
-        cpu = crate::shaders::vec_scale_inplace::cpu,
-        cpu_oracle = crate::shaders::vec_scale_inplace::cpu_oracle,
-        gpu = crate::shaders::vec_scale_inplace::gpu,
-        fixture = crate::shaders::vec_scale_inplace::tiny_fixture,
-        out_len = crate::shaders::vec_scale_inplace::fixture_len,
-        formats: [F32],
-        max_tol = 1e-6,
-        min_cos = 0.9999,
-    }
-}
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "vec_scale_inplace",
-        entry: "vec_scale_inplace",
-        source: SHADER,
-        quant_formats: &[QuantFormat::Q4Affine],
-        fc: &[],
-        variants: KernelVariants::Elementwise,
-    }
 }

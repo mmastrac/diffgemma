@@ -17,9 +17,16 @@ use crate::Error;
 use crate::metal::{BlockGroupedJob, RouteScratch};
 use crate::shaders::gpu_common;
 
-pub const ENTRY: &str = "gemm_int_sparse";
-
-pub const SHADER: &str = include_str!("gemm_int_sparse.metal");
+crate::shader_kernel! {
+    name = "gemm_int_sparse",
+    metal = "gemm_int_sparse.metal",
+    spec = {
+            quant_formats: &[QuantFormat::Q4Affine],
+            fc: &[],
+            variants: KernelVariants::Elementwise,
+    },
+    tests = {},
+}
 
 /// Production-equivalent tile config: matches `gemm_tunable_sparse`
 /// (SPARSE_BM=32 / SPARSE_BN=128 / BK=32) for apples-to-apples comparison.
@@ -292,101 +299,4 @@ pub fn gpu_int_sparse(f: &IntFixture, bm: usize, bn: usize, bk: usize) -> Result
     let mut out = vec![0.0f32; out_len];
     BufferPool::read_f32(&buf_c, &mut out);
     Ok(out)
-}
-
-#[cfg(all(test, target_os = "macos"))]
-mod tests {
-    use super::*;
-
-    fn cos(a: &[f32], b: &[f32]) -> f32 {
-        let (mut d, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
-        for (x, y) in a.iter().zip(b) {
-            d += (*x as f64) * (*y as f64);
-            na += (*x as f64).powi(2);
-            nb += (*y as f64).powi(2);
-        }
-        (d / (na.sqrt() * nb.sqrt() + 1e-12)) as f32
-    }
-
-    /// Tier-1 oracle: GPU int8 sparse GEMM tracks the CPU int8 oracle within
-    /// quant tolerance. Counts > 128 exercise the ragged last-block padding
-    /// path (same shape contract as gemm_tunable::sparse_block_m_invariant).
-    #[test]
-    fn sparse_int8_matches_cpu_oracle() {
-        if crate::shaders::test_util::skip_gpu_on_ci() {
-            return;
-        }
-        let counts: &[usize] = &[200, 77, 150, 5, 300, 33, 128];
-        let f = grouped_int_fixture(256, 128, counts);
-        let (a_int8, w_int8, scale_a, scale_w) = f.int8_side_channel();
-        let jobs = f.jobs();
-        let (route, _num_blocks) = build_route(&f.row_starts, f.num_jobs(), INT_BM);
-        let oracle = cpu::gemm_int_sparse_cpu(
-            &a_int8,
-            &w_int8,
-            &scale_a,
-            &scale_w,
-            &jobs,
-            &f.row_starts,
-            &route,
-            f.n,
-            f.k,
-            INT_BM,
-        );
-        let gpu = gpu_int_sparse(&f, INT_BM, INT_BN, INT_BK).expect("int8 sparse gpu");
-        assert_eq!(gpu.len(), oracle.len());
-        let c = cos(&gpu, &oracle);
-        println!("  sparse_int8_matches_cpu_oracle: cos={c:.6}");
-        assert!(c > 0.999, "int8 sparse cos={c:.6} < 0.999");
-    }
-
-    /// Tile invariance: BM=32/64/128 must all match the CPU oracle. The int8
-    /// path has no MMA register pressure (no simdgroup_float8x8 array), so tile
-    /// height is mathematically irrelevant. Also guards the pipeline-cache-label
-    /// collision class (the DGQ_MOE_PREFILL_BM root cause) — loops tiles in one
-    /// process to force the collision if the source-hash fix regresses.
-    #[test]
-    fn sparse_int8_block_m_invariant() {
-        if crate::shaders::test_util::skip_gpu_on_ci() {
-            return;
-        }
-        let counts: &[usize] = &[200, 77, 150, 5, 300, 33, 128];
-        let f = grouped_int_fixture(256, 128, counts);
-        let (a_int8, w_int8, scale_a, scale_w) = f.int8_side_channel();
-        let jobs = f.jobs();
-        for (bm, bn) in [(32usize, 128usize), (64, 64), (128, 64)] {
-            let (route, _num_blocks) = build_route(&f.row_starts, f.num_jobs(), bm);
-            let oracle = cpu::gemm_int_sparse_cpu(
-                &a_int8,
-                &w_int8,
-                &scale_a,
-                &scale_w,
-                &jobs,
-                &f.row_starts,
-                &route,
-                f.n,
-                f.k,
-                bm,
-            );
-            let gpu = gpu_int_sparse(&f, bm, bn, INT_BK).expect("int8 sparse gpu bm");
-            assert_eq!(gpu.len(), oracle.len());
-            let c = cos(&gpu, &oracle);
-            println!("  bm={bm:>3} bn={bn:>3}: cos={c:.6} vs CPU oracle");
-            assert!(
-                c > 0.999,
-                "int8 sparse tile bm={bm} bn={bn} diverged: cos={c:.6}"
-            );
-        }
-    }
-}
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "gemm_int_sparse",
-        entry: "gemm_int_sparse",
-        source: SHADER,
-        quant_formats: &[QuantFormat::Q4Affine],
-        fc: &[],
-        variants: KernelVariants::Elementwise,
-    }
 }

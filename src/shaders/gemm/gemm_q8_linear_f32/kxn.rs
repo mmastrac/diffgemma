@@ -39,10 +39,6 @@ impl Fixture {
     }
 }
 
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.out_len()
-}
-
 pub fn tiny_fixture(_: ElemFormat) -> Fixture {
     let m = 2usize;
     let n = 16usize;
@@ -168,7 +164,6 @@ mod tests {
         cpu_oracle = crate::shaders::gemm_q8_linear_f32::kxn::cpu_oracle,
         gpu = crate::shaders::gemm_q8_linear_f32::kxn::gpu,
         fixture = crate::shaders::gemm_q8_linear_f32::kxn::tiny_fixture,
-        out_len = crate::shaders::gemm_q8_linear_f32::kxn::fixture_len,
         formats: [F32],
         max_tol = 1e-4,
         min_cos = 0.9999,

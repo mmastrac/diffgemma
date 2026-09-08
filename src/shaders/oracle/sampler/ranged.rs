@@ -33,13 +33,9 @@ pub struct Fixture {
 }
 
 impl Fixture {
-    pub fn len(&self) -> usize {
+    pub fn out_len(&self) -> usize {
         self.src.len()
     }
-}
-
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.len()
 }
 
 fn fill_logits(len: usize, seed: f32) -> Vec<f32> {
@@ -98,7 +94,7 @@ pub fn gpu(f: &Fixture) -> Result<Vec<f32>, Error> {
     let ctx = MetalContext::new()?;
     let pipeline = ctx.compile_kernel(shader, entry)?;
     let mut pool = BufferPool::new();
-    let len = f.len();
+    let len = f.out_len();
     let bytes = len * 4;
 
     let buf = pool
@@ -150,7 +146,6 @@ mod tests {
         cpu_oracle = crate::shaders::sampler_ranged::cpu_oracle,
         gpu = crate::shaders::sampler_ranged::gpu_variant,
         fixture = crate::shaders::sampler_ranged::tiny_softcap_fixture,
-        out_len = crate::shaders::sampler_ranged::fixture_len,
         formats: [F32],
         max_tol = 1e-5,
         min_cos = 0.9999,
@@ -162,11 +157,49 @@ mod tests {
         cpu_oracle = crate::shaders::sampler_ranged::cpu_oracle,
         gpu = crate::shaders::sampler_ranged::gpu_variant,
         fixture = crate::shaders::sampler_ranged::tiny_scale_fixture,
-        out_len = crate::shaders::sampler_ranged::fixture_len,
         formats: [F32],
         max_tol = 1e-5,
         min_cos = 0.9999,
     }
+
+    #[cfg(target_os = "macos")]
+    mod canvas_vocab {
+        use super::*;
+        use crate::shaders::test_util::assert_oracle;
+
+        fn run(op: RangedOp, seed: f32) {
+            let fix = Fixture {
+                src: fill_logits(CANVAS_VOCAB_LEN, seed),
+                cap: 30.0,
+                inv_t: 1.0 / 0.8,
+                op,
+            };
+            let cpu = cpu(&fix);
+            let gpu = gpu(&fix).expect("gpu");
+            assert_oracle(&gpu, &cpu, 1e-4, 0.9999);
+        }
+
+        #[test]
+        fn gpu_softcap_matches_cpu() {
+            if crate::shaders::test_util::skip_gpu_on_ci() {
+                return;
+            }
+            run(RangedOp::Softcap, 0.000011);
+        }
+
+        #[test]
+        fn gpu_scale_matches_cpu() {
+            if crate::shaders::test_util::skip_gpu_on_ci() {
+                return;
+            }
+            run(RangedOp::Scale, 0.000013);
+        }
+    }
+}
+
+#[cfg(test)]
+mod extra_tests {
+    use super::*;
 
     #[cfg(target_os = "macos")]
     mod canvas_vocab {

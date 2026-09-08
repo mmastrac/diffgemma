@@ -9,11 +9,32 @@
 use crate::Error;
 use crate::shaders::QuantFormat;
 
-pub const ENTRY: &str = "gemm_tunable";
+crate::shader_kernel! {
+    name = "gemm_tunable",
+    metal = "gemm_tunable.metal",
+    spec = {
+            quant_formats: &[
+                QuantFormat::Q4Affine,
+                QuantFormat::Q8,
+                QuantFormat::Q6,
+                QuantFormat::NvFp4,
+                QuantFormat::Raw,
+            ],
+            fc: &[
+                (4, "IS_FULL_LAYER"),
+                (5, "GEMM_N"),
+                (6, "GEMM_K"),
+                (10, "K_X_FP16"),
+                (11, "GEMM_N_TILE"),
+                (28, "TUNE_GATHER_A"),
+                (29, "K_OUT_BF16"),
+            ],
+            variants: KernelVariants::Elementwise,
+    },
+    tests = {},
+}
 
 pub const ENTRY_DB: &str = "gemm_tunable_db";
-
-pub const SHADER: &str = include_str!("gemm_tunable.metal");
 
 /// Production tile config: 64x64 won every swept production shape.
 pub const TUNE_BM: usize = 64;
@@ -953,30 +974,5 @@ mod double_buffer_tests {
             mismatches, 0,
             "gemm_tunable_db produced {mismatches} mismatches vs gemm_tunable"
         );
-    }
-}
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "gemm_tunable",
-        entry: "gemm_tunable",
-        source: SHADER,
-        quant_formats: &[
-            QuantFormat::Q4Affine,
-            QuantFormat::Q8,
-            QuantFormat::Q6,
-            QuantFormat::NvFp4,
-            QuantFormat::Raw,
-        ],
-        fc: &[
-            (4, "IS_FULL_LAYER"),
-            (5, "GEMM_N"),
-            (6, "GEMM_K"),
-            (10, "K_X_FP16"),
-            (11, "GEMM_N_TILE"),
-            (28, "TUNE_GATHER_A"),
-            (29, "K_OUT_BF16"),
-        ],
-        variants: KernelVariants::Elementwise,
     }
 }

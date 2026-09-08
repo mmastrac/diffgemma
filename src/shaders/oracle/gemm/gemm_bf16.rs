@@ -9,7 +9,7 @@ use crate::shaders::bf16;
 use crate::shaders::test_util::ElemFormat;
 
 #[allow(unused_imports)]
-pub use super::fixture::{ENTRY, Fixture, SHADER, fixture_len};
+pub use super::fixture::{ENTRY, Fixture, SHADER};
 
 /// bf16 weights as raw bf16-bit bytes (`Raw` = no quantization).
 fn w_bytes(f: &Fixture) -> Vec<u8> {
@@ -82,7 +82,6 @@ mod tests {
         cpu_oracle = crate::shaders::gemm_bf16::cpu_oracle,
         gpu = crate::shaders::gemm_bf16::gpu,
         fixture = crate::shaders::gemm_bf16::tile_fixture,
-        out_len = crate::shaders::gemm_bf16::fixture_len,
         formats: [F32],
         max_tol = 0.02,
         min_cos = 0.999,

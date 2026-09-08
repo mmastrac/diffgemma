@@ -6,9 +6,16 @@
 use crate::Error;
 use crate::shaders::variant::KernelVariant;
 
-pub const ENTRY: &str = "convert_scale";
-
-pub const SHADER: &str = include_str!("convert_scale.metal");
+crate::shader_kernel! {
+    name = "convert_scale",
+    metal = "convert_scale.metal",
+    spec = {
+            quant_formats: &[QuantFormat::Q4Affine],
+            fc: &[(4, "K_SRC_F32"), (5, "K_DST_F32")],
+            variants: KernelVariants::Elementwise,
+    },
+    tests = {},
+}
 
 /// Compile the convert/scale kernel specialized for (src_f32, dst_f32).
 #[cfg(target_os = "macos")]
@@ -67,104 +74,4 @@ pub fn bind_gpu_buffers(
     crate::shaders::gpu_common::set_bytes(enc, &dst_base, 3);
     crate::shaders::gpu_common::set_bytes(enc, &len, 4);
     crate::shaders::gpu_common::set_bytes(enc, &scale, 5);
-}
-
-#[cfg(all(test, target_os = "macos"))]
-mod tests {
-    use super::*;
-    use crate::metal::buffer::BufferPool;
-    use crate::metal::device::MetalContext;
-    use crate::shaders::bf16;
-    use crate::shaders::variant::KernelVariant;
-    use objc2_metal::{
-        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-        MTLSize,
-    };
-
-    /// Each (src_f32, dst_f32) corner converts+scales bit-for-bit like a CPU
-    /// mirror at the arena's bf16 precision (bf16-exact inputs).
-    #[test]
-    fn all_four_corners_match_cpu() {
-        if crate::shaders::test_util::skip_gpu_on_ci() {
-            return;
-        }
-        // bf16-exact input values so arena round-trips are exact.
-        let src_f32_vals: Vec<f32> = (0..16).map(|i| (i as f32 - 8.0) * 0.5).collect();
-        let scale = 0.25f32;
-        let n = src_f32_vals.len();
-        let ctx = MetalContext::new().expect("ctx");
-
-        for &(src_f32, dst_f32) in &[(false, true), (false, false), (true, true), (true, false)] {
-            let mut pool = BufferPool::new();
-            // src buffer: f32 or arena bf16 bits.
-            let buf_src = if src_f32 {
-                let b = pool.allocate(&ctx.device, n * 4).unwrap();
-                BufferPool::write_f32(&b, &src_f32_vals);
-                b
-            } else {
-                let b = pool.allocate(&ctx.device, n * 2).unwrap();
-                BufferPool::write_bf16(&b, &bf16::f32_slice_to_bf16_bits(&src_f32_vals));
-                b
-            };
-            let dst_elem = if dst_f32 { 4 } else { 2 };
-            let buf_dst = pool.allocate(&ctx.device, n * dst_elem).unwrap();
-            let dump = pool.allocate(&ctx.device, n * 4).unwrap();
-
-            let pipe =
-                pipeline_for_fmt(&ctx, KernelVariant::PRODUCTION, src_f32, dst_f32).expect("pipe");
-            let cmd = ctx.queue.commandBuffer().unwrap();
-            let enc = cmd.computeCommandEncoder().unwrap();
-            enc.setComputePipelineState(&pipe.pipeline);
-            bind_gpu_buffers(&enc, &buf_src, 0, &buf_dst, 0, 0, 0, n as u32, scale, &dump);
-            enc.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize {
-                    width: n.div_ceil(64),
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: 64,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-            enc.endEncoding();
-            cmd.commit();
-            cmd.waitUntilCompleted();
-
-            for (i, &sv) in src_f32_vals.iter().enumerate().take(n) {
-                // CPU mirror: src already bf16-exact, so from_src == value.
-                let want = bf16::store_bf16_round_half(sv * scale);
-                let want = if dst_f32 {
-                    // dst f32 stores the (bf16-rounded on read? no) exact product.
-                    sv * scale
-                } else {
-                    want
-                };
-                let got = if dst_f32 {
-                    let p = buf_dst.contents().as_ptr() as *const f32;
-                    unsafe { *p.add(i) }
-                } else {
-                    let p = buf_dst.contents().as_ptr() as *const u16;
-                    bf16::bf16_bits_to_f32(unsafe { *p.add(i) })
-                };
-                assert_eq!(
-                    got.to_bits(),
-                    want.to_bits(),
-                    "corner (src_f32={src_f32}, dst_f32={dst_f32}) elem {i}: got {got} want {want}"
-                );
-            }
-        }
-    }
-}
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "convert_scale",
-        entry: "convert_scale",
-        source: SHADER,
-        quant_formats: &[QuantFormat::Q4Affine],
-        fc: &[(4, "K_SRC_F32"), (5, "K_DST_F32")],
-        variants: KernelVariants::Elementwise,
-    }
 }

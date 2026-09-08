@@ -75,7 +75,6 @@ macro_rules! kernel_oracle_matrix {
         cpu_oracle = $oracle_fn:path,
         gpu = $gpu_fn:path,
         fixture = $fixture_fn:path,
-        out_len = $out_len:expr,
         formats: [ $( $fmt:ident ),* $(,)? ],
         max_tol = $max_tol:expr,
         min_cos = $min_cos:expr $(,)?
@@ -96,7 +95,7 @@ macro_rules! kernel_oracle_matrix {
                         let fix = $fixture_fn(ElemFormat::$fmt);
                         let out = $cpu_fn(&fix);
                         let oracle = $oracle_fn(&fix);
-                        assert_eq!(out.len(), $out_len(&fix));
+                        assert_eq!(out.len(), fix.out_len());
                         assert_oracle(&out, &oracle, $max_tol, $min_cos);
                     }
 

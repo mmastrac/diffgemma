@@ -83,6 +83,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dgemm"
+version = "0.1.0"
+dependencies = [
+ "gpukit",
+ "objc2",
+ "objc2-metal",
+]
+
+[[package]]
 name = "dgops"
 version = "0.1.0"
 dependencies = [
@@ -249,6 +258,7 @@ dependencies = [
 name = "nanogpt"
 version = "0.1.0"
 dependencies = [
+ "dgemm",
  "dgops",
 ]
 

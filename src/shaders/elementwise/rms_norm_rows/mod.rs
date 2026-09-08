@@ -7,9 +7,26 @@ use crate::shaders::test_util::ElemFormat;
 use crate::shaders::manifest::{self};
 pub use crate::shaders::variant::KernelVariant;
 
-pub const ENTRY: &str = "rms_norm_rows";
-
-pub const SHADER: &str = include_str!("rms_norm_rows.metal");
+crate::shader_kernel! {
+    name = "rms_norm_rows",
+    metal = "rms_norm_rows.metal",
+    spec = {
+            quant_formats: &[QuantFormat::Q4Affine],
+            fc: &[(4, "K_AFFINE")],
+            variants: KernelVariants::RmsNormRows {
+                rows: &[
+                    RmsNormRowsVariant { affine: false },
+                    RmsNormRowsVariant { affine: true },
+                ],
+            },
+    },
+    tests = [
+        tiny => tiny_fixture => (1e-5, 0.9999),
+        mlp_shape => mlp_shape_fixture => (1e-5, 0.9999),
+        no_scale_tiny => { fixture = tiny_fixture_no_scale, gpu = gpu_no_scale, cpu = cpu_no_scale, oracle = cpu_no_scale, tol = 1e-5, cos = 0.9999 },
+        no_scale_mlp_shape => { fixture = mlp_shape_fixture_no_scale, gpu = gpu_no_scale, cpu = cpu_no_scale, oracle = cpu_no_scale, tol = 1e-5, cos = 0.9999 },
+    ],
+}
 
 /// Synthetic tier-1 fixture (blob-free).
 #[derive(Debug, Clone)]
@@ -25,10 +42,6 @@ impl Fixture {
     pub fn out_len(&self) -> usize {
         self.seq_len * self.hidden
     }
-}
-
-pub fn fixture_out_len(fix: &Fixture) -> usize {
-    fix.out_len()
 }
 
 pub fn tiny_fixture(_fmt: ElemFormat) -> Fixture {
@@ -255,58 +268,11 @@ fn set_bytes<T>(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, value: &
 #[cfg(target_os = "macos")]
 use crate::shaders::gpu_common::div_up;
 
+pub mod tiled;
+
 #[cfg(test)]
-mod tests {
+mod extra_tests {
     use super::*;
-    use crate::kernel_oracle_matrix;
-
-    kernel_oracle_matrix! {
-        mod tiny,
-        cpu = crate::shaders::rms_norm_rows::cpu,
-        cpu_oracle = crate::shaders::rms_norm_rows::cpu_oracle,
-        gpu = crate::shaders::rms_norm_rows::gpu,
-        fixture = crate::shaders::rms_norm_rows::tiny_fixture,
-        out_len = crate::shaders::rms_norm_rows::fixture_out_len,
-        formats: [F32],
-        max_tol = 1e-5,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod mlp_shape,
-        cpu = crate::shaders::rms_norm_rows::cpu,
-        cpu_oracle = crate::shaders::rms_norm_rows::cpu_oracle,
-        gpu = crate::shaders::rms_norm_rows::gpu,
-        fixture = crate::shaders::rms_norm_rows::mlp_shape_fixture,
-        out_len = crate::shaders::rms_norm_rows::fixture_out_len,
-        formats: [F32],
-        max_tol = 1e-5,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod no_scale_tiny,
-        cpu = crate::shaders::rms_norm_rows::cpu_no_scale,
-        cpu_oracle = crate::shaders::rms_norm_rows::cpu_no_scale,
-        gpu = crate::shaders::rms_norm_rows::gpu_no_scale,
-        fixture = crate::shaders::rms_norm_rows::tiny_fixture_no_scale,
-        out_len = crate::shaders::rms_norm_rows::fixture_out_len,
-        formats: [F32],
-        max_tol = 1e-5,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod no_scale_mlp_shape,
-        cpu = crate::shaders::rms_norm_rows::cpu_no_scale,
-        cpu_oracle = crate::shaders::rms_norm_rows::cpu_no_scale,
-        gpu = crate::shaders::rms_norm_rows::gpu_no_scale,
-        fixture = crate::shaders::rms_norm_rows::mlp_shape_fixture_no_scale,
-        out_len = crate::shaders::rms_norm_rows::fixture_out_len,
-        formats: [F32],
-        max_tol = 1e-5,
-        min_cos = 0.9999,
-    }
 
     #[test]
     fn golden_row_values() {
@@ -325,23 +291,5 @@ mod tests {
         for (a, b) in out.iter().zip(expected) {
             assert!((a - b).abs() < 1e-4, "got {a}, expected {b}");
         }
-    }
-}
-
-pub mod tiled;
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "rms_norm_rows",
-        entry: "rms_norm_rows",
-        source: SHADER,
-        quant_formats: &[QuantFormat::Q4Affine],
-        fc: &[(4, "K_AFFINE")],
-        variants: KernelVariants::RmsNormRows {
-            rows: &[
-                RmsNormRowsVariant { affine: false },
-                RmsNormRowsVariant { affine: true },
-            ],
-        },
     }
 }

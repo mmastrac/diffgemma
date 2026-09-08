@@ -5,9 +5,21 @@ use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;
 use crate::shaders::variant::KernelVariant;
 
-pub const ENTRY: &str = "gather_rows";
-
-pub const SHADER: &str = include_str!("gather_rows.metal");
+crate::shader_kernel! {
+    name = "gather_rows",
+    metal = "gather_rows.metal",
+    spec = {
+            quant_formats: &[QuantFormat::Q4Affine],
+            fc: &[(4, "K_SRC_F32"), (5, "K_DST_F32")],
+            variants: KernelVariants::Elementwise,
+    },
+    tests = [
+        tiny => tiny_fixture => (1e-6, 0.9999),
+        moe => moe_fixture => (1e-6, 0.9999),
+        moe_routing => moe_routing_fixture => (1e-6, 0.9999),
+        moe_batched_pin_l0 => moe_batched_pin_l0_fixture => (1e-6, 0.9999),
+    ],
+}
 
 #[derive(Debug, Clone)]
 pub struct Fixture {
@@ -25,10 +37,6 @@ impl Fixture {
     pub fn out_len(&self) -> usize {
         self.batch_size() * self.hidden
     }
-}
-
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.out_len()
 }
 
 pub fn tiny_fixture(_: ElemFormat) -> Fixture {
@@ -298,9 +306,8 @@ fn run_fmt(f: &Fixture, src_f32: bool, dst_f32: bool) -> Vec<f32> {
 }
 
 #[cfg(test)]
-mod tests {
+mod extra_tests {
     use super::*;
-    use crate::kernel_oracle_matrix;
 
     /// All three production specializations of the merged kernel — f32->f32,
     /// arena->arena (the ex-`gather_rows_bf16`, previously untested), and
@@ -327,64 +334,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    kernel_oracle_matrix! {
-        mod tiny,
-        cpu = crate::shaders::gather_rows::cpu,
-        cpu_oracle = crate::shaders::gather_rows::cpu_oracle,
-        gpu = crate::shaders::gather_rows::gpu,
-        fixture = crate::shaders::gather_rows::tiny_fixture,
-        out_len = crate::shaders::gather_rows::fixture_len,
-        formats: [F32],
-        max_tol = 1e-6,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod moe,
-        cpu = crate::shaders::gather_rows::cpu,
-        cpu_oracle = crate::shaders::gather_rows::cpu_oracle,
-        gpu = crate::shaders::gather_rows::gpu,
-        fixture = crate::shaders::gather_rows::moe_fixture,
-        out_len = crate::shaders::gather_rows::fixture_len,
-        formats: [F32],
-        max_tol = 1e-6,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod moe_routing,
-        cpu = crate::shaders::gather_rows::cpu,
-        cpu_oracle = crate::shaders::gather_rows::cpu_oracle,
-        gpu = crate::shaders::gather_rows::gpu,
-        fixture = crate::shaders::gather_rows::moe_routing_fixture,
-        out_len = crate::shaders::gather_rows::fixture_len,
-        formats: [F32],
-        max_tol = 1e-6,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod moe_batched_pin_l0,
-        cpu = crate::shaders::gather_rows::cpu,
-        cpu_oracle = crate::shaders::gather_rows::cpu_oracle,
-        gpu = crate::shaders::gather_rows::gpu,
-        fixture = crate::shaders::gather_rows::moe_batched_pin_l0_fixture,
-        out_len = crate::shaders::gather_rows::fixture_len,
-        formats: [F32],
-        max_tol = 1e-6,
-        min_cos = 0.9999,
-    }
-}
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "gather_rows",
-        entry: "gather_rows",
-        source: SHADER,
-        quant_formats: &[QuantFormat::Q4Affine],
-        fc: &[(4, "K_SRC_F32"), (5, "K_DST_F32")],
-        variants: KernelVariants::Elementwise,
     }
 }

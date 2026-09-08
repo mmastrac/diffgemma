@@ -1,17 +1,15 @@
 //! Backward pass of the tanh-approximation GELU.
 
-use crate::Error;
-
-pub const ENTRY: &str = "gelu_backward";
-pub const METAL: &str = include_str!("gelu_backward.metal");
-
-#[cfg(all(feature = "cuda", dgops_cuda_kernels))]
-const CUBIN: &[u8] = include_bytes!(concat!(
-    env!("OUT_DIR"),
-    "/cuda/ops/gelu_backward/gelu_backward.cubin"
-));
-#[cfg(all(feature = "cuda", not(dgops_cuda_kernels)))]
-const CUBIN: &[u8] = &[];
+crate::op_kernel! {
+    name = "gelu_backward",
+    metal = "gelu_backward.metal",
+    cuda = "ops/gelu_backward/gelu_backward",
+    fixture = Fixture,
+    tests = [
+        tiny => tiny_fixture => (1e-5, 0.99999),
+        long => long_fixture => (1e-4, 0.99999),
+    ],
+}
 
 /// Matches the engine's gelu_tanh in include/activations.metal.
 const GELU_TANH_COEF: f32 = 0.797_884_6;
@@ -27,10 +25,6 @@ impl Fixture {
     pub fn len(&self) -> usize {
         self.g.len()
     }
-}
-
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.len()
 }
 
 pub fn tiny_fixture() -> Fixture {
@@ -70,50 +64,4 @@ pub fn cpu(fix: &Fixture) -> Vec<f32> {
         .zip(fix.dy.iter())
         .map(|(&g, &dy)| dy * gelu_tanh_grad(g))
         .collect()
-}
-
-pub fn gpu(fix: &Fixture) -> Result<Vec<f32>, Error> {
-    #[cfg(target_os = "macos")]
-    {
-        metal::gpu(fix)
-    }
-    #[cfg(all(feature = "cuda", not(target_os = "macos")))]
-    {
-        cuda::gpu(fix)
-    }
-    #[cfg(not(any(target_os = "macos", all(feature = "cuda", not(target_os = "macos")))))]
-    {
-        let _ = fix;
-        Err(Error::Gpu(
-            "no GPU backend enabled (build with --features cuda on a CUDA host)",
-        ))
-    }
-}
-
-#[cfg(feature = "cuda")]
-pub mod cuda;
-#[cfg(target_os = "macos")]
-pub mod metal;
-
-#[cfg(test)]
-mod tests {
-    crate::op_oracle_matrix! {
-        mod tiny,
-        cpu = crate::ops::gelu_backward::cpu,
-        gpu = crate::ops::gelu_backward::gpu,
-        fixture = crate::ops::gelu_backward::tiny_fixture,
-        out_len = crate::ops::gelu_backward::fixture_len,
-        max_tol = 1e-5,
-        min_cos = 0.99999,
-    }
-
-    crate::op_oracle_matrix! {
-        mod long,
-        cpu = crate::ops::gelu_backward::cpu,
-        gpu = crate::ops::gelu_backward::gpu,
-        fixture = crate::ops::gelu_backward::long_fixture,
-        out_len = crate::ops::gelu_backward::fixture_len,
-        max_tol = 1e-4,
-        min_cos = 0.99999,
-    }
 }

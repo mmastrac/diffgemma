@@ -9,10 +9,21 @@ use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;
 use crate::shaders::variant::KernelVariant;
 
-pub const ENTRY: &str = "sample_commit";
+crate::shader_kernel! {
+    name = "sample_commit",
+    metal = "sample_commit.metal",
+    pipeline = |ctx, variant| ctx.compile_subkernel(SHADER, ENTRY, variant),
+    spec = {
+            quant_formats: &[QuantFormat::Q4Affine],
+            fc: &[],
+            variants: KernelVariants::Elementwise,
+    },
+    tests = [
+        tiny => tiny_fixture => (1e-5, 0.9999),
+        final_step => final_step_fixture => (1e-5, 0.9999),
+    ],
+}
 pub const THREADGROUP_WIDTH: usize = 256;
-
-pub const SHADER: &str = include_str!("sample_commit.metal");
 
 #[derive(Debug, Clone)]
 pub struct Fixture {
@@ -32,10 +43,6 @@ impl Fixture {
     pub fn out_len(&self) -> usize {
         self.canvas_size * 3 + 6
     }
-}
-
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.out_len()
 }
 
 pub fn tiny_fixture(_: ElemFormat) -> Fixture {
@@ -188,14 +195,6 @@ fn bytes_to_state(bytes: &[u8]) -> CanvasState {
 }
 
 #[cfg(target_os = "macos")]
-pub fn pipeline_for(
-    ctx: &crate::metal::device::MetalContext,
-    variant: KernelVariant,
-) -> Result<crate::metal::device::ComputePipeline, Error> {
-    ctx.compile_subkernel(SHADER, ENTRY, variant)
-}
-
-#[cfg(target_os = "macos")]
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
     MTLSize,
@@ -256,44 +255,4 @@ pub fn gpu(f: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     }
     let state_out = bytes_to_state(&out_buf);
     Ok(pack_out(&state_out, f.canvas_size))
-}
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "sample_commit",
-        entry: "sample_commit",
-        source: SHADER,
-        quant_formats: &[QuantFormat::Q4Affine],
-        fc: &[],
-        variants: KernelVariants::Elementwise,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::kernel_oracle_matrix;
-
-    kernel_oracle_matrix! {
-        mod tiny,
-        cpu = crate::shaders::sample_commit::cpu,
-        cpu_oracle = crate::shaders::sample_commit::cpu_oracle,
-        gpu = crate::shaders::sample_commit::gpu,
-        fixture = crate::shaders::sample_commit::tiny_fixture,
-        out_len = crate::shaders::sample_commit::fixture_len,
-        formats: [F32],
-        max_tol = 1e-5,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod final_step,
-        cpu = crate::shaders::sample_commit::cpu,
-        cpu_oracle = crate::shaders::sample_commit::cpu_oracle,
-        gpu = crate::shaders::sample_commit::gpu,
-        fixture = crate::shaders::sample_commit::final_step_fixture,
-        out_len = crate::shaders::sample_commit::fixture_len,
-        formats: [F32],
-        max_tol = 1e-5,
-        min_cos = 0.9999,
-    }
 }

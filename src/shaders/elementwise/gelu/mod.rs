@@ -6,9 +6,23 @@ use crate::shaders::manifest;
 use crate::shaders::test_util::ElemFormat;
 use crate::shaders::variant::KernelVariant;
 
-pub const ENTRY: &str = "gelu";
-
-pub const SHADER: &str = include_str!("gelu.metal");
+crate::shader_kernel! {
+    name = "gelu",
+    metal = "gelu.metal",
+    pipeline = |ctx, variant| {
+        manifest::validate_shared(ENTRY, variant)?;
+        ctx.compile_subkernel(SHADER, ENTRY, variant)
+    },
+    spec = {
+            quant_formats: &[QuantFormat::Q4Affine],
+            fc: &[],
+            variants: KernelVariants::Gelu,
+    },
+    tests = [
+        tiny => tiny_fixture => (1e-4, 0.9999),
+        mlp_shape => mlp_shape_fixture => (1e-4, 0.9999),
+    ],
+}
 
 #[derive(Debug, Clone)]
 pub struct Fixture {
@@ -16,13 +30,9 @@ pub struct Fixture {
 }
 
 impl Fixture {
-    pub fn len(&self) -> usize {
+    pub fn out_len(&self) -> usize {
         self.x.len()
     }
-}
-
-pub fn fixture_len(fix: &Fixture) -> usize {
-    fix.len()
 }
 
 pub fn tiny_fixture(_fmt: ElemFormat) -> Fixture {
@@ -60,7 +70,7 @@ pub fn gpu(fix: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
     let ctx = MetalContext::new()?;
     let pipeline = pipeline_for(&ctx, variant)?;
     let mut pool = BufferPool::new();
-    let len = fix.len();
+    let len = fix.out_len();
     let buf = pool
         .allocate(&ctx.device, len * 4)
         .ok_or(Error::Gpu("buffer alloc failed"))?;
@@ -101,15 +111,6 @@ pub fn gpu(fix: &Fixture, variant: KernelVariant) -> Result<Vec<f32>, Error> {
 }
 
 #[cfg(target_os = "macos")]
-pub fn pipeline_for(
-    ctx: &crate::metal::device::MetalContext,
-    variant: KernelVariant,
-) -> Result<crate::metal::device::ComputePipeline, Error> {
-    manifest::validate_shared(ENTRY, variant)?;
-    ctx.compile_subkernel(SHADER, ENTRY, variant)
-}
-
-#[cfg(target_os = "macos")]
 use objc2::runtime::ProtocolObject;
 #[cfg(target_os = "macos")]
 use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder};
@@ -141,43 +142,3 @@ fn set_bytes<T>(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, value: &
 
 #[cfg(target_os = "macos")]
 use crate::shaders::gpu_common::div_up;
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "gelu",
-        entry: "gelu",
-        source: SHADER,
-        quant_formats: &[QuantFormat::Q4Affine],
-        fc: &[],
-        variants: KernelVariants::Gelu,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::kernel_oracle_matrix;
-
-    kernel_oracle_matrix! {
-        mod tiny,
-        cpu = crate::shaders::gelu::cpu,
-        cpu_oracle = crate::shaders::gelu::cpu_oracle,
-        gpu = crate::shaders::gelu::gpu,
-        fixture = crate::shaders::gelu::tiny_fixture,
-        out_len = crate::shaders::gelu::fixture_len,
-        formats: [F32],
-        max_tol = 1e-4,
-        min_cos = 0.9999,
-    }
-
-    kernel_oracle_matrix! {
-        mod mlp_shape,
-        cpu = crate::shaders::gelu::cpu,
-        cpu_oracle = crate::shaders::gelu::cpu_oracle,
-        gpu = crate::shaders::gelu::gpu,
-        fixture = crate::shaders::gelu::mlp_shape_fixture,
-        out_len = crate::shaders::gelu::fixture_len,
-        formats: [F32],
-        max_tol = 1e-4,
-        min_cos = 0.9999,
-    }
-}

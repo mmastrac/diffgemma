@@ -5,9 +5,19 @@ use crate::model::embed::LM_HEAD_CHUNK;
 use crate::shaders::gpu_common;
 use crate::shaders::test_util::ElemFormat;
 
-pub const ENTRY: &str = "scatter_vocab_chunk";
-
-pub const SHADER: &str = include_str!("scatter_vocab_chunk.metal");
+crate::shader_kernel! {
+    name = "scatter_vocab_chunk",
+    metal = "scatter_vocab_chunk.metal",
+    spec = {
+            quant_formats: &[QuantFormat::Q4Affine],
+            fc: &[],
+            variants: KernelVariants::Elementwise,
+    },
+    tests = [
+        tiny => tiny_fixture => no_variant => (0.0, 0.9999),
+        lm_head_chunk => lm_head_chunk_fixture => no_variant => (0.0, 0.9999),
+    ],
+}
 
 #[derive(Debug, Clone)]
 pub struct Fixture {
@@ -23,10 +33,6 @@ impl Fixture {
     pub fn out_len(&self) -> usize {
         self.logits.len()
     }
-}
-
-pub fn fixture_len(f: &Fixture) -> usize {
-    f.out_len()
 }
 
 fn fill(len: usize, seed: f32) -> Vec<f32> {
@@ -136,68 +142,4 @@ pub fn gpu(f: &Fixture) -> Result<Vec<f32>, Error> {
     let mut out = vec![0.0f32; f.logits.len()];
     BufferPool::read_f32(&buf_logits, &mut out);
     Ok(out)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::shaders::test_util::{ElemFormat, assert_oracle};
-
-    fn run_matrix(fixture_fn: fn(ElemFormat) -> Fixture, max_tol: f32) {
-        let fix = fixture_fn(ElemFormat::F32);
-        let cpu = cpu(&fix);
-        assert!(cpu.iter().all(|v| v.is_finite()));
-        assert_eq!(cpu.len(), fixture_len(&fix));
-
-        #[cfg(target_os = "macos")]
-        {
-            let gpu = gpu(&fix).expect("gpu");
-            assert_oracle(&gpu, &cpu, max_tol, 0.9999);
-        }
-    }
-
-    #[test]
-    fn cpu_tiny() {
-        if crate::shaders::test_util::skip_gpu_on_ci() {
-            return;
-        }
-        run_matrix(tiny_fixture, 0.0);
-    }
-
-    #[test]
-    fn cpu_lm_head_chunk() {
-        if crate::shaders::test_util::skip_gpu_on_ci() {
-            return;
-        }
-        run_matrix(lm_head_chunk_fixture, 0.0);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn gpu_tiny() {
-        if crate::shaders::test_util::skip_gpu_on_ci() {
-            return;
-        }
-        run_matrix(tiny_fixture, 0.0);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn gpu_lm_head_chunk() {
-        if crate::shaders::test_util::skip_gpu_on_ci() {
-            return;
-        }
-        run_matrix(lm_head_chunk_fixture, 0.0);
-    }
-}
-
-crate::kernel_spec! {
-    pub const SPEC {
-        name: "scatter_vocab_chunk",
-        entry: "scatter_vocab_chunk",
-        source: SHADER,
-        quant_formats: &[QuantFormat::Q4Affine],
-        fc: &[],
-        variants: KernelVariants::Elementwise,
-    }
 }
