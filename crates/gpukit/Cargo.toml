@@ -5,6 +5,12 @@ edition = "2024"
 description = "GPU compute infrastructure: pipeline compilation, specialization, caching, buffers"
 license = "MIT"
 
+[features]
+default = []
+# CUDA backend. The driver is resolved at runtime, so enabling this does not
+# require a CUDA toolkit to build; running a kernel does.
+cuda = []
+
 [dependencies]
 scattered-collect = "0.22"
 include_dir = "0.7"

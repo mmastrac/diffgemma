@@ -7,6 +7,8 @@ pub enum Error {
     Compile(String),
     /// Pipeline archive open or persistence failed.
     Cache(String),
+    /// CUDA driver, module, or launch failure; carries the driver message.
+    Cuda(String),
 }
 
 impl std::fmt::Display for Error {
@@ -15,6 +17,7 @@ impl std::fmt::Display for Error {
             Self::Gpu(msg) => write!(f, "gpu error: {msg}"),
             Self::Compile(msg) => write!(f, "shader compile failed: {msg}"),
             Self::Cache(msg) => write!(f, "pipeline cache: {msg}"),
+            Self::Cuda(msg) => write!(f, "cuda: {msg}"),
         }
     }
 }
