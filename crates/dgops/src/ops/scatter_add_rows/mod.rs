@@ -4,7 +4,15 @@ crate::op_kernel! {
     name = "scatter_add_rows",
     metal = "scatter_add_rows.metal",
     cuda = "scatter_add_rows.cu",
-    fixture = Fixture,
+    fixture = Fixture => fix,
+    abi = [
+        inout(buf_dst = fix.dst),
+        in_u32(buf_idx = fix.indices),
+        in(buf_src = fix.src),
+        u32x2(fix.indices.len(), fix.hidden),
+    ],
+    launch = rows(fix.indices.len()),
+    result = (buf_dst, fix.len()),
     tests = [
         tiny => tiny_fixture => (0.0, 1.0),
         repeated => repeated_fixture => (1e-6, 1.0),

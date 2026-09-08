@@ -4,7 +4,13 @@ crate::op_kernel! {
     name = "vec_fill_zero",
     metal = "fill_zero.metal",
     cuda = "fill_zero.cu",
-    fixture = Fixture,
+    fixture = Fixture => fix,
+    abi = [
+        inout(buf = fix.x),
+        u32x2(fix.base, fix.count),
+    ],
+    launch = 1d(fix.count),
+    result = (buf, fix.len()),
     tests = [
         tiny => tiny_fixture => (0.0, 1.0),
         long => long_fixture => (0.0, 1.0),

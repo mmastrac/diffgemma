@@ -553,8 +553,11 @@ are local-only dev tooling for experiment arms (`quantize --overlay`,
   and type-checks on hosts with no CUDA installed.
 - `crates/dgops` — the portable op set: one CPU reference per op with a
   Metal and a CUDA body beside it and a tier-1 test pinning both to that
-  reference. Dispatches to Metal on macOS, CUDA elsewhere when the `cuda`
-  feature is on. This is the layer the engine's own kernels migrate onto.
+  reference. An op declares its kernel arguments once as an `abi` list in its
+  `op_kernel!` block and gpukit generates both backends' `gpu()` from that
+  list, so the Metal and CUDA argument orders cannot drift. Dispatches to
+  Metal on macOS, CUDA elsewhere when the `cuda` feature is on. This is the
+  layer the engine's own kernels migrate onto.
 - `crates/dgemm` — the GEMM family: one tiled body per backend plus
   the CPU oracle, a problem/stride API shared by the engine and examples, and
   the decode side of every weight format (byte layout, bf16/fp4 codecs,
