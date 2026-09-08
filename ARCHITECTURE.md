@@ -545,7 +545,17 @@ are local-only dev tooling for experiment arms (`quantize --overlay`,
   header folders (`register_includes!`), function-constant specialization
   with cache labels derived from the full input set (FC values + source
   hash), the pipeline binary-archive cache (keyed on the whole shader-tree
-  hash), buffer pool, one-shot dispatch helpers.
+  hash), buffer pool, one-shot dispatch helpers. The Metal backend is
+  `gpukit::metal`; `gpukit::cuda` (feature `cuda`) is the same mechanism over
+  the CUDA driver API, resolved with `dlopen` at first use so the crate builds
+  and type-checks on hosts with no CUDA installed.
+- `crates/dgops` — the portable op set: one CPU reference per op with a
+  Metal and a CUDA body beside it and a tier-1 test pinning both to that
+  reference. Dispatches to Metal on macOS, CUDA elsewhere when the `cuda`
+  feature is on. This is the layer the engine's own kernels migrate onto.
+- `crates/nanogpt` — a tiny character-level GPT composed from dgops
+  (forward, backward, AdamW) with an independent CPU forward as its oracle;
+  the end-to-end consumer that keeps the CUDA path honest.
 - `src/shaders/<group>/<kernel>/` — every kernel's Rust wrapper, Metal
   source, CPU oracle, and manifest `SPEC` colocated (see AGENTS.md §4).
 - `src/metal/` — the runtime: the gpukit policy layer (`device.rs`: flag

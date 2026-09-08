@@ -17,6 +17,9 @@ pub enum Error {
     /// Runtime / logic error: invalid argument, budget or limit exceeded,
     /// unsupported configuration, missing state.
     Runtime(&'static str),
+    /// GPU backend failure carrying a dynamic message (CUDA driver, module
+    /// load, or launch; the message names the failing call).
+    Backend(String),
     /// Token-pipeline op failure (the underlying error stringified on the
     /// pipeline thread, prefixed with the op).
     Pipeline(String),
@@ -51,6 +54,7 @@ impl std::fmt::Display for Error {
             Self::Format(msg) => write!(f, "format error: {msg}"),
             Self::Gpu(msg) => write!(f, "gpu error: {msg}"),
             Self::Runtime(msg) => write!(f, "runtime error: {msg}"),
+            Self::Backend(msg) => write!(f, "{msg}"),
             Self::NotFound(name) => write!(f, "tensor not found: {name}"),
             Self::Layered(msg) => write!(f, "{msg}"),
             Self::Config(msg) => write!(f, "{msg}"),
@@ -101,7 +105,7 @@ impl From<gpukit::Error> for Error {
             gpukit::Error::Gpu(msg) => Self::Gpu(msg),
             gpukit::Error::Compile(msg) => Self::NotFound(format!("shader compile failed: {msg}")),
             gpukit::Error::Cache(msg) => Self::NotFound(format!("pipeline cache: {msg}")),
-            gpukit::Error::Cuda(msg) => Self::Gpu(format!("cuda: {msg}")),
+            gpukit::Error::Cuda(msg) => Self::Backend(format!("cuda: {msg}")),
         }
     }
 }

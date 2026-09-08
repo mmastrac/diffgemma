@@ -35,7 +35,7 @@ fn rms_norm(x: &[f32], weight: &[f32], rows: usize, hidden: usize, eps: f32) -> 
 }
 
 fn gelu(x: &[f32]) -> Vec<f32> {
-    const COEF: f32 = 0.7978845608028654;
+    const COEF: f32 = 0.797_884_6;
     x.iter()
         .map(|&v| {
             let u = COEF * (v + 0.044_715 * v * v * v);

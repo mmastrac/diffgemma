@@ -36,13 +36,11 @@ impl Corpus {
         self.bytes.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
-    }
-
     /// Encode a string; unknown bytes are skipped.
     pub fn encode(&self, s: &str) -> Vec<u32> {
-        s.bytes().filter_map(|b| self.stoi.get(&b).copied()).collect()
+        s.bytes()
+            .filter_map(|b| self.stoi.get(&b).copied())
+            .collect()
     }
 
     pub fn decode(&self, ids: &[u32]) -> String {

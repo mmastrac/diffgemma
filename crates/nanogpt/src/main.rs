@@ -9,10 +9,12 @@
 //! run reproducible. The backend is whichever dgops found (Metal on macOS,
 //! CUDA elsewhere when built with --features cuda).
 
+mod backward;
 mod data;
 mod model;
 mod reference;
 mod tensor;
+mod train;
 
 use dgops::backend;
 use model::{GptConfig, Rng, Weights};
@@ -23,6 +25,7 @@ use std::process::ExitCode;
 struct Args {
     check: bool,
     train: bool,
+    gradcheck: bool,
     steps: usize,
     batch: usize,
     lr: f32,
@@ -51,13 +54,16 @@ fn parse() -> Result<Args, String> {
         match flag.as_str() {
             "--check" => args.check = true,
             "--train" => args.train = true,
+            "--gradcheck" => args.gradcheck = true,
             "--sample" => args.sample = true,
             "--steps" => args.steps = value()?.parse().map_err(|e| format!("--steps: {e}"))?,
             "--batch" => args.batch = value()?.parse().map_err(|e| format!("--batch: {e}"))?,
             "--lr" => args.lr = value()?.parse().map_err(|e| format!("--lr: {e}"))?,
             "--tokens" => args.tokens = value()?.parse().map_err(|e| format!("--tokens: {e}"))?,
             "--temperature" => {
-                args.temperature = value()?.parse().map_err(|e| format!("--temperature: {e}"))?
+                args.temperature = value()?
+                    .parse()
+                    .map_err(|e| format!("--temperature: {e}"))?
             }
             "--seed" => args.seed = value()?.parse().map_err(|e| format!("--seed: {e}"))?,
             "--prompt" => args.prompt = value()?,
@@ -69,7 +75,7 @@ fn parse() -> Result<Args, String> {
             other => return Err(format!("unknown flag {other}\n\n{USAGE}")),
         }
     }
-    if !args.check && !args.train && !args.sample {
+    if !args.check && !args.train && !args.sample && !args.gradcheck {
         args.check = true;
     }
     Ok(args)
@@ -78,6 +84,7 @@ fn parse() -> Result<Args, String> {
 const USAGE: &str = "\
 usage: nanogpt [--check] [--train] [--sample] [options]
   --check              forward parity against the CPU reference (default)
+  --gradcheck          finite-difference check of the analytic gradients
   --train              train on the corpus
   --sample             generate text
   --steps N            training steps (default 2000)
@@ -101,7 +108,9 @@ fn main() -> ExitCode {
 
 fn load_corpus(args: &Args) -> Result<data::Corpus, String> {
     let text = match &args.data {
-        Some(path) => std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?,
+        Some(path) => {
+            std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?
+        }
         None => data::DEFAULT_TEXT.to_string(),
     };
     Ok(data::Corpus::from_str(&text))
@@ -109,14 +118,13 @@ fn load_corpus(args: &Args) -> Result<data::Corpus, String> {
 
 fn run() -> Result<(), String> {
     let args = parse()?;
-    let backend = backend::available().ok_or(
-        "no GPU backend in this build (build with --features cuda on a CUDA host)",
-    )?;
+    let backend = backend::available()
+        .ok_or("no GPU backend in this build (build with --features cuda on a CUDA host)")?;
     println!("backend: {backend}");
 
     let corpus = load_corpus(&args)?;
     let cfg = GptConfig::tiny(corpus.vocab_size());
-    let weights = Weights::random(&cfg, args.seed);
+    let mut weights = Weights::random(&cfg, args.seed);
     println!(
         "corpus: {} chars, vocab {} | model: {} layers, {} heads, dim {}, block {} | params {}",
         corpus.len(),
@@ -128,8 +136,12 @@ fn run() -> Result<(), String> {
         param_count(&cfg)
     );
 
+    if args.gradcheck {
+        train::gradcheck(&mut weights, &cfg, &corpus)?;
+    }
+
     if args.train {
-        return Err("--train needs the backward ops (not wired yet)".to_string());
+        train::train(&mut weights, &cfg, &corpus, &args)?;
     }
 
     if args.check {
@@ -187,12 +199,7 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     (dot / (na.sqrt() * nb.sqrt())) as f32
 }
 
-fn sample(
-    w: &Weights,
-    cfg: &GptConfig,
-    corpus: &data::Corpus,
-    args: &Args,
-) -> Result<(), String> {
+fn sample(w: &Weights, cfg: &GptConfig, corpus: &data::Corpus, args: &Args) -> Result<(), String> {
     let mut rng = Rng::new(args.seed ^ 0x5eed);
     let mut ids = corpus.encode(&args.prompt);
     if ids.is_empty() {
