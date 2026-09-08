@@ -7,8 +7,8 @@ use gpukit::metal::{BufferPool, dispatch_grid, div_up, set_bytes};
 use objc2_metal::MTLComputeCommandEncoder;
 
 pub fn gpu(call: &Call) -> Result<Vec<f32>, Error> {
-    let ctx = crate::metal_rt::context()?;
-    let pipeline = crate::metal_rt::pipeline(&ctx, METAL, ENTRY)?;
+    let ctx = gpukit::metal::cached_context(gpukit::metal::CacheConfig::MEMORY)?;
+    let pipeline = gpukit::metal::cached_pipeline(&ctx, METAL, ENTRY)?;
     let p: AbiParams = call.problem.into();
     let out_len = call.out_len();
     let mut pool = BufferPool::new();

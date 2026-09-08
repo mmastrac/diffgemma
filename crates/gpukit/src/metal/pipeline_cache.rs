@@ -33,6 +33,16 @@ pub struct CacheConfig {
 }
 
 impl CacheConfig {
+    /// In-memory only: nothing touches disk, so namespace/key are inert.
+    /// The portable layer uses this; the engine policy layer builds its own.
+    pub const MEMORY: Self = Self {
+        enabled: false,
+        dir: None,
+        namespace: "gpukit",
+        key: 0,
+        verbose: false,
+    };
+
     fn root_dir(&self) -> PathBuf {
         if let Some(dir) = &self.dir {
             return dir.clone();

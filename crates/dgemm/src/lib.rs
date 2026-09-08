@@ -15,14 +15,10 @@
 mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
-#[cfg(feature = "cuda")]
-pub(crate) mod cuda_rt;
 pub mod fixtures;
 pub mod format;
 #[cfg(target_os = "macos")]
 mod metal;
-#[cfg(target_os = "macos")]
-mod metal_rt;
 pub mod problem;
 pub mod testing;
 
