@@ -7,7 +7,7 @@ use objc2_metal::MTLComputeCommandEncoder;
 
 pub fn gpu(fix: &super::Fixture) -> Result<Vec<f32>, Error> {
     let ctx = crate::metal_rt::context()?;
-    let pipeline = ctx.compile_kernel(METAL, ENTRY)?;
+    let pipeline = crate::metal_rt::pipeline(&ctx, METAL, ENTRY)?;
     let p = fix.params;
     let mut pool = BufferPool::new();
     let out_len = fix.out_len();

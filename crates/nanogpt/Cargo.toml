@@ -1,0 +1,17 @@
+[package]
+name = "nanogpt"
+version = "0.1.0"
+edition = "2024"
+description = "Tiny character-level GPT that runs on the portable Metal/CUDA ops in dgops"
+license = "MIT"
+
+[[bin]]
+name = "nanogpt"
+path = "src/main.rs"
+
+[dependencies]
+dgops = { path = "../dgops" }
+
+[features]
+default = []
+cuda = ["dgops/cuda"]
