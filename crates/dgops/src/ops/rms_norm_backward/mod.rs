@@ -4,7 +4,17 @@ crate::op_kernel! {
     name = "rms_norm_backward",
     metal = "rms_norm_backward.metal",
     cuda = "rms_norm_backward.cu",
-    fixture = Fixture,
+    fixture = Fixture => fix,
+    abi = [
+        in(buf_x = fix.x),
+        in(buf_w = fix.weight),
+        in(buf_dy = fix.dy),
+        out(buf_out = fix.len()),
+        u32x2(fix.rows, fix.hidden),
+        f32(fix.eps),
+    ],
+    launch = rows(fix.rows),
+    result = (buf_out, fix.len()),
     tests = [
         tiny => tiny_fixture => (1e-5, 0.99999),
         wide => wide_fixture => (1e-3, 0.9999),

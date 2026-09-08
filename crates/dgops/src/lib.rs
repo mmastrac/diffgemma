@@ -5,6 +5,10 @@
 //! per-backend source bodies live beside it (op.metal / op.cu) and are expected
 //! to compute the same function; the tier-1 tests in each module pin the GPU
 //! result to the CPU reference, which is the oracle.
+//!
+//! An op's registration block (`crate::op_kernel!`) declares its kernel
+//! arguments once as an `abi` list, and the host-side dispatch for both
+//! backends is generated from that list — see `gpukit::kernel!`.
 
 // Fixtures always have a length and are never empty; an is_empty twin would
 // be meaningless.

@@ -4,7 +4,15 @@ crate::op_kernel! {
     name = "gather_rows",
     metal = "gather_rows.metal",
     cuda = "gather_rows.cu",
-    fixture = Fixture,
+    fixture = Fixture => fix,
+    abi = [
+        out(buf_y = fix.len()),
+        in(buf_src = fix.src),
+        in_u32(buf_idx = fix.indices),
+        u32x2(fix.indices.len(), fix.hidden),
+    ],
+    launch = rows(fix.indices.len()),
+    result = (buf_y, fix.len()),
     tests = [
         tiny => tiny_fixture => (0.0, 1.0),
         moe => moe_fixture => (0.0, 1.0),

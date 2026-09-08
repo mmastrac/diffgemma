@@ -4,7 +4,13 @@ crate::op_kernel! {
     name = "softmax_rows",
     metal = "softmax.metal",
     cuda = "softmax.cu",
-    fixture = Fixture,
+    fixture = Fixture => fix,
+    abi = [
+        inout(buf = fix.logits),
+        u32x2(fix.rows, fix.cols),
+    ],
+    launch = rows(fix.rows),
+    result = (buf, fix.len()),
     tests = [
         tiny => tiny_fixture => (1e-6, 0.999999),
         wide => wide_fixture => (1e-6, 0.999999),

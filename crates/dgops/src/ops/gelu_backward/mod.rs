@@ -4,7 +4,15 @@ crate::op_kernel! {
     name = "gelu_backward",
     metal = "gelu_backward.metal",
     cuda = "gelu_backward.cu",
-    fixture = Fixture,
+    fixture = Fixture => fix,
+    abi = [
+        in(buf_g = fix.g),
+        in(buf_dy = fix.dy),
+        out(buf_out = fix.len()),
+        u32(fix.len()),
+    ],
+    launch = 1d(fix.len()),
+    result = (buf_out, fix.len()),
     tests = [
         tiny => tiny_fixture => (1e-5, 0.99999),
         long => long_fixture => (1e-4, 0.99999),

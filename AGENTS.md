@@ -140,8 +140,11 @@ knows `.metal` paths; `src/metal/` (the runtime) consumes pipelines via
   backend-agnostic subset lives in `crates/dgops/`,
   where an op has one CPU reference and a `.metal` + `.cu` body side by side,
   dispatched through `crates/gpukit` (Metal on macOS, CUDA elsewhere with
-  `--features cuda`). A CUDA port of an engine kernel is a `cuda.cu` beside
-  its `.metal` sharing the same CPU oracle, never a forked body.
+  `--features cuda`). An op declares its kernel arguments once as an `abi`
+  list in its `op_kernel!` block and gpukit generates both backends' `gpu()`
+  from it, so Metal and CUDA cannot drift and a new op writes no dispatch
+  code. A CUDA port of an engine kernel is a `cuda.cu` beside its `.metal`
+  sharing the same CPU oracle, never a forked body.
 - **One source body per logical kernel.** A kernel = the operation + its
   tiling. Variant axes — weight format (q4/q8/nvfp4/raw), fusion/output mode,
   dtype, dump depth, even divergent buffer signatures — are **function

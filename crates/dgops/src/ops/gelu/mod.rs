@@ -4,7 +4,13 @@ crate::op_kernel! {
     name = "gelu",
     metal = "gelu.metal",
     cuda = "gelu.cu",
-    fixture = Fixture,
+    fixture = Fixture => fix,
+    abi = [
+        inout(buf_x = fix.x),
+        u32(fix.len()),
+    ],
+    launch = 1d(fix.len()),
+    result = (buf_x, fix.len()),
     tests = [
         tiny => tiny_fixture => (1e-5, 0.99999),
         mlp_shape => mlp_shape_fixture => (1e-5, 0.99999),

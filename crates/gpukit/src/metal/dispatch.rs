@@ -3,7 +3,7 @@
 use crate::Error;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
     MTLComputePipelineState, MTLSize,
 };
 
@@ -20,6 +20,17 @@ pub fn set_bytes<T>(
             std::mem::size_of_val(value),
             index,
         );
+    }
+}
+
+/// Bind a buffer as kernel argument index.
+pub fn bind_buffer(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    buffer: &ProtocolObject<dyn MTLBuffer>,
+    index: usize,
+) {
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(buffer), 0, index);
     }
 }
 
