@@ -1,5 +1,5 @@
 // Numerically stable row softmax. Mirrors softmax.metal.
-#include <cmath>
+// tanhf/expf/sqrtf/powf/fmaxf are device intrinsics: NVRTC has no <cmath>.
 
 extern "C" __global__ void softmax_rows(float *x, unsigned rows, unsigned cols) {
     const unsigned TG = 256u;

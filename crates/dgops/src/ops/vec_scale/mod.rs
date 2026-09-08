@@ -3,7 +3,7 @@
 crate::op_kernel! {
     name = "vec_scale_inplace",
     metal = "vec_scale.metal",
-    cuda = "ops/vec_scale/vec_scale",
+    cuda = "vec_scale.cu",
     fixture = Fixture,
     tests = [
         tiny => tiny_fixture => (0.0, 1.0),

@@ -37,3 +37,34 @@ pub fn cached_kernel(cubin: &'static [u8], entry: &'static str) -> Result<Kernel
 pub fn pod_bytes<T: Copy>(value: &T) -> &[u8] {
     unsafe { std::slice::from_raw_parts(std::ptr::from_ref(value).cast::<u8>(), size_of::<T>()) }
 }
+
+/// Compile CUDA C++ `source` once per process and resolve `entry`.
+
+///
+
+/// Keyed by the source's address and entry, so an embedded `include_str!`
+
+/// const compiles at most once however many kernels reference it.
+
+pub fn cached_source_kernel(
+    source: &'static str,
+    entry: &'static str,
+) -> Result<Kernel, crate::Error> {
+    static CACHE: OnceLock<Mutex<HashMap<(usize, &'static str), Kernel>>> = OnceLock::new();
+
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    let key = (source.as_ptr() as usize, entry);
+
+    if let Some(existing) = cache.lock().unwrap().get(&key) {
+        return Ok(existing.clone());
+    }
+
+    let ctx = cached_context()?;
+
+    let kernel = ctx.compile_kernel(source, entry)?;
+
+    cache.lock().unwrap().insert(key, kernel.clone());
+
+    Ok(kernel)
+}

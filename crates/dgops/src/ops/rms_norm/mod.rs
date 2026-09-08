@@ -3,7 +3,7 @@
 crate::op_kernel! {
     name = "rms_norm_rows",
     metal = "rms_norm.metal",
-    cuda = "ops/rms_norm/rms_norm",
+    cuda = "rms_norm.cu",
     fixture = Fixture,
     tests = [
         tiny => tiny_fixture => (1e-5, 0.99999),

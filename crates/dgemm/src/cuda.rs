@@ -2,17 +2,12 @@
 
 use crate::Error;
 use crate::problem::{AbiParams, Call};
-use crate::{BM, BN, CUBIN, ENTRY, THREADS};
+use crate::{BM, BN, CUDA, ENTRY, THREADS};
 use gpukit::cuda::{BufferPool, KernelArgs, div_up, launch_grid};
 
 pub fn gpu(call: &Call) -> Result<Vec<f32>, Error> {
-    if CUBIN.is_empty() {
-        return Err(Error::Gpu(
-            "CUDA kernels were not built (nvcc missing at build time)",
-        ));
-    }
     let ctx = gpukit::cuda::cached_context()?;
-    let kernel = gpukit::cuda::cached_kernel(CUBIN, ENTRY)?;
+    let kernel = gpukit::cuda::cached_source_kernel(CUDA, ENTRY)?;
     let p: AbiParams = call.problem.into();
     let out_len = call.out_len();
     let mut pool = BufferPool::new();

@@ -34,10 +34,8 @@ pub const THREADS: u32 = 256;
 pub const ENTRY: &str = "gemm_f32";
 pub const METAL: &str = include_str!("gemm.metal");
 
-#[cfg(all(feature = "cuda", dgemm_cuda_kernels))]
-const CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cuda/gemm.cubin"));
-#[cfg(all(feature = "cuda", not(dgemm_cuda_kernels)))]
-const CUBIN: &[u8] = &[];
+/// CUDA C++ source, compiled by NVRTC on first dispatch.
+pub const CUDA: &str = include_str!("gemm.cu");
 
 /// The CPU reference: the same function in plain loops. This is the oracle.
 pub fn cpu(call: &Call) -> Vec<f32> {

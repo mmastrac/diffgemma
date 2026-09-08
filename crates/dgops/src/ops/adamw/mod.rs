@@ -3,7 +3,7 @@
 crate::op_kernel! {
     name = "adamw",
     metal = "adamw.metal",
-    cuda = "ops/adamw/adamw",
+    cuda = "adamw.cu",
     fixture = Fixture,
     tests = [
         tiny => { fixture = tiny_fixture, gpu = gpu, out_len = out_len, tol = 1e-6, cos = 0.999999 },

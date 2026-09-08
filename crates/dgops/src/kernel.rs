@@ -8,7 +8,6 @@ macro_rules! op_kernel {
     ($($rest:tt)*) => {
         gpukit::kernel! {
             op,
-            cuda_cfg = dgops_cuda_kernels,
             error = crate::Error,
             assert_oracle = crate::testing::assert_oracle,
             gpu_available = crate::testing::gpu_available,

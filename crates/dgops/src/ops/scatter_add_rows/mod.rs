@@ -3,7 +3,7 @@
 crate::op_kernel! {
     name = "scatter_add_rows",
     metal = "scatter_add_rows.metal",
-    cuda = "ops/scatter_add_rows/scatter_add_rows",
+    cuda = "scatter_add_rows.cu",
     fixture = Fixture,
     tests = [
         tiny => tiny_fixture => (0.0, 1.0),

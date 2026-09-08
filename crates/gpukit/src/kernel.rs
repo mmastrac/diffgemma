@@ -7,7 +7,7 @@
 //!
 //! - `op` — a backend-agnostic op whose Metal and CUDA bodies sit beside a CPU
 //!   oracle (`crates/dgops`, `crates/dgemm`): emits `ENTRY`, `METAL`, the
-//!   `CUBIN` cfg pair, `pub mod metal/cuda`, the backend-selecting `gpu()`
+//!   `CUDA` source, `pub mod metal/cuda`, the backend-selecting `gpu()`
 //!   wrapper, and the test module.
 //! - `shader` — one Metal entry point with an FC-specialized pipeline and an
 //!   optional manifest `SPEC` (the engine's `src/shaders`): emits `ENTRY`,
@@ -24,9 +24,9 @@
 //!
 //! - `include_str!($metal)` resolves relative to the *invoking* file, so
 //!   `metal = "gelu.metal"` means "beside this `mod.rs`".
-//! - `include_bytes!(concat!(env!("OUT_DIR"), …))` uses the *consuming* crate's
-//!   `OUT_DIR`, so `cuda = "ops/gelu/gelu"` maps to
-//!   `$OUT_DIR/cuda/ops/gelu/gelu.cubin` (the build script's layout, unchanged).
+//! - `cuda = "gelu.cu"` embeds the CUDA C++ source beside the op, exactly like
+//!   `metal`: NVRTC compiles it on first dispatch, so no build-time toolchain is
+//!   needed and the artifact matches the running device's architecture.
 //! - `pub mod metal;` emitted here resolves to the caller's directory.
 //! - The `pipeline` body must be a caller-written closure: names introduced by
 //!   this macro's transcriber are hygiene-invisible to caller tokens, so a
@@ -40,7 +40,6 @@ macro_rules! kernel {
     // ---- op: Metal + CUDA bodies beside a CPU oracle ------------------------
     (
         op,
-        cuda_cfg = $cuda_cfg:ident,
         error = $err:path,
         assert_oracle = $assert_oracle:path,
         gpu_available = $gpu_available:path,
@@ -52,14 +51,9 @@ macro_rules! kernel {
     ) => {
         pub const ENTRY: &str = $name;
         pub const METAL: &str = include_str!($metal);
-
-        // The cubin is only embedded when nvcc produced one; otherwise the
-        // backend reports that CUDA kernels were not built.
-        #[cfg(all(feature = "cuda", $cuda_cfg))]
-        const CUBIN: &[u8] =
-            include_bytes!(concat!(env!("OUT_DIR"), "/cuda/", $cuda, ".cubin"));
-        #[cfg(all(feature = "cuda", not($cuda_cfg)))]
-        const CUBIN: &[u8] = &[];
+        // CUDA C++ is embedded and compiled by NVRTC on first dispatch, so the
+        // artifact is never tied to the build machine's architecture.
+        pub const CUDA: &str = include_str!($cuda);
 
         #[cfg(feature = "cuda")]
         pub mod cuda;
