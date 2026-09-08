@@ -126,6 +126,8 @@ pub struct LayerCache {
 }
 
 pub struct Cache {
+    pub tokens: Vec<u32>,
+    pub pos_ids: Vec<u32>,
     pub x0: Vec<f32>,
     pub layers: Vec<LayerCache>,
     pub hf: Vec<f32>,
@@ -137,12 +139,7 @@ pub struct Cache {
 /// One forward pass over batch sequences of seq tokens (seq <= block; shorter
 /// contexts are what autoregressive sampling feeds). Returns logits
 /// (batch*seq, vocab) plus every intermediate the backward pass needs.
-pub fn forward(
-    w: &Weights,
-    cfg: &GptConfig,
-    tokens: &[u32],
-    seq: usize,
-) -> Result<Cache, Error> {
+pub fn forward(w: &Weights, cfg: &GptConfig, tokens: &[u32], seq: usize) -> Result<Cache, Error> {
     let c = cfg.n_embd;
     let heads = cfg.n_head;
     let hd = cfg.head_dim();
@@ -247,6 +244,8 @@ pub fn forward(
     let hf = t::rms_norm(&x, &w.ln_f, m, c, EPS)?;
     let logits = t::linear(&hf, &w.lm_head, m, cfg.vocab, c)?;
     Ok(Cache {
+        tokens: tokens.to_vec(),
+        pos_ids,
         x0,
         layers,
         hf,

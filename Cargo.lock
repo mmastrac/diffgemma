@@ -83,6 +83,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dgops"
+version = "0.1.0"
+dependencies = [
+ "gpukit",
+ "objc2",
+ "objc2-metal",
+]
+
+[[package]]
 name = "diffgemma"
 version = "0.1.0"
 dependencies = [

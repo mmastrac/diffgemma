@@ -242,6 +242,16 @@ clears 0.641 by a lot.
 - **cli.rs parser structure**: the usage string is true, but `parse_cli` still
   uses ~90 shared mutable locals (cross-wiring hazard); a per-command
   arg-struct redesign remains open.
+- **Port the engine's kernels to CUDA.** `crates/dgops` proves the pattern on
+  the shared subset (one CPU oracle, Metal + CUDA bodies, tier-1 parity) and
+  `crates/nanogpt` exercises it end to end. `src/shaders/**` is still
+  Metal-only and the crate does not build on Linux at all (`main.rs`
+  compile_errors off macOS; `src/metal/`, `chat/`, `server/`, `decoder/` are
+  macOS-gated). Order: make `src/shaders` + `src/model` build on Linux behind
+  the cuda feature (their GPU halves are already cfg-gated), port the tranche
+  nanogpt covers as `cuda.cu` beside each `.metal` against the same CPU
+  oracle, then the quantized GEMM and attention families. A CUDA box can run
+  the tier-1 parity suite without the 19 GiB pack.
 
 ## Parked / speculative
 

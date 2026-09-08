@@ -134,6 +134,12 @@ and the manifest registration (`SPEC`) are colocated. Only `src/shaders/`
 knows `.metal` paths; `src/metal/` (the runtime) consumes pipelines via
 `shaders::<kernel>::pipeline_for*` / `{SHADER, ENTRY}`.
 
+- **Two homes for kernels.** The engine's kernels live in `src/shaders/`
+  (Metal only today). The backend-agnostic subset lives in `crates/dgops/`,
+  where an op has one CPU reference and a `.metal` + `.cu` body side by side,
+  dispatched through `crates/gpukit` (Metal on macOS, CUDA elsewhere with
+  `--features cuda`). A CUDA port of an engine kernel is a `cuda.cu` beside
+  its `.metal` sharing the same CPU oracle, never a forked body.
 - **One source body per logical kernel.** A kernel = the operation + its
   tiling. Variant axes — weight format (q4/q8/nvfp4/raw), fusion/output mode,
   dtype, dump depth, even divergent buffer signatures — are **function
@@ -323,6 +329,15 @@ diffgemma smoketest -m $WEIGHTS             # 17/17 required
 diffgemma smoketest -m $WEIGHTS --longctx   # doc-QA ladder
 diffgemma golden -m $WEIGHTS                # byte-identity 8/8
 cargo test --release
+
+# CUDA (Linux + NVIDIA GPU). The DiffusionGemma engine is still Metal-only;
+# this covers the portable layer in crates/dgops and the nanogpt example.
+# From any machine with SSH to a CUDA box, scripts/verify-cuda.sh runs all of:
+#   scripts/verify-cuda.sh <user@@host>
+cargo test --release -p dgops --features cuda   # per-op CUDA vs CPU parity
+cargo run --release -p nanogpt --features cuda -- --check      # forward parity
+cargo run --release -p nanogpt --features cuda -- --gradcheck  # finite-diff grads
+cargo run --release -p nanogpt --features cuda -- --train --steps 2000
 
 # Campaigns: flag ARMS x BATTERIES with explicit gates, one process, stats
 # to a dir. This is how a quality lever is decided — not a shell loop.

@@ -18,11 +18,13 @@ port of the original paper's architecture to Apple Silicon.
 
 ## Requirements
 
-This is still a work-in-progress. Expanded platform support (CUDA, optimizations
-for smaller memory-class models, M4/M5-specific optimizations) are planned (PRs
-welcome!).
+This is still a work-in-progress. Expanded platform support, optimizations
+for smaller memory-class models, and M4/M5-specific optimizations are planned
+(PRs welcome!).
 
-- **macOS on Apple Silicon.** Metal is currently the only backend.
+- **macOS on Apple Silicon** for the DiffusionGemma engine. Metal is currently
+  its only backend. The portable kernel layer and the `nanogpt` example also
+  run on CUDA (see [CUDA](#cuda)).
 - **36 GB unified memory**, minimum. The `q4` pack is ~19 GiB of weights; the
   rest is KV cache and denoise working set. On a 36 GB machine you can reach
   ~105k tokens of context without swapping.
@@ -172,6 +174,39 @@ precision-sensitive and small):
 `--set class=format` overrides one tensor class (e.g. `--set experts=nvfp4`,
 which is what `nvfp4x` expands to). The full class/format matrix is available in
 [ARCHITECTURE.md](ARCHITECTURE.md).
+
+## CUDA
+
+The portable kernel layer is backend-agnostic. `crates/gpukit` owns GPU
+mechanism and resolves the CUDA driver at runtime with `dlopen` (nothing is
+linked against `libcuda`, so the crate still builds and type-checks on a host
+with no CUDA). `crates/dgops` holds one CPU reference per op with a Metal and a
+CUDA body side by side and a tier-1 test pinning both to that reference.
+`crates/nanogpt` is a tiny character-level GPT (forward, backward, AdamW)
+composed entirely from those ops, checked against an independent CPU forward.
+
+The 26B DiffusionGemma engine is still Metal-only; porting its own kernels to
+the CUDA backend is open work (PLAN.md).
+
+Requirements: Linux, an NVIDIA GPU, and the CUDA toolkit (`nvcc`, found on
+`PATH` or at `/usr/local/cuda/bin/nvcc`). Build with `--features cuda`.
+
+```bash
+cargo run --release -p nanogpt --features cuda -- --check       # GPU forward vs CPU
+cargo run --release -p nanogpt --features cuda -- --gradcheck   # d(loss)/d(param)
+cargo run --release -p nanogpt --features cuda -- --train --steps 2000
+cargo run --release -p nanogpt --features cuda -- --sample --tokens 400
+cargo test --release -p dgops --features cuda                   # per-op parity
+```
+
+`DGQ_CUDA_ARCH` (default: detected with `nvidia-smi`, else `native`) picks
+the `-arch` nvcc compiles for; `DGQ_NVCC` overrides the compiler path and
+`DGQ_CUDA_DRIVER` the driver library name.
+
+Verified end to end on an NVIDIA GB10 (sm_121, CUDA 13.0). From a machine with
+SSH access to a CUDA box, `scripts/verify-cuda.sh <user@@host>` mirrors the tree
+and runs the driver smoke test, per-op parity, forward parity, the gradient
+check, a short training run, and a sample.
 
 ## Local Development
 
