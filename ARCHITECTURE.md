@@ -557,7 +557,11 @@ are local-only dev tooling for experiment arms (`quantize --overlay`,
   `op_kernel!` block and gpukit generates both backends' `gpu()` from that
   list, so the Metal and CUDA argument orders cannot drift. Dispatches to
   Metal on macOS, CUDA elsewhere when the `cuda` feature is on. This is the
-  layer the engine's own kernels migrate onto.
+  layer the engine's own kernels migrate onto. `dgops::dgq` is a minimal
+  pack reader (manifest + mmapped blob) so a CUDA host can run a real-weight
+  slice without the engine; `crates/dgops/tests/golden_slice.rs` pins seven
+  diffusion stages (embed gather, RMSNorm, SwiGLU, RoPE, GQA attention, MoE
+  router) to their CPU oracles on real layer-0 weights.
 - `crates/dgemm` — the GEMM family: one tiled body per backend plus
   the CPU oracle, a problem/stride API shared by the engine and examples, and
   the decode side of every weight format (byte layout, bf16/fp4 codecs,

@@ -2,14 +2,20 @@
 //! source bodies, and its tier-1 parity tests.
 
 pub mod adamw;
+pub mod apply_rope_heads;
+pub mod embed_gather;
 pub mod fill_zero;
 pub mod gather_rows;
 pub mod gelu;
 pub mod gelu_backward;
+pub mod gqa_attention;
+pub mod moe_router_topk;
 pub mod rms_norm;
 pub mod rms_norm_backward;
+pub mod rms_norm_rows;
 pub mod scatter_add_rows;
 pub mod softmax;
 pub mod softmax_backward;
+pub mod swiglu_gelu;
 pub mod vec_add;
 pub mod vec_scale;

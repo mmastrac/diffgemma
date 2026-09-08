@@ -96,8 +96,11 @@ name = "dgops"
 version = "0.1.0"
 dependencies = [
  "gpukit",
+ "memmap2",
  "objc2",
  "objc2-metal",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

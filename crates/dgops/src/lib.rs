@@ -15,6 +15,7 @@
 #![allow(clippy::len_without_is_empty)]
 
 pub mod backend;
+pub mod dgq;
 pub mod kernel;
 pub mod ops;
 pub mod testing;

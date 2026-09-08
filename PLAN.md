@@ -244,14 +244,20 @@ clears 0.641 by a lot.
   arg-struct redesign remains open.
 - **Port the engine's kernels to CUDA.** `crates/dgops` proves the pattern on
   the shared subset (one CPU oracle, Metal + CUDA bodies, tier-1 parity) and
-  `crates/nanogpt` exercises it end to end. `src/shaders/**` is still
+  `crates/nanogpt` exercises it end to end. The diffusion tranche is started:
+  `dgops::ops::{embed_gather, rms_norm_rows, swiglu_gelu, apply_rope_heads,
+  gqa_attention, moe_router_topk}` are the same kernels with a CUDA body
+  beside the Metal one, and `crates/dgops/tests/golden_slice.rs` runs seven
+  real-weight stages of the `engine_prefill` golden case on the GB10
+  (`DGQ_MODEL_DIR=<pack>`, `--features cuda`). `src/shaders/**` is still
   Metal-only and the crate does not build on Linux at all (`main.rs`
   compile_errors off macOS; `src/metal/`, `chat/`, `server/`, `decoder/` are
   macOS-gated). Order: make `src/shaders` + `src/model` build on Linux behind
-  the cuda feature (their GPU halves are already cfg-gated), port the tranche
-  nanogpt covers as `cuda.cu` beside each `.metal` against the same CPU
-  oracle, then attention. A CUDA box can run the tier-1 parity suite
-  without the 19 GiB pack.
+  the cuda feature (their GPU halves are already cfg-gated), move each ported
+  kernel onto the portable body so the engine and the CUDA slice share one
+  oracle, port the rest as `cuda.cu` beside each `.metal` (the quantized GEMM
+  family next), then the step kernel. A CUDA box runs the tier-1 parity suite
+  without the 19 GiB pack; the golden slice additionally needs the pack.
 - **Model-gated tests treat a manifest-only pack as present.**
   `test_util::dgq_model_dir()` returns `Some` when `model.dgq.json` exists, so an
   interrupted pack download (manifest present, `model.dgq.bin` missing or a
