@@ -34,6 +34,13 @@ struct Inner {
     modules: Mutex<HashMap<u64, Arc<Module>>>,
 }
 
+// A CUcontext is a driver-owned opaque handle. The CUDA driver API is
+// thread-safe, every operation makes the context current on the calling
+// thread first, and the module cache is behind a Mutex -- so sharing one
+// Context across threads is sound.
+unsafe impl Send for Inner {}
+unsafe impl Sync for Inner {}
+
 impl Drop for Inner {
     fn drop(&mut self) {
         // Unload modules before destroying the context they were loaded into.

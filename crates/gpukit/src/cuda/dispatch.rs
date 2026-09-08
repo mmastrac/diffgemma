@@ -130,6 +130,9 @@ pub fn launch_1d_ranged(
 }
 
 /// One block per row, block_width threads per block.
+///
+/// Rows go on gridDim.x, not y: CUDA caps gridDim.y at 65535, and a row count
+/// is a data-dependent dimension. Kernel bodies therefore index blockIdx.x.
 pub fn launch_rows(
     ctx: &Context,
     kernel: &Kernel,
@@ -137,10 +140,13 @@ pub fn launch_rows(
     block_width: u32,
     args: &mut KernelArgs,
 ) -> Result<(), Error> {
-    ctx.launch(kernel, ctx_grid(1, rows), (block_width, 1, 1), 0, args)
+    ctx.launch(kernel, (rows as u32, 1, 1), (block_width, 1, 1), 0, args)
 }
 
 /// 2D grid with a fixed block width (one block per (x, y)).
+///
+/// gridDim.y is capped at 65535 by CUDA; callers whose height is a
+/// data-dependent dimension must keep the large axis on x.
 pub fn launch_grid(
     ctx: &Context,
     kernel: &Kernel,
@@ -149,9 +155,9 @@ pub fn launch_grid(
     block_width: u32,
     args: &mut KernelArgs,
 ) -> Result<(), Error> {
-    ctx.launch(kernel, ctx_grid(width, height), (block_width, 1, 1), 0, args)
-}
-
-fn ctx_grid(width: usize, height: usize) -> (u32, u32, u32) {
-    (width as u32, height as u32, 1)
+    assert!(
+        height <= 65535,
+        "launch_grid height {height} exceeds the CUDA gridDim.y limit of 65535"
+    );
+    ctx.launch(kernel, (width as u32, height as u32, 1), (block_width, 1, 1), 0, args)
 }

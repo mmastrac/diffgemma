@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/gpukit"]
+members = ["crates/dgops", "crates/gpukit"]
 
 [package]
 name = "diffgemma"
