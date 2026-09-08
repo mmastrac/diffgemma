@@ -167,3 +167,86 @@ pub fn adamw(
         weight_decay,
     })
 }
+// ---------------------------------------------------------------------------
+// CPU counterparts: the same ops through the shared CPU oracles (dgemm /
+// dgops). The reference forward uses these so a kernel's parity is pinned to
+// one CPU implementation; what stays independent there is the composition.
+// ---------------------------------------------------------------------------
+
+/// C = alpha * op(A) @ op(B) + beta * C on the CPU oracle.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_cpu(
+    a: &[f32],
+    b: &[f32],
+    c: Vec<f32>,
+    m: usize,
+    n: usize,
+    k: usize,
+    lda: usize,
+    ldb: usize,
+    ldc: usize,
+    trans_a: bool,
+    trans_b: bool,
+    beta: f32,
+) -> Vec<f32> {
+    let call = Call {
+        a: a.to_vec(),
+        b: b.to_vec(),
+        c,
+        problem: Problem {
+            m,
+            n,
+            k,
+            lda,
+            ldb,
+            ldc,
+            alpha: 1.0,
+            beta,
+            trans_a,
+            trans_b,
+        },
+    };
+    dgemm::cpu(&call)
+}
+
+/// Y = X @ W^T with X (m,k), W (n,k) (PyTorch linear layout) on the CPU oracle.
+pub fn linear_cpu(x: &[f32], w: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    gemm_cpu(x, w, vec![0.0; m * n], m, n, k, k, k, n, false, true, 0.0)
+}
+
+pub fn rms_norm_cpu(x: &[f32], weight: &[f32], rows: usize, hidden: usize, eps: f32) -> Vec<f32> {
+    dgops::ops::rms_norm::cpu(&dgops::ops::rms_norm::Fixture {
+        x: x.to_vec(),
+        weight: weight.to_vec(),
+        rows,
+        hidden,
+        eps,
+    })
+}
+
+pub fn gelu_cpu(x: &[f32]) -> Vec<f32> {
+    dgops::ops::gelu::cpu(&dgops::ops::gelu::Fixture { x: x.to_vec() })
+}
+
+pub fn vec_add_cpu(x: &[f32], addend: &[f32]) -> Vec<f32> {
+    dgops::ops::vec_add::cpu(&dgops::ops::vec_add::Fixture {
+        x: x.to_vec(),
+        addend: addend.to_vec(),
+    })
+}
+
+pub fn softmax_cpu(x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    dgops::ops::softmax::cpu(&dgops::ops::softmax::Fixture {
+        logits: x.to_vec(),
+        rows,
+        cols,
+    })
+}
+
+pub fn gather_rows_cpu(src: &[f32], indices: &[u32], hidden: usize) -> Vec<f32> {
+    dgops::ops::gather_rows::cpu(&dgops::ops::gather_rows::Fixture {
+        src: src.to_vec(),
+        indices: indices.to_vec(),
+        hidden,
+    })
+}
