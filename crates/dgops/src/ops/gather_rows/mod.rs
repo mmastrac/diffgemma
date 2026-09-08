@@ -6,7 +6,10 @@ pub const ENTRY: &str = "gather_rows";
 pub const METAL: &str = include_str!("gather_rows.metal");
 
 #[cfg(all(feature = "cuda", dgops_cuda_kernels))]
-const CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cuda/ops/gather_rows/gather_rows.cubin"));
+const CUBIN: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/cuda/ops/gather_rows/gather_rows.cubin"
+));
 #[cfg(all(feature = "cuda", not(dgops_cuda_kernels)))]
 const CUBIN: &[u8] = &[];
 
@@ -57,8 +60,7 @@ pub fn cpu(fix: &Fixture) -> Vec<f32> {
     for (t, &row) in fix.indices.iter().enumerate() {
         let src_off = row as usize * fix.hidden;
         let dst_off = t * fix.hidden;
-        out[dst_off..dst_off + fix.hidden]
-            .copy_from_slice(&fix.src[src_off..src_off + fix.hidden]);
+        out[dst_off..dst_off + fix.hidden].copy_from_slice(&fix.src[src_off..src_off + fix.hidden]);
     }
     out
 }
@@ -81,10 +83,10 @@ pub fn gpu(fix: &Fixture) -> Result<Vec<f32>, Error> {
     }
 }
 
-#[cfg(target_os = "macos")]
-pub mod metal;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+#[cfg(target_os = "macos")]
+pub mod metal;
 
 #[cfg(test)]
 mod tests {

@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex};
 
 use super::dispatch::KernelArgs;
 use super::driver::{
-    self, CUcontext, CUdevice, CUfunction, CUmodule, Driver,
-    CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+    self, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+    CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, CUcontext, CUdevice, CUfunction, CUmodule,
+    Driver,
 };
 use crate::Error;
 
@@ -152,9 +153,10 @@ impl Context {
 
     pub fn synchronize(&self) -> Result<(), Error> {
         self.set_current()?;
-        self.0
-            .driver
-            .check(unsafe { (self.0.driver.cu_ctx_synchronize)() }, "cuCtxSynchronize")
+        self.0.driver.check(
+            unsafe { (self.0.driver.cu_ctx_synchronize)() },
+            "cuCtxSynchronize",
+        )
     }
 
     /// Load a cubin/PTX image, reusing an already-loaded module for identical
@@ -175,7 +177,11 @@ impl Context {
             driver: self.0.driver,
             raw: handle,
         });
-        self.0.modules.lock().unwrap().insert(key, Arc::clone(&module));
+        self.0
+            .modules
+            .lock()
+            .unwrap()
+            .insert(key, Arc::clone(&module));
         Ok(module)
     }
 
@@ -235,6 +241,12 @@ impl Module {
         })
     }
 }
+
+// Same reasoning as Inner: a CUmodule is a driver-owned handle and the CUDA
+// driver API is thread-safe, so a loaded module may be shared and used from
+// any thread (each launch makes its context current first).
+unsafe impl Send for Module {}
+unsafe impl Sync for Module {}
 
 impl Drop for Module {
     fn drop(&mut self) {

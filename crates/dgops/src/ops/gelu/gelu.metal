@@ -1,7 +1,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-constant float GELU_TANH_COEF = 0.7978845608028654f;
+constant float GELU_TANH_COEF = 0.7978846f;
 
 inline float gelu_tanh(float x) {
     float x3 = x * x * x;

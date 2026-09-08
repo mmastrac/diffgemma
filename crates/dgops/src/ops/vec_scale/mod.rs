@@ -6,7 +6,10 @@ pub const ENTRY: &str = "vec_scale_inplace";
 pub const METAL: &str = include_str!("vec_scale.metal");
 
 #[cfg(all(feature = "cuda", dgops_cuda_kernels))]
-const CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cuda/ops/vec_scale/vec_scale.cubin"));
+const CUBIN: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/cuda/ops/vec_scale/vec_scale.cubin"
+));
 #[cfg(all(feature = "cuda", not(dgops_cuda_kernels)))]
 const CUBIN: &[u8] = &[];
 
@@ -63,10 +66,10 @@ pub fn gpu(fix: &Fixture) -> Result<Vec<f32>, Error> {
     }
 }
 
-#[cfg(target_os = "macos")]
-pub mod metal;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+#[cfg(target_os = "macos")]
+pub mod metal;
 
 #[cfg(test)]
 mod tests {

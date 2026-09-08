@@ -34,7 +34,9 @@ impl DeviceBuffer {
         self.assert_fits(bytes.len());
         self.ctx.set_current()?;
         self.ctx.driver().check(
-            unsafe { (self.ctx.driver().cu_memcpy_htod)(self.ptr, bytes.as_ptr().cast(), bytes.len()) },
+            unsafe {
+                (self.ctx.driver().cu_memcpy_htod)(self.ptr, bytes.as_ptr().cast(), bytes.len())
+            },
             "cuMemcpyHtoD",
         )
     }
@@ -53,7 +55,8 @@ impl DeviceBuffer {
 
     pub fn write_f32(&self, data: &[f32]) -> Result<(), Error> {
         // f32 is plain data; viewing it as bytes is exact.
-        let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 4) };
+        let bytes =
+            unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 4) };
         self.write_bytes(bytes)
     }
 

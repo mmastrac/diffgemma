@@ -62,8 +62,12 @@ fn build(m: usize, n: usize, k: usize, trans_a: bool, trans_b: bool, beta: f32) 
     let ldc = n;
     let a_len = if trans_a { k * lda } else { m * lda };
     let b_len = if trans_b { n * ldb } else { k * ldb };
-    let a: Vec<f32> = (0..a_len).map(|i| ((i as f32) * 0.013).sin() * 0.25).collect();
-    let b: Vec<f32> = (0..b_len).map(|i| ((i as f32) * 0.007).cos() * 0.02).collect();
+    let a: Vec<f32> = (0..a_len)
+        .map(|i| ((i as f32) * 0.013).sin() * 0.25)
+        .collect();
+    let b: Vec<f32> = (0..b_len)
+        .map(|i| ((i as f32) * 0.007).cos() * 0.02)
+        .collect();
     let c: Vec<f32> = (0..m * ldc)
         .map(|i| ((i as f32) * 0.021).sin() * 0.1)
         .collect();
@@ -157,10 +161,10 @@ pub fn gpu(fix: &Fixture) -> Result<Vec<f32>, Error> {
     }
 }
 
-#[cfg(target_os = "macos")]
-pub mod metal;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+#[cfg(target_os = "macos")]
+pub mod metal;
 
 #[cfg(test)]
 mod tests {

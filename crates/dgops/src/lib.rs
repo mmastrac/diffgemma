@@ -6,6 +6,10 @@
 //! to compute the same function; the tier-1 tests in each module pin the GPU
 //! result to the CPU reference, which is the oracle.
 
+// Fixtures always have a length and are never empty; an is_empty twin would
+// be meaningless.
+#![allow(clippy::len_without_is_empty)]
+
 pub mod backend;
 #[cfg(feature = "cuda")]
 pub(crate) mod cuda_rt;
