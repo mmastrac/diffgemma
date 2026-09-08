@@ -5,7 +5,7 @@
 #   DGQ_CUDA_HOST=admin@host scripts/verify-cuda.sh
 #
 # Mirrors the working tree, then runs, in order:
-#   1. gpukit driver smoke test (nvcc -> cubin -> cuLaunchKernel -> result)
+#   1. gpukit runtime compile + launch (NVRTC -> PTX -> cuLaunchKernel -> result)
 #   2. dgemm + dgops tier-1 parity: every CUDA body vs its CPU oracle
 #   3. nanogpt forward vs the independent CPU reference
 #   4. nanogpt finite-difference gradient check of the backward pass

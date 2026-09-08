@@ -1,5 +1,5 @@
 // Backward pass of tanh-approximation GELU. Mirrors gelu_backward.metal.
-#include <cmath>
+// tanhf/expf/sqrtf/powf/fmaxf are device intrinsics: NVRTC has no <cmath>.
 
 __device__ __forceinline__ float gelu_tanh_grad(float x) {
     float x3 = x * x * x;

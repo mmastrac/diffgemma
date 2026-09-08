@@ -185,6 +185,24 @@ impl Context {
         Ok(module)
     }
 
+    /// Compile CUDA C++ at runtime (NVRTC) and resolve `entry`.
+
+    ///
+
+    /// The PTX goes through [`load_module`], so a source compiled twice in one
+
+    /// context is loaded once. The architecture comes from this context's
+
+    /// device, so an artifact is never tied to the build machine.
+
+    pub fn compile_kernel(&self, source: &str, entry: &str) -> Result<Kernel, Error> {
+        let (major, minor) = self.compute_capability();
+
+        let ptx = super::nvrtc::compile_to_ptx(source, major, minor)?;
+
+        self.load_module(&ptx)?.function(entry)
+    }
+
     /// Enqueue a kernel launch; returns once the launch is enqueued, not
     /// completed. Call synchronize (or copy to host) to wait.
     pub fn launch(

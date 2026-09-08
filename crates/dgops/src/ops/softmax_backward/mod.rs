@@ -3,7 +3,7 @@
 crate::op_kernel! {
     name = "softmax_backward",
     metal = "softmax_backward.metal",
-    cuda = "ops/softmax_backward/softmax_backward",
+    cuda = "softmax_backward.cu",
     fixture = Fixture,
     tests = [
         tiny => tiny_fixture => (1e-6, 0.999999),

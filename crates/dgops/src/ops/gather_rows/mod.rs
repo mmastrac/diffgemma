@@ -3,7 +3,7 @@
 crate::op_kernel! {
     name = "gather_rows",
     metal = "gather_rows.metal",
-    cuda = "ops/gather_rows/gather_rows",
+    cuda = "gather_rows.cu",
     fixture = Fixture,
     tests = [
         tiny => tiny_fixture => (0.0, 1.0),

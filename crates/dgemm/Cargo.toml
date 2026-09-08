@@ -7,8 +7,8 @@ license = "MIT"
 
 [features]
 default = []
-# Build the CUDA bodies with nvcc and enable the CUDA dispatch path. The driver
-# is resolved at runtime, so the Rust side builds without a toolkit.
+# Enable the CUDA dispatch path. The .cu body is compiled by NVRTC on first
+# dispatch, so neither the driver nor a toolkit is needed to build.
 cuda = ["gpukit/cuda"]
 
 [dependencies]

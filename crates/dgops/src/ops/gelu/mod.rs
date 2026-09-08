@@ -3,7 +3,7 @@
 crate::op_kernel! {
     name = "gelu",
     metal = "gelu.metal",
-    cuda = "ops/gelu/gelu",
+    cuda = "gelu.cu",
     fixture = Fixture,
     tests = [
         tiny => tiny_fixture => (1e-5, 0.99999),

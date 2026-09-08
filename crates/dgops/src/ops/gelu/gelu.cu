@@ -1,5 +1,5 @@
 // PyTorch tanh-approximation GELU, in place. Mirrors gelu.metal.
-#include <cmath>
+// tanhf/expf/sqrtf/powf/fmaxf are device intrinsics: NVRTC has no <cmath>.
 
 __device__ __forceinline__ float gelu_tanh(float x) {
     float x3 = x * x * x;
