@@ -95,6 +95,7 @@ dependencies = [
 name = "diffgemma"
 version = "0.1.0"
 dependencies = [
+ "dgemm",
  "gpukit",
  "memmap2",
  "objc2",

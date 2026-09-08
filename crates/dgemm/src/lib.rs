@@ -6,11 +6,11 @@
 //! stacked segment tables, grouped MoE index maps, epilogue fusion) is a
 //! compile-time axis value on the same body, never a forked kernel.
 //!
-//! This crate currently covers f32 operands. The quantized bodies the engine
-//! runs (q4/q6/q8/nvfp4 decode fused into the tile load, stacked and grouped
-//! structures, arena/gather epilogues) join as axis values, and the decode
-//! they need arrives as the crate's Format axis rather than as a dependency on
-//! the engine.
+//! The f32 body is here today, together with the decode side of every weight
+//! format the engine stores (see the format module): byte layout, bit-level
+//! codecs, and the per-format CPU GEMM oracles. The fused bodies that consume
+//! that decode -- stacked and grouped structures, arena/gather epilogues --
+//! join as axis values on the same body, not as forked kernels.
 
 mod cpu;
 #[cfg(feature = "cuda")]
@@ -18,6 +18,7 @@ pub mod cuda;
 #[cfg(feature = "cuda")]
 pub(crate) mod cuda_rt;
 pub mod fixtures;
+pub mod format;
 #[cfg(target_os = "macos")]
 mod metal;
 #[cfg(target_os = "macos")]

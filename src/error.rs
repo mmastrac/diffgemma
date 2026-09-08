@@ -98,7 +98,6 @@ impl From<serde_json::Error> for Error {
     }
 }
 
-#[cfg(target_os = "macos")]
 impl From<gpukit::Error> for Error {
     fn from(value: gpukit::Error) -> Self {
         match value {
@@ -106,6 +105,7 @@ impl From<gpukit::Error> for Error {
             gpukit::Error::Compile(msg) => Self::NotFound(format!("shader compile failed: {msg}")),
             gpukit::Error::Cache(msg) => Self::NotFound(format!("pipeline cache: {msg}")),
             gpukit::Error::Cuda(msg) => Self::Backend(format!("cuda: {msg}")),
+            gpukit::Error::Format(msg) => Self::Format(msg),
         }
     }
 }

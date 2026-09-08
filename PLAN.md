@@ -252,9 +252,16 @@ clears 0.641 by a lot.
   nanogpt covers as `cuda.cu` beside each `.metal` against the same CPU
   oracle, then attention. A CUDA box can run the tier-1 parity suite
   without the 19 GiB pack.
-- **Move the engine GEMM family into `crates/dgemm`.** Stage 1 (the plain f32
-  body, shared with nanogpt) has landed. Next: extract the decode-only subset
-  of `src/dgq` into the crate's Format axis (q4/q6/q8/nvfp4), then move
+- **Model-gated tests treat a manifest-only pack as present.**
+  `test_util::dgq_model_dir()` returns `Some` when `model.dgq.json` exists, so an
+  interrupted pack download (manifest present, `model.dgq.bin` missing or a
+  0-byte `.incomplete`) turns the ~25 graceful skips into ENOENT failures
+  instead of skipping. Gate on the blob (or a complete-pack marker) too.
+- **Move the engine GEMM family into `crates/dgemm`.** Stages 1-2 have
+  landed: the f32 body (shared with nanogpt) and the decode-only subset of
+  `src/dgq` (layout, bf16/fp4 codecs, q4/q6/q8/nvfp4 decode plus their CPU
+  GEMM oracles) are in the crate, with the engine re-exporting them so no call
+  site moved. Next: move
   `gemm_tunable` plus its bit-exact oracle twins (`gemm_block`,
   `gemm_block_stacked`, `gemm_block_grouped`) in verbatim -- gated by
   `bench-gemm --oracle` per-element bit-exactness across all production shapes,

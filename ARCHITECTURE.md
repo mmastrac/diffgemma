@@ -554,9 +554,12 @@ are local-only dev tooling for experiment arms (`quantize --overlay`,
   reference. Dispatches to Metal on macOS, CUDA elsewhere when the `cuda`
   feature is on. This is the layer the engine's own kernels migrate onto.
 - `crates/dgemm` — the GEMM family: one tiled body per backend plus
-  the CPU oracle, with a problem/stride API shared by the engine and examples.
-  Weight-format decode, stacked/grouped structure and epilogue fusion are
-  compile-time axis values on that body, not forked kernels.
+  the CPU oracle, a problem/stride API shared by the engine and examples, and
+  the decode side of every weight format (byte layout, bf16/fp4 codecs,
+  q4/q6/q8/nvfp4 decode and their CPU GEMM oracles). Stacked/grouped structure
+  and arena/gather epilogues are compile-time axis values on that body, not
+  forked kernels; the engine's `src/dgq` keeps the manifest, the encoders and
+  the store, re-exporting the decode.
 - `crates/nanogpt` — a tiny character-level GPT composed from dgops
   (forward, backward, AdamW) with an independent CPU forward as its oracle;
   the end-to-end consumer that keeps the CUDA path honest.
