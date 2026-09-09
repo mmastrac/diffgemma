@@ -209,6 +209,7 @@ struct Bufs {
     mlp_down: DeviceBuffer,
     moe_in: DeviceBuffer,
     moe_out: DeviceBuffer,
+    norm_scratch: DeviceBuffer,
     router_in: DeviceBuffer,
     router_logits: DeviceBuffer,
     top_idx: DeviceBuffer,
@@ -244,6 +245,7 @@ impl Bufs {
             mlp_down: a(seq * hidden)?,
             moe_in: a(seq * hidden)?,
             moe_out: a(seq * hidden)?,
+            norm_scratch: a(seq * hidden)?,
             router_in: a(seq * hidden)?,
             router_logits: a(seq * t.num_experts)?,
             top_idx: a(seq * t.top_k_experts)?,
@@ -622,12 +624,15 @@ fn layer_forward(
         lw.mlp_down.device_ptr(),
         b.mlp_down.device_ptr(),
     )?;
+    // rms reads its input and writes its output from parallel blocks, so an
+    // in-place call is a race; normalize into the scratch and copy back.
     r.rms(
         &b.mlp_down,
         &lw.post_feedforward_layernorm_1,
-        &b.mlp_down,
+        &b.norm_scratch,
         seq,
     )?;
+    copy_device(ctx, &b.mlp_down, &b.norm_scratch, seq * hidden)?;
 
     if stop_at == 2 {
         return Ok(());
@@ -721,9 +726,17 @@ fn layer_forward(
             launch(ctx, "dgq_accum", flat(hidden, 256), 256, &mut args)?;
         }
     }
+    // The CPU oracle does: scratch = moe_out; moe_out = rms(scratch) * w2;
+    // normed += moe_out. rms writes into b.normed, which holds the residual
+    // this branch must keep, so normalize first, park the residual in
+    // moe_out, then move the normalized result back and accumulate.
+    // CPU oracle order: scratch = moe_out; moe_out = rms(scratch) * w2;
+    // normed += moe_out. Here rms leaves the normalized value in b.normed and
+    // b.moe_out still holds the raw value, so add first, then move the
+    // normalized result into moe_out.
     r.rms(&b.moe_out, &lw.post_feedforward_layernorm_2, &b.normed, seq)?;
-    copy_device(ctx, &b.moe_out, &b.normed, seq * hidden)?;
     r.add_in_place(&b.normed, &b.moe_out, seq * hidden)?;
+    copy_device(ctx, &b.moe_out, &b.normed, seq * hidden)?;
 
     if stop_at == 3 {
         return Ok(());
@@ -910,11 +923,6 @@ pub fn cublas_probe(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Resul
         bc.device_ptr(),
     )?;
     ctx.synchronize()?;
-    let mut rb = vec![0.0f32; b.len()];
-    bb.read_f32(&mut rb)?;
-    let mut ra = vec![0.0f32; a.len()];
-    ba.read_f32(&mut ra)?;
-    eprintln!("[probe] a={a:?} read_a={ra:?} b={b:?} read_b={rb:?} m={m} n={n} k={k}");
     let mut out = vec![0.0f32; m * n];
     bc.read_f32(&mut out)?;
     Ok(out)

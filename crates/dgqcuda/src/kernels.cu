@@ -29,6 +29,7 @@ extern "C" __global__ void dgq_rms_norm(
     }
 }
 
+
 // Per-head QK-norm: one block per (row, head); weight may be null (V).
 extern "C" __global__ void dgq_rms_norm_heads(
     const float *x, const float *weight, float *out,
