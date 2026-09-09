@@ -603,12 +603,14 @@ fn layer_forward(
         b.mlp_up.device_ptr(),
     )?;
     // out = gelu_tanh(gate) * up, written into mlp_gate
+    // (kernel args: gate, up, weight, out, len)
     let mut args = KernelArgs::new();
     args.device_ptr(b.mlp_gate.device_ptr())
         .device_ptr(b.mlp_up.device_ptr())
         .f32(1.0)
         .device_ptr(b.mlp_gate.device_ptr())
         .u32((seq * inter) as u32);
+    let _ = &args;
     launch(
         ctx,
         "dgq_swiglu_weighted",
@@ -726,14 +728,13 @@ fn layer_forward(
             launch(ctx, "dgq_accum", flat(hidden, 256), 256, &mut args)?;
         }
     }
-    // The CPU oracle does: scratch = moe_out; moe_out = rms(scratch) * w2;
-    // normed += moe_out. rms writes into b.normed, which holds the residual
-    // this branch must keep, so normalize first, park the residual in
-    // moe_out, then move the normalized result back and accumulate.
-    // CPU oracle order: scratch = moe_out; moe_out = rms(scratch) * w2;
-    // normed += moe_out. Here rms leaves the normalized value in b.normed and
-    // b.moe_out still holds the raw value, so add first, then move the
-    // normalized result into moe_out.
+    // CPU oracle: scratch = moe_out; moe_out = rms(scratch) * w2; normed += moe_out.
+    // rms writes into b.normed (which holds this branch's residual), so the
+    // normalized value is moved into moe_out before the accumulate, leaving
+    // b.normed = residual + rms(moe_out).
+    // CPU oracle: scratch = moe_out; moe_out = rms(scratch) * w2; normed += moe_out.
+    // rms leaves the normalized value in b.normed; b.moe_out still holds the raw
+    // value, so add first and then move the normalized result into moe_out.
     r.rms(&b.moe_out, &lw.post_feedforward_layernorm_2, &b.normed, seq)?;
     r.add_in_place(&b.normed, &b.moe_out, seq * hidden)?;
     copy_device(ctx, &b.moe_out, &b.normed, seq * hidden)?;
