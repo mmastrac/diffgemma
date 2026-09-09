@@ -72,7 +72,14 @@ impl LayerWeights {
     }
 }
 
-pub fn rms_norm_rows(out: &mut [f32], x: &[f32], weight: &[f32], seq: usize, hidden: usize, eps: f32) {
+pub fn rms_norm_rows(
+    out: &mut [f32],
+    x: &[f32],
+    weight: &[f32],
+    seq: usize,
+    hidden: usize,
+    eps: f32,
+) {
     for s in 0..seq {
         let off = s * hidden;
         let row = &x[off..off + hidden];
@@ -148,7 +155,11 @@ pub fn apply_rope(vec: &mut [f32], freqs: &[f32], rotary_dim: usize) {
     for d in 0..half {
         let cos = freqs[2 * d];
         let sin = freqs[2 * d + 1];
-        let i1 = if proportional { half_head + d } else { d + half };
+        let i1 = if proportional {
+            half_head + d
+        } else {
+            d + half
+        };
         let x0 = vec[d];
         let x1 = vec[i1];
         vec[d] = x0 * cos - x1 * sin;
@@ -337,7 +348,12 @@ fn layer_forward_at(
             }
             softmax_row(row);
             if qi == 3 && h == 7 && std::env::var_os("DGQ_DBG").is_some() {
-                eprintln!("[dbg] cpu attn qi=3 h=7 row={:?} v0[0]={} v1[0]={}", &row[..4], b.v[(0 * n_kv + kv_h) * head_dim], b.v[(1 * n_kv + kv_h) * head_dim]);
+                eprintln!(
+                    "[dbg] cpu attn qi=3 h=7 row={:?} v0[0]={} v1[0]={}",
+                    &row[..4],
+                    b.v[(0 * n_kv + kv_h) * head_dim],
+                    b.v[(1 * n_kv + kv_h) * head_dim]
+                );
             }
             let o = &mut b.attn_out[q_off..q_off + head_dim];
             o.fill(0.0);
@@ -380,12 +396,33 @@ fn layer_forward_at(
         hidden,
         eps,
     );
-    linear(&mut b.mlp_gate, &b.normed, &lw.mlp_gate, seq, hidden, t.intermediate_size);
-    linear(&mut b.mlp_up, &b.normed, &lw.mlp_up, seq, hidden, t.intermediate_size);
+    linear(
+        &mut b.mlp_gate,
+        &b.normed,
+        &lw.mlp_gate,
+        seq,
+        hidden,
+        t.intermediate_size,
+    );
+    linear(
+        &mut b.mlp_up,
+        &b.normed,
+        &lw.mlp_up,
+        seq,
+        hidden,
+        t.intermediate_size,
+    );
     for i in 0..b.mlp_gate.len() {
         b.mlp_up[i] *= gelu_tanh(b.mlp_gate[i]);
     }
-    linear(&mut b.mlp_down, &b.mlp_up, &lw.mlp_down, seq, t.intermediate_size, hidden);
+    linear(
+        &mut b.mlp_down,
+        &b.mlp_up,
+        &lw.mlp_down,
+        seq,
+        t.intermediate_size,
+        hidden,
+    );
     b.norm_scratch.copy_from_slice(&b.mlp_down);
     rms_norm_rows(
         &mut b.mlp_down,
@@ -435,6 +472,10 @@ fn layer_forward_at(
     for s in 0..seq {
         let logits = &b.router_logits[s * t.num_experts..(s + 1) * t.num_experts];
         let (idx, weights) = top_k_route(logits, t.top_k_experts, &lw.router_per_expert_scale);
+        if s == 0 && std::env::var_os("DGQ_DBG").is_some() {
+            eprintln!("[dbg] cpu route idx={:?} w={:?}", idx, weights);
+            eprintln!("[dbg] cpu router_logits[0..4]={:?}", &logits[..4]);
+        }
         let x = &b.moe_input[s * hidden..(s + 1) * hidden];
         let o = &mut b.moe_out[s * hidden..(s + 1) * hidden];
         for (e, w) in idx.iter().zip(weights.iter()) {
@@ -446,7 +487,16 @@ fn layer_forward_at(
             }
             let dn = &lw.experts_down[e * down_stride..(e + 1) * down_stride];
             linear(&mut b.expert_out, &b.expert_act, dn, 1, moe_inter, hidden);
+            if s == 0 && e == &idx[0] && std::env::var_os("DGQ_DBG").is_some() {
+                eprintln!(
+                    "[dbg] cpu expert_out[0..4]={:?} act[0..2]={:?}",
+                    &b.expert_out[..4],
+                    &b.expert_act[..2]
+                );
+            }
             for i in 0..hidden {
+                // Engine order: the expert weight is applied after the down
+                // projection (moe_scatter_weighted).
                 o[i] += w * b.expert_out[i];
             }
         }
@@ -465,6 +515,9 @@ fn layer_forward_at(
         b.normed[i] += b.moe_out[i];
     }
 
+    if stop_at == 3 {
+        return;
+    }
     // ---- output ----------------------------------------------------------
     rms_norm_rows(
         out,
@@ -555,10 +608,20 @@ pub fn forward(
     }
     sc.hidden_a.copy_from_slice(&sc.bufs.embed);
 
-    let n_layers = layers.unwrap_or(t.num_hidden_layers).min(t.num_hidden_layers);
+    let n_layers = layers
+        .unwrap_or(t.num_hidden_layers)
+        .min(t.num_hidden_layers);
     for layer in 0..n_layers {
         let lw = LayerWeights::load(w, layer)?;
-        layer_forward(&mut sc.hidden_b, &sc.hidden_a, &lw, cfg, layer, seq, &mut sc.bufs);
+        layer_forward(
+            &mut sc.hidden_b,
+            &sc.hidden_a,
+            &lw,
+            cfg,
+            layer,
+            seq,
+            &mut sc.bufs,
+        );
         std::mem::swap(&mut sc.hidden_a, &mut sc.hidden_b);
     }
 
@@ -633,8 +696,17 @@ pub fn hidden_after(
     for layer in 0..layers {
         let lw = LayerWeights::load(w, layer)?;
         let stop = if layer + 1 == layers { stop_at } else { 0 };
-        layer_forward_at(&mut sc.hidden_b, &sc.hidden_a, &lw, cfg, layer, seq, &mut sc.bufs, stop);
-        if stop == 1 || stop == 2 {
+        layer_forward_at(
+            &mut sc.hidden_b,
+            &sc.hidden_a,
+            &lw,
+            cfg,
+            layer,
+            seq,
+            &mut sc.bufs,
+            stop,
+        );
+        if stop == 1 || stop == 2 || stop == 3 {
             return Ok(sc.bufs.normed[..seq * hidden].to_vec());
         }
         std::mem::swap(&mut sc.hidden_a, &mut sc.hidden_b);
@@ -672,7 +744,14 @@ pub fn attn_stage(
     let kv_dim = n_kv * head_dim;
     let b = &mut sc.bufs;
     b.residual.copy_from_slice(&sc.hidden_a);
-    rms_norm_rows(&mut b.normed, &sc.hidden_a, &lw.input_layernorm, seq, hidden, eps);
+    rms_norm_rows(
+        &mut b.normed,
+        &sc.hidden_a,
+        &lw.input_layernorm,
+        seq,
+        hidden,
+        eps,
+    );
     linear(&mut b.q, &b.normed, &lw.q_proj, seq, hidden, q_dim);
     linear(&mut b.k, &b.normed, &lw.k_proj, seq, hidden, kv_dim);
     if lw.v_proj.is_empty() {
@@ -702,12 +781,20 @@ pub fn attn_stage(
         for h in 0..n_heads {
             let off = (s * n_heads + h) * head_dim;
             let foff = s * rotary_dim;
-            apply_rope(&mut b.q[off..off + head_dim], &freqs[foff..foff + rotary_dim], rotary_dim);
+            apply_rope(
+                &mut b.q[off..off + head_dim],
+                &freqs[foff..foff + rotary_dim],
+                rotary_dim,
+            );
         }
         for h in 0..n_kv {
             let off = (s * n_kv + h) * head_dim;
             let foff = s * rotary_dim;
-            apply_rope(&mut b.k[off..off + head_dim], &freqs[foff..foff + rotary_dim], rotary_dim);
+            apply_rope(
+                &mut b.k[off..off + head_dim],
+                &freqs[foff..foff + rotary_dim],
+                rotary_dim,
+            );
         }
     }
     for qi in 0..seq {
@@ -729,14 +816,116 @@ pub fn attn_stage(
             o.fill(0.0);
             for ki in 0..seq {
                 let p = row[ki];
-                if p == 0.0 { continue; }
+                if p == 0.0 {
+                    continue;
+                }
                 let v_off = (ki * n_kv + kv_h) * head_dim;
-                for d in 0..head_dim { o[d] += p * b.v[v_off + d]; }
+                for d in 0..head_dim {
+                    o[d] += p * b.v[v_off + d];
+                }
             }
         }
     }
     linear(&mut b.proj_out, &b.attn_out, &lw.o_proj, seq, q_dim, hidden);
-    rms_norm_rows(&mut b.normed, &b.proj_out, &lw.post_attention_layernorm, seq, hidden, eps);
-    for i in 0..b.normed.len() { b.normed[i] += b.residual[i]; }
+    rms_norm_rows(
+        &mut b.normed,
+        &b.proj_out,
+        &lw.post_attention_layernorm,
+        seq,
+        hidden,
+        eps,
+    );
+    for i in 0..b.normed.len() {
+        b.normed[i] += b.residual[i];
+    }
     Ok(b.normed[..seq * hidden].to_vec())
+}
+
+/// The attention sub-layer's Q/K/V buffers after QK-norm and RoPE, for
+/// layout tests. Returns copies of the oracle's own buffers.
+pub struct AttnBuffers {
+    pub q: Vec<f32>,
+    pub k: Vec<f32>,
+    pub v: Vec<f32>,
+}
+
+pub fn attn_buffers(
+    w: &Weights,
+    cfg: &ModelConfig,
+    token_ids: &[u32],
+    sc: &mut Scratch,
+) -> Result<AttnBuffers, Error> {
+    let t = &cfg.text_config;
+    let seq = token_ids.len();
+    let hidden = t.hidden_size;
+    let (n_kv, head_dim, rotary_dim, theta, _) = t.attn_geometry(0);
+    let n_heads = t.num_attention_heads;
+    let eps = t.rms_norm_eps as f32;
+    let q_dim = n_heads * head_dim;
+    let kv_dim = n_kv * head_dim;
+    let embed_scale = (hidden as f32).sqrt();
+    let embed_w = w.tensor_f32("model.decoder.embed_tokens.weight")?;
+    for (s, &id) in token_ids.iter().enumerate() {
+        let src = id as usize * hidden;
+        let dst = s * hidden;
+        for i in 0..hidden {
+            sc.hidden_a[dst + i] = embed_w[src + i] * embed_scale;
+        }
+    }
+    let lw = LayerWeights::load(w, 0)?;
+    let b = &mut sc.bufs;
+    rms_norm_rows(
+        &mut b.normed,
+        &sc.hidden_a,
+        &lw.input_layernorm,
+        seq,
+        hidden,
+        eps,
+    );
+    linear(&mut b.q, &b.normed, &lw.q_proj, seq, hidden, q_dim);
+    linear(&mut b.k, &b.normed, &lw.k_proj, seq, hidden, kv_dim);
+    linear(&mut b.v, &b.normed, &lw.v_proj, seq, hidden, kv_dim);
+    for s in 0..seq {
+        for h in 0..n_heads {
+            let off = (s * n_heads + h) * head_dim;
+            let mut head: Vec<f32> = b.q[off..off + head_dim].to_vec();
+            rms_norm_head(&mut head, Some(&lw.q_norm), eps);
+            b.q[off..off + head_dim].copy_from_slice(&head);
+        }
+        for h in 0..n_kv {
+            let off = (s * n_kv + h) * head_dim;
+            let mut head: Vec<f32> = b.k[off..off + head_dim].to_vec();
+            rms_norm_head(&mut head, Some(&lw.k_norm), eps);
+            b.k[off..off + head_dim].copy_from_slice(&head);
+            let mut vh: Vec<f32> = b.v[off..off + head_dim].to_vec();
+            rms_norm_head(&mut vh, None, eps);
+            b.v[off..off + head_dim].copy_from_slice(&vh);
+        }
+    }
+    let freqs = rope_freqs(seq, rotary_dim, head_dim, theta);
+    for s in 0..seq {
+        for h in 0..n_heads {
+            let off = (s * n_heads + h) * head_dim;
+            let foff = s * rotary_dim;
+            apply_rope(
+                &mut b.q[off..off + head_dim],
+                &freqs[foff..foff + rotary_dim],
+                rotary_dim,
+            );
+        }
+        for h in 0..n_kv {
+            let off = (s * n_kv + h) * head_dim;
+            let foff = s * rotary_dim;
+            apply_rope(
+                &mut b.k[off..off + head_dim],
+                &freqs[foff..foff + rotary_dim],
+                rotary_dim,
+            );
+        }
+    }
+    Ok(AttnBuffers {
+        q: b.q[..seq * q_dim].to_vec(),
+        k: b.k[..seq * kv_dim].to_vec(),
+        v: b.v[..seq * kv_dim].to_vec(),
+    })
 }

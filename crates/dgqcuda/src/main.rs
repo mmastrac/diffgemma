@@ -120,7 +120,9 @@ fn main() {
         Ok(a) => a,
         Err(e) => {
             eprintln!("error: {e}");
-            eprintln!("usage: dgqcuda [forward|parity] -m <pack dir> [--ids 1,2,3] [--layers N] [--seed S]");
+            eprintln!(
+                "usage: dgqcuda [forward|parity] -m <pack dir> [--ids 1,2,3] [--layers N] [--seed S]"
+            );
             std::process::exit(2);
         }
     };
@@ -187,7 +189,14 @@ fn run(args: &Args) -> Result<(), config::Error> {
                 &mut sc,
             )?;
             let mut gpu_sc = Scratch::new(seq, &cfg);
-            let gpu = gpu::forward(&w, &cfg, &args.ids, args.layers, forward::LogitRows::All, &mut gpu_sc)?;
+            let gpu = gpu::forward(
+                &w,
+                &cfg,
+                &args.ids,
+                args.layers,
+                forward::LogitRows::All,
+                &mut gpu_sc,
+            )?;
             let n = cpu.logits.len();
             let (a, b) = if gpu.logits.len() == cpu.logits.len() {
                 (cpu.logits.as_slice(), gpu.logits.as_slice())
@@ -227,33 +236,67 @@ fn run(args: &Args) -> Result<(), config::Error> {
             }
         }
         "stage" => {
-            let n = args.layers.unwrap_or(t.num_hidden_layers).min(t.num_hidden_layers);
+            let n = args
+                .layers
+                .unwrap_or(t.num_hidden_layers)
+                .min(t.num_hidden_layers);
             let cpu = forward::hidden_after(&w, &cfg, &args.ids, n, args.at, &mut sc)?;
-            let gpu = gpu::hidden_after(&w, &cfg, &args.ids, n, args.at, &mut Scratch::new(seq, &cfg))?;
+            let gpu = gpu::hidden_after(
+                &w,
+                &cfg,
+                &args.ids,
+                n,
+                args.at,
+                &mut Scratch::new(seq, &cfg),
+            )?;
             let cos = cosine(&cpu, &gpu);
-            let mad = cpu.iter().zip(gpu.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            let mad = cpu
+                .iter()
+                .zip(gpu.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
             let scale = cpu.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-30);
             println!(
                 "stage {n} (at {}): hidden cos {cos:.7} max_abs {mad:.3e} rel {:.2e}",
                 args.at,
                 mad / scale
             );
-            println!("  len cpu {} gpu {} | cpu[0..4]={:?} gpu[0..4]={:?}", cpu.len(), gpu.len(), &cpu[..4.min(cpu.len())], &gpu[..4.min(gpu.len())]);
+            println!(
+                "  len cpu {} gpu {} | cpu[0..4]={:?} gpu[0..4]={:?}",
+                cpu.len(),
+                gpu.len(),
+                &cpu[..4.min(cpu.len())],
+                &gpu[..4.min(gpu.len())]
+            );
             let mut worst = (0usize, 0.0f32);
             for i in 0..cpu.len().min(gpu.len()) {
                 let d = (cpu[i] - gpu[i]).abs();
-                if d > worst.1 { worst = (i, d); }
+                if d > worst.1 {
+                    worst = (i, d);
+                }
             }
-            println!("  worst idx {} cpu={} gpu={}", worst.0, cpu[worst.0], gpu[worst.0]);
+            println!(
+                "  worst idx {} cpu={} gpu={}",
+                worst.0, cpu[worst.0], gpu[worst.0]
+            );
         }
         "attn" => {
             let cpu = forward::attn_stage(&w, &cfg, &args.ids, &mut sc)?;
             let gpu = gpu::attn_stage(&w, &cfg, &args.ids, &mut Scratch::new(seq, &cfg))?;
             let cos = cosine(&cpu, &gpu);
-            let mad = cpu.iter().zip(gpu.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            let mad = cpu
+                .iter()
+                .zip(gpu.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
             let scale = cpu.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-30);
-            println!("attn stage: cos {cos:.7} max_abs {mad:.3e} rel {:.2e}", mad / scale);
-            for i in 0..4 { println!("  i={i} cpu={} gpu={}", cpu[i], gpu[i]); }
+            println!(
+                "attn stage: cos {cos:.7} max_abs {mad:.3e} rel {:.2e}",
+                mad / scale
+            );
+            for i in 0..4 {
+                println!("  i={i} cpu={} gpu={}", cpu[i], gpu[i]);
+            }
         }
         other => return Err(config::Error::Msg(format!("unknown command {other}"))),
     }

@@ -8,7 +8,9 @@
 use crate::config::{Error, ModelConfig};
 use crate::forward::{LogitRows, Scratch};
 use crate::weights::{LayerKeys, Weights};
-use gpukit::cuda::{BufferPool, Context, DeviceBuffer, KernelArgs, cached_context, cached_source_kernel};
+use gpukit::cuda::{
+    BufferPool, Context, DeviceBuffer, KernelArgs, cached_context, cached_source_kernel,
+};
 
 pub const KERNELS: &str = include_str!("../kernels.cu");
 
@@ -146,12 +148,30 @@ impl GpuModel {
                 k_proj: up_f32(&ctx, &w.tensor_f32(&k.k_proj)?)?,
                 v_proj: v,
                 o_proj: up_f32(&ctx, &w.tensor_f32(&k.o_proj)?)?,
-                post_attention_layernorm: up_f32(&ctx, &w.tensor_f32(&k.post_attention_layernorm)?)?,
-                pre_feedforward_layernorm: up_f32(&ctx, &w.tensor_f32(&k.pre_feedforward_layernorm)?)?,
-                post_feedforward_layernorm: up_f32(&ctx, &w.tensor_f32(&k.post_feedforward_layernorm)?)?,
-                post_feedforward_layernorm_1: up_f32(&ctx, &w.tensor_f32(&k.post_feedforward_layernorm_1)?)?,
-                post_feedforward_layernorm_2: up_f32(&ctx, &w.tensor_f32(&k.post_feedforward_layernorm_2)?)?,
-                pre_feedforward_layernorm_2: up_f32(&ctx, &w.tensor_f32(&k.pre_feedforward_layernorm_2)?)?,
+                post_attention_layernorm: up_f32(
+                    &ctx,
+                    &w.tensor_f32(&k.post_attention_layernorm)?,
+                )?,
+                pre_feedforward_layernorm: up_f32(
+                    &ctx,
+                    &w.tensor_f32(&k.pre_feedforward_layernorm)?,
+                )?,
+                post_feedforward_layernorm: up_f32(
+                    &ctx,
+                    &w.tensor_f32(&k.post_feedforward_layernorm)?,
+                )?,
+                post_feedforward_layernorm_1: up_f32(
+                    &ctx,
+                    &w.tensor_f32(&k.post_feedforward_layernorm_1)?,
+                )?,
+                post_feedforward_layernorm_2: up_f32(
+                    &ctx,
+                    &w.tensor_f32(&k.post_feedforward_layernorm_2)?,
+                )?,
+                pre_feedforward_layernorm_2: up_f32(
+                    &ctx,
+                    &w.tensor_f32(&k.pre_feedforward_layernorm_2)?,
+                )?,
                 mlp_gate: up_f32(&ctx, &w.tensor_f32(&k.mlp_gate)?)?,
                 mlp_up: up_f32(&ctx, &w.tensor_f32(&k.mlp_up)?)?,
                 mlp_down: up_f32(&ctx, &w.tensor_f32(&k.mlp_down)?)?,
@@ -277,7 +297,13 @@ impl<'a> Runner<'a> {
             .u32(n_rows as u32)
             .u32(hidden as u32)
             .f32(eps);
-        launch(&self.m.ctx, "dgq_rms_norm", rows(n_rows, 256), 256, &mut args)
+        launch(
+            &self.m.ctx,
+            "dgq_rms_norm",
+            rows(n_rows, 256),
+            256,
+            &mut args,
+        )
     }
 
     fn add_in_place(&self, dst: &DeviceBuffer, src: &DeviceBuffer, n: usize) -> Result<(), Error> {
@@ -285,7 +311,13 @@ impl<'a> Runner<'a> {
         args.device_ptr(dst.device_ptr())
             .device_ptr(src.device_ptr())
             .u32(n as u32);
-        Ok(launch(&self.m.ctx, "dgq_vec_add", flat(n, 256), 256, &mut args)?)
+        Ok(launch(
+            &self.m.ctx,
+            "dgq_vec_add",
+            flat(n, 256),
+            256,
+            &mut args,
+        )?)
     }
 }
 
@@ -336,7 +368,9 @@ pub fn forward(
     }
     ctx.synchronize()?;
 
-    let n_layers = layers.unwrap_or(t.num_hidden_layers).min(t.num_hidden_layers);
+    let n_layers = layers
+        .unwrap_or(t.num_hidden_layers)
+        .min(t.num_hidden_layers);
     for layer in 0..n_layers {
         layer_forward(&r, &mut b, &model.layers[layer], layer, 0)?;
         std::mem::swap(&mut b.hidden_a, &mut b.hidden_b);
@@ -385,7 +419,13 @@ fn offset_view<'a>(buf: &'a DeviceBuffer, elems: usize) -> View<'a> {
     View(buf, elems as u64)
 }
 
-fn layer_forward(r: &Runner<'_>, b: &mut Bufs, lw: &GpuLayer, layer: usize, stop_at: u8) -> Result<(), Error> {
+fn layer_forward(
+    r: &Runner<'_>,
+    b: &mut Bufs,
+    lw: &GpuLayer,
+    layer: usize,
+    stop_at: u8,
+) -> Result<(), Error> {
     let t = r.t();
     let hidden = t.hidden_size;
     let seq = r.seq;
@@ -401,10 +441,31 @@ fn layer_forward(r: &Runner<'_>, b: &mut Bufs, lw: &GpuLayer, layer: usize, stop
 
     // ---- attention -------------------------------------------------------
     r.rms(&b.hidden_a, &lw.input_layernorm, &b.normed, seq)?;
-    r.gemm(seq, q_dim, hidden, b.normed.device_ptr(), lw.q_proj.device_ptr(), b.q.device_ptr())?;
-    r.gemm(seq, kv_dim, hidden, b.normed.device_ptr(), lw.k_proj.device_ptr(), b.k.device_ptr())?;
+    r.gemm(
+        seq,
+        q_dim,
+        hidden,
+        b.normed.device_ptr(),
+        lw.q_proj.device_ptr(),
+        b.q.device_ptr(),
+    )?;
+    r.gemm(
+        seq,
+        kv_dim,
+        hidden,
+        b.normed.device_ptr(),
+        lw.k_proj.device_ptr(),
+        b.k.device_ptr(),
+    )?;
     match &lw.v_proj {
-        Some(vw) => r.gemm(seq, kv_dim, hidden, b.normed.device_ptr(), vw.device_ptr(), b.v.device_ptr())?,
+        Some(vw) => r.gemm(
+            seq,
+            kv_dim,
+            hidden,
+            b.normed.device_ptr(),
+            vw.device_ptr(),
+            b.v.device_ptr(),
+        )?,
         None => copy_device(ctx, &b.v, &b.k, seq * kv_dim)?,
     }
 
@@ -417,7 +478,13 @@ fn layer_forward(r: &Runner<'_>, b: &mut Bufs, lw: &GpuLayer, layer: usize, stop
         .u32(n_heads as u32)
         .u32(head_dim as u32)
         .f32(eps);
-    launch(ctx, "dgq_rms_norm_heads", (n_heads as u32, seq as u32, 1), 128, &mut args)?;
+    launch(
+        ctx,
+        "dgq_rms_norm_heads",
+        (n_heads as u32, seq as u32, 1),
+        128,
+        &mut args,
+    )?;
     let mut args = KernelArgs::new();
     args.device_ptr(b.k.device_ptr())
         .device_ptr(lw.k_norm.device_ptr())
@@ -426,7 +493,13 @@ fn layer_forward(r: &Runner<'_>, b: &mut Bufs, lw: &GpuLayer, layer: usize, stop
         .u32(n_kv as u32)
         .u32(head_dim as u32)
         .f32(eps);
-    launch(ctx, "dgq_rms_norm_heads", (n_kv as u32, seq as u32, 1), 128, &mut args)?;
+    launch(
+        ctx,
+        "dgq_rms_norm_heads",
+        (n_kv as u32, seq as u32, 1),
+        128,
+        &mut args,
+    )?;
     let mut args = KernelArgs::new();
     args.device_ptr(b.v.device_ptr())
         .device_ptr(b.v.device_ptr()) // weight ignored when null_ptr = 0
@@ -444,7 +517,13 @@ fn layer_forward(r: &Runner<'_>, b: &mut Bufs, lw: &GpuLayer, layer: usize, stop
         .u32(n_kv as u32)
         .u32(head_dim as u32)
         .f32(eps);
-    launch(ctx, "dgq_rms_norm_heads", (n_kv as u32, seq as u32, 1), 128, &mut args)?;
+    launch(
+        ctx,
+        "dgq_rms_norm_heads",
+        (n_kv as u32, seq as u32, 1),
+        128,
+        &mut args,
+    )?;
 
     // RoPE
     let freqs = crate::forward::rope_freqs(seq, rotary_dim, head_dim, theta);
@@ -479,9 +558,22 @@ fn layer_forward(r: &Runner<'_>, b: &mut Bufs, lw: &GpuLayer, layer: usize, stop
         .u32(head_dim as u32)
         .u32(seq as u32)
         .u32(window.unwrap_or(0) as u32);
-    launch(ctx, "dgq_attention_v2", rows(seq * n_heads, 128), 128, &mut args)?;
+    launch(
+        ctx,
+        "dgq_attention_v2",
+        rows(seq * n_heads, 128),
+        128,
+        &mut args,
+    )?;
 
-    r.gemm(seq, hidden, q_dim, b.attn_out.device_ptr(), lw.o_proj.device_ptr(), b.proj_out.device_ptr())?;
+    r.gemm(
+        seq,
+        hidden,
+        q_dim,
+        b.attn_out.device_ptr(),
+        lw.o_proj.device_ptr(),
+        b.proj_out.device_ptr(),
+    )?;
     r.rms(&b.proj_out, &lw.post_attention_layernorm, &b.normed, seq)?;
     r.add_in_place(&b.normed, &b.residual, seq * hidden)?;
     if stop_at == 1 {
@@ -492,8 +584,22 @@ fn layer_forward(r: &Runner<'_>, b: &mut Bufs, lw: &GpuLayer, layer: usize, stop
     copy_device(ctx, &b.residual, &b.normed, seq * hidden)?;
     r.rms(&b.residual, &lw.pre_feedforward_layernorm, &b.normed, seq)?;
     let inter = t.intermediate_size;
-    r.gemm(seq, inter, hidden, b.normed.device_ptr(), lw.mlp_gate.device_ptr(), b.mlp_gate.device_ptr())?;
-    r.gemm(seq, inter, hidden, b.normed.device_ptr(), lw.mlp_up.device_ptr(), b.mlp_up.device_ptr())?;
+    r.gemm(
+        seq,
+        inter,
+        hidden,
+        b.normed.device_ptr(),
+        lw.mlp_gate.device_ptr(),
+        b.mlp_gate.device_ptr(),
+    )?;
+    r.gemm(
+        seq,
+        inter,
+        hidden,
+        b.normed.device_ptr(),
+        lw.mlp_up.device_ptr(),
+        b.mlp_up.device_ptr(),
+    )?;
     // out = gelu_tanh(gate) * up, written into mlp_gate
     let mut args = KernelArgs::new();
     args.device_ptr(b.mlp_gate.device_ptr())
@@ -501,9 +607,27 @@ fn layer_forward(r: &Runner<'_>, b: &mut Bufs, lw: &GpuLayer, layer: usize, stop
         .f32(1.0)
         .device_ptr(b.mlp_gate.device_ptr())
         .u32((seq * inter) as u32);
-    launch(ctx, "dgq_swiglu_weighted", flat(seq * inter, 256), 256, &mut args)?;
-    r.gemm(seq, hidden, inter, b.mlp_gate.device_ptr(), lw.mlp_down.device_ptr(), b.mlp_down.device_ptr())?;
-    r.rms(&b.mlp_down, &lw.post_feedforward_layernorm_1, &b.mlp_down, seq)?;
+    launch(
+        ctx,
+        "dgq_swiglu_weighted",
+        flat(seq * inter, 256),
+        256,
+        &mut args,
+    )?;
+    r.gemm(
+        seq,
+        hidden,
+        inter,
+        b.mlp_gate.device_ptr(),
+        lw.mlp_down.device_ptr(),
+        b.mlp_down.device_ptr(),
+    )?;
+    r.rms(
+        &b.mlp_down,
+        &lw.post_feedforward_layernorm_1,
+        &b.mlp_down,
+        seq,
+    )?;
 
     if stop_at == 2 {
         return Ok(());
@@ -519,7 +643,14 @@ fn layer_forward(r: &Runner<'_>, b: &mut Bufs, lw: &GpuLayer, layer: usize, stop
         .f32(eps)
         .f32(root);
     launch(ctx, "dgq_router_input", rows(seq, 256), 256, &mut args)?;
-    r.gemm(seq, t.num_experts, hidden, b.router_in.device_ptr(), lw.router_proj.device_ptr(), b.router_logits.device_ptr())?;
+    r.gemm(
+        seq,
+        t.num_experts,
+        hidden,
+        b.router_in.device_ptr(),
+        lw.router_proj.device_ptr(),
+        b.router_logits.device_ptr(),
+    )?;
 
     r.rms(&b.residual, &lw.pre_feedforward_layernorm_2, &b.moe_in, seq)?;
 
@@ -551,21 +682,41 @@ fn layer_forward(r: &Runner<'_>, b: &mut Bufs, lw: &GpuLayer, layer: usize, stop
             let w = wts[s * t.top_k_experts + kk];
             let x = offset_view(&b.moe_in, s * hidden);
             let gu = offset_view(&lw.experts_gate_up, e * gu_stride);
-            r.gemm(1, moe_inter * 2, hidden, x.device_ptr(), gu.device_ptr(), b.expert_gu.device_ptr())?;
+            r.gemm(
+                1,
+                moe_inter * 2,
+                hidden,
+                x.device_ptr(),
+                gu.device_ptr(),
+                b.expert_gu.device_ptr(),
+            )?;
             let mut args = KernelArgs::new();
             args.device_ptr(b.expert_gu.device_ptr())
                 .device_ptr(unsafe { b.expert_gu.device_ptr() + (moe_inter as u64) * 4 })
-                .f32(w)
+                .f32(1.0)
                 .device_ptr(b.expert_act.device_ptr())
                 .u32(moe_inter as u32);
-            launch(ctx, "dgq_swiglu_weighted", flat(moe_inter, 256), 256, &mut args)?;
+            launch(
+                ctx,
+                "dgq_swiglu_weighted",
+                flat(moe_inter, 256),
+                256,
+                &mut args,
+            )?;
             let dn = offset_view(&lw.experts_down, e * down_stride);
-            r.gemm(1, hidden, moe_inter, b.expert_act.device_ptr(), dn.device_ptr(), b.expert_out.device_ptr())?;
+            r.gemm(
+                1,
+                hidden,
+                moe_inter,
+                b.expert_act.device_ptr(),
+                dn.device_ptr(),
+                b.expert_out.device_ptr(),
+            )?;
             let dst = offset_view(&b.moe_out, s * hidden);
             let mut args = KernelArgs::new();
             args.device_ptr(dst.device_ptr())
                 .device_ptr(b.expert_out.device_ptr())
-                .f32(1.0)
+                .f32(w)
                 .u32(hidden as u32);
             launch(ctx, "dgq_accum", flat(hidden, 256), 256, &mut args)?;
         }
@@ -574,6 +725,9 @@ fn layer_forward(r: &Runner<'_>, b: &mut Bufs, lw: &GpuLayer, layer: usize, stop
     copy_device(ctx, &b.moe_out, &b.normed, seq * hidden)?;
     r.add_in_place(&b.normed, &b.moe_out, seq * hidden)?;
 
+    if stop_at == 3 {
+        return Ok(());
+    }
     // ---- output ----------------------------------------------------------
     r.rms(&b.normed, &lw.post_feedforward_layernorm, &b.hidden_b, seq)?;
     r.add_in_place(&b.hidden_b, &b.residual, seq * hidden)?;
@@ -593,18 +747,16 @@ fn copy_device(
 ) -> Result<(), Error> {
     ctx.set_current()?;
     Ok(ctx.driver().check(
-        unsafe {
-            (ctx.driver().cu_memcpy_dtod)(dst.device_ptr(), src.device_ptr(), elems * 4)
-        },
+        unsafe { (ctx.driver().cu_memcpy_dtod)(dst.device_ptr(), src.device_ptr(), elems * 4) },
         "cuMemcpyDtoD",
     )?)
 }
 
-/// [seq, n_kv, head_dim] K and V -> [seq, n_kv, 2*head_dim]: per head, its K
-/// vector followed by its V vector. dgq_attention reads
-/// \`k = kv + ((t*nkv + h)*hd)\` and \`v = k + nkv*hd\`, so the V vector for head
-/// h must start at the same offset plus nkv*hd — i.e. all V heads for the
-/// position, not the next head's K.
+/// [seq, n_kv, head_dim] K and V -> [seq, 2*n_kv*head_dim]: for each position,
+/// all K heads followed by all V heads. dgq_attention reads
+/// \`k = kv + ((t*nkv + h)*hd)\` and \`v = k + nkv*hd\`, and the kernel test
+/// (tests/kernels.rs::attention_layouts) pins this layout: the per-head
+/// alternative scores cos 0.098.
 fn interleave_kv(
     ctx: &Context,
     k: &DeviceBuffer,
@@ -615,31 +767,29 @@ fn interleave_kv(
     head_dim: usize,
 ) -> Result<(), Error> {
     ctx.set_current()?;
+    let row = n_kv * head_dim;
     for t in 0..seq {
-        for h in 0..n_kv {
-            let dst = ((t * n_kv + h) * 2) * head_dim;
-            let src = (t * n_kv + h) * head_dim;
-            ctx.driver().check(
-                unsafe {
-                    (ctx.driver().cu_memcpy_dtod)(
-                        kv.device_ptr() + (dst as u64) * 4,
-                        k.device_ptr() + (src as u64) * 4,
-                        head_dim * 4,
-                    )
-                },
-                "cuMemcpyDtoD",
-            )?;
-            ctx.driver().check(
-                unsafe {
-                    (ctx.driver().cu_memcpy_dtod)(
-                        kv.device_ptr() + ((dst + n_kv * head_dim) as u64) * 4,
-                        v.device_ptr() + (src as u64) * 4,
-                        head_dim * 4,
-                    )
-                },
-                "cuMemcpyDtoD",
-            )?;
-        }
+        let base = t * 2 * row;
+        ctx.driver().check(
+            unsafe {
+                (ctx.driver().cu_memcpy_dtod)(
+                    kv.device_ptr() + (base as u64) * 4,
+                    k.device_ptr() + (t * row) as u64 * 4,
+                    row * 4,
+                )
+            },
+            "cuMemcpyDtoD",
+        )?;
+        ctx.driver().check(
+            unsafe {
+                (ctx.driver().cu_memcpy_dtod)(
+                    kv.device_ptr() + ((base + row) as u64) * 4,
+                    v.device_ptr() + (t * row) as u64 * 4,
+                    row * 4,
+                )
+            },
+            "cuMemcpyDtoD",
+        )?;
     }
     Ok(())
 }
@@ -659,7 +809,11 @@ pub fn hidden_after(
     let seq = ids.len();
     let hidden = t.hidden_size;
     let mut b = Bufs::new(seq, cfg, &ctx)?;
-    let r = Runner { m: &model, cfg, seq };
+    let r = Runner {
+        m: &model,
+        cfg,
+        seq,
+    };
     b.ids.write_bytes(unsafe {
         std::slice::from_raw_parts(ids.as_ptr().cast::<u8>(), ids.len() * 4)
     })?;
@@ -686,7 +840,7 @@ pub fn hidden_after(
     }
     ctx.synchronize()?;
     let mut out = vec![0.0f32; seq * hidden];
-    if stop_at == 1 || stop_at == 2 {
+    if stop_at == 1 || stop_at == 2 || stop_at == 3 {
         b.normed.read_f32(&mut out)?;
     } else {
         b.hidden_a.read_f32(&mut out)?;
@@ -707,7 +861,11 @@ pub fn attn_stage(
     let seq = ids.len();
     let hidden = t.hidden_size;
     let mut b = Bufs::new(seq, cfg, &ctx)?;
-    let r = Runner { m: &model, cfg, seq };
+    let r = Runner {
+        m: &model,
+        cfg,
+        seq,
+    };
     b.ids.write_bytes(unsafe {
         std::slice::from_raw_parts(ids.as_ptr().cast::<u8>(), ids.len() * 4)
     })?;
@@ -717,8 +875,13 @@ pub fn attn_stage(
         args.device_ptr(model.embed.device_ptr())
             .device_ptr(unsafe { b.ids.device_ptr() + (s as u64) * 4 })
             .device_ptr(unsafe { b.hidden_a.device_ptr() + (s as u64) * (hidden as u64) * 4 })
-            .u32(hidden as u32).u32(1).u32(0).u32(0).f32(embed_scale)
-            .u32(t.vocab_size as u32).u32(1);
+            .u32(hidden as u32)
+            .u32(1)
+            .u32(0)
+            .u32(0)
+            .f32(embed_scale)
+            .u32(t.vocab_size as u32)
+            .u32(1);
         let k = cached_source_kernel(dgops::ops::embed_gather::CUDA, "embed_gather")?;
         ctx.launch(&k, flat(hidden, 256), (256, 1, 1), 0, &mut args)?;
     }
@@ -737,7 +900,15 @@ pub fn cublas_probe(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Resul
     let ba = up_f32(&ctx, a)?;
     let bb = up_f32(&ctx, b)?;
     let bc = DeviceBuffer::alloc(&ctx, m * n * 4)?;
-    gemm::gemm(&ctx, m, n, k, ba.device_ptr(), bb.device_ptr(), bc.device_ptr())?;
+    gemm::gemm(
+        &ctx,
+        m,
+        n,
+        k,
+        ba.device_ptr(),
+        bb.device_ptr(),
+        bc.device_ptr(),
+    )?;
     ctx.synchronize()?;
     let mut rb = vec![0.0f32; b.len()];
     bb.read_f32(&mut rb)?;

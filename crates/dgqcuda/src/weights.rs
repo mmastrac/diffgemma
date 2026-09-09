@@ -7,8 +7,8 @@
 //! oracle.
 
 use crate::config::{Error, ModelConfig};
-use dgops::dgq::{DgqPack, DgqTensorEntry};
 use dgemm::format::block::{dequant_matrix_q4, dequant_matrix_q8};
+use dgops::dgq::{DgqPack, DgqTensorEntry};
 
 pub struct Weights {
     pub pack: DgqPack,
@@ -47,7 +47,10 @@ impl Weights {
         match e.kind.as_str() {
             "raw" => {
                 if e.dtype != "BF16" {
-                    return Err(Error::Msg(format!("{name}: raw dtype {} unsupported", e.dtype)));
+                    return Err(Error::Msg(format!(
+                        "{name}: raw dtype {} unsupported",
+                        e.dtype
+                    )));
                 }
                 for (i, o) in out.iter_mut().enumerate() {
                     let bits = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
@@ -87,10 +90,7 @@ impl Weights {
                     return Err(Error::Msg(format!("{name}: nvfp4 rank {}", shape.len())));
                 }
                 let global = dgemm::format::nvfp4::dequant_matrix_nvfp4_payload(
-                    bytes,
-                    shape[0],
-                    shape[1],
-                    &mut out,
+                    bytes, shape[0], shape[1], &mut out,
                 )?;
                 let _ = global;
             }

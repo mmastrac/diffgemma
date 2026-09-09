@@ -96,12 +96,6 @@ extern "C" __global__ void dgq_attention_v2(
     if (tok >= seq) return;
     const unsigned n_groups = n_heads / n_kv_heads;
     const unsigned kvh = qh / n_groups;
-    if (blockIdx.x == 8 && threadIdx.x == 0) {
-        out[0] = (float)row;
-        out[1] = (float)qh;
-        out[2] = (float)kvh;
-        out[3] = (float)n_groups;
-    }
     const float *qv = q + (size_t)row * head_dim;
     float *ov = out + (size_t)row * head_dim;
     float m = -1.0e30f, l = 0.0f;
@@ -110,7 +104,10 @@ extern "C" __global__ void dgq_attention_v2(
     for (unsigned t = 0; t < total_kv; t++) {
         if (t > tok) break;
         if (window > 0u && t + window <= tok) continue;
-        const float *k = kv + ((size_t)t * n_kv_heads + kvh) * head_dim;
+        // K for this position/head; V sits in the same position's V block,
+        // which starts n_kv_heads*head_dim past the position's K block.
+        const size_t pos_base = (size_t)t * 2u * n_kv_heads * head_dim;
+        const float *k = kv + pos_base + (size_t)kvh * head_dim;
         float dot = 0.0f;
         for (unsigned d = 0; d < head_dim; d++) dot += qv[d] * k[d];
         const float mn = fmaxf(m, dot);
@@ -118,7 +115,7 @@ extern "C" __global__ void dgq_attention_v2(
         const float p = expf(dot - mn);
         m = mn;
         l = l * corr + p;
-        const float *v = k + (size_t)n_kv_heads * head_dim;
+        const float *v = kv + pos_base + (size_t)n_kv_heads * head_dim + (size_t)kvh * head_dim;
         for (unsigned d = 0; d < head_dim; d++) acc[d] = acc[d] * corr + p * v[d];
     }
     const float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;

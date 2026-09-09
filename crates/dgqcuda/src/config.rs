@@ -72,9 +72,7 @@ impl TextConfig {
             LayerType::FullAttention => {
                 let rope = self.rope_parameters.get("full_attention");
                 let theta = rope.map(|r| r.rope_theta as f32).unwrap_or(1_000_000.0);
-                let factor = rope
-                    .and_then(|r| r.partial_rotary_factor)
-                    .unwrap_or(0.25);
+                let factor = rope.and_then(|r| r.partial_rotary_factor).unwrap_or(0.25);
                 let rotary_dim = (self.global_head_dim as f64 * factor) as usize;
                 (
                     self.num_global_key_value_heads,
@@ -90,9 +88,11 @@ impl TextConfig {
     pub fn eos_token_ids(&self) -> Vec<u32> {
         match &self.eos_token_id {
             Some(serde_json::Value::Number(n)) => vec![n.as_u64().unwrap_or(1) as u32],
-            Some(serde_json::Value::Array(a)) => {
-                a.iter().filter_map(|v| v.as_u64()).map(|v| v as u32).collect()
-            }
+            Some(serde_json::Value::Array(a)) => a
+                .iter()
+                .filter_map(|v| v.as_u64())
+                .map(|v| v as u32)
+                .collect(),
             _ => vec![1],
         }
     }
