@@ -347,14 +347,6 @@ fn layer_forward_at(
                 row[ki] = if masked { MASK_NEG } else { dot };
             }
             softmax_row(row);
-            if qi == 3 && h == 7 && std::env::var_os("DGQ_DBG").is_some() {
-                eprintln!(
-                    "[dbg] cpu attn qi=3 h=7 row={:?} v0[0]={} v1[0]={}",
-                    &row[..4],
-                    b.v[(0 * n_kv + kv_h) * head_dim],
-                    b.v[(1 * n_kv + kv_h) * head_dim]
-                );
-            }
             let o = &mut b.attn_out[q_off..q_off + head_dim];
             o.fill(0.0);
             for ki in 0..seq {
@@ -472,10 +464,6 @@ fn layer_forward_at(
     for s in 0..seq {
         let logits = &b.router_logits[s * t.num_experts..(s + 1) * t.num_experts];
         let (idx, weights) = top_k_route(logits, t.top_k_experts, &lw.router_per_expert_scale);
-        if s == 0 && std::env::var_os("DGQ_DBG").is_some() {
-            eprintln!("[dbg] cpu route idx={:?} w={:?}", idx, weights);
-            eprintln!("[dbg] cpu router_logits[0..4]={:?}", &logits[..4]);
-        }
         let x = &b.moe_input[s * hidden..(s + 1) * hidden];
         let o = &mut b.moe_out[s * hidden..(s + 1) * hidden];
         for (e, w) in idx.iter().zip(weights.iter()) {
@@ -487,13 +475,6 @@ fn layer_forward_at(
             }
             let dn = &lw.experts_down[e * down_stride..(e + 1) * down_stride];
             linear(&mut b.expert_out, &b.expert_act, dn, 1, moe_inter, hidden);
-            if s == 0 && e == &idx[0] && std::env::var_os("DGQ_DBG").is_some() {
-                eprintln!(
-                    "[dbg] cpu expert_out[0..4]={:?} act[0..2]={:?}",
-                    &b.expert_out[..4],
-                    &b.expert_act[..2]
-                );
-            }
             for i in 0..hidden {
                 // Engine order: the expert weight is applied after the down
                 // projection (moe_scatter_weighted).
