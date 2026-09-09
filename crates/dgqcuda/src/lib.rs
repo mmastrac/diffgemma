@@ -4,6 +4,7 @@
 pub const KERNELS: &str = include_str!("kernels.cu");
 
 pub mod config;
+pub mod denoise;
 pub mod forward;
 #[cfg(feature = "cuda")]
 pub mod gpu;

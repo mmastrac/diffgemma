@@ -5,6 +5,7 @@
 //!   parity    CPU oracle vs CUDA forward pass on the same prompt
 
 mod config;
+mod denoise;
 mod forward;
 mod gpu;
 mod weights;
@@ -26,6 +27,20 @@ struct Args {
     layers: Option<usize>,
     at: u8,
     seed: u64,
+    /// `--gpu`: run the device path (default is the CPU oracle).
+    gpu: bool,
+    /// `--rows all`: compute logits for every canvas position.
+    rows_all: bool,
+    /// Diagnostic stop point for the device path (see `forward_stop`).
+    stop_after: u8,
+    /// `--row N`: single-row logits at position N.
+    only_row: Option<usize>,
+    /// `--canvas N`: denoise canvas width (default 256).
+    canvas: usize,
+    /// `--steps N`: denoise steps (default 48).
+    steps: Option<usize>,
+    /// `--parity`: also run the CPU oracle for each step and compare logits.
+    parity: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -35,6 +50,13 @@ fn parse_args() -> Result<Args, String> {
     let mut layers = None;
     let mut at = 0u8;
     let mut seed = 7u64;
+    let mut gpu = false;
+    let mut rows_all = false;
+    let mut only_row: Option<usize> = None;
+    let mut canvas = 256usize;
+    let mut steps: Option<usize> = None;
+    let mut parity = false;
+    let mut stop_after = 0u8;
     let mut it = std::env::args().skip(1);
     if let Some(first) = it.next() {
         if !first.starts_with('-') {
@@ -65,6 +87,32 @@ fn parse_args() -> Result<Args, String> {
                 let s = it.next().ok_or("--seed needs a value")?;
                 seed = s.parse::<u64>().map_err(|e| e.to_string())?;
             }
+            "--canvas" => {
+                let s = it.next().ok_or("--canvas needs a value")?;
+                canvas = s.parse::<usize>().map_err(|e| e.to_string())?;
+            }
+            "--steps" => {
+                let s = it.next().ok_or("--steps needs a value")?;
+                steps = Some(s.parse::<usize>().map_err(|e| e.to_string())?);
+            }
+            "--parity" => parity = true,
+            "--gpu" => gpu = true,
+            "--stop-after" => {
+                let s = it.next().ok_or("--stop-after needs a value")?;
+                stop_after = s.parse::<u8>().map_err(|e| e.to_string())?;
+            }
+            "--rows" => {
+                let s = it.next().ok_or("--rows needs a value")?;
+                rows_all = match s.as_str() {
+                    "all" => true,
+                    "last" => false,
+                    other => return Err(format!("--rows takes all|last, got {other}")),
+                };
+            }
+            "--row" => {
+                let s = it.next().ok_or("--row needs a value")?;
+                only_row = Some(s.parse::<usize>().map_err(|e| e.to_string())?);
+            }
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -78,6 +126,13 @@ fn parse_args() -> Result<Args, String> {
         layers,
         at,
         seed,
+        gpu,
+        rows_all,
+        stop_after,
+        only_row,
+        canvas,
+        steps,
+        parity,
     })
 }
 
@@ -149,21 +204,37 @@ fn run(args: &Args) -> Result<(), config::Error> {
     match args.cmd.as_str() {
         "forward" => {
             let start = std::time::Instant::now();
-            let out = forward::forward(
-                &w,
-                &cfg,
-                &args.ids,
-                args.layers,
-                forward::LogitRows::Last,
-                &mut sc,
-            )?;
+            let rows = match args.only_row {
+                Some(r) => forward::LogitRows::Only(r),
+                None if args.rows_all => forward::LogitRows::All,
+                None => forward::LogitRows::Last,
+            };
+            let out = if args.gpu {
+                gpu::forward_stop(
+                    &w,
+                    &cfg,
+                    &args.ids,
+                    args.layers,
+                    rows,
+                    &mut sc,
+                    args.stop_after,
+                )?
+            } else {
+                forward::forward(&w, &cfg, &args.ids, args.layers, rows, &mut sc)?
+            };
             let elapsed = start.elapsed();
-            let last = &out.logits[(seq - 1) * t.vocab_size..seq * t.vocab_size];
+            let rows_done = out.logits.len() / t.vocab_size;
+            let last_row = args
+                .only_row
+                .unwrap_or(if args.rows_all { seq - 1 } else { seq - 1 });
+            let last = &out.logits[last_row.min(rows_done - 1) * t.vocab_size
+                ..(last_row.min(rows_done - 1) + 1) * t.vocab_size];
             println!(
-                "forward: {} tokens x {} layers in {:.1}s",
+                "forward: {} tokens x {} layers in {:.1}s ({} logit rows)",
                 seq,
                 args.layers.unwrap_or(t.num_hidden_layers),
-                elapsed.as_secs_f32()
+                elapsed.as_secs_f32(),
+                rows_done
             );
             println!(
                 "  logits: mean {:.4} std {:.4} entropy {:.4} nats",
@@ -177,6 +248,17 @@ fn run(args: &Args) -> Result<(), config::Error> {
             println!("  next-token top-5:");
             for (id, v) in top_k(last, 5) {
                 println!("    {id:>7}  {v:+.4}");
+            }
+            if args.rows_all {
+                println!("  per-row argmax / entropy (row 0, 1, last):");
+                for r in [0usize, 1, seq - 1] {
+                    let row = &out.logits[r * t.vocab_size..(r + 1) * t.vocab_size];
+                    println!(
+                        "    row {r:>3}: argmax {:>7} entropy {:.4}",
+                        top_k(row, 1)[0].0,
+                        entropy(row)
+                    );
+                }
             }
         }
         "parity" => {
@@ -297,6 +379,119 @@ fn run(args: &Args) -> Result<(), config::Error> {
             for i in 0..4 {
                 println!("  i={i} cpu={} gpu={}", cpu[i], gpu[i]);
             }
+        }
+        "denoise" => {
+            let canvas = args.canvas;
+            let prompt = &args.ids;
+            let mut dcfg = denoise::SamplerConfig::default();
+            if let Some(n) = args.steps {
+                dcfg.max_denoising_steps = n;
+            }
+            let mut st = denoise::DenoiseState::new(dcfg, args.seed, canvas, t.vocab_size);
+            let mut sess = gpu::session::Session::open(&w, &cfg, prompt.len(), canvas)?;
+            if let Some(n) = args.layers {
+                sess.set_layers(n);
+            }
+            let load = std::time::Instant::now();
+            let ph = sess.prompt_hidden(prompt)?;
+            eprintln!("prompt prefill in {:.1}s", load.elapsed().as_secs_f32());
+            let mut total = std::time::Duration::ZERO;
+            let mut prev: Option<Vec<f32>> = None;
+            for _ in 0..st.cfg.max_denoising_steps {
+                let start = std::time::Instant::now();
+                let logits = sess.step(prompt, &ph, &st.ids)?;
+                sess.set_prev_logits(&logits)?;
+                if args.parity {
+                    // The same step on the CPU oracle: prompt + canvas, the
+                    // SC MLP over the canvas rows, all layers, LM head. Its
+                    // logits are indexed by sequence position, so the canvas
+                    // rows start at `prompt.len()`.
+                    let mut ids = prompt.clone();
+                    ids.extend_from_slice(&st.ids);
+                    let mut csc = Scratch::new(ids.len(), &cfg);
+                    let cpu = forward::forward_sc(
+                        &w,
+                        &cfg,
+                        &ids,
+                        args.layers,
+                        forward::LogitRows::All,
+                        &mut csc,
+                        prompt.len(),
+                        canvas,
+                        prev.as_deref(),
+                        Some(&ph),
+                    )?;
+                    // The device step returns pre-softcap logits (the sampler
+                    // needs them raw); the CPU oracle leaves them raw too, so
+                    // compare both under the same final softcap.
+                    let cap = t.final_logit_softcapping as f32;
+                    let softcap = |v: f32| if cap > 0.0 { (v / cap).tanh() * cap } else { v };
+                    let cpu_raw = &cpu.logits[prompt.len() * t.vocab_size..];
+                    let gpu_capped: Vec<f32> = logits.iter().copied().map(softcap).collect();
+                    let cpu_capped: Vec<f32> = cpu_raw.iter().copied().map(softcap).collect();
+                    let gpu_row = gpu_capped.as_slice();
+                    let cpu_row = cpu_capped.as_slice();
+                    let cos = cosine(gpu_row, cpu_row);
+                    let mad = gpu_row
+                        .iter()
+                        .zip(cpu_row.iter())
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0f32, f32::max);
+                    let (gi, _) = top_k(gpu_row, 1)[0];
+                    let (ci, _) = top_k(cpu_row, 1)[0];
+                    for row in 0..canvas {
+                        let g = &gpu_row[row * t.vocab_size..(row + 1) * t.vocab_size];
+                        let c = &cpu_row[row * t.vocab_size..(row + 1) * t.vocab_size];
+                        let (gr, _) = top_k(g, 1)[0];
+                        let (cr, _) = top_k(c, 1)[0];
+                        println!(
+                            "    row {row}: cos {:.7} argmax gpu {gr} cpu {cr}",
+                            cosine(g, c)
+                        );
+                    }
+                    println!(
+                        "  parity vs CPU oracle: cos {cos:.7} max_abs {mad:.3e} argmax gpu {gi} cpu {ci} {}",
+                        if gi == ci { "match" } else { "MISMATCH" }
+                    );
+                }
+                prev = Some(logits.clone());
+                let (stats, stop) = st.step(&logits, t.vocab_size);
+                let dt = start.elapsed();
+                total += dt;
+                println!(
+                    "step {:>2} t={:.3} accept {:>3} mean_H {:.4} min_H {:.4} max_H {:.4} changed {:>3}  {:.1}s",
+                    stats.step,
+                    stats.temperature,
+                    stats.accept_count,
+                    stats.mean_entropy,
+                    stats.min_entropy,
+                    stats.max_entropy,
+                    stats.changed,
+                    dt.as_secs_f32()
+                );
+                if let Some(reason) = stop {
+                    println!(
+                        "stop: {reason:?} after {} steps ({:.1}s total)",
+                        stats.step,
+                        total.as_secs_f32()
+                    );
+                    break;
+                }
+            }
+            println!("canvas ({} ids):", st.ids.len());
+            let ids: Vec<String> = st.ids.iter().map(|v| v.to_string()).collect();
+            println!("{}", ids.join(","));
+            let active = st
+                .ids
+                .iter()
+                .filter(|&&v| v != denoise::PAD_TOKEN_ID)
+                .count();
+            println!("active tokens: {active}/{}", st.ids.len());
+        }
+        "gemm-probe" => {
+            let m = args.layers.unwrap_or(1);
+            let v = gpu::gemm_probe(m, t.hidden_size, t.vocab_size)?;
+            println!("gemm probe ok: c[0] = {v}");
         }
         other => return Err(config::Error::Msg(format!("unknown command {other}"))),
     }

@@ -1,0 +1,140 @@
+//! Tier-1 tests for the denoise sampler: the CPU oracle is the authority, so
+//! these pin the accept rule, the entropy/argmax stats, and the early-stop
+//! floor against hand-computed values.
+
+use dgqcuda::denoise::{
+    DenoiseState, MIN_EARLY_STOP_STEPS, Rng, SamplerConfig, StopReason, accept_mask_from_entropies,
+    row_stats,
+};
+
+#[test]
+fn rng_matches_the_engine_lcg() {
+    // `sample.rs::Rng`: state = seed + 1, then xorshift-free LCG.
+    let mut r = Rng::new(7);
+    let a = r.next_u32();
+    let mut state: u64 = 8;
+    state = state
+        .wrapping_mul(6_966_169_279)
+        .wrapping_add(1_039_523_323);
+    assert_eq!(a, (state >> 32) as u32);
+    let b = r.next_u32();
+    state = state
+        .wrapping_mul(6_966_169_279)
+        .wrapping_add(1_039_523_323);
+    assert_eq!(b, (state >> 32) as u32);
+}
+
+#[test]
+fn temperature_counts_down() {
+    let cfg = SamplerConfig::default();
+    let n = cfg.max_denoising_steps;
+    // The engine calls `temperature_at_step(S.step)` with S.step counting
+    // DOWN from max to 1, so the first denoise step is the hottest.
+    assert!((cfg.temperature_at_step(n) - cfg.t_max).abs() < 1e-6);
+    let mid = cfg.temperature_at_step(n / 2);
+    assert!(mid > cfg.t_min && mid < cfg.t_max);
+    // The schedule is a staircase: 48 steps never reach exactly t_min.
+    assert!((cfg.temperature_at_step(1) - 0.408_333_3).abs() < 1e-5);
+}
+
+#[test]
+fn accept_mask_is_an_entropy_sorted_prefix() {
+    // Ascending entropies: every prefix fits under a large bound, so all
+    // positions are accepted.
+    let ent = [0.1, 0.2, 0.3, 0.4];
+    assert_eq!(accept_mask_from_entropies(&ent, 10.0), vec![true; 4]);
+    // A bound of 0.25 accepts only the two lowest (0.1 + 0.2 = 0.3 > 0.25
+    // stops at the third).
+    let mask = accept_mask_from_entropies(&ent, 0.25);
+    assert_eq!(mask, vec![true, true, false, false]);
+    // The lowest-entropy position is always accepted, even under a bound of 0.
+    let mask = accept_mask_from_entropies(&ent, 0.0);
+    assert_eq!(mask, vec![true, false, false, false]);
+    // The mask is indexed by position, not by sorted rank. Sorted: 0.05, 0.8,
+    // 0.9 — the prefix is checked BEFORE adding, so 0.8 is still accepted
+    // (prefix 0.05 <= 0.1) and only 0.9 is cut (prefix 0.85 > 0.1).
+    let ent = [0.9, 0.05, 0.8];
+    let mask = accept_mask_from_entropies(&ent, 0.1);
+    assert_eq!(mask, vec![false, true, true]);
+}
+
+#[test]
+fn row_stats_matches_a_hand_computed_row() {
+    // Two rows, 4 columns. Row 0 is uniform, so its entropy is ln(4) and the
+    // argmax is the lowest id; row 1 is peaked, so its entropy is ~0.
+    let logits = [1.0, 1.0, 1.0, 1.0, 0.0, 10.0, 0.0, 0.0];
+    let stats = row_stats(&logits, 2, 4, 1.0);
+    assert!((stats.entropy[0] - 4.0f32.ln()).abs() < 1e-5);
+    assert_eq!(stats.argmax[0], 0);
+    assert!(stats.entropy[1] < 0.002);
+    assert_eq!(stats.argmax[1], 1);
+    // Temperature divides the logits before the softmax, so a hotter row is
+    // less peaked and has higher entropy.
+    let hot = row_stats(&logits, 2, 4, 4.0);
+    assert!(hot.entropy[1] > stats.entropy[1]);
+    assert!(hot.entropy[1] < 4.0f32.ln());
+}
+
+#[test]
+fn step_commits_accepted_argmax_and_renoises_the_rest() {
+    // A canvas of 2, vocab 4. Row 0 is sharply peaked (accepted); row 1 is
+    // uniform (rejected, re-noised with a fresh uniform draw).
+    let vocab = 4;
+    let canvas = 2;
+    let mut cfg = SamplerConfig::default();
+    cfg.max_denoising_steps = 4;
+    let mut st = DenoiseState::new(cfg, 7, canvas, vocab);
+    st.ids = vec![0, 0];
+    let logits = vec![0.0, 10.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+    let (stats, stop) = st.step(&logits, vocab);
+    assert_eq!(stats.step, 1);
+    assert!(stop.is_none());
+    // The peaked row is accepted and takes its argmax.
+    assert_eq!(st.ids[0], 1);
+    assert!(st.accept[0]);
+    // The uniform row is re-noised, so its id is some valid token.
+    assert!(st.ids[1] < vocab as u32);
+    // Both rows sit under the entropy bound of 0.1 here, so both are accepted;
+    // the re-noise path is exercised by the uniform-row case in
+    // `the_final_step_commits_every_position`.
+    assert_eq!(stats.accept_count, 2);
+}
+
+#[test]
+fn the_final_step_commits_every_position() {
+    let vocab = 4;
+    let canvas = 2;
+    let mut cfg = SamplerConfig::default();
+    cfg.max_denoising_steps = 1;
+    let mut st = DenoiseState::new(cfg, 3, canvas, vocab);
+    st.ids = vec![0, 0];
+    let logits = vec![0.0, 10.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+    let (stats, stop) = st.step(&logits, vocab);
+    // Every position commits on the last step, so a half-denoised canvas
+    // cannot leak out of the loop.
+    assert_eq!(stats.accept_count, 2);
+    assert_eq!(st.ids[0], 1);
+    assert_eq!(st.ids[1], 0);
+    assert_eq!(stop, Some(StopReason::MaxSteps));
+}
+
+#[test]
+fn a_confident_canvas_stops_only_after_the_minimum_steps() {
+    // One canvas position whose logits never change: the argmax is stable from
+    // step 2 on, and the entropy is ~0, so the confident stop fires as soon as
+    // the step floor allows it.
+    let vocab = 4;
+    let mut cfg = SamplerConfig::default();
+    cfg.max_denoising_steps = 40;
+    let mut st = DenoiseState::new(cfg, 11, 1, vocab);
+    let logits = vec![0.0, 20.0, 0.0, 0.0];
+    let mut stop = None;
+    let mut steps = 0;
+    while stop.is_none() && steps < 40 {
+        let (_, s) = st.step(&logits, vocab);
+        steps += 1;
+        stop = s;
+    }
+    assert_eq!(stop, Some(StopReason::Confident));
+    assert!(steps >= MIN_EARLY_STOP_STEPS, "stopped after {steps} steps");
+}

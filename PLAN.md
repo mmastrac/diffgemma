@@ -257,6 +257,14 @@ clears 0.641 by a lot.
   kernel onto the portable body so the engine and the CUDA slice share one
   oracle, port the rest as `cuda.cu` beside each `.metal` (the quantized GEMM
   family next), then the step kernel. A CUDA box runs the tier-1 parity suite
+  `crates/dgqcuda` goes further: it runs the whole 30-layer forward and the
+  denoise loop on CUDA against a real pack, with a CPU oracle per stage and a
+  per-step parity mode. Two limits are open. (1) Every weight is held as f32,
+  so the resident model is ~52 GiB — the box must be free of other model
+  processes, and a quantized (q4/bf16) GEMM body is the fix. (2) The MoE
+  expert matmuls are per-token per-expert GEMMs (2 x 8 x canvas launches per
+  layer, ~2.2 s of a 6.7 s step at canvas 4); a grouped/bucketed expert GEMM
+  (the engine's block-sparse body) is the next perf tranche.
   without the 19 GiB pack; the golden slice additionally needs the pack.
 - **Model-gated tests treat a manifest-only pack as present.**
   `test_util::dgq_model_dir()` returns `Some` when `model.dgq.json` exists, so an

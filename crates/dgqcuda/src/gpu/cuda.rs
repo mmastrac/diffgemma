@@ -39,6 +39,56 @@ fn flat(n: usize, block: u32) -> (u32, u32, u32) {
     (n.div_ceil(block as usize) as u32, 1, 1)
 }
 
+/// Per-stage wall-clock attribution, enabled by `DGQCUDA_TIME=1`. Each mark
+/// synchronizes, so this is a diagnostic mode, never a timing baseline.
+pub(crate) struct Stage {
+    on: bool,
+    last: std::time::Instant,
+    rows: Vec<(&'static str, f32)>,
+}
+
+impl Stage {
+    pub(crate) fn new() -> Self {
+        Self {
+            on: std::env::var("DGQCUDA_TIME").is_ok_and(|v| v != "0"),
+            last: std::time::Instant::now(),
+            rows: Vec::new(),
+        }
+    }
+
+    fn mark(&mut self, ctx: &Context, name: &'static str) {
+        if !self.on {
+            return;
+        }
+        let _ = ctx.synchronize();
+        let now = std::time::Instant::now();
+        self.rows.push((name, (now - self.last).as_secs_f32()));
+        self.last = now;
+    }
+
+    pub(crate) fn report(&self) {
+        if !self.on {
+            return;
+        }
+        let total: f32 = self.rows.iter().map(|r| r.1).sum();
+        let mut agg: Vec<(&str, f32)> = Vec::new();
+        for (n, s) in &self.rows {
+            match agg.iter_mut().find(|a| a.0 == *n) {
+                Some(a) => a.1 += s,
+                None => agg.push((n, *s)),
+            }
+        }
+        agg.sort_by(|a, b| b.1.total_cmp(&a.1));
+        eprintln!("  [time] total {total:.1}s");
+        for (n, s) in agg {
+            eprintln!(
+                "  [time]   {n:<12} {s:7.1}s  {:4.1}%",
+                100.0 * s / total.max(1e-6)
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // cuBLAS: row-major C = A @ B (no transposes) via the column-major identity
 // C^T = B^T A^T, i.e. sgemm('N','N', n, m, k, B, n, A, k, C, n).
@@ -66,6 +116,13 @@ mod gemm {
         let p = dgemm::abi_params(&problem);
         let mut args = KernelArgs::new();
         args.device_ptr(a).device_ptr(b).device_ptr(c).bytes(&p);
+        if std::env::var("DGQCUDA_GEMM_LOG").is_ok() {
+            eprintln!(
+                "  [gemm] m={m} n={n} k={k} a=0x{a:x} b=0x{b:x} c=0x{c:x} grid=({},{})",
+                div_up(n, dgemm::BN),
+                div_up(m, dgemm::BM)
+            );
+        }
         launch_grid(
             ctx,
             &kernel,
@@ -80,37 +137,42 @@ mod gemm {
 
 // ---------------------------------------------------------------------------
 
-struct GpuLayer {
-    input_layernorm: DeviceBuffer,
-    q_norm: DeviceBuffer,
-    k_norm: DeviceBuffer,
-    q_proj: DeviceBuffer,
-    k_proj: DeviceBuffer,
-    v_proj: Option<DeviceBuffer>,
-    o_proj: DeviceBuffer,
-    post_attention_layernorm: DeviceBuffer,
-    pre_feedforward_layernorm: DeviceBuffer,
-    post_feedforward_layernorm: DeviceBuffer,
-    post_feedforward_layernorm_1: DeviceBuffer,
-    post_feedforward_layernorm_2: DeviceBuffer,
-    pre_feedforward_layernorm_2: DeviceBuffer,
-    mlp_gate: DeviceBuffer,
-    mlp_up: DeviceBuffer,
-    mlp_down: DeviceBuffer,
-    router_proj: DeviceBuffer,
-    router_scale: DeviceBuffer,
-    router_per_expert_scale: DeviceBuffer,
-    experts_gate_up: DeviceBuffer,
-    experts_down: DeviceBuffer,
-    layer_scalar: f32,
+pub(crate) struct GpuLayer {
+    pub(crate) input_layernorm: DeviceBuffer,
+    pub(crate) q_norm: DeviceBuffer,
+    pub(crate) k_norm: DeviceBuffer,
+    pub(crate) q_proj: DeviceBuffer,
+    pub(crate) k_proj: DeviceBuffer,
+    pub(crate) v_proj: Option<DeviceBuffer>,
+    pub(crate) o_proj: DeviceBuffer,
+    pub(crate) post_attention_layernorm: DeviceBuffer,
+    pub(crate) pre_feedforward_layernorm: DeviceBuffer,
+    pub(crate) post_feedforward_layernorm: DeviceBuffer,
+    pub(crate) post_feedforward_layernorm_1: DeviceBuffer,
+    pub(crate) post_feedforward_layernorm_2: DeviceBuffer,
+    pub(crate) pre_feedforward_layernorm_2: DeviceBuffer,
+    pub(crate) mlp_gate: DeviceBuffer,
+    pub(crate) mlp_up: DeviceBuffer,
+    pub(crate) mlp_down: DeviceBuffer,
+    pub(crate) router_proj: DeviceBuffer,
+    pub(crate) router_scale: DeviceBuffer,
+    pub(crate) router_per_expert_scale: DeviceBuffer,
+    pub(crate) experts_gate_up: DeviceBuffer,
+    pub(crate) experts_down: DeviceBuffer,
+    pub(crate) layer_scalar: f32,
 }
 
-struct GpuModel {
-    ctx: Context,
+pub(crate) struct GpuModel {
+    pub(crate) ctx: Context,
 
-    layers: Vec<GpuLayer>,
-    embed: DeviceBuffer,
-    final_norm: DeviceBuffer,
+    pub(crate) layers: Vec<GpuLayer>,
+    /// bf16 embed table, decoded by the gather kernel.
+    pub(crate) embed: DeviceBuffer,
+    /// The same table widened to f32 for the tied LM-head GEMM (the tiled f32
+    /// body has no bf16 input). 2.75 GiB; the f32 GEMM would otherwise read
+    /// past the 1.375 GiB bf16 allocation.
+    pub(crate) lm_head: DeviceBuffer,
+    pub(crate) final_norm: DeviceBuffer,
 }
 
 /// Upload raw bytes (the bf16 embed table the gather kernel decodes).
@@ -120,20 +182,42 @@ fn up_bf16(ctx: &Context, data: Vec<u8>) -> Result<DeviceBuffer, Error> {
     Ok(b)
 }
 
-fn up_f32(ctx: &Context, data: &[f32]) -> Result<DeviceBuffer, Error> {
+/// bf16 bytes -> f32 (bit pattern shifted, exact).
+fn bf16_to_f32(bytes: &[u8]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for c in bytes.chunks_exact(2) {
+        let bits = u16::from_le_bytes([c[0], c[1]]);
+        out.push(f32::from_bits((bits as u32) << 16));
+    }
+    out
+}
+
+pub(crate) fn up_f32(ctx: &Context, data: &[f32]) -> Result<DeviceBuffer, Error> {
     let b = DeviceBuffer::alloc(ctx, data.len().max(1) * 4)?;
     b.write_f32(data)?;
     Ok(b)
 }
 
 impl GpuModel {
-    fn load(w: &Weights, cfg: &ModelConfig) -> Result<Self, Error> {
+    /// Load `n_layers` decoder layers (or all of them when `None`). Loading is
+    /// the dominant cost — every tensor is dequantized to f32 and uploaded —
+    /// so a bisect run only pays for the layers it uses.
+    pub(crate) fn load(
+        w: &Weights,
+        cfg: &ModelConfig,
+        n_layers: Option<usize>,
+    ) -> Result<Self, Error> {
         let ctx = cached_context()?.clone();
+        let n = n_layers
+            .unwrap_or(cfg.text_config.num_hidden_layers)
+            .min(cfg.text_config.num_hidden_layers);
 
-        let embed = up_bf16(&ctx, w.raw_bf16_bytes("model.decoder.embed_tokens.weight")?)?;
+        let embed_bytes = w.raw_bf16_bytes("model.decoder.embed_tokens.weight")?;
+        let lm_head = up_f32(&ctx, &bf16_to_f32(&embed_bytes))?;
+        let embed = up_bf16(&ctx, embed_bytes)?;
         let final_norm = up_f32(&ctx, &w.tensor_f32("model.decoder.norm.weight")?)?;
-        let mut layers = Vec::with_capacity(cfg.text_config.num_hidden_layers);
-        for layer in 0..cfg.text_config.num_hidden_layers {
+        let mut layers = Vec::with_capacity(n);
+        for layer in 0..n {
             let k = LayerKeys::new(layer);
             let v = if w.has(&k.v_proj) {
                 Some(up_f32(&ctx, &w.tensor_f32(&k.v_proj)?)?)
@@ -187,42 +271,45 @@ impl GpuModel {
             ctx,
             layers,
             embed,
+            lm_head,
             final_norm,
         })
     }
 }
 
-struct Bufs {
-    ids: DeviceBuffer,
-    hidden_a: DeviceBuffer,
-    hidden_b: DeviceBuffer,
-    normed: DeviceBuffer,
-    residual: DeviceBuffer,
-    q: DeviceBuffer,
-    k: DeviceBuffer,
-    v: DeviceBuffer,
-    kv: DeviceBuffer,
-    attn_out: DeviceBuffer,
-    proj_out: DeviceBuffer,
-    mlp_gate: DeviceBuffer,
-    mlp_up: DeviceBuffer,
-    mlp_down: DeviceBuffer,
-    moe_in: DeviceBuffer,
-    moe_out: DeviceBuffer,
-    norm_scratch: DeviceBuffer,
-    router_in: DeviceBuffer,
-    router_logits: DeviceBuffer,
-    top_idx: DeviceBuffer,
-    top_w: DeviceBuffer,
-    freqs: DeviceBuffer,
-    expert_gu: DeviceBuffer,
-    expert_act: DeviceBuffer,
-    expert_out: DeviceBuffer,
-    logits: DeviceBuffer,
+pub(crate) struct Bufs {
+    pub(crate) ids: DeviceBuffer,
+    pub(crate) hidden_a: DeviceBuffer,
+    pub(crate) hidden_b: DeviceBuffer,
+    pub(crate) normed: DeviceBuffer,
+    pub(crate) residual: DeviceBuffer,
+    pub(crate) q: DeviceBuffer,
+    pub(crate) k: DeviceBuffer,
+    pub(crate) v: DeviceBuffer,
+    pub(crate) kv: DeviceBuffer,
+    pub(crate) attn_out: DeviceBuffer,
+    pub(crate) proj_out: DeviceBuffer,
+    pub(crate) mlp_gate: DeviceBuffer,
+    pub(crate) mlp_up: DeviceBuffer,
+    pub(crate) mlp_down: DeviceBuffer,
+    pub(crate) moe_in: DeviceBuffer,
+    pub(crate) moe_out: DeviceBuffer,
+    pub(crate) norm_scratch: DeviceBuffer,
+    pub(crate) router_in: DeviceBuffer,
+    pub(crate) router_logits: DeviceBuffer,
+    pub(crate) top_idx: DeviceBuffer,
+    pub(crate) top_w: DeviceBuffer,
+    pub(crate) freqs: DeviceBuffer,
+    pub(crate) expert_gu: DeviceBuffer,
+    pub(crate) expert_act: DeviceBuffer,
+    pub(crate) expert_out: DeviceBuffer,
+    /// [seq, vocab] — the full canvas's logits on the `LogitRows::All` path,
+    /// one row on the others.
+    pub(crate) logits: DeviceBuffer,
 }
 
 impl Bufs {
-    fn new(seq: usize, cfg: &ModelConfig, ctx: &Context) -> Result<Self, Error> {
+    pub(crate) fn new(seq: usize, cfg: &ModelConfig, ctx: &Context) -> Result<Self, Error> {
         let t = &cfg.text_config;
         let hidden = t.hidden_size;
         let max_q = t.num_attention_heads * t.global_head_dim;
@@ -254,15 +341,21 @@ impl Bufs {
             expert_gu: a(t.moe_intermediate_size * 2)?,
             expert_act: a(t.moe_intermediate_size)?,
             expert_out: a(hidden)?,
-            logits: a(t.vocab_size)?,
+            logits: a(seq * t.vocab_size)?,
         })
     }
 }
 
-struct Runner<'a> {
-    m: &'a GpuModel,
-    cfg: &'a ModelConfig,
-    seq: usize,
+pub(crate) struct Runner<'a> {
+    pub(crate) m: &'a GpuModel,
+    pub(crate) cfg: &'a ModelConfig,
+    pub(crate) seq: usize,
+    /// Absolute position of row 0 (0 for a from-scratch forward pass; the
+    /// prompt length when a denoise pass runs the canvas after the prompt).
+    pub(crate) pos0: usize,
+    /// Leading rows that attend causally; `seq` is a plain causal pass.
+    pub(crate) causal_split: usize,
+    pub(crate) stage: std::cell::RefCell<Stage>,
 }
 
 impl<'a> Runner<'a> {
@@ -271,7 +364,7 @@ impl<'a> Runner<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn gemm(
+    pub(crate) fn gemm(
         &self,
         m: usize,
         n: usize,
@@ -283,7 +376,7 @@ impl<'a> Runner<'a> {
         gemm::gemm(&self.m.ctx, m, n, k, a, b, c)
     }
 
-    fn rms(
+    pub(crate) fn rms(
         &self,
         x: &DeviceBuffer,
         w: &DeviceBuffer,
@@ -306,6 +399,10 @@ impl<'a> Runner<'a> {
             256,
             &mut args,
         )
+    }
+
+    pub(crate) fn mark(&self, name: &'static str) {
+        self.stage.borrow_mut().mark(&self.m.ctx, name);
     }
 
     fn add_in_place(&self, dst: &DeviceBuffer, src: &DeviceBuffer, n: usize) -> Result<(), Error> {
@@ -333,42 +430,102 @@ pub fn forward(
     rows: LogitRows,
     sc: &mut Scratch,
 ) -> Result<crate::forward::ForwardOutput, Error> {
+    forward_stop(w, cfg, ids, layers, rows, sc, 0)
+}
+
+/// `forward` with a diagnostic stop point (1 embed, 2 final norm, 3 lm_head
+/// GEMM) for bisecting a device fault.
+pub fn forward_stop(
+    w: &Weights,
+    cfg: &ModelConfig,
+    ids: &[u32],
+    layers: Option<usize>,
+    rows: LogitRows,
+    sc: &mut Scratch,
+    stop_after: u8,
+) -> Result<crate::forward::ForwardOutput, Error> {
+    forward_full(w, cfg, ids, layers, rows, sc, stop_after, None, 0, 0, true)
+}
+
+/// The device forward pass with every knob the denoise loop needs: an optional
+/// pre-computed hidden state to start from (the prompt's, so a denoise step only
+/// runs the layers above it), the absolute position of row 0, the number of
+/// leading rows that attend causally, and whether to apply the final logit
+/// softcap.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_full(
+    w: &Weights,
+    cfg: &ModelConfig,
+    ids: &[u32],
+    layers: Option<usize>,
+    rows: LogitRows,
+    sc: &mut Scratch,
+    stop_after: u8,
+    init_hidden: Option<&[f32]>,
+    pos0: usize,
+    causal_split: usize,
+    softcap: bool,
+) -> Result<crate::forward::ForwardOutput, Error> {
     let _ = sc;
-    let model = GpuModel::load(w, cfg)?;
+    let mut stage = Stage::new();
+    let model = GpuModel::load(w, cfg, layers)?;
     let ctx = model.ctx.clone();
     let t = cfg.text_config.clone();
     let seq = ids.len();
     let hidden = t.hidden_size;
+    stage.mark(&ctx, "load");
     let mut b = Bufs::new(seq, cfg, &ctx)?;
     let r = Runner {
         m: &model,
         cfg,
         seq,
+        pos0,
+        causal_split,
+        stage: std::cell::RefCell::new(Stage::new()),
     };
 
-    // ---- embed gather ----------------------------------------------------
-    b.ids.write_bytes(unsafe {
-        std::slice::from_raw_parts(ids.as_ptr().cast::<u8>(), ids.len() * 4)
-    })?;
-    // out[t, d] = embed[id[t], d] * scale, one row at a time (the op's gather is
-    // row-wise; the table is huge so this stays O(seq * hidden) of reads).
-    let embed_scale = (hidden as f32).sqrt();
-    for s in 0..seq {
-        let mut args = KernelArgs::new();
-        args.device_ptr(model.embed.device_ptr())
-            .device_ptr(unsafe { b.ids.device_ptr() + (s as u64) * 4 })
-            .device_ptr(unsafe { b.hidden_a.device_ptr() + (s as u64) * (hidden as u64) * 4 })
-            .u32(hidden as u32)
-            .u32(1)
-            .u32(0)
-            .u32(0)
-            .f32(embed_scale)
-            .u32(t.vocab_size as u32)
-            .u32(1);
-        let k = cached_source_kernel(dgops::ops::embed_gather::CUDA, "embed_gather")?;
-        ctx.launch(&k, flat(hidden, 256), (256, 1, 1), 0, &mut args)?;
+    let skip_layers = match init_hidden {
+        Some(h) => {
+            assert_eq!(h.len(), seq * hidden, "init_hidden shape");
+            b.hidden_a.write_f32(h)?;
+            true
+        }
+        None => false,
+    };
+
+    if !skip_layers {
+        // ---- embed gather ------------------------------------------------
+        b.ids.write_bytes(unsafe {
+            std::slice::from_raw_parts(ids.as_ptr().cast::<u8>(), ids.len() * 4)
+        })?;
+        // out[t, d] = embed[id[t], d] * scale, one row at a time (the op's
+        // gather is row-wise; the table is huge so this stays O(seq * hidden)
+        // of reads).
+        let embed_scale = (hidden as f32).sqrt();
+        for s in 0..seq {
+            let mut args = KernelArgs::new();
+            args.device_ptr(model.embed.device_ptr())
+                .device_ptr(unsafe { b.ids.device_ptr() + (s as u64) * 4 })
+                .device_ptr(unsafe { b.hidden_a.device_ptr() + (s as u64) * (hidden as u64) * 4 })
+                .u32(hidden as u32)
+                .u32(1)
+                .u32(0)
+                .u32(0)
+                .f32(embed_scale)
+                .u32(t.vocab_size as u32)
+                .u32(1);
+            let k = cached_source_kernel(dgops::ops::embed_gather::CUDA, "embed_gather")?;
+            ctx.launch(&k, flat(hidden, 256), (256, 1, 1), 0, &mut args)?;
+        }
     }
-    ctx.synchronize()?;
+    stage.mark(&ctx, "embed");
+    if stop_after == 1 {
+        ctx.synchronize()?;
+        eprintln!("  [stop] after embed");
+        return Ok(crate::forward::ForwardOutput {
+            logits: vec![0.0; t.vocab_size],
+        });
+    }
 
     let n_layers = layers
         .unwrap_or(t.num_hidden_layers)
@@ -376,35 +533,62 @@ pub fn forward(
     for layer in 0..n_layers {
         layer_forward(&r, &mut b, &model.layers[layer], layer, 0)?;
         std::mem::swap(&mut b.hidden_a, &mut b.hidden_b);
+        stage.mark(&ctx, "layer");
     }
 
     r.rms(&b.hidden_a, &model.final_norm, &b.hidden_b, seq)?;
+    stage.mark(&ctx, "final_norm");
+    if stop_after == 2 {
+        ctx.synchronize()?;
+        eprintln!("  [stop] after final_norm");
+        return Ok(crate::forward::ForwardOutput {
+            logits: vec![0.0; t.vocab_size],
+        });
+    }
 
-    // tied LM head for the requested position(s)
-    let s = match rows {
-        LogitRows::Last => seq - 1,
-        LogitRows::Only(r) => r,
-        LogitRows::All => seq - 1,
+    // tied LM head. `All` runs the whole canvas in one GEMM (the denoise
+    // step's shape); the single-row modes still do m=1.
+    let (m, src) = match rows {
+        LogitRows::Last => (1, seq - 1),
+        LogitRows::Only(r) => (1, r),
+        LogitRows::All => (seq, 0),
     };
     r.gemm(
-        1,
+        m,
         t.vocab_size,
         hidden,
-        unsafe { offset_view(&b.hidden_b, s * hidden).device_ptr() },
-        model.embed.device_ptr(),
+        unsafe { offset_view(&b.hidden_b, src * hidden).device_ptr() },
+        model.lm_head.device_ptr(),
         b.logits.device_ptr(),
     )?;
+    if stop_after == 3 {
+        ctx.synchronize()?;
+        eprintln!("  [stop] after lm_head gemm");
+        return Ok(crate::forward::ForwardOutput {
+            logits: vec![0.0; t.vocab_size],
+        });
+    }
     let cap = t.final_logit_softcapping as f32;
-    if cap > 0.0 {
+    if softcap && cap > 0.0 {
         let mut args = KernelArgs::new();
         args.device_ptr(b.logits.device_ptr())
             .f32(cap)
-            .u32(t.vocab_size as u32);
-        launch(&ctx, "dgq_softcap", flat(t.vocab_size, 256), 256, &mut args)?;
+            .u32((m * t.vocab_size) as u32);
+        launch(
+            &ctx,
+            "dgq_softcap",
+            flat(m * t.vocab_size, 256),
+            256,
+            &mut args,
+        )?;
     }
     ctx.synchronize()?;
-    let mut logits = vec![0.0f32; t.vocab_size];
+    stage.mark(&ctx, "lm_head");
+    let mut logits = vec![0.0f32; m * t.vocab_size];
     b.logits.read_f32(&mut logits)?;
+    stage.mark(&ctx, "readback");
+    r.stage.borrow().report();
+    stage.report();
     Ok(crate::forward::ForwardOutput { logits })
 }
 
@@ -421,7 +605,7 @@ fn offset_view<'a>(buf: &'a DeviceBuffer, elems: usize) -> View<'a> {
     View(buf, elems as u64)
 }
 
-fn layer_forward(
+pub(crate) fn layer_forward(
     r: &Runner<'_>,
     b: &mut Bufs,
     lw: &GpuLayer,
@@ -433,6 +617,8 @@ fn layer_forward(
     let seq = r.seq;
     let eps = t.rms_norm_eps as f32;
     let (n_kv, head_dim, rotary_dim, theta, window) = t.attn_geometry(layer);
+    let pos0 = r.pos0;
+    let causal_split = r.causal_split;
     let n_heads = t.num_attention_heads;
     let q_dim = n_heads * head_dim;
     let kv_dim = n_kv * head_dim;
@@ -440,6 +626,7 @@ fn layer_forward(
 
     // residual = hidden_a
     copy_device(ctx, &b.residual, &b.hidden_a, seq * hidden)?;
+    r.mark("l:residual");
 
     // ---- attention -------------------------------------------------------
     r.rms(&b.hidden_a, &lw.input_layernorm, &b.normed, seq)?;
@@ -559,7 +746,9 @@ fn layer_forward(
         .u32(n_kv as u32)
         .u32(head_dim as u32)
         .u32(seq as u32)
-        .u32(window.unwrap_or(0) as u32);
+        .u32(window.unwrap_or(0) as u32)
+        .u32(pos0 as u32)
+        .u32(causal_split as u32);
     launch(
         ctx,
         "dgq_attention_v2",
@@ -578,6 +767,7 @@ fn layer_forward(
     )?;
     r.rms(&b.proj_out, &lw.post_attention_layernorm, &b.normed, seq)?;
     r.add_in_place(&b.normed, &b.residual, seq * hidden)?;
+    r.mark("l:attn");
     if stop_at == 1 {
         return Ok(());
     }
@@ -637,6 +827,7 @@ fn layer_forward(
     )?;
     copy_device(ctx, &b.mlp_down, &b.norm_scratch, seq * hidden)?;
     r.add_in_place(&b.normed, &b.mlp_down, seq * hidden)?;
+    r.mark("l:dense_mlp");
 
     if stop_at == 2 {
         return Ok(());
@@ -673,12 +864,14 @@ fn layer_forward(
         .u32(t.top_k_experts as u32);
     launch(ctx, "dgq_router_topk", rows(seq, 32), 32, &mut args)?;
     ctx.synchronize()?;
+    r.mark("l:router");
     let mut idx = vec![0u32; seq * t.top_k_experts];
     let mut wts = vec![0.0f32; seq * t.top_k_experts];
     b.top_idx.read_bytes(unsafe {
         std::slice::from_raw_parts_mut(idx.as_mut_ptr().cast::<u8>(), idx.len() * 4)
     })?;
     b.top_w.read_f32(&mut wts)?;
+    r.mark("l:route_readback");
 
     // zero moe_out, then accumulate each token's experts
     b.moe_out.zero()?;
@@ -741,6 +934,7 @@ fn layer_forward(
     // b.normed holds the layer residual and must not be overwritten, so the
     // normalized value goes to the scratch, the residual accumulates into it,
     // and the result moves back to moe_out for the next stage.
+    r.mark("l:experts");
     r.rms(
         &b.moe_out,
         &lw.post_feedforward_layernorm_2,
@@ -829,7 +1023,7 @@ pub fn hidden_after(
     stop_at: u8,
     _sc: &mut Scratch,
 ) -> Result<Vec<f32>, Error> {
-    let model = GpuModel::load(w, cfg)?;
+    let model = GpuModel::load(w, cfg, Some(layers))?;
     let ctx = model.ctx.clone();
     let t = cfg.text_config.clone();
     let seq = ids.len();
@@ -839,6 +1033,9 @@ pub fn hidden_after(
         m: &model,
         cfg,
         seq,
+        pos0: 0,
+        causal_split: seq,
+        stage: std::cell::RefCell::new(Stage::new()),
     };
     b.ids.write_bytes(unsafe {
         std::slice::from_raw_parts(ids.as_ptr().cast::<u8>(), ids.len() * 4)
@@ -881,7 +1078,7 @@ pub fn attn_stage(
     ids: &[u32],
     _sc: &mut Scratch,
 ) -> Result<Vec<f32>, Error> {
-    let model = GpuModel::load(w, cfg)?;
+    let model = GpuModel::load(w, cfg, Some(1))?;
     let ctx = model.ctx.clone();
     let t = cfg.text_config.clone();
     let seq = ids.len();
@@ -891,6 +1088,9 @@ pub fn attn_stage(
         m: &model,
         cfg,
         seq,
+        pos0: 0,
+        causal_split: seq,
+        stage: std::cell::RefCell::new(Stage::new()),
     };
     b.ids.write_bytes(unsafe {
         std::slice::from_raw_parts(ids.as_ptr().cast::<u8>(), ids.len() * 4)
@@ -920,6 +1120,37 @@ pub fn attn_stage(
 
 /// Test hook: C[m,n] = A[m,k] @ B[k,n] through the same cuBLAS path the
 /// forward pass uses.
+/// Diagnostic: run the dgemm body on a zeroed device-only B of the given
+/// shape, with A and C small — the LM head's shape without the 737 MiB embed
+/// table. Returns C's first element (the value itself is meaningless).
+pub fn gemm_probe(m: usize, k: usize, n: usize) -> Result<f32, Error> {
+    let ctx = cached_context()?.clone();
+    let ba = up_f32(&ctx, &vec![1.0f32; m * k])?;
+    let bb = DeviceBuffer::alloc(&ctx, n * k * 4)?;
+    bb.zero()?;
+    let bc = DeviceBuffer::alloc(&ctx, m * n * 4)?;
+    eprintln!(
+        "  [probe] a={:?} b={:?} c={:?}",
+        ba.size(),
+        bb.size(),
+        bc.size()
+    );
+    gemm::gemm(
+        &ctx,
+        m,
+        n,
+        k,
+        ba.device_ptr(),
+        bb.device_ptr(),
+        bc.device_ptr(),
+    )?;
+    eprintln!("  [probe] launched, synchronizing");
+    ctx.synchronize()?;
+    let mut out = vec![0.0f32; m * n];
+    bc.read_f32(&mut out)?;
+    Ok(out[0])
+}
+
 pub fn cublas_probe(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>, Error> {
     let ctx = cached_context()?.clone();
 

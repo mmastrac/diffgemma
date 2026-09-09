@@ -30,6 +30,34 @@ extern "C" __global__ void dgq_rms_norm(
 }
 
 
+// Scale-free row norm (rms_norm_no_scale): out = x * rsqrt(mean(x^2) + eps).
+// A separate entry rather than a null weight pointer, which the driver
+// rejects as an illegal address.
+extern "C" __global__ void dgq_rms_norm_ns(
+    const float *x, float *out, unsigned seq, unsigned hidden, float eps
+) {
+    const unsigned row = blockIdx.x;
+    if (row >= seq) return;
+    const float *xr = x + (size_t)row * hidden;
+    float *o = out + (size_t)row * hidden;
+    __shared__ float red[256];
+    float acc = 0.0f;
+    for (unsigned i = threadIdx.x; i < hidden; i += blockDim.x) {
+        float v = xr[i];
+        acc += v * v;
+    }
+    red[threadIdx.x] = acc;
+    __syncthreads();
+    for (unsigned s = blockDim.x / 2u; s > 0u; s >>= 1u) {
+        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(red[0] / (float)hidden + eps);
+    for (unsigned i = threadIdx.x; i < hidden; i += blockDim.x) {
+        o[i] = xr[i] * inv;
+    }
+}
+
 // Per-head QK-norm: one block per (row, head); weight may be null (V).
 extern "C" __global__ void dgq_rms_norm_heads(
     const float *x, const float *weight, float *out,
@@ -84,12 +112,20 @@ extern "C" __global__ void dgq_rope(
     }
 }
 
-// Causal (+ optional sliding window) GQA attention, one block per query head.
+// GQA attention, one block per query head.
 // kv layout: [total_kv, n_kv_heads, 2*head_dim] = K then V per head.
+//
+// pos0 is the absolute position of query row 0 (the denoise pass runs the
+// prompt and the canvas in one sequence, so the canvas starts at pos0 = prompt
+// length). causal_split is the number of leading rows that attend causally:
+// rows tok < causal_split see only positions <= their own, every other row
+// sees the whole sequence (the diffusion canvas is bidirectional).
+// causal_split = seq is a plain causal prefill; 0 is fully bidirectional.
 extern "C" __global__ void dgq_attention_v2(
     const float *q, const float *kv, float *out,
     unsigned seq, unsigned n_heads, unsigned n_kv_heads,
-    unsigned head_dim, unsigned total_kv, unsigned window
+    unsigned head_dim, unsigned total_kv, unsigned window,
+    unsigned pos0, unsigned causal_split
 ) {
     const unsigned row = blockIdx.x;
     const unsigned tok = row / n_heads;
@@ -99,12 +135,18 @@ extern "C" __global__ void dgq_attention_v2(
     const unsigned kvh = qh / n_groups;
     const float *qv = q + (size_t)row * head_dim;
     float *ov = out + (size_t)row * head_dim;
+    const unsigned abs_pos = pos0 + tok;
+    // Exclusive upper bound on the attended positions. Clamped to the KV
+    // length: with a non-zero pos0 a small sequence can put abs_pos + 1 past
+    // the buffer, and reading there is an out-of-bounds fault (or, worse,
+    // silently non-deterministic attention).
+    const unsigned causal_end = (abs_pos + 1u < total_kv) ? (abs_pos + 1u) : total_kv;
+    const unsigned kv_end = (tok < causal_split) ? causal_end : total_kv;
     float m = -1.0e30f, l = 0.0f;
     float acc[512];
     for (unsigned d = 0; d < head_dim; d++) acc[d] = 0.0f;
-    for (unsigned t = 0; t < total_kv; t++) {
-        if (t > tok) break;
-        if (window > 0u && t + window <= tok) continue;
+    for (unsigned t = 0; t < kv_end; t++) {
+        if (window > 0u && t + window <= abs_pos) continue;
         // K for this position/head; V sits in the same position's V block,
         // which starts n_kv_heads*head_dim past the position's K block.
         const size_t pos_base = (size_t)t * 2u * n_kv_heads * head_dim;
@@ -226,4 +268,143 @@ extern "C" __global__ void dgq_accum(float *dst, const float *src, float w, unsi
     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] += src[i] * w;
 }
+// Sampler row stats for one canvas position: tempered softmax max/sum, the
+// natural-log entropy (nats), and the argmax of the tempered logits.
+//   entropy = ln(Z) - sum(e_i * x_i) / Z,  x_i = logit_i / t,  e_i = exp(x_i - mx)
+// Ties in the argmax resolve to the lower id, like the CPU oracle.
+extern "C" __global__ void dgq_row_stats(
+    const float *logits, float *rowstat, float *entropy, unsigned *argmax,
+    unsigned rows, unsigned cols, float t
+) {
+    const unsigned row = blockIdx.x;
+    if (row >= rows) return;
+    const float *lr = logits + (size_t)row * cols;
+    __shared__ float r_mx[256];
+    __shared__ float r_sum[256];
+    __shared__ float r_ent[256];
+    __shared__ unsigned r_am[256];
+    __shared__ float r_amv[256];
 
+    float mx = -1.0e30f;
+    float amv = -1.0e30f;
+    unsigned am = 0u;
+    for (unsigned v = threadIdx.x; v < cols; v += blockDim.x) {
+        const float x = lr[v] / t;
+        if (x > amv || (x == amv && v < am)) { amv = x; am = v; }
+        if (x > mx) mx = x;
+    }
+    r_mx[threadIdx.x] = mx;
+    r_am[threadIdx.x] = am;
+    r_amv[threadIdx.x] = amv;
+    __syncthreads();
+    for (unsigned s = blockDim.x / 2u; s > 0u; s >>= 1u) {
+        if (threadIdx.x < s) {
+            if (r_mx[threadIdx.x + s] > r_mx[threadIdx.x]) r_mx[threadIdx.x] = r_mx[threadIdx.x + s];
+            if (r_amv[threadIdx.x + s] > r_amv[threadIdx.x]
+                || (r_amv[threadIdx.x + s] == r_amv[threadIdx.x]
+                    && r_am[threadIdx.x + s] < r_am[threadIdx.x])) {
+                r_amv[threadIdx.x] = r_amv[threadIdx.x + s];
+                r_am[threadIdx.x] = r_am[threadIdx.x + s];
+            }
+        }
+        __syncthreads();
+    }
+    mx = r_mx[0];
+    float sum = 0.0f, ent = 0.0f;
+    for (unsigned v = threadIdx.x; v < cols; v += blockDim.x) {
+        const float x = lr[v] / t;
+        const float e = expf(x - mx);
+        sum += e;
+        ent += e * (x - mx);
+    }
+    r_sum[threadIdx.x] = sum;
+    r_ent[threadIdx.x] = ent;
+    __syncthreads();
+    for (unsigned s = blockDim.x / 2u; s > 0u; s >>= 1u) {
+        if (threadIdx.x < s) {
+            r_sum[threadIdx.x] += r_sum[threadIdx.x + s];
+            r_ent[threadIdx.x] += r_ent[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0u) {
+        const float z = r_sum[0];
+        rowstat[row * 2u] = mx;
+        rowstat[row * 2u + 1u] = z;
+        entropy[row] = logf(z) - r_ent[0] / z;
+        argmax[row] = r_am[0];
+    }
+}
+
+// Sparse self-conditioning soft embedding, one block per canvas row: the soft
+// embedding is sum_v p_v * embed[v] * scale with p = softmax(logits), but the
+// diffusion distribution sharpens, so only entries within e^-THRESH of the row
+// max are read (the tail contributes < 1e-4 of the row mass).
+//
+// Each thread scans its strided slice of the row and keeps up to MAXK
+// survivors in shared memory (the engine sc_sparse_select uses the same
+// per-thread compaction; survivors past the budget drop, the same
+// approximation the engine documents). The hidden-dimension loop then walks
+// the survivor lists and touches each surviving embed row once.
+#define MAXK 16
+
+extern "C" __global__ void dgq_soft_embed(
+    const float *logits, const unsigned short *embed, float *out,
+    unsigned rows, unsigned cols, unsigned hidden, float thresh, float scale
+) {
+    const unsigned row = blockIdx.x;
+    if (row >= rows) return;
+    const unsigned tid = threadIdx.x;
+    const float *lr = logits + (size_t)row * cols;
+    float *orow = out + (size_t)row * hidden;
+    __shared__ unsigned s_idx[256 * MAXK];
+    __shared__ float s_prob[256 * MAXK];
+    __shared__ unsigned s_cnt[256];
+    __shared__ float r_mx[256];
+
+    float mx = -1.0e30f;
+    for (unsigned v = tid; v < cols; v += blockDim.x) {
+        if (lr[v] > mx) mx = lr[v];
+    }
+    r_mx[tid] = mx;
+    __syncthreads();
+    for (unsigned s = blockDim.x / 2u; s > 0u; s >>= 1u) {
+        if (tid < s && r_mx[tid + s] > r_mx[tid]) r_mx[tid] = r_mx[tid + s];
+        __syncthreads();
+    }
+    mx = r_mx[0];
+    float z = 0.0f;
+    for (unsigned v = tid; v < cols; v += blockDim.x) {
+        if (lr[v] - mx >= thresh) z += expf(lr[v] - mx);
+    }
+    r_mx[tid] = z;
+    __syncthreads();
+    for (unsigned s = blockDim.x / 2u; s > 0u; s >>= 1u) {
+        if (tid < s) r_mx[tid] += r_mx[tid + s];
+        __syncthreads();
+    }
+    z = r_mx[0];
+
+    unsigned cnt = 0u;
+    for (unsigned v = tid; v < cols; v += blockDim.x) {
+        if (lr[v] - mx >= thresh && cnt < MAXK) {
+            s_idx[tid * MAXK + cnt] = v;
+            s_prob[tid * MAXK + cnt] = expf(lr[v] - mx) / z;
+            cnt++;
+        }
+    }
+    s_cnt[tid] = cnt;
+    __syncthreads();
+    for (unsigned d = tid; d < hidden; d += blockDim.x) {
+        float acc = 0.0f;
+        for (unsigned t = 0u; t < blockDim.x; t++) {
+            const unsigned c = s_cnt[t];
+            const unsigned base = t * MAXK;
+            for (unsigned i = 0u; i < c; i++) {
+                const unsigned short bits = embed[(size_t)s_idx[base + i] * hidden + d];
+                acc += s_prob[base + i] * __uint_as_float((unsigned)bits << 16u);
+            }
+        }
+        orow[d] = acc * scale;
+    }
+}

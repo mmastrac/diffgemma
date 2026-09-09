@@ -3,7 +3,9 @@
 #[cfg(feature = "cuda")]
 mod cuda;
 #[cfg(feature = "cuda")]
-pub use cuda::forward;
+pub mod session;
+#[cfg(feature = "cuda")]
+pub use cuda::{forward, forward_stop, gemm_probe};
 
 use crate::config::{Error, ModelConfig};
 use crate::forward::Scratch;

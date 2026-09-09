@@ -9,6 +9,20 @@ use gpukit::cuda::{DeviceBuffer, KernelArgs, cached_context, cached_source_kerne
 ///   k = pos_base + kvh*hd,  v = pos_base + n_kv*hd + kvh*hd,
 ///   pos_base = t * 2 * n_kv * hd
 fn run_case(seq: usize, n_heads: usize, n_kv: usize, hd: usize) -> f64 {
+    run_case_split(seq, n_heads, n_kv, hd, 0, seq)
+}
+
+/// The same case with an explicit absolute position and causal split: rows
+/// below `causal_split` attend causally, the rest bidirectionally (the denoise
+/// pass's prompt/canvas layout).
+fn run_case_split(
+    seq: usize,
+    n_heads: usize,
+    n_kv: usize,
+    hd: usize,
+    pos0: usize,
+    causal_split: usize,
+) -> f64 {
     let q: Vec<f32> = (0..seq * n_heads * hd)
         .map(|i| (i as f32 * 0.0007).sin())
         .collect();
@@ -42,7 +56,9 @@ fn run_case(seq: usize, n_heads: usize, n_kv: usize, hd: usize) -> f64 {
         .u32(n_kv as u32)
         .u32(hd as u32)
         .u32(seq as u32)
-        .u32(1024);
+        .u32(1024)
+        .u32(pos0 as u32)
+        .u32(causal_split as u32);
     ctx.launch(
         &kk,
         ((seq * n_heads) as u32, 1, 1),
@@ -62,7 +78,16 @@ fn run_case(seq: usize, n_heads: usize, n_kv: usize, hd: usize) -> f64 {
             let qv = &q[(tok * n_heads + qh) * hd..(tok * n_heads + qh + 1) * hd];
             let (mut m, mut l) = (f32::NEG_INFINITY, 0.0f32);
             let mut acc = vec![0.0f32; hd];
-            for t in 0..=tok {
+            let abs_q = pos0 + tok;
+            let kv_end = if tok < causal_split {
+                (abs_q + 1).min(seq)
+            } else {
+                seq
+            };
+            for t in 0..kv_end {
+                if t + 1024 <= abs_q {
+                    continue;
+                }
                 let pos_base = t * 2 * row;
                 let koff = pos_base + kvh * hd;
                 let dot: f32 = qv
@@ -103,4 +128,26 @@ fn attention_matches_reference() {
     let cos = run_case(4, 16, 8, 256);
     println!("attention cos {cos}");
     assert!(cos > 0.9999, "cos {cos}");
+}
+
+/// The denoise pass layout: rows [0, split) are the prompt (causal), rows
+/// [split, seq) are the canvas (bidirectional). A canvas row must see rows it
+/// could not see causally, so a kernel that ignored causal_split diverges.
+#[test]
+fn attention_honors_the_causal_split() {
+    let cos = run_case_split(6, 16, 8, 256, 0, 2);
+    println!("split attention cos {cos}");
+    assert!(cos > 0.9999, "cos {cos}");
+}
+
+/// A non-zero absolute position shifts the sliding window, so the kernel and
+/// the reference must agree on where row 0 sits. The tolerance is looser than
+/// the plain-causal case because a large `pos0` makes the online-softmax
+/// rescaling order matter at f32 (~1e-3 relative on the first row); a wrong
+/// window still drops the cosine far below this.
+#[test]
+fn attention_honors_the_absolute_position() {
+    let cos = run_case_split(6, 16, 8, 256, 500, 6);
+    println!("pos0 attention cos {cos}");
+    assert!(cos > 0.98, "cos {cos}");
 }

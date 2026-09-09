@@ -255,6 +255,11 @@ impl Scratch {
 }
 
 /// One decoder layer, matching `src/model/decoder_layer.rs::forward`.
+/// `causal_split`: query rows below it attend causally (prefill and the prompt
+/// half of a denoise pass); every row at or above it attends the whole
+/// sequence (the diffusion canvas is bidirectional). Pass `seq` for a plain
+/// causal pass.
+#[allow(clippy::too_many_arguments)]
 fn layer_forward_at(
     out: &mut [f32],
     hidden_states: &[f32],
@@ -264,6 +269,8 @@ fn layer_forward_at(
     seq: usize,
     b: &mut Buffers,
     stop_at: u8,
+    causal_split: usize,
+    pos0: usize,
 ) {
     let t = &cfg.text_config;
     let hidden = t.hidden_size;
@@ -345,7 +352,13 @@ fn layer_forward_at(
                 for d in 0..head_dim {
                     dot += b.q[q_off + d] * b.k[k_off + d];
                 }
-                let masked = ki > qi || window.is_some_and(|w| ki + w <= qi);
+                // Absolute positions: the denoise pass places row 0 at pos0
+                // (the prompt length) so the sliding window covers the same
+                // span the device path sees.
+                let abs_q = pos0 + qi;
+                let abs_k = pos0 + ki;
+                let masked =
+                    (qi < causal_split && ki > qi) || window.is_some_and(|w| abs_k + w <= abs_q);
                 row[ki] = if masked { MASK_NEG } else { dot };
             }
             softmax_row(row);
@@ -531,7 +544,7 @@ fn layer_forward(
     seq: usize,
     b: &mut Buffers,
 ) {
-    layer_forward_at(out, hidden_states, lw, cfg, layer, seq, b, 0)
+    layer_forward_at(out, hidden_states, lw, cfg, layer, seq, b, 0, seq, 0)
 }
 
 /// MLX/Gemma4 top-k: rank raw logits, softmax over the selected set, then
@@ -661,6 +674,217 @@ pub fn forward(
     })
 }
 
+/// Per-row, scale-free RMS norm (rms_norm_no_scale).
+pub fn rms_norm_no_scale_row(out: &mut [f32], x: &[f32], eps: f32) {
+    let n = x.len();
+    let sum_sq: f32 = x.iter().map(|v| v * v).sum();
+    let inv = 1.0 / (sum_sq / n as f32 + eps).sqrt();
+    for i in 0..n {
+        out[i] = x[i] * inv;
+    }
+}
+
+/// The self-conditioning MLP, applied to the canvas rows only:
+/// x = rms_norm_rows(signal, pre_norm), x = down(up * gelu(gate(x))),
+/// hidden[canvas] += x, then a scale-free RMS norm of the sum. signal is the
+/// soft embedding of the previous step logits, or (first step) the canvas
+/// embeddings themselves.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_self_conditioning(
+    hidden: &mut [f32],
+    embed: &[f32],
+    signal: &[f32],
+    prompt_len: usize,
+    canvas: usize,
+    cfg: &ModelConfig,
+    pre_norm: &[f32],
+    gate_w: &[f32],
+    up_w: &[f32],
+    down_w: &[f32],
+) {
+    let t = &cfg.text_config;
+    let h = t.hidden_size;
+    let inter = t.intermediate_size;
+    let eps = t.rms_norm_eps as f32;
+    let base = prompt_len * h;
+    let mut normed = vec![0.0f32; canvas * h];
+    rms_norm_rows(&mut normed, signal, pre_norm, canvas, h, eps);
+    let mut gate = vec![0.0f32; canvas * inter];
+    let mut up = vec![0.0f32; canvas * inter];
+    linear(&mut gate, &normed, gate_w, canvas, h, inter);
+    linear(&mut up, &normed, up_w, canvas, h, inter);
+    for i in 0..gate.len() {
+        gate[i] = gelu_tanh(gate[i]) * up[i];
+    }
+    let mut out = vec![0.0f32; canvas * h];
+    linear(&mut out, &gate, down_w, canvas, inter, h);
+    for i in 0..canvas * h {
+        hidden[base + i] = embed[base + i] + out[i];
+    }
+    let mut row = vec![0.0f32; h];
+    for s in 0..canvas {
+        let off = base + s * h;
+        row.copy_from_slice(&hidden[off..off + h]);
+        rms_norm_no_scale_row(&mut hidden[off..off + h], &row, eps);
+    }
+}
+
+/// The sparse soft embedding of logits (canvas rows), scaled by sqrt(h):
+/// sum_v p_v * embed[v] over entries within e^-10 of the row max.
+pub fn soft_embed_from_logits(
+    out: &mut [f32],
+    logits: &[f32],
+    embed: &[f32],
+    canvas: usize,
+    vocab: usize,
+    hidden: usize,
+    scale: f32,
+) {
+    for r in 0..canvas {
+        let lr = &logits[r * vocab..(r + 1) * vocab];
+        let mx = lr.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut z = 0.0f32;
+        for &x in lr {
+            if x - mx >= -10.0 {
+                z += (x - mx).exp();
+            }
+        }
+        let orow = &mut out[r * hidden..(r + 1) * hidden];
+        orow.fill(0.0);
+        for v in 0..vocab {
+            if lr[v] - mx < -10.0 {
+                continue;
+            }
+            let p = (lr[v] - mx).exp() / z;
+            let er = &embed[v * hidden..(v + 1) * hidden];
+            for d in 0..hidden {
+                orow[d] += p * er[d] * scale;
+            }
+        }
+    }
+}
+
+/// forward with the denoise pass self-conditioning: prompt_len leading rows
+/// are left alone, the canvas rows after them get the SC MLP, and prev_logits
+/// is the previous step canvas logits (None = first step).
+#[allow(clippy::too_many_arguments)]
+pub fn forward_sc(
+    w: &Weights,
+    cfg: &ModelConfig,
+    token_ids: &[u32],
+    layers: Option<usize>,
+    rows: LogitRows,
+    sc: &mut Scratch,
+    prompt_len: usize,
+    canvas: usize,
+    prev_logits: Option<&[f32]>,
+    prompt_hidden: Option<&[f32]>,
+) -> Result<ForwardOutput, Error> {
+    let t = &cfg.text_config;
+    let seq = token_ids.len();
+    let hidden = t.hidden_size;
+    let embed_scale = (hidden as f32).sqrt();
+    let embed_w = w.tensor_f32("model.decoder.embed_tokens.weight")?;
+    for (s, &id) in token_ids.iter().enumerate() {
+        let src = id as usize * hidden;
+        let dst = s * hidden;
+        for i in 0..hidden {
+            sc.bufs.embed[dst + i] = embed_w[src + i] * embed_scale;
+        }
+    }
+    sc.hidden_a.copy_from_slice(&sc.bufs.embed);
+    if let Some(ph) = prompt_hidden {
+        // The device path starts the denoise pass from the prompt's post-layer
+        // hidden state; mirror that so both paths run the same graph.
+        sc.hidden_a[..prompt_len * hidden].copy_from_slice(&ph[..prompt_len * hidden]);
+    }
+    let pre_norm = w.tensor_f32("model.decoder.self_conditioning.pre_norm.weight")?;
+    let gate_w = w.tensor_f32("model.decoder.self_conditioning.gate_proj.weight")?;
+    let up_w = w.tensor_f32("model.decoder.self_conditioning.up_proj.weight")?;
+    let down_w = w.tensor_f32("model.decoder.self_conditioning.down_proj.weight")?;
+    let signal = match prev_logits {
+        Some(lg) => {
+            let mut s = vec![0.0f32; canvas * hidden];
+            soft_embed_from_logits(
+                &mut s,
+                lg,
+                &embed_w,
+                canvas,
+                t.vocab_size,
+                hidden,
+                embed_scale,
+            );
+            s
+        }
+        None => sc.bufs.embed[prompt_len * hidden..].to_vec(),
+    };
+    apply_self_conditioning(
+        &mut sc.hidden_a,
+        &sc.bufs.embed,
+        &signal,
+        prompt_len,
+        canvas,
+        cfg,
+        &pre_norm,
+        &gate_w,
+        &up_w,
+        &down_w,
+    );
+    let n_layers = layers
+        .unwrap_or(t.num_hidden_layers)
+        .min(t.num_hidden_layers);
+    for layer in 0..n_layers {
+        let lw = LayerWeights::load(w, layer)?;
+        layer_forward_at(
+            &mut sc.hidden_b,
+            &sc.hidden_a,
+            &lw,
+            cfg,
+            layer,
+            seq,
+            &mut sc.bufs,
+            0,
+            prompt_len,
+            prompt_len,
+        );
+        std::mem::swap(&mut sc.hidden_a, &mut sc.hidden_b);
+    }
+    let norm_w = w.tensor_f32("model.decoder.norm.weight")?;
+    rms_norm_rows(
+        &mut sc.hidden_b,
+        &sc.hidden_a,
+        &norm_w,
+        seq,
+        hidden,
+        t.rms_norm_eps as f32,
+    );
+    let want: Vec<usize> = match rows {
+        LogitRows::All => (0..seq).collect(),
+        LogitRows::Last => vec![seq - 1],
+        LogitRows::Only(s) => vec![s],
+    };
+    const CHUNK: usize = 4096;
+    for v0 in (0..t.vocab_size).step_by(CHUNK) {
+        let v1 = (v0 + CHUNK).min(t.vocab_size);
+        let wblock = &embed_w[v0 * hidden..v1 * hidden];
+        for &s in &want {
+            let h = &sc.hidden_b[s * hidden..(s + 1) * hidden];
+            let row = &mut sc.logits[s * t.vocab_size + v0..s * t.vocab_size + v1];
+            for (o, dst) in row.iter_mut().enumerate() {
+                let wr = &wblock[o * hidden..(o + 1) * hidden];
+                let mut acc = 0.0f32;
+                for d in 0..hidden {
+                    acc += h[d] * wr[d];
+                }
+                *dst = acc;
+            }
+        }
+    }
+    Ok(ForwardOutput {
+        logits: sc.logits.clone(),
+    })
+}
+
 /// Hidden state after \`layers\` decoder layers (the CPU oracle's stage output).
 pub fn hidden_after(
     w: &Weights,
@@ -695,6 +919,8 @@ pub fn hidden_after(
             seq,
             &mut sc.bufs,
             stop,
+            seq,
+            0,
         );
         if stop == 1 || stop == 2 || stop == 3 {
             return Ok(sc.bufs.normed[..seq * hidden].to_vec());
