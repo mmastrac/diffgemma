@@ -197,6 +197,7 @@ pub struct Buffers {
     pub mlp_down: Vec<f32>,
     pub moe_input: Vec<f32>,
     pub moe_out: Vec<f32>,
+    pub router_input: Vec<f32>,
     pub router_logits: Vec<f32>,
     pub expert_gate_up: Vec<f32>,
     pub expert_act: Vec<f32>,
@@ -232,6 +233,7 @@ impl Buffers {
             mlp_down: vec![0.0; seq * hidden],
             moe_input: vec![0.0; seq * hidden],
             moe_out: vec![0.0; seq * hidden],
+            router_input: vec![0.0; seq * hidden],
             router_logits: vec![0.0; seq * t.num_experts],
             expert_gate_up: vec![0.0; t.moe_intermediate_size * 2],
             expert_act: vec![0.0; t.moe_intermediate_size],
@@ -440,13 +442,15 @@ fn layer_forward_at(
         let row = &b.residual[off..off + hidden];
         let sum_sq: f32 = row.iter().map(|v| v * v).sum();
         let inv = 1.0 / (sum_sq / hidden as f32 + eps).sqrt();
+        // Router input goes in its own buffer: normed now holds the layer's
+        // running residual and must survive until the final output norm.
         for i in 0..hidden {
-            b.normed[off + i] = row[i] * inv * lw.router_scale[i] * root;
+            b.router_input[off + i] = row[i] * inv * lw.router_scale[i] * root;
         }
     }
     linear(
         &mut b.router_logits,
-        &b.normed,
+        &b.router_input,
         &lw.router_proj,
         seq,
         hidden,

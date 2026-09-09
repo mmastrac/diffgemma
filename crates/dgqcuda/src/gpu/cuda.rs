@@ -737,9 +737,19 @@ fn layer_forward(
     // CPU oracle: scratch = moe_out; moe_out = rms(scratch) * w2; normed += moe_out.
     // rms leaves the normalized value in b.normed; b.moe_out still holds the raw
     // value, so add first and then move the normalized result into moe_out.
-    r.rms(&b.moe_out, &lw.post_feedforward_layernorm_2, &b.normed, seq)?;
-    r.add_in_place(&b.normed, &b.moe_out, seq * hidden)?;
-    copy_device(ctx, &b.moe_out, &b.normed, seq * hidden)?;
+    // CPU oracle: scratch = moe_out; moe_out = rms(scratch) * w2; normed += moe_out.
+    // b.normed holds the layer residual and must not be overwritten, so the
+    // normalized value goes to the scratch, the residual accumulates into it,
+    // and the result moves back to moe_out for the next stage.
+    r.rms(
+        &b.moe_out,
+        &lw.post_feedforward_layernorm_2,
+        &b.norm_scratch,
+        seq,
+    )?;
+    r.add_in_place(&b.norm_scratch, &b.normed, seq * hidden)?;
+    copy_device(ctx, &b.normed, &b.norm_scratch, seq * hidden)?;
+    copy_device(ctx, &b.moe_out, &b.norm_scratch, seq * hidden)?;
 
     if stop_at == 3 {
         return Ok(());
