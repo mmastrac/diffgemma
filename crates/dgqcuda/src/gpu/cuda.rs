@@ -626,8 +626,9 @@ fn layer_forward(
         lw.mlp_down.device_ptr(),
         b.mlp_down.device_ptr(),
     )?;
-    // rms reads its input and writes its output from parallel blocks, so an
-    // in-place call is a race; normalize into the scratch and copy back.
+    // CPU oracle: scratch = mlp_down; mlp_down = rms(scratch) * w1; then the
+    // dense branch's output is ADDED to normed (which still holds the residual
+    // from before the pre-feedforward norm).
     r.rms(
         &b.mlp_down,
         &lw.post_feedforward_layernorm_1,
@@ -635,6 +636,7 @@ fn layer_forward(
         seq,
     )?;
     copy_device(ctx, &b.mlp_down, &b.norm_scratch, seq * hidden)?;
+    r.add_in_place(&b.normed, &b.mlp_down, seq * hidden)?;
 
     if stop_at == 2 {
         return Ok(());

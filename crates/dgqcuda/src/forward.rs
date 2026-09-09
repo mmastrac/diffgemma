@@ -424,6 +424,11 @@ fn layer_forward_at(
         hidden,
         eps,
     );
+    // The dense branch's output is added to normed (which still holds the
+    // residual from before the pre-feedforward norm).
+    for i in 0..b.normed.len() {
+        b.normed[i] += b.mlp_down[i];
+    }
 
     if stop_at == 2 {
         return;
