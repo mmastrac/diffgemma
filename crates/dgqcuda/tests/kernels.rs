@@ -1,9 +1,14 @@
-//! dgq_attention against an explicit CPU reference over several layouts.
+//! dgq_attention against an explicit CPU reference over the KV layout.
 #![cfg(feature = "cuda")]
 
 use gpukit::cuda::{DeviceBuffer, KernelArgs, cached_context, cached_source_kernel};
 
-fn run_case(seq: usize, n_heads: usize, n_kv: usize, hd: usize, layout: &str) -> f64 {
+/// Build [seq, n_kv, 2*hd] = per position all K heads then all V heads, run the
+/// kernel, and compare against a reference that reads the same buffer with the
+/// kernel's indexing:
+///   k = pos_base + kvh*hd,  v = pos_base + n_kv*hd + kvh*hd,
+///   pos_base = t * 2 * n_kv * hd
+fn run_case(seq: usize, n_heads: usize, n_kv: usize, hd: usize) -> f64 {
     let q: Vec<f32> = (0..seq * n_heads * hd)
         .map(|i| (i as f32 * 0.0007).sin())
         .collect();
@@ -14,32 +19,11 @@ fn run_case(seq: usize, n_heads: usize, n_kv: usize, hd: usize, layout: &str) ->
         .map(|i| (i as f32 * 0.0013).sin() + 0.3)
         .collect();
 
-    // Two candidate layouts.
-    //  "pos": [t][2*n_kv*hd] = all K heads then all V heads (kernel: k=(t*nkv+h)*hd, v=k+nkv*hd)
-    //  "head": [t][n_kv][2*hd] = per head K then V (kernel: k=(t*nkv+h)*hd, v=k+hd)
     let row = n_kv * hd;
     let mut kv = vec![0.0f32; seq * 2 * row];
-    let vstride;
-    match layout {
-        "pos" => {
-            for t in 0..seq {
-                kv[t * 2 * row..t * 2 * row + row].copy_from_slice(&k[t * row..(t + 1) * row]);
-                kv[t * 2 * row + row..(t + 1) * 2 * row]
-                    .copy_from_slice(&v[t * row..(t + 1) * row]);
-            }
-            vstride = n_kv * hd;
-        }
-        _ => {
-            for t in 0..seq {
-                for h in 0..n_kv {
-                    let dst = (t * n_kv + h) * 2 * hd;
-                    let src = (t * n_kv + h) * hd;
-                    kv[dst..dst + hd].copy_from_slice(&k[src..src + hd]);
-                    kv[dst + hd..dst + 2 * hd].copy_from_slice(&v[src..src + hd]);
-                }
-            }
-            vstride = hd;
-        }
+    for t in 0..seq {
+        kv[t * 2 * row..t * 2 * row + row].copy_from_slice(&k[t * row..(t + 1) * row]);
+        kv[t * 2 * row + row..(t + 1) * 2 * row].copy_from_slice(&v[t * row..(t + 1) * row]);
     }
 
     let ctx = cached_context().expect("ctx");
@@ -79,7 +63,8 @@ fn run_case(seq: usize, n_heads: usize, n_kv: usize, hd: usize, layout: &str) ->
             let (mut m, mut l) = (f32::NEG_INFINITY, 0.0f32);
             let mut acc = vec![0.0f32; hd];
             for t in 0..=tok {
-                let koff = (t * n_kv + kvh) * hd;
+                let pos_base = t * 2 * row;
+                let koff = pos_base + kvh * hd;
                 let dot: f32 = qv
                     .iter()
                     .zip(&kv[koff..koff + hd])
@@ -93,7 +78,7 @@ fn run_case(seq: usize, n_heads: usize, n_kv: usize, hd: usize, layout: &str) ->
                 }
                 l = l * corr + p;
                 m = mn;
-                let voff = (t * 2 * row) + row + kvh * hd;
+                let voff = pos_base + n_kv * hd + kvh * hd;
                 for d in 0..hd {
                     acc[d] += p * kv[voff + d];
                 }
@@ -114,13 +99,8 @@ fn run_case(seq: usize, n_heads: usize, n_kv: usize, hd: usize, layout: &str) ->
 }
 
 #[test]
-fn attention_layouts() {
-    let cos_pos = run_case(4, 16, 8, 256, "pos");
-    let cos_head = run_case(4, 16, 8, 256, "head");
-    println!("cos with v=k+nkv*hd layout: {cos_pos}");
-    println!("cos with v=k+hd layout:      {cos_head}");
-    assert!(
-        cos_pos > 0.9999 || cos_head > 0.9999,
-        "neither layout matches"
-    );
+fn attention_matches_reference() {
+    let cos = run_case(4, 16, 8, 256);
+    println!("attention cos {cos}");
+    assert!(cos > 0.9999, "cos {cos}");
 }
