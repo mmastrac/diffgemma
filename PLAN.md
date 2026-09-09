@@ -257,15 +257,17 @@ clears 0.641 by a lot.
   kernel onto the portable body so the engine and the CUDA slice share one
   oracle, port the rest as `cuda.cu` beside each `.metal` (the quantized GEMM
   family next), then the step kernel. A CUDA box runs the tier-1 parity suite
+  without the 19 GiB pack; the golden slice additionally needs the pack.
   `crates/dgqcuda` goes further: it runs the whole 30-layer forward and the
   denoise loop on CUDA against a real pack, with a CPU oracle per stage and a
-  per-step parity mode. Two limits are open. (1) Every weight is held as f32,
-  so the resident model is ~52 GiB — the box must be free of other model
-  processes, and a quantized (q4/bf16) GEMM body is the fix. (2) The MoE
-  expert matmuls are per-token per-expert GEMMs (2 x 8 x canvas launches per
-  layer, ~2.2 s of a 6.7 s step at canvas 4); a grouped/bucketed expert GEMM
-  (the engine's block-sparse body) is the next perf tranche.
-  without the 19 GiB pack; the golden slice additionally needs the pack.
+  per-step parity mode. The MoE experts use a bucketed grouped GEMM
+  (`moe_grouped.rs` + `moe_grouped.cu`): tokens are bucketed by expert, the
+  expert-major rows feed one tiled GEMM per bucket with the q4 weight tile
+  decoded into shared memory once per tile, and the routing weight is folded
+  into the SwiGLU. That also removes the f32 expert copies, so the resident
+  model drops from ~52 GiB to ~35 GiB. Remaining: the tokenizer + chat
+  template for a text prompt, and the same quantized-GEMM treatment for the
+  attention/dense weights.
 - **Model-gated tests treat a manifest-only pack as present.**
   `test_util::dgq_model_dir()` returns `Some` when `model.dgq.json` exists, so an
   interrupted pack download (manifest present, `model.dgq.bin` missing or a

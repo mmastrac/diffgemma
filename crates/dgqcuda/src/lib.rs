@@ -12,3 +12,4 @@ pub mod weights;
 
 #[cfg(feature = "cuda")]
 pub use gpu::cublas_probe;
+pub mod moe_grouped;

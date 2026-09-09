@@ -8,6 +8,7 @@ mod config;
 mod denoise;
 mod forward;
 mod gpu;
+mod moe_grouped;
 mod weights;
 
 use config::ModelConfig;

@@ -157,8 +157,11 @@ pub(crate) struct GpuLayer {
     pub(crate) router_proj: DeviceBuffer,
     pub(crate) router_scale: DeviceBuffer,
     pub(crate) router_per_expert_scale: DeviceBuffer,
-    pub(crate) experts_gate_up: DeviceBuffer,
-    pub(crate) experts_down: DeviceBuffer,
+    /// The expert stacks as raw q4 bytes ([n_experts, n, k] rows), which
+    /// the grouped kernel decodes on the fly. Keeping them quantized is both
+    /// 4x less resident memory and 4x fewer bytes read per step.
+    pub(crate) experts_gate_up_q4: DeviceBuffer,
+    pub(crate) experts_down_q4: DeviceBuffer,
     pub(crate) layer_scalar: f32,
 }
 
@@ -190,6 +193,12 @@ fn bf16_to_f32(bytes: &[u8]) -> Vec<f32> {
         out.push(f32::from_bits((bits as u32) << 16));
     }
     out
+}
+
+pub(crate) fn up_bytes(ctx: &Context, data: &[u8]) -> Result<DeviceBuffer, Error> {
+    let b = DeviceBuffer::alloc(ctx, data.len().max(1))?;
+    b.write_bytes(data)?;
+    Ok(b)
 }
 
 pub(crate) fn up_f32(ctx: &Context, data: &[f32]) -> Result<DeviceBuffer, Error> {
@@ -262,8 +271,8 @@ impl GpuModel {
                 router_proj: up_f32(&ctx, &w.tensor_f32(&k.router_proj)?)?,
                 router_scale: up_f32(&ctx, &w.tensor_f32(&k.router_scale)?)?,
                 router_per_expert_scale: up_f32(&ctx, &w.tensor_f32(&k.router_per_expert_scale)?)?,
-                experts_gate_up: up_f32(&ctx, &w.tensor_f32(&k.experts_gate_up)?)?,
-                experts_down: up_f32(&ctx, &w.tensor_f32(&k.experts_down)?)?,
+                experts_gate_up_q4: up_bytes(&ctx, &w.raw_bf16_bytes(&k.experts_gate_up)?)?,
+                experts_down_q4: up_bytes(&ctx, &w.raw_bf16_bytes(&k.experts_down)?)?,
                 layer_scalar: w.scalar(&k.layer_scalar)?,
             });
         }
@@ -303,6 +312,16 @@ pub(crate) struct Bufs {
     pub(crate) expert_gu: DeviceBuffer,
     pub(crate) expert_act: DeviceBuffer,
     pub(crate) expert_out: DeviceBuffer,
+    /// Grouped MoE: expert-major rows of the flat [rows, hidden] input, the
+    /// [rows, 2*inter] gate/up result, the [rows, inter] activation, the
+    /// [rows, hidden] down result, and the per-row bucket tables.
+    pub(crate) moe_rows_a: DeviceBuffer,
+    pub(crate) moe_rows_gu: DeviceBuffer,
+    pub(crate) moe_rows_act: DeviceBuffer,
+    pub(crate) moe_rows_down: DeviceBuffer,
+    pub(crate) moe_starts: DeviceBuffer,
+    pub(crate) moe_tok_idx: DeviceBuffer,
+    pub(crate) moe_row_w: DeviceBuffer,
     /// [seq, vocab] — the full canvas's logits on the `LogitRows::All` path,
     /// one row on the others.
     pub(crate) logits: DeviceBuffer,
@@ -341,6 +360,13 @@ impl Bufs {
             expert_gu: a(t.moe_intermediate_size * 2)?,
             expert_act: a(t.moe_intermediate_size)?,
             expert_out: a(hidden)?,
+            moe_rows_a: a(seq * t.top_k_experts * hidden)?,
+            moe_rows_gu: a(seq * t.top_k_experts * t.moe_intermediate_size * 2)?,
+            moe_rows_act: a(seq * t.top_k_experts * t.moe_intermediate_size)?,
+            moe_rows_down: a(seq * t.top_k_experts * hidden)?,
+            moe_starts: a(t.num_experts + 1)?,
+            moe_tok_idx: a(seq * t.top_k_experts)?,
+            moe_row_w: a(seq * t.top_k_experts)?,
             logits: a(seq * t.vocab_size)?,
         })
     }
@@ -873,55 +899,84 @@ pub(crate) fn layer_forward(
     b.top_w.read_f32(&mut wts)?;
     r.mark("l:route_readback");
 
-    // zero moe_out, then accumulate each token's experts
+    // Grouped MoE: bucket the tokens by expert, gather their normalized rows
+    // into one expert-major matrix, and run one tiled GEMM per expert bucket —
+    // the expert weight tile is then reused across every token in the bucket.
     b.moe_out.zero()?;
     let moe_inter = t.moe_intermediate_size;
-    let gu_stride = moe_inter * 2 * hidden;
-    let down_stride = hidden * moe_inter;
-    for s in 0..seq {
-        for kk in 0..t.top_k_experts {
-            let e = idx[s * t.top_k_experts + kk] as usize;
-            let w = wts[s * t.top_k_experts + kk];
-            let x = offset_view(&b.moe_in, s * hidden);
-            let gu = offset_view(&lw.experts_gate_up, e * gu_stride);
-            r.gemm(
-                1,
-                moe_inter * 2,
-                hidden,
-                x.device_ptr(),
-                gu.device_ptr(),
-                b.expert_gu.device_ptr(),
-            )?;
-            let mut args = KernelArgs::new();
-            args.device_ptr(b.expert_gu.device_ptr())
-                .device_ptr(unsafe { b.expert_gu.device_ptr() + (moe_inter as u64) * 4 })
-                .f32(1.0)
-                .device_ptr(b.expert_act.device_ptr())
-                .u32(moe_inter as u32);
-            launch(
-                ctx,
-                "dgq_swiglu_weighted",
-                flat(moe_inter, 256),
-                256,
-                &mut args,
-            )?;
-            let dn = offset_view(&lw.experts_down, e * down_stride);
-            r.gemm(
-                1,
-                hidden,
-                moe_inter,
-                b.expert_act.device_ptr(),
-                dn.device_ptr(),
-                b.expert_out.device_ptr(),
-            )?;
-            let dst = offset_view(&b.moe_out, s * hidden);
-            let mut args = KernelArgs::new();
-            args.device_ptr(dst.device_ptr())
-                .device_ptr(b.expert_out.device_ptr())
-                .f32(w)
-                .u32(hidden as u32);
-            launch(ctx, "dgq_accum", flat(hidden, 256), 256, &mut args)?;
-        }
+    let plan =
+        crate::moe_grouped::GroupedPlan::new(&idx, &wts, seq, t.top_k_experts, t.num_experts);
+    let n_rows = plan.rows();
+    // The plan tables live in the session buffers: uploading fresh ones per
+    // layer would add 60 host-to-device copies (and their syncs) per step.
+    b.moe_starts.write_bytes(unsafe {
+        std::slice::from_raw_parts(plan.starts.as_ptr().cast::<u8>(), plan.starts.len() * 4)
+    })?;
+    b.moe_tok_idx.write_bytes(unsafe {
+        std::slice::from_raw_parts(plan.tok_idx.as_ptr().cast::<u8>(), plan.tok_idx.len() * 4)
+    })?;
+    b.moe_row_w.write_f32(&plan.row_w)?;
+    // Gather the expert-major input rows.
+    {
+        let mut args = KernelArgs::new();
+        args.device_ptr(b.moe_in.device_ptr())
+            .device_ptr(b.moe_rows_a.device_ptr())
+            .device_ptr(b.moe_tok_idx.device_ptr())
+            .u32(n_rows as u32)
+            .u32(hidden as u32);
+        launch(ctx, "dgq_moe_gather", rows(n_rows, 256), 256, &mut args)?;
+    }
+    let gemm_gu = crate::moe_grouped::GroupedGemm::new(hidden, moe_inter * 2, "dgq_moe_gate_up");
+    gemm_gu.run(
+        ctx,
+        &b.moe_rows_a,
+        &lw.experts_gate_up_q4,
+        &b.moe_starts,
+        &b.moe_tok_idx,
+        &b.moe_rows_gu,
+        n_rows,
+        plan.num_jobs(),
+    )?;
+    {
+        let mut args = KernelArgs::new();
+        args.device_ptr(b.moe_rows_gu.device_ptr())
+            .device_ptr(b.moe_rows_act.device_ptr())
+            .device_ptr(b.moe_row_w.device_ptr())
+            .u32(n_rows as u32)
+            .u32(moe_inter as u32);
+        launch(
+            ctx,
+            "dgq_moe_swiglu_weighted",
+            flat(n_rows * moe_inter, 256),
+            256,
+            &mut args,
+        )?;
+    }
+    let gemm_down = crate::moe_grouped::GroupedGemm::new(moe_inter, hidden, "dgq_moe_down");
+    gemm_down.run(
+        ctx,
+        &b.moe_rows_act,
+        &lw.experts_down_q4,
+        &b.moe_starts,
+        &b.moe_tok_idx,
+        &b.moe_rows_down,
+        n_rows,
+        plan.num_jobs(),
+    )?;
+    {
+        let mut args = KernelArgs::new();
+        args.device_ptr(b.moe_out.device_ptr())
+            .device_ptr(b.moe_rows_down.device_ptr())
+            .device_ptr(b.moe_tok_idx.device_ptr())
+            .u32(n_rows as u32)
+            .u32(hidden as u32);
+        launch(
+            ctx,
+            "dgq_moe_scatter",
+            flat(n_rows * hidden, 256),
+            256,
+            &mut args,
+        )?;
     }
     // CPU oracle: scratch = moe_out; moe_out = rms(scratch) * w2; normed += moe_out.
     // rms writes into b.normed (which holds this branch's residual), so the
