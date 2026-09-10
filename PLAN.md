@@ -272,21 +272,16 @@ clears 0.641 by a lot.
   never over rows: a row-count grid silently truncates the gather and the
   expert path degrades to zeros without failing. Text prompts work
   (`--prompt`, tokenizer + chat template), and the remaining port is the same
-  quantized-GEMM treatment for the attention/dense weights. Open: the canvas
-  rows. The device's canvas embedding is bit-identical to the engine's
-  (`diffgemma step-layer-probe` after_preamble against the device's own
-  post-embed row: -0.9068896, -0.283403, -1.4186344, 0.44372812 on both), and
-  the device and its CPU oracle agree exactly at every stage (step parity cos
-  1.0000000, matching argmax). Past the preamble they part company: at a
-  canvas of 256 and seed 7 the device's canvas hidden is uncorrelated with
-  the engine's (cos 0.03 at layer 1, and the device's residual stream grows
-  10-20x larger by layer 13) while the prompt rows match the engine exactly.
-  That still does not localize, because the engine's dump disagrees with its
-  own `apply_from_store` on the preamble: for the same token the engine
-  prints -0.73047 where the engine's own SC function, run on the same
-  weights, gives -0.73150 (ratio 0.50004 against 0.49999 of the embed row),
-  so at least one of those engine paths is not the one the device is being
-  compared against. Settling that is the next step, not another device probe.
+  quantized-GEMM treatment for the attention/dense weights. Open: whether the
+  step's remaining divergence is the sampler trajectory or residual numerical
+  drift. Settled this round: the engine's two preamble paths agree. The older
+  `apply_from_store` fed a zero signal reproduces the production preamble in
+  `encode_step_preamble` exactly (-0.73053414, -0.22829193, -1.1427641,
+  0.3574399), and both differ from `step-layer-probe`'s -0.730469 only by
+  bf16 rounding on the readback. That path skips the self-conditioning MLP on
+  step 1 outright (`first_step` leaves `dense_off` zero), so the device now
+  does the same: a scale-free RMS norm of the canvas embeddings, with the
+  oracle matching. Device and oracle keep cos 1.0000000.
 - **Model-gated tests treat a manifest-only pack as present.**
   `test_util::dgq_model_dir()` returns `Some` when `model.dgq.json` exists, so an
   interrupted pack download (manifest present, `model.dgq.bin` missing or a
