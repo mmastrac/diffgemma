@@ -798,15 +798,20 @@ pub fn forward_sc(
         // hidden state; mirror that so both paths run the same graph.
         sc.hidden_a[..prompt_len * hidden].copy_from_slice(&ph[..prompt_len * hidden]);
     }
-    let pre_norm = w.tensor_f32("model.decoder.self_conditioning.pre_norm.weight")?;
-    let gate_w = w.tensor_f32("model.decoder.self_conditioning.gate_proj.weight")?;
-    let up_w = w.tensor_f32("model.decoder.self_conditioning.up_proj.weight")?;
-    let down_w = w.tensor_f32("model.decoder.self_conditioning.down_proj.weight")?;
-    let signal = match prev_logits {
+    // Step 1 has no previous prediction, and the engine's no-signal branch
+    // applies NO self-conditioning to the canvas rows at all: they are just a
+    // scale-free RMS norm of their own embeddings (src/metal/decoder.rs, the
+    // final else). From step 2 on the SC MLP runs over the soft embedding of
+    // the previous step's logits.
+    match prev_logits {
         Some(lg) => {
-            let mut s = vec![0.0f32; canvas * hidden];
+            let pre_norm = w.tensor_f32("model.decoder.self_conditioning.pre_norm.weight")?;
+            let gate_w = w.tensor_f32("model.decoder.self_conditioning.gate_proj.weight")?;
+            let up_w = w.tensor_f32("model.decoder.self_conditioning.up_proj.weight")?;
+            let down_w = w.tensor_f32("model.decoder.self_conditioning.down_proj.weight")?;
+            let mut signal = vec![0.0f32; canvas * hidden];
             soft_embed_from_logits(
-                &mut s,
+                &mut signal,
                 lg,
                 &embed_w,
                 canvas,
@@ -814,22 +819,31 @@ pub fn forward_sc(
                 hidden,
                 embed_scale,
             );
-            s
+            apply_self_conditioning(
+                &mut sc.hidden_a,
+                &sc.bufs.embed,
+                &signal,
+                prompt_len,
+                canvas,
+                cfg,
+                &pre_norm,
+                &gate_w,
+                &up_w,
+                &down_w,
+            );
         }
-        None => sc.bufs.embed[prompt_len * hidden..].to_vec(),
-    };
-    apply_self_conditioning(
-        &mut sc.hidden_a,
-        &sc.bufs.embed,
-        &signal,
-        prompt_len,
-        canvas,
-        cfg,
-        &pre_norm,
-        &gate_w,
-        &up_w,
-        &down_w,
-    );
+        None => {
+            let base = prompt_len * hidden;
+            for s in 0..canvas {
+                let row = sc.bufs.embed[base + s * hidden..base + (s + 1) * hidden].to_vec();
+                rms_norm_no_scale_row(
+                    &mut sc.hidden_a[base + s * hidden..base + (s + 1) * hidden],
+                    &row,
+                    t.rms_norm_eps as f32,
+                );
+            }
+        }
+    }
     let n_layers = layers
         .unwrap_or(t.num_hidden_layers)
         .min(t.num_hidden_layers);
