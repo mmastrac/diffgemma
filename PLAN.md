@@ -272,17 +272,21 @@ clears 0.641 by a lot.
   never over rows: a row-count grid silently truncates the gather and the
   expert path degrades to zeros without failing. Text prompts work
   (`--prompt`, tokenizer + chat template), and the remaining port is the same
-  quantized-GEMM treatment for the attention/dense weights. Open: the residual
-  drift between the device's canvas rows and the engine's, and after it the
-  sampler trajectory. `step-layer-probe` note: its `checkpoints[N+1]` is the
-  output of layer N and `checkpoints[0]` is the preamble, so a comparison must
-  shift by one -- reading them unshifted understates agreement. With the step-1
-  path fixed and the layers aligned, the device tracks the engine per row
-  (row 0 l2, device vs engine): layer 1 67.2 vs 66.5, layer 13 128.3 vs 135.1,
-  layer 20 75.6 vs 78.5, against 1064 vs 70.9 and 1917 vs 133 before the fix.
-  The cosine sits at 0.4-0.7, consistent with the device's f32 weights against
-  the engine's bf16 attention/dense, but that is not proven and the reply is
-  still not text, so the drift is the next thing to attribute.
+  quantized-GEMM treatment for the attention/dense weights. Open: why the step
+  still does not produce text. What is ruled out: the commit rule (the device
+  now inverse-CDF samples like `sample_apply`, and still degenerates), the
+  step-1 preamble, the MoE path, the attention path, and the prompt rows, all
+  of which match the engine or the oracle exactly. What is measured: the
+  device's step-1 logits are sharp where the engine's are nearly uniform at
+  the same seed, prompt and canvas -- full-vocabulary entropy 0.936 raw and
+  9.862 after the softcap, against the engine's 11.426. Two cautions on that
+  number: the engine's dumps store logits AFTER the softcap (`logit_softcapping`
+  runs before the readback, and its `logit_raw` inverts through atanh to a raw
+  value near 42), and the engine's `step-layer-probe`/`step-logits-dump`
+  numbers remain lower-magnitude than the device's by roughly 2x on the
+  residual stream. The remaining candidates are the f32-versus-bf16 weight
+  precision in attention/dense, and the sampler's tolerance to it on a random
+  canvas.
 - **Model-gated tests treat a manifest-only pack as present.**
   `test_util::dgq_model_dir()` returns `Some` when `model.dgq.json` exists, so an
   interrupted pack download (manifest present, `model.dgq.bin` missing or a
