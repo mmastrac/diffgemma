@@ -4,7 +4,7 @@
 
 use dgqcuda::denoise::{
     DenoiseState, MIN_EARLY_STOP_STEPS, Rng, SamplerConfig, StopReason, accept_mask_from_entropies,
-    row_stats,
+    row_stats, sample_row,
 };
 
 #[test]
@@ -76,6 +76,33 @@ fn row_stats_matches_a_hand_computed_row() {
 }
 
 #[test]
+fn sample_row_is_an_inverse_cdf_over_the_tempered_row() {
+    // Uniform row: the CDF rises in equal steps, so u picks the bin it lands in.
+    let row = [0.0f32, 0.0, 0.0, 0.0];
+    let stats = row_stats(&row, 1, 4, 1.0);
+    assert!((stats.sum[0] - 4.0).abs() < 1e-6);
+    assert!((stats.max[0] - 0.0).abs() < 1e-6);
+    for (u, want) in [(0.01f32, 0u32), (0.30, 1), (0.55, 2), (0.99, 3)] {
+        assert_eq!(
+            sample_row(&row, stats.max[0], stats.sum[0], u, 1.0),
+            want,
+            "u {u}"
+        );
+    }
+    // Peaked row: essentially all mass is on token 1, so every u >= its tail
+    // picks it.
+    let row = [0.0f32, 10.0, 0.0, 0.0];
+    let stats = row_stats(&row, 1, 4, 1.0);
+    for u in [0.001f32, 0.5, 0.999] {
+        assert_eq!(
+            sample_row(&row, stats.max[0], stats.sum[0], u, 1.0),
+            1,
+            "u {u}"
+        );
+    }
+}
+
+#[test]
 fn step_commits_accepted_argmax_and_renoises_the_rest() {
     // A canvas of 2, vocab 4. Row 0 is sharply peaked (accepted); row 1 is
     // uniform (rejected, re-noised with a fresh uniform draw).
@@ -89,8 +116,13 @@ fn step_commits_accepted_argmax_and_renoises_the_rest() {
     let (stats, stop) = st.step(&logits, vocab);
     assert_eq!(stats.step, 1);
     assert!(stop.is_none());
-    // The peaked row is accepted and takes its argmax.
-    assert_eq!(st.ids[0], 1);
+    // The peaked row is accepted and takes its CATEGORICAL DRAW, not its
+    // argmax: the engine's `sample_apply` fills `new_sample` by inverse CDF on
+    // every step. With this row's mass at token 1 the draw lands there anyway,
+    // so the commitment is checked against `new_sample` rather than by value.
+    assert_eq!(st.ids[0], st.new_sample[0]);
+    // The peaked row's draw must be its argmax here: the mass is at token 1.
+    assert_eq!(st.new_sample[0], 1);
     assert!(st.accept[0]);
     // The uniform row is re-noised, so its id is some valid token.
     assert!(st.ids[1] < vocab as u32);
@@ -113,8 +145,13 @@ fn the_final_step_commits_every_position() {
     // Every position commits on the last step, so a half-denoised canvas
     // cannot leak out of the loop.
     assert_eq!(stats.accept_count, 2);
-    assert_eq!(st.ids[0], 1);
-    assert_eq!(st.ids[1], 0);
+    // Both positions commit their categorical draw, so these are not the argmax
+    // by construction -- the engine's `sample_apply` samples every step and the
+    // final step differs only by accepting all of it.
+    assert_eq!(st.ids[0], st.new_sample[0]);
+    assert_eq!(st.ids[1], st.new_sample[1]);
+    assert_eq!(st.new_sample[0], 1, "the peaked row's mass is at token 1");
+    assert!(st.new_sample[1] < vocab as u32);
     assert_eq!(stop, Some(StopReason::MaxSteps));
 }
 

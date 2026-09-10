@@ -118,11 +118,17 @@ pub fn initialize_canvas(canvas_len: usize, vocab_size: usize, rng: &mut Rng) ->
 pub struct RowStats {
     pub entropy: Vec<f32>,
     pub argmax: Vec<u32>,
+    /// Row softmax max and sum over the tempered logits, which the categorical
+    /// draw needs.
+    pub max: Vec<f32>,
+    pub sum: Vec<f32>,
 }
 
 pub fn row_stats(logits: &[f32], rows: usize, cols: usize, t: f32) -> RowStats {
     let mut entropy = vec![0.0f32; rows];
     let mut argmax = vec![0u32; rows];
+    let mut maxes = vec![0.0f32; rows];
+    let mut sums = vec![0.0f32; rows];
     for r in 0..rows {
         let row = &logits[r * cols..(r + 1) * cols];
         let mut mx = f32::NEG_INFINITY;
@@ -148,8 +154,31 @@ pub fn row_stats(logits: &[f32], rows: usize, cols: usize, t: f32) -> RowStats {
         }
         entropy[r] = z.ln() - acc / z;
         argmax[r] = am as u32;
+        maxes[r] = mx;
+        sums[r] = z;
     }
-    RowStats { entropy, argmax }
+    RowStats {
+        entropy,
+        argmax,
+        max: maxes,
+        sum: sums,
+    }
+}
+
+/// Categorical inverse-CDF over one row of tempered logits. This is the
+/// engine's `sample_apply`, which fills `S->new_sample` on EVERY step
+/// including the last one -- the final step's difference is that every
+/// position is accepted, not that the token comes from somewhere else.
+pub fn sample_row(row: &[f32], mx: f32, z: f32, u: f32, t: f32) -> u32 {
+    let target = u * z;
+    let mut cum = 0.0f32;
+    for (v, &lg) in row.iter().enumerate() {
+        cum += (lg / t - mx).exp();
+        if cum >= target {
+            return v as u32;
+        }
+    }
+    row.len().saturating_sub(1) as u32
 }
 
 /// HuggingFace/MLX `EntropyBoundSampler`: sort by entropy ascending, accept
@@ -199,6 +228,9 @@ pub struct DenoiseState {
     pub entropy: Vec<f32>,
     pub accept: Vec<bool>,
     pub u_cat: Vec<f32>,
+    /// The categorical draw for each position, recomputed every step (the
+    /// engine's `CanvasState.new_sample`).
+    pub new_sample: Vec<u32>,
     pub step: usize,
     argmax_hist: Vec<u32>,
     argmax_hist_len: u32,
@@ -219,6 +251,7 @@ impl DenoiseState {
             entropy: vec![0.0; canvas],
             accept: vec![false; canvas],
             u_cat: vec![0.0; canvas],
+            new_sample: vec![0; canvas],
             step: 0,
             argmax_hist: vec![0; ARGMAX_HIST_MAX * SAMPLER_CANVAS],
             argmax_hist_len: 0,
@@ -252,6 +285,16 @@ impl DenoiseState {
         for u in self.u_cat.iter_mut() {
             *u = self.rng.next_f32();
         }
+        // `new_sample` is a categorical draw over the tempered row, not the
+        // argmax: the engine's `sample_apply` fills it that way on every step,
+        // and the final step only differs by accepting all of it. Taking the
+        // argmax on the last step instead concentrates the whole reply on the
+        // modal token of each row.
+        self.new_sample.resize(canvas, 0);
+        for r in 0..canvas {
+            let row = &logits[r * vocab..(r + 1) * vocab];
+            self.new_sample[r] = sample_row(row, stats.max[r], stats.sum[r], self.u_cat[r], t);
+        }
 
         // Accept mask. On the final step every position commits, so the loop
         // cannot end on a half-denoised canvas.
@@ -281,7 +324,7 @@ impl DenoiseState {
         let mut changed = 0usize;
         for i in 0..canvas {
             let next = if self.accept[i] {
-                self.argmax[i]
+                self.new_sample[i]
             } else {
                 self.rng.uniform_below(vocab.max(1) as u32)
             };
