@@ -52,6 +52,10 @@ struct Args {
     prompt: Option<String>,
     /// `--diag`: per-step logit statistics.
     diag: bool,
+    /// `--dump-step PATH`: write the first step's raw canvas logits as JSON,
+    /// in the shape of the engine's `step-logits-dump`, so the two can be
+    /// diffed token by token.
+    dump_step: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -70,6 +74,7 @@ fn parse_args() -> Result<Args, String> {
     let mut causal = false;
     let mut prompt = None;
     let mut diag = false;
+    let mut dump_step: Option<String> = None;
     let mut stop_after = 0u8;
     let mut it = std::env::args().skip(1);
     if let Some(first) = it.next() {
@@ -113,6 +118,7 @@ fn parse_args() -> Result<Args, String> {
             "--causal" => causal = true,
             "--prompt" => prompt = Some(it.next().ok_or("--prompt needs a value")?),
             "--diag" => diag = true,
+            "--dump-step" => dump_step = Some(it.next().ok_or("--dump-step needs a path")?),
             "--gpu" => gpu = true,
             "--stop-after" => {
                 let s = it.next().ok_or("--stop-after needs a value")?;
@@ -153,7 +159,57 @@ fn parse_args() -> Result<Args, String> {
         causal,
         prompt,
         diag,
+        dump_step,
     })
+}
+
+/// Write one step's raw canvas logits in the engine's step-logits-dump shape.
+fn dump_step_json(
+    path: &str,
+    canvas_ids: &[u32],
+    logits: &[f32],
+    vocab: usize,
+    prompt_ids: &[u32],
+    prompt_text: &str,
+) -> Result<(), config::Error> {
+    let rows = canvas_ids.len();
+    let mut out = String::new();
+    out.push_str(&format!("{{\"rows\": ["));
+    for r in 0..rows {
+        if r > 0 {
+            out.push(',');
+        }
+        let row = &logits[r * vocab..(r + 1) * vocab];
+        let mut idx: Vec<usize> = (0..vocab).collect();
+        idx.sort_by(|&a, &b| {
+            row[b]
+                .partial_cmp(&row[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let am = idx[0];
+        let top: Vec<String> = idx[..16]
+            .iter()
+            .map(|&i| format!("{{\"token\":{i},\"logit_raw\":{}}}", row[i]))
+            .collect();
+        out.push_str(&format!(
+            "{{\"position\":{r},\"canvas_token\":{},\"argmax_raw\":{am},\"logit_raw_at_argmax\":{},\"token_logits\":[{}]}}",
+            canvas_ids[r],
+            row[am],
+            top.join(",")
+        ));
+    }
+    out.push_str(&format!(
+        "], \"prompt_token_ids\": [{}], \"prompt\": {:?}, \"vocab\": {vocab}}}",
+        prompt_ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        prompt_text
+    ));
+    std::fs::write(path, out)?;
+    eprintln!("wrote {path} ({rows} rows)");
+    Ok(())
 }
 
 fn top_k(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
@@ -472,9 +528,21 @@ fn run(args: &Args) -> Result<(), config::Error> {
             }
             let mut total = std::time::Duration::ZERO;
             let mut prev: Option<Vec<f32>> = None;
+            let mut step_no = 0usize;
             for _ in 0..st.cfg.max_denoising_steps {
                 let start = std::time::Instant::now();
                 let logits = sess.step(prompt, &ph, &st.ids)?;
+                if let Some(path) = args.dump_step.as_ref().filter(|_| step_no == 0) {
+                    dump_step_json(
+                        path,
+                        &st.ids,
+                        &logits,
+                        t.vocab_size,
+                        prompt,
+                        args.prompt.as_deref().unwrap_or(""),
+                    )?;
+                }
+                step_no += 1;
                 sess.set_prev_logits(&logits)?;
                 if args.diag {
                     // Device post-layer hidden for the canvas row vs the CPU
