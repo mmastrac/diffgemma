@@ -272,16 +272,17 @@ clears 0.641 by a lot.
   never over rows: a row-count grid silently truncates the gather and the
   expert path degrades to zeros without failing. Text prompts work
   (`--prompt`, tokenizer + chat template), and the remaining port is the same
-  quantized-GEMM treatment for the attention/dense weights. Open: whether the
-  step's remaining divergence is the sampler trajectory or residual numerical
-  drift. Settled this round: the engine's two preamble paths agree. The older
-  `apply_from_store` fed a zero signal reproduces the production preamble in
-  `encode_step_preamble` exactly (-0.73053414, -0.22829193, -1.1427641,
-  0.3574399), and both differ from `step-layer-probe`'s -0.730469 only by
-  bf16 rounding on the readback. That path skips the self-conditioning MLP on
-  step 1 outright (`first_step` leaves `dense_off` zero), so the device now
-  does the same: a scale-free RMS norm of the canvas embeddings, with the
-  oracle matching. Device and oracle keep cos 1.0000000.
+  quantized-GEMM treatment for the attention/dense weights. Open: the residual
+  drift between the device's canvas rows and the engine's, and after it the
+  sampler trajectory. `step-layer-probe` note: its `checkpoints[N+1]` is the
+  output of layer N and `checkpoints[0]` is the preamble, so a comparison must
+  shift by one -- reading them unshifted understates agreement. With the step-1
+  path fixed and the layers aligned, the device tracks the engine per row
+  (row 0 l2, device vs engine): layer 1 67.2 vs 66.5, layer 13 128.3 vs 135.1,
+  layer 20 75.6 vs 78.5, against 1064 vs 70.9 and 1917 vs 133 before the fix.
+  The cosine sits at 0.4-0.7, consistent with the device's f32 weights against
+  the engine's bf16 attention/dense, but that is not proven and the reply is
+  still not text, so the drift is the next thing to attribute.
 - **Model-gated tests treat a manifest-only pack as present.**
   `test_util::dgq_model_dir()` returns `Some` when `model.dgq.json` exists, so an
   interrupted pack download (manifest present, `model.dgq.bin` missing or a
