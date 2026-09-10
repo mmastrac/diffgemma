@@ -392,6 +392,23 @@ impl Session {
         // canvas rows need embedding + self-conditioning.
         self.bufs.hidden_a.write_f32(prompt_hidden)?;
         self.embed_rows(canvas_ids, self.prompt_len)?;
+        // The buffers are sized for [prompt][canvas]; the canvas is written
+        // into the tail, leaving no spare row today, but the zeroing keeps a
+        // future short canvas from feeding stale rows into attention, which
+        // attends every position up to seq and cannot tell a filler row from
+        // a live one.
+        {
+            let base = (self.prompt_len + self.canvas) * hidden;
+            let spare = self.seq - (self.prompt_len + self.canvas);
+            if spare > 0 {
+                self.model.ctx.set_current()?;
+                let dst = unsafe { self.bufs.hidden_a.device_ptr() + (base as u64) * 4 };
+                self.model.ctx.driver().check(
+                    unsafe { (self.model.ctx.driver().cu_memset_d8)(dst, 0, spare * hidden * 4) },
+                    "cuMemsetD8",
+                )?;
+            }
+        }
         if timing {
             ctx.synchronize()?;
             eprintln!("  [d] embed ok");
