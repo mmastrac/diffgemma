@@ -273,13 +273,15 @@ clears 0.641 by a lot.
   expert path degrades to zeros without failing. Text prompts work
   (`--prompt`, tokenizer + chat template), and the remaining port is the same
   quantized-GEMM treatment for the attention/dense weights. Open: the step's
-  output still does not converge to text. Step 1's logits are already past
-  the final softcap on every row, so both the device and the engine report
-  argmax 30.0 and their entropies are not comparable until the softcap comes
-  off; what is left is the sampler's trajectory, not a scale. `--dump-step
-  PATH` writes the step's canvas logits in the engine's own JSON shape for a
-  token-by-token diff, and `diffgemma step-logits-dump --steps N` writes the
-  engine's.
+  first self-conditioning block. The device and its CPU oracle agree exactly
+  (step parity cos 1.0000000, matching argmax at a canvas of 4 and of 256)
+  and the engine's own `apply_from_store` on the canvas rows reproduces the
+  same canvas hidden, so the block is not the suspect. What is open is the
+  per-step trajectory: the device's step-1 logits are far past the softcap
+  (entropy 0.087 capped against the engine's 11.4) and the canvas then locks
+  into a fixed point instead of converging to text. The engine's
+  `step-logits-dump` re-dumps step 1 for any --steps, so a trajectory
+  comparison needs the engine's per-step canvas, not its logits.
 - **Model-gated tests treat a manifest-only pack as present.**
   `test_util::dgq_model_dir()` returns `Some` when `model.dgq.json` exists, so an
   interrupted pack download (manifest present, `model.dgq.bin` missing or a
