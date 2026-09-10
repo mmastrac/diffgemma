@@ -272,19 +272,16 @@ clears 0.641 by a lot.
   never over rows: a row-count grid silently truncates the gather and the
   expert path degrades to zeros without failing. Text prompts work
   (`--prompt`, tokenizer + chat template), and the remaining port is the same
-  quantized-GEMM treatment for the attention/dense weights. Open: the step's
-  first self-conditioning block. On step 1 the engine takes the no-signal
-  branch -- a scale-free RMS norm of the canvas embeddings, with no SC MLP
-  (src/metal/decoder.rs:299-311). dgqcuda instead feeds the canvas embeddings
-  through the SC MLP, so the canvas rows enter layer 0 at a different scale.
-  Measured with the same prompt, seed and initial canvas (256 ids, identical)
-  against the engine's step-logits-dump: the device's canvas hidden l2 is 1064
-  at layer 1 and peaks at 1917 at layer 13 against the engine's 147.9, giving
-  step-1 logits up to 140 pre-softcap where the engine's saturate below 30.
-  The prompt rows are unaffected (no SC), which is why the causal path, the
-  MoE fix and every per-layer prompt comparison pass while the reply is still
-  noise. `--dump-step PATH` writes the canvas logits in the engine's own JSON
-  shape for a token-by-token diff.
+  quantized-GEMM treatment for the attention/dense weights. Open: the canvas
+  rows still enter layer 0 smaller than the engine's. Measured with the same
+  prompt, seed and initial canvas, step 1's canvas hidden reads about -0.10 in
+  its first slot where the engine's step-logits-dump reports -5.625, and the
+  engine's canvas hidden l2 settles near 148 while the device's is several
+  hundred. Both the device and its CPU oracle agree on the value, and the
+  prompt rows match the engine's to the last digit, so the next measurement is
+  the device's post-embed canvas row against the engine's, not another logit
+  comparison. `--dump-step PATH` writes the canvas logits in the engine's own
+  JSON shape for a token-by-token diff.
 - **Model-gated tests treat a manifest-only pack as present.**
   `test_util::dgq_model_dir()` returns `Some` when `model.dgq.json` exists, so an
   interrupted pack download (manifest present, `model.dgq.bin` missing or a
