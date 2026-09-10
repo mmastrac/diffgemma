@@ -22,8 +22,12 @@ extern "C" __global__ void dgq_rms_norm(
         if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
         __syncthreads();
     }
-    const float inv = rsqrtf(red[0] / (float)hidden + eps);
+    // Every thread must see the finished reduction before it reads red[0]:
+    // without this the threads that skipped the last tree levels read a
+    // partial sum, so the row scale depends on scheduling (the prompt path
+    // and the denoise step disagreed on the same row).
     __syncthreads();
+    const float inv = rsqrtf(red[0] / (float)hidden + eps);
     for (unsigned i = threadIdx.x; i < hidden; i += blockDim.x) {
         o[i] = xr[i] * inv * weight[i];
     }
@@ -52,6 +56,9 @@ extern "C" __global__ void dgq_rms_norm_ns(
         if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
         __syncthreads();
     }
+    // Same barrier as dgq_rms_norm: red[0] is only final once every thread
+    // has left the tree reduction.
+    __syncthreads();
     const float inv = rsqrtf(red[0] / (float)hidden + eps);
     for (unsigned i = threadIdx.x; i < hidden; i += blockDim.x) {
         o[i] = xr[i] * inv;
@@ -80,8 +87,9 @@ extern "C" __global__ void dgq_rms_norm_heads(
         if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
         __syncthreads();
     }
-    const float inv = rsqrtf(red[0] / (float)head_dim + eps);
+    // Barrier before reading the reduced value (see dgq_rms_norm).
     __syncthreads();
+    const float inv = rsqrtf(red[0] / (float)head_dim + eps);
     for (unsigned i = threadIdx.x; i < head_dim; i += blockDim.x) {
         o[i] = xr[i] * inv * (weight ? weight[i] : 1.0f);
     }
@@ -216,8 +224,9 @@ extern "C" __global__ void dgq_router_input(
         if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
         __syncthreads();
     }
-    const float inv = rsqrtf(red[0] / (float)hidden + eps);
+    // Barrier before reading the reduced value (see dgq_rms_norm).
     __syncthreads();
+    const float inv = rsqrtf(red[0] / (float)hidden + eps);
     for (unsigned i = threadIdx.x; i < hidden; i += blockDim.x) {
         o[i] = xr[i] * inv * scale[i] * root;
     }
