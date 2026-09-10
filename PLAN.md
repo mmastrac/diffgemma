@@ -272,16 +272,14 @@ clears 0.641 by a lot.
   never over rows: a row-count grid silently truncates the gather and the
   expert path degrades to zeros without failing. Text prompts work
   (`--prompt`, tokenizer + chat template), and the remaining port is the same
-  quantized-GEMM treatment for the attention/dense weights. Open: the canvas
-  rows still enter layer 0 smaller than the engine's. Measured with the same
-  prompt, seed and initial canvas, step 1's canvas hidden reads about -0.10 in
-  its first slot where the engine's step-logits-dump reports -5.625, and the
-  engine's canvas hidden l2 settles near 148 while the device's is several
-  hundred. Both the device and its CPU oracle agree on the value, and the
-  prompt rows match the engine's to the last digit, so the next measurement is
-  the device's post-embed canvas row against the engine's, not another logit
-  comparison. `--dump-step PATH` writes the canvas logits in the engine's own
-  JSON shape for a token-by-token diff.
+  quantized-GEMM treatment for the attention/dense weights. Open: the step's
+  output still does not converge to text. Step 1's logits are already past
+  the final softcap on every row, so both the device and the engine report
+  argmax 30.0 and their entropies are not comparable until the softcap comes
+  off; what is left is the sampler's trajectory, not a scale. `--dump-step
+  PATH` writes the step's canvas logits in the engine's own JSON shape for a
+  token-by-token diff, and `diffgemma step-logits-dump --steps N` writes the
+  engine's.
 - **Model-gated tests treat a manifest-only pack as present.**
   `test_util::dgq_model_dir()` returns `Some` when `model.dgq.json` exists, so an
   interrupted pack download (manifest present, `model.dgq.bin` missing or a
