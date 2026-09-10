@@ -267,13 +267,10 @@ clears 0.641 by a lot.
   into the SwiGLU. That also removes the f32 expert copies, so the resident
   model drops from ~52 GiB to ~35 GiB. The grouped launch reads each bucket's
   expert from the plan (`experts[job]`), never from the job index: a bucket
-  with no tokens holds no rows, so job j is not expert j. Remaining: the
-  `denoise --parity` step is the blocker for token generation: `forward` is
-  coherent but a step's canvas logits are garbage (mean ~32, argmax ~152,
-  decoded as `<unusedN>` noise). Layer 0's `hidden_a`, `residual` and pre-FFN
-  norm agree with the oracle to 1e-6 while the MoE output already differs
-  (device -0.3465 vs oracle 2.5926 from the same input and routing), so the
-  hunt is inside the step's expert path. Text prompts work
+  with no tokens holds no rows, so job j is not expert j. Every bucketed
+  kernel is element-wise and must be dispatched over `rows * width` elements,
+  never over rows: a row-count grid silently truncates the gather and the
+  expert path degrades to zeros without failing. Text prompts work
   (`--prompt`, tokenizer + chat template), and the remaining port is the same
   quantized-GEMM treatment for the attention/dense weights.
 - **Model-gated tests treat a manifest-only pack as present.**
