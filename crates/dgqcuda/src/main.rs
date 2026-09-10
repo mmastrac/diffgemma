@@ -171,6 +171,7 @@ fn dump_step_json(
     vocab: usize,
     prompt_ids: &[u32],
     prompt_text: &str,
+    softcap: Option<f32>,
 ) -> Result<(), config::Error> {
     let rows = canvas_ids.len();
     let mut out = String::new();
@@ -179,7 +180,12 @@ fn dump_step_json(
         if r > 0 {
             out.push(',');
         }
-        let row = &logits[r * vocab..(r + 1) * vocab];
+        let raw = &logits[r * vocab..(r + 1) * vocab];
+        let row: Vec<f32> = match softcap {
+            Some(cap) => raw.iter().map(|v| (v / cap).tanh() * cap).collect(),
+            None => raw.to_vec(),
+        };
+        let row = &row[..];
         let mut idx: Vec<usize> = (0..vocab).collect();
         idx.sort_by(|&a, &b| {
             row[b]
@@ -540,6 +546,7 @@ fn run(args: &Args) -> Result<(), config::Error> {
                         t.vocab_size,
                         prompt,
                         args.prompt.as_deref().unwrap_or(""),
+                        Some(t.final_logit_softcapping as f32).filter(|c| *c > 0.0),
                     )?;
                 }
                 step_no += 1;
