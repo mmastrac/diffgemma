@@ -204,6 +204,8 @@ extern "C" __global__ void dgq_moe_swiglu_weighted(
     const float t = (uu > 8.0f) ? 1.0f : (uu < -8.0f) ? -1.0f : tanhf(uu);
     const float gelu = 0.5f * g * (1.0f + t);
     act[i] = gelu * u * row_w[grow];
+    if (i == 0u) {
+    }
 }
 
 // dst[token, :] += src[row, :] for every expert-major row (the routing weight

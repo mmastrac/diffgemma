@@ -4,11 +4,13 @@
 //!   forward   run the forward pass and print the next-token distribution
 //!   parity    CPU oracle vs CUDA forward pass on the same prompt
 
+mod chat_template;
 mod config;
 mod denoise;
 mod forward;
 mod gpu;
 mod moe_grouped;
+mod tokenizer;
 mod weights;
 
 use config::ModelConfig;
@@ -45,6 +47,11 @@ struct Args {
     /// `hidden-parity --causal`: compare against a short causal pass over the
     /// prompt rows (the device prompt path's shape) instead of the step.
     causal: bool,
+    /// `--prompt TEXT`: render a text prompt through the chat template instead
+    /// of using `--ids`.
+    prompt: Option<String>,
+    /// `--diag`: per-step logit statistics.
+    diag: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -61,6 +68,8 @@ fn parse_args() -> Result<Args, String> {
     let mut steps: Option<usize> = None;
     let mut parity = false;
     let mut causal = false;
+    let mut prompt = None;
+    let mut diag = false;
     let mut stop_after = 0u8;
     let mut it = std::env::args().skip(1);
     if let Some(first) = it.next() {
@@ -102,6 +111,8 @@ fn parse_args() -> Result<Args, String> {
             }
             "--parity" => parity = true,
             "--causal" => causal = true,
+            "--prompt" => prompt = Some(it.next().ok_or("--prompt needs a value")?),
+            "--diag" => diag = true,
             "--gpu" => gpu = true,
             "--stop-after" => {
                 let s = it.next().ok_or("--stop-after needs a value")?;
@@ -140,6 +151,8 @@ fn parse_args() -> Result<Args, String> {
         steps,
         parity,
         causal,
+        prompt,
+        diag,
     })
 }
 
@@ -205,7 +218,27 @@ fn run(args: &Args) -> Result<(), config::Error> {
     let w = Weights::open(&args.model, &cfg)?;
     eprintln!("pack opened in {:.1}s", load_start.elapsed().as_secs_f32());
 
-    let seq = args.ids.len();
+    // A text prompt is rendered through the chat template; without one the
+    // golden token ids are used, so the existing probes keep working.
+    let tok = if args.prompt.is_some() {
+        Some(tokenizer::Tokenizer::load(
+            std::path::Path::new(&args.model).join("tokenizer.json"),
+        )?)
+    } else {
+        None
+    };
+    let ids: Vec<u32> = match (&args.prompt, &tok) {
+        (Some(text), Some(tok)) => {
+            let rendered = chat_template::user_prompt_ids(tok, text)?;
+            eprintln!("prompt: {} ids", rendered.len());
+            eprintln!("  ids {rendered:?}");
+            eprintln!("  text {:?}", tok.decode(&rendered));
+            rendered
+        }
+        _ => args.ids.clone(),
+    };
+    let ids = ids.as_slice();
+    let seq = ids.len();
     let mut sc = Scratch::new(seq, &cfg);
 
     match args.cmd.as_str() {
@@ -217,17 +250,9 @@ fn run(args: &Args) -> Result<(), config::Error> {
                 None => forward::LogitRows::Last,
             };
             let out = if args.gpu {
-                gpu::forward_stop(
-                    &w,
-                    &cfg,
-                    &args.ids,
-                    args.layers,
-                    rows,
-                    &mut sc,
-                    args.stop_after,
-                )?
+                gpu::forward_stop(&w, &cfg, ids, args.layers, rows, &mut sc, args.stop_after)?
             } else {
-                forward::forward(&w, &cfg, &args.ids, args.layers, rows, &mut sc)?
+                forward::forward(&w, &cfg, ids, args.layers, rows, &mut sc)?
             };
             let elapsed = start.elapsed();
             let rows_done = out.logits.len() / t.vocab_size;
@@ -276,15 +301,15 @@ fn run(args: &Args) -> Result<(), config::Error> {
             let n = args.layers.unwrap_or(t.num_hidden_layers);
             let prev = std::cell::Cell::new(1.0f32);
             for layer in 1..=n {
-                let g = sess.prompt_hidden_after(&args.ids, layer)?;
+                let g = sess.prompt_hidden_after(ids, layer)?;
                 let mut csc = Scratch::new(seq, &cfg);
                 let c = if args.causal {
                     // The device prompt path runs a short causal pass over the
                     // prompt rows only; compare it against the same pass, not
                     // against the oracle's [prompt][canvas] step.
-                    forward::causal_hidden_after(&w, &cfg, &args.ids, layer, &mut csc)?
+                    forward::causal_hidden_after(&w, &cfg, ids, layer, &mut csc)?
                 } else {
-                    forward::hidden_after(&w, &cfg, &args.ids, layer, 0, &mut csc)?
+                    forward::hidden_after(&w, &cfg, ids, layer, 0, &mut csc)?
                 };
                 let cos = cosine(&g, &c);
                 let mad = g
@@ -303,19 +328,13 @@ fn run(args: &Args) -> Result<(), config::Error> {
             }
         }
         "parity" => {
-            let cpu = forward::forward(
-                &w,
-                &cfg,
-                &args.ids,
-                args.layers,
-                forward::LogitRows::All,
-                &mut sc,
-            )?;
+            let cpu =
+                forward::forward(&w, &cfg, ids, args.layers, forward::LogitRows::All, &mut sc)?;
             let mut gpu_sc = Scratch::new(seq, &cfg);
             let gpu = gpu::forward(
                 &w,
                 &cfg,
-                &args.ids,
+                ids,
                 args.layers,
                 forward::LogitRows::All,
                 &mut gpu_sc,
@@ -363,15 +382,8 @@ fn run(args: &Args) -> Result<(), config::Error> {
                 .layers
                 .unwrap_or(t.num_hidden_layers)
                 .min(t.num_hidden_layers);
-            let cpu = forward::hidden_after(&w, &cfg, &args.ids, n, args.at, &mut sc)?;
-            let gpu = gpu::hidden_after(
-                &w,
-                &cfg,
-                &args.ids,
-                n,
-                args.at,
-                &mut Scratch::new(seq, &cfg),
-            )?;
+            let cpu = forward::hidden_after(&w, &cfg, ids, n, args.at, &mut sc)?;
+            let gpu = gpu::hidden_after(&w, &cfg, ids, n, args.at, &mut Scratch::new(seq, &cfg))?;
             let cos = cosine(&cpu, &gpu);
             let mad = cpu
                 .iter()
@@ -404,8 +416,8 @@ fn run(args: &Args) -> Result<(), config::Error> {
             );
         }
         "attn" => {
-            let cpu = forward::attn_stage(&w, &cfg, &args.ids, &mut sc)?;
-            let gpu = gpu::attn_stage(&w, &cfg, &args.ids, &mut Scratch::new(seq, &cfg))?;
+            let cpu = forward::attn_stage(&w, &cfg, ids, &mut sc)?;
+            let gpu = gpu::attn_stage(&w, &cfg, ids, &mut Scratch::new(seq, &cfg))?;
             let cos = cosine(&cpu, &gpu);
             let mad = cpu
                 .iter()
@@ -423,12 +435,13 @@ fn run(args: &Args) -> Result<(), config::Error> {
         }
         "denoise" => {
             let canvas = args.canvas;
-            let prompt = &args.ids;
+            let prompt = ids;
             let mut dcfg = denoise::SamplerConfig::default();
             if let Some(n) = args.steps {
                 dcfg.max_denoising_steps = n;
             }
             let mut st = denoise::DenoiseState::new(dcfg, args.seed, canvas, t.vocab_size);
+            let prompt_ids = prompt.to_vec();
             let mut sess = gpu::session::Session::open(&w, &cfg, prompt.len(), canvas)?;
             if let Some(n) = args.layers {
                 sess.set_layers(n);
@@ -436,24 +449,91 @@ fn run(args: &Args) -> Result<(), config::Error> {
             let load = std::time::Instant::now();
             let ph = sess.prompt_hidden(prompt)?;
             eprintln!("prompt prefill in {:.1}s", load.elapsed().as_secs_f32());
+            if args.diag {
+                // The same causal pass the step's prompt rows must reproduce:
+                // run it standalone so the two hidden states can be compared.
+                let hidden = t.hidden_size;
+                let scale = ph.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                eprintln!(
+                    "  [diag] prompt_hidden rows {} max_abs {scale:.3} row0[0..4] {:?}",
+                    ph.len() / hidden,
+                    &ph[..4]
+                );
+                let mut csc = Scratch::new(prompt_ids.len(), &cfg);
+                let c = forward::causal_hidden_after(
+                    &w,
+                    &cfg,
+                    &prompt_ids,
+                    t.num_hidden_layers,
+                    &mut csc,
+                )?;
+                let cos = cosine(&ph, &c);
+                eprintln!("  [diag] prompt_hidden vs cpu causal: cos {cos:.7}");
+            }
             let mut total = std::time::Duration::ZERO;
             let mut prev: Option<Vec<f32>> = None;
             for _ in 0..st.cfg.max_denoising_steps {
                 let start = std::time::Instant::now();
                 let logits = sess.step(prompt, &ph, &st.ids)?;
                 sess.set_prev_logits(&logits)?;
+                if args.diag {
+                    // Device post-layer hidden for the canvas row vs the CPU
+                    // oracle's, plus the same buffer's prompt row.
+                    let hidden_n = t.hidden_size;
+                    let h = sess.read_hidden_b((prompt.len() + canvas) * hidden_n)?;
+                    let base = prompt.len() * hidden_n;
+                    eprintln!(
+                        "  [diag] step hidden prompt0[0..4] {:?} canvas0[0..4] {:?}",
+                        &h[..4],
+                        &h[base..base + 4]
+                    );
+                    let mut step_ids = prompt.to_vec();
+                    step_ids.extend_from_slice(&st.ids);
+                    let mut hsc = Scratch::new(step_ids.len(), &cfg);
+                    let cpu = forward::forward_sc(
+                        &w,
+                        &cfg,
+                        &step_ids,
+                        args.layers,
+                        forward::LogitRows::All,
+                        &mut hsc,
+                        prompt.len(),
+                        canvas,
+                        prev.as_deref(),
+                        Some(&ph),
+                    )?;
+                    let cbase = prompt.len() * hidden_n;
+                    eprintln!(
+                        "  [diag] cpu  hidden canvas0[0..4] {:?} cos {:.5}",
+                        &hsc.hidden_b[cbase..cbase + 4],
+                        cosine(
+                            &h[base..base + hidden_n],
+                            &hsc.hidden_b[cbase..cbase + hidden_n]
+                        )
+                    );
+                    let row = &logits[..t.vocab_size];
+                    let mean = row.iter().sum::<f32>() / row.len() as f32;
+                    let var =
+                        row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / row.len() as f32;
+                    let (am, av) = top_k(row, 1)[0];
+                    eprintln!(
+                        "  [diag] canvas row0 logits mean {mean:.3} std {:.3} entropy {:.3} argmax {am} ({av:.3})",
+                        var.sqrt(),
+                        entropy(row)
+                    );
+                }
                 if args.parity {
                     // The same step on the CPU oracle: prompt + canvas, the
                     // SC MLP over the canvas rows, all layers, LM head. Its
                     // logits are indexed by sequence position, so the canvas
                     // rows start at `prompt.len()`.
-                    let mut ids = prompt.clone();
-                    ids.extend_from_slice(&st.ids);
-                    let mut csc = Scratch::new(ids.len(), &cfg);
+                    let mut step_ids = prompt.to_vec();
+                    step_ids.extend_from_slice(&st.ids);
+                    let mut csc = Scratch::new(step_ids.len(), &cfg);
                     let cpu = forward::forward_sc(
                         &w,
                         &cfg,
-                        &ids,
+                        &step_ids,
                         args.layers,
                         forward::LogitRows::All,
                         &mut csc,
@@ -528,6 +608,24 @@ fn run(args: &Args) -> Result<(), config::Error> {
                 .filter(|&&v| v != denoise::PAD_TOKEN_ID)
                 .count();
             println!("active tokens: {active}/{}", st.ids.len());
+            if let Some(tok) = &tok {
+                // The canvas is the reply: cut at the first end-of-turn/eos
+                // marker, drop padding, then decode and strip the ceremony.
+                let eos = t.eos_token_ids();
+                let end = st
+                    .ids
+                    .iter()
+                    .position(|id| eos.contains(id))
+                    .unwrap_or(st.ids.len());
+                let text_ids: Vec<u32> = st.ids[..end]
+                    .iter()
+                    .copied()
+                    .filter(|&v| v != denoise::PAD_TOKEN_ID)
+                    .collect();
+                let raw = tok.decode(&text_ids);
+                println!("--- reply ---");
+                println!("{}", chat_template::sanitize_model_reply(&raw));
+            }
         }
         "gemm-probe" => {
             let m = args.layers.unwrap_or(1);
