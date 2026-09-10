@@ -265,9 +265,14 @@ clears 0.641 by a lot.
   expert-major rows feed one tiled GEMM per bucket with the q4 weight tile
   decoded into shared memory once per tile, and the routing weight is folded
   into the SwiGLU. That also removes the f32 expert copies, so the resident
-  model drops from ~52 GiB to ~35 GiB. Remaining: the tokenizer + chat
-  template for a text prompt, and the same quantized-GEMM treatment for the
-  attention/dense weights.
+  model drops from ~52 GiB to ~35 GiB. The grouped launch reads each bucket's
+  expert from the plan (`experts[job]`), never from the job index: a bucket
+  with no tokens holds no rows, so job j is not expert j. Remaining: the
+  `denoise --parity` step still diverges from the CPU oracle (cos 0.806) even
+  though every stage compared so far agrees — per-layer hidden parity bisects it
+  to a layer-0 MoE difference the stage dumps do not reproduce; the tokenizer +
+  chat template for a text prompt; and the same quantized-GEMM treatment for
+  the attention/dense weights.
 - **Model-gated tests treat a manifest-only pack as present.**
   `test_util::dgq_model_dir()` returns `Some` when `model.dgq.json` exists, so an
   interrupted pack download (manifest present, `model.dgq.bin` missing or a
