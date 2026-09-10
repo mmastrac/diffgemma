@@ -19,7 +19,7 @@ fn pool() -> Result<(Context, BufferPool), Error> {
     Ok((ctx, BufferPool::new()))
 }
 
-/// One kernel launch with a fresh argument list.
+/// One kernel launch from `kernels.cu` with a fresh argument list.
 fn launch(
     ctx: &Context,
     entry: &'static str,
@@ -27,7 +27,19 @@ fn launch(
     block: u32,
     args: &mut KernelArgs,
 ) -> Result<(), Error> {
-    let kernel = cached_source_kernel(KERNELS, entry)?;
+    launch_src(ctx, KERNELS, entry, grid, block, args)
+}
+
+/// The same, for a kernel in another translation unit (the grouped-MoE file).
+fn launch_src(
+    ctx: &Context,
+    src: &'static str,
+    entry: &'static str,
+    grid: (u32, u32, u32),
+    block: u32,
+    args: &mut KernelArgs,
+) -> Result<(), Error> {
+    let kernel = cached_source_kernel(src, entry)?;
     Ok(ctx.launch(&kernel, grid, (block, 1, 1), 0, args)?)
 }
 
@@ -321,6 +333,9 @@ pub(crate) struct Bufs {
     pub(crate) moe_rows_down: DeviceBuffer,
     pub(crate) moe_starts: DeviceBuffer,
     pub(crate) moe_tok_idx: DeviceBuffer,
+    /// The expert each bucket holds: a bucket with no tokens still occupies a
+    /// job slot, so the kernel cannot use the job index as the expert index.
+    pub(crate) moe_experts: DeviceBuffer,
     pub(crate) moe_row_w: DeviceBuffer,
     /// [seq, vocab] — the full canvas's logits on the `LogitRows::All` path,
     /// one row on the others.
@@ -366,6 +381,7 @@ impl Bufs {
             moe_rows_down: a(seq * t.top_k_experts * hidden)?,
             moe_starts: a(t.num_experts + 1)?,
             moe_tok_idx: a(seq * t.top_k_experts)?,
+            moe_experts: a(t.num_experts)?,
             moe_row_w: a(seq * t.top_k_experts)?,
             logits: a(seq * t.vocab_size)?,
         })
@@ -715,15 +731,8 @@ pub(crate) fn layer_forward(
         128,
         &mut args,
     )?;
-    let mut args = KernelArgs::new();
-    args.device_ptr(b.v.device_ptr())
-        .device_ptr(b.v.device_ptr()) // weight ignored when null_ptr = 0
-        .device_ptr(b.v.device_ptr())
-        .u32(seq as u32)
-        .u32(n_kv as u32)
-        .u32(head_dim as u32)
-        .f32(eps);
-    // pass a null weight pointer for the V norm
+    // V norm with a null weight pointer: the weighted entry faults on a null
+    // weight, so this passes 0 and the kernel skips the scale.
     let mut args = KernelArgs::new();
     args.device_ptr(b.v.device_ptr())
         .u64(0)
@@ -915,6 +924,9 @@ pub(crate) fn layer_forward(
     b.moe_tok_idx.write_bytes(unsafe {
         std::slice::from_raw_parts(plan.tok_idx.as_ptr().cast::<u8>(), plan.tok_idx.len() * 4)
     })?;
+    b.moe_experts.write_bytes(unsafe {
+        std::slice::from_raw_parts(plan.experts.as_ptr().cast::<u8>(), plan.experts.len() * 4)
+    })?;
     b.moe_row_w.write_f32(&plan.row_w)?;
     // Gather the expert-major input rows.
     {
@@ -924,7 +936,14 @@ pub(crate) fn layer_forward(
             .device_ptr(b.moe_tok_idx.device_ptr())
             .u32(n_rows as u32)
             .u32(hidden as u32);
-        launch(ctx, "dgq_moe_gather", rows(n_rows, 256), 256, &mut args)?;
+        launch_src(
+            ctx,
+            crate::moe_grouped::MOE_KERNELS,
+            "dgq_moe_gather",
+            rows(n_rows, 256),
+            256,
+            &mut args,
+        )?;
     }
     let gemm_gu = crate::moe_grouped::GroupedGemm::new(hidden, moe_inter * 2, "dgq_moe_gate_up");
     gemm_gu.run(
@@ -933,6 +952,7 @@ pub(crate) fn layer_forward(
         &lw.experts_gate_up_q4,
         &b.moe_starts,
         &b.moe_tok_idx,
+        &b.moe_experts,
         &b.moe_rows_gu,
         n_rows,
         plan.num_jobs(),
@@ -942,10 +962,12 @@ pub(crate) fn layer_forward(
         args.device_ptr(b.moe_rows_gu.device_ptr())
             .device_ptr(b.moe_rows_act.device_ptr())
             .device_ptr(b.moe_row_w.device_ptr())
+            .u32(0)
             .u32(n_rows as u32)
             .u32(moe_inter as u32);
-        launch(
+        launch_src(
             ctx,
+            crate::moe_grouped::MOE_KERNELS,
             "dgq_moe_swiglu_weighted",
             flat(n_rows * moe_inter, 256),
             256,
@@ -959,6 +981,7 @@ pub(crate) fn layer_forward(
         &lw.experts_down_q4,
         &b.moe_starts,
         &b.moe_tok_idx,
+        &b.moe_experts,
         &b.moe_rows_down,
         n_rows,
         plan.num_jobs(),
@@ -968,23 +991,18 @@ pub(crate) fn layer_forward(
         args.device_ptr(b.moe_out.device_ptr())
             .device_ptr(b.moe_rows_down.device_ptr())
             .device_ptr(b.moe_tok_idx.device_ptr())
+            .u32(0)
             .u32(n_rows as u32)
             .u32(hidden as u32);
-        launch(
+        launch_src(
             ctx,
+            crate::moe_grouped::MOE_KERNELS,
             "dgq_moe_scatter",
             flat(n_rows * hidden, 256),
             256,
             &mut args,
         )?;
     }
-    // CPU oracle: scratch = moe_out; moe_out = rms(scratch) * w2; normed += moe_out.
-    // rms writes into b.normed (which holds this branch's residual), so the
-    // normalized value is moved into moe_out before the accumulate, leaving
-    // b.normed = residual + rms(moe_out).
-    // CPU oracle: scratch = moe_out; moe_out = rms(scratch) * w2; normed += moe_out.
-    // rms leaves the normalized value in b.normed; b.moe_out still holds the raw
-    // value, so add first and then move the normalized result into moe_out.
     // CPU oracle: scratch = moe_out; moe_out = rms(scratch) * w2; normed += moe_out.
     // b.normed holds the layer residual and must not be overwritten, so the
     // normalized value goes to the scratch, the residual accumulates into it,

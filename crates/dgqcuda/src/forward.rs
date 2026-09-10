@@ -885,6 +885,48 @@ pub fn forward_sc(
     })
 }
 
+/// The prompt's hidden state after the first n causal layers: the CPU twin of
+/// the device session's prompt_hidden_after. Plain causal over the token list,
+/// with no prompt splice and no self-conditioning.
+pub fn causal_hidden_after(
+    w: &Weights,
+    cfg: &ModelConfig,
+    token_ids: &[u32],
+    n: usize,
+    sc: &mut Scratch,
+) -> Result<Vec<f32>, Error> {
+    let t = &cfg.text_config;
+    let seq = token_ids.len();
+    let hidden = t.hidden_size;
+    let embed_scale = (hidden as f32).sqrt();
+    let embed_w = w.tensor_f32("model.decoder.embed_tokens.weight")?;
+    for (s, &id) in token_ids.iter().enumerate() {
+        let src = id as usize * hidden;
+        let dst = s * hidden;
+        for i in 0..hidden {
+            sc.bufs.embed[dst + i] = embed_w[src + i] * embed_scale;
+        }
+    }
+    sc.hidden_a.copy_from_slice(&sc.bufs.embed);
+    for layer in 0..n {
+        let lw = LayerWeights::load(w, layer)?;
+        layer_forward_at(
+            &mut sc.hidden_b,
+            &sc.hidden_a,
+            &lw,
+            cfg,
+            layer,
+            seq,
+            &mut sc.bufs,
+            0,
+            seq,
+            0,
+        );
+        std::mem::swap(&mut sc.hidden_a, &mut sc.hidden_b);
+    }
+    Ok(sc.hidden_a[..seq * hidden].to_vec())
+}
+
 /// Hidden state after \`layers\` decoder layers (the CPU oracle's stage output).
 pub fn hidden_after(
     w: &Weights,

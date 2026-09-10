@@ -304,6 +304,7 @@ impl Session {
         let ctx = self.model.ctx.clone();
         let hidden = self.cfg.text_config.hidden_size;
         self.embed_rows(prompt, 0)?;
+        let n_layers = self.layers.min(self.model.layers.len());
         {
             let Self {
                 model,
@@ -312,7 +313,8 @@ impl Session {
                 bufs,
                 ..
             } = self;
-            // A short-sequence runner: only the prompt rows exist yet.
+            // A short-sequence runner: only the prompt rows exist yet. It
+            // honors the layer limit so --layers bisects this path too.
             let r = Runner {
                 m: model,
                 cfg,
@@ -321,7 +323,42 @@ impl Session {
                 causal_split: *prompt_len,
                 stage: std::cell::RefCell::new(Stage::new()),
             };
-            for (i, lw) in model.layers.iter().enumerate() {
+            for (i, lw) in model.layers.iter().take(n_layers).enumerate() {
+                layer_forward(&r, bufs, lw, i, 0)?;
+                std::mem::swap(&mut bufs.hidden_a, &mut bufs.hidden_b);
+            }
+        }
+        ctx.synchronize()?;
+        let mut out = vec![0.0f32; self.prompt_len * hidden];
+        self.bufs.hidden_a.read_f32(&mut out)?;
+        Ok(out)
+    }
+
+    /// The prompt's hidden state after the first `n` causal layers, for
+    /// bisecting a layer against the CPU oracle. Runs the same graph as
+    /// `prompt_hidden`; the caller pays one prompt pass per layer.
+    pub fn prompt_hidden_after(&mut self, prompt: &[u32], n: usize) -> Result<Vec<f32>, Error> {
+        assert_eq!(prompt.len(), self.prompt_len, "prompt length");
+        let ctx = self.model.ctx.clone();
+        let hidden = self.cfg.text_config.hidden_size;
+        self.embed_rows(prompt, 0)?;
+        {
+            let Self {
+                model,
+                cfg,
+                prompt_len,
+                bufs,
+                ..
+            } = self;
+            let r = Runner {
+                m: model,
+                cfg,
+                seq: *prompt_len,
+                pos0: 0,
+                causal_split: *prompt_len,
+                stage: std::cell::RefCell::new(Stage::new()),
+            };
+            for (i, lw) in model.layers.iter().take(n).enumerate() {
                 layer_forward(&r, bufs, lw, i, 0)?;
                 std::mem::swap(&mut bufs.hidden_a, &mut bufs.hidden_b);
             }

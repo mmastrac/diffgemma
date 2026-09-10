@@ -32,6 +32,10 @@ pub struct GroupedPlan {
     pub row_w: Vec<f32>,
     /// `num_jobs + 1` entries; bucket `j` owns rows `starts[j]..starts[j+1]`.
     pub starts: Vec<u32>,
+    /// The expert each bucket holds. A bucket with no tokens still occupies a
+    /// job slot, so the kernel and the oracle must read the expert index from
+    /// here rather than assume job j is expert j.
+    pub experts: Vec<u32>,
 }
 
 impl GroupedPlan {
@@ -66,7 +70,12 @@ impl GroupedPlan {
         let mut tok_idx = Vec::new();
         let mut row_w = Vec::new();
         let mut starts = vec![0u32];
+        let mut experts = Vec::with_capacity(n_experts);
         for b in &buckets {
+            if b.tokens.is_empty() {
+                continue;
+            }
+            experts.push(b.expert as u32);
             for &t in &b.tokens {
                 tok_idx.push(t);
                 row_w.push(entry_w[t as usize * n_experts + b.expert]);
@@ -77,6 +86,7 @@ impl GroupedPlan {
             tok_idx,
             row_w,
             starts,
+            experts,
         }
     }
 
@@ -84,8 +94,11 @@ impl GroupedPlan {
         self.tok_idx.len()
     }
 
+    /// Buckets that hold at least one row. The empty ones are dropped from the
+    /// expert list (their job slot disappears) so the kernel never indexes a
+    /// value the host did not fill in.
     pub fn num_jobs(&self) -> usize {
-        self.starts.len() - 1
+        self.experts.len()
     }
 }
 
@@ -124,6 +137,7 @@ impl GroupedGemm {
         w_blob: &DeviceBuffer,
         starts: &DeviceBuffer,
         tok_idx: &DeviceBuffer,
+        experts: &DeviceBuffer,
         c: &DeviceBuffer,
         rows: usize,
         num_jobs: usize,
@@ -135,6 +149,7 @@ impl GroupedGemm {
             .device_ptr(c.device_ptr())
             .device_ptr(starts.device_ptr())
             .device_ptr(tok_idx.device_ptr())
+            .device_ptr(experts.device_ptr())
             .u32(self.k_dim as u32)
             .u32(self.n_dim as u32)
             .u32(num_jobs as u32)
@@ -166,13 +181,16 @@ pub fn grouped_gemm_cpu(
     for j in 0..plan.num_jobs() {
         let start = plan.starts[j] as usize;
         let end = plan.starts[j + 1] as usize;
-        let w_off = j * n_dim * k_dim;
+        let w_off = plan.experts[j] as usize * n_dim * k_dim;
         for r in start..end {
-            let tok = plan.tok_idx[r] as usize;
             for o in 0..n_dim {
                 let mut acc = 0.0f32;
                 for k in 0..k_dim {
-                    acc += a[tok * k_dim + k] * w[w_off + o * k_dim + k];
+                    // A is already in bucketed (expert-major) row order: the
+                    // down projection reads the gate/up output, which the
+                    // grouped GEMM wrote in this order. The gather happens on
+                    // the way in, not here.
+                    acc += a[r * k_dim + k] * w[w_off + o * k_dim + k];
                 }
                 c[r * n_dim + o] = acc;
             }

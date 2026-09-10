@@ -40,7 +40,7 @@ __device__ __forceinline__ float moe_q4_at(
 // c[global_row, col] = sum_k a[tok_idx[global_row], k] * w_e[col, k]
 extern "C" __global__ void dgq_moe_gate_up(
     const float *a, const unsigned char *w_blob, float *c,
-    const unsigned *row_starts, const unsigned *tok_idx,
+    const unsigned *row_starts, const unsigned *tok_idx, const unsigned *experts,
     unsigned k_dim, unsigned n_dim, unsigned num_jobs, unsigned row_bytes
 ) {
     __shared__ float as[MOE_BM * MOE_BK];
@@ -49,53 +49,64 @@ extern "C" __global__ void dgq_moe_gate_up(
     const unsigned ty = threadIdx.x >> 4u;
     const unsigned col0 = blockIdx.x * MOE_BN;
     const unsigned row0 = blockIdx.y * MOE_BM;
+    // A launch with no buckets must not read row_starts[0] as a row count.
+    if (num_jobs == 0u) return;
     const unsigned row_end = row_starts[num_jobs];
+    // One row block can straddle a bucket boundary, so walk the buckets it
+    // overlaps instead of resolving a single job for the whole block.
     if (col0 >= n_dim || row0 >= row_end) return;
-
-    unsigned job = 0u;
-    for (unsigned j = 0u; j < num_jobs; j++) {
-        if (row_starts[j] <= row0) job = j; else break;
-    }
-    const unsigned job_end = row_starts[job + 1u];
-    const unsigned char *w = w_blob + (size_t)job * (size_t)n_dim * (size_t)row_bytes;
 
     float acc[MOE_TM][MOE_TN];
     for (unsigned i = 0u; i < MOE_TM; i++)
         for (unsigned j = 0u; j < MOE_TN; j++) acc[i][j] = 0.0f;
 
+    // A is the bucketed row space (dgq_moe_gather wrote it expert-major), so a
+    // block row IS a bucketed row. The A tile is therefore the same for every
+    // job the block overlaps; only the weight tile changes. The accumulators
+    // must be shared across those jobs and written once, or the last job would
+    // overwrite the others.
     for (unsigned k0 = 0u; k0 < k_dim; k0 += MOE_BK) {
         for (unsigned i = 0u; i < MOE_TM; i++) {
             const unsigned r = row0 + ty * MOE_TM + i;
-            const unsigned tok = (r < job_end) ? tok_idx[r] : 0u;
             for (unsigned kk = tx; kk < MOE_BK; kk += 16u) {
                 const unsigned k = k0 + kk;
                 as[(ty * MOE_TM + i) * MOE_BK + kk] =
-                    (r < job_end && k < k_dim) ? a[(size_t)tok * k_dim + k] : 0.0f;
+                    (r < row_end && k < k_dim) ? a[(size_t)r * k_dim + k] : 0.0f;
             }
         }
-        for (unsigned kk = 0u; kk < MOE_BK; kk++) {
-            const unsigned k = k0 + kk;
-            for (unsigned j = 0u; j < MOE_TN; j++) {
-                const unsigned col = col0 + tx * MOE_TN + j;
-                ws[kk * MOE_BN + tx * MOE_TN + j] =
-                    (col < n_dim && k < k_dim) ? moe_q4_at(w, col, k, row_bytes) : 0.0f;
-            }
-        }
-        __syncthreads();
-        for (unsigned kk = 0u; kk < MOE_BK; kk++) {
-            for (unsigned i = 0u; i < MOE_TM; i++) {
-                const float av = as[(ty * MOE_TM + i) * MOE_BK + kk];
+        for (unsigned job = 0u; job < num_jobs; job++) {
+            const unsigned job_start = row_starts[job];
+            const unsigned job_end = row_starts[job + 1u];
+            if (job_end <= row0) continue;
+            if (job_start >= row0 + MOE_BM) break;
+            const unsigned char *w =
+                w_blob + (size_t)experts[job] * (size_t)n_dim * (size_t)row_bytes;
+            for (unsigned kk = 0u; kk < MOE_BK; kk++) {
+                const unsigned k = k0 + kk;
                 for (unsigned j = 0u; j < MOE_TN; j++) {
-                    acc[i][j] += av * ws[kk * MOE_BN + tx * MOE_TN + j];
+                    const unsigned col = col0 + tx * MOE_TN + j;
+                    ws[kk * MOE_BN + tx * MOE_TN + j] =
+                        (col < n_dim && k < k_dim) ? moe_q4_at(w, col, k, row_bytes) : 0.0f;
                 }
             }
+            __syncthreads();
+            for (unsigned kk = 0u; kk < MOE_BK; kk++) {
+                for (unsigned i = 0u; i < MOE_TM; i++) {
+                    const unsigned r = row0 + ty * MOE_TM + i;
+                    if (r >= job_end || r < job_start) continue;
+                    const float av = as[(ty * MOE_TM + i) * MOE_BK + kk];
+                    for (unsigned j = 0u; j < MOE_TN; j++) {
+                        acc[i][j] += av * ws[kk * MOE_BN + tx * MOE_TN + j];
+                    }
+                }
+            }
+            __syncthreads();
         }
-        __syncthreads();
     }
 
     for (unsigned i = 0u; i < MOE_TM; i++) {
         const unsigned r = row0 + ty * MOE_TM + i;
-        if (r >= job_end) continue;
+        if (r >= row_end) continue;
         for (unsigned j = 0u; j < MOE_TN; j++) {
             const unsigned col = col0 + tx * MOE_TN + j;
             if (col < n_dim) c[(size_t)r * n_dim + col] = acc[i][j];
@@ -107,7 +118,7 @@ extern "C" __global__ void dgq_moe_gate_up(
 // the k dimension is the expert intermediate width.
 extern "C" __global__ void dgq_moe_down(
     const float *a, const unsigned char *w_blob, float *c,
-    const unsigned *row_starts, const unsigned *tok_idx,
+    const unsigned *row_starts, const unsigned *tok_idx, const unsigned *experts,
     unsigned k_dim, unsigned n_dim, unsigned num_jobs, unsigned row_bytes
 ) {
     __shared__ float as[MOE_BM * MOE_BK];
@@ -116,61 +127,66 @@ extern "C" __global__ void dgq_moe_down(
     const unsigned ty = threadIdx.x >> 4u;
     const unsigned col0 = blockIdx.x * MOE_BN;
     const unsigned row0 = blockIdx.y * MOE_BM;
+    if (num_jobs == 0u) return;
     const unsigned row_end = row_starts[num_jobs];
     if (col0 >= n_dim || row0 >= row_end) return;
-
-    unsigned job = 0u;
-    for (unsigned j = 0u; j < num_jobs; j++) {
-        if (row_starts[j] <= row0) job = j; else break;
-    }
-    const unsigned job_end = row_starts[job + 1u];
-    const unsigned char *w = w_blob + (size_t)job * (size_t)n_dim * (size_t)row_bytes;
 
     float acc[MOE_TM][MOE_TN];
     for (unsigned i = 0u; i < MOE_TM; i++)
         for (unsigned j = 0u; j < MOE_TN; j++) acc[i][j] = 0.0f;
 
+    // Down takes the expert-major activation rows directly, so the A tile is
+    // the block rows themselves and only the weight tile depends on the job.
     for (unsigned k0 = 0u; k0 < k_dim; k0 += MOE_BK) {
         for (unsigned i = 0u; i < MOE_TM; i++) {
             const unsigned r = row0 + ty * MOE_TM + i;
             for (unsigned kk = tx; kk < MOE_BK; kk += 16u) {
                 const unsigned k = k0 + kk;
                 as[(ty * MOE_TM + i) * MOE_BK + kk] =
-                    (r < job_end && k < k_dim) ? a[(size_t)r * k_dim + k] : 0.0f;
+                    (r < row_end && k < k_dim) ? a[(size_t)r * k_dim + k] : 0.0f;
             }
         }
-        for (unsigned kk = 0u; kk < MOE_BK; kk++) {
-            const unsigned k = k0 + kk;
-            for (unsigned j = 0u; j < MOE_TN; j++) {
-                const unsigned col = col0 + tx * MOE_TN + j;
-                ws[kk * MOE_BN + tx * MOE_TN + j] =
-                    (col < n_dim && k < k_dim) ? moe_q4_at(w, col, k, row_bytes) : 0.0f;
-            }
-        }
-        __syncthreads();
-        for (unsigned kk = 0u; kk < MOE_BK; kk++) {
-            for (unsigned i = 0u; i < MOE_TM; i++) {
-                const float av = as[(ty * MOE_TM + i) * MOE_BK + kk];
+        for (unsigned job = 0u; job < num_jobs; job++) {
+            const unsigned job_start = row_starts[job];
+            const unsigned job_end = row_starts[job + 1u];
+            if (job_end <= row0) continue;
+            if (job_start >= row0 + MOE_BM) break;
+            const unsigned char *w =
+                w_blob + (size_t)experts[job] * (size_t)n_dim * (size_t)row_bytes;
+            for (unsigned kk = 0u; kk < MOE_BK; kk++) {
+                const unsigned k = k0 + kk;
                 for (unsigned j = 0u; j < MOE_TN; j++) {
-                    acc[i][j] += av * ws[kk * MOE_BN + tx * MOE_TN + j];
+                    const unsigned col = col0 + tx * MOE_TN + j;
+                    ws[kk * MOE_BN + tx * MOE_TN + j] =
+                        (col < n_dim && k < k_dim) ? moe_q4_at(w, col, k, row_bytes) : 0.0f;
                 }
             }
+            __syncthreads();
+            for (unsigned kk = 0u; kk < MOE_BK; kk++) {
+                for (unsigned i = 0u; i < MOE_TM; i++) {
+                    const unsigned r = row0 + ty * MOE_TM + i;
+                    if (r >= job_end || r < job_start) continue;
+                    const float av = as[(ty * MOE_TM + i) * MOE_BK + kk];
+                    for (unsigned j = 0u; j < MOE_TN; j++) {
+                        acc[i][j] += av * ws[kk * MOE_BN + tx * MOE_TN + j];
+                    }
+                }
+            }
+            __syncthreads();
         }
-        __syncthreads();
     }
 
     for (unsigned i = 0u; i < MOE_TM; i++) {
         const unsigned r = row0 + ty * MOE_TM + i;
-        if (r >= job_end) continue;
+        if (r >= row_end) continue;
         for (unsigned j = 0u; j < MOE_TN; j++) {
             const unsigned col = col0 + tx * MOE_TN + j;
             if (col < n_dim) c[(size_t)r * n_dim + col] = acc[i][j];
         }
     }
+
 }
 
-// SwiGLU over the gate/up result of one expert tile, times the row routing
-// weight (row_w, indexed by expert-major row). One thread per element.
 extern "C" __global__ void dgq_moe_swiglu_weighted(
     const float *gu, float *act, const float *row_w,
     unsigned row_start, unsigned rows, unsigned inter

@@ -1,6 +1,10 @@
 //! Tier-1 test for the grouped MoE expert GEMM: the CUDA kernel against a CPU
 //! oracle over the same q4 weights, with buckets that overflow one row block
 //! so the padding path is exercised too.
+//!
+//! The A matrix is the bucketed row space (what `dgq_moe_gather` produces and
+//! what the down projection reads from the gate/up output), so the test applies
+//! the same gather the device path does.
 #![cfg(feature = "cuda")]
 
 use dgqcuda::moe_grouped::{BM, GroupedGemm, GroupedPlan, grouped_gemm_cpu, q4_row_bytes};
@@ -113,17 +117,26 @@ fn case(seq: usize, top_k: usize, n_experts: usize, k_dim: usize, n_dim: usize) 
         }
     }
 
-    let want = grouped_gemm_cpu(&a, &w_f32, &plan, k_dim, n_dim);
+    // The kernel reads bucketed rows; gather the token rows in plan order
+    // exactly as dgq_moe_gather does, and give the oracle the same matrix.
+    let a_rows: Vec<f32> = (0..plan.rows())
+        .flat_map(|r| {
+            let tok = plan.tok_idx[r] as usize;
+            a[tok * k_dim..(tok + 1) * k_dim].to_vec()
+        })
+        .collect();
+    let want = grouped_gemm_cpu(&a_rows, &w_f32, &plan, k_dim, n_dim);
 
     let ctx = cached_context().expect("ctx");
-    let ba = DeviceBuffer::alloc(&ctx, a.len() * 4).unwrap();
-    ba.write_f32(&a).unwrap();
+    let ba = DeviceBuffer::alloc(&ctx, a_rows.len() * 4).unwrap();
+    ba.write_f32(&a_rows).unwrap();
     let bw = DeviceBuffer::alloc(&ctx, blob.len()).unwrap();
     bw.write_bytes(&blob).unwrap();
     let rows = plan.rows();
     let bc = DeviceBuffer::alloc(&ctx, rows * n_dim * 4).unwrap();
     let starts = dgqcuda::moe_grouped::upload_u32(&ctx, &plan.starts).unwrap();
     let tok_idx = dgqcuda::moe_grouped::upload_u32(&ctx, &plan.tok_idx).unwrap();
+    let experts = dgqcuda::moe_grouped::upload_u32(&ctx, &plan.experts).unwrap();
     let gemm = GroupedGemm::new(k_dim, n_dim, "dgq_moe_gate_up");
     gemm.run(
         &ctx,
@@ -131,6 +144,7 @@ fn case(seq: usize, top_k: usize, n_experts: usize, k_dim: usize, n_dim: usize) 
         &bw,
         &starts,
         &tok_idx,
+        &experts,
         &bc,
         rows,
         plan.num_jobs(),
@@ -148,6 +162,14 @@ fn case(seq: usize, top_k: usize, n_experts: usize, k_dim: usize, n_dim: usize) 
     }
     let cos = dot / (na.sqrt() * nb.sqrt());
     println!("seq {seq} k {k_dim} n {n_dim}: cos {cos:.9}");
+    if std::env::var("DGQCUDA_DBG").is_ok() {
+        println!("  want[0..4] {:?}", &want[..4]);
+        println!("  got[0..4]  {:?}", &got[..4]);
+        println!("  want[64..68] {:?}", &want[64..68]);
+        println!("  got[64..68]  {:?}", &got[64..68]);
+        println!("  starts {:?}", &plan.starts);
+        println!("  tok_idx {:?}", &plan.tok_idx);
+    }
     cos
 }
 

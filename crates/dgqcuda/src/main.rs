@@ -42,6 +42,9 @@ struct Args {
     steps: Option<usize>,
     /// `--parity`: also run the CPU oracle for each step and compare logits.
     parity: bool,
+    /// `hidden-parity --causal`: compare against a short causal pass over the
+    /// prompt rows (the device prompt path's shape) instead of the step.
+    causal: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -57,6 +60,7 @@ fn parse_args() -> Result<Args, String> {
     let mut canvas = 256usize;
     let mut steps: Option<usize> = None;
     let mut parity = false;
+    let mut causal = false;
     let mut stop_after = 0u8;
     let mut it = std::env::args().skip(1);
     if let Some(first) = it.next() {
@@ -97,6 +101,7 @@ fn parse_args() -> Result<Args, String> {
                 steps = Some(s.parse::<usize>().map_err(|e| e.to_string())?);
             }
             "--parity" => parity = true,
+            "--causal" => causal = true,
             "--gpu" => gpu = true,
             "--stop-after" => {
                 let s = it.next().ok_or("--stop-after needs a value")?;
@@ -134,6 +139,7 @@ fn parse_args() -> Result<Args, String> {
         canvas,
         steps,
         parity,
+        causal,
     })
 }
 
@@ -260,6 +266,40 @@ fn run(args: &Args) -> Result<(), config::Error> {
                         entropy(row)
                     );
                 }
+            }
+        }
+        // Bisect the device prompt path against the CPU oracle one layer at a
+        // time: both run the same causal pass over the prompt tokens, so the
+        // first layer whose cosine drops below 1 is where they diverge.
+        "hidden-parity" => {
+            let mut sess = gpu::session::Session::open(&w, &cfg, seq, 1)?;
+            let n = args.layers.unwrap_or(t.num_hidden_layers);
+            let prev = std::cell::Cell::new(1.0f32);
+            for layer in 1..=n {
+                let g = sess.prompt_hidden_after(&args.ids, layer)?;
+                let mut csc = Scratch::new(seq, &cfg);
+                let c = if args.causal {
+                    // The device prompt path runs a short causal pass over the
+                    // prompt rows only; compare it against the same pass, not
+                    // against the oracle's [prompt][canvas] step.
+                    forward::causal_hidden_after(&w, &cfg, &args.ids, layer, &mut csc)?
+                } else {
+                    forward::hidden_after(&w, &cfg, &args.ids, layer, 0, &mut csc)?
+                };
+                let cos = cosine(&g, &c);
+                let mad = g
+                    .iter()
+                    .zip(c.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                println!("  layer {layer:>2}: cos {cos:.7} max_abs {mad:.3e}");
+                if cos < 0.9999 && prev.get() >= 0.9999 {
+                    println!("  first divergence at layer {layer}");
+                    for i in 0..8 {
+                        println!("    gpu[{i}] {:.6} cpu[{i}] {:.6}", g[i], c[i]);
+                    }
+                }
+                prev.set(cos);
             }
         }
         "parity" => {
