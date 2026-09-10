@@ -272,16 +272,21 @@ clears 0.641 by a lot.
   never over rows: a row-count grid silently truncates the gather and the
   expert path degrades to zeros without failing. Text prompts work
   (`--prompt`, tokenizer + chat template), and the remaining port is the same
-  quantized-GEMM treatment for the attention/dense weights. Open: the step's
-  first self-conditioning block. The device and its CPU oracle agree exactly
-  (step parity cos 1.0000000, matching argmax at a canvas of 4 and of 256)
-  and the engine's own `apply_from_store` on the canvas rows reproduces the
-  same canvas hidden, so the block is not the suspect. What is open is the
-  per-step trajectory: the device's step-1 logits are far past the softcap
-  (entropy 0.087 capped against the engine's 11.4) and the canvas then locks
-  into a fixed point instead of converging to text. The engine's
-  `step-logits-dump` re-dumps step 1 for any --steps, so a trajectory
-  comparison needs the engine's per-step canvas, not its logits.
+  quantized-GEMM treatment for the attention/dense weights. Open: the canvas
+  rows. The device's canvas embedding is bit-identical to the engine's
+  (`diffgemma step-layer-probe` after_preamble against the device's own
+  post-embed row: -0.9068896, -0.283403, -1.4186344, 0.44372812 on both), and
+  the device and its CPU oracle agree exactly at every stage (step parity cos
+  1.0000000, matching argmax). Past the preamble they part company: at a
+  canvas of 256 and seed 7 the device's canvas hidden is uncorrelated with
+  the engine's (cos 0.03 at layer 1, and the device's residual stream grows
+  10-20x larger by layer 13) while the prompt rows match the engine exactly.
+  That still does not localize, because the engine's dump disagrees with its
+  own `apply_from_store` on the preamble: for the same token the engine
+  prints -0.73047 where the engine's own SC function, run on the same
+  weights, gives -0.73150 (ratio 0.50004 against 0.49999 of the embed row),
+  so at least one of those engine paths is not the one the device is being
+  compared against. Settling that is the next step, not another device probe.
 - **Model-gated tests treat a manifest-only pack as present.**
   `test_util::dgq_model_dir()` returns `Some` when `model.dgq.json` exists, so an
   interrupted pack download (manifest present, `model.dgq.bin` missing or a
