@@ -537,7 +537,20 @@ fn run(args: &Args) -> Result<(), config::Error> {
             let mut step_no = 0usize;
             for _ in 0..st.cfg.max_denoising_steps {
                 let start = std::time::Instant::now();
-                let logits = sess.step(prompt, &ph, &st.ids)?;
+                let mut logits = sess.step(prompt, &ph, &st.ids)?;
+                // The engine softcaps inside the step, BEFORE the sampler: its
+                // StepStage::Softcap runs ahead of SampleRowstats, and the
+                // comment there notes that sample_rowstats reads post-softcap
+                // logits. Sampling the raw row samples a far sharper
+                // distribution than the model means to expose -- the softcap's
+                // derivative tapers the tail, so the raw row spans about 175
+                // where the capped one spans about 84.
+                let cap = t.final_logit_softcapping as f32;
+                if cap > 0.0 {
+                    for v in logits.iter_mut() {
+                        *v = (*v / cap).tanh() * cap;
+                    }
+                }
                 if let Some(path) = args.dump_step.as_ref().filter(|_| step_no == 0) {
                     dump_step_json(
                         path,
@@ -546,7 +559,7 @@ fn run(args: &Args) -> Result<(), config::Error> {
                         t.vocab_size,
                         prompt,
                         args.prompt.as_deref().unwrap_or(""),
-                        Some(t.final_logit_softcapping as f32).filter(|c| *c > 0.0),
+                        None,
                     )?;
                 }
                 step_no += 1;
