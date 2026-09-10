@@ -940,7 +940,7 @@ pub(crate) fn layer_forward(
             ctx,
             crate::moe_grouped::MOE_KERNELS,
             "dgq_moe_gather",
-            rows(n_rows, 256),
+            flat(n_rows * hidden, 256),
             256,
             &mut args,
         )?;

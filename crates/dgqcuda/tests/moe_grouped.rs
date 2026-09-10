@@ -187,6 +187,64 @@ fn grouped_gemm_handles_one_token_per_bucket() {
     assert!(cos > 0.99999, "cos {cos}");
 }
 
+/// The gather kernel writes one element per thread, so its grid must count
+/// `rows * width` elements, not rows. Sizing it by rows fills only the leading
+/// `blocks * blockDim / width` rows; the grouped GEMMs then read zeros for
+/// every bucket past that and the whole expert path is silently wrong while the
+/// router, the attention path, and every per-kernel test still pass.
+#[test]
+fn gather_fills_every_bucketed_row() {
+    let (seq, top_k, n_experts, hidden) = (20usize, 8usize, 12usize, 2816usize);
+    let idx: Vec<u32> = (0..seq * top_k).map(|i| (i % n_experts) as u32).collect();
+    let wts: Vec<f32> = (0..seq * top_k).map(|i| 0.01 + 0.001 * i as f32).collect();
+    let plan = GroupedPlan::new(&idx, &wts, seq, top_k, n_experts);
+    let n_rows = plan.rows();
+    assert_eq!(n_rows, seq * top_k, "every entry is non-empty");
+    // The discriminator: more than one element per grid block.
+    assert!(
+        n_rows * hidden > n_rows * 256,
+        "need several elements per block"
+    );
+
+    let x: Vec<f32> = (0..seq * hidden)
+        .map(|i| ((i as f32 * 0.0013).sin() * 0.9) + 0.1)
+        .collect();
+    let ctx = cached_context().expect("ctx");
+    let bx = DeviceBuffer::alloc(&ctx, x.len() * 4).unwrap();
+    bx.write_f32(&x).unwrap();
+    let dst = DeviceBuffer::alloc(&ctx, n_rows * hidden * 4).unwrap();
+    let tok_idx = dgqcuda::moe_grouped::upload_u32(&ctx, &plan.tok_idx).unwrap();
+    let kernel =
+        gpukit::cuda::cached_source_kernel(dgqcuda::moe_grouped::MOE_KERNELS, "dgq_moe_gather")
+            .expect("kernel");
+    let mut args = gpukit::cuda::KernelArgs::new();
+    args.device_ptr(bx.device_ptr())
+        .device_ptr(dst.device_ptr())
+        .device_ptr(tok_idx.device_ptr())
+        .u32(n_rows as u32)
+        .u32(hidden as u32);
+    ctx.launch(
+        &kernel,
+        ((n_rows * hidden).div_ceil(256) as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        &mut args,
+    )
+    .expect("gather launch");
+    ctx.synchronize().unwrap();
+
+    let mut got = vec![0.0f32; n_rows * hidden];
+    dst.read_f32(&mut got).unwrap();
+    for r in 0..n_rows {
+        let src = plan.tok_idx[r] as usize * hidden;
+        assert_eq!(
+            got[r * hidden..(r + 1) * hidden],
+            x[src..src + hidden],
+            "bucketed row {r} was not gathered"
+        );
+    }
+}
+
 #[test]
 fn plan_buckets_are_expert_major_and_weighted() {
     // Two tokens, three experts, top-2: token 0 -> {0, 2}, token 1 -> {1, 2}.
