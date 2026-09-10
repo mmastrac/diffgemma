@@ -272,21 +272,22 @@ clears 0.641 by a lot.
   never over rows: a row-count grid silently truncates the gather and the
   expert path degrades to zeros without failing. Text prompts work
   (`--prompt`, tokenizer + chat template), and the remaining port is the same
-  quantized-GEMM treatment for the attention/dense weights. Open: why the step
-  still does not produce text. What is ruled out: the commit rule (the device
-  now inverse-CDF samples like `sample_apply`, and still degenerates), the
-  step-1 preamble, the MoE path, the attention path, and the prompt rows, all
-  of which match the engine or the oracle exactly. What is measured: the
-  device's step-1 logits are sharp where the engine's are nearly uniform at
-  the same seed, prompt and canvas -- full-vocabulary entropy 0.936 raw and
-  9.862 after the softcap, against the engine's 11.426. Two cautions on that
-  number: the engine's dumps store logits AFTER the softcap (`logit_softcapping`
-  runs before the readback, and its `logit_raw` inverts through atanh to a raw
-  value near 42), and the engine's `step-layer-probe`/`step-logits-dump`
-  numbers remain lower-magnitude than the device's by roughly 2x on the
-  residual stream. The remaining candidates are the f32-versus-bf16 weight
-  precision in attention/dense, and the sampler's tolerance to it on a random
-  canvas.
+  quantized-GEMM treatment for the attention/dense weights. Open: why the
+  canvas does not sharpen. Three engine/port divergences are now fixed and
+  verified -- the MoE gather's dispatch grid, the step-1 preamble (the engine
+  skips the SC MLP when `first_step`), and the sampler's input (the engine
+  softcaps inside the step, `finish_stages` runs Softcap before
+  SampleRowstats, so `sample_rowstats` reads capped logits). Softcapping the
+  port's sampler input moved a 32-wide run's mean step entropy from 0.94 to
+  8.4 and stopped it locking onto a fixed point, which is the right regime,
+  but the canvas still accepts nothing before the final step, so the reply is
+  still noise. Everything measurable now agrees with the engine (prompt rows,
+  canvas embedding, step-1 preamble, per-layer residual magnitude, sampler
+  rules), which leaves the residual itself: the device runs f32 attention and
+  dense against the engine's bf16, and a random canvas is the worst case for
+  that, since every row attends nearly uniformly. Next: run the port's
+  attention/dense at the engine's precision and see whether the canvas
+  sharpens.
 - **Model-gated tests treat a manifest-only pack as present.**
   `test_util::dgq_model_dir()` returns `Some` when `model.dgq.json` exists, so an
   interrupted pack download (manifest present, `model.dgq.bin` missing or a
