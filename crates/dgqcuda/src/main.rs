@@ -509,18 +509,15 @@ fn run(args: &Args) -> Result<(), config::Error> {
                 sess.set_layers(n);
             }
             let load = std::time::Instant::now();
-            let ph = sess.prompt_hidden(prompt)?;
+            // Warm the device (module load and first-touch allocs land on the
+            // first step) and report the CPU causal prefill scale. Note what
+            // this does NOT do: it never compares `prompt_hidden`. That helper
+            // runs the prompt standalone, which is a different code path from
+            // the step's [prompt][canvas] sequence, and probing it instead of
+            // the step is how a double-applied prompt residual stream hid here.
+            sess.warm(prompt)?;
             eprintln!("prompt prefill in {:.1}s", load.elapsed().as_secs_f32());
             if args.diag {
-                // The same causal pass the step's prompt rows must reproduce:
-                // run it standalone so the two hidden states can be compared.
-                let hidden = t.hidden_size;
-                let scale = ph.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-                eprintln!(
-                    "  [diag] prompt_hidden rows {} max_abs {scale:.3} row0[0..4] {:?}",
-                    ph.len() / hidden,
-                    &ph[..4]
-                );
                 let mut csc = Scratch::new(prompt_ids.len(), &cfg);
                 let c = forward::causal_hidden_after(
                     &w,
@@ -529,15 +526,19 @@ fn run(args: &Args) -> Result<(), config::Error> {
                     t.num_hidden_layers,
                     &mut csc,
                 )?;
-                let cos = cosine(&ph, &c);
-                eprintln!("  [diag] prompt_hidden vs cpu causal: cos {cos:.7}");
+                let scale = c.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                eprintln!(
+                    "  [diag] cpu causal prompt hidden rows {} max_abs {scale:.3} row0[0..4] {:?}",
+                    c.len() / t.hidden_size,
+                    &c[..4]
+                );
             }
             let mut total = std::time::Duration::ZERO;
             let mut prev: Option<Vec<f32>> = None;
             let mut step_no = 0usize;
             for _ in 0..st.cfg.max_denoising_steps {
                 let start = std::time::Instant::now();
-                let mut logits = sess.step(prompt, &ph, &st.ids)?;
+                let mut logits = sess.step(prompt, &st.ids)?;
                 // The engine softcaps inside the step, BEFORE the sampler: its
                 // StepStage::Softcap runs ahead of SampleRowstats, and the
                 // comment there notes that sample_rowstats reads post-softcap
@@ -588,7 +589,6 @@ fn run(args: &Args) -> Result<(), config::Error> {
                         prompt.len(),
                         canvas,
                         prev.as_deref(),
-                        Some(&ph),
                     )?;
                     let cbase = prompt.len() * hidden_n;
                     eprintln!(
@@ -628,7 +628,6 @@ fn run(args: &Args) -> Result<(), config::Error> {
                         prompt.len(),
                         canvas,
                         prev.as_deref(),
-                        Some(&ph),
                     )?;
                     // The device step returns pre-softcap logits (the sampler
                     // needs them raw); the CPU oracle leaves them raw too, so

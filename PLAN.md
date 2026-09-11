@@ -272,22 +272,45 @@ clears 0.641 by a lot.
   never over rows: a row-count grid silently truncates the gather and the
   expert path degrades to zeros without failing. Text prompts work
   (`--prompt`, tokenizer + chat template), and the remaining port is the same
-  quantized-GEMM treatment for the attention/dense weights. Open: why the
-  canvas does not sharpen. Three engine/port divergences are now fixed and
-  verified -- the MoE gather's dispatch grid, the step-1 preamble (the engine
-  skips the SC MLP when `first_step`), and the sampler's input (the engine
-  softcaps inside the step, `finish_stages` runs Softcap before
-  SampleRowstats, so `sample_rowstats` reads capped logits). Softcapping the
-  port's sampler input moved a 32-wide run's mean step entropy from 0.94 to
-  8.4 and stopped it locking onto a fixed point, which is the right regime,
-  but the canvas still accepts nothing before the final step, so the reply is
-  still noise. Everything measurable now agrees with the engine (prompt rows,
-  canvas embedding, step-1 preamble, per-layer residual magnitude, sampler
-  rules), which leaves the residual itself: the device runs f32 attention and
-  dense against the engine's bf16, and a random canvas is the worst case for
-  that, since every row attends nearly uniformly. Next: run the port's
-  attention/dense at the engine's precision and see whether the canvas
-  sharpens.
+  quantized-GEMM treatment for the attention/dense weights.
+
+  **Fixed: the step re-applied the layer stack to the prompt rows.** The port
+  has no resident KV cache, so each step runs `[prompt][canvas]` through the
+  layers and rebuilds the prompt's K/V that way. It seeded the prompt rows
+  with the post-layer hidden state from `prompt_hidden`, which feeds a state
+  that has already been through all 30 layers back into layer 0: the prompt
+  residual stream leaves the stack 30 layers ahead, and the canvas attends the
+  resulting wrong K/V. Seeding from the embeddings instead is exact, not an
+  approximation -- a prompt row is causal (`causal_split` is the prompt
+  length), so it attends only prompt keys up to itself and cannot see the
+  canvas, which reproduces the standalone causal prefill's hidden and K/V bit
+  for bit. `forward_sc` and the device `Session::step` now both embed the
+  prompt; `prompt_hidden` became `warm` (a device warm-up that no longer feeds
+  a probe), and the `--diag` line that compared it was the misleading
+  probe-vs-production pair AGENTS.md warns about: it exercised a code path the
+  step never used, so "prompt rows match the engine" and "the canvas drifts"
+  were both true at once. `tests/step_prompt.rs` pins the prompt rows to the
+  causal prefill and to canvas-independence; with the bug reinstated it reports
+  cos 0.0061, and green it passes on the real pack.
+
+  **Disproved: bf16-versus-f32 activations are not the residual drift.** Every
+  attention and dense weight in the production pack is raw BF16 and bf16->f32
+  widening is exact, so weights were never a divergence; the only delta is that
+  the engine bf16-rounds activations at each arena store while the port keeps
+  f32. Simulating that faithfully (norm-bounded 30-layer residual,
+  round-to-nearest-even at every store) gives hidden cos 0.9997 and leaves
+  argmax and entropy unchanged (8.4953 vs 8.4954) across 12 seeds. A relative
+  cos of 0.4-0.7 is a structural mismatch, not a 2^-9 per-store accumulation.
+
+  **Latent, not yet active.** `Session::step` builds its runner with `pos0: 0`
+  although the canvas starts at absolute position `prompt_len`; the sliding
+  window is still correct only because `window` (1024) exceeds the canvas and
+  prompt lengths in use. Likewise the port windows the canvas where the engine
+  windows only the prompt (`t_lo = kv_len - (window-1)`, canvas always
+  visible), which the same sizes keep inert. Both bite at canvas > window.
+
+  Next: re-run the denoise loop on the GB10 and read whether the canvas
+  sharpens past the prompt fix.
 - **Model-gated tests treat a manifest-only pack as present.**
   `test_util::dgq_model_dir()` returns `Some` when `model.dgq.json` exists, so an
   interrupted pack download (manifest present, `model.dgq.bin` missing or a

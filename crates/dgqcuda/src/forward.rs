@@ -765,8 +765,10 @@ pub fn soft_embed_from_logits(
 }
 
 /// forward with the denoise pass self-conditioning: prompt_len leading rows
-/// are left alone, the canvas rows after them get the SC MLP, and prev_logits
-/// is the previous step canvas logits (None = first step).
+/// run through the layers as embeddings (the port has no resident KV cache, so
+/// it rebuilds the prompt's K/V in the same sequence the way the engine's
+/// prefill did), the canvas rows after them get the SC MLP, and prev_logits is
+/// the previous step canvas logits (None = first step).
 #[allow(clippy::too_many_arguments)]
 pub fn forward_sc(
     w: &Weights,
@@ -778,7 +780,6 @@ pub fn forward_sc(
     prompt_len: usize,
     canvas: usize,
     prev_logits: Option<&[f32]>,
-    prompt_hidden: Option<&[f32]>,
 ) -> Result<ForwardOutput, Error> {
     let t = &cfg.text_config;
     let seq = token_ids.len();
@@ -792,12 +793,12 @@ pub fn forward_sc(
             sc.bufs.embed[dst + i] = embed_w[src + i] * embed_scale;
         }
     }
+    // The prompt rows enter as embeddings. A prompt row is causal
+    // (`causal_split` is the prompt length below), so it attends only prompt
+    // keys up to itself and cannot see the canvas: this reproduces the
+    // standalone causal prefill's prompt hidden and K/V exactly, which is what
+    // the engine's KV cache holds when its denoise step runs the canvas alone.
     sc.hidden_a.copy_from_slice(&sc.bufs.embed);
-    if let Some(ph) = prompt_hidden {
-        // The device path starts the denoise pass from the prompt's post-layer
-        // hidden state; mirror that so both paths run the same graph.
-        sc.hidden_a[..prompt_len * hidden].copy_from_slice(&ph[..prompt_len * hidden]);
-    }
     // Step 1 has no previous prediction, and the engine's no-signal branch
     // applies NO self-conditioning to the canvas rows at all: they are just a
     // scale-free RMS norm of their own embeddings (src/metal/decoder.rs, the

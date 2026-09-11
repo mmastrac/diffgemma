@@ -326,12 +326,14 @@ impl Session {
         )
     }
 
-    /// The prompt hidden state after all layers, `[prompt_len, hidden]`, used
-    /// to seed a denoise step's canvas rows.
-    pub fn prompt_hidden(&mut self, prompt: &[u32]) -> Result<Vec<f32>, Error> {
+    /// Warm the device: embed the prompt, then run the prompt rows through the
+    /// layers once. This is not an oracle -- the step embeds both row groups
+    /// into the same sequence, so it does not consume this result. What it buys
+    /// is that module load, first-touch allocations and the prompt-width
+    /// dispatch shapes are all paid before the first timed step.
+    pub fn warm(&mut self, prompt: &[u32]) -> Result<(), Error> {
         assert_eq!(prompt.len(), self.prompt_len, "prompt length");
         let ctx = self.model.ctx.clone();
-        let hidden = self.cfg.text_config.hidden_size;
         self.embed_rows(prompt, 0)?;
         let n_layers = self.layers.min(self.model.layers.len());
         {
@@ -342,8 +344,6 @@ impl Session {
                 bufs,
                 ..
             } = self;
-            // A short-sequence runner: only the prompt rows exist yet. It
-            // honors the layer limit so --layers bisects this path too.
             let r = Runner {
                 m: model,
                 cfg,
@@ -358,9 +358,7 @@ impl Session {
             }
         }
         ctx.synchronize()?;
-        let mut out = vec![0.0f32; self.prompt_len * hidden];
-        self.bufs.hidden_a.read_f32(&mut out)?;
-        Ok(out)
+        Ok(())
     }
 
     /// The prompt's hidden state after the first `n` causal layers, for
@@ -400,26 +398,36 @@ impl Session {
 
     /// One denoise forward pass. Returns the canvas's pre-softcap logits,
     /// `[canvas, vocab]` row-major.
+    ///
+    /// The prompt rows enter from their EMBEDDINGS, not from the post-layer
+    /// hidden `prompt_hidden` computes. The engine's denoise step runs the
+    /// canvas alone (its attention grids are `active_canvas` wide) and reads
+    /// the prompt from the KV cache the prefill wrote; the port has no resident
+    /// KV cache, so it rebuilds the prompt's K/V by running the prompt rows
+    /// through the layers as part of the same sequence. Handing the layers a
+    /// post-layer state re-applies the whole stack to the prompt rows, which
+    /// leaves the prompt residual stream 30 layers "ahead" and hands the canvas
+    /// the wrong K/V to attend.
+    ///
+    /// Embedding the prompt instead is exact, not an approximation: a prompt row
+    /// is causal (`causal_split` is the prompt length), so it attends only
+    /// prompt keys up to itself and cannot see the canvas. Running
+    /// `[prompt][canvas]` therefore reproduces the standalone causal pass's
+    /// prompt hidden and K/V bit for bit.
     pub fn step(
         &mut self,
         prompt: &[u32],
-        prompt_hidden: &[f32],
         canvas_ids: &[u32],
     ) -> Result<Vec<f32>, Error> {
         assert_eq!(prompt.len(), self.prompt_len, "prompt length");
         assert_eq!(canvas_ids.len(), self.canvas, "canvas length");
-        assert_eq!(
-            prompt_hidden.len(),
-            self.prompt_len * self.cfg.text_config.hidden_size
-        );
         let ctx = self.model.ctx.clone();
         let t = self.cfg.text_config.clone();
         let hidden = t.hidden_size;
         let timing = std::env::var("DGQCUDA_TIME").is_ok_and(|v| v != "0");
 
-        // The prompt's rows are already at their post-layer value; only the
-        // canvas rows need embedding + self-conditioning.
-        self.bufs.hidden_a.write_f32(prompt_hidden)?;
+        // Both row groups enter the layer stack as embeddings, exactly once.
+        self.embed_rows(prompt, 0)?;
         self.embed_rows(canvas_ids, self.prompt_len)?;
         // The buffers are sized for [prompt][canvas]; the canvas is written
         // into the tail, leaving no spare row today, but the zeroing keeps a
