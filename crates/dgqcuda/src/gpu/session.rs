@@ -61,6 +61,35 @@ pub struct Session {
     first_step: bool,
 }
 
+/// One `DGQCUDA_LAYER_DUMP` checkpoint: the canvas row's stats to stderr, and
+/// -- when `DGQCUDA_LAYER_DUMP_JSONL` names a path -- the whole row appended
+/// there as one JSON object, so it can be cosine-compared against the engine's
+/// `step-layer-probe` checkpoints rather than eyeballed four floats at a time.
+fn emit_layer_checkpoint(label: &str, row: &[f32]) {
+    let l2 = row.iter().map(|v| v * v).sum::<f32>().sqrt();
+    let max = row.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    eprintln!(
+        "  [layer] {label:<17} l2={l2:10.3} max={max:8.3} h[0..4]={:?}",
+        &row[..4]
+    );
+    let Ok(path) = std::env::var("DGQCUDA_LAYER_DUMP_JSONL") else {
+        return;
+    };
+    use std::io::Write;
+    let vals: Vec<String> = row.iter().map(|v| format!("{v}")).collect();
+    let line = format!(
+        "{{\"label\":\"{label}\",\"hidden_l2\":{l2},\"hidden_max_abs\":{max},\"hidden\":[{}]}}\n",
+        vals.join(",")
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 impl Session {
     pub fn open(
         w: &Weights,
@@ -432,6 +461,18 @@ impl Session {
             self.soft_embed(lg)?;
         }
         self.self_condition(first)?;
+        if let Some(pos) = std::env::var("DGQCUDA_LAYER_DUMP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&p| p < self.canvas)
+        {
+            let hidden = self.cfg.text_config.hidden_size;
+            self.model.ctx.synchronize()?;
+            let mut all = vec![0.0f32; self.seq * hidden];
+            self.bufs.hidden_a.read_f32(&mut all)?;
+            let off = (self.prompt_len + pos) * hidden;
+            emit_layer_checkpoint("after_preamble", &all[off..off + hidden]);
+        }
         if timing {
             ctx.synchronize()?;
             eprintln!("  [d] self-condition ok");
@@ -457,16 +498,39 @@ impl Session {
             causal_split: *prompt_len,
             stage: std::cell::RefCell::new(Stage::new()),
         };
+        // `DGQCUDA_LAYER_DUMP=<canvas row>` traces one canvas row's residual
+        // down the stack, in the shape of the engine's `step-layer-probe`, so
+        // the two can be read side by side to find the first layer that
+        // disagrees. Off by default and never allocated when off.
+        let layer_dump: Option<usize> = std::env::var("DGQCUDA_LAYER_DUMP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&p| p < *canvas);
         let n_layers = self.layers.min(model.layers.len());
         for (i, lw) in model.layers.iter().take(n_layers).enumerate() {
             layer_forward(&r, bufs, lw, i, 0)?;
             std::mem::swap(&mut bufs.hidden_a, &mut bufs.hidden_b);
+            if let Some(pos) = layer_dump {
+                // The swap above leaves the layer's output in hidden_a.
+                ctx.synchronize()?;
+                let mut all = vec![0.0f32; *seq * hidden];
+                bufs.hidden_a.read_f32(&mut all)?;
+                let off = (*prompt_len + pos) * hidden;
+                emit_layer_checkpoint(&format!("after_layer_{i}"), &all[off..off + hidden]);
+            }
             if timing {
                 ctx.synchronize()?;
                 eprintln!("  [d] layer {i} ok");
             }
         }
         r.rms(&bufs.hidden_a, &model.final_norm, &bufs.hidden_b, *seq)?;
+        if let Some(pos) = layer_dump {
+            ctx.synchronize()?;
+            let mut all = vec![0.0f32; *seq * hidden];
+            bufs.hidden_b.read_f32(&mut all)?;
+            let off = (*prompt_len + pos) * hidden;
+            emit_layer_checkpoint("after_final_norm", &all[off..off + hidden]);
+        }
         if timing {
             r.mark("d:final_norm");
         }
