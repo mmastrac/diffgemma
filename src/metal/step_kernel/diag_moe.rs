@@ -300,7 +300,7 @@ pub fn run_step_moe_batched_pin_capture(
     let format = rt.block_profile.format;
 
     rt.dispatch_and_wait(|enc| {
-        enc.encode_step_preamble(&layout, 1)?;
+        enc.encode_preamble_for_step(&layout, 1, StepFinishMode::ForwardOnly)?;
         for l in 0..layer {
             enc.encode_full_layer(l, &layout)?;
         }
@@ -412,7 +412,7 @@ pub fn run_step_moe_route_capture(
     .to_string();
 
     rt.dispatch_and_wait(|enc| {
-        enc.encode_step_preamble(&layout, 1)?;
+        enc.encode_preamble_for_step(&layout, 1, StepFinishMode::ForwardOnly)?;
         for l in 0..layer {
             enc.encode_full_layer(l, &layout)?;
         }
@@ -469,7 +469,7 @@ pub fn run_step_moe_layer_capture(
     let layout = rt.layout;
 
     rt.dispatch_and_wait(|enc| {
-        enc.encode_step_preamble(&layout, 1)?;
+        enc.encode_preamble_for_step(&layout, 1, StepFinishMode::ForwardOnly)?;
         Ok(())
     })?;
     for l in 0..layer {
@@ -593,7 +593,7 @@ pub fn run_step_moe_single_expert_capture(
     let layout = rt.layout;
 
     rt.dispatch_and_wait(|enc| {
-        enc.encode_step_preamble(&layout, 1)?;
+        enc.encode_preamble_for_step(&layout, 1, StepFinishMode::ForwardOnly)?;
         Ok(())
     })?;
     for l in 0..layer {

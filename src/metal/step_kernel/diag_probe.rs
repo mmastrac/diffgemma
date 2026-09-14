@@ -243,7 +243,9 @@ pub fn run_step_preamble_capture(
     let embed_scaled =
         read_arena_hidden_row(&rt.bufs.arena, rt.bufs.arena_map.hidden_off(), position);
 
-    rt.dispatch_and_wait(|enc| enc.encode_step_preamble(&layout, 1))?;
+    rt.dispatch_and_wait(|enc| {
+        enc.encode_preamble_for_step(&layout, 1, StepFinishMode::ForwardOnly)
+    })?;
     let after_preamble =
         read_arena_hidden_row(&rt.bufs.arena, rt.bufs.arena_map.hidden_off(), position);
 
@@ -387,7 +389,7 @@ pub fn run_step_attn_layer_capture(
     let layout = rt.layout;
 
     rt.dispatch_and_wait(|enc| {
-        enc.encode_step_preamble(&layout, 1)?;
+        enc.encode_preamble_for_step(&layout, 1, StepFinishMode::ForwardOnly)?;
         Ok(())
     })?;
     for l in 0..layer {
@@ -515,7 +517,7 @@ pub fn run_step_attn_qk_plane_dump(
     let layout = rt.layout;
 
     rt.dispatch_and_wait(|enc| {
-        enc.encode_step_preamble(&layout, 1)?;
+        enc.encode_preamble_for_step(&layout, 1, StepFinishMode::ForwardOnly)?;
         Ok(())
     })?;
     for l in 0..layer {
