@@ -372,9 +372,26 @@ clears 0.641 by a lot.
   is therefore narrower than "why does the port differ": why does the canvas
   hidden land where `model.decoder.norm.weight` (l2 4746, mean 29.5, max 588)
   blows it up 6.6x, when the engine's lands on the small-weight coordinates.
-  Next: read the port's canvas `after_final_norm` against its own PROMPT rows'
-  (the prompt path is known good), and check whether the canvas row is
-  pathological in an absolute sense or only relative to the engine.
+  It is pathological in an absolute sense, and the shape is specific. The
+  port's canvas row after the final norm carries 79% of its energy in ONE
+  coordinate (216): l2 789.4, max 700.3. Neither control looks like that --
+  the port's own last PROMPT row is l2 371.8 / max 105.4 (8%), and the engine's
+  canvas row is l2 119.2 / max 36.0 (9%). Coordinate 216 holds -7.29 in the
+  port's layer-29 hidden against the engine's -0.20, and the final norm's
+  weight there (36.25, not even its largest) turns 19.3 sigma into 700. A
+  normed row dominated by one coordinate makes every logit a multiple of one
+  embedding column, which is why they are all large and all saturate.
+
+  Where it happens is the last four layers. Tracing max_abs down the stack, the
+  engine CONTRACTS hard at the end -- 10.9, 5.8, 2.8 at layers 26, 27, 28 --
+  while the port grows: 10.7, 11.5, 18.8. Coordinate 216 does the same, engine
+  1.04 -> 0.30 -> -0.20 against the port -7.9 -> -12.5 -> -7.3. The engine's
+  late-layer row is flat (max/rms 4.8 at layer 28), the port's is spiky (17.5).
+  Cos is already 0.72 by layer 26, so the failure to contract may be a
+  consequence rather than the cause -- but it is where a merely-different
+  trajectory turns into a broken one, and it is the first thing to look at that
+  is NOT explained by the amplification above. Layers 26-29 are the place to
+  put the next probe, not layer 3.
 
   **Open: the port is not deterministic.** Three identical runs give different
   bytes. `dgq_moe_scatter` accumulates each token's experts with `atomicAdd`,

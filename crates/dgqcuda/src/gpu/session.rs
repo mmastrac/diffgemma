@@ -503,6 +503,12 @@ impl Session {
             bufs.hidden_b.read_f32(&mut all)?;
             let off = (*prompt_len + pos) * hidden;
             emit_layer_checkpoint("after_final_norm", &all[off..off + hidden]);
+            // The same buffer's last PROMPT row, as an absolute control: the
+            // prompt path is verified, so if the canvas row is an outlier here
+            // and the prompt row is not, the canvas state is pathological in
+            // its own right and not merely different from the engine's.
+            let poff = (*prompt_len - 1) * hidden;
+            emit_layer_checkpoint("after_final_norm_prompt", &all[poff..poff + hidden]);
         }
         if timing {
             r.mark("d:final_norm");
