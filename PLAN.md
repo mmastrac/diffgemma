@@ -382,16 +382,44 @@ clears 0.641 by a lot.
   normed row dominated by one coordinate makes every logit a multiple of one
   embedding column, which is why they are all large and all saturate.
 
-  Where it happens is the last four layers. Tracing max_abs down the stack, the
-  engine CONTRACTS hard at the end -- 10.9, 5.8, 2.8 at layers 26, 27, 28 --
-  while the port grows: 10.7, 11.5, 18.8. Coordinate 216 does the same, engine
-  1.04 -> 0.30 -> -0.20 against the port -7.9 -> -12.5 -> -7.3. The engine's
-  late-layer row is flat (max/rms 4.8 at layer 28), the port's is spiky (17.5).
-  Cos is already 0.72 by layer 26, so the failure to contract may be a
-  consequence rather than the cause -- but it is where a merely-different
-  trajectory turns into a broken one, and it is the first thing to look at that
-  is NOT explained by the amplification above. Layers 26-29 are the place to
-  put the next probe, not layer 3.
+  Where it happens is the last four layers, and probing them RULES THEM OUT as
+  the bug. Three rows through the same 30 layers and the same final norm, one
+  run, reported as the share of the row's energy in its largest coordinate:
+
+    row                      L28    L29    after final norm
+    engine canvas            0.8%   43.5%   9.1%   (the norm REDUCES the spike)
+    port prompt (control)   22.8%   14.8%   8.0%   (reduces, like the engine)
+    port canvas             10.9%   13.3%  78.7%   (the norm AMPLIFIES it)
+
+  The port's own PROMPT row -- same code, same layers, same norm, a path already
+  verified against the causal prefill -- comes out healthy at 8.0%, in line with
+  the engine's canvas at 9.1%. So layers 26-29 and the final norm are not
+  broken; they are handed a broken row. What separates the cases is WHERE the
+  layer-29 spike sits: the engine's and the port's prompt row put theirs on
+  coordinates whose norm weight is about 1, and the port's canvas puts its on
+  coordinate 216, weight 36.25, which is how 19 sigma becomes 700.
+
+  The late-layer behaviour is a symptom of not converging, not a missing
+  mechanism. The engine's MoE output collapses over those layers (l2 39.8 ->
+  15.5 -> 11.3 at 26/27/28) and its residual contracts with it (47.0 -> 36.3 ->
+  31.4), because its canvas has already resolved -- at step 1 it reads "The
+  capital of France is". The port's MoE matches the engine to 0.1% at layer 26
+  (39.83 vs 39.79) and then stays high (24.9, 27.1) while its residual does not
+  contract (55.8 -> 50.4 -> 57.0): a model still working on a representation
+  that never resolved. Its attention branch is not the difference either --
+  the engine's attn_out magnitude is flat (l2 41-46) across 26-28 while the
+  residual falls, so the contraction is cancellation in the residual.
+
+  So the cause is upstream and diffuse, and the next experiment is state
+  INJECTION, not another layer dump. Extend `step-layer-probe` to write the
+  engine's whole canvas hidden at a chosen layer (256 x 2816 f32, ~2.9 MB, as
+  raw little-endian, not JSON), load it into the port's `hidden_a`, and run the
+  port's remaining layers plus the final norm and lm_head. If the logits then
+  match the engine, everything below that layer is correct; binary-search the
+  first layer at which injection no longer rescues the output. That is
+  "same input, two paths" applied at depth, and it is the only thing that
+  separates a per-layer bug from accumulated drift -- which the whole-row
+  cosines cannot, because by layer 26 the two inputs already differ by cos 0.72.
 
   **Fixed: the port reproduces itself.** `dgq_moe_scatter` accumulated each
   token's expert rows with `atomicAdd`, so the sum order varied with scheduling

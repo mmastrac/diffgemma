@@ -490,6 +490,15 @@ impl Session {
                 bufs.hidden_a.read_f32(&mut all)?;
                 let off = (*prompt_len + pos) * hidden;
                 emit_layer_checkpoint(&format!("after_layer_{i}"), &all[off..off + hidden]);
+                // The last PROMPT row through the same layers, as a control.
+                // The prompt path is verified against the causal prefill, so a
+                // layer that mishandles a good input shows up here too; one
+                // that only mishandles the canvas does not.
+                let poff = (*prompt_len - 1) * hidden;
+                emit_layer_checkpoint(
+                    &format!("after_layer_{i}_prompt"),
+                    &all[poff..poff + hidden],
+                );
             }
             if timing {
                 ctx.synchronize()?;
