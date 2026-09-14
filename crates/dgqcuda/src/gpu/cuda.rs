@@ -674,6 +674,35 @@ fn attn_dump_write(fields: &[(&str, Vec<f32>)]) {
     let _ = std::fs::write(path, format!("{{{}}}", body.join(",")));
 }
 
+/// One `DGQCUDA_LAYER_DUMP` checkpoint: the canvas row's stats to stderr, and
+/// -- when `DGQCUDA_LAYER_DUMP_JSONL` names a path -- the whole row appended
+/// there as one JSON object, so it can be cosine-compared against the engine's
+/// `step-layer-probe` checkpoints rather than eyeballed four floats at a time.
+pub(crate) fn emit_layer_checkpoint(label: &str, row: &[f32]) {
+    let l2 = row.iter().map(|v| v * v).sum::<f32>().sqrt();
+    let max = row.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    eprintln!(
+        "  [layer] {label:<17} l2={l2:10.3} max={max:8.3} h[0..4]={:?}",
+        &row[..4]
+    );
+    let Ok(path) = std::env::var("DGQCUDA_LAYER_DUMP_JSONL") else {
+        return;
+    };
+    use std::io::Write;
+    let vals: Vec<String> = row.iter().map(|v| format!("{v}")).collect();
+    let line = format!(
+        "{{\"label\":\"{label}\",\"hidden_l2\":{l2},\"hidden_max_abs\":{max},\"hidden\":[{}]}}\n",
+        vals.join(",")
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 pub(crate) fn layer_forward(
     r: &Runner<'_>,
     b: &mut Bufs,
@@ -1108,6 +1137,27 @@ pub(crate) fn layer_forward(
             256,
             &mut args,
         )?;
+    }
+    // The raw MoE output over the canvas rows, before the post-norm folds it
+    // back in: directly comparable to `step-moe-route-dump`'s `moe_out_l2`,
+    // which is the same quantity over the same rows.
+    if std::env::var("DGQCUDA_ROUTE_DUMP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .is_some_and(|l| l == layer)
+        && seq > causal_split
+    {
+        ctx.synchronize()?;
+        let mut all = vec![0.0f32; seq * hidden];
+        b.moe_out.read_f32(&mut all)?;
+        let canvas = &all[causal_split * hidden..];
+        let l2 = canvas.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let nz = canvas.iter().filter(|v| v.abs() > 1e-9).count();
+        eprintln!(
+            "  [route] layer {layer} moe_out_l2 {l2:.4} nonzero {nz}/{}",
+            canvas.len()
+        );
+        emit_layer_checkpoint("moe_out_row0", &canvas[..hidden]);
     }
     // CPU oracle: scratch = moe_out; moe_out = rms(scratch) * w2; normed += moe_out.
     // b.normed holds the layer residual and must not be overwritten, so the

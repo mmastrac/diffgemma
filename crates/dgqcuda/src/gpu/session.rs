@@ -8,7 +8,9 @@
 //! occupies [prompt_len, prompt_len + canvas).
 
 use crate::config::{Error, ModelConfig};
-use crate::gpu::cuda::{Bufs, GpuModel, Runner, Stage, layer_forward, up_f32};
+use crate::gpu::cuda::{
+    Bufs, GpuModel, Runner, Stage, emit_layer_checkpoint, layer_forward, up_f32,
+};
 use crate::weights::Weights;
 use gpukit::cuda::{Context, DeviceBuffer, KernelArgs, cached_source_kernel};
 
@@ -59,35 +61,6 @@ pub struct Session {
     /// The first step has no previous prediction: it seeds self-conditioning
     /// with the canvas embeddings instead of the soft embedding.
     first_step: bool,
-}
-
-/// One `DGQCUDA_LAYER_DUMP` checkpoint: the canvas row's stats to stderr, and
-/// -- when `DGQCUDA_LAYER_DUMP_JSONL` names a path -- the whole row appended
-/// there as one JSON object, so it can be cosine-compared against the engine's
-/// `step-layer-probe` checkpoints rather than eyeballed four floats at a time.
-fn emit_layer_checkpoint(label: &str, row: &[f32]) {
-    let l2 = row.iter().map(|v| v * v).sum::<f32>().sqrt();
-    let max = row.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-    eprintln!(
-        "  [layer] {label:<17} l2={l2:10.3} max={max:8.3} h[0..4]={:?}",
-        &row[..4]
-    );
-    let Ok(path) = std::env::var("DGQCUDA_LAYER_DUMP_JSONL") else {
-        return;
-    };
-    use std::io::Write;
-    let vals: Vec<String> = row.iter().map(|v| format!("{v}")).collect();
-    let line = format!(
-        "{{\"label\":\"{label}\",\"hidden_l2\":{l2},\"hidden_max_abs\":{max},\"hidden\":[{}]}}\n",
-        vals.join(",")
-    );
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = f.write_all(line.as_bytes());
-    }
 }
 
 impl Session {

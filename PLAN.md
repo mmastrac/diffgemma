@@ -315,53 +315,76 @@ clears 0.641 by a lot.
   prediction -- the engine seeds it with the canvas embeddings themselves,
   reading the initial canvas as the step-0 prediction. The port skipped the
   MLP outright, which is the SC=0 case the engine's own comment on that branch
-  records as degenerate ("cold-start empty reply"). On the port it saturated
-  the final softcap: every canvas logit pinned at the 30.0 cap, so the
-  post-cap row was flat, per-row entropy sat at ~11 nats of a 12.48 ceiling,
-  the entropy-bound rule accepted one token per step, and the last step
-  committed 64 categorical draws from noise. `forward_sc` and
+  records as degenerate ("cold-start empty reply"). `forward_sc` and
   `Session::self_condition` now both take the signal as a parameter, and
   `tests/step_first.rs` pins the row to the engine's PRODUCTION value.
+
+  This moved the preamble onto the engine (cos 0.999988, from a row that was a
+  different computation before) and moved step-1 entropy 11.10 -> 10.37. It did
+  NOT fix generation: the logits still saturate and the canvas still does not
+  sharpen, so the SC branch was a real divergence but not the whole one.
 
   The earlier reading came from `encode_step_preamble`, which production does
   not run on step 1 -- see the engine fix below. Every port conclusion drawn
   against a `step-*-dump` before that fix is unverified and worth re-deriving.
 
-  **Open: the canvas still does not sharpen.** With the preamble matching the
-  engine at cos 0.999988, the per-layer bisect (`DGQCUDA_LAYER_DUMP=<row>`
-  against `diffgemma step-layer-probe`, same prompt/seed/canvas) reads:
+  **Open: the canvas still does not sharpen, and the failure is absolute.**
+  A canvas row's logits come out around 144 raw, so the 30.0 softcap saturates
+  every one of them (top sixteen post-cap all 29.99) and the row is flat. The
+  engine's same row spans 18 to 28.4. That is not "a different trajectory" --
+  it is a broken distribution, and it is what starves the accept rule.
 
-    after_preamble  cos 0.999988   l2 ratio 1.003
-    after_layer_0   cos 0.999602   l2 ratio 1.015
-    after_layer_2   cos 0.992072   l2 ratio 1.016
-    after_layer_3   cos 0.974683   l2 ratio 1.176   <-- discrete jump
-    after_layer_29  cos 0.182897   l2 ratio 0.855
-    after_final_norm cos 0.174781  l2 ratio 6.620
+  What is measured, all against the now-production-faithful engine probes on
+  the same prompt, seed and canvas (`DGQCUDA_LAYER_DUMP` / `DGQCUDA_ATTN_DUMP`
+  / `DGQCUDA_ROUTE_DUMP` vs `step-layer-probe` / `step-attn-dump` /
+  `step-moe-route-dump`):
 
-  Two separate things. First, a DISCRETE event at layer 3: the l2 ratio steps
-  1.016 -> 1.176 in one layer, which is the shape of a routing flip, not
-  rounding ([[fast-prefill-degeneration-cause]]: bf16-vs-f32 flips discrete
-  MoE routing). Layer 3 is not a layer-type or dense/MoE boundary -- every
-  layer carries both a dense FFN and MoE, and 0-4 are all sliding. Second, the
-  final norm AMPLIFIES whatever disagreement survives: `model.decoder.norm.weight`
-  has l2 4746, mean 29.5 and max 588, so coordinates where the two rows differ
-  by ~0.1 come out hundreds apart, which is how cos 0.18 becomes a 6.6x l2 and
-  a saturated softcap. Chase the layer-3 jump first; it is the only discrete
-  step in the trace. Next probe: split layer 3 at the attention/MoE boundary
-  (the port's `layer_forward` already takes a `stop_at`) and dump the router's
-  top-8 on both sides.
-- **The remaining step probes still run the non-production preamble.**
-  `encode_step_preamble` skips self-conditioning whenever `first_step` is
-  non-zero, so every caller that passes a literal `1` (four sites in
-  `diag_moe.rs`, three more in `diag_probe.rs`) reports a step the model never
-  takes. `step-logits-dump` and `step-layer-probe` were moved onto the
-  production path (`run_forward_once` / `encode_preamble_for_step`) because the
-  CUDA port needed a reference it could trust; the MoE dumps and the
-  profiling/range paths in `runtime.rs` were left alone. Convert as touched,
-  and treat any conclusion drawn from those dumps as unverified until then.
-  The underlying hazard is that `encode_step_preamble` is reachable at all:
-  folding it into `encode_preamble_for_step` would make the wrong path
-  unspellable.
+    preamble         cos 0.999988  (the step-1 SC fix; row 1 agrees, 0.999980)
+    layer 0 attention cos 0.999984 -- exact, carries its input through
+    layer 0 whole     cos 0.999602 -- the error enters in the FFN/MoE half
+    layer 0 moe_out   cos 0.9999694, l2 ratio 1.0214 (row 0)
+    layer 29          cos 0.183
+    final norm        cos 0.175, l2 ratio 6.62
+
+  Ruled out. The attention kernel is exact at the real full-attention geometry
+  (head_dim 512, 2 KV heads, 276 keys) and across tile boundaries, so the
+  amplification at layer 5 is a real input error, not a kernel bug -- that also
+  closes the multi-tile fixture gap this file used to list. Routing is 99.1%
+  identical (2029 of 2048, 68 experts both sides), so no wrong expert index.
+  The MoE difference is a 2.1% SCALE with the direction intact, which is the
+  same size as the engine's own GPU-vs-CPU-oracle MoE spread (rel_l2 0.0141,
+  printed by the route dump) -- f32 against the engine's bf16 arithmetic, not a
+  formula error: both routers compute `softmax(top_k) * per_expert_scale` with
+  no renormalization, and both gate with `gelu_tanh`.
+
+  The amplification is measured, not assumed. Two identical port runs (same
+  seed, same binary) diverge by 6e-6 at layer 1 and 1.7e-3 by layer 29 -- a
+  gain of about 1.2x per layer, ~300x over the stack. The port's 0.49% relative
+  difference at the preamble, amplified 260x, is the observed 128% at layer 29.
+  So per-layer divergence from the engine is EXPECTED at f32-vs-bf16 and bit
+  parity is unattainable without matching the engine's arithmetic. Do not spend
+  another session bisecting layers for a single wrong kernel; the trace is
+  consistent with amplification everywhere.
+
+  What that does NOT explain is saturation. A different-but-valid trajectory
+  should still produce a sane logit row, and the port's prompt-path logits do
+  (top 27.4, clear of the cap) while its canvas rows do not. The open question
+  is therefore narrower than "why does the port differ": why does the canvas
+  hidden land where `model.decoder.norm.weight` (l2 4746, mean 29.5, max 588)
+  blows it up 6.6x, when the engine's lands on the small-weight coordinates.
+  Next: read the port's canvas `after_final_norm` against its own PROMPT rows'
+  (the prompt path is known good), and check whether the canvas row is
+  pathological in an absolute sense or only relative to the engine.
+
+  **Open: the port is not deterministic.** Three identical runs give different
+  bytes. `dgq_moe_scatter` accumulates each token's experts with `atomicAdd`,
+  which is correct but order-dependent, so the sum varies run to run: layer 0
+  is bit-identical, layer 1 differs by 6e-6, layer 29 by 1.7e-3. Harmless for
+  the current bug (cos 0.9999997) but a blocker on its own terms -- this
+  project gates on golden BYTE-identity, which a port with an order-dependent
+  reduction can never pass. Fix by giving the scatter a deterministic order
+  (accumulate per token over its k experts in index order) rather than racing
+  slots into one address.
 
 - **Model-gated tests treat a manifest-only pack as present.**
   `test_util::dgq_model_dir()` returns `Some` when `model.dgq.json` exists, so an
