@@ -149,10 +149,13 @@ pub fn run_step_layer_hidden_probe(
     for _ in 0..warm_steps {
         rt.run_denoise_step()?;
     }
-    let step_index = warm_steps as u32 + 1;
 
+    // `first_step` is a 0/1 flag, not the step number: passing `step_index`
+    // here made every probe run take the non-self-conditioning branch, so the
+    // probe never exercised the SC MLP at any warm_steps.
+    let first_step = u32::from(warm_steps == 0);
     rt.dispatch_and_wait(|enc| {
-        enc.encode_step_preamble(&layout, step_index)?;
+        enc.encode_preamble_for_step(&layout, first_step, StepFinishMode::ForwardOnly)?;
         Ok(())
     })?;
     {

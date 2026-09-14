@@ -379,43 +379,22 @@ pub fn run_step_forward(
     cfg: &StepSmokeConfig,
 ) -> Result<StepForwardOutput, Error> {
     let (mut rt, _) = build_step_runtime(model_dir, cfg)?;
-    let layout = rt.layout;
-    let layers = rt.layers;
-    let st_before: CanvasState = read_struct(&rt.bufs.state);
-    let first_step = if st_before.step == 0 { 1u32 } else { 0u32 };
-
-    rt.dispatch_and_wait(|enc| enc.encode_step_preamble(&layout, first_step))?;
-    for layer in 0..layers {
-        rt.dispatch_and_wait(|enc| enc.encode_full_layer(layer, &layout))?;
-    }
-    // Snapshot final norm before lm_head; gemm_q8_logits clobbers self.arena().tmp_off() on GPU.
-    rt.dispatch_and_wait(|enc| {
-        enc.rmsnorm(
-            enc.arena().hidden_off(),
-            enc.arena().tmp_off(),
-            layout.final_norm,
-            HID as u32,
-            CANVAS,
-        );
-        Ok(())
-    })?;
+    // Run the production step, not a transliteration of it. Hand-rolling the
+    // preamble and the lm_head here diverged from what generation actually
+    // does in two ways at once, and the dump reported the divergence as the
+    // model's output: `encode_step_preamble` skips self-conditioning when
+    // `first_step` is set, where production's `interpret_step` seeds it with
+    // the canvas embedding, and `gemm_q8_logits` decodes a bf16 tied embed
+    // table as q8 blocks, where production branches on `embed_bf16`.
+    // `ForwardOnly` exists for exactly this: everything but the sampler.
+    rt.run_forward_once(StepFinishMode::ForwardOnly)?;
+    // `FinalNorm` leaves the pre-lm_head rows in tmp_off, and the bf16 lm_head
+    // GEMM reads them without clobbering them.
     let norm_hidden = read_arena_buffer_f32(
         &rt.bufs.arena,
         rt.bufs.arena_map.tmp_off() as usize,
         CANVAS * HID,
     );
-    rt.dispatch_and_wait(|enc| {
-        enc.gemm_q8_logits(
-            enc.arena().tmp_off(),
-            layout.embed,
-            CANVAS as u32,
-            VOCAB as u32,
-            HID as u32,
-            0,
-        )?;
-        enc.dispatch_softcap();
-        Ok(())
-    })?;
     let state: CanvasState = read_struct(&rt.bufs.state);
     Ok(StepForwardOutput {
         norm_hidden,
