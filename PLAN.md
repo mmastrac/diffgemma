@@ -309,8 +309,60 @@ clears 0.641 by a lot.
   windows only the prompt (`t_lo = kv_len - (window-1)`, canvas always
   visible), which the same sizes keep inert. Both bite at canvas > window.
 
-  Next: re-run the denoise loop on the GB10 and read whether the canvas
-  sharpens past the prompt fix.
+  **Fixed: step 1 self-conditions on the canvas embedding.** The SC MLP runs
+  on EVERY step; only its input changes. From step 2 on it is the soft
+  embedding of the previous step's logits, and on step 1 -- no previous
+  prediction -- the engine seeds it with the canvas embeddings themselves,
+  reading the initial canvas as the step-0 prediction. The port skipped the
+  MLP outright, which is the SC=0 case the engine's own comment on that branch
+  records as degenerate ("cold-start empty reply"). On the port it saturated
+  the final softcap: every canvas logit pinned at the 30.0 cap, so the
+  post-cap row was flat, per-row entropy sat at ~11 nats of a 12.48 ceiling,
+  the entropy-bound rule accepted one token per step, and the last step
+  committed 64 categorical draws from noise. `forward_sc` and
+  `Session::self_condition` now both take the signal as a parameter, and
+  `tests/step_first.rs` pins the row to the engine's PRODUCTION value.
+
+  The earlier reading came from `encode_step_preamble`, which production does
+  not run on step 1 -- see the engine fix below. Every port conclusion drawn
+  against a `step-*-dump` before that fix is unverified and worth re-deriving.
+
+  **Open: the canvas still does not sharpen.** With the preamble matching the
+  engine at cos 0.999988, the per-layer bisect (`DGQCUDA_LAYER_DUMP=<row>`
+  against `diffgemma step-layer-probe`, same prompt/seed/canvas) reads:
+
+    after_preamble  cos 0.999988   l2 ratio 1.003
+    after_layer_0   cos 0.999602   l2 ratio 1.015
+    after_layer_2   cos 0.992072   l2 ratio 1.016
+    after_layer_3   cos 0.974683   l2 ratio 1.176   <-- discrete jump
+    after_layer_29  cos 0.182897   l2 ratio 0.855
+    after_final_norm cos 0.174781  l2 ratio 6.620
+
+  Two separate things. First, a DISCRETE event at layer 3: the l2 ratio steps
+  1.016 -> 1.176 in one layer, which is the shape of a routing flip, not
+  rounding ([[fast-prefill-degeneration-cause]]: bf16-vs-f32 flips discrete
+  MoE routing). Layer 3 is not a layer-type or dense/MoE boundary -- every
+  layer carries both a dense FFN and MoE, and 0-4 are all sliding. Second, the
+  final norm AMPLIFIES whatever disagreement survives: `model.decoder.norm.weight`
+  has l2 4746, mean 29.5 and max 588, so coordinates where the two rows differ
+  by ~0.1 come out hundreds apart, which is how cos 0.18 becomes a 6.6x l2 and
+  a saturated softcap. Chase the layer-3 jump first; it is the only discrete
+  step in the trace. Next probe: split layer 3 at the attention/MoE boundary
+  (the port's `layer_forward` already takes a `stop_at`) and dump the router's
+  top-8 on both sides.
+- **The remaining step probes still run the non-production preamble.**
+  `encode_step_preamble` skips self-conditioning whenever `first_step` is
+  non-zero, so every caller that passes a literal `1` (four sites in
+  `diag_moe.rs`, three more in `diag_probe.rs`) reports a step the model never
+  takes. `step-logits-dump` and `step-layer-probe` were moved onto the
+  production path (`run_forward_once` / `encode_preamble_for_step`) because the
+  CUDA port needed a reference it could trust; the MoE dumps and the
+  profiling/range paths in `runtime.rs` were left alone. Convert as touched,
+  and treat any conclusion drawn from those dumps as unverified until then.
+  The underlying hazard is that `encode_step_preamble` is reachable at all:
+  folding it into `encode_preamble_for_step` would make the wrong path
+  unspellable.
+
 - **Model-gated tests treat a manifest-only pack as present.**
   `test_util::dgq_model_dir()` returns `Some` when `model.dgq.json` exists, so an
   interrupted pack download (manifest present, `model.dgq.bin` missing or a
