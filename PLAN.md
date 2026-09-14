@@ -358,8 +358,10 @@ clears 0.641 by a lot.
   no renormalization, and both gate with `gelu_tanh`.
 
   The amplification is measured, not assumed. Two identical port runs (same
-  seed, same binary) diverge by 6e-6 at layer 1 and 1.7e-3 by layer 29 -- a
-  gain of about 1.2x per layer, ~300x over the stack. The port's 0.49% relative
+  seed, same binary), taken before the determinism fix below, diverged by 6e-6
+  at layer 1 and 1.7e-3 by layer 29 -- the model's own gain on a perturbation
+  it did not ask for, about 1.2x per layer, ~300x over the stack. The port is
+  deterministic now, so re-measuring this needs a deliberate perturbation. The port's 0.49% relative
   difference at the preamble, amplified 260x, is the observed 128% at layer 29.
   So per-layer divergence from the engine is EXPECTED at f32-vs-bf16 and bit
   parity is unattainable without matching the engine's arithmetic. Do not spend
@@ -372,9 +374,9 @@ clears 0.641 by a lot.
   is therefore narrower than "why does the port differ": why does the canvas
   hidden land where `model.decoder.norm.weight` (l2 4746, mean 29.5, max 588)
   blows it up 6.6x, when the engine's lands on the small-weight coordinates.
-  It is pathological in an absolute sense, and the shape is specific. The
-  port's canvas row after the final norm carries 79% of its energy in ONE
-  coordinate (216): l2 789.4, max 700.3. Neither control looks like that --
+
+  That row is pathological in an absolute sense, and the shape is specific: it
+  carries 79% of its energy in ONE coordinate (216), l2 789.4 and max 700.3. Neither control looks like that --
   the port's own last PROMPT row is l2 371.8 / max 105.4 (8%), and the engine's
   canvas row is l2 119.2 / max 36.0 (9%). Coordinate 216 holds -7.29 in the
   port's layer-29 hidden against the engine's -0.20, and the final norm's
@@ -382,8 +384,8 @@ clears 0.641 by a lot.
   normed row dominated by one coordinate makes every logit a multiple of one
   embedding column, which is why they are all large and all saturate.
 
-  Where it happens is the last four layers, and probing them RULES THEM OUT as
-  the bug. Three rows through the same 30 layers and the same final norm, one
+  The spike appears over the last four layers, and probing them rules them out
+  as its cause. Three rows through the same 30 layers and the same final norm, one
   run, reported as the share of the row's energy in its largest coordinate:
 
     row                      L28    L29    after final norm
