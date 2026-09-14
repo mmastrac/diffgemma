@@ -163,18 +163,15 @@ impl Session {
     /// `x = rms_norm_rows(signal, pre_norm)`, `x = down(up * gelu(gate(x)))`,
     /// `hidden += x`, then a scale-free RMS norm of the sum.
     ///
-    /// `signal` is the soft embedding of the previous step's logits. Step 1
-    /// has no previous prediction, and the engine takes a different branch
-    /// there (`src/metal/decoder.rs`, the final `else`): the canvas rows are
-    /// just `rms_norm_no_scale(embed)` with NO SC MLP anywhere. Running the
-    /// embeddings through the MLP instead inflates the canvas rows -- measured
-    /// against the engine on the same prompt, seed and canvas, the canvas
-    /// hidden l2 reached 1917 by layer 13 against the engine's 147.9 -- and
-    /// every step-1 logit lands far past the softcap.
+    /// The MLP runs on every step; only the signal changes. From step 2 on it
+    /// is the soft embedding of the previous step's logits, in `norm_scratch`.
+    /// Step 1 has no previous prediction, so the engine seeds it with the
+    /// canvas embeddings themselves -- the initial canvas read as the step-0
+    /// prediction (`interpret_step`'s `first_step == 1` branch, which norms
+    /// `hidden_off` rather than `soft_off`). Skipping the MLP there is a zero
+    /// signal, and that branch's comment records the model as degenerate under
+    /// it: a cold-start empty reply.
     fn self_condition(&self, signal_first_step: bool) -> Result<(), Error> {
-        if signal_first_step {
-            return self.first_step_norm();
-        }
         let ctx = &self.model.ctx;
         let t = &self.cfg.text_config;
         let hidden = t.hidden_size;
@@ -184,8 +181,13 @@ impl Session {
         let r = self.runner(self.prompt_len);
         let base = self.prompt_len * hidden;
 
-        // `norm_scratch` holds the soft embedding of the previous step's logits.
-        let src = self.bufs.norm_scratch.device_ptr();
+        // Step 1 norms the canvas embeddings already sitting in `hidden_a`;
+        // every later step norms the soft embedding in `norm_scratch`.
+        let src = if signal_first_step {
+            unsafe { self.bufs.hidden_a.device_ptr() + (base as u64) * 4 }
+        } else {
+            self.bufs.norm_scratch.device_ptr()
+        };
         let mut args = KernelArgs::new();
         args.device_ptr(src)
             .device_ptr(self.sc.pre_norm.device_ptr())
@@ -275,32 +277,6 @@ impl Session {
             eprintln!("  [sc] residual rms ok");
         }
         Ok(())
-    }
-
-    /// Step 1's canvas rows: a scale-free RMS norm of their own embeddings.
-    /// The engine's no-signal branch, with no self-conditioning MLP (a zero
-    /// signal would only push a constant through the MLP's bias-free linears
-    /// and rescale every row the same way, but the engine does not run it at
-    /// all, and the port matches the engine).
-    fn first_step_norm(&self) -> Result<(), Error> {
-        let ctx = &self.model.ctx;
-        let hidden = self.cfg.text_config.hidden_size;
-        let eps = self.cfg.text_config.rms_norm_eps as f32;
-        let base = self.prompt_len * hidden;
-        let dst = unsafe { self.bufs.hidden_a.device_ptr() + (base as u64) * 4 };
-        let mut args = KernelArgs::new();
-        args.device_ptr(dst)
-            .device_ptr(dst)
-            .u32(self.canvas as u32)
-            .u32(hidden as u32)
-            .f32(eps);
-        Ok(launch(
-            ctx,
-            "dgq_rms_norm_ns",
-            rows(self.canvas),
-            256,
-            &mut args,
-        )?)
     }
 
     /// Sparse soft embedding of `logits` (canvas rows) into `norm_scratch`.
@@ -414,11 +390,7 @@ impl Session {
     /// prompt keys up to itself and cannot see the canvas. Running
     /// `[prompt][canvas]` therefore reproduces the standalone causal pass's
     /// prompt hidden and K/V bit for bit.
-    pub fn step(
-        &mut self,
-        prompt: &[u32],
-        canvas_ids: &[u32],
-    ) -> Result<Vec<f32>, Error> {
+    pub fn step(&mut self, prompt: &[u32], canvas_ids: &[u32]) -> Result<Vec<f32>, Error> {
         assert_eq!(prompt.len(), self.prompt_len, "prompt length");
         assert_eq!(canvas_ids.len(), self.canvas, "canvas length");
         let ctx = self.model.ctx.clone();
