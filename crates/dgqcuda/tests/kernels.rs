@@ -221,3 +221,29 @@ fn attention_honors_the_absolute_position() {
     println!("pos0 attention cos {cos}");
     assert!(cos > 0.98, "cos {cos}");
 }
+
+/// The full-attention geometry at the size the denoise step actually runs.
+/// Layers 5, 11, 17, 23 and 29 are `full_attention`: head_dim 512, 2 KV heads
+/// against 16 query heads (8 per group), no window. Every other attention case
+/// here is head_dim 256 / 8 KV heads at seq 4-6, and the tier-1 fixture in
+/// `dgops` is canvas 16 / t_total 44 -- all of which fit one tile. The denoise
+/// step runs 20 prompt rows plus a 256 canvas, so 276 keys, which is the first
+/// time this kernel is asked to walk more than one tile of K.
+#[test]
+fn attention_full_geometry_at_step_size() {
+    let cos = run_case_split(276, 16, 2, 512, 0, 20);
+    println!("full-attention (hd 512, 2 kv, 276 keys) cos {cos}");
+    assert!(cos > 0.9999, "cos {cos}");
+}
+
+/// The same geometry one key short of, and one key past, a 64-wide tile, so a
+/// partial trailing tile is covered on its own rather than only inside the
+/// full-size case.
+#[test]
+fn attention_full_geometry_across_a_tile_boundary() {
+    for seq in [63usize, 64, 65, 129] {
+        let cos = run_case_split(seq, 16, 2, 512, 0, 20.min(seq));
+        println!("full-attention seq {seq} cos {cos}");
+        assert!(cos > 0.9999, "seq {seq}: cos {cos}");
+    }
+}

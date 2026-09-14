@@ -647,6 +647,33 @@ fn offset_view<'a>(buf: &'a DeviceBuffer, elems: usize) -> View<'a> {
     View(buf, elems as u64)
 }
 
+/// `DGQCUDA_ATTN_DUMP=<layer>` writes that layer's attention intermediates for
+/// one canvas row (`DGQCUDA_ATTN_ROW`, default 0) to `DGQCUDA_ATTN_DUMP_JSON`,
+/// in the field names of the engine's `step-attn-dump`, so the two can be
+/// compared stage by stage. The first stage that disagrees names the bug; the
+/// whole-layer trace can only say which layer.
+fn attn_dump_row(buf: &DeviceBuffer, row: usize, width: usize, rows_total: usize) -> Vec<f32> {
+    let mut all = vec![0.0f32; rows_total * width];
+    if buf.read_f32(&mut all).is_err() || (row + 1) * width > all.len() {
+        return Vec::new();
+    }
+    all[row * width..(row + 1) * width].to_vec()
+}
+
+fn attn_dump_write(fields: &[(&str, Vec<f32>)]) {
+    let Ok(path) = std::env::var("DGQCUDA_ATTN_DUMP_JSON") else {
+        return;
+    };
+    let body: Vec<String> = fields
+        .iter()
+        .map(|(k, v)| {
+            let vals: Vec<String> = v.iter().map(|x| format!("{x}")).collect();
+            format!("\"{k}\":[{}]", vals.join(","))
+        })
+        .collect();
+    let _ = std::fs::write(path, format!("{{{}}}", body.join(",")));
+}
+
 pub(crate) fn layer_forward(
     r: &Runner<'_>,
     b: &mut Bufs,
@@ -671,7 +698,27 @@ pub(crate) fn layer_forward(
     r.mark("l:residual");
 
     // ---- attention -------------------------------------------------------
+    let attn_dump = std::env::var("DGQCUDA_ATTN_DUMP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&l| l == layer)
+        .map(|_| {
+            std::env::var("DGQCUDA_ATTN_ROW")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0)
+                + causal_split
+        })
+        // The device warm-up runs the prompt alone, so the canvas row it names
+        // is past the end there; only the step has a canvas to dump.
+        .filter(|&row| row < seq);
     r.rms(&b.hidden_a, &lw.input_layernorm, &b.normed, seq)?;
+    let mut dump: Vec<(&str, Vec<f32>)> = Vec::new();
+    if let Some(row) = attn_dump {
+        ctx.synchronize()?;
+        dump.push(("hidden_in", attn_dump_row(&b.hidden_a, row, hidden, seq)));
+        dump.push(("hidden_ln", attn_dump_row(&b.normed, row, hidden, seq)));
+    }
     r.gemm(
         seq,
         q_dim,
@@ -698,6 +745,14 @@ pub(crate) fn layer_forward(
             b.v.device_ptr(),
         )?,
         None => copy_device(ctx, &b.v, &b.k, seq * kv_dim)?,
+    }
+
+    if attn_dump.is_some() {
+        ctx.synchronize()?;
+        dump.push((
+            "q_raw_proj",
+            attn_dump_row(&b.q, attn_dump.unwrap(), q_dim, seq),
+        ));
     }
 
     // per-head QK-norm (V unweighted)
@@ -749,6 +804,14 @@ pub(crate) fn layer_forward(
         &mut args,
     )?;
 
+    if attn_dump.is_some() {
+        ctx.synchronize()?;
+        dump.push((
+            "q_pre_rope",
+            attn_dump_row(&b.q, attn_dump.unwrap(), q_dim, seq),
+        ));
+    }
+
     // RoPE
     let freqs = crate::forward::rope_freqs(seq, rotary_dim, head_dim, theta);
     b.freqs.write_f32(&freqs)?;
@@ -768,6 +831,14 @@ pub(crate) fn layer_forward(
         .u32(head_dim as u32)
         .u32(rotary_dim as u32);
     launch(ctx, "dgq_rope", flat(seq * n_kv, 128), 128, &mut args)?;
+
+    if attn_dump.is_some() {
+        ctx.synchronize()?;
+        dump.push((
+            "q_post_rope",
+            attn_dump_row(&b.q, attn_dump.unwrap(), q_dim, seq),
+        ));
+    }
 
     // KV region: [t, n_kv, 2*head_dim] = K then V
     interleave_kv(ctx, &b.k, &b.v, &b.kv, seq, n_kv, head_dim)?;
@@ -791,6 +862,12 @@ pub(crate) fn layer_forward(
         128,
         &mut args,
     )?;
+
+    if let Some(row) = attn_dump {
+        ctx.synchronize()?;
+        dump.push(("attn_out", attn_dump_row(&b.attn_out, row, q_dim, seq)));
+        attn_dump_write(&dump);
+    }
 
     r.gemm(
         seq,
@@ -915,6 +992,35 @@ pub(crate) fn layer_forward(
     let moe_inter = t.moe_intermediate_size;
     let plan =
         crate::moe_grouped::GroupedPlan::new(&idx, &wts, seq, t.top_k_experts, t.num_experts);
+    // `DGQCUDA_ROUTE_DUMP=<layer>` prints that layer's canvas expert histogram
+    // in the shape of `step-moe-route-dump`'s `count`, so the two routings can
+    // be diffed. Routing is discrete, so a flip shows here as a changed count
+    // where a magnitude comparison would only show drift.
+    if std::env::var("DGQCUDA_ROUTE_DUMP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .is_some_and(|l| l == layer)
+    {
+        let mut count = vec![0u32; t.num_experts];
+        for s in causal_split..seq {
+            for k in 0..t.top_k_experts {
+                let e = idx[s * t.top_k_experts + k] as usize;
+                if e < t.num_experts {
+                    count[e] += 1;
+                }
+            }
+        }
+        let used = count.iter().filter(|&&c| c > 0).count();
+        eprintln!("  [route] layer {layer} experts_used {used}");
+        eprintln!(
+            "  [route] count {}",
+            count
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
     let n_rows = plan.rows();
     // The plan tables live in the session buffers: uploading fresh ones per
     // layer would add 60 host-to-device copies (and their syncs) per step.
