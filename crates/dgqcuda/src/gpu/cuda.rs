@@ -684,6 +684,10 @@ fn attn_dump_write(fields: &[(&str, Vec<f32>)]) {
 /// -- when `DGQCUDA_LAYER_DUMP_JSONL` names a path -- the whole row appended
 /// there as one JSON object, so it can be cosine-compared against the engine's
 /// `step-layer-probe` checkpoints rather than eyeballed four floats at a time.
+/// The K positions both sides sample: prompt rows plus the first canvas rows,
+/// matching the engine `step-attn-dump`'s `k_samples`.
+const K_SAMPLE_POSITIONS: [usize; 8] = [0, 1, 2, 4, 13, 19, 20, 21];
+
 pub(crate) fn emit_layer_checkpoint(label: &str, row: &[f32]) {
     let l2 = row.iter().map(|v| v * v).sum::<f32>().sqrt();
     let max = row.iter().fold(0.0f32, |m, v| m.max(v.abs()));
@@ -873,6 +877,39 @@ pub(crate) fn layer_forward(
             "q_post_rope",
             attn_dump_row(&b.q, attn_dump.unwrap(), q_dim, seq),
         ));
+        for t in K_SAMPLE_POSITIONS {
+            if t < seq {
+                dump.push((
+                    Box::leak(format!("k_at_{t}").into_boxed_str()),
+                    attn_dump_row(&b.k, t, kv_dim, seq),
+                ));
+            }
+        }
+    }
+    // `DGQCUDA_K_DUMP_JSONL=<path>` writes those same K rows for EVERY layer in
+    // one run, so the layer at which the prompt keys stop matching the engine
+    // can be found without a run per layer.
+    if let Ok(path) = std::env::var("DGQCUDA_K_DUMP_JSONL") {
+        ctx.synchronize()?;
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            for t in K_SAMPLE_POSITIONS {
+                if t >= seq {
+                    continue;
+                }
+                let k = attn_dump_row(&b.k, t, kv_dim, seq);
+                let vals: Vec<String> = k.iter().map(|v| format!("{v}")).collect();
+                let _ = writeln!(
+                    f,
+                    "{{\"layer\":{layer},\"pos\":{t},\"k\":[{}]}}",
+                    vals.join(",")
+                );
+            }
+        }
     }
 
     // KV region: [t, n_kv, 2*head_dim] = K then V

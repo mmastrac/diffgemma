@@ -475,6 +475,10 @@ impl Session {
         // down the stack, in the shape of the engine's `step-layer-probe`, so
         // the two can be read side by side to find the first layer that
         // disagrees. Off by default and never allocated when off.
+        let inject_after: Option<usize> = std::env::var("DGQCUDA_INJECT_AFTER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|_| *seq > *prompt_len);
         let layer_dump: Option<usize> = std::env::var("DGQCUDA_LAYER_DUMP")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -483,6 +487,41 @@ impl Session {
         for (i, lw) in model.layers.iter().take(n_layers).enumerate() {
             layer_forward(&r, bufs, lw, i, 0)?;
             std::mem::swap(&mut bufs.hidden_a, &mut bufs.hidden_b);
+            // `DGQCUDA_INJECT_AFTER=<layer>` + `DGQCUDA_INJECT_BIN=<path>`
+            // overwrite the canvas rows with the engine's state at that same
+            // checkpoint, then let the port run the REST of the stack. If the
+            // logits come out right, every layer below the injection point is
+            // correct and the divergence is above it; walking the layer down
+            // finds the first one that is not. Only the canvas rows are
+            // replaced -- the prompt rows stay the port's own, which is what
+            // supplies K/V, and they already reproduce the causal prefill.
+            if inject_after == Some(i) {
+                let path = std::env::var("DGQCUDA_INJECT_BIN").map_err(|_| {
+                    Error::Msg("DGQCUDA_INJECT_AFTER needs DGQCUDA_INJECT_BIN".into())
+                })?;
+                let bytes =
+                    std::fs::read(&path).map_err(|e| Error::Msg(format!("inject {path}: {e}")))?;
+                let want = *canvas * hidden * 4;
+                if bytes.len() != want {
+                    return Err(Error::Msg(format!(
+                        "inject {path}: {} bytes, expected {want} ({} canvas rows x {hidden})",
+                        bytes.len(),
+                        *canvas
+                    )));
+                }
+                let vals: Vec<f32> = bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                ctx.synchronize()?;
+                let mut all = vec![0.0f32; *seq * hidden];
+                bufs.hidden_a.read_f32(&mut all)?;
+                let base = *prompt_len * hidden;
+                all[base..base + *canvas * hidden].copy_from_slice(&vals);
+                bufs.hidden_a.write_f32(&all)?;
+                ctx.synchronize()?;
+                eprintln!("  [inject] canvas rows replaced after layer {i} from {path}");
+            }
             if let Some(pos) = layer_dump {
                 // The swap above leaves the layer's output in hidden_a.
                 ctx.synchronize()?;

@@ -412,16 +412,58 @@ clears 0.641 by a lot.
   the engine's attn_out magnitude is flat (l2 41-46) across 26-28 while the
   residual falls, so the contraction is cancellation in the residual.
 
-  So the cause is upstream and diffuse, and the next experiment is state
-  INJECTION, not another layer dump. Extend `step-layer-probe` to write the
-  engine's whole canvas hidden at a chosen layer (256 x 2816 f32, ~2.9 MB, as
-  raw little-endian, not JSON), load it into the port's `hidden_a`, and run the
-  port's remaining layers plus the final norm and lm_head. If the logits then
-  match the engine, everything below that layer is correct; binary-search the
-  first layer at which injection no longer rescues the output. That is
-  "same input, two paths" applied at depth, and it is the only thing that
-  separates a per-layer bug from accumulated drift -- which the whole-row
-  cosines cannot, because by layer 26 the two inputs already differ by cos 0.72.
+  **The injection test ran, and it moved the bug.** `DGQ_PROBE_HIDDEN_DIR`
+  makes `step-layer-probe` write the engine's whole canvas hidden at every
+  checkpoint as raw f32; `DGQCUDA_INJECT_AFTER`/`DGQCUDA_INJECT_BIN` load one
+  of those into the port's canvas rows and let it run the rest of the stack.
+  Injecting the engine's state after layer 28 lifts `after_layer_29` from cos
+  0.183 to 0.954 and the final norm from 0.175 to 0.666, so the remaining
+  layers are broadly right when handed the right input.
+
+  Then, with a BIT-IDENTICAL canvas hidden at layer 29:
+
+    hidden_in    cos 1.0000000
+    hidden_ln    cos 0.9999988
+    q_post_rope  cos 0.9999958   <- the whole query path is exact
+    attn_out     cos 0.7838784   <- collapses, and 23% large (73.0 vs 59.2)
+
+  The queries are exact and the attention kernel is verified at this geometry,
+  so the divergence enters through K/V. Splitting the keys by position says
+  which:
+
+    pos  0 prompt  cos  0.3907      pos 20 canvas  cos 0.9999958
+    pos  1 prompt  cos -0.0914      pos 21 canvas  cos 0.9999961
+    pos 19 prompt  cos  0.0610
+
+  The CANVAS keys are exact -- they come from the injected rows -- and the
+  PROMPT keys are uncorrelated. That matters because at layer 29 between 47%
+  and 83% of each head's attention mass lands on the 20 prompt keys, so
+  wrecking them wrecks the output whatever the canvas does.
+
+  **The prompt path is the minimal reproduction, and it needs no canvas.** The
+  port's prompt keys are cos 1.0000000 against the engine at layer 0 and decay
+  with depth (0.997 at 5, 0.99 at 20, 0.86 at 23, 0.06 at 29), so they are not
+  structurally wrong, they drift. They are also canvas-independent: the device
+  warm-up runs the prompt ALONE and the step runs it beside the canvas, and
+  their keys are bit-identical at every layer, so `causal_split` masks
+  correctly and nothing leaks. What that leaves is exactly this -- the port's
+  20-token causal prefill does not reproduce the engine's 20-token causal
+  prefill at depth. That is the whole bug, with no canvas, no
+  self-conditioning, and no sampler in it, and it iterates in seconds instead
+  of minutes. Work there, and compare per layer against
+  `step-attn-dump`'s `k_samples` (positions 0 and 19 are enough).
+
+  The likeliest seed is a BIAS, not noise. The port's layer-0 MoE output is
+  cos 0.9999694 against the engine with l2 ratio 1.0214 -- same direction, 2.1%
+  large -- and a systematic 2% per layer compounds (1.02^30 = 1.8x), which is
+  the shape of the residual l2 ratios through the middle layers. Unbiased
+  rounding would not do that. Find where the 2.1% comes from: the q4 expert
+  decode in the port's kernel against the engine's, the GEMM's accumulation
+  precision, or the routing weight the engine stores as bf16. The engine's own
+  GPU-vs-CPU-oracle spread on that same buffer is rel_l2 0.0141, so check the
+  SIGN of that difference too -- if the engine's GPU path is the one losing
+  magnitude, the port is the accurate one and the target is bit-compatibility,
+  not correctness.
 
   **Fixed: the port reproduces itself.** `dgq_moe_scatter` accumulated each
   token's expert rows with `atomicAdd`, so the sum order varied with scheduling

@@ -107,6 +107,34 @@ pub(super) fn read_arena_row(
     read_arena_buffer_f32(arena, byte_off, width)
 }
 
+/// `DGQ_PROBE_HIDDEN_DIR=<dir>`: write the WHOLE canvas hidden at each
+/// checkpoint as raw little-endian f32 (`<dir>/<label>.f32`, CANVAS*HID
+/// values), not just the one probed row.
+///
+/// This is the injection test's source. A per-row cosine cannot separate a
+/// layer that computes the wrong thing from a layer that faithfully amplifies
+/// a wrong input, because by the late layers the two inputs already disagree.
+/// Feeding this state into another implementation and running only its
+/// remaining layers does separate them: if the logits then agree, everything
+/// below the injection point is correct.
+fn dump_canvas_hidden(arena: &ProtocolObject<dyn MTLBuffer>, base: u64, label: &str) {
+    let Ok(dir) = std::env::var("DGQ_PROBE_HIDDEN_DIR") else {
+        return;
+    };
+    let all = read_arena_buffer_f32(arena, base as usize, CANVAS * HID);
+    let mut bytes = Vec::with_capacity(all.len() * 4);
+    for v in &all {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    let path = std::path::Path::new(&dir).join(format!("{label}.f32"));
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&path, &bytes) {
+        eprintln!("probe hidden dump {}: {e}", path.display());
+    }
+}
+
 fn hidden_vec_stats(v: &[f32]) -> (f32, f32) {
     let l2 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     let max_abs = v.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
@@ -159,6 +187,11 @@ pub fn run_step_layer_hidden_probe(
         Ok(())
     })?;
     {
+        dump_canvas_hidden(
+            &rt.bufs.arena,
+            rt.bufs.arena_map.hidden_off(),
+            "after_preamble",
+        );
         let hidden =
             read_arena_hidden_row(&rt.bufs.arena, rt.bufs.arena_map.hidden_off(), position);
         let (hidden_l2, hidden_max_abs) = hidden_vec_stats(&hidden);
@@ -173,6 +206,11 @@ pub fn run_step_layer_hidden_probe(
 
     for layer in 0..layers {
         rt.encode_full_layer(layer)?;
+        dump_canvas_hidden(
+            &rt.bufs.arena,
+            rt.bufs.arena_map.hidden_off(),
+            &format!("after_layer_{layer}"),
+        );
         let hidden =
             read_arena_hidden_row(&rt.bufs.arena, rt.bufs.arena_map.hidden_off(), position);
         let (hidden_l2, hidden_max_abs) = hidden_vec_stats(&hidden);
