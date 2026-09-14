@@ -393,15 +393,18 @@ clears 0.641 by a lot.
   is NOT explained by the amplification above. Layers 26-29 are the place to
   put the next probe, not layer 3.
 
-  **Open: the port is not deterministic.** Three identical runs give different
-  bytes. `dgq_moe_scatter` accumulates each token's experts with `atomicAdd`,
-  which is correct but order-dependent, so the sum varies run to run: layer 0
-  is bit-identical, layer 1 differs by 6e-6, layer 29 by 1.7e-3. Harmless for
-  the current bug (cos 0.9999997) but a blocker on its own terms -- this
-  project gates on golden BYTE-identity, which a port with an order-dependent
-  reduction can never pass. Fix by giving the scatter a deterministic order
-  (accumulate per token over its k experts in index order) rather than racing
-  slots into one address.
+  **Fixed: the port reproduces itself.** `dgq_moe_scatter` accumulated each
+  token's expert rows with `atomicAdd`, so the sum order varied with scheduling
+  and three identical runs gave three different results (bit-identical at layer
+  0, 6e-6 apart by layer 1, 1.7e-3 by layer 29). `dgq_moe_combine` inverts the
+  loop: `GroupedPlan::token_slots` builds the CSR inverse of `tok_idx` on the
+  host and one thread sums each token's rows in ascending row order. No atomics,
+  and `moe_out` needs no pre-zeroing. Three runs now hash identically, and it is
+  the same computation (cos 1.000000000 against the old path at layers 0/1/15).
+
+  When repeating that check, hash the dumps AFTER the runs finish. Hashing a
+  file that is still being appended reports a difference that is not there,
+  which is how this first read as unfixed.
 
 - **Model-gated tests treat a manifest-only pack as present.**
   `test_util::dgq_model_dir()` returns `Some` when `model.dgq.json` exists, so an
