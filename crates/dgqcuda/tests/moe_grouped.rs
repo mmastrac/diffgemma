@@ -262,3 +262,106 @@ fn plan_buckets_are_expert_major_and_weighted() {
 fn bm_is_the_kernel_tile() {
     assert_eq!(BM, 32);
 }
+
+/// `token_slots` must invert `tok_idx` exactly: every bucketed row appears
+/// under its own token, once, and in ascending row order. The order is the
+/// point -- it is what makes the combine's sum reproducible.
+#[test]
+fn token_slots_invert_tok_idx_in_row_order() {
+    let (seq, top_k, n_experts) = (20usize, 8usize, 12usize);
+    let idx: Vec<u32> = (0..seq * top_k).map(|i| (i % n_experts) as u32).collect();
+    let wts: Vec<f32> = (0..seq * top_k).map(|i| 0.01 + 0.001 * i as f32).collect();
+    let plan = GroupedPlan::new(&idx, &wts, seq, top_k, n_experts);
+    let (start, slots) = plan.token_slots(seq);
+
+    assert_eq!(start.len(), seq + 1);
+    assert_eq!(*start.last().unwrap() as usize, plan.rows());
+    let mut seen = vec![false; plan.rows()];
+    for t in 0..seq {
+        let (a, b) = (start[t] as usize, start[t + 1] as usize);
+        assert_eq!(b - a, top_k, "token {t} owns {} rows", b - a);
+        for w in a..b {
+            let row = slots[w] as usize;
+            assert_eq!(
+                plan.tok_idx[row] as usize, t,
+                "row {row} is not token {t}'s"
+            );
+            assert!(!seen[row], "row {row} claimed twice");
+            seen[row] = true;
+            if w > a {
+                assert!(slots[w - 1] < slots[w], "token {t} rows are not ascending");
+            }
+        }
+    }
+    assert!(seen.into_iter().all(|s| s), "a bucketed row went unclaimed");
+}
+
+/// The combine sums each token's expert rows, and does it the same way twice.
+/// The kernel it replaced used `atomicAdd`, which is correct but reorders the
+/// adds run to run; this pins both the value and its reproducibility.
+#[test]
+fn combine_sums_each_token_deterministically() {
+    let (seq, top_k, n_experts, hidden) = (24usize, 8usize, 11usize, 2816usize);
+    let idx: Vec<u32> = (0..seq * top_k).map(|i| (i % n_experts) as u32).collect();
+    let wts: Vec<f32> = (0..seq * top_k).map(|i| 0.01 + 0.001 * i as f32).collect();
+    let plan = GroupedPlan::new(&idx, &wts, seq, top_k, n_experts);
+    let n_rows = plan.rows();
+    let (start, slots) = plan.token_slots(seq);
+
+    // Rows big enough that a float sum's ORDER changes the result: one large
+    // value against several small ones, so adding them in a different order
+    // rounds differently.
+    let rows: Vec<f32> = (0..n_rows * hidden)
+        .map(|i| {
+            let r = i / hidden;
+            if r % top_k == 0 { 1.0e6 } else { 1.0e-3 }
+        })
+        .collect();
+
+    let ctx = cached_context().expect("ctx");
+    let src = DeviceBuffer::alloc(&ctx, rows.len() * 4).unwrap();
+    src.write_f32(&rows).unwrap();
+    let bstart = dgqcuda::moe_grouped::upload_u32(&ctx, &start).unwrap();
+    let bslots = dgqcuda::moe_grouped::upload_u32(&ctx, &slots).unwrap();
+    let kernel =
+        gpukit::cuda::cached_source_kernel(dgqcuda::moe_grouped::MOE_KERNELS, "dgq_moe_combine")
+            .expect("kernel");
+
+    let run = || {
+        let dst = DeviceBuffer::alloc(&ctx, seq * hidden * 4).unwrap();
+        let mut args = gpukit::cuda::KernelArgs::new();
+        args.device_ptr(dst.device_ptr())
+            .device_ptr(src.device_ptr())
+            .device_ptr(bstart.device_ptr())
+            .device_ptr(bslots.device_ptr())
+            .u32(seq as u32)
+            .u32(hidden as u32);
+        ctx.launch(
+            &kernel,
+            ((seq * hidden).div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            &mut args,
+        )
+        .expect("combine launch");
+        ctx.synchronize().unwrap();
+        let mut got = vec![0.0f32; seq * hidden];
+        dst.read_f32(&mut got).unwrap();
+        got
+    };
+
+    let got = run();
+    // Against the host sum in the same ascending-row order.
+    for t in 0..seq {
+        for d in 0..hidden {
+            let mut want = 0.0f32;
+            for w in start[t] as usize..start[t + 1] as usize {
+                want += rows[slots[w] as usize * hidden + d];
+            }
+            assert_eq!(got[t * hidden + d], want, "token {t} slot {d}");
+        }
+    }
+    for attempt in 0..4 {
+        assert_eq!(run(), got, "combine differed on repeat {attempt}");
+    }
+}

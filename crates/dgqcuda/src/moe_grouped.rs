@@ -94,6 +94,34 @@ impl GroupedPlan {
         self.tok_idx.len()
     }
 
+    /// The inverse of `tok_idx`, in CSR form: token `t` owns the bucketed rows
+    /// `slots[start[t]..start[t + 1]]`, in ascending row order.
+    ///
+    /// This is what makes the combine deterministic. Adding each bucketed row
+    /// into its token with `atomicAdd` is correct but order-dependent, so the
+    /// same seed produced different bytes run to run -- measured at 6e-6 by
+    /// layer 1 and 1.7e-3 by layer 29. Summing a token's rows in a fixed order
+    /// instead gives one thread sole ownership of each output element, so the
+    /// result cannot depend on scheduling. A port that cannot reproduce itself
+    /// can never pass a byte-identity gate.
+    pub fn token_slots(&self, seq: usize) -> (Vec<u32>, Vec<u32>) {
+        let mut start = vec![0u32; seq + 1];
+        for &t in &self.tok_idx {
+            start[t as usize + 1] += 1;
+        }
+        for t in 0..seq {
+            start[t + 1] += start[t];
+        }
+        let mut fill = start.clone();
+        let mut slots = vec![0u32; self.tok_idx.len()];
+        for (row, &t) in self.tok_idx.iter().enumerate() {
+            let at = &mut fill[t as usize];
+            slots[*at as usize] = row as u32;
+            *at += 1;
+        }
+        (start, slots)
+    }
+
     /// Buckets that hold at least one row. The empty ones are dropped from the
     /// expert list (their job slot disappears) so the kernel never indexes a
     /// value the host did not fill in.

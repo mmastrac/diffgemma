@@ -210,17 +210,26 @@ extern "C" __global__ void dgq_moe_swiglu_weighted(
 
 // dst[token, :] += src[row, :] for every expert-major row (the routing weight
 // is already folded in by dgq_moe_swiglu_weighted).
-extern "C" __global__ void dgq_moe_scatter(
-    float *dst, const float *src, const unsigned *tok_idx,
-    unsigned row_start, unsigned rows, unsigned hidden
+// Combine each token's expert rows: dst[t, :] = sum over the rows routed to t,
+// summed in ascending row order. One thread owns each output element, so no
+// atomics and no dependence on scheduling -- the previous atomicAdd scatter was
+// correct but reordered float adds run to run, which cost byte-identity.
+extern "C" __global__ void dgq_moe_combine(
+    float *dst, const float *src, const unsigned *slot_start, const unsigned *slots,
+    unsigned seq, unsigned hidden
 ) {
     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
-    const unsigned n = rows * hidden;
+    const unsigned n = seq * hidden;
     if (i >= n) return;
-    const unsigned r = i / hidden;
-    const unsigned d = i - r * hidden;
-    const unsigned grow = row_start + r;
-    atomicAdd(&dst[(size_t)tok_idx[grow] * hidden + d], src[i]);
+    const unsigned t = i / hidden;
+    const unsigned d = i - t * hidden;
+    const unsigned s0 = slot_start[t];
+    const unsigned s1 = slot_start[t + 1u];
+    float acc = 0.0f;
+    for (unsigned s = s0; s < s1; ++s) {
+        acc += src[(size_t)slots[s] * hidden + d];
+    }
+    dst[i] = acc;
 }
 // Gather the bucketed input rows: rows_a[r, :] = x[tok_idx[r], :].
 extern "C" __global__ void dgq_moe_gather(

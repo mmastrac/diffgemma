@@ -337,6 +337,10 @@ pub(crate) struct Bufs {
     /// job slot, so the kernel cannot use the job index as the expert index.
     pub(crate) moe_experts: DeviceBuffer,
     pub(crate) moe_row_w: DeviceBuffer,
+    /// CSR inverse of `tok_idx`: the bucketed rows each token owns, so the
+    /// combine can sum them in a fixed order.
+    pub(crate) moe_slot_start: DeviceBuffer,
+    pub(crate) moe_slots: DeviceBuffer,
     /// [seq, vocab] — the full canvas's logits on the `LogitRows::All` path,
     /// one row on the others.
     pub(crate) logits: DeviceBuffer,
@@ -383,6 +387,8 @@ impl Bufs {
             moe_tok_idx: a(seq * t.top_k_experts)?,
             moe_experts: a(t.num_experts)?,
             moe_row_w: a(seq * t.top_k_experts)?,
+            moe_slot_start: a(seq + 1)?,
+            moe_slots: a(seq * t.top_k_experts)?,
             logits: a(seq * t.vocab_size)?,
         })
     }
@@ -1017,7 +1023,7 @@ pub(crate) fn layer_forward(
     // Grouped MoE: bucket the tokens by expert, gather their normalized rows
     // into one expert-major matrix, and run one tiled GEMM per expert bucket —
     // the expert weight tile is then reused across every token in the bucket.
-    b.moe_out.zero()?;
+
     let moe_inter = t.moe_intermediate_size;
     let plan =
         crate::moe_grouped::GroupedPlan::new(&idx, &wts, seq, t.top_k_experts, t.num_experts);
@@ -1063,6 +1069,13 @@ pub(crate) fn layer_forward(
         std::slice::from_raw_parts(plan.experts.as_ptr().cast::<u8>(), plan.experts.len() * 4)
     })?;
     b.moe_row_w.write_f32(&plan.row_w)?;
+    let (slot_start, slots) = plan.token_slots(seq);
+    b.moe_slot_start.write_bytes(unsafe {
+        std::slice::from_raw_parts(slot_start.as_ptr().cast::<u8>(), slot_start.len() * 4)
+    })?;
+    b.moe_slots.write_bytes(unsafe {
+        std::slice::from_raw_parts(slots.as_ptr().cast::<u8>(), slots.len() * 4)
+    })?;
     // Gather the expert-major input rows.
     {
         let mut args = KernelArgs::new();
@@ -1122,18 +1135,20 @@ pub(crate) fn layer_forward(
         plan.num_jobs(),
     )?;
     {
+        // One thread per output element, summing that token's rows in ascending
+        // row order. `moe_out` needs no pre-zeroing: every element is written.
         let mut args = KernelArgs::new();
         args.device_ptr(b.moe_out.device_ptr())
             .device_ptr(b.moe_rows_down.device_ptr())
-            .device_ptr(b.moe_tok_idx.device_ptr())
-            .u32(0)
-            .u32(n_rows as u32)
+            .device_ptr(b.moe_slot_start.device_ptr())
+            .device_ptr(b.moe_slots.device_ptr())
+            .u32(seq as u32)
             .u32(hidden as u32);
         launch_src(
             ctx,
             crate::moe_grouped::MOE_KERNELS,
-            "dgq_moe_scatter",
-            flat(n_rows * hidden, 256),
+            "dgq_moe_combine",
+            flat(seq * hidden, 256),
             256,
             &mut args,
         )?;
