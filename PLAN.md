@@ -303,9 +303,18 @@ clears 0.641 by a lot.
 
     - Long answers. 0/6 on the haiku and list prompts, in both arena arms, at
       every seed. p2/p3 take 6-9 denoise steps against p0/p1's 2-5.
-    - Per-row K drift at depth. Some prompt rows reproduce the engine through
-      all 30 layers (position 3 is cos 0.9997 at layer 29) and others are
-      destroyed (position 4 is 0.0525). Uniform across rows it is not.
+    - RESOLVED: the "per-row K drift at depth" (position 4 at cos 0.0525 by
+      layer 29 while position 3 held 0.9997) was the diagnostic `forward`
+      command, not the model path. `forward --gpu` ran every prompt row
+      bidirectionally (`causal_split 0`); the engine prefills a prompt
+      causally, so the dump it was compared against had a different mask per
+      row. `forward --gpu --causal` (c267df43) gives cos 1.000 at every one
+      of the 20 rows at every one of the 30 layers, and two runs agree at
+      every cell to 16 digits, which also rules out a kernel race. The
+      denoise session path always used `causal_split = prompt_len` and was
+      never affected. What is left under a matched mask is bf16-sized:
+      worst row/layer cell is 0.972 (f32 arena), 0.9963 (RNE), 0.982
+      (trunc), each arm's worst on a different row, so no arm dominates.
     - The engine's f32->bf16 store truncation is a real, deliberate
       arithmetic difference the port does not share. `DGQCUDA_BF16_ARENA=trunc`
       reproduces it; whether the port SHOULD is a bit-compatibility-vs-accuracy
@@ -832,6 +841,16 @@ clears 0.641 by a lot.
   The injection path (`DGQCUDA_INJECT_AFTER` / `DGQCUDA_INJECT_BIN`) answers
   that directly -- give the port the engine's own layer-N input at the real
   geometry and see whether its layer-N output matches.
+
+  **Resolved: it was the mask, and the contradiction was never real.** The
+  `forward` command that produced every prefill-K table above
+  ran the prompt rows bidirectionally, the engine prefills them causally, and
+  the rows that "survived" were the ones a mask cannot distinguish (bos, and
+  the last row, which sees everything either way). Under `--causal` all 20
+  rows are cos 1.000 at all 30 layers, bit-stable across runs. The layer
+  bodies, the geometry and the cache were right all along; the seq-16
+  synthetic test could not show the mismatch because both sides ran it with
+  the same mask.
 
   Still open, and it is only verification now: the port's end-to-end output
   against the engine's on the same prompt and seed, and the per-layer K curve
