@@ -1033,11 +1033,12 @@ clears 0.641 by a lot.
   would have been visible without the full replies, which is what
   `--replies-out` is for.
 
-  Port, seed 7 (seeds 42/123 still running at 56 s/step): rubric 24/27,
-  full 7/9. Every miss is an explain probe cut at the single 256-token
-  canvas -- transformer 174 words against the engine's 633, hash_table 164
-  against 598 -- and the groups lost (query/encoder, collision) are the
-  ones the engine reaches after the cut. On the six probes that fit in one
+  Port, seeds 7 and 42 (123 still running at 56 s/step): rubric 24/27 and
+  full 7/9 at both seeds, the same two probes missing the same groups both
+  times. Every miss is an explain probe cut at the single 256-token canvas
+  -- transformer 174/175 words against the engine's 633/653, hash_table
+  164/170 against 598/593 -- and the groups lost (query/encoder,
+  collision) are the ones the engine reaches after the cut. On the six probes that fit in one
   canvas (compare, list x2, form x2, summary) both sides are 6/6 FULL,
   same structure (3-line haiku, 5-line limerick, 5 fruit lines, exactly
   two sentences), same facts, different wording. Steps land within 1-4 of
