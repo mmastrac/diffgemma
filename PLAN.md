@@ -453,7 +453,38 @@ clears 0.641 by a lot.
   of minutes. Work there, and compare per layer against
   `step-attn-dump`'s `k_samples` (positions 0 and 19 are enough).
 
-  The likeliest seed is a BIAS, not noise. The port's layer-0 MoE output is
+  **The prefill test ran, and it is the loop to work in.** `dgqcuda forward
+  --gpu` on the golden 20 ids (which ARE the chat-templated "What is the
+  capital of France?", so it matches the engine dumps exactly) takes 43s, and
+  `DGQCUDA_K_DUMP_JSONL` records every layer's K in that one run. Both sides now
+  sample every prompt position, so the picture is a matrix rather than whichever
+  positions a layer happened to attend to. Against the engine:
+
+    layer    kind    mean cos   min cos
+        1  sliding   0.990871   0.981119
+        2  sliding   0.986844   0.973080
+        3  sliding   0.960083   0.879676
+        5     FULL   0.886938   0.731883
+       10  sliding   0.894963   0.489285
+       15  sliding   0.853597   0.420505
+       20  sliding   0.833522   0.189830
+
+  It decays smoothly from layer 1 across ALL positions. There is no step at the
+  first full-attention layer: a `bad(<0.9)` count made it look like one, which
+  was a threshold artifact and not a finding. RoPE is ruled out as well -- the
+  port's `rope_freqs` and `apply_rope` are character-identical to the engine's
+  `compute_rope_freqs`/`apply_rope`, and `dgq_rope` uses the same proportional
+  `half_head + d` pairing, so the partial rope on full-attention layers is
+  right. (Worth knowing anyway: the dgops tier-1 rope fixture only covers a
+  SLIDING layer, where `rotary_dim == head_dim` makes both pairings identical,
+  so it could not have caught a proportional bug.)
+
+  The number to chase is the first row. K is cos 1.0000000 at layer 0 and
+  0.9909 after ONE layer, so a single layer injects ~1e-2 of relative error
+  into the prompt rows from a bit-identical start. That is the per-layer seed,
+  it is measurable in 43 seconds, and everything downstream is it compounding.
+
+  The likeliest cause is a BIAS, not noise. The port's layer-0 MoE output is
   cos 0.9999694 against the engine with l2 ratio 1.0214 -- same direction, 2.1%
   large -- and a systematic 2% per layer compounds (1.02^30 = 1.8x), which is
   the shape of the residual l2 ratios through the middle layers. Unbiased

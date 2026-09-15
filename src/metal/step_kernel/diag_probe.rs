@@ -497,12 +497,16 @@ pub fn run_step_attn_layer_capture(
     let attn_probs = softmax_attn_rows(&raw_scores, n_heads, total_kv);
 
     let canvas_abs = kv_len as usize + position;
-    let mut sample_pos = vec![
-        0usize,
+    // Every PROMPT position, not just the ones this layer happens to attend to:
+    // a port that diverges on one token and not its neighbours looks like an
+    // opportunistic sample gap otherwise, and per-token divergence is exactly
+    // what a routing flip produces.
+    let mut sample_pos: Vec<usize> = (0..kv_len as usize).collect();
+    sample_pos.extend([
         kv_len.saturating_sub(1) as usize,
         kv_len as usize,
         canvas_abs,
-    ];
+    ]);
     for t in top_key_positions(&attn_probs, n_heads, total_kv, 8) {
         sample_pos.push(t);
     }
