@@ -301,8 +301,11 @@ clears 0.641 by a lot.
 
   What is still open:
 
-    - Long answers. 0/6 on the haiku and list prompts, in both arena arms, at
-      every seed. p2/p3 take 6-9 denoise steps against p0/p1's 2-5.
+    - Long answers. Text identity was the wrong bar (see the smoketest
+      criteria note below); the `content` battery now scores them. The
+      port's structural limit there: `dgqcuda denoise` runs ONE 256-token
+      canvas and never chains a second block, so any reply longer than that
+      is cut off. The engine writes 550-665 words for the explain probes.
     - RESOLVED: the "per-row K drift at depth" (position 4 at cos 0.0525 by
       layer 29 while position 3 held 0.9997) was the diagnostic `forward`
       command, not the model path. `forward --gpu` ran every prompt row
@@ -1007,8 +1010,33 @@ clears 0.641 by a lot.
   port converges like the engine, not that its long answers are as good. And
   `adherence`, the criterion that does check content, covers only short
   prompts. A quality claim about long answers needs a probe class that scores
-  content on a free-form reply, which this spec does not have; that is the
-  real next piece of work on the port, and it is a build rather than a hunt.
+  content on a free-form reply, which this spec did not have.
+
+  **Built: the `content` battery** (`smoketest --battery content`, commits
+  8b57cbd2, 98ad1bba, 15287528; `commands::content`). Nine probes across
+  explain / compare / list / form / summary, each with a rubric of any-of
+  groups, optional `forbid` terms and structure checks (lines, sentences,
+  word bounds). Rates, not pass/fail, for the reason item R found: long
+  answers are trajectory-sensitive at bf16 precision. The soft battery's
+  authoring rule carries over and is pinned by a test: no rubric term may
+  appear in its own prompt. `--replies FILE` judges replies made elsewhere
+  with the same code and no model, which is how the port is scored;
+  `--replies-out FILE` keeps a live run's full replies in that shape.
+
+  Engine, seeds 7/42/123: rubric 27/27 and full 9/9 at every seed. Two
+  battery defects found and fixed on the way there, both of the same kind
+  the programmatic battery already warns about (measuring our ceiling as
+  the model's error): the 512-token smoke gen cap cut the transformer
+  explanation off mid-word before it reached query/key/value (rubric 26/27
+  at every seed, a different group each time), and a 60-step guard called
+  a complete 650-word explanation "over budget" at one seed. Neither
+  would have been visible without the full replies, which is what
+  `--replies-out` is for.
+
+  Port: pending (the batch runs at 56 s/step on the GB10, ~9 hours for
+  9 probes x 3 seeds). Expect the explain probes to lose rubric groups to
+  the single-canvas cut rather than to content; the form / list / summary
+  probes fit in one canvas and are the like-for-like comparison.
 
 - **Model-gated tests treat a manifest-only pack as present.**
   `test_util::dgq_model_dir()` returns `Some` when `model.dgq.json` exists, so an
