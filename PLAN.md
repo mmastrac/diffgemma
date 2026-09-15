@@ -802,6 +802,61 @@ clears 0.641 by a lot.
   above is untouched by this and still stands on its own -- it is real, it is
   small, and it is the remaining known difference between the two engines.
 
+  **End to end, the port now answers the prompt the engine answers.** Same
+  prompt, seed 42: both produce "The capital of France is **Paris**.", eight
+  tokens, eos at offset 8. That took a second fix -- the port's early-stop
+  floor was an AND where `sample::early_stop_allowed` has an OR
+  (`steps_done >= 12 || real >= MIN_REAL_ARGMAX_POSITIONS`), and the port had
+  no equivalent of the second clause at all, so a resolved canvas could not
+  stop before step 12. With it restored the port stops at step 3 like the
+  engine, 167.6s against 775.2s.
+
+  Stopping at the engine's step also exposes what the extra steps were hiding:
+  at step 3 the port has token 145020 at canvas position 8 where the engine
+  has eos. So the honest statement is "same answer, one trailing token at the
+  step the engine stops on", not "identical".
+
+  **And that last token is one near-tie, not a defect.** Step 1 is the only
+  step whose inputs are provably identical on both sides -- verified same
+  prompt ids, same initial canvas token at every dumped position, same seed,
+  same temperature. Engine `step-logits-dump` against port `--dump-step`
+  there:
+
+      pos  eng am  port am   e gap   p gap   e top1  p top1     d
+        0     818      818   4.750   5.363   28.25   28.45   0.20
+        1    5279     5279   6.375   5.217   26.25   26.70   0.45
+        2     529      529   5.750   4.869   27.88   27.86  -0.02
+        3    7001     7001   5.500   4.454   27.00   27.07   0.07
+        4     563      563   6.625   5.579   27.25   27.55   0.30
+        5    5213     5213   3.250   4.873   28.38   29.08   0.71
+        6  236761    50429   0.000   2.291   27.12   27.35   0.23   FLIP
+        7   84750    84750   2.375   4.073   28.50   28.86   0.36
+        8       1      106   0.500   0.366   27.88   28.13   0.26   FLIP
+        9       1        1   5.250   4.698   29.00   28.83  -0.17
+
+  Eight of ten argmaxes agree. Position 8 is the same two tokens within half a
+  logit on both sides, ordered oppositely. Position 6 is an EXACT tie on the
+  engine (50429 and 236761 both 27.12), and a tie goes to whatever breaks it.
+
+  Read the engine's `top_k_tempered`, not its `token_logits`: the latter is a
+  fixed watch-list of special tokens and its first entry is not the argmax. A
+  table built off the wrong field looks like a total disagreement.
+
+  Two engine-side notes fall out of that dump. Its `top_k_tempered` lists
+  50429 first at position 6 while `argmax_raw` says 236761, so the sort and
+  the argmax kernel break an exact tie differently -- harmless here, but it
+  means `argmax_raw` is not reproducible from the dumped ranking. And the
+  dumped logits are bf16-quantized (0.125 spacing at this magnitude), which is
+  why an engine gap can read as exactly 0.000 where the port has 2.291; that
+  particular pair is too far apart to be a quantization artifact, so position
+  6 is a real relative-logit disagreement rather than a display effect.
+
+  Top-1 logits differ by -0.17 to +0.71, mean about +0.24, with the port high.
+  That is the direction the engine's f32->bf16 truncation predicts and the
+  reason `DGQCUDA_BF16_ARENA=trunc` now exists: the pre-existing arm rounded
+  to nearest even, which is a different convention from the engine's and so
+  could not answer whether the engine's bias accounts for the spread.
+
 - **Model-gated tests treat a manifest-only pack as present.**
   `test_util::dgq_model_dir()` returns `Some` when `model.dgq.json` exists, so an
   interrupted pack download (manifest present, `model.dgq.bin` missing or a
