@@ -534,6 +534,26 @@ fn layer_forward_at(
     }
 }
 
+/// One decoder layer on the engine's `layer0` synthetic input: seq 16, hidden
+/// `(i % hidden) * 0.01 - 0.5`, positions 0..15, fully causal.
+///
+/// `diffgemma layer0` builds the identical input and runs the identical layer
+/// on the identical weights, so its output is a reference this needs nothing
+/// transferred to compare against. That comparison is what caught the dense
+/// branch folding into the pre-feedforward norm instead of replacing it.
+pub fn layer0_synthetic_cpu(w: &Weights, cfg: &ModelConfig) -> Result<Vec<f32>, Error> {
+    const SEQ: usize = 16;
+    let hidden = cfg.text_config.hidden_size;
+    let lw = LayerWeights::load(w, 0)?;
+    let mut b = Buffers::new(SEQ, cfg);
+    let input: Vec<f32> = (0..SEQ * hidden)
+        .map(|i| ((i % hidden) as f32) * 0.01 - 0.5)
+        .collect();
+    let mut out = vec![0.0f32; SEQ * hidden];
+    layer_forward(&mut out, &input, &lw, cfg, 0, SEQ, &mut b);
+    Ok(out)
+}
+
 fn layer_forward(
     out: &mut [f32],
     hidden_states: &[f32],
