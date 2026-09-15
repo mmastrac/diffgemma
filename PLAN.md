@@ -701,6 +701,57 @@ clears 0.641 by a lot.
   file that is still being appended reports a difference that is not there,
   which is how this first read as unfixed.
 
+  **FOUND, and it was none of the above: the dense MLP added where it should
+  have overwritten.** `layer_forward` folded the dense branch in with
+
+      normed += rms(dense_out, post_feedforward_layernorm_1)
+
+  where `normed` held `rms(residual, pre_feedforward_layernorm)` -- the GEMM
+  input from four calls earlier, not a residual. `decoder_layer::forward`
+  OVERWRITES there; the MoE branch is what gets added, and the residual rejoins
+  at the layer output. So every layer summed an extra normalized copy of its
+  own input, on every row, prompt and canvas alike.
+
+  Measured on one layer, the same synthetic input on both sides, nothing
+  accumulated:
+
+      hidden_in                identical by construction   cos 1.000000000
+      output, add (the bug)    cos 0.997230850   rel_l2 0.083099
+      output, overwrite (now)  cos 0.999999615   rel_l2 0.000878
+
+  A/B'd behind an env switch inside ONE binary so a rebuild could not be
+  mistaken for the effect, then the switch came out. Fixed in the CUDA path and
+  in the port's own CPU forward, which had the identical line and the identical
+  comment -- so the parity test that compares those two was comparing two
+  copies of one mistake and passed. `tests/layer0_oracle.rs` now pins the CPU
+  half against a fixture of the engine's answer; putting the bug back makes it
+  fail at cos 0.997230862, within 1.2e-8 of what the CUDA path scored, which is
+  its own confirmation the two defects were the same one.
+
+  Why the ladder of disproofs above never reached it. Every measurement was
+  taken downstream of the fold and read as evidence about the thing it measured:
+  K at layer N carries it, the MoE output carries it, the residual ratios carry
+  it. It is uniform across rows, so the routing test read "not routing"
+  correctly and learned nothing. It is ~8% at one layer, far above bf16, so the
+  precision test read "not precision" correctly and learned nothing. It is in
+  the layer body, so the prefill-path test read "not the prefill" correctly and
+  learned nothing. Each disproof was sound and none of them could have found
+  it, because none compared ONE layer against a reference that did not share
+  the bug. The engine's `layer0` was that reference the whole time and was
+  unreachable only because `DecoderLayerWeights::load` could not open a
+  quantized pack.
+
+  The cost of that blocker is the lesson worth keeping. Two days of
+  disproof-by-elimination ran because a single-layer oracle comparison needed
+  two tensors dequantized, and that was filed as a blocker rather than done.
+  `ExpertPlanes` is 60 lines.
+
+  Still open, and it is only verification now: the port's end-to-end output
+  against the engine's on the same prompt and seed, and the per-layer K curve
+  re-measured (layer 1 was cos 0.9909 before the fix). The bf16-store finding
+  above is untouched by this and still stands on its own -- it is real, it is
+  small, and it is the remaining known difference between the two engines.
+
 - **Model-gated tests treat a manifest-only pack as present.**
   `test_util::dgq_model_dir()` returns `Some` when `model.dgq.json` exists, so an
   interrupted pack download (manifest present, `model.dgq.bin` missing or a
