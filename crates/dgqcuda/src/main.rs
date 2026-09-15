@@ -706,25 +706,32 @@ fn run(args: &Args) -> Result<(), config::Error> {
                     break;
                 }
             }
-            println!("canvas ({} ids):", st.ids.len());
-            let ids: Vec<String> = st.ids.iter().map(|v| v.to_string()).collect();
+            // What gets EMITTED is the argmax canvas, not the sampled one.
+            // `step_generate::turn` commits `st.prev_argmax`, and the two are
+            // not the same object: `ids` carries the categorical draw that
+            // drives the next step's denoise, and any position the accept mask
+            // left out still holds `rng.uniform_below(vocab)` -- a uniform
+            // random token. Emitting `ids` therefore leaks noise into the
+            // reply at exactly the positions the sampler was least sure about.
+            println!("canvas ({} ids):", st.argmax.len());
+            let ids: Vec<String> = st.argmax.iter().map(|v| v.to_string()).collect();
             println!("{}", ids.join(","));
             let active = st
-                .ids
+                .argmax
                 .iter()
                 .filter(|&&v| v != denoise::PAD_TOKEN_ID)
                 .count();
-            println!("active tokens: {active}/{}", st.ids.len());
+            println!("active tokens: {active}/{}", st.argmax.len());
             if let Some(tok) = &tok {
                 // The canvas is the reply: cut at the first end-of-turn/eos
                 // marker, drop padding, then decode and strip the ceremony.
                 let eos = t.eos_token_ids();
                 let end = st
-                    .ids
+                    .argmax
                     .iter()
                     .position(|id| eos.contains(id))
-                    .unwrap_or(st.ids.len());
-                let text_ids: Vec<u32> = st.ids[..end]
+                    .unwrap_or(st.argmax.len());
+                let text_ids: Vec<u32> = st.argmax[..end]
                     .iter()
                     .copied()
                     .filter(|&v| v != denoise::PAD_TOKEN_ID)
