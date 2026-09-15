@@ -407,14 +407,22 @@ pub(crate) fn run_smoketest(
     // Soft probes feed a whole fixture document, so they need doc headroom.
     const SOFT_MAX_SEQ: usize = 8192;
     const PROG_GEN_CAP: usize = 1536;
+    // Content probes ask for explanations, which the engine writes at 700+
+    // tokens. At the 512 smoke cap the transformer explanation was cut off
+    // mid-word before it reached query/key/value and the rubric scored the
+    // truncation, not the answer. Same headroom as programs.
+    const CONTENT_MAX_SEQ: usize = 4096;
+    const CONTENT_GEN_CAP: usize = 1536;
     let smoke_max_seq = match battery {
         Battery::LongCtx => LONGCTX_MAX_SEQ,
         Battery::Programmatic => PROG_MAX_SEQ,
         Battery::Soft => SOFT_MAX_SEQ,
-        Battery::Smoke | Battery::Content => SMOKE_MAX_SEQ,
+        Battery::Content => CONTENT_MAX_SEQ,
+        Battery::Smoke => SMOKE_MAX_SEQ,
     };
     let gen_cap = match battery {
         Battery::Programmatic => PROG_GEN_CAP,
+        Battery::Content => CONTENT_GEN_CAP,
         _ => SMOKE_GEN_CAP,
     };
     let stop_token_ids = config::load_generation_stop_tokens(model_dir);
