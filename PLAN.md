@@ -857,6 +857,40 @@ clears 0.641 by a lot.
   to nearest even, which is a different convention from the engine's and so
   could not answer whether the engine's bias accounts for the spread.
 
+  **Across a prompt set, the port matches on short answers and never on long
+  ones.** 24 port runs (exact-f32 and engine-truncation arms) against 12
+  engine references, four smoketest prompts x seeds {7,42,123}, judged on the
+  full reply text:
+
+      prompt                                   f32    trunc
+      p0  7x8            (short, seed-invariant)   2/3    3/3
+      p1  colors         (short, seed-invariant)   3/3    3/3
+      p2  haiku          (long,  seed-varying)     0/3    0/3
+      p3  list           (long,  seed-varying)     0/3    0/3
+      TOTAL                                        5/12   6/12
+
+  The split is the result; the totals are not. 5-vs-6 of 12 cannot separate
+  the arms. 6/6 against 0/6 separates the regimes completely: the port
+  reproduces the engine exactly on short convergent answers and never on long
+  trajectory-sensitive ones, in either arm, at any seed.
+
+  That retires "What is the capital of France?" as evidence for anything
+  general. It is a p0/p1-class prompt, and the end-to-end agreement recorded
+  above was measuring the easy half of the space.
+
+  Degenerate tokens, as replies containing non-Latin characters: engine 0/12,
+  exact-f32 3/12, truncation arm 0/12. All three f32 cases are at the END of
+  the reply ("56<CJK>", "Endless<HEB>jetbrains.", "...(RGB).Examin"), the same
+  eos-boundary signature as the spurious 145020 on the France prompt -- one
+  defect with four instances, not four defects. The measure is a lower bound
+  for both arms: it cannot see Latin-script degeneracy, and the truncation arm
+  has at least one ("Tidesallerg mehrere the sand"). So it does not say the
+  truncation arm is clean, and none of this is grounds to change the port's
+  default.
+
+  What it does say: neither arm reproduces a long answer, p2/p3 take 6-9
+  denoise steps against p0/p1's 2-5, and that is where the remaining work is.
+
 - **Model-gated tests treat a manifest-only pack as present.**
   `test_util::dgq_model_dir()` returns `Some` when `model.dgq.json` exists, so an
   interrupted pack download (manifest present, `model.dgq.bin` missing or a
