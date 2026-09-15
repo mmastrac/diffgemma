@@ -714,6 +714,28 @@ fn run(args: &Args) -> Result<(), config::Error> {
                 println!("{}", chat_template::sanitize_model_reply(&raw));
             }
         }
+        // One layer on the engine's `layer0` synthetic input, for a direct
+        // body-vs-body comparison against `diffgemma layer0`.
+        "layer0" => {
+            let row = args.only_row.unwrap_or(0);
+            let (hin, attn, out) = gpu::layer0_synthetic(&w, &cfg, row)?;
+            let field = |name: &str, v: &[f32]| {
+                let vals: Vec<String> = v.iter().map(|x| format!("{x}")).collect();
+                format!("\"{name}\":[{}]", vals.join(","))
+            };
+            let path = std::env::var("DGQCUDA_LAYER0_DUMP")
+                .unwrap_or_else(|_| "/tmp/port_layer0.json".to_string());
+            let body = [
+                field("hidden_in", &hin),
+                field("attn_out", &attn),
+                field("output", &out),
+                format!("\"row\":{row}"),
+            ]
+            .join(",");
+            std::fs::write(&path, format!("{{{body}}}"))?;
+            eprintln!("wrote {path} (row {row})");
+            println!("  output[0..4]: {:?}", &out[..4]);
+        }
         "gemm-probe" => {
             let m = args.layers.unwrap_or(1);
             let v = gpu::gemm_probe(m, t.hidden_size, t.vocab_size)?;

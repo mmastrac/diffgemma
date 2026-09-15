@@ -536,7 +536,41 @@ clears 0.641 by a lot.
   ever been checked on a CANVAS row (cos 0.999984 at layer 0), never on a
   causal prompt row.
 
-  Next: split layer 0 for a PROMPT row. `DGQCUDA_ATTN_DUMP` is canvas-relative
+  **Disproved: it is not MoE routing flips.** Routing is discrete and per row,
+  so a flipped expert shows up as a few ruined rows against a clean background.
+  The layer-1 K divergence is instead UNIFORM across all 20 prompt positions:
+
+    layer 1  mean 0.990871   worst p1=0.9811   best p19=0.9977
+    layer 2  mean 0.986844   worst p8=0.9731   best p0=0.9977
+    layer 3  mean 0.960083   worst p12=0.8797  best p0=0.9932
+
+  No outliers at layer 1 -- every row is off by about the same 1-2%. So layer 0
+  applies a systematically different function to every prompt row, rather than
+  mis-routing a few.
+
+  That also narrows attention as the suspect, because at layer 0 the two sides
+  provably agree on its inputs: prompt K is cos 1.0000000 there, which means
+  `rms_norm`, `k_proj`, `k_norm` and RoPE are all exact for prompt rows, and Q
+  travels the same code. The masks agree too -- seq is 20 against a 1024
+  window, so sliding is inert and both sides are plain causal. V is the only
+  attention input never compared, and the dense FFN and the MoE are the only
+  other components.
+
+  Next: split layer 0 for a PROMPT row. BLOCKED on the engine side, and the
+  blocker is worth knowing before anyone retries: the engine's CPU single-layer
+  commands (`layer0`, `attention`) cannot load a .dgq pack at all. Both go
+  through `DecoderLayerWeights::load`, which fetches every tensor with
+  `store.tensor()`, and that refuses quantized ones ("dgq tensor is quantized;
+  use tensor_f32") -- the attention and dense weights are raw bf16 and load
+  fine, but `experts_gate_up` is q4 and kills the whole load. So the obvious
+  clean experiment -- one layer, identical synthetic input, real weights, f32 on
+  both sides, which would isolate the layer body from prefill and canvas
+  entirely -- needs `DecoderLayerWeights` to support partial or dequantizing
+  loads first. `dgqcuda layer0` (the port half, on the engine's own synthetic
+  input `(i % hidden) * 0.01 - 0.5`, seq 16, causal) is already built and
+  waiting for a counterpart.
+
+  `DGQCUDA_ATTN_DUMP` is canvas-relative
   (`row = DGQCUDA_ATTN_ROW + causal_split`), so in the prefill, where
   `causal_split == seq`, every row it can name is out of range and the dump
   never fires -- it needs an absolute-row mode before it can be pointed at a

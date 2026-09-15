@@ -532,6 +532,38 @@ pub(crate) fn run_layer0_forward(m: &model::Model) -> ExitCode {
         &mut scratch,
     ) {
         Ok(()) => {
+            // `DGQ_LAYER0_DUMP=<path>`: the layer's input and its stage outputs
+            // for row `DGQ_LAYER0_ROW` (default 0), as JSON. The input is
+            // synthetic and deterministic, so another implementation can
+            // generate the identical input without transferring it and compare
+            // one layer directly -- no prefill, no canvas, nothing accumulated.
+            if let Ok(path) = std::env::var("DGQ_LAYER0_DUMP") {
+                let row: usize = std::env::var("DGQ_LAYER0_ROW")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0)
+                    .min(SEQ_LEN - 1);
+                let take = |v: &[f32]| -> Vec<f32> {
+                    let w = v.len() / SEQ_LEN;
+                    v[row * w..(row + 1) * w].to_vec()
+                };
+                let field = |name: &str, v: Vec<f32>| {
+                    let vals: Vec<String> = v.iter().map(|x| format!("{x}")).collect();
+                    format!("\"{name}\":[{}]", vals.join(","))
+                };
+                let body = [
+                    field("hidden_in", take(&input)),
+                    field("attn_out", take(&scratch.attn_out)),
+                    field("output", take(&output)),
+                    format!("\"seq_len\":{SEQ_LEN},\"row\":{row},\"hidden\":{hidden}"),
+                ]
+                .join(",");
+                if let Err(e) = std::fs::write(&path, format!("{{{body}}}")) {
+                    eprintln!("layer0 dump {path}: {e}");
+                } else {
+                    eprintln!("wrote {path} (row {row})");
+                }
+            }
             println!("decoder layer 0 forward ok");
             println!("  output shape: [{SEQ_LEN}, {hidden}]");
             println!("  elapsed: {:.2?}", started.elapsed());

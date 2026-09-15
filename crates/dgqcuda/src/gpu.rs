@@ -26,7 +26,7 @@ pub fn forward(
 }
 
 #[cfg(feature = "cuda")]
-pub use cuda::{attn_stage, cublas_probe, hidden_after};
+pub use cuda::{attn_stage, cublas_probe, hidden_after, layer0_synthetic};
 
 #[cfg(not(feature = "cuda"))]
 pub fn hidden_after(

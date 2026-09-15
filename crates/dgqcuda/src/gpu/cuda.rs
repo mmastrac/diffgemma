@@ -1351,6 +1351,52 @@ fn interleave_kv(
 }
 
 /// Hidden state after \`layers\` decoder layers (device-resident path).
+/// One decoder layer on the engine's `layer0` synthetic input: seq 16, hidden
+/// values `(i % hidden) * 0.01 - 0.5`, positions 0..15, fully causal. The input
+/// is deterministic, so this needs nothing transferred from the engine -- both
+/// sides build it and run ONE layer on the same real weights. That isolates the
+/// layer body from the prefill, the canvas and everything accumulated, which
+/// the per-layer K comparison cannot.
+///
+/// Returns `(hidden_in, attn_out, output)` for `row`.
+pub fn layer0_synthetic(
+    w: &Weights,
+    cfg: &ModelConfig,
+    row: usize,
+) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), Error> {
+    const SEQ: usize = 16;
+    let model = GpuModel::load(w, cfg, Some(1))?;
+    let ctx = model.ctx.clone();
+    let hidden = cfg.text_config.hidden_size;
+    let mut b = Bufs::new(SEQ, cfg, &ctx)?;
+    let r = Runner {
+        m: &model,
+        cfg,
+        seq: SEQ,
+        pos0: 0,
+        causal_split: SEQ,
+        stage: std::cell::RefCell::new(Stage::new()),
+    };
+    let input: Vec<f32> = (0..SEQ * hidden)
+        .map(|i| ((i % hidden) as f32) * 0.01 - 0.5)
+        .collect();
+    b.hidden_a.write_f32(&input)?;
+    layer_forward(&r, &mut b, &model.layers[0], 0, 0)?;
+    ctx.synchronize()?;
+    let mut attn =
+        vec![0.0f32; SEQ * cfg.text_config.num_attention_heads * cfg.text_config.head_dim];
+    b.attn_out.read_f32(&mut attn)?;
+    let mut out = vec![0.0f32; SEQ * hidden];
+    b.hidden_b.read_f32(&mut out)?;
+    let row = row.min(SEQ - 1);
+    let aw = attn.len() / SEQ;
+    Ok((
+        input[row * hidden..(row + 1) * hidden].to_vec(),
+        attn[row * aw..(row + 1) * aw].to_vec(),
+        out[row * hidden..(row + 1) * hidden].to_vec(),
+    ))
+}
+
 pub fn hidden_after(
     w: &Weights,
     cfg: &ModelConfig,
