@@ -967,10 +967,29 @@ clears 0.641 by a lot.
   By eye the port's long answers are good: valid haikus, and p3 lists RGB /
   RYB / CMY correctly. They differ in wording, not in correctness.
 
-  What that leaves as real work: an AGGREGATE quality comparison on long
-  prompts, which is what `smoketest`'s adherence and convergence criteria
-  measure and what the port has never been run against. Text identity cannot
-  separate "different wording" from "worse"; those criteria can.
+  **Scored on the engine's own criteria, the port is indistinguishable from
+  it.** The smoketest criteria are data, not code -- `answer` plus a
+  `max_steps` budget in fixtures/smoketest/prompts.json -- so they apply to
+  replies already collected, with no need to teach the port a smoketest output
+  format. All four batch prompts are in the spec:
+
+      engine 12/12    port f32 12/12    port trunc 12/12
+
+  Steps land inside budget everywhere and within 1-3 of the engine's
+  (haiku_ocean, budget 9: engine 8,6,6 against f32 7,8,6; primary_colors,
+  budget 11: engine 8,8,9 against f32 8,7,8).
+
+  So "0/6 on long prompts" was an artifact of grading on text identity, and on
+  the bar the engine holds itself to there is no gap on these probes.
+
+  Two limits on that, both real. Four probes of seventeen, and the two long
+  ones are `convergence` probes whose only criterion is "converged within
+  max_steps" -- a bar that never inspects the answer. 12/12 therefore says the
+  port converges like the engine, not that its long answers are as good. And
+  `adherence`, the criterion that does check content, covers only short
+  prompts. A quality claim about long answers needs a probe class that scores
+  content on a free-form reply, which this spec does not have; that is the
+  real next piece of work on the port, and it is a build rather than a hunt.
 
 - **Model-gated tests treat a manifest-only pack as present.**
   `test_util::dgq_model_dir()` returns `Some` when `model.dgq.json` exists, so an
