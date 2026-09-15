@@ -941,8 +941,36 @@ clears 0.641 by a lot.
   the step-1 argmax table). The convention still has no end-to-end evidence
   either way; do not set the port's default from any of this.
 
-  What survives: neither arm reproduces a long answer, p2/p3 take 6-9 denoise
-  steps against p0/p1's 2-5, and that is where the remaining work is.
+  **And the long-answer gap is not a defect.** Reply-text similarity, same
+  measure on all three pairs:
+
+      case            eng vs f32   eng vs trunc   f32 vs trunc
+      short (p0,p1)        1.000          1.000          1.000
+      long  (p2,p3)        0.645          0.746          0.668
+
+  The third column is the control: the port's own two arena arms differ only
+  by a bf16 rounding convention, in the same binary, on the same machine, same
+  seed, same prompt. On long answers they differ from EACH OTHER as much as
+  either differs from the engine. A long reply is therefore not determined at
+  bf16 precision -- changing only the rounding convention reorganises it --
+  and exact long-answer identity between two engines with different arithmetic
+  conventions is not an achievable target. Short answers are fully determined
+  (1.000 everywhere) and the port reproduces them exactly.
+
+  The port is deterministic, so that control is sound: 20 of 24 run-to-run
+  pairs are bit-identical and all 4 differences are exactly the rows the
+  argmax-emit fix corrected. One of those four was in the truncation arm
+  ("Tidesallerg mehrere the sand" -> "Tides pull against the sand"), so that
+  arm had an unaccepted-row leak too, in Latin script, below what the
+  non-Latin measure could see.
+
+  By eye the port's long answers are good: valid haikus, and p3 lists RGB /
+  RYB / CMY correctly. They differ in wording, not in correctness.
+
+  What that leaves as real work: an AGGREGATE quality comparison on long
+  prompts, which is what `smoketest`'s adherence and convergence criteria
+  measure and what the port has never been run against. Text identity cannot
+  separate "different wording" from "worse"; those criteria can.
 
 - **Model-gated tests treat a manifest-only pack as present.**
   `test_util::dgq_model_dir()` returns `Some` when `model.dgq.json` exists, so an
