@@ -216,6 +216,31 @@ fn is_active_token(id: u32) -> bool {
     id != PAD_TOKEN_ID && id != FILLER_TOKEN_ID
 }
 
+impl DenoiseState {
+    /// The ids to emit as the reply: the ARGMAX canvas, cut at the first
+    /// end-of-turn/eos marker, with padding dropped.
+    ///
+    /// Never `ids`. `ids` is the categorical draw that drives the next step,
+    /// and a row the accept mask declined holds `rng.uniform_below(vocab)` --
+    /// a uniform random token with no relation to the logits. The engine
+    /// commits `st.prev_argmax` (`metal/step_generate/turn.rs`) for the same
+    /// reason. Emitting `ids` leaks noise into the reply at exactly the
+    /// positions the sampler was least sure about, so it stays invisible until
+    /// a prompt has a genuinely uncertain row.
+    pub fn reply_ids(&self, eos: &[u32]) -> Vec<u32> {
+        let end = self
+            .argmax
+            .iter()
+            .position(|id| eos.contains(id))
+            .unwrap_or(self.argmax.len());
+        self.argmax[..end]
+            .iter()
+            .copied()
+            .filter(|&v| v != PAD_TOKEN_ID)
+            .collect()
+    }
+}
+
 fn argmax_is_degenerate(argmax: &[u32]) -> bool {
     argmax.iter().all(|&t| !is_active_token(t))
 }

@@ -723,19 +723,9 @@ fn run(args: &Args) -> Result<(), config::Error> {
                 .count();
             println!("active tokens: {active}/{}", st.argmax.len());
             if let Some(tok) = &tok {
-                // The canvas is the reply: cut at the first end-of-turn/eos
-                // marker, drop padding, then decode and strip the ceremony.
-                let eos = t.eos_token_ids();
-                let end = st
-                    .argmax
-                    .iter()
-                    .position(|id| eos.contains(id))
-                    .unwrap_or(st.argmax.len());
-                let text_ids: Vec<u32> = st.argmax[..end]
-                    .iter()
-                    .copied()
-                    .filter(|&v| v != denoise::PAD_TOKEN_ID)
-                    .collect();
+                // `reply_ids` owns the argmax-not-ids decision and is pinned by
+                // tests/denoise.rs; do not inline it back to a field access.
+                let text_ids = st.reply_ids(&t.eos_token_ids());
                 let raw = tok.decode(&text_ids);
                 println!("--- reply ---");
                 println!("{}", chat_template::sanitize_model_reply(&raw));

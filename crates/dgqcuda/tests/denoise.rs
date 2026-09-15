@@ -3,8 +3,8 @@
 //! floor against hand-computed values.
 
 use dgqcuda::denoise::{
-    DenoiseState, MIN_EARLY_STOP_STEPS, Rng, SamplerConfig, StopReason, accept_mask_from_entropies,
-    row_stats, sample_row,
+    DenoiseState, MIN_EARLY_STOP_STEPS, PAD_TOKEN_ID, Rng, SamplerConfig, StopReason,
+    accept_mask_from_entropies, row_stats, sample_row,
 };
 
 #[test]
@@ -174,4 +174,66 @@ fn a_confident_canvas_stops_only_after_the_minimum_steps() {
     }
     assert_eq!(stop, Some(StopReason::Confident));
     assert!(steps >= MIN_EARLY_STOP_STEPS, "stopped after {steps} steps");
+}
+
+#[test]
+fn argmax_is_the_emitted_canvas_and_ids_can_hold_noise() {
+    // The reply is decoded from `argmax`, never from `ids`. This is the bug
+    // that shipped: `denoise` printed `ids`, but `ids` carries the categorical
+    // draw that drives the NEXT step, and a row the accept mask declines keeps
+    // `rng.uniform_below(vocab)` -- a uniform random token. The engine commits
+    // `st.prev_argmax` (step_generate/turn.rs), which is the argmax canvas.
+    //
+    // Two rows: row 0 sharply peaked at token 1, row 1 flat. A tight entropy
+    // bound accepts only the peaked one, so row 1 exercises the re-noise path.
+    let vocab = 4;
+    let canvas = 2;
+    let mut cfg = SamplerConfig::default();
+    cfg.max_denoising_steps = 8;
+    cfg.entropy_bound = 0.0;
+    let mut st = DenoiseState::new(cfg, 11, canvas, vocab);
+    st.ids = vec![0, 0];
+    let logits = vec![0.0, 20.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+    let (stats, _) = st.step(&logits, vocab);
+
+    // Only the peaked row is accepted, so the flat row was re-noised.
+    assert_eq!(stats.accept_count, 1, "the flat row must be declined");
+    assert!(st.accept[0] && !st.accept[1]);
+
+    // `argmax` holds the true per-row argmax at EVERY position, declined ones
+    // included. That is what makes it safe to emit.
+    assert_eq!(st.argmax[0], 1, "peaked row's argmax is token 1");
+    assert_eq!(
+        st.argmax[1], 0,
+        "a flat row's argmax is its first maximal token, not a random draw"
+    );
+
+    // `ids` at the declined row is a uniform draw with no relation to the
+    // logits, which is precisely why emitting it leaked garbage into replies.
+    assert!(st.ids[1] < vocab as u32);
+}
+
+#[test]
+fn reply_ids_reads_the_argmax_canvas_and_stops_at_eos() {
+    // Pins the call site, not just the invariant: the shipped bug was that
+    // `denoise` decoded `ids`, which is a field access away from correct.
+    let vocab = 8;
+    let canvas = 4;
+    let mut cfg = SamplerConfig::default();
+    cfg.max_denoising_steps = 8;
+    let mut st = DenoiseState::new(cfg, 5, canvas, vocab);
+    st.argmax = vec![3, 4, 1, 6];
+    // Deliberately different at every position, and holding the eos id where
+    // the argmax does not: a reply built from `ids` would both contain these
+    // tokens and terminate in the wrong place.
+    st.ids = vec![7, 1, 7, 7];
+
+    // eos is token 1, so the reply is the argmax prefix before it.
+    assert_eq!(st.reply_ids(&[1]), vec![3, 4]);
+    // No eos in the canvas: the whole argmax row, padding dropped.
+    st.argmax = vec![3, 4, PAD_TOKEN_ID, 6];
+    assert_eq!(st.reply_ids(&[1]), vec![3, 4, 6]);
+    // Several stop ids: the FIRST one encountered ends the reply.
+    st.argmax = vec![3, 6, 4, 1];
+    assert_eq!(st.reply_ids(&[1, 6]), vec![3]);
 }
