@@ -1103,6 +1103,37 @@ pub(crate) fn layer_forward(
     })?;
     b.top_w.read_f32(&mut wts)?;
     r.mark("l:route_readback");
+    // `DGQCUDA_ROUTE_ROWS=<path>` appends every row's top-8 expert set for
+    // every layer in one run. Routing is the only per-row discrete decision in
+    // the model, so when some rows reproduce the engine through 30 layers and
+    // others are destroyed, this is the thing to diff. Indices only: the
+    // weights are continuous and drift, the SET either matches or does not.
+    if let Ok(path) = std::env::var("DGQCUDA_ROUTE_ROWS") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let k = t.top_k_experts;
+            for row in 0..seq {
+                let e: Vec<String> = idx[row * k..(row + 1) * k]
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect();
+                let w: Vec<String> = wts[row * k..(row + 1) * k]
+                    .iter()
+                    .map(|v| format!("{v}"))
+                    .collect();
+                let _ = writeln!(
+                    f,
+                    "{{\"layer\":{layer},\"row\":{row},\"experts\":[{}],\"weights\":[{}]}}",
+                    e.join(","),
+                    w.join(",")
+                );
+            }
+        }
+    }
 
     // Grouped MoE: bucket the tokens by expert, gather their normalized rows
     // into one expert-major matrix, and run one tiled GEMM per expert bucket —
