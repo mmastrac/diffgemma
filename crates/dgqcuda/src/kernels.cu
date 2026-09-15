@@ -173,6 +173,28 @@ extern "C" __global__ void dgq_attention_v2(
     for (unsigned d = 0; d < head_dim; d++) ov[d] = acc[d] * inv;
 }
 
+// f32 -> bf16 precision, round-to-nearest-even, matching the engine's arena
+// store (`f32_round_bf16`, src/shaders/include/common.metal) and MLX before it.
+// The engine keeps its activations in a 2-byte arena and takes this rounding at
+// every stage boundary; a port that carries exact f32 through follows a
+// different trajectory, so matching it means rounding at the same points with
+// the same mode.
+//
+// It is NOT the port's divergence from the engine. Rounding here is very nearly
+// a uniform scale, and the per-layer K comparison is a cosine, which ignores
+// scale: turning this on moves those cosines by +-0.001 on values of 0.83-0.99.
+// The port's divergence is directional, and a scale correction cannot fix it.
+extern "C" __global__ void dgq_round_bf16(float *x, unsigned n) {
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    unsigned u = __float_as_uint(x[i]);
+    // Leave NaN/Inf alone: the rounding bump would carry into the exponent.
+    if ((u & 0x7F800000u) != 0x7F800000u) {
+        u += 0x7FFFu + ((u >> 16) & 1u);
+    }
+    x[i] = __uint_as_float(u & 0xFFFF0000u);
+}
+
 extern "C" __global__ void dgq_vec_add(float *x, const float *y, unsigned n) {
     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] += y[i];

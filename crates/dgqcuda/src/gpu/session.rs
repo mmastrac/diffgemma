@@ -9,7 +9,7 @@
 
 use crate::config::{Error, ModelConfig};
 use crate::gpu::cuda::{
-    Bufs, GpuModel, Runner, Stage, emit_layer_checkpoint, layer_forward, up_f32,
+    Bufs, GpuModel, Runner, Stage, arena_store, emit_layer_checkpoint, layer_forward, up_f32,
 };
 use crate::weights::Weights;
 use gpukit::cuda::{Context, DeviceBuffer, KernelArgs, cached_source_kernel};
@@ -198,6 +198,7 @@ impl Session {
             .u32(hidden as u32)
             .f32(eps);
         launch(ctx, "dgq_rms_norm", rows(canvas), 256, &mut args)?;
+        arena_store(ctx, &self.bufs.normed, canvas * hidden)?;
         if std::env::var("DGQCUDA_TIME").is_ok() {
             ctx.synchronize()?;
             eprintln!("  [sc] rms ok");
@@ -234,6 +235,7 @@ impl Session {
             256,
             &mut args,
         )?;
+        arena_store(ctx, &self.bufs.mlp_gate, canvas * inter)?;
         r.gemm(
             canvas,
             hidden,
@@ -291,6 +293,7 @@ impl Session {
             .u32(hidden as u32)
             .f32(eps);
         launch(ctx, "dgq_rms_norm_ns", rows(canvas), 256, &mut args)?;
+        arena_store(ctx, &self.bufs.hidden_a, self.seq * hidden)?;
         if std::env::var("DGQCUDA_TIME").is_ok() {
             ctx.synchronize()?;
             eprintln!("  [sc] residual rms ok");
@@ -437,6 +440,7 @@ impl Session {
                 )?;
             }
         }
+        arena_store(&ctx, &self.bufs.hidden_a, self.seq * hidden)?;
         if timing {
             ctx.synchronize()?;
             eprintln!("  [d] embed ok");
@@ -562,6 +566,7 @@ impl Session {
             }
         }
         r.rms(&bufs.hidden_a, &model.final_norm, &bufs.hidden_b, *seq)?;
+        arena_store(&ctx, &bufs.hidden_b, *seq * hidden)?;
         if let Some(pos) = layer_dump {
             ctx.synchronize()?;
             let mut all = vec![0.0f32; *seq * hidden];

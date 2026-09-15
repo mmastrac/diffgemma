@@ -684,6 +684,32 @@ fn attn_dump_write(fields: &[(&str, Vec<f32>)]) {
 /// -- when `DGQCUDA_LAYER_DUMP_JSONL` names a path -- the whole row appended
 /// there as one JSON object, so it can be cosine-compared against the engine's
 /// `step-layer-probe` checkpoints rather than eyeballed four floats at a time.
+/// `DGQCUDA_BF16_ARENA=1`: round every stage output to bf16 precision the way
+/// the engine's arena store does, so the port follows the same trajectory
+/// instead of a more accurate one. Off by default: it costs a launch per stage
+/// and, measured, it does not move the port's agreement with the engine (see
+/// `dgq_round_bf16`), so it is a parity lever rather than a fix.
+fn bf16_arena() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DGQCUDA_BF16_ARENA").is_ok_and(|v| v != "0" && !v.is_empty()))
+}
+
+/// Round `n` elements of `buf` to bf16 precision in place, when the flag is on.
+pub(crate) fn arena_store(
+    ctx: &Context,
+    buf: &DeviceBuffer,
+    n: usize,
+) -> Result<(), crate::config::Error> {
+    if !bf16_arena() {
+        return Ok(());
+    }
+    let mut args = KernelArgs::new();
+    args.device_ptr(buf.device_ptr()).u32(n as u32);
+    launch(ctx, "dgq_round_bf16", flat(n, 256), 256, &mut args)?;
+    Ok(())
+}
+
 /// The K positions both sides sample: prompt rows plus the first canvas rows,
 /// matching the engine `step-attn-dump`'s `k_samples`.
 const K_SAMPLE_POSITIONS: [usize; 22] = [
@@ -754,6 +780,7 @@ pub(crate) fn layer_forward(
         // is past the end there; only the step has a canvas to dump.
         .filter(|&row| row < seq);
     r.rms(&b.hidden_a, &lw.input_layernorm, &b.normed, seq)?;
+    arena_store(ctx, &b.normed, seq * hidden)?;
     let mut dump: Vec<(&str, Vec<f32>)> = Vec::new();
     if let Some(row) = attn_dump {
         ctx.synchronize()?;
@@ -788,6 +815,9 @@ pub(crate) fn layer_forward(
         None => copy_device(ctx, &b.v, &b.k, seq * kv_dim)?,
     }
 
+    arena_store(ctx, &b.q, seq * q_dim)?;
+    arena_store(ctx, &b.k, seq * kv_dim)?;
+    arena_store(ctx, &b.v, seq * kv_dim)?;
     if attn_dump.is_some() {
         ctx.synchronize()?;
         dump.push((
@@ -845,6 +875,9 @@ pub(crate) fn layer_forward(
         &mut args,
     )?;
 
+    arena_store(ctx, &b.q, seq * q_dim)?;
+    arena_store(ctx, &b.k, seq * kv_dim)?;
+    arena_store(ctx, &b.v, seq * kv_dim)?;
     if attn_dump.is_some() {
         ctx.synchronize()?;
         dump.push((
@@ -873,6 +906,8 @@ pub(crate) fn layer_forward(
         .u32(rotary_dim as u32);
     launch(ctx, "dgq_rope", flat(seq * n_kv, 128), 128, &mut args)?;
 
+    arena_store(ctx, &b.q, seq * q_dim)?;
+    arena_store(ctx, &b.k, seq * kv_dim)?;
     if attn_dump.is_some() {
         ctx.synchronize()?;
         dump.push((
@@ -916,6 +951,7 @@ pub(crate) fn layer_forward(
 
     // KV region: [t, n_kv, 2*head_dim] = K then V
     interleave_kv(ctx, &b.k, &b.v, &b.kv, seq, n_kv, head_dim)?;
+    arena_store(ctx, &b.kv, seq * 2 * kv_dim)?;
 
     let mut args = KernelArgs::new();
     args.device_ptr(b.q.device_ptr())
@@ -937,6 +973,7 @@ pub(crate) fn layer_forward(
         &mut args,
     )?;
 
+    arena_store(ctx, &b.attn_out, seq * q_dim)?;
     if let Some(row) = attn_dump {
         ctx.synchronize()?;
         dump.push(("attn_out", attn_dump_row(&b.attn_out, row, q_dim, seq)));
@@ -951,8 +988,10 @@ pub(crate) fn layer_forward(
         lw.o_proj.device_ptr(),
         b.proj_out.device_ptr(),
     )?;
+    arena_store(ctx, &b.proj_out, seq * hidden)?;
     r.rms(&b.proj_out, &lw.post_attention_layernorm, &b.normed, seq)?;
     r.add_in_place(&b.normed, &b.residual, seq * hidden)?;
+    arena_store(ctx, &b.normed, seq * hidden)?;
     r.mark("l:attn");
     if stop_at == 1 {
         return Ok(());
@@ -961,6 +1000,7 @@ pub(crate) fn layer_forward(
     // ---- dense MLP -------------------------------------------------------
     copy_device(ctx, &b.residual, &b.normed, seq * hidden)?;
     r.rms(&b.residual, &lw.pre_feedforward_layernorm, &b.normed, seq)?;
+    arena_store(ctx, &b.normed, seq * hidden)?;
     let inter = t.intermediate_size;
     r.gemm(
         seq,
@@ -978,6 +1018,8 @@ pub(crate) fn layer_forward(
         lw.mlp_up.device_ptr(),
         b.mlp_up.device_ptr(),
     )?;
+    arena_store(ctx, &b.mlp_gate, seq * inter)?;
+    arena_store(ctx, &b.mlp_up, seq * inter)?;
     // out = gelu_tanh(gate) * up, written into mlp_gate
     // (kernel args: gate, up, weight, out, len)
     let mut args = KernelArgs::new();
@@ -994,6 +1036,7 @@ pub(crate) fn layer_forward(
         256,
         &mut args,
     )?;
+    arena_store(ctx, &b.mlp_gate, seq * inter)?;
     r.gemm(
         seq,
         hidden,
@@ -1002,6 +1045,7 @@ pub(crate) fn layer_forward(
         lw.mlp_down.device_ptr(),
         b.mlp_down.device_ptr(),
     )?;
+    arena_store(ctx, &b.mlp_down, seq * hidden)?;
     // CPU oracle: scratch = mlp_down; mlp_down = rms(scratch) * w1; then the
     // dense branch's output is ADDED to normed (which still holds the residual
     // from before the pre-feedforward norm).
@@ -1132,6 +1176,7 @@ pub(crate) fn layer_forward(
             &mut args,
         )?;
     }
+    arena_store(ctx, &b.moe_rows_a, n_rows * hidden)?;
     let gemm_gu = crate::moe_grouped::GroupedGemm::new(hidden, moe_inter * 2, "dgq_moe_gate_up");
     gemm_gu.run(
         ctx,
@@ -1144,6 +1189,7 @@ pub(crate) fn layer_forward(
         n_rows,
         plan.num_jobs(),
     )?;
+    arena_store(ctx, &b.moe_rows_gu, n_rows * moe_inter * 2)?;
     {
         let mut args = KernelArgs::new();
         args.device_ptr(b.moe_rows_gu.device_ptr())
@@ -1161,6 +1207,7 @@ pub(crate) fn layer_forward(
             &mut args,
         )?;
     }
+    arena_store(ctx, &b.moe_rows_act, n_rows * moe_inter)?;
     let gemm_down = crate::moe_grouped::GroupedGemm::new(moe_inter, hidden, "dgq_moe_down");
     gemm_down.run(
         ctx,
@@ -1173,6 +1220,7 @@ pub(crate) fn layer_forward(
         n_rows,
         plan.num_jobs(),
     )?;
+    arena_store(ctx, &b.moe_rows_down, n_rows * hidden)?;
     {
         // One thread per output element, summing that token's rows in ascending
         // row order. `moe_out` needs no pre-zeroing: every element is written.
@@ -1192,6 +1240,7 @@ pub(crate) fn layer_forward(
             &mut args,
         )?;
     }
+    arena_store(ctx, &b.moe_out, seq * hidden)?;
     // The raw MoE output over the canvas rows, before the post-norm folds it
     // back in: directly comparable to `step-moe-route-dump`'s `moe_out_l2`,
     // which is the same quantity over the same rows.
@@ -1224,7 +1273,9 @@ pub(crate) fn layer_forward(
         &b.norm_scratch,
         seq,
     )?;
+    arena_store(ctx, &b.norm_scratch, seq * hidden)?;
     r.add_in_place(&b.norm_scratch, &b.normed, seq * hidden)?;
+    arena_store(ctx, &b.norm_scratch, seq * hidden)?;
     copy_device(ctx, &b.normed, &b.norm_scratch, seq * hidden)?;
     copy_device(ctx, &b.moe_out, &b.norm_scratch, seq * hidden)?;
 
@@ -1233,12 +1284,14 @@ pub(crate) fn layer_forward(
     }
     // ---- output ----------------------------------------------------------
     r.rms(&b.normed, &lw.post_feedforward_layernorm, &b.hidden_b, seq)?;
+    arena_store(ctx, &b.hidden_b, seq * hidden)?;
     r.add_in_place(&b.hidden_b, &b.residual, seq * hidden)?;
     let mut args = KernelArgs::new();
     args.device_ptr(b.hidden_b.device_ptr())
         .f32(lw.layer_scalar)
         .u32((seq * hidden) as u32);
     launch(ctx, "dgq_scale", flat(seq * hidden, 256), 256, &mut args)?;
+    arena_store(ctx, &b.hidden_b, seq * hidden)?;
     Ok(())
 }
 
