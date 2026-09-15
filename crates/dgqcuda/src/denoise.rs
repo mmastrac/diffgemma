@@ -15,6 +15,8 @@ pub const ARGMAX_HIST_MAX: usize = 8;
 pub const ACCEPT_PLATEAU_THRESHOLD: usize = 8;
 /// Minimum denoise steps before a confident/plateau early stop may fire.
 pub const MIN_EARLY_STOP_STEPS: usize = 12;
+/// Non-degenerate argmax positions that let early stop fire before that floor.
+pub const MIN_REAL_ARGMAX_POSITIONS: usize = 8;
 /// Plateau backstop also needs the mean entropy below this.
 pub const PLATEAU_MAX_PREFIX_MEAN: f32 = 0.05;
 
@@ -337,8 +339,14 @@ impl DenoiseState {
 
         // Early stop needs a floor on the steps taken, so a degenerate or
         // barely-denoised canvas cannot stop the loop early.
+        // The engine's `sample::early_stop_allowed`: the step floor is an OR,
+        // not an AND. A canvas that has already resolved enough real positions
+        // may stop before step 12. Requiring both kept the port running to
+        // step 12 on a prompt the engine finished in 3.
         let degenerate = argmax_is_degenerate(&self.argmax);
-        let early_ok = cur_step >= MIN_EARLY_STOP_STEPS && !degenerate;
+        let real = self.argmax.iter().filter(|&&t| is_active_token(t)).count();
+        let early_ok =
+            !degenerate && (cur_step >= MIN_EARLY_STOP_STEPS || real >= MIN_REAL_ARGMAX_POSITIONS);
         let confident = early_ok && canvas_stable && mean_entropy < self.cfg.confidence_threshold;
         let plateau = early_ok
             && self.accept_plateau >= self.cfg.accept_plateau_threshold as u32
