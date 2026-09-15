@@ -274,6 +274,43 @@ clears 0.641 by a lot.
   (`--prompt`, tokenizer + chat template), and the remaining port is the same
   quantized-GEMM treatment for the attention/dense weights.
 
+  **Where the port stands.** The entries below this one are a chronological
+  hunt and most of them are disproofs; read this first.
+
+  Four real defects have been found and fixed, all in the port:
+
+    1. the step re-applied the layer stack to the prompt rows (below)
+    2. `dgq_moe_scatter` accumulated with atomicAdd, so the port was not
+       deterministic against itself (below)
+    3. the dense MLP ADDED where the oracle overwrites, which put an extra
+       rms(residual, pre_ff) term in every layer of every row
+    4. the reply was decoded from the sampled canvas `ids` instead of the
+       argmax canvas, so any row the accept mask declined emitted a uniform
+       random token
+
+  Plus one behavioural mismatch: the early-stop floor was an AND where
+  `sample::early_stop_allowed` has an OR, so the port could not stop before
+  step 12 and burned nine steps on a resolved canvas.
+
+  State after all of that, measured end to end against the engine on four
+  smoketest prompts x seeds {7,42,123}: the port reproduces the engine's reply
+  EXACTLY on short convergent answers and never on long trajectory-sensitive
+  ones. Every decoder layer body is exact on synthetic input (cos >= 0.9999999
+  at layers 0, 5, 15, 23, 29, both attention kinds), so what remains is not a
+  wrong kernel.
+
+  What is still open:
+
+    - Long answers. 0/6 on the haiku and list prompts, in both arena arms, at
+      every seed. p2/p3 take 6-9 denoise steps against p0/p1's 2-5.
+    - Per-row K drift at depth. Some prompt rows reproduce the engine through
+      all 30 layers (position 3 is cos 0.9997 at layer 29) and others are
+      destroyed (position 4 is 0.0525). Uniform across rows it is not.
+    - The engine's f32->bf16 store truncation is a real, deliberate
+      arithmetic difference the port does not share. `DGQCUDA_BF16_ARENA=trunc`
+      reproduces it; whether the port SHOULD is a bit-compatibility-vs-accuracy
+      call nobody has made.
+
   **Fixed: the step re-applied the layer stack to the prompt rows.** The port
   has no resident KV cache, so each step runs `[prompt][canvas]` through the
   layers and rebuilds the prompt's K/V that way. It seeded the prompt rows
