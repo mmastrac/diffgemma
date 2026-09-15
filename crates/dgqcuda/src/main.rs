@@ -552,16 +552,36 @@ fn run(args: &Args) -> Result<(), config::Error> {
                         *v = (*v / cap).tanh() * cap;
                     }
                 }
-                if let Some(path) = args.dump_step.as_ref().filter(|_| step_no == 0) {
-                    dump_step_json(
-                        path,
-                        &st.ids,
-                        &logits,
-                        t.vocab_size,
-                        prompt,
-                        args.prompt.as_deref().unwrap_or(""),
-                        None,
-                    )?;
+                // `--dump-step PATH` writes step 1 to PATH.
+                // `DGQCUDA_DUMP_STEP_ALL=1` also writes every later step, to
+                // PATH with `.stepN` inserted before the extension. A defect
+                // that appears BETWEEN steps is invisible in a step-1 dump,
+                // and step 1 is all either side could dump until now -- the
+                // engine's `step-logits-dump --steps N` runs one forward
+                // whatever N says, and this filter did the same here.
+                if let Some(path) = args.dump_step.as_ref() {
+                    let all = std::env::var("DGQCUDA_DUMP_STEP_ALL").as_deref() == Ok("1");
+                    let target = if step_no == 0 {
+                        Some(path.clone())
+                    } else if all {
+                        Some(match path.rsplit_once('.') {
+                            Some((stem, ext)) => format!("{stem}.step{}.{ext}", step_no + 1),
+                            None => format!("{path}.step{}", step_no + 1),
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(target) = target {
+                        dump_step_json(
+                            &target,
+                            &st.ids,
+                            &logits,
+                            t.vocab_size,
+                            prompt,
+                            args.prompt.as_deref().unwrap_or(""),
+                            None,
+                        )?;
+                    }
                 }
                 step_no += 1;
                 sess.set_prev_logits(&logits)?;
