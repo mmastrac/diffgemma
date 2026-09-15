@@ -263,6 +263,13 @@ pub struct PreambleCapture {
     pub kv_len: u32,
     pub embed_scaled: Vec<f32>,
     pub after_preamble: Vec<f32>,
+    /// The SC MLP's own output for this row (`dense_off`). `EmbedScResidual`
+    /// sums it with `embed_scaled`, and `RmsNormHidden` then normalizes in
+    /// place, so this is the only way to see the pre-norm sum: the norm
+    /// overwrites it. A port whose SC output has the wrong MAGNITUDE looks
+    /// identical after a scale-free norm except for what eps does, which is
+    /// far too small a signal to bisect against.
+    pub sc_dense: Vec<f32>,
 }
 
 /// Step-1 preamble hidden at one canvas row (embed gather + no-scale RMSNorm).
@@ -286,6 +293,7 @@ pub fn run_step_preamble_capture(
     })?;
     let after_preamble =
         read_arena_hidden_row(&rt.bufs.arena, rt.bufs.arena_map.hidden_off(), position);
+    let sc_dense = read_arena_hidden_row(&rt.bufs.arena, rt.bufs.arena_map.dense_off(), position);
 
     let state = rt.read_canvas_state();
     Ok(PreambleCapture {
@@ -295,6 +303,7 @@ pub fn run_step_preamble_capture(
         kv_len: rt.read_params().kv_len,
         embed_scaled,
         after_preamble,
+        sc_dense,
     })
 }
 

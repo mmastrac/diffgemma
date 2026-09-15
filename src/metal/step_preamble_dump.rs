@@ -19,6 +19,8 @@ pub struct StepPreambleDump {
     pub canvas_token: u32,
     pub kv_len: u32,
     /// `embed_tokens(id) * sqrt(hidden)` before self-conditioning / no-scale norm.
+    pub sc_dense: Vec<f32>,
+    pub sc_dense_l2: f32,
     pub embed_scaled: Vec<f32>,
     pub embed_scaled_l2: f32,
     pub embed_scaled_max_abs: f32,
@@ -52,6 +54,8 @@ fn dump_from_capture(
         position: cap.position,
         canvas_token: cap.canvas_token,
         kv_len: cap.kv_len,
+        sc_dense: cap.sc_dense.clone(),
+        sc_dense_l2: vec_l2(&cap.sc_dense),
         embed_scaled: cap.embed_scaled.clone(),
         embed_scaled_l2: vec_l2(&cap.embed_scaled),
         embed_scaled_max_abs: vec_max_abs(&cap.embed_scaled),

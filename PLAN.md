@@ -506,30 +506,37 @@ clears 0.641 by a lot.
   scale-free norm and its eps (both 1e-6; the port's `rms_norm_eps` is a
   required serde field that parses from the pack).
 
-  **A separate and larger discrepancy is in the step-1 SC MLP.** The port's
-  `after_preamble` is EXACTLY unit RMS (53.0660 = sqrt(2816)); the engine's is
-  0.279% below it (52.9182), and bf16 readback accounts for only 0.0008% of
-  that. In a scale-free norm the only mechanism that yields a non-unit output
-  is eps, so the engine's pre-norm sum must have RMS ~0.0134 -- against an
-  `embed_scaled` of RMS 1.238, meaning its SC MLP output cancels the embedding
-  to about 1%. The port's pre-norm sum is measured, not inferred:
+  **Retracted: there is no 6x in the step-1 SC MLP.** An earlier reading here
+  inferred the engine's pre-norm sum from its `after_preamble` RMS deficit, on
+  the reasoning that eps is the only thing that can make a scale-free norm miss
+  unity. That put the engine's sum at RMS 0.0134 and the port's SC output at
+  ~6.4x the engine's. The engine's preamble dump now carries `sc_dense`, so the
+  sum can be MEASURED as `embed_scaled + sc_dense` instead, and it is not close:
 
-    port   preamble_pre_norm  l2 356.866 (RMS 6.725)  [4.919, -2.226, -6.819, 1.581]
-    engine same row, derived  RMS 0.0134              [0.0097, -0.0044, -0.0135, 0.0032]
+    engine  embed_scaled    rms 1.23791
+    engine  sc_dense        rms 6.18777
+    engine  sum (pre-norm)  rms 6.61901   <- inferred 0.01336, wrong by 500x
+    port    sum (pre-norm)  rms 6.72500   <- ratio 1.02x, not 6.4x
 
-  Same direction -- which is why the post-norm rows still agree at cos
-  0.999988 -- but ~503x the magnitude. Both start from a bit-identical
-  embedding, so the port's SC MLP output is about 6.4x the engine's
-  (port `down` ~ embed x -6.43, engine ~ embed x -1.011).
+  The port's SC output is about 2% large, in line with everything else, and the
+  inference was worthless because with the real sum eps/m is 2e-8. Do not
+  back-solve a magnitude through a scale-free norm; dump the operand.
 
-  CAUTION on that comparison: the engine's pre-norm magnitude is INFERRED from
-  the eps deficit, not measured. Confirm it before acting -- dump the engine's
-  `hidden_off` and `dense_off` immediately before `RmsNormHidden` and compare
-  `dense_off` against the port's `mlp_down` directly. If it holds, bisect the
-  SC MLP itself (normed -> gate -> up -> glu -> down); every formula around it
-  has already been eliminated. It matters beyond the 0.28%: from step 2 on the
-  SC signal is the soft embedding of the previous logits, and a 6x-oversized
-  MLP output stops being a near-parallel scale the norm can hide.
+  **Open, engine-side: its scale-free norm returns 0.9972, not 1.** Renormalizing
+  the engine's own `embed_scaled + sc_dense` in f32 gives l2 53.0660 (unit RMS,
+  as it must) where the engine's `after_preamble` is 52.9182. The two are
+  parallel (cos 0.9999968) and the ratio is a near-uniform 0.997215, with
+  per-element ratios spread 0.989-1.002 around a median of 0.9977. bf16 and f16
+  rounding of the sum both reproduce l2 53.066, so storage does not explain it,
+  and eps cannot at this magnitude. RMS_EPS is 1e-6, `w_off` is 0 so no weight
+  is applied, and the reduction is a normal simd_sum tree. Cause unidentified.
+
+  Note what that makes the pattern: the engine's GPU sits BELOW exact math
+  wherever it has been measured -- -1.34% on the layer-0 MoE against its own
+  f32 oracle, -0.28% on this norm -- while the port computes the exact f32
+  answer. Reproducing the engine therefore means matching its ARITHMETIC, not
+  being more accurate than it. The port's +0.79% on the MoE is the one
+  discrepancy so far that points the other way and is the port's own.
 
   The remaining MoE bias is likelier to be a BIAS than noise. The port's layer-0 MoE output is
   cos 0.9999694 against the engine with l2 ratio 1.0214 -- same direction, 2.1%
