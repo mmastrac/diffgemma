@@ -515,12 +515,39 @@ clears 0.641 by a lot.
   reproducing the wrong one of the two. This is the AGENTS.md class exactly:
   "the fast-prefill encoder running a denoise-only norm".
 
-  Next, and it needs no canvas: get the engine's ENCODER prefill hidden per
-  layer for a prompt row and diff it against the port's, or run the engine's two
-  prefill paths against each other and see whether THEY agree. `step-kv-parity`
-  does not answer this -- it defaults to `layers: 1` and compares two runs of
-  the same path, so it is a determinism check, and it passes at max_kv_diff
-  0.000000 while this divergence is live.
+  **Disproved: the engine's two prefill paths agree.** `DGQ_FAST_PREFILL=0|1`
+  forces the monolithic encoder or the step-kernel chunked path (the default is
+  a length band, >256 tokens, so a 20-token prompt had only ever taken the
+  encoder). Dumping layer-1 K under both and comparing them to each other:
+
+    prompt positions 0-19   cos 0.999992 to 0.999998
+
+  They are the same answer. So the port is NOT reproducing the wrong one of two
+  prefills, and the encoder-vs-denoise reading above is wrong. Note the trap in
+  that comparison: position 20 reads cos 0.673 and the canvas-row stages read
+  0.49-0.79, but those are artifacts -- fast prefill streams the prompt through
+  the CANVAS ids plane and clobbers the seeded canvas, which `diag_probe`'s own
+  comment documents. Only positions < kv_len carry signal.
+
+  So two explanations are now eliminated by measurement: arithmetic precision
+  (1700x too small) and prefill-path confusion (the paths agree). What remains
+  for layer 0 on prompt rows is the layer body itself -- attention under the
+  causal mask, the dense FFN, or the MoE -- and the port's attention has only
+  ever been checked on a CANVAS row (cos 0.999984 at layer 0), never on a
+  causal prompt row.
+
+  Next: split layer 0 for a PROMPT row. `DGQCUDA_ATTN_DUMP` is canvas-relative
+  (`row = DGQCUDA_ATTN_ROW + causal_split`), so in the prefill, where
+  `causal_split == seq`, every row it can name is out of range and the dump
+  never fires -- it needs an absolute-row mode before it can be pointed at a
+  prompt row. Pair that with the engine's `hidden_in` for the same row, which
+  no dump currently exposes for prompt positions: `step-attn-dump` reports
+  `hidden_in`/`hidden_ln`/`q_*`/`attn_out` for a CANVAS row only, and
+  `k_samples` is the sole prompt-row quantity it carries.
+
+  `step-kv-parity` does not cover any of this -- it defaults to `layers: 1` and
+  compares two runs of the same path, so it is a determinism check, and it
+  passes at max_kv_diff 0.000000 while this divergence is live.
 
   **The 2.1% MoE gap decomposes, and both sides are off.** The engine's route
   dump now reports its CPU oracle's own magnitude, not just its distance from
