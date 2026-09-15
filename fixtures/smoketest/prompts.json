@@ -971,7 +971,7 @@
           "gas"
         ]
       ],
-      "max_steps": 60
+      "max_steps": 90
     },
     {
       "id": "transformer",
@@ -1008,7 +1008,7 @@
           "positional"
         ]
       ],
-      "max_steps": 60
+      "max_steps": 90
     },
     {
       "id": "hash_table",
@@ -1046,7 +1046,7 @@
           "collisions"
         ]
       ],
-      "max_steps": 60
+      "max_steps": 90
     },
     {
       "id": "tcp_udp",
