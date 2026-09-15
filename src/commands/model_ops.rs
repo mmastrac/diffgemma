@@ -492,11 +492,22 @@ pub(crate) fn run_attention_parity(m: &model::Model) -> ExitCode {
 pub(crate) fn run_layer0_forward(m: &model::Model) -> ExitCode {
     const SEQ_LEN: usize = 16;
     let hidden = m.config.text_config.hidden_size;
+    // `DGQ_LAYER0_INDEX=<n>` runs layer n instead of layer 0 on the same
+    // synthetic input. Layer 0 is the natural place to start because nothing
+    // upstream can have drifted, but once it matches, the same isolation is
+    // what narrows a deeper layer: the input is still synthetic, so a deep
+    // layer's divergence cannot be inherited from the layers above it.
+    let n_layers = m.config.text_config.num_hidden_layers;
+    let layer = std::env::var("DGQ_LAYER0_INDEX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(n_layers - 1);
 
     // A quantized pack stores the experts as q4, which no CPU path reads
     // directly. Widen them once up front and lend them to the layer.
     let planes = if m.weights.is_quantized() {
-        match model::layer_weights::ExpertPlanes::load(&m.weights, 0, &m.config.text_config) {
+        match model::layer_weights::ExpertPlanes::load(&m.weights, layer, &m.config.text_config) {
             Ok(planes) => Some(planes),
             Err(err) => {
                 eprintln!("error: {err}");
@@ -510,16 +521,18 @@ pub(crate) fn run_layer0_forward(m: &model::Model) -> ExitCode {
     let loaded = match &planes {
         Some(planes) => model::layer_weights::DecoderLayerWeights::load_with_experts(
             &m.weights,
-            0,
+            layer,
             &m.config.text_config,
             planes,
         ),
-        None => {
-            model::layer_weights::DecoderLayerWeights::load(&m.weights, 0, &m.config.text_config)
-        }
+        None => model::layer_weights::DecoderLayerWeights::load(
+            &m.weights,
+            layer,
+            &m.config.text_config,
+        ),
     };
-    let layer = match loaded {
-        Ok(layer) => layer,
+    let weights = match loaded {
+        Ok(weights) => weights,
         Err(err) => {
             eprintln!("error: {err}");
             return ExitCode::FAILURE;
@@ -527,7 +540,8 @@ pub(crate) fn run_layer0_forward(m: &model::Model) -> ExitCode {
     };
 
     let mut scratch =
-        match model::decoder_layer::DecoderLayerScratch::new(SEQ_LEN, &m.config.text_config, 0) {
+        match model::decoder_layer::DecoderLayerScratch::new(SEQ_LEN, &m.config.text_config, layer)
+        {
             Ok(scratch) => scratch,
             Err(err) => {
                 eprintln!("error: {err}");
@@ -542,14 +556,14 @@ pub(crate) fn run_layer0_forward(m: &model::Model) -> ExitCode {
     }
     let positions: Vec<i64> = (0..SEQ_LEN as i64).collect();
 
-    eprintln!("running decoder layer 0 forward (seq={SEQ_LEN}, hidden={hidden})...");
+    eprintln!("running decoder layer {layer} forward (seq={SEQ_LEN}, hidden={hidden})...");
     let started = std::time::Instant::now();
     match model::decoder_layer::forward(
         &mut output,
         &input,
-        &layer,
+        &weights,
         &m.config.text_config,
-        0,
+        layer,
         SEQ_LEN,
         &positions,
         &mut scratch,
@@ -578,7 +592,9 @@ pub(crate) fn run_layer0_forward(m: &model::Model) -> ExitCode {
                     field("hidden_in", take(&input)),
                     field("attn_out", take(&scratch.attn_out)),
                     field("output", take(&output)),
-                    format!("\"seq_len\":{SEQ_LEN},\"row\":{row},\"hidden\":{hidden}"),
+                    format!(
+                        "\"seq_len\":{SEQ_LEN},\"row\":{row},\"hidden\":{hidden},\"layer\":{layer}"
+                    ),
                 ]
                 .join(",");
                 if let Err(e) = std::fs::write(&path, format!("{{{body}}}")) {
@@ -587,7 +603,7 @@ pub(crate) fn run_layer0_forward(m: &model::Model) -> ExitCode {
                     eprintln!("wrote {path} (row {row})");
                 }
             }
-            println!("decoder layer 0 forward ok");
+            println!("decoder layer {layer} forward ok");
             println!("  output shape: [{SEQ_LEN}, {hidden}]");
             println!("  elapsed: {:.2?}", started.elapsed());
             println!(

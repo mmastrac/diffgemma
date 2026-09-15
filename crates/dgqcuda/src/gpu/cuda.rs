@@ -1364,9 +1364,12 @@ pub fn layer0_synthetic(
     w: &Weights,
     cfg: &ModelConfig,
     row: usize,
+    layer: usize,
 ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), Error> {
     const SEQ: usize = 16;
-    let model = GpuModel::load(w, cfg, Some(1))?;
+    // Layers load from 0, so reaching layer n costs n+1 layers of load time.
+    // Only layer n runs.
+    let model = GpuModel::load(w, cfg, Some(layer + 1))?;
     let ctx = model.ctx.clone();
     let hidden = cfg.text_config.hidden_size;
     let mut b = Bufs::new(SEQ, cfg, &ctx)?;
@@ -1382,10 +1385,10 @@ pub fn layer0_synthetic(
         .map(|i| ((i % hidden) as f32) * 0.01 - 0.5)
         .collect();
     b.hidden_a.write_f32(&input)?;
-    layer_forward(&r, &mut b, &model.layers[0], 0, 0)?;
+    layer_forward(&r, &mut b, &model.layers[layer], layer, 0)?;
     ctx.synchronize()?;
-    let mut attn =
-        vec![0.0f32; SEQ * cfg.text_config.num_attention_heads * cfg.text_config.head_dim];
+    let (_, head_dim, ..) = cfg.text_config.attn_geometry(layer);
+    let mut attn = vec![0.0f32; SEQ * cfg.text_config.num_attention_heads * head_dim];
     b.attn_out.read_f32(&mut attn)?;
     let mut out = vec![0.0f32; SEQ * hidden];
     b.hidden_b.read_f32(&mut out)?;

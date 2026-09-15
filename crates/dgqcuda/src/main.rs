@@ -718,7 +718,11 @@ fn run(args: &Args) -> Result<(), config::Error> {
         // body-vs-body comparison against `diffgemma layer0`.
         "layer0" => {
             let row = args.only_row.unwrap_or(0);
-            let (hin, attn, out) = gpu::layer0_synthetic(&w, &cfg, row)?;
+            // `--at <n>` picks the layer, matching the engine's
+            // `DGQ_LAYER0_INDEX`. The input is synthetic at every layer, so a
+            // deep layer's divergence here is its own and not inherited.
+            let layer = (args.at as usize).min(cfg.text_config.num_hidden_layers - 1);
+            let (hin, attn, out) = gpu::layer0_synthetic(&w, &cfg, row, layer)?;
             let field = |name: &str, v: &[f32]| {
                 let vals: Vec<String> = v.iter().map(|x| format!("{x}")).collect();
                 format!("\"{name}\":[{}]", vals.join(","))
@@ -729,11 +733,11 @@ fn run(args: &Args) -> Result<(), config::Error> {
                 field("hidden_in", &hin),
                 field("attn_out", &attn),
                 field("output", &out),
-                format!("\"row\":{row}"),
+                format!("\"row\":{row},\"layer\":{layer}"),
             ]
             .join(",");
             std::fs::write(&path, format!("{{{body}}}"))?;
-            eprintln!("wrote {path} (row {row})");
+            eprintln!("wrote {path} (layer {layer}, row {row})");
             println!("  output[0..4]: {:?}", &out[..4]);
         }
         "gemm-probe" => {
