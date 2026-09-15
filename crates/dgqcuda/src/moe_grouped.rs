@@ -1,7 +1,9 @@
 //! Grouped MoE expert GEMM (q4 weights): kernels, the host-side bucket layout,
 //! and a CPU oracle the tier-1 test pins them to.
 
+#[cfg(feature = "cuda")]
 use crate::config::Error;
+#[cfg(feature = "cuda")]
 use gpukit::cuda::{Context, DeviceBuffer, KernelArgs, cached_source_kernel};
 
 /// The grouped-MoE kernel source, compiled by NVRTC on first use.
@@ -133,6 +135,7 @@ impl GroupedPlan {
 /// A grouped GEMM shape: the expert-major input rows, the q4 expert weights
 /// (`[n_experts, n_dim, k_dim]` rows of q4), and the plan mapping rows back to
 /// tokens.
+#[cfg(feature = "cuda")]
 pub struct GroupedGemm {
     pub k_dim: usize,
     pub n_dim: usize,
@@ -141,6 +144,7 @@ pub struct GroupedGemm {
     pub entry: &'static str,
 }
 
+#[cfg(feature = "cuda")]
 impl GroupedGemm {
     /// `entry` selects the kernel entry; the gate/up and down bodies differ
     /// only in how the A rows are indexed.
@@ -188,6 +192,7 @@ impl GroupedGemm {
     }
 }
 
+#[cfg(feature = "cuda")]
 pub fn upload_u32(ctx: &Context, data: &[u32]) -> Result<DeviceBuffer, Error> {
     let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 4) };
     let b = DeviceBuffer::alloc(ctx, data.len().max(1) * 4)?;

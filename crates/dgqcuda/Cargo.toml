@@ -12,6 +12,9 @@ path = "src/lib.rs"
 [[bin]]
 name = "dgqcuda"
 path = "src/main.rs"
+# The CLI is device-only. The lib is not, so the CPU oracle and its tests
+# still build on a machine with no CUDA.
+required-features = ["cuda"]
 
 [features]
 default = []

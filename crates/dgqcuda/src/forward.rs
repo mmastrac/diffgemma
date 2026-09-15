@@ -431,19 +431,18 @@ fn layer_forward_at(
         hidden,
     );
     b.norm_scratch.copy_from_slice(&b.mlp_down);
+    // normed = rms(dense_out) * w1, OVERWRITING the pre-feedforward norm that
+    // was the GEMM input. The MoE branch is added to this below; the residual
+    // rejoins at the layer output. This mirrored the CUDA path's add, so the
+    // parity test compared two copies of the same mistake.
     rms_norm_rows(
-        &mut b.mlp_down,
+        &mut b.normed,
         &b.norm_scratch,
         &lw.post_feedforward_layernorm_1,
         seq,
         hidden,
         eps,
     );
-    // The dense branch's output is added to normed (which still holds the
-    // residual from before the pre-feedforward norm).
-    for i in 0..b.normed.len() {
-        b.normed[i] += b.mlp_down[i];
-    }
 
     if stop_at == 2 {
         return;
@@ -455,8 +454,8 @@ fn layer_forward_at(
         let row = &b.residual[off..off + hidden];
         let sum_sq: f32 = row.iter().map(|v| v * v).sum();
         let inv = 1.0 / (sum_sq / hidden as f32 + eps).sqrt();
-        // Router input goes in its own buffer: normed now holds the layer's
-        // running residual and must survive until the final output norm.
+        // Router input goes in its own buffer: normed now holds the dense
+        // branch and must survive until the final output norm.
         for i in 0..hidden {
             b.router_input[off + i] = row[i] * inv * lw.router_scale[i] * root;
         }
