@@ -484,7 +484,54 @@ clears 0.641 by a lot.
   into the prompt rows from a bit-identical start. That is the per-layer seed,
   it is measurable in 43 seconds, and everything downstream is it compounding.
 
-  The likeliest cause is a BIAS, not noise. The port's layer-0 MoE output is
+  **The 2.1% MoE gap decomposes, and both sides are off.** The engine's route
+  dump now reports its CPU oracle's own magnitude, not just its distance from
+  the GPU, which is what says WHICH side is wrong. Layer 0, canvas l2:
+
+    engine GPU (Metal, bf16)   82.4949    -1.34% vs the oracle
+    engine CPU oracle (f32)    83.6482
+    port    GPU (CUDA,  f32)   84.4968    +0.79% vs the oracle
+
+  (1.0134 x 1.0079 = 1.0214.) So it is NOT "the port is exact and the engine is
+  lossy". The engine's -1.34% is its own bf16 accumulation, which the port
+  neither can nor should reproduce; the port's +0.79% against the same f32
+  oracle is its own bug and is the number to fix.
+
+  Ruled out for that +0.79%, by reading the engine's source against the port's:
+  the q4 decode (`delta * q + min`, same nibble order, in both the shared Rust
+  decode and the port's CUDA `moe_q4_at`), GELU (the coefficients differ by
+  under one ulp), the gate/up split, the routing-weight formula (both
+  `softmax(top_k) * per_expert_scale`, no renormalization), the residual
+  (`scal_off` is a blob offset, 0 means scale 1, so it is a plain sum), and the
+  scale-free norm and its eps (both 1e-6; the port's `rms_norm_eps` is a
+  required serde field that parses from the pack).
+
+  **A separate and larger discrepancy is in the step-1 SC MLP.** The port's
+  `after_preamble` is EXACTLY unit RMS (53.0660 = sqrt(2816)); the engine's is
+  0.279% below it (52.9182), and bf16 readback accounts for only 0.0008% of
+  that. In a scale-free norm the only mechanism that yields a non-unit output
+  is eps, so the engine's pre-norm sum must have RMS ~0.0134 -- against an
+  `embed_scaled` of RMS 1.238, meaning its SC MLP output cancels the embedding
+  to about 1%. The port's pre-norm sum is measured, not inferred:
+
+    port   preamble_pre_norm  l2 356.866 (RMS 6.725)  [4.919, -2.226, -6.819, 1.581]
+    engine same row, derived  RMS 0.0134              [0.0097, -0.0044, -0.0135, 0.0032]
+
+  Same direction -- which is why the post-norm rows still agree at cos
+  0.999988 -- but ~503x the magnitude. Both start from a bit-identical
+  embedding, so the port's SC MLP output is about 6.4x the engine's
+  (port `down` ~ embed x -6.43, engine ~ embed x -1.011).
+
+  CAUTION on that comparison: the engine's pre-norm magnitude is INFERRED from
+  the eps deficit, not measured. Confirm it before acting -- dump the engine's
+  `hidden_off` and `dense_off` immediately before `RmsNormHidden` and compare
+  `dense_off` against the port's `mlp_down` directly. If it holds, bisect the
+  SC MLP itself (normed -> gate -> up -> glu -> down); every formula around it
+  has already been eliminated. It matters beyond the 0.28%: from step 2 on the
+  SC signal is the soft embedding of the previous logits, and a 6x-oversized
+  MLP output stops being a near-parallel scale the norm can hide.
+
+  The remaining MoE bias is likelier to be a BIAS than noise. The port's layer-0 MoE output is
   cos 0.9999694 against the engine with l2 ratio 1.0214 -- same direction, 2.1%
   large -- and a systematic 2% per layer compounds (1.02^30 = 1.8x), which is
   the shape of the residual l2 ratios through the middle layers. Unbiased

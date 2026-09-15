@@ -264,6 +264,23 @@ impl Session {
             ctx.synchronize()?;
             eprintln!("  [sc] add ok");
         }
+        // The sum BEFORE the scale-free norm. Its magnitude is what decides how
+        // much the norm's eps bites: the engine's `after_preamble` comes out at
+        // 0.279% BELOW unit RMS, which back-solves to a pre-norm RMS of ~0.013
+        // against an embedding of RMS 1.238, so on that side the SC MLP very
+        // nearly cancels the embedding. The port's comes out at exactly unit
+        // RMS, so its sum cannot be anywhere near that small.
+        if let Some(pos) = std::env::var("DGQCUDA_LAYER_DUMP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&p| p < canvas)
+        {
+            ctx.synchronize()?;
+            let mut all = vec![0.0f32; self.seq * hidden];
+            self.bufs.hidden_a.read_f32(&mut all)?;
+            let off = base + pos * hidden;
+            emit_layer_checkpoint("preamble_pre_norm", &all[off..off + hidden]);
+        }
         // Scale-free norm: a dedicated entry, because the weighted kernel with
         // a null weight pointer faults and with `pre_norm` would apply the
         // wrong weight.

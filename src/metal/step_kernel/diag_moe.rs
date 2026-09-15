@@ -272,6 +272,8 @@ pub struct MoeRouteCapture {
     /// Canvas row 0 of the raw MoE output, so a port can compare the vector
     /// and not just its norm: a scale error and a rotation both move `l2`.
     pub moe_out_row0: Vec<f32>,
+    pub moe_out_cpu_l2: Option<f32>,
+    pub moe_out_cpu_row0: Vec<f32>,
 }
 
 fn read_scratch_f32(
@@ -443,6 +445,11 @@ pub fn run_step_moe_route_capture(
     let moe_out_cpu = read_f32_arena(&rt.bufs.arena, rt.bufs.arena_map.moeout_off(), CANVAS * HID);
     let moe_out_gpu_cpu_cos = Some(cosine_f32(&moe_out_gpu, &moe_out_cpu));
     let moe_out_gpu_cpu_rel_l2 = Some(rel_l2_f32(&moe_out_cpu, &moe_out_gpu));
+    // The oracle's own magnitude, not just its distance from the GPU. A
+    // rel_l2 says the two disagree; it does not say WHICH of them is off, and
+    // for a port that reproduces exact f32 math that is the whole question.
+    let moe_out_cpu_l2 = Some(vector_l2(&moe_out_cpu));
+    let moe_out_cpu_row0 = moe_out_cpu[..HID.min(moe_out_cpu.len())].to_vec();
 
     Ok(MoeRouteCapture {
         layer,
@@ -456,6 +463,8 @@ pub fn run_step_moe_route_capture(
         moe_out_gpu_cpu_cos,
         moe_out_gpu_cpu_rel_l2,
         moe_out_row0,
+        moe_out_cpu_l2,
+        moe_out_cpu_row0,
     })
 }
 

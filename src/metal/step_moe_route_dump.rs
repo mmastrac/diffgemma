@@ -33,6 +33,8 @@ pub struct StepMoeRouteDump {
     pub moe_out_gpu_cpu_cos: Option<f32>,
     pub moe_out_gpu_cpu_rel_l2: Option<f32>,
     pub moe_out_row0: Vec<f32>,
+    pub moe_out_cpu_l2: Option<f32>,
+    pub moe_out_cpu_row0: Vec<f32>,
 }
 
 impl StepMoeRouteDump {
@@ -65,6 +67,8 @@ impl StepMoeRouteDump {
             moe_out_gpu_cpu_cos: cap.moe_out_gpu_cpu_cos,
             moe_out_gpu_cpu_rel_l2: cap.moe_out_gpu_cpu_rel_l2,
             moe_out_row0: cap.moe_out_row0.clone(),
+            moe_out_cpu_l2: cap.moe_out_cpu_l2,
+            moe_out_cpu_row0: cap.moe_out_cpu_row0.clone(),
         }
     }
 }
