@@ -484,6 +484,44 @@ clears 0.641 by a lot.
   into the prompt rows from a bit-identical start. That is the per-layer seed,
   it is measurable in 43 seconds, and everything downstream is it compounding.
 
+  **Ruled out: arithmetic precision, by 1700x.** The two `DGQCUDA_BF16_ARENA`
+  arms differ by a bf16-sized perturbation of every activation -- the size of
+  the engine's own rounding -- so comparing them to EACH OTHER measures how much
+  the port amplifies a known-small perturbation:
+
+    layer   K cos(f32, bf16)   K cos(port, engine)
+        1          0.9999947             0.9908709
+       20          0.9997162             0.8335219
+
+  At layer 1 the port-vs-engine gap is 9.1e-3 of (1-cos) where a full bf16
+  perturbation produces 5.3e-6 -- 1700x smaller. Precision cannot be the
+  explanation, and the whole "small seed amplified at 1.2x/layer" story
+  recorded above is wrong for the prompt path: layer 0 computes a materially
+  different function. (The K path itself only amplifies (1-cos) about 2.6x, so
+  the hidden after layer 0 sits near cos 0.9965.)
+
+  **Which points at encoder-vs-denoise, not at a kernel.** The port has ONE
+  `layer_forward`, differing only in the mask, and it is compared against two
+  DIFFERENT engine paths:
+
+    canvas rows   reference = the engine's denoise step      layer 0 cos 0.999602
+    prompt rows   reference = the engine's encoder prefill   layer 0 cos ~0.9965
+
+  Same port code, 9x worse against the encoder. The engine has more than one
+  prefill implementation -- the monolithic encoder (which wrote the KV every
+  reference dump here was taken from, per its "monolithic-prefill" log line) and
+  a step-kernel chunked path that runs the prompt through the denoise stack
+  (`encode_prefill_chunk`). The port mirrors the denoise stack, so it is
+  reproducing the wrong one of the two. This is the AGENTS.md class exactly:
+  "the fast-prefill encoder running a denoise-only norm".
+
+  Next, and it needs no canvas: get the engine's ENCODER prefill hidden per
+  layer for a prompt row and diff it against the port's, or run the engine's two
+  prefill paths against each other and see whether THEY agree. `step-kv-parity`
+  does not answer this -- it defaults to `layers: 1` and compares two runs of
+  the same path, so it is a determinism check, and it passes at max_kv_diff
+  0.000000 while this divergence is live.
+
   **The 2.1% MoE gap decomposes, and both sides are off.** The engine's route
   dump now reports its CPU oracle's own magnitude, not just its distance from
   the GPU, which is what says WHICH side is wrong. Layer 0, canvas l2:
