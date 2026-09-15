@@ -746,6 +746,56 @@ clears 0.641 by a lot.
   two tensors dequantized, and that was filed as a blocker rather than done.
   `ExpertPlanes` is 60 lines.
 
+  **The fix is a strict improvement at every layer, and it is not the whole
+  divergence.** One binary, both arms behind a temporary env switch, each arm
+  against the SAME engine dump per layer (prefill K, 20 prompt positions):
+
+      layer   kind      ADD mean   ADD min    OVR mean   OVR min
+          0  sliding    1.000000  1.000000    1.000000  1.000000
+          5  FULL       0.978429  0.921858    0.995458  0.980868
+         10  sliding    0.988223  0.971237    0.989605  0.967252
+         15  sliding    0.893790  0.420505    0.896133  0.432931
+         20  sliding    0.989013  0.975899    0.990701  0.981286
+         23  FULL       0.720024 -0.251772    0.750468 -0.229099
+         27  sliding    0.695005  0.035063    0.798152  0.089466
+         29  FULL       0.051228 -0.104093    0.778844  0.052532
+
+  Better everywhere, hugely so at depth. Layer 0 is 1.000000 in both arms
+  because K there is computed before the dense MLP, so the fold cannot reach
+  it. Two traps in reading that table: the curve ACROSS layers is not
+  comparable, because those engine dumps span 10:30-22:11 on Sep 14 across
+  three engine defect fixes; and an earlier attempt that compared an old port
+  run against the new one showed layers 15-27 getting worse, which was two
+  builds and two runs rather than an A/B, and was discarded.
+
+  **And no layer body is wrong.** `DGQ_LAYER0_INDEX` / `--at` run the
+  single-layer split at any layer, on the same synthetic input:
+
+      layer   kind             cos       rel_l2
+          0   sliding   0.999999615     0.000878
+          5   FULL      0.999999993     0.000120
+         15   sliding   0.999999971     0.000242
+         23   FULL      0.999999978     0.000212
+         29   FULL      0.999999999     0.000035
+
+  Both attention kinds, so the full-attention geometry (partial RoPE, head_dim
+  512, 2 kv heads) is right as well. Layer 0's 8.8e-4 is the engine's bf16
+  expert-plane floor and is the WORST of the five, which says it is the floor
+  rather than a defect.
+
+  That leaves a contradiction worth stating plainly, because it is the next
+  thing to resolve. The input to layer 0 is right (prefill K there is cos
+  1.0000000). Every layer body is right to ~1e-4 on synthetic input. Yet
+  prefill K at layer 5 reads 0.9955, a rel_l2 near 0.095. A 1e-4 seed cannot
+  reach that by layer 5 through this stack's measured amplification -- a
+  bf16-sized perturbation grew only 5e-6 to 2.8e-4 over TWENTY layers. So
+  either those engine dumps are stale (being regenerated from one build), or
+  the real prefill path injects error the synthetic seq-16 single-layer test
+  does not reproduce: the KV cache, the seq-20 geometry, or the positions.
+  The injection path (`DGQCUDA_INJECT_AFTER` / `DGQCUDA_INJECT_BIN`) answers
+  that directly -- give the port the engine's own layer-N input at the real
+  geometry and see whether its layer-N output matches.
+
   Still open, and it is only verification now: the port's end-to-end output
   against the engine's on the same prompt and seed, and the per-layer K curve
   re-measured (layer 1 was cos 0.9909 before the fix). The bf16-store finding
