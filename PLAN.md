@@ -1033,19 +1033,23 @@ clears 0.641 by a lot.
   would have been visible without the full replies, which is what
   `--replies-out` is for.
 
-  Port, seeds 7 and 42 (123 still running at 56 s/step): rubric 24/27 and
-  full 7/9 at both seeds, the same two probes missing the same groups both
-  times. Every miss is an explain probe cut at the single 256-token canvas
-  -- transformer 174/175 words against the engine's 633/653, hash_table
-  164/170 against 598/593 -- and the groups lost (query/encoder,
-  collision) are the ones the engine reaches after the cut. On the six probes that fit in one
-  canvas (compare, list x2, form x2, summary) both sides are 6/6 FULL,
-  same structure (3-line haiku, 5-line limerick, 5 fruit lines, exactly
-  two sentences), same facts, different wording. Steps land within 1-4 of
-  the engine's on those six. So the first content measurement of the port
-  says: no quality gap where a reply fits, and a length ceiling where it
-  does not. The ceiling is a missing feature (block chaining), not a
-  defect, and it is the next thing to build if long answers matter.
+  Port, seeds 7/42/123: rubric 24/27 and full 7/9 at EVERY seed, the same
+  two probes missing the same groups all three times. Every miss is an
+  explain probe cut at the single 256-token canvas -- transformer 174-175
+  words against the engine's 633-665, hash_table 164-170 against 549-598
+  -- and the groups lost (query/encoder, collision) are the ones the
+  engine reaches after the cut; the port's text up to the cut is the same
+  essay (same opening, same worked example). On the six probes that fit in
+  one canvas (compare, list x2, form x2, summary) both sides are 18/18
+  FULL over the three seeds, same structure (3-line haiku, 5-line
+  limerick, 5 fruit lines, exactly two sentences), same facts, different
+  wording, mean steps 10.0 (port) against 10.1 (engine). So the first
+  content measurement of the port says: no quality gap where a reply
+  fits, and a length ceiling where it does not. The ceiling is a missing
+  feature (block chaining), not a defect, and it is the next thing to
+  build if long answers matter. Replies for all six runs are in the
+  session scratchpad (`content/{engine,port}_s{7,42,123}.replies.json`),
+  re-judgeable with `--replies`.
 
 - **Model-gated tests treat a manifest-only pack as present.**
   `test_util::dgq_model_dir()` returns `Some` when `model.dgq.json` exists, so an
