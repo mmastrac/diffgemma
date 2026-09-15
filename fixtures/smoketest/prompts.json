@@ -101,7 +101,7 @@
     {
       "id": "primary_colors",
       "prompt": "List the three primary colors.",
-      "max_steps": 11
+      "max_steps": 13
     },
     {
       "id": "water_cycle",
