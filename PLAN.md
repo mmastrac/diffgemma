@@ -1033,10 +1033,18 @@ clears 0.641 by a lot.
   would have been visible without the full replies, which is what
   `--replies-out` is for.
 
-  Port: pending (the batch runs at 56 s/step on the GB10, ~9 hours for
-  9 probes x 3 seeds). Expect the explain probes to lose rubric groups to
-  the single-canvas cut rather than to content; the form / list / summary
-  probes fit in one canvas and are the like-for-like comparison.
+  Port, seed 7 (seeds 42/123 still running at 56 s/step): rubric 24/27,
+  full 7/9. Every miss is an explain probe cut at the single 256-token
+  canvas -- transformer 174 words against the engine's 633, hash_table 164
+  against 598 -- and the groups lost (query/encoder, collision) are the
+  ones the engine reaches after the cut. On the six probes that fit in one
+  canvas (compare, list x2, form x2, summary) both sides are 6/6 FULL,
+  same structure (3-line haiku, 5-line limerick, 5 fruit lines, exactly
+  two sentences), same facts, different wording. Steps land within 1-4 of
+  the engine's on those six. So the first content measurement of the port
+  says: no quality gap where a reply fits, and a length ceiling where it
+  does not. The ceiling is a missing feature (block chaining), not a
+  defect, and it is the next thing to build if long answers matter.
 
 - **Model-gated tests treat a manifest-only pack as present.**
   `test_util::dgq_model_dir()` returns `Some` when `model.dgq.json` exists, so an
