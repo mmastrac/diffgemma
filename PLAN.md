@@ -916,17 +916,33 @@ clears 0.641 by a lot.
   above was measuring the easy half of the space.
 
   Degenerate tokens, as replies containing non-Latin characters: engine 0/12,
-  exact-f32 3/12, truncation arm 0/12. All three f32 cases are at the END of
+  exact-f32 3/12, truncation arm 0/12. All three f32 cases were at the END of
   the reply ("56<CJK>", "Endless<HEB>jetbrains.", "...(RGB).Examin"), the same
   eos-boundary signature as the spurious 145020 on the France prompt -- one
-  defect with four instances, not four defects. The measure is a lower bound
-  for both arms: it cannot see Latin-script degeneracy, and the truncation arm
-  has at least one ("Tidesallerg mehrere the sand"). So it does not say the
-  truncation arm is clean, and none of this is grounds to change the port's
-  default.
+  defect with four instances, not four defects. That defect was the reply
+  being decoded from the sampled canvas; see the entry below. Re-running all
+  24 with the fix:
 
-  What it does say: neither arm reproduces a long answer, p2/p3 take 6-9
-  denoise steps against p0/p1's 2-5, and that is where the remaining work is.
+      prompt              BEFORE f32/trunc   AFTER f32/trunc   junk
+      p0  7x8   (short)       2/3   3/3         3/3   3/3      f32 1 -> 0
+      p1  colors(short)       3/3   3/3         3/3   3/3          0 -> 0
+      p2  haiku (long)        0/3   0/3         0/3   0/3      f32 1 -> 0
+      p3  list  (long)        0/3   0/3         0/3   0/3      f32 1 -> 0
+      TOTAL                  5/12  6/12        6/12  6/12    3/0 -> 0/0
+
+  Every degenerate reply is gone and the long prompts did not move, which is
+  what a fix to what is EMITTED rather than to the trajectory should do.
+
+  It also means the two arena arms are exactly tied, 6/12 each, zero junk
+  each. The apparent advantage of the truncation arm in the first run was
+  entirely the emit bug -- it just did not land on an unaccepted row in that
+  sample -- and was never evidence about the rounding convention. That is the
+  second arm comparison tonight that measured something else (the first was
+  the step-1 argmax table). The convention still has no end-to-end evidence
+  either way; do not set the port's default from any of this.
+
+  What survives: neither arm reproduces a long answer, p2/p3 take 6-9 denoise
+  steps against p0/p1's 2-5, and that is where the remaining work is.
 
 - **Model-gated tests treat a manifest-only pack as present.**
   `test_util::dgq_model_dir()` returns `Some` when `model.dgq.json` exists, so an
