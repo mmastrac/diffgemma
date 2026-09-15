@@ -200,6 +200,38 @@ pub fn load_expert_bf16_slices(
     ))
 }
 
+/// `DGQ_ROUTE_ROWS=<path>` appends `{layer, row, experts, weights}` for every
+/// row of every layer, in the same shape as the CUDA port's
+/// `DGQCUDA_ROUTE_ROWS`, so the two expert SETS can be diffed directly.
+///
+/// `step-moe-route-dump` cannot answer this: it reports a canvas expert
+/// histogram, and the question is per row. Rows here are whatever the caller
+/// passed -- prompt positions during a prefill, `[prompt][canvas]` during a
+/// step.
+fn dump_route_rows(layer: usize, routes: &[RouteResult]) {
+    let Ok(path) = std::env::var("DGQ_ROUTE_ROWS") else {
+        return;
+    };
+    use std::io::Write;
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    for (row, r) in routes.iter().enumerate() {
+        let e: Vec<String> = r.indices.iter().map(|v| v.to_string()).collect();
+        let w: Vec<String> = r.weights.iter().map(|v| format!("{v}")).collect();
+        let _ = writeln!(
+            f,
+            "{{\"layer\":{layer},\"row\":{row},\"experts\":[{}],\"weights\":[{}]}}",
+            e.join(","),
+            w.join(",")
+        );
+    }
+}
+
 pub fn experts_forward_gpu_batched(
     out: &mut [f32],
     residual: &[f32],
@@ -229,6 +261,7 @@ pub fn experts_forward_gpu_batched(
     let dgq = expert_cache.is_dgq();
 
     out.fill(0.0);
+    dump_route_rows(layer, routes);
 
     let mut jobs = build_expert_jobs(routes, experts);
 
