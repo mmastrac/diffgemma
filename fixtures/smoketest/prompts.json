@@ -116,7 +116,10 @@
       "doc": "longdoc.md",
       "doc_tokens": 3300,
       "question": "(a) Which StepParams field suppresses pad-row KV cache stores during prefill, and (b) what SPARSE_BN value shipped as the default?",
-      "require": ["kv_write_end", "128"],
+      "require": [
+        "kv_write_end",
+        "128"
+      ],
       "max_steps": 60
     },
     {
@@ -124,7 +127,10 @@
       "doc": "longdoc.md",
       "doc_tokens": 8192,
       "question": "(a) How many seconds did the 105k-token needle prefill take, and (b) what is the Metal single-buffer allocation cap in GiB?",
-      "require": ["1085", "20.25"],
+      "require": [
+        "1085",
+        "20.25"
+      ],
       "max_steps": 60
     },
     {
@@ -132,7 +138,10 @@
       "doc": "longdoc.md",
       "doc_tokens": 13300,
       "question": "(a) What TF/s figure did the 64x64x32 partial-win GEMM tile reach at the MoE shape 2048x704x2816, and (b) what is the name of the bench-only prototype kernel used in the GEMM headroom hunt?",
-      "require": ["3.07", "gemm_block_sq"],
+      "require": [
+        "3.07",
+        "gemm_block_sq"
+      ],
       "max_steps": 60
     },
     {
@@ -140,7 +149,10 @@
       "doc": "longdoc.md",
       "doc_tokens": 20600,
       "question": "(a) What per-step time (in seconds) does the engine achieve on M3 Pro according to the opening status summary, and (b) which model component does the roadmap recommend deferring to v2?",
-      "require": ["0.93", "vision"],
+      "require": [
+        "0.93",
+        "vision"
+      ],
       "max_steps": 60
     }
   ],
@@ -151,7 +163,9 @@
       "class": "attribute indirection",
       "doc": "softdoc.md",
       "question": "One of the animals at the station wears a collar. What colour is it?",
-      "expect_any": ["mauve"],
+      "expect_any": [
+        "mauve"
+      ],
       "max_steps": 60
     },
     {
@@ -159,7 +173,12 @@
       "class": "synonym paraphrase",
       "doc": "softdoc.md",
       "question": "How often does the generator get topped up?",
-      "expect_any": ["fortnight", "two weeks", "14 days", "fortnightly"],
+      "expect_any": [
+        "fortnight",
+        "two weeks",
+        "14 days",
+        "fortnightly"
+      ],
       "max_steps": 60
     },
     {
@@ -167,7 +186,10 @@
       "class": "numeric restatement / unit conversion",
       "doc": "softdoc.md",
       "question": "How tall is the signal mast in centimetres?",
-      "expect_any": ["1200", "1,200"],
+      "expect_any": [
+        "1200",
+        "1,200"
+      ],
       "max_steps": 60
     },
     {
@@ -175,7 +197,10 @@
       "class": "negation / exception",
       "doc": "softdoc.md",
       "question": "Which instrument does not follow the standard reporting schedule?",
-      "expect_any": ["tide gauge", "gauge"],
+      "expect_any": [
+        "tide gauge",
+        "gauge"
+      ],
       "max_steps": 60
     },
     {
@@ -183,7 +208,10 @@
       "class": "aggregation",
       "doc": "softdoc.md",
       "question": "How many people are stationed there this season?",
-      "expect_any": ["3", "three"],
+      "expect_any": [
+        "3",
+        "three"
+      ],
       "max_steps": 60
     },
     {
@@ -191,7 +219,10 @@
       "class": "multi-hop",
       "doc": "softdoc.md",
       "question": "Who sends the weekly summary up to Bran Harbour?",
-      "expect_any": ["combe", "petra"],
+      "expect_any": [
+        "combe",
+        "petra"
+      ],
       "max_steps": 60
     },
     {
@@ -199,7 +230,10 @@
       "class": "ordinal",
       "doc": "softdoc.md",
       "question": "Who was the second person to reach the station this season?",
-      "expect_any": ["rusk", "iver"],
+      "expect_any": [
+        "rusk",
+        "iver"
+      ],
       "max_steps": 60
     },
     {
@@ -207,7 +241,10 @@
       "class": "superlative",
       "doc": "softdoc.md",
       "question": "Which of the sampling sites is the deepest?",
-      "expect_any": ["bram", "47"],
+      "expect_any": [
+        "bram",
+        "47"
+      ],
       "max_steps": 60
     },
     {
@@ -215,7 +252,9 @@
       "class": "temporal ordering",
       "doc": "softdoc.md",
       "question": "Of the mooring survey and the antenna repair, which month did the earlier one happen in?",
-      "expect_any": ["march"],
+      "expect_any": [
+        "march"
+      ],
       "max_steps": 60
     },
     {
@@ -223,7 +262,9 @@
       "class": "referential callback",
       "doc": "softdoc.md",
       "question": "What name do the crew use for the winter resupply run?",
-      "expect_any": ["long haul"],
+      "expect_any": [
+        "long haul"
+      ],
       "max_steps": 60
     },
     {
@@ -231,7 +272,9 @@
       "class": "long-form: exception + rationale",
       "doc": "softdoc.md",
       "question": "One instrument reports on a different schedule from all the others. Explain in full what the log says about that arrangement and why it is intentional rather than a defect.",
-      "expect_any": ["averages"],
+      "expect_any": [
+        "averages"
+      ],
       "max_steps": 90
     },
     {
@@ -239,7 +282,9 @@
       "class": "long-form: ordering + cause",
       "doc": "softdoc.md",
       "question": "Walk through the order in which the crew reached the station this season, and say what held up the final arrival.",
-      "expect_any": ["ice"],
+      "expect_any": [
+        "ice"
+      ],
       "max_steps": 90
     },
     {
@@ -247,7 +292,9 @@
       "class": "long-form: enumeration + comparison",
       "doc": "softdoc.md",
       "question": "Give a full account of the sampling sites, including how deep each one goes and how they compare to one another.",
-      "expect_any": ["31"],
+      "expect_any": [
+        "31"
+      ],
       "max_steps": 90
     },
     {
@@ -255,7 +302,10 @@
       "class": "long-form: aggregation across sections",
       "doc": "softdoc.md",
       "question": "Summarise everything the log flags as needing attention before the next season.",
-      "expect_any": ["felting", "felted"],
+      "expect_any": [
+        "felting",
+        "felted"
+      ],
       "max_steps": 90
     },
     {
@@ -263,7 +313,10 @@
       "class": "long-form: attribute + fault report",
       "doc": "softdoc.md",
       "question": "Explain the state of the signal mast: how big it is, how it is held up, and any problem the log notes with it.",
-      "expect_any": ["hums", "humming"],
+      "expect_any": [
+        "hums",
+        "humming"
+      ],
       "max_steps": 90
     },
     {
@@ -271,7 +324,9 @@
       "class": "long-form: callback + rationale",
       "doc": "softdoc.md",
       "question": "Describe the winter resupply run in full: what it carries, what the crew call it, and why it cannot be shifted to another date.",
-      "expect_any": ["long haul"],
+      "expect_any": [
+        "long haul"
+      ],
       "max_steps": 90
     },
     {
@@ -280,7 +335,18 @@
       "absence": true,
       "doc": "softdoc.md",
       "question": "What is the station's annual operating budget?",
-      "expect_any": ["not mentioned", "does not mention", "no mention", "not stated", "not specified", "not given", "no information", "does not say", "not say", "not include"],
+      "expect_any": [
+        "not mentioned",
+        "does not mention",
+        "no mention",
+        "not stated",
+        "not specified",
+        "not given",
+        "no information",
+        "does not say",
+        "not say",
+        "not include"
+      ],
       "max_steps": 60
     },
     {
@@ -289,7 +355,18 @@
       "absence": true,
       "doc": "softdoc.md",
       "question": "How many metres does Site Crake silt up over the winter?",
-      "expect_any": ["not mentioned", "does not mention", "no mention", "not stated", "not specified", "not given", "no information", "does not say", "not say", "not include"],
+      "expect_any": [
+        "not mentioned",
+        "does not mention",
+        "no mention",
+        "not stated",
+        "not specified",
+        "not given",
+        "no information",
+        "does not say",
+        "not say",
+        "not include"
+      ],
       "max_steps": 60
     }
   ],
@@ -300,7 +377,11 @@
       "lang": "rust",
       "prompt": "Write a complete Rust program. It must print exactly the line `hello` to standard output and then terminate with exit status code 42. Output only the Rust source code, with no explanation and no markdown code fences.",
       "cases": [
-        { "args": [], "stdout": "hello", "exit": 42 }
+        {
+          "args": [],
+          "stdout": "hello",
+          "exit": 42
+        }
       ],
       "max_steps": 90
     },
@@ -309,8 +390,24 @@
       "lang": "python",
       "prompt": "Write a complete Python 3 program. It takes any number of words as command-line arguments and prints one line per word, in the order given, in the form `word:length` where length is the number of characters in that word. Print nothing else. Output only the Python source code, with no explanation and no markdown code fences.",
       "cases": [
-        { "args": ["apple", "fig"], "stdout": "apple:5\nfig:3", "exit": 0 },
-        { "args": ["a", "bb", "ccc", "dddd"], "stdout": "a:1\nbb:2\nccc:3\ndddd:4", "exit": 0 }
+        {
+          "args": [
+            "apple",
+            "fig"
+          ],
+          "stdout": "apple:5\nfig:3",
+          "exit": 0
+        },
+        {
+          "args": [
+            "a",
+            "bb",
+            "ccc",
+            "dddd"
+          ],
+          "stdout": "a:1\nbb:2\nccc:3\ndddd:4",
+          "exit": 0
+        }
       ],
       "max_steps": 90
     },
@@ -319,8 +416,22 @@
       "lang": "bash",
       "prompt": "Write a complete bash script. It prints its command-line arguments on a single line, joined by one underscore character between each pair, with no leading or trailing underscore. Print nothing else. Output only the script source, with no explanation and no markdown code fences.",
       "cases": [
-        { "args": ["red", "green", "blue"], "stdout": "red_green_blue", "exit": 0 },
-        { "args": ["solo"], "stdout": "solo", "exit": 0 }
+        {
+          "args": [
+            "red",
+            "green",
+            "blue"
+          ],
+          "stdout": "red_green_blue",
+          "exit": 0
+        },
+        {
+          "args": [
+            "solo"
+          ],
+          "stdout": "solo",
+          "exit": 0
+        }
       ],
       "max_steps": 90
     },
@@ -329,8 +440,20 @@
       "lang": "rust",
       "prompt": "Write a complete Rust program. It reads a single command-line argument N (a positive integer) and prints every prime number less than or equal to N in increasing order, one per line. Print nothing else. Output only the Rust source code, with no explanation and no markdown code fences.",
       "cases": [
-        { "args": ["20"], "stdout": "2\n3\n5\n7\n11\n13\n17\n19", "exit": 0 },
-        { "args": ["2"], "stdout": "2", "exit": 0 }
+        {
+          "args": [
+            "20"
+          ],
+          "stdout": "2\n3\n5\n7\n11\n13\n17\n19",
+          "exit": 0
+        },
+        {
+          "args": [
+            "2"
+          ],
+          "stdout": "2",
+          "exit": 0
+        }
       ],
       "max_steps": 90
     },
@@ -339,9 +462,27 @@
       "lang": "python",
       "prompt": "Write a complete Python 3 program. It reads a single command-line argument that is a comma-separated list of integers, and prints those integers sorted in increasing numeric order, comma-separated, on one line with no spaces. Print nothing else. Output only the Python source code, with no explanation and no markdown code fences.",
       "cases": [
-        { "args": ["5,3,10,1"], "stdout": "1,3,5,10", "exit": 0 },
-        { "args": ["42"], "stdout": "42", "exit": 0 },
-        { "args": ["9,-2,0"], "stdout": "-2,0,9", "exit": 0 }
+        {
+          "args": [
+            "5,3,10,1"
+          ],
+          "stdout": "1,3,5,10",
+          "exit": 0
+        },
+        {
+          "args": [
+            "42"
+          ],
+          "stdout": "42",
+          "exit": 0
+        },
+        {
+          "args": [
+            "9,-2,0"
+          ],
+          "stdout": "-2,0,9",
+          "exit": 0
+        }
       ],
       "max_steps": 90
     },
@@ -350,8 +491,24 @@
       "lang": "bash",
       "prompt": "Write a complete bash script. It prints the sum of all of its command-line arguments, which are integers, as a single number on one line. Print nothing else. Output only the script source, with no explanation and no markdown code fences.",
       "cases": [
-        { "args": ["1", "2", "3"], "stdout": "6", "exit": 0 },
-        { "args": ["100", "250", "-50"], "stdout": "300", "exit": 0 }
+        {
+          "args": [
+            "1",
+            "2",
+            "3"
+          ],
+          "stdout": "6",
+          "exit": 0
+        },
+        {
+          "args": [
+            "100",
+            "250",
+            "-50"
+          ],
+          "stdout": "300",
+          "exit": 0
+        }
       ],
       "max_steps": 90
     },
@@ -360,8 +517,20 @@
       "lang": "rust",
       "prompt": "Write a complete Rust program. It reads a single command-line argument that is a sentence, and prints the words of that sentence in reverse order on one line, separated by single spaces. Print nothing else. Output only the Rust source code, with no explanation and no markdown code fences.",
       "cases": [
-        { "args": ["the quick brown fox"], "stdout": "fox brown quick the", "exit": 0 },
-        { "args": ["one"], "stdout": "one", "exit": 0 }
+        {
+          "args": [
+            "the quick brown fox"
+          ],
+          "stdout": "fox brown quick the",
+          "exit": 0
+        },
+        {
+          "args": [
+            "one"
+          ],
+          "stdout": "one",
+          "exit": 0
+        }
       ],
       "max_steps": 90
     },
@@ -370,8 +539,18 @@
       "lang": "python",
       "prompt": "Write a complete Python 3 program. It reads all of standard input and prints the number of lines it read, as a single number on one line. Print nothing else. Output only the Python source code, with no explanation and no markdown code fences.",
       "cases": [
-        { "args": [], "stdin": "a\nb\nc\n", "stdout": "3", "exit": 0 },
-        { "args": [], "stdin": "hello world\n", "stdout": "1", "exit": 0 }
+        {
+          "args": [],
+          "stdin": "a\nb\nc\n",
+          "stdout": "3",
+          "exit": 0
+        },
+        {
+          "args": [],
+          "stdin": "hello world\n",
+          "stdout": "1",
+          "exit": 0
+        }
       ],
       "max_steps": 90
     },
@@ -380,10 +559,34 @@
       "lang": "python",
       "prompt": "Write a complete Python 3 program. It reads a single command-line argument containing space-separated tokens. Each token is either an integer, which is pushed onto a stack, or one of the operators +, -, or *, which pops the top two values off the stack, applies the operator with the second-popped value on the left-hand side, and pushes the result. After all tokens are processed, print the single value remaining on the stack. Print nothing else. Output only the Python source code, with no explanation and no markdown code fences.",
       "cases": [
-        { "args": ["3 4 +"], "stdout": "7", "exit": 0 },
-        { "args": ["5 1 2 + 4 * + 3 -"], "stdout": "14", "exit": 0 },
-        { "args": ["2 3 -"], "stdout": "-1", "exit": 0 },
-        { "args": ["7"], "stdout": "7", "exit": 0 }
+        {
+          "args": [
+            "3 4 +"
+          ],
+          "stdout": "7",
+          "exit": 0
+        },
+        {
+          "args": [
+            "5 1 2 + 4 * + 3 -"
+          ],
+          "stdout": "14",
+          "exit": 0
+        },
+        {
+          "args": [
+            "2 3 -"
+          ],
+          "stdout": "-1",
+          "exit": 0
+        },
+        {
+          "args": [
+            "7"
+          ],
+          "stdout": "7",
+          "exit": 0
+        }
       ],
       "max_steps": 120
     },
@@ -392,10 +595,40 @@
       "lang": "rust",
       "prompt": "Write a complete Rust program. It reads its command-line arguments as integers, prints nothing at all to standard output, and terminates with an exit status equal to how many of those integers are strictly greater than 100. Output only the Rust source code, with no explanation and no markdown code fences.",
       "cases": [
-        { "args": ["5", "200", "300"], "stdout": "", "exit": 2 },
-        { "args": ["1", "2"], "stdout": "", "exit": 0 },
-        { "args": ["101", "102", "103", "104"], "stdout": "", "exit": 4 },
-        { "args": ["100"], "stdout": "", "exit": 0 }
+        {
+          "args": [
+            "5",
+            "200",
+            "300"
+          ],
+          "stdout": "",
+          "exit": 2
+        },
+        {
+          "args": [
+            "1",
+            "2"
+          ],
+          "stdout": "",
+          "exit": 0
+        },
+        {
+          "args": [
+            "101",
+            "102",
+            "103",
+            "104"
+          ],
+          "stdout": "",
+          "exit": 4
+        },
+        {
+          "args": [
+            "100"
+          ],
+          "stdout": "",
+          "exit": 0
+        }
       ],
       "max_steps": 120
     },
@@ -404,9 +637,30 @@
       "lang": "bash",
       "prompt": "Write a complete bash script. It takes one command-line argument, then reads lines from standard input and prints only those lines that contain that argument as a substring, in their original order. It must always terminate with exit status 0, even when no line matches. Print nothing else. Output only the script source, with no explanation and no markdown code fences.",
       "cases": [
-        { "args": ["cat"], "stdin": "cat\ndog\nconcat\n", "stdout": "cat\nconcat", "exit": 0 },
-        { "args": ["z"], "stdin": "alpha\nbeta\n", "stdout": "", "exit": 0 },
-        { "args": ["a"], "stdin": "alpha\nbeta\ngamma\n", "stdout": "alpha\nbeta\ngamma", "exit": 0 }
+        {
+          "args": [
+            "cat"
+          ],
+          "stdin": "cat\ndog\nconcat\n",
+          "stdout": "cat\nconcat",
+          "exit": 0
+        },
+        {
+          "args": [
+            "z"
+          ],
+          "stdin": "alpha\nbeta\n",
+          "stdout": "",
+          "exit": 0
+        },
+        {
+          "args": [
+            "a"
+          ],
+          "stdin": "alpha\nbeta\ngamma\n",
+          "stdout": "alpha\nbeta\ngamma",
+          "exit": 0
+        }
       ],
       "max_steps": 120
     },
@@ -415,9 +669,35 @@
       "lang": "bash",
       "prompt": "Write a complete bash script. Its first command-line argument is a prefix; the remaining arguments are words. Print, one per line and in the order given, only those words that begin with the prefix. It must always exit with status 0, even when no word matches. Print nothing else. Output only the script source, with no explanation and no markdown code fences.",
       "cases": [
-        { "args": ["ap", "apple", "apricot", "banana"], "stdout": "apple\napricot", "exit": 0 },
-        { "args": ["con", "apple", "apricot", "banana"], "stdout": "", "exit": 0 },
-        { "args": ["b", "banana", "berry"], "stdout": "banana\nberry", "exit": 0 }
+        {
+          "args": [
+            "ap",
+            "apple",
+            "apricot",
+            "banana"
+          ],
+          "stdout": "apple\napricot",
+          "exit": 0
+        },
+        {
+          "args": [
+            "con",
+            "apple",
+            "apricot",
+            "banana"
+          ],
+          "stdout": "",
+          "exit": 0
+        },
+        {
+          "args": [
+            "b",
+            "banana",
+            "berry"
+          ],
+          "stdout": "banana\nberry",
+          "exit": 0
+        }
       ],
       "max_steps": 120
     },
@@ -426,8 +706,25 @@
       "lang": "bash",
       "prompt": "Write a complete bash script. Its first command-line argument is a suffix; the remaining arguments are words. Print, one per line and in the order given, only those words that end with the suffix. It must always exit with status 0, even when no word matches. Print nothing else. Output only the script source, with no explanation and no markdown code fences.",
       "cases": [
-        { "args": ["ry", "berry", "cherry", "apple"], "stdout": "berry\ncherry", "exit": 0 },
-        { "args": ["zz", "berry", "apple"], "stdout": "", "exit": 0 }
+        {
+          "args": [
+            "ry",
+            "berry",
+            "cherry",
+            "apple"
+          ],
+          "stdout": "berry\ncherry",
+          "exit": 0
+        },
+        {
+          "args": [
+            "zz",
+            "berry",
+            "apple"
+          ],
+          "stdout": "",
+          "exit": 0
+        }
       ],
       "max_steps": 120
     },
@@ -436,8 +733,21 @@
       "lang": "bash",
       "prompt": "Write a complete bash script. It prints each of its command-line arguments on its own line, wrapped in double-quote characters, in the order given. For an argument of hi the line printed must be exactly \"hi\" including the quote characters. Print nothing else. Output only the script source, with no explanation and no markdown code fences.",
       "cases": [
-        { "args": ["a", "b"], "stdout": "\"a\"\n\"b\"", "exit": 0 },
-        { "args": ["hello world"], "stdout": "\"hello world\"", "exit": 0 }
+        {
+          "args": [
+            "a",
+            "b"
+          ],
+          "stdout": "\"a\"\n\"b\"",
+          "exit": 0
+        },
+        {
+          "args": [
+            "hello world"
+          ],
+          "stdout": "\"hello world\"",
+          "exit": 0
+        }
       ],
       "max_steps": 120
     },
@@ -446,8 +756,20 @@
       "lang": "python",
       "prompt": "Write a complete Python 3 program. It takes one command-line argument and prints it with every single-quote character replaced by a double-quote character. Print nothing else. Output only the Python source code, with no explanation and no markdown code fences.",
       "cases": [
-        { "args": ["it's 'here'"], "stdout": "it\"s \"here\"", "exit": 0 },
-        { "args": ["none"], "stdout": "none", "exit": 0 }
+        {
+          "args": [
+            "it's 'here'"
+          ],
+          "stdout": "it\"s \"here\"",
+          "exit": 0
+        },
+        {
+          "args": [
+            "none"
+          ],
+          "stdout": "none",
+          "exit": 0
+        }
       ],
       "max_steps": 120
     },
@@ -456,14 +778,70 @@
       "lang": "rust",
       "prompt": "Write a complete Rust program. It takes two command-line arguments: a pattern and a text. In the pattern, the character . matches any single character, and the character * matches zero or more repetitions of the single character immediately preceding it. All other characters match themselves literally. The pattern must match the ENTIRE text, not merely a part of it. Print true if the pattern matches the text and false if it does not. Do not use any external crate and do not use any regular expression library. Print nothing else. Output only the Rust source code, with no explanation and no markdown code fences.",
       "cases": [
-        { "args": ["a*", ""], "stdout": "true", "exit": 0 },
-        { "args": ["a*b", "aaab"], "stdout": "true", "exit": 0 },
-        { "args": ["ab*c", "ac"], "stdout": "true", "exit": 0 },
-        { "args": ["a*a", "aaa"], "stdout": "true", "exit": 0 },
-        { "args": [".*c", "abc"], "stdout": "true", "exit": 0 },
-        { "args": ["a.c", "abc"], "stdout": "true", "exit": 0 },
-        { "args": ["a.c", "abbc"], "stdout": "false", "exit": 0 },
-        { "args": ["abc", "abcd"], "stdout": "false", "exit": 0 }
+        {
+          "args": [
+            "a*",
+            ""
+          ],
+          "stdout": "true",
+          "exit": 0
+        },
+        {
+          "args": [
+            "a*b",
+            "aaab"
+          ],
+          "stdout": "true",
+          "exit": 0
+        },
+        {
+          "args": [
+            "ab*c",
+            "ac"
+          ],
+          "stdout": "true",
+          "exit": 0
+        },
+        {
+          "args": [
+            "a*a",
+            "aaa"
+          ],
+          "stdout": "true",
+          "exit": 0
+        },
+        {
+          "args": [
+            ".*c",
+            "abc"
+          ],
+          "stdout": "true",
+          "exit": 0
+        },
+        {
+          "args": [
+            "a.c",
+            "abc"
+          ],
+          "stdout": "true",
+          "exit": 0
+        },
+        {
+          "args": [
+            "a.c",
+            "abbc"
+          ],
+          "stdout": "false",
+          "exit": 0
+        },
+        {
+          "args": [
+            "abc",
+            "abcd"
+          ],
+          "stdout": "false",
+          "exit": 0
+        }
       ],
       "max_steps": 160
     },
@@ -472,10 +850,38 @@
       "lang": "python",
       "prompt": "Write a complete Python 3 program. It takes two command-line arguments: a positive integer width N, and a line of text. Split the text on whitespace into words and greedily pack them into lines so that each output line is at most N characters long, joining words on a line with a single space. Never split a word: a word longer than N goes alone on its own line. Print one line per packed line, with no trailing spaces. Print nothing else. Output only the Python source code, with no explanation and no markdown code fences.",
       "cases": [
-        { "args": ["10", "the quick brown fox"], "stdout": "the quick\nbrown fox", "exit": 0 },
-        { "args": ["5", "a bb ccc dddd"], "stdout": "a bb\nccc\ndddd", "exit": 0 },
-        { "args": ["3", "aaaa bb"], "stdout": "aaaa\nbb", "exit": 0 },
-        { "args": ["20", "short text"], "stdout": "short text", "exit": 0 }
+        {
+          "args": [
+            "10",
+            "the quick brown fox"
+          ],
+          "stdout": "the quick\nbrown fox",
+          "exit": 0
+        },
+        {
+          "args": [
+            "5",
+            "a bb ccc dddd"
+          ],
+          "stdout": "a bb\nccc\ndddd",
+          "exit": 0
+        },
+        {
+          "args": [
+            "3",
+            "aaaa bb"
+          ],
+          "stdout": "aaaa\nbb",
+          "exit": 0
+        },
+        {
+          "args": [
+            "20",
+            "short text"
+          ],
+          "stdout": "short text",
+          "exit": 0
+        }
       ],
       "max_steps": 160
     },
@@ -484,13 +890,353 @@
       "lang": "rust",
       "prompt": "Write a complete Rust program. It takes three command-line arguments: a number written as a string, the base that number is written in, and a target base. Both bases are integers from 2 to 36 inclusive. Digits with a value above 9 are written as lowercase letters, so a is 10 and z is 35. Print the number rewritten in the target base, with no leading zeros, using zero for the value zero. Do not use any external crate. Print nothing else. Output only the Rust source code, with no explanation and no markdown code fences.",
       "cases": [
-        { "args": ["255", "10", "16"], "stdout": "ff", "exit": 0 },
-        { "args": ["ff", "16", "2"], "stdout": "11111111", "exit": 0 },
-        { "args": ["0", "10", "2"], "stdout": "0", "exit": 0 },
-        { "args": ["z", "36", "10"], "stdout": "35", "exit": 0 },
-        { "args": ["1010", "2", "10"], "stdout": "10", "exit": 0 }
+        {
+          "args": [
+            "255",
+            "10",
+            "16"
+          ],
+          "stdout": "ff",
+          "exit": 0
+        },
+        {
+          "args": [
+            "ff",
+            "16",
+            "2"
+          ],
+          "stdout": "11111111",
+          "exit": 0
+        },
+        {
+          "args": [
+            "0",
+            "10",
+            "2"
+          ],
+          "stdout": "0",
+          "exit": 0
+        },
+        {
+          "args": [
+            "z",
+            "36",
+            "10"
+          ],
+          "stdout": "35",
+          "exit": 0
+        },
+        {
+          "args": [
+            "1010",
+            "2",
+            "10"
+          ],
+          "stdout": "10",
+          "exit": 0
+        }
       ],
       "max_steps": 160
+    }
+  ],
+  "_comment_content": "Long-answer CONTENT (`census --battery content` or `smoketest --battery content`; excluded from the default gate and NON-BLOCKING — rates, not pass/fail). The gate's convergence probes never read the reply and adherence only reads one-word answers, so nothing scored what a long answer SAID. Each probe carries a rubric: groups of alternatives, ANY member hits the group, and the headline rate is groups hit / groups; `full` counts probes that hit every group, said nothing in `forbid`, met the structure checks (`lines`, `sentences`, word bounds) and converged within `max_steps` (a runaway guard, not a ratchet). Authoring rule, enforced by `content::authoring_violations` and pinned by a test over this file: no rubric term may appear in its own prompt, or a reply that repeats the question scores it — which is why the ocean haiku is scored on waves/tide/foam and not on 'ocean'. `smoketest --battery content --replies FILE` judges replies generated elsewhere (the CUDA port) with the same code and no model; FILE maps probe id to {reply, steps}.",
+  "content": [
+    {
+      "id": "sky_blue",
+      "class": "explain",
+      "prompt": "Why is the sky blue?",
+      "rubric": [
+        [
+          "rayleigh",
+          "scattering",
+          "scattered",
+          "scatter",
+          "scatters"
+        ],
+        [
+          "wavelength",
+          "wavelengths",
+          "shorter",
+          "short"
+        ],
+        [
+          "sunlight",
+          "light"
+        ],
+        [
+          "atmosphere",
+          "air",
+          "molecules",
+          "gases",
+          "gas"
+        ]
+      ],
+      "max_steps": 60
+    },
+    {
+      "id": "transformer",
+      "class": "explain",
+      "prompt": "Explain how a transformer neural network works.",
+      "rubric": [
+        [
+          "attention"
+        ],
+        [
+          "query",
+          "queries",
+          "key",
+          "keys",
+          "value",
+          "values"
+        ],
+        [
+          "embedding",
+          "embeddings",
+          "token",
+          "tokens"
+        ],
+        [
+          "encoder",
+          "decoder",
+          "layer",
+          "layers",
+          "feed forward",
+          "feedforward"
+        ],
+        [
+          "position",
+          "positional"
+        ]
+      ],
+      "max_steps": 60
+    },
+    {
+      "id": "hash_table",
+      "class": "explain",
+      "prompt": "Explain what a hash table is and when you would use one.",
+      "rubric": [
+        [
+          "key",
+          "keys"
+        ],
+        [
+          "hash function",
+          "hashing",
+          "hashes",
+          "hashed"
+        ],
+        [
+          "bucket",
+          "buckets",
+          "index",
+          "indices",
+          "array",
+          "slot",
+          "slots"
+        ],
+        [
+          "constant",
+          "o 1",
+          "lookup",
+          "lookups",
+          "fast"
+        ],
+        [
+          "collision",
+          "collisions"
+        ]
+      ],
+      "max_steps": 60
+    },
+    {
+      "id": "tcp_udp",
+      "class": "compare",
+      "prompt": "Give three differences between TCP and UDP.",
+      "rubric": [
+        [
+          "connection",
+          "connectionless",
+          "handshake",
+          "connection oriented"
+        ],
+        [
+          "reliable",
+          "reliability",
+          "unreliable",
+          "guarantee",
+          "guaranteed",
+          "guarantees"
+        ],
+        [
+          "order",
+          "ordered",
+          "ordering",
+          "sequence",
+          "in order"
+        ],
+        [
+          "faster",
+          "speed",
+          "latency",
+          "overhead",
+          "lightweight",
+          "slower"
+        ]
+      ],
+      "max_steps": 60
+    },
+    {
+      "id": "primary_colors",
+      "class": "list",
+      "prompt": "List the three primary colors.",
+      "rubric": [
+        [
+          "red"
+        ],
+        [
+          "blue"
+        ],
+        [
+          "yellow",
+          "green"
+        ]
+      ],
+      "forbid": [
+        "purple",
+        "orange",
+        "black",
+        "white"
+      ],
+      "max_steps": 60
+    },
+    {
+      "id": "five_fruits",
+      "class": "list",
+      "prompt": "List five fruits, one per line, with no other text.",
+      "rubric": [
+        [
+          "apple",
+          "apples",
+          "banana",
+          "bananas",
+          "orange",
+          "oranges",
+          "mango",
+          "mangoes",
+          "grape",
+          "grapes",
+          "pear",
+          "pears",
+          "cherry",
+          "cherries",
+          "strawberry",
+          "strawberries",
+          "pineapple",
+          "kiwi",
+          "peach",
+          "peaches",
+          "lemon",
+          "lime",
+          "melon",
+          "watermelon",
+          "plum",
+          "plums",
+          "apricot",
+          "blueberry",
+          "blueberries",
+          "raspberry",
+          "raspberries",
+          "papaya",
+          "fig",
+          "figs",
+          "coconut",
+          "pomegranate",
+          "avocado"
+        ]
+      ],
+      "lines": 5,
+      "max_words": 15,
+      "max_steps": 60
+    },
+    {
+      "id": "haiku_ocean",
+      "class": "form",
+      "prompt": "Write a haiku about the ocean.",
+      "rubric": [
+        [
+          "waves",
+          "wave",
+          "tide",
+          "tides",
+          "sea",
+          "shore",
+          "salt",
+          "foam",
+          "deep",
+          "blue"
+        ]
+      ],
+      "lines": 3,
+      "max_words": 24,
+      "max_steps": 60
+    },
+    {
+      "id": "limerick_cat",
+      "class": "form",
+      "prompt": "Write a limerick about a cat.",
+      "rubric": [
+        [
+          "kitten",
+          "kitty",
+          "feline",
+          "paws",
+          "paw",
+          "purr",
+          "purred",
+          "purring",
+          "whiskers",
+          "meow",
+          "mouse",
+          "mice",
+          "tail",
+          "nap",
+          "fur",
+          "claws"
+        ]
+      ],
+      "lines": 5,
+      "max_words": 60,
+      "max_steps": 60
+    },
+    {
+      "id": "water_cycle",
+      "class": "summary",
+      "prompt": "Summarize the water cycle in two sentences.",
+      "rubric": [
+        [
+          "evaporation",
+          "evaporates",
+          "evaporate",
+          "evaporating"
+        ],
+        [
+          "condensation",
+          "condenses",
+          "condense",
+          "clouds",
+          "cloud"
+        ],
+        [
+          "precipitation",
+          "rain",
+          "rains",
+          "snow",
+          "falls"
+        ]
+      ],
+      "sentences": 2,
+      "max_words": 90,
+      "max_steps": 60
     }
   ]
 }

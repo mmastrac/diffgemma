@@ -16,6 +16,7 @@ mod bench;
 mod census;
 mod chat;
 mod common;
+mod content;
 mod download;
 mod fit_token_probe;
 mod gen_cmd;
@@ -584,6 +585,9 @@ pub(crate) fn dispatch(cli: Cli) -> ExitCode {
             filter,
             repeat,
             longctx,
+            battery,
+            replies,
+            replies_out,
         } => run_smoketest_cmd(
             &cli.model_dir,
             prompts_path.as_deref(),
@@ -594,6 +598,9 @@ pub(crate) fn dispatch(cli: Cli) -> ExitCode {
             filter.as_deref(),
             repeat,
             longctx,
+            battery.as_deref(),
+            replies.as_deref(),
+            replies_out.as_deref(),
         ),
         #[cfg(target_os = "macos")]
         Command::Census {

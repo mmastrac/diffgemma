@@ -47,6 +47,8 @@ pub(crate) fn parse_cli() -> Cli {
     let mut smoke_filter: Option<String> = None;
     let mut smoke_repeat: usize = 1;
     let mut smoke_longctx = false;
+    let mut smoke_replies: Option<PathBuf> = None;
+    let mut smoke_replies_out: Option<PathBuf> = None;
     let mut census_arms: Vec<String> = Vec::new();
     let mut census_batteries: Vec<String> = Vec::new();
     let mut census_seeds: Vec<u64> = Vec::new();
@@ -270,6 +272,16 @@ pub(crate) fn parse_cli() -> Cli {
                 }
             }
             "--longctx" => smoke_longctx = true,
+            "--replies" => {
+                if let Some(v) = args.next() {
+                    smoke_replies = Some(PathBuf::from(v));
+                }
+            }
+            "--replies-out" => {
+                if let Some(v) = args.next() {
+                    smoke_replies_out = Some(PathBuf::from(v));
+                }
+            }
             // census: --arm repeats; the rest are comma-lists.
             "--arm" => {
                 if let Some(v) = args.next() {
@@ -648,6 +660,10 @@ pub(crate) fn parse_cli() -> Cli {
             filter: smoke_filter.clone(),
             repeat: smoke_repeat.max(1),
             longctx: smoke_longctx,
+            // `--battery` is shared with census; smoketest runs one tier.
+            battery: census_batteries.first().cloned(),
+            replies: smoke_replies.clone(),
+            replies_out: smoke_replies_out.clone(),
         },
         Some("census") => Command::Census {
             arms: census_arms.clone(),
