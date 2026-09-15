@@ -46,6 +46,8 @@ struct Args {
     parity: bool,
     /// `hidden-parity --causal`: compare against a short causal pass over the
     /// prompt rows (the device prompt path's shape) instead of the step.
+    /// `forward --gpu --causal`: run the prompt rows causally, the way the
+    /// engine prefills them.
     causal: bool,
     /// `--prompt TEXT`: render a text prompt through the chat template instead
     /// of using `--ids`.
@@ -311,7 +313,14 @@ fn run(args: &Args) -> Result<(), config::Error> {
                 None if args.rows_all => forward::LogitRows::All,
                 None => forward::LogitRows::Last,
             };
-            let out = if args.gpu {
+            let out = if args.gpu && args.causal {
+                // The engine prefills a prompt causally. `forward_stop` runs
+                // every row bidirectionally, which is not comparable to an
+                // engine prefill dump row by row.
+                gpu::forward_full(
+                    &w, &cfg, ids, args.layers, rows, &mut sc, args.stop_after, None, 0, seq, true,
+                )?
+            } else if args.gpu {
                 gpu::forward_stop(&w, &cfg, ids, args.layers, rows, &mut sc, args.stop_after)?
             } else {
                 forward::forward(&w, &cfg, ids, args.layers, rows, &mut sc)?
