@@ -195,6 +195,16 @@ extern "C" __global__ void dgq_round_bf16(float *x, unsigned n) {
     x[i] = __uint_as_float(u & 0xFFFF0000u);
 }
 
+// The engine's `f32_round_bf16` (src/shaders/include/common.metal) masks the
+// low 16 bits and nothing else, so every store moves toward zero by up to a
+// full ulp instead of a signed half. That is a bias, not noise, and it is the
+// engine's actual convention -- reproducing the engine means reproducing it.
+extern "C" __global__ void dgq_trunc_bf16(float *x, unsigned n) {
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    x[i] = __uint_as_float(__float_as_uint(x[i]) & 0xFFFF0000u);
+}
+
 extern "C" __global__ void dgq_vec_add(float *x, const float *y, unsigned n) {
     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] += y[i];

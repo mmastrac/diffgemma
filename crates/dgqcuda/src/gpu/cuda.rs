@@ -689,10 +689,24 @@ fn attn_dump_write(fields: &[(&str, Vec<f32>)]) {
 /// instead of a more accurate one. Off by default: it costs a launch per stage
 /// and, measured, it does not move the port's agreement with the engine (see
 /// `dgq_round_bf16`), so it is a parity lever rather than a fix.
-fn bf16_arena() -> bool {
+/// `DGQCUDA_BF16_ARENA`: off (default) keeps the arena in exact f32; `1`
+/// rounds to nearest even; `trunc` masks the low 16 bits, which is what the
+/// engine actually does. The three are an A/B/C over the one arithmetic
+/// convention the two engines are known to differ on, so keep all three: `1`
+/// answers "how much does bf16-sized noise matter", `trunc` answers "is the
+/// engine's bias the whole difference", and they are not the same question.
+fn arena_mode() -> Option<&'static str> {
     use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("DGQCUDA_BF16_ARENA").is_ok_and(|v| v != "0" && !v.is_empty()))
+    static MODE: OnceLock<Option<&'static str>> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("DGQCUDA_BF16_ARENA") {
+        Ok(v) if v == "trunc" => Some("dgq_trunc_bf16"),
+        Ok(v) if v != "0" && !v.is_empty() => Some("dgq_round_bf16"),
+        _ => None,
+    })
+}
+
+fn bf16_arena() -> bool {
+    arena_mode().is_some()
 }
 
 /// Round `n` elements of `buf` to bf16 precision in place, when the flag is on.
@@ -701,12 +715,12 @@ pub(crate) fn arena_store(
     buf: &DeviceBuffer,
     n: usize,
 ) -> Result<(), crate::config::Error> {
-    if !bf16_arena() {
+    let Some(entry) = arena_mode() else {
         return Ok(());
-    }
+    };
     let mut args = KernelArgs::new();
     args.device_ptr(buf.device_ptr()).u32(n as u32);
-    launch(ctx, "dgq_round_bf16", flat(n, 256), 256, &mut args)?;
+    launch(ctx, entry, flat(n, 256), 256, &mut args)?;
     Ok(())
 }
 
