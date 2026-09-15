@@ -1,5 +1,6 @@
 use crate::Error;
 use crate::config::{LayerType, TextConfig};
+use crate::safetensors::DType;
 use crate::tensor::TensorView;
 use crate::weights::WeightStore;
 
@@ -112,6 +113,80 @@ impl DecoderLayerShapes {
     }
 }
 
+/// The two q4 expert planes of one layer, widened to bf16 and owned by the
+/// caller so a `DecoderLayerWeights` can borrow them like any mmap'd tensor.
+///
+/// A `.dgq` pack quantizes exactly these two tensors per layer and leaves
+/// everything else raw bf16, so this is all the CPU oracle needs to read a
+/// quantized pack. bf16 is not a compromise here: it is where the upstream
+/// checkpoint keeps the experts, and it halves the 3 GB an f32 plane pair
+/// would cost.
+pub struct ExpertPlanes {
+    gate_up_name: String,
+    down_name: String,
+    gate_up_shape: [i64; 3],
+    down_shape: [i64; 3],
+    gate_up: Vec<u8>,
+    down: Vec<u8>,
+}
+
+impl ExpertPlanes {
+    pub fn load(store: &WeightStore, layer: usize, cfg: &TextConfig) -> Result<Self, Error> {
+        let keys = DecoderLayerKeys::new(layer);
+        let shapes = DecoderLayerShapes::for_layer(cfg, layer)?;
+        let gate_up = widen_to_bf16(store, &keys.experts_gate_up, &shapes.experts_gate_up)?;
+        let down = widen_to_bf16(store, &keys.experts_down, &shapes.experts_down)?;
+        Ok(Self {
+            gate_up_name: keys.experts_gate_up,
+            down_name: keys.experts_down,
+            gate_up_shape: shapes.experts_gate_up,
+            down_shape: shapes.experts_down,
+            gate_up,
+            down,
+        })
+    }
+
+    fn gate_up_view(&self) -> TensorView<'_> {
+        TensorView::from_parts(
+            &self.gate_up_name,
+            DType::BF16,
+            &self.gate_up_shape,
+            &self.gate_up,
+        )
+    }
+
+    fn down_view(&self) -> TensorView<'_> {
+        TensorView::from_parts(&self.down_name, DType::BF16, &self.down_shape, &self.down)
+    }
+}
+
+fn widen_to_bf16(store: &WeightStore, name: &str, shape: &[i64; 3]) -> Result<Vec<u8>, Error> {
+    let vals = store.tensor_f32(name)?;
+    let expected: i64 = shape.iter().product();
+    if vals.len() as i64 != expected {
+        return Err(Error::Runtime(
+            "expert plane element count does not match shape",
+        ));
+    }
+    let mut out = vec![0u8; vals.len() * 2];
+    for (dst, &v) in out.chunks_exact_mut(2).zip(vals.iter()) {
+        dst.copy_from_slice(&round_bf16(v).to_le_bytes());
+    }
+    Ok(out)
+}
+
+/// Round to nearest even. The GPU's activation stores truncate instead, but a
+/// weight load is not an activation store, and truncating here would bias
+/// every expert weight toward zero.
+fn round_bf16(v: f32) -> u16 {
+    let bits = v.to_bits();
+    if v.is_nan() {
+        return (bits >> 16) as u16 | 0x0040;
+    }
+    let round = 0x7fff + ((bits >> 16) & 1);
+    (bits.wrapping_add(round) >> 16) as u16
+}
+
 #[allow(dead_code)] // fields used starting in phase 3 (decoder forward)
 pub struct DecoderLayerWeights<'a> {
     pub keys: DecoderLayerKeys,
@@ -141,6 +216,26 @@ pub struct DecoderLayerWeights<'a> {
 
 impl<'a> DecoderLayerWeights<'a> {
     pub fn load(store: &'a WeightStore, layer: usize, cfg: &TextConfig) -> Result<Self, Error> {
+        Self::build(store, layer, cfg, None)
+    }
+
+    /// Same, but reading the experts from caller-owned planes instead of the
+    /// store. This is the path that works on a quantized pack.
+    pub fn load_with_experts(
+        store: &'a WeightStore,
+        layer: usize,
+        cfg: &TextConfig,
+        planes: &'a ExpertPlanes,
+    ) -> Result<Self, Error> {
+        Self::build(store, layer, cfg, Some(planes))
+    }
+
+    fn build(
+        store: &'a WeightStore,
+        layer: usize,
+        cfg: &TextConfig,
+        planes: Option<&'a ExpertPlanes>,
+    ) -> Result<Self, Error> {
         let keys = DecoderLayerKeys::new(layer);
         let shapes = DecoderLayerShapes::for_layer(cfg, layer)?;
 
@@ -204,10 +299,14 @@ impl<'a> DecoderLayerWeights<'a> {
         let router_scale = store.tensor(&keys.router_scale)?;
         let router_per_expert_scale = store.tensor(&keys.router_per_expert_scale)?;
 
-        let experts_gate_up = store.tensor(&keys.experts_gate_up)?;
+        let (experts_gate_up, experts_down) = match planes {
+            Some(p) => (p.gate_up_view(), p.down_view()),
+            None => (
+                store.tensor(&keys.experts_gate_up)?,
+                store.tensor(&keys.experts_down)?,
+            ),
+        };
         experts_gate_up.expect_shape(&shapes.experts_gate_up)?;
-
-        let experts_down = store.tensor(&keys.experts_down)?;
         experts_down.expect_shape(&shapes.experts_down)?;
 
         let layer_scalar = store.tensor(&keys.layer_scalar)?;

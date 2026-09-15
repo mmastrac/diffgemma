@@ -1046,17 +1046,18 @@ pub(crate) fn layer_forward(
         b.mlp_down.device_ptr(),
     )?;
     arena_store(ctx, &b.mlp_down, seq * hidden)?;
-    // CPU oracle: scratch = mlp_down; mlp_down = rms(scratch) * w1; then the
-    // dense branch's output is ADDED to normed (which still holds the residual
-    // from before the pre-feedforward norm).
+    // normed = rms(dense_out) * w1, OVERWRITING the pre-feedforward norm that
+    // was sitting there as the GEMM input. The MoE branch is what gets added
+    // to this, further down; the residual rejoins at the layer output. Adding
+    // here instead left an extra rms(residual, pre_ff) term in the sum and
+    // cost the layer cos 0.9972 against the oracle.
     r.rms(
         &b.mlp_down,
         &lw.post_feedforward_layernorm_1,
         &b.norm_scratch,
         seq,
     )?;
-    copy_device(ctx, &b.mlp_down, &b.norm_scratch, seq * hidden)?;
-    r.add_in_place(&b.normed, &b.mlp_down, seq * hidden)?;
+    copy_device(ctx, &b.normed, &b.norm_scratch, seq * hidden)?;
     r.mark("l:dense_mlp");
 
     if stop_at == 2 {

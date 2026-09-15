@@ -142,6 +142,15 @@ impl WeightStore {
         }
     }
 
+    /// Materialize a tensor as f32 whatever the store holds. The only caller
+    /// that needs it is the CPU oracle, which has no dequantizing GEMM.
+    pub fn tensor_f32(&self, name: &str) -> Result<Vec<f32>, Error> {
+        match self {
+            Self::Safetensors(s) => Ok(s.tensor(name)?.bf16()?.to_f32_vec()),
+            Self::Dgq(s) => s.tensor_f32(name),
+        }
+    }
+
     pub fn summarize(&self) -> Summary {
         match self {
             Self::Safetensors(s) => s.summarize(),

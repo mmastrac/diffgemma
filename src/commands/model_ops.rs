@@ -493,15 +493,38 @@ pub(crate) fn run_layer0_forward(m: &model::Model) -> ExitCode {
     const SEQ_LEN: usize = 16;
     let hidden = m.config.text_config.hidden_size;
 
-    let layer =
-        match model::layer_weights::DecoderLayerWeights::load(&m.weights, 0, &m.config.text_config)
-        {
-            Ok(layer) => layer,
+    // A quantized pack stores the experts as q4, which no CPU path reads
+    // directly. Widen them once up front and lend them to the layer.
+    let planes = if m.weights.is_quantized() {
+        match model::layer_weights::ExpertPlanes::load(&m.weights, 0, &m.config.text_config) {
+            Ok(planes) => Some(planes),
             Err(err) => {
                 eprintln!("error: {err}");
                 return ExitCode::FAILURE;
             }
-        };
+        }
+    } else {
+        None
+    };
+
+    let loaded = match &planes {
+        Some(planes) => model::layer_weights::DecoderLayerWeights::load_with_experts(
+            &m.weights,
+            0,
+            &m.config.text_config,
+            planes,
+        ),
+        None => {
+            model::layer_weights::DecoderLayerWeights::load(&m.weights, 0, &m.config.text_config)
+        }
+    };
+    let layer = match loaded {
+        Ok(layer) => layer,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let mut scratch =
         match model::decoder_layer::DecoderLayerScratch::new(SEQ_LEN, &m.config.text_config, 0) {
