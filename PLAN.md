@@ -522,7 +522,46 @@ clears 0.641 by a lot.
   inference was worthless because with the real sum eps/m is 2e-8. Do not
   back-solve a magnitude through a scale-free norm; dump the operand.
 
-  **Open, engine-side: its scale-free norm returns 0.9972, not 1.** Renormalizing
+  **FOUND: the engine TRUNCATES every f32->bf16 store instead of rounding.**
+
+    inline float f32_round_bf16(float x) {          // src/shaders/include/common.metal
+        return as_type<float>(as_type<uint>(x) & 0xFFFF0000u);
+    }
+
+  Masking the low 16 bits always moves a value toward zero, so every arena
+  store loses a uniform fraction of an ulp rather than a signed half-ulp. The
+  Rust side does the same (`(v.to_bits() >> 16) as u16`, in dgq/dequant.rs,
+  dgq/block.rs, dgemm/format/bf16.rs), so the convention is consistent across
+  the engine -- it is a bias, not a CPU/GPU mismatch. The function is named
+  `round`, which is how it reads as correct on the way past.
+
+  This is verified, not inferred. Re-running the engine's own step-1 preamble
+  from its dumped `embed_scaled + sc_dense`:
+
+    round-to-nearest    after l2 53.0721   rms 1.000115
+    TRUNCATE (engine)   after l2 52.9182   rms 0.997215
+    engine actual       after l2 52.9182   rms 0.997215   cos 1.000000000
+
+  Truncation reproduces the engine exactly. That is the whole of the 0.28%
+  "scale-free norm returns 0.9972" anomaly, and it is why the port sits ABOVE
+  the engine in magnitude at every stage measured: the port computes exact f32
+  and the engine shrinks ~0.28% of l2 at every store. The MoE runs several
+  stores per expert (gate_up, glu, down), which is the right order for the
+  -1.34% the engine's GPU shows against its own f32 oracle.
+
+  Two ways to use this, and they are different goals. To make the PORT match
+  the engine bit-for-bit, truncate at the same points -- the port keeps f32
+  throughout today and so has no equivalent of the arena store. To make the
+  ENGINE better, switch `f32_round_bf16` to round-to-nearest-even
+  (`(bits + 0x7fff + ((bits >> 16) & 1)) >> 16`), which costs two integer ops
+  and removes a systematic half-ulp downward bias that compounds over 30 layers
+  and every store within them. That second one is TRAJECTORY-AFFECTING: it
+  changes every activation, so it needs a golden re-bless and a quality gate,
+  and it should not be done casually just because it is more accurate.
+
+  **Also open, engine-side: its scale-free norm returns 0.9972, not 1.**
+  RESOLVED by the above -- the deficit is the output store truncating.
+  Historical note kept because the inference chain that chased it was wrong: Renormalizing
   the engine's own `embed_scaled + sc_dense` in f32 gives l2 53.0660 (unit RMS,
   as it must) where the engine's `after_preamble` is 52.9182. The two are
   parallel (cos 0.9999968) and the ratio is a near-uniform 0.997215, with
