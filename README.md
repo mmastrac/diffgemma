@@ -141,9 +141,12 @@ For something permanent, drop that same `"provider"` block into `opencode.json`
 ### Structured decisions
 
 A system message that is a JSON question schema turns a chat request into
-one scored forward. No text is generated: the answer template is seeded
-into the canvas and each question's distribution is read from the logits
-at its label slot. All questions in a request share the forward.
+a few scored forwards. No text is generated: the answer template is seeded
+into the canvas with each label slot as noise, and each question's
+distribution is read from the logits at its slot. All questions in a
+request share each forward. One read conditions on one noise draw and is
+sharper than the model's marginal, so the reply averages 4 reads by
+default and reports the standard error.
 
 Request: exactly two messages. `system` is the schema, `user` is the state
 as JSON.
@@ -172,37 +175,44 @@ Reply: `content` is JSON.
 
 ```json
 {"answers": {
-   "urgent": {"type": "noul", "noul": 0.96, "label": "yes", "confidence": 0.96,
-              "probabilities": {"yes": 0.96, "no": 0.04}},
+   "urgent": {"type": "noul", "noul": 0.60, "label": "yes", "confidence": 0.60,
+              "stderr": 0.16, "agreement": 0.75,
+              "probabilities": {"yes": 0.60, "no": 0.40}},
    "bucket": {"type": "choice", "choice": "engineering", "label": "C", "confidence": 1.0,
+              "stderr": 0.0, "agreement": 1.0,
               "probabilities": {"billing": 0.0, "support": 0.0, "engineering": 1.0}},
-   "tone":   {"type": "score", "score": 1.68, "level": "annoyed", "label": "2", "confidence": 0.68,
-              "probabilities": {"calm": 0.32, "annoyed": 0.68, "furious": 0.0}}},
- "diagnostics": {"steps": 1, "hole": "noise", "samples": {"n": 1, "tops": [...]},
-                 "timing": {"prefill_ms": 668, "denoise_ms": 1161, "reused_tokens": 140, ...},
+   "tone":   {"type": "score", "score": 1.77, "level": "annoyed", "label": "2", "confidence": 0.77,
+              "stderr": 0.06, "agreement": 1.0,
+              "probabilities": {"calm": 0.23, "annoyed": 0.77, "furious": 0.0}}},
+ "diagnostics": {"steps": 1, "hole": "noise", "samples": {"n": 4, "tops": [...]},
+                 "timing": {"prefill_ms": 720, "denoise_ms": 5060, "reused_tokens": 140, ...},
                  "questions": {"tone": {"argmax_is_label": true, "entropy": 0.6, "label_mass": 1.0, ...}}}}
 ```
 
-`probabilities` is a softmax over the label logits at temperature 1.
-`confidence` is the top probability. With `samples` > 1, `agreement` is
-the share of reads that picked the reported label. These are the model's
-raw marginals. Nothing calibrates them.
+`probabilities` is the mean over the reads of a softmax over the label
+logits at temperature 1. `confidence` is the top label's mean probability,
+`stderr` its standard error over the reads, and `agreement` the share of
+reads that picked it. Two reads at 0.9 for opposite labels average to 0.5,
+which is the right answer: the marginal over the noise is a coin flip.
+These are the model's marginals. Nothing calibrates them to the truth.
 
 Optional schema fields: `instructions` (context), `samples` (reads with
-different hole noise, averaged; default 1), `steps` (forwards per read;
-default 1), `active` (canvas rows, multiple of 64; default 256), `hole`
-(`noise` default, `pad`, `label`), `climb` and `climb_mode` (diagnostic
-hill climb; ratifies the first read).
+different hole noise; default 4, `1` is a single read), `steps` (forwards
+per read; default 1), `active` (canvas rows, multiple of 64; default 256),
+`hole` (`noise` default, `pad`, `label`), `climb` and `climb_mode`
+(diagnostic hill climb; ratifies the first read).
 
 Performance on an M3 Pro with the q4 pack, a 3-question schema, a ~190-token prompt, one
 server process:
 
 | Case | Wall |
 | :-- | --: |
-| First request on a schema (f32 engine prefill of the schema, once) | 8.1 s |
-| Next state on that schema, 256 rows | 1.9 s (0.7 prefill + 1.2 forward) |
-| Next state, `active: 64` | 1.3 s |
-| 8 averaged reads, `active: 64` | 5.3 s |
+| First request on a schema (f32 engine prefill of the schema, once) | 8 to 15 s |
+| Next state, default (4 reads, 256 rows) | 5.8 s (0.7 prefill + 4 × 1.25 forward) |
+| Next state, 4 reads, `active: 64` | 3.1 s |
+| Next state, `samples: 1`, 256 rows | 2.0 s |
+| Next state, `samples: 1`, `active: 64` | 1.3 s |
+| 8 reads, `active: 64` | 5.3 s |
 | Generating the same three answers as JSON (19 tokens, 3 to 5 steps) | 9.6 to 13.1 s |
 
 The schema prefix stays in the KV. Each later request prefills only its

@@ -26,7 +26,7 @@
 //!     "options": [{"name": "bug", "description": "defect"}, {"name": "feature"}]},
 //!    {"id": "depth", "type": "score", "instructions": "How thorough?",
 //!     "levels": ["Superficial", "Adequate", "Thorough"]}],
-//!  "steps": 1, "hole": "noise", "climb": 0, "climb_mode": "joint", "samples": 1}
+//!  "steps": 1, "hole": "noise", "climb": 0, "climb_mode": "joint", "samples": 4}
 //! ```
 
 use serde::Deserialize;
@@ -94,8 +94,11 @@ pub struct Schema {
     /// Climb rounds re-read each slot in its own forward, with the other
     /// slots filled and its own slot back at its seed filler.
     pub leave_one_out: bool,
-    /// Independent reads with different hole noise, which are averaged. The prompt is
-    /// prefilled once, so each extra sample costs one forward per round.
+    /// Independent reads with different hole noise, which are averaged. A
+    /// single read conditions on one noise token in the slot and is sharper
+    /// than the marginal over the noise. The mean over reads estimates that
+    /// marginal. The prompt is prefilled once, so each extra sample costs
+    /// one forward per round.
     pub samples: usize,
 }
 
@@ -223,7 +226,7 @@ impl Schema {
                 Some("loo") => true,
                 Some(other) => return Err(format!("schema: unknown climb_mode {other:?}")),
             },
-            samples: raw.samples.unwrap_or(1).clamp(1, 32),
+            samples: raw.samples.unwrap_or(4).clamp(1, 32),
         })
     }
 
@@ -375,10 +378,11 @@ impl Schema {
 
     /// The reply body. Probabilities are a softmax over the label logits at
     /// temperature 1, averaged over `samples` (each sample's last round), and
-    /// `confidence` is the top label's probability. `label_mass` is the share
-    /// of the row's full-vocabulary mass the labels hold. It is low when the
-    /// model did not read the slot as an answer. Per-slot diagnostics come
-    /// from the first sample.
+    /// `confidence` is the top label's probability with `stderr` its standard
+    /// error over the samples (absent for one sample). `label_mass` is the
+    /// share of the row's full-vocabulary mass the labels hold. It is low when
+    /// the model did not read the slot as an answer. Per-slot diagnostics
+    /// come from the first sample.
     pub fn answers_json(
         &self,
         template: &Template,
@@ -413,6 +417,14 @@ impl Schema {
                 .collect();
             let top = argmax(&probs);
             let agreement = per_sample.iter().filter(|p| argmax(p) == top).count() as f32 / n;
+            let stderr = (per_sample.len() > 1).then(|| {
+                let var = per_sample
+                    .iter()
+                    .map(|p| (p[top] - probs[top]).powi(2))
+                    .sum::<f32>()
+                    / (n - 1.0);
+                (var / n).sqrt()
+            });
             let mut dist = serde_json::Map::new();
             for (choice, p) in q.choices.iter().zip(&probs) {
                 dist.insert(choice.name.clone(), json!(p));
@@ -439,7 +451,8 @@ impl Schema {
             }
             a.insert("probabilities".into(), Value::Object(dist));
             a.insert("confidence".into(), json!(probs[top]));
-            if per_sample.len() > 1 {
+            if let Some(se) = stderr {
+                a.insert("stderr".into(), json!(se));
                 a.insert("agreement".into(), json!(agreement));
             }
             answers.insert(q.id.clone(), Value::Object(a));
