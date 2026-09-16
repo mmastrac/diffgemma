@@ -320,8 +320,14 @@ clears 0.641 by a lot.
       0.99999999, step geometry and window included); A/B against the
       pre-cache v2 build: 0 argmax flips at all 256 positions on steps 1
       and 2, max logit delta 1e-4. `DGQCUDA_ATTN=v2` keeps the old kernel.
-      The step is now the expert path: 3.8 s of 4.8. The engine target of
-      <= 5 s/step is met on this shape; the experts are the next lever.
+      Against the CPU oracle (canvas 64; the 256 run was OOM-killed on the
+      host, which also took the admin login's systemd --user with it):
+      step 1 min row cos 0.9998, step 2 0.956 / mean 0.993, 0 argmax
+      mismatches in 128 rows. The step-2 spread is the soft-embed regime
+      item below (canvas 64 sits at mean_H 0.53 after step 1, not 0.016),
+      identical on the old build. The step is now the expert path: 3.8 s
+      of 4.8. The engine target of <= 5 s/step is met on this shape; the
+      experts are the next lever.
     - Soft-embed disagrees with the CPU oracle in high-entropy regimes.
       At canvas 16 with only the chat-template prefix as prompt (mean_H
       ~4), step 2 is cos 0.89 with argmax mismatches against the oracle
