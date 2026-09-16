@@ -86,7 +86,11 @@ fn canvas_step_against_the_cache_matches_the_whole_sequence_oracle() {
 
     // Step 1: self-conditioned on the canvas embedding.
     let dev1 = softcap(&sess.step(&canvas).expect("step 1"), cap);
-    assert_eq!(sess.cache_len(), prompt.len(), "a step must not extend the cache");
+    assert_eq!(
+        sess.cache_len(),
+        prompt.len(),
+        "a step must not extend the cache"
+    );
     let cpu1 = oracle(&w, &cfg, &prompt, &canvas, None);
     for row in 0..canvas.len() {
         let d = &dev1[row * vocab..(row + 1) * vocab];

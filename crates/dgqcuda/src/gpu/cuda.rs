@@ -1431,7 +1431,13 @@ fn interleave_kv(
         .u32(seq as u32)
         .u32(row as u32)
         .u32(pos0 as u32);
-    launch(ctx, "dgq_interleave_kv", flat(seq * row, 256), 256, &mut args)
+    launch(
+        ctx,
+        "dgq_interleave_kv",
+        flat(seq * row, 256),
+        256,
+        &mut args,
+    )
 }
 
 /// Hidden state after \`layers\` decoder layers (device-resident path).

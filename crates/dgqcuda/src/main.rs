@@ -318,7 +318,17 @@ fn run(args: &Args) -> Result<(), config::Error> {
                 // every row bidirectionally, which is not comparable to an
                 // engine prefill dump row by row.
                 gpu::forward_full(
-                    &w, &cfg, ids, args.layers, rows, &mut sc, args.stop_after, None, 0, seq, true,
+                    &w,
+                    &cfg,
+                    ids,
+                    args.layers,
+                    rows,
+                    &mut sc,
+                    args.stop_after,
+                    None,
+                    0,
+                    seq,
+                    true,
                 )?
             } else if args.gpu {
                 gpu::forward_stop(&w, &cfg, ids, args.layers, rows, &mut sc, args.stop_after)?

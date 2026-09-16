@@ -90,7 +90,10 @@ impl Session {
         let mut kv_cache = Vec::with_capacity(t.num_hidden_layers);
         for layer in 0..t.num_hidden_layers {
             let (n_kv, head_dim, _, _, _) = t.attn_geometry(layer);
-            kv_cache.push(DeviceBuffer::alloc(&ctx, max_ctx * 2 * n_kv * head_dim * 4)?);
+            kv_cache.push(DeviceBuffer::alloc(
+                &ctx,
+                max_ctx * 2 * n_kv * head_dim * 4,
+            )?);
         }
         let sc = ScWeights {
             pre_norm: up_f32(
@@ -358,7 +361,11 @@ impl Session {
     /// hidden output is not kept: only their K/V matter to later passes.
     pub fn prefill(&mut self, ids: &[u32]) -> Result<(), Error> {
         let n = ids.len();
-        assert!(n <= self.seq, "prefill of {n} rows into {}-row buffers", self.seq);
+        assert!(
+            n <= self.seq,
+            "prefill of {n} rows into {}-row buffers",
+            self.seq
+        );
         assert!(
             self.cache_len + n <= self.max_ctx,
             "prefill of {n} rows past the {}-position cache ({} used)",
@@ -367,7 +374,11 @@ impl Session {
         );
         let ctx = self.model.ctx.clone();
         self.embed_rows(ids, 0)?;
-        arena_store(&ctx, &self.bufs.hidden_a, n * self.cfg.text_config.hidden_size)?;
+        arena_store(
+            &ctx,
+            &self.bufs.hidden_a,
+            n * self.cfg.text_config.hidden_size,
+        )?;
         let n_layers = self.layers.min(self.model.layers.len());
         {
             let Self {

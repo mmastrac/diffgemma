@@ -270,7 +270,10 @@ pub(crate) fn run_probes(
                 want.push(format!("sentences {}/{n}", v.sentences));
             }
             if p.min_words > 0 || p.max_words > 0 {
-                want.push(format!("words {} not in {}..{}", v.words, p.min_words, p.max_words));
+                want.push(format!(
+                    "words {} not in {}..{}",
+                    v.words, p.min_words, p.max_words
+                ));
             }
             notes.push(format!("structure [{}]", want.join(", ")));
         }
@@ -304,7 +307,13 @@ pub(crate) fn run_probes(
 
 /// Print the battery's rate line.
 pub(crate) fn report(c: &ContentCounts) {
-    let pct = |a: u64, b: u64| if b == 0 { 0.0 } else { 100.0 * a as f64 / b as f64 };
+    let pct = |a: u64, b: u64| {
+        if b == 0 {
+            0.0
+        } else {
+            100.0 * a as f64 / b as f64
+        }
+    };
     println!(
         "content: rubric {}/{} ({:.1}%)  full {}/{} ({:.1}%)  structure {}/{}  forbidden hits {}  [rates only — not pass/fail]",
         c.rubric_hit,
@@ -333,7 +342,8 @@ pub(crate) struct ReplyRecord {
 pub(crate) fn load_replies(
     path: &std::path::Path,
 ) -> Result<std::collections::BTreeMap<String, ReplyRecord>, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))
 }
 
@@ -415,7 +425,11 @@ mod tests {
         let mut p = probe("Haiku?", &[&["sea"]]);
         p.lines = Some(3);
         p.max_words = 20;
-        let ok = judge("Sea under the moon\nwaves fold into silver foam\nthe tide keeps its time", &p, 2);
+        let ok = judge(
+            "Sea under the moon\nwaves fold into silver foam\nthe tide keeps its time",
+            &p,
+            2,
+        );
         assert!(ok.structure_ok);
         let two = judge("Sea under the moon\nwaves fold into silver foam", &p, 2);
         assert!(!two.structure_ok);
@@ -438,7 +452,10 @@ mod tests {
         let mut inverted = probe("Why?", &[&["x"]]);
         inverted.min_words = 5;
         inverted.max_words = 2;
-        assert_eq!(authoring_violations(std::slice::from_ref(&inverted)).len(), 1);
+        assert_eq!(
+            authoring_violations(std::slice::from_ref(&inverted)).len(),
+            1
+        );
     }
 
     /// A probe that cannot run is the only failure; a probe that ran counts as
@@ -485,10 +502,12 @@ mod tests {
             assert!(probes.iter().any(|p| p.class == shape), "no {shape} probe");
         }
         // Form probes must actually check a form.
-        assert!(probes
-            .iter()
-            .filter(|p| p.class == "form")
-            .all(|p| p.lines.is_some() || p.sentences.is_some()));
+        assert!(
+            probes
+                .iter()
+                .filter(|p| p.class == "form")
+                .all(|p| p.lines.is_some() || p.sentences.is_some())
+        );
         let mut ids: Vec<&str> = probes.iter().map(|p| p.id.as_str()).collect();
         ids.sort_unstable();
         ids.dedup();
