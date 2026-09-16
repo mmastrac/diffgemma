@@ -167,8 +167,8 @@ curl -s 127.0.0.1:8080/v1/chat/completions -d '{
 
 Question types: `noul` (yes/no, reported as the probability of yes),
 `choice` (one of `options`), `score` (one of the ordered `levels`, plus
-the expected level). Labels are single tokens (`yes`/`no`, `A`/`B`/…,
-`1`/`2`/…); a schema whose labels do not tokenize to one token each is
+the expected level). Labels are single tokens: `yes`/`no`, `A`/`B`/…,
+`1`/`2`/…. A schema whose labels tokenize to more than one token each is
 refused.
 
 Reply: `content` is JSON.
@@ -193,18 +193,25 @@ Reply: `content` is JSON.
 logits at temperature 1. `confidence` is the top label's mean probability,
 `stderr` its standard error over the reads, and `agreement` the share of
 reads that picked it. Two reads at 0.9 for opposite labels average to 0.5,
-which is the right answer: the marginal over the noise is a coin flip.
-These are the model's marginals. Nothing calibrates them to the truth.
+the marginal over the noise. The values are the model's own marginals. No
+calibration against labelled data has been applied.
 
-Optional schema fields: `instructions` (context), `samples` (reads with
-different hole noise; default 4, `1` is a single read), `steps` (forwards
-per read; default 1), `active` (canvas rows, multiple of 64; default: the
-smallest that holds the template, 64 for up to about 12 questions; `256`
-is the full canvas), `hole` (`noise` default, `pad`, `label`), `climb` and
-`climb_mode` (diagnostic hill climb; ratifies the first read).
+Optional schema fields:
 
-Performance on an M3 Pro with the q4 pack, a 3-question schema, a ~190-token prompt, one
-server process:
+- `instructions`: context placed before the questions.
+- `samples`: reads with different hole noise, averaged. Default 4. `1` is
+  a single read.
+- `steps`: forwards per read. Default 1.
+- `active`: canvas rows, a multiple of 64. Default: the smallest that
+  holds the template, 64 for up to about 12 questions. `256` is the full
+  canvas.
+- `hole`: what fills a label slot before the read. `noise` (default),
+  `pad`, `label`.
+- `climb`, `climb_mode`: a diagnostic hill climb. It ratifies the first
+  read.
+
+Performance on an M3 Pro with the q4 pack, a 3-question schema, a
+~190-token prompt, one server process:
 
 | Case | Wall |
 | :-- | --: |
@@ -221,9 +228,10 @@ state. `DGQ_FAST_PREFILL=1` cuts the first request to 3 s but changed a
 borderline answer in our runs, so it is off. Width: 32 reads per setting
 gave identical 1.00 answers on the unambiguous tickets at 64 and 256 rows
 and a borderline answer within 1.3 standard errors (yes 0.56 ± 0.07
-against 0.68 ± 0.06), so the narrow default is not stretching the model.
-A borderline question still moves with the hole noise and the prefill
-precision (PLAN.md has the measurements); use `samples` and read `stderr`.
+against 0.68 ± 0.06), so the narrow default reads the same as the full
+canvas within noise. A borderline question still moves with the hole
+noise and the prefill precision (PLAN.md has the measurements). Use
+`samples` and read `stderr`.
 
 ## Custom Quantization
 
