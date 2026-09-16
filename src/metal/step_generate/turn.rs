@@ -54,6 +54,185 @@ pub struct ProposedBlock {
     pub block_mode: Option<(crate::delimiter::BlockMode, f32)>,
 }
 
+/// A canvas position to read after [`score_canvas`], and the token ids whose
+/// logits the caller wants from it.
+#[derive(Debug, Clone)]
+pub struct ScoreProbe {
+    pub pos: usize,
+    pub candidates: Vec<u32>,
+}
+
+/// One probed row: the candidates' raw logits plus the row's own argmax,
+/// tempered entropy and full-vocabulary log-sum-exp.
+#[derive(Debug, Clone)]
+pub struct CanvasScore {
+    pub candidate_logits: Vec<f32>,
+    pub argmax: u32,
+    pub entropy: f32,
+    pub row_logsumexp: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct CanvasScoreOutput {
+    /// The last round's scores, one per probe.
+    pub probes: Vec<CanvasScore>,
+    /// Every round's scores, round 0 first. One entry when `climb` is 0.
+    pub rounds: Vec<Vec<CanvasScore>>,
+    /// The last round repeated the round before it, so the canvas is a fixed
+    /// point of the climb.
+    pub converged: bool,
+    pub steps_run: usize,
+    pub prefill_elapsed: Duration,
+    pub denoise_elapsed: Duration,
+}
+
+/// Prefill `prompt`, seed the canvas with `canvas` (CANVAS ids), run `steps`
+/// denoise forwards at `active` width, and read the logits at `probes`.
+/// Nothing is committed: the causal log ends at the prompt, as it does after
+/// a turn abandoned past `begin_turn`, so the next turn's reuse guard matches
+/// the KV.
+///
+/// `climb` > 0 hill-climbs: after each round every probe's position is
+/// overwritten with its best candidate and the block restarts from step 0 on
+/// that canvas, up to `climb` more rounds or until a round repeats the
+/// previous round's choices. Each round is a fresh first step, so no
+/// self-conditioning carries between rounds. Only the canvas does.
+///
+/// `leave_one_out` changes what a climb round reads: one forward per probe,
+/// with every other probe's position holding its current choice and the
+/// probe's own position holding its original seed. A probe then conditions
+/// on the other answers without seeing its own, which a filled slot would
+/// ratify. Round 0 is the same in both modes.
+#[allow(clippy::too_many_arguments)]
+pub fn score_canvas(
+    session: &mut StepGenerateSession,
+    cfg: &StepGenerateConfig,
+    prompt: &[u32],
+    label: &str,
+    canvas: &[u32],
+    active: usize,
+    steps: usize,
+    climb: usize,
+    leave_one_out: bool,
+    probes: &[ScoreProbe],
+) -> Result<CanvasScoreOutput, Error> {
+    if canvas.len() != CANVAS {
+        return Err(Error::Format("score_canvas: canvas must be CANVAS ids"));
+    }
+    if let Some(p) = probes.iter().find(|p| p.pos >= active.min(CANVAS)) {
+        eprintln!(
+            "score_canvas: probe {} outside the active canvas ({active})",
+            p.pos
+        );
+        return Err(Error::Format(
+            "score_canvas: probe outside the active canvas",
+        ));
+    }
+    let mut ts = begin_turn(session, prompt, cfg, label)?;
+    let rt = &mut session.rt;
+    let denoise_started = Instant::now();
+    let params = step_params_from_sampler(
+        &cfg.sampler,
+        rt.read_params().kv_len,
+        true,
+        rt.read_params().eos_token_id,
+    );
+    rt.set_active_canvas(active);
+    let mut steps_run = 0;
+    let seed_canvas = canvas.to_vec();
+    let mut canvas = canvas.to_vec();
+    let mut rounds: Vec<Vec<CanvasScore>> = Vec::new();
+    let mut converged = false;
+    let result: Result<(), Error> = (|| {
+        let mut prev_choice: Option<Vec<u32>> = None;
+        for round in 0..=climb {
+            let loo = leave_one_out && round > 0;
+            if !loo {
+                rt.reset_block(VOCAB, &mut ts.rng, params);
+                rt.set_canvas_ids(&canvas)?;
+                for _ in 0..steps.max(1) {
+                    rt.run_denoise_step()?;
+                    steps_run += 1;
+                }
+            }
+            let mut st = rt.read_canvas_state();
+            let mut scores = Vec::with_capacity(probes.len());
+            let mut choice = Vec::with_capacity(probes.len());
+            for probe in probes {
+                if loo {
+                    let mut own = canvas.clone();
+                    own[probe.pos] = seed_canvas[probe.pos];
+                    rt.reset_block(VOCAB, &mut ts.rng, params);
+                    rt.set_canvas_ids(&own)?;
+                    for _ in 0..steps.max(1) {
+                        rt.run_denoise_step()?;
+                        steps_run += 1;
+                    }
+                    st = rt.read_canvas_state();
+                }
+                let row = rt.read_logit_row_f32(probe.pos);
+                let mx = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = row.iter().map(|&l| (l - mx).exp()).sum();
+                let candidate_logits: Vec<f32> = probe
+                    .candidates
+                    .iter()
+                    .map(|&c| row.get(c as usize).copied().unwrap_or(f32::NEG_INFINITY))
+                    .collect();
+                let best = (0..candidate_logits.len())
+                    .max_by(|&a, &b| candidate_logits[a].total_cmp(&candidate_logits[b]))
+                    .unwrap_or(0);
+                choice.push(
+                    probe
+                        .candidates
+                        .get(best)
+                        .copied()
+                        .unwrap_or(canvas[probe.pos]),
+                );
+                scores.push(CanvasScore {
+                    candidate_logits,
+                    argmax: st.prev_argmax[probe.pos],
+                    entropy: st.entropy[probe.pos],
+                    row_logsumexp: mx + sum.ln(),
+                });
+            }
+            rounds.push(scores);
+            if prev_choice.as_ref() == Some(&choice) {
+                converged = true;
+                break;
+            }
+            if round == climb {
+                break;
+            }
+            for (probe, &id) in probes.iter().zip(&choice) {
+                canvas[probe.pos] = id;
+            }
+            prev_choice = Some(choice);
+        }
+        Ok(())
+    })();
+    // The width is per-runtime state. A later plain turn must not inherit it.
+    rt.set_active_canvas(CANVAS);
+    result?;
+    let probes = rounds.last().cloned().unwrap_or_default();
+    if progress_enabled() {
+        eprintln!(
+            "score_canvas: {} probe(s), {} round(s), {steps_run} step(s), converged={converged}, active={active}, prefill {:.2?}, denoise {:.2?}",
+            probes.len(),
+            rounds.len(),
+            ts.prefill_elapsed,
+            denoise_started.elapsed()
+        );
+    }
+    Ok(CanvasScoreOutput {
+        probes,
+        rounds,
+        converged,
+        steps_run,
+        prefill_elapsed: ts.prefill_elapsed,
+        denoise_elapsed: denoise_started.elapsed(),
+    })
+}
+
 /// Outcome of one [`propose_block`] call.
 pub enum BlockOutcome {
     /// A canvas converged and awaits the commit decision.

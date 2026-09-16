@@ -138,6 +138,101 @@ For something permanent, drop that same `"provider"` block into `opencode.json`
 (project) or `~/.config/opencode/opencode.json` (global) and run
 `opencode -m diffgemma/diffgemma-26b-a4b-it-q4`.
 
+### Structured decisions
+
+A system message that is a JSON question schema turns a chat request into
+a few scored forwards. No text is generated: the answer template is seeded
+into the canvas with each label slot as noise, and each question's
+distribution is read from the logits at its slot. All questions in a
+request share each forward. One read conditions on one noise draw and is
+sharper than the model's marginal, so the reply averages 4 reads by
+default and reports the standard error.
+
+Request: exactly two messages. `system` is the schema, `user` is the state
+as JSON.
+
+```bash
+curl -s 127.0.0.1:8080/v1/chat/completions -d '{
+  "messages": [
+    {"role": "system", "content": "{\"questions\": [
+       {\"id\": \"urgent\", \"type\": \"noul\", \"instructions\": \"Does this ticket need a reply today?\"},
+       {\"id\": \"bucket\", \"type\": \"choice\", \"instructions\": \"Which team owns it?\",
+        \"options\": [{\"name\": \"billing\"}, {\"name\": \"support\"}, {\"name\": \"engineering\", \"description\": \"a defect or outage\"}]},
+       {\"id\": \"tone\", \"type\": \"score\", \"instructions\": \"How angry is the customer?\",
+        \"levels\": [\"calm\", \"annoyed\", \"furious\"]}]}"},
+    {"role": "user", "content": "{\"ticket\": \"Since this morning the dashboard shows a blank page after login. Console says 500 from /api/session.\"}"}
+  ]
+}'
+```
+
+Question types: `noul` (yes/no, reported as the probability of yes),
+`choice` (one of `options`), `score` (one of the ordered `levels`, plus
+the expected level). Labels are single tokens: `yes`/`no`, `A`/`B`/…,
+`1`/`2`/…. A schema whose labels tokenize to more than one token each is
+refused.
+
+Reply: `content` is JSON.
+
+```json
+{"answers": {
+   "urgent": {"type": "noul", "noul": 0.60, "label": "yes", "confidence": 0.60,
+              "stderr": 0.16, "agreement": 0.75,
+              "probabilities": {"yes": 0.60, "no": 0.40}},
+   "bucket": {"type": "choice", "choice": "engineering", "label": "C", "confidence": 1.0,
+              "stderr": 0.0, "agreement": 1.0,
+              "probabilities": {"billing": 0.0, "support": 0.0, "engineering": 1.0}},
+   "tone":   {"type": "score", "score": 1.77, "level": "annoyed", "label": "2", "confidence": 0.77,
+              "stderr": 0.06, "agreement": 1.0,
+              "probabilities": {"calm": 0.23, "annoyed": 0.77, "furious": 0.0}}},
+ "diagnostics": {"steps": 1, "hole": "noise", "samples": {"n": 4, "tops": [...]},
+                 "timing": {"prefill_ms": 720, "denoise_ms": 5060, "reused_tokens": 140, ...},
+                 "questions": {"tone": {"argmax_is_label": true, "entropy": 0.6, "label_mass": 1.0, ...}}}}
+```
+
+`probabilities` is the mean over the reads of a softmax over the label
+logits at temperature 1. `confidence` is the top label's mean probability,
+`stderr` its standard error over the reads, and `agreement` the share of
+reads that picked it. Two reads at 0.9 for opposite labels average to 0.5,
+the marginal over the noise. The values are the model's own marginals. No
+calibration against labelled data has been applied.
+
+Optional schema fields:
+
+- `instructions`: context placed before the questions.
+- `samples`: reads with different hole noise, averaged. Default 4. `1` is
+  a single read.
+- `steps`: forwards per read. Default 1.
+- `active`: canvas rows, a multiple of 64. Default: the smallest that
+  holds the template, 64 for up to about 12 questions. `256` is the full
+  canvas.
+- `hole`: what fills a label slot before the read. `noise` (default),
+  `pad`, `label`.
+- `climb`, `climb_mode`: a diagnostic hill climb. It ratifies the first
+  read.
+
+Performance on an M3 Pro with the q4 pack, a 3-question schema, a
+~190-token prompt, one server process:
+
+| Case | Wall |
+| :-- | --: |
+| First request on a schema (f32 engine prefill of the schema, once) | 8 to 15 s |
+| Next state, default (4 reads, 64 rows) | 3.1 s (0.7 prefill + 4 × 0.6 forward) |
+| Next state, 4 reads, `active: 256` | 5.8 s |
+| Next state, `samples: 1` | 1.3 s |
+| Next state, `samples: 1`, `active: 256` | 2.0 s |
+| 8 reads | 5.3 s |
+| Generating the same three answers as JSON (19 tokens, 3 to 5 steps) | 9.6 to 13.1 s |
+
+The schema prefix stays in the KV. Each later request prefills only its
+state. `DGQ_FAST_PREFILL=1` cuts the first request to 3 s but changed a
+borderline answer in our runs, so it is off. Width: 32 reads per setting
+gave identical 1.00 answers on the unambiguous tickets at 64 and 256 rows
+and a borderline answer within 1.3 standard errors (yes 0.56 ± 0.07
+against 0.68 ± 0.06), so the narrow default reads the same as the full
+canvas within noise. A borderline question still moves with the hole
+noise and the prefill precision (PLAN.md has the measurements). Use
+`samples` and read `stderr`.
+
 ## Custom Quantization
 
 Pull the bf16 weights into your huggingface cache

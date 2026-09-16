@@ -93,6 +93,22 @@ pub enum PipelineOp {
     /// Close the open turn: record `kv_valid_tokens` and return the assembled
     /// `Generated` output (same shape as the whole-turn op).
     EndTurn,
+    /// Prefill `prompt`, seed the canvas with `canvas`, run `steps` denoise
+    /// forwards at `active` width, and read the logits at `probes`; `climb`
+    /// more rounds re-seed each probe with its best candidate and restart
+    /// from step 0. Commits nothing: the causal log ends at the prompt. The
+    /// structured-decision primitive (`structured.rs`).
+    Score {
+        prompt: Vec<u32>,
+        cfg: Box<crate::metal::StepGenerateConfig>,
+        label: String,
+        canvas: Vec<u32>,
+        active: usize,
+        steps: usize,
+        climb: usize,
+        leave_one_out: bool,
+        probes: Vec<crate::metal::ScoreProbe>,
+    },
     Shutdown,
 }
 
@@ -116,6 +132,7 @@ impl PipelineOp {
             Self::CommitBlock { .. } => "commit_block",
             Self::DiscardBlock => "discard_block",
             Self::EndTurn => "end_turn",
+            Self::Score { .. } => "score",
             Self::Shutdown => "shutdown",
         }
     }
@@ -170,6 +187,27 @@ impl PipelineOp {
             }
             Self::DiscardBlock => json!("discard_block"),
             Self::EndTurn => json!("end_turn"),
+            Self::Score {
+                prompt,
+                cfg,
+                label,
+                canvas,
+                active,
+                steps,
+                climb,
+                leave_one_out,
+                probes,
+            } => json!({"score": {
+                "prompt": prompt,
+                "cfg": cfg_json(cfg),
+                "label": label,
+                "canvas": canvas,
+                "active": active,
+                "steps": steps,
+                "climb": climb,
+                "leave_one_out": leave_one_out,
+                "probes": probes.iter().map(|p| json!({"pos": p.pos, "candidates": p.candidates})).collect::<Vec<_>>(),
+            }}),
             Self::Shutdown => json!("shutdown"),
         }
     }
@@ -269,6 +307,27 @@ impl PipelineOp {
             "commit_block" => Some(Self::CommitBlock {
                 kept_len: body.get("kept_len")?.as_u64()? as usize,
                 extend: body.get("extend")?.as_bool()?,
+            }),
+            "score" => Some(Self::Score {
+                prompt: ids(body.get("prompt")?)?,
+                cfg: Box::new(cfg_from(body.get("cfg")?, model_dir)?),
+                label: body.get("label")?.as_str()?.to_string(),
+                canvas: ids(body.get("canvas")?)?,
+                active: body.get("active")?.as_u64()? as usize,
+                steps: body.get("steps")?.as_u64()? as usize,
+                climb: body.get("climb")?.as_u64()? as usize,
+                leave_one_out: body.get("leave_one_out")?.as_bool()?,
+                probes: body
+                    .get("probes")?
+                    .as_array()?
+                    .iter()
+                    .map(|p| {
+                        Some(crate::metal::ScoreProbe {
+                            pos: p.get("pos")?.as_u64()? as usize,
+                            candidates: ids(p.get("candidates")?)?,
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()?,
             }),
             _ => None,
         }

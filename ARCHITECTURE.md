@@ -176,8 +176,11 @@ the **f32 engine** prefill; longer prompts use the **fast quantized (bf16
 activation) prefill** (~3 ms/token, ~20× the engine, doc-QA-grounded to 13k+
 and needle-exact to 121k). `DGQ_FAST_PREFILL_MAX` (default 0 = uncapped) can
 reinstate an upper band routed back to the engine; `DGQ_FAST_PREFILL=1|0`
-forces either path. Cross-turn delta reuse follows the same rule on the
-DELTA length.
+forces either path for a whole-prompt prefill. A cross-turn DELTA (the
+tokens past a reused prefix) always takes the fast quantized resume, at any
+length, unless it exceeds `DGQ_FAST_PREFILL_MAX`; the force flag does not
+reach it. So a short multi-turn prompt is mixed precision by default: an
+engine-prefilled first turn and fast-prefilled later turns.
 
 The ≤256 engine floor is a QUALITY choice, not just wall-clock: fast prefill
 for all lengths regresses the multi-seed gate on short factual prompts

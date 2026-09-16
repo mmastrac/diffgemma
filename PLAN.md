@@ -107,6 +107,100 @@ decode headroom is STEP COUNT (E7 territory), not per-step attention.
   full rebuild. A KV snapshot restore path could make deep rewinds cheap;
   measure demand from field op-logs first.
 
+## Structured decisions (serve, shipped as a subset)
+
+`structured.rs` + `PipelineOp::Score`: a JSON schema in the system message
+turns a chat request into one scored forward (README "Structured
+decisions"). Open, in order of what would change the product:
+
+- Calibration. The reply reports raw step-1 marginals. Get expected
+  calibration error on a labelled set before claiming anything. A per-schema
+  temperature fit is the cheapest fix if the marginals are overconfident.
+- Hole filler, step count, canvas width. `hole` (noise / pad / label),
+  `steps` (1 / 2) and `active` are request knobs so they can be A/B'd on the
+  same state. On one borderline question (an outage ticket, "reply today?")
+  they disagree: noise/256/1 step says yes 0.96, pad holes say no 0.99,
+  a 64-row canvas says no 0.92, 2 steps say yes 1.00. The unambiguous
+  questions agree under every knob. A 64-row forward takes 575 ms against
+  1200 ms at 256 rows. Pick defaults from a labelled run.
+- Hole-noise variance is the real uncertainty. Eight seeds on that question
+  split 6/2 (256 rows), 4/4 (64 rows) and 5/3 (2 steps), every single read
+  at 0.8 or better. `samples: 8` reports the mean (0.55 to 0.70) and the
+  agreement, and the two easy tickets stay unanimous at 1.00. Cost is one
+  forward per sample after the shared prefill (0.6 s at 64 rows, 1.3 s at
+  256).
+- Hill climbing (`climb`, `climb_mode`) is not a lever. A joint climb
+  (write every top label back, re-read from step 0) converges in one round
+  and ratifies the first read to 1.00 whatever it was, including the pad
+  artifact and a label-seeded bias: a filled slot is read as signal, the
+  same self-confirmation the rewound-canvas fixed point measures. A
+  leave-one-out climb (re-read each slot with the others filled and its own
+  slot noised) does not self-ratify and corrected the pad artifact, but it
+  costs one forward per question per round. It moved no noise-start
+  label. Kept as request knobs for diagnosis.
+- Cross-question interference. Slots see each other's fillers
+  bidirectionally. Compare N-question requests against N single-question
+  requests on the same state.
+- Prefill is the remaining cost. Profiled under samply: the pipeline
+  thread's CPU-active time over a whole session is under a second, the rest
+  is GPU wait, so the levers are GPU dispatch shape. Shipped: a short tail
+  prefill chunk runs at a 64-row multiple (`DGQ_PREFILL_NARROW=0` restores
+  full width), bit-identical KV (`narrow_prefill_chunk_bit_identity`,
+  the 8-case byte-identity gate 8/8), 51-token delta 1.12 s to 0.51 s in the test and 1.3 s to
+  0.65 s served, request wall 2.0 s to 1.2 s at 64 rows. Open: the cold
+  schema prefix pays the f32 engine (9.4 s for 187 tokens).
+  `DGQ_FAST_PREFILL=1` makes that 3.0 s, but the fast-prefilled prefix
+  moves the outage ticket's borderline answers while the easy tickets
+  hold, so the engine stays the default until a labelled run picks.
+- Which prefill precision matters: the schema prefix. Five
+  arms on the outage ticket, 16 averaged 64-row reads each, "urgent" mean
+  and agreement: engine schema + fast state (default) yes 0.57 / 0.62;
+  engine schema + engine state yes 0.56 / 0.56; whole prompt engine in one
+  pass yes 0.56 / 0.56; fast schema + fast state no 0.80 / 0.81; whole
+  prompt fast in one pass no 0.80 / 0.81, sample for sample identical to
+  the reused-prefix arm. Tone moved less (0.76 to 0.68 annoyed). The
+  state's own precision is within noise. The 140-token instruction prefix
+  is where the bf16 route flips land (the mechanism behind the ≤256 engine
+  floor in ARCHITECTURE's prefill path selection), and the engine is the
+  reference precision, so the mixed default keeps the reference where it
+  counts and pays the f32 cost once per schema.
+- Against generating the JSON. The same tickets in the same process, thinking
+  off, the model asked for a JSON object with the three keys: it produced
+  the same labels in 19 tokens after 3 to 5 full-canvas steps, 4.3 to 7.2 s
+  of denoise, about 3 tok/s effective. A structured read is one forward:
+  0.6 s at 64 rows, 1.3 s at 256, and eight averaged 64-row reads cost
+  4.7 s. Both paths pay the same engine prefill for the state, but the
+  plain chat path folds the system prompt into the user turn and reused
+  none of it (6 s), while the structured path reuses the schema prefix
+  (1.3 s, now 0.67 s with the narrow tail chunk). Final run, one process:
+  a single read 2.0 s at 256 rows and 1.3 s at 64; the 4-read default
+  5.8 s at 256 rows and 3.1 s at 64; 8 reads at 64 rows 5.3 s; generated
+  JSON 9.6 to 13.1 s (3.9 to 6.7 s of denoise). A generation baseline at
+  a narrow canvas would be the fairer step-cost comparison and does not
+  exist as a product path.
+- Canvas width. The model is trained at 256 and MLX shrinks to
+  max(remaining, 64) near the budget, so 64 is the reference's own floor;
+  width does change behavior somewhere (the empty-reply attractor falls
+  72% to 3% with it). For reads, 32 samples per width on three tickets:
+  unambiguous answers 1.00 ± 0.00 at both widths; the outage ticket's tone
+  0.70 ± 0.05 (64) against 0.68 ± 0.06 (256) and "urgent" yes 0.56 ± 0.07
+  against yes 0.68 ± 0.06, within 1.3 standard errors, same lean. The
+  default is now the smallest 64-row multiple that holds the template
+  (`active: 256` opts back), which halves the per-read cost.
+- Standing of the probabilities. A read is the denoiser's posterior over
+  the slot's clean token given one noised canvas, a cross-entropy-trained
+  conditional, restricted to labels that hold 0.99+ of the row's mass. It
+  conditions on one noise draw, so the mean over reads is the Monte Carlo
+  estimate of the marginal and is what `probabilities` reports, with
+  `stderr` and `agreement` beside it (default 4 reads; on the outage
+  ticket "urgent" reads yes 0.60 ± 0.16 at agreement 0.75). Nothing ties
+  the marginals to real-world frequencies: instruction tuning sharpens
+  them, and a calibration claim needs a labelled set and a per-schema
+  temperature fit.
+- Multi-token answers (extraction fields) need the `Refine
+  {mask|forced_ids}` primitive: pin the skeleton, denoise the hole, which the
+  rewound-canvas fixed point puts at 2 to 3 steps.
+
 ## Message-layer designs (user-directed, not started)
 
 - **Interleaving-restoration blob**: any assistant-turn interleaving not

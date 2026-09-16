@@ -8,8 +8,9 @@ mod turn;
 pub use config::{CancelToken, StepGenerateConfig, StepObserver};
 pub use session::{KvSnapshot, StepGenerateSession};
 pub use turn::{
-    BlockOutcome, ProposedBlock, TurnState, begin_turn, commit_block, finish_turn,
-    generate_monolithic, generate_with_session, propose_block,
+    BlockOutcome, CanvasScoreOutput, ProposedBlock, ScoreProbe, TurnState, begin_turn,
+    commit_block, finish_turn, generate_monolithic, generate_with_session, propose_block,
+    score_canvas,
 };
 
 #[cfg(test)]
