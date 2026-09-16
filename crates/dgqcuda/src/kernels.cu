@@ -129,6 +129,85 @@ extern "C" __global__ void dgq_rope(
 // rows tok < causal_split see only positions <= their own, every other row
 // sees the whole sequence (the diffusion canvas is bidirectional).
 // causal_split = seq is a plain causal prefill; 0 is fully bidirectional.
+// dgq_attention_v3: the same contract as v2 (one block per (row, head),
+// same arguments, same mask), parallel inside the block. v2 had every one
+// of its 128 threads walk the whole key range with a 512-float local
+// accumulator, so a block did 128x the work of one thread and spilled; it
+// was 50 s of a 55 s denoise step. Here each of the 4 warps takes every
+// 4th key, lanes split head_dim (element d = i*32 + lane, so a warp's loads
+// coalesce), the QK dot is a shuffle reduction, each warp keeps its own
+// online-softmax state, and the 4 states merge through shared memory at
+// the end. Per-key math is v2's; only the summation order differs.
+#define ATTN_MAX_PER_LANE 16   // head_dim 512 / 32 lanes
+extern "C" __global__ void dgq_attention_v3(
+    const float *q, const float *kv, float *out,
+    unsigned seq, unsigned n_heads, unsigned n_kv_heads,
+    unsigned head_dim, unsigned total_kv, unsigned window,
+    unsigned pos0, unsigned causal_split
+) {
+    const unsigned row = blockIdx.x;
+    const unsigned tok = row / n_heads;
+    const unsigned qh = row % n_heads;
+    if (tok >= seq) return;
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned warp = threadIdx.x >> 5u;
+    const unsigned n_warps = blockDim.x >> 5u;
+    const unsigned per_lane = head_dim / 32u;
+    const unsigned n_groups = n_heads / n_kv_heads;
+    const unsigned kvh = qh / n_groups;
+    const float *qv = q + (size_t)row * head_dim;
+    const unsigned abs_pos = pos0 + tok;
+    const unsigned causal_end = (abs_pos + 1u < total_kv) ? (abs_pos + 1u) : total_kv;
+    const unsigned kv_end = (tok < causal_split) ? causal_end : total_kv;
+    // Sliding window: v2 skips t when t + window <= abs_pos.
+    const unsigned kv_start = (window > 0u && abs_pos + 1u > window) ? (abs_pos + 1u - window) : 0u;
+
+    float qr[ATTN_MAX_PER_LANE];
+    float acc[ATTN_MAX_PER_LANE];
+    for (unsigned i = 0; i < ATTN_MAX_PER_LANE; i++) {
+        qr[i] = (i < per_lane) ? qv[i * 32u + lane] : 0.0f;
+        acc[i] = 0.0f;
+    }
+    float m = -1.0e30f, l = 0.0f;
+    const size_t kv_stride = (size_t)2u * n_kv_heads * head_dim;
+    for (unsigned t = kv_start + warp; t < kv_end; t += n_warps) {
+        const float *k = kv + (size_t)t * kv_stride + (size_t)kvh * head_dim;
+        float part = 0.0f;
+        for (unsigned i = 0; i < per_lane; i++) part += qr[i] * k[i * 32u + lane];
+        for (unsigned off = 16; off > 0; off >>= 1)
+            part += __shfl_xor_sync(0xffffffffu, part, off);
+        const float dot = part;
+        const float mn = fmaxf(m, dot);
+        const float corr = expf(m - mn);
+        const float p = expf(dot - mn);
+        m = mn;
+        l = l * corr + p;
+        const float *v = k + (size_t)n_kv_heads * head_dim;
+        for (unsigned i = 0; i < per_lane; i++) acc[i] = acc[i] * corr + p * v[i * 32u + lane];
+    }
+
+    // Merge the warps' states: M = max m_w, each warp's (l, acc) rescaled
+    // by exp(m_w - M). A warp that saw no key has m = -1e30 and l = 0, so its
+    // weight underflows to 0 and it contributes nothing.
+    __shared__ float s_m[4];
+    __shared__ float s_l[4];
+    __shared__ float s_acc[4][512];
+    if (lane == 0) { s_m[warp] = m; s_l[warp] = l; }
+    for (unsigned i = 0; i < per_lane; i++) s_acc[warp][i * 32u + lane] = acc[i];
+    __syncthreads();
+    float M = s_m[0];
+    for (unsigned w = 1; w < n_warps; w++) M = fmaxf(M, s_m[w]);
+    float L = 0.0f;
+    for (unsigned w = 0; w < n_warps; w++) L += s_l[w] * expf(s_m[w] - M);
+    const float inv = (L > 0.0f) ? (1.0f / L) : 0.0f;
+    float *ov = out + (size_t)row * head_dim;
+    for (unsigned d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float a = 0.0f;
+        for (unsigned w = 0; w < n_warps; w++) a += s_acc[w][d] * expf(s_m[w] - M);
+        ov[d] = a * inv;
+    }
+}
+
 extern "C" __global__ void dgq_attention_v2(
     const float *q, const float *kv, float *out,
     unsigned seq, unsigned n_heads, unsigned n_kv_heads,

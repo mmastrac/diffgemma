@@ -12,10 +12,31 @@ fn run_case(seq: usize, n_heads: usize, n_kv: usize, hd: usize) -> f64 {
     run_case_split(seq, n_heads, n_kv, hd, 0, seq)
 }
 
+/// Both kernels share one contract; every reference check runs on each.
+const KERNELS: [&str; 2] = ["dgq_attention_v2", "dgq_attention_v3"];
+
 /// The same case with an explicit absolute position and causal split: rows
 /// below `causal_split` attend causally, the rest bidirectionally (the denoise
 /// pass's prompt/canvas layout).
 fn run_case_split(
+    seq: usize,
+    n_heads: usize,
+    n_kv: usize,
+    hd: usize,
+    pos0: usize,
+    causal_split: usize,
+) -> f64 {
+    let mut worst = 1.0f64;
+    for name in KERNELS {
+        let cos = run_case_kernel(name, seq, n_heads, n_kv, hd, pos0, causal_split);
+        println!("  {name}: cos {cos}");
+        worst = worst.min(cos);
+    }
+    worst
+}
+
+fn run_case_kernel(
+    name: &'static str,
     seq: usize,
     n_heads: usize,
     n_kv: usize,
@@ -46,7 +67,7 @@ fn run_case_split(
     let bkv = DeviceBuffer::alloc(&ctx, kv.len() * 4).unwrap();
     bkv.write_f32(&kv).unwrap();
     let bo = DeviceBuffer::alloc(&ctx, q.len() * 4).unwrap();
-    let kk = cached_source_kernel(dgqcuda::KERNELS, "dgq_attention_v2").expect("kernel");
+    let kk = cached_source_kernel(dgqcuda::KERNELS, name).expect("kernel");
     let mut args = KernelArgs::new();
     args.device_ptr(bq.device_ptr())
         .device_ptr(bkv.device_ptr())
@@ -148,7 +169,10 @@ fn attention_honors_the_causal_split() {
 /// other cases use.
 #[test]
 fn attention_first_causal_row_is_its_own_value() {
-    for (seq, split) in [(4usize, 4usize), (6, 2), (22, 20), (33, 20)] {
+    for (name, (seq, split)) in KERNELS
+        .into_iter()
+        .flat_map(|n| [(4usize, 4usize), (6, 2), (22, 20), (33, 20)].map(|c| (n, c)))
+    {
         let hd = 256;
         let (n_heads, n_kv) = (16, 8);
         let row = n_kv * hd;
@@ -170,7 +194,7 @@ fn attention_first_causal_row_is_its_own_value() {
         let bkv = DeviceBuffer::alloc(&ctx, kv.len() * 4).unwrap();
         bkv.write_f32(&kv).unwrap();
         let bo = DeviceBuffer::alloc(&ctx, q.len() * 4).unwrap();
-        let kk = cached_source_kernel(dgqcuda::KERNELS, "dgq_attention_v2").expect("kernel");
+        let kk = cached_source_kernel(dgqcuda::KERNELS, name).expect("kernel");
         let mut args = KernelArgs::new();
         args.device_ptr(bq.device_ptr())
             .device_ptr(bkv.device_ptr())
@@ -201,7 +225,7 @@ fn attention_first_causal_row_is_its_own_value() {
             for d in 0..hd {
                 assert!(
                     (want[d] - have[d]).abs() <= 1e-6,
-                    "seq {seq} split {split} head {qh} d {d}: want {} got {}",
+                    "{name} seq {seq} split {split} head {qh} d {d}: want {} got {}",
                     want[d],
                     have[d]
                 );
@@ -246,4 +270,22 @@ fn attention_full_geometry_across_a_tile_boundary() {
         println!("full-attention seq {seq} cos {cos}");
         assert!(cos > 0.9999, "seq {seq}: cos {cos}");
     }
+}
+
+/// The step's own geometry: 27 causal prompt rows then a 256-row
+/// bidirectional canvas, full-attention heads. Both kernels against the
+/// reference, and the window path at the sliding geometry.
+#[test]
+fn attention_v3_matches_v2_at_the_step_geometry() {
+    let full = run_case_split(283, 16, 2, 512, 0, 27);
+    println!("step geometry (full) worst cos {full}");
+    assert!(full > 0.99999, "cos {full}");
+    let sliding = run_case_split(283, 16, 8, 256, 0, 27);
+    println!("step geometry (sliding) worst cos {sliding}");
+    assert!(sliding > 0.99999, "cos {sliding}");
+    // Into the window: at pos0 1010 the rows from 14 on drop the keys at
+    // t <= tok - 14 (t + 1024 <= abs_q), so both kernels must skip them.
+    let windowed = run_case_split(40, 16, 8, 256, 1010, 40);
+    println!("windowed worst cos {windowed}");
+    assert!(windowed > 0.99999, "cos {windowed}");
 }

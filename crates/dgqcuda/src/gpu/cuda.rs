@@ -740,6 +740,16 @@ pub(crate) fn arena_store(
     Ok(())
 }
 
+/// `DGQCUDA_ATTN=v2` keeps the serial kernel for A/Bs; v3 is the default.
+fn attention_kernel() -> &'static str {
+    use std::sync::OnceLock;
+    static K: OnceLock<&'static str> = OnceLock::new();
+    K.get_or_init(|| match std::env::var("DGQCUDA_ATTN").as_deref() {
+        Ok("v2") => "dgq_attention_v2",
+        _ => "dgq_attention_v3",
+    })
+}
+
 /// `arena_store` from element `offset` of `buf`: a pass against a KV cache
 /// stores only the rows it wrote.
 pub(crate) fn arena_store_at(
@@ -1023,7 +1033,7 @@ pub(crate) fn layer_forward(
         .u32(causal_split as u32);
     launch(
         ctx,
-        "dgq_attention_v2",
+        attention_kernel(),
         rows(seq * n_heads, 128),
         128,
         &mut args,
