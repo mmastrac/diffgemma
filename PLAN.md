@@ -306,6 +306,38 @@ clears 0.641 by a lot.
       port's structural limit there: `dgqcuda denoise` runs ONE 256-token
       canvas and never chains a second block, so any reply longer than that
       is cut off. The engine writes 550-665 words for the explain probes.
+      The KV cache below is the prerequisite; chaining itself is not built.
+    - Step time is the attention kernel. With the timing marks split,
+      `dgq_attention_v2` alone is 50.1 s of a 54.8 s step (canvas 256,
+      283 keys); the QKV GEMMs are 0.3 s, experts 3.8 s. The kernel is one
+      block per (row, head) with every thread of the block walking the
+      whole key range redundantly and a 512-float accumulator per thread,
+      which spills. The engine's target is <= 5 s/step; this kernel is the
+      whole gap and the next lever.
+    - Soft-embed disagrees with the CPU oracle in high-entropy regimes.
+      At canvas 16 with only the chat-template prefix as prompt (mean_H
+      ~4), step 2 is cos 0.89 with argmax mismatches against the oracle
+      while step 1 is 0.9997; identical on the pre-cache and cache builds,
+      so it is not the cache. `dgq_soft_embed` keeps at most 16 candidates
+      per thread (4096 per row) of the tokens within 10 logits of the max;
+      the CPU keeps all of them. Invisible on real prompts (mean_H 0.0156
+      at step 1, 0.9997 at step 2), so it is a diagnostic-regime finding,
+      not a generation defect on anything measured. Not fixed.
+
+  **Built: a resident per-layer KV cache** (a3ead737). `Session::prefill`
+  runs clean rows causally at the cache length and appends their K/V;
+  `Session::step` runs the canvas rows alone at absolute positions past
+  the cache, attending the whole cache plus themselves. A committed block
+  is prefilled the same way, so block chaining is a loop on top of this.
+  Exact against the old `[prompt][canvas]` pass by A/B of both binaries on
+  the same prompt and seed: 0 argmax flips and a 0.0000 max logit delta at
+  every canvas position on steps 1 and 2, identical accept counts and
+  entropies. Against the CPU oracle, 512/512 argmaxes over two steps, min
+  row cos 0.9996; `tests/kv_session.rs` pins prefill + two steps. What it
+  did NOT do is make the step faster (57 s against 59 s): the prompt was
+  27 of 283 rows and the cost is the canvas, which is the attention
+  finding above. The pre-cache build is kept at `~/diffgemma-cuda-old` on
+  gx10-efcd for further A/Bs.
     - RESOLVED: the "per-row K drift at depth" (position 4 at cos 0.0525 by
       layer 29 while position 3 held 0.9997) was the diagnostic `forward`
       command, not the model path. `forward --gpu` ran every prompt row
