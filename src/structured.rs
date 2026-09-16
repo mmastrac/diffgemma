@@ -26,13 +26,14 @@
 //!     "options": [{"name": "bug", "description": "defect"}, {"name": "feature"}]},
 //!    {"id": "depth", "type": "score", "instructions": "How thorough?",
 //!     "levels": ["Superficial", "Adequate", "Thorough"]}],
-//!  "steps": 1, "hole": "noise", "climb": 0, "climb_mode": "joint", "samples": 4}
+//!  "steps": 1, "hole": "noise", "climb": 0, "climb_mode": "joint", "samples": "auto"}
 //! ```
 //!
-//! `"samples": "auto"` takes one read and the remaining reads (up to
-//! `auto_max`) only when some slot's first-read entropy is above
-//! `auto_threshold`. `fix_definite` fills the slots below the threshold
-//! with their first-read label for the later reads.
+//! `"samples": "auto"` (the default) takes one read and the remaining
+//! reads (up to `auto_max`) only when some slot's first-read entropy is
+//! above `auto_threshold`. A count fixes the number of reads.
+//! `fix_definite` fills the slots below the threshold with their first-read
+//! label for the later reads.
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -120,11 +121,10 @@ pub struct Schema {
 pub enum Samples {
     Fixed(usize),
     /// One read, then up to `max` in total when any slot's first-read row
-    /// entropy (nats) is above `threshold`. Measured on ten tickets: the
-    /// slots that moved across noise draws read 0.25 nats or more on their
-    /// first read, the stable ones 0.16 or less. The 0.1 default was fixed
-    /// before the held-out run, for margin, and is opt-in until that run
-    /// reports its miss rate.
+    /// entropy (nats) is above `threshold`. The 0.1 threshold was fixed
+    /// before a held-out run of 20 tickets and 60 slots at 16 reads each,
+    /// where the rule caught all 5 slots that moved across noise draws and
+    /// flagged none of the 55 stable ones. The default.
     Auto {
         max: usize,
         threshold: f32,
@@ -277,7 +277,10 @@ impl Schema {
                 Some(other) => return Err(format!("schema: unknown climb_mode {other:?}")),
             },
             samples: match raw.samples {
-                None => Samples::Fixed(4),
+                None => Samples::Auto {
+                    max: raw.auto_max.unwrap_or(4).clamp(1, 32),
+                    threshold: raw.auto_threshold.unwrap_or(0.1).max(0.0),
+                },
                 Some(SamplesJson::Count(n)) => Samples::Fixed(n.clamp(1, 32)),
                 Some(SamplesJson::Mode(m)) if m == "auto" => Samples::Auto {
                     max: raw.auto_max.unwrap_or(4).clamp(1, 32),
@@ -549,8 +552,8 @@ impl Schema {
                 Value::Object(m)
             })
             .collect();
-        // Each sample's top label per question, so the spread reads at a
-        // glance beside the averaged answer.
+        // Each sample's top label, its probability and the row entropy per
+        // question, so the spread reads at a glance beside the averaged answer.
         let sample_tops: Vec<Value> = finals
             .iter()
             .map(|f| {
@@ -558,7 +561,7 @@ impl Schema {
                 for (q, s) in self.questions.iter().zip(f.iter()) {
                     let probs = softmax(&s.label_logits);
                     let top = argmax(&probs);
-                    m.insert(q.id.clone(), json!([q.labels[top], probs[top]]));
+                    m.insert(q.id.clone(), json!([q.labels[top], probs[top], s.entropy]));
                 }
                 Value::Object(m)
             })

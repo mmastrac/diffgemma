@@ -210,8 +210,9 @@ decisions"). Open, in order of what would change the product:
   threshold would have missed one mover (first-read entropy 0.15), so 0.1
   stays. First-read entropy also tracked the author's borderline flags
   (median 0.028 against 0.002 nats), and the 16-read labels matched the
-  author's intent on 53 of 60 slots, 11 of 17 borderline. Shipped as
-  `samples: "auto"` (opt-in) with `auto_threshold` and `auto_max`.
+  author's intent on 53 of 60 slots, 11 of 17 borderline. `samples:
+  "auto"` with `auto_threshold` and `auto_max` is the default. A count
+  fixes the reads.
 - Pinning settled slots. `fix_definite` fills the first-read-settled
   slots with their label for the later reads. On the 5 held-out movers it
   changed no label, moved agreement by +0.25, −0.06, 0, +0.06, +0.12, and

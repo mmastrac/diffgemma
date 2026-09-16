@@ -145,8 +145,8 @@ a few scored forwards. No text is generated: the answer template is seeded
 into the canvas with each label slot as noise, and each question's
 distribution is read from the logits at its slot. All questions in a
 request share each forward. One read conditions on one noise draw and is
-sharper than the model's marginal, so the reply averages 4 reads by
-default and reports the standard error.
+sharper than the model's marginal, so when any slot's first read is
+uncertain the reply averages 4 reads and reports the standard error.
 
 Request: exactly two messages. `system` is the schema, `user` is the state
 as JSON.
@@ -199,13 +199,13 @@ calibration against labelled data has been applied.
 Optional schema fields:
 
 - `instructions`: context placed before the questions.
-- `samples`: reads with different hole noise, averaged. Default 4. `1` is
-  a single read. `"auto"` takes one read and the rest (up to `auto_max`,
-  default 4) only when some slot's first-read entropy is above
-  `auto_threshold` (default 0.1 nats). On a held-out set of 20 tickets and
-  60 slots the rule caught all 5 slots that moved across noise draws,
-  flagged none of the 55 stable ones, and stopped 15 of the 20 tickets at
-  one read.
+- `samples`: reads with different hole noise, averaged. Default `"auto"`:
+  a single read, then the rest (up to `auto_max`, default 4) only when some
+  slot's first-read entropy is above `auto_threshold` (default 0.1 nats).
+  On a held-out set of 20 tickets and 60 slots the rule caught all 5
+  slots that moved across noise draws, flagged none of the 55 stable
+  ones, and stopped 15 of the 20 tickets at one read. A count (`4`, `1`)
+  fixes the number of reads.
 - `fix_definite`: under `"auto"`, pin the slots that settled on the first
   read to their label for the later reads, so the uncertain slots
   condition on the settled answers. Changes what is estimated (a
@@ -226,12 +226,12 @@ Performance on an M3 Pro with the q4 pack, a 3-question schema, a
 | Case | Wall |
 | :-- | --: |
 | First request on a schema (f32 engine prefill of the schema, once) | 8 to 15 s |
-| Next state, default (4 reads, 64 rows) | 3.1 s (0.7 prefill + 4 × 0.6 forward) |
-| Next state, `samples: "auto"`, no slot flagged (15 of 20 held-out tickets) | 1.3 s |
-| Next state, 4 reads, `active: 256` | 5.8 s |
-| Next state, `samples: 1` | 1.3 s |
+| Next state, default, no slot flagged (15 of 20 held-out tickets) | 1.3 s (0.7 prefill + 0.6 forward) |
+| Next state, default, a slot flagged (4 reads) | 3.1 s |
+| Next state, `samples: 4` | 3.1 s |
+| Next state, `samples: 4`, `active: 256` | 5.8 s |
 | Next state, `samples: 1`, `active: 256` | 2.0 s |
-| 8 reads | 5.3 s |
+| `samples: 8` | 5.3 s |
 | Generating the same three answers as JSON (19 tokens, 3 to 5 steps) | 9.6 to 13.1 s |
 
 The schema prefix stays in the KV. Each later request prefills only its
