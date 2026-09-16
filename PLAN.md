@@ -187,6 +187,19 @@ decisions"). Open, in order of what would change the product:
   against yes 0.68 ± 0.06, within 1.3 standard errors, same lean. The
   default is now the smallest 64-row multiple that holds the template
   (`active: 256` opts back), which halves the per-read cost.
+- First-read entropy predicts which slots move. Ten tickets, 30 slots,
+  16 reads each at the default width: 3 slots had agreement below 1
+  (outage urgent 0.62, outage tone 0.81, cancel-now tone 0.75). Their
+  first-read row entropy was 0.25, 0.36 and 0.63 nats; the 27 stable slots
+  were at or below 0.16, and 24 of them below 0.06. A threshold of 0.2
+  catches all three movers and flags no stable slot on this set; 0.1 flags
+  one. The first read's label probability also separates them here (0.92,
+  0.88, 0.68 against 0.96 and up), with a thinner margin. Each read's
+  entropy is now in `diagnostics.samples.tops`. The candidate: adaptive
+  sampling, one read, then the remaining reads only when some slot's
+  entropy is above the threshold, which on this set stops 6 of 10
+  tickets at one read. Three movers is thin evidence; the threshold
+  wants a labelled run before it is a default.
 - Standing of the probabilities. A read is the denoiser's posterior over
   the slot's clean token given one noised canvas, a cross-entropy-trained
   conditional, restricted to labels that hold 0.99+ of the row's mass. It

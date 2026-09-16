@@ -489,8 +489,8 @@ impl Schema {
                 Value::Object(m)
             })
             .collect();
-        // Each sample's top label per question, so the spread reads at a
-        // glance beside the averaged answer.
+        // Each sample's top label, its probability and the row entropy per
+        // question, so the spread reads at a glance beside the averaged answer.
         let sample_tops: Vec<Value> = finals
             .iter()
             .map(|f| {
@@ -498,7 +498,7 @@ impl Schema {
                 for (q, s) in self.questions.iter().zip(f.iter()) {
                     let probs = softmax(&s.label_logits);
                     let top = argmax(&probs);
-                    m.insert(q.id.clone(), json!([q.labels[top], probs[top]]));
+                    m.insert(q.id.clone(), json!([q.labels[top], probs[top], s.entropy]));
                 }
                 Value::Object(m)
             })
