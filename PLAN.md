@@ -107,6 +107,58 @@ decode headroom is STEP COUNT (E7 territory), not per-step attention.
   full rebuild. A KV snapshot restore path could make deep rewinds cheap;
   measure demand from field op-logs first.
 
+## Structured decisions (serve, shipped as a subset)
+
+`structured.rs` + `PipelineOp::Score`: a JSON schema in the system message
+turns a chat request into one scored forward (README "Structured
+decisions"). Open, in order of what would change the product:
+
+- Calibration. The reply reports raw step-1 marginals. Get expected
+  calibration error on a labelled set before claiming anything. A per-schema
+  temperature fit is the cheapest fix if the marginals are overconfident.
+- Hole filler, step count, canvas width. `hole` (noise / pad / label),
+  `steps` (1 / 2) and `active` are request knobs so they can be A/B'd on the
+  same state. On one borderline question (an outage ticket, "reply today?")
+  they disagree: noise/256/1 step says yes 0.96, pad holes say no 0.99,
+  a 64-row canvas says no 0.92, 2 steps say yes 1.00. The unambiguous
+  questions agree under every knob. A 64-row forward takes 575 ms against
+  1200 ms at 256 rows. Pick defaults from a labelled run.
+- Hole-noise variance is the real uncertainty. Eight seeds on that question
+  split 6/2 (256 rows), 4/4 (64 rows) and 5/3 (2 steps), every single read
+  at 0.8 or better. `samples: 8` reports the mean (0.55 to 0.70) and the
+  agreement, and the two easy tickets stay unanimous at 1.00. Cost is one
+  forward per sample after the shared prefill (0.6 s at 64 rows, 1.3 s at
+  256).
+- Hill climbing (`climb`, `climb_mode`) is not a lever. A joint climb
+  (write every top label back, re-read from step 0) converges in one round
+  and ratifies the first read to 1.00 whatever it was, including the pad
+  artifact and a label-seeded bias: a filled slot is read as signal, the
+  same self-confirmation the rewound-canvas fixed point measures. A
+  leave-one-out climb (re-read each slot with the others filled and its own
+  slot noised) does not self-ratify and corrected the pad artifact, but it
+  costs one forward per question per round. It moved no noise-start
+  label. Kept as request knobs for diagnosis.
+- Cross-question interference. Slots see each other's fillers
+  bidirectionally. Compare N-question requests against N single-question
+  requests on the same state.
+- Short-prompt prefill. The state delta runs through the f32 engine (~1.3 s
+  for ~50 tokens). `DGQ_FAST_PREFILL=1` would cut that to a chunk floor of
+  ~0.8 s if its short-prompt regression does not reach logit readout.
+- Against generating the JSON. The same tickets in the same process, thinking
+  off, the model asked for a JSON object with the three keys: it produced
+  the same labels in 19 tokens after 3 to 5 full-canvas steps, 4.3 to 7.2 s
+  of denoise, about 3 tok/s effective. A structured read is one forward:
+  0.6 s at 64 rows, 1.3 s at 256, and eight averaged 64-row reads cost
+  4.7 s. Both paths pay the same engine prefill for the state, but the
+  plain chat path folds the system prompt into the user turn and reused
+  none of it (6 s), while the structured path reuses the schema prefix
+  (1.3 s). Wall: 2.0 s against 12 to 14 s. A generation baseline at a
+  narrow canvas would be the fairer step-cost comparison and does not
+  exist as a product path.
+- Multi-token answers (extraction fields) need the `Refine
+  {mask|forced_ids}` primitive: pin the skeleton, denoise the hole, which the
+  rewound-canvas fixed point puts at 2 to 3 steps.
+
 ## Message-layer designs (user-directed, not started)
 
 - **Interleaving-restoration blob**: any assistant-turn interleaving not

@@ -73,6 +73,12 @@ pub enum PipelineEvent {
     BlockDiscarded {
         kv: KvId,
     },
+    /// `Score` result: per-probe logits and row stats; `kv` is unchanged
+    /// (the op commits nothing).
+    Scored {
+        out: Box<crate::metal::CanvasScoreOutput>,
+        kv: KvId,
+    },
     Error(String),
     ShutDown,
 }
@@ -137,6 +143,12 @@ impl std::fmt::Debug for PipelineEvent {
                 )
             }
             Self::BlockDiscarded { kv } => write!(f, "BlockDiscarded {{ kv: {kv:?} }}"),
+            Self::Scored { out, kv } => write!(
+                f,
+                "Scored {{ probes: {}, steps: {}, kv: {kv:?} }}",
+                out.probes.len(),
+                out.steps_run
+            ),
             Self::Error(msg) => write!(f, "Error({msg:?})"),
             Self::ShutDown => write!(f, "ShutDown"),
         }
@@ -204,6 +216,17 @@ impl PipelineEvent {
                 json!({"block_committed": {"new_tokens": new_tokens, "kv": kv_json(kv)}})
             }
             Self::BlockDiscarded { kv } => json!({"block_discarded": {"kv": kv_json(kv)}}),
+            Self::Scored { out, kv } => json!({"scored": {
+                "probes": out.probes.iter().map(|p| json!({
+                    "argmax": p.argmax,
+                    "entropy": p.entropy,
+                    "candidate_logits": p.candidate_logits,
+                })).collect::<Vec<_>>(),
+                "steps": out.steps_run,
+                "rounds": out.rounds.len(),
+                "converged": out.converged,
+                "kv": kv_json(kv),
+            }}),
             Self::Error(msg) => json!({"error": msg}),
             Self::ShutDown => json!("shutdown"),
         }

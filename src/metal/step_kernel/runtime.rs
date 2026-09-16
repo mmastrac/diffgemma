@@ -436,6 +436,20 @@ impl StepRuntime {
         read_struct(&self.bufs.state)
     }
 
+    /// One canvas row of the last forward's logits (softcapped, untempered:
+    /// the sampler reads the buffer, it never writes it back). Valid after a
+    /// denoise step, for rows under the active canvas width.
+    pub fn read_logit_row_f32(&self, row: usize) -> Vec<f32> {
+        use crate::shaders::bf16::bf16_bits_to_f32;
+        let vocab = self.dims.vocab;
+        assert!(row < self.dims.canvas, "logit row {row} outside the canvas");
+        let ptr =
+            unsafe { self.bufs.logits.contents().as_ptr().add(row * vocab * 2) as *const u16 };
+        (0..vocab)
+            .map(|c| bf16_bits_to_f32(unsafe { *ptr.add(c) }))
+            .collect()
+    }
+
     /// Read the sampler rowstat plane `{mx, sum}` (f32 pairs, tempered
     /// distribution) for the first `rows` canvas rows. `p_max = 1/sum` since
     /// the softmax is centered on the max logit. Trace-only readback

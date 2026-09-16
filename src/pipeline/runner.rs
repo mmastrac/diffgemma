@@ -126,6 +126,7 @@ fn run_pipeline(
                 | PipelineOp::AlignTo { .. }
                 | PipelineOp::Splice { .. }
                 | PipelineOp::BeginTurn { .. }
+                | PipelineOp::Score { .. }
         )
     }
 
@@ -397,6 +398,39 @@ fn run_pipeline(
                     }
                 } else {
                     PipelineEvent::Error("end_turn: no open turn".into())
+                }
+            }
+            PipelineOp::Score {
+                prompt,
+                cfg,
+                label,
+                canvas,
+                active,
+                steps,
+                climb,
+                leave_one_out,
+                probes,
+            } => {
+                let mut cfg = *cfg;
+                cfg.layers = layers;
+                cfg.max_seq = max_seq;
+                match crate::metal::score_canvas(
+                    manager.session_mut(),
+                    &cfg,
+                    &prompt,
+                    &label,
+                    &canvas,
+                    active,
+                    steps,
+                    climb,
+                    leave_one_out,
+                    &probes,
+                ) {
+                    Ok(out) => PipelineEvent::Scored {
+                        out: Box::new(out),
+                        kv: kv_id(epoch, &mut manager),
+                    },
+                    Err(err) => PipelineEvent::Error(format!("score: {err}")),
                 }
             }
             PipelineOp::Shutdown => {

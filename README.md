@@ -138,6 +138,75 @@ For something permanent, drop that same `"provider"` block into `opencode.json`
 (project) or `~/.config/opencode/opencode.json` (global) and run
 `opencode -m diffgemma/diffgemma-26b-a4b-it-q4`.
 
+### Structured decisions (no text generation)
+
+A request whose **system message is a JSON question schema** is answered by
+one scored denoise forward instead of a generation: the answer template is
+seeded into the canvas, each label slot is left as noise, and the model's
+distribution over the labels is read off the logits at that slot. Every
+question is scored in the same forward, so a request with ten questions
+costs the same as one. The reply is always JSON. The **user message must
+be JSON** (the state to judge), and a request is exactly those two messages:
+the reply is read off the logits. It never enters the KV, so there is
+nothing to carry into a next turn. Repeat the schema with a new state, and
+the schema prefix is reused from the KV with only the state prefilled.
+
+```bash
+curl -s 127.0.0.1:8080/v1/chat/completions -d '{
+  "messages": [
+    {"role": "system", "content": "{\"questions\": [
+       {\"id\": \"urgent\", \"type\": \"noul\", \"instructions\": \"Does this need a reply today?\"},
+       {\"id\": \"bucket\", \"type\": \"choice\", \"instructions\": \"Which team owns it?\",
+        \"options\": [{\"name\": \"billing\"}, {\"name\": \"support\"}, {\"name\": \"engineering\", \"description\": \"a defect or outage\"}]},
+       {\"id\": \"tone\", \"type\": \"score\", \"instructions\": \"How angry is the customer?\",
+        \"levels\": [\"calm\", \"annoyed\", \"furious\"]}]}"},
+    {"role": "user", "content": "{\"ticket\": \"Since this morning the dashboard shows a blank page after login. Console says 500 from /api/session. Several people on my team see the same thing.\"}"}
+  ]
+}'
+```
+
+Question types, after Jev: `noul` (a proposition, answered `yes`/`no` and
+reported as the probability of `yes`), `choice` (one of the named `options`,
+labelled `A`, `B`, …), and `score` (one of the ordered `levels`, labelled
+`1`, `2`, …, reported as the top level plus the expected level). The
+`content` of the reply is a JSON object. This is the q4 pack's answer to the
+request above on an M3 Pro, with the schema prefix already resident:
+
+```json
+{"answers": {
+   "urgent": {"type": "noul", "noul": 0.96, "label": "yes", "confidence": 0.96,
+              "probabilities": {"yes": 0.96, "no": 0.04}},
+   "bucket": {"type": "choice", "choice": "engineering", "label": "C", "confidence": 1.0,
+              "probabilities": {"billing": 0.0, "support": 0.0, "engineering": 1.0}},
+   "tone":   {"type": "score", "score": 1.68, "level": "annoyed", "label": "2", "confidence": 0.68,
+              "probabilities": {"calm": 0.32, "annoyed": 0.68, "furious": 0.0}}},
+ "diagnostics": {"steps": 1, "hole": "noise",
+                 "timing": {"prefill_ms": 1283, "denoise_ms": 1203, "steps_run": 1,
+                            "prompt_tokens": 191, "reused_tokens": 140},
+                 "questions": {"tone": {"argmax_token": "2", "argmax_is_label": true,
+                                        "entropy": 0.6, "label_mass": 1.0}}}}
+```
+
+`probabilities` is a softmax over the label logits at temperature 1, and
+`confidence` is the top label's probability. These are the model's raw
+marginals. Nothing calibrates them, and a borderline question can flip with
+the canvas width or the hole filler. `label_mass` (the share of the row's
+full-vocabulary mass the labels hold) and `argmax_is_label` say whether the
+model read the slot as an answer at all.
+
+The hole noise itself moves a borderline answer: the same outage ticket
+read at eight seeds split 6 to 2 on "urgent", each read at 0.8 or better.
+`samples: N` averages N reads with different noise and adds an `agreement`
+field (the share of reads that picked the reported label), which is the
+honest confidence for a request that can afford N forwards. Optional schema
+fields: `instructions` (global context), `samples` (reads to average,
+default 1), `steps` (forwards per read, default 1), `hole` (`noise`
+default, `pad`, or `label`), `active` (canvas width to run, rounded up to
+64), `climb` (hill-climb rounds, default 0) with `climb_mode` (`joint`
+default, or `loo`). A joint climb writes every slot's top label back into
+the canvas and re-reads from step 0. It converges in one round and only
+ratifies the first read. It is a diagnostic rather than a lever.
+
 ## Custom Quantization
 
 Pull the bf16 weights into your huggingface cache

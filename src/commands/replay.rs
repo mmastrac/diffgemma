@@ -134,6 +134,7 @@ fn op_name(op: &PipelineOp) -> &'static str {
         PipelineOp::CommitBlock { .. } => "commit_block",
         PipelineOp::DiscardBlock => "discard_block",
         PipelineOp::EndTurn => "end_turn",
+        PipelineOp::Score { .. } => "score",
         PipelineOp::Shutdown => "shutdown",
     }
 }

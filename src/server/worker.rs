@@ -170,6 +170,16 @@ impl Worker {
         job: Job,
     ) {
         use crate::pipeline::{PipelineEvent, PipelineOp};
+        // A JSON question schema as the system message selects the
+        // structured-decision path: no text generation, one scored forward.
+        if let Some(schema) = crate::structured::detect(&job.messages) {
+            return match schema {
+                Ok(schema) => self.handle_structured(stage, job, schema),
+                Err(err) => {
+                    let _ = job.resp.send(ServerEvent::Error(err));
+                }
+            };
+        }
         let tool_mode = needs_tool_rendering(&job.messages, &job.tools);
         if tool_mode && let (Some(cc), Some(store)) = (&self.tool_compact, store) {
             return self.handle_tool_compact(stage, store, cc, job);
@@ -542,6 +552,247 @@ impl Worker {
                 let _ = job.resp.send(ServerEvent::Error(format!("{err}")));
             }
         }
+    }
+
+    /// Structured decisions (`structured.rs`): the system message is the
+    /// question schema and the one user message is the state JSON. The answer
+    /// template is seeded into the canvas and scored in `schema.steps`
+    /// forwards, and the reply is the distribution set. One request is one
+    /// turn. The reply never needs prefilling, so the canonical log is the
+    /// schema prefix, and a later request with the same schema reuses it and
+    /// prefills only its state.
+    fn handle_structured(
+        &self,
+        stage: &dyn crate::pipeline::PipelineStage,
+        job: Job,
+        schema: crate::structured::Schema,
+    ) {
+        use crate::chat_template::{ChatFormatOptions, ChatTurn, format_chat_token_ids};
+        use crate::pipeline::{PipelineEvent, PipelineOp};
+        use crate::structured::{SlotScore, state_text};
+        use std::time::Instant;
+        let fail = |msg: String| {
+            eprintln!("serve: structured: {msg}");
+            let _ = job.resp.send(ServerEvent::Error(msg));
+        };
+
+        let state = match job.messages.as_slice() {
+            [_, m] if m.get("role").and_then(|r| r.as_str()) == Some("user") => {
+                match state_text(m) {
+                    Ok(state) => state,
+                    Err(err) => return fail(err),
+                }
+            }
+            _ => {
+                return fail(
+                    "a structured request is exactly two messages: the schema (system) and the state JSON (user)"
+                        .into(),
+                );
+            }
+        };
+        let turns = [
+            ChatTurn::system(schema.system_text()),
+            ChatTurn::user(state),
+        ];
+
+        let tok = &self.tokenizer;
+        let opts = ChatFormatOptions {
+            add_generation_prompt: true,
+            enable_thinking: false,
+        };
+        let prompt = match format_chat_token_ids(tok, &turns, &opts) {
+            Ok(p) => p,
+            Err(err) => return fail(format!("prompt: {err}")),
+        };
+        let template = match schema.resolve_template(tok) {
+            Ok(t) => t,
+            Err(err) => return fail(err),
+        };
+        let Some(turn_close) = tok.special_token_id("<turn|>") else {
+            return fail("tokenizer has no <turn|> token".into());
+        };
+        let seed = job.seed.unwrap_or(self.base_cfg.seed);
+        let active = schema.active_width(&template, crate::metal::CANVAS);
+        let budget = self
+            .max_seq
+            .saturating_sub(prompt.len() + crate::metal::CANVAS);
+        if budget == 0 {
+            return fail(format!(
+                "prompt ({} tokens) leaves no room for the canvas within the {}-token context",
+                prompt.len(),
+                self.max_seq
+            ));
+        }
+        let probes: Vec<crate::metal::ScoreProbe> = template
+            .slots
+            .iter()
+            .map(|s| crate::metal::ScoreProbe {
+                pos: s.pos,
+                candidates: s.label_ids.clone(),
+            })
+            .collect();
+
+        let request_started = Instant::now();
+        let (conv_id, reuse) = match stage.call(PipelineOp::Activate {
+            prompt: prompt.clone(),
+        }) {
+            PipelineEvent::Activated {
+                conv_id, reused, ..
+            } => (conv_id, reused),
+            ev => return fail(format!("activate: {ev:?}")),
+        };
+        eprintln!(
+            "serve: structured {} question(s), {} template tok, prompt {} tok (reused {reuse}), {} step(s), climb {}, active {active}, activate {:.0}ms",
+            schema.questions.len(),
+            template.ids.len(),
+            prompt.len(),
+            schema.steps,
+            schema.climb,
+            request_started.elapsed().as_secs_f64() * 1e3,
+        );
+
+        // One Score op per sample. The prompt is resident after the first,
+        // so later samples skip the prefill.
+        let base_cfg = self.score_cfg(&job, budget);
+        let mut samples: Vec<Vec<Vec<SlotScore>>> = Vec::with_capacity(schema.samples);
+        let mut prefill_ms = 0.0;
+        let mut denoise_ms = 0.0;
+        let mut steps_run = 0;
+        let mut rounds_run = 0;
+        let mut converged = true;
+        for k in 0..schema.samples as u64 {
+            let sample_seed = seed.wrapping_add(k.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let canvas = match schema.build_canvas(
+                &template,
+                turn_close,
+                0,
+                crate::metal::VOCAB as u32,
+                crate::metal::CANVAS,
+                sample_seed,
+            ) {
+                Ok(c) => c,
+                Err(err) => return fail(err),
+            };
+            let mut cfg = base_cfg.clone();
+            cfg.seed = sample_seed;
+            let op_started = Instant::now();
+            let out = match stage.call(PipelineOp::Score {
+                prompt: prompt.clone(),
+                cfg: Box::new(cfg),
+                label: "serve-structured".into(),
+                canvas,
+                active,
+                steps: schema.steps,
+                climb: schema.climb,
+                leave_one_out: schema.leave_one_out,
+                probes: probes.clone(),
+            }) {
+                PipelineEvent::Scored { out, .. } => out,
+                PipelineEvent::Error(err) => return fail(format!("score: {err}")),
+                ev => return fail(format!("score: unexpected event {ev:?}")),
+            };
+            let op_ms = op_started.elapsed().as_secs_f64() * 1e3;
+            let sample_prefill_ms = out.prefill_elapsed.as_secs_f64() * 1e3;
+            let sample_denoise_ms = out.denoise_elapsed.as_secs_f64() * 1e3;
+            eprintln!(
+                "serve: structured sample {k}: op {op_ms:.0}ms = prefill {sample_prefill_ms:.0}ms + forward {sample_denoise_ms:.0}ms + other {:.0}ms",
+                op_ms - sample_prefill_ms - sample_denoise_ms,
+            );
+            prefill_ms += sample_prefill_ms;
+            denoise_ms += sample_denoise_ms;
+            steps_run += out.steps_run;
+            rounds_run += out.rounds.len();
+            converged &= out.converged;
+            samples.push(
+                out.rounds
+                    .iter()
+                    .map(|round| {
+                        round
+                            .iter()
+                            .map(|p| SlotScore {
+                                label_logits: p.candidate_logits.clone(),
+                                argmax: p.argmax,
+                                entropy: p.entropy,
+                                row_logsumexp: p.row_logsumexp,
+                            })
+                            .collect()
+                    })
+                    .collect(),
+            );
+        }
+        let timing = serde_json::json!({
+            "prefill_ms": prefill_ms,
+            "denoise_ms": denoise_ms,
+            "steps_run": steps_run,
+            "rounds": rounds_run,
+            "samples": samples.len(),
+            "prompt_tokens": prompt.len(),
+            "reused_tokens": reuse,
+        });
+        let body = schema.answers_json(&template, &samples, converged, tok, &timing);
+        let content = serde_json::to_string_pretty(&body).unwrap_or_default();
+        let summary: Vec<String> = body["answers"]
+            .as_object()
+            .map(|a| {
+                schema
+                    .questions
+                    .iter()
+                    .map(|q| format!("{}={}", q.id, a[&q.id]["label"].as_str().unwrap_or("?")))
+                    .collect()
+            })
+            .unwrap_or_default();
+        eprintln!(
+            "serve: structured out {} samples={} rounds={rounds_run} converged={converged} prefill={prefill_ms:.0}ms denoise={denoise_ms:.0}ms",
+            summary.join(" "),
+            samples.len(),
+        );
+
+        if job.stream {
+            let _ = job
+                .resp
+                .send(ServerEvent::Delta(WireDelta::Content(content.clone())));
+        }
+        let _ = job.resp.send(ServerEvent::Done {
+            content,
+            reasoning: String::new(),
+            tool_calls: Vec::new(),
+            prompt_tokens: prompt.len(),
+            completion_tokens: template.ids.len() + 1,
+            stopped: true,
+        });
+
+        // The router matches a recorded log only when it is a prefix of the
+        // new prompt. Recording the schema prefix alone makes every request
+        // on this schema such a prefix, whatever its state.
+        let schema_only = ChatFormatOptions {
+            add_generation_prompt: false,
+            enable_thinking: false,
+        };
+        let canonical = match format_chat_token_ids(tok, &turns[..1], &schema_only) {
+            Ok(ids) if prompt.starts_with(&ids) => ids,
+            _ => prompt,
+        };
+        let finalize_started = Instant::now();
+        if let PipelineEvent::Error(err) = stage.call(PipelineOp::Finalize { conv_id, canonical }) {
+            eprintln!("serve: conversation finalize failed: {err}");
+        }
+        eprintln!(
+            "serve: structured finalize {:.0}ms, request {:.0}ms",
+            finalize_started.elapsed().as_secs_f64() * 1e3,
+            request_started.elapsed().as_secs_f64() * 1e3,
+        );
+    }
+
+    /// The scoring config: `per_request_cfg` without the empty-reply
+    /// predicate, which loads the tokenizer from disk (~300 ms) and which
+    /// scoring never consults, and without the tool-mode stop policy.
+    fn score_cfg(&self, job: &Job, budget: usize) -> crate::metal::StepGenerateConfig {
+        let mut cfg = self.base_cfg.clone();
+        cfg.sampler = crate::sample::sampler_for_steps(self.steps, self.no_early_stop);
+        cfg.max_new_tokens = job.max_tokens.map_or(budget, |c| c.min(budget));
+        cfg.seed = job.seed.unwrap_or(self.base_cfg.seed);
+        cfg.stop_token_ids = self.stop_token_ids.clone();
+        cfg
     }
 
     /// Per-request generation config shared by every serve path.
