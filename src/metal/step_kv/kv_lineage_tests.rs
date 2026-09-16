@@ -26,6 +26,7 @@ fn fingerprint(
 }
 
 #[test]
+#[ignore = "real-model tier: fresh-vs-delta lineage matrix, many multi-thousand-token prefills"]
 fn kv_lineage_paths_are_fingerprint_identical() {
     lineage_matrix(false);
 }
@@ -87,6 +88,7 @@ fn kv_lineage_paths_are_fingerprint_identical() {
 /// sat in a chunk whose OTHER rows' k differed, and a wrong k anywhere in
 /// a full layer perturbs the shared hidden stream).
 #[test]
+#[ignore = "real-model tier: the misaligned wrapped-ring matrix at multi-thousand-token offsets"]
 fn kv_lineage_unaligned_delta_offsets_are_fingerprint_identical() {
     unaligned_matrix(None);
 }

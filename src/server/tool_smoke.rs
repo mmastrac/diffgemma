@@ -85,6 +85,7 @@ fn search_tool() -> Value {
 /// Both tool-grammar scenarios as phases of one test (single model load):
 /// a well-formed call with a string arg, then schema-typed argument kinds.
 #[test]
+#[ignore = "real-model tier: generates a real tool call"]
 fn tool_smoke_call_shape_and_argument_types() {
     let Some(dir) = model_dir() else {
         eprintln!("skip tool_smoke_call_shape_and_argument_types: quantized model not present");

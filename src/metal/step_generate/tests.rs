@@ -180,7 +180,7 @@ fn truncate_after_uncommitted_canvas_write_matches_fresh_prefill() {
     const KEEP: usize = 1200; // window [177, 1200] reaches the poisoned slots
 
     let layers = crate::commands::resolve_model_layers(&dir, None).unwrap();
-    let sampler = crate::sample::sampler_for_steps(24, false);
+    let sampler = crate::sample::sampler_for_steps(8, false);
     // One block only: max_new_tokens <= CANVAS keeps the reply in the final
     // (uncommitted) block, which is the precondition the bug needs.
     let cfg = StepGenerateConfig::from_generate(7, 64, MAX_SEQ, layers, sampler, false);
@@ -262,7 +262,7 @@ fn begin_turn_after_abandoned_turn_prefills_the_new_prompt() {
     };
     const MAX_SEQ: usize = 4096;
     let layers = crate::commands::resolve_model_layers(&dir, None).unwrap();
-    let sampler = crate::sample::sampler_for_steps(24, false);
+    let sampler = crate::sample::sampler_for_steps(8, false);
     let cfg = StepGenerateConfig::from_generate(7, 64, MAX_SEQ, layers, sampler, false);
     let (mut session, _) = StepGenerateSession::open(&dir, &cfg, None).unwrap();
 

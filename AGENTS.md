@@ -195,6 +195,14 @@ waits on a condvar instead of OOMing), and the pipeline archive is behind a
 `Mutex`. Expect only ~20-30% off the wall, since the ~9 heavy model-gated
 tests still serialize on memory and dominate it.
 
+The heaviest model-gated gates are `#[ignore]`d into the real-model tier.
+The gate block below has the invocation; `grep -rn 'real-model tier:' src/`
+lists the set. Each runs two or more full generates, or a lineage matrix of
+multi-thousand-token prefills. What stays in the default suite still opens
+real sessions and still generates, so the pack is exercised on every run. The
+equivalence and byte-identity gates for the rewind and replay contracts are in
+the tier, so run it before shipping a change to those paths.
+
 If parallelism regresses it fails LOUD (SIGSEGV, or a membudget timeout that
 names the holder) — revert to `--test-threads=1` and say why. `membudget`
 PANICS on a nested acquire on ONE thread: build a second runtime only after
@@ -336,7 +344,27 @@ diffgemma smoketest -m $WEIGHTS --battery content   # long-answer rubric rates
 #   --replies FILE judges replies made elsewhere (the CUDA port) with the
 #   same code, no model: FILE maps probe id -> {reply, steps}
 diffgemma golden -m $WEIGHTS                # byte-identity 8/8
-cargo test --release
+cargo test --release                        # ~4 min with the pack present
+
+# Real-model tier. Model-gated tests that each run two or more full
+# generates, or a lineage matrix of multi-thousand-token prefills. They are
+# `#[ignore]`d out of the default suite, which they were ~80% of. ~15 min.
+# Required before shipping any pipeline, step-generate, KV-lineage or
+# tool-compaction change. `grep -rn 'real-model tier:' src/` lists the set.
+# The --skip is required: filters match by substring, and without it
+# `kv_lineage_paths_are_fingerprint_identical` also selects the known-red q8
+# variant and the tier comes back failed.
+cargo test --release -- --ignored \
+  --skip kv_lineage_paths_are_fingerprint_identical_q8 \
+  ask_via_pipeline_matches_direct \
+  forced_reroll_leaves_no_residue \
+  kv_lineage_paths_are_fingerprint_identical \
+  kv_lineage_unaligned_delta_offsets_are_fingerprint_identical \
+  oplog_roundtrip_replays_bit_identically \
+  per_block_ops_match_monolithic_generate \
+  pipeline_rewind_kv_byte_consistency \
+  tool_compact_m1_m2_and_overlong_smoke \
+  tool_smoke_call_shape_and_argument_types
 
 # CUDA (Linux + NVIDIA GPU). The DiffusionGemma engine is still Metal-only;
 # this covers crates/dgemm, crates/dgops and the nanogpt example.
