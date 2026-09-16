@@ -150,9 +150,20 @@ decisions"). Open, in order of what would change the product:
   0.65 s served, request wall 2.0 s to 1.2 s at 64 rows. Open: the cold
   schema prefix pays the f32 engine (9.4 s for 187 tokens).
   `DGQ_FAST_PREFILL=1` makes that 3.0 s, but the fast-prefilled prefix
-  flipped the outage ticket's borderline answers (urgent yes 0.96 to no
-  0.99, tone 0.68 annoyed to a 0.50 tie) while the easy tickets held, so
-  the engine stays the default until a labelled run picks.
+  moves the outage ticket's borderline answers while the easy tickets
+  hold, so the engine stays the default until a labelled run picks.
+- Which prefill precision matters: the schema prefix. Five
+  arms on the outage ticket, 16 averaged 64-row reads each, "urgent" mean
+  and agreement: engine schema + fast state (default) yes 0.57 / 0.62;
+  engine schema + engine state yes 0.56 / 0.56; whole prompt engine in one
+  pass yes 0.56 / 0.56; fast schema + fast state no 0.80 / 0.81; whole
+  prompt fast in one pass no 0.80 / 0.81, sample for sample identical to
+  the reused-prefix arm. Tone moved less (0.76 to 0.68 annoyed). The
+  state's own precision is within noise. The 140-token instruction prefix
+  is where the bf16 route flips land (the mechanism behind the ≤256 engine
+  floor in ARCHITECTURE's prefill path selection), and the engine is the
+  reference precision, so the mixed default keeps the reference where it
+  counts and pays the f32 cost once per schema.
 - Against generating the JSON. The same tickets in the same process, thinking
   off, the model asked for a JSON object with the three keys: it produced
   the same labels in 19 tokens after 3 to 5 full-canvas steps, 4.3 to 7.2 s
