@@ -196,7 +196,7 @@ decisions"). Open, in order of what would change the product:
   one. The first read's label probability also separates them here (0.92,
   0.88, 0.68 against 0.96 and up), with a thinner margin. Each read's
   entropy is now in `diagnostics.samples.tops`. The candidate: adaptive
-  sampling, one read, then the remaining reads only when some slot's
+  sampling: a single read, then the remaining reads only when some slot's
   entropy is above the threshold, which on this set stops 6 of 10
   tickets at one read. Three movers is thin evidence; the threshold
   wants a labelled run before it is a default.
