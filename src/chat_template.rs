@@ -89,10 +89,11 @@ impl Default for ChatFormatOptions {
 /// and `sanitize_model_reply` — rather than blocklisting leading token ids.
 /// This catches both shapes of the attractor with one rule: the eos-first
 /// "empty" canvas AND the `<|channel>thought` ceremony (sanitize erases the
-/// thought-channel scaffold to nothing). Owns the tokenizer by move so it can
-/// live in `StepGenerateConfig` as a `Send + Sync` closure.
+/// thought-channel scaffold to nothing). Holds the tokenizer by `Arc` so it
+/// can live in `StepGenerateConfig` as a `Send + Sync` closure and share a
+/// tokenizer the caller already has.
 pub fn empty_reply_predicate(
-    tok: Tokenizer,
+    tok: std::sync::Arc<Tokenizer>,
     stop_ids: Vec<u32>,
     eos_token_id: u32,
 ) -> impl Fn(&[u32]) -> bool + Send + Sync {
@@ -106,17 +107,36 @@ pub fn empty_reply_predicate(
     }
 }
 
+/// The empty-reply predicate as `StepGenerateConfig` carries it.
+pub type EmptyReplyCheck = std::sync::Arc<dyn Fn(&[u32]) -> bool + Send + Sync>;
+
 /// Build the empty-reply predicate for `StepGenerateConfig`, or `None` when
 /// the retry is disabled (`DGQ_EMPTY_REPLY_RETRY=0`) or the tokenizer/config
 /// can't be loaded — so the re-roll only ever activates when enabled.
+///
+/// Loads the tokenizer, about 300 ms for the 32 MB Gemma vocab. A caller that
+/// serves many requests builds it once with `empty_reply_check_with`.
 pub fn empty_reply_check(
     model_dir: &std::path::Path,
     stop_ids: Vec<u32>,
-) -> Option<std::sync::Arc<dyn Fn(&[u32]) -> bool + Send + Sync>> {
+) -> Option<EmptyReplyCheck> {
     if crate::flags::empty_reply_retry() == 0 {
         return None;
     }
     let tok = Tokenizer::load(model_dir.join("tokenizer.json")).ok()?;
+    empty_reply_check_with(model_dir, std::sync::Arc::new(tok), stop_ids)
+}
+
+/// `empty_reply_check` over a tokenizer the caller already holds: the same
+/// flag gate and the same `None` on an unreadable config.
+pub fn empty_reply_check_with(
+    model_dir: &std::path::Path,
+    tok: std::sync::Arc<Tokenizer>,
+    stop_ids: Vec<u32>,
+) -> Option<EmptyReplyCheck> {
+    if crate::flags::empty_reply_retry() == 0 {
+        return None;
+    }
     let eos = crate::config::ModelConfig::load(model_dir)
         .ok()?
         .eos_token_id_u32();
