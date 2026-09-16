@@ -1,9 +1,39 @@
 //! CUDA dispatch for the f32 GEMM.
 
 use crate::Error;
-use crate::problem::{AbiParams, Call};
+use crate::problem::{AbiParams, Call, Problem};
 use crate::{BM, BN, CUDA, ENTRY, THREADS};
-use gpukit::cuda::{BufferPool, KernelArgs, div_up, launch_grid};
+use gpukit::cuda::{BufferPool, DeviceBuffer, KernelArgs, div_up, launch_grid};
+
+/// Launch the GEMM into caller-owned device buffers — no host round-trip.
+///
+/// This is the entry point a multi-kernel pipeline uses: the buffers stay on
+/// the device across dispatches and only the final result is read back. The
+/// one-shot `gpu` below is the tier-1 convenience wrapper over it.
+pub fn gpu_device(
+    ctx: &gpukit::cuda::Context,
+    problem: &Problem,
+    a: &DeviceBuffer,
+    b: &DeviceBuffer,
+    c: &DeviceBuffer,
+) -> Result<(), Error> {
+    let kernel = gpukit::cuda::cached_source_kernel(CUDA, ENTRY)?;
+    let p: AbiParams = (*problem).into();
+    let mut args = KernelArgs::new();
+    args.device_ptr(a.device_ptr())
+        .device_ptr(b.device_ptr())
+        .device_ptr(c.device_ptr())
+        .bytes(gpukit::cuda::pod_bytes(&p));
+    launch_grid(
+        ctx,
+        &kernel,
+        div_up(p.n as usize, BN),
+        div_up(p.m as usize, BM),
+        THREADS,
+        &mut args,
+    )?;
+    Ok(())
+}
 
 pub fn gpu(call: &Call) -> Result<Vec<f32>, Error> {
     let ctx = gpukit::cuda::cached_context()?;

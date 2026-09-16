@@ -2482,34 +2482,26 @@ impl StepEnc<'_> {
         }
     }
 
-    pub(super) fn interpret_step(
+    /// The step preamble as generation runs it. Probes and dumps must call
+    /// this rather than `encode_step_preamble`, which skips self-conditioning
+    /// whenever `first_step` is non-zero: that is a different function, and a
+    /// probe running it reports numbers generation never produces.
+    ///
+    /// `first_step == 1` is deterministic first-step self-conditioning. The
+    /// first denoise step has no prior prediction, so the normal SC path has
+    /// no signal — but the model is degenerate with SC=0 (cold-start empty
+    /// reply), and leaving dense_off as a prior generation's residual makes
+    /// reused sessions nondeterministic (reset_kv carryover). Seed it
+    /// deterministically: treat the initial canvas as the step-0 prediction
+    /// and run the SC MLP on its embedding (ScPreNorm reads hidden after
+    /// EmbedGather, in place of soft_off).
+    pub(super) fn encode_preamble_for_step(
         &mut self,
         layout: &ModelLayout,
-        layers: usize,
         first_step: u32,
         finish: StepFinishMode,
     ) -> Result<(), Error> {
-        if arena_liveness::runtime_arena_liveness_enabled()
-            && let Err(e) = arena_liveness::check_step_arena_liveness(
-                &self.block_profile,
-                layout,
-                layers,
-                first_step,
-                finish,
-            )
-        {
-            panic!("{e}");
-        }
-        let schedule =
-            step_schedule::build_step_schedule(&self.block_profile, finish == StepFinishMode::Full);
         if first_step == 1 {
-            // Deterministic first-step self-conditioning. The first denoise step has
-            // no prior prediction, so the normal SC path is skipped — but the model
-            // is degenerate with SC=0 (cold-start empty reply), and leaving dense_off
-            // as a prior generation's residual makes reused sessions nondeterministic
-            // (reset_kv carryover). Seed it deterministically: treat the initial
-            // canvas as the step-0 prediction and run the SC MLP on its embedding
-            // (ScPreNorm reads hidden after EmbedGather, in place of soft_off).
             use step_schedule::StepStage;
             self.exec_stage(StepStage::EmbedGather, 0, layout, finish)?;
             self.rmsnorm(
@@ -2530,6 +2522,30 @@ impl StepEnc<'_> {
                 self.exec_stage(stage, 0, layout, finish)?;
             }
         }
+        Ok(())
+    }
+
+    pub(super) fn interpret_step(
+        &mut self,
+        layout: &ModelLayout,
+        layers: usize,
+        first_step: u32,
+        finish: StepFinishMode,
+    ) -> Result<(), Error> {
+        if arena_liveness::runtime_arena_liveness_enabled()
+            && let Err(e) = arena_liveness::check_step_arena_liveness(
+                &self.block_profile,
+                layout,
+                layers,
+                first_step,
+                finish,
+            )
+        {
+            panic!("{e}");
+        }
+        let schedule =
+            step_schedule::build_step_schedule(&self.block_profile, finish == StepFinishMode::Full);
+        self.encode_preamble_for_step(layout, first_step, finish)?;
         for layer in 0..layers {
             for &stage in &schedule.per_layer {
                 self.exec_stage(stage, layer, layout, finish)?;

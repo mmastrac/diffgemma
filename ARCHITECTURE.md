@@ -557,7 +557,11 @@ are local-only dev tooling for experiment arms (`quantize --overlay`,
   `op_kernel!` block and gpukit generates both backends' `gpu()` from that
   list, so the Metal and CUDA argument orders cannot drift. Dispatches to
   Metal on macOS, CUDA elsewhere when the `cuda` feature is on. This is the
-  layer the engine's own kernels migrate onto.
+  layer the engine's own kernels migrate onto. `dgops::dgq` is a minimal
+  pack reader (manifest + mmapped blob) so a CUDA host can run a real-weight
+  slice without the engine; `crates/dgops/tests/golden_slice.rs` pins seven
+  diffusion stages (embed gather, RMSNorm, SwiGLU, RoPE, GQA attention, MoE
+  router) to their CPU oracles on real layer-0 weights.
 - `crates/dgemm` — the GEMM family: one tiled body per backend plus
   the CPU oracle, a problem/stride API shared by the engine and examples, and
   the decode side of every weight format (byte layout, bf16/fp4 codecs,
@@ -565,6 +569,16 @@ are local-only dev tooling for experiment arms (`quantize --overlay`,
   and arena/gather epilogues are compile-time axis values on that body, not
   forked kernels; the engine's `src/dgq` keeps the manifest, the encoders and
   the store, re-exporting the decode.
+- `crates/dgqcuda` — the CUDA inference path for a real `.dgq` pack: a
+  forward pass whose weights and intermediates stay resident on the device
+  (cuBLAS-free tiled GEMM from `dgemm` + the elementwise/attention kernels in
+  `kernels.cu`, compiled by NVRTC), a CPU oracle transliterated from the
+  engine's `src/model/*`, and the denoise loop (`denoise.rs`: entropy-bound
+  accept, temperature count-down, renoise, confident/plateau/max-steps stops)
+  driven by a resident `Session` (`gpu/session.rs`: prompt prefill, then one
+  step per canvas state). `denoise --parity` runs the same step through the
+  CPU oracle and reports cosine/argmax agreement; the two agree at 1e-3 on the
+  real pack. The engine itself is still Metal-only.
 - `crates/nanogpt` — a tiny character-level GPT composed from dgops
   (forward, backward, AdamW) with an independent CPU forward as its oracle;
   the end-to-end consumer that keeps the CUDA path honest.
@@ -825,65 +839,3 @@ opt-in flags for A/B.
 - **Software-pipelined double-buffering GEMM port** — `gemm_tunable_db`
   (sibling entry in `gemm_tunable.metal`) doubles the tgmem tiles, prologue-
   loads tile 0, then overlaps the device→tgmem load of tile N+1 with the MMA of
-  tile N. Bit-exact vs single-buffered `gemm_tunable`, and **7-9% SLOWER** at
-  the prefill-relevant dense shapes (256×2816×2816 and 1024×2816×2816, tile
-  64×64, q4): 3.377 / 3.566 vs 3.611 / 3.919 TF/s. PHYSICS: there is no
-  async-copy engine on Apple GPU, so the "overlap" is just issuing the loads
-  before the MMA — which the single-buffered kernel already does implicitly,
-  because the load is fully hidden behind the ~6× compute margin. The extra
-  barrier and the doubled tgmem footprint (occupancy, SLC pressure) cost more
-  than the overlap returns. Kept as a documented negative (`gemm_tunable_db` +
-  `bench-gemm --shapes db`), not wired to production. Lesson: when
-  compute >> load, double-buffering is a regression, not a lever.
-
-**Quality levers, disproven by measurement:**
-- **Confidence trim as a fix for CODE-correctness errors** — the
-  `programmatic` battery's failures looked like the low-p_max tool-arg
-  stutter class. `DGQ_TRACE_PMAX_JSONL` over seeds {7,42,123} says
-  otherwise: the wrong tokens commit at the TOP of the distribution (seed
-  7's `"*` at **0.9993**, ` final` at **1.0000**; seed 123's failing rows
-  0.83–0.98), inside blocks that are ~1.0 throughout with
-  `conf_trim_row=None`; committed rows below 0.9 number just 9/4490,
-  5/4343, 12/4352. Dup-stutter commits live at 0.40–0.86 — a different
-  regime. **No threshold separates a confidently-WRONG token from a
-  confidently-right one**, so no trim tier addresses this class. The
-  failures are trajectory-dependent, not a fixed model limitation (seed 42
-  scores 14/14; `bash_stdin_and_argv` is correct at seed 123 and wrong at
-  seed 7), and the defect sits UPSTREAM of the visible error: seed 7 wrote
-  `*` `$` `SEARCH` `"*`, confidently closing a quote it never opened, while
-  seed 123 wrote `*"$` `SEARCH` `"*` — the same closing token, correct.
-- **Hard freeze of accepted positions** — WAS the flat-row wart driver
-  (census 4/10 → 0/10 on removal); reference semantics have no freeze.
-- **Expert quantization as wart driver** — q6 experts (2% err vs q4's 7.9%)
-  changed nothing; quantization is exonerated. Close quality gaps
-  memory-neutrally.
-- **q8 embed** — flattened hard-tail logits, stalled convergence; embed
-  stays bf16.
-- **First-step eos-guard (token suppression)** — recovers a ceremony token,
-  not the answer; token-suppression is a dead end for the empty-reply class
-  (the shipped fix is the canvas re-roll).
-- **Fast prefill for short prompts** — regresses the multi-seed gate
-  (empty-reply class spreads); the ≤256 engine floor is a quality mitigation.
-- **f32 hidden / f16 arena for short-context quality** — self-noise is bf16
-  branch storage, not the trunk; both null.
-- **fp16 prefill stream (E11) & f32 side-KV (E14) for the long-context
-  collapse** — every precision variant still failed while a 1%-KV-noise
-  engine run stayed correct; the cause was a computational defect (spurious
-  encoder norm), since fixed. Precision-accumulation theories for this class
-  are disproven; machinery kept opt-in.
-- **Un-RoPE / rotated KV for q4** — pre-RoPE K quantizes identically
-  (0.99-1.00× all formats); group-32 scaling and rotation are SUBSTITUTES,
-  and nothing bridges the ~17× q4→q8 resolution gap. Feasible (QK-norms are
-  exact scalars, the fold is sound) but valueless; revive only if q4-KV
-  becomes necessary (18-24 GB Macs).
-- **Global weight rotation** — residual-stream norms are genuinely
-  per-channel (std/mean 0.4-2.1); no global orthogonal fold exists. Per-op
-  rotation is modest+costly; the practical lever is plain q6.
-
-**Validation lessons (encoded in the gates):**
-- Needle probes are blind to comprehension loss — retrieval rides a few
-  sharp attention edges. Long-context claims use the doc-QA ladder.
-- Single-seed step comparisons are meaningless for trajectory-reshuffling
-  changes — use matched-canvas multi-seed.
-- A single-prompt delta can be trajectory chaos, not a bug — check that it
-  is systematic before chasing it.

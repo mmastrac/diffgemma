@@ -385,6 +385,14 @@ pub(crate) enum Command {
         repeat: usize,
         /// Run ONLY the long-context doc-QA tier (bigger session).
         longctx: bool,
+        /// `--battery NAME`: run that tier instead of the default gate.
+        battery: Option<String>,
+        /// `--replies FILE`: judge pre-generated replies (content battery
+        /// only) instead of generating; no model is opened.
+        replies: Option<PathBuf>,
+        /// `--replies-out FILE`: write every full reply a content run
+        /// produced, in the shape `--replies` reads.
+        replies_out: Option<PathBuf>,
     },
     /// Flag-arm x battery campaign with explicit acceptance gates.
     Census {

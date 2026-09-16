@@ -1,5 +1,6 @@
 //! `smoketest` gate subcommand + fixture spec types.
 
+use super::content::{ContentCounts, ContentProbe};
 use super::programmatic::{ProgCounts, ProgProbe};
 use super::soft::{SoftCounts, SoftProbe};
 use super::*;
@@ -19,6 +20,8 @@ pub(crate) enum Battery {
     Programmatic,
     /// Indirect ("soft") retrieval + hallucination. Rates only, non-blocking.
     Soft,
+    /// Free-form long answers scored on what they say. Rates only, non-blocking.
+    Content,
 }
 
 #[cfg(target_os = "macos")]
@@ -30,10 +33,11 @@ impl Battery {
             "longctx" => Self::LongCtx,
             "programmatic" => Self::Programmatic,
             "soft" => Self::Soft,
+            "content" => Self::Content,
             _ => return None,
         })
     }
-    pub(crate) const KNOWN: &'static str = "smoke, longctx, programmatic, soft";
+    pub(crate) const KNOWN: &'static str = "smoke, longctx, programmatic, soft, content";
 }
 
 /// Smoketest prompt spec (`fixtures/smoketest/prompts.json`).
@@ -59,6 +63,10 @@ pub(crate) struct SmoketestSpec {
     /// `commands::soft`. Rates only — never pass/fail.
     #[serde(default)]
     soft: Vec<SoftProbe>,
+    /// Long-answer content probes (`census --battery content`); see
+    /// `commands::content`. Rates only — never pass/fail.
+    #[serde(default)]
+    content: Vec<ContentProbe>,
     /// Gate baseline seed. Trajectory-reshuffling accepted changes re-baseline
     /// the gate here (single-seed pass/fail is arbitrary for such changes; the
     /// multi-seed aggregate is the real quality metric).
@@ -175,6 +183,8 @@ pub(crate) struct SmokeOutcome {
     pub(crate) prog: Option<ProgCounts>,
     /// Indirect-retrieval + hallucination rates (`Battery::Soft` only).
     pub(crate) soft: Option<SoftCounts>,
+    /// Long-answer content rates (`Battery::Content` only).
+    pub(crate) content: Option<ContentCounts>,
     /// Set when the run could not start (bad model dir, missing spec, …);
     /// distinct from "ran and failed prompts".
     pub(crate) error: Option<String>,
@@ -209,7 +219,43 @@ pub(crate) fn run_smoketest_cmd(
     filter: Option<&str>,
     repeat: usize,
     longctx: bool,
+    battery: Option<&str>,
+    replies: Option<&std::path::Path>,
+    replies_out: Option<&std::path::Path>,
 ) -> ExitCode {
+    let battery = if longctx {
+        Battery::LongCtx
+    } else {
+        match battery.map(Battery::parse) {
+            None => Battery::Smoke,
+            Some(Some(b)) => b,
+            Some(None) => {
+                eprintln!(
+                    "smoketest: unknown battery {:?} (known: {})",
+                    battery.unwrap_or(""),
+                    Battery::KNOWN
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+    // `--replies FILE` judges replies generated elsewhere (the CUDA port, an
+    // older build) with this battery's code and no model. Only the content
+    // battery has a judge that is pure text-in, verdict-out.
+    if let Some(replies) = replies {
+        let out = match battery {
+            Battery::Content => score_content_replies(prompts_path, filter, replies),
+            _ => SmokeOutcome::err("smoketest: --replies is only supported for --battery content"),
+        };
+        if let Some(e) = &out.error {
+            eprintln!("{e}");
+        }
+        return if out.ok() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
     let out = run_smoketest(
         model_dir,
         prompts_path,
@@ -219,11 +265,8 @@ pub(crate) fn run_smoketest_cmd(
         raw_prompt,
         filter,
         repeat,
-        if longctx {
-            Battery::LongCtx
-        } else {
-            Battery::Smoke
-        },
+        battery,
+        replies_out,
     );
     if let Some(e) = &out.error {
         eprintln!("{e}");
@@ -250,6 +293,7 @@ pub(crate) fn run_smoketest(
     filter: Option<&str>,
     repeat: usize,
     battery: Battery,
+    replies_out: Option<&std::path::Path>,
 ) -> SmokeOutcome {
     use metal::{StepGenerateConfig, StepGenerateSession, generate_with_session};
 
@@ -263,16 +307,9 @@ pub(crate) fn run_smoketest(
 
     let default_path = std::path::PathBuf::from("fixtures/smoketest/prompts.json");
     let path = prompts_path.unwrap_or(default_path.as_path());
-    let mut spec: SmoketestSpec = match std::fs::read_to_string(path) {
-        Ok(text) => match serde_json::from_str(&text) {
-            Ok(s) => s,
-            Err(err) => {
-                return SmokeOutcome::err(format!("error: parse {}: {err}", path.display()));
-            }
-        },
-        Err(err) => {
-            return SmokeOutcome::err(format!("error: read {}: {err}", path.display()));
-        }
+    let mut spec = match load_spec(path) {
+        Ok(s) => s,
+        Err(e) => return SmokeOutcome::err(e),
     };
 
     // `--filter <pat>`: keep only prompts whose id contains <pat> (case-insensitive).
@@ -288,10 +325,13 @@ pub(crate) fn run_smoketest(
             .retain(|p| p.id.to_ascii_lowercase().contains(&pat));
         spec.soft
             .retain(|p| p.id.to_ascii_lowercase().contains(&pat));
+        spec.content
+            .retain(|p| p.id.to_ascii_lowercase().contains(&pat));
         let kept = match battery {
             Battery::LongCtx => spec.longctx.len(),
             Battery::Programmatic => spec.programmatic.len(),
             Battery::Soft => spec.soft.len(),
+            Battery::Content => spec.content.len(),
             Battery::Smoke => spec.adherence.len() + spec.convergence.len(),
         };
         if kept == 0 {
@@ -321,6 +361,15 @@ pub(crate) fn run_smoketest(
         // just stops measuring indirection. That is invisible in the results,
         // so it is a hard startup error rather than a review item.
         let bad = soft::authoring_violations(&spec.soft);
+        if !bad.is_empty() {
+            return SmokeOutcome::err(bad.join("\n"));
+        }
+    }
+    if battery == Battery::Content {
+        if spec.content.is_empty() {
+            return SmokeOutcome::err("smoketest: the spec has no content probes");
+        }
+        let bad = content::authoring_violations(&spec.content);
         if !bad.is_empty() {
             return SmokeOutcome::err(bad.join("\n"));
         }
@@ -358,14 +407,22 @@ pub(crate) fn run_smoketest(
     // Soft probes feed a whole fixture document, so they need doc headroom.
     const SOFT_MAX_SEQ: usize = 8192;
     const PROG_GEN_CAP: usize = 1536;
+    // Content probes ask for explanations, which the engine writes at 700+
+    // tokens. At the 512 smoke cap the transformer explanation was cut off
+    // mid-word before it reached query/key/value and the rubric scored the
+    // truncation, not the answer. Same headroom as programs.
+    const CONTENT_MAX_SEQ: usize = 4096;
+    const CONTENT_GEN_CAP: usize = 1536;
     let smoke_max_seq = match battery {
         Battery::LongCtx => LONGCTX_MAX_SEQ,
         Battery::Programmatic => PROG_MAX_SEQ,
         Battery::Soft => SOFT_MAX_SEQ,
+        Battery::Content => CONTENT_MAX_SEQ,
         Battery::Smoke => SMOKE_MAX_SEQ,
     };
     let gen_cap = match battery {
         Battery::Programmatic => PROG_GEN_CAP,
+        Battery::Content => CONTENT_GEN_CAP,
         _ => SMOKE_GEN_CAP,
     };
     let stop_token_ids = config::load_generation_stop_tokens(model_dir);
@@ -436,6 +493,7 @@ pub(crate) fn run_smoketest(
     let mut kw_total_total = 0usize;
     let mut prog_counts: Option<ProgCounts> = None;
     let mut soft_counts: Option<SoftCounts> = None;
+    let mut content_counts: Option<ContentCounts> = None;
 
     println!(
         "\nsmoketest: {} (seed {seed}, {layers}L, sampler cap {steps} steps)",
@@ -650,6 +708,31 @@ pub(crate) fn run_smoketest(
             );
             continue;
         }
+        // `content` is non-blocking like `soft`: it reads the reply, which
+        // the gate's convergence probes never do, and reports what it found.
+        if battery == Battery::Content {
+            println!("\n[content]");
+            let mut by_id = |_id: &str, prompt: &str| run_one(prompt);
+            let mut r = content::run_probes(&spec.content, &mut by_id);
+            passed += r.passed;
+            total += r.total;
+            failures.append(&mut r.failures);
+            let acc = content_counts.get_or_insert_with(ContentCounts::default);
+            acc.rubric_hit += r.counts.rubric_hit;
+            acc.rubric_total += r.counts.rubric_total;
+            acc.forbid_hits += r.counts.forbid_hits;
+            acc.structure_ok += r.counts.structure_ok;
+            acc.structure_total += r.counts.structure_total;
+            acc.full += r.counts.full;
+            acc.probes += r.counts.probes;
+            content::report(&r.counts);
+            // The full replies, so a rubric can be re-judged offline and the
+            // engine's file sits next to the port's in the same shape.
+            if let Some(path) = replies_out {
+                content::save_replies(path, &r.replies);
+            }
+            continue;
+        }
         if !spec.adherence.is_empty() {
             println!("\n[adherence]");
             for p in &spec.adherence {
@@ -733,6 +816,69 @@ pub(crate) fn run_smoketest(
         failures,
         prog: prog_counts,
         soft: soft_counts,
+        content: content_counts,
         error: None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn load_spec(path: &std::path::Path) -> Result<SmoketestSpec, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|err| format!("error: read {}: {err}", path.display()))?;
+    serde_json::from_str(&text).map_err(|err| format!("error: parse {}: {err}", path.display()))
+}
+
+/// `smoketest --battery content --replies FILE`: the content judge over
+/// replies produced elsewhere. Same probes, same authoring check, same
+/// per-probe lines, no session. A probe with no reply in the file is an
+/// ERROR line (it could not run), not a zero.
+#[cfg(target_os = "macos")]
+fn score_content_replies(
+    prompts_path: Option<&std::path::Path>,
+    filter: Option<&str>,
+    replies: &std::path::Path,
+) -> SmokeOutcome {
+    let default_path = std::path::PathBuf::from("fixtures/smoketest/prompts.json");
+    let path = prompts_path.unwrap_or(default_path.as_path());
+    let mut spec = match load_spec(path) {
+        Ok(s) => s,
+        Err(e) => return SmokeOutcome::err(e),
+    };
+    if let Some(pat) = filter {
+        let pat = pat.to_ascii_lowercase();
+        spec.content
+            .retain(|p| p.id.to_ascii_lowercase().contains(&pat));
+    }
+    if spec.content.is_empty() {
+        return SmokeOutcome::err("smoketest: no content probes to score");
+    }
+    let bad = content::authoring_violations(&spec.content);
+    if !bad.is_empty() {
+        return SmokeOutcome::err(bad.join("\n"));
+    }
+    let table = match content::load_replies(replies) {
+        Ok(t) => t,
+        Err(e) => return SmokeOutcome::err(format!("smoketest: {e}")),
+    };
+    println!("\nsmoketest: content replies from {}", replies.display());
+    println!("\n[content]");
+    let mut lookup = |id: &str, _prompt: &str| -> Result<(usize, String), crate::Error> {
+        table
+            .get(id)
+            .map(|r| (r.steps, r.reply.clone()))
+            .ok_or_else(|| crate::Error::Config(format!("no reply for {id:?} in the file")))
+    };
+    let r = content::run_probes(&spec.content, &mut lookup);
+    content::report(&r.counts);
+    println!("\nsmoketest: {}/{} scored", r.passed, r.total);
+    if r.passed != r.total {
+        println!("missing: {}", r.failures.join(", "));
+    }
+    SmokeOutcome {
+        passed: r.passed,
+        total: r.total,
+        failures: r.failures,
+        content: Some(r.counts),
+        ..Default::default()
     }
 }

@@ -452,9 +452,19 @@ macro_rules! __op_cases {
 //                         `result`), size expr.len()
 //   out(buf = size)       write-only f32 buffer of `size` elements
 //   in_u32(buf = expr)    read-only u32 buffer, size expr.len()
+//   in_u32(buf = expr,    same, but the expression is evaluated once into a
+//          as tmp)        local `tmp` first. Use this whenever `expr` is not a
+//                         place expression (e.g. a method returning a Vec):
+//                         the plain form names `expr` twice, so a temporary
+//                         dies before its bytes are copied.
 //   u32(expr) f32(expr)   scalar arguments
 //   u32x2(a, b)           two u32 dims: one packed uint2 on Metal, two args on CUDA
 //   pod(expr)             repr(C) POD scalar argument
+//   pod(expr, as tmp)     same, but the expression is evaluated once into a
+//                         local `tmp` first. Use this whenever `expr` is a
+//                         method call: the plain form's `&$e` does NOT extend
+//                         a temporary's lifetime through set_bytes, so the
+//                         kernel silently reads freed stack bytes.
 //
 // `launch = 1d(expr) | rows(expr)` picks the dispatch shape and
 // `result = (buf, len_expr)` the buffer copied back to the host.
@@ -484,6 +494,16 @@ macro_rules! __op_metal_prep {
             .ok_or(<$err>::Gpu("buffer alloc"))?;
         $crate::__op_metal_prep!($err, $ctx, $pool $($tail)*);
     };
+    ($err:path, $ctx:ident, $pool:ident, in_u32($n:ident = $e:expr, as $tmp:ident) $($tail:tt)*) => {
+        let $tmp = $e;
+        let $n = $pool
+            .allocate(&$ctx.device, $tmp.len() * 4)
+            .ok_or(<$err>::Gpu("buffer alloc"))?;
+        gpukit::metal::BufferPool::write_bytes(&$n, unsafe {
+            std::slice::from_raw_parts($tmp.as_ptr().cast::<u8>(), $tmp.len() * 4)
+        });
+        $crate::__op_metal_prep!($err, $ctx, $pool $($tail)*);
+    };
     ($err:path, $ctx:ident, $pool:ident, in_u32($n:ident = $e:expr) $($tail:tt)*) => {
         let $n = $pool
             .allocate(&$ctx.device, $e.len() * 4)
@@ -494,6 +514,9 @@ macro_rules! __op_metal_prep {
         $crate::__op_metal_prep!($err, $ctx, $pool $($tail)*);
     };
     ($err:path, $ctx:ident, $pool:ident, u32x2($a:expr, $b:expr) $($tail:tt)*) => {
+        $crate::__op_metal_prep!($err, $ctx, $pool $($tail)*);
+    };
+    ($err:path, $ctx:ident, $pool:ident, pod($e:expr, as $tmp:ident) $($tail:tt)*) => {
         $crate::__op_metal_prep!($err, $ctx, $pool $($tail)*);
     };
     ($err:path, $ctx:ident, $pool:ident, $head:ident($e:expr) $($tail:tt)*) => {
@@ -517,6 +540,10 @@ macro_rules! __op_metal_bind {
         gpukit::metal::bind_buffer($enc, &$n, $idx);
         $crate::__op_metal_bind!($enc, $idx + 1 $($tail)*);
     };
+    ($enc:ident, $idx:expr, in_u32($n:ident = $e:expr, as $tmp:ident) $($tail:tt)*) => {
+        gpukit::metal::bind_buffer($enc, &$n, $idx);
+        $crate::__op_metal_bind!($enc, $idx + 1 $($tail)*);
+    };
     ($enc:ident, $idx:expr, in_u32($n:ident = $e:expr) $($tail:tt)*) => {
         gpukit::metal::bind_buffer($enc, &$n, $idx);
         $crate::__op_metal_bind!($enc, $idx + 1 $($tail)*);
@@ -531,6 +558,11 @@ macro_rules! __op_metal_bind {
     };
     ($enc:ident, $idx:expr, f32($e:expr) $($tail:tt)*) => {
         gpukit::metal::set_bytes($enc, &($e as f32), $idx);
+        $crate::__op_metal_bind!($enc, $idx + 1 $($tail)*);
+    };
+    ($enc:ident, $idx:expr, pod($e:expr, as $tmp:ident) $($tail:tt)*) => {
+        let $tmp = $e;
+        gpukit::metal::set_bytes($enc, &$tmp, $idx);
         $crate::__op_metal_bind!($enc, $idx + 1 $($tail)*);
     };
     ($enc:ident, $idx:expr, pod($e:expr) $($tail:tt)*) => {
@@ -557,6 +589,14 @@ macro_rules! __op_cuda_prep {
         let $n = $pool.allocate($ctx, ($size) * 4)?;
         $crate::__op_cuda_prep!($ctx, $pool $($tail)*);
     };
+    ($ctx:ident, $pool:ident, in_u32($n:ident = $e:expr, as $tmp:ident) $($tail:tt)*) => {
+        let $tmp = $e;
+        let $n = $pool.allocate($ctx, $tmp.len() * 4)?;
+        $n.write_bytes(unsafe {
+            std::slice::from_raw_parts($tmp.as_ptr().cast::<u8>(), $tmp.len() * 4)
+        })?;
+        $crate::__op_cuda_prep!($ctx, $pool $($tail)*);
+    };
     ($ctx:ident, $pool:ident, in_u32($n:ident = $e:expr) $($tail:tt)*) => {
         let $n = $pool.allocate($ctx, $e.len() * 4)?;
         $n.write_bytes(unsafe {
@@ -565,6 +605,9 @@ macro_rules! __op_cuda_prep {
         $crate::__op_cuda_prep!($ctx, $pool $($tail)*);
     };
     ($ctx:ident, $pool:ident, u32x2($a:expr, $b:expr) $($tail:tt)*) => {
+        $crate::__op_cuda_prep!($ctx, $pool $($tail)*);
+    };
+    ($ctx:ident, $pool:ident, pod($e:expr, as $tmp:ident) $($tail:tt)*) => {
         $crate::__op_cuda_prep!($ctx, $pool $($tail)*);
     };
     ($ctx:ident, $pool:ident, $head:ident($e:expr) $($tail:tt)*) => {
@@ -588,6 +631,10 @@ macro_rules! __op_cuda_args {
         $args.device_ptr($n.device_ptr());
         $crate::__op_cuda_args!($args $($tail)*);
     };
+    ($args:ident, in_u32($n:ident = $e:expr, as $tmp:ident) $($tail:tt)*) => {
+        $args.device_ptr($n.device_ptr());
+        $crate::__op_cuda_args!($args $($tail)*);
+    };
     ($args:ident, in_u32($n:ident = $e:expr) $($tail:tt)*) => {
         $args.device_ptr($n.device_ptr());
         $crate::__op_cuda_args!($args $($tail)*);
@@ -603,6 +650,11 @@ macro_rules! __op_cuda_args {
     };
     ($args:ident, f32($e:expr) $($tail:tt)*) => {
         $args.f32($e as f32);
+        $crate::__op_cuda_args!($args $($tail)*);
+    };
+    ($args:ident, pod($e:expr, as $tmp:ident) $($tail:tt)*) => {
+        let $tmp = $e;
+        $args.bytes(gpukit::cuda::pod_bytes(&$tmp));
         $crate::__op_cuda_args!($args $($tail)*);
     };
     ($args:ident, pod($e:expr) $($tail:tt)*) => {

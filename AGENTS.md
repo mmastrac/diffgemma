@@ -332,6 +332,9 @@ diffgemma replay /path/ops.jsonl -m $WEIGHTS  # re-execute + diff an op-log
 # Gates (run before commit)
 diffgemma smoketest -m $WEIGHTS             # 17/17 required
 diffgemma smoketest -m $WEIGHTS --longctx   # doc-QA ladder
+diffgemma smoketest -m $WEIGHTS --battery content   # long-answer rubric rates
+#   --replies FILE judges replies made elsewhere (the CUDA port) with the
+#   same code, no model: FILE maps probe id -> {reply, steps}
 diffgemma golden -m $WEIGHTS                # byte-identity 8/8
 cargo test --release
 
@@ -355,7 +358,10 @@ diffgemma census -m $WEIGHTS --analyze runs/c1   # re-report, no GPU
 #   batteries: smoke | longctx | programmatic (generate a program, RUN it,
 #   judge stdout + exit code; metrics prog_pass_pct, compile_fail,
 #   wrong_output, fenced_pct) | soft (indirect retrieval + hallucination
-#   rates, non-blocking)
+#   rates, non-blocking) | content (long free-form answers scored on a
+#   rubric + forbid + structure; metrics content_pct, content_full_pct,
+#   forbid_hits; non-blocking — the gate's convergence probes never read
+#   the reply, this is the only battery that scores what a long answer says)
 
 # Bench / diagnostics
 diffgemma bench-step-kernel -m $WEIGHTS --profile-steps 8

@@ -244,14 +244,859 @@ clears 0.641 by a lot.
   arg-struct redesign remains open.
 - **Port the engine's kernels to CUDA.** `crates/dgops` proves the pattern on
   the shared subset (one CPU oracle, Metal + CUDA bodies, tier-1 parity) and
-  `crates/nanogpt` exercises it end to end. `src/shaders/**` is still
+  `crates/nanogpt` exercises it end to end. The diffusion tranche is started:
+  `dgops::ops::{embed_gather, rms_norm_rows, swiglu_gelu, apply_rope_heads,
+  gqa_attention, moe_router_topk}` are the same kernels with a CUDA body
+  beside the Metal one, and `crates/dgops/tests/golden_slice.rs` runs seven
+  real-weight stages of the `engine_prefill` golden case on the GB10
+  (`DGQ_MODEL_DIR=<pack>`, `--features cuda`). `src/shaders/**` is still
   Metal-only and the crate does not build on Linux at all (`main.rs`
   compile_errors off macOS; `src/metal/`, `chat/`, `server/`, `decoder/` are
   macOS-gated). Order: make `src/shaders` + `src/model` build on Linux behind
-  the cuda feature (their GPU halves are already cfg-gated), port the tranche
-  nanogpt covers as `cuda.cu` beside each `.metal` against the same CPU
-  oracle, then attention. A CUDA box can run the tier-1 parity suite
-  without the 19 GiB pack.
+  the cuda feature (their GPU halves are already cfg-gated), move each ported
+  kernel onto the portable body so the engine and the CUDA slice share one
+  oracle, port the rest as `cuda.cu` beside each `.metal` (the quantized GEMM
+  family next), then the step kernel. A CUDA box runs the tier-1 parity suite
+  without the 19 GiB pack; the golden slice additionally needs the pack.
+  `crates/dgqcuda` goes further: it runs the whole 30-layer forward and the
+  denoise loop on CUDA against a real pack, with a CPU oracle per stage and a
+  per-step parity mode. The MoE experts use a bucketed grouped GEMM
+  (`moe_grouped.rs` + `moe_grouped.cu`): tokens are bucketed by expert, the
+  expert-major rows feed one tiled GEMM per bucket with the q4 weight tile
+  decoded into shared memory once per tile, and the routing weight is folded
+  into the SwiGLU. That also removes the f32 expert copies, so the resident
+  model drops from ~52 GiB to ~35 GiB. The grouped launch reads each bucket's
+  expert from the plan (`experts[job]`), never from the job index: a bucket
+  with no tokens holds no rows, so job j is not expert j. Every bucketed
+  kernel is element-wise and must be dispatched over `rows * width` elements,
+  never over rows: a row-count grid silently truncates the gather and the
+  expert path degrades to zeros without failing. Text prompts work
+  (`--prompt`, tokenizer + chat template), and the remaining port is the same
+  quantized-GEMM treatment for the attention/dense weights.
+
+  **Where the port stands.** The entries below this one are a chronological
+  hunt and most of them are disproofs; read this first.
+
+  Four real defects have been found and fixed, all in the port:
+
+    1. the step re-applied the layer stack to the prompt rows (below)
+    2. `dgq_moe_scatter` accumulated with atomicAdd, so the port was not
+       deterministic against itself (below)
+    3. the dense MLP ADDED where the oracle overwrites, which put an extra
+       rms(residual, pre_ff) term in every layer of every row
+    4. the reply was decoded from the sampled canvas `ids` instead of the
+       argmax canvas, so any row the accept mask declined emitted a uniform
+       random token
+
+  Plus one behavioural mismatch: the early-stop floor was an AND where
+  `sample::early_stop_allowed` has an OR, so the port could not stop before
+  step 12 and burned nine steps on a resolved canvas.
+
+  State after all of that, measured end to end against the engine on four
+  smoketest prompts x seeds {7,42,123}: the port reproduces the engine's reply
+  EXACTLY on short convergent answers and never on long trajectory-sensitive
+  ones. Every decoder layer body is exact on synthetic input (cos >= 0.9999999
+  at layers 0, 5, 15, 23, 29, both attention kinds), so what remains is not a
+  wrong kernel.
+
+  What is still open:
+
+    - Long answers. Text identity was the wrong bar (see the smoketest
+      criteria note below); the `content` battery now scores them. The
+      port's structural limit there: `dgqcuda denoise` runs ONE 256-token
+      canvas and never chains a second block, so any reply longer than that
+      is cut off. The engine writes 550-665 words for the explain probes.
+      The KV cache below is the prerequisite; chaining itself is not built.
+    - FIXED: step time was the attention kernel. With the timing marks
+      split, `dgq_attention_v2` alone was 50.1 s of a 54.8 s step (canvas
+      256, 283 keys): one block per (row, head) with every thread walking
+      the whole key range redundantly and a 512-float accumulator per
+      thread. `dgq_attention_v3` (cb608e9f) keeps the contract and
+      parallelizes inside the block (warp per key, lanes across head_dim,
+      shuffle-reduced dot, per-warp online softmax, shared-memory merge).
+      Kernel 50.1 s -> 0.1 s; step 54.8 s -> 4.8 s; France seed 42 end to
+      end 174.8 s -> 20.8 s with the same three steps and reply. Every
+      kernel test runs on both kernels against the CPU reference (cos >=
+      0.99999999, step geometry and window included); A/B against the
+      pre-cache v2 build: 0 argmax flips at all 256 positions on steps 1
+      and 2, max logit delta 1e-4. `DGQCUDA_ATTN=v2` keeps the old kernel.
+      Against the CPU oracle (canvas 64; the 256 run was OOM-killed on the
+      host, which also took the admin login's systemd --user with it):
+      step 1 min row cos 0.9998, step 2 0.956 / mean 0.993, 0 argmax
+      mismatches in 128 rows. The step-2 spread is the soft-embed regime
+      item below (canvas 64 sits at mean_H 0.53 after step 1, not 0.016),
+      identical on the old build. The step is now the expert path: 3.8 s
+      of 4.8. The engine target of <= 5 s/step is met on this shape; the
+      experts are the next lever.
+    - Soft-embed disagrees with the CPU oracle in high-entropy regimes.
+      At canvas 16 with only the chat-template prefix as prompt (mean_H
+      ~4), step 2 is cos 0.89 with argmax mismatches against the oracle
+      while step 1 is 0.9997; identical on the pre-cache and cache builds,
+      so it is not the cache. `dgq_soft_embed` keeps at most 16 candidates
+      per thread (4096 per row) of the tokens within 10 logits of the max;
+      the CPU keeps all of them. Invisible on real prompts (mean_H 0.0156
+      at step 1, 0.9997 at step 2), so it is a diagnostic-regime finding,
+      not a generation defect on anything measured. Not fixed.
+
+  **Built: a resident per-layer KV cache** (a3ead737). `Session::prefill`
+  runs clean rows causally at the cache length and appends their K/V;
+  `Session::step` runs the canvas rows alone at absolute positions past
+  the cache, attending the whole cache plus themselves. A committed block
+  is prefilled the same way, so block chaining is a loop on top of this.
+  Exact against the old `[prompt][canvas]` pass by A/B of both binaries on
+  the same prompt and seed: 0 argmax flips and a 0.0000 max logit delta at
+  every canvas position on steps 1 and 2, identical accept counts and
+  entropies. Against the CPU oracle, 512/512 argmaxes over two steps, min
+  row cos 0.9996; `tests/kv_session.rs` pins prefill + two steps. What it
+  did NOT do is make the step faster (57 s against 59 s): the prompt was
+  27 of 283 rows and the cost is the canvas, which is the attention
+  finding above. The pre-cache build is kept at `~/diffgemma-cuda-old` on
+  gx10-efcd for further A/Bs.
+    - RESOLVED: the "per-row K drift at depth" (position 4 at cos 0.0525 by
+      layer 29 while position 3 held 0.9997) was the diagnostic `forward`
+      command, not the model path. `forward --gpu` ran every prompt row
+      bidirectionally (`causal_split 0`); the engine prefills a prompt
+      causally, so the dump it was compared against had a different mask per
+      row. `forward --gpu --causal` (c267df43) gives cos 1.000 at every one
+      of the 20 rows at every one of the 30 layers, and two runs agree at
+      every cell to 16 digits, which also rules out a kernel race. The
+      denoise session path always used `causal_split = prompt_len` and was
+      never affected. What is left under a matched mask is bf16-sized:
+      worst row/layer cell is 0.972 (f32 arena), 0.9963 (RNE), 0.982
+      (trunc), each arm's worst on a different row, so no arm dominates.
+    - The engine's f32->bf16 store truncation is a real, deliberate
+      arithmetic difference the port does not share. `DGQCUDA_BF16_ARENA=trunc`
+      reproduces it; whether the port SHOULD is a bit-compatibility-vs-accuracy
+      call nobody has made.
+
+  **Fixed: the step re-applied the layer stack to the prompt rows.** The port
+  has no resident KV cache, so each step runs `[prompt][canvas]` through the
+  layers and rebuilds the prompt's K/V that way. It seeded the prompt rows
+  with the post-layer hidden state from `prompt_hidden`, which feeds a state
+  that has already been through all 30 layers back into layer 0: the prompt
+  residual stream leaves the stack 30 layers ahead, and the canvas attends the
+  resulting wrong K/V. Seeding from the embeddings instead is exact, not an
+  approximation -- a prompt row is causal (`causal_split` is the prompt
+  length), so it attends only prompt keys up to itself and cannot see the
+  canvas, which reproduces the standalone causal prefill's hidden and K/V bit
+  for bit. `forward_sc` and the device `Session::step` now both embed the
+  prompt; `prompt_hidden` became `warm` (a device warm-up that no longer feeds
+  a probe), and the `--diag` line that compared it was the misleading
+  probe-vs-production pair AGENTS.md warns about: it exercised a code path the
+  step never used, so "prompt rows match the engine" and "the canvas drifts"
+  were both true at once. `tests/step_prompt.rs` pins the prompt rows to the
+  causal prefill and to canvas-independence; with the bug reinstated it reports
+  cos 0.0061, and green it passes on the real pack.
+
+  **Disproved: bf16-versus-f32 activations are not the residual drift.** Every
+  attention and dense weight in the production pack is raw BF16 and bf16->f32
+  widening is exact, so weights were never a divergence; the only delta is that
+  the engine bf16-rounds activations at each arena store while the port keeps
+  f32. Simulating that faithfully (norm-bounded 30-layer residual,
+  round-to-nearest-even at every store) gives hidden cos 0.9997 and leaves
+  argmax and entropy unchanged (8.4953 vs 8.4954) across 12 seeds. A relative
+  cos of 0.4-0.7 is a structural mismatch, not a 2^-9 per-store accumulation.
+
+  **Latent, not yet active.** `Session::step` builds its runner with `pos0: 0`
+  although the canvas starts at absolute position `prompt_len`; the sliding
+  window is still correct only because `window` (1024) exceeds the canvas and
+  prompt lengths in use. Likewise the port windows the canvas where the engine
+  windows only the prompt (`t_lo = kv_len - (window-1)`, canvas always
+  visible), which the same sizes keep inert. Both bite at canvas > window.
+
+  **Fixed: step 1 self-conditions on the canvas embedding.** The SC MLP runs
+  on EVERY step; only its input changes. From step 2 on it is the soft
+  embedding of the previous step's logits, and on step 1 -- no previous
+  prediction -- the engine seeds it with the canvas embeddings themselves,
+  reading the initial canvas as the step-0 prediction. The port skipped the
+  MLP outright, which is the SC=0 case the engine's own comment on that branch
+  records as degenerate ("cold-start empty reply"). `forward_sc` and
+  `Session::self_condition` now both take the signal as a parameter, and
+  `tests/step_first.rs` pins the row to the engine's PRODUCTION value.
+
+  This moved the preamble onto the engine (cos 0.999988, from a row that was a
+  different computation before) and moved step-1 entropy 11.10 -> 10.37. It did
+  NOT fix generation: the logits still saturate and the canvas still does not
+  sharpen, so the SC branch was a real divergence but not the whole one.
+
+  The earlier reading came from `encode_step_preamble`, which production does
+  not run on step 1 -- see the engine fix below. Every port conclusion drawn
+  against a `step-*-dump` before that fix is unverified and worth re-deriving.
+
+  **Open: the canvas still does not sharpen, and the failure is absolute.**
+  A canvas row's logits come out around 144 raw, so the 30.0 softcap saturates
+  every one of them (top sixteen post-cap all 29.99) and the row is flat. The
+  engine's same row spans 18 to 28.4. That is not "a different trajectory" --
+  it is a broken distribution, and it is what starves the accept rule.
+
+  What is measured, all against the now-production-faithful engine probes on
+  the same prompt, seed and canvas (`DGQCUDA_LAYER_DUMP` / `DGQCUDA_ATTN_DUMP`
+  / `DGQCUDA_ROUTE_DUMP` vs `step-layer-probe` / `step-attn-dump` /
+  `step-moe-route-dump`):
+
+    preamble         cos 0.999988  (the step-1 SC fix; row 1 agrees, 0.999980)
+    layer 0 attention cos 0.999984 -- exact, carries its input through
+    layer 0 whole     cos 0.999602 -- the error enters in the FFN/MoE half
+    layer 0 moe_out   cos 0.9999694, l2 ratio 1.0214 (row 0)
+    layer 29          cos 0.183
+    final norm        cos 0.175, l2 ratio 6.62
+
+  Ruled out. The attention kernel is exact at the real full-attention geometry
+  (head_dim 512, 2 KV heads, 276 keys) and across tile boundaries, so the
+  amplification at layer 5 is a real input error, not a kernel bug -- that also
+  closes the multi-tile fixture gap this file used to list. Routing is 99.1%
+  identical (2029 of 2048, 68 experts both sides), so no wrong expert index.
+  The MoE difference is a 2.1% SCALE with the direction intact, which is the
+  same size as the engine's own GPU-vs-CPU-oracle MoE spread (rel_l2 0.0141,
+  printed by the route dump) -- f32 against the engine's bf16 arithmetic, not a
+  formula error: both routers compute `softmax(top_k) * per_expert_scale` with
+  no renormalization, and both gate with `gelu_tanh`.
+
+  The amplification is measured, not assumed. Two identical port runs (same
+  seed, same binary), taken before the determinism fix below, diverged by 6e-6
+  at layer 1 and 1.7e-3 by layer 29 -- the model's own gain on a perturbation
+  it did not ask for, about 1.2x per layer, ~300x over the stack. The port is
+  deterministic now, so re-measuring this needs a deliberate perturbation. The port's 0.49% relative
+  difference at the preamble, amplified 260x, is the observed 128% at layer 29.
+  So per-layer divergence from the engine is EXPECTED at f32-vs-bf16 and bit
+  parity is unattainable without matching the engine's arithmetic. Do not spend
+  another session bisecting layers for a single wrong kernel; the trace is
+  consistent with amplification everywhere.
+
+  What that does NOT explain is saturation. A different-but-valid trajectory
+  should still produce a sane logit row, and the port's prompt-path logits do
+  (top 27.4, clear of the cap) while its canvas rows do not. The open question
+  is therefore narrower than "why does the port differ": why does the canvas
+  hidden land where `model.decoder.norm.weight` (l2 4746, mean 29.5, max 588)
+  blows it up 6.6x, when the engine's lands on the small-weight coordinates.
+
+  That row is pathological in an absolute sense, and the shape is specific: it
+  carries 79% of its energy in ONE coordinate (216), l2 789.4 and max 700.3. Neither control looks like that --
+  the port's own last PROMPT row is l2 371.8 / max 105.4 (8%), and the engine's
+  canvas row is l2 119.2 / max 36.0 (9%). Coordinate 216 holds -7.29 in the
+  port's layer-29 hidden against the engine's -0.20, and the final norm's
+  weight there (36.25, not even its largest) turns 19.3 sigma into 700. A
+  normed row dominated by one coordinate makes every logit a multiple of one
+  embedding column, which is why they are all large and all saturate.
+
+  The spike appears over the last four layers, and probing them rules them out
+  as its cause. Three rows through the same 30 layers and the same final norm, one
+  run, reported as the share of the row's energy in its largest coordinate:
+
+    row                      L28    L29    after final norm
+    engine canvas            0.8%   43.5%   9.1%   (the norm REDUCES the spike)
+    port prompt (control)   22.8%   14.8%   8.0%   (reduces, like the engine)
+    port canvas             10.9%   13.3%  78.7%   (the norm AMPLIFIES it)
+
+  The port's own PROMPT row -- same code, same layers, same norm, a path already
+  verified against the causal prefill -- comes out healthy at 8.0%, in line with
+  the engine's canvas at 9.1%. So layers 26-29 and the final norm are not
+  broken; they are handed a broken row. What separates the cases is WHERE the
+  layer-29 spike sits: the engine's and the port's prompt row put theirs on
+  coordinates whose norm weight is about 1, and the port's canvas puts its on
+  coordinate 216, weight 36.25, which is how 19 sigma becomes 700.
+
+  The late-layer behaviour is a symptom of not converging, not a missing
+  mechanism. The engine's MoE output collapses over those layers (l2 39.8 ->
+  15.5 -> 11.3 at 26/27/28) and its residual contracts with it (47.0 -> 36.3 ->
+  31.4), because its canvas has already resolved -- at step 1 it reads "The
+  capital of France is". The port's MoE matches the engine to 0.1% at layer 26
+  (39.83 vs 39.79) and then stays high (24.9, 27.1) while its residual does not
+  contract (55.8 -> 50.4 -> 57.0): a model still working on a representation
+  that never resolved. Its attention branch is not the difference either --
+  the engine's attn_out magnitude is flat (l2 41-46) across 26-28 while the
+  residual falls, so the contraction is cancellation in the residual.
+
+  **The injection test ran, and it moved the bug.** `DGQ_PROBE_HIDDEN_DIR`
+  makes `step-layer-probe` write the engine's whole canvas hidden at every
+  checkpoint as raw f32; `DGQCUDA_INJECT_AFTER`/`DGQCUDA_INJECT_BIN` load one
+  of those into the port's canvas rows and let it run the rest of the stack.
+  Injecting the engine's state after layer 28 lifts `after_layer_29` from cos
+  0.183 to 0.954 and the final norm from 0.175 to 0.666, so the remaining
+  layers are broadly right when handed the right input.
+
+  Then, with a BIT-IDENTICAL canvas hidden at layer 29:
+
+    hidden_in    cos 1.0000000
+    hidden_ln    cos 0.9999988
+    q_post_rope  cos 0.9999958   <- the whole query path is exact
+    attn_out     cos 0.7838784   <- collapses, and 23% large (73.0 vs 59.2)
+
+  The queries are exact and the attention kernel is verified at this geometry,
+  so the divergence enters through K/V. Splitting the keys by position says
+  which:
+
+    pos  0 prompt  cos  0.3907      pos 20 canvas  cos 0.9999958
+    pos  1 prompt  cos -0.0914      pos 21 canvas  cos 0.9999961
+    pos 19 prompt  cos  0.0610
+
+  The CANVAS keys are exact -- they come from the injected rows -- and the
+  PROMPT keys are uncorrelated. That matters because at layer 29 between 47%
+  and 83% of each head's attention mass lands on the 20 prompt keys, so
+  wrecking them wrecks the output whatever the canvas does.
+
+  **The prompt path is the minimal reproduction, and it needs no canvas.** The
+  port's prompt keys are cos 1.0000000 against the engine at layer 0 and decay
+  with depth (0.997 at 5, 0.99 at 20, 0.86 at 23, 0.06 at 29), so they are not
+  structurally wrong, they drift. They are also canvas-independent: the device
+  warm-up runs the prompt ALONE and the step runs it beside the canvas, and
+  their keys are bit-identical at every layer, so `causal_split` masks
+  correctly and nothing leaks. What that leaves is exactly this -- the port's
+  20-token causal prefill does not reproduce the engine's 20-token causal
+  prefill at depth. That is the whole bug, with no canvas, no
+  self-conditioning, and no sampler in it, and it iterates in seconds instead
+  of minutes. Work there, and compare per layer against
+  `step-attn-dump`'s `k_samples` (positions 0 and 19 are enough).
+
+  **The prefill test ran, and it is the loop to work in.** `dgqcuda forward
+  --gpu` on the golden 20 ids (which ARE the chat-templated "What is the
+  capital of France?", so it matches the engine dumps exactly) takes 43s, and
+  `DGQCUDA_K_DUMP_JSONL` records every layer's K in that one run. Both sides now
+  sample every prompt position, so the picture is a matrix rather than whichever
+  positions a layer happened to attend to. Against the engine:
+
+    layer    kind    mean cos   min cos
+        1  sliding   0.990871   0.981119
+        2  sliding   0.986844   0.973080
+        3  sliding   0.960083   0.879676
+        5     FULL   0.886938   0.731883
+       10  sliding   0.894963   0.489285
+       15  sliding   0.853597   0.420505
+       20  sliding   0.833522   0.189830
+
+  It decays smoothly from layer 1 across ALL positions. There is no step at the
+  first full-attention layer: a `bad(<0.9)` count made it look like one, which
+  was a threshold artifact and not a finding. RoPE is ruled out as well -- the
+  port's `rope_freqs` and `apply_rope` are character-identical to the engine's
+  `compute_rope_freqs`/`apply_rope`, and `dgq_rope` uses the same proportional
+  `half_head + d` pairing, so the partial rope on full-attention layers is
+  right. (Worth knowing anyway: the dgops tier-1 rope fixture only covers a
+  SLIDING layer, where `rotary_dim == head_dim` makes both pairings identical,
+  so it could not have caught a proportional bug.)
+
+  The number to chase is the first row. K is cos 1.0000000 at layer 0 and
+  0.9909 after ONE layer, so a single layer injects ~1e-2 of relative error
+  into the prompt rows from a bit-identical start. That is the per-layer seed,
+  it is measurable in 43 seconds, and everything downstream is it compounding.
+
+  **Ruled out: arithmetic precision, by 1700x.** The two `DGQCUDA_BF16_ARENA`
+  arms differ by a bf16-sized perturbation of every activation -- the size of
+  the engine's own rounding -- so comparing them to EACH OTHER measures how much
+  the port amplifies a known-small perturbation:
+
+    layer   K cos(f32, bf16)   K cos(port, engine)
+        1          0.9999947             0.9908709
+       20          0.9997162             0.8335219
+
+  At layer 1 the port-vs-engine gap is 9.1e-3 of (1-cos) where a full bf16
+  perturbation produces 5.3e-6 -- 1700x smaller. Precision cannot be the
+  explanation, and the whole "small seed amplified at 1.2x/layer" story
+  recorded above is wrong for the prompt path: layer 0 computes a materially
+  different function. (The K path itself only amplifies (1-cos) about 2.6x, so
+  the hidden after layer 0 sits near cos 0.9965.)
+
+  **Which points at encoder-vs-denoise, not at a kernel.** The port has ONE
+  `layer_forward`, differing only in the mask, and it is compared against two
+  DIFFERENT engine paths:
+
+    canvas rows   reference = the engine's denoise step      layer 0 cos 0.999602
+    prompt rows   reference = the engine's encoder prefill   layer 0 cos ~0.9965
+
+  Same port code, 9x worse against the encoder. The engine has more than one
+  prefill implementation -- the monolithic encoder (which wrote the KV every
+  reference dump here was taken from, per its "monolithic-prefill" log line) and
+  a step-kernel chunked path that runs the prompt through the denoise stack
+  (`encode_prefill_chunk`). The port mirrors the denoise stack, so it is
+  reproducing the wrong one of the two. This is the AGENTS.md class exactly:
+  "the fast-prefill encoder running a denoise-only norm".
+
+  **Disproved: the engine's two prefill paths agree.** `DGQ_FAST_PREFILL=0|1`
+  forces the monolithic encoder or the step-kernel chunked path (the default is
+  a length band, >256 tokens, so a 20-token prompt had only ever taken the
+  encoder). Dumping layer-1 K under both and comparing them to each other:
+
+    prompt positions 0-19   cos 0.999992 to 0.999998
+
+  They are the same answer. So the port is NOT reproducing the wrong one of two
+  prefills, and the encoder-vs-denoise reading above is wrong. Note the trap in
+  that comparison: position 20 reads cos 0.673 and the canvas-row stages read
+  0.49-0.79, but those are artifacts -- fast prefill streams the prompt through
+  the CANVAS ids plane and clobbers the seeded canvas, which `diag_probe`'s own
+  comment documents. Only positions < kv_len carry signal.
+
+  So two explanations are now eliminated by measurement: arithmetic precision
+  (1700x too small) and prefill-path confusion (the paths agree). What remains
+  for layer 0 on prompt rows is the layer body itself -- attention under the
+  causal mask, the dense FFN, or the MoE -- and the port's attention has only
+  ever been checked on a CANVAS row (cos 0.999984 at layer 0), never on a
+  causal prompt row.
+
+  **Disproved: it is not MoE routing flips.** Routing is discrete and per row,
+  so a flipped expert shows up as a few ruined rows against a clean background.
+  The layer-1 K divergence is instead UNIFORM across all 20 prompt positions:
+
+    layer 1  mean 0.990871   worst p1=0.9811   best p19=0.9977
+    layer 2  mean 0.986844   worst p8=0.9731   best p0=0.9977
+    layer 3  mean 0.960083   worst p12=0.8797  best p0=0.9932
+
+  No outliers at layer 1 -- every row is off by about the same 1-2%. So layer 0
+  applies a systematically different function to every prompt row, rather than
+  mis-routing a few.
+
+  That also narrows attention as the suspect, because at layer 0 the two sides
+  provably agree on its inputs: prompt K is cos 1.0000000 there, which means
+  `rms_norm`, `k_proj`, `k_norm` and RoPE are all exact for prompt rows, and Q
+  travels the same code. The masks agree too -- seq is 20 against a 1024
+  window, so sliding is inert and both sides are plain causal. V is the only
+  attention input never compared, and the dense FFN and the MoE are the only
+  other components.
+
+  Next: split layer 0 for a PROMPT row. BLOCKED on the engine side, and the
+  blocker is worth knowing before anyone retries: the engine's CPU single-layer
+  commands (`layer0`, `attention`) cannot load a .dgq pack at all. Both go
+  through `DecoderLayerWeights::load`, which fetches every tensor with
+  `store.tensor()`, and that refuses quantized ones ("dgq tensor is quantized;
+  use tensor_f32") -- the attention and dense weights are raw bf16 and load
+  fine, but `experts_gate_up` is q4 and kills the whole load. So the obvious
+  clean experiment -- one layer, identical synthetic input, real weights, f32 on
+  both sides, which would isolate the layer body from prefill and canvas
+  entirely -- needs `DecoderLayerWeights` to support partial or dequantizing
+  loads first. `dgqcuda layer0` (the port half, on the engine's own synthetic
+  input `(i % hidden) * 0.01 - 0.5`, seq 16, causal) is already built and
+  waiting for a counterpart.
+
+  `DGQCUDA_ATTN_DUMP` is canvas-relative
+  (`row = DGQCUDA_ATTN_ROW + causal_split`), so in the prefill, where
+  `causal_split == seq`, every row it can name is out of range and the dump
+  never fires -- it needs an absolute-row mode before it can be pointed at a
+  prompt row. Pair that with the engine's `hidden_in` for the same row, which
+  no dump currently exposes for prompt positions: `step-attn-dump` reports
+  `hidden_in`/`hidden_ln`/`q_*`/`attn_out` for a CANVAS row only, and
+  `k_samples` is the sole prompt-row quantity it carries.
+
+  `step-kv-parity` does not cover any of this -- it defaults to `layers: 1` and
+  compares two runs of the same path, so it is a determinism check, and it
+  passes at max_kv_diff 0.000000 while this divergence is live.
+
+  **The 2.1% MoE gap decomposes, and both sides are off.** The engine's route
+  dump now reports its CPU oracle's own magnitude, not just its distance from
+  the GPU, which is what says WHICH side is wrong. Layer 0, canvas l2:
+
+    engine GPU (Metal, bf16)   82.4949    -1.34% vs the oracle
+    engine CPU oracle (f32)    83.6482
+    port    GPU (CUDA,  f32)   84.4968    +0.79% vs the oracle
+
+  (1.0134 x 1.0079 = 1.0214.) So it is NOT "the port is exact and the engine is
+  lossy". The engine's -1.34% is its own bf16 accumulation, which the port
+  neither can nor should reproduce; the port's +0.79% against the same f32
+  oracle is its own bug and is the number to fix.
+
+  Ruled out for that +0.79%, by reading the engine's source against the port's:
+  the q4 decode (`delta * q + min`, same nibble order, in both the shared Rust
+  decode and the port's CUDA `moe_q4_at`), GELU (the coefficients differ by
+  under one ulp), the gate/up split, the routing-weight formula (both
+  `softmax(top_k) * per_expert_scale`, no renormalization), the residual
+  (`scal_off` is a blob offset, 0 means scale 1, so it is a plain sum), and the
+  scale-free norm and its eps (both 1e-6; the port's `rms_norm_eps` is a
+  required serde field that parses from the pack).
+
+  **Retracted: there is no 6x in the step-1 SC MLP.** An earlier reading here
+  inferred the engine's pre-norm sum from its `after_preamble` RMS deficit, on
+  the reasoning that eps is the only thing that can make a scale-free norm miss
+  unity. That put the engine's sum at RMS 0.0134 and the port's SC output at
+  ~6.4x the engine's. The engine's preamble dump now carries `sc_dense`, so the
+  sum can be MEASURED as `embed_scaled + sc_dense` instead, and it is not close:
+
+    engine  embed_scaled    rms 1.23791
+    engine  sc_dense        rms 6.18777
+    engine  sum (pre-norm)  rms 6.61901   <- inferred 0.01336, wrong by 500x
+    port    sum (pre-norm)  rms 6.72500   <- ratio 1.02x, not 6.4x
+
+  The port's SC output is about 2% large, in line with everything else, and the
+  inference was worthless because with the real sum eps/m is 2e-8. Do not
+  back-solve a magnitude through a scale-free norm; dump the operand.
+
+  **FOUND: the engine TRUNCATES every f32->bf16 store instead of rounding.**
+
+    inline float f32_round_bf16(float x) {          // src/shaders/include/common.metal
+        return as_type<float>(as_type<uint>(x) & 0xFFFF0000u);
+    }
+
+  Masking the low 16 bits always moves a value toward zero, so every arena
+  store loses a uniform fraction of an ulp rather than a signed half-ulp. The
+  Rust side does the same (`(v.to_bits() >> 16) as u16`, in dgq/dequant.rs,
+  dgq/block.rs, dgemm/format/bf16.rs), so the convention is consistent across
+  the engine -- it is a bias, not a CPU/GPU mismatch. The function is named
+  `round`, which is how it reads as correct on the way past.
+
+  This is verified, not inferred. Re-running the engine's own step-1 preamble
+  from its dumped `embed_scaled + sc_dense`:
+
+    round-to-nearest    after l2 53.0721   rms 1.000115
+    TRUNCATE (engine)   after l2 52.9182   rms 0.997215
+    engine actual       after l2 52.9182   rms 0.997215   cos 1.000000000
+
+  Truncation reproduces the engine exactly. That is the whole of the 0.28%
+  "scale-free norm returns 0.9972" anomaly, and it is why the port sits ABOVE
+  the engine in magnitude at every stage measured: the port computes exact f32
+  and the engine shrinks ~0.28% of l2 at every store. The MoE runs several
+  stores per expert (gate_up, glu, down), which is the right order for the
+  -1.34% the engine's GPU shows against its own f32 oracle.
+
+  Two ways to use this, and they are different goals. To make the PORT match
+  the engine bit-for-bit, truncate at the same points -- the port keeps f32
+  throughout today and so has no equivalent of the arena store. To make the
+  ENGINE better, switch `f32_round_bf16` to round-to-nearest-even
+  (`(bits + 0x7fff + ((bits >> 16) & 1)) >> 16`), which costs two integer ops
+  and removes a systematic half-ulp downward bias that compounds over 30 layers
+  and every store within them. That second one is TRAJECTORY-AFFECTING: it
+  changes every activation, so it needs a golden re-bless and a quality gate,
+  and it should not be done casually just because it is more accurate.
+
+  **Also open, engine-side: its scale-free norm returns 0.9972, not 1.**
+  RESOLVED by the above -- the deficit is the output store truncating.
+  Historical note kept because the inference chain that chased it was wrong: Renormalizing
+  the engine's own `embed_scaled + sc_dense` in f32 gives l2 53.0660 (unit RMS,
+  as it must) where the engine's `after_preamble` is 52.9182. The two are
+  parallel (cos 0.9999968) and the ratio is a near-uniform 0.997215, with
+  per-element ratios spread 0.989-1.002 around a median of 0.9977. bf16 and f16
+  rounding of the sum both reproduce l2 53.066, so storage does not explain it,
+  and eps cannot at this magnitude. RMS_EPS is 1e-6, `w_off` is 0 so no weight
+  is applied, and the reduction is a normal simd_sum tree. Cause unidentified.
+
+  Note what that makes the pattern: the engine's GPU sits BELOW exact math
+  wherever it has been measured -- -1.34% on the layer-0 MoE against its own
+  f32 oracle, -0.28% on this norm -- while the port computes the exact f32
+  answer. Reproducing the engine therefore means matching its ARITHMETIC, not
+  being more accurate than it. The port's +0.79% on the MoE is the one
+  discrepancy so far that points the other way and is the port's own.
+
+  The remaining MoE bias is likelier to be a BIAS than noise. The port's layer-0 MoE output is
+  cos 0.9999694 against the engine with l2 ratio 1.0214 -- same direction, 2.1%
+  large -- and a systematic 2% per layer compounds (1.02^30 = 1.8x), which is
+  the shape of the residual l2 ratios through the middle layers. Unbiased
+  rounding would not do that. Find where the 2.1% comes from: the q4 expert
+  decode in the port's kernel against the engine's, the GEMM's accumulation
+  precision, or the routing weight the engine stores as bf16. The engine's own
+  GPU-vs-CPU-oracle spread on that same buffer is rel_l2 0.0141, so check the
+  SIGN of that difference too -- if the engine's GPU path is the one losing
+  magnitude, the port is the accurate one and the target is bit-compatibility,
+  not correctness.
+
+  **Fixed: the port reproduces itself.** `dgq_moe_scatter` accumulated each
+  token's expert rows with `atomicAdd`, so the sum order varied with scheduling
+  and three identical runs gave three different results (bit-identical at layer
+  0, 6e-6 apart by layer 1, 1.7e-3 by layer 29). `dgq_moe_combine` inverts the
+  loop: `GroupedPlan::token_slots` builds the CSR inverse of `tok_idx` on the
+  host and one thread sums each token's rows in ascending row order. No atomics,
+  and `moe_out` needs no pre-zeroing. Three runs now hash identically, and it is
+  the same computation (cos 1.000000000 against the old path at layers 0/1/15).
+
+  When repeating that check, hash the dumps AFTER the runs finish. Hashing a
+  file that is still being appended reports a difference that is not there,
+  which is how this first read as unfixed.
+
+  **FOUND, and it was none of the above: the dense MLP added where it should
+  have overwritten.** `layer_forward` folded the dense branch in with
+
+      normed += rms(dense_out, post_feedforward_layernorm_1)
+
+  where `normed` held `rms(residual, pre_feedforward_layernorm)` -- the GEMM
+  input from four calls earlier, not a residual. `decoder_layer::forward`
+  OVERWRITES there; the MoE branch is what gets added, and the residual rejoins
+  at the layer output. So every layer summed an extra normalized copy of its
+  own input, on every row, prompt and canvas alike.
+
+  Measured on one layer, the same synthetic input on both sides, nothing
+  accumulated:
+
+      hidden_in                identical by construction   cos 1.000000000
+      output, add (the bug)    cos 0.997230850   rel_l2 0.083099
+      output, overwrite (now)  cos 0.999999615   rel_l2 0.000878
+
+  A/B'd behind an env switch inside ONE binary so a rebuild could not be
+  mistaken for the effect, then the switch came out. Fixed in the CUDA path and
+  in the port's own CPU forward, which had the identical line and the identical
+  comment -- so the parity test that compares those two was comparing two
+  copies of one mistake and passed. `tests/layer0_oracle.rs` now pins the CPU
+  half against a fixture of the engine's answer; putting the bug back makes it
+  fail at cos 0.997230862, within 1.2e-8 of what the CUDA path scored, which is
+  its own confirmation the two defects were the same one.
+
+  Why the ladder of disproofs above never reached it. Every measurement was
+  taken downstream of the fold and read as evidence about the thing it measured:
+  K at layer N carries it, the MoE output carries it, the residual ratios carry
+  it. It is uniform across rows, so the routing test read "not routing"
+  correctly and learned nothing. It is ~8% at one layer, far above bf16, so the
+  precision test read "not precision" correctly and learned nothing. It is in
+  the layer body, so the prefill-path test read "not the prefill" correctly and
+  learned nothing. Each disproof was sound and none of them could have found
+  it, because none compared ONE layer against a reference that did not share
+  the bug. The engine's `layer0` was that reference the whole time and was
+  unreachable only because `DecoderLayerWeights::load` could not open a
+  quantized pack.
+
+  The cost of that blocker is the lesson worth keeping. Two days of
+  disproof-by-elimination ran because a single-layer oracle comparison needed
+  two tensors dequantized, and that was filed as a blocker rather than done.
+  `ExpertPlanes` is 60 lines.
+
+  **The fix is a strict improvement at every layer, and it is not the whole
+  divergence.** One binary, both arms behind a temporary env switch, each arm
+  against the SAME engine dump per layer (prefill K, 20 prompt positions):
+
+      layer   kind      ADD mean   ADD min    OVR mean   OVR min
+          0  sliding    1.000000  1.000000    1.000000  1.000000
+          5  FULL       0.978429  0.921858    0.995458  0.980868
+         10  sliding    0.988223  0.971237    0.989605  0.967252
+         15  sliding    0.893790  0.420505    0.896133  0.432931
+         20  sliding    0.989013  0.975899    0.990701  0.981286
+         23  FULL       0.720024 -0.251772    0.750468 -0.229099
+         27  sliding    0.695005  0.035063    0.798152  0.089466
+         29  FULL       0.051228 -0.104093    0.778844  0.052532
+
+  Better everywhere, hugely so at depth. Layer 0 is 1.000000 in both arms
+  because K there is computed before the dense MLP, so the fold cannot reach
+  it. Two traps in reading that table: the curve ACROSS layers is not
+  comparable, because those engine dumps span 10:30-22:11 on Sep 14 across
+  three engine defect fixes; and an earlier attempt that compared an old port
+  run against the new one showed layers 15-27 getting worse, which was two
+  builds and two runs rather than an A/B, and was discarded.
+
+  **And no layer body is wrong.** `DGQ_LAYER0_INDEX` / `--at` run the
+  single-layer split at any layer, on the same synthetic input:
+
+      layer   kind             cos       rel_l2
+          0   sliding   0.999999615     0.000878
+          5   FULL      0.999999993     0.000120
+         15   sliding   0.999999971     0.000242
+         23   FULL      0.999999978     0.000212
+         29   FULL      0.999999999     0.000035
+
+  Both attention kinds, so the full-attention geometry (partial RoPE, head_dim
+  512, 2 kv heads) is right as well. Layer 0's 8.8e-4 is the engine's bf16
+  expert-plane floor and is the WORST of the five, which says it is the floor
+  rather than a defect.
+
+  That leaves a contradiction worth stating plainly, because it is the next
+  thing to resolve. The input to layer 0 is right (prefill K there is cos
+  1.0000000). Every layer body is right to ~1e-4 on synthetic input. Yet
+  prefill K at layer 5 reads 0.9955, a rel_l2 near 0.095. A 1e-4 seed cannot
+  reach that by layer 5 through this stack's measured amplification -- a
+  bf16-sized perturbation grew only 5e-6 to 2.8e-4 over TWENTY layers. So
+  either those engine dumps are stale (being regenerated from one build), or
+  the real prefill path injects error the synthetic seq-16 single-layer test
+  does not reproduce: the KV cache, the seq-20 geometry, or the positions.
+  The injection path (`DGQCUDA_INJECT_AFTER` / `DGQCUDA_INJECT_BIN`) answers
+  that directly -- give the port the engine's own layer-N input at the real
+  geometry and see whether its layer-N output matches.
+
+  **Resolved: it was the mask, and the contradiction was never real.** The
+  `forward` command that produced every prefill-K table above
+  ran the prompt rows bidirectionally, the engine prefills them causally, and
+  the rows that "survived" were the ones a mask cannot distinguish (bos, and
+  the last row, which sees everything either way). Under `--causal` all 20
+  rows are cos 1.000 at all 30 layers, bit-stable across runs. The layer
+  bodies, the geometry and the cache were right all along; the seq-16
+  synthetic test could not show the mismatch because both sides ran it with
+  the same mask.
+
+  Still open, and it is only verification now: the port's end-to-end output
+  against the engine's on the same prompt and seed, and the per-layer K curve
+  re-measured (layer 1 was cos 0.9909 before the fix). The bf16-store finding
+  above is untouched by this and still stands on its own -- it is real, it is
+  small, and it is the remaining known difference between the two engines.
+
+  **End to end, the port now answers the prompt the engine answers.** Same
+  prompt, seed 42: both produce "The capital of France is **Paris**.", eight
+  tokens, eos at offset 8. That took a second fix -- the port's early-stop
+  floor was an AND where `sample::early_stop_allowed` has an OR
+  (`steps_done >= 12 || real >= MIN_REAL_ARGMAX_POSITIONS`), and the port had
+  no equivalent of the second clause at all, so a resolved canvas could not
+  stop before step 12. With it restored the port stops at step 3 like the
+  engine, 167.6s against 775.2s.
+
+  Stopping at the engine's step also exposes what the extra steps were hiding:
+  at step 3 the port has token 145020 at canvas position 8 where the engine
+  has eos. So the honest statement is "same answer, one trailing token at the
+  step the engine stops on", not "identical".
+
+  **And that last token is one near-tie, not a defect.** Step 1 is the only
+  step whose inputs are provably identical on both sides -- verified same
+  prompt ids, same initial canvas token at every dumped position, same seed,
+  same temperature. Engine `step-logits-dump` against port `--dump-step`
+  there:
+
+      pos  eng am  port am   e gap   p gap   e top1  p top1     d
+        0     818      818   4.750   5.363   28.25   28.45   0.20
+        1    5279     5279   6.375   5.217   26.25   26.70   0.45
+        2     529      529   5.750   4.869   27.88   27.86  -0.02
+        3    7001     7001   5.500   4.454   27.00   27.07   0.07
+        4     563      563   6.625   5.579   27.25   27.55   0.30
+        5    5213     5213   3.250   4.873   28.38   29.08   0.71
+        6  236761    50429   0.000   2.291   27.12   27.35   0.23   FLIP
+        7   84750    84750   2.375   4.073   28.50   28.86   0.36
+        8       1      106   0.500   0.366   27.88   28.13   0.26   FLIP
+        9       1        1   5.250   4.698   29.00   28.83  -0.17
+
+  Eight of ten argmaxes agree. Position 8 is the same two tokens within half a
+  logit on both sides, ordered oppositely. Position 6 is an EXACT tie on the
+  engine (50429 and 236761 both 27.12), and a tie goes to whatever breaks it.
+
+  Read the engine's `top_k_tempered`, not its `token_logits`: the latter is a
+  fixed watch-list of special tokens and its first entry is not the argmax. A
+  table built off the wrong field looks like a total disagreement.
+
+  Two engine-side notes fall out of that dump. Its `top_k_tempered` lists
+  50429 first at position 6 while `argmax_raw` says 236761, so the sort and
+  the argmax kernel break an exact tie differently -- harmless here, but it
+  means `argmax_raw` is not reproducible from the dumped ranking. And the
+  dumped logits are bf16-quantized (0.125 spacing at this magnitude), which is
+  why an engine gap can read as exactly 0.000 where the port has 2.291; that
+  particular pair is too far apart to be a quantization artifact, so position
+  6 is a real relative-logit disagreement rather than a display effect.
+
+  Top-1 logits differ by -0.17 to +0.71, mean about +0.24, with the port high.
+  That is the direction the engine's f32->bf16 truncation predicts and the
+  reason `DGQCUDA_BF16_ARENA=trunc` now exists: the pre-existing arm rounded
+  to nearest even, which is a different convention from the engine's and so
+  could not answer whether the engine's bias accounts for the spread.
+
+  **Across a prompt set, the port matches on short answers and never on long
+  ones.** 24 port runs (exact-f32 and engine-truncation arms) against 12
+  engine references, four smoketest prompts x seeds {7,42,123}, judged on the
+  full reply text:
+
+      prompt                                   f32    trunc
+      p0  7x8            (short, seed-invariant)   2/3    3/3
+      p1  colors         (short, seed-invariant)   3/3    3/3
+      p2  haiku          (long,  seed-varying)     0/3    0/3
+      p3  list           (long,  seed-varying)     0/3    0/3
+      TOTAL                                        5/12   6/12
+
+  The split is the result; the totals are not. 5-vs-6 of 12 cannot separate
+  the arms. 6/6 against 0/6 separates the regimes completely: the port
+  reproduces the engine exactly on short convergent answers and never on long
+  trajectory-sensitive ones, in either arm, at any seed.
+
+  That retires "What is the capital of France?" as evidence for anything
+  general. It is a p0/p1-class prompt, and the end-to-end agreement recorded
+  above was measuring the easy half of the space.
+
+  Degenerate tokens, as replies containing non-Latin characters: engine 0/12,
+  exact-f32 3/12, truncation arm 0/12. All three f32 cases were at the END of
+  the reply ("56<CJK>", "Endless<HEB>jetbrains.", "...(RGB).Examin"), the same
+  eos-boundary signature as the spurious 145020 on the France prompt -- one
+  defect with four instances, not four defects. That defect was the reply
+  being decoded from the sampled canvas; see the entry below. Re-running all
+  24 with the fix:
+
+      prompt              BEFORE f32/trunc   AFTER f32/trunc   junk
+      p0  7x8   (short)       2/3   3/3         3/3   3/3      f32 1 -> 0
+      p1  colors(short)       3/3   3/3         3/3   3/3          0 -> 0
+      p2  haiku (long)        0/3   0/3         0/3   0/3      f32 1 -> 0
+      p3  list  (long)        0/3   0/3         0/3   0/3      f32 1 -> 0
+      TOTAL                  5/12  6/12        6/12  6/12    3/0 -> 0/0
+
+  Every degenerate reply is gone and the long prompts did not move, which is
+  what a fix to what is EMITTED rather than to the trajectory should do.
+
+  It also means the two arena arms are exactly tied, 6/12 each, zero junk
+  each. The apparent advantage of the truncation arm in the first run was
+  entirely the emit bug -- it just did not land on an unaccepted row in that
+  sample -- and was never evidence about the rounding convention. That is the
+  second arm comparison tonight that measured something else (the first was
+  the step-1 argmax table). The convention still has no end-to-end evidence
+  either way; do not set the port's default from any of this.
+
+  **And the long-answer gap is not a defect.** Reply-text similarity, same
+  measure on all three pairs:
+
+      case            eng vs f32   eng vs trunc   f32 vs trunc
+      short (p0,p1)        1.000          1.000          1.000
+      long  (p2,p3)        0.645          0.746          0.668
+
+  The third column is the control: the port's own two arena arms differ only
+  by a bf16 rounding convention, in the same binary, on the same machine, same
+  seed, same prompt. On long answers they differ from EACH OTHER as much as
+  either differs from the engine. A long reply is therefore not determined at
+  bf16 precision -- changing only the rounding convention reorganises it --
+  and exact long-answer identity between two engines with different arithmetic
+  conventions is not an achievable target. Short answers are fully determined
+  (1.000 everywhere) and the port reproduces them exactly.
+
+  The port is deterministic, so that control is sound: 20 of 24 run-to-run
+  pairs are bit-identical and all 4 differences are exactly the rows the
+  argmax-emit fix corrected. One of those four was in the truncation arm
+  ("Tidesallerg mehrere the sand" -> "Tides pull against the sand"), so that
+  arm had an unaccepted-row leak too, in Latin script, below what the
+  non-Latin measure could see.
+
+  By eye the port's long answers are good: valid haikus, and p3 lists RGB /
+  RYB / CMY correctly. They differ in wording, not in correctness.
+
+  **Scored on the engine's own criteria, the port is indistinguishable from
+  it.** The smoketest criteria are data, not code -- `answer` plus a
+  `max_steps` budget in fixtures/smoketest/prompts.json -- so they apply to
+  replies already collected, with no need to teach the port a smoketest output
+  format. All four batch prompts are in the spec:
+
+      engine 12/12    port f32 12/12    port trunc 12/12
+
+  Steps land inside budget everywhere and within 1-3 of the engine's
+  (haiku_ocean, budget 9: engine 8,6,6 against f32 7,8,6; primary_colors,
+  budget 11: engine 8,8,9 against f32 8,7,8).
+
+  So "0/6 on long prompts" was an artifact of grading on text identity, and on
+  the bar the engine holds itself to there is no gap on these probes.
+
+  Two limits on that, both real. Four probes of seventeen, and the two long
+  ones are `convergence` probes whose only criterion is "converged within
+  max_steps" -- a bar that never inspects the answer. 12/12 therefore says the
+  port converges like the engine, not that its long answers are as good. And
+  `adherence`, the criterion that does check content, covers only short
+  prompts. A quality claim about long answers needs a probe class that scores
+  content on a free-form reply, which this spec did not have.
+
+  **Built: the `content` battery** (`smoketest --battery content`, commits
+  8b57cbd2, 98ad1bba, 15287528; `commands::content`). Nine probes across
+  explain / compare / list / form / summary, each with a rubric of any-of
+  groups, optional `forbid` terms and structure checks (lines, sentences,
+  word bounds). Rates, not pass/fail, for the reason item R found: long
+  answers are trajectory-sensitive at bf16 precision. The soft battery's
+  authoring rule carries over and is pinned by a test: no rubric term may
+  appear in its own prompt. `--replies FILE` judges replies made elsewhere
+  with the same code and no model, which is how the port is scored;
+  `--replies-out FILE` keeps a live run's full replies in that shape.
+
+  Engine, seeds 7/42/123: rubric 27/27 and full 9/9 at every seed. Two
+  battery defects found and fixed on the way there, both of the same kind
+  the programmatic battery already warns about (measuring our ceiling as
+  the model's error): the 512-token smoke gen cap cut the transformer
+  explanation off mid-word before it reached query/key/value (rubric 26/27
+  at every seed, a different group each time), and a 60-step guard called
+  a complete 650-word explanation "over budget" at one seed. Neither
+  would have been visible without the full replies, which is what
+  `--replies-out` is for.
+
+  Port, seeds 7/42/123: rubric 24/27 and full 7/9 at EVERY seed, the same
+  two probes missing the same groups all three times. Every miss is an
+  explain probe cut at the single 256-token canvas -- transformer 174-175
+  words against the engine's 633-665, hash_table 164-170 against 549-598
+  -- and the groups lost (query/encoder, collision) are the ones the
+  engine reaches after the cut; the port's text up to the cut is the same
+  essay (same opening, same worked example). On the six probes that fit in
+  one canvas (compare, list x2, form x2, summary) both sides are 18/18
+  FULL over the three seeds, same structure (3-line haiku, 5-line
+  limerick, 5 fruit lines, exactly two sentences), same facts, different
+  wording, mean steps 10.0 (port) against 10.1 (engine). So the first
+  content measurement of the port says: no quality gap where a reply
+  fits, and a length ceiling where it does not. The ceiling is a missing
+  feature (block chaining), not a defect, and it is the next thing to
+  build if long answers matter. Replies for all six runs are in the
+  session scratchpad (`content/{engine,port}_s{7,42,123}.replies.json`),
+  re-judgeable with `--replies`.
+
 - **Model-gated tests treat a manifest-only pack as present.**
   `test_util::dgq_model_dir()` returns `Some` when `model.dgq.json` exists, so an
   interrupted pack download (manifest present, `model.dgq.bin` missing or a

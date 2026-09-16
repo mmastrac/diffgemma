@@ -269,6 +269,11 @@ pub struct MoeRouteCapture {
     /// Full-canvas cosine: batched grouped GPU `moe_out` vs `fill_moe_out_dgq_cpu` oracle.
     pub moe_out_gpu_cpu_cos: Option<f32>,
     pub moe_out_gpu_cpu_rel_l2: Option<f32>,
+    /// Canvas row 0 of the raw MoE output, so a port can compare the vector
+    /// and not just its norm: a scale error and a rotation both move `l2`.
+    pub moe_out_row0: Vec<f32>,
+    pub moe_out_cpu_l2: Option<f32>,
+    pub moe_out_cpu_row0: Vec<f32>,
 }
 
 fn read_scratch_f32(
@@ -300,7 +305,7 @@ pub fn run_step_moe_batched_pin_capture(
     let format = rt.block_profile.format;
 
     rt.dispatch_and_wait(|enc| {
-        enc.encode_step_preamble(&layout, 1)?;
+        enc.encode_preamble_for_step(&layout, 1, StepFinishMode::ForwardOnly)?;
         for l in 0..layer {
             enc.encode_full_layer(l, &layout)?;
         }
@@ -412,7 +417,7 @@ pub fn run_step_moe_route_capture(
     .to_string();
 
     rt.dispatch_and_wait(|enc| {
-        enc.encode_step_preamble(&layout, 1)?;
+        enc.encode_preamble_for_step(&layout, 1, StepFinishMode::ForwardOnly)?;
         for l in 0..layer {
             enc.encode_full_layer(l, &layout)?;
         }
@@ -435,10 +440,16 @@ pub fn run_step_moe_route_capture(
     let moe_out_gpu = read_f32_arena(&rt.bufs.arena, rt.bufs.arena_map.moeout_off(), CANVAS * HID);
     let moe_out_l2 = Some(vector_l2(&moe_out_gpu));
     let moe_out_nonzero = Some(count_nonzero_f32(&moe_out_gpu, 1e-9));
+    let moe_out_row0 = moe_out_gpu[..HID.min(moe_out_gpu.len())].to_vec();
     rt.fill_moe_out_dgq_cpu(layer)?;
     let moe_out_cpu = read_f32_arena(&rt.bufs.arena, rt.bufs.arena_map.moeout_off(), CANVAS * HID);
     let moe_out_gpu_cpu_cos = Some(cosine_f32(&moe_out_gpu, &moe_out_cpu));
     let moe_out_gpu_cpu_rel_l2 = Some(rel_l2_f32(&moe_out_cpu, &moe_out_gpu));
+    // The oracle's own magnitude, not just its distance from the GPU. A
+    // rel_l2 says the two disagree; it does not say WHICH of them is off, and
+    // for a port that reproduces exact f32 math that is the whole question.
+    let moe_out_cpu_l2 = Some(vector_l2(&moe_out_cpu));
+    let moe_out_cpu_row0 = moe_out_cpu[..HID.min(moe_out_cpu.len())].to_vec();
 
     Ok(MoeRouteCapture {
         layer,
@@ -451,6 +462,9 @@ pub fn run_step_moe_route_capture(
         moe_out_nonzero,
         moe_out_gpu_cpu_cos,
         moe_out_gpu_cpu_rel_l2,
+        moe_out_row0,
+        moe_out_cpu_l2,
+        moe_out_cpu_row0,
     })
 }
 
@@ -469,7 +483,7 @@ pub fn run_step_moe_layer_capture(
     let layout = rt.layout;
 
     rt.dispatch_and_wait(|enc| {
-        enc.encode_step_preamble(&layout, 1)?;
+        enc.encode_preamble_for_step(&layout, 1, StepFinishMode::ForwardOnly)?;
         Ok(())
     })?;
     for l in 0..layer {
@@ -593,7 +607,7 @@ pub fn run_step_moe_single_expert_capture(
     let layout = rt.layout;
 
     rt.dispatch_and_wait(|enc| {
-        enc.encode_step_preamble(&layout, 1)?;
+        enc.encode_preamble_for_step(&layout, 1, StepFinishMode::ForwardOnly)?;
         Ok(())
     })?;
     for l in 0..layer {

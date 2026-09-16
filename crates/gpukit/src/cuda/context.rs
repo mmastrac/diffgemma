@@ -139,12 +139,12 @@ impl Context {
         self.0.device
     }
 
-    pub(crate) fn driver(&self) -> &'static Driver {
+    pub fn driver(&self) -> &'static Driver {
         self.0.driver
     }
 
     /// Make this context current on the calling thread.
-    pub(crate) fn set_current(&self) -> Result<(), Error> {
+    pub fn set_current(&self) -> Result<(), Error> {
         self.0.driver.check(
             unsafe { (self.0.driver.cu_ctx_set_current)(self.0.raw) },
             "cuCtxSetCurrent",
@@ -248,10 +248,19 @@ impl Module {
         let c_name = CString::new(name)
             .map_err(|e| Error::Cuda(format!("kernel name {name:?} has a NUL: {e}")))?;
         let mut raw: CUfunction = std::ptr::null_mut();
-        self.driver.check(
-            unsafe { (self.driver.cu_module_get_function)(&mut raw, self.raw, c_name.as_ptr()) },
-            "cuModuleGetFunction",
-        )?;
+        self.driver
+            .check(
+                unsafe {
+                    (self.driver.cu_module_get_function)(&mut raw, self.raw, c_name.as_ptr())
+                },
+                "cuModuleGetFunction",
+            )
+            .map_err(|e| match e {
+                // Name the symbol: a missing entry otherwise reads as a bare
+                // driver error with no hint which kernel failed to resolve.
+                Error::Cuda(msg) => Error::Cuda(format!("{msg} for entry {name:?}")),
+                other => other,
+            })?;
         Ok(Kernel {
             module: Arc::clone(self),
             raw,

@@ -76,6 +76,14 @@ struct Metrics {
     soft_total: u64,
     absence_ok: u64,
     absence_total: u64,
+    /// `content` battery. `rubric_*` is the headline rate; `content_full`
+    /// counts probes meeting every criterion at once, which is the number a
+    /// long-answer quality claim should quote.
+    rubric_hit: u64,
+    rubric_total: u64,
+    forbid_hits: u64,
+    content_full: u64,
+    content_probes: u64,
 }
 
 impl Metrics {
@@ -104,6 +112,11 @@ impl Metrics {
         self.soft_total += o.soft_total;
         self.absence_ok += o.absence_ok;
         self.absence_total += o.absence_total;
+        self.rubric_hit += o.rubric_hit;
+        self.rubric_total += o.rubric_total;
+        self.forbid_hits += o.forbid_hits;
+        self.content_full += o.content_full;
+        self.content_probes += o.content_probes;
     }
 
     /// Steps thrown away by re-rolls.
@@ -172,6 +185,23 @@ impl Metrics {
             100.0 * self.absence_ok as f64 / self.absence_total as f64
         }
     }
+    /// Rubric groups hit across the arm's content probes; 0 when nothing
+    /// ran, so a floor gate cannot pass on an unmeasured battery.
+    fn content_pct(&self) -> f64 {
+        if self.rubric_total == 0 {
+            0.0
+        } else {
+            100.0 * self.rubric_hit as f64 / self.rubric_total as f64
+        }
+    }
+    /// Content probes that met rubric, forbid, structure and budget at once.
+    fn content_full_pct(&self) -> f64 {
+        if self.content_probes == 0 {
+            0.0
+        } else {
+            100.0 * self.content_full as f64 / self.content_probes as f64
+        }
+    }
     fn mean_steps(&self) -> f64 {
         if self.blocks == 0 {
             0.0
@@ -210,6 +240,13 @@ impl Metrics {
             "absence_ok" => self.absence_ok as f64,
             "absence_total" => self.absence_total as f64,
             "absence_pct" => self.absence_pct(),
+            "rubric_hit" => self.rubric_hit as f64,
+            "rubric_total" => self.rubric_total as f64,
+            "forbid_hits" => self.forbid_hits as f64,
+            "content_full" => self.content_full as f64,
+            "content_probes" => self.content_probes as f64,
+            "content_pct" => self.content_pct(),
+            "content_full_pct" => self.content_full_pct(),
             _ => return None,
         })
     }
@@ -325,6 +362,13 @@ fn append_run_summary(path: &Path, out: &super::smoketest::SmokeOutcome) {
         obj.insert("absence_ok".into(), sf.absence_ok.into());
         obj.insert("absence_total".into(), sf.absence_total.into());
     }
+    if let (Some(c), Some(obj)) = (&out.content, rec.as_object_mut()) {
+        obj.insert("rubric_hit".into(), c.rubric_hit.into());
+        obj.insert("rubric_total".into(), c.rubric_total.into());
+        obj.insert("forbid_hits".into(), c.forbid_hits.into());
+        obj.insert("content_full".into(), c.full.into());
+        obj.insert("content_probes".into(), c.probes.into());
+    }
     match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -378,6 +422,11 @@ fn scan_trace(path: &Path, tau: f32) -> Metrics {
                 m.soft_total += u("soft_total");
                 m.absence_ok += u("absence_ok");
                 m.absence_total += u("absence_total");
+                m.rubric_hit += u("rubric_hit");
+                m.rubric_total += u("rubric_total");
+                m.forbid_hits += u("forbid_hits");
+                m.content_full += u("content_full");
+                m.content_probes += u("content_probes");
                 continue;
             }
             _ => continue,
@@ -602,6 +651,10 @@ pub(crate) fn run_census_cmd(
                 debug_assert!(errs.is_empty(), "{errs:?}");
                 let _guard = crate::flags::install_scoped(run_cfg);
                 eprintln!("census: [{tag}] running");
+                // Content runs keep their full replies next to the trace, so
+                // a rubric edit can be re-judged from the campaign directory.
+                let replies_out = (kind == super::smoketest::Battery::Content)
+                    .then(|| trace_dir.join(format!("{tag}.replies.json")));
                 let outcome = super::smoketest::run_smoketest(
                     model_dir,
                     None,
@@ -612,6 +665,7 @@ pub(crate) fn run_census_cmd(
                     None,
                     1,
                     kind,
+                    replies_out.as_deref(),
                 );
                 if let Some(e) = &outcome.error {
                     eprintln!("census: [{tag}] {e}");
@@ -754,6 +808,26 @@ fn report(
         }
     }
 
+    if results.values().any(|m| m.content_probes > 0) {
+        println!();
+        println!(
+            "{:<12} {:<13} {:>10} {:>8} {:>10} {:>8} {:>7}",
+            "arm", "battery", "rubric", "rubric%", "full", "full%", "forbid"
+        );
+        for ((arm, battery), m) in results.iter().filter(|(_, m)| m.content_probes > 0) {
+            println!(
+                "{:<12} {:<13} {:>10} {:>8.1} {:>10} {:>8.1} {:>7}",
+                arm,
+                battery,
+                format!("{}/{}", m.rubric_hit, m.rubric_total),
+                m.content_pct(),
+                format!("{}/{}", m.content_full, m.content_probes),
+                m.content_full_pct(),
+                m.forbid_hits,
+            );
+        }
+    }
+
     if let Some(dir) = out_dir {
         let json: Vec<serde_json::Value> = results
             .iter()
@@ -782,6 +856,12 @@ fn report(
                     "soft_pct": m.soft_pct(),
                     "absence_ok": m.absence_ok, "absence_total": m.absence_total,
                     "absence_pct": m.absence_pct(),
+                    "rubric_hit": m.rubric_hit, "rubric_total": m.rubric_total,
+                    "forbid_hits": m.forbid_hits,
+                    "content_full": m.content_full,
+                    "content_probes": m.content_probes,
+                    "content_pct": m.content_pct(),
+                    "content_full_pct": m.content_full_pct(),
                 })
             })
             .collect();
