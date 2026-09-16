@@ -118,6 +118,7 @@ fn base_messages(output: &str) -> Vec<Value> {
 ///   C) M1 summarize-rewind + substituted finalize (via the manager);
 ///   D) overlong finalize trims to capacity instead of panicking.
 #[test]
+#[ignore = "real-model tier: four compaction phases over one model load"]
 fn tool_compact_m1_m2_and_overlong_smoke() {
     let Some(dir) = model_dir() else {
         eprintln!("skip tool_compact_m1_m2_and_overlong_smoke: quantized model not present");

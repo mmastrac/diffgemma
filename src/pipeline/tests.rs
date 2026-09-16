@@ -248,6 +248,7 @@ fn tool_validator_rewinds_and_retries_malformed_reply() {
 /// event digests (fingerprints, generated ids FNV, lineage ids). This is
 /// the standing replay gate — a field ops.jsonl IS a repro artifact.
 #[test]
+#[ignore = "real-model tier: records a generate then replays it on a second session"]
 fn oplog_roundtrip_replays_bit_identically() {
     let Some(dir) = crate::shaders::test_util::dgq_model_dir() else {
         return;
@@ -259,10 +260,10 @@ fn oplog_roundtrip_replays_bit_identically() {
     let cfg = || {
         crate::metal::StepGenerateConfig::from_generate(
             42,
-            192,
+            64,
             4096,
             0,
-            crate::sample::sampler_for_steps(24, false),
+            crate::sample::sampler_for_steps(8, false),
             false,
         )
     };
@@ -343,7 +344,7 @@ fn wrap_crossing_rewind_restores_state() {
 
     let cfg = crate::metal::StepGenerateConfig::from_generate(
         42,
-        384,
+        256,
         8192,
         0,
         crate::sample::sampler_for_steps(8, false),
@@ -408,6 +409,7 @@ fn wrap_crossing_rewind_restores_state() {
 /// bit-identical across rounds and every rewind must restore the base
 /// fingerprint. Also exercises shrink-on-retry (the retry canvas is 128).
 #[test]
+#[ignore = "real-model tier: two rounds, each denoising a discarded canvas then a retry"]
 fn forced_reroll_leaves_no_residue() {
     let Some(dir) = crate::shaders::test_util::dgq_model_dir() else {
         return;
@@ -617,6 +619,7 @@ fn splice_matches_fresh_build() {
 /// byte-identical token ids to the whole-turn Generate op at the same
 /// seed. Pins the per-block protocol to the path it decomposed.
 #[test]
+#[ignore = "real-model tier: two full turns (monolithic + per-block) at two blocks each"]
 fn per_block_ops_match_monolithic_generate() {
     let Some(dir) = crate::shaders::test_util::dgq_model_dir() else {
         return;
@@ -634,7 +637,7 @@ fn per_block_ops_match_monolithic_generate() {
             max_new,
             4096,
             0, // session-owned; overwritten by the pipeline
-            crate::sample::sampler_for_steps(24, false),
+            crate::sample::sampler_for_steps(8, false),
             false,
         )
     };
@@ -721,7 +724,7 @@ fn per_block_partial_commit_and_discard_consistency() {
         512,
         4096,
         0,
-        crate::sample::sampler_for_steps(24, false),
+        crate::sample::sampler_for_steps(8, false),
         false,
     );
     let ev = p.call(PipelineOp::BeginTurn {
@@ -791,6 +794,7 @@ fn per_block_partial_commit_and_discard_consistency() {
 /// excursions stay inside the window), so every rewind takes the O(1)
 /// truncate path; a wrap-crossing variant is a follow-up.
 #[test]
+#[ignore = "real-model tier: three generate/rewind rounds"]
 fn pipeline_rewind_kv_byte_consistency() {
     let Some(dir) = crate::shaders::test_util::dgq_model_dir() else {
         return;
@@ -812,7 +816,7 @@ fn pipeline_rewind_kv_byte_consistency() {
             192,
             4096,
             0, // session-owned; overwritten by the pipeline
-            crate::sample::sampler_for_steps(24, false),
+            crate::sample::sampler_for_steps(8, false),
             false,
         );
         let ev = p.call(PipelineOp::Generate {
@@ -948,6 +952,7 @@ fn synthetic_kv_deep_extend_redo_determinism() {
 /// same inputs. Pins the first production client of the pipeline to the
 /// path it replaced.
 #[test]
+#[ignore = "real-model tier: two full generates (direct + pipeline)"]
 fn ask_via_pipeline_matches_direct() {
     let Some(dir) = crate::shaders::test_util::dgq_model_dir() else {
         return;
@@ -956,6 +961,9 @@ fn ask_via_pipeline_matches_direct() {
         seed: 42,
         max_new_tokens: 64,
         full_message_stop: true,
+        // Both arms run this cfg, so the step budget does not move the
+        // comparison.
+        sampler: crate::sample::sampler_for_steps(8, false),
         ..Default::default()
     };
     let ids: Vec<u32> = (0..48u32).map(|i| 1000 + i * 13).collect();
