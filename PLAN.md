@@ -178,6 +178,15 @@ decisions"). Open, in order of what would change the product:
   JSON 9.6 to 13.1 s (3.9 to 6.7 s of denoise). A generation baseline at
   a narrow canvas would be the fairer step-cost comparison and does not
   exist as a product path.
+- Canvas width. The model is trained at 256 and MLX shrinks to
+  max(remaining, 64) near the budget, so 64 is the reference's own floor;
+  width does change behavior somewhere (the empty-reply attractor falls
+  72% to 3% with it). For reads, 32 samples per width on three tickets:
+  unambiguous answers 1.00 ± 0.00 at both widths; the outage ticket's tone
+  0.70 ± 0.05 (64) against 0.68 ± 0.06 (256) and "urgent" yes 0.56 ± 0.07
+  against yes 0.68 ± 0.06, within 1.3 standard errors, same lean. The
+  default is now the smallest 64-row multiple that holds the template
+  (`active: 256` opts back), which halves the per-read cost.
 - Standing of the probabilities. A read is the denoiser's posterior over
   the slot's clean token given one noised canvas, a cross-entropy-trained
   conditional, restricted to labels that hold 0.99+ of the row's mass. It

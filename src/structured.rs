@@ -84,8 +84,12 @@ pub struct Schema {
     /// 2 adds a self-conditioned pass.
     pub steps: usize,
     pub hole: Hole,
-    /// Denoise canvas width to run. The template must fit under it, and
-    /// `None` runs the full canvas.
+    /// Denoise canvas width to run, rounded up to a 64-row multiple that
+    /// holds the template. `None` picks the smallest such width: the answer
+    /// is a fixed number of single-token labels, so it always fits, and a
+    /// 64-row forward costs half a 256-row one. Read 32 times per width,
+    /// three tickets: unambiguous answers identical at 1.00, a borderline
+    /// one within 1.3 standard errors of its 256-row value.
     pub active: Option<usize>,
     /// Hill-climb rounds after the first read: each round writes every
     /// slot's top label into the canvas and re-reads from step 0, stopping
@@ -362,18 +366,17 @@ impl Schema {
         Ok(canvas)
     }
 
-    /// Canvas width to dispatch: the schema's `active` rounded up to a
-    /// multiple of 64 and clamped so the template plus turn close fits.
+    /// Canvas width to dispatch: the schema's `active`, or the template plus
+    /// its turn close, rounded up to a multiple of 64 and clamped to the
+    /// canvas.
     pub fn active_width(&self, template: &Template, canvas_len: usize) -> usize {
         let need = template.ids.len() + 1;
-        match self.active {
-            None => canvas_len,
-            Some(w) => w
-                .max(need)
-                .div_ceil(64)
-                .saturating_mul(64)
-                .clamp(1, canvas_len),
-        }
+        self.active
+            .unwrap_or(need)
+            .max(need)
+            .div_ceil(64)
+            .saturating_mul(64)
+            .clamp(1, canvas_len)
     }
 
     /// The reply body. Probabilities are a softmax over the label logits at
@@ -708,6 +711,11 @@ mod tests {
         let canvas = s.build_canvas(&t, 106, 0, 262144, 256, 7).unwrap();
         assert_eq!(canvas.len(), 256);
         assert_eq!(canvas[t.ids.len()], 106);
-        assert_eq!(s.active_width(&t, 256), 256);
+        assert_eq!(s.active_width(&t, 256), 64);
+        let mut wide = s.clone();
+        wide.active = Some(256);
+        assert_eq!(wide.active_width(&t, 256), 256);
+        wide.active = Some(1);
+        assert_eq!(wide.active_width(&t, 256), 64);
     }
 }

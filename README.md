@@ -198,9 +198,10 @@ These are the model's marginals. Nothing calibrates them to the truth.
 
 Optional schema fields: `instructions` (context), `samples` (reads with
 different hole noise; default 4, `1` is a single read), `steps` (forwards
-per read; default 1), `active` (canvas rows, multiple of 64; default 256),
-`hole` (`noise` default, `pad`, `label`), `climb` and `climb_mode`
-(diagnostic hill climb; ratifies the first read).
+per read; default 1), `active` (canvas rows, multiple of 64; default: the
+smallest that holds the template, 64 for up to about 12 questions; `256`
+is the full canvas), `hole` (`noise` default, `pad`, `label`), `climb` and
+`climb_mode` (diagnostic hill climb; ratifies the first read).
 
 Performance on an M3 Pro with the q4 pack, a 3-question schema, a ~190-token prompt, one
 server process:
@@ -208,19 +209,21 @@ server process:
 | Case | Wall |
 | :-- | --: |
 | First request on a schema (f32 engine prefill of the schema, once) | 8 to 15 s |
-| Next state, default (4 reads, 256 rows) | 5.8 s (0.7 prefill + 4 × 1.25 forward) |
-| Next state, 4 reads, `active: 64` | 3.1 s |
-| Next state, `samples: 1`, 256 rows | 2.0 s |
-| Next state, `samples: 1`, `active: 64` | 1.3 s |
-| 8 reads, `active: 64` | 5.3 s |
+| Next state, default (4 reads, 64 rows) | 3.1 s (0.7 prefill + 4 × 0.6 forward) |
+| Next state, 4 reads, `active: 256` | 5.8 s |
+| Next state, `samples: 1` | 1.3 s |
+| Next state, `samples: 1`, `active: 256` | 2.0 s |
+| 8 reads | 5.3 s |
 | Generating the same three answers as JSON (19 tokens, 3 to 5 steps) | 9.6 to 13.1 s |
 
 The schema prefix stays in the KV. Each later request prefills only its
 state. `DGQ_FAST_PREFILL=1` cuts the first request to 3 s but changed a
-borderline answer in our runs, so it is off. A borderline question's
-answer moves with the hole noise, the canvas width and the prefill
-precision (PLAN.md has the measurements); use `samples` and read
-`agreement`. Unambiguous questions were unanimous under every setting.
+borderline answer in our runs, so it is off. Width: 32 reads per setting
+gave identical 1.00 answers on the unambiguous tickets at 64 and 256 rows
+and a borderline answer within 1.3 standard errors (yes 0.56 ± 0.07
+against 0.68 ± 0.06), so the narrow default is not stretching the model.
+A borderline question still moves with the hole noise and the prefill
+precision (PLAN.md has the measurements); use `samples` and read `stderr`.
 
 ## Custom Quantization
 
