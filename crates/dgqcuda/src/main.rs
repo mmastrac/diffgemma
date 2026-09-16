@@ -518,14 +518,14 @@ fn run(args: &Args) -> Result<(), config::Error> {
                 sess.set_layers(n);
             }
             let load = std::time::Instant::now();
-            // Warm the device (module load and first-touch allocs land on the
-            // first step) and report the CPU causal prefill scale. Note what
-            // this does NOT do: it never compares `prompt_hidden`. That helper
-            // runs the prompt standalone, which is a different code path from
-            // the step's [prompt][canvas] sequence, and probing it instead of
-            // the step is how a double-applied prompt residual stream hid here.
-            sess.warm(prompt)?;
-            eprintln!("prompt prefill in {:.1}s", load.elapsed().as_secs_f32());
+            // The prompt's K/V go into the session's cache once; every step
+            // then runs the canvas rows alone against it.
+            sess.prefill(prompt)?;
+            eprintln!(
+                "prompt prefill in {:.1}s ({} positions cached)",
+                load.elapsed().as_secs_f32(),
+                sess.cache_len()
+            );
             if args.diag {
                 let mut csc = Scratch::new(prompt_ids.len(), &cfg);
                 let c = forward::causal_hidden_after(
@@ -547,7 +547,7 @@ fn run(args: &Args) -> Result<(), config::Error> {
             let mut step_no = 0usize;
             for _ in 0..st.cfg.max_denoising_steps {
                 let start = std::time::Instant::now();
-                let mut logits = sess.step(prompt, &st.ids)?;
+                let mut logits = sess.step(&st.ids)?;
                 // The engine softcaps inside the step, BEFORE the sampler: its
                 // StepStage::Softcap runs ahead of SampleRowstats, and the
                 // comment there notes that sample_rowstats reads post-softcap
@@ -598,13 +598,9 @@ fn run(args: &Args) -> Result<(), config::Error> {
                     // Device post-layer hidden for the canvas row vs the CPU
                     // oracle's, plus the same buffer's prompt row.
                     let hidden_n = t.hidden_size;
-                    let h = sess.read_hidden_b((prompt.len() + canvas) * hidden_n)?;
-                    let base = prompt.len() * hidden_n;
-                    eprintln!(
-                        "  [diag] step hidden prompt0[0..4] {:?} canvas0[0..4] {:?}",
-                        &h[..4],
-                        &h[base..base + 4]
-                    );
+                    let h = sess.read_hidden_b(canvas * hidden_n)?;
+                    let base = 0;
+                    eprintln!("  [diag] step hidden canvas0[0..4] {:?}", &h[..4]);
                     let mut step_ids = prompt.to_vec();
                     step_ids.extend_from_slice(&st.ids);
                     let mut hsc = Scratch::new(step_ids.len(), &cfg);

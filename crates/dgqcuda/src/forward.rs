@@ -131,6 +131,19 @@ fn rms_norm_head(v: &mut [f32], weight: Option<&[f32]>, eps: f32) {
 
 /// Interleaved [cos, sin] pairs per frequency.
 pub fn rope_freqs(seq: usize, rotary_dim: usize, full_head_dim: usize, theta: f32) -> Vec<f32> {
+    rope_freqs_at(0, seq, rotary_dim, full_head_dim, theta)
+}
+
+/// The RoPE table for `seq` rows at absolute positions `pos0..pos0 + seq`.
+/// A canvas that runs alone against a KV cache sits at `pos0 = cache_len`,
+/// and its keys have to be rotated by that position, not by its row index.
+pub fn rope_freqs_at(
+    pos0: usize,
+    seq: usize,
+    rotary_dim: usize,
+    full_head_dim: usize,
+    theta: f32,
+) -> Vec<f32> {
     let mut freqs = vec![0.0f32; seq * rotary_dim];
     let half = rotary_dim / 2;
     for s in 0..seq {
@@ -138,7 +151,7 @@ pub fn rope_freqs(seq: usize, rotary_dim: usize, full_head_dim: usize, theta: f3
         for d in 0..half {
             let exponent = (2 * d) as f32 / full_head_dim as f32;
             let freq = 1.0 / theta.powf(exponent);
-            let angle = s as f32 * freq;
+            let angle = (pos0 + s) as f32 * freq;
             freqs[base + 2 * d] = angle.cos();
             freqs[base + 2 * d + 1] = angle.sin();
         }
@@ -318,7 +331,7 @@ fn layer_forward_at(
         }
     }
 
-    let freqs = rope_freqs(seq, rotary_dim, head_dim, theta);
+    let freqs = rope_freqs_at(pos0, seq, rotary_dim, head_dim, theta);
     for s in 0..seq {
         for h in 0..n_heads {
             let off = (s * n_heads + h) * head_dim;

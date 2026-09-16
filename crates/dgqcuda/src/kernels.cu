@@ -205,6 +205,22 @@ extern "C" __global__ void dgq_trunc_bf16(float *x, unsigned n) {
     x[i] = __uint_as_float(__float_as_uint(x[i]) & 0xFFFF0000u);
 }
 
+// kv[(pos0 + t), 0, :] = k[t, :], kv[(pos0 + t), 1, :] = v[t, :]; `row` is
+// n_kv * head_dim. One launch for the whole sequence, where the driver-memcpy
+// version cost two calls per position per layer.
+extern "C" __global__ void dgq_interleave_kv(
+    const float *k, const float *v, float *kv,
+    unsigned seq, unsigned row, unsigned pos0
+) {
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= seq * row) return;
+    const unsigned t = i / row;
+    const unsigned d = i % row;
+    float *dst = kv + (size_t)(pos0 + t) * 2u * row;
+    dst[d] = k[i];
+    dst[row + d] = v[i];
+}
+
 extern "C" __global__ void dgq_vec_add(float *x, const float *y, unsigned n) {
     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] += y[i];

@@ -1,15 +1,19 @@
-//! A resident denoise session: the model, its buffers, and the self-conditioning
-//! weights stay on the device across the whole denoise loop, so one step is
-//! only the 30 decoder layers plus the LM head it needs.
+//! A resident denoise session: the model, its buffers, the self-conditioning
+//! weights and a per-layer KV cache stay on the device across the whole
+//! denoise loop, so one step is the canvas rows through the 30 decoder layers
+//! plus the LM head, and nothing else.
 //!
-//! The sequence layout of a step is [prompt tokens][canvas tokens]: prompt rows
-//! attend causally, canvas rows attend the whole sequence (the diffusion canvas
-//! is bidirectional). Positions are absolute over that layout, so the canvas
-//! occupies [prompt_len, prompt_len + canvas).
+//! `prefill` runs clean rows causally and appends their K/V to the cache; the
+//! prompt goes in first, and a committed canvas block goes in the same way
+//! later. `step` runs only the canvas rows, at absolute positions starting at
+//! the cache length, attending everything in the cache plus themselves (the
+//! diffusion canvas is bidirectional). The canvas's own K/V are written past
+//! the cache length each step and never advance it.
 
 use crate::config::{Error, ModelConfig};
 use crate::gpu::cuda::{
-    Bufs, GpuModel, Runner, Stage, arena_store, emit_layer_checkpoint, layer_forward, up_f32,
+    Bufs, GpuModel, KvView, Runner, Stage, arena_store, emit_layer_checkpoint, layer_forward,
+    up_f32,
 };
 use crate::weights::Weights;
 use gpukit::cuda::{Context, DeviceBuffer, KernelArgs, cached_source_kernel};
@@ -47,11 +51,17 @@ pub struct Session {
     /// Layers the step runs (all of them unless a bisect overrides it).
     layers: usize,
     cfg: ModelConfig,
-    /// `prompt_len + canvas` the buffers are sized for.
+    /// Rows the pass buffers hold: the larger of the prompt and the canvas,
+    /// since a pass is one or the other.
     seq: usize,
     prompt_len: usize,
     canvas: usize,
     bufs: Bufs,
+    /// One `[position][K|V]` buffer per layer, `max_ctx` positions each.
+    kv_cache: Vec<DeviceBuffer>,
+    /// Positions of `kv_cache` that hold committed rows.
+    cache_len: usize,
+    max_ctx: usize,
     sc: ScWeights,
     /// Canvas logits of the previous step (pre-softcap), the self-conditioning
     /// signal for the next one.
@@ -70,11 +80,18 @@ impl Session {
         prompt_len: usize,
         canvas: usize,
     ) -> Result<Self, Error> {
-        let seq = prompt_len + canvas;
+        let seq = prompt_len.max(canvas);
+        let max_ctx = prompt_len + canvas;
         let model = GpuModel::load(w, cfg, None)?;
         let ctx = model.ctx.clone();
         let t = &cfg.text_config;
         let bufs = Bufs::new(seq, cfg, &ctx)?;
+        // Sized per layer: sliding and full layers have different kv widths.
+        let mut kv_cache = Vec::with_capacity(t.num_hidden_layers);
+        for layer in 0..t.num_hidden_layers {
+            let (n_kv, head_dim, _, _, _) = t.attn_geometry(layer);
+            kv_cache.push(DeviceBuffer::alloc(&ctx, max_ctx * 2 * n_kv * head_dim * 4)?);
+        }
         let sc = ScWeights {
             pre_norm: up_f32(
                 &ctx,
@@ -102,6 +119,9 @@ impl Session {
             prompt_len,
             canvas,
             bufs,
+            kv_cache,
+            cache_len: 0,
+            max_ctx,
             sc,
             prev_logits: Some(prev_logits),
             host_logits: vec![0.0f32; canvas * t.vocab_size],
@@ -122,13 +142,21 @@ impl Session {
         self.prompt_len
     }
 
-    fn runner(&self, causal_split: usize) -> Runner<'_> {
+    /// Positions the KV cache holds.
+    pub fn cache_len(&self) -> usize {
+        self.cache_len
+    }
+
+    /// A runner for the GEMMs outside the layer stack; its positions and
+    /// mask are never read.
+    fn runner(&self) -> Runner<'_> {
         Runner {
             m: &self.model,
             cfg: &self.cfg,
             seq: self.seq,
             pos0: 0,
-            causal_split,
+            causal_split: 0,
+            kv: None,
             stage: std::cell::RefCell::new(Stage::new()),
         }
     }
@@ -180,13 +208,12 @@ impl Session {
         let inter = t.intermediate_size;
         let eps = t.rms_norm_eps as f32;
         let canvas = self.canvas;
-        let r = self.runner(self.prompt_len);
-        let base = self.prompt_len * hidden;
+        let r = self.runner();
 
         // Step 1 norms the canvas embeddings already sitting in `hidden_a`;
         // every later step norms the soft embedding in `norm_scratch`.
         let src = if signal_first_step {
-            unsafe { self.bufs.hidden_a.device_ptr() + (base as u64) * 4 }
+            self.bufs.hidden_a.device_ptr()
         } else {
             self.bufs.norm_scratch.device_ptr()
         };
@@ -250,7 +277,7 @@ impl Session {
         }
 
         // hidden[canvas] += signal, then rms_norm_no_scale in place.
-        let dst = unsafe { self.bufs.hidden_a.device_ptr() + (base as u64) * 4 };
+        let dst = self.bufs.hidden_a.device_ptr();
         let mut args = KernelArgs::new();
         args.device_ptr(dst)
             .device_ptr(self.bufs.mlp_down.device_ptr())
@@ -278,9 +305,9 @@ impl Session {
             .filter(|&p| p < canvas)
         {
             ctx.synchronize()?;
-            let mut all = vec![0.0f32; self.seq * hidden];
+            let mut all = vec![0.0f32; canvas * hidden];
             self.bufs.hidden_a.read_f32(&mut all)?;
-            let off = base + pos * hidden;
+            let off = pos * hidden;
             emit_layer_checkpoint("preamble_pre_norm", &all[off..off + hidden]);
         }
         // Scale-free norm: a dedicated entry, because the weighted kernel with
@@ -293,7 +320,7 @@ impl Session {
             .u32(hidden as u32)
             .f32(eps);
         launch(ctx, "dgq_rms_norm_ns", rows(canvas), 256, &mut args)?;
-        arena_store(ctx, &self.bufs.hidden_a, self.seq * hidden)?;
+        arena_store(ctx, &self.bufs.hidden_a, canvas * hidden)?;
         if std::env::var("DGQCUDA_TIME").is_ok() {
             ctx.synchronize()?;
             eprintln!("  [sc] residual rms ok");
@@ -324,30 +351,43 @@ impl Session {
         )
     }
 
-    /// Warm the device: embed the prompt, then run the prompt rows through the
-    /// layers once. This is not an oracle -- the step embeds both row groups
-    /// into the same sequence, so it does not consume this result. What it buys
-    /// is that module load, first-touch allocations and the prompt-width
-    /// dispatch shapes are all paid before the first timed step.
-    pub fn warm(&mut self, prompt: &[u32]) -> Result<(), Error> {
-        assert_eq!(prompt.len(), self.prompt_len, "prompt length");
+    /// Run `ids` causally at positions `cache_len..` and append their K/V to
+    /// every layer's cache. The prompt goes in first; a committed canvas block
+    /// goes in the same way, which is what the engine does when it extends
+    /// its cache ("causally prefill them to extend the KV cache"). The rows'
+    /// hidden output is not kept: only their K/V matter to later passes.
+    pub fn prefill(&mut self, ids: &[u32]) -> Result<(), Error> {
+        let n = ids.len();
+        assert!(n <= self.seq, "prefill of {n} rows into {}-row buffers", self.seq);
+        assert!(
+            self.cache_len + n <= self.max_ctx,
+            "prefill of {n} rows past the {}-position cache ({} used)",
+            self.max_ctx,
+            self.cache_len
+        );
         let ctx = self.model.ctx.clone();
-        self.embed_rows(prompt, 0)?;
+        self.embed_rows(ids, 0)?;
+        arena_store(&ctx, &self.bufs.hidden_a, n * self.cfg.text_config.hidden_size)?;
         let n_layers = self.layers.min(self.model.layers.len());
         {
             let Self {
                 model,
                 cfg,
-                prompt_len,
+                cache_len,
                 bufs,
+                kv_cache,
                 ..
             } = self;
             let r = Runner {
                 m: model,
                 cfg,
-                seq: *prompt_len,
-                pos0: 0,
-                causal_split: *prompt_len,
+                seq: n,
+                pos0: *cache_len,
+                causal_split: n,
+                kv: Some(KvView {
+                    layers: kv_cache,
+                    total: *cache_len + n,
+                }),
                 stage: std::cell::RefCell::new(Stage::new()),
             };
             for (i, lw) in model.layers.iter().take(n_layers).enumerate() {
@@ -355,6 +395,7 @@ impl Session {
                 std::mem::swap(&mut bufs.hidden_a, &mut bufs.hidden_b);
             }
         }
+        self.cache_len += n;
         ctx.synchronize()?;
         Ok(())
     }
@@ -381,6 +422,7 @@ impl Session {
                 seq: *prompt_len,
                 pos0: 0,
                 causal_split: *prompt_len,
+                kv: None,
                 stage: std::cell::RefCell::new(Stage::new()),
             };
             for (i, lw) in model.layers.iter().take(n).enumerate() {
@@ -394,53 +436,36 @@ impl Session {
         Ok(out)
     }
 
-    /// One denoise forward pass. Returns the canvas's pre-softcap logits,
-    /// `[canvas, vocab]` row-major.
+    /// One denoise forward pass over the canvas rows alone. Returns the
+    /// canvas's pre-softcap logits, `[canvas, vocab]` row-major.
     ///
-    /// The prompt rows enter from their EMBEDDINGS, not from the post-layer
-    /// hidden `prompt_hidden` computes. The engine's denoise step runs the
-    /// canvas alone (its attention grids are `active_canvas` wide) and reads
-    /// the prompt from the KV cache the prefill wrote; the port has no resident
-    /// KV cache, so it rebuilds the prompt's K/V by running the prompt rows
-    /// through the layers as part of the same sequence. Handing the layers a
-    /// post-layer state re-applies the whole stack to the prompt rows, which
-    /// leaves the prompt residual stream 30 layers "ahead" and hands the canvas
-    /// the wrong K/V to attend.
-    ///
-    /// Embedding the prompt instead is exact, not an approximation: a prompt row
-    /// is causal (`causal_split` is the prompt length), so it attends only
-    /// prompt keys up to itself and cannot see the canvas. Running
-    /// `[prompt][canvas]` therefore reproduces the standalone causal pass's
-    /// prompt hidden and K/V bit for bit.
-    pub fn step(&mut self, prompt: &[u32], canvas_ids: &[u32]) -> Result<Vec<f32>, Error> {
-        assert_eq!(prompt.len(), self.prompt_len, "prompt length");
+    /// The canvas sits at absolute positions `cache_len..cache_len + canvas`
+    /// and attends every cached position plus itself; nothing cached is
+    /// recomputed. This is the engine's step shape (its attention grids are
+    /// `active_canvas` wide and read the prompt from the cache the prefill
+    /// wrote), and it is exact against the old `[prompt][canvas]` pass: a
+    /// prompt row was causal there, so its K/V never depended on the canvas
+    /// and are the same values the prefill cached.
+    pub fn step(&mut self, canvas_ids: &[u32]) -> Result<Vec<f32>, Error> {
         assert_eq!(canvas_ids.len(), self.canvas, "canvas length");
+        assert!(
+            self.cache_len > 0,
+            "step before any prefill: the canvas would attend an empty cache"
+        );
+        assert!(
+            self.cache_len + self.canvas <= self.max_ctx,
+            "canvas of {} past the {}-position cache ({} used)",
+            self.canvas,
+            self.max_ctx,
+            self.cache_len
+        );
         let ctx = self.model.ctx.clone();
         let t = self.cfg.text_config.clone();
         let hidden = t.hidden_size;
         let timing = std::env::var("DGQCUDA_TIME").is_ok_and(|v| v != "0");
 
-        // Both row groups enter the layer stack as embeddings, exactly once.
-        self.embed_rows(prompt, 0)?;
-        self.embed_rows(canvas_ids, self.prompt_len)?;
-        // The buffers are sized for [prompt][canvas]; the canvas is written
-        // into the tail, leaving no spare row today, but the zeroing keeps a
-        // future short canvas from feeding stale rows into attention, which
-        // attends every position up to seq and cannot tell a filler row from
-        // a live one.
-        {
-            let base = (self.prompt_len + self.canvas) * hidden;
-            let spare = self.seq - (self.prompt_len + self.canvas);
-            if spare > 0 {
-                self.model.ctx.set_current()?;
-                let dst = unsafe { self.bufs.hidden_a.device_ptr() + (base as u64) * 4 };
-                self.model.ctx.driver().check(
-                    unsafe { (self.model.ctx.driver().cu_memset_d8)(dst, 0, spare * hidden * 4) },
-                    "cuMemsetD8",
-                )?;
-            }
-        }
-        arena_store(&ctx, &self.bufs.hidden_a, self.seq * hidden)?;
+        self.embed_rows(canvas_ids, 0)?;
+        arena_store(&ctx, &self.bufs.hidden_a, self.canvas * hidden)?;
         if timing {
             ctx.synchronize()?;
             eprintln!("  [d] embed ok");
@@ -460,11 +485,10 @@ impl Session {
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&p| p < self.canvas)
         {
-            let hidden = self.cfg.text_config.hidden_size;
             self.model.ctx.synchronize()?;
-            let mut all = vec![0.0f32; self.seq * hidden];
+            let mut all = vec![0.0f32; self.canvas * hidden];
             self.bufs.hidden_a.read_f32(&mut all)?;
-            let off = (self.prompt_len + pos) * hidden;
+            let off = pos * hidden;
             emit_layer_checkpoint("after_preamble", &all[off..off + hidden]);
         }
         if timing {
@@ -474,36 +498,42 @@ impl Session {
 
         // Split the borrow so Runner can hold the model while bufs is mutated
         // by the layer body.
-        let timing = std::env::var("DGQCUDA_TIME").is_ok_and(|v| v != "0");
         let Self {
             model,
             cfg,
-            seq,
-            prompt_len,
             canvas,
+            cache_len,
             bufs,
+            kv_cache,
             ..
         } = self;
+        let canvas = *canvas;
         let r = Runner {
             m: model,
             cfg,
-            seq: *seq,
-            pos0: 0,
-            causal_split: *prompt_len,
+            seq: canvas,
+            pos0: *cache_len,
+            causal_split: 0,
+            kv: Some(KvView {
+                layers: kv_cache,
+                total: *cache_len + canvas,
+            }),
             stage: std::cell::RefCell::new(Stage::new()),
         };
         // `DGQCUDA_LAYER_DUMP=<canvas row>` traces one canvas row's residual
         // down the stack, in the shape of the engine's `step-layer-probe`, so
         // the two can be read side by side to find the first layer that
-        // disagrees. Off by default and never allocated when off.
+        // disagrees. Off by default and never allocated when off. (The old
+        // pass also emitted the last prompt row as a control; the prompt is
+        // no longer in the pass, and its path is pinned by `prefill` against
+        // the causal oracle instead.)
         let inject_after: Option<usize> = std::env::var("DGQCUDA_INJECT_AFTER")
             .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|_| *seq > *prompt_len);
+            .and_then(|v| v.parse().ok());
         let layer_dump: Option<usize> = std::env::var("DGQCUDA_LAYER_DUMP")
             .ok()
             .and_then(|v| v.parse().ok())
-            .filter(|&p| p < *canvas);
+            .filter(|&p| p < canvas);
         let n_layers = self.layers.min(model.layers.len());
         for (i, lw) in model.layers.iter().take(n_layers).enumerate() {
             layer_forward(&r, bufs, lw, i, 0)?;
@@ -513,21 +543,18 @@ impl Session {
             // checkpoint, then let the port run the REST of the stack. If the
             // logits come out right, every layer below the injection point is
             // correct and the divergence is above it; walking the layer down
-            // finds the first one that is not. Only the canvas rows are
-            // replaced -- the prompt rows stay the port's own, which is what
-            // supplies K/V, and they already reproduce the causal prefill.
+            // finds the first one that is not.
             if inject_after == Some(i) {
                 let path = std::env::var("DGQCUDA_INJECT_BIN").map_err(|_| {
                     Error::Msg("DGQCUDA_INJECT_AFTER needs DGQCUDA_INJECT_BIN".into())
                 })?;
                 let bytes =
                     std::fs::read(&path).map_err(|e| Error::Msg(format!("inject {path}: {e}")))?;
-                let want = *canvas * hidden * 4;
+                let want = canvas * hidden * 4;
                 if bytes.len() != want {
                     return Err(Error::Msg(format!(
-                        "inject {path}: {} bytes, expected {want} ({} canvas rows x {hidden})",
+                        "inject {path}: {} bytes, expected {want} ({canvas} canvas rows x {hidden})",
                         bytes.len(),
-                        *canvas
                     )));
                 }
                 let vals: Vec<f32> = bytes
@@ -535,59 +562,40 @@ impl Session {
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect();
                 ctx.synchronize()?;
-                let mut all = vec![0.0f32; *seq * hidden];
-                bufs.hidden_a.read_f32(&mut all)?;
-                let base = *prompt_len * hidden;
-                all[base..base + *canvas * hidden].copy_from_slice(&vals);
-                bufs.hidden_a.write_f32(&all)?;
+                bufs.hidden_a.write_f32(&vals)?;
                 ctx.synchronize()?;
                 eprintln!("  [inject] canvas rows replaced after layer {i} from {path}");
             }
             if let Some(pos) = layer_dump {
                 // The swap above leaves the layer's output in hidden_a.
                 ctx.synchronize()?;
-                let mut all = vec![0.0f32; *seq * hidden];
+                let mut all = vec![0.0f32; canvas * hidden];
                 bufs.hidden_a.read_f32(&mut all)?;
-                let off = (*prompt_len + pos) * hidden;
+                let off = pos * hidden;
                 emit_layer_checkpoint(&format!("after_layer_{i}"), &all[off..off + hidden]);
-                // The last PROMPT row through the same layers, as a control.
-                // The prompt path is verified against the causal prefill, so a
-                // layer that mishandles a good input shows up here too; one
-                // that only mishandles the canvas does not.
-                let poff = (*prompt_len - 1) * hidden;
-                emit_layer_checkpoint(
-                    &format!("after_layer_{i}_prompt"),
-                    &all[poff..poff + hidden],
-                );
             }
             if timing {
                 ctx.synchronize()?;
                 eprintln!("  [d] layer {i} ok");
             }
         }
-        r.rms(&bufs.hidden_a, &model.final_norm, &bufs.hidden_b, *seq)?;
-        arena_store(&ctx, &bufs.hidden_b, *seq * hidden)?;
+        r.rms(&bufs.hidden_a, &model.final_norm, &bufs.hidden_b, canvas)?;
+        arena_store(&ctx, &bufs.hidden_b, canvas * hidden)?;
         if let Some(pos) = layer_dump {
             ctx.synchronize()?;
-            let mut all = vec![0.0f32; *seq * hidden];
+            let mut all = vec![0.0f32; canvas * hidden];
             bufs.hidden_b.read_f32(&mut all)?;
-            let off = (*prompt_len + pos) * hidden;
+            let off = pos * hidden;
             emit_layer_checkpoint("after_final_norm", &all[off..off + hidden]);
-            // The same buffer's last PROMPT row, as an absolute control: the
-            // prompt path is verified, so if the canvas row is an outlier here
-            // and the prompt row is not, the canvas state is pathological in
-            // its own right and not merely different from the engine's.
-            let poff = (*prompt_len - 1) * hidden;
-            emit_layer_checkpoint("after_final_norm_prompt", &all[poff..poff + hidden]);
         }
         if timing {
             r.mark("d:final_norm");
         }
         r.gemm(
-            *canvas,
+            canvas,
             t.vocab_size,
             hidden,
-            unsafe { bufs.hidden_b.device_ptr() + (*prompt_len * hidden) as u64 * 4 },
+            bufs.hidden_b.device_ptr(),
             model.lm_head.device_ptr(),
             bufs.logits.device_ptr(),
         )?;
@@ -602,8 +610,8 @@ impl Session {
         Ok(self.host_logits.clone())
     }
 
-    /// Diagnostic: the device hidden state of the last `step` (pre-final-norm
-    /// is `hidden_b`; the post-layer value is what the LM head reads).
+    /// Diagnostic: the device hidden state of the last `step` after the final
+    /// norm (`hidden_b`, canvas rows only; what the LM head read).
     pub fn read_hidden_b(&self, elems: usize) -> Result<Vec<f32>, Error> {
         self.model.ctx.synchronize()?;
         let mut out = vec![0.0f32; elems];

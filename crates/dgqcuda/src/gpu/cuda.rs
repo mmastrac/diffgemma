@@ -394,15 +394,30 @@ impl Bufs {
     }
 }
 
+/// A resident KV cache the layers read and extend: one `[position][K|V]`
+/// buffer per layer in the layout `dgq_attention_v2` reads, holding
+/// positions `0..total`. A pass with `pos0 = n` writes its rows' K/V at
+/// positions `n..n + seq` and attends `0..total`, so a causal prefill
+/// appends to the cache and a canvas pass runs only its own rows against
+/// everything before it.
+pub(crate) struct KvView<'a> {
+    pub(crate) layers: &'a [DeviceBuffer],
+    /// Positions attended, `pos0 + seq` of the pass that owns this view.
+    pub(crate) total: usize,
+}
+
 pub(crate) struct Runner<'a> {
     pub(crate) m: &'a GpuModel,
     pub(crate) cfg: &'a ModelConfig,
     pub(crate) seq: usize,
     /// Absolute position of row 0 (0 for a from-scratch forward pass; the
-    /// prompt length when a denoise pass runs the canvas after the prompt).
+    /// cache length when a pass runs against a KV cache).
     pub(crate) pos0: usize,
     /// Leading rows that attend causally; `seq` is a plain causal pass.
     pub(crate) causal_split: usize,
+    /// None: the pass builds K/V for its own rows only and attends those
+    /// (the whole sequence is in the pass). Some: see `KvView`.
+    pub(crate) kv: Option<KvView<'a>>,
     pub(crate) stage: std::cell::RefCell<Stage>,
 }
 
@@ -529,6 +544,7 @@ pub fn forward_full(
         seq,
         pos0,
         causal_split,
+        kv: None,
         stage: std::cell::RefCell::new(Stage::new()),
     };
 
@@ -724,6 +740,24 @@ pub(crate) fn arena_store(
     Ok(())
 }
 
+/// `arena_store` from element `offset` of `buf`: a pass against a KV cache
+/// stores only the rows it wrote.
+pub(crate) fn arena_store_at(
+    ctx: &Context,
+    buf: &DeviceBuffer,
+    offset: usize,
+    n: usize,
+) -> Result<(), crate::config::Error> {
+    let Some(entry) = arena_mode() else {
+        return Ok(());
+    };
+    let mut args = KernelArgs::new();
+    args.device_ptr(unsafe { buf.device_ptr() + (offset as u64) * 4 })
+        .u32(n as u32);
+    launch(ctx, entry, flat(n, 256), 256, &mut args)?;
+    Ok(())
+}
+
 /// The K positions both sides sample: prompt rows plus the first canvas rows,
 /// matching the engine `step-attn-dump`'s `k_samples`.
 const K_SAMPLE_POSITIONS: [usize; 22] = [
@@ -900,8 +934,8 @@ pub(crate) fn layer_forward(
         ));
     }
 
-    // RoPE
-    let freqs = crate::forward::rope_freqs(seq, rotary_dim, head_dim, theta);
+    // RoPE, at the rows' absolute positions.
+    let freqs = crate::forward::rope_freqs_at(pos0, seq, rotary_dim, head_dim, theta);
     b.freqs.write_f32(&freqs)?;
     let mut args = KernelArgs::new();
     args.device_ptr(b.q.device_ptr())
@@ -963,19 +997,27 @@ pub(crate) fn layer_forward(
         }
     }
 
-    // KV region: [t, n_kv, 2*head_dim] = K then V
-    interleave_kv(ctx, &b.k, &b.v, &b.kv, seq, n_kv, head_dim)?;
-    arena_store(ctx, &b.kv, seq * 2 * kv_dim)?;
+    // KV region: [t, n_kv, 2*head_dim] = K then V. With a cache the rows land
+    // at their absolute positions in the layer's cache buffer and attention
+    // reads the whole cache; without one the pass's own rows are the whole
+    // key set.
+    let (kv_buf, kv_pos0, total_kv) = match &r.kv {
+        Some(view) => (&view.layers[layer], pos0, view.total),
+        None => (&b.kv, 0, seq),
+    };
+    interleave_kv(ctx, &b.k, &b.v, kv_buf, seq, n_kv, head_dim, kv_pos0)?;
+    arena_store_at(ctx, kv_buf, kv_pos0 * 2 * kv_dim, seq * 2 * kv_dim)?;
+    r.mark("l:qkv");
 
     let mut args = KernelArgs::new();
     args.device_ptr(b.q.device_ptr())
-        .device_ptr(b.kv.device_ptr())
+        .device_ptr(kv_buf.device_ptr())
         .device_ptr(b.attn_out.device_ptr())
         .u32(seq as u32)
         .u32(n_heads as u32)
         .u32(n_kv as u32)
         .u32(head_dim as u32)
-        .u32(seq as u32)
+        .u32(total_kv as u32)
         .u32(window.unwrap_or(0) as u32)
         .u32(pos0 as u32)
         .u32(causal_split as u32);
@@ -988,6 +1030,7 @@ pub(crate) fn layer_forward(
     )?;
 
     arena_store(ctx, &b.attn_out, seq * q_dim)?;
+    r.mark("l:attn_kernel");
     if let Some(row) = attn_dump {
         ctx.synchronize()?;
         dump.push(("attn_out", attn_dump_row(&b.attn_out, row, q_dim, seq)));
@@ -1006,7 +1049,7 @@ pub(crate) fn layer_forward(
     r.rms(&b.proj_out, &lw.post_attention_layernorm, &b.normed, seq)?;
     r.add_in_place(&b.normed, &b.residual, seq * hidden)?;
     arena_store(ctx, &b.normed, seq * hidden)?;
-    r.mark("l:attn");
+    r.mark("l:o_proj");
     if stop_at == 1 {
         return Ok(());
     }
@@ -1359,6 +1402,7 @@ fn copy_device(
 /// \`k = kv + ((t*nkv + h)*hd)\` and \`v = k + nkv*hd\`, and the kernel test
 /// (tests/kernels.rs::attention_layouts) pins this layout: the per-head
 /// alternative scores cos 0.098.
+/// `kv[pos0 + t] = [k[t] | v[t]]` for every row, one launch.
 fn interleave_kv(
     ctx: &Context,
     k: &DeviceBuffer,
@@ -1367,33 +1411,17 @@ fn interleave_kv(
     seq: usize,
     n_kv: usize,
     head_dim: usize,
+    pos0: usize,
 ) -> Result<(), Error> {
-    ctx.set_current()?;
     let row = n_kv * head_dim;
-    for t in 0..seq {
-        let base = t * 2 * row;
-        ctx.driver().check(
-            unsafe {
-                (ctx.driver().cu_memcpy_dtod)(
-                    kv.device_ptr() + (base as u64) * 4,
-                    k.device_ptr() + (t * row) as u64 * 4,
-                    row * 4,
-                )
-            },
-            "cuMemcpyDtoD",
-        )?;
-        ctx.driver().check(
-            unsafe {
-                (ctx.driver().cu_memcpy_dtod)(
-                    kv.device_ptr() + ((base + row) as u64) * 4,
-                    v.device_ptr() + (t * row) as u64 * 4,
-                    row * 4,
-                )
-            },
-            "cuMemcpyDtoD",
-        )?;
-    }
-    Ok(())
+    let mut args = KernelArgs::new();
+    args.device_ptr(k.device_ptr())
+        .device_ptr(v.device_ptr())
+        .device_ptr(kv.device_ptr())
+        .u32(seq as u32)
+        .u32(row as u32)
+        .u32(pos0 as u32);
+    launch(ctx, "dgq_interleave_kv", flat(seq * row, 256), 256, &mut args)
 }
 
 /// Hidden state after \`layers\` decoder layers (device-resident path).
@@ -1424,6 +1452,7 @@ pub fn layer0_synthetic(
         seq: SEQ,
         pos0: 0,
         causal_split: SEQ,
+        kv: None,
         stage: std::cell::RefCell::new(Stage::new()),
     };
     let input: Vec<f32> = (0..SEQ * hidden)
@@ -1466,6 +1495,7 @@ pub fn hidden_after(
         seq,
         pos0: 0,
         causal_split: seq,
+        kv: None,
         stage: std::cell::RefCell::new(Stage::new()),
     };
     b.ids.write_bytes(unsafe {
@@ -1521,6 +1551,7 @@ pub fn attn_stage(
         seq,
         pos0: 0,
         causal_split: seq,
+        kv: None,
         stage: std::cell::RefCell::new(Stage::new()),
     };
     b.ids.write_bytes(unsafe {
