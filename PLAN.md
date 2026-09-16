@@ -307,13 +307,21 @@ clears 0.641 by a lot.
       canvas and never chains a second block, so any reply longer than that
       is cut off. The engine writes 550-665 words for the explain probes.
       The KV cache below is the prerequisite; chaining itself is not built.
-    - Step time is the attention kernel. With the timing marks split,
-      `dgq_attention_v2` alone is 50.1 s of a 54.8 s step (canvas 256,
-      283 keys); the QKV GEMMs are 0.3 s, experts 3.8 s. The kernel is one
-      block per (row, head) with every thread of the block walking the
-      whole key range redundantly and a 512-float accumulator per thread,
-      which spills. The engine's target is <= 5 s/step; this kernel is the
-      whole gap and the next lever.
+    - FIXED: step time was the attention kernel. With the timing marks
+      split, `dgq_attention_v2` alone was 50.1 s of a 54.8 s step (canvas
+      256, 283 keys): one block per (row, head) with every thread walking
+      the whole key range redundantly and a 512-float accumulator per
+      thread. `dgq_attention_v3` (cb608e9f) keeps the contract and
+      parallelizes inside the block (warp per key, lanes across head_dim,
+      shuffle-reduced dot, per-warp online softmax, shared-memory merge).
+      Kernel 50.1 s -> 0.1 s; step 54.8 s -> 4.8 s; France seed 42 end to
+      end 174.8 s -> 20.8 s with the same three steps and reply. Every
+      kernel test runs on both kernels against the CPU reference (cos >=
+      0.99999999, step geometry and window included); A/B against the
+      pre-cache v2 build: 0 argmax flips at all 256 positions on steps 1
+      and 2, max logit delta 1e-4. `DGQCUDA_ATTN=v2` keeps the old kernel.
+      The step is now the expert path: 3.8 s of 4.8. The engine target of
+      <= 5 s/step is met on this shape; the experts are the next lever.
     - Soft-embed disagrees with the CPU oracle in high-entropy regimes.
       At canvas 16 with only the chat-template prefix as prompt (mean_H
       ~4), step 2 is cos 0.89 with argmax mismatches against the oracle
