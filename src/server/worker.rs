@@ -653,7 +653,7 @@ impl Worker {
 
         // One Score op per sample. The prompt is resident after the first,
         // so later samples skip the prefill.
-        let base_cfg = self.score_cfg(&job, budget);
+        let base_cfg = self.per_request_cfg(&job, budget);
         let mut samples: Vec<Vec<Vec<SlotScore>>> = Vec::with_capacity(schema.samples);
         let mut prefill_ms = 0.0;
         let mut denoise_ms = 0.0;
@@ -781,18 +781,6 @@ impl Worker {
             finalize_started.elapsed().as_secs_f64() * 1e3,
             request_started.elapsed().as_secs_f64() * 1e3,
         );
-    }
-
-    /// The scoring config: `per_request_cfg` without the empty-reply
-    /// predicate, which loads the tokenizer from disk (~300 ms) and which
-    /// scoring never consults, and without the tool-mode stop policy.
-    fn score_cfg(&self, job: &Job, budget: usize) -> crate::metal::StepGenerateConfig {
-        let mut cfg = self.base_cfg.clone();
-        cfg.sampler = crate::sample::sampler_for_steps(self.steps, self.no_early_stop);
-        cfg.max_new_tokens = job.max_tokens.map_or(budget, |c| c.min(budget));
-        cfg.seed = job.seed.unwrap_or(self.base_cfg.seed);
-        cfg.stop_token_ids = self.stop_token_ids.clone();
-        cfg
     }
 
     /// Per-request generation config shared by every serve path.
