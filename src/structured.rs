@@ -28,6 +28,11 @@
 //!     "levels": ["Superficial", "Adequate", "Thorough"]}],
 //!  "steps": 1, "hole": "noise", "climb": 0, "climb_mode": "joint", "samples": 4}
 //! ```
+//!
+//! `"samples": "auto"` takes one read and the remaining reads (up to
+//! `auto_max`) only when some slot's first-read entropy is above
+//! `auto_threshold`. `fix_definite` fills the slots below the threshold
+//! with their first-read label for the later reads.
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -103,7 +108,35 @@ pub struct Schema {
     /// than the marginal over the noise. The mean over reads estimates that
     /// marginal. The prompt is prefilled once, so each extra sample costs
     /// one forward per round.
-    pub samples: usize,
+    pub samples: Samples,
+    /// Under `Samples::Auto`, fill every slot whose first-read entropy is at
+    /// or below the threshold with its first-read label for the later
+    /// reads, so the uncertain slots condition on the settled answers.
+    pub fix_definite: bool,
+}
+
+/// How many reads a request takes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Samples {
+    Fixed(usize),
+    /// One read, then up to `max` in total when any slot's first-read row
+    /// entropy (nats) is above `threshold`. Measured on ten tickets: the
+    /// slots that moved across noise draws read 0.25 nats or more on their
+    /// first read, the stable ones 0.16 or less. The 0.1 default was fixed
+    /// before the held-out run, for margin, and is opt-in until that run
+    /// reports its miss rate.
+    Auto {
+        max: usize,
+        threshold: f32,
+    },
+}
+
+impl Samples {
+    pub fn max(self) -> usize {
+        match self {
+            Self::Fixed(n) | Self::Auto { max: n, .. } => n,
+        }
+    }
 }
 
 /// The answer template as canvas tokens, plus where each question's label
@@ -148,7 +181,20 @@ struct SchemaJson {
     #[serde(default)]
     climb_mode: Option<String>,
     #[serde(default)]
-    samples: Option<usize>,
+    samples: Option<SamplesJson>,
+    #[serde(default)]
+    auto_threshold: Option<f32>,
+    #[serde(default)]
+    auto_max: Option<usize>,
+    #[serde(default)]
+    fix_definite: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SamplesJson {
+    Count(usize),
+    Mode(String),
 }
 
 #[derive(Deserialize)]
@@ -230,7 +276,20 @@ impl Schema {
                 Some("loo") => true,
                 Some(other) => return Err(format!("schema: unknown climb_mode {other:?}")),
             },
-            samples: raw.samples.unwrap_or(4).clamp(1, 32),
+            samples: match raw.samples {
+                None => Samples::Fixed(4),
+                Some(SamplesJson::Count(n)) => Samples::Fixed(n.clamp(1, 32)),
+                Some(SamplesJson::Mode(m)) if m == "auto" => Samples::Auto {
+                    max: raw.auto_max.unwrap_or(4).clamp(1, 32),
+                    threshold: raw.auto_threshold.unwrap_or(0.1).max(0.0),
+                },
+                Some(SamplesJson::Mode(m)) => {
+                    return Err(format!(
+                        "schema: samples must be a count or \"auto\", got {m:?}"
+                    ));
+                }
+            },
+            fix_definite: raw.fix_definite.unwrap_or(false),
         })
     }
 
@@ -391,6 +450,7 @@ impl Schema {
         template: &Template,
         samples: &[Vec<Vec<SlotScore>>],
         converged: bool,
+        sampling: Value,
         tok: &Tokenizer,
         timing: &Value,
     ) -> Value {
@@ -508,7 +568,7 @@ impl Schema {
             "diagnostics": {
                 "steps": self.steps,
                 "hole": hole_name(self.hole),
-                "samples": {"n": finals.len(), "tops": sample_tops},
+                "samples": {"n": finals.len(), "tops": sample_tops, "policy": sampling},
                 "climb": {
                     "mode": if self.leave_one_out { "loo" } else { "joint" },
                     "rounds": climb,

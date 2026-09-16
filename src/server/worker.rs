@@ -654,15 +654,22 @@ impl Worker {
         // One Score op per sample. The prompt is resident after the first,
         // so later samples skip the prefill.
         let base_cfg = self.per_request_cfg(&job, budget);
-        let mut samples: Vec<Vec<Vec<SlotScore>>> = Vec::with_capacity(schema.samples);
+        let mut samples: Vec<Vec<Vec<SlotScore>>> = Vec::with_capacity(schema.samples.max());
+        // Auto sampling: when every slot settles on the first read (entropy
+        // at or below the threshold) the request ends there. Otherwise the
+        // settled slots may be pinned to their first-read label for the
+        // later reads.
+        let mut pinned: Vec<(usize, u32)> = Vec::new();
+        let mut first_read_max_entropy = 0.0f32;
+        let mut extended = false;
         let mut prefill_ms = 0.0;
         let mut denoise_ms = 0.0;
         let mut steps_run = 0;
         let mut rounds_run = 0;
         let mut converged = true;
-        for k in 0..schema.samples as u64 {
+        for k in 0..schema.samples.max() as u64 {
             let sample_seed = seed.wrapping_add(k.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            let canvas = match schema.build_canvas(
+            let mut canvas = match schema.build_canvas(
                 &template,
                 turn_close,
                 0,
@@ -673,6 +680,9 @@ impl Worker {
                 Ok(c) => c,
                 Err(err) => return fail(err),
             };
+            for &(pos, id) in &pinned {
+                canvas[pos] = id;
+            }
             let mut cfg = base_cfg.clone();
             cfg.seed = sample_seed;
             let op_started = Instant::now();
@@ -719,7 +729,42 @@ impl Worker {
                     })
                     .collect(),
             );
+            if k == 0
+                && let crate::structured::Samples::Auto { threshold, .. } = schema.samples
+                && let Some(first) = out.rounds.last()
+            {
+                first_read_max_entropy = first.iter().map(|p| p.entropy).fold(0.0, f32::max);
+                if first_read_max_entropy <= threshold {
+                    break;
+                }
+                extended = true;
+                if schema.fix_definite {
+                    for (probe, p) in probes.iter().zip(first) {
+                        if p.entropy <= threshold {
+                            let best = (0..p.candidate_logits.len())
+                                .max_by(|&a, &b| {
+                                    p.candidate_logits[a].total_cmp(&p.candidate_logits[b])
+                                })
+                                .unwrap_or(0);
+                            pinned.push((probe.pos, probe.candidates[best]));
+                        }
+                    }
+                }
+            }
         }
+        let sampling = match schema.samples {
+            crate::structured::Samples::Fixed(n) => {
+                serde_json::json!({"mode": "fixed", "requested": n})
+            }
+            crate::structured::Samples::Auto { max, threshold } => serde_json::json!({
+                "mode": "auto",
+                "max": max,
+                "threshold": threshold,
+                "first_read_max_entropy": first_read_max_entropy,
+                "extended": extended,
+                "pinned_slots": pinned.len(),
+            }),
+        };
         let timing = serde_json::json!({
             "prefill_ms": prefill_ms,
             "denoise_ms": denoise_ms,
@@ -729,7 +774,7 @@ impl Worker {
             "prompt_tokens": prompt.len(),
             "reused_tokens": reuse,
         });
-        let body = schema.answers_json(&template, &samples, converged, tok, &timing);
+        let body = schema.answers_json(&template, &samples, converged, sampling, tok, &timing);
         let content = serde_json::to_string_pretty(&body).unwrap_or_default();
         let summary: Vec<String> = body["answers"]
             .as_object()
