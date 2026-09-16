@@ -569,8 +569,7 @@ impl Worker {
         // Only read under the flag above: quoted stop ids are literal tool-arg
         // content, not stops.
         cfg.quote_token_id = self.quote_tok;
-        cfg.degenerate_reply_check =
-            crate::chat_template::empty_reply_check(&self.model_dir, self.stop_token_ids.clone());
+        cfg.degenerate_reply_check = self.degenerate_reply_check.clone();
         cfg
     }
 
@@ -703,7 +702,7 @@ impl Worker {
                     &self.base_cfg,
                     self.steps,
                     &self.stop_token_ids,
-                    &self.model_dir,
+                    self.degenerate_reply_check.as_ref(),
                     self.max_seq,
                     cc.summarize_max_new,
                     &ctx,

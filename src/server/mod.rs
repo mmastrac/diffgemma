@@ -282,6 +282,9 @@ struct Worker {
     steps: usize,
     no_early_stop: bool,
     base_cfg: crate::metal::StepGenerateConfig,
+    /// Built once, since it depends only on the tokenizer, the stop ids and
+    /// eos.
+    degenerate_reply_check: Option<crate::chat_template::EmptyReplyCheck>,
     tool_compact: Option<ToolCompactCfg>,
     /// `--tool-repair`: model-guided repair — error tool-response, corrected
     /// call, corrupt exchange rewound out of KV.
@@ -480,7 +483,7 @@ pub(crate) fn run_summarize_pass(
     base_cfg: &crate::metal::StepGenerateConfig,
     steps: usize,
     stop_token_ids: &[u32],
-    model_dir: &std::path::Path,
+    degenerate_reply_check: Option<&crate::chat_template::EmptyReplyCheck>,
     max_seq: usize,
     summarize_max_new: usize,
     messages_ctx: &[serde_json::Value],
@@ -496,8 +499,7 @@ pub(crate) fn run_summarize_pass(
     cfg.sampler = crate::sample::sampler_for_steps(steps, false);
     cfg.max_new_tokens = summarize_max_new.min(room);
     cfg.stop_token_ids = stop_token_ids.to_vec();
-    cfg.degenerate_reply_check =
-        crate::chat_template::empty_reply_check(model_dir, stop_token_ids.to_vec());
+    cfg.degenerate_reply_check = degenerate_reply_check.cloned();
     cfg.step_observer = None;
     // Internal pass: a stage intervention here must not surface a thinking
     // block into whatever client stream the base cfg was wired to.
@@ -603,6 +605,11 @@ pub fn run_serve(
     let channel_open = tokenizer.special_token_id("<|channel>");
     let channel_close = tokenizer.special_token_id("<channel|>");
     let quote_tok = tokenizer.special_token_id("<|\"|>");
+    let degenerate_reply_check = crate::chat_template::empty_reply_check_with(
+        model_dir,
+        Arc::clone(&tokenizer),
+        stop_token_ids.clone(),
+    );
     let model_name: Arc<str> = Arc::from(
         model_dir
             .file_name()
@@ -628,6 +635,7 @@ pub fn run_serve(
         steps,
         no_early_stop: false,
         base_cfg,
+        degenerate_reply_check,
         tool_compact: tool_compact.then(|| ToolCompactCfg {
             threshold: crate::flags::tool_compact_threshold(),
             max_expand_rounds: 4,

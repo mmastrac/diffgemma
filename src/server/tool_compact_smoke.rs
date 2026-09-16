@@ -245,10 +245,20 @@ fn tool_compact_m1_m2_and_overlong_smoke() {
     let mut ctx = messages.clone();
     ctx.push(json!({"role":"user","content": tc::summarize_instruction()}));
     let stop = crate::config::load_generation_stop_tokens(&dir);
+    let degen = crate::chat_template::empty_reply_check(&dir, stop.clone());
     let summary_opt = {
         let stage = SessionStage(std::cell::RefCell::new(&mut manager));
         super::run_summarize_pass(
-            &stage, &tok, &cfg, 24, &stop, &dir, MAX_SEQ, 256, &ctx, &tools,
+            &stage,
+            &tok,
+            &cfg,
+            24,
+            &stop,
+            degen.as_ref(),
+            MAX_SEQ,
+            256,
+            &ctx,
+            &tools,
         )
     };
     assert_eq!(
