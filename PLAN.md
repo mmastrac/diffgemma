@@ -141,9 +141,18 @@ decisions"). Open, in order of what would change the product:
 - Cross-question interference. Slots see each other's fillers
   bidirectionally. Compare N-question requests against N single-question
   requests on the same state.
-- Short-prompt prefill. The state delta runs through the f32 engine (~1.3 s
-  for ~50 tokens). `DGQ_FAST_PREFILL=1` would cut that to a chunk floor of
-  ~0.8 s if its short-prompt regression does not reach logit readout.
+- Prefill is the remaining cost. Profiled under samply: the pipeline
+  thread's CPU-active time over a whole session is under a second, the rest
+  is GPU wait, so the levers are GPU dispatch shape. Shipped: a short tail
+  prefill chunk runs at a 64-row multiple (`DGQ_PREFILL_NARROW=0` restores
+  full width), bit-identical KV (`narrow_prefill_chunk_bit_identity`,
+  the 8-case byte-identity gate 8/8), 51-token delta 1.12 s to 0.51 s in the test and 1.3 s to
+  0.65 s served, request wall 2.0 s to 1.2 s at 64 rows. Open: the cold
+  schema prefix pays the f32 engine (9.4 s for 187 tokens).
+  `DGQ_FAST_PREFILL=1` makes that 3.0 s, but the fast-prefilled prefix
+  flipped the outage ticket's borderline answers (urgent yes 0.96 to no
+  0.99, tone 0.68 annoyed to a 0.50 tie) while the easy tickets held, so
+  the engine stays the default until a labelled run picks.
 - Against generating the JSON. The same tickets in the same process, thinking
   off, the model asked for a JSON object with the three keys: it produced
   the same labels in 19 tokens after 3 to 5 full-canvas steps, 4.3 to 7.2 s
@@ -152,9 +161,9 @@ decisions"). Open, in order of what would change the product:
   4.7 s. Both paths pay the same engine prefill for the state, but the
   plain chat path folds the system prompt into the user turn and reused
   none of it (6 s), while the structured path reuses the schema prefix
-  (1.3 s). Wall: 2.0 s against 12 to 14 s. A generation baseline at a
-  narrow canvas would be the fairer step-cost comparison and does not
-  exist as a product path.
+  (1.3 s, now 0.65 s with the narrow tail chunk). Wall: 1.2 to 2.0 s
+  against 12 to 14 s. A generation baseline at a narrow canvas would be
+  the fairer step-cost comparison and does not exist as a product path.
 - Multi-token answers (extraction fields) need the `Refine
   {mask|forced_ids}` primitive: pin the skeleton, denoise the hole, which the
   rewound-canvas fixed point puts at 2 to 3 steps.

@@ -440,3 +440,50 @@ fn condense_step_text_transforms() {
     assert!(out.starts_with(&long[..32]), "head missing: {out}");
     assert!(out.ends_with(&long[200 - 48..]), "tail missing: {out}");
 }
+
+/// Narrow tail prefill chunk (`DGQ_PREFILL_NARROW`): a 51-token delta at
+/// offset 140 prefilled at 64 rows must leave the same live KV as at 256
+/// rows, and as the whole prompt prefilled in one go.
+///
+/// Run: `cargo test --release narrow_prefill_chunk_bit_identity -- --ignored --nocapture`
+#[test]
+#[ignore = "real model: cargo test --release narrow_prefill_chunk_bit_identity -- --ignored --nocapture"]
+fn narrow_prefill_chunk_bit_identity() {
+    use crate::metal::step_kernel::set_narrow_prefill_override;
+    let Some(dir) = crate::shaders::test_util::dgq_model_dir() else {
+        return;
+    };
+    let layers = crate::commands::resolve_model_layers(&dir, None).unwrap();
+    let sampler = crate::sample::sampler_for_steps(24, false);
+    let cfg = StepGenerateConfig::from_generate(7, 64, 4096, layers, sampler, false);
+    let (mut session, _) = StepGenerateSession::open(&dir, &cfg, None).unwrap();
+    let ids: Vec<u32> = (0..191u32).map(|i| 1000 + (i * 7919) % 30000).collect();
+    let split = 140;
+
+    let mut run = |narrow: Option<bool>, whole: bool| {
+        set_narrow_prefill_override(narrow);
+        session.reset_kv();
+        if whole {
+            session.extend_kv(&ids).unwrap();
+        } else {
+            session.extend_kv(&ids[..split]).unwrap();
+        }
+        let started = std::time::Instant::now();
+        if !whole {
+            session.extend_kv(&ids[split..]).unwrap();
+        }
+        let delta = started.elapsed();
+        (session.live_kv_fingerprint(), delta)
+    };
+    let (fp_whole, _) = run(Some(false), true);
+    let (fp_wide, t_wide) = run(Some(false), false);
+    let (fp_narrow, t_narrow) = run(Some(true), false);
+    let (fp_wide2, t_wide2) = run(Some(false), false);
+    set_narrow_prefill_override(None);
+    eprintln!(
+        "narrow prefill: whole={fp_whole:#x} wide={fp_wide:#x} ({t_wide:.2?}) narrow={fp_narrow:#x} ({t_narrow:.2?}) wide2={fp_wide2:#x} ({t_wide2:.2?})"
+    );
+    assert_eq!(fp_wide, fp_wide2, "wide delta prefill is not deterministic");
+    assert_eq!(fp_whole, fp_wide, "chunk grouping changed the KV");
+    assert_eq!(fp_wide, fp_narrow, "narrow tail chunk changed the KV");
+}

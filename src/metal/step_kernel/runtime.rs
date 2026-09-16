@@ -45,6 +45,33 @@ pub struct StepRuntime {
     pub(super) active_canvas: usize,
 }
 
+/// A short tail prefill chunk runs at a 64-row multiple instead of the full
+/// canvas (`DGQ_PREFILL_NARROW=0` restores full width). Bit-identical KV,
+/// pinned by `narrow_prefill_chunk_bit_identity`; a 51-token delta takes
+/// 0.5 s instead of 1.1 s. Tests override it per arm.
+static NARROW_PREFILL_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+pub fn set_narrow_prefill_override(v: Option<bool>) {
+    NARROW_PREFILL_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn narrow_prefill_chunk() -> bool {
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    match NARROW_PREFILL_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => *ENV.get_or_init(|| std::env::var("DGQ_PREFILL_NARROW").map_or(true, |v| v != "0")),
+    }
+}
+
 impl StepRuntime {
     /// KV-cache capacity (positions per layer) the buffers were sized for.
     pub fn max_seq(&self) -> usize {
@@ -402,7 +429,23 @@ impl StepRuntime {
                 .copy_from_slice(&delta_token_ids[pos - offset..pos - offset + chunk_len]);
             self.set_canvas_ids(&ids)?;
             self.set_kv_len(pos as u32);
-            self.dispatch_and_wait(|enc| enc.encode_prefill_chunk(&layout, layers))?;
+            // A short tail chunk runs at the narrowest 64-row multiple that
+            // holds it. The stages take their row count from `forward_m`, as
+            // a shrunk denoise canvas does, and `kv_write_end` already keeps
+            // the pad rows out of the cache.
+            let m = if narrow_prefill_chunk() {
+                chunk_len
+                    .div_ceil(64)
+                    .saturating_mul(64)
+                    .min(self.dims.canvas)
+            } else {
+                self.dims.canvas
+            };
+            self.dispatch_and_wait(|enc| {
+                enc.forward_m = m;
+                enc.active_canvas = m;
+                enc.encode_prefill_chunk(&layout, layers)
+            })?;
             if let Some(peaks) = range_peaks.as_mut() {
                 probe_planes(self, self.dims.canvas, peaks);
             }

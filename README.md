@@ -181,7 +181,7 @@ request above on an M3 Pro, with the schema prefix already resident:
    "tone":   {"type": "score", "score": 1.68, "level": "annoyed", "label": "2", "confidence": 0.68,
               "probabilities": {"calm": 0.32, "annoyed": 0.68, "furious": 0.0}}},
  "diagnostics": {"steps": 1, "hole": "noise",
-                 "timing": {"prefill_ms": 1283, "denoise_ms": 1203, "steps_run": 1,
+                 "timing": {"prefill_ms": 668, "denoise_ms": 1161, "steps_run": 1,
                             "prompt_tokens": 191, "reused_tokens": 140},
                  "questions": {"tone": {"argmax_token": "2", "argmax_is_label": true,
                                         "entropy": 0.6, "label_mass": 1.0}}}}
@@ -206,6 +206,12 @@ default, `pad`, or `label`), `active` (canvas width to run, rounded up to
 default, or `loo`). A joint climb writes every slot's top label back into
 the canvas and re-reads from step 0. It converges in one round and only
 ratifies the first read. It is a diagnostic rather than a lever.
+
+A schema's first request pays the f32 engine prefill once (about 10 s for
+a 190-token prompt); every later state on it prefills only the state
+(0.65 s for 50 tokens). `DGQ_FAST_PREFILL=1` runs the cold schema through
+the quantized prefill instead (3 s), but a schema prefix prefilled that way
+changed the borderline outage answers above, so it is not the default.
 
 ## Custom Quantization
 
