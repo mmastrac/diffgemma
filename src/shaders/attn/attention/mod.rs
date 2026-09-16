@@ -247,7 +247,7 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
         f.kv_len,
     );
     for o in out.iter_mut() {
-        *o = bf16::store_bf16_round_half(*o);
+        *o = bf16::arena_round_f32(*o);
     }
     out
 }

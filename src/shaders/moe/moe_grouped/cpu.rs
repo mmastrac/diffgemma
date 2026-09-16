@@ -31,7 +31,7 @@ pub fn expert_forward_q4_mirror(
             g += q4_weight_at(gate_up, r, k, hidden) * xk;
             u += q4_weight_at(gate_up, r + moe_ff, k, hidden) * xk;
         }
-        *act_r = bf16::round_bf16_f32(gelu_pytorch_tanh_f32(g) * u);
+        *act_r = bf16::arena_round_f32(gelu_pytorch_tanh_f32(g) * u);
     }
     let mut out = vec![0.0f32; hidden];
     for (d, out_d) in out.iter_mut().enumerate() {
@@ -39,7 +39,7 @@ pub fn expert_forward_q4_mirror(
         for (k, &ak) in act.iter().enumerate() {
             o += q4_weight_at(down, d, k, moe_ff) * ak;
         }
-        *out_d = bf16::round_bf16_f32(o);
+        *out_d = bf16::arena_round_f32(o);
     }
     out
 }
@@ -66,7 +66,7 @@ pub fn expert_forward_nvfp4_mirror(
             g += nvfp4_weight_at(gu_body, r, k, hidden, gu_scale) * xk;
             u += nvfp4_weight_at(gu_body, r + moe_ff, k, hidden, gu_scale) * xk;
         }
-        *act_r = bf16::round_bf16_f32(gelu_pytorch_tanh_f32(g) * u);
+        *act_r = bf16::arena_round_f32(gelu_pytorch_tanh_f32(g) * u);
     }
     let mut out = vec![0.0f32; hidden];
     for (d, out_d) in out.iter_mut().enumerate() {
@@ -74,7 +74,7 @@ pub fn expert_forward_nvfp4_mirror(
         for (k, &ak) in act.iter().enumerate() {
             o += nvfp4_weight_at(dn_body, d, k, moe_ff, dn_scale) * ak;
         }
-        *out_d = bf16::round_bf16_f32(o);
+        *out_d = bf16::arena_round_f32(o);
     }
     out
 }
@@ -126,7 +126,7 @@ pub fn moe_grouped_q4(
             let expert_out = expert_forward_q4_mirror(x, gu, dn, moe_ff, hidden);
             let out_row = &mut moe_out[slot as usize * hidden..(slot as usize + 1) * hidden];
             for (o, &v) in out_row.iter_mut().zip(expert_out.iter()) {
-                *o = bf16::round_bf16_f32(v);
+                *o = bf16::arena_round_f32(v);
             }
         }
     }
@@ -166,7 +166,7 @@ pub fn moe_grouped_nvfp4(
             let expert_out = expert_forward_nvfp4_mirror(x, gu, dn, moe_ff, hidden);
             let out_row = &mut moe_out[slot as usize * hidden..(slot as usize + 1) * hidden];
             for (o, &v) in out_row.iter_mut().zip(expert_out.iter()) {
-                *o = bf16::round_bf16_f32(v);
+                *o = bf16::arena_round_f32(v);
             }
         }
     }

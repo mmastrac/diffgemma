@@ -10,26 +10,42 @@ use crate::shaders::attention::{
 use crate::shaders::attn::attention_gemm::cpu_causal;
 use crate::shaders::test_util::ElemFormat;
 
-fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+/// Position of a bf16 value on the monotone number line of bf16 values, so
+/// that subtracting two of them counts ulps across the whole range and through
+/// zero. Both sides of this comparison come out of a bf16 arena store, so their
+/// difference is always a whole number of ulps.
+fn bf16_ordinal(v: f32) -> i32 {
+    let bits = (v.to_bits() >> 16) as i32;
+    if bits & 0x8000 != 0 {
+        -(bits & 0x7FFF)
+    } else {
+        bits
+    }
+}
+
+fn max_ulp_diff(a: &[f32], b: &[f32]) -> i32 {
     assert_eq!(a.len(), b.len());
     a.iter()
         .zip(b.iter())
-        .map(|(x, y)| (x - y).abs())
-        .fold(0.0, f32::max)
+        .map(|(x, y)| (bf16_ordinal(*x) - bf16_ordinal(*y)).abs())
+        .fold(0, i32::max)
 }
 
 // Block-streaming online softmax is mathematically identical to the single-pass
-// reference; only f32 rounding differs, so a tight eps holds for ALL block
-// sizes, including bk=1 (degenerate), bk that splits the causal cutoff, and
-// bk >= t_total (single block == batch softmax).
+// reference; only f32 rounding differs. The shared bf16 store then quantizes
+// that slop: it either vanishes or tips one value across a rounding boundary,
+// which is why the bound is one ulp and not an absolute eps (an eps finer than
+// an ulp would be asserting bit-equality, and one coarser would pass on a real
+// rescale bug). Holds for ALL block sizes, including bk=1 (degenerate), bk that
+// splits the causal cutoff, and bk >= t_total (single block == batch softmax).
 fn assert_flash_matches(f: &crate::shaders::attention::Fixture, round_kv_f16: bool) {
     let reference = cpu_causal(f, round_kv_f16);
     for bk in [1usize, 3, 8, 16, 64, 4096] {
         let flash = cpu_flash_blocked(f, bk, round_kv_f16);
-        let d = max_abs_diff(&reference, &flash);
+        let d = max_ulp_diff(&reference, &flash);
         assert!(
-            d < 1e-3,
-            "flash bk={bk} round_kv_f16={round_kv_f16} diverged from cpu_causal: max|Δ|={d}"
+            d <= 1,
+            "flash bk={bk} round_kv_f16={round_kv_f16} diverged from cpu_causal: max ulps={d}"
         );
     }
 }

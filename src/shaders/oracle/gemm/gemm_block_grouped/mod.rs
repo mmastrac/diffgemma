@@ -64,7 +64,7 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
         f.format,
     );
     for v in out.iter_mut() {
-        *v = bf16::round_bf16_f32(*v);
+        *v = bf16::arena_round_f32(*v);
     }
     out
 }

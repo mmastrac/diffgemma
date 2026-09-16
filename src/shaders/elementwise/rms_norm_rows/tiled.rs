@@ -95,7 +95,7 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
             let mut row = vec![0.0f32; f.dim];
             cpu::rms_norm(&mut row, x, w, RMS_EPS);
             for i in 0..f.dim {
-                out[off + i] = bf16::store_bf16_round_half(row[i]);
+                out[off + i] = bf16::arena_round_f32(row[i]);
             }
         }
     } else {
@@ -105,7 +105,7 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
             let mut row = vec![0.0f32; f.dim];
             cpu::rms_norm_no_scale(&mut row, x, RMS_EPS);
             for i in 0..f.dim {
-                out[off + i] = bf16::store_bf16_round_half(row[i]);
+                out[off + i] = bf16::arena_round_f32(row[i]);
             }
         }
     }
@@ -114,7 +114,7 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
 
 pub fn cpu_f32_in(f: &Fixture) -> Vec<f32> {
     let mut rounded = f.clone();
-    rounded.x = f.x.iter().map(|&v| bf16::round_bf16_f32(v)).collect();
+    rounded.x = f.x.iter().map(|&v| bf16::load_bf16_f32(v)).collect();
     cpu(&rounded)
 }
 

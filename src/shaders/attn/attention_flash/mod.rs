@@ -86,7 +86,7 @@ pub fn cpu_flash_blocked(
             }
             let o_off = (tok * n_q_heads + qh) * hd;
             for (o, a) in out[o_off..o_off + hd].iter_mut().zip(acc.iter()) {
-                *o = bf16::store_bf16_round_half(a / l);
+                *o = bf16::arena_round_f32(a / l);
             }
         }
     }

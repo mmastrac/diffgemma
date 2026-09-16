@@ -46,7 +46,7 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
         .iter()
         .map(|&v| {
             let x = (v / f16::SOFTCAP).clamp(-20.0, 20.0);
-            bf16::round_bf16_f32(x.tanh() * f16::SOFTCAP)
+            bf16::arena_round_f32(x.tanh() * f16::SOFTCAP)
         })
         .collect()
 }
