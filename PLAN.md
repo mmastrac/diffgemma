@@ -187,6 +187,38 @@ decisions"). Open, in order of what would change the product:
   against yes 0.68 ± 0.06, within 1.3 standard errors, same lean. The
   default is now the smallest 64-row multiple that holds the template
   (`active: 256` opts back), which halves the per-read cost.
+- First-read entropy predicts which slots move. Ten tickets, 30 slots,
+  16 reads each at the default width: 3 slots had agreement below 1
+  (outage urgent 0.62, outage tone 0.81, cancel-now tone 0.75). Their
+  first-read row entropy was 0.25, 0.36 and 0.63 nats; the 27 stable slots
+  were at or below 0.16, and 24 of them below 0.06. A threshold of 0.2
+  catches all three movers and flags no stable slot on this set; 0.1 flags
+  one. The first read's label probability also separates them here (0.92,
+  0.88, 0.68 against 0.96 and up), with a thinner margin. Each read's
+  entropy is now in `diagnostics.samples.tops`. The candidate: adaptive
+  sampling: a single read, then the remaining reads only when some slot's
+  entropy is above the threshold, which on this set stops 6 of 10
+  tickets at one read. Three movers is thin evidence, and the threshold
+  was fit on the same slots.
+- Held-out validation of that rule, threshold fixed at 0.1 before the
+  run. A separate agent wrote 20 tickets, choosing each one's intended
+  labels first and marking which were borderline (8 clear, 8 with one
+  borderline label, 4 with two or three); the text was never read by the
+  person running the evaluation. 16 reads per ticket, 60 slots: 5 moved
+  across noise draws, the rule caught all 5 and flagged 0 of the 55 stable
+  slots, and 15 of 20 tickets would have stopped at one read. A 0.2
+  threshold would have missed one mover (first-read entropy 0.15), so 0.1
+  stays. First-read entropy also tracked the author's borderline flags
+  (median 0.028 against 0.002 nats), and the 16-read labels matched the
+  author's intent on 53 of 60 slots, 11 of 17 borderline. `samples:
+  "auto"` with `auto_threshold` and `auto_max` is the default. A count
+  fixes the reads.
+- Pinning settled slots. `fix_definite` fills the first-read-settled
+  slots with their label for the later reads. On the 5 held-out movers it
+  changed no label, moved agreement by +0.25, −0.06, 0, +0.06, +0.12, and
+  shifted means by up to 0.18. It estimates a different quantity (the
+  slot conditional on the settled answers rather than the marginal over their
+  noise) for no fewer reads, so it stays opt-in.
 - Standing of the probabilities. A read is the denoiser's posterior over
   the slot's clean token given one noised canvas, a cross-entropy-trained
   conditional, restricted to labels that hold 0.99+ of the row's mass. It
