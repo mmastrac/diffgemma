@@ -138,39 +138,37 @@ For something permanent, drop that same `"provider"` block into `opencode.json`
 (project) or `~/.config/opencode/opencode.json` (global) and run
 `opencode -m diffgemma/diffgemma-26b-a4b-it-q4`.
 
-### Structured decisions (no text generation)
+### Structured decisions
 
-A request whose **system message is a JSON question schema** is answered by
-one scored denoise forward instead of a generation: the answer template is
-seeded into the canvas, each label slot is left as noise, and the model's
-distribution over the labels is read off the logits at that slot. Every
-question is scored in the same forward, so a request with ten questions
-costs the same as one. The reply is always JSON. The **user message must
-be JSON** (the state to judge), and a request is exactly those two messages:
-the reply is read off the logits. It never enters the KV, so there is
-nothing to carry into a next turn. Repeat the schema with a new state, and
-the schema prefix is reused from the KV with only the state prefilled.
+A system message that is a JSON question schema turns a chat request into
+one scored forward. No text is generated: the answer template is seeded
+into the canvas and each question's distribution is read from the logits
+at its label slot. All questions in a request share the forward.
+
+Request: exactly two messages. `system` is the schema, `user` is the state
+as JSON.
 
 ```bash
 curl -s 127.0.0.1:8080/v1/chat/completions -d '{
   "messages": [
     {"role": "system", "content": "{\"questions\": [
-       {\"id\": \"urgent\", \"type\": \"noul\", \"instructions\": \"Does this need a reply today?\"},
+       {\"id\": \"urgent\", \"type\": \"noul\", \"instructions\": \"Does this ticket need a reply today?\"},
        {\"id\": \"bucket\", \"type\": \"choice\", \"instructions\": \"Which team owns it?\",
         \"options\": [{\"name\": \"billing\"}, {\"name\": \"support\"}, {\"name\": \"engineering\", \"description\": \"a defect or outage\"}]},
        {\"id\": \"tone\", \"type\": \"score\", \"instructions\": \"How angry is the customer?\",
         \"levels\": [\"calm\", \"annoyed\", \"furious\"]}]}"},
-    {"role": "user", "content": "{\"ticket\": \"Since this morning the dashboard shows a blank page after login. Console says 500 from /api/session. Several people on my team see the same thing.\"}"}
+    {"role": "user", "content": "{\"ticket\": \"Since this morning the dashboard shows a blank page after login. Console says 500 from /api/session.\"}"}
   ]
 }'
 ```
 
-Question types, after Jev: `noul` (a proposition, answered `yes`/`no` and
-reported as the probability of `yes`), `choice` (one of the named `options`,
-labelled `A`, `B`, …), and `score` (one of the ordered `levels`, labelled
-`1`, `2`, …, reported as the top level plus the expected level). The
-`content` of the reply is a JSON object. This is the q4 pack's answer to the
-request above on an M3 Pro, with the schema prefix already resident:
+Question types: `noul` (yes/no, reported as the probability of yes),
+`choice` (one of `options`), `score` (one of the ordered `levels`, plus
+the expected level). Labels are single tokens (`yes`/`no`, `A`/`B`/…,
+`1`/`2`/…); a schema whose labels do not tokenize to one token each is
+refused.
+
+Reply: `content` is JSON.
 
 ```json
 {"answers": {
@@ -180,38 +178,39 @@ request above on an M3 Pro, with the schema prefix already resident:
               "probabilities": {"billing": 0.0, "support": 0.0, "engineering": 1.0}},
    "tone":   {"type": "score", "score": 1.68, "level": "annoyed", "label": "2", "confidence": 0.68,
               "probabilities": {"calm": 0.32, "annoyed": 0.68, "furious": 0.0}}},
- "diagnostics": {"steps": 1, "hole": "noise",
-                 "timing": {"prefill_ms": 668, "denoise_ms": 1161, "steps_run": 1,
-                            "prompt_tokens": 191, "reused_tokens": 140},
-                 "questions": {"tone": {"argmax_token": "2", "argmax_is_label": true,
-                                        "entropy": 0.6, "label_mass": 1.0}}}}
+ "diagnostics": {"steps": 1, "hole": "noise", "samples": {"n": 1, "tops": [...]},
+                 "timing": {"prefill_ms": 668, "denoise_ms": 1161, "reused_tokens": 140, ...},
+                 "questions": {"tone": {"argmax_is_label": true, "entropy": 0.6, "label_mass": 1.0, ...}}}}
 ```
 
-`probabilities` is a softmax over the label logits at temperature 1, and
-`confidence` is the top label's probability. These are the model's raw
-marginals. Nothing calibrates them, and a borderline question can flip with
-the canvas width or the hole filler. `label_mass` (the share of the row's
-full-vocabulary mass the labels hold) and `argmax_is_label` say whether the
-model read the slot as an answer at all.
+`probabilities` is a softmax over the label logits at temperature 1.
+`confidence` is the top probability. With `samples` > 1, `agreement` is
+the share of reads that picked the reported label. These are the model's
+raw marginals. Nothing calibrates them.
 
-The hole noise itself moves a borderline answer: the same outage ticket
-read at eight seeds split 6 to 2 on "urgent", each read at 0.8 or better.
-`samples: N` averages N reads with different noise and adds an `agreement`
-field (the share of reads that picked the reported label), which is the
-honest confidence for a request that can afford N forwards. Optional schema
-fields: `instructions` (global context), `samples` (reads to average,
-default 1), `steps` (forwards per read, default 1), `hole` (`noise`
-default, `pad`, or `label`), `active` (canvas width to run, rounded up to
-64), `climb` (hill-climb rounds, default 0) with `climb_mode` (`joint`
-default, or `loo`). A joint climb writes every slot's top label back into
-the canvas and re-reads from step 0. It converges in one round and only
-ratifies the first read. It is a diagnostic rather than a lever.
+Optional schema fields: `instructions` (context), `samples` (reads with
+different hole noise, averaged; default 1), `steps` (forwards per read;
+default 1), `active` (canvas rows, multiple of 64; default 256), `hole`
+(`noise` default, `pad`, `label`), `climb` and `climb_mode` (diagnostic
+hill climb; ratifies the first read).
 
-A schema's first request pays the f32 engine prefill once (about 10 s for
-a 190-token prompt); every later state on it prefills only the state
-(0.65 s for 50 tokens). `DGQ_FAST_PREFILL=1` runs the cold schema through
-the quantized prefill instead (3 s), but a schema prefix prefilled that way
-changed the borderline outage answers above, so it is not the default.
+Performance on an M3 Pro with the q4 pack, a 3-question schema, a ~190-token prompt, one
+server process:
+
+| Case | Wall |
+| :-- | --: |
+| First request on a schema (f32 engine prefill of the schema, once) | 8.1 s |
+| Next state on that schema, 256 rows | 1.9 s (0.7 prefill + 1.2 forward) |
+| Next state, `active: 64` | 1.3 s |
+| 8 averaged reads, `active: 64` | 5.3 s |
+| Generating the same three answers as JSON (19 tokens, 3 to 5 steps) | 9.6 to 13.1 s |
+
+The schema prefix stays in the KV. Each later request prefills only its
+state. `DGQ_FAST_PREFILL=1` cuts the first request to 3 s but changed a
+borderline answer in our runs, so it is off. A borderline question's
+answer moves with the hole noise, the canvas width and the prefill
+precision (PLAN.md has the measurements); use `samples` and read
+`agreement`. Unambiguous questions were unanimous under every setting.
 
 ## Custom Quantization
 

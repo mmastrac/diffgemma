@@ -172,9 +172,11 @@ decisions"). Open, in order of what would change the product:
   4.7 s. Both paths pay the same engine prefill for the state, but the
   plain chat path folds the system prompt into the user turn and reused
   none of it (6 s), while the structured path reuses the schema prefix
-  (1.3 s, now 0.65 s with the narrow tail chunk). Wall: 1.2 to 2.0 s
-  against 12 to 14 s. A generation baseline at a narrow canvas would be
-  the fairer step-cost comparison and does not exist as a product path.
+  (1.3 s, now 0.67 s with the narrow tail chunk). Final run, one process:
+  structured 1.9 s at 256 rows, 1.3 s at 64, 5.3 s for 8 averaged reads;
+  generated JSON 9.6 to 13.1 s (3.9 to 6.7 s of denoise). A generation
+  baseline at a narrow canvas would be the fairer step-cost comparison and
+  does not exist as a product path.
 - Multi-token answers (extraction fields) need the `Refine
   {mask|forced_ids}` primitive: pin the skeleton, denoise the hole, which the
   rewound-canvas fixed point puts at 2 to 3 steps.
