@@ -355,7 +355,7 @@ pub fn cpu(f: &StackedFixture) -> Vec<f32> {
         for row in 0..f.m {
             for col in 0..s.n {
                 let dst = base_half + row * s.y_row_cols + s.y_col0 + col;
-                y[dst] = bf16::store_bf16_round_half(seg_out[row * s.n + col]);
+                y[dst] = bf16::arena_round_f32(seg_out[row * s.n + col]);
             }
         }
         w_off += q4_matrix_bytes(s.n, f.k);

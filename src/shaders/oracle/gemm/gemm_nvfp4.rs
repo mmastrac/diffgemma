@@ -39,9 +39,7 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
     let body = &w[NVFP4_HEADER_BYTES..];
     let mut out = vec![0.0f32; f.out_len()];
     nvfp4_gemm_cpu(&f.x, f.m, f.k, body, f.n, gscale, &mut out);
-    out.iter()
-        .map(|&v| bf16::store_bf16_round_half(v))
-        .collect()
+    out.iter().map(|&v| bf16::arena_round_f32(v)).collect()
 }
 
 pub fn cpu_oracle(f: &Fixture) -> Vec<f32> {

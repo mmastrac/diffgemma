@@ -54,7 +54,7 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
     let s = f.scale.unwrap_or(1.0);
     f.a.iter()
         .zip(f.b.iter())
-        .map(|(&a, &b)| bf16::store_bf16_round_half((a + b) * s))
+        .map(|(&a, &b)| bf16::arena_round_f32((a + b) * s))
         .collect()
 }
 

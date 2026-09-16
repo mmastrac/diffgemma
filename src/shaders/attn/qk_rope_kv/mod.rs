@@ -258,7 +258,7 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
         f.kv_len,
     );
     for v in q.iter_mut().chain(k.iter_mut()) {
-        *v = bf16::store_bf16_round_half(*v);
+        *v = bf16::arena_round_f32(*v);
     }
     // KV cache stores f16 (attention_device.metal kv_store).
     for v in kvcache.iter_mut() {

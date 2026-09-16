@@ -149,7 +149,7 @@ pub fn pack_route_rows(rows: &[RouteRow]) -> Vec<f32> {
             out.push(e as f32);
         }
         for &w in &row.weights {
-            out.push(bf16::store_bf16_round_half(w));
+            out.push(bf16::arena_round_f32(w));
         }
     }
     out

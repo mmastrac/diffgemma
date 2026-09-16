@@ -100,7 +100,7 @@ pub fn embed_gather_cpu(
         dequant_row_q8(&embed_q8[row_off..row_off + row_bytes], hidden, &mut raw);
         let dst = tok * hidden;
         for d in 0..hidden {
-            out[dst + d] = bf16::store_bf16_round_half(raw[d] * embed_scale);
+            out[dst + d] = bf16::arena_round_f32(raw[d] * embed_scale);
         }
     }
 }

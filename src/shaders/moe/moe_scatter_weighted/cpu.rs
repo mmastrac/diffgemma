@@ -13,7 +13,8 @@ pub fn moe_scatter_weighted(expert_out: &[f32], route: &RouteScratch, hidden: us
         let src = slot * hidden;
         let dst = tok * hidden;
         for d in 0..hidden {
-            moe_out[dst + d] += bf16::round_bf16_f32(w * bf16::round_bf16_f32(expert_out[src + d]));
+            moe_out[dst + d] +=
+                bf16::arena_round_f32(w * bf16::arena_round_f32(expert_out[src + d]));
         }
     }
     moe_out

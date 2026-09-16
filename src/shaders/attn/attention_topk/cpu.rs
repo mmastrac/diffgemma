@@ -112,7 +112,7 @@ fn topk_attn(f: &Fixture, round_kv_f16: bool, k: usize, causal: bool) -> Vec<f32
             // Step 5: bf16-round at store (matches cpu_causal output rounding).
             let o_off = (tok * n_q_heads + qh) * hd;
             for (o, a) in out[o_off..o_off + hd].iter_mut().zip(acc.iter()) {
-                *o = bf16::store_bf16_round_half(*a);
+                *o = bf16::arena_round_f32(*a);
             }
         }
     }
@@ -223,7 +223,7 @@ mod tests {
                             (scores[t] - mmax).exp() / l * f.kvcache[v_off + d]
                         })
                         .sum();
-                    let expected = crate::shaders::bf16::store_bf16_round_half(o);
+                    let expected = crate::shaders::bf16::arena_round_f32(o);
                     max_diff =
                         max_diff.max((topk[(tok * f.n_q_heads + qh) * hd + d] - expected).abs());
                 }
@@ -289,8 +289,7 @@ mod tests {
                 let v_off = best_t * nkv * hd * 2 + nkv * hd + kvh * hd;
                 let o_off = (tok * f.n_q_heads + qh) * hd;
                 for d in 0..hd {
-                    let expected =
-                        crate::shaders::bf16::store_bf16_round_half(f.kvcache[v_off + d]);
+                    let expected = crate::shaders::bf16::arena_round_f32(f.kvcache[v_off + d]);
                     assert!(
                         (topk[o_off + d] - expected).abs() < 1e-5,
                         "topk_k1 mismatch at tok={tok} qh={qh} d={d}: got {} expected {expected}",

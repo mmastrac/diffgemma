@@ -28,8 +28,8 @@ pub fn tile_fixture(_: ElemFormat) -> Fixture {
 /// `y[m,n] = sum_k bf16(x) * bf16(w)`, f32 accumulate, bf16-rounded result —
 /// mirrors the kernel (bf16 inputs into half tiles, float8x8 accumulate).
 pub fn cpu(f: &Fixture) -> Vec<f32> {
-    let xb: Vec<f32> = f.x.iter().map(|&v| bf16::round_bf16_f32(v)).collect();
-    let wb: Vec<f32> = f.w_f32.iter().map(|&v| bf16::round_bf16_f32(v)).collect();
+    let xb: Vec<f32> = f.x.iter().map(|&v| bf16::load_bf16_f32(v)).collect();
+    let wb: Vec<f32> = f.w_f32.iter().map(|&v| bf16::load_bf16_f32(v)).collect();
     let mut out = vec![0.0f32; f.out_len()];
     for mi in 0..f.m {
         for ni in 0..f.n {
@@ -37,7 +37,7 @@ pub fn cpu(f: &Fixture) -> Vec<f32> {
             for ki in 0..f.k {
                 acc += xb[mi * f.k + ki] * wb[ni * f.k + ki];
             }
-            out[mi * f.n + ni] = bf16::store_bf16_round_half(acc);
+            out[mi * f.n + ni] = bf16::arena_round_f32(acc);
         }
     }
     out

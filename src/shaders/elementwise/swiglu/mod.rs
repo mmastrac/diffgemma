@@ -95,7 +95,7 @@ pub fn cpu_half_glu(f: &HalfFixture) -> Vec<f32> {
     f.gate
         .iter()
         .zip(f.up.iter())
-        .map(|(&g, &u)| bf16::store_bf16_round_half(gelu_pytorch_tanh_f32(g) * u))
+        .map(|(&g, &u)| bf16::arena_round_f32(gelu_pytorch_tanh_f32(g) * u))
         .collect()
 }
 
@@ -104,7 +104,7 @@ pub fn cpu_oracle_half_glu(f: &HalfFixture) -> Vec<f32> {
     gelu_pytorch_tanh(&mut gate);
     gate.iter()
         .zip(f.up.iter())
-        .map(|(&g, &u)| bf16::store_bf16_round_half(g * u))
+        .map(|(&g, &u)| bf16::arena_round_f32(g * u))
         .collect()
 }
 
@@ -150,7 +150,7 @@ pub fn cpu_interleaved(f: &InterleavedFixture) -> Vec<f32> {
             let off = b * (2 * mi) + j;
             let g = gelu_pytorch_tanh_f32(f.gate_up[off]);
             let u = f.gate_up[off + mi];
-            out[b * mi + j] = bf16::round_bf16_f32(g * u);
+            out[b * mi + j] = bf16::arena_round_f32(g * u);
         }
     }
     out
@@ -166,7 +166,7 @@ pub fn cpu_oracle_interleaved(f: &InterleavedFixture) -> Vec<f32> {
             gelu_pytorch_tanh(&mut g);
             g.into_iter()
                 .zip(row[mi..].iter())
-                .map(|(gv, &u)| bf16::round_bf16_f32(gv * u))
+                .map(|(gv, &u)| bf16::arena_round_f32(gv * u))
                 .collect::<Vec<_>>()
         })
         .collect();
