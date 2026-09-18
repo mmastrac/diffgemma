@@ -1391,18 +1391,33 @@ fn mtp_gpu_parity_debug() {
             let ms = gpu.debug_time_chains(n).unwrap();
             eprintln!("chain x{n}: {ms:.2}ms total, {:.2}ms/chain", ms / n as f64);
         }
-        for op in ["lm", "gate", "down", "qproj", "preproj", "postproj", "attend"] {
+        for op in [
+            "lm", "gate", "down", "qproj", "preproj", "postproj", "attend",
+        ] {
             let ms = gpu.debug_time_op(op, 20).unwrap();
             eprintln!("op {op}: {:.3}ms each", ms / 20.0);
         }
     }
     let ans_start = meta["ans_start"].as_u64().unwrap() as usize;
     for p in [ans_start - 1, ans_start + 20, ans_start + 50] {
-        let c = draft_tokens(&cpu, &kv, p, &h29[p * 2816..(p + 1) * 2816], seq[p], 5, &mut |t| row(t));
+        let c = draft_tokens(
+            &cpu,
+            &kv,
+            p,
+            &h29[p * 2816..(p + 1) * 2816],
+            seq[p],
+            5,
+            &mut |t| row(t),
+        );
         let g = gpu
-            .draft_tokens(p, &h29[p * 2816..(p + 1) * 2816], seq[p], 5, None, &mut |t| {
-                row(t)
-            })
+            .draft_tokens(
+                p,
+                &h29[p * 2816..(p + 1) * 2816],
+                seq[p],
+                5,
+                None,
+                &mut |t| row(t),
+            )
             .unwrap();
         eprintln!("pos {p}: cpu={c:?}\n         gpu={g:?}  match={}", c == g);
     }
@@ -1464,7 +1479,12 @@ fn mtp_head_to_head() {
     let snippet = |ids: &[u32]| -> String {
         let end = ids.iter().position(|&t| t == eos).unwrap_or(ids.len());
         let text = tokenizer.decode(&ids[..end]);
-        text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(160).collect()
+        text.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(160)
+            .collect()
     };
 
     for (pi, prompt) in prompts.iter().enumerate() {
@@ -1498,7 +1518,10 @@ fn mtp_head_to_head() {
         // Trim on the head's own confidence: cut at the first drafted token
         // whose softmax probability drops below the threshold.
         let conf_tau = 0.15f32;
-        let cut = confs.iter().position(|&c| c < conf_tau).unwrap_or(draft.len());
+        let cut = confs
+            .iter()
+            .position(|&c| c < conf_tau)
+            .unwrap_or(draft.len());
         let profile: Vec<String> = confs.iter().take(40).map(|c| format!("{c:.2}")).collect();
         eprintln!("  conf: [{}]", profile.join(" "));
         // Fallback policy: a draft this short means the head was not
@@ -1523,22 +1546,28 @@ fn mtp_head_to_head() {
         // Baseline: from noise.
         cfg.initial_canvas_ids = None;
         let t0 = Instant::now();
-        let BlockOutcome::Proposal(pb) = propose_block(&mut session, &cfg, &mut ts).unwrap()
-        else {
+        let BlockOutcome::Proposal(pb) = propose_block(&mut session, &cfg, &mut ts).unwrap() else {
             continue;
         };
         let base_ms = t0.elapsed().as_secs_f64() * 1e3;
-        let base_kept = pb.token_ids.iter().position(|&t| t == eos).unwrap_or(pb.token_ids.len());
+        let base_kept = pb
+            .token_ids
+            .iter()
+            .position(|&t| t == eos)
+            .unwrap_or(pb.token_ids.len());
 
         // Drafted: seeded canvas (or the fallback path from noise).
         cfg.initial_canvas_ids = if fallback { None } else { Some(canvas) };
         let t0 = Instant::now();
-        let BlockOutcome::Proposal(ps) = propose_block(&mut session, &cfg, &mut ts).unwrap()
-        else {
+        let BlockOutcome::Proposal(ps) = propose_block(&mut session, &cfg, &mut ts).unwrap() else {
             continue;
         };
         let seed_ms = t0.elapsed().as_secs_f64() * 1e3;
-        let seed_kept = ps.token_ids.iter().position(|&t| t == eos).unwrap_or(ps.token_ids.len());
+        let seed_kept = ps
+            .token_ids
+            .iter()
+            .position(|&t| t == eos)
+            .unwrap_or(ps.token_ids.len());
         let seed_total_ms = draft_ms + seed_ms;
 
         eprintln!("\n=== {prompt:.60}");
@@ -1711,7 +1740,10 @@ fn mtp_step1_seed_probe() {
         .unwrap()
         .filter_map(|e| {
             let name = e.ok()?.file_name().into_string().ok()?;
-            name.strip_prefix("blk")?.strip_suffix("_pred.bin")?.parse().ok()
+            name.strip_prefix("blk")?
+                .strip_suffix("_pred.bin")?
+                .parse()
+                .ok()
         })
         .collect();
     block_ids.sort();
@@ -1751,8 +1783,8 @@ fn mtp_step1_seed_probe() {
         let pred = read_u32(&format!("{pred_dir}/blk{si}_pred.bin"));
 
         let run_arm = |session: &mut StepGenerateSession,
-                           cfg: &mut StepGenerateConfig,
-                           seed_ids: Option<&[u32]>|
+                       cfg: &mut StepGenerateConfig,
+                       seed_ids: Option<&[u32]>|
          -> (usize, f32) {
             cfg.seed = 7 + si as u64;
             cfg.initial_canvas_ids = seed_ids.map(|s| s.to_vec());

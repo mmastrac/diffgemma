@@ -537,9 +537,10 @@ impl StepGenerateSession {
                                     .chunks_exact(2)
                                     .enumerate()
                                 {
-                                    dst[j] = crate::shaders::f16::f16_bits_to_f32(
-                                        u16::from_le_bytes([c[0], c[1]]),
-                                    );
+                                    dst[j] =
+                                        crate::shaders::f16::f16_bits_to_f32(u16::from_le_bytes([
+                                            c[0], c[1],
+                                        ]));
                                 }
                             };
                             row(hh, &mut k[hh * s * hd + pos * hd..][..hd]);

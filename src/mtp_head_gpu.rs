@@ -98,7 +98,11 @@ pub struct MtpHeadGpu {
 
 fn write_bytes(buf: &Buf, bytes: &[u8]) {
     unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.contents().as_ptr() as *mut u8, bytes.len());
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            buf.contents().as_ptr() as *mut u8,
+            bytes.len(),
+        );
     }
 }
 
@@ -191,9 +195,24 @@ impl MtpHeadGpu {
                     scalar_bytes[0],
                     scalar_bytes[1],
                 ])),
-                q_proj: upload_bf16(&mut pool, &ctx, &st, &format!("{p}.self_attn.q_proj.weight"))?,
-                q_norm: upload_f32(&mut pool, &ctx, &st, &format!("{p}.self_attn.q_norm.weight"))?,
-                o_proj: upload_bf16(&mut pool, &ctx, &st, &format!("{p}.self_attn.o_proj.weight"))?,
+                q_proj: upload_bf16(
+                    &mut pool,
+                    &ctx,
+                    &st,
+                    &format!("{p}.self_attn.q_proj.weight"),
+                )?,
+                q_norm: upload_f32(
+                    &mut pool,
+                    &ctx,
+                    &st,
+                    &format!("{p}.self_attn.q_norm.weight"),
+                )?,
+                o_proj: upload_bf16(
+                    &mut pool,
+                    &ctx,
+                    &st,
+                    &format!("{p}.self_attn.o_proj.weight"),
+                )?,
                 gate: upload_bf16(&mut pool, &ctx, &st, &format!("{p}.mlp.gate_proj.weight"))?,
                 up: upload_bf16(&mut pool, &ctx, &st, &format!("{p}.mlp.up_proj.weight"))?,
                 down: upload_bf16(&mut pool, &ctx, &st, &format!("{p}.mlp.down_proj.weight"))?,
@@ -277,7 +296,15 @@ impl MtpHeadGpu {
         stop_tok: Option<u32>,
         embed_fn: &mut dyn FnMut(u32) -> Option<Vec<f32>>,
     ) -> Result<Vec<u32>, Error> {
-        self.draft_tokens_conf(pos, init_hidden, init_tok, k_draft, stop_tok, embed_fn, None)
+        self.draft_tokens_conf(
+            pos,
+            init_hidden,
+            init_tok,
+            k_draft,
+            stop_tok,
+            embed_fn,
+            None,
+        )
     }
 
     /// As `draft_tokens`, optionally recording each drafted token's softmax
@@ -402,9 +429,13 @@ impl MtpHeadGpu {
                 "down" => matvec(&l3.down, &s.g, &s.m, HEAD_HID, FFW),
                 "qproj" => matvec(&l3.q_proj, &s.hn, &s.q, N_Q_HEADS * 512, HEAD_HID),
                 "preproj" => matvec(&self.pre_projection, &s.x, &s.h, HEAD_HID, 2 * BACKBONE_HID),
-                "postproj" => {
-                    matvec(&self.post_projection, &s.hn, &s.hidden_next, BACKBONE_HID, HEAD_HID)
-                }
+                "postproj" => matvec(
+                    &self.post_projection,
+                    &s.hn,
+                    &s.hidden_next,
+                    BACKBONE_HID,
+                    HEAD_HID,
+                ),
                 "attend" => {
                     enc.setComputePipelineState(&self.p_attend.pipeline);
                     unsafe {
@@ -547,66 +578,72 @@ impl MtpHeadGpu {
 
         let s = &self.scratch;
         for _ in 0..n {
-        matvec(&self.pre_projection, &s.x, &s.h, HEAD_HID, 2 * BACKBONE_HID);
-        for l in &self.layers {
-            let hd = l.head_dim;
-            rmsnorm(&s.h, &l.input_ln, &s.hn, 1, HEAD_HID);
-            matvec(&l.q_proj, &s.hn, &s.q, N_Q_HEADS * hd, HEAD_HID);
-            rmsnorm(&s.q, &l.q_norm, &s.q, N_Q_HEADS, hd);
-            let (rot, theta) = if l.is_full {
-                (hd / 4, 1e6f32)
-            } else {
-                (hd, 1e4f32)
-            };
-            bind(&[&s.q]);
-            set_bytes(&enc, &[N_Q_HEADS as u32, hd as u32, rot as u32, pos], 1);
-            set_bytes(&enc, &theta, 2);
-            dispatch(&self.p_rope, N_Q_HEADS * rot / 2);
-            let (k, v, n_kv) = if l.is_full {
-                (&kv.k_full, &kv.v_full, 2u32)
-            } else {
-                (&kv.k_swa, &kv.v_swa, 8u32)
-            };
-            bind(&[&s.q, k, v, &s.attn]);
-            set_bytes(
-                &enc,
-                &AttnDims {
-                    n_q: N_Q_HEADS as u32,
-                    n_kv,
-                    hd: hd as u32,
-                    seq: kv.seq as u32,
-                    kv_len,
-                },
-                4,
+            matvec(&self.pre_projection, &s.x, &s.h, HEAD_HID, 2 * BACKBONE_HID);
+            for l in &self.layers {
+                let hd = l.head_dim;
+                rmsnorm(&s.h, &l.input_ln, &s.hn, 1, HEAD_HID);
+                matvec(&l.q_proj, &s.hn, &s.q, N_Q_HEADS * hd, HEAD_HID);
+                rmsnorm(&s.q, &l.q_norm, &s.q, N_Q_HEADS, hd);
+                let (rot, theta) = if l.is_full {
+                    (hd / 4, 1e6f32)
+                } else {
+                    (hd, 1e4f32)
+                };
+                bind(&[&s.q]);
+                set_bytes(&enc, &[N_Q_HEADS as u32, hd as u32, rot as u32, pos], 1);
+                set_bytes(&enc, &theta, 2);
+                dispatch(&self.p_rope, N_Q_HEADS * rot / 2);
+                let (k, v, n_kv) = if l.is_full {
+                    (&kv.k_full, &kv.v_full, 2u32)
+                } else {
+                    (&kv.k_swa, &kv.v_swa, 8u32)
+                };
+                bind(&[&s.q, k, v, &s.attn]);
+                set_bytes(
+                    &enc,
+                    &AttnDims {
+                        n_q: N_Q_HEADS as u32,
+                        n_kv,
+                        hd: hd as u32,
+                        seq: kv.seq as u32,
+                        kv_len,
+                    },
+                    4,
+                );
+                enc.setComputePipelineState(&self.p_attend.pipeline);
+                let grid = MTLSize {
+                    width: N_Q_HEADS.div_ceil(8),
+                    height: 1,
+                    depth: 1,
+                };
+                let tgs = MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                };
+                enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tgs);
+                matvec(&l.o_proj, &s.attn, &s.a, HEAD_HID, N_Q_HEADS * hd);
+                rmsnorm(&s.a, &l.post_attn_ln, &s.an, 1, HEAD_HID);
+                add_scale(&s.h, &s.an, HEAD_HID, 1.0);
+                rmsnorm(&s.h, &l.pre_ffw_ln, &s.hn, 1, HEAD_HID);
+                matvec(&l.gate, &s.hn, &s.g, FFW, HEAD_HID);
+                matvec(&l.up, &s.hn, &s.u, FFW, HEAD_HID);
+                bind(&[&s.g, &s.u]);
+                set_bytes(&enc, &(FFW as u32), 2);
+                dispatch(&self.p_gelu_mul, FFW);
+                matvec(&l.down, &s.g, &s.m, HEAD_HID, FFW);
+                rmsnorm(&s.m, &l.post_ffw_ln, &s.an, 1, HEAD_HID);
+                add_scale(&s.h, &s.an, HEAD_HID, l.layer_scalar);
+            }
+            rmsnorm(&s.h, &self.final_norm, &s.hn, 1, HEAD_HID);
+            matvec(&self.embed, &s.hn, &s.logits, VOCAB, HEAD_HID);
+            matvec(
+                &self.post_projection,
+                &s.hn,
+                &s.hidden_next,
+                BACKBONE_HID,
+                HEAD_HID,
             );
-            enc.setComputePipelineState(&self.p_attend.pipeline);
-            let grid = MTLSize {
-                width: N_Q_HEADS.div_ceil(8),
-                height: 1,
-                depth: 1,
-            };
-            let tgs = MTLSize {
-                width: 256,
-                height: 1,
-                depth: 1,
-            };
-            enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tgs);
-            matvec(&l.o_proj, &s.attn, &s.a, HEAD_HID, N_Q_HEADS * hd);
-            rmsnorm(&s.a, &l.post_attn_ln, &s.an, 1, HEAD_HID);
-            add_scale(&s.h, &s.an, HEAD_HID, 1.0);
-            rmsnorm(&s.h, &l.pre_ffw_ln, &s.hn, 1, HEAD_HID);
-            matvec(&l.gate, &s.hn, &s.g, FFW, HEAD_HID);
-            matvec(&l.up, &s.hn, &s.u, FFW, HEAD_HID);
-            bind(&[&s.g, &s.u]);
-            set_bytes(&enc, &(FFW as u32), 2);
-            dispatch(&self.p_gelu_mul, FFW);
-            matvec(&l.down, &s.g, &s.m, HEAD_HID, FFW);
-            rmsnorm(&s.m, &l.post_ffw_ln, &s.an, 1, HEAD_HID);
-            add_scale(&s.h, &s.an, HEAD_HID, l.layer_scalar);
-        }
-        rmsnorm(&s.h, &self.final_norm, &s.hn, 1, HEAD_HID);
-        matvec(&self.embed, &s.hn, &s.logits, VOCAB, HEAD_HID);
-        matvec(&self.post_projection, &s.hn, &s.hidden_next, BACKBONE_HID, HEAD_HID);
         }
 
         enc.endEncoding();

@@ -792,9 +792,10 @@ pub(crate) fn run_command(
         Command::Attention => run_attention_parity(m),
         Command::Chat { .. } => ExitCode::FAILURE,
         Command::Serve { .. } => ExitCode::FAILURE,
-        Command::Smoketest { .. } | Command::Census { .. } | Command::MtpDump { .. } | Command::FitTokenProbe { .. } => {
-            ExitCode::FAILURE
-        }
+        Command::Smoketest { .. }
+        | Command::Census { .. }
+        | Command::MtpDump { .. }
+        | Command::FitTokenProbe { .. } => ExitCode::FAILURE,
         Command::Golden { .. } => ExitCode::FAILURE,
         Command::Replay { .. } => ExitCode::FAILURE,
         Command::Manifest => {
