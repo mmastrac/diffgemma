@@ -44,12 +44,12 @@ impl Weights {
         let bytes = self.pack.bytes(name)?;
         let numel = e.numel();
         let mut out = vec![0.0f32; numel];
-        match e.kind.as_str() {
+        match e.meta.kind.as_str() {
             "raw" => {
-                if e.dtype != "BF16" {
+                if e.meta.dtype != "BF16" {
                     return Err(Error::Msg(format!(
                         "{name}: raw dtype {} unsupported",
-                        e.dtype
+                        e.meta.dtype
                     )));
                 }
                 for (i, o) in out.iter_mut().enumerate() {
@@ -58,7 +58,7 @@ impl Weights {
                 }
             }
             "q4_block" => {
-                let shape: Vec<usize> = e.shape.iter().map(|&d| d as usize).collect();
+                let shape: Vec<usize> = e.meta.shape.iter().map(|&d| d as usize).collect();
                 match shape.len() {
                     2 => dequant_matrix_q4(bytes, shape[0], shape[1], &mut out),
                     // Stacked experts: [n_experts, out, in], one q4 matrix each.
@@ -78,14 +78,14 @@ impl Weights {
                 }
             }
             "q8_row" => {
-                let shape: Vec<usize> = e.shape.iter().map(|&d| d as usize).collect();
+                let shape: Vec<usize> = e.meta.shape.iter().map(|&d| d as usize).collect();
                 if shape.len() != 2 {
                     return Err(Error::Msg(format!("{name}: q8 rank {}", shape.len())));
                 }
                 dequant_matrix_q8(bytes, shape[0], shape[1], &mut out);
             }
             "nvfp4_block" => {
-                let shape: Vec<usize> = e.shape.iter().map(|&d| d as usize).collect();
+                let shape: Vec<usize> = e.meta.shape.iter().map(|&d| d as usize).collect();
                 if shape.len() != 2 {
                     return Err(Error::Msg(format!("{name}: nvfp4 rank {}", shape.len())));
                 }
@@ -107,13 +107,13 @@ impl Weights {
     /// A single row of a 2-D tensor, without materializing the whole tensor.
     pub fn row_f32(&self, name: &str, row: usize) -> Result<Vec<f32>, Error> {
         let e = self.entry(name)?;
-        if e.shape.len() != 2 {
+        if e.meta.shape.len() != 2 {
             return Err(Error::Msg(format!("{name}: not a matrix")));
         }
-        let in_dim = e.shape[1] as usize;
+        let in_dim = e.meta.shape[1] as usize;
         let bytes = self.pack.bytes(name)?;
         let mut out = vec![0.0f32; in_dim];
-        match e.kind.as_str() {
+        match e.meta.kind.as_str() {
             "raw" => {
                 let off = row * in_dim * 2;
                 for (i, o) in out.iter_mut().enumerate() {

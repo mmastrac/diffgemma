@@ -29,8 +29,9 @@ pub enum Error {
     /// actionable message (e.g. the exact `hf download` command to run).
     Layered(String),
     /// `.dgq` pack integrity failure the manifest itself can prove: a blob
-    /// file shorter than the tensors it describes. Names the shortfall and
-    /// the command that re-fetches the pack.
+    /// file shorter than the tensors it describes, or one still carrying the
+    /// download sentinel. Names the shortfall and the command that re-fetches
+    /// the pack.
     Pack(String),
     /// User-facing CLI/config validation failure (`quantize --set class=format`):
     /// unknown class, locked class, unsupported class×format combo, or a
@@ -90,6 +91,18 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl From<dgqpack::Error> for Error {
+    fn from(e: dgqpack::Error) -> Self {
+        match e {
+            dgqpack::Error::Io(e) => Self::Io(e),
+            dgqpack::Error::Json(e) => Self::Json(e),
+            dgqpack::Error::Format(msg) => Self::Format(msg),
+            dgqpack::Error::Runtime(msg) => Self::Runtime(msg),
+            dgqpack::Error::Pack(msg) => Self::Pack(msg),
+        }
+    }
+}
 
 impl From<std::io::Error> for Error {
     fn from(value: std::io::Error) -> Self {

@@ -19,6 +19,7 @@
 //! a prior `huggingface-cli download`) is symlinked in instead of re-fetched.
 
 use super::*;
+use crate::dgq::layout::INCOMPLETE_SENTINEL;
 use shell_download::{Quiet, RequestBuilder, RequestHandle};
 use std::path::{Path, PathBuf};
 
@@ -299,17 +300,23 @@ fn download_file(
 ) -> Result<(), String> {
     if force {
         let _ = std::fs::remove_file(dest);
+        let _ = std::fs::remove_file(tmp_path(dest));
     }
 
     let n_chunks = size.div_ceil(CHUNK_SIZE).max(1);
     if n_chunks == 1 {
-        let resp = start_fetch(url, dest, None)?
+        // Fetch beside the destination and rename, so a killed transfer
+        // leaves no half file under the name the loader looks for.
+        let tmp = tmp_path(dest);
+        let resp = start_fetch(url, &tmp, None)?
             .join()
             .map_err(|e| format!("{e:?}"))?;
-        return match resp.status_code {
-            200 => Ok(()),
-            code => Err(format!("HTTP {code}")),
-        };
+        if resp.status_code != 200 {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("HTTP {}", resp.status_code));
+        }
+        return std::fs::rename(&tmp, dest)
+            .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), dest.display()));
     }
 
     // Chunk plan: [start, end] inclusive byte ranges.
@@ -388,37 +395,89 @@ fn part_path(dest: &Path, i: u64) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Concatenate `parts` (in order) into `dest`, deleting each part the moment
-/// it has been written. Parts are 256 MiB, so a plain buffered copy is fine.
+/// Assemble `parts` into `dest`, in order, so that `dest` never exists in a
+/// state a loader would accept.
 ///
-/// Deleting as we go is what keeps the pack downloadable. Holding every part
-/// until the end puts the parts and the assembled file on disk at once, so a
-/// 19 GiB pack needs 38 GiB free to land. Freeing each part once its bytes
-/// are flushed holds the high-water mark near the pack size instead. The
-/// cost: a failure part-way through assembly re-fetches the parts it has
-/// already consumed.
+/// Three things make that true. The bytes land in a `.tmp` sibling and only
+/// become `dest` on a successful rename, so an interrupted run leaves a file
+/// under a name nothing loads. The first chunk is written LAST, after every
+/// other byte is on disk and the assembled length checks out, and until then
+/// offset 0 holds `INCOMPLETE_SENTINEL`: a blob carrying it is unfinished
+/// whatever its length says, which is the one thing a length check cannot
+/// see. And each part is deleted the moment its bytes are flushed, because
+/// holding all of them to the end puts the parts and the assembled file on
+/// disk at once and a 19 GiB pack would need 38 GiB free to land.
 ///
-/// A failed assembly deletes the partial `dest` too, because leaving it is
-/// worse than leaving nothing. It is a plausible-looking `model.dgq.bin`
-/// that loads and produces zero weights.
+/// The cost of freeing as we go: a failure part-way through re-fetches the
+/// parts it already consumed.
 fn concat_parts(dest: &Path, parts: &[(PathBuf, u64)]) -> Result<(), String> {
-    match concat_parts_inner(dest, parts) {
+    let tmp = tmp_path(dest);
+    match concat_parts_inner(dest, &tmp, parts) {
         Ok(()) => Ok(()),
         Err(e) => {
-            let _ = std::fs::remove_file(dest);
+            let _ = std::fs::remove_file(&tmp);
             Err(e)
         }
     }
 }
 
-fn concat_parts_inner(dest: &Path, parts: &[(PathBuf, u64)]) -> Result<(), String> {
-    use std::io::{BufWriter, Write};
+fn concat_parts_inner(dest: &Path, tmp: &Path, parts: &[(PathBuf, u64)]) -> Result<(), String> {
+    use std::io::{Seek, SeekFrom, Write};
     eprintln!(
         "       assembling {} chunks -> {}",
         parts.len(),
         dest.display()
     );
-    let out = std::fs::File::create(dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
+    let Some(((_, head_len), tail_parts)) = parts.split_first() else {
+        return Err("no chunks to assemble".to_string());
+    };
+
+    let mut out =
+        std::fs::File::create(tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
+    // Only when the head is long enough to hold it: a shorter one would leave
+    // the sentinel's tail sticking out past the bytes the head will overwrite.
+    if *head_len >= INCOMPLETE_SENTINEL.len() as u64 {
+        out.write_all(INCOMPLETE_SENTINEL)
+            .map_err(|e| format!("write sentinel to {}: {e}", tmp.display()))?;
+    }
+
+    // The head's bytes arrive last, so skip its span and start with chunk 1.
+    out.seek(SeekFrom::Start(*head_len))
+        .map_err(|e| format!("seek {}: {e}", tmp.display()))?;
+    copy_parts_into(&mut out, tail_parts, tmp)?;
+
+    let want: u64 = parts.iter().map(|(_, len)| len).sum();
+    let got = out
+        .metadata()
+        .map_err(|e| format!("stat {}: {e}", tmp.display()))?
+        .len();
+    if got != want {
+        return Err(format!(
+            "assembled {} bytes from chunks 1..{}, expected {want}",
+            got,
+            parts.len()
+        ));
+    }
+
+    out.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("seek {}: {e}", tmp.display()))?;
+    copy_parts_into(&mut out, &parts[..1], tmp)?;
+    out.sync_all()
+        .map_err(|e| format!("sync {}: {e}", tmp.display()))?;
+    drop(out);
+
+    std::fs::rename(tmp, dest)
+        .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), dest.display()))
+}
+
+/// Copy each part into `out` at the current position and delete it once its
+/// bytes are flushed.
+fn copy_parts_into(
+    out: &mut std::fs::File,
+    parts: &[(PathBuf, u64)],
+    tmp: &Path,
+) -> Result<(), String> {
+    use std::io::{BufWriter, Write};
     let mut writer = BufWriter::with_capacity(8 << 20, out);
     for (part, _) in parts {
         let mut r =
@@ -426,10 +485,17 @@ fn concat_parts_inner(dest: &Path, parts: &[(PathBuf, u64)]) -> Result<(), Strin
         std::io::copy(&mut r, &mut writer).map_err(|e| format!("copy {}: {e}", part.display()))?;
         writer
             .flush()
-            .map_err(|e| format!("flush {}: {e}", part.display()))?;
+            .map_err(|e| format!("flush {}: {e}", tmp.display()))?;
         let _ = std::fs::remove_file(part);
     }
     Ok(())
+}
+
+/// The sibling a transfer writes into before it earns `dest`'s name.
+fn tmp_path(dest: &Path) -> PathBuf {
+    let mut name = dest.as_os_str().to_os_string();
+    name.push(".tmp");
+    PathBuf::from(name)
 }
 
 /// Resolve a file inside the local HF hub snapshot for `repo`@`revision`, if the
@@ -578,40 +644,71 @@ mod verify_pack_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Chunks wide enough that the head covers the sentinel, as a real
+    /// 256 MiB chunk does.
+    fn write_parts(dest: &Path, n: u64) -> Vec<(PathBuf, u64)> {
+        (0..n)
+            .map(|i| {
+                let p = part_path(dest, i);
+                std::fs::write(&p, vec![b'a' + i as u8; 64]).expect("write part");
+                (p, 64)
+            })
+            .collect()
+    }
+
     /// Peak disk during assembly is what decides whether a 19 GiB pack fits
     /// on a machine with 25 GiB free.
     #[test]
     fn concat_frees_each_part_as_it_goes() {
         let dir = scratch_dir("concat");
         let dest = dir.join("out.bin");
-        let parts: Vec<(PathBuf, u64)> = (0..3u64)
-            .map(|i| {
-                let p = part_path(&dest, i);
-                std::fs::write(&p, vec![b'a' + i as u8; 4]).expect("write part");
-                (p, 4)
-            })
-            .collect();
+        let parts = write_parts(&dest, 3);
 
         concat_parts(&dest, &parts).expect("concat");
-        assert_eq!(std::fs::read(&dest).expect("read dest"), b"aaaabbbbcccc");
+        let got = std::fs::read(&dest).expect("read dest");
+        let mut want = vec![b'a'; 64];
+        want.extend(std::iter::repeat_n(b'b', 64));
+        want.extend(std::iter::repeat_n(b'c', 64));
+        assert_eq!(got, want);
         for (p, _) in &parts {
             assert!(!p.exists(), "{} survived assembly", p.display());
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A partial `model.dgq.bin` is worse than no file: it loads, reads past
-    /// its own end as zeros, and generates `<pad>` forever.
+    /// The head lands last, so the finished file must not keep the marker
+    /// the loader rejects packs for.
     #[test]
-    fn failed_concat_leaves_no_partial_dest() {
+    fn assembled_blob_does_not_keep_the_sentinel() {
+        let dir = scratch_dir("concat-sentinel");
+        let dest = dir.join("out.bin");
+        let parts = write_parts(&dest, 2);
+
+        concat_parts(&dest, &parts).expect("concat");
+        let got = std::fs::read(&dest).expect("read dest");
+        assert_ne!(&got[..INCOMPLETE_SENTINEL.len()], INCOMPLETE_SENTINEL);
+        assert!(!tmp_path(&dest).exists(), "tmp survived a good assembly");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A partial `model.dgq.bin` is worse than no file: it loads, reads past
+    /// its own end as zeros, and generates `<pad>` forever. The bytes go to a
+    /// `.tmp` that never earns the name, and a failure removes even that.
+    #[test]
+    fn failed_concat_leaves_nothing_behind() {
         let dir = scratch_dir("concat-fail");
         let dest = dir.join("out.bin");
         let good = part_path(&dest, 0);
-        std::fs::write(&good, b"aaaa").expect("write part");
+        std::fs::write(&good, vec![b'a'; 64]).expect("write part");
         let missing = part_path(&dest, 1);
 
-        concat_parts(&dest, &[(good, 4), (missing, 4)]).expect_err("must fail on missing part");
-        assert!(!dest.exists(), "partial dest survived a failed assembly");
+        concat_parts(&dest, &[(good, 64), (missing, 64)]).expect_err("must fail on missing part");
+        assert!(
+            !dest.exists(),
+            "a failed assembly produced {}",
+            dest.display()
+        );
+        assert!(!tmp_path(&dest).exists(), "a failed assembly left its tmp");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

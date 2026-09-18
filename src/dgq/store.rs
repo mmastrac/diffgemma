@@ -3,7 +3,7 @@
 use crate::Error;
 use crate::dgq::dequant::dequant_to_f32;
 use crate::dgq::layout::{
-    DgqManifest, MANIFEST_FILE, QuantKind, TensorSource, blob_slice_range, dgq_version_supported,
+    DgqManifest, MANIFEST_FILE, PackFile, QuantKind, TensorSource, blob_slice_range,
     parse_quant_kind,
 };
 use crate::tensor::TensorView;
@@ -26,16 +26,9 @@ pub struct DgqStore {
 impl DgqStore {
     pub fn open(model_dir: impl AsRef<Path>) -> Result<Self, Error> {
         let model_dir = model_dir.as_ref().to_path_buf();
-        let manifest_path = model_dir.join(MANIFEST_FILE);
-        let manifest_json = std::fs::read_to_string(&manifest_path)?;
-        let manifest: DgqManifest = serde_json::from_str(&manifest_json)?;
-        if !dgq_version_supported(manifest.version) {
-            return Err(Error::Format("unsupported .dgq version"));
-        }
-        let blob_path = model_dir.join(&manifest.blob_file);
-        let file = File::open(&blob_path)?;
-        let blob = unsafe { Mmap::map(&file)? };
-        manifest.check_local_blob_len(blob.len() as u64, &blob_path)?;
+        let pack = PackFile::open(&model_dir)?;
+        let blob = pack.map()?;
+        let manifest = pack.into_manifest();
         let mut index = HashMap::with_capacity(manifest.tensors.len());
         for (i, t) in manifest.tensors.iter().enumerate() {
             index.insert(t.name.clone(), i);

@@ -3,8 +3,8 @@
 use crate::Error;
 use crate::dgq::DgqStore;
 use crate::dgq::layout::{
-    DgqManifest, MANIFEST_FILE, QuantKind, TensorSource, blob_offset_for_mtl, blob_offset_usize,
-    dgq_version_supported, nvfp4_matrix_bytes, q4_matrix_bytes, q8_row_bytes,
+    DgqManifest, PackFile, QuantKind, TensorSource, blob_offset_for_mtl, blob_offset_usize,
+    nvfp4_matrix_bytes, q4_matrix_bytes, q8_row_bytes,
 };
 use memmap2::{Mmap, MmapMut};
 use objc2::rc::Retained;
@@ -37,63 +37,14 @@ pub struct DgqGpuBlob {
     pub len: usize,
 }
 
-/// Minimum canonical-offset alignment every `.dgq` tensor entry has always
-/// had, unconditionally, since before layered packs existed: several
-/// production kernels reinterpret `blob + w_off` as a typed pointer (e.g.
-/// `gemm_rowk.metal`: `device const ushort *w = (device const ushort
-/// *)(blob + w_off)`, then indexed) — correctness of that read depends on
-/// `w_off` being sufficiently aligned, and 64 bytes is the value every
-/// working pack (self-contained or layered) has always used via the writer's
-/// unconditional `align_offset`.
-const TENSOR_OFFSET_ALIGN: u64 = 64;
-
-/// Load-time tripwire for the failure class a byte-content check CANNOT see:
-/// a `w_off` that is byte-CORRECT (right tensor, right value once read) but
-/// insufficiently aligned for the typed-pointer reads several kernels do.
-/// This is cheap (manifest-only, no I/O) and unconditional — it runs for
-/// every pack, not just layered ones. Regression history: a (since-removed)
-/// VA-splice writer draft dropped per-tensor alignment inside a shard-run to
-/// mirror the source file's zero-gap layout — safe for byte CONTENT, unsafe
-/// for GPU reads, and invisible to
-/// `gpu_buffer_matches_store_for_every_tensor`'s host_ptr-vs-`DgqStore`
-/// comparison (both sides read through untyped byte pointers with no
-/// alignment requirement of their own — only the actual GPU kernel's typed
-/// reinterpret-cast cares). Golden caught it as silently wrong generation.
-fn assert_tensor_offset_alignment(manifest: &DgqManifest) -> Result<(), Error> {
-    let offenders: Vec<&str> = manifest
-        .tensors
-        .iter()
-        .filter(|t| !t.meta.offset.is_multiple_of(TENSOR_OFFSET_ALIGN))
-        .map(|t| t.name.as_str())
-        .collect();
-    if offenders.is_empty() {
-        return Ok(());
-    }
-    eprintln!(
-        "dgq: {} tensor(s) have a canonical offset not aligned to {TENSOR_OFFSET_ALIGN} bytes \
-         — this pack is unsafe to load (GPU kernels read weight bytes through a typed pointer \
-         cast at that offset); first few: {:?}",
-        offenders.len(),
-        &offenders[..offenders.len().min(10)]
-    );
-    Err(Error::Format(
-        "dgq: manifest has misaligned tensor offset(s) — refusing to load",
-    ))
-}
-
 impl DgqGpuBlob {
     pub fn from_store(
         store: &DgqStore,
         device: &ProtocolObject<dyn MTLDevice>,
     ) -> Result<Arc<Self>, Error> {
         let model_dir = store.model_dir.clone();
-        let manifest_path = model_dir.join(MANIFEST_FILE);
-        let manifest_json = std::fs::read_to_string(&manifest_path)?;
-        let manifest: DgqManifest = serde_json::from_str(&manifest_json)?;
-        if !dgq_version_supported(manifest.version) {
-            return Err(Error::Format("unsupported .dgq version"));
-        }
-        assert_tensor_offset_alignment(&manifest)?;
+        let pack = PackFile::open(&model_dir)?;
+        let manifest = pack.manifest();
         if manifest.is_layered() {
             if let (Some(expert_split), Some(local_expert_split)) =
                 (manifest.expert_split, manifest.local_expert_split)
@@ -108,8 +59,7 @@ impl DgqGpuBlob {
                 // re-readable from disk under memory pressure (anonymous
                 // pages are not).
                 return Self::from_store_layered_split(
-                    &model_dir,
-                    &manifest,
+                    pack,
                     expert_split,
                     local_expert_split,
                     device,
@@ -124,14 +74,13 @@ impl DgqGpuBlob {
             // produced. Costs a full-blob memcpy and anonymous (swap-backed,
             // not evictable-and-re-readable) resident pages — see
             // ARCHITECTURE.md's pack-format section.
-            let mmap = materialize_layered_blob(&model_dir, &manifest)?;
-            return Self::wrap_mmap(None, mmap, manifest.expert_split, device);
+            let expert_split = manifest.expert_split;
+            let mmap = materialize_layered_blob(&pack)?;
+            return Self::wrap_mmap(None, mmap, expert_split, device);
         }
-        let blob_path = model_dir.join(&manifest.blob_file);
-        let file = File::open(&blob_path)?;
-        let mmap = unsafe { Mmap::map(&file)? };
-        manifest.check_local_blob_len(mmap.len() as u64, &blob_path)?;
-        Self::wrap_mmap(Some(file), mmap, manifest.expert_split, device)
+        let expert_split = manifest.expert_split;
+        let (mmap, file, _) = pack.into_map_and_file()?;
+        Self::wrap_mmap(Some(file), mmap, expert_split, device)
     }
 
     /// Layered split-source path: the head (raw refs + small local bytes) is
@@ -147,38 +96,28 @@ impl DgqGpuBlob {
     /// double resident/dirty memory per load — measured live, two such
     /// loads overlapping OOM-killed a full-suite run.
     fn from_store_layered_split(
-        model_dir: &Path,
-        manifest: &DgqManifest,
+        pack: PackFile,
         expert_split: u64,
         local_expert_split: u64,
         device: &ProtocolObject<dyn MTLDevice>,
     ) -> Result<Arc<Self>, Error> {
-        let head = materialize_layered_head_only(model_dir, manifest, expert_split)?;
-        Self::finish_layered_split(
-            model_dir,
-            manifest,
-            expert_split,
-            local_expert_split,
-            head,
-            device,
-        )
+        let head = materialize_layered_head_only(&pack, expert_split)?;
+        Self::finish_layered_split(pack, expert_split, local_expert_split, head, device)
     }
 
     // Arc holds a GPU blob (Metal buffers, not Send/Sync); the Arc is for shared
     // ownership on one thread, never cross-thread, so the lint does not apply.
     #[allow(clippy::arc_with_non_send_sync)]
     fn finish_layered_split(
-        model_dir: &Path,
-        manifest: &DgqManifest,
+        pack: PackFile,
         expert_split: u64,
         local_expert_split: u64,
         head: Mmap,
         device: &ProtocolObject<dyn MTLDevice>,
     ) -> Result<Arc<Self>, Error> {
         let head_len = head.len();
+        let canonical_total = pack.manifest().canonical_extent();
 
-        let local_bin_path = model_dir.join(&manifest.blob_file);
-        let local_file = File::open(&local_bin_path)?;
         if !local_expert_split.is_multiple_of(16384) {
             return Err(Error::Layered(format!(
                 "dgq layered blob: local_expert_split {local_expert_split} is not 16384-aligned — \
@@ -189,11 +128,7 @@ impl DgqGpuBlob {
         // address and the region-2 MTLBuffer's base address coincide: host_ptr
         // and the GPU wrap then share the single rebase rule
         // (off - expert_split), with no second file-side base to forget.
-        let local_mmap = unsafe {
-            memmap2::MmapOptions::new()
-                .offset(local_expert_split)
-                .map(&local_file)?
-        };
+        let local_mmap = pack.map_from(local_expert_split)?;
         let tail_len = local_mmap.len();
         if tail_len == 0 {
             return Err(Error::Runtime(
@@ -206,12 +141,6 @@ impl DgqGpuBlob {
         // [expert_split, total)) is exactly what `w_off` addressing depends
         // on. A mismatched tail length means a writer bug, not a value to
         // silently absorb.
-        let canonical_total = manifest
-            .tensors
-            .iter()
-            .map(|t| t.meta.offset + t.meta.byte_len)
-            .max()
-            .unwrap_or(0);
         let expected_tail_len = blob_offset_usize(canonical_total)?
             .checked_sub(blob_offset_usize(expert_split)?)
             .ok_or(Error::Runtime("dgq: expert_split past canonical total"))?;
@@ -255,7 +184,7 @@ impl DgqGpuBlob {
         Ok(Arc::new(Self {
             _file: None,
             _mmap: head,
-            _tail_file: Some(local_file),
+            _tail_file: Some(pack.into_file()),
             _tail_mmap: Some(local_mmap),
             buffer,
             buffer_experts: Some(buffer_experts),
@@ -477,18 +406,12 @@ fn source_slice<'a>(
 /// pack's blob would be once mmap'd. Fallback when the writer didn't record
 /// `local_expert_split` — see `materialize_layered_head` for the preferred,
 /// much cheaper path.
-fn materialize_layered_blob(model_dir: &Path, manifest: &DgqManifest) -> Result<Mmap, Error> {
-    let local_bin = File::open(model_dir.join(&manifest.blob_file))?;
-    let local_mmap = unsafe { Mmap::map(&local_bin)? };
-    let external = resolve_external_mmaps(model_dir, manifest)?;
+fn materialize_layered_blob(pack: &PackFile) -> Result<Mmap, Error> {
+    let manifest = pack.manifest();
+    let local_mmap = pack.map()?;
+    let external = resolve_external_mmaps(pack.model_dir(), manifest)?;
 
-    let total_len = manifest
-        .tensors
-        .iter()
-        .map(|t| t.meta.offset + t.meta.byte_len)
-        .max()
-        .unwrap_or(0);
-    let total_len = blob_offset_usize(total_len)?;
+    let total_len = blob_offset_usize(manifest.canonical_extent())?;
     let mut anon = MmapMut::map_anon(total_len)?;
 
     for entry in &manifest.tensors {
@@ -517,15 +440,11 @@ fn materialize_layered_blob(model_dir: &Path, manifest: &DgqManifest) -> Result<
 /// splices or falls back — gathering the tail too would needlessly double
 /// the anonymous (dirty, non-shared, non-evictable-and-re-readable)
 /// resident memory of every load whenever the head can't be spliced.
-fn materialize_layered_head_only(
-    model_dir: &Path,
-    manifest: &DgqManifest,
-    expert_split: u64,
-) -> Result<Mmap, Error> {
+fn materialize_layered_head_only(pack: &PackFile, expert_split: u64) -> Result<Mmap, Error> {
+    let manifest = pack.manifest();
     let head_len = blob_offset_usize(expert_split)?;
-    let local_bin = File::open(model_dir.join(&manifest.blob_file))?;
-    let local_mmap = unsafe { Mmap::map(&local_bin)? };
-    let external = resolve_external_mmaps(model_dir, manifest)?;
+    let local_mmap = pack.map()?;
+    let external = resolve_external_mmaps(pack.model_dir(), manifest)?;
 
     let mut anon = MmapMut::map_anon(head_len)?;
     for entry in &manifest.tensors {
@@ -895,83 +814,6 @@ pub fn load_raw_view(
         byte_len: entry.meta.byte_len,
         numel,
     })
-}
-
-/// Pure `plan_head_splice` tests: no I/O, no unsafe, no GPU — the plan is
-/// just arithmetic over a hand-built manifest.
-#[cfg(test)]
-mod splice_plan_tests {
-    use super::*;
-    use crate::dgq::layout::{DgqTensorEntry, DgqTensorMeta, QuantProfile};
-
-    fn manifest(tensors: Vec<DgqTensorEntry>) -> DgqManifest {
-        DgqManifest {
-            version: crate::dgq::layout::DGQ_VERSION_LAYERED,
-            profile: QuantProfile::Q4,
-            source_model: "src".to_string(),
-            blob_file: "model.dgq.bin".to_string(),
-            expert_split: None,
-            local_expert_split: None,
-            base_model: None,
-            external_files: Default::default(),
-            custom_classes: Default::default(),
-            tensors,
-        }
-    }
-
-    fn external(name: &str, file: &str, canonical: u64, file_off: u64, len: u64) -> DgqTensorEntry {
-        DgqTensorEntry {
-            name: name.to_string(),
-            meta: DgqTensorMeta {
-                kind: "raw".to_string(),
-                dtype: "bf16".to_string(),
-                shape: vec![1],
-                offset: canonical,
-                byte_len: len,
-                source: Some(TensorSource::External {
-                    file: file.to_string(),
-                    offset: file_off,
-                }),
-            },
-        }
-    }
-
-    fn local(name: &str, canonical: u64, len: u64) -> DgqTensorEntry {
-        DgqTensorEntry {
-            name: name.to_string(),
-            meta: DgqTensorMeta {
-                kind: "q8_row".to_string(),
-                dtype: "bf16".to_string(),
-                shape: vec![1],
-                offset: canonical,
-                byte_len: len,
-                source: Some(TensorSource::Local { local_offset: 0 }),
-            },
-        }
-    }
-
-    #[test]
-    fn offset_alignment_tripwire_accepts_64_aligned_manifest() {
-        let m = manifest(vec![
-            external("a", "shardA", 0, 0, 128),
-            local("b", 128, 64),
-        ]);
-        assert_tensor_offset_alignment(&m).expect("64-byte-aligned manifest must pass");
-    }
-
-    #[test]
-    fn offset_alignment_tripwire_rejects_misaligned_tensor() {
-        // canonical offset 130 is not a multiple of 64 — exactly the class
-        // of writer bug this tripwire exists to catch at load time (byte
-        // content can be perfectly correct and this would still be unsafe
-        // for a GPU kernel's typed pointer read).
-        let m = manifest(vec![
-            external("a", "shardA", 0, 0, 128),
-            local("b", 130, 64),
-        ]);
-        let err = assert_tensor_offset_alignment(&m).expect_err("must reject misaligned offset");
-        assert!(err.to_string().contains("misaligned"), "{err}");
-    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
