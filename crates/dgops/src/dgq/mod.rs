@@ -1,47 +1,20 @@
-//! Minimal portable reader for a \`.dgq\` weight pack.
+//! The CUDA side's view of a `.dgq` pack.
 //!
-//! The pack is a JSON manifest plus one mmapped blob. This is the subset the
-//! CUDA-side verification needs: tensor lookup, raw bytes, and f32
-//! materialization for the raw (bf16) tensors the diffusion slice uses. The
-//! engine's \`src/dgq\` remains authoritative for everything else (layered packs,
-//! external refs, quantized classes); this reader deliberately rejects what it
-//! does not implement rather than guessing.
+//! The format, the manifest types and every load-time gate live in
+//! `dgqpack`, which the engine opens packs through as well, so both backends
+//! agree on what a valid pack is and a truncated or unfinished one is
+//! refused here for the same reason it is refused there. What stays local is
+//! the handful of accessors the CUDA verification slice needs: tensor
+//! lookup, raw bytes, and f32 materialization for the raw bf16 tensors the
+//! diffusion slice uses.
 
-use serde::Deserialize;
+use dgqpack::PackFile;
+
+pub use dgqpack::{DgqTensorEntry, DgqTensorMeta};
 use std::collections::HashMap;
-use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-pub const MANIFEST_FILE: &str = "model.dgq.json";
-
-#[derive(Debug, Deserialize)]
-pub struct DgqManifest {
-    pub version: u32,
-    #[serde(default)]
-    pub profile: Option<String>,
-    pub blob_file: String,
-    pub tensors: Vec<DgqTensorEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct DgqTensorEntry {
-    pub name: String,
-    pub kind: String,
-    pub dtype: String,
-    pub shape: Vec<i64>,
-    pub offset: u64,
-    pub byte_len: u64,
-}
-
-impl DgqTensorEntry {
-    pub fn numel(&self) -> usize {
-        self.shape.iter().product::<i64>() as usize
-    }
-
-    pub fn is_raw(&self) -> bool {
-        self.kind == "raw"
-    }
-}
+pub use dgqpack::MANIFEST_FILE;
 
 pub struct DgqPack {
     blob: memmap2::Mmap,
@@ -51,20 +24,16 @@ pub struct DgqPack {
 
 impl DgqPack {
     pub fn open(model_dir: impl AsRef<Path>) -> Result<Self, Error> {
-        let model_dir = model_dir.as_ref();
-        let manifest_path = model_dir.join(MANIFEST_FILE);
-        let manifest: DgqManifest =
-            serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
-        let blob_path: PathBuf = model_dir.join(&manifest.blob_file);
-        let file = File::open(&blob_path)?;
-        let blob = unsafe { memmap2::Mmap::map(&file)? };
-        let mut index = HashMap::with_capacity(manifest.tensors.len());
-        for (i, t) in manifest.tensors.iter().enumerate() {
+        let pack = PackFile::open(model_dir)?;
+        let blob = pack.map()?;
+        let entries = pack.into_manifest().tensors;
+        let mut index = HashMap::with_capacity(entries.len());
+        for (i, t) in entries.iter().enumerate() {
             index.insert(t.name.clone(), i);
         }
         Ok(Self {
             blob,
-            entries: manifest.tensors,
+            entries,
             index,
         })
     }
@@ -84,13 +53,14 @@ impl DgqPack {
             .get(name)
             .ok_or_else(|| Error::NotFound(name.to_string()))?;
         let end = e
+            .meta
             .offset
-            .checked_add(e.byte_len)
+            .checked_add(e.meta.byte_len)
             .ok_or(Error::Format("tensor range overflow"))?;
         if end > self.blob.len() as u64 {
             return Err(Error::Format("tensor range past end of blob"));
         }
-        Ok(&self.blob[e.offset as usize..end as usize])
+        Ok(&self.blob[e.meta.offset as usize..end as usize])
     }
 
     /// A raw bf16 tensor as f32.
@@ -98,7 +68,7 @@ impl DgqPack {
         let e = self
             .get(name)
             .ok_or_else(|| Error::NotFound(name.to_string()))?;
-        if !e.is_raw() || e.dtype != "BF16" {
+        if !e.is_raw() || e.meta.dtype != "BF16" {
             return Err(Error::Format("tensor is not raw bf16"));
         }
         let src = self.bytes(name)?;
@@ -110,18 +80,18 @@ impl DgqPack {
         Ok(out)
     }
 
-    /// The first \`rows\` rows of a raw bf16 \`[out, in]\` matrix, as f32.
+    /// The first `rows` rows of a raw bf16 `[out, in]` matrix, as f32.
     /// Lets a verification slice run real weights without materializing a
     /// whole 1.4 GiB table.
     pub fn raw_bf16_rows(&self, name: &str, rows: usize) -> Result<Vec<f32>, Error> {
         let e = self
             .get(name)
             .ok_or_else(|| Error::NotFound(name.to_string()))?;
-        if !e.is_raw() || e.dtype != "BF16" || e.shape.len() != 2 {
+        if !e.is_raw() || e.meta.dtype != "BF16" || e.meta.shape.len() != 2 {
             return Err(Error::Format("tensor is not a raw bf16 matrix"));
         }
-        let in_dim = e.shape[1] as usize;
-        let rows = rows.min(e.shape[0] as usize);
+        let in_dim = e.meta.shape[1] as usize;
+        let rows = rows.min(e.meta.shape[0] as usize);
         let src = self.bytes(name)?;
         let mut out = vec![0.0f32; rows * in_dim];
         for (i, o) in out.iter_mut().enumerate() {
@@ -131,25 +101,25 @@ impl DgqPack {
         Ok(out)
     }
 
-    /// Raw bf16 bytes for the first \`rows\` rows of a \`[out, in]\` matrix — the
+    /// Raw bf16 bytes for the first `rows` rows of a `[out, in]` matrix, the
     /// embed-gather table slice.
     pub fn raw_bf16_row_bytes(&self, name: &str, rows: usize) -> Result<Vec<u8>, Error> {
         let e = self
             .get(name)
             .ok_or_else(|| Error::NotFound(name.to_string()))?;
-        if !e.is_raw() || e.dtype != "BF16" || e.shape.len() != 2 {
+        if !e.is_raw() || e.meta.dtype != "BF16" || e.meta.shape.len() != 2 {
             return Err(Error::Format("tensor is not a raw bf16 matrix"));
         }
-        let in_dim = e.shape[1] as usize;
-        let rows = rows.min(e.shape[0] as usize);
+        let in_dim = e.meta.shape[1] as usize;
+        let rows = rows.min(e.meta.shape[0] as usize);
         Ok(self.bytes(name)?[..rows * in_dim * 2].to_vec())
     }
 }
 
 #[derive(Debug)]
 pub enum Error {
-    Io(std::io::Error),
-    Json(serde_json::Error),
+    /// Opening or validating the pack, carrying `dgqpack`'s message.
+    Pack(dgqpack::Error),
     NotFound(String),
     Format(&'static str),
 }
@@ -157,8 +127,7 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Io(e) => write!(f, "io: {e}"),
-            Error::Json(e) => write!(f, "manifest json: {e}"),
+            Error::Pack(e) => write!(f, "{e}"),
             Error::NotFound(n) => write!(f, "tensor not found: {n}"),
             Error::Format(m) => write!(f, "bad dgq pack: {m}"),
         }
@@ -167,14 +136,8 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-impl From<std::io::Error> for Error {
-    fn from(e: std::io::Error) -> Self {
-        Error::Io(e)
-    }
-}
-
-impl From<serde_json::Error> for Error {
-    fn from(e: serde_json::Error) -> Self {
-        Error::Json(e)
+impl From<dgqpack::Error> for Error {
+    fn from(e: dgqpack::Error) -> Self {
+        Error::Pack(e)
     }
 }

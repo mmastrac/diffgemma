@@ -95,6 +95,7 @@ dependencies = [
 name = "dgops"
 version = "0.1.0"
 dependencies = [
+ "dgqpack",
  "gpukit",
  "memmap2",
  "objc2",
@@ -115,10 +116,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dgqpack"
+version = "0.1.0"
+dependencies = [
+ "memmap2",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "diffgemma"
 version = "0.1.0"
 dependencies = [
  "dgemm",
+ "dgqpack",
  "gpukit",
  "memmap2",
  "objc2",
