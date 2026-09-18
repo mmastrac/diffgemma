@@ -286,11 +286,19 @@ fn list_repo_files(repo: &str, revision: &str) -> Result<Vec<RepoFile>, String> 
     Ok(files)
 }
 
-/// Download one file to `dest`. Files that fit in a single chunk are fetched
-/// straight to `dest`. Larger files split into byte-range chunks fetched `jobs`
-/// at a time to `.partNNN` siblings, then concatenated; a re-run resumes by
-/// skipping any part already fully on disk. A truncated file/part fails its
-/// size check and is refetched.
+/// Download one file to `dest`.
+///
+/// A file that fits in one chunk is fetched beside `dest` and renamed. A
+/// larger one is fetched as byte ranges, `jobs` at a time, and each chunk is
+/// written into its final position in a sparse `.tmp` as soon as it lands.
+/// Staging on arrival is what keeps the transfer inside the pack's own size:
+/// the only bytes on disk twice are the chunks currently in flight, and there
+/// is no assembly pass reading 19 GiB back to write it out again.
+///
+/// A re-run resumes from `.stage`, which records the SHA-256 of every chunk
+/// already staged. Those hashes are re-checked against the file before any of
+/// it is trusted, so a chunk that a crash left half written is refetched
+/// rather than inherited.
 fn download_file(
     url: &str,
     dest: &Path,
@@ -298,16 +306,17 @@ fn download_file(
     force: bool,
     jobs: usize,
 ) -> Result<(), String> {
+    let tmp = tmp_path(dest);
     if force {
         let _ = std::fs::remove_file(dest);
-        let _ = std::fs::remove_file(tmp_path(dest));
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(stage_log_path(dest));
     }
 
     let n_chunks = size.div_ceil(CHUNK_SIZE).max(1);
     if n_chunks == 1 {
         // Fetch beside the destination and rename, so a killed transfer
         // leaves no half file under the name the loader looks for.
-        let tmp = tmp_path(dest);
         let resp = start_fetch(url, &tmp, None)?
             .join()
             .map_err(|e| format!("{e:?}"))?;
@@ -319,61 +328,270 @@ fn download_file(
             .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), dest.display()));
     }
 
-    // Chunk plan: [start, end] inclusive byte ranges.
-    let mut part_paths = Vec::with_capacity(n_chunks as usize);
-    let mut pending = Vec::new(); // (index, part_path, expected_len)
-    for i in 0..n_chunks {
-        let start = i * CHUNK_SIZE;
-        let end = ((i + 1) * CHUNK_SIZE).min(size) - 1;
-        let expected = end - start + 1;
-        let part = part_path(dest, i);
-        if !force && file_len(&part) == Some(expected) {
-            // Already fetched on a prior run: resume past it.
-        } else {
-            let _ = std::fs::remove_file(&part);
-            pending.push((i, part.clone(), start, end, expected));
+    match stage_chunks(url, dest, &tmp, size, n_chunks, jobs) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(stage_log_path(dest));
+            Ok(())
         }
-        part_paths.push((part, expected));
+        // The `.tmp` and its log stay put: between them they are the resume
+        // point, and neither can be mistaken for a finished download.
+        Err(e) => Err(e),
+    }
+}
+
+fn stage_chunks(
+    url: &str,
+    dest: &Path,
+    tmp: &Path,
+    size: u64,
+    n_chunks: u64,
+    jobs: usize,
+) -> Result<(), String> {
+    use std::os::unix::fs::FileExt;
+
+    let out = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(tmp)
+        .map_err(|e| format!("open {}: {e}", tmp.display()))?;
+    // Full length up front, as a hole. Chunks land at their real offsets, so
+    // the file is the right size from the start and only the staged ranges
+    // occupy blocks.
+    out.set_len(size)
+        .map_err(|e| format!("size {}: {e}", tmp.display()))?;
+
+    let head_len = CHUNK_SIZE.min(size);
+    if head_len >= INCOMPLETE_SENTINEL.len() as u64 {
+        out.write_all_at(INCOMPLETE_SENTINEL, 0)
+            .map_err(|e| format!("write sentinel to {}: {e}", tmp.display()))?;
     }
 
-    let done = n_chunks as usize - pending.len();
-    if done > 0 {
-        eprintln!("       resuming: {done}/{n_chunks} chunks already present");
+    let mut log =
+        StageLog::load(dest, size, CHUNK_SIZE).unwrap_or_else(|| StageLog::new(size, CHUNK_SIZE));
+    let staged = log.retain_verified(&out, n_chunks)?;
+    if staged > 0 {
+        eprintln!("       resuming: {staged}/{n_chunks} chunks already staged and verified");
     }
 
-    // Fetch pending chunks `jobs` at a time.
-    let mut completed = done;
-    for batch in pending.chunks(jobs) {
+    // Chunk 0 goes last and is never recorded, so it is always refetched: it
+    // carries the sentinel's span, and the file must not hold real head bytes
+    // until everything behind them is down.
+    let pending: Vec<u64> = (1..n_chunks)
+        .filter(|i| !log.has(*i))
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut completed = staged;
+    for batch in pending.chunks(jobs.max(1)) {
         let mut running = Vec::new();
-        for (idx, part, start, end, expected) in batch {
-            let handle = start_fetch(url, part, Some((*start, *end)));
-            running.push((*idx, part.clone(), *expected, handle));
+        for &idx in batch {
+            let start = idx * CHUNK_SIZE;
+            let end = ((idx + 1) * CHUNK_SIZE).min(size) - 1;
+            let part = part_path(dest, idx);
+            let _ = std::fs::remove_file(&part);
+            running.push((
+                idx,
+                part.clone(),
+                start,
+                end - start + 1,
+                start_fetch(url, &part, Some((start, end))),
+            ));
         }
-        for (idx, part, expected, handle) in running {
-            let handle = handle?;
-            let resp = handle.join().map_err(|e| format!("chunk {idx}: {e:?}"))?;
-            // 206 = partial content (range honored); 200 means the server sent
-            // the whole file for a ranged request, which breaks the chunk plan.
-            if resp.status_code != 206 {
-                return Err(format!(
-                    "chunk {idx}: server returned HTTP {} for a range request (expected 206)",
-                    resp.status_code
-                ));
-            }
-            match file_len(&part) {
-                Some(got) if got == expected => {}
-                Some(got) => {
-                    return Err(format!("chunk {idx}: got {got} bytes, expected {expected}"));
-                }
-                None => return Err(format!("chunk {idx}: part missing after fetch")),
+        for (idx, part, start, expected, handle) in running {
+            let staged_hash = stage_one(&out, &part, idx, start, expected, handle);
+            let _ = std::fs::remove_file(&part);
+            let hash = staged_hash?;
+            if idx != 0 {
+                log.record(idx, hash);
+                log.save(dest)?;
             }
             completed += 1;
-            eprintln!("       chunk {completed}/{n_chunks} ok");
+            eprintln!("       chunk {completed}/{n_chunks} staged");
         }
     }
 
-    // Stitch parts into the final file in order, then drop the parts.
-    concat_parts(dest, &part_paths)
+    let got = out
+        .metadata()
+        .map_err(|e| format!("stat {}: {e}", tmp.display()))?
+        .len();
+    if got != size {
+        return Err(format!("staged {got} bytes, expected {size}"));
+    }
+    out.sync_all()
+        .map_err(|e| format!("sync {}: {e}", tmp.display()))?;
+    drop(out);
+
+    std::fs::rename(tmp, dest)
+        .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), dest.display()))
+}
+
+/// Wait for one chunk's fetch, then stage it. The part file is the caller's
+/// to delete either way.
+fn stage_one(
+    out: &std::fs::File,
+    part: &Path,
+    idx: u64,
+    start: u64,
+    expected: u64,
+    handle: Result<RequestHandle, String>,
+) -> Result<String, String> {
+    let resp = handle?.join().map_err(|e| format!("chunk {idx}: {e:?}"))?;
+    // 206 = partial content (range honored). 200 means the server sent the
+    // whole file for a ranged request, which breaks the chunk plan.
+    if resp.status_code != 206 {
+        return Err(format!(
+            "chunk {idx}: server returned HTTP {} for a range request (expected 206)",
+            resp.status_code
+        ));
+    }
+    stage_part(out, part, idx, start, expected)
+}
+
+/// Copy a fetched chunk into `out` at `start` and return its SHA-256. One
+/// pass: the bytes are hashed as they are written, so the hash the resume log
+/// stores is of exactly what landed.
+fn stage_part(
+    out: &std::fs::File,
+    part: &Path,
+    idx: u64,
+    start: u64,
+    expected: u64,
+) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    use std::os::unix::fs::FileExt;
+
+    match file_len(part) {
+        Some(got) if got == expected => {}
+        Some(got) => return Err(format!("chunk {idx}: got {got} bytes, expected {expected}")),
+        None => return Err(format!("chunk {idx}: part missing after fetch")),
+    }
+
+    let mut src = std::fs::File::open(part).map_err(|e| format!("chunk {idx}: open: {e}"))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 8 << 20];
+    let mut at = start;
+    loop {
+        let n = src
+            .read(&mut buf)
+            .map_err(|e| format!("chunk {idx}: read: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        out.write_all_at(&buf[..n], at)
+            .map_err(|e| format!("chunk {idx}: stage at {at}: {e}"))?;
+        at += n as u64;
+    }
+    Ok(hex(&hasher.finalize()))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// What a `.tmp` already holds, so a resumed run refetches only what it must.
+///
+/// Sizes cannot answer that once chunks are staged in place: the file is full
+/// length from the first write. The log records each staged chunk's SHA-256
+/// and `retain_verified` re-reads them, so a range a crash left half written
+/// is dropped and refetched instead of being trusted for its position alone.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StageLog {
+    size: u64,
+    chunk_size: u64,
+    /// Chunk index to hex SHA-256 of the bytes staged for it.
+    chunks: std::collections::BTreeMap<u64, String>,
+}
+
+impl StageLog {
+    fn new(size: u64, chunk_size: u64) -> Self {
+        Self {
+            size,
+            chunk_size,
+            chunks: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// The log for `dest`, if one is there and describes this same transfer.
+    /// A different size or chunking is a different download, so its hashes
+    /// say nothing about these offsets.
+    fn load(dest: &Path, size: u64, chunk_size: u64) -> Option<Self> {
+        let raw = std::fs::read_to_string(stage_log_path(dest)).ok()?;
+        let log: Self = serde_json::from_str(&raw).ok()?;
+        (log.size == size && log.chunk_size == chunk_size).then_some(log)
+    }
+
+    fn save(&self, dest: &Path) -> Result<(), String> {
+        let path = stage_log_path(dest);
+        let json = serde_json::to_string(self).map_err(|e| e.to_string())?;
+        std::fs::write(&path, json).map_err(|e| format!("write {}: {e}", path.display()))
+    }
+
+    fn has(&self, idx: u64) -> bool {
+        self.chunks.contains_key(&idx)
+    }
+
+    fn record(&mut self, idx: u64, hash: String) {
+        self.chunks.insert(idx, hash);
+    }
+
+    /// Re-hash every chunk the log claims and keep only the ones that still
+    /// match. Returns how many survived.
+    fn retain_verified(&mut self, out: &std::fs::File, n_chunks: u64) -> Result<usize, String> {
+        if self.chunks.is_empty() {
+            return Ok(0);
+        }
+        eprintln!(
+            "       verifying {} staged chunk(s) before resuming",
+            self.chunks.len()
+        );
+        let mut good = std::collections::BTreeMap::new();
+        for (&idx, want) in &self.chunks {
+            if idx == 0 || idx >= n_chunks {
+                continue;
+            }
+            let start = idx * self.chunk_size;
+            let len = self.chunk_size.min(self.size.saturating_sub(start));
+            if len == 0 {
+                continue;
+            }
+            if &chunk_hash(out, start, len)? == want {
+                good.insert(idx, want.clone());
+            } else {
+                eprintln!("       chunk {idx} does not match its hash, refetching");
+            }
+        }
+        self.chunks = good;
+        Ok(self.chunks.len())
+    }
+}
+
+fn chunk_hash(out: &std::fs::File, start: u64, len: u64) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::FileExt;
+
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 8 << 20];
+    let mut at = start;
+    let end = start + len;
+    while at < end {
+        let want = buf.len().min((end - at) as usize);
+        out.read_exact_at(&mut buf[..want], at)
+            .map_err(|e| format!("read staged bytes at {at}: {e}"))?;
+        hasher.update(&buf[..want]);
+        at += want as u64;
+    }
+    Ok(hex(&hasher.finalize()))
+}
+
+/// Where the resume log for `dest` lives.
+fn stage_log_path(dest: &Path) -> PathBuf {
+    let mut name = dest.as_os_str().to_os_string();
+    name.push(".stage");
+    PathBuf::from(name)
 }
 
 /// Start a background fetch of `url` to `dest`, optionally for one inclusive
@@ -393,102 +611,6 @@ fn part_path(dest: &Path, i: u64) -> PathBuf {
     let mut name = dest.as_os_str().to_os_string();
     name.push(format!(".part{i:04}"));
     PathBuf::from(name)
-}
-
-/// Assemble `parts` into `dest`, in order, so that `dest` never exists in a
-/// state a loader would accept.
-///
-/// Three things make that true. The bytes land in a `.tmp` sibling and only
-/// become `dest` on a successful rename, so an interrupted run leaves a file
-/// under a name nothing loads. The first chunk is written LAST, after every
-/// other byte is on disk and the assembled length checks out, and until then
-/// offset 0 holds `INCOMPLETE_SENTINEL`: a blob carrying it is unfinished
-/// whatever its length says, which is the one thing a length check cannot
-/// see. And each part is deleted the moment its bytes are flushed, because
-/// holding all of them to the end puts the parts and the assembled file on
-/// disk at once and a 19 GiB pack would need 38 GiB free to land.
-///
-/// The cost of freeing as we go: a failure part-way through re-fetches the
-/// parts it already consumed.
-fn concat_parts(dest: &Path, parts: &[(PathBuf, u64)]) -> Result<(), String> {
-    let tmp = tmp_path(dest);
-    match concat_parts_inner(dest, &tmp, parts) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
-}
-
-fn concat_parts_inner(dest: &Path, tmp: &Path, parts: &[(PathBuf, u64)]) -> Result<(), String> {
-    use std::io::{Seek, SeekFrom, Write};
-    eprintln!(
-        "       assembling {} chunks -> {}",
-        parts.len(),
-        dest.display()
-    );
-    let Some(((_, head_len), tail_parts)) = parts.split_first() else {
-        return Err("no chunks to assemble".to_string());
-    };
-
-    let mut out =
-        std::fs::File::create(tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
-    // Only when the head is long enough to hold it: a shorter one would leave
-    // the sentinel's tail sticking out past the bytes the head will overwrite.
-    if *head_len >= INCOMPLETE_SENTINEL.len() as u64 {
-        out.write_all(INCOMPLETE_SENTINEL)
-            .map_err(|e| format!("write sentinel to {}: {e}", tmp.display()))?;
-    }
-
-    // The head's bytes arrive last, so skip its span and start with chunk 1.
-    out.seek(SeekFrom::Start(*head_len))
-        .map_err(|e| format!("seek {}: {e}", tmp.display()))?;
-    copy_parts_into(&mut out, tail_parts, tmp)?;
-
-    let want: u64 = parts.iter().map(|(_, len)| len).sum();
-    let got = out
-        .metadata()
-        .map_err(|e| format!("stat {}: {e}", tmp.display()))?
-        .len();
-    if got != want {
-        return Err(format!(
-            "assembled {} bytes from chunks 1..{}, expected {want}",
-            got,
-            parts.len()
-        ));
-    }
-
-    out.seek(SeekFrom::Start(0))
-        .map_err(|e| format!("seek {}: {e}", tmp.display()))?;
-    copy_parts_into(&mut out, &parts[..1], tmp)?;
-    out.sync_all()
-        .map_err(|e| format!("sync {}: {e}", tmp.display()))?;
-    drop(out);
-
-    std::fs::rename(tmp, dest)
-        .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), dest.display()))
-}
-
-/// Copy each part into `out` at the current position and delete it once its
-/// bytes are flushed.
-fn copy_parts_into(
-    out: &mut std::fs::File,
-    parts: &[(PathBuf, u64)],
-    tmp: &Path,
-) -> Result<(), String> {
-    use std::io::{BufWriter, Write};
-    let mut writer = BufWriter::with_capacity(8 << 20, out);
-    for (part, _) in parts {
-        let mut r =
-            std::fs::File::open(part).map_err(|e| format!("open {}: {e}", part.display()))?;
-        std::io::copy(&mut r, &mut writer).map_err(|e| format!("copy {}: {e}", part.display()))?;
-        writer
-            .flush()
-            .map_err(|e| format!("flush {}: {e}", tmp.display()))?;
-        let _ = std::fs::remove_file(part);
-    }
-    Ok(())
 }
 
 /// The sibling a transfer writes into before it earns `dest`'s name.
@@ -644,71 +766,78 @@ mod verify_pack_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Chunks wide enough that the head covers the sentinel, as a real
-    /// 256 MiB chunk does.
-    fn write_parts(dest: &Path, n: u64) -> Vec<(PathBuf, u64)> {
-        (0..n)
-            .map(|i| {
-                let p = part_path(dest, i);
-                std::fs::write(&p, vec![b'a' + i as u8; 64]).expect("write part");
-                (p, 64)
-            })
-            .collect()
+    /// Stage `n` chunks of `len` bytes into a sparse file the way the fetch
+    /// loop does, and return the file plus what the log ends up holding.
+    fn stage(dir: &Path, n: u64, len: u64) -> (PathBuf, StageLog) {
+        let tmp = dir.join("out.bin.tmp");
+        let out = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&tmp)
+            .expect("open tmp");
+        out.set_len(n * len).expect("set_len");
+
+        let mut log = StageLog::new(n * len, len);
+        for i in 0..n {
+            let part = dir.join(format!("part{i}"));
+            std::fs::write(&part, vec![b'a' + i as u8; len as usize]).expect("write part");
+            let hash = stage_part(&out, &part, i, i * len, len).expect("stage");
+            if i != 0 {
+                log.record(i, hash);
+            }
+        }
+        (tmp, log)
     }
 
-    /// Peak disk during assembly is what decides whether a 19 GiB pack fits
-    /// on a machine with 25 GiB free.
+    /// Staging writes each chunk where it belongs, so the file is correct
+    /// with no assembly pass and no second copy of the data on disk.
     #[test]
-    fn concat_frees_each_part_as_it_goes() {
-        let dir = scratch_dir("concat");
-        let dest = dir.join("out.bin");
-        let parts = write_parts(&dest, 3);
-
-        concat_parts(&dest, &parts).expect("concat");
-        let got = std::fs::read(&dest).expect("read dest");
+    fn chunks_land_at_their_own_offsets() {
+        let dir = scratch_dir("stage");
+        let (tmp, _) = stage(&dir, 3, 64);
+        let got = std::fs::read(&tmp).expect("read tmp");
         let mut want = vec![b'a'; 64];
         want.extend(std::iter::repeat_n(b'b', 64));
         want.extend(std::iter::repeat_n(b'c', 64));
         assert_eq!(got, want);
-        for (p, _) in &parts {
-            assert!(!p.exists(), "{} survived assembly", p.display());
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The head lands last, so the finished file must not keep the marker
-    /// the loader rejects packs for.
+    /// The log's whole job is to say which staged ranges can be trusted, and
+    /// a crash mid-write leaves a range that is the right length and the
+    /// wrong bytes. Only the hash can tell those apart.
     #[test]
-    fn assembled_blob_does_not_keep_the_sentinel() {
-        let dir = scratch_dir("concat-sentinel");
-        let dest = dir.join("out.bin");
-        let parts = write_parts(&dest, 2);
+    fn resume_drops_a_chunk_whose_bytes_changed() {
+        let dir = scratch_dir("stage-resume");
+        let (tmp, mut log) = stage(&dir, 3, 64);
+        assert_eq!(log.chunks.len(), 2);
 
-        concat_parts(&dest, &parts).expect("concat");
-        let got = std::fs::read(&dest).expect("read dest");
-        assert_ne!(&got[..INCOMPLETE_SENTINEL.len()], INCOMPLETE_SENTINEL);
-        assert!(!tmp_path(&dest).exists(), "tmp survived a good assembly");
+        let out = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&tmp)
+            .expect("reopen");
+        std::os::unix::fs::FileExt::write_all_at(&out, b"xx", 64).expect("corrupt chunk 1");
+
+        let kept = log.retain_verified(&out, 3).expect("verify");
+        assert_eq!(kept, 1, "the corrupted chunk must not survive");
+        assert!(!log.has(1));
+        assert!(log.has(2));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A partial `model.dgq.bin` is worse than no file: it loads, reads past
-    /// its own end as zeros, and generates `<pad>` forever. The bytes go to a
-    /// `.tmp` that never earns the name, and a failure removes even that.
+    /// A log written for a different transfer says nothing about these
+    /// offsets, so it is ignored rather than trusted.
     #[test]
-    fn failed_concat_leaves_nothing_behind() {
-        let dir = scratch_dir("concat-fail");
+    fn resume_log_for_a_different_size_is_ignored() {
+        let dir = scratch_dir("stage-mismatch");
         let dest = dir.join("out.bin");
-        let good = part_path(&dest, 0);
-        std::fs::write(&good, vec![b'a'; 64]).expect("write part");
-        let missing = part_path(&dest, 1);
-
-        concat_parts(&dest, &[(good, 64), (missing, 64)]).expect_err("must fail on missing part");
-        assert!(
-            !dest.exists(),
-            "a failed assembly produced {}",
-            dest.display()
-        );
-        assert!(!tmp_path(&dest).exists(), "a failed assembly left its tmp");
+        StageLog::new(4096, CHUNK_SIZE).save(&dest).expect("save");
+        assert!(StageLog::load(&dest, 4096, CHUNK_SIZE).is_some());
+        assert!(StageLog::load(&dest, 8192, CHUNK_SIZE).is_none());
+        assert!(StageLog::load(&dest, 4096, CHUNK_SIZE / 2).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
