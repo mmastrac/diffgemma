@@ -3,6 +3,7 @@
 use crate::Error;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::Path;
 
 pub const MANIFEST_FILE: &str = "model.dgq.json";
 pub const BLOB_FILE: &str = "model.dgq.bin";
@@ -218,6 +219,46 @@ impl DgqManifest {
     /// fast path everywhere — zero behavior change from pre-layering code.
     pub fn is_layered(&self) -> bool {
         self.tensors.iter().any(|t| t.meta.source.is_some())
+    }
+
+    /// Byte length this pack's own `blob_file` must reach for every tensor
+    /// sourced from it to be readable. A self-contained entry (`source:
+    /// None`) lives at its canonical `offset`, a `Local` entry at its
+    /// `local_offset`, and an `External` entry's bytes are in another file,
+    /// so they contribute nothing here.
+    pub fn local_blob_extent(&self) -> u64 {
+        self.tensors
+            .iter()
+            .map(|t| match &t.meta.source {
+                None => t.meta.offset + t.meta.byte_len,
+                Some(TensorSource::Local { local_offset }) => local_offset + t.meta.byte_len,
+                Some(TensorSource::External { .. }) => 0,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Reject a `blob_file` shorter than the manifest says it is.
+    ///
+    /// A short blob is the download failure that survives every other check.
+    /// The GPU wraps the truncated mmap as an `MTLBuffer`, kernels read
+    /// `blob + w_off` past its end, and out-of-range reads come back as
+    /// zeros. Zero weights give exactly uniform logits (entropy `ln(vocab)`)
+    /// and an all-`<pad>` canvas, which reads as a broken model rather than
+    /// a broken file. Nothing on the GPU path bounds-checks `w_off`, so this
+    /// is the only place the shortfall is visible.
+    pub fn check_local_blob_len(&self, blob_len: u64, blob_path: &Path) -> Result<(), Error> {
+        let need = self.local_blob_extent();
+        if blob_len >= need {
+            return Ok(());
+        }
+        Err(Error::Pack(format!(
+            "{}: truncated. {blob_len} bytes on disk, manifest needs {need}.\n\
+             \x20 The pack is incomplete or corrupt. An interrupted or out-of-disk\n\
+             \x20 download is the usual cause. Re-fetch it:\n\
+             \x20   diffgemma download --force",
+            blob_path.display()
+        )))
     }
 }
 
@@ -630,6 +671,73 @@ pub fn classify_tensor_custom(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(offset: u64, byte_len: u64, source: Option<TensorSource>) -> DgqTensorEntry {
+        DgqTensorEntry {
+            name: format!("t{offset}"),
+            meta: DgqTensorMeta {
+                kind: "raw".to_string(),
+                dtype: "bf16".to_string(),
+                shape: vec![1],
+                offset,
+                byte_len,
+                source,
+            },
+        }
+    }
+
+    fn manifest(tensors: Vec<DgqTensorEntry>) -> DgqManifest {
+        DgqManifest {
+            version: DGQ_VERSION_AFFINE,
+            profile: QuantProfile::Q4,
+            source_model: "test".to_string(),
+            blob_file: BLOB_FILE.to_string(),
+            expert_split: None,
+            local_expert_split: None,
+            base_model: None,
+            external_files: BTreeMap::new(),
+            custom_classes: BTreeMap::new(),
+            tensors,
+        }
+    }
+
+    /// The published q4 pack is 20227522560 bytes. A copy 4096 bytes short of
+    /// that loaded without complaint and then generated nothing but `<pad>`
+    /// at entropy ln(vocab), so one byte short has to fail here.
+    #[test]
+    fn short_blob_is_rejected() {
+        let m = manifest(vec![entry(0, 64, None), entry(64, 20227522496, None)]);
+        assert_eq!(m.local_blob_extent(), 20227522560);
+        let path = Path::new("model.dgq.bin");
+        assert!(m.check_local_blob_len(20227522560, path).is_ok());
+        assert!(m.check_local_blob_len(20227522561, path).is_ok());
+        assert!(m.check_local_blob_len(20227522559, path).is_err());
+    }
+
+    /// A layered pack's own blob holds only its `Local` tensors, so the
+    /// extent it must reach is the largest `local_offset` end. An `External`
+    /// tensor's canonical `offset` is an address in the HF base.
+    #[test]
+    fn local_blob_extent_ignores_external_bytes() {
+        let m = manifest(vec![
+            entry(
+                0,
+                4096,
+                Some(TensorSource::External {
+                    file: "shard".to_string(),
+                    offset: 0,
+                }),
+            ),
+            entry(
+                1 << 30,
+                512,
+                Some(TensorSource::Local { local_offset: 128 }),
+            ),
+        ]);
+        assert_eq!(m.local_blob_extent(), 640);
+        assert!(m.check_local_blob_len(640, Path::new("x.bin")).is_ok());
+        assert!(m.check_local_blob_len(639, Path::new("x.bin")).is_err());
+    }
 
     #[test]
     fn classify_experts_and_router() {

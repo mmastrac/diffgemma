@@ -35,6 +35,7 @@ impl DgqStore {
         let blob_path = model_dir.join(&manifest.blob_file);
         let file = File::open(&blob_path)?;
         let blob = unsafe { Mmap::map(&file)? };
+        manifest.check_local_blob_len(blob.len() as u64, &blob_path)?;
         let mut index = HashMap::with_capacity(manifest.tensors.len());
         for (i, t) in manifest.tensors.iter().enumerate() {
             index.insert(t.name.clone(), i);

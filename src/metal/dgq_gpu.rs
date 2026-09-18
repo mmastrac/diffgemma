@@ -130,6 +130,7 @@ impl DgqGpuBlob {
         let blob_path = model_dir.join(&manifest.blob_file);
         let file = File::open(&blob_path)?;
         let mmap = unsafe { Mmap::map(&file)? };
+        manifest.check_local_blob_len(mmap.len() as u64, &blob_path)?;
         Self::wrap_mmap(Some(file), mmap, manifest.expert_split, device)
     }
 
