@@ -28,6 +28,10 @@ pub enum Error {
     /// snapshot, size/header mismatch, unpinned base). Always carries an
     /// actionable message (e.g. the exact `hf download` command to run).
     Layered(String),
+    /// `.dgq` pack integrity failure the manifest itself can prove: a blob
+    /// file shorter than the tensors it describes. Names the shortfall and
+    /// the command that re-fetches the pack.
+    Pack(String),
     /// User-facing CLI/config validation failure (`quantize --set class=format`):
     /// unknown class, locked class, unsupported class×format combo, or a
     /// dimension constraint the offending tensor violates. Always names the
@@ -57,6 +61,7 @@ impl std::fmt::Display for Error {
             Self::Backend(msg) => write!(f, "{msg}"),
             Self::NotFound(name) => write!(f, "tensor not found: {name}"),
             Self::Layered(msg) => write!(f, "{msg}"),
+            Self::Pack(msg) => write!(f, "{msg}"),
             Self::Config(msg) => write!(f, "{msg}"),
             Self::DType {
                 name,

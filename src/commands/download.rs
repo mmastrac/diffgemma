@@ -67,7 +67,7 @@ pub(crate) fn run_download(
         total as f64 / GIB,
     );
 
-    for f in &files {
+    for (i, f) in files.iter().enumerate() {
         let dest_path = dest.join(&f.path);
         if let Some(parent) = dest_path.parent()
             && let Err(e) = std::fs::create_dir_all(parent)
@@ -106,6 +106,7 @@ pub(crate) fn run_download(
         let url = format!("{HF_ENDPOINT}/{repo}/resolve/{revision}/{}", f.path);
         if let Err(msg) = download_file(&url, &dest_path, f.size, force, jobs) {
             eprintln!("error: downloading {}: {msg}", f.path);
+            report_unfetched(&files, i);
             return ExitCode::FAILURE;
         }
         match file_len(&dest_path) {
@@ -115,10 +116,12 @@ pub(crate) fn run_download(
                     "error: {} size mismatch: got {got}, expected {}",
                     f.path, f.size
                 );
+                report_unfetched(&files, i);
                 return ExitCode::FAILURE;
             }
             None => {
                 eprintln!("error: {} missing after download", f.path);
+                report_unfetched(&files, i);
                 return ExitCode::FAILURE;
             }
         }
@@ -151,7 +154,7 @@ pub(crate) fn run_download(
 /// for a layered pack is reported, not failed, since fetching it is a
 /// separate, expected step.
 fn verify_downloaded_pack(dest: &Path) -> Result<String, String> {
-    use crate::dgq::layout::{DgqManifest, MANIFEST_FILE, TensorSource, dgq_version_supported};
+    use crate::dgq::layout::{DgqManifest, MANIFEST_FILE, dgq_version_supported};
 
     let manifest_path = dest.join(MANIFEST_FILE);
     let manifest_json = std::fs::read_to_string(&manifest_path)
@@ -167,30 +170,21 @@ fn verify_downloaded_pack(dest: &Path) -> Result<String, String> {
         ));
     }
 
-    let mut canonical_bytes = 0u64;
-    let mut max_local_extent = 0u64;
-    for t in &manifest.tensors {
-        canonical_bytes = canonical_bytes.max(t.meta.offset + t.meta.byte_len);
-        let local_end = match &t.meta.source {
-            None => t.meta.offset + t.meta.byte_len,
-            Some(TensorSource::Local { local_offset }) => local_offset + t.meta.byte_len,
-            Some(TensorSource::External { .. }) => 0,
-        };
-        max_local_extent = max_local_extent.max(local_end);
-    }
+    let canonical_bytes = manifest
+        .tensors
+        .iter()
+        .map(|t| t.meta.offset + t.meta.byte_len)
+        .max()
+        .unwrap_or(0);
 
     let blob_path = dest.join(&manifest.blob_file);
     let blob_len = std::fs::metadata(&blob_path)
         .map_err(|e| format!("stat {}: {e}", blob_path.display()))?
         .len();
-    if blob_len < max_local_extent {
-        return Err(format!(
-            "{} is {blob_len} bytes, but the manifest's local tensors extend to \
-             {max_local_extent} bytes — the transfer looks truncated or corrupt; \
-             re-run with --force",
-            blob_path.display()
-        ));
-    }
+    // Same check the loader runs, so a pack that passes here cannot fail there.
+    manifest
+        .check_local_blob_len(blob_len, &blob_path)
+        .map_err(|e| e.to_string())?;
 
     let layered = manifest.is_layered();
     let mut base_line = String::new();
@@ -231,6 +225,22 @@ fn verify_downloaded_pack(dest: &Path) -> Result<String, String> {
 }
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+/// Spell out what the aborted run never got to. The blob is listed before
+/// the manifest and the tokenizer, so a blob failure leaves a directory
+/// holding the one huge file and missing the small ones, which reads as "it
+/// skipped them" unless the abort says otherwise.
+fn report_unfetched(files: &[RepoFile], failed_at: usize) {
+    let rest: Vec<&str> = files[failed_at + 1..]
+        .iter()
+        .map(|f| f.path.as_str())
+        .collect();
+    eprintln!("download aborted: {} is incomplete", files[failed_at].path);
+    if !rest.is_empty() {
+        eprintln!("  not fetched: {}", rest.join(", "));
+    }
+    eprintln!("  the model directory is not usable yet. Re-run `diffgemma download` to resume.");
+}
 
 fn file_len(path: &Path) -> Option<u64> {
     std::fs::metadata(path).ok().map(|m| m.len())
@@ -378,9 +388,30 @@ fn part_path(dest: &Path, i: u64) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Concatenate `parts` (in order) into `dest`, deleting each part as it is
-/// consumed. Parts are 256 MiB; a plain buffered copy is fine.
+/// Concatenate `parts` (in order) into `dest`, deleting each part the moment
+/// it has been written. Parts are 256 MiB, so a plain buffered copy is fine.
+///
+/// Deleting as we go is what keeps the pack downloadable. Holding every part
+/// until the end puts the parts and the assembled file on disk at once, so a
+/// 19 GiB pack needs 38 GiB free to land. Freeing each part once its bytes
+/// are flushed holds the high-water mark near the pack size instead. The
+/// cost: a failure part-way through assembly re-fetches the parts it has
+/// already consumed.
+///
+/// A failed assembly deletes the partial `dest` too, because leaving it is
+/// worse than leaving nothing. It is a plausible-looking `model.dgq.bin`
+/// that loads and produces zero weights.
 fn concat_parts(dest: &Path, parts: &[(PathBuf, u64)]) -> Result<(), String> {
+    match concat_parts_inner(dest, parts) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(dest);
+            Err(e)
+        }
+    }
+}
+
+fn concat_parts_inner(dest: &Path, parts: &[(PathBuf, u64)]) -> Result<(), String> {
     use std::io::{BufWriter, Write};
     eprintln!(
         "       assembling {} chunks -> {}",
@@ -393,10 +424,9 @@ fn concat_parts(dest: &Path, parts: &[(PathBuf, u64)]) -> Result<(), String> {
         let mut r =
             std::fs::File::open(part).map_err(|e| format!("open {}: {e}", part.display()))?;
         std::io::copy(&mut r, &mut writer).map_err(|e| format!("copy {}: {e}", part.display()))?;
-    }
-    writer.flush().map_err(|e| e.to_string())?;
-    drop(writer);
-    for (part, _) in parts {
+        writer
+            .flush()
+            .map_err(|e| format!("flush {}: {e}", part.display()))?;
         let _ = std::fs::remove_file(part);
     }
     Ok(())
@@ -542,7 +572,46 @@ mod verify_pack_tests {
         std::fs::write(dir.join(BLOB_FILE), vec![0u8; 50]).expect("write blob");
 
         let err = verify_downloaded_pack(&dir).expect_err("must reject truncated blob");
-        assert!(err.contains("truncated or corrupt"), "{err}");
+        assert!(err.contains("truncated"), "{err}");
+        assert!(err.contains("50 bytes on disk"), "{err}");
+        assert!(err.contains("needs 100"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Peak disk during assembly is what decides whether a 19 GiB pack fits
+    /// on a machine with 25 GiB free.
+    #[test]
+    fn concat_frees_each_part_as_it_goes() {
+        let dir = scratch_dir("concat");
+        let dest = dir.join("out.bin");
+        let parts: Vec<(PathBuf, u64)> = (0..3u64)
+            .map(|i| {
+                let p = part_path(&dest, i);
+                std::fs::write(&p, vec![b'a' + i as u8; 4]).expect("write part");
+                (p, 4)
+            })
+            .collect();
+
+        concat_parts(&dest, &parts).expect("concat");
+        assert_eq!(std::fs::read(&dest).expect("read dest"), b"aaaabbbbcccc");
+        for (p, _) in &parts {
+            assert!(!p.exists(), "{} survived assembly", p.display());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A partial `model.dgq.bin` is worse than no file: it loads, reads past
+    /// its own end as zeros, and generates `<pad>` forever.
+    #[test]
+    fn failed_concat_leaves_no_partial_dest() {
+        let dir = scratch_dir("concat-fail");
+        let dest = dir.join("out.bin");
+        let good = part_path(&dest, 0);
+        std::fs::write(&good, b"aaaa").expect("write part");
+        let missing = part_path(&dest, 1);
+
+        concat_parts(&dest, &[(good, 4), (missing, 4)]).expect_err("must fail on missing part");
+        assert!(!dest.exists(), "partial dest survived a failed assembly");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
